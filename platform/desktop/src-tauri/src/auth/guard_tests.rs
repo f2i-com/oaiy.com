@@ -57,6 +57,18 @@ fn env_with(
     gui: bool,
     static_token: Option<&str>,
 ) -> Env {
+    env_at_port(mode, vars, bind_all, gui, static_token, 17972)
+}
+
+/// [`env_with`] for a listener on `port`.
+fn env_at_port(
+    mode: AccessMode,
+    vars: &[(&str, &str)],
+    bind_all: bool,
+    gui: bool,
+    static_token: Option<&str>,
+    port: u16,
+) -> Env {
     let dir = TempDir::new("guard-tests");
     let clock = Arc::new(ManualClock::new(T0));
     let map: std::collections::BTreeMap<String, String> = vars
@@ -64,7 +76,7 @@ fn env_with(
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
     let (config, warnings) =
-        GuardConfig::from_env(&move |n| map.get(n).cloned(), bind_all, gui, 17972);
+        GuardConfig::from_env(&move |n| map.get(n).cloned(), bind_all, gui, port);
     assert!(warnings.is_empty(), "{warnings:?}");
     let store = Arc::new(AuthStore::memory(clock.clone()));
     let audit = Arc::new(AuditLog::open(&dir.0.join("auth"), clock.clone(), false));
@@ -2622,6 +2634,66 @@ async fn f4_a_static_token_that_fails_the_shape_rule_is_still_accepted_until_the
     let e = env_with(AccessMode::Scoped, &[], false, true, Some("ab$cd"));
     let r = go(&e, send(Method::GET, "/api/config").bearer("ab$cd")).await;
     assert_eq!(r.status, 400);
+}
+
+// ================================ F8: a LAN listener on a port the schemes use ========================
+
+#[tokio::test]
+async fn f8_a_lan_listener_on_port_80_or_443_or_another_answers_the_address_it_was_reached_at() {
+    for (bound, hosts, refused) in [
+        (
+            80u16,
+            vec!["192.168.1.5", "192.168.1.5:80"],
+            vec!["192.168.1.5:17972"],
+        ),
+        (
+            443,
+            vec!["192.168.1.5", "192.168.1.5:443"],
+            vec!["192.168.1.5:17972"],
+        ),
+        (
+            17972,
+            vec!["192.168.1.5:17972"],
+            vec!["192.168.1.5", "192.168.1.5:80", "192.168.1.5:443"],
+        ),
+        (8080, vec!["192.168.1.5:8080"], vec!["192.168.1.5"]),
+    ] {
+        let e = env_at_port(
+            AccessMode::Scoped,
+            &[],
+            true,
+            false,
+            Some(STATIC_TOKEN),
+            bound,
+        );
+        for host in hosts {
+            // A peer on the LAN, with the token: the request is for this server.
+            let r = go(
+                &e,
+                send(Method::GET, "/api/config")
+                    .h("host", host)
+                    .peer("192.168.1.20:50000")
+                    .bearer(STATIC_TOKEN),
+            )
+            .await;
+            assert_eq!(r.status, 200, "bound {bound}, Host {host}: {}", r.text);
+        }
+        for host in refused {
+            let r = go(
+                &e,
+                send(Method::GET, "/api/config")
+                    .h("host", host)
+                    .peer("192.168.1.20:50000")
+                    .bearer(STATIC_TOKEN),
+            )
+            .await;
+            assert_eq!(
+                (r.status, r.code().as_deref()),
+                (421, Some("misdirected_host")),
+                "bound {bound}, Host {host}"
+            );
+        }
+    }
 }
 
 // ============================ F7: a busy parent does not wash out the audit log ======================

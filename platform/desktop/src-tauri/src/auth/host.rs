@@ -200,13 +200,20 @@ impl HostPolicy {
         if let Some(app) = self.public.get(host) {
             return Ok(HostClass::Public(*app));
         }
-        if self.exposure == Exposure::Lan
-            && host.is_ip_literal()
-            && host.port.unwrap_or(0) == self.port
-        {
+        if self.exposure == Exposure::Lan && host.is_ip_literal() && self.is_bound_port(host.port) {
             return Ok(HostClass::LanAddress);
         }
         Err(Misdirected)
+    }
+
+    /// Whether a `Host` with this port (as [`HostName`] keeps it: `None` for no port and for `:80` and `:443`,
+    /// which it drops as the schemes' defaults) is for the port the listener is bound to: the port itself, and
+    /// no port at all when the listener is on 80 or 443, the ports a client uses when it names none.
+    fn is_bound_port(&self, port: Option<u16>) -> bool {
+        match port {
+            Some(p) => p == self.port,
+            None => self.port == 80 || self.port == 443,
+        }
     }
 
     /// Whether `host` is one of the configured public hosts.
@@ -449,6 +456,71 @@ mod tests {
             p.classify(&h("127.0.0.1:17972"), true),
             Ok(HostClass::Loopback)
         );
+    }
+
+    #[test]
+    fn f8_a_lan_listener_on_port_80_or_443_answers_an_ip_literal_with_no_port_and_with_its_own() {
+        // A client that names no port uses the scheme's: 80 for http, 443 for https. `HostName` drops both
+        // from a `Host`, so an address with no port is what `:80` and `:443` come to; a listener on either
+        // answers it (the address is one of the machine's own, so nothing is opened to a rebinding name).
+        for bound in [80u16, 443] {
+            let p = policy(Exposure::Lan, bound, false);
+            for host in [
+                "192.168.1.5",
+                "192.168.1.5:80",
+                "192.168.1.5:443",
+                "10.0.0.7",
+                "[fd12::5]",
+                "[fd12::5]:80",
+                "[fd12::5]:443",
+            ] {
+                assert_eq!(
+                    p.classify(&h(host), false),
+                    Ok(HostClass::LanAddress),
+                    "bound {bound}, Host {host}"
+                );
+            }
+            // Another port, a name, and a public name are not this server's.
+            for host in [
+                "192.168.1.5:17972",
+                "192.168.1.5:8080",
+                "[fd12::5]:17972",
+                "nas.local",
+                "nas.local:80",
+                "evil.example",
+            ] {
+                assert_eq!(
+                    p.classify(&h(host), false),
+                    Err(Misdirected),
+                    "bound {bound}, Host {host}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn f8_a_lan_listener_on_another_port_answers_that_port_only() {
+        for bound in [17972u16, 8080, 8443, 1] {
+            let p = policy(Exposure::Lan, bound, false);
+            assert_eq!(
+                p.classify(&h(&format!("192.168.1.5:{bound}")), false),
+                Ok(HostClass::LanAddress),
+                "bound {bound}"
+            );
+            for host in [
+                "192.168.1.5",
+                "192.168.1.5:80",
+                "192.168.1.5:443",
+                "192.168.1.5:9",
+                "[fd12::5]",
+            ] {
+                assert_eq!(
+                    p.classify(&h(host), false),
+                    Err(Misdirected),
+                    "bound {bound}, Host {host}"
+                );
+            }
+        }
     }
 
     #[test]
