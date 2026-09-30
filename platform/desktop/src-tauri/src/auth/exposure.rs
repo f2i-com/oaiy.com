@@ -16,7 +16,10 @@
 //!    served; the dashboard's URL is required by the other two.
 //! 4. A bind beyond loopback with `OAIY_PUBLIC_URL` needs `OAIY_TRUSTED_PROXIES` ("name your proxy"): that is the
 //!    proxy-only shape, in which a direct peer that is not a trusted proxy is `403 direct_access_refused`.
-//! 5. `OAIY_SERVER_TOKEN` has the shape of design 4.1 (32 to 256 printable ASCII characters, 16 different).
+//! 5. `OAIY_SERVER_TOKEN` is a token and not a pattern (`token::check_static_token_shape`: 32 to 256 printable ASCII
+//!    characters worth 128 bits for the alphabet they are written in, at least 8 different, no placeholder word, no run
+//!    that counts or follows the keyboard, no piece of 8 characters twice). Design 4.1 gave it 16 different characters,
+//!    which refused `openssl rand -hex 24` about one time in two.
 //! 6. The access mode (`mode::validate_mode`): `shadow` on a proxied or lan install, `legacy` where the web login
 //!    is built in, where an owner exists or where the exposure is not local.
 //!
@@ -540,7 +543,7 @@ pub fn evaluate(env: &dyn Fn(&str) -> Option<String>, facts: &Facts) -> Evaluati
                 violate!(
                     Rule::StaticToken,
                     format!(
-                        "{}: use a random value such as `openssl rand -base64 32` (random hex has too few different characters), or a token made on the console (`oaiy-server auth token create`)",
+                        "{}: use a random value such as `openssl rand -base64 32`, or a token made on the console (`oaiy-server auth token create`)",
                         shape.message()
                     ),
                 );
@@ -725,7 +728,7 @@ mod tests {
         owner_exists: false,
         web_login: false,
     };
-    const GOOD_TOKEN: &str = "abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+    const GOOD_TOKEN: &str = "Vl0JTnJtFseAe9ePKCDhuBymfRXQ8osZ-QMlM86leCU";
 
     fn vars(pairs: &[(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
         let map: BTreeMap<String, String> = pairs
@@ -1246,7 +1249,7 @@ mod tests {
     fn rule_5_a_static_token_of_the_wrong_shape_is_refused() {
         let too_long = "a1".repeat(129);
         let few_distinct = "ab".repeat(20);
-        let fifteen_distinct = format!("{}{}", "abcdefghijklmno", "a".repeat(20));
+        let one_run = format!("{}{}", "abcdefghijklmno", "a".repeat(20));
         for (what, bad) in [
             ("short", "short".to_string()),
             (
@@ -1275,8 +1278,29 @@ mod tests {
             ),
             ("too long", too_long.clone()),
             ("two characters repeated", few_distinct),
-            ("15 distinct characters", fifteen_distinct),
+            ("a run of one character", one_run),
             ("change-me", "change-me".to_string()),
+            // The old shape took this one: 40 different characters, that count.
+            (
+                "a run that counts",
+                "abcdefghijklmnopqrstuvwxyz0123456789ABCD".to_string(),
+            ),
+            (
+                "a word from an example",
+                "verysecrettokenverysecrettoken1234".to_string(),
+            ),
+            (
+                "a run along the keyboard",
+                "qwertyuiopasdfghjklzxcvbnmqwertyui".to_string(),
+            ),
+            (
+                "a piece twice",
+                "k7Qz!mV3#pW9xLd2rn8TbHv4$wN6@cJ1k7Qz!mV3".to_string(),
+            ),
+            (
+                "32 decimal digits, 106 bits",
+                "67374834151859291927224391593075".to_string(),
+            ),
         ] {
             let e = evaluate(
                 &|n| (n == "OAIY_SERVER_TOKEN").then(|| bad.clone()),
@@ -1289,9 +1313,12 @@ mod tests {
             );
             let msg = &e.violations[0].message;
             assert!(
-                msg.contains("OAIY_SERVER_TOKEN") && msg.contains("auth token create"),
+                msg.contains("OAIY_SERVER_TOKEN")
+                    && msg.contains("openssl rand -base64 32")
+                    && msg.contains("auth token create"),
                 "{msg}"
             );
+            assert!(!msg.contains("random hex"), "hex is fine now: {msg}");
             // The token is never echoed into the message (it is a credential, even a weak one).
             assert!(!msg.contains(&bad) || bad.len() < 12, "{what}: {msg}");
         }
@@ -1299,12 +1326,23 @@ mod tests {
 
     #[test]
     fn rule_5_a_static_token_of_the_right_shape_is_kept_trimmed() {
-        let sixteen_of_thirty_two = "abcdefghijklmnop".repeat(2);
-        let printable_256: String = ('!'..='~').cycle().take(256).collect();
+        // 256 printable characters that are no pattern: a xorshift stream, seeded.
+        let mut x: u64 = 88_172_645_463_325_252;
+        let printable_256: String = (0..256)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (0x21 + (x % 94) as u8) as char
+            })
+            .collect();
         for good in [
             GOOD_TOKEN.to_string(),
             "Sup3r$ecret!Zq7kLm9VbNw2XyHdFg5!".to_string(),
-            sixteen_of_thirty_two,
+            // Random hex, of the lengths people use, and one of them with only 15 of the 16 digits.
+            "f450474c461f635bacde4cc71a4d10a9".to_string(),
+            "d812d74ba4c163bbf58d6fa2605b596946c9d50880c35500".to_string(),
+            "zkwdexEjP8A727+Q2moKCafq4F2IVlZbLJOseRU8Ric=".to_string(),
             printable_256,
         ] {
             let padded = format!("  {good}\n");

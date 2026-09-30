@@ -3264,7 +3264,7 @@ fn login_options_from_a_validated_configuration_are_what_the_environment_says() 
 
 // ==================================== ACC-14: a lan listener has no login ============================
 
-const LAN_TOKEN: &str = "abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+const LAN_TOKEN: &str = "pyKvbv-kgRHhxqjS7f7IBb-MU_CUY6a7A7RmMk3s0Dg";
 
 /// The same data folder, started again as a listener bound beyond loopback with no public URL (design 3.4: plain
 /// HTTP, bearer only). The owner exists (a lan install cannot start without one).

@@ -23,9 +23,10 @@ use std::time::{Duration, Instant};
 use oaiy_desktop_lib::auth::routes::{Class, Route, Verb, ROUTES};
 use serde_json::Value;
 
-/// The shape the design gives the static token (4.1): 32 to 256 printable characters, at least 16 different. A
-/// shorter one is a startup refusal now (`oaiy-server` exits 78: see the test of rule 5 below).
-const TOKEN: &str = "integration-test-token-0123456789ABCDEF";
+/// A static token the server takes (`auth::token::check_static_token_shape`: 32 to 256 printable characters worth 128
+/// bits, no pattern and no word an example is made of). One that fails it is a startup refusal (`oaiy-server` exits
+/// 78: see the test of rule 5 below).
+const TOKEN: &str = "34kI-kQagl-ZBnGbe5K5cFscsUBdYtkk7Hc9s9Z-EEM";
 
 /// A folder of the test's own, removed when the test ends.
 struct Scratch(PathBuf);
@@ -640,7 +641,24 @@ fn a_scoped_server_takes_the_static_token_in_the_shape_the_design_gives_it() {
     // `OAIY_SERVER_TOKEN` is 32 to 256 printable characters (design 4.1), which is wider than the strict
     // bearer rule (`[A-Za-z0-9._~+/=-]`, 128 bytes): a token with a `$` in it, or one of 200 characters, must
     // not be a `400` in front of the server that was configured with it.
-    let long: String = ('!'..='~').cycle().take(200).collect();
+    // 200 printable characters that the rule takes: the first of a seeded xorshift series that it does.
+    let long: String = (1u64..)
+        .map(|seed| {
+            let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            (0..200)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (0x21 + (x % 94) as u8) as char
+                })
+                .collect::<String>()
+        })
+        .find(|t| {
+            oaiy_desktop_lib::auth::token::check_static_token_shape(t).is_ok()
+                && !t.starts_with('Z')
+        })
+        .unwrap();
     for (i, token) in ["Sup3r$ecret!Zq7kLm9VbNw2XyHdFg5!", long.as_str()]
         .into_iter()
         .enumerate()
@@ -730,7 +748,7 @@ fn the_startup_refusals_of_design_4_5_5_stop_the_server_with_exit_78_and_a_line_
 #[test]
 fn a_static_token_is_kept_out_of_the_line_that_refuses_it() {
     let scratch = Scratch::new("boot-refusal-token-echo");
-    let weak = "hunter2hunter2hunter2";
+    let weak = "hunter2hunter2hunter2hunter2hunter2";
     let mut server = Server::spawn(&scratch, &[("OAIY_SERVER_TOKEN", weak)], "server");
     assert_eq!(server.exit_code(Duration::from_secs(60)), Some(78));
     assert!(

@@ -32,7 +32,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-const TOKEN: &str = "exposure-test-token-0123456789ABCDEF";
+/// A token of the kind the server takes (`auth::token::check_static_token_shape`: worth 128 bits, no pattern).
+const TOKEN: &str = "55Vg_eegIwyr7yMQ_Nh6euAXoVKz9nTnWw8vtNNtxeE";
 #[cfg(feature = "web")]
 const PASSWORD: &str = "k7Qz!mV3#pW9xLd2 rn8Tb";
 
@@ -582,6 +583,9 @@ fn t28_rule_5_a_weak_static_token_is_refused_and_a_good_one_is_the_cli_preset() 
         "change-me",
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "has a space in it 0123456789abcdefghijk",
+        // 40 different characters that count up, which the shape of design 4.1 took; and what a hand made up.
+        "abcdefghijklmnopqrstuvwxyz0123456789ABCD",
+        "verysecrettokenverysecrettoken1234",
     ]
     .into_iter()
     .enumerate()

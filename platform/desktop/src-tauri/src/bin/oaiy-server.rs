@@ -26,7 +26,9 @@
 //!                                                                 OAIY_PUBLIC_URL is set]
 //!   OAIY_ALLOWED_HOSTS   extra Host names, for every install       [none]
 //!   OAIY_SERVER_TOKEN    a bearer of the `cli` preset: 32 to 256 printable
-//!                       characters, at least 16 different (else exit 78) [none]
+//!                       characters worth 128 bits and no pattern (no word like
+//!                       `test`, no run like `1234`: `openssl rand -base64 32`
+//!                       is one; else exit 78)                         [none]
 //!
 //! A configuration that breaks a rule of the design (an unreadable bind, a lan bind with no owner,
 //! a public URL with a path, a proxy not named, a weak token, a mode that is not allowed there)

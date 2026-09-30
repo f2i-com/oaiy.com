@@ -23,8 +23,9 @@ socket.listen(0, '127.0.0.1');
 await once(socket, 'listening');
 const port = socket.address().port;
 await new Promise(resolve => socket.close(resolve));
-// The shape the server requires of OAIY_SERVER_TOKEN: 32 to 256 printable characters, at least 16 different. Random
-// hex (`randomBytes(32).toString('hex')`) has only 16 to choose from, and about a quarter of them miss one.
+// What the server requires of OAIY_SERVER_TOKEN: 32 to 256 printable characters worth 128 bits and no pattern (no
+// word like `test`, no run like `1234`). Any random token is one nearly always: 43 base64url characters are refused
+// by chance about one time in 20,000.
 const token = randomBytes(32).toString('base64url');
 const env = {
   PATH: process.platform === 'win32' ? path.join(process.env.SystemRoot, 'System32') : path.join(data, 'empty-path'),

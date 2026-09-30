@@ -318,10 +318,37 @@ pub const STATIC_TOKEN_MIN_LEN: usize = 32;
 /// The longest.
 pub const STATIC_TOKEN_MAX_LEN: usize = 256;
 /// The fewest distinct characters it may be made of.
-pub const STATIC_TOKEN_MIN_DISTINCT: usize = 16;
+pub const STATIC_TOKEN_MIN_DISTINCT: usize = 8;
+/// What it must be worth, in thousandths of a bit: its length times what one character of the alphabet it seems to be
+/// drawn from carries (see [`millibits_per_character`]). 128 bits: 32 hex digits, 22 letters and digits, 44 base64.
+pub const STATIC_TOKEN_MIN_MILLIBITS: usize = 128_000;
+/// A run of this many characters, each the next or the previous one in the character set (`abcdefgh`, `87654321`).
+const SEQUENTIAL_RUN: usize = 8;
+/// A run of this many characters along one row of the keyboard (`qwerty`, `poiuyt`), whatever the case.
+const KEYBOARD_RUN: usize = 6;
+/// A piece of this many characters that occurs twice. Every token that repeats itself with a period up to its length
+/// less this contains one, so the check for a token made of one short piece over and over is this one.
+const REPEATED_PIECE: usize = 8;
+/// What a token that a person made up, or copied from an example, is likely to contain, whatever the case.
+const PLACEHOLDERS: [&str; 12] = [
+    "change-me",
+    "changeme",
+    "password",
+    "secret",
+    "token",
+    "example",
+    "test",
+    "admin",
+    "default",
+    "xxxx",
+    "0000",
+    "1234",
+];
+const KEYBOARD_ROWS: [&str; 3] = ["qwertyuiop", "asdfghjkl", "zxcvbnm"];
 
-/// Why a value is not a static token of the shape the design gives it (`^[\x21-\x7e]{32,256}$` with at
-/// least 16 distinct characters, design 4.1).
+/// Why a value is not a static token the server takes (design 4.1 gave it a shape, `^[\x21-\x7e]{32,256}$` with 16
+/// different characters, which refused what `openssl rand -hex 32` makes about one time in four and took
+/// `abcdefghijklmnopqrstuvwxyz0123456789ABCD`: it is now worth 128 bits and no pattern).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StaticTokenShape {
     TooShort,
@@ -329,6 +356,14 @@ pub enum StaticTokenShape {
     /// A space, a control character, a byte over 0x7e.
     BadCharacter,
     TooFewDistinct,
+    /// A word that a placeholder is made of (`change-me`, `password`, `test`, `1234`).
+    Placeholder,
+    /// A run that counts up or down, or follows the keyboard.
+    Sequential,
+    /// A piece of it occurs twice.
+    Repeats,
+    /// Its length, for the alphabet it is written in, is worth less than 128 bits.
+    TooLittleEntropy,
 }
 
 impl StaticTokenShape {
@@ -340,16 +375,114 @@ impl StaticTokenShape {
                 "OAIY_SERVER_TOKEN has a space, a control character or a non-ASCII character"
             }
             StaticTokenShape::TooFewDistinct => {
-                "OAIY_SERVER_TOKEN is made of fewer than 16 different characters"
+                "OAIY_SERVER_TOKEN is made of fewer than 8 different characters"
+            }
+            StaticTokenShape::Placeholder => {
+                "OAIY_SERVER_TOKEN has a word in it that a placeholder is made of (change-me, password, secret, token, example, test, admin, default, 1234)"
+            }
+            StaticTokenShape::Sequential => {
+                "OAIY_SERVER_TOKEN has a run of characters that count up or down (abcdefgh, 12345678) or follow the keyboard (qwerty)"
+            }
+            StaticTokenShape::Repeats => {
+                "OAIY_SERVER_TOKEN repeats itself (a piece of 8 characters occurs twice)"
+            }
+            StaticTokenShape::TooLittleEntropy => {
+                "OAIY_SERVER_TOKEN is too short for what it is made of: it must be worth 128 bits (32 hex digits, 22 letters and digits, 20 printable characters)"
             }
         }
     }
 }
 
-/// Whether `token` has the shape of a static token: 32 to 256 printable ASCII characters (0x21 to 0x7e),
-/// at least 16 of them different. `oaiy-server` refuses to start with a token that fails it (`auth::exposure`,
-/// rule 5), and the guard ignores such a token in `scoped` and `shadow` mode (the desktop's way); it also
-/// decides which wide tokens [`bearer_or_static`] takes.
+/// What one character of `token` is worth, in thousandths of a bit: the log of the size of the smallest of the
+/// alphabets people generate tokens in that holds all of it. Decimal digits 10, hex digits of one case 16, base32
+/// 32, letters and digits 62, base64 and base64url 64, anything else the 94 printable characters. Trailing `=` is
+/// the padding of base32 and base64.
+fn millibits_per_character(token: &[u8]) -> usize {
+    fn decimal(b: u8) -> bool {
+        b.is_ascii_digit()
+    }
+    fn hex_lower(b: u8) -> bool {
+        matches!(b, b'0'..=b'9' | b'a'..=b'f')
+    }
+    fn hex_upper(b: u8) -> bool {
+        matches!(b, b'0'..=b'9' | b'A'..=b'F')
+    }
+    fn base32(b: u8) -> bool {
+        b.is_ascii_uppercase() || matches!(b, b'2'..=b'7')
+    }
+    fn alphanumeric(b: u8) -> bool {
+        b.is_ascii_alphanumeric()
+    }
+    fn base64(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'+' || b == b'/'
+    }
+    fn base64url(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+    }
+    let body_len = token.iter().rposition(|b| *b != b'=').map_or(0, |i| i + 1);
+    let padded = body_len < token.len();
+    let body = &token[..body_len];
+    let all = |member: fn(u8) -> bool| !body.is_empty() && body.iter().all(|b| member(*b));
+    if !padded && all(decimal) {
+        3321
+    } else if !padded && (all(hex_lower) || all(hex_upper)) {
+        4000
+    } else if all(base32) {
+        5000
+    } else if !padded && all(alphanumeric) {
+        5954
+    } else if all(base64) || (!padded && all(base64url)) {
+        6000
+    } else {
+        6554
+    }
+}
+
+/// A run of [`SEQUENTIAL_RUN`] characters that each differ from the one before by one in the character set.
+fn counts_in_the_character_set(token: &[u8]) -> bool {
+    let mut run = 1;
+    for pair in token.windows(2) {
+        if pair[1].abs_diff(pair[0]) == 1 {
+            run += 1;
+            if run >= SEQUENTIAL_RUN {
+                return true;
+            }
+        } else {
+            run = 1;
+        }
+    }
+    false
+}
+
+/// A piece of [`KEYBOARD_RUN`] characters that is along a row of the keyboard, either way.
+fn follows_the_keyboard(token: &[u8]) -> bool {
+    let lower: Vec<u8> = token.iter().map(u8::to_ascii_lowercase).collect();
+    KEYBOARD_ROWS.iter().any(|row| {
+        let forward = row.as_bytes();
+        let backward: Vec<u8> = forward.iter().rev().copied().collect();
+        lower.windows(KEYBOARD_RUN).any(|piece| {
+            forward.windows(KEYBOARD_RUN).any(|p| p == piece)
+                || backward.windows(KEYBOARD_RUN).any(|p| p == piece)
+        })
+    })
+}
+
+/// A piece of [`REPEATED_PIECE`] characters that occurs twice, the two allowed to overlap.
+fn repeats_a_piece(token: &[u8]) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    token
+        .windows(REPEATED_PIECE)
+        .any(|piece| !seen.insert(piece))
+}
+
+/// Whether `token` is one the server takes as `OAIY_SERVER_TOKEN`: 32 to 256 printable ASCII characters (0x21 to
+/// 0x7e), at least 8 of them different, worth at least 128 bits for the alphabet it is written in, and no pattern: no
+/// word a placeholder is made of, no run that counts or follows the keyboard, no piece of 8 characters twice.
+/// Every generator of the tokens people use (`openssl rand -hex 32`, `-base64 32`, `uuidgen`, `secrets.token_urlsafe`)
+/// passes about 999 times in a thousand or better, and what a person makes up does not. `oaiy-server` refuses to
+/// start with a token that fails it (`auth::exposure`, rule 5), the guard ignores such a token in `scoped` and
+/// `shadow` mode (the desktop's way), it decides which wide tokens [`bearer_or_static`] takes, and `oaiy-server
+/// check` says so: this is the one function.
 pub fn check_static_token_shape(token: &str) -> Result<(), StaticTokenShape> {
     let bytes = token.as_bytes();
     if !bytes.iter().all(|b| (0x21..=0x7e).contains(b)) {
@@ -361,12 +494,25 @@ pub fn check_static_token_shape(token: &str) -> Result<(), StaticTokenShape> {
     if bytes.len() > STATIC_TOKEN_MAX_LEN {
         return Err(StaticTokenShape::TooLong);
     }
-    let mut seen = [false; 256];
+    let mut seen = [false; 128];
     for b in bytes {
         seen[*b as usize] = true;
     }
     if seen.iter().filter(|s| **s).count() < STATIC_TOKEN_MIN_DISTINCT {
         return Err(StaticTokenShape::TooFewDistinct);
+    }
+    let lower = token.to_ascii_lowercase();
+    if PLACEHOLDERS.iter().any(|word| lower.contains(word)) {
+        return Err(StaticTokenShape::Placeholder);
+    }
+    if counts_in_the_character_set(bytes) || follows_the_keyboard(bytes) {
+        return Err(StaticTokenShape::Sequential);
+    }
+    if repeats_a_piece(bytes) {
+        return Err(StaticTokenShape::Repeats);
+    }
+    if bytes.len() * millibits_per_character(bytes) < STATIC_TOKEN_MIN_MILLIBITS {
+        return Err(StaticTokenShape::TooLittleEntropy);
     }
     Ok(())
 }
@@ -728,14 +874,118 @@ mod tests {
         }
     }
 
-    /// `len` printable characters, all of them different for as long as the alphabet lasts.
-    fn printable(len: usize) -> String {
-        ('!'..='~').cycle().take(len).collect()
+    /// A splitmix64 stream: seeded, so that a failure is the same failure the next time.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+        fn bytes(&mut self, n: usize) -> Vec<u8> {
+            (0..n).map(|_| self.next() as u8).collect()
+        }
+        /// `len` characters drawn from `alphabet`.
+        fn text(&mut self, len: usize, alphabet: &str) -> String {
+            let a: Vec<char> = alphabet.chars().collect();
+            (0..len).map(|_| a[self.below(a.len())]).collect()
+        }
+    }
+
+    const PRINTABLE: &str = "!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+    const ALNUM: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+    /// `len` printable characters that the rule takes (the first of a seeded series that it does), for the tests
+    /// that need a token and are about something else. Not longer than 256.
+    fn wide(len: usize) -> String {
+        for seed in 0u64.. {
+            let mut rng = Rng(seed * 1000 + len as u64);
+            let token = rng.text(len, PRINTABLE);
+            if check_static_token_shape(&token).is_ok() {
+                return token;
+            }
+        }
+        unreachable!()
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn base32(bytes: &[u8]) -> String {
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+        let (mut out, mut bits, mut have) = (String::new(), 0u32, 0u32);
+        for b in bytes {
+            bits = (bits << 8) | *b as u32;
+            have += 8;
+            while have >= 5 {
+                out.push(alphabet[((bits >> (have - 5)) & 31) as usize] as char);
+                have -= 5;
+            }
+        }
+        out
+    }
+
+    /// A version 4 UUID, in the form `uuidgen` prints it.
+    fn uuid4(rng: &mut Rng) -> String {
+        let mut b = rng.bytes(16);
+        b[6] = (b[6] & 0x0f) | 0x40;
+        b[8] = (b[8] & 0x3f) | 0x80;
+        let h = hex(&b);
+        format!(
+            "{}-{}-{}-{}-{}",
+            &h[..8],
+            &h[8..12],
+            &h[12..16],
+            &h[16..20],
+            &h[20..]
+        )
+    }
+
+    /// What the tools that people make tokens with make, each named for the command.
+    fn generators() -> Vec<(&'static str, fn(&mut Rng) -> String)> {
+        use base64::Engine;
+        vec![
+            ("openssl rand -hex 32 (64 hex)", |r| hex(&r.bytes(32))),
+            (
+                "openssl rand -hex 24 (48 hex, the length of a real token)",
+                |r| hex(&r.bytes(24)),
+            ),
+            ("openssl rand -hex 16 (32 hex)", |r| hex(&r.bytes(16))),
+            ("openssl rand -base64 32 (44, padded)", |r| {
+                base64::engine::general_purpose::STANDARD.encode(r.bytes(32))
+            }),
+            ("python secrets.token_urlsafe(32) (43)", |r| {
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r.bytes(32))
+            }),
+            ("python secrets.token_urlsafe(24) (32)", |r| {
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r.bytes(24))
+            }),
+            ("uuidgen twice, joined (73)", |r| {
+                let first = uuid4(r);
+                format!("{first}{}", uuid4(r))
+            }),
+            ("uuidgen once (36)", |r| uuid4(r)),
+            ("uuidgen on macOS, upper case (36)", |r| {
+                uuid4(r).to_uppercase()
+            }),
+            ("base32 of 20 bytes (32)", |r| base32(&r.bytes(20))),
+            ("tr -dc A-Za-z0-9 | head -c 32", |r| r.text(32, ALNUM)),
+            ("a password manager's 40 printable characters", |r| {
+                r.text(40, PRINTABLE)
+            }),
+        ]
     }
 
     #[test]
-    fn a_static_token_has_the_shape_of_the_design_or_is_named_for_why_not() {
-        assert_eq!(check_static_token_shape(&printable(32)), Ok(()));
+    fn a_static_token_is_of_the_length_of_the_design_or_is_named_for_why_not() {
+        assert_eq!(check_static_token_shape(&wide(32)), Ok(()));
         // The two ends of the length, and one over each.
         for (len, want) in [
             (0, Err(StaticTokenShape::TooShort)),
@@ -743,46 +993,460 @@ mod tests {
             (32, Ok(())),
             (100, Ok(())),
             (256, Ok(())),
-            (257, Err(StaticTokenShape::TooLong)),
-            (1000, Err(StaticTokenShape::TooLong)),
         ] {
-            assert_eq!(check_static_token_shape(&printable(len)), want, "{len}");
+            let token = if len < 32 {
+                "k7Qz!mV3#pW9xLd2rn8TbHv4$wN6@cJ1"[..len].to_string()
+            } else {
+                wide(len)
+            };
+            assert_eq!(check_static_token_shape(&token), want, "{len}");
+        }
+        for len in [257, 1000] {
+            let token = Rng(len as u64).text(len, PRINTABLE);
+            assert_eq!(
+                check_static_token_shape(&token),
+                Err(StaticTokenShape::TooLong),
+                "{len}"
+            );
         }
         // Every byte: printable ASCII (0x21 to 0x7e) is allowed, and nothing else is.
         for b in 0u32..=0x2FF {
             let Some(c) = char::from_u32(b) else { continue };
-            let mut token = printable(31);
+            let mut token = "k7Qz!mV3#pW9xLd2rn8TbHv4$wN6@cJ".to_string();
             token.push(c);
             let printable_ascii = (0x21..=0x7e).contains(&b);
-            assert_eq!(
-                check_static_token_shape(&token),
-                if printable_ascii {
-                    Ok(())
-                } else {
-                    Err(StaticTokenShape::BadCharacter)
-                },
-                "U+{b:04X}"
-            );
+            // The rule that a character breaks may be another one of the pattern rules (a digit or a letter
+            // next to its neighbour) but a byte outside printable ASCII is this one, and only this one.
+            let verdict = check_static_token_shape(&token);
+            if printable_ascii {
+                assert!(
+                    verdict != Err(StaticTokenShape::BadCharacter),
+                    "U+{b:04X} is printable"
+                );
+            } else {
+                assert_eq!(verdict, Err(StaticTokenShape::BadCharacter), "U+{b:04X}");
+            }
         }
-        // At least 16 different characters.
-        let fifteen: String = ('a'..='o').cycle().take(40).collect();
-        let sixteen: String = ('a'..='p').cycle().take(40).collect();
-        assert_eq!(
-            check_static_token_shape(&fifteen),
-            Err(StaticTokenShape::TooFewDistinct)
-        );
-        assert_eq!(check_static_token_shape(&sixteen), Ok(()));
-        assert_eq!(
-            check_static_token_shape(&"a".repeat(64)),
-            Err(StaticTokenShape::TooFewDistinct)
-        );
         for reason in [
             StaticTokenShape::TooShort,
             StaticTokenShape::TooLong,
             StaticTokenShape::BadCharacter,
             StaticTokenShape::TooFewDistinct,
+            StaticTokenShape::Placeholder,
+            StaticTokenShape::Sequential,
+            StaticTokenShape::Repeats,
+            StaticTokenShape::TooLittleEntropy,
         ] {
             assert!(reason.message().starts_with("OAIY_SERVER_TOKEN"));
+            assert!(
+                !reason.message().contains("random hex"),
+                "{reason:?}: a lie now"
+            );
+        }
+    }
+
+    /// What a token that a person made up looks like, and the clause that refuses it. Each is refused by the rule
+    /// that is named and by no other that comes before it.
+    #[test]
+    fn a_static_token_that_is_a_pattern_or_an_example_is_refused_and_named_for_why() {
+        use StaticTokenShape::*;
+        for (token, why) in [
+            // The design's own example, and the owner's habits.
+            ("change-me", TooShort),
+            ("change-me-change-me-change-me-change-me", Placeholder),
+            ("passwordpasswordpasswordpassword12", Placeholder),
+            ("verysecrettokenverysecrettoken1234", Placeholder),
+            ("integration-test-token-0123456789ABCDEF", Placeholder),
+            // The token this test module used to hold up: 40 different characters that count.
+            ("abcdefghijklmnopqrstuvwxyz0123456789ABCD", Placeholder),
+            ("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN", Sequential),
+            ("ZYXWVUTSRQPONMLKJIHGFEDCBAzyxwvutsrqpon", Sequential),
+            ("qwertyuiopasdfghjklzxcvbnm1234567890", Placeholder),
+            ("qwertyuiopasdfghjklzxcvbnmqwertyui", Sequential),
+            ("poiuytrewqlkjhgfdsamnbvcxzpoiuytrew", Sequential),
+            ("0123456789abcdef0123456789abcdef", Placeholder),
+            ("1234567890123456789012345678901234567890", Placeholder),
+            // A few characters over and over, however they are arranged.
+            ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", TooFewDistinct),
+            ("abababababababababababababababababababab", TooFewDistinct),
+            ("Tr0ub4dor&3Tr0ub4dor&3Tr0ub4dor&3xx", Repeats),
+            ("correcthorsebatterystaplecorrecthorse", Repeats),
+            ("k7Qz!mV3#pW9xLd2rn8TbHv4$wN6@cJ1k7Qz!mV3", Repeats),
+            // Too few bits: 32 decimal digits are worth 106, and the same 32 characters as hex are worth 128.
+            ("67374834151859291927224391593075", TooLittleEntropy),
+        ] {
+            assert_eq!(check_static_token_shape(token), Err(why), "{token}");
+        }
+        // What the same clauses leave alone: no word, no run, no repeat, and the bits.
+        for token in [
+            "k7Qz!mV3#pW9xLd2rn8TbHv4$wN6@cJ1",
+            // 32 hex digits are 128 bits, exactly enough; 39 decimal digits are 129.
+            "f450474c461f635bacde4cc71a4d10a9",
+            "402018455530338697140336938258712660836",
+            // The base64 that `openssl rand -base64 32` prints, padding and all.
+            "zkwdexEjP8A727+Q2moKCafq4F2IVlZbLJOseRU8Ric=",
+        ] {
+            assert_eq!(check_static_token_shape(token), Ok(()), "{token}");
+        }
+    }
+
+    /// Each clause of the rule at its edge: one step inside it is a token, and the step over is named for the clause.
+    /// Each word of the list, in each case; a run of 8 in the character set and 7; 6 along the keyboard and 5; a
+    /// piece of 8 twice and of 7; 8 different characters and 7; 39 decimal digits and 38.
+    #[test]
+    fn every_clause_of_the_rule_has_its_edge() {
+        use StaticTokenShape::*;
+        // 32 characters that the rule takes, and a place in the middle to put a piece.
+        let base = "k7Qz!mV3#pW9xLd2rn8TbHv4$wN6@cJ1";
+        assert_eq!(check_static_token_shape(base), Ok(()));
+        let with = |piece: &str| format!("{}{piece}{}", &base[..12], &base[12..]);
+        for word in PLACEHOLDERS {
+            let capital = format!("{}{}", word[..1].to_uppercase(), &word[1..]);
+            for spelled in [word.to_string(), word.to_uppercase(), capital] {
+                assert_eq!(
+                    check_static_token_shape(&with(&spelled)),
+                    Err(Placeholder),
+                    "{spelled}"
+                );
+            }
+            // Not the word: one letter of it changed, or a character in it.
+            let broken = format!("{}~{}", &word[..word.len() / 2], &word[word.len() / 2..]);
+            assert_eq!(check_static_token_shape(&with(&broken)), Ok(()), "{broken}");
+        }
+        for (piece, run) in [
+            ("ABCDEFGH", true),
+            ("ABCDEFG", false),
+            ("HGFEDCBA", true),
+            ("HGFEDCB", false),
+            ("hijklmno", true),
+            ("hijklmn", false),
+            ("23456789", true),
+            ("2345678", false),
+            ("9876543", false),
+        ] {
+            assert_eq!(
+                check_static_token_shape(&with(piece)),
+                if run { Err(Sequential) } else { Ok(()) },
+                "{piece}"
+            );
+        }
+        for (piece, along) in [
+            ("qwerty", true),
+            ("QWERTY", true),
+            ("poiuyt", true),
+            ("asdfgh", true),
+            ("lkjhgf", true),
+            ("zxcvbn", true),
+            ("mnbvcx", true),
+            ("qwert", false),
+            ("poiuy", false),
+            ("asdfg", false),
+            ("zxcvb", false),
+            // Two rows are not a row.
+            ("opasdf", false),
+            ("plkjhg", false),
+        ] {
+            assert_eq!(
+                check_static_token_shape(&with(piece)),
+                if along { Err(Sequential) } else { Ok(()) },
+                "{piece}"
+            );
+        }
+        // A piece of 8 that occurs twice, and of 7 and then a different character.
+        assert_eq!(
+            check_static_token_shape(&format!("{base}{}", &base[..8])),
+            Err(Repeats)
+        );
+        assert_eq!(
+            check_static_token_shape(&format!("{base}{}~", &base[..7])),
+            Ok(())
+        );
+        // The same piece twice with something between.
+        assert_eq!(
+            check_static_token_shape(&format!("{base}!!{}", &base[4..12])),
+            Err(Repeats)
+        );
+        // 8 different characters in 40 that no piece repeats in, and 7.
+        for (alphabet, want) in [("kQzmVpWx", Ok(())), ("kQzmVpW", Err(TooFewDistinct))] {
+            // (Of 40 characters drawn from 8, one time in 25 misses one, and is 7: the first that is taken.)
+            let token = (0u64..)
+                .map(|seed| Rng(seed).text(40, alphabet))
+                .find(|t| want.is_err() || check_static_token_shape(t).is_ok())
+                .unwrap();
+            assert_eq!(
+                check_static_token_shape(&token),
+                want,
+                "{alphabet}: {token}"
+            );
+        }
+        // 39 decimal digits are worth 129 bits and 38 are worth 126; 32 hex digits are worth 128 and 31 are short.
+        for (digits, want) in [(38, Err(TooLittleEntropy)), (39, Ok(()))] {
+            let token = (0u64..)
+                .map(|seed| Rng(seed).text(digits, "0123456789"))
+                .find(|t| {
+                    let verdict = check_static_token_shape(t);
+                    verdict == Ok(()) || verdict == Err(TooLittleEntropy)
+                })
+                .unwrap();
+            assert_eq!(check_static_token_shape(&token), want, "{token}");
+        }
+        // The edge of every alphabet the estimate tells apart: what 32 characters of it are worth. Hex of one case
+        // is the one whose 32 characters are exactly enough; two cases of it are letters and digits.
+        let hex32 = "f450474c461f635bacde4cc71a4d10a9";
+        assert_eq!(check_static_token_shape(hex32), Ok(()));
+        assert_eq!(check_static_token_shape(&hex32.to_uppercase()), Ok(()));
+        assert_eq!(check_static_token_shape(&hex32[..31]), Err(TooShort));
+    }
+
+    /// The owner's own token has 48 characters and 15 different ones, and the rule the design gave the static
+    /// token refused it (the server would not start, and a desktop moved to `scoped` dropped it with a line in
+    /// its log). It is not their token in this test, only one of its kind.
+    #[test]
+    fn a_hex_token_of_48_characters_that_misses_one_digit_is_a_token_and_was_refused() {
+        // 48 hex digits made with no `e`: 15 different characters, 192 bits.
+        let token = "d812d74ba4c163bbf58d6fa2605b596946c9d50880c35500";
+        let mut seen: Vec<char> = token.chars().collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!((token.len(), seen.len()), (48, 15));
+        // The design's rule was 32 to 256 printable characters, at least 16 different: it refused this.
+        assert!(seen.len() < 16);
+        assert_eq!(check_static_token_shape(token), Ok(()));
+        // ... and it took this, which is 40 different characters that count up and are made of the word for
+        // one of the examples.
+        assert!(check_static_token_shape("abcdefghijklmnopqrstuvwxyz0123456789ABCD").is_err());
+    }
+
+    /// How often each of the tools that people make tokens with makes one that the rule takes. The design's rule
+    /// took about one `openssl rand -hex 24` in two, one `uuidgen` in three and one `-hex 16` in fourteen. The
+    /// words and runs the new rule looks for turn away about one hex token in five hundred, by chance and no more.
+    #[test]
+    fn what_the_tools_that_make_tokens_make_is_taken_nearly_every_time() {
+        const N: usize = 10_000;
+        for (name, make) in generators() {
+            let mut rng = Rng(0x0A1D_5EED ^ name.len() as u64);
+            let mut taken = 0;
+            let mut first_refused = None;
+            for _ in 0..N {
+                let token = make(&mut rng);
+                match check_static_token_shape(&token) {
+                    Ok(()) => taken += 1,
+                    Err(why) => {
+                        first_refused.get_or_insert((token, why));
+                    }
+                }
+            }
+            eprintln!("{name}: {:.2}% taken", 100.0 * taken as f64 / N as f64);
+            assert!(
+                taken * 1000 >= N * 995,
+                "{name}: {taken} of {N} taken; the first one refused: {first_refused:?}"
+            );
+        }
+    }
+
+    /// A second implementation of the rule, written from its description and not from the code: characters and
+    /// strings where the rule reads bytes, `f64` where it counts thousandths, a search for every piece where it
+    /// keeps a set.
+    fn reference_takes(token: &str) -> bool {
+        let chars: Vec<char> = token.chars().collect();
+        let n = chars.len();
+        if n < 32 || n > 256 || chars.iter().any(|c| !('!'..='~').contains(c)) {
+            return false;
+        }
+        let mut different = chars.clone();
+        different.sort_unstable();
+        different.dedup();
+        if different.len() < 8 {
+            return false;
+        }
+        let lower: String = token.to_lowercase();
+        for word in [
+            "change-me",
+            "changeme",
+            "password",
+            "secret",
+            "token",
+            "example",
+            "test",
+            "admin",
+            "default",
+            "xxxx",
+            "0000",
+            "1234",
+        ] {
+            if lower.contains(word) {
+                return false;
+            }
+        }
+        // Each character one step from the one before, eight in a row.
+        let mut run = 1;
+        for i in 1..n {
+            if (chars[i] as i32 - chars[i - 1] as i32).abs() == 1 {
+                run += 1;
+                if run >= 8 {
+                    return false;
+                }
+            } else {
+                run = 1;
+            }
+        }
+        // Six in a row along a row of the keyboard, either way.
+        let lower_chars: Vec<char> = lower.chars().collect();
+        for row in ["qwertyuiop", "asdfghjkl", "zxcvbnm"] {
+            let forward: Vec<char> = row.chars().collect();
+            let backward: Vec<char> = row.chars().rev().collect();
+            for start in 0..=(n - 6) {
+                let piece = &lower_chars[start..start + 6];
+                for line in [&forward, &backward] {
+                    if (0..=(line.len() - 6)).any(|s| &line[s..s + 6] == piece) {
+                        return false;
+                    }
+                }
+            }
+        }
+        // A piece of eight that occurs at two places.
+        for a in 0..=(n - 8) {
+            for b in (a + 1)..=(n - 8) {
+                if chars[a..a + 8] == chars[b..b + 8] {
+                    return false;
+                }
+            }
+        }
+        // The alphabet: what is left when the `=` at the end is off.
+        let mut end = n;
+        while end > 0 && chars[end - 1] == '=' {
+            end -= 1;
+        }
+        let body = &chars[..end];
+        let padded = end < n;
+        let all = |f: &dyn Fn(char) -> bool| !body.is_empty() && body.iter().all(|c| f(*c));
+        let size: f64 = if !padded && all(&|c| c.is_ascii_digit()) {
+            10.0
+        } else if !padded
+            && (all(&|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+                || all(&|c| c.is_ascii_digit() || ('A'..='F').contains(&c)))
+        {
+            16.0
+        } else if all(&|c| c.is_ascii_uppercase() || ('2'..='7').contains(&c)) {
+            32.0
+        } else if !padded && all(&|c| c.is_ascii_alphanumeric()) {
+            62.0
+        } else if all(&|c| c.is_ascii_alphanumeric() || c == '+' || c == '/')
+            || (!padded && all(&|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        {
+            64.0
+        } else {
+            94.0
+        };
+        // Whole thousandths of a bit, as the rule counts them, so that the two agree at the edge.
+        (n as f64 * (size.log2() * 1000.0).floor()) >= 128_000.0
+    }
+
+    /// A token that a generator made, and then what a person might do to it.
+    fn tampered(rng: &mut Rng, gens: &[(&'static str, fn(&mut Rng) -> String)]) -> String {
+        let mut t = (gens[rng.below(gens.len())].1)(rng);
+        let pieces = [
+            "change-me",
+            "Password",
+            "SECRET",
+            "token",
+            "Example",
+            "test",
+            "admin",
+            "DEFAULT",
+            "xxxx",
+            "0000",
+            "1234",
+            "abcdefgh",
+            "HGFEDCBA",
+            "12345678",
+            "87654321",
+            "qwerty",
+            "POIUYT",
+            "asdfgh",
+            "mnbvcx",
+            "AbCdEfGhIj",
+        ];
+        for _ in 0..rng.below(3) {
+            let step = rng.below(9);
+            match step {
+                0 => {
+                    let cut = 8 + rng.below(t.len().max(9) - 8);
+                    t.truncate(cut);
+                }
+                1 => {
+                    let more = 1 + rng.below(6);
+                    t.push_str(&rng.text(more, PRINTABLE));
+                }
+                2 => {
+                    let at = rng.below(t.len() + 1);
+                    t.insert_str(at, pieces[rng.below(pieces.len())]);
+                }
+                3 => {
+                    if t.len() > 16 {
+                        let a = rng.below(t.len() - 8);
+                        let piece =
+                            t[a..a + 8 + rng.below((t.len() - a - 8).min(8) + 1)].to_string();
+                        t.push_str(&piece);
+                    }
+                }
+                4 => t = t.to_uppercase(),
+                5 => t = t.to_lowercase(),
+                6 | 7 => {
+                    let len = 30 + rng.below(30);
+                    t = rng.text(len, if step == 6 { "0123456789" } else { "abcd" });
+                }
+                _ => t.push_str(&"=".repeat(rng.below(4))),
+            }
+        }
+        t
+    }
+
+    /// The rule and a second implementation of it agree on 30,000 tokens made and mistreated as tokens are, and the
+    /// corpus holds enough of both answers for that to mean something.
+    #[test]
+    fn the_rule_and_a_second_implementation_of_it_agree_on_30000_tokens() {
+        let gens = generators();
+        let mut rng = Rng(0x7047_0C0D_E5EE_D001);
+        let (mut taken, mut refused) = (0, 0);
+        let mut by_reason: std::collections::BTreeMap<String, usize> = Default::default();
+        for i in 0..30_000 {
+            let token = tampered(&mut rng, &gens);
+            let verdict = check_static_token_shape(&token);
+            assert_eq!(
+                verdict.is_ok(),
+                reference_takes(&token),
+                "case {i}: {token:?}: the rule says {verdict:?}"
+            );
+            match verdict {
+                Ok(()) => taken += 1,
+                Err(why) => {
+                    refused += 1;
+                    *by_reason.entry(format!("{why:?}")).or_default() += 1;
+                }
+            }
+        }
+        eprintln!("30000 tokens: {taken} taken, {refused} refused: {by_reason:?}");
+        assert!(
+            taken > 5_000 && refused > 5_000,
+            "{taken} taken, {refused} refused"
+        );
+        for reason in [
+            "TooShort",
+            "TooFewDistinct",
+            "Placeholder",
+            "Sequential",
+            "Repeats",
+            "TooLittleEntropy",
+            "BadCharacter",
+        ] {
+            // (a token that a generator made has no bad character: the corpus does not test that one)
+            if reason != "BadCharacter" {
+                assert!(
+                    by_reason.get(reason).copied().unwrap_or(0) > 50,
+                    "{reason}: {by_reason:?}"
+                );
+            }
         }
     }
 
@@ -791,9 +1455,9 @@ mod tests {
         // Outside the strict bearer rule (`[A-Za-z0-9._~+/=-]`, 128 bytes) and inside the static token's
         // (`[\x21-\x7e]{32,256}`): a `$` and a `!`, 129 and 256 characters, every punctuation mark.
         let with_dollar = "Sup3r$ecret!Zq7kLm9VbNw2XyHdFg5!ab".to_string();
-        let long_129: String = printable(129);
-        let long_256: String = printable(256);
-        let marks: String = format!("{}\"'(){{}}[]<>|^`,;:@#%&*?\\", printable(20));
+        let long_129: String = wide(129);
+        let long_256: String = wide(256);
+        let marks: String = format!("{}\"'(){{}}[]<>|^`,;:@#%&*?\\", wide(32));
         for token in [with_dollar, long_129, long_256, marks] {
             assert_eq!(check_static_token_shape(&token), Ok(()), "{token}");
             let header = format!("Bearer {token}");
@@ -808,7 +1472,7 @@ mod tests {
                 "{token}"
             );
             // Configured with nothing, or another token of the same shape: the strict rule's refusal.
-            let other = printable(40);
+            let other = wide(40);
             for configured in [None, Some(other.as_str())] {
                 assert!(
                     matches!(
@@ -870,7 +1534,7 @@ mod tests {
             bearer_or_static(&[b"Bearer ab$cd"], Some(short)),
             Err(BearerError::BadCharset)
         );
-        let too_long = format!("{}$", printable(256));
+        let too_long = format!("{}$", wide(256));
         let header = format!("Bearer {too_long}");
         assert_eq!(
             bearer_or_static(&[header.as_bytes()], Some(&too_long)),

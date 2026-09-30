@@ -32,7 +32,7 @@ use crate::secret_file::testing::TempDir;
 
 const T0: u64 = 1_790_000_000_000;
 const DAY: u64 = 86_400_000;
-const STATIC_TOKEN: &str = "abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+const STATIC_TOKEN: &str = "Vl0JTnJtFseAe9ePKCDhuBymfRXQ8osZ-QMlM86leCU";
 const DESK_ORIGIN: &str = "tauri://localhost";
 
 /// The routes of the table that are real handlers (`api.rs`): the stub leaves them to it.
@@ -524,7 +524,7 @@ async fn t1_the_environment_token_is_the_cli_preset_on_every_install_and_never_m
     assert_eq!(
         go(
             &e,
-            send(Method::GET, "/api/config").bearer("abcdefghijklmnopqrstuvwxyz0123456789ABCE")
+            send(Method::GET, "/api/config").bearer("Vl0JTnJtFseAe9ePKCDhuBymfRXQ8osZ-QMlM86leCV")
         )
         .await
         .code()
@@ -2580,17 +2580,35 @@ async fn y21_the_health_probe_is_exempt_from_the_host_check_for_get_and_head_of_
 
 // ============================= F4: the static token in the shape the design gives it ==============
 
-/// Tokens of the static token's shape (`[\x21-\x7e]{32,256}`, 16 different characters) that the strict bearer
-/// rule (`[A-Za-z0-9._~+/=-]`, 128 bytes) alone would refuse.
+/// `len` printable characters that the static token rule takes: the first of a seeded xorshift series that it does.
+fn random_printable(len: usize) -> String {
+    for seed in 1u64.. {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ len as u64;
+        let token: String = (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (0x21 + (x % 94) as u8) as char
+            })
+            .collect();
+        if super::token::check_static_token_shape(&token).is_ok() {
+            return token;
+        }
+    }
+    unreachable!()
+}
+
+/// Tokens the static token rule takes (32 to 256 printable characters worth 128 bits, no pattern) that the strict
+/// bearer rule (`[A-Za-z0-9._~+/=-]`, 128 bytes) alone would refuse.
 fn wide_static_tokens() -> Vec<(&'static str, String)> {
-    let printable = |len: usize| -> String { ('!'..='~').cycle().take(len).collect() };
     vec![
         (
-            "36 characters with a dollar sign and an exclamation mark",
+            "32 characters with a dollar sign and an exclamation mark",
             "Sup3r$ecret!Zq7kLm9VbNw2XyHdFg5!".to_string(),
         ),
-        ("129 characters", printable(129)),
-        ("256 characters", printable(256)),
+        ("129 characters", random_printable(129)),
+        ("256 characters", random_printable(256)),
     ]
 }
 
@@ -2654,7 +2672,13 @@ async fn f4_a_static_token_that_fails_the_shape_rule_is_ignored_where_the_new_gu
     // "ignored with a warning" in every other embedding: the desktop's guard in `scoped` and `shadow` drops the
     // token. In `legacy`, which changes nothing for the routes that existed before the model, the token stays
     // what it was (a bearer; the new routes take it as the `cli` preset), and a line says what will change.
-    for token in ["short", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "change-me"] {
+    for token in [
+        "short",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "change-me",
+        // What the design's rule took, and what the fixtures of this module were: 40 different characters that count.
+        "abcdefghijklmnopqrstuvwxyz0123456789ABCD",
+    ] {
         assert!(
             super::token::check_static_token_shape(token).is_err(),
             "{token} fails the shape rule"

@@ -58,7 +58,7 @@ if (!serverBin) {
 }
 
 const FORBIDDEN = new Set([17972, 17872, 17973, 7860, 8080, 9333, 17880]);
-const TOKEN = 'e2e-exposure-token-0123456789ABCDEF';
+const TOKEN = '2O2F3TZaWxe3KiwGqm4mU-HyY2uZ9KF87R-mAxKcyxM';
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'oaiy-e2e-exposure-'));
 
 // The opt-in of the checks that need a listener that is not loopback.
@@ -509,10 +509,22 @@ await scenario('T45 a weak static token stops the server with exit 78, a good on
   const weak = await startServer('t45-weak-token', { OAIY_SERVER_TOKEN: 'change-me' }, { expectExit: true });
   eq(weak.exitCode, 78, 'exit 78');
   ok(weak.stderr().includes('OAIY_SERVER_TOKEN') && !weak.stderr().includes('change-me'), 'names the variable, never the value', weak.stderr());
-  const good = await startServer('t45-good-token', { OAIY_SERVER_TOKEN: TOKEN });
-  const r = await request({ port: good.port, pathname: '/api/auth/whoami', headers: { host: `127.0.0.1:${good.port}`, authorization: `Bearer ${TOKEN}` } });
-  eq([r.status, r.json?.kind], [200, 'static'], 'the static token is the cli preset');
-  await good.stop();
+  // 40 different characters that count up: the shape of design 4.1 took it, and the rule now does not.
+  const counting = await startServer('t45-counting-token', { OAIY_SERVER_TOKEN: 'abcdefghijklmnopqrstuvwxyz0123456789ABCD' }, { expectExit: true });
+  eq(counting.exitCode, 78, 'a token that counts is refused');
+  ok(!counting.stderr().includes('random hex'), 'and the line no longer says that hex is too poor', counting.stderr());
+  // A token of the kinds that people make (each refused by the old rule about as often as it is said): started, and the cli preset.
+  for (const [name, token] of [
+    ['t45-good-token', TOKEN],
+    // `openssl rand -hex 24`: 48 characters and, this once, 15 different (the shape rule of design 4.1 refused about one in two)
+    ['t45-hex-token', 'd812d74ba4c163bbf58d6fa2605b596946c9d50880c35500'],
+    ['t45-base64-token', 'zkwdexEjP8A727+Q2moKCafq4F2IVlZbLJOseRU8Ric='],
+  ]) {
+    const good = await startServer(name, { OAIY_SERVER_TOKEN: token });
+    const r = await request({ port: good.port, pathname: '/api/auth/whoami', headers: { host: `127.0.0.1:${good.port}`, authorization: `Bearer ${token}` } });
+    eq([r.status, r.json?.kind], [200, 'static'], `the static token ${name} is the cli preset`);
+    await good.stop();
+  }
 });
 
 // A bearer from a public peer on a lan listener: needs a source address that is public, so only where this machine has one.
