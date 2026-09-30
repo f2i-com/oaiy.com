@@ -34,7 +34,9 @@ import { TOOLS } from './agent/tools';
 import type { SessionTool, ToolHook } from './agent/agent';
 import { editPhone } from './ui/phone';
 import { startTheme } from './ui/theme';
-import { OAIY_ORIGIN, discoverOaiy, mediaAbilities, mergeDiscovered, originOf } from './agent/media';
+import { discoverOaiy, mediaAbilities, mergeDiscovered, originOf } from './agent/media';
+import { whereToFollow, whereToLook } from './agent/lookup';
+import { readHost } from '@oaiy/shared/capabilities/host';
 import { budgetFor, contextWindow, detectContextWindow, formatTokens } from './agent/context';
 import { ChatPane } from './ui/chat';
 import { clear, h } from './ui/dom';
@@ -108,6 +110,8 @@ if (IN_OAIY) document.documentElement.classList.add('in-oaiy');
 // Light or dark: OAIY's (the dashboard's choice), or the system's.
 startTheme(IN_OAIY);
 const DESKTOP = IN_OAIY || location.hostname === 'botcomputer.localhost' || location.protocol === 'botcomputer:' || '__TAURI_INTERNALS__' in window;
+// Which window this is, for what the page may look at (see agent/lookup.ts): only OAIY's own windows and the desktop shell look for OAIY on their own.
+const HOST = readHost();
 // The browser offers to install the app as the page loads: listened for here, before anything is awaited. Never in OAIY's own window.
 const install = startInstall(window, DESKTOP);
 
@@ -1555,13 +1559,15 @@ A project can hold several apps, each in its own folder (any folder whose manife
   /**
    * OAIY on this computer: read its discovery document and set up images,
    * video and chat from it. A service set up by hand is left alone; one found
-   * before is refreshed (its models may have changed). `?OAIY=<address>` looks
+   * before is refreshed (its models may have changed). `?oaiy=<address>` looks
    * somewhere else; automated browsers (the tests) only look when asked to.
+   * Where the page looks on its own is decided in agent/lookup.ts: OAIY's own
+   * windows at OAIY's usual address, a tab in a browser only at an OAIY it
+   * found before (Settings → Find OAIY looks whenever it is pressed).
    */
   async function lookForOaiy(): Promise<void> {
-    const asked = new URLSearchParams(location.search).get('oaiy');
-    const where = asked ?? (navigator.webdriver ? null : media.discovered?.origin ?? OAIY_ORIGIN);
-    if (!where || (media.baseUrl && !media.discovered && !asked)) return;
+    const where = whereToLook({ host: HOST, asked: new URLSearchParams(location.search).get('oaiy'), discovered: media.discovered?.origin, setByHand: !!media.baseUrl && !media.discovered });
+    if (!where) return;
     const found = await discoverOaiy(where, media.apiKey, undefined, 3000).catch(() => null);
     if (!found || found.state === 'absent') return;
     if (found.state !== 'found') {
@@ -1626,8 +1632,9 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
 
   // What Engines has chosen is looked at again now and then (it may be changed there at any time).
   setInterval(() => {
-    if (!providers.some((p) => p.followEngine) || navigator.webdriver) return;
-    const origin = media.discovered?.origin ?? OAIY_ORIGIN;
+    if (!providers.some((p) => p.followEngine)) return;
+    const origin = whereToFollow({ host: HOST, discovered: media.discovered?.origin });
+    if (!origin) return;
     void discoverOaiy(origin, media.apiKey, undefined, 3000).then((found) => {
       if (found.state === 'found') followEngine(found);
     }).catch(() => {});

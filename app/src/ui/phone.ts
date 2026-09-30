@@ -34,7 +34,7 @@ export interface PhoneDialog {
 export async function editPhone(options: PhoneDialog): Promise<MessageSettings | null> {
   let desktop = options.desktop;
   const phone = options.phone !== false;
-  const status = h('p.muted', options.given ? (phone ? "This is OAIY's own window: texts and calls to the phone come here." : "This is OAIY's own window: it is OAIY Desktop's.") : 'Looking for OAIY Desktop…');
+  const status = h('p.muted', options.given ? (phone ? "This is OAIY's own window: texts and calls to the phone come here." : "This is OAIY's own window: it is OAIY Desktop's.") : `Looking for OAIY Desktop at ${desktop?.origin ?? DESKTOP_ORIGIN}. This page reaches out to your computer only from here, so your browser may ask whether it may connect to your network: that is this.`);
   const code = h('div.pair-code');
   code.hidden = true;
   let pairing: AbortController | null = null;
