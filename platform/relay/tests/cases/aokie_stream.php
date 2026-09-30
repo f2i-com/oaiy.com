@@ -165,7 +165,7 @@ test('4.14.5 with nothing to say a stream writes a keepalive comment every 2 sec
 });
 
 test('4.14.5 a burst is coalesced: 60 frames posted one after another while a stream waits arrive in order, none twice, none missing', function () {
-    [$k, $a, $b, $plug, $ta] = aok_pair(['wait' => ['max' => 3]]);
+    [$k, $a, $b, $plug, $ta] = aok_pair(['wait' => ['max' => 20]]); // long enough for 60 posts on a slow database; the read stops at frame 60
     [$srv] = $k->r->fleet(1);
     usleep(300000);
     $p = aks_open($srv, $plug);
@@ -173,11 +173,14 @@ test('4.14.5 a burst is coalesced: 60 frames posted one after another while a st
     for ($i = 1; $i <= 60; $i++) {
         eq(200, $k->send($ta, 'plugin', [['i' => $i]])['status']);
     }
-    $res = aks_finish($p, 8.0);
-    $frames = aks_frames($res['body']);
+    ok(aks_until($p, "id: 60\nevent: frame", 15.0) !== null, 'the last frame arrived');
+    $raw = $p->received();
+    $p->abort();
+    $body = substr($raw, (int)strpos($raw, "\r\n\r\n") + 4);
+    $frames = aks_frames($body);
     eq(range(1, 60), array_keys($frames));
     eq(range(1, 60), array_map(fn($f) => $f['frame']['i'], array_values($frames)));
-    eq(60, substr_count($res['body'], "event: frame\n"));
+    eq(60, substr_count($body, "event: frame\n"));
 });
 
 test('4.14.5 a stream serves at most 128 frames per read and goes on reading: 200 frames waiting when it opens are all delivered, once, in order', function () {
