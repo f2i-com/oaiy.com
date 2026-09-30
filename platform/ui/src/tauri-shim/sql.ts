@@ -13,9 +13,9 @@
  * BUT that VFS needs synchronous file handles, which a browser gives only to a
  * Worker. On the main thread, where this runs, `installOpfsSAHPoolVfs` throws
  * ("Missing required OPFS APIs", checked in Chromium 148), `getEnv` falls back
- * to in-memory SQLite, and what a flow stores is gone with the tab. The Data
- * page says so in a tab (shared/capabilities: `dataSessionOnly`). Running SQLite in a
- * Worker is what makes it persistent.
+ * to in-memory SQLite, and what a flow stores is gone with the page. The Data
+ * page says so, in a tab and in OAIY's window alike (both run this build). Running
+ * SQLite in a Worker is what makes it persistent.
  *
  * The desktop API surface we replicate is small:
  *   Database.load(conn) → .execute(sql, params) → { rowsAffected, lastInsertId }

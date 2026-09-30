@@ -1573,7 +1573,8 @@ A project can hold several apps, each in its own folder (any folder whose manife
   /**
    * OAIY on this computer: read its discovery document and set up images,
    * video and chat from it. A service set up by hand is left alone; one found
-x
+   * before is refreshed (its models may have changed).
+   *
    * Where the page looks on its own is decided in agent/lookup.ts: OAIY's own
    * windows at OAIY's usual address, a tab in a browser only at an OAIY it
    * found before (Settings → Find OAIY looks whenever it is pressed).
