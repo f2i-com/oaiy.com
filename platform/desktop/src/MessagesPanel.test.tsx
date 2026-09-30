@@ -67,7 +67,7 @@ beforeEach(() => {
   document.body.appendChild(host);
   root = createRoot(host);
   stored = [
-    message({ id: 'msg_b', at: '2026-09-30T03:00:00Z', name: 'Sam', from: '+61491570156', callback: '0412 345 678', message: 'The gate is <b>jammed</b>.', urgency: 'urgent' }),
+    message({ id: 'msg_b', at: '2026-09-30T03:00:00Z', name: 'Sam', from: '+61491570156', callback: '0491 570 006', message: 'The gate is <b>jammed</b>.', urgency: 'urgent' }),
     message({ id: 'msg_a', at: '2026-09-29T09:00:00Z', name: 'Alex', state: 'seen', seenAt: '2026-09-29T10:00:00Z' }),
     message({ id: 'msg_c', at: '2026-09-28T09:00:00Z', from: '', callback: '', name: '', message: 'They did not say who.', wantsCallback: false, state: 'handled', handledAt: '2026-09-28T10:00:00Z', handledBy: 'owner' }),
   ];
@@ -94,8 +94,8 @@ describe('Messages', () => {
     expect(sam.querySelector('.message-who')?.textContent).toBe('Sam');
     expect(sam.textContent).toContain('Urgent');
     expect(sam.textContent).toContain('New');
-    expect(sam.querySelector('a.message-number')?.textContent).toContain('0412 345 678');
-    expect(sam.querySelector('a.message-number')?.getAttribute('href')).toBe('tel:0412345678');
+    expect(sam.querySelector('a.message-number')?.textContent).toContain('0491 570 006');
+    expect(sam.querySelector('a.message-number')?.getAttribute('href')).toBe('tel:0491570006');
     // No name given: their number, written the way people read it.
     expect(whoOf(message({ id: 'x', from: '+61491570006' }))).toBe('0491 570 006');
     expect(whoOf(message({ id: 'x', from: '', name: '' }))).toBe('A caller who hid their number');
