@@ -7168,6 +7168,7 @@ fn providers_and_a_media_service_with_keys() -> serde_json::Value {
             { "id": "number", "type": "custom", "name": "Number", "apiKey": "K-number", "baseUrl": 7 },
             { "id": "vendor", "type": "openai", "name": "Vendor", "apiKey": "K-vendor" },
             { "id": "blank", "type": "openai", "name": "Blank", "apiKey": "K-blank", "baseUrl": "" },
+            { "id": "null", "type": "openai", "name": "Null", "apiKey": "K-null", "baseUrl": null },
             { "id": "ok", "type": "custom", "name": "Fine", "apiKey": "K-ok", "baseUrl": "https://ok.example/v1?api-version=2024-02-01" }
         ],
         "media": { "baseUrl": "https://bob:pw@media.example/v1", "apiKey": "K-media", "enabled": true }
@@ -7189,6 +7190,8 @@ fn a_key_is_left_out_with_the_address_it_was_for_when_that_address_does_not_come
     }
     assert_eq!(key_and_address_of(&found.value, "vendor"), (Some("K-vendor".into()), None), "no address: the vendor's own, and its key stays");
     assert_eq!(key_and_address_of(&found.value, "blank"), (Some("K-blank".into()), None), "an empty address is no address");
+    // A JSON null is no address either: the table says nothing of a key with nothing in it, the page reads a provider whose address is null as the vendor's own (it takes `baseUrl?.trim() || the default`), and a key for the vendor's own stays. It is not refused as a value of the wrong kind.
+    assert_eq!(key_and_address_of(&found.value, "null"), (Some("K-null".into()), None), "a null address is no address");
     assert_eq!(key_and_address_of(&found.value, "ok"), (Some("K-ok".into()), Some("https://ok.example/v1?api-version=2024-02-01".into())));
     assert!(found.value["media"].get("apiKey").is_none() && found.value["media"].get("baseUrl").is_none(), "the media service too: {}", found.value["media"]);
     assert_eq!(found.value["media"]["enabled"], true);
@@ -7199,11 +7202,7 @@ fn a_key_is_left_out_with_the_address_it_was_for_when_that_address_does_not_come
     let unticked = filter_json(keys, &providers_and_a_media_service_with_keys(), &|row| !row.secret);
     assert!(unticked.left.iter().all(|l| l.why != Why::KeyWithoutAddress));
     assert!(unticked.value["providers"].as_array().unwrap().iter().all(|p| p.get("apiKey").is_none()));
-    // Only a secret goes with an address, and only with one that is in the table.
-    let table = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/backup/table.json")).unwrap();
-    assert!(super::table::Table::parse(&table.replace("\"goesWith\": \"baseUrl\", \"what\": \"The media service's API key\"", "\"goesWith\": \"nowhere\", \"what\": \"The media service's API key\"")).err().expect("a table that does not hold together does not load").contains("goes with \"media.nowhere\""));
-    assert!(super::table::Table::parse(&table.replace("\"goesWith\": \"baseUrl\", \"what\": \"The media service's API key\"", "\"goesWith\": \"enabled\", \"what\": \"The media service's API key\"")).err().expect("a table that does not hold together does not load").contains("goes with \"media.enabled\""));
-    assert!(super::table::Table::parse(&table.replace("\"secret\": true, \"goesWith\": \"baseUrl\", \"what\": \"The media service's API key\"", "\"goesWith\": \"baseUrl\", \"what\": \"The media service's API key\"")).err().expect("a table that does not hold together does not load").contains("only a secret goes with an address"));
+    // (Only a secret goes with an address, and only with one that is in the table: the table's own test, in table_tests.rs, holds the loader to it.)
 }
 
 #[test]
@@ -7228,6 +7227,7 @@ fn a_restore_with_the_keys_box_brings_no_key_for_an_address_it_refuses_and_says_
     }
     assert_eq!(key_and_address_of(&handed, "vendor").0.as_deref(), Some("K-vendor"));
     assert_eq!(key_and_address_of(&handed, "ok").0.as_deref(), Some("K-ok"));
+    assert_eq!(key_and_address_of(&handed, "null"), (Some("K-null".into()), None), "a null address is the vendor's own, and its key comes");
     assert!(handed["media"].get("apiKey").is_none() && handed["media"].get("baseUrl").is_none(), "{}", handed["media"]);
     let notes = restore::last_restore(&dst.0).unwrap().notes;
     assert!(notes.iter().any(|n| n.starts_with("6 API keys of the Agent's were left out: their addresses do not come back") && n.contains("Enter them again as the key of their providers")), "{notes:?}");

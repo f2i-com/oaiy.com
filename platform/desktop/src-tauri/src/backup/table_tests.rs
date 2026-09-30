@@ -88,6 +88,44 @@ fn a_table_that_does_not_hold_together_does_not_load() {
     .is_some(), "a key that comes back needs a container that comes back");
 }
 
+/// A secret that goes with an address (`goesWith`: its key is left out when its address is refused) names one that is there: a key beside
+/// it, of the type `url`, that comes back; and only a secret goes with one. The loader says so, so that a key cannot be put in the table
+/// that goes with nothing and is then never left out. (This is the table's own test: it needs no restore to run.)
+#[test]
+fn a_secret_that_goes_with_an_address_names_an_address_that_is_in_the_table() {
+    let says = |edit: &dyn Fn(&mut Value), needle: &str| {
+        let mut v: Value = serde_json::from_str(TABLE_JSON).unwrap();
+        edit(&mut v);
+        let why = Table::parse(&v.to_string()).err().unwrap_or_else(|| panic!("a table that goes wrong loads: {needle}"));
+        assert!(why.contains(needle), "{needle:?} is said: {why}");
+    };
+    fn key<'a>(v: &'a mut Value, path: &str) -> &'a mut Value {
+        v["keyTables"]["agent.settings"]["keys"].as_array_mut().unwrap().iter_mut().find(|k| k["path"] == path).unwrap_or_else(|| panic!("{path}"))
+    }
+    // As it is: the key of a provider and of the media service go with their addresses.
+    let keys = table().key_table("agent.settings").unwrap();
+    for path in ["providers[].apiKey", "media.apiKey"] {
+        assert_eq!(keys.row(path).unwrap().goes_with.as_deref(), Some("baseUrl"), "{path}");
+    }
+    assert!(keys.keys.iter().filter(|k| k.goes_with.is_some()).all(|k| k.secret), "only a secret goes with an address");
+    says(&|v| key(v, "media.apiKey")["goesWith"] = json!("nowhere"), "\"media.apiKey\" goes with \"media.nowhere\", which is not an address that comes back");
+    says(&|v| key(v, "media.apiKey")["goesWith"] = json!("enabled"), "goes with \"media.enabled\", which is not an address that comes back");
+    says(&|v| key(v, "providers[].apiKey")["goesWith"] = json!("name"), "goes with \"providers[].name\", which is not an address that comes back");
+    says(
+        &|v| {
+            let k = key(v, "media.baseUrl").as_object_mut().unwrap();
+            for gone in ["tick", "type", "maxChars"] {
+                k.remove(gone);
+            }
+            k.insert("class".into(), json!("excluded"));
+            k.insert("reason".into(), json!("Left out for this test."));
+        },
+        "goes with \"media.baseUrl\", which is not an address that comes back",
+    );
+    says(&|v| { key(v, "media.apiKey").as_object_mut().unwrap().remove("secret"); }, "only a secret goes with an address");
+    says(&|v| key(v, "media.enabled")["goesWith"] = json!("baseUrl"), "only a secret goes with an address");
+}
+
 // ---- globs ------------------------------------------------------------------------------------------
 
 #[test]
