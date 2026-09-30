@@ -200,22 +200,39 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
   class the local address has (the class of `POST /api/bridge/runs` and `POST /api/voice/calls/{id}/say`; the
   updater's install is stricter only because it is a Tauri command that checks the webview's label, not a route;
   these routes are mounted by the same `serve` in `http.rs` that the headless server uses, where there is no window to
-  check). A web page is refused, a
-  caller with no origin is refused, and a headless server takes the token alone; what is let in is the window's own
-  origin, `oaiy.com` and (debug builds only) any loopback page, or a bearer that is the configured, the internal or
-  a paired token. Plugins are not handed the internal token. So a program on this computer that sends the window's
-  origin, or that has been paired, can turn transfers on: it can equally run a flow, which is why the Transfers
-  page says so. `ring/routes.rs` tests hold the routes to that gate (a stranger, the token, the window). That is the
-  guard of `legacy` access mode, which the routes keep: each has a row in the access model's table
-  (`auth/routes.rs`, `since: 1`), so `scoped` mode judges it by scope, and the differential test of the legacy guard
-  compares both on them. A row is `calls.read` for what reads callers' words and numbers or the owner's settings
-  (`GET /api/messages`, `/api/messages/{id}`, `/api/ring/settings`, `/api/ring/preview`, `/api/ring/active`, the scope of
-  the call events and the calls list) and `calls.write` for what acts on them (`PATCH` and `DELETE /api/messages/{id}`,
-  `PUT /api/ring/settings`, `POST /api/ring/active/{id}/respond`, `POST /api/ring/notices/{id}/dismiss` and the
-  receptionist's `POST /api/voice/calls/{id}/message`, as `say` and `finish` are). The `agent` and `owner` presets hold
-  both, the interim `companion` preset the reads, and no other preset either; none is a dangerous scope, and none takes
-  a call to the owner, which only the Companion does. The CORS layer of each mode allows every method the pages send
-  to them, `PATCH` and `DELETE` included (in `scoped` mode to a page that has paired, and to no other).
+  check). A web page is refused, a caller with no origin is refused, and a headless server takes the token alone;
+  what is let in is the window's own origin, `oaiy.com` and (debug builds only) any loopback page, or a bearer that is
+  the configured, the internal or a paired token. Plugins are not handed the internal token. That is the guard of
+  `legacy` access mode (the default), which the routes keep, and in it a program on this computer that sends the
+  window's origin, or that has been paired, can turn transfers on: whoever passes that guard is the owner, so it can
+  equally run a flow, which is why the Transfers page says so. `ring/routes.rs` tests hold the routes to that gate
+  (a stranger, the token, the window).
+
+  In `scoped` access mode each of the routes is judged by scope instead (each has a row in the access model's table,
+  `auth/routes.rs`, `since: 1`, and the differential test of the legacy guard compares that guard on them), and a
+  paired program is not the owner: it holds the scopes of the preset it was paired with.
+  - `calls.read` reads what callers said and their numbers: `GET /api/messages`, `/api/messages/{id}`,
+    `/api/ring/preview` and `/api/ring/active`, the scope of the call events and the calls list.
+  - `calls.write` is the receptionist's own `POST /api/voice/calls/{id}/message`, as `say` and `finish` are.
+  - `calls.manage` acts on what callers left and on the rings: `PATCH` and `DELETE /api/messages/{id}`,
+    `POST /api/ring/active/{id}/respond` (decline, or a message instead) and `POST /api/ring/notices/{id}/dismiss`. The
+    owner holds it, and so does a phone that may control a call (the relay's call-control tier); the Agent page does not.
+  - `calls.settings` reads and changes the owner's transfer settings (`GET` and `PUT /api/ring/settings`: whether
+    transfers are on, whom they may be put through to, the VIP numbers, the quiet hours, which Companions ring). Only the
+    owner holds it (and the relay's admin tier, with a confirmed step-up), so a page that may be untrusted cannot turn
+    transfers on, name a VIP number or silence the owner's phones; it is why `agent.settings` is off the Agent page's
+    preset too.
+
+  So the `agent` preset (the Agent page, or a hosted web Agent paired to this computer) reads the messages and the
+  rings and keeps the message the receptionist takes, and nothing more of these routes; the interim `companion` preset
+  reads the messages, the preview and the rings; and a paired program cannot turn transfers on, nor run a flow of its
+  own (a flow runs only once it is approved, and approving takes `flows.approve`, which is dangerous and on no token but
+  a native one minted with the owner's elevation). The Transfers page's warning that a paired program can change these
+  settings is the `legacy` mode's, and does not yet know the mode. No scope of these is dangerous, and none takes a
+  call to the owner, which only the Companion does. Who marked a message
+  is recorded from the credential that asked ("owner" for the owner's own; "pat: <label>" for a paired app), and a name
+  in the request's body is refused. The CORS layer of each mode allows every method the pages send to them, `PATCH` and
+  `DELETE` included (in `scoped` mode to a page that has paired, and to no other).
 - **What the model is told.** The instructions and the tool list follow the owner's settings, not the
   call, so they are the same for every call and caller and the engine's prompt cache holds them (with
   the settings off, they are byte for byte what they were). Whether the owner can be rung on *this*
