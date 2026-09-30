@@ -90,11 +90,14 @@ export function createStore(db: Db, vault: ListableVault, env: StoreEnv): Provid
       if (previous && movesKey(previous, checked.record) && (await vault.names()).includes(providerKeyName(id)) && !key) {
         return { ok: false, code: 'retype-key', message: 'You changed where this provider is. Type its key again to save: a saved key is never sent somewhere new without it.' };
       }
+      // The key is written first (a record with no key behind it is the worse half-way state), and put back as it was if the record
+      // cannot be written: a new key must not be left pointing at the address the record still has.
+      const before = key && previous ? ((await vault.get([providerKeyName(id)]))[providerKeyName(id)] ?? '') : '';
       if (key) await vault.set(providerKeyName(id), key);
       try {
         await db.put('records', id, checked.record);
       } catch (e) {
-        if (key && !previous) await vault.set(providerKeyName(id), '').catch(() => {});
+        if (key) await vault.set(providerKeyName(id), before).catch(() => {});
         throw e;
       }
       changed();
