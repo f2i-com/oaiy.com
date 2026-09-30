@@ -6301,6 +6301,32 @@ fn a_finalize_that_is_done_again_keeps_the_hand_over_it_already_made() {
     assert_eq!(fs::read(dir.join("agent-import").join("current.zip")).unwrap(), handed);
 }
 
+/// The same, when what waits for the page under the restore's id is not the archive that was staged (another archive of the same
+/// size): the page is given nothing, and the result says it was not handed over.
+#[test]
+fn a_hand_over_that_is_not_the_archive_that_was_staged_is_not_left_for_the_page() {
+    let src = TempDir::new("refinalize-other-src");
+    let out = TempDir::new("refinalize-other-out");
+    let file = backup_with_agent(&src.0, &out.0, "f.oaiybackup", agent_part(), false);
+    let dst = TempDir::new("refinalize-other-dst");
+    put(&dst.0, "callers.json", b"{\"contacts\":[]}");
+    let staged = restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
+    restore::INJECT.with(|c| c.set(Some(Inject::CrashAfterDone)));
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::None));
+    restore::INJECT.with(|c| c.set(None));
+    let dir = dst.0.join("restore");
+    let zip = dir.join(format!("pending-{}", staged.id)).join("agent-storage.zip");
+    // Someone left another archive of the very same size under the restore's id (and the staged copy is gone).
+    fs::write(&zip, same_size_other(&fs::read(&zip).unwrap())).unwrap();
+    agent::leave_for_page(&dst.0, &staged.id, "restore", &zip, true, true, &[]).unwrap();
+    assert!(agent::import_meta(&dst.0).pending && !zip.exists());
+    let ApplyOutcome::Applied(last) = restore::apply_pending(&dst.0) else { panic!("the restore is finished at the next start") };
+    assert_eq!(last.agent_storage, "failed", "{last:?}");
+    assert!(last.notes.iter().any(|n| n.contains("not handed to the Agent's page")), "{:?}", last.notes);
+    assert!(!agent::import_meta(&dst.0).pending, "the page is given nothing");
+    assert!(!dir.join("agent-import").join("current.zip").exists());
+}
+
 /// Put `value` at the path `parts` (`a[]` is the one element of the list `a`) in `node`.
 fn put_at(node: &mut serde_json::Value, parts: &[&str], value: &serde_json::Value) {
     let (name, in_list) = match parts[0].strip_suffix("[]") {

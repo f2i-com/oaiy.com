@@ -1614,6 +1614,10 @@ fn finalize(data_dir: &Path, marker: &Marker, applied: &[(String, bool)]) -> App
                     log::warn!("backup: the Agent's storage was not handed over: {why}");
                     notes.push(format!("{why}, so it was not handed to the Agent's page."));
                     agent_storage = "failed";
+                    // What waits for the page under this restore's id is then not the archive that was staged: it gets nothing.
+                    if agent::pending_import_id(data_dir).as_deref() == Some(marker.id.as_str()) {
+                        agent::drop_pending_import(data_dir);
+                    }
                 }
                 Ok(()) => match agent::leave_for_page(data_dir, &marker.id, &marker.kind, &zip, agent_marker.apply_settings, agent_marker.apply_keys, &agent_marker.remove) {
                     Ok(()) => agent_storage = "pending",
