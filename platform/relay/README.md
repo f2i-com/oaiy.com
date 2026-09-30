@@ -322,6 +322,12 @@ on) the relay does what FormLogic does for the shipped Aokie plugin and phone, s
   desktop's roster or revoking it ends its access at its next request and its held stream within a fraction of a second.
 - **Errors** on these routes have FormLogic's three members, `{"error":true,"code","message"}`, and a wait is the `Retry-After` header.
 
+The shipped plugin and phone are not unchanged clients in every respect. The relay works around what it can (a post to a phone that
+is gone is a success, a display name is cut to 120 bytes, frames are sent in ASCII, a request with no `supportedTransports` is read
+as `relay`), and the rest needs a change in them: a 403, 404 or 503 from any route makes the plugin re-bootstrap, `Retry-After` is
+ignored, a phone has no route to discover a personal relay, and the challenge's margin is narrow (`call.challenge_s`). The list is
+"Design defects" 9 and 10 in the [protocol README](../protocol/relay/v1/README.md).
+
 **TURN.** Put a coturn beside the relay (a phone on a carrier network needs it: the status page warns when none is configured) with
 `use-auth-secret`, `static-auth-secret=<the same string as turn.secret>` and a `realm`, and list its urls in `turn.urls`. Every
 admission carries a credential: `username = <expiry>:<opaque id>` (the expiry is rounded down to a window of a sixth of `turn.ttl`, at most 100 seconds, so one endpoint keeps one username, and one coturn `user-quota` key, for a window instead of getting a new one with every admission), `credential = base64(HMAC-SHA1(secret, username))`, the id a

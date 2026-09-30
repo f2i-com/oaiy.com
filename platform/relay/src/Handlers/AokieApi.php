@@ -22,7 +22,9 @@ defined('OAIY_RELAY') or exit;
 
 /**
  * The Aokie compatibility routes (section 4.14.4 and 4.14.5): the endpoint challenge, the frames mailbox and the framed
- * stream, reproducing FormLogic's contract so the shipped plugin and phone need no change to signal through the relay.
+ * stream, reproducing FormLogic's contract so the shipped plugin and phone signal through the relay. They are not unchanged
+ * clients in every respect: the protocol README lists what the relay works around (Interpretations 40, 46, 47 and 52) and what a
+ * client must still change (Design defects 9 and 10).
  *
  * Authentication is the admission bearer (Facade::identify): the party is only ever what the verified claims say (`plugin`, or
  * `mobile:<holder thumbprint>`), and every request re-reads the device row, so a revoked phone is 401 on its next request and
