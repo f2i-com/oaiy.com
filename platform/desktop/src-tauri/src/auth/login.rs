@@ -93,6 +93,23 @@ pub struct LoginOptions {
 }
 
 impl LoginOptions {
+    /// The real thing, from a configuration that passed the startup rules (`auth::exposure`): the dashboard's
+    /// origin, the host names and the login's address allow-list are as they were validated.
+    pub fn from_config(config: &super::exposure::Config, port: u16) -> LoginOptions {
+        // An empty environment names no `OAIY_LOGIN_ALLOW` to refuse: what was wrong with the real one was refused
+        // by the rules before this.
+        let mut options = LoginOptions::production(&|_| None, port)
+            .expect("an environment with no OAIY_LOGIN_ALLOW has no list to refuse");
+        options.dash_origin = config
+            .public_origins
+            .get(&App::Dash)
+            .cloned()
+            .unwrap_or_else(|| format!("http://dash.oaiy.localhost:{port}"));
+        options.hosts = config.public.keys().map(|h| h.display()).collect();
+        options.login_allow = config.login_allow.clone();
+        options
+    }
+
     /// The real thing, from the environment: `OAIY_PUBLIC_URL` and `OAIY_LOGIN_ALLOW` (a list with an entry that is
     /// not an address or a network is refused, see [`parse_login_allow`]).
     pub fn production(
@@ -1844,16 +1861,7 @@ async fn revoke_others(
 /// refused. The login needs the store on disk, which `legacy` never opens (it changes nothing under the data
 /// folder), and `legacy` trusts Origins: a server with a login has moved past that (design 4.5.5 rule 6).
 pub fn server_mode(value: Option<&str>) -> Result<AccessMode, ConfigRefusal> {
-    match value.map(str::trim).filter(|v| !v.is_empty()) {
-        None => Ok(AccessMode::Scoped),
-        Some(_) => match AccessMode::from_env(value)? {
-            AccessMode::Legacy => Err(ConfigRefusal(
-                "OAIY_ACCESS_MODE=legacy is refused by a server with the web login: use scoped (the default)"
-                    .into(),
-            )),
-            mode => Ok(mode),
-        },
-    }
+    super::exposure::mode_from_env(value, true).map_err(ConfigRefusal)
 }
 
 /// The period of the upkeep task: the throttle is written at most every five seconds when it changed.

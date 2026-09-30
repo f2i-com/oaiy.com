@@ -1392,11 +1392,14 @@ pub fn run() {
                 .and_then(|s| s.trim().parse::<u16>().ok())
                 .filter(|p| *p != 0)
                 .unwrap_or(DESKTOP_PORT);
-            let lan_access: bool = read_config_str(&app_for_dialog, "lanAccess")
-                .map(|s| s.trim() == "true")
-                .unwrap_or(false);
-            if lan_access {
-                log::warn!("lanAccess is on — the API will bind every interface on port {server_port}");
+            // The desktop never binds beyond loopback (design 4.5.5 rule 8, 10.3): `lanAccess` is ignored, and one
+            // line says so. Its Host allow-list is the loopback names on any port (`auth::host`), which is what a
+            // request to a loopback listener carries.
+            let (server_bind, lan_access_note) = crate::auth::exposure::desktop_bind(
+                read_config_str(&app_for_dialog, "lanAccess").as_deref(),
+            );
+            if let Some(note) = lan_access_note {
+                log::warn!("{note}");
             }
             // How the API judges requests: `legacy` (the default) keeps every route that existed before the
             // access model exactly as it was; `scoped` and `shadow` are the new guard. Read once, like the
@@ -1530,7 +1533,7 @@ pub fn run() {
                 );
                 if let Err(e) = http::serve(
                     server_port,
-                    lan_access,
+                    server_bind,
                     config_provider,
                     // GUI: webview-origin auth, plus an OPTIONAL bearer token
                     // (set OAIY_SERVER_TOKEN) so the CLI can drive this companion
