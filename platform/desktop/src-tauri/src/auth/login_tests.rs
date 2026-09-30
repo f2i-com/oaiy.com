@@ -3177,6 +3177,54 @@ async fn a_device_made_by_a_login_is_in_the_audit_log_by_its_id_and_never_by_its
     assert_eq!(after, before);
 }
 
+#[tokio::test]
+async fn a_password_change_says_in_the_audit_log_how_many_paired_tokens_it_revoked_in_words_that_are_not_redacted(
+) {
+    let e = env();
+    let owner = make_owner(&e, PASSWORD).await;
+    let b = browser_from(&e, &owner);
+    let (pat_a, pat_b) = (a_pat(&e), a_pat(&e));
+    let r = go(
+        &e,
+        as_page(&e, &b, Method::POST, "/api/auth/password").json(json!({
+            "current": PASSWORD,
+            "next": NEW_PASSWORD,
+            "revokeTokens": true
+        })),
+    )
+    .await;
+    assert_eq!(r.status, 204, "{}", r.text);
+    assert!(e.store.authenticate(&pat_a.token, None).is_err());
+    assert!(e.store.authenticate(&pat_b.token, None).is_err());
+    let events = audit_events(&e);
+    let changed = events
+        .iter()
+        .find(|x| x["event"] == "password.changed")
+        .expect("a password.changed");
+    let detail = &changed["detail"];
+    assert_eq!(detail["pairedRevoked"], 2, "{detail}");
+    assert_eq!(detail["devices"], 1);
+    assert!(
+        !detail.to_string().contains("redacted"),
+        "nothing in it is hidden by the redaction of a name that looks like a secret: {detail}"
+    );
+    // Without the request, none are revoked, and it says so.
+    let b2 = browser_from(&e, &login_as(&e, NEW_PASSWORD, "198.51.100.61").await);
+    let pat_c = a_pat(&e);
+    let r = go(
+        &e,
+        as_page(&e, &b2, Method::POST, "/api/auth/password")
+            .json(json!({ "current": NEW_PASSWORD, "next": PASSWORD })),
+    )
+    .await;
+    assert_eq!(r.status, 204, "{}", r.text);
+    assert!(e.store.authenticate(&pat_c.token, None).is_ok());
+    let second = audit_events(&e)
+        .into_iter()
+        .find(|x| x["event"] == "password.changed" && x["detail"]["pairedRevoked"] == 0)
+        .expect("the second change says none");
+    assert!(!second["detail"].to_string().contains("redacted"));
+}
 // ==================================== fuzzing =========================================================
 
 #[tokio::test]

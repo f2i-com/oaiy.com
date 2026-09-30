@@ -1299,6 +1299,12 @@ impl LoginState {
                 || r.kind == Kind::Run
                 || (tokens && r.kind == Kind::Pat)
         });
+        // How many paired tokens went with it, under a name the audit log's redaction does not take for a secret
+        // (a key that says `token` has its value hidden).
+        let paired = revoked
+            .iter()
+            .filter(|id| self.store().record(id).is_some_and(|r| r.kind == Kind::Pat))
+            .count();
         self.critical(
             "password.changed",
             Some(&principal.actor()),
@@ -1307,7 +1313,7 @@ impl LoginState {
                 host: Some(&info.host),
                 ua: None,
             },
-            json!({ "revoked": revoked.len(), "devices": devices.len(), "tokens": tokens }),
+            json!({ "revoked": revoked.len(), "devices": devices.len(), "pairedRevoked": paired }),
         ); // The browser's device is among those revoked: its cookie is no use, so it is dropped.
         let clear = CookieHost::of(&info).map(|c| c.clear_device());
         Ok(no_content(&clear.into_iter().collect::<Vec<_>>()))
