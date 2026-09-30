@@ -274,6 +274,30 @@ describe('a request to reach the owner', () => {
     }
   });
 
+  it('takes how a request came out even when this page never saw it ring: a session that took the call over is told, and so is the model', async () => {
+    // The line moved to a new session while a request was ringing: this page saw no `ringing` for it (it began in the session before), and the
+    // desktop tells it how it came out all the same.
+    const fake = fakeProvider('openai', [
+      (body) => {
+        expect(JSON.stringify(body.messages)).toContain(TRANSFER_NOTES.declined.replace(/"/g, '\\"'));
+        return { text: "I'm sorry, they can't come to the phone. Would you like to leave a message?" };
+      },
+    ]);
+    const { sessions, said } = setup();
+    await sessions.callEvent(ALLOWED);
+    const call = (await sessions.callEvent(START))!;
+    expect(call.transferRequest).toBeUndefined();
+    await sessions.callEvent({ type: 'call.transfer', callId: 'call_o', requestId: 'assist_9', outcome: 'declined', source: 'phone' });
+    await settled(sessions);
+    expect(fake.bodies).toHaveLength(1);
+    expect(said.join(' ')).toContain("I'm sorry, they can't come to the phone. Would you like to leave a message?");
+    expect(call.handingOver).toBe(false);
+    // ...and an acceptance for one it never saw ring stops the agent and says nothing more.
+    await sessions.callEvent({ type: 'call.transfer', callId: 'call_o', requestId: 'assist_10', outcome: 'accepted', source: 'phone' });
+    expect(call.handingOver).toBe(true);
+    expect(lastUser(call.agent.turns)?.text).toBe(TRANSFER_NOTES.accepted);
+  });
+
   it('the owner’s own words for the caller are relayed as words, with no promise added', async () => {
     const fake = fakeProvider('openai', [
       { calls: [{ name: 'transfer_to_owner', input: { reason: 'caller_asked' } }] },

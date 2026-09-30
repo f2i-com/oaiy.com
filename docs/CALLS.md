@@ -237,7 +237,12 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
   carries the call from then on, and the first ends alone: it ends without ending the call (the record of the call,
   what the app is told, what rings for it and the new session's own commands are all left as they are), and a stop it
   might still be given for a hand-over does not hand the call to the owner. Each session's registration is its own, and
-  only the session that holds it can end the call, hand it over or say it ended.
+  only the session that holds it can end the call, hand it over or say it ended. What was on its way when the session
+  lost the call is answered as it is, not as "the call ended": a tool the phone had not answered, a goodbye it had not
+  accepted and what waited to be sent are told the line moved to a new session and may be asked again, and a request for
+  the owner that had been sent is told the owner may still be ringing and is not to be asked again (a second request
+  would be refused while it rings): the app is told how it came out (`call.transfer`) by the session that took the call,
+  as it is for any ring that session did not begin.
 - **A line that promises a transfer is not said before it happens.** Until an owner device has accepted, a line the
   model writes that tells the caller they are being connected, transferred, put through or handed over, in any of the
   forms a model uses ("connecting you now", "I'm transferring you", "I'll transfer you", "let me put you through",

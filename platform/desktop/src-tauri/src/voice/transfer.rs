@@ -891,6 +891,11 @@ impl Tools {
         self.transfer_on_wire() || self.waiting.iter().any(Waiting::is_transfer)
     }
 
+    /// The name of the tool call `id`, if it is on the wire and unanswered.
+    pub fn on_wire_name(&self, id: &str) -> Option<&str> {
+        self.on_wire.iter().find(|(on, _, _)| on == id).map(|(_, name, _)| name.as_str())
+    }
+
     /// When the transfer request on the wire was sent, if one is (and the phone has not answered it, nor has it been given up on).
     pub fn transfer_sent_at(&self) -> Option<Instant> {
         self.on_wire.iter().find(|(_, name, _)| name == TOOL).map(|(_, _, at)| *at)

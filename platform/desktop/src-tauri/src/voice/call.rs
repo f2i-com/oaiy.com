@@ -283,6 +283,11 @@ fn drop_unstarted(epoch: &AtomicU64, ledger: &Mutex<Ledger>, current_item: &Mute
     Some(ledger.take(was).into_iter().map(|l| l.text).collect())
 }
 
+/// What the app is told of what was on its way when the session that had it was taken over by another for the same call.
+const MOVED_UNSENT: &str = "The line moved to a new session before that was sent: ask again if it still matters.";
+const MOVED_ASKED: &str = "The line moved to a new session before the phone answered that: ask again if it still matters.";
+const MOVED_REQUEST: &str = "The line moved to a new session while the request for the owner was being made, and the owner may still be ringing. Do not ask again: you will be told how it came out.";
+
 /// A caller still speaking when the greeting's settle is over is waited for,
 /// but the greeting is said this long after the call begins at the latest.
 const GREETING_LATEST: Duration = Duration::from_millis(3_000);
@@ -1580,12 +1585,22 @@ where
         // Whatever still rings for this call on this desktop is over.
         ring.call_finished(&ids.call);
     }
-    tools.end("the call ended");
-    for (_, reply) in pending_tools.drain() {
-        let _ = reply.send(Err("the call ended".into()));
+    // What was on its way is answered as it is: when the call ended, that it ended; when another session took the call from this one (the phone
+    // opened a second stream for it) the call did not end, and the app is not told it did. What had not been sent may be asked again on the new
+    // session; a request for the owner that had been sent may still be ringing, and asking again would be refused as one already going while the
+    // owner is rung, so that one is not to be asked again, and the app is told how it came out.
+    let moved = !carried && !speak_only;
+    tools.end(if moved { MOVED_UNSENT } else { "the call ended" });
+    for (id, reply) in pending_tools.drain() {
+        let why = match (moved, tools.on_wire_name(&id)) {
+            (false, _) => "the call ended",
+            (true, Some(transfer::TOOL)) => MOVED_REQUEST,
+            (true, _) => MOVED_ASKED,
+        };
+        let _ = reply.send(Err(why.into()));
     }
     for (_, (_, reply)) in finishing.drain() {
-        let _ = reply.send(Err("the call ended".into()));
+        let _ = reply.send(Err(if moved { MOVED_ASKED } else { "the call ended" }.into()));
     }
     drop(speak_tx);
     drop(utter_tx);

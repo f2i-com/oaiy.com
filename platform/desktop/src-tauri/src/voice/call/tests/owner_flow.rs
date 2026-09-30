@@ -1328,6 +1328,50 @@ async fn a_second_session_for_a_call_that_is_still_live_takes_the_call_and_the_f
     assert!(again.event("call.ended", Duration::from_millis(300)).await.is_none(), "and it was told once");
 }
 
+/// What was on its way when another session took the call is answered as it is: the call did not end, so the app is not told it did. What had not reached
+/// the phone, or that the phone had not answered, may be asked again on the new session; a request for the owner that was sent may still be ringing, and
+/// is not to be asked again (the app is told how it came out instead). A call that does end still answers "the call ended".
+#[tokio::test]
+async fn what_was_in_flight_when_another_session_took_the_call_is_told_the_line_moved_and_not_that_the_call_ended() {
+    let mut f = flow(owner_settings(true)).await;
+    f.caller_says(ASKED);
+    // A lookup the phone has not answered, and a goodbye it has not accepted.
+    let lookup = asking(&f.aokie, "lookup_business_data", json!({"question": "What are your hours?"}));
+    f.aokie.text("formlogic.realtime.tool_call", secs(3)).await.expect("the lookup reached the phone");
+    let (reply, goodbye) = oneshot::channel();
+    f.aokie.hub.command(&f.aokie.call).unwrap().send(CallCommand::Finish { goodbye: "Thanks for calling, bye!".into(), reply }).unwrap();
+    let mut again = f.aokie.restart(json!({"allowTransfer": true, "generation": 2, "greeting": "Sorry about that."})).await;
+    again.begin(json!({}));
+    again.event("call.started", secs(3)).await.expect("the call began again");
+    let told = answer_of(lookup).await.unwrap_err();
+    assert!(told.contains("moved to a new session") && told.contains("ask again") && !told.contains("call ended"), "{told}");
+    let goodbye = tokio::time::timeout(secs(3), goodbye).await.expect("the goodbye was answered").expect("with an answer").unwrap_err();
+    assert!(goodbye.contains("moved to a new session") && !goodbye.contains("call ended"), "{goodbye}");
+
+    // A request for the owner that was sent, and a lookup that waits behind it.
+    let mut g = flow(owner_settings(true)).await;
+    g.caller_says(ASKED);
+    let request = asking(&g.aokie, transfer::TOOL, json!({"reason": "caller_asked"}));
+    g.aokie.text("formlogic.realtime.tool_call", secs(3)).await.expect("the request reached the phone");
+    let waiting = asking(&g.aokie, "lookup_business_data", json!({"question": "What are your hours?"}));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut again = g.aokie.restart(json!({"allowTransfer": true, "generation": 2, "greeting": "Sorry about that."})).await;
+    again.begin(json!({}));
+    again.event("call.started", secs(3)).await.expect("the call began again");
+    let told = answer_of(request).await.unwrap_err();
+    assert!(told.contains("the owner may still be ringing") && told.contains("Do not ask again") && !told.contains("call ended"), "{told}");
+    let told = answer_of(waiting).await.unwrap_err();
+    assert!(told.contains("moved to a new session before that was sent") && !told.contains("call ended"), "{told}");
+
+    // A call that ends still says so.
+    let mut h = flow(owner_settings(true)).await;
+    let lookup = asking(&h.aokie, "lookup_business_data", json!({"question": "What are your hours?"}));
+    h.aokie.text("formlogic.realtime.tool_call", secs(3)).await.expect("the lookup reached the phone");
+    h.aokie.send(json!({"type": "formlogic.realtime.stop", "callId": h.aokie.call, "generation": 1, "reason": "the caller hung up"}));
+    let told = answer_of(lookup).await.unwrap_err();
+    assert_eq!(told, "the call ended");
+}
+
 /// The other scenario: a ring the owner declined, a minute and a bit on, and the caller says only "No, just take a message please." Nothing
 /// about the gap between tries having passed makes that an ask.
 #[tokio::test]
