@@ -7337,6 +7337,37 @@ fn a_campaigns_dry_run_names_ten_people_with_notes_and_counts_the_rest() {
     assert!(!said.contains("Skipped name 11") && said.contains("2 more people skipped at planning are not listed here"), "{said}");
 }
 
+/// A list of numbers not to be contacted is 8 MiB at most for a restore to read (the list is read whole, to be cleaned): over that, none of
+/// its numbers come back, and BACKUP.md said so and the dry run did not. The dry run says it now, and says when a list is cut at 50,000.
+#[test]
+fn the_dry_run_says_when_a_list_of_numbers_not_to_be_contacted_is_too_large_to_read_or_is_cut() {
+    let list = |count: usize| -> Vec<u8> { serde_json::to_vec(&(0..count).map(|i| serde_json::json!({ "number": format!("+61{:09}", 400_000_000 + i), "at": 1_764_000_000_000u64, "why": "texted STOP" })).collect::<Vec<_>>()).unwrap() };
+    assert_eq!(Limits::default().max_agent_read_bytes, 8 << 20, "the size a restore reads: the dry run and BACKUP.md say it");
+    let notes_of = |count: usize, tag: &str| -> (Vec<String>, Vec<String>) {
+        let src = TempDir::new(&format!("dnc-src-{tag}"));
+        let out = TempDir::new(&format!("dnc-out-{tag}"));
+        let file = backup_with_agent(&src.0, &out.0, "d.oaiybackup", agent_archive(&[("opfs/front-desk/outreach/do-not-contact.json", &list(count))]), false);
+        let dst = TempDir::new(&format!("dnc-dst-{tag}"));
+        let preview = restore::inspect(&dst.0, &file, PASS, &options()).unwrap();
+        let staged = restore::stage(&dst.0, &file, PASS, &Ticks::none(), &options()).unwrap();
+        (preview.notes, staged.skipped)
+    };
+    // Well under both: the dry run says the numbers are added, and nothing about a cut.
+    let (small, staged) = notes_of(1_000, "small");
+    assert!(small.iter().any(|n| n.contains("are added to yours")) && !small.iter().any(|n| n.contains("a restore reads") || n.contains("a restore brings")), "{small:?}");
+    assert!(!staged.iter().any(|n| n.contains("not to be contacted")), "{staged:?}");
+    // Over the 50,000 a restore brings: the first come back, and the dry run says how many do not.
+    let (cut, staged) = notes_of(50_010, "cut");
+    assert!(cut.iter().any(|n| n == "The list of numbers not to be contacted holds more than the 50000 a restore brings: the first 50000 come back and 10 do not."), "{cut:?}");
+    assert!(staged.iter().any(|n| n.contains("10 more of the numbers not to be contacted were left out")), "{staged:?}");
+    // Over the size a restore reads (about 8 MiB: a hundred and thirty thousand and more of the entries the Agent writes): none come back.
+    let big = list(140_000);
+    assert!(big.len() as u64 > 8 << 20, "the list is over 8 MiB: {} bytes", big.len());
+    let (none, staged) = notes_of(140_000, "big");
+    assert!(none.iter().any(|n| n.starts_with("The list of numbers not to be contacted is ") && n.contains("more than the 8 MiB a restore reads, so NONE of its numbers come back (yours is not touched).")), "{none:?}");
+    assert!(staged.iter().any(|n| n.contains("The list of numbers not to be contacted was not brought back: it is too large to be read.")), "the restore does what the dry run said: {staged:?}");
+}
+
 /// The reviewer's x6c: a person's keys were said in alphabetical order and the whole person was cut at 700 characters, so a value padded
 /// to any length (`answers`, which comes first) pushed the notes, the summary and the reason out of the dry run. Every key of a person is
 /// said, each cut to its own length, so no value hides another.

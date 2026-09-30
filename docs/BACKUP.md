@@ -711,6 +711,12 @@ in parts through internal routes with a secret made for that one backup.
   the bound is a defence against a hostile file, and it is not a way to restore a list of more in
   parts). A list of a hundred thousand is a moment's work for the page, where comparing each number
   with the whole list took 40 seconds for 8,000, in a page that opens nothing until it is done.
+  **A file of more than 8 MiB brings none of its numbers back**: the list is read whole, to be
+  cleaned, and the desktop reads at most 8 MiB of any one file of the Agent's storage (that is
+  about 130,000 to 180,000 of the entries the Agent writes, and fewer where the reasons are long).
+  The dry run says so before anything is restored ("The list of numbers not to be contacted is 9500 KB,
+  more than the 8 MiB a restore reads, so NONE of its numbers come back (yours is not touched)"), and so
+  does the result; a list of more than 50,000 says in the dry run how many of its numbers are cut.
   **Agent data** (projects, the brief and knowledge files), **Earlier conversations** (the phone's
   call and text threads, which the receptionist loads as what was said before), **Memory** (what
   the phone's agents remember about people, which they read as instructions) and **Outreach**

@@ -571,6 +571,26 @@ pub struct Described {
     pub restorable: usize,
     /// The names, as the backup calls them, of everything the look lists as able to come back.
     pub names: Vec<String>,
+    /// What the dry run says of the Agent's archive that is not about one item: a list of numbers that will not come back whole or at all.
+    pub notes: Vec<String>,
+}
+
+/// What the dry run says of the list of numbers not to be contacted when a restore would not bring all of it back: a file that is more
+/// than a restore reads brings none of its numbers (the list is read whole, to be cleaned), and a list of more than
+/// [`MAX_DO_NOT_CONTACT`] numbers brings the first ones. Nothing for a list that comes back whole (the dry run says the numbers are added).
+fn do_not_contact_notes(archive: &mut Archive, entry: &Entry, limits: &Limits) -> Result<Vec<String>> {
+    let Some(bytes) = read_small(archive, entry, limits.max_agent_read_bytes)? else {
+        return Ok(vec![format!(
+            "The list of numbers not to be contacted is {}, more than the {} MiB a restore reads, so NONE of its numbers come back (yours is not touched).",
+            kb(entry.size),
+            limits.max_agent_read_bytes >> 20
+        )]);
+    };
+    let Some(list) = serde_json::from_slice::<Value>(strip_bom(&bytes)).ok().as_ref().and_then(clean_do_not_contact) else { return Ok(Vec::new()) };
+    if list.over == 0 {
+        return Ok(Vec::new());
+    }
+    Ok(vec![format!("The list of numbers not to be contacted holds more than the {MAX_DO_NOT_CONTACT} a restore brings: the first {MAX_DO_NOT_CONTACT} come back and {} do not.", list.over)])
 }
 
 fn display(name: &str) -> String {
@@ -585,6 +605,7 @@ pub fn describe(path: &Path, listing: &Listing, limits: &Limits, budget: &Budget
     let mut not_restored: Vec<NotRestored> = Vec::new();
     let mut names: Vec<String> = Vec::new();
     let mut restorable = 0usize;
+    let mut dry_notes: Vec<String> = Vec::new();
 
     #[derive(Default)]
     struct Project {
@@ -624,6 +645,11 @@ pub fn describe(path: &Path, listing: &Listing, limits: &Limits, budget: &Budget
         }
         restorable += 1;
         names.push(entry.name.clone());
+        if row.id == "agent-do-not-contact" {
+            // (It comes back without a tick, so it has no item of its own: what the dry run says of it is a note.)
+            dry_notes.extend(do_not_contact_notes(&mut archive, entry, limits)?);
+            continue;
+        }
         let Some(class) = row.tick else { continue };
         let inner = entry.name.strip_prefix("opfs/").unwrap_or(&entry.name);
         let parts: Vec<&str> = inner.split('/').collect();
@@ -784,7 +810,7 @@ pub fn describe(path: &Path, listing: &Listing, limits: &Limits, budget: &Budget
         let name = if count > 1 { format!("{first} and {} more like it", count - 1) } else { first };
         not_restored.push(NotRestored { name: clip(&name, 200), why: clip(&format!("not restored: {why}"), 400) });
     }
-    Ok(Described { items, not_restored, restorable, names })
+    Ok(Described { items, not_restored, restorable, names, notes: dry_notes })
 }
 
 /// The Agent's settings, by key, by name and by value: what comes back with a tick, and what is never restored.

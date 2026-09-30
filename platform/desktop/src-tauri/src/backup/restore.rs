@@ -622,10 +622,12 @@ fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, f
         not_restored.push(review::NotRestored { name: format!("and {more} more"), why: "not restored".to_string() });
     }
     let mut agent_names: Vec<String> = Vec::new();
+    let mut agent_dry_notes: Vec<String> = Vec::new();
     if let Some(described) = agent_described {
         items.extend(described.items);
         not_restored.extend(described.not_restored);
         agent_names = described.names.iter().map(|n| agent_item(n)).collect();
+        agent_dry_notes = described.notes;
     }
     if items.len() > review::MAX_REVIEW_ITEMS {
         return Err(BackupError::new(ErrorKind::TooLarge, "This backup holds more things that can run or reconfigure OAIY than can be looked through, so it is refused."));
@@ -653,6 +655,7 @@ fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, f
     if agent_names.iter().any(|n| n.ends_with("#opfs/front-desk/outreach/do-not-contact.json")) {
         notes.push("The numbers in the backup that are not to be called or texted again are added to yours; none of yours is ever taken away.".to_string());
     }
+    notes.extend(agent_dry_notes.iter().map(|n| review::clip(n, 400)));
     let preview = Preview {
         file_name: review::clip(file_name, 200),
         created_at: review::clip(&manifest.created_at, 40),
