@@ -1,0 +1,4 @@
+# The known-answer files and the word list are compared byte for byte (hashes, emoji, LF-terminated lines): never let a
+# checkout convert their line endings.
+tests/vectors/** -text
+src/bip39_english.txt -text

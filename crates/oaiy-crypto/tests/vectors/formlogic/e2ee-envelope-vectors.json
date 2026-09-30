@@ -1,0 +1,106 @@
+{
+  "meta": {
+    "format": "formlogic-e2ee-vectors.1",
+    "note": "Deterministic KATs shared by vitest + phpunit. recovery/envelopeAad sections are client-only (PHP never builds AADs or recovery kits). Regenerate: FORMLOGIC_E2EE_VECTORS_WRITE=1 vitest run src/lib/crypto/vectors.test.ts"
+  },
+  "argon2id": [
+    {
+      "password": "formlogic vector passphrase",
+      "salt_hex": "000102030405060708090a0b0c0d0e0f",
+      "opslimit": 2,
+      "memlimit": 8388608,
+      "out_hex": "b1558ace0a83ac40470da20fa48cad75c57fcb36b8fb3adb8480aa9584ad7032"
+    },
+    {
+      "password": "correct horse battery staple 🐴",
+      "salt_hex": "f0e0d0c0b0a090807060504030201000",
+      "opslimit": 3,
+      "memlimit": 67108864,
+      "out_hex": "f93141f96a1579d9fde21651ccbd3d5af60879cb7aeead620ae97078ed839f1f"
+    }
+  ],
+  "xchacha": [
+    {
+      "key_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "nonce_hex": "222222222222222222222222222222222222222222222222",
+      "aad": "flenc:1|form-a|7d444840-9dc0-41a2-8da8-ff8cb9fca735|1|fik_v1|1|1|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|-",
+      "plaintext_b64": "eyJ2IjoxLCJhbnN3ZXJzIjp7InEiOiJ2ZWN0b3IifX0=",
+      "ct_b64": "+EWRLmaIyLaEI2e82AvSwAjs4aU3pNiSBSgCiAPCJFgSNCgwHz2udNnBAeF3+CwG",
+      "badAads": [
+        "flenc:1|form-a|7d444840-9dc0-41a2-8da8-ff8cb9fca735|2|fik_v1|1|1|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|-",
+        "flenc:1|form-b|7d444840-9dc0-41a2-8da8-ff8cb9fca735|1|fik_v1|1|1|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|-",
+        "flenc:1|form-a|7d444840-9dc0-41a2-8da8-ff8cb9fca735|1|fik_v1|1|1|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        ""
+      ]
+    },
+    {
+      "key_hex": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3",
+      "nonce_hex": "5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c",
+      "aad": "flvault-umk:1|user-vector-1",
+      "plaintext_b64": "dmF1bHQgdW5pdCB2ZWN0b3IgcGF5bG9hZA==",
+      "ct_b64": "L1B2H3j97VDIWK/zjYC1cQv6oq49uzPW2nD9SDYOAiraucMTiEaEFHA=",
+      "badAads": [
+        "flvault-umk:1|user-vector-2",
+        "flvault-umk:2|user-vector-1"
+      ]
+    }
+  ],
+  "kdf": [
+    {
+      "key_hex": "4242424242424242424242424242424242424242424242424242424242424242",
+      "subkey_id": 1,
+      "context": "flrecov1",
+      "out_hex": "6f9549b4561e44c236bc6cdb3019f86c31a767c11597ae089f04343d746c81ab"
+    },
+    {
+      "key_hex": "9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d",
+      "subkey_id": 7,
+      "context": "flrecov1",
+      "out_hex": "f70f9def1c9ab09a2ec4f22d527ea4fa3e799652d2386884c807f1cfaecd86d4"
+    }
+  ],
+  "recovery": [
+    {
+      "key_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "display": "FLRK1-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-MZUH"
+    },
+    {
+      "key_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "display": "FLRK1-7777-7777-7777-7777-7777-7777-7777-7777-7777-7777-7777-7777-777Q-V6LB"
+    },
+    {
+      "key_hex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "display": "FLRK1-AERU-KZ4J-VPG6-6AJD-IVTY-TK6N-54AS-GRLH-RGV4-33YB-ENCW-PCNL-ZXXQ-JCCP"
+    }
+  ],
+  "envelopeAad": [
+    {
+      "params": {
+        "formId": "form-e2ee-fixture",
+        "recordId": "7d444840-9dc0-41a2-8da8-ff8cb9fca735",
+        "rev": 1,
+        "keyId": "fik_fixture01",
+        "epoch": 1,
+        "schemaVersion": 1,
+        "schemaHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "aad": "flenc:1|form-e2ee-fixture|7d444840-9dc0-41a2-8da8-ff8cb9fca735|1|fik_fixture01|1|1|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|-"
+    },
+    {
+      "params": {
+        "formId": "form-e2ee-fixture",
+        "recordId": "7d444840-9dc0-41a2-8da8-ff8cb9fca735",
+        "rev": 3,
+        "keyId": "fik_fixture01",
+        "epoch": 1,
+        "schemaVersion": 1,
+        "schemaHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "attachments": [
+          "fil_b2",
+          "fil_a1"
+        ]
+      },
+      "aad": "flenc:1|form-e2ee-fixture|7d444840-9dc0-41a2-8da8-ff8cb9fca735|3|fik_fixture01|1|1|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|932bad1c29787982bca6881f0919f81888573047ab437946192e7117aa94fec7"
+    }
+  ]
+}
