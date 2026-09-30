@@ -540,9 +540,11 @@ interface PendingImport {
 export interface RestoreOptions {
   fetch?: FetchLike;
   limits?: Partial<Limits>;
-  /** Tries to reach the desktop again after a refused connection (it may still be starting), and how long to wait. */
+  /** The most tries to reach the desktop (it may still be starting); they stop sooner when [`RESTORE_WAIT_MS`] has passed. */
   retries?: number;
   sleep?: (ms: number) => Promise<void>;
+  /** The clock (for the tests). */
+  now?: () => number;
 }
 
 /** How an item of the archive is brought back (see the header). */
@@ -807,16 +809,31 @@ function refused(why: string): ImportOutcome {
   return { ok: false, error: why, applied: { projects: 0, files: 0, settings: false, removed: 0 }, warnings: [], added: [] };
 }
 
-/** A restore waiting on the desktop: null when there is none (or the desktop cannot be reached). */
-async function fetchPending(desktop: DesktopRef, token: string, fetchImpl: FetchLike, limits: Limits, retries: number, sleep: (ms: number) => Promise<void>): Promise<PendingParse | null> {
+/**
+ * How long a page that cannot reach the desktop keeps asking before it goes on without a restore (it is asked again at the
+ * next start, and the desktop cancels one that was replaced meanwhile). The desktop's server may still be starting when this page
+ * loads first, and a restore that is skipped for that waits a whole start longer. This is the most that startup waits for it, apart
+ * from the time a request that is not answered takes (5 seconds).
+ */
+export const RESTORE_WAIT_MS = 20_000;
+/** The longest pause between two tries. */
+const RETRY_PAUSE_MAX_MS = 4000;
+
+/** A restore waiting on the desktop: null when there is none (or the desktop cannot be reached within [`RESTORE_WAIT_MS`]). */
+async function fetchPending(desktop: DesktopRef, token: string, fetchImpl: FetchLike, limits: Limits, retries: number, sleep: (ms: number) => Promise<void>, now: () => number): Promise<PendingParse | null> {
+  const started = now();
   for (let attempt = 0; ; attempt++) {
-    let response: Response;
+    let response: Response | null = null;
     try {
       response = await fetchImpl(`${base(desktop)}/api/backup/agent-import`, { headers: bearer(desktop, token), signal: timeout(5000) });
     } catch {
-      // The desktop's server may still be starting when this page loads first.
-      if (attempt >= retries) return null;
-      await sleep(400 * 2 ** attempt);
+      response = null;
+    }
+    // An unanswered request, and a server that is up but not ready, are tried again for a while.
+    if (!response || response.status >= 500) {
+      const pause = Math.min(400 * 2 ** attempt, RETRY_PAUSE_MAX_MS);
+      if (attempt >= retries || now() - started + pause > RESTORE_WAIT_MS) return null;
+      await sleep(pause);
       continue;
     }
     if (!response.ok) return null;
@@ -842,7 +859,7 @@ export async function applyPendingRestore(desktop: DesktopRef, storage: AgentSto
   try {
     const token = desktop.backupToken;
     if (!token || !SAFE_ID.test(token)) return null;
-    const found = await fetchPending(desktop, token, fetchImpl, limits, options.retries ?? 3, sleep);
+    const found = await fetchPending(desktop, token, fetchImpl, limits, options.retries ?? 12, sleep, options.now ?? Date.now);
     if (!found) return null;
     const id = found.ok ? found.pending.id : found.id;
     if (!id) return null;

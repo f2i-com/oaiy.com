@@ -673,6 +673,15 @@ in parts through internal routes with a secret made for that one backup.
   (of storage that is already half restored) is thrown away and the first one is kept. What was
   left for the page and not taken within 24 hours, or that the page refused (say, because it is
   bigger than the page restores), is removed and reported.
+  **An undo, or another restore, that is applied while the Agent's part of an earlier restore still
+  waits (the page had not come, or had not finished) cancels it**: what it was to bring back is not
+  what you meant any more, the page is turned away if it comes for it later, and the result says
+  so. A snapshot of the page's storage is kept only for a restore that was applied and has its
+  record, so a page that asks for anything else makes no folder; and one that no record owns, found
+  at the next start, is kept as `restore/unowned-agent-copy-<id>.zip` and reported. If the page
+  cannot reach the desktop when it starts (the desktop's server may still be starting), it keeps
+  asking for up to **20 seconds** (pauses of up to 4 seconds, and a request that is not answered
+  takes 5) before it goes on without the restore, which then waits for the next start.
 - **The Agent's own settings** are brought back key by key (see the table of `idb/settings.json`
   above): the instructions for texts and calls, the answer and call-back switches, the line said to
   a person who is rung back, the network gate, the providers and the media service's address need

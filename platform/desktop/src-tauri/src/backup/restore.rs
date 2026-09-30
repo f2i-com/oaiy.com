@@ -1261,6 +1261,8 @@ pub fn sweep_leftovers(data_dir: &Path) -> usize {
                 removed += 1;
             } else if orphan_holding && is_dir && remove_empty_tree(&entry.path()) {
                 removed += 1;
+            } else if orphan_holding && is_dir && keep_unowned_agent_copy(data_dir, &entry.path(), name.strip_prefix("undo-").unwrap_or("")) {
+                removed += 1;
             }
         }
     }
@@ -1277,6 +1279,35 @@ pub fn sweep_leftovers(data_dir: &Path) -> usize {
         log::info!("backup: removed {removed} leftover working folder(s) of a backup or restore that did not finish");
     }
     removed
+}
+
+/// A folder no record names (no `undo.json`) that holds only what the Agent's page sent for a restore: the copy of its storage and the
+/// list of files it added. The copy is the person's own storage as it was, so it is not thrown away: it is kept under a name that
+/// says whose it is not, and the result the panel shows says so. The rest of the folder goes. A folder that holds anything else (a
+/// set-aside file is the only copy of something) is left alone. True when the folder is gone.
+fn keep_unowned_agent_copy(data_dir: &Path, folder: &Path, id: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(folder) else { return false };
+    let names: Vec<String> = entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    let only_the_pages = names.iter().all(|n| matches!(n.as_str(), "agent-storage.zip" | "agent-storage.zip.part" | "agent-added.json"));
+    if names.is_empty() || !only_the_pages {
+        return false;
+    }
+    let whole = folder.join("agent-storage.zip");
+    let mut kept = None;
+    if whole.is_file() {
+        let to = restore_dir(data_dir).join(format!("unowned-agent-copy-{id}.zip"));
+        if secret_file::rename_over(&whole, &to).is_ok() {
+            kept = Some(to);
+        } else {
+            return false;
+        }
+    }
+    let gone = std::fs::remove_dir_all(folder).is_ok();
+    if let (Some(to), Some(mut last)) = (kept, read_json::<LastRestore>(&last_result_path(data_dir))) {
+        last.notes.push(format!("A copy of the Agent's storage that no restore owns (it was sent for restore {id}, which is not there any more) was found and is kept as {}.", to.display()));
+        record_last(data_dir, &last);
+    }
+    gone
 }
 
 /// Step 3: called at the very start of the app, before any store is opened. If a restore is
@@ -1531,6 +1562,18 @@ fn finalize(data_dir: &Path, marker: &Marker, applied: &[(String, bool)]) -> App
             log::warn!("backup: could not record what the {} replaced: {e}", marker.kind);
         }
     }
+    // The Agent part of an earlier restore that its page has not finished taking is cancelled, whether or not this apply has an
+    // Agent part of its own: the page would otherwise take it later, over what was just put back, and nothing would say so.
+    let mut notes = marker.notes.clone();
+    if let Some(earlier) = agent::pending_import_id(data_dir).filter(|id| *id != marker.id) {
+        agent::cancel_pending_import(data_dir);
+        notes.push(if marker.kind == KIND_UNDO {
+            "The Agent's conversations and projects of the restore you undid had not been taken by the Agent's page yet, so they were cancelled: they will not be brought back.".to_string()
+        } else {
+            "The Agent's conversations and projects of an earlier restore had not been taken by the Agent's page yet, so this restore cancelled them: they will not be brought back.".to_string()
+        });
+        log::warn!("backup: the Agent's part of restore {earlier} was cancelled by {} {}", marker.kind, marker.id);
+    }
     let mut agent_storage = "none";
     if let Some(agent_marker) = &marker.agent {
         let zip = source.join(&agent_marker.file);
@@ -1550,7 +1593,7 @@ fn finalize(data_dir: &Path, marker: &Marker, applied: &[(String, bool)]) -> App
         error: None,
         redo: marker.redo.clone(),
         agent_storage: agent_storage.to_string(),
-        notes: marker.notes.clone(),
+        notes,
     };
     record_last(data_dir, &last);
     // What was staged, or (for an undo) the snapshot that was just put back, is used up; the new

@@ -10,6 +10,7 @@ import {
   MAX_DO_NOT_CONTACT_ADDED,
   MAX_ENTRIES,
   PART_BYTES,
+  RESTORE_WAIT_MS,
   RECORD,
   applyPendingRestore,
   checkName,
@@ -864,6 +865,40 @@ describe('restoring into the Agent storage', () => {
     expect(fetchStub).toHaveBeenCalledTimes(3);
     expect(sleep).toHaveBeenCalledTimes(2);
     expect(target.files.size).toBe(0);
+  });
+
+  it('keeps asking for up to twenty seconds while the desktop starts, so that a slow start does not skip a restore', async () => {
+    const target = new FakeStorage();
+    let clock = 0;
+    const asked: number[] = [];
+    const never = vi.fn<FetchLike>(() => {
+      asked.push(clock);
+      return Promise.reject(new Error('connection refused'));
+    });
+    const sleep = async (ms: number) => void (clock += ms);
+    await expect(applyPendingRestore(DESKTOP, target, { fetch: never, sleep, now: () => clock })).resolves.toBeNull();
+    // Pauses of 0.4, 0.8, 1.6, 3.2 seconds and then 4: it stops before the pause that would pass twenty seconds in all.
+    expect(asked).toEqual([0, 400, 1200, 2800, 6000, 10000, 14000, 18000]);
+    expect(clock).toBeLessThanOrEqual(RESTORE_WAIT_MS);
+    expect(RESTORE_WAIT_MS).toBe(20_000);
+
+    // The desktop that comes up in the middle of that wait is found: the restore that waited is taken, not skipped.
+    const archive = craft({ 'opfs/projects/p1/chat.json': '[]' });
+    const desk = fakeDesktop(archive, {});
+    clock = 0;
+    let tries = 0;
+    const slowStart: FetchLike = (url, init) => (tries++ < 4 ? Promise.reject(new Error('connection refused')) : desk.fetch(url, init));
+    const outcome = await applyPendingRestore(DESKTOP, new FakeStorage(), { fetch: slowStart, sleep, now: () => clock });
+    expect(outcome).toMatchObject({ ok: true });
+    expect(tries).toBeGreaterThan(4);
+    expect(clock).toBe(400 + 800 + 1600 + 3200);
+    // A server that is up but not ready (a 503) is asked again too; a plain refusal (a 404) is not.
+    let served = 0;
+    const notReady: FetchLike = (url, init) => (served++ < 2 ? Promise.resolve(new Response('starting', { status: 503 })) : desk.fetch(url, init));
+    expect(await applyPendingRestore(DESKTOP, new FakeStorage(), { fetch: notReady, sleep, now: () => clock })).toMatchObject({ ok: true });
+    const refused = vi.fn<FetchLike>(() => Promise.resolve(new Response('no', { status: 404 })));
+    await expect(applyPendingRestore(DESKTOP, new FakeStorage(), { fetch: refused, sleep, now: () => clock })).resolves.toBeNull();
+    expect(refused).toHaveBeenCalledTimes(1);
   });
 
   it('does not throw when the network fails part way through, and says so', async () => {

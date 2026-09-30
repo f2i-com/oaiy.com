@@ -447,6 +447,33 @@ pub(crate) fn drop_pending_import(data_dir: &Path) {
     let _ = std::fs::remove_file(dir.join("current.zip"));
 }
 
+/// The restore whose Agent part is left for the page, when one is (even if what was left is damaged).
+pub(crate) fn pending_import_id(data_dir: &Path) -> Option<String> {
+    serde_json::from_str::<PendingImport>(&std::fs::read_to_string(import_dir(data_dir).join("current.json")).ok()?).ok().map(|p| p.id)
+}
+
+/// Cancel the Agent part of a restore its page has not finished taking, because another restore or an undo has been applied
+/// over it: what it was to bring back is not what the person meant any more, and a page that came for it later would write it
+/// over what was put back. Returns the restore it belonged to. (A snapshot of the page's storage that the page had begun to
+/// send for it is the business of the undo folder it is in, which is used up or kept with the restore's own record.)
+pub(crate) fn cancel_pending_import(data_dir: &Path) -> Option<String> {
+    let id = pending_import_id(data_dir);
+    drop_pending_import(data_dir);
+    if let Some(id) = &id {
+        if let Some(progress) = UNDO_PROGRESS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            progress.remove(id);
+        }
+    }
+    id
+}
+
+/// Whether restore `id` has been applied and its undo record is there: only then is there a snapshot of the page's storage to keep
+/// for it. A snapshot for anything else would be a folder no record names, that nothing offers back.
+fn undo_record_exists(data_dir: &Path, id: &str) -> bool {
+    let read = std::fs::read_to_string(restore_dir(data_dir).join(format!("undo-{id}")).join("undo.json")).ok();
+    read.and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()).and_then(|v| v.get("id").and_then(|i| i.as_str().map(str::to_string))).as_deref() == Some(id)
+}
+
 /// `GET /api/backup/agent-import` (the route checks the page's token with [`page_token_matches`]).
 pub fn import_meta(data_dir: &Path) -> ImportMeta {
     match read_pending_import(data_dir) {
@@ -512,6 +539,9 @@ static UNDO_PROGRESS: Mutex<Option<HashMap<String, u32>>> = Mutex::new(None);
 pub fn undo_part(data_dir: &Path, id: &str, token: &str, seq: u32, bytes: &[u8]) -> Result<(), PartError> {
     // An undo takes a snapshot too (the redo): what it overwrites and takes away is nowhere else.
     check_import(data_dir, id, token)?;
+    if !undo_record_exists(data_dir, id) {
+        return Err(PartError::Unknown);
+    }
     if bytes.len() > PART_SIZE {
         return Err(PartError::TooLarge);
     }
@@ -541,6 +571,9 @@ pub fn undo_part(data_dir: &Path, id: &str, token: &str, seq: u32, bytes: &[u8])
 /// `POST .../undo-done`: the snapshot is whole (or the page says it failed, and it is thrown away).
 pub fn undo_done(data_dir: &Path, id: &str, token: &str, done: &DonePayload) -> Result<(), PartError> {
     check_import(data_dir, id, token)?;
+    if !undo_record_exists(data_dir, id) {
+        return Err(PartError::Unknown);
+    }
     let partial = undo_partial_path(data_dir, id);
     if !done.ok {
         let _ = std::fs::remove_file(&partial);
