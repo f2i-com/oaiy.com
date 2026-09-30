@@ -129,6 +129,13 @@ peer) are opt-in: `#[ignore]`d in `desktop/src-tauri/tests/access_exposure.rs` a
 and the same flag (`--lan`) on `desktop/scripts/e2e-exposure.mjs` and `desktop/scripts/check-exposure.mjs`. They say
 what they are about to do before they do it; a default run lists them as not run. The same behaviours are covered in
 process by `auth::guard_tests` (fake peer addresses, a guard built from `exposure::evaluate`) and `auth::login_tests`.
+Any server a test or a helper starts (`mysqld --bind-address=127.0.0.1`, `php -S 127.0.0.1:port`, a Node double) binds
+`127.0.0.1`, and takes `127.0.0.2` to `127.0.0.9` where it needs another peer; they are all this machine.
+
+Nor does a unit test call out. `link::open_handle` starts a heartbeat and a data-node worker that run until the process
+ends, and a store that holds a linked account (the fixtures use `https://formlogic.com`) would send that provider a
+heartbeat with a made-up key. A test of the link opens its store with `link::open_handle_without_workers` or
+`link::store_for_tests`, never `open_handle`, and gives an account no `baseUrl` beyond `127.0.0.1`.
 
 ## API end-to-end
 
