@@ -475,22 +475,39 @@ describe('E5: the Agent\'s boot (the review\'s F9)', () => {
   const LAN = 'http://192.168.1.20:8080';
   const KEY = 'sk-oaiy-review-key-0123456789';
 
-  it('a saved OAIY that does not answer does not hold the page back: the welcome and the desktop come while its request is still out (the review\'s F9)', async () => {
-    const DESK = 'http://127.0.0.1:17972';
-    const HELD_MS = 6000;
-    // Every request to a local address is held for HELD_MS before it is refused, the saved OAIY's among them.
+  // Every request to a local address is held this long before it is refused, the saved OAIY's among them: a network the person is not on.
+  // The Agent gives up on a look at OAIY after 3 s (discoverOaiy), so a boot that waited for it would be 3 s late, and one that does not is not.
+  const HELD_MS = 6000;
+  const DESK = 'http://127.0.0.1:17972';
+
+  it('the welcome does not wait for a saved OAIY that does not answer: it comes about a second after the look began, not after the look gave up (the review\'s F9)', async () => {
+    const s = await open('agent', { refuseAfterMs: HELD_MS });
+    await ready('agent', s.page);
+    await seedOaiyLink(s.page, { origin: LAN, key: KEY });
+    const asked = s.page.waitForRequest(`${LAN}/v1/discovery`, { timeout: 30_000 });
+    await s.page.reload();
+    await asked;
+    const askedAt = Date.now();
+    await s.page.waitForFunction(() => /Welcome!/.test(document.querySelector('.chat-log')?.textContent ?? ''), null, { timeout: 30_000 });
+    const after = Date.now() - askedAt;
+    assert.ok(after < 2000, `the welcome came ${after} ms after the saved OAIY was asked, which the look's 3 s limit would make 3000 or more: it waited for the look`);
+    await s.context.close();
+  });
+
+  it('a paired tab asks its desktop while the saved OAIY is still being asked, not after the look has given up (the review\'s F9)', async () => {
     const s = await open('agent', { refuseAfterMs: HELD_MS });
     await ready('agent', s.page);
     await seedOaiyLink(s.page, { origin: LAN, key: KEY });
     await seedPairing(s.page, { origin: DESK, token: 'paired-token-0123456789' });
-    s.attempts.length = 0;
-    const began = Date.now();
+    s.details.length = 0;
     await s.page.reload();
-    await s.page.waitForFunction(() => /Welcome!/.test(document.querySelector('.chat-log')?.textContent ?? ''), null, { timeout: 30_000 });
-    const welcomeMs = Date.now() - began;
-    assert.ok(s.attempts.includes(`GET ${LAN}/v1/discovery`), `the saved OAIY was being asked: ${s.attempts.join(', ')}`);
-    assert.ok(s.attempts.some((a) => a.startsWith(`GET ${DESK}/api/`)), `the desktop was being asked, not waiting for it: ${s.attempts.join(', ')}`);
-    assert.ok(welcomeMs < HELD_MS - 2000, `the welcome came after ${welcomeMs} ms, while the saved OAIY's request (held ${HELD_MS} ms) was still out`);
+    const first = (prefix) => s.details.find((d) => d.url.startsWith(prefix));
+    for (let i = 0; i < 100 && !(first(`${LAN}/v1/discovery`) && first(`${DESK}/api/`)); i++) await sleep(100);
+    const look = first(`${LAN}/v1/discovery`);
+    const desk = first(`${DESK}/api/`);
+    assert.ok(look, 'the saved OAIY was asked');
+    assert.ok(desk, 'the desktop was asked');
+    assert.ok(desk.at - look.at < 2000, `the desktop was asked ${desk.at - look.at} ms after the saved OAIY, which the look's 3 s limit would make 3000 or more: the boot waited for the look`);
     await s.context.close();
   });
 });
