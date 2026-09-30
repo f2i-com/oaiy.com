@@ -402,6 +402,7 @@ describe('exporting the Agent storage', () => {
     for (const [raw, made] of [
       ['https://alice:hunter2@gw.example/v1', 'https://gw.example/v1'],
       ['https://alice@gw.example/v1', 'https://gw.example/v1'],
+      ['https://:pw@gw.example/v1', 'https://gw.example/v1'],
       ['https://gw.example/v1?api_key=abc', 'https://gw.example/v1'],
       ['https://gw.example/v1?key=a&api-version=2024-02-01&token=b&key=c', 'https://gw.example/v1?api-version=2024-02-01'],
       ['https://gw.example/v1?sig=a#frag', 'https://gw.example/v1'],
@@ -1659,8 +1660,11 @@ describe('the numbers not to be contacted only grow', () => {
     // Many that are new, with some that are here between them: the most is added, the rest of the new ones are counted, and the ones
     // that are here are not counted at all.
     const empty = new FakeStorage().put(PATH, JSON.stringify([{ number: number(7), at: 1, why: 'asked' }]));
+    expect(MAX_DO_NOT_CONTACT_ADDED).toBe(50_000);
     const many = Array.from({ length: MAX_DO_NOT_CONTACT_ADDED + 9 }, (_, i) => ({ number: number(1_000_000 + i), at: 1, why: 'x' }));
-    many.splice(3, 0, { number: number(7), at: 1, why: 'here' }, { number: number(7), at: 1, why: 'here' });
+    // (Some that are here between the first, and some after the most has been added: neither is counted as left out.)
+    many.splice(MAX_DO_NOT_CONTACT_ADDED + 4, 0, { number: number(7), at: 1, why: 'here' }, { number: number(7), at: 1, why: 'here' });
+    many.splice(3, 0, { number: number(7), at: 1, why: 'here' });
     const again = await restore(empty, many);
     expect(list(empty)).toHaveLength(1 + MAX_DO_NOT_CONTACT_ADDED);
     expect(again!.warnings.join('\n')).toContain('9 of the numbers not to be contacted in the backup were left out');

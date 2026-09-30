@@ -3168,6 +3168,9 @@ fn an_address_that_holds_a_credential_does_not_come_back_and_one_that_names_an_a
         ("https://gw.example/v1?api-version=sk-abcdefghijklmnopqrstuvwxyz0123456789ABCD", false),
         ("https://gw.example/v1#token=abc", false),
         ("https://gw.example/v1?", true),
+        // Not an address at all, though it begins like one (and has no space in it).
+        ("https://gw.example:notaport/v1", false),
+        ("http://[::1/v1", false),
     ] {
         let doc = serde_json::json!({ "providers": [{ "id": "p1", "type": "custom", "name": "Gateway", "baseUrl": address }], "media": { "baseUrl": address, "enabled": true } });
         let found = super::table::filter_json(keys, &doc, &|_| true);
@@ -3198,8 +3201,17 @@ fn what_is_said_when_nothing_of_a_file_comes_back_is_true_of_it() {
     assert_eq!(say(serde_json::json!({ "brandNew": 1 }), &Ticks::all()), "nothing in it is something OAIY brings back (1 setting left out)");
     // Only what needs the tick, and it was not ticked.
     let appointment = serde_json::json!({ "id": "appt_00000000000000000000000000000c0c", "start": "2026-10-05T10:00", "minutes": 30, "status": "requested" });
-    let said = say(serde_json::json!({ "appointments": [appointment] }), &Ticks::none());
+    let said = say(serde_json::json!({ "appointments": [appointment.clone()] }), &Ticks::none());
     assert!(said.starts_with("nothing in it comes back without its tick (") && said.ends_with(" left out)") && !said.contains("(0 "), "{said}");
+    // The number is of keys, not of how often they are met: three appointments are as many keys as one.
+    let three: Vec<serde_json::Value> = (1..=3)
+        .map(|i| {
+            let mut a = appointment.clone();
+            a["id"] = serde_json::json!(format!("appt_{i:032x}"));
+            a
+        })
+        .collect();
+    assert_eq!(say(serde_json::json!({ "appointments": three }), &Ticks::none()), said);
     // The same words for a settings file with a key table, through a restore.
     let out = TempDir::new("nothing-comes-back");
     for (name, body, ticks, says) in [
@@ -3371,20 +3383,35 @@ fn what_is_merged_again_is_only_what_changed_and_is_held_to_what_the_backup_held
     let got = json_of(&dst.0, "calendar/calendar.json");
     assert!(got["appointments"].as_array().unwrap().iter().any(|a| a["id"] == "appt_000000000000000000000000000000e1"));
     assert!(crate::calendar::is_readable(&got.to_string()));
-    // What it was merged from is what the backup held: a copy that was swapped is not merged.
-    let dst = TempDir::new("remerge-only-swapped");
+    // What it was merged from is what the backup held: a copy that was swapped (for another size, or for the same size) is not merged.
+    for (what, swap) in [("another size", 0), ("the same size", 1)] {
+        let dst = TempDir::new("remerge-only-swapped");
+        put(&dst.0, "calendar/calendar.json", calendar_text("mine"));
+        let staged = restore::stage(&dst.0, &file, PASS, &ticks_of(&[RestoreClass::Calendar], false), &options()).unwrap();
+        let mut live = json_of(&dst.0, "calendar/calendar.json");
+        live["settings"]["business"] = serde_json::json!("Changed");
+        put(&dst.0, "calendar/calendar.json", live.to_string());
+        let theirs = dst.0.join("restore").join(format!("pending-{}", staged.id)).join("theirs").join("calendar").join("calendar.json");
+        assert!(theirs.is_file(), "the backup's file is kept as it came");
+        let kept_bytes = fs::read(&theirs).unwrap();
+        fs::write(&theirs, if swap == 0 { br#"{"settings":{"business":"Swapped in"}}"#.to_vec() } else { same_size_other(&kept_bytes) }).unwrap();
+        let before = snapshot(&dst.0);
+        let ApplyOutcome::Failed(last) = restore::apply_pending(&dst.0) else { panic!("{what}: refused") };
+        assert!(last.error.as_deref().unwrap().contains("nothing was changed"), "{what}: {last:?}");
+        assert_eq!(snapshot(&dst.0), before, "{what}: nothing was changed");
+    }
+    // What was said of the calendar when it was prepared is said once, not again beside what is said when it is merged again.
+    let dst = TempDir::new("remerge-only-notes");
     put(&dst.0, "calendar/calendar.json", calendar_text("mine"));
-    let staged = restore::stage(&dst.0, &file, PASS, &ticks_of(&[RestoreClass::Calendar], false), &options()).unwrap();
+    restore::stage(&dst.0, &file, PASS, &Ticks::none(), &options()).unwrap();
     let mut live = json_of(&dst.0, "calendar/calendar.json");
     live["settings"]["business"] = serde_json::json!("Changed");
     put(&dst.0, "calendar/calendar.json", live.to_string());
-    let theirs = dst.0.join("restore").join(format!("pending-{}", staged.id)).join("theirs").join("calendar").join("calendar.json");
-    assert!(theirs.is_file(), "the backup's file is kept as it came");
-    fs::write(&theirs, br#"{"settings":{"business":"Swapped in"}}"#).unwrap();
-    let before = snapshot(&dst.0);
-    let ApplyOutcome::Failed(last) = restore::apply_pending(&dst.0) else { panic!("refused") };
-    assert!(last.error.as_deref().unwrap().contains("nothing was changed"), "{last:?}");
-    assert_eq!(snapshot(&dst.0), before, "nothing was changed");
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let notes = restore::last_restore(&dst.0).unwrap().notes;
+    let of_the_calendar: Vec<&String> = notes.iter().filter(|n| n.starts_with("calendar/calendar.json: ")).collect();
+    assert_eq!(of_the_calendar.iter().filter(|n| n.contains("not brought back")).count(), 1, "{notes:?}");
+    assert_eq!(of_the_calendar.iter().filter(|n| n.contains("merged again")).count(), 1, "{notes:?}");
     // And the marker of a restore that merges names only files of its kind.
     let (dst, _, _) = staged_with_agent_part("remerge-marker");
     let marker_path = dst.0.join("restore").join("pending.json");
@@ -3392,6 +3419,36 @@ fn what_is_merged_again_is_only_what_changed_and_is_held_to_what_the_backup_held
     marker["merges"] = serde_json::json!([{ "name": "callers.json", "theirsSize": 1, "theirsSha256": "00", "hereSha256": null }]);
     fs::write(&marker_path, marker.to_string()).unwrap();
     let ApplyOutcome::Failed(last) = restore::apply_pending(&dst.0) else { panic!("a damaged record is refused") };
+    assert!(last.error.as_deref().unwrap().contains("damaged"), "{last:?}");
+    // A file that is staged but is not one that is merged with what is here (the contacts file takes the place of the one that is here).
+    let src = TempDir::new("remerge-marker-plain-src");
+    realistic(&src.0, "A");
+    let out = TempDir::new("remerge-marker-plain-out");
+    let file = out.0.join("m.oaiybackup");
+    make(&src.0, &file);
+    let plain = TempDir::new("remerge-marker-plain-dst");
+    target(&plain.0);
+    restore::stage(&plain.0, &file, PASS, &Ticks::all(), &options()).unwrap();
+    let marker_path = plain.0.join("restore").join("pending.json");
+    let mut marker: serde_json::Value = serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+    assert!(marker["files"].as_array().unwrap().iter().any(|f| f["name"] == "callers.json"), "the contacts file is staged");
+    marker["merges"] = serde_json::json!([{ "name": "callers.json", "theirsSize": 1, "theirsSha256": "00", "hereSha256": null }]);
+    fs::write(&marker_path, marker.to_string()).unwrap();
+    let ApplyOutcome::Failed(last) = restore::apply_pending(&plain.0) else { panic!("a file that is not merged is not named as one") };
+    assert!(last.error.as_deref().unwrap().contains("damaged"), "{last:?}");
+    // An undo merges nothing: its marker that names a merge is refused.
+    let undoing = TempDir::new("remerge-marker-undo-dst");
+    target(&undoing.0);
+    put(&undoing.0, "calendar/calendar.json", calendar_text("mine"));
+    restore::stage(&undoing.0, &file, PASS, &Ticks::all(), &options()).unwrap();
+    assert!(matches!(restore::apply_pending(&undoing.0), ApplyOutcome::Applied(_)));
+    restore::stage_undo(&undoing.0, &options()).unwrap();
+    let marker_path = undoing.0.join("restore").join("pending.json");
+    let mut marker: serde_json::Value = serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+    let merged_file = marker["files"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap().to_string()).find(|n| n == "calendar/calendar.json").expect("the calendar is one of what an undo puts back");
+    marker["merges"] = serde_json::json!([{ "name": merged_file, "theirsSize": 1, "theirsSha256": "00", "hereSha256": null }]);
+    fs::write(&marker_path, marker.to_string()).unwrap();
+    let ApplyOutcome::Failed(last) = restore::apply_pending(&undoing.0) else { panic!("an undo does not merge") };
     assert!(last.error.as_deref().unwrap().contains("damaged"), "{last:?}");
 }
 
@@ -6740,6 +6797,18 @@ fn a_marker_is_left_alone_when_the_restore_was_not_finished_or_never_begun() {
     // The journal is complete and the record of what it replaced is not there yet: the restore is finished, not dropped.
     assert!(dst.0.join("restore").join("pending.json").exists());
     assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    // The journal is complete AND the record of what it replaced is there (it was cut short inside its last step, after that record was
+    // written and before the marker and the journal went): the restore is finished, and its Agent part is handed over, not dropped.
+    let (cut, cut_id, _) = staged_with_agent_part("marker-cut-inside-the-last-step");
+    restore::INJECT.with(|c| c.set(Some(Inject::CrashAfterDone)));
+    assert!(matches!(restore::apply_pending(&cut.0), ApplyOutcome::None));
+    restore::INJECT.with(|c| c.set(None));
+    let folder = cut.0.join("restore").join(format!("undo-{cut_id}"));
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(folder.join("undo.json"), serde_json::json!({ "id": cut_id, "appliedAt": "2026-09-30T00:00:00Z", "backupCreatedAt": "x", "kind": "restore", "replaced": [], "added": [] }).to_string()).unwrap();
+    let ApplyOutcome::Applied(last) = restore::apply_pending(&cut.0) else { panic!("a journal that is complete is finished, whatever else is there") };
+    assert_eq!(last.agent_storage, "pending", "{last:?}");
+    assert!(agent::import_meta(&cut.0).pending);
     let (never, _, _) = staged_with_agent_part("marker-never-begun");
     assert!(matches!(restore::apply_pending(&never.0), ApplyOutcome::Applied(_)), "a restore that was staged is applied");
 }
@@ -6775,6 +6844,33 @@ fn an_archive_left_for_the_page_with_no_record_is_given_its_record_or_swept() {
     let meta = agent::import_meta(&dst.0);
     assert!(meta.pending && meta.id.as_deref() == Some(id.as_str()));
     assert_ne!(fs::read(import.join("current.zip")).unwrap(), b"another archive, in the clear");
+    // (b2) Another archive of the very same size as the one that was staged is not that archive: it is replaced, not adopted.
+    let (dst, id, zip) = staged_with_agent_part("orphan-b2");
+    restore::INJECT.with(|c| c.set(Some(Inject::CrashAfterDone)));
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::None));
+    restore::INJECT.with(|c| c.set(None));
+    let import = dst.0.join("restore").join("agent-import");
+    fs::create_dir_all(&import).unwrap();
+    let staged_bytes = fs::read(&zip).unwrap();
+    fs::write(import.join("current.zip"), same_size_other(&staged_bytes)).unwrap();
+    let ApplyOutcome::Applied(last) = restore::apply_pending(&dst.0) else { panic!("applied") };
+    assert_eq!(last.agent_storage, "pending", "{last:?}");
+    assert_eq!(agent::import_meta(&dst.0).id.as_deref(), Some(id.as_str()));
+    assert_eq!(fs::read(import.join("current.zip")).unwrap(), staged_bytes, "the page is given what was staged");
+    // (b3) Where a restore with no Agent part waits, an archive with no record is still swept (nothing will give it its record).
+    let src = TempDir::new("orphan-b3-src");
+    realistic(&src.0, "A");
+    let out = TempDir::new("orphan-b3-out");
+    let file = out.0.join("b3.oaiybackup");
+    make(&src.0, &file);
+    let dst = TempDir::new("orphan-b3-dst");
+    target(&dst.0);
+    restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
+    let import = dst.0.join("restore").join("agent-import");
+    fs::create_dir_all(&import).unwrap();
+    fs::write(import.join("current.zip"), b"nobody's archive, in the clear").unwrap();
+    assert!(restore::sweep_leftovers(&dst.0) >= 1);
+    assert!(!import.join("current.zip").exists(), "a waiting restore with no Agent part does not keep it");
     // (c) The reviewer's x2b: no restore waits and nothing names the archive: it is swept, whatever its age.
     let data = TempDir::new("orphan-c");
     let import = data.0.join("restore").join("agent-import");

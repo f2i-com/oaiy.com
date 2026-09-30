@@ -1485,7 +1485,7 @@ pub fn apply_pending(data_dir: &Path) -> ApplyOutcome {
     // record of what it replaced is there, and whose journal is gone, has nothing to apply and nothing to put back: it was applied,
     // and its result is what was recorded. (With the journal there, the restore is finished again below; without the record, it
     // was never applied.)
-    if std::fs::symlink_metadata(&journal_file).is_err() && undo_record_names(data_dir, &marker.id) {
+    if std::fs::symlink_metadata(&journal_file).is_err() && agent::undo_record_exists(data_dir, &marker.id) {
         let _ = std::fs::remove_file(&marker_file);
         log::info!("backup: the record of a {} that was already applied was still there, and was removed", marker.kind);
         return ApplyOutcome::None;
@@ -1542,11 +1542,6 @@ pub fn apply_pending(data_dir: &Path) -> ApplyOutcome {
             conclude_failed(data_dir, &marker, last)
         }
     }
-}
-
-/// Whether the record of what restore `id` replaced is there and names it (an apply writes it before it removes its journal).
-fn undo_record_names(data_dir: &Path, id: &str) -> bool {
-    is_id(id) && agent::undo_record_exists(data_dir, id)
 }
 
 /// A rollback that could not put everything back: say which files, where their originals are, and

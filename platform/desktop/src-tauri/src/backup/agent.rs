@@ -666,8 +666,9 @@ fn added_by_the_import(data_dir: &Path, id: &str) -> Option<(Vec<String>, usize)
     let handed = super::agentzip::file_names(&import_dir(data_dir).join("current.zip"))?;
     let before: std::collections::HashSet<String> = super::agentzip::file_names(&undo_agent_path(data_dir, id))?.into_iter().collect();
     let added: Vec<String> = handed.into_iter().filter(|n| n.starts_with("opfs/") && plausible_name(n) && !before.contains(n)).collect();
+    // (What is kept is bounded where it is kept, see `keep_added`: here it is counted.)
     let over = added.len().saturating_sub(MAX_ADDED);
-    Some((added.into_iter().take(MAX_ADDED).collect(), over))
+    Some((added, over))
 }
 
 /// `POST .../done`: the page has imported (or could not). Which files it added is worked out here, not taken from the page.
