@@ -37,6 +37,8 @@ import { startTheme } from './ui/theme';
 import { discoverOaiy, mediaAbilities, mergeDiscovered, originOf } from './agent/media';
 import { whereToFollow, whereToLook } from './agent/lookup';
 import { readHost } from '@oaiy/shared/capabilities/host';
+import type { FeatureId } from '@oaiy/shared/capabilities/features';
+import { agentCaps } from './desktop/caps';
 import { budgetFor, contextWindow, detectContextWindow, formatTokens } from './agent/context';
 import { ChatPane } from './ui/chat';
 import { clear, h } from './ui/dom';
@@ -175,11 +177,16 @@ async function main(): Promise<void> {
   const given = embeddedDesktop();
   let desktop: Desktop | null = given ? new Desktop(given.origin, given.token) : settings.desktop ? new Desktop(settings.desktop.origin, settings.desktop.token) : null;
   /**
+   * Whether a feature of the desktop's is on here, from where the page is and the desktop it is paired with now (desktop/caps.ts).
+   * Each control asks this AND what it needed before (a desktop to talk to, a module that is on), so this can only hide, never show.
+   */
+  const canDo = (id: FeatureId): boolean => agentCaps(HOST, desktop).features[id];
+  /**
    * OAIY Desktop's control API (its MCP server): the Agent checks and changes
    * OAIY itself through it, with the tools each kind of conversation is
    * offered (see desktop/mcp.ts).
    */
-  let control: ControlClient | null = desktop ? new ControlClient(desktop.origin, desktop.token) : null;
+  let control: ControlClient | null = desktop && canDo('control') ? new ControlClient(desktop.origin, desktop.token) : null;
   /**
    * Who answers the phone, and for whom (the receptionist's name and the
    * business's, from the desktop's calendar settings): every call, text and
@@ -228,8 +235,8 @@ async function main(): Promise<void> {
    * Receptionist). Null until the desktop has said; with no desktop, none.
    */
   let modules: Modules | null = null;
-  const phoneOn = () => isOn(modules, 'phone');
-  const calendarOn = () => isOn(modules, 'calendar');
+  const phoneOn = () => canDo('phone') && isOn(modules, 'phone');
+  const calendarOn = () => canDo('calendar') && isOn(modules, 'calendar');
   /**
    * The plugins' actions offered to the agent in `where`, as the desktop's
    * modules list them now (so they come and go with the snapshot), while the
@@ -513,9 +520,9 @@ async function main(): Promise<void> {
     if (frontDesk && (phoneOn() || project === frontDesk)) projectSelect.append(h('option', { value: FRONT_DESK.id, selected: project === frontDesk, title: "The phone's agents: calls, texts and flows' tasks" }, `📞 ${frontDesk.meta.name}`));
     // Then "Set up OAIY", once it has been opened: while there is a desktop to set up (and while it is open).
     const setup = list.find((m) => m.id === SETUP_PROJECT.id);
-    if (setup && (desktop || project?.meta.id === setup.id)) projectSelect.append(h('option', { value: setup.id, selected: setup.id === project?.meta.id, title: 'Your conversation with the Agent about setting up OAIY' }, `⚙ ${setup.name}`));
+    if (setup && ((desktop && canDo('setup')) || project?.meta.id === setup.id)) projectSelect.append(h('option', { value: setup.id, selected: setup.id === project?.meta.id, title: 'Your conversation with the Agent about setting up OAIY' }, `⚙ ${setup.name}`));
     for (const meta of list) if (meta.id !== SETUP_PROJECT.id) projectSelect.append(h('option', { value: meta.id, selected: meta.id === project?.meta.id }, meta.incognito ? `🕶 ${meta.name} (incognito)` : meta.name));
-    setupButton.hidden = !desktop;
+    setupButton.hidden = !(desktop && canDo('setup'));
   };
 
   /** Tell OAIY an incognito session has ended: it wipes what it held of it (a model not running is not started for this). */
@@ -609,7 +616,9 @@ async function main(): Promise<void> {
         // Outreach where the person is (never a call, a text, a flow's task or "Set up OAIY").
         // OAIY's own tools (its control API) after them, as this kind of conversation is offered them.
         sessionTools: () => withControl(kind(), [
-          ...(desktop ? [...flowTools, transcribe, ...(calendarOn() ? calendar : []), ...flowBuilder] : flowTools),
+          ...(canDo('flowTools') ? flowTools : []),
+          ...(desktop ? [transcribe, ...(calendarOn() ? calendar : [])] : []),
+          ...(desktop && canDo('flowTools') ? flowBuilder : []),
           ...(runner() ? phone : []),
           ...(withPreview ? pluginTools(runner() ? 'runner' : 'project') : []),
           ...(withPreview && phoneOn() && (kind() === 'runner' || kind() === 'project') ? outreachSet(kind()) : []),
@@ -1435,7 +1444,7 @@ A project can hold several apps, each in its own folder (any folder whose manife
   // Project actions: a row of buttons on a wide screen, a ☰ menu on a phone.
   const closeMenu = () => header.classList.remove('menu-open');
   // "Set up OAIY": the conversation with the Agent about OAIY itself (while there is a desktop to set up).
-  const setupButton = h('button.setup-oaiy', { title: 'Chat with the Agent to set OAIY up: your phone, flows, models, plugins and services', hidden: !desktop, onclick: () => void openSetup() }, 'Set up OAIY') as HTMLButtonElement;
+  const setupButton = h('button.setup-oaiy', { title: 'Chat with the Agent to set OAIY up: your phone, flows, models, plugins and services', hidden: !(desktop && canDo('setup')), onclick: () => void openSetup() }, 'Set up OAIY') as HTMLButtonElement;
   const actions = h(
     'div.actions',
     { onclick: (e: Event) => { if ((e.target as HTMLElement).closest('button')) closeMenu(); } },
@@ -1721,7 +1730,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
    * files, empty state and instructions.
    */
   async function openSetup(): Promise<void> {
-    if (!desktop) {
+    if (!desktop || !canDo('setup')) {
       chat.system('Setting up OAIY needs OAIY Desktop: pair this page with it first (the desktop chip at the top).', 'error');
       return;
     }
@@ -2067,7 +2076,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   /** The flows made tools on the desktop, as the agents' tools. */
   async function refreshFlowTools(): Promise<void> {
     const d = desktop;
-    if (!d) {
+    if (!d || !canDo('flowTools')) {
       flowTools = [];
       toolHooks = [];
       return;
@@ -2251,7 +2260,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
         void saveDesktop(d);
         desktopEvents.stop();
         // Another desktop (or none): its own control API, and its own choice of the Agent's model.
-        control = desktop ? new ControlClient(desktop.origin, desktop.token) : null;
+        control = desktop && canDo('control') ? new ControlClient(desktop.origin, desktop.token) : null;
         codexDefault = null;
         chatgptProblem = '';
         void followAgentModel();
