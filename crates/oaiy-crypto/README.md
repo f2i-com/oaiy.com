@@ -8,19 +8,25 @@ This is work package **V-01** of `design/vault.final.md` (section 4.1 "Primitive
 It is a workspace member and not a default member; `cargo test -p oaiy-crypto` runs it.
 
 ```text
-cargo test --locked -p oaiy-crypto                           # 82 tests (and 1 ignored), about 35 seconds unoptimised
+cargo test --locked -p oaiy-crypto                           # 98 tests (and 1 ignored), about 40 seconds unoptimised
 cargo test --release -p oaiy-crypto -- --ignored             # the one-million-iteration X25519 vector of RFC 7748 (run once: passed, 44 s)
 ```
 
-Run on Windows 11 (MSVC, rustc 1.92.0): 82 passed, 1 ignored, none failed. Run on Linux (WSL2 Ubuntu 24.04, rustc 1.94.0, from a copy on ext4): the same 82 pass. macOS: compile-checked
-only (`cargo check --target aarch64-apple-darwin --all-targets`). `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` (the crate's `rustfmt.toml`) are clean.
+Run on Windows 11 (MSVC, rustc 1.92.0): 98 passed, 1 ignored, none failed. Run on Linux (WSL2 Ubuntu 24.04, rustc 1.94.0, from a copy in the WSL file system, WSL stopped afterwards): the same 98 pass.
+macOS: compile-checked only (`cargo check --target aarch64-apple-darwin --all-targets`, a step of the `vault-linux` CI lane). `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` (the crate's `rustfmt.toml`)
+are clean on Windows, Linux and `x86_64-unknown-linux-musl`. The independent review of `5859fd8d` (differential tests against libsodium in Node and PHP: 400 kdf, 7,774 xchacha, 3,642 sealed boxes,
+31,801 Ed25519 verdicts, 6,542 X25519, Argon2id, 510,000 fuzz inputs, all identical or refused with no panic) found the primitives sound and zeroization and the keystore not; the fixes are the commits after it.
+
+The `test-vectors` feature (off by default) is the deterministic part of the API that known-answer tests need and production code must not have: `aead::Nonce::from_bytes_for_tests`, `kdf::derive_subkey` and
+`kdf::derive_subkey_into`. This crate's own tests turn it on through a dev-dependency on the crate itself; a crate that depends on `oaiy-crypto` does not get it (Cargo resolver 2), and the `vault-linux` CI lane
+checks that the documentation of a build without dev-dependencies has neither function.
 
 ## What is in it
 
 | Module | What | Design |
 |---|---|---|
-| `kdf` | `crypto_kdf` (BLAKE2b, `salt = LE64(id)`, `personal = ctx`) and the append-only registry of contexts; HKDF-SHA256 (RFC 5869), HMAC-SHA256, SHA-256 | 4.1.1 `kdf`, 4.1.2 |
-| `aead` | XChaCha20-Poly1305 (`seal`, `open`) and the 72-byte `wrap` format `nonce24 \|\| ct \|\| tag16` with a checked AAD | 4.1.1 `xaead`, `wrap` |
+| `kdf` | `crypto_kdf` (BLAKE2b, `salt = LE64(id)`, `personal = ctx`) and the append-only registry of contexts (the only derivation production code has is `derive(master, Purpose)`); HKDF-SHA256 (RFC 5869), HMAC-SHA256, SHA-256 | 4.1.1 `kdf`, 4.1.2 |
+| `aead` | XChaCha20-Poly1305 (`seal` with a `Nonce` that only the random generator can make, `open`) and the 72-byte `wrap` format `nonce24 \|\| ct \|\| tag16` with a checked AAD | 4.1.1 `xaead`, `wrap` |
 | `sealbox` | libsodium's `crypto_box_seal`, byte for byte | 4.1.1 `sealbox` |
 | `ed25519` | detached signatures, **strict verification only**, keys with a role, signed strings built from a domain registry | 4.1.1, 4.1.3, 4.1.4 |
 | `x25519` | RFC 7748 Diffie-Hellman, the 14 low-order encodings refused twice | 4.1.1 `x25519` |
@@ -28,7 +34,8 @@ only (`cargo check --target aarch64-apple-darwin --all-targets`). `cargo clippy 
 | `bip39` | the twelve-word phrase, checksum verified before any key derivation | 4.1.1 `bip39`, 4.3 |
 | `kit` | FormLogic's FLRK1 recovery-kit code | FormLogic `vault.ts` |
 | `canon` | canonical AAD and signed strings, the prefix-free domain registry | 4.1.3 rules 1 to 3, 4.1.5 |
-| `zeroize` | `Secret<N>`, `SecretVec`, `SecretString`, `ct_eq` | 4.1.1, "constant-time comparisons" |
+| `zeroize` | `Secret<N>`, `SecretVec`, `SecretString`, `ct_eq`, and the stack scrub that the derivations call | 4.1.1, "constant-time comparisons" |
+| `text` (private) | the white space of JavaScript's `\s`, shared by the phrase and the kit decoders, and the zeroizing growth of a secret `String` | 4.3, FormLogic `vault.ts` |
 
 Every secret is one of those types (or a dalek type that zeroizes on drop and is wrapped by one of ours): no `Clone`, no `Copy`, no `Display`, a
 `Debug` that prints nothing of the value, bytes overwritten when dropped, `==` is `subtle`'s `ct_eq`. A refused input is an `Error` whose message
@@ -57,6 +64,12 @@ names what was refused and never a byte of what was given; every failed decrypti
 | 4.3 checksum before any KDF; NFKD; exactly 12 words; length, word, checksum in that order | `bip39::tests::checksum_before_kdf_no_argon2_runs_for_a_bad_phrase`, `phrase_fuzz::nfkd_and_case_and_unicode_white_space`, `phrase_fuzz::precedence_length_then_word_then_checksum` |
 | 4.3 the four-letter prefix of a word is unique (autocomplete) | `design_vectors::the_wordlist_is_the_official_one` |
 | zeroization of every secret type; constant-time comparison | `zeroize::heap_secrets_are_zero_when_they_are_freed`, `zeroize::inline_secrets_are_zero_after_drop`, `zeroize::every_secret_type_is_zeroize_on_drop_and_prints_nothing`, `zeroize::comparison_of_secrets_is_constant_time_equality`, `argon::tests::the_argon2_blocks_are_wiped_when_the_guard_drops` |
+| **text secrets leave no copy in freed memory** (M-4): phrase encode, decode, `phrase_wrap_key`, a typed phrase, a phrase whose NFKD form outgrows its buffer, the kit code encode, decode, typed | `zeroize_text::text_secrets_leave_no_copy_in_freed_or_moved_memory` (an allocator that looks for the text in every block freed or moved, with controls), `text::tests::pushing_builds_the_same_text_as_a_string_across_growth_and_multibyte_characters` |
+| **no key is left in the dead stack** (L-7): `kdf::derive`, `derive_subkey`, HKDF, HMAC, Ed25519, X25519, the AEAD, Argon2id, sealed boxes, in debug and optimised builds | `zeroize_stack::no_primitive_leaves_its_key_in_the_dead_stack` (a scan of the stack below the caller, with a positive and a negative control); the release run is a CI step |
+| **every wrap draws a fresh random nonce** (M-5): 10,000 wraps, no repeat, every byte varies, bits balanced | `nonce::ten_thousand_wraps_of_one_plaintext_under_one_key_use_ten_thousand_different_random_nonces`, `nonce::wrapping_a_key_twice_gives_different_blobs_and_different_nonces_and_both_unwrap` |
+| **HMAC**: the seven cases of RFC 4231; a tag that is not whole (any prefix, suffix, extension, one bit) is refused (M04) | `hmac::hmac_sha256_gives_the_rfc_4231_tags_and_verify_accepts_them`, `hmac::verify_accepts_the_whole_tag_and_no_truncation_of_it_and_no_extension` |
+| **one set of white space**, JavaScript's `\s` (25 characters), for the phrase and the kit; the kit decoder and the phrase decoder agree with Node on every entry of a corpus (L-8, M52, M53, M33) | `text::tests::the_white_space_set_is_javascripts_backslash_s_for_every_code_point` (all 1,112,064 scalar values), `text_corpus::the_kit_decoder_agrees_with_formlogics_javascript_where_it_should_and_is_stricter_only_where_it_is_meant_to_be`, `text_corpus::the_phrase_decoder_agrees_with_the_browser_code_on_every_entry_of_the_corpus`, `text_corpus::a_kit_code_longer_than_the_cap_is_refused_and_one_of_exactly_the_cap_is_read`, `text_corpus::next_line_does_not_separate_the_words_of_a_phrase` |
+| the typed entry points are the ones the known-answer tests check (L-10) | `typed_api::derive_by_purpose_is_the_free_form_derivation_of_its_registry_row`, `typed_api::a_nonce_is_random_public_and_used_up_by_the_seal_that_takes_it` |
 
 A test cannot see timing, so `ct_eq` is tested for what it returns and reviewed for what it calls (`subtle`).
 
@@ -70,6 +83,7 @@ folder is `-text` in `.gitattributes` and `tests/provenance.rs` pins the SHA-256
 | `formlogic/e2ee-envelope-vectors.json`, `e2ee-sealed-js.json`, `e2ee-sealed-php.json` | FormLogic's committed vectors: kdf x2, XChaCha20 x2 with the bad-AAD matrix, Argon2id x2, FLRK1 x3, the envelope AADs; sealed boxes written by JavaScript and by PHP and one whole `__flenc:1` envelope | copies, byte for byte, of `docs/contracts/` at FormLogic commit `81860c8a937b9e2a2ed7e6f71c5d7a9dd8cad1fc` (last changed in `83a7eec3`); their git blob ids are FormLogic's: `609800802a0dc8f9ba682b7c1546666910b86735`, `93fb73ef371f7fd7b6bf4183ed3fbc523921955d`, `79ea626d2384b5940febfcb9cceebde1aaf9f767` (`git hash-object` prints them) |
 | `vault-work/vectors.json` | the design's vectors (phrase, wrapper, registry, backup identity and manifest signature, signed operations and head, archive signature, ceremony, Ed25519 probe) | the design's `gen.mjs` (Node, libsodium) and recomputed by `verify.py` (Python, OpenSSL, a hand-written age): 59 + 11 checks; `run_all.ps1` was rerun for this work: 70 checks `ok`, both suites `ALL OK`, `vectors.json` unchanged (SHA-256 `7057862f...`); the age files typage writes with random keys (`nodeage.bin`, `rekeyed.*`) come out different on every run and were restored to the design's copies afterwards |
 | `public-vectors.json` | RFC 5869 cases 1 to 3, RFC 8032 section 7.1 (five), RFC 7748 (two, the iterated vectors to 1,000,000, section 6.1), RFC 9106 Argon2id, draft-irtf-cfrg-xchacha-03 A.3.1, the eight 128-bit BIP-39 vectors of the reference | `scripts/extract_public.py` parses the published texts (URLs and hashes of the sources are in the file), and recomputes every value with Python `cryptography` before writing it: 54 checks. Nothing is typed from memory |
+| `text-corpus.json` | the code points of JavaScript's `\s`, 274 kit-code inputs with the verdict of a port of FormLogic's `decodeRecoveryKey`, and 172 phrases with the verdict of the browser decoder of design 4.3 (`normalize('NFKD').toLowerCase().split(/\s+/)`), each kit entry classed `same` (the Rust decoder must agree) or `stricter` (JavaScript accepts it and this decoder must refuse it: trailing bits, Unicode upper-casing, the length cap) | `scripts/text_corpora.mjs` (Node 24; ASCII-only output) |
 | `libsodium-oracle.json` | libsodium's verdict on 80 Ed25519 cases (the RFC 8032 vectors malleated in every way, every point of small order in every encoding, the twelve ed25519-speccheck cases, two mixed-order-key forgeries), the 14 low-order X25519 encodings, 14 forged sealed boxes, and known answers for `crypto_kdf`, XChaCha20-Poly1305, Ed25519, X25519, sealed boxes, Argon2id and HKDF | `scripts/gen_corpus.py` (plain Python integer arithmetic: the torsion points, the malleations), `scripts/oracle.mjs` (libsodium 1.0.x from FormLogic's `node_modules`, and Node's OpenSSL), `scripts/oracle_check.py` (Python `cryptography`, `hashlib`, a hand-written Salsa20 family): 467 recomputations, all agree. Where Python's OpenSSL disagrees with libsodium (16 of the 80 Ed25519 cases: it accepts what a strict verifier refuses, design finding A5) the file says so, and this crate sides with libsodium |
 
 The scripts are kept beside the data. They name the scratch folder they were run from (`vault-work-backup`, FormLogic's `node_modules`); they are
@@ -112,10 +126,12 @@ this crate (a follow-up, as nothing links it yet).
 
 ## Unsafe
 
-None in the library: `#![forbid(unsafe_code)]`. Two test files contain `unsafe`, each justified where it stands, and they are the only two:
-`tests/argon_ceiling.rs` (a `GlobalAlloc` that records the largest request, to show that a hostile Argon2 cost asks for no memory) and `tests/zeroize.rs`
-(a `GlobalAlloc` that reads a block at the moment it is freed, and a volatile read of a slot after `drop_in_place`, to show that secrets are zero by then).
-Both forward every call to the system allocator.
+None in the library: `#![forbid(unsafe_code)]`. Four test files contain `unsafe`, each justified where it stands, and they are the only four:
+`tests/argon_ceiling.rs` (a `GlobalAlloc` that records the largest request, to show that a hostile Argon2 cost asks for no memory), `tests/zeroize.rs`
+(a `GlobalAlloc` that reads a block at the moment it is freed, and a volatile read of a slot after `drop_in_place`, to show that secrets are zero by then),
+`tests/zeroize_text.rs` (a `GlobalAlloc` that looks for a run of a phrase or a kit code in every block that is freed or moved) and `tests/zeroize_stack.rs`
+(a volatile read of stack memory that nothing has written since a function returned, to count the copies of a key that it left: that read is undefined behaviour in
+Rust's abstract machine and is what every stack-scanning test does; the counts are asserted, not the bytes). Each allocator forwards every call to the system allocator.
 
 ## Where this differs from the design
 
@@ -127,23 +143,56 @@ Both forward every call to the system allocator.
 3. **The API enforces 4.1.3 and 4.1.4 itself.** The design states them as rules for host operations. Here a `SigningKey` has a role, signing takes a
    `SignedString` built from an enum of domains, and signing arbitrary bytes needs a key made with `KeyRole::Hazmat` (for the RFC vectors and other
    specifications' messages). A consumer that lets a remote party pick the role has built a signing oracle; `grep Hazmat` finds every such place.
-4. **Stricter than libsodium in three places, on purpose.** A KDF context is eight characters of `[a-z0-9]` (every registry row is); an Argon2id memory size
-   is a whole number of KiB (libsodium rounds down); the FLRK1 decoder requires the four unused bits of the 52nd character to be zero and upper-cases ASCII only
-   (the JavaScript ignores those bits and maps a few Unicode letters onto `A` to `Z`, so two spellings of one key decode there and one here). `crypto_kdf`
-   subkey lengths are 16, 32 and 64 (libsodium allows 16 to 64).
-5. **Phrase white space** is Unicode `White_Space` plus U+FEFF (the byte-order mark, which JavaScript's `\s` counts); input over 1024 bytes is refused before
-   it is normalised. JavaScript's `\s` does not include U+0085 (NEL) and this rule does: the V-04 TypeScript should pin the same set.
+4. **Stricter than libsodium in three places, and than FormLogic's JavaScript in three, on purpose.** A KDF context is eight characters of `[a-z0-9]` (every registry row is); an Argon2id
+   memory size is a whole number of KiB (libsodium rounds down); `crypto_kdf` subkey lengths are 16, 32 and 64 (libsodium allows 16 to 64). The FLRK1 decoder requires the four unused bits of the
+   52nd character to be zero, upper-cases ASCII only (the JavaScript ignores those bits and maps the dotless i, the long s and some ligatures onto `A` to `Z`, so two spellings of one key decode
+   there and only one here), and reads at most 256 bytes (`kit::MAX_INPUT_BYTES`; the JavaScript has no cap). Each is a class of entries in `tests/vectors/text-corpus.json`: no code this decoder
+   accepts is refused by the JavaScript.
+5. **White space is JavaScript's `\s`, for the phrase and the kit alike** (review L-8): TAB, LF, VT, FF, CR, SPACE, NBSP, U+1680, U+2000 to U+200A, U+2028, U+2029, U+202F, U+205F, U+3000 and
+   U+FEFF, 25 characters, compared with Node over every code point. It is not Unicode `White_Space` (which also has U+0085, NEL: a phrase that separated its words with it used to decode here and
+   not in a browser) and not the ASCII set the kit decoder used (which refused codes that FormLogic accepts when pasted with a no-break space, an ideographic space, a vertical tab or a
+   byte-order mark). Input over 1024 bytes (a phrase) or 256 bytes (a kit code) is refused before it is normalised.
 6. **`unwrap` refuses blobs of 40 bytes or fewer, and `wrap` refuses an empty plaintext,** as `unwrapKey` in `vault.ts` does; the raw `seal` and `open` handle the
    empty message (FormLogic's sealed empty message opens).
 7. **A wrong salt length is `kdf_params_out_of_range`,** with the other bounds, not a separate error: it is a parameter the server chooses.
 8. **The workspace** gets `[profile.dev.package.argon2] opt-level = 3` so that the 64 MiB tests take a tenth of a second; nothing else is optimised.
+9. **`aead::seal` takes a `Nonce`, not 24 bytes; `kdf::derive_subkey` is not in the library** (review L-10). A `Nonce` can only come from the random generator and is used up by the seal that takes it;
+   the functions that take a nonce or a context of the caller's choosing exist only with the `test-vectors` feature. A protocol that needs a nonce it derives (the ceremony of 4.8, when V-03 builds it)
+   gets a constructor of its own, with its own test, rather than a way for anyone to choose.
+10. **The derivations scrub the stack** (review L-7): `kdf::derive`, HKDF, HMAC and Ed25519 `from_seed` overwrite the stack below the caller after they return (4 KiB in an optimised build, 96 KiB in a debug
+    build, where the BLAKE2b computation itself reaches about 80 KiB down). See the known limits for what this does not cover.
 
 ## Known limits
 
-- Rust cannot promise that no copy of a secret is left in a register or a dead stack slot; the crate removes the copies it owns. Two known residues sit in
-  dependencies: `argon2` keeps a 1 KiB stack buffer of the first blocks while it initialises, and `blake2` does not zeroize its state.
+- Rust cannot promise that no copy of a secret is left in a register or a dead stack slot; the crate removes the copies it owns, and `zeroize_stack` shows that none of the primitives that take a key leaves
+  one in the dead stack after it returns, on Windows and Linux, in debug and release builds. What that does not cover: a function that **returns** a key by value (Ed25519 `from_seed`) moves it out
+  of its own frame, and in an optimised build the frame can keep the one copy that the returned value is a copy of (the test allows exactly one, and the expansion that used to leave two more
+  is scrubbed); a register; a swap file; a debugger. The dead-stack scrub is an overwrite of a depth that was measured for this compiler and this dependency tree (8 KiB and 64 KiB left a copy in a debug
+  build, 88 KiB did not), so a new `blake2`, a new compiler or a new target can need it deeper, and the probe is what says so.
+- `argon2` keeps a 1 KiB stack buffer of the first blocks while it initialises; `zeroize_stack` probes it with a 32-byte password and finds nothing.
 - `PartialEq` on a secret is constant-time; a caller who copies bytes out with `expose()` and compares them with `==` has left the crate's protection.
 - The tests cannot see timing; the mutant that replaces `ct_eq` with `==` survives (below).
+
+## Key roles are fixed at construction (advisory, review L-10)
+
+A `SigningKey` has a role (`Vault`, `Writer`, ...) and signs only the domains of that role (design 4.1.4, R-KEY). The role is fixed when the key object is made, **not when the seed was made**: the seed is 32 bytes,
+`SigningKey::seed()` hands them out, and `SigningKey::from_seed(other_role, &seed)` makes a key of another role from the same seed. So R-KEY holds for a key object and across the functions of this crate, and does not hold
+for key material that a caller copies between roles. What keeps a seed in its role is what the caller stores it under: the keystore names (`archive.writer`, `vault.fk.<id>`, ...) are the roles, and a caller that reads the
+seed of one name and builds a key of another role has made a signing oracle out of it. Nothing in this crate can prevent that; V-03 must not write that code, and `grep from_seed` finds every place where a role
+is chosen, as `grep Hazmat` finds every place that signs arbitrary bytes.
+
+## For V-03, V-04 and FormLogic (follow-ups, nothing here edits FormLogic)
+
+1. **V-04 must pin the phrase white space before it ships.** The decoder of design 4.3 in TypeScript is `normalize('NFKD').toLowerCase().split(/\s+/)` and this crate agrees with it on every entry of
+   `tests/vectors/text-corpus.json` (172 phrases, verdicts computed by exactly that code in Node). Put the same corpus in the browser's test suite, and never let a browser library's `trim`, an input element's
+   normalisation or a mobile keyboard's autocorrect change what `\s` means to it: the set is the 25 characters of `text::is_js_space`.
+2. **Raise on the FormLogic side: tighten `decodeRecoveryKey` (`formlogic/ui/src/lib/crypto/vault.ts`).** It accepts four trailing bits that are not zero (35 corpus entries of that class: two spellings
+   of one key decode, and the checksum covers only the key), and it upper-cases with Unicode rules, which maps the dotless i (U+0131), the long s (U+017F) and ligatures such as U+FB01 and U+FB02 onto letters of the alphabet (13 corpus entries). This
+   crate refuses both on purpose; a recovery code must mean one thing. The corpus (`kit` entries of class `stricter`) is the test to hand them: the fix is to require the last character's four low bits to be zero,
+   to upper-case ASCII only (`s.replace(/[a-z]/g, c => c.toUpperCase())`), and optionally to cap the input at 256 bytes, which is ours. Until they do, a code that FormLogic wrote is read here (every code it writes has
+   zero trailing bits and ASCII letters), and a code this crate writes is read there.
+3. **Key names are not FormLogic ids** (the keystore README): a FormLogic id with an upper-case letter is `InvalidName` in the keystore; a caller chooses the mapping (lower-case hex of the id's bytes is a valid name).
+4. **A protocol that needs a nonce it derives** (4.8) needs its own typed constructor next to `aead::Nonce`, with a test; do not reopen `seal` to 24 arbitrary bytes.
 
 ## Mutation checks
 
@@ -198,3 +247,44 @@ The three survivors, and why none is a gap:
 Found while choosing the mutants, and fixed before the run: the first corpus had no case that separates strict verification from the plain equation once the key is acceptable, and a sealed-box test whose
 "forged" boxes had random tags would have passed without the all-zero check; `a_small_order_r_under_a_key_of_mixed_order_...` and `a_forged_sealed_box_under_a_small_order_ephemeral_key_is_refused` were added and
 C01 and C08 are killed by them.
+
+### Round 2, after the independent review
+
+The review found the primitives sound, and its own mutants found six places in this crate that no test noticed (M04 HMAC verify accepts a truncated tag; M05 wrap uses an all-zero nonce; M33 no length cap on a kit code; M52 U+0085 as a phrase separator; M53 the kit's white space set; and the dead-stack copies of L-7, which a mutant cannot show). Round 2 is run on the code after the fixes, in a second worktree (`scratchpad/vault-impl/mutate2.ps1` and `mutants2.ps1`, outside the repository), on Windows, except the optimised-build and Linux ones (L702 and L703 are run on Linux under WSL in a release build, and L705 and L706 in a release build on Windows): **32 mutants, 32 killed.** The keystore's round 2 is in its README.
+
+| # | Break | Result | Killed by (up to three tests) |
+|---|---|---|---|
+| H01 | bip39::decode builds its NFKD copy by pushing into a String that grows (unwiped blocks) | KILLED | `text_secrets_leave_no_copy_in_freed_or_moved_memory` |
+| H02 | bip39::encode builds the phrase in a String that grows | KILLED | `text_secrets_leave_no_copy_in_freed_or_moved_memory` |
+| H03 | the kit's encode builds the code in a String that grows | KILLED | `text_secrets_leave_no_copy_in_freed_or_moved_memory` |
+| H04 | the kit's decode builds its cleaned copy in a String that grows | KILLED | `text_secrets_leave_no_copy_in_freed_or_moved_memory` |
+| H05 | push_zeroizing leaves the buffer it grows out of unwiped | KILLED | `text_secrets_leave_no_copy_in_freed_or_moved_memory` |
+| H06 | the lower-case copy of the phrase grows by pushing into a String | KILLED | `text_secrets_leave_no_copy_in_freed_or_moved_memory` |
+| L701 | kdf::derive does not scrub the stack (debug build) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack` |
+| L702 | HKDF does not scrub the stack (optimised build, Linux) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack` |
+| L703 | HMAC does not scrub the stack (optimised build, Linux) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack` |
+| L704 | the scrub of a debug build is too shallow (8 KiB) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack` |
+| L705 | the scrub writes nothing the compiler must keep (optimised build) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack` |
+| L706 | Ed25519 from_seed does not scrub the stack (optimised build) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack` |
+| W01 | U+0085 is white space (Unicode's set, not JavaScript's) | KILLED | `the_white_space_set_is_javascripts_backslash_s_for_every_code_point`, `next_line_does_not_separate_the_words_of_a_phrase`, `the_kit_decoder_strips_exactly_the_white_space_of_javascript` |
+| W02 | the byte-order mark is not white space | KILLED | `the_white_space_set_is_javascripts_backslash_s_for_every_code_point`, `two_hundred_thousand_generated_inputs_never_panic_and_agree_with_the_model_and_the_reference_crate`, `next_line_does_not_separate_the_words_of_a_phrase` |
+| W03 | the vertical tab is not white space | KILLED | `the_white_space_set_is_javascripts_backslash_s_for_every_code_point`, `next_line_does_not_separate_the_words_of_a_phrase`, `the_kit_decoder_strips_exactly_the_white_space_of_javascript` |
+| W04 | the no-break space is not white space | KILLED | `the_white_space_set_is_javascripts_backslash_s_for_every_code_point`, `the_kit_decoder_strips_exactly_the_white_space_of_javascript`, `the_kit_decoder_agrees_with_formlogics_javascript_where_it_should_and_is_stricter_only_where_it_is_meant_to_be` |
+| W05 | the kit decoder strips ASCII white space only (M53) | KILLED | `a_kit_code_longer_than_the_cap_is_refused_and_one_of_exactly_the_cap_is_read`, `the_kit_decoder_strips_exactly_the_white_space_of_javascript`, `the_kit_decoder_agrees_with_formlogics_javascript_where_it_should_and_is_stricter_only_where_it_is_meant_to_be` |
+| W06 | the kit decoder has no length cap (M33) | KILLED | `a_kit_code_longer_than_the_cap_is_refused_and_one_of_exactly_the_cap_is_read`, `the_kit_decoder_agrees_with_formlogics_javascript_where_it_should_and_is_stricter_only_where_it_is_meant_to_be` |
+| W07 | the kit cap is one byte too small | KILLED | `a_kit_code_longer_than_the_cap_is_refused_and_one_of_exactly_the_cap_is_read`, `the_kit_decoder_agrees_with_formlogics_javascript_where_it_should_and_is_stricter_only_where_it_is_meant_to_be` |
+| W08 | the kit cap counts characters, not bytes | KILLED | `a_kit_code_longer_than_the_cap_is_refused_and_one_of_exactly_the_cap_is_read`, `the_kit_decoder_agrees_with_formlogics_javascript_where_it_should_and_is_stricter_only_where_it_is_meant_to_be` |
+| W09 | the phrase decoder splits on Unicode white space (M52) | KILLED | `two_hundred_thousand_generated_inputs_never_panic_and_agree_with_the_model_and_the_reference_crate`, `next_line_does_not_separate_the_words_of_a_phrase`, `the_phrase_decoder_agrees_with_the_browser_code_on_every_entry_of_the_corpus` |
+| W10 | the kit decoder upper-cases Unicode letters like JavaScript does | KILLED | `the_kit_decoder_agrees_with_formlogics_javascript_where_it_should_and_is_stricter_only_where_it_is_meant_to_be` |
+| W11 | the four unused bits of the last character are ignored, like JavaScript does | KILLED | `recovery_kit_codes_refuse_every_single_character_substitution_and_the_trailing_bits`, `the_kit_decoder_agrees_with_formlogics_javascript_where_it_should_and_is_stricter_only_where_it_is_meant_to_be` |
+| N01 | wrap uses an all-zero nonce (the reviewer's M05) | KILLED | `ten_thousand_wraps_of_one_plaintext_under_one_key_use_ten_thousand_different_random_nonces`, `wrapping_a_key_twice_gives_different_blobs_and_different_nonces_and_both_unwrap` |
+| N02 | only the first 8 bytes of a nonce are random | KILLED | `ten_thousand_wraps_of_one_plaintext_under_one_key_use_ten_thousand_different_random_nonces` |
+| N03 | a nonce is a counter | KILLED | `ten_thousand_wraps_of_one_plaintext_under_one_key_use_ten_thousand_different_random_nonces` |
+| N04 | Nonce::random is not random at all | KILLED | `wrapping_a_key_twice_gives_different_blobs_and_different_nonces_and_both_unwrap`, `ten_thousand_wraps_of_one_plaintext_under_one_key_use_ten_thousand_different_random_nonces`, `a_nonce_is_random_public_and_used_up_by_the_seal_that_takes_it` |
+| T01 | HMAC verify accepts a truncated tag (M04) | KILLED | `verify_accepts_the_whole_tag_and_no_truncation_of_it_and_no_extension` |
+| T02 | HMAC verify compares the last bytes only | KILLED | `verify_accepts_the_whole_tag_and_no_truncation_of_it_and_no_extension` |
+| T03 | HMAC verify compares the first 16 bytes only | KILLED | `verify_accepts_the_whole_tag_and_no_truncation_of_it_and_no_extension` |
+| T04 | HMAC verify accepts every tag | KILLED | `verify_accepts_the_whole_tag_and_no_truncation_of_it_and_no_extension`, `verify_rejects_another_key_or_another_message` |
+| T05 | the typed derive uses the wrong subkey id | KILLED | `the_backup_manifest_signature_flbackup_1`, `the_backup_recipient_secret_and_public_key`, `the_kdf_registry_vectors` |
+
+The older survivors (C14, C28, C32) are unchanged: a redundant line, a timing-only change and a redundant guard. The one this round leaves is in the keystore (B06, a redundant unlock).
