@@ -4,10 +4,12 @@
 //! decides with: the path predicates, the origin lists, the bearer comparison, `AuthConfig`), byte for byte
 //! except that `AuthConfig`, its fields and `origin_guard` are `pub(super)` so the test can reach them, and
 //! for four lines of `is_personal_path` (marked there) that name the routes the receptionist's transfers and
-//! messages add (`/api/ring/*`, `/api/messages/*`). Those routes did not exist at 2ea1ee8 and were given the
-//! guard of every route of their kind (a read is a restricted read, a change is privileged) when they were
-//! built, before the access model merged; the differential compares the live guard with this one on them, and
-//! can only do so fairly if this one knows them. Nothing else is changed. Do not edit it: the differential
+//! messages add (`/api/ring/*`, `/api/messages/*`) and for the lines (marked there) that name the routes of the
+//! backup (`/api/backup/status`, `/api/backup/agent/*`, `/api/backup/agent-import*`). Those routes did not exist at
+//! 2ea1ee8 and were given the guard of every route of their kind (a read is a restricted read, a change is
+//! privileged, what carries the Agent's storage is an export read) when they were built, before the access model
+//! merged; the differential compares the live guard with this one on them, and can only do so fairly if this one
+//! knows them. Nothing else is changed. Do not edit it: the differential
 //! test in `legacy_neutrality.rs` exists to notice when the live guard stops answering as this one does, and
 //! it can only do that against a copy that does not move with it.
 
@@ -127,6 +129,9 @@ fn is_privileged_path(method: &Method, path: &str) -> bool {
                 || is_personal_path(path)
                 || is_control_path(path)
                 || is_engine_control_path(path)
+                // (Not in the guard of 2ea1ee8: the same line as the live guard's, for the routes of the backup, which that guard was given
+                // when they were built. See the module docs.)
+                || is_backup_path(path)
         }
         Method::PATCH => is_personal_path(path),
         // PUT is only used by the bridge (flow documents). A flow doc is
@@ -265,7 +270,14 @@ fn is_ai_exec_path(path: &str) -> bool {
 /// It's the read-twin of the privileged `add_service` POST, so it's gated like a privileged read
 /// (trusted origin or token) rather than left on the open GET surface.
 fn is_export_path(path: &str) -> bool {
-    path.starts_with("/api/services/") && path.ends_with("/export")
+    (path.starts_with("/api/services/") && path.ends_with("/export"))
+        // (Not in the guard of 2ea1ee8: the same lines as the live guard's, for the routes of the backup. See the module docs.)
+        || (is_backup_path(path) && path != "/api/backup/status")
+}
+
+/// (Not in the guard of 2ea1ee8: the paths of the routes of the backup, as the live guard's `backup::routes::is_backup_path` spells them.)
+fn is_backup_path(path: &str) -> bool {
+    path == "/api/backup/status" || path == "/api/backup/agent-import" || path.starts_with("/api/backup/agent-import/") || path.starts_with("/api/backup/agent/")
 }
 
 /// GET reads that expose process output / absolute paths (the OS username via the data-dir path)
@@ -274,6 +286,8 @@ fn is_export_path(path: &str) -> bool {
 /// tools + the native CLI still pass).
 fn is_restricted_read_path(path: &str) -> bool {
     path == "/api/config"
+        // (Not in the guard of 2ea1ee8: the same line as the live guard's, for the status of the backup. See the module docs.)
+        || path == "/api/backup/status"
         || path == "/api/python/logs"
         || path == "/api/node"
         || path == "/api/node/logs"

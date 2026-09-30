@@ -615,7 +615,9 @@ mod tests {
     /// `calls.manage` (four: a message marked or deleted, a ring declined, a notice put away) or
     /// `calls.settings` (the ring's settings, read and changed: two, the owner's alone): so `owner`, which
     /// holds every scope, reaches eleven more, `agent`, which holds the first two, five, and `companion` (the
-    /// interim LAN preset), which holds `calls.read` alone, four. No other preset holds any of them.
+    /// interim LAN preset), which holds `calls.read` alone, four. No other preset holds any of them. The encrypted backup adds eight routes: the
+    /// status (`system.read`, which `owner`, `cli`, `cli-admin` and `readonly` hold: one more each) and the Agent page's seven hand-over routes
+    /// (`agent.serve`, which `owner` and `agent` alone hold: seven more each).
     #[test]
     fn what_each_preset_reaches_of_the_routes_that_existed() {
         let reaches: Vec<(&str, usize)> = ALL_PRESETS
@@ -625,16 +627,16 @@ mod tests {
         assert_eq!(
             reaches,
             [
-                ("owner", 165 + 11),
-                ("agent", 78 + 5),
+                ("owner", 165 + 11 + 8),
+                ("agent", 78 + 5 + 7),
                 ("flows", 64),
                 ("flows-host", 54),
                 ("flows-web", 38),
                 ("formlogic", 36),
-                ("cli", 75),
-                ("cli-admin", 86),
+                ("cli", 75 + 1),
+                ("cli-admin", 86 + 1),
                 ("mcp", 7),
-                ("readonly", 28),
+                ("readonly", 28 + 1),
                 ("companion", 17 + 4),
                 ("run", 32),
                 ("ceremony", 4),

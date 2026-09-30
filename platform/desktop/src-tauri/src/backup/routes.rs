@@ -188,9 +188,12 @@ pub fn router(data_dir: PathBuf) -> Router {
         .with_state(ctx)
 }
 
-/// Whether a path belongs to the backup routes (for the origin guard in `http.rs`).
+/// Whether a path is one of this module's routes (for the origin guard in `http.rs`): the status, and the Agent page's hand-over of its
+/// storage (`/api/backup/agent/...`, `/api/backup/agent-import...`). Not any other path under `/api/backup`: `/api/backup` itself and what
+/// the vault design reserved there (`catalog`, `config`, `run`, `restore`, `rollback`, ...) are that design's, with its own rows in the access
+/// table, and this guard claims none of them.
 pub fn is_backup_path(path: &str) -> bool {
-    path == "/api/backup" || path.starts_with("/api/backup/")
+    path == "/api/backup/status" || path == "/api/backup/agent-import" || path.starts_with("/api/backup/agent-import/") || path.starts_with("/api/backup/agent/")
 }
 
 /// The one route that only reads and holds nothing an outside page could not learn from the dashboard.

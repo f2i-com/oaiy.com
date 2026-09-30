@@ -11,7 +11,7 @@
 # without their elevation flag (the appendix says "own rule, 4.7"; the table holds `elevate: false` for all).
 #
 # The differences from the appendix, decided on purpose and the only ones:
-#   + the eleven routes the code gained since the design counted them (marked "added since the appendix"):
+#   + the eleven routes the code gained since the design counted them, besides the eight below (marked "added since the appendix"):
 #       GET /api/update/status (system.read), POST /api/update/check (services.control: it makes OAIY ask
 #       GitHub for a release, so a monitor's token must not do it), POST /api/update/agent-flushed
 #       (agent.serve) (the updater) and POST /api/plugins/:id/trust (plugins.install), and seven of the
@@ -19,6 +19,13 @@
 #       (calls.write), GET /api/ring/preview (calls.read), GET /api/ring/active (calls.read),
 #       POST /api/ring/active/:id/respond (calls.write), POST /api/ring/notices/:id/dismiss (calls.write) and
 #       POST /api/voice/calls/:id/message (calls.write), each classified on purpose in src/auth/routes.rs;
+#   + the eight routes of the encrypted backup (`backup/routes.rs`), built before the access model merged (marked "added
+#       since the appendix"): GET /api/backup/status (system.read, beside the update status) and the Agent page's
+#       hand-over of its own storage, seven routes under /api/backup/agent/ and /api/backup/agent-import (agent.serve,
+#       beside POST /api/update/agent-flushed: the page answers the desktop when it is asked for its storage, or
+#       handed what a restore left for it, with a session secret that only the two hold). Neither class is dangerous,
+#       and none of them restores or overwrites a setting (the desktop applies a restore itself, from files the owner
+#       ticked); the vault design's reserved /api/backup rows below are a different design's and are not these;
 #   ~ four rows the design reserved (since 2, "(rsv)": the routes were not built) and the code built since,
 #       before the access model merged (marked "built since the appendix"): GET /api/messages and
 #       GET /api/ring/settings, PATCH /api/messages/:id and PUT /api/ring/settings. Their since is 1 now, because
@@ -309,3 +316,11 @@ GET /api/ring/active scope:calls.read 1 all  # added since the appendix
 POST /api/ring/active/:id/respond scope:calls.manage 1 all  # added since the appendix
 POST /api/ring/notices/:id/dismiss scope:calls.manage 1 all  # added since the appendix
 POST /api/voice/calls/:id/message scope:calls.write 1 all  # added since the appendix
+GET /api/backup/status scope:system.read 1 all  # added since the appendix
+POST /api/backup/agent/:id/part scope:agent.serve 1 all  # added since the appendix
+POST /api/backup/agent/:id/done scope:agent.serve 1 all  # added since the appendix
+GET /api/backup/agent-import scope:agent.serve 1 all  # added since the appendix
+GET /api/backup/agent-import/:id/part/:index scope:agent.serve 1 all  # added since the appendix
+POST /api/backup/agent-import/:id/undo-part scope:agent.serve 1 all  # added since the appendix
+POST /api/backup/agent-import/:id/undo-done scope:agent.serve 1 all  # added since the appendix
+POST /api/backup/agent-import/:id/done scope:agent.serve 1 all  # added since the appendix

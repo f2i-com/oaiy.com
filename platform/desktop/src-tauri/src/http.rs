@@ -2433,17 +2433,13 @@ mod tests {
 
     #[test]
     fn the_backup_routes_take_the_strict_gates_and_only_the_status_is_a_plain_read() {
-        // Everything that carries a session's bytes, and anything that might be mistaken for a way
-        // to make or restore a backup, is a privileged change.
+        // Everything that carries a session's bytes is a privileged change.
         for path in [
             "/api/backup/agent/abc/part",
             "/api/backup/agent/abc/done",
             "/api/backup/agent-import/abc/undo-part",
             "/api/backup/agent-import/abc/undo-done",
             "/api/backup/agent-import/abc/done",
-            "/api/backup/create",
-            "/api/backup/restore",
-            "/api/backup",
         ] {
             assert!(is_privileged_path(&Method::POST, path), "POST {path} must be privileged");
         }
@@ -2454,6 +2450,12 @@ mod tests {
             assert!(super::is_export_path(path), "GET {path} must be an export read");
         }
         assert!(!super::is_export_path("/api/backupx") && !is_restricted_read_path("/api/backupx/status"));
+        // What the vault design reserved under `/api/backup` is not this module's: its paths are not claimed by any of the three gates
+        // (the design's rows in the access table judge them when they exist).
+        for path in ["/api/backup", "/api/backup/catalog", "/api/backup/jobs/abc", "/api/backup/config", "/api/backup/run", "/api/backup/restore", "/api/backup/rollback", "/api/backup/verify", "/api/backup/identity", "/api/backup/create", "/api/backup/webview-import", "/api/backup/webview/abc/part"] {
+            assert!(!crate::backup::routes::is_backup_path(path), "{path} is not a route of the backup module");
+            assert!(!is_privileged_path(&Method::POST, path) && !super::is_export_path(path) && !is_restricted_read_path(path), "{path} is not claimed by the backup's gates");
+        }
     }
 
     #[tokio::test]

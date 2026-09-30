@@ -410,10 +410,17 @@ fn the_lock_holds_one_subtle_and_one_hmac_that_brings_no_other_crate() {
     let hmac = named("hmac");
     assert_eq!(hmac.len(), 1, "one hmac in the lock: {hmac:?}");
     assert!(hmac[0].1.starts_with("0.12."), "{}", hmac[0].1);
+    // (The lock names `digest` with its version when it holds two: the encrypted backup's `age` brings `digest` 0.11 beside the 0.10 that
+    // `hmac` and `sha2` 0.10 use, so the dependency reads `digest 0.10.7`. It is still the one crate.)
     assert_eq!(
-        hmac[0].2,
+        hmac[0].2.iter().map(|d| d.split(' ').next().unwrap_or("")).collect::<Vec<_>>(),
         ["digest"],
         "hmac depends on digest and nothing else"
+    );
+    assert!(
+        hmac[0].2[0] == "digest" || hmac[0].2[0].starts_with("digest 0.10."),
+        "the digest hmac uses is the 0.10 one: {:?}",
+        hmac[0].2
     );
     let subtle = named("subtle");
     assert_eq!(subtle.len(), 1, "one subtle in the lock: {subtle:?}");
