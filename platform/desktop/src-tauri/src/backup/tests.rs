@@ -7955,6 +7955,28 @@ fn every_cap_and_every_literal_cut_of_the_backup_module_is_in_the_audit_of_the_d
     assert_eq!(literal, said, "the module cuts with a number written in the code in {literal} places (`.take(N)`) and the audit table of BACKUP.md marks {said} rows \"(literal cut)\": add a row for each, or a place of the code that is cut was not looked at");
 }
 
+/// Every class of notes a restore says (the `NOTE_...` constants of `restore.rs` and `agentzip.rs`) is a class of its own: two that had the same
+/// name would be one budget of eight, and the notes of one could crowd out the notes of the other.
+#[test]
+fn every_class_of_notes_a_restore_says_is_its_own() {
+    let mut classes: Vec<(String, String)> = Vec::new();
+    for (file, text) in backup_sources() {
+        for line in text.lines().map(str::trim).filter(|l| !l.starts_with("//")) {
+            let Some(rest) = line.strip_prefix("const NOTE_").or_else(|| line.strip_prefix("pub(crate) const NOTE_")).or_else(|| line.strip_prefix("pub const NOTE_")) else { continue };
+            let name = rest.split(':').next().unwrap_or("").to_string();
+            let value = rest.split('"').nth(1).unwrap_or("").to_string();
+            classes.push((format!("{file}: NOTE_{name}"), value));
+        }
+    }
+    assert!(classes.len() >= 9, "the classes of notes are found: {classes:?}");
+    assert!(classes.iter().all(|(_, value)| !value.is_empty()), "{classes:?}");
+    for (i, (name, value)) in classes.iter().enumerate() {
+        for (other, other_value) in &classes[i + 1..] {
+            assert_ne!(value, other_value, "{name} and {other} are one class of notes");
+        }
+    }
+}
+
 /// The desktop and the dashboard make the same characters visible: the ranges of `is_invisible` (`parts.rs`) are those of `isInvisible`
 /// (`visibleText.ts`), for every code point there is. (There are two copies of the rule, one in each language, because a text reaches the
 /// person by the desktop and the dashboard draws whatever it is given; this holds them together.)
