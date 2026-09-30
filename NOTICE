@@ -29,3 +29,8 @@ crates/ggml-rs-cuda, crates/tokenizer, and crates/llama-rs are vendored
 from the author's own pure-Rust GGUF compute subsystem (see
 crates/VENDORED.md), licensed MIT OR Apache-2.0 (see LICENSE-MIT and
 LICENSE-APACHE).
+
+platform/desktop/src-tauri/src/auth/bip39_english.txt is the English word list of BIP-39
+(https://github.com/bitcoin/bips/blob/master/bip-0039/english.txt), by Marek Palatinus,
+Pavol Rusnak, Aaron Voisine and Sean Bowe, published under the MIT License. oaiy-server's
+web login draws the passwords it generates from it.

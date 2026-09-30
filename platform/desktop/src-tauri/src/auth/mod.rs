@@ -36,6 +36,8 @@ pub mod scopes;
 pub mod scrub;
 pub mod store;
 pub mod token;
+#[cfg(feature = "web")]
+pub mod wordlist;
 
 pub use guard::{Guard, GuardConfig, HealthExtras};
 pub use mode::{AccessMode, ConfigRefusal, Exposure};
