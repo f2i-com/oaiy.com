@@ -146,7 +146,7 @@ fn xchacha20_poly1305_draft_irtf_cfrg_xchacha_03_appendix_a_3_1() {
     let aad = unhex(s(&x["aad"]));
     let plaintext = unhex(s(&x["plaintext"]));
     assert!(plaintext.starts_with(b"Ladies and Gentlemen of the class of '99"));
-    let sealed = aead::seal(&key, &nonce, &aad, &plaintext).unwrap();
+    let sealed = aead::seal(&key, aead::Nonce::from_bytes_for_tests(nonce), &aad, &plaintext).unwrap();
     assert_eq!(hex(&sealed[..sealed.len() - 16]), s(&x["ciphertext"]));
     assert_eq!(hex(&sealed[sealed.len() - 16..]), s(&x["tag"]));
     assert_eq!(aead::open(&key, &nonce, &aad, &sealed).unwrap().expose(), plaintext.as_slice());

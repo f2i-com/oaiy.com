@@ -1,7 +1,7 @@
 //! `xaead` and `wrap` (design 4.1.1): XChaCha20-Poly1305-IETF, the primitive of every wrapper, envelope and package.
 //!
 //! [`seal`] and [`open`] are the primitive as libsodium's `crypto_aead_xchacha20poly1305_ietf_*` and the XChaCha draft
-//! define it: a 24-byte nonce, a 16-byte tag after the ciphertext, and associated data of any bytes (the ceremony's is the
+//! define it, except that `seal` takes a [`Nonce`], which only the random generator can make: a 24-byte nonce, a 16-byte tag after the ciphertext, and associated data of any bytes (the ceremony's is the
 //! 32-byte transcript hash). [`wrap`] is the format the vault uses for keys: `nonce(24) || ciphertext || tag(16)`, 72 bytes
 //! for a 32-byte key, with a random nonce and an [`Aad`](crate::canon::Aad) that is a checked canonical string, so that the
 //! associated data of a wrapper always names its domain, its user and its purpose (4.2.1).
@@ -30,13 +30,41 @@ pub const WRAP_OVERHEAD: usize = NONCE_LEN + TAG_LEN;
 /// A wrapped 32-byte key: 24 + 32 + 16.
 pub const WRAPPED_KEY_LEN: usize = WRAP_OVERHEAD + KEY_LEN;
 
-/// Encrypts `plaintext` and returns `ciphertext || tag`. The caller owns the uniqueness of `(key, nonce)`: use [`wrap`] unless the
-/// nonce is fixed by a protocol or a known-answer test.
-pub fn seal(key: &Secret<32>, nonce: &[u8; NONCE_LEN], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, Error> {
+/// A nonce for XChaCha20-Poly1305 that can only be drawn from the operating system's random generator (review L-10). `seal` used to take any 24 bytes, so a caller
+/// could reuse a (key, nonce) pair, which gives away the XOR of two plaintexts and the authentication key; now it takes a `Nonce` **by value**, and a `Nonce` has no
+/// constructor from bytes: [`Nonce::random`] is the only way to make one, and a `Nonce` that has been used is gone. (A nonce that a protocol fixes, or that a known-answer test
+/// chooses, is a different thing: the test-only [`Nonce::from_bytes_for_tests`] exists for the vectors, behind the `test-vectors` feature that this crate's own tests turn
+/// on; a protocol that needs a derived nonce gets a constructor of its own, with its own test, when it is designed.) A nonce is public: it travels with the ciphertext.
+#[derive(Debug)]
+pub struct Nonce([u8; NONCE_LEN]);
+
+impl Nonce {
+    /// 24 bytes from the operating system's random generator.
+    pub fn random() -> Result<Nonce, Error> {
+        let mut bytes = [0u8; NONCE_LEN];
+        crate::random::fill(&mut bytes)?;
+        Ok(Nonce(bytes))
+    }
+
+    /// The bytes, to be sent with the ciphertext (copy them before the nonce is given to [`seal`]).
+    pub const fn as_bytes(&self) -> &[u8; NONCE_LEN] {
+        &self.0
+    }
+
+    /// A nonce that the caller chooses, for known-answer tests: not part of the library that production code is built against. Only with the `test-vectors` feature (or in
+    /// this crate's unit tests).
+    #[cfg(any(test, feature = "test-vectors"))]
+    pub const fn from_bytes_for_tests(bytes: [u8; NONCE_LEN]) -> Nonce {
+        Nonce(bytes)
+    }
+}
+
+/// Encrypts `plaintext` under a fresh [`Nonce`] and returns `ciphertext || tag`; the caller sends the nonce with it (see [`wrap`] for the format that does).
+pub fn seal(key: &Secret<32>, nonce: Nonce, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, Error> {
     let cipher = XChaCha20Poly1305::new(Key::from_slice(key.expose()));
     let mut out = Vec::with_capacity(plaintext.len() + TAG_LEN);
     out.extend_from_slice(plaintext);
-    let tag = cipher.encrypt_in_place_detached(XNonce::from_slice(nonce), aad, &mut out).map_err(|_| Error::InvalidLength("plaintext"))?;
+    let tag = cipher.encrypt_in_place_detached(XNonce::from_slice(nonce.as_bytes()), aad, &mut out).map_err(|_| Error::InvalidLength("plaintext"))?;
     out.extend_from_slice(&tag);
     Ok(out)
 }
@@ -58,11 +86,11 @@ pub fn wrap(key: &Secret<32>, aad: &Aad, plaintext: &[u8]) -> Result<Vec<u8>, Er
     if plaintext.is_empty() {
         return Err(Error::InvalidLength("plaintext"));
     }
-    let mut nonce = [0u8; NONCE_LEN];
-    crate::random::fill(&mut nonce)?;
-    let sealed = seal(key, &nonce, aad.as_bytes(), plaintext)?;
+    let nonce = Nonce::random()?;
+    let nonce_bytes = *nonce.as_bytes();
+    let sealed = seal(key, nonce, aad.as_bytes(), plaintext)?;
     let mut out = Vec::with_capacity(NONCE_LEN + sealed.len());
-    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&nonce_bytes);
     out.extend_from_slice(&sealed);
     Ok(out)
 }

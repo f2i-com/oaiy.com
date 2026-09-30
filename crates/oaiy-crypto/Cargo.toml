@@ -24,7 +24,14 @@ unicode-normalization = "0.1.25"
 x25519-dalek = { version = "2.0.1", default-features = false, features = ["static_secrets", "zeroize"] }
 zeroize = { version = "1.8.2", features = ["derive"] }
 
+[features]
+# The deterministic entry points that known-answer tests need and production code must not have (review L-10): sealing under a chosen nonce
+# (`aead::Nonce::from_bytes_for_tests`) and deriving a subkey from any id and any context (`kdf::derive_subkey`, `derive_subkey_into`). Off by default, so a crate that
+# depends on this one cannot reuse a nonce or derive under a context of its own; this crate's own tests turn it on through the dev-dependency on itself below.
+test-vectors = []
+
 [dev-dependencies]
+oaiy-crypto = { path = ".", features = ["test-vectors"] }
 # A second, independent BIP-39 implementation for the differential test.
 bip39 = { version = "2.2.2", default-features = false, features = ["std"] }
 serde_json = "1.0.151"

@@ -98,7 +98,7 @@ fn the_phrase_wrapper_of_section_4_2_1() {
     assert_eq!(aad.as_bytes(), s(&out["aad"]).as_bytes());
 
     let mut wrapped = nonce.to_vec();
-    wrapped.extend_from_slice(&aead::seal(&wk, &nonce, aad.as_bytes(), umk.expose()).unwrap());
+    wrapped.extend_from_slice(&aead::seal(&wk, aead::Nonce::from_bytes_for_tests(nonce), aad.as_bytes(), umk.expose()).unwrap());
     assert_eq!(b64(&wrapped), s(&out["wrappedUmkB64"]));
     assert_eq!(wrapped.len(), 72);
     assert_eq!(out["wrappedLen"].as_u64().unwrap(), 72);
@@ -373,7 +373,7 @@ fn the_key_transfer_ceremony_x25519_hkdf_and_the_package() {
 
     let payload = s(&inp["payload"]).as_bytes();
     let nonce: [u8; 24] = arr(s(&inp["pnonceHex"]));
-    let package = aead::seal(&k_s2r, &nonce, &th, payload).unwrap();
+    let package = aead::seal(&k_s2r, aead::Nonce::from_bytes_for_tests(nonce), &th, payload).unwrap();
     assert_eq!(hex(&package), s(&out["packageHex"]));
     assert_eq!(aead::open(&k_s2r, &nonce, &th, &package).unwrap().expose(), payload);
 

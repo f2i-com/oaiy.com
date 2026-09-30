@@ -70,7 +70,7 @@ fn xchacha20_poly1305_30_vectors_with_empty_and_long_inputs() {
         let nonce: [u8; 24] = arr(s(&case["nonce"]));
         let aad = unhex(s(&case["aad"]));
         let plaintext = unhex(s(&case["pt"]));
-        let sealed = aead::seal(&key, &nonce, &aad, &plaintext).unwrap();
+        let sealed = aead::seal(&key, aead::Nonce::from_bytes_for_tests(nonce), &aad, &plaintext).unwrap();
         assert_eq!(hex(&sealed), s(&case["ct"]));
         assert_eq!(aead::open(&key, &nonce, &aad, &sealed).unwrap().expose(), plaintext.as_slice());
     }

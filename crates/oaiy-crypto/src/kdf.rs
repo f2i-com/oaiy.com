@@ -3,9 +3,9 @@
 //! `kdf(id, ctx8, key)` is libsodium's `crypto_kdf_derive_from_key`: BLAKE2b keyed with the 32-byte master key,
 //! `salt = LE64(id) || 0x00 * 8`, `personal = ctx || 0x00 * 8`, an empty message, and an output of 16, 32 or 64 bytes. Each
 //! purpose has its own eight-character context, listed in [`REGISTRY`] (design 4.1.2, append-only); a test rejects a
-//! duplicate context and a context that is not eight characters of `[a-z0-9]`. The typed entry point is
-//! [`derive`], which takes a [`Purpose`]; [`derive_subkey`] takes any id and any context and exists for the
-//! vectors (FormLogic's second `flrecov1` vector uses subkey id 7) and for a consumer that owns a context of its own.
+//! duplicate context and a context that is not eight characters of `[a-z0-9]`. The only derivation that production code has is
+//! [`derive`], which takes a [`Purpose`]; `derive_subkey` (any id, any context) exists for the known-answer tests, behind the `test-vectors`
+//! feature (FormLogic's second `flrecov1` vector uses subkey id 7). A consumer that needs a context of its own adds a row to the registry.
 //!
 //! HKDF-SHA256 is the derivation of the ceremony (`oaiy-kt:1`, 4.8) and of the browser device cache (4.4.3); HMAC-SHA256 and
 //! SHA-256 are here so that the relay and access code use the same implementation and the same constant-time comparison.
@@ -147,14 +147,15 @@ impl Purpose {
     }
 }
 
-/// `kdf(id, ctx8, key)` for a registered purpose: 32 bytes.
+/// `kdf(id, ctx8, key)` for a registered purpose: 32 bytes. **The only derivation in the library that production code has** (review L-10): the context and the subkey
+/// id come from the registry row of the [`Purpose`], so a caller cannot derive under a context that the registry does not hold (a misspelt one, another component's, one
+/// that is reserved), and adding a purpose means adding a registry row, which the tests that guard the registry see.
 pub fn derive(master: &Secret<32>, purpose: Purpose) -> Result<Secret<32>, Error> {
     let entry = purpose.entry();
-    derive_subkey(master, entry.id, &entry.context)
+    derive_32(master, entry.id, &entry.context)
 }
 
-/// `crypto_kdf_derive_from_key` with a 32-byte output, for any subkey id and any (valid) context.
-pub fn derive_subkey(master: &Secret<32>, id: u64, context: &Context) -> Result<Secret<32>, Error> {
+fn derive_32(master: &Secret<32>, id: u64, context: &Context) -> Result<Secret<32>, Error> {
     let mut out = [0u8; 32];
     let result = derive_into(master, id, context, &mut out);
     let secret = Secret::new(out);
@@ -162,7 +163,17 @@ pub fn derive_subkey(master: &Secret<32>, id: u64, context: &Context) -> Result<
     result.map(|()| secret)
 }
 
-/// `crypto_kdf_derive_from_key` for a 16, 32 or 64 byte output (libsodium allows 16 to 64; nothing here needs the others).
+/// `crypto_kdf_derive_from_key` with a 32-byte output, for any subkey id and any (valid) context: for the known-answer tests (FormLogic's second `flrecov1` vector uses
+/// subkey id 7) and nothing else. Only with the `test-vectors` feature, which this crate's own tests turn on, so that code built against the library cannot derive
+/// under a context of its own.
+#[cfg(any(test, feature = "test-vectors"))]
+pub fn derive_subkey(master: &Secret<32>, id: u64, context: &Context) -> Result<Secret<32>, Error> {
+    derive_32(master, id, context)
+}
+
+/// `crypto_kdf_derive_from_key` for a 16, 32 or 64 byte output (libsodium allows 16 to 64; nothing here needs the others). Only with the `test-vectors` feature, like
+/// [`derive_subkey`].
+#[cfg(any(test, feature = "test-vectors"))]
 pub fn derive_subkey_into(master: &Secret<32>, id: u64, context: &Context, out: &mut [u8]) -> Result<(), Error> {
     if !matches!(out.len(), 16 | 32 | 64) {
         return Err(Error::KdfContext);

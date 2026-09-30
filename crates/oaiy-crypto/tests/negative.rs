@@ -85,7 +85,7 @@ fn wrap_never_wraps_nothing_and_unwrap_never_opens_a_blob_of_40_bytes_or_fewer()
     // a genuine empty-plaintext blob (nonce || tag) made with the raw primitive: refused, as FormLogic's unwrapKey refuses it
     let nonce = [7u8; 24];
     let mut blob = nonce.to_vec();
-    blob.extend_from_slice(&aead::seal(&wrapping_key(), &nonce, aad().as_bytes(), b"").unwrap());
+    blob.extend_from_slice(&aead::seal(&wrapping_key(), aead::Nonce::from_bytes_for_tests(nonce), aad().as_bytes(), b"").unwrap());
     assert_eq!(blob.len(), 40);
     assert_eq!(aead::unwrap(&wrapping_key(), &aad(), &blob).unwrap_err(), Error::DecryptFailed);
     // the raw primitive itself handles the empty message
@@ -109,7 +109,7 @@ fn a_multi_block_message_refuses_every_bit_flip_in_the_ciphertext_and_tag() {
     let mut rng = Rng(12);
     let message = rng.bytes(200); // three ChaCha blocks and a partial one
     let nonce = [9u8; 24];
-    let sealed = aead::seal(&wrapping_key(), &nonce, b"context", &message).unwrap();
+    let sealed = aead::seal(&wrapping_key(), aead::Nonce::from_bytes_for_tests(nonce), b"context", &message).unwrap();
     assert_eq!(sealed.len(), 216);
     for bit in 0..sealed.len() * 8 {
         let mut bad = sealed.clone();
@@ -123,7 +123,7 @@ fn a_multi_block_message_refuses_every_bit_flip_in_the_ciphertext_and_tag() {
         bad_nonce[bit / 8] ^= 1 << (bit % 8);
     }
     // the same key and nonce over two messages must not give related ciphertexts of the tag (a sanity check that the AAD is authenticated)
-    let other = aead::seal(&wrapping_key(), &nonce, b"other context", &message).unwrap();
+    let other = aead::seal(&wrapping_key(), aead::Nonce::from_bytes_for_tests(nonce), b"other context", &message).unwrap();
     assert_eq!(sealed[..200], other[..200], "same keystream, as any stream cipher under one nonce");
     assert_ne!(sealed[200..], other[200..], "but the tag covers the AAD");
 }

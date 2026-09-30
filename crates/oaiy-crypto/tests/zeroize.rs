@@ -82,7 +82,7 @@ fn heap_secrets_are_zero_when_they_are_freed() {
     // a decrypted message of N3 bytes
     let key: Secret<32> = Secret::new([0x5a; 32]);
     let nonce = [1u8; 24];
-    let sealed = aead::seal(&key, &nonce, b"aad", &vec![0xCDu8; N3]).unwrap();
+    let sealed = aead::seal(&key, aead::Nonce::from_bytes_for_tests(nonce), b"aad", &vec![0xCDu8; N3]).unwrap();
     assert_eq!(verdict_for(N3, || drop(aead::open(&key, &nonce, b"aad", &sealed).unwrap())), 1, "aead::open");
     let recipient = SecretKey::from_bytes([0x61; 32]);
     let box_ = sealbox::seal(&recipient.public_key(), &vec![0xEFu8; N4]).unwrap();

@@ -46,7 +46,7 @@ fn xchacha_vectors_1_and_2_and_the_bad_aad_matrix() {
         let aad = case["aad"].as_str().unwrap().as_bytes();
         let plaintext = unb64(case["plaintext_b64"].as_str().unwrap());
         let ct = unb64(case["ct_b64"].as_str().unwrap());
-        assert_eq!(aead::seal(&key, &nonce, aad, &plaintext).unwrap(), ct, "ciphertext || tag");
+        assert_eq!(aead::seal(&key, aead::Nonce::from_bytes_for_tests(nonce), aad, &plaintext).unwrap(), ct, "ciphertext || tag");
         assert_eq!(aead::open(&key, &nonce, aad, &ct).unwrap().expose(), plaintext.as_slice());
         let bad = case["badAads"].as_array().unwrap();
         assert!(bad.len() >= 2);
