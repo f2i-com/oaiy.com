@@ -33,7 +33,8 @@ export default function RingDialog({ on = true }: { on?: boolean }) {
   /** The desktop's clock less this window's, when it last answered: the countdown does not trust this window's clock. */
   const offset = useRef(0);
   const [tick, setTick] = useState(0);
-  const [busy, setBusy] = useState<RingAction | null>(null);
+  /** What is being asked of the desktop about which ring: a request on its way for one ring does not hold another's buttons. */
+  const [busy, setBusy] = useState<{ ring: string; action: RingAction } | null>(null);
   /** Rings the owner put away with "Not now": not shown again, though they go on ringing on their devices. */
   const [putAway, setPutAway] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -72,21 +73,25 @@ export default function RingDialog({ on = true }: { on?: boolean }) {
 
   // What went wrong is about the ring it happened on: another caller's ring, or none, does not inherit it.
   const shownId = shown?.id;
+  const shownNow = useRef(shownId);
+  shownNow.current = shownId;
   useEffect(() => {
     setError(null);
   }, [shownId]);
 
   const act = async (action: RingAction) => {
     if (!shown) return;
-    setBusy(action);
+    const id = shown.id;
+    setBusy({ ring: id, action });
     setError(null);
     try {
       // The phone is asked to withdraw the request: the ring stays, stopping, until it answers (the next look shows it).
-      await api.respond(shown.id, action);
+      await api.respond(id, action);
     } catch (e) {
-      setError(errText(e));
+      // An answer that comes late is about the ring it was asked for: if another caller's ring is the one shown by now, it does not carry the error.
+      if (shownNow.current === id) setError(errText(e));
     } finally {
-      setBusy(null);
+      setBusy((now) => (now?.ring === id ? null : now));
       look();
     }
   };
@@ -159,7 +164,7 @@ export default function RingDialog({ on = true }: { on?: boolean }) {
         </div>
         <p className="ring-note">Answer on your Companion. This computer cannot take the call.</p>
         <div className="ring-actions">
-          <button type="button" className="button secondary" disabled={busy !== null || shown.stopping || shown.taken} onClick={() => void act('decline')}>
+          <button type="button" className="button secondary" disabled={busy?.ring === shown.id || shown.stopping || shown.taken} onClick={() => void act('decline')}>
             <PhoneOff size={14} /> Decline and take a message
           </button>
           <button type="button" className="button secondary" onClick={() => setPutAway((ids) => [...ids.slice(-20), shown.id])}>
