@@ -24,6 +24,8 @@ pub mod clock;
 #[cfg(feature = "web")]
 pub mod cookie;
 pub mod cors;
+#[cfg(feature = "web")]
+pub mod device;
 pub mod export;
 pub mod exposure_checks;
 pub mod guard;
