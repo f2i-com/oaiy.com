@@ -913,6 +913,117 @@ mod tests {
         assert!(!classes.contains_key("unclassified"));
     }
 
+    /// The design's table (Appendix B), one row per line, as `routes.golden.txt` holds it.
+    const GOLDEN: &str = include_str!("routes.golden.txt");
+
+    /// A row of the table in the golden file's words.
+    fn golden_line(r: &Route) -> String {
+        let class = match r.class {
+            Class::Public => "public".to_string(),
+            Class::AnyCredential => "any".to_string(),
+            Class::Console => "console".to_string(),
+            Class::Session { .. } => "session".to_string(),
+            Class::Desk { .. } => "desk".to_string(),
+            Class::Scope(s) => format!("scope:{s}"),
+            Class::Unclassified => "unclassified".to_string(),
+        };
+        let only = match r.only {
+            Only::Everywhere => "all",
+            Only::Server => "server",
+        };
+        format!(
+            "{} {} {class} {} {only}",
+            r.method.as_str(),
+            r.pattern,
+            r.since
+        )
+    }
+
+    /// The rows of the golden file, and how many of them are marked as added since the appendix.
+    fn golden_rows() -> (Vec<String>, usize) {
+        let mut rows = Vec::new();
+        let mut added = 0;
+        for line in GOLDEN.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (row, note) = line.split_once('#').unwrap_or((line, ""));
+            if note.contains("added since the appendix") {
+                added += 1;
+            }
+            rows.push(row.trim().to_string());
+        }
+        (rows, added)
+    }
+
+    #[test]
+    fn every_row_of_the_table_is_the_row_the_design_gives_and_nothing_else_is_there() {
+        // The golden file is written from Appendix B of the design, not from `ROUTES`; the two are compared
+        // exactly. A scope changed on a route (`POST /api/link/start` from `link.manage` to `link.read`),
+        // a method, a `since`, a route added or one dropped fails here until the file says the same.
+        let (mut want, added) = golden_rows();
+        let mut have: Vec<String> = ROUTES.iter().map(golden_line).collect();
+        want.sort();
+        have.sort();
+        let missing: Vec<&String> = want.iter().filter(|w| !have.contains(w)).collect();
+        let extra: Vec<&String> = have.iter().filter(|h| !want.contains(h)).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "rows the design has and the table does not:\n{}\nrows the table has and the design does not:\n{}",
+            missing
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            extra
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert_eq!(want, have);
+        // 161 existing pairs, 41 new and 60 reserved (Appendix B), less the reserved `GET /api/update` that
+        // was built under another name, plus the four routes the code gained since.
+        assert_eq!(
+            want.len(),
+            161 + 41 + 60 - 1 + 4,
+            "the rows of the design and its four documented differences"
+        );
+        assert_eq!(
+            added, 4,
+            "the differences from the appendix are the four the file lists"
+        );
+        let mut unique = want.clone();
+        unique.dedup();
+        assert_eq!(unique.len(), want.len(), "no row twice");
+    }
+
+    #[test]
+    fn what_the_golden_file_does_not_say_of_a_row_is_pinned_here() {
+        // The appendix says "own rule, 4.7" for a cookie session and "role read from the credential" for a
+        // desk: the table holds no elevation on the five session routes and all three roles on the desk one.
+        let sessions: Vec<&Route> = ROUTES
+            .iter()
+            .filter(|r| matches!(r.class, Class::Session { .. }))
+            .collect();
+        assert_eq!(sessions.len(), 5);
+        assert!(sessions
+            .iter()
+            .all(|r| r.class == Class::Session { elevate: false }));
+        let desk: Vec<&Route> = ROUTES
+            .iter()
+            .filter(|r| matches!(r.class, Class::Desk { .. }))
+            .collect();
+        assert_eq!(desk.len(), 1);
+        assert_eq!(
+            desk[0].class,
+            Class::Desk {
+                roles: &[DeskRole::Dashboard, DeskRole::Agent, DeskRole::Flows]
+            }
+        );
+    }
+
     #[test]
     fn a_pattern_is_old_when_any_method_of_it_has_a_row_from_before_the_model() {
         // `/api/bridge/pairing` has the old `GET` and `POST` and the `DELETE` the table adds: the pattern is old.
