@@ -767,6 +767,16 @@ in parts through internal routes with a secret made for that one backup.
   have left it; a key stays only with the address it was kept for, and what the restore read from
   another service is read again). A test takes every setting the table lets an undo carry, once
   with every value set and once with every value empty, and shows that an undo puts each back.
+  **An address goes back exactly as you had it**, whatever it holds: a name and password, a
+  parameter of its own (`?tenant=acme`), a fragment, a key in the path, an address written without
+  its scheme. What a backup holds or a restore writes has no credential in an address (see
+  [Include my API provider keys](#include-my-api-provider-keys)); the undo copy is not a backup. It stays on this
+  computer, and the Agent's page writes it with the addresses as they are (an address cleaned
+  there would no longer be yours, and the key kept for it would be dropped). The desktop's table
+  refuses in an undo only what is not an address at all: text with a control character, a sealed
+  value, or one over 2,048 characters. A test takes a list of addresses of every such form
+  (`testdata/address-corpus.json`), in the provider list and as the media service's, and shows that
+  a restore then an undo leaves every setting as it was, key included (the desktop's tests read the same list).
   The result names the providers that were taken away. (A copy whose
   list of providers was empty is read as an empty list.)
 - **The page's secret.** Every request the page makes about a restore carries a secret the

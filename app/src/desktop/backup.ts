@@ -180,6 +180,12 @@ export interface ExportOptions {
   flush?: () => Promise<void>;
   now?: () => Date;
   limits?: Partial<Limits>;
+  /**
+   * The undo copy: the person's own state as it is, so an address is written exactly as it is held (with the name and password, or
+   * the parameter of its own, that the person put in it). A backup is not made this way: what goes into one has no credential in an
+   * address (see `addressWithoutCredentials`). The desktop puts the copy back as it is, so an undo leaves every address as it was.
+   */
+  exact?: boolean;
 }
 
 /** Where the parts go. */
@@ -389,6 +395,8 @@ export async function exportAgentStorage(storage: AgentStorage, target: PartTarg
       // A key is never written in an address: whatever the keys box says, a name and password before the host, and a key in the
       // query, are taken out of the address (the key is what the box is for), and the person is told.
       const clean = (who: string, address: string): string => {
+        // The undo copy is exact: the address the person has, whatever it holds (it stays on this computer and goes back as it is).
+        if (options.exact === true) return address;
         const made = addressWithoutCredentials(address);
         if (made.changed) warnings.push(`${clip(who)}: its address held a name and password, or a key, which a backup never holds. It was saved without them: enter them again as its key after a restore.`);
         return made.address;
@@ -1197,7 +1205,7 @@ async function doImport(desktop: DesktopRef, token: string, storage: AgentStorag
     // Without the API keys: they were sealed here with a key the browser will not let out, and the undo copy is
     // kept by the desktop as plain files. The merge rule never replaces a stored key with an empty one, so
     // an undo does not need them (it also does not roll back keys that a restore brought in).
-    const copy = await exportAgentStorage(storage, target, { includeKeys: false, limits });
+    const copy = await exportAgentStorage(storage, target, { includeKeys: false, exact: true, limits });
     if (!copy.ok) throw new Error(`the undo copy could not be made, so nothing was restored (${copy.error ?? 'unknown reason'})`);
     const left = new Set(copy.skipped);
     const clash = [...writes, ...takeAway].filter((w) => left.has(w.path));

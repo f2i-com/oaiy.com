@@ -812,7 +812,8 @@ fn looks_secret(text: &str) -> bool {
 }
 
 /// Check a scalar against its type. `Err` says what is wrong, in a few words. `exact`: the value is one the person's own page
-/// held (an undo), where an address that is empty means "none" and is a value like any other.
+/// held (an undo), where an address is put back as it was: an empty one means "none", and one that holds a name and password or a
+/// parameter of its own is the person's own and comes back with them.
 fn check_value(ty: &ValueType, value: &Value, is_a_key: bool, exact: bool) -> Result<(), String> {
     match (ty, value) {
         (ValueType::Bool, Value::Bool(_)) => Ok(()),
@@ -836,7 +837,20 @@ fn check_value(ty: &ValueType, value: &Value, is_a_key: bool, exact: bool) -> Re
             }
         }
         (ValueType::Enum(options), Value::String(s)) => if options.iter().any(|o| o == s) { Ok(()) } else { Err("it is not one of the choices".to_string()) },
-        (ValueType::Url { .. }, Value::String(s)) if exact && s.is_empty() => Ok(()),
+        // An undo puts back the address the person's own page held, as it was: the empty one ("none"), one with a name and password or
+        // a parameter of its own (`?tenant=acme`), one written without its scheme. What a backup may hold or a restore may write is
+        // another matter (see `holds_no_credential`): here nothing is cleaned, and nothing the person had is refused for its shape.
+        (ValueType::Url { max_chars }, Value::String(s)) if exact => {
+            if s.chars().count() > *max_chars {
+                Err(format!("longer than {max_chars} characters"))
+            } else if s.chars().any(char::is_control) {
+                Err("it has control characters".to_string())
+            } else if looks_secret(s) {
+                Err("it looks like a key or a sealed value".to_string())
+            } else {
+                Ok(())
+            }
+        }
         (ValueType::Url { max_chars }, Value::String(s)) => {
             if plain_url(s, *max_chars) && !looks_secret(s) {
                 Ok(())

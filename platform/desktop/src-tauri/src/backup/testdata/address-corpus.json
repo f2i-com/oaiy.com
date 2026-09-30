@@ -1,0 +1,28 @@
+{
+  "what": "Addresses the Agent's page and the desktop both read, so that the two sides are tested against the same list (the Agent's tests in app/tests/unit/backup.test.ts and the desktop's in src/backup/tests.rs). `own` are addresses a person may have typed into a provider or the image, video and audio service: an undo puts every one of them back exactly as it was, whatever it holds.",
+  "own": [
+    "https://gw.example/v1",
+    "https://gw.example/v1/",
+    "http://127.0.0.1:8080/v1",
+    "https://gw.example:8443/v1",
+    "https://gw.example/v1?api-version=2024-02-15-preview",
+    "https://gw.example/v1?tenant=acme",
+    "https://alice:pw@proxy.example/v1",
+    "https://alice@gw.example/v1",
+    "https://:pw@gw.example/v1",
+    "https://gw.example/v1#frag",
+    "https://gw.example/v1?token=abc&api-version=1#x",
+    "https://gw.example/v1?a=b c",
+    "https://gw.example/sk-ABC123/v1",
+    "https://gw.example/bot123:ABC/v1",
+    "https://gw.example/v1?api-version=sk-ABCDEF",
+    "https://gw.example/v1?",
+    "https://gw.example/v1#",
+    "https://gw.example/v1;jsessionid=abc",
+    "HTTPS://GW.EXAMPLE/v1",
+    "https://gw.example./v1",
+    "https://gw.exämple/v1",
+    "localhost:11434",
+    "gw.example/v1"
+  ]
+}

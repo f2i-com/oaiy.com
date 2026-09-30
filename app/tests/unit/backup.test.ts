@@ -35,6 +35,7 @@ import { PhoneLine } from '../../src/phoneLine';
 import { setLocalCountry } from '../../src/phoneNumbers';
 import { Vfs } from '../../src/vfs/vfs';
 import TABLE from '../../../platform/desktop/src-tauri/src/backup/table.json?raw';
+import ADDRESS_CORPUS from '../../../platform/desktop/src-tauri/src/backup/testdata/address-corpus.json?raw';
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -2190,5 +2191,71 @@ describe('what an import leaves in the front desk’s storage, run by the real o
     await outreach.tick();
     expect(outreach.get('mine')).toMatchObject({ state: 'done' });
     expect(reports.map((c) => c.id)).toEqual(['mine']);
+  });
+});
+
+/** The addresses the desktop's tests read too (platform/desktop/src-tauri/src/backup/testdata/address-corpus.json). */
+const OWN_ADDRESSES = (JSON.parse(ADDRESS_CORPUS) as { own: string[] }).own;
+
+/** The desktop's part of an undo, as far as the address goes: it hands the page the copy's settings as they were (the desktop's tests hold the other half). */
+async function undoOf(storage: FakeStorage, copyOfSettings: unknown): Promise<ImportOutcome> {
+  const archive = craft({ 'idb/settings.json': JSON.stringify(copyOfSettings) }, { modes: { 'idb/settings.json': 'settings' } });
+  const back = fakeDesktop(archive, { kind: 'undo', apply: { settings: true, keys: false } });
+  return (await applyPendingRestore(DESKTOP, storage, { fetch: back.fetch }))!;
+}
+
+describe('an undo puts every address back as the person had it', () => {
+  it('V8: a restore that touches no setting, then its undo: an address with a parameter of its own, or a name and password, comes back with its key', async () => {
+    const storage = populated();
+    storage.settings = settings({
+      providers: [
+        { id: 'gw', type: 'openai', name: 'Gateway', apiKey: KEY, baseUrl: 'https://gw.example/v1?tenant=acme', modelId: 'm' },
+        { id: 'px', type: 'custom', name: 'Proxy', apiKey: 'proxy-key-CANARY', baseUrl: 'https://alice:pw@proxy.example/v1', modelId: 'm' },
+      ],
+      activeProviderId: 'gw',
+      media: { ...EMPTY_MEDIA, baseUrl: 'https://bob:pw@media.example/v1?tenant=acme#x', apiKey: MEDIA_KEY },
+    });
+    const before = structuredClone(storage.settings);
+    // A restore of a brief only (no setting comes back): the page takes its undo copy first.
+    const restoring = fakeDesktop(craft({ 'opfs/front-desk/brief.md': 'the restored brief' }), { kind: 'restore', apply: { settings: false, keys: false } });
+    expect((await applyPendingRestore(DESKTOP, storage, { fetch: restoring.fetch }))!.ok).toBe(true);
+    const copy = JSON.parse(dec.decode(unzipSync(joined(restoring.posted.undoParts))['idb/settings.json'])) as { providers: Array<{ id: string; baseUrl: string }>; media: { baseUrl: string } };
+    expect(copy.providers.map((p) => [p.id, p.baseUrl]), 'the copy holds the addresses as they are').toEqual([['gw', 'https://gw.example/v1?tenant=acme'], ['px', 'https://alice:pw@proxy.example/v1']]);
+    expect(copy.media.baseUrl).toBe('https://bob:pw@media.example/v1?tenant=acme#x');
+    expect(restoring.posted.undoDone!.warnings ?? [], 'nothing was taken out of the copy, so nothing is said of it').toEqual([]);
+    expect((await undoOf(storage, copy)).ok).toBe(true);
+    expect(storage.settings.providers.map((p) => [p.id, p.baseUrl, p.apiKey])).toEqual([['gw', 'https://gw.example/v1?tenant=acme', KEY], ['px', 'https://alice:pw@proxy.example/v1', 'proxy-key-CANARY']]);
+    expect(storage.settings).toEqual(before);
+  });
+
+  it('a restore and its undo leave every setting as it was, whatever form an address has (the media service too)', async () => {
+    const providers = OWN_ADDRESSES.map((baseUrl, i) => ({ id: `p${i}`, type: 'custom', name: `Provider ${i}`, apiKey: `key-${i}-CANARY`, baseUrl, modelId: 'm' }));
+    expect(OWN_ADDRESSES.length).toBeGreaterThanOrEqual(20);
+    for (const media of OWN_ADDRESSES) {
+      const storage = populated();
+      storage.settings = settings({ providers: providers as Settings['providers'], activeProviderId: 'p3', media: { ...EMPTY_MEDIA, baseUrl: media, apiKey: MEDIA_KEY, enabled: true } });
+      const before = structuredClone(storage.settings);
+      const restoring = fakeDesktop(craft({ 'opfs/front-desk/brief.md': 'the restored brief' }), { kind: 'restore', apply: { settings: false, keys: false } });
+      expect((await applyPendingRestore(DESKTOP, storage, { fetch: restoring.fetch }))!.ok, media).toBe(true);
+      const copy = JSON.parse(dec.decode(unzipSync(joined(restoring.posted.undoParts))['idb/settings.json'])) as Settings;
+      expect(copy.providers.map((p) => p.baseUrl), media).toEqual(OWN_ADDRESSES);
+      expect(copy.media.baseUrl, media).toBe(media);
+      expect((await undoOf(storage, copy)).ok, media).toBe(true);
+      expect(storage.settings, `an undo leaves everything as it was (media ${media})`).toEqual(before);
+      expect(JSON.stringify(storage.settings.providers.map((p) => [p.baseUrl, p.apiKey])), media).toBe(JSON.stringify(providers.map((p) => [p.baseUrl, p.apiKey])));
+    }
+  });
+
+  it('the copy for an undo is exact and a backup is not: two exporters, one setting', async () => {
+    const storage = populated();
+    storage.settings = settings({ providers: [{ id: 'gw', type: 'custom', name: 'Gateway', apiKey: KEY, baseUrl: 'https://alice:pw@gw.example/v1?tenant=acme#f', modelId: 'm' }] as Settings['providers'] });
+    const exact = new Collector();
+    const said = await exportAgentStorage(storage, exact, { includeKeys: false, exact: true });
+    expect(JSON.parse(dec.decode(exact.entries['idb/settings.json'])).providers[0].baseUrl).toBe('https://alice:pw@gw.example/v1?tenant=acme#f');
+    expect(said.warnings).toEqual([]);
+    const backup = new Collector();
+    const warned = await exportAgentStorage(storage, backup, { includeKeys: false });
+    expect(JSON.parse(dec.decode(backup.entries['idb/settings.json'])).providers[0].baseUrl).toBe('https://gw.example/v1');
+    expect(warned.warnings.join('\n')).toContain('Provider “Gateway”: its address held a name and password, or a key');
   });
 });

@@ -7029,6 +7029,63 @@ fn an_undo_hands_the_page_an_empty_media_address() {
     assert_eq!(settings["gate"]["allow"], serde_json::json!([]));
 }
 
+/// The addresses the Agent's page and this side are both tested with (`testdata/address-corpus.json`).
+const ADDRESS_CORPUS: &str = include_str!("testdata/address-corpus.json");
+
+fn address_corpus(list: &str) -> Vec<String> {
+    let corpus: serde_json::Value = serde_json::from_str(ADDRESS_CORPUS).unwrap();
+    let out: Vec<String> = corpus[list].as_array().unwrap_or_else(|| panic!("the corpus has no list {list}")).iter().map(|a| a.as_str().unwrap().to_string()).collect();
+    assert!(out.len() >= 20, "the corpus is not thin: {}", out.len());
+    out
+}
+
+/// The reviewer's x10: the person's own provider list, as the undo copy holds it, through the exact filter. An address with a parameter
+/// of its own or a name and password came back without it, and a provider that has no address is another provider (its key was dropped).
+#[test]
+fn an_undo_keeps_the_address_of_a_provider_and_of_the_media_service_as_the_person_had_it() {
+    use super::table::filter_json_exact;
+    let keys = super::table::table().key_table("agent.settings").unwrap();
+    for address in ["https://gw.example/v1?tenant=acme", "https://alice:pw@proxy.example/v1"].into_iter().map(str::to_string).chain(address_corpus("own")) {
+        let copy = serde_json::json!({ "providers": [{ "id": "gw", "type": "openai", "name": "Gateway", "baseUrl": address }], "media": { "baseUrl": address } });
+        let found = filter_json_exact(keys, &copy, &|_| true);
+        assert_eq!(found.value["providers"][0]["baseUrl"], address.as_str(), "the undo does not put a provider's own address back: {:?}", found.left.iter().map(|l| (&l.path, &l.why)).collect::<Vec<_>>());
+        assert_eq!(found.value["media"]["baseUrl"], address.as_str(), "nor the media service's own address");
+        assert!(found.left.is_empty(), "{address}: {:?}", found.left.iter().map(|l| (&l.path, &l.why)).collect::<Vec<_>>());
+    }
+    // What is not a value an address can be is still refused: a control character (a line break makes a second header), a sealed value.
+    for bad in ["https://gw.example/v1\nX-Evil: 1", "https://gw.example/v1\u{0}", "dpapi:AAAA"] {
+        let copy = serde_json::json!({ "providers": [{ "id": "gw", "type": "openai", "name": "Gateway", "baseUrl": bad }] });
+        assert!(filter_json_exact(keys, &copy, &|_| true).value["providers"][0].get("baseUrl").is_none(), "{bad:?} is not an address the undo carries");
+    }
+    let long = format!("https://gw.example/{}", "a".repeat(2048));
+    let copy = serde_json::json!({ "providers": [{ "id": "gw", "type": "openai", "name": "Gateway", "baseUrl": long }] });
+    assert!(filter_json_exact(keys, &copy, &|_| true).value["providers"][0].get("baseUrl").is_none(), "an address over its length is not carried");
+    // A restore is another matter: an address that holds a credential is not written (see `holds_no_credential`).
+    let restored = super::table::filter_json(keys, &serde_json::json!({ "providers": [{ "id": "gw", "type": "openai", "name": "Gateway", "baseUrl": "https://alice:pw@proxy.example/v1" }] }), &|_| true);
+    assert!(restored.value["providers"][0].get("baseUrl").is_none(), "a restore does not write an address with a name and password");
+}
+
+/// Through a whole undo: what the page is handed is the list it had, at every address it had, whatever the address holds.
+#[test]
+fn an_undo_hands_the_page_every_address_as_the_person_had_it() {
+    let src = TempDir::new("undo-addresses-src");
+    let out = TempDir::new("undo-addresses-out");
+    let file = backup_with_agent(&src.0, &out.0, "a.oaiybackup", agent_archive(&[("opfs/projects/p1/chat.json", b"[]")]), false);
+    let dst = TempDir::new("undo-addresses-dst");
+    restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let own = address_corpus("own");
+    let providers: Vec<serde_json::Value> = own.iter().enumerate().map(|(i, a)| serde_json::json!({ "id": format!("p{i}"), "type": "custom", "name": format!("Provider {i}"), "baseUrl": a, "modelId": "m" })).collect();
+    let before = serde_json::json!({ "providers": providers, "media": { "baseUrl": "https://bob:pw@media.example/v1?tenant=acme#x", "enabled": true }, "gate": { "mode": "open", "allow": [], "deny": [] } });
+    page_takes_import(&dst.0, &agent_archive(&[("idb/settings.json", before.to_string().as_bytes())]), &[]);
+    restore::stage_undo(&dst.0, &options()).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let settings: serde_json::Value = serde_json::from_slice(&zip_entries(&handed_over(&dst.0))["idb/settings.json"]).unwrap();
+    assert_eq!(settings["providers"], before["providers"], "every provider comes back at the address it had");
+    assert_eq!(settings["media"]["baseUrl"], before["media"]["baseUrl"]);
+    assert_eq!(settings["media"]["enabled"], true);
+}
+
 /// A restore (not an undo) does not hand the page an address that is empty: an empty address in a backup is no address, and the
 /// page would take it for a service of another address than the one it keeps. (Only an undo, which puts back what there was, carries it.)
 #[test]
