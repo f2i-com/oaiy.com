@@ -193,6 +193,9 @@ pub struct LoginState {
     last_owner_flush: Mutex<u64>,
     /// Serialises what changes the owner (setup, a password change, a reset).
     pub(crate) owner_gate: tokio::sync::Mutex<()>,
+    /// One write of `owner.json` at a time, from the owner as it is when the write starts: a slow write of an older
+    /// owner can never land after a newer one.
+    owner_write: Mutex<()>,
     pub(crate) setup: SetupCode,
     pub(crate) throttle: Arc<LoginThrottle>,
     anon: Arc<AnonLane>,
@@ -245,6 +248,7 @@ pub fn enable(
         owner_dirty: AtomicBool::new(false),
         last_owner_flush: Mutex::new(opts.clock.now_ms()),
         owner_gate: tokio::sync::Mutex::new(()),
+        owner_write: Mutex::new(()),
         setup,
         throttle,
         anon,
@@ -547,6 +551,9 @@ impl LoginState {
     /// Write the owner as it is in memory, for what may fail without failing the request (a device's use, a
     /// re-hash). A failure is logged, marked for a retry, and audited when the disk is the reason.
     fn persist_owner_best_effort(&self) {
+        // The owner is copied and written under the write lock, so a write that started earlier and is slow is
+        // finished before this one copies anything.
+        let _one_at_a_time = self.owner_write.lock().unwrap_or_else(|e| e.into_inner());
         let Some(doc) = self.owner_lock().clone() else {
             return;
         };
@@ -574,6 +581,24 @@ impl LoginState {
                 }
             }
         }
+    }
+
+    /// Replace the owner by `doc` (a changed password): the new file first, and only when it is written the new
+    /// owner in memory, so that a disk that will not take it leaves the old one in force. Under the write lock, as
+    /// every write of the file is.
+    fn replace_owner(&self, doc: OwnerDoc) -> std::io::Result<()> {
+        let _one_at_a_time = self.owner_write.lock().unwrap_or_else(|e| e.into_inner());
+        owner::write(self.writer.as_ref(), &self.auth_dir, &doc)?;
+        *self.owner_lock() = Some(doc);
+        Ok(())
+    }
+
+    /// Make the first owner: the file, only if there is none, and then the owner in memory, under the write lock.
+    fn create_owner(&self, doc: OwnerDoc) -> Result<(), CreateError> {
+        let _one_at_a_time = self.owner_write.lock().unwrap_or_else(|e| e.into_inner());
+        owner::create_exclusive(self.writer.as_ref(), &self.auth_dir, &doc)?;
+        *self.owner_lock() = Some(doc);
+        Ok(())
     }
 
     /// Write the owner if a use changed it and a minute has passed (or `force`).
@@ -945,7 +970,7 @@ impl LoginState {
             return Err(already_configured());
         }
         let doc = OwnerDoc::new(self.now(), phc);
-        match owner::create_exclusive(self.writer.as_ref(), &self.auth_dir, &doc) {
+        match self.create_owner(doc) {
             Ok(()) => {}
             Err(CreateError::Exists) => return Err(already_configured()),
             Err(CreateError::Io(e)) => {
@@ -962,7 +987,6 @@ impl LoginState {
                 ));
             }
         }
-        *self.owner_lock() = Some(doc);
         self.setup.consume();
         self.throttle.address_succeeded(&pre.info.client_key);
         // Setup is a login: a session, elevated, and the browser's device.
@@ -1192,7 +1216,7 @@ impl LoginState {
         doc.password = phc;
         doc.password_changed_ms = self.now();
         doc.devices.clear();
-        if let Err(e) = owner::write(self.writer.as_ref(), &self.auth_dir, &doc) {
+        if let Err(e) = self.replace_owner(doc) {
             if is_storage_error(&e) {
                 self.critical(
                     "disk.full",
@@ -1205,7 +1229,6 @@ impl LoginState {
                 "The new password could not be written: the old one is still in force.",
             ));
         }
-        *self.owner_lock() = Some(doc);
         for d in &devices {
             self.throttle.forget_device(&d.id);
         }
@@ -1487,23 +1510,22 @@ impl LoginState {
                 (doc, false)
             }
         };
-        let written = if created {
-            owner::create_exclusive(self.writer.as_ref(), &self.auth_dir, &doc).map_err(|e| match e
-            {
-                CreateError::Exists => already_configured(),
-                CreateError::Io(_) => store_unavailable("The owner file cannot be written."),
-            })
-        } else {
-            owner::write(self.writer.as_ref(), &self.auth_dir, &doc)
-                .map_err(|_| store_unavailable("The owner file cannot be written."))
-        };
-        written?;
         let old_devices: Vec<String> = self
             .owner_lock()
             .as_ref()
             .map(|o| o.devices.iter().map(|d| d.id.clone()).collect())
             .unwrap_or_default();
-        *self.owner_lock() = Some(doc);
+        // The file, and then the owner in memory, under the write lock (as every write of the file is).
+        let written = if created {
+            self.create_owner(doc).map_err(|e| match e {
+                CreateError::Exists => already_configured(),
+                CreateError::Io(_) => store_unavailable("The owner file cannot be written."),
+            })
+        } else {
+            self.replace_owner(doc)
+                .map_err(|_| store_unavailable("The owner file cannot be written."))
+        };
+        written?;
         for d in &old_devices {
             self.throttle.forget_device(d);
         }

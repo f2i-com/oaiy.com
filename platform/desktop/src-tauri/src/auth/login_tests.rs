@@ -73,15 +73,30 @@ const REAL_MORE: [&str; 2] = [
     "/api/auth/console/status",
 ];
 
-/// A disk that can be made full.
+/// A disk that can be made full, and slow for what holds a marker.
 struct Disk {
     full: AtomicBool,
     writes: AtomicUsize,
+    /// A write of bytes that hold this marker sleeps this long before it writes.
+    slow: std::sync::Mutex<Option<(Vec<u8>, Duration)>>,
 }
 
 impl FileWriter for Disk {
     fn write(&self, path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
         self.writes.fetch_add(1, Ordering::SeqCst);
+        let slow = self.slow.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some((marker, wait)) = slow {
+            if bytes.windows(marker.len()).any(|w| w == marker.as_slice()) {
+                // On a worker of a multi-threaded runtime the wait hands the worker (and the task that its
+                // wake-ups have queued behind this one) to another thread: a busy disk does not stop the others.
+                match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+                    Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
+                        tokio::task::block_in_place(|| std::thread::sleep(wait))
+                    }
+                    _ => std::thread::sleep(wait),
+                }
+            }
+        }
         if self.full.load(Ordering::SeqCst) {
             return Err(std::io::Error::from_raw_os_error(ENOSPC));
         }
@@ -188,6 +203,7 @@ fn build(b: Build) -> Env {
     let disk = Arc::new(Disk {
         full: AtomicBool::new(false),
         writes: AtomicUsize::new(0),
+        slow: std::sync::Mutex::new(None),
     });
     let mut vars: std::collections::BTreeMap<String, String> = Default::default();
     if b.proxied {
@@ -3568,4 +3584,139 @@ async fn the_login_attack_flag_is_the_dashboards_and_no_other_apps() {
     .json();
     assert_eq!(agent["authenticated"], true, "{agent}");
     assert!(agent.get("loginAttack").is_none(), "{agent}");
+}
+
+// ==================================== the owner file has one writer at a time ==========================
+
+/// The password hash in `owner.json`, as a restart would read it.
+fn hash_on_disk(e: &Env) -> String {
+    owner_file(e)["password"].as_str().unwrap().to_string()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_write_of_the_old_owner_file_does_not_undo_a_password_change() {
+    // Two ways to change the password: the owner's own, and the console's.
+    for by_console in [false, true] {
+        let e = Arc::new(build(Build::default()));
+        let owner = make_owner(&e, PASSWORD).await;
+        let b = browser_from(&e, &owner);
+        let old_hash = hash_on_disk(&e);
+        // A write of the owner file with the old hash in it is slow (a busy disk).
+        *e.disk.slow.lock().unwrap() =
+            Some((old_hash.clone().into_bytes(), Duration::from_millis(500)));
+        // Revoking a device writes the owner file from the owner as it is in memory, and here it is slow.
+        let device = token::parse(b.device.as_ref().unwrap())
+            .unwrap()
+            .id
+            .to_string();
+        let (e2, b2) = (e.clone(), (b.session.clone(), b.csrf.clone()));
+        let slow = tokio::spawn(async move {
+            let browser = Browser {
+                session: b2.0,
+                csrf: b2.1,
+                device: None,
+            };
+            go(
+                &e2,
+                as_page(
+                    &e2,
+                    &browser,
+                    Method::DELETE,
+                    &format!("/api/auth/sessions/{device}"),
+                ),
+            )
+            .await
+            .status
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        // The password change, while that write is still in flight.
+        let status = if by_console {
+            let con = console_token(&e);
+            go(
+                &e,
+                req(&e, Method::POST, "/api/auth/console/reset-password")
+                    .bearer(&con)
+                    .json(json!({ "password": NEW_PASSWORD })),
+            )
+            .await
+            .status
+        } else {
+            go(
+                &e,
+                as_page(&e, &b, Method::POST, "/api/auth/password")
+                    .json(json!({ "current": PASSWORD, "next": NEW_PASSWORD })),
+            )
+            .await
+            .status
+        };
+        assert!(matches!(status, 200 | 204), "{by_console}: {status}");
+        assert_eq!(slow.await.unwrap(), 204, "the device was revoked");
+        assert_ne!(
+            hash_on_disk(&e),
+            old_hash,
+            "{by_console}: owner.json holds the OLD password hash again after the change: a restart would accept the old password"
+        );
+        // And a restart reads the new password.
+        let e3 = restart(
+            Arc::try_unwrap(e)
+                .ok()
+                .expect("nothing else holds the server"),
+            MIN,
+        );
+        assert_eq!(login_as(&e3, PASSWORD, "203.0.113.9").await.status, 401);
+        assert_eq!(
+            login_as(&e3, NEW_PASSWORD, "203.0.113.10").await.status,
+            200
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_password_changes_at_once_from_the_same_password_make_one_change_and_refuse_the_other()
+{
+    let e = Arc::new(build(Build {
+        hold: Duration::from_millis(150),
+        ..Build::default()
+    }));
+    let owner = make_owner(&e, PASSWORD).await;
+    let first = browser_from(&e, &owner);
+    let second = browser_from(&e, &login_as(&e, PASSWORD, "198.51.100.30").await);
+    // Writing the owner file is slow, so that the second change has time to read the owner while the first is
+    // still writing its own: only the gate stands between them.
+    *e.disk.slow.lock().unwrap() =
+        Some((b"password_changed_ms".to_vec(), Duration::from_millis(300)));
+    let change = |e: Arc<Env>, b: Browser, next: &'static str| {
+        tokio::spawn(async move {
+            go(
+                &e,
+                as_page(&e, &b, Method::POST, "/api/auth/password")
+                    .json(json!({ "current": PASSWORD, "next": next })),
+            )
+            .await
+            .status
+        })
+    };
+    let (a, b) = (
+        change(e.clone(), first, NEW_PASSWORD),
+        change(e.clone(), second, "Qm7&rT2!vX9# kd4Lp"),
+    );
+    let mut statuses = [a.await.unwrap(), b.await.unwrap()];
+    statuses.sort_unstable();
+    assert_eq!(
+        statuses,
+        [204, 401],
+        "the second change asked with a password that was no longer the owner's"
+    );
+    // One of the two new passwords is the owner's now, and the old one is not.
+    assert_eq!(login_as(&e, PASSWORD, "198.51.100.31").await.status, 401);
+    let mut works = 0;
+    for (i, pw) in [NEW_PASSWORD, "Qm7&rT2!vX9# kd4Lp"].iter().enumerate() {
+        works += usize::from(
+            login_as(&e, pw, &format!("198.51.100.{}", 32 + i))
+                .await
+                .status
+                == 200,
+        );
+    }
+    assert_eq!(works, 1);
 }
