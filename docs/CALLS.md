@@ -225,11 +225,12 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
 
   So the `agent` preset (the Agent page, or a hosted web Agent paired to this computer) reads the messages and the
   rings and keeps the message the receptionist takes, and nothing more of these routes; the interim `companion` preset
-  reads the messages, the preview and the rings; and a paired program cannot turn transfers on, nor run a flow of its
-  own (a flow runs only once it is approved, and approving takes `flows.approve`, which is dangerous and on no token but
-  a native one minted with the owner's elevation). The Transfers page's warning that a paired program can change these
-  settings is the `legacy` mode's, and does not yet know the mode. No scope of these is dangerous, and none takes a
-  call to the owner, which only the Companion does. Who marked a message
+  reads the messages, the preview and the rings; and a paired program cannot turn transfers on, whatever else it may
+  do (that is what these scopes say: the flow approval of the access design, which would also keep a flow of its own
+  from running, is not built in the code yet, and the internal token a flow's process is given is not a credential in
+  `scoped` mode). The Transfers page's warning that a paired program can change these settings is the `legacy` mode's,
+  and does not yet know the mode. No scope of these is dangerous, and none takes a call to the owner, which only the
+  Companion does. Who marked a message
   is recorded from the credential that asked ("owner" for the owner's own; "pat: <label>" for a paired app), and a name
   in the request's body is refused. The CORS layer of each mode allows every method the pages send to them, `PATCH` and
   `DELETE` included (in `scoped` mode to a page that has paired, and to no other).
