@@ -19,10 +19,11 @@
 //!    served; the dashboard's URL is required by the other two.
 //! 4. A bind beyond loopback with `OAIY_PUBLIC_URL` needs `OAIY_TRUSTED_PROXIES` ("name your proxy"): that is the
 //!    proxy-only shape, in which a direct peer that is not a trusted proxy is `403 direct_access_refused`.
-//! 5. `OAIY_SERVER_TOKEN` is a token and not a pattern (`token::check_static_token_shape`: 32 to 256 printable ASCII
-//!    characters worth 128 bits for the alphabet they are written in, at least 8 different, no placeholder word, no run
-//!    that counts or follows the keyboard, no piece of 8 characters twice). Design 4.1 gave it 16 different characters,
-//!    which refused `openssl rand -hex 24` about one time in two.
+//! 5. `OAIY_SERVER_TOKEN` has no common pattern (`token::check_static_token_shape`: 32 to 256 printable ASCII
+//!    characters, an estimated 128 bits for the alphabet they are written in, at least 8 different, no placeholder word, no
+//!    run that counts or follows the keyboard, no piece of 8 characters twice in either case, not a phrase of common words,
+//!    not the digest of a password everyone tries). A guard against the obvious, not a strength meter. Design 4.1 gave it 16
+//!    different characters, which refused `openssl rand -hex 24` about one time in two.
 //! 6. The access mode (`mode::validate_mode`): `shadow` on a proxied or lan install, `legacy` where the web login
 //!    is built in, where an owner exists or where the exposure is not local.
 //!
@@ -41,7 +42,7 @@ use super::clientip::{unmap, Cidr, TrustedProxies};
 use super::host::{parse_port_digits, HostName};
 use super::mode::{validate_mode, AccessMode, Exposure};
 use super::presets::App;
-use super::token::check_static_token_shape;
+use super::token::static_token_refusal;
 
 /// What the environment cannot say: it is looked up by the caller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -548,14 +549,13 @@ pub fn evaluate(env: &dyn Fn(&str) -> Option<String>, facts: &Facts) -> Evaluati
     // 5. the static token.
     let static_token = match nonblank(env, "OAIY_SERVER_TOKEN") {
         None => None,
-        Some(t) => match check_static_token_shape(&t) {
-            Ok(()) => Some(t),
-            Err(shape) => {
+        Some(t) => match static_token_refusal(&t) {
+            None => Some(t),
+            Some(why) => {
                 violate!(
                     Rule::StaticToken,
                     format!(
-                        "{}: use a random value such as `openssl rand -base64 32`, or a token made on the console (`oaiy-server auth token create`)",
-                        shape.message()
+                        "{why}: use a random value such as `openssl rand -base64 32`, or a token made on the console (`oaiy-server auth token create`)"
                     ),
                 );
                 None
@@ -1440,6 +1440,56 @@ mod tests {
     }
 
     // ---- rule 6: the mode -----------------------------------------------------------------------
+
+    /// The line names what was matched (a random hex token with `0000` in it was refused with a line that did not list
+    /// `0000`), says that a random token has one by chance, and never says what the token says.
+    #[test]
+    fn rule_5_the_line_names_what_matched_and_never_the_token() {
+        for (token, names) in [
+            // A random-looking token with `0000` in it: the review's case.
+            ("f450474c461a0000acde4cc71a4d10a9", "\"0000\""),
+            (
+                "d812d74ba4c163bbf58d6fa2605bxxxx96946c9d50880c35500",
+                "\"xxxx\"",
+            ),
+            (
+                "d812d74ba4c163bbf58d6fa2605bchangeme46c9d50880c35500",
+                "\"changeme\"",
+            ),
+            (
+                "k7Qz!mV3#pW9xLd2rn8TbHv4$wN6@cJ1abcdefgh",
+                "characters 33 to 40",
+            ),
+            ("correct-horse-battery-staple-oaiy-2026", "common words"),
+            ("5f4dcc3b5aa765d61d8327deb882cf99", "MD5, SHA-1 or SHA-256"),
+        ] {
+            let e = evaluate(
+                &|n| (n == "OAIY_SERVER_TOKEN").then(|| token.to_string()),
+                &NO_OWNER,
+            );
+            assert_eq!(
+                e.violations.iter().map(|v| v.rule).collect::<Vec<_>>(),
+                [Rule::StaticToken],
+                "{token}"
+            );
+            let line = &e.violations[0].message;
+            assert!(line.contains(names), "{token}: {line}");
+            assert!(
+                line.contains("openssl rand -base64 32") && line.contains("auth token create"),
+                "{line}"
+            );
+            assert!(
+                !line.contains(token),
+                "the whole token is never in the line: {line}"
+            );
+        }
+        // A token that is refused by chance says to make another.
+        let e = evaluate(
+            &|n| (n == "OAIY_SERVER_TOKEN").then(|| "f450474c461a0000acde4cc71a4d10a9".to_string()),
+            &NO_OWNER,
+        );
+        assert!(e.violations[0].message.contains("generate another"));
+    }
 
     #[test]
     fn rule_6_shadow_is_refused_on_a_proxied_or_lan_install_and_allowed_on_a_local_one() {

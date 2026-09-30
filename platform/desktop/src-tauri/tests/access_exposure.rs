@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-/// A token of the kind the server takes (`auth::token::check_static_token_shape`: worth 128 bits, no pattern).
+/// A token of the kind the server takes (`auth::token::check_static_token_shape`: no common pattern).
 const TOKEN: &str = "55Vg_eegIwyr7yMQ_Nh6euAXoVKz9nTnWw8vtNNtxeE";
 #[cfg(feature = "web")]
 const PASSWORD: &str = "k7Qz!mV3#pW9xLd2 rn8Tb";

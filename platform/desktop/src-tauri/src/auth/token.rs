@@ -320,15 +320,26 @@ pub const STATIC_TOKEN_MAX_LEN: usize = 256;
 /// The fewest distinct characters it may be made of.
 pub const STATIC_TOKEN_MIN_DISTINCT: usize = 8;
 /// What it must be worth, in thousandths of a bit: its length times what one character of the alphabet it seems to be
-/// drawn from carries (see [`millibits_per_character`]). 128 bits: 32 hex digits, 22 letters and digits, 44 base64.
+/// drawn from carries (see [`millibits_per_character`]). 128 bits: 32 hex digits, 22 letters and digits, 44 base64. An
+/// estimate by alphabet and length, which says nothing of how the token was made.
 pub const STATIC_TOKEN_MIN_MILLIBITS: usize = 128_000;
-/// A run of this many characters, each the next or the previous one in the character set (`abcdefgh`, `87654321`).
-const SEQUENTIAL_RUN: usize = 8;
+/// A run of this many characters, in the case-folded token, each `step` from the one `stride` places before it.
+const PROGRESSION_RUN: usize = 8;
+/// The longest distance between the characters of a run (`abcdefgh` is 1, `a1b2c3d4e5f6g7h8` reads as a run of letters at
+/// 2, `a0b0c0...`), and the largest step between them (`abcdefgh` is 1, `acegikmo` 2, `adgjmpsv` 3).
+const PROGRESSION_STRIDES: usize = 4;
+const PROGRESSION_STEPS: i32 = 3;
 /// A run of this many characters along one row of the keyboard (`qwerty`, `poiuyt`), whatever the case.
 const KEYBOARD_RUN: usize = 6;
-/// A piece of this many characters that occurs twice. Every token that repeats itself with a period up to its length
-/// less this contains one, so the check for a token made of one short piece over and over is this one.
+/// A piece of this many characters that occurs twice in the case-folded token. Every token that repeats itself with a
+/// period up to its length less this contains one, so the check for a token made of one short piece over and over, in
+/// any case, is this one.
 const REPEATED_PIECE: usize = 8;
+/// The shortest word the list of common words is asked for, and the fewest different ones a phrase is made of.
+const WORD_MIN_LEN: usize = 3;
+const WORDS_MIN_DISTINCT: usize = 3;
+/// How much of the token the words must cover, at least, for it to be a phrase: this many hundredths of its length.
+const WORDS_COVER_PERCENT: usize = 60;
 /// What a token that a person made up, or copied from an example, is likely to contain, whatever the case.
 const PLACEHOLDERS: [&str; 12] = [
     "change-me",
@@ -348,7 +359,9 @@ const KEYBOARD_ROWS: [&str; 3] = ["qwertyuiop", "asdfghjkl", "zxcvbnm"];
 
 /// Why a value is not a static token the server takes (design 4.1 gave it a shape, `^[\x21-\x7e]{32,256}$` with 16
 /// different characters, which refused what `openssl rand -hex 32` makes about one time in four and took
-/// `abcdefghijklmnopqrstuvwxyz0123456789ABCD`: it is now worth 128 bits and no pattern).
+/// `abcdefghijklmnopqrstuvwxyz0123456789ABCD`). It is now worth 128 bits for its alphabet and has no common pattern: a
+/// guard against the obvious, which takes almost every token a tool makes and few that a person does, and not a measure of
+/// how strong a token is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StaticTokenShape {
     TooShort,
@@ -358,15 +371,21 @@ pub enum StaticTokenShape {
     TooFewDistinct,
     /// A word that a placeholder is made of (`change-me`, `password`, `test`, `1234`).
     Placeholder,
-    /// A run that counts up or down, or follows the keyboard.
+    /// A run that counts up or down by a step of 1 to 3 (`abcdefgh`, `acegikmo`, `a1b2c3d4...`), or follows the keyboard.
     Sequential,
-    /// A piece of it occurs twice.
+    /// A piece of it occurs twice, in either case.
     Repeats,
+    /// Mostly common words: a phrase.
+    Words,
+    /// The hex digest of a string that every list of passwords has.
+    KnownDigest,
     /// Its length, for the alphabet it is written in, is worth less than 128 bits.
     TooLittleEntropy,
 }
 
 impl StaticTokenShape {
+    /// The kind of refusal in words, for a list of them. What was matched, and where, is
+    /// [`static_token_refusal`]'s.
     pub fn message(self) -> &'static str {
         match self {
             StaticTokenShape::TooShort => "OAIY_SERVER_TOKEN is shorter than 32 characters",
@@ -378,17 +397,50 @@ impl StaticTokenShape {
                 "OAIY_SERVER_TOKEN is made of fewer than 8 different characters"
             }
             StaticTokenShape::Placeholder => {
-                "OAIY_SERVER_TOKEN has a word in it that a placeholder is made of (change-me, password, secret, token, example, test, admin, default, 1234)"
+                "OAIY_SERVER_TOKEN has a word in it that a placeholder is made of (change-me, password, secret, token, example, test, admin, default, xxxx, 0000, 1234)"
             }
             StaticTokenShape::Sequential => {
-                "OAIY_SERVER_TOKEN has a run of characters that count up or down (abcdefgh, 12345678) or follow the keyboard (qwerty)"
+                "OAIY_SERVER_TOKEN has a run of characters that count up or down (abcdefgh, 12345678, acegikmo, a1b2c3d4e5f6g7h8) or follow the keyboard (qwerty)"
             }
             StaticTokenShape::Repeats => {
-                "OAIY_SERVER_TOKEN repeats itself (a piece of 8 characters occurs twice)"
+                "OAIY_SERVER_TOKEN repeats itself (a piece of 8 characters occurs twice, in either case)"
+            }
+            StaticTokenShape::Words => {
+                "OAIY_SERVER_TOKEN is made mostly of common words: a phrase, not a key"
+            }
+            StaticTokenShape::KnownDigest => {
+                "OAIY_SERVER_TOKEN is, or contains, the MD5, SHA-1 or SHA-256 of a string that is in every list of passwords"
             }
             StaticTokenShape::TooLittleEntropy => {
                 "OAIY_SERVER_TOKEN is too short for what it is made of: it must be worth 128 bits (32 hex digits, 22 letters and digits, 20 printable characters)"
             }
+        }
+    }
+}
+
+/// A refusal with what was matched: the kind, and the one line for the person who has to make another. It says which
+/// word, which run or which piece, by where it is in the token and never what the token says there (a token is a
+/// credential, and a line is kept in a log); a placeholder word is the list's, not the token's.
+struct Refusal {
+    kind: StaticTokenShape,
+    message: String,
+}
+
+impl Refusal {
+    fn of(kind: StaticTokenShape) -> Refusal {
+        Refusal {
+            kind,
+            message: kind.message().to_string(),
+        }
+    }
+
+    /// A refusal that a token that was made at random has by chance now and then: it says so, and what to do.
+    fn by_chance(kind: StaticTokenShape, what: String) -> Refusal {
+        Refusal {
+            kind,
+            message: format!(
+                "OAIY_SERVER_TOKEN {what}; a random token has one now and then by chance, so generate another"
+            ),
         }
     }
 }
@@ -438,83 +490,224 @@ fn millibits_per_character(token: &[u8]) -> usize {
     }
 }
 
-/// A run of [`SEQUENTIAL_RUN`] characters that each differ from the one before by one in the character set.
-fn counts_in_the_character_set(token: &[u8]) -> bool {
-    let mut run = 1;
-    for pair in token.windows(2) {
-        if pair[1].abs_diff(pair[0]) == 1 {
-            run += 1;
-            if run >= SEQUENTIAL_RUN {
-                return true;
+/// A run of [`PROGRESSION_RUN`] characters of `folded` (the token in lower case), each a fixed step from the one a fixed
+/// stride before it, the stride from 1 to [`PROGRESSION_STRIDES`] and the step from 1 to [`PROGRESSION_STEPS`] either
+/// way: `abcdefgh`, `87654321`, `acegikmo`, `adgjmpsv`, and two sequences woven together, `a1b2c3d4e5f6g7h8` (the letters
+/// are a run at stride 2), `AbCdEfGh` (a run once the case is folded). Where it starts and ends, counted from 1.
+fn a_progression(folded: &[u8]) -> Option<(usize, usize)> {
+    for stride in 1..=PROGRESSION_STRIDES {
+        for start in 0..folded.len() {
+            let Some(next) = folded.get(start + stride) else {
+                break;
+            };
+            let step = *next as i32 - folded[start] as i32;
+            if step == 0 || step.abs() > PROGRESSION_STEPS {
+                continue;
             }
-        } else {
-            run = 1;
+            let mut run = 1;
+            let mut at = start;
+            while at + stride < folded.len()
+                && folded[at + stride] as i32 - folded[at] as i32 == step
+            {
+                run += 1;
+                at += stride;
+                if run >= PROGRESSION_RUN {
+                    return Some((start + 1, at + 1));
+                }
+            }
         }
     }
-    false
+    None
 }
 
-/// A piece of [`KEYBOARD_RUN`] characters that is along a row of the keyboard, either way.
-fn follows_the_keyboard(token: &[u8]) -> bool {
-    let lower: Vec<u8> = token.iter().map(u8::to_ascii_lowercase).collect();
-    KEYBOARD_ROWS.iter().any(|row| {
-        let forward = row.as_bytes();
-        let backward: Vec<u8> = forward.iter().rev().copied().collect();
-        lower.windows(KEYBOARD_RUN).any(|piece| {
-            forward.windows(KEYBOARD_RUN).any(|p| p == piece)
-                || backward.windows(KEYBOARD_RUN).any(|p| p == piece)
-        })
-    })
+/// A piece of [`KEYBOARD_RUN`] characters of `folded` that is along a row of the keyboard, either way: where it is, from 1.
+fn along_the_keyboard(folded: &[u8]) -> Option<(usize, usize)> {
+    // A piece as a number, and every piece of a row, forward and backward, sorted, made once.
+    fn number(piece: &[u8]) -> u64 {
+        piece.iter().fold(0u64, |n, b| (n << 8) | *b as u64)
+    }
+    static PIECES: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    let pieces = PIECES.get_or_init(|| {
+        let mut all = Vec::new();
+        for row in KEYBOARD_ROWS {
+            let forward = row.as_bytes();
+            let backward: Vec<u8> = forward.iter().rev().copied().collect();
+            for line in [forward, &backward[..]] {
+                all.extend(line.windows(KEYBOARD_RUN).map(number));
+            }
+        }
+        all.sort_unstable();
+        all.dedup();
+        all
+    });
+    folded
+        .windows(KEYBOARD_RUN)
+        .enumerate()
+        .find(|(_, piece)| pieces.binary_search(&number(piece)).is_ok())
+        .map(|(i, _)| (i + 1, i + KEYBOARD_RUN))
 }
 
-/// A piece of [`REPEATED_PIECE`] characters that occurs twice, the two allowed to overlap.
-fn repeats_a_piece(token: &[u8]) -> bool {
-    let mut seen = std::collections::HashSet::new();
-    token
+/// A piece of [`REPEATED_PIECE`] characters of `folded` that occurs twice, the two allowed to overlap: where the first
+/// and the second are, from 1 (the second the soonest there is, and the first the earliest that it repeats).
+fn a_repeated_piece(folded: &[u8]) -> Option<(usize, usize)> {
+    // Each piece as a number: a token is 256 characters at most, so this is a compare of 30,000 pairs at the most.
+    let pieces: Vec<u64> = folded
         .windows(REPEATED_PIECE)
-        .any(|piece| !seen.insert(piece))
+        .map(|piece| piece.iter().fold(0u64, |n, b| (n << 8) | *b as u64))
+        .collect();
+    for again in 1..pieces.len() {
+        if let Some(first) = pieces[..again].iter().position(|p| *p == pieces[again]) {
+            return Some((first + 1, again + 1));
+        }
+    }
+    None
 }
 
-/// Whether `token` is one the server takes as `OAIY_SERVER_TOKEN`: 32 to 256 printable ASCII characters (0x21 to
-/// 0x7e), at least 8 of them different, worth at least 128 bits for the alphabet it is written in, and no pattern: no
-/// word a placeholder is made of, no run that counts or follows the keyboard, no piece of 8 characters twice.
-/// Every generator of the tokens people use (`openssl rand -hex 32`, `-base64 32`, `uuidgen`, `secrets.token_urlsafe`)
-/// passes about 999 times in a thousand or better, and what a person makes up does not. `oaiy-server` refuses to
-/// start with a token that fails it (`auth::exposure`, rule 5), the guard ignores such a token in `scoped` and
-/// `shadow` mode (the desktop's way), it decides which wide tokens [`bearer_or_static`] takes, and `oaiy-server
-/// check` says so: this is the one function.
-pub fn check_static_token_shape(token: &str) -> Result<(), StaticTokenShape> {
+/// How much of `folded` common words can cover (the most characters that words of [`WORD_MIN_LEN`] or more, which do not
+/// overlap, add up to) and how many different of them are in it anywhere.
+fn common_words(folded: &[u8]) -> (usize, usize) {
+    // Words are letters, and a token with fewer of them than the share the words must cover has no phrase in it (most of
+    // the tokens that tools make, hex among them, stop here).
+    let letters = folded.iter().filter(|b| b.is_ascii_lowercase()).count();
+    if letters * 100 < folded.len() * WORDS_COVER_PERCENT {
+        return (0, 0);
+    }
+    let words = &super::token_words::WORDS;
+    let is_word = |piece: &[u8]| {
+        std::str::from_utf8(piece)
+            .ok()
+            .is_some_and(|p| words.binary_search(&p).is_ok())
+    };
+    // covered[i]: the most that the first i characters hold.
+    let mut covered = vec![0usize; folded.len() + 1];
+    let mut found = std::collections::HashSet::new();
+    for i in 0..folded.len() {
+        covered[i + 1] = covered[i + 1].max(covered[i]);
+        // A word is letters: as far as they go from here, and no further than the longest word.
+        let letters_here = folded[i..]
+            .iter()
+            .take_while(|b| b.is_ascii_lowercase())
+            .count();
+        for len in WORD_MIN_LEN..=letters_here.min(14) {
+            let piece = &folded[i..i + len];
+            if is_word(piece) {
+                found.insert(piece);
+                covered[i + len] = covered[i + len].max(covered[i] + len);
+            }
+        }
+    }
+    (covered[folded.len()], found.len())
+}
+
+/// Judge `token`: the first rule it breaks, with what was matched. [`check_static_token_shape`] and
+/// [`static_token_refusal`] are this, the kind and the line.
+fn judge(token: &str) -> Result<(), Refusal> {
     let bytes = token.as_bytes();
     if !bytes.iter().all(|b| (0x21..=0x7e).contains(b)) {
-        return Err(StaticTokenShape::BadCharacter);
+        return Err(Refusal::of(StaticTokenShape::BadCharacter));
     }
     if bytes.len() < STATIC_TOKEN_MIN_LEN {
-        return Err(StaticTokenShape::TooShort);
+        return Err(Refusal::of(StaticTokenShape::TooShort));
     }
     if bytes.len() > STATIC_TOKEN_MAX_LEN {
-        return Err(StaticTokenShape::TooLong);
+        return Err(Refusal::of(StaticTokenShape::TooLong));
     }
     let mut seen = [false; 128];
     for b in bytes {
         seen[*b as usize] = true;
     }
     if seen.iter().filter(|s| **s).count() < STATIC_TOKEN_MIN_DISTINCT {
-        return Err(StaticTokenShape::TooFewDistinct);
+        return Err(Refusal::of(StaticTokenShape::TooFewDistinct));
     }
     let lower = token.to_ascii_lowercase();
-    if PLACEHOLDERS.iter().any(|word| lower.contains(word)) {
-        return Err(StaticTokenShape::Placeholder);
+    let folded = lower.as_bytes();
+    // (A digest is 32 hex digits or more: a token with no such run has none in it.)
+    let longest_hex_run = folded
+        .split(|b| !b.is_ascii_hexdigit())
+        .map(<[u8]>::len)
+        .max()
+        .unwrap_or(0);
+    if longest_hex_run >= 32
+        && super::token_words::KNOWN_DIGESTS
+            .iter()
+            .any(|digest| lower.contains(digest))
+    {
+        return Err(Refusal::of(StaticTokenShape::KnownDigest));
     }
-    if counts_in_the_character_set(bytes) || follows_the_keyboard(bytes) {
-        return Err(StaticTokenShape::Sequential);
+    if let Some(word) = PLACEHOLDERS.iter().find(|word| lower.contains(*word)) {
+        return Err(Refusal::by_chance(
+            StaticTokenShape::Placeholder,
+            format!(
+                "contains \"{word}\", which a placeholder is made of (change-me, password, secret, token, example, test, admin, default, xxxx, 0000, 1234)"
+            ),
+        ));
     }
-    if repeats_a_piece(bytes) {
-        return Err(StaticTokenShape::Repeats);
+    if let Some((from, to)) = a_progression(folded) {
+        return Err(Refusal::by_chance(
+            StaticTokenShape::Sequential,
+            format!(
+                "has a run of characters that count up or down by a fixed step at characters {from} to {to} (abcdefgh, 12345678, acegikmo, a1b2c3d4e5f6g7h8)"
+            ),
+        ));
     }
-    if bytes.len() * millibits_per_character(bytes) < STATIC_TOKEN_MIN_MILLIBITS {
-        return Err(StaticTokenShape::TooLittleEntropy);
+    if let Some((from, to)) = along_the_keyboard(folded) {
+        return Err(Refusal::by_chance(
+            StaticTokenShape::Sequential,
+            format!("follows a row of the keyboard (qwerty) at characters {from} to {to}"),
+        ));
+    }
+    if let Some((first, again)) = a_repeated_piece(folded) {
+        return Err(Refusal::by_chance(
+            StaticTokenShape::Repeats,
+            format!(
+                "repeats itself: the {REPEATED_PIECE} characters at {first} occur again at {again} (in either case)"
+            ),
+        ));
+    }
+    let (covered, distinct) = common_words(folded);
+    if distinct >= WORDS_MIN_DISTINCT && covered * 100 >= bytes.len() * WORDS_COVER_PERCENT {
+        return Err(Refusal {
+            kind: StaticTokenShape::Words,
+            message: format!(
+                "OAIY_SERVER_TOKEN is made mostly of common words ({covered} of its {} characters, {distinct} different words): a phrase is not a key, so generate a random one",
+                bytes.len()
+            ),
+        });
+    }
+    let millibits = bytes.len() * millibits_per_character(bytes);
+    if millibits < STATIC_TOKEN_MIN_MILLIBITS {
+        return Err(Refusal {
+            kind: StaticTokenShape::TooLittleEntropy,
+            message: format!(
+                "OAIY_SERVER_TOKEN is too short for what it is made of: {} characters of that kind are worth {} bits, and it must be worth 128 (32 hex digits, 22 letters and digits, 20 printable characters)",
+                bytes.len(),
+                millibits / 1000
+            ),
+        });
     }
     Ok(())
+}
+
+/// Whether `token` is one the server takes as `OAIY_SERVER_TOKEN`: 32 to 256 printable ASCII characters (0x21 to
+/// 0x7e), at least 8 of them different, worth at least 128 bits for the alphabet it is written in, and no common pattern:
+/// no word a placeholder is made of, no run that counts (by a step of 1 to 3, at a stride of 1 to 4, in either case) or
+/// follows the keyboard, no piece of 8 characters twice in either case, not mostly common words, and not the digest of a
+/// string that every list of passwords has. It is a guard against the obvious and not a measure of strength: a token
+/// that a person made up and that has none of these passes. Every generator of the tokens people use (`openssl rand
+/// -hex 32`, `-base64 32`, `uuidgen`, `secrets.token_urlsafe`) passes 99.7 times in a hundred or better. `oaiy-server`
+/// refuses to start with a token that fails it (`auth::exposure`, rule 5), the guard ignores such a token in `scoped` and
+/// `shadow` mode (the desktop's way), it decides which wide tokens [`bearer_or_static`] takes, and `oaiy-server check`
+/// says so: this is the one function (with [`static_token_refusal`], which is the same judgement with the line that says
+/// what matched).
+pub fn check_static_token_shape(token: &str) -> Result<(), StaticTokenShape> {
+    judge(token).map_err(|refusal| refusal.kind)
+}
+
+/// The line that says why `token` is refused, naming the word, the run or the piece by where it is in the token (never
+/// what it says there), and what to do; `None` for a token the rule takes. The same judgement as
+/// [`check_static_token_shape`].
+pub fn static_token_refusal(token: &str) -> Option<String> {
+    judge(token).err().map(|refusal| refusal.message)
 }
 
 /// [`bearer_from_headers`], except that the operator's own static token is a bearer whatever its shape
@@ -893,8 +1086,9 @@ mod tests {
         }
         /// `len` characters drawn from `alphabet`.
         fn text(&mut self, len: usize, alphabet: &str) -> String {
-            let a: Vec<char> = alphabet.chars().collect();
-            (0..len).map(|_| a[self.below(a.len())]).collect()
+            // (Every alphabet of these tests is ASCII.)
+            let a = alphabet.as_bytes();
+            (0..len).map(|_| a[self.below(a.len())] as char).collect()
         }
     }
 
@@ -915,7 +1109,13 @@ mod tests {
     }
 
     fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            out.push(DIGITS[(b >> 4) as usize] as char);
+            out.push(DIGITS[(b & 15) as usize] as char);
+        }
+        out
     }
 
     fn base32(bytes: &[u8]) -> String {
@@ -980,6 +1180,23 @@ mod tests {
             ("a password manager's 40 printable characters", |r| {
                 r.text(40, PRINTABLE)
             }),
+            ("openssl rand -hex 48 (96 hex)", |r| hex(&r.bytes(48))),
+            ("openssl rand -base64 24 (32)", |r| {
+                base64::engine::general_purpose::STANDARD.encode(r.bytes(24))
+            }),
+            ("openssl rand -base64 48 (64)", |r| {
+                base64::engine::general_purpose::STANDARD.encode(r.bytes(48))
+            }),
+            ("uuid without its hyphens, twice (64 hex)", |r| {
+                let first = uuid4(r).replace('-', "");
+                format!("{first}{}", uuid4(r).replace('-', ""))
+            }),
+            ("base32 of 25 bytes (40)", |r| base32(&r.bytes(25))),
+            ("tr -dc a-z | head -c 34 (lower case letters)", |r| {
+                r.text(34, "abcdefghijklmnopqrstuvwxyz")
+            }),
+            ("tr -dc A-Za-z0-9 | head -c 40", |r| r.text(40, ALNUM)),
+            ("pwgen -s 64 (letters and digits)", |r| r.text(64, ALNUM)),
         ]
     }
 
@@ -1035,6 +1252,8 @@ mod tests {
             StaticTokenShape::Placeholder,
             StaticTokenShape::Sequential,
             StaticTokenShape::Repeats,
+            StaticTokenShape::Words,
+            StaticTokenShape::KnownDigest,
             StaticTokenShape::TooLittleEntropy,
         ] {
             assert!(reason.message().starts_with("OAIY_SERVER_TOKEN"));
@@ -1087,6 +1306,354 @@ mod tests {
             "zkwdexEjP8A727+Q2moKCafq4F2IVlZbLJOseRU8Ric=",
         ] {
             assert_eq!(check_static_token_shape(token), Ok(()), "{token}");
+        }
+    }
+
+    /// What the review of the rule found it took: phrases of common words, joined or not; sequences that step by two or
+    /// three or that weave two together; a pattern in two cases; the digest of a password everyone tries. Each is named.
+    #[test]
+    fn what_a_person_makes_up_that_the_first_rule_took_is_refused_and_named() {
+        use StaticTokenShape::*;
+        for (token, why) in [
+            // Phrases: words of a list, with and without the characters between them.
+            ("thequickbrownfoxjumpsoverthelazydog", Words),
+            ("the-quick-brown-fox-jumps-over-the-lazy-dog", Words),
+            ("correct-horse-battery-staple-oaiy-2026", Words),
+            ("oaiy-server-production-key-2026-abc", Words),
+            ("dragon-wizard-castle-knight-sword-shield", Words),
+            ("sunshine-and-rainbows-in-the-morning", Words),
+            ("red-orange-yellow-green-blue-indigo-violet", Words),
+            ("Dragon_Wizard_Castle_Knight_Sword_Shield_7", Words),
+            // Sequences that do not step by one, and two that are woven together.
+            ("ACEGIKMOQSUWYacegikmoqsuwy024681", Sequential),
+            ("adgjmpsvybehknqtwzcfilorux+Q7!zk", Sequential),
+            ("a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6", Sequential),
+            ("Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0Kk", Sequential),
+            ("AbCdEfGhIjKlMnOpQrStUvWxYzAbCdEf", Sequential),
+            ("zYxWvUtSrQpOnMlKjIhGfEdCbAzYxWvU", Sequential),
+            // The digest of a password that every list has: hex, and looks random.
+            ("5f4dcc3b5aa765d61d8327deb882cf99", KnownDigest),
+            ("21232f297a57a5a743894a0e4a801fc3", KnownDigest),
+            (
+                "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918",
+                KnownDigest,
+            ),
+            (
+                "5E884898DA28047151D0E56F8DC6292773603D0D6AABBDD62A11EF721D1542D8",
+                KnownDigest,
+            ),
+            // ... and one with something before it.
+            ("ghij5f4dcc3b5aa765d61d8327deb882cf99", KnownDigest),
+        ] {
+            assert_eq!(check_static_token_shape(token), Err(why), "{token}");
+            assert_eq!(
+                static_token_refusal(token).is_some(),
+                true,
+                "{token}: a line for each refusal"
+            );
+        }
+        // A pattern in two cases: the second block is the first with its case turned, which no raw comparison of 8
+        // characters sees (the 8 characters of the first are not the 8 of the second) and the folded token does.
+        let turned = format!(
+            "xYzQwErT{}{}",
+            "XyZqWeRt", "k7Qz!mV3#pW9xLd2rn8TbHv4$wN6@cJ1"
+        );
+        assert!(
+            a_repeated_piece(turned.as_bytes()).is_none(),
+            "raw: no repeat"
+        );
+        assert_eq!(check_static_token_shape(&turned), Err(Repeats));
+        // A period of 2 to 4, in any case, is the repeat (or too few different characters).
+        for period in ["aB", "aBc", "aBcD", "AbCdE", "xYzQwErT"] {
+            let token = period.repeat(40 / period.len() + 1);
+            assert!(
+                matches!(
+                    check_static_token_shape(&token),
+                    Err(TooFewDistinct | Repeats | Sequential)
+                ),
+                "{token}"
+            );
+        }
+        // What is not a phrase: two words in a key, a word among random characters, a dictionary word that a random
+        // token holds by chance.
+        for token in [
+            "k7Qz!mV3#pW9xLd2rn8TbHv4$wN6@cJ1",
+            "horse-Qz7!mV3#pW9xLd2rn8TbHv4$wN6",
+            "Zq7kLmhorse9VbNw2XyHdFg5staple-Rt8PcJ4u",
+            "f450474c461f635bacde4cc71a4d10a9",
+        ] {
+            assert_eq!(check_static_token_shape(token), Ok(()), "{token}");
+        }
+    }
+
+    /// Each new clause at its edge: a run of 8 at a stride of 1 to 4 and a step of 1 to 3, and not 7, 5 or 4 apart; a
+    /// phrase at three words and three fifths, and not two words or a half; a digest of 32 hex digits inside something.
+    #[test]
+    fn the_new_clauses_have_their_edges() {
+        use StaticTokenShape::*;
+        let base = "k7Qz!mV3#pW9xLd2rn8TbHv4$wN6@cJ1";
+        // (Four characters on each side that are no part of any run: the next element of a run is at most four away, and a
+        // neighbour that the case folded into one, `L` for `l`, was found by this test's first version.)
+        let with = |piece: &str| format!("{}~~~~{piece}~~~~{}", &base[..12], &base[12..]);
+        // A run at a stride and a step: 8 elements are a run, 7 are not. The places between the elements are characters
+        // of their own, so that no other stride reads them as a run.
+        for stride in 1..=4usize {
+            for step in [-3i32, -2, -1, 1, 2, 3] {
+                // Letters all the way: from 'a' up by at most 3 eight times is 'v', and from 'z' down the same.
+                let first = if step > 0 { b'a' } else { b'z' } as i32;
+                let make = |len: usize| -> String {
+                    let mut out = vec![0u8; stride * (len - 1) + 1];
+                    for (i, b) in out.iter_mut().enumerate() {
+                        *b = if i % stride == 0 {
+                            (first + (i / stride) as i32 * step) as u8
+                        } else {
+                            b"Q7!z$"[i % 5]
+                        };
+                    }
+                    String::from_utf8(out).unwrap()
+                };
+                assert_eq!(
+                    check_static_token_shape(&with(&make(8))),
+                    Err(Sequential),
+                    "stride {stride} step {step}: {}",
+                    make(8)
+                );
+                assert_eq!(
+                    check_static_token_shape(&with(&make(7))),
+                    Ok(()),
+                    "stride {stride} step {step} at 7: {}",
+                    make(7)
+                );
+            }
+        }
+        // A step of 4 and a stride of 5 are not looked for (a random token has them at 1 in 10^9 and a person
+        // does not write them), and nor is a step of 0: eight of one character is not a count (nine are a repeat, the
+        // rule for repeats', and fewer different characters than 8 a token of its own).
+        for piece in [
+            "aeimquy!",
+            "aeimquyc",
+            "!%)-159=",
+            "a!!!!b!!!!c!!!!d!!!!e!!!!f!!!!g!!!!h",
+            "QQQQQQQQ",
+            "77777777",
+        ] {
+            let verdict = check_static_token_shape(&with(piece));
+            assert!(verdict != Err(Sequential), "{piece}: {verdict:?}");
+        }
+        // A phrase: three different words covering three fifths, and not two, and not a half.
+        let three = "dragon-wizard-castle-7Qz!mV3#pW9xLd2rn8TbHv4"; // 18 of 44 = 41%
+        assert_eq!(check_static_token_shape(three), Ok(()), "{three}");
+        let phrase = |words: &[&str], tail: &str| format!("{}{}", words.join("-"), tail);
+        // 4 words of 6 + 3 separators: 24 covered of 27 + the tail.
+        for (words, tail, taken) in [
+            (&["dragon", "wizard", "castle"][..], "-7Qz!mV3#pW9", true),
+            (&["dragon", "wizard", "castle"][..], "", false),
+            (
+                &["dragon", "wizard"][..],
+                "-7Qz!mV3#pW9xLd2rn8TbHv4$wN6@cJ1",
+                true,
+            ),
+            (&["dragon", "dragon", "dragon"][..], "", false),
+        ] {
+            let token = phrase(words, tail);
+            let verdict = check_static_token_shape(&token);
+            if token.len() < 32 {
+                assert_eq!(verdict, Err(TooShort), "{token}");
+            } else if taken {
+                assert_eq!(verdict, Ok(()), "{token}");
+            } else {
+                assert!(verdict.is_err(), "{token}: {verdict:?}");
+            }
+        }
+        // A repeat may overlap itself: a period of 4 over 12 characters has its first 8 again 4 on, and is the only place
+        // that any piece of 8 occurs twice (at the start, so that the second is at 5: a search that began at 9 misses it).
+        for token in [
+            format!("wXyZwXyZwXyZ~~~~{base}"),
+            format!("{}wXyZwXyZwXyZ~~~~{}", &base[..3], &base[3..]),
+        ] {
+            assert_eq!(check_static_token_shape(&token), Err(Repeats), "{token}");
+        }
+        // "Three different words" and not two: a token of 32 or more characters that two words cover three fifths of is two
+        // words of 20 letters together, and every such pair of this list holds a third word inside them (`admin` in
+        // `administrator`, `pro` in `production`), so the list itself decides those tokens, and 2 or 3 is the same number
+        // here. (A list with longer words without words inside them would make it matter: this says so when it does.)
+        let long: Vec<&str> = crate::auth::token_words::WORDS
+            .iter()
+            .copied()
+            .filter(|w| w.len() >= 7)
+            .collect();
+        let mut pairs = 0;
+        for a in &long {
+            for b in &long {
+                // (A word twice is a repeat, which the rule for repeats refuses whatever the words are.)
+                if a.len() + b.len() < 20 || a == b {
+                    continue;
+                }
+                for joiner in ["", "-"] {
+                    let mut token = format!("{a}{joiner}{b}");
+                    let mut fill = "Q7!#".chars().cycle();
+                    while token.len() < 32 {
+                        token.push(fill.next().unwrap());
+                    }
+                    let (covered, distinct) = common_words(token.to_ascii_lowercase().as_bytes());
+                    assert!(
+                        covered * 100 < token.len() * 60 || distinct >= 3,
+                        "{a}+{b}: covered {covered} of {}, {distinct} different words",
+                        token.len()
+                    );
+                    pairs += 1;
+                }
+            }
+        }
+        assert!(pairs > 10, "{pairs} pairs of long words were looked at");
+        // The share: 11 words of 6 letters and 10 hyphens are 66 of 76 (87%); put random characters after them until the
+        // words are 60% (at 110 characters: 66 of 110) and then one over (111).
+        let words = [
+            "dragon", "wizard", "castle", "knight", "sword", "shield", "tiger", "river", "ocean",
+            "stone", "flame",
+        ];
+        let front = words.join("-"); // 11 words: 6+6+6+6+5+6+5+5+5+5+5 = 60 letters, 10 hyphens
+        assert_eq!(front.len(), 70);
+        let tail_for = |total: usize| {
+            let mut rng = Rng(total as u64);
+            rng.text(total - front.len(), "QZ7!$#")
+        };
+        // 60 letters are 60% of 100 characters and less of 101.
+        let at_100 = format!("{front}{}", tail_for(100));
+        let at_101 = format!("{front}{}", tail_for(101));
+        assert_eq!(check_static_token_shape(&at_100), Err(Words), "{at_100}");
+        assert_ne!(check_static_token_shape(&at_101), Err(Words), "{at_101}");
+        // A digest: 32 hex digits and 64; half of one is not.
+        let md5 = "5f4dcc3b5aa765d61d8327deb882cf99";
+        assert_eq!(check_static_token_shape(md5), Err(KnownDigest));
+        assert_ne!(check_static_token_shape(&md5[..31]), Err(KnownDigest));
+        assert_ne!(
+            check_static_token_shape(&format!(
+                "{}{}",
+                &md5[..31],
+                "g5f4dcc3b5aa765d61d8327deb882cf9"
+            )),
+            Err(KnownDigest)
+        );
+    }
+
+    /// What the line says (N3 of the review): the exact word, or where the run or the piece is, and that a random token has
+    /// one now and then, with what to do; never what the token says. `0000` and `xxxx` and `changeme` were not in the line
+    /// that listed the words, and hit about one random hex token in a thousand.
+    #[test]
+    fn the_line_names_what_matched_and_says_to_generate_another_and_never_quotes_the_token() {
+        // A random-looking hex token with 0000 in it: 32 digits, the 12th to 15th are zeros.
+        let hex0000 = "f450474c461a0000acde4cc71a4d10a9";
+        assert_eq!(
+            check_static_token_shape(hex0000),
+            Err(StaticTokenShape::Placeholder)
+        );
+        let line = static_token_refusal(hex0000).unwrap();
+        assert!(
+            line.contains("\"0000\"")
+                && line.contains("generate another")
+                && line.contains("by chance"),
+            "{line}"
+        );
+        for (token, says) in [
+            (
+                "d812d74ba4c163bbf58d6fa2605bxxxx96946c9d50880c35500",
+                "\"xxxx\"",
+            ),
+            (
+                "d812d74ba4c163bbf58d6fa2605bchangeme46c9d50880c35500",
+                "\"changeme\"",
+            ),
+            (
+                "d812d74ba4c163bbf58d6fa2605bTokEn46c9d50880c35500",
+                "\"token\"",
+            ),
+            (
+                "d812d74ba4c163bbf58d6fa2605b1234a6c9d50880c35500",
+                "\"1234\"",
+            ),
+        ] {
+            let line = static_token_refusal(token).unwrap();
+            assert!(
+                line.contains(says) && line.contains("generate another"),
+                "{token}: {line}"
+            );
+        }
+        // A run, a keyboard row and a repeat: where, and that it is a chance the token may have had.
+        let run = format!(
+            "{}abcdefgh{}",
+            &"k7Qz!mV3#pW9"[..12],
+            "xLd2rn8TbHv4$wN6@cJ1"
+        );
+        let line = static_token_refusal(&run).unwrap();
+        assert!(
+            line.contains("characters 13 to 20") && line.contains("generate another"),
+            "{line}"
+        );
+        let keys = format!("{}qwerty{}", &"k7Qz!mV3#pW9"[..12], "xLd2rn8TbHv4$wN6@cJ1");
+        let line = static_token_refusal(&keys).unwrap();
+        assert!(
+            line.contains("keyboard") && line.contains("characters 13 to 18"),
+            "{line}"
+        );
+        let again = "k7Qz!mV3#pW9xLd2rn8TbHv4$wN6@cJ1k7Qz!mV3";
+        let line = static_token_refusal(again).unwrap();
+        assert!(
+            line.contains("at 1 occur again at 33") && line.contains("generate another"),
+            "{line}"
+        );
+        // Words and a digest say what kind, and to make a random one.
+        let line = static_token_refusal("correct-horse-battery-staple-oaiy-2026").unwrap();
+        assert!(
+            line.contains("common words")
+                && line.contains("5 different words")
+                && line.contains("random one"),
+            "{line}"
+        );
+        let line = static_token_refusal("5f4dcc3b5aa765d61d8327deb882cf99").unwrap();
+        assert!(
+            line.contains("MD5") && line.contains("list of passwords"),
+            "{line}"
+        );
+        // A token that is taken has no line, and the kind and the line agree for every token of a corpus.
+        assert_eq!(
+            static_token_refusal("k7Qz!mV3#pW9xLd2rn8TbHv4$wN6@cJ1"),
+            None
+        );
+        // Never what the token says: no 6 characters of it, in any line (the words are the list's, and the list's are
+        // shorter or are not a piece of this token at that place).
+        let mut rng = Rng(77);
+        for _ in 0..3000 {
+            let token = tampered(&mut rng, &generators());
+            if let Some(line) = static_token_refusal(&token) {
+                assert_eq!(check_static_token_shape(&token).is_err(), true);
+                // (The examples that a line gives of what it looks for are its own, and a token may be made of them.)
+                let mut line = line;
+                for example in [
+                    "abcdefgh",
+                    "12345678",
+                    "acegikmo",
+                    "a1b2c3d4e5f6g7h8",
+                    "change-me",
+                    "password",
+                    "openssl rand -base64 32",
+                ] {
+                    line = line.replace(example, "");
+                }
+                if token.len() >= 32 && token.is_ascii() {
+                    for piece in token.as_bytes().windows(7) {
+                        let piece = std::str::from_utf8(piece).unwrap();
+                        // A placeholder word is the list's own and may be as long as 9 ("change-me"); the rest are not.
+                        if PLACEHOLDERS
+                            .iter()
+                            .any(|w| w.contains(piece) || piece.contains(w))
+                        {
+                            continue;
+                        }
+                        assert!(!line.contains(piece), "{token}: {line}");
+                    }
+                }
+            }
         }
     }
 
@@ -1240,7 +1807,7 @@ mod tests {
             }
             eprintln!("{name}: {:.2}% taken", 100.0 * taken as f64 / N as f64);
             assert!(
-                taken * 1000 >= N * 995,
+                taken * 1000 >= N * 997,
                 "{name}: {taken} of {N} taken; the first one refused: {first_refused:?}"
             );
         }
@@ -1262,6 +1829,13 @@ mod tests {
             return false;
         }
         let lower: String = token.to_lowercase();
+        let lower_chars: Vec<char> = lower.chars().collect();
+        // The digest of a string that every list of passwords has, or a token that contains one.
+        for digest in crate::auth::token_words::KNOWN_DIGESTS {
+            if lower.contains(digest) {
+                return false;
+            }
+        }
         for word in [
             "change-me",
             "changeme",
@@ -1280,20 +1854,22 @@ mod tests {
                 return false;
             }
         }
-        // Each character one step from the one before, eight in a row.
-        let mut run = 1;
-        for i in 1..n {
-            if (chars[i] as i32 - chars[i - 1] as i32).abs() == 1 {
-                run += 1;
-                if run >= 8 {
-                    return false;
+        // Eight characters in a row, in lower case, each the same step from the one a fixed stride before it: every
+        // stride from 1 to 4 and every step of 1 to 3, up or down, from every place.
+        let codes: Vec<i32> = lower_chars.iter().map(|c| *c as i32).collect();
+        for stride in 1..=4usize {
+            for step in [-3i32, -2, -1, 1, 2, 3] {
+                for start in 0..n {
+                    if start + 7 * stride < n
+                        && (0..8)
+                            .all(|j| codes[start + j * stride] == codes[start] + j as i32 * step)
+                    {
+                        return false;
+                    }
                 }
-            } else {
-                run = 1;
             }
         }
         // Six in a row along a row of the keyboard, either way.
-        let lower_chars: Vec<char> = lower.chars().collect();
         for row in ["qwertyuiop", "asdfghjkl", "zxcvbnm"] {
             let forward: Vec<char> = row.chars().collect();
             let backward: Vec<char> = row.chars().rev().collect();
@@ -1306,12 +1882,42 @@ mod tests {
                 }
             }
         }
-        // A piece of eight that occurs at two places.
+        // A piece of eight that occurs at two places, in either case.
         for a in 0..=(n - 8) {
             for b in (a + 1)..=(n - 8) {
-                if chars[a..a + 8] == chars[b..b + 8] {
+                if lower_chars[a..a + 8] == lower_chars[b..b + 8] {
                     return false;
                 }
+            }
+        }
+        // Mostly common words: the most the words can cover, worked out from the end (the rule works from the front), and
+        // how many different ones are in the token at all.
+        let words = crate::auth::token_words::WORDS;
+        // The words as characters, by the letter they begin with.
+        static BY_FIRST: std::sync::OnceLock<Vec<Vec<Vec<char>>>> = std::sync::OnceLock::new();
+        let by_first = BY_FIRST.get_or_init(|| {
+            let mut by_first = vec![Vec::new(); 26];
+            for w in crate::auth::token_words::WORDS {
+                by_first[(w.as_bytes()[0] - b'a') as usize].push(w.chars().collect());
+            }
+            by_first
+        });
+        let mut best = vec![0usize; n + 1];
+        for i in (0..n).rev() {
+            best[i] = best[i + 1];
+            if !lower_chars[i].is_ascii_lowercase() {
+                continue;
+            }
+            for w in &by_first[(lower_chars[i] as u8 - b'a') as usize] {
+                if i + w.len() <= n && lower_chars[i..i + w.len()] == w[..] {
+                    best[i] = best[i].max(w.len() + best[i + w.len()]);
+                }
+            }
+        }
+        if best[0] * 100 >= n * 60 {
+            let distinct = words.iter().filter(|w| lower.contains(*w)).count();
+            if distinct >= 3 {
+                return false;
             }
         }
         // The alphabet: what is left when the `=` at the end is off.
@@ -1368,9 +1974,14 @@ mod tests {
             "asdfgh",
             "mnbvcx",
             "AbCdEfGhIj",
+            "acegikmo",
+            "ADGJMPSV",
+            "a1b2c3d4e5f6g7h8",
+            "AaBbCcDdEeFfGgHh",
+            "aZbYcXdWeVfUgThS",
         ];
         for _ in 0..rng.below(3) {
-            let step = rng.below(9);
+            let step = rng.below(12);
             match step {
                 0 => {
                     let cut = 8 + rng.below(t.len().max(9) - 8);
@@ -1397,6 +2008,36 @@ mod tests {
                 6 | 7 => {
                     let len = 30 + rng.below(30);
                     t = rng.text(len, if step == 6 { "0123456789" } else { "abcd" });
+                }
+                // A phrase of common words, joined or not, with a number or a capital, as a person makes one.
+                8 | 9 => {
+                    let words = crate::auth::token_words::WORDS;
+                    let joiner = ["-", "_", "", " "][rng.below(4)];
+                    let count = 3 + rng.below(6);
+                    let mut phrase: Vec<String> = Vec::new();
+                    for _ in 0..count {
+                        let w = words[rng.below(words.len())];
+                        phrase.push(if rng.below(3) == 0 {
+                            w[..1].to_uppercase() + &w[1..]
+                        } else {
+                            w.to_string()
+                        });
+                    }
+                    t = phrase.join(if joiner == " " { "-" } else { joiner });
+                    if rng.below(2) == 0 {
+                        let digits = 1 + rng.below(6);
+                        t.push_str(&rng.text(digits, "0123456789"));
+                    }
+                }
+                // The digest of a string everyone tries, alone or in a token with something around it.
+                10 => {
+                    let digest = crate::auth::token_words::KNOWN_DIGESTS
+                        [rng.below(crate::auth::token_words::KNOWN_DIGESTS.len())];
+                    t = match rng.below(3) {
+                        0 => digest.to_string(),
+                        1 => format!("{}{digest}", rng.text(4, "ghijklmnop")),
+                        _ => digest.to_uppercase(),
+                    };
                 }
                 _ => t.push_str(&"=".repeat(rng.below(4))),
             }
@@ -1439,6 +2080,8 @@ mod tests {
             "Placeholder",
             "Sequential",
             "Repeats",
+            "Words",
+            "KnownDigest",
             "TooLittleEntropy",
             "BadCharacter",
         ] {

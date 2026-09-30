@@ -63,6 +63,7 @@ pub mod store;
 #[cfg(feature = "web")]
 pub mod throttle;
 pub mod token;
+mod token_words;
 #[cfg(feature = "web")]
 pub mod wordlist;
 

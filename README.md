@@ -288,7 +288,7 @@ server put on a network needs it. It is configured by environment variables, amo
 | `OAIY_SERVER_PORT` | `17972` | the port |
 | `OAIY_SERVER_BIND` | loopback | `lan` listens on every interface, bearer tokens only, and needs an owner login first (`oaiy-server auth init`); or an address |
 | `OAIY_PUBLIC_URL`, `OAIY_TRUSTED_PROXIES` | none | `https://<host>` of the dashboard when a reverse proxy is in front, and the proxy's address or network (required with a bind beyond loopback) |
-| `OAIY_SERVER_TOKEN` | none | a bearer token for its protected routes: 32 to 256 characters worth 128 bits and no pattern (`openssl rand -base64 32`); one that is not stops the server (exit 78) |
+| `OAIY_SERVER_TOKEN` | none | a bearer token for its protected routes: 32 to 256 characters, no common pattern (a guard against the obvious, not a strength meter: `openssl rand -base64 32`); one that has one stops the server (exit 78) |
 | `OAIY_ENGINES_UI` | none | an `oaiy-studio` control port to relay (`http://127.0.0.1:7860`) |
 | `OAIY_VOICE_GATEWAY` | on | `off` leaves 17872 alone, for a server run beside a desktop |
 | `OAIY_PLUGIN_SOURCES` | none | a folder of plugin folders the setup catalog offers |

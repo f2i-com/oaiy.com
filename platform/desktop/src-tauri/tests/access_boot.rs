@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 use oaiy_desktop_lib::auth::routes::{Class, Route, Verb, ROUTES};
 use serde_json::Value;
 
-/// A static token the server takes (`auth::token::check_static_token_shape`: 32 to 256 printable characters worth 128
-/// bits, no pattern and no word an example is made of). One that fails it is a startup refusal (`oaiy-server` exits
+/// A static token the server takes (`auth::token::check_static_token_shape`: 32 to 256 printable characters,
+/// no common pattern and no word an example is made of). One that fails it is a startup refusal (`oaiy-server` exits
 /// 78: see the test of rule 5 below).
 const TOKEN: &str = "34kI-kQagl-ZBnGbe5K5cFscsUBdYtkk7Hc9s9Z-EEM";
 

@@ -2790,7 +2790,7 @@ fn random_printable(len: usize) -> String {
     panic!("the static token rule takes no token of {len} printable characters in 5000 tries");
 }
 
-/// Tokens the static token rule takes (32 to 256 printable characters worth 128 bits, no pattern) that the strict
+/// Tokens the static token rule takes (32 to 256 printable characters, no common pattern) that the strict
 /// bearer rule (`[A-Za-z0-9._~+/=-]`, 128 bytes) alone would refuse.
 fn wide_static_tokens() -> Vec<(&'static str, String)> {
     vec![
