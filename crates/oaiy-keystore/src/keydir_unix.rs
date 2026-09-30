@@ -21,7 +21,8 @@ const MAX_DEPTH: usize = 4096;
 pub(crate) struct KeyDir {
     path: PathBuf,
     dir: File,
-    uid: u32,
+    /// The user this process runs as, which every file and folder of the store must belong to (a test may pretend to be someone else).
+    pub(crate) uid: u32,
     dev: u64,
     ino: u64,
     /// How long [`KeyDir::lock`] waits for another holder.
@@ -37,6 +38,11 @@ fn errno(op: &'static str, e: Errno) -> KeyError {
 impl KeyDir {
     /// Opens the folder (making it `0700` if it is not there), judges it and every directory above it, and holds it.
     pub(crate) fn open(path: &Path) -> Result<KeyDir, KeyError> {
+        KeyDir::open_as(path, rustix::process::geteuid().as_raw())
+    }
+
+    /// [`KeyDir::open`] for the user `uid` (the one this process runs as, except in a test that shows the owner rules are applied).
+    pub(crate) fn open_as(path: &Path, uid: u32) -> Result<KeyDir, KeyError> {
         match fs::symlink_metadata(path) {
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -55,7 +61,6 @@ impl KeyDir {
         })?;
         let dir = File::from(fd);
         let meta = dir.metadata().map_err(|e| KeyError::io("inspect the keys directory", e))?;
-        let uid = rustix::process::geteuid().as_raw();
         perm::check(Kind::Dir, &perm::meta_of(&meta), Some(uid)).map_err(|why| KeyError::Permissions(format!("{}: {why}", path.display())))?;
         let found = KeyDir {
             path: path.to_path_buf(),
@@ -77,7 +82,7 @@ impl KeyDir {
 
     /// Walks `..` from the descriptor to the root, judging every directory on the way: the directories that hold the folder the store is in, as the file
     /// system has them, whatever symbolic links the path went through to get here. Whoever can rename or remove the folder can put another in its place.
-    fn check_ancestors(&self) -> Result<(), KeyError> {
+    pub(crate) fn check_ancestors(&self) -> Result<(), KeyError> {
         let mut current = self.dir.try_clone().map_err(|e| KeyError::io("inspect the keys directory", e))?;
         let (mut dev, mut ino) = (self.dev, self.ino);
         for level in 1..=MAX_DEPTH {

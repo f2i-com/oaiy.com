@@ -480,6 +480,43 @@ mod tests {
         assert_eq!(&**store.get(&n).unwrap().unwrap(), b"new");
         assert_eq!(temporaries(), 0);
     }
+    /// KM16: the owner rule is applied where files and folders are judged: at open, before every operation, for a key file, for the lock file and for every folder
+    /// above. Mutating any of the five to skip the owner (a probe that returned nothing, `None` where `Some(uid)` belongs) left the suite green, because the
+    /// rule itself was tested only as a pure function. This process pretends to be the next user, so that everything it made belongs to "another user"; the
+    /// same thing with a real second account needs root and is the `#[ignore]`d test in `tests/keystore.rs`.
+    #[cfg(unix)]
+    #[test]
+    fn what_another_user_owns_is_refused_at_open_before_each_operation_in_a_file_the_lock_and_the_folders_above() {
+        let scratch = Scratch::new("owner");
+        let keys = scratch.keys();
+        let mut store = FileStore::open(&keys, KeyfileCodec).unwrap();
+        store.put(&name("a.one"), b"1").unwrap();
+        let me = store.dir.uid;
+        let another = |error: KeyError| matches!(&error, KeyError::Permissions(why) if why.contains("another user"));
+        assert!(another(KeyDir::open_as(&keys, me + 1).err().expect("open refuses a folder another user owns")), "open");
+        // at open, on its own: a folder directly under /tmp (root's and sticky, so nothing above it is what refuses: the folders above are judged too, and
+        // here they are the scratch folder's, which would refuse first)
+        if std::env::temp_dir() == Path::new("/tmp") {
+            let direct = std::env::temp_dir().join(format!("oaiy-keystore-owner-{}", std::process::id()));
+            drop(FileStore::open(&direct, KeyfileCodec).unwrap());
+            let refused = KeyDir::open_as(&direct, me + 1).err();
+            fs::remove_dir_all(&direct).unwrap();
+            assert!(
+                matches!(&refused, Some(KeyError::Permissions(why)) if why.contains("another user") && !why.contains("above")),
+                "open did not compare the owner of the folder itself: {refused:?}"
+            );
+        }
+        store.dir.uid = me + 1;
+        assert!(another(store.dir.verify().unwrap_err()), "the folder, before each operation");
+        assert!(another(store.get(&name("a.one")).unwrap_err()), "get");
+        assert!(another(store.dir.read("a.one.kf").expect_err("refused")), "a key file, judged on its own");
+        assert!(another(store.dir.lock(false).err().expect("refused")), "the lock file");
+        if me != 0 {
+            // root owns the folders above in most places, and root is allowed; everyone else's are judged
+            assert!(another(store.dir.check_ancestors().unwrap_err()), "the folders above");
+        }
+    }
+
     /// The lock is what keeps an old file that is still being written: a write that takes longer than a minute (a suspended laptop, a stalled disk) is older than
     /// the age rule, and only the lock tells the other process that the file is alive.
     #[test]

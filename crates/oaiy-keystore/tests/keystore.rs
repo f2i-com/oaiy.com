@@ -37,6 +37,10 @@ impl Drop for Scratch {
     }
 }
 
+fn unhex(text: &str) -> Vec<u8> {
+    (0..text.len() / 2).map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).unwrap()).collect()
+}
+
 /// The keyfile provider, by the name this platform allows: on Windows `keyfile` is refused, and only a test may name the unsafe one.
 fn keyfile() -> ProviderChoice {
     if cfg!(windows) {
@@ -364,9 +368,6 @@ fn no_plaintext_beside_the_blob() {
 /// code), and a file in that format that someone else wrote is read. A later version must read the files of this one.
 #[test]
 fn a_keyfile_is_the_pinned_format_on_disk_and_a_pinned_file_is_read() {
-    fn unhex(text: &str) -> Vec<u8> {
-        (0..text.len() / 2).map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).unwrap()).collect()
-    }
     let first = "4f4149594b463101195a64d1c2e3a8d0c197bc2ddf1df260424530839be9fda34c33e23fdde2795c0000001a6f616979206b657973746f7265206b6e6f776e20616e73776572d57f32c601b74541a0f629ddf6506393553028cb8598860d71ade7a85424bc2e";
     let second = "4f4149594b46310171a3542662649453a76dc19689a899f8bbff6f57b7dd580805c66c809a7aa7770000000300ff01748ed4d0507837dfd14a1edb9e7296d0a9638617d76efe6359acb88933fb2a46";
     let scratch = Scratch::new("kat");
@@ -914,6 +915,138 @@ mod unix {
         );
         assert!(matches!(store.put(&name("vault.pins"), b"x"), Ok(())), "a put replaces the file by renaming, which needs no access to the old one");
         assert_eq!(get(&*store, &name("vault.pins")), Some(b"x".to_vec()));
+    }
+
+    /// Whether a result is the refusal of something that another user owns.
+    fn is_another_user<T>(result: Result<T, KeyError>) -> bool {
+        matches!(result, Err(KeyError::Permissions(why)) if why.contains("another user"))
+    }
+
+    fn require_root() {
+        assert!(
+            rustix::process::geteuid().is_root(),
+            "this test needs root (it makes files that another user owns): build the test binary as yourself, then run it as root, for example \
+             `wsl -d Ubuntu-24.04 -u root -- <the keystore test binary> --ignored`; see scripts in the keystore README"
+        );
+    }
+
+    /// KM16 with a real second account (nobody, 65534). Needs root, so it is `#[ignore]`d; it is run by running the test binary as root. A key file, the keys
+    /// folder, and the folder above it that another user owns are each refused, in the place where each is judged.
+    #[test]
+    #[ignore = "needs root: run the test binary as root with --ignored (see the README)"]
+    fn a_file_a_folder_and_a_parent_that_a_real_other_user_owns_are_refused() {
+        use std::os::unix::fs::chown;
+        require_root();
+        let scratch = Scratch::new("realowner");
+        let store = store(&scratch, ProviderChoice::Keyfile);
+        let n = name("a.one");
+        store.put(&n, b"1").unwrap();
+        let (nobody, root) = (Some(65534), Some(0));
+        let file = file_of(&scratch, "a.one", "kf");
+        chown(&file, nobody, nobody).unwrap();
+        assert!(is_another_user(store.get(&n)), "a key file that another user owns");
+        chown(&file, root, root).unwrap();
+        assert!(store.get(&n).unwrap().is_some());
+        chown(scratch.keys(), nobody, nobody).unwrap();
+        assert!(is_another_user(store.get(&n)), "the keys folder, before each operation");
+        assert!(
+            matches!(open_at(scratch.keys(), ProviderChoice::Keyfile), Err(KeyError::Permissions(why)) if why.contains("another user")),
+            "the keys folder, at open"
+        );
+        chown(scratch.keys(), root, root).unwrap();
+        chown(&scratch.0, nobody, nobody).unwrap();
+        let error = open_at(scratch.keys(), ProviderChoice::Keyfile).err().expect("a folder above that another user owns");
+        assert!(
+            matches!(&error, KeyError::Permissions(why) if why.contains("above the keys directory") && why.contains("another user")),
+            "{error:?}"
+        );
+        chown(&scratch.0, root, root).unwrap();
+        assert!(open_at(scratch.keys(), ProviderChoice::Keyfile).is_ok());
+    }
+
+    const ATTACK_DIR: &str = "OAIY_KS_ATTACK_DIR";
+    const ATTACK_SECONDS: u64 = 5;
+    /// A keyfile (the pinned format) for the name `archive.writer` holding `oaiy keystore known answer`: what the attacker would like the victim to read.
+    const ATTACKER_BLOB: &str = "4f4149594b463101195a64d1c2e3a8d0c197bc2ddf1df260424530839be9fda34c33e23fdde2795c0000001a6f616979206b657973746f7265206b6e6f776e20616e73776572d57f32c601b74541a0f629ddf6506393553028cb8598860d71ade7a85424bc2e";
+
+    /// The attacker of the next test: run by the test binary as another user. It swaps the victim's `keys` folder and its own `evilkeys` folder as fast as it can.
+    #[test]
+    fn child_of_the_uid_swap_stress_swaps_two_folders_as_fast_as_it_can() {
+        let Some(shared) = std::env::var_os(ATTACK_DIR) else { return };
+        let shared = PathBuf::from(shared);
+        let (keys, evil, parked) = (shared.join("keys"), shared.join("evilkeys"), shared.join("parked"));
+        fs::create_dir(&evil).unwrap();
+        fs::write(evil.join("archive.writer.kf"), unhex(ATTACKER_BLOB)).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(ATTACK_SECONDS);
+        let mut swaps = 0u64;
+        while std::time::Instant::now() < deadline {
+            if fs::rename(&keys, &parked).is_ok() {
+                let _ = fs::rename(&evil, &keys);
+                let _ = fs::rename(&parked, &evil);
+                swaps += 1;
+            }
+        }
+        println!("swaps={swaps}");
+    }
+
+    /// M-3, the reviewer's stress with a real second account, made a test (needs root, so `#[ignore]`d; see the README for the command). The victim is root; the
+    /// attacker is uid 65534, running this test binary. The victim's store is opened where it should be (a sticky parent); the parent then becomes world-writable
+    /// and not sticky, which is exactly the reviewer's configuration, and the attacker swaps `keys` and `evilkeys` for five seconds while the victim reads in a
+    /// loop. The reviewer's store accepted 3,388 of the attacker's values and answered `None` 58,442 times in 40 seconds. This one must never return the
+    /// attacker's value and never `None`: it reads its own value, or says that the folder is not where it was (an error). A new `open` in that parent is refused.
+    #[test]
+    #[ignore = "needs root: run the test binary as root with --ignored (see the README)"]
+    fn uid_swap_stress_the_victim_never_reads_the_attackers_value_and_never_gets_none() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+        require_root();
+        let base = Scratch::new("uidswap");
+        fs::set_permissions(&base.0, fs::Permissions::from_mode(0o755)).unwrap();
+        let shared = base.0.join("shared");
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o1777)).unwrap();
+        let store = open_at(shared.join("keys"), ProviderChoice::Keyfile).unwrap();
+        let n = name("archive.writer");
+        let value = canary(80, 32);
+        store.put(&n, &value).unwrap();
+        // the reviewer's configuration: the parent that anyone can rename in
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+        let refused =
+            open_at(shared.join("keys2"), ProviderChoice::Keyfile).err().expect("a new open in a parent that anyone can rename in is refused");
+        assert!(matches!(&refused, KeyError::Permissions(why) if why.contains("not sticky")), "{refused:?}");
+
+        let attacker = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "unix::child_of_the_uid_swap_stress_swaps_two_folders_as_fast_as_it_can", "--test-threads=1", "--nocapture"])
+            .env(ATTACK_DIR, &shared)
+            .uid(65534)
+            .gid(65534)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (mut good, mut errors, mut none, mut attackers) = (0u64, 0u64, 0u64, 0u64);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(ATTACK_SECONDS + 1);
+        while std::time::Instant::now() < deadline {
+            match store.get(&n) {
+                Ok(Some(v)) if *v == value => good += 1,
+                Ok(Some(_)) => attackers += 1,
+                Ok(None) => none += 1,
+                Err(_) => errors += 1,
+            }
+        }
+        let output = attacker.wait_with_output().unwrap();
+        let text = String::from_utf8_lossy(&output.stdout);
+        // (the harness prints the line after "test <name> ... ", so it is searched for, not matched from the start)
+        let swaps: u64 = text
+            .split("swaps=")
+            .nth(1)
+            .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|digits| digits.parse().ok())
+            .unwrap_or_else(|| panic!("the attacker said nothing: {text}"));
+        println!("uid swap stress: attacker swaps {swaps}; victim reads: {good} good, {errors} errors, {none} none, {attackers} attacker values");
+        assert!(swaps > 100, "the attack did not happen ({swaps} swaps): the test proves nothing");
+        assert_eq!(attackers, 0, "the victim read the attacker's value");
+        assert_eq!(none, 0, "the victim was told that a key that exists was never stored");
+        assert!(good > 0, "the victim never read its own value");
     }
 
     fn make_fifo(path: &Path) {
