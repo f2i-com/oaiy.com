@@ -3394,10 +3394,14 @@ fn what_is_merged_again_is_only_what_changed_and_is_held_to_what_the_backup_held
         let theirs = dst.0.join("restore").join(format!("pending-{}", staged.id)).join("theirs").join("calendar").join("calendar.json");
         assert!(theirs.is_file(), "the backup's file is kept as it came");
         let kept_bytes = fs::read(&theirs).unwrap();
-        fs::write(&theirs, if swap == 0 { br#"{"settings":{"business":"Swapped in"}}"#.to_vec() } else { same_size_other(&kept_bytes) }).unwrap();
+        // (The same size, and still a calendar: only what it says is not what was kept.)
+        let same_size = String::from_utf8(kept_bytes.clone()).unwrap().replacen("Acme", "Bcme", 1).into_bytes();
+        assert_eq!(same_size.len(), kept_bytes.len());
+        fs::write(&theirs, if swap == 0 { br#"{"settings":{"business":"Swapped in"}}"#.to_vec() } else { same_size }).unwrap();
         let before = snapshot(&dst.0);
         let ApplyOutcome::Failed(last) = restore::apply_pending(&dst.0) else { panic!("{what}: refused") };
         assert!(last.error.as_deref().unwrap().contains("nothing was changed"), "{what}: {last:?}");
+        assert!(last.error.as_deref().unwrap().contains(if swap == 0 { "is not what was staged" } else { "does not check out" }), "{what}: {last:?}");
         assert_eq!(snapshot(&dst.0), before, "{what}: nothing was changed");
     }
     // What was said of the calendar when it was prepared is said once, not again beside what is said when it is merged again.
