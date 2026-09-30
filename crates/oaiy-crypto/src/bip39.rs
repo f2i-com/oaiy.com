@@ -8,9 +8,11 @@
 //! and the checksum verified, in that order, with `Error::PhraseLength`, `PhraseWord`, `PhraseChecksum`. The checksum is
 //! verified before any key derivation, and the type system keeps it so: the derivation functions take an [`Entropy`], and an
 //! `Entropy` comes only from [`decode`] (or from random bytes or 16 bytes the caller holds), never from unchecked words.
-//! Input over 1024 bytes is refused as `PhraseLength` before it is normalised. White space is Unicode `White_Space` plus U+FEFF
-//! (the byte-order mark, which JavaScript's `\s` counts). A phrase a user made up is never accepted: there is no path from text
-//! to entropy but the checksummed words.
+//! Input over 1024 bytes is refused as `PhraseLength` before it is normalised. **White space is JavaScript's `\s`** (review L-8): TAB, LF, VT, FF, CR, SPACE,
+//! NBSP, U+1680, U+2000 to U+200A, U+2028, U+2029, U+202F, U+205F, U+3000 and the byte-order mark U+FEFF, and not Unicode's `White_Space`, which also has U+0085
+//! (the set is `text::is_js_space`, the same one the kit decoder strips, compared with Node code point by code point). The browser's decoder (V-04) is `normalize('NFKD').
+//! toLowerCase().split(/\s+/)`, so a phrase that one accepts the other accepts: `tests/vectors/text-corpus.json` has 172 phrases, with the verdict of exactly that code
+//! in Node, and this decoder agrees with every one. A phrase a user made up is never accepted: there is no path from text to entropy but the checksummed words.
 //!
 //! The list is embedded (`bip39_english.txt`, SHA-256 [`WORDLIST_SHA256`], the official list): the first four letters of a word
 //! identify it, which is what lets the entry window resolve a word by autocomplete.
@@ -23,7 +25,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use crate::argon;
 use crate::error::Error;
 use crate::kdf::{self, sha256, Purpose};
-use crate::text::push_zeroizing;
+use crate::text::{is_js_space, push_zeroizing};
 use crate::zeroize::{Secret, SecretString};
 
 /// The list, one word per line, LF-terminated.
@@ -120,7 +122,7 @@ pub fn decode(input: &str) -> Result<Entropy, Error> {
             push_zeroizing(&mut lowered, lower);
         }
     }
-    let words: Vec<&str> = lowered.split(|c: char| c.is_whitespace() || c == '\u{feff}').filter(|w| !w.is_empty()).collect();
+    let words: Vec<&str> = lowered.split(is_js_space).filter(|w| !w.is_empty()).collect();
     if words.len() != WORD_COUNT {
         return Err(Error::PhraseLength);
     }

@@ -3,15 +3,24 @@
 //!
 //! The code is `FLRK1-` and 52 unpadded RFC 4648 Base32 characters of the key in groups of four, then a group of four characters that
 //! are the first 20 bits of SHA-256 of the key: `FLRK1-AAAA-...-MZUH` for 32 zero bytes. Decoding ignores case, white space and
-//! hyphens, and checks the checksum before anything else uses the key. Two things are stricter than the JavaScript: only ASCII
-//! letters are upper-cased (the JavaScript maps a few Unicode letters onto `A` to `Z`), and the four unused bits of the 52nd
-//! character must be zero (the JavaScript ignores them, so two spellings of one key decode there and only one here).
+//! hyphens, and checks the checksum before anything else uses the key. **White space is JavaScript's `\s`** (review L-8), the set FormLogic's
+//! `display.trim().toUpperCase().replace(/[\s-]+/g, "")` strips and the one the phrase decoder splits on (`text::is_js_space`): it used to be ASCII only, and refused
+//! a code pasted with a no-break space, an ideographic space, a vertical tab or a byte-order mark, which FormLogic accepts. Three things are stricter than the
+//! JavaScript, on purpose, and each is a class of entries in `tests/vectors/text-corpus.json` (computed by a port of FormLogic's decoder in Node): only ASCII letters
+//! are upper-cased (the JavaScript maps the dotless i, the long s and some ligatures onto `A` to `Z`); the four unused bits of the 52nd character must be zero (the
+//! JavaScript ignores them, so two spellings of one key decode there and only one here); and the input is at most [`MAX_INPUT_BYTES`] bytes. So no code that
+//! this decoder accepts is refused by the JavaScript, and FormLogic should tighten its decoder to the same (see the crate README).
 
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::Error;
 use crate::kdf::{self, sha256, Purpose};
+use crate::text::is_js_space;
 use crate::zeroize::{Secret, SecretString};
+
+/// The longest text `decode` looks at, in bytes: a code is 75 characters, and the rest is room for the white space a person types. Longer is `KitFormat`. (FormLogic's
+/// decoder has no cap; this is one of the places where this decoder is stricter, and `tests/vectors/text-corpus.json` has the boundary: 256 bytes accepted, 257 not.)
+pub const MAX_INPUT_BYTES: usize = 256;
 
 const PREFIX: &str = "FLRK1";
 const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
@@ -78,12 +87,12 @@ impl RecoveryKit {
     /// Reads a code. `Error::KitFormat` for a wrong prefix, length, character or trailing bit; `Error::KitChecksum` when the
     /// checksum does not match the key (typing errors show here, before any derivation).
     pub fn decode(display: &str) -> Result<RecoveryKit, Error> {
-        if display.len() > 256 {
+        if display.len() > MAX_INPUT_BYTES {
             return Err(Error::KitFormat);
         }
         // never longer than the input, so it never grows (review M-4)
         let mut cleaned: Zeroizing<String> = Zeroizing::new(String::with_capacity(display.len()));
-        for c in display.chars().filter(|c| !c.is_ascii_whitespace() && *c != '-') {
+        for c in display.chars().filter(|c| !is_js_space(*c) && *c != '-') {
             cleaned.push(c.to_ascii_uppercase());
         }
         let rest = cleaned.strip_prefix(PREFIX).ok_or(Error::KitFormat)?;

@@ -52,7 +52,7 @@ fn ours_as_model(input: &str) -> Model {
     }
 }
 
-const SEPARATORS: [&str; 12] = [" ", " ", "  ", "\t", "\n", "\r\n", " \n ", "\u{a0}", "\u{3000}", "\u{2003}", "\u{feff} ", "\u{85}"];
+const SEPARATORS: [&str; 12] = [" ", " ", "  ", "\t", "\n", "\r\n", " \n ", "\u{a0}", "\u{3000}", "\u{2003}", "\u{feff} ", "\u{2028}"];
 
 fn fullwidth(text: &str) -> String {
     text.chars().map(|c| if c.is_ascii_lowercase() { char::from_u32(0xff41 + (c as u32 - 'a' as u32)).unwrap() } else { c }).collect()
