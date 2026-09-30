@@ -247,9 +247,12 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
   moment, please." is; and the model's flow goes on as if it had been said. What denies it ("I can't transfer you") or
   only offers it ("would you like me to transfer you?") or hedges it ("I'll try to reach them") is said as written. The
   instructions also name the words. After an acceptance the desktop's own lines say it, and the model says nothing more.
-  **The rule for when it runs** is written in one place, `call.rs`: only on an inbound call, while the owner has transfers
-  on. With transfers off, or on a call this desktop placed or a line to say, the receptionist speaks exactly as it did before
-  transfers existed and no line of it is read for a promise. And what it reads is only a promise that **this call** goes to
+  **The rule for when it runs** is written in one place, `call.rs`: only on an inbound call that was set up with transfers (the
+  owner had them on and the phone could when it began, which is when the model was given the tool: the call's own `allowTransfer`,
+  not the owner's setting of the moment). With transfers off then, or on a call this desktop placed or a line to say, the
+  receptionist speaks exactly as it did before transfers existed and no line of it is read for a promise, even if the owner turns
+  transfers on in the middle of the call; and a call that was offered them stays filtered if the owner turns them off, since a
+  request may be going. And what it reads is only a promise that **this call** goes to
   a person: a line about a call-back or a message ("I'll get the owner to call you back", "the owner will call you", "someone
   will be in touch"), a visit ("the owner will be there on Tuesday"), a link or a menu ("I'll put you through to the menu",
   "I'll connect you with our online booking page"), or a transfer of something else ("I'll transfer the booking to

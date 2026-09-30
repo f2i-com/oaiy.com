@@ -404,6 +404,27 @@ async fn with_transfers_off_or_on_a_call_we_placed_nothing_the_receptionist_says
     assert!(spoken_within(&placed, "I'll transfer you now.", secs(4)).await, "{:?}", placed.speech.spoken());
 }
 
+/// What the promise filter reads is decided by the call, as it was set up, and not by the owner's setting of the moment: a call that was never offered
+/// transfers (they were off when it began) cannot have the owner rung for it, so a line of its own is said as written even if the owner turns transfers
+/// on in the middle of it; and a call that was offered them stays filtered when the owner turns them off, since a request may be going.
+#[tokio::test]
+async fn the_promise_filter_follows_the_call_as_it_was_set_up_and_not_the_owners_setting_of_the_moment() {
+    // Off at the start, on later: never offered, so nothing is swapped.
+    let mut f = flow(owner_settings(false)).await;
+    f.ring.change_settings(&json!({ "enabled": true })).unwrap();
+    assert!(f.aokie.say("I'll transfer you now.").await.is_ok());
+    assert!(spoken_within(&f.aokie, "I'll transfer you now.", secs(3)).await, "said as written: {:?}", f.aokie.speech.spoken());
+    assert!(f.aokie.event("call.line_replaced", Duration::from_millis(400)).await.is_none(), "and no swap is reported");
+    assert!(!f.aokie.speech.spoken().iter().any(|l| l == transfer::WAIT_LINE), "{:?}", f.aokie.speech.spoken());
+    // On at the start, off later: still filtered.
+    let mut g = flow(owner_settings(true)).await;
+    g.ring.change_settings(&json!({ "enabled": false })).unwrap();
+    assert!(g.aokie.say("I'll transfer you now.").await.is_ok());
+    let replaced = g.aokie.event("call.line_replaced", secs(3)).await.expect("a call that was offered transfers stays filtered");
+    assert_eq!(replaced["wanted"], "I'll transfer you now.", "{replaced}");
+    assert!(spoken_within(&g.aokie, transfer::WAIT_LINE, secs(3)).await, "{:?}", g.aokie.speech.spoken());
+}
+
 #[tokio::test]
 async fn a_decline_before_the_phone_names_the_request_to_the_call_is_kept_and_goes_the_moment_it_does() {
     // The reviewer's case: the owner's likeliest click is right after the popup, before the model's line has drained and the phone's answer

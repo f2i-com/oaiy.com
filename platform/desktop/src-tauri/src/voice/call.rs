@@ -1260,9 +1260,12 @@ where
                         // their call is being put through is not true, and is not said, whether the model wrote it before it asked for the owner (its
                         // words come first, then its call), while it rings, or after. The fixed hold line is said in its place while a request is being
                         // made or rings; before any request there is nothing being tried, so a plain "one moment" is; and the model's flow goes on.
-                        // (Only on a call the owner may be rung for: with transfers off, or on a call this desktop placed or a line to say, the receptionist
-                        // speaks exactly as it did before transfers existed, and nothing it says is read for a promise.)
-                        if !text.is_empty() && !speak_only && !outbound && ring.features().transfer && transfer::promises_transfer(&text) {
+                        // (Only on a call that was set up so that the owner may be rung for it (`allow_transfer`: an inbound call, the phone able, and the
+                        // owner's setting on when the call began, which is when the model was given the tool): with transfers off then, or on a call this
+                        // desktop placed or a line to say, the receptionist speaks exactly as it did before transfers existed, and nothing it says is read
+                        // for a promise. The owner's setting of the moment is not asked: turned on in the middle of a call that was never offered them,
+                        // nobody can be rung for it, and a line of its own is not swapped for a hold line.)
+                        if !text.is_empty() && allow_transfer && transfer::promises_transfer(&text) {
                             let line = if transfer.awaiting_owner() || tools.transfer_pending() { transfer.hold_instead(Instant::now()) } else { transfer.wait_instead(Instant::now()) };
                             resume = None;
                             let said = if !begun {
