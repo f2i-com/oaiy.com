@@ -1075,6 +1075,13 @@ pub fn check(env: &dyn Fn(&str) -> Option<String>) -> Report {
             report.violations.push(refusal.to_string());
         }
     }
+    // Flow authority is not here yet: a signed-in dashboard session (not elevated) can write and run flows.
+    if exposure != Exposure::Local {
+        report.warnings.push(format!(
+            "flows: on a {} install a signed-in dashboard session can write and run flows without elevating (flows.write and runs.write are not dangerous scopes: flow authority is ACC-05, not built yet); do not put this install on a network with flows in use until it is (README, The web login)",
+            exposure.name()
+        ));
+    }
     report
 }
 
@@ -1433,6 +1440,32 @@ mod tests {
         assert!(r.violations.is_empty(), "{r:?}");
         let text = r.warnings.join("\n");
         assert!(text.contains("OAIY_PUBLIC_URL"), "{text}");
+    }
+
+    #[test]
+    fn check_warns_that_a_login_on_a_network_can_write_and_run_flows_until_flow_authority_lands() {
+        let dir = TempDir::new("check-flows");
+        // On the machine alone: nothing to say.
+        let r = check_in(&dir, &[]);
+        assert!(!r.warnings.iter().any(|w| w.contains("flows")), "{r:?}");
+        // Behind a proxy, and on a network address: the login is reachable from elsewhere.
+        for extra in [
+            &[("OAIY_PUBLIC_URL", "https://dash.example.com")][..],
+            &[("OAIY_SERVER_BIND", "lan"), ("OAIY_SERVER_TOKEN", "x")][..],
+        ] {
+            let r = check_in(&dir, extra);
+            let warning = r
+                .warnings
+                .iter()
+                .find(|w| w.contains("flows"))
+                .unwrap_or_else(|| panic!("{extra:?}: {r:?}"));
+            assert!(
+                warning.contains("write and run") && warning.contains("ACC-05"),
+                "{warning}"
+            );
+            // A warning is not a refusal: the install starts, and the operator has been told.
+            assert!(r.violations.is_empty(), "{extra:?}: {r:?}");
+        }
     }
 
     #[test]
