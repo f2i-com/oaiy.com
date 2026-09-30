@@ -259,7 +259,7 @@ test('4.7.2 the status page counts live holds by kind against the limits', funct
     holds_fake($r, 'poll', 'b');
     holds_fake($r, 'lookup', 'c');
     $j = $r->call($d, 'GET', '/v1/admin/status')['json'];
-    eq(['soft' => 3, 'hard' => 4, 'measured' => false, 'byKind' => ['poll' => 2, 'lookup' => 1, 'rbx' => 0, 'pair' => 0, 'stream' => 0], 'live' => 3], $j['holds']);
+    eq(['soft' => 3, 'hard' => 4, 'measured' => false, 'byKind' => ['poll' => 2, 'lookup' => 1, 'rbx' => 0, 'pair' => 0, 'stream' => 0, 'admin' => 0], 'live' => 3], $j['holds']);
 });
 
 test('4.7.2 rule 3: with the pool at the soft limit an edge poll is answered at once as a short poll (200, hold.refused, retryAfter, header); wait=0 is never refused', function () {

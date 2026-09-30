@@ -24,7 +24,7 @@ final class CalibrationApi
 {
     public const MAX_HOLD = 35;
 
-    /** GET /v1/admin/hold?wait=N: hold N seconds (0 to 35), exempt from the hold registry, so the client can measure the pool. */
+    /** GET /v1/admin/hold?wait=N: hold N seconds (0 to 35), so the client can measure the pool; at most Holds::adminCap() at once per credential, else 429. */
     public static function hold(Context $ctx, Request $req, ?Principal $p, array $m): Response
     {
         $wait = 5;
@@ -35,13 +35,25 @@ final class CalibrationApi
             }
         }
         $wait = min($wait, self::MAX_HOLD);
-        if (function_exists('set_time_limit')) {
-            @set_time_limit($wait + 10);
-        }
-        $ctx->db->close();
-        $end = Clock::mono() + $wait;
-        while (Clock::mono() < $end) {
-            usleep((int)(min(0.2, max(0.0, $end - Clock::mono())) * 1e6));
+        // A hold pins a worker. It is counted in the registry like any other, and one credential may keep only a handful
+        // (the pool, at most 16) at once: with no bound, ten parallel holds on a five-worker pool starved every other request.
+        $hold = $wait > 0 ? $ctx->holds->acquire('admin', 'tok:' . $p->tokenId, 'core', $wait, $ctx->holds->adminCap()) : null;
+        try {
+            if (function_exists('set_time_limit')) {
+                @set_time_limit($wait + 10);
+            }
+            $ctx->db->close();
+            $end = Clock::mono() + $wait;
+            while (Clock::mono() < $end) {
+                usleep((int)(min(0.2, max(0.0, $end - Clock::mono())) * 1e6));
+                if ($hold !== null) {
+                    $hold->refresh();
+                }
+            }
+        } finally {
+            if ($hold !== null) {
+                $hold->release();
+            }
         }
         return Response::json(200, ['v' => 1, 'waited' => $wait, 'time' => Clock::now()]);
     }

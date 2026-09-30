@@ -141,20 +141,21 @@ test('4.18.7 echo: over 1 MiB is 413 (from the relay: the answer carries X-OAIY-
 
 // ------------------------------------------------------------------------------------------------ hold
 
-test('4.18.7 hold: it waits the seconds asked, is not counted in the registry, and leaves no marker', function () {
+test('4.18.7 hold: it waits the seconds asked, is counted in the registry as an admin hold while it waits, and leaves no marker', function () {
     $r = Relay::make();
     $d = $r->desktop();
     [$a, $b] = $r->fleet(2);
     $t = microtime(true);
     $pend = $a->begin('GET', '/v1/admin/hold?wait=2', ['Authorization' => 'Bearer ' . $d->token]);
     usleep(500000);
-    eq(0, $r->ctx()->holds->liveCount(), 'the calibration hold is exempt: it registers nothing');
+    eq(['admin' => 1], array_filter($r->ctx()->holds->byKind()), 'the calibration hold is in the registry, as its own kind');
     $res = $pend->finish(8);
     $el = microtime(true) - $t;
     eq(200, $res['status'], $res['body']);
     eq(['v' => 1, 'waited' => 2], array_intersect_key(json_decode($res['body'], true), ['v' => 1, 'waited' => 1]));
     between(1.9, 3.3, $el);
     eq('oaiy-relay/1', $res['headers']['x-oaiy-relay']);
+    eq(0, $r->ctx()->holds->liveCount(), 'and no marker is left');
 });
 
 test('4.18.7 hold: many at once are all granted (a pool of any size is measured by pinning it), and a pool full of ordinary holds does not refuse them', function () {
@@ -174,6 +175,48 @@ test('4.18.7 hold: many at once are all granted (a pool of any size is measured 
         $res = $p->finish(10);
         eq(200, $res['status'], $res['body']);
     }
+});
+
+test('4.18.7 hold: one credential may keep only about a pool\'s worth at once - the eighth on an unmeasured pool is 429 - and each credential has its own', function () {
+    $r = Relay::make(['wait' => ['max' => 20]]);
+    $d = $r->desktop();
+    $admin = $r->adminToken();
+    $servers = $r->fleet(9);
+    $pend = [];
+    for ($i = 0; $i < 7; $i++) {
+        $pend[] = $servers[$i]->begin('GET', '/v1/admin/hold?wait=4', ['Authorization' => 'Bearer ' . $d->token]);
+    }
+    usleep(900000);
+    eq(7, $r->ctx()->holds->byKind()['admin'], 'seven are held and counted');
+    $res = $servers[7]->request('GET', '/v1/admin/hold?wait=4', ['Authorization' => 'Bearer ' . $d->token]);
+    eq(429, $res['status'], $res['body']);
+    eq('rate_limited', json_decode($res['body'], true)['error']['code']);
+    eq('1', $res['headers']['retry-after']);
+    eq(7, $r->ctx()->holds->byKind()['admin'], 'the refused one left no marker');
+    // Another credential has a cap of its own.
+    $other = $servers[8]->begin('GET', '/v1/admin/hold?wait=3', ['Authorization' => 'Bearer ' . $admin]);
+    usleep(500000);
+    eq(8, $r->ctx()->holds->byKind()['admin']);
+    // They are in the registry, so an ordinary edge poll finds the pool full and is told to short-poll.
+    $phone = $r->phone($d);
+    $poll = Relay::http($r->serve(), $phone, 'GET', '/v1/poll?wait=2');
+    eq(200, $poll['status'], $poll['body']);
+    eq(true, $poll['json']['hold']['refused'] ?? null, 'the pool is full of calibration holds');
+    foreach ($pend as $p) {
+        eq(200, $p->finish(10)['status']);
+    }
+    eq(200, $other->finish(10)['status']);
+    eq(0, $r->ctx()->holds->liveCount(), 'every marker is gone');
+});
+
+test('4.18.7 hold: the per-credential cap follows the pool - never below 4, two more than the workers, never above 16', function () {
+    $r = Relay::make();
+    $cfg = $r->ctx()->cfg;
+    foreach ([[1, 4], [2, 4], [5, 7], [10, 12], [14, 16], [30, 16], [1000, 16]] as [$w, $cap]) {
+        $h = new Oaiy\Relay\Holds($r->data, new Oaiy\Relay\Effective($cfg, $w, null, null, false, null));
+        eq($cap, $h->adminCap(), "W=$w");
+    }
+    eq(7, $r->ctx()->holds->adminCap(), 'unmeasured: W is assumed to be 5');
 });
 
 test('4.18.7 hold: a bad wait is 400, a phone 403, no credential 401; the admin token may hold', function () {

@@ -21,7 +21,7 @@ defined('OAIY_RELAY') or exit;
  */
 final class Holds
 {
-    public const KINDS = ['poll', 'lookup', 'rbx', 'pair', 'stream'];
+    public const KINDS = ['poll', 'lookup', 'rbx', 'pair', 'stream', 'admin'];
 
     private string $dir;
     private Effective $eff;
@@ -77,7 +77,7 @@ final class Holds
                     continue; // a hold that is being superseded does not count against the pool
                 }
             }
-            if ($m['kind'] === 'lookup') {
+            if ($m['kind'] === 'lookup' || $m['kind'] === 'admin') { // each of these pins a worker of its own, however many one principal has
                 $others++;
             } else {
                 $distinct[$m['principalDir']] = true;
@@ -89,11 +89,18 @@ final class Holds
             throw ApiError::make('rate_limited', 1);
         }
         $limit = $class === 'core' ? $this->eff->heldHard : $this->eff->heldSoft;
-        if ($others >= $limit) {
+        // A calibration hold is refused only by its per-credential cap: its purpose is to fill the pool and see where it stops.
+        if ($kind !== 'admin' && $others >= $limit) {
             $hold->release();
             return null;
         }
         return $hold;
+    }
+
+    /** How many calibration holds one credential may have at once: about the pool, but never more than 16 and never fewer than 4. */
+    public function adminCap(): int
+    {
+        return min(16, max(4, $this->eff->workers + 2));
     }
 
     /**
