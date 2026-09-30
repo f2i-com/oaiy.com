@@ -437,6 +437,12 @@ writes such an address without it (no name or password, no fragment, and in the 
 version of an API, such as `?api-version=2024-02-01`, which an Azure address needs), says so in the
 backup's warnings ("enter it again as its key"), and the desktop's table refuses to bring back an
 address that has one (the dry run lists it under what is not restored). The keys box is for the key.
+**A version is written as a version**: a date (`2024-02-15`, or `2024-02-15-preview`) or up to four
+numbers of up to four digits joined by dots (`1`, `2.1`, `1.0.3`), in the parameter `api-version` or
+`api_version`. Any other value (`api-version=sk-...`, an empty one, a word) is taken out with the
+rest: a value of any shape has room for a short key, and a version does not. The page and the
+desktop hold the same rule, and a test reads one list of addresses (`testdata/address-corpus.json`)
+on each side, so a change to one that the other does not follow fails.
 The desktop's own provider list (`ai/providers.json`, which a backup holds only when the keys box is
 ticked) has no key table: when it comes back, an address in it is saved without the name and password,
 the fragment and the parameters of the query (keeping the version of an API), keys ticked or not, and

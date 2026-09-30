@@ -649,8 +649,12 @@ function pendingFrom(value: unknown, limits: Limits): PendingParse {
  * a key (`api_key`, `key`, `token`, `sig`, `code`, or a name nobody has thought of). The desktop's table holds the same list.
  */
 export const SAFE_QUERY_NAMES: readonly string[] = ['api-version', 'api_version'];
-/** What the value of such a parameter may be (the desktop's table holds the same rule): letters, digits, `-`, `_` and `.`, at most 40. */
-const SAFE_QUERY_VALUE = /^[A-Za-z0-9._-]{0,40}$/;
+/**
+ * What the value of such a parameter may be (the desktop holds the same rule, and the two are tested against one list of addresses):
+ * a version, and nothing that has room for a key. A date (`2024-02-15`, with `-preview` after it if it is one), or up to four numbers of up
+ * to four digits joined by dots (`1`, `2.1`, `1.0.3`).
+ */
+const SAFE_QUERY_VALUE = /^(?:\d{4}-\d{2}-\d{2}(?:-preview)?|\d{1,4}(?:\.\d{1,4}){0,3})$/;
 
 /**
  * An address as a backup may hold it: with no name or password before the host, no fragment, and in its query nothing but the
@@ -665,7 +669,7 @@ export function addressWithoutCredentials(raw: string): { address: string; chang
   } catch {
     return { address: raw, changed: false };
   }
-  // A parameter goes unless it is the version of an API with a plain value (`api-version=sk-…` is a key with a name on it).
+  // A parameter goes unless it is the version of an API, written as a version is (`api-version=sk-…` is a key with a name on it).
   const foreign = new Set([...url.searchParams].filter(([name, value]) => !SAFE_QUERY_NAMES.includes(name.toLowerCase()) || !SAFE_QUERY_VALUE.test(value)).map(([name]) => name));
   if (!url.username && !url.password && !url.hash && foreign.size === 0) return { address: raw, changed: false };
   url.username = '';

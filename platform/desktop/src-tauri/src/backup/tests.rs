@@ -3155,7 +3155,10 @@ fn an_address_that_holds_a_credential_does_not_come_back_and_one_that_names_an_a
         ("http://127.0.0.1:8080/v1/", true),
         ("https://gw.example/v1?api-version=2024-02-01", true),
         ("https://gw.example/v1?API_VERSION=2024-02-01-preview", true),
-        ("https://gw.example/openai/deployments/d?api-version=2024-02-01&api_version=x", true),
+        ("https://gw.example/openai/deployments/d?api-version=2024-02-01&api_version=2024-02-01", true),
+        ("https://gw.example/v1?api-version=1.2.3.4", true),
+        ("https://gw.example/v1#", true),
+        ("HTTPS://gw.example/v1", true),
         ("https://alice:hunter2-CANARY@gw.example/v1", false),
         ("https://alice@gw.example/v1", false),
         ("https://:pw@gw.example/v1", false),
@@ -3165,6 +3168,15 @@ fn an_address_that_holds_a_credential_does_not_come_back_and_one_that_names_an_a
         ("https://gw.example/v1?sig=abc", false),
         ("https://gw.example/v1?a", false),
         ("https://gw.example/v1?api-version=a%20b", false),
+        // The version of an API is a version and nothing that has room for a key: a date, or numbers joined by dots.
+        ("https://gw.example/v1?api-version=", false),
+        ("https://gw.example/v1?api-version=v1", false),
+        ("https://gw.example/v1?api-version=x", false),
+        ("https://gw.example/v1?api-version=abcdefgh", false),
+        ("https://gw.example/v1?api-version=12345", false),
+        ("https://gw.example/v1?api-version=2024-2-15", false),
+        ("https://gw.example/v1?api-version=2024-02-15-Preview", false),
+        ("https://gw.example/v1?api-version=1.2.3.4.5", false),
         ("https://gw.example/v1?api-version=sk-abcdefghijklmnopqrstuvwxyz0123456789ABCD", false),
         ("https://gw.example/v1#token=abc", false),
         ("https://gw.example/v1?", true),
@@ -7039,6 +7051,38 @@ fn address_corpus(list: &str) -> Vec<String> {
     out
 }
 
+/// One list of addresses is read by both sides (`testdata/address-corpus.json`, the Agent's tests read it too): what the page writes
+/// into a backup, what this side makes of an address when it is restored, and whether it comes back at all, are the same address by
+/// address. The reviewer found the two rules drifting (an empty fragment, an upper case scheme); a list both read cannot drift silently.
+#[test]
+fn the_desktop_and_the_agents_page_read_every_address_of_one_list_the_same_way() {
+    use super::table::{address_without_credentials, filter_json, table};
+    let corpus: serde_json::Value = serde_json::from_str(ADDRESS_CORPUS).unwrap();
+    let rows = corpus["backup"].as_array().unwrap();
+    assert!(rows.len() >= 70, "the list is not thin: {}", rows.len());
+    let keys = table().key_table("agent.settings").unwrap();
+    let carried = |address: &str| -> (Option<String>, Option<String>) {
+        let providers = filter_json(keys, &serde_json::json!({ "providers": [{ "id": "p", "type": "custom", "name": "n", "baseUrl": address }] }), &|_| true);
+        let media = filter_json(keys, &serde_json::json!({ "media": { "baseUrl": address, "enabled": true } }), &|_| true);
+        (providers.value["providers"][0].get("baseUrl").and_then(|a| a.as_str()).map(str::to_string), media.value["media"].get("baseUrl").and_then(|a| a.as_str()).map(str::to_string))
+    };
+    for row in rows {
+        let (raw, cleaned) = (row["raw"].as_str().unwrap(), row["cleaned"].as_str().unwrap());
+        let (changed, comes_back) = (row["changed"].as_bool().unwrap(), row["comesBack"].as_bool().unwrap());
+        assert_eq!(address_without_credentials(raw).as_deref(), changed.then_some(cleaned), "{raw}: what is made of it");
+        assert_eq!(address_without_credentials(cleaned), None, "{raw}: what the page writes has nothing more to take out");
+        let there = comes_back.then(|| cleaned.to_string());
+        assert_eq!(carried(cleaned), (there.clone(), there), "{raw}: whether what the page writes comes back");
+        // An address comes back as it is exactly when the page leaves it as it is and it is a web address: one the page cleans is
+        // refused as it stands (a restore of an old backup does not write a credential either).
+        let stands = (!changed && comes_back).then(|| raw.to_string());
+        assert_eq!(carried(raw), (stands.clone(), stands), "{raw}: whether it comes back as it stands");
+    }
+    for expected in [true, false] {
+        assert!(rows.iter().any(|r| r["comesBack"] == expected) && rows.iter().any(|r| r["changed"] == expected), "the list has both kinds of address ({expected})");
+    }
+}
+
 /// The reviewer's x10: the person's own provider list, as the undo copy holds it, through the exact filter. An address with a parameter
 /// of its own or a name and password came back without it, and a provider that has no address is another provider (its key was dropped).
 #[test]
@@ -7094,7 +7138,7 @@ fn providers_and_a_media_service_with_keys() -> serde_json::Value {
             { "id": "gw", "type": "openai", "name": "Gateway", "apiKey": "K-gw", "baseUrl": "https://alice:pw@gw.example/v1" },
             { "id": "tenant", "type": "openai", "name": "Tenant", "apiKey": "K-tenant", "baseUrl": "https://gw.example/v1?tenant=acme" },
             { "id": "local", "type": "custom", "name": "Local", "apiKey": "K-local", "baseUrl": "localhost:11434" },
-            { "id": "upper", "type": "custom", "name": "Upper", "apiKey": "K-upper", "baseUrl": "HTTPS://gw.example/v1" },
+            { "id": "slash", "type": "custom", "name": "Slash", "apiKey": "K-slash", "baseUrl": "https:/gw.example/v1" },
             { "id": "number", "type": "custom", "name": "Number", "apiKey": "K-number", "baseUrl": 7 },
             { "id": "vendor", "type": "openai", "name": "Vendor", "apiKey": "K-vendor" },
             { "id": "blank", "type": "openai", "name": "Blank", "apiKey": "K-blank", "baseUrl": "" },
@@ -7114,7 +7158,7 @@ fn a_key_is_left_out_with_the_address_it_was_for_when_that_address_does_not_come
     use super::table::{filter_json, table, Why};
     let keys = table().key_table("agent.settings").unwrap();
     let found = filter_json(keys, &providers_and_a_media_service_with_keys(), &|_| true);
-    for gone in ["gw", "tenant", "local", "upper", "number"] {
+    for gone in ["gw", "tenant", "local", "slash", "number"] {
         assert_eq!(key_and_address_of(&found.value, gone), (None, None), "{gone}: an address that is refused takes its key with it");
     }
     assert_eq!(key_and_address_of(&found.value, "vendor"), (Some("K-vendor".into()), None), "no address: the vendor's own, and its key stays");
@@ -7153,7 +7197,7 @@ fn a_restore_with_the_keys_box_brings_no_key_for_an_address_it_refuses_and_says_
     restore::stage(&dst.0, &file, PASS, &ticks_of(&[RestoreClass::AgentSettings], true), &options()).unwrap();
     assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
     let handed: serde_json::Value = serde_json::from_slice(&zip_entries(&handed_over(&dst.0))["idb/settings.json"]).unwrap();
-    for gone in ["gw", "tenant", "local", "upper", "number"] {
+    for gone in ["gw", "tenant", "local", "slash", "number"] {
         assert_eq!(key_and_address_of(&handed, gone), (None, None), "{gone}");
     }
     assert_eq!(key_and_address_of(&handed, "vendor").0.as_deref(), Some("K-vendor"));
@@ -7163,7 +7207,7 @@ fn a_restore_with_the_keys_box_brings_no_key_for_an_address_it_refuses_and_says_
     assert!(notes.iter().any(|n| n.starts_with("6 API keys of the Agent's were left out: their addresses do not come back") && n.contains("Enter them again as the key of their providers")), "{notes:?}");
     // Everything that came back for the provider list is a provider with its own address or the vendor's, never a key alone.
     let handed_text = handed.to_string();
-    for canary in ["K-gw", "K-tenant", "K-local", "K-upper", "K-number", "K-media"] {
+    for canary in ["K-gw", "K-tenant", "K-local", "K-slash", "K-number", "K-media"] {
         assert!(!handed_text.contains(canary), "{canary} is not handed to the page");
     }
 }

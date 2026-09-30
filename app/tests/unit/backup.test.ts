@@ -398,7 +398,7 @@ describe('exporting the Agent storage', () => {
   });
 
   it('takes a credential out of an address and nothing else', () => {
-    const same = ['https://gw.example/v1', 'http://127.0.0.1:8080/v1/', 'https://gw.example/v1?api-version=2024-02-01', 'https://gw.example/v1?API_VERSION=x', 'https://gw.example/v1?', 'not an address', ''];
+    const same = ['https://gw.example/v1', 'http://127.0.0.1:8080/v1/', 'https://gw.example/v1?api-version=2024-02-01', 'https://gw.example/v1?API_VERSION=2024-02-01-preview', 'https://gw.example/v1?api-version=1.2.3.4', 'https://gw.example/v1?', 'https://gw.example/v1#', 'not an address', ''];
     for (const address of same) expect(addressWithoutCredentials(address), address).toEqual({ address, changed: false });
     for (const [raw, made] of [
       ['https://alice:hunter2@gw.example/v1', 'https://gw.example/v1'],
@@ -415,6 +415,25 @@ describe('exporting the Agent storage', () => {
       ['https://u:p@gw.example/v1?a', 'https://gw.example/v1'],
     ]) {
       expect(addressWithoutCredentials(raw), raw).toEqual({ address: made, changed: true });
+    }
+  });
+
+  it('cleans every address of one list the way the desktop does (the desktop\u2019s tests read the same list)', () => {
+    const rows = (JSON.parse(ADDRESS_CORPUS) as { backup: Array<{ raw: string; cleaned: string; changed: boolean; comesBack: boolean }> }).backup;
+    expect(rows.length).toBeGreaterThanOrEqual(70);
+    for (const { raw, cleaned, changed } of rows) {
+      expect(addressWithoutCredentials(raw), raw).toEqual({ address: cleaned, changed });
+      expect(addressWithoutCredentials(cleaned), `${raw}: what is written has nothing more to take out`).toEqual({ address: cleaned, changed: false });
+    }
+    expect(rows.some((r) => r.changed) && rows.some((r) => !r.changed)).toBe(true);
+  });
+
+  it('keeps the version of an API only when it is written as a version, so there is no room in it for a key', () => {
+    for (const value of ['2024-02-15', '2024-02-15-preview', '2023-05-15', '1', '2', '1.0', '2.1.3', '1.2.3.4', '0', '9999']) {
+      expect(addressWithoutCredentials(`https://gw.example/v1?api-version=${value}`), value).toEqual({ address: `https://gw.example/v1?api-version=${value}`, changed: false });
+    }
+    for (const value of ['', 'v1', 'x', 'abcdefgh', 'sk-abcdefghijklmnopqrstuvwxyz', '12345', '1234567890123456', '2024-2-15', '2024-02-15-Preview', '2024-02-15-preview-preview', '2024-02-15.1', '1.2.3.4.5', '1.', '.1', '1..2', '-preview', '\u0662\u0660\u0662\u0664-\u0660\u0662-\u0661\u0665', '2024-02-15\n', '1 ', 'a%2Fb']) {
+      expect(addressWithoutCredentials(`https://gw.example/v1?api-version=${value.replace(/[\n ]/g, (c) => encodeURIComponent(c))}`), JSON.stringify(value)).toEqual({ address: 'https://gw.example/v1', changed: true });
     }
   });
 

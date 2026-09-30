@@ -794,7 +794,8 @@ fn plain_text(text: &str) -> bool {
 }
 
 fn plain_url(text: &str, max_chars: usize) -> bool {
-    text.chars().count() <= max_chars && !text.chars().any(|c| c.is_control() || c.is_whitespace()) && (text.starts_with("http://") || text.starts_with("https://")) && text.len() > 8 && holds_no_credential(text)
+    let lower = text.get(..8).unwrap_or(text).to_ascii_lowercase();
+    text.chars().count() <= max_chars && !text.chars().any(|c| c.is_control() || c.is_whitespace()) && (lower.starts_with("http://") || lower.starts_with("https://")) && text.len() > 8 && holds_no_credential(text)
 }
 
 /// The only parameters an address may carry in its query: the version of an API (an Azure address names one). Any other could be a key
@@ -802,16 +803,29 @@ fn plain_url(text: &str, max_chars: usize) -> bool {
 /// the keys box decides whether it travels.
 pub const SAFE_QUERY_NAMES: [&str; 2] = ["api-version", "api_version"];
 
-/// Whether an address holds no credential: no name or password before the host (`https://alice:hunter2@gw.example`), no fragment, and
-/// in its query nothing but the version of an API.
+/// Whether an address holds no credential: no name or password before the host (`https://alice:hunter2@gw.example`), no fragment (an
+/// empty one, a bare `#`, holds nothing: the page's rule is the same), and in its query nothing but the version of an API.
 fn holds_no_credential(text: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(text) else { return false };
-    url.username().is_empty() && url.password().is_none() && url.fragment().is_none() && url.query_pairs().all(|(name, value)| safe_query_pair(&name, &value))
+    url.username().is_empty() && url.password().is_none() && url.fragment().is_none_or(str::is_empty) && url.query_pairs().all(|(name, value)| safe_query_pair(&name, &value))
 }
 
-/// A parameter of a query that may stay: the version of an API, with a plain value (letters, digits, `-`, `_` and `.`, at most 40).
+/// A parameter of a query that may stay: the version of an API, written as a version is (see [`is_api_version`]).
 fn safe_query_pair(name: &str, value: &str) -> bool {
-    SAFE_QUERY_NAMES.contains(&name.to_lowercase().as_str()) && value.len() <= 40 && value.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    SAFE_QUERY_NAMES.contains(&name.to_lowercase().as_str()) && is_api_version(value)
+}
+
+/// What the value of the version of an API may be, and nothing that has room for a key: a date (`2024-02-15`, with `-preview` after
+/// it if it is one), or up to four numbers of up to four digits joined by dots (`1`, `2.1`, `1.0.3`). The Agent's page holds the same
+/// rule (`SAFE_QUERY_VALUE` in `app/src/desktop/backup.ts`), and the two are tested against one list of addresses.
+fn is_api_version(value: &str) -> bool {
+    let digits = |part: &str, most: usize| (1..=most).contains(&part.len()) && part.bytes().all(|b| b.is_ascii_digit());
+    let date = value.strip_suffix("-preview").unwrap_or(value).split('-').collect::<Vec<_>>();
+    if date.len() == 3 && date[0].len() == 4 && date[1].len() == 2 && date[2].len() == 2 && date.iter().all(|part| digits(part, 4)) {
+        return true;
+    }
+    let numbers = value.split('.').collect::<Vec<_>>();
+    numbers.len() <= 4 && numbers.iter().all(|part| digits(part, 4))
 }
 
 /// An address without what an address must not hold (see [`holds_no_credential`]): the name and password, the fragment and every
