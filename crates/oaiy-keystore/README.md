@@ -57,7 +57,7 @@ Tests marked (all) run on every provider the platform has: the keyfile everywher
 |---|---|
 | a round trip; overwrite; delete; list with a prefix; every size from 1 byte to 64 KiB (all) | `keystore::round_trip_overwrite_delete_and_list_for_every_provider` |
 | `Ok(None)` is never stored (all) | `keystore::a_name_that_was_never_stored_is_none_not_an_error` |
-| `Err` is could not read: junk, an empty file, every truncation, every single bit flipped, an extension, a directory in its place, a locked file, an oversized file (all) | `keystore::a_store_that_cannot_read_its_key_is_an_error_and_never_none`, `keystore::a_locked_file_is_an_error_and_a_locked_destination_makes_put_fail_and_keep_the_old_value` (Windows), `keystore::a_file_that_is_far_larger_than_any_secret_is_refused_without_being_read_into_memory` |
+| `Err` is could not read: junk, an empty file, every truncation, every single bit flipped, an extension, a directory in its place, a locked file, an oversized file (all) | `keystore::a_store_that_cannot_read_its_key_is_an_error_and_never_none`, `keystore::a_locked_file_is_an_error_and_a_locked_destination_makes_put_fail_and_keep_the_old_value` (Windows), `keystore::a_file_that_is_far_larger_than_any_secret_is_refused_without_being_read_into_memory` (that it is an error), `no_big_reads::a_file_far_larger_than_any_secret_is_refused_before_it_is_read_into_memory` (that the error comes before the allocation: a counting allocator) |
 | a keys folder that has gone is an error, not an empty store (all) | `keystore::a_keys_directory_that_has_gone_is_an_error_not_an_empty_store` |
 | a blob moved to another name fails (all) | `keystore::a_blob_copied_or_moved_to_another_name_fails_and_never_yields_the_other_secret`, `dpapi::a_blob_that_names_a_master_key_this_user_does_not_hold_is_an_error` |
 | another user's blob fails (Windows, `#[ignore]`) | `dpapi::another_users_blob_fails`: **not run**, it needs a blob made by another Windows account (below); its stand-in, a blob that names a master key this user does not hold, runs |
@@ -95,7 +95,8 @@ One module, `dpapi.rs`, Windows only: the two calls `CryptProtectData` and `Cryp
 copies the plaintext DPAPI returns into a zeroizing buffer, overwrites the system's copy with volatile writes and only then frees it. That overwrite cannot be
 observed from Rust (the memory is not the Rust allocator's); it is covered by review, and the mutant that removes it is reported as surviving.
 
-The tests contain `unsafe` in `tests/zeroize_probe.rs` only: a `GlobalAlloc` that forwards every call to the system allocator and reads a block as it is freed.
+The tests contain `unsafe` in two files, `tests/zeroize_probe.rs` and `tests/no_big_reads.rs`, and nowhere else: each is a `GlobalAlloc` that forwards every call to the system allocator (the first also reads a block
+as it is freed, the second records the largest request), with the safety argument beside it.
 
 ## Dependencies
 
@@ -129,10 +130,11 @@ No dev-dependencies. For the two crates together the workspace lock gained 39 `[
 ## Mutation checks
 
 Each mutant breaks the code in one place (two where noted), runs the crate's whole suite, and restores the file from git: `scratchpad/vault-impl/mutate.ps1` and `mutants.ps1` (kept outside the
-repository; the table is their output). K16 and K17 only run on Unix and were run under WSL; the rest on Windows (K02, K19 and K23 concern DPAPI). **25 mutants: 22 killed, 3 survived** in the first run;
-K11 (a growing read buffer) and K25 (a file read into memory before it is refused) survived the tests as first written, the tests were fixed (`zeroize_probe.rs` looks for the secret's bytes in every freed
-block instead of judging by size; `no_big_reads.rs` counts the allocator's largest request), and both are killed in the table below, whose K11 mutant reads in 4 KiB chunks (an earlier version of it
-called `read_to_end`, which std sizes exactly from the file's length, and was therefore no mutant at all). **Final: 23 killed, 2 survived.**
+repository; the table is their output). K16 and K17 only run on Unix and were run under WSL; the rest on Windows (K02, K19 and K23 concern DPAPI). **25 mutants: 23 killed, 2 survived.** The first run gave 21 killed, one that did not compile (K11) and three survivors (K23, K24, K25). K25 (a file read into memory before it is refused) survived because the
+only test of an oversized file asked for an error, which arrives either way; `no_big_reads.rs` now counts the allocator's largest request and kills it. K11 (a read buffer that grows) needed a mutant that grows:
+its first version did not compile, its second called `read_to_end`, which std sizes exactly from the file's length and so changed nothing, and its third reads in 4 KiB chunks. Against the probe as first
+written (which judged copies by the size of the block) it was not tried; `zeroize_probe.rs` now looks for a distinctive 32-byte run of the secret in every block that is freed or reallocated, with a control that a
+grown buffer is seen, and the chunked K11 is killed by it.
 
 | # | Break | Result | Killed by (up to three tests) |
 |---|---|---|---|
