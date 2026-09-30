@@ -324,6 +324,7 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
 #[cfg(test)]
 mod request_tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn empty_negative_from_generic_clients_is_absent_conditioning() {
