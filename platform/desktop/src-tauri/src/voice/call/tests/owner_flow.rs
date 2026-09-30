@@ -1103,6 +1103,60 @@ async fn in_quiet_hours_nobody_is_rung_and_a_message_is_kept() {
     assert_eq!(f.kept().len(), 1);
 }
 
+/// The reviewer's scenario, on the real call: ask, ring, accept, the owner takes the call, two minutes, the owner hands it back, and the caller
+/// says something that is not an ask. The model asks for the owner all the same: it must be refused for want of an ask, and nothing may reach
+/// the phone (before, the ask from two minutes earlier was still among the last turns, and rang the owner again for "Thanks, that is all
+/// sorted now." and "Okay, bye.").
+#[tokio::test]
+async fn the_ask_that_began_a_ring_is_not_an_ask_for_the_next_request_after_the_owner_hands_the_caller_back() {
+    let mut f = flow(owner_settings(true)).await;
+    f.caller_says(ASKED);
+    f.ring_through("assist_1", 30).await;
+    f.a_device_takes_the_call("assist_1");
+    f.aokie.event("call.transfer", secs(3)).await.expect("accepted");
+    owner_takes_the_session(&f);
+    f.aokie.event("call.handoff", secs(3)).await.expect("the owner has the call");
+    // Two minutes on (past the gap between tries, so it is the ask and not a limit that is being tested).
+    f.ring.set_clock(Arc::new(At(f.ring.clock().local() + chrono::Duration::seconds(120))));
+    let mut back = f.aokie.restart(json!({"allowTransfer": true, "generation": 2, "greeting": "Thank you for waiting.", "resume": {"afterHandoff": true, "handoffSeconds": 120, "via": "return"}})).await;
+    back.begin(json!({}));
+    back.event("call.started", secs(3)).await.expect("the call began again");
+    for said in ["Thanks, that is all sorted now.", "Okay, bye.", "Yeah, sure.", "No thanks.", "Never mind."] {
+        back.hub.note_turn(&back.call, said);
+        let answer = answer_of(asking(&back, transfer::TOOL, json!({"reason": "caller_asked"}))).await.unwrap();
+        assert_eq!((answer["ok"].clone(), answer["output"]["status"].clone(), answer["output"]["reason"].clone()), (json!(false), json!("refused"), json!("caller_did_not_ask")), "after {said:?}: {answer}");
+    }
+    assert!(back.text("formlogic.realtime.tool_call", Duration::from_millis(400)).await.is_none(), "nothing was asked of the phone");
+    // An ask after the hand-back is an ask: judged on its own words.
+    back.hub.note_turn(&back.call, "Actually, can I speak to the owner again?");
+    let asked = asking(&back, transfer::TOOL, json!({"reason": "caller_asked"}));
+    let frame = back.text("formlogic.realtime.tool_call", secs(3)).await.expect("the second request reached the phone");
+    assert_eq!(frame["name"], transfer::TOOL);
+    drop(asked);
+}
+
+/// The other scenario: a ring the owner declined, a minute and a bit on, and the caller says only "No, just take a message please." Nothing
+/// about the gap between tries having passed makes that an ask.
+#[tokio::test]
+async fn after_a_ring_the_caller_who_says_they_will_leave_a_message_has_not_asked_again_when_the_gap_has_passed() {
+    let mut f = flow(owner_settings(true)).await;
+    f.caller_says(ASKED);
+    f.ring_through("assist_1", 30).await;
+    f.aokie.send(outcome(&f.aokie, "assist_1", "declined", None));
+    f.aokie.event("call.transfer", secs(3)).await.expect("the ring was declined");
+    f.ring.set_clock(Arc::new(At(f.ring.clock().local() + chrono::Duration::seconds(61))));
+    f.caller_says("No, just take a message please.");
+    let answer = answer_of(asking(&f.aokie, transfer::TOOL, json!({"reason": "caller_asked"}))).await.unwrap();
+    assert_eq!((answer["ok"].clone(), answer["output"]["status"].clone(), answer["output"]["reason"].clone()), (json!(false), json!("refused"), json!("caller_did_not_ask")), "{answer}");
+    assert!(f.aokie.text("formlogic.realtime.tool_call", Duration::from_millis(400)).await.is_none(), "nothing was asked of the phone");
+    assert_eq!(f.dialog().await.len(), 0);
+    // Asking again is asking.
+    f.caller_says("Actually, can I speak to the owner please?");
+    let asked = asking(&f.aokie, transfer::TOOL, json!({"reason": "caller_asked"}));
+    assert!(f.aokie.text("formlogic.realtime.tool_call", secs(3)).await.is_some(), "the second request reached the phone");
+    drop(asked);
+}
+
 #[tokio::test]
 async fn a_second_try_at_once_is_refused_and_so_is_a_fourth_call_from_one_number_in_an_hour() {
     let mut f = flow(owner_settings(true)).await;
@@ -1110,7 +1164,9 @@ async fn a_second_try_at_once_is_refused_and_so_is_a_fourth_call_from_one_number
     f.ring_through("assist_1", 30).await;
     assert_eq!(f.owner_answers("assist_1", "decline").await.0, 200);
     f.aokie.event("call.transfer", secs(3)).await.expect("declined");
-    // Straight away, the model asks again: the gap between tries on one call. The plugin asking is refused the same way.
+    // Straight away, the caller asks again (an ask counts for one request, so it is said again) and the model asks: the gap between tries on
+    // one call. The plugin asking is refused the same way.
+    f.caller_says(ASKED);
     let again = answer_of(asking(&f.aokie, transfer::TOOL, json!({"reason": "caller_asked"}))).await.unwrap();
     assert_eq!((again["output"]["status"].clone(), again["output"]["reason"].clone()), (json!("refused"), json!("limit_gap")));
     let plan = PluginHost::ring_request(&f.ring, "oaiy.ring.plan", json!({"callId": f.aokie.call, "reason": "caller_asked", "recentCallerTurns": [ASKED]})).unwrap();
@@ -1193,6 +1249,7 @@ async fn a_try_the_phone_refused_at_once_is_given_back_so_the_caller_may_ask_aga
     // A request that rang and was declined stays counted: the gap holds.
     assert_eq!(f.owner_answers("assist_1", "decline").await.0, 200);
     f.aokie.event("call.transfer", secs(3)).await.expect("declined");
+    f.caller_says(ASKED);
     let soon = answer_of(asking(&f.aokie, transfer::TOOL, json!({"reason": "caller_asked"}))).await.unwrap();
     assert_eq!(soon["output"]["reason"], "limit_gap");
 }

@@ -68,6 +68,11 @@ pub trait CallSource: Send + Sync {
     /// `transfer_cancel` on its stream, waits for the phone's answer and acts on it. What came of the asking is the answer: the frame
     /// is on the wire, or is waiting for the phone to name the request to the call, or there was nothing to withdraw, or no session.
     fn cancel_transfer(&self, call: &str, request: &str, reason: crate::voice::transfer::CancelReason) -> tokio::sync::oneshot::Receiver<Withdrawal>;
+    /// A ring opened for `call` on what the caller had said as `facts` gave it: those words are used up. An ask counts for ONE request, so the
+    /// next request is judged on what the caller says after it, never on an ask that has been acted on (a caller who was rung, and who then
+    /// says "no, just take a message", or who is handed back by the owner and says "thanks, that's all sorted", has not asked again). A
+    /// request that was refused, or that the phone refused before it rang, has acted on nothing: its ask stands.
+    fn consume_turns(&self, _call: &str) {}
 }
 
 /// What came of asking the phone to withdraw a request (see [`CallSource::cancel_transfer`]): what the owner is told is never more than
@@ -287,6 +292,13 @@ impl Ring {
     /// What this desktop knows of `call`.
     pub fn call_info(&self, call: &str) -> Option<CallInfo> {
         get(&self.calls).and_then(|c| c.facts(call))
+    }
+
+    /// The words a ring for `call` was made on are used up (see [`CallSource::consume_turns`]).
+    pub(super) fn use_up_asked_turns(&self, call: &str) {
+        if let Some(calls) = get(&self.calls) {
+            calls.consume_turns(call);
+        }
     }
 
     /// The phone reports the call ended.

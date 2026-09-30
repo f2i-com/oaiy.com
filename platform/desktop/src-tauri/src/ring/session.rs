@@ -186,6 +186,9 @@ impl Ring {
         // A request opened a ring: the plugin's consent is there.
         self.note_ring_opened();
         let info = self.call_info(&params.call_id).unwrap_or_default();
+        // The ask that this ring is for is acted on now: the next request needs an ask of its own, said after this. (What the dialog shows is what
+        // was read just above.)
+        self.use_up_asked_turns(&params.call_id);
         let now = self.now_ms();
         let given = params.expires_at.saturating_mul(1000);
         let longest = now + (u64::from(plan.ring_seconds) + 10) * 1000;

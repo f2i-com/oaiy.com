@@ -254,7 +254,11 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
   greeting, or as a reply that was cut off was taken up again; an acknowledgement said in a pause after the receptionist had
   finished ("Yeah, sure." after "Is that all right?") is a turn like any other and keeps its place among the three. The phone
   plugin cannot hear when a word was said, so it drops the acknowledgements by their words alone (its `backchannel` rule in
-  the shared caller-asked fixture); that can only reach further back, so its check stays a floor under this one.
+  the shared caller-asked fixture); that can only reach further back, so its check stays a floor under this one. **An ask counts for
+  one request.** Once a ring opens from it, what the caller had said is used up, and a call that begins again (the owner handing the
+  caller back) starts with nothing said: the next request is judged on what the caller says after that, so "Thanks, that is all
+  sorted now" or "No, just take a message please" after a ring, however much later, is never taken for asking again. A request that was
+  refused, or that the phone refused before anything rang, acted on nothing, and its ask stands.
 - **Take a message.** `take_message` goes to `POST /api/voice/calls/{id}/message`, on the call's own
   route: the number comes from this desktop's record of the call, and the message is refused when the
   owner has not allowed messages, or a limit is reached. The receptionist says the owner "will be

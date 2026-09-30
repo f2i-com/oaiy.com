@@ -25,11 +25,14 @@ struct Calls {
     live: std::sync::atomic::AtomicBool,
     /// What the call says of the withdrawal when it has a live session (the frame sent, kept for the phone to name the request, or nothing to withdraw).
     answer: Mutex<Withdrawal>,
+    /// The calls the ring said a request was judged on (see `CallSource::consume_turns`), and whether the call then forgets what was said, as the hub does.
+    used: Mutex<Vec<String>>,
+    consuming: std::sync::atomic::AtomicBool,
 }
 
 impl Default for Calls {
     fn default() -> Self {
-        Self { info: Mutex::default(), cancels: Mutex::default(), ended: Mutex::default(), live: std::sync::atomic::AtomicBool::new(true), answer: Mutex::new(Withdrawal::Sent) }
+        Self { info: Mutex::default(), cancels: Mutex::default(), ended: Mutex::default(), live: std::sync::atomic::AtomicBool::new(true), answer: Mutex::new(Withdrawal::Sent), used: Mutex::default(), consuming: std::sync::atomic::AtomicBool::new(false) }
     }
 }
 
@@ -44,6 +47,16 @@ impl CallSource for Calls {
     }
     fn call_ended_by_phone(&self, call: &str) {
         self.ended.lock().unwrap().push(call.to_string());
+    }
+    fn consume_turns(&self, call: &str) {
+        self.used.lock().unwrap().push(call.to_string());
+        if self.consuming.load(std::sync::atomic::Ordering::SeqCst) {
+            for (c, info) in self.info.lock().unwrap().iter_mut() {
+                if c == call {
+                    info.turns.clear();
+                }
+            }
+        }
     }
     fn cancel_transfer(&self, call: &str, request: &str, reason: CancelReason) -> tokio::sync::oneshot::Receiver<Withdrawal> {
         self.cancels.lock().unwrap().push((call.to_string(), request.to_string(), reason));
@@ -804,6 +817,40 @@ fn a_try_the_plugin_refused_before_any_ring_is_given_back_with_its_gap_and_one_t
     assert_eq!(r.ring.attempts.lock().unwrap().counters(CALL, "491570006", r.ring.clock().unix()).attempts_this_call, 1);
     assert!(r.ring.request_refused("call_2"), "another call's request that never opened is given back");
     assert_eq!(r.ring.attempts.lock().unwrap().counters(CALL, "491570006", r.ring.clock().unix()).attempts_this_call, 1);
+}
+
+#[test]
+fn a_ring_uses_up_the_ask_it_was_made_on_and_the_next_request_needs_an_ask_of_its_own() {
+    struct At(chrono::DateTime<chrono::FixedOffset>);
+    impl Clock for At {
+        fn local(&self) -> chrono::DateTime<chrono::FixedOffset> {
+            self.0
+        }
+    }
+    let r = rig(Presence::Active);
+    r.calls.consuming.store(true, std::sync::atomic::Ordering::SeqCst);
+    let start = chrono::DateTime::parse_from_rfc3339("2026-09-30T11:00:00+10:00").unwrap();
+    r.ring.set_clock(Arc::new(At(start)));
+    // A plan allowed is not yet an ask acted on: nothing is used up until a ring opens for it.
+    let plan = planned(&r.ring, CALL);
+    assert!(r.calls.used.lock().unwrap().is_empty());
+    let ring = r.ring.opened(&opened(&plan, "assist_1", CALL, 25, &r.ring)).unwrap();
+    assert!(ring.said.iter().any(|s| s == ASKED), "the dialog shows what the caller said, which is read before it is used up: {:?}", ring.said);
+    assert_eq!(r.calls.used.lock().unwrap().as_slice(), [CALL.to_string()], "the ring said which words it was made on");
+    r.ring.resolve("assist_1", Outcome::Declined, "phone");
+    // Two minutes on, well past the gap between tries: the caller, rung for and declined, says only that they will leave a message.
+    r.ring.set_clock(Arc::new(At(start + chrono::Duration::minutes(2))));
+    r.calls.info.lock().unwrap()[0].1.turns.push("No, just take a message please.".into());
+    let second = r.ring.authorise(CALL, Reason::CallerAsked);
+    assert_eq!((second.plan.decision, second.plan.reason), (Decision::Refused, PlanReason::CallerDidNotAsk), "the ask that was acted on is not an ask again: {:?}", second.plan);
+    assert_eq!(r.calls.used.lock().unwrap().len(), 1, "a refusal acts on nothing");
+    // Asking again is asking: judged on its own words, and rung. The phone refuses it before it rang, so nothing was acted on and the ask stands.
+    r.calls.info.lock().unwrap()[0].1.turns.push("Actually, can I speak to the owner please".into());
+    let third = r.ring.authorise(CALL, Reason::CallerAsked);
+    assert!(third.rings(), "{:?}", third.plan);
+    assert!(r.ring.request_refused(CALL), "a try was given back");
+    assert_eq!(r.calls.used.lock().unwrap().len(), 1, "and the ask with it");
+    assert!(r.ring.authorise(CALL, Reason::CallerAsked).rings(), "the same ask, judged again");
 }
 
 #[test]
