@@ -1,0 +1,79 @@
+#!/bin/sh
+# oaiyctl: the console of oaiy-server (design 4.7.9), run as the service user with the service's settings.
+#
+#   oaiyctl auth setup-code          make a setup code and print it here (never in the journal)
+#   oaiyctl auth init --generate     make the owner login on the console
+#   oaiyctl auth session-link        a single-use link that signs you in, for an incident
+#   oaiyctl auth status              exposure, login, sessions, slow mode, blocked addresses (no secrets)
+#   oaiyctl check                    validate the configuration and the data folder
+#
+# `oaiyctl ...` is `oaiy-server ...` as the service user, with the OAIY_* settings of the unit's environment file
+# (/etc/oaiy/oaiy.env). Why a wrapper: the data folder belongs to the service user, and a console run as root
+# would make root-owned files in it (oaiy-server refuses, and says so); and the console needs the same
+# OAIY_DATA_DIR as the service, which is in the unit, not in your shell. Nothing secret is put on a command line:
+# the service user reads the environment file itself, through the group that owns it (root:oaiy, 0640).
+#
+# Settings, from the environment (the defaults are the reference install of the guide):
+#   OAIYCTL_ENV_FILE   /etc/oaiy/oaiy.env
+#   OAIYCTL_USER       oaiy
+#   OAIYCTL_SERVER     /opt/oaiy/current/oaiy-server
+
+set -eu
+
+env_file=${OAIYCTL_ENV_FILE:-/etc/oaiy/oaiy.env}
+service_user=${OAIYCTL_USER:-oaiy}
+server=${OAIYCTL_SERVER:-/opt/oaiy/current/oaiy-server}
+
+if [ "$#" -eq 0 ]; then
+  echo "usage: oaiyctl auth setup-code | auth init [--generate] | auth reset-password | auth session-link | auth status | check" >&2
+  echo "       (oaiyctl runs 'oaiy-server ...' as the user $service_user; see oaiy-server auth for every command)" >&2
+  exit 2
+fi
+
+current_user=$(id -un)
+if [ "$current_user" != "$service_user" ]; then
+  # Become the service user: run this script again as them. sudo resets the environment, so the three settings
+  # (none of them secret) go along.
+  if ! command -v sudo >/dev/null 2>&1; then
+    echo "oaiyctl: this must run as $service_user and there is no sudo here: su to $service_user first" >&2
+    exit 1
+  fi
+  self=$(command -v -- "$0" 2>/dev/null || printf '%s' "$0")
+  exec sudo -u "$service_user" -- env \
+    "OAIYCTL_ENV_FILE=$env_file" "OAIYCTL_USER=$service_user" "OAIYCTL_SERVER=$server" \
+    "$self" "$@"
+fi
+
+# As the service user: the OAIY_* settings of the environment file. One KEY=VALUE per line, as systemd reads it:
+# blank lines and lines starting with # or ; are skipped, one pair of quotes round a value is removed, and nothing is
+# evaluated (the file is read, not sourced).
+if [ -r "$env_file" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    case $line in
+      '' | '#'* | ';'*) continue ;;
+    esac
+    case $line in
+      *=*) ;;
+      *) continue ;;
+    esac
+    key=${line%%=*}
+    value=${line#*=}
+    case $key in
+      OAIY_[A-Z0-9_]*) ;;
+      *) continue ;;
+    esac
+    case $key in
+      *[!A-Z0-9_]*) continue ;;
+    esac
+    case $value in
+      \"*\") value=${value#\"}; value=${value%\"} ;;
+      \'*\') value=${value#\'}; value=${value%\'} ;;
+    esac
+    export "$key=$value"
+  done < "$env_file"
+elif [ -e "$env_file" ]; then
+  echo "oaiyctl: cannot read $env_file as $service_user: is $service_user in the group that owns it (root:oaiy, 0640)?" >&2
+  exit 1
+fi
+
+exec "$server" "$@"
