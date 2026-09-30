@@ -246,6 +246,80 @@ const MUTATIONS = [
     files: { 'web/providers/src/embed.ts': [{ find: "window.open(`${location.origin}/`, '_blank', 'noopener');", replace: "window.open(`${location.origin}/`, '_blank');" }] },
     caught: [],
   },
+  // F2: the holder stays out of the app's process on every response, and the apps do not delegate cross-origin-isolated to it.
+  {
+    name: 'F2 the holder drops Origin-Agent-Cluster',
+    what: 'no response of the providers host asks for an agent cluster of its own',
+    tests: [E3, 'tests/e2e/cases/headers.test.mjs'],
+    files: { 'web/hosting/headers/providers.headers': [{ find: '  Origin-Agent-Cluster: ?1\n', replace: '' }] },
+    caught: ["and it stays out of the app's process however the origin was first loaded", 'a 200 of each document and each kind of asset'],
+  },
+  {
+    name: 'F2 only one page carries the set',
+    what: 'the whole header set is on /index.html only, so a 404, /_headers or an alias answers without it',
+    tests: [E3, 'tests/e2e/cases/headers.test.mjs'],
+    files: { 'web/hosting/headers/providers.headers': [{ find: '/*\n  X-Content-Type-Options: nosniff\n', replace: '/index.html\n  X-Content-Type-Options: nosniff\n' }] },
+    caught: ['a 200 of each document and each kind of asset', 'an alias is the document exactly'],
+  },
+  {
+    name: 'F2 the default handshake delegates isolation',
+    what: 'the apps give the providers frame allow="cross-origin-isolated", so the holder is cross-origin isolated',
+    tests: ['tests/e2e/cases/e2-isolation.test.mjs'],
+    files: { 'web/tests/e2e/fixtures/shell/shell.js': [{ find: "const DEFAULT_ALLOW = 'local-network-access; local-network; loopback-network';", replace: "const DEFAULT_ALLOW = 'cross-origin-isolated; local-network-access; local-network; loopback-network';" }] },
+    caught: ['inside the frame: NOT isolated'],
+  },
+  // F3: the default is deny.
+  {
+    name: 'F3 the default policy lets the apps frame any page',
+    what: 'the /* policy says frame-ancestors {{APP_ORIGINS}}, so a page no rule names (the Providers page, an alias) can be framed by an app',
+    tests: [E3, 'tests/e2e/cases/headers.test.mjs'],
+    files: { 'web/hosting/headers/providers.headers': [{ find: "frame-src 'none'; frame-ancestors 'none'\n/broker\n", replace: 'frame-src \'none\'; frame-ancestors {{APP_ORIGINS}}\n/broker\n' }] },
+    caught: ['what a page could ask a browser to frame is denied to every frame but the two documents', 'an alias is the document exactly'],
+  },
+  // F4: what an app may spend is bounded in volume.
+  {
+    name: 'F4 no cap on the size of a body',
+    what: 'a request body of any size is sent',
+    tests: ['tests/unit/spend.test.mjs'],
+    files: { 'web/providers/src/fetcher.ts': [{ find: /\n\s+if \(bodyBytes\(body\) > maxBodyBytes\(record\)\) throw new BodyRefused[^\n]*/g, replace: '' }] },
+    caught: ['a body over the default 1 MiB is refused before anything is sent or counted'],
+  },
+  {
+    name: 'F4 no cap put on a reply',
+    what: 'the holder does not put max_tokens in a chat request, whatever the record says',
+    tests: ['tests/unit/spend.test.mjs'],
+    files: { 'web/providers/src/fetcher.ts': [{ find: '          body = capOutputTokens(record, request.path, body);\n', replace: '' }] },
+    caught: ['OpenAI dialect: no ask gets the cap'],
+  },
+  {
+    name: 'F4 bytes are not counted',
+    what: 'a request counts as a request but its bytes are not taken from the app\'s hour',
+    tests: ['tests/unit/spend.test.mjs'],
+    files: { 'web/providers/src/fetcher.ts': [{ find: "const taken = await deps.budget.take(app, request.method === 'POST' ? bodyBytes(body) : 0);", replace: 'const taken = await deps.budget.take(app, 0);' }] },
+    caught: ['are counted with the requests'],
+  },
+  {
+    name: 'F4 the modal\'s buttons are not counted',
+    what: 'the embedded modal\'s Load models and Test buttons call the provider without spending anything',
+    tests: ['tests/e2e/cases/providers-page.test.mjs'],
+    files: { 'web/providers/src/embed.ts': [{ find: 'take: async (bytes) => { const taken = await ctx.budget.take(MODAL_APP, bytes); return taken.ok ? { ok: true } : taken; }', replace: 'take: async () => ({ ok: true })' }] },
+    caught: ["the modal's Load models button counts against an hour of its own"],
+  },
+  // F7: the context probe.
+  {
+    name: 'F7 the probe asks a service on the internet',
+    what: 'a probe is made for a record that is not a server on this computer or network',
+    tests: ['tests/unit/net.test.mjs'],
+    files: { 'web/providers/src/probe.ts': [{ find: "if (!model || record.dialect === 'anthropic' || record.kind !== 'local-server') return none;", replace: "if (!model || record.dialect === 'anthropic') return none;" }] },
+    caught: ['only a server on this computer or network is probed'],
+  },
+  {
+    name: 'F7 the probe sends the key everywhere',
+    what: 'the key goes with every address the probe asks, not only those under the record\'s base',
+    tests: ['tests/unit/net.test.mjs'],
+    files: { 'web/providers/src/probe.ts': [{ find: 'headers: { ...(underBase(url) ? withKey : withoutKey),', replace: 'headers: { ...withKey,' }] },
+    caught: ['the key goes only to an address under the record'],
+  },
   // Leaks the scans must find. They put the key where a scan of TEXT does not look (the reviewer's two: a Uint8Array, and reversed).
   {
     name: 'H1 leak: list returns the key as a Uint8Array',
