@@ -2,7 +2,7 @@
  * E5, no probes (design 8, 3.5 rule R1, 6 threat 8): a tab in a browser makes NO request to loopback or LAN ranges when an app loads;
  * pressing the button that looks (Connect) makes exactly the one request it says it makes. OAIY's own windows look as they always did.
  *
- * Against the REAL builds of the Agent and the flow editor, served on their own hosts with the headers those hosts send (tests/e2e/apps.mjs).
+ * Against the REAL builds of the Agent and the flow editor, served on their own hosts with the headers those hosts send (tests/e2e/app-pages.mjs).
  * Every request the browser makes to this computer or its network, by a page, a worker or a service worker, is recorded and refused
  * (tests/e2e/local-ranges.mjs), so a probe is SEEN, and cannot reach the owner's desktop.
  *
@@ -19,86 +19,21 @@
  */
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
-import { readTemplate, renderHeaders } from '../../../scripts/headers.mjs';
-import { buildApps } from '../apps.mjs';
-import { browserVersion, launchBrowser, sleep, startWorld } from '../harness.mjs';
-import { watchLocal } from '../local-ranges.mjs';
+import { sleep } from '../harness.mjs';
+import { DESKTOP, OAIY, OAIY_WINDOW, appReady as ready, fakeDesktop, healthOf as health, openApp, startAppWorld } from '../app-pages.mjs';
 
-const DESKTOP = 'http://127.0.0.1:17972';
-const OAIY = 'http://127.0.0.1:8080';
-/** How long a page is given to send whatever it is going to send as it loads (its probes fire in the first moments). */
-const SETTLE_MS = 3000;
-
-let apps;
-let world;
-let browser;
-let sites;
+let env;
 
 before(async () => {
-  apps = await buildApps();
-  world = await startWorld({ providers: false });
-  const origins = { ...world.origins, apps: [] };
-  world.hosts.setSite('agent', { root: apps.agent, headers: renderHeaders(readTemplate('agent'), origins) });
-  world.hosts.setSite('flows', { root: apps.flows, headers: renderHeaders(readTemplate('flows'), origins) });
-  sites = Object.keys(world.origins).map((name) => `${world.hosts.host(name)}:${world.hosts.port}`);
-  browser = await launchBrowser({});
-  console.log(`# browser: ${await browserVersion(browser)}`);
+  env = await startAppWorld();
 });
 
 after(async () => {
-  await browser?.close();
-  await world?.close();
-  apps?.remove();
+  await env?.close();
 });
 
-/**
- * A page of one of the apps, in a browser context of its own with the recorder on.
- * `desktop`: what OAIY's window gives its pages before they run. `storage`: localStorage set before the page runs.
- */
-async function open(app, { desktop = null, storage = {}, path = app === 'agent' ? '/' : '/app.html', refuseAfterMs = 0, answer = null } = {}) {
-  const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
-  const { attempts } = await watchLocal(context, { sites, refuseAfterMs, answer });
-  const errors = [];
-  await context.addInitScript(
-    ({ desktop, storage }) => {
-      // A visitor's browser is not automated: the Agent looks for OAIY on its own only in a browser that is not.
-      Object.defineProperty(Navigator.prototype, 'webdriver', { get: () => false, configurable: true });
-      if (desktop) window.__OAIY_DESKTOP__ = Object.freeze(desktop);
-      try {
-        // No splash and no first-run wizard: they cover the pages a scenario presses buttons in.
-        localStorage.setItem('skipSplash', 'true');
-        localStorage.setItem('oaiy.wizard.completed', 'true');
-        localStorage.setItem('oaiy_theme', 'dark');
-        for (const [key, value] of Object.entries(storage)) localStorage.setItem(key, value);
-      } catch {
-        /* blocked storage: the page still loads */
-      }
-    },
-    { desktop, storage },
-  );
-  const page = await context.newPage();
-  page.on('pageerror', (e) => errors.push(e.message));
-  await page.goto(`${world.origins[app]}${path}`);
-  return { context, page, attempts, errors };
-}
-
-/** The app is up: the Agent shows its project tree, the flow editor its workspace. */
-async function ready(app, page) {
-  if (app === 'agent') await page.waitForSelector('.tree-row', { timeout: 60_000 });
-  else await page.waitForSelector('#oaiy-main', { timeout: 60_000 });
-  await sleep(SETTLE_MS);
-}
-
-const health = (attempts) => attempts.filter((a) => a.endsWith('/api/health'));
-
-/** What OAIY Desktop answers to the routes a tab reads. It exists only in the browser: the request is answered there and goes no further. */
-const fakeDesktop = ({ url }) => {
-  const route = new URL(url).pathname;
-  if (route === '/api/health') return { body: { status: 'ok', product: 'oaiy-desktop', protocol: 'oaiy-bridge/1', version: '9.9.9' } };
-  if (route === '/api/services') return { body: { services: [{ id: 'py-rig', name: 'Python rig', description: 'A rig', category: 'llm', status: 'running', port: 8123, defaultPort: 8123, installed: true }] } };
-  if (route === '/api/ai/engine/services') return { body: { services: [] } };
-  return null;
-};
+const open = (app, options) => openApp(env, app, options);
+const world = { get origins() { return env.world.origins; } };
 
 describe('E5: the recorder sees what a page sends', () => {
   it('a request to loopback, to each private range, to link-local, to Tailscale and to a .local name is seen and refused, from a page and from a worker', async () => {
@@ -187,7 +122,7 @@ describe('E5: the Agent', () => {
   });
 
   it('given a desktop (as OAIY\'s window gives it) the Agent looks for OAIY as it opens, as it always has, and the recorder sees it', async () => {
-    const { context, page, attempts } = await open('agent', { desktop: { origin: DESKTOP, token: 'window-token', theme: 'dark' } });
+    const { context, page, attempts } = await open('agent', { desktop: OAIY_WINDOW });
     await ready('agent', page);
     assert.ok(attempts.includes(`GET ${OAIY}/v1/discovery`), `it looked for OAIY: ${attempts.join(', ')}`);
     assert.ok(attempts.some((a) => a.startsWith(`GET ${DESKTOP}/api/`)), `and at the desktop it was given: ${attempts.join(', ')}`);
@@ -301,7 +236,7 @@ describe('E5: the flow editor', () => {
   });
 
   it('given a desktop (as OAIY\'s window gives it) the editor looks as it opens, as it always has: the two probes, and no Connect button', async () => {
-    const { context, page, attempts } = await open('flows', { desktop: { origin: DESKTOP, token: 'window-token', theme: 'dark' } });
+    const { context, page, attempts } = await open('flows', { desktop: OAIY_WINDOW });
     await ready('flows', page);
     assert.equal(health(attempts).length, 2, `the detection and the service sync each look once: ${attempts.join(', ')}`);
     assert.ok(health(attempts).every((a) => a === `GET ${DESKTOP}/api/health`));
