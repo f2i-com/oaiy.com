@@ -32,6 +32,9 @@ pub trait Host: Send + Sync {
     fn data_dir(&self) -> Result<PathBuf, String>;
     /// Where the look is remembered for the prepare that follows.
     fn desk(&self) -> &Desk;
+    /// Ask the Agent's page to save its work, and wait a little for its word (the updater's own handshake: no page, no answer or an
+    /// error is not a reason to stop). OAIY is about to restart, and what the page has not saved is lost.
+    fn save_agent(&self) -> impl Future<Output = ()> + Send;
     /// Restart OAIY so that what waits is applied at the start.
     fn restart(&self);
 }
@@ -147,9 +150,10 @@ pub async fn stage<H: Host>(host: &H, inspect_id: String, passphrase: String, cl
     }
 }
 
-/// Restart OAIY so the staged restore is applied, unless the app is busy. The look at what is in the way is made twice: once
-/// to decide, and once again right before OAIY is stopped, because the first can take seconds (it asks a phone plugin whether a
-/// call is live) and a call can have started in them. A restart ends a call.
+/// Restart OAIY so the staged restore is applied, unless the app is busy. The order is: a look at what is in the way, the Agent's
+/// page is asked to save its work (as the updater asks before it installs), a last look, and the restart. The look is made twice
+/// because the first can take seconds (it asks a phone plugin whether a call is live) and the save up to five more, and a call
+/// can have started in them. A restart ends a call.
 pub async fn restart_to_apply<H: Host>(host: &H) -> Result<(), String> {
     let data_dir = host.data_dir()?;
     match restore::pending_info(&data_dir) {
@@ -161,6 +165,8 @@ pub async fn restart_to_apply<H: Host>(host: &H) -> Result<(), String> {
         Some(_) => {}
     }
     host.busy().await.refuse_if_busy("restarting to finish the restore").map_err(|e| e.message)?;
+    // What the Agent's page has not saved is lost when OAIY stops: it is asked first, as the updater asks.
+    host.save_agent().await;
     // The last look, with nothing between it and the restart.
     host.busy().await.refuse_if_busy("restarting to finish the restore").map_err(|e| e.message)?;
     host.restart();

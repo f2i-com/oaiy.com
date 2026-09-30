@@ -109,6 +109,16 @@ impl Host for DashboardHost {
         &DESK
     }
 
+    fn save_agent(&self) -> impl std::future::Future<Output = ()> + Send {
+        let app = self.app.clone();
+        async move {
+            let Some(updater) = app.try_state::<UpdaterHandle>() else { return };
+            let updater = updater.inner().clone();
+            // The wait for the page's word is a blocking one (up to five seconds), so it is not made on the async runtime's thread.
+            let _ = tokio::task::spawn_blocking(move || crate::update::gui::flush_agent(&app, &updater)).await;
+        }
+    }
+
     fn restart(&self) {
         crate::gui::restart_app(self.app.clone());
     }

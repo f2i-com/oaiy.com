@@ -1057,11 +1057,18 @@ fn what_a_backup_waits_for_is_worked_out_in_one_place_and_not_a_second_time() {
         assert!(body.contains("look_busy(&app).await") && (body.contains(&format!("refuse_if_busy(\"{refusal}\")"))), "{name} asks whether the app is busy and refuses with {refusal:?}");
     }
     // The restart is the flow's too, and asks twice (tested by driving it: the_restart_that_applies_a_restore_asks_again_right_before_it_restarts).
+    // The Agent's page is asked to save between the looks, by the updater's own handshake and not a copy of it.
     assert!(command_source("backup_restart_to_apply").contains("desk::restart_to_apply"), "the restart hands over to the restore flow");
     let restart = source_text(include_str!("desk.rs"));
     let restart = &restart[restart.find("pub async fn restart_to_apply").unwrap()..];
     assert_eq!(restart.matches("refuse_if_busy(\"restarting to finish the restore\")").count(), 2, "asked twice: to decide, and again right before restarting");
     assert!(restart.find("host.restart()").unwrap() > restart.rfind("refuse_if_busy(\"restarting to finish the restore\")").unwrap(), "and the restart comes after the last look");
+    let (first_look, last_look, save) = (restart.find("refuse_if_busy(\"restarting to finish the restore\")").unwrap(), restart.rfind("refuse_if_busy(\"restarting to finish the restore\")").unwrap(), restart.find("host.save_agent()").expect("the Agent's page is asked to save"));
+    assert!(first_look < save && save < last_look, "the page saves between the two looks, so that the last look is the one right before the restart");
+    let window = source_text(include_str!("commands.rs"));
+    assert!(window.contains("crate::update::gui::flush_agent(&app, &updater)"), "the window asks the way the updater does");
+    let updater = source_text(include_str!("../update/gui.rs"));
+    assert!(updater.contains("pub(crate) fn flush_agent(") && updater.contains("answer.recv_timeout(FLUSH_TIMEOUT)"), "and that way gives up after five seconds and lets what follows go on");
     // Looking at a backup and preparing one are the restore flow's (`desk.rs`, and tested by driving it); the commands hand over to it.
     let desk = source_text(include_str!("desk.rs"));
     assert!(desk.contains("host.busy().await.refuse_if_busy(\"checking a backup\")"), "looking asks whether the app is busy and refuses with \"checking a backup\"");
@@ -5021,6 +5028,11 @@ impl super::desk::Host for FakeHost {
         &self.desk
     }
 
+    fn save_agent(&self) -> impl std::future::Future<Output = ()> + Send {
+        self.calls.lock().unwrap().push("save");
+        std::future::ready(())
+    }
+
     fn restart(&self) {
         self.calls.lock().unwrap().push("restart");
         *self.restarts.lock().unwrap() += 1;
@@ -5609,16 +5621,16 @@ async fn the_restart_that_applies_a_restore_asks_again_right_before_it_restarts(
     let host2 = FakeHost::new(&data.0, vec![Busy::none(), in_a_call()], vec![]);
     let err = desk::restart_to_apply(&host2).await.unwrap_err();
     assert!(err.contains("A call is live"), "{err}");
-    assert_eq!(host2.calls(), ["busy", "busy"], "asked twice, and did not restart");
+    assert_eq!(host2.calls(), ["busy", "save", "busy"], "asked, the Agent saved, asked again, and did not restart");
     assert_eq!(*host2.restarts.lock().unwrap(), 0);
     // Busy at the first look: not asked again, not restarted.
     let host3 = FakeHost::new(&data.0, vec![in_a_call()], vec![]);
     assert!(desk::restart_to_apply(&host3).await.is_err());
-    assert_eq!(host3.calls(), ["busy"]);
+    assert_eq!(host3.calls(), ["busy"], "busy at the first look: the Agent is not even asked to save, and nothing restarts");
     // Quiet both times: it restarts, once, and after both looks.
     let host4 = FakeHost::new(&data.0, vec![], vec![]);
     desk::restart_to_apply(&host4).await.unwrap();
-    assert_eq!(host4.calls(), ["busy", "busy", "restart"]);
+    assert_eq!(host4.calls(), ["busy", "save", "busy", "restart"], "look, save (the updater's handshake), the last look, restart");
     // A restore that has waited too long is not applied by a restart, and is thrown away.
     let marker = data.0.join("restore").join("pending.json");
     let mut value: serde_json::Value = serde_json::from_str(&fs::read_to_string(&marker).unwrap()).unwrap();

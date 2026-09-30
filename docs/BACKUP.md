@@ -465,13 +465,21 @@ A restore is never done in place. It has three steps, and the first two change n
    back (at once, or at the next start) and the failure is reported in Settings. The marker is
    removed last, so a restore is applied once and only once.
 
-The restart button refuses while OAIY is busy (the same list as for making a backup, and for updating). It
-asks twice: once to decide, and again with nothing between that look and the restart, because the first can
-take seconds (it asks a phone plugin whether a call is live) and a restart ends a call.
-**Preparing a restore does not wait for a quiet app**: it only writes the staging folder and changes nothing
-you use, so a phone plugin that cannot say whether a call is live does not leave you unable to go on. What
-needs a quiet app is what touches the running app: looking at a backup (a second of computing and up to a
-gigabyte of memory), making a backup, and the restart.
+The restart button refuses while OAIY is busy (the same list as for making a backup, and for updating). The
+order is: a look at what is in the way, the Agent's page is asked to save its work (the updater's own
+handshake, used before an update installs: it waits up to five seconds for the page's word and goes on
+without it), a last look with nothing between it and the restart, and the restart. It looks twice because
+the first can take seconds (it asks a phone plugin whether a call is live), the save up to five more, and a
+restart ends a call.
+
+**Preparing a restore does not itself wait for a quiet app**: it only writes the staging folder and changes
+nothing you use, so a call that starts after you looked at a backup does not undo the look. That is all it
+buys, and it is less than it may seem: the dashboard reaches the step only after **looking** at the backup,
+and looking is refused while OAIY is busy (a phone plugin that cannot say whether a call is live stops it
+too). Looking at a backup takes a second of computing and up to a gigabyte of memory whatever the size of
+the file, since a backup is written at no less than 256 MiB of work, so a small file is not looked at while a
+call is live either. What needs a quiet app is therefore what touches the running app: looking at a backup,
+making a backup, and the restart.
 
 **Any restart applies a prepared restore**, not only this button's: the restart that installs an update
 (Settings, About and updates) applies it too, at the start of the updated OAIY, if it is still within its
@@ -760,7 +768,7 @@ in parts through internal routes with a secret made for that one backup.
   a second on this computer, but never below 2^18 (256 MiB) and never above 2^20 (1 GiB): a
   backup made on a busy computer is not a weak one. Checking and preparing a restore have a
   15-minute limit and the panel goes on after it; a check is refused while OAIY is busy, and
-  preparing is not (it changes nothing that is live).
+  preparing is not in itself (it changes nothing that is live), though it comes after a check.
 - **What a file may ask is bounded from its own record, before any of it is read.** At most 20,000
   items (a real backup has a few hundred), a record of 16 MiB, one JSON or text item of 16 MiB (a
   calendar is a few megabytes; one of 512 MiB is not a calendar), a voice of 128 MiB, the Agent's
