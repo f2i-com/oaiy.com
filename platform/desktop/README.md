@@ -333,6 +333,12 @@ a setting undoes:
    cli-admin` (which adds the installs and is a 24-hour token), and give that token to the client instead of
    `OAIY_SERVER_TOKEN`; a dashboard session or a paired or derived credential reaches the rest.
 
+A static token that is refused by the rule (an example or a pattern) stops `oaiy-server` (exit 78). The desktop keeps the
+one it was given, as it always did, in `legacy` and warns; in `scoped` it ignores it, and a token with a character outside
+`A-Za-z0-9._~+/=-` that is also refused is then read by the strict bearer rule, which is `400 bad_request`: on every route
+in `scoped`, and in `legacy` on the routes the access model added (the routes that existed before are the old guard's and
+take the token as it is).
+
 ### The web login (`oaiy-server` built with `--features web`)
 
 A server built with the `web` feature has an owner login for the dashboard in a browser: one password, sessions in

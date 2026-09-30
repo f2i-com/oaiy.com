@@ -2908,6 +2908,53 @@ async fn f4_a_static_token_that_fails_the_shape_rule_is_ignored_where_the_new_gu
     }
 }
 
+/// What the README says (N4 of the review): a static token with a character outside the strict bearer rule
+/// (`[A-Za-z0-9._~+/=-]`) that the rule ALSO refuses (here `secret` is in it) is not the operator's token to a guard that
+/// judges the route, so it meets the strict rule, which is `400 bad_request`: on every route in `scoped` and `shadow`, and in
+/// `legacy` on the routes the access model added (`legacy` keeps the routes that existed before with the old guard, which
+/// takes any token: this harness puts the new guard in front of every route, so that half is the legacy-neutrality suite's
+/// and not this test's). A token of that shape that the rule takes is the operator's, as the test above holds. Only the
+/// desktop can meet this: `oaiy-server` does not start with such a token.
+#[tokio::test]
+async fn n4_a_wide_static_token_that_the_rule_refuses_is_a_400_on_the_routes_the_model_adds_and_nothing_more(
+) {
+    let token = "Zq7$kLm9VbNw2XyHdFg5-secret-Rt8PcJ4u";
+    assert_eq!(
+        super::token::check_static_token_shape(token),
+        Err(super::token::StaticTokenShape::Placeholder)
+    );
+    assert!(token.contains('$'));
+    for mode in [AccessMode::Scoped, AccessMode::Shadow, AccessMode::Legacy] {
+        let e = env_with(mode, &[], false, true, Some(token));
+        for path in ["/api/auth/whoami", "/api/auth/derive"] {
+            let r = go(&e, send(Method::GET, path).bearer(token)).await;
+            assert_eq!(
+                (r.status, r.code().as_deref()),
+                (400, Some("bad_request")),
+                "{mode:?} {path}, a route the model adds: {}",
+                r.text
+            );
+        }
+    }
+    // In `scoped` no route is the old guard's: the same.
+    let e = env_with(AccessMode::Scoped, &[], false, true, Some(token));
+    let r = go(&e, send(Method::GET, "/api/config").bearer(token)).await;
+    assert_eq!(
+        (r.status, r.code().as_deref()),
+        (400, Some("bad_request")),
+        "{}",
+        r.text
+    );
+    // The same token without the word the rule refuses is the operator's on both.
+    let taken = "Zq7$kLm9VbNw2XyHdFg5-Wv3Rt8PcJ4u";
+    assert_eq!(super::token::check_static_token_shape(taken), Ok(()));
+    for mode in [AccessMode::Scoped, AccessMode::Legacy] {
+        let e = env_with(mode, &[], false, true, Some(taken));
+        let r = go(&e, send(Method::GET, "/api/auth/whoami").bearer(taken)).await;
+        assert_eq!(r.status, 200, "{mode:?}: {}", r.text);
+    }
+}
+
 // ======================= F9: what the guard says of the address it sees, and what it keeps ================
 
 fn proxied_env() -> Env {
