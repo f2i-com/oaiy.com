@@ -38,7 +38,6 @@ web = [
     "dep:unicode-normalization",
     "dep:zxcvbn",
     "dep:rpassword",
-    "dep:zeroize",
 ]
 
 [[bin]]
@@ -183,8 +182,6 @@ argon2 = { version = "0.5", optional = true }
 unicode-normalization = { version = "0.1", optional = true }
 zxcvbn = { version = "3", optional = true }
 rpassword = { version = "7", optional = true }
-# Already in the tree (crypto_box, ed25519-dalek): what holds a password is wiped when it is dropped.
-zeroize = { version = "1", optional = true }
 
 # The backup file (`backup/`): a ZIP encrypted as a whole in the standard age file format
 # (https://age-encryption.org/v1), passphrase mode, so any age implementation opens it and
@@ -192,7 +189,8 @@ zeroize = { version = "1", optional = true }
 age = { version = "0.11", default-features = false }
 # The same scrypt age uses, named here to time it: a backup is written at a work factor chosen here (see backup/container.rs).
 scrypt = { version = "0.11", default-features = false }
-# The passphrase of a backup is wiped from memory when the command that was given it is done with it.
+# Already in the tree (crypto_box, ed25519-dalek). The passphrase of a backup is wiped from memory when the command that was given it is
+# done with it, and what holds a password of the web login (feature `web`) is wiped when it is dropped: one dependency, always built.
 zeroize = "1"
 
 # Windows-only: the job object that kills child processes when this process
