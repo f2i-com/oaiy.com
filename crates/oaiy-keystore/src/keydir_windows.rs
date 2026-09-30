@@ -312,6 +312,53 @@ mod tests {
         dir.create_new(name).unwrap().write_all(bytes).unwrap();
     }
 
+    /// The rules that judge what a handle says, over every combination of the bits that matter and the bits that do not. A file symbolic link, a cloud placeholder and a file with two
+    /// names cannot be made in a test without privileges, so they are made up: a reparse point that is not a folder must be refused wherever it stands (a junction is caught by the
+    /// directory bit as well, which is why the junction tests alone cannot tell whether the reparse check is there), a folder where a key file should be is refused as a folder, and
+    /// a key file has one name.
+    #[test]
+    fn the_rules_for_a_folder_and_for_a_key_file_hold_over_every_attribute() {
+        const DIRECTORY: u32 = FILE_ATTRIBUTE_DIRECTORY;
+        const REPARSE: u32 = FILE_ATTRIBUTE_REPARSE_POINT;
+        let message = |r: Result<(), KeyError>| match r {
+            Ok(()) => "ok".to_string(),
+            Err(KeyError::Permissions(why)) => why,
+            Err(other) => panic!("{other:?}"),
+        };
+        // bits that say nothing about what a thing is: read-only, hidden, system, archive, normal, temporary, offline, not content indexed, encrypted
+        for other in [0u32, 0x1, 0x2, 0x4, 0x20, 0x80, 0x100, 0x1000, 0x2000, 0x4000, 0x1 | 0x2 | 0x4 | 0x20] {
+            let with = |bits: u32, links: u32| Info::made_up(other | bits, links);
+            // a folder
+            assert_eq!(message(require_directory(&with(DIRECTORY, 1), "x")), "ok", "{other:#x}");
+            assert!(message(require_directory(&with(0, 1), "x")).contains("not a directory"), "{other:#x}");
+            assert!(message(require_directory(&with(DIRECTORY | REPARSE, 1), "x")).contains("junction or a symbolic link"), "{other:#x}");
+            assert!(
+                message(require_directory(&with(REPARSE, 1), "x")).contains("junction or a symbolic link"),
+                "{other:#x}: a reparse point that is not a folder, in place of one"
+            );
+            // a key file, with one name
+            assert_eq!(message(require_file(&with(0, 1), "x", true)), "ok", "{other:#x}");
+            assert!(
+                message(require_file(&with(REPARSE, 1), "x", true)).contains("junction or a symbolic link"),
+                "{other:#x}: a file symbolic link or a cloud placeholder"
+            );
+            assert!(message(require_file(&with(DIRECTORY | REPARSE, 1), "x", true)).contains("junction or a symbolic link"), "{other:#x}");
+            assert!(
+                message(require_file(&with(DIRECTORY, 1), "x", true)).contains("is a directory"),
+                "{other:#x}: a folder where a key file should be"
+            );
+            assert!(message(require_file(&with(DIRECTORY, 1), "x", false)).contains("is a directory"), "{other:#x}");
+            // one name
+            for links in [0u32, 1] {
+                assert_eq!(message(require_file(&with(0, links), "x", true)), "ok", "{other:#x}: {links} names");
+            }
+            for links in [2u32, 3, 1000] {
+                assert!(message(require_file(&with(0, links), "x", true)).contains(&format!("{links} names")), "{other:#x}: {links} names");
+                assert_eq!(message(require_file(&with(0, links), "x", false)), "ok", "{other:#x}: the lock file is not judged by its names");
+            }
+        }
+    }
+
     /// M-1 (b) and (c): the path and the folder that is held come apart (here by hand: the store's own `path` is pointed at another folder, which is what a junction above
     /// the folder that was re-pointed would do to it). The next operation says so, and whatever it does, it does in the folder that is held, never in the one that the path
     /// leads to now: a read finds the held folder's file and not the decoy's, a write goes into the held folder, a listing is of the held folder. Without the comparison the

@@ -40,6 +40,14 @@ pub(crate) struct Info {
     pub attributes: u32,
 }
 
+#[cfg(test)]
+impl Info {
+    /// A made-up `Info`, for the tests of the rules that judge one: what a file symbolic link, a cloud placeholder or a file with two names look like cannot be made here without privileges.
+    pub(crate) fn made_up(attributes: u32, links: u32) -> Info {
+        Info { id: FileId { volume: 0, index: 0 }, links, attributes }
+    }
+}
+
 fn handle_of(file: &File) -> HANDLE {
     file.as_raw_handle() as HANDLE
 }
