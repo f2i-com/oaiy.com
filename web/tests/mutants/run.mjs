@@ -9,7 +9,8 @@
  *
  * Each mutation is `{ id, finding, what, file, find, replace, dir, command }`: `find` must occur in `file` exactly once (a mutation that
  * matches nothing is an error, not a survivor), the tests in `command` run from `dir`, and the mutation is KILLED when they fail. The
- * file is restored byte for byte in a `finally`, and its hash is checked. Before any mutation of a command runs, the command is run
+ * file is restored byte for byte in a `finally`, and its hash is checked; a mutation whose command builds (`restore`, a command) has the
+ * build made again from the restored file, so the next run of those tests does not meet the broken build. Before any mutation of a command runs, the command is run
  * on the unbroken tree: a check that starts from a failing test proves nothing, and the run stops if one does.
  *
  * The catalogue is catalogue.mjs. RESULTS.md is what the last full run said (which mutations were killed, by which failing test, and
@@ -115,6 +116,15 @@ for (const m of chosen) {
       if (sha(fs.readFileSync(file)) !== before) {
         console.error(`!!! ${m.file} was not restored`);
         process.exit(3);
+      }
+      // A command that builds (`--build`) leaves the broken source's build behind: what a later run of the same tests without `--build` (the
+      // Agent's install test runs against app/dist) would then test. The build is made again from the file as it is now.
+      if (m.restore) {
+        const rebuilt = run(m.dir, m.restore);
+        if (rebuilt.code !== 0) {
+          console.error(`!!! ${m.dir} could not be rebuilt after ${m.id} (${m.restore}):\n${rebuilt.text.split('\n').slice(-20).join('\n')}`);
+          process.exit(4);
+        }
       }
     }
   };

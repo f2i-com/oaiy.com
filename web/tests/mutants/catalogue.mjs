@@ -15,7 +15,8 @@ const MEDIA = { dir: 'platform/ui', command: 'node tests/local-media.mjs' };
 const e2e = (file, pattern) => ({ dir: 'web', command: `node --test --test-timeout=300000${pattern ? ` --test-name-pattern="${pattern}"` : ''} tests/e2e/cases/${file}`, slow: true });
 const E5 = (pattern) => e2e('e5-no-probes.test.mjs', pattern);
 // The Agent's install test runs against app/dist, which it builds only when there is none: --build makes it build the broken source.
-const PWA = { dir: 'app', command: 'node tests/e2e/pwa.mjs --build', slow: true };
+// `restore` makes the build again from the restored source, so the dist a mutation built is not left for the next run of the test.
+const PWA = { dir: 'app', command: 'node tests/e2e/pwa.mjs --build', restore: 'npx vite build', slow: true };
 
 const HOST = 'shared/capabilities/host.ts';
 const DERIVE = 'shared/capabilities/derive.ts';
