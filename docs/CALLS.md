@@ -293,7 +293,11 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
   is asked for, and the request that follows is judged on it); and an acknowledgement said in a pause after the receptionist had
   finished ("Yeah, sure." after "Is that all right?") is a turn like any other and keeps its place among the three. The phone
   plugin cannot hear when a word was said, so it drops the acknowledgements by their words alone (its `backchannel` rule in
-  the shared caller-asked fixture); that can only reach further back, so its check stays a floor under this one. **An ask counts for
+  the shared caller-asked fixture); that mostly only reaches further back, so its check stays a floor under this one, and is
+  stricter only in the cases the contract states (`transfer-v1.md`, step 6): a first name (the phone knows no names), an
+  invisible joiner or mark inside a word, a refusal and the words that would finish it with an acknowledgement between them
+  ("I don't want to", "mm-hmm", "speak to the owner": the phone drops the acknowledgement and refuses; this desktop keeps it as a
+  turn of its own and counts the words), and a turn this desktop drops for its timing that the phone keeps. **An ask counts for
   one request.** Once a ring opens from it, what the caller had said is used up, as far as the request was judged on and no
   further (what they said while the request was being planned and sent is the next request's own), and when the owner hands
   the caller back to the receptionist (`resume.afterHandoff`, or this desktop's own record of the handoff) every turn so far is
