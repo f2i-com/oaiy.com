@@ -24,8 +24,12 @@ const shell = (() => {
   return null;
 })();
 
-/** A folder with a fake `id`, `sudo` and server, and an environment file. */
-function harness({ user, envText }) {
+/**
+ * A folder with a fake `id`, `sudo` and server, and an environment file. With `running` it also has a `systemctl` that
+ * says the service runs as process 4242, and a /proc in which that process was started with `running.dataDir` (or with
+ * no OAIY_DATA_DIR when that is null).
+ */
+function harness({ user, envText, running }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oaiyctl-'));
   const bin = path.join(dir, 'bin');
   fs.mkdirSync(bin);
@@ -45,7 +49,27 @@ function harness({ user, envText }) {
   );
   const envFile = path.join(dir, 'oaiy.env');
   fs.writeFileSync(envFile, envText);
-  return { dir, bin, envFile, calls: () => (fs.existsSync(path.join(dir, 'calls.log')) ? fs.readFileSync(path.join(dir, 'calls.log'), 'utf8') : ''), posix };
+  // `systemctl` of a machine where the service runs, or is stopped.
+  write(
+    'systemctl',
+    running
+      ? '#!/bin/sh\ncase "$*" in\n  "is-active --quiet oaiy-server") exit 0 ;;\n  "show -p MainPID --value oaiy-server") echo 4242 ;;\n  *) exit 3 ;;\nesac\n'
+      : '#!/bin/sh\nexit 3\n',
+  );
+  const proc = path.join(dir, 'proc');
+  if (running) {
+    fs.mkdirSync(path.join(proc, '4242'), { recursive: true });
+    const vars = ['OAIY_SERVER_PORT=17972', ...(running.dataDir === null ? [] : [`OAIY_DATA_DIR=${running.dataDir}`])];
+    fs.writeFileSync(path.join(proc, '4242', 'environ'), vars.join('\0') + '\0');
+  }
+  return {
+    dir,
+    bin,
+    envFile,
+    proc,
+    calls: () => (fs.existsSync(path.join(dir, 'calls.log')) ? fs.readFileSync(path.join(dir, 'calls.log'), 'utf8') : ''),
+    posix,
+  };
 }
 
 function run(h, args, extraEnv = {}) {
@@ -58,6 +82,7 @@ function run(h, args, extraEnv = {}) {
       OAIYCTL_ENV_FILE: h.posix(h.envFile),
       OAIYCTL_USER: 'oaiy',
       OAIYCTL_SERVER: h.posix(path.join(h.bin, 'oaiy-server')),
+      OAIYCTL_PROC: h.posix(h.proc),
       ...extraEnv,
     },
   });
@@ -125,6 +150,71 @@ test('it says how it is used when it is given nothing, and names an environment 
     const unreadable = run(h, ['check']);
     assert.equal(unreadable.status, 1);
     assert.match(unreadable.stderr, /cannot read .*oaiy\.env/);
+  }
+});
+
+test('every run says which data folder it works in, and where the setting came from', { skip }, () => {
+  const h = harness({ user: 'oaiy', envText: 'OAIY_DATA_DIR=/var/lib/oaiy\n' });
+  const r = run(h, ['auth', 'status']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stderr, /oaiyctl: data folder \/var\/lib\/oaiy \(OAIY_DATA_DIR of .*oaiy\.env\)/);
+  const none = harness({ user: 'oaiy', envText: 'OAIY_SERVER_PORT=1\n' });
+  const r2 = run(none, ['auth', 'status']);
+  assert.equal(r2.status, 0, r2.stderr);
+  assert.match(r2.stderr, /no OAIY_DATA_DIR in .*oaiy\.env: the server's own default/);
+});
+
+test('it refuses when the running service keeps its data in another folder than the console would use', { skip }, () => {
+  // The unit is started with /var/lib/oaiy; the environment file this console reads says nothing (so the server's default).
+  const h = harness({ user: 'oaiy', envText: 'OAIY_SERVER_PORT=17972\n', running: { dataDir: '/var/lib/oaiy' } });
+  const r = run(h, ['auth', 'init', '--generate']);
+  assert.equal(r.status, 1, r.stderr);
+  assert.match(r.stderr, /refusing: the running oaiy-server keeps its data in '\/var\/lib\/oaiy'/);
+  assert.match(r.stderr, /must read the same environment file/);
+  assert.doesNotMatch(h.calls(), /server args/, 'the server was not run');
+  // The other way round: the console's file names a folder, the running server was started with none.
+  const other = harness({ user: 'oaiy', envText: 'OAIY_DATA_DIR=/srv/oaiy\n', running: { dataDir: null } });
+  const r2 = run(other, ['auth', 'init']);
+  assert.equal(r2.status, 1, r2.stderr);
+  assert.match(r2.stderr, /its default folder/);
+  // As another user the same refusal comes through sudo.
+  const asAlice = harness({ user: 'alice', envText: 'OAIY_SERVER_PORT=1\n', running: { dataDir: '/var/lib/oaiy' } });
+  const r3 = run(asAlice, ['auth', 'status']);
+  assert.equal(r3.status, 1, r3.stderr);
+  assert.match(r3.stderr, /refusing/);
+});
+
+test('it runs the server when the running service keeps its data where the console works, and when none runs', { skip }, () => {
+  const agree = harness({ user: 'oaiy', envText: 'OAIY_DATA_DIR=/var/lib/oaiy\n', running: { dataDir: '/var/lib/oaiy' } });
+  const r = run(agree, ['auth', 'status']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(agree.calls(), /server args: auth status/);
+  // No service running (the console of a stopped server, or the check before a start): nothing to compare.
+  const stopped = harness({ user: 'oaiy', envText: 'OAIY_DATA_DIR=/anywhere\n' });
+  const r2 = run(stopped, ['check']);
+  assert.equal(r2.status, 0, r2.stderr);
+  assert.match(stopped.calls(), /server args: check/);
+});
+
+test('the shipped unit and oaiyctl read one source, and the unit sets no OAIY_ setting of its own', () => {
+  const dir = path.resolve(here, '..', 'systemd');
+  const unit = fs.readFileSync(path.join(dir, 'oaiy-server.service'), 'utf8');
+  const ctl = fs.readFileSync(script, 'utf8');
+  const unitFile = /^EnvironmentFile=(\S+)$/m.exec(unit)?.[1];
+  const ctlFile = /^env_file=\$\{OAIYCTL_ENV_FILE:-([^}]+)\}$/m.exec(ctl)?.[1];
+  assert.ok(unitFile, 'the unit has an EnvironmentFile');
+  assert.equal(unitFile, ctlFile, 'the unit and oaiyctl read the same file');
+  assert.doesNotMatch(unit.replace(/^#.*$/gm, ''), /^\s*Environment=OAIY_/m, 'no OAIY_ setting inline in the unit');
+  // The unit stops a configuration the server would refuse, and does not restart on it.
+  assert.match(unit, /^ExecStartPre=\S*oaiy-server check$/m);
+  assert.match(unit, /^RestartPreventExitStatus=78$/m);
+  // The example file has the folder the unit's StateDirectory makes, and every setting is an OAIY_ one.
+  const example = fs.readFileSync(path.join(dir, 'oaiy.env.example'), 'utf8');
+  assert.match(example, /^OAIY_DATA_DIR=\/var\/lib\/oaiy$/m);
+  assert.match(unit, /^StateDirectory=oaiy /m);
+  for (const line of example.split('\n')) {
+    if (line.trim() === '' || line.startsWith('#')) continue;
+    assert.match(line, /^OAIY_[A-Z0-9_]+=/, `a setting of the example: ${line}`);
   }
 });
 

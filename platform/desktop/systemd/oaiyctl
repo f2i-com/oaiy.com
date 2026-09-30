@@ -10,19 +10,29 @@
 # `oaiyctl ...` is `oaiy-server ...` as the service user, with the OAIY_* settings of the unit's environment file
 # (/etc/oaiy/oaiy.env). Why a wrapper: the data folder belongs to the service user, and a console run as root
 # would make root-owned files in it (oaiy-server refuses, and says so); and the console needs the same
-# OAIY_DATA_DIR as the service, which is in the unit, not in your shell. Nothing secret is put on a command line:
-# the service user reads the environment file itself, through the group that owns it (root:oaiy, 0640).
+# OAIY_DATA_DIR as the service. That is why the unit (oaiy-server.service) and this script read ONE file, the
+# environment file, and the unit sets no OAIY_ setting of its own: two sources would let the console look at another
+# folder than the server keeps its data in. Nothing secret is put on a command line: the service user reads the
+# environment file itself, through the group that owns it (root:oaiy, 0640).
+#
+# Every run prints the data folder it is about to work in, and, while the service is running, checks it against the
+# folder the running server was started with (its own environment, which the service user may read) and refuses if
+# they differ.
 #
 # Settings, from the environment (the defaults are the reference install of the guide):
 #   OAIYCTL_ENV_FILE   /etc/oaiy/oaiy.env
 #   OAIYCTL_USER       oaiy
 #   OAIYCTL_SERVER     /opt/oaiy/current/oaiy-server
+#   OAIYCTL_UNIT       oaiy-server        (the service whose running server is compared)
+#   OAIYCTL_PROC       /proc              (where the environment of a running process is read)
 
 set -eu
 
 env_file=${OAIYCTL_ENV_FILE:-/etc/oaiy/oaiy.env}
 service_user=${OAIYCTL_USER:-oaiy}
 server=${OAIYCTL_SERVER:-/opt/oaiy/current/oaiy-server}
+unit=${OAIYCTL_UNIT:-oaiy-server}
+proc=${OAIYCTL_PROC:-/proc}
 
 if [ "$#" -eq 0 ]; then
   echo "usage: oaiyctl auth setup-code | auth init [--generate] | auth reset-password | auth session-link | auth status | check" >&2
@@ -32,7 +42,7 @@ fi
 
 current_user=$(id -un)
 if [ "$current_user" != "$service_user" ]; then
-  # Become the service user: run this script again as them. sudo resets the environment, so the three settings
+  # Become the service user: run this script again as them. sudo resets the environment, so the settings
   # (none of them secret) go along.
   if ! command -v sudo >/dev/null 2>&1; then
     echo "oaiyctl: this must run as $service_user and there is no sudo here: su to $service_user first" >&2
@@ -41,6 +51,7 @@ if [ "$current_user" != "$service_user" ]; then
   self=$(command -v -- "$0" 2>/dev/null || printf '%s' "$0")
   exec sudo -u "$service_user" -- env \
     "OAIYCTL_ENV_FILE=$env_file" "OAIYCTL_USER=$service_user" "OAIYCTL_SERVER=$server" \
+    "OAIYCTL_UNIT=$unit" "OAIYCTL_PROC=$proc" \
     "$self" "$@"
 fi
 
@@ -74,6 +85,33 @@ if [ -r "$env_file" ]; then
 elif [ -e "$env_file" ]; then
   echo "oaiyctl: cannot read $env_file as $service_user: is $service_user in the group that owns it (root:oaiy, 0640)?" >&2
   exit 1
+fi
+
+# The folder this console will work in, said before anything is done in it.
+ours=${OAIY_DATA_DIR-}
+if [ -n "$ours" ]; then
+  echo "oaiyctl: data folder $ours (OAIY_DATA_DIR of $env_file)" >&2
+else
+  echo "oaiyctl: no OAIY_DATA_DIR in $env_file: the server's own default folder for $service_user" >&2
+fi
+
+# While the service runs, the folder it was started with is the one that counts. Its environment is the unit's
+# (the environment file included), and the service user may read it.
+if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$unit" 2>/dev/null; then
+  pid=$(systemctl show -p MainPID --value "$unit" 2>/dev/null || true)
+  case $pid in
+    '' | 0 | *[!0-9]*) ;;
+    *)
+      if [ -r "$proc/$pid/environ" ]; then
+        running=$(tr '\0' '\n' < "$proc/$pid/environ" | sed -n 's/^OAIY_DATA_DIR=//p' | head -n 1)
+        if [ "$running" != "$ours" ]; then
+          echo "oaiyctl: refusing: the running $unit keeps its data in '${running:-its default folder}', but this console would work in '${ours:-the default folder}'." >&2
+          echo "         The unit and this script must read the same environment file ($env_file): fix it, restart the service, and run this again." >&2
+          exit 1
+        fi
+      fi
+      ;;
+  esac
 fi
 
 exec "$server" "$@"

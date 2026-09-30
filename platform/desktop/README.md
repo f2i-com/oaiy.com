@@ -276,6 +276,17 @@ violation (exit 78); a refusal to start is exit 78 too.
 | `OAIY_TRUSTED_PROXIES` | the proxies whose `X-Forwarded-*` headers are believed |
 | `OAIY_LOGIN_ALLOW` | addresses and networks a sign-in may come from (`203.0.113.7`, `203.0.113.0/24`, `2001:db8::/32`, comma-separated). **A list with any entry that is not an address or a network is refused whole** (the server does not start, `check` fails): a typo must not turn the restriction off. Unset means every address |
 
+**A service install** has one settings file, `/etc/oaiy/oaiy.env` (install it from
+`systemd/oaiy.env.example`, `root:oaiy`, `0640`), which the unit `systemd/oaiy-server.service` reads
+(`EnvironmentFile=`) and `oaiyctl` reads too: the unit sets no `OAIY_` setting of its own, so the console works in
+the folder the server keeps its data in. `oaiyctl` (`systemd/oaiyctl`) runs `oaiy-server ...` as the service user,
+says which data folder it is about to work in, and, while the service runs, refuses if that is not the folder the
+running server was started with. The unit runs `oaiy-server check` before the server (a refusal, exit 78, is not
+restarted). First run: `oaiyctl auth setup-code`, open the dashboard's `/setup` with it, or `oaiyctl auth init
+--generate` on the console. `auth init` makes no data folder of its own unless it is told to (`--new-folder`, for
+an install that has never run): a console that looks at the wrong folder says so instead of making an owner there.
+An install made with the earlier unit (`Environment=OAIY_DATA_DIR=...` in the unit) moves those lines into the file.
+
 **Limits to know before exposing a login** (they are recorded here so that nobody finds them by accident):
 
 - **Flows.** Until flow authority (ACC-05) exists, a signed-in dashboard session can write and run flows
