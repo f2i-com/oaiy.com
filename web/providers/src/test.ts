@@ -31,6 +31,8 @@ export interface TesterDeps {
    * (the Providers page and the modal), whose DOM no app can read.
    */
   providerText?: 'omit' | 'scrubbed';
+  /** Told the ids of every model list the provider returns, so the store can keep them (`rememberModels`). */
+  onModels?: (record: ProviderRecord, ids: string[]) => Promise<void>;
 }
 
 export interface Tester {
@@ -61,6 +63,8 @@ export function createTester(deps: TesterDeps): Tester {
     };
     try {
       const list = await listRecordModels(record, key, { fetchImpl, page: deps.page, providerText: deps.providerText === 'scrubbed' ? 'include' : 'omit' });
+      // What the provider itself listed is what an app may later choose from.
+      await deps.onModels?.(record, list.map((m) => m.id)).catch(() => {});
       return { ok: true, models: list.map((m) => (m.label ? { id: m.id, label: m.label } : { id: m.id })) };
     } catch (e) {
       if (exhausted) return budgetResult(exhausted);

@@ -33,14 +33,22 @@ export interface ProviderStore {
   save(input: RecordInput, key?: string): Promise<SaveResult>;
   remove(id: string): Promise<void>;
   setKey(id: string, key: string): Promise<void>;
-  /** The model of a record: the one thing a page may change over the port. False when there is no such record. */
-  setModel(id: string, model: string): Promise<boolean>;
+  /**
+   * The model of a record: the one thing a page may change over the port. With `by` (an app's name) only a model the provider itself listed
+   * (`rememberModels`) or the record's own is accepted, and the record says the app chose it; without `by` (the owner) any name goes.
+   */
+  setModel(id: string, model: string, by?: string): Promise<'ok' | 'no-provider' | 'unknown-model'>;
+  /** Keep the ids of the model list the provider just gave (at most 500): what an app may choose from. */
+  rememberModels(id: string, ids: readonly string[]): Promise<void>;
   /** Called when the list changed, here or in another document of this origin. */
   onChange(listener: () => void): () => void;
   close(): void;
 }
 
 const CHANNEL = 'oaiy-providers';
+const modelsKey = (id: string): string => `models:${id}`;
+const MODEL_ID_MAX = 200;
+const MODELS_KEPT = 500;
 
 export function createStore(db: Db, vault: ListableVault, env: StoreEnv): ProviderStore {
   const listeners = new Set<() => void>();
@@ -93,6 +101,8 @@ export function createStore(db: Db, vault: ListableVault, env: StoreEnv): Provid
       // The key is written first (a record with no key behind it is the worse half-way state), and put back as it was if the record
       // cannot be written: a new key must not be left pointing at the address the record still has.
       const before = key && previous ? ((await vault.get([providerKeyName(id)]))[providerKeyName(id)] ?? '') : '';
+      // A model an app chose stays marked as the app's while the owner leaves it alone; one the owner types is the owner's.
+      if (previous?.modelChosenBy && previous.model === checked.record.model) checked.record.modelChosenBy = previous.modelChosenBy;
       if (key) await vault.set(providerKeyName(id), key);
       try {
         await db.put('records', id, checked.record);
@@ -106,6 +116,7 @@ export function createStore(db: Db, vault: ListableVault, env: StoreEnv): Provid
 
     async remove(id) {
       await db.delete('records', id);
+      await db.delete('meta', modelsKey(id));
       await vault.set(providerKeyName(id), '');
       changed();
     },
@@ -116,18 +127,31 @@ export function createStore(db: Db, vault: ListableVault, env: StoreEnv): Provid
       changed();
     },
 
-    async setModel(id, model) {
-      // One transaction: a model chosen from a page must not overwrite an edit made at the same moment in the top-level window.
-      const outcome = await db.transact(['records'], 'readwrite', async (tx) => {
+    async rememberModels(id, ids) {
+      const clean = [...new Set(ids.filter((m) => typeof m === 'string' && m !== '' && m.length <= MODEL_ID_MAX))].slice(0, MODELS_KEPT);
+      await db.put('meta', modelsKey(id), clean);
+    },
+
+    async setModel(id, model, by) {
+      // One transaction: a model chosen from a page must not overwrite an edit made at the same moment in the top-level window, and
+      // the list it is checked against is the one read in the same transaction.
+      const outcome = await db.transact(['records', 'meta'], 'readwrite', async (tx) => {
         const store = tx.objectStore('records');
         const record = await request<ProviderRecord | undefined>(store.get(id));
-        if (!record || record.via !== 'broker') return 'none' as const;
-        if ((record.model ?? '') === model) return 'same' as const;
-        store.put({ ...record, model }, id);
+        if (!record || record.via !== 'broker') return 'no-provider' as const;
+        const known = await request<unknown>(tx.objectStore('meta').get(modelsKey(id)));
+        // The owner (no `by`) may name any model; an app may name only one the holder itself was told about by the provider (its last
+        // model list) or the one the record already has: the words on the Providers page are then the provider's, not the app's.
+        if (by !== undefined && (record.model ?? '') !== model && !(Array.isArray(known) && known.includes(model))) return 'unknown-model' as const;
+        if ((record.model ?? '') === model && (record.modelChosenBy ?? undefined) === by) return 'same' as const;
+        const next: ProviderRecord = { ...record, model };
+        if (by !== undefined) next.modelChosenBy = by;
+        else delete next.modelChosenBy;
+        store.put(next, id);
         return 'changed' as const;
       });
       if (outcome === 'changed') changed();
-      return outcome !== 'none';
+      return outcome === 'changed' || outcome === 'same' ? 'ok' : outcome;
     },
 
     onChange(listener) {

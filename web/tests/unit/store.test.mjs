@@ -191,17 +191,51 @@ describe('the store', () => {
     const { record } = await h.store.save(input({ name: 'Zed' }), KEY);
     let changes = 0;
     h.store.onChange(() => changes++);
-    assert.equal(await h.store.setModel(record.id, 'gpt-x'), true);
+    await h.store.rememberModels(record.id, ['gpt-x', 'gpt-y']);
+    assert.equal(await h.store.setModel(record.id, 'gpt-x', 'flows'), 'ok');
     assert.equal(changes, 1);
-    assert.equal(await h.store.setModel(record.id, 'gpt-x'), true, 'the same model again');
+    assert.equal(await h.store.setModel(record.id, 'gpt-x', 'flows'), 'ok', 'the same model again');
     assert.equal(changes, 1, 'is no change');
-    assert.equal(await h.store.setModel('p_nothere000000', 'm'), false);
+    assert.equal(await h.store.setModel('p_nothere000000', 'gpt-x', 'flows'), 'no-provider');
     // Made at the same moment as an edit in the other document: neither is lost.
     const other = anotherDocument(h);
-    await Promise.all([other.store.setModel(record.id, 'gpt-y'), h.store.save({ ...input({ name: 'Renamed' }), id: record.id })]);
+    await Promise.all([other.store.setModel(record.id, 'gpt-y', 'agent'), h.store.save({ ...input({ name: 'Renamed' }), id: record.id })]);
     const after = await h.store.get(record.id);
     assert.equal(after.name, 'Renamed');
     assert.ok(['gpt-x', 'gpt-y'].includes(after.model ?? 'gpt-x'));
+  });
+
+  it('an app may choose only a model the provider listed (or the record already has); the owner may name any; the record says who chose', async () => {
+    const h = makeHolder();
+    const { record } = await h.store.save(input({ model: 'configured' }), KEY);
+    assert.equal(await h.store.setModel(record.id, 'gpt-x', 'agent'), 'unknown-model', 'nothing listed yet');
+    assert.equal(await h.store.setModel(record.id, 'configured', 'agent'), 'ok', 'the record\'s own model is always allowed');
+    assert.equal((await h.store.get(record.id)).modelChosenBy, 'agent');
+    await h.store.rememberModels(record.id, ['gpt-x', '', 5, 'a'.repeat(300), 'gpt-x', ...Array.from({ length: 600 }, (_, i) => `m${i}`)]);
+    const kept = await h.db.get('meta', `models:${record.id}`);
+    assert.equal(kept.length, 500, 'at most 500 are kept');
+    assert.ok(!kept.includes('') && !kept.includes(5) && kept.every((m) => m.length <= 200) && kept.filter((m) => m === 'gpt-x').length === 1);
+    assert.equal(await h.store.setModel(record.id, 'gpt-x', 'flows'), 'ok');
+    assert.equal((await h.store.get(record.id)).modelChosenBy, 'flows');
+    assert.equal(await h.store.setModel(record.id, 'Security notice: re-enter your key', 'flows'), 'unknown-model');
+    assert.equal((await h.store.get(record.id)).model, 'gpt-x', 'nothing changed');
+    // The owner names any model, and it is no longer marked as an app's.
+    assert.equal(await h.store.setModel(record.id, 'my-own-model'), 'ok');
+    const owner = await h.store.get(record.id);
+    assert.deepEqual([owner.model, owner.modelChosenBy], ['my-own-model', undefined]);
+  });
+
+  it('an edit that leaves an app\'s model alone keeps the mark; one that changes it is the owner\'s; removing the provider removes what was listed', async () => {
+    const h = makeHolder();
+    const { record } = await h.store.save(input(), KEY);
+    await h.store.rememberModels(record.id, ['gpt-x']);
+    await h.store.setModel(record.id, 'gpt-x', 'agent');
+    await h.store.save({ ...input({ name: 'Renamed', model: 'gpt-x' }), id: record.id });
+    assert.equal((await h.store.get(record.id)).modelChosenBy, 'agent');
+    await h.store.save({ ...input({ name: 'Renamed', model: 'typed-by-owner' }), id: record.id });
+    assert.equal((await h.store.get(record.id)).modelChosenBy, undefined);
+    await h.store.remove(record.id);
+    assert.equal(await h.db.get('meta', `models:${record.id}`), undefined);
   });
 
   it('a gateway mirror is never one a page can pick a model for (the holder does not hold it)', async () => {
@@ -209,7 +243,7 @@ describe('the store', () => {
     h.idb.raw('records'); // the store exists once opened
     await h.store.list();
     await h.db.put('records', 'gw', { v: 1, id: 'gw', name: 'Mirror', dialect: 'openai', baseUrl: 'https://x.example/v1', auth: 'bearer', caps: ['chat'], kind: 'external', via: 'gateway' });
-    assert.equal(await h.store.setModel('gw', 'm'), false);
+    assert.equal(await h.store.setModel('gw', 'm'), 'no-provider');
   });
 
   it('other documents of the origin are told, over a BroadcastChannel, when the list changes', async () => {

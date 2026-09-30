@@ -99,6 +99,7 @@ export function createBroker(deps: BrokerDeps): Broker {
       fetchImpl: deps.fetchImpl,
       page: deps.page,
       key: (record) => deps.store.key(record.id),
+      onModels: (record, ids) => deps.store.rememberModels(record.id, ids),
       take: async () => {
         const taken = await deps.budget.take(app);
         return taken.ok ? { ok: true } : { ok: false, limit: taken.limit, retryAfterMs: taken.retryAfterMs };
@@ -125,8 +126,11 @@ export function createBroker(deps: BrokerDeps): Broker {
             // The holder opens nothing: it tells the page which of its own two ways to show the providers was asked for.
             return ok(id, { action: request.target });
           case 'setModel': {
-            const changed = await deps.store.setModel(request.provider, request.model);
-            return changed ? ok(id, {}) : refuse(id, errorBody('unknown-provider', 'There is no such provider.'));
+            const outcome = await deps.store.setModel(request.provider, request.model, app);
+            if (outcome === 'no-provider') return refuse(id, errorBody('unknown-provider', 'There is no such provider.'));
+            // A model the provider has not listed is refused: what the Providers page then shows is the provider's words, not the app's.
+            if (outcome === 'unknown-model') return refuse(id, errorBody('unknown-model', 'That model is not in the provider’s own list. Ask for the models first.'));
+            return ok(id, {});
           }
           case 'abort':
             inFlight.get(request.target)?.abort();

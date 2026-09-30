@@ -41,7 +41,7 @@ export function mountManage(root: HTMLElement, ctx: Context): void {
 
   const presets = loadPresets();
   // This page is the holder's own, and no app can read its DOM: a provider's words may be shown (as text, scrubbed of the key).
-  const tester = (key: () => Promise<string>) => createTester({ fetchImpl: ctx.fetchImpl, page: ctx.page, key, providerText: 'scrubbed' });
+  const tester = (key: () => Promise<string>) => createTester({ fetchImpl: ctx.fetchImpl, page: ctx.page, key, providerText: 'scrubbed', onModels: (record, ids) => ctx.store.rememberModels(record.id, ids) });
 
   const listBox = h('section', { class: 'card', attrs: { 'aria-label': 'Your providers' } });
   const formBox = h('section', { class: 'card', attrs: { 'aria-label': 'Add or change a provider' } });
@@ -102,7 +102,7 @@ export function mountManage(root: HTMLElement, ctx: Context): void {
       return h(
         'li',
         { class: 'row' },
-        h('div', { class: 'grow' }, h('strong', { text: s.name }), h('span', { class: 'chip', text: KIND_LABEL[s.kind] ?? s.kind }), h('br'), h('span', { class: 'fine', text: `${s.host} · ${s.model ?? 'no model chosen'} · ${s.hasKey ? 'key stored' : 'no key'}` }), result),
+        h('div', { class: 'grow' }, h('strong', { text: s.name }), h('span', { class: 'chip', text: KIND_LABEL[s.kind] ?? s.kind }), h('br'), h('span', { class: 'fine', text: `${s.host} · ${s.model ?? 'no model chosen'}${record.modelChosenBy && s.model ? ` (chosen by ${record.modelChosenBy})` : ''} · ${s.hasKey ? 'key stored' : 'no key'}` }), result),
         h('div', { class: 'actions' }, check, h('button', { class: 'button', text: 'Edit', on: { click: () => openForm(record) } }), remove),
       );
     });

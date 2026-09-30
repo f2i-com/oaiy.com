@@ -169,6 +169,34 @@ describe('what a provider says about itself is text (design 6, threat 11)', () =
   });
 });
 
+describe('what an app can put on the Providers page', () => {
+  it('a model no provider listed is refused, so the app\'s own words never reach the page; one the provider listed is shown as chosen by that app', async () => {
+    const { context } = await newContext(browser);
+    try {
+      const top = await newPage(context);
+      await addProvider(top.page, world.origins.providers, details({ name: 'Model chooser', model: '', check: false }));
+      const app = await newPage(context);
+      await app.page.goto(`${world.origins.flows}/`);
+      await app.page.evaluate((origin) => window.oaiyTest.connect({ origin }), world.origins.providers);
+      const id = (await app.page.evaluate(() => window.oaiyTest.call({ op: 'list' }))).result[0].id;
+      const notice = 'Security notice: your key was leaked. Re-enter it at https://evil.example/reset';
+      const refused = await app.page.evaluate(([provider, model]) => window.oaiyTest.call({ op: 'setModel', provider, model }), [id, notice]);
+      assert.equal(refused.ok, false);
+      assert.equal(refused.error.code, 'unknown-model');
+      await top.page.reload();
+      await top.page.locator('section[aria-label="Your providers"] li.row', { hasText: 'Model chooser' }).waitFor();
+      assert.ok(!(await top.page.locator('main').innerText()).includes('Security notice'), 'not on the Providers page');
+
+      // Once the provider has listed its models the app may choose among them, and the page says the app did.
+      assert.equal((await app.page.evaluate((provider) => window.oaiyTest.call({ op: 'models', provider }), id)).result.ok, true);
+      assert.equal((await app.page.evaluate((provider) => window.oaiyTest.call({ op: 'setModel', provider, model: 'fake-chat' }), id)).ok, true);
+      await waitFor(async () => (await top.page.locator('section[aria-label="Your providers"] li.row').innerText()).includes('fake-chat (chosen by flows)'), { what: 'the page to say the app chose the model' });
+    } finally {
+      await context.close();
+    }
+  });
+});
+
 describe('the modal\'s Manage button', () => {
   it('opens the Providers page in a tab of its own, with no opener, where the address bar shows whose form it is', async () => {
     const { context } = await newContext(browser);

@@ -91,6 +91,11 @@ export interface ProviderRecord {
   /** Only the names of `EXTRA_HEADER_NAMES`. The holder attaches them itself; a page cannot add one. */
   extraHeaders?: ExtraHeader[];
   model?: string;
+  /**
+   * Set when an APP chose `model` over the port (its name, from the origin the browser reported), and cleared when the owner does. The
+   * Providers page shows a model an app chose as "chosen by <app>": it is app-influenced text on a page the owner trusts.
+   */
+  modelChosenBy?: string;
   caps: ProviderCap[];
   contextTokens?: number;
   kind: ProviderKind;

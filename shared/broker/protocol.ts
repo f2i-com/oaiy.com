@@ -248,6 +248,7 @@ export function parseRequest(data: unknown): ParsedRequest {
 export type ErrorCode =
   | ParseFailureCode
   | 'unknown-provider'
+  | 'unknown-model'
   | 'bad-path'
   | 'bad-method'
   | 'bad-query'

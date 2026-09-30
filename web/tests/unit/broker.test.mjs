@@ -107,7 +107,7 @@ describe('the operations', () => {
       { op: 'list', includeKey: true, withSecrets: true },
       { op: 'status', reveal: true },
       { op: 'models', provider: w.record.id, key: 'x', includeKey: true },
-      { op: 'setModel', provider: w.record.id, model: 'm', key: KEY, baseUrl: 'https://evil.example/v1', name: 'Renamed' },
+      { op: 'setModel', provider: w.record.id, model: 'fake-chat', key: KEY, baseUrl: 'https://evil.example/v1', name: 'Renamed' },
       { op: 'ui.open', target: 'manage', edit: w.record.id },
       { op: 'abort', target: 999 },
     ]) await client.call(message);
@@ -115,7 +115,8 @@ describe('the operations', () => {
     const after = await w.store.get(w.record.id);
     assert.equal(after.baseUrl, 'https://api.openai.com/v1', 'a baseUrl in a message changed nothing');
     assert.equal(after.name, 'Work OpenAI', 'and neither did a name');
-    assert.equal(after.model, 'm', 'the model is the one thing a page can set');
+    assert.equal(after.model, 'fake-chat', 'the model is the one thing a page can set');
+    assert.equal(after.modelChosenBy, 'agent', 'and the record says which app chose it');
   });
 
   it('a request that is malformed is refused with its id when it has one, and dropped when it has none', async () => {
@@ -137,14 +138,35 @@ describe('the operations', () => {
     assert.equal((await client.call({ op: 'ui.open', target: 'https://evil.example' })).ok, false);
   });
 
-  it('setModel changes the model of a provider the holder holds, and pushes `changed` to every connected page', async () => {
-    const w = await world();
+  it('setModel changes the model of a provider the holder holds to one the provider itself listed, and pushes `changed` to every connected page', async () => {
+    const w = await world({ handler: () => jsonResponse({ data: [{ id: 'gpt-x' }, { id: 'gpt-y' }] }) });
     const a = await w.connect();
     const b = await w.connect({ origin: FLOWS });
+    assert.equal((await a.call({ op: 'setModel', provider: w.record.id, model: 'gpt-x' })).error.code, 'unknown-model', 'before the models were asked for, nothing is known');
+    assert.equal((await a.call({ op: 'models', provider: w.record.id })).result.ok, true);
     assert.equal((await a.call({ op: 'setModel', provider: w.record.id, model: 'gpt-x' })).ok, true);
-    assert.equal((await w.store.get(w.record.id)).model, 'gpt-x');
+    const record = await w.store.get(w.record.id);
+    assert.deepEqual([record.model, record.modelChosenBy], ['gpt-x', 'agent']);
     await b.waitFor((m) => m.t === 'changed');
-    assert.equal((await a.call({ op: 'setModel', provider: 'p_nothere000000', model: 'm' })).error.code, 'unknown-provider');
+    assert.equal((await a.call({ op: 'setModel', provider: 'p_nothere000000', model: 'gpt-x' })).error.code, 'unknown-provider');
+  });
+
+  it('a model no provider listed is refused: an app cannot put its own words on the Providers page (the reviewer\'s "Security notice" string)', async () => {
+    const w = await world({ handler: () => jsonResponse({ data: [{ id: 'gpt-x' }] }) });
+    const client = await w.connect();
+    await client.call({ op: 'models', provider: w.record.id });
+    const notice = 'Security notice: your key was leaked. Re-enter it at https://evil.example/reset';
+    for (const model of [notice, 'gpt-x ', 'GPT-X', 'gpt-y', '<img src=x>']) {
+      const reply = await client.call({ op: 'setModel', provider: w.record.id, model });
+      assert.equal(reply.ok, false, model);
+      assert.ok(['unknown-model', 'bad-request'].includes(reply.error.code), `${model}: ${reply.error.code}`);
+    }
+    assert.equal((await w.store.get(w.record.id)).model, undefined, 'nothing was stored');
+    // The other app cannot slip past by listing first: it may choose only what the PROVIDER listed.
+    const flows = await w.connect({ origin: FLOWS });
+    assert.equal((await flows.call({ op: 'setModel', provider: w.record.id, model: notice })).ok, false);
+    assert.equal((await flows.call({ op: 'setModel', provider: w.record.id, model: 'gpt-x' })).ok, true);
+    assert.equal((await w.store.get(w.record.id)).modelChosenBy, 'flows');
   });
 });
 
