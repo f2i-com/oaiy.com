@@ -642,7 +642,7 @@ fn a_scoped_server_takes_the_static_token_in_the_shape_the_design_gives_it() {
     // bearer rule (`[A-Za-z0-9._~+/=-]`, 128 bytes): a token with a `$` in it, or one of 200 characters, must
     // not be a `400` in front of the server that was configured with it.
     // 200 printable characters that the rule takes: the first of a seeded xorshift series that it does.
-    let long: String = (1u64..)
+    let long: String = (1u64..5000)
         .map(|seed| {
             let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
             (0..200)

@@ -2582,7 +2582,7 @@ async fn y21_the_health_probe_is_exempt_from_the_host_check_for_get_and_head_of_
 
 /// `len` printable characters that the static token rule takes: the first of a seeded xorshift series that it does.
 fn random_printable(len: usize) -> String {
-    for seed in 1u64.. {
+    for seed in 1u64..5000 {
         let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ len as u64;
         let token: String = (0..len)
             .map(|_| {
@@ -2596,7 +2596,7 @@ fn random_printable(len: usize) -> String {
             return token;
         }
     }
-    unreachable!()
+    panic!("the static token rule takes no token of {len} printable characters in 5000 tries");
 }
 
 /// Tokens the static token rule takes (32 to 256 printable characters worth 128 bits, no pattern) that the strict

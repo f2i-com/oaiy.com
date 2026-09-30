@@ -904,14 +904,14 @@ mod tests {
     /// `len` printable characters that the rule takes (the first of a seeded series that it does), for the tests
     /// that need a token and are about something else. Not longer than 256.
     fn wide(len: usize) -> String {
-        for seed in 0u64.. {
+        for seed in 0u64..5000 {
             let mut rng = Rng(seed * 1000 + len as u64);
             let token = rng.text(len, PRINTABLE);
             if check_static_token_shape(&token).is_ok() {
                 return token;
             }
         }
-        unreachable!()
+        panic!("the rule takes no token of {len} printable characters in 5000 tries");
     }
 
     fn hex(bytes: &[u8]) -> String {
@@ -1169,10 +1169,10 @@ mod tests {
         // 8 different characters in 40 that no piece repeats in, and 7.
         for (alphabet, want) in [("kQzmVpWx", Ok(())), ("kQzmVpW", Err(TooFewDistinct))] {
             // (Of 40 characters drawn from 8, one time in 25 misses one, and is 7: the first that is taken.)
-            let token = (0u64..)
+            let token = (0u64..5000)
                 .map(|seed| Rng(seed).text(40, alphabet))
                 .find(|t| want.is_err() || check_static_token_shape(t).is_ok())
-                .unwrap();
+                .unwrap_or_else(|| panic!("no token of {alphabet} is taken in 5000 tries"));
             assert_eq!(
                 check_static_token_shape(&token),
                 want,
@@ -1181,13 +1181,15 @@ mod tests {
         }
         // 39 decimal digits are worth 129 bits and 38 are worth 126; 32 hex digits are worth 128 and 31 are short.
         for (digits, want) in [(38, Err(TooLittleEntropy)), (39, Ok(()))] {
-            let token = (0u64..)
+            let token = (0u64..5000)
                 .map(|seed| Rng(seed).text(digits, "0123456789"))
                 .find(|t| {
                     let verdict = check_static_token_shape(t);
                     verdict == Ok(()) || verdict == Err(TooLittleEntropy)
                 })
-                .unwrap();
+                .unwrap_or_else(|| {
+                    panic!("no token of {digits} digits that only the bits refuse in 5000 tries")
+                });
             assert_eq!(check_static_token_shape(&token), want, "{token}");
         }
         // The edge of every alphabet the estimate tells apart: what 32 characters of it are worth. Hex of one case
