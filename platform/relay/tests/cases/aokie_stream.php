@@ -352,6 +352,32 @@ test('4.14.5 a hold looks for a newer one every 50 ms for its first two seconds 
     eq(0.2, Stream::stepSeconds($now - 19.0), 'and for the rest of the wait');
 });
 
+test('4.14.5 a stream and a frames wait take the fast step in their first two seconds and the usual one after, as they actually run (the steps they sleep are recorded), and not only in the function that names them', function () {
+    [$k, $a, $b, $plug, $ta] = aok_pair();
+    $f = $k->facade($ta);
+    $steps = [];
+    Stream::$sleeper = static function (float $s) use (&$steps): void {
+        $steps[] = round($s, 3);
+        usleep((int)($s * 1e6));
+    };
+    try {
+        // A stream that lasts 1.3 seconds: every step it sleeps is a fast one (the last may be shorter: what is left).
+        Stream::run($k->r->ctx(), $f, 0, 1.3, static fn(string $b): bool => true, static fn(): bool => false);
+        ok(count($steps) >= 20, count($steps) . ' steps in 1.3 s: ' . json_encode($steps));
+        foreach ($steps as $s) {
+            ok($s <= 0.05 + 1e-9, "a step of $s s inside the first two seconds of a stream");
+        }
+        // A frames wait of one second: the same.
+        $steps = [];
+        Stream::pull($k->r->ctx(), $f, 0, 1, static fn(): bool => false);
+        ok(count($steps) >= 15, count($steps) . ' steps in a 1 s frames wait: ' . json_encode($steps));
+        foreach ($steps as $s) {
+            ok($s <= 0.05 + 1e-9, "a step of $s s inside the first second of a frames wait");
+        }
+    } finally {
+        Stream::$sleeper = null;
+    }
+});
 test('4.14.5 a frames wait writes nothing until it ends, so its answer has the status and the headers it means to: JSON, the hold header, no headers sent early by a flush', function () {
     [$k, $a, $b, $plug, $ta] = aok_pair(['wait' => ['max' => 3]]);
     [$srv] = $k->r->fleet(1);

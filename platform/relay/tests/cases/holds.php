@@ -615,6 +615,42 @@ test('4.7.2 rule 5: a credential has at most three polls that wait running at on
     eq(200, $r->call($phone, 'GET', '/v1/poll', null, ['wait' => '1'])['status'], 'and a place that was freed is taken');
 });
 
+test('4.7.2 rule 5: the bound is made atomic by the order of marker then count, not by luck: with three other polls of the credential having made their markers between this one\'s pre-check and its count, this one is refused every time, and with two it is let through', function () {
+    $r = Relay::make(['wait' => ['max' => 8], 'capacity' => ['workers' => 20]]);
+    $d = $r->desktop();
+    $phone = $r->phone($d);
+    $dir = $r->data . '/holds/poll/' . Signals::hash($phone->id);
+    // Requests that run in the same instant cannot be made to meet at one point from outside (a test that tries is a race, and passes or
+    // fails by timing). The point is a hook in Holds::acquire: it is called when this hold has made its marker and not yet counted the
+    // others, and there the test makes the markers that three other polls, which passed the same pre-check a moment ago, have made.
+    $others = static function (int $n) use ($dir): \Closure {
+        return static function (string $kind, string $principal, string $file) use ($n, $dir): void {
+            if ($kind !== 'poll') {
+                return;
+            }
+            for ($i = 0; $i < $n; $i++) {
+                file_put_contents($dir . '/20.' . bin2hex(random_bytes(6)), '');
+            }
+            Holds::$afterMarker = null; // once
+        };
+    };
+    try {
+        Holds::$afterMarker = $others(3);
+        $res = $r->call($phone, 'GET', '/v1/poll', null, ['wait' => '1']);
+        eq(429, $res['status'], 'the pre-check saw none; the count, after the marker, sees three: ' . $res['body']);
+        eq('1', $res['headers']['retry-after']);
+        eq(3, $r->ctx()->holds->inFlight('poll', $phone->id), 'and its own marker was taken away');
+        foreach (Oaiy\Relay\Fs::entries($dir) as $f) {
+            unlink($f);
+        }
+        Holds::$afterMarker = $others(2);
+        $res = $r->call($phone, 'GET', '/v1/poll', null, ['wait' => '1']);
+        eq(200, $res['status'], 'two others and this one are three: ' . $res['body']);
+        eq(['granted' => true], $res['json']['hold']);
+    } finally {
+        Holds::$afterMarker = null;
+    }
+});
 test('4.7.2 rule 5: eight polls of one credential that arrive together are not all let through: the marker is made first and the others counted second, so at most three run', function () {
     $r = Relay::make(['wait' => ['max' => 8], 'capacity' => ['workers' => 20]]);
     $d = $r->desktop();

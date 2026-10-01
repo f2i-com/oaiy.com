@@ -40,6 +40,19 @@ final class Stream
     {
         return (Clock::mono() - $startedAt < self::FAST_FOR_S ? self::FAST_STEP_MS : self::STEP_MS) / 1000.0;
     }
+
+    /** Set by a test that wants to see the steps a wait takes (it is handed each step in seconds and sleeps it, or not); null in the relay. */
+    public static ?\Closure $sleeper = null;
+
+    /** Sleep one step of a wait. */
+    private static function step(float $seconds): void
+    {
+        if (self::$sleeper !== null) {
+            (self::$sleeper)($seconds);
+            return;
+        }
+        usleep((int)($seconds * 1e6));
+    }
     public const PAGE_FRAMES = 128;
     public const PAGE_BYTES = 1048576;
 
@@ -135,7 +148,7 @@ final class Stream
             if ($left <= 0) {
                 break;
             }
-            usleep((int)(min(self::stepSeconds($startedAt), $left) * 1e6));
+            self::step(min(self::stepSeconds($startedAt), $left));
         }
         $write(self::endEvent($cursor));
         return $cursor;
@@ -172,7 +185,7 @@ final class Stream
         }
         $startedAt = Clock::mono();
         while (Clock::mono() < $deadline) {
-            usleep((int)(min(self::stepSeconds($startedAt), max(0.0, $deadline - Clock::mono())) * 1e6));
+            self::step(min(self::stepSeconds($startedAt), max(0.0, $deadline - Clock::mono())));
             if ($ctx->signals->isRevoked($f->deviceId)) {
                 throw ApiError::make('revoked');
             }

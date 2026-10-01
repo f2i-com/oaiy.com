@@ -891,6 +891,24 @@ test('4.10.3 step 9: the plaintext token is wiped from memory once it is sealed,
     ok($token2 === null || trim($token2, "\0") === '', 'wiped after a refusal too');
 });
 
+test('4.10.3 step 9: an approval puts the token through sealAndWipe once, and a denial and a refusal put none: the wipe is what the approval does, not only what a helper can do', function () {
+    [$r, $d, $c] = pair_setup();
+    $c->open();
+    $c->answer();
+    $before = Oaiy\Relay\Pairing::$wiped;
+    eq(200, $c->decide()['status']);
+    eq($before + 1, Oaiy\Relay\Pairing::$wiped, 'the approval made one device token and wiped it once');
+    // The same approval again (an outbox retry) makes no token, so wipes none.
+    eq(200, $c->decide()['status']);
+    eq($before + 1, Oaiy\Relay\Pairing::$wiped);
+    // A denial makes no token either.
+    [$r2, $d2, $c2] = pair_setup();
+    $c2->open();
+    $c2->answer();
+    $b2 = Oaiy\Relay\Pairing::$wiped;
+    eq(200, $c2->decide(['approve' => false])['status']);
+    eq($b2, Oaiy\Relay\Pairing::$wiped);
+});
 test('4.10.3 step 9: the phone reading the outcome marks the rendezvous read (deleted ten minutes later, as at expiry); a reader that has not read it does not', function () {
     [$r, $d, $c] = pair_setup();
     $c->open();

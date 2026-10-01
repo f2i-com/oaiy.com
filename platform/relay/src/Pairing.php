@@ -353,6 +353,9 @@ final class Pairing
         return $result;
     }
 
+    /** How many tokens sealAndWipe has been given in this process: a test that approves a pairing counts, because the wipe itself cannot be seen. */
+    public static int $wiped = 0;
+
     /**
      * Seal a device token to the phone's X25519 key and zero the plaintext, whether or not the sealing worked: the caller's variable
      * holds no token once this returns (sodium_memzero leaves it NULL), so the plaintext lives in the one box and nowhere else. A key
@@ -362,6 +365,7 @@ final class Pairing
      */
     public static function sealAndWipe(string &$token, string $x25519): string
     {
+        self::$wiped++;
         try {
             return sodium_crypto_box_seal($token, $x25519);
         } catch (\SodiumException $e) {

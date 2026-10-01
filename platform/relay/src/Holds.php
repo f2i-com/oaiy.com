@@ -48,6 +48,12 @@ final class Holds
     public const OPEN_BUCKET = 20;
     public const OPEN_REFILL_PER_S = 3;
 
+    /**
+     * Set by a test: called with the kind, the principal and the marker's path right after a hold has made its marker and before it counts the
+     * others, which is the instant at which a hold that passed a pre-check at the same moment as this one has made its marker too. Null in the relay.
+     */
+    public static ?\Closure $afterMarker = null;
+
     private string $dir;
     private Effective $eff;
     private \Closure $clock;
@@ -90,6 +96,9 @@ final class Holds
             return null;
         }
         $hold = new Hold($file, $capS, $this->clock); // stamps the marker from the relay's clock, not the filesystem's
+        if (self::$afterMarker !== null) {
+            (self::$afterMarker)($kind, $principal, $file);
+        }
         // Count what the others pin. A principal that may hold only one request at a time (every kind but lookup) pins one
         // worker however many markers it has: a second marker is a hold being superseded, which ends within 250 ms.
         $distinct = [];

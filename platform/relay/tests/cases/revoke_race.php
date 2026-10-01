@@ -22,7 +22,8 @@ use OaiyTest\Relay;
  * What these tests cannot tell, on SQLite (the review's mutants D19 and D21, "the shared lock is not taken"): the lock is what makes a
  * post wait for a revocation that is still in flight, and SQLite has no such thing to wait for (BEGIN IMMEDIATE holds the whole file, so
  * the post and the revocation never overlap at all); a mutant without the lock survives here, as it must, and is killed on MySQL and
- * MariaDB by the tests in pairing_mysql.php that hold the revocation open on a second connection (D19m and D21m in the review's run).
+ * MariaDB: D19 by the tests in pairing_mysql.php that hold the revocation open on a second connection, and D21 (the per-device read
+ * of a revocation without its lock) by the last test of this file, which runs a second revocation into a first that is in flight.
  */
 
 /** A POST /v1/items request from $p to $to with one cmd item, as the Kernel hands it to the handler. */
@@ -202,4 +203,31 @@ slow_test('4.5 eight posters racing the revocation of their sender: when it has 
 slow_test('4.5 eight posters racing the revocation of their recipient: no mailbox and no item of it exists afterwards', function () {
     Relay::sqliteOnly();
     rr_race(Relay::make(), 'recipient', 8);
+});
+
+test('4.5 MySQL and MariaDB: a revocation reads the device row with a lock before it changes it, so a second revocation that meets the first one in flight finds the device revoked and leaves its revocation time alone (a plain read would see the old row and overwrite the time)', function () {
+    Relay::mysqlOnly();
+    $r = Relay::make();
+    $d = $r->desktop();
+    $phone = $r->phone($d);
+    [$srv] = $r->fleet(1);
+    usleep(300000);
+    $c = $r->ctx()->db->config()->db();
+    $a = new PDO($c['dsn'], $c['user'], $c['pass'], [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+    // A first revocation, in flight on another connection: it has locked the device row and set the time, and has not committed.
+    $first = Relay::T0 + 5;
+    $a->exec('START TRANSACTION');
+    $a->prepare('SELECT id FROM devices WHERE id = ? FOR UPDATE')->execute([$phone->id]);
+    $a->prepare('UPDATE devices SET revoked_at = ? WHERE id = ?')->execute([$first, $phone->id]);
+    // The second, a minute later by the relay's clock, from the desktop: it has to wait for the first.
+    OaiyTest\Tmp::setClock(Relay::T0 + 60);
+    $p = $srv->begin('DELETE', '/v1/devices/' . $phone->id, ['Authorization' => 'Bearer ' . $d->token]);
+    $p->pump(0.7);
+    ok(!$p->done(), 'the second revocation waits for the first, which holds the row');
+    $a->exec('COMMIT');
+    $res = $p->finish(20.0);
+    eq(204, $res['status'], $res['body']);
+    // It found the device revoked at the first time, and left it: with a plain read it would have seen the row as it was before the first
+    // began (not revoked), revoked it again, and the time would be the second's.
+    eq($first, (int)$r->ctx()->db->val('SELECT revoked_at FROM devices WHERE id = ?', [$phone->id]), 'the revocation time is the first one\'s');
 });
