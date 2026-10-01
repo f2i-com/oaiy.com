@@ -100,7 +100,11 @@ the phone's (MOB-21a) can be tested against the same table before there is a rel
 
 The table also says what it holds: `constants` (the numbers of the rules, which a reader refuses unless they are exactly the README's, and
 takes its numbers from), `caseCount` and `idsSha256` (the SHA-256 of the sorted case names, one per line: a case that goes missing changes
-both, and the conformance suite pins both so that a table edited to agree with itself is noticed too).
+both) and `layoutSha256` (the SHA-256 of the lines `id|rule` in the table's own order: a case that was relabelled as another rule, or moved,
+changes it). A reader refuses a table whose own digests do not match its cases; the conformance suite pins all three, so that a table edited to
+agree with itself is noticed too, and reads the numbers out of the README's own words and requires that the table's `constants` and both readers'
+own copies of them are those (a reader whose guard on `constants` was removed, or a table and two readers that agree on a number the README
+does not state, are refused).
 
 A reader loads the file, runs every case through its own implementation of the rules and compares all six members; `python
 poll-client/verify_poll_client.py` and `node poll-client/verify_poll_client.mjs` each print `N checks, 0 mismatches` (and take `--file`

@@ -6,7 +6,8 @@
 //   node verify_poll_client.mjs [--file poll-client.json]
 //
 // Beyond each case it enforces the table's `constants` block (exactly the numbers the README states, EXPECTED below; every rule takes its number
-// from that block) and its `caseCount` and `idsSha256` (a case that went missing is noticed; the conformance suite pins both).
+// from that block) and its `caseCount`, `idsSha256` and `layoutSha256` (a case that went missing, or was relabelled or moved, is noticed; the
+// conformance suite pins all three and checks EXPECTED below against the README's own text).
 //
 // Prints "N checks, M mismatches" and exits 1 on any mismatch.
 import { createHash } from 'node:crypto';
@@ -161,6 +162,8 @@ const ids = doc.cases.map((c) => c.id);
 check('caseCount', 'the table holds the number of cases it says', doc.caseCount === ids.length, `says ${doc.caseCount}, holds ${ids.length}`);
 const digest = createHash('sha256').update([...ids].sort().join('\n'), 'utf8').digest('hex');
 check('idsSha256', 'the digest of the case names is the one the table says (a case went missing, or was added)', doc.idsSha256 === digest);
+const layout = createHash('sha256').update(doc.cases.map((c) => `${c.id}|${c.rule}`).join('\n'), 'utf8').digest('hex'); // `id|rule` in the table's own order
+check('layoutSha256', "the digest of the case names with their rule labels, in the table's order, is the one the table says (a case was relabelled or moved)", doc.layoutSha256 === layout);
 const used = { ...EXPECTED };
 for (const k of Object.keys(EXPECTED)) if (K[k] !== undefined) used[k] = K[k];
 const { decide, replaceWaitMs, proofDue } = make(used);

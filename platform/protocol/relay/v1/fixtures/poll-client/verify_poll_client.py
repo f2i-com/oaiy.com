@@ -7,8 +7,9 @@ language; a client's own code is a fourth, tested against the same table.
 
 What it enforces beyond each case: the `constants` block of the table must be exactly the numbers the README states (EXPECTED below), and every
 rule below takes its number from that block, so a table whose constants were changed is refused and so is a reader that ignores them; the
-`caseCount` and `idsSha256` of the table must match the cases it holds, so a case that went missing from it is noticed (the conformance suite
-pins both, so that a table edited to agree with itself is noticed too).
+`caseCount`, `idsSha256` and `layoutSha256` of the table must match the cases it holds, so a case that went missing from it, or was relabelled or
+moved, is noticed (the conformance suite pins all three, and checks EXPECTED below against the README's own text, so that a table edited to
+agree with itself, or a reader and a table that agree on a number the README does not state, are noticed too).
 
 Prints "N checks, M mismatches" and exits 1 on any mismatch.
 """
@@ -164,6 +165,11 @@ def ids_digest(ids) -> str:
     return hashlib.sha256("\n".join(sorted(ids)).encode("utf-8")).hexdigest()
 
 
+def layout_digest(cases) -> str:
+    """The lines `id|rule` in the table's own order: which rule each case says it checks, and in what order."""
+    return hashlib.sha256("\n".join(f"{c['id']}|{c['rule']}" for c in cases).encode("utf-8")).hexdigest()
+
+
 def main() -> int:
     path = HERE / "poll-client.json"
     if "--file" in sys.argv:
@@ -183,6 +189,8 @@ def main() -> int:
     ids = [c["id"] for c in doc["cases"]]
     check("caseCount", "the table holds the number of cases it says", doc.get("caseCount") == len(ids), f"says {doc.get('caseCount')}, holds {len(ids)}")
     check("idsSha256", "the digest of the case names is the one the table says (a case went missing, or was added)", doc.get("idsSha256") == ids_digest(ids))
+    check("layoutSha256", "the digest of the case names with their rule labels, in the table's order, is the one the table says (a case was relabelled or moved)",
+          doc.get("layoutSha256") == layout_digest(doc["cases"]))
     decide, replace_wait_ms, proof_due = make({**EXPECTED, **{k: v for k, v in K.items() if k in EXPECTED}})
     seen = set()
     for c in doc["cases"]:

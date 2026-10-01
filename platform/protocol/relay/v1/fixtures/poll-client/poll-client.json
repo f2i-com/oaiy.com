@@ -1,6 +1,6 @@
 {
  "version": 1,
- "about": "Known answers for the poll loop of a native client (README section 5.1.1: DK-03, MOB-21a). Each case gives the client's counters before the answer, what the relay answered (or that nothing came), the jitter draw u, and what the rules lead to: the outcome (P2), the pause before jitter and after it (P3, P5, P6), the counters after, what the loop does when it ends (P8) and what it reports (P7). A case with `replace` is rule P1 (the earliest a replacement poll may start); one with `proof` is the answer to the identity proof of P9; one with `proofDue` says whether a proof is due. `caseCount` and `idsSha256` (the digest of the sorted case names, one per line) say what the table holds, so that a case that goes missing is noticed. Both readers recompute every case from the rules, not from this file's other cases, and refuse constants that are not the numbers of the README.",
+ "about": "Known answers for the poll loop of a native client (README section 5.1.1: DK-03, MOB-21a). Each case gives the client's counters before the answer, what the relay answered (or that nothing came), the jitter draw u, and what the rules lead to: the outcome (P2), the pause before jitter and after it (P3, P5, P6), the counters after, what the loop does when it ends (P8) and what it reports (P7). A case with `replace` is rule P1 (the earliest a replacement poll may start); one with `proof` is the answer to the identity proof of P9; one with `proofDue` says whether a proof is due. `caseCount` and `idsSha256` (the digest of the sorted case names, one per line) say what the table holds, so that a case that goes missing is noticed; `layoutSha256` (the digest of the lines id|rule in the table's own order) says which rule each case checks and in what order, so that a case that was relabelled or moved is noticed too. Both readers recompute every case from the rules, not from this file's other cases, and refuse constants that are not the numbers of the README.",
  "constants": {
   "replaceMinMs": 250,
   "clampMin": 1,
@@ -19,6 +19,7 @@
  },
  "caseCount": 111,
  "idsSha256": "e9ce737bd8df32d166aa61cd5dfdc6aea038f72437063be9d1d3633613a4c34d",
+ "layoutSha256": "f9d7696242d382d232a70a0f63d76ef8d6024d6c2c3ddacca36ba66a82e08534",
  "cases": [
   {
    "id": "p1-replace-at-once",
