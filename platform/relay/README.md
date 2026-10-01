@@ -15,7 +15,7 @@ The wire protocol is [`platform/protocol/relay/v1/`](../protocol/relay/v1/README
 | Extensions | `sodium` (bundled with PHP since 7.2), `json`, `hash`, and `pdo_sqlite` (the default store) or `pdo_mysql`. `openssl` and `curl` matter only to the optional FCM sender, which is not part of this build. |
 | Disk | A writable `data/` folder on a **local** filesystem (SQLite's write-ahead log is unsafe on NFS and similar). The hold markers in `data/holds/` are stamped with PHP's clock and not the filesystem's, so a `data/` whose filesystem clock is off PHP's by minutes still counts its holds (a marker is stale 5 seconds past its cap, or when stamped more than a minute ahead). |
 | HTTPS | A publicly trusted certificate on a hostname of its own (a subdomain such as `relay.example.com`, not a path on a site that hosts anything else). The desktop and the phone use the bundled web roots and cannot use a private CA. |
-| Workers | Each waiting poll holds one PHP worker for up to 20 seconds. Measure what your host allows with the [host probe](probe/host-probe.php) and [`docs/relay-hosting-matrix.md`](../../docs/relay-hosting-matrix.md) before you commit to a plan. |
+| Workers | Each waiting poll holds one PHP worker for up to 20 seconds; at most three polls that wait of one credential run at once (the fourth is `429`, `Retry-After: 1`, before the database is read), so one phone cannot pin a small pool. Measure what your host allows with the [host probe](probe/host-probe.php) and [`docs/relay-hosting-matrix.md`](../../docs/relay-hosting-matrix.md) before you commit to a plan. |
 
 ## Layout
 
@@ -427,7 +427,8 @@ own tests: every rule of the design's sections 4.10 and 4.14 is named by one, th
 for the races (two responders to one pid, an approval racing a burn, a newer stream replacing an older one within a step, a
 revocation ending a held stream), the pool tests (`tests/cases/pool.php`: a pool of W workers, meaning W `php -S` servers behind
 `tests/pool_front.php`, a front that queues a request until a worker is free as PHP-FPM does, is put in front of the relay while one
-phone opens fifty streams or frames waits at once, and again every two seconds with a new admission each time, on 5 and on 8 workers,
+phone opens fifty streams, frames waits or native polls at once, and again every two seconds (with a new admission each time for the
+streams and frames waits; a phone's and a desktop's token for the polls), on 5 and on 8 workers,
 and `/v1/health` is timed: design 9.2's test; it needs no Python and runs with `--slow`) and against a fake clock for every lifetime, the bearers and credentials are checked against the
 design's vectors and against FormLogic's own known answers, the sealed tokens of a pairing were opened with the Rust `crypto_box` crate 0.9.1 (`fixtures/rust-check`, which also shows that its `unseal` alone does not refuse a small-order ephemeral key), and mutation testing broke the rules that carry safety one at a time (220 changes, 207 caught; the other 13 are equivalent: a second guard makes the first redundant, or the platform's own library refuses the same thing).
 

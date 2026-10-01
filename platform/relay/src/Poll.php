@@ -102,9 +102,6 @@ final class Poll
         }
         $q = self::parseQuery($req);
         $lookup = $q['re'] !== null || $q['peek'];
-        $mailbox = 'dev:' . $p->id;
-        $now = Clock::now();
-        $epoch = (string)$this->db->metaStr('epoch');
 
         $wait = $q['wait'];
         if ($lookup) {
@@ -118,6 +115,40 @@ final class Poll
             }
         }
         $wait = min($wait, $this->eff->waitMax);
+
+        // A consumer poll that waits takes its place in the registry before anything is read or written: at most POLL_INFLIGHT_MAX of
+        // one credential run at once, the ones a newer poll is superseding included (each pins a worker until it notices, up to a
+        // step), and the fourth is refused 429 at once. The marker is made first and the others are counted second (Holds::acquire), so
+        // a burst that arrives in the same few milliseconds cannot all pass a check that was made before any of them had a marker.
+        $hold = null;
+        $refused = false;
+        if ($wait > 0 && !$lookup) {
+            if ($this->holds->inFlight('poll', $p->id) >= Holds::POLL_INFLIGHT_MAX) {
+                throw new ApiError(429, 'rate_limited', null, 1); // a read of one small folder: the cheapest refusal there is
+            }
+            $hold = $this->holds->acquire('poll', $p->id, $p->isDesktop() ? 'core' : 'edge', $wait, 0, Holds::POLL_INFLIGHT_MAX);
+            $refused = $hold === null;
+        }
+        try {
+            return $this->answer($p, $q, $lookup, $wait, $hold, $refused);
+        } finally {
+            if ($hold !== null) {
+                $hold->release();
+            }
+        }
+    }
+
+    /**
+     * The rest of a poll, once its hold (if it asked for one and was given it) is held. `$hold` is also where a lookup's hold is put,
+     * so that run() releases whichever it is.
+     *
+     * @param array{since:int,epoch:?string,wait:int,limit:int,maxBytes:int,re:?string,peek:bool} $q
+     */
+    private function answer(Principal $p, array $q, bool $lookup, int $wait, ?Hold &$hold, bool $refused): Response
+    {
+        $mailbox = 'dev:' . $p->id;
+        $now = Clock::now();
+        $epoch = (string)$this->db->metaStr('epoch');
         $asked = $q['wait'] > 0; // the request asked for a hold: a hold object and header answer it
 
         // A restored older database, or a cursor from the future: tell the client, hand it nothing.
@@ -134,16 +165,14 @@ final class Poll
             }
         }
 
-        $hold = null;
         $holdInfo = null;
         $token = bin2hex(random_bytes(8));
         if ($wait > 0) {
             if ($lookup) {
                 $hold = $this->holds->acquire('lookup', $p->id, 'edge', $wait, (int)$this->cfg->limit('lookupHeld'));
-            } else {
-                $hold = $this->holds->acquire('poll', $p->id, $p->isDesktop() ? 'core' : 'edge', $wait, 0);
+                $refused = $hold === null;
             }
-            if ($hold === null) {
+            if ($refused) {
                 $wait = 0;
                 $holdInfo = ['refused' => true, 'retryAfter' => $this->cfg->fallbackS() > 2 ? 2 : $this->cfg->fallbackS()];
             } else {
@@ -153,17 +182,11 @@ final class Poll
         } elseif ($asked) {
             $holdInfo = null; // the relay allows no holds at all right now (wait.max is 0): nothing to grant
         }
-        try {
-            if (!$lookup) {
-                $this->signals->writeGen($p->id, $token); // the newest consumer hold: an older one ends within 250 ms
-                $this->touchPresence($p, $now);
-            }
-            return $this->serve($p, $q, $lookup, $mailbox, $epoch, $wait, $hold, $token, $holdInfo, $now);
-        } finally {
-            if ($hold !== null) {
-                $hold->release();
-            }
+        if (!$lookup) {
+            $this->signals->writeGen($p->id, $token); // the newest consumer hold: an older one ends within 250 ms
+            $this->touchPresence($p, $now);
         }
+        return $this->serve($p, $q, $lookup, $mailbox, $epoch, $wait, $hold, $token, $holdInfo, $now);
     }
 
     /**

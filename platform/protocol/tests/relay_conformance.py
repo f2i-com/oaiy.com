@@ -1816,6 +1816,10 @@ ok("README says consumers de-duplicate on (from, id) and never on the id alone, 
    "consumers de-duplicate on `(from, id)`" in readme and "never on `id` alone" in readme and "`(mailbox, lane, sender, id)` uniqueness for 10 minutes" in readme
    and "`(mailbox, lane, id)` uniqueness" not in readme and "A consumer de-duplicates on (from, id), after authenticating the sender" in readme)
 ok("README makes the challenge life a config value, call.challenge_s", "`call.challenge_s` (10 to 30, default 25)" in readme)
+ok("README bounds the polls that wait of one credential to three in flight, answers the fourth 429 with Retry-After 1, and requires a client to treat that 429 as no failure and to honour Retry-After with jitter (DK-03 and MOB-21a)",
+   "At most three consumer polls that wait" in readme and "A fourth is refused `429 rate_limited`, `Retry-After: 1`, before anything is read or written" in readme
+   and "MUST NOT treat this `429` as a failure, and MUST honour `Retry-After`" in readme and "DK-03" in readme and "MOB-21a" in readme and "Interpretation 58" in readme
+   and "`Holds::POLL_INFLIGHT_MAX` (3)" in readme)
 ok("README records that the relay's limits are tighter than the decoders' and that 'no change to the shipped plugin and phone' is not true, and lists what needs a client change",
    "The relay's limits are tighter than the decoders'" in readme and "need no change\" is not true today" in readme
    and all(x in readme for x in ("`relay_status_error`", "both carriers ignore `Retry-After`", "no OAuth route", "`supportedTransports`", "64 roster entries and an app id of 200 characters")))

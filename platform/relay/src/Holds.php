@@ -36,6 +36,8 @@ final class Holds
     public const ADMIN_REFILL_UNITS_PER_S = 1;
     /** The most streams and frames waits of one party that may be running at once, the ones being superseded included. */
     public const STREAM_INFLIGHT_MAX = 3;
+    /** The most consumer polls that wait, of one credential, that may be running at once, the ones a newer poll is superseding included. */
+    public const POLL_INFLIGHT_MAX = 3;
     /** A party's bucket of stream opens and frames waits: 10 at once, one more a second. */
     public const OPEN_BUCKET = 10;
     public const OPEN_REFILL_PER_S = 1;

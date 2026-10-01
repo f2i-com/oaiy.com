@@ -577,6 +577,82 @@ test('4.7.2 rule 4: a consumer poll and the same device\'s lookups are independe
     eq(['granted' => true], $p['json']['hold'], 'the lookup did not end the poll');
 });
 
+test('4.7.2 rule 5: a credential has at most three polls that wait running at once, the ones being superseded included: the fourth is 429 rate_limited with Retry-After 1 before anything is read or written, and takes no place', function () {
+    $r = Relay::make(['wait' => ['max' => 8], 'capacity' => ['workers' => 20]]);
+    $d = $r->desktop();
+    $phone = $r->phone($d);
+    $holds = $r->ctx()->holds;
+    // In process: the registry's own bound, through the same call the poll makes.
+    $made = [];
+    for ($i = 1; $i <= 3; $i++) {
+        $made[] = $holds->acquire('poll', $phone->id, 'edge', 8, 0, Holds::POLL_INFLIGHT_MAX);
+        eq($i, $holds->inFlight('poll', $phone->id), "$i running");
+    }
+    $e = throws(fn() => $holds->acquire('poll', $phone->id, 'edge', 8, 0, Holds::POLL_INFLIGHT_MAX), Oaiy\Relay\ApiError::class);
+    eq([429, 'rate_limited', 1], [$e->status, $e->errorCode, $e->retryAfter]);
+    eq(3, $holds->inFlight('poll', $phone->id), 'the refused one left no marker');
+    eq(0, $holds->inFlight('poll', $d->id), 'another credential is not counted');
+    // Through the whole request, with three polls running (their markers, as a running poll leaves them): the fourth is refused at once,
+    // and a refusal changes nothing (no presence, no generation that supersedes the others, no marker): the cheapest answer there is.
+    $db = $r->ctx()->db;
+    $signals = $r->ctx()->signals;
+    $before = [$db->val('SELECT last_poll_at FROM devices WHERE id = ?', [$phone->id]), $signals->readGen($phone->id)];
+    $t = microtime(true);
+    $res = $r->call($phone, 'GET', '/v1/poll', null, ['wait' => '4']);
+    ok(microtime(true) - $t < 1.0, 'refused at once, not after a wait');
+    eq(429, $res['status'], $res['body']);
+    eq('rate_limited', $res['json']['error']['code'] ?? null);
+    eq('1', $res['headers']['retry-after']);
+    eq(3, $holds->inFlight('poll', $phone->id), 'and took no place');
+    eq($before, [$db->val('SELECT last_poll_at FROM devices WHERE id = ?', [$phone->id]), $signals->readGen($phone->id)], 'a refusal wrote neither presence nor the generation');
+    // A request that does not wait is never counted, and the bound is on the credential: another device polls as it likes.
+    eq(200, $r->call($phone, 'GET', '/v1/poll')['status'], 'wait=0 holds nothing');
+    eq(200, $r->call($d, 'GET', '/v1/poll', null, ['wait' => '1'])['status'], 'another credential has its own');
+    foreach ($made as $h) {
+        $h->release();
+    }
+    eq(0, holds_count($r));
+    eq(200, $r->call($phone, 'GET', '/v1/poll', null, ['wait' => '1'])['status'], 'and a place that was freed is taken');
+});
+
+test('4.7.2 rule 5: eight polls of one credential that arrive together are not all let through: the marker is made first and the others counted second, so at most three run', function () {
+    $r = Relay::make(['wait' => ['max' => 8], 'capacity' => ['workers' => 20]]);
+    $d = $r->desktop();
+    $phone = $r->phone($d);
+    $servers = $r->fleet(8);
+    usleep(300000);
+    // Every request is sent but for its last two bytes, and the last two bytes are then sent to all eight in one go: a server starts
+    // on a request when it has the whole header, so the eight are in the same step at the same time, all before any of them has a
+    // marker, and a check that was made before the markers were made would let every one of them through.
+    $pend = [];
+    $socks = [];
+    foreach ($servers as $s) {
+        $sock = stream_socket_client('tcp://127.0.0.1:' . $s->port, $errno, $errstr, 5.0);
+        $p = new \OaiyTest\PendingHttp($sock);
+        $p->write("GET /v1/poll?wait=3 HTTP/1.1\r\nHost: 127.0.0.1:{$s->port}\r\nConnection: close\r\nAuthorization: Bearer {$phone->token}\r\n");
+        $pend[] = $p;
+        $socks[] = $p;
+    }
+    usleep(200000);
+    foreach ($socks as $p) {
+        $p->write("\r\n");
+    }
+    $granted = $refused = 0;
+    foreach ($pend as $p) {
+        $res = holds_finish($p, 8.0);
+        if ($res['status'] === 429) {
+            $refused++;
+            eq('1', $res['headers']['retry-after']);
+        } else {
+            eq(200, $res['status'], $res['body']);
+            $granted++;
+        }
+    }
+    ok($granted <= 3, "$granted of 8 simultaneous polls ran: at most three of one credential may");
+    ok($refused >= 5, "$refused of 8 were refused");
+    eq(0, holds_count($r));
+});
+
 test('4.7.2 rule 5: many polls from one device leave exactly one live hold, and the workers that held the superseded ones are free again', function () {
     $r = Relay::make(['wait' => ['max' => 8], 'capacity' => ['workers' => 20]]);
     $d = $r->desktop();
@@ -601,7 +677,7 @@ test('4.7.2 rule 5: many polls from one device leave exactly one live hold, and 
         }
         ok($free !== null, "poll $i found a free worker");
         $slot[$free] = $pend[] = holds_begin($servers[$free], $d, ['wait' => '8']);
-        usleep(60000);
+        usleep(130000); // an honest retry, a little over half a step apart: at most three of one credential run at once (below)
     }
     // Every superseded hold ends within a quarter of a second of the newer poll starting: the pool drains at once.
     $t0 = microtime(true);

@@ -34,7 +34,7 @@ function pool_open(Pool $pool, string $bearer, string $what): array
     if ($sock === false) {
         throw new \RuntimeException("cannot connect to the pool: $errstr");
     }
-    $target = $what === 'stream' ? '/v1/aokie-companion/relay/stream' : '/v1/aokie-companion/relay/frames?since=0&wait=20';
+    $target = ['stream' => '/v1/aokie-companion/relay/stream', 'frames' => '/v1/aokie-companion/relay/frames?since=0&wait=20', 'poll' => '/v1/poll?wait=20'][$what];
     $accept = $what === 'stream' ? "Accept: text/event-stream\r\n" : '';
     $req = "GET $target HTTP/1.1\r\nHost: 127.0.0.1:{$pool->port}\r\nConnection: close\r\nUser-Agent: oaiy-test\r\n{$accept}Authorization: Bearer $bearer\r\n\r\n";
     return [new PendingHttp($sock), $req];
@@ -180,6 +180,58 @@ foreach ([5, 8] as $workers) {
                 // Its bucket holds 10 and gives one back a second (the relay's clock is a fake one here and does not run, so no refill
                 // is seen): a party is let through at most that many, however many admissions it minted.
                 ok($accepted <= Holds::OPEN_BUCKET + 2 * Holds::STREAM_INFLIGHT_MAX, "the party got $accepted of 200 opens through: " . json_encode($res['statuses']));
+                $passed = pool_p90($res['latency']) < 1.0 && $worst < 2.0;
+            }
+            ok($passed, 'health checks took a second at the 90th percentile or two at the most, in all of three tries: ' . implode(' | ', $tries));
+        });
+    }
+}
+
+// The native poll (GET /v1/poll?wait=20) is the hold that every phone and desktop opens, and it was left out of the bound above: fifty of
+// them at once from ONE phone token, six times over, kept a five-worker pool busy for ten seconds (a health check took 6.9 s at the
+// median and 10.3 s at the worst; 2.5 s and 5.1 s on eight workers), because each pins a worker for a step until a newer one supersedes it
+// and a refusal came only after the database had been read. At most three of a credential run at once, and the fourth is refused at once.
+foreach ([5, 8] as $workers) {
+    foreach (['phone', 'desktop'] as $who) {
+        slow_test("9.2 fifty parallel polls of one $who's token on a host of $workers workers leave /v1/health answering in under a second: all but a few are refused at once (429)", function () use ($workers, $who) {
+            $r = Relay::make(['capacity' => ['workers' => $workers]]);
+            $d = $r->desktop();
+            $token = $who === 'phone' ? $r->phone($d)->token : $d->token;
+            $pool = Pool::start($r->fleet($workers));
+            $quiet = pool_burst($pool, static fn(int $i): string => $token, 'poll', 0, 0, 1.0, 1.0);
+            ok($quiet['latency'] !== [] && max($quiet['latency']) < 1.0, 'the host is quiet: ' . json_encode($quiet['latency']));
+            $tries = [];
+            $passed = false;
+            for ($try = 1; $try <= 3 && !$passed; $try++) {
+                $res = pool_burst($pool, static fn(int $i): string => $token, 'poll', 50, 1, 0.0, 3.0);
+                $worst = $res['latency'] === [] ? 99.0 : max($res['latency']);
+                $tries[] = sprintf('%.2f s, %s', $worst, json_encode($res['statuses']));
+                ok(count($res['latency']) >= 20, 'the probes were answered: ' . count($res['latency']));
+                eq(50, array_sum($res['statuses']));
+                $refused = (int)($res['statuses'][429] ?? 0);
+                ok($refused >= 35, 'at least 35 of the 50 were refused at once, not queued and run: ' . json_encode($res['statuses']));
+                $passed = pool_p90($res['latency']) < 1.0 && $worst < 2.0;
+            }
+            ok($passed, "health checks during 50 polls from one $who token took a second at the 90th percentile or two at the most, in all of three tries: " . implode(' | ', $tries));
+        });
+
+        slow_test("9.2 one $who token that sends fifty polls every two seconds, on a host of $workers workers, is let through three at a time and no more, and health answers throughout", function () use ($workers, $who) {
+            $r = Relay::make(['capacity' => ['workers' => $workers]]);
+            $d = $r->desktop();
+            $token = $who === 'phone' ? $r->phone($d)->token : $d->token;
+            $pool = Pool::start($r->fleet($workers));
+            $tries = [];
+            $passed = false;
+            for ($try = 1; $try <= 3 && !$passed; $try++) {
+                $res = pool_burst($pool, static fn(int $i): string => $token, 'poll', 50, 4, 2.0, 8.0);
+                $worst = $res['latency'] === [] ? 99.0 : max($res['latency']);
+                $accepted = (int)($res['statuses']['200'] ?? 0) + (int)($res['statuses']['open'] ?? 0);
+                $tries[] = sprintf('worst %.2f s, p90 %.2f s, %s', $worst, pool_p90($res['latency']), json_encode($res['statuses']));
+                eq(200, array_sum($res['statuses']));
+                // A poll that runs is superseded by the next one within a step and answers 200, so a burst lets a few through as the places
+                // come free (about three in a step, so a slower database lets more of them through in the second or two that a burst takes
+                // to be answered): well under the 200 that were sent, all of which are let through without the bound.
+                ok($accepted <= 100,"the token got $accepted of 200 polls through: " . json_encode($res['statuses']));
                 $passed = pool_p90($res['latency']) < 1.0 && $worst < 2.0;
             }
             ok($passed, 'health checks took a second at the 90th percentile or two at the most, in all of three tries: ' . implode(' | ', $tries));
