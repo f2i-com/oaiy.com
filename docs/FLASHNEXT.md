@@ -58,6 +58,39 @@ For example, `chenrm/qwen3.8-flash-next-abliterated-lora` (rank 2, 2,656 project
 attention and DeltaNet outputs, the shared experts' down projections, and every expert's
 down projection in five layers) loads in the same time and decodes at about 103 tokens/s.
 
+## Two conversations on one model
+
+The engine keeps one conversation's state on the GPUs (the cache, and the checkpoints it
+returns to at message boundaries) and nothing on disk. When two conversations take turns on
+it (a runner and a call's sub-agent that share only a short system prompt), each one's prompt
+is read again at every switch: 36 s for 21,000 tokens, where the conversation alone is cached
+and takes under a second.
+
+So a state the engine is about to lose is copied to host RAM first (about 60 KB a token, so
+1.3 GB for a 21,000-token conversation, with its checkpoints about 1.8 GB), and comes back when a
+later prompt continues it. `--park-gb` bounds the RAM (default 8, never more than half of what is
+free, 0 = off); Studio's `llm.park_gb` passes it.
+
+- It happens only when the engine displaces a state, never after each turn: a prompt that
+  continues a stashed state sets the live one aside and brings that one back; a prompt that
+  shares less than half of a big live state sets that one aside before it is discarded. A
+  conversation that branches (a larger share) is the checkpoints' business, as before.
+- States of 1,024 tokens or fewer are not kept, and one is brought back only when it saves 1,024
+  more tokens than the live one.
+- The oldest goes first when the budget is full.
+- An incognito request neither takes from the stash nor adds to it, and when an incognito
+  request or session ends the stash is emptied with the rest of what the engine holds.
+- A copy that cannot be made or put back (a cache of another shape, a device that refuses the
+  memory) falls back to reading the prompt, as before. Nothing else about a request changes.
+- The log says so: `Qwen park: stashed 21097 tokens (1790 MB) in 0.4s; 1 states, 1790 MB held`,
+  `Qwen restore: 21097 tokens (1790 MB) in 0.5s`, and `Qwen cache: 21097/21134 tokens from ram
+  (common 21097)`, where the time includes the copies. The reply's `cache_source` is `ram`.
+
+The decode graphs need nothing from a restore: every step captures its graph again from the
+buffers at hand and updates the old one to the new addresses, so the caches may be grown or
+replaced between steps, which is also what a restore does (through the same `reserve_layer`).
+The Qwen3.5 hybrid and the other engines are not changed.
+
 ## The architecture
 
 It is the Qwen3.5 MoE lineage: 48 layers, three Gated DeltaNet layers to each full
