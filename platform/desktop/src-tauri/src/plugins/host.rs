@@ -1688,6 +1688,9 @@ impl PluginHost {
         method: &str,
         params: Value,
     ) -> Result<Value, (String, String)> {
+        if crate::isolated::active() {
+            return Err(("isolated_capability_unavailable".into(), crate::isolated_policy::REFUSAL.into()));
+        }
         if method == "companion.admission" {
             return self.handle_companion_admission(plugin_id, params);
         }
@@ -1965,6 +1968,13 @@ impl PluginHost {
     /// Returns the per-binding outcomes for the event ring, and — when the event
     /// should have produced work but did not — the reason to dead-letter it.
     fn dispatch_event(&self, event: &Event) -> Dispatched {
+        if crate::isolated::active() {
+            return Dispatched {
+                outcomes: vec![crate::isolated_policy::REFUSAL.into()],
+                dead: None,
+                reserved: false,
+            };
+        }
         let bindings: Vec<TriggerBinding> = match self.triggers.lock() {
             Ok(t) => t.list().to_vec(),
             Err(_) => Vec::new(),

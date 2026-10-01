@@ -19,6 +19,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 #   oaiy-server    — headless HTTP API (no GUI deps when built --no-default-features)
 [features]
 default = ["gui"]
+custom-protocol = ["tauri/custom-protocol"]
 gui = [
     "dep:tauri",
     "dep:tauri-plugin-shell",
@@ -204,6 +205,8 @@ windows-sys = { version = "0.61", features = [
     # Whether the workstation is locked (ring/presence.rs).
     "Win32_System_StationsAndDesktops",
     "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Registry",
     # How long ago the owner last used the computer (ring/presence.rs).
     "Win32_UI_Input_KeyboardAndMouse",
 ] }
