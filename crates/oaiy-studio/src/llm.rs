@@ -224,6 +224,9 @@ pub fn arguments(llm: &Json, root: &Path, port: u16, key: &str, local_images: bo
         push("--prompt-cache", root.join("cache").join("prompt-states").to_string_lossy().into_owned());
         push("--prompt-cache-gb", num_or(llm, "prompt_cache_gb", 4.0).to_string());
     }
+    // Host RAM where Qwen3.8-Flash-Next sets aside the conversation another displaces (it keeps one
+    // on the GPUs and nothing on disk); 0 = off. Server builds before this option refuse the flag.
+    push("--park-gb", num_or(llm, "park_gb", 8.0).max(0.0).to_string());
     a.push("--watch-stdin".into());
     if bool_or(llm, "thinking", false) {
         a.push("--thinking".into());
@@ -582,6 +585,26 @@ mod tests {
         let args = arguments(&stacked, root, 1, "k", true).unwrap().0;
         let loras: Vec<&str> = args.windows(2).filter(|w| w[0] == "--lora").map(|w| w[1].as_str()).collect();
         assert_eq!(loras, ["q=C:/yes", "q=C:/heresy@0.5", "q=C:/plain"]);
+    }
+
+    #[test]
+    fn conversations_set_aside_in_ram_default_to_eight_gb_and_can_be_turned_off() {
+        let root = Path::new("/install");
+        let park = |llm: &str| {
+            let llm = Json::parse(llm.as_bytes()).unwrap();
+            let args = arguments(&llm, root, 1, "k", true).unwrap().0;
+            args.windows(2).find(|w| w[0] == "--park-gb").map(|w| w[1].clone())
+        };
+        let model = r#""models": [{"name": "a", "path": "a.gguf"}]"#;
+        // The configuration's defaults carry it, and a bare section (no key) gets the same.
+        let defaults = config::default_json();
+        assert_eq!(defaults.get("llm").and_then(|l| l.get("park_gb")).and_then(Json::as_f64), Some(8.0));
+        assert_eq!(park(&format!("{{{model}}}")).as_deref(), Some("8"));
+        assert_eq!(park(&format!(r#"{{"park_gb": 2.5, {model}}}"#)).as_deref(), Some("2.5"));
+        assert_eq!(park(&format!(r#"{{"park_gb": 0, {model}}}"#)).as_deref(), Some("0"));
+        assert_eq!(park(&format!(r#"{{"park_gb": -3, {model}}}"#)).as_deref(), Some("0"), "never negative");
+        // Independent of the disk cache.
+        assert_eq!(park(&format!(r#"{{"prompt_cache": false, {model}}}"#)).as_deref(), Some("8"));
     }
 
     #[test]

@@ -77,6 +77,7 @@ pub const DEFAULT: &str = r#"{
     "top_p": 0.95,
     "prompt_cache": true,
     "prompt_cache_gb": 4,
+    "park_gb": 8,
     "vision": true,
     "idle_stop_minutes": 0,
     "extra_args": []

@@ -905,6 +905,7 @@ dialog::backdrop { background: var(--backdrop); }
           <label class="f"><span>Top-p</span><input type="number" step="0.01" data-bind="llm.top_p" data-type="num"></label>
           <label class="f"><span>Repeat penalty (1 = off; 1.1 stops a reply looping on a phrase)</span><input type="number" step="0.05" min="1" max="2" data-bind="llm.repeat_penalty" data-type="num"></label>
           <label class="f"><span>Prompt cache on disk (GB)</span><input type="number" step="0.5" data-bind="llm.prompt_cache_gb" data-type="num"></label>
+          <label class="f"><span>Flash-Next: conversations set aside in RAM (GB, 0 = off)</span><input type="number" step="0.5" min="0" data-bind="llm.park_gb" data-type="num"></label>
           <label class="f"><span>Runs on</span><select data-bind="llm.backend">
             <option value="auto">Auto: CUDA, else WebGPU, else CPU</option>
             <option value="cuda">CUDA (NVIDIA)</option>

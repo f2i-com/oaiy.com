@@ -466,7 +466,10 @@ sections are:
   Qwen3.8-Flash-Next: see [FLASHNEXT.md](FLASHNEXT.md)),
   `default_model`, `devices`, `ctx`, `ram_gb` (expert cache, 0 = 80% of free),
   `cpu_threads`, `vram_headroom_gb`, `thinking`, `max_tokens`, `temperature`,
-  `top_p`, `prompt_cache`, `prompt_cache_gb`, `vision`, `autostart`,
+  `top_p`, `prompt_cache`, `prompt_cache_gb`, `park_gb` (host RAM, in GB, where
+  Qwen3.8-Flash-Next sets aside the conversation another displaces, so that it does not
+  read its prompt again when it comes back: default 8, 0 = off; passed as `--park-gb`, which
+  server builds before it refuse), `vision`, `autostart`,
   `idle_stop_minutes`, `extra_args`.
 - `media`: `worker`, `output_dir`, `device`, `llm_policy`, `resume_llm`,
   `keep_jobs`, and:
