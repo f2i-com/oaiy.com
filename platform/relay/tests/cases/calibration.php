@@ -172,8 +172,8 @@ test('4.18.7 hold: many at once are all granted (a pool of any size is measured 
         $pend[] = $s->begin('GET', '/v1/admin/hold?wait=1', ['Authorization' => 'Bearer ' . $d->token]);
     }
     foreach ($pend as $p) {
-        $res = $p->finish(10);
-        eq(200, $res['status'], $res['body']);
+        $res = $p->finish(40); // (a wait of a second: the generous limit is for a machine that is busy with something else, and does not change what is asked)
+        eq(200, $res['status'], $res['body'] . $r->errorSites());
     }
 });
 

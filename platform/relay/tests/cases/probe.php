@@ -147,7 +147,9 @@ test('SP-01 probe: a streamed answer starts at once, the chunks arrive a second 
     eq(200, $r['status']);
     contains('text/event-stream', $r['headers']['content-type']);
     eq('no', $r['headers']['x-accel-buffering']);
-    ok($r['ttfb'] < 0.5, 'first byte in ' . $r['ttfb']);
+    // The property is that the first byte does not wait for the stream to end or for the first second to pass: a host that buffers delivers it
+    // after the last chunk (about three seconds), so under a second tells a flushing host from one that does not, busy machine or not.
+    ok($r['ttfb'] < 0.9, 'first byte in ' . $r['ttfb']);
     $at = array_map(static fn($a) => $a[0], $r['arrivals']);
     ok(count($at) >= 4, 'at least four separate arrivals, got ' . count($at));
     $gaps = [];
