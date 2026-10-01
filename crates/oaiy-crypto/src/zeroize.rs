@@ -164,8 +164,23 @@ const SCRUB_DEPTH: usize = 96 * 1024;
 /// It is `#[inline(never)]` so that its frame is a frame of its own; the dead-stack probe in `tests/zeroize_stack.rs` is what shows that it reaches the copies.
 #[inline(never)]
 pub(crate) fn scrub_stack() {
+    #[cfg(test)]
+    SCRUBS.with(|calls| calls.set(calls.get() + 1));
     let mut pad = [0u8; SCRUB_DEPTH];
     core::hint::black_box(&mut pad);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread called [`scrub_stack`] (tests only): what a scrub removes cannot always be seen (the functions that write their key where it lives leave nothing for
+    /// it to remove, and a probe that counts copies cannot tell a scrub that was removed from one that had nothing to do), so the tests of "this function scrubs" read this.
+    static SCRUBS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// How many times this thread has called the scrub (tests only).
+#[cfg(test)]
+pub(crate) fn scrub_calls() -> u64 {
+    SCRUBS.with(core::cell::Cell::get)
 }
 
 /// A secret `String` (a recovery phrase, a kit code) that overwrites itself when dropped, and prints nothing.
@@ -198,3 +213,68 @@ impl PartialEq for SecretString {
 }
 
 impl Eq for SecretString {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::argon;
+    use crate::bip39::{self, Entropy};
+    use crate::ed25519::{KeyRole, SigningKey};
+    use crate::kit::RecoveryKit;
+    use crate::x25519::SecretKey;
+
+    /// How many times `f` calls the scrub, and what it returns.
+    fn scrubs<R>(f: impl FnOnce() -> R) -> (u64, R) {
+        let before = scrub_calls();
+        let result = f();
+        (scrub_calls() - before, result)
+    }
+
+    /// Third review, L-1 and the mutants Y37 to Y40. **A scrub that is not there cannot always be seen by a probe**: a function that writes its key where it lives (`Secret::zeroed` and
+    /// `fill_random`, which is what every generator does) leaves nothing below its own frame for the scrub to remove, and the dead-stack probe measured the same number of copies with
+    /// the four generators' scrubs removed as with them (Windows, in a debug build, an optimised one and one with no optimisation and no assertions). The scrub there is defence in depth
+    /// (a random generator or an expansion that does copy), and what is tested is that it is called: after the key is made, in each function that makes one, and in each function that reads a
+    /// text that holds one. The comparisons are relative (a function scrubs once more than the functions it calls), so that a scrub that is added to a callee does not break them.
+    #[test]
+    fn the_functions_that_make_or_read_a_key_scrub_the_stack_after_it() {
+        // made at random
+        assert!(scrubs(|| drop(Entropy::random().unwrap())).0 >= 1, "Entropy::random");
+        assert!(scrubs(|| drop(RecoveryKit::generate().unwrap())).0 >= 1, "RecoveryKit::generate");
+        assert!(scrubs(|| drop(SecretKey::generate().unwrap())).0 >= 1, "SecretKey::generate");
+        let (from_seed, key) = scrubs(|| SigningKey::from_seed(KeyRole::Hazmat, &Secret::new([7u8; 32])));
+        drop(key);
+        assert!(from_seed >= 1, "from_seed");
+        assert!(
+            scrubs(|| drop(SigningKey::generate(KeyRole::Hazmat).unwrap())).0 > from_seed,
+            "SigningKey::generate scrubs once more than the from_seed it calls"
+        );
+
+        // read and written as text
+        let entropy = Entropy::from_bytes([0x31, 0x38, 0x3f, 0x46, 0x4d, 0x54, 0x5b, 0x62, 0x69, 0x70, 0x77, 0x7e, 0x85, 0x8c, 0x93, 0x9a]);
+        let (encode, phrase) = scrubs(|| bip39::encode(&entropy));
+        assert!(encode >= 1, "bip39::encode");
+        let (decode, decoded) = scrubs(|| bip39::decode(phrase.expose()).unwrap());
+        assert!(decode >= 1, "bip39::decode");
+        assert!(decoded == entropy);
+        assert!(scrubs(|| bip39::decode("not a phrase")).0 >= 1, "bip39::decode of a text that is refused scrubs too");
+        let kit = RecoveryKit::from_bytes(Secret::new([9u8; 32]));
+        let (encode, code) = scrubs(|| kit.encode());
+        assert!(encode >= 1, "RecoveryKit::encode");
+        assert!(scrubs(|| RecoveryKit::decode(code.expose()).unwrap()).0 >= 1, "RecoveryKit::decode");
+        assert!(scrubs(|| RecoveryKit::decode("FLRK1-nonsense")).0 >= 1, "RecoveryKit::decode of a text that is refused scrubs too");
+
+        // Argon2, and the wrap key of a phrase: the output is written in place and scrubbed, and the function that decodes and derives scrubs once more than its parts
+        let salt = [3u8; 16];
+        let mut ikm = Secret::<32>::zeroed();
+        assert!(scrubs(|| argon::argon2id13_into(b"password", &salt, 3, argon::MEM_MIN, &mut ikm).unwrap()).0 >= 1, "argon2id13_into");
+        let mut wrap = Secret::<32>::zeroed();
+        let (parts, ()) = scrubs(|| {
+            let entropy = bip39::decode(phrase.expose()).unwrap();
+            bip39::wrap_key_into(&entropy, &salt, 3, argon::MEM_MIN, &mut wrap).unwrap();
+        });
+        let mut whole_key = Secret::<32>::zeroed();
+        let (whole, ()) = scrubs(|| bip39::phrase_wrap_key_into(phrase.expose(), &salt, 3, argon::MEM_MIN, &mut whole_key).unwrap());
+        assert!(whole > parts, "phrase_wrap_key_into scrubs once more than the decode and the wrap key it is made of ({whole} and {parts})");
+        assert!(whole_key == wrap, "and it writes the same key");
+    }
+}
