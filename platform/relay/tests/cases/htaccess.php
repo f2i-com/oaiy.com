@@ -109,6 +109,14 @@ function ht_public_rules(Httpd $s, string $what): void
         ok(in_array($r['status'], [400, 403, 404], true), "$what: $p is refused as sent, got " . $r['status'] . ': ' . substr($r['body'], 0, 60));
         not_contains('Kernel::main', $r['body'], "$what: $p reached the front controller");
     }
+    // A backslash is a path separator on Windows Apache, where /v1/..\index.php is /v1/../index.php and has no dot segment as it was written (tried
+    // there: it was the front controller, with and without mod_rewrite); no client sends one, and it is refused as sent on every platform.
+    foreach (['/v1/..\\index.php', '/v1/..\\README', '/v1/%5c..%5cindex.php', '/v1/%5C..%5Cindex.php', '/v1/.\\health', '/v1\\..\\README', '/v1/health\\', '/status.html/..\\README', '/v1/x\\y'] as $p) {
+        $r = $s->request('GET', $p);
+        ok(in_array($r['status'], [400, 403, 404], true), "$what: $p is refused as sent, got " . $r['status'] . ': ' . substr($r['body'], 0, 60));
+        not_contains('Kernel::main', $r['body'], "$what: $p reached the front controller");
+        not_contains('not a real', $r['body'], "$what: $p was handed out");
+    }
     // A dot segment in the query is not in the path: the request is the relay's.
     if (!str_contains($what, 'without mod_rewrite')) {
         eq(200, $s->request('GET', '/v1/health?x=/../index.php')['status'], "$what: a query that looks like a path is only a query");
@@ -157,7 +165,20 @@ test('4.18.8 Apache: without mod_rewrite the same files are refused (the rules d
     contains('mod_rewrite', $rows[0]['message'], 'the doctor says what is missing');
 });
 
-test('4.18.8 Apache: nothing in public/.htaccess can refuse a TRACE (Apache answers it in its core, before the access and rewrite rules, wherever TraceEnable is on), so the doctor says whether the host echoes one, and the README names the one line that stops it', function () {
+test('4.18.8 Apache: with AllowEncodedSlashes On (Apache then decodes %5c, a path separator on Windows) a %5c in the path is refused as sent, as a literal backslash is', function () {
+    $site = Tmp::dir('site');
+    ht_package($site . '/oaiy-relay');
+    $s = ht_httpd($site . '/oaiy-relay/public', ['allowOverride' => 'All', 'allowRoot' => $site, 'extra' => "AllowEncodedSlashes On\n"]);
+    foreach (['/v1/%5c..%5cindex.php', '/v1/%5C..%5Cindex.php', '/v1/..%5cindex.php', '/v1/..%5CREADME', '/v1%5c..%5cREADME', '/v1/health%5c', '/v1/x%5cy'] as $p) {
+        $r = $s->request('GET', $p);
+        ok(in_array($r['status'], [400, 403, 404], true), "$p is refused as sent, got " . $r['status'] . ': ' . substr($r['body'], 0, 60));
+        not_contains('Kernel::main', $r['body'], "$p reached the front controller");
+        not_contains('not a real', $r['body'], "$p was handed out");
+    }
+    eq(200, $s->request('GET', '/v1/health')['status'], 'and the relay is still served: ' . $s->errors());
+});
+
+test('4.18.8 Apache: nothing in public/.htaccess can refuse a TRACE (Apache answers it in its core,before the access and rewrite rules, wherever TraceEnable is on), so the doctor says whether the host echoes one, and the README names the one line that stops it', function () {
     $site = Tmp::dir('site');
     ht_package($site . '/oaiy-relay');
     $probe = static function (Httpd $s): array {

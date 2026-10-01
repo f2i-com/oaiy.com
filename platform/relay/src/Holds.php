@@ -132,7 +132,7 @@ final class Holds
             $hold->release();
             throw (new ApiError(429, 'rate_limited', null, 1))->rule('in_flight');
         }
-        $limit =$class === 'core' ? $this->eff->heldHard : $this->eff->heldSoft;
+        $limit = $class === 'core' ? $this->eff->heldHard : $this->eff->heldSoft;
         // A calibration hold is refused only by its per-credential cap: its purpose is to fill the pool and see where it stops.
         if ($kind !== 'admin' && $others >= $limit) {
             $hold->release();

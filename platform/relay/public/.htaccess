@@ -11,7 +11,8 @@
 # and the path Apache resolved it to (REQUEST_URI, with the dot segments taken out: GET /v1/../README is /README) is one of those too,
 # or /index.php, which is where the rewrite below sends /v1/... A request whose own path has a dot segment (/v1/../index.php, /v1/./x,
 # or the same spelled with %2e) is refused as sent, whatever it resolves to: no client sends one, and /v1/../index.php would otherwise
-# resolve to the front controller itself on a server that has no mod_rewrite.
+# resolve to the front controller itself on a server that has no mod_rewrite. So is one whose path has a backslash or %5c: on Windows
+# Apache takes a backslash for a path separator, so /v1/..\index.php is /v1/../index.php and has no dot segment as it was written.
 #
 # This folder is the one that is served. The package root above it carries a deny-all .htaccess (for a document root that is wrong), and
 # Apache reads the .htaccess of every folder on the way to a file wherever AllowOverride covers them, as it does on hosts that set it
@@ -19,7 +20,7 @@
 # a parent folder's .htaccess or of a <Directory> block of the server's configuration that covers this folder (Apache's rule for
 # Require); to limit who may use the relay, say it in a <Location> block, which Apache applies after the .htaccess files.
 <IfModule mod_authz_core.c>
-    Require expr "%{THE_REQUEST} =~ m#^[A-Z]+ (?:https?://[^/ ?]*)?/(v1/|status\.html[ ?]|install\.php[ ?])# && %{THE_REQUEST} !~ m#^[A-Z]+ [^ ?]*/(?:\.|%2[eE]){1,2}(?:/|[ ?])# && (%{REQUEST_URI} =~ m#^/(v1/|status\.html$|install\.php$)# || %{REQUEST_URI} == '/index.php')"
+    Require expr "%{THE_REQUEST} =~ m#^[A-Z]+ (?:https?://[^/ ?]*)?/(v1/|status\.html[ ?]|install\.php[ ?])# && %{THE_REQUEST} !~ m#^[A-Z]+ [^ ?]*/(?:\.|%2[eE]){1,2}(?:/|[ ?])# && %{THE_REQUEST} !~ m#^[A-Z]+ [^ ?]*([\x5c]|%5[cC])# && (%{REQUEST_URI} =~ m#^/(v1/|status\.html$|install\.php$)# || %{REQUEST_URI} == '/index.php')"
 </IfModule>
 <IfModule !mod_authz_core.c>
     Order allow,deny

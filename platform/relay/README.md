@@ -214,7 +214,7 @@ It:
   `web.trace` row warns when the host echoes one;
 - **refuses a path with a dot segment** as it was sent (`/v1/../index.php`, `/v1/./health`, and the `%2e` spellings), whatever it
   resolves to: no client sends one, and `/v1/../index.php` is the front controller itself, served as it is by a server that has no
-  mod_rewrite. An absolute-form request line (`GET http://host/v1/health`) is judged by its path like any other;
+  mod_rewrite. A backslash or `%5c` in the path is refused as sent too: Windows Apache takes it for a separator, so `/v1/..\index.php` has no dot segment as written and was the front controller there (the tests send it raw, and with `AllowEncodedSlashes On`, which makes Apache decode `%5c` too). An absolute-form request line (`GET http://host/v1/health`) is judged by its path like any other. **One difference remains and is Apache's own on Windows:** a path segment of three or more dots (`/v1/items/...`, which is a valid item id: design 4.3 allows `[A-Za-z0-9._-]` and refuses only `.` and `..`) is a `403` from Apache before any `.htaccess` rule, where Linux serves it, so such an id cannot be fetched through Windows Apache;
 - **grants itself** by that same line. Apache reads the `.htaccess` of every folder on the way to a file wherever `AllowOverride`
   covers them, and many hosts set it for all of `/home` or `/var/www`, so the package root's deny-all (below) would otherwise refuse every
   request to the relay, which is what a real Apache 2.4.65 did before this was added. **This replaces any `Require` of a parent folder's
