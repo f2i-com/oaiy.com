@@ -402,7 +402,11 @@ past the configuration, and `info` then advertises what is in force. A calibrati
 may have 16 of them running at once and has a budget of hold time: 600 seconds at once and a fifth of a second back for every second
 (twelve minutes an hour), after which `GET /v1/admin/hold` is `429 rate_limited` with the seconds to wait. (A cap that followed the
 pool, its workers plus two, never tripped on a small one: the requests beyond the workers wait in the web server, where nothing counts
-them, so a credential could pin every worker for as long as it liked.) A measurement of a pool of any size is a small part of the budget.
+them, so a credential could pin every worker for as long as it liked.) **What a measurement costs.** One 35 second hold per worker: a
+pool of 5 is 175 of the 600 seconds, which come back in about fifteen minutes, so a second measurement a quarter of an hour later is
+whole; a pool of 17 workers or more spends all 600 (17 holds are 595 seconds), and the budget is back after about fifty minutes: a second
+measurement before that is `429 rate_limited` with the seconds to wait. That is the price of a bound that a stolen credential cannot
+get round; set `capacity.workers` in `config.json` (the table above) on a host whose pool you know, and nothing needs measuring.
 
 ## Garbage collection without cron
 
