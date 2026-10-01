@@ -102,6 +102,8 @@ pub(crate) struct Reply {
 pub(crate) struct Engine {
     tx: Option<Sender<Job>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Tokens run through the model (prefill and decode), for a test that wants to count them.
+    #[allow(dead_code)]
     pub forwarded: Arc<AtomicUsize>,
 }
 
