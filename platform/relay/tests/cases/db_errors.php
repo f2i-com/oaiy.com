@@ -3,6 +3,7 @@ declare(strict_types=1);
 
 use Oaiy\Relay\Db;
 use Oaiy\Relay\Kernel;
+use OaiyTest\Actor;
 use OaiyTest\AokieRig;
 use OaiyTest\MysqlServer;
 use OaiyTest\Relay;
@@ -105,47 +106,100 @@ test('4.18.5 a database that is busy, locked or gone for a moment is a 503 unava
     eq([], array_values(array_filter($lines, fn($j) => ($j['event'] ?? '') === 'internal')), 'and no internal error was logged');
 });
 
-test('4.18.5 on the compatibility routes a database that is busy or gone is the 500 internal the shipped plugin retries and not the 503 that ends its carrier: the plugin\'s own table of what each status does is held to every request it makes', function () {
+/**
+ * The eight requests that the shipped plugin and the shipped phone make of the compatibility routes (companion_relay.rs of each): the
+ * plugin's four, which are the four rows of the plugin's own table (challenge 324, tail 508, frames post 980, stream open 956 in the
+ * plugin), and the phone's four (its challenge, a frames post, a frames read that waits, a stream open).
+ * name => [who, the plugin's table key (null for the phone), method, route under /v1/aokie-companion/relay/, body, query, headers]
+ */
+function dberr_compat_requests(AokieRig $k, Actor $phone): array
+{
+    $toPhone = '{"to":"mobile:' . $k->thumb($phone) . '","frames":[{"kind":"x"}]}';
+    $toPlugin = '{"to":"plugin","frames":[{"kind":"x"}]}';
+    $sse = ['Accept' => 'text/event-stream'];
+    return [
+        'plugin challenge' => ['plugin', 'challenge', 'GET', 'challenge', null, [], []],
+        'plugin tail' => ['plugin', 'tail', 'GET', 'frames', null, ['since' => '0', 'wait' => '0'], []],
+        'plugin frames post' => ['plugin', 'frames-post', 'POST', 'frames', $toPhone, [], []],
+        'plugin stream open' => ['plugin', 'stream-open', 'GET', 'stream', null, ['since' => '0'], $sse],
+        'phone challenge' => ['phone', null, 'GET', 'challenge', null, [], []],
+        'phone frames post' => ['phone', null, 'POST', 'frames', $toPlugin, [], []],
+        'phone frames wait' => ['phone', null, 'GET', 'frames', null, ['since' => '0', 'wait' => '5'], []],
+        'phone stream open' => ['phone', null, 'GET', 'stream', null, ['since' => '0'], $sse],
+    ];
+}
+
+/** What a compatibility route answers when the database is the trouble: the 500 internal in the Aokie shape, and what the plugin does with it. */
+function dberr_expect_compat_500(Relay $r, string $what, ?string $pluginKey, array $res, string $fault): void
+{
+    eq(500, $res['status'], "$what ($fault): " . $res['body'] . $r->errorSites());
+    eq(['error' => true, 'code' => 'internal', 'message' => 'The relay hit an internal error.'], $res['json'], "$what ($fault): the Aokie shape");
+    ok(!isset($res['headers']['retry-after']), "$what ($fault): no Retry-After, which the plugin ignores");
+    if ($pluginKey === null) {
+        return; // the phone retries any status three times (post_batch, 647-700) and reconnects a stream: no status is the end of it
+    }
+    // And what the plugin does with it: a failure to reconnect, which its frames post retries; not "unavailable for this app".
+    $o = OaiyTest\AokiePlugin::outcome($pluginKey, $res['status']);
+    eq('reconnect', $o['kind'], "$what ($fault): the plugin's kind for 500");
+    if ($pluginKey === 'frames-post') {
+        eq(OaiyTest\AokiePlugin::POST_ATTEMPTS, $o['tries'], 'the plugin makes the frames post three times (250 ms apart) before it gives up on a 500');
+    }
+    // The contrast, so that the table is seen to tell the two apart: a 503 is a re-bootstrap, and a frames post is not retried at all.
+    $bad = OaiyTest\AokiePlugin::outcome($pluginKey, 503);
+    eq('rebootstrap', $bad['kind'], "$what ($fault): the plugin's kind for 503");
+    if ($pluginKey === 'frames-post') {
+        eq(1, $bad['tries'], 'a 503 ends the frames post at the first try, and with it the carrier and every live call');
+    }
+}
+
+/**
+ * A competing writer, so that the relay's own writes wait and give up (Db::write: three attempts) while its reads still work, which is what a
+ * busy database that is not gone looks like. SQLite: another connection holds the write lock of the write-ahead log (a reader is not blocked
+ * in it) and this one waits no time. MySQL and MariaDB: another connection holds a READ lock on the limiter's table, which every compatibility request
+ * counts a hit in first (the admission's bucket): the plain read that comes before the write goes through, and the write inside Db::write waits one second for
+ * the lock and gives up, three times (a WRITE lock would fail the plain read, outside Db::write, and never reach the write). Returns the undo.
+ * @return callable():void
+ */
+function dberr_busy_writer(Relay $r, Oaiy\Relay\Context $ctx): callable
+{
+    $c = $ctx->db->config()->db();
+    if (Relay::isMysql()) {
+        $ctx->db->pdo()->exec('SET SESSION lock_wait_timeout = 1');
+        $ctx->db->pdo()->exec('SET SESSION innodb_lock_wait_timeout = 1');
+        $other = new PDO((string)$c['dsn'], $c['user'], $c['pass'], [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        $other->exec('LOCK TABLES rl READ');
+        return static function () use ($other): void {
+            $other->exec('UNLOCK TABLES');
+        };
+    }
+    $ctx->db->pdo()->exec('PRAGMA busy_timeout = 0');
+    $other = new PDO('sqlite:' . $r->data . '/relay.sqlite');
+    $other->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    $other->exec('BEGIN IMMEDIATE');
+    return static function () use ($other): void {
+        $other->exec('ROLLBACK');
+    };
+}
+
+test('4.18.5 on the compatibility routes a database that is gone or locked for a moment is the 500 internal the shipped plugin retries and not the 503 that ends its carrier, on each of the eight requests the plugin and the phone make: the plugin\'s own table of what each status does is held to every one', function () {
     $k = AokieRig::make();
     $r = $k->r;
     $a = $k->addPhone('A');
     $k->pushRoster();
-    $plug = $k->pluginToken();
-    $frames = '{"to":"mobile:' . $k->thumb($a) . '","frames":[{"kind":"x"}]}';
-    $requests = [
-        // plugin request => how the test makes it (the four requests of companion_relay.rs: challenge 324, tail 508, frames post 980, stream 956)
-        'challenge' => fn(Relay $r) => $r->call($plug, 'GET', '/v1/aokie-companion/relay/challenge'),
-        'tail' => fn(Relay $r) => $r->call($plug, 'GET', '/v1/aokie-companion/relay/frames', null, ['since' => '0', 'wait' => '0']),
-        'frames-post' => fn(Relay $r) => $r->call($plug, 'POST', '/v1/aokie-companion/relay/frames', $frames),
-        'stream-open' => fn(Relay $r) => $r->call($plug, 'GET', '/v1/aokie-companion/relay/stream', null, ['since' => '0'], ['Accept' => 'text/event-stream']),
-    ];
-    foreach ($requests as $what => $fire) {
+    $tokens = ['plugin' => $k->pluginToken(), 'phone' => $k->mobileToken($a)];
+    foreach (dberr_compat_requests($k, $a) as $what => [$who, $key, $method, $route, $body, $query, $headers]) {
         $ctx = $r->ctx();
         $undo = dberr_break($r, $ctx);
         try {
-            $res = $r->onContext($ctx, fn() => $fire($r));
+            $res = $r->onContext($ctx, fn() => $r->call($tokens[$who], $method, '/v1/aokie-companion/relay/' . $route, $body, $query, $headers));
         } finally {
             $undo();
             $ctx = null;
             gc_collect_cycles();
         }
         // Exactly the answer the relay gave to such a failure before the 503 was introduced: 500, the Aokie shape, no Retry-After.
-        eq(500, $res['status'], "$what: " . $res['body'] . $r->errorSites());
-        eq(['error' => true, 'code' => 'internal', 'message' => 'The relay hit an internal error.'], $res['json'], "$what: the Aokie shape");
-        ok(!isset($res['headers']['retry-after']), "$what: no Retry-After, which the plugin ignores");
-        // And what the plugin does with it: a failure to reconnect, which its frames post retries; not "unavailable for this app".
-        $o = OaiyTest\AokiePlugin::outcome($what, $res['status']);
-        eq('reconnect', $o['kind'], "$what: the plugin's kind for 500");
-        if ($what === 'frames-post') {
-            eq(OaiyTest\AokiePlugin::POST_ATTEMPTS, $o['tries'], 'the plugin makes the frames post three times (250 ms apart) before it gives up on a 500');
-        }
-        // The contrast, so that the table is seen to tell the two apart: a 503 is a re-bootstrap, and a frames post is not retried at all.
-        $bad = OaiyTest\AokiePlugin::outcome($what, 503);
-        eq('rebootstrap', $bad['kind'], "$what: the plugin's kind for 503");
-        if ($what === 'frames-post') {
-            eq(1, $bad['tries'], 'a 503 ends the frames post at the first try, and with it the carrier and every live call');
-        }
-        eq(200, $r->call($plug, 'GET', '/v1/aokie-companion/relay/challenge')['status'], "$what: works again");
+        dberr_expect_compat_500($r, $what, $key, $res, 'the connection is gone or the file locked');
+        eq(200, $r->call($tokens['plugin'], 'GET', '/v1/aokie-companion/relay/challenge')['status'], "$what: works again");
     }
     // The table itself: the statuses the plugin treats as a failure to reconnect, and as "unavailable for this app".
     foreach ([401, 400, 429, 500, 502] as $status) {
@@ -157,7 +211,39 @@ test('4.18.5 on the compatibility routes a database that is busy or gone is the 
     eq(['kind' => null, 'tries' => 3, 'result' => 'dropped', 'closesCalls' => false], OaiyTest\AokiePlugin::framesPost(429), 'a 429 on a post is retried and then dropped');
 });
 
-test('4.18.5 a database that cannot be opened at all is answered by the front controller in the shape of the route: the 500 internal of the compatibility routes in the Aokie shape, and on the ordinary routes 503 unavailable with Retry-After 5', function () {
+test('4.18.5 on the compatibility routes a database that is BUSY (a competing writer, so that the relay\'s own writes give up after their three tries while its reads work) is the 500 internal on each of the eight requests, as the connection that is gone is: Db::write\'s 503 does not reach the plugin, whose frames post would not be retried and whose carrier would end', function () {
+    $k = AokieRig::make();
+    $r = $k->r;
+    $a = $k->addPhone('A');
+    $k->pushRoster();
+    $tokens = ['plugin' => $k->pluginToken(), 'phone' => $k->mobileToken($a)];
+    $before = (int)$r->ctx()->db->val('SELECT COUNT(*) FROM items');
+    foreach (dberr_compat_requests($k, $a) as $what => [$who, $key, $method, $route, $body, $query, $headers]) {
+        $ctx = $r->ctx();
+        $undo = dberr_busy_writer($r, $ctx);
+        $t = microtime(true);
+        try {
+            $res = $r->onContext($ctx, fn() => $r->call($tokens[$who], $method, '/v1/aokie-companion/relay/' . $route, $body, $query, $headers));
+        } finally {
+            $undo();
+            $ctx = null;
+            gc_collect_cycles();
+        }
+        dberr_expect_compat_500($r, $what, $key, $res, 'a busy database');
+        ok(microtime(true) - $t < 20.0, "$what: it gave up after its three tries");
+        eq(200, $r->call($tokens['plugin'], 'GET', '/v1/aokie-companion/relay/challenge')['status'], "$what: works again");
+    }
+    eq($before, (int)$r->ctx()->db->val('SELECT COUNT(*) FROM items'), 'no frame was stored by a post that was answered with an error');
+    // What it logged says what happened: the busy database, once for each request (and the ordinary routes say the same thing in a 503: the test above this one).
+    $lines = array_map(fn($l) => json_decode($l, true), file($r->data . '/logs/relay.log', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: []);
+    $unavailable = array_values(array_filter($lines, fn($j) => ($j['event'] ?? '') === 'db_unavailable'));
+    ok(count($unavailable) >= 8, count($unavailable) . ' db_unavailable lines, one per request');
+    $codes = array_values(array_unique(array_column($unavailable, 'code')));
+    eq(['db_busy'], $codes, 'every request gave up in Db::write after its three tries (the 503 that Facade::run used to let reach the plugin)');
+    eq([], array_values(array_filter($lines, fn($j) => ($j['event'] ?? '') === 'internal')), 'and no internal error was logged: it is the database\'s state, not the relay\'s mistake');
+});
+
+test('4.18.5 a database that cannot be opened at all is answered by the front controller in the shape of the route: the 500 internal of the compatibility routes in the Aokie shape on each of the eight requests (a change from the 503 with Retry-After 5 that it was, on purpose: the plugin re-bootstraps on a 503), and on the ordinary routes 503 unavailable with Retry-After 5', function () {
     $r = Relay::make();
     $d = $r->desktop();
     [$srv] = $r->fleet(1);
@@ -176,12 +262,20 @@ test('4.18.5 a database that cannot be opened at all is answered by the front co
     eq(503, $native['status'], $native['body']);
     eq('unavailable', $native['json']['error']['code']);
     eq('5', $native['headers']['retry-after'] ?? null, 'a database that cannot be opened: five seconds');
-    $compat = Relay::http($srv, 'x', 'GET', '/v1/aokie-companion/relay/challenge');
-    eq(500, $compat['status'], $compat['body']);
-    eq(['error' => true, 'code' => 'internal', 'message' => 'The relay hit an internal error.'], $compat['json'], 'the Aokie shape');
-    ok(!isset($compat['headers']['retry-after']));
-    $stream = Relay::http($srv, 'x', 'GET', '/v1/aokie-companion/relay/stream', null, ['Accept' => 'text/event-stream']);
-    eq(500, $stream['status']);
+    // The eight requests, with a bearer that nothing has verified: the relay fails before it knows the route's credential.
+    foreach ([['plugin challenge', 'plugin', 'GET', 'challenge', null, []], ['plugin tail', 'plugin', 'GET', 'frames?since=0&wait=0', null, []],
+        ['plugin frames post', 'plugin', 'POST', 'frames', '{"to":"mobile:x","frames":[{"kind":"x"}]}', []], ['plugin stream open', 'plugin', 'GET', 'stream?since=0', null, ['Accept' => 'text/event-stream']],
+        ['phone challenge', 'phone', 'GET', 'challenge', null, []], ['phone frames post', 'phone', 'POST', 'frames', '{"to":"plugin","frames":[{"kind":"x"}]}', []],
+        ['phone frames wait', 'phone', 'GET', 'frames?since=0&wait=5', null, []], ['phone stream open', 'phone', 'GET', 'stream?since=0', null, ['Accept' => 'text/event-stream']]] as [$what, $who, $method, $route, $body, $headers]) {
+        $res = Relay::http($srv, 'x', $method, '/v1/aokie-companion/relay/' . $route, $body, $headers);
+        eq(500, $res['status'], "$what: " . $res['body']);
+        eq(['error' => true, 'code' => 'internal', 'message' => 'The relay hit an internal error.'], $res['json'], "$what: the Aokie shape");
+        ok(!isset($res['headers']['retry-after']), "$what: no Retry-After");
+    }
+    // What it logged: the database that could not be opened, once for every request, with the reason that tells it from a busy one.
+    $lines = array_map(fn($l) => json_decode($l, true), file($r->data . '/logs/relay.log', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: []);
+    $open = array_values(array_filter($lines, fn($j) => ($j['event'] ?? '') === 'db_unavailable' && ($j['code'] ?? '') === 'db_open' && ($j['where'] ?? '') === 'bootstrap'));
+    ok(count($open) >= 9, count($open) . ' db_unavailable lines with the reason db_open: the native request and the eight compatibility ones');
     $r->countersMayDrift = true; // the database was taken away from under the run
 });
 

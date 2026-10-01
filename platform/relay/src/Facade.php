@@ -64,20 +64,18 @@ final class Facade
     }
 
     /**
-     * Run a handler and answer whatever it throws in the Aokie shape (an unexpected exception is the same 500 as everywhere,
-     * logged, with nothing in the answer).
+     * Run a handler of a compatibility route. It does not catch what the handler throws: an ApiError goes to Kernel::handle, which answers
+     * every error of a path under /v1/aokie-companion/ in the Aokie shape (error() above), counts it, logs it with the place that decided
+     * it (debug.error_sites) and, for an error that is the database's state, gives it the status the shipped plugin retries instead of the
+     * 503 it re-bootstraps on (Kernel::forRoute). This method used to catch the ApiError itself and answer it here, and so never let a
+     * busy database that Db::write had given up on (a 503 ApiError) reach forRoute(): five of the eight requests the plugin and the
+     * phone make still answered 503, which ends the plugin's carrier and closes a live call. Kept so that a handler of these routes is
+     * written the same way whatever it does; the one place that decides is the front controller.
      * @param callable():Response $fn
      */
     public static function run(Context $ctx, callable $fn): Response
     {
-        try {
-            return $fn();
-        } catch (ApiError $e) {
-            if ($e->errorCode !== 'rate_limited') {
-                $ctx->limiter->bump('rej:' . $e->errorCode);
-            }
-            return self::error($e);
-        }
+        return $fn();
     }
 
     /** The uniform refusal of a bearer: one 401 whatever was wrong, counted against the address. */

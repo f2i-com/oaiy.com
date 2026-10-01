@@ -93,8 +93,9 @@ None of this was run: this package has no Cargo build of the Aokie workspace, an
 5. **Errors.** `classify_admission_http_failure(status, is_json, bytes)` (phone) with the admission errors of `errors.json`: 403 and
    422 are `AdmissionFailure::Policy { code, message }`, 401 is `Unauthorized`; and `relay_status_error` for the codes of the
    routes: 401 rotates, **403, 404 and 503 make the plugin re-bootstrap**, 429 on a post is retried and then dropped, and every
-    other status (a `500`) is a failure to reconnect that a frames post retries three times. That is why a database that is busy or
-    gone is **`500 internal` on these routes** (and `503` on the native ones): see Interpretation 59, and `tests/lib/AokiePlugin.php`
+    other status (a `500`) is a failure to reconnect that a frames post retries three times. That is why a database that is busy, gone or
+    cannot be opened is **`500 internal` on these routes**, on all eight requests the plugin and the phone make (and `503` on the native ones):
+    see Interpretation 59, which also says what the plugin's 10 second timeouts do to a long wait, and `tests/lib/AokiePlugin.php`
     in the relay package for the plugin's table with the lines of `companion_relay.rs` it comes from.
 6. **ICE.** `validate_admission_ice_configuration` and `IceServerConfig::validate_all` over every `iceServers` of `admission.json`
    and `ice.json` (with the time shift), and `usable_relay_endpoints` over the `relay` members and the variants the verifier damages.
