@@ -511,6 +511,24 @@ test('4.18.2 installer (both, and a re-key): one guard refuses data/ inside publ
     Tmp::after('gc_collect_cycles');
 });
 
+test('4.18.2 installer: a data folder in which the relay cannot count its own hold markers is refused before any secret is written (a count that cannot see its markers lets every limit on held requests through)', function () {
+    $root = inst_scratch();
+    $data = $root . '/data';
+    mkdir($data . '/holds', 0700, true);
+    file_put_contents($data . '/holds/addr-doctor', 'a file where the self test needs a folder');
+    $e = throws(fn() => Oaiy\Relay\Installer::provision($data, ['public_url' => 'https://relay.example.com']), Oaiy\Relay\InstallRefused::class);
+    eq('holds', $e->kind);
+    contains('hold marker could not be made', $e->getMessage());
+    foreach (['config.json', 'first-key.txt', 'admin-token.txt', 'relay.sqlite', 'installed.lock', 'secrets/relay.key'] as $f) {
+        ok(!file_exists($data . '/' . $f), "$f was not written");
+    }
+    // The same folder with nothing in the way installs.
+    unlink($data . '/holds/addr-doctor');
+    Oaiy\Relay\Installer::provision($data, ['public_url' => 'https://relay.example.com']);
+    ok(is_file($data . '/installed.lock'));
+    ok(!is_dir($data . '/holds/addr-doctor'), 'and the self test left nothing behind');
+});
+
 test('4.18.8 installer CLI: call features are off by default and by --yes, on only with --call-features=yes, and a bad value is a usage error', function () {
     $cases = [[[], false], [['--yes'], false], [['--call-features=no'], false], [['--call-features=yes'], true], [['--call-features=YES'], true]];
     foreach ($cases as [$extra, $want]) {

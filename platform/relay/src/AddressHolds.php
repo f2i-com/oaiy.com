@@ -38,7 +38,7 @@ final class AddressHolds
         $hold = new Hold($file, $capS, $clock); // stamps the marker from the relay's clock, not the filesystem's
         $live = 0;
         $now = (int)$clock();
-        foreach (glob($dir . '/*') ?: [] as $f) {
+        foreach (Fs::entries($dir) as $f) {
             if ($f === $file || !preg_match('/^(\d{1,4})\.[0-9a-f]{12}$/D', basename($f), $m)) {
                 continue;
             }
@@ -68,14 +68,16 @@ final class AddressHolds
     {
         $removed = 0;
         $now = (int)($clock ?? 'time')();
-        foreach (glob(rtrim($dataDir, '/') . '/holds/addr-*/*', GLOB_ONLYDIR) ?: [] as $dir) {
-            foreach (glob($dir . '/*') ?: [] as $f) {
-                $mt = @filemtime($f);
-                if ($mt !== false && preg_match('/^(\d{1,4})\.[0-9a-f]{12}$/D', basename($f), $m) && Hold::isStale($mt, (int)$m[1], $now) && @unlink($f)) {
-                    $removed++;
+        foreach (Fs::entries(rtrim($dataDir, '/') . '/holds', 'addr-', '', true) as $kindDir) {
+            foreach (Fs::entries($kindDir, '', '', true) as $dir) {
+                foreach (Fs::entries($dir) as $f) {
+                    $mt = @filemtime($f);
+                    if ($mt !== false && preg_match('/^(\d{1,4})\.[0-9a-f]{12}$/D', basename($f), $m) && Hold::isStale($mt, (int)$m[1], $now) && @unlink($f)) {
+                        $removed++;
+                    }
                 }
+                @rmdir($dir); // only when empty
             }
-            @rmdir($dir); // only when empty
         }
         return $removed;
     }
@@ -86,7 +88,7 @@ final class AddressHolds
         $dir = rtrim($dataDir, '/') . '/holds/addr-' . $kind . '/' . Signals::hash($addr);
         $live = 0;
         $now = (int)($clock ?? 'time')();
-        foreach (glob($dir . '/*') ?: [] as $f) {
+        foreach (Fs::entries($dir) as $f) {
             if (preg_match('/^(\d{1,4})\.[0-9a-f]{12}$/D', basename($f), $m) && ($mt = @filemtime($f)) !== false && !Hold::isStale($mt, (int)$m[1], $now)) {
                 $live++;
             }

@@ -228,6 +228,12 @@ XML;
         foreach (['secrets', 'holds', 'wake', 'cache', 'backups', 'logs'] as $sub) {
             Paths::ensureDir($dataDir . '/' . $sub);
         }
+        // Before any secret is written: can the relay count its own hold markers in this folder? A path it cannot list would leave every limit on
+        // held requests open (see Doctor::holdAccounting), and nothing afterwards would show it.
+        $counts = Doctor::holdAccounting($dataDir)[0];
+        if ($counts['level'] !== Doctor::OK) {
+            throw new InstallRefused('holds', $counts['message']);
+        }
         $journal = ($opts['journal'] ?? 'auto') === 'auto' ? Fs::journalFor($dataDir) : (string)$opts['journal'];
         $db = $opts['db'] ?? [];
         $cfg = [

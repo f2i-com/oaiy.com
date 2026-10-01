@@ -11,6 +11,43 @@ final class Fs
     /** Filesystems on which SQLite's write-ahead log is unsafe (it needs shared memory that a network filesystem cannot give). */
     private const NETWORK = ['nfs', 'nfs4', 'cifs', 'smb', 'smb2', 'smb3', 'smbfs', 'ceph', 'glusterfs', '9p', 'afs', 'lustre', 'gpfs'];
 
+    /**
+     * The entries of a folder as full paths, sorted, from a plain directory listing and never a glob pattern. glob() reads `[`, `]`, `{`,
+     * `}`, `?` and `*` in the path it is given as pattern syntax, so a data folder that is, or sits under, a folder named `a[b]` matched
+     * nothing and every count that was made with it (the hold registry, the signal files, the address holds) read zero and let everything
+     * through: nothing here may be built from a path with glob(). Hidden names (a leading dot) are left out, as glob's `*` leaves them.
+     *
+     * @param string    $prefix keep only names that start with this (a plain string, not a pattern)
+     * @param string    $suffix keep only names that end with this; a name must be longer than the prefix and the suffix together
+     * @param bool|null $dirs   true: folders only; false: files only; null: both
+     * @return list<string>
+     */
+    public static function entries(string $dir, string $prefix = '', string $suffix = '', ?bool $dirs = null): array
+    {
+        $names = @scandir($dir);
+        if ($names === false) {
+            return [];
+        }
+        $out = [];
+        $base = rtrim($dir, '/\\');
+        foreach ($names as $name) {
+            if ($name === '.' || $name === '..' || ($name[0] === '.' && ($prefix === '' || $prefix[0] !== '.'))) {
+                continue;
+            }
+            if ($prefix !== '' && strncmp($name, $prefix, strlen($prefix)) !== 0) {
+                continue;
+            }
+            if ($suffix !== '' && (strlen($name) < strlen($prefix) + strlen($suffix) || substr($name, -strlen($suffix)) !== $suffix)) {
+                continue;
+            }
+            if ($dirs !== null && is_dir($base . '/' . $name) !== $dirs) {
+                continue;
+            }
+            $out[] = $base . '/' . $name;
+        }
+        return $out;
+    }
+
     /** The filesystem type of the mount holding $dir from /proc/self/mountinfo; null when it cannot be read. */
     public static function type(string $dir, ?string $mountinfo = null): ?string
     {

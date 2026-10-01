@@ -144,7 +144,7 @@ final class Holds
         $pdir = $this->dir . '/' . $kind . '/' . Signals::hash($principal);
         $n = 0;
         $now = (int)($this->clock)();
-        foreach (glob($pdir . '/*') ?: [] as $f) {
+        foreach (Fs::entries($pdir) as $f) {
             if (!preg_match('/^(\d{1,4})\.[0-9a-f]{12}$/D', basename($f), $m)) {
                 continue;
             }
@@ -177,8 +177,8 @@ final class Holds
         $out = [];
         $now = (int)($this->clock)();
         foreach (self::KINDS as $kind) {
-            foreach (glob($this->dir . '/' . $kind . '/*', GLOB_ONLYDIR) ?: [] as $pdir) {
-                foreach (glob($pdir . '/*') ?: [] as $f) {
+            foreach (Fs::entries($this->dir . '/' . $kind, '', '', true) as $pdir) {
+                foreach (Fs::entries($pdir) as $f) {
                     $name = basename($f);
                     if (!preg_match('/^(\d{1,4})\.[0-9a-f]{12}$/D', $name, $m)) {
                         continue;

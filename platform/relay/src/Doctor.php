@@ -540,9 +540,42 @@ final class Doctor
         if ($cfg !== null && $db !== null) {
             $out = array_merge($out, self::databaseChecks($cfg, $db, $data));
         }
+        $out = array_merge($out, self::holdAccounting($data));
         $out = array_merge($out, self::wakeVisibility($data, $opts['php'] ?? PHP_BINARY, $cfg !== null ? $cfg->wakeMode() : 'file'));
         $out = array_merge($out, self::keys($data));
         return array_merge($out, self::webSection($opts, $cfg, $installed));
+    }
+
+    /**
+     * Do the hold counts see the markers this data folder's own holds leave? A hold is a marker file under data/holds/, and every bound that
+     * the relay puts on how many workers one credential or address may pin is a count of those files. A count that cannot see them (a
+     * path the listing code cannot read, a folder that cannot be written) reads zero and lets everything through, which nothing else would
+     * show: so make a marker the way a hold does, count it, and take it away. Fails closed: a count that does not see its own marker is a FAIL.
+     * @return list<array{name:string,level:string,message:string}>
+     */
+    public static function holdAccounting(string $data): array
+    {
+        $addr = 'doctor-self-test-' . bin2hex(random_bytes(4));
+        $made = [];
+        try {
+            for ($i = 0; $i < 2; $i++) {
+                $made[] = AddressHolds::acquire($data, 'doctor', $addr, 5, 4);
+            }
+            $seen = AddressHolds::count($data, 'doctor', $addr);
+            $listed = in_array(rtrim($data, '/') . '/holds/addr-doctor', Fs::entries(rtrim($data, '/') . '/holds', 'addr-', '', true), true);
+        } catch (\Throwable $e) {
+            return [self::row('holds.accounting', self::FAIL, 'a hold marker could not be made in data/holds/ (' . get_class($e) . '): the limits on how many workers one credential may pin cannot work')];
+        } finally {
+            foreach ($made as $h) {
+                $h->release();
+            }
+            @rmdir(rtrim($data, '/') . '/holds/addr-doctor/' . Signals::hash($addr));
+            @rmdir(rtrim($data, '/') . '/holds/addr-doctor');
+        }
+        if ($seen !== 2 || !$listed) {
+            return [self::row('holds.accounting', self::FAIL, 'the hold counts do not see the markers they make in this data folder (counted ' . $seen . ' of 2): every limit on held requests would let everything through. Is the path of the data folder one the relay cannot list?')];
+        }
+        return [self::row('holds.accounting', self::OK, 'the hold counts see the markers they make in data/holds/')];
     }
 
     /**
@@ -561,7 +594,7 @@ final class Doctor
         }
         $files = ['config.json', Installer::FIRST_KEY, Installer::ADMIN_TOKEN_FILE, 'relay.sqlite', 'relay.sqlite-wal', 'relay.sqlite-shm', 'relay.sqlite-journal',
             'logs/relay.log', 'logs/relay.log.1'];
-        foreach (glob($data . '/backups/*') ?: [] as $b) {
+        foreach (Fs::entries($data . '/backups') as $b) {
             if (is_file($b)) {
                 $files[] = 'backups/' . basename($b);
             }
@@ -658,7 +691,7 @@ final class Doctor
         fclose($pipes[2]);
         proc_close($p);
         // The shard file is shared by many mailboxes and is left alone; only a stray temporary would be ours.
-        foreach (glob($shard . '.*.tmp') ?: [] as $t) {
+        foreach (Fs::entries(dirname($shard), basename($shard) . '.', '.tmp') as $t) {
             @unlink($t);
         }
         if (is_string($line) && preg_match('/^seen ([0-9.]+)$/', trim($line), $m) === 1) {

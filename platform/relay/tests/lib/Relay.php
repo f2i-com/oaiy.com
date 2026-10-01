@@ -83,12 +83,16 @@ final class Relay
         }
     }
 
-    /** @param array<string,mixed> $config merged into config.json after provisioning */
-    public static function make(array $config = [], array $provision = []): self
+    /**
+     * @param array<string,mixed> $config merged into config.json after provisioning
+     * @param string $folder a folder (or a path of folders) between the test's own folder and data/: a data path with characters in it that
+     *        a pattern or a shell treats as syntax ("a[b]", "{x,y}", a space) is what a test of such a path asks for
+     */
+    public static function make(array $config = [], array $provision = [], string $folder = ''): self
     {
         $r = new self();
         $r->dir = Tmp::dir('relay');
-        $r->data = $r->dir . '/data';
+        $r->data = $r->dir . ($folder === '' ? '' : '/' . $folder) . '/data';
         Tmp::setClock(self::T0);
         $my = MysqlServer::forEnv();
         if ($my !== null && !isset($provision['db'])) {
