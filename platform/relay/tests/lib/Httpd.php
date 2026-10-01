@@ -51,7 +51,7 @@ final class Httpd
     }
 
     /**
-     * @param array{allowOverride?:string,allowRoot?:string,extra?:string} $opt allowOverride: what .htaccess may change (All, or None,
+     * @param array{allowOverride?:string,allowRoot?:string,extra?:string,without?:list<string>} $opt without: modules to leave out (['rewrite'] for a host that has none); allowOverride: what .htaccess may change (All, or None,
      *        a host that ignores the files); allowRoot: the folder it applies to and below, which may be above the document root
      *        (default: the document root), as it is on a host that sets AllowOverride All for all of /home or /var/www; extra: more
      *        lines for the server configuration (a <Location> or <Directory> block)
@@ -71,7 +71,7 @@ final class Httpd
         for ($attempt = 0; $attempt < 5; $attempt++) {
             $s->port = Server::freePort();
             $conf = $s->dir . '/httpd.conf';
-            file_put_contents($conf, self::config($s->dir, $bin, $mods, $s->port, $docroot, $allowRoot, $opt['allowOverride'] ?? 'All') . ($opt['extra'] ?? ''));
+            file_put_contents($conf, self::config($s->dir, $bin, $mods, $s->port, $docroot, $allowRoot, $opt['allowOverride'] ?? 'All', $opt['without'] ?? []) . ($opt['extra'] ?? ''));
             $log = $s->dir . '/out.log';
             $cmd = [$bin, '-f', $conf, '-d', dirname($bin, 2)];
             $s->proc = proc_open($cmd, [0 => ['pipe', 'r'], 1 => ['file', $log, 'a'], 2 => ['file', $log, 'a']], $pipes, $s->dir);
@@ -100,7 +100,7 @@ final class Httpd
         throw new \RuntimeException('httpd did not start: ' . (is_file($s->dir . '/out.log') ? (string)file_get_contents($s->dir . '/out.log') : '') . (is_file($s->dir . '/error.log') ? (string)file_get_contents($s->dir . '/error.log') : ''));
     }
 
-    private static function config(string $dir, string $bin, string $mods, int $port, string $docroot, string $allowRoot, string $allowOverride): string
+    private static function config(string $dir, string $bin, string $mods, int $port, string $docroot, string $allowRoot, string $allowOverride, array $without = []): string
     {
         $c = "ServerRoot \"" . dirname($bin, 2) . "\"\n";
         $c .= "PidFile \"$dir/httpd.pid\"\n";
@@ -115,8 +115,8 @@ final class Httpd
             }
             $c .= "DefaultRuntimeDir \"$dir\"\nMutex \"file:$dir\" default\n"; // everything the server writes stays in the test's own folder
         }
-        foreach (['authn_core', 'authz_core', 'authz_host', 'access_compat', 'rewrite', 'headers', 'setenvif', 'version', 'dir', 'unixd'] as $m) {
-            if (is_file($mods . '/mod_' . $m . '.so')) {
+        foreach (['authn_core', 'authz_core', 'authz_host', 'access_compat', 'rewrite', 'headers', 'setenvif', 'version', 'dir', 'unixd', 'alias'] as $m) {
+            if (!in_array($m, $without, true) && is_file($mods . '/mod_' . $m . '.so')) {
                 $c .= "LoadModule {$m}_module \"$mods/mod_$m.so\"\n";
             }
         }

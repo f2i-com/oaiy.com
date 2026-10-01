@@ -314,14 +314,27 @@ final class Doctor
 
     /**
      * The dummy bearer went through the real web stack: /v1/health must say the header arrived.
-     * @param array{status:int,body:string,error:?string} $r
+     * @param array{status:int,body:string,error:?string,headers?:array<string,string>} $r
      * @return list<array{name:string,level:string,message:string}>
      */
     public static function authorizationSeen(array $r): array
     {
         $hint = 'Every request would be a uniform 401. Apache: add "CGIPassAuth On" (2.4.13+) or RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}] to public/.htaccess; nginx: fastcgi_param HTTP_AUTHORIZATION $http_authorization;';
         if ($r['status'] !== 200) {
-            return [self::row('web.authorization', self::FAIL, 'GET /v1/health answered ' . ($r['status'] ?: 'nothing') . ($r['error'] ? ' (' . $r['error'] . ')' : '') . '; the relay is not answering at this URL')];
+            // An answer that did not come from the relay (it carries no X-OAIY-Relay header) is the web server's own, and the likely causes
+            // are known: say them, because "the relay is not answering" does not tell an owner where to look.
+            $mine = isset($r['headers']) && (($r['headers']['x-oaiy-relay'] ?? '') !== '');
+            $cause = '';
+            if (!$mine && isset($r['headers'])) {
+                if ($r['status'] === 500) {
+                    $cause = ' The web server itself answered, not the relay. On Apache this is almost always a directive in public/.htaccess that AllowOverride does not allow: it needs AuthConfig, FileInfo, Options and Indexes (or All), and the web server\'s error log names the directive.';
+                } elseif ($r['status'] === 404) {
+                    $cause = ' The web server itself answered, not the relay. On Apache the front controller in public/.htaccess needs mod_rewrite; on nginx check the try_files of the /v1/ location.';
+                } elseif ($r['status'] === 403) {
+                    $cause = ' The web server itself refused it. On Apache the .htaccess of the package folder (which refuses everything) may be applying to public/ because of a Require of the host\'s that public/.htaccess does not replace, or the document root is not public/.';
+                }
+            }
+            return [self::row('web.authorization', self::FAIL, 'GET /v1/health answered ' . ($r['status'] ?: 'nothing') . ($r['error'] ? ' (' . $r['error'] . ')' : '') . '; the relay is not answering at this URL.' . $cause)];
         }
         $j = json_decode($r['body'], true);
         if (!is_array($j) || !array_key_exists('authHeaderSeen', $j)) {

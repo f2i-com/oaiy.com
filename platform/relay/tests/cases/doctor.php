@@ -380,6 +380,28 @@ test('4.9.1 doctor: the dummy bearer must arrive: authHeaderSeen true passes, fa
     eq('fail', doc_level(Doctor::authorizationSeen(['status' => 200, 'body' => '{"authHeaderSeen":"true"}', 'error' => null]), 'web.authorization'));
 });
 
+test('4.18.8 doctor: an answer from the web server itself (no X-OAIY-Relay header) names the likely cause: a 500 is an .htaccess directive AllowOverride does not allow, a 404 is a missing mod_rewrite, a 403 is a Require that is not replaced; the relay\'s own errors do not get that advice', function () {
+    $own = fn(int $status, array $headers) => Doctor::authorizationSeen(['status' => $status, 'body' => '', 'error' => null, 'headers' => $headers]);
+    $m = fn(array $rows) => doc_msg($rows, 'web.authorization');
+    $rows = $own(500, []);
+    eq('fail', doc_level($rows, 'web.authorization'));
+    contains('AllowOverride', $m($rows));
+    contains('AuthConfig, FileInfo, Options and Indexes', $m($rows));
+    contains('The web server itself answered, not the relay', $m($rows));
+    contains('mod_rewrite', $m($own(404, [])));
+    contains('try_files', $m($own(404, [])));
+    contains('Require', $m($own(403, [])));
+    // The relay's own answer to the same request is the relay's: no advice about the web server.
+    foreach ([500, 404, 403] as $st) {
+        $rows = $own($st, ['x-oaiy-relay' => 'oaiy-relay/1']);
+        eq('fail', doc_level($rows, 'web.authorization'));
+        not_contains('AllowOverride', $m($rows));
+        not_contains('mod_rewrite', $m($rows));
+    }
+    // Where the headers were not given (an older caller) the message is the plain one.
+    not_contains('AllowOverride', $m(Doctor::authorizationSeen(['status' => 500, 'body' => '', 'error' => null])));
+});
+
 test('4.18.7 doctor: the web SAPI\'s ini values are compared with the command line\'s and a difference is shown', function () {
     $cli = ['memory_limit' => '128M', 'post_max_size' => '8M', 'max_execution_time' => '0', 'output_buffering' => '0', 'zlib.output_compression' => '0', 'disable_functions' => ''];
     eq('ok', doc_level(Doctor::compareIni($cli, $cli), 'web.ini-difference'));

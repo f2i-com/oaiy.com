@@ -28,6 +28,12 @@ function ht_package(string $root): void
     Oaiy\Relay\Installer::writeGuards($root . '/data');
     file_put_contents($root . '/public/status.html', "<p>status</p>\n");
     file_put_contents($root . '/public/notes.txt', "a file that is not PHP or HTML\n");
+    // What a careless upload or a deploy leaves in public/: a file with no extension, a nested page, a dot folder.
+    file_put_contents($root . '/public/README', "not a real secret: a file without an extension\n");
+    mkdir($root . '/public/sub', 0700, true);
+    file_put_contents($root . '/public/sub/inner.html', "<p>not a real secret: a nested page</p>\n");
+    mkdir($root . '/public/.git', 0700, true);
+    file_put_contents($root . '/public/.git/config', "not a real secret: a dot folder\n");
 }
 
 function ht_copy(string $from, string $to): void
@@ -71,7 +77,7 @@ test('4.18.8 Apache: with public/ as the document root and AllowOverride All on 
     eq(200, $r['status'], 'the file the relay serves is served: ' . $s->errors());
     contains('<p>status</p>', $r['body']);
     eq('nosniff', $r['headers']['x-content-type-options'] ?? null, 'and the public/ .htaccess ran');
-    eq(404, $s->request('GET', '/anything-else')['status'], 'the rewrite rules ran: what is not the relay\'s is not found');
+    eq(403, $s->request('GET', '/anything-else')['status'], 'what is not the relay\'s is refused');
     eq(403, $s->request('GET', '/.env')['status'], 'a dotfile is refused by name, whether or not it exists');
     eq(403, $s->request('GET', '/.x-y')['status'], 'a dotfile that no file-type rule would catch is refused too');
     eq(403, $s->request('GET', '/notes.txt')['status'], 'a file type the relay does not serve is still refused once the folder is granted');
@@ -80,6 +86,74 @@ test('4.18.8 Apache: with public/ as the document root and AllowOverride All on 
     not_contains('not allowed here', $s->errors());
 });
 
+/** What a careless upload leaves in public/ is never handed out, and what the relay needs is let through, whatever the server's modules. */
+function ht_public_rules(Httpd $s, string $what): void
+{
+    foreach (['/README', '/sub/inner.html', '/.git/config', '/.git/', '/notes.txt', '/.htaccess', '/sub/', '/index.php', '/anything-else'] as $p) {
+        $r = $s->request('GET', $p);
+        eq(403, $r['status'], "$what: $p: " . substr($r['body'], 0, 60));
+        not_contains('not a real', $r['body'], "$what: $p was handed out");
+    }
+    eq(200, $s->request('GET', '/status.html')['status'], "$what: status.html is the relay's own");
+    // /v1/ is the front controller: Apache has no PHP here, so what comes back is the file index.php itself, which is how the test sees
+    // that the request got there. An item id may hold a dot or start with one (design 4.3: [A-Za-z0-9._-], never . or ..).
+    if (!str_contains($what, 'without mod_rewrite')) {
+        foreach (['/v1/health', '/v1/items/cmd.1', '/v1/items/.a', '/v1/items/a.b.c', '/v1/pair/AAAAAAAAAAAAAAAAAAAAAA/response'] as $p) {
+            $r = $s->request('GET', $p);
+            eq(200, $r['status'], "$what: $p reaches the front controller: " . substr($r['body'], 0, 60));
+            contains('Kernel::main', $r['body'], "$what: $p");
+        }
+    } else {
+        eq(404, $s->request('GET', '/v1/health')['status'], "$what: with no mod_rewrite there is no front controller (the doctor says so)");
+    }
+}
+
+test('4.18.8 Apache: what a careless upload leaves in public/ (no extension, a nested page, a dot folder) is refused, and the front controller and item ids with dots are let through', function () {
+    $site = Tmp::dir('site');
+    ht_package($site . '/oaiy-relay');
+    $s = ht_httpd($site . '/oaiy-relay/public', ['allowOverride' => 'All', 'allowRoot' => $site]);
+    ht_public_rules($s, 'with mod_rewrite');
+});
+
+test('4.18.8 Apache: without mod_rewrite the same files are refused (the rules do not depend on it); /v1/ is then a 404, which the README and the doctor say', function () {
+    $site = Tmp::dir('site');
+    ht_package($site . '/oaiy-relay');
+    $s = ht_httpd($site . '/oaiy-relay/public', ['allowOverride' => 'All', 'allowRoot' => $site, 'without' => ['rewrite']]);
+    ht_public_rules($s, 'without mod_rewrite');
+    $rows = Oaiy\Relay\Doctor::authorizationSeen(Oaiy\Relay\HttpProbe::get($s->base() . '/v1/health', ['Authorization' => 'Bearer probe']));
+    contains('mod_rewrite', $rows[0]['message'], 'the doctor says what is missing');
+});
+
+test('4.18.8 Apache: AllowOverride without AuthConfig makes every request a 500 (Require is not allowed there), and with AuthConfig, FileInfo, Options and Indexes the relay is served', function () {
+    $site = Tmp::dir('site');
+    ht_package($site . '/oaiy-relay');
+    $s = ht_httpd($site . '/oaiy-relay/public', ['allowOverride' => 'FileInfo Options Indexes', 'allowRoot' => $site]);
+    foreach (['/status.html', '/v1/health'] as $p) {
+        $r = $s->request('GET', $p);
+        eq(500, $r['status'], $p);
+        ok(!isset($r['headers']['x-oaiy-relay']), 'and the answer is Apache\'s, not the relay\'s');
+    }
+    contains('not allowed here', $s->errors());
+    // The doctor, asking the way it does, says what it is.
+    $rows = Oaiy\Relay\Doctor::authorizationSeen(Oaiy\Relay\HttpProbe::get($s->base() . '/v1/health', ['Authorization' => 'Bearer probe']));
+    eq('fail', $rows[0]['level']);
+    contains('AuthConfig, FileInfo, Options and Indexes', $rows[0]['message']);
+    $s = ht_httpd($site . '/oaiy-relay/public', ['allowOverride' => 'AuthConfig FileInfo Options Indexes', 'allowRoot' => $site]);
+    eq(200, $s->request('GET', '/status.html')['status'], $s->errors());
+    eq(200, $s->request('GET', '/v1/health')['status']);
+});
+
+test('4.18.8 Apache: the grant replaces a Require in a parent folder\'s .htaccess (an operator\'s restriction on the path above the relay), as the README says; a <Location> restriction still holds', function () {
+    $site = Tmp::dir('site');
+    ht_package($site . '/oaiy-relay');
+    // The operator limits the whole site to one address in the site folder's own .htaccess: the relay's grant replaces that for public/.
+    file_put_contents($site . '/.htaccess', "Require ip 192.0.2.0/24\n");
+    $s = ht_httpd($site . '/oaiy-relay/public', ['allowOverride' => 'All', 'allowRoot' => $site]);
+    eq(200, $s->request('GET', '/status.html')['status'], 'a parent .htaccess\'s Require is replaced, not combined: ' . $s->errors());
+    $pub = str_replace('\\', '/', $site) . '/oaiy-relay/public';
+    $s = ht_httpd($pub, ['allowOverride' => 'All', 'allowRoot' => $site, 'extra' => "<Location \"/\">\n    Require ip 192.0.2.0/24\n</Location>\n"]);
+    eq(403, $s->request('GET', '/status.html')['status'], 'and the Location block that README names is what holds');
+});
 test('4.18.8 Apache: with public/ as the document root and AllowOverride All only on public/ itself, the relay is served too', function () {
     $site = Tmp::dir('site');
     ht_package($site . '/oaiy-relay');
@@ -95,12 +169,12 @@ test('4.18.8 Apache: a site whose document root is the folder that holds the rel
     not_contains('Invalid command', $s->errors());
 });
 
-test('4.18.8 Apache: a document root that is the relay folder itself refuses data, src, bin and the root files, and answers "not found" under /public/ (its rewrite rules are made for public/ as the root)', function () {
+test('4.18.8 Apache: a document root that is the relay folder itself refuses data, src, bin and the root files, and refuses /public/ too (the relay is at the root of public/, not under it)', function () {
     $root = Tmp::dir('root');
     ht_package($root);
     $s = ht_httpd($root, ['allowOverride' => 'All']);
     ht_refused($s, '', 'the relay folder as the document root');
-    eq(404, $s->request('GET', '/public/status.html')['status'], 'nothing under /public/ is the relay\'s in this layout: ' . $s->errors());
+    eq(403, $s->request('GET', '/public/status.html')['status'], 'nothing under /public/ is the relay\'s in this layout: ' . $s->errors());
 });
 
 test('4.18.8 Apache: the grant in public/.htaccess replaces a <Directory> rule of the server\'s configuration for that folder, and a <Location> rule, which Apache applies after the .htaccess files, still limits it', function () {

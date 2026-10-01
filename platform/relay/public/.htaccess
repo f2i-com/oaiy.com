@@ -1,29 +1,34 @@
 # OAIY Relay. The document root of the site must be THIS folder (public/); data/, src/ and bin/ live above it.
 # Run against Apache 2.4 by tests/cases/htaccess.php (2.2 syntax and LiteSpeed are not): check a host with `php bin/doctor.php --url=...`.
+#
+# What it needs from the server: AllowOverride that covers AuthConfig, FileInfo, Options and Indexes (or All), and mod_rewrite (the front
+# controller below). With less than that Apache answers 500 to every request, which the doctor reports; with no mod_rewrite /v1/ is a 404.
 
-# This folder is the one that is served. The package root above it carries a deny-all .htaccess (for a document root that is
-# wrong), and Apache reads the .htaccess of every folder on the way to a file wherever AllowOverride covers them, as it does on
-# hosts that set it for all of /home or /var/www: without this grant that file refuses every request to the relay.
+# Only /v1/..., /status.html and /install.php are the relay's, and a request for anything else is refused (403), by what was asked for and
+# not by which modules the server has: a README, a nested page, a dot folder (.git/config) or an editor's leftover that a careless upload
+# put here is never handed out, with or without mod_rewrite. THE_REQUEST is the request as the client sent it, so the internal redirect of
+# /v1/... to index.php below is judged as /v1/..., not as /index.php.
+#
+# This folder is the one that is served. The package root above it carries a deny-all .htaccess (for a document root that is wrong), and
+# Apache reads the .htaccess of every folder on the way to a file wherever AllowOverride covers them, as it does on hosts that set it
+# for all of /home or /var/www: without a grant of its own this folder would be refused by that file. The grant REPLACES any Require of
+# a parent folder's .htaccess or of a <Directory> block of the server's configuration that covers this folder (Apache's rule for
+# Require); to limit who may use the relay, say it in a <Location> block, which Apache applies after the .htaccess files.
 <IfModule mod_authz_core.c>
-    Require all granted
+    Require expr "%{THE_REQUEST} =~ m#^[A-Z]+ /(v1/|status\.html[ ?]|install\.php[ ?])#"
 </IfModule>
 <IfModule !mod_authz_core.c>
     Order allow,deny
     Allow from all
+    # Apache 2.2 has no expressions: by file name instead (not run in the tests).
+    <FilesMatch "^\.|\.(?!php$|html$)[A-Za-z0-9]+$">
+        Order deny,allow
+        Deny from all
+    </FilesMatch>
 </IfModule>
 
 Options -Indexes
 DirectoryIndex index.php
-
-# Never serve dotfiles.
-<FilesMatch "^\.">
-    Require all denied
-</FilesMatch>
-
-# Only index.php, install.php and status.html are PHP or HTML that belongs here.
-<FilesMatch "\.(?!php$|html$)[A-Za-z0-9]+$">
-    Require all denied
-</FilesMatch>
 
 # The Authorization header carries every device token. FastCGI-family handlers drop it unless it is passed on.
 <IfModule mod_version.c>
@@ -39,13 +44,14 @@ DirectoryIndex index.php
     RewriteEngine On
     RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
 
-    # Dotfiles and anything outside /v1/, /status.html and /install.php are not found.
-    RewriteRule (^|/)\. - [R=404,L]
-    RewriteCond %{REQUEST_URI} !^/(v1/|status\.html$|install\.php$)
+    # Anything outside /v1/, /status.html and /install.php is not found (on 2.2; on 2.4 it was refused above). An item id may start with a
+    # dot or hold one (GET /v1/items/.a, /v1/items/cmd.1): nothing under /v1/ is refused here.
+    RewriteCond %{THE_REQUEST} !^[A-Z]+\ /(v1/|status\.html[\ ?]|install\.php[\ ?])
     RewriteRule ^ - [R=404,L]
 
-    # Everything under /v1/ is the front controller.
-    RewriteCond %{REQUEST_URI} ^/v1/
+    # Everything under /v1/ is the front controller. (The conditions read THE_REQUEST, the request as it was sent, and not REQUEST_URI: after
+    # this rule's internal redirect to index.php the URI is /index.php, which the condition above would send to a 404.)
+    RewriteCond %{THE_REQUEST} ^[A-Z]+\ /v1/
     RewriteRule ^ index.php [L]
 </IfModule>
 

@@ -63,6 +63,12 @@ installer and the doctor ask the web for a canary in `data/` and refuse or fail 
 6. Run `php bin/doctor.php --url=https://relay.example.com --admin-token-file=data/admin-token.txt` if you have a shell, and fix
    anything red. OAIY's "Test this relay" then measures the worker pool, streaming and body limits on this host.
 
+**On Apache or LiteSpeed (cPanel is both), three things about `public/.htaccess`** (the section below has the detail): the host's
+`AllowOverride` must cover **AuthConfig, FileInfo, Options and Indexes** (or `All`), or every request is a 500; **`mod_rewrite`** must be
+on, or `/v1/` is a 404; and the file **replaces any `Require` of a folder above `public/`**, so a password or an address limit that you put
+on a parent folder does not protect the relay (put it in a `<Location>` block of the server's configuration instead). The doctor says
+the first two when it sees them.
+
 A lost first key is re-armed, never re-issued over the network: create `INSTALL_ENABLED` again and run `php bin/install.php
 --rekey` (or open `install.php?mode=rekey` and use the token). It writes a new `data/first-key.txt` and changes nothing else.
 
@@ -177,16 +183,33 @@ could choose its own address. nginx drops them by default (`underscores_in_heade
 ## Apache and LiteSpeed: `public/.htaccess`
 
 Run against a real Apache 2.4 (`tests/cases/htaccess.php`, which starts the httpd it finds on a loopback port and skips where there is
-none; 2.2 syntax and LiteSpeed were not run): read it as a starting point and let the doctor judge it on your host. It:
+none; 2.2 syntax and LiteSpeed were not run): read it as a starting point and let the doctor judge it on your host.
 
-- **grants itself** (`Require all granted`): Apache reads the `.htaccess` of every folder on the way to a file wherever
-  `AllowOverride` covers them, and many hosts set it for all of `/home` or `/var/www`, so the package root's deny-all (below) would
-  otherwise refuse every request to the relay, which is what a real Apache 2.4.65 did before this line was added;
-- turns directory listings off, denies dotfiles and every file type except `.php` and `.html`;
+**What it needs from the server.** `AllowOverride` that covers **AuthConfig, FileInfo, Options and Indexes** (or `All`), and
+**`mod_rewrite`**. With less `AllowOverride` (say `FileInfo Options Indexes`) Apache does not allow the `Require` in the file and
+answers **500 to every request**; the doctor's `web.authorization` row says so (a 500 that carries no `X-OAIY-Relay` header is the web
+server's own). Without `mod_rewrite` the front controller is missing and `/v1/` is a 404, which the doctor says too; what is in
+`public/` is refused all the same (the rules below do not depend on it). **Before this was run against Apache the front controller did
+not work at all** (the file's own rewrite sent the internal redirect to `index.php` to a 404), and an item id that starts with a dot
+(`/v1/items/.a`, which design 4.3 allows) or holds one was refused (`/v1/items/cmd.1`): both are fixed and have tests.
+
+It:
+
+- **allows only what is the relay's**: `Require expr` on the request line as the client sent it: `/v1/...`, `/status.html` and
+  `/install.php` are let through and **everything else is a 403**, whatever the server's modules: a `README`, a nested page, a dot
+  folder (`/.git/config`), `index.php` asked for directly, or an editor's leftover that a careless upload put in `public/`;
+- **grants itself** by that same line. Apache reads the `.htaccess` of every folder on the way to a file wherever `AllowOverride`
+  covers them, and many hosts set it for all of `/home` or `/var/www`, so the package root's deny-all (below) would otherwise refuse every
+  request to the relay, which is what a real Apache 2.4.65 did before this was added. **This replaces any `Require` of a parent folder's
+  `.htaccess` or of a `<Directory>` block of the server's configuration that covers `public/`** (Apache's rule: a folder's `Require`
+  replaces its parents'), so a site that is password protected or limited to some addresses at a folder above the relay is **not**
+  protected for the relay: **say it in a `<Location>` block of the server's configuration, which Apache applies after the `.htaccess` files
+  and which holds** (`<Location "/"> Require ip 192.0.2.0/24 </Location>`; `tests/cases/htaccess.php` runs both);
+- turns directory listings off;
 - passes the `Authorization` header to PHP (`CGIPassAuth On` on Apache 2.4.13 or later, and the `SetEnvIf` / `RewriteRule`
   forms for older stacks). Without it every request is a uniform `401`, which looks like a revoked device;
-- returns 404 for anything outside `/v1/`, `/status.html` and `/install.php`, and sends `/v1/*` to `index.php`.
-
+- sends `/v1/*` to `index.php` (the conditions read `THE_REQUEST`, the request as sent, because after the redirect the URI is
+  `/index.php`), and answers 404 for anything else where the server is Apache 2.2.
 The folder above it carries its own `.htaccess` (and `data/` gets one from the installer) that refuses everything, in Apache 2.4
 syntax (`Require all denied`) and 2.2 syntax (`Order deny,allow` and `Deny from all`), each inside an `IfModule` for the module
 that understands it. It matters only when the document root is wrong, and then only if the server lets `.htaccess` files apply
@@ -444,8 +467,10 @@ design's vectors and against FormLogic's own known answers, the sealed tokens of
   it, and how they report a client that hung up, was not tried: the calibration's probe is what decides, on your host.
 
 - `public/.htaccess` and the deny-all files were run through a real Apache 2.4.65 (WAMP's, on Windows) and 2.4.58 (Ubuntu 24.04 under
-  WSL 2), static files: which files are refused and served under each layout, `tests/cases/htaccess.php`; **not** with PHP behind it (the rewrite to `index.php` and
-  the `Authorization` pass-through), not on Apache 2.2 and not on LiteSpeed. The nginx snippet above was **not** run through nginx or
+  WSL 2), without PHP: which files are refused and served under each layout, that `/v1/...` (item ids with dots and a leading dot
+  included) reaches `index.php` (Apache then hands out the file, which is how the test sees it), what `AllowOverride` and a missing
+  `mod_rewrite` do, and what a parent's `Require` and a `<Location>` do (`tests/cases/htaccess.php`); **not** with PHP behind it (that
+  the front controller then runs, and the `Authorization` pass-through), not on Apache 2.2 and not on LiteSpeed. The nginx snippet above was **not** run through nginx or
   PHP-FPM. Those are written from the design and from general knowledge of those servers; the doctor's exposure and Authorization
   probes are the check to use on your host.
 - No real shared host, cPanel account, VPS, CDN or proxy was tried.
