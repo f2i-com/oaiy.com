@@ -46,6 +46,8 @@ mod lora;
 mod qwen_cache;
 // Conversations Qwen3.8-Flash-Next sets aside in host RAM.
 mod qwen_park;
+#[cfg(test)]
+mod qwen_real;
 #[cfg(feature = "cuda")]
 mod qwen_vision;
 pub mod images;

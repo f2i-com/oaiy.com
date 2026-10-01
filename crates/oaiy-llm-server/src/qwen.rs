@@ -254,6 +254,8 @@ pub enum Hybrid {
     Qwen35(Model),
     #[cfg(feature = "cuda")]
     Flash(Box<crate::flashnext::FlashNext>),
+    #[cfg(test)]
+    Fake(Box<crate::qwen_real::FakeModel>),
 }
 
 impl From<Model> for Hybrid {
@@ -271,6 +273,8 @@ impl Hybrid {
             Self::Qwen35(_) => Err("not a dense Qwen hybrid".into()),
             #[cfg(feature = "cuda")]
             Self::Flash(f) => Ok(&f.tokenizer),
+            #[cfg(test)]
+            Self::Fake(f) => Ok(&f.tok),
         }
     }
     fn width(&self) -> usize {
@@ -278,6 +282,8 @@ impl Hybrid {
             Self::Qwen35(m) => m.config().embedding_dim,
             #[cfg(feature = "cuda")]
             Self::Flash(f) => f.config.hidden,
+            #[cfg(test)]
+            Self::Fake(f) => f.width,
         }
     }
     /// Whether the engine may set conversations aside in RAM: Flash-Next, which keeps one
@@ -288,6 +294,8 @@ impl Hybrid {
             Self::Qwen35(_) => false,
             #[cfg(feature = "cuda")]
             Self::Flash(_) => true,
+            #[cfg(test)]
+            Self::Fake(_) => true,
         }
     }
     fn new_kv_cache(&self, max_seq: usize) -> KvCache {
@@ -295,6 +303,8 @@ impl Hybrid {
             Self::Qwen35(m) => m.new_kv_cache(max_seq),
             #[cfg(feature = "cuda")]
             Self::Flash(f) => f.new_kv_cache(max_seq),
+            #[cfg(test)]
+            Self::Fake(_) => crate::qwen_real::new_kv(max_seq),
         }
     }
     /// Token embeddings on the host.
@@ -304,6 +314,8 @@ impl Hybrid {
             Self::Qwen35(_) => Err("not a dense Qwen hybrid".into()),
             #[cfg(feature = "cuda")]
             Self::Flash(f) => f.embed_text(tokens).map_err(|e| e.to_string()),
+            #[cfg(test)]
+            Self::Fake(f) => Ok(Tensor::zeros(vec![tokens.len(), f.width])),
         }
     }
     /// Run `tokens` (embedded as `embeds`, on the host) after what `kv` holds: the last logits, on the host.
@@ -316,6 +328,8 @@ impl Hybrid {
             Self::Qwen35(_) => Err("not a dense Qwen hybrid".into()),
             #[cfg(feature = "cuda")]
             Self::Flash(f) => f.forward(tokens, &embeds, kv, positions).map_err(|e| e.to_string()),
+            #[cfg(test)]
+            Self::Fake(f) => f.forward(tokens, kv),
         }
     }
 }
