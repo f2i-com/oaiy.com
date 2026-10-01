@@ -189,6 +189,9 @@ final class Db
     /**
      * Append to a SELECT that must read the row as it is now and keep it from being changed until this transaction ends, without
      * keeping other readers of it out (MySQL and MariaDB: a shared lock, LOCK IN SHARE MODE, which both accept; SQLite locks the file).
+     * MySQL 8.0 and later call that form deprecated in favour of FOR SHARE (8.4.7 still runs it, and warns nothing a client sees);
+     * MariaDB (11.4 here) does not accept FOR SHARE, so the one spelling both take is the one used. If a later MySQL drops it, this is the
+     * one place to give MySQL its own.
      */
     public function forShare(): string
     {

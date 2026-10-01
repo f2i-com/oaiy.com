@@ -494,6 +494,9 @@ design's vectors and against FormLogic's own known answers, the sealed tokens of
   PHP lacks, so they have not been run on Linux. The `/proc/self/mountinfo` reader is tested with synthetic text, not on an NFS mount.
 - The doctor's MySQL checks (`max_allowed_packet`, `max_user_connections`) and a MySQL install by the installer were not
   exercised against a MySQL server. The relay itself, with its test suite, was (next item).
+- The shared row locks of the revocation and roster races are spelled `LOCK IN SHARE MODE` (`Db::forShare`): MySQL 8.0 and later call
+  that deprecated in favour of `FOR SHARE` (8.4.7 takes both), and MariaDB 11.4.9 refuses `FOR SHARE` (a syntax error: tried), so the one
+  spelling both accept is used. A MySQL that drops the old one needs its own in that one function.
 - MySQL and MariaDB were tested on a **local throwaway server only** (MySQL 8.4.7 and MariaDB 11.4.9 on Windows, over loopback,
   one server process, root without a password). Not tried: MySQL 5.7, MariaDB 10.x, a shared host's MySQL with its own
   `max_user_connections`, `sql_mode` or collation defaults, a remote server, or TLS to the database.
