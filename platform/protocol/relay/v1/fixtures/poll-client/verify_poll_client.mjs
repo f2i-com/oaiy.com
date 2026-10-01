@@ -61,7 +61,10 @@ function decide(c) {
     const hold = isObj(body.hold) ? body.hold : {};
     if (body.items.length > 0 || body.reset === true) return result('progress', 0, cleared);
     if (hold.superseded === true) {
-      if (c.weReplaced === false) out.report = ['duplicate_credential'];
+      if (c.weReplaced === false) {
+        out.report = ['duplicate_credential'];
+        return result('superseded', c.info.pollGapMs / 1000, cleared); // another process polls: pause as after idle
+      }
       return result('superseded', 0, cleared);
     }
     if (hold.refused === true) {

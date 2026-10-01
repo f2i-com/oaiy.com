@@ -1799,9 +1799,9 @@ ok("README says what DK-03 and MOB-21a are, since nothing else in the repository
    "DK-03 is the work package that builds the desktop's relay client" in pc_readme and "MOB-21a the one that builds the phone's" in pc_readme)
 ok("every rule P1 to P8 has cases in the table, and at least ninety cases in all",
    {c["rule"] for c in pc_doc["cases"]} >= {f"P{i}" for i in range(1, 9)} and len(pc_doc["cases"]) >= 90)
-ok("README states the numbers the table pins: clamp 1 to 120, jitter up to 20 percent, 429 backoff 1, 2, 4, 8, 16, 30, failure backoff capped at 60, unreachable after three failures, a defect after five in_flight 429s, a replacement 250 ms after the poll it cancels",
+ok("README states the numbers the table pins: clamp 1 to 120, jitter up to 20 percent, 429 backoff 1, 2, 4, 8, 16, 30, failure backoff capped at 60, unreachable after three failures, a defect when the fifth 429 in a row says in_flight, a replacement 250 ms after the poll it cancels",
    all(s in pc_readme for s in ("`clamp(x)` is `x` limited to 1 to 120", "`pause = base * (1 + 0.2 * u)`", "`base = max(clamp(D), min(30, 2^(n-1)))`: 1, 2, 4, 8, 16, 30, 30...",
-                                "`base = min(60, 2^(n-1))`: 1, 2, 4, 8, 16, 32, 60, 60...", "after three failures in a row", "after five `429`s in a row with `rule: \"in_flight\"`",
+                                "`base = min(60, 2^(n-1))`: 1, 2, 4, 8, 16, 32, 60, 60...", "after three failures in a row", "when the fifth `429` in a row says `rule: \"in_flight\"`",
                                 "no sooner than 250 ms after it started the one it cancels")))
 ok("README says how the two refusals of a poll are told apart (error.rule: gap, in_flight), that a 429 is neither a success nor a failure, how Retry-After is read (digits, HTTP-date, the body, none) and what the shipped carriers do, with their lines",
    all(s in pc_readme for s in ("`\"rule\":\"gap\"`", "`\"rule\":\"in_flight\"`", "A **429 is never a failure**", "an HTTP-date (the IMF-fixdate of RFC 9110", "`error.retryAfter` when that is an integer from 0 to 86400",
@@ -1850,6 +1850,8 @@ pc_damaged = [
     ("a fifth in_flight 429 that is not reported", pc_damage("p5-429-5-in-flight", ("expect", "report"), [])),
     ("a refused hold that does not double", pc_damage("p3-refused-second", ("expect", "baseS"), 2)),
     ("a replacement poll that may start at once", pc_damage("p1-replace-at-once", ("expect", "waitMs"), 0)),
+    ("a poll replaced by another process that does not pause as after idle", pc_damage("p2-superseded-not-ours", ("expect", "baseS"), 0)),
+    ("a superseded poll that this client replaced and that waits", pc_damage("p2-superseded-ours", ("expect", "baseS"), 0.25)),
     ("a jitter that is not added", pc_damage("p6-clamp-jitter", ("expect", "pauseS"), 120)),
 ]
 with tempfile.TemporaryDirectory() as tmpd:

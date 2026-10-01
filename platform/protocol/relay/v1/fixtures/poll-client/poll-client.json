@@ -354,7 +354,7 @@
   {
    "id": "p2-superseded-not-ours",
    "rule": "P2",
-   "what": "a poll this client did not replace was replaced by another process of the same credential: reported",
+   "what": "a poll this client did not replace was replaced by another process of the same credential: reported, and the pause is the idle one (P3), so that the two do not take turns at once",
    "state": {
     "n429": 0,
     "nFail": 0,
@@ -383,8 +383,8 @@
    },
    "expect": {
     "outcome": "superseded",
-    "baseS": 0,
-    "pauseS": 0,
+    "baseS": 0.25,
+    "pauseS": 0.25,
     "state": {
      "n429": 0,
      "nFail": 0,
@@ -1205,7 +1205,7 @@
   {
    "id": "p5-429-5-in-flight",
    "rule": "P7",
-   "what": "the fifth 429 in a row with rule in_flight is a defect to report",
+   "what": "the fifth 429 in a row, when it says in_flight, is a defect to report",
    "state": {
     "n429": 4,
     "nFail": 0,

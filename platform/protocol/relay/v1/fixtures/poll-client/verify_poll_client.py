@@ -80,6 +80,7 @@ def decide(c: dict) -> dict:
         if hold.get("superseded") is True:
             if c.get("weReplaced", True) is False:
                 out["report"] = ["duplicate_credential"]
+                return result("superseded", info["pollGapMs"] / 1000, {"n429": 0, "nFail": 0, "nRefused": 0})  # another process polls: pause as after idle
             return result("superseded", 0, {"n429": 0, "nFail": 0, "nRefused": 0})
         if hold.get("refused") is True:
             r = hold.get("retryAfter")
