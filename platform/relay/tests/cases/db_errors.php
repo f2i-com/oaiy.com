@@ -188,7 +188,7 @@ test('4.18.5 a database that cannot be opened at all is answered by the front co
 test('4.18.5 an error that is the relay\'s own (a table that is gone) stays 500 internal, logged with where it happened, and is not mistaken for a busy database', function () {
     $r = Relay::make();
     $d = $r->desktop();
-    $bad = substr($d->token, 0, -1) . (substr($d->token, -1) === 'A' ? 'B' : 'A'); // a request that has to count a failure: it writes to the limiter's table
+    $bad = substr($d->token, 0, -1) . (substr($d->token, -1) === 'A' ? 'E' : 'A'); // a request that has to count a failure: it writes to the limiter's table
     $r->ctx()->db->exec('DROP TABLE rl');
     $res = $r->call($bad, 'GET', '/v1/poll');
     eq(500, $res['status'], $res['body']);
@@ -201,7 +201,7 @@ test('4.18.5 an error that is the relay\'s own (a table that is gone) stays 500 
 test('4.18.3 debug.error_sites is off unless asked for: nothing is logged for a 401 or a 404; on, each 401, 404 and 5xx is one line with its route, status, code, the place in the code that decided it, and both clocks, and no credential', function () {
     $r = Relay::make(['debug' => ['error_sites' => false]]);
     $d = $r->desktop();
-    $bad = substr($d->token, 0, -1) . (substr($d->token, -1) === 'A' ? 'B' : 'A'); // a well formed token whose secret is wrong
+    $bad = substr($d->token, 0, -1) . (substr($d->token, -1) === 'A' ? 'E' : 'A'); // a well formed token whose secret is wrong
     $log = $r->data . '/logs/relay.log';
     $lines = fn() => array_values(array_filter(array_map(fn($l) => json_decode($l, true), @file($log, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: []), fn($j) => ($j['event'] ?? '') === 'error_site'));
     eq(401, $r->call($bad, 'GET', '/v1/poll')['status']);
@@ -243,7 +243,14 @@ test('4.18.3 debug.error_sites gives each cause that shares a refusal its own re
         $rows = array_values(array_filter(array_map(fn($l) => json_decode($l, true), @file($log, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: []), fn($j) => ($j['event'] ?? '') === 'error_site'));
         return $rows === [] ? [] : $rows[count($rows) - 1];
     };
-    $secretFlipped = substr($d->token, 0, -1) . (substr($d->token, -1) === 'A' ? 'B' : 'A');
+    // A secret of 32 bytes is 43 characters and the last holds only four bits: its low two bits must be 0 (B, and 15 of every 16 other
+    // characters, make a token that is malformed, not one with a wrong secret: the version of this line that flipped A to B failed one run in
+    // sixteen, whenever the real secret happened to end in A). A and E both end a secret well, so the flip is always well formed.
+    $flip = static fn(string $token): string => substr($token, 0, -1) . (substr($token, -1) === 'A' ? 'E' : 'A');
+    foreach (str_split('AEIMQUYcgkosw048') as $c) {
+        ok(Oaiy\Relay\Auth::parseToken($flip(substr($d->token, 0, -1) . $c)) !== null, "a flipped secret that ended in $c is still a well formed token");
+    }
+    $secretFlipped = $flip($d->token);
     $unknownId = 'oaiyrt1.' . str_repeat('A', 11) . '.' . substr($d->token, strrpos($d->token, '.') + 1);
     $addr = ['REMOTE_ADDR' => '203.0.113.50'];
     $cases = [
