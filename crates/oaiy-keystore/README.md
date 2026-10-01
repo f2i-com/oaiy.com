@@ -27,11 +27,18 @@ match store.get(&Name::new("archive.writer")?)? {
 pub trait KeyStore: Send + Sync {
     fn provider(&self) -> ProviderInfo;                                          // id, strength, one line for a status page
     fn get(&self, name: &Name) -> Result<Option<Zeroizing<Vec<u8>>>, KeyError>;  // Ok(None) = never stored; Err = could not read. NOT the same.
-    fn put(&self, name: &Name, value: &[u8]) -> Result<(), KeyError>;            // atomic; reads back and compares, else Err
-    fn delete(&self, name: &Name) -> Result<(), KeyError>;                       // only after the caller verified its replacement
+    fn put(&self, name: &Name, value: &[u8]) -> Result<Durability, KeyError>;    // atomic; reads back and compares. Err = nothing changed; Ok = stored
+    fn delete(&self, name: &Name) -> Result<Durability, KeyError>;               // only after the caller verified its replacement. Err = still there; Ok = gone
     fn list(&self, prefix: &str) -> Result<Vec<Name>, KeyError>;
 }
 ```
+
+**`Err` from `put` or `delete` means that nothing changed, and `Ok` means that the change is made** (third review, M-A: over an SMB share every put and delete returned `Err` after the rename had
+committed, so "a failed put leaves the previous value" was false there). What comes back with the `Ok` is a `Durability`: `Confirmed` (the folder was flushed after the rename, so the new name
+survives a power cut) or `Unconfirmed` (the file system cannot flush a folder, or the flush failed: the value is stored and every reader sees it, and a power cut right after could bring the previous one
+back; the file itself was flushed before it was renamed into place, so what comes back is whole). **A caller whose next step destroys the only other copy of what was replaced** (a rotation that has
+re-wrapped data under the new key; a delete it cannot redo) treats `Unconfirmed` as "not safe yet": it keeps the old copy until a later change says `Confirmed` or the next start finds the new value there.
+`store.put(..)?;` still compiles, and says nothing about durability: a caller that does not care does not look.
 
 Names are `^[a-z0-9][a-z0-9._-]{0,79}$` (one file each, so a name is a file name), values are 1 byte to 64 KiB. `Ok(None)` is a name that is not stored.
 Every other reason a read does not produce a value is an error: a corrupt, truncated or bit-flipped file, a file moved to another name, a file another user
@@ -61,8 +68,9 @@ pinned byte for byte by known answers that node computed (`codec::tests::the_nam
 
 **`put`** validates the value, makes the provider's bytes, writes them to a temporary file (`.<name>.<16 hex>.tmp`, created new, `0600` on Unix, a name that can
 never be a key, locked while it is written), flushes it, reads it back through the provider, compares, and only then, holding the folder's lock, renames it over the
-old file and flushes the folder. A failure at any step leaves the previous value and no file of the failed attempt. A file is read into one buffer of exactly its
-size, so no smaller copy of a secret is left in freed memory.
+old file and flushes the folder. **A failure at any step up to and including the rename leaves the previous value and no file of the failed attempt** (a temporary file that cannot be removed is
+debris, which the next open removes). The flush of the folder comes after the rename: it cannot undo it, so its failure is `Ok(Durability::Unconfirmed)` and not an error, on every platform. A file is
+read into one buffer of exactly its size, so no smaller copy of a secret is left in freed memory.
 
 ## One folder, several processes, other users: what the store does (review H-1, M-2, M-3, L-6, L-9)
 
@@ -86,8 +94,8 @@ in by another user was read as the real one, a FIFO hung a read for ever, and op
   reparse point, not a regular file, or has more than one name (**on Unix too**: a key file has exactly one name, and a put repairs one that has two). The folder is flushed after a rename and a removal. A reparse point of any kind is refused, cloud placeholders
   (OneDrive) and a profile folder moved by junction included: fail closed; give the store the real path. **What is left, and is not claimed away:** whoever can write in the keys
   folder itself can delete a key file (a caller then sees `None`, "never stored") or put back an older copy of a DPAPI blob (which the same user can unprotect: a rollback). Windows
-  gives `E:\` and other roots that nobody set up "Modify" to Authenticated Users, which is exactly that: **keep the data folder under the user's profile** (`%LOCALAPPDATA%`,
-  `%APPDATA%`), whose access control is the user, SYSTEM and Administrators. The store does not read or set ACLs (a follow-up).
+  gives `E:\` and other roots that nobody set up "Modify" to Authenticated Users, which is exactly that: **keep the data folder under the user's profile, on a local disk**
+  (`%LOCALAPPDATA%`; not `%APPDATA%`, which folder redirection puts on a server: see "Network shares and redirected profiles"), whose access control is the user, SYSTEM and Administrators. The store does not read or set ACLs (a follow-up).
 - **An advisory lock orders readers and writers** (`<keys>/.lock`; `flock` on Unix, `LockFileEx` on Windows, through std's `File::lock`). A reader holds it shared
   and a change of what a name refers to (the rename of a put, the removal of a delete) holds it exclusively, so a reader never sees a name in the middle of a replace
   (on Windows a rename over an existing file does leave such a moment, and a reader in another process used to get `None`). Each operation opens the lock file for
@@ -99,7 +107,40 @@ in by another user was read as the real one, a FIFO hung a read for ever, and op
   migrate call yet**: moving a folder from one provider to another has to read every secret with the old one and write it with the new one.
 - **Opening removes debris only**: a file of exactly the shape `.<name>.<16 hex>.tmp`, older than a minute, that nobody has locked. A put in progress is young and
   locked; two processes that start together, or a thread that opens the store in a loop, never break a put.
-- **`.lock` and `.provider` are bookkeeping**: they hold no secret and no name, `list` does not show them, and no test counts them as key files.
+- **`.lock` and `.provider` are bookkeeping**: they hold no secret and no name, `list` does not show them, and no test counts them as key files. **They are looked for** (third review, L-5):
+  the marker is read before every operation, and the lock file is made when the folder is opened and only opened afterwards, with one name like a key file. A store whose folder was emptied while
+  it was open (`remove_dir_all` on a held folder on Windows deletes everything in it and then fails to remove the folder, which the store holds) used to answer `Ok(None)`, "never stored", for every key
+  that had been there; now every operation is an error, whatever the name (`Corrupt`: the marker has gone; or `ProviderMismatch`: it names another provider; or the lock file could not be opened).
+- **A flush that fails after the change is made is not an error of the change** (third review, M-A: see the next section). The first open ignores a failure to flush its marker.
+
+## Network shares and redirected profiles (third review, M-A)
+
+**What was found.** On an SMB share, `FlushFileBuffers` on a folder handle fails with os error 1 (`ERROR_INVALID_FUNCTION`, kind `Uncategorized`), which the Windows tolerance (the kinds `InvalidInput` and
+`Unsupported`) never matched: the first open failed (with the lock file and the marker already written), and every `put` and `delete` returned `Err` **after** the rename or the removal had committed. A
+caller that follows the contract after a failed rotation keeps the old key in memory while the new one is on disk and the old one is gone. It is reachable: the desktop's default data folder is under
+`%APPDATA%` (`platform/desktop/src-tauri/src/lib.rs`), which domain folder redirection puts on a server.
+
+**What is done.** The contract is stated exactly (above): `Err` means nothing changed, `Ok` means the change is made, and the flush that comes after the rename can only say `Confirmed` or `Unconfirmed`. Windows
+knows os errors 1, 50 (`ERROR_NOT_SUPPORTED`) and 87 as "this file system cannot flush a folder", Unix `EINVAL`, `ENOTSUP` and `ENOSYS`; **every other failure to flush, after a change that is made, is
+`Unconfirmed` too** (it cannot be an error), so an error code nobody has seen costs the report of durability and never correctness.
+
+**What is supported, and what is claimed.** A data folder on an SMB share works: over loopback SMB (`\\localhost\c$`, the administrative share of this machine's `C:`, which is all that was tried), every step of a
+first open, two puts (a rotation), a read from the other path of the same folder, a delete and an open again returns `Ok` with the right value, for DPAPI and for the plaintext provider alike, with
+the advisory lock (`LockFileEx`) working between the share path and the local path of one folder, and every change `Unconfirmed`. **Not tested, and not claimed:** FAT, exFAT, ReFS, NFS, DFS, a share on another
+machine, Offline Files, a roaming profile with a real server; each can answer a flush of a folder differently. **Recommended against**, all the same: a vault's keys belong on a local disk. A redirected
+`%APPDATA%` is on a server whose administrators (and whoever can write to the share) can delete a key file (a caller sees `None`) or put back an older copy of a DPAPI blob (a rollback; the same user can unprotect
+it), which is the "whoever can write in the keys folder" limit below, widened to everyone with access to the share. **A deployment that uses folder redirection should give the store
+`%LOCALAPPDATA%` (never redirected) and not `%APPDATA%`**: the earlier editions of this file listed `%APPDATA%` beside `%LOCALAPPDATA%`, and the desktop's default data folder is there (`app_data_dir()`) (a follow-up for whoever links this store:
+the desktop crate is not edited here).
+
+**The opt-in test**, which needs the administrative share of the drive that the temp folder is on, and connects to nothing but `localhost`:
+
+```text
+cargo test -p oaiy-keystore --features unsafe-keyfile --test keystore -- --ignored smb --nocapture
+```
+
+It asks the share what a flush of a folder handle says, and requires every step to be `Ok` with the right value and the durability to match (`Unconfirmed` where the flush fails, `Confirmed` where it works). Without
+the fix its first put is an `Err` with the file on disk. The flush failures are also injected on every platform, for a put, a delete and a first open, by the unit tests of `store.rs`.
 
 ## The rules of 4.5.1, and the test that carries each
 
@@ -125,6 +166,12 @@ Tests marked (all) run on every provider the platform has: the keyfile on Unix a
 | a key file has exactly one name (Windows and Unix) | `perm::tests::a_key_file_with_more_than_one_name_is_refused_and_a_folder_is_not_judged_by_its_count`, `keystore::unix::a_key_file_with_another_hard_link_is_refused_until_the_extra_name_is_gone`, `keystore::windows::a_key_file_with_another_hard_link_is_refused_until_the_extra_name_is_gone` |
 | the unsafe keyfile is not in a build without the feature: refused from `parse` and from `OAIY_KEY_PROVIDER`, no plaintext provider on Windows, no folder made | `keystore::a_build_without_the_unsafe_keyfile_feature_refuses_the_unsafe_name_and_windows_has_no_plaintext_provider`, `keystore::the_provider_is_chosen_on_purpose_and_a_typo_is_an_error` (run without `--features`); with the feature: `keystore::the_keyfile_is_refused_on_windows_and_the_unsafe_name_is_needed_to_use_it_there` |
 | a put and a delete flush the folder (L-9) | `store::tests::a_put_and_a_delete_flush_the_folder` |
+| **a flush that fails after the change is made is not an error of the change: `Err` means nothing changed, `Ok` carries a `Durability`** (M-A), for a put, a delete and a first open, whether the file system cannot flush a folder or the flush failed | `store::tests::a_flush_that_fails_after_the_change_is_made_does_not_make_a_put_or_a_delete_an_error`, `store::tests::the_flush_of_a_folder_tells_a_file_system_that_cannot_from_a_flush_that_failed`, `store::tests::a_first_open_whose_flush_fails_still_opens_and_claims_the_folder`, `keydir::tests::only_the_errors_that_say_a_file_system_cannot_flush_a_folder_are_told_so` (the os errors, per platform); over loopback SMB (opt-in, `#[ignore]`): `keystore::windows::a_store_on_a_share_over_loopback_smb_keeps_the_contract_whatever_the_share_says_about_flushing` |
+| **a store whose folder was emptied while it was open answers with errors, never `None`; a lock file that has gone is an error and is not made again** (L-5) | `store::tests::a_store_whose_folder_was_emptied_while_it_was_open_answers_with_errors_never_none`, `store::tests::a_lock_file_that_has_gone_is_an_error_and_is_not_made_again`, `keystore::a_keys_directory_that_has_gone_is_an_error_not_an_empty_store` (its Windows branch is the `remove_dir_all` case) |
+| the lock file has one name and is not a link | `store::tests::a_lock_file_with_another_hard_link_is_refused_until_the_extra_name_is_gone` (both platforms), `store::tests::a_symbolic_link_in_place_of_the_lock_file_is_refused` (Unix) |
+| a link to nothing under another provider's extension is still that provider's secret, not `None` | `store::tests::a_link_to_nothing_under_another_providers_extension_is_still_a_value_of_that_provider` (a symbolic link; a junction whose target is gone) |
+| a key file that is a file symbolic link (a file reparse point) is refused as that, not followed or opened | `keystore::windows::a_file_symbolic_link_in_place_of_a_key_file_is_refused_not_followed`: **needs `SeCreateSymbolicLinkPrivilege`**, ends with a message where it is not held, and **has not been run on the machine that wrote it** (an account without the privilege); the hosted Windows runners of the CI lane hold it. And, opt-in because it starts WSL, with a reparse point that WSL makes without a privilege (`ln -s` on a Windows drive): `keystore::windows::a_file_reparse_point_made_by_wsl_in_place_of_a_key_file_is_refused_as_a_link_not_opened` (`cargo test -p oaiy-keystore --test keystore -- --ignored wsl`), which **was run**, and is what kills mutant Y16 |
+| `list` is sorted whatever order the file system keeps; the debris shape is exactly 16 hex; a marker needs an identifier | `store::tests::list_is_sorted`, `store::tests::a_file_with_a_longer_random_part_than_the_stores_is_not_its_temporary_file`, `keystore::a_folder_remembers_its_provider_and_refuses_to_be_opened_with_another` |
 | **a reader is never told that a key that exists was never stored** (H-1) | `store::tests::a_reader_that_starts_in_the_middle_of_a_puts_rename_waits_and_never_returns_none` (**the guard**: the real put paused inside its locked rename step, on every platform), `store::tests::a_reader_waits_for_a_writer_in_the_middle_of_a_replace_and_is_never_told_that_nothing_is_stored`, `keystore::readers_never_see_a_name_that_other_processes_are_rewriting_as_missing_or_torn` (two writer processes, three reader threads: a weak guard, see the limits), `store::tests::readers_share_the_lock_and_a_holder_that_never_lets_go_is_an_error_after_the_wait`, `store::tests::a_put_does_not_hold_the_lock_while_it_writes` |
 | a folder remembers its provider; the other provider's files are refused everywhere (M-2) | `keystore::a_folder_remembers_its_provider_and_refuses_to_be_opened_with_another`, `keystore::a_secret_of_another_providers_kind_is_an_error_everywhere_never_none_and_never_a_second_value` |
 | opening the store never deletes a put in progress (L-6) | `store::tests::opening_the_store_removes_the_debris_of_an_interrupted_put_and_nothing_else`, `store::tests::a_put_in_progress_survives_another_process_opening_the_store`, `store::tests::a_slow_write_that_is_older_than_a_minute_is_not_debris_while_its_writer_holds_the_lock`, `keystore::puts_do_not_fail_while_the_store_is_being_opened_again_and_again` |
@@ -132,7 +179,7 @@ Tests marked (all) run on every provider the platform has: the keyfile on Unix a
 | the formats and the DPAPI scope are pinned | `codec::tests::the_name_binding_and_the_keyfile_format_are_pinned_byte_for_byte`, `keystore::a_keyfile_is_the_pinned_format_on_disk_and_a_pinned_file_is_read`, `keystore::dpapi::the_file_is_a_dpapi_blob_with_the_magic_and_no_plaintext` (flags zero) |
 | another user's blob fails (Windows, `#[ignore]`) | `dpapi::another_users_blob_fails`: **not run**, it needs a blob made by another Windows account (below); its stand-in, a blob that names a master key this user does not hold, runs |
 | no plaintext beside the blob: after a success, an overwrite, a failed put and a delete (all); the bookkeeping files hold none | `keystore::no_plaintext_beside_the_blob`, `dpapi::the_file_is_a_dpapi_blob_with_the_magic_and_no_plaintext` |
-| `put` reads back and compares, else `Err`; a failure leaves the previous value (all) | `store::tests::a_put_whose_read_back_differs_fails_leaves_the_old_value_and_no_debris`, `..::a_put_whose_read_back_fails_...`, `..::a_put_that_cannot_create_its_temporary_file_...` |
+| `put` reads back and compares, else `Err`; **a failure before the rename leaves the previous value** (a failure after it is `Ok(Unconfirmed)`: the row above) (all) | `store::tests::a_put_whose_read_back_differs_fails_leaves_the_old_value_and_no_debris`, `..::a_put_whose_read_back_fails_...`, `..::a_put_that_cannot_create_its_temporary_file_...` |
 | keyfile mode refusal | `perm::tests::keyfile_mode_refusal_over_every_permission_bit_pattern` (all 4,096 patterns, every platform), and on Unix `unix::a_directory_or_file_with_any_group_or_other_permission_is_refused_and_never_repaired`, `unix::a_new_store_is_0700_and_its_files_are_0600` |
 | names: the regular expression, the Windows device names (`con`, `nul`, `com1` ...), one plain path component | `name::tests::*` |
 | fail closed: no provider chosen for you, a typo is an error, the Secret Service does not fall back | `keystore::the_provider_is_chosen_on_purpose_and_a_typo_is_an_error` |
@@ -141,7 +188,7 @@ Tests marked (all) run on every provider the platform has: the keyfile on Unix a
 
 ### The tests that need root or another account
 
-A test cannot make a second user, and this crate does not create accounts. Three tests are `#[ignore]`d:
+A test cannot make a second user, and this crate does not create accounts. Three tests are `#[ignore]`d for that (and two more are opt-in for other reasons, and `#[ignore]`d too: the one over loopback SMB, in "Network shares and redirected profiles", and the one that makes a file reparse point through WSL, in the table above):
 
 - `dpapi::another_users_blob_fails` (Windows), from a blob another account made: as a different Windows user `cargo run -p oaiy-keystore --example write_blob -- <folder> foreign.secret`;
   as the usual user `set OAIY_KS_FOREIGN_BLOB=<folder>\keys\foreign.secret.ks`, then `cargo test -p oaiy-keystore -- --ignored another_users_blob`. It has not been run.
@@ -155,16 +202,16 @@ A test cannot make a second user, and this crate does not create accounts. Three
   # in WSL, from Windows:   wsl -d Ubuntu-24.04 -u root -- /tmp/oaiy-vault-wsl/target/debug/deps/keystore-<hash> --ignored --nocapture --test-threads=1
   ```
 
-  Both ran on the final code in WSL2 Ubuntu 24.04 as root (rustc 1.94, from a copy in the WSL file system, run from `target/debug/deps/keystore-<hash>`): the owner test passed, and the stress made 227,612 swaps in
-  about five seconds while the victim read 165,115 values of its own, got 1,174,341 errors (the folder is not where it was: fail closed), no `None` and no attacker value. The stress also asserts that a new `open` in the
+  Both ran on the final code in WSL2 Ubuntu 24.04 as root (rustc 1.94, from a copy in the WSL file system, run from `target/debug/deps/keystore-<hash>`): the owner test passed, and the stress made 238,405 swaps in
+  about five seconds while the victim read 119,760 values of its own (each read now also reads the marker), got 1,567,045 errors (the folder is not where it was: fail closed), no `None` and no attacker value. The stress also asserts that a new `open` in the
   world-writable parent is refused.
 
 ## Platforms, and what was actually run
 
 | Platform | Result |
 |---|---|
-| Windows 11 (this machine): DPAPI and the unsafe keyfile | `cargo test --locked --no-fail-fast -p oaiy-crypto -p oaiy-keystore` (as a product is built): **oaiy-keystore 60 passed, 1 ignored** (the other-user DPAPI test; before the second review 47 and 1), oaiy-crypto 100 passed and 1 ignored (98 and 1): 160 and 2. With `--features unsafe-keyfile` the keystore is also 60 and 1. `cargo test --release -p oaiy-keystore` (no feature): 60 and 1, the refusal of the unsafe name included |
-| Linux (WSL2 Ubuntu 24.04, ext4, rustc 1.94, from a copy in the WSL file system, WSL stopped afterwards): keyfile, the `unix` tests, the two-process and FIFO tests, the allocator probe | **oaiy-keystore 56 passed, 2 ignored** (the two root tests, which also passed when run as root: above; before the second review 53 and 2), oaiy-crypto 100 and 1 (98 and 1): 156 and 3. The same with `--features unsafe-keyfile` (56 and 2), and in a release build (`cargo test --release -p oaiy-keystore`: 56 and 2) |
+| Windows 11 (this machine): DPAPI and the unsafe keyfile | `cargo test --locked --no-fail-fast -p oaiy-crypto -p oaiy-keystore` (as a product is built): **oaiy-keystore 73 passed, 3 ignored** (the other-user DPAPI test, the opt-in SMB test and the opt-in WSL test; before the third review 60 and 1, before the second 47 and 1), oaiy-crypto 101 passed and 1 ignored (100 and 1; 98 and 1): 174 and 4. With `--features unsafe-keyfile` the keystore is also 73 and 3. `cargo test --release -p oaiy-keystore` (no feature): 73 and 3, the refusal of the unsafe name included. The opt-in tests were run: `--ignored smb` (loopback SMB over `\\localhost\c$`, both providers: every step `Ok`, every durability `Unconfirmed`) and `--ignored wsl` (a file reparse point made by WSL: refused as a link) |
+| Linux (WSL2 Ubuntu 24.04, ext4, rustc 1.94, from a copy in the WSL file system, WSL stopped afterwards): keyfile, the `unix` tests, the two-process and FIFO tests, the allocator probe | **oaiy-keystore 67 passed, 2 ignored** (the two root tests, which also passed when run as root: above; before the third review 56 and 2, before the second 53 and 2), oaiy-crypto 101 and 1 (100 and 1; 98 and 1): 168 and 3. The same with `--features unsafe-keyfile` (67 and 2), and in a release build (`cargo test --release -p oaiy-keystore`: 67 and 2) |
 | macOS | **compile only**: `cargo check --target aarch64-apple-darwin --all-targets` is clean (and is a step of the `vault-linux` lane); the keyfile provider is the only one there, and only by name |
 | `x86_64-unknown-linux-musl` | `cargo clippy --all-targets -- -D warnings` clean (compiles the Unix code from Windows) |
 
@@ -207,9 +254,14 @@ No dev-dependencies. For the two crates together the workspace lock gained 39 `[
    those true against another process and another user.
 8. **Group-writable directories above the keys folder are refused** as well as world-writable ones: the store cannot know that a group has one member, so a data folder under a `0775`
    parent (the umask of some distributions) needs the parent made `0755`.
+9. **`put` and `delete` return a `Durability`** (third review, M-A), not `()`: the design says only "atomic" and "a failure leaves the previous value", which cannot be true of a failure that comes after the rename.
+   Nothing links the trait yet, and `store.put(..)?;` still compiles. A caller that rotates a key should look at it (see the contract above).
 
 ## Known limits
 
+- **`Durability::Unconfirmed` is a fact about the file system, and the store cannot repair it.** On a share, and on any file system that cannot flush a folder, a power cut just after a put could bring the previous value back (whole: the file is flushed
+  before it is renamed), and just after a delete could bring the file back. Over loopback SMB every change is `Unconfirmed`. FAT, exFAT, ReFS, NFS, DFS and a share on another machine were **not tested** (see "Network shares and redirected
+  profiles"); the classification knows os errors 1, 50 and 87 (Windows) and `EINVAL`, `ENOTSUP`, `ENOSYS` (Unix), and any other failure to flush after a change is `Unconfirmed` too.
 - Same-user malware defeats DPAPI (accepted, R1 of the design). An administrator's reset of the Windows password loses the DPAPI blobs: `get` answers an error, and everything K1 holds
   in Release 1 is re-derivable by reconnecting (4.5.2).
 - Two processes writing the same name: each put is atomic and verified and readers never see `None` or a torn value; the last rename wins. A process that holds the lock and never lets go
@@ -340,3 +392,49 @@ The second review found one medium (M-1, a junction above the keys folder on Win
 | P05 | a temporary file is debris only after ten minutes | KILLED | `opening_the_store_removes_the_debris_of_an_interrupted_put_and_nothing_else` |
 
 How this round went, because two of the mutants were alive at first: **R03** (a reparse point is not refused) and **R12** (a directory is accepted as a key file) survived the first run, because a junction is also a directory and a directory in place of a key file is refused by the open of the file before the rule is reached, so the junction tests and the store tests cannot tell whether the rules are there. They are killed by `the_rules_for_a_folder_and_for_a_key_file_hold_over_every_attribute`, which judges made-up handles over every combination of attribute bits (a file symbolic link and a cloud placeholder cannot be made in a test without privileges). A variant of R02 that removed a *third* walk of the path (between the open and the comparison) survived, because it was redundant: the walk was removed from the code (`956082a1`). U01 and U02 did not compile in their first form and were rewritten. The survivors that nothing can observe (B06, K23, the flush) are those of round 2, above, and are unchanged.
+
+### Round 4, after the third review
+
+The third review found one medium (M-A, a flush that fails after the change is made on a network share) and lows. The mutants below break the code that fixed M-A and L-5, and are the reviewer's survivors that this crate owns, Y06, Y07, Y10, Y13 to Y16, Y18, Y51 and Y54, run on Windows (A, B and most of the Y mutants) and on Linux under WSL (those marked as such: A07l, A08, B06u, Y18l, Y51, Y54), each with the whole keystore suite and `--features unsafe-keyfile` (`scratchpad/vault-impl/mutate4.ps1` and `mutants4.ps1`, outside the repository; Y16w with `-- --ignored wsl`). **32 new mutants of the keystore: 30 killed, 2 survived** (Y16 and Y18, below). Round 3's R05 to R09, U01 to U03 and P01 to P03 were run again, because the code they break had moved: all killed.
+
+| # | Break | Result | Killed by (up to three tests) |
+|---|---|---|---|
+| A01 | Windows: os error 1 (an SMB share) is not a file system that cannot flush a folder | KILLED | `only_the_errors_that_say_a_file_system_cannot_flush_a_folder_are_told_so`, `the_flush_of_a_folder_tells_a_file_system_that_cannot_from_a_flush_that_failed` |
+| A02 | a put returns the error of the flush that comes after the rename (the old behaviour) | KILLED | `a_flush_that_fails_after_the_change_is_made_does_not_make_a_put_or_a_delete_an_error` |
+| A03 | a delete returns the error of the flush that comes after the removal | KILLED | `a_flush_that_fails_after_the_change_is_made_does_not_make_a_put_or_a_delete_an_error` |
+| A04 | the first open fails when the flush of its marker fails | KILLED | `a_first_open_whose_flush_fails_still_opens_and_claims_the_folder` |
+| A05 | a flush that failed after the change is reported as Confirmed | KILLED | `a_flush_that_fails_after_the_change_is_made_does_not_make_a_put_or_a_delete_an_error` |
+| A06 | a file system that cannot flush a folder is reported as Confirmed | KILLED | `only_the_errors_that_say_a_file_system_cannot_flush_a_folder_are_told_so`, `the_flush_of_a_folder_tells_a_file_system_that_cannot_from_a_flush_that_failed`, `a_flush_that_fails_after_the_change_is_made_does_not_make_a_put_or_a_delete_an_error` |
+| A07 | every failure to flush the folder is Unconfirmed, none is an error (Y12) | KILLED | `only_the_errors_that_say_a_file_system_cannot_flush_a_folder_are_told_so`, `the_flush_of_a_folder_tells_a_file_system_that_cannot_from_a_flush_that_failed` |
+| A07l | every failure to flush the folder is Unconfirmed, none is an error (Y53, Linux) | KILLED | `only_the_errors_that_say_a_file_system_cannot_flush_a_folder_are_told_so`, `the_flush_of_a_folder_tells_a_file_system_that_cannot_from_a_flush_that_failed` |
+| A08 | Unix: ENOTSUP is not a file system that cannot flush a folder | KILLED | `only_the_errors_that_say_a_file_system_cannot_flush_a_folder_are_told_so` |
+| A09 | Windows: os error 50 (not supported) is not a file system that cannot flush a folder | KILLED | `only_the_errors_that_say_a_file_system_cannot_flush_a_folder_are_told_so` |
+| A10 | Windows: access denied (5) counts as a file system that cannot flush a folder | KILLED | `only_the_errors_that_say_a_file_system_cannot_flush_a_folder_are_told_so` |
+| B01 | a get does not look for the marker | KILLED | `a_store_whose_folder_was_emptied_while_it_was_open_answers_with_errors_never_none`, `a_keys_directory_that_has_gone_is_an_error_not_an_empty_store` |
+| B02 | a put does not look for the marker | KILLED | `a_store_whose_folder_was_emptied_while_it_was_open_answers_with_errors_never_none`, `a_keys_directory_that_has_gone_is_an_error_not_an_empty_store` |
+| B03 | a delete does not look for the marker | KILLED | `a_store_whose_folder_was_emptied_while_it_was_open_answers_with_errors_never_none`, `a_keys_directory_that_has_gone_is_an_error_not_an_empty_store` |
+| B04 | a list does not look for the marker | KILLED | `a_store_whose_folder_was_emptied_while_it_was_open_answers_with_errors_never_none`, `a_keys_directory_that_has_gone_is_an_error_not_an_empty_store` |
+| B05 | the marker that an open store looks for may name another provider | KILLED | `a_store_whose_folder_was_emptied_while_it_was_open_answers_with_errors_never_none` |
+| B06 | Windows: an operation makes the lock file again if it has gone | KILLED | `a_lock_file_that_has_gone_is_an_error_and_is_not_made_again` |
+| B06u | Unix: an operation makes the lock file again if it has gone | KILLED | `a_lock_file_that_has_gone_is_an_error_and_is_not_made_again` |
+| B08 | Windows: the lock file is not judged by its names | KILLED | `a_lock_file_with_another_hard_link_is_refused_until_the_extra_name_is_gone` |
+| B10 | Windows: the open does not make the lock file | KILLED | `a_put_and_a_delete_flush_the_folder`, `a_put_in_progress_survives_another_process_opening_the_store`, `a_put_whose_read_back_fails_is_an_error_and_changes_nothing` |
+| Y06 | debris: a dot-file with a longer random part counts as the store's temporary file | KILLED | `a_file_with_a_longer_random_part_than_the_stores_is_not_its_temporary_file` |
+| Y07 | marker: an empty provider identifier is a marker | KILLED | `a_folder_remembers_its_provider_and_refuses_to_be_opened_with_another` |
+| Y10 | the identity compares the file index and not the volume | KILLED | `two_files_are_one_only_when_the_volume_and_the_index_are_both_the_same`, `a_path_whose_folder_has_another_volume_or_another_index_than_the_held_one_leads_elsewhere` |
+| Y13 | the lock file is not judged at all (a reparse point, a folder, a second name) | KILLED | `a_lock_file_with_another_hard_link_is_refused_until_the_extra_name_is_gone` |
+| Y14 | a dangling link under another provider's name does not count as an entry (Windows) | KILLED | `a_link_to_nothing_under_another_providers_extension_is_still_a_value_of_that_provider` |
+| Y15 | a file with an invalid stem counts as another provider's secret | KILLED | `a_folder_remembers_its_provider_and_refuses_to_be_opened_with_another` |
+| Y16 | a key file is opened following a reparse point (needs SeCreateSymbolicLinkPrivilege to test) | SURVIVED |  |
+| Y18 | list: the names are not sorted (Windows: NTFS keeps names sorted) | SURVIVED |  |
+| Y18l | list: the names are not sorted (Linux) | KILLED | `list_is_sorted`, `round_trip_overwrite_delete_and_list_for_every_provider` |
+| Y51 | a dangling link under another provider's name does not count as an entry (Unix) | KILLED | `a_link_to_nothing_under_another_providers_extension_is_still_a_value_of_that_provider` |
+| Y54 | the lock file is opened following a symbolic link (Unix) | KILLED | `a_symbolic_link_in_place_of_the_lock_file_is_refused` |
+| Y16w | a key file is opened following a reparse point (the opt-in test that makes the link through WSL) | KILLED | `a_file_reparse_point_made_by_wsl_in_place_of_a_key_file_is_refused_as_a_link_not_opened` |
+
+**The two that survived**, and why they are not a gap:
+
+- **Y16** (a key file is opened following a reparse point) is killed only by an opt-in test: the default suite cannot make a file reparse point on an account that does not hold `SeCreateSymbolicLinkPrivilege` (this machine's), and the test that uses `symlink_file` ends with a message there (and **has not been run** on this machine: it is for the hosted Windows runners). Y16w is the same mutant run against the opt-in test that makes the link through WSL, which needs no privilege (`wsl ln -s` on a Windows drive makes a file reparse point that Win32 cannot open by following it): **killed** (`cargo test -p oaiy-keystore --test keystore -- --ignored wsl`).
+- **Y18** (`list` does not sort) is equivalent on NTFS, which keeps the names of a folder in order (and the test that asserts the order passes with or without the sort); Y18l is the same mutant on Linux, where the order is the file system's own: **killed**.
+
+Y12 and Y53 of the review (every failure to flush the folder is success) are A07 and A07l, **killed**; Y10 (the volume is not compared) is killed by a unit test of the comparison with made-up identities and by one that makes the held folder's identity differ in the volume and in the index (there is no second volume to mount in a test without an administrator); Y14 and Y51 (a link to nothing hides another provider's secret) by a test that makes one on each platform (a symbolic link, a junction whose target is gone); Y54 by a symbolic link in place of the lock file on Linux; Y06, Y07 and Y15 by cases added to the tests of the debris shape and of the marker; Y13 by a hard link to the lock file (which Unix refused and Windows did not).

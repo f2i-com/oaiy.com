@@ -15,7 +15,7 @@
 //!   for an attacker who flips the path back and forth faster than a check takes (every later operation compares again); and whoever can **write to the keys
 //!   folder itself** can delete a key file (a caller then sees `None`) or put back an older copy of a DPAPI blob (which the same user can unprotect: a rollback).
 //!   Windows gives `E:\` and other roots that nobody set up "Modify" to Authenticated Users, which is exactly that: **keep the data folder under the user's
-//!   profile** (`%LOCALAPPDATA%`, `%APPDATA%`), whose access control is the user, SYSTEM and Administrators. The store does not read or set ACLs.
+//!   profile, on a local disk** (`%LOCALAPPDATA%`; `%APPDATA%` is redirected to a server by folder redirection), whose access control is the user, SYSTEM and Administrators. The store does not read or set ACLs.
 
 use std::fs::{self, File, OpenOptions};
 use std::io;

@@ -8,11 +8,11 @@ This is work package **V-01** of `design/vault.final.md` (section 4.1 "Primitive
 It is a workspace member and not a default member; `cargo test -p oaiy-crypto` runs it.
 
 ```text
-cargo test --locked -p oaiy-crypto                           # 100 tests (and 1 ignored), about a minute unoptimised
+cargo test --locked -p oaiy-crypto                           # 101 tests (and 1 ignored), about a minute unoptimised
 cargo test --release -p oaiy-crypto -- --ignored             # the one-million-iteration X25519 vector of RFC 7748 (passed again on the final code: 46.7 s)
 ```
 
-Run on Windows 11 (MSVC, rustc 1.92.0): 100 passed, 1 ignored, none failed (98 and 1 before the second review). Run on Linux (WSL2 Ubuntu 24.04, rustc 1.94.0, from a copy in the WSL file system, WSL stopped afterwards): the same 100 pass. The dead-stack probe (`zeroize_stack`) is also run with `--release` and with `--profile vault-probe`, on both.
+Run on Windows 11 (MSVC, rustc 1.92.0): 101 passed, 1 ignored, none failed (100 and 1 before the third review; 98 and 1 before the second). Run on Linux (WSL2 Ubuntu 24.04, rustc 1.94.0, from a copy in the WSL file system, WSL stopped afterwards): the same 101 pass. The dead-stack probe (`zeroize_stack`) is also run with `--release` and with `--profile vault-probe`, on both.
 macOS: compile-checked only (`cargo check --target aarch64-apple-darwin --all-targets`, a step of the `vault-linux` CI lane). `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` (the crate's `rustfmt.toml`)
 are clean on Windows, Linux and `x86_64-unknown-linux-musl`. The independent review of `5859fd8d` (differential tests against libsodium in Node and PHP: 400 kdf, 7,774 xchacha, 3,642 sealed boxes,
 31,801 Ed25519 verdicts, 6,542 X25519, Argon2id, 510,000 fuzz inputs, all identical or refused with no panic) found the primitives sound and zeroization and the keystore not; the fixes are the commits after it.
@@ -174,12 +174,19 @@ Rust's abstract machine and is what every stack-scanning test does; the counts a
   the mutants that write the key through a plain array or a by-value `Secret` before they copy it to `out`, S03, S05, S06 and, through the by-value derivation, S11 and S12, were alive until the probe was changed). **The input keys: none, in any of them** (Ed25519 `from_seed`, which
   returns a key that is the seed, is the one exception: one, which is the price of a by-value return: the harness's own move of the result with no optimisation, the frame of `from_seed` in an optimised build).
   **The keys that come out of an `*_into` function: none, in any of them** (`kdf::derive_into`, `hkdf_sha256_secret_into`, `RecoveryKit::wrap_key_into`, `SecretKey::diffie_hellman_into`,
-  `aead::unwrap_key_into`, `bip39::wrap_key_into`). **The keys that come out by value** (`kdf::derive`, `hkdf_sha256_secret`, `RecoveryKit::wrap_key`, `SecretKey::diffie_hellman`, `aead::unwrap_key`,
-  `bip39::wrap_key`): at most the floor of a function with no cryptography in it plus one. The floor, measured the same way (a `Secret` returned through a `Result`, moved out of the harness's frame),
-  is **4** with no optimisation (assertions on or off, Windows and Linux) and **1** in an optimised build; the functions leave 1 to 3 with no optimisation and 1 to 2 in an optimised build (kdf::derive 3 / 2,
-  hkdf 3 / 1, kit.wrap_key 3 / 2, x25519 3 / 2, unwrap_key 3 / 2, bip39::wrap_key 1 to 2 / 2). **The keys made at random** (`Secret::random`, the `generate` functions, `Entropy::random`), by value and
+  `aead::unwrap_key_into`, `bip39::wrap_key_into`, `bip39::phrase_wrap_key_into`, `argon2id13_into`). **The text** that is read or made (the phrase, the code: `bip39::decode`, `bip39::encode`,
+  `RecoveryKit::decode`, `RecoveryKit::encode`, `bip39::phrase_wrap_key`): **none of it** is left, and **the Argon2 output** that a phrase's wrap key is derived from **is never left** (third review, L-1 and L-2: the
+  decoders, the encoders and `phrase_wrap_key_into` did not scrub and had no row, and left one to three copies of the entropy or the kit key; `argon2id13` was by value only and left its output; the
+  probe's bip39 needles had a period). **The keys that come out by value** (`kdf::derive`, `hkdf_sha256_secret`, `RecoveryKit::wrap_key`, `SecretKey::diffie_hellman`, `aead::unwrap_key`,
+  `bip39::wrap_key`, `bip39::phrase_wrap_key`, `argon2id13`, and the entropy and the kit that the two decoders return): at most the floor of a function with no cryptography in it plus one. The floor, measured the same way
+  (a `Secret` returned through a `Result`, moved out of the harness's frame), is **4** with no optimisation (assertions on or off, Windows and Linux) and **1** in an optimised build; the functions leave 2 to 3 with
+  no optimisation and 1 to 2 in an optimised build (kdf::derive 3 / 2, hkdf 3 / 1, kit.wrap_key 3 / 2, x25519 3 / 2, unwrap_key 3 / 2, bip39::wrap_key 3 / 2, argon2id13 3 / 2, phrase_wrap_key 3 / 2, bip39::decode
+  2 to 3 / 2, RecoveryKit::decode 2 / 2). **The keys made at random** (`Secret::random`, the `generate` functions, `Entropy::random`), by value and
   scrubbed, at most two above the floor: measured 0 to 4 (Windows: up to 2 with assertions on, 3 optimised, 4 with no optimisation and no assertions; Linux: up to 4, with `Entropy::random` and
-  `RecoveryKit::generate` the highest). **The bounds on the by-value and the made keys are loose with no optimisation** (the floor is 4 and the functions leave 3, so "floor plus one" and "floor plus two" allow 5 and 6):
+  `RecoveryKit::generate` the highest). **The scrubs of the generators are not seen by the probe** (third review, Y37 to Y40): with the scrub removed from `Entropy::random`, `RecoveryKit::generate`,
+  `SecretKey::generate` and `SigningKey::generate` the probe counts the same copies as with it, in all three configurations, because the generators write the key where it lives and leave nothing below their frame
+  for a scrub to remove; the scrub there is defence in depth, and a unit test (`zeroize::tests::the_functions_that_make_or_read_a_key_scrub_the_stack_after_it`) requires that each of them, and each decoder
+  and encoder, calls it. **The bounds on the by-value and the made keys are loose with no optimisation** (the floor is 4 and the functions leave 3, so "floor plus one" and "floor plus two" allow 5 and 6):
   they do not discriminate there, and the optimised build is where they bite (floor 1, by-value at most 2, made at most 3, Ed25519 `generate` exactly at 3); the assertions that do discriminate in every configuration are the two that matter for
   a consumer, **none in the input and none in an `_into` output**. **A consumer that has to show that no key is in memory
   after it has connected (design test P9: the UMK and what is derived from it: `flbkrcp1`, `flbksig1`) uses the `_into` functions and must account for the rest: tracked as a follow-up for V-13 (a
@@ -348,3 +355,51 @@ The second review (low 1) found that the derived keys left one to three copies i
 The three survivors are equivalent on the build they are run in, and each has a twin that is killed where the leak exists: **S04** (`diffie_hellman_into` without the scrub) leaves no copy of the key or of the shared secret with assertions on (the copy in a build with no optimisation and no assertions, S04p, and in an optimised one, S04r, is found); **Z04** and **Z05** (HMAC and HMAC verify without the scrub) leave none in an optimised build on Windows, and leave the key on Linux (Z04w and Z05w).
 
 How this round went, because six of the mutants were alive at first: S03, S05, S06, S11 and S12 (an `_into` function that derives into a plain array, or a by-value key, and copies it to `out`) survived the first two forms of the probe, which ran the code and then dropped the output in the same frame: the drop's own calls were made where the callee's frame had been and overwrote the copy. The code now runs under `deep` (a frame of 1.5 KiB) and at eight depths, with a control that has the shape of a row (a copy left under `deep`, followed by an unwrap and the drop of a `Secret`); S03 and S06 are kept in both of their forms (S03v and S06v are the by-value ones that the first form of each wrote); S04, the sixth, is explained above. The first run of Ed25519's mutants (S08 to S10: N06, the missing scrub after the key expansion) is killed in a debug build as well as in an optimised one and in a build with no optimisation and no assertions, which review low 1 asked for.
+
+### Round 4, after the third review
+
+The third review found that the text decoders and encoders did not scrub (L-1), that the Argon2 output was left in the dead stack (L-2), and that the scrubs of the four generators could be removed without the suite noticing (Y37 to Y40). The mutants below break each of those fixes, in the whole suite and in each probe configuration, and round 3's stack mutants were run again against the probe as it is now (`scratchpad/vault-impl/mutate4.ps1` and `mutants4.ps1`, outside the repository; the keystore's half is in its README). **33 new mutants of the crypto crate: 25 killed, 8 survived**; the nineteen of round 3 (S01 to S06 and their variants, S08 to S11, Z01 to Z03, Z04w, Z05w, Z06) were run again: all killed.
+
+| # | Break | Result | Killed by (up to three tests) |
+|---|---|---|---|
+| Y37 | Entropy::random does not scrub the stack | KILLED | `the_functions_that_make_or_read_a_key_scrub_the_stack_after_it` |
+| Y38 | RecoveryKit::generate does not scrub the stack | KILLED | `the_functions_that_make_or_read_a_key_scrub_the_stack_after_it` |
+| Y39 | SecretKey::generate does not scrub the stack | KILLED | `the_functions_that_make_or_read_a_key_scrub_the_stack_after_it` |
+| Y40 | SigningKey::generate does not scrub the stack (from_seed still does) | KILLED | `the_functions_that_make_or_read_a_key_scrub_the_stack_after_it` |
+| S12 | bip39 wrap_key_into goes through the by-value key | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| D01 | bip39::decode does not scrub the stack (the whole suite) | KILLED | `the_functions_that_make_or_read_a_key_scrub_the_stack_after_it`, `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| D01d | bip39::decode does not scrub the stack (the probe, debug build) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| D01r | bip39::decode does not scrub the stack (the probe, optimised build) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| D01v | bip39::decode does not scrub the stack (the probe, no optimisation and no assertions) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| D02 | bip39::encode does not scrub the stack (the whole suite) | KILLED | `the_functions_that_make_or_read_a_key_scrub_the_stack_after_it`, `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| D02d | bip39::encode does not scrub the stack (the probe, debug build) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| D02r | bip39::encode does not scrub the stack (the probe, optimised build) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| D02v | bip39::encode does not scrub the stack (the probe, no optimisation and no assertions) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| D03 | RecoveryKit::decode does not scrub the stack (the whole suite) | KILLED | `the_functions_that_make_or_read_a_key_scrub_the_stack_after_it` |
+| D03d | RecoveryKit::decode does not scrub the stack (the probe, debug build) | SURVIVED |  |
+| D03r | RecoveryKit::decode does not scrub the stack (the probe, optimised build) | SURVIVED |  |
+| D03v | RecoveryKit::decode does not scrub the stack (the probe, no optimisation and no assertions) | SURVIVED |  |
+| D04 | RecoveryKit::encode does not scrub the stack (the whole suite) | KILLED | `the_functions_that_make_or_read_a_key_scrub_the_stack_after_it` |
+| D04d | RecoveryKit::encode does not scrub the stack (the probe, debug build) | SURVIVED |  |
+| D04r | RecoveryKit::encode does not scrub the stack (the probe, optimised build) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| D04v | RecoveryKit::encode does not scrub the stack (the probe, no optimisation and no assertions) | SURVIVED |  |
+| D05 | bip39::phrase_wrap_key_into does not scrub the stack (the whole suite) | KILLED | `the_functions_that_make_or_read_a_key_scrub_the_stack_after_it`, `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| D05d | bip39::phrase_wrap_key_into does not scrub the stack (the probe, debug build) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| D05r | bip39::phrase_wrap_key_into does not scrub the stack (the probe, optimised build) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| D05v | bip39::phrase_wrap_key_into does not scrub the stack (the probe, no optimisation and no assertions) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| D06 | argon2id13_into does not scrub the stack (the whole suite) | KILLED | `the_functions_that_make_or_read_a_key_scrub_the_stack_after_it`, `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| D06d | argon2id13_into does not scrub the stack (the probe, debug build) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| D06r | argon2id13_into does not scrub the stack (the probe, optimised build) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| D06v | argon2id13_into does not scrub the stack (the probe, no optimisation and no assertions) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| E01 | argon2id13_into writes its output through a plain array (the probe, optimised build) | SURVIVED |  |
+| E01v | argon2id13_into writes its output through a plain array (the probe, no optimisation and no assertions) | SURVIVED |  |
+| E02 | wrap_key_into takes the Argon2 output by value, as before the third review (the probe, no optimisation and no assertions) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| E02r | wrap_key_into takes the Argon2 output by value, as before the third review (the probe, optimised build) | SURVIVED |  |
+
+**The eight that survived** each have a reason, and none is a missing test of something that leaks:
+
+- **D03** (`RecoveryKit::decode` without its scrub) in the three probe configurations, and **D04** (`RecoveryKit::encode`) in the two unoptimised ones: the scrub has nothing to remove there. The kit is unpacked straight into the array that is moved into the returned key, so what `decode` leaves below its frame is the copy that any by-value return leaves, which is the floor and which a scrub cannot reduce (it moves where the copy is, from the frame of the body to the frame of the wrapper). They are killed by the unit test that requires the scrub to be called (D03, D04), and D04 by the probe in an optimised build (D04r), where `encode` does leave one.
+- **E01** and **E01v** (`argon2id13_into` writes through a plain array): the array is in the frame of the function below the one that scrubs, so the scrub that follows it removes it. It is equivalent, and D06 (no scrub at all) is killed in all four.
+- **E02r** (`wrap_key_into` takes the Argon2 output by value) in an optimised build: the by-value `argon2id13` is now a wrapper over the in-place one and an optimised build leaves no copy of the output in the caller; E02 (no optimisation and no assertions) is **killed**, which is where the by-value return does.
+
+**Y37 to Y40** (the generators' scrubs): the probe measures the same copies with the four scrubs removed as with them, in all three configurations on Windows (`made` 1, 0, 2, 0, 1 / 1, 1, 3, 2, 2 / 2, 2, 3, 4, 3 with them; 1, 1, 1, 0, 1 / 1, 0, 2, 2, 2 / 2, 2, 2, 4, 3 without), because a generator writes its key where it lives and leaves nothing below its frame for the scrub to remove. So the scrub counts its calls in a test build and a unit test requires each function that makes or reads a key to call it: **killed**. The probe cannot see these scrubs, and says so in its header.
