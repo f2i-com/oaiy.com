@@ -168,7 +168,23 @@ test('4.18.3 the 410 of a pairing on a desktop route (not recorded by the log, s
     OaiyTest\Tmp::setClock(Relay::T0 + 6);
     eq('pid_expired', rs_thrown($ownedE, 410, 'a rendezvous that ran out of its five seconds'));
 });
-test('4.18.3 an exception that is neither the relay\'s error nor the database\'s is a 500 whose reason is its class, on the ordinary routes and on the compatibility ones (a fault is made in the registry\'s test hook, which production never sets)', function () {
+test('4.18.3 the 429 that an address earns by failing twenty times in a minute has its reason, on the native check of a bearer and on the compatibility check of an admission (the log records no 429, so what is thrown is asserted)', function () {
+    $r = Relay::make();
+    $ctx = $r->ctx();
+    $req = new Oaiy\Relay\Request('GET', '/v1/poll', [], ['REMOTE_ADDR' => '198.51.100.9', 'REQUEST_METHOD' => 'GET', 'HTTP_AUTHORIZATION' => 'Bearer not-a-token'], '', null);
+    $req->client = '198.51.100.9';
+    for ($i = 1; $i <= 20; $i++) {
+        eq('malformed_token', rs_thrown(fn() => $ctx->auth->device($req), 401, "native failure $i"));
+    }
+    eq('address_failed_too_often', rs_thrown(fn() => $ctx->auth->device($req), 429, 'the native check, after twenty failures'));
+    [$k] = aok_pair();
+    for ($i = 1; $i <= 20; $i++) {
+        eq('admission_invalid_or_expired', rs_thrown(fn() => $k->facade('not-an-admission'), 401, "compatibility failure $i"));
+    }
+    eq('address_failed_too_often', rs_thrown(fn() => $k->facade('not-an-admission'), 429, 'the compatibility check, after twenty failures'));
+});
+
+test('4.18.3 an exception that is neither the relay\'s error nor the database\'s is a 500 whose reason is its class,on the ordinary routes and on the compatibility ones (a fault is made in the registry\'s test hook, which production never sets)', function () {
     [$k, $a, $b, $plug, $ta, $tb] = aok_pair();
     $r = $k->r;
     $d = $r->desktop('Poller');
