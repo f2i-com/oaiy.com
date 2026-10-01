@@ -253,6 +253,7 @@ is an error, not a default. Keys this build understands (unknown keys are ignore
 | `wake.mode`, `wake.safety_ms` | `file`, 2000 | `file` (shard files, with a database fetch every `safety_ms`) or `db` (poll the database) |
 | `client_ip.header`, `client_ip.trusted_proxies` | none | Honoured only when `REMOTE_ADDR` is a trusted proxy |
 | `cors.extra_origins` | none | Extra https origins listed in `info` |
+| `gc.one_in` | 20 | About one request in this many checks whether a garbage-collection pass is due (0 to 1,000; 0: none does, and only a health or status request, or a poll that can be answered before the pass on a host that can, runs it) |
 | `debug.error_sites` | `false` | When `true`, every `401`, `404` and `5xx` the relay answers is also one line in `data/logs/relay.log` (`event: error_site`) with the route, status, code, the file and line that decided it, the relay's clock and the host's, and the process: no credential, id, header or body. For finding out why an answer was what it was; leave it off otherwise |
 
 Accepted and validated now, used by a later part of the relay: `push.fcm.*` and `limits.slotBytes`.
@@ -411,6 +412,14 @@ health or status request (or after a poll when the host can answer first). If yo
 most, because it locks the database) compacts the file. A request's pass has a budget of 50 ms and keeps to it inside the deletes as
 well as between them (a hundred rows at a time): a backlog of a hundred thousand rows of metadata, or a limiter table far over its
 bound, is worked off over many passes and never by one request that waits for all of it.
+
+**How fast a backlog goes.** Where the host can answer first (PHP-FPM and LiteSpeed: `fastcgi_finish_request`) the pass runs after the
+answer with a budget of 5 seconds, about 60,000 rows of metadata a pass. Where it cannot (mod_php, CGI, `php -S`) a pass is paid for by a
+health or status request, or by about one request in `gc.one_in` (20) of any kind, and has the 50 ms budget: **about 600 rows a pass and
+a pass a minute at most, so a backlog of a hundred thousand rows takes about three hours there.** A backlog does not grow without bound
+on such a host (the limiter table has a hard cap, and items expire), but one that is already there is cleared slowly: run
+`php bin/gc.php --force` once by hand (it has no budget), or put it in cron as above, and the host that has no cron gets the slow path
+only. A test keeps the budget honest between chunks of a backlog (`4.18.6 a backlog is cut at the budget between chunks of a hundred`).
 
 ## Tests
 
