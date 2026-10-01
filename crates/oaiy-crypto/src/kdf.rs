@@ -151,8 +151,9 @@ impl Purpose {
 /// id come from the registry row of the [`Purpose`], so a caller cannot derive under a context that the registry does not hold (a misspelt one, another component's, one
 /// that is reserved), and adding a purpose means adding a registry row, which the tests that guard the registry see.
 ///
-/// The key comes back **by value**, which leaves a copy of it in the frame that made it once that frame has returned (one in a build with no optimisation, and none or one in an
-/// optimised one: `tests/zeroize_stack.rs` counts them). A caller that keeps the key for a while, or that has to show that no key is left in memory after it has connected
+/// The key comes back **by value**, which leaves copies of it in the frames that made it once they have returned: **three** in a build with no optimisation (with or without assertions) and
+/// **two** in an optimised one, measured on Windows and on Linux (`tests/zeroize_stack.rs` counts them, against the floor of a function with no cryptography in it, which is four and one;
+/// the README has the table). A caller that keeps the key for a while, or that has to show that no key is left in memory after it has connected
 /// (design test P9), uses [`derive_into`], which writes the key where the caller says and leaves none.
 pub fn derive(master: &Secret<32>, purpose: Purpose) -> Result<Secret<32>, Error> {
     let mut out = Secret::zeroed();
@@ -224,6 +225,10 @@ fn derive_unscrubbed(master: &Secret<32>, id: u64, context: &Context, out: &mut 
 pub const HKDF_SHA256_MAX_OUTPUT: usize = 255 * 32;
 
 /// HKDF-SHA256 (RFC 5869): extract with `salt` (`None` is a string of 32 zero bytes), expand with `info`, fill `out`.
+///
+/// **`out` is a plain slice**, for outputs that are not one fixed-size secret (up to [`HKDF_SHA256_MAX_OUTPUT`] bytes: the 64-byte subkeys, a block of output keying material) and for the
+/// known-answer tests: the derived bytes are written into it in place, no copy of them is made here or left in the stack, and **keeping the buffer in a type that wipes itself is the
+/// caller's job**. For one 16, 32 or 64-byte secret use [`hkdf_sha256_secret_into`], which takes a [`Secret`] and is the typed form (third review, informational).
 pub fn hkdf_sha256(ikm: &[u8], salt: Option<&[u8]>, info: &[u8], out: &mut [u8]) -> Result<(), Error> {
     if out.len() > HKDF_SHA256_MAX_OUTPUT {
         return Err(Error::HkdfLength);
