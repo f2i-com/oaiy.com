@@ -322,13 +322,7 @@ final class Pairing
                 'ed25519' => $phone['ed'], 'x25519' => $phone['x'], 'owner_desktop' => (string)$row['desktop_dev'], 'app_id' => (string)$row['app_id'],
                 'peer_thumbprint' => (string)$row['desktop_thumb'], 'grants' => $phone['grants'], 'flags' => ['canCmd' => false],
             ]);
-            try {
-                $sealed = sodium_crypto_box_seal($token, $phone['x']);
-            } catch (\SodiumException $e) {
-                sodium_memzero($token);
-                throw ApiError::make('unprocessable'); // an all-zero shared secret: a key of small order that slipped past the list
-            }
-            sodium_memzero($token); // the plaintext token has done its one job: it is in the box, and nowhere else
+            $sealed = self::sealAndWipe($token, $phone['x']); // the plaintext token has done its one job: it is in the box, and nowhere else
             unset($token);
             $db->exec(
                 "UPDATE pairings SET state = 'approved', phone_dev = ?, sealed_token = ?, receipt = ?, response = NULL WHERE pid = ? AND state = 'answered'",
@@ -342,6 +336,24 @@ final class Pairing
         }
         $ctx->signals->wakeWrite('pair:' . $pid);
         return $result;
+    }
+
+    /**
+     * Seal a device token to the phone's X25519 key and zero the plaintext, whether or not the sealing worked: the caller's variable
+     * holds no token once this returns (sodium_memzero leaves it NULL), so the plaintext lives in the one box and nowhere else. A key
+     * of small order that slipped past the list gives an all-zero shared secret and no box: 422, and the token is wiped all the same.
+     * Public so that a test can hand it a variable and look at the variable afterwards.
+     * @throws ApiError unprocessable
+     */
+    public static function sealAndWipe(string &$token, string $x25519): string
+    {
+        try {
+            return sodium_crypto_box_seal($token, $x25519);
+        } catch (\SodiumException $e) {
+            throw ApiError::make('unprocessable');
+        } finally {
+            sodium_memzero($token);
+        }
     }
 
     /**

@@ -820,6 +820,26 @@ test('4.10.3 step 9: the sealed token opens only with the phone\'s own key (anot
     neq($g['json']['sealedToken'], $g2['json']['sealedToken']);
 });
 
+test('4.10.3 step 9: the plaintext token is wiped from memory once it is sealed, and also when the sealing fails (a key of small order): the variable the caller holds is not the token any more', function () {
+    $kp = sodium_crypto_box_keypair();
+    $pub = sodium_crypto_box_publickey($kp);
+    $plain = 'oaiyrt1.' . str_repeat('A', 11) . '.' . str_repeat('B', 43); // built at run time: a string of its own, not a shared literal
+    $token = $plain;
+    $token .= ''; // (a copy that PHP has to separate from $plain before it is changed)
+    $sealed = Oaiy\Relay\Pairing::sealAndWipe($token, $pub);
+    eq($plain, sodium_crypto_box_seal_open($sealed, $kp), 'the box holds the token');
+    ok($token === null || trim($token, "\0") === '', 'and the variable no longer does: ' . var_export($token === null ? null : bin2hex($token), true));
+    ok($token !== $plain);
+    // A key whose shared secret is all zeros (small order) gives no box, 422, and the token is wiped just the same.
+    $token2 = $plain;
+    $token2 .= '';
+    $e = throws(function () use (&$token2) {
+        Oaiy\Relay\Pairing::sealAndWipe($token2, str_repeat("\0", 32));
+    }, Oaiy\Relay\ApiError::class);
+    eq([422, 'unprocessable'], [$e->status, $e->errorCode]);
+    ok($token2 === null || trim($token2, "\0") === '', 'wiped after a refusal too');
+});
+
 test('4.10.3 step 9: the phone reading the outcome marks the rendezvous read (deleted ten minutes later, as at expiry); a reader that has not read it does not', function () {
     [$r, $d, $c] = pair_setup();
     $c->open();
