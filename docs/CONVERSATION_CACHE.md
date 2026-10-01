@@ -34,13 +34,18 @@ selection policy covers DeepSeek and GLM. Cancelling DeepSeek's token-by-token
 prompt pass also checkpoints the fully processed tokens before returning.
 
 Streaming `oaiy_progress` now includes `cached_tokens`, `cache_source` (memory,
-checkpoint, disk or none), and `previous_prefix_tokens`, alongside the existing
+checkpoint, disk, ram or none), and `previous_prefix_tokens`, alongside the existing
 `prompt_done` / `prompt_total`. The latter total is the suffix still requiring
 processing, not the entire prompt. The first progress event reports reuse before
 prefill finishes. `previous_prefix_tokens` measures the match with the prior
 in-memory history; zero after a process restart does not mean disk reuse failed.
 No text, credentials or token IDs are exposed by these diagnostics. Existing
 clients may ignore the added fields. Final usage remains backward compatible.
+
+A `cache_source` of `ram` is Qwen3.8-Flash-Next bringing back a conversation it had set aside in
+host RAM (`--park-gb`; see [FLASHNEXT.md](FLASHNEXT.md#two-conversations-on-one-model)). Measured
+on 1 Oct 2026 on the owner's two-GPU machine, in one run, a swap-in of a 20.3k-token conversation
+took 0.21 to 0.26 s in all, against 31 to 36 s of prefill without it.
 
 Exact reuse still depends on model identity and the complete preceding tokens.
 This cache is not interchangeable between original and ternary experts. A saved

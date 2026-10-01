@@ -44,6 +44,10 @@ mod flashnext;
 #[cfg(feature = "cuda")]
 mod lora;
 mod qwen_cache;
+// Conversations Qwen3.8-Flash-Next sets aside in host RAM.
+mod qwen_park;
+#[cfg(test)]
+mod qwen_real;
 #[cfg(feature = "cuda")]
 mod qwen_vision;
 pub mod images;
@@ -172,6 +176,11 @@ pub struct Options {
     pub prompt_cache: Option<PathBuf>,
     /// Disk the prompt states may take, in GB.
     pub prompt_cache_gb: f64,
+    /// Host RAM, in GB, where Qwen3.8-Flash-Next sets aside the conversations it is about to lose
+    /// to another (it keeps one on the GPUs and no disk states), so that a conversation that
+    /// comes back finds its state instead of reading its prompt again. Never more than half of
+    /// the RAM that is free. 0: not at all.
+    pub park_gb: f64,
     /// CPU threads for experts that miss VRAM (`None`: upload every miss).
     pub cpu_threads: Option<usize>,
     /// Load the vision tower.
@@ -259,6 +268,7 @@ impl Default for Options {
             checkpoints: 256,
             prompt_cache: None,
             prompt_cache_gb: 4.0,
+            park_gb: 8.0,
             cpu_threads: Some(24),
             vision: true,
             local_images: None,

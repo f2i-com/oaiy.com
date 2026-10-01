@@ -69,6 +69,10 @@ const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|
                        not read a system prompt (or a conversation it resumes)
                        again (default: not kept)
   --prompt-cache-gb F  disk the prompt states may take (default 4)
+  --park-gb F          host RAM where Qwen3.8-Flash-Next sets aside the conversation it is
+                       about to lose to another, so that one that comes back does not read
+                       its prompt again (default 8; never more than half of what is free;
+                       0 = off)
   --cpu-threads N      CPU threads for experts that miss VRAM (default 24; 0 = off)
   --lora NAME=DIR[@X]         LoRA adapter for an Orca or Flash-Next model alias (a PEFT
                               folder; for Flash-Next also a llama.cpp .gguf LoRA); repeat
@@ -210,6 +214,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Options, Stri
             "--checkpoints" => a.checkpoints = num(val()?)?,
             "--prompt-cache" => a.prompt_cache = Some(val()?.into()),
             "--prompt-cache-gb" => a.prompt_cache_gb = val()?.parse().map_err(|_| "--prompt-cache-gb: not a number".to_string())?,
+            "--park-gb" => a.park_gb = val()?.parse().ok().filter(|gb: &f64| gb.is_finite() && *gb >= 0.0).ok_or("--park-gb: a number of GB, 0 or more")?,
             "--cpu-threads" => {
                 let n = num(val()?)?;
                 a.cpu_threads = if n == 0 { None } else { Some(n) };
@@ -254,6 +259,17 @@ mod tests {
         assert_eq!(a.ternary_experts["other"], std::path::PathBuf::from("packed2"));
         assert_eq!(a.tool_expert_sources["other"], std::path::PathBuf::from("source"));
         assert!(parse_args_from(["--model", "copy", "--also-ternary", "bad"].into_iter().map(str::to_owned)).is_err());
+    }
+    #[test]
+    fn park_gb_defaults_to_eight_and_zero_turns_it_off() {
+        let parse = |extra: &[&str]| parse_args_from(["--model", "m"].into_iter().chain(extra.iter().copied()).map(str::to_owned));
+        assert_eq!(parse(&[]).unwrap().park_gb, 8.0);
+        assert_eq!(parse(&["--park-gb", "2.5"]).unwrap().park_gb, 2.5);
+        assert_eq!(parse(&["--park-gb", "0"]).unwrap().park_gb, 0.0);
+        for bad in ["-1", "many", "NaN", "inf", ""] {
+            assert!(parse(&["--park-gb", bad]).is_err(), "{bad:?}");
+        }
+        assert!(parse(&["--park-gb"]).is_err());
     }
 }
 

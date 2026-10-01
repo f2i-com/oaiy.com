@@ -620,7 +620,14 @@ impl Models {
             Some(mm)
         } else { None };
         let (jobs, rx) = std::sync::mpsc::channel();
-        let e = crate::qwen::QwenEngine::new(crate::qwen::Hybrid::Flash(Box::new(model)), projector, max_seq, !o.quiet && !o.silent);
+        // Flash-Next keeps one conversation on the GPUs and nothing on disk: the conversations it
+        // sets aside (a runner and its call's sub-agent taking turns) wait in host RAM, within
+        // --park-gb and never more than half of what is free.
+        let park = crate::qwen_park::budget(o.park_gb, ggml_rs_cuda::host_memory().map(|(free, _)| free as u64));
+        if park > 0 {
+            self.say(format!("Flash-Next: conversations it sets aside wait in host RAM, up to {:.1} GB (--park-gb)", park as f64 / 1e9));
+        }
+        let e = crate::qwen::QwenEngine::new(crate::qwen::Hybrid::Flash(Box::new(model)), projector, max_seq, !o.quiet && !o.silent).park_up_to(park);
         let thread = std::thread::Builder::new().name("flashnext-model".into()).spawn(move || e.run(rx))?;
         Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Qwen(tok)) })
     }

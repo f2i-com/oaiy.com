@@ -58,6 +58,83 @@ For example, `chenrm/qwen3.8-flash-next-abliterated-lora` (rank 2, 2,656 project
 attention and DeltaNet outputs, the shared experts' down projections, and every expert's
 down projection in five layers) loads in the same time and decodes at about 103 tokens/s.
 
+## Two conversations on one model
+
+The engine keeps one conversation's state on the GPUs (the cache, and the checkpoints it
+returns to at message boundaries) and nothing on disk. When two conversations take turns on
+it (a runner and a call's sub-agent that share only a short system prompt), each one's prompt
+is read again at every switch: 31 to 36 s of prefill for 20,000 to 21,000 tokens, where the
+conversation alone is cached and takes under a second.
+
+So a state the engine is about to lose is copied to host RAM first, and comes back when a later
+prompt continues it. `--park-gb` bounds the RAM (default 8, never more than half of what is
+free, 0 = off); Studio's `llm.park_gb` passes it when it is set (`null` leaves the server's own
+default, and an older server that does not know the flag still starts).
+
+Measured on 1 Oct 2026 on the owner's two-GPU machine, one run, the model loaded on both GPUs:
+
+| | |
+|---|---|
+| A state of 20.3k tokens | 1.7 GB, checkpoints included (5.3k tokens: 0.44 GB) |
+| Parking it | 0.17 to 0.20 s (0.60 s once, right after the model had been loaded) |
+| Restoring it | 0.15 s (the 5.3k-token one: 0.055 s) |
+| The whole `Qwen cache:` line of a swap-in | 0.21 to 0.26 s, against 31 to 36 s of prefill before |
+| Six requests, A1 B1 A2 B2 A3 B3 (a 20k and a 5k conversation) | every switch from `ram`, 96 tokens read each time |
+| A2 after a swap against A2 without one | the same text, byte for byte (fresh servers) |
+
+While a state is copied the engine holds a K slice and a V slice of one attention slot on the
+device at once, 86 MB at 21,000 tokens (43 MB each); a restore uploads one slice at a time. The
+tighter GPU has about 2 GB free with the model loaded, so both are small beside it; a copy that the
+device refuses falls back to reading the prompt.
+
+- It happens only when the engine displaces a state, never after each turn: a prompt that
+  continues a stashed state sets the live one aside and brings that one back; a prompt that
+  shares less than half of a big live state sets that one aside before it throws it away (or
+  rolls it back to a checkpoint and writes over it, when the conversations share a system
+  prompt that ends at a message boundary; then the stash gets copies, because the new prompt
+  still needs the checkpoint). A conversation that branches (a larger share) is the
+  checkpoints' business, as before.
+- A state shorter than 1,024 tokens is not kept, and one is brought back only when it saves
+  1,024 tokens or more than the live one does.
+- The one set aside longest ago goes first when the budget is full.
+- An incognito request neither takes from the stash nor adds to it, and when an incognito
+  request or session ends the stash is emptied with the rest of what the engine holds.
+- A copy that cannot be made or put back (a cache of another shape, a device that refuses the
+  memory) falls back to reading the prompt, as before. Nothing else about a request changes.
+- The log says so: `Qwen park: stashed N tokens (X MB) in Ys; M states, Z MB held`, `Qwen
+  restore: N tokens (X MB) in Ys`, and `Qwen cache: S/N tokens from ram (common C) in Ys`, where
+  that time includes the copies. The reply's `cache_source` is `ram`.
+
+The decode graphs need nothing from a restore: every step captures its graph again from the
+buffers at hand and updates the old one to the new addresses, so the caches may be grown or
+replaced between steps, which is also what a restore does (through the same `reserve_layer`).
+The Qwen3.5 hybrid and the other engines are not changed.
+
+### Checking it
+
+The logic runs on the CPU, with no model: `cargo test -p oaiy-llm-server --lib qwen` (set
+`CUDA_VISIBLE_DEVICES=-1` if the GPUs are in use). That includes `qwen_real.rs`, which drives the real
+`QwenEngine::run` with a fake model whose answers depend on every row and recurrent tensor of the
+cache, and compares an engine that sets conversations aside with one that does not over randomized
+scripts (`PARK_FUZZ_SEEDS` sets how many). `cuda_round_trip_is_bit_exact_on_the_real_devices` is
+ignored: it opens a CUDA context on devices 0 and 1, so run it only with the model stopped.
+
+On the real model, `crates/oaiy-llm-server/tools/verify_parking.py` (loopback only, synthetic
+text; its own logic is tested against `tools/mock_server.py` with `python -m unittest
+tools/test_verify_parking.py`). It needs a short model restart, so ask first:
+
+1. Put the new `oaiy-llm-server.exe` in place: `POST http://127.0.0.1:7860/api/llm/stop`, copy
+   the exe over `target\release\oaiy-llm-server.exe`, and the next request starts it (the
+   Studio's Incognito setting must be off).
+2. `python verify_parking.py --mode calibrate`, then `--mode sequence` with the notes it prints:
+   A1 B1 A2 B2 A3 B3, which should all be `ram` after the first round, each with only the new
+   turn read. A request of someone else's in the middle makes the run INCONCLUSIVE.
+3. Three runs, each on a freshly started model (`--restart` stops it first): `--mode reference`
+   (A1 A2, no swap), `--mode swapped` (A1 B1 A2), and a second `--mode reference`. Then
+   `--mode compare` on the first two (PASS when A2 answers byte for byte the same, VACUOUS when
+   A2 did not come from `ram`) and `--mode compare --baseline` on the two references (whether the
+   engine reproduces itself across restarts, without which a difference means nothing).
+
 ## The architecture
 
 It is the Qwen3.5 MoE lineage: 48 layers, three Gated DeltaNet layers to each full
