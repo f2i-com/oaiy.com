@@ -130,9 +130,9 @@ final class Holds
         // them at once is refused, so that one principal opening streams in a burst cannot occupy the pool one dying stream at a time.
         if ($maxInFlight > 0 && $samePrincipal >= $maxInFlight) {
             $hold->release();
-            throw new ApiError(429, 'rate_limited', null, 1);
+            throw (new ApiError(429, 'rate_limited', null, 1))->rule('in_flight');
         }
-        $limit = $class === 'core' ? $this->eff->heldHard : $this->eff->heldSoft;
+        $limit =$class === 'core' ? $this->eff->heldHard : $this->eff->heldSoft;
         // A calibration hold is refused only by its per-credential cap: its purpose is to fill the pool and see where it stops.
         if ($kind !== 'admin' && $others >= $limit) {
             $hold->release();

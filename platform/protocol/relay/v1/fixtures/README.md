@@ -13,6 +13,8 @@ box is not one of those: its ephemeral key is random, so no two are alike. The f
 | `verify_fixtures.py`, `verify_fixtures.mjs` | two independent checks of the two files above, with no libsodium | the conformance suite (`../../../tests/relay_conformance.py`) |
 | `selftest_fixtures.py` | runs those two checks on sixteen damaged copies of the two files (a flipped bit, a wrong hash, a bad receipt, a good box among the refused ones, ...) and requires each to refuse each | the conformance suite |
 | `aokie/` | what the relay answers to the shipped Aokie plugin and phone (admissions, challenges, frames, streams, errors, ICE) and the rules of their decoders applied to it; its own [`README.md`](aokie/README.md) | a Rust contract test in the Aokie repository, and the conformance suite |
+| `poll-client/poll-client.json` | **not a recording**: a hand-written table of what the poll loop of a native client does with each answer of the relay (rules P1 to P8 of `README.md` section 5.1.1) | the desktop's relay client (DK-03), the phone's (MOB-21a), and the two readers below |
+| `poll-client/verify_poll_client.py`, `poll-client/verify_poll_client.mjs` | two readings of those rules, written from the README alone in two languages, each recomputing every case of the table; the conformance suite also runs both on thirteen damaged tables and requires each to refuse each | the conformance suite |
 
 Regenerate with `php platform/relay/tests/fixtures.php --write` (it drives the relay in a temporary directory on loopback and
 overwrites the files: the sealed boxes and tokens change, so commit the result). `php platform/relay/tests/fixtures.php --check`
@@ -74,3 +76,25 @@ phone's relay device id and the sealed token.
 
 The verifiers re-derive the pid, both MACs, both signatures, the canonical receipt document and the SAS from the secret and the
 keys, and open the sealed token.
+
+## `poll-client/poll-client.json`
+
+Not a recording of the relay: the relay's own side of these rules (`error.rule` on the two refusals of a poll, the pause it asks for) is
+tested in `platform/relay/tests/`. This is the other side, what a client does with an answer, so that the desktop's client (DK-03) and
+the phone's (MOB-21a) can be tested against the same table before there is a relay to poll. `cases` is a list; each case has an `id`, the
+`rule` of README section 5.1.1 it checks (`P1` to `P8`), and either
+
+- `replace`: `{ "msSinceLastStart": n }`, and `expect.waitMs`: how long a client that cancels a running poll waits before it starts the
+  next (P1); or
+- `state`: the client's counters before the answer (`n429`, `nFail`, `nRefused`), `info` (`pollGapMs` and `fallbackS` as `GET /v1/info`
+  gave them), `response` (`status` or `null` with a `transport` word when nothing came back, `headers` with lower-case names, `body` as
+  parsed JSON or `null`), `u` (the jitter draw, 0 up to but not including 1), and optionally `nowEpoch` (the client's own clock, for a
+  `Retry-After` that is an HTTP-date with no usable `Date` header) and `weReplaced: false` (the poll answered `superseded` was not
+  replaced by this client); and `expect`: the `outcome` (`progress`, `superseded`, `idle`, `flow`, `failure` or `stop`), `baseS` (the
+  pause before jitter, in seconds), `pauseS` (after: `baseS * (1 + 0.2 * u)`), the `state` after, the `action` a `stop` leads to
+  (`forget_credential`, `refresh_or_reenrol`, `update_client` or `report_defect`) and the `report` (`unreachable`,
+  `in_flight_defect`, `duplicate_credential`).
+
+A reader loads the file, runs every case through its own implementation of the rules and compares all six members; `python
+poll-client/verify_poll_client.py` and `node poll-client/verify_poll_client.mjs` each print `N checks, 0 mismatches` (and take `--file`
+to read another copy, which is how the conformance suite shows that they are not vacuous).

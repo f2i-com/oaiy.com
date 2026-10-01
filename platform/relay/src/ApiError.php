@@ -18,6 +18,11 @@ final class ApiError extends \RuntimeException
     /** The relay's clock and the host's at the moment it was decided (not when it was logged). */
     public ?int $decidedAt = null;
     public ?int $decidedReal = null;
+    /**
+     * Which rule refused a consumer poll with 429, for the client to tell them apart: 'gap' (a tight loop that makes no progress) or
+     * 'in_flight' (more polls of the device running than the bound). Shown as `error.rule` on the native routes; null on every other error.
+     */
+    public ?string $rule = null;
 
     public function __construct(int $status, string $code, ?string $message = null, ?int $retryAfter = null)
     {
@@ -30,6 +35,13 @@ final class ApiError extends \RuntimeException
     public static function make(string $code, ?int $retryAfter = null, ?string $message = null): self
     {
         return new self(Errors::status($code), $code, $message, $retryAfter);
+    }
+
+    /** Name the poll rule that refused this 429 (see $rule). Returns $this, to be thrown. */
+    public function rule(string $rule): self
+    {
+        $this->rule = $rule;
+        return $this;
     }
 
     /** 503 unavailable for a database that is busy or cannot be opened: marked so that the compatibility routes can answer as they must. */

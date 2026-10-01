@@ -553,6 +553,7 @@ test('4.7.2 rule 5: the fifth waiting lookup of a device is 429 at once while fo
     eq(429, $fifth['status'], $fifth['body']);
     eq('rate_limited', $fifth['json']['error']['code']);
     eq('1', $fifth['headers']['retry-after']);
+    ok(!array_key_exists('rule', $fifth['json']['error']), 'a lookup is not a consumer poll: its 429 names no poll rule');
     // The four are still held and none was superseded.
     foreach ($held as $i => $h) {
         $res = holds_finish($h, 8.0);
@@ -589,7 +590,7 @@ test('4.7.2 rule 5: a credential has at most three polls that wait running at on
         eq($i, $holds->inFlight('poll', $phone->id), "$i running");
     }
     $e = throws(fn() => $holds->acquire('poll', $phone->id, 'edge', 8, 0, Holds::POLL_INFLIGHT_MAX), Oaiy\Relay\ApiError::class);
-    eq([429, 'rate_limited', 1], [$e->status, $e->errorCode, $e->retryAfter]);
+    eq([429, 'rate_limited', 1, 'in_flight'], [$e->status, $e->errorCode, $e->retryAfter, $e->rule]);
     eq(3, $holds->inFlight('poll', $phone->id), 'the refused one left no marker');
     eq(0, $holds->inFlight('poll', $d->id), 'another credential is not counted');
     // Through the whole request, with three polls running (their markers, as a running poll leaves them): the fourth is refused at once,
@@ -602,6 +603,7 @@ test('4.7.2 rule 5: a credential has at most three polls that wait running at on
     ok(microtime(true) - $t < 1.0, 'refused at once, not after a wait');
     eq(429, $res['status'], $res['body']);
     eq('rate_limited', $res['json']['error']['code'] ?? null);
+    eq('in_flight', $res['json']['error']['rule'] ?? null, 'the answer says which rule refused the poll (README 5.1.1, rule P4)');
     eq('1', $res['headers']['retry-after']);
     eq(3, $holds->inFlight('poll', $phone->id), 'and took no place');
     eq($before, [$db->val('SELECT last_poll_at FROM devices WHERE id = ?', [$phone->id]), $signals->readGen($phone->id)], 'a refusal wrote neither presence nor the generation');

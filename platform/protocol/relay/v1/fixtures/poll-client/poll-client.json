@@ -1,0 +1,3506 @@
+{
+ "version": 1,
+ "about": "Known answers for the poll loop of a native client (README section 5.1.1: DK-03, MOB-21a). Each case gives the client's counters before the answer, what the relay answered (or that nothing came), the jitter draw u, and what the rules lead to: the outcome (P2), the pause before jitter and after it (P3, P5, P6), the counters after, what the loop does when it ends (P8) and what it reports (P7). A case with `replace` is rule P1 (the earliest a replacement poll may start). Both readers recompute every case from the rules, not from this file's other cases.",
+ "constants": {
+  "replaceMinMs": 250,
+  "clampMin": 1,
+  "clampMax": 120,
+  "retryAfterBodyMax": 86400,
+  "jitter": 0.2,
+  "backoff429Cap": 30,
+  "backoffFailureCap": 60,
+  "unreachableAfter": 3,
+  "inFlightDefectAfter": 5,
+  "refusedHoldDefaultS": 2
+ },
+ "cases": [
+  {
+   "id": "p1-replace-at-once",
+   "rule": "P1",
+   "what": "a client that cancels a running poll and starts another waits until 250 ms have passed since it started the first (0 ms have)",
+   "replace": {
+    "msSinceLastStart": 0
+   },
+   "expect": {
+    "waitMs": 250
+   }
+  },
+  {
+   "id": "p1-replace-100ms",
+   "rule": "P1",
+   "what": "a client that cancels a running poll and starts another waits until 250 ms have passed since it started the first (100 ms have)",
+   "replace": {
+    "msSinceLastStart": 100
+   },
+   "expect": {
+    "waitMs": 150
+   }
+  },
+  {
+   "id": "p1-replace-249ms",
+   "rule": "P1",
+   "what": "a client that cancels a running poll and starts another waits until 250 ms have passed since it started the first (249 ms have)",
+   "replace": {
+    "msSinceLastStart": 249
+   },
+   "expect": {
+    "waitMs": 1
+   }
+  },
+  {
+   "id": "p1-replace-250ms",
+   "rule": "P1",
+   "what": "a client that cancels a running poll and starts another waits until 250 ms have passed since it started the first (250 ms have)",
+   "replace": {
+    "msSinceLastStart": 250
+   },
+   "expect": {
+    "waitMs": 0
+   }
+  },
+  {
+   "id": "p1-replace-later",
+   "rule": "P1",
+   "what": "a client that cancels a running poll and starts another waits until 250 ms have passed since it started the first (5000 ms have)",
+   "replace": {
+    "msSinceLastStart": 5000
+   },
+   "expect": {
+    "waitMs": 0
+   }
+  },
+  {
+   "id": "p2-progress",
+   "rule": "P2",
+   "what": "a 200 with an item is progress: no pause, every counter cleared",
+   "state": {
+    "n429": 3,
+    "nFail": 2,
+    "nRefused": 1
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "cursor": 1,
+     "items": [
+      {
+       "seq": 1
+      }
+     ],
+     "more": false,
+     "time": 1790000000
+    }
+   },
+   "expect": {
+    "outcome": "progress",
+    "baseS": 0,
+    "pauseS": 0,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p2-progress-reset",
+   "rule": "P2",
+   "what": "a 200 with reset:true and no items is progress too (the client adopts the cursor, section 5.1)",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 2
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "cursor": 0,
+     "items": [],
+     "more": false,
+     "time": 1790000000,
+     "reset": true
+    }
+   },
+   "expect": {
+    "outcome": "progress",
+    "baseS": 0,
+    "pauseS": 0,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p3-idle-default-gap",
+   "rule": "P3",
+   "what": "an empty 200 is idle: wait info.wait.pollGapMs (250 ms) before the next poll",
+   "state": {
+    "n429": 2,
+    "nFail": 1,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "cursor": 0,
+     "items": [],
+     "more": false,
+     "time": 1790000000
+    }
+   },
+   "expect": {
+    "outcome": "idle",
+    "baseS": 0.25,
+    "pauseS": 0.25,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p3-idle-jitter-half",
+   "rule": "P6",
+   "what": "the pause is the base plus up to 20 percent of it: u = 0.5 adds 10 percent",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.5,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "cursor": 0,
+     "items": [],
+     "more": false,
+     "time": 1790000000
+    }
+   },
+   "expect": {
+    "outcome": "idle",
+    "baseS": 0.25,
+    "pauseS": 0.275,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p3-idle-gap-zero",
+   "rule": "P3",
+   "what": "a relay whose gap is 0 asks for no pause",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 0,
+    "fallbackS": 5
+   },
+   "u": 0.9,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "cursor": 0,
+     "items": [],
+     "more": false,
+     "time": 1790000000
+    }
+   },
+   "expect": {
+    "outcome": "idle",
+    "baseS": 0,
+    "pauseS": 0,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p3-idle-gap-5s",
+   "rule": "P3",
+   "what": "the longest gap the relay allows is 5000 ms",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 5000,
+    "fallbackS": 5
+   },
+   "u": 0.5,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "cursor": 0,
+     "items": [],
+     "more": false,
+     "time": 1790000000
+    }
+   },
+   "expect": {
+    "outcome": "idle",
+    "baseS": 5.0,
+    "pauseS": 5.5,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p2-superseded-ours",
+   "rule": "P2",
+   "what": "a poll this client replaced answers superseded: discarded, no pause, nothing started",
+   "state": {
+    "n429": 1,
+    "nFail": 1,
+    "nRefused": 1
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "cursor": 0,
+     "items": [],
+     "more": false,
+     "time": 1790000000,
+     "hold": {
+      "granted": true,
+      "superseded": true
+     }
+    }
+   },
+   "expect": {
+    "outcome": "superseded",
+    "baseS": 0,
+    "pauseS": 0,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p2-superseded-not-ours",
+   "rule": "P2",
+   "what": "a poll this client did not replace was replaced by another process of the same credential: reported",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "cursor": 0,
+     "items": [],
+     "more": false,
+     "time": 1790000000,
+     "hold": {
+      "granted": true,
+      "superseded": true
+     }
+    }
+   },
+   "expect": {
+    "outcome": "superseded",
+    "baseS": 0,
+    "pauseS": 0,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": [
+     "duplicate_credential"
+    ]
+   },
+   "weReplaced": false
+  },
+  {
+   "id": "p3-refused-first",
+   "rule": "P3",
+   "what": "a refused hold is idle: the first pause is hold.retryAfter",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "cursor": 0,
+     "items": [],
+     "more": false,
+     "time": 1790000000,
+     "hold": {
+      "refused": true,
+      "retryAfter": 2
+     }
+    }
+   },
+   "expect": {
+    "outcome": "idle",
+    "baseS": 2,
+    "pauseS": 2,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 1
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p3-refused-second",
+   "rule": "P3",
+   "what": "the second refused hold in a row doubles the pause",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 1
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "cursor": 0,
+     "items": [],
+     "more": false,
+     "time": 1790000000,
+     "hold": {
+      "refused": true,
+      "retryAfter": 2
+     }
+    }
+   },
+   "expect": {
+    "outcome": "idle",
+    "baseS": 4,
+    "pauseS": 4,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 2
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p3-refused-third",
+   "rule": "P3",
+   "what": "the third reaches info.wait.fallbackS (5), not 8",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 2
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "cursor": 0,
+     "items": [],
+     "more": false,
+     "time": 1790000000,
+     "hold": {
+      "refused": true,
+      "retryAfter": 2
+     }
+    }
+   },
+   "expect": {
+    "outcome": "idle",
+    "baseS": 5,
+    "pauseS": 5,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 3
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p3-refused-tenth",
+   "rule": "P3",
+   "what": "and stays there",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 9
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "cursor": 0,
+     "items": [],
+     "more": false,
+     "time": 1790000000,
+     "hold": {
+      "refused": true,
+      "retryAfter": 2
+     }
+    }
+   },
+   "expect": {
+    "outcome": "idle",
+    "baseS": 5,
+    "pauseS": 5,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 10
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p3-refused-no-retryafter",
+   "rule": "P3",
+   "what": "a refused hold with no retryAfter is read as 2",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "cursor": 0,
+     "items": [],
+     "more": false,
+     "time": 1790000000,
+     "hold": {
+      "refused": true
+     }
+    }
+   },
+   "expect": {
+    "outcome": "idle",
+    "baseS": 2,
+    "pauseS": 2,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 1
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p3-refused-long-retryafter",
+   "rule": "P3",
+   "what": "a retryAfter beyond the fallback is honoured, never shortened",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "cursor": 0,
+     "items": [],
+     "more": false,
+     "time": 1790000000,
+     "hold": {
+      "refused": true,
+      "retryAfter": 30
+     }
+    }
+   },
+   "expect": {
+    "outcome": "idle",
+    "baseS": 30,
+    "pauseS": 30,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 1
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p3-refused-zero-retryafter",
+   "rule": "P3",
+   "what": "a retryAfter of 0 is clamped to 1",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "cursor": 0,
+     "items": [],
+     "more": false,
+     "time": 1790000000,
+     "hold": {
+      "refused": true,
+      "retryAfter": 0
+     }
+    }
+   },
+   "expect": {
+    "outcome": "idle",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 1
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p3-granted-clears-refused",
+   "rule": "P3",
+   "what": "a granted hold that ends empty is idle and clears the count of refused holds",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 4
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "cursor": 0,
+     "items": [],
+     "more": false,
+     "time": 1790000000,
+     "hold": {
+      "granted": true
+     }
+    }
+   },
+   "expect": {
+    "outcome": "idle",
+    "baseS": 0.25,
+    "pauseS": 0.25,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p2-200-text",
+   "rule": "P2",
+   "what": "a 200 whose body is not a JSON object is a failure: pause 1, the failure count rises",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": "ok"
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p2-200-null",
+   "rule": "P2",
+   "what": "a 200 whose body is empty or not JSON is a failure: pause 1, the failure count rises",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": null
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p2-200-no-items",
+   "rule": "P2",
+   "what": "a 200 object without items is a failure: pause 1, the failure count rises",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1
+    }
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p2-200-items-object",
+   "rule": "P2",
+   "what": "a 200 whose items is not an array is a failure: pause 1, the failure count rises",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "items": {}
+    }
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p4-gap-first",
+   "rule": "P4",
+   "what": "the gap rule's 429 (Retry-After 1) is flow control: pause 1, the 429 count rises, the failure count is cleared",
+   "state": {
+    "n429": 0,
+    "nFail": 2,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "1"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 1,
+      "rule": "gap"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p5-429-after-1",
+   "rule": "P5",
+   "what": "the 2th 429 in a row (Retry-After 1) pauses 2 seconds",
+   "state": {
+    "n429": 1,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "1"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 1,
+      "rule": "in_flight"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 2,
+    "pauseS": 2,
+    "state": {
+     "n429": 2,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p5-429-after-2",
+   "rule": "P5",
+   "what": "the 3th 429 in a row (Retry-After 1) pauses 4 seconds",
+   "state": {
+    "n429": 2,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "1"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 1,
+      "rule": "in_flight"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 4,
+    "pauseS": 4,
+    "state": {
+     "n429": 3,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p5-429-after-3",
+   "rule": "P5",
+   "what": "the 4th 429 in a row (Retry-After 1) pauses 8 seconds",
+   "state": {
+    "n429": 3,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "1"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 1,
+      "rule": "in_flight"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 8,
+    "pauseS": 8,
+    "state": {
+     "n429": 4,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p5-429-after-4",
+   "rule": "P5",
+   "what": "the 5th 429 in a row (Retry-After 1) pauses 16 seconds",
+   "state": {
+    "n429": 4,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "1"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 1,
+      "rule": "in_flight"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 16,
+    "pauseS": 16,
+    "state": {
+     "n429": 5,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": [
+     "in_flight_defect"
+    ]
+   }
+  },
+  {
+   "id": "p5-429-after-5",
+   "rule": "P5",
+   "what": "the 6th 429 in a row (Retry-After 1) pauses 30 seconds",
+   "state": {
+    "n429": 5,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "1"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 1,
+      "rule": "in_flight"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 30,
+    "pauseS": 30,
+    "state": {
+     "n429": 6,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p5-429-after-8",
+   "rule": "P5",
+   "what": "the 9th 429 in a row (Retry-After 1) pauses 30 seconds",
+   "state": {
+    "n429": 8,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "1"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 1,
+      "rule": "in_flight"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 30,
+    "pauseS": 30,
+    "state": {
+     "n429": 9,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p5-429-after-30",
+   "rule": "P5",
+   "what": "the 31th 429 in a row (Retry-After 1) pauses 30 seconds",
+   "state": {
+    "n429": 30,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "1"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 1,
+      "rule": "in_flight"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 30,
+    "pauseS": 30,
+    "state": {
+     "n429": 31,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p5-429-5-in-flight",
+   "rule": "P7",
+   "what": "the fifth 429 in a row with rule in_flight is a defect to report",
+   "state": {
+    "n429": 4,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "1"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 1,
+      "rule": "in_flight"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 16,
+    "pauseS": 16,
+    "state": {
+     "n429": 5,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": [
+     "in_flight_defect"
+    ]
+   }
+  },
+  {
+   "id": "p7-429-4-in-flight",
+   "rule": "P7",
+   "what": "the fourth is not yet",
+   "state": {
+    "n429": 3,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "1"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 1,
+      "rule": "in_flight"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 8,
+    "pauseS": 8,
+    "state": {
+     "n429": 4,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p7-429-5-gap",
+   "rule": "P7",
+   "what": "five 429s of the gap rule are not that defect (they are the pause of P3 not being kept, which P4 says)",
+   "state": {
+    "n429": 4,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "1"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 1,
+      "rule": "gap"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 16,
+    "pauseS": 16,
+    "state": {
+     "n429": 5,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p7-429-6-in-flight",
+   "rule": "P7",
+   "what": "a sixth is reported no more (once)",
+   "state": {
+    "n429": 5,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "1"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 1,
+      "rule": "in_flight"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 30,
+    "pauseS": 30,
+    "state": {
+     "n429": 6,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p5-retryafter-longer",
+   "rule": "P5",
+   "what": "a Retry-After longer than the backoff is honoured: 7 seconds on the first 429",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "7"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 7,
+      "rule": "gap"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 7,
+    "pauseS": 7,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p5-backoff-longer",
+   "rule": "P5",
+   "what": "and a backoff longer than the Retry-After wins: the fourth 429 in a row pauses 8 seconds though the relay said 7",
+   "state": {
+    "n429": 3,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "7"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 7,
+      "rule": "gap"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 8,
+    "pauseS": 8,
+    "state": {
+     "n429": 4,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p6-clamp-high",
+   "rule": "P6",
+   "what": "a Retry-After of 600 is clamped to 120",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "600"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 600
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 120,
+    "pauseS": 120,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p6-clamp-jitter",
+   "rule": "P6",
+   "what": "and the jitter is added after the clamp: 120 with u = 0.9 is 141.6",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.9,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "600"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 600
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 120,
+    "pauseS": 141.6,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p6-clamp-low",
+   "rule": "P6",
+   "what": "a Retry-After of 0 is clamped to 1: a client never spins",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "0"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 0
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p6-body-only",
+   "rule": "P6",
+   "what": "no header: error.retryAfter is read",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {},
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 3
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 3,
+    "pauseS": 3,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p6-none",
+   "rule": "P6",
+   "what": "neither: 1 second for a 429",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {},
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p6-http-date",
+   "rule": "P6",
+   "what": "an HTTP-date is the seconds from the Date header of the answer: 10",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "Sun, 06 Nov 1994 08:49:47 GMT",
+     "date": "Sun, 06 Nov 1994 08:49:37 GMT"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 10,
+    "pauseS": 10,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p6-http-date-past",
+   "rule": "P6",
+   "what": "an HTTP-date that has passed is 0, so 1",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "Sun, 06 Nov 1994 08:49:30 GMT",
+     "date": "Sun, 06 Nov 1994 08:49:37 GMT"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p6-http-date-own-clock",
+   "rule": "P6",
+   "what": "with no Date header the client's own clock stands in: 7 seconds",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "Sun, 06 Nov 1994 08:49:37 GMT"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 7,
+    "pauseS": 7,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   },
+   "nowEpoch": 784111770
+  },
+  {
+   "id": "p6-http-date-bad-date-header",
+   "rule": "P6",
+   "what": "an unreadable Date header is as good as none: the client's own clock stands in (7 seconds), and the body's 4 is not read",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "Sun, 06 Nov 1994 08:49:37 GMT",
+     "date": "yesterday"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 4
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 7,
+    "pauseS": 7,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   },
+   "nowEpoch": 784111770
+  },
+  {
+   "id": "p6-garbage-header-body",
+   "rule": "P6",
+   "what": "a header that is text is no header: the body's 4 is read",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "soon"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 4
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 4,
+    "pauseS": 4,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p6-negative",
+   "rule": "P6",
+   "what": "a signed number is no header",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "-5"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p6-fraction",
+   "rule": "P6",
+   "what": "a fraction is no header",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "1.5"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 6
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 6,
+    "pauseS": 6,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p6-seven-digits",
+   "rule": "P6",
+   "what": "seven digits are no header",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "1234567"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p6-spaces",
+   "rule": "P6",
+   "what": "spaces around the digits are trimmed",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": " 9 "
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 9,
+    "pauseS": 9,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p6-leading-zeros",
+   "rule": "P6",
+   "what": "leading zeros are digits",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "0009"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 9,
+    "pauseS": 9,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p6-body-too-big",
+   "rule": "P6",
+   "what": "error.retryAfter above 86400 is not read",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {},
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 100000
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p6-body-bool",
+   "rule": "P6",
+   "what": "error.retryAfter that is a boolean is not read",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {},
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": true
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p4-unknown-rule",
+   "rule": "P4",
+   "what": "a rule the client does not know is treated as none",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "1"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 1,
+      "rule": "burst"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p4-bucket-no-rule",
+   "rule": "P4",
+   "what": "a bucket's 429 (no rule) is flow control too, and the pause is its Retry-After",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "5"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 5
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 5,
+    "pauseS": 5,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p4-not-json",
+   "rule": "P4",
+   "what": "a 429 from a proxy with an HTML body is flow control too",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "3"
+    },
+    "body": null
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 3,
+    "pauseS": 3,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p2-429-clears-failures",
+   "rule": "P2",
+   "what": "a 429 proves the relay answered: the failure count is cleared, the 429 count is not",
+   "state": {
+    "n429": 1,
+    "nFail": 5,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "1"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 1
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 2,
+    "pauseS": 2,
+    "state": {
+     "n429": 2,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p5-timeout-first",
+   "rule": "P5",
+   "what": "no response: the first failure pauses 1",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": null,
+    "transport": "timeout"
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p5-fail-second",
+   "rule": "P5",
+   "what": "the second pauses 2",
+   "state": {
+    "n429": 0,
+    "nFail": 1,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": null,
+    "transport": "reset"
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 2,
+    "pauseS": 2,
+    "state": {
+     "n429": 0,
+     "nFail": 2,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p7-fail-third",
+   "rule": "P7",
+   "what": "the third pauses 4 and the relay is reported unreachable",
+   "state": {
+    "n429": 0,
+    "nFail": 2,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": null,
+    "transport": "refused"
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 4,
+    "pauseS": 4,
+    "state": {
+     "n429": 0,
+     "nFail": 3,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": [
+     "unreachable"
+    ]
+   }
+  },
+  {
+   "id": "p7-fail-fourth",
+   "rule": "P7",
+   "what": "and the fourth reports it again (the report is a state, not an event: it holds until a success or a 429)",
+   "state": {
+    "n429": 0,
+    "nFail": 3,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": null,
+    "transport": "tls"
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 8,
+    "pauseS": 8,
+    "state": {
+     "n429": 0,
+     "nFail": 4,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": [
+     "unreachable"
+    ]
+   }
+  },
+  {
+   "id": "p5-fail-sixth",
+   "rule": "P5",
+   "what": "the sixth pauses 32",
+   "state": {
+    "n429": 0,
+    "nFail": 5,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": null,
+    "transport": "timeout"
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 32,
+    "pauseS": 32,
+    "state": {
+     "n429": 0,
+     "nFail": 6,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": [
+     "unreachable"
+    ]
+   }
+  },
+  {
+   "id": "p5-fail-seventh",
+   "rule": "P5",
+   "what": "the seventh is capped at 60",
+   "state": {
+    "n429": 0,
+    "nFail": 6,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": null,
+    "transport": "timeout"
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 60,
+    "pauseS": 60,
+    "state": {
+     "n429": 0,
+     "nFail": 7,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": [
+     "unreachable"
+    ]
+   }
+  },
+  {
+   "id": "p5-fail-twentieth",
+   "rule": "P5",
+   "what": "and stays at 60",
+   "state": {
+    "n429": 0,
+    "nFail": 19,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": null,
+    "transport": "timeout"
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 60,
+    "pauseS": 60,
+    "state": {
+     "n429": 0,
+     "nFail": 20,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": [
+     "unreachable"
+    ]
+   }
+  },
+  {
+   "id": "p2-failure-408",
+   "rule": "P2",
+   "what": "a 408 is a failure: pause 1, failure count 1",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 408,
+    "headers": {},
+    "body": {
+     "error": {
+      "code": "internal",
+      "message": "x"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p2-failure-500",
+   "rule": "P2",
+   "what": "a 500 is a failure: pause 1, failure count 1",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 500,
+    "headers": {},
+    "body": {
+     "error": {
+      "code": "internal",
+      "message": "x"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p2-failure-502",
+   "rule": "P2",
+   "what": "a 502 is a failure: pause 1, failure count 1",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 502,
+    "headers": {},
+    "body": {
+     "error": {
+      "code": "internal",
+      "message": "x"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p2-failure-504",
+   "rule": "P2",
+   "what": "a 504 is a failure: pause 1, failure count 1",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 504,
+    "headers": {},
+    "body": {
+     "error": {
+      "code": "internal",
+      "message": "x"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p2-failure-501",
+   "rule": "P2",
+   "what": "a 501 is a failure: pause 1, failure count 1",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 501,
+    "headers": {},
+    "body": {
+     "error": {
+      "code": "internal",
+      "message": "x"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p2-failure-505",
+   "rule": "P2",
+   "what": "a 505 is a failure: pause 1, failure count 1",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 505,
+    "headers": {},
+    "body": {
+     "error": {
+      "code": "internal",
+      "message": "x"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p5-503-retryafter",
+   "rule": "P5",
+   "what": "a 503 with Retry-After 30 pauses 30",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 503,
+    "headers": {
+     "retry-after": "30"
+    },
+    "body": {
+     "error": {
+      "code": "unavailable",
+      "message": "x",
+      "retryAfter": 30
+     }
+    }
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 30,
+    "pauseS": 30,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p5-503-retryafter-clamped",
+   "rule": "P5",
+   "what": "a Retry-After of 600 on a 503 is 120",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 503,
+    "headers": {
+     "retry-after": "600"
+    },
+    "body": {
+     "error": {
+      "code": "unavailable",
+      "message": "x",
+      "retryAfter": 600
+     }
+    }
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 120,
+    "pauseS": 120,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p5-503-no-retryafter",
+   "rule": "P5",
+   "what": "a 503 with no Retry-After pauses by the backoff alone",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 503,
+    "headers": {},
+    "body": {
+     "error": {
+      "code": "unavailable",
+      "message": "x"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p5-503-backoff-wins",
+   "rule": "P5",
+   "what": "a 503's Retry-After 2 does not shorten the fourth failure's 8",
+   "state": {
+    "n429": 0,
+    "nFail": 3,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 503,
+    "headers": {
+     "retry-after": "2"
+    },
+    "body": {
+     "error": {
+      "code": "unavailable",
+      "message": "x",
+      "retryAfter": 2
+     }
+    }
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 8,
+    "pauseS": 8,
+    "state": {
+     "n429": 0,
+     "nFail": 4,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": [
+     "unreachable"
+    ]
+   }
+  },
+  {
+   "id": "p2-failure-redirect",
+   "rule": "P2",
+   "what": "a 301 is a failure and is not followed",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 301,
+    "headers": {
+     "location": "https://elsewhere.example/"
+    },
+    "body": null
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p2-failure-clears-429",
+   "rule": "P2",
+   "what": "a failure clears the 429 count",
+   "state": {
+    "n429": 6,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": null,
+    "transport": "timeout"
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p5-fail-jitter",
+   "rule": "P6",
+   "what": "the jitter applies to failures too: a 4 second pause with u = 0.25 is 4.2",
+   "state": {
+    "n429": 0,
+    "nFail": 2,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.25,
+   "response": {
+    "status": null,
+    "transport": "timeout"
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 4,
+    "pauseS": 4.2,
+    "state": {
+     "n429": 0,
+     "nFail": 3,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": [
+     "unreachable"
+    ]
+   }
+  },
+  {
+   "id": "p7-success-clears-failures",
+   "rule": "P7",
+   "what": "any success clears the failure count (and with it the report)",
+   "state": {
+    "n429": 0,
+    "nFail": 9,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "cursor": 0,
+     "items": [],
+     "more": false,
+     "time": 1790000000
+    }
+   },
+   "expect": {
+    "outcome": "idle",
+    "baseS": 0.25,
+    "pauseS": 0.25,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p8-401-unauthorized",
+   "rule": "P8",
+   "what": "401 unauthorized: the credential is not accepted: refresh it once or enrol again; the loop does not retry",
+   "state": {
+    "n429": 2,
+    "nFail": 1,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 401,
+    "headers": {
+     "www-authenticate": "Bearer realm=\"oaiy-relay\""
+    },
+    "body": {
+     "error": {
+      "code": "unauthorized",
+      "message": "x"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "stop",
+    "baseS": 0,
+    "pauseS": 0,
+    "state": {
+     "n429": 2,
+     "nFail": 1,
+     "nRefused": 0
+    },
+    "action": "refresh_or_reenrol",
+    "report": []
+   }
+  },
+  {
+   "id": "p8-401-revoked",
+   "rule": "P8",
+   "what": "401 revoked: the device was revoked: forget the credential",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 401,
+    "headers": {},
+    "body": {
+     "error": {
+      "code": "revoked",
+      "message": "x"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "stop",
+    "baseS": 0,
+    "pauseS": 0,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": "forget_credential",
+    "report": []
+   }
+  },
+  {
+   "id": "p8-426",
+   "rule": "P8",
+   "what": "426: end the loop and tell the user to update",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 426,
+    "headers": {},
+    "body": {
+     "error": {
+      "code": "upgrade_required",
+      "message": "x"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "stop",
+    "baseS": 0,
+    "pauseS": 0,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": "update_client",
+    "report": []
+   }
+  },
+  {
+   "id": "p8-400-invalid_request",
+   "rule": "P8",
+   "what": "400 invalid_request: a defect of the client or a relay that is off: end the loop and report the code",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 400,
+    "headers": {},
+    "body": {
+     "error": {
+      "code": "invalid_request",
+      "message": "x"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "stop",
+    "baseS": 0,
+    "pauseS": 0,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": "report_defect",
+    "report": []
+   }
+  },
+  {
+   "id": "p8-403-forbidden",
+   "rule": "P8",
+   "what": "403 forbidden: a defect of the client or a relay that is off: end the loop and report the code",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 403,
+    "headers": {},
+    "body": {
+     "error": {
+      "code": "forbidden",
+      "message": "x"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "stop",
+    "baseS": 0,
+    "pauseS": 0,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": "report_defect",
+    "report": []
+   }
+  },
+  {
+   "id": "p8-403-feature_disabled",
+   "rule": "P8",
+   "what": "403 feature_disabled: a defect of the client or a relay that is off: end the loop and report the code",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 403,
+    "headers": {},
+    "body": {
+     "error": {
+      "code": "feature_disabled",
+      "message": "x"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "stop",
+    "baseS": 0,
+    "pauseS": 0,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": "report_defect",
+    "report": []
+   }
+  },
+  {
+   "id": "p8-404-not_found",
+   "rule": "P8",
+   "what": "404 not_found: a defect of the client or a relay that is off: end the loop and report the code",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 404,
+    "headers": {},
+    "body": {
+     "error": {
+      "code": "not_found",
+      "message": "x"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "stop",
+    "baseS": 0,
+    "pauseS": 0,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": "report_defect",
+    "report": []
+   }
+  },
+  {
+   "id": "p8-405-method_not_allowed",
+   "rule": "P8",
+   "what": "405 method_not_allowed: a defect of the client or a relay that is off: end the loop and report the code",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 405,
+    "headers": {},
+    "body": {
+     "error": {
+      "code": "method_not_allowed",
+      "message": "x"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "stop",
+    "baseS": 0,
+    "pauseS": 0,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": "report_defect",
+    "report": []
+   }
+  },
+  {
+   "id": "p8-413-item_too_large",
+   "rule": "P8",
+   "what": "413 item_too_large: a defect of the client or a relay that is off: end the loop and report the code",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 413,
+    "headers": {},
+    "body": {
+     "error": {
+      "code": "item_too_large",
+      "message": "x"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "stop",
+    "baseS": 0,
+    "pauseS": 0,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": "report_defect",
+    "report": []
+   }
+  },
+  {
+   "id": "p8-415-unsupported_media_type",
+   "rule": "P8",
+   "what": "415 unsupported_media_type: a defect of the client or a relay that is off: end the loop and report the code",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 415,
+    "headers": {},
+    "body": {
+     "error": {
+      "code": "unsupported_media_type",
+      "message": "x"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "stop",
+    "baseS": 0,
+    "pauseS": 0,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": "report_defect",
+    "report": []
+   }
+  },
+  {
+   "id": "p8-422-unprocessable",
+   "rule": "P8",
+   "what": "422 unprocessable: a defect of the client or a relay that is off: end the loop and report the code",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 422,
+    "headers": {},
+    "body": {
+     "error": {
+      "code": "unprocessable",
+      "message": "x"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "stop",
+    "baseS": 0,
+    "pauseS": 0,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": "report_defect",
+    "report": []
+   }
+  },
+  {
+   "id": "p8-409-conflict",
+   "rule": "P8",
+   "what": "409 conflict: a defect of the client or a relay that is off: end the loop and report the code",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 409,
+    "headers": {},
+    "body": {
+     "error": {
+      "code": "conflict",
+      "message": "x"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "stop",
+    "baseS": 0,
+    "pauseS": 0,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": "report_defect",
+    "report": []
+   }
+  },
+  {
+   "id": "p8-410-expired",
+   "rule": "P8",
+   "what": "410 expired: a defect of the client or a relay that is off: end the loop and report the code",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 410,
+    "headers": {},
+    "body": {
+     "error": {
+      "code": "expired",
+      "message": "x"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "stop",
+    "baseS": 0,
+    "pauseS": 0,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0
+    },
+    "action": "report_defect",
+    "report": []
+   }
+  }
+ ]
+}

@@ -43,6 +43,9 @@ final class Response
             $err['retryAfter'] = $e->retryAfter;
             $h['Retry-After'] = (string)$e->retryAfter;
         }
+        if ($e->rule !== null) {
+            $err['rule'] = $e->rule;
+        }
         if ($e->status === 401) {
             $h['WWW-Authenticate'] = 'Bearer realm="oaiy-relay"';
         }

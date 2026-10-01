@@ -248,6 +248,7 @@ test('4.5 lookups count against tok.req; consumer polls do not', function () {
     $res = $r->call($d, 'GET', '/v1/poll', null, ['re' => 'x']);
     eq(429, $res['status']);
     eq('rate_limited', $res['json']['error']['code']);
+    ok(!array_key_exists('rule', $res['json']['error']), 'a bucket is not one of the poll rules: no rule member (a client treats it as any 429)');
     eq(200, $r->call($d, 'GET', '/v1/poll')['status'], 'a consumer poll is not counted');
 });
 
@@ -261,6 +262,7 @@ test('4.5 the gap rule: a consumer poll that makes no progress within 250 ms of 
     eq('rate_limited', $res['json']['error']['code']);
     eq('1', $res['headers']['retry-after']);
     eq(1, $res['json']['error']['retryAfter']);
+    eq('gap', $res['json']['error']['rule'] ?? null, 'the answer says which rule refused the poll (README 5.1.1, rule P4)');
     // A lookup is exempt, and another device has its own gap.
     eq(200, $r->call($d, 'GET', '/v1/poll', null, ['re' => 'x'])['status']);
     eq(200, $r->call($d, 'GET', '/v1/poll', null, ['peek' => '1'])['status']);

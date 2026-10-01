@@ -884,6 +884,8 @@ for d, ex_ in {
 
 pos("error", "a rate limit with retryAfter", {"error": {"code": "rate_limited", "message": "Slow down.", "retryAfter": 7}})
 pos("error", "an unauthorized error", {"error": {"code": "unauthorized", "message": "Credential missing or wrong."}})
+pos("error", "the gap rule's refusal of a poll", {"error": {"code": "rate_limited", "message": "Slow down.", "retryAfter": 1, "rule": "gap"}})
+pos("error", "the in-flight rule's refusal of a poll", {"error": {"code": "rate_limited", "message": "Slow down.", "retryAfter": 1, "rule": "in_flight"}})
 pos("compat-error", "the Aokie shape", {"error": True, "code": "relay_backpressure", "message": "Mailbox full."})
 pos("health", "a healthy relay", {"ok": True, "time": NOW, "authHeaderSeen": False})
 pos("info", "the design's full example (Appendix A6b)", INFO)
@@ -1138,6 +1140,8 @@ neg("error", "an empty message", {"error": {"code": "internal", "message": ""}},
 neg("error", "no message", {"error": {"code": "internal"}}, "message")
 neg("error", "an unwrapped error", {"code": "internal", "message": "x"}, "error")
 neg("error", "retryAfter negative", {"error": {"code": "rate_limited", "message": "x", "retryAfter": -1}}, "retryAfter")
+neg("error", "a poll rule the relay does not have", {"error": {"code": "rate_limited", "message": "x", "retryAfter": 1, "rule": "burst"}}, "rule")
+neg("error", "a poll rule that is not a string", {"error": {"code": "rate_limited", "message": "x", "retryAfter": 1, "rule": 3}}, "rule")
 neg("compat-error", "error must be the boolean true", {"error": False, "code": "invalid_token", "message": "x"}, "error")
 neg("compat-error", "an unknown compat code", {"error": True, "code": "nope", "message": "x"}, "code")
 neg("health", "an extra member", dict(p1("health"), extra=1), "extra")
@@ -1785,6 +1789,77 @@ try:
 except (OSError, subprocess.TimeoutExpired) as e:
     ok("the Aokie fixture verifier ran", False, str(e))
 
+section("poll-client fixture (fixtures/poll-client/): the rules of README 5.1.1 for the native pollers (DK-03, MOB-21a), read twice")
+PC = FIX / "poll-client"
+pc_readme = (V1 / "README.md").read_text(encoding="utf-8")
+pc_doc = json.loads((PC / "poll-client.json").read_text(encoding="utf-8"))
+ok("README has the section and states each of the rules P1 to P8 by its number",
+   "### 5.1.1 The poll loop of a native client (DK-03 and MOB-21a)" in pc_readme and all(f"**P{i}. " in pc_readme for i in range(1, 9)))
+ok("README says what DK-03 and MOB-21a are, since nothing else in the repository does",
+   "DK-03 is the work package that builds the desktop's relay client" in pc_readme and "MOB-21a the one that builds the phone's" in pc_readme)
+ok("every rule P1 to P8 has cases in the table, and at least ninety cases in all",
+   {c["rule"] for c in pc_doc["cases"]} >= {f"P{i}" for i in range(1, 9)} and len(pc_doc["cases"]) >= 90)
+ok("README states the numbers the table pins: clamp 1 to 120, jitter up to 20 percent, 429 backoff 1, 2, 4, 8, 16, 30, failure backoff capped at 60, unreachable after three failures, a defect after five in_flight 429s, a replacement 250 ms after the poll it cancels",
+   all(s in pc_readme for s in ("`clamp(x)` is `x` limited to 1 to 120", "`pause = base * (1 + 0.2 * u)`", "`base = max(clamp(D), min(30, 2^(n-1)))`: 1, 2, 4, 8, 16, 30, 30...",
+                                "`base = min(60, 2^(n-1))`: 1, 2, 4, 8, 16, 32, 60, 60...", "after three failures in a row", "after five `429`s in a row with `rule: \"in_flight\"`",
+                                "no sooner than 250 ms after it started the one it cancels")))
+ok("README says how the two refusals of a poll are told apart (error.rule: gap, in_flight), that a 429 is neither a success nor a failure, how Retry-After is read (digits, HTTP-date, the body, none) and what the shipped carriers do, with their lines",
+   all(s in pc_readme for s in ("`\"rule\":\"gap\"`", "`\"rule\":\"in_flight\"`", "A **429 is never a failure**", "an HTTP-date (the IMF-fixdate of RFC 9110", "`error.retryAfter` when that is an integer from 0 to 86400",
+                                "plugin `companion_relay.rs` 50-52 and 670-677; phone 70-72 and 458-460", "plugin 53-56 and 745-755; phone 73-76 and 560-564", "(`post_frames`, 980-1031)")))
+fix_readme = (FIX / "README.md").read_text(encoding="utf-8")
+for f in ("poll-client/poll-client.json", "poll-client/verify_poll_client.py", "poll-client/verify_poll_client.mjs"):
+    ok(f"fixtures/README.md describes {f}", f"`{f}`" in fix_readme)
+node_exe = shutil.which("node")
+pc_readers = [("Python", [sys.executable, str(PC / "verify_poll_client.py")])]
+if node_exe is None:
+    ok("node is on PATH for the second reader of the poll-client table", False, "install Node 18+")
+else:
+    pc_readers.append(("Node", [node_exe, str(PC / "verify_poll_client.mjs")]))
+for label, cmd in pc_readers:
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=120)
+        m = re.search(r"(\d+) checks, (\d+) mismatches", proc.stdout)
+        n = int(m.group(1)) if m else 0
+        fix_checks += n
+        ok(f"{label} reading of the poll-client table, written from the README alone, agrees with every case ({n} checks)", proc.returncode == 0 and bool(m) and m.group(2) == "0" and n >= 600, (proc.stdout + proc.stderr)[-500:])
+    except (OSError, subprocess.TimeoutExpired) as e:
+        ok(f"{label} reading of the poll-client table ran", False, str(e))
+# Not vacuous: a table with one answer changed is refused by both readers (each change is one thing a client could get wrong).
+import tempfile  # noqa: E402
+
+
+def pc_damage(case_id: str, path: tuple, value) -> dict:
+    d = copy.deepcopy(pc_doc)
+    case = next(c for c in d["cases"] if c["id"] == case_id)
+    for key in path[:-1]:
+        case = case[key]
+    case[path[-1]] = value
+    return d
+
+
+pc_damaged = [
+    ("a 429 pause that is not clamped to 120", pc_damage("p6-clamp-high", ("expect", "baseS"), 600)),
+    ("a Retry-After of 0 that is not clamped to 1", pc_damage("p6-clamp-low", ("expect", "baseS"), 0)),
+    ("a 429 backoff that is not capped at 30", pc_damage("p5-429-after-8", ("expect", "baseS"), 256)),
+    ("a failure backoff that is not capped at 60", pc_damage("p5-fail-seventh", ("expect", "baseS"), 64)),
+    ("a 429 that is counted as a failure", pc_damage("p4-gap-first", ("expect", "state", "nFail"), 1)),
+    ("a 429 that is called a failure", pc_damage("p4-gap-first", ("expect", "outcome"), "failure")),
+    ("an HTTP-date Retry-After that is read as text", pc_damage("p6-http-date", ("expect", "baseS"), 1)),
+    ("a revoked device that is told to refresh", pc_damage("p8-401-revoked", ("expect", "action"), "refresh_or_reenrol")),
+    ("a relay that is not reported unreachable after three failures", pc_damage("p7-fail-third", ("expect", "report"), [])),
+    ("a fifth in_flight 429 that is not reported", pc_damage("p5-429-5-in-flight", ("expect", "report"), [])),
+    ("a refused hold that does not double", pc_damage("p3-refused-second", ("expect", "baseS"), 2)),
+    ("a replacement poll that may start at once", pc_damage("p1-replace-at-once", ("expect", "waitMs"), 0)),
+    ("a jitter that is not added", pc_damage("p6-clamp-jitter", ("expect", "pauseS"), 120)),
+]
+with tempfile.TemporaryDirectory() as tmpd:
+    for i, (what, damaged) in enumerate(pc_damaged):
+        f = pathlib.Path(tmpd) / f"damaged{i}.json"
+        f.write_text(json.dumps(damaged), encoding="utf-8")
+        for label, cmd in pc_readers:
+            proc = subprocess.run(cmd + ["--file", str(f)], capture_output=True, text=True, encoding="utf-8", timeout=120)
+            ok(f"the {label} reader refuses the table with {what}", proc.returncode == 1 and "MISMATCH" in proc.stdout, (proc.stdout + proc.stderr)[-200:])
+
 section("vectors.json is what generate_vectors.py writes")
 proc = subprocess.run([sys.executable, str(V1 / "generate_vectors.py"), "--check"], capture_output=True, text=True, encoding="utf-8", timeout=120)
 ok("vectors.json is current", proc.returncode == 0, (proc.stdout + proc.stderr)[-300:])
@@ -1824,9 +1899,10 @@ ok("README says a busy or gone database is 503 unavailable with Retry-After on t
    and "`Db::isTransient`" in readme and "`relay_status_error`, `companion_relay.rs` 1093-1108" in readme and "`post_frames`, 1025-1031" in readme and "`errors.rs` 170-180" in readme
    and "`tests/lib/AokiePlugin.php`" in readme and "stores a second set of frames under new `seq` numbers" in readme and "a reason code that tells the causes apart" in readme
    and "as they were when the decision was made" in readme and "`debug.error_sites`" in readme)
-ok("README bounds the polls that wait of one credential to three in flight, answers the fourth 429 with Retry-After 1, and requires a client to treat that 429 as no failure and to honour Retry-After with jitter (DK-03 and MOB-21a)",
-   "At most three consumer polls that wait" in readme and "A fourth is refused `429 rate_limited`, `Retry-After: 1`, before anything is read or written" in readme
+ok("README bounds the polls that wait of one credential to three in flight, answers the fourth 429 with Retry-After 1 and error.rule, and requires a client to treat that 429 as no failure and to honour Retry-After with jitter (DK-03 and MOB-21a)",
+   "At most three consumer polls that wait" in readme and "A fourth is refused `429 rate_limited`, `Retry-After: 1`, `error.rule: \"in_flight\"`, before the poll reads or writes anything of its own" in readme
    and "MUST NOT treat this `429` as a failure, and MUST honour `Retry-After`" in readme and "DK-03" in readme and "MOB-21a" in readme and "Interpretation 58" in readme
+   and "`error.rule: \"in_flight\"`" in readme and "`error.rule: \"gap\"`" in readme and "section 5.1.1 says exactly how" in readme
    and "`Holds::POLL_INFLIGHT_MAX` (3)" in readme)
 ok("README says what the poll bound is worth: with the shipped gap rule its benefit is small (a defence in depth that matters when wait.gap_ms is 0), that the first figures came from a relay whose gap was 0, and that the pool tests run with both",
    "a bound in depth, whose benefit with the shipped gap rule is small" in readme and "were measured on a relay whose `wait.gap_ms` was 0, which the tests set and the product does not ship" in readme
