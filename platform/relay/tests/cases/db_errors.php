@@ -163,9 +163,7 @@ test('4.18.3 debug.error_sites is off unless asked for: nothing is logged for a 
 });
 
 test('4.18.3 the test clock is read again when its file cannot be read for a moment, and an unreadable one is an error and never the host\'s own time', function () {
-    $r = Relay::make();
-    $d = $r->desktop();
-    $file = $r->dir . '/clock-moved.txt';
+    $file = Tmp::dir('clockfile') . '/clock-moved.txt'; // (no relay and no database: this test is about the clock file alone)
     // The clock file of this run is the one the runner made; this test uses the relay's code with a clock file of its own by way of
     // the constant it reads, in a child process that has the folder to itself.
     $script = Tmp::dir('clk') . '/clk.php';
