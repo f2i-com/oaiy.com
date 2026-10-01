@@ -94,6 +94,27 @@ foreach (array_slice($_SERVER['argv'], 1) as $arg) {
     }
 }
 
+// The working tree's data/ folder may be a real relay's (a developer's own, served from the checkout): no test touches it, and the run
+// checks that none did, by what is in it before and after. (The first version of a test that boots the relay under the checkout as a wrong
+// document root wrote its failure to start into platform/relay/data/logs/relay.log of whoever ran it.) A relay of your own that is
+// serving from that folder while the tests run changes it too, and fails the check: run the tests from another copy, or set
+// OAIY_TEST_LIVE_DATA=1. OAIY_TEST_REAL_DATA names another folder to watch (the harness's own test of this check uses it).
+$realData = getenv('OAIY_TEST_REAL_DATA');
+$realData = is_string($realData) && $realData !== '' ? rtrim(str_replace('\\', '/', $realData), '/') : str_replace('\\', '/', dirname($testsDir)) . '/data';
+$dataState = static function () use ($realData): array {
+    if (!is_dir($realData)) {
+        return ['(no data/ folder)' => 'absent'];
+    }
+    $rows = ['/' => 'dir'];
+    $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($realData, FilesystemIterator::SKIP_DOTS), RecursiveIteratorIterator::SELF_FIRST);
+    foreach ($it as $f) {
+        $rows[str_replace('\\', '/', substr($f->getPathname(), strlen($realData)))] = $f->isDir() ? 'dir' : $f->getSize() . ' bytes, ' . $f->getMTime();
+    }
+    ksort($rows);
+    return $rows;
+};
+$dataBefore = getenv('OAIY_TEST_LIVE_DATA') === '1' ? null : $dataState();
+
 // OAIY_TEST_CASES names another folder of cases: the harness's own test runs the runner over a test that leaves a process behind.
 $casesDir = getenv('OAIY_TEST_CASES');
 foreach (glob((is_string($casesDir) && $casesDir !== '' ? rtrim(str_replace('\\', '/', $casesDir), '/') : $testsDir . '/cases') . '/*.php') as $file) {
@@ -194,6 +215,17 @@ foreach ($endLeft as $pid => $cmd) {
 }
 if ($endLeft) {
     $failed[] = 'the run left ' . count($endLeft) . ' process(es) behind';
+}
+$dataAfter = $dataBefore === null ? null : $dataState();
+if ($dataBefore !== null && $dataAfter !== $dataBefore) {
+    $changed = [];
+    foreach (array_unique(array_merge(array_keys($dataBefore), array_keys($dataAfter))) as $k) {
+        if (($dataBefore[$k] ?? '(not there)') !== ($dataAfter[$k] ?? '(not there)')) {
+            $changed[] = sprintf('%s: %s -> %s', $k, $dataBefore[$k] ?? '(not there)', $dataAfter[$k] ?? '(not there)');
+        }
+    }
+    printf("  FAIL  the run changed the working tree's data/ folder (%s), which no test may touch:\n          %s\n", $realData, implode("\n          ", array_slice($changed, 0, 8)));
+    $failed[] = 'the run changed the working tree\'s data/ folder';
 }
 if (\OaiyTest\Procs::$blind) {
     echo "  note: the process table could not be read here, so what the tests leave running was not checked\n";

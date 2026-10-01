@@ -98,3 +98,50 @@ test('harness: when the check is made only at the end of a run, a process that n
     not_contains('still running after the test', $out);
     ok(!Procs::alive($pid), "and the runner ended it (pid $pid): it is not running");
 });
+
+test('harness: the run fails when a test changes the working tree\'s data/ folder (a real relay\'s may be there), and is silent when none does', function () {
+    $watched = Tmp::dir('realdata') . '/data';
+    mkdir($watched . '/logs', 0700, true);
+    file_put_contents($watched . '/logs/relay.log', "a line that was there\n");
+    $dir = Tmp::dir('datacases');
+    file_put_contents($dir . '/touch.php', <<<'PHP'
+<?php
+declare(strict_types=1);
+
+test('writes into the watched data folder', function () {
+    file_put_contents(getenv('OAIY_TEST_REAL_DATA') . '/logs/relay.log', "a line a test wrote\n", FILE_APPEND);
+});
+PHP);
+    file_put_contents($dir . '/clean.php', <<<'PHP'
+<?php
+declare(strict_types=1);
+
+test('touches nothing', function () {
+});
+PHP);
+    $run = function (string $only) use ($watched, $dir): array {
+        $env = array_merge(getenv(), ['OAIY_TEST_CASES' => $dir, 'OAIY_TEST_REAL_DATA' => $watched, 'OAIY_TEST_PROCS' => 'end']);
+        $p = proc_open(array_merge([PHP_BINARY], Server::phpFlags(), [dirname(__DIR__) . '/run.php', '--file=' . $only]), [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, $env);
+        $out = (string)stream_get_contents($pipes[1]) . (string)stream_get_contents($pipes[2]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        return [$out, proc_close($p)];
+    };
+    [$out, $code] = $run('clean');
+    eq(0, $code, 'a run that touches nothing passes: ' . $out);
+    not_contains("changed the working tree's data/ folder", $out);
+    [$out, $code] = $run('touch');
+    eq(1, $code, 'a run that appends to the data folder fails: ' . $out);
+    contains("FAIL  the run changed the working tree's data/ folder", $out);
+    contains('/logs/relay.log', $out, 'and names the file');
+    // Absent before and created by a test is a change too.
+    $gone = Tmp::dir('nodata') . '/data';
+    file_put_contents($dir . '/touch.php', "<?php\ndeclare(strict_types=1);\ntest('makes the data folder', function () {\n    mkdir(getenv('OAIY_TEST_REAL_DATA'), 0700, true);\n});\n");
+    $env = array_merge(getenv(), ['OAIY_TEST_CASES' => $dir, 'OAIY_TEST_REAL_DATA' => $gone, 'OAIY_TEST_PROCS' => 'end']);
+    $p = proc_open(array_merge([PHP_BINARY], Server::phpFlags(), [dirname(__DIR__) . '/run.php', '--file=touch']), [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, $env);
+    $out = (string)stream_get_contents($pipes[1]) . (string)stream_get_contents($pipes[2]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    eq(1, proc_close($p), 'a data folder that a test made fails the run: ' . $out);
+    contains('(no data/ folder): absent -> (not there)', $out);
+});
