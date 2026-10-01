@@ -56,6 +56,12 @@ final class AdminApi
         }
         if ($ctx->cfg->callEnabled()) {
             $warnings[] = 'Call features are on: whoever administers this host can read call captions and act as an approved phone on call control.';
+            if ($ctx->cfg->turn()['urls'] === []) {
+                $warnings[] = 'No TURN server is configured: a phone on a carrier network (behind carrier-grade NAT) will not connect to a call.';
+            }
+            if (!$eff->streamOffered() && $ctx->cfg->compatSse() !== 'off') {
+                $warnings[] = 'The framed stream is not offered: the streaming probe has not passed on this host, so the plugin and the phone need poll-mode carriers.';
+            }
         }
         if (strncmp($ctx->cfg->publicUrl(), 'https://', 8) !== 0) {
             $warnings[] = 'public_url is not https: clients will refuse it.';

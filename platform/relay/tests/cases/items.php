@@ -135,6 +135,8 @@ test('4.3 hdr: only re, ct, eph, kid, prio, n and sig; another key, a wrong type
     $good = [
         ['re' => 'cmd-1'], ['ct' => 'sealed1'], ['ct' => 'text'], ['ct' => 'json'], ['ct' => 'tunnel1'], ['ct' => 'noise1'], ['eph' => $eph], ['kid' => 'key-1'],
         ['prio' => 0], ['prio' => 1], ['n' => 0], ['n' => 7], ['sig' => B64::enc(random_bytes(64))], ['ct' => 'sealed1', 're' => 'x', 'n' => 3], [],
+        // The signature's cap is 88 characters, whatever they decode to: 87 and 88 are the last that are valid b64u and inside it.
+        ['sig' => str_repeat('A', 87)], ['sig' => str_repeat('A', 88)],
     ];
     $n = 0;
     foreach ($good as $h) {
@@ -144,6 +146,8 @@ test('4.3 hdr: only re, ct, eph, kid, prio, n and sig; another key, a wrong type
         ['foo' => 'x'], ['from' => 'dev-x'], ['CT' => 'text'], ['ct' => 'binary'], ['ct' => 1], ['ct' => null], ['re' => 'a/b'], ['re' => ''], ['re' => str_repeat('a', 129)],
         ['eph' => 'short'], ['eph' => rtrim(base64_encode(random_bytes(32)), '=')], ['eph' => base64_encode(random_bytes(33))], ['kid' => str_repeat('k', 65)], ['kid' => 'has space'],
         ['prio' => 2], ['prio' => '1'], ['prio' => true], ['n' => -1], ['n' => 1.5], ['n' => '3'], ['n' => 9007199254740992], ['sig' => str_repeat('A', 89)],
+        // Past the cap with a length that is valid b64u (90, 91 and 92 characters decode; 89 cannot), so only the cap refuses them.
+        ['sig' => str_repeat('A', 90)], ['sig' => str_repeat('A', 91)], ['sig' => str_repeat('A', 92)], ['sig' => str_repeat('A', 340)],
         ['sig' => 'not base64!!'], ['sig' => 7], ['ct' => ['sealed1']], [['ct' => 'text']], ['ct'],
     ];
     foreach ($bad as $h) {

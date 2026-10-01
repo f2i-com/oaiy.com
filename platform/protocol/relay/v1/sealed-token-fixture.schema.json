@@ -1,0 +1,157 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/sealed-token-fixture.schema.json",
+  "title": "Sealed token fixture",
+  "description": "The shape of fixtures/sealed-token.json: sealed boxes of the token a pairing gives the phone, for the desktop and phone code that will open them. `opens` are real relay output that the recipient key opens to a 63 byte device token whose SHA-256 is recorded (the token itself is never written down); `refused` are boxes a reader must not open (a flipped bit, a wrong length, an ephemeral key of small order); `wrongRecipient` is a key that must not open the first box. Which bytes are the box, and what a reader must check, is in fixtures/README.md.",
+  "type": "object",
+  "properties": {
+    "protocol": {
+      "const": "oaiy-relay/1"
+    },
+    "title": {
+      "type": "string"
+    },
+    "about": {
+      "type": "string"
+    },
+    "format": {
+      "type": "object",
+      "properties": {
+        "box": {
+          "type": "string"
+        },
+        "encoding": {
+          "type": "string"
+        },
+        "layout": {
+          "type": "string"
+        },
+        "nonce": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "plaintext": {
+          "type": "string"
+        },
+        "refuse": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "box",
+        "encoding",
+        "layout",
+        "nonce",
+        "key",
+        "plaintext",
+        "refuse"
+      ],
+      "additionalProperties": false
+    },
+    "recipient": {
+      "type": "object",
+      "properties": {
+        "note": {
+          "type": "string"
+        },
+        "x25519Secret": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/key32"
+        },
+        "x25519Public": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/key32"
+        }
+      },
+      "required": [
+        "x25519Secret",
+        "x25519Public"
+      ],
+      "additionalProperties": false
+    },
+    "opens": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "sealedToken": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{148}$"
+          },
+          "sealedBytes": {
+            "const": 111
+          },
+          "plaintextLength": {
+            "const": 63
+          },
+          "plaintextSha256": {
+            "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/sha256Hex"
+          }
+        },
+        "required": [
+          "label",
+          "sealedToken",
+          "sealedBytes",
+          "plaintextLength",
+          "plaintextSha256"
+        ],
+        "additionalProperties": false
+      },
+      "minItems": 1
+    },
+    "refused": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "sealedToken": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]*$"
+          }
+        },
+        "required": [
+          "label",
+          "sealedToken"
+        ],
+        "additionalProperties": false
+      },
+      "minItems": 1
+    },
+    "wrongRecipient": {
+      "type": "object",
+      "properties": {
+        "note": {
+          "type": "string"
+        },
+        "x25519Secret": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/key32"
+        },
+        "x25519Public": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/key32"
+        }
+      },
+      "required": [
+        "x25519Secret",
+        "x25519Public"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "protocol",
+    "title",
+    "about",
+    "format",
+    "recipient",
+    "opens",
+    "refused",
+    "wrongRecipient"
+  ],
+  "additionalProperties": false
+}

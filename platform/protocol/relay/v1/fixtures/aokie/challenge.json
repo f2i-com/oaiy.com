@@ -1,0 +1,113 @@
+{
+  "protocol": "oaiy-relay/1",
+  "title": "Endpoint challenges recorded from the relay",
+  "about": "GET /v1/aokie-companion/relay/challenge with each admission bearer of admission.json. A plugin's challenge carries its roster and never expectedPeerKeyThumbprint; a phone's carries expectedPeerKeyThumbprint and no roster member at all (EndpointChallengeFrame refuses both). connectionId and challengeNonce are random; expiresAt is 25 seconds after the relay clock.",
+  "relay": {
+    "url": "https://relay.example.com",
+    "clock": 1790000000,
+    "stunUrls": [
+      "stun:stun.example.com:3478"
+    ],
+    "turnUrls": [
+      "turn:turn.example.com:3478?transport=udp",
+      "turns:turn.example.com:5349?transport=tcp"
+    ],
+    "turnSecret": "0123456789abcdef0123456789abcdef",
+    "turnTtl": 600,
+    "admissionSecretHex": "0101010101010101010101010101010101010101010101010101010101010101"
+  },
+  "cases": [
+    {
+      "name": "the plugin's challenge",
+      "bearer": "aokie-adm-v2.7b22617564223a22616f6b69652d76322d67617465776179222c226170704964223a22616f6b6965222c227375626a6563744964223a22616f6b6965222c22726f6c65223a22706c7567696e222c22686f6c6465724b65795468756d627072696e74223a2261745a523633744e4733573247685070566c654b6e667277314e374e364c41714f65356772453253425234222c22617070726f766564506565724b65795468756d627072696e7473223a5b222d2d36494d356c304f6f734c6a397957736b495359685541336e5f33435552516b6d72594d5368615f636b222c224539313658546a4a434b3832764169624547476842336c44563777414e766c4c667869434e5471666f5f63225d2c2270656572526f737465725265766973696f6e223a372c2270656572526f7374657248617368223a22375a4573516a36413155694e4971587245596659536a664b5247656e776c5156675a4f76575851512d4e73222c2273636f706573223a5b2273746174655f72656164222c227274635f7369676e616c225d2c2264736b223a226465762d6f4b47696f36536c7071656f71617172724b32757277222c22657870223a313739303030303039302c226a7469223a2261646d5f6135613763326561646235353663393062303134366465383362663238306632227d.f7f70ef2b3172742a1c35137e6543606ebfbcbedfa5f26e2bb35a5bd140ec5c0",
+      "request": {
+        "method": "GET",
+        "path": "/v1/aokie-companion/relay/challenge",
+        "auth": "Bearer of plugin"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "cache-control": "no-store",
+          "pragma": "no-cache"
+        },
+        "body": {
+          "kind": "endpoint_challenge",
+          "schemaVersion": 2,
+          "appId": "aokie",
+          "subjectId": "aokie",
+          "role": "plugin",
+          "connectionId": "relay_6efe1a072a3971ae6436207fd586ba3d",
+          "challengeNonce": "challenge_8be2847bbfe253b8c0b2bfff70c220a0",
+          "admissionJti": "adm_a5a7c2eadb556c90b0146de83bf280f2",
+          "holderKeyThumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4",
+          "approvedPeerKeyThumbprints": [
+            "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck",
+            "E916XTjJCK82vAibEGGhB3lDV7wANvlLfxiCNTqfo_c"
+          ],
+          "peerRosterRevision": 7,
+          "peerRosterHash": "7ZEsQj6A1UiNIqXrEYfYSjfKRGenwlQVgZOvWXQQ-Ns",
+          "expiresAt": 1790000025
+        }
+      }
+    },
+    {
+      "name": "phone A's challenge",
+      "bearer": "aokie-adm-v2.7b22617564223a22616f6b69652d76322d67617465776179222c226170704964223a22616f6b6965222c227375626a6563744964223a226465762d734c4779733753317472653475627137764c322d7677222c22726f6c65223a226d6f62696c65222c22686f6c6465724b65795468756d627072696e74223a222d2d36494d356c304f6f734c6a397957736b495359685541336e5f33435552516b6d72594d5368615f636b222c226578706563746564506565724b65795468756d627072696e74223a2261745a523633744e4733573247685070566c654b6e667277314e374e364c41714f65356772453253425234222c2273636f706573223a5b2273746174655f72656164222c2263616c6c65725f72656164222c2263617074696f6e735f72656164222c227274635f7369676e616c225d2c2264736b223a226465762d6f4b47696f36536c7071656f71617172724b32757277222c22657870223a313739303030303039302c226a7469223a2261646d5f3435326264383131623833396435376363393731346562663137383535363265227d.95b5577679c52089de3a723ff01abe45a821408bcc564dac578ad6b3346165e4",
+      "request": {
+        "method": "GET",
+        "path": "/v1/aokie-companion/relay/challenge",
+        "auth": "Bearer of phone A"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "cache-control": "no-store",
+          "pragma": "no-cache"
+        },
+        "body": {
+          "kind": "endpoint_challenge",
+          "schemaVersion": 2,
+          "appId": "aokie",
+          "subjectId": "dev-sLGys7S1tre4ubq7vL2-vw",
+          "role": "mobile",
+          "connectionId": "relay_5edbf26ddcdb9f459ae49c7a80bcee31",
+          "challengeNonce": "challenge_67de11b9e65937eceb828025ce770768",
+          "admissionJti": "adm_452bd811b839d57cc9714ebf1785562e",
+          "holderKeyThumbprint": "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck",
+          "expectedPeerKeyThumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4",
+          "expiresAt": 1790000025
+        }
+      }
+    },
+    {
+      "name": "phone B's challenge (the admission of the poll-mode case)",
+      "bearer": "aokie-adm-v2.7b22617564223a22616f6b69652d76322d67617465776179222c226170704964223a22616f6b6965222c227375626a6563744964223a226465762d43416749434167494341674943416749434167494341222c22726f6c65223a226d6f62696c65222c22686f6c6465724b65795468756d627072696e74223a224539313658546a4a434b3832764169624547476842336c44563777414e766c4c667869434e5471666f5f63222c226578706563746564506565724b65795468756d627072696e74223a2261745a523633744e4733573247685070566c654b6e667277314e374e364c41714f65356772453253425234222c2273636f706573223a5b2273746174655f72656164225d2c2264736b223a226465762d6f4b47696f36536c7071656f71617172724b32757277222c22657870223a313739303030303039302c226a7469223a2261646d5f3561366632613265646564626265653630346337616565383337653563386461227d.a71682a6420cc87e6a3ace94e7c301bfce0926bb63562b461676f7846ff02565",
+      "request": {
+        "method": "GET",
+        "path": "/v1/aokie-companion/relay/challenge",
+        "auth": "Bearer of phone B"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "cache-control": "no-store",
+          "pragma": "no-cache"
+        },
+        "body": {
+          "kind": "endpoint_challenge",
+          "schemaVersion": 2,
+          "appId": "aokie",
+          "subjectId": "dev-CAgICAgICAgICAgICAgICA",
+          "role": "mobile",
+          "connectionId": "relay_6591d59fa725c9a08f2b7bfa1f56e03b",
+          "challengeNonce": "challenge_d72e8a67a164bd45caf41580d5a21587",
+          "admissionJti": "adm_5a6f2a2ededbbee604c7aee837e5c8da",
+          "holderKeyThumbprint": "E916XTjJCK82vAibEGGhB3lDV7wANvlLfxiCNTqfo_c",
+          "expectedPeerKeyThumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4",
+          "expiresAt": 1790000025
+        }
+      }
+    }
+  ]
+}

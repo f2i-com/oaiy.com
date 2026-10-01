@@ -6,6 +6,7 @@
  *   php tests/run.php --filter=poll    run the tests whose name contains "poll" (case-insensitive)
  *   php tests/run.php --file=poll|holds  run the tests of tests/cases/poll.php and holds.php
  *   php tests/run.php --list           list the test names
+ *   php tests/run.php --repeat=N       run every selected test N times (OAIY_TEST_REPEAT=N too): for a test that fails one run in a hundred
  *   php tests/run.php --stop           stop at the first failure
  *   php tests/run.php --verbose        print passing tests too
  *   php tests/run.php --slow           also run the slow tests (real waits and holds; a minute or more)
@@ -58,6 +59,8 @@ require $testsDir . '/lib/Tmp.php';
 
 // The test clock: a constant defined only here (and by prepend.php in child servers), never by a request.
 \OaiyTest\Tmp::init();
+require_once $testsDir . '/lib/Procs.php';
+\OaiyTest\Procs::watch(\OaiyTest\Tmp::root()); // the end of the run still has to find what names this root, after Tmp::cleanup() has forgotten it
 putenv('OAIY_TEST_CLOCK=' . \OaiyTest\Tmp::clockFile());
 require $testsDir . '/prepend.php';
 
@@ -75,6 +78,7 @@ $list = false;
 $stop = false;
 $verbose = false;
 $slow = false;
+$repeat = (int)(getenv('OAIY_TEST_REPEAT') ?: 1);
 foreach (array_slice($_SERVER['argv'], 1) as $arg) {
     if (strpos($arg, '--filter=') === 0) {
         $filter = strtolower(substr($arg, 9));
@@ -82,6 +86,8 @@ foreach (array_slice($_SERVER['argv'], 1) as $arg) {
         $onlyFiles = explode('|', substr($arg, 7));
     } elseif ($arg === '--slow') {
         $slow = true;
+    } elseif (strpos($arg, '--repeat=') === 0) {
+        $repeat = max(1, (int)substr($arg, 9));
     } elseif ($arg === '--list') {
         $list = true;
     } elseif ($arg === '--stop') {
@@ -94,12 +100,38 @@ foreach (array_slice($_SERVER['argv'], 1) as $arg) {
     }
 }
 
-foreach (glob($testsDir . '/cases/*.php') as $file) {
+// The working tree's data/ folder may be a real relay's (a developer's own, served from the checkout): no test touches it, and the run
+// checks that none did, by what is in it before and after. (The first version of a test that boots the relay under the checkout as a wrong
+// document root wrote its failure to start into platform/relay/data/logs/relay.log of whoever ran it.) A relay of your own that is
+// serving from that folder while the tests run changes it too, and fails the check: run the tests from another copy, or set
+// OAIY_TEST_LIVE_DATA=1. OAIY_TEST_REAL_DATA names another folder to watch (the harness's own test of this check uses it).
+$realData = getenv('OAIY_TEST_REAL_DATA');
+$realData = is_string($realData) && $realData !== '' ? rtrim(str_replace('\\', '/', $realData), '/') : str_replace('\\', '/', dirname($testsDir)) . '/data';
+$dataState = static function () use ($realData): array {
+    if (!is_dir($realData)) {
+        return ['(no data/ folder)' => 'absent'];
+    }
+    $rows = ['/' => 'dir'];
+    $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($realData, FilesystemIterator::SKIP_DOTS), RecursiveIteratorIterator::SELF_FIRST);
+    foreach ($it as $f) {
+        $rows[str_replace('\\', '/', substr($f->getPathname(), strlen($realData)))] = $f->isDir() ? 'dir' : $f->getSize() . ' bytes, ' . $f->getMTime();
+    }
+    ksort($rows);
+    return $rows;
+};
+$dataBefore = getenv('OAIY_TEST_LIVE_DATA') === '1' ? null : $dataState();
+
+// OAIY_TEST_CASES names another folder of cases: the harness's own test runs the runner over a test that leaves a process behind.
+$casesDir = getenv('OAIY_TEST_CASES');
+foreach (glob((is_string($casesDir) && $casesDir !== '' ? rtrim(str_replace('\\', '/', $casesDir), '/') : $testsDir . '/cases') . '/*.php') as $file) {
     \OaiyTest\Registry::file(basename($file, '.php'));
     require $file;
 }
 
 $tests = \OaiyTest\Registry::all();
+if ($repeat > 1 && !$list) {
+    $tests = array_merge(...array_fill(0, $repeat, $tests)); // every selected test, N times over (the filter below still applies)
+}
 if ($list) {
     foreach ($tests as $t) {
         echo $t['name'], "\n";
@@ -112,6 +144,7 @@ if ($list) {
 $passed = 0;
 $failed = [];
 $skipped = [];
+$procsEach = \OaiyTest\Procs::eachTest();
 $started = microtime(true);
 $slowNotRun = 0;
 foreach ($tests as $t) {
@@ -133,7 +166,9 @@ foreach ($tests as $t) {
         $slowNotRun++;
         continue;
     }
+    $before = $procsEach ? \OaiyTest\Procs::live() : [];
     $t0 = microtime(true);
+    $outcome = 'fail';
     // The relay lowers the time limit while it holds a request (set_time_limit); in process that would otherwise end the run.
     @set_time_limit(0);
     try {
@@ -141,23 +176,69 @@ foreach ($tests as $t) {
         ($t['fn'])();
         \OaiyTest\Relay::verifyCounters(); // after every test: the counters of every relay it made equal a recount
         $passed++;
+        $outcome = 'pass';
         if ($verbose) {
             printf("  ok    %s (%.2fs)\n", $t['name'], microtime(true) - $t0);
         }
     } catch (\OaiyTest\SkipException $e) {
+        $outcome = 'skip';
         $skipped[] = [$t['name'], $e->getMessage()];
         printf("  skip  %s -> %s\n", $t['name'], $e->getMessage());
     } catch (\Throwable $e) {
         $failed[] = $t['name'];
         printf("  FAIL  %s\n        %s: %s\n        at %s:%d\n", $t['name'], get_class($e), $e->getMessage(), basename($e->getFile()), $e->getLine());
-        if ($stop) {
-            break;
-        }
     }
-    \OaiyTest\Tmp::afterTest();
+    // A test leaves nothing running: what it started is stopped by what it registered with Tmp::after, and the runner checks. A server
+    // that would not stop, or a process that is still there once the test is over, is a failure of that test, and is ended so that it
+    // is not counted against the tests after it.
+    $leaks = [];
+    foreach (\OaiyTest\Tmp::afterTest() as $problem) {
+        $leaks[] = 'cleanup: ' . $problem;
+    }
+    $left = $procsEach ? \OaiyTest\Procs::leftSince($before) : [];
+    foreach ($left as $pid => $cmd) {
+        $leaks[] = sprintf('still running after the test: pid %d, %s', $pid, substr($cmd, 0, 110));
+        \OaiyTest\Procs::end($pid, true);
+    }
+    if ($leaks) {
+        if ($outcome === 'pass') {
+            $passed--;
+            $failed[] = $t['name'];
+        } elseif ($outcome === 'skip') {
+            $failed[] = $t['name'];
+        }
+        printf("  FAIL  %s\n        left a process or a server behind:\n          %s\n", $t['name'], implode("\n          ", $leaks));
+    }
     \OaiyTest\Relay::forget();
+    if ($stop && ($outcome === 'fail' || $leaks)) {
+        break;
+    }
 }
 \OaiyTest\Tmp::cleanup();
+// The end of the run: nothing the run started is still alive (the shared database server included, which Tmp::cleanup() has stopped).
+\OaiyTest\Procs::releaseKept();
+$endLeft = \OaiyTest\Procs::leftSince([], 5.0);
+foreach ($endLeft as $pid => $cmd) {
+    printf("  FAIL  the run left a process behind: pid %d, %s\n", $pid, substr($cmd, 0, 110));
+    \OaiyTest\Procs::end($pid, true);
+}
+if ($endLeft) {
+    $failed[] = 'the run left ' . count($endLeft) . ' process(es) behind';
+}
+$dataAfter = $dataBefore === null ? null : $dataState();
+if ($dataBefore !== null && $dataAfter !== $dataBefore) {
+    $changed = [];
+    foreach (array_unique(array_merge(array_keys($dataBefore), array_keys($dataAfter))) as $k) {
+        if (($dataBefore[$k] ?? '(not there)') !== ($dataAfter[$k] ?? '(not there)')) {
+            $changed[] = sprintf('%s: %s -> %s', $k, $dataBefore[$k] ?? '(not there)', $dataAfter[$k] ?? '(not there)');
+        }
+    }
+    printf("  FAIL  the run changed the working tree's data/ folder (%s), which no test may touch:\n          %s\n", $realData, implode("\n          ", array_slice($changed, 0, 8)));
+    $failed[] = 'the run changed the working tree\'s data/ folder';
+}
+if (\OaiyTest\Procs::$blind) {
+    echo "  note: the process table could not be read here, so what the tests leave running was not checked\n";
+}
 
 printf("\nphp %s: %d passed, %d failed, %d skipped in %.1fs\n", PHP_VERSION, $passed, count($failed), count($skipped), microtime(true) - $started);
 if ($slowNotRun > 0) {

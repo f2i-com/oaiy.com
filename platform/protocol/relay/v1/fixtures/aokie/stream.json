@@ -1,0 +1,63 @@
+{
+  "protocol": "oaiy-relay/1",
+  "title": "The framed stream, recorded byte for byte",
+  "about": "The body of GET /v1/aokie-companion/relay/stream as the relay writes it (status 200, Content-Type text/event-stream; charset=utf-8, Cache-Control no-store, X-Accel-Buffering no). Feed each body to the carriers' SseParser, whole and split at every offset.",
+  "relay": {
+    "url": "https://relay.example.com",
+    "clock": 1790000000,
+    "stunUrls": [
+      "stun:stun.example.com:3478"
+    ],
+    "turnUrls": [
+      "turn:turn.example.com:3478?transport=udp",
+      "turns:turn.example.com:5349?transport=tcp"
+    ],
+    "turnSecret": "0123456789abcdef0123456789abcdef",
+    "turnTtl": 600,
+    "admissionSecretHex": "0101010101010101010101010101010101010101010101010101010101010101"
+  },
+  "cases": [
+    {
+      "name": "the plugin's stream with three frames waiting",
+      "note": "The preamble, one frame event per frame with id = seq, and end with the cursor. The stream lasts min(20, wait.max) seconds; this recording is cut at 0.6.",
+      "request": {
+        "method": "GET",
+        "path": "/v1/aokie-companion/relay/stream",
+        "auth": "Bearer of the plugin",
+        "headers": {
+          "Accept": "text/event-stream"
+        }
+      },
+      "body": "retry: 2000\n\n: connected\n\nid: 1\nevent: frame\ndata: {\"seq\":1,\"from\":\"mobile:--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck\",\"subjectId\":\"dev-sLGys7S1tre4ubq7vL2-vw\",\"grants\":[\"state_read\",\"caller_read\",\"captions_read\",\"rtc_signal\"],\"frame\":{}}\n\nid: 2\nevent: frame\ndata: {\"seq\":2,\"from\":\"mobile:--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck\",\"subjectId\":\"dev-sLGys7S1tre4ubq7vL2-vw\",\"grants\":[\"state_read\",\"caller_read\",\"captions_read\",\"rtc_signal\"],\"frame\":{\"type\":\"hello\",\"n\":9007199254740993,\"f\":1.0,\"u\":\"h\\u00e9llo \\ud83d\\ude00/\",\"e\":{},\"a\":[],\"z\":[{}]}}\n\nid: 3\nevent: frame\ndata: {\"seq\":3,\"from\":\"mobile:--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck\",\"subjectId\":\"dev-sLGys7S1tre4ubq7vL2-vw\",\"grants\":[\"state_read\",\"caller_read\",\"captions_read\",\"rtc_signal\"],\"frame\":{\"kind\":\"snapshot\",\"grants\":[\"state_read\"],\"seq\":999}}\n\nid: 3\nevent: end\ndata: {}\n\n"
+    },
+    {
+      "name": "resuming after the second",
+      "note": "A carrier that saw event 2 opens with since=2 (the plugin does; Last-Event-ID does the same).",
+      "request": {
+        "method": "GET",
+        "path": "/v1/aokie-companion/relay/stream",
+        "query": {
+          "since": "2"
+        },
+        "auth": "Bearer of the plugin",
+        "headers": {
+          "Accept": "text/event-stream"
+        }
+      },
+      "body": "retry: 2000\n\n: connected\n\nid: 3\nevent: frame\ndata: {\"seq\":3,\"from\":\"mobile:--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck\",\"subjectId\":\"dev-sLGys7S1tre4ubq7vL2-vw\",\"grants\":[\"state_read\",\"caller_read\",\"captions_read\",\"rtc_signal\"],\"frame\":{\"kind\":\"snapshot\",\"grants\":[\"state_read\"],\"seq\":999}}\n\nid: 3\nevent: end\ndata: {}\n\n"
+    },
+    {
+      "name": "an idle stream",
+      "note": "Nothing to say: the preamble, a keepalive comment 2 seconds in (both carriers' 45 second freshness timer is fed by it), an empty comment a quarter second after it (the second write, which finds a client that has hung up), and end. Both are comments: no event.",
+      "request": {
+        "method": "GET",
+        "path": "/v1/aokie-companion/relay/stream",
+        "auth": "Bearer of phone B",
+        "headers": {
+          "Accept": "text/event-stream"
+        }
+      },
+      "body": "retry: 2000\n\n: connected\n\n: keepalive\n\n:\n\nid: 0\nevent: end\ndata: {}\n\n"
+    }
+  ]
+}

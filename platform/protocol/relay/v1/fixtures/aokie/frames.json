@@ -1,0 +1,352 @@
+{
+  "protocol": "oaiy-relay/1",
+  "title": "Frames posted and read through the relay",
+  "about": "A conversation through POST and GET /v1/aokie-companion/relay/frames, in order, with the bearers of admission.json. Request bodies are what the shipped carriers send (relay_post_body embeds the frames as they are).",
+  "relay": {
+    "url": "https://relay.example.com",
+    "clock": 1790000000,
+    "stunUrls": [
+      "stun:stun.example.com:3478"
+    ],
+    "turnUrls": [
+      "turn:turn.example.com:3478?transport=udp",
+      "turns:turn.example.com:5349?transport=tcp"
+    ],
+    "turnSecret": "0123456789abcdef0123456789abcdef",
+    "turnTtl": 600,
+    "admissionSecretHex": "0101010101010101010101010101010101010101010101010101010101010101"
+  },
+  "bearers": {
+    "plugin": "aokie-adm-v2.7b22617564223a22616f6b69652d76322d67617465776179222c226170704964223a22616f6b6965222c227375626a6563744964223a22616f6b6965222c22726f6c65223a22706c7567696e222c22686f6c6465724b65795468756d627072696e74223a2261745a523633744e4733573247685070566c654b6e667277314e374e364c41714f65356772453253425234222c22617070726f766564506565724b65795468756d627072696e7473223a5b222d2d36494d356c304f6f734c6a397957736b495359685541336e5f33435552516b6d72594d5368615f636b222c224539313658546a4a434b3832764169624547476842336c44563777414e766c4c667869434e5471666f5f63225d2c2270656572526f737465725265766973696f6e223a372c2270656572526f7374657248617368223a22375a4573516a36413155694e4971587245596659536a664b5247656e776c5156675a4f76575851512d4e73222c2273636f706573223a5b2273746174655f72656164222c227274635f7369676e616c225d2c2264736b223a226465762d6f4b47696f36536c7071656f71617172724b32757277222c22657870223a313739303030303039302c226a7469223a2261646d5f3862613730663761333732633765626632323736346333346331633538633734227d.48ec54446adae8c667d631936813ff2c4ee5c4fcc2abd05c5057a08c694b280e",
+    "phone A": "aokie-adm-v2.7b22617564223a22616f6b69652d76322d67617465776179222c226170704964223a22616f6b6965222c227375626a6563744964223a226465762d734c4779733753317472653475627137764c322d7677222c22726f6c65223a226d6f62696c65222c22686f6c6465724b65795468756d627072696e74223a222d2d36494d356c304f6f734c6a397957736b495359685541336e5f33435552516b6d72594d5368615f636b222c226578706563746564506565724b65795468756d627072696e74223a2261745a523633744e4733573247685070566c654b6e667277314e374e364c41714f65356772453253425234222c2273636f706573223a5b2273746174655f72656164222c2263616c6c65725f72656164222c2263617074696f6e735f72656164222c227274635f7369676e616c225d2c2264736b223a226465762d6f4b47696f36536c7071656f71617172724b32757277222c22657870223a313739303030303039302c226a7469223a2261646d5f6136663839393831386137343434353163623334666162323233386662313966227d.dd030ce39fa716aa30072835c6d155404917315154e7832d583d04460bff0742",
+    "phone B": "aokie-adm-v2.7b22617564223a22616f6b69652d76322d67617465776179222c226170704964223a22616f6b6965222c227375626a6563744964223a226465762d43416749434167494341674943416749434167494341222c22726f6c65223a226d6f62696c65222c22686f6c6465724b65795468756d627072696e74223a224539313658546a4a434b3832764169624547476842336c44563777414e766c4c667869434e5471666f5f63222c226578706563746564506565724b65795468756d627072696e74223a2261745a523633744e4733573247685070566c654b6e667277314e374e364c41714f65356772453253425234222c2273636f706573223a5b2273746174655f72656164225d2c2264736b223a226465762d6f4b47696f36536c7071656f71617172724b32757277222c22657870223a313739303030303039302c226a7469223a2261646d5f3237333663316536303335643538323266383965376639386536636636343065227d.063aeedd7fdebc1085adb07fb71bf87f18b2239dad29c22d69323c8bbadb3d28"
+  },
+  "steps": [
+    {
+      "step": "phone A posts three frames to the plugin",
+      "from": "phone A",
+      "request": {
+        "method": "POST",
+        "path": "/v1/aokie-companion/relay/frames",
+        "auth": "Bearer of phone A",
+        "body": {
+          "to": "plugin",
+          "frames": [
+            {},
+            {
+              "type": "hello",
+              "n": 9007199254740993,
+              "f": 1.0,
+              "u": "héllo 😀/",
+              "e": {},
+              "a": [],
+              "z": [
+                {}
+              ]
+            },
+            {
+              "kind": "snapshot",
+              "grants": [
+                "state_read"
+              ],
+              "seq": 999
+            }
+          ]
+        },
+        "bodyText": "{\"to\":\"plugin\",\"frames\":[{},{\"type\":\"hello\",\"n\":9007199254740993,\"f\":1.0,\"u\":\"héllo 😀/\",\"e\":{},\"a\":[],\"z\":[{}]},{\"kind\":\"snapshot\",\"grants\":[\"state_read\"],\"seq\":999}]}"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "body": {
+          "accepted": 3,
+          "seq": 3,
+          "time": 1790000000
+        }
+      },
+      "note": "The frames are stored as decoded and encoded again: {} stays an object, 9007199254740993 an integer, 1.0 a float, slashes and Unicode as they are. The relay records who posted them; nothing in a frame can say so."
+    },
+    {
+      "step": "the plugin reads them",
+      "from": "plugin",
+      "request": {
+        "method": "GET",
+        "path": "/v1/aokie-companion/relay/frames",
+        "query": {
+          "since": "0",
+          "wait": "0"
+        },
+        "auth": "Bearer of the plugin"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "body": {
+          "frames": [
+            {
+              "seq": 1,
+              "from": "mobile:--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck",
+              "subjectId": "dev-sLGys7S1tre4ubq7vL2-vw",
+              "grants": [
+                "state_read",
+                "caller_read",
+                "captions_read",
+                "rtc_signal"
+              ],
+              "frame": {}
+            },
+            {
+              "seq": 2,
+              "from": "mobile:--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck",
+              "subjectId": "dev-sLGys7S1tre4ubq7vL2-vw",
+              "grants": [
+                "state_read",
+                "caller_read",
+                "captions_read",
+                "rtc_signal"
+              ],
+              "frame": {
+                "type": "hello",
+                "n": 9007199254740993,
+                "f": 1.0,
+                "u": "héllo 😀/",
+                "e": {},
+                "a": [],
+                "z": [
+                  {}
+                ]
+              }
+            },
+            {
+              "seq": 3,
+              "from": "mobile:--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck",
+              "subjectId": "dev-sLGys7S1tre4ubq7vL2-vw",
+              "grants": [
+                "state_read",
+                "caller_read",
+                "captions_read",
+                "rtc_signal"
+              ],
+              "frame": {
+                "kind": "snapshot",
+                "grants": [
+                  "state_read"
+                ],
+                "seq": 999
+              }
+            }
+          ],
+          "lastSeq": 3,
+          "time": 1790000000
+        }
+      },
+      "note": "from, subjectId and grants are the relay's record of phone A's admission, not the frame's own members (the third frame claims seq 999)."
+    },
+    {
+      "step": "the plugin finds the tail",
+      "from": "plugin",
+      "request": {
+        "method": "GET",
+        "path": "/v1/aokie-companion/relay/frames",
+        "query": {
+          "since": "3",
+          "wait": "0"
+        },
+        "auth": "Bearer of the plugin"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "body": {
+          "frames": [],
+          "lastSeq": 3,
+          "time": 1790000000
+        }
+      },
+      "note": "How the plugin primes its cursor (tail_cursor reads lastSeq): with nothing after since, lastSeq is since."
+    },
+    {
+      "step": "the plugin posts two frames to phone A",
+      "from": "plugin",
+      "request": {
+        "method": "POST",
+        "path": "/v1/aokie-companion/relay/frames",
+        "auth": "Bearer of the plugin",
+        "body": {
+          "to": "mobile:--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck",
+          "frames": [
+            {
+              "kind": "plugin_idle"
+            },
+            {
+              "kind": "lease_granted",
+              "deviceId": "dev-sLGys7S1tre4ubq7vL2-vw"
+            }
+          ]
+        },
+        "bodyText": "{\"to\":\"mobile:--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck\",\"frames\":[{\"kind\":\"plugin_idle\"},{\"kind\":\"lease_granted\",\"deviceId\":\"dev-sLGys7S1tre4ubq7vL2-vw\"}]}"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "body": {
+          "accepted": 2,
+          "seq": 2,
+          "time": 1790000000
+        }
+      }
+    },
+    {
+      "step": "phone A reads them",
+      "from": "phone A",
+      "request": {
+        "method": "GET",
+        "path": "/v1/aokie-companion/relay/frames",
+        "query": {
+          "since": "0",
+          "wait": "0"
+        },
+        "auth": "Bearer of phone A"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "body": {
+          "frames": [
+            {
+              "seq": 1,
+              "from": "plugin",
+              "subjectId": "aokie",
+              "grants": [
+                "state_read",
+                "rtc_signal"
+              ],
+              "frame": {
+                "kind": "plugin_idle"
+              }
+            },
+            {
+              "seq": 2,
+              "from": "plugin",
+              "subjectId": "aokie",
+              "grants": [
+                "state_read",
+                "rtc_signal"
+              ],
+              "frame": {
+                "kind": "lease_granted",
+                "deviceId": "dev-sLGys7S1tre4ubq7vL2-vw"
+              }
+            }
+          ],
+          "lastSeq": 2,
+          "time": 1790000000
+        }
+      },
+      "note": "Reading does not acknowledge: the same read answers the same until the frames' 120 seconds are up."
+    },
+    {
+      "step": "phone A reads them again, from where it left off",
+      "from": "phone A",
+      "request": {
+        "method": "GET",
+        "path": "/v1/aokie-companion/relay/frames",
+        "query": {
+          "since": "1",
+          "wait": "0"
+        },
+        "auth": "Bearer of phone A"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "body": {
+          "frames": [
+            {
+              "seq": 2,
+              "from": "plugin",
+              "subjectId": "aokie",
+              "grants": [
+                "state_read",
+                "rtc_signal"
+              ],
+              "frame": {
+                "kind": "lease_granted",
+                "deviceId": "dev-sLGys7S1tre4ubq7vL2-vw"
+              }
+            }
+          ],
+          "lastSeq": 2,
+          "time": 1790000000
+        }
+      }
+    },
+    {
+      "step": "phone B has nothing",
+      "from": "phone B",
+      "request": {
+        "method": "GET",
+        "path": "/v1/aokie-companion/relay/frames",
+        "query": {
+          "since": "0",
+          "wait": "0"
+        },
+        "auth": "Bearer of phone B"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "body": {
+          "frames": [],
+          "lastSeq": 0,
+          "time": 1790000000
+        }
+      },
+      "note": "A mailbox is the party's own."
+    },
+    {
+      "step": "the plugin posts to a phone the desktop no longer has",
+      "from": "plugin",
+      "request": {
+        "method": "POST",
+        "path": "/v1/aokie-companion/relay/frames",
+        "auth": "Bearer of the plugin",
+        "body": {
+          "to": "mobile:uxkzb9AeGnDj20rkFU1Yw-Rb677yRjr3N-cMDrjZWxY",
+          "frames": [
+            {
+              "kind": "plugin_idle"
+            }
+          ]
+        },
+        "bodyText": "{\"to\":\"mobile:uxkzb9AeGnDj20rkFU1Yw-Rb677yRjr3N-cMDrjZWxY\",\"frames\":[{\"kind\":\"plugin_idle\"}]}"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "body": {
+          "accepted": 1,
+          "seq": 1,
+          "time": 1790000000
+        }
+      },
+      "note": "Answered like a delivered post (200, the same three members) and stored nowhere: the shipped plugin ends the session of every phone on a 403, so the removal of one phone must not look like an error. The same answer covers a revoked phone, one the roster dropped, one the plugin's admission does not list, and another desktop's."
+    }
+  ]
+}

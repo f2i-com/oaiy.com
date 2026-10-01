@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://oaiy.com/schemas/relay/v1/pairing-fetch-response.schema.json",
   "title": "Rendezvous state",
-  "description": "200 response of GET /v1/pair/{pid}. An unknown or expired pid is one 404 with an identical body and timing.",
+  "description": "200 response of GET /v1/pair/{pid}. An unknown, an expired and a burned pid are one 404 with an identical body and timing. `hold` appears only when the request waited (wait > 0 on a live, unchanged rendezvous) and means what it means on a poll: granted, granted and superseded by a newer wait, or refused because the pool is nearly full (the answer is then the state as it is now, at once).",
   "type": "object",
   "properties": {
     "v": {
@@ -50,6 +50,43 @@
     },
     "time": {
       "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    },
+    "hold": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "granted": {
+              "const": true
+            },
+            "superseded": {
+              "const": true
+            }
+          },
+          "required": [
+            "granted"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "refused": {
+              "const": true
+            },
+            "retryAfter": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 120
+            }
+          },
+          "required": [
+            "refused",
+            "retryAfter"
+          ],
+          "additionalProperties": true
+        }
+      ]
     }
   },
   "required": [

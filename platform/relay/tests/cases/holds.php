@@ -169,6 +169,40 @@ test('4.7.2 rule 1: a marker stamped more than a minute ahead (a clock that step
     ok(!is_file($ahead) && is_file($skew));
 });
 
+test('4.7.2 rule 1: a marker is stamped with the relay\'s own clock, so a data folder whose clock is minutes or hours off PHP\'s (a network share) does not make every hold invisible, and the pool caps still bind', function () {
+    $r = Relay::make();
+    // A filesystem whose clock differs from PHP's is a PHP clock that differs from the stamp the filesystem puts on a new file.
+    // The test process cannot change either, so the clock the registry reads is one that is $off seconds from the real one.
+    foreach ([300, -300, 7200, -7200] as $off) {
+        $h = new Holds($r->data, $r->ctx()->eff, fn() => time() + $off); // soft 3
+        $held = [];
+        foreach (['a', 'b', 'c'] as $p) {
+            $held[$p] = $h->acquire('poll', "dev-$p-$off", 'edge', 20);
+            ok($held[$p] !== null, "edge hold $p is granted with the filesystem $off seconds off");
+        }
+        eq(3, $h->liveCount(), "the three markers count with the filesystem $off seconds off");
+        eq(null, $h->acquire('poll', "dev-d-$off", 'edge', 20), "the fourth is refused with the filesystem $off seconds off: the cap binds");
+        eq(1, $h->inFlight('poll', "dev-a-$off"), 'and in flight counts too');
+        foreach (glob($r->data . '/holds/poll/*/*') ?: [] as $f) {
+            ok(abs(filemtime($f) - (time() + $off)) <= 3, 'the marker carries the relay\'s clock, not the filesystem\'s');
+        }
+        // The heartbeat is stamped the same way.
+        $ref = new ReflectionProperty(\Oaiy\Relay\Hold::class, 'touched');
+        $ref->setAccessible(true);
+        $f = glob($r->data . '/holds/poll/' . Signals::hash("dev-a-$off") . '/*')[0];
+        touch($f, 1000);
+        $ref->setValue($held['a'], 0.0); // "the last touch was long ago"
+        $held['a']->refresh();
+        clearstatcache(true, $f);
+        ok(abs(filemtime($f) - (time() + $off)) <= 3, 'a refresh stamps the relay\'s clock too');
+        eq(3, $h->liveCount());
+        foreach ($held as $x) {
+            $x->release();
+        }
+        eq(0, $h->liveCount());
+    }
+});
+
 test('4.7.2 rule 5: at most four waiting lookups per device; the fifth is 429 rate_limited with Retry-After 1', function () {
     $r = Relay::make();
     $h = $r->ctx()->holds;
@@ -519,6 +553,7 @@ test('4.7.2 rule 5: the fifth waiting lookup of a device is 429 at once while fo
     eq(429, $fifth['status'], $fifth['body']);
     eq('rate_limited', $fifth['json']['error']['code']);
     eq('1', $fifth['headers']['retry-after']);
+    ok(!array_key_exists('rule', $fifth['json']['error']), 'a lookup is not a consumer poll: its 429 names no poll rule');
     // The four are still held and none was superseded.
     foreach ($held as $i => $h) {
         $res = holds_finish($h, 8.0);
@@ -541,6 +576,136 @@ test('4.7.2 rule 4: a consumer poll and the same device\'s lookups are independe
     $p = holds_finish($poll, 6.0);
     eq(['granted' => true], $l['json']['hold']);
     eq(['granted' => true], $p['json']['hold'], 'the lookup did not end the poll');
+});
+
+test('4.7.2 rule 5: a credential has at most three polls that wait running at once, the ones being superseded included: the fourth is 429 rate_limited with Retry-After 1 before the poll reads or writes anything of its own (the credential\'s check came first), and takes no place', function () {
+    $r = Relay::make(['wait' => ['max' => 8], 'capacity' => ['workers' => 20]]);
+    $d = $r->desktop();
+    $phone = $r->phone($d);
+    $holds = $r->ctx()->holds;
+    // In process: the registry's own bound, through the same call the poll makes.
+    $made = [];
+    for ($i = 1; $i <= 3; $i++) {
+        $made[] = $holds->acquire('poll', $phone->id, 'edge', 8, 0, Holds::POLL_INFLIGHT_MAX);
+        eq($i, $holds->inFlight('poll', $phone->id), "$i running");
+    }
+    $e = throws(fn() => $holds->acquire('poll', $phone->id, 'edge', 8, 0, Holds::POLL_INFLIGHT_MAX), Oaiy\Relay\ApiError::class);
+    eq([429, 'rate_limited', 1, 'in_flight'], [$e->status, $e->errorCode, $e->retryAfter, $e->rule]);
+    eq(3, $holds->inFlight('poll', $phone->id), 'the refused one left no marker');
+    eq(0, $holds->inFlight('poll', $d->id), 'another credential is not counted');
+    // Through the whole request, with three polls running (their markers, as a running poll leaves them): the fourth is refused at once,
+    // and a refusal changes nothing (no presence, no generation that supersedes the others, no marker): the cheapest answer there is.
+    $db = $r->ctx()->db;
+    $signals = $r->ctx()->signals;
+    $before = [$db->val('SELECT last_poll_at FROM devices WHERE id = ?', [$phone->id]), $signals->readGen($phone->id)];
+    $t = microtime(true);
+    $res = $r->call($phone, 'GET', '/v1/poll', null, ['wait' => '4']);
+    ok(microtime(true) - $t < 1.0, 'refused at once, not after a wait');
+    eq(429, $res['status'], $res['body']);
+    eq('rate_limited', $res['json']['error']['code'] ?? null);
+    eq('in_flight', $res['json']['error']['rule'] ?? null, 'the answer says which rule refused the poll (README 5.1.1, rule P4)');
+    eq('1', $res['headers']['retry-after']);
+    eq(3, $holds->inFlight('poll', $phone->id), 'and took no place');
+    eq($before, [$db->val('SELECT last_poll_at FROM devices WHERE id = ?', [$phone->id]), $signals->readGen($phone->id)], 'a refusal wrote neither presence nor the generation');
+    // With one of the three gone there are two running, and the next poll is let through: the bound is three and not two (a pre-check that
+    // refused at two would pass every test above).
+    $made[0]->release();
+    eq(2, $holds->inFlight('poll', $phone->id));
+    $res = $r->call($phone, 'GET', '/v1/poll', null, ['wait' => '1']);
+    eq(200, $res['status'], 'two running, a third is let through: ' . $res['body']);
+    eq(['granted' => true], $res['json']['hold']);
+    $made[0] = $holds->acquire('poll', $phone->id, 'edge', 8, 0, Holds::POLL_INFLIGHT_MAX); // the place that was freed is taken again, for the rest of the test
+    // A request that does not wait is never counted, and the bound is on the credential: another device polls as it likes.
+    eq(200, $r->call($phone, 'GET', '/v1/poll')['status'], 'wait=0 holds nothing');
+    eq(200, $r->call($d, 'GET', '/v1/poll', null, ['wait' => '1'])['status'], 'another credential has its own');
+    foreach ($made as $h) {
+        $h->release();
+    }
+    eq(0, holds_count($r));
+    eq(200, $r->call($phone, 'GET', '/v1/poll', null, ['wait' => '1'])['status'], 'and a place that was freed is taken');
+});
+
+test('4.7.2 rule 5: the bound is made atomic by the order of marker then count, not by luck: with three other polls of the credential having made their markers between this one\'s pre-check and its count, this one is refused every time, and with two it is let through', function () {
+    $r = Relay::make(['wait' => ['max' => 8], 'capacity' => ['workers' => 20]]);
+    $d = $r->desktop();
+    $phone = $r->phone($d);
+    $dir = $r->data . '/holds/poll/' . Signals::hash($phone->id);
+    // Requests that run in the same instant cannot be made to meet at one point from outside (a test that tries is a race, and passes or
+    // fails by timing). The point is a hook in Holds::acquire: it is called when this hold has made its marker and not yet counted the
+    // others, and there the test makes the markers that three other polls, which passed the same pre-check a moment ago, have made.
+    $others = static function (int $n) use ($dir): \Closure {
+        return static function (string $kind, string $principal, string $file) use ($n, $dir): void {
+            if ($kind !== 'poll') {
+                return;
+            }
+            for ($i = 0; $i < $n; $i++) {
+                file_put_contents($dir . '/20.' . bin2hex(random_bytes(6)), '');
+            }
+            Holds::$afterMarker = null; // once
+        };
+    };
+    try {
+        Holds::$afterMarker = $others(3);
+        $res = $r->call($phone, 'GET', '/v1/poll', null, ['wait' => '1']);
+        eq(429, $res['status'], 'the pre-check saw none; the count, after the marker, sees three: ' . $res['body']);
+        eq('1', $res['headers']['retry-after']);
+        eq(3, $r->ctx()->holds->inFlight('poll', $phone->id), 'and its own marker was taken away');
+        foreach (Oaiy\Relay\Fs::entries($dir) as $f) {
+            unlink($f);
+        }
+        Holds::$afterMarker = $others(2);
+        $res = $r->call($phone, 'GET', '/v1/poll', null, ['wait' => '1']);
+        eq(200, $res['status'], 'two others and this one are three: ' . $res['body']);
+        eq(['granted' => true], $res['json']['hold']);
+    } finally {
+        Holds::$afterMarker = null;
+    }
+});
+test('4.7.2 rule 5: eight polls of one credential that arrive together are not all let through: the marker is made first and the others counted second, so at most three run', function () {
+    $r = Relay::make(['wait' => ['max' => 8], 'capacity' => ['workers' => 20]]);
+    $d = $r->desktop();
+    $phone = $r->phone($d);
+    $servers = $r->fleet(8);
+    usleep(300000);
+    // Every request is sent but for its last two bytes, and the last two bytes are then sent to all eight in one go: a server starts
+    // on a request when it has the whole header, so the eight are in the same step at the same time, all before any of them has a
+    // marker, and a check that was made before the markers were made would let every one of them through. What the bound promises is how
+    // many of them RUN: at most three. It does not promise that one does: create-then-count is atomic in the other direction, so when all
+    // eight make their markers before any of them has counted, each counts seven others and every one of the eight is refused (the review
+    // measured 3 runs in 100 on SQLite and 11 in 30 on MySQL: the test of this once required at least one, and failed for that).
+    // The deterministic test above (the hook between the marker and the count) is what proves the atomicity; this one is the end to end sample.
+    $pend = [];
+    $socks = [];
+    foreach ($servers as $s) {
+        $sock = stream_socket_client('tcp://127.0.0.1:' . $s->port, $errno, $errstr, 5.0);
+        $p = new \OaiyTest\PendingHttp($sock);
+        $p->write("GET /v1/poll?wait=3 HTTP/1.1\r\nHost: 127.0.0.1:{$s->port}\r\nConnection: close\r\nAuthorization: Bearer {$phone->token}\r\n");
+        $pend[] = $p;
+        $socks[] = $p;
+    }
+    usleep(200000);
+    foreach ($socks as $p) {
+        $p->write("\r\n");
+    }
+    $granted = $refused = 0;
+    foreach ($pend as $p) {
+        $res = holds_finish($p, 8.0);
+        if ($res['status'] === 429) {
+            // the documented refusal: rate_limited, the in-flight rule, Retry-After 1
+            $refused++;
+            eq('rate_limited', $res['json']['error']['code'] ?? null, $res['body']);
+            eq('in_flight', $res['json']['error']['rule'] ?? null, $res['body']);
+            eq('1', $res['headers']['retry-after']);
+        } else {
+            // a poll that ran: its hold was granted (superseded polls end with granted too)
+            eq(200, $res['status'], $res['body']);
+            eq(true, $res['json']['hold']['granted'] ?? null, $res['body']);
+            $granted++;
+        }
+    }
+    ok($granted <= 3, "$granted of 8 simultaneous polls ran: at most three of one credential may (and none is an allowed outcome: see above)");
+    eq(8, $granted + $refused, 'every one of the eight was answered, a granted poll or the documented 429, and nothing else');
+    eq(0, holds_count($r));
 });
 
 test('4.7.2 rule 5: many polls from one device leave exactly one live hold, and the workers that held the superseded ones are free again', function () {
@@ -567,7 +732,7 @@ test('4.7.2 rule 5: many polls from one device leave exactly one live hold, and 
         }
         ok($free !== null, "poll $i found a free worker");
         $slot[$free] = $pend[] = holds_begin($servers[$free], $d, ['wait' => '8']);
-        usleep(60000);
+        usleep(130000); // an honest retry, a little over half a step apart: at most three of one credential run at once (below)
     }
     // Every superseded hold ends within a quarter of a second of the newer poll starting: the pool drains at once.
     $t0 = microtime(true);
@@ -581,7 +746,8 @@ test('4.7.2 rule 5: many polls from one device leave exactly one live hold, and 
         }
     } while ($open > 1 && microtime(true) - $t0 < 4.0);
     $drain = microtime(true) - $t0;
-    ok($open <= 1, "the superseded polls were answered within " . round($drain * 1000) . " ms of the last one being sent ($open still open)");    // Now the count is what the rule says. Health goes to every worker of the pool at once, and all but the one that is still
+    ok($open <= 1, "the superseded polls were answered within " . round($drain * 1000) . " ms of the last one being sent ($open still open)");
+    // Now the count is what the rule says. Health goes to every worker of the pool at once, and all but the one that is still
     // holding the newest poll answer immediately: the workers that held superseded polls are free.
     $probes = array_map(fn($s) => $s->begin('GET', '/v1/health'), $servers);
     $t1 = microtime(true);
@@ -599,11 +765,12 @@ test('4.7.2 rule 5: many polls from one device leave exactly one live hold, and 
     eq(1, holds_count($r), 'one live hold, the newest: no superseded hold lingers');
     ok(count($answered) >= 4, 'four of the five workers answered health at once (' . count($answered) . ' did, in ' . implode(', ', array_map(fn($x) => round($x * 1000) . ' ms', $answered)) . '): the workers that held superseded polls are free');
     foreach ($probes as $p) {
-        eq(200, $p->finish(15.0)['status']); // the fifth is the worker that holds the newest poll: it answers when that ends
-    }    $superseded = 0;
+        eq(200, $p->finish(15.0)['status'], 'health' . $r->errorSites()); // the fifth is the worker that holds the newest poll: it answers when that ends
+    }
+    $superseded = 0;
     foreach ($pend as $p) {
         $res = holds_finish($p, 15.0);
-        eq(200, $res['status'], $res['body']);
+        eq(200, $res['status'], $res['body'] . $r->errorSites()); // (a 401 or a 404 here says, below its status, which line of the relay decided it)
         $superseded += isset($res['json']['hold']['superseded']) ? 1 : 0;
     }
     ok($superseded >= 15, "$superseded of 20 were superseded by a newer poll");

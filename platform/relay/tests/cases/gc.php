@@ -251,6 +251,108 @@ test('4.18.6 GC stops between steps when its time budget is spent, and the next 
     eq(0, (int)$r->ctx()->db->val('SELECT live_items FROM mailboxes WHERE id = ?', [$d->inbox()]));
 });
 
+test('4.18.6 a backlog is cut at the budget between chunks of a hundred rows, in the deletes of metadata and of limiter rows alike: the budget is asked after every chunk, and a pass that has none left stops there and the next goes on', function () {
+    $r = Relay::make();
+    $d = $r->desktop();
+    $ctx = $r->ctx();
+    $db = $ctx->db;
+    $box = $d->inbox();
+    $old = Relay::T0 - 7200;
+    $db->write(function (Db $x) use ($box, $old): void {
+        $x->exec('INSERT INTO mailboxes (id, next_seq, live_items, live_bytes, bulk_items, bulk_bytes, created_at) VALUES (?, 2501, 0, 0, 0, 0, ?)', [$box, $old]);
+        $item = $x->pdo()->prepare('INSERT INTO items (mailbox, seq, lane, id, sender, re, rp, hdr, body, body_hash, size, subject_id, grants, state, at, exp, delivered_at, acked_at) VALUES (?, ?, \'cmd\', ?, \'s\', NULL, NULL, \'{}\', NULL, ?, 1, NULL, NULL, 2, ?, ?, NULL, ?)');
+        for ($i = 1; $i <= 2500; $i++) {
+            $item->execute([$box, $i, 'm' . $i, str_repeat('0', 64), $old, $old + 60, $old + 30]);
+        }
+    });
+    // The budget is a function that says yes a set number of times, so that the test does not depend on how fast the machine is: it is
+    // asked once before a round and once after each chunk, so "three yeses" is two full chunks run and a third after which it says no.
+    $budget = static function (int $yes): callable {
+        $n = 0;
+        return static function () use (&$n, $yes): bool {
+            return ++$n <= $yes;
+        };
+    };
+    $delete = new ReflectionMethod(Oaiy\Relay\Gc::class, 'deleteItems');
+    $delete->setAccessible(true);
+    $where = 'state IN (2, 3) AND ((state = 2 AND acked_at < ?) OR (state = 3 AND exp < ?))';
+    $cut = Relay::T0 - 600;
+    eq(300, $delete->invoke($ctx->gc, $where, [$cut, $cut], $budget(3)), 'three yeses: three chunks of a hundred, and the pass stops after the third');
+    eq(2200, (int)$db->val('SELECT COUNT(*) FROM items WHERE state = 2'));
+    eq(100, $delete->invoke($ctx->gc, $where, [$cut, $cut], $budget(1)), 'one yes (before the round): one chunk, then the question after it says no');
+    eq(0, $delete->invoke($ctx->gc, $where, [$cut, $cut], $budget(0)), 'no yes: nothing starts');
+    eq(2100, (int)$db->val('SELECT COUNT(*) FROM items WHERE state = 2'));
+    // The limiter table: more rows than it may keep, the oldest go, a chunk at a time, until the budget says no.
+    $over = 350;
+    $db->write(function (Db $x) use ($over): void {
+        for ($from = 1; $from <= Oaiy\Relay\Gc::RL_MAX_ROWS + $over; $from += 500) {
+            $rows = [];
+            $args = [];
+            for ($i = $from; $i < $from + 500 && $i <= Oaiy\Relay\Gc::RL_MAX_ROWS + $over; $i++) {
+                $rows[] = '(?, ?, 1)';
+                array_push($args, 'w:bulk-' . $i, (Relay::T0 - 60 + ($i % 50)) * 1000);
+            }
+            $x->exec('INSERT INTO rl (k, w, n) VALUES ' . implode(', ', $rows), $args);
+        }
+    });
+    $count = fn(): int => (int)$db->val("SELECT COUNT(*) FROM rl WHERE k NOT LIKE 's:%'");
+    $before = $count();
+    $bound = new ReflectionMethod(Oaiy\Relay\Gc::class, 'boundLimiterRows');
+    $bound->setAccessible(true);
+    eq(200, $bound->invoke($ctx->gc, $budget(2)), 'two yeses: the question before the first chunk and the one after it; the chunk after that was the last');
+    eq($before - 200, $count());
+    eq(100, $bound->invoke($ctx->gc, $budget(1)), 'one yes: one chunk');
+    eq(0, $bound->invoke($ctx->gc, $budget(0)));
+    // And a pass with no limit finishes what is left.
+    $left = $count() - Oaiy\Relay\Gc::RL_MAX_ROWS;
+    eq($left, $bound->invoke($ctx->gc, $budget(1000)), 'with budget the rest of the excess goes');
+    eq(Oaiy\Relay\Gc::RL_MAX_ROWS, $count());
+});
+slow_test('4.18.6 a backlog of a hundred thousand rows is worked off over several passes: a pass of 50 ms spends about 50 ms in the deletes of metadata and of limiter rows, where it took a second or more, and the passes together leave nothing', function () {
+    $r = Relay::make();
+    $d = $r->desktop();
+    $ctx = $r->ctx();
+    $db = $ctx->db;
+    $box = $d->inbox();
+    $old = Relay::T0 - 7200;
+    $db->write(function (Db $x) use ($box, $old): void {
+        $x->exec('INSERT INTO mailboxes (id, next_seq, live_items, live_bytes, bulk_items, bulk_bytes, created_at) VALUES (?, 60001, 0, 0, 0, 0, ?)', [$box, $old]);
+        $item = $x->pdo()->prepare('INSERT INTO items (mailbox, seq, lane, id, sender, re, rp, hdr, body, body_hash, size, subject_id, grants, state, at, exp, delivered_at, acked_at) VALUES (?, ?, \'cmd\', ?, \'s\', NULL, NULL, \'{}\', NULL, ?, 1, NULL, NULL, 2, ?, ?, NULL, ?)');
+        for ($i = 1; $i <= 60000; $i++) {
+            $item->execute([$box, $i, 'm' . $i, str_repeat('0', 64), $old, $old + 60, $old + 30]);
+        }
+    });
+    eq(60000, (int)$db->val("SELECT COUNT(*) FROM items WHERE state = 2"));
+    // Passes of 50 ms until the job is done: the time of each, and how many it took.
+    $work = function (callable $done) use ($ctx): array {
+        $times = [];
+        do {
+            $t0 = microtime(true);
+            $ctx->gc->pass(Relay::T0, 50);
+            $times[] = microtime(true) - $t0;
+        } while (!$done() && count($times) < 600);
+        sort($times);
+        return [$times, $times[intdiv(count($times), 2)]];
+    };
+    // First the metadata alone...
+    [$times, $median] = $work(fn(): bool => (int)$db->val("SELECT COUNT(*) FROM items WHERE state IN (2, 3)") === 0);
+    ok(count($times) > 2, 'the metadata took ' . count($times) . ' passes, not one');
+    ok($median < 0.1, sprintf('the median pass of the metadata took %.3f s against a budget of 0.05 (one pass took %.3f s at most)', $median, end($times)));
+    ok(end($times) < 0.5, sprintf('and none took %.3f s', end($times)));
+    // ...then a limiter table sixty thousand rows over its bound (they are live windows: bounded by the cap, not by age).
+    $db->write(function (Db $x): void {
+        $rl = $x->pdo()->prepare('INSERT INTO rl (k, w, n) VALUES (?, ?, 1)');
+        for ($i = 1; $i <= 60000; $i++) {
+            $rl->execute(['w:bulk-' . $i, (Relay::T0 - 60 + ($i % 50)) * 1000]);
+        }
+    });
+    [$times, $median] = $work(fn(): bool => (int)$db->val("SELECT COUNT(*) FROM rl WHERE k NOT LIKE 's:%'") <= Oaiy\Relay\Gc::RL_MAX_ROWS);
+    ok(count($times) > 2, 'the limiter rows took ' . count($times) . ' passes, not one');
+    ok($median < 0.1, sprintf('the median pass over the limiter rows took %.3f s against a budget of 0.05', $median));
+    ok(end($times) < 0.5, sprintf('and none took %.3f s', end($times)));
+    eq(0, (int)$db->val("SELECT COUNT(*) FROM items WHERE state IN (2, 3)"), 'all the metadata is gone');
+});
+
 // ------------------------------------------------------------------------------------------------ 4.18.6 when it runs
 
 test('4.18.6 without a finish_request function GC runs only after health and status requests, and only for 50 ms', function () {

@@ -57,7 +57,7 @@ final class Db
         try {
             $this->pdo = $this->driver === 'mysql' ? $this->connectMysql() : $this->connectSqlite();
         } catch (\PDOException $e) {
-            throw new ApiError(503, 'unavailable', null, 5);
+            throw ApiError::databaseBusy(5, 'db_open');
         }
         return $this->pdo;
     }
@@ -172,7 +172,8 @@ final class Db
     private static function cast(array $r): array
     {
         foreach (self::INT_COLS as $c) {
-            if (isset($r[$c]) && is_string($r[$c])) {
+            // Only a number: pairings.state is text ('open', 'answered') under a name items.state uses for an integer.
+            if (isset($r[$c]) && is_string($r[$c]) && is_numeric($r[$c])) {
                 $r[$c] = (int)$r[$c];
             }
         }
@@ -183,6 +184,18 @@ final class Db
     public function forUpdate(): string
     {
         return $this->driver === 'mysql' ? ' FOR UPDATE' : '';
+    }
+
+    /**
+     * Append to a SELECT that must read the row as it is now and keep it from being changed until this transaction ends, without
+     * keeping other readers of it out (MySQL and MariaDB: a shared lock, LOCK IN SHARE MODE, which both accept; SQLite locks the file).
+     * MySQL 8.0 and later call that form deprecated in favour of FOR SHARE (8.4.7 still runs it, and warns nothing a client sees);
+     * MariaDB (11.4 here) does not accept FOR SHARE, so the one spelling both take is the one used. If a later MySQL drops it, this is the
+     * one place to give MySQL its own.
+     */
+    public function forShare(): string
+    {
+        return $this->driver === 'mysql' ? ' LOCK IN SHARE MODE' : '';
     }
 
     /**
@@ -258,7 +271,7 @@ final class Db
                         usleep(random_int(20000, 100000));
                         continue;
                     }
-                    throw new ApiError(503, 'unavailable', null, 1);
+                    throw ApiError::databaseBusy(1, 'db_busy');
                 }
                 throw $e;
             }
@@ -304,6 +317,30 @@ final class Db
         $m = $e->getMessage();
         return stripos($m, 'database is locked') !== false || stripos($m, 'database table is locked') !== false
             || stripos($m, 'Lock wait timeout') !== false || stripos($m, 'Deadlock found') !== false;
+    }
+
+    /**
+     * A database error that is the database's state and not the relay's mistake, and that goes away: a busy or locked database, a
+     * deadlock or a lock wait timeout (isBusy), a connection the server dropped or refused (gone away, lost connection, too many
+     * connections, the server shutting down), and a file SQLite cannot open or write for the moment (I/O error, a full disk). The
+     * relay answers these 503 unavailable with Retry-After, never 500 and never a refusal of a credential that is fine.
+     */
+    public static function isTransient(\PDOException $e): bool
+    {
+        if (self::isBusy($e)) {
+            return true;
+        }
+        $code = $e->errorInfo[1] ?? null;
+        if (in_array($code, [10, 13, 14, 1040, 1053, 1203, 1317, 2002, 2003, 2006, 2013, 2055], true)) {
+            return true; // SQLite: I/O error, disk full, cannot open; MySQL: too many connections, shutdown, user limit, interrupted, cannot connect, gone away, lost
+        }
+        $m = $e->getMessage();
+        foreach (['server has gone away', 'Lost connection', 'Too many connections', 'Server shutdown', 'disk I/O error', 'database or disk is full', 'unable to open database file', 'Connection refused', 'max_user_connections'] as $needle) {
+            if (stripos($m, $needle) !== false) {
+                return true;
+            }
+        }
+        return false;
     }
 
     public static function isDuplicate(\PDOException $e): bool
@@ -361,7 +398,7 @@ final class Db
         if ($this->driver === 'mysql') {
             $locked = (int)$this->val("SELECT GET_LOCK('oaiy-relay-migrate', 20)") === 1;
             if (!$locked) {
-                throw new ApiError(503, 'unavailable', null, 5);
+                throw ApiError::databaseBusy(5, 'db_migrate_lock');
             }
         }
         try {

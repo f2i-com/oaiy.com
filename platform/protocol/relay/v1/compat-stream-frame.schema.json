@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/compat-stream-frame.schema.json",
+  "title": "Aokie frame as delivered",
+  "description": "One stored frame as the relay delivers it: an element of the frames page and the `data` of an SSE `frame` event (README section 4.14.5). `from`, `subjectId` and `grants` are the relay's own record of the verified sender (interpretation 38): nothing in `frame` can set them. `frame` is the document the sender posted, as an object.",
+  "type": "object",
+  "properties": {
+    "seq": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/seq"
+    },
+    "from": {
+      "type": "string",
+      "pattern": "^(plugin|mobile:[A-Za-z0-9_-]{43})$"
+    },
+    "subjectId": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/appId"
+    },
+    "grants": {
+      "type": "array",
+      "items": {
+        "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/grant"
+      },
+      "maxItems": 16,
+      "uniqueItems": true
+    },
+    "frame": {
+      "type": "object"
+    }
+  },
+  "required": [
+    "seq",
+    "from",
+    "subjectId",
+    "grants",
+    "frame"
+  ],
+  "additionalProperties": false
+}

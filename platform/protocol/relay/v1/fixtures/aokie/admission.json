@@ -1,0 +1,877 @@
+{
+  "protocol": "oaiy-relay/1",
+  "title": "Admissions recorded from the relay, for the plugin's and the phone's decoders",
+  "about": "The requests the desktop's broker and a phone send to POST /v1/aokie-companion/admission (or /v1/admission) and the relay's answers, with the vectors' keys and ids. The accessToken is signed with the admission secret named in relay.admissionSecretHex (Appendix A4's test secret), so a reader can verify the claims against the answer. The jti and the times are the recording's. A Rust contract test feeds each response to AdmissionResponse (plugin) or AdmissionResponse (phone) and checks what the README says.",
+  "relay": {
+    "url": "https://relay.example.com",
+    "clock": 1790000000,
+    "stunUrls": [
+      "stun:stun.example.com:3478"
+    ],
+    "turnUrls": [
+      "turn:turn.example.com:3478?transport=udp",
+      "turns:turn.example.com:5349?transport=tcp"
+    ],
+    "turnSecret": "0123456789abcdef0123456789abcdef",
+    "turnTtl": 600,
+    "admissionSecretHex": "0101010101010101010101010101010101010101010101010101010101010101"
+  },
+  "identities": {
+    "desktopDevice": "dev-oKGio6SlpqeoqaqrrK2urw",
+    "desktopEndpointThumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4",
+    "phoneA": "dev-sLGys7S1tre4ubq7vL2-vw",
+    "phoneAThumbprint": "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck",
+    "phoneB": "dev-CAgICAgICAgICAgICAgICA",
+    "phoneBThumbprint": "E916XTjJCK82vAibEGGhB3lDV7wANvlLfxiCNTqfo_c"
+  },
+  "cases": [
+    {
+      "name": "plugin, stream, STUN and TURN",
+      "role": "plugin",
+      "note": "What the desktop's broker sends (upstream.rs) plus supportedTransports. The two phones are the roster, revision 7.",
+      "request": {
+        "method": "POST",
+        "path": "/v1/aokie-companion/admission",
+        "auth": "the desktop's device token",
+        "body": {
+          "appId": "aokie",
+          "pluginId": "aokie",
+          "displayName": "Receptionist",
+          "endpointPublicKey": {
+            "algorithm": "ed25519",
+            "publicKey": "_RckOFqgx1tk-3jNYC-h2ZH96_drE8WO1wLqyDXp9hg",
+            "thumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4"
+          },
+          "holderKeyThumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4",
+          "approvedPeerKeyThumbprints": [
+            "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck",
+            "E916XTjJCK82vAibEGGhB3lDV7wANvlLfxiCNTqfo_c"
+          ],
+          "peerRosterRevision": 7,
+          "peerRosterHash": "7ZEsQj6A1UiNIqXrEYfYSjfKRGenwlQVgZOvWXQQ-Ns",
+          "supportedTransports": [
+            "relay"
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "body": {
+          "accessToken": "aokie-adm-v2.7b22617564223a22616f6b69652d76322d67617465776179222c226170704964223a22616f6b6965222c227375626a6563744964223a22616f6b6965222c22726f6c65223a22706c7567696e222c22686f6c6465724b65795468756d627072696e74223a2261745a523633744e4733573247685070566c654b6e667277314e374e364c41714f65356772453253425234222c22617070726f766564506565724b65795468756d627072696e7473223a5b222d2d36494d356c304f6f734c6a397957736b495359685541336e5f33435552516b6d72594d5368615f636b222c224539313658546a4a434b3832764169624547476842336c44563777414e766c4c667869434e5471666f5f63225d2c2270656572526f737465725265766973696f6e223a372c2270656572526f7374657248617368223a22375a4573516a36413155694e4971587245596659536a664b5247656e776c5156675a4f76575851512d4e73222c2273636f706573223a5b2273746174655f72656164222c227274635f7369676e616c225d2c2264736b223a226465762d6f4b47696f36536c7071656f71617172724b32757277222c22657870223a313739303030303039302c226a7469223a2261646d5f3764653431303634306365323230646633313538396365623932333931386530227d.30b5a4e63939e45d1e1083cbae7fe5e56a5005f8f880a4ebaafc8d2998b014c3",
+          "tokenType": "Bearer",
+          "expiresIn": 90,
+          "expiresAt": 1790000090,
+          "gatewayUrl": "wss://relay.example.com/v2/realtime",
+          "appId": "aokie",
+          "subjectId": "aokie",
+          "role": "plugin",
+          "scopes": [
+            "state_read",
+            "rtc_signal"
+          ],
+          "device": {
+            "id": "aokie",
+            "appId": "aokie",
+            "subjectId": "aokie",
+            "role": "plugin"
+          },
+          "iceServers": [
+            {
+              "urls": [
+                "stun:stun.example.com:3478"
+              ],
+              "username": "",
+              "credential": ""
+            },
+            {
+              "urls": [
+                "turn:turn.example.com:3478?transport=udp",
+                "turns:turn.example.com:5349?transport=tcp"
+              ],
+              "username": "1790000600:e8e8d6685ab52d2b50f62b7235f0633c",
+              "credential": "OQgYeKPoyZ/vU8h78oHO/Xeymwo=",
+              "expiresAt": 1790000600
+            }
+          ],
+          "relayOnly": false,
+          "turnCredentialExpiresAt": 1790000600,
+          "endpointPublicKey": {
+            "algorithm": "ed25519",
+            "publicKey": "_RckOFqgx1tk-3jNYC-h2ZH96_drE8WO1wLqyDXp9hg",
+            "thumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4"
+          },
+          "holderKeyThumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4",
+          "approvedPeerKeyThumbprints": [
+            "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck",
+            "E916XTjJCK82vAibEGGhB3lDV7wANvlLfxiCNTqfo_c"
+          ],
+          "peerRosterRevision": 7,
+          "peerRosterHash": "7ZEsQj6A1UiNIqXrEYfYSjfKRGenwlQVgZOvWXQQ-Ns",
+          "relay": {
+            "challengeUrl": "https://relay.example.com/v1/aokie-companion/relay/challenge",
+            "framesUrl": "https://relay.example.com/v1/aokie-companion/relay/frames",
+            "streamUrl": "https://relay.example.com/v1/aokie-companion/relay/stream"
+          }
+        }
+      }
+    },
+    {
+      "name": "plugin, exactly as the desktop's broker sends it",
+      "role": "plugin",
+      "note": "upstream.rs (admission_request_body) sends no supportedTransports; the relay reads the absent member as [\"relay\"], so the answer is the stream one.",
+      "request": {
+        "method": "POST",
+        "path": "/v1/aokie-companion/admission",
+        "auth": "the desktop's device token",
+        "body": {
+          "appId": "aokie",
+          "pluginId": "aokie",
+          "displayName": "Receptionist",
+          "endpointPublicKey": {
+            "algorithm": "ed25519",
+            "publicKey": "_RckOFqgx1tk-3jNYC-h2ZH96_drE8WO1wLqyDXp9hg",
+            "thumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4"
+          },
+          "holderKeyThumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4",
+          "approvedPeerKeyThumbprints": [
+            "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck",
+            "E916XTjJCK82vAibEGGhB3lDV7wANvlLfxiCNTqfo_c"
+          ],
+          "peerRosterRevision": 7,
+          "peerRosterHash": "7ZEsQj6A1UiNIqXrEYfYSjfKRGenwlQVgZOvWXQQ-Ns"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "body": {
+          "accessToken": "aokie-adm-v2.7b22617564223a22616f6b69652d76322d67617465776179222c226170704964223a22616f6b6965222c227375626a6563744964223a22616f6b6965222c22726f6c65223a22706c7567696e222c22686f6c6465724b65795468756d627072696e74223a2261745a523633744e4733573247685070566c654b6e667277314e374e364c41714f65356772453253425234222c22617070726f766564506565724b65795468756d627072696e7473223a5b222d2d36494d356c304f6f734c6a397957736b495359685541336e5f33435552516b6d72594d5368615f636b222c224539313658546a4a434b3832764169624547476842336c44563777414e766c4c667869434e5471666f5f63225d2c2270656572526f737465725265766973696f6e223a372c2270656572526f7374657248617368223a22375a4573516a36413155694e4971587245596659536a664b5247656e776c5156675a4f76575851512d4e73222c2273636f706573223a5b2273746174655f72656164222c227274635f7369676e616c225d2c2264736b223a226465762d6f4b47696f36536c7071656f71617172724b32757277222c22657870223a313739303030303039302c226a7469223a2261646d5f3265663335353532366364663865326130396236383263363765643062303662227d.5fe20f7f01eac43372530bc09ec6716d4526cdcedce133cb1c1960b7a23531bf",
+          "tokenType": "Bearer",
+          "expiresIn": 90,
+          "expiresAt": 1790000090,
+          "gatewayUrl": "wss://relay.example.com/v2/realtime",
+          "appId": "aokie",
+          "subjectId": "aokie",
+          "role": "plugin",
+          "scopes": [
+            "state_read",
+            "rtc_signal"
+          ],
+          "device": {
+            "id": "aokie",
+            "appId": "aokie",
+            "subjectId": "aokie",
+            "role": "plugin"
+          },
+          "iceServers": [
+            {
+              "urls": [
+                "stun:stun.example.com:3478"
+              ],
+              "username": "",
+              "credential": ""
+            },
+            {
+              "urls": [
+                "turn:turn.example.com:3478?transport=udp",
+                "turns:turn.example.com:5349?transport=tcp"
+              ],
+              "username": "1790000600:e8e8d6685ab52d2b50f62b7235f0633c",
+              "credential": "OQgYeKPoyZ/vU8h78oHO/Xeymwo=",
+              "expiresAt": 1790000600
+            }
+          ],
+          "relayOnly": false,
+          "turnCredentialExpiresAt": 1790000600,
+          "endpointPublicKey": {
+            "algorithm": "ed25519",
+            "publicKey": "_RckOFqgx1tk-3jNYC-h2ZH96_drE8WO1wLqyDXp9hg",
+            "thumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4"
+          },
+          "holderKeyThumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4",
+          "approvedPeerKeyThumbprints": [
+            "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck",
+            "E916XTjJCK82vAibEGGhB3lDV7wANvlLfxiCNTqfo_c"
+          ],
+          "peerRosterRevision": 7,
+          "peerRosterHash": "7ZEsQj6A1UiNIqXrEYfYSjfKRGenwlQVgZOvWXQQ-Ns",
+          "relay": {
+            "challengeUrl": "https://relay.example.com/v1/aokie-companion/relay/challenge",
+            "framesUrl": "https://relay.example.com/v1/aokie-companion/relay/frames",
+            "streamUrl": "https://relay.example.com/v1/aokie-companion/relay/stream"
+          }
+        }
+      }
+    },
+    {
+      "name": "plugin, poll mode",
+      "role": "plugin",
+      "note": "A carrier that only polls: relay.mode is \"poll\".",
+      "request": {
+        "method": "POST",
+        "path": "/v1/admission",
+        "auth": "the desktop's device token",
+        "body": {
+          "appId": "aokie",
+          "pluginId": "aokie",
+          "displayName": "Receptionist",
+          "endpointPublicKey": {
+            "algorithm": "ed25519",
+            "publicKey": "_RckOFqgx1tk-3jNYC-h2ZH96_drE8WO1wLqyDXp9hg",
+            "thumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4"
+          },
+          "holderKeyThumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4",
+          "approvedPeerKeyThumbprints": [
+            "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck",
+            "E916XTjJCK82vAibEGGhB3lDV7wANvlLfxiCNTqfo_c"
+          ],
+          "peerRosterRevision": 7,
+          "peerRosterHash": "7ZEsQj6A1UiNIqXrEYfYSjfKRGenwlQVgZOvWXQQ-Ns",
+          "supportedTransports": [
+            "relay-poll"
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "body": {
+          "accessToken": "aokie-adm-v2.7b22617564223a22616f6b69652d76322d67617465776179222c226170704964223a22616f6b6965222c227375626a6563744964223a22616f6b6965222c22726f6c65223a22706c7567696e222c22686f6c6465724b65795468756d627072696e74223a2261745a523633744e4733573247685070566c654b6e667277314e374e364c41714f65356772453253425234222c22617070726f766564506565724b65795468756d627072696e7473223a5b222d2d36494d356c304f6f734c6a397957736b495359685541336e5f33435552516b6d72594d5368615f636b222c224539313658546a4a434b3832764169624547476842336c44563777414e766c4c667869434e5471666f5f63225d2c2270656572526f737465725265766973696f6e223a372c2270656572526f7374657248617368223a22375a4573516a36413155694e4971587245596659536a664b5247656e776c5156675a4f76575851512d4e73222c2273636f706573223a5b2273746174655f72656164222c227274635f7369676e616c225d2c2264736b223a226465762d6f4b47696f36536c7071656f71617172724b32757277222c22657870223a313739303030303039302c226a7469223a2261646d5f6338393262333666636231363132366434383639343466393162386436343539227d.a31228a6cb944530c128885fabccc692e135d8f58a608abcfae7bc56f18147f0",
+          "tokenType": "Bearer",
+          "expiresIn": 90,
+          "expiresAt": 1790000090,
+          "gatewayUrl": "wss://relay.example.com/v2/realtime",
+          "appId": "aokie",
+          "subjectId": "aokie",
+          "role": "plugin",
+          "scopes": [
+            "state_read",
+            "rtc_signal"
+          ],
+          "device": {
+            "id": "aokie",
+            "appId": "aokie",
+            "subjectId": "aokie",
+            "role": "plugin"
+          },
+          "iceServers": [
+            {
+              "urls": [
+                "stun:stun.example.com:3478"
+              ],
+              "username": "",
+              "credential": ""
+            },
+            {
+              "urls": [
+                "turn:turn.example.com:3478?transport=udp",
+                "turns:turn.example.com:5349?transport=tcp"
+              ],
+              "username": "1790000600:e8e8d6685ab52d2b50f62b7235f0633c",
+              "credential": "OQgYeKPoyZ/vU8h78oHO/Xeymwo=",
+              "expiresAt": 1790000600
+            }
+          ],
+          "relayOnly": false,
+          "turnCredentialExpiresAt": 1790000600,
+          "endpointPublicKey": {
+            "algorithm": "ed25519",
+            "publicKey": "_RckOFqgx1tk-3jNYC-h2ZH96_drE8WO1wLqyDXp9hg",
+            "thumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4"
+          },
+          "holderKeyThumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4",
+          "approvedPeerKeyThumbprints": [
+            "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck",
+            "E916XTjJCK82vAibEGGhB3lDV7wANvlLfxiCNTqfo_c"
+          ],
+          "peerRosterRevision": 7,
+          "peerRosterHash": "7ZEsQj6A1UiNIqXrEYfYSjfKRGenwlQVgZOvWXQQ-Ns",
+          "relay": {
+            "challengeUrl": "https://relay.example.com/v1/aokie-companion/relay/challenge",
+            "framesUrl": "https://relay.example.com/v1/aokie-companion/relay/frames",
+            "streamUrl": "https://relay.example.com/v1/aokie-companion/relay/stream",
+            "mode": "poll"
+          }
+        }
+      }
+    },
+    {
+      "name": "plugin, a carrier that offers both",
+      "role": "plugin",
+      "note": "The stream wins when the host flushes.",
+      "request": {
+        "method": "POST",
+        "path": "/v1/aokie-companion/admission",
+        "auth": "the desktop's device token",
+        "body": {
+          "appId": "aokie",
+          "pluginId": "aokie",
+          "displayName": "Receptionist",
+          "endpointPublicKey": {
+            "algorithm": "ed25519",
+            "publicKey": "_RckOFqgx1tk-3jNYC-h2ZH96_drE8WO1wLqyDXp9hg",
+            "thumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4"
+          },
+          "holderKeyThumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4",
+          "approvedPeerKeyThumbprints": [
+            "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck",
+            "E916XTjJCK82vAibEGGhB3lDV7wANvlLfxiCNTqfo_c"
+          ],
+          "peerRosterRevision": 7,
+          "peerRosterHash": "7ZEsQj6A1UiNIqXrEYfYSjfKRGenwlQVgZOvWXQQ-Ns",
+          "supportedTransports": [
+            "relay",
+            "relay-poll"
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "body": {
+          "accessToken": "aokie-adm-v2.7b22617564223a22616f6b69652d76322d67617465776179222c226170704964223a22616f6b6965222c227375626a6563744964223a22616f6b6965222c22726f6c65223a22706c7567696e222c22686f6c6465724b65795468756d627072696e74223a2261745a523633744e4733573247685070566c654b6e667277314e374e364c41714f65356772453253425234222c22617070726f766564506565724b65795468756d627072696e7473223a5b222d2d36494d356c304f6f734c6a397957736b495359685541336e5f33435552516b6d72594d5368615f636b222c224539313658546a4a434b3832764169624547476842336c44563777414e766c4c667869434e5471666f5f63225d2c2270656572526f737465725265766973696f6e223a372c2270656572526f7374657248617368223a22375a4573516a36413155694e4971587245596659536a664b5247656e776c5156675a4f76575851512d4e73222c2273636f706573223a5b2273746174655f72656164222c227274635f7369676e616c225d2c2264736b223a226465762d6f4b47696f36536c7071656f71617172724b32757277222c22657870223a313739303030303039302c226a7469223a2261646d5f6630323837363566666532303933326332333066643630343865313463666266227d.b2f9f19cb9b026f8d562c9e0e0a90d87d6a7a94052c200840502c81cea88f42c",
+          "tokenType": "Bearer",
+          "expiresIn": 90,
+          "expiresAt": 1790000090,
+          "gatewayUrl": "wss://relay.example.com/v2/realtime",
+          "appId": "aokie",
+          "subjectId": "aokie",
+          "role": "plugin",
+          "scopes": [
+            "state_read",
+            "rtc_signal"
+          ],
+          "device": {
+            "id": "aokie",
+            "appId": "aokie",
+            "subjectId": "aokie",
+            "role": "plugin"
+          },
+          "iceServers": [
+            {
+              "urls": [
+                "stun:stun.example.com:3478"
+              ],
+              "username": "",
+              "credential": ""
+            },
+            {
+              "urls": [
+                "turn:turn.example.com:3478?transport=udp",
+                "turns:turn.example.com:5349?transport=tcp"
+              ],
+              "username": "1790000600:e8e8d6685ab52d2b50f62b7235f0633c",
+              "credential": "OQgYeKPoyZ/vU8h78oHO/Xeymwo=",
+              "expiresAt": 1790000600
+            }
+          ],
+          "relayOnly": false,
+          "turnCredentialExpiresAt": 1790000600,
+          "endpointPublicKey": {
+            "algorithm": "ed25519",
+            "publicKey": "_RckOFqgx1tk-3jNYC-h2ZH96_drE8WO1wLqyDXp9hg",
+            "thumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4"
+          },
+          "holderKeyThumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4",
+          "approvedPeerKeyThumbprints": [
+            "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck",
+            "E916XTjJCK82vAibEGGhB3lDV7wANvlLfxiCNTqfo_c"
+          ],
+          "peerRosterRevision": 7,
+          "peerRosterHash": "7ZEsQj6A1UiNIqXrEYfYSjfKRGenwlQVgZOvWXQQ-Ns",
+          "relay": {
+            "challengeUrl": "https://relay.example.com/v1/aokie-companion/relay/challenge",
+            "framesUrl": "https://relay.example.com/v1/aokie-companion/relay/frames",
+            "streamUrl": "https://relay.example.com/v1/aokie-companion/relay/stream"
+          }
+        }
+      }
+    },
+    {
+      "name": "phone A, stream, STUN and TURN",
+      "role": "mobile",
+      "note": "What the phone sends (managed_auth.rs) plus supportedTransports.",
+      "request": {
+        "method": "POST",
+        "path": "/v1/aokie-companion/admission",
+        "auth": "the phone's device token",
+        "body": {
+          "appId": "aokie",
+          "deviceId": "dev-sLGys7S1tre4ubq7vL2-vw",
+          "displayName": "Aokie Companion",
+          "holderKeyThumbprint": "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck",
+          "supportedTransports": [
+            "relay"
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "body": {
+          "accessToken": "aokie-adm-v2.7b22617564223a22616f6b69652d76322d67617465776179222c226170704964223a22616f6b6965222c227375626a6563744964223a226465762d734c4779733753317472653475627137764c322d7677222c22726f6c65223a226d6f62696c65222c22686f6c6465724b65795468756d627072696e74223a222d2d36494d356c304f6f734c6a397957736b495359685541336e5f33435552516b6d72594d5368615f636b222c226578706563746564506565724b65795468756d627072696e74223a2261745a523633744e4733573247685070566c654b6e667277314e374e364c41714f65356772453253425234222c2273636f706573223a5b2273746174655f72656164222c2263616c6c65725f72656164222c2263617074696f6e735f72656164222c227274635f7369676e616c225d2c2264736b223a226465762d6f4b47696f36536c7071656f71617172724b32757277222c22657870223a313739303030303039302c226a7469223a2261646d5f6434303863356464626261343438383830643836316264323238363337656130227d.0df9d41385ad3737b4145803b05ee9c23610ae17d7f9c2d199e31c81bbb61d13",
+          "tokenType": "Bearer",
+          "expiresIn": 90,
+          "expiresAt": 1790000090,
+          "gatewayUrl": "wss://relay.example.com/v2/realtime",
+          "appId": "aokie",
+          "subjectId": "dev-sLGys7S1tre4ubq7vL2-vw",
+          "role": "mobile",
+          "holderKeyThumbprint": "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck",
+          "expectedPeerKeyThumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4",
+          "scopes": [
+            "state_read",
+            "caller_read",
+            "captions_read",
+            "rtc_signal"
+          ],
+          "iceServers": [
+            {
+              "urls": [
+                "stun:stun.example.com:3478"
+              ],
+              "username": "",
+              "credential": ""
+            },
+            {
+              "urls": [
+                "turn:turn.example.com:3478?transport=udp",
+                "turns:turn.example.com:5349?transport=tcp"
+              ],
+              "username": "1790000600:7ff63462c30fe39275b3a7c6ac580ce2",
+              "credential": "x4zr15hpi6xJVK29djMqDln7j7M=",
+              "expiresAt": 1790000600
+            }
+          ],
+          "relayOnly": false,
+          "turnCredentialExpiresAt": 1790000600,
+          "device": {
+            "id": "dev-sLGys7S1tre4ubq7vL2-vw",
+            "appId": "aokie",
+            "subjectId": "dev-sLGys7S1tre4ubq7vL2-vw",
+            "role": "mobile",
+            "displayName": "Phone",
+            "grants": [
+              "state_read",
+              "caller_read",
+              "captions_read",
+              "rtc_signal"
+            ],
+            "approvedAt": "2026-09-21T14:13:20Z",
+            "lastSeenAt": "2026-09-21T14:13:20Z"
+          },
+          "relay": {
+            "challengeUrl": "https://relay.example.com/v1/aokie-companion/relay/challenge",
+            "framesUrl": "https://relay.example.com/v1/aokie-companion/relay/frames",
+            "streamUrl": "https://relay.example.com/v1/aokie-companion/relay/stream"
+          }
+        }
+      }
+    },
+    {
+      "name": "phone B, poll mode",
+      "role": "mobile",
+      "note": "The second phone has the narrower grants (state_read only).",
+      "request": {
+        "method": "POST",
+        "path": "/v1/admission",
+        "auth": "the phone's device token",
+        "body": {
+          "appId": "aokie",
+          "deviceId": "dev-CAgICAgICAgICAgICAgICA",
+          "displayName": "Aokie Companion",
+          "holderKeyThumbprint": "E916XTjJCK82vAibEGGhB3lDV7wANvlLfxiCNTqfo_c",
+          "supportedTransports": [
+            "relay-poll"
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "body": {
+          "accessToken": "aokie-adm-v2.7b22617564223a22616f6b69652d76322d67617465776179222c226170704964223a22616f6b6965222c227375626a6563744964223a226465762d43416749434167494341674943416749434167494341222c22726f6c65223a226d6f62696c65222c22686f6c6465724b65795468756d627072696e74223a224539313658546a4a434b3832764169624547476842336c44563777414e766c4c667869434e5471666f5f63222c226578706563746564506565724b65795468756d627072696e74223a2261745a523633744e4733573247685070566c654b6e667277314e374e364c41714f65356772453253425234222c2273636f706573223a5b2273746174655f72656164225d2c2264736b223a226465762d6f4b47696f36536c7071656f71617172724b32757277222c22657870223a313739303030303039302c226a7469223a2261646d5f6365643835376634326137353038613466353235396130633431363138386435227d.c481127f01b52a4257a39526d0d49d2d208f9840f32b91a678389a4703e4a4ff",
+          "tokenType": "Bearer",
+          "expiresIn": 90,
+          "expiresAt": 1790000090,
+          "gatewayUrl": "wss://relay.example.com/v2/realtime",
+          "appId": "aokie",
+          "subjectId": "dev-CAgICAgICAgICAgICAgICA",
+          "role": "mobile",
+          "holderKeyThumbprint": "E916XTjJCK82vAibEGGhB3lDV7wANvlLfxiCNTqfo_c",
+          "expectedPeerKeyThumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4",
+          "scopes": [
+            "state_read"
+          ],
+          "iceServers": [
+            {
+              "urls": [
+                "stun:stun.example.com:3478"
+              ],
+              "username": "",
+              "credential": ""
+            },
+            {
+              "urls": [
+                "turn:turn.example.com:3478?transport=udp",
+                "turns:turn.example.com:5349?transport=tcp"
+              ],
+              "username": "1790000600:647aeb91fdcfc95cfc701415a3e48474",
+              "credential": "g5lhy9G0t3E8yGAEbqwcb0N4j2I=",
+              "expiresAt": 1790000600
+            }
+          ],
+          "relayOnly": false,
+          "turnCredentialExpiresAt": 1790000600,
+          "device": {
+            "id": "dev-CAgICAgICAgICAgICAgICA",
+            "appId": "aokie",
+            "subjectId": "dev-CAgICAgICAgICAgICAgICA",
+            "role": "mobile",
+            "displayName": "Phone",
+            "grants": [
+              "state_read"
+            ],
+            "approvedAt": "2026-09-21T14:13:20Z",
+            "lastSeenAt": "2026-09-21T14:13:20Z"
+          },
+          "relay": {
+            "challengeUrl": "https://relay.example.com/v1/aokie-companion/relay/challenge",
+            "framesUrl": "https://relay.example.com/v1/aokie-companion/relay/frames",
+            "streamUrl": "https://relay.example.com/v1/aokie-companion/relay/stream",
+            "mode": "poll"
+          }
+        }
+      }
+    },
+    {
+      "name": "phone A, STUN only (no TURN configured)",
+      "role": "mobile",
+      "note": "turnCredentialExpiresAt is null and iceServers holds the STUN entry alone.",
+      "request": {
+        "method": "POST",
+        "path": "/v1/aokie-companion/admission",
+        "auth": "the phone's device token",
+        "body": {
+          "appId": "aokie",
+          "deviceId": "dev-sLGys7S1tre4ubq7vL2-vw",
+          "displayName": "Aokie Companion",
+          "holderKeyThumbprint": "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck",
+          "supportedTransports": [
+            "relay"
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "body": {
+          "accessToken": "aokie-adm-v2.7b22617564223a22616f6b69652d76322d67617465776179222c226170704964223a22616f6b6965222c227375626a6563744964223a226465762d734c4779733753317472653475627137764c322d7677222c22726f6c65223a226d6f62696c65222c22686f6c6465724b65795468756d627072696e74223a222d2d36494d356c304f6f734c6a397957736b495359685541336e5f33435552516b6d72594d5368615f636b222c226578706563746564506565724b65795468756d627072696e74223a2261745a523633744e4733573247685070566c654b6e667277314e374e364c41714f65356772453253425234222c2273636f706573223a5b2273746174655f72656164222c2263616c6c65725f72656164222c2263617074696f6e735f72656164222c227274635f7369676e616c225d2c2264736b223a226465762d6f4b47696f36536c7071656f71617172724b32757277222c22657870223a313739303030303039302c226a7469223a2261646d5f3639343766636465373639303431323561396331396430336664666230623763227d.2f8af852a34c8e60d1db0d853e04d613ac6de8f3ea755c38a5f19431cfece807",
+          "tokenType": "Bearer",
+          "expiresIn": 90,
+          "expiresAt": 1790000090,
+          "gatewayUrl": "wss://relay.example.com/v2/realtime",
+          "appId": "aokie",
+          "subjectId": "dev-sLGys7S1tre4ubq7vL2-vw",
+          "role": "mobile",
+          "holderKeyThumbprint": "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck",
+          "expectedPeerKeyThumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4",
+          "scopes": [
+            "state_read",
+            "caller_read",
+            "captions_read",
+            "rtc_signal"
+          ],
+          "iceServers": [
+            {
+              "urls": [
+                "stun:stun.example.com:3478"
+              ],
+              "username": "",
+              "credential": ""
+            }
+          ],
+          "relayOnly": false,
+          "turnCredentialExpiresAt": null,
+          "device": {
+            "id": "dev-sLGys7S1tre4ubq7vL2-vw",
+            "appId": "aokie",
+            "subjectId": "dev-sLGys7S1tre4ubq7vL2-vw",
+            "role": "mobile",
+            "displayName": "Phone",
+            "grants": [
+              "state_read",
+              "caller_read",
+              "captions_read",
+              "rtc_signal"
+            ],
+            "approvedAt": "2026-09-21T14:13:20Z",
+            "lastSeenAt": "2026-09-21T14:13:20Z"
+          },
+          "relay": {
+            "challengeUrl": "https://relay.example.com/v1/aokie-companion/relay/challenge",
+            "framesUrl": "https://relay.example.com/v1/aokie-companion/relay/frames",
+            "streamUrl": "https://relay.example.com/v1/aokie-companion/relay/stream"
+          }
+        }
+      }
+    },
+    {
+      "name": "plugin, no ICE server at all",
+      "role": "plugin",
+      "note": "iceServers is an empty list.",
+      "request": {
+        "method": "POST",
+        "path": "/v1/aokie-companion/admission",
+        "auth": "the desktop's device token",
+        "body": {
+          "appId": "aokie",
+          "pluginId": "aokie",
+          "displayName": "Receptionist",
+          "endpointPublicKey": {
+            "algorithm": "ed25519",
+            "publicKey": "_RckOFqgx1tk-3jNYC-h2ZH96_drE8WO1wLqyDXp9hg",
+            "thumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4"
+          },
+          "holderKeyThumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4",
+          "approvedPeerKeyThumbprints": [
+            "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck",
+            "E916XTjJCK82vAibEGGhB3lDV7wANvlLfxiCNTqfo_c"
+          ],
+          "peerRosterRevision": 7,
+          "peerRosterHash": "7ZEsQj6A1UiNIqXrEYfYSjfKRGenwlQVgZOvWXQQ-Ns",
+          "supportedTransports": [
+            "relay"
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "body": {
+          "accessToken": "aokie-adm-v2.7b22617564223a22616f6b69652d76322d67617465776179222c226170704964223a22616f6b6965222c227375626a6563744964223a22616f6b6965222c22726f6c65223a22706c7567696e222c22686f6c6465724b65795468756d627072696e74223a2261745a523633744e4733573247685070566c654b6e667277314e374e364c41714f65356772453253425234222c22617070726f766564506565724b65795468756d627072696e7473223a5b222d2d36494d356c304f6f734c6a397957736b495359685541336e5f33435552516b6d72594d5368615f636b222c224539313658546a4a434b3832764169624547476842336c44563777414e766c4c667869434e5471666f5f63225d2c2270656572526f737465725265766973696f6e223a372c2270656572526f7374657248617368223a22375a4573516a36413155694e4971587245596659536a664b5247656e776c5156675a4f76575851512d4e73222c2273636f706573223a5b2273746174655f72656164222c227274635f7369676e616c225d2c2264736b223a226465762d6f4b47696f36536c7071656f71617172724b32757277222c22657870223a313739303030303039302c226a7469223a2261646d5f3131303538343937396565313335313535363636633764303461333966343131227d.cebcd69c35a3d7fb7f736741a9ab81b77679c8e3c5b2fc5d268691e705af18f5",
+          "tokenType": "Bearer",
+          "expiresIn": 90,
+          "expiresAt": 1790000090,
+          "gatewayUrl": "wss://relay.example.com/v2/realtime",
+          "appId": "aokie",
+          "subjectId": "aokie",
+          "role": "plugin",
+          "scopes": [
+            "state_read",
+            "rtc_signal"
+          ],
+          "device": {
+            "id": "aokie",
+            "appId": "aokie",
+            "subjectId": "aokie",
+            "role": "plugin"
+          },
+          "iceServers": [],
+          "relayOnly": false,
+          "turnCredentialExpiresAt": null,
+          "endpointPublicKey": {
+            "algorithm": "ed25519",
+            "publicKey": "_RckOFqgx1tk-3jNYC-h2ZH96_drE8WO1wLqyDXp9hg",
+            "thumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4"
+          },
+          "holderKeyThumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4",
+          "approvedPeerKeyThumbprints": [
+            "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck",
+            "E916XTjJCK82vAibEGGhB3lDV7wANvlLfxiCNTqfo_c"
+          ],
+          "peerRosterRevision": 7,
+          "peerRosterHash": "7ZEsQj6A1UiNIqXrEYfYSjfKRGenwlQVgZOvWXQQ-Ns",
+          "relay": {
+            "challengeUrl": "https://relay.example.com/v1/aokie-companion/relay/challenge",
+            "framesUrl": "https://relay.example.com/v1/aokie-companion/relay/frames",
+            "streamUrl": "https://relay.example.com/v1/aokie-companion/relay/stream"
+          }
+        }
+      }
+    },
+    {
+      "name": "phone A, relay only",
+      "role": "mobile",
+      "note": "relayOnly true: every route goes through TURN.",
+      "request": {
+        "method": "POST",
+        "path": "/v1/aokie-companion/admission",
+        "auth": "the phone's device token",
+        "body": {
+          "appId": "aokie",
+          "deviceId": "dev-sLGys7S1tre4ubq7vL2-vw",
+          "displayName": "Aokie Companion",
+          "holderKeyThumbprint": "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck",
+          "supportedTransports": [
+            "relay"
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "body": {
+          "accessToken": "aokie-adm-v2.7b22617564223a22616f6b69652d76322d67617465776179222c226170704964223a22616f6b6965222c227375626a6563744964223a226465762d734c4779733753317472653475627137764c322d7677222c22726f6c65223a226d6f62696c65222c22686f6c6465724b65795468756d627072696e74223a222d2d36494d356c304f6f734c6a397957736b495359685541336e5f33435552516b6d72594d5368615f636b222c226578706563746564506565724b65795468756d627072696e74223a2261745a523633744e4733573247685070566c654b6e667277314e374e364c41714f65356772453253425234222c2273636f706573223a5b2273746174655f72656164222c2263616c6c65725f72656164222c2263617074696f6e735f72656164222c227274635f7369676e616c225d2c2264736b223a226465762d6f4b47696f36536c7071656f71617172724b32757277222c22657870223a313739303030303039302c226a7469223a2261646d5f3831353431393666333732313661363937376639373338343230613062366536227d.c7906fa37302830de4730804d5ae20db7e5bd6e0c22f653fd73db79be1a51212",
+          "tokenType": "Bearer",
+          "expiresIn": 90,
+          "expiresAt": 1790000090,
+          "gatewayUrl": "wss://relay.example.com/v2/realtime",
+          "appId": "aokie",
+          "subjectId": "dev-sLGys7S1tre4ubq7vL2-vw",
+          "role": "mobile",
+          "holderKeyThumbprint": "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck",
+          "expectedPeerKeyThumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4",
+          "scopes": [
+            "state_read",
+            "caller_read",
+            "captions_read",
+            "rtc_signal"
+          ],
+          "iceServers": [
+            {
+              "urls": [
+                "stun:stun.example.com:3478"
+              ],
+              "username": "",
+              "credential": ""
+            },
+            {
+              "urls": [
+                "turn:turn.example.com:3478?transport=udp",
+                "turns:turn.example.com:5349?transport=tcp"
+              ],
+              "username": "1790000600:7ff63462c30fe39275b3a7c6ac580ce2",
+              "credential": "x4zr15hpi6xJVK29djMqDln7j7M=",
+              "expiresAt": 1790000600
+            }
+          ],
+          "relayOnly": true,
+          "turnCredentialExpiresAt": 1790000600,
+          "device": {
+            "id": "dev-sLGys7S1tre4ubq7vL2-vw",
+            "appId": "aokie",
+            "subjectId": "dev-sLGys7S1tre4ubq7vL2-vw",
+            "role": "mobile",
+            "displayName": "Phone",
+            "grants": [
+              "state_read",
+              "caller_read",
+              "captions_read",
+              "rtc_signal"
+            ],
+            "approvedAt": "2026-09-21T14:13:20Z",
+            "lastSeenAt": "2026-09-21T14:13:20Z"
+          },
+          "relay": {
+            "challengeUrl": "https://relay.example.com/v1/aokie-companion/relay/challenge",
+            "framesUrl": "https://relay.example.com/v1/aokie-companion/relay/frames",
+            "streamUrl": "https://relay.example.com/v1/aokie-companion/relay/stream"
+          }
+        }
+      }
+    },
+    {
+      "name": "phone A, the longest credential (turn.ttl 3600)",
+      "role": "mobile",
+      "note": "expiresAt is an hour ahead; the decoders allow 24.",
+      "request": {
+        "method": "POST",
+        "path": "/v1/aokie-companion/admission",
+        "auth": "the phone's device token",
+        "body": {
+          "appId": "aokie",
+          "deviceId": "dev-sLGys7S1tre4ubq7vL2-vw",
+          "displayName": "Aokie Companion",
+          "holderKeyThumbprint": "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck",
+          "supportedTransports": [
+            "relay"
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "body": {
+          "accessToken": "aokie-adm-v2.7b22617564223a22616f6b69652d76322d67617465776179222c226170704964223a22616f6b6965222c227375626a6563744964223a226465762d734c4779733753317472653475627137764c322d7677222c22726f6c65223a226d6f62696c65222c22686f6c6465724b65795468756d627072696e74223a222d2d36494d356c304f6f734c6a397957736b495359685541336e5f33435552516b6d72594d5368615f636b222c226578706563746564506565724b65795468756d627072696e74223a2261745a523633744e4733573247685070566c654b6e667277314e374e364c41714f65356772453253425234222c2273636f706573223a5b2273746174655f72656164222c2263616c6c65725f72656164222c2263617074696f6e735f72656164222c227274635f7369676e616c225d2c2264736b223a226465762d6f4b47696f36536c7071656f71617172724b32757277222c22657870223a313739303030303039302c226a7469223a2261646d5f6333323836383964663565396232633438393666356634326432656662353735227d.e80eed5c139a67dab98d6465c20b5e2243602851d74015e486b12e38e0917aae",
+          "tokenType": "Bearer",
+          "expiresIn": 90,
+          "expiresAt": 1790000090,
+          "gatewayUrl": "wss://relay.example.com/v2/realtime",
+          "appId": "aokie",
+          "subjectId": "dev-sLGys7S1tre4ubq7vL2-vw",
+          "role": "mobile",
+          "holderKeyThumbprint": "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck",
+          "expectedPeerKeyThumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4",
+          "scopes": [
+            "state_read",
+            "caller_read",
+            "captions_read",
+            "rtc_signal"
+          ],
+          "iceServers": [
+            {
+              "urls": [
+                "stun:stun.example.com:3478"
+              ],
+              "username": "",
+              "credential": ""
+            },
+            {
+              "urls": [
+                "turn:turn.example.com:3478?transport=udp",
+                "turns:turn.example.com:5349?transport=tcp"
+              ],
+              "username": "1790003600:7ff63462c30fe39275b3a7c6ac580ce2",
+              "credential": "P56uOXXRXdTlFALtlAhob9pwNxI=",
+              "expiresAt": 1790003600
+            }
+          ],
+          "relayOnly": false,
+          "turnCredentialExpiresAt": 1790003600,
+          "device": {
+            "id": "dev-sLGys7S1tre4ubq7vL2-vw",
+            "appId": "aokie",
+            "subjectId": "dev-sLGys7S1tre4ubq7vL2-vw",
+            "role": "mobile",
+            "displayName": "Phone",
+            "grants": [
+              "state_read",
+              "caller_read",
+              "captions_read",
+              "rtc_signal"
+            ],
+            "approvedAt": "2026-09-21T14:13:20Z",
+            "lastSeenAt": "2026-09-21T14:13:20Z"
+          },
+          "relay": {
+            "challengeUrl": "https://relay.example.com/v1/aokie-companion/relay/challenge",
+            "framesUrl": "https://relay.example.com/v1/aokie-companion/relay/frames",
+            "streamUrl": "https://relay.example.com/v1/aokie-companion/relay/stream"
+          }
+        }
+      }
+    }
+  ]
+}

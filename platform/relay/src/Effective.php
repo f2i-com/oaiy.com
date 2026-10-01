@@ -72,4 +72,21 @@ final class Effective
     {
         return $this->laneBody[$lane];
     }
+
+    /**
+     * Is the framed stream (`compat.sse-framed-poll`) offered on this host? Only with call features on, and only when the
+     * calibration's streaming probe passed, unless `compat.sse` says `force` (offer it anyway) or `off` (never). `auto` and
+     * `on` both follow the probe.
+     */
+    public function streamOffered(): bool
+    {
+        $mode = $this->cfg->compatSse();
+        return $this->cfg->callEnabled() && $mode !== 'off' && ($mode === 'force' || $this->streamOk);
+    }
+
+    /** How long one stream or frames wait may last, in seconds: 20, never more than the host's measured hold allows (at least 1). */
+    public function streamSeconds(): int
+    {
+        return max(1, min(20, $this->waitMax));
+    }
 }

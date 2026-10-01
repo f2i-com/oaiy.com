@@ -522,3 +522,48 @@ test('4.18.5 WAL is refused on a network filesystem: the mount type is read from
     eq('truncate', Fs::journalFor($dir, $mi('garbage line')), 'a mountinfo that names no mount: the safe mode');
     eq(null, Fs::type($dir . '/does-not-exist', $mi($line('/', 'ext4'))));
 });
+
+test('4.18.8 Fs::createPrivate makes a missing database file, keeps an existing one\'s content, and (POSIX) leaves it owner-only under the loosest umask, a wider one too', function () {
+    $dir = Tmp::dir('priv');
+    $posix = DIRECTORY_SEPARATOR === '/';
+    $mode = static function (string $f): string {
+        clearstatcache(true, $f);
+        return sprintf('%04o', fileperms($f) & 0777);
+    };
+    $old = umask(0); // a host whose umask lets everything through: a file SQLite made itself would be 0666
+    try {
+        Fs::createPrivate($dir . '/new.sqlite');
+        file_put_contents($dir . '/wide.sqlite', 'data');
+        chmod($dir . '/wide.sqlite', 0666);
+        Fs::createPrivate($dir . '/wide.sqlite');
+        Fs::createPrivate($dir . '/new.sqlite'); // twice is the same
+    } finally {
+        umask($old);
+    }
+    ok(is_file($dir . '/new.sqlite'), 'a missing file is created');
+    eq(0, filesize($dir . '/new.sqlite'), 'empty, for SQLite to initialise');
+    eq('data', (string)file_get_contents($dir . '/wide.sqlite'), 'an existing file keeps its content');
+    if ($posix) {
+        eq('0600', $mode($dir . '/new.sqlite'), 'a new file is owner-only');
+        eq('0600', $mode($dir . '/wide.sqlite'), 'a wider one is narrowed');
+    }
+});
+
+test('4.18.8 Fs::createPrivate gives the process its umask back, after a file it made and after one it could not make (the umask is the whole process\'s: a thread or a later file that met 0177 would be wrong)', function () {
+    if (DIRECTORY_SEPARATOR !== '/') {
+        skip('a umask is a POSIX notion: the Windows CRT keeps only a read-only bit of it');
+    }
+    $dir = Tmp::dir('priv-umask');
+    $old = umask(022);
+    try {
+        Fs::createPrivate($dir . '/made.sqlite');
+        eq(022, umask(022), 'after a file it made');
+        Fs::createPrivate($dir . '/made.sqlite');
+        eq(022, umask(022), 'after one that was there already');
+        Fs::createPrivate($dir . '/no-such-folder/never.sqlite'); // cannot be made: nothing is thrown, and the umask is still given back
+        eq(022, umask(022), 'after a file it could not make');
+        ok(!is_file($dir . '/no-such-folder/never.sqlite'));
+    } finally {
+        umask($old);
+    }
+});

@@ -155,6 +155,12 @@ final class PendingHttp
         return $this->eof;
     }
 
+    /** Everything received so far, headers included (a test that watches a stream while it is still open). */
+    public function received(): string
+    {
+        return $this->buf;
+    }
+
     /** Read until the server closes the connection or $timeout seconds pass. */
     public function finish(float $timeout = 15.0): array
     {

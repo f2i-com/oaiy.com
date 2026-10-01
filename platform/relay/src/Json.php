@@ -32,7 +32,7 @@ final class Json
     }
 
     /** True when the text has a number token that is exactly -0 (outside strings): not -0.5, -0e1 or -01, and not the two characters inside a string. */
-    private static function hasNegativeZero(string $raw): bool
+    public static function hasNegativeZero(string $raw): bool
     {
         $n = strlen($raw);
         $inString = false;

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://oaiy.com/schemas/relay/v1/compat-error.schema.json",
   "title": "Aokie compatibility error",
-  "description": "Error body of the Aokie compatibility routes (README section 4.14), which keep FormLogic's shape so shipped clients behave as they do today: {\"error\":true,\"code\":...,\"message\":...}. These codes and this shape appear on those routes only.",
+  "description": "Error body of the Aokie compatibility routes (README section 4.14), which keep FormLogic's shape so shipped clients behave as they do today: {\"error\":true,\"code\":...,\"message\":...} and nothing else. The phone's decoder of an error (MobileApiError) is deny_unknown_fields, so a fourth member (retryAfter, which the native shape carries) would make it lose the code and the message; the wait to honour is the Retry-After header. These codes and this shape appear on those routes only.",
   "type": "object",
   "properties": {
     "error": {
@@ -48,5 +48,5 @@
     "code",
     "message"
   ],
-  "additionalProperties": true
+  "additionalProperties": false
 }

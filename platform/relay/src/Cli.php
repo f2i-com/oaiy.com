@@ -352,7 +352,7 @@ final class Cli
         copy($this->data . '/config.json', $dir . '/config.json');
         @chmod($dir . '/config.json', 0600);
         Paths::ensureDir($dir . '/secrets', 0700);
-        foreach (glob($this->data . '/secrets/*') ?: [] as $f) {
+        foreach (Fs::entries($this->data . '/secrets') as $f) {
             if (is_file($f)) {
                 copy($f, $dir . '/secrets/' . basename($f));
                 @chmod($dir . '/secrets/' . basename($f), 0600);
@@ -362,7 +362,7 @@ final class Cli
         foreach (['relay.sqlite', 'config.json'] as $f) {
             $manifest[] = hash_file('sha256', $dir . '/' . $f) . '  ' . $f;
         }
-        foreach (glob($dir . '/secrets/*') ?: [] as $f) {
+        foreach (Fs::entries($dir . '/secrets') as $f) {
             $manifest[] = hash_file('sha256', $f) . '  secrets/' . basename($f);
         }
         Paths::writeFile($dir . '/MANIFEST.txt', implode("\n", $manifest) . "\n", 0600);
@@ -399,7 +399,7 @@ final class Cli
         }
         copy($dir . '/relay.sqlite', $this->data . '/relay.sqlite');
         copy($dir . '/config.json', $this->data . '/config.json');
-        foreach (glob($dir . '/secrets/*') ?: [] as $f) {
+        foreach (Fs::entries($dir . '/secrets') as $f) {
             copy($f, $this->data . '/secrets/' . basename($f));
             @chmod($this->data . '/secrets/' . basename($f), 0600);
         }

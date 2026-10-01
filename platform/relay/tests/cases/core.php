@@ -249,9 +249,9 @@ test('4.4 the lane table equals the vectors\' table (caps, default, minimum and 
     eq(['ai', 'ai.in', 'ai.out', 'sync'], array_values(array_filter(array_keys(Lanes::TABLE), 'Oaiy\Relay\Lanes::isBulk')));
 });
 
-test('4.4 advertised lanes are the ones a client can post to; ring only with call features', function () {
+test('4.4 advertised lanes are the ones a client can post to; ring only with call features, and sig (reached through the compatibility routes only) with them', function () {
     eq(['cmd', 'res', 'ctl', 'sync'], Lanes::advertised(false));
-    eq(['cmd', 'res', 'ring', 'ctl', 'sync'], Lanes::advertised(true));
+    eq(['cmd', 'res', 'ring', 'ctl', 'sync', 'sig'], Lanes::advertised(true));
 });
 
 // ------------------------------------------------------------------------------------------------ 4.7.1 client address
@@ -401,10 +401,19 @@ test('4.18.10 config: wrong types and out-of-range values fail closed', function
         ['wake' => ['safety_ms' => 10]], ['token_pepper' => 'short'], ['client_ip' => ['header' => 'X Forwarded']], ['client_ip' => ['trusted_proxies' => ['nope']]],
         ['client_ip' => ['trusted_proxies' => 'nope']], ['db' => ['driver' => 'oracle']], ['db' => ['driver' => 'mysql']], ['db' => ['journal' => 'delete']],
         ['apps' => 'aokie'], ['apps' => ['bad app']], ['capacity' => ['workers' => 0]], ['cors' => ['extra_origins' => ['http://x.example']]],
-        ['gc' => ['one_in' => -1]], ['gc' => ['one_in' => 1001]], ['gc' => ['one_in' => '20']], ['gc' => ['one_in' => 2.5]]];
+        ['gc' => ['one_in' => -1]], ['gc' => ['one_in' => 1001]], ['gc' => ['one_in' => '20']], ['gc' => ['one_in' => 2.5]],
+        ['call' => ['challenge_s' => 9]], ['call' => ['challenge_s' => 31]], ['call' => ['challenge_s' => '25']], ['call' => ['challenge_s' => 25.5]], ['call' => ['challenge_s' => true]], ['call' => ['challenge_s' => null]],
+        ['debug' => ['error_sites' => 'yes']], ['debug' => ['error_sites' => 1]], ['debug' => ['error_sites' => null]]];
     foreach ($bad as $patch) {
         throws(fn() => Config::fromArray($base + $patch, '/x'), \RuntimeException::class, 'config invalid', json_encode($patch));
     }
+    eq(false, Config::fromArray($base, '/x')->debugErrorSites(), 'the error sites are not logged unless asked for');
+    eq(true, Config::fromArray($base + ['debug' => ['error_sites' => true]], '/x')->debugErrorSites());
+    eq(25, Config::fromArray($base, '/x')->challengeSeconds(), 'the challenge lives 25 seconds unless told otherwise');
+    foreach ([10, 15, 25, 30] as $s) {
+        eq($s, Config::fromArray($base + ['call' => ['enabled' => true, 'challenge_s' => $s]], '/x')->challengeSeconds(), "call.challenge_s $s");
+    }
+    eq(15, Config::fromArray($base + ['call' => ['challenge_s' => 15]], '/x')->challengeSeconds(), 'without call.enabled in the same object');
     $good = Config::fromArray($base + ['wait' => ['max' => 300], 'call' => ['enabled' => true], 'client_ip' => ['header' => 'X-Forwarded-For', 'trusted_proxies' => ['10.0.0.0/8', '::1']], 'apps' => ['aokie']], '/x');
     eq(300, $good->waitMax());
     eq(true, $good->callEnabled());

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://oaiy.com/schemas/relay/v1/admission-mobile-response.schema.json",
   "title": "Mobile admission response",
-  "description": "Exactly the phone decoder's members. `device` carries ISO 8601 strings. expectedPeerKeyThumbprint is advisory to the phone: its pin comes only from the MAC-verified offer.",
+  "description": "Exactly the phone decoder's members. `device` carries ISO 8601 strings. expectedPeerKeyThumbprint is advisory to the phone: its pin comes only from the MAC-verified offer. `device` has exactly the eight members of the phone's DeviceRecord (deny_unknown_fields), and its grants equal `scopes` as an ordered list (a rule the schema cannot state; the conformance suite checks it). The phone accepts expiresIn 1 to 300 and expiresAt in (now, now + 300].",
   "type": "object",
   "properties": {
     "accessToken": {
@@ -15,7 +15,7 @@
     },
     "expiresIn": {
       "type": "integer",
-      "minimum": 31,
+      "minimum": 1,
       "maximum": 300
     },
     "expiresAt": {
@@ -104,7 +104,8 @@
         },
         "displayName": {
           "type": "string",
-          "maxLength": 60
+          "minLength": 1,
+          "maxLength": 120
         },
         "grants": {
           "type": "array",
@@ -132,7 +133,7 @@
         "approvedAt",
         "lastSeenAt"
       ],
-      "additionalProperties": true
+      "additionalProperties": false
     }
   },
   "required": [

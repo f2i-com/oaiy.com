@@ -150,7 +150,7 @@ final class Signals
         $removed = 0;
         $cutoff = time() - 3600;
         foreach (['gen', 'rev'] as $sub) {
-            $files = glob($this->dir . '/holds/' . $sub . '/*') ?: [];
+            $files = Fs::entries($this->dir . '/holds/' . $sub);
             $excess = max(0, count($files) - $cap);
             foreach ($files as $f) {
                 $mt = @filemtime($f);
@@ -162,12 +162,12 @@ final class Signals
                 }
             }
         }
-        foreach (glob($this->dir . '/wake/*.tmp') ?: [] as $f) {
+        foreach (Fs::entries($this->dir . '/wake', '', '.tmp') as $f) {
             $mt = @filemtime($f);
             if ($mt !== false && $mt < time() - 60 && @unlink($f)) {
                 $removed++;
             }
         }
-        return $removed;
+        return $removed + AddressHolds::collect($this->dir);
     }
 }

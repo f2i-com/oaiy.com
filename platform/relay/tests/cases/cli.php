@@ -399,7 +399,7 @@ test('4.18.8 bin/relay.php as a process: usage, exit codes, OAIY_RELAY_DATA, and
 
 test('4.18.2 bin/relay.php refuses to run under a web server: nothing is printed and nothing is done', function () {
     $r = Relay::make();
-    $srv = Server::start(dirname(__DIR__, 2), ['prepend' => false]);
+    $srv = Server::start(inst_scratch(), ['prepend' => false]); // a copy of the package: never the working tree and its data/ folder
     $res = $srv->request('GET', '/bin/relay.php');
     eq('', $res['body']);
 });

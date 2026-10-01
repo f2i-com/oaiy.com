@@ -75,16 +75,16 @@ final class Auth
      * address) pair once the id is real. Returns the error to throw: the uniform 401, or 429 when the address has
      * failed 20 times in a minute.
      */
-    private function unauthorized(Request $req, ?string $tokenId, bool $known): ApiError
+    private function unauthorized(Request $req, ?string $tokenId, bool $known, string $reason): ApiError
     {
         $retry = $this->limiter->hit('ip.authfail:' . $req->client, 20, 60);
         if ($tokenId !== null && $known) {
             $this->countTokenFailure($tokenId, $req->client);
         }
         if ($retry !== null) {
-            return new ApiError(429, 'rate_limited', null, 60);
+            return (new ApiError(429, 'rate_limited', null, 60))->because('address_failed_too_often');
         }
-        return ApiError::make('unauthorized');
+        return ApiError::make('unauthorized')->because($reason); // the client is told one thing whatever the reason; the reason is for debug.error_sites
     }
 
     private function countTokenFailure(string $tokenId, string $addr): void
@@ -120,11 +120,11 @@ final class Auth
         $bearer = $req->bearer();
         if ($bearer === null) {
             $this->limiter->bump('noauth');
-            throw $this->unauthorized($req, null, false);
+            throw $this->unauthorized($req, null, false, 'no_bearer');
         }
         $p = self::parseToken($bearer);
         if ($p === null) {
-            throw $this->unauthorized($req, null, false);
+            throw $this->unauthorized($req, null, false, 'malformed_token');
         }
         [$tokenId, $secret] = $p;
         $row = $this->db->one(
@@ -141,15 +141,15 @@ final class Auth
         $match = Crypto::equals($stored, $given);
         $locked = $this->isLocked($tokenId, $req->client);
         if ($row === null || !$match || $locked) {
-            throw $this->unauthorized($req, $tokenId, $row !== null);
+            throw $this->unauthorized($req, $tokenId, $row !== null, $row === null ? 'unknown_token_id' : (!$match ? 'wrong_secret' : 'token_locked'));
         }
         // The secret verified. Now what the token is allowed to still be.
         if ($row['t_revoked'] !== null || $row['revoked_at'] !== null) {
-            throw ApiError::make('revoked');
+            throw ApiError::make('revoked')->because($row['t_revoked'] !== null ? 'token_revoked' : 'device_revoked');
         }
         $now = Clock::now();
         if ($row['not_after'] !== null && $row['not_after'] <= $now) {
-            throw ApiError::make('unauthorized');
+            throw ApiError::make('unauthorized')->because('token_expired');
         }
         if ($row['last_used_at'] === null || $row['last_used_at'] < $now - 60) {
             // last_used_at is bookkeeping: a busy database must neither fail the request nor make it wait
@@ -166,11 +166,11 @@ final class Auth
         $bearer = $req->bearer();
         if ($bearer === null) {
             $this->limiter->bump('noauth');
-            throw $this->unauthorized($req, null, false);
+            throw $this->unauthorized($req, null, false, 'no_bearer');
         }
         $p = self::parseAdminToken($bearer);
         if ($p === null) {
-            throw $this->unauthorized($req, null, false);
+            throw $this->unauthorized($req, null, false, 'malformed_admin_token');
         }
         [$id, $secret] = $p;
         $rec = self::readAdminRecord($this->cfg->dataDir);
@@ -180,7 +180,7 @@ final class Auth
         self::$compares++;
         $ok = Crypto::equals($stored, $given) && $rec !== null && hash_equals($rec['id'], $id);
         if (!$ok) {
-            throw $this->unauthorized($req, null, false);
+            throw $this->unauthorized($req, null, false, $rec === null ? 'admin_record_missing' : (hash_equals($rec['id'], $id) ? 'wrong_admin_secret' : 'unknown_admin_id'));
         }
         return Principal::admin($id);
     }

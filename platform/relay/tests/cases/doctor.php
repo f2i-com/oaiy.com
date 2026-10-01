@@ -5,6 +5,7 @@ use Oaiy\Relay\Doctor;
 use Oaiy\Relay\Fs;
 use Oaiy\Relay\HttpProbe;
 use Oaiy\Relay\Installer;
+use OaiyTest\Relay;
 use OaiyTest\Server;
 use OaiyTest\Tmp;
 
@@ -380,6 +381,30 @@ test('4.9.1 doctor: the dummy bearer must arrive: authHeaderSeen true passes, fa
     eq('fail', doc_level(Doctor::authorizationSeen(['status' => 200, 'body' => '{"authHeaderSeen":"true"}', 'error' => null]), 'web.authorization'));
 });
 
+test('4.18.8 doctor: an answer from the web server itself (no X-OAIY-Relay header) names the likely cause: a 500 is an .htaccess directive AllowOverride does not allow, a 404 is a missing mod_rewrite, a 403 is a Require that is not replaced; the relay\'s own errors do not get that advice', function () {
+    $own = fn(int $status, array $headers) => Doctor::authorizationSeen(['status' => $status, 'body' => '', 'error' => null, 'headers' => $headers]);
+    $m = fn(array $rows) => doc_msg($rows, 'web.authorization');
+    $rows = $own(500, []);
+    eq('fail', doc_level($rows, 'web.authorization'));
+    contains('AllowOverride', $m($rows));
+    contains('AuthConfig, FileInfo, Options and Indexes', $m($rows));
+    contains('The web server itself answered, not the relay', $m($rows));
+    contains('mod_rewrite', $m($own(404, [])));
+    // The advice for nginx names what the README's snippet has (it once named a try_files that the snippet does not use).
+    contains('SCRIPT_FILENAME $document_root/index.php', $m($own(404, [])));
+    contains('fastcgi_param SCRIPT_FILENAME $document_root/index.php;', (string)file_get_contents(dirname(__DIR__, 2) . '/README.md'), 'the line the doctor names is in the README\'s nginx snippet');
+    contains('Require', $m($own(403, [])));
+    // The relay's own answer to the same request is the relay's: no advice about the web server.
+    foreach ([500, 404, 403] as $st) {
+        $rows = $own($st, ['x-oaiy-relay' => 'oaiy-relay/1']);
+        eq('fail', doc_level($rows, 'web.authorization'));
+        not_contains('AllowOverride', $m($rows));
+        not_contains('mod_rewrite', $m($rows));
+    }
+    // Where the headers were not given (an older caller) the message is the plain one.
+    not_contains('AllowOverride', $m(Doctor::authorizationSeen(['status' => 500, 'body' => '', 'error' => null])));
+});
+
 test('4.18.7 doctor: the web SAPI\'s ini values are compared with the command line\'s and a difference is shown', function () {
     $cli = ['memory_limit' => '128M', 'post_max_size' => '8M', 'max_execution_time' => '0', 'output_buffering' => '0', 'zlib.output_compression' => '0', 'disable_functions' => ''];
     eq('ok', doc_level(Doctor::compareIni($cli, $cli), 'web.ini-difference'));
@@ -563,6 +588,7 @@ test('4.18.8 doctor web: with public/ as the document root no exposure probe suc
         eq('ok', doc_level($rows, 'web.exposure ' . $p), $p . ': ' . doc_msg($rows, 'web.exposure ' . $p));
     }
     eq('ok', doc_level($rows, 'web.authorization'), doc_msg($rows, 'web.authorization'));
+    eq('ok', doc_level($rows, 'web.trace'), 'the doctor asked whether the host echoes a TRACE request, and php -S does not: ' . doc_msg($rows, 'web.trace'));
     // php -S runs with its own ini defaults, so the comparison may legitimately report a difference; it must have run.
     ok(in_array(doc_level($rows, 'web.ini-difference'), ['ok', 'warn'], true));
     if (doc_level($rows, 'web.ini-difference') === 'warn') {
@@ -814,4 +840,41 @@ test('4.18.2 bin scripts: a request to bin/*.php through the web runs nothing an
         eq('', $srv->request('GET', $p)['body'], $p);
     }
     ok(!file_exists($root . '/data'), 'and nothing was created by src/');
+});
+
+test('4.18.8 doctor web: a host that echoes a TRACE request, headers and all, is a warning in the doctor\'s own run (the row is there, and it is the doctor that sends the request), and one that does not is not', function () {
+    [$root, $data] = inst_installed();
+    $dir = Tmp::dir('traceecho');
+    // A router that answers a TRACE as Apache does with TraceEnable on: 200, the request line and every header in the body.
+    file_put_contents($dir . '/echo.php', <<<'PHP'
+<?php
+if (($_SERVER['REQUEST_METHOD'] ?? '') === 'TRACE') {
+    header('Content-Type: message/http');
+    echo 'TRACE ' . $_SERVER['REQUEST_URI'] . " HTTP/1.1\r\n";
+    foreach (getallheaders() as $k => $v) {
+        echo $k . ': ' . $v . "\r\n";
+    }
+    return true;
+}
+return false;
+PHP);
+    $echo = Server::start($root . '/public', ['prepend' => false, 'name' => 'doc-trace', 'router' => $dir . '/echo.php']);
+    $rows = Doctor::run(['dataDir' => $data, 'url' => $echo->base(), 'slowBody' => false, 'publicDir' => $root . '/public']);
+    eq('warn', doc_level($rows, 'web.trace'), doc_msg($rows, 'web.trace'));
+    contains('TraceEnable off', doc_msg($rows, 'web.trace'));
+});
+
+test('4.7.2 the doctor fails when its hold counts are wrong, in each way they can be: a count that sees none of its markers, one that sees one of two, one that sees three, a listing that does not show the folder; and passes when both are right', function () {
+    $r = Relay::make();
+    $count = fn(int $n) => static fn(string $data, string $kind, string $addr): int => $n;
+    foreach ([0, 1, 3] as $n) {
+        $rows = Doctor::holdAccounting($r->data, $count($n));
+        eq('fail', $rows[0]['level'], "a count of $n: " . json_encode($rows));
+        contains("counted $n of 2", $rows[0]['message']);
+    }
+    $rows = Doctor::holdAccounting($r->data, null, static fn(string $data): bool => false);
+    eq('fail', $rows[0]['level'], 'a listing that does not show the holds folder: ' . json_encode($rows));
+    $rows = Doctor::holdAccounting($r->data, $count(2), static fn(string $data): bool => true);
+    eq('ok', $rows[0]['level'], json_encode($rows));
+    eq('holds.accounting', $rows[0]['name']);
 });

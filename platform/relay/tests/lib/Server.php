@@ -65,11 +65,20 @@ final class Server
         throw new \RuntimeException('no free port');
     }
 
-    /** @return list<string> extra php flags the runner was started with */
+    /**
+     * Extra php flags the runner was started with, and a marker: every php process the tests start carries `-d oaiy.test_root=<this run's
+     * test root>` in its command line, so that the runner (Procs::live) can find one that outlived its parent, which a walk down the
+     * process tree cannot. The root is a random name made for the run, and the directive is one php does not know and ignores.
+     * @return list<string>
+     */
     public static function phpFlags(): array
     {
         $f = getenv('OAIY_TEST_PHP_FLAGS');
-        return is_string($f) && $f !== '' ? explode(' ', $f) : [];
+        $flags = is_string($f) && $f !== '' ? explode(' ', $f) : [];
+        if (Tmp::root() !== '') {
+            array_push($flags, '-d', 'oaiy.test_root=' . Tmp::root());
+        }
+        return $flags;
     }
 
     private function launch(array $opt): void

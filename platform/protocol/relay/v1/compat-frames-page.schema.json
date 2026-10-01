@@ -2,53 +2,64 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://oaiy.com/schemas/relay/v1/compat-frames-page.schema.json",
   "title": "Aokie frames page",
-  "description": "GET /v1/aokie-companion/relay/frames?since=&wait=: at most 128 frames and 1 MiB (the first frame is always returned). Facade reads do not acknowledge.",
+  "description": "GET /v1/aokie-companion/relay/frames?since=&wait=: at most 128 frames and 1 MiB (the first frame is always returned), lastSeq (the last frame's seq, or the cursor asked for when there is none: the plugin's tail priming reads it), the relay's clock, and `hold` only when a wait was asked for. Reads do not acknowledge.",
   "type": "object",
   "properties": {
     "frames": {
       "type": "array",
       "items": {
-        "type": "object",
-        "properties": {
-          "seq": {
-            "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/seq"
-          },
-          "from": {
-            "type": "string",
-            "pattern": "^(plugin|mobile:[A-Za-z0-9_-]{43})$"
-          },
-          "subjectId": {
-            "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/appId"
-          },
-          "grants": {
-            "type": "array",
-            "items": {
-              "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/grant"
-            },
-            "maxItems": 16
-          },
-          "frame": {
-            "type": "object"
-          }
-        },
-        "required": [
-          "seq",
-          "from",
-          "subjectId",
-          "grants",
-          "frame"
-        ],
-        "additionalProperties": true
+        "$ref": "https://oaiy.com/schemas/relay/v1/compat-stream-frame.schema.json"
       },
       "maxItems": 128
     },
     "lastSeq": {
       "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/uint53"
+    },
+    "time": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    },
+    "hold": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "granted": {
+              "const": true
+            },
+            "superseded": {
+              "const": true
+            }
+          },
+          "required": [
+            "granted"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "refused": {
+              "const": true
+            },
+            "retryAfter": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 120
+            }
+          },
+          "required": [
+            "refused",
+            "retryAfter"
+          ],
+          "additionalProperties": true
+        }
+      ]
     }
   },
   "required": [
     "frames",
-    "lastSeq"
+    "lastSeq",
+    "time"
   ],
-  "additionalProperties": true
+  "additionalProperties": false
 }

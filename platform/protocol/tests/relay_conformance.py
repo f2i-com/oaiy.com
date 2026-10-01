@@ -797,7 +797,7 @@ PLUGIN_TOKEN = vec["A4b"]["expected"]["tokenForOnePhone"]
 MOBILE_TOKEN = vec["A4"]["expected"]["token"]
 PHONE_TH, DESK_TH = TH["phone"], TH["desktopEndpoint"]
 ROSTER_HASH = roster_hash(7, [PHONE_TH])
-STUN = {"urls": ["stun:stun.example.com:3478"]}
+STUN = {"urls": ["stun:stun.example.com:3478"], "username": "", "credential": ""}   # the plugin decoder requires both members, empty on STUN
 TURN = {"urls": ["turn:turn.example.com:3478?transport=udp", "turns:turn.example.com:5349?transport=tcp"],
         "username": vec["A5"]["expected"]["username"], "credential": vec["A5"]["expected"]["credential"], "expiresAt": NOW + 600}
 RELAY_URLS = {"challengeUrl": "https://relay.example.com/v1/aokie-companion/relay/challenge",
@@ -807,7 +807,8 @@ ENDPOINT_KEY = {"algorithm": "ed25519", "publicKey": PUB["desktopEndpoint"], "th
 PLUGIN_RESPONSE = {
     "accessToken": PLUGIN_TOKEN, "tokenType": "Bearer", "expiresIn": 90, "expiresAt": NOW + 90,
     "gatewayUrl": "wss://relay.example.com/v2/realtime", "appId": "aokie", "subjectId": "aokie", "role": "plugin",
-    "scopes": ["state_read", "rtc_signal"], "device": {}, "iceServers": [STUN, TURN], "relayOnly": False,
+    "scopes": ["state_read", "rtc_signal"], "device": {"id": "aokie", "appId": "aokie", "subjectId": "aokie", "role": "plugin"},
+    "iceServers": [STUN, TURN], "relayOnly": False,
     "turnCredentialExpiresAt": NOW + 600, "endpointPublicKey": ENDPOINT_KEY, "holderKeyThumbprint": DESK_TH,
     "approvedPeerKeyThumbprints": [PHONE_TH], "peerRosterRevision": 7, "peerRosterHash": ROSTER_HASH, "relay": RELAY_URLS}
 MOBILE_RESPONSE = {
@@ -883,6 +884,8 @@ for d, ex_ in {
 
 pos("error", "a rate limit with retryAfter", {"error": {"code": "rate_limited", "message": "Slow down.", "retryAfter": 7}})
 pos("error", "an unauthorized error", {"error": {"code": "unauthorized", "message": "Credential missing or wrong."}})
+pos("error", "the gap rule's refusal of a poll", {"error": {"code": "rate_limited", "message": "Slow down.", "retryAfter": 1, "rule": "gap"}})
+pos("error", "the in-flight rule's refusal of a poll", {"error": {"code": "rate_limited", "message": "Slow down.", "retryAfter": 1, "rule": "in_flight"}})
 pos("compat-error", "the Aokie shape", {"error": True, "code": "relay_backpressure", "message": "Mailbox full."})
 pos("health", "a healthy relay", {"ok": True, "time": NOW, "authHeaderSeen": False})
 pos("info", "the design's full example (Appendix A6b)", INFO)
@@ -947,6 +950,17 @@ pos("pairing-decision", "approve", {"approve": True, "phone": {"ed25519": PUB["p
                                     "grants": RECEIPT["grants"], "receipt": {"issuedAt": NOW, "signature": SIG64}})
 pos("pairing-decision", "deny", {"approve": False})
 pos("pairing-reject-request", "a reason", {"reason": "mac mismatch"})
+pos("pairing-reject-request", "no reason at all", {})
+pos("pairing-decision-response", "an approval", {"v": 1, "state": "approved", "deviceId": PHONEID, "time": NOW})
+pos("pairing-decision-response", "a denial (no device)", {"v": 1, "state": "denied", "time": NOW})
+pos("pairing-state-response", "a reject that reopened it", {"v": 1, "state": "open", "time": NOW})
+pos("pairing-state-response", "a burn, or the third reject", {"v": 1, "state": "expired", "time": NOW})
+FETCH_OPEN = POS["pairing-fetch-response"][0][1]
+pos("pairing-fetch-response", "open, after a granted wait", dict(FETCH_OPEN, hold={"granted": True}))
+pos("pairing-fetch-response", "answered, superseded by a newer wait", dict(FETCH_OPEN, state="answered", hold={"granted": True, "superseded": True}))
+pos("pairing-fetch-response", "open, the wait refused because the pool is nearly full", dict(FETCH_OPEN, hold={"refused": True, "retryAfter": 2}))
+SEALED_FIXTURE = json.loads((V1 / "fixtures" / "sealed-token.json").read_text(encoding="utf-8"))
+pos("sealed-token-fixture", "the recorded fixture", SEALED_FIXTURE)
 pos("approval-receipt", "the A3 receipt document", RECEIPT)
 pos("admission-claims", "the A4 mobile claims", vec["A4"]["inputs"]["claims"])
 pos("admission-claims", "a plugin claims set", {"aud": "aokie-v2-gateway", "appId": "aokie", "subjectId": "aokie", "role": "plugin", "holderKeyThumbprint": DESK_TH,
@@ -955,10 +969,13 @@ pos("admission-claims", "a plugin claims set", {"aud": "aokie-v2-gateway", "appI
 PLUGIN_REQUEST = {"appId": "aokie", "pluginId": "aokie", "displayName": "Receptionist", "endpointPublicKey": ENDPOINT_KEY, "holderKeyThumbprint": DESK_TH,
                   "approvedPeerKeyThumbprints": [PHONE_TH], "peerRosterRevision": 7, "peerRosterHash": ROSTER_HASH, "supportedTransports": ["relay"]}
 pos("admission-plugin-request", "a plugin admission request", PLUGIN_REQUEST)
+pos("admission-plugin-request", "a plugin admission request without supportedTransports (the desktop's broker sends none: it means relay)",
+    {k: v for k, v in PLUGIN_REQUEST.items() if k != "supportedTransports"})
 pos("admission-plugin-response", "a plugin admission response", PLUGIN_RESPONSE)
 pos("admission-plugin-response", "a poll-mode response", dict(PLUGIN_RESPONSE, relay=dict(RELAY_URLS, mode="poll")))
 MOBILE_REQUEST = {"appId": "aokie", "deviceId": PHONEID, "displayName": "Test phone", "holderKeyThumbprint": PHONE_TH, "supportedTransports": ["relay"]}
 pos("admission-mobile-request", "a phone admission request", MOBILE_REQUEST)
+pos("admission-mobile-request", "a phone admission request without supportedTransports", {k: v for k, v in MOBILE_REQUEST.items() if k != "supportedTransports"})
 pos("admission-mobile-response", "a phone admission response", MOBILE_RESPONSE)
 pos("ice-server", "STUN", STUN)
 pos("ice-server", "TURN with the A5 credential", TURN)
@@ -966,8 +983,17 @@ pos("challenge", "a plugin challenge", CHALLENGE_PLUGIN)
 pos("challenge", "a phone challenge", CHALLENGE_MOBILE)
 pos("compat-frames-request", "a frame to the plugin", {"to": "plugin", "frames": [{"type": "hello"}]})
 pos("compat-frames-request", "a frame to a phone", {"to": "mobile:" + PHONE_TH, "frames": [{"type": "state"}]})
-pos("compat-frames-accepted", "accepted", {"accepted": 1, "seq": 9})
-pos("compat-frames-page", "one frame", {"lastSeq": 9, "frames": [{"seq": 9, "from": "plugin", "subjectId": "aokie", "grants": ["state_read"], "frame": {"type": "state"}}]})
+FRAME = {"seq": 9, "from": "plugin", "subjectId": "aokie", "grants": ["state_read"], "frame": {"type": "state"}}
+pos("compat-frames-accepted", "accepted", {"accepted": 1, "seq": 9, "time": NOW})
+pos("compat-frames-accepted", "sixty-four accepted", {"accepted": 64, "seq": 2 ** 53 - 1, "time": NOW})
+pos("compat-frames-page", "one frame", {"frames": [FRAME], "lastSeq": 9, "time": NOW})
+pos("compat-frames-page", "the tail: no frames, lastSeq is the cursor asked for", {"frames": [], "lastSeq": 9, "time": NOW})
+pos("compat-frames-page", "a granted wait that found nothing", {"frames": [], "lastSeq": 9, "time": NOW, "hold": {"granted": True}})
+pos("compat-frames-page", "a wait ended by a newer one", {"frames": [], "lastSeq": 9, "time": NOW, "hold": {"granted": True, "superseded": True}})
+pos("compat-frames-page", "a wait the pool refused", {"frames": [FRAME], "lastSeq": 9, "time": NOW, "hold": {"refused": True, "retryAfter": 2}})
+pos("compat-stream-frame", "a frame from the plugin", FRAME)
+pos("compat-stream-frame", "a frame from a phone with the plugin's whole scope set", dict(FRAME, **{"from": "mobile:" + PHONE_TH, "subjectId": PHONEID, "grants": ["state_read", "caller_read", "captions_read", "assistance_read", "assistance_respond", "rtc_signal"]}))
+pos("compat-stream-frame", "a frame with empty grants (a sender with no known scope)", dict(FRAME, grants=[]))
 pos("ring", "the A11 voice offer", RING)
 pos("ring", "a cancel", {"aokieClass": "voice_offer_cancel", "schemaVersion": "1", "eventId": "evt_2", "offerId": "toffer_0001", "reason": "answered elsewhere"})
 pos("ring", "an assistance offer", {"aokieClass": "assistance_offer", "schemaVersion": "1", "eventId": "evt_3", "appId": "aokie", "requestId": "req_1", "callId": "call_0123", "callEpoch": "7", "ownerEpoch": "0", "expiresAt": "1790000040"})
@@ -1114,6 +1140,10 @@ neg("error", "an empty message", {"error": {"code": "internal", "message": ""}},
 neg("error", "no message", {"error": {"code": "internal"}}, "message")
 neg("error", "an unwrapped error", {"code": "internal", "message": "x"}, "error")
 neg("error", "retryAfter negative", {"error": {"code": "rate_limited", "message": "x", "retryAfter": -1}}, "retryAfter")
+neg("error", "a poll rule the relay does not have", {"error": {"code": "rate_limited", "message": "x", "retryAfter": 1, "rule": "burst"}}, "rule")
+neg("error", "a poll rule that is not a string", {"error": {"code": "rate_limited", "message": "x", "retryAfter": 1, "rule": 3}}, "rule")
+neg("error", "a poll rule on an error that is not a rate limit", {"error": {"code": "internal", "message": "x", "rule": "gap"}}, "rate_limited")
+neg("error", "a poll rule with no retryAfter", {"error": {"code": "rate_limited", "message": "x", "rule": "gap"}}, "retryAfter")
 neg("compat-error", "error must be the boolean true", {"error": False, "code": "invalid_token", "message": "x"}, "error")
 neg("compat-error", "an unknown compat code", {"error": True, "code": "nope", "message": "x"}, "code")
 neg("health", "an extra member", dict(p1("health"), extra=1), "extra")
@@ -1212,6 +1242,38 @@ neg("pairing-fetch-response", "approved without a sealed token", mut(p1("pairing
 neg("pairing-fetch-response", "open without an offer", mut(p1("pairing-fetch-response"), "offer"), "offer")
 neg("pairing-fetch-response", "expired is an error (410), not a state", {"v": 1, "state": "expired", "time": NOW}, "state")
 neg("pairing-reject-request", "a reason of 201 characters", {"reason": "x" * 201}, "reason")
+neg("pairing-reject-request", "a reason that is a number", {"reason": 5}, "reason")
+neg("pairing-create-request", "ttl zero", mut(p1("pairing-create-request"), "ttl", 0), "ttl")
+neg("pairing-create-request", "ttl fractional", mut(p1("pairing-create-request"), "ttl", 1.5), "ttl")
+neg("pairing-create-request", "no desktopThumbprint", mut(p1("pairing-create-request"), "desktopThumbprint"), "desktopThumbprint")
+neg("pairing-create-request", "a pid of 23 characters", mut(p1("pairing-create-request"), "pid", "A" * 23), "pid")
+neg("pairing-create-request", "an appId of 65 characters", mut(p1("pairing-create-request"), "appId", "a" * 65), "appId")
+neg("pairing-create-request", "an empty offer", mut(p1("pairing-create-request"), "offer", ""), "offer")
+neg("pairing-answer-request", "no response member", {}, "response")
+neg("pairing-answer-request", "an empty response", {"response": ""}, "response")
+neg("pairing-answer-request", "a response that is an object, not text", {"response": {"kind": "aokie_mobile_pairing_response"}}, "response")
+neg("pairing-decision", "an approval with 17 grants", mut(p1("pairing-decision"), "grants", [f"g{i}" for i in range(17)]), "grants")
+neg("pairing-decision", "a grant that is not a name", mut(p1("pairing-decision"), "grants", ["State-Read"]), "grants")
+neg("pairing-decision", "an approval without the phone's X25519 key", mut(p1("pairing-decision"), "phone.x25519"), "x25519")
+neg("pairing-decision", "a receipt with a negative issuedAt", mut(p1("pairing-decision"), "receipt.issuedAt", -1), "issuedAt")
+neg("pairing-decision", "a receipt signature of 85 characters", mut(p1("pairing-decision"), "receipt.signature", SIG64[:85]), "signature")
+neg("pairing-decision", "a name of 61 characters", mut(p1("pairing-decision"), "name", "x" * 61), "name")
+neg("pairing-decision-response", "state open is not an outcome", {"v": 1, "state": "open", "time": NOW}, "state")
+neg("pairing-decision-response", "an approval without the device id", {"v": 1, "state": "approved", "time": NOW}, "deviceId")
+neg("pairing-decision-response", "a denial that names a device", {"v": 1, "state": "denied", "deviceId": PHONEID, "time": NOW}, "deviceId")
+neg("pairing-decision-response", "a device id that is a provider id", {"v": 1, "state": "approved", "deviceId": PROVID, "time": NOW}, "deviceId")
+neg("pairing-decision-response", "no time", {"v": 1, "state": "denied"}, "time")
+neg("pairing-state-response", "state approved is not for a reject", {"v": 1, "state": "approved", "time": NOW}, "state")
+neg("pairing-state-response", "v 2", {"v": 2, "state": "open", "time": NOW}, "v")
+neg("pairing-fetch-response", "a hold both granted and refused", dict(p1("pairing-fetch-response"), hold={"granted": True, "refused": True, "retryAfter": 2}), "hold")
+neg("pairing-fetch-response", "a refused hold without retryAfter", dict(p1("pairing-fetch-response"), hold={"refused": True}), "hold")
+neg("pairing-fetch-response", "an approval without the receipt", mut(p1("pairing-fetch-response", 1), "receipt"), "receipt")
+neg("pairing-fetch-response", "an answered rendezvous without its MAC", mut(dict(p1("pairing-fetch-response"), state="answered"), "mac"), "mac")
+neg("sealed-token-fixture", "a sealed token of 147 characters", mut(SEALED_FIXTURE, "opens.0.sealedToken", SEALED_FIXTURE["opens"][0]["sealedToken"][:147]), "sealedToken")
+neg("sealed-token-fixture", "a plaintext length that is not a token's", mut(SEALED_FIXTURE, "opens.0.plaintextLength", 64), "plaintextLength")
+neg("sealed-token-fixture", "a token written into the file", mut(SEALED_FIXTURE, "opens.0.token", "oaiyrt1.AQIDBAUGBwg.ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8"), "token")
+neg("sealed-token-fixture", "no wrongRecipient", mut(SEALED_FIXTURE, "wrongRecipient"), "wrongRecipient")
+neg("sealed-token-fixture", "a refused box that is not base64url", mut(SEALED_FIXTURE, "refused.0.sealedToken", "not base64!"), "sealedToken")
 
 # --- admission (4.14)
 MOBILE_CLAIMS = vec["A4"]["inputs"]["claims"]
@@ -1225,14 +1287,14 @@ neg("admission-claims", "a plugin claims set with an empty roster", dict(PLUGIN_
 neg("admission-claims", "a plugin claims set with 17 thumbprints", dict(PLUGIN_CLAIMS, approvedPeerKeyThumbprints=sorted(b64u(hashlib.sha256(bytes([i])).digest()) for i in range(17))), "oneOf")
 neg("admission-claims", "a plugin claims set with revision 0", dict(PLUGIN_CLAIMS, peerRosterRevision=0), "oneOf")
 neg("admission-claims", "a role that is neither mobile nor plugin", dict(MOBILE_CLAIMS, role="admin"), "oneOf")
-neg("admission-plugin-request", "no supportedTransports", mut(PLUGIN_REQUEST, "supportedTransports"), "supportedTransports")
+neg("admission-plugin-request", "a supportedTransports that is null", mut(PLUGIN_REQUEST, "supportedTransports", None), "supportedTransports")
 neg("admission-plugin-request", "an empty supportedTransports", mut(PLUGIN_REQUEST, "supportedTransports", []), "supportedTransports")
 neg("admission-plugin-request", "a websocket transport", mut(PLUGIN_REQUEST, "supportedTransports", ["websocket"]), "supportedTransports")
 neg("admission-plugin-request", "an empty roster", mut(PLUGIN_REQUEST, "approvedPeerKeyThumbprints", []), "approvedPeerKeyThumbprints")
 neg("admission-plugin-response", "desktopConnection (the plugin's decoder rejects it)", dict(PLUGIN_RESPONSE, desktopConnection={}), "desktopConnection")
 neg("admission-plugin-response", "scopeCompatibility (the plugin's decoder rejects it)", dict(PLUGIN_RESPONSE, scopeCompatibility={}), "scopeCompatibility")
 neg("admission-plugin-response", "no relay member", mut(PLUGIN_RESPONSE, "relay"), "relay")
-neg("admission-plugin-response", "expiresIn 30 (below the decoder's 31)", mut(PLUGIN_RESPONSE, "expiresIn", 30), "expiresIn")
+neg("admission-plugin-response", "expiresIn 10 (the decoder needs more than its 10 second safety margin)", mut(PLUGIN_RESPONSE, "expiresIn", 10), "expiresIn")
 neg("admission-plugin-response", "expiresIn 301", mut(PLUGIN_RESPONSE, "expiresIn", 301), "expiresIn")
 neg("admission-plugin-response", "tokenType bearer in lower case", mut(PLUGIN_RESPONSE, "tokenType", "bearer"), "tokenType")
 neg("admission-plugin-response", "a gatewayUrl on ws://", mut(PLUGIN_RESPONSE, "gatewayUrl", "ws://relay.example.com/v2/realtime"), "gatewayUrl")
@@ -1255,8 +1317,61 @@ neg("challenge", "schemaVersion 3", mut(CHALLENGE_PLUGIN, "schemaVersion", 3), "
 neg("compat-frames-request", "65 frames", {"to": "plugin", "frames": [{}] * 65}, "frames")
 neg("compat-frames-request", "an address that is neither plugin nor mobile:<thumbprint>", {"to": "phone", "frames": [{}]}, "to")
 neg("compat-frames-request", "no frames", {"to": "plugin", "frames": []}, "frames")
-neg("compat-frames-accepted", "accepted above 64", {"accepted": 65, "seq": 1}, "accepted")
-neg("compat-frames-page", "129 frames", {"lastSeq": 9, "frames": [p1("compat-frames-page")["frames"][0]] * 129}, "frames")
+neg("compat-frames-accepted", "accepted above 64", {"accepted": 65, "seq": 1, "time": NOW}, "accepted")
+neg("compat-frames-page", "129 frames", {"lastSeq": 9, "time": NOW, "frames": [p1("compat-frames-page")["frames"][0]] * 129}, "frames")
+
+# --- RL-07: the members the decoders are strict about, and the rules of the compatibility routes' answers
+PAGE = p1("compat-frames-page")
+neg("ice-server", "a STUN entry without username and credential (the plugin's decoder requires both members)", {"urls": STUN["urls"]}, "oneOf")
+neg("ice-server", "a STUN entry without credential", mut(STUN, "credential"), "oneOf")
+neg("ice-server", "a STUN entry with an expiresAt", dict(STUN, expiresAt=NOW + 600), "oneOf")
+neg("ice-server", "a STUN and a TURN url in one entry (the decoders treat it as TURN)", dict(TURN, urls=STUN["urls"] + TURN["urls"]), "oneOf")
+neg("ice-server", "a TURN entry without a credential", mut(TURN, "credential"), "oneOf")
+neg("ice-server", "a TURN username of 513 characters", mut(TURN, "username", "1790000600:" + "a" * 502), "oneOf")
+neg("ice-server", "a url that is neither stun nor turn", {"urls": ["https://stun.example.com"], "username": "", "credential": ""}, "oneOf")
+neg("ice-server", "nine urls in one entry", dict(STUN, urls=["stun:s%d.example.com" % i for i in range(9)]), "oneOf")
+neg("ice-server", "an unknown member", dict(TURN, realm="example"), "oneOf")
+neg("compat-error", "a retryAfter member (the phone's error decoder refuses a fourth member)", {"error": True, "code": "rate_limited", "message": "x", "retryAfter": 5}, "retryAfter")
+neg("compat-error", "the native nesting", {"error": {"code": "rate_limited", "message": "x"}}, "error")
+neg("compat-error", "an empty message", {"error": True, "code": "rate_limited", "message": ""}, "message")
+neg("compat-frames-accepted", "no time", {"accepted": 1, "seq": 9}, "time")
+neg("compat-frames-accepted", "nothing accepted", {"accepted": 0, "seq": 9, "time": NOW}, "accepted")
+neg("compat-frames-accepted", "an extra member", {"accepted": 1, "seq": 9, "time": NOW, "ok": True}, "ok")
+neg("compat-frames-page", "no time", mut(PAGE, "time"), "time")
+neg("compat-frames-page", "a negative lastSeq", mut(PAGE, "lastSeq", -1), "lastSeq")
+neg("compat-frames-page", "an unknown member", dict(PAGE, more=True), "more")
+neg("compat-frames-page", "a frame that has no subjectId", mut(PAGE, "frames.0.subjectId"), "subjectId")
+neg("compat-frames-page", "a frame that is an array", mut(PAGE, "frames.0.frame", [1]), "frame")
+neg("compat-frames-page", "a frame element with an extra member", mut(PAGE, "frames.0.extra", 1), "extra")
+neg("compat-frames-page", "a hold that is both granted and refused", dict(PAGE, hold={"granted": True, "refused": True, "retryAfter": 2}), "hold")
+neg("compat-stream-frame", "from is a bare role", mut(FRAME, "from", "phone"), "from")
+neg("compat-stream-frame", "from names a thumbprint of 42 characters", mut(FRAME, "from", "mobile:" + "A" * 42), "from")
+neg("compat-stream-frame", "seq 0", mut(FRAME, "seq", 0), "seq")
+neg("compat-stream-frame", "no frame", mut(FRAME, "frame"), "frame")
+neg("compat-stream-frame", "a frame that is a string", mut(FRAME, "frame", "x"), "frame")
+neg("compat-stream-frame", "a subjectId with a space", mut(FRAME, "subjectId", "a b"), "subjectId")
+neg("compat-stream-frame", "seventeen grants", mut(FRAME, "grants", ["state_read"] * 17), "grants")
+neg("compat-stream-frame", "a grant that is not a grant name at all", mut(FRAME, "grants", ["state_read", "Delete All"]), "grants")
+neg("compat-stream-frame", "a grant twice", mut(FRAME, "grants", ["state_read", "state_read"]), "grants")
+neg("compat-stream-frame", "an extra member", mut(FRAME, "id", "x"), "id")
+neg("admission-plugin-response", "a device record without a role", mut(PLUGIN_RESPONSE, "device", {"id": "aokie", "appId": "aokie", "subjectId": "aokie"}), "device")
+neg("admission-plugin-response", "no endpointPublicKey", mut(PLUGIN_RESPONSE, "endpointPublicKey"), "endpointPublicKey")
+neg("admission-plugin-response", "an empty roster", mut(PLUGIN_RESPONSE, "approvedPeerKeyThumbprints", []), "approvedPeerKeyThumbprints")
+neg("admission-plugin-response", "no turnCredentialExpiresAt (a required member, null when there is no TURN)", mut(PLUGIN_RESPONSE, "turnCredentialExpiresAt"), "turnCredentialExpiresAt")
+neg("admission-plugin-response", "a STUN entry without its empty credential members", mut(PLUGIN_RESPONSE, "iceServers", [{"urls": STUN["urls"]}, TURN]), "iceServers")
+neg("admission-mobile-response", "a device record with an extra member (the phone's DeviceRecord is strict)", mut(MOBILE_RESPONSE, "device.email", "x"), "email")
+neg("admission-mobile-response", "a device displayName of 121 characters", mut(MOBILE_RESPONSE, "device.displayName", "n" * 121), "displayName")
+neg("admission-mobile-response", "an empty device displayName", mut(MOBILE_RESPONSE, "device.displayName", ""), "displayName")
+neg("admission-mobile-response", "no scopes", mut(MOBILE_RESPONSE, "scopes", []), "scopes")
+neg("admission-mobile-response", "a device record without lastSeenAt", mut(MOBILE_RESPONSE, "device.lastSeenAt"), "lastSeenAt")
+neg("admission-mobile-response", "expiresIn 0", mut(MOBILE_RESPONSE, "expiresIn", 0), "expiresIn")
+neg("admission-mobile-response", "expiresIn 301", mut(MOBILE_RESPONSE, "expiresIn", 301), "expiresIn")
+neg("challenge", "an expiresAt that is a string", mut(CHALLENGE_PLUGIN, "expiresAt", str(NOW + 25)), "expiresAt")
+neg("challenge", "a connectionId in capitals", mut(CHALLENGE_PLUGIN, "connectionId", "relay_" + "A" * 32), "connectionId")
+neg("challenge", "an admissionJti that is short", mut(CHALLENGE_PLUGIN, "admissionJti", "adm_1"), "admissionJti")
+neg("challenge", "a challengeNonce with another prefix", mut(CHALLENGE_PLUGIN, "challengeNonce", "nonce_" + "1" * 32), "challengeNonce")
+neg("challenge", "the plugin's roster hash as a thumbprint of 42 characters", mut(CHALLENGE_PLUGIN, "peerRosterHash", "A" * 42), "peerRosterHash")
+neg("challenge", "role admin", mut(CHALLENGE_PLUGIN, "role", "admin"), "role")
 
 # --- ring (4.15.1)
 neg("ring", "an extra member (the Android parser forbids it)", dict(RING, extra="x"), "oneOf")
@@ -1469,6 +1584,87 @@ for t in ex["tokens"]["invalid"]:
 rule("item ids: a path-like id never reaches a file name (ids are matched by pattern)", lambda: validate("common#itemId", "../../data/relay.sqlite") != [])
 rule("item ids: NUL byte", lambda: validate("common#itemId", "a\u0000b") != [])
 rule("item ids: . and .. match the character class and are refused all the same", lambda: validate("common#itemId", ".") != [] and validate("common#itemId", "..") != [])
+
+# --- the rendezvous state machine (README 10.1): the reference function, and what it must refuse
+class Conflict(ValueError):
+    pass
+
+
+def pairing_next(state: str, event: str, rejects: int = 0, responses: int = 0) -> str:
+    """One step of the relay-side state machine: open -> answered -> approved | denied; answered -> open by a reject (the
+    third ends it); open | answered | denied -> expired by a burn or at exp. Anything else is a Conflict."""
+    if state == "expired":
+        raise Conflict("gone")
+    if event == "response" and state == "open" and responses < 3:
+        return "answered"
+    if event == "reject" and state == "answered":
+        return "open" if rejects + 1 < 3 else "expired"
+    if event == "approve" and state == "answered":
+        return "approved"
+    if event == "deny" and state == "answered":
+        return "denied"
+    if event == "burn" and state in ("open", "answered", "denied"):
+        return "expired"
+    raise Conflict(f"{event} in {state}")
+
+
+def refused_step(state: str, event: str, **kw) -> bool:
+    try:
+        pairing_next(state, event, **kw)
+        return False
+    except Conflict:
+        return True
+
+
+def pair_item_id(pid: str, n: int) -> str:
+    """The id of the pair item of the n-th accepted response: the pid itself for the first, pid.n after a reject."""
+    return pid if n == 1 else f"{pid}.{n}"
+
+
+def response_status(state: str, same_as_accepted: bool, rejects_left_open: bool = False) -> int:
+    """The status a phone's response gets in each state (README 10.1 and Interpretation 51): 202 in the open state, and 202 again in
+    answered, approved and denied for the very response the state holds (a retry whose 202 was lost), else 409; 404 for an ended one."""
+    if state in ("burned", "expired"):
+        return 404
+    if state == "open":
+        return 202
+    if state in ("answered", "approved", "denied"):
+        return 202 if same_as_accepted else 409
+    raise Conflict(state)
+
+
+PID3 = A3["expected"]["pid"]
+rule("pairing states: the identical response again is 202 in the answered, approved and denied states (a retry whose 202 was lost)",
+     lambda: all(response_status(s, True) == 202 for s in ("answered", "approved", "denied")))
+rule("pairing states: a different response is 409 in the answered, approved and denied states",
+     lambda: all(response_status(s, False) == 409 for s in ("answered", "approved", "denied")))
+rule("pairing states: a response is 202 in the open state whatever it says (a reject discarded the earlier one) and 404 once ended",
+     lambda: response_status("open", True) == 202 and response_status("open", False) == 202 and response_status("burned", True) == 404 and response_status("expired", False) == 404)
+rule("pairing states: a response opens the answered state, a reject reopens it, the third reject ends it",
+     lambda: (pairing_next("open", "response"), pairing_next("answered", "reject", rejects=0), pairing_next("answered", "reject", rejects=1),
+              pairing_next("answered", "reject", rejects=2)) == ("answered", "open", "open", "expired"))
+rule("pairing states: a second response while answered is refused (already_answered)", lambda: refused_step("answered", "response"))
+rule("pairing states: a response after an approval is refused", lambda: refused_step("approved", "response"))
+rule("pairing states: a response after a denial is refused", lambda: refused_step("denied", "response"))
+rule("pairing states: a fourth response is refused whatever the state (three are accepted)", lambda: refused_step("open", "response", responses=3))
+rule("pairing states: an approval of an open rendezvous (nobody answered) is refused", lambda: refused_step("open", "approve"))
+rule("pairing states: a denial of an open rendezvous is refused", lambda: refused_step("open", "deny"))
+rule("pairing states: a reject of an open rendezvous is refused", lambda: refused_step("open", "reject"))
+rule("pairing states: an approval after a denial is refused", lambda: refused_step("denied", "approve"))
+rule("pairing states: a reject after an approval is refused", lambda: refused_step("approved", "reject"))
+rule("pairing states: an approved rendezvous is not burned (its phone has yet to read the token)", lambda: refused_step("approved", "burn"))
+rule("pairing states: nothing happens to an expired rendezvous", lambda: all(refused_step("expired", e) for e in ("response", "reject", "approve", "deny", "burn")))
+rule("pairing states: the state after a burn is expired, from open, answered and denied",
+     lambda: all(pairing_next(s, "burn") == "expired" for s in ("open", "answered", "denied")))
+rule("pairing: the item ids of three responses are all different and the first is the pid",
+     lambda: [pair_item_id(PID3, n) for n in (1, 2, 3)] == [PID3, PID3 + ".2", PID3 + ".3"] and len({pair_item_id(PID3, n) for n in (1, 2, 3)}) == 3)
+rule("pairing: the receipt document lists the grants sorted, so an unsorted list is another text and another signature",
+     lambda: canonical_json(json.dumps(dict(A3["inputs"]["receiptDocument"], grants=list(reversed(A3["inputs"]["receiptDocument"]["grants"]))))) != A3["expected"]["receiptText"])
+rule("pairing: a receipt signature does not verify for another pid",
+     lambda: not ed_verify(pub["desktopEndpoint"], b"oaiy/pairing/3/approval\x00" + canonical_json(json.dumps(dict(A3["inputs"]["receiptDocument"], pid=b64u(bytes(16))))).encode(), unb64u_strict(A3["expected"]["receiptSignature"])))
+rule("pairing: a receipt signature does not verify under the response domain",
+     lambda: not ed_verify(pub["desktopEndpoint"], b"oaiy/pairing/3/response\x00" + A3["expected"]["receiptText"].encode(), unb64u_strict(A3["expected"]["receiptSignature"])))
+
 n_rules = 0
 for label, fn in RULES:
     n_rules += 1
@@ -1489,6 +1685,216 @@ else:
     node_total = int(m.group(1)) if m else 0
     ok(f"node re-computation agrees ({node_total} checks)", proc.returncode == 0 and bool(m) and m.group(2) == "0", "\n".join(tail[-8:]) + proc.stderr[-300:])
     ok("node re-computation ran at least 217 checks (a checker that was silently thinned fails here)", node_total >= 217, str(node_total))
+
+section("recorded fixtures (fixtures/): sealed tokens and the pairing ceremony, read by two independent implementations")
+FIX = V1 / "fixtures"
+CEREMONY = json.loads((FIX / "pairing-ceremony.json").read_text(encoding="utf-8"))
+STEP_SCHEMAS = [("pairing-create-request", "pairing-create-response"), (None, "pairing-fetch-response"), ("pairing-answer-request", "pairing-answer-response"),
+                (None, "poll-response"), ("pairing-decision", "pairing-decision-response"), (None, "pairing-fetch-response")]
+n_fix_docs = 0
+for i, (step, (req_schema, res_schema)) in enumerate(zip(CEREMONY["steps"], STEP_SCHEMAS)):
+    for schema_name, body in ((req_schema, step["request"].get("body")), (res_schema, step["response"]["body"])):
+        if schema_name is None or body is None:
+            continue
+        n_fix_docs += 1
+        errs = problems(schema_name, body)
+        ok(f"ceremony step {i} ({step['step']}) validates against {schema_name}", not errs, errs[0].message[:150] if errs else "")
+print(f"\n  {n_fix_docs} documents of the recorded ceremony validated")
+ok("the ceremony's pair item body is the response text the phone posted, byte for byte",
+   CEREMONY["steps"][3]["response"]["body"]["items"][0]["body"] == CEREMONY["steps"][2]["request"]["body"]["response"])
+ok("the ceremony's offer is Appendix A3's 778 byte text", CEREMONY["steps"][0]["request"]["body"]["offer"] == A3["expected"]["offerText"])
+ok("no device token is written into any fixture file",
+   all(re.search(r"oaiyrt1\.[A-Za-z0-9_-]{11}\.[A-Za-z0-9_-]{43}", p.read_text(encoding="utf-8")) is None for p in FIX.rglob("*.json")),
+   "a token-shaped string was found")
+fix_readme = (FIX / "README.md").read_text(encoding="utf-8")
+for f in ("sealed-token.json", "pairing-ceremony.json", "verify_fixtures.py", "verify_fixtures.mjs"):
+    ok(f"fixtures/README.md describes {f}", f"`{f}`" in fix_readme)
+fix_checks = 0
+for label, cmd in (("Python (no libsodium)", [sys.executable, str(FIX / "verify_fixtures.py")]), ("Node (no libsodium)", [shutil.which("node") or "node", str(FIX / "verify_fixtures.mjs")])):
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=180)
+        m = re.search(r"(\d+) checks, (\d+) mismatches", proc.stdout)
+        n = int(m.group(1)) if m else 0
+        fix_checks += n
+        ok(f"independent reading of the fixtures in {label} agrees ({n} checks)", proc.returncode == 0 and bool(m) and m.group(2) == "0", (proc.stdout + proc.stderr)[-400:])
+    except (OSError, subprocess.TimeoutExpired) as e:
+        ok(f"independent reading of the fixtures in {label} ran", False, str(e))
+
+try:
+    proc = subprocess.run([sys.executable, str(FIX / "selftest_fixtures.py")], capture_output=True, text=True, encoding="utf-8", timeout=300)
+    m = re.search(r"(\d+) damaged copies, each refused by", proc.stdout)
+    n = int(m.group(1)) if m else 0
+    ok(f"the two readers of the pairing fixtures are not vacuous: each of {n} damaged copies is refused by both", proc.returncode == 0 and n >= 10, (proc.stdout + proc.stderr)[-500:])
+except (OSError, subprocess.TimeoutExpired) as e:
+    ok("the self-test of the pairing fixture readers ran", False, str(e))
+for f in ("sealed-token.json", "selftest_fixtures.py"):
+    ok(f"fixtures/README.md describes {f}", f"`{f}`" in fix_readme)
+
+section("recorded Aokie fixtures (fixtures/aokie/): admissions, challenges, frames, streams, errors and ICE, read by the decoders' rules")
+AOK = FIX / "aokie"
+aok = {n: json.loads((AOK / n).read_text(encoding="utf-8")) for n in ("admission.json", "challenge.json", "frames.json", "stream.json", "errors.json", "ice.json")}
+n_aok_docs = 0
+
+
+def aok_valid(schema_name: str, body, label: str) -> None:
+    global n_aok_docs
+    n_aok_docs += 1
+    errs = problems(schema_name, body)
+    ok(f"aokie fixture {label} validates against {schema_name}", not errs, errs[0].message[:150] if errs else "")
+
+
+for c in aok["admission.json"]["cases"]:
+    plug = c["role"] == "plugin"
+    aok_valid("admission-plugin-request" if plug else "admission-mobile-request", c["request"]["body"], f"admission request '{c['name']}'")
+    aok_valid(("admission-plugin-response" if plug else "admission-mobile-response") if c["response"]["status"] == 200 else "compat-error", c["response"]["body"], f"admission answer '{c['name']}'")
+    for s_ in (c["response"]["body"].get("iceServers", []) if c["response"]["status"] == 200 else []):
+        aok_valid("ice-server", s_, f"ICE entry of '{c['name']}'")
+for c in aok["challenge.json"]["cases"]:
+    aok_valid("challenge", c["response"]["body"], f"challenge '{c['name']}'")
+for st in aok["frames.json"]["steps"]:
+    post = st["request"]["method"] == "POST"
+    if post:
+        aok_valid("compat-frames-request", st["request"]["body"], f"frames request '{st['step']}'")
+    aok_valid("compat-frames-accepted" if post else "compat-frames-page", st["response"]["body"], f"frames answer '{st['step']}'")
+for c in aok["stream.json"]["cases"]:
+    events = [b for b in c["body"].split("\n\n") if b]
+    for b in events:
+        lines = dict(l.split(": ", 1) for l in b.split("\n") if ": " in l and not l.startswith(":"))
+        if lines.get("event") == "frame":
+            aok_valid("compat-stream-frame", json.loads(lines["data"]), f"stream event id {lines['id']} of '{c['name']}'")
+        elif lines.get("event") == "end":
+            ok(f"stream '{c['name']}': the end event's data is an empty object", lines["data"] == "{}")
+for c in aok["errors.json"]["cases"]:
+    if c["response"]["status"] >= 400:
+        aok_valid("compat-error", c["response"]["body"], f"error '{c['name']}'")
+    else:
+        aok_valid("compat-frames-page", c["response"]["body"], f"answer '{c['name']}'")
+for c in aok["ice.json"]["cases"]:
+    for s_ in c["expected"]["iceServers"]:
+        aok_valid("ice-server", s_, f"ICE entry of '{c['name']}'")
+print(f"\n  {n_aok_docs} documents of the Aokie fixtures validated")
+aok_readme = (AOK / "README.md").read_text(encoding="utf-8")
+for f in ("admission.json", "challenge.json", "frames.json", "stream.json", "errors.json", "ice.json", "aokie_decoders.py", "verify_aokie_fixtures.py"):
+    ok(f"fixtures/aokie/README.md describes {f}", f"`{f}`" in aok_readme)
+ok("every admission of the Aokie fixtures carries the same three relay URLs (the plugin's cursor domain)",
+   len({json.dumps({k: v for k, v in c["response"]["body"]["relay"].items() if k != "mode"}, sort_keys=True) for c in aok["admission.json"]["cases"] if c["response"]["status"] == 200}) == 1)
+aok_neg = 0
+try:
+    proc = subprocess.run([sys.executable, str(AOK / "verify_aokie_fixtures.py")], capture_output=True, text=True, encoding="utf-8", timeout=180)
+    m = re.search(r"(\d+) checks, (\d+) mismatches", proc.stdout)
+    n = int(m.group(1)) if m else 0
+    fix_checks += n
+    ok(f"the decoders' rules, transcribed in Python, accept the Aokie fixtures and refuse every damaged copy ({n} checks)", proc.returncode == 0 and bool(m) and m.group(2) == "0", (proc.stdout + proc.stderr)[-500:])
+    m2 = re.search(r"(\d+) damaged documents refused", proc.stdout)
+    aok_neg = int(m2.group(1)) if m2 else 0
+    ok("at least a hundred damaged copies of the Aokie fixtures were refused", aok_neg >= 100)
+except (OSError, subprocess.TimeoutExpired) as e:
+    ok("the Aokie fixture verifier ran", False, str(e))
+
+section("poll-client fixture (fixtures/poll-client/): the rules of README 5.1.1 for the native pollers (DK-03, MOB-21a), read twice")
+PC = FIX / "poll-client"
+pc_readme = (V1 / "README.md").read_text(encoding="utf-8")
+pc_doc = json.loads((PC / "poll-client.json").read_text(encoding="utf-8"))
+# What the table holds, pinned here as the vectors' values are (DESIGN_PINS): a case that goes missing from the table, or one that is added,
+# changes these, and whoever does it changes them here on purpose. The readers check the table against its own caseCount and idsSha256, which
+# a table edited to agree with itself would satisfy; these are what that edit cannot satisfy.
+POLL_CLIENT_PINS = {"cases": 111, "idsSha256": "e9ce737bd8df32d166aa61cd5dfdc6aea038f72437063be9d1d3633613a4c34d"}
+ok("README has the section and states each of the rules P1 to P9 by its number",
+   "### 5.1.1 The poll loop of a native client (DK-03 and MOB-21a)" in pc_readme and all(f"**P{i}. " in pc_readme for i in range(1, 10)))
+pc_ids = [x["id"] for x in pc_doc["cases"]]
+ok("the table holds exactly the cases that are pinned here, by their number and the digest of their names (a case that went missing is noticed)",
+   len(pc_ids) == POLL_CLIENT_PINS["cases"] and len(set(pc_ids)) == len(pc_ids) and hashlib.sha256("\n".join(sorted(pc_ids)).encode("utf-8")).hexdigest() == POLL_CLIENT_PINS["idsSha256"]
+   and pc_doc["caseCount"] == len(pc_ids) and pc_doc["idsSha256"] == POLL_CLIENT_PINS["idsSha256"])
+ok("README says what DK-03 and MOB-21a are, since nothing else in the repository does",
+   "DK-03 is the work package that builds the desktop's relay client" in pc_readme and "MOB-21a the one that builds the phone's" in pc_readme)
+ok("every rule P1 to P9 has cases in the table",
+   {c["rule"] for c in pc_doc["cases"]} >= {f"P{i}" for i in range(1, 10)})
+ok("README closes what the review found open in the rules: the relay's step (200 ms) and the 250 ms bound, a poll's own timeout, the epoch that is cleared after a first 400, 426 and info, a reset answer arming no gap, what to persist and when, the counters and the times a client keeps, the identity proof in the loop, and the names of every action and report",
+   all(s in pc_readme for s in ("The relay's **step** is 200 ms", "A poll's own timeout is `wait + 10` seconds", "action `clear_epoch`", "makes the client re-read `GET /v1/info` (section 8.5)",
+                                "the relay records no end of a poll for it, so the gap rule never refuses the poll that follows", "**To persist** is to write what the client accepted",
+                                "**P8. State.** A client keeps four numbers and two times", "**P9. The relay's identity, and `info`.**", "`report_relay_changed`", "`forget_credential`, `refresh_or_reenrol`, `update_client`, `report_defect`, `clear_epoch`",
+                                "`unreachable`, `in_flight_defect`, `duplicate_credential` (P2), `invalid_request`", "(2 s, doubling up to `info.wait.fallbackS`, 5: 2, 4, 5, 5...)", "the protocol's bound for it is 250 ms, section 5.1.1")))
+ok("README states the numbers the table pins: clamp 1 to 120, jitter up to 20 percent, 429 backoff 1, 2, 4, 8, 16, 30, failure backoff capped at 60, unreachable after three failures, a defect when the fifth 429 in a row says in_flight, a replacement 250 ms after the poll it cancels",
+   all(s in pc_readme for s in ("`clamp(x)` is `x` limited to 1 to 120", "`pause = base * (1 + 0.2 * u)`", "`base = max(clamp(D), min(30, 2^(n-1)))`: 1, 2, 4, 8, 16, 30, 30...",
+                                "`base = min(60, 2^(n-1))`: 1, 2, 4, 8, 16, 32, 60, 60...", "after three failures in a row", "when the fifth `429` in a row says `rule: \"in_flight\"`",
+                                "no sooner than 250 ms after it started the one it cancels")))
+ok("README says how the two refusals of a poll are told apart (error.rule: gap, in_flight), that a 429 is neither a success nor a failure, how Retry-After is read (digits, HTTP-date, the body, none) and what the shipped carriers do, with their lines",
+   all(s in pc_readme for s in ("`\"rule\":\"gap\"`", "`\"rule\":\"in_flight\"`", "A **429 is never a failure**", "an HTTP-date (the IMF-fixdate of RFC 9110", "`error.retryAfter` when that is an integer from 0 to 86400",
+                                "plugin `companion_relay.rs` 50-52 and 670-677; phone 70-72 and 458-460", "plugin 53-56 and 745-755; phone 73-76 and 560-564", "(`post_frames`, 980-1031)")))
+fix_readme = (FIX / "README.md").read_text(encoding="utf-8")
+for f in ("poll-client/poll-client.json", "poll-client/verify_poll_client.py", "poll-client/verify_poll_client.mjs"):
+    ok(f"fixtures/README.md describes {f}", f"`{f}`" in fix_readme)
+node_exe = shutil.which("node")
+pc_readers = [("Python", [sys.executable, str(PC / "verify_poll_client.py")])]
+if node_exe is None:
+    ok("node is on PATH for the second reader of the poll-client table", False, "install Node 18+")
+else:
+    pc_readers.append(("Node", [node_exe, str(PC / "verify_poll_client.mjs")]))
+for label, cmd in pc_readers:
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=120)
+        m = re.search(r"(\d+) checks, (\d+) mismatches", proc.stdout)
+        n = int(m.group(1)) if m else 0
+        fix_checks += n
+        ok(f"{label} reading of the poll-client table, written from the README alone, agrees with every case ({n} checks)", proc.returncode == 0 and bool(m) and m.group(2) == "0" and n >= 700, (proc.stdout + proc.stderr)[-500:])
+    except (OSError, subprocess.TimeoutExpired) as e:
+        ok(f"{label} reading of the poll-client table ran", False, str(e))
+# Not vacuous: a table with one answer changed is refused by both readers (each change is one thing a client could get wrong).
+import tempfile  # noqa: E402
+
+
+def pc_damage(case_id: str, path: tuple, value) -> dict:
+    d = copy.deepcopy(pc_doc)
+    case = next(c for c in d["cases"] if c["id"] == case_id)
+    for key in path[:-1]:
+        case = case[key]
+    case[path[-1]] = value
+    return d
+
+
+pc_damaged = [
+    ("a 429 pause that is not clamped to 120", pc_damage("p6-clamp-high", ("expect", "baseS"), 600)),
+    ("a Retry-After of 0 that is not clamped to 1", pc_damage("p6-clamp-low", ("expect", "baseS"), 0)),
+    ("a 429 backoff that is not capped at 30", pc_damage("p5-429-after-8", ("expect", "baseS"), 256)),
+    ("a failure backoff that is not capped at 60", pc_damage("p5-fail-seventh", ("expect", "baseS"), 64)),
+    ("a 429 that is counted as a failure", pc_damage("p4-gap-first", ("expect", "state", "nFail"), 1)),
+    ("a 429 that is called a failure", pc_damage("p4-gap-first", ("expect", "outcome"), "failure")),
+    ("an HTTP-date Retry-After that is read as text", pc_damage("p6-http-date", ("expect", "baseS"), 1)),
+    ("a revoked device that is told to refresh", pc_damage("p8-401-revoked", ("expect", "action"), "refresh_or_reenrol")),
+    ("a relay that is not reported unreachable after three failures", pc_damage("p7-fail-third", ("expect", "report"), [])),
+    ("a fifth in_flight 429 that is not reported", pc_damage("p5-429-5-in-flight", ("expect", "report"), [])),
+    ("a refused hold that does not double", pc_damage("p3-refused-second", ("expect", "baseS"), 2)),
+    ("a replacement poll that may start at once", pc_damage("p1-replace-at-once", ("expect", "waitMs"), 0)),
+    ("a poll replaced by another process that does not pause as after idle", pc_damage("p2-superseded-not-ours", ("expect", "baseS"), 0)),
+    ("a superseded poll that this client replaced and that waits", pc_damage("p2-superseded-ours", ("expect", "baseS"), 0.25)),
+    ("a jitter that is not added", pc_damage("p6-clamp-jitter", ("expect", "pauseS"), 120)),
+    ("a second 400 in a row that is retried again", pc_damage("p2-400-second", ("expect", "outcome"), "failure")),
+    ("a first 400 that does not clear the epoch", pc_damage("p2-400-first", ("expect", "action"), None)),
+    ("a 426 that stops a client that is not too old", pc_damage("p8-426-not-too-old", ("expect", "outcome"), "stop")),
+    ("a stop that clears the counters", pc_damage("p8-stop-keeps-counters", ("expect", "state", "n429"), 0)),
+    ("a proof that does not verify and is only a failure", pc_damage("p9-proof-wrong-key", ("expect", "outcome"), "failure")),
+    ("a proof that is not due at 300 seconds", pc_damage("p9-due-every-300s", ("expect", "due"), False)),
+    ("a poll's own timeout that is judged a replacement (no failure counted)", pc_damage("p1-own-timeout-is-failure", ("expect", "state", "nFail"), 0)),
+    ("a table with a case missing from it (its count and digest as they were)", dict(copy.deepcopy(pc_doc), cases=[x for x in pc_doc["cases"] if x["id"] != "p6-clamp-low"])),
+    ("a table whose constants say a clamp of 100", dict(copy.deepcopy(pc_doc), constants=dict(pc_doc["constants"], clampMax=100))),
+    ("a table whose constants say a jitter of 30 percent", dict(copy.deepcopy(pc_doc), constants=dict(pc_doc["constants"], jitter=0.3))),
+    ("a table whose constants say a failure backoff capped at 120", dict(copy.deepcopy(pc_doc), constants=dict(pc_doc["constants"], backoffFailureCap=120))),
+]
+# A table that was edited to agree with itself (a case removed, its count and digest recomputed) is accepted by the readers, which is why the
+# pins above exist: it does not agree with them.
+pc_edited = copy.deepcopy(pc_doc)
+pc_edited["cases"] = [x for x in pc_edited["cases"] if x["id"] != "p6-clamp-low"]
+pc_edited["caseCount"] = len(pc_edited["cases"])
+pc_edited["idsSha256"] = hashlib.sha256("\n".join(sorted(x["id"] for x in pc_edited["cases"])).encode("utf-8")).hexdigest()
+ok("a table edited to agree with itself (a case removed, its count and digest recomputed) is not the pinned one",
+   pc_edited["idsSha256"] != POLL_CLIENT_PINS["idsSha256"] and pc_edited["caseCount"] != POLL_CLIENT_PINS["cases"])
+with tempfile.TemporaryDirectory() as tmpd:
+    for i, (what, damaged) in enumerate(pc_damaged):
+        f = pathlib.Path(tmpd) / f"damaged{i}.json"
+        f.write_text(json.dumps(damaged), encoding="utf-8")
+        for label, cmd in pc_readers:
+            proc = subprocess.run(cmd + ["--file", str(f)], capture_output=True, text=True, encoding="utf-8", timeout=120)
+            ok(f"the {label} reader refuses the table with {what}", proc.returncode == 1 and "MISMATCH" in proc.stdout, (proc.stdout + proc.stderr)[-200:])
 
 section("vectors.json is what generate_vectors.py writes")
 proc = subprocess.run([sys.executable, str(V1 / "generate_vectors.py"), "--check"], capture_output=True, text=True, encoding="utf-8", timeout=120)
@@ -1511,19 +1917,42 @@ for route in ("/v1/health", "/v1/info", "/v1/poll", "/v1/items", "/v1/slots", "/
               "/v1/admin/hold", "/v1/admin/stream-probe", "/v1/admin/echo", "/v1/admin/capacity", "/v1/aokie-companion/relay/stream"):
     ok(f"README lists the route {route}", route in readme)
 ok("README has an Interpretations section", re.search(r"^## (\d+\. )?Interpretations$", readme, re.M) is not None)
-interp_section = re.split(r"^## (?:\d+\. )?Interpretations$", readme, flags=re.M)[-1]
+interp_section = re.split(r"^## ", re.split(r"^## (?:\d+\. )?Interpretations$", readme, flags=re.M)[-1], maxsplit=1, flags=re.M)[0]  # up to the next H2: the design defects that follow are numbered too
 interp_numbers = [int(n) for n in re.findall(r"^(\d+)\. \*\*", interp_section, re.M)]
 ok("the Interpretations are numbered 1 to N with no gap and no repeat, and there are at least 23", interp_numbers == list(range(1, len(interp_numbers) + 1)) and len(interp_numbers) >= 23, str(interp_numbers))
 ok("README says the SAS input carries the raw 16 bytes of pid and points at extras.sasNegative", "**raw 16 bytes**" in readme and "extras.sasNegative" in readme and 'not its 22-character b64u text' in readme)
 ok("README says the item ids . and .. and the spelling -0 are refused", "never `.` or `..`" in readme and "the spelling `-0`" in readme and "`-0` is not an integer" in readme)
 ok("README has a Response shapes section", re.search(r"^## (\d+\. )?Response shapes$", readme, re.M) is not None)
+ok("README says consumers de-duplicate on (from, id) and never on the id alone, and keys the relay's own rule with the sender",
+   "consumers de-duplicate on `(from, id)`" in readme and "never on `id` alone" in readme and "`(mailbox, lane, sender, id)` uniqueness for 10 minutes" in readme
+   and "`(mailbox, lane, id)` uniqueness" not in readme and "A consumer de-duplicates on (from, id), after authenticating the sender" in readme)
+ok("README makes the challenge life a config value, call.challenge_s", "`call.challenge_s` (10 to 30, default 25)" in readme)
+ok("README sizes the stream open bucket at 20 refilled three a second, says why (the carriers pause one second after a failed open, ignore Retry-After and give up after three failures) and what was measured and not done",
+   "a bucket of 20 opens for the party, refilled three a second" in readme and "**A carrier that cancels opens is a different case" in readme
+   and "give a session up after three failures in a row" in readme and "Not done: answering an open over the bucket with a stream that ends at once" in readme)
+ok("README says a busy or gone database is 503 unavailable with Retry-After on the ordinary routes, the 500 internal the plugin retries on the compatibility routes (with the plugin's lines), never a 401 or a 404, that a frames post that committed is stored again by its retry, and that debug.error_sites gives a reason code and the clocks of the decision",
+   "is `503 unavailable` with a `Retry-After` on the ordinary routes and the `500 internal` that the shipped plugin retries on the compatibility routes, and never a `401` or a `404`" in readme
+   and "`Db::isTransient`" in readme and "`relay_status_error`, `companion_relay.rs` 1093-1108" in readme and "`post_frames`, 1025-1031" in readme and "`errors.rs` 170-180" in readme
+   and "`tests/lib/AokiePlugin.php`" in readme and "stores a second set of frames under new `seq` numbers" in readme and "a reason code that tells the causes apart" in readme
+   and "as they were when the decision was made" in readme and "`debug.error_sites`" in readme)
+ok("README bounds the polls that wait of one credential to three in flight, answers the fourth 429 with Retry-After 1 and error.rule, and requires a client to treat that 429 as no failure and to honour Retry-After with jitter (DK-03 and MOB-21a)",
+   "At most three consumer polls that wait" in readme and "A fourth is refused `429 rate_limited`, `Retry-After: 1`, `error.rule: \"in_flight\"`, before the poll reads or writes anything of its own" in readme
+   and "MUST NOT treat this `429` as a failure, and MUST honour `Retry-After`" in readme and "DK-03" in readme and "MOB-21a" in readme and "Interpretation 58" in readme
+   and "`error.rule: \"in_flight\"`" in readme and "`error.rule: \"gap\"`" in readme and "section 5.1.1 says exactly how" in readme
+   and "`Holds::POLL_INFLIGHT_MAX` (3)" in readme)
+ok("README says what the poll bound is worth: with the shipped gap rule its benefit is small (a defence in depth that matters when wait.gap_ms is 0), that the first figures came from a relay whose gap was 0, and that the pool tests run with both",
+   "a bound in depth, whose benefit with the shipped gap rule is small" in readme and "were measured on a relay whose `wait.gap_ms` was 0, which the tests set and the product does not ship" in readme
+   and "The bound is therefore defence in depth" in readme and "run with both: gap 0, where the bound alone protects the pool, and the shipped 250" in readme)
+ok("README records that the relay's limits are tighter than the decoders' and that 'no change to the shipped plugin and phone' is not true, and lists what needs a client change",
+   "The relay's limits are tighter than the decoders'" in readme and "need no change\" is not true today" in readme
+   and all(x in readme for x in ("`relay_status_error`", "both carriers ignore `Retry-After`", "no OAuth route", "`supportedTransports`", "64 roster entries and an app id of 200 characters")))
 
 # ---------------------------------------------------------------------------
 print("\n" + "-" * 60)
 n_vec_neg = len(ex["tokens"]["invalid"]) + len(ex["canonical"]["refused"]) + 2 * len(a12["inputs"]["encodings"]) + len(ex["sasNegative"]["wrong"])
 print(f"negative documents: {n_neg_schema} by schema + {n_rules} by reference rule "
       f"({n_vec_neg} of the rules replay the vectors' invalid tokens, refused numbers, wrong SAS readings and small-order keys) "
-      f"= {n_neg_schema + n_rules}")
+      f"= {n_neg_schema + n_rules}, and {aok_neg} damaged copies of the Aokie fixtures refused by the decoders' rules")
 print(f"positive documents: {n_pos}; vector values recomputed in Python: {recomputed}; node checks: {node_total}")
 print(f"relay protocol conformance: {passed} passed, {len(failures)} failed")
 if failures:

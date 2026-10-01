@@ -28,7 +28,7 @@ final class Config
             'slotBytes' => 65536, 'sigItems' => 1024, 'sigSenderShare' => 0.25, 'lanes' => [],
         ],
         'apps' => null,
-        'call' => ['enabled' => false],
+        'call' => ['enabled' => false, 'challenge_s' => 25],
         'compat' => ['sse' => 'auto'],
         'turn' => ['urls' => [], 'secret' => null, 'ttl' => 600, 'relay_only' => false],
         'stun' => ['urls' => []],
@@ -37,8 +37,18 @@ final class Config
         'token_pepper' => null,
         'wake' => ['mode' => 'file', 'safety_ms' => 2000],
         'gc' => ['one_in' => 20],
+        'debug' => ['error_sites' => false],
         'client_ip' => ['header' => null, 'trusted_proxies' => []],
     ];
+
+    /**
+     * The life of an Aokie endpoint challenge, call.challenge_s: 25 is FormLogic's and the design's. The shipped phone refuses a
+     * challenge whose expiresAt is more than 30 seconds ahead of its own clock or not ahead of it at all, so 25 tolerates a phone clock
+     * 24 seconds ahead of the relay's and only 5 seconds behind it; 15 tolerates 15 either way. Below 10 a slow network would make the
+     * hello late.
+     */
+    public const CHALLENGE_MIN_S = 10;
+    public const CHALLENGE_MAX_S = 30;
 
     /** Numeric maxima a config may not exceed (section 4.3, 4.4, 4.7, 4.18.10). */
     private const MAX = [
@@ -182,6 +192,7 @@ final class Config
         if (!is_bool($c['call']['enabled'] ?? null)) {
             throw self::bad('call.enabled');
         }
+        self::intIn($c['call']['challenge_s'] ?? null, self::CHALLENGE_MIN_S, self::CHALLENGE_MAX_S, 'call.challenge_s');
         if (!in_array($c['compat']['sse'] ?? null, ['auto', 'on', 'off', 'force'], true)) {
             throw self::bad('compat.sse');
         }
@@ -190,6 +201,9 @@ final class Config
         }
         self::intIn($c['wake']['safety_ms'] ?? null, 200, 60000, 'wake.safety_ms');
         self::intIn($c['gc']['one_in'] ?? null, 0, 1000, 'gc.one_in');
+        if (!is_bool($c['debug']['error_sites'] ?? null)) {
+            throw self::bad('debug.error_sites');
+        }
         if ($c['token_pepper'] !== null && (!is_string($c['token_pepper']) || strlen($c['token_pepper']) < 16)) {
             throw self::bad('token_pepper');
         }
@@ -214,6 +228,7 @@ final class Config
                 throw self::bad('cors.extra_origins');
             }
         }
+        Ice::validate($c);
     }
 
     /**
@@ -293,9 +308,34 @@ final class Config
         return (bool)$this->c['call']['enabled'];
     }
 
+    /** How long an Aokie endpoint challenge lives, in seconds (call.challenge_s, 10 to 30, default 25). */
+    public function challengeSeconds(): int
+    {
+        return (int)$this->c['call']['challenge_s'];
+    }
+
     public function pepper(): ?string
     {
         return $this->c['token_pepper'];
+    }
+
+    /** @return array{urls:list<string>,secret:?string,ttl:int,relay_only:bool} the TURN section, validated (see Ice) */
+    public function turn(): array
+    {
+        $t = $this->c['turn'];
+        return ['urls' => array_values($t['urls']), 'secret' => $t['secret'], 'ttl' => (int)$t['ttl'], 'relay_only' => (bool)$t['relay_only']];
+    }
+
+    /** @return list<string> */
+    public function stunUrls(): array
+    {
+        return array_values($this->c['stun']['urls']);
+    }
+
+    /** `auto`, `on`, `off` or `force`: whether the framed stream is offered (see Info::features). */
+    public function compatSse(): string
+    {
+        return (string)$this->c['compat']['sse'];
     }
 
     public function wakeMode(): string
@@ -312,6 +352,15 @@ final class Config
     public function gcOneIn(): int
     {
         return (int)$this->c['gc']['one_in'];
+    }
+
+    /**
+     * debug.error_sites: log, for every 401, 404 and 5xx answered, the place in the code that decided it (a file and a line), with the
+     * route, status, code and the relay's clock. Off by default; a log line names no credential, body or header.
+     */
+    public function debugErrorSites(): bool
+    {
+        return (bool)$this->c['debug']['error_sites'];
     }
 
     public function clientIpHeader(): ?string

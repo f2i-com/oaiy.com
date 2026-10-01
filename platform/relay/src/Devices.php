@@ -10,8 +10,9 @@ defined('OAIY_RELAY') or exit;
  *
  * Revocation is immediate and complete (section 4.5): the device is marked revoked, its tokens are marked revoked (the
  * rows stay, so the device learns "revoked" instead of a blank 401, and only after its secret verified), its inbox is
- * purged, the items it had already posted to other mailboxes are retired (they are not delivered afterwards), its party
- * mailboxes, slots and push registration go, and any hold it has ends with
+ * purged, the items it had already posted to other mailboxes are retired (they are not delivered afterwards, and that holds
+ * for the frames a phone posted to the plugin, which carry its party rather than its id), its party mailbox, slots and push
+ * registration go, and any hold it has ends with
  * `401 revoked` within 250 ms because a marker file tells the waiting request.
  */
 final class Devices
@@ -60,37 +61,58 @@ final class Devices
      */
     public static function revoke(Context $ctx, string $id, bool $cascade = false): array
     {
-        $db = $ctx->db;
         $now = Clock::now();
-        $done = $db->write(function (Db $db) use ($ctx, $id, $now, $cascade): array {
-            $ids = [];
-            $todo = [$id];
-            if ($cascade) {
-                foreach ($db->all('SELECT id FROM devices WHERE owner_desktop = ? AND revoked_at IS NULL', [$id]) as $r) {
-                    $todo[] = (string)$r['id'];
-                }
+        $done = $ctx->db->write(fn(Db $db): array => self::revokeInTx($ctx, $db, $id, $cascade, $now));
+        self::markRevoked($ctx, $done);
+        return $done;
+    }
+
+    /**
+     * The revocation itself, for a caller that has its own transaction (a roster push revokes the phones it no longer lists in the
+     * same transaction that stores it). Call inside write(); when it has committed, call markRevoked() with the ids it returned.
+     * @return list<string> the ids revoked
+     */
+    public static function revokeInTx(Context $ctx, Db $db, string $id, bool $cascade, int $now): array
+    {
+        $ids = [];
+        $todo = [$id];
+        if ($cascade) {
+            // The desktop's row is locked before the phones are listed: an approval that is making a phone for this desktop holds
+            // the same lock until it commits, so the list below (a read that sees the state as of its first statement) includes
+            // that phone, and an approval that comes after finds the desktop revoked (Pairing::decide).
+            $db->one('SELECT id FROM devices WHERE id = ?' . $db->forUpdate(), [$id]);
+            foreach ($db->all('SELECT id FROM devices WHERE owner_desktop = ? AND revoked_at IS NULL', [$id]) as $r) {
+                $todo[] = (string)$r['id'];
             }
-            foreach ($todo as $one) {
-                $row = $db->one('SELECT * FROM devices WHERE id = ?' . $db->forUpdate(), [$one]);
-                if ($row === null || $row['revoked_at'] !== null) {
-                    continue;
-                }
-                $db->exec('UPDATE devices SET revoked_at = ?, push_kind = NULL, push_token = NULL WHERE id = ?', [$now, $one]);
-                $db->exec('UPDATE tokens SET revoked_at = ? WHERE device_id = ? AND revoked_at IS NULL', [$now, $one]);
-                $ctx->mb->retireSenderInTx($db, $one); // what it already posted to others is not delivered after this
-                $ctx->mb->purgeInTx($db, 'dev:' . $one);
-                if ($row['app_id'] !== null && $row['owner_desktop'] !== null && $row['thumbprint'] !== null) {
-                    $ctx->mb->purgeInTx($db, 'app:' . $row['app_id'] . '@' . $row['owner_desktop'] . '/mobile:' . $row['thumbprint']);
-                }
-                $db->exec('DELETE FROM slots WHERE dev = ?', [$one]);
-                $ids[] = $one;
+        }
+        foreach ($todo as $one) {
+            $row = $db->one('SELECT * FROM devices WHERE id = ?' . $db->forUpdate(), [$one]);
+            if ($row === null || $row['revoked_at'] !== null) {
+                continue;
             }
-            return $ids;
-        });
-        foreach ($done as $one) {
+            $db->exec('UPDATE devices SET revoked_at = ?, push_kind = NULL, push_token = NULL WHERE id = ?', [$now, $one]);
+            $db->exec('UPDATE tokens SET revoked_at = ? WHERE device_id = ? AND revoked_at IS NULL', [$now, $one]);
+            $ctx->mb->retireSenderInTx($db, $one); // what it already posted to others is not delivered after this
+            $ctx->mb->purgeInTx($db, 'dev:' . $one);
+            if ($row['app_id'] !== null && $row['owner_desktop'] !== null && $row['thumbprint'] !== null) {
+                $party = 'mobile:' . $row['thumbprint'];
+                // The frames a phone posted to the plugin carry its party as their sender, not its device id, so retireSenderInTx did not
+                // find them; they carry its device id as their subject. They must not be delivered after the revocation either.
+                $ctx->mb->retireSubjectFromInTx($db, Party::mailbox((string)$row['app_id'], (string)$row['owner_desktop'], 'plugin'), $one);
+                $ctx->mb->purgeInTx($db, Party::mailbox((string)$row['app_id'], (string)$row['owner_desktop'], $party));
+            }
+            $db->exec('DELETE FROM slots WHERE dev = ?', [$one]);
+            $ids[] = $one;
+        }
+        return $ids;
+    }
+
+    /** Tell the requests of these devices that are waiting that they were revoked: after the transaction that revoked them has committed. @param list<string> $ids */
+    public static function markRevoked(Context $ctx, array $ids): void
+    {
+        foreach ($ids as $one) {
             $ctx->signals->markRevoked($one); // held requests of this device end with 401 revoked
         }
-        return $done;
     }
 
     /**

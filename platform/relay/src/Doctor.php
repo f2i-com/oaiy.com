@@ -314,14 +314,27 @@ final class Doctor
 
     /**
      * The dummy bearer went through the real web stack: /v1/health must say the header arrived.
-     * @param array{status:int,body:string,error:?string} $r
+     * @param array{status:int,body:string,error:?string,headers?:array<string,string>} $r
      * @return list<array{name:string,level:string,message:string}>
      */
     public static function authorizationSeen(array $r): array
     {
         $hint = 'Every request would be a uniform 401. Apache: add "CGIPassAuth On" (2.4.13+) or RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}] to public/.htaccess; nginx: fastcgi_param HTTP_AUTHORIZATION $http_authorization;';
         if ($r['status'] !== 200) {
-            return [self::row('web.authorization', self::FAIL, 'GET /v1/health answered ' . ($r['status'] ?: 'nothing') . ($r['error'] ? ' (' . $r['error'] . ')' : '') . '; the relay is not answering at this URL')];
+            // An answer that did not come from the relay (it carries no X-OAIY-Relay header) is the web server's own, and the likely causes
+            // are known: say them, because "the relay is not answering" does not tell an owner where to look.
+            $mine = isset($r['headers']) && (($r['headers']['x-oaiy-relay'] ?? '') !== '');
+            $cause = '';
+            if (!$mine && isset($r['headers'])) {
+                if ($r['status'] === 500) {
+                    $cause = ' The web server itself answered, not the relay. On Apache this is almost always a directive in public/.htaccess that AllowOverride does not allow: it needs AuthConfig, FileInfo, Options and Indexes (or All), and the web server\'s error log names the directive.';
+                } elseif ($r['status'] === 404) {
+                    $cause = ' The web server itself answered, not the relay. On Apache the front controller in public/.htaccess needs mod_rewrite; on nginx check that the /v1/ location passes the request to index.php (the README\'s snippet sets fastcgi_param SCRIPT_FILENAME $document_root/index.php there; a try_files that looks for a file called v1 would answer 404 as well).';
+                } elseif ($r['status'] === 403) {
+                    $cause = ' The web server itself refused it. On Apache the .htaccess of the package folder (which refuses everything) may be applying to public/ because of a Require of the host\'s that public/.htaccess does not replace, or the document root is not public/.';
+                }
+            }
+            return [self::row('web.authorization', self::FAIL, 'GET /v1/health answered ' . ($r['status'] ?: 'nothing') . ($r['error'] ? ' (' . $r['error'] . ')' : '') . '; the relay is not answering at this URL.' . $cause)];
         }
         $j = json_decode($r['body'], true);
         if (!is_array($j) || !array_key_exists('authHeaderSeen', $j)) {
@@ -330,6 +343,22 @@ final class Doctor
         return $j['authHeaderSeen'] === true
             ? [self::row('web.authorization', self::OK, 'the Authorization header reaches PHP')]
             : [self::row('web.authorization', self::FAIL, 'the Authorization header does NOT reach PHP. ' . $hint)];
+    }
+
+    /**
+     * A TRACE request through the real web stack, carrying a header with a value of its own: a web server that answers it by echoing the
+     * request (Apache does, in its core, before any .htaccess rule, wherever TraceEnable is on, which is its default) hands every header
+     * of a request back to whoever sent it, an Authorization header included. Nothing the relay ships can stop it: the server's
+     * configuration can.
+     * @param array{status:int,body:string,error:?string,headers?:array<string,string>} $r
+     * @return list<array{name:string,level:string,message:string}>
+     */
+    public static function traceSeen(array $r, string $canary): array
+    {
+        if ($r['status'] === 200 && strpos($r['body'], $canary) !== false) {
+            return [self::row('web.trace', self::WARN, 'the web server echoes a TRACE request, headers included (an Authorization header with them). On Apache set "TraceEnable off" in the server configuration (it is not a directive .htaccess can hold); no file of the relay can stop it.')];
+        }
+        return [self::row('web.trace', self::OK, 'the web server does not echo a TRACE request (it answered ' . ($r['status'] ?: 'nothing') . ')')];
     }
 
     /**
@@ -527,9 +556,46 @@ final class Doctor
         if ($cfg !== null && $db !== null) {
             $out = array_merge($out, self::databaseChecks($cfg, $db, $data));
         }
+        $out = array_merge($out, self::holdAccounting($data));
         $out = array_merge($out, self::wakeVisibility($data, $opts['php'] ?? PHP_BINARY, $cfg !== null ? $cfg->wakeMode() : 'file'));
         $out = array_merge($out, self::keys($data));
         return array_merge($out, self::webSection($opts, $cfg, $installed));
+    }
+
+    /**
+     * Do the hold counts see the markers this data folder's own holds leave? A hold is a marker file under data/holds/, and every bound that
+     * the relay puts on how many workers one credential or address may pin is a count of those files. A count that cannot see them (a
+     * path the listing code cannot read, a folder that cannot be written) reads zero and lets everything through, which nothing else would
+     * show: so make a marker the way a hold does, count it, and take it away. Fails closed: a count that does not see its own marker is a FAIL.
+     * $count and $listed are the two things that are asked of the folder (the address holds' count of the markers, and whether the listing
+     * of the holds folder shows the kind's folder), which a test replaces to show that the doctor does fail when either is wrong.
+     * @param (\Closure(string,string,string):int)|null $count
+     * @param (\Closure(string):bool)|null $listed
+     * @return list<array{name:string,level:string,message:string}>
+     */
+    public static function holdAccounting(string $data, ?\Closure $count = null, ?\Closure $listed = null): array
+    {
+        $addr = 'doctor-self-test-' . bin2hex(random_bytes(4));
+        $made = [];
+        try {
+            for ($i = 0; $i < 2; $i++) {
+                $made[] = AddressHolds::acquire($data, 'doctor', $addr, 5, 4);
+            }
+            $seen = $count !== null ? $count($data, 'doctor', $addr) : AddressHolds::count($data, 'doctor', $addr);
+            $isListed = $listed !== null ? $listed($data) : in_array(rtrim($data, '/') . '/holds/addr-doctor', Fs::entries(rtrim($data, '/') . '/holds', 'addr-', '', true), true);
+        } catch (\Throwable $e) {
+            return [self::row('holds.accounting', self::FAIL, 'a hold marker could not be made in data/holds/ (' . get_class($e) . '): the limits on how many workers one credential may pin cannot work')];
+        } finally {
+            foreach ($made as $h) {
+                $h->release();
+            }
+            @rmdir(rtrim($data, '/') . '/holds/addr-doctor/' . Signals::hash($addr));
+            @rmdir(rtrim($data, '/') . '/holds/addr-doctor');
+        }
+        if ($seen !== 2 || !$isListed) {
+            return [self::row('holds.accounting', self::FAIL, 'the hold counts do not see the markers they make in this data folder (counted ' . $seen . ' of 2): every limit on held requests would let everything through. Is the path of the data folder one the relay cannot list?')];
+        }
+        return [self::row('holds.accounting', self::OK, 'the hold counts see the markers they make in data/holds/')];
     }
 
     /**
@@ -548,7 +614,7 @@ final class Doctor
         }
         $files = ['config.json', Installer::FIRST_KEY, Installer::ADMIN_TOKEN_FILE, 'relay.sqlite', 'relay.sqlite-wal', 'relay.sqlite-shm', 'relay.sqlite-journal',
             'logs/relay.log', 'logs/relay.log.1'];
-        foreach (glob($data . '/backups/*') ?: [] as $b) {
+        foreach (Fs::entries($data . '/backups') as $b) {
             if (is_file($b)) {
                 $files[] = 'backups/' . basename($b);
             }
@@ -612,7 +678,7 @@ final class Doctor
      * rests on it. proc_open is used to start the second process.
      * @return list<array{name:string,level:string,message:string}>
      */
-    public static function wakeVisibility(string $data, string $php, string $wakeMode = 'file'): array
+    public static function wakeVisibility(string $data, string $php, string $wakeMode = 'file', ?string $box = null): array
     {
         if ($wakeMode === 'db') {
             return [self::row('wake.shard', self::OK, 'wake.mode is "db": no shard file is used')];
@@ -621,7 +687,7 @@ final class Doctor
             return [self::row('wake.shard', self::WARN, 'proc_open is disabled, so the wake shard could not be tested across processes; set wake.mode to "db" if a poll ever answers late')];
         }
         $signals = new Signals($data);
-        $box = 'doctor:' . bin2hex(random_bytes(4));
+        $box ??= 'doctor:' . bin2hex(random_bytes(4)); // (a test names it, to know which shard to put a stray temporary beside)
         $signals->wakeWrite($box);
         $shard = $signals->wakePath($box);
         $code = '$f=$argv[1];clearstatcache(true,$f);$v0=@file_get_contents($f);echo "ready\n";fflush(STDOUT);'
@@ -645,7 +711,7 @@ final class Doctor
         fclose($pipes[2]);
         proc_close($p);
         // The shard file is shared by many mailboxes and is left alone; only a stray temporary would be ours.
-        foreach (glob($shard . '.*.tmp') ?: [] as $t) {
+        foreach (Fs::entries(dirname($shard), basename($shard) . '.', '.tmp') as $t) {
             @unlink($t);
         }
         if (is_string($line) && preg_match('/^seen ([0-9.]+)$/', trim($line), $m) === 1) {
@@ -731,6 +797,9 @@ final class Doctor
         // 2. The Authorization header through the real stack.
         $h = HttpProbe::get($base . '/v1/health', ['Authorization' => 'Bearer probe'], 5.0, 4096);
         $out = array_merge($out, self::authorizationSeen($h));
+        // 2b. Whether the host echoes a TRACE request (Apache does, in its core, wherever TraceEnable is on).
+        $canary = 'doctor-' . bin2hex(random_bytes(6));
+        $out = array_merge($out, self::traceSeen(HttpProbe::request('TRACE', $base . '/v1/health', ['X-OAIY-Doctor-Trace' => $canary], null, 5.0, 4096), $canary));
         // 3. What the web SAPI sees (needs the admin token, from a file).
         $host = trim($p['host'], '[]');
         $urlIsLocal = $host === 'localhost' || (filter_var($host, FILTER_VALIDATE_IP) !== false && ClientIp::isNonPublic($host));

@@ -64,7 +64,10 @@ test('4.18.2 running any src file directly (as a web server would when the layou
 });
 
 test('4.18.2 with a wrong document root (the relay folder itself) a request for src/*.php and bin/*.php is empty and reveals nothing', function () {
-    $root = dirname(__DIR__, 2);
+    // A scratch copy of the package, never the working tree: a request that boots the relay (the last one below) reads and logs under the
+    // data/ folder next to src/, and that must not be a real one (the first version of this test wrote its failure to start into
+    // platform/relay/data/logs/relay.log of whoever ran it).
+    $root = inst_scratch();
     $srv = Server::start($root, ['prepend' => false]);
     foreach (['/src/Db.php', '/src/Kernel.php', '/src/Handlers/AdminApi.php', '/src/autoload.php', '/src/Crypto.php'] as $p) {
         $res = $srv->request('GET', $p);
@@ -77,7 +80,7 @@ test('4.18.2 with a wrong document root (the relay folder itself) a request for 
         eq('', $res['body'], basename($f));
     }
     // The front controller under a folder name that is not /v1/ is not the API: a plain error (a 500 here only because
-    // this checkout has no data/ next to it), never a listing, a source line or a path.
+    // this copy has no data/ next to it), never a listing, a source line or a path.
     $res = $srv->request('GET', '/public/index.php');
     ok(in_array($res['status'], [404, 500], true), 'status ' . $res['status']);
     not_contains('/src/', $res['body']);

@@ -83,14 +83,25 @@ final class Ids
         return null;
     }
 
-    /** Display names: control characters removed, trimmed, at most $max code points. */
-    public static function cleanName(string $s, int $max): string
+    /**
+     * Display names: control characters removed, trimmed, at most $max code points and at most $maxBytes bytes, cut between code
+     * points (never inside one). The byte cap is the shipped phone's: it refuses an admission whose display name is longer than 120
+     * bytes, and 50 CJK characters or 35 emoji are under 60 characters and over 120 bytes.
+     */
+    public static function cleanName(string $s, int $max, int $maxBytes = 120): string
     {
         $s = preg_replace('/[\x00-\x1F\x7F]/u', '', $s) ?? '';
         $s = trim($s);
-        if (preg_match('/^.{0,' . $max . '}/us', $s, $m) === 1) {
-            return trim($m[0]);
+        if (preg_match('/^.{0,' . $max . '}/us', $s, $m) !== 1) {
+            return '';
         }
-        return '';
+        $s = $m[0];
+        if (strlen($s) > $maxBytes) {
+            $s = substr($s, 0, $maxBytes);
+            while ($s !== '' && preg_match('//u', $s) !== 1) {
+                $s = substr($s, 0, -1); // a code point cut in two: at most three bytes of it are left
+            }
+        }
+        return trim($s);
     }
 }

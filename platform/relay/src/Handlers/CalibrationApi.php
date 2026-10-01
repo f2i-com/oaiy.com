@@ -7,6 +7,7 @@ use Oaiy\Relay\ApiError;
 use Oaiy\Relay\Clock;
 use Oaiy\Relay\Context;
 use Oaiy\Relay\Db;
+use Oaiy\Relay\Holds;
 use Oaiy\Relay\Json;
 use Oaiy\Relay\Principal;
 use Oaiy\Relay\Request;
@@ -24,7 +25,20 @@ final class CalibrationApi
 {
     public const MAX_HOLD = 35;
 
-    /** GET /v1/admin/hold?wait=N: hold N seconds (0 to 35), so the client can measure the pool; at most Holds::adminCap() at once per credential, else 429. */
+    /**
+     * The budget of hold time of one credential: $wait seconds are taken from a bucket of ADMIN_BURST_S that refills a fifth of a
+     * second per second, else 429 rate_limited with the seconds until there is enough. Read-only when the bucket is short.
+     * @throws ApiError rate_limited
+     */
+    public static function admitHold(Context $ctx, Principal $p, int $wait): void
+    {
+        $retry = $ctx->limiter->take('adm.hold:' . $p->tokenId, $wait * Holds::ADMIN_UNITS_PER_S, Holds::ADMIN_BURST_S * Holds::ADMIN_UNITS_PER_S, Holds::ADMIN_REFILL_UNITS_PER_S);
+        if ($retry !== null) {
+            throw new ApiError(429, 'rate_limited', null, $retry);
+        }
+    }
+
+    /** GET /v1/admin/hold?wait=N: hold N seconds (0 to 35), so the client can measure the pool; at most Holds::adminCap() at once per credential, and a budget of hold time, else 429. */
     public static function hold(Context $ctx, Request $req, ?Principal $p, array $m): Response
     {
         $wait = 5;
@@ -35,8 +49,11 @@ final class CalibrationApi
             }
         }
         $wait = min($wait, self::MAX_HOLD);
-        // A hold pins a worker. It is counted in the registry like any other, and one credential may keep only a handful
-        // (the pool, at most 16) at once: with no bound, ten parallel holds on a five-worker pool starved every other request.
+        // A hold pins a worker. It is counted in the registry like any other, one credential may have 16 at once, and it has a budget of
+        // hold time (Holds::ADMIN_BURST_S): with no bound a credential could keep every worker pinned for as long as it liked.
+        if ($wait > 0) {
+            self::admitHold($ctx, $p, $wait);
+        }
         $hold = $wait > 0 ? $ctx->holds->acquire('admin', 'tok:' . $p->tokenId, 'core', $wait, $ctx->holds->adminCap()) : null;
         try {
             if (function_exists('set_time_limit')) {

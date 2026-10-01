@@ -58,7 +58,13 @@ final class Info
     /** @return list<string> the features this build implements and this relay has enabled */
     public function features(): array
     {
-        $f = ['poll', 'items', 'presence', 'methods.post-forms'];
+        $f = ['poll', 'items', 'presence', 'pairing.v3', 'methods.post-forms'];
+        if ($this->cfg->callEnabled()) {
+            array_push($f, 'call', 'admission.aokie-adm-v2', 'compat.aokie-companion-relay');
+            if ($this->eff->streamOffered()) {
+                $f[] = 'compat.sse-framed-poll';
+            }
+        }
         return $f;
     }
 

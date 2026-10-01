@@ -1,0 +1,89 @@
+{
+  "protocol": "oaiy-relay/1",
+  "title": "Sealed tokens from the pairing rendezvous",
+  "about": "What GET /v1/pair/{pid} returns as sealedToken once the owner has approved, recorded from the real relay. The phone opens it with the X25519 secret it made for the pairing; nothing else opens it. See README.md in this folder for the format and for what a Rust reader calls.",
+  "format": {
+    "box": "libsodium crypto_box_seal: an anonymous sealed box (X25519, XSalsa20-Poly1305)",
+    "encoding": "base64url without padding (canonical: unused low bits zero)",
+    "layout": "ephemeralPublic (32 bytes) || tag (16 bytes) || ciphertext (the same length as the plaintext)",
+    "nonce": "BLAKE2b with a 24 byte output over ephemeralPublic || recipientPublic",
+    "key": "crypto_box_beforenm: HSalsa20 over the X25519 shared secret of the recipient secret and ephemeralPublic",
+    "plaintext": "the ASCII device token: \"oaiyrt1.\" + 11 characters + \".\" + 43 characters, 63 bytes. It is never written in this file: plaintextSha256 is the check.",
+    "refuse": "a box that does not authenticate, a length under 48 bytes, or an X25519 shared secret of all zeros (a small-order ephemeral key), even when the box authenticates under the key that shared secret gives (refused[8] and refused[9])"
+  },
+  "recipient": {
+    "note": "The test phone of Appendix A3: a fixed public test key, never a real one.",
+    "x25519Secret": "4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uI",
+    "x25519Public": "GdgCBL-F8-ERjhsjQQyI8NDuztUVb0xb3zR7FO1-xj8"
+  },
+  "opens": [
+    {
+      "label": "the token of the recorded ceremony",
+      "sealedToken": "IUwkc-ECVm2xHI7cj3zqQAO4ghRP4xFqkGO3hq1BkX-D2nxuK8wJoL1z4YeCYfp_FanpwTdtOmhPAPngOxvevHjv_sR0NBwW3z214TW2w8QjSSywECdSUzEPTqYE8u4gEVQe7BBBA7ViHLYc8G6B",
+      "sealedBytes": 111,
+      "plaintextLength": 63,
+      "plaintextSha256": "86100c7037423b92c38e095c96506d85ae4b65a7055276932dc4fc8971b60952"
+    },
+    {
+      "label": "another ceremony, token 2 (a fresh ephemeral key each time)",
+      "sealedToken": "fVTv910m5tc5sWNtk_QTpeqV1PUYkpjOTqDluzuuPDwm0C4SGkKYQPXOLRpwL5KXjsF1_9At8XAoaBaWV7IFbizUiB9x9Tq_EtL1zjHDRX2NW7OeInovp01jXSDlWE81NzdBlRSHxXu69QfiPscC",
+      "sealedBytes": 111,
+      "plaintextLength": 63,
+      "plaintextSha256": "bd907e3edb428a820632b6ce4277077e1b98cdf12406f07795f8de42b3d88573"
+    },
+    {
+      "label": "another ceremony, token 3 (a fresh ephemeral key each time)",
+      "sealedToken": "4YayMhTtKfICEbrJQCr9so40cC78Z6JyK9A2mo7vhSF45m9LaIWmt7cEOZSK37iq0SGnCEHhOe9rbW13VjF21kYUDAtJw00V6R9I44U1BbJRCOTB4qWfWMcIhCEbmLCZBW6UaIc_8zWljl2VRD5O",
+      "sealedBytes": 111,
+      "plaintextLength": 63,
+      "plaintextSha256": "0f04b1706ebc291021eef0a80237b52a676db1c1f365734eb99df3c9493a469d"
+    }
+  ],
+  "refused": [
+    {
+      "label": "one bit of the ephemeral public key flipped",
+      "sealedToken": "IUwkc-EDVm2xHI7cj3zqQAO4ghRP4xFqkGO3hq1BkX-D2nxuK8wJoL1z4YeCYfp_FanpwTdtOmhPAPngOxvevHjv_sR0NBwW3z214TW2w8QjSSywECdSUzEPTqYE8u4gEVQe7BBBA7ViHLYc8G6B"
+    },
+    {
+      "label": "one bit of the authentication tag flipped",
+      "sealedToken": "IUwkc-ECVm2xHI7cj3zqQAO4ghRP4xFqkGO3hq1BkX-D2nxuK8wJoLxz4YeCYfp_FanpwTdtOmhPAPngOxvevHjv_sR0NBwW3z214TW2w8QjSSywECdSUzEPTqYE8u4gEVQe7BBBA7ViHLYc8G6B"
+    },
+    {
+      "label": "one bit of the ciphertext flipped",
+      "sealedToken": "IUwkc-ECVm2xHI7cj3zqQAO4ghRP4xFqkGO3hq1BkX-D2nxuK8wJoL1z4YeCYfp_FanpwTdtOmhPAPngOhvevHjv_sR0NBwW3z214TW2w8QjSSywECdSUzEPTqYE8u4gEVQe7BBBA7ViHLYc8G6B"
+    },
+    {
+      "label": "the last byte removed",
+      "sealedToken": "IUwkc-ECVm2xHI7cj3zqQAO4ghRP4xFqkGO3hq1BkX-D2nxuK8wJoL1z4YeCYfp_FanpwTdtOmhPAPngOxvevHjv_sR0NBwW3z214TW2w8QjSSywECdSUzEPTqYE8u4gEVQe7BBBA7ViHLYc8G4"
+    },
+    {
+      "label": "a byte added",
+      "sealedToken": "IUwkc-ECVm2xHI7cj3zqQAO4ghRP4xFqkGO3hq1BkX-D2nxuK8wJoL1z4YeCYfp_FanpwTdtOmhPAPngOxvevHjv_sR0NBwW3z214TW2w8QjSSywECdSUzEPTqYE8u4gEVQe7BBBA7ViHLYc8G6BAA"
+    },
+    {
+      "label": "shorter than an ephemeral key and a tag (47 bytes)",
+      "sealedToken": "IUwkc-ECVm2xHI7cj3zqQAO4ghRP4xFqkGO3hq1BkX-D2nxuK8wJoL1z4YeCYfo"
+    },
+    {
+      "label": "an ephemeral key of small order (the identity), with the rest of a real box",
+      "sealedToken": "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACD2nxuK8wJoL1z4YeCYfp_FanpwTdtOmhPAPngOxvevHjv_sR0NBwW3z214TW2w8QjSSywECdSUzEPTqYE8u4gEVQe7BBBA7ViHLYc8G6B"
+    },
+    {
+      "label": "an all-zero ephemeral key",
+      "sealedToken": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACD2nxuK8wJoL1z4YeCYfp_FanpwTdtOmhPAPngOxvevHjv_sR0NBwW3z214TW2w8QjSSywECdSUzEPTqYE8u4gEVQe7BBBA7ViHLYc8G6B"
+    },
+    {
+      "label": "an ephemeral key of small order (zero) whose box authenticates under the all-zero shared secret",
+      "sealedToken": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAbC4P43GGYIdc1bUSywdIjibJaj6tevozDgBEUVR0W2riNzHT9NQrKASjkGjZNJ56Oee8Sh23cNyM6c-d1KKdnK_Fi80-SJb8FsOY0x7dK"
+    },
+    {
+      "label": "an ephemeral key of small order (order8-a) whose box authenticates under the all-zero shared secret",
+      "sealedToken": "4Ot6fDtBuK4WVuP68Z_EatoJjeucMrH9hmIFFl9JuADBsHbumxIULzoSU3_LoW0TlrOa2beA1N4kVNZbWyzdW7gZiaPkEWnhd4GEvOhjQPg2M_psNh8u9wF8ekaD8HRdnLug4kXPuWNHSqQmfsXj"
+    }
+  ],
+  "wrongRecipient": {
+    "note": "The first recorded token does not open with this other key.",
+    "x25519Secret": "-_B5Wz2XXmwOdQhJqwtmNq7csusWRjkOWQUI3TO2RX4",
+    "x25519Public": "SNj3M5MCUJXQa-hVw-FW7VsZyoC0q96BU9t14qmlIgw"
+  }
+}

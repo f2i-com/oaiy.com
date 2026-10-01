@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://oaiy.com/schemas/relay/v1/ice-server.schema.json",
   "title": "ICE server entry",
-  "description": "An iceServers element (README section 4.14.3). A STUN entry carries urls and nothing else (credentials on it are refused by the decoders); a TURN entry carries a REST credential: username = <expiry>:<subjectId>, credential = base64(HMAC-SHA1(secret, username)), expiresAt = expiry.",
+  "description": "An iceServers element (README section 4.14.3). A STUN entry carries urls and, because the plugin's decoder requires both members, username and credential as EMPTY strings, and no expiresAt (a value in any of them is refused by both decoders). A TURN entry carries a REST credential: username = <expiry>:<opaque id> (FormLogic's keyed hash of the endpoint, 32 hex characters; interpretation 36), credential = base64(HMAC-SHA1(secret, username)), expiresAt = expiry. A STUN and a TURN url are never mixed in one entry: the decoders treat any entry with a turn: url as TURN.",
   "oneOf": [
     {
       "type": "object",
@@ -11,13 +11,23 @@
           "type": "array",
           "items": {
             "type": "string",
-            "pattern": "^stun:[^\\s]+$"
+            "pattern": "^stuns?:[^\\s]+$",
+            "maxLength": 2048
           },
-          "minItems": 1
+          "minItems": 1,
+          "maxItems": 8
+        },
+        "username": {
+          "const": ""
+        },
+        "credential": {
+          "const": ""
         }
       },
       "required": [
-        "urls"
+        "urls",
+        "username",
+        "credential"
       ],
       "additionalProperties": false
     },
@@ -28,13 +38,16 @@
           "type": "array",
           "items": {
             "type": "string",
-            "pattern": "^turns?:[^\\s]+$"
+            "pattern": "^turns?:[^\\s]+$",
+            "maxLength": 2048
           },
-          "minItems": 1
+          "minItems": 1,
+          "maxItems": 8
         },
         "username": {
           "type": "string",
-          "pattern": "^[0-9]+:[A-Za-z0-9._:-]+$"
+          "pattern": "^[0-9]+:[A-Za-z0-9._:-]+$",
+          "maxLength": 512
         },
         "credential": {
           "type": "string",

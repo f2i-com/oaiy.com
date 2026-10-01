@@ -115,6 +115,35 @@ test('9.1 contract: every response shape the relay produces validates against th
     $add('roster-request', ['appId' => 'aokie', 'revision' => 8, 'thumbprints' => [$ths[0]]], 'roster request (one phone)');
     $addRes('roster-response', $go($desk, 'POST', '/v1/roster', ['appId' => 'aokie', 'revision' => 8, 'thumbprints' => [$ths[0]]]), 'roster response with a revocation');
 
+    // Pairing (RL-06): a whole ceremony, a denial, a reject, a burn, a wait and the errors of each.
+    $c = OaiyTest\Ceremony::random($r, $desk);
+    $add('pairing-create-request', $c->createDoc(), 'pairing create request');
+    $addRes('pairing-create-response', $go($desk, 'POST', '/v1/pair', $c->createDoc()), 'pairing create response');
+    $addRes('pairing-fetch-response', $go(null, 'GET', '/v1/pair/' . $c->pid), 'pairing fetch: open');
+    $addRes('pairing-fetch-response', $go(null, 'GET', '/v1/pair/' . $c->pid, null, ['wait' => '1']), 'pairing fetch: open, after a refused wait (the poll markers above fill the pool)');
+    $add('pairing-answer-request', ['response' => $c->responseText()], 'pairing answer request');
+    $addRes('pairing-answer-response', $go(null, 'POST', '/v1/pair/' . $c->pid . '/response', ['response' => $c->responseText()]), 'pairing answer response');
+    $addRes('pairing-fetch-response', $go(null, 'GET', '/v1/pair/' . $c->pid), 'pairing fetch: answered');
+    $go(null, 'POST', '/v1/pair/' . $c->pid . '/response', ['response' => $c->responseText()]); // 409 already_answered
+    $add('pairing-decision', $c->decisionDoc(), 'pairing approval');
+    $addRes('pairing-decision-response', $go($desk, 'POST', '/v1/pair/' . $c->pid . '/decision', $c->decisionDoc()), 'pairing approval response');
+    $addRes('pairing-fetch-response', $go(null, 'GET', '/v1/pair/' . $c->pid), 'pairing fetch: approved');
+    $c2 = OaiyTest\Ceremony::random($r, $desk);
+    $go($desk, 'POST', '/v1/pair', $c2->createDoc());
+    $go(null, 'POST', '/v1/pair/' . $c2->pid . '/response', ['response' => $c2->responseText()]);
+    $add('pairing-decision', ['approve' => false], 'pairing denial');
+    $addRes('pairing-decision-response', $go($desk, 'POST', '/v1/pair/' . $c2->pid . '/decision', ['approve' => false]), 'pairing denial response');
+    $addRes('pairing-fetch-response', $go(null, 'GET', '/v1/pair/' . $c2->pid), 'pairing fetch: denied');
+    $c3 = OaiyTest\Ceremony::random($r, $desk);
+    $go($desk, 'POST', '/v1/pair', $c3->createDoc());
+    $go(null, 'POST', '/v1/pair/' . $c3->pid . '/response', ['response' => $c3->responseText()]);
+    $add('pairing-reject-request', ['reason' => 'mac mismatch'], 'pairing reject request');
+    $addRes('pairing-state-response', $go($desk, 'POST', '/v1/pair/' . $c3->pid . '/reject', ['reason' => 'mac mismatch']), 'pairing reject response (open again)');
+    $addRes('pairing-state-response', $go($desk, 'POST', '/v1/pair/' . $c3->pid . '/burn'), 'pairing burn response');
+    $go(null, 'GET', '/v1/pair/' . $c3->pid); // 404
+    $go($desk, 'POST', '/v1/pair/' . $c3->pid . '/decision', ['approve' => false]); // 410
+    $go($desk, 'POST', '/v1/pair', ['pid' => 'short'] + $c3->createDoc()); // 400
+
     // Revocation.
     $add('devices-revoke-request', ['role' => 'phone'], 'revoke-all request');
     $addRes('devices-revoke-response', $go($desk, 'POST', '/v1/devices/revoke', ['role' => 'phone']), 'revoke-all response');
@@ -128,6 +157,77 @@ test('9.1 contract: every response shape the relay produces validates against th
     $addRes('admin-capacity-response', $go($desk, 'POST', '/v1/admin/capacity', $capDoc), 'capacity response');
     $addRes('info', $go(null, 'GET', '/v1/info'), 'info after calibration');
     $addRes('admin-status', $go($desk, 'GET', '/v1/admin/status'), 'admin status after calibration');
+
+    // The admission issuer and the Aokie compatibility routes (RL-07). These go straight to the relay: their errors are in the
+    // Aokie shape and are added under compat-error, and a bearer only lives 90 seconds of the clock $go moves on.
+    $r->configure(['public_url' => 'https://relay.example.com', 'stun' => ['urls' => ['stun:stun.example.com:3478']], 'turn' => ['urls' => ['turn:turn.example.com:3478?transport=udp', 'turns:turn.example.com:5349?transport=tcp'], 'secret' => str_repeat('s', 32)]]);
+    $epSeed = random_bytes(32);
+    [$epPk] = Crypto::signKeypairFromSeed($epSeed);
+    $pin = Crypto::thumbprint($epPk);
+    $cph = $r->phone($desk, 'Contract phone', ['peer_thumbprint' => $pin, 'grants' => Oaiy\Relay\Grants::DEFAULT]);
+    $cph2 = $r->phone($desk, 'Second contract phone', ['peer_thumbprint' => $pin, 'grants' => ['state_read']]);
+    $cths = [Crypto::thumbprint($cph->edPk), Crypto::thumbprint($cph2->edPk)];
+    sort($cths, SORT_STRING);
+    $r->call($desk, 'POST', '/v1/roster', ['appId' => 'aokie', 'revision' => 9, 'thumbprints' => $cths]);
+    $pluginReq = ['appId' => 'aokie', 'pluginId' => 'aokie', 'displayName' => 'Receptionist',
+        'endpointPublicKey' => ['algorithm' => 'ed25519', 'publicKey' => B64::enc($epPk), 'thumbprint' => $pin], 'holderKeyThumbprint' => $pin,
+        'approvedPeerKeyThumbprints' => $cths, 'peerRosterRevision' => 9, 'peerRosterHash' => Oaiy\Relay\Handlers\DevicesApi::rosterHash($cths, 9), 'supportedTransports' => ['relay']];
+    $mobReq = fn(OaiyTest\Actor $p, array $t) => ['appId' => 'aokie', 'deviceId' => $p->id, 'displayName' => 'Contract phone', 'holderKeyThumbprint' => Crypto::thumbprint($p->edPk), 'supportedTransports' => $t];
+    $add('admission-plugin-request', $pluginReq, 'plugin admission request');
+    $add('admission-mobile-request', $mobReq($cph, ['relay']), 'phone admission request');
+    $pa = $r->call($desk, 'POST', '/v1/aokie-companion/admission', $pluginReq);
+    eq(200, $pa['status'], $pa['body']);
+    $addRes('admission-plugin-response', $pa, 'plugin admission (stream)');
+    $addRes('admission-plugin-response', $r->call($desk, 'POST', '/v1/admission', array_merge($pluginReq, ['supportedTransports' => ['relay-poll']])), 'plugin admission (poll mode)');
+    $ma = $r->call($cph, 'POST', '/v1/aokie-companion/admission', $mobReq($cph, ['relay']));
+    eq(200, $ma['status'], $ma['body']);
+    $addRes('admission-mobile-response', $ma, 'phone admission (stream)');
+    $addRes('admission-mobile-response', $r->call($cph2, 'POST', '/v1/admission', $mobReq($cph2, ['relay-poll'])), 'phone admission (poll mode)');
+    $r->configure(['turn' => ['urls' => [], 'secret' => null]]);
+    $addRes('admission-mobile-response', $r->call($cph, 'POST', '/v1/admission', $mobReq($cph, ['relay'])), 'phone admission with STUN only');
+    $r->configure(['stun' => ['urls' => []]]);
+    $addRes('admission-plugin-response', $r->call($desk, 'POST', '/v1/admission', $pluginReq), 'plugin admission with no ICE server at all');
+    $r->configure(['turn' => ['urls' => ['turn:turn.example.com:3478'], 'secret' => str_repeat('s', 32), 'relay_only' => true]]);
+    $addRes('admission-mobile-response', $r->call($cph, 'POST', '/v1/admission', $mobReq($cph, ['relay'])), 'phone admission, relay only');
+    $pt = $pa['json']['accessToken'];
+    $mt = $ma['json']['accessToken'];
+    $base = '/v1/aokie-companion/relay/';
+    $addRes('challenge', $r->call($pt, 'GET', $base . 'challenge'), 'plugin challenge');
+    $addRes('challenge', $r->call($mt, 'GET', $base . 'challenge'), 'phone challenge');
+    $rawFrames = '{"to":"plugin","frames":[{},{"type":"hello","n":9007199254740993,"f":1.0,"u":"héllo/","e":{}}]}';
+    $samples[] = ['schema' => 'compat-frames-request', 'raw' => $rawFrames, 'label' => 'frames request (phone to plugin)']; // raw: {} must stay an object
+    $addRes('compat-frames-accepted', $r->call($mt, 'POST', $base . 'frames', $rawFrames), 'frames accepted');
+    $addRes('compat-frames-page', $r->call($pt, 'GET', $base . 'frames', null, ['since' => '0', 'wait' => '0']), 'frames page (two frames)');
+    $addRes('compat-frames-page', $r->call($pt, 'GET', $base . 'frames', null, ['since' => '2', 'wait' => '0']), 'frames page at the tail');
+    $addRes('compat-frames-accepted', $r->call($pt, 'POST', $base . 'frames', '{"to":"mobile:' . Crypto::thumbprint($cph->edPk) . '","frames":[{"kind":"snapshot"}]}'), 'frames accepted (plugin to phone)');
+    $addRes('compat-frames-page', $r->call($mt, 'GET', $base . 'frames', null, ['since' => '0']), 'frames page for the phone');
+    $addRes('compat-frames-page', $r->call($mt, 'GET', $base . 'frames', null, ['since' => '1', 'wait' => '1']), 'frames page after a granted wait');
+    foreach ([2, 3, 4, 5] as $i) {
+        aks_fake($r, 'contract-' . $i);
+    }
+    $addRes('compat-frames-page', $r->call($mt, 'GET', $base . 'frames', null, ['since' => '2', 'wait' => '2']), 'frames page with a refused wait');
+    while ($r->ctx()->holds->liveCount() < $r->ctx()->eff->heldHard) {
+        aks_fake($r, 'contract-more-' . random_int(1, 1 << 30));
+    }
+    $errs = [
+        [$r->call($mt, 'GET', $base . 'stream'), 'stream refused at the hard limit (503)'],
+        [$r->call('nonsense', 'GET', $base . 'challenge'), 'a bad bearer (401)'],
+        [$r->call($mt, 'POST', $base . 'frames', '{"to":"mobile:' . $cths[0] . '","frames":[{}]}'), 'a phone addressing a phone (403)'],
+        [$r->call($mt, 'POST', $base . 'frames', '{"to":"plugin","frames":[{"p":"' . str_repeat('x', 200000) . '"}]}'), 'a frame over the cap (413)'],
+        [$r->call($mt, 'POST', $base . 'frames', '{"to":"plugin","frames":[]}'), 'no frames (400)'],
+        [$r->call($cph, 'POST', '/v1/aokie-companion/admission', $mobReq($cph, ['websocket'])), 'no transport this relay serves (422)'],
+        [$r->call($pt, 'GET', $base . 'nothing'), 'an unknown compatibility route (404)'],
+        [$r->call($pt, 'POST', $base . 'challenge', '{}'), 'a wrong method (405)'],
+    ];
+    foreach ($errs as [$res, $label]) {
+        ok($res['status'] >= 400, $label . ': ' . $res['status']);
+        $addRes('compat-error', $res, $label);
+    }
+    $r->configure(['limits' => ['sigItems' => 1]]);
+    $addRes('compat-error', $r->call($mt, 'POST', $base . 'frames', '{"to":"plugin","frames":[{},{}]}'), 'a mailbox that would overflow (429 relay_backpressure)');
+    $r->configure(['call' => ['enabled' => false]]);
+    $addRes('compat-error', $r->call($pt, 'GET', $base . 'challenge'), 'call features off (403 feature_disabled)');
+    $r->configure(['call' => ['enabled' => true]]);
 
     // Errors of every code the routes can give.
     $go(null, 'GET', '/v1/nope');

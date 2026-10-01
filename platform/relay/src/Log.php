@@ -24,7 +24,12 @@ final class Log
     public static function write(string $level, string $event, array $ctx = []): void
     {
         $file = self::$file ?? (Paths::dataDir() . '/logs/relay.log');
-        $line = ['t' => Clock::now(), 'level' => $level, 'event' => self::scrub($event)];
+        try {
+            $at = Clock::now();
+        } catch (\Throwable $e) {
+            $at = time(); // a log line must not be what fails when the clock cannot be read (the test clock's file, for a moment)
+        }
+        $line = ['t' => $at, 'level' => $level, 'event' => self::scrub($event)];
         foreach ($ctx as $k => $v) {
             if (is_string($k) && (is_scalar($v) || $v === null)) {
                 $line[$k] = is_string($v) ? self::scrub($v) : $v;
