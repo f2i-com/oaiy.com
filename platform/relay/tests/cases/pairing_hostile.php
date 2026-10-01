@@ -304,8 +304,9 @@ test('4.10.6 many responders racing over four servers still leave one response, 
         $pending[] = $fleet[$i % 4]->begin('POST', '/v1/pair/' . $c->pid . '/response', ['Content-Type' => 'application/json'], json_encode(['response' => $text]));
     }
     $codes = array_map(fn($p) => $p->finish(15)['status'], $pending);
-    eq(1, count(array_filter($codes, fn($x) => $x === 202)), json_encode($codes));
-    eq(7, count(array_filter($codes, fn($x) => $x === 409)), json_encode($codes));
+    // (a status that is not 202 or 409 is shown with the relay's own record of where it decided it: Relay::errorSites)
+    eq(1, count(array_filter($codes, fn($x) => $x === 202)), json_encode($codes) . $r->errorSites());
+    eq(7, count(array_filter($codes, fn($x) => $x === 409)), json_encode($codes) . $r->errorSites());
     eq(1, count(pair_items($r, $d)));
 });
 

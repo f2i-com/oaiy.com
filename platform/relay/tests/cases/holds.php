@@ -691,7 +691,8 @@ test('4.7.2 rule 5: many polls from one device leave exactly one live hold, and 
         }
     } while ($open > 1 && microtime(true) - $t0 < 4.0);
     $drain = microtime(true) - $t0;
-    ok($open <= 1, "the superseded polls were answered within " . round($drain * 1000) . " ms of the last one being sent ($open still open)");    // Now the count is what the rule says. Health goes to every worker of the pool at once, and all but the one that is still
+    ok($open <= 1, "the superseded polls were answered within " . round($drain * 1000) . " ms of the last one being sent ($open still open)");
+    // Now the count is what the rule says. Health goes to every worker of the pool at once, and all but the one that is still
     // holding the newest poll answer immediately: the workers that held superseded polls are free.
     $probes = array_map(fn($s) => $s->begin('GET', '/v1/health'), $servers);
     $t1 = microtime(true);
@@ -709,11 +710,12 @@ test('4.7.2 rule 5: many polls from one device leave exactly one live hold, and 
     eq(1, holds_count($r), 'one live hold, the newest: no superseded hold lingers');
     ok(count($answered) >= 4, 'four of the five workers answered health at once (' . count($answered) . ' did, in ' . implode(', ', array_map(fn($x) => round($x * 1000) . ' ms', $answered)) . '): the workers that held superseded polls are free');
     foreach ($probes as $p) {
-        eq(200, $p->finish(15.0)['status']); // the fifth is the worker that holds the newest poll: it answers when that ends
-    }    $superseded = 0;
+        eq(200, $p->finish(15.0)['status'], 'health' . $r->errorSites()); // the fifth is the worker that holds the newest poll: it answers when that ends
+    }
+    $superseded = 0;
     foreach ($pend as $p) {
         $res = holds_finish($p, 15.0);
-        eq(200, $res['status'], $res['body']);
+        eq(200, $res['status'], $res['body'] . $r->errorSites()); // (a 401 or a 404 here says, below its status, which line of the relay decided it)
         $superseded += isset($res['json']['hold']['superseded']) ? 1 : 0;
     }
     ok($superseded >= 15, "$superseded of 20 were superseded by a newer poll");
