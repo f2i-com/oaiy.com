@@ -100,6 +100,14 @@ test('4.18.5 a database that is busy, locked or gone for a moment is a 503 unava
     $lines = array_map(fn($l) => json_decode($l, true), file($log, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: []);
     $seen = array_values(array_filter($lines, fn($j) => ($j['event'] ?? '') === 'db_unavailable'));
     ok(count($seen) >= 3, count($seen) . ' db_unavailable lines');
+    // The reason that the error-site line gives (debug.error_sites is on in the tests) is the driver's own code: db_error_5 for SQLite's "database is
+    // locked", db_error_2006 or db_error_2013 for a connection MySQL dropped: never "unspecified", and never a name that is not a cause.
+    $sites = array_values(array_filter($lines, fn($j) => ($j['event'] ?? '') === 'error_site'));
+    eq(3, count($sites), 'one error-site line for each of the three 503s: ' . json_encode($sites));
+    foreach ($sites as $s) {
+        eq(503, $s['status']);
+        ok(preg_match('/^db_error_\d+$/D', (string)$s['reason']) === 1, 'the reason is the driver\'s code: ' . json_encode($s));
+    }
     $text = (string)file_get_contents($log);
     not_contains($d->token, $text, 'no credential in the log');
     // It was a 503 and so is not counted as an "internal" error either.
@@ -325,6 +333,7 @@ test('4.18.3 debug.error_sites is off unless asked for: nothing is logged for a 
     eq(500, $r->call($bad, 'GET', '/v1/poll')['status']);
     $five = array_values(array_filter($lines(), fn($j) => $j['status'] === 500));
     ok(count($five) === 1 && $five[0]['code'] === 'internal' && preg_match('/^Db\.php:\d+$/D', $five[0]['site']) === 1, json_encode($five));
+    eq('db_error_not_transient', $five[0]['reason'], 'the relay\'s own mistake is told from a database that is busy by its reason');
     // And the test helper that a failing assertion shows says it in words.
     contains('poll 401 unauthorized at Auth.php:', $r->errorSites());
 });

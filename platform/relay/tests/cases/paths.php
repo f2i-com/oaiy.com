@@ -98,6 +98,22 @@ foreach (paths_names() as $label => $folder) {
         // The doctor makes a marker, counts it and takes it away: and says so.
         $rows = Doctor::holdAccounting($r->data);
         eq('ok', $rows[0]['level'], $rows[0]['message']);
+        // The doctor's mode check lists backups/ (a file there holds the relay's data and must be judged like the database): by listing, not by a pattern.
+        if (!is_dir($r->data . '/backups')) {
+            mkdir($r->data . '/backups', 0700, true);
+        }
+        file_put_contents($r->data . '/backups/b1.bak', 'x');
+        ok(in_array('data/backups/b1.bak', array_column(Doctor::dataModeItems($r->data), 'label'), true), "a backup in a folder whose path holds $label is judged by the doctor: " . json_encode(array_column(Doctor::dataModeItems($r->data), 'label')));
+        // The doctor's wake probe leaves its own temporaries nowhere: a stray one beside the shard of its probe is taken away, the shard is not.
+        $box = 'doctor:paths';
+        $shard = $signals->wakePath($box);
+        $signals->wakeWrite($box);
+        $stray = $shard . '.stray1.tmp';
+        file_put_contents($stray, 'x');
+        $rows = Doctor::wakeVisibility($r->data, PHP_BINARY, 'file', $box);
+        ok($rows !== [] && in_array($rows[0]['level'], ['ok', 'warn'], true), json_encode($rows));
+        ok(!is_file($stray), "the stray temporary beside the shard was taken away ($label)");
+        ok(is_file($shard), 'and the shard, which many mailboxes share, was left');
     });
 }
 
@@ -130,7 +146,7 @@ test('4.18.8 bin/relay export copies the secrets of a data folder whose path hol
     Relay::sqliteOnly();
     $r = Relay::make([], [], 'a[b] {c}');
     $d = $r->desktop();
-    $dir = $r->dir . '/export';
+    $dir = $r->dir . '/ex[port] {1}'; // the export folder holds brackets too: bin/relay lists the secrets/ of the folder it wrote (the manifest) and of the one it reads (the import)
     $out = '';
     $err = '';
     $cli = new Cli($r->data, function (string $s) use (&$out): void {

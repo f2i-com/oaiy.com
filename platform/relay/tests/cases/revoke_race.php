@@ -80,6 +80,7 @@ test('4.5 a post to a device revoked after the ACL passed does not make its mail
     }
     ok($err !== null);
     eq([404, 'not_found'], [$err->status, $err->errorCode]);
+    eq('device_revoked_in_transaction', $err->reason, 'a recipient that was revoked: the reason in the log');
     eq(0, (int)$ctx->db->val('SELECT COUNT(*) FROM mailboxes WHERE id = ?', [$d->inbox()]), 'the mailbox of a revoked device was not made again');
     // A device that never existed is the same.
     $err = null;
@@ -89,6 +90,7 @@ test('4.5 a post to a device revoked after the ACL passed does not make its mail
         $err = $e;
     }
     eq('not_found', $err->errorCode ?? '');
+    eq('device_not_found_in_transaction', $err->reason ?? null, 'a recipient that never existed: the reason in the log');
     // The revoked sender wins over the recipient's state.
     $d2 = $r->desktop('Other');
     Devices::revoke($ctx, $prov->id);
@@ -102,6 +104,7 @@ test('4.5 a post to a device revoked after the ACL passed does not make its mail
         $err = $e;
     }
     eq([401, 'revoked'], [$err->status ?? 0, $err->errorCode ?? '']);
+    eq('device_revoked_in_transaction', $err->reason ?? null, 'a sender that was revoked: the reason in the log');
     eq(0, (int)$ctx->db->val('SELECT COUNT(*) FROM mailboxes WHERE id = ?', [$d2->inbox()]), 'and made no mailbox for the recipient');
 });
 

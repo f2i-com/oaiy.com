@@ -607,6 +607,14 @@ test('4.7.2 rule 5: a credential has at most three polls that wait running at on
     eq('1', $res['headers']['retry-after']);
     eq(3, $holds->inFlight('poll', $phone->id), 'and took no place');
     eq($before, [$db->val('SELECT last_poll_at FROM devices WHERE id = ?', [$phone->id]), $signals->readGen($phone->id)], 'a refusal wrote neither presence nor the generation');
+    // With one of the three gone there are two running, and the next poll is let through: the bound is three and not two (a pre-check that
+    // refused at two would pass every test above).
+    $made[0]->release();
+    eq(2, $holds->inFlight('poll', $phone->id));
+    $res = $r->call($phone, 'GET', '/v1/poll', null, ['wait' => '1']);
+    eq(200, $res['status'], 'two running, a third is let through: ' . $res['body']);
+    eq(['granted' => true], $res['json']['hold']);
+    $made[0] = $holds->acquire('poll', $phone->id, 'edge', 8, 0, Holds::POLL_INFLIGHT_MAX); // the place that was freed is taken again, for the rest of the test
     // A request that does not wait is never counted, and the bound is on the credential: another device polls as it likes.
     eq(200, $r->call($phone, 'GET', '/v1/poll')['status'], 'wait=0 holds nothing');
     eq(200, $r->call($d, 'GET', '/v1/poll', null, ['wait' => '1'])['status'], 'another credential has its own');

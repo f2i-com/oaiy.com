@@ -567,9 +567,13 @@ final class Doctor
      * the relay puts on how many workers one credential or address may pin is a count of those files. A count that cannot see them (a
      * path the listing code cannot read, a folder that cannot be written) reads zero and lets everything through, which nothing else would
      * show: so make a marker the way a hold does, count it, and take it away. Fails closed: a count that does not see its own marker is a FAIL.
+     * $count and $listed are the two things that are asked of the folder (the address holds' count of the markers, and whether the listing
+     * of the holds folder shows the kind's folder), which a test replaces to show that the doctor does fail when either is wrong.
+     * @param (\Closure(string,string,string):int)|null $count
+     * @param (\Closure(string):bool)|null $listed
      * @return list<array{name:string,level:string,message:string}>
      */
-    public static function holdAccounting(string $data): array
+    public static function holdAccounting(string $data, ?\Closure $count = null, ?\Closure $listed = null): array
     {
         $addr = 'doctor-self-test-' . bin2hex(random_bytes(4));
         $made = [];
@@ -577,8 +581,8 @@ final class Doctor
             for ($i = 0; $i < 2; $i++) {
                 $made[] = AddressHolds::acquire($data, 'doctor', $addr, 5, 4);
             }
-            $seen = AddressHolds::count($data, 'doctor', $addr);
-            $listed = in_array(rtrim($data, '/') . '/holds/addr-doctor', Fs::entries(rtrim($data, '/') . '/holds', 'addr-', '', true), true);
+            $seen = $count !== null ? $count($data, 'doctor', $addr) : AddressHolds::count($data, 'doctor', $addr);
+            $isListed = $listed !== null ? $listed($data) : in_array(rtrim($data, '/') . '/holds/addr-doctor', Fs::entries(rtrim($data, '/') . '/holds', 'addr-', '', true), true);
         } catch (\Throwable $e) {
             return [self::row('holds.accounting', self::FAIL, 'a hold marker could not be made in data/holds/ (' . get_class($e) . '): the limits on how many workers one credential may pin cannot work')];
         } finally {
@@ -588,7 +592,7 @@ final class Doctor
             @rmdir(rtrim($data, '/') . '/holds/addr-doctor/' . Signals::hash($addr));
             @rmdir(rtrim($data, '/') . '/holds/addr-doctor');
         }
-        if ($seen !== 2 || !$listed) {
+        if ($seen !== 2 || !$isListed) {
             return [self::row('holds.accounting', self::FAIL, 'the hold counts do not see the markers they make in this data folder (counted ' . $seen . ' of 2): every limit on held requests would let everything through. Is the path of the data folder one the relay cannot list?')];
         }
         return [self::row('holds.accounting', self::OK, 'the hold counts see the markers they make in data/holds/')];
@@ -674,7 +678,7 @@ final class Doctor
      * rests on it. proc_open is used to start the second process.
      * @return list<array{name:string,level:string,message:string}>
      */
-    public static function wakeVisibility(string $data, string $php, string $wakeMode = 'file'): array
+    public static function wakeVisibility(string $data, string $php, string $wakeMode = 'file', ?string $box = null): array
     {
         if ($wakeMode === 'db') {
             return [self::row('wake.shard', self::OK, 'wake.mode is "db": no shard file is used')];
@@ -683,7 +687,7 @@ final class Doctor
             return [self::row('wake.shard', self::WARN, 'proc_open is disabled, so the wake shard could not be tested across processes; set wake.mode to "db" if a poll ever answers late')];
         }
         $signals = new Signals($data);
-        $box = 'doctor:' . bin2hex(random_bytes(4));
+        $box ??= 'doctor:' . bin2hex(random_bytes(4)); // (a test names it, to know which shard to put a stray temporary beside)
         $signals->wakeWrite($box);
         $shard = $signals->wakePath($box);
         $code = '$f=$argv[1];clearstatcache(true,$f);$v0=@file_get_contents($f);echo "ready\n";fflush(STDOUT);'
