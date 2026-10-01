@@ -333,8 +333,7 @@ test('9.2 the stream opens of one party are a bucket (Holds::OPEN_BUCKET, refill
     $refuse($ta2, 'the bucket is empty again');
     Tmp::setClock(Relay::T0 + 21);
     $k->facade($ta, true); // another open of the party, taking a token of the second's refill
-    $k->facade($ta2, true); // the carrier's retry, one second after its refusal
-    ok($refill >= 2, 'a refill of at least two a second leaves the retry a token when one other open drew on the second');
+    $k->facade($ta2, true); // the carrier's retry, one second after its refusal: not refused, though another open took a token of that second
     // Another party has a bucket of its own.
     $tb = $k->mobileToken($b);
     for ($i = 0; $i < $bucket; $i++) {

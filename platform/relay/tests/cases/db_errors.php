@@ -210,6 +210,21 @@ test('4.18.3 the test clock is read again when its file cannot be read for a mom
     fclose($pipes[2]);
     proc_close($p);
     eq((string)Relay::T0, $out, 'an empty file for a moment is read again: ' . $err);
+    // A log line is not what fails when the clock cannot be read (the front controller logs while it answers an error): it is stamped with
+    // the host's time and written.
+    $logFile = Tmp::dir('clklog') . '/relay.log';
+    $script3 = Tmp::dir('clk') . '/clk3.php';
+    file_put_contents($script3, "<?php\ndefine('OAIY_RELAY', true);\ndefine('OAIY_TEST_CLOCK_FILE', \$argv[1] . '.missing');\nrequire " . var_export(dirname(__DIR__, 2) . '/src/autoload.php', true) . ";\n"
+        . "Oaiy\\Relay\\Log::setFile(\$argv[2]);\nOaiy\\Relay\\Log::write('info', 'clock_test');\necho 'done';\n");
+    $p = proc_open(array_merge([PHP_BINARY], OaiyTest\Server::phpFlags(), ['-d', 'display_errors=stderr', $script3, $file, $logFile]), [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+    $out = trim((string)stream_get_contents($pipes[1]));
+    $err = trim((string)stream_get_contents($pipes[2]));
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    proc_close($p);
+    eq('done', $out, $err);
+    $line = json_decode((string)file_get_contents($logFile), true);
+    ok(is_array($line) && ($line['event'] ?? '') === 'clock_test' && abs((int)$line['t'] - time()) <= 5, 'the line is written, with the host\'s time: ' . json_encode($line));
 });
 
 slow_test('4.18.5 MySQL and MariaDB: a lock wait timeout inside a write is retried three times and answered 503 unavailable, never 500, 401 or 404, and the request works once the lock is gone', function () {

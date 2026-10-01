@@ -28,9 +28,9 @@ final class Clock
 
     /**
      * The test clock: the number in the file. A file that cannot be read for a moment (a writer has it open, a scanner has it, the
-     * machine is busy) is read again, and one that stays unreadable is an error, never the host's own time: the host's time is months
-     * ahead of a test clock, so every rendezvous and every window would look over, and the answer would be a 404 or a 401 that nobody
-     * could explain.
+     * machine is busy) is read again, and one that stays unreadable is an error, never the host's own time: the host's time is ahead of a
+     * test clock, which keeps a fixed date (the tests' starts at 1790000000, 21 September 2026, and the gap only grows), so every rendezvous
+     * and every window would look over, and the answer would be a 404 that nobody could explain.
      */
     private static function fromTestFile(): int
     {
