@@ -21,6 +21,20 @@ final class Clock
     public static function now(): int
     {
         if (defined('OAIY_TEST_CLOCK_FILE')) {
+            return self::fromTestFile();
+        }
+        return time();
+    }
+
+    /**
+     * The test clock: the number in the file. A file that cannot be read for a moment (a writer has it open, a scanner has it, the
+     * machine is busy) is read again, and one that stays unreadable is an error, never the host's own time: the host's time is months
+     * ahead of a test clock, so every rendezvous and every window would look over, and the answer would be a 404 or a 401 that nobody
+     * could explain.
+     */
+    private static function fromTestFile(): int
+    {
+        for ($try = 0; $try < 60; $try++) {
             $v = @file_get_contents(OAIY_TEST_CLOCK_FILE);
             if (is_string($v)) {
                 $v = trim($v);
@@ -28,8 +42,9 @@ final class Clock
                     return (int)$v;
                 }
             }
+            usleep(5000);
         }
-        return time();
+        throw new \RuntimeException('the test clock file could not be read');
     }
 
     public static function nowMs(): int

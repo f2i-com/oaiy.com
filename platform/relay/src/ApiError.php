@@ -24,4 +24,19 @@ final class ApiError extends \RuntimeException
     {
         return new self(Errors::status($code), $code, $message, $retryAfter);
     }
+
+    /** Where in the code this error was decided: "File.php:123" (the caller of make(), when it was made there). */
+    public function site(): string
+    {
+        $file = $this->getFile();
+        $line = $this->getLine();
+        if (basename($file) === basename(__FILE__)) {
+            $t = $this->getTrace()[0] ?? null;
+            if ($t !== null && isset($t['file'], $t['line'])) {
+                $file = (string)$t['file'];
+                $line = (int)$t['line'];
+            }
+        }
+        return basename($file) . ':' . $line;
+    }
 }

@@ -75,6 +75,14 @@ final class Relay
         }
     }
 
+    /** For a test that is about MySQL and MariaDB (locks, connections): it is skipped on the default SQLite run. */
+    public static function mysqlOnly(): void
+    {
+        if (!self::isMysql()) {
+            skip('MySQL- and MariaDB-specific: this run uses SQLite (OAIY_TEST_DB=mysql or mariadb runs it)');
+        }
+    }
+
     /** @param array<string,mixed> $config merged into config.json after provisioning */
     public static function make(array $config = [], array $provision = []): self
     {
@@ -90,10 +98,31 @@ final class Relay
         // The gap rule looks at real time between two polls, which a test that polls twice in a row would trip; tests
         // of the rule itself set wait.gap_ms back to 250. Garbage collection after a random request would strike at random in
         // a test that moved the clock, so it is off (gc.one_in 0) unless a test of it asks for it.
-        $r->configure(array_replace_recursive(['wait' => ['gap_ms' => 0], 'gc' => ['one_in' => 0]], $config));
+        // Every relay of the tests records where each 401, 404 and 5xx it answers was decided (debug.error_sites), so that a test that
+        // fails on one it did not expect, or a flake that nobody can reproduce, says which line of the relay answered it (errorSites()).
+        $r->configure(array_replace_recursive(['wait' => ['gap_ms' => 0], 'gc' => ['one_in' => 0], 'debug' => ['error_sites' => true]], $config));
         Paths::setDataDir($r->data);
         self::$made[] = $r;
         return $r;
+    }
+
+    /**
+     * What the relay logged about the errors it answered (401, 404, 5xx), one line each: route, status, code, the place in the code, the
+     * relay's clock and the host's, and the process. For the message of an assertion on a status code: "got 401" then says where.
+     */
+    public function errorSites(): string
+    {
+        $file = $this->data . '/logs/relay.log';
+        $out = [];
+        foreach (@file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $line) {
+            $j = json_decode($line, true);
+            if (is_array($j) && in_array($j['event'] ?? '', ['error_site', 'internal', 'db_unavailable'], true)) {
+                $out[] = ($j['event'] === 'error_site')
+                    ? sprintf('%s %s %s at %s (relay clock %s, host clock %s, pid %s)', $j['route'] ?? '?', $j['status'] ?? '?', $j['code'] ?? '?', $j['site'] ?? '?', $j['now'] ?? '?', $j['real'] ?? '?', $j['pid'] ?? '?')
+                    : $j['event'] . ' ' . json_encode(array_diff_key($j, ['t' => 1, 'level' => 1, 'event' => 1]));
+            }
+        }
+        return $out === [] ? ' [the relay logged no error]' : "\n  the relay's own record of its errors:\n  " . implode("\n  ", array_slice($out, -12));
     }
 
     /**
@@ -184,6 +213,24 @@ final class Relay
         return Context::open($this->data);
     }
 
+    /** The Context that call() uses while a test holds one with onContext(), instead of opening a new one for every call. */
+    private ?Context $forced = null;
+
+    /**
+     * Run $fn with every call() of this relay using $ctx (and so one database connection): a test that has to break that connection
+     * (kill it, lock the file under it) between opening it and the request makes the request meet the break.
+     * @return mixed what $fn returns
+     */
+    public function onContext(Context $ctx, callable $fn)
+    {
+        $this->forced = $ctx;
+        try {
+            return $fn();
+        } finally {
+            $this->forced = null;
+        }
+    }
+
     public function adminToken(): string
     {
         return trim((string)file_get_contents($this->data . '/' . Installer::ADMIN_TOKEN_FILE));
@@ -246,7 +293,7 @@ final class Relay
             $srv['HTTP_' . strtoupper(str_replace('-', '_', $k))] = $v;
         }
         $req = new Request($method, $path, $query, $srv, $raw, null);
-        $res = (new Kernel($this->ctx()))->handle($req);
+        $res = (new Kernel($this->forced ?? $this->ctx()))->handle($req);
         @set_time_limit(0); // a held request lowers the limit to its wait + 10 seconds (Windows counts wall time); the run itself has none
         $out = ['status' => $res->status, 'headers' => array_change_key_case($res->headers, CASE_LOWER), 'body' => $res->body, 'json' => null];
         if ($res->body !== '' && strncmp($out['headers']['content-type'] ?? '', 'application/json', 16) === 0) {

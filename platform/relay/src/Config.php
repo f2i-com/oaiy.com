@@ -37,6 +37,7 @@ final class Config
         'token_pepper' => null,
         'wake' => ['mode' => 'file', 'safety_ms' => 2000],
         'gc' => ['one_in' => 20],
+        'debug' => ['error_sites' => false],
         'client_ip' => ['header' => null, 'trusted_proxies' => []],
     ];
 
@@ -200,6 +201,9 @@ final class Config
         }
         self::intIn($c['wake']['safety_ms'] ?? null, 200, 60000, 'wake.safety_ms');
         self::intIn($c['gc']['one_in'] ?? null, 0, 1000, 'gc.one_in');
+        if (!is_bool($c['debug']['error_sites'] ?? null)) {
+            throw self::bad('debug.error_sites');
+        }
         if ($c['token_pepper'] !== null && (!is_string($c['token_pepper']) || strlen($c['token_pepper']) < 16)) {
             throw self::bad('token_pepper');
         }
@@ -348,6 +352,15 @@ final class Config
     public function gcOneIn(): int
     {
         return (int)$this->c['gc']['one_in'];
+    }
+
+    /**
+     * debug.error_sites: log, for every 401, 404 and 5xx answered, the place in the code that decided it (a file and a line), with the
+     * route, status, code and the relay's clock. Off by default; a log line names no credential, body or header.
+     */
+    public function debugErrorSites(): bool
+    {
+        return (bool)$this->c['debug']['error_sites'];
     }
 
     public function clientIpHeader(): ?string

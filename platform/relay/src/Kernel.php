@@ -116,18 +116,41 @@ final class Kernel
     {
         $req->client = ClientIp::resolve($req->server, $this->ctx->cfg->clientIpHeader(), $this->ctx->cfg->trustedProxies(), [$req, 'exactHeader']);
         $code = null;
+        $site = null;
         try {
             $res = $this->dispatch($req);
         } catch (ApiError $e) {
             $code = $e->errorCode;
+            $site = $e->site();
             $res = Facade::isCompatPath($req->path) ? Facade::error($e) : Response::error($e);
             if ($e->status === 405) {
                 $res->headers['Allow'] = 'GET, POST, PUT, PATCH, DELETE';
             }
+        } catch (\PDOException $e) {
+            // A database that is busy, locked, dropped the connection or refuses it for the moment is the database's state: 503 with a
+            // Retry-After, whatever route and whatever step it was in (a read outside a write transaction is not retried by Db::write
+            // and used to be a 500). A client is never told its credential or what it asked for is wrong because the database hiccuped.
+            $site = basename($e->getFile()) . ':' . $e->getLine();
+            if (Db::isTransient($e)) {
+                $err = new ApiError(503, 'unavailable', null, 1);
+                Log::write('warn', 'db_unavailable', ['where' => $this->route, 'code' => (string)($e->errorInfo[1] ?? $e->getCode()), 'site' => $site]);
+                $code = 'unavailable';
+                $res = Facade::isCompatPath($req->path) ? Facade::error($err) : Response::error($err);
+            } else {
+                Log::error($e, $this->route);
+                $code = 'internal';
+                $res = Facade::isCompatPath($req->path) ? Facade::error(ApiError::make('internal')) : Response::error(ApiError::make('internal'));
+            }
         } catch (\Throwable $e) {
             Log::error($e, $this->route);
+            $site = basename($e->getFile()) . ':' . $e->getLine();
             $code = 'internal';
             $res = Facade::isCompatPath($req->path) ? Facade::error(ApiError::make('internal')) : Response::error(ApiError::make('internal'));
+        }
+        if ($site !== null && ($res->status === 401 || $res->status === 404 || $res->status >= 500) && $this->ctx->cfg->debugErrorSites()) {
+            // Off unless the owner (or a test) turns it on. A line names the route, the status, the code and the place in the code that
+            // decided it, and the relay's own clock beside the host's: no credential, id, header or body.
+            Log::write('info', 'error_site', ['route' => $this->route, 'status' => $res->status, 'code' => (string)$code, 'site' => $site, 'now' => Clock::now(), 'real' => time(), 'pid' => (int)getmypid()]);
         }
         if ($code !== null && $code !== 'rate_limited') {
             $this->ctx->limiter->bump('rej:' . $code);

@@ -316,6 +316,30 @@ final class Db
             || stripos($m, 'Lock wait timeout') !== false || stripos($m, 'Deadlock found') !== false;
     }
 
+    /**
+     * A database error that is the database's state and not the relay's mistake, and that goes away: a busy or locked database, a
+     * deadlock or a lock wait timeout (isBusy), a connection the server dropped or refused (gone away, lost connection, too many
+     * connections, the server shutting down), and a file SQLite cannot open or write for the moment (I/O error, a full disk). The
+     * relay answers these 503 unavailable with Retry-After, never 500 and never a refusal of a credential that is fine.
+     */
+    public static function isTransient(\PDOException $e): bool
+    {
+        if (self::isBusy($e)) {
+            return true;
+        }
+        $code = $e->errorInfo[1] ?? null;
+        if (in_array($code, [10, 13, 14, 1040, 1053, 1203, 1317, 2002, 2003, 2006, 2013, 2055], true)) {
+            return true; // SQLite: I/O error, disk full, cannot open; MySQL: too many connections, shutdown, user limit, interrupted, cannot connect, gone away, lost
+        }
+        $m = $e->getMessage();
+        foreach (['server has gone away', 'Lost connection', 'Too many connections', 'Server shutdown', 'disk I/O error', 'database or disk is full', 'unable to open database file', 'Connection refused', 'max_user_connections'] as $needle) {
+            if (stripos($m, $needle) !== false) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public static function isDuplicate(\PDOException $e): bool
     {
         $state = (string)($e->errorInfo[0] ?? $e->getCode());

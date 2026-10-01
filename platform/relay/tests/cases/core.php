@@ -402,10 +402,13 @@ test('4.18.10 config: wrong types and out-of-range values fail closed', function
         ['client_ip' => ['trusted_proxies' => 'nope']], ['db' => ['driver' => 'oracle']], ['db' => ['driver' => 'mysql']], ['db' => ['journal' => 'delete']],
         ['apps' => 'aokie'], ['apps' => ['bad app']], ['capacity' => ['workers' => 0]], ['cors' => ['extra_origins' => ['http://x.example']]],
         ['gc' => ['one_in' => -1]], ['gc' => ['one_in' => 1001]], ['gc' => ['one_in' => '20']], ['gc' => ['one_in' => 2.5]],
-        ['call' => ['challenge_s' => 9]], ['call' => ['challenge_s' => 31]], ['call' => ['challenge_s' => '25']], ['call' => ['challenge_s' => 25.5]], ['call' => ['challenge_s' => true]], ['call' => ['challenge_s' => null]]];
+        ['call' => ['challenge_s' => 9]], ['call' => ['challenge_s' => 31]], ['call' => ['challenge_s' => '25']], ['call' => ['challenge_s' => 25.5]], ['call' => ['challenge_s' => true]], ['call' => ['challenge_s' => null]],
+        ['debug' => ['error_sites' => 'yes']], ['debug' => ['error_sites' => 1]], ['debug' => ['error_sites' => null]]];
     foreach ($bad as $patch) {
         throws(fn() => Config::fromArray($base + $patch, '/x'), \RuntimeException::class, 'config invalid', json_encode($patch));
     }
+    eq(false, Config::fromArray($base, '/x')->debugErrorSites(), 'the error sites are not logged unless asked for');
+    eq(true, Config::fromArray($base + ['debug' => ['error_sites' => true]], '/x')->debugErrorSites());
     eq(25, Config::fromArray($base, '/x')->challengeSeconds(), 'the challenge lives 25 seconds unless told otherwise');
     foreach ([10, 15, 25, 30] as $s) {
         eq($s, Config::fromArray($base + ['call' => ['enabled' => true, 'challenge_s' => $s]], '/x')->challengeSeconds(), "call.challenge_s $s");

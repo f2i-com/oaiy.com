@@ -230,6 +230,7 @@ is an error, not a default. Keys this build understands (unknown keys are ignore
 | `wake.mode`, `wake.safety_ms` | `file`, 2000 | `file` (shard files, with a database fetch every `safety_ms`) or `db` (poll the database) |
 | `client_ip.header`, `client_ip.trusted_proxies` | none | Honoured only when `REMOTE_ADDR` is a trusted proxy |
 | `cors.extra_origins` | none | Extra https origins listed in `info` |
+| `debug.error_sites` | `false` | When `true`, every `401`, `404` and `5xx` the relay answers is also one line in `data/logs/relay.log` (`event: error_site`) with the route, status, code, the file and line that decided it, the relay's clock and the host's, and the process: no credential, id, header or body. For finding out why an answer was what it was; leave it off otherwise |
 
 Accepted and validated now, used by a later part of the relay: `push.fcm.*` and `limits.slotBytes`.
 
