@@ -76,7 +76,10 @@ function harness_run_leaky(string $mode): array
 declare(strict_types=1);
 
 test('leaves a sleeper', function () {
-    $p = proc_open([PHP_BINARY, '-r', 'sleep(120);'], [], $pipes);
+    // (Its output goes nowhere, as the detached one's does: a sleeper that kept the runner's own pipes would hold the outer test's read open until
+    // its own sleep ran out, and the outer test could not tell a runner that ended it from one that did not.)
+    $null = DIRECTORY_SEPARATOR === '\\' ? 'NUL' : '/dev/null';
+    $p = proc_open([PHP_BINARY, '-r', 'sleep(120);'], [0 => ['file', $null, 'r'], 1 => ['file', $null, 'w'], 2 => ['file', $null, 'w']], $pipes);
     file_put_contents(getenv('LEAK_PID_FILE'), (string)proc_get_status($p)['pid']);
 });
 test('is clean', function () {
@@ -107,13 +110,13 @@ test('leaves a detached process', function () {
 PHP);
     $orphanFile = $dir . '/orphan.pid';
     $env = array_merge(getenv(), ['OAIY_TEST_CASES' => $dir, 'OAIY_TEST_PROCS' => $mode, 'LEAK_PID_FILE' => $pidFile, 'ORPHAN_PID_FILE' => $orphanFile]);
-    $p = proc_open(array_merge([PHP_BINARY], Server::phpFlags(), [dirname(__DIR__) . '/run.php']), [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, $env);
+    // Its output goes to files, not pipes: a process it leaves behind holds a pipe's write end (Windows hands every inheritable handle on) and would
+    // keep the read open until its own sleep ran out, so that the test could not tell a runner that ended it from one that did not.
+    $p = proc_open(array_merge([PHP_BINARY], Server::phpFlags(), [dirname(__DIR__) . '/run.php']), [1 => ['file', $dir . '/out.txt', 'w'], 2 => ['file', $dir . '/err.txt', 'w']], $pipes, null, $env);
     ok(is_resource($p), 'the runner starts');
-    $out = (string)stream_get_contents($pipes[1]);
-    $err = (string)stream_get_contents($pipes[2]);
-    fclose($pipes[1]);
-    fclose($pipes[2]);
     $code = proc_close($p);
+    $out = (string)@file_get_contents($dir . '/out.txt');
+    $err = (string)@file_get_contents($dir . '/err.txt');
     $pid = (int)trim((string)@file_get_contents($pidFile));
     $orphan = (int)trim((string)@file_get_contents($orphanFile));
     // Whatever happens next, what this test started is ended by the pids it recorded.
@@ -156,9 +159,6 @@ test('harness: when the check is made only at the end of a run, a process that n
     ok(!Procs::alive($orphan), "and the detached process (pid $orphan)");
 });
 
-test('harness: the run fails when a test changes the working tree\'s data/ folder (a real relay\'s may be there), and is silent when none does', function () {
-    $watched = Tmp::dir('realdata') . '/data';
-    mkdir($watched . '/logs', 0700, true);
 test('harness: what a test declares kept (the shared database server) is exempt together with everything below it, found below the runner or by the root its command line names (a server can be a launcher and a child with the same data folder)', function () {
     $dir = Tmp::dir('keeptree');
     $pidFile = $dir . '/pids';
@@ -235,6 +235,9 @@ foreach (['each', 'end'] as $harnessDbMode) {
     });
 }
 
+test('harness: the run fails when a test changes the working tree\'s data/ folder (a real relay\'s may be there), and is silent when none does', function () {
+    $watched = Tmp::dir('realdata') . '/data';
+    mkdir($watched . '/logs', 0700, true);
     file_put_contents($watched . '/logs/relay.log', "a line that was there\n");
     $dir = Tmp::dir('datacases');
     file_put_contents($dir . '/touch.php', <<<'PHP'

@@ -209,6 +209,18 @@ test('4.18.5 on the compatibility routes a database that is gone or locked for a
         dberr_expect_compat_500($r, $what, $key, $res, 'the connection is gone or the file locked');
         eq(200, $r->call($tokens['plugin'], 'GET', '/v1/aokie-companion/relay/challenge')['status'], "$what: works again");
     }
+    // What it logged (a Facade::run that answered the database's own exception itself would be a 500 of the right shape and would log nothing):
+    // the database that was not there for a moment, once for each of the eight requests, and the line that says where the 500 was decided, with the
+    // driver's own code as its reason.
+    $lines = array_map(fn($l) => json_decode($l, true), file($r->data . '/logs/relay.log', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: []);
+    $unavailable = array_values(array_filter($lines, fn($j) => ($j['event'] ?? '') === 'db_unavailable'));
+    ok(count($unavailable) >= 8, count($unavailable) . ' db_unavailable lines, one per request');
+    $sites = array_values(array_filter($lines, fn($j) => ($j['event'] ?? '') === 'error_site' && ($j['status'] ?? 0) === 500));
+    eq(8, count($sites), 'one error-site line for each of the eight 500s: ' . json_encode($sites));
+    foreach ($sites as $site) {
+        ok(preg_match('/^db_error_\d+$/D', (string)($site['reason'] ?? '')) === 1, 'the reason is the driver\'s code: ' . json_encode($site));
+    }
+    eq([], array_values(array_filter($lines, fn($j) => ($j['event'] ?? '') === 'internal')), 'and no internal error was logged: the database\'s state is not the relay\'s mistake');
     // The table itself: the statuses the plugin treats as a failure to reconnect, and as "unavailable for this app".
     foreach ([401, 400, 429, 500, 502] as $status) {
         eq('reconnect', OaiyTest\AokiePlugin::kind($status), (string)$status);
@@ -491,13 +503,22 @@ slow_test('4.18.5 MySQL and MariaDB: a lock wait timeout inside a write is retri
     $pdo = new PDO($c['dsn'], $c['user'], $c['pass'], [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
     $pdo->exec('START TRANSACTION');
     $pdo->prepare('SELECT id FROM devices WHERE id = ? FOR UPDATE')->execute([$d->id]);
+    // The server counts every wait for a row lock, and nothing else waits for this one: the number of waits the request made is the number of
+    // times Db::write tried (an elapsed time of more than ten seconds is two waits of five as well as three, and four waits would be twenty).
+    $waits = static function () use ($pdo): int {
+        $row = $pdo->query("SHOW GLOBAL STATUS LIKE 'Innodb_row_lock_waits'")->fetch(PDO::FETCH_NUM);
+        return (int)($row[1] ?? -1);
+    };
+    $before = $waits();
     $t = microtime(true);
     $res = $r->call($prov, 'POST', '/v1/items', ['items' => [['to' => $d->inbox(), 'lane' => 'cmd', 'id' => 'locked', 'body' => 'x']]]);
     $el = microtime(true) - $t;
+    $made = $waits() - $before;
     $pdo->exec('COMMIT');
     eq(503, $res['status'], $res['body'] . $r->errorSites());
     eq('unavailable', $res['json']['error']['code']);
-    ok(isset($res['headers']['retry-after']));
+    eq('1', $res['headers']['retry-after'] ?? null, 'Db::write gives up with Retry-After 1');
+    eq(3, $made, 'the write waited for the lock three times: it tried three times, not two or four');
     ok($el > 10.0, 'three lock waits: ' . round($el, 1) . ' s');
     eq(0, (int)$r->ctx()->db->val('SELECT COUNT(*) FROM items'), 'nothing half written');
     $res = $r->call($prov, 'POST', '/v1/items', ['items' => [['to' => $d->inbox(), 'lane' => 'cmd', 'id' => 'after', 'body' => 'x']]]);
