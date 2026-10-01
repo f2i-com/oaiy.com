@@ -1142,6 +1142,8 @@ neg("error", "an unwrapped error", {"code": "internal", "message": "x"}, "error"
 neg("error", "retryAfter negative", {"error": {"code": "rate_limited", "message": "x", "retryAfter": -1}}, "retryAfter")
 neg("error", "a poll rule the relay does not have", {"error": {"code": "rate_limited", "message": "x", "retryAfter": 1, "rule": "burst"}}, "rule")
 neg("error", "a poll rule that is not a string", {"error": {"code": "rate_limited", "message": "x", "retryAfter": 1, "rule": 3}}, "rule")
+neg("error", "a poll rule on an error that is not a rate limit", {"error": {"code": "internal", "message": "x", "rule": "gap"}}, "rate_limited")
+neg("error", "a poll rule with no retryAfter", {"error": {"code": "rate_limited", "message": "x", "rule": "gap"}}, "retryAfter")
 neg("compat-error", "error must be the boolean true", {"error": False, "code": "invalid_token", "message": "x"}, "error")
 neg("compat-error", "an unknown compat code", {"error": True, "code": "nope", "message": "x"}, "code")
 neg("health", "an extra member", dict(p1("health"), extra=1), "extra")
@@ -1793,12 +1795,25 @@ section("poll-client fixture (fixtures/poll-client/): the rules of README 5.1.1 
 PC = FIX / "poll-client"
 pc_readme = (V1 / "README.md").read_text(encoding="utf-8")
 pc_doc = json.loads((PC / "poll-client.json").read_text(encoding="utf-8"))
-ok("README has the section and states each of the rules P1 to P8 by its number",
-   "### 5.1.1 The poll loop of a native client (DK-03 and MOB-21a)" in pc_readme and all(f"**P{i}. " in pc_readme for i in range(1, 9)))
+# What the table holds, pinned here as the vectors' values are (DESIGN_PINS): a case that goes missing from the table, or one that is added,
+# changes these, and whoever does it changes them here on purpose. The readers check the table against its own caseCount and idsSha256, which
+# a table edited to agree with itself would satisfy; these are what that edit cannot satisfy.
+POLL_CLIENT_PINS = {"cases": 111, "idsSha256": "e9ce737bd8df32d166aa61cd5dfdc6aea038f72437063be9d1d3633613a4c34d"}
+ok("README has the section and states each of the rules P1 to P9 by its number",
+   "### 5.1.1 The poll loop of a native client (DK-03 and MOB-21a)" in pc_readme and all(f"**P{i}. " in pc_readme for i in range(1, 10)))
+pc_ids = [x["id"] for x in pc_doc["cases"]]
+ok("the table holds exactly the cases that are pinned here, by their number and the digest of their names (a case that went missing is noticed)",
+   len(pc_ids) == POLL_CLIENT_PINS["cases"] and len(set(pc_ids)) == len(pc_ids) and hashlib.sha256("\n".join(sorted(pc_ids)).encode("utf-8")).hexdigest() == POLL_CLIENT_PINS["idsSha256"]
+   and pc_doc["caseCount"] == len(pc_ids) and pc_doc["idsSha256"] == POLL_CLIENT_PINS["idsSha256"])
 ok("README says what DK-03 and MOB-21a are, since nothing else in the repository does",
    "DK-03 is the work package that builds the desktop's relay client" in pc_readme and "MOB-21a the one that builds the phone's" in pc_readme)
-ok("every rule P1 to P8 has cases in the table, and at least ninety cases in all",
-   {c["rule"] for c in pc_doc["cases"]} >= {f"P{i}" for i in range(1, 9)} and len(pc_doc["cases"]) >= 90)
+ok("every rule P1 to P9 has cases in the table",
+   {c["rule"] for c in pc_doc["cases"]} >= {f"P{i}" for i in range(1, 10)})
+ok("README closes what the review found open in the rules: the relay's step (200 ms) and the 250 ms bound, a poll's own timeout, the epoch that is cleared after a first 400, 426 and info, a reset answer arming no gap, what to persist and when, the counters and the times a client keeps, the identity proof in the loop, and the names of every action and report",
+   all(s in pc_readme for s in ("The relay's **step** is 200 ms", "A poll's own timeout is `wait + 10` seconds", "action `clear_epoch`", "makes the client re-read `GET /v1/info` (section 8.5)",
+                                "the relay records no end of a poll for it, so the gap rule never refuses the poll that follows", "**To persist** is to write what the client accepted",
+                                "**P8. State.** A client keeps four numbers and two times", "**P9. The relay's identity, and `info`.**", "`report_relay_changed`", "`forget_credential`, `refresh_or_reenrol`, `update_client`, `report_defect`, `clear_epoch`",
+                                "`unreachable`, `in_flight_defect`, `duplicate_credential` (P2), `invalid_request`", "(2 s, doubling up to `info.wait.fallbackS`, 5: 2, 4, 5, 5...)", "the protocol's bound for it is 250 ms, section 5.1.1")))
 ok("README states the numbers the table pins: clamp 1 to 120, jitter up to 20 percent, 429 backoff 1, 2, 4, 8, 16, 30, failure backoff capped at 60, unreachable after three failures, a defect when the fifth 429 in a row says in_flight, a replacement 250 ms after the poll it cancels",
    all(s in pc_readme for s in ("`clamp(x)` is `x` limited to 1 to 120", "`pause = base * (1 + 0.2 * u)`", "`base = max(clamp(D), min(30, 2^(n-1)))`: 1, 2, 4, 8, 16, 30, 30...",
                                 "`base = min(60, 2^(n-1))`: 1, 2, 4, 8, 16, 32, 60, 60...", "after three failures in a row", "when the fifth `429` in a row says `rule: \"in_flight\"`",
@@ -1821,7 +1836,7 @@ for label, cmd in pc_readers:
         m = re.search(r"(\d+) checks, (\d+) mismatches", proc.stdout)
         n = int(m.group(1)) if m else 0
         fix_checks += n
-        ok(f"{label} reading of the poll-client table, written from the README alone, agrees with every case ({n} checks)", proc.returncode == 0 and bool(m) and m.group(2) == "0" and n >= 600, (proc.stdout + proc.stderr)[-500:])
+        ok(f"{label} reading of the poll-client table, written from the README alone, agrees with every case ({n} checks)", proc.returncode == 0 and bool(m) and m.group(2) == "0" and n >= 700, (proc.stdout + proc.stderr)[-500:])
     except (OSError, subprocess.TimeoutExpired) as e:
         ok(f"{label} reading of the poll-client table ran", False, str(e))
 # Not vacuous: a table with one answer changed is refused by both readers (each change is one thing a client could get wrong).
@@ -1853,7 +1868,26 @@ pc_damaged = [
     ("a poll replaced by another process that does not pause as after idle", pc_damage("p2-superseded-not-ours", ("expect", "baseS"), 0)),
     ("a superseded poll that this client replaced and that waits", pc_damage("p2-superseded-ours", ("expect", "baseS"), 0.25)),
     ("a jitter that is not added", pc_damage("p6-clamp-jitter", ("expect", "pauseS"), 120)),
+    ("a second 400 in a row that is retried again", pc_damage("p2-400-second", ("expect", "outcome"), "failure")),
+    ("a first 400 that does not clear the epoch", pc_damage("p2-400-first", ("expect", "action"), None)),
+    ("a 426 that stops a client that is not too old", pc_damage("p8-426-not-too-old", ("expect", "outcome"), "stop")),
+    ("a stop that clears the counters", pc_damage("p8-stop-keeps-counters", ("expect", "state", "n429"), 0)),
+    ("a proof that does not verify and is only a failure", pc_damage("p9-proof-wrong-key", ("expect", "outcome"), "failure")),
+    ("a proof that is not due at 300 seconds", pc_damage("p9-due-every-300s", ("expect", "due"), False)),
+    ("a poll's own timeout that is judged a replacement (no failure counted)", pc_damage("p1-own-timeout-is-failure", ("expect", "state", "nFail"), 0)),
+    ("a table with a case missing from it (its count and digest as they were)", dict(copy.deepcopy(pc_doc), cases=[x for x in pc_doc["cases"] if x["id"] != "p6-clamp-low"])),
+    ("a table whose constants say a clamp of 100", dict(copy.deepcopy(pc_doc), constants=dict(pc_doc["constants"], clampMax=100))),
+    ("a table whose constants say a jitter of 30 percent", dict(copy.deepcopy(pc_doc), constants=dict(pc_doc["constants"], jitter=0.3))),
+    ("a table whose constants say a failure backoff capped at 120", dict(copy.deepcopy(pc_doc), constants=dict(pc_doc["constants"], backoffFailureCap=120))),
 ]
+# A table that was edited to agree with itself (a case removed, its count and digest recomputed) is accepted by the readers, which is why the
+# pins above exist: it does not agree with them.
+pc_edited = copy.deepcopy(pc_doc)
+pc_edited["cases"] = [x for x in pc_edited["cases"] if x["id"] != "p6-clamp-low"]
+pc_edited["caseCount"] = len(pc_edited["cases"])
+pc_edited["idsSha256"] = hashlib.sha256("\n".join(sorted(x["id"] for x in pc_edited["cases"])).encode("utf-8")).hexdigest()
+ok("a table edited to agree with itself (a case removed, its count and digest recomputed) is not the pinned one",
+   pc_edited["idsSha256"] != POLL_CLIENT_PINS["idsSha256"] and pc_edited["caseCount"] != POLL_CLIENT_PINS["cases"])
 with tempfile.TemporaryDirectory() as tmpd:
     for i, (what, damaged) in enumerate(pc_damaged):
         f = pathlib.Path(tmpd) / f"damaged{i}.json"

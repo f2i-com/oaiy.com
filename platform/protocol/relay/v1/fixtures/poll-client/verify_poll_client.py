@@ -5,11 +5,17 @@ language; a client's own code is a fourth, tested against the same table.
 
     python verify_poll_client.py [--file poll-client.json]
 
+What it enforces beyond each case: the `constants` block of the table must be exactly the numbers the README states (EXPECTED below), and every
+rule below takes its number from that block, so a table whose constants were changed is refused and so is a reader that ignores them; the
+`caseCount` and `idsSha256` of the table must match the cases it holds, so a case that went missing from it is noticed (the conformance suite
+pins both, so that a table edited to agree with itself is noticed too).
+
 Prints "N checks, M mismatches" and exits 1 on any mismatch.
 """
 from __future__ import annotations
 
 import calendar
+import hashlib
 import json
 import pathlib
 import re
@@ -19,13 +25,17 @@ HERE = pathlib.Path(__file__).resolve().parent
 MONTHS = {m: i + 1 for i, m in enumerate("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split())}
 IMF = re.compile(r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), (\d\d) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (\d{4}) (\d\d):(\d\d):(\d\d) GMT")
 
+# The numbers README section 5.1.1 states (P1, P3, P5, P6, P7, P9). The table's own `constants` must equal this.
+EXPECTED = {
+    "replaceMinMs": 250, "clampMin": 1, "clampMax": 120, "retryAfterBodyMax": 86400, "retryAfterDigitsMax": 6, "jitter": 0.2,
+    "backoff429Cap": 30, "backoffFailureCap": 60, "unreachableAfter": 3, "inFlightDefectAfter": 5, "refusedHoldDefaultS": 2,
+    "proofEveryS": 300, "proofAfterPauseS": 60, "pollTimeoutExtraS": 10,
+}
+ZERO = {"n429": 0, "nFail": 0, "nRefused": 0, "n400": 0}
+
 
 def is_int(x) -> bool:
     return isinstance(x, int) and not isinstance(x, bool)
-
-
-def clamp(x: float) -> float:
-    return max(1, min(120, x))
 
 
 def http_date(text: str):
@@ -36,86 +46,122 @@ def http_date(text: str):
     return calendar.timegm((int(y), MONTHS[mon], int(d), int(hh), int(mm), int(ss)))
 
 
-def retry_after(headers: dict, body, now):
-    """P6: the header first (digits, or an HTTP-date measured from the answer's Date header or else the client's clock), then error.retryAfter, else None."""
-    v = headers.get("retry-after")
-    if v is not None:
-        s = v.strip(" \t")
-        if re.fullmatch(r"[0-9]{1,6}", s):
-            return int(s)
-        t = http_date(s)
-        if t is not None:
-            ref = http_date(headers["date"]) if "date" in headers else None
-            if ref is None:
-                ref = now
-            if ref is not None:
-                return max(0, t - ref)
-    if isinstance(body, dict) and isinstance(body.get("error"), dict):
-        r = body["error"].get("retryAfter")
-        if is_int(r) and 0 <= r <= 86400:
-            return r
-    return None
+def make(K: dict):
+    """The rules, with every number taken from the constants K."""
 
+    def clamp(x):
+        return max(K["clampMin"], min(K["clampMax"], x))
 
-def decide(c: dict) -> dict:
-    st = c["state"]
-    n429, nfail, nref = st["n429"], st["nFail"], st["nRefused"]
-    info, u = c["info"], c["u"]
-    resp = c["response"]
-    status = resp["status"]
-    headers = {k.lower(): v for k, v in resp.get("headers", {}).items()}
-    body = resp.get("body")
-    now = c.get("nowEpoch")
-    out = {"action": None, "report": []}
+    def retry_after(headers, body, now):
+        v = headers.get("retry-after")
+        if v is not None:
+            s = v.strip(" \t")
+            if re.fullmatch(r"[0-9]{1,%d}" % K["retryAfterDigitsMax"], s):
+                return int(s)
+            t = http_date(s)
+            if t is not None:
+                ref = http_date(headers["date"]) if "date" in headers else None
+                if ref is None:
+                    ref = now
+                if ref is not None:
+                    return max(0, t - ref)
+        if isinstance(body, dict) and isinstance(body.get("error"), dict):
+            r = body["error"].get("retryAfter")
+            if is_int(r) and 0 <= r <= K["retryAfterBodyMax"]:
+                return r
+        return None
 
-    def result(outcome, base, state):
-        out.update(outcome=outcome, baseS=base, pauseS=base * (1 + 0.2 * u), state=state)
-        return out
+    def decide(c):
+        st = c["state"]
+        n429, nfail, nref, n400 = st["n429"], st["nFail"], st["nRefused"], st["n400"]
+        info, u = c["info"], c["u"]
+        out = {"action": None, "report": []}
 
-    items_ok = status == 200 and isinstance(body, dict) and isinstance(body.get("items"), list)
-    if status == 200 and items_ok:
-        hold = body.get("hold") if isinstance(body.get("hold"), dict) else {}
-        if body["items"] or body.get("reset") is True:
-            return result("progress", 0, {"n429": 0, "nFail": 0, "nRefused": 0})
-        if hold.get("superseded") is True:
-            if c.get("weReplaced", True) is False:
-                out["report"] = ["duplicate_credential"]
-                return result("superseded", info["pollGapMs"] / 1000, {"n429": 0, "nFail": 0, "nRefused": 0})  # another process polls: pause as after idle
-            return result("superseded", 0, {"n429": 0, "nFail": 0, "nRefused": 0})
-        if hold.get("refused") is True:
-            r = hold.get("retryAfter")
-            r = clamp(r if is_int(r) else 2)
-            base = max(r, min(info["fallbackS"], r * 2 ** nref))
-            return result("idle", base, {"n429": 0, "nFail": 0, "nRefused": nref + 1})
-        return result("idle", info["pollGapMs"] / 1000, {"n429": 0, "nFail": 0, "nRefused": 0})
-    if status == 429:
-        n = n429 + 1
-        d = retry_after(headers, body, now)
-        d = clamp(1 if d is None else d)
-        base = max(d, min(30, 2 ** (n - 1)))
-        rule = body["error"].get("rule") if isinstance(body, dict) and isinstance(body.get("error"), dict) else None
-        if rule == "in_flight" and n == 5:
-            out["report"] = ["in_flight_defect"]
-        return result("flow", base, {"n429": n, "nFail": 0, "nRefused": 0})
-    stop = status is not None and 400 <= status <= 499 and status not in (408, 429)
-    if stop:
-        code = body["error"].get("code") if isinstance(body, dict) and isinstance(body.get("error"), dict) else None
-        if status == 401:
-            out["action"] = "forget_credential" if code == "revoked" else "refresh_or_reenrol"
-        elif status == 426:
+        def result(outcome, base, state):
+            out.update(outcome=outcome, baseS=base, pauseS=base * (1 + K["jitter"] * u), state=state)
+            return out
+
+        def fail_backoff(n, d=None):
+            base = min(K["backoffFailureCap"], 2 ** (n - 1))
+            return max(base, clamp(d)) if d is not None else base
+
+        if "proof" in c:  # P9: the answer to the interactive proof of section 8.3
+            res = c["proof"]["result"]
+            if res == "verified":
+                return result("proved", 0, {**st, "nFail": 0})
+            if res == "none":
+                n = nfail + 1
+                if n >= K["unreachableAfter"]:
+                    out["report"] = ["unreachable"]
+                return result("failure", fail_backoff(n), {"n429": 0, "nFail": n, "nRefused": 0, "n400": 0})
+            out["action"] = "report_relay_changed"  # a replayed body, another key
+            return result("stop", 0, dict(st))
+        resp = c["response"]
+        status = resp["status"]
+        headers = {k.lower(): v for k, v in resp.get("headers", {}).items()}
+        body = resp.get("body")
+        now = c.get("nowEpoch")
+        cleared = dict(ZERO)
+        if status == 200 and isinstance(body, dict) and isinstance(body.get("items"), list):
+            hold = body.get("hold") if isinstance(body.get("hold"), dict) else {}
+            if body["items"] or body.get("reset") is True:
+                return result("progress", 0, cleared)
+            if hold.get("superseded") is True:
+                if c.get("weReplaced", True) is False:
+                    out["report"] = ["duplicate_credential"]
+                    return result("superseded", info["pollGapMs"] / 1000, cleared)  # another process polls: pause as after idle
+                return result("superseded", 0, cleared)
+            if hold.get("refused") is True:
+                r = hold.get("retryAfter")
+                r = clamp(r if is_int(r) else K["refusedHoldDefaultS"])
+                base = max(r, min(info["fallbackS"], r * 2 ** nref))
+                return result("idle", base, {**cleared, "nRefused": nref + 1})
+            return result("idle", info["pollGapMs"] / 1000, cleared)
+        if status == 429:
+            n = n429 + 1
+            d = retry_after(headers, body, now)
+            d = clamp(1 if d is None else d)
+            base = max(d, min(K["backoff429Cap"], 2 ** (n - 1)))
+            rule = body["error"].get("rule") if isinstance(body, dict) and isinstance(body.get("error"), dict) else None
+            if rule == "in_flight" and n == K["inFlightDefectAfter"]:
+                out["report"] = ["in_flight_defect"]
+            return result("flow", base, {**cleared, "n429": n})
+        if status == 400:
+            if n400 >= 1:  # a second in a row
+                out["action"] = "report_defect"
+                return result("stop", 0, dict(st))
+            n = nfail + 1  # the first: retried without the stored epoch
+            out["action"] = "clear_epoch"
+            out["report"] = ["invalid_request"]
+            return result("failure", fail_backoff(n), {**cleared, "nFail": n, "n400": 1})
+        if status == 426 and c.get("minClientAboveOurs") is True:
             out["action"] = "update_client"
-        else:
-            out["action"] = "report_defect"
-        return result("stop", 0, dict(st))
-    # everything else is a failure: no answer, 408, 5xx, 1xx, 2xx other than a valid 200, 3xx, an invalid 200
-    n = nfail + 1
-    base = min(60, 2 ** (n - 1))
-    d = retry_after(headers, body, now) if status is not None else None
-    if d is not None:
-        base = max(base, clamp(d))
-    if n >= 3:
-        out["report"] = ["unreachable"]
-    return result("failure", base, {"n429": 0, "nFail": n, "nRefused": 0})
+            return result("stop", 0, dict(st))
+        if status is not None and 400 <= status <= 499 and status not in (408, 426, 429):
+            code = body["error"].get("code") if isinstance(body, dict) and isinstance(body.get("error"), dict) else None
+            if status == 401:
+                out["action"] = "forget_credential" if code == "revoked" else "refresh_or_reenrol"
+            else:
+                out["action"] = "report_defect"
+            return result("stop", 0, dict(st))
+        # everything else is a failure: no answer, 408, 5xx, 1xx, 2xx other than a valid 200, 3xx, an invalid 200, a 426 that is not ours to obey
+        n = nfail + 1
+        d = retry_after(headers, body, now) if status is not None else None
+        if n >= K["unreachableAfter"]:
+            out["report"] = ["unreachable"]
+        return result("failure", fail_backoff(n, d), {**cleared, "nFail": n})
+
+    def replace_wait_ms(since_last_start_ms):
+        return max(0, K["replaceMinMs"] - since_last_start_ms)
+
+    def proof_due(p):
+        return bool(p.get("processStart") or p.get("networkChanged") or p["longestPauseS"] >= K["proofAfterPauseS"] or p["secondsSinceProof"] >= K["proofEveryS"])
+
+    return decide, replace_wait_ms, proof_due
+
+
+def ids_digest(ids) -> str:
+    return hashlib.sha256("\n".join(sorted(ids)).encode("utf-8")).hexdigest()
 
 
 def main() -> int:
@@ -132,13 +178,23 @@ def main() -> int:
         if not ok:
             bad.append(f"{cid}: {what} {detail}")
 
-    ids = set()
+    K = doc["constants"]
+    check("constants", "the constants block is the numbers of README 5.1.1", K == EXPECTED, f"table {K}, README {EXPECTED}")
+    ids = [c["id"] for c in doc["cases"]]
+    check("caseCount", "the table holds the number of cases it says", doc.get("caseCount") == len(ids), f"says {doc.get('caseCount')}, holds {len(ids)}")
+    check("idsSha256", "the digest of the case names is the one the table says (a case went missing, or was added)", doc.get("idsSha256") == ids_digest(ids))
+    decide, replace_wait_ms, proof_due = make({**EXPECTED, **{k: v for k, v in K.items() if k in EXPECTED}})
+    seen = set()
     for c in doc["cases"]:
-        check(c["id"], "id is unique", c["id"] not in ids)
-        ids.add(c["id"])
+        check(c["id"], "id is unique", c["id"] not in seen)
+        seen.add(c["id"])
         if "replace" in c:
-            wait = max(0, doc["constants"]["replaceMinMs"] - c["replace"]["msSinceLastStart"])
+            wait = replace_wait_ms(c["replace"]["msSinceLastStart"])
             check(c["id"], "waitMs", wait == c["expect"]["waitMs"], f"got {wait}, table {c['expect']['waitMs']}")
+            continue
+        if "proofDue" in c:
+            got = proof_due(c["proofDue"])
+            check(c["id"], "proof due", got == c["expect"]["due"], f"got {got}, table {c['expect']['due']}")
             continue
         got = decide(c)
         want = c["expect"]
@@ -149,9 +205,9 @@ def main() -> int:
         check(c["id"], "action", got["action"] == want["action"], f"got {got['action']}, table {want['action']}")
         check(c["id"], "report", sorted(got["report"]) == sorted(want["report"]), f"got {got['report']}, table {want['report']}")
     # every rule of section 5.1.1 that a case can check has a case
-    seen = {c["rule"] for c in doc["cases"]}
-    for rule in ("P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8"):
-        check(rule, "has a case", rule in seen)
+    rules = {c["rule"] for c in doc["cases"]}
+    for rule in ("P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9"):
+        check(rule, "has a case", rule in rules)
     for line in bad:
         print("MISMATCH", line)
     print(f"{checks} checks, {len(bad)} mismatches")

@@ -28,13 +28,25 @@
             "gap",
             "in_flight"
           ],
-          "description": "Only on the 429 of a consumer poll (README section 5.1.1, rule P4): which rule refused it. `gap`: a poll that made no progress came sooner than `info.wait.pollGapMs` after the last one ended. `in_flight`: more polls that wait of the device are running than the bound (3). Any other 429 has no `rule`; a client that meets a value it does not know treats it as absent."
+          "description": "Only on the 429 of a consumer poll (README section 5.1.1, rule P4): which rule refused it. `gap`: a poll that made no progress came sooner than `info.wait.pollGapMs` after the last one ended. `in_flight`: more polls that wait of the device are running than the bound (3). Any other 429 has no `rule`, and no other error has one (a `rule` is allowed only beside the code `rate_limited` and a `retryAfter`); a client that meets a value it does not know treats it as absent."
         }
       },
       "required": [
         "code",
         "message"
       ],
+      "dependentSchemas": {
+        "rule": {
+          "properties": {
+            "code": {
+              "const": "rate_limited"
+            }
+          },
+          "required": [
+            "retryAfter"
+          ]
+        }
+      },
       "additionalProperties": true
     }
   },
