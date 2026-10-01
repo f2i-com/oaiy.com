@@ -26,6 +26,10 @@ test('4.18.5 transient database errors are told apart from the relay\'s own mist
         ['08004', 1040, 'Too many connections'], ['HY000', 1053, 'Server shutdown in progress'], ['HY000', 2002, 'Connection refused'], ['HY000', 2003, "Can't connect"],
         ['HY000', 1203, 'User has more than max_user_connections active connections'], ['HY000', 10, 'disk I/O error'], ['HY000', 13, 'database or disk is full'],
         ['HY000', 14, 'unable to open database file'], ['HY000', 0, 'SQLSTATE[HY000]: General error: 2006 MySQL server has gone away'],
+        // Two codes with nothing in their message that the message rules would catch, so that only the code list can be what says so:
+        // ER_QUERY_INTERRUPTED (a KILL QUERY, or the server's own timeout, mid-statement) and CR_SERVER_LOST_EXTENDED (the connection lost
+        // with the system error appended, which a client library words its own way).
+        ['70100', 1317, 'interrupted'], ['HY000', 2055, 'worded by the client library'],
     ];
     foreach ($transient as [$s, $c, $m]) {
         eq(true, Db::isTransient($mk($s, $c, $m)), "$c $m");

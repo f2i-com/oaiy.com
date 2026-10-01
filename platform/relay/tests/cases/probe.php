@@ -147,8 +147,12 @@ test('SP-01 probe: a streamed answer starts at once, the chunks arrive a second 
     eq(200, $r['status']);
     contains('text/event-stream', $r['headers']['content-type']);
     eq('no', $r['headers']['x-accel-buffering']);
-    // The property is that the first byte does not wait for the stream to end or for the first second to pass: a host that buffers delivers it
-    // after the last chunk (about three seconds), so under a second tells a flushing host from one that does not, busy machine or not.
+    // The property is that the first byte does not wait for the stream to end or for the first second to pass. The answer flushes `retry:`
+    // and `: connected` at once and its first keepalive comes a second later, so a first byte before 0.9 s can only be the first flush,
+    // and a host that buffers delivers it after the last chunk (about three seconds). The bound was 0.5 s and a machine that was busy with
+    // other work measured 0.50064 s: starting a process and the first request is not what is tested here. 0.9 is under the first second's
+    // gap (the earliest anything but the first flush can arrive), above the time a busy machine takes to answer a request that flushes at
+    // once, and far from the three seconds of a host that buffers: it tells a flushing host from one that does not, busy machine or not.
     ok($r['ttfb'] < 0.9, 'first byte in ' . $r['ttfb']);
     $at = array_map(static fn($a) => $a[0], $r['arrivals']);
     ok(count($at) >= 4, 'at least four separate arrivals, got ' . count($at));

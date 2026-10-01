@@ -578,7 +578,7 @@ test('4.7.2 rule 4: a consumer poll and the same device\'s lookups are independe
     eq(['granted' => true], $p['json']['hold'], 'the lookup did not end the poll');
 });
 
-test('4.7.2 rule 5: a credential has at most three polls that wait running at once, the ones being superseded included: the fourth is 429 rate_limited with Retry-After 1 before anything is read or written, and takes no place', function () {
+test('4.7.2 rule 5: a credential has at most three polls that wait running at once, the ones being superseded included: the fourth is 429 rate_limited with Retry-After 1 before the poll reads or writes anything of its own (the credential\'s check came first), and takes no place', function () {
     $r = Relay::make(['wait' => ['max' => 8], 'capacity' => ['workers' => 20]]);
     $d = $r->desktop();
     $phone = $r->phone($d);
@@ -686,8 +686,9 @@ test('4.7.2 rule 5: eight polls of one credential that arrive together are not a
             $granted++;
         }
     }
-    ok($granted <= 3, "$granted of 8 simultaneous polls ran: at most three of one credential may");
+    ok($granted >= 1 && $granted <= 3, "$granted of 8 simultaneous polls ran: at least one must (a bound that refuses all of them is a different bug), and at most three of one credential may");
     ok($refused >= 5, "$refused of 8 were refused");
+    eq(8, $granted + $refused, 'every one of the eight was answered, one way or the other');
     eq(0, holds_count($r));
 });
 

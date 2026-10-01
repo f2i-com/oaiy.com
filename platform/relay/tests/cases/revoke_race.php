@@ -56,7 +56,7 @@ test('4.5 a native post whose sender was revoked after it was authenticated and 
     eq($boxes, (int)$ctx->db->val('SELECT COUNT(*) FROM mailboxes'), 'and no mailbox was made');
 });
 
-test('4.5 a post to a device revoked after the ACL passed does not make its mailbox again: not_found, nothing stored; a revoked sender is 401 revoked; a repeat of a post that went in before is still a duplicate', function () {
+test('4.5 a post to a device revoked after the ACL passed does not make its mailbox again: not_found, nothing stored; a revoked sender is 401 revoked; a repeat of a post that went in before, while its device is active, is still a duplicate (the check inside the transaction did not change that)', function () {
     $r = Relay::make();
     $d = $r->desktop();
     $prov = $r->provider();
@@ -67,6 +67,9 @@ test('4.5 a post to a device revoked after the ACL passed does not make its mail
     };
     $first = $ctx->mb->post($d->inbox(), 'cmd', 'c1', $prov->id, 60, '{}', null, null, 'x', false, $guard);
     eq('queued', $first['status']);
+    $again = $ctx->mb->post($d->inbox(), 'cmd', 'c1', $prov->id, 60, '{}', null, null, 'x', false, $guard);
+    eq('duplicate', $again['status'], 'the same sender and id again, to a device that is active, is a duplicate and not a second item');
+    eq(1, (int)$ctx->db->val("SELECT COUNT(*) FROM items WHERE sender = ? AND id = 'c1'", [$prov->id]), 'and stored once');
     Devices::revoke($ctx, $d->id); // the desktop is revoked: its inbox is purged
     eq(0, (int)$ctx->db->val('SELECT COUNT(*) FROM mailboxes WHERE id = ?', [$d->inbox()]), 'the revocation removed the inbox');
     $err = null;

@@ -13,7 +13,8 @@ use OaiyTest\Tmp;
  * What one party can make a small host do with streams and frames waits (design 9.2, "fifty parallel ... streams from one principal
  * leave /v1/health answering in under a second and never exceed the per-principal bounds"). A hold pins a worker for as long as it
  * waits, and a stream that a newer one of the same party supersedes still pins its worker for a step; so a burst of them from one
- * bearer, however many admissions it has minted, must be refused cheaply, before the database is touched.
+ * bearer, however many admissions it has minted, must be refused cheaply, before the request does any database work of its own (a stream
+ * is refused after one read of a bucket's row, a native poll after the check of its credential).
  *
  * The slow tests put a pool of W workers (Pool: W `php -S` servers behind a front that queues, as PHP-FPM's accept queue does) between
  * the requests and the relay, so a health check that finds every worker busy waits its turn. A request costs a worker about 50 ms
@@ -291,6 +292,11 @@ test('9.2 a party has at most three streams or frames waits running at once, the
 });
 
 test('9.2 the stream opens of one party are a bucket (Holds::OPEN_BUCKET, refilled Holds::OPEN_REFILL_PER_S a second), whatever admissions it holds: 429 with Retry-After, judged before the admission\'s own bucket and without a write, and a retry after the carriers\' one second pause is let through even when another open took a token meanwhile', function () {
+    // The numbers are pinned, not read back from the constants: 20 opens, refilled three a second, is the design (the README's
+    // Interpretation 53 gives the reasoning: the shipped carriers give a session up after three failed opens a second apart, so a bucket that
+    // holds fewer or refills slower fails them on the bucket alone, and one that holds more lets a hostile party pin a pool), and a change
+    // to either is a decision to make with the README and the conformance check, not a refactor that every test below would follow.
+    eq([20, 3], [Holds::OPEN_BUCKET, Holds::OPEN_REFILL_PER_S], 'the bucket of stream opens and its refill');
     $bucket = Holds::OPEN_BUCKET;
     $refill = Holds::OPEN_REFILL_PER_S;
     $k = AokieRig::make();

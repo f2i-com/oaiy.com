@@ -548,3 +548,22 @@ test('4.18.8 Fs::createPrivate makes a missing database file, keeps an existing 
         eq('0600', $mode($dir . '/wide.sqlite'), 'a wider one is narrowed');
     }
 });
+
+test('4.18.8 Fs::createPrivate gives the process its umask back, after a file it made and after one it could not make (the umask is the whole process\'s: a thread or a later file that met 0177 would be wrong)', function () {
+    if (DIRECTORY_SEPARATOR !== '/') {
+        skip('a umask is a POSIX notion: the Windows CRT keeps only a read-only bit of it');
+    }
+    $dir = Tmp::dir('priv-umask');
+    $old = umask(022);
+    try {
+        Fs::createPrivate($dir . '/made.sqlite');
+        eq(022, umask(022), 'after a file it made');
+        Fs::createPrivate($dir . '/made.sqlite');
+        eq(022, umask(022), 'after one that was there already');
+        Fs::createPrivate($dir . '/no-such-folder/never.sqlite'); // cannot be made: nothing is thrown, and the umask is still given back
+        eq(022, umask(022), 'after a file it could not make');
+        ok(!is_file($dir . '/no-such-folder/never.sqlite'));
+    } finally {
+        umask($old);
+    }
+});

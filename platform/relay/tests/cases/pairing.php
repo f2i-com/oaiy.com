@@ -506,6 +506,51 @@ final class PairingTestRecordingStatement extends PDOStatement
     }
 }
 
+/**
+ * A connection that remembers every statement of every kind: the prepared ones (through the statement class), and what the relay runs with
+ * exec() and query(), which is where a transaction's BEGIN IMMEDIATE, START TRANSACTION, COMMIT and ROLLBACK go and which a statement class
+ * never sees (a request that opened and closed an empty transaction, work that costs a lock and shows in no timing sample, was invisible).
+ */
+final class PairingTestRecordingPdo extends PDO
+{
+    #[\ReturnTypeWillChange]
+    public function exec($statement)
+    {
+        PairingTestRecordingStatement::$log[] = (string)$statement;
+        return parent::exec($statement);
+    }
+
+    #[\ReturnTypeWillChange]
+    public function query($query, $fetchMode = null, ...$fetchModeArgs)
+    {
+        PairingTestRecordingStatement::$log[] = (string)$query;
+        return $fetchMode === null ? parent::query($query) : parent::query($query, $fetchMode, ...$fetchModeArgs);
+    }
+}
+
+/** Replace the relay's connection of $ctx by a recording one to the same database, set up as Db sets its own up. */
+function pairing_record_statements(Oaiy\Relay\Context $ctx): void
+{
+    $db = $ctx->db;
+    $c = $db->config()->db();
+    $opts = [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC, PDO::ATTR_EMULATE_PREPARES => false];
+    if ($db->driver === 'mysql') {
+        $opts += [PDO::ATTR_TIMEOUT => 5, PDO::MYSQL_ATTR_FOUND_ROWS => true, PDO::MYSQL_ATTR_INIT_COMMAND => "SET NAMES utf8mb4 COLLATE utf8mb4_bin, time_zone = '+00:00', "
+            . "sql_mode = 'STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION', innodb_lock_wait_timeout = 5"];
+        $pdo = new PairingTestRecordingPdo((string)$c['dsn'], $c['user'], $c['pass'], $opts);
+    } else {
+        $pdo = new PairingTestRecordingPdo('sqlite:' . $db->sqlitePath(), null, null, $opts + [PDO::ATTR_STRINGIFY_FETCHES => false]);
+        foreach (['PRAGMA busy_timeout = 5000', 'PRAGMA foreign_keys = ON', 'PRAGMA synchronous = NORMAL'] as $sql) {
+            $pdo->exec($sql);
+        }
+    }
+    $pdo->setAttribute(PDO::ATTR_STATEMENT_CLASS, [PairingTestRecordingStatement::class]);
+    $prop = new ReflectionProperty(Oaiy\Relay\Db::class, 'pdo');
+    $prop->setAccessible(true);
+    $prop->setValue($db, $pdo);
+    PairingTestRecordingStatement::$log = [];
+}
+
 test('4.10.3 step 2: an unknown pid, an expired one and a burned one do the same work: the same statements, in the same order (the property that the timing of the next test is a sample of, and which no busy machine can blur)', function () {
     [$r, $d, $c] = pair_setup();
     $c->open([], 5);
@@ -520,8 +565,7 @@ test('4.10.3 step 2: an unknown pid, an expired one and a burned one do the same
     }
     foreach (['unknown' => $unknown->pid, 'expired' => $c->pid, 'burned' => $burned->pid] as $what => $pid) {
         $ctx = $r->ctx();
-        $ctx->db->pdo()->setAttribute(PDO::ATTR_STATEMENT_CLASS, [PairingTestRecordingStatement::class]);
-        PairingTestRecordingStatement::$log = [];
+        pairing_record_statements($ctx);
         $res = $r->onContext($ctx, fn() => $r->call(null, 'GET', '/v1/pair/' . $pid, null, [], [], ['REMOTE_ADDR' => '198.51.100.' . strlen($what)]));
         eq(404, $res['status'], $what . ': ' . $res['body']);
         $statements[$what] = PairingTestRecordingStatement::$log;
@@ -530,6 +574,13 @@ test('4.10.3 step 2: an unknown pid, an expired one and a burned one do the same
     }
     eq($statements['unknown'], $statements['expired'], 'an expired pid does what an unknown one does');
     eq($statements['unknown'], $statements['burned'], 'a burned pid does what an unknown one does');
+    // The recorder is not blind to a transaction that does nothing: an empty write is the BEGIN and the COMMIT, and both are in the log
+    // (a request that took the write lock for nothing would otherwise differ from the others in no statement and no timing sample).
+    $ctx = $r->ctx();
+    pairing_record_statements($ctx);
+    $ctx->db->write(static function (): void {
+    });
+    eq($ctx->db->driver === 'mysql' ? ['START TRANSACTION', 'COMMIT'] : ['BEGIN IMMEDIATE', 'COMMIT'], PairingTestRecordingStatement::$log, 'an empty write is its BEGIN and its COMMIT, and the recorder sees them');
 });
 
 test('4.10.3 step 2: the timing of an unknown pid and of an expired one is the same (the same lookup, no extra work either way): the medians of interleaved samples agree within a tolerance, in at least one of five rounds, so that a machine that is busy with something else does not decide it', function () {
