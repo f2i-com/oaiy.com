@@ -775,6 +775,8 @@ fn is_privileged_path(method: &Method, path: &str) -> bool {
                 || is_personal_path(path)
                 || is_control_path(path)
                 || is_engine_control_path(path)
+                // The Agent page handing its storage over to a backup a session the desktop opened.
+                || crate::backup::routes::is_backup_path(path)
         }
         Method::PATCH => is_personal_path(path),
         // PUT is only used by the bridge (flow documents). A flow doc is
@@ -1128,7 +1130,9 @@ fn is_ai_exec_path(path: &str) -> bool {
 /// It's the read-twin of the privileged `add_service` POST, so it's gated like a privileged read
 /// (trusted origin or token) rather than left on the open GET surface.
 fn is_export_path(path: &str) -> bool {
-    path.starts_with("/api/services/") && path.ends_with("/export")
+    (path.starts_with("/api/services/") && path.ends_with("/export"))
+        // The storage a restore left for the Agent page (whole conversations): its own page, the dashboard, or a token.
+        || (crate::backup::routes::is_backup_path(path) && !crate::backup::routes::is_status_path(path))
 }
 
 /// GET reads that expose process output / absolute paths (the OS username via the data-dir path)
@@ -1141,6 +1145,8 @@ fn is_restricted_read_path(path: &str) -> bool {
         || path == "/api/node"
         || path == "/api/node/logs"
         || (path.starts_with("/api/services/") && path.ends_with("/logs"))
+        // When the last backup was made and whether a restore waits: for OAIY's own pages.
+        || crate::backup::routes::is_status_path(path)
         // Bridge/plugin reads carry real data an arbitrary remote page must not
         // scrape cross-origin: events hold plugin-supplied payloads (for Aokie,
         // caller phone numbers and message bodies), runs hold flow inputs and
@@ -1562,6 +1568,8 @@ pub async fn serve(
     // before `registry` is moved into AppState below.
     let registry_for_ai = registry.clone();
     let registry_for_voice = registry.clone();
+    // The backup routes (its status, and the Agent page handing over its storage) work on the data folder.
+    let backup_data_dir = registry.lock().map(|r| r.data_dir().to_path_buf()).unwrap_or_else(|_| std::env::temp_dir().join("oaiy-backup-unavailable"));
     // The calendar lives in the data folder, beside the flows it may defer to.
     if let Ok(dir) = registry.lock().map(|r| r.data_dir().to_path_buf()) {
         crate::calendar::init(&dir);
@@ -1698,6 +1706,7 @@ pub async fn serve(
         .merge(crate::agent_tasks::router())
         // Whether a newer release exists: read-only status, and a rate-limited check (never a download or an install).
         .merge(crate::update::routes::router(updater))
+        .merge(crate::backup::routes::router(backup_data_dir))
         .merge(setup_routes)
         .route("/api/engines", axum::routing::get(engines_status))
         .route("/api/engines/catalog", axum::routing::get(engines_catalog))
@@ -1818,6 +1827,23 @@ mod tests {
         privileged_allowed, AuthConfig, ModelDownloadRequest,
     };
     use axum::http::Method;
+
+    #[test]
+    fn token_eq_compares_the_whole_token() {
+        let want = "0123456789abcdef0123456789abcdef";
+        assert!(super::token_eq(want, want));
+        // The same length, one character different at the start, in the middle and at the end; every character different.
+        for wrong in ["1123456789abcdef0123456789abcdef", "0123456789abcdee0123456789abcdef", "0123456789abcdef0123456789abcdee", "fedcba9876543210fedcba9876543210", "00000000000000000000000000000000"] {
+            assert!(!super::token_eq(want, wrong), "{wrong}");
+        }
+        // Other lengths: a prefix, a longer one, and none.
+        for wrong in ["0123456789abcdef0123456789abcde", "0123456789abcdef0123456789abcdef0", "", "0"] {
+            assert!(!super::token_eq(want, wrong), "{wrong:?}");
+        }
+        assert!(!super::token_eq(want, ""));
+        // Two empty ones are equal: a caller refuses an empty token itself (see `token_matches`).
+        assert!(super::token_eq("", ""));
+    }
 
     #[test]
     fn network_listener_requires_a_nonempty_token() {
@@ -2037,6 +2063,50 @@ mod tests {
         for f in scanned.iter().filter(|f| f.file.starts_with("ring/routes.rs") || f.file.starts_with("messages/routes.rs")) {
             assert!(routes.iter().any(|(m, p, _)| m.as_str() == f.verb.as_str() && *p == f.pattern), "{} {} ({}:{}) has no line in this test: is its row in `auth/routes.rs` the scope of its kind?", f.verb.as_str(), f.pattern, f.file, f.line);
         }
+    }
+
+    /// The encrypted backup's eight routes (`backup/routes.rs`) have a row each in the access table, and each is `since: 1` (the routes exist, and `legacy`
+    /// mode keeps the guard they were built with, the lines of `is_backup_path`): the status is `system.read`, beside the update status, and the seven of
+    /// the Agent page's hand-over of its own storage are `agent.serve`, which the `agent` and `owner` presets hold and no other does; none of the
+    /// scopes is dangerous (none of the routes restores or overwrites a setting: what a restore brings back is prepared from files the owner looked at and
+    /// ticked, and applied by the desktop at its next start). The scoped CORS answers a paired page's preflight for each method and no page that has not
+    /// paired. Every route `backup/routes.rs` registers is one of those, and every one of those is registered there.
+    #[test]
+    fn the_backups_routes_take_the_scope_of_their_kind_and_the_scoped_cors_lets_a_paired_page_use_them() {
+        use crate::auth::presets::{Preset, ALL_PRESETS};
+        use crate::auth::routes::{pattern_existed_before, route_class, Class};
+        use crate::auth::scopes::ScopeSet;
+        let paired: std::collections::BTreeSet<String> = ["https://app.oaiy.com".to_string()].into();
+        let routes = [
+            (Method::GET, "/api/backup/status", "system.read"),
+            (Method::POST, "/api/backup/agent/:id/part", "agent.serve"),
+            (Method::POST, "/api/backup/agent/:id/done", "agent.serve"),
+            (Method::GET, "/api/backup/agent-import", "agent.serve"),
+            (Method::GET, "/api/backup/agent-import/:id/part/:index", "agent.serve"),
+            (Method::POST, "/api/backup/agent-import/:id/undo-part", "agent.serve"),
+            (Method::POST, "/api/backup/agent-import/:id/undo-done", "agent.serve"),
+            (Method::POST, "/api/backup/agent-import/:id/done", "agent.serve"),
+        ];
+        for (method, pattern, scope) in &routes {
+            assert_eq!(route_class(method, pattern), Class::Scope(scope), "{method} {pattern}");
+            assert!(pattern_existed_before(pattern), "{pattern}: the guard these routes were built with is the one `legacy` mode keeps");
+            assert!(!ScopeSet::of(&[*scope]).has_dangerous(), "{scope}: no route of the backup is behind a dangerous scope");
+            let cors = crate::auth::cors::decide(method, Some(pattern), Some("https://app.oaiy.com"), &paired, false);
+            assert_eq!(cors.get("access-control-allow-origin"), Some("https://app.oaiy.com"), "{method} {pattern}: a paired page's preflight is answered");
+            assert!(cors.get("access-control-allow-methods").is_some_and(|m| m.split(", ").any(|m| m == method.as_str())), "{method} {pattern}: {:?}", cors.get("access-control-allow-methods"));
+            assert!(crate::auth::cors::decide(method, Some(pattern), Some("https://evil.example"), &paired, false).is_empty(), "{method} {pattern}: a page that has not paired gets nothing");
+        }
+        // Who holds them: the Agent's hand-over is for the Agent page and the owner alone, the status is for whoever may read the system.
+        let holders = |scope: &str| ALL_PRESETS.iter().copied().filter(|p| p.scopes().contains(scope)).collect::<Vec<Preset>>();
+        assert_eq!(holders("agent.serve"), [Preset::Owner, Preset::Agent]);
+        assert_eq!(holders("system.read"), [Preset::Owner, Preset::Cli, Preset::CliAdmin, Preset::Readonly]);
+        // The routes of the table are the routes of the module, both ways (a route added to `backup/routes.rs` needs its row and its line here).
+        let ours: std::collections::BTreeSet<(String, String)> = routes.iter().map(|(m, p, _)| (m.as_str().to_string(), p.to_string())).collect();
+        let module: std::collections::BTreeSet<(String, String)> = crate::backup::routes::ROUTES.iter().map(|(m, p)| (m.to_string(), p.to_string())).collect();
+        assert_eq!(ours, module, "the routes `backup/routes.rs` lists are the ones this test holds to the table");
+        let scanned = crate::auth::route_coverage::scan_main_router().found;
+        let registered: std::collections::BTreeSet<(String, String)> = scanned.iter().filter(|f| f.file.starts_with("backup/routes.rs")).map(|f| (f.verb.as_str().to_string(), f.pattern.clone())).collect();
+        assert_eq!(registered, ours, "the routes `backup/routes.rs` registers are the ones this test holds to the table");
     }
 
     /// Every HTTP method the dashboard's and the Agent's sources send to this API (`method: 'PATCH'`; tests excluded). Read at test time, so a
@@ -2403,6 +2473,78 @@ mod tests {
         }
         assert!(!is_restricted_read_path("/api/mcpx"));
         assert!(!is_restricted_read_path("/api/controls"));
+    }
+
+    #[test]
+    fn the_backup_routes_take_the_strict_gates_and_only_the_status_is_a_plain_read() {
+        // Everything that carries a session's bytes is a privileged change.
+        for path in [
+            "/api/backup/agent/abc/part",
+            "/api/backup/agent/abc/done",
+            "/api/backup/agent-import/abc/undo-part",
+            "/api/backup/agent-import/abc/undo-done",
+            "/api/backup/agent-import/abc/done",
+        ] {
+            assert!(is_privileged_path(&Method::POST, path), "POST {path} must be privileged");
+        }
+        // The status is a restricted read; what carries the Agent's storage is an export read
+        // (its own window's origin or a token, never a loopback page in a release build).
+        assert!(is_restricted_read_path("/api/backup/status") && !super::is_export_path("/api/backup/status"));
+        for path in ["/api/backup/agent-import", "/api/backup/agent-import/abc/part/0"] {
+            assert!(super::is_export_path(path), "GET {path} must be an export read");
+        }
+        assert!(!super::is_export_path("/api/backupx") && !is_restricted_read_path("/api/backupx/status"));
+        // What the vault design reserved under `/api/backup` is not this module's: its paths are not claimed by any of the three gates
+        // (the design's rows in the access table judge them when they exist).
+        for path in ["/api/backup", "/api/backup/catalog", "/api/backup/jobs/abc", "/api/backup/config", "/api/backup/run", "/api/backup/restore", "/api/backup/rollback", "/api/backup/verify", "/api/backup/identity", "/api/backup/create", "/api/backup/webview-import", "/api/backup/webview/abc/part"] {
+            assert!(!crate::backup::routes::is_backup_path(path), "{path} is not a route of the backup module");
+            assert!(!is_privileged_path(&Method::POST, path) && !super::is_export_path(path) && !is_restricted_read_path(path), "{path} is not claimed by the backup's gates");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stranger_cannot_reach_the_backup_routes_and_the_agents_page_can() {
+        let dir = crate::secret_file::testing::TempDir::new("backup-guard");
+        let app = super::guarded_for_tests(crate::backup::routes::router(dir.0.clone()), Some("desk-token".into()), true);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        for origin in [Some("null"), Some("http://evil.example"), None] {
+            let mut post = client.post(format!("{base}/api/backup/agent/abc/part?seq=0")).body("x");
+            let mut import = client.get(format!("{base}/api/backup/agent-import"));
+            let mut status = client.get(format!("{base}/api/backup/status"));
+            if let Some(origin) = origin {
+                post = post.header("Origin", origin);
+                import = import.header("Origin", origin);
+                status = status.header("Origin", origin);
+            }
+            assert_eq!(post.send().await.unwrap().status(), 403, "POST {origin:?}");
+            assert_eq!(import.send().await.unwrap().status(), 403, "GET import {origin:?}");
+            assert_eq!(status.send().await.unwrap().status(), 403, "GET status {origin:?}");
+        }
+        // The Agent's page (its own scheme) passes the gate; the session does not exist, so the answer is the route's own.
+        let own = client.post(format!("{base}/api/backup/agent/abc/part?seq=0")).header("Origin", "http://oaiy.localhost").body("x").send().await.unwrap();
+        assert_eq!(own.status(), 404);
+        // ... but the description of an import needs the secret the desktop gave the Agent's window as well: the origin alone gets 403.
+        let import = client.get(format!("{base}/api/backup/agent-import")).header("Origin", "http://oaiy.localhost").send().await.unwrap();
+        assert_eq!(import.status(), 403, "an origin is not enough");
+        let import = client.get(format!("{base}/api/backup/agent-import")).header("Origin", "http://oaiy.localhost").header("X-Backup-Token", crate::backup::agent::page_token()).send().await.unwrap();
+        assert_eq!(import.status(), 200);
+        // A paired or configured token, and the linked provider's own site, pass the guard but are not the Agent's page.
+        let token_only = client.get(format!("{base}/api/backup/agent-import")).bearer_auth("desk-token").send().await.unwrap();
+        assert_eq!(token_only.status(), 403, "a token with no origin");
+        let token_post = client.post(format!("{base}/api/backup/agent/abc/part?seq=0")).bearer_auth("desk-token").body("x").send().await.unwrap();
+        assert_eq!(token_post.status(), 403);
+        let provider = client.get(format!("{base}/api/backup/agent-import")).header("Origin", "https://oaiy.com").send().await.unwrap();
+        assert_eq!(provider.status(), 403, "the provider's site");
+        // The dashboard reads the status.
+        let status = client.get(format!("{base}/api/backup/status")).header("Origin", "http://tauri.localhost").send().await.unwrap();
+        assert_eq!(status.status(), 200);
+        // A token holder gets in too.
+        let token = client.get(format!("{base}/api/backup/status")).bearer_auth("desk-token").send().await.unwrap();
+        assert_eq!(token.status(), 200);
+        server.abort();
     }
 
     #[tokio::test]

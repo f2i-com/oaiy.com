@@ -315,8 +315,10 @@ fn flush_script(nonce: &str) -> String {
     )
 }
 
-/// Ask the Agent page to save its work, and wait a little for its word. No page, no answer or an error: the install goes on.
-fn flush_agent(app: &AppHandle, updater: &UpdaterHandle) {
+/// Ask the Agent page to save its work, and wait a little for its word (up to [`FLUSH_TIMEOUT`]). No page, no answer or an error:
+/// what follows goes on. A restart that applies a restore asks the same way (`backup::commands`), so the page saves before
+/// OAIY stops for either.
+pub(crate) fn flush_agent(app: &AppHandle, updater: &UpdaterHandle) {
     let Some(webview) = crate::embed::agent_webview(app) else {
         log::info!("update: the Agent page is not open; nothing to save");
         return;

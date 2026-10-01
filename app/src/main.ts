@@ -25,6 +25,7 @@ import { pluginSessionTools, type PluginToolAudience } from './desktop/pluginToo
 import { TRANSCRIBE_TOOL, transcribeTool } from './desktop/transcribe';
 import { calendarTools } from './desktop/calendarTools';
 import { flowBuilderTools } from './desktop/flowBuilder';
+import { applyPendingRestore, installBackupHooks, opfsStorage } from './desktop/backup';
 import { answeringOn, installIntents } from './desktop/intents';
 import { ControlClient, withControlTools } from './desktop/mcp';
 import { ENGINE, codexDefaultModel, modelChipText, providerFor, readAgentModel, sameModel, type AgentKind, type AgentModel } from './desktop/agentModel';
@@ -100,9 +101,11 @@ A coding agent that lives entirely in this browser tab.
  */
 /** The desktop app (Tauri): it serves the page with the headers itself, and ships its files, so no service worker. */
 /** The desktop OAIY's window gives its pages: where it is, and a token for it. */
-function embeddedDesktop(): { origin: string; token: string } | null {
-  const given = (window as unknown as { __OAIY_DESKTOP__?: { origin?: unknown; token?: unknown } }).__OAIY_DESKTOP__;
-  return given && typeof given.origin === 'string' && typeof given.token === 'string' && given.token ? { origin: given.origin, token: given.token } : null;
+function embeddedDesktop(): { origin: string; token: string; backupToken?: string } | null {
+  const given = (window as unknown as { __OAIY_DESKTOP__?: { origin?: unknown; token?: unknown; backupToken?: unknown } }).__OAIY_DESKTOP__;
+  if (!given || typeof given.origin !== 'string' || typeof given.token !== 'string' || !given.token) return null;
+  // The desktop's own secret for a restore's requests (backup.ts): only this page is given it.
+  return { origin: given.origin, token: given.token, ...(typeof given.backupToken === 'string' && given.backupToken ? { backupToken: given.backupToken } : {}) };
 }
 
 // Which window this is, read once as the page loads (shared/capabilities/host.ts): OAIY's own window (given the desktop, or served from OAIY's own
@@ -162,6 +165,10 @@ async function main(): Promise<void> {
     return;
   }
   if (crossOriginIsolated) void registerServiceWorker();
+  // A restore staged in OAIY Desktop's Settings (Backup and restore) is put into this page's storage first, before its
+  // settings and projects are read. Never throws, and does nothing when none waits or the desktop is not there.
+  const restoring = embeddedDesktop();
+  if (restoring) await applyPendingRestore(restoring, opfsStorage());
   const settings = await loadSettings();
   const gate = new NetGate(settings.gate);
   let saveGateTimer: ReturnType<typeof setTimeout> | null = null;
@@ -2365,6 +2372,18 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       setupWithAgent: async () => {
         await followAgentModel(3000);
         await openSetup();
+      },
+    });
+    // OAIY Desktop's backup asks this page for its conversations and projects (desktop/backup.ts): what is pending is
+    // written out first, so the backup has the latest, and a running agent is not stopped.
+    installBackupHooks({
+      desktop: given,
+      storage: opfsStorage(),
+      flush: async () => {
+        editor.flush();
+        await project.flush();
+        if (frontDesk !== project) await frontDesk.flush();
+        await project.saveChat(agent.savedTurns());
       },
     });
   }

@@ -1,0 +1,1970 @@
+//! Restoring a backup: look, stage, apply at the next start, and undo.
+//!
+//! A restore is never done in place. It goes in three steps, and the first two change nothing that
+//! is live:
+//!
+//! 1. **Look** ([`inspect`]): decrypt the file, check every item against its manifest, and say per
+//!    category what restoring would add, replace and leave alone, what the backup lacks, and what
+//!    the person will have to do again because credentials are never in a backup.
+//! 2. **Stage** ([`stage`]): unpack the items into `<data>/restore/pending-<id>/` (every name is
+//!    checked first: nothing that leaves its folder, nothing on a drive, no duplicates, nothing a
+//!    backup never holds, within the size and count limits and the free space), then write the
+//!    marker `<data>/restore/pending.json`. Writing the marker is what commits the step.
+//! 3. **Apply** ([`apply_pending`]): at the next start, before any store is opened, each staged file
+//!    is put in place with an atomic rename, the file it replaces having been moved (not copied)
+//!    into `<data>/restore/undo-<id>/` first. A journal is written before every step. Any failure
+//!    puts everything back and is reported on the next start. The marker is removed last.
+//!
+//! The undo snapshot is taken at apply time by moving, not at staging time by copying: what is
+//! saved is exactly what the restore replaced, even if the app changed a file between the person
+//! asking and the restart, and nothing is copied twice. The last two snapshots are kept.
+//! [`stage_undo`] stages putting the newest one back (and removing what the restore added), by the
+//! same three steps. A restore never touches anything a backup does not hold, and never a
+//! credential: those are not in a backup, and a file that says otherwise is refused.
+
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use super::manifest::{Entry, Manifest};
+use super::parts::NoteBook;
+use super::review::{self, ClassInfo, Local, RestoreClass, ReviewItem, Ticks};
+use super::rules::{self, Category, Excluded};
+use super::{agent, agentzip, container, free_space, restore_dir, Budget, scratch_dir, sha256_file, BackupError, ErrorKind, Limits, Result, TempFolder, AGENT_ENTRY};
+use crate::secret_file;
+
+pub const KIND_RESTORE: &str = "restore";
+pub const KIND_UNDO: &str = "undo";
+
+/// How many undo snapshots are kept.
+const KEEP_UNDO: usize = 2;
+
+/// How long a prepared restore (or undo) waits for its restart. After this it is thrown away at the
+/// next start, unapplied: what it would replace may have changed, and the person may no longer
+/// remember choosing it.
+pub const STAGED_LIFETIME_HOURS: i64 = 24;
+/// Room to leave on the disk beyond what a restore needs.
+const MARGIN: u64 = 32 << 20;
+
+/// What restoring does, and what the caller chooses about how it is checked.
+#[derive(Clone)]
+pub struct RestoreOptions {
+    pub limits: Limits,
+    pub free_space: fn(&Path) -> u64,
+    /// How long looking at or staging a backup may take.
+    pub time_limit: std::time::Duration,
+    /// What is going on in the app now: looking at a backup asks for a second of computing and up to
+    /// a gigabyte of memory, and is not done while a call is live.
+    pub busy: super::busy::Busy,
+    /// The largest Agent storage that is left for its page (which takes no more than this).
+    pub agent_import_max: u64,
+}
+
+impl Default for RestoreOptions {
+    fn default() -> Self {
+        Self { limits: Limits::default(), free_space, time_limit: super::RESTORE_TIME_LIMIT, busy: super::busy::Busy::none(), agent_import_max: agent::IMPORT_MAX }
+    }
+}
+
+impl RestoreOptions {
+    fn budget(&self) -> Budget {
+        Budget::within(self.time_limit)
+    }
+}
+
+// ---- what the dashboard is told -------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CategoryPlan {
+    pub id: String,
+    pub label: String,
+    pub added: u64,
+    pub replaced: u64,
+    pub unchanged: u64,
+    pub left_alone: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Preview {
+    pub file_name: String,
+    pub created_at: String,
+    pub app_version: String,
+    pub platform: String,
+    pub includes_keys: bool,
+    pub categories: Vec<CategoryPlan>,
+    /// Categories the backup does not have.
+    pub lacks: Vec<String>,
+    /// What went less than fully to plan when the backup was made.
+    pub partial: Vec<String>,
+    /// What the backup left out on purpose.
+    pub excluded: Vec<Excluded>,
+    /// What to do again after restoring.
+    pub redo: Vec<String>,
+    pub total_files: u64,
+    pub total_bytes: u64,
+    /// The classes of things that can act, each to be ticked on its own (only those the backup has).
+    pub classes: Vec<ClassInfo>,
+    /// Every item of those classes, by name and by what it does.
+    pub items: Vec<ReviewItem>,
+    /// What the backup holds that is never restored: items the table excludes inside a file that comes
+    /// back (a plugin's address for audio), and every item it does not know ("not restored: unknown item").
+    pub not_restored: Vec<review::NotRestored>,
+    pub keys: KeysInfo,
+    /// What is said about what will be left out or cleaned on the way in.
+    pub notes: Vec<String>,
+}
+
+/// Whether the backup holds API keys (what its record says; the person decides whether they come back).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeysInfo {
+    pub in_backup: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Staged {
+    pub id: String,
+    pub kind: String,
+    pub files: u64,
+    pub bytes: u64,
+    pub agent_storage: bool,
+    pub redo: Vec<String>,
+    /// What was left out, cleaned or dropped, in plain words.
+    pub skipped: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingInfo {
+    pub id: String,
+    pub kind: String,
+    pub staged_at: String,
+    /// When it is thrown away, unapplied, if it has not been applied by then.
+    pub expires_at: String,
+    /// It has waited longer than that: the next start will discard it, and restarting is pointless.
+    pub expired: bool,
+    pub files: u64,
+    pub agent_storage: bool,
+    /// The classes that were ticked.
+    pub classes: Vec<String>,
+    /// The same, as the person reads them (the words of [`RestoreClass::label`]).
+    pub class_labels: Vec<String>,
+}
+
+/// How the last restore or undo went (camelCase).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LastRestore {
+    pub id: String,
+    pub kind: String,
+    pub at: String,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub redo: Vec<String>,
+    /// `applied`, `pending` (waiting for the Agent page), `failed` or `none`.
+    pub agent_storage: String,
+    /// What was left out, cleaned or dropped on the way in.
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+// ---- files kept in <data>/restore ------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MarkerFile {
+    name: String,
+    size: u64,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MarkerAgent {
+    /// The archive left for the page, in the folder the marker names: `agent-storage.zip` (a restore's, rebuilt from
+    /// the backup's) or `agent-undo.zip` (an undo's, rebuilt from the page's own snapshot).
+    #[serde(default = "agent_file")]
+    file: String,
+    size: u64,
+    sha256: String,
+    /// The Agent's own settings were ticked (or, in an undo, they are the person's own).
+    #[serde(default)]
+    apply_settings: bool,
+    /// The API keys were ticked.
+    #[serde(default)]
+    apply_keys: bool,
+    /// An undo: the Agent's files the restore added, to be taken away.
+    #[serde(default)]
+    remove: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Marker {
+    v: u32,
+    id: String,
+    kind: String,
+    staged_at: String,
+    backup_created_at: String,
+    /// The classes that were ticked, and whether the keys were.
+    #[serde(default)]
+    ticked: Vec<String>,
+    #[serde(default)]
+    keys: bool,
+    /// What was left out, cleaned or dropped on the way in.
+    #[serde(default)]
+    notes: Vec<String>,
+    /// The folder in `<data>/restore` the staged files are in: `pending-<id>` or `undo-<id>`.
+    source: String,
+    files: Vec<MarkerFile>,
+    /// Undo: what the restore added, to be taken away again.
+    #[serde(default)]
+    removals: Vec<String>,
+    #[serde(default)]
+    agent: Option<MarkerAgent>,
+    #[serde(default)]
+    redo: Vec<String>,
+    /// The staged files that were merged with the file that was here when the restore was prepared (see [`MarkerMerge`]).
+    #[serde(default)]
+    merges: Vec<MarkerMerge>,
+    bytes: u64,
+}
+
+/// A staged file that was merged with the file that is here (the calendar, the settings of a phone plugin): what it was merged from,
+/// kept as it came in `<source>/theirs/<name>` with its size and SHA-256, and the SHA-256 of the file that was here (none: there was
+/// none). If that file has changed when the restore is applied, the backup's file is merged again with it (see `merge_again`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MarkerMerge {
+    name: String,
+    theirs_size: u64,
+    theirs_sha256: String,
+    #[serde(default)]
+    here_sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UndoRecord {
+    id: String,
+    applied_at: String,
+    backup_created_at: String,
+    /// What made this snapshot: a `restore` (it holds what the restore replaced) or an `undo` (it holds
+    /// what the undo replaced and took away: the redo).
+    #[serde(default = "restore_kind")]
+    kind: String,
+    replaced: Vec<String>,
+    added: Vec<String>,
+}
+
+fn restore_kind() -> String {
+    KIND_RESTORE.to_string()
+}
+
+const AGENT_RESTORE_FILE: &str = "agent-storage.zip";
+const AGENT_UNDO_FILE: &str = "agent-undo.zip";
+
+fn agent_file() -> String {
+    AGENT_RESTORE_FILE.to_string()
+}
+
+/// The Agent's archive that was staged is the one the marker recorded: a plain file of that size with that SHA-256. (The files
+/// staged for the data folder are checked when they are applied; this is the same for the one that is handed to the page.)
+fn verify_staged_agent(zip: &Path, recorded: &MarkerAgent) -> std::result::Result<(), String> {
+    let meta = std::fs::symlink_metadata(zip).map_err(|_| "The staged copy of the Agent's storage is missing".to_string())?;
+    if !meta.is_file() || rules::is_link(&meta) || meta.len() != recorded.size {
+        return Err("The staged copy of the Agent's storage is not what was staged".to_string());
+    }
+    let (sha, _) = sha256_file(zip).map_err(|_| "The staged copy of the Agent's storage could not be read".to_string())?;
+    if sha != recorded.sha256 {
+        return Err("The staged copy of the Agent's storage does not check out".to_string());
+    }
+    Ok(())
+}
+
+fn marker_path(data_dir: &Path) -> PathBuf {
+    restore_dir(data_dir).join("pending.json")
+}
+
+fn journal_path(data_dir: &Path) -> PathBuf {
+    restore_dir(data_dir).join("apply-journal.jsonl")
+}
+
+fn last_result_path(data_dir: &Path) -> PathBuf {
+    restore_dir(data_dir).join("last-result.json")
+}
+
+fn is_id(s: &str) -> bool {
+    s.len() == 16 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
+    serde_json::from_str(std::fs::read_to_string(path).ok()?.trim_start_matches('\u{feff}')).ok()
+}
+
+fn write_json<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    secret_file::write(path, serde_json::to_string_pretty(value).unwrap_or_default())
+}
+
+/// The time, to the millisecond: two restores in one second still tell which is newer.
+fn now() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// Whether a restore staged at `staged_at` (RFC 3339) has waited too long. A time that cannot be read,
+/// or that is well in the future (a clock that was set back, or a record made by hand), counts as expired.
+fn expired(staged_at: &str) -> bool {
+    match chrono::DateTime::parse_from_rfc3339(staged_at) {
+        Ok(at) => {
+            let age = chrono::Utc::now().signed_duration_since(at);
+            age > chrono::Duration::hours(STAGED_LIFETIME_HOURS) || age < -chrono::Duration::hours(1)
+        }
+        Err(_) => true,
+    }
+}
+
+fn expiry_of(staged_at: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(staged_at)
+        .map(|at| (at + chrono::Duration::hours(STAGED_LIFETIME_HOURS)).with_timezone(&chrono::Utc).to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .unwrap_or_else(|_| staged_at.to_string())
+}
+
+impl Marker {
+    /// A marker read from disk is checked before anything is done with it: the folder names are
+    /// ours, and every name passes the checks a backup's names pass.
+    fn check(&self, limits: &Limits) -> std::result::Result<(), String> {
+        if self.v != 1 || !is_id(&self.id) {
+            return Err("the record of the restore is damaged".into());
+        }
+        let expected_source = match self.kind.as_str() {
+            KIND_RESTORE => format!("pending-{}", self.id),
+            KIND_UNDO => match self.source.strip_prefix("undo-") {
+                Some(uid) if is_id(uid) => self.source.clone(),
+                _ => return Err("the record of the restore is damaged".into()),
+            },
+            _ => return Err("the record of the restore is damaged".into()),
+        };
+        if self.source != expected_source {
+            return Err("the record of the restore is damaged".into());
+        }
+        for f in &self.files {
+            self.check_name(&f.name, limits)?;
+        }
+        for r in &self.removals {
+            self.check_name(r, limits)?;
+        }
+        // A file that is merged again is a file of this restore, and only a restore merges (with a name of its own kind).
+        for m in &self.merges {
+            self.check_name(&m.name, limits)?;
+            let category = rules::category_of_backup_entry(&m.name).ok().flatten().map(|(c, _)| c);
+            if self.kind != KIND_RESTORE || !self.files.iter().any(|f| f.name == m.name) || !merged_with_local(&m.name, category) {
+                return Err("the record of the restore is damaged".into());
+            }
+        }
+        if let Some(agent) = &self.agent {
+            if agent.remove.len() > agent::MAX_ADDED || (agent.file != AGENT_RESTORE_FILE && agent.file != AGENT_UNDO_FILE) {
+                return Err("the record of the restore is damaged".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn check_name(&self, name: &str, limits: &Limits) -> std::result::Result<(), String> {
+        container::check_entry_name(name, limits).map_err(|e| e.message)?;
+        if name == AGENT_ENTRY {
+            return Err("the record of the restore is damaged".into());
+        }
+        // Everything that was staged was known to the table when it was staged.
+        match rules::category_of_backup_entry(name) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err("the record of the restore is damaged".to_string()),
+            Err(why) => Err(why),
+        }
+    }
+}
+
+// ---- looking ---------------------------------------------------------------------------------------
+
+/// The state of one place in the data folder that a restore would write to.
+enum Target {
+    Absent,
+    File,
+}
+
+/// Looks at where files would be restored to, remembering each folder's listing.
+struct Targets {
+    listed: HashMap<PathBuf, Option<HashSet<String>>>,
+    /// Whether a folder's listing is kept: not while files are being put in place, which changes them.
+    keep: bool,
+}
+
+impl Targets {
+    /// For looking, when nothing changes.
+    fn new() -> Self {
+        Self { listed: HashMap::new(), keep: true }
+    }
+
+    /// For use while files are being moved: every look lists the folder again.
+    fn fresh() -> Self {
+        Self { listed: HashMap::new(), keep: false }
+    }
+
+    fn names_in(&mut self, dir: &Path) -> Option<&HashSet<String>> {
+        if !self.keep {
+            self.listed.remove(dir);
+        }
+        self.listed
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| std::fs::read_dir(dir).ok().map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().to_lowercase()).collect()))
+            .as_ref()
+    }
+
+    /// Look at where `rel` would go, refusing when something other than a plain file is there or on
+    /// the way: a link is never followed, a folder is never replaced by a file, and a name that
+    /// resolves but is not the name of anything in its folder (an NTFS short name such as
+    /// `PAIRIN~1.JSO`) is an alias for a file the checks on names never saw.
+    fn state(&mut self, data_dir: &Path, rel: &str) -> Result<Target> {
+        let mut cur = data_dir.to_path_buf();
+        let parts: Vec<&str> = rel.split('/').collect();
+        for (i, part) in parts.iter().enumerate() {
+            let parent = cur.clone();
+            cur.push(part);
+            let meta = match std::fs::symlink_metadata(&cur) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Target::Absent),
+                Err(e) => return Err(BackupError::io("Could not look at a place to restore into", &e)),
+            };
+            if self.names_in(&parent).is_some_and(|names| !names.contains(&part.to_lowercase())) {
+                return Err(BackupError::new(ErrorKind::Unsafe, format!("\"{part}\" is a short-name alias for another file, and a restore will not write through one.")));
+            }
+            if rules::is_link(&meta) {
+                return Err(BackupError::new(ErrorKind::Unsafe, "A restore will not go through a symbolic link or junction, and one is in the way."));
+            }
+            let last = i + 1 == parts.len();
+            if last && !meta.is_file() {
+                return Err(BackupError::new(ErrorKind::Conflict, format!("Something other than a file is where \"{rel}\" would be restored.")));
+            }
+            if !last && !meta.is_dir() {
+                return Err(BackupError::new(ErrorKind::Conflict, format!("A file is in the way of where \"{rel}\" would be restored.")));
+            }
+            if last {
+                return Ok(Target::File);
+            }
+        }
+        Ok(Target::Absent)
+    }
+}
+
+/// A test's way to ask whether a place could be restored to.
+#[cfg(test)]
+pub(crate) fn check_target(data_dir: &Path, rel: &str) -> Result<()> {
+    Targets::new().state(data_dir, rel).map(|_| ())
+}
+
+fn redo_of(manifest: &Manifest) -> Vec<String> {
+    let mut seen = HashSet::new();
+    manifest.excluded.iter().filter_map(|e| e.redo.clone()).filter(|r| seen.insert(r.clone())).collect()
+}
+
+/// The most of an item's own file that is read to describe it: 2 MiB. A flow, a template, a trigger list or a
+/// settings file is a few kilobytes; one that is larger is listed as too large to look at, and is not brought back.
+const MAX_REVIEW_BYTES: u64 = 2 << 20;
+
+/// The most of one entry that is read to describe it: a calendar of a busy business is larger than any other file that is
+/// described, and is read up to the largest a JSON file may be.
+fn review_cap(name: &str) -> u64 {
+    if name.eq_ignore_ascii_case("calendar/calendar.json") {
+        16 << 20
+    } else {
+        MAX_REVIEW_BYTES
+    }
+}
+
+/// The most that is read altogether to describe everything in a backup: 128 MiB, where a real backup's flows,
+/// templates, triggers and settings add up to a few megabytes. A backup that would take more to look through is
+/// refused whole, so that looking at a hostile file costs a bounded amount of time and memory.
+const MAX_REVIEW_TOTAL: u64 = 128 << 20;
+
+/// The most items the dry run names as not restored (the rest are counted).
+const MAX_NOT_RESTORED: usize = 300;
+
+/// The most excluded patterns of a backup's record that the dry run names (the rest are counted).
+const MOST_EXCLUDED_NAMED: usize = 300;
+
+/// The most lines of the backup's own list of what it left out (`partial`) or what to do again (`redo`) that the dry run says.
+const MOST_LINES_NAMED: usize = 50;
+
+/// Cut a hostile string to what a panel can show, and a list to a length, with a last line that says how many more there were.
+fn clipped(lines: &[String], count: usize, each: usize) -> Vec<String> {
+    super::parts::lines_of(lines, count, each)
+}
+
+/// The patterns a backup's record says it left out, the first [`MOST_EXCLUDED_NAMED`] with a line that says how many more there were.
+fn excluded_of(manifest: &Manifest) -> Vec<Excluded> {
+    let mut out: Vec<Excluded> = manifest
+        .excluded
+        .iter()
+        .take(MOST_EXCLUDED_NAMED)
+        .map(|e| Excluded { pattern: review::clip(&e.pattern, 200), reason: review::clip(&e.reason, 400), redo: e.redo.as_ref().map(|r| review::clip(r, 400)) })
+        .collect();
+    if manifest.excluded.len() > MOST_EXCLUDED_NAMED {
+        out.push(Excluded { pattern: format!("and {} more", manifest.excluded.len() - MOST_EXCLUDED_NAMED), reason: "left out of this backup, and not listed here".to_string(), redo: None });
+    }
+    out
+}
+
+/// The name an item of the Agent's storage goes by in [`Inspection::restorable`].
+fn agent_item(inner: &str) -> String {
+    format!("{AGENT_ENTRY}#{inner}")
+}
+
+fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, file_name: &str, limits: &Limits, budget: &Budget) -> Result<(Preview, Vec<String>, BTreeSet<String>)> {
+    let manifest = &verified.manifest;
+    let local = rules::plan(data_dir, true);
+    // The Agent's storage is read from its own directory, not from what the backup says of it.
+    let mut agent_described: Option<agentzip::Described> = None;
+    if manifest.entries.iter().any(|e| e.name == AGENT_ENTRY) {
+        let nested = scratch.join("agent-nested.zip");
+        let mut outer = container::open_archive(&verified.plain)?;
+        agentzip::extract(&mut outer, &nested, budget)?;
+        let listing = agentzip::read_listing(&nested, limits);
+        let described = listing.and_then(|l| agentzip::describe(&nested, &l, limits, budget));
+        let _ = std::fs::remove_file(&nested);
+        agent_described = Some(described?);
+    }
+    let in_backup: HashSet<String> = manifest.entries.iter().map(|e| e.name.to_lowercase()).collect();
+    let mut targets = Targets::new();
+    let mut plans: HashMap<Category, CategoryPlan> = HashMap::new();
+    let mut bump = |c: Category, f: &dyn Fn(&mut CategoryPlan)| {
+        let p = plans.entry(c).or_insert_with(|| CategoryPlan { id: c.id().to_string(), label: c.label().to_string(), added: 0, replaced: 0, unchanged: 0, left_alone: 0 });
+        f(p);
+    };
+    let mut not_restored: Vec<review::NotRestored> = Vec::new();
+    let mut unknown_more = 0usize;
+    for entry in &manifest.entries {
+        let Some((category, _)) = rules::category_of_backup_entry(&entry.name).map_err(|why| BackupError::new(ErrorKind::Unsafe, why))? else {
+            // The table does not know it, so it is not restored (default-deny), and it is said so.
+            if not_restored.len() < MAX_NOT_RESTORED {
+                not_restored.push(review::NotRestored { name: review::clip(&entry.name, 200), why: "not restored: unknown item".to_string() });
+            } else {
+                unknown_more += 1;
+            }
+            continue;
+        };
+        if category == Category::Agent {
+            // Merged by the Agent page: files in the backup overwrite files of the same name, nothing is deleted.
+            // How many is what the archive's own directory lists, not what the backup says of itself.
+            let files = agent_described.as_ref().map(|d| d.restorable as u64).unwrap_or(0);
+            bump(category, &|p| p.added += files);
+            continue;
+        }
+        match targets.state(data_dir, &entry.name)? {
+            Target::Absent => bump(category, &|p| p.added += 1),
+            Target::File => {
+                let target = data_dir.join(entry.name.replace('/', std::path::MAIN_SEPARATOR_STR));
+                let same = std::fs::metadata(&target).map(|m| m.len() == entry.size).unwrap_or(false) && sha256_file(&target).map(|(h, _)| h == entry.sha256).unwrap_or(false);
+                if same {
+                    bump(category, &|p| p.unchanged += 1)
+                } else {
+                    bump(category, &|p| p.replaced += 1)
+                }
+            }
+        }
+    }
+    for item in &local.items {
+        if !in_backup.contains(&item.rel.to_lowercase()) {
+            bump(item.category, &|p| p.left_alone += 1);
+        }
+    }
+    let mut categories: Vec<CategoryPlan> = Category::ALL.iter().filter_map(|c| plans.remove(c)).collect();
+    categories.retain(|c| c.added + c.replaced + c.unchanged + c.left_alone > 0);
+    let has: HashSet<&str> = categories.iter().filter(|c| c.added + c.replaced + c.unchanged > 0).map(|c| c.id.as_str()).collect();
+    let lacks: Vec<String> = Category::ALL.iter().filter(|c| !has.contains(c.id())).map(|c| c.label().to_string()).collect();
+
+    // ---- everything that can act, by name and by what it does ----
+    let mut archive = container::open_archive(&verified.plain)?;
+    let here = Local::read(data_dir);
+    // Each item is described the moment it is read and then let go: what is held at any moment is one item, however
+    // many there are. (The service templates are read first for their ids alone, so that a service that starts with
+    // OAIY can be said to have its template in this backup.) What is read altogether is bounded too.
+    let mut read_total = 0u64;
+    let too_much = || BackupError::new(ErrorKind::TooLarge, "This backup holds more things that can run or reconfigure OAIY than can be looked through, so it is refused.");
+    let mut backup_templates: HashSet<String> = HashSet::new();
+    for entry in manifest.entries.iter().filter(|e| e.name.to_lowercase().starts_with("templates/")) {
+        budget.check()?;
+        if let Some(bytes) = container::read_entry(&mut archive, &entry.name, MAX_REVIEW_BYTES)? {
+            read_total += bytes.len() as u64;
+            if read_total > MAX_REVIEW_TOTAL {
+                return Err(too_much());
+            }
+            if let Some(id) = serde_json::from_slice::<serde_json::Value>(&bytes).ok().and_then(|v| v.get("id").and_then(|i| i.as_str().map(str::to_string))) {
+                backup_templates.insert(id);
+            }
+        }
+    }
+    let mut items: Vec<ReviewItem> = Vec::new();
+    for entry in &manifest.entries {
+        budget.check()?;
+        let Ok(Some(standing)) = rules::standing_of_backup_entry(&entry.name) else { continue };
+        let Some(class) = standing.tick else { continue };
+        let first = items.len();
+        if standing.category == Category::Voices {
+            // A voice is an audio file: it is listed by name and size, and never read.
+            items.push(review::describe_voice(class, &entry.name, entry.size));
+        } else {
+            let bytes = container::read_entry(&mut archive, &entry.name, review_cap(&entry.name))?;
+            match &bytes {
+                Some(bytes) => {
+                    read_total += bytes.len() as u64;
+                    if read_total > MAX_REVIEW_TOTAL {
+                        return Err(too_much());
+                    }
+                    items.extend(review::describe(class, &entry.name, bytes, &here, &backup_templates));
+                    if let Some(keys) = standing.keys() {
+                        not_restored.extend(review::keys_not_restored(&entry.name, keys, bytes));
+                    }
+                }
+                None => items.push(review::too_large(class, &entry.name, entry.name.rsplit('/').next().unwrap_or(&entry.name))),
+            }
+        }
+        // (What was made of this entry is marked with it, so that a thing the preview had no room to describe can be left out of a restore.)
+        for item in &mut items[first..] {
+            item.from = Some(entry.name.clone());
+        }
+        if items.len() > review::MAX_REVIEW_ITEMS {
+            return Err(too_much());
+        }
+    }
+    let more = unknown_more + not_restored.len().saturating_sub(MAX_NOT_RESTORED);
+    not_restored.truncate(MAX_NOT_RESTORED);
+    if more > 0 {
+        not_restored.push(review::NotRestored { name: format!("and {more} more"), why: "not restored".to_string() });
+    }
+    let mut agent_names: Vec<String> = Vec::new();
+    let mut agent_dry_notes: Vec<String> = Vec::new();
+    if let Some(described) = agent_described {
+        items.extend(described.items.into_iter().map(|mut item| {
+            item.from = item.from.map(|inner| agent_item(&inner));
+            item
+        }));
+        not_restored.extend(described.not_restored);
+        agent_names = described.names.iter().map(|n| agent_item(n)).collect();
+        agent_dry_notes = described.notes;
+    }
+    if items.len() > review::MAX_REVIEW_ITEMS {
+        return Err(BackupError::new(ErrorKind::TooLarge, "This backup holds more things that can run or reconfigure OAIY than can be looked through, so it is refused."));
+    }
+    // A kind whose items are each long is described in full up to a number of them, and the rest are named; and all the things together say at
+    // most so much (see `parts::cap`). What is only named is not brought back: a restore brings back only what the dry run described.
+    let capped = super::parts::cap(items);
+    let (items, not_described) = (capped.items, capped.not_brought_back);
+    let classes: Vec<ClassInfo> = RestoreClass::ALL
+        .iter()
+        .filter_map(|c| {
+            let count = items.iter().filter(|i| i.class == *c).count();
+            (count > 0).then(|| ClassInfo { id: c.id().to_string(), label: c.label().to_string(), description: c.description().to_string(), count })
+        })
+        .collect();
+    let mut notes = Vec::new();
+    if in_backup.contains("calendar/calendar.json") {
+        notes.push("The calendar comes back without its FormLogic sync state (it pairs and syncs again when you link FormLogic). Only its opening hours and the steps between the times offered come back without a tick; the rest (the business's name, the services, and the appointments, which the phone also sends to your linked FormLogic account) comes back only with the calendar tick. An appointment that is here is never touched by a restore that was not ticked.".to_string());
+    }
+    if items.iter().any(|i| i.class == RestoreClass::Plugins) {
+        notes.push("Plugin settings come back without PINs, keys or values sealed to another computer; what this computer already has of those stays.".to_string());
+    }
+    if items.iter().any(|i| i.class == RestoreClass::Flows && i.name == "bridge/ledger.jsonl") {
+        notes.push("Runs that were waiting or running when the backup was made are never brought back.".to_string());
+    }
+    if items.iter().any(|i| i.class == RestoreClass::Outreach) {
+        notes.push("Outreach campaigns come back PAUSED, never running and never scheduled: nothing is sent or called until you start one. A campaign of the same id that is here is kept as it is, and anyone who was being reached is set aside, not contacted again.".to_string());
+    }
+    if agent_names.iter().any(|n| n.ends_with("#opfs/front-desk/outreach/do-not-contact.json")) {
+        notes.push("The numbers in the backup that are not to be called or texted again are added to yours; none of yours is ever taken away.".to_string());
+    }
+    notes.extend(agent_dry_notes.iter().map(|n| review::clip(n, 400)));
+    let preview = Preview {
+        file_name: review::clip(file_name, 200),
+        created_at: review::clip(&manifest.created_at, 40),
+        app_version: review::clip(&manifest.app.version, 64),
+        platform: review::clip(&manifest.platform, 32),
+        includes_keys: manifest.includes_keys,
+        categories,
+        lacks,
+        partial: clipped(&manifest.partial, MOST_LINES_NAMED, 400),
+        excluded: excluded_of(manifest),
+        redo: clipped(&redo_of(manifest), MOST_LINES_NAMED, 400),
+        total_files: manifest.entries.len() as u64,
+        total_bytes: manifest.entries.iter().map(|e| e.size).sum(),
+        classes,
+        items,
+        not_restored,
+        keys: KeysInfo { in_backup: manifest.includes_keys },
+        notes,
+    };
+    Ok((in_plain_sight(preview), agent_names, not_described))
+}
+
+/// The preview with every text in it that a person reads made visible: the characters they cannot see (a tag, a zero-width or a
+/// direction character) are said as what they are, with how many. Every description, title, name and note is made this way where it is
+/// built; this is the last place, so that nothing that reaches the person is drawn as it is written.
+fn in_plain_sight(mut preview: Preview) -> Preview {
+    let seen = super::parts::visible;
+    for item in &mut preview.items {
+        item.name = seen(&item.name);
+        item.title = seen(&item.title);
+        item.what = seen(&item.what);
+    }
+    for n in &mut preview.not_restored {
+        n.name = seen(&n.name);
+        n.why = seen(&n.why);
+    }
+    for list in [&mut preview.notes, &mut preview.partial, &mut preview.redo] {
+        *list = list.iter().map(|n| seen(n)).collect();
+    }
+    for e in &mut preview.excluded {
+        e.pattern = seen(&e.pattern);
+        e.reason = seen(&e.reason);
+        e.redo = e.redo.as_deref().map(seen);
+    }
+    preview
+}
+
+/// What a look at a backup found, kept to hold the restore that follows to it: the SHA-256 of the decrypted
+/// backup, and the names of the items the look listed as able to come back. A restore prepared from it is
+/// of the backup that was looked at, byte for byte, and brings back nothing the look did not list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Inspection {
+    pub plain_sha256: String,
+    /// The entries the look said could come back (data, and what needs a tick), by their names in the backup.
+    pub restorable: BTreeSet<String>,
+    /// The entries among them that the look named and did not describe, for want of room in the preview (the Agent's as `restorable` has them): a
+    /// restore brings back only what the look described, so these are left out.
+    pub not_described: BTreeSet<String>,
+}
+
+fn restorable_names(manifest: &Manifest) -> BTreeSet<String> {
+    manifest.entries.iter().filter(|e| matches!(rules::standing_of_backup_entry(&e.name), Ok(Some(_)))).map(|e| e.name.clone()).collect()
+}
+
+/// Step 1: decrypt and check the backup, and say what restoring would do. Changes nothing.
+pub fn inspect(data_dir: &Path, file: &Path, passphrase: &str, opts: &RestoreOptions) -> Result<Preview> {
+    inspect_bound(data_dir, file, passphrase, opts).map(|(preview, _)| preview)
+}
+
+/// Step 1, with what is needed to hold step 2 to it (see [`Inspection`]).
+pub fn inspect_bound(data_dir: &Path, file: &Path, passphrase: &str, opts: &RestoreOptions) -> Result<(Preview, Inspection)> {
+    opts.busy.refuse_if_busy("checking a backup")?;
+    let scratch = TempFolder::new(&scratch_dir(data_dir))?;
+    let budget = opts.budget();
+    let verified = container::open_backup(file, passphrase, &scratch.0, &opts.limits, &budget)?;
+    let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let (preview, agent_names, not_described) = preview_of(data_dir, &verified, &scratch.0, &name, &opts.limits, &budget)?;
+    let mut restorable = restorable_names(&verified.manifest);
+    restorable.extend(agent_names);
+    let inspection = Inspection { plain_sha256: verified.plain_sha256.clone(), restorable, not_described };
+    Ok((preview, inspection))
+}
+
+// ---- staging ---------------------------------------------------------------------------------------
+
+/// Step 2: unpack the backup into `<data>/restore/pending-<id>/` and write the marker. Nothing live
+/// is changed. Data comes back as it is; a class that can run things or change settings comes back
+/// only if `ticks` has it (see [`review`]).
+pub fn stage(data_dir: &Path, file: &Path, passphrase: &str, ticks: &Ticks, opts: &RestoreOptions) -> Result<Staged> {
+    stage_inner(data_dir, file, passphrase, ticks, opts, None)
+}
+
+/// Step 2 for the restore of a backup that was looked at: the file is decrypted again, and it must be the
+/// backup that was looked at, byte for byte (its decrypted contents have the hash the look recorded), and
+/// nothing is brought back that the look did not list. What the person saw is what is prepared.
+pub fn stage_checked(data_dir: &Path, file: &Path, passphrase: &str, ticks: &Ticks, opts: &RestoreOptions, looked_at: &Inspection) -> Result<Staged> {
+    stage_inner(data_dir, file, passphrase, ticks, opts, Some(looked_at))
+}
+
+fn stage_inner(data_dir: &Path, file: &Path, passphrase: &str, ticks: &Ticks, opts: &RestoreOptions, looked_at: Option<&Inspection>) -> Result<Staged> {
+    // Preparing writes only into the staging folder and changes nothing that is live, so it does not wait for a quiet app: a
+    // phone plugin that cannot say whether a call is live would otherwise leave the person unable to go on. What needs a
+    // quiet app is what a restore does to the app: looking at a backup (a second of computing and up to a gigabyte of memory),
+    // making a backup, and the restart that applies one (it ends a call).
+    let budget = opts.budget();
+    let scratch = TempFolder::new(&scratch_dir(data_dir))?;
+    let verified = container::open_backup(file, passphrase, &scratch.0, &opts.limits, &budget)?;
+    if let Some(seen) = looked_at {
+        if verified.plain_sha256 != seen.plain_sha256 {
+            return Err(BackupError::new(ErrorKind::Conflict, "This is not the backup that was checked: the file has changed since. Choose it again and look at what it holds."));
+        }
+    }
+    let manifest = &verified.manifest;
+    let mut skipped: Vec<String> = Vec::new();
+    // What is brought back: data, and the classes that were ticked (and the Agent's storage, if it is small enough for its page).
+    let mut selected: Vec<&Entry> = Vec::new();
+    let mut left_out: HashMap<RestoreClass, usize> = HashMap::new();
+    let mut unknown = 0usize;
+    let mut undescribed: Vec<String> = Vec::new();
+    for entry in &manifest.entries {
+        if entry.name == AGENT_ENTRY {
+            if entry.size > opts.agent_import_max {
+                skipped.push(format!("The Agent's conversations and projects were not brought back: they are {} MB, more than the {} MB its page takes back.", entry.size >> 20, opts.agent_import_max >> 20));
+            } else {
+                selected.push(entry);
+            }
+            continue;
+        }
+        // What the table does not know is not restored; what it excludes cannot be in a backup that got this far.
+        let Ok(Some(standing)) = rules::standing_of_backup_entry(&entry.name) else {
+            unknown += 1;
+            continue;
+        };
+        match standing.file_tick() {
+            Some(class) if !ticks.has(class) => *left_out.entry(class).or_default() += 1,
+            // What the look named and did not describe (there was no room in the preview) is not brought back: what a person ticked is what they were told of.
+            _ if looked_at.is_some_and(|seen| seen.not_described.contains(&entry.name)) => undescribed.push(entry.name.clone()),
+            _ => selected.push(entry),
+        }
+    }
+    if !undescribed.is_empty() {
+        skipped.push(format!(
+            "Not brought back: {} that the dry run named and did not describe, for want of room in it: {}.",
+            if undescribed.len() == 1 { "1 file".to_string() } else { format!("{} files", undescribed.len()) },
+            super::parts::some_of(&undescribed, MOST_LINES_NAMED, 120)
+        ));
+    }
+    if unknown > 0 {
+        skipped.push(format!("Not restored: {unknown} item{} that this version of OAIY does not know (unknown items are never restored).", if unknown == 1 { "" } else { "s" }));
+    }
+    for class in RestoreClass::ALL {
+        if let Some(n) = left_out.get(&class) {
+            skipped.push(format!("Not brought back (not ticked): {} ({n} file{}).", class.label(), if *n == 1 { "" } else { "s" }));
+        }
+    }
+    if let Some(seen) = looked_at {
+        if let Some(unlisted) = selected.iter().find(|e| !seen.restorable.contains(&e.name)) {
+            return Err(BackupError::new(ErrorKind::Unsafe, format!("\"{}\" was not listed when the backup was checked, so nothing was prepared.", review::clip(&unlisted.name, 120))));
+        }
+    }
+    let total: u64 = selected.iter().map(|e| e.size).sum();
+    let plain_len = std::fs::metadata(&verified.plain).map(|m| m.len()).unwrap_or(0);
+    // (The Agent's archive is copied out of the backup to be read, and rebuilt: two more of its size at the most.)
+    let agent_size = selected.iter().find(|e| e.name == AGENT_ENTRY).map(|e| e.size).unwrap_or(0);
+    let needed = total.saturating_add(plain_len).saturating_add(agent_size).saturating_add(MARGIN);
+    let free = (opts.free_space)(data_dir);
+    if free < needed {
+        return Err(BackupError::new(
+            ErrorKind::NoSpace,
+            format!("There is not enough free space to prepare this restore: about {} MB is needed and {} MB is free.", needed >> 20, free >> 20),
+        ));
+    }
+    // Everything it would replace must be a plain file, and nothing may be behind a link.
+    let mut targets = Targets::new();
+    for entry in &selected {
+        if entry.name != AGENT_ENTRY {
+            targets.state(data_dir, &entry.name)?;
+        }
+    }
+
+    discard_pending(data_dir)?;
+    let id = super::random_id();
+    let source = format!("pending-{id}");
+    let root = restore_dir(data_dir).join(&source);
+    let wanted: HashSet<&str> = selected.iter().map(|e| e.name.as_str()).collect();
+    let staged = (|| -> Result<(Marker, Vec<String>)> {
+        secret_file::create_private_dir(&root.join("files")).map_err(|e| BackupError::io("Could not make a folder for the restore", &e))?;
+        let limits = &opts.limits;
+        container::extract_all(&verified, |entry| {
+            if !wanted.contains(entry.name.as_str()) || entry.name == AGENT_ENTRY {
+                Ok(None)
+            } else {
+                container::safe_join(&root.join("files"), &entry.name, limits).map(Some)
+            }
+        }, &budget)?;
+        // The Agent's archive is not handed over as it is: it is rebuilt from what the table lets come back (see `agentzip`).
+        let mut agent_notes: Vec<String> = Vec::new();
+        let mut agent = None;
+        if selected.iter().any(|e| e.name == AGENT_ENTRY) {
+            let nested = scratch.0.join("agent-nested.zip");
+            let mut outer = container::open_archive(&verified.plain)?;
+            agentzip::extract(&mut outer, &nested, &budget)?;
+            let built = root.join(AGENT_RESTORE_FILE);
+            // (What the look named and did not describe is left out, as it is of the desktop's own files.)
+            let skip: HashSet<String> = looked_at
+                .map(|seen| seen.not_described.iter().filter_map(|n| n.strip_prefix(&format!("{AGENT_ENTRY}#")).map(str::to_string)).collect())
+                .unwrap_or_default();
+            let prepared = agentzip::filter(&nested, &built, &scratch.0, ticks, agentzip::Mode::Restore, &skip, limits, &budget)?;
+            let _ = std::fs::remove_file(&nested);
+            if let Some(seen) = looked_at {
+                if let Some(unlisted) = prepared.items.iter().find(|i| !seen.restorable.contains(&agent_item(&i.name))) {
+                    return Err(BackupError::new(ErrorKind::Unsafe, format!("\"{}\" in the Agent's storage was not listed when the backup was checked, so nothing was prepared.", review::clip(&unlisted.name, 120))));
+                }
+            }
+            agent_notes = prepared.notes;
+            if prepared.items.is_empty() {
+                let _ = std::fs::remove_file(&built);
+            } else {
+                let (sha256, size) = sha256_file(&built).map_err(|e| BackupError::io("Could not read the Agent's staged storage", &e))?;
+                agent = Some(MarkerAgent { file: AGENT_RESTORE_FILE.to_string(), size, sha256, apply_settings: prepared.settings, apply_keys: ticks.keys, remove: Vec::new() });
+            }
+        }
+        // What can carry more than data is cleaned as it comes in, and the marker records what is there now.
+        let names: Vec<String> = selected.iter().filter(|e| e.name != AGENT_ENTRY).map(|e| e.name.clone()).collect();
+        let Cleaned { kept, notes: mut notes, merges } = clean_staged(data_dir, &root.join("files"), &names, ticks, limits)?;
+        notes.extend(agent_notes);
+        let mut files = Vec::new();
+        for name in &kept {
+            let path = container::safe_join(&root.join("files"), name, limits)?;
+            let (sha256, size) = sha256_file(&path).map_err(|e| BackupError::io("Could not read a staged file", &e))?;
+            files.push(MarkerFile { name: name.clone(), size, sha256 });
+        }
+        let bytes: u64 = files.iter().map(|f| f.size).sum();
+        Ok((
+            Marker {
+                v: 1,
+                id: id.clone(),
+                kind: KIND_RESTORE.to_string(),
+                staged_at: now(),
+                backup_created_at: review::clip(&manifest.created_at, 40),
+                ticked: ticks.ids(),
+                keys: ticks.keys,
+                notes: clipped(&notes, MOST_NOTES, 400),
+                source: source.clone(),
+                files,
+                removals: Vec::new(),
+                agent,
+                redo: clipped(&redo_of(manifest), MOST_LINES_NAMED, 400),
+                merges,
+                bytes,
+            },
+            notes,
+        ))
+    })();
+    let (marker, notes) = match staged {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&root);
+            return Err(e);
+        }
+    };
+    skipped.extend(notes);
+    // The marker is what commits the step.
+    if let Err(e) = write_json(&marker_path(data_dir), &marker) {
+        let _ = std::fs::remove_dir_all(&root);
+        return Err(BackupError::io("Could not record the restore", &e));
+    }
+    log::info!("backup: a restore ({} files, {} classes ticked) is staged and will be applied at the next start", marker.files.len(), marker.ticked.len());
+    Ok(Staged {
+        id,
+        kind: KIND_RESTORE.to_string(),
+        files: marker.files.len() as u64,
+        bytes: marker.bytes,
+        agent_storage: marker.agent.is_some(),
+        redo: marker.redo,
+        skipped: clipped(&skipped, MOST_NOTES, 400),
+    })
+}
+
+/// Clean the staged files that carry more than data: the calendar loses its FormLogic sync state, a
+/// plugin's settings lose every PIN, key and sealed value the backup holds while keeping the ones this
+/// computer already has, the provider list loses its keys unless they were ticked, the run journal
+/// keeps only runs that finished, and the autostart list keeps only services that have a template
+/// here or in this restore. A file that cannot be cleaned is not brought back. Returns the names that
+/// remain, what was said about the rest, and the files that were merged with what is here (see [`MarkerMerge`]).
+pub(crate) fn clean_staged(data_dir: &Path, files_root: &Path, names: &[String], ticks: &Ticks, limits: &Limits) -> Result<Cleaned> {
+    let mut kept = Vec::new();
+    // What is said of the files, by class: a class has a budget of its own, so files of one kind cannot crowd out what is said of another.
+    let mut notes = NoteBook::default();
+    let mut merges: Vec<MarkerMerge> = Vec::new();
+    // A staged file is measured before it is read: what a backup declares is checked when it is read, but a file
+    // is only ever read whole when it is no larger than the most a file of its kind may be.
+    let read = |path: &Path| {
+        let len = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
+        if len > limits.max_json_bytes {
+            return Err("it is too large to be read".to_string());
+        }
+        std::fs::read(path).map_err(|e| e.to_string())
+    };
+    for name in names {
+        let path = container::safe_join(files_root, name, limits)?;
+        let category = rules::category_of_backup_entry(name).ok().flatten().map(|(c, _)| c);
+        let cleaned: Option<std::result::Result<Vec<u8>, String>> = match (category, name.as_str()) {
+            // The calendar, and a settings file with a key table, are put into the file this computer has (see `merge_file`).
+            (Some(_), _) if merged_with_local(name, category) => {
+                let (local, here) = (local_json(data_dir, name, limits), here_state(data_dir, name));
+                Some(read(&path).and_then(|b| {
+                    let (bytes, more) = merge_file(name, local.as_ref(), &b, ticks)?;
+                    notes.extend(NOTE_MERGED, more);
+                    // What it was merged from is kept as it came, so that it can be merged again with what is here when it is applied.
+                    let theirs = files_root.parent().unwrap_or(files_root).join("theirs").join(native(name));
+                    if let Some(parent) = theirs.parent() {
+                        secret_file::create_private_dir(parent).map_err(|e| e.to_string())?;
+                    }
+                    secret_file::write(&theirs, &b).map_err(|e| e.to_string())?;
+                    let (theirs_sha256, theirs_size) = sha256_file(&theirs).map_err(|e| e.to_string())?;
+                    merges.push(MarkerMerge { name: name.clone(), theirs_size, theirs_sha256, here_sha256: here });
+                    Ok(bytes)
+                }))
+            }
+            (Some(Category::Providers), _) => Some(read(&path).and_then(|b| {
+                super::sanitize::providers_for_restore(&b, ticks.keys).map(|(c, removed, cleaned)| {
+                    if removed > 0 {
+                        notes.push(NOTE_PROVIDERS, format!("{removed} API key(s) in the provider list were left out: you did not tick the keys."));
+                    }
+                    if cleaned > 0 {
+                        notes.push(NOTE_PROVIDERS, format!("{cleaned} address{} in the provider list held a name and password, or a key, which a backup never brings back: {} saved without {}; enter {} again as the provider's key.", if cleaned == 1 { "" } else { "es" }, if cleaned == 1 { "it was" } else { "they were" }, if cleaned == 1 { "it" } else { "them" }, if cleaned == 1 { "it" } else { "them" }));
+                    }
+                    c
+                })
+            })),
+            // The messages callers left: a message that hides text is refused first (on the file as it came, as the dry run looked at it), and the rest
+            // is cleaned as the store cleans a message it takes and held to the store's limits.
+            (Some(Category::Messages), "messages/messages.json") => Some(read(&path).and_then(|b| {
+                if let Some(why) = review::hidden_text_in(name, &b) {
+                    return Err(format!("it hides text ({why})"));
+                }
+                super::sanitize::messages_for_restore(&b).map(|(cleaned, said)| {
+                    notes.extend(NOTE_MESSAGES, said);
+                    cleaned
+                })
+            })),
+            (Some(Category::Flows), "bridge/ledger.jsonl") => Some(read(&path).map(|b| {
+                let (c, left_out) = super::sanitize::ledger_finished_only(&b);
+                if left_out > 0 {
+                    notes.push(NOTE_JOURNAL, format!("{left_out} run record(s) of runs that were waiting or running were left out: nothing starts by itself."));
+                }
+                c
+            })),
+            _ => None,
+        };
+        match cleaned {
+            None => kept.push(name.clone()),
+            Some(Ok(bytes)) => {
+                secret_file::write(&path, bytes).map_err(|e| BackupError::io("Could not clean a staged file", &e))?;
+                kept.push(name.clone());
+            }
+            Some(Err(why)) => {
+                let _ = std::fs::remove_file(&path);
+                notes.push(NOTE_LEFT_OUT, format!("{name} was not brought back: {why}."));
+            }
+        }
+    }
+    // The dry run says of a file that can act, and that OAIY could not read or is too large to look at, that it
+    // is not brought back: so it is not. (What was not looked at does not come in.)
+    let mut readable = Vec::new();
+    for name in std::mem::take(&mut kept) {
+        // Voices are audio: they are never read, so the dry run has nothing to say of them that staging must honour.
+        let acting = rules::standing_of_backup_entry(&name).ok().flatten().filter(|s| s.category != Category::Voices).and_then(|s| s.tick);
+        let Some(class) = acting else {
+            readable.push(name);
+            continue;
+        };
+        let path = container::safe_join(files_root, &name, limits)?;
+        let too_large = std::fs::metadata(&path).map(|m| m.len() > review_cap(&name)).unwrap_or(false);
+        let unreadable = if too_large {
+            Some(review::TOO_LARGE.to_string())
+        } else {
+            let bytes = std::fs::read(&path).map_err(|e| BackupError::io("Could not read a staged file", &e))?;
+            review::describe(class, &name, &bytes, &Local::default(), &HashSet::new()).into_iter().find(review::is_unreadable).map(|item| item.what)
+        };
+        match unreadable {
+            Some(why) => {
+                let _ = std::fs::remove_file(&path);
+                notes.push(NOTE_LEFT_OUT, format!("{name} was not brought back. {why}"));
+            }
+            None => readable.push(name),
+        }
+    }
+    kept = readable;
+
+    // A service starts with OAIY only if OAIY has a template for it: one here already, or one in this restore.
+    if kept.iter().any(|n| n == "services-autostart.json") {
+        let mut known = Local::read(data_dir).template_ids;
+        for name in kept.iter().filter(|n| n.starts_with("templates/")) {
+            let staged = container::safe_join(files_root, name, limits)?;
+            if let Some(id) = std::fs::read(&staged).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).and_then(|v| v.get("id").and_then(|i| i.as_str().map(str::to_string))) {
+                known.insert(id);
+            }
+        }
+        let path = container::safe_join(files_root, "services-autostart.json", limits)?;
+        match read(&path).and_then(|b| super::sanitize::autostart_known_only(&b, &known)) {
+            Ok((bytes, dropped)) => {
+                secret_file::write(&path, bytes).map_err(|e| BackupError::io("Could not clean a staged file", &e))?;
+                if !dropped.is_empty() {
+                    notes.push(NOTE_SERVICES, format!("These services were not set to start with OAIY, because OAIY has no template for them: {}.", super::parts::some_of(&dropped, MOST_SERVICES_NAMED, 60)));
+                }
+            }
+            Err(why) => {
+                let _ = std::fs::remove_file(&path);
+                kept.retain(|n| n != "services-autostart.json");
+                notes.push(NOTE_SERVICES, format!("services-autostart.json was not brought back: {why}."));
+            }
+        }
+    }
+    merges.retain(|m| kept.contains(&m.name));
+    Ok(Cleaned { kept, notes: notes.finish(), merges })
+}
+
+/// The most notes a restore keeps in its record and says in its result. It has room for every class at its budget (see [`NoteBook`]) and
+/// the notes that are one line each: nine classes of nine notes and a few dozen more.
+const MOST_NOTES: usize = 150;
+
+/// The most services left out of the autostart list (for want of a template) that a note names; the rest are counted.
+const MOST_SERVICES_NAMED: usize = 20;
+
+/// The classes of the notes said of the staged files.
+const NOTE_MERGED: &str = "merged files";
+const NOTE_PROVIDERS: &str = "the provider list";
+const NOTE_JOURNAL: &str = "the run journal";
+const NOTE_LEFT_OUT: &str = "files not brought back";
+const NOTE_SERVICES: &str = "services that start with OAIY";
+const NOTE_MESSAGES: &str = "the messages callers left";
+
+/// What [`clean_staged`] leaves: the names that come back, what was said, and the files that were merged with what is here.
+pub(crate) struct Cleaned {
+    pub(crate) kept: Vec<String>,
+    pub(crate) notes: Vec<String>,
+    merges: Vec<MarkerMerge>,
+}
+
+/// Whether the file `name` of a backup is put into the file this computer has (the calendar, and a settings file with a key table),
+/// instead of taking its place.
+fn merged_with_local(name: &str, category: Option<Category>) -> bool {
+    category == Some(Category::Calendar) || rules::keys_of(name).is_some()
+}
+
+/// The file this computer has under `name`, when it is JSON of a size that is read.
+fn local_json(data_dir: &Path, name: &str, limits: &Limits) -> Option<serde_json::Value> {
+    let here = data_dir.join(native(name));
+    // (Read as the stores read it: UTF-8, or UTF-16 with its byte order mark, as another program may have saved it.)
+    std::fs::metadata(&here)
+        .ok()
+        .filter(|m| m.len() <= limits.max_json_bytes)
+        .and_then(|_| std::fs::read(&here).ok())
+        .and_then(|b| secret_file::decode_text(&b).ok())
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+}
+
+/// The state of the file this computer has under `name`: the SHA-256 of a plain file, none when there is none (or it is not a plain file).
+fn here_state(data_dir: &Path, name: &str) -> Option<String> {
+    let here = data_dir.join(native(name));
+    if !std::fs::symlink_metadata(&here).ok()?.is_file() {
+        return None;
+    }
+    sha256_file(&here).ok().map(|(sha, _)| sha)
+}
+
+/// The backup's file `theirs` put into the file that is here (`local`, when it is JSON of a size that is read): the calendar merged
+/// appointment by appointment (see `sanitize::calendar_merge`), a settings file with a key table key by key: what the table lets
+/// through (the keys that cannot act, and those whose tick was ticked) goes into the file this computer has, and everything else
+/// stays as it is here. Returns the bytes that are to be in place and what was said of them (each note begins with the name).
+/// `Err` says why nothing of it may come back.
+fn merge_file(name: &str, local: Option<&serde_json::Value>, theirs: &[u8], ticks: &Ticks) -> std::result::Result<(Vec<u8>, Vec<String>), String> {
+    let staged: serde_json::Value = serde_json::from_slice(theirs.strip_prefix(&[0xef, 0xbb, 0xbf][..]).unwrap_or(theirs)).map_err(|_| "it is not valid JSON".to_string())?;
+    let category = rules::category_of_backup_entry(name).ok().flatten().map(|(c, _)| c);
+    if category == Some(Category::Calendar) {
+        let merged = super::sanitize::calendar_merge(local, &staged, ticks)?;
+        return Ok((merged.bytes, merged.notes.into_iter().map(|n| format!("{name}: {n}")).collect()));
+    }
+    let keys_name = rules::keys_of(name).ok_or_else(|| "OAIY does not know how to read it".to_string())?;
+    let table = super::table::table().key_table(keys_name).ok_or_else(|| "OAIY does not know how to read it".to_string())?;
+    let found = super::table::filter_json(table, &staged, &|row| row.class == super::table::Class::Data || row.tick.is_some_and(|t| ticks.has(t)));
+    let left = found.left.iter().map(|l| l.path.as_str()).collect::<HashSet<_>>().len() + found.left_more;
+    if found.kept.is_empty() {
+        // Nothing in it may come back (as ticked): the file that is here is left exactly as it is.
+        return Err(found.nothing_comes_back());
+    }
+    let mut notes = Vec::new();
+    if left > 0 {
+        notes.push(format!("{name}: {left} setting{} not brought back (addresses, switches that grant access, PINs and anything not in the table are never restored; the rest need their tick).", if left == 1 { " was" } else { "s were" }));
+    }
+    let bytes = serde_json::to_vec_pretty(&super::table::merge_into_local(local, &found)).map_err(|_| "it could not be written".to_string())?;
+    Ok((bytes, notes))
+}
+
+/// A restore is applied to the files that are here when it is applied. What was merged with a file that is here when the restore was
+/// prepared (the calendar takes bookings, the phone plugin's settings are changed) is merged again with that file if it changed since,
+/// from what the backup held (kept as it came, and held to its size and SHA-256), so that what was added in the hours between (a booking, a
+/// setting the backup has no key for) is not lost. What the backup itself carries is put over it, as it would have been at once.
+/// The staged file and the marker are updated (and the marker is written again) before anything is put in place. `Err` says why
+/// nothing may be applied.
+fn merge_again(data_dir: &Path, marker: &mut Marker, limits: &Limits) -> std::result::Result<(), String> {
+    if marker.merges.is_empty() {
+        return Ok(());
+    }
+    let ticks = Ticks::from_ids(&marker.ticked, marker.keys).map_err(|e| e.message)?;
+    let root = restore_dir(data_dir).join(&marker.source);
+    let mut changed = false;
+    for m in marker.merges.clone() {
+        let here = here_state(data_dir, &m.name);
+        if here == m.here_sha256 {
+            continue;
+        }
+        changed = true;
+        let theirs = root.join("theirs").join(native(&m.name));
+        let meta = std::fs::symlink_metadata(&theirs).map_err(|_| "A staged file is missing, so nothing was changed.".to_string())?;
+        if !meta.is_file() || meta.len() != m.theirs_size {
+            return Err("A staged file is not what was staged, so nothing was changed.".into());
+        }
+        if !matches!(sha256_file(&theirs), Ok((sha, _)) if sha == m.theirs_sha256) {
+            return Err("A staged file does not check out, so nothing was changed.".into());
+        }
+        let bytes = std::fs::read(&theirs).map_err(|_| "A staged file could not be read, so nothing was changed.".to_string())?;
+        let staged = container::safe_join(&root.join("files"), &m.name, limits).map_err(|e| e.message)?;
+        // What was said about this file when it was prepared is said again from what is here now.
+        marker.notes.retain(|n| !n.starts_with(&format!("{}: ", m.name)));
+        match merge_file(&m.name, local_json(data_dir, &m.name, limits).as_ref(), &bytes, &ticks) {
+            Ok((merged, more)) => {
+                secret_file::write(&staged, merged).map_err(|e| format!("Could not merge a staged file again ({e})."))?;
+                let (sha256, size) = sha256_file(&staged).map_err(|e| format!("Could not read a staged file ({e})."))?;
+                if let Some(f) = marker.files.iter_mut().find(|f| f.name == m.name) {
+                    f.sha256 = sha256;
+                    f.size = size;
+                }
+                marker.notes.push(review::clip(&format!("{}: it changed after this restore was prepared, so it was merged again with what is there now.", m.name), 400));
+                marker.notes.extend(more.iter().map(|n| review::clip(n, 400)));
+            }
+            // (What the backup holds is what it held when the restore was prepared, and it was merged then: this is reached only by
+            // a file that is not the one that was staged, or a table that has changed since.)
+            Err(why) => return Err(format!("{} could not be merged with what is there now ({why}), so nothing was changed.", m.name)),
+        }
+        if let Some(entry) = marker.merges.iter_mut().find(|e| e.name == m.name) {
+            entry.here_sha256 = here;
+        }
+    }
+    marker.notes = clipped(&marker.notes, MOST_NOTES, 400);
+    if changed {
+        write_json(&marker_path(data_dir), marker).map_err(|e| format!("Could not record the restore again ({e})."))?;
+    }
+    Ok(())
+}
+
+/// Cancel a staged restore: the marker and, for a restore, its staged files. An undo snapshot is not touched.
+pub fn discard_pending(data_dir: &Path) -> Result<()> {
+    let path = marker_path(data_dir);
+    if let Some(marker) = read_json::<Marker>(&path) {
+        if marker.kind == KIND_RESTORE && marker.source == format!("pending-{}", marker.id) && is_id(&marker.id) {
+            let _ = std::fs::remove_dir_all(restore_dir(data_dir).join(&marker.source));
+        }
+    }
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(BackupError::io("Could not cancel the restore", &e)),
+    }
+}
+
+// ---- undo ------------------------------------------------------------------------------------------
+
+fn undo_dirs(data_dir: &Path) -> Vec<(String, UndoRecord)> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(restore_dir(data_dir)) else { return out };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(id) = name.strip_prefix("undo-") else { continue };
+        if !is_id(id) {
+            continue;
+        }
+        if let Some(record) = read_json::<UndoRecord>(&entry.path().join("undo.json")) {
+            if record.id == id {
+                out.push((id.to_string(), record));
+            }
+        }
+    }
+    out.sort_by(|a, b| b.1.applied_at.cmp(&a.1.applied_at).then(b.0.cmp(&a.0)));
+    out
+}
+
+pub fn undo_available(data_dir: &Path) -> bool {
+    !undo_dirs(data_dir).is_empty()
+}
+
+/// What the newest snapshot was made by: `restore` (the button undoes it) or `undo` (the button redoes
+/// what the undo took away).
+pub fn undo_kind(data_dir: &Path) -> Option<String> {
+    undo_dirs(data_dir).into_iter().next().map(|(_, record)| record.kind)
+}
+
+/// Stage putting back what the last restore replaced (and taking away what it added), to be applied at the next start.
+pub fn stage_undo(data_dir: &Path, opts: &RestoreOptions) -> Result<Staged> {
+    let Some((uid, record)) = undo_dirs(data_dir).into_iter().next() else {
+        return Err(BackupError::new(ErrorKind::Conflict, "There is no restore to undo."));
+    };
+    discard_pending(data_dir)?;
+    let root = restore_dir(data_dir).join(format!("undo-{uid}"));
+    let mut files = Vec::new();
+    let mut bytes = 0u64;
+    let mut targets = Targets::new();
+    for rel in &record.replaced {
+        container::check_entry_name(rel, &opts.limits)?;
+        let path = container::safe_join(&root.join("files"), rel, &opts.limits)?;
+        let meta = std::fs::symlink_metadata(&path).map_err(|_| BackupError::new(ErrorKind::Damaged, "The saved copy of what the restore replaced is incomplete, so it cannot be put back."))?;
+        if !meta.is_file() {
+            return Err(BackupError::new(ErrorKind::Damaged, "The saved copy of what the restore replaced is damaged, so it cannot be put back."));
+        }
+        let (sha256, size) = sha256_file(&path).map_err(|e| BackupError::io("Could not read the saved copy", &e))?;
+        bytes += size;
+        files.push(MarkerFile { name: rel.clone(), size, sha256 });
+        targets.state(data_dir, rel)?;
+    }
+    for rel in &record.added {
+        container::check_entry_name(rel, &opts.limits)?;
+        targets.state(data_dir, rel)?;
+    }
+    let agent_zip = root.join("agent-storage.zip");
+    let agent = match std::fs::metadata(&agent_zip) {
+        Ok(m) if m.is_file() => {
+            // What the page saved is the person's own state, so it is put back without a tick, but through the same
+            // table as a restore: an old campaign is never brought back running, callbacks that are long stale are
+            // not, the list of numbers not to be contacted only grows, and what the table does not know is not
+            // written. Its keys were never in it.
+            let scratch = TempFolder::new(&scratch_dir(data_dir))?;
+            let budget = opts.budget();
+            let built = root.join(AGENT_UNDO_FILE);
+            let _ = std::fs::remove_file(&built);
+            let prepared = agentzip::filter(&agent_zip, &built, &scratch.0, &Ticks::all(), agentzip::Mode::Undo, &HashSet::new(), &opts.limits, &budget)?;
+            let remove = agent::read_added(data_dir, &uid);
+            if prepared.items.is_empty() && remove.is_empty() {
+                let _ = std::fs::remove_file(&built);
+                None
+            } else {
+                let (sha256, size) = sha256_file(&built).map_err(|e| BackupError::io("Could not read the saved copy", &e))?;
+                Some(MarkerAgent { file: AGENT_UNDO_FILE.to_string(), size, sha256, apply_settings: prepared.settings, apply_keys: false, remove })
+            }
+        }
+        _ => None,
+    };
+    let marker = Marker {
+        v: 1,
+        id: super::random_id(),
+        kind: KIND_UNDO.to_string(),
+        staged_at: now(),
+        backup_created_at: record.backup_created_at.clone(),
+        ticked: Vec::new(),
+        keys: false,
+        notes: Vec::new(),
+        source: format!("undo-{uid}"),
+        files,
+        removals: record.added.clone(),
+        agent,
+        redo: Vec::new(),
+        merges: Vec::new(),
+        bytes,
+    };
+    write_json(&marker_path(data_dir), &marker).map_err(|e| BackupError::io("Could not record the undo", &e))?;
+    Ok(Staged {
+        id: marker.id.clone(),
+        kind: KIND_UNDO.to_string(),
+        files: (marker.files.len() + marker.removals.len()) as u64,
+        bytes,
+        agent_storage: marker.agent.is_some(),
+        redo: Vec::new(),
+        skipped: Vec::new(),
+    })
+}
+
+// ---- applying --------------------------------------------------------------------------------------
+
+/// What happened when the app started with a restore waiting.
+#[derive(Debug)]
+pub enum ApplyOutcome {
+    /// Nothing was waiting.
+    None,
+    Applied(LastRestore),
+    /// It failed and everything was put back.
+    Failed(LastRestore),
+    /// It had waited more than a day: it was thrown away unapplied.
+    Expired(LastRestore),
+}
+
+/// One line of the journal, written before its step.
+#[derive(Serialize, Deserialize)]
+struct JournalLine {
+    op: String,
+    #[serde(default)]
+    rel: String,
+    #[serde(default)]
+    had: bool,
+    /// A staged file goes in at this step (as opposed to a file being taken away, in an undo).
+    #[serde(default)]
+    install: bool,
+}
+
+struct Journal {
+    file: std::fs::File,
+}
+
+impl Journal {
+    fn create(path: &Path) -> std::io::Result<Self> {
+        let _ = std::fs::remove_file(path);
+        Ok(Self { file: secret_file::create_new_owner_only(path)? })
+    }
+
+    fn line(&mut self, op: &str, rel: &str, had: bool, install: bool) -> std::io::Result<()> {
+        let mut text = serde_json::to_string(&JournalLine { op: op.to_string(), rel: rel.to_string(), had, install }).unwrap_or_default();
+        text.push('\n');
+        self.file.write_all(text.as_bytes())?;
+        self.file.sync_data()
+    }
+}
+
+fn read_journal(path: &Path) -> Vec<JournalLine> {
+    std::fs::read_to_string(path).map(|t| t.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()).unwrap_or_default()
+}
+
+fn native(rel: &str) -> PathBuf {
+    rel.split('/').collect()
+}
+
+/// One rename of a rollback. A test can make the next few fail, as a file that is locked at that
+/// moment (a virus scanner, an indexer, the program itself) would.
+fn put_back(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if ROLLBACK_FAILS.with(|c| {
+        let left = c.get();
+        c.set(left.saturating_sub(1));
+        left > 0
+    }) {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "the file is locked"));
+    }
+    secret_file::rename_over(from, to)
+}
+
+/// Put back what the journal says was begun, newest first. Safe to run more than once, and after a crash at any point.
+///
+/// Nothing is ever deleted here. What a step put in place goes back to where it came from first (for
+/// an undo, the staged file is the only copy of what the restore replaced), and then the file that
+/// was set aside goes back to its place. Returns the files that could not be put back, each with
+/// whether a file of the person's had been set aside for it (its original is then in the holding
+/// folder): the step is left as it is rather than risk overwriting the one copy there is.
+fn roll_back(data_dir: &Path, staged_root: &Path, holding: &Path, lines: &[JournalLine]) -> Vec<(String, bool)> {
+    let mut failed = Vec::new();
+    for line in lines.iter().rev().filter(|l| l.op == "begin") {
+        let target = data_dir.join(native(&line.rel));
+        let kept = holding.join(native(&line.rel));
+        let staged = staged_root.join(native(&line.rel));
+        // Installed: the staged file is gone from its place and a plain file stands at the target.
+        if line.install && !staged.exists() && target.is_file() && put_back(&target, &staged).is_err() {
+            failed.push((line.rel.clone(), line.had));
+            continue;
+        }
+        // The original is in the holding folder if it was set aside: it goes back over whatever is there now.
+        if line.had && kept.exists() && put_back(&kept, &target).is_err() {
+            failed.push((line.rel.clone(), true));
+        }
+    }
+    failed.reverse();
+    failed
+}
+
+/// Where the files an apply replaces or takes away are kept: for a restore, and for an undo too, so
+/// an undo that overwrites or removes work done since the restore keeps a copy of it (the redo).
+fn holding_of(data_dir: &Path, marker: &Marker) -> PathBuf {
+    restore_dir(data_dir).join(format!("undo-{}", marker.id)).join("files")
+}
+
+fn record_last(data_dir: &Path, last: &LastRestore) {
+    if let Err(e) = write_json(&last_result_path(data_dir), last) {
+        log::warn!("backup: could not record how the restore went: {e}");
+    }
+}
+
+fn failed(marker_id: &str, kind: &str, why: &str) -> LastRestore {
+    LastRestore { id: marker_id.to_string(), kind: kind.to_string(), at: now(), ok: false, error: Some(why.to_string()), redo: Vec::new(), agent_storage: "none".into(), notes: Vec::new() }
+}
+
+/// Remove what a backup or a restore that was killed part-way leaves behind, at the start of the app
+/// and before a staged restore is applied: the working copies under `backup/scratch` (plaintext, and
+/// with the keys ticked, the provider keys), a `pending-<id>` folder that no marker names (a staging
+/// that never got as far as its marker) and, when no marker waits, a set-aside folder of an undo.
+/// What a waiting marker names, the undo snapshots and the Agent's import are left alone.
+/// Returns how many folders were removed.
+pub fn sweep_leftovers(data_dir: &Path) -> usize {
+    let mut removed = 0;
+    if let Ok(entries) = std::fs::read_dir(super::scratch_dir(data_dir)) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let done = match entry.file_type() {
+                Ok(t) if t.is_dir() => std::fs::remove_dir_all(&path).is_ok(),
+                _ => std::fs::remove_file(&path).is_ok(),
+            };
+            removed += usize::from(done);
+        }
+    }
+    let waiting = read_json::<Marker>(&marker_path(data_dir));
+    let marker_present = std::fs::symlink_metadata(marker_path(data_dir)).is_ok();
+    let named = waiting.as_ref().map(|m| m.source.clone());
+    if let Ok(entries) = std::fs::read_dir(restore_dir(data_dir)) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let orphan_pending = name.strip_prefix("pending-").is_some_and(is_id) && named.as_deref() != Some(name.as_str());
+            // A set-aside folder that no snapshot record names and no waiting restore may need, and that
+            // holds no file (a file in it is the only copy of something, and stays).
+            let orphan_holding = name.strip_prefix("undo-").is_some_and(is_id) && !marker_present && !entry.path().join("undo.json").exists();
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if orphan_pending && is_dir && std::fs::remove_dir_all(entry.path()).is_ok() {
+                removed += 1;
+            } else if orphan_holding && is_dir && remove_empty_tree(&entry.path()) {
+                removed += 1;
+            } else if orphan_holding && is_dir && keep_unowned_agent_copy(data_dir, &entry.path(), name.strip_prefix("undo-").unwrap_or("")) {
+                removed += 1;
+            }
+        }
+    }
+    // The encrypted file a backup that was killed had begun beside its destination.
+    if super::create::sweep_output(data_dir) {
+        removed += 1;
+    }
+    // An archive left for the Agent's page that has no record, unless a restore waits with an Agent part of its own (it is finished
+    // first, and gives that archive its record or replaces it).
+    if agent::sweep_unrecorded_handover(data_dir, waiting.as_ref().is_some_and(|m| m.agent.is_some())) {
+        removed += 1;
+    }
+    // The Agent's part of a restore that its page has not taken for a day: it is not kept for ever.
+    if let Some(id) = agent::drop_stale_import(data_dir, std::time::Duration::from_secs(STAGED_LIFETIME_HOURS as u64 * 3600)) {
+        record_agent_result(data_dir, &id, false, Some("its page did not take them within a day, so what was kept for it was deleted"), &[]);
+        removed += 1;
+    }
+    if removed > 0 {
+        log::info!("backup: removed {removed} leftover working folder(s) of a backup or restore that did not finish");
+    }
+    removed
+}
+
+/// A folder no record names (no `undo.json`) that holds only what the Agent's page sent for a restore: the copy of its storage and the
+/// list of files it added. The copy is the person's own storage as it was, so it is not thrown away: it is kept under a name that
+/// says whose it is not, and the result the panel shows says so. The rest of the folder goes. A folder that holds anything else (a
+/// set-aside file is the only copy of something) is left alone. True when the folder is gone.
+fn keep_unowned_agent_copy(data_dir: &Path, folder: &Path, id: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(folder) else { return false };
+    let names: Vec<String> = entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    let only_the_pages = names.iter().all(|n| matches!(n.as_str(), "agent-storage.zip" | "agent-storage.zip.part" | "agent-added.json"));
+    if names.is_empty() || !only_the_pages {
+        return false;
+    }
+    let whole = folder.join("agent-storage.zip");
+    let mut kept = None;
+    if whole.is_file() {
+        let to = restore_dir(data_dir).join(format!("unowned-agent-copy-{id}.zip"));
+        if secret_file::rename_over(&whole, &to).is_ok() {
+            kept = Some(to);
+        } else {
+            return false;
+        }
+    }
+    let gone = std::fs::remove_dir_all(folder).is_ok();
+    if let (Some(to), Some(mut last)) = (kept, read_json::<LastRestore>(&last_result_path(data_dir))) {
+        last.notes.push(format!("A copy of the Agent's storage that no restore owns (it was sent for restore {id}, which is not there any more) was found and is kept as {}.", to.display()));
+        record_last(data_dir, &last);
+    }
+    gone
+}
+
+/// Step 3: called at the very start of the app, before any store is opened. If a restore is
+/// staged, put it in place; otherwise do nothing.
+pub fn apply_pending(data_dir: &Path) -> ApplyOutcome {
+    let dir = restore_dir(data_dir);
+    let marker_file = marker_path(data_dir);
+    if std::fs::symlink_metadata(&marker_file).is_err() {
+        return ApplyOutcome::None;
+    }
+    let limits = Limits::default();
+    let Some(marker) = read_json::<Marker>(&marker_file) else {
+        let _ = std::fs::rename(&marker_file, dir.join(format!("bad-marker-{}.json", super::random_id())));
+        let last = failed("unknown", KIND_RESTORE, "The record of the restore was damaged, so nothing was changed.");
+        record_last(data_dir, &last);
+        return ApplyOutcome::Failed(last);
+    };
+    if let Err(why) = marker.check(&limits) {
+        // What was staged is personal data: it goes with the record that named it.
+        if is_id(&marker.id) && marker.kind == KIND_RESTORE {
+            let _ = std::fs::remove_dir_all(dir.join(format!("pending-{}", marker.id)));
+        }
+        let _ = std::fs::rename(&marker_file, dir.join(format!("bad-marker-{}.json", super::random_id())));
+        let last = failed("unknown", &marker.kind, &format!("The restore was refused, so nothing was changed: {why}."));
+        record_last(data_dir, &last);
+        return ApplyOutcome::Failed(last);
+    }
+    let staged_root = dir.join(&marker.source).join("files");
+    let holding = holding_of(data_dir, &marker);
+    let journal_file = journal_path(data_dir);
+
+    // The marker is the last thing a finished restore removes (after the journal). A start that finds the marker of a restore whose
+    // record of what it replaced is there, and whose journal is gone, has nothing to apply and nothing to put back: it was applied,
+    // and its result is what was recorded. (With the journal there, the restore is finished again below; without the record, it
+    // was never applied.)
+    if std::fs::symlink_metadata(&journal_file).is_err() && agent::undo_record_exists(data_dir, &marker.id) {
+        let _ = std::fs::remove_file(&marker_file);
+        log::info!("backup: the record of a {} that was already applied was still there, and was removed", marker.kind);
+        return ApplyOutcome::None;
+    }
+
+    // A restore prepared long ago is not applied. (One that was begun is never expired: it is finished or rolled back, below.)
+    if std::fs::symlink_metadata(&journal_file).is_err() && expired(&marker.staged_at) {
+        return expire(data_dir, &marker);
+    }
+
+    // An earlier start began this and did not finish.
+    if std::fs::symlink_metadata(&journal_file).is_ok() {
+        let lines = read_journal(&journal_file);
+        if lines.last().map(|l| l.op == "done").unwrap_or(false) {
+            let applied: Vec<(String, bool)> = lines.iter().filter(|l| l.op == "begin").map(|l| (l.rel.clone(), l.had)).collect();
+            return finalize(data_dir, &marker, &applied);
+        }
+        let stuck = roll_back(data_dir, &staged_root, &holding, &lines);
+        if !stuck.is_empty() {
+            return conclude_stuck(data_dir, &marker, "The restore was interrupted part-way.", &stuck, &holding);
+        }
+        let last = failed(&marker.id, &marker.kind, "The restore was interrupted part-way, so everything it had changed was put back.");
+        return conclude_failed(data_dir, &marker, last);
+    }
+
+    // The calendar and the settings that were merged with what was here when the restore was prepared are merged again if what is here
+    // has changed since (a booking taken in the hours between, a setting changed): the restore is applied to what is here now.
+    let mut marker = marker;
+    if let Err(why) = merge_again(data_dir, &mut marker, &limits) {
+        let last = failed(&marker.id, &marker.kind, &why);
+        return conclude_failed(data_dir, &marker, last);
+    }
+
+    // What is handed to the page is what was staged, before anything is changed (a copy that was swapped after it was prepared
+    // stops the restore as a staged data file that was swapped does).
+    if let Some(agent_marker) = &marker.agent {
+        if let Err(why) = verify_staged_agent(&dir.join(&marker.source).join(&agent_marker.file), agent_marker) {
+            let last = failed(&marker.id, &marker.kind, &format!("{why}, so nothing was changed."));
+            return conclude_failed(data_dir, &marker, last);
+        }
+    }
+    match apply_files(data_dir, &marker, &staged_root, &holding, &journal_file, &limits) {
+        Ok(applied) => finalize(data_dir, &marker, &applied),
+        // A test's stand-in for the process dying: nothing is rolled back and nothing is cleaned up.
+        #[cfg(test)]
+        Err(why) if why == CRASH => ApplyOutcome::None,
+        Err(why) => {
+            let lines = read_journal(&journal_file);
+            let stuck = roll_back(data_dir, &staged_root, &holding, &lines);
+            if !stuck.is_empty() {
+                return conclude_stuck(data_dir, &marker, &why, &stuck, &holding);
+            }
+            let last = failed(&marker.id, &marker.kind, &format!("{why} Everything it had changed was put back."));
+            conclude_failed(data_dir, &marker, last)
+        }
+    }
+}
+
+/// A rollback that could not put everything back: say which files, where their originals are, and
+/// keep the evidence (the record of the restore and its journal are kept under other names, and
+/// nothing that was set aside or staged is deleted), and never claim that all was put back.
+fn conclude_stuck(data_dir: &Path, marker: &Marker, why: &str, stuck: &[(String, bool)], holding: &Path) -> ApplyOutcome {
+    let dir = restore_dir(data_dir);
+    let list = stuck.iter().take(10).map(|(rel, _)| review::clip(rel, 120)).collect::<Vec<_>>().join(", ");
+    let more = if stuck.len() > 10 { format!(" and {} more", stuck.len() - 10) } else { String::new() };
+    let set_aside = stuck.iter().filter(|(_, had)| *had).count();
+    let mut message = format!("{why} Rolling it back did not finish: these files could not be put back: {list}{more}.");
+    if set_aside > 0 {
+        message.push_str(&format!(" Nothing was deleted: the original of {} of them is in {}.", if set_aside == stuck.len() { "each" } else { "some" }, holding.display()));
+    }
+    if set_aside < stuck.len() {
+        message.push_str(" Some of them were not there before, and the file from the backup is still in place.");
+    }
+    message.push_str(" Close whatever may be holding them (another program, a virus scanner) and copy them back by hand, or ask for help.");
+    let last = failed(&marker.id, &marker.kind, &message);
+    record_last(data_dir, &last);
+    let _ = std::fs::rename(marker_path(data_dir), dir.join(format!("failed-{}.json", marker.id)));
+    let _ = std::fs::rename(journal_path(data_dir), dir.join(format!("apply-journal-{}.jsonl", marker.id)));
+    log::error!("backup: a restore could not be rolled back completely: {} file(s), {} of them set aside in {}", stuck.len(), set_aside, holding.display());
+    ApplyOutcome::Failed(last)
+}
+
+/// A prepared restore that waited too long: its marker and, for a restore, its staged copy are removed
+/// (an undo's saved copy is not touched), and the person is told.
+fn expire(data_dir: &Path, marker: &Marker) -> ApplyOutcome {
+    let _ = discard_pending(data_dir);
+    let message = if marker.kind == KIND_UNDO {
+        "The undo you prepared was more than a day old, so it was not applied. The saved copy is still there: prepare the undo again if you still want it."
+    } else {
+        "The restore you prepared was more than a day old, so it was not applied and the prepared copy was deleted. Choose the backup again if you still want it."
+    };
+    let last = failed(&marker.id, &marker.kind, message);
+    record_last(data_dir, &last);
+    log::warn!("backup: a prepared {} was more than a day old and was thrown away unapplied", marker.kind);
+    ApplyOutcome::Expired(last)
+}
+
+fn conclude_failed(data_dir: &Path, marker: &Marker, last: LastRestore) -> ApplyOutcome {
+    let dir = restore_dir(data_dir);
+    record_last(data_dir, &last);
+    // What was staged is personal data: it does not stay behind after a failure. The folder that
+    // held what was set aside goes only if the rollback emptied it: a file still in it is the only
+    // copy of something, and stays.
+    let holding_root = dir.join(format!("undo-{}", marker.id));
+    if marker.kind == KIND_RESTORE {
+        let _ = std::fs::remove_dir_all(dir.join(&marker.source));
+    }
+    if !remove_empty_tree(&holding_root) {
+        log::warn!("backup: something set aside by the failed restore could not be put back and was kept in {}", holding_root.display());
+    }
+    let _ = std::fs::remove_file(journal_path(data_dir));
+    let _ = std::fs::remove_file(marker_path(data_dir));
+    log::warn!("backup: a restore did not finish and was rolled back");
+    ApplyOutcome::Failed(last)
+}
+
+/// Remove `path`, and the folders under it, if no file is left in them; anything that holds a file stays.
+/// True when `path` is gone.
+fn remove_empty_tree(path: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(path) else { return true };
+    let mut empty = true;
+    for entry in entries.flatten() {
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => empty &= remove_empty_tree(&entry.path()),
+            _ => empty = false,
+        }
+    }
+    empty && std::fs::remove_dir(path).is_ok()
+}
+
+/// Verify the staged files, then put each in place: the file it replaces (if any) is moved into the
+/// holding folder first, and a line is journalled before each step.
+fn apply_files(data_dir: &Path, marker: &Marker, staged_root: &Path, holding: &Path, journal_file: &Path, limits: &Limits) -> std::result::Result<Vec<(String, bool)>, String> {
+    // What is staged is what was staged: every file is there, plain, and has its hash.
+    for f in &marker.files {
+        let path = container::safe_join(staged_root, &f.name, limits).map_err(|e| e.message)?;
+        let meta = std::fs::symlink_metadata(&path).map_err(|_| "A staged file is missing, so nothing was changed.".to_string())?;
+        if !meta.is_file() || rules::is_link(&meta) || meta.len() != f.size {
+            return Err("A staged file is not what was staged, so nothing was changed.".into());
+        }
+        let (sha, _) = sha256_file(&path).map_err(|_| "A staged file could not be read, so nothing was changed.".to_string())?;
+        if sha != f.sha256 {
+            return Err("A staged file does not check out, so nothing was changed.".into());
+        }
+    }
+    let mut journal = Journal::create(journal_file).map_err(|e| format!("Could not start the restore's journal ({e})."))?;
+    let mut targets = Targets::fresh();
+    let mut applied = Vec::new();
+    for (_index, f) in marker.files.iter().enumerate() {
+        let staged = container::safe_join(staged_root, &f.name, limits).map_err(|e| e.message)?;
+        let target = data_dir.join(native(&f.name));
+        let had = match targets.state(data_dir, &f.name).map_err(|e| e.message)? {
+            Target::Absent => false,
+            Target::File => true,
+        };
+        journal.line("begin", &f.name, had, true).map_err(|e| format!("Could not write the restore's journal ({e})."))?;
+        if had {
+            let kept = holding.join(native(&f.name));
+            if let Some(parent) = kept.parent() {
+                secret_file::create_private_dir(parent).map_err(|e| format!("Could not make a folder for the saved copy ({e})."))?;
+            }
+            secret_file::rename_over(&target, &kept).map_err(|e| format!("Could not set aside a file it replaces ({e})."))?;
+        }
+        #[cfg(test)]
+        inject_at(_index)?;
+        if let Some(parent) = target.parent() {
+            secret_file::create_private_dir(parent).map_err(|e| format!("Could not make a folder ({e})."))?;
+        }
+        secret_file::rename_over(&staged, &target).map_err(|e| format!("Could not put a restored file in place ({e})."))?;
+        applied.push((f.name.clone(), had));
+    }
+    for (_position, rel) in marker.removals.iter().enumerate() {
+        let target = data_dir.join(native(rel));
+        if !matches!(targets.state(data_dir, rel).map_err(|e| e.message)?, Target::File) {
+            continue;
+        }
+        journal.line("begin", rel, true, false).map_err(|e| format!("Could not write the restore's journal ({e})."))?;
+        let kept = holding.join(native(rel));
+        if let Some(parent) = kept.parent() {
+            secret_file::create_private_dir(parent).map_err(|e| format!("Could not make a folder for the saved copy ({e})."))?;
+        }
+        secret_file::rename_over(&target, &kept).map_err(|e| format!("Could not take away a file the restore had added ({e})."))?;
+        #[cfg(test)]
+        inject_at(marker.files.len() + _position)?;
+        applied.push((rel.clone(), true));
+    }
+    journal.line("done", "", false, false).map_err(|e| format!("Could not finish the restore's journal ({e})."))?;
+    #[cfg(test)]
+    if INJECT.with(|c| c.get()) == Some(Inject::CrashAfterDone) {
+        return Err(CRASH.to_string());
+    }
+    Ok(applied)
+}
+
+/// Where a test makes an apply fail or the process "die", on this thread only.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Inject {
+    /// Fail after the file at this index was set aside and before its replacement goes in.
+    FailBeforeInstall(usize),
+    /// Die after the file at this index was set aside (nothing rolled back, nothing cleaned up).
+    CrashBeforeInstall(usize),
+    /// Die after the journal is complete, before the marker is removed.
+    CrashAfterDone,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static INJECT: std::cell::Cell<Option<Inject>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+const CRASH: &str = "__crash__";
+
+#[cfg(test)]
+fn inject_at(index: usize) -> std::result::Result<(), String> {
+    match INJECT.with(|c| c.get()) {
+        Some(Inject::FailBeforeInstall(k)) if k == index => Err("An injected failure.".to_string()),
+        Some(Inject::CrashBeforeInstall(k)) if k == index => Err(CRASH.to_string()),
+        _ => Ok(()),
+    }
+}
+
+/// The files are in place: keep the undo record, hand the Agent's storage to its page, record how it
+/// went, clean up, and remove the marker last.
+fn finalize(data_dir: &Path, marker: &Marker, applied: &[(String, bool)]) -> ApplyOutcome {
+    let dir = restore_dir(data_dir);
+    let source = dir.join(&marker.source);
+    // What was replaced or taken away is kept, for a restore and for an undo alike: an undo also
+    // overwrites and removes files, and what a person did in them since is nowhere else.
+    let record = UndoRecord {
+        id: marker.id.clone(),
+        applied_at: now(),
+        backup_created_at: marker.backup_created_at.clone(),
+        kind: marker.kind.clone(),
+        replaced: applied.iter().filter(|(_, had)| *had).map(|(r, _)| r.clone()).collect(),
+        added: applied.iter().filter(|(_, had)| !*had).map(|(r, _)| r.clone()).collect(),
+    };
+    let undo_root = dir.join(format!("undo-{}", marker.id));
+    if secret_file::create_private_dir(&undo_root).is_ok() {
+        if let Err(e) = write_json(&undo_root.join("undo.json"), &record) {
+            log::warn!("backup: could not record what the {} replaced: {e}", marker.kind);
+        }
+    }
+    // The Agent part of an earlier restore that its page has not finished taking is cancelled, whether or not this apply has an
+    // Agent part of its own: the page would otherwise take it later, over what was just put back, and nothing would say so.
+    let mut notes = marker.notes.clone();
+    if let Some(earlier) = agent::pending_import_id(data_dir).filter(|id| *id != marker.id) {
+        agent::cancel_pending_import(data_dir);
+        notes.push(if marker.kind == KIND_UNDO {
+            "The Agent's conversations and projects of the restore you undid had not been taken by the Agent's page yet, so they were cancelled: they will not be brought back.".to_string()
+        } else {
+            "The Agent's conversations and projects of an earlier restore had not been taken by the Agent's page yet, so this restore cancelled them: they will not be brought back.".to_string()
+        });
+        log::warn!("backup: the Agent's part of restore {earlier} was cancelled by {} {}", marker.kind, marker.id);
+    }
+    let mut agent_storage = "none";
+    if let Some(agent_marker) = &marker.agent {
+        let zip = source.join(&agent_marker.file);
+        // A finalize that was cut short after it handed the archive over (it moves the staged copy) is done again at the next start:
+        // what waits for the page is then already the archive that was staged, and stays.
+        // (An archive that was moved for the page before its record was written is given its record.)
+        let handed_before = agent::read_pending_import(data_dir).is_some_and(|p| p.id == marker.id && p.size == agent_marker.size && p.sha256 == agent_marker.sha256)
+            || agent::adopt_unrecorded_handover(data_dir, &marker.id, &marker.kind, agent_marker.size, &agent_marker.sha256, agent_marker.apply_settings, agent_marker.apply_keys, &agent_marker.remove);
+        // Once more, at the last moment: the page is given what was staged, or nothing (the files are in place already, so the
+        // result says what was not handed over).
+        if handed_before {
+            agent_storage = "pending";
+        } else {
+            match verify_staged_agent(&zip, agent_marker) {
+                Err(why) => {
+                    log::warn!("backup: the Agent's storage was not handed over: {why}");
+                    notes.push(format!("{why}, so it was not handed to the Agent's page."));
+                    agent_storage = "failed";
+                    // What waits for the page under this restore's id is then not the archive that was staged: it gets nothing.
+                    if agent::pending_import_id(data_dir).as_deref() == Some(marker.id.as_str()) {
+                        agent::drop_pending_import(data_dir);
+                    }
+                }
+                Ok(()) => match agent::leave_for_page(data_dir, &marker.id, &marker.kind, &zip, agent_marker.apply_settings, agent_marker.apply_keys, &agent_marker.remove) {
+                    Ok(()) => agent_storage = "pending",
+                    Err(e) => {
+                        log::warn!("backup: the Agent's storage could not be handed over: {e}");
+                        agent_storage = "failed";
+                    }
+                },
+            }
+        }
+    }
+    let last = LastRestore {
+        id: marker.id.clone(),
+        kind: marker.kind.clone(),
+        at: now(),
+        ok: true,
+        error: None,
+        redo: marker.redo.clone(),
+        agent_storage: agent_storage.to_string(),
+        notes,
+    };
+    record_last(data_dir, &last);
+    // What was staged, or (for an undo) the snapshot that was just put back, is used up; the new
+    // snapshot, of what this apply replaced, stays.
+    let _ = std::fs::remove_dir_all(&source);
+    prune_undo(data_dir);
+    let _ = std::fs::remove_file(journal_path(data_dir));
+    let _ = std::fs::remove_file(marker_path(data_dir));
+    log::info!("backup: a {} was applied ({} files)", marker.kind, applied.len());
+    ApplyOutcome::Applied(last)
+}
+
+/// Keep the newest [`KEEP_UNDO`] undo snapshots and delete the rest.
+fn prune_undo(data_dir: &Path) {
+    for (id, _) in undo_dirs(data_dir).into_iter().skip(KEEP_UNDO) {
+        let _ = std::fs::remove_dir_all(restore_dir(data_dir).join(format!("undo-{id}")));
+    }
+}
+
+// ---- what the status route reads -------------------------------------------------------------------
+
+pub fn pending_info(data_dir: &Path) -> Option<PendingInfo> {
+    let marker = read_json::<Marker>(&marker_path(data_dir))?;
+    Some(PendingInfo {
+        id: marker.id,
+        kind: marker.kind,
+        expires_at: expiry_of(&marker.staged_at),
+        expired: expired(&marker.staged_at),
+        staged_at: marker.staged_at,
+        files: (marker.files.len() + marker.removals.len()) as u64,
+        agent_storage: marker.agent.is_some(),
+        class_labels: marker.ticked.iter().map(|id| RestoreClass::from_id(id).map(|c| c.label().to_string()).unwrap_or_else(|| id.clone())).collect(),
+        classes: marker.ticked,
+    })
+}
+
+pub fn last_restore(data_dir: &Path) -> Option<LastRestore> {
+    let mut last = read_json::<LastRestore>(&last_result_path(data_dir))?;
+    // The Agent's storage waits for its page: say so only while it does.
+    if last.agent_storage == "pending" && agent::read_pending_import(data_dir).map(|p| p.id) != Some(last.id.clone()) {
+        last.agent_storage = "applied".to_string();
+    }
+    Some(last)
+}
+
+/// The Agent page said how its part of a restore went.
+pub(crate) fn record_agent_result(data_dir: &Path, id: &str, ok: bool, error: Option<&str>, warnings: &[String]) {
+    let Some(mut last) = read_json::<LastRestore>(&last_result_path(data_dir)) else { return };
+    if last.id != id {
+        return;
+    }
+    // What the page left out or could not do goes where the person reads the result, cut to what a panel shows.
+    for warning in super::parts::lines_of(warnings, super::parts::MOST_PAGE_WARNINGS_NAMED, 300) {
+        let line = format!("Agent: {warning}");
+        if !last.notes.contains(&line) {
+            last.notes.push(line);
+        }
+    }
+    if ok {
+        last.agent_storage = "applied".into();
+    } else {
+        last.agent_storage = "failed".into();
+        // The reason goes in the plain: the person may need to try again.
+        last.redo.push(format!("Restore again once the Agent is open: its conversations and projects could not be brought back ({}).", error.unwrap_or("no reason given")));
+    }
+    record_last(data_dir, &last);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many of the next renames of a rollback fail, on this thread only.
+    pub(crate) static ROLLBACK_FAILS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}

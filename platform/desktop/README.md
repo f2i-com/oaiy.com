@@ -100,6 +100,7 @@ is loopback-only.
 - `GET    /api/update/status` — whether a newer release exists (`state`, `currentVersion`, `latestVersion`, `notes`, `lastCheckedAt`, `blockers`, …). Open like health on the headless server, which only reports; on the desktop it is read like the calls are (OAIY's own pages or the token), because it says whether a call is live ([docs/UPDATES.md](../../docs/UPDATES.md))
 - `POST   /api/update/check` — look at the release feed now (a plain GET, at most once every 30 seconds; privileged). There is no route that downloads or installs: those are commands of the dashboard's own window
 - `GET    /api/config` — `{ activeDir, defaultDir, configuredDir, isCustom, restartRequired }` (read-only; changing the data dir is a desktop-only action — native picker + restart)
+- `GET    /api/backup/status` — `{ lastBackupAt, lastBackupOk, lastBackupSize, pendingRestore, lastRestore, undoAvailable, undoKind, running }` (read-only, a restricted read; `pendingRestore` carries `stagedAt`, `expiresAt` and `expired`: a prepared restore is thrown away unapplied after 24 hours). No HTTP route makes or restores a backup: those are the dashboard's own commands (see [docs/BACKUP.md](../../docs/BACKUP.md)); the other `/api/backup/*` routes are the Agent page's hand-over of its storage, for its origin only and only with a per-backup secret (an export) or the secret the desktop put in the Agent's window (an import).
 
 ### Services
 - `GET    /api/services` — registry snapshot (status, ports, errors)

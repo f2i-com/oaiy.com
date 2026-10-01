@@ -258,6 +258,12 @@ impl Updater {
         *self.activity.write().unwrap_or_else(|e| e.into_inner()) = Some(activity);
     }
 
+    /// What the app is doing, as this updater asks it: a backup asks the same source, so that the two agree about what is in the way
+    /// (None: nothing has said yet, which is still starting up).
+    pub fn activity(&self) -> Option<Arc<dyn Activity>> {
+        self.activity.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     /// Say what this build can do about an update (the desktop replaces the headless default).
     pub fn set_platform(&self, platform: Arc<dyn Platform>) {
         *self.platform.write().unwrap_or_else(|e| e.into_inner()) = platform;

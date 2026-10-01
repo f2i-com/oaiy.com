@@ -12,6 +12,8 @@ import {
 import { FolderOpen, FolderSearch, ListChecks, RotateCcw, X } from 'lucide-react';
 import { useToast } from './Toasts';
 import UpdatesSection from './UpdatesSection';
+
+import { BackupSection } from './BackupPanel';
 import { forgetGuideDismissal, openSetup, setSetupState, useSetupState } from './useSetupState';
 
 /**
@@ -456,6 +458,8 @@ export default function SettingsPanel() {
       <SetupSection />
 
       <UpdatesSection />
+
+      <BackupSection />
 
       <section className="model-section">
         <h3 className="section-title">Data folder</h3>

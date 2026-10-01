@@ -22,6 +22,8 @@ pub mod messages;
 pub mod calendar;
 pub mod modules;
 pub mod agent_tasks;
+/// Backing up OAIY's data to one encrypted file, restoring it, and undoing a restore.
+pub mod backup;
 /// The setup wizard's record (`<data>/setup.json`) and routes.
 pub mod setup;
 /// The Agent's control API: the MCP server it configures OAIY with (`/api/mcp`).
@@ -1057,7 +1059,7 @@ async fn pick_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
 /// we DON'T relaunch — we leave the working window in place and tell the user to
 /// re-run the dev command to apply the change.
 #[tauri::command]
-fn restart_app(app: tauri::AppHandle) {
+pub(crate) fn restart_app(app: tauri::AppHandle) {
     #[cfg(debug_assertions)]
     {
         use tauri_plugin_notification::NotificationExt;
@@ -1197,6 +1199,12 @@ pub fn run() {
             crate::embed::hide_embedded,
             crate::embed::set_theme,
             crate::embed::agent_intent,
+            crate::backup::commands::backup_create,
+            crate::backup::commands::backup_restore_inspect,
+            crate::backup::commands::backup_restore_stage,
+            crate::backup::commands::backup_undo_stage,
+            crate::backup::commands::backup_discard_pending,
+            crate::backup::commands::backup_restart_to_apply,
             open_path,
             log_path,
             open_url,
@@ -1232,6 +1240,14 @@ pub fn run() {
             // user relocates the data folder.
             crate::applog::LOGGER.attach(&data_dir);
             log::info!("OAIY Desktop {} starting (data={})", env!("CARGO_PKG_VERSION"), data_dir.display());
+            // A restore the person staged (or an undo) is put in place NOW, before anything below
+            // opens a store: every store then loads what was restored, and nothing has a file open.
+            crate::backup::restore::sweep_leftovers(&data_dir);
+            match crate::backup::restore::apply_pending(&data_dir) {
+                crate::backup::restore::ApplyOutcome::None => {}
+                crate::backup::restore::ApplyOutcome::Applied(done) => log::info!("backup: the staged {} was applied", done.kind),
+                crate::backup::restore::ApplyOutcome::Failed(done) | crate::backup::restore::ApplyOutcome::Expired(done) => log::warn!("backup: the staged {} was not applied: {}", done.kind, done.error.unwrap_or_default()),
+            }
             // The Agent's control tools show a page in the dashboard (a plugin's
             // setup step, say) with this event; the dashboard listens for it.
             {

@@ -6,6 +6,8 @@
  * non-2xx as thrown errors with the body's `error` field when present.
  */
 
+import { visibleText } from './visibleText';
+
 export const API_BASE = 'http://127.0.0.1:17972';
 
 async function request<T>(
@@ -1347,6 +1349,209 @@ export const appConfig = {
    * the service's next start — no app restart needed. */
   setServiceGpu: (id: string, gpu: number | null) =>
     tauriInvoke<void>('set_service_gpu', { id, gpu }),
+};
+
+// ----- backup and restore (Rust commands; the status is read over HTTP) -----
+
+/** What a backup holds, counted. */
+export interface BackupCounts {
+  files: number;
+  bytes: number;
+  agentProjects: number;
+  agentConversations: number;
+  agentFiles: number;
+}
+
+/** Something a backup leaves out on purpose, why, and what to do about it after a restore. */
+export interface BackupExcluded {
+  pattern: string;
+  reason: string;
+  redo?: string;
+}
+
+/** A backup that was written and read back to check it. */
+export interface BackupCreateResult {
+  path: string;
+  fileName: string;
+  size: number;
+  createdAt: string;
+  counts: BackupCounts;
+  includesKeys: boolean;
+  /** Plain warnings: what could not be included (e.g. the Agent's conversations). */
+  partial: string[];
+  excluded: BackupExcluded[];
+  verified: boolean;
+}
+
+/** What restoring would do to one kind of data. */
+export interface RestoreCategory {
+  id: string;
+  label: string;
+  added: number;
+  replaced: number;
+  unchanged: number;
+  leftAlone: number;
+}
+
+/**
+ * The kinds of thing in a backup that can run programs, send messages, point OAIY at another
+ * server or change what OAIY and the Agent may do. Each is brought back only when it is ticked.
+ */
+export type RestoreClassId = 'settings' | 'templates' | 'flows' | 'providers' | 'connections' | 'plugins' | 'agentSettings' | 'voices' | 'memory' | 'calendar' | 'messages' | 'transfers' | 'conversations' | 'outreach' | 'agentData';
+
+/** One such kind, and how many items of it the backup holds. */
+export interface RestoreClass {
+  id: RestoreClassId;
+  label: string;
+  description: string;
+  count: number;
+}
+
+/** One item of such a kind, by its name in the backup, and what it does. */
+export interface ReviewItem {
+  class: RestoreClassId;
+  name: string;
+  title: string;
+  what: string;
+}
+
+/** Something in a backup that is not brought back, and why. */
+export interface NotRestored {
+  name: string;
+  why: string;
+}
+
+/** The dry run of a restore: what is in the file and what would change. Nothing has changed yet. */
+export interface RestorePreview {
+  inspectId: string;
+  fileName: string;
+  createdAt: string;
+  appVersion: string;
+  platform: string;
+  includesKeys: boolean;
+  categories: RestoreCategory[];
+  /** What the backup does not have. */
+  lacks: string[];
+  /** Warnings recorded when the backup was made. */
+  partial: string[];
+  excluded: BackupExcluded[];
+  /** What the person has to do again afterwards. */
+  redo: string[];
+  totalFiles: number;
+  totalBytes: number;
+  /** The kinds of item that can run or reconfigure things: each needs its own tick. */
+  classes: RestoreClass[];
+  /** Every item of those kinds, by name. */
+  items: ReviewItem[];
+  /** What the backup holds that is never restored: a name OAIY does not know ("not restored: unknown item"), or a key of a settings file that is excluded. */
+  notRestored: NotRestored[];
+  /** Whether the file holds API keys (the person decides at restore time whether they come back). */
+  keys: { inBackup: boolean };
+  notes: string[];
+}
+
+/** What the person ticked when they prepared a restore. */
+export interface RestoreTicks {
+  classes: RestoreClassId[];
+  keys: boolean;
+}
+
+/** A restore (or an undo) made ready; it is applied at the next start. */
+export interface StagedRestore {
+  id: string;
+  kind: 'restore' | 'undo';
+  files: number;
+  bytes: number;
+  agentStorage: boolean;
+  redo: string[];
+  /** Plain lines: what was left out, stripped or skipped. */
+  skipped: string[];
+}
+
+export type BackupPhase = 'collecting' | 'agent' | 'packing' | 'encrypting' | 'verifying';
+
+export interface BackupStatus {
+  lastBackupAt: string | null;
+  lastBackupOk: boolean | null;
+  lastBackupSize: number | null;
+  /** A restore that waits for the next start (and is discarded, unapplied, after `expiresAt`). */
+  pendingRestore: null | {
+    id: string;
+    kind: 'restore' | 'undo';
+    stagedAt: string;
+    expiresAt: string;
+    /** It has waited more than a day: the next start discards it unapplied, and restarting for it is pointless. */
+    expired: boolean;
+    files: number;
+    agentStorage: boolean;
+    /** The kinds of item the person ticked (ids), for a restore. */
+    classes: string[];
+    /** The same, in the words the desktop calls them by (the labels of the kinds the dry run listed). */
+    classLabels?: string[];
+  };
+  /** How the last restore (or undo) went, reported at the start that applied it (or refused to). */
+  lastRestore: null | {
+    id: string;
+    kind: 'restore' | 'undo';
+    at: string;
+    ok: boolean;
+    error?: string;
+    redo: string[];
+    notes: string[];
+    agentStorage: 'applied' | 'pending' | 'failed' | 'none';
+  };
+  undoAvailable: boolean;
+  /** Whether the snapshot an undo would use came from a restore or from an undo (then it is a redo). */
+  undoKind: 'restore' | 'undo' | null;
+  /** A backup being made right now. */
+  running: null | { phase: BackupPhase; label: string };
+}
+
+/**
+ * Backup and restore. The commands open the native save and open dialogs themselves (no path ever
+ * passes through here), and take the passphrase as an argument only: it is never stored.
+ */
+/**
+ * The dry run as the person reads it: every text in it that came from a backup has the characters they cannot see made visible (a tag,
+ * a zero-width or a direction character), whoever built it. The desktop does it too; this is the last place before the screen.
+ */
+export function inPlainSight(preview: RestorePreview): RestorePreview {
+  const seen = (list: string[]) => list.map(visibleText);
+  return {
+    ...preview,
+    lacks: seen(preview.lacks),
+    partial: seen(preview.partial),
+    excluded: preview.excluded.map((e) => ({ ...e, pattern: visibleText(e.pattern), reason: visibleText(e.reason), ...(e.redo === undefined || e.redo === null ? {} : { redo: visibleText(e.redo) }) })),
+    redo: seen(preview.redo),
+    items: preview.items.map((i) => ({ ...i, name: visibleText(i.name), title: visibleText(i.title), what: visibleText(i.what) })),
+    notRestored: preview.notRestored.map((n) => ({ name: visibleText(n.name), why: visibleText(n.why) })),
+    notes: seen(preview.notes),
+  };
+}
+
+const staged = (made: StagedRestore): StagedRestore => ({ ...made, redo: made.redo.map(visibleText), skipped: made.skipped.map(visibleText) });
+
+export const backup = {
+  status: () =>
+    request<BackupStatus>('/api/backup/status').then((s) => (s.lastRestore ? { ...s, lastRestore: { ...s.lastRestore, ...(s.lastRestore.error ? { error: visibleText(s.lastRestore.error) } : {}), redo: s.lastRestore.redo.map(visibleText), notes: s.lastRestore.notes.map(visibleText) } } : s)),
+  /** Make a backup; `null` when the person closed the save dialog. */
+  create: (passphrase: string, includeKeys: boolean) =>
+    tauriInvoke<BackupCreateResult | null>('backup_create', { passphrase, includeKeys }),
+  /** Choose a backup and check it (nothing changes); `null` when the person closed the dialog. */
+  inspectRestore: (passphrase: string) =>
+    tauriInvoke<RestorePreview | null>('backup_restore_inspect', { passphrase }).then((found) => (found ? inPlainSight(found) : found)),
+  /**
+   * Make the checked restore ready: it is applied at the next start. Only the kinds of item
+   * ticked (and, with `keys`, the API keys in the backup) are brought back besides the data.
+   */
+  stageRestore: (inspectId: string, passphrase: string, ticks: RestoreTicks) =>
+    tauriInvoke<StagedRestore>('backup_restore_stage', { inspectId, passphrase, classes: ticks.classes, keys: ticks.keys }).then(staged),
+  /** Make "undo the last restore" ready the same way. */
+  undo: () => tauriInvoke<StagedRestore>('backup_undo_stage').then(staged),
+  /** Cancel a restore that waits for the next start. */
+  discardPending: () => tauriInvoke<void>('backup_discard_pending'),
+  /** Restart OAIY so the waiting restore is applied; refused while the app is busy. */
+  restartToApply: () => tauriInvoke<void>('backup_restart_to_apply'),
 };
 
 // ----- calendar -----

@@ -1,0 +1,43 @@
+# The Agent's storage as its page keeps it and its export names it (`opfs/...` is the private file system; the layout is
+# in app/src/vfs/projects.ts), then what the table says of each name (excluded, data, runs, or unknown: not in the table,
+# so never restored). The test reads this file and checks the table's answer for every line.
+
+agent-manifest.json	excluded
+idb/settings.json	runs
+opfs/projects/p1/project.json	runs
+opfs/projects/p1/chat.json	runs
+opfs/projects/p1/files/index.html	runs
+opfs/projects/p1/files/js/app.js	runs
+opfs/projects/p1/sessions/index.json	runs
+opfs/projects/p1/sessions/thread-a.json	runs
+opfs/projects/oaiy-setup/project.json	runs
+opfs/projects/oaiy-setup/files/README.md	runs
+opfs/front-desk/project.json	runs
+opfs/front-desk/chat.json	runs
+opfs/front-desk/callers.json	runs
+opfs/front-desk/contacts-moved.json	runs
+opfs/front-desk/callbacks.json	excluded
+opfs/front-desk/outreach/index.json	runs
+opfs/front-desk/outreach/out-mk1-ab12.json	runs
+opfs/front-desk/outreach/do-not-contact.json	data
+opfs/front-desk/sessions/index.json	runs
+opfs/front-desk/sessions/thread-1.json	runs
+opfs/front-desk/files/brief.md	runs
+opfs/front-desk/files/knowledge/README.md	runs
+opfs/front-desk/files/knowledge/prices.md	runs
+opfs/front-desk/files/outreach/reminders/results.md	runs
+opfs/front-desk/.backup-2026-09-29/callers.json	excluded
+opfs/front-desk/.backup-2026-09-29/callbacks.json	excluded
+opfs/front-desk/.backup-2026-09-29/sessions/index.json	excluded
+opfs/front-desk/brief.md	unknown
+opfs/front-desk/Brief.md	unknown
+opfs/front-desk/knowledge/x.md	unknown
+opfs/front-desk/outreach/nested/x.json	unknown
+opfs/front-desk/anything-new.json	unknown
+opfs/projects/p1/callers.json	unknown
+opfs/projects/p1/outreach/index.json	unknown
+opfs/projects/p1/anything-new.json	unknown
+opfs/other/x.json	unknown
+opfs/settings.json	unknown
+idb/other.json	unknown
+idb/secret-key.json	unknown

@@ -14,6 +14,7 @@ import {
 import { peek, put } from './useCached';
 import SetupGuidePanel from './SetupGuidePanel';
 import UpdateBanner from './UpdateBanner';
+import { BackupLine } from './BackupPanel';
 import TodayPanel from './TodayPanel';
 import { dismissGuide, reopenGuide, shouldAutoOpen } from './setupGuide';
 import type { StepTarget } from './setupGuide';
@@ -373,6 +374,7 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
             <small>Connected apps</small>
           </button>
         </div>
+        <BackupLine onOpenSettings={() => onNavigate('settings')} />
       </section>
 
       {/* Anything actionable, rather than making the user hunt for it. While the

@@ -226,6 +226,21 @@ pub static ROUTES: &[Route] = &[
     //   before an update".
     // - `POST /api/plugins/:id/trust` (under `plugins.install`) trusts native code.
     scope(Verb::Get, "/api/update/status", "system.read"),
+    // The encrypted backup (`backup/routes.rs`) was built before the access model merged, and is not in Appendix B (the vault design
+    // reserves other `/api/backup` routes, which stay as they are below). Eight rows, each classified on purpose, `since: 1`: the routes
+    // exist, and `legacy` mode keeps the guard they were built with (the lines of `is_backup_path` in `http.rs`, which the frozen guard
+    // copies, marked). No scope is dangerous, and none of the eight restores or overwrites a setting: making and restoring a backup are
+    // commands of the dashboard's own window (`backup_create`, `backup_restore_stage`, ...), not routes, and the desktop applies a restore
+    // itself, at the next start, from files the owner looked at and ticked.
+    //
+    // - `GET /api/backup/status` is `system.read`, beside `GET /api/update/status`: when the last backup was made, whether a restore waits
+    //   for the next start and how the last one went. The dashboard's window reads it; a monitor may.
+    // - The Agent page's hand-over of its own storage (seven routes, below under `agent.serve`) is the same kind of route as the page's
+    //   answer to "save your work before an update": the desktop asks the page for its conversations and projects when the owner makes a
+    //   backup, and hands the page what a restore left for it, and the page answers. Each takes a session secret that only the desktop and
+    //   the page hold, so a credential with the scope alone can do nothing with them, and `agent.serve` is held by the `agent` preset and
+    //   `owner` alone.
+    scope(Verb::Get, "/api/backup/status", "system.read"),
     // logs.read
     scope(Verb::Get, "/api/node/logs", "logs.read"),
     scope(Verb::Get, "/api/python/logs", "logs.read"),
@@ -500,6 +515,29 @@ pub static ROUTES: &[Route] = &[
         "agent.serve",
     ),
     scope(Verb::Post, "/api/update/agent-flushed", "agent.serve"),
+    scope(Verb::Post, "/api/backup/agent/:id/part", "agent.serve"),
+    scope(Verb::Post, "/api/backup/agent/:id/done", "agent.serve"),
+    scope(Verb::Get, "/api/backup/agent-import", "agent.serve"),
+    scope(
+        Verb::Get,
+        "/api/backup/agent-import/:id/part/:index",
+        "agent.serve",
+    ),
+    scope(
+        Verb::Post,
+        "/api/backup/agent-import/:id/undo-part",
+        "agent.serve",
+    ),
+    scope(
+        Verb::Post,
+        "/api/backup/agent-import/:id/undo-done",
+        "agent.serve",
+    ),
+    scope(
+        Verb::Post,
+        "/api/backup/agent-import/:id/done",
+        "agent.serve",
+    ),
     // agent.settings
     scope(Verb::Put, "/api/agent/preferences", "agent.settings"),
     scope_new(Verb::Post, "/api/agent/intents", "agent.settings"),
@@ -1050,12 +1088,12 @@ mod tests {
         // seven of the receptionist's transfers and messages).
         assert_eq!(
             want.len(),
-            161 + 41 + 60 - 1 + 4 + 7,
+            161 + 41 + 60 - 1 + 4 + 7 + 8,
             "the rows of the design and its documented differences"
         );
         assert_eq!(
-            added, 11,
-            "the routes added since the appendix are the eleven the file lists"
+            added, 19,
+            "the routes added since the appendix are the nineteen the file lists"
         );
         // Four rows the appendix reserves were built (the messages and the ring's settings): the scope is the
         // design's and the `since` is 1, since the routes exist.

@@ -445,6 +445,46 @@ mod process_tests {
     }
 
     #[test]
+    fn what_stops_an_update_because_of_the_phone_stops_a_backup_the_real_probes_and_a_real_plugin_included() {
+        // The real path: the desktop's `Probes` asking a running phone plugin (a real child process), read once, and what
+        // an update makes of it beside what a backup makes of it.
+        if !has_node() {
+            return;
+        }
+        let phone_only = |codes: Vec<&'static str>| codes.into_iter().filter(|c| matches!(*c, "phoneCall" | "callUnknown")).collect::<Vec<_>>();
+        for (name, live, behavior, want) in [
+            // A call in the plugin's own pipeline (a legacy mode) that OAIY's own line never sees.
+            ("legacy", &["call.switchboard", "call.current"][..], json!({ "mode": "answer", "data": { "foreground": call(), "waiting": null, "parked": null } }), vec!["phoneCall"]),
+            // A plugin that is running and does not answer, and one that answers with an error.
+            ("hang", &["call.switchboard"][..], json!({ "mode": "hang" }), vec!["callUnknown"]),
+            ("error", &["call.switchboard"][..], json!({ "mode": "error" }), vec!["callUnknown"]),
+            // And one that says the line is quiet blocks neither.
+            ("idle", &["call.switchboard", "call.current"][..], idle_board(), vec![]),
+        ] {
+            let sb = Sandbox::new(name);
+            let host = host(&sb);
+            install(&sb, live, behavior);
+            start(&host);
+            let probes = Probes { phone: Some(Arc::new(PluginLine::with_timeout(host.clone(), Duration::from_millis(800)))), ..Default::default() };
+            let readings = probes.read(true);
+            let update = phone_only(compute(Some(&readings), Duration::from_secs(3600)).iter().map(|b| b.code).collect());
+            let backup = crate::backup::busy::Busy::from_readings(&readings);
+            assert_eq!(update, want, "{name}: an update");
+            assert_eq!(phone_only(backup.codes()), want, "{name}: a backup, the same");
+            if !want.is_empty() {
+                let refusal = backup.refuse_if_busy("making a backup").unwrap_err();
+                assert_eq!(refusal.kind, crate::backup::ErrorKind::Busy, "{name}");
+                assert!(refusal.message.starts_with("Making a backup has to wait.") && refusal.message.contains("Line Test Plugin"), "{name}: {refusal}");
+                if want == ["callUnknown"] {
+                    // The words are the update's, with what waits changed: a backup does not "restart".
+                    assert!(refusal.message.contains("It does not start a backup or a restore while it can't tell") && !refusal.message.contains("does not restart"), "{name}: {refusal}");
+                }
+            }
+            host.stop("line").unwrap();
+        }
+    }
+
+    #[test]
     fn a_ringing_call_a_waiting_caller_and_a_call_on_hold_each_count() {
         for (name, board) in [
             ("ringing", json!({ "foreground": { "callId": "c", "state": "ringing" }, "waiting": null, "parked": null })),

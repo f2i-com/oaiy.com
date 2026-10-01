@@ -65,6 +65,28 @@ describe("the runner's outreach tools", () => {
     expect(await tool('outreach_results').run({ id: c.id, format: 'csv' })).toMatch(/^name,number,outcome,summary,tries,last_contact,conversation\nJane Smith,'\+61412345678,queued,/);
   });
 
+  it('a campaign that came from a backup is started by the person, not by the agent: outreach_resume tells it to ask', async () => {
+    const { engine, tool, dials } = setup();
+    await tool('start_outreach').run(INPUT);
+    const c = engine.campaigns[0] as Campaign;
+    await tool('outreach_pause').run({ id: c.id });
+    // What a restore leaves: paused, and never approved on this computer.
+    c.approvedAt = 0;
+    const said = await tool('outreach_resume').run({ id: c.id });
+    expect(said).toContain('came from a backup and has not been approved on this computer');
+    expect(said).toContain('Ask your person');
+    expect(c.state).toBe('paused');
+    expect(c.approvedAt).toBe(0);
+    expect(dials).toEqual([]);
+    // Its card's Resume (the person) does start it, and that is the approval.
+    expect(engine.resume(c.id)).toBe('Resumed "Confirm Friday bookings".');
+    expect(c.state).toBe('running');
+    expect(c.approvedAt).toBeGreaterThan(0);
+    // And a campaign the person has already approved is resumed by the agent as before.
+    await tool('outreach_pause').run({ id: c.id });
+    expect(await tool('outreach_resume').run({ id: c.id })).toBe('Resumed "Confirm Friday bookings".');
+  });
+
   it('declined, nothing is started, and the agent is told not to try again unasked', async () => {
     const { engine, tool, dials } = setup({ approve: false });
     expect(await tool('start_outreach').run(INPUT)).toBe('The person declined, so nothing was sent or dialled. Do not start it again unless they ask.');
