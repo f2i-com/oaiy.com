@@ -194,7 +194,7 @@ final class AokieApi
     public static function pull(Context $ctx, Request $req, ?Principal $p, array $m): Response
     {
         return Facade::run($ctx, static function () use ($ctx, $req): Response {
-            // A read that will wait is a hold: it is judged on the bearer alone before the database is touched (wait=0 holds nothing).
+            // A read that will wait is a hold: it is judged on the bearer alone before the request does any database work of its own (wait=0 holds nothing).
             $waits = $req->hasQuery('wait') && (Json::queryInt($req->q('wait'), 0) ?? 0) > 0;
             $f = Facade::identify($ctx, $req, $waits);
             $since = Facade::cursor($req);

@@ -170,8 +170,8 @@ final class Facade
     }
 
     /**
-     * A stream open or a frames wait, admitted or refused on what the verified bearer says, before the database is touched (a refusal
-     * is a read of one folder and of one row). Two bounds per party (the plugin, or one phone) whatever admissions it holds: at most
+     * A stream open or a frames wait, admitted or refused on what the verified bearer says, before the request does any database work of
+     * its own (a refusal is a read of one folder and of the one row of the party's bucket, and writes nothing). Two bounds per party (the plugin, or one phone) whatever admissions it holds: at most
      * Holds::STREAM_INFLIGHT_MAX running at once, the ones being superseded included (each pins a worker until it notices, about 250
      * ms), and a bucket of Holds::OPEN_BUCKET opens refilled at Holds::OPEN_REFILL_PER_S a second. Both are 429 rate_limited with
      * Retry-After. An honest carrier opens one stream at a time and reopens when it ends; a burst of fifty from one party cannot
