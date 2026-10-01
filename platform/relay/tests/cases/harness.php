@@ -143,8 +143,8 @@ test('harness: the runner fails a test that leaves a process behind (checked aft
     contains('FAIL  has a cleanup that fails', $out);
     contains('cleanup: would not stop', $out);
     not_contains('FAIL  is clean', $out);
-    ok(!Procs::alive($pid), "and the runner ended the sleeper (pid $pid): it is not running");
-    ok(!Procs::alive($orphan), "and the detached process (pid $orphan)");
+    ok(Procs::gone($pid, 3.0), "and the runner ended the sleeper (pid $pid): it is gone within three seconds (it sleeps for 120)");
+    ok(Procs::gone($orphan, 3.0), "and the detached process (pid $orphan)");
 });
 
 test('harness: when the check is made only at the end of a run, a process that nothing stopped still fails the run, which names it and ends it', function () {
@@ -155,8 +155,8 @@ test('harness: when the check is made only at the end of a run, a process that n
     contains('FAIL  the run left a process behind: pid ' . $orphan, $out, 'the detached one too');
     contains('the run left 2 process(es) behind', $out);
     not_contains('still running after the test', $out);
-    ok(!Procs::alive($pid), "and the runner ended the sleeper (pid $pid): it is not running");
-    ok(!Procs::alive($orphan), "and the detached process (pid $orphan)");
+    ok(Procs::gone($pid, 3.0), "and the runner ended the sleeper (pid $pid): it is gone within three seconds (it sleeps for 120)");
+    ok(Procs::gone($orphan, 3.0), "and the detached process (pid $orphan)");
 });
 
 test('harness: what a test declares kept (the shared database server) is exempt together with everything below it, found below the runner or by the root its command line names (a server can be a launcher and a child with the same data folder)', function () {
