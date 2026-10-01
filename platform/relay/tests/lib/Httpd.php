@@ -20,6 +20,9 @@ final class Httpd
     /** @var resource|null */
     private $proc = null;
     private int $pid = 0;
+    private bool $stopped = false;
+    /** @var list<resource> servers that would not stop: kept so that nothing waits for them before the runner has ended them */
+    private static array $unstopped = [];
 
     /** @return array{0:string,1:string}|null the binary and its modules folder, or null where there is no Apache to use */
     public static function find(): ?array
@@ -73,7 +76,10 @@ final class Httpd
             $conf = $s->dir . '/httpd.conf';
             file_put_contents($conf, self::config($s->dir, $bin, $mods, $s->port, $docroot, $allowRoot, $opt['allowOverride'] ?? 'All', $opt['without'] ?? []) . ($opt['extra'] ?? ''));
             $log = $s->dir . '/out.log';
-            $cmd = [$bin, '-f', $conf, '-d', dirname($bin, 2)];
+            // -D FOREGROUND: the process started here stays the master (without it Apache on Linux forks a daemon and the process
+            // started here exits at once, so that stopping it stops nothing, and every test left an apache2 behind).
+            $cmd = [$bin, '-f', $conf, '-d', dirname($bin, 2), '-D', 'FOREGROUND'];
+            $s->stopped = false;
             $s->proc = proc_open($cmd, [0 => ['pipe', 'r'], 1 => ['file', $log, 'a'], 2 => ['file', $log, 'a']], $pipes, $s->dir);
             if (!is_resource($s->proc)) {
                 return null;
@@ -126,22 +132,71 @@ final class Httpd
         return $c;
     }
 
+    /**
+     * Stop the server, and be sure it is stopped: the master (and what it started) is ended by its pid, and by the pid in its own pid
+     * file where that is another (a configuration that detaches), politely first and then at once, and the call fails if any of
+     * them is still alive, so a test that cannot stop its Apache is a failed test and not a daemon left behind.
+     */
     public function stop(): void
     {
-        if (!is_resource($this->proc)) {
+        if ($this->stopped) {
             return;
         }
-        if (stripos(PHP_OS, 'WIN') === 0 && $this->pid > 0) {
-            @exec('taskkill /PID ' . $this->pid . ' /T /F 2>&1'); // the parent and the child the Windows MPM starts
-        } else {
-            @proc_terminate($this->proc);
+        $this->stopped = true;
+        $pids = $this->pid > 0 ? [$this->pid] : [];
+        $recorded = $this->recordedMaster();
+        if ($recorded > 0 && !in_array($recorded, $pids, true)) {
+            $pids[] = $recorded;
         }
-        $deadline = microtime(true) + 3.0;
-        while (microtime(true) < $deadline && proc_get_status($this->proc)['running']) {
-            usleep(50000);
+        foreach ($pids as $pid) {
+            Procs::end($pid); // SIGTERM: Apache's fast stop, the master ends its children and itself (taskkill /T /F on Windows)
         }
-        @proc_close($this->proc);
+        $alive = [];
+        foreach ($pids as $pid) {
+            if (!Procs::gone($pid, 4.0)) {
+                Procs::end($pid, true);
+                if (!Procs::gone($pid, 3.0)) {
+                    $alive[] = $pid;
+                }
+            }
+        }
+        if (is_resource($this->proc)) {
+            if (proc_get_status($this->proc)['running']) {
+                // proc_close() of a process that is still running waits for it for ever (so does the resource's destructor): keep the
+                // resource until the run ends, where the runner ends what is left by its pid and the wait returns.
+                self::$unstopped[] = $this->proc;
+            } else {
+                @proc_close($this->proc);
+            }
+        }
         $this->proc = null;
+        if ($alive) {
+            throw new \RuntimeException('httpd is still running after it was stopped: pid ' . implode(', ', $alive));
+        }
+    }
+
+    /**
+     * The master's pid from its own pid file, when that is a process of this server (its command line names this server's configuration:
+     * a pid file can be stale, and its number can belong to something else by now, which is never touched). 0 where it cannot be told.
+     */
+    private function recordedMaster(): int
+    {
+        $f = $this->dir . '/httpd.pid';
+        if (stripos(PHP_OS, 'WIN') === 0 || !is_file($f)) {
+            return 0;
+        }
+        $pid = (int)trim((string)@file_get_contents($f));
+        if ($pid <= 0) {
+            return 0;
+        }
+        $cmd = str_replace("\0", ' ', (string)@file_get_contents('/proc/' . $pid . '/cmdline'));
+        return strpos($cmd, $this->dir . '/httpd.conf') !== false ? $pid : 0;
+    }
+
+    /** The pid of the process started for this server (its master, with -D FOREGROUND). */
+    public function pid(): int
+    {
+        return $this->pid;
     }
 
     public function base(): string

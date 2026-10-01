@@ -94,7 +94,9 @@ foreach (array_slice($_SERVER['argv'], 1) as $arg) {
     }
 }
 
-foreach (glob($testsDir . '/cases/*.php') as $file) {
+// OAIY_TEST_CASES names another folder of cases: the harness's own test runs the runner over a test that leaves a process behind.
+$casesDir = getenv('OAIY_TEST_CASES');
+foreach (glob((is_string($casesDir) && $casesDir !== '' ? rtrim(str_replace('\\', '/', $casesDir), '/') : $testsDir . '/cases') . '/*.php') as $file) {
     \OaiyTest\Registry::file(basename($file, '.php'));
     require $file;
 }
@@ -112,6 +114,7 @@ if ($list) {
 $passed = 0;
 $failed = [];
 $skipped = [];
+$procsEach = \OaiyTest\Procs::eachTest();
 $started = microtime(true);
 $slowNotRun = 0;
 foreach ($tests as $t) {
@@ -133,7 +136,9 @@ foreach ($tests as $t) {
         $slowNotRun++;
         continue;
     }
+    $before = $procsEach ? \OaiyTest\Procs::below() : [];
     $t0 = microtime(true);
+    $outcome = 'fail';
     // The relay lowers the time limit while it holds a request (set_time_limit); in process that would otherwise end the run.
     @set_time_limit(0);
     try {
@@ -141,23 +146,58 @@ foreach ($tests as $t) {
         ($t['fn'])();
         \OaiyTest\Relay::verifyCounters(); // after every test: the counters of every relay it made equal a recount
         $passed++;
+        $outcome = 'pass';
         if ($verbose) {
             printf("  ok    %s (%.2fs)\n", $t['name'], microtime(true) - $t0);
         }
     } catch (\OaiyTest\SkipException $e) {
+        $outcome = 'skip';
         $skipped[] = [$t['name'], $e->getMessage()];
         printf("  skip  %s -> %s\n", $t['name'], $e->getMessage());
     } catch (\Throwable $e) {
         $failed[] = $t['name'];
         printf("  FAIL  %s\n        %s: %s\n        at %s:%d\n", $t['name'], get_class($e), $e->getMessage(), basename($e->getFile()), $e->getLine());
-        if ($stop) {
-            break;
-        }
     }
-    \OaiyTest\Tmp::afterTest();
+    // A test leaves nothing running: what it started is stopped by what it registered with Tmp::after, and the runner checks. A server
+    // that would not stop, or a process that is still there once the test is over, is a failure of that test, and is ended so that it
+    // is not counted against the tests after it.
+    $leaks = [];
+    foreach (\OaiyTest\Tmp::afterTest() as $problem) {
+        $leaks[] = 'cleanup: ' . $problem;
+    }
+    $left = $procsEach ? \OaiyTest\Procs::leftSince($before) : [];
+    foreach ($left as $pid => $cmd) {
+        $leaks[] = sprintf('still running after the test: pid %d, %s', $pid, substr($cmd, 0, 110));
+        \OaiyTest\Procs::end($pid, true);
+    }
+    if ($leaks) {
+        if ($outcome === 'pass') {
+            $passed--;
+            $failed[] = $t['name'];
+        } elseif ($outcome === 'skip') {
+            $failed[] = $t['name'];
+        }
+        printf("  FAIL  %s\n        left a process or a server behind:\n          %s\n", $t['name'], implode("\n          ", $leaks));
+    }
     \OaiyTest\Relay::forget();
+    if ($stop && ($outcome === 'fail' || $leaks)) {
+        break;
+    }
 }
 \OaiyTest\Tmp::cleanup();
+// The end of the run: nothing the run started is still alive (the shared database server included, which Tmp::cleanup() has stopped).
+\OaiyTest\Procs::releaseKept();
+$endLeft = \OaiyTest\Procs::leftSince([], 5.0);
+foreach ($endLeft as $pid => $cmd) {
+    printf("  FAIL  the run left a process behind: pid %d, %s\n", $pid, substr($cmd, 0, 110));
+    \OaiyTest\Procs::end($pid, true);
+}
+if ($endLeft) {
+    $failed[] = 'the run left ' . count($endLeft) . ' process(es) behind';
+}
+if (\OaiyTest\Procs::$blind) {
+    echo "  note: the process table could not be read here, so what the tests leave running was not checked\n";
+}
 
 printf("\nphp %s: %d passed, %d failed, %d skipped in %.1fs\n", PHP_VERSION, $passed, count($failed), count($skipped), microtime(true) - $started);
 if ($slowNotRun > 0) {

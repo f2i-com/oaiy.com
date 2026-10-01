@@ -66,14 +66,21 @@ final class Tmp
         self::$onCleanup[] = $fn;
     }
 
-    public static function afterTest(): void
+    /**
+     * Run what the test asked to be done when it ends (servers stopped), then remove its folders.
+     *
+     * @return list<string> what a cleanup could not do (a server that would not stop): the runner fails the test with it
+     */
+    public static function afterTest(): array
     {
+        $problems = [];
         $fns = array_reverse(self::$afterTest);
         self::$afterTest = [];
         foreach ($fns as $fn) {
             try {
                 $fn();
             } catch (\Throwable $e) {
+                $problems[] = $e->getMessage();
                 fwrite(STDERR, 'cleanup failed: ' . $e->getMessage() . "\n");
             }
         }
@@ -81,6 +88,7 @@ final class Tmp
             self::rm($d);
         }
         self::$perTest = [];
+        return $problems;
     }
 
     public static function cleanup(): void

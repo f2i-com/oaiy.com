@@ -74,6 +74,7 @@ final class MysqlServer
         $this->port = Server::freePort();
         $this->initialise();
         $this->start();
+        Procs::keep((int)proc_get_status($this->proc)['pid']); // it lives until the end of the run, whatever test started it
         Tmp::onCleanup([$this, 'stop']);
     }
 
