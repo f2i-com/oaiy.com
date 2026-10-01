@@ -5,6 +5,7 @@ use ggml_rs::{Backend, Tensor};
 use llama_rs::{KvCache, qwen35::SsmConfig};
 use std::sync::Arc;
 
+#[derive(Clone)]
 pub struct Snapshot {
     pub pos: usize,
     layers: Vec<[Option<Tensor>; 4]>, // K, V, delta-net, convolution
@@ -13,6 +14,8 @@ pub struct Snapshot {
 /// Conversation checkpoints reuse the append-only attention prefix already on
 /// the GPUs. Only recurrent/conv state needs a separate copy at each boundary.
 /// Unlike a disk snapshot, this is usable only while that prefix is still live.
+/// (Cloned when the engine sets a conversation aside and keeps using its checkpoints.)
+#[derive(Clone)]
 pub struct RecurrentSnapshot(Snapshot);
 
 impl RecurrentSnapshot {

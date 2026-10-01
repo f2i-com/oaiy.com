@@ -66,25 +66,28 @@ it (a runner and a call's sub-agent that share only a short system prompt), each
 is read again at every switch: 36 s for 21,000 tokens, where the conversation alone is cached
 and takes under a second.
 
-So a state the engine is about to lose is copied to host RAM first (about 60 KB a token, so
-1.3 GB for a 21,000-token conversation, with its checkpoints about 1.8 GB), and comes back when a
-later prompt continues it. `--park-gb` bounds the RAM (default 8, never more than half of what is
-free, 0 = off); Studio's `llm.park_gb` passes it.
+So a state the engine is about to lose is copied to host RAM first (the model's dimensions make
+it about 60 KB a token: 1.3 GB for a 21,000-token conversation, a little under 2 GB with its
+checkpoints), and comes back when a later prompt continues it. `--park-gb` bounds the RAM
+(default 8, never more than half of what is free, 0 = off); Studio's `llm.park_gb` passes it.
 
 - It happens only when the engine displaces a state, never after each turn: a prompt that
   continues a stashed state sets the live one aside and brings that one back; a prompt that
-  shares less than half of a big live state sets that one aside before it is discarded. A
-  conversation that branches (a larger share) is the checkpoints' business, as before.
-- States of 1,024 tokens or fewer are not kept, and one is brought back only when it saves 1,024
-  more tokens than the live one.
-- The oldest goes first when the budget is full.
+  shares less than half of a big live state sets that one aside before it throws it away (or
+  rolls it back to a checkpoint and writes over it, when the conversations share a system
+  prompt that ends at a message boundary; then the stash gets copies, because the new prompt
+  still needs the checkpoint). A conversation that branches (a larger share) is the
+  checkpoints' business, as before.
+- A state shorter than 1,024 tokens is not kept, and one is brought back only when it saves
+  1,024 tokens or more than the live one does.
+- The one set aside longest ago goes first when the budget is full.
 - An incognito request neither takes from the stash nor adds to it, and when an incognito
   request or session ends the stash is emptied with the rest of what the engine holds.
 - A copy that cannot be made or put back (a cache of another shape, a device that refuses the
   memory) falls back to reading the prompt, as before. Nothing else about a request changes.
-- The log says so: `Qwen park: stashed 21097 tokens (1790 MB) in 0.4s; 1 states, 1790 MB held`,
-  `Qwen restore: 21097 tokens (1790 MB) in 0.5s`, and `Qwen cache: 21097/21134 tokens from ram
-  (common 21097)`, where the time includes the copies. The reply's `cache_source` is `ram`.
+- The log says so: `Qwen park: stashed N tokens (X MB) in Ys; M states, Z MB held`, `Qwen
+  restore: N tokens (X MB) in Ys`, and `Qwen cache: S/N tokens from ram (common C) in Ys`, where
+  that time includes the copies. The reply's `cache_source` is `ram`.
 
 The decode graphs need nothing from a restore: every step captures its graph again from the
 buffers at hand and updates the old one to the new addresses, so the caches may be grown or

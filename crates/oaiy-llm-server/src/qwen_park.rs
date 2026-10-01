@@ -6,7 +6,7 @@
 //! prompt again at every switch: 36 s for a 21,000-token prompt that costs 0.3 to 0.7 s when
 //! the engine has it to itself. Here a state the engine is about to lose is copied to host RAM
 //! first (about 60 KB a token), and comes back when a later prompt continues it: a switch costs
-//! the copies (a second or so) instead of the reading.
+//! the copies instead of the reading (the copies are RAM at PCIe speed, the reading is the model).
 //!
 //! Only when the engine displaces a state, never after every turn; and never a private one.
 //! A state comes back as the same bytes it left as, so a prompt that continues it reads on
@@ -21,8 +21,9 @@ use std::time::Instant;
 /// and whether it is the base one (the system prompt).
 pub(crate) type Checkpoint = (Vec<u64>, RecurrentSnapshot, bool);
 
-/// A state shorter than this is read again faster than it is worth keeping or fetching back
-/// (about 1.7 s at the engine's 600 tokens a second, against copies that cost far less).
+/// A state shorter than this is not kept or fetched back: reading it again is quick (1,024
+/// tokens are under 2 s at the engine's 600 tokens a second) and it takes budget a longer one
+/// would use. One of exactly this many is kept.
 pub(crate) const MIN_TOKENS: usize = 1024;
 
 /// A stashed state is brought back only when it saves this many more tokens than the live one.
@@ -48,9 +49,9 @@ pub(crate) fn reusable<'a>(covered: &[u64], checkpoints: impl IntoIterator<Item 
     start
 }
 
-/// Whether a state the engine is about to discard is worth keeping: big enough, and mostly
-/// unrelated to the prompt that displaces it. A prompt that shares more than half of it is the
-/// same conversation branching, which the checkpoints already hold.
+/// Whether a state a prompt is about to displace is worth keeping: at least [`MIN_TOKENS`], and
+/// mostly unrelated to that prompt. A prompt that shares half of it or more is the same
+/// conversation branching, which the checkpoints already hold.
 pub(crate) fn worth_parking(held: usize, common: usize) -> bool {
     held >= MIN_TOKENS && common * 2 < held
 }
@@ -332,10 +333,11 @@ impl Parking {
     }
 
     /// Copy the live state to the host and stash it, when it is worth keeping: it is big enough,
-    /// it is not a private session's, and its cache and tokens agree. The cache is as it was;
+    /// it is not a private session's, and its cache and tokens agree. The cache is as it was.
     /// `covered` and `checkpoints` have gone into the stash (and are empty), so that nothing
-    /// claims a cache the caller is about to rewrite.
-    fn park(&mut self, held: &mut Held<'_>) -> bool {
+    /// claims a cache the caller is about to rewrite; or, with `copy`, the stash has copies and
+    /// they stay (the prompt that displaces the state reads on from one of its checkpoints).
+    fn park(&mut self, held: &mut Held<'_>, copy: bool) -> bool {
         let tokens = held.covered.len();
         if held.private || tokens < MIN_TOKENS || held.kv.len != tokens {
             return false;
@@ -363,7 +365,11 @@ impl Parking {
                 return false;
             }
         };
-        let entry = Entry::new(std::mem::take(held.covered), state, std::mem::take(held.checkpoints));
+        let entry = if copy {
+            Entry::new(held.covered.clone(), state, held.checkpoints.clone())
+        } else {
+            Entry::new(std::mem::take(held.covered), state, std::mem::take(held.checkpoints))
+        };
         let bytes = entry.bytes;
         let outcome = self.stash.insert(entry);
         if self.log {
@@ -399,7 +405,7 @@ impl Parking {
         }
         // Out of the stash first: the room it held is the live state's.
         let Entry { keys: entry_keys, state, checkpoints: entry_checkpoints, .. } = self.stash.take(index);
-        self.park(&mut Held { kv: &mut *kv, covered: &mut *covered, checkpoints: &mut *checkpoints, private });
+        self.park(&mut Held { kv: &mut *kv, covered: &mut *covered, checkpoints: &mut *checkpoints, private }, false);
         // While the cache is rewritten, nothing claims what it holds.
         covered.clear();
         checkpoints.clear();
@@ -423,14 +429,20 @@ impl Parking {
         }
     }
 
-    /// The engine is about to throw its state away for `keys` (nothing of it is reused): set it
-    /// aside first when it is big and mostly unrelated to `keys`, so that the prompt that comes
-    /// back for it finds it.
-    pub(crate) fn park_discarded(&mut self, mut held: Held<'_>, keys: &[u64]) {
+    /// The engine is about to read `keys` over its live state, which they share less than half
+    /// of: it is thrown away, or rolled back to an early checkpoint and written over. Set it
+    /// aside first, so that the prompt that comes back for it finds it. This is the last moment
+    /// the state's checkpoints are whole: the engine drops the ones `keys` do not share right
+    /// after, so it is asked before that, and not from the place where the state is reset.
+    ///
+    /// When `keys` read on from one of its checkpoints (the system prompt they share ends at a
+    /// message boundary) the engine still needs them, and the stash gets copies.
+    pub(crate) fn park_displaced(&mut self, mut held: Held<'_>, keys: &[u64]) {
         if !self.enabled() || !worth_parking(held.covered.len(), common_prefix(held.covered, keys)) {
             return;
         }
-        self.park(&mut held);
+        let reads_on = reusable(held.covered.as_slice(), held.checkpoints.iter().map(|(k, _, _)| k.as_slice()), keys) > 0;
+        self.park(&mut held, reads_on);
     }
 
     /// The states set aside and the bytes they hold.
@@ -805,7 +817,7 @@ mod tests {
             self.parking.swap_in(Held { kv: &mut self.kv, covered: &mut self.covered, checkpoints: &mut self.checkpoints, private: self.private }, keys)
         }
         fn discard(&mut self, keys: &[u64]) {
-            self.parking.park_discarded(Held { kv: &mut self.kv, covered: &mut self.covered, checkpoints: &mut self.checkpoints, private: self.private }, keys)
+            self.parking.park_displaced(Held { kv: &mut self.kv, covered: &mut self.covered, checkpoints: &mut self.checkpoints, private: self.private }, keys)
         }
     }
 
@@ -901,6 +913,32 @@ mod tests {
         far.push(9);
         rig.discard(&far);
         assert_eq!(rig.parking.held().0, 1);
+    }
+
+    #[test]
+    fn a_prompt_that_reads_on_from_a_checkpoint_of_the_live_state_gets_a_copy_set_aside() {
+        let mut rig = Rig::new(20);
+        rig.hold(1, 4_000);
+        // The state also has a checkpoint at 800 (the end of a system prompt both conversations share).
+        rig.checkpoints.insert(0, (rig.covered[..800].to_vec(), RecurrentSnapshot::capture(&rig.kv), true));
+        let live = (dump(&rig.kv), rig.covered.clone(), rig.checkpoints.iter().map(|(k, _, _)| k.len()).collect::<Vec<_>>());
+        let mut prompt = lineage(1, 1_500);
+        prompt.push(5);
+        rig.discard(&prompt);
+        // The engine rolls back to the checkpoint at 800 and still needs what it holds: nothing moved...
+        assert_eq!((dump(&rig.kv), rig.covered.clone(), rig.checkpoints.iter().map(|(k, _, _)| k.len()).collect::<Vec<_>>()), live);
+        // ...and the stash has the state whole, checkpoints and all.
+        assert_eq!(rig.parking.keys_held(), [lineage(1, 4_000)]);
+        assert_eq!(rig.parking.stash.entries[0].checkpoints.iter().map(|(k, _, _)| k.len()).collect::<Vec<_>>(), [800, 2_000]);
+        assert!(rig.parking.stash.consistent());
+        // With nothing of the prompt to read on from, the state itself goes into the stash.
+        let mut rig = Rig::new(20);
+        rig.hold(1, 4_000);
+        let mut prompt = lineage(1, 700);
+        prompt.push(5);
+        rig.discard(&prompt);
+        assert!(rig.covered.is_empty() && rig.checkpoints.is_empty());
+        assert_eq!(rig.parking.stash.entries[0].checkpoints.iter().map(|(k, _, _)| k.len()).collect::<Vec<_>>(), [2_000]);
     }
 
     #[test]

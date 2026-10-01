@@ -395,8 +395,13 @@ impl QwenEngine {
         let cache_clock = std::time::Instant::now();
         // Flash-Next: a conversation set aside in RAM that this prompt continues comes back
         // first (the live one is set aside in its place), and the cache logic below goes on from
-        // it as from any live state. An incognito request neither takes from the RAM nor gives to it.
+        // it as from any live state. A big live state that this prompt shares little with is set
+        // aside too, now, while all its checkpoints are there: the logic below drops the ones the
+        // prompt does not share. An incognito request neither takes from the RAM nor gives to it.
         let swapped = !job.forget && self.parking.swap_in(Held { kv: &mut self.kv, covered: &mut self.covered, checkpoints: &mut self.checkpoints, private: self.private_session.is_some() }, &keys);
+        if !job.forget {
+            self.parking.park_displaced(Held { kv: &mut self.kv, covered: &mut self.covered, checkpoints: &mut self.checkpoints, private: self.private_session.is_some() }, &keys);
+        }
         let hybrid = &self.model;
         // Checkpoints and disk states are the Qwen3.5 hybrid's (Flash-Next continues from memory only).
         let model = hybrid.qwen35();
@@ -437,14 +442,7 @@ impl QwenEngine {
         }
         // What came back from RAM is not "memory" or a checkpoint of this process's own making.
         if swapped && start > 0 { source = "ram"; }
-        if start == 0 {
-            // About to throw a big conversation away for a prompt that shares little with it: set it
-            // aside first, so the prompt that comes back for it finds it (not for an incognito one).
-            if !job.forget {
-                self.parking.park_discarded(Held { kv: &mut self.kv, covered: &mut self.covered, checkpoints: &mut self.checkpoints, private: self.private_session.is_some() }, &keys);
-            }
-            self.kv.reset(); self.covered.clear(); self.checkpoints.clear();
-        }
+        if start == 0 { self.kv.reset(); self.covered.clear(); self.checkpoints.clear(); }
         let _ = job.events.send(Event::CacheReuse { cached: start, source, common });
         if self.log { eprintln!("  Qwen cache: {start}/{} tokens from {source} (common {common}) in {:.3}s", keys.len(), cache_clock.elapsed().as_secs_f64()); }
         let total = keys.len()-start;
@@ -771,6 +769,9 @@ mod tests {
             let keys: Vec<u64> = prompt.iter().map(|&t| t as u64).collect();
             let stops = checkpoint_positions(prompt, Some(IM));
             let swapped = !forget && self.parking.swap_in(Held { kv: &mut self.kv, covered: &mut self.covered, checkpoints: &mut self.checkpoints, private: false }, &keys);
+            if !forget {
+                self.parking.park_displaced(Held { kv: &mut self.kv, covered: &mut self.covered, checkpoints: &mut self.checkpoints, private: false }, &keys);
+            }
             let common = self.covered.iter().zip(&keys).take_while(|(a, b)| a == b).count();
             self.checkpoints.retain(|(saved, _, _)| saved.len() <= common && keys.starts_with(saved));
             let mut start = if common == self.covered.len() && common < keys.len() { common } else { 0 };
@@ -781,13 +782,7 @@ mod tests {
                 self.checkpoints.retain(|(saved, _, _)| saved.len() <= start);
             }
             if swapped && start > 0 { source = "ram"; }
-            if start == 0 {
-                if !forget {
-                    let held = Held { kv: &mut self.kv, covered: &mut self.covered, checkpoints: &mut self.checkpoints, private: false };
-                    self.parking.park_discarded(held, &keys);
-                }
-                self.kv.reset(); self.covered.clear(); self.checkpoints.clear();
-            }
+            if start == 0 { self.kv.reset(); self.covered.clear(); self.checkpoints.clear(); }
             let mut pos = start;
             while pos < keys.len() {
                 let end = (pos + PREFILL_CHUNK).min(keys.len()).min(stops.iter().copied().find(|&s| s > pos).unwrap_or(keys.len()));
@@ -808,11 +803,16 @@ mod tests {
     /// A conversation: the system prompt every conversation starts with (520 tokens), a system
     /// prompt of its own after it (300 tokens, so that the first message boundary lies past what
     /// they share), and the messages that follow.
-    struct Chat { id: u32, messages: Vec<Vec<u32>> }
+    struct Chat { id: u32, messages: Vec<Vec<u32>>, shared_system: bool }
 
     impl Chat {
         fn new(id: u32, first: usize) -> Self {
-            Chat { id, messages: vec![Self::message(id, 1, first)] }
+            Chat { id, messages: vec![Self::message(id, 1, first)], shared_system: false }
+        }
+        /// As `new`, but its own part of the system prompt is the same for every conversation: all
+        /// of them share it up to the first message boundary.
+        fn sharing_its_system_prompt(id: u32, first: usize) -> Self {
+            Chat { shared_system: true, ..Self::new(id, first) }
         }
         /// A message of `n` tokens of its own; it begins at a message boundary.
         fn message(id: u32, turn: u32, n: usize) -> Vec<u32> {
@@ -830,8 +830,10 @@ mod tests {
         }
         /// What a request sends: the system prompts, the messages and the assistant's header.
         fn prompt(&self) -> Vec<u32> {
-            let mut p: Vec<u32> = std::iter::once(IM).chain(5..520).collect();
-            p.extend((0..300).map(|i| (self.id << 20) + (1 << 19) + i));
+            let mut p: Vec<u32> = std::iter::once(IM).chain(5..524).collect();
+            assert_eq!(p.len(), 520);
+            let own = if self.shared_system { 0 } else { self.id };
+            p.extend((0..300).map(|i| (own << 20) + (1 << 19) + i));
             for m in &self.messages { p.extend(m); }
             p.extend([IM, 2]);
             p
@@ -897,6 +899,55 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_rendered_differently_still_finds_its_checkpoint_after_a_conversation_was_discarded() {
+        // The runner's A1 is set aside as B1 displaces it (nothing of it is shared but 520 tokens),
+        // and its next prompt renders the last reply with something more in it, so that it
+        // can only go back to a checkpoint of A1: the checkpoints went into the stash with it,
+        // though the engine drops the ones a prompt does not share as soon as B1 is read.
+        let (ra1, ra2, rb1) = (vec![902_000; 40], vec![903_000; 25], vec![904_000; 30]);
+        let mut m = Mini::new(1 << 40, false);
+        let (mut a, b) = (Chat::new(10, 16_180), Chat::new(20, 3_680));
+        let a1 = a.prompt();
+        m.serve(&a1, &ra1, false);
+        m.serve(&b.prompt(), &rb1, false);
+        assert_eq!(lengths(&m), [a1.len() + ra1.len()]);
+        a.answered(&ra1, Some(9), 2_000);
+        let a2 = a.prompt();
+        let s = m.serve(&a2, &ra2, false);
+        assert_eq!((s.source, s.swapped), ("ram", true));
+        assert_eq!(s.start, a1.len() - 1, "the checkpoint one token short of A1's prompt");
+        assert_eq!(s.read, a2.len() - (a1.len() - 1));
+        assert_eq!(dump(&m.kv), cold(&a2, &ra2));
+    }
+
+    #[test]
+    fn a_conversation_rolled_back_to_a_shared_system_prompt_is_set_aside_as_a_copy() {
+        // The two conversations share their whole system prompt, which ends at a message boundary:
+        // B1 goes back to A1's checkpoint there and writes over the rest of A1. A1 has to be set
+        // aside before that, and the checkpoint it leaves B1 is still B1's to use.
+        let (ra1, ra2, rb1, rb2) = (vec![902_000; 40], vec![903_000; 25], vec![904_000; 30], vec![905_000; 20]);
+        let mut m = Mini::new(1 << 40, false);
+        let (mut a, mut b) = (Chat::sharing_its_system_prompt(10, 16_180), Chat::sharing_its_system_prompt(20, 3_680));
+        let a1 = a.prompt();
+        m.serve(&a1, &ra1, false);
+        let b1 = b.prompt();
+        let s = m.serve(&b1, &rb1, false);
+        assert_eq!((s.source, s.start, s.swapped), ("checkpoint", 820, false), "B1 reads on from A1's checkpoint at the end of the system prompt");
+        assert_eq!(dump(&m.kv), cold(&b1, &rb1));
+        assert_eq!(lengths(&m), [a1.len() + ra1.len()], "and A1 waits");
+        a.answered(&ra1, None, 2_000);
+        let a2 = a.prompt();
+        let s = m.serve(&a2, &ra2, false);
+        assert_eq!((s.source, s.swapped, s.start), ("ram", true, a1.len() + ra1.len()));
+        assert_eq!(dump(&m.kv), cold(&a2, &ra2));
+        b.answered(&rb1, None, 400);
+        let b2 = b.prompt();
+        let s = m.serve(&b2, &rb2, false);
+        assert_eq!((s.source, s.swapped, s.start), ("ram", true, b1.len() + rb1.len()));
+        assert_eq!(dump(&m.kv), cold(&b2, &rb2));
+    }
+
+    #[test]
     fn without_it_every_switch_reads_the_whole_prompt_again_and_with_it_only_what_is_new() {
         let reply = |id: u32| -> Vec<u32> { (0..30).map(|i| 900_000 + id * 1_000 + i).collect() };
         // (prompt length, tokens read) of each request, three rounds of the two conversations.
@@ -935,7 +986,7 @@ mod tests {
         assert_eq!(m.parking.held().0, 1, "A waits");
         // An incognito request that continues A takes nothing from the stash, and B, which it
         // displaces, is not set aside for it.
-        let mut again = Chat { id: 10, messages: a.messages.clone() };
+        let mut again = Chat { id: 10, messages: a.messages.clone(), shared_system: false };
         again.answered(&[7, 8], None, 100);
         let s = m.serve(&again.prompt(), &[], true);
         assert_eq!((s.source, s.start, s.swapped), ("none", 0, false));
