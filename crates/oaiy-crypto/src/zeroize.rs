@@ -231,7 +231,7 @@ mod tests {
     }
 
     /// Third review, L-1 and the mutants Y37 to Y40. **A scrub that is not there cannot always be seen by a probe**: a function that writes its key where it lives (`Secret::zeroed` and
-    /// `fill_random`, which is what every generator does) leaves nothing below its own frame for the scrub to remove, and the dead-stack probe measured the same number of copies with
+    /// `fill_random`, which is what every generator does) leaves nothing below its own frame for the scrub to remove, and the dead-stack probe measured within one copy of the same number (in either direction, and always within its bound) with
     /// the four generators' scrubs removed as with them (Windows, in a debug build, an optimised one and one with no optimisation and no assertions). The scrub there is defence in depth
     /// (a random generator or an expansion that does copy), and what is tested is that it is called: after the key is made, in each function that makes one, and in each function that reads a
     /// text that holds one. The comparisons are relative (a function scrubs once more than the functions it calls), so that a scrub that is added to a callee does not break them.
