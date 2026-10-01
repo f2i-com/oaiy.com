@@ -334,6 +334,19 @@ describe('the runner, with its real tools and campaigns', () => {
     expect(events.at(-1)).toMatchObject({ type: 'done', text: 'Calling Jane now.' });
   });
 
+  it("a flow of the person's runs before start_outreach and puts its note in front of the answer: the run still knows its calls started", async () => {
+    const log: string[] = [];
+    let step = 0;
+    engine((_b, asker) => (asker === 'runner' ? [planStep, { text: 'Going out now; I will report when it ends.' }, { text: 'Jane agreed.' }][step++] ?? { text: 'Done.' } : { text: 'Hi.' }), log);
+    const w = world();
+    await w.sessions.load();
+    const before: ToolHook = { tool: 'start_outreach', mode: 'before', flowName: 'Check the list', run: async () => '' };
+    const { agent: runner, events, emit } = runnerOf(w, { toolHooks: [before] });
+    await runner.run('Ring Jane and tell her the hedge trimming price.', emit);
+    expect(JSON.stringify(runner.turns)).toContain('Your flow \\"Check the list\\" ran before start_outreach');
+    expect(log.filter((l) => l === 'runner')).toHaveLength(2);
+    expect(nudges(events)).toEqual([]);
+  });
   it('is declined (the person said no): nothing started, so the plan pushes on as before', async () => {
     const log: string[] = [];
     let step = 0;
