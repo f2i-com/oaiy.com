@@ -555,3 +555,47 @@ test('4.14.5 a frames wait is a core hold like the stream: at the soft limit it 
     eq(200, $res['status'], $res['body']);
     between(1.5, 3.6, $el, 'the wait ended with the admission, not after eight seconds');
 });
+
+test('9.2 the 429 of a stream open or a frames wait over the in-flight bound, through a real request, is the Aokie error of exactly three members with Retry-After and no poll rule (the phone\'s decoder refuses a fourth member), and the bound is the party\'s', function () {
+    [$k, $a, $b, $plug, $ta] = aok_pair();
+    $holds = $k->r->ctx()->holds;
+    $key = 'aokie|' . $k->desk->id . '|' . $k->app . '|mobile:' . $k->thumb($a);
+    $dir = $k->r->data . '/holds/stream/' . Signals::hash($key);
+    // Two of the party's streams are running, so the pre-check lets the request through; the third is made by a request that arrived in the same
+    // instant (the hook is called after this request's own marker is made and before it counts the others), so the registry's count is
+    // what refuses it, which is where the refusal carries the poll rule that the Aokie error must not show.
+    $made = [$holds->acquire('stream', $key, 'core', 20, 0, Oaiy\Relay\Holds::STREAM_INFLIGHT_MAX), $holds->acquire('stream', $key, 'core', 20, 0, Oaiy\Relay\Holds::STREAM_INFLIGHT_MAX)];
+    $extra = [];
+    $other = static function (string $kind, string $principal, string $file) use ($dir, &$extra): void {
+        if ($kind === 'stream') {
+            $extra[] = $dir . '/20.' . bin2hex(random_bytes(6));
+            file_put_contents($extra[count($extra) - 1], '');
+            Oaiy\Relay\Holds::$afterMarker = null; // once
+        }
+    };
+    try {
+        foreach ([['stream', [], ['Accept' => 'text/event-stream']], ['frames', ['since' => '0', 'wait' => '5'], []]] as [$route, $q, $h]) {
+            Oaiy\Relay\Holds::$afterMarker = $other;
+            $res = aok_call($k, $ta, 'GET', $route, null, $q, $h);
+            eq(429, $res['status'], "$route: " . $res['body']);
+            ok(count($extra) >= 1, "$route: the hook ran, so it was the registry's count that refused this");
+            $keys = array_keys((array)$res['json']);
+            sort($keys);
+            eq(['code', 'error', 'message'], $keys, "$route: exactly the three members of the Aokie error, and no `rule`, which only the native poll has: " . $res['body']);
+            eq([true, 'rate_limited'], [$res['json']['error'], $res['json']['code']], $route);
+            eq('1', $res['headers']['retry-after'], $route);
+            foreach ($extra as $f) {
+                @unlink($f); // the third stream of this round ends
+            }
+            $extra = [];
+        }
+    } finally {
+        Oaiy\Relay\Holds::$afterMarker = null;
+    }
+    // The other phone of the same desktop and app is another party, and is served.
+    $tb = $k->mobileToken($b);
+    eq(200, aok_call($k, $tb, 'GET', 'frames', null, ['since' => '0', 'wait' => '0'])['status'], 'another party has its own bound');
+    foreach ($made as $h) {
+        $h->release();
+    }
+});
