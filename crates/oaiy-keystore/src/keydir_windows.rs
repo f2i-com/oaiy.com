@@ -27,6 +27,7 @@ use zeroize::Zeroizing;
 
 use super::{claim_if_stale, read_blob, DirLock, Entry, LOCK_FILE, LOCK_WAIT};
 use crate::error::KeyError;
+use crate::store::Durability;
 use crate::winfs::{self, FileId, Info};
 
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
@@ -144,6 +145,8 @@ impl KeyDir {
         // through real folders only. This is the walk that catches a junction that was put on the path after the first one, and before the open.
         found.path_leads_here()?;
         refuse_links_on_the_way(&found.path, false)?;
+        // the lock file is made here, once, and an operation only opens it: one that has gone is an error, not a lock that is made again beside the holders of the old one
+        drop(found.open_lock(true)?);
         Ok(found)
     }
 
@@ -180,17 +183,22 @@ impl KeyDir {
 
     /// Takes the advisory lock of the folder (see [`DirLock`]), shared for a read and exclusive for a change (`LockFileEx` on the lock file).
     pub(crate) fn lock(&self, exclusive: bool) -> Result<DirLock, KeyError> {
-        let path = self.at(LOCK_FILE);
+        DirLock::acquire(self.open_lock(false)?, exclusive, self.lock_wait)
+    }
+
+    /// Opens the lock file, making it only if `create`, and judges it as any key file is judged: not a reparse point, not a folder, **one name** (like Unix: a hard link to the lock file
+    /// is another way to reach it from a place this store does not look after).
+    fn open_lock(&self, create: bool) -> Result<File, KeyError> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
+            .create(create)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(&path)
+            .open(self.at(LOCK_FILE))
             .map_err(|e| KeyError::io("open the lock file", e))?;
         let info = winfs::info(&file).map_err(|e| KeyError::io("inspect the lock file", e))?;
-        require_file(&info, &self.shown(LOCK_FILE), false)?;
-        DirLock::acquire(file, exclusive, self.lock_wait)
+        require_file(&info, &self.shown(LOCK_FILE), true)?;
+        Ok(file)
     }
 
     /// The file as a person should read it in a message: in the folder as the caller named it.
@@ -268,16 +276,16 @@ impl KeyDir {
         Ok(out)
     }
 
-    /// Flushes the folder, so that a rename or a removal survives a power cut (`FlushFileBuffers` on the folder handle).
-    pub(crate) fn sync(&self) -> Result<(), KeyError> {
+    /// Flushes the folder, so that a rename or a removal survives a power cut (`FlushFileBuffers` on the folder handle). A file system that cannot flush a folder says so (over
+    /// SMB, os error 1 `ERROR_INVALID_FUNCTION`; see [`super::flush_not_supported`]) and that is `Unconfirmed`, not an error. Not tested on FAT, exFAT or ReFS.
+    pub(crate) fn sync(&self) -> Result<Durability, KeyError> {
         #[cfg(test)]
         self.hooks.syncs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        match self.held.sync_all() {
-            Ok(()) => Ok(()),
-            // a file system that cannot flush a folder (FAT, some network shares) says so
-            Err(e) if matches!(e.kind(), io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported) => Ok(()),
-            Err(e) => Err(KeyError::io("flush the keys directory", e)),
+        #[cfg(test)]
+        if let Some(injected) = self.hooks.injected_flush_error() {
+            return super::flushed(Err(injected));
         }
+        super::flushed(self.held.sync_all())
     }
 }
 
@@ -395,11 +403,32 @@ mod tests {
         );
         let mut names: Vec<String> = dir.list().unwrap().into_iter().map(|e| e.name).collect();
         names.sort();
-        assert_eq!(names, ["renamed.ks", "x.ks"], "a listing is of the held folder");
+        assert_eq!(names, [".lock", "renamed.ks", "x.ks"], "a listing is of the held folder (the lock file is made when the folder is opened)");
         drop(dir.lock(true).unwrap());
         assert!(held.join(LOCK_FILE).exists() && !decoy.join(LOCK_FILE).exists(), "and so is the lock");
         dir.remove("x.ks").unwrap();
         assert!(decoy.join("x.ks").exists(), "a removal leaves the decoy's file alone");
+    }
+
+    /// M-1 (b): what the path is compared with is **the volume and the file index of the folder that is held**. A path that leads to a folder with another file index, or the same index on
+    /// another volume (made up here: a test cannot mount a second volume), is a path that leads elsewhere: an error, never `None`. Without the volume in the comparison the second case
+    /// passes, and the store answers from a folder on another volume.
+    #[test]
+    fn a_path_whose_folder_has_another_volume_or_another_index_than_the_held_one_leads_elsewhere() {
+        let s = Scratch::new("identity");
+        let mut dir = KeyDir::open(&s.0.join("keys")).unwrap();
+        let (volume, index) = dir.id.parts();
+        let leads_elsewhere = |dir: &KeyDir| {
+            let error = dir.verify().expect_err("the path leads elsewhere");
+            matches!(&error, KeyError::Io { op: "inspect the keys directory", source } if source.to_string().contains("replaced or moved"))
+        };
+        dir.verify().unwrap();
+        dir.id = FileId::made_up(volume ^ 1, index);
+        assert!(leads_elsewhere(&dir), "the same index on another volume");
+        dir.id = FileId::made_up(volume, index ^ 1);
+        assert!(leads_elsewhere(&dir), "another index on the same volume");
+        dir.id = FileId::made_up(volume, index);
+        dir.verify().unwrap();
     }
 
     /// M-1 (a), and the window of the open: the path is walked before the folder is opened, and a junction can be put in place of a folder on it in between (here by a

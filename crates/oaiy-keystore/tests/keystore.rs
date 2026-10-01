@@ -266,12 +266,18 @@ fn a_keys_directory_that_has_gone_is_an_error_not_an_empty_store() {
             assert!(fs::rename(scratch.keys(), scratch.0.join("moved")).is_err(), "a folder held open cannot be renamed");
             assert!(fs::rename(&scratch.0, scratch.0.with_extension("moved")).is_err(), "nor can the folder above it");
             for entry in fs::read_dir(scratch.keys()).unwrap() {
-                fs::remove_file(entry.unwrap().path()).unwrap(); // the files can go: the folder cannot
+                fs::remove_file(entry.unwrap().path()).unwrap(); // the files can go (the marker and the lock file with them): the folder cannot
             }
             assert!(fs::remove_dir(scratch.keys()).is_err(), "an empty folder held open cannot be removed");
-            assert_eq!(get(&*store, &n), None, "and the store is still usable, and its folder is still its folder");
-            store.put(&n, b"pins").unwrap();
-            assert_eq!(get(&*store, &n), Some(b"pins".to_vec()));
+            // third review, L-5: this is what `remove_dir_all` does to a folder that is held (it deletes what is in it and fails to remove the folder), and the store answered `None`,
+            // "never stored", for every key that had been there. It looks for its marker, and an emptied folder is an error whatever the name.
+            let emptied = |error: KeyError| matches!(&error, KeyError::Corrupt(why) if why.contains("marker"));
+            assert!(emptied(store.get(&n).unwrap_err()), "get of a name that was there");
+            assert!(emptied(store.get(&name("never.stored")).unwrap_err()), "get of a name that never was");
+            assert!(emptied(store.put(&n, b"pins").unwrap_err()), "put");
+            assert!(emptied(store.delete(&n).unwrap_err()), "delete");
+            assert!(emptied(store.list("").unwrap_err()), "list");
+            assert!(fs::read_dir(scratch.keys()).unwrap().next().is_none(), "and nothing was written into the emptied folder");
             drop(store);
             fs::remove_dir_all(scratch.keys()).unwrap();
         } else {
@@ -596,7 +602,8 @@ fn a_folder_remembers_its_provider_and_refuses_to_be_opened_with_another() {
             }
         }
         // a marker that is not one of ours is an error, not a folder to adopt
-        for junk in [&b""[..], b"keyfile", b"keyfile\r\n", b"KEYFILE\n", b"key file\n", &[0xff, 0xfe, b'\n'][..], &[b'a'; 65][..]] {
+        // (`b"\n"` is an empty identifier: a marker is 1 to 64 characters of the identifier alphabet and a line feed)
+        for junk in [&b""[..], b"\n", b"keyfile", b"keyfile\r\n", b"KEYFILE\n", b"key file\n", &[0xff, 0xfe, b'\n'][..], &[b'a'; 65][..]] {
             fs::write(&marker, junk).unwrap();
             assert!(matches!(open_at(scratch.keys(), choice), Err(KeyError::Corrupt(_))), "{ext}: marker {junk:?}");
         }
@@ -604,9 +611,20 @@ fn a_folder_remembers_its_provider_and_refuses_to_be_opened_with_another() {
         fs::remove_file(&marker).unwrap();
         assert_eq!(get(&*store(&scratch, choice), &name("archive.writer")), Some(canary(70, 32)));
         assert_eq!(fs::read(&marker).unwrap(), format!("{id}\n").into_bytes());
-        // a folder with no marker that holds another provider's files is refused, and gets no marker
+        // a file that has another provider's extension and is not a name is not a secret of that provider (a note, a copy): it does not stop a folder being claimed
         fs::remove_file(&marker).unwrap();
         let other_ext = if ext == "kf" { "ks" } else { "kf" };
+        let not_a_secret = scratch.keys().join(format!("NOT A NAME.{other_ext}"));
+        fs::write(&not_a_secret, b"x").unwrap();
+        assert_eq!(
+            get(&*store(&scratch, choice), &name("archive.writer")),
+            Some(canary(70, 32)),
+            "{ext}: a file that is not a name was taken for a secret"
+        );
+        assert_eq!(fs::read(&marker).unwrap(), format!("{id}\n").into_bytes());
+        fs::remove_file(&not_a_secret).unwrap();
+        // a folder with no marker that holds another provider's files is refused, and gets no marker
+        fs::remove_file(&marker).unwrap();
         fs::write(scratch.keys().join(format!("strange.secret.{other_ext}")), b"x").unwrap();
         match open_at(scratch.keys(), choice) {
             Err(KeyError::ProviderMismatch { stored, requested }) => assert_eq!((stored.as_str(), requested), (store_id(other_ext), id)),
@@ -965,7 +983,7 @@ mod unix {
             matches!(&error, KeyError::Io { op: "open a key file", source } if source.kind() == std::io::ErrorKind::PermissionDenied),
             "{error:?}"
         );
-        assert!(matches!(store.put(&name("vault.pins"), b"x"), Ok(())), "a put replaces the file by renaming, which needs no access to the old one");
+        assert!(store.put(&name("vault.pins"), b"x").is_ok(), "a put replaces the file by renaming, which needs no access to the old one");
         assert_eq!(get(&*store, &name("vault.pins")), Some(b"x".to_vec()));
     }
 
@@ -1359,6 +1377,86 @@ mod windows {
             store.put(&n, b"pins again").unwrap();
             assert_eq!(get(&*store, &n), Some(b"pins again".to_vec()));
             fs::remove_file(&elsewhere).unwrap();
+        }
+    }
+
+    /// A key file that is a **file symbolic link** is refused as that, and not followed (the file is opened with `FILE_FLAG_OPEN_REPARSE_POINT` and judged: a mutant that opened it
+    /// following the link read the target). The error is asserted by kind: following the link would give a good blob (the real one, moved aside) and the value.
+    ///
+    /// **Not run on a machine where the account does not hold `SeCreateSymbolicLinkPrivilege`** (a standard account without Developer Mode): creating a file symbolic link fails there, and the test
+    /// says so and ends. It is run where the privilege is held (an administrator, Developer Mode, the hosted Windows runners of the CI lane). It has not been run on the machine of the
+    /// work that wrote it, so the assertion has been read, not seen to fail.
+    #[test]
+    fn a_file_symbolic_link_in_place_of_a_key_file_is_refused_not_followed() {
+        for (choice, ext) in providers() {
+            let scratch = Scratch::new("symlink-file");
+            let store = store(&scratch, choice);
+            let n = name("vault.pins");
+            store.put(&n, b"pins").unwrap();
+            let real = file_of(&scratch, "vault.pins", ext);
+            let moved = scratch.keys().join(format!("vault.pins.{ext}.moved"));
+            fs::rename(&real, &moved).unwrap();
+            if let Err(error) = std::os::windows::fs::symlink_file(&moved, &real) {
+                println!("SKIPPED {ext}: a file symbolic link cannot be made here ({error}): the account holds no SeCreateSymbolicLinkPrivilege");
+                fs::rename(&moved, &real).unwrap();
+                continue;
+            }
+            let error = store.get(&n).expect_err("a link where a key file should be");
+            assert!(matches!(&error, KeyError::Permissions(why) if why.contains("junction or a symbolic link")), "{ext}: {error:?}");
+            fs::remove_file(&real).unwrap();
+        }
+    }
+
+    /// Third review, M-A: **the keystore on a network share**, over loopback SMB. Opt-in (`#[ignore]`): it needs the administrative share of the drive that the temp folder is on
+    /// (`\\localhost\c$` for `C:`), which an administrator account has by default and a machine with file sharing turned off does not. It never connects to anything but `localhost`.
+    ///
+    /// ```text
+    /// cargo test -p oaiy-keystore --features unsafe-keyfile --test keystore -- --ignored smb --nocapture
+    /// ```
+    ///
+    /// On a share, `FlushFileBuffers` on a folder handle fails with os error 1 (`ERROR_INVALID_FUNCTION`), and every put and delete returned `Err` **after** it had committed (and the first
+    /// open failed). Now every step is `Ok` with the right value, and the durability says what the share said: `Unconfirmed` where the folder cannot be flushed, `Confirmed` where it can
+    /// (the test asks the share the same question first, so that it holds on a setup where the flush works). The other process on the machine, which opens the folder by its local path, sees
+    /// the same values.
+    ///
+    /// Not tested: FAT, exFAT, ReFS, NFS, DFS, a share on another machine, a redirected `%APPDATA%` (the README says what follows).
+    #[test]
+    #[ignore = "opt-in: needs the administrative share of the temp folder's drive (\\\\localhost\\c$); run with --ignored smb"]
+    fn a_store_on_a_share_over_loopback_smb_keeps_the_contract_whatever_the_share_says_about_flushing() {
+        use oaiy_keystore::Durability;
+        use std::fs::OpenOptions;
+        use std::os::windows::fs::OpenOptionsExt;
+        for (choice, ext) in providers() {
+            let scratch = Scratch::new("smb");
+            let local = scratch.0.display().to_string();
+            let bytes = local.as_bytes();
+            assert!(bytes.len() > 3 && bytes[1] == b':' && bytes[2] == b'\\', "the temp folder is not on a drive letter: {local}");
+            let share = format!(r"\\localhost\{}$\{}", (bytes[0] as char).to_ascii_lowercase(), &local[3..]);
+            let unc = PathBuf::from(&share);
+            assert!(unc.exists(), "{share} is not reachable: this test needs the administrative share of the drive, over loopback");
+            // the premise: what the share says to a flush of a folder handle
+            let raw = OpenOptions::new().read(true).write(true).share_mode(3).custom_flags(0x0200_0000 | 0x0020_0000).open(&unc).unwrap();
+            let flush = raw.sync_all();
+            drop(raw);
+            println!("SMB {ext}: FlushFileBuffers on a folder handle over {share} -> {:?}", flush.as_ref().map_err(|e| e.raw_os_error()));
+            let expected = if flush.is_ok() { Durability::Confirmed } else { Durability::Unconfirmed };
+
+            let store = open_at(unc.join("keys"), choice).unwrap_or_else(|e| panic!("{ext}: the first open over the share failed: {e:?}"));
+            let n = name("vault.pins");
+            assert_eq!(store.put(&n, b"key version 1").unwrap(), expected, "{ext}: put v1");
+            assert_eq!(get(&*store, &n), Some(b"key version 1".to_vec()));
+            assert_eq!(store.put(&n, b"key version 2 (the rotation)").unwrap(), expected, "{ext}: put v2");
+            assert_eq!(get(&*store, &n), Some(b"key version 2 (the rotation)".to_vec()), "{ext}: the rotation is what a reader sees");
+            // another process on this machine, by the local path of the same folder
+            let local_store = open_at(scratch.keys(), choice).unwrap();
+            assert_eq!(get(&*local_store, &n), Some(b"key version 2 (the rotation)".to_vec()), "{ext}: and what the local path sees");
+            drop(local_store);
+            assert_eq!(store.delete(&n).unwrap(), expected, "{ext}: delete");
+            assert_eq!(get(&*store, &n), None);
+            assert!(key_files(&scratch.keys()).is_empty(), "{ext}: the file is gone");
+            drop(store);
+            drop(open_at(unc.join("keys"), choice).unwrap());
+            println!("SMB {ext}: every step was Ok, and every durability was {expected:?}");
         }
     }
 }

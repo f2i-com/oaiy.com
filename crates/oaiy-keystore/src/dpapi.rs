@@ -1,4 +1,4 @@
-//! Windows DPAPI, the only `unsafe` of this crate (design 4.5.1, provider `windows-dpapi-file`).
+//! Windows DPAPI, one of the two modules of this crate that contain `unsafe` (the other is `winfs`, which asks the file system about a handle: design 4.5.1, provider `windows-dpapi-file`).
 //!
 //! Two functions over `CryptProtectData` and `CryptUnprotectData`, and nothing else: user scope (never `CRYPTPROTECT_LOCAL_MACHINE`),
 //! `CRYPTPROTECT_UI_FORBIDDEN` (a service or a headless session never waits on a dialog), the secret's name bound in as optional entropy. The

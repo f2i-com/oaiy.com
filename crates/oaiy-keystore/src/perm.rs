@@ -45,8 +45,8 @@ pub struct Meta {
     pub mode: u32,
     /// The owner.
     pub uid: u32,
-    /// How many names the file has (hard links). Only a file's count is judged: a key file has exactly one.
-    pub links: u64,
+    /// How many names the file has (hard links). Only a file's count is judged: a key file has exactly one. Crate-private: it is what [`meta_of`] reads, not part of the interface.
+    pub(crate) links: u64,
 }
 
 /// Applies the rule. `expected_uid` is the user this process runs as, when known.

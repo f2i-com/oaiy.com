@@ -41,6 +41,18 @@ pub(crate) struct Info {
 }
 
 #[cfg(test)]
+impl FileId {
+    /// A made-up identity, for the tests of what is compared: there is no second volume to open in a test without an administrator.
+    pub(crate) fn made_up(volume: u64, index: u128) -> FileId {
+        FileId { volume, index }
+    }
+
+    pub(crate) fn parts(&self) -> (u64, u128) {
+        (self.volume, self.index)
+    }
+}
+
+#[cfg(test)]
 impl Info {
     /// A made-up `Info`, for the tests of the rules that judge one: what a file symbolic link, a cloud placeholder or a file with two names look like cannot be made here without privileges.
     pub(crate) fn made_up(attributes: u32, links: u32) -> Info {
@@ -116,6 +128,20 @@ mod tests {
 
     fn folder(path: &std::path::Path) -> File {
         OpenOptions::new().read(true).share_mode(7).custom_flags(0x0200_0000 | 0x0020_0000).open(path).unwrap()
+    }
+
+    /// What makes two files one: **the volume and the index**, both. The file index of an NTFS volume is only unique on that volume: the same folder index on another volume (a USB
+    /// drive, a second partition, a share) is another folder, and a path that has been re-pointed at it must not pass for the one that is held. (There is no second volume to open in a test
+    /// without an administrator, so the identities are made up; the comparison in `KeyDir` is tested with them below.)
+    #[test]
+    fn two_files_are_one_only_when_the_volume_and_the_index_are_both_the_same() {
+        let id = FileId::made_up(0xE200_0B7F, 42);
+        assert_eq!(id, FileId::made_up(0xE200_0B7F, 42));
+        assert_ne!(id, FileId::made_up(0xE200_0B80, 42), "the same index on another volume is another file");
+        assert_ne!(id, FileId::made_up(0xE200_0B7F, 43), "another index on the same volume is another file");
+        assert_ne!(id, FileId::made_up(0, 0));
+        // the 128-bit index of ReFS: the high half counts
+        assert_ne!(FileId::made_up(1, 1), FileId::made_up(1, 1 | (1u128 << 64)));
     }
 
     /// Two handles to one file have one id, however they were opened; two files have two; a hard link is another name of the same file and says so.

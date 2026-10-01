@@ -31,7 +31,7 @@ fn main() {
         }
     };
     match store.put(&name, b"a test value that belongs to the user who ran this") {
-        Ok(()) => println!("stored under {name} in {folder}\\keys"),
+        Ok(durability) => println!("stored under {name} in {folder}\\keys (durability {durability:?})"),
         Err(error) => {
             eprintln!("cannot store: {error}");
             std::process::exit(1);

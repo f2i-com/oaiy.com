@@ -2,9 +2,15 @@
 //!
 //! Every rule of design 4.5.1 that is not about how a blob is made lives here, once: `Ok(None)` means the name was never stored and nothing else
 //! does; `put` writes a temporary file (created new, never overwriting, with only what the provider makes of the value in it), flushes it, reads
-//! it back through the provider and compares, and only then renames it over the old value, so a failure at any step leaves the previous value
-//! and no file of the failed attempt; `delete` is idempotent; `list` shows valid names only; a keys directory that has disappeared is an error, not an
+//! it back through the provider and compares, and only then renames it over the old value, so a failure at any step **before the rename** leaves the previous value
+//! and no file of the failed attempt; `delete` is idempotent; `list` shows valid names only; a keys directory that has disappeared, or one whose provider marker has gone, is an error, not an
 //! empty store. Every file is reached through the folder the store holds open ([`crate::keydir`]), never through a path looked up again.
+//!
+//! **What an error means, and what comes after the rename** (third review, M-A). `Err` from `put` or `delete` means that nothing changed: the previous value is still the value. Once the
+//! rename (or the removal) has been made the change is made, and nothing that comes after it can be an error, or the contract would be false: the step after it is the flush of the
+//! folder, which is what makes the new name survive a power cut, and it fails on file systems that cannot flush a folder (an SMB share: `FlushFileBuffers` on the folder handle is
+//! "incorrect function", os error 1; FAT; some network and FUSE ones). That outcome is `Ok(Durability::Unconfirmed)`: the change is made and visible to every reader, and a power cut
+//! right after it could undo the rename (the file itself was flushed before it). `Ok(Durability::Confirmed)` says the folder was flushed too.
 
 use std::io::Write;
 use std::path::Path;
@@ -21,6 +27,20 @@ use crate::name::Name;
 /// The most a value may be: 64 KiB.
 pub const MAX_VALUE_LEN: usize = 64 * 1024;
 
+/// What the store can say about a change it has made (`put` and `delete`, when they succeed): whether the folder was flushed after it. **The change is made either way**: it is
+/// visible to every reader, and the previous state is gone. The difference is the power cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Durability {
+    /// The change was made and the folder was flushed after it: the new name (or the absence of the old one) survives a power cut.
+    Confirmed,
+    /// The change was made, and the flush of the folder that makes it survive a power cut did not happen: the file system cannot flush a folder (an SMB share, FAT, some network and FUSE
+    /// ones) or the flush failed after the change. The new value (or the removal) is stored and is what every reader sees; a power cut right after it could bring the previous state
+    /// back (the file itself was flushed before it was renamed into place, so what comes back is whole). **A caller whose next step destroys the only other copy of what was replaced**
+    /// (a rotation that has re-wrapped data under the new key, a delete that the caller is not able to redo) should treat this as "not safe yet": keep the old copy until a later
+    /// change reports `Confirmed`, or until the next start finds the new value there.
+    Unconfirmed,
+}
+
 /// K1: named secrets. `Ok(None)` and `Err` are not the same thing.
 pub trait KeyStore: Send + Sync {
     /// What backs this store, for the status page.
@@ -31,11 +51,14 @@ pub trait KeyStore: Send + Sync {
     fn get(&self, name: &Name) -> Result<Option<Zeroizing<Vec<u8>>>, KeyError>;
 
     /// Stores `value` (1 byte to 64 KiB) under `name`, replacing any earlier one. Atomic: the value is written, read back and compared before it replaces
-    /// anything, and a failure leaves the previous value in place.
-    fn put(&self, name: &Name, value: &[u8]) -> Result<(), KeyError>;
+    /// anything. **`Err` means nothing changed**: the previous value is still the value, and no file of the attempt is left (every failure that comes before the rename,
+    /// and the rename itself). **`Ok` means the value is stored** and every reader sees it; the [`Durability`] says whether the folder was flushed after the rename. A failure to flush the folder
+    /// cannot be an `Err`, because the value is already in place: it is `Ok(Durability::Unconfirmed)`.
+    fn put(&self, name: &Name, value: &[u8]) -> Result<Durability, KeyError>;
 
-    /// Removes `name`. Removing a name that is not there is not an error. Call it only after the replacement of what it held has been verified.
-    fn delete(&self, name: &Name) -> Result<(), KeyError>;
+    /// Removes `name`. Removing a name that is not there is not an error. Call it only after the replacement of what it held has been verified. **`Err` means the name is still
+    /// there**; `Ok` means it has gone, with the same [`Durability`] as `put` (`Unconfirmed`: a power cut right after could bring the file back).
+    fn delete(&self, name: &Name) -> Result<Durability, KeyError>;
 
     /// The names that start with `prefix`, in order.
     fn list(&self, prefix: &str) -> Result<Vec<Name>, KeyError>;
@@ -58,7 +81,13 @@ impl<C: Codec> FileStore<C> {
     /// Opens (creating it if need be) the keys directory, checks it, makes sure that it belongs to this provider, and removes the debris of an interrupted
     /// write.
     pub(crate) fn open(dir: &Path, codec: C) -> Result<Self, KeyError> {
+        Self::open_prepared(dir, codec, |_| {})
+    }
+
+    /// [`FileStore::open`], with `prepare` run on the folder once it is held and before anything is made in it (a test uses it to make the first flush fail).
+    fn open_prepared(dir: &Path, codec: C, prepare: impl FnOnce(&KeyDir)) -> Result<Self, KeyError> {
         let store = FileStore { dir: KeyDir::open(dir)?, codec };
+        prepare(&store.dir);
         {
             let _lock = store.dir.lock(true)?;
             store.claim_folder()?;
@@ -102,7 +131,26 @@ impl<C: Codec> FileStore<C> {
             let _ = self.dir.remove(&tmp);
             return Err(error);
         }
-        self.dir.sync()
+        // The marker is in place. Flushing the folder makes the marker survive a power cut, and a folder that cannot be flushed (an SMB share: os error 1) is no reason for the open
+        // to fail: a marker that a power cut takes back is made again by the next open, which adopts a folder that has none (above). Whatever the flush says, the store is open.
+        let _ = self.dir.sync();
+        Ok(())
+    }
+
+    /// **The marker must still be there, and still be this provider's** (third review, L-5). A folder that is wiped while it is open (`remove_dir_all` on Windows deletes everything in it and
+    /// then fails to remove the folder, which the store holds) is an empty folder to a store that does not look, and `get` answered `Ok(None)`, "never stored", for every key that had
+    /// been there. The marker is written when the folder is first opened and never changes, so a store that is open and does not find it has been emptied (or opened on another folder):
+    /// an error, whatever the name. The lock file is looked for the same way (it is made when the folder is opened, and an operation does not make it again).
+    fn check_marker(&self) -> Result<(), KeyError> {
+        let info = self.codec.info();
+        let Some(bytes) = self.dir.read(MARKER_FILE)? else {
+            return Err(KeyError::Corrupt("the provider marker of the keys folder has gone: the folder was emptied while it was open"));
+        };
+        let stored = parse_marker(&bytes)?;
+        if stored != info.id {
+            return Err(KeyError::ProviderMismatch { stored, requested: info.id });
+        }
+        Ok(())
     }
 
     /// A value of another provider's kind under this name is an error, not "nothing there": it is a secret that this provider cannot read, and a `put` beside
@@ -132,6 +180,12 @@ impl<C: Codec> FileStore<C> {
     fn temporary_name(&self, name: &Name) -> Result<String, KeyError> {
         let random: Secret<8> = Secret::random().map_err(|_| KeyError::io("random", std::io::Error::other("the random generator failed")))?;
         Ok(format!(".{}.{}.tmp", name.as_str(), hex_lower(random.expose())))
+    }
+
+    /// Flushes the folder after a change that is already made: `Confirmed` if it was, `Unconfirmed` if the file system cannot flush a folder or the flush failed. Never an error, because
+    /// the change cannot be undone by a failure that comes after it (see the header of this file).
+    fn flushed_after_the_change(&self) -> Durability {
+        self.dir.sync().unwrap_or(Durability::Unconfirmed)
     }
 
     /// Makes `tmp` (which must not exist) with `bytes` in it and flushes it. The file is locked while it is written, so that a process that is looking for debris
@@ -188,6 +242,7 @@ impl<C: Codec> KeyStore for FileStore<C> {
 
     fn get(&self, name: &Name) -> Result<Option<Zeroizing<Vec<u8>>>, KeyError> {
         self.dir.verify()?;
+        self.check_marker()?;
         // the lock, shared, is what makes `None` mean "not there": a writer that is replacing the name holds it exclusively (review H-1)
         let blob = {
             let _lock = self.dir.lock(false)?;
@@ -198,7 +253,7 @@ impl<C: Codec> KeyStore for FileStore<C> {
         self.codec.open(name, &blob).map(Some)
     }
 
-    fn put(&self, name: &Name, value: &[u8]) -> Result<(), KeyError> {
+    fn put(&self, name: &Name, value: &[u8]) -> Result<Durability, KeyError> {
         if value.is_empty() {
             return Err(KeyError::InvalidValue("empty"));
         }
@@ -206,6 +261,7 @@ impl<C: Codec> KeyStore for FileStore<C> {
             return Err(KeyError::InvalidValue("larger than 64 KiB"));
         }
         self.dir.verify()?;
+        self.check_marker()?;
         self.refuse_a_value_of_another_provider(name)?;
         let blob = self.codec.seal(name, value)?;
         let tmp = self.temporary_name(name)?;
@@ -223,21 +279,25 @@ impl<C: Codec> KeyStore for FileStore<C> {
             let _ = self.dir.remove(&tmp);
             return Err(error);
         }
-        self.dir.sync()
+        // The new value is in place, and what is left is the flush that makes the name survive a power cut. It cannot be an error now (third review, M-A): over SMB it fails on every
+        // put with "incorrect function" after the rename, and a caller that saw `Err` kept the old key in memory while the new one was on disk and the old one was gone.
+        Ok(self.flushed_after_the_change())
     }
 
-    fn delete(&self, name: &Name) -> Result<(), KeyError> {
+    fn delete(&self, name: &Name) -> Result<Durability, KeyError> {
         self.dir.verify()?;
+        self.check_marker()?;
         {
             let _lock = self.dir.lock(true)?;
             self.refuse_a_value_of_another_provider(name)?;
             self.dir.remove(&self.file_name(name))?;
         }
-        self.dir.sync()
+        Ok(self.flushed_after_the_change())
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<Name>, KeyError> {
         self.dir.verify()?;
+        self.check_marker()?;
         let own = self.codec.extension();
         let mut names = Vec::new();
         let entries = {
@@ -795,5 +855,238 @@ mod tests {
         assert_eq!(syncs(), 2, "delete");
         assert!(store.put(&name("a.two"), b"").is_err());
         assert_eq!(syncs(), 2, "a refused put flushes nothing");
+    }
+
+    /// The raw operating system error of "this file system cannot flush a folder" (an SMB share: `ERROR_INVALID_FUNCTION`; Unix: `EINVAL`), and of "the flush was tried and failed" (a
+    /// failing disk: `ERROR_IO_DEVICE`; `EIO`).
+    const CANNOT_FLUSH: i32 = if cfg!(windows) { 1 } else { 22 };
+    const FLUSH_FAILED: i32 = if cfg!(windows) { 1117 } else { 5 };
+
+    /// Third review, M-A. On an SMB share `FlushFileBuffers` on the folder handle is "incorrect function" (os error 1), and every `put` and `delete` returned `Err` **after** the rename had
+    /// committed: the contract says that a failed put leaves the previous value, and here the new one was in place, so a caller that followed the contract after a failed rotation kept the
+    /// old key in memory while the new one was on disk and the old one was gone. A flush that fails after the change is not an error of the change: it is `Ok(Unconfirmed)`, whichever
+    /// way it fails (a file system that cannot flush a folder, and a flush that was tried and failed), and the value is stored, and every reader sees it. Without the exception the
+    /// first put here is an `Err` with the file on disk.
+    #[test]
+    fn a_flush_that_fails_after_the_change_is_made_does_not_make_a_put_or_a_delete_an_error() {
+        for code in [CANNOT_FLUSH, FLUSH_FAILED] {
+            let scratch = Scratch::new("flushfails");
+            let store = faulty(&scratch);
+            let n = name("vault.pins");
+            assert_eq!(store.put(&n, b"key version 0").unwrap(), Durability::Confirmed, "a flush that works is `Confirmed`");
+            store.dir.hooks.fail_sync.store(code, Ordering::SeqCst);
+
+            assert_eq!(store.put(&n, b"key version 1").unwrap(), Durability::Unconfirmed, "os error {code}: the put is made");
+            assert_eq!(&**store.get(&n).unwrap().unwrap(), b"key version 1", "os error {code}: and it is what a reader sees");
+            assert_eq!(files(&scratch.keys()), vec!["vault.pins.kf".to_string()], "os error {code}: no temporary file");
+            assert_eq!(store.put(&n, b"key version 2 (the rotation)").unwrap(), Durability::Unconfirmed, "os error {code}: a rotation");
+            assert_eq!(&**store.get(&n).unwrap().unwrap(), b"key version 2 (the rotation)");
+            assert_eq!(store.delete(&n).unwrap(), Durability::Unconfirmed, "os error {code}: the delete is made");
+            assert!(store.get(&n).unwrap().is_none(), "os error {code}: and the name is gone");
+            assert!(files(&scratch.keys()).is_empty());
+            // a delete of what is not there is as it ever was
+            assert_eq!(store.delete(&n).unwrap(), Durability::Unconfirmed);
+
+            // and the folder flushes again: `Confirmed`
+            store.dir.hooks.fail_sync.store(0, Ordering::SeqCst);
+            assert_eq!(store.put(&n, b"key version 3").unwrap(), Durability::Confirmed);
+            assert_eq!(store.delete(&n).unwrap(), Durability::Confirmed);
+        }
+    }
+
+    /// What the flush of the folder says, told apart at the level of the folder: a file system that cannot flush a folder is `Unconfirmed`, a flush that was tried and failed is an
+    /// error (the store turns that into `Unconfirmed` for a change that is made; nothing else may swallow it: a mutant that made every failure a success was alive).
+    #[test]
+    fn the_flush_of_a_folder_tells_a_file_system_that_cannot_from_a_flush_that_failed() {
+        let scratch = Scratch::new("flushkinds");
+        let store = faulty(&scratch);
+        assert_eq!(store.dir.sync().unwrap(), Durability::Confirmed);
+        store.dir.hooks.fail_sync.store(CANNOT_FLUSH, Ordering::SeqCst);
+        assert_eq!(store.dir.sync().unwrap(), Durability::Unconfirmed, "a file system that says it cannot");
+        store.dir.hooks.fail_sync.store(FLUSH_FAILED, Ordering::SeqCst);
+        let failed = store.dir.sync().unwrap_err();
+        assert!(
+            matches!(&failed, KeyError::Io { op: "flush the keys directory", source } if source.raw_os_error() == Some(FLUSH_FAILED)),
+            "{failed:?}"
+        );
+    }
+
+    /// Third review, M-A: the first open of a new folder over SMB failed with "flush the keys directory" after it had made the lock file and the marker. The marker is in place, and
+    /// whether the flush could make it survive a power cut is no reason for the open to fail (a marker that a power cut takes back is made again by the next open): the store opens, the
+    /// folder is claimed, and it works.
+    #[test]
+    fn a_first_open_whose_flush_fails_still_opens_and_claims_the_folder() {
+        for code in [CANNOT_FLUSH, FLUSH_FAILED] {
+            let scratch = Scratch::new("openflush");
+            let store = FileStore::open_prepared(&scratch.keys(), Faulty { inner: KeyfileCodec, fault: AtomicU8::new(FAULT_NONE) }, |dir| {
+                dir.hooks.fail_sync.store(code, Ordering::SeqCst);
+            })
+            .unwrap_or_else(|e| panic!("os error {code}: the open failed: {e:?}"));
+            assert_eq!(store.dir.hooks.syncs.load(Ordering::SeqCst), 1, "the marker was flushed (and the flush failed)");
+            assert_eq!(fs::read(scratch.keys().join(MARKER_FILE)).unwrap(), b"faulty\n", "os error {code}: the folder is claimed");
+            store.dir.hooks.fail_sync.store(0, Ordering::SeqCst);
+            let n = name("vault.pins");
+            assert_eq!(store.put(&n, b"1").unwrap(), Durability::Confirmed);
+            drop(store);
+            assert_eq!(&**faulty(&scratch).get(&n).unwrap().unwrap(), b"1", "and the next open finds it as it was");
+        }
+    }
+
+    /// Third review, L-5. A store that is open and finds its folder emptied (on Windows `remove_dir_all` deletes everything in a folder that is held and then fails to remove the
+    /// folder, which is the same thing) answered `Ok(None)`, "never stored", for every key that had been there, and a caller that believes `None` mints a new identity. The marker is
+    /// written when the folder is first opened and never changes: a store that does not find it is an error, for every operation and for every name, whether or not the name was there.
+    /// A marker that has been replaced by another provider's is as much an error. Without the look for the marker the first `get` is `Ok(None)`.
+    #[test]
+    fn a_store_whose_folder_was_emptied_while_it_was_open_answers_with_errors_never_none() {
+        let scratch = Scratch::new("emptied");
+        let keys = scratch.keys();
+        let store = faulty(&scratch);
+        let n = name("archive.writer");
+        store.put(&n, b"the identity").unwrap();
+        for entry in fs::read_dir(&keys).unwrap() {
+            fs::remove_file(entry.unwrap().path()).unwrap(); // the key file, the marker and the lock file
+        }
+        let emptied = |error: KeyError| matches!(&error, KeyError::Corrupt(why) if why.contains("marker"));
+        assert!(emptied(store.get(&n).unwrap_err()), "get of a name that was there");
+        assert!(emptied(store.get(&name("never.stored")).unwrap_err()), "get of a name that never was");
+        assert!(emptied(store.put(&n, b"a new identity").unwrap_err()), "put");
+        assert!(emptied(store.delete(&n).unwrap_err()), "delete");
+        assert!(emptied(store.list("").unwrap_err()), "list");
+        assert!(
+            fs::read_dir(&keys).unwrap().next().is_none(),
+            "and nothing was made in the emptied folder: no marker, no lock file, no temporary file"
+        );
+
+        // a marker that names another provider, put in its place by whoever can write there: refused, whatever the name
+        let write_marker = |text: &[u8]| {
+            fs::write(keys.join(MARKER_FILE), text).unwrap();
+            #[cfg(unix)]
+            fs::set_permissions(keys.join(MARKER_FILE), std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        };
+        write_marker(b"keyfile\n");
+        let mismatch =
+            |error: KeyError| matches!(&error, KeyError::ProviderMismatch { stored, requested } if stored == "keyfile" && *requested == "faulty");
+        assert!(mismatch(store.get(&n).unwrap_err()), "get with another provider's marker");
+        assert!(mismatch(store.put(&n, b"x").unwrap_err()), "put with another provider's marker");
+        // the folder is empty, and a store opened again is a new store of an empty folder: `None` is the truth there, and the caller learns it only now
+        write_marker(b"faulty\n");
+        drop(store);
+        assert!(faulty(&scratch).get(&n).unwrap().is_none());
+    }
+
+    /// Third review, L-5: the lock file is made when the folder is opened, and an operation only opens it. One that has gone is an error, not a lock that is made again beside the
+    /// holders of the old one (on Unix a lock belongs to the file that was opened, so two lock files would not exclude each other). Without it an operation after the file is deleted
+    /// makes a new one and succeeds.
+    #[test]
+    fn a_lock_file_that_has_gone_is_an_error_and_is_not_made_again() {
+        let scratch = Scratch::new("lostlock");
+        let store = faulty(&scratch);
+        let n = name("relay.token");
+        store.put(&n, b"first").unwrap();
+        fs::remove_file(scratch.keys().join(".lock")).unwrap();
+        let gone = |error: KeyError| matches!(&error, KeyError::Io { op: "open the lock file", .. });
+        assert!(gone(store.get(&n).unwrap_err()), "get");
+        assert!(gone(store.put(&n, b"second").unwrap_err()), "put");
+        assert!(gone(store.delete(&n).unwrap_err()), "delete");
+        assert!(gone(store.list("").unwrap_err()), "list");
+        assert!(!scratch.keys().join(".lock").exists(), "and no lock file was made");
+        assert_eq!(files(&scratch.keys()), vec!["relay.token.kf".to_string()], "nothing else was changed");
+        // a new open makes it again, and the same key is there
+        assert_eq!(&**faulty(&scratch).get(&n).unwrap().unwrap(), b"first");
+    }
+
+    /// The lock file has one name, like a key file (the third review: Unix refused a second name and Windows did not). A hard link to it is another way to reach the file from a place
+    /// this store does not look after.
+    #[test]
+    fn a_lock_file_with_another_hard_link_is_refused_until_the_extra_name_is_gone() {
+        let scratch = Scratch::new("lockhardlink");
+        let store = faulty(&scratch);
+        let n = name("relay.token");
+        store.put(&n, b"first").unwrap();
+        let extra = scratch.0.join("another-name-for-the-lock");
+        fs::hard_link(scratch.keys().join(".lock"), &extra).unwrap();
+        let refused = |error: KeyError| matches!(&error, KeyError::Permissions(why) if why.contains("names (hard links)"));
+        assert!(refused(store.get(&n).unwrap_err()), "get");
+        assert!(refused(store.put(&n, b"second").unwrap_err()), "put");
+        assert!(refused(store.dir.lock(true).err().expect("refused")), "the lock itself");
+        fs::remove_file(&extra).unwrap();
+        assert_eq!(&**store.get(&n).unwrap().unwrap(), b"first", "the same lock file with one name again");
+    }
+
+    /// The lock file is opened as itself, never through a link (Unix: `O_NOFOLLOW`): a symbolic link in its place is refused, and what it points at is not locked, written or made.
+    /// Without `O_NOFOLLOW` the target is a regular file of ours with a good mode and the lock is taken on it.
+    #[cfg(unix)]
+    #[test]
+    fn a_symbolic_link_in_place_of_the_lock_file_is_refused() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let scratch = Scratch::new("locklink");
+        let store = faulty(&scratch);
+        let n = name("relay.token");
+        store.put(&n, b"first").unwrap();
+        let real = scratch.keys().join("a-file-of-ours.txt");
+        fs::write(&real, b"not a lock").unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::remove_file(scratch.keys().join(".lock")).unwrap();
+        symlink(&real, scratch.keys().join(".lock")).unwrap();
+        let error = store.get(&n).unwrap_err();
+        assert!(matches!(&error, KeyError::Permissions(why) if why.contains("symbolic link")), "{error:?}");
+        assert_eq!(fs::read(&real).unwrap(), b"not a lock");
+    }
+
+    /// A name that another provider's extension has, and that is a link to nothing, is still an entry: a secret that this provider cannot read, which `get`, `put` and `delete` refuse.
+    /// The look for it must not follow the link (a dangling one would read as "not there", and `get` would answer `None` for a name that has a value of another provider, `put` would
+    /// leave two live values): a symbolic link on Unix, a junction whose target is gone on Windows.
+    #[test]
+    fn a_link_to_nothing_under_another_providers_extension_is_still_a_value_of_that_provider() {
+        let scratch = Scratch::new("dangling");
+        let store = faulty(&scratch);
+        let link = scratch.keys().join("other.name.ks");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(scratch.0.join("nothing-here"), &link).unwrap();
+        #[cfg(windows)]
+        {
+            let target = scratch.0.join("gone-target");
+            fs::create_dir(&target).unwrap();
+            let made = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(&link).arg(&target).output().unwrap();
+            assert!(made.status.success(), "mklink /J failed: {}", String::from_utf8_lossy(&made.stdout));
+            fs::remove_dir(&target).unwrap();
+        }
+        let other = name("other.name");
+        let mismatch = |error: KeyError| matches!(&error, KeyError::ProviderMismatch { stored, .. } if stored == "windows-dpapi-file");
+        assert!(mismatch(store.get(&other).unwrap_err()), "get: not `None`");
+        assert!(mismatch(store.put(&other, b"a second value").unwrap_err()), "put: not a second value beside it");
+        assert!(mismatch(store.delete(&other).unwrap_err()), "delete");
+        assert!(store.get(&name("some.other")).unwrap().is_none(), "the names that have no such entry are unaffected");
+    }
+
+    /// Debris is a file of exactly the store's shape: `.<name>.<16 hex>.tmp`. A longer random part is not (a file someone else put there), however old.
+    #[test]
+    fn a_file_with_a_longer_random_part_than_the_stores_is_not_its_temporary_file() {
+        assert!(is_temporary_name(".keep.me.0123456789abcdef.tmp"));
+        for other in [
+            ".keep.me.0123456789abcdef0.tmp",
+            ".keep.me.0123456789abcde.tmp",
+            ".keep.me.0123456789ABCDEF.tmp",
+            ".keep.me.0123456789abcdeg.tmp",
+            ".keep.me..tmp",
+            ".0123456789abcdef.tmp",
+        ] {
+            assert!(!is_temporary_name(other), "{other}");
+        }
+    }
+
+    /// `list` answers in order, whatever order the file system keeps (NTFS keeps names sorted; ext4 does not).
+    #[test]
+    fn list_is_sorted() {
+        let scratch = Scratch::new("sorted");
+        let store = faulty(&scratch);
+        let names: Vec<String> = (0..24).rev().map(|i| format!("n{:02}.x", (i * 7) % 24)).collect();
+        for n in &names {
+            store.put(&name(n), b"1").unwrap();
+        }
+        let listed: Vec<String> = store.list("").unwrap().iter().map(|n| n.as_str().to_string()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(listed, sorted);
     }
 }

@@ -13,6 +13,7 @@ use zeroize::Zeroizing;
 use super::{claim_if_stale, read_blob, DirLock, Entry, LOCK_FILE, LOCK_WAIT};
 use crate::error::KeyError;
 use crate::perm::{self, FileKind, Kind};
+use crate::store::Durability;
 
 /// The most directories above the keys folder that are walked (a path is never this deep; a loop of links cannot make the walk endless).
 const MAX_DEPTH: usize = 4096;
@@ -73,6 +74,8 @@ impl KeyDir {
             hooks: super::Hooks::default(),
         };
         found.check_ancestors()?;
+        // the lock file is made here, once, and an operation only opens it: one that has gone is an error, not a lock that is made again beside the holders of the old one
+        drop(found.open_lock(true)?);
         Ok(found)
     }
 
@@ -115,7 +118,15 @@ impl KeyDir {
 
     /// Takes the advisory lock of the folder (see [`DirLock`]), shared for a read and exclusive for a change.
     pub(crate) fn lock(&self, exclusive: bool) -> Result<DirLock, KeyError> {
-        let flags = OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        DirLock::acquire(self.open_lock(false)?, exclusive, self.lock_wait)
+    }
+
+    /// Opens the lock file (`O_NOFOLLOW`), making it only if `create`, and judges it as any key file is judged: a regular file, ours, no group or other permission, **one name**.
+    fn open_lock(&self, create: bool) -> Result<File, KeyError> {
+        let mut flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        if create {
+            flags |= OFlags::CREATE;
+        }
         let fd = openat(&self.dir, LOCK_FILE, flags, Mode::RUSR | Mode::WUSR).map_err(|e| match e {
             Errno::LOOP => KeyError::Permissions(format!("{}: is a symbolic link", self.display(LOCK_FILE))),
             other => errno("open the lock file", other),
@@ -124,7 +135,7 @@ impl KeyDir {
         let meta = file.metadata().map_err(|e| KeyError::io("inspect the lock file", e))?;
         perm::check(Kind::File, &perm::meta_of(&meta), Some(self.uid))
             .map_err(|why| KeyError::Permissions(format!("{}: {why}", self.display(LOCK_FILE))))?;
-        DirLock::acquire(file, exclusive, self.lock_wait)
+        Ok(file)
     }
 
     /// The contents of one file of the folder, or `None` if the folder has no such entry.
@@ -215,13 +226,15 @@ impl KeyDir {
         Ok(out)
     }
 
-    /// Flushes the folder, so that a rename or a removal survives a power cut.
-    pub(crate) fn sync(&self) -> Result<(), KeyError> {
+    /// Flushes the folder, so that a rename or a removal survives a power cut. A file system that cannot flush a folder says so (`EINVAL`, `ENOTSUP`, `ENOSYS`; some network and FUSE
+    /// ones) and that is `Unconfirmed`, not an error.
+    pub(crate) fn sync(&self) -> Result<Durability, KeyError> {
         #[cfg(test)]
         self.hooks.syncs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        match fsync(&self.dir) {
-            Ok(()) | Err(Errno::INVAL) => Ok(()), // a file system that cannot flush a folder (some network and FUSE ones) says so
-            Err(e) => Err(errno("flush the keys directory", e)),
+        #[cfg(test)]
+        if let Some(injected) = self.hooks.injected_flush_error() {
+            return super::flushed(Err(injected));
         }
+        super::flushed(fsync(&self.dir).map_err(io::Error::from))
     }
 }

@@ -123,7 +123,9 @@ fn the_keystores_copies_of_a_secret_are_zero_when_they_are_freed() {
         let store = open_at(dir.join("keys"), choice).unwrap();
         let name = Name::new("probe.secret").unwrap();
 
-        let (seen, leaked) = probe(|| store.put(&name, &original).unwrap());
+        let (seen, leaked) = probe(|| {
+            store.put(&name, &original).unwrap();
+        });
         // the keyfile makes several copies of the value in the clear (blob, read-back, opened value, check buffer); DPAPI only the opened value it verifies with
         let expected = if label == "keyfile" { 3 } else { 1 };
         assert!(seen >= expected, "{label}: put freed {seen} blocks of the secret's size, expected at least {expected}");
