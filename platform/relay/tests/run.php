@@ -59,6 +59,8 @@ require $testsDir . '/lib/Tmp.php';
 
 // The test clock: a constant defined only here (and by prepend.php in child servers), never by a request.
 \OaiyTest\Tmp::init();
+require_once $testsDir . '/lib/Procs.php';
+\OaiyTest\Procs::watch(\OaiyTest\Tmp::root()); // the end of the run still has to find what names this root, after Tmp::cleanup() has forgotten it
 putenv('OAIY_TEST_CLOCK=' . \OaiyTest\Tmp::clockFile());
 require $testsDir . '/prepend.php';
 
@@ -164,7 +166,7 @@ foreach ($tests as $t) {
         $slowNotRun++;
         continue;
     }
-    $before = $procsEach ? \OaiyTest\Procs::below() : [];
+    $before = $procsEach ? \OaiyTest\Procs::live() : [];
     $t0 = microtime(true);
     $outcome = 'fail';
     // The relay lowers the time limit while it holds a request (set_time_limit); in process that would otherwise end the run.

@@ -466,8 +466,12 @@ Dependency free: nothing to install. The runner enables `sodium` for a run on a 
 tests only, an Apache `httpd` with a configuration of its own, bound to `127.0.0.1`, when `OAIY_TEST_HTTPD` names one or WAMP's is
 found; those tests skip otherwise), and never touches a web server's document root, a real data folder or any port that is not
 its own, and checks that: after every test (on a POSIX host, where listing processes takes a few milliseconds; with
-`OAIY_TEST_PROCS=each` on Windows, where it takes a second) and at the end of the run no process the tests started is still
-running (a leftover fails the test, is named and is ended by its pid), and at the end the working tree's `data/` folder is as it
+`OAIY_TEST_PROCS=each` on Windows, where it takes a second) and at the end of the run no process that the run owns is still
+running (a leftover fails the test, is named and is ended by its pid). What the run owns is every process below the runner in the
+process tree, and every process, whatever its parent, whose command line names the run's own test root (a random folder made for the
+run: an Apache or a database server started with a configuration or a data folder under it, and every `php` the tests start, which
+carry `-d oaiy.test_root=<root>`), so that a daemon that detached from its parent is seen too; what it cannot see is a process that
+is neither, which no launcher in the harness starts. At the end the working tree's `data/` folder is as it
 was (`OAIY_TEST_LIVE_DATA=1` turns that off, for a relay of your own that is served from the checkout while the tests run).
 `php -S` serves one request at a time on
 Windows, so tests that need overlapping requests start several servers on one data folder. The test clock is a PHP constant
