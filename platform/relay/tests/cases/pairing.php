@@ -489,28 +489,79 @@ test('4.10.3 step 2: an expired rendezvous whose row is still there costs the sa
     eq(404, $c->get()['status'], 'at exp it is not');
 });
 
-test('4.10.3 step 2: the timing of an unknown pid and of an expired one is the same (the same lookup, no extra work either way)', function () {
+/** A statement class that remembers the SQL it was asked to run, to compare what two requests did without timing them. */
+final class PairingTestRecordingStatement extends PDOStatement
+{
+    /** @var list<string> */
+    public static array $log = [];
+
+    protected function __construct()
+    {
+    }
+
+    public function execute(?array $params = null): bool
+    {
+        self::$log[] = $this->queryString;
+        return parent::execute($params);
+    }
+}
+
+test('4.10.3 step 2: an unknown pid, an expired one and a burned one do the same work: the same statements, in the same order (the property that the timing of the next test is a sample of, and which no busy machine can blur)', function () {
+    [$r, $d, $c] = pair_setup();
+    $c->open([], 5);
+    $unknown = Ceremony::random($r, $d);
+    $burned = Ceremony::random($r, $d);
+    $burned->open();
+    $burned->burn();
+    Tmp::setClock(Relay::T0 + 6); // the first one is now past its life
+    $statements = [];
+    foreach (['unknown' => $unknown->pid, 'expired' => $c->pid, 'burned' => $burned->pid] as $pid) {
+        $r->call(null, 'GET', '/v1/pair/' . $pid); // once first: the counters of rejections that the relay keeps (the first of an hour makes a row) are then all there
+    }
+    foreach (['unknown' => $unknown->pid, 'expired' => $c->pid, 'burned' => $burned->pid] as $what => $pid) {
+        $ctx = $r->ctx();
+        $ctx->db->pdo()->setAttribute(PDO::ATTR_STATEMENT_CLASS, [PairingTestRecordingStatement::class]);
+        PairingTestRecordingStatement::$log = [];
+        $res = $r->onContext($ctx, fn() => $r->call(null, 'GET', '/v1/pair/' . $pid, null, [], [], ['REMOTE_ADDR' => '198.51.100.' . strlen($what)]));
+        eq(404, $res['status'], $what . ': ' . $res['body']);
+        $statements[$what] = PairingTestRecordingStatement::$log;
+        ok(count($statements[$what]) >= 2, "$what: the statements were recorded: " . json_encode($statements[$what]));
+        $ctx = null;
+    }
+    eq($statements['unknown'], $statements['expired'], 'an expired pid does what an unknown one does');
+    eq($statements['unknown'], $statements['burned'], 'a burned pid does what an unknown one does');
+});
+
+test('4.10.3 step 2: the timing of an unknown pid and of an expired one is the same (the same lookup, no extra work either way): the medians of interleaved samples agree within a tolerance, in at least one of five rounds, so that a machine that is busy with something else does not decide it', function () {
     [$r, $d, $c] = pair_setup();
     $c->open([], 5);
     $unknown = Ceremony::random($r, $d);
     Tmp::setClock(Relay::T0 + 6);
-    $t = ['unknown' => [], 'expired' => []];
     $r->call(null, 'GET', '/v1/pair/' . $c->pid); // warm up
-    for ($i = 0; $i < 60; $i++) {
-        foreach (['unknown' => $unknown->pid, 'expired' => $c->pid] as $k => $pid) {
-            $a = $i % 2 === 0 ? ['REMOTE_ADDR' => '198.51.100.' . ($i % 200)] : ['REMOTE_ADDR' => '203.0.113.' . ($i % 200)];
-            $t0 = hrtime(true);
-            $r->call(null, 'GET', '/v1/pair/' . $pid, null, [], [], $a);
-            $t[$k][] = (hrtime(true) - $t0) / 1e6;
+    $rounds = [];
+    $agreed = false;
+    // What the property says is that the two answers cost the same work: a difference that is the machine's (another process, a cache)
+    // comes and goes between rounds, one that is the code's (an extra statement for one of them, a write) is in every round.
+    for ($round = 0; $round < 5 && !$agreed; $round++) {
+        $t = ['unknown' => [], 'expired' => []];
+        for ($i = 0; $i < 100; $i++) {
+            $order = $i % 2 === 0 ? ['unknown' => $unknown->pid, 'expired' => $c->pid] : ['expired' => $c->pid, 'unknown' => $unknown->pid]; // alternate who goes first
+            foreach ($order as $k => $pid) {
+                $a = ['REMOTE_ADDR' => ($i % 2 === 0 ? '198.51.100.' : '203.0.113.') . ($i % 200)];
+                $t0 = hrtime(true);
+                $r->call(null, 'GET', '/v1/pair/' . $pid, null, [], [], $a);
+                $t[$k][] = (hrtime(true) - $t0) / 1e6;
+            }
         }
+        sort($t['unknown']);
+        sort($t['expired']);
+        $mu = $t['unknown'][50];
+        $me = $t['expired'][50];
+        $agreed = abs($mu - $me) <= max(0.3, 0.15 * max($mu, $me));
+        $rounds[] = sprintf('unknown %.3f ms, expired %.3f ms', $mu, $me);
     }
-    sort($t['unknown']);
-    sort($t['expired']);
-    $mu = $t['unknown'][30];
-    $me = $t['expired'][30];
-    ok(abs($mu - $me) <= max(0.35, 0.3 * max($mu, $me)), sprintf('median unknown %.3f ms, expired %.3f ms', $mu, $me));
+    ok($agreed, 'in none of five rounds did the medians agree: ' . implode(' | ', $rounds));
 });
-
 test('4.10.3 step 2: a wait on an unknown, an expired or a burned pid returns at once and holds nothing', function () {
     [$r, $d, $c] = pair_setup();
     $unknown = Ceremony::random($r, $d);
@@ -1446,6 +1497,11 @@ test('4.10.6 a rendezvous answers 60 GETs in its life; the 61st is 429 rate_limi
     eq(202, $c->answer(null, ['REMOTE_ADDR' => '198.51.100.98'])['status'], 'the budget is for GETs: the answer still goes through');
 });
 
+// A note on what this test cannot tell (the review's mutant D20, "the counting UPDATE counts terminal states again", survives it, and is
+// equivalent): the UPDATE that counts a GET also says AND state IN ('open', 'answered'), a second guard for a rendezvous that reaches an
+// outcome between the read of its row and the update. A request whose read already shows an outcome never reaches that UPDATE (it
+// goes to its own bucket, below), so no sequence of requests can show the second guard missing; only a race can, and the race has one
+// effect, that one GET of a rendezvous that has just ended is counted once. The guard is kept for that and not tested for it.
 test('4.10.6 the 60 GETs are for a rendezvous that is open or answered: one that has an outcome (approved, denied) answers reads without counting them, so nobody who learns the pid can spend the budget the phone needs to read its own result; a read of an outcome has its own small bucket per address and pid', function () {
     foreach (['approved', 'denied'] as $outcome) {
         [$r, $d, $c] = pair_setup();
