@@ -1407,6 +1407,47 @@ mod windows {
         }
     }
 
+    /// The same, with a **file reparse point that WSL makes** (`ln -s` on a Windows drive makes an `IO_REPARSE_TAG_LX_SYMLINK` file, which needs no privilege: a Win32 open that follows it fails
+    /// with "the file cannot be accessed by the system", and one that does not follow it opens the link itself). Opt-in because it starts WSL, which a plain `cargo test` should not do:
+    ///
+    /// ```text
+    /// cargo test -p oaiy-keystore --test keystore -- --ignored wsl --nocapture
+    /// ```
+    ///
+    /// This is what shows that a key file is opened as itself and refused: without the refusal the error is the open's ("cannot be accessed"), not the keystore's, and the assertion on the
+    /// kind of the error is what a mutant that opens following the link (Y16) fails. Skips, with a message, where `wsl.exe` or a distribution is not there.
+    #[test]
+    #[ignore = "opt-in: starts WSL to make a file reparse point without a privilege: run with --ignored wsl"]
+    fn a_file_reparse_point_made_by_wsl_in_place_of_a_key_file_is_refused_as_a_link_not_opened() {
+        for (choice, ext) in providers() {
+            let scratch = Scratch::new("wsl-link");
+            let store = store(&scratch, choice);
+            let n = name("vault.pins");
+            store.put(&n, b"pins").unwrap();
+            let real = file_of(&scratch, "vault.pins", ext);
+            let moved = scratch.keys().join(format!("vault.pins.{ext}.moved"));
+            fs::rename(&real, &moved).unwrap();
+            let as_wsl = |p: &Path| {
+                let text = p.display().to_string().replace('\\', "/");
+                format!("/mnt/{}/{}", text[..1].to_ascii_lowercase(), &text[3..])
+            };
+            let made = std::process::Command::new("wsl.exe").args(["--exec", "ln", "-s"]).arg(moved.file_name().unwrap()).arg(as_wsl(&real)).output();
+            match made {
+                Ok(out) if out.status.success() && fs::symlink_metadata(&real).is_ok() => {}
+                other => {
+                    println!("SKIPPED {ext}: WSL could not make the link here ({other:?})");
+                    fs::rename(&moved, &real).unwrap();
+                    continue;
+                }
+            }
+            assert!(fs::read(&real).is_err(), "{ext}: the link is a reparse point that Win32 cannot open by following it");
+            let error = store.get(&n).expect_err("a link where a key file should be");
+            assert!(matches!(&error, KeyError::Permissions(why) if why.contains("junction or a symbolic link")), "{ext}: {error:?}");
+            assert!(store.list("").unwrap().is_empty(), "{ext}: a reparse point is not a key file, so it is not listed");
+            fs::remove_file(&real).unwrap();
+        }
+    }
+
     /// Third review, M-A: **the keystore on a network share**, over loopback SMB. Opt-in (`#[ignore]`): it needs the administrative share of the drive that the temp folder is on
     /// (`\\localhost\c$` for `C:`), which an administrator account has by default and a machine with file sharing turned off does not. It never connects to anything but `localhost`.
     ///
