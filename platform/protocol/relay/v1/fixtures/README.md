@@ -14,7 +14,7 @@ box is not one of those: its ephemeral key is random, so no two are alike. The f
 | `selftest_fixtures.py` | runs those two checks on sixteen damaged copies of the two files (a flipped bit, a wrong hash, a bad receipt, a good box among the refused ones, ...) and requires each to refuse each | the conformance suite |
 | `aokie/` | what the relay answers to the shipped Aokie plugin and phone (admissions, challenges, frames, streams, errors, ICE) and the rules of their decoders applied to it; its own [`README.md`](aokie/README.md) | a Rust contract test in the Aokie repository, and the conformance suite |
 | `poll-client/poll-client.json` | **not a recording**: a hand-written table of what the poll loop of a native client does with each answer of the relay (rules P1 to P9 of `README.md` section 5.1.1) | the desktop's relay client (DK-03), the phone's (MOB-21a), and the two readers below |
-| `poll-client/verify_poll_client.py`, `poll-client/verify_poll_client.mjs` | two readings of those rules, written from the README alone in two languages, each recomputing every case of the table; the conformance suite also runs both on twenty-six damaged tables (a clamp, a backoff cap, a jitter or a count that is wrong, a case that went missing, constants that are not the README's) and pins the number of cases and the digest of their names and requires each to refuse each | the conformance suite |
+| `poll-client/verify_poll_client.py`, `poll-client/verify_poll_client.mjs` | two readings of those rules, written from the README alone in two languages, each recomputing every case of the table; the conformance suite also runs both on forty-eight damaged tables (a clamp, a backoff cap, a jitter or a count that is wrong, a case that went missing, was relabelled or moved, constants that are not the README's, and a wrong answer to each rule settled in 5.1.1) and pins the number of cases and the digest of their names and requires each to refuse each | the conformance suite |
 
 Regenerate with `php platform/relay/tests/fixtures.php --write` (it drives the relay in a temporary directory on loopback and
 overwrites the files: the sealed boxes and tokens change, so commit the result). `php platform/relay/tests/fixtures.php --check`
@@ -92,11 +92,13 @@ the phone's (MOB-21a) can be tested against the same table before there is a rel
   gave them), `response` (`status` or `null` with a `transport` word when nothing came back, `headers` with lower-case names, `body` as
   parsed JSON or `null`), `u` (the jitter draw, 0 up to but not including 1), and optionally `nowEpoch` (the client's own clock, for a
   `Retry-After` that is an HTTP-date with no usable `Date` header), `weReplaced: false` (the poll answered `superseded` was not replaced by
-  this client) and `minClientAboveOurs` (what a `426` made the client find out by re-reading `info`); and `expect`: the `outcome` (`progress`,
+  this client), `minClientAboveOurs` (what a `426` made the client find out by re-reading `info`), `since` (the `since` the poll carried: 0 when it is
+  absent; which items of the answer are accepted depends on it) and `persisted: false` (the write of what was accepted failed); and `expect`: the `outcome` (`progress`,
   `superseded`, `idle`, `flow`, `failure`, `stop`, or `proved` for a proof), `baseS` (the pause before jitter, in seconds), `pauseS` (after:
   `baseS * (1 + 0.2 * u)`), the `state` after, the `action` (`forget_credential`, `refresh_or_reenrol`, `update_client`, `report_defect`,
-  `clear_epoch`, `report_relay_changed`) and the `report` (`unreachable`, `in_flight_defect`, `duplicate_credential`, `invalid_request`): the
-  names are those of README section 5.1.1 (P7).
+  `clear_epoch`, `cancel_own_polls`, `report_relay_changed`), the `report` (`unreachable`, `in_flight_defect`, `duplicate_credential`,
+  `invalid_request`, `storage_failure`): the names are those of README section 5.1.1 (P7), and, where a case has it, the `since` after (the
+  highest `seq` accepted, or a reset's cursor; the same as before otherwise).
 
 The table also says what it holds: `constants` (the numbers of the rules, which a reader refuses unless they are exactly the README's, and
 takes its numbers from), `caseCount` and `idsSha256` (the SHA-256 of the sorted case names, one per line: a case that goes missing changes

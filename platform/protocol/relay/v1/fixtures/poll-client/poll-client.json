@@ -17,9 +17,9 @@
   "proofAfterPauseS": 60,
   "pollTimeoutExtraS": 10
  },
- "caseCount": 111,
- "idsSha256": "e9ce737bd8df32d166aa61cd5dfdc6aea038f72437063be9d1d3633613a4c34d",
- "layoutSha256": "f9d7696242d382d232a70a0f63d76ef8d6024d6c2c3ddacca36ba66a82e08534",
+ "caseCount": 135,
+ "idsSha256": "9c82ed60bdf576fd414ef432e3f9df7f4e617cc563a0cf10e74e4de572f20479",
+ "layoutSha256": "6558668de8734e3cb5add52fb88bd96e0225ca22ebfc7e5f4c9c15ebdaf4853b",
  "cases": [
   {
    "id": "p1-replace-at-once",
@@ -79,7 +79,7 @@
   {
    "id": "p2-progress",
    "rule": "P2",
-   "what": "a 200 with an item is progress: no pause, every counter cleared",
+   "what": "a 200 with an accepted item is progress: no pause, every counter cleared, and since is the item's seq",
    "state": {
     "n429": 3,
     "nFail": 2,
@@ -96,7 +96,7 @@
     "headers": {},
     "body": {
      "v": 1,
-     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "epoch": "AAAAAAAAAAA",
      "cursor": 1,
      "items": [
       {
@@ -118,7 +118,8 @@
      "n400": 0
     },
     "action": null,
-    "report": []
+    "report": [],
+    "since": 1
    }
   },
   {
@@ -141,7 +142,7 @@
     "headers": {},
     "body": {
      "v": 1,
-     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "epoch": "AAAAAAAAAAA",
      "cursor": 0,
      "items": [],
      "more": false,
@@ -160,7 +161,8 @@
      "n400": 0
     },
     "action": null,
-    "report": []
+    "report": [],
+    "since": 0
    }
   },
   {
@@ -183,7 +185,7 @@
     "headers": {},
     "body": {
      "v": 1,
-     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "epoch": "AAAAAAAAAAA",
      "cursor": 0,
      "items": [],
      "more": false,
@@ -224,7 +226,7 @@
     "headers": {},
     "body": {
      "v": 1,
-     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "epoch": "AAAAAAAAAAA",
      "cursor": 0,
      "items": [],
      "more": false,
@@ -265,7 +267,7 @@
     "headers": {},
     "body": {
      "v": 1,
-     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "epoch": "AAAAAAAAAAA",
      "cursor": 0,
      "items": [],
      "more": false,
@@ -306,7 +308,7 @@
     "headers": {},
     "body": {
      "v": 1,
-     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "epoch": "AAAAAAAAAAA",
      "cursor": 0,
      "items": [],
      "more": false,
@@ -347,7 +349,7 @@
     "headers": {},
     "body": {
      "v": 1,
-     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "epoch": "AAAAAAAAAAA",
      "cursor": 0,
      "items": [],
      "more": false,
@@ -392,7 +394,7 @@
     "headers": {},
     "body": {
      "v": 1,
-     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "epoch": "AAAAAAAAAAA",
      "cursor": 0,
      "items": [],
      "more": false,
@@ -440,7 +442,7 @@
     "headers": {},
     "body": {
      "v": 1,
-     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "epoch": "AAAAAAAAAAA",
      "cursor": 0,
      "items": [],
      "more": false,
@@ -485,7 +487,7 @@
     "headers": {},
     "body": {
      "v": 1,
-     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "epoch": "AAAAAAAAAAA",
      "cursor": 0,
      "items": [],
      "more": false,
@@ -530,7 +532,7 @@
     "headers": {},
     "body": {
      "v": 1,
-     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "epoch": "AAAAAAAAAAA",
      "cursor": 0,
      "items": [],
      "more": false,
@@ -575,7 +577,7 @@
     "headers": {},
     "body": {
      "v": 1,
-     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "epoch": "AAAAAAAAAAA",
      "cursor": 0,
      "items": [],
      "more": false,
@@ -620,7 +622,7 @@
     "headers": {},
     "body": {
      "v": 1,
-     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "epoch": "AAAAAAAAAAA",
      "cursor": 0,
      "items": [],
      "more": false,
@@ -664,7 +666,7 @@
     "headers": {},
     "body": {
      "v": 1,
-     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "epoch": "AAAAAAAAAAA",
      "cursor": 0,
      "items": [],
      "more": false,
@@ -709,7 +711,7 @@
     "headers": {},
     "body": {
      "v": 1,
-     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "epoch": "AAAAAAAAAAA",
      "cursor": 0,
      "items": [],
      "more": false,
@@ -754,7 +756,7 @@
     "headers": {},
     "body": {
      "v": 1,
-     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "epoch": "AAAAAAAAAAA",
      "cursor": 0,
      "items": [],
      "more": false,
@@ -1001,7 +1003,7 @@
      "nRefused": 0,
      "n400": 0
     },
-    "action": null,
+    "action": "cancel_own_polls",
     "report": []
    }
   },
@@ -1044,7 +1046,7 @@
      "nRefused": 0,
      "n400": 0
     },
-    "action": null,
+    "action": "cancel_own_polls",
     "report": []
    }
   },
@@ -1087,7 +1089,7 @@
      "nRefused": 0,
      "n400": 0
     },
-    "action": null,
+    "action": "cancel_own_polls",
     "report": []
    }
   },
@@ -1130,7 +1132,7 @@
      "nRefused": 0,
      "n400": 0
     },
-    "action": null,
+    "action": "cancel_own_polls",
     "report": [
      "in_flight_defect"
     ]
@@ -1175,7 +1177,7 @@
      "nRefused": 0,
      "n400": 0
     },
-    "action": null,
+    "action": "cancel_own_polls",
     "report": []
    }
   },
@@ -1218,7 +1220,7 @@
      "nRefused": 0,
      "n400": 0
     },
-    "action": null,
+    "action": "cancel_own_polls",
     "report": []
    }
   },
@@ -1261,7 +1263,7 @@
      "nRefused": 0,
      "n400": 0
     },
-    "action": null,
+    "action": "cancel_own_polls",
     "report": []
    }
   },
@@ -1304,7 +1306,7 @@
      "nRefused": 0,
      "n400": 0
     },
-    "action": null,
+    "action": "cancel_own_polls",
     "report": [
      "in_flight_defect"
     ]
@@ -1349,7 +1351,7 @@
      "nRefused": 0,
      "n400": 0
     },
-    "action": null,
+    "action": "cancel_own_polls",
     "report": []
    }
   },
@@ -1435,7 +1437,7 @@
      "nRefused": 0,
      "n400": 0
     },
-    "action": null,
+    "action": "cancel_own_polls",
     "report": []
    }
   },
@@ -3157,7 +3159,7 @@
     "headers": {},
     "body": {
      "v": 1,
-     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "epoch": "AAAAAAAAAAA",
      "cursor": 0,
      "items": [],
      "more": false,
@@ -3750,7 +3752,7 @@
     "headers": {},
     "body": {
      "v": 1,
-     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "epoch": "AAAAAAAAAAA",
      "cursor": 2,
      "items": [
       {
@@ -3939,12 +3941,12 @@
   {
    "id": "p9-proof-verified",
    "rule": "P9",
-   "what": "a proof that verifies is 'proved': no pause, and it proves the relay answered, so the failure count is cleared (the others stay)",
+   "what": "a proof that verifies is 'proved': no pause, and it proves the relay answered, so the failure count is cleared and the 429 count, the refused holds and the 400 count stay as they were",
    "state": {
     "n429": 2,
     "nFail": 2,
     "nRefused": 1,
-    "n400": 0
+    "n400": 1
    },
    "info": {
     "pollGapMs": 250,
@@ -3962,7 +3964,7 @@
      "n429": 2,
      "nFail": 0,
      "nRefused": 1,
-     "n400": 0
+     "n400": 1
     },
     "action": null,
     "report": []
@@ -3971,12 +3973,12 @@
   {
    "id": "p9-proof-no-answer",
    "rule": "P9",
-   "what": "no answer to the proof request is a failure like any: pause 4 on the third",
+   "what": "no answer to the proof request is a failure like any: pause 4 on the third, and the other counters are cleared",
    "state": {
-    "n429": 0,
+    "n429": 2,
     "nFail": 2,
-    "nRefused": 0,
-    "n400": 0
+    "nRefused": 1,
+    "n400": 1
    },
    "info": {
     "pollGapMs": 250,
@@ -4010,7 +4012,7 @@
     "n429": 2,
     "nFail": 2,
     "nRefused": 1,
-    "n400": 0
+    "n400": 1
    },
    "info": {
     "pollGapMs": 250,
@@ -4028,7 +4030,7 @@
      "n429": 2,
      "nFail": 2,
      "nRefused": 1,
-     "n400": 0
+     "n400": 1
     },
     "action": "report_relay_changed",
     "report": []
@@ -4171,7 +4173,7 @@
     "headers": {},
     "body": {
      "v": 1,
-     "epoch": "AAAAAAAAAAAAAAAAAAAAAA",
+     "epoch": "AAAAAAAAAAA",
      "cursor": 0,
      "items": [],
      "more": false,
@@ -4185,6 +4187,1131 @@
     "pauseS": 0,
     "state": {
      "n429": 0,
+     "nFail": 0,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [],
+    "since": 0
+   }
+  },
+  {
+   "id": "p2-since-advances",
+   "rule": "P2",
+   "what": "items above the since the poll carried are accepted: progress, and since becomes the highest seq among them",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAA",
+     "cursor": 7,
+     "items": [
+      {
+       "seq": 6
+      },
+      {
+       "seq": 7
+      }
+     ],
+     "more": false,
+     "time": 1790000000
+    }
+   },
+   "expect": {
+    "outcome": "progress",
+    "baseS": 0,
+    "pauseS": 0,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [],
+    "since": 7
+   },
+   "since": 5
+  },
+  {
+   "id": "p2-items-partly-accepted",
+   "rule": "P2",
+   "what": "an item that is not above the since, or not above the one accepted before it in the answer, is dropped (5 and the second 6 here); the others are accepted",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAA",
+     "cursor": 7,
+     "items": [
+      {
+       "seq": 5
+      },
+      {
+       "seq": 6
+      },
+      {
+       "seq": 6
+      },
+      {
+       "seq": 7
+      }
+     ],
+     "more": false,
+     "time": 1790000000
+    }
+   },
+   "expect": {
+    "outcome": "progress",
+    "baseS": 0,
+    "pauseS": 0,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [],
+    "since": 7
+   },
+   "since": 5
+  },
+  {
+   "id": "p2-items-out-of-order",
+   "rule": "P2",
+   "what": "items are accepted in the order they come: 3 and then 4, and the 2 after the 3 is dropped",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAA",
+     "cursor": 4,
+     "items": [
+      {
+       "seq": 3
+      },
+      {
+       "seq": 2
+      },
+      {
+       "seq": 4
+      }
+     ],
+     "more": false,
+     "time": 1790000000
+    }
+   },
+   "expect": {
+    "outcome": "progress",
+    "baseS": 0,
+    "pauseS": 0,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [],
+    "since": 4
+   },
+   "since": 0
+  },
+  {
+   "id": "p2-items-not-above-since",
+   "rule": "P2",
+   "what": "an answer none of whose items is accepted (the relay never sends one at or below the since: it deletes what was acknowledged) is idle, and since stays",
+   "state": {
+    "n429": 1,
+    "nFail": 1,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAA",
+     "cursor": 5,
+     "items": [
+      {
+       "seq": 5
+      },
+      {
+       "seq": 4
+      }
+     ],
+     "more": false,
+     "time": 1790000000
+    }
+   },
+   "expect": {
+    "outcome": "idle",
+    "baseS": 0.25,
+    "pauseS": 0.25,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [],
+    "since": 5
+   },
+   "since": 5
+  },
+  {
+   "id": "p2-item-seq-not-integer",
+   "rule": "P2",
+   "what": "an item whose seq is not an integer (a string, a fraction, none) is not accepted",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAA",
+     "cursor": 7,
+     "items": [
+      {
+       "seq": "7"
+      },
+      {
+       "seq": 1.5
+      },
+      {
+       "id": "x"
+      }
+     ],
+     "more": false,
+     "time": 1790000000
+    }
+   },
+   "expect": {
+    "outcome": "idle",
+    "baseS": 0.25,
+    "pauseS": 0.25,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [],
+    "since": 0
+   }
+  },
+  {
+   "id": "p2-refused-hold-with-items",
+   "rule": "P2",
+   "what": "the rows of P2 are tried in order and the first that fits wins: a refused hold that carries an accepted item is progress, not idle, and clears the count of refused holds",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 3,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAA",
+     "cursor": 1,
+     "items": [
+      {
+       "seq": 1
+      }
+     ],
+     "more": false,
+     "time": 1790000000,
+     "hold": {
+      "refused": true,
+      "retryAfter": 2
+     }
+    }
+   },
+   "expect": {
+    "outcome": "progress",
+    "baseS": 0,
+    "pauseS": 0,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [],
+    "since": 1
+   }
+  },
+  {
+   "id": "p2-superseded-with-items",
+   "rule": "P2",
+   "what": "and so is a superseded answer that carries one (the items are accepted, and the next poll acknowledges them)",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAA",
+     "cursor": 1,
+     "items": [
+      {
+       "seq": 1
+      }
+     ],
+     "more": false,
+     "time": 1790000000,
+     "hold": {
+      "granted": true,
+      "superseded": true
+     }
+    }
+   },
+   "expect": {
+    "outcome": "progress",
+    "baseS": 0,
+    "pauseS": 0,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [],
+    "since": 1
+   }
+  },
+  {
+   "id": "p2-refused-hold-items-not-accepted",
+   "rule": "P2",
+   "what": "a refused hold whose items are not accepted is idle, and counts as a refused hold (the pause doubles)",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 1,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAA",
+     "cursor": 3,
+     "items": [
+      {
+       "seq": 2
+      }
+     ],
+     "more": false,
+     "time": 1790000000,
+     "hold": {
+      "refused": true,
+      "retryAfter": 2
+     }
+    }
+   },
+   "expect": {
+    "outcome": "idle",
+    "baseS": 4,
+    "pauseS": 4,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 2,
+     "n400": 0
+    },
+    "action": null,
+    "report": [],
+    "since": 3
+   },
+   "since": 3
+  },
+  {
+   "id": "p2-reset-lower-cursor",
+   "rule": "P2",
+   "what": "a reset adopts the cursor of the answer once, and it may be lower than the since the client had: that is what a reset is",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAA",
+     "cursor": 10,
+     "items": [],
+     "more": false,
+     "time": 1790000000,
+     "reset": true
+    }
+   },
+   "expect": {
+    "outcome": "progress",
+    "baseS": 0,
+    "pauseS": 0,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [],
+    "since": 10
+   },
+   "since": 50
+  },
+  {
+   "id": "p2-reset-no-cursor",
+   "rule": "P2",
+   "what": "a reset with no cursor is not a valid 200 (the schema requires both in every 200): a failure that adopts nothing, and since stays",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAA",
+     "items": [],
+     "more": false,
+     "time": 1790000000,
+     "reset": true
+    }
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [],
+    "since": 50
+   },
+   "since": 50
+  },
+  {
+   "id": "p2-reset-negative-cursor",
+   "rule": "P2",
+   "what": "a reset with a negative cursor is not a valid 200 (the schema requires both in every 200): a failure that adopts nothing, and since stays",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAA",
+     "cursor": -1,
+     "items": [],
+     "more": false,
+     "time": 1790000000,
+     "reset": true
+    }
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [],
+    "since": 50
+   },
+   "since": 50
+  },
+  {
+   "id": "p2-reset-cursor-not-integer",
+   "rule": "P2",
+   "what": "a reset whose cursor is not an integer is not a valid 200 (the schema requires both in every 200): a failure that adopts nothing, and since stays",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAA",
+     "cursor": 1.5,
+     "items": [],
+     "more": false,
+     "time": 1790000000,
+     "reset": true
+    }
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [],
+    "since": 50
+   },
+   "since": 50
+  },
+  {
+   "id": "p2-reset-cursor-too-big",
+   "rule": "P2",
+   "what": "a reset whose cursor is above 2^53 - 1 is not a valid 200 (the schema requires both in every 200): a failure that adopts nothing, and since stays",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAA",
+     "cursor": 9007199254740992,
+     "items": [],
+     "more": false,
+     "time": 1790000000,
+     "reset": true
+    }
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [],
+    "since": 50
+   },
+   "since": 50
+  },
+  {
+   "id": "p2-reset-no-epoch",
+   "rule": "P2",
+   "what": "a reset with no epoch is not a valid 200 (the schema requires both in every 200): a failure that adopts nothing, and since stays",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "cursor": 0,
+     "items": [],
+     "more": false,
+     "time": 1790000000,
+     "reset": true
+    }
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [],
+    "since": 50
+   },
+   "since": 50
+  },
+  {
+   "id": "p2-reset-short-epoch",
+   "rule": "P2",
+   "what": "a reset whose epoch is not 11 characters is not a valid 200 (the schema requires both in every 200): a failure that adopts nothing, and since stays",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAA",
+     "cursor": 0,
+     "items": [],
+     "more": false,
+     "time": 1790000000,
+     "reset": true
+    }
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [],
+    "since": 50
+   },
+   "since": 50
+  },
+  {
+   "id": "p2-reset-epoch-not-text",
+   "rule": "P2",
+   "what": "a reset whose epoch is not text is not a valid 200 (the schema requires both in every 200): a failure that adopts nothing, and since stays",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": 5,
+     "cursor": 0,
+     "items": [],
+     "more": false,
+     "time": 1790000000,
+     "reset": true
+    }
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [],
+    "since": 50
+   },
+   "since": 50
+  },
+  {
+   "id": "p2-items-no-epoch",
+   "rule": "P2",
+   "what": "a 200 with items and no epoch is not a valid 200 (the schema requires both in every 200): a failure that adopts nothing, and since stays",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "cursor": 6,
+     "items": [
+      {
+       "seq": 6
+      }
+     ],
+     "more": false,
+     "time": 1790000000
+    }
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [],
+    "since": 50
+   },
+   "since": 50
+  },
+  {
+   "id": "p2-storage-failure",
+   "rule": "P2",
+   "what": "items that cannot be written to the store are a failure for the pause (the third in a row pauses 4): since is not advanced, the report is storage_failure and not unreachable (the relay answered)",
+   "state": {
+    "n429": 2,
+    "nFail": 2,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAA",
+     "cursor": 6,
+     "items": [
+      {
+       "seq": 6
+      }
+     ],
+     "more": false,
+     "time": 1790000000
+    }
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 4,
+    "pauseS": 4,
+    "state": {
+     "n429": 0,
+     "nFail": 3,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [
+     "storage_failure"
+    ],
+    "since": 5
+   },
+   "since": 5,
+   "persisted": false
+  },
+  {
+   "id": "p2-storage-failure-first",
+   "rule": "P2",
+   "what": "the first one pauses 1, so that a store that keeps failing is polled at the capped pauses and not in a tight loop",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAA",
+     "cursor": 6,
+     "items": [
+      {
+       "seq": 6
+      }
+     ],
+     "more": false,
+     "time": 1790000000
+    }
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [
+     "storage_failure"
+    ],
+    "since": 5
+   },
+   "since": 5,
+   "persisted": false
+  },
+  {
+   "id": "p2-storage-failure-reset",
+   "rule": "P2",
+   "what": "a reset whose adoption cannot be written is the same: nothing is adopted",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAA",
+     "cursor": 10,
+     "items": [],
+     "more": false,
+     "time": 1790000000,
+     "reset": true
+    }
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [
+     "storage_failure"
+    ],
+    "since": 50
+   },
+   "since": 50,
+   "persisted": false
+  },
+  {
+   "id": "p7-500-after-400-reports-unreachable",
+   "rule": "P7",
+   "what": "a first 400 raises the failure count but is not reported unreachable (the relay answered): a 500 after it, with the count at three, is the fourth failure and is",
+   "state": {
+    "n429": 0,
+    "nFail": 3,
+    "nRefused": 0,
+    "n400": 1
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 500,
+    "headers": {},
+    "body": {
+     "error": {
+      "code": "internal",
+      "message": "x"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 8,
+    "pauseS": 8,
+    "state": {
+     "n429": 0,
+     "nFail": 4,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [
+     "unreachable"
+    ]
+   }
+  },
+  {
+   "id": "p4-in-flight-cancels-own-polls",
+   "rule": "P4",
+   "what": "an in_flight 429 is flow control and also asks the client to cancel every poll of its own that is still in flight (the relay counts a cancelled poll for up to 250 ms, and the pause is at least a second)",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "1"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 1,
+      "rule": "in_flight"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": "cancel_own_polls",
+    "report": []
+   }
+  },
+  {
+   "id": "p7-429-5-no-rule",
+   "rule": "P7",
+   "what": "the fifth 429 in a row that carries no rule is not that defect (a bucket's, a proxy's), and asks nothing of the client's own polls",
+   "state": {
+    "n429": 4,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "1"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 1
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 16,
+    "pauseS": 16,
+    "state": {
+     "n429": 5,
+     "nFail": 0,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p7-429-5-unknown-rule",
+   "rule": "P7",
+   "what": "nor is one whose rule the client does not know (it is treated as none)",
+   "state": {
+    "n429": 4,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "1"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 1,
+      "rule": "burst"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 16,
+    "pauseS": 16,
+    "state": {
+     "n429": 5,
      "nFail": 0,
      "nRefused": 0,
      "n400": 0
