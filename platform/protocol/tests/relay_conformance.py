@@ -1828,6 +1828,9 @@ ok("README bounds the polls that wait of one credential to three in flight, answ
    "At most three consumer polls that wait" in readme and "A fourth is refused `429 rate_limited`, `Retry-After: 1`, before anything is read or written" in readme
    and "MUST NOT treat this `429` as a failure, and MUST honour `Retry-After`" in readme and "DK-03" in readme and "MOB-21a" in readme and "Interpretation 58" in readme
    and "`Holds::POLL_INFLIGHT_MAX` (3)" in readme)
+ok("README says what the poll bound is worth: with the shipped gap rule its benefit is small (a defence in depth that matters when wait.gap_ms is 0), that the first figures came from a relay whose gap was 0, and that the pool tests run with both",
+   "a bound in depth, whose benefit with the shipped gap rule is small" in readme and "were measured on a relay whose `wait.gap_ms` was 0, which the tests set and the product does not ship" in readme
+   and "The bound is therefore defence in depth" in readme and "run with both: gap 0, where the bound alone protects the pool, and the shipped 250" in readme)
 ok("README records that the relay's limits are tighter than the decoders' and that 'no change to the shipped plugin and phone' is not true, and lists what needs a client change",
    "The relay's limits are tighter than the decoders'" in readme and "need no change\" is not true today" in readme
    and all(x in readme for x in ("`relay_status_error`", "both carriers ignore `Retry-After`", "no OAuth route", "`supportedTransports`", "64 roster entries and an app id of 200 characters")))

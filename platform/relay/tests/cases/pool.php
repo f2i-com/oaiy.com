@@ -18,8 +18,10 @@ use OaiyTest\Tmp;
  * The slow tests put a pool of W workers (Pool: W `php -S` servers behind a front that queues, as PHP-FPM's accept queue does) between
  * the requests and the relay, so a health check that finds every worker busy waits its turn. A request costs a worker about 50 ms
  * on a Windows development machine, so fifty of them take about half a second to get through five workers whatever they are: the
- * bound is on how much more than that a burst may cost, and a run is repeated up to three times because a machine that is doing
- * something else can add a second to any one of them (a burst that is not refused takes 3 seconds and more every time).
+ * bound is on how much more than that a burst may cost. A burst is tried up to three times and the test passes with the first try that
+ * keeps health under its bounds (a machine that is doing something else can add a second to any one try; a burst that is not refused
+ * takes 3 seconds and more in every try, so three failures in a row is what a missing bound looks like). The count of refusals is checked
+ * in every try that is run.
  */
 
 /**
@@ -154,7 +156,7 @@ foreach ([5, 8] as $workers) {
                 ok($refused >= 50 - Holds::OPEN_BUCKET - 6, 'at least ' . (50 - Holds::OPEN_BUCKET - 6) . ' of the 50 were refused at once, not queued and run: ' . json_encode($res['statuses']));
                 $passed = pool_p90($res['latency']) < 1.0 && $worst < 2.0;
             }
-            ok($passed, "health checks during 50 $what opens from one bearer took a second at the 90th percentile or two at the most, in all of three tries: " . implode(' | ', $tries));
+            ok($passed, "health checks during 50 $what opens from one bearer took a second at the 90th percentile or two at the most, in one of up to three tries (the first that does ends the test): " . implode(' | ', $tries));
         });
 
         slow_test("9.2 a party that opens fifty " . ($what === 'stream' ? 'streams' : 'frames waits') . " every two seconds with a new admission each time, on a host of $workers workers, is let through its bucket and no more, and health answers throughout", function () use ($workers, $what) {
@@ -183,60 +185,68 @@ foreach ([5, 8] as $workers) {
                 ok($accepted <= Holds::OPEN_BUCKET + 2 * Holds::STREAM_INFLIGHT_MAX, "the party got $accepted of 200 opens through: " . json_encode($res['statuses']));
                 $passed = pool_p90($res['latency']) < 1.0 && $worst < 2.0;
             }
-            ok($passed, 'health checks took a second at the 90th percentile or two at the most, in all of three tries: ' . implode(' | ', $tries));
+            ok($passed, 'health checks took a second at the 90th percentile or two at the most, in one of up to three tries (the first that does ends the test): ' . implode(' | ', $tries));
         });
     }
 }
 
 // The native poll (GET /v1/poll?wait=20) is the hold that every phone and desktop opens, and it was left out of the bound above: fifty of
-// them at once from ONE phone token, six times over, kept a five-worker pool busy for ten seconds (a health check took 6.9 s at the
-// median and 10.3 s at the worst; 2.5 s and 5.1 s on eight workers), because each pins a worker for a step until a newer one supersedes it
-// and a refusal came only after the database had been read. At most three of a credential run at once, and the fourth is refused at once.
+// them at once from ONE phone token, six times over, kept a five-worker pool busy for ten seconds when wait.gap_ms was 0 (a health check
+// took 7 s at the median and 10 s at the worst), because each pins a worker for a step until a newer one supersedes it and a refusal came
+// only after the database had been read. At most three of a credential run at once, and the fourth is refused at once.
+//
+// The tests run with wait.gap_ms 0 (where the bound alone protects the pool, and the test fails without it) and with the shipped 250
+// (where the gap rule already refuses most of a burst, and the bound adds little: Interpretation 58 has the measured figures). The
+// tests' own default of 0 is not what the product ships, so a figure or a pass that only held with it would say nothing about a relay
+// as installed. With the bound taken out the burst test fails with gap 0 (49 of 50 polls are let through) and passes with 250: the
+// variants with 250 are the check that a relay as installed keeps health answering, and the bound's own tests are the ones with 0.
 foreach ([5, 8] as $workers) {
     foreach (['phone', 'desktop'] as $who) {
-        slow_test("9.2 fifty parallel polls of one $who's token on a host of $workers workers leave /v1/health answering in under a second: all but a few are refused at once (429)", function () use ($workers, $who) {
-            $r = Relay::make(['capacity' => ['workers' => $workers]]);
-            $d = $r->desktop();
-            $token = $who === 'phone' ? $r->phone($d)->token : $d->token;
-            $pool = Pool::start($r->fleet($workers));
-            $quiet = pool_burst($pool, static fn(int $i): string => $token, 'poll', 0, 0, 1.0, 1.0);
-            ok($quiet['latency'] !== [] && max($quiet['latency']) < 1.0, 'the host is quiet: ' . json_encode($quiet['latency']));
-            $tries = [];
-            $passed = false;
-            for ($try = 1; $try <= 3 && !$passed; $try++) {
-                $res = pool_burst($pool, static fn(int $i): string => $token, 'poll', 50, 1, 0.0, 3.0);
-                $worst = $res['latency'] === [] ? 99.0 : max($res['latency']);
-                $tries[] = sprintf('%.2f s, %s', $worst, json_encode($res['statuses']));
-                ok(count($res['latency']) >= 20, 'the probes were answered: ' . count($res['latency']));
-                eq(50, array_sum($res['statuses']));
-                $refused = (int)($res['statuses'][429] ?? 0);
-                ok($refused >= 35, 'at least 35 of the 50 were refused at once, not queued and run: ' . json_encode($res['statuses']));
-                $passed = pool_p90($res['latency']) < 1.0 && $worst < 2.0;
-            }
-            ok($passed, "health checks during 50 polls from one $who token took a second at the 90th percentile or two at the most, in all of three tries: " . implode(' | ', $tries));
-        });
+        foreach ([0, 250] as $gap) {
+            slow_test("9.2 fifty parallel polls of one $who's token on a host of $workers workers (wait.gap_ms $gap) leave /v1/health answering in under a second: all but a few are refused at once (429)", function () use ($workers, $who, $gap) {
+                $r = Relay::make(['capacity' => ['workers' => $workers], 'wait' => ['gap_ms' => $gap]]);
+                $d = $r->desktop();
+                $token = $who === 'phone' ? $r->phone($d)->token : $d->token;
+                $pool = Pool::start($r->fleet($workers));
+                $quiet = pool_burst($pool, static fn(int $i): string => $token, 'poll', 0, 0, 1.0, 1.0);
+                ok($quiet['latency'] !== [] && max($quiet['latency']) < 1.0, 'the host is quiet: ' . json_encode($quiet['latency']));
+                $tries = [];
+                $passed = false;
+                for ($try = 1; $try <= 3 && !$passed; $try++) {
+                    $res = pool_burst($pool, static fn(int $i): string => $token, 'poll', 50, 1, 0.0, 3.0);
+                    $worst = $res['latency'] === [] ? 99.0 : max($res['latency']);
+                    $tries[] = sprintf('%.2f s, %s', $worst, json_encode($res['statuses']));
+                    ok(count($res['latency']) >= 20, 'the probes were answered: ' . count($res['latency']));
+                    eq(50, array_sum($res['statuses']));
+                    $refused = (int)($res['statuses'][429] ?? 0);
+                    ok($refused >= 35, 'at least 35 of the 50 were refused at once, not queued and run: ' . json_encode($res['statuses']));
+                    $passed = pool_p90($res['latency']) < 1.0 && $worst < 2.0;
+                }
+                ok($passed, "health checks during 50 polls from one $who token took a second at the 90th percentile or two at the most, in one of up to three tries (the first that does ends the test; every try must also have its refusals): " . implode(' | ', $tries));
+            });
 
-        slow_test("9.2 one $who token that sends fifty polls every two seconds, on a host of $workers workers, is let through three at a time and no more, and health answers throughout", function () use ($workers, $who) {
-            $r = Relay::make(['capacity' => ['workers' => $workers]]);
-            $d = $r->desktop();
-            $token = $who === 'phone' ? $r->phone($d)->token : $d->token;
-            $pool = Pool::start($r->fleet($workers));
-            $tries = [];
-            $passed = false;
-            for ($try = 1; $try <= 3 && !$passed; $try++) {
-                $res = pool_burst($pool, static fn(int $i): string => $token, 'poll', 50, 4, 2.0, 8.0);
-                $worst = $res['latency'] === [] ? 99.0 : max($res['latency']);
-                $accepted = (int)($res['statuses']['200'] ?? 0) + (int)($res['statuses']['open'] ?? 0);
-                $tries[] = sprintf('worst %.2f s, p90 %.2f s, %s', $worst, pool_p90($res['latency']), json_encode($res['statuses']));
-                eq(200, array_sum($res['statuses']));
-                // A poll that runs is superseded by the next one within a step and answers 200, so a burst lets a few through as the places
-                // come free (about three in a step, so a slower database lets more of them through in the second or two that a burst takes
-                // to be answered): well under the 200 that were sent, all of which are let through without the bound.
-                ok($accepted <= 100,"the token got $accepted of 200 polls through: " . json_encode($res['statuses']));
-                $passed = pool_p90($res['latency']) < 1.0 && $worst < 2.0;
-            }
-            ok($passed, 'health checks took a second at the 90th percentile or two at the most, in all of three tries: ' . implode(' | ', $tries));
-        });
+            slow_test("9.2 one $who token that sends fifty polls every two seconds, on a host of $workers workers (wait.gap_ms $gap), is let through three at a time and no more, and health answers throughout", function () use ($workers, $who, $gap) {
+                $r = Relay::make(['capacity' => ['workers' => $workers], 'wait' => ['gap_ms' => $gap]]);
+                $d = $r->desktop();
+                $token = $who === 'phone' ? $r->phone($d)->token : $d->token;
+                $pool = Pool::start($r->fleet($workers));
+                $tries = [];
+                $passed = false;
+                for ($try = 1; $try <= 3 && !$passed; $try++) {
+                    $res = pool_burst($pool, static fn(int $i): string => $token, 'poll', 50, 4, 2.0, 8.0);
+                    $worst = $res['latency'] === [] ? 99.0 : max($res['latency']);
+                    $accepted = (int)($res['statuses']['200'] ?? 0) + (int)($res['statuses']['open'] ?? 0);
+                    $tries[] = sprintf('worst %.2f s, p90 %.2f s, %s', $worst, pool_p90($res['latency']), json_encode($res['statuses']));
+                    eq(200, array_sum($res['statuses']));
+                    // A poll that runs is superseded by the next one within a step and answers 200, so a burst lets a few through as the places
+                    // come free (about three in a step, so a slower database lets more of them through in the second or two that a burst takes
+                    // to be answered): well under the 200 that were sent, all of which are let through without the bound.
+                    ok($accepted <= 100,"the token got $accepted of 200 polls through: " . json_encode($res['statuses']));
+                    $passed = pool_p90($res['latency']) < 1.0 && $worst < 2.0;
+                }
+                ok($passed, 'health checks took a second at the 90th percentile or two at the most, in one of up to three tries (the first that does ends the test): ' . implode(' | ', $tries));
+            });
+        }
     }
 }
 

@@ -15,7 +15,7 @@ The wire protocol is [`platform/protocol/relay/v1/`](../protocol/relay/v1/README
 | Extensions | `sodium` (bundled with PHP since 7.2), `json`, `hash`, and `pdo_sqlite` (the default store) or `pdo_mysql`. `openssl` and `curl` matter only to the optional FCM sender, which is not part of this build. |
 | Disk | A writable `data/` folder on a **local** filesystem (SQLite's write-ahead log is unsafe on NFS and similar). The hold markers in `data/holds/` are stamped with PHP's clock and not the filesystem's, so a `data/` whose filesystem clock is off PHP's by minutes still counts its holds (a marker is stale 5 seconds past its cap, or when stamped more than a minute ahead). |
 | HTTPS | A publicly trusted certificate on a hostname of its own (a subdomain such as `relay.example.com`, not a path on a site that hosts anything else). The desktop and the phone use the bundled web roots and cannot use a private CA. |
-| Workers | Each waiting poll holds one PHP worker for up to 20 seconds; at most three polls that wait of one credential run at once (the fourth is `429`, `Retry-After: 1`, before the database is read), so one phone cannot pin a small pool. Measure what your host allows with the [host probe](probe/host-probe.php) and [`docs/relay-hosting-matrix.md`](../../docs/relay-hosting-matrix.md) before you commit to a plan. |
+| Workers | Each waiting poll holds one PHP worker for up to 20 seconds; at most three polls that wait of one credential run at once (the fourth is `429`, `Retry-After: 1`, before the database is read), so one phone cannot pin a small pool; with the shipped `wait.gap_ms` of 250 the gap rule already refuses most of a burst of polls and this bound adds little (a bound in depth: it is what holds when the gap is 0, and Interpretation 58 of the protocol README has the measured figures). Measure what your host allows with the [host probe](probe/host-probe.php) and [`docs/relay-hosting-matrix.md`](../../docs/relay-hosting-matrix.md) before you commit to a plan. |
 
 ## Layout
 
@@ -237,7 +237,7 @@ is an error, not a default. Keys this build understands (unknown keys are ignore
 | `db.driver`, `db.dsn`, `db.user`, `db.pass` | `sqlite`, none | The database. SQLite lives in `data/relay.sqlite`; `mysql` needs a DSN |
 | `db.journal` | `wal` | `wal`, or `truncate` on a network filesystem. The installer sets it from `/proc/self/mountinfo` |
 | `wait.max` | 20 | Longest a poll is held, seconds (at most 300, and lowered to the measured hold minus 5 by the calibration) |
-| `wait.gap_ms` | 250 | The poll gap rule |
+| `wait.gap_ms` | 250 | The poll gap rule (0 to 5000): a poll that makes no progress within this many milliseconds of the last one ending is `429`. It is also what refuses most of a burst of polls from one token; the in-flight bound of three does not depend on it, and its measured benefit is small unless this is 0 |
 | `wait.fallback_s` | 5 | Short-poll interval after a refused hold |
 | `presence_window` | 60 | Seconds a poll start counts as online (effective value is at least `wait.max` + 5) |
 | `capacity.workers` | unset | The worker pool. Unset means 5 until the calibration measures it |

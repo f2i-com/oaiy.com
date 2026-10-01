@@ -100,7 +100,8 @@ final class Relay
         }
         Installer::provision($r->data, array_merge(['public_url' => $r->publicUrl, 'journal' => 'wal'], $provision));
         // The gap rule looks at real time between two polls, which a test that polls twice in a row would trip; tests
-        // of the rule itself set wait.gap_ms back to 250. Garbage collection after a random request would strike at random in
+        // of the rule itself set wait.gap_ms back to 250 (as do the pool tests of poll bursts, which run with both: 0 is not what the
+        // product ships, and a figure measured with it says nothing about a relay as installed). Garbage collection after a random request would strike at random in
         // a test that moved the clock, so it is off (gc.one_in 0) unless a test of it asks for it.
         // Every relay of the tests records where each 401, 404 and 5xx it answers was decided (debug.error_sites), so that a test that
         // fails on one it did not expect, or a flake that nobody can reproduce, says which line of the relay answered it (errorSites()).
