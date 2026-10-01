@@ -77,7 +77,7 @@ pub const DEFAULT: &str = r#"{
     "top_p": 0.95,
     "prompt_cache": true,
     "prompt_cache_gb": 4,
-    "park_gb": 8,
+    "park_gb": null,
     "vision": true,
     "idle_stop_minutes": 0,
     "extra_args": []
@@ -458,6 +458,12 @@ pub fn validate(v: &Json) -> Result<(), String> {
         return Err("llm.backend must be auto, cuda, webgpu or cpu".into());
     }
     gib(llm, "webgpu_gb", "llm", 1024)?;
+    // Host RAM for the conversations Flash-Next sets aside; null (or absent) leaves the server's own default.
+    if let Some(gb) = llm.get("park_gb").filter(|g| !matches!(g, Json::Null)) {
+        if !gb.as_f64().is_some_and(|g| g.is_finite() && (0.0..=1024.0).contains(&g)) {
+            return Err("llm.park_gb must be a number of GB in 0..1024, or null".into());
+        }
+    }
     let default = str_or(llm, "default_model", "");
     if !default.is_empty() && !names.contains(&default) {
         return Err(format!("llm.default_model {default} is not one of the listed models"));
@@ -716,6 +722,17 @@ mod tests {
     }
 
     #[test]
+    fn park_gb_is_null_by_default_and_takes_zero_or_a_number_of_gb() {
+        assert_eq!(field(&mut default_json(), &["llm", "park_gb"]), &Json::Null, "unset: the server's own default applies");
+        for ok in [Json::Null, Json::Int(0), Json::Int(8), Json::Num(2.5), Json::Int(1024)] {
+            assert!(with(|v| *field(v, &["llm", "park_gb"]) = ok.clone()).is_ok(), "{ok:?}");
+        }
+        for bad in [Json::Int(-1), Json::Num(f64::NAN), Json::Int(1025), Json::str("8"), Json::Bool(true)] {
+            assert!(with(|v| *field(v, &["llm", "park_gb"]) = bad.clone()).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn missing_sections_are_filled_but_user_values_kept() {
         let mut v = Json::parse(br#"{"ui":{"port":9000},"gateway":{"routes":[]}}"#).unwrap();
         merge_defaults(&mut v, &default_json());
@@ -733,6 +750,8 @@ mod tests {
             (Box::new(|v: &mut Json| *field(v, &["media", "image", "memory"]) = Json::str("disk")), "memory"),
             (Box::new(|v: &mut Json| *field(v, &["media", "llm_policy"]) = Json::str("never")), "llm_policy"),
             (Box::new(|v: &mut Json| *field(v, &["llm", "default_model"]) = Json::str("ghost")), "default_model"),
+            (Box::new(|v: &mut Json| *field(v, &["llm", "park_gb"]) = Json::Int(-1)), "llm.park_gb"),
+            (Box::new(|v: &mut Json| *field(v, &["llm", "park_gb"]) = Json::str("8")), "llm.park_gb"),
             (Box::new(move |v: &mut Json| {
                 let mut r = routes(v);
                 if let Json::Arr(items) = &mut r { let first = items[0].clone(); items.push(first); }

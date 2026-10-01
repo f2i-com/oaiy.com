@@ -225,8 +225,12 @@ pub fn arguments(llm: &Json, root: &Path, port: u16, key: &str, local_images: bo
         push("--prompt-cache-gb", num_or(llm, "prompt_cache_gb", 4.0).to_string());
     }
     // Host RAM where Qwen3.8-Flash-Next sets aside the conversation another displaces (it keeps one
-    // on the GPUs and nothing on disk); 0 = off. Server builds before this option refuse the flag.
-    push("--park-gb", num_or(llm, "park_gb", 8.0).max(0.0).to_string());
+    // on the GPUs and nothing on disk); 0 = off. Passed only when `park_gb` is set: otherwise the
+    // server's own default (8 GB) applies, and a server from before the option, which refuses the
+    // flag, still starts.
+    if let Some(gb) = llm.get("park_gb").and_then(Json::as_f64).filter(|gb| gb.is_finite()) {
+        push("--park-gb", gb.max(0.0).to_string());
+    }
     a.push("--watch-stdin".into());
     if bool_or(llm, "thinking", false) {
         a.push("--thinking".into());
@@ -588,23 +592,31 @@ mod tests {
     }
 
     #[test]
-    fn conversations_set_aside_in_ram_default_to_eight_gb_and_can_be_turned_off() {
+    fn park_gb_is_passed_only_when_it_is_configured() {
         let root = Path::new("/install");
-        let park = |llm: &str| {
-            let llm = Json::parse(llm.as_bytes()).unwrap();
-            let args = arguments(&llm, root, 1, "k", true).unwrap().0;
+        let park = |llm: &Json| {
+            let args = arguments(llm, root, 1, "k", true).unwrap().0;
             args.windows(2).find(|w| w[0] == "--park-gb").map(|w| w[1].clone())
         };
+        let parse = |llm: &str| Json::parse(llm.as_bytes()).unwrap();
         let model = r#""models": [{"name": "a", "path": "a.gguf"}]"#;
-        // The configuration's defaults carry it, and a bare section (no key) gets the same.
-        let defaults = config::default_json();
-        assert_eq!(defaults.get("llm").and_then(|l| l.get("park_gb")).and_then(Json::as_f64), Some(8.0));
-        assert_eq!(park(&format!("{{{model}}}")).as_deref(), Some("8"));
-        assert_eq!(park(&format!(r#"{{"park_gb": 2.5, {model}}}"#)).as_deref(), Some("2.5"));
-        assert_eq!(park(&format!(r#"{{"park_gb": 0, {model}}}"#)).as_deref(), Some("0"));
-        assert_eq!(park(&format!(r#"{{"park_gb": -3, {model}}}"#)).as_deref(), Some("0"), "never negative");
-        // Independent of the disk cache.
-        assert_eq!(park(&format!(r#"{{"prompt_cache": false, {model}}}"#)).as_deref(), Some("8"));
+        // Not configured: no flag, so the server's own default of 8 GB applies and a server from before the
+        // option (which refuses the flag) still starts. A section without the key, a null, and a
+        // configuration file written before the option, once the defaults have filled it in.
+        assert_eq!(park(&parse(&format!("{{{model}}}"))), None);
+        assert_eq!(park(&parse(&format!(r#"{{"park_gb": null, {model}}}"#))), None);
+        let mut old = parse(&format!("{{\"llm\": {{{model}}}}}"));
+        config::merge_defaults(&mut old, &config::default_json());
+        assert_eq!(old.get("llm").and_then(|l| l.get("park_gb")), Some(&Json::Null));
+        assert_eq!(park(old.get("llm").unwrap()), None);
+        // Configured: it is passed, 0 (off) included, whatever the disk cache does.
+        assert_eq!(park(&parse(&format!(r#"{{"park_gb": 2.5, {model}}}"#))).as_deref(), Some("2.5"));
+        assert_eq!(park(&parse(&format!(r#"{{"park_gb": 8, {model}}}"#))).as_deref(), Some("8"));
+        assert_eq!(park(&parse(&format!(r#"{{"park_gb": 0, {model}}}"#))).as_deref(), Some("0"));
+        assert_eq!(park(&parse(&format!(r#"{{"park_gb": 4, "prompt_cache": false, {model}}}"#))).as_deref(), Some("4"));
+        assert_eq!(park(&parse(&format!(r#"{{"park_gb": -3, {model}}}"#))).as_deref(), Some("0"), "never negative");
+        // A value that is not a number leaves it out (the configuration check refuses it before it gets here).
+        assert_eq!(park(&parse(&format!(r#"{{"park_gb": "8", {model}}}"#))), None);
     }
 
     #[test]
