@@ -159,6 +159,82 @@ test('harness: when the check is made only at the end of a run, a process that n
 test('harness: the run fails when a test changes the working tree\'s data/ folder (a real relay\'s may be there), and is silent when none does', function () {
     $watched = Tmp::dir('realdata') . '/data';
     mkdir($watched . '/logs', 0700, true);
+test('harness: what a test declares kept (the shared database server) is exempt together with everything below it, found below the runner or by the root its command line names (a server can be a launcher and a child with the same data folder)', function () {
+    $dir = Tmp::dir('keeptree');
+    $pidFile = $dir . '/pids';
+    // A launcher that starts a child whose command line names the root, as MySQL's monitor and server on Windows both name their data folder.
+    $script = '$c = proc_open([PHP_BINARY, "-d", "oaiy.test_root=" . $argv[2], "-r", "sleep(60);"], [], $p); file_put_contents($argv[1], getmypid() . " " . proc_get_status($c)["pid"]); sleep(60);';
+    $null = DIRECTORY_SEPARATOR === '\\' ? 'NUL' : '/dev/null';
+    $launcher = proc_open([PHP_BINARY, '-r', $script, '--', $pidFile, Tmp::root()], [0 => ['file', $null, 'r'], 1 => ['file', $null, 'w'], 2 => ['file', $null, 'w']], $pipes);
+    ok(is_resource($launcher), 'the launcher starts');
+    $pids = [];
+    for ($i = 0; $i < 200 && !is_file($pidFile); $i++) {
+        usleep(50000);
+    }
+    $parts = preg_split('/\s+/', trim((string)@file_get_contents($pidFile))) ?: [];
+    $pids = array_map('intval', $parts);
+    [$parent, $child] = [$pids[0] ?? 0, $pids[1] ?? 0];
+    Tmp::after(static function () use ($parent, $child): void {
+        Procs::unkeep($parent);
+        foreach ([$parent, $child] as $one) {
+            if ($one > 0 && Procs::alive($one)) {
+                Procs::end($one, true);
+            }
+        }
+    });
+    ok($parent > 0 && $child > 0 && $parent !== $child, 'a launcher and its child: ' . json_encode($pids));
+    $live = Procs::live();
+    ok(isset($live[$parent]) && isset($live[$child]), 'before it is declared kept, both are the run\'s (the child is below the launcher and names the root): ' . json_encode(array_keys($live)));
+    Procs::keep($parent);
+    $live = Procs::live();
+    ok(!isset($live[$parent]), 'the launcher that is kept is not reported');
+    ok(!isset($live[$child]), 'nor is its child, which names the root in its command line: it is the kept server\'s as much as the launcher is');
+    Procs::unkeep($parent);
+    ok(isset(Procs::live()[$child]), 'and once it is not kept any more it is reported again');
+});
+
+/**
+ * Run the runner over three tests of its own, the first of which starts the shared MySQL server (as every test that needs a database does, and
+ * which then lives until the end of the run) and the others do nothing, in $mode: the server must not be taken for a leak after any of them,
+ * and must be gone at the end. @return array{0:string,1:int} its output and its exit code
+ */
+function harness_run_db(string $mode): array
+{
+    $dir = Tmp::dir('dbcases');
+    file_put_contents($dir . '/db.php', <<<'PHP'
+<?php
+declare(strict_types=1);
+
+test('starts the shared database server', function () {
+    \OaiyTest\MysqlServer::for('mysql');
+});
+test('is clean, with the server running', function () {
+});
+test('is clean too, with the server running', function () {
+});
+PHP);
+    $env = array_merge(getenv(), ['OAIY_TEST_CASES' => $dir, 'OAIY_TEST_PROCS' => $mode]);
+    unset($env['OAIY_TEST_DB']);
+    $p = proc_open(array_merge([PHP_BINARY], Server::phpFlags(), [dirname(__DIR__) . '/run.php']), [1 => ['file', $dir . '/out.txt', 'w'], 2 => ['file', $dir . '/err.txt', 'w']], $pipes, null, $env);
+    ok(is_resource($p), 'the runner starts');
+    $code = proc_close($p);
+    return [(string)@file_get_contents($dir . '/out.txt') . (string)@file_get_contents($dir . '/err.txt'), $code];
+}
+
+foreach (['each', 'end'] as $harnessDbMode) {
+    slow_test('harness: a real MySQL server, which the runner keeps from the first test that needs it to the end of the run, is not a leak, checked ' . ($harnessDbMode === 'each' ? 'after every test (OAIY_TEST_PROCS=each, which is the default on a POSIX host)' : 'at the end of the run only') . ', and is gone when the run ends', function () use ($harnessDbMode) {
+        if (!OaiyTest\MysqlServer::available('mysql')) {
+            skip('no MySQL server binary found (set OAIY_TEST_MYSQLD)');
+        }
+        [$out, $code] = harness_run_db($harnessDbMode);
+        eq(0, $code, 'the run passes: ' . $out);
+        contains('3 passed, 0 failed', $out);
+        not_contains('FAIL', $out);
+        not_contains('left a process', $out);
+        not_contains('still running', $out);
+    });
+}
+
     file_put_contents($watched . '/logs/relay.log', "a line that was there\n");
     $dir = Tmp::dir('datacases');
     file_put_contents($dir . '/touch.php', <<<'PHP'
