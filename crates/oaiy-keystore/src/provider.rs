@@ -1,0 +1,106 @@
+//! Which provider backs the store, and how it is chosen: on purpose, never by a silent fallback.
+//!
+//! `Auto` is DPAPI on Windows and **nothing** elsewhere: a Linux or macOS build without an operating-system keystore refuses to start rather than fall
+//! back to a file (design 4.5.1: "fail closed, no plaintext fallback"). The keyfile is chosen by naming it (`OAIY_KEY_PROVIDER=keyfile`, or the
+//! configuration that maps to it), it says what it is in its provider information, and it is the only provider that stores a value in the clear.
+//!
+//! Not built: `os-keyring` (the Secret Service of Linux desktops). The name is accepted and answers `ProviderUnavailable`, so that a machine
+//! configured for it fails with a message and does not fall back.
+
+use std::env;
+use std::path::Path;
+
+#[cfg(any(unix, feature = "unsafe-keyfile"))]
+use crate::codec::KeyfileCodec;
+use crate::error::KeyError;
+use crate::store::{FileStore, KeyStore};
+
+/// The environment variable that names the provider.
+pub const ENV_PROVIDER: &str = "OAIY_KEY_PROVIDER";
+
+/// The folder inside the data folder that holds the secrets.
+pub const KEYS_DIR: &str = "keys";
+
+/// A provider, as asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderChoice {
+    /// The default of the platform: DPAPI on Windows, and an error elsewhere.
+    Auto,
+    /// `windows-dpapi-file`.
+    DpapiFile,
+    /// `os-keyring`: the Secret Service. Not built.
+    OsKeyring,
+    /// `keyfile`: a file per secret, the weakest provider, for headless machines. On Windows it is **refused**: a file there has no POSIX modes and nothing in
+    /// this crate sets an ACL, so the value would be readable by whatever the folder's inherited permissions allow.
+    Keyfile,
+    /// `keyfile-unsafe-for-tests`: the keyfile provider where `Keyfile` is refused (Windows), named as what it is. On Unix it is the same as `Keyfile`. **Exists only in a
+    /// build with the `unsafe-keyfile` feature**, which is for tests and is never enabled by default or by a product: in any other build the name is `ProviderUnavailable`.
+    #[cfg(feature = "unsafe-keyfile")]
+    KeyfileUnsafe,
+}
+
+impl ProviderChoice {
+    /// Reads a provider name: `auto`, `windows-dpapi-file`, `os-keyring`, `keyfile` or (in a build with the `unsafe-keyfile` feature only) `keyfile-unsafe-for-tests`
+    /// (exactly, in lower case).
+    pub fn parse(text: &str) -> Result<ProviderChoice, KeyError> {
+        match text {
+            "auto" => Ok(ProviderChoice::Auto),
+            "windows-dpapi-file" => Ok(ProviderChoice::DpapiFile),
+            "os-keyring" => Ok(ProviderChoice::OsKeyring),
+            "keyfile" => Ok(ProviderChoice::Keyfile),
+            #[cfg(feature = "unsafe-keyfile")]
+            "keyfile-unsafe-for-tests" => Ok(ProviderChoice::KeyfileUnsafe),
+            #[cfg(not(feature = "unsafe-keyfile"))]
+            "keyfile-unsafe-for-tests" => Err(KeyError::ProviderUnavailable(
+                "keyfile-unsafe-for-tests is not in this build: it needs the unsafe-keyfile feature, which is for tests and is never enabled in a product",
+            )),
+            other => Err(KeyError::InvalidProvider(other.chars().take(64).collect())),
+        }
+    }
+
+    /// `OAIY_KEY_PROVIDER`; unset is `Auto`, and a value that is not a provider is an error (a typo must not select a default).
+    pub fn from_env() -> Result<ProviderChoice, KeyError> {
+        match env::var(ENV_PROVIDER) {
+            Ok(value) => ProviderChoice::parse(&value),
+            Err(env::VarError::NotPresent) => Ok(ProviderChoice::Auto),
+            Err(env::VarError::NotUnicode(_)) => Err(KeyError::InvalidProvider("(not text)".into())),
+        }
+    }
+
+    /// The provider `Auto` resolves to on this platform, or why there is none.
+    pub fn resolve(self) -> Result<ProviderChoice, KeyError> {
+        match self {
+            ProviderChoice::Auto if cfg!(windows) => Ok(ProviderChoice::DpapiFile),
+            ProviderChoice::Auto => Err(KeyError::ProviderUnavailable(
+                "no operating-system keystore is built for this platform; name the keyfile provider on purpose (OAIY_KEY_PROVIDER=keyfile)",
+            )),
+            other => Ok(other),
+        }
+    }
+}
+
+/// Opens the keystore in `<data_dir>/keys`, with the provider `choice` resolves to.
+pub fn open(data_dir: &Path, choice: ProviderChoice) -> Result<Box<dyn KeyStore>, KeyError> {
+    open_at(data_dir.join(KEYS_DIR), choice)
+}
+
+/// Opens the keystore in the given directory itself.
+pub fn open_at(keys_dir: impl AsRef<Path>, choice: ProviderChoice) -> Result<Box<dyn KeyStore>, KeyError> {
+    let keys_dir = keys_dir.as_ref();
+    match choice.resolve()? {
+        #[cfg(windows)]
+        ProviderChoice::Keyfile => Err(KeyError::ProviderUnavailable(
+            "the keyfile provider is refused on Windows, where nothing protects a file the way modes do on Unix; use windows-dpapi-file",
+        )),
+        #[cfg(unix)]
+        ProviderChoice::Keyfile => Ok(Box::new(FileStore::open(keys_dir, KeyfileCodec)?)),
+        #[cfg(feature = "unsafe-keyfile")]
+        ProviderChoice::KeyfileUnsafe => Ok(Box::new(FileStore::open(keys_dir, KeyfileCodec)?)),
+        #[cfg(windows)]
+        ProviderChoice::DpapiFile => Ok(Box::new(FileStore::open(keys_dir, crate::codec::DpapiCodec)?)),
+        #[cfg(not(windows))]
+        ProviderChoice::DpapiFile => Err(KeyError::ProviderUnavailable("DPAPI exists on Windows only")),
+        ProviderChoice::OsKeyring => Err(KeyError::ProviderUnavailable("the os-keyring (Secret Service) provider is not built")),
+        ProviderChoice::Auto => Err(KeyError::ProviderUnavailable("unresolved provider")),
+    }
+}

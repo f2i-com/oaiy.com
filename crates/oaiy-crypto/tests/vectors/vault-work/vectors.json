@@ -1,0 +1,277 @@
+{
+  "meta": {
+    "generator": "gen.mjs",
+    "libsodium": "1.0.22",
+    "node": "v24.19.0",
+    "ageLib": "age-encryption 0.3.1"
+  },
+  "inputs": {
+    "bip39": {
+      "wordlistSha256Expected": "2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda",
+      "entropies": [
+        "00000000000000000000000000000000",
+        "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f",
+        "80808080808080808080808080808080",
+        "ffffffffffffffffffffffffffffffff",
+        "000102030405060708090a0b0c0d0e0f",
+        "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf"
+      ],
+      "failures": [
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon",
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon",
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abouu"
+      ]
+    },
+    "phraseWrapper": {
+      "userId": "3f2a7c1e-8d4b-4a6f-9c15-2e7b0d9a1c44",
+      "wrapperId": "vw_00112233445566778899aabbccddeeff",
+      "entropyHex": "000102030405060708090a0b0c0d0e0f",
+      "saltHex": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+      "ops": 3,
+      "mem": 67108864,
+      "umkHex": "4242424242424242424242424242424242424242424242424242424242424242",
+      "nonceHex": "0102030405060708090a0b0c0d0e0f101112131415161718"
+    },
+    "kdfRegistry": {
+      "masterHex": "4242424242424242424242424242424242424242424242424242424242424242",
+      "subkeyId": 1,
+      "contexts": [
+        "flrecov1",
+        "flphras1",
+        "flbkrcp1",
+        "flbksig1",
+        "fllocal1"
+      ]
+    },
+    "manifestSig": {
+      "umkHex": "4242424242424242424242424242424242424242424242424242424242424242",
+      "installId": "9f8e7d6c5b4a3921",
+      "seq": 12,
+      "createdAt": "2026-09-30T03:30:00Z",
+      "kind": "full",
+      "includesKeys": 0,
+      "entries": [
+        {
+          "name": "calendar/calendar.json",
+          "size": 1234,
+          "sha256": "5152790e278eb89039f8bfaa354b944ec1b44c5d3fc144edc5720c3edc045c73"
+        },
+        {
+          "name": "callers.json",
+          "size": 77,
+          "sha256": "e39c47327782029dbfc328dcf88584a74050fadace1f3d3ac368d29ba4e619a8"
+        },
+        {
+          "name": "agent/agent-storage.zip",
+          "size": 4096,
+          "sha256": "d4f0bc5a29de06b510f9aa428f1eedba926012b591fef7a518e776a7c9bd1824"
+        }
+      ]
+    },
+    "ageFile": {
+      "stanzaArgs": [
+        "oaiy.com/vault-wrap",
+        "1",
+        "3f2a7c1e-8d4b-4a6f-9c15-2e7b0d9a1c44",
+        "vw_00112233445566778899aabbccddeeff",
+        "oKGio6SlpqeoqaqrrK2urw",
+        "3",
+        "64"
+      ],
+      "plaintextLen": 70060,
+      "plaintextSha256": "f6c9d97d689815c14e5e2a2884fc8405e1f9676c2aecd2dbf4723b967cd45716",
+      "verifySkHex": "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1"
+    },
+    "fkCache": {
+      "userId": "3f2a7c1e-8d4b-4a6f-9c15-2e7b0d9a1c44",
+      "deviceId": "vd_0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+      "formId": "b7d2e4a1-5c3f-4d8e-9a6b-1f0e2d3c4b5a",
+      "fkEpoch": 1,
+      "ed25519PkHex": "c050c5637a44fa8629fff3cccce2300cb362a63d99d95fc54145266f4332445a",
+      "wrapKeyHex": "6666666666666666666666666666666666666666666666666666666666666666",
+      "ivHex": "c0c1c2c3c4c5c6c7c8c9cacb",
+      "fkHex": "8888888888888888888888888888888888888888888888888888888888888888"
+    },
+    "ops": {
+      "seedHex": "5151515151515151515151515151515151515151515151515151515151515151",
+      "userId": "3f2a7c1e-8d4b-4a6f-9c15-2e7b0d9a1c44",
+      "body": "vw_00112233445566778899aabbccddeeff|recovery-phrase|argon2id13.1|3|67108864|oKGio6SlpqeoqaqrrK2urw==|AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYk3LXMnt0e9IrbvJEsLpISC9ZLMRyAxfaZGNf12TIKvvVBwSG2UGY9VE7M/jnk0H8|0",
+      "label": "Firefox on Laptop|2027-01-01",
+      "regBody": "vd_0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f|browser|e94b7bf9cafaa7347e779b36cfabaebeb6d737f3effd3e127bbfbee32fd94b3c|-|2026-09-30T09:15:00Z",
+      "state": {
+        "kdfSaltHex": "101112131415161718191a1b1c1d1e1f",
+        "ops": 3,
+        "mem": 67108864,
+        "passWrappedHex": "212121212121212121212121212121212121212121212121212121212121212121212121212121212121212121212121212121212121212121212121212121212121212121212121",
+        "bundleHex": "313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131",
+        "kitHex": "414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141",
+        "wrappers": [
+          {
+            "id": "vw_00112233445566778899aabbccddeeff",
+            "kind": "recovery-phrase",
+            "P": "argon2id13.1|3|67108864|oKGio6SlpqeoqaqrrK2urw==",
+            "wrappedB64": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYk3LXMnt0e9IrbvJEsLpISC9ZLMRyAxfaZGNf12TIKvvVBwSG2UGY9VE7M/jnk0H8"
+          }
+        ]
+      },
+      "headVersion": 8
+    },
+    "archive": {
+      "seedHex": "7777777777777777777777777777777777777777777777777777777777777777",
+      "F": "b7d2e4a1-5c3f-4d8e-9a6b-1f0e2d3c4b5a",
+      "recordId": "9c61d18c-08a3-490c-a5b5-5913d6460a43",
+      "K": "call",
+      "fields": {
+        "title": "Call 0491 570 006",
+        "kind": "call",
+        "ref": "call_9f3a2c",
+        "when": "2026-09-30T09:15:00Z",
+        "peer": "+61491570006",
+        "text": "caller: Hi, it is a test call. é",
+        "rec": "{\"v\":1,\"kind\":\"call\",\"id\":\"call_9f3a2c\",\"seq\":1,\"prev\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"turns\":[{\"i\":0,\"who\":\"caller\",\"text\":\"Hi, it is a test call.\"}]}",
+        "writer": "d2f381d7b0b5f1d3"
+      },
+      "forgedText": "caller: something else",
+      "order": [
+        "title",
+        "kind",
+        "ref",
+        "when",
+        "peer",
+        "text",
+        "rec",
+        "writer"
+      ]
+    },
+    "ceremony": {
+      "rSkHex": "7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a",
+      "sSkHex": "3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c",
+      "nrHex": "10101010101010101010101010101010",
+      "nsHex": "20202020202020202020202020202020",
+      "code": "K7M2-9QXP",
+      "labelR": "Firefox on Laptop",
+      "labelS": "Office PC (OAIY)",
+      "purpose": "unlock-browser",
+      "ptype": "archive-read-key",
+      "xr": "",
+      "payload": "{\"v\":1,\"type\":\"archive-read-key\",\"userId\":\"3f2a7c1e-8d4b-4a6f-9c15-2e7b0d9a1c44\",\"formId\":\"b7d2e4a1-5c3f-4d8e-9a6b-1f0e2d3c4b5a\",\"fkEpoch\":1,\"fk\":\"iIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIg=\",\"ttlSeconds\":1800,\"issuedAt\":\"2026-09-30T09:15:00Z\"}",
+      "pnonceHex": "303132333435363738393a3b3c3d3e3f4041424344454647",
+      "mSkHex": "9999999999999999999999999999999999999999999999999999999999999999"
+    },
+    "edProbe": {
+      "pkHex": "0100000000000000000000000000000000000000000000000000000000000000",
+      "sigHex": "01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "msg": "any message at all"
+    }
+  },
+  "out": {
+    "bip39": {
+      "wordlistSha256": "2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda",
+      "words": [
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        "legal winner thank year wave sausage worth useful legal winner thank yellow",
+        "letter advice cage absurd amount doctor acoustic avoid letter advice cage above",
+        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
+        "abandon amount liar amount expire adjust cage candy arch gather drum buyer",
+        "pass artist pottery enable foil fatigue pencil crystal produce grace hill gadget"
+      ],
+      "failures": [
+        "phrase_checksum",
+        "phrase_length",
+        "phrase_length",
+        "phrase_word"
+      ]
+    },
+    "phraseWrapper": {
+      "words": "abandon amount liar amount expire adjust cage candy arch gather drum buyer",
+      "ikmHex": "a2bf7282d285e26138e72deaa78aa4d9d949c68655803a667a56feadda6c2932",
+      "ikmAgreesWithNodeOpenSSL": true,
+      "wkHex": "24e31db3c58c8bbeda17a41c89ec49be95996db732b5e78d6a3a623fe6aa739a",
+      "P": "argon2id13.1|3|67108864|oKGio6SlpqeoqaqrrK2urw==",
+      "aad": "flvault-wrap:2|3f2a7c1e-8d4b-4a6f-9c15-2e7b0d9a1c44|vw_00112233445566778899aabbccddeeff|recovery-phrase|6ec252ef1279e3bd13e60d354a81e3bba32797aaa414ea962c24685dc47f2db1",
+      "wrappedUmkB64": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYk3LXMnt0e9IrbvJEsLpISC9ZLMRyAxfaZGNf12TIKvvVBwSG2UGY9VE7M/jnk0H8",
+      "wrappedLen": 72
+    },
+    "kdfRegistry": {
+      "flrecov1": "6f9549b4561e44c236bc6cdb3019f86c31a767c11597ae089f04343d746c81ab",
+      "flphras1": "30dfc59eed003ea79aa0f94f6a9a140b33d1c9f79515eb26f9005262e735947d",
+      "flbkrcp1": "29197b36d73268cd98e5f35278538cead4eabb19719e3a60cb2a6a604c3f2727",
+      "flbksig1": "6dc3eab3b9004b546bcc8c6a5a43566285f7a9a9670241880f36adab3747f702",
+      "fllocal1": "96c57e19b2062a083217d2bd19bcda25f6620fe3814bcc8ed6e981ec3e9f432c"
+    },
+    "flCommitted": {
+      "kdf": [
+        true,
+        true
+      ],
+      "xchacha": [
+        true,
+        true
+      ],
+      "argon2id": [
+        true,
+        true
+      ]
+    },
+    "backupIdentity": {
+      "bskHex": "29197b36d73268cd98e5f35278538cead4eabb19719e3a60cb2a6a604c3f2727",
+      "bpkHex": "833b89117d2ce5ddb6e91283f1a0e7ea6ae602621b5644beea044ba8e52bb964",
+      "ageIdentity": "AGE-SECRET-KEY-19YVHKDKHXF5VMX897DF8S5UVAT2W4WCEWX0R5CXT9F4XQNPLYUNSAJYVPG",
+      "ageRecipient": "age1svacjyta9njamdhfz2plrg88af4wvqnzrdtyf0h2q3963efth9jqpefuja",
+      "ageRecipientFromLibrary": "age1svacjyta9njamdhfz2plrg88af4wvqnzrdtyf0h2q3963efth9jqpefuja"
+    },
+    "manifestSig": {
+      "sigSeedHex": "6dc3eab3b9004b546bcc8c6a5a43566285f7a9a9670241880f36adab3747f702",
+      "pkHex": "a9e29e9cfef86438a760edb049ac4cd6b8e46cdf547d4f70d187b4499b5f669e",
+      "entriesDigest": "47ce456bf0321684a2edfbaaed40086c0d1d80693606cbbc870639d18b828fd8",
+      "msg": "flbackup:1|9f8e7d6c5b4a3921|12|2026-09-30T03:30:00Z|full|0|47ce456bf0321684a2edfbaaed40086c0d1d80693606cbbc870639d18b828fd8",
+      "sigB64": "WhBcl/GxnicD2Ef5gGHwfUugMytRkdL9NZ8lj4J5eRMpGymjOGXmQwnprA6Oht7h5BTAq8HE6GegMlk2o/umDw=="
+    },
+    "ageFile": {
+      "nodeFile": "nodeage.bin",
+      "fileLen": 70598,
+      "roundTripOk": true,
+      "verifyRecipientOpensToo": true
+    },
+    "fkCache": {
+      "fp": "4b735ac174e40636",
+      "aad": "flvault-fk:1|3f2a7c1e-8d4b-4a6f-9c15-2e7b0d9a1c44|vd_0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f|b7d2e4a1-5c3f-4d8e-9a6b-1f0e2d3c4b5a|1|4b735ac174e40636",
+      "blobHex": "7130185cd80619969047dee9aa2617478c6adaf48640ff9a0c692595618690a4c75a337e85493e07ec727ec700175459",
+      "webcryptoAgrees": true
+    },
+    "ops": {
+      "pkHex": "c050c5637a44fa8629fff3cccce2300cb362a63d99d95fc54145266f4332445a",
+      "opString": "flvault-op:1|3f2a7c1e-8d4b-4a6f-9c15-2e7b0d9a1c44|recovery.replace|7|b4e604267e6c0f08f35acc3de62c44fbbd54563df6041fa7e25d37f8d23283e0",
+      "sigB64": "Eko3+HaqnsvALRSCelg3aT4zrnUh8aRHDShWl5XVU+xouCpgDJRn8BAp3uO9AVhMq8p9EqOsyKi/MWKwrNwADw==",
+      "regOp": "flvault-op:1|3f2a7c1e-8d4b-4a6f-9c15-2e7b0d9a1c44|device.register|-|2f381db344f178e0832fb18fa8e85574d9e16307e647c90fa84809f25deb417f",
+      "regSigB64": "Vv6P8ionXHqlbDeJfzVZNRQADtuCyN/3KuIY+gez5z2SRU4SLaaofQ+A8Enp5eqoTvsxJatj4rGsI7yo+WogDw==",
+      "stateHash": "f068067c5992ff7b62f8997a7fb0be73a4cff22d850fbab72f82f82300f37857",
+      "head": "flvault-head:1|3f2a7c1e-8d4b-4a6f-9c15-2e7b0d9a1c44|8|f068067c5992ff7b62f8997a7fb0be73a4cff22d850fbab72f82f82300f37857",
+      "headSigB64": "Ru0AwG5Mhla1FIfb/J4Wz+18B7x7oZHt7o/jKCku/mfNrzyjvawmDRuvmfV/2aMMQZfZIKdSaq0zPUIKoJjtAQ=="
+    },
+    "archive": {
+      "pkHex": "c853ad0f0cd2b619aea92ceec4fd56a24d6499d584ce79257e45cfd8139b60a7",
+      "sigMsg": "flarch:1|b7d2e4a1-5c3f-4d8e-9a6b-1f0e2d3c4b5a|9c61d18c-08a3-490c-a5b5-5913d6460a43|call|de428a37b58c0ca7283ea20b08470b0823f7cb8d09dceb8d9a933ffbf2046eb2",
+      "sigB64": "9216eh+9Ilo7k89gUXqRVF9/9+/REPMGQoSajc6pNhU0CR78pNOdJ96j/UpJA4aGABSQSS1/LuQaa+nhYYu9Bg==",
+      "forgedFieldsHash": "abcac1cb27735dcad7cb3419a7e0ba348c9b8046c2f855da9f2ac4a15e28c6b1",
+      "nextPrev": "f2c4fd009585607977c0759bf8d740546cde911d0f0854c883ac5919033cdd92"
+    },
+    "ceremony": {
+      "mailbox": "kt_1c4776315a01cf088ae843327e2cb5e8",
+      "rPkHex": "16b7ef026e37ac845b780eb2aeda2308e0b63cb36b29e9478bef1242dfd84532",
+      "sPkHex": "513f6639b3e84e8db530e84bba689373da3b6f3ecf45df32414738d58d792d66",
+      "cr": "d5a5ccab2d6af0c80fbb9bfd0037ad660e276c2415631259616a450a13ab446b",
+      "THHex": "0caa4c4aec22da48817f8b9c87859735c8ba6ccc604997f499b82b45ef691db3",
+      "DHHex": "96f98c3ece4899a2e795597b2c2661dfed49d1a6a88c2abbc878af1015e4d566",
+      "KS2RHex": "ed227345ca9d99453219eec44babc101f8c0098f78d2759ba8c1a44236086d65",
+      "KR2SHex": "05b0f26e9aff4286ab3d5ce4862e15a3b0cfffa1c2bc000d546f0cb31ecf4813",
+      "sas": "1344 7077",
+      "packageHex": "e58377c2533bf4590210b5c82107486fb21d8a1a419e3cafcbeaebdc707625cc2643fc5ba73cc6a2f3cfe41d6c1a58e80d22efde169b5a15e9148dbcfa444f29aa3f7d2aa5756040480e4f4f65f32d309a0b781740a6e4aa35c53e4af3e3f31c4e1298d776112d116ea8aa4443d5f0cd041f3d2416e0f850ace4c8cf1fb041fe54d23f21d76d5c4be38b113b8bdff75807d140c46ec5af8a8717511645e07ddf48ee46d3b8e079491f202cbdcc8ec4824f4011f5e1d6967bc5afbc7cdef4b80ce1c4798fb29d2547d9a7bfdeea672e5d817d6bd3fef93c441a808d978357693caf7578fb8ed3261eb12931c763020d9503f32b5fd1a55d62fc1cfa898c691e08e8271e18e5",
+      "sasMitm": "6211 8695"
+    },
+    "edProbe": {
+      "libsodiumAccepts": false
+    }
+  }
+}

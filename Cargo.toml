@@ -50,6 +50,13 @@ members = [
     # oaiy-media a member, not a default member: Candle is a long build, and
     # its GPU build needs a CUDA toolchain (`--features cuda`).
     "crates/oaiy-voice",
+    # The vault's key material (docs: design/vault.final.md, work packages
+    # V-01 and V-02): the cryptographic primitives and the named-secret
+    # keystore. Libraries with external dependencies (RustCrypto, windows-sys),
+    # so members and not default members, like oaiy-media: nothing links them
+    # yet, and `cargo test -p oaiy-crypto -p oaiy-keystore` runs them.
+    "crates/oaiy-crypto",
+    "crates/oaiy-keystore",
 ]
 default-members = [
     "crates/oaiy-engine",
@@ -75,6 +82,23 @@ license = "Apache-2.0"
 # ggml-quants, ggml-rs, tokenizer, llama-rs, ggml-rs-cuda — see
 # crates/VENDORED.md) carry their own explicit external dependencies and
 # do not inherit from this workspace.
+
+[profile.dev.package.argon2]
+# oaiy-crypto's tests run Argon2id at the design's 64 MiB floor (a hundred milliseconds when optimised, many seconds without
+# it): the dependency alone is optimised in test and dev builds, and nothing of ours is.
+opt-level = 3
+
+# A build with no optimisation and no debug assertions, which no other profile is: the dead-stack probe of oaiy-crypto runs in it
+# (`cargo test --profile vault-probe -p oaiy-crypto --test zeroize_stack`), because the frames of a computation are largest there and "debug" and "release" do not cover it (review low 1).
+[profile.vault-probe]
+inherits = "release"
+opt-level = 0
+debug-assertions = false
+overflow-checks = false
+codegen-units = 16
+
+[profile.vault-probe.package.argon2]
+opt-level = 3
 
 [profile.release]
 # rustc 1.92.0 (stable MSVC) crashes with STATUS_ACCESS_VIOLATION compiling

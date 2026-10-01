@@ -132,7 +132,7 @@ steps:
 describe('the workflows', () => {
   it('read as jobs of steps, with what each step runs', () => {
     const ci = parseYaml(workflow('ci.yml'));
-    assert.deepEqual(Object.keys(ci.jobs), ['revision', 'zipp', 'web', 'webapp', 'cli', 'desktop']);
+    assert.deepEqual(Object.keys(ci.jobs), ['revision', 'zipp', 'web', 'webapp', 'cli', 'desktop', 'vault-linux', 'vault-windows']);
     const release = parseYaml(workflow('release.yml'));
     assert.deepEqual(Object.keys(release.jobs), ['meta', 'verify', 'web', 'desktop', 'sign', 'release']);
     assert.equal(release.jobs.verify.uses, './.github/workflows/ci.yml');

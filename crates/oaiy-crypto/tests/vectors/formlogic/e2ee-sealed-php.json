@@ -1,0 +1,27 @@
+{
+    "meta": {
+        "writer": "phpunit/bin",
+        "recipient_seed_hex": "4040404040404040404040404040404040404040404040404040404040404040",
+        "note": "Sealed-box fixtures written by PHP, opened by vitest. Sealing is randomized; only OPEN these. Regenerate: php bin/e2ee-vectors-write.php"
+    },
+    "recipient": {
+        "publicKey_b64": "T9+KMwxPpdxyRnH07yNSjOiZlPROT8eZuivQfXgJQHU="
+    },
+    "items": [
+        {
+            "label": "php-item-1",
+            "plaintext_b64": "Zm9ybWxvZ2ljIGUyZWUgc2VhbGVkIGZpeHR1cmUgZnJvbSBQSFA=",
+            "sealed_b64": "PXSJTP8BOL+ieTaxQ3x4s8Pi5wrM1KsLMpUs+b4/UxnhKSEb5TiTPlZibION/+/R1jGsineGf+jpv7tDfMZPI7TgjvOJJFOWj8gtmq1OiY71/DLTpEc="
+        },
+        {
+            "label": "php-item-2",
+            "plaintext_b64": "eyJ2IjoxLCJhbnN3ZXJzIjp7ImEiOiJwaHAg4oKsIHVuaWNvZGUg4pyTIn19",
+            "sealed_b64": "MbEy0oOqk0wb6H9GVMZVOEdSXmXDPXltGbgQCuqdV3vSK73hYqvk2tGcau8JlVK57qpIix65jpLCzcA24A2a2onntwtY75+DL5LPIh2cGdkfnZQEfLOisg4REF7g"
+        },
+        {
+            "label": "php-item-3",
+            "plaintext_b64": "",
+            "sealed_b64": "o9Noy2uB/XrEn2M6P1TpXFez5nlKC1sOKtECiO14dWNU51t8M08JX7WZoXvum8Vm"
+        }
+    ]
+}

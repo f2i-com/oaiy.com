@@ -1,0 +1,57 @@
+{
+  "meta": {
+    "writer": "vitest",
+    "recipient_seed_hex": "4040404040404040404040404040404040404040404040404040404040404040",
+    "note": "Sealed-box fixtures written by JS, opened by PHP (and JS self-check). Sealing is randomized; only OPEN these."
+  },
+  "recipient": {
+    "publicKey_b64": "T9+KMwxPpdxyRnH07yNSjOiZlPROT8eZuivQfXgJQHU="
+  },
+  "items": [
+    {
+      "label": "js-item-1",
+      "plaintext_b64": "Zm9ybWxvZ2ljIGUyZWUgc2VhbGVkIGZpeHR1cmUgMQ==",
+      "sealed_b64": "qR6KFsYPHtaJp8EQqV38PRSHdZ1m60tVF6byC/tQ3jJQOhvhut+p5US5gEoCHNir88PGbXy2MOmY6U51CKvp9dorwmCSs8V/+45j/0OUPw=="
+    },
+    {
+      "label": "js-item-2",
+      "plaintext_b64": "eyJ2IjoxLCJhbnN3ZXJzIjp7ImEiOiLigqwgdW5pY29kZSDinJMifX0=",
+      "sealed_b64": "xBOIiIHKQUnpHG3/UoVxjS/J2yRCrcKijtmSNg6LeTfNV1G0AJC5xJ9kF3TQrI3kwNZhtETWnfLRE15sJwVikoh8y2VuPW8iuVrUGh4KrrPwgpuusoX557c="
+    },
+    {
+      "label": "js-item-3",
+      "plaintext_b64": "",
+      "sealed_b64": "w9nY2owH/fL77UctgpxAoFjOV980s3DSYaJ2YqDDwDIAO0MvJKPtbWUg6OtuT2tq"
+    }
+  ],
+  "envelope": {
+    "formId": "form-e2ee-fixture",
+    "ingestion_seed_hex": "4141414141414141414141414141414141414141414141414141414141414141",
+    "ingestionPublicKey_b64": "EEOtNNMpbBfP5VbhcEUrbYluUsTtkR8lRxE5jlhHbiA=",
+    "envelope": {
+      "__flenc": 1,
+      "recordId": "7d444840-9dc0-41a2-8da8-ff8cb9fca735",
+      "rev": 1,
+      "keyId": "fik_fixture01",
+      "epoch": 1,
+      "content": "xchacha20p1305.1",
+      "wrap": "sealedbox-x25519xsalsa20p1305.1",
+      "schemaVersion": 1,
+      "schemaHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "wrappedDek": "ZK5y6DP+3hCQDn2DxRFZh5kVyCioZrB+6wmA6j9HO0Y3kTljjSzhF4Iji93d/gb2VwIzM8C2js1S9yYseblckfKGnOYCzElWipPrRb3CDlI=",
+      "nonce": "8ZhcI/KyRKEZUyAjjNebjwkkbhydDE5T",
+      "ct": "iMptA+sKuHntcV7ea977V7+Yc2FuPZzrbfiWLJzBSZZklT4t8FbqqOFDuWw1HgwwqRlxO9uPn1EGXzWJb9Cra15zYzH5Znhl6ayZq1NE8fvXt9rSd0RclUe5pkNIK6uNFI6BOJpIc3GA+YnsthBPijAJW7DiPsb5O1ND+jwY7qbLvw00QV6+1m6Pb3QLe0/hYwYZT8S3vebewkA="
+    },
+    "expectedInner": {
+      "v": 1,
+      "answers": {
+        "field_name": "Ada Lovelace",
+        "field_notes": "E2EE fixture — do not change"
+      },
+      "meta": {
+        "completionTime": 42,
+        "language": "en"
+      }
+    }
+  }
+}

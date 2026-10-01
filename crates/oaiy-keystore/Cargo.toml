@@ -1,0 +1,27 @@
+[package]
+name = "oaiy-keystore"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "K1, the named-secret keystore of the OAIY desktop: Windows DPAPI files and a strict keyfile, fail closed, the name bound into every blob"
+publish = false
+
+[features]
+# **Never enabled by default, and never by a product.** Adds `ProviderChoice::KeyfileUnsafe` (`keyfile-unsafe-for-tests`): the keyfile provider on Windows, where nothing in this crate
+# makes a file private and the plain `keyfile` is therefore refused. Without the feature the name is refused (`ProviderUnavailable`), the variant does not exist, and on Windows
+# the plaintext codec is not compiled in at all, so no setting, environment variable or configuration can make a Windows build store a value in the clear. The crate's
+# own tests that need a keyfile on Windows are run with `--features unsafe-keyfile`.
+unsafe-keyfile = []
+
+[dependencies]
+oaiy-crypto = { path = "../oaiy-crypto" }
+zeroize = "1.8.2"
+
+# The keys folder is held as a directory descriptor and every file is opened, created, renamed and removed relative to it (openat, renameat, unlinkat), which std
+# does not offer. rustix's safe API is used: this crate keeps `#![deny(unsafe_code)]` outside the DPAPI module. Only what it uses is enabled.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.4", default-features = false, features = ["std", "fs", "process"] }
+
+[target.'cfg(windows)'.dependencies]
+# Win32_Storage_FileSystem: which file a handle is (volume and file index), how many names it has, and its real path (`src/winfs.rs`, the second unsafe module)
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem"] }

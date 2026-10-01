@@ -1,0 +1,37 @@
+[package]
+name = "oaiy-crypto"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "The cryptographic primitives of the OAIY vault: KDFs, XChaCha20-Poly1305, sealed boxes, strict Ed25519, X25519 with low-order checks, the 12-word phrase, Argon2id with a cost ceiling"
+publish = false
+
+# Not std-only like the engine core (CONVENTIONS.md): these are the audited
+# RustCrypto and dalek crates, because the rule for key material is "do not
+# write your own". README.md lists every dependency and why. No unsafe here.
+[dependencies]
+argon2 = { version = "0.5.3", default-features = false, features = ["zeroize"] }
+blake2 = "0.10.6"
+chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc"] }
+crypto_secretbox = { version = "0.1.1", default-features = false, features = ["alloc", "salsa20"] }
+ed25519-dalek = { version = "2.2.0", default-features = false, features = ["std", "fast", "zeroize"] }
+getrandom = "0.3.4"
+hkdf = "0.12.4"
+hmac = "0.12.1"
+sha2 = "0.10.9"
+subtle = "2.6.1"
+unicode-normalization = "0.1.25"
+x25519-dalek = { version = "2.0.1", default-features = false, features = ["static_secrets", "zeroize"] }
+zeroize = { version = "1.8.2", features = ["derive"] }
+
+[features]
+# The deterministic entry points that known-answer tests need and production code must not have (review L-10): sealing under a chosen nonce
+# (`aead::Nonce::from_bytes_for_tests`) and deriving a subkey from any id and any context (`kdf::derive_subkey`, `derive_subkey_into`). Off by default, so a crate that
+# depends on this one cannot reuse a nonce or derive under a context of its own; this crate's own tests turn it on through the dev-dependency on itself below.
+test-vectors = []
+
+[dev-dependencies]
+oaiy-crypto = { path = ".", features = ["test-vectors"] }
+# A second, independent BIP-39 implementation for the differential test.
+bip39 = { version = "2.2.2", default-features = false, features = ["std"] }
+serde_json = "1.0.151"

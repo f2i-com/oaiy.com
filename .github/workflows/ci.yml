@@ -7,7 +7,12 @@
 # (ecosystem review OAI-01 / ECO-01): the web app's test chain, the CLI's
 # complete test script and typecheck, the desktop app's Vitest suite, and the
 # native Rust tests in both the headless (no default features) and the
-# shipping GUI feature configurations, each on the platform it ships on.
+# shipping GUI feature configurations, each on the platform it ships on, and the two
+# crates that hold the vault's keys (oaiy-crypto and oaiy-keystore: the vault-linux and
+# vault-windows lanes, which run format, clippy, the tests as a product is built and
+# with the test-only features, the keystore's tests in a release build (the unsafe keyfile
+# is refused there), the memory probes in three build configurations, and a
+# dependency audit of those two crates).
 # A later commit can never inherit an earlier run's status: the caller
 # passes the revision it is about to build, and every lane checks it out.
 #
@@ -409,3 +414,112 @@ jobs:
       - name: Native tests (shipping GUI features)
         working-directory: platform/desktop/src-tauri
         run: cargo test --locked --features gui
+
+  # The two crates that hold the vault's keys (design 4.1 and 4.5.1, review L-10): oaiy-crypto and oaiy-keystore. Nothing else links them yet, so the desktop lane
+  # above never builds them; these two lanes are where their tests run, on the two platforms the keystore has providers for. Both are in the release gate like every
+  # job of this file (the release attests the lane names in platform/scripts/attest-release-evidence.mjs and release.yml, and a test keeps the three lists equal).
+  # The tests that need root (the keystore's real other-user and uid-swap tests) are #[ignore]d and are run by hand, as crates/oaiy-keystore/README.md says.
+  vault-linux:
+    name: Vault crates (linux)
+    needs: [revision]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref || '' }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (pinned revision)
+        with:
+          components: clippy, rustfmt
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - name: Format
+        run: cargo fmt --check -p oaiy-crypto -p oaiy-keystore
+      - name: Clippy (warnings are errors)
+        run: |
+          cargo clippy --locked -p oaiy-crypto -p oaiy-keystore --all-targets -- -D warnings
+          cargo clippy --locked -p oaiy-keystore --all-targets --features unsafe-keyfile -- -D warnings
+      # Both suites, as a product is built (no `unsafe-keyfile`: the refusal of the unsafe name is tested here), with the tests that look at memory (the allocator and dead-stack
+      # probes) and the two-process, FIFO and symlink tests of the keystore; and then the keystore with `unsafe-keyfile`, which is the same on Unix and, on Windows, everything.
+      - name: Tests
+        run: |
+          cargo test --locked --no-fail-fast -p oaiy-crypto -p oaiy-keystore
+          cargo test --locked --no-fail-fast -p oaiy-keystore --features unsafe-keyfile
+      # The same probes in an optimised build, where the frames are small and the compiler keeps different copies: the dead-stack probe found leftovers there that a
+      # debug build does not show (review L-7); and in a build with no optimisation and no debug assertions (the `vault-probe` profile of the workspace), where the
+      # frames are largest and which neither `dev` nor `release` is (second review, low 1).
+      - name: Memory probes (release build, and no optimisation with no assertions)
+        run: |
+          cargo test --locked --release -p oaiy-crypto --test zeroize_stack --test zeroize_text --test zeroize
+          cargo test --locked --profile vault-probe -p oaiy-crypto --test zeroize_stack
+      # The keystore's tests in a release build, as a product is built: the unsafe keyfile is refused there too (second review, low 2), by the parser and by the environment variable.
+      - name: Keystore tests in a release build (no unsafe keyfile)
+        run: cargo test --locked --release --no-fail-fast -p oaiy-keystore
+      # The keystore has a macOS code path (Unix, no provider but the keyfile): it must compile for macOS, which no runner here executes.
+      - name: Compile check for macOS
+        run: cargo check --locked --target aarch64-apple-darwin -p oaiy-crypto -p oaiy-keystore --all-targets
+      # `test-vectors` (sealing under a chosen nonce, deriving under any context) is for the crate's own tests. A build without dev-dependencies must not have it:
+      # the documentation of that build has neither function.
+      - name: The test-only entry points are absent from the library
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo doc --locked -p oaiy-crypto --no-deps
+          docs=target/doc/oaiy_crypto
+          test -f "$docs/aead/struct.Nonce.html"
+          if test -e "$docs/kdf/fn.derive_subkey.html" || test -e "$docs/kdf/fn.derive_subkey_into.html" || grep -q 'id="method.from_bytes_for_tests"' "$docs/aead/struct.Nonce.html"; then
+            echo "::error::a test-only function is in the library built without the test-vectors feature"; exit 1
+          fi
+      # `unsafe-keyfile` (the keyfile on Windows, where nothing here makes a file private) is for tests and is never in a product: the documentation of the library built without
+      # the feature has no `KeyfileUnsafe`, and the tests above that run without the feature show that the name is refused.
+      - name: The unsafe keyfile is absent from the keystore library
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo doc --locked -p oaiy-keystore --no-deps
+          test -f target/doc/oaiy_keystore/enum.ProviderChoice.html
+          if grep -q "KeyfileUnsafe" target/doc/oaiy_keystore/enum.ProviderChoice.html; then
+            echo "::error::the unsafe keyfile is in the keystore built without the unsafe-keyfile feature"; exit 1
+          fi
+      # ECO-04 for the Rust side: the dependencies of these two crates only, warnings (yanked, unmaintained) denied. See the script for why not the whole lock.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+      - name: Dependency audit (the two crates, warnings denied)
+        run: node platform/scripts/audit-vault-crates.mjs
+
+  vault-windows:
+    name: Vault crates (windows)
+    needs: [revision]
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref || '' }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (pinned revision)
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - name: Format
+        run: cargo fmt --check -p oaiy-crypto -p oaiy-keystore
+      - name: Clippy (warnings are errors)
+        run: |
+          cargo clippy --locked -p oaiy-crypto -p oaiy-keystore --all-targets -- -D warnings
+          cargo clippy --locked -p oaiy-keystore --all-targets --features unsafe-keyfile -- -D warnings
+      # DPAPI (the provider Windows has), the junction-above, rollback and held-folder tests, the hard-link test, the two-process test on a real DPAPI store; first as a product is
+      # built (no `unsafe-keyfile`: Windows has no plaintext provider, and the refusal is tested), then with the feature, which adds the keyfile tests on Windows.
+      - name: Tests
+        run: |
+          cargo test --locked --no-fail-fast -p oaiy-crypto -p oaiy-keystore
+          cargo test --locked --no-fail-fast -p oaiy-keystore --features unsafe-keyfile
+      - name: Keystore tests in a release build (no unsafe keyfile)
+        run: cargo test --locked --release --no-fail-fast -p oaiy-keystore
+      - name: Memory probes (release build, and no optimisation with no assertions)
+        run: |
+          cargo test --locked --release -p oaiy-crypto --test zeroize_stack --test zeroize_text --test zeroize
+          cargo test --locked --profile vault-probe -p oaiy-crypto --test zeroize_stack
