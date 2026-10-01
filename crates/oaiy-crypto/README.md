@@ -403,3 +403,20 @@ The third review found that the text decoders and encoders did not scrub (L-1), 
 - **E02r** (`wrap_key_into` takes the Argon2 output by value) in an optimised build: the by-value `argon2id13` is now a wrapper over the in-place one and an optimised build leaves no copy of the output in the caller; E02 (no optimisation and no assertions) is **killed**, which is where the by-value return does.
 
 **Y37 to Y40** (the generators' scrubs): the probe measures within one copy of the same with the four scrubs removed as with them (in either direction: x25519 is 0 with the scrub and 1 without in a debug build, and 1 and 0 in an optimised one), always within the bound, in all three configurations on Windows (`made` 1, 0, 2, 0, 1 / 1, 1, 3, 2, 2 / 2, 2, 3, 4, 3 with them; 1, 1, 1, 0, 1 / 1, 0, 2, 2, 2 / 2, 2, 2, 4, 3 without), because a generator writes its key where it lives and leaves nothing below its frame for the scrub to remove. So the scrub counts its calls in a test build and a unit test requires each function that makes or reads a key to call it: **killed**. The probe cannot see these scrubs, and says so in its header.
+**The reviewer's own probe, run again.** The third review's probe (`xrev_stack3`: a different harness from `tests/zeroize_stack.rs`, a floor of 2 for a returned entropy where this one's is 4, three caller depths) was run against this code in its 18
+build configurations (dev at opt-level 0, 0 with no assertions, 1, 2, 3, s, z; release at 3, 0, 1, 2, s, z, with fat and thin LTO, 16 codegen units and with assertions; the `vault-probe` profile). Its controls hold in all of them (positive at least 1,
+negative 0). Worst case over the configurations and the three depths, **before** (its table at `76762a28`) and **after**:
+
+| What it counts | before | after |
+|---|---|---|
+| `bip39::decode`, the entropy | 5 (4 with the check typed) | 2 (1 with the check typed): the floor of a returned entropy, 2 |
+| `bip39::encode`, the entropy | 2 | 0 |
+| `RecoveryKit::decode`, the kit key | 3 | 2: the copies that a by-value return leaves; the scrub added here changes nothing (D03) |
+| `RecoveryKit::encode`, the kit key | 1 | 0 |
+| `bip39::phrase_wrap_key_into`, the entropy and the Argon2 output | 2 and 1 | 0 and 0 |
+| `bip39::wrap_key_into`, the Argon2 output (opt-level 1 in dev and release) | 1 | 0 |
+| `bip39::wrap_key` by value, the Argon2 output | 1 | 0 |
+| every `*_into` output, and every input key that the function does not return itself (Ed25519 `from_seed` returns its seed in the key: 1, before and after) | 0 | 0 |
+
+What is left is the by-value return itself: `RecoveryKit::decode` leaves 2 in an optimised build, with or without its scrub, and that is where a decoder cannot do better than a by-value function; a caller that must not have it
+decodes into a type that is made in place (the V-13 follow-up).
