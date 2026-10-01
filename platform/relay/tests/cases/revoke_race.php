@@ -18,6 +18,11 @@ use OaiyTest\Relay;
  * inside it (Mailbox::requireActive), with a shared lock on the device's row on MySQL and MariaDB that a revocation takes exclusively.
  * The state the race leaves is made here directly (the principal was authenticated, then the device was revoked, then the post ran);
  * pairing_mysql.php holds the revocation half-done on a server to see the post wait for it, and the last tests race real requests.
+ *
+ * What these tests cannot tell, on SQLite (the review's mutants D19 and D21, "the shared lock is not taken"): the lock is what makes a
+ * post wait for a revocation that is still in flight, and SQLite has no such thing to wait for (BEGIN IMMEDIATE holds the whole file, so
+ * the post and the revocation never overlap at all); a mutant without the lock survives here, as it must, and is killed on MySQL and
+ * MariaDB by the tests in pairing_mysql.php that hold the revocation open on a second connection (D19m and D21m in the review's run).
  */
 
 /** A POST /v1/items request from $p to $to with one cmd item, as the Kernel hands it to the handler. */

@@ -343,6 +343,15 @@ test('4.14.5 each keepalive is followed a quarter second later by an empty comme
     eq(0.25, Stream::PROBE_AFTER_S);
 });
 
+test('4.14.5 a hold looks for a newer one every 50 ms for its first two seconds and every 200 ms after: a hold that is superseded (the older of two) pins its worker for a quarter of the time, and the long wait of an idle stream costs no more than before', function () {
+    eq([50, 200, 2.0], [Stream::FAST_STEP_MS, Stream::STEP_MS, Stream::FAST_FOR_S]);
+    $now = Oaiy\Relay\Clock::mono();
+    eq(0.05, Stream::stepSeconds($now), 'just started');
+    eq(0.05, Stream::stepSeconds($now - 1.9), 'still inside the first two seconds');
+    eq(0.2, Stream::stepSeconds($now - 2.1), 'past them');
+    eq(0.2, Stream::stepSeconds($now - 19.0), 'and for the rest of the wait');
+});
+
 test('4.14.5 a frames wait writes nothing until it ends, so its answer has the status and the headers it means to: JSON, the hold header, no headers sent early by a flush', function () {
     [$k, $a, $b, $plug, $ta] = aok_pair(['wait' => ['max' => 3]]);
     [$srv] = $k->r->fleet(1);
