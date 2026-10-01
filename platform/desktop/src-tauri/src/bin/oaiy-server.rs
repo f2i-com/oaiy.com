@@ -4,18 +4,38 @@
 //! `127.0.0.1:17972`), but with no window, tray, or webview — for running on a
 //! Linux box (or any server) driven by a CO-LOCATED Node CLI / oaiy-web. The API
 //! binds 127.0.0.1 by default; OAIY_SERVER_BIND=lan binds every interface for the
-//! case this exists to serve — editing from a phone on the same network. Prefer an
-//! SSH tunnel or an authenticating reverse proxy for anything beyond a trusted LAN.
-//! OAIY_SERVER_BIND=lan refuses to start without OAIY_SERVER_TOKEN.
+//! case this exists to serve — editing from a phone on the same network — but only
+//! with an owner login already made on the console (`oaiy-server auth init`), and
+//! then it answers bearer tokens only: no cookies, no sign-in, no UI over plain
+//! HTTP. Prefer an SSH tunnel or an authenticating reverse proxy (OAIY_PUBLIC_URL)
+//! for anything beyond a trusted LAN.
 //!
 //! Configuration is by environment variable instead of the GUI's pointer file:
 //!   OAIY_DATA_DIR        data root (databases, venvs, templates)  [~/.oaiy-server]
 //!   OAIY_MODELS_DIR      where downloads land                     [<data>/models]
 //!   OAIY_EXTRA_MODEL_DIRS extra read-only model roots (`:`/`;`-separated)
 //!   OAIY_SERVER_PORT     listen port                              [17972]
-//!   OAIY_SERVER_BIND     `lan` binds 0.0.0.0 instead of loopback  [loopback]
-//!   OAIY_SERVER_TOKEN    the bearer every request but health, capability
-//!                       discovery and pairing must present       [none]
+//!   OAIY_SERVER_BIND     `loopback`, `lan` (0.0.0.0, bearer only, needs an
+//!                       owner) or an IP address to bind           [loopback]
+//!   OAIY_PUBLIC_URL      https://<host>[:port] of the dashboard: the install is
+//!                       behind a reverse proxy (OAIY_AGENT_URL and OAIY_FLOWS_URL
+//!                       name the other two app hosts)             [none]
+//!   OAIY_TRUSTED_PROXIES the peers whose X-Forwarded-For is believed; a bind
+//!                       beyond loopback behind a public URL must name them, and
+//!                       then answers nothing else                 [loopback when
+//!                                                                 OAIY_PUBLIC_URL is set]
+//!   OAIY_ALLOWED_HOSTS   extra Host names, for every install       [none]
+//!   OAIY_SERVER_TOKEN    a bearer of the `cli` preset: 32 to 256 printable
+//!                       characters with no common pattern, a guard against
+//!                       the obvious and not a strength meter (no word like
+//!                       `test`, no run like `1234`, no phrase of common words:
+//!                       `openssl rand -base64 32` is one; else exit 78) [none]
+//!
+//! A configuration that breaks a rule of the design (an unreadable bind, a lan bind with no owner,
+//! a public URL with a path, a proxy not named, a weak token, a mode that is not allowed there)
+//! stops the server with exit 78, and one line saying what to change. The shipped unit does not restart
+//! that (`RestartPreventExitStatus=78`, and it runs `oaiy-server check` first, which lists every
+//! violation at once; `scripts/check-release.mjs` holds the unit to both).
 //!   OAIY_HF_TOKEN        HuggingFace token for this server's own gated
 //!                       downloads (not passed on to services)    [none]
 //!   OAIY_ENGINES_UI      the engines' control pages, when oaiy-studio runs beside
@@ -31,16 +51,18 @@
 //!                       (scoped, but a scope a token lacks is logged, not refused, unless it is
 //!                       a dangerous one) [legacy]
 //!
-//! Every request but a few needs the bearer token: a headless server has no real
-//! webview origin, and any local process can forge the `Origin` header, so the
+//! Every request but a few needs a credential: a headless server has no real
+//! webview origin, and any local process can forge the `Origin` header, so a
 //! token is the only credential trusted off the GUI. Public without one are only
 //! the health route (`/api/health`), capability discovery
-//! (`/api/bridge/capabilities`) and the pairing bootstrap (`/api/bridge/pairing`).
-//! With no OAIY_SERVER_TOKEN set that is ALL the server answers: everything else,
-//! reads included, gets 403. Set a token to administer the server — the CLI sends
-//! `Authorization: Bearer <token>`. (A token that pairing minted, or the one this
-//! process hands the flow runs it starts, is accepted too; approving a pairing
-//! needs a bearer to begin with.)
+//! (`/api/bridge/capabilities`) and the pairing bootstrap (`/api/bridge/pairing`):
+//! on a build with the web login (the release's) the last two are open to a caller
+//! with no credential once an owner exists, and before that, in setup-only mode, to
+//! a caller WITH one (the token) only. With no OAIY_SERVER_TOKEN set that is ALL the
+//! server answers: everything else, reads included, is refused. Set a token to
+//! administer the server — the CLI sends `Authorization: Bearer <token>`. (A token
+//! that pairing minted, or the one this process hands the flow runs it starts, is
+//! accepted too; approving a pairing needs a bearer to begin with.)
 //!
 //! SIGTERM / Ctrl-C stops every managed service before exiting, and on unix the plugins
 //! first (on Windows a plugin ends with the server's job object).
@@ -54,7 +76,6 @@ use oaiy_desktop_lib::services::catalog::CatalogHandle;
 use oaiy_desktop_lib::services::downloads::{Downloads, DownloadsHandle};
 use oaiy_desktop_lib::services::python::{Python, PythonHandle};
 use oaiy_desktop_lib::services::registry::{Registry, RegistryHandle};
-use oaiy_desktop_lib::DESKTOP_PORT;
 
 /// Env-var-backed config provider (the headless analogue of the GUI's
 /// AppHandle-backed one). No pointer file, no restart-required concept.
@@ -122,8 +143,10 @@ async fn shutdown_signal() {
     }
 }
 
-fn auth_token_is_empty() -> bool {
-    std::env::var("OAIY_SERVER_TOKEN").map(|s| s.trim().is_empty()).unwrap_or(true)
+/// The environment as text. A value that is not UTF-8 is read lossily, so that it fails whatever rule reads it
+/// rather than passing for unset.
+fn env_text(name: &str) -> Option<String> {
+    std::env::var_os(name).map(|v| v.to_string_lossy().into_owned())
 }
 
 /// `oaiy-server auth ...`, `oaiy-server check` and `oaiy-server flows ...`: the console (design 4.7.9). They run
@@ -149,6 +172,14 @@ fn console(args: &[String]) -> i32 {
 
 #[cfg(not(feature = "web"))]
 fn console(args: &[String]) -> i32 {
+    // `check` needs no console: the rules of the design over the environment.
+    if args.first().map(String::as_str) == Some("check") {
+        return oaiy_desktop_lib::auth::exposure::check_headless(
+            &env_text,
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+        );
+    }
     eprintln!(
         "oaiy-server {}: this build has no web login (it was built without the `web` feature), so it has no console",
         args.first().map_or("", String::as_str)
@@ -184,55 +215,39 @@ async fn server_main() {
                 .collect()
         })
         .unwrap_or_default();
-    // Default only when UNSET/blank; fail loud on a typo / out-of-range / 0 rather
-    // than silently binding the default (which leaves the server reachable on a
-    // port the operator didn't choose, with no error).
-    let port: u16 = match std::env::var("OAIY_SERVER_PORT") {
-        Err(_) => DESKTOP_PORT,
-        Ok(s) if s.trim().is_empty() => DESKTOP_PORT,
-        Ok(s) => s.trim().parse::<u16>().ok().filter(|p| *p != 0).unwrap_or_else(|| {
-            eprintln!("oaiy-server: invalid OAIY_SERVER_PORT {s:?} (want 1-65535)");
-            std::process::exit(1);
-        }),
-    };
-    // Opt-in only, and only on an exact value: anything else (including a typo
-    // like `LAN ` or `true`) keeps loopback, because the failure mode of guessing
-    // wrong here is a server on the network that nobody meant to expose.
-    let bind_all = std::env::var("OAIY_SERVER_BIND")
-        .map(|s| s.trim().eq_ignore_ascii_case("lan"))
-        .unwrap_or(false);
-    if bind_all && auth_token_is_empty() {
-        eprintln!(
-            "oaiy-server: OAIY_SERVER_BIND=lan requires a non-empty OAIY_SERVER_TOKEN"
-        );
-        std::process::exit(1);
+    // The configuration is judged whole, before anything is made or opened (design 4.5.5): the port, the bind and
+    // what it needs (a lan bind needs an owner login, a bind beyond loopback behind a public URL names its
+    // proxy), the public URLs, the token's shape, the access mode. The first violation is the one line printed and
+    // the exit is 78, which the shipped unit does not restart; `oaiy-server check` lists them all. Nothing here
+    // guesses: a bind that is not loopback, lan or an address used to keep loopback quietly, and does not now.
+    // The owner file is read as the store reads it (`inspect_owner_file`): one that is there and that this server
+    // cannot use is a refusal named by the file, first, as `oaiy-server check` lists it, and not a file that
+    // satisfies rule 2 and stops the server one step later.
+    let owner = oaiy_desktop_lib::auth::exposure::inspect_owner_file(&data_dir.join("auth"));
+    if let Some(line) = owner.refusal() {
+        eprintln!("oaiy-server: {line}");
+        std::process::exit(oaiy_desktop_lib::auth::mode::EX_CONFIG);
     }
-
-    // A mode nobody chose must not be guessed: a value that is not one of the three stops the server
-    // (exit 78, which the shipped unit does not restart). A server with the web login defaults to `scoped` and
-    // refuses `legacy`: the login needs the store on disk, which `legacy` never opens.
-    #[cfg(feature = "web")]
-    let mode_from_env = oaiy_desktop_lib::auth::login::server_mode(
-        std::env::var("OAIY_ACCESS_MODE").ok().as_deref(),
-    );
-    #[cfg(not(feature = "web"))]
-    let mode_from_env = oaiy_desktop_lib::auth::AccessMode::from_env(
-        std::env::var("OAIY_ACCESS_MODE").ok().as_deref(),
-    );
-    let access_mode = match mode_from_env {
-        Ok(mode) => mode,
-        Err(refusal) => {
-            eprintln!("oaiy-server: {refusal}");
-            std::process::exit(refusal.exit_code());
+    let facts = oaiy_desktop_lib::auth::exposure::Facts {
+        owner_exists: owner.exists(),
+        web_login: cfg!(feature = "web"),
+    };
+    let config = match oaiy_desktop_lib::auth::exposure::validate_config(&env_text, &facts) {
+        Ok(config) => config,
+        Err(line) => {
+            eprintln!("oaiy-server: {line}");
+            std::process::exit(oaiy_desktop_lib::auth::mode::EX_CONFIG);
         }
     };
-
-    // Trim symmetrically with the client (bearer_token trims), so surrounding
-    // whitespace in the env var can't silently reject a valid token.
-    let auth_token = std::env::var("OAIY_SERVER_TOKEN")
-        .ok()
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty());
+    for warning in &config.warnings {
+        log::warn!("{warning}");
+    }
+    // (What this install is, in words, with no secret in it, is printed by `http::serve` once the credential store is
+    // open and the listener is bound: a banner that says "listening" is not printed by a server that then stops.)
+    let port: u16 = config.port;
+    let bind = config.bind.addr();
+    // Trimmed and of the shape of design 4.1, or the server would not be here.
+    let auth_token = config.static_token.clone();
 
     // Owner-only when this is what makes it (unix mode 0700): the provider keys,
     // the account link, paired-app tokens and identity keys all live in here. A
@@ -269,7 +284,7 @@ async fn server_main() {
     let python: PythonHandle = Python::new(data_dir.clone()).into_handle();
     let catalog = CatalogHandle::new(data_dir.clone());
 
-    let config: Arc<dyn ConfigProvider> = Arc::new(EnvConfig {
+    let env_config: Arc<dyn ConfigProvider> = Arc::new(EnvConfig {
         data_dir: data_dir.clone(),
         models_dir: models_dir.clone(),
     });
@@ -366,7 +381,8 @@ async fn server_main() {
     // serve() logs the authoritative post-bind "listening" line, so a port-in-use
     // failure here no longer prints a contradictory success message first.
     log::info!(
-        "oaiy-server starting on http://127.0.0.1:{port}  (data={}, models={}, auth={})",
+        "oaiy-server starting on {}:{port}  (data={}, models={}, auth={})",
+        if bind.is_ipv6() { format!("http://[{bind}]") } else { format!("http://{bind}") },
         data_dir.display(),
         models_dir.display(),
         if auth_token.is_some() {
@@ -482,9 +498,9 @@ async fn server_main() {
     let registry_for_exit = registry.clone();
     if let Err(e) = http::serve(
         port,
-        bind_all, config, auth_token, false, registry, downloads, python, catalog, bridge,
+        bind, env_config, auth_token, false, registry, downloads, python, catalog, bridge,
         companion, companion_upstream, link, ai_providers, ai_codex, node_runtime, updater,
-        oaiy_desktop_lib::auth::AccessSettings::new(access_mode),
+        oaiy_desktop_lib::auth::AccessSettings::for_server(config),
     )
     .await
     {

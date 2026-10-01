@@ -231,7 +231,9 @@ fn cli_scopes() -> ScopeSet {
 }
 
 /// The three apps a cookie session or a desktop webview can be for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum App {
     /// The dashboard.

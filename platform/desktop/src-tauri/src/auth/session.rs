@@ -155,6 +155,20 @@ pub fn authenticate_cookie(
     info: &RequestInfo,
 ) -> Result<Option<Principal>, Denial> {
     let Some(ch) = CookieHost::of(info) else {
+        // A host that serves no app has no cookies to read. On a connection that cannot carry one (plain HTTP
+        // from the network: a lan listener) a request that presents a session cookie of ours is refused and
+        // told why, not quietly treated as anonymous (design 4.5.4).
+        if info.channel == Channel::Insecure
+            && guard.login().is_some()
+            && cookie::carries_a_session_cookie(headers)
+        {
+            return Err(refuse(
+                StatusCode::FORBIDDEN,
+                "secure_channel_required",
+                "A cookie is accepted only over https, or from the machine itself.",
+                None,
+            ));
+        }
         return Ok(None);
     };
     let value = match read_cookie(guard, headers, &ch) {

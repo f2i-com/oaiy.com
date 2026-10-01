@@ -258,6 +258,32 @@ pub struct LinkStore {
 pub type LinkHandle = Arc<LinkStore>;
 
 pub fn open_handle(data_dir: PathBuf) -> LinkHandle {
+    let store = load_store(data_dir);
+    // One worker for the process lifetime. It asks the store what to do each
+    // tick, so linking and unlinking need not start or stop anything.
+    heartbeat::spawn(store.clone());
+    // Enrolment as a storage node the owner can approve. Separate from the
+    // heartbeat: presence is per-minute, enrolment is per-hour and its answer
+    // is a state the user acts on rather than a liveness signal.
+    data_node::spawn(store.clone());
+    set_linked_origin(store.account().as_ref().map(|a| a.base_url.as_str()));
+    store
+}
+
+/// What `open_handle` returns, without the two workers it starts. A worker lives as
+/// long as the process and asks its store what to do every tick, so a test that
+/// holds a store with the fixture account of `formlogic.com` would send that
+/// provider a heartbeat and an enrolment, with a made-up key, from then until the
+/// last test ends. A test opens no connection beyond this machine. The trusted
+/// origin is set as `open_handle` sets it.
+#[cfg(test)]
+pub(crate) fn open_handle_without_workers(data_dir: PathBuf) -> LinkHandle {
+    let store = load_store(data_dir);
+    set_linked_origin(store.account().as_ref().map(|a| a.base_url.as_str()));
+    store
+}
+
+fn load_store(data_dir: PathBuf) -> LinkHandle {
     let path = data_dir.join("link").join("account.json");
     let account = std::fs::read_to_string(&path)
         .ok()
@@ -282,14 +308,6 @@ pub fn open_handle(data_dir: PathBuf) -> LinkHandle {
             data_node_error: None,
         }),
     });
-    // One worker for the process lifetime. It asks the store what to do each
-    // tick, so linking and unlinking need not start or stop anything.
-    heartbeat::spawn(store.clone());
-    // Enrolment as a storage node the owner can approve. Separate from the
-    // heartbeat: presence is per-minute, enrolment is per-hour and its answer
-    // is a state the user acts on rather than a liveness signal.
-    data_node::spawn(store.clone());
-    set_linked_origin(store.account().as_ref().map(|a| a.base_url.as_str()));
     store
 }
 
@@ -773,7 +791,7 @@ mod tests {
         let p = std::env::temp_dir().join(format!("oaiy-link-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
-        let h = open_handle(p.clone());
+        let h = open_handle_without_workers(p.clone());
         (p, h)
     }
 
@@ -820,7 +838,7 @@ mod tests {
         renewed.credential = "flk_renewed".into();
         s.persist(&renewed).unwrap();
         assert_private(&file);
-        assert_eq!(open_handle(dir.clone()).account().unwrap().credential, "flk_renewed");
+        assert_eq!(open_handle_without_workers(dir.clone()).account().unwrap().credential, "flk_renewed");
         let staged: Vec<_> = std::fs::read_dir(file.parent().unwrap())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -844,7 +862,7 @@ mod tests {
         assert!(first.starts_with("oaiy-"), "{first}");
         assert_eq!(s.instance_id(), first, "the same id within a session");
         // …and across a restart, which is the half that matters.
-        assert_eq!(open_handle(dir.clone()).instance_id(), first);
+        assert_eq!(open_handle_without_workers(dir.clone()).instance_id(), first);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -862,7 +880,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("link")).unwrap();
         std::fs::write(dir.join("link").join("account.json"), legacy.to_string()).unwrap();
 
-        let reopened = open_handle(dir.clone());
+        let reopened = open_handle_without_workers(dir.clone());
         let a = reopened.account().expect("a pre-heartbeat link must still load");
         assert_eq!(a.credential, "flk_old");
         assert!(a.instance_id.is_none());
@@ -976,13 +994,13 @@ mod tests {
         let (dir, s) = store("persist");
         s.persist(&account()).unwrap();
 
-        let reopened = open_handle(dir.clone());
+        let reopened = open_handle_without_workers(dir.clone());
         let a = reopened.account().expect("the link must survive");
         assert_eq!(a.credential, "flk_supersecret");
         assert_eq!(a.connector_id, "formlogic");
 
         assert!(!reopened.unlink().linked);
-        assert!(open_handle(dir.clone()).account().is_none(), "unlink must be durable");
+        assert!(open_handle_without_workers(dir.clone()).account().is_none(), "unlink must be durable");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

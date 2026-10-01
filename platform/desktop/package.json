@@ -10,7 +10,7 @@
     "build": "node scripts/sync-cli.mjs && tsc --noEmit && vite build",
     "build:bundle": "npm run stage-pages && npm run build",
     "test": "vitest run && npm run test:shell",
-    "test:shell": "node --test scripts/oaiyctl.test.mjs",
+    "test:shell": "node --test scripts/oaiyctl.test.mjs scripts/check-release.test.mjs scripts/smoke-token.test.mjs",
     "test:unit": "vitest",
     "check:transfer-contract": "node ../../scripts/check-transfer-contract.mjs && node --test ../../scripts/check-transfer-contract.test.mjs",
     "preview": "vite preview",

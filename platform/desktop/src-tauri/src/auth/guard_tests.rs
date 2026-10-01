@@ -32,7 +32,7 @@ use crate::secret_file::testing::TempDir;
 
 const T0: u64 = 1_790_000_000_000;
 const DAY: u64 = 86_400_000;
-const STATIC_TOKEN: &str = "abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+const STATIC_TOKEN: &str = "Vl0JTnJtFseAe9ePKCDhuBymfRXQ8osZ-QMlM86leCU";
 const DESK_ORIGIN: &str = "tauri://localhost";
 
 /// The routes of the table that are real handlers (`api.rs`): the stub leaves them to it.
@@ -69,8 +69,6 @@ fn env_at_port(
     static_token: Option<&str>,
     port: u16,
 ) -> Env {
-    let dir = TempDir::new("guard-tests");
-    let clock = Arc::new(ManualClock::new(T0));
     let map: std::collections::BTreeMap<String, String> = vars
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -78,6 +76,42 @@ fn env_at_port(
     let (config, warnings) =
         GuardConfig::from_env(&move |n| map.get(n).cloned(), bind_all, gui, port);
     assert!(warnings.is_empty(), "{warnings:?}");
+    env_from_config(mode, config, static_token)
+}
+
+/// A guard built the way `oaiy-server` builds one: from a configuration that passed the startup rules
+/// (`auth::exposure`), not from the lenient reader. The bind is an address in the configuration and nothing listens
+/// on it: every request of these tests is made with a fake peer address, so a lan or proxy-only install is exercised
+/// without a socket beyond loopback.
+fn env_validated(vars: &[(&str, &str)], owner_exists: bool) -> Env {
+    let map: std::collections::BTreeMap<String, String> = vars
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let evaluation = super::exposure::evaluate(
+        &move |n| map.get(n).cloned(),
+        &super::exposure::Facts {
+            owner_exists,
+            web_login: true,
+        },
+    );
+    assert!(
+        evaluation.violations.is_empty(),
+        "{:?}",
+        evaluation.violations
+    );
+    let config = evaluation.config.expect("a configuration");
+    let token = config.static_token.clone();
+    env_from_config(
+        config.mode,
+        GuardConfig::from_config(&config, false),
+        token.as_deref(),
+    )
+}
+
+fn env_from_config(mode: AccessMode, config: GuardConfig, static_token: Option<&str>) -> Env {
+    let dir = TempDir::new("guard-tests");
+    let clock = Arc::new(ManualClock::new(T0));
     let store = Arc::new(AuthStore::memory(clock.clone()));
     let audit = Arc::new(AuditLog::open(&dir.0.join("auth"), clock.clone(), false));
     let guard = Arc::new(Guard::new(
@@ -604,7 +638,7 @@ async fn t1_the_environment_token_is_the_cli_preset_on_every_install_and_never_m
     assert_eq!(
         go(
             &e,
-            send(Method::GET, "/api/config").bearer("abcdefghijklmnopqrstuvwxyz0123456789ABCE")
+            send(Method::GET, "/api/config").bearer("Vl0JTnJtFseAe9ePKCDhuBymfRXQ8osZ-QMlM86leCV")
         )
         .await
         .code()
@@ -1304,6 +1338,109 @@ async fn t45_a_forwarded_header_on_a_local_install_is_421_and_a_proxied_install_
         (r.status, r.code().as_deref()),
         (421, Some("misdirected_host"))
     );
+}
+
+/// The last entry of `X-Forwarded-Proto` across all its lines, as the rightmost of `X-Forwarded-For` is the client's:
+/// a proxy that adds to the header puts its own word last, and what a client sends comes before it. The first line
+/// used to win here, so `[https, http]` was a secure channel and `[http, https]` a `400`.
+#[tokio::test]
+async fn f4_the_protocol_a_proxy_says_is_the_last_entry_of_the_header_across_its_lines() {
+    let p = env_with(
+        AccessMode::Scoped,
+        &[("OAIY_PUBLIC_URL", "https://dash.example.com")],
+        false,
+        false,
+        None,
+    );
+    let ask = |lines: &[&str]| {
+        let mut s = send(Method::GET, "/api/auth/info")
+            .h("host", "dash.example.com")
+            .add("x-forwarded-for", "203.0.113.9");
+        for line in lines {
+            s = s.add("x-forwarded-proto", line);
+        }
+        s
+    };
+    // What the server makes of it: `Some(secure)` for an answer, and `None` for the `400` of a proxy that says http.
+    for (lines, secure) in [
+        (vec!["https"], Some(true)),
+        (vec!["HTTPS"], Some(true)),
+        (vec![" https "], Some(true)),
+        (vec!["http"], None),
+        // One line, a list: the last entry is the proxy's.
+        (vec!["https, http"], None),
+        (vec!["http, https"], Some(true)),
+        (vec!["https,http,https"], Some(true)),
+        (vec!["http,https,http"], None),
+        (vec!["https,"], Some(false)),
+        // Two lines: the last line, and in it the last entry.
+        (vec!["https", "http"], None),
+        (vec!["http", "https"], Some(true)),
+        (vec!["http", "https, http"], None),
+        (vec!["https, http", "https"], Some(true)),
+        (vec!["https", ""], Some(false)),
+        (vec!["", "https"], Some(true)),
+        (vec!["https", "ws"], Some(false)),
+        // Not a word that says a channel.
+        (vec!["ws"], Some(false)),
+        (vec![""], Some(false)),
+    ] {
+        let r = go(&p, ask(&lines)).await;
+        match secure {
+            None => assert_eq!(
+                (r.status, r.code().as_deref()),
+                (400, Some("proxy_misconfigured")),
+                "{lines:?}"
+            ),
+            Some(secure) => {
+                assert_eq!(r.status, 200, "{lines:?}: {}", r.text);
+                assert_eq!(r.json()["secureChannel"], secure, "{lines:?}");
+                // What the server says it saw is the same word.
+                assert_eq!(
+                    r.json()["seen"]["proto"],
+                    if secure { "https" } else { "http" },
+                    "{lines:?}"
+                );
+            }
+        }
+    }
+    // A peer that is not the proxy says nothing that counts, in whichever order.
+    for lines in [vec!["https"], vec!["http", "https"], vec!["https, https"]] {
+        let r = go(&p, ask(&lines).peer("198.51.100.7:4000")).await;
+        assert_eq!(r.json()["secureChannel"], false, "{lines:?}");
+        assert_eq!(r.json()["seen"]["proto"], "http", "{lines:?}");
+    }
+    // A line that is not text is a header that cannot be read, wherever it is: no protocol is said.
+    for lines in [
+        vec![&b"https"[..], &b"\xff"[..]],
+        vec![&b"\xff"[..], &b"https"[..]],
+        vec![&b"https\xe9"[..]],
+    ] {
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/auth/info")
+            .header("host", "dash.example.com")
+            .header("x-forwarded-for", "203.0.113.9");
+        for line in &lines {
+            req = req.header(
+                "x-forwarded-proto",
+                axum::http::HeaderValue::from_bytes(line).unwrap(),
+            );
+        }
+        let mut req = req.body(Body::empty()).unwrap();
+        req.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:50000".parse::<SocketAddr>().unwrap(),
+        ));
+        let response = p.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status().as_u16(), 200, "{lines:?}");
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["secureChannel"], false, "{lines:?}");
+    }
 }
 
 #[tokio::test]
@@ -2658,19 +2795,125 @@ async fn y21_the_health_probe_is_exempt_from_the_host_check_for_get_and_head_of_
     }
 }
 
+/// The reader that does not judge (the desktop's, and these tests') reads the scheme of a public URL as the startup
+/// rules do, in any case: `HTTPS://Dash.Example.com` is the host `dash.example.com`, where it was a warning and no host.
+#[tokio::test]
+async fn y21_a_public_url_with_its_scheme_in_capitals_is_read_to_a_host_by_the_lenient_reader_too()
+{
+    let e = env_with(
+        AccessMode::Scoped,
+        &[("OAIY_PUBLIC_URL", "HTTPS://Dash.Example.com")],
+        false,
+        false,
+        None,
+    );
+    let r = go(
+        &e,
+        send(Method::GET, "/api/auth/info")
+            .h("host", "dash.example.com")
+            .add("x-forwarded-for", "203.0.113.9")
+            .add("x-forwarded-proto", "https"),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.json()["secureChannel"], true);
+}
+
+/// A `Host` whose port is not written as a browser writes it is not the `Host` of the server: `+8080` and `08080`
+/// used to be read as the port they stand for (`u16::from_str` takes both), on a loopback name and on a public one.
+#[tokio::test]
+async fn y21_a_host_with_a_port_a_browser_does_not_write_is_misdirected() {
+    for mode in [AccessMode::Scoped, AccessMode::Shadow] {
+        let e = env(mode);
+        for host in [
+            "localhost:+8080",
+            "localhost:08080",
+            "127.0.0.1:+1",
+            "127.0.0.1:0",
+            "[::1]:05",
+            "localhost:",
+        ] {
+            let r = go(&e, send(Method::GET, "/api/config").h("host", host)).await;
+            assert_eq!(
+                (r.status, r.code().as_deref()),
+                (421, Some("misdirected_host")),
+                "{mode:?} {host}"
+            );
+        }
+        for host in [
+            "localhost:8080",
+            "127.0.0.1:1",
+            "[::1]:5",
+            "localhost:65535",
+        ] {
+            let r = go(&e, send(Method::GET, "/api/config").h("host", host)).await;
+            assert_ne!(
+                r.code().as_deref(),
+                Some("misdirected_host"),
+                "{mode:?} {host}"
+            );
+        }
+    }
+    let p = proxied_env();
+    let via_proxy = |host: &str| {
+        send(Method::GET, "/api/auth/info")
+            .h("host", host)
+            .add("x-forwarded-for", "203.0.113.9")
+            .add("x-forwarded-proto", "https")
+    };
+    for host in [
+        "dash.example.com:+443",
+        "dash.example.com:0443",
+        "dash.example.com:00443",
+    ] {
+        let r = go(&p, via_proxy(host)).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (421, Some("misdirected_host")),
+            "{host}"
+        );
+    }
+    for host in [
+        "dash.example.com",
+        "dash.example.com:443",
+        "DASH.example.com:443",
+    ] {
+        let r = go(&p, via_proxy(host)).await;
+        assert_eq!(r.status, 200, "{host}: {}", r.text);
+    }
+}
+
 // ============================= F4: the static token in the shape the design gives it ==============
 
-/// Tokens of the static token's shape (`[\x21-\x7e]{32,256}`, 16 different characters) that the strict bearer
-/// rule (`[A-Za-z0-9._~+/=-]`, 128 bytes) alone would refuse.
+/// `len` printable characters that the static token rule takes: the first of a seeded xorshift series that it does.
+fn random_printable(len: usize) -> String {
+    for seed in 1u64..5000 {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ len as u64;
+        let token: String = (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (0x21 + (x % 94) as u8) as char
+            })
+            .collect();
+        if super::token::check_static_token_shape(&token).is_ok() {
+            return token;
+        }
+    }
+    panic!("the static token rule takes no token of {len} printable characters in 5000 tries");
+}
+
+/// Tokens the static token rule takes (32 to 256 printable characters, no common pattern) that the strict
+/// bearer rule (`[A-Za-z0-9._~+/=-]`, 128 bytes) alone would refuse.
 fn wide_static_tokens() -> Vec<(&'static str, String)> {
-    let printable = |len: usize| -> String { ('!'..='~').cycle().take(len).collect() };
     vec![
         (
-            "36 characters with a dollar sign and an exclamation mark",
+            "32 characters with a dollar sign and an exclamation mark",
             "Sup3r$ecret!Zq7kLm9VbNw2XyHdFg5!".to_string(),
         ),
-        ("129 characters", printable(129)),
-        ("256 characters", printable(256)),
+        ("129 characters", random_printable(129)),
+        ("256 characters", random_printable(256)),
     ]
 }
 
@@ -2727,27 +2970,103 @@ async fn f4_in_legacy_mode_the_new_routes_take_a_static_token_of_the_designs_sha
 }
 
 #[tokio::test]
-async fn f4_a_static_token_that_fails_the_shape_rule_is_still_accepted_until_the_startup_rule_exists(
+async fn f4_a_static_token_that_fails_the_shape_rule_is_ignored_where_the_new_guard_judges_every_route_and_kept_in_legacy(
 ) {
-    // ACC-14 (`validate_config`) makes a static token that fails the shape rule of design 4.1 a startup
-    // refusal (exit 78 in `oaiy-server`, ignored with a warning in the desktop). Until then it is what it was:
-    // a bearer, the `cli` preset. When ACC-14 lands this test changes on purpose.
-    for token in ["short", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "change-me"] {
+    // ACC-14 flips what this test pinned (it used to say that such a token is still accepted "until the startup
+    // rule exists"). The rule of design 4.1 is a startup refusal in `oaiy-server` (`auth::exposure`, exit 78) and
+    // "ignored with a warning" in every other embedding: the desktop's guard in `scoped` and `shadow` drops the
+    // token. In `legacy`, which changes nothing for the routes that existed before the model, the token stays
+    // what it was (a bearer; the new routes take it as the `cli` preset), and a line says what will change.
+    for token in [
+        "short",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "change-me",
+        // What the design's rule took, and what the fixtures of this module were: 40 different characters that count.
+        "abcdefghijklmnopqrstuvwxyz0123456789ABCD",
+    ] {
         assert!(
             super::token::check_static_token_shape(token).is_err(),
             "{token} fails the shape rule"
         );
-        for mode in [AccessMode::Scoped, AccessMode::Shadow, AccessMode::Legacy] {
+        for mode in [AccessMode::Scoped, AccessMode::Shadow] {
             let e = env_with(mode, &[], false, true, Some(token));
-            let r = go(&e, send(Method::GET, "/api/auth/whoami").bearer(token)).await;
-            assert_eq!(r.status, 200, "{mode:?} {token}: {}", r.text);
-            assert_eq!(r.json()["kind"], "static");
+            // Not the operator's token any more: a bearer of the strict charset that names nobody.
+            for path in ["/api/auth/whoami", "/api/config"] {
+                let r = go(&e, send(Method::GET, path).bearer(token)).await;
+                assert_eq!(
+                    (r.status, r.code().as_deref()),
+                    (401, Some("token_invalid")),
+                    "{mode:?} {token} {path}: {}",
+                    r.text
+                );
+            }
         }
+        let e = env_with(AccessMode::Legacy, &[], false, true, Some(token));
+        let r = go(&e, send(Method::GET, "/api/auth/whoami").bearer(token)).await;
+        assert_eq!(r.status, 200, "legacy {token}: {}", r.text);
+        assert_eq!(r.json()["kind"], "static");
     }
-    // What is refused is a short token outside the strict charset: neither rule takes it.
+    // A short token outside the strict charset is refused by neither rule in either way: it is a 400 as before.
     let e = env_with(AccessMode::Scoped, &[], false, true, Some("ab$cd"));
     let r = go(&e, send(Method::GET, "/api/config").bearer("ab$cd")).await;
     assert_eq!(r.status, 400);
+    // A token of the right shape is kept in every mode (the test above holds it to that too).
+    for mode in [AccessMode::Scoped, AccessMode::Shadow, AccessMode::Legacy] {
+        let e = env_with(mode, &[], false, true, Some(STATIC_TOKEN));
+        let r = go(
+            &e,
+            send(Method::GET, "/api/auth/whoami").bearer(STATIC_TOKEN),
+        )
+        .await;
+        assert_eq!(r.status, 200, "{mode:?}");
+    }
+}
+
+/// What the README says (N4 of the review): a static token with a character outside the strict bearer rule
+/// (`[A-Za-z0-9._~+/=-]`) that the rule ALSO refuses (here `secret` is in it) is not the operator's token to a guard that
+/// judges the route, so it meets the strict rule, which is `400 bad_request`: on every route in `scoped` and `shadow`, and in
+/// `legacy` on the routes the access model added (`legacy` keeps the routes that existed before with the old guard, which
+/// takes any token: this harness puts the new guard in front of every route, so that half is the legacy-neutrality suite's
+/// and not this test's). A token of that shape that the rule takes is the operator's, as the test above holds. Only the
+/// desktop can meet this: `oaiy-server` does not start with such a token.
+#[tokio::test]
+async fn n4_a_wide_static_token_that_the_rule_refuses_is_a_400_on_the_routes_the_model_adds_and_nothing_more(
+) {
+    let token = "Zq7$kLm9VbNw2XyHdFg5-secret-Rt8PcJ4u";
+    assert_eq!(
+        super::token::check_static_token_shape(token),
+        Err(super::token::StaticTokenShape::Placeholder)
+    );
+    assert!(token.contains('$'));
+    for mode in [AccessMode::Scoped, AccessMode::Shadow, AccessMode::Legacy] {
+        let e = env_with(mode, &[], false, true, Some(token));
+        for path in ["/api/auth/whoami", "/api/auth/derive"] {
+            let r = go(&e, send(Method::GET, path).bearer(token)).await;
+            assert_eq!(
+                (r.status, r.code().as_deref()),
+                (400, Some("bad_request")),
+                "{mode:?} {path}, a route the model adds: {}",
+                r.text
+            );
+        }
+    }
+    // In `scoped` no route is the old guard's: the same.
+    let e = env_with(AccessMode::Scoped, &[], false, true, Some(token));
+    let r = go(&e, send(Method::GET, "/api/config").bearer(token)).await;
+    assert_eq!(
+        (r.status, r.code().as_deref()),
+        (400, Some("bad_request")),
+        "{}",
+        r.text
+    );
+    // The same token without the word the rule refuses is the operator's on both.
+    let taken = "Zq7$kLm9VbNw2XyHdFg5-Wv3Rt8PcJ4u";
+    assert_eq!(super::token::check_static_token_shape(taken), Ok(()));
+    for mode in [AccessMode::Scoped, AccessMode::Legacy] {
+        let e = env_with(mode, &[], false, true, Some(taken));
+        let r = go(&e, send(Method::GET, "/api/auth/whoami").bearer(taken)).await;
+        assert_eq!(r.status, 200, "{mode:?}: {}", r.text);
+    }
 }
 
 // ======================= F9: what the guard says of the address it sees, and what it keeps ================
@@ -3192,4 +3511,1097 @@ fn the_guard_reports_its_mode_and_the_storage_state_for_health() {
     assert_eq!((x.access, x.storage), ("shadow", "ok"));
     assert_eq!(e.guard.mode(), AccessMode::Shadow);
     let _ = (Only::Everywhere, e.guard.config().port);
+}
+
+// ============== ACC-14: proxy-only, forged forwarded headers, the lan listener, the docker shape ======
+
+/// A container pair (design 4.14): bound beyond loopback behind a public URL, the proxy's network named.
+fn proxy_only_env() -> Env {
+    env_with(
+        AccessMode::Scoped,
+        &[
+            ("OAIY_PUBLIC_URL", "https://dash.example.com"),
+            ("OAIY_TRUSTED_PROXIES", "172.30.0.0/24"),
+        ],
+        true,
+        false,
+        Some(STATIC_TOKEN),
+    )
+}
+
+/// A preflight is answered by the CORS layer, which sits outside the guard so that an app can read the refusal it
+/// gets, and it was answered before the front door every other request meets: a proxy-only listener answered the
+/// preflight of anyone, and a `Host` that is not the server's got `204` too. The front door
+/// (`Guard::refuses_before_a_preflight`) is now first for every path but the health probe's, and `TRACE` of a peer
+/// that is not let in is `403` and not `405`, as the comment on the door says.
+#[tokio::test]
+async fn t45_a_preflight_and_a_trace_meet_the_front_door_before_anything_answers_them() {
+    let preflight = |path: &str, host: &str| {
+        send(Method::OPTIONS, path)
+            .h("host", host)
+            .h("origin", "https://evil.example")
+            .h("access-control-request-method", "GET")
+            .h("access-control-request-headers", "authorization")
+    };
+    let pna = |s: Send| s.h("access-control-request-private-network", "true");
+    let through_the_proxy = |s: Send| {
+        s.peer("172.30.0.3:5000")
+            .add("x-forwarded-for", "203.0.113.9")
+            .add("x-forwarded-proto", "https")
+    };
+    let po = proxy_only_env();
+    let stranger = "203.0.113.9:5000";
+    // What each is answered: the status, the code of a refusal, and whether the answer carries CORS headers at all.
+    let answer = |r: &Reply| {
+        (
+            r.status,
+            r.code(),
+            r.headers.contains_key("access-control-allow-origin")
+                || r.headers.contains_key("access-control-allow-methods"),
+        )
+    };
+    let refused = |status: u16, code: &str| (status, Some(code.to_string()), false);
+    let passed = (204, None, false);
+
+    // A proxy-only listener: a peer that is neither the proxy nor this machine is refused, whatever it asks.
+    for (what, s) in [
+        ("preflight", preflight("/api/config", "dash.example.com")),
+        (
+            "preflight with a bad Host",
+            preflight("/api/config", "evil.example"),
+        ),
+        (
+            "preflight that asks for the private network",
+            pna(preflight("/api/config", "evil.example")),
+        ),
+        (
+            "preflight of a path with no route",
+            preflight("/api/no/such", "dash.example.com"),
+        ),
+        (
+            "bare OPTIONS",
+            send(Method::OPTIONS, "/api/config").h("host", "dash.example.com"),
+        ),
+        (
+            "bare OPTIONS of the health route",
+            send(Method::OPTIONS, "/api/health").h("host", "dash.example.com"),
+        ),
+        (
+            "TRACE",
+            send(Method::TRACE, "/api/config").h("host", "dash.example.com"),
+        ),
+        (
+            "CONNECT",
+            send(Method::CONNECT, "/api/config").h("host", "dash.example.com"),
+        ),
+    ] {
+        let r = go(&po, s.peer(stranger)).await;
+        assert_eq!(
+            answer(&r),
+            refused(403, "direct_access_refused"),
+            "{what}: {}",
+            r.text
+        );
+    }
+    // The refusals of the door are counted, by address, as every refusal of that kind is (the noise log): in a listener
+    // that has refused nothing else, one preflight is one count.
+    let fresh = proxy_only_env();
+    let r = go(
+        &fresh,
+        preflight("/api/config", "dash.example.com").peer(stranger),
+    )
+    .await;
+    assert_eq!(answer(&r), refused(403, "direct_access_refused"));
+    fresh.audit.flush_noise();
+    let noise = fresh.audit.read(LogFile::Noise, 50, None, None);
+    assert!(
+        noise
+            .iter()
+            .any(|l| l["event"] == "auth.denied" && l["ip"] == "203.0.113.9" && l["count"] == 1),
+        "{noise:?}"
+    );
+    // ... and the peers it does answer are answered as they were: its proxy, and this machine.
+    let r = go(
+        &po,
+        through_the_proxy(preflight("/api/config", "dash.example.com")),
+    )
+    .await;
+    assert_eq!(answer(&r), passed, "the proxy's preflight: {}", r.text);
+    // A route that is public altogether is passed on to the layer too (what its router would say is public already).
+    let r = go(
+        &po,
+        through_the_proxy(preflight("/api/bridge/capabilities", "dash.example.com")),
+    )
+    .await;
+    assert_eq!(
+        answer(&r),
+        (204, None, true),
+        "a preflight of a public route (answered with the headers of a public route): {}",
+        r.text
+    );
+    let r = go(&po, preflight("/api/config", "localhost:17972")).await;
+    assert_eq!(answer(&r), passed, "this machine's preflight: {}", r.text);
+    // A `Host` that is not the server's is refused for every peer that is let in: a preflight is no exception.
+    for (who, s) in [
+        (
+            "the proxy",
+            through_the_proxy(preflight("/api/config", "evil.example")),
+        ),
+        (
+            "the proxy, asking for the private network",
+            through_the_proxy(pna(preflight("/api/config", "evil.example"))),
+        ),
+        ("this machine", preflight("/api/config", "evil.example")),
+        (
+            "this machine, asking for the private network",
+            pna(preflight("/api/config", "evil.example")),
+        ),
+    ] {
+        let r = go(&po, s).await;
+        assert_eq!(
+            answer(&r),
+            refused(421, "misdirected_host"),
+            "{who}: {}",
+            r.text
+        );
+    }
+    // TRACE of the proxy is what it always was: a method that is not served.
+    let r = go(
+        &po,
+        through_the_proxy(send(Method::TRACE, "/api/config").h("host", "dash.example.com")),
+    )
+    .await;
+    assert_eq!(answer(&r), refused(405, "method_not_allowed"), "{}", r.text);
+    // The health route is what it was: a preflight of it is answered `204` with the headers of a public route, for
+    // any peer and any Host (a page that probes this server from another origin asks), and the probe itself, `GET`
+    // and `HEAD`, passes the door from anywhere; a bare `OPTIONS` of it is what any `OPTIONS` is.
+    for peer in [stranger, "127.0.0.1:50000"] {
+        let r = go(
+            &po,
+            pna(preflight("/api/health", "evil.example")).peer(peer),
+        )
+        .await;
+        assert_eq!(
+            r.status, 204,
+            "a preflight of health from {peer}: {}",
+            r.text
+        );
+        assert!(
+            r.headers.get("access-control-allow-origin").is_some(),
+            "{peer}: {:?}",
+            r.headers
+        );
+        let r = go(
+            &po,
+            send(Method::GET, "/api/health")
+                .h("host", "evil.example")
+                .peer(peer),
+        )
+        .await;
+        assert_eq!(r.status, 200, "{peer}: {}", r.text);
+    }
+    let r = go(
+        &po,
+        send(Method::OPTIONS, "/api/health").h("host", "evil.example"),
+    )
+    .await;
+    assert_eq!(
+        r.status, 421,
+        "a bare OPTIONS of health is judged by the Host: {}",
+        r.text
+    );
+
+    // A proxied install that listens on this machine only, and a desktop-shaped one: the same, for the Host.
+    for (what, e) in [
+        ("proxied", proxied_env()),
+        ("local", env(AccessMode::Scoped)),
+    ] {
+        let r = go(&e, preflight("/api/config", "evil.example")).await;
+        assert_eq!(
+            answer(&r),
+            refused(421, "misdirected_host"),
+            "{what}: {}",
+            r.text
+        );
+        let good = if what == "proxied" {
+            "dash.example.com"
+        } else {
+            "localhost:17972"
+        };
+        let s = preflight("/api/config", good);
+        let s = if what == "proxied" {
+            through_the_proxy(s).peer("127.0.0.1:50000")
+        } else {
+            s
+        };
+        let r = go(&e, s).await;
+        assert_eq!(answer(&r), passed, "{what}: {}", r.text);
+    }
+}
+
+#[tokio::test]
+async fn t45_a_proxy_only_install_answers_its_proxy_and_this_machine_and_nothing_else() {
+    let e = proxy_only_env();
+    assert!(e.guard.config().proxy_only);
+    let through_proxy = |peer: &str| {
+        send(Method::GET, "/api/config")
+            .bearer(STATIC_TOKEN)
+            .peer(peer)
+            .h("host", "dash.example.com")
+            .add("x-forwarded-for", "203.0.113.9")
+            .add("x-forwarded-proto", "https")
+    };
+    // The proxy, in its own network (and as a mapped IPv6 address, which is the same peer).
+    for peer in [
+        "172.30.0.3:5000",
+        "172.30.0.254:5000",
+        "[::ffff:172.30.0.3]:5000",
+    ] {
+        let r = go(&e, through_proxy(peer)).await;
+        assert_eq!(r.status, 200, "{peer}: {}", r.text);
+    }
+    // Everyone else who reaches the port directly, with or without the headers a proxy would add: refused, and
+    // nothing they send in a header changes it.
+    for peer in [
+        "203.0.113.9:5000",
+        "[2001:db8::9]:5000",
+        "192.168.1.9:5000",
+        "10.0.0.7:5000",
+        "172.30.1.3:5000",
+        "172.31.0.3:5000",
+        "172.29.255.255:5000",
+        "[::ffff:172.31.0.3]:5000",
+    ] {
+        let r = go(&e, through_proxy(peer)).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (403, Some("direct_access_refused")),
+            "{peer} with the proxy's headers"
+        );
+        let r = go(
+            &e,
+            send(Method::GET, "/api/config")
+                .bearer(STATIC_TOKEN)
+                .peer(peer)
+                .h("host", "10.9.9.9:17972"),
+        )
+        .await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (403, Some("direct_access_refused")),
+            "{peer} bare"
+        );
+        // Not a credential in the world changes it, and no request is judged before it: a request with nothing
+        // (an anonymous one) is refused the same way, not with a `401` that says a credential would do.
+        let r = go(
+            &e,
+            send(Method::GET, "/api/config")
+                .peer(peer)
+                .h("host", "dash.example.com"),
+        )
+        .await;
+        assert_eq!(
+            r.code().as_deref(),
+            Some("direct_access_refused"),
+            "{peer} anonymous"
+        );
+    }
+    // Every path, routed or not: the pages a later step serves are behind the same door as the API.
+    for path in ["/", "/index.html", "/assets/app.js", "/api/no/such/route"] {
+        let r = go(
+            &e,
+            send(Method::GET, path)
+                .peer("203.0.113.9:5000")
+                .h("host", "dash.example.com"),
+        )
+        .await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (403, Some("direct_access_refused")),
+            "{path}"
+        );
+        let r = go(
+            &e,
+            send(Method::GET, path)
+                .peer("172.30.0.3:5000")
+                .h("host", "dash.example.com"),
+        )
+        .await;
+        assert_ne!(r.code().as_deref(), Some("direct_access_refused"), "{path}");
+    }
+    // This machine, straight to the port (the CLI on the server, `oaiy-server auth ...`, a check inside the
+    // container): answered, with no forwarded header. With one it is not a client of the port but a proxy that
+    // was never named.
+    for (peer, host) in [
+        ("127.0.0.1:5000", "127.0.0.1:17972"),
+        ("[::1]:5000", "[::1]:17972"),
+        ("127.0.0.1:5000", "localhost:17972"),
+    ] {
+        let r = go(
+            &e,
+            send(Method::GET, "/api/config")
+                .bearer(STATIC_TOKEN)
+                .peer(peer)
+                .h("host", host),
+        )
+        .await;
+        assert_eq!(r.status, 200, "{peer} {host}: {}", r.text);
+    }
+    let r = go(
+        &e,
+        send(Method::GET, "/api/config")
+            .bearer(STATIC_TOKEN)
+            .peer("127.0.0.1:5000")
+            .h("host", "127.0.0.1:17972")
+            .add("x-forwarded-for", "203.0.113.9"),
+    )
+    .await;
+    assert_eq!(
+        (r.status, r.code().as_deref()),
+        (403, Some("direct_access_refused"))
+    );
+}
+
+#[tokio::test]
+async fn t45_a_probe_of_health_from_a_pod_address_is_answered_by_a_proxy_only_install_and_nothing_else_is(
+) {
+    let e = proxy_only_env();
+    for m in [Method::GET, Method::HEAD] {
+        for peer in ["10.244.1.7:5000", "203.0.113.9:5000", "172.31.9.9:5000"] {
+            let r = go(
+                &e,
+                send(m.clone(), "/api/health")
+                    .peer(peer)
+                    .h("host", "10.244.1.7:17972"),
+            )
+            .await;
+            assert_eq!(r.status, 200, "{m} {peer}");
+        }
+    }
+    // Only `GET` and `HEAD` of that one path.
+    let r = go(
+        &e,
+        send(Method::POST, "/api/health")
+            .peer("10.244.1.7:5000")
+            .h("host", "10.244.1.7:17972"),
+    )
+    .await;
+    assert_eq!(r.code().as_deref(), Some("direct_access_refused"));
+    let r = go(
+        &e,
+        send(Method::GET, "/api/auth/info")
+            .peer("10.244.1.7:5000")
+            .h("host", "10.244.1.7:17972"),
+    )
+    .await;
+    assert_eq!(r.code().as_deref(), Some("direct_access_refused"));
+}
+
+#[tokio::test]
+async fn t45_an_install_that_is_not_proxy_only_does_not_refuse_direct_peers() {
+    // Bound to loopback behind a public URL (Caddy on this machine), a lan listener, and a local install: nobody is
+    // refused for not being the proxy. (The rest of the pipeline judges them as it always did.)
+    for e in [
+        proxied_env(),
+        env_with(AccessMode::Scoped, &[], true, false, Some(STATIC_TOKEN)),
+        env(AccessMode::Scoped),
+    ] {
+        assert!(!e.guard.config().proxy_only);
+        let r = go(
+            &e,
+            send(Method::GET, "/api/config")
+                .bearer(STATIC_TOKEN)
+                .peer("192.168.1.9:5000")
+                .h("host", "192.168.1.5:17972"),
+        )
+        .await;
+        assert_ne!(r.code().as_deref(), Some("direct_access_refused"));
+    }
+}
+
+#[tokio::test]
+async fn t30_a_forged_forwarded_for_from_an_untrusted_peer_is_ignored_and_dodges_no_throttle() {
+    let e = proxied_env();
+    // Twenty wrong bearers from one untrusted address, each with another forged client address: they are all that
+    // address, and it is blocked at the twentieth.
+    let wrong = format!("oaiypat_0123456789abcdef_{}", "A".repeat(43));
+    for i in 0..20 {
+        let r = go(
+            &e,
+            send(Method::GET, "/api/config")
+                .bearer(&wrong)
+                .peer("198.51.100.7:4000")
+                .h("host", "dash.example.com")
+                .add("x-forwarded-for", &format!("203.0.113.{}", i + 1))
+                .add("x-forwarded-proto", "https"),
+        )
+        .await;
+        assert_eq!(r.status, 401, "guess {i}: {}", r.text);
+    }
+    let r = go(
+        &e,
+        send(Method::GET, "/api/config")
+            .bearer(&wrong)
+            .peer("198.51.100.7:4000")
+            .h("host", "dash.example.com")
+            .add("x-forwarded-for", "203.0.113.200")
+            .add("x-forwarded-proto", "https"),
+    )
+    .await;
+    assert_eq!(
+        (r.status, r.code().as_deref()),
+        (429, Some("rate_limited")),
+        "the forged addresses did not spread the guesses"
+    );
+    // Nor did the forgery blame a client for what the peer did: 203.0.113.1 is not blocked, as a client of the
+    // real proxy.
+    let r = go(
+        &e,
+        send(Method::GET, "/api/config")
+            .bearer(&wrong)
+            .h("host", "dash.example.com")
+            .add("x-forwarded-for", "203.0.113.1")
+            .add("x-forwarded-proto", "https"),
+    )
+    .await;
+    assert_eq!(r.status, 401);
+    // What the server understood of a forged header: the peer, on an insecure channel.
+    let r = go(
+        &e,
+        send(Method::GET, "/api/auth/info")
+            .peer("198.51.100.8:4000")
+            .h("host", "dash.example.com")
+            .add("x-forwarded-for", "10.0.0.1")
+            .add("x-forwarded-host", "dash.example.com")
+            .add("x-forwarded-proto", "https"),
+    )
+    .await;
+    let seen = &r.json()["seen"];
+    assert_eq!(
+        (
+            seen["clientIp"].as_str(),
+            seen["viaTrustedProxy"].as_bool(),
+            seen["proto"].as_str()
+        ),
+        (Some("198.51.100.8"), Some(false), Some("http"))
+    );
+    assert_eq!(r.json()["secureChannel"], false);
+}
+
+#[tokio::test]
+async fn t30_only_x_forwarded_for_names_a_client_and_the_other_forwarded_headers_are_never_believed(
+) {
+    let e = proxied_env();
+    let info = |extra: &[(&str, &str)]| {
+        let mut s = send(Method::GET, "/api/auth/info")
+            .h("host", "dash.example.com")
+            .add("x-forwarded-proto", "https");
+        for (n, v) in extra {
+            s = s.add(n, v);
+        }
+        s
+    };
+    // A trusted proxy (the default: this machine) that names a client only in another header: the client is the
+    // proxy, and it is not a client the server can tell from its neighbours (a warning is logged once).
+    for header in [
+        ("forwarded", "for=203.0.113.9;proto=https"),
+        ("forwarded", "for=\"[2001:db8::9]\""),
+        ("x-real-ip", "203.0.113.9"),
+        ("cf-connecting-ip", "203.0.113.9"),
+        ("true-client-ip", "203.0.113.9"),
+        ("x-client-ip", "203.0.113.9"),
+        ("x-forwarded-host", "203.0.113.9"),
+        ("via", "1.1 203.0.113.9"),
+    ] {
+        let r = go(&e, info(&[header])).await;
+        assert_eq!(
+            r.json()["seen"]["clientIp"],
+            "127.0.0.1",
+            "{}: {}",
+            header.0,
+            r.text
+        );
+    }
+    // With `X-Forwarded-For` beside them, that one is the answer, whatever the others say.
+    let r = go(
+        &e,
+        info(&[
+            ("x-forwarded-for", "203.0.113.9"),
+            ("x-real-ip", "198.51.100.1"),
+            ("cf-connecting-ip", "198.51.100.2"),
+            ("forwarded", "for=198.51.100.3"),
+        ]),
+    )
+    .await;
+    assert_eq!(r.json()["seen"]["clientIp"], "203.0.113.9");
+    // Several `X-Forwarded-For` lines are one list, walked from the right: the left ones are the client's own.
+    let r = go(
+        &e,
+        info(&[
+            ("x-forwarded-for", "198.51.100.66"),
+            ("x-forwarded-for", "2001:db8::66, 203.0.113.9"),
+            ("x-forwarded-for", "127.0.0.1"),
+        ]),
+    )
+    .await;
+    assert_eq!(r.json()["seen"]["clientIp"], "203.0.113.9");
+    // One entry that is not an address, anywhere: none of it is believed.
+    for bad in [
+        "203.0.113.9, unknown",
+        "unknown, 203.0.113.9",
+        "203.0.113.9:443",
+        "[2001:db8::9]",
+    ] {
+        let r = go(&e, info(&[("x-forwarded-for", bad)])).await;
+        assert_eq!(r.json()["seen"]["clientIp"], "127.0.0.1", "{bad}");
+    }
+}
+
+#[tokio::test]
+async fn t30_a_trusted_proxy_that_names_no_client_is_warned_of_once_a_minute_and_the_loopback_cli_is_not(
+) {
+    let e = proxied_env();
+    assert_eq!(e.guard.no_forwarded_for_lines(), 0);
+    // The CLI on this machine (a trusted peer by default) reaches the port by a loopback name and sends no header:
+    // that is not a proxy that forgot one.
+    for _ in 0..3 {
+        let r = go(&e, send(Method::GET, "/api/auth/info")).await;
+        assert_eq!(r.json()["seen"]["clientIp"], "127.0.0.1");
+    }
+    assert_eq!(
+        e.guard.no_forwarded_for_lines(),
+        0,
+        "the loopback CLI is not a proxy"
+    );
+    // A proxy: the public host, and no `X-Forwarded-For`. Every client is the proxy's address; one line a minute.
+    let via_proxy = || {
+        send(Method::GET, "/api/auth/info")
+            .h("host", "dash.example.com")
+            .add("x-forwarded-proto", "https")
+    };
+    for _ in 0..5 {
+        let r = go(&e, via_proxy()).await;
+        assert_eq!(
+            (
+                r.json()["seen"]["clientIp"].as_str(),
+                r.json()["seen"]["viaTrustedProxy"].as_bool()
+            ),
+            (Some("127.0.0.1"), Some(true))
+        );
+    }
+    assert_eq!(e.guard.no_forwarded_for_lines(), 1, "logged once");
+    e.clock.advance(61_000);
+    go(&e, via_proxy()).await;
+    assert_eq!(
+        e.guard.no_forwarded_for_lines(),
+        2,
+        "and again a minute later"
+    );
+    // With a client named, or from a peer that is not trusted, there is nothing to say.
+    go(&e, via_proxy().add("x-forwarded-for", "203.0.113.9")).await;
+    go(&e, via_proxy().peer("198.51.100.7:4000")).await;
+    e.clock.advance(61_000);
+    go(&e, via_proxy().add("x-forwarded-for", "203.0.113.9")).await;
+    go(&e, via_proxy().peer("198.51.100.7:4000")).await;
+    assert_eq!(e.guard.no_forwarded_for_lines(), 2);
+}
+
+#[tokio::test]
+async fn t30_a_forwarded_for_line_that_is_not_text_makes_the_whole_header_unusable_not_absent() {
+    let e = proxied_env();
+    let ask = |lines: &[&[u8]]| {
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/auth/info")
+            .header("host", "dash.example.com")
+            .header("x-forwarded-proto", "https");
+        for l in lines {
+            req = req.header(
+                "x-forwarded-for",
+                axum::http::HeaderValue::from_bytes(l).unwrap(),
+            );
+        }
+        let mut req = req.body(Body::empty()).unwrap();
+        req.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:50000".parse::<SocketAddr>().unwrap(),
+        ));
+        req
+    };
+    // Bytes that are not visible ASCII in a line of the header: the line is an entry that is not an address, so none of
+    // the header is believed (the readable line beside it is the client's to write as much as the unreadable one).
+    for lines in [
+        vec![&b"198.51.100.66\xff"[..], &b"203.0.113.9"[..]],
+        vec![&b"203.0.113.9"[..], &b"\xe9"[..]],
+        vec![&b"\x80"[..]],
+    ] {
+        let response = e.app.clone().oneshot(ask(&lines)).await.unwrap();
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["seen"]["clientIp"], "127.0.0.1", "{lines:?}");
+    }
+    let response = e.app.clone().oneshot(ask(&[b"203.0.113.9"])).await.unwrap();
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["seen"]["clientIp"], "203.0.113.9");
+}
+
+#[tokio::test]
+async fn t45_a_docker_bridge_peer_is_a_client_until_the_operator_names_its_network() {
+    // A proxy container's peer is a bridge address, and the loopback-only default does not trust it: the address the
+    // server sees is the proxy's, for everyone (`seen` says so). With the compose network named it is the client's.
+    let default = env_with(
+        AccessMode::Scoped,
+        &[("OAIY_PUBLIC_URL", "https://dash.example.com")],
+        false,
+        false,
+        Some(STATIC_TOKEN),
+    );
+    let named = proxy_only_env();
+    async fn ask(e: &Env) -> Reply {
+        go(
+            e,
+            send(Method::GET, "/api/auth/info")
+                .peer("172.30.0.3:5000")
+                .h("host", "dash.example.com")
+                .add("x-forwarded-for", "203.0.113.9")
+                .add("x-forwarded-proto", "https"),
+        )
+        .await
+    }
+    let r = ask(&default).await;
+    assert_eq!(
+        (
+            r.json()["seen"]["clientIp"].as_str(),
+            r.json()["secureChannel"].as_bool()
+        ),
+        (Some("172.30.0.3"), Some(false)),
+        "not trusted: its word is worth nothing"
+    );
+    let r = ask(&named).await;
+    assert_eq!(
+        (
+            r.json()["seen"]["clientIp"].as_str(),
+            r.json()["seen"]["viaTrustedProxy"].as_bool(),
+            r.json()["secureChannel"].as_bool()
+        ),
+        (Some("203.0.113.9"), Some(true), Some(true))
+    );
+}
+
+#[tokio::test]
+async fn t45_a_bearer_from_a_public_peer_on_a_lan_listener_is_refused_in_every_way_an_address_can_be_written(
+) {
+    let lan = env_with(AccessMode::Scoped, &[], true, false, Some(STATIC_TOKEN));
+    let ask = |peer: &str| {
+        go(
+            &lan,
+            send(Method::GET, "/api/config")
+                .bearer(STATIC_TOKEN)
+                .peer(peer)
+                .h("host", "192.168.1.5:17972"),
+        )
+    };
+    for peer in [
+        "203.0.113.50:4000",
+        "8.8.8.8:4000",
+        "172.32.0.1:4000",
+        "172.15.255.255:4000",
+        "100.128.0.1:4000",
+        "100.63.255.255:4000",
+        "192.169.0.1:4000",
+        "[2001:db8::9]:4000",
+        "[2606:4700::1]:4000",
+        "[fb00::1]:4000",
+        "[::ffff:203.0.113.50]:4000",
+        "[::ffff:8.8.8.8]:4000",
+    ] {
+        let r = ask(peer).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (403, Some("plaintext_from_public_address")),
+            "{peer}"
+        );
+    }
+    for peer in [
+        "10.0.0.1:4000",
+        "172.16.0.1:4000",
+        "172.31.255.255:4000",
+        "192.168.255.1:4000",
+        "100.64.0.1:4000",
+        "100.127.255.255:4000",
+        "169.254.1.1:4000",
+        "127.0.0.1:4000",
+        "[::1]:4000",
+        "[fd12:3456::1]:4000",
+        "[fc00::1]:4000",
+        "[fe80::1]:4000",
+        "[::ffff:192.168.1.9]:4000",
+        "[::ffff:127.0.0.1]:4000",
+    ] {
+        let r = ask(peer).await;
+        assert_eq!(r.status, 200, "{peer}: {}", r.text);
+    }
+    // The header a client would forge to look private changes nothing: it is not read on a lan listener
+    // (no proxy is trusted there), and the peer is what is judged.
+    let r = go(
+        &lan,
+        send(Method::GET, "/api/config")
+            .bearer(STATIC_TOKEN)
+            .peer("203.0.113.50:4000")
+            .h("host", "192.168.1.5:17972")
+            .add("x-forwarded-for", "192.168.1.9"),
+    )
+    .await;
+    assert_eq!(r.code().as_deref(), Some("plaintext_from_public_address"));
+}
+
+#[tokio::test]
+async fn t45_a_lan_listener_with_a_trusted_proxy_judges_the_bearer_by_the_peer_and_not_by_the_forwarded_client(
+) {
+    // A proxy on the private network in front of a lan listener: the plaintext rule is about the connection the
+    // bearer travels on, which is the proxy's, not the client's.
+    let e = env_with(
+        AccessMode::Scoped,
+        &[("OAIY_TRUSTED_PROXIES", "10.0.0.0/8")],
+        true,
+        false,
+        Some(STATIC_TOKEN),
+    );
+    let r = go(
+        &e,
+        send(Method::GET, "/api/config")
+            .bearer(STATIC_TOKEN)
+            .peer("10.1.1.1:4000")
+            .h("host", "192.168.1.5:17972")
+            .add("x-forwarded-for", "203.0.113.9"),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    // A public peer that says it is that proxy is a public peer.
+    let r = go(
+        &e,
+        send(Method::GET, "/api/config")
+            .bearer(STATIC_TOKEN)
+            .peer("203.0.113.9:4000")
+            .h("host", "192.168.1.5:17972")
+            .add("x-forwarded-for", "10.1.1.1"),
+    )
+    .await;
+    assert_eq!(r.code().as_deref(), Some("plaintext_from_public_address"));
+}
+
+#[test]
+fn a_desktop_ignores_the_settings_of_a_proxy_and_is_never_a_proxied_install() {
+    // Design 3.4: the desktop's API is on loopback only. Its environment can name a proxy all it likes.
+    let vars = |name: &str| match name {
+        "OAIY_PUBLIC_URL" => Some("https://dash.example.com".to_string()),
+        "OAIY_AGENT_URL" => Some("https://agent.example.com".to_string()),
+        "OAIY_TRUSTED_PROXIES" => Some("10.0.0.0/8".to_string()),
+        "OAIY_ALLOW_PUBLIC_PLAINTEXT" => Some("1".to_string()),
+        "OAIY_ALLOWED_HOSTS" => Some("nas.example:9000".to_string()),
+        _ => None,
+    };
+    let (c, warnings) = GuardConfig::from_env(&vars, false, true, 17972);
+    assert_eq!(c.exposure, super::mode::Exposure::Local);
+    assert!(c.trusted.is_empty() && !c.allow_public_plaintext && !c.proxy_only);
+    assert_eq!(warnings.len(), 4, "{warnings:?}");
+    assert!(warnings.iter().all(|w| w.contains("ignored")));
+    // A server reads them.
+    let (c, _) = GuardConfig::from_env(&vars, false, false, 17972);
+    assert_eq!(c.exposure, super::mode::Exposure::Proxied);
+    assert!(!c.trusted.is_empty());
+}
+
+#[tokio::test]
+async fn t45_the_desktops_host_allow_list_is_the_loopback_names_on_any_port_and_nothing_else() {
+    let e = env(AccessMode::Scoped);
+    for host in [
+        "localhost:17972",
+        "127.0.0.1:9999",
+        "[::1]:17972",
+        "LOCALHOST",
+        "127.0.0.1",
+    ] {
+        let r = go(
+            &e,
+            send(Method::GET, "/api/config")
+                .bearer(STATIC_TOKEN)
+                .h("host", host),
+        )
+        .await;
+        assert_eq!(r.status, 200, "{host}");
+    }
+    for host in [
+        "dash.oaiy.localhost:17972",
+        "oaiy.localhost",
+        "evil.example:17972",
+        "127.0.0.1.evil.example:17972",
+        "192.168.1.5:17972",
+        "",
+    ] {
+        let r = go(
+            &e,
+            send(Method::GET, "/api/config")
+                .bearer(STATIC_TOKEN)
+                .h("host", host),
+        )
+        .await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (421, Some("misdirected_host")),
+            "{host:?}"
+        );
+    }
+}
+
+// ===== the shapes of 4.5.5 from a validated configuration, with fake peers and no socket beyond loopback =====
+//
+// A default run of the tests opens nothing on a network address (a listener on 0.0.0.0 makes Windows Firewall ask the
+// owner). These build the guard the way `oaiy-server` does, from `exposure::evaluate`, so that the lan and the
+// proxy-only shapes, whose whole point is a bind beyond loopback, are exercised end to end from the environment to the
+// answer without one. The tests that start the real program on a network address are `#[ignore]`d in
+// `tests/access_exposure.rs` (`OAIY_TEST_LAN=1`).
+
+#[tokio::test]
+async fn t45_a_proxy_only_install_built_from_its_environment_answers_its_proxy_and_this_machine_only(
+) {
+    let e = env_validated(
+        &[
+            ("OAIY_SERVER_BIND", "0.0.0.0"),
+            ("OAIY_PUBLIC_URL", "https://dash.example.com"),
+            ("OAIY_TRUSTED_PROXIES", "172.30.0.0/24"),
+            ("OAIY_SERVER_TOKEN", STATIC_TOKEN),
+        ],
+        false,
+    );
+    let cfg = e.guard.config();
+    assert!(cfg.proxy_only && cfg.exposure == super::mode::Exposure::Proxied && cfg.port == 17972);
+    let via = |peer: &str| {
+        send(Method::GET, "/api/config")
+            .bearer(STATIC_TOKEN)
+            .peer(peer)
+            .h("host", "dash.example.com")
+            .add("x-forwarded-for", "203.0.113.9")
+            .add("x-forwarded-proto", "https")
+    };
+    assert_eq!(go(&e, via("172.30.0.3:5000")).await.status, 200);
+    for peer in [
+        "203.0.113.9:5000",
+        "192.168.1.9:5000",
+        "172.31.0.3:5000",
+        "[2001:db8::9]:5000",
+    ] {
+        let r = go(&e, via(peer)).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (403, Some("direct_access_refused")),
+            "{peer}"
+        );
+    }
+    // The CLI on the server: this machine, no forwarded header, a loopback name.
+    let cli = send(Method::GET, "/api/config").bearer(STATIC_TOKEN);
+    assert_eq!(go(&e, cli.clone()).await.status, 200);
+    // With one it is a proxy that was never named.
+    let r = go(&e, cli.add("x-forwarded-for", "203.0.113.9")).await;
+    assert_eq!(r.code().as_deref(), Some("direct_access_refused"));
+    // A probe from a pod address.
+    let r = go(
+        &e,
+        send(Method::GET, "/api/health")
+            .peer("10.244.1.7:5000")
+            .h("host", "10.244.1.7:17972"),
+    )
+    .await;
+    assert_eq!(r.status, 200);
+}
+
+#[tokio::test]
+async fn t45_a_lan_install_built_from_its_environment_is_bearer_only_and_takes_a_bearer_from_private_addresses(
+) {
+    // A lan bind needs an owner (the facts say there is one); the port is the configured one, and it is the port a
+    // host is judged by.
+    let e = env_validated(
+        &[
+            ("OAIY_SERVER_BIND", "192.168.1.5"),
+            ("OAIY_SERVER_PORT", "8443"),
+            ("OAIY_SERVER_TOKEN", STATIC_TOKEN),
+        ],
+        true,
+    );
+    let cfg = e.guard.config();
+    assert!(!cfg.proxy_only && cfg.exposure == super::mode::Exposure::Lan && cfg.port == 8443);
+    let ask = |peer: &str, host: &str| {
+        send(Method::GET, "/api/config")
+            .bearer(STATIC_TOKEN)
+            .peer(peer)
+            .h("host", host)
+    };
+    // The bound port is what an address is answered on: the default port is not.
+    assert_eq!(
+        go(&e, ask("192.168.1.9:4000", "192.168.1.5:8443"))
+            .await
+            .status,
+        200
+    );
+    for host in ["192.168.1.5:17972", "192.168.1.5", "nas.local:8443"] {
+        let r = go(&e, ask("192.168.1.9:4000", host)).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (421, Some("misdirected_host")),
+            "{host}"
+        );
+    }
+    // A bearer from a public address is refused, and nothing a client forges makes it look private.
+    for peer in [
+        "203.0.113.50:4000",
+        "[2001:db8::9]:4000",
+        "[::ffff:8.8.8.8]:4000",
+    ] {
+        let r = go(&e, ask(peer, "192.168.1.5:8443")).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (403, Some("plaintext_from_public_address")),
+            "{peer}"
+        );
+    }
+    let r = go(
+        &e,
+        ask("203.0.113.50:4000", "192.168.1.5:8443").add("x-forwarded-for", "192.168.1.9"),
+    )
+    .await;
+    assert_eq!(r.code().as_deref(), Some("plaintext_from_public_address"));
+    // From a private one it is taken, and no channel there is secure.
+    for peer in [
+        "192.168.1.9:4000",
+        "10.0.0.7:4000",
+        "100.64.1.1:4000",
+        "[fd12::5]:4000",
+    ] {
+        assert_eq!(
+            go(&e, ask(peer, "192.168.1.5:8443")).await.status,
+            200,
+            "{peer}"
+        );
+    }
+    let r = go(
+        &e,
+        send(Method::GET, "/api/auth/info")
+            .peer("192.168.1.9:4000")
+            .h("host", "192.168.1.5:8443"),
+    )
+    .await;
+    assert_eq!(r.json()["secureChannel"], false);
+    // The operator may say otherwise, and the answer follows the setting.
+    let e = env_validated(
+        &[
+            ("OAIY_SERVER_BIND", "lan"),
+            ("OAIY_ALLOW_PUBLIC_PLAINTEXT", "1"),
+            ("OAIY_SERVER_TOKEN", STATIC_TOKEN),
+        ],
+        true,
+    );
+    assert!(e.guard.config().allow_public_plaintext);
+    assert_eq!(
+        go(&e, ask("203.0.113.50:4000", "192.168.1.5:17972"))
+            .await
+            .status,
+        200
+    );
+}
+
+#[tokio::test]
+async fn t45_a_local_install_built_from_its_environment_refuses_every_forwarded_header_and_a_proxied_one_believes_only_its_proxy(
+) {
+    let local = env_validated(&[("OAIY_SERVER_TOKEN", STATIC_TOKEN)], false);
+    assert!(local.guard.config().exposure == super::mode::Exposure::Local);
+    for name in [
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "forwarded",
+        "via",
+        "x-real-ip",
+        "cf-connecting-ip",
+        "true-client-ip",
+    ] {
+        let r = go(
+            &local,
+            send(Method::GET, "/api/config")
+                .bearer(STATIC_TOKEN)
+                .add(name, "203.0.113.9"),
+        )
+        .await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (421, Some("proxy_detected")),
+            "{name}"
+        );
+    }
+    // Behind a proxy on this machine (the default), with the loopback default replaced by the operator's own list.
+    let named = env_validated(
+        &[
+            ("OAIY_PUBLIC_URL", "https://dash.example.com"),
+            ("OAIY_TRUSTED_PROXIES", "192.0.2.7"),
+        ],
+        false,
+    );
+    let info = |peer: &str| {
+        send(Method::GET, "/api/auth/info")
+            .peer(peer)
+            .h("host", "dash.example.com")
+            .add("x-forwarded-for", "203.0.113.9")
+            .add("x-forwarded-proto", "https")
+    };
+    let r = go(&named, info("192.0.2.7:4000")).await;
+    assert_eq!(r.json()["seen"]["clientIp"], "203.0.113.9");
+    assert_eq!(r.json()["secureChannel"], true);
+    for peer in ["127.0.0.1:4000", "192.0.2.8:4000", "[::1]:4000"] {
+        let r = go(&named, info(peer)).await;
+        assert_ne!(r.json()["seen"]["clientIp"], "203.0.113.9", "{peer}");
+        assert_eq!(r.json()["secureChannel"], false, "{peer}");
+    }
+    let default = env_validated(&[("OAIY_PUBLIC_URL", "https://dash.example.com")], false);
+    let r = go(&default, info("127.0.0.1:4000")).await;
+    assert_eq!(r.json()["seen"]["clientIp"], "203.0.113.9");
+}
+
+/// The release builds the headless server with the web login, whose mode is `scoped`, and its smoke test of the
+/// distribution (`scripts/smoke-server.mjs`) does what this does: with the static token, the routes it uses, and
+/// without a credential, a refusal (401 of `scoped`, where `legacy` said 403) whatever the Origin says.
+#[tokio::test]
+async fn the_release_smoke_test_of_the_headless_distribution_passes_a_scoped_server_with_its_token()
+{
+    let e = env_with(AccessMode::Scoped, &[], false, false, Some(STATIC_TOKEN));
+    for (m, p) in [
+        (Method::GET, "/api/health"),
+        (Method::GET, "/api/node"),
+        (Method::PUT, "/api/bridge/flows/audit-smoke"),
+        (Method::POST, "/api/bridge/runs"),
+        (Method::GET, "/api/bridge/runs/run_1"),
+    ] {
+        let r = go(&e, send(m.clone(), p).bearer(STATIC_TOKEN)).await;
+        assert_eq!(r.status, 200, "{m} {p}: {}", r.text);
+    }
+    for origin in [None, Some("https://oaiy.com"), Some("tauri://localhost")] {
+        let s = send(Method::GET, "/api/config");
+        let s = match origin {
+            Some(o) => s.h("origin", o),
+            None => s,
+        };
+        let r = go(&e, s).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (401, Some("auth_required")),
+            "{origin:?}: {}",
+            r.text
+        );
+    }
 }

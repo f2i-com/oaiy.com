@@ -32,8 +32,10 @@
 //!
 //! # The switch and the log
 //!
-//! `<data>/control.json` holds `{"agentMayChange": true}` (the default). While
-//! it is false the change tools refuse and the read tools still work. Every
+//! `<data>/control.json` holds `{"agentMayChange": true}` (the default on a local
+//! install; off on a proxied or lan one, where nobody has said yet: design
+//! 4.5.5). While it is false the change tools refuse and the read tools still
+//! work. Every
 //! change-tool call, refused or not, is one line of `<data>/control-log.jsonl`
 //! (see [`audit`]); read tools are not logged.
 
@@ -138,6 +140,9 @@ pub struct Control {
 
 struct Inner {
     data_dir: PathBuf,
+    /// What the switch is when the person has not said: on for a local install, off for one that can be reached
+    /// through a proxy or from a network (design 4.5.5).
+    default_on: bool,
     /// One writer of `control.json` at a time.
     settings_lock: Mutex<()>,
     audit: audit::Log,
@@ -151,24 +156,37 @@ struct Inner {
 }
 
 impl Control {
+    /// A local install: the switch is on unless the person switched it off.
     pub fn new(data_dir: &Path) -> Control {
-        Control::build(data_dir, None)
+        Control::build(data_dir, None, true)
+    }
+
+    /// For an install with this exposure: `agentMayChange` is what `control.json` says, and where the file
+    /// (or its field) is absent, on for a local install (as it has always been) and **off** for a proxied or
+    /// lan one, where a prompt-injected Agent could reach further than the person at the keyboard.
+    pub fn with_exposure(data_dir: &Path, exposure: crate::auth::mode::Exposure) -> Control {
+        Control::build(
+            data_dir,
+            None,
+            exposure == crate::auth::mode::Exposure::Local,
+        )
     }
 
     /// For tests: its own navigator, and no engines.
     #[cfg(test)]
     pub(crate) fn with_navigator(data_dir: &Path, navigator: Option<Navigator>) -> Control {
-        let mut control = Control::build(data_dir, navigator);
+        let mut control = Control::build(data_dir, navigator, true);
         if let Some(inner) = Arc::get_mut(&mut control.inner) {
             inner.engines = Some(None);
         }
         control
     }
 
-    fn build(data_dir: &Path, navigator: Option<Navigator>) -> Control {
+    fn build(data_dir: &Path, navigator: Option<Navigator>, default_on: bool) -> Control {
         Control {
             inner: Arc::new(Inner {
                 data_dir: data_dir.to_path_buf(),
+                default_on,
                 settings_lock: Mutex::new(()),
                 audit: audit::Log::new(data_dir.join(LOG_FILE)),
                 router: OnceLock::new(),
@@ -203,11 +221,12 @@ impl Control {
         self.inner.data_dir.join(SETTINGS_FILE)
     }
 
-    /// The switch. No file (or no field) is the default, on; a file that
-    /// cannot be read is off, so a person who switched it off is never
-    /// switched back on by a damaged file.
+    /// The switch. No file (or no field) is the default: on for a local
+    /// install, off for a proxied or lan one; a file that cannot be read is
+    /// off, so a person who switched it off is never switched back on by a
+    /// damaged file.
     pub fn agent_may_change(&self) -> bool {
-        read_switch(&self.settings_path())
+        read_switch(&self.settings_path(), self.inner.default_on)
     }
 
     pub fn set_agent_may_change(&self, on: bool) -> Result<bool, String> {
@@ -227,16 +246,16 @@ impl Control {
     }
 }
 
-fn read_switch(path: &Path) -> bool {
+fn read_switch(path: &Path, default_on: bool) -> bool {
     match std::fs::read_to_string(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => default_on,
         Err(e) => {
             log::warn!("control: {} could not be read ({e}): the Agent may not change OAIY until it is saved again", path.display());
             false
         }
         Ok(text) => match serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')) {
             Ok(v) => match v.get("agentMayChange") {
-                None | Some(Value::Null) => true,
+                None | Some(Value::Null) => default_on,
                 Some(Value::Bool(b)) => *b,
                 Some(_) => false,
             },

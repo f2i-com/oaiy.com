@@ -1449,14 +1449,12 @@ async fn access_guard(
 
 pub async fn serve(
     port: u16,
-    // Bind every interface instead of loopback only.
+    // The address to listen on: loopback unless the person running it said otherwise.
     //
-    // Off by default and never inferred: it widens the reachable surface from
-    // "this machine" to "anything that can route here", which is a decision for
-    // the person running it, not for us. It exists because the editor is useful
-    // from a phone on the same network, and a loopback-only server can never
-    // serve that no matter what address the phone is given.
-    bind_all: bool,
+    // Never inferred: an address other machines can reach widens the surface from "this machine" to "anything
+    // that can route here", which is a decision for the person running it, not for us (`OAIY_SERVER_BIND`,
+    // and the startup rules of `auth::exposure` that go with it). The desktop always passes loopback.
+    bind: std::net::IpAddr,
     config: Arc<dyn ConfigProvider>,
     // Optional bearer token gating privileged routes for non-browser clients.
     auth_token: Option<String>,
@@ -1491,7 +1489,13 @@ pub async fn serve(
     // The access mode (`legacy` keeps every route that existed before the access model exactly as it was).
     access: crate::auth::AccessSettings,
 ) -> Result<(), BoxError> {
-    validate_listener_auth(bind_all, auth_token.as_deref())?;
+    let bind_all = !crate::auth::clientip::unmap(bind).is_loopback();
+    // A server that passed the startup rules has been told what a network bind needs (an owner login, and a
+    // named proxy behind a public URL): the bearer token is no stand-in for a login. Anything else that binds
+    // beyond loopback still needs the token it always needed.
+    if access.config.is_none() {
+        validate_listener_auth(bind_all, auth_token.as_deref())?;
+    }
     // The access guard: in `legacy` mode it holds nothing on disk; otherwise it opens `<data>/auth`.
     let data_dir_for_auth = registry
         .lock()
@@ -1515,8 +1519,10 @@ pub async fn serve(
     // store does, a file it cannot read (a mangled or unreadable owner file is a startup error, never setup-only).
     #[cfg(feature = "web")]
     let login = if access.mode.is_enforcing() && !gui_mode && crate::auth::login::can_host(&guard) {
-        let opts =
-            crate::auth::login::LoginOptions::production(&|name| std::env::var(name).ok(), port)?;
+        let opts = match &access.config {
+            Some(config) => crate::auth::login::LoginOptions::from_config(config, port),
+            None => crate::auth::login::LoginOptions::production(&|name| std::env::var(name).ok(), port)?,
+        };
         let state = crate::auth::login::enable(&guard, &data_dir_for_auth.join("auth"), opts)?;
         tokio::spawn(crate::auth::login::maintain_forever(state.clone()));
         // One banner with no secret in it: not through the log facade, which the journal and the ring keep.
@@ -1582,8 +1588,11 @@ pub async fn serve(
         crate::messages::init(&dir);
     }
     // The Agent's control API: its switch and its log live in the data folder too.
-    let control = crate::control::Control::new(
+    // Whether the Agent may change OAIY when the person has not said (no `control.json`) depends on how the install
+    // can be reached: on for a local one, as it has always been, off for a proxied or lan one (design 4.5.5).
+    let control = crate::control::Control::with_exposure(
         &registry.lock().map(|r| r.data_dir().to_path_buf()).unwrap_or_else(|_| std::env::temp_dir().join("oaiy-control-unavailable")),
+        guard.config().exposure,
     );
     // Which modules (the phone, the calendar) a plugin provides: worked out now, then kept up to date.
     crate::modules::start(bridge.plugins.clone());
@@ -1745,18 +1754,21 @@ pub async fn serve(
     // router and its gate (see `control/`).
     control.set_router(app.clone());
 
-    let addr = SocketAddr::from((
-        if bind_all { [0, 0, 0, 0] } else { [127, 0, 0, 1] },
-        port,
-    ));
+    let addr = SocketAddr::new(bind, port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
+    // Every bound address is logged, and the exposure with it (design 4.5.5).
+    let bound = listener.local_addr().unwrap_or(addr);
     if bind_all {
         log::warn!(
-            "OAIY API listening on http://{addr} — reachable from the NETWORK, not just this machine"
+            "OAIY API listening on http://{bound} ({} install) — reachable from the NETWORK, not just this machine",
+            guard.config().exposure.name()
         );
     } else {
-        log::info!("OAIY API listening on http://{addr}");
+        log::info!(
+            "OAIY API listening on http://{bound} ({} install)",
+            guard.config().exposure.name()
+        );
     }
     // The console's credential and the port it is on are written only now that the listener is bound: a console that
     // finds them finds a server that answers. (A clean exit removes them; the binary does that.)
@@ -1770,6 +1782,14 @@ pub async fn serve(
                     "auth: the console cannot reach this server: {e}"
                 ))
             );
+        }
+    }
+    // What this install is, in words, with no secret in it (the audit log's startup event has it too): now that the
+    // credential store is open and the listener is bound, so that "listening on" is true. One banner, not through the
+    // log facade, which the journal and the ring keep. (A server that stops before this says why in one line.)
+    if let Some(config) = &access.config {
+        for line in config.banner_lines() {
+            eprintln!("{line}");
         }
     }
     // With the peer's address on each request: the new guard needs it (a `desk` credential works only from

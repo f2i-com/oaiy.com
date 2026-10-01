@@ -12,6 +12,8 @@
 //! - [`audit`], [`scrub`]: the audit and noise logs, and the scrub every log line passes through.
 //! - [`guard`], [`mode`], [`host`], [`clientip`], [`exposure_checks`], [`bearer_throttle`], [`cors`]:
 //!   the request pipeline, and the access mode that decides which requests it judges.
+//! - [`exposure`]: how an install can be reached (local, proxied, lan) and the startup rules that refuse a
+//!   configuration that would expose it wrongly.
 //! - [`api`], [`runtime`]: the routes that exist (`/api/auth/info`, `whoami`, `derive`) and the assembly of
 //!   a guard for a running server.
 
@@ -31,6 +33,7 @@ pub mod cors;
 #[cfg(feature = "web")]
 pub mod device;
 pub mod export;
+pub mod exposure;
 pub mod exposure_checks;
 pub mod guard;
 pub mod host;
@@ -60,6 +63,7 @@ pub mod store;
 #[cfg(feature = "web")]
 pub mod throttle;
 pub mod token;
+mod token_words;
 #[cfg(feature = "web")]
 pub mod wordlist;
 
@@ -67,6 +71,8 @@ pub use guard::{Guard, GuardConfig, HealthExtras};
 pub use mode::{AccessMode, ConfigRefusal, Exposure};
 pub use runtime::{build_guard, flush_installed, AccessSettings};
 
+#[cfg(test)]
+mod clientip_crosscheck;
 #[cfg(test)]
 mod conformance;
 #[cfg(test)]

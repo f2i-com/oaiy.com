@@ -23,7 +23,10 @@ use std::time::{Duration, Instant};
 use oaiy_desktop_lib::auth::routes::{Class, Route, Verb, ROUTES};
 use serde_json::Value;
 
-const TOKEN: &str = "integration-test-token";
+/// A static token the server takes (`auth::token::check_static_token_shape`: 32 to 256 printable characters,
+/// no common pattern and no word an example is made of). One that fails it is a startup refusal (`oaiy-server` exits
+/// 78: see the test of rule 5 below).
+const TOKEN: &str = "34kI-kQagl-ZBnGbe5K5cFscsUBdYtkk7Hc9s9Z-EEM";
 
 /// A folder of the test's own, removed when the test ends.
 struct Scratch(PathBuf);
@@ -638,7 +641,24 @@ fn a_scoped_server_takes_the_static_token_in_the_shape_the_design_gives_it() {
     // `OAIY_SERVER_TOKEN` is 32 to 256 printable characters (design 4.1), which is wider than the strict
     // bearer rule (`[A-Za-z0-9._~+/=-]`, 128 bytes): a token with a `$` in it, or one of 200 characters, must
     // not be a `400` in front of the server that was configured with it.
-    let long: String = ('!'..='~').cycle().take(200).collect();
+    // 200 printable characters that the rule takes: the first of a seeded xorshift series that it does.
+    let long: String = (1u64..5000)
+        .map(|seed| {
+            let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            (0..200)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (0x21 + (x % 94) as u8) as char
+                })
+                .collect::<String>()
+        })
+        .find(|t| {
+            oaiy_desktop_lib::auth::token::check_static_token_shape(t).is_ok()
+                && !t.starts_with('Z')
+        })
+        .unwrap();
     for (i, token) in ["Sup3r$ecret!Zq7kLm9VbNw2XyHdFg5!", long.as_str()]
         .into_iter()
         .enumerate()
@@ -662,57 +682,92 @@ fn a_scoped_server_takes_the_static_token_in_the_shape_the_design_gives_it() {
     }
 }
 
+/// Design 4.5.5 rules 1 to 5, at the real program. This test pinned the opposite (each of these servers started, "until
+/// ACC-14 makes the refusals") and is flipped on purpose: each configuration is refused with exit 78 and one line that
+/// names what to change, and starts nothing (no data folder is made). The tests of the rest of each rule (its
+/// non-refusal, every violation of `check` at once, the exact messages) are `auth::exposure::tests` and
+/// `tests/access_exposure.rs`; here it is the program that is held to it.
 #[test]
-fn the_startup_refusals_of_design_4_5_5_that_are_not_made_yet_are_pinned() {
-    // ACC-14 (`validate_config`) refuses each of these configurations at startup: exit 78, one line saying
-    // what to change. Until it does, each of these servers starts, and this test says so, so that the step
-    // that adds the refusals flips it on purpose. (Refusals 6 and 7, the mode and the data folder, are made:
-    // see the tests above.)
-    let cases: [(&str, Vec<(&str, &str)>); 5] = [
+fn the_startup_refusals_of_design_4_5_5_stop_the_server_with_exit_78_and_a_line_naming_what_to_change(
+) {
+    let cases: [(&str, Vec<(&str, &str)>, &str); 5] = [
         (
             "1: OAIY_SERVER_BIND is not loopback, lan or an address",
             vec![("OAIY_SERVER_BIND", "bogus")],
+            "OAIY_SERVER_BIND",
         ),
         (
             "2: a lan bind and no owner.json (`oaiy-server auth init` has not run)",
             vec![("OAIY_SERVER_BIND", "lan")],
+            "oaiy-server auth init",
         ),
         (
             "3: OAIY_PUBLIC_URL with a path",
             vec![("OAIY_PUBLIC_URL", "https://dash.example.com/some/path")],
+            "OAIY_PUBLIC_URL",
         ),
         (
             "4: a network bind with OAIY_PUBLIC_URL and no OAIY_TRUSTED_PROXIES",
             vec![
-                ("OAIY_SERVER_BIND", "lan"),
+                ("OAIY_SERVER_BIND", "0.0.0.0"),
                 ("OAIY_PUBLIC_URL", "https://dash.example.com"),
             ],
+            "OAIY_TRUSTED_PROXIES",
         ),
         (
             "5: OAIY_SERVER_TOKEN that fails the shape rule of design 4.1",
             vec![("OAIY_SERVER_TOKEN", "short")],
+            "OAIY_SERVER_TOKEN",
         ),
     ];
-    for (i, (what, extra)) in cases.iter().enumerate() {
-        let scratch = Scratch::new(&format!("boot-pin-4-5-5-{i}"));
+    for (i, (what, extra, names)) in cases.iter().enumerate() {
+        let scratch = Scratch::new(&format!("boot-refusal-4-5-5-{i}"));
         let mut env = vec![("OAIY_ACCESS_MODE", "scoped")];
         env.extend(extra.iter().copied());
         let mut server = Server::spawn(&scratch, &env, "server");
-        // `wait_until_up` panics when the server exits (78 is the day this changes).
-        server.wait_until_up();
-        assert!(
-            server.child.try_wait().unwrap().is_none(),
-            "{what}: the server stopped"
+        assert_eq!(
+            server.exit_code(Duration::from_secs(60)),
+            Some(78),
+            "{what}: {}",
+            server.stderr_tail()
         );
+        let said = server.stderr_tail();
+        assert!(said.contains(names), "{what}: {said}");
+        // One line, and nothing was made or opened on the way to refusing.
+        assert_eq!(
+            said.lines()
+                .filter(|l| l.starts_with("oaiy-server:"))
+                .count(),
+            1,
+            "{what}: {said}"
+        );
+        assert!(!scratch.data().exists(), "{what}: the data folder was made");
     }
 }
 
 #[test]
+fn a_static_token_is_kept_out_of_the_line_that_refuses_it() {
+    let scratch = Scratch::new("boot-refusal-token-echo");
+    let weak = "hunter2hunter2hunter2hunter2hunter2";
+    let mut server = Server::spawn(&scratch, &[("OAIY_SERVER_TOKEN", weak)], "server");
+    assert_eq!(server.exit_code(Duration::from_secs(60)), Some(78));
+    assert!(
+        !server.stderr_tail().contains(weak),
+        "{}",
+        server.stderr_tail()
+    );
+}
+
+#[test]
 fn a_block_of_the_failed_bearer_throttle_survives_a_kill() {
-    // A network listener, so that the throttle applies to this test's own (loopback) peer. The first server
-    // is killed, not stopped: what the next one knows is what the upkeep saved.
+    // An install the throttle applies to a loopback peer of (proxied: a proxy on this machine is the peer of every
+    // client), so that this test's own requests count. The first server is killed, not stopped: what the next one
+    // knows is what the upkeep saved.
     let scratch = Scratch::new("boot-throttle-kill");
-    let env = [("OAIY_ACCESS_MODE", "scoped"), ("OAIY_SERVER_BIND", "lan")];
+    let env = [
+        ("OAIY_ACCESS_MODE", "scoped"),
+        ("OAIY_PUBLIC_URL", "https://dash.example.com"),
+    ];
     let wrong = format!("oaiypat_0123456789abcdef_{}", "A".repeat(43));
     {
         let server = Server::start(&scratch, &env);
@@ -767,11 +822,15 @@ fn a_mode_that_is_not_one_stops_the_server_with_exit_78() {
 }
 
 #[test]
-fn shadow_on_a_network_address_stops_the_server_with_exit_78() {
-    let scratch = Scratch::new("boot-shadow-lan");
+fn shadow_on_a_proxied_install_stops_the_server_with_exit_78() {
+    // (A lan bind would be refused first, for having no owner: rule 2 comes before rule 6.)
+    let scratch = Scratch::new("boot-shadow-proxied");
     let mut server = Server::spawn(
         &scratch,
-        &[("OAIY_ACCESS_MODE", "shadow"), ("OAIY_SERVER_BIND", "lan")],
+        &[
+            ("OAIY_ACCESS_MODE", "shadow"),
+            ("OAIY_PUBLIC_URL", "https://dash.example.com"),
+        ],
         "server",
     );
     assert_eq!(

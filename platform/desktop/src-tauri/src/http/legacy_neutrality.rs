@@ -627,6 +627,83 @@ async fn health_gains_access_and_storage_only_with_the_guard_in_front_and_nothin
     assert!(text.starts_with(r#"{"status":"ok","product":"oaiy-desktop","companion":"oaiy-desktop","protocol":"oaiy-bridge/1","version":"#), "{text}");
 }
 
+/// N4: a static token with a character a token never has, which the token rule also refuses (the desktop keeps the
+/// one it was given, in `legacy`): the routes that existed before answer it as the old guard did, which takes the
+/// token as it is, and a route the model adds reads it by the strict bearer rule, `400 bad_request`. The documents say
+/// so (the desktop README, "A token-only install on the web build").
+#[tokio::test]
+async fn a_wide_token_the_rule_refuses_is_the_old_guards_on_old_routes_and_a_400_on_the_routes_the_model_adds(
+) {
+    use crate::auth::api;
+    const WIDE: &str = "Zq7$kLm9VbNw2XyHdFg5-secret-Rt8PcJ4u";
+    assert!(WIDE.contains('$'));
+    assert!(crate::auth::token::check_static_token_shape(WIDE).is_err());
+    let (pairing, _) = a_paired_token();
+    let unused = std::env::temp_dir().join("oaiy-legacy-neutrality-nothing-is-made-here");
+    let credential = format!("Bearer {WIDE}");
+    for gui in [true, false] {
+        let (new, old) = (
+            live(gui, Some(WIDE), pairing.clone()),
+            frozen(gui, Some(WIDE), pairing.clone()),
+        );
+        for (m, p) in [
+            (Method::GET, "/api/config"),
+            (Method::POST, "/api/services/x/start"),
+            (Method::GET, "/api/services"),
+        ] {
+            let (a, b) = (
+                ask(&new, &m, p, Some(&credential), None).await,
+                ask(&old, &m, p, Some(&credential), None).await,
+            );
+            assert_eq!(a, b, "gui={gui} {m} {p}");
+            assert_eq!(
+                a.status, 200,
+                "gui={gui} {m} {p}: the old guard takes the token"
+            );
+        }
+        let guard = crate::auth::build_guard(
+            &AccessSettings::legacy(),
+            &unused,
+            17972,
+            false,
+            gui,
+            Some(WIDE.into()),
+            &|_| None,
+        )
+        .unwrap();
+        let state = AccessState {
+            legacy: AuthConfig {
+                token: Some(WIDE.into()),
+                gui_mode: gui,
+                pairing: Some(pairing.clone()),
+            },
+            guard: guard.clone(),
+        };
+        let app = stub_routes()
+            .merge(api::router(guard))
+            .layer(middleware::from_fn_with_state(state, access_guard));
+        let a = ask(
+            &app,
+            &Method::GET,
+            "/api/auth/whoami",
+            Some(&credential),
+            None,
+        )
+        .await;
+        let body = String::from_utf8_lossy(&a.body).into_owned();
+        assert_eq!(a.status, 400, "gui={gui}: {body}");
+        assert!(body.contains("bad_request"), "gui={gui}: {body}");
+        // And the old route in the same router is still the old guard's.
+        let a = ask(&app, &Method::GET, "/api/config", Some(&credential), None).await;
+        assert_eq!(
+            a.status,
+            200,
+            "gui={gui}: {}",
+            String::from_utf8_lossy(&a.body)
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_route_the_model_adds_is_judged_by_the_new_guard_even_in_legacy_mode() {
     use crate::auth::api;

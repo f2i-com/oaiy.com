@@ -11,12 +11,17 @@
 //! The pipeline, in order (an in-process request, one made by code in this process with no socket, has
 //! no `Host`, no peer and no `Origin`, so the steps that read them are skipped for it):
 //!
+//! 0. on a proxy-only listener, a peer that is neither a trusted proxy nor this machine: `403
+//!    direct_access_refused`, for any method and any path (`GET`/`HEAD /api/health` alone is let by);
 //! 1. a method other than `GET HEAD POST PUT PATCH DELETE OPTIONS`: `405`;
 //! 2. `Host` not in the allow-list: `421 misdirected_host` (except `GET`/`HEAD /api/health`);
 //! 3. the effective client address (trusted proxies);
 //! 4. a forwarded header on a local install: `421 proxy_detected`; a bearer from a public address on a
-//!    LAN listener: `403 plaintext_from_public_address`; the channel;
-//! 5. `OPTIONS`: public (the CORS layer answers it);
+//!    LAN listener: `403 plaintext_from_public_address`; the channel (`X-Forwarded-Proto`: the last entry
+//!    of the header, across its lines, as for `X-Forwarded-For`);
+//! 5. `OPTIONS`: public (the CORS layer answers it, once the steps above, which it asks the guard for
+//!    before it answers a preflight, `Guard::refuses_before_a_preflight`, have let it by: `OPTIONS
+//!    /api/health` is the one path it does not ask about, which stays what it was);
 //! 6. classify `(Method, MatchedPath)`; a route with no row is `403 unclassified_route`;
 //! 7. the credential: `Authorization: Bearer`, strictly parsed (`400 bad_request`);
 //! 8. the failed-bearer throttle (`429`), before any lookup;
@@ -47,7 +52,8 @@ use super::clientip::{client_ip, ClientIp, TrustedProxies};
 use super::clock::Clock;
 use super::exposure_checks::{forwarded_header, is_loopback, is_public_address};
 use super::host::{
-    channel, expected_origin, Channel, HostClass, HostName, HostPolicy, ProxyMisconfigured,
+    channel, expected_origin, forwarded_proto, Channel, HostClass, HostName, HostPolicy,
+    ProxyMisconfigured,
 };
 use super::mode::{AccessMode, Exposure};
 use super::presets::App;
@@ -253,6 +259,17 @@ impl Denial {
         Denial::new(StatusCode::MISDIRECTED_REQUEST, "proxy_detected", "A forwarded header reached an install that is not behind a proxy: set OAIY_PUBLIC_URL.").counted("auth.denied")
     }
 
+    /// A connection that is neither from a trusted proxy nor from this machine, to a server that is configured
+    /// to be reached only through its proxy (design 4.4, 4.5.5 rule 4).
+    pub fn direct_access_refused() -> Denial {
+        Denial::new(
+            StatusCode::FORBIDDEN,
+            "direct_access_refused",
+            "This server answers only its reverse proxy: use its public address.",
+        )
+        .counted("auth.denied")
+    }
+
     pub fn plaintext_from_public_address() -> Denial {
         Denial::new(
             StatusCode::FORBIDDEN,
@@ -455,20 +472,55 @@ pub struct GuardConfig {
     pub hosts: HostPolicy,
     /// `OAIY_ALLOW_PUBLIC_PLAINTEXT=1`.
     pub allow_public_plaintext: bool,
+    /// The proxy-only shape (design 4.5.5 rule 4): a bind beyond loopback behind a named proxy. A direct peer
+    /// that is neither a trusted proxy nor this machine is `403 direct_access_refused`.
+    pub proxy_only: bool,
 }
 
 /// `https://host[:port]` with no path, query or fragment, as a host.
 fn https_origin_host(url: &str) -> Option<HostName> {
-    let rest = url.trim().strip_prefix("https://")?;
+    let rest = super::exposure::strip_https_scheme(url.trim())?;
     if rest.is_empty() || rest.contains(['/', '?', '#', '@']) {
         return None;
     }
     HostName::parse(rest)
 }
 
+/// What the desktop does not read from its environment: it is never behind a proxy (design 3.4: the desktop's
+/// API is on loopback only), so none of these can make it a proxied install.
+const DESKTOP_IGNORES: [&str; 5] = [
+    "OAIY_PUBLIC_URL",
+    "OAIY_AGENT_URL",
+    "OAIY_FLOWS_URL",
+    "OAIY_TRUSTED_PROXIES",
+    "OAIY_ALLOW_PUBLIC_PLAINTEXT",
+];
+
 impl GuardConfig {
+    /// The settings of a server that passed the startup rules (`auth::exposure`): nothing left to read leniently.
+    pub fn from_config(config: &super::exposure::Config, gui: bool) -> GuardConfig {
+        let loopback_apps = !gui && config.exposure == Exposure::Local;
+        GuardConfig {
+            exposure: config.exposure,
+            gui,
+            port: config.port,
+            trusted: config.trusted.clone(),
+            hosts: HostPolicy::new(
+                config.exposure,
+                config.port,
+                config.allowed_hosts.clone(),
+                config.public.clone(),
+                loopback_apps,
+            ),
+            allow_public_plaintext: config.allow_public_plaintext,
+            proxy_only: config.proxy_only(),
+        }
+    }
+
     /// Read the settings of 4.13 from the environment (`env`), leniently: what cannot be read is
-    /// ignored and named in the warnings (the strict startup rules are a later step).
+    /// ignored and named in the warnings. This is the desktop's way (it starts whatever it is given) and the
+    /// tests'; `oaiy-server` applies the startup rules of `auth::exposure` first and uses
+    /// [`GuardConfig::from_config`]. The desktop ignores the settings of a proxy altogether, and says so.
     pub fn from_env(
         env: &dyn Fn(&str) -> Option<String>,
         bind_all: bool,
@@ -477,10 +529,22 @@ impl GuardConfig {
     ) -> (GuardConfig, Vec<String>) {
         let mut warnings = Vec::new();
         let get = |name: &str| {
+            if gui && DESKTOP_IGNORES.contains(&name) {
+                return None;
+            }
             env(name)
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty())
         };
+        if gui {
+            for name in DESKTOP_IGNORES {
+                if env(name).is_some_and(|v| !v.trim().is_empty()) {
+                    warnings.push(format!(
+                        "{name} is ignored: the desktop's API is on this machine only and is never behind a proxy"
+                    ));
+                }
+            }
+        }
         let public_url = get("OAIY_PUBLIC_URL");
         let exposure = Exposure::compute(bind_all, public_url.is_some());
         let mut public: BTreeMap<HostName, App> = BTreeMap::new();
@@ -527,6 +591,8 @@ impl GuardConfig {
         let loopback_apps = !gui && exposure == Exposure::Local;
         let hosts = HostPolicy::new(exposure, port, extra, public, loopback_apps);
         let allow_public_plaintext = get("OAIY_ALLOW_PUBLIC_PLAINTEXT").as_deref() == Some("1");
+        // Fail toward the stricter shape: a bind beyond loopback behind a public URL refuses direct peers.
+        let proxy_only = exposure == Exposure::Proxied && bind_all;
         (
             GuardConfig {
                 exposure,
@@ -535,6 +601,7 @@ impl GuardConfig {
                 trusted,
                 hosts,
                 allow_public_plaintext,
+                proxy_only,
             },
             warnings,
         )
@@ -563,6 +630,9 @@ pub struct Guard {
     /// When a trusted proxy's unusable `X-Forwarded-For` was last logged (once a minute), how many lines.
     fell_back_at: AtomicU64,
     fell_back_lines: AtomicU64,
+    /// When a trusted proxy's request with no `X-Forwarded-For` was last logged (once a minute), how many lines.
+    no_xff_at: AtomicU64,
+    no_xff_lines: AtomicU64,
     /// The web login, when this server has one: it turns on the session cookie and setup-only mode.
     #[cfg(feature = "web")]
     login: std::sync::OnceLock<std::sync::Weak<dyn super::session::LoginFacts>>,
@@ -606,6 +676,27 @@ impl Guard {
         let static_token = static_token
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty());
+        // The shape of design 4.1: `oaiy-server` refuses to start with a token that fails it (exit 78), and every
+        // other embedding (the desktop) ignores the token, with a line saying so. `legacy` keeps today's guard for
+        // the routes that existed before the model, which took any token, so it keeps the token too, and says
+        // what will change.
+        let static_token = match static_token {
+            Some(t) => match super::token::check_static_token_shape(&t) {
+                Ok(()) => Some(t),
+                Err(shape) if mode.is_enforcing() => {
+                    log::warn!("auth: OAIY_SERVER_TOKEN is ignored: {}", shape.message());
+                    None
+                }
+                Err(shape) => {
+                    log::warn!(
+                        "auth: {}: it is accepted while the access mode is legacy and ignored once it is scoped",
+                        shape.message()
+                    );
+                    Some(t)
+                }
+            },
+            None => None,
+        };
         store.set_static_present(static_token.is_some());
         Guard {
             mode,
@@ -621,6 +712,8 @@ impl Guard {
             proxy_misconfigured_noted: AtomicBool::new(false),
             fell_back_at: AtomicU64::new(0),
             fell_back_lines: AtomicU64::new(0),
+            no_xff_at: AtomicU64::new(0),
+            no_xff_lines: AtomicU64::new(0),
             #[cfg(feature = "web")]
             login: std::sync::OnceLock::new(),
         }
@@ -733,6 +826,23 @@ impl Guard {
         }
     }
 
+    /// A trusted proxy forwarded a request for a public host with no `X-Forwarded-For` at all: one log line a minute
+    /// (design 6, "proxy misconfigured").
+    fn note_no_forwarded_for(&self, peer: IpAddr) {
+        if !once_a_minute(&self.no_xff_at, self.clock.now_ms()) {
+            return;
+        }
+        self.no_xff_lines.fetch_add(1, Ordering::Relaxed);
+        log::warn!(
+            "auth: the trusted proxy {peer} forwarded a request with no X-Forwarded-For: its address stands for every client behind it (they share its limits); make the proxy send the client's address in X-Forwarded-For (nginx: proxy_set_header X-Forwarded-For $remote_addr)"
+        );
+    }
+
+    /// How many lines of the missing-`X-Forwarded-For` kind the guard has written (for the tests).
+    pub fn no_forwarded_for_lines(&self) -> u64 {
+        self.no_xff_lines.load(Ordering::Relaxed)
+    }
+
     /// A trusted proxy's `X-Forwarded-For` could not be used, so its address stands for every client behind
     /// it (they share its limits): one log line a minute.
     fn note_fell_back(&self, peer: IpAddr) {
@@ -832,7 +942,7 @@ impl Guard {
     /// Decide `req`: refuse it, or put the principal and the request's facts on it and run the handler.
     pub async fn handle(&self, mut req: Request, next: Next) -> Response {
         let path = req.uri().path().to_owned();
-        match self.admit(&mut req) {
+        match self.admit(&req) {
             Ok(admitted) => {
                 if let Some(info) = admitted.info {
                     req.extensions_mut().insert(info);
@@ -861,8 +971,33 @@ impl Guard {
         }
     }
 
-    /// Steps 1 to 10. On a refusal, the client address and host to count it against.
-    fn admit(&self, req: &mut Request) -> Result<Admitted, Box<Refusal>> {
+    /// What the front door of the listener says to an `OPTIONS` request before the CORS layer answers it, which
+    /// the layer does without the guard (it sits outside it, so that an app can read the refusal it gets): the
+    /// refusals that are made of the connection alone and come first for every other method, the proxy-only
+    /// listener's `403 direct_access_refused` and the rest of what steps 0 to 5 refuse (the Host, a proxy that says
+    /// http, a forwarded header on a local install, a bearer from a public address on a lan one). `None` is a request
+    /// the door lets by: the layer answers it. `GET /api/health` and `HEAD` of it are the probe that passes the
+    /// door from anywhere; `OPTIONS /api/health` is not asked here either, and is what it was (a preflight is
+    /// answered, a bare `OPTIONS` is judged by the Host like every other request).
+    pub fn refuses_before_a_preflight(&self, req: &Request) -> Option<Response> {
+        if req.method() != Method::OPTIONS || req.uri().path() == "/api/health" {
+            return None;
+        }
+        match self.admit(req) {
+            Ok(_) => None,
+            // The one refusal that is a `204` is the answer to an `OPTIONS` that got past everything above it.
+            Err(refusal) if refusal.denial.status == StatusCode::NO_CONTENT => None,
+            Err(refusal) => {
+                if let Some(event) = refusal.denial.noise {
+                    self.note(event, &refusal.ip, &refusal.host);
+                }
+                Some(refusal.denial.into_response())
+            }
+        }
+    }
+
+    /// Steps 0 to 10. On a refusal, the client address and host to count it against.
+    fn admit(&self, req: &Request) -> Result<Admitted, Box<Refusal>> {
         let peer = req
             .extensions()
             .get::<ConnectInfo<SocketAddr>>()
@@ -891,6 +1026,22 @@ impl Guard {
             .map(|i| i.to_string())
             .unwrap_or_else(|| "in-process".into());
 
+        let is_health_probe = matches!(method, Method::GET | Method::HEAD) && path == "/api/health";
+        // 0. Proxy-only (design 4.5.5 rule 4): bound beyond loopback and told who the proxy is. A connection that is
+        // neither from that proxy nor from this machine (the CLI on the server, `oaiy-server auth ...`, a check
+        // inside a container: a loopback peer with no forwarded header) did not come through it, and is refused
+        // first, before the method is read (`TRACE` is a 403 from it, as everything is), whatever the request says
+        // in its headers, and for any path: the pages a later step serves are behind the same door. A probe of
+        // `GET /api/health` is exempt, as it is from the Host check. (An `OPTIONS` reaches this the same way: the
+        // CORS layer asks the guard first, `Guard::refuses_before_a_preflight`.)
+        if self.config.proxy_only && !is_health_probe {
+            if let Some(peer_ip) = peer.ip() {
+                let direct = peer.is_loopback() && forwarded_header(req.headers()).is_none();
+                if !direct && !self.config.trusted.contains(peer_ip) {
+                    return Err(fail(Denial::direct_access_refused(), &peer_text));
+                }
+            }
+        }
         // 1. methods
         if !is_served_method(&method) {
             return Err(fail(Denial::method_not_allowed(), &peer_text));
@@ -905,7 +1056,6 @@ impl Guard {
         let headers = req.headers().clone();
         let forwarded = forwarded_header(&headers);
         let direct_loopback = peer.is_loopback() && forwarded.is_none();
-        let is_health_probe = matches!(method, Method::GET | Method::HEAD) && path == "/api/health";
 
         // 2-4. the address side of the request (skipped for a request with no socket)
         let mut info = RequestInfo {
@@ -929,17 +1079,29 @@ impl Guard {
                 (None, true) => {}
                 (None, false) => return Err(fail(Denial::misdirected_host(), &peer_text)),
             }
+            // A header line that cannot be read as text is not skipped: it stands for an entry that is not an
+            // address, and one of those means nothing in the header can be believed (design 4.5.4).
             let xff: Vec<&str> = headers
                 .get_all("x-forwarded-for")
                 .iter()
-                .filter_map(|v| v.to_str().ok())
+                .map(|v| v.to_str().unwrap_or("\u{fffd}"))
                 .collect();
             let client: ClientIp = client_ip(peer_ip, &xff, &self.config.trusted);
             info.client_ip = client.ip.to_string();
             info.client_key = client.key.clone();
-            info.via_trusted_proxy = client.via_proxy || self.config.trusted.contains(peer_ip);
+            let peer_is_trusted = self.config.trusted.contains(peer_ip);
+            info.via_trusted_proxy = client.via_proxy || peer_is_trusted;
             if client.fell_back {
                 self.note_fell_back(peer_ip);
+            }
+            // A trusted peer that forwards a public host with no `X-Forwarded-For` is a proxy that names no client: every
+            // client behind it is that one address (they share its limits: five wrong logins from anyone block the
+            // owner). The CLI on this machine reaches the port by a loopback name, so it is not this.
+            if peer_is_trusted
+                && xff.is_empty()
+                && matches!(info.host_class, Some(HostClass::Public(_)))
+            {
+                self.note_no_forwarded_for(peer_ip);
             }
             if self.config.exposure == Exposure::Local {
                 if let Some(header) = forwarded {
@@ -957,9 +1119,14 @@ impl Guard {
                     &info.client_ip,
                 ));
             }
-            let xfp = headers
-                .get("x-forwarded-proto")
-                .and_then(|v| v.to_str().ok());
+            // The last entry of the header, across its lines: what a proxy that adds to it says, and never what a
+            // client wrote before it (the first line of two, the first entry of a list). As the client address is.
+            let xfp_lines: Vec<Option<&str>> = headers
+                .get_all("x-forwarded-proto")
+                .iter()
+                .map(|v| v.to_str().ok())
+                .collect();
+            let xfp = forwarded_proto(&xfp_lines);
             if let Some(h) = &host {
                 match channel(
                     &self.config.hosts,
@@ -1015,15 +1182,32 @@ impl Guard {
         };
         let no_route = matched.is_none();
 
-        // Setup-only mode (design 4.7.1): an install with a web login and no owner answers only the short list of
-        // routes that say whether there is a login and make one, and 401 `setup_required` to everything else,
-        // however public the model would have that route be (the bridge's pairing and capabilities are not open
-        // until there is an owner to pair with).
+        // Setup-only mode (design 4.7.1): an install with a web login and no owner answers an UNAUTHENTICATED caller
+        // only the short list of routes that say whether there is a login and make one, and 401 `setup_required` to
+        // everything else, however public the model would have that route be (the bridge's pairing and capabilities
+        // are not open to anyone until there is an owner to pair with). A caller that presents a credential is not
+        // the stranger this is for: it is judged by the guard as it is everywhere else (the operator's static token
+        // reaches capability discovery and the pairing routes on an install that has no owner yet, as it reaches
+        // the protected routes), and a credential that is not valid is what it is anywhere (`401 token_invalid`, a
+        // `429`), not `setup_required`.
         #[cfg(feature = "web")]
         if class == Class::Public && !no_route && self.in_setup_only() {
             if let Some(m) = &matched {
                 if !setup_only_open(&method, m) {
-                    return Err(fail(Denial::setup_required()));
+                    if !headers.contains_key(header::AUTHORIZATION) {
+                        return Err(fail(Denial::setup_required()));
+                    }
+                    match self.authenticate(
+                        &headers,
+                        &method,
+                        &info,
+                        direct_loopback,
+                        self.throttle_applies(peer),
+                    ) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => return Err(fail(Denial::setup_required())),
+                        Err(denial) => return Err(fail(denial)),
+                    }
                 }
             }
         }
@@ -1075,7 +1259,8 @@ impl Guard {
 
     /// An install with a web login and no owner is in setup-only mode (design 4.7.1): an anonymous caller of a
     /// route that needs a credential is told to set up instead of to sign in. Bearer credentials are unaffected
-    /// (they never reach this), and every other refusal stands as it is.
+    /// (they never reach this; nor does a valid one on a public route, see the gate in `admit`), and every other
+    /// refusal stands as it is.
     fn setup_only(&self, denial: Denial) -> Denial {
         #[cfg(feature = "web")]
         if denial.code == "auth_required" && self.in_setup_only() {
@@ -1217,14 +1402,19 @@ pub async fn scoped_guard(
 }
 
 /// CORS and Private Network Access for the `scoped` and `shadow` modes (`auth/cors.rs`), outside the guard so
-/// that a paired app can read the refusal it gets. A preflight is answered here, without a credential, `204`;
-/// a route with no row, and an origin no live credential is bound to, get no headers.
+/// that a paired app can read the refusal it gets. A preflight is answered here, without a credential, `204`,
+/// once the front door of the listener has let it by (`Guard::refuses_before_a_preflight`: a listener that
+/// answers only its proxy answers no preflight of anyone else, and a Host that is not the server's is refused, as
+/// for any request); a route with no row, and an origin no live credential is bound to, get no headers.
 pub async fn scoped_cors(
     axum::extract::State(guard): axum::extract::State<Arc<Guard>>,
     req: Request,
     next: Next,
 ) -> Response {
     use super::cors;
+    if let Some(refusal) = guard.refuses_before_a_preflight(&req) {
+        return refusal;
+    }
     let method = req.method().clone();
     let origin = req
         .headers()

@@ -19,6 +19,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::mode::Exposure;
 use super::presets::App;
 
+/// A port as a browser writes it: digits and nothing else (no `+`, no space), no leading zero, 1 to 65535.
+/// `u16::from_str` alone takes `+8080` and `08080`, which no client sends and which a `Host` check has no reason to
+/// read as the port they stand for.
+pub fn parse_port_digits(text: &str) -> Option<u16> {
+    if text.is_empty()
+        || !text.bytes().all(|b| b.is_ascii_digit())
+        || (text.len() > 1 && text.starts_with('0'))
+    {
+        return None;
+    }
+    text.parse::<u16>().ok().filter(|n| *n != 0)
+}
+
 /// A `Host` (or a configured host) as `host` and optional `port`, lowercased, with the port of the
 /// scheme's default (`:443`, `:80`) removed: `dash.example.com`, not `dash.example.com:443`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -88,7 +101,7 @@ impl HostName {
         let port = match port {
             None => None,
             Some(p) => {
-                let n: u16 = p.parse().ok().filter(|n| *n != 0)?;
+                let n = parse_port_digits(p)?;
                 (n != 80 && n != 443).then_some(n)
             }
         };
@@ -297,6 +310,20 @@ pub fn channel(
     Ok(Channel::Insecure)
 }
 
+/// What a trusted proxy says the protocol of the client's connection was: the last entry of `X-Forwarded-Proto`, across
+/// all its lines, each split at its commas. A proxy that adds to what it was sent puts its own word last, and what a
+/// client sends comes before it, so the last entry is the only one that is not the client's to write; it is the entry
+/// the client address is read from too (`X-Forwarded-For`, the rightmost that is not a proxy of ours). A line that
+/// is not text means the header cannot be read, and then no protocol is said (which is an insecure channel), as
+/// with the client address. `[https, http]` is `http` and `[http, https]` is `https`, one line or two.
+pub fn forwarded_proto<'a>(lines: &[Option<&'a str>]) -> Option<&'a str> {
+    let mut last: Option<&'a str> = None;
+    for line in lines {
+        last = Some((*line)?);
+    }
+    last?.rsplit(',').next().map(str::trim)
+}
+
 /// The origin a browser page served for this `Host` has, as the same-origin checks need it: `https://<host>`
 /// on a secure channel behind a proxy, `http://<host>:<port>` for the loopback names.
 pub fn expected_origin(host: &HostName, channel: Channel) -> String {
@@ -317,6 +344,78 @@ mod tests {
 
     fn h(s: &str) -> HostName {
         HostName::parse(s).unwrap_or_else(|| panic!("{s} does not parse"))
+    }
+
+    #[test]
+    fn a_port_in_a_host_is_digits_from_1_to_65535_as_a_browser_writes_it() {
+        // The ports the `Host` of a request may carry: 80 and 443 are the defaults and are dropped.
+        assert_eq!(h("localhost:8080").port, Some(8080));
+        assert_eq!(h("localhost:1").port, Some(1));
+        assert_eq!(h("localhost:65535").port, Some(65535));
+        assert_eq!(h("localhost:80").port, None);
+        assert_eq!(h("dash.example.com:443").port, None);
+        assert_eq!(h("[::1]:5").port, Some(5));
+        // `u16::from_str` takes a sign and leading zeros, which the check for the port a request is on then took
+        // for the port they stand for: `localhost:+8080` and `dash.example.com:0443` were a valid `Host`.
+        for bad in [
+            "localhost:+8080",
+            "localhost:08080",
+            "localhost:00",
+            "localhost:0",
+            "localhost:65536",
+            "localhost:99999",
+            "localhost:",
+            "localhost:-1",
+            "localhost:8 0",
+            "localhost:8080a",
+            "localhost:0x50",
+            "localhost:\u{ff18}\u{ff10}",
+            "dash.example.com:+443",
+            "dash.example.com:0443",
+            "dash.example.com:00443",
+            "[::1]:+5",
+            "[::1]:05",
+            "[::1]:",
+        ] {
+            assert_eq!(HostName::parse(bad), None, "{bad:?}");
+        }
+        for (text, want) in [
+            ("8080", Some(8080)),
+            ("1", Some(1)),
+            ("65535", Some(65535)),
+            ("0", None),
+            ("", None),
+            ("+1", None),
+            ("01", None),
+            ("65536", None),
+        ] {
+            assert_eq!(parse_port_digits(text), want, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn the_protocol_a_proxy_says_is_the_last_entry_of_the_last_line() {
+        let lines = |l: &[&'static str]| l.iter().map(|s| Some(*s)).collect::<Vec<_>>();
+        for (given, want) in [
+            (vec![], None),
+            (vec!["https"], Some("https")),
+            (vec![" https "], Some("https")),
+            (vec!["https, http"], Some("http")),
+            (vec!["http, https"], Some("https")),
+            (vec!["a,b,c"], Some("c")),
+            (vec!["https", "http"], Some("http")),
+            (vec!["http", "https"], Some("https")),
+            (vec!["http", "https, http"], Some("http")),
+            (vec!["https,"], Some("")),
+            (vec!["https", ""], Some("")),
+            (vec![""], Some("")),
+        ] {
+            assert_eq!(forwarded_proto(&lines(&given)), want, "{given:?}");
+        }
+        // A line that is not text: the header cannot be read, wherever the line is.
+        assert_eq!(forwarded_proto(&[Some("https"), None]), None);
+        assert_eq!(forwarded_proto(&[None, Some("https")]), None);
+        assert_eq!(forwarded_proto(&[None]), None);
     }
 
     fn policy(exposure: Exposure, port: u16, loopback_apps: bool) -> HostPolicy {
@@ -712,6 +811,126 @@ mod tests {
                 false,
                 true
             ),
+            Ok(Channel::Insecure)
+        );
+    }
+
+    /// Channel classification (design 4.5.4), over every combination of what it reads, against the two rules of the
+    /// design written out on their own: (a) the peer is a trusted proxy, `X-Forwarded-Proto` is `https` and `Host`
+    /// is a configured public host; (b) `Host` is a loopback name, the peer is loopback and no forwarded header is
+    /// present. Anything else is insecure; a trusted proxy that says `http` for a public host is misconfigured.
+    #[test]
+    fn t30_the_channel_is_the_two_rules_of_the_design_over_every_combination_of_its_inputs() {
+        let hosts = [
+            "dash.example.com",
+            "agent.example.com",
+            "other.example.com",
+            "localhost:17972",
+            "127.0.0.1:17972",
+            "[::1]:17972",
+            "dash.oaiy.localhost:17972",
+            "192.168.1.5:17972",
+            "oaiy.localhost",
+        ];
+        let protos = [
+            None,
+            Some("https"),
+            Some("HTTPS"),
+            Some(" https "),
+            Some("http"),
+            Some("HTTP"),
+            Some("gopher"),
+            Some(""),
+            Some("https, http"),
+        ];
+        let mut secure = 0;
+        for loopback_apps in [false, true] {
+            let p = policy(
+                if loopback_apps {
+                    Exposure::Local
+                } else {
+                    Exposure::Proxied
+                },
+                17972,
+                loopback_apps,
+            );
+            // Which of those are configured public hosts on this install: none on a loopback server.
+            let public = |host: &str| p.is_public(&h(host));
+            for host in hosts {
+                for proto in protos {
+                    for trusted in [false, true] {
+                        for peer_loopback in [false, true] {
+                            for forwarded in [false, true] {
+                                let name = h(host);
+                                let want: Result<Channel, ProxyMisconfigured> = if trusted
+                                    && public(host)
+                                {
+                                    match proto.map(|x| x.trim().to_ascii_lowercase()).as_deref() {
+                                        Some("https") => Ok(Channel::Secure),
+                                        Some("http") => Err(ProxyMisconfigured),
+                                        _ => Ok(Channel::Insecure),
+                                    }
+                                } else {
+                                    let loopbackish = matches!(
+                                        name.host.as_str(),
+                                        "localhost" | "127.0.0.1" | "[::1]"
+                                    ) || (loopback_apps
+                                        && name.host == "dash.oaiy.localhost");
+                                    if loopbackish && peer_loopback && !forwarded {
+                                        Ok(Channel::Secure)
+                                    } else {
+                                        Ok(Channel::Insecure)
+                                    }
+                                };
+                                let got =
+                                    channel(&p, &name, trusted, proto, peer_loopback, forwarded);
+                                assert_eq!(
+                                    got, want,
+                                    "apps {loopback_apps} host {host} proto {proto:?} trusted {trusted} loopback {peer_loopback} forwarded {forwarded}"
+                                );
+                                if got == Ok(Channel::Secure) {
+                                    secure += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(secure > 20, "the table has {secure} secure rows");
+    }
+
+    #[test]
+    fn t30_a_secure_channel_needs_the_trusted_proxy_to_say_https_and_nothing_a_client_says_counts()
+    {
+        let p = policy(Exposure::Proxied, 17972, false);
+        let dash = h("dash.example.com");
+        // The Caddy double: a trusted peer, `X-Forwarded-Proto: https`, the public Host.
+        assert_eq!(
+            channel(&p, &dash, true, Some("https"), false, true),
+            Ok(Channel::Secure)
+        );
+        // A client that sends the same headers itself is not a trusted proxy.
+        assert_eq!(
+            channel(&p, &dash, false, Some("https"), false, true),
+            Ok(Channel::Insecure)
+        );
+        // Even from this machine, a public host is not a loopback name.
+        assert_eq!(
+            channel(&p, &dash, false, Some("https"), true, true),
+            Ok(Channel::Insecure)
+        );
+        assert_eq!(
+            channel(&p, &dash, false, None, true, false),
+            Ok(Channel::Insecure)
+        );
+        // A wrong `X-Forwarded-Proto` from the proxy, and a missing one.
+        assert_eq!(
+            channel(&p, &dash, true, Some("http"), false, true),
+            Err(ProxyMisconfigured)
+        );
+        assert_eq!(
+            channel(&p, &dash, true, None, false, true),
             Ok(Channel::Insecure)
         );
     }

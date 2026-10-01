@@ -3,6 +3,14 @@ Description=OAIY server (headless companion — services/models/python API on 12
 Documentation=https://oaiy.com
 After=network-online.target
 Wants=network-online.target
+# A start that fails is tried again (Restart= below), but not for ever: five starts in a minute and the unit stays
+# failed (systemctl reset-failed oaiy-server, after the settings are put right). This bounds what
+# RestartPreventExitStatus= below cannot: a failing ExecStartPre is not "the main process" exiting 78.
+# Requires systemd 230 or newer: StartLimitIntervalSec= and StartLimitBurst= are read in [Unit] from that version (an older
+# systemd ignores them here with a warning. If `systemctl --version` says less, move both to [Service] and rename the
+# first to StartLimitInterval=: that is its name there before 230, which does not know StartLimitIntervalSec=).
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -23,7 +31,8 @@ EnvironmentFile=/etc/oaiy/oaiy.env
 ExecStart=/usr/local/bin/oaiy-server
 # Refuses to start on a configuration the server would refuse (exit 78), and says why, before the server runs.
 ExecStartPre=/usr/local/bin/oaiy-server check
-# A refusal of the configuration (exit 78) is not restarted: it would refuse again.
+# A refusal of the configuration (exit 78) is not restarted: it would refuse again. (That is the main process only: a
+# failing `check` above is tried again, and StartLimit* above ends it.)
 Restart=on-failure
 RestartPreventExitStatus=78
 RestartSec=3

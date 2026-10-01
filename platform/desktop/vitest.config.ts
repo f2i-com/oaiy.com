@@ -20,9 +20,14 @@ export default defineConfig({
     // TypeScript build's `include` is `src` only, and an import of an .mjs from
     // there would need a declaration the build does not have.
     include: ['src/**/*.{test,spec}.{ts,tsx}', 'scripts/**/*.test.mjs'],
-    // oaiyctl uses node:test and a real POSIX shell, rather than Vitest/jsdom.
-    // npm test runs it separately, preserving both test runners' failures.
-    exclude: [...configDefaults.exclude, 'scripts/oaiyctl.test.mjs'],
+    // oaiyctl, the release check and the smoke-test token helper use node:test (oaiyctl also a real POSIX
+    // shell), rather than Vitest/jsdom. npm test runs them separately, preserving both runners' failures.
+    exclude: [
+      ...configDefaults.exclude,
+      'scripts/oaiyctl.test.mjs',
+      'scripts/check-release.test.mjs',
+      'scripts/smoke-token.test.mjs',
+    ],
     setupFiles: ['./src/test-setup.ts'],
   },
 });

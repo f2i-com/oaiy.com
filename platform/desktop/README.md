@@ -97,7 +97,7 @@ is loopback-only.
 
 ### General
 - `GET    /api/health` — `{ status, product, protocol, version }`
-- `GET    /api/update/status` — whether a newer release exists (`state`, `currentVersion`, `latestVersion`, `notes`, `lastCheckedAt`, `blockers`, …). Open like health on the headless server, which only reports; on the desktop it is read like the calls are (OAIY's own pages or the token), because it says whether a call is live ([docs/UPDATES.md](../../docs/UPDATES.md))
+- `GET    /api/update/status` — whether a newer release exists (`state`, `currentVersion`, `latestVersion`, `notes`, `lastCheckedAt`, `blockers`, …). Open like health on a headless server built without the web login, which only reports; on the web build (what the release ships) and on the desktop it is read like the calls are (OAIY's own pages or a credential with `system.read`, which the token has), because it says whether a call is live ([docs/UPDATES.md](../../docs/UPDATES.md))
 - `POST   /api/update/check` — look at the release feed now (a plain GET, at most once every 30 seconds; privileged). There is no route that downloads or installs: those are commands of the dashboard's own window
 - `GET    /api/config` — `{ activeDir, defaultDir, configuredDir, isCustom, restartRequired }` (read-only; changing the data dir is a desktop-only action — native picker + restart)
 - `GET    /api/backup/status` — `{ lastBackupAt, lastBackupOk, lastBackupSize, pendingRestore, lastRestore, undoAvailable, undoKind, running }` (read-only, a restricted read; `pendingRestore` carries `stagedAt`, `expiresAt` and `expired`: a prepared restore is thrown away unapplied after 24 hours). No HTTP route makes or restores a backup: those are the dashboard's own commands (see [docs/BACKUP.md](../../docs/BACKUP.md)); the other `/api/backup/*` routes are the Agent page's hand-over of its storage, for its origin only and only with a per-backup secret (an export) or the secret the desktop put in the Agent's window (an import).
@@ -190,6 +190,33 @@ npm run tauri:dev   # Spawns vite + Rust dev build + opens window
 The first build takes a few minutes (downloads + compiles the Tauri
 runtime); subsequent rebuilds are cached.
 
+### Tests that open a socket on your network address are opt-in
+
+A default `cargo test` and the local checks (`scripts/check-access.mjs`, `scripts/check-exposure.mjs`,
+`scripts/e2e-exposure.mjs`) **listen and connect on loopback only**: every server binds `127.0.0.1` (or another
+`127.x.y.z` address) and every proxy or peer they pretend to be is another `127.x.y.z` address. On Windows the
+firewall asks for an exception, once per path of the exe, when a program listens on `0.0.0.0` or a LAN address, and
+every "Allow" is a permanent inbound rule for that exe (each `cargo` target folder is a new path), so nothing that
+does that runs by default.
+
+What genuinely needs a listener that is not loopback (`OAIY_SERVER_BIND=lan`, the proxy-only shape, this machine's
+network address as a peer that is neither loopback nor the proxy) is opt-in. Each such test says what it is about to do
+and then does it only when you ask for it:
+
+```pwsh
+# the #[ignore]d tests of the real program, and the opt-in scenarios of the Node proxy doubles
+node scripts/check-exposure.mjs --lan
+# or one at a time
+$env:OAIY_TEST_LAN = "1"; cargo test --no-default-features --features web --test access_exposure -- --ignored --nocapture
+$env:OAIY_TEST_LAN = "1"; node scripts/e2e-exposure.mjs --lan
+```
+
+The same behaviours are also covered without a socket beyond loopback, so a default run is not blind to them: the
+guard's tests (`src-tauri/src/auth/guard_tests.rs`, `login_tests.rs`) send requests with fake peer addresses to a guard
+built from a validated configuration (`exposure::evaluate`), and `auth::exposure` tests every startup rule. When you run a
+throwaway server of your own for a test (`mysqld`, `php -S`, a dev server) bind it to `127.0.0.1`
+(`--bind-address=127.0.0.1`, `-S 127.0.0.1:port`), for the same reason.
+
 To check the API is up:
 ```pwsh
 curl http://127.0.0.1:17972/api/health
@@ -236,14 +263,17 @@ AppHandle-backed config is swapped for an env-var one (`ConfigProvider`).
 
 ```bash
 cargo run --bin oaiy-server                                   # dev (links tauri)
-cargo build --release --no-default-features --bin oaiy-server  # tauri-free, for a clean Linux server
+cargo build --release --no-default-features --features web --bin oaiy-server  # tauri-free, with the web login: what the release builds
 ```
 
 The GUI and the server share one crate but split on a default **`gui`** Cargo
 feature: `oaiy-desktop` (the tray app) requires it; `oaiy-server` built with
 `--no-default-features` drops tauri entirely — **no `webkit2gtk`/GTK on the
 box** (`cargo tree -i tauri` is empty). `npm run tauri:dev` / `tauri:build`
-pass `--features gui` for the GUI.
+pass `--features gui` for the GUI. The **`web`** feature is the server's web login
+(the owner's password, the sign-in page, `oaiy-server auth init`); the release builds
+the server with it (`scripts/check-release.mjs` fails if it does not), its default access
+mode is `scoped`, and a lan or a proxied install needs it (a build without it says so).
 
 Configuration is by environment variable (no pointer file):
 
@@ -253,19 +283,69 @@ Configuration is by environment variable (no pointer file):
 | `OAIY_MODELS_DIR` | `<data>/models` | where downloads land |
 | `OAIY_EXTRA_MODEL_DIRS` | — | extra read-only model roots (`:`/`;`-separated) |
 | `OAIY_SERVER_PORT` | `17972` | listen port (loopback by default) |
-| `OAIY_SERVER_BIND` | — | `lan` enables network binding; requires a token |
+| `OAIY_SERVER_BIND` | loopback | `lan` (every interface) or an address: bearer tokens only over plain HTTP, and it needs an owner login first (`oaiy-server auth init`; a token is no stand-in). Behind a reverse proxy set `OAIY_PUBLIC_URL` (`https://<host>`) and, with a bind beyond loopback, `OAIY_TRUSTED_PROXIES` (only that proxy and this machine are then answered). The desktop ignores `lanAccess`: its API is on this machine only |
 | `OAIY_PLUGIN_DEV_MODE` | debug: `true`, release: `false` | `0`/`false` runs plugins against real hardware; `1`/`true` simulates. Invalid values keep simulation enabled. **`1`/`true` also makes a release build start unsigned plugins** (a debug build always does, whatever this says: `0` there means real hardware); any other value in a release build does not. See [Package trust](../../docs/PLUGINS.md#package-trust). |
-| `OAIY_SERVER_TOKEN` | — | bearer token required for non-public headless APIs |
+| `OAIY_SERVER_TOKEN` | — | bearer token for non-public headless APIs: 32 to 256 printable characters with **no common pattern: a guard against the obvious, not a strength meter** (no placeholder word like `test`, no run like `1234` or `acegikmo` or `a1b2c3d4`, no repeated piece in either case, no phrase of common words, not the hash of `password`; 128 bits is estimated from the alphabet and the length, and says nothing of how the token was made). Make one with `openssl rand -base64 32`: every tool's tokens pass 99.7 times in a hundred or more. One that fails stops the server (exit 78) and the line says what matched and where, never what the token says there |
 | `OAIY_HF_TOKEN` | — | HuggingFace token for gated downloads |
 | `OAIY_UPDATE_FEED` | — | **debug builds only** (a release build ignores it): read the update feed from this address instead of GitHub's, for tests against a local stub |
 
 **Auth:** set `OAIY_SERVER_TOKEN` and send it as `Authorization: Bearer …`.
 Headless APIs require a valid token for reads and writes except health,
-capability discovery and pairing bootstrap. Missing or forged Origin headers
-never substitute for credentials. Network binding without a token fails at
-startup, including when launched from the GUI. `SIGTERM`/`Ctrl-C` stops the managed
-services before exit, and on unix the plugins first, and so does a failed bind of the
+capability discovery and the pairing bootstrap (which, on the web build, are open to a caller with no credential
+only once an owner exists: see *A token-only install on the web build* below). Missing or forged Origin headers
+never substitute for credentials. A configuration the startup rules refuse (a lan bind
+with no owner login, a public URL with a path, a proxy not named, a token that is an
+example or a pattern, a mode that is not allowed there) is exit 78 and one line saying what
+to change; `oaiy-server check` lists every such rule at once, and the shipped systemd unit
+runs it first and does not restart a server that exits 78 (the unit needs systemd 230 or newer: it bounds the restarts
+with `StartLimitIntervalSec=` and `StartLimitBurst=` in `[Unit]`, which an older systemd ignores with a warning; on
+one, move the two to `[Service]`, where they are `StartLimitInterval=` and `StartLimitBurst=`). `SIGTERM`/`Ctrl-C`
+stops the managed services before exit, and on unix the plugins first, and so does a failed bind of the
 port (on Windows a plugin ends with the server's job object).
+
+### A token-only install on the web build
+
+The release builds the headless server with the web login. An install that has only `OAIY_SERVER_TOKEN` (no owner, no
+public URL, the loopback default: what a server without the web login was told) meets three differences, none of which
+a setting undoes:
+
+1. **Until an owner exists the server is in setup-only mode.** A caller with no credential is told `401 setup_required` by
+   every route but health, `GET /api/auth/info`, `GET /api/auth/session` and the login, setup and link routes: capability
+   discovery (`GET /api/bridge/capabilities`), the pairing routes and `GET /api/update/status` included. Those are kept
+   closed on purpose: discovery lists the installed plugins with their states and the reasons they are not running (which
+   can name a path on this machine), and a public server must not accept pairing requests from anyone before there is an
+   owner to approve them. **A caller with a valid credential is not a stranger**: the operator's token, and any token
+   the console made, is judged as it is on every other route, so it reaches capability discovery and the pairing routes
+   (a bridge client that is given the token, as `bridge-client.ts` does on every request, finds the server as before), and
+   a token that is not valid is `401 token_invalid` there as anywhere, and counts towards the failed-bearer throttle. Once
+   an owner exists (`oaiy-server auth init`) those routes are open to everyone again, as on a server without the web login.
+2. **`GET /api/update/status` is not open on the web build.** It is a read of `system.read`, which the token has; it says
+   whether a call is live (the blockers of "Restart to update"), which is not for a stranger. (On a server without the web
+   login it is open, like health.)
+3. **The token is the `cli` preset, which is less than a server without the web login let it reach.** The web build's
+   access mode is `scoped`, and it refuses `legacy`. The token holds `system.read`, `logs.read`, `services.read` and
+   `.control`, `models.read` and `.write`, `plugins.read` and `.control`, `flows.read` and `.write`, `runs.read` and
+   `.write`, `ai.read`, `ai.use` and `events.read`: what the CLI and a bridge client do. **108 routes that a server without the web login let a token reach
+   answer it `403 insufficient_scope`**, by the scope they ask for: `services.define` (defining,
+   uninstalling and exporting services), `runtimes.install` and `plugins.install` (Python and Node installs, installing,
+   removing and trusting a plugin: native code), `ai.admin` (provider keys and the ChatGPT login), `connectors.use`,
+   `speech.use`, `calls.read`, `calls.write`, `calls.manage` and `calls.settings` (voice calls, voices, callers, the
+   messages callers leave, the transfer settings), `calendar.*`, `contacts.*`,
+   `agent.*` (tasks, events, leases, preferences), `setup.*` (the setup wizard and its catalog), `control.read` and
+   `control.admin` (the MCP endpoint, the control settings and log), `link.*` (the account link), `auth.*` (pairings),
+   `companion.*` (the phone relay). `oaiy-server check` and the start's log say so, with the count, for any web-build
+   install that sets a token. The list is pinned to the route table by a test (`auth::login_tests`).
+
+   There is no setting that brings the old behaviour back. Run `oaiy-server auth init`, then make a token with the scopes
+   the job needs: `oaiy-server auth token create --preset cli --scope calendar.read --scope contacts.read`, or `--preset
+   cli-admin` (which adds the installs and is a 24-hour token), and give that token to the client instead of
+   `OAIY_SERVER_TOKEN`; a dashboard session or a paired or derived credential reaches the rest.
+
+A static token that is refused by the rule (an example or a pattern) stops `oaiy-server` (exit 78). The desktop keeps the
+one it was given, as it always did, in `legacy` and warns; in `scoped` it ignores it, and a token with a character outside
+`A-Za-z0-9._~+/=-` that is also refused is then read by the strict bearer rule, which is `400 bad_request`: on every route
+in `scoped`, and in `legacy` on the routes the access model added (the routes that existed before are the old guard's and
+take the token as it is).
 
 ### The web login (`oaiy-server` built with `--features web`)
 
@@ -280,6 +360,12 @@ violation (exit 78); a refusal to start is exit 78 too.
 | `OAIY_PUBLIC_URL`, `OAIY_AGENT_URL`, `OAIY_FLOWS_URL` | the `https://` hosts of the dashboard and the two apps behind your proxy; the dashboard's is where the login lives |
 | `OAIY_TRUSTED_PROXIES` | the proxies whose `X-Forwarded-*` headers are believed |
 | `OAIY_LOGIN_ALLOW` | addresses and networks a sign-in may come from (`203.0.113.7`, `203.0.113.0/24`, `2001:db8::/32`, comma-separated). **A list with any entry that is not an address or a network is refused whole** (the server does not start, `check` fails): a typo must not turn the restriction off. Unset means every address |
+
+`<data>/auth/owner.json` is judged by what the server can read, not by whether the password in it is one: startup rule 2
+(a lan install needs an owner login) is satisfied by any file of the full shape, even one whose hash matches no
+password. Such a file is written only by someone who can already write the data folder, and a hash that matches
+nothing is a server nobody can sign in to (it fails closed, and `oaiyctl auth reset-password` on the console sets a
+real one).
 
 **A service install** has one settings file, `/etc/oaiy/oaiy.env` (install it from
 `systemd/oaiy.env.example`, `root:oaiy`, `0640`), which the unit `systemd/oaiy-server.service` reads
@@ -319,8 +405,20 @@ names counted as guessable) at 10^10 guesses or more, score 4. There are no comp
   absolute-form request target is ignored; both are core behaviour recorded for the exposure work (ACC-14) and the
   static UI (ACC-15), and a proxy in front (Caddy, nginx) normalises both.
 
+**Behind a reverse proxy:** `OAIY_PUBLIC_URL` (and `OAIY_AGENT_URL`, `OAIY_FLOWS_URL` for the other two apps) names
+the hosts the proxy answers to, each `https://<host>[:<port>]` with no path (the scheme may be written in any case;
+the origin the server makes is lowercase), and `OAIY_TRUSTED_PROXIES` the peers whose `X-Forwarded-For` and
+`X-Forwarded-Proto` are believed: the last entry of each, as a proxy that adds to the header puts its own there. A few
+things to know about it: a **Docker network** written as a `/24` holds the bridge's gateway too, which is then trusted
+as well (a connection that reaches a published port comes from the gateway, whoever made it): name the proxy
+container's address, not its network, where the proxy has one; a list that contains a `/0` (every address) is
+accepted with a warning, since any client could then write `X-Forwarded-For`; and the **desktop ignores
+`OAIY_ALLOWED_HOSTS`** (its `Host` allow-list is the loopback names, stricter than the server's, which adds the
+names that variable lists).
+
 **Updates:** the server never downloads or replaces itself. `GET /api/update/status` (open,
-like health) and `POST /api/update/check` (needs the token) tell you whether a newer release
+like health, on a build without the web login; `system.read` on the web build) and `POST /api/update/check` (needs the
+token) tell you whether a newer release
 exists; [docs/UPDATES.md](../../docs/UPDATES.md#the-headless-server) has the steps to upgrade
 one by hand, keeping each version in a directory of its own so going back is one command.
 

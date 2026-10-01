@@ -200,6 +200,56 @@ fn a_damaged_switch_file_is_off_and_an_empty_one_is_the_default() {
     assert!(!control.agent_may_change(), "a byte-order mark is no reason to miss it");
 }
 
+/// Design 4.5.5: the Agent may change OAIY, when nobody has said, on a local install (as it always could) and not on
+/// a proxied or lan one; what the person saved wins on all three, and a damaged file is off on all three.
+#[tokio::test]
+async fn t_agent_may_change_by_default_only_on_a_local_install_and_the_persons_word_wins_everywhere() {
+    use crate::auth::mode::Exposure;
+    for (exposure, default_on) in [
+        (Exposure::Local, true),
+        (Exposure::Proxied, false),
+        (Exposure::Lan, false),
+    ] {
+        let sb = Sandbox::new("switch-exposure");
+        let control = Control::with_exposure(&sb.0, exposure);
+        let file = sb.0.join(super::SETTINGS_FILE);
+        assert_eq!(control.agent_may_change(), default_on, "{exposure:?}: no file");
+        // A file with no such field says nothing about it: `approveDangerous` will live there too.
+        for body in ["{}", r#"{"approveDangerous":true}"#, r#"{"agentMayChange":null}"#] {
+            std::fs::write(&file, body).unwrap();
+            assert_eq!(control.agent_may_change(), default_on, "{exposure:?}: {body}");
+        }
+        // What the person saved, either way.
+        for saved in [true, false] {
+            std::fs::write(&file, json!({ "agentMayChange": saved }).to_string()).unwrap();
+            assert_eq!(control.agent_may_change(), saved, "{exposure:?}: saved {saved}");
+        }
+        // A file that cannot be read, or says something that is not a switch, is off: never a default that is on.
+        for damaged in ["{ not json", r#"{"agentMayChange":"yes"}"#, r#"{"agentMayChange":1}"#] {
+            std::fs::write(&file, damaged).unwrap();
+            assert!(!control.agent_may_change(), "{exposure:?}: {damaged}");
+        }
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        assert!(!control.agent_may_change(), "{exposure:?}: a folder where the file belongs");
+        std::fs::remove_dir(&file).unwrap();
+        // The switch's own routes and the change tools say the same.
+        let app = super::router(control.clone());
+        control.set_router(app.clone());
+        let (status, v) = send(&app, Method::GET, "/api/control/settings", &[], None).await;
+        assert_eq!((status, v), (StatusCode::OK, json!({ "agentMayChange": default_on })), "{exposure:?}");
+        let r = call(&app, None, "setup_finish", json!({})).await;
+        assert_eq!(text(&r) == SWITCHED_OFF, !default_on, "{exposure:?}: {r}");
+        // The person turns it on, where it was off: the file says so from then on.
+        let (status, v) = send(&app, Method::PUT, "/api/control/settings", &[], Some(json!({ "agentMayChange": true }).to_string())).await;
+        assert_eq!((status, v), (StatusCode::OK, json!({ "agentMayChange": true })));
+        assert!(control.agent_may_change());
+    }
+    // A local one built the old way is the same as `with_exposure(Local)`.
+    let sb = Sandbox::new("switch-new");
+    assert!(Control::new(&sb.0).agent_may_change());
+}
+
 // ---------------------------------------------------------------------------
 // The audit log
 // ---------------------------------------------------------------------------

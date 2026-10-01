@@ -273,20 +273,23 @@ at other builds of the Agent and the flow editor.
 
 ```sh
 cd platform/desktop/src-tauri
-cargo build --release --no-default-features --bin oaiy-server
-OAIY_SERVER_TOKEN=change-me ./target/release/oaiy-server
+cargo build --release --no-default-features --features web --bin oaiy-server
+export OAIY_SERVER_TOKEN="$(openssl rand -base64 32)"
+./target/release/oaiy-server
 curl http://127.0.0.1:17972/api/health
 ```
 
-Without the `gui` feature there is no Tauri, WebView or GTK. It is configured by
-environment variables, among them:
+Without the `gui` feature there is no Tauri, WebView or GTK. The `web` feature is the web login
+(the owner's password, the sign-in page, `oaiy-server auth init`): the release builds the server with it, and a
+server put on a network needs it. It is configured by environment variables, among them:
 
 | Variable | Default | What |
 |---|---|---|
 | `OAIY_DATA_DIR` | `~/.oaiy-server` | its data folder |
 | `OAIY_SERVER_PORT` | `17972` | the port |
-| `OAIY_SERVER_BIND` | loopback | `lan` listens on every interface (needs a token) |
-| `OAIY_SERVER_TOKEN` | none | the bearer token for its protected routes |
+| `OAIY_SERVER_BIND` | loopback | `lan` listens on every interface, bearer tokens only, and needs an owner login first (`oaiy-server auth init`); or an address |
+| `OAIY_PUBLIC_URL`, `OAIY_TRUSTED_PROXIES` | none | `https://<host>` of the dashboard when a reverse proxy is in front, and the proxy's address or network (required with a bind beyond loopback) |
+| `OAIY_SERVER_TOKEN` | none | a bearer token for its protected routes: 32 to 256 characters, no common pattern (a guard against the obvious, not a strength meter: `openssl rand -base64 32`); one that has one stops the server (exit 78) |
 | `OAIY_ENGINES_UI` | none | an `oaiy-studio` control port to relay (`http://127.0.0.1:7860`) |
 | `OAIY_VOICE_GATEWAY` | on | `off` leaves 17872 alone, for a server run beside a desktop |
 | `OAIY_PLUGIN_SOURCES` | none | a folder of plugin folders the setup catalog offers |

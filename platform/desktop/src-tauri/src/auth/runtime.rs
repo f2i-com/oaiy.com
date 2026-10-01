@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use super::audit::{self, AuditLog};
 use super::bearer_throttle::ThrottleFile;
 use super::clock::{Clock, SystemClock};
+use super::exposure::Config;
 use super::guard::{Guard, GuardConfig};
 use super::mode::{validate_mode, AccessMode};
 use super::store::{AuthStore, Host, SecureWriter, StoreError};
@@ -13,20 +14,29 @@ use super::store::{AuthStore, Host, SecureWriter, StoreError};
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// What `serve` is told about the access model.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct AccessSettings {
     pub mode: AccessMode,
+    /// A server that passed the startup rules (`auth::exposure`): what the guard, the login and the control
+    /// switch are built from. The desktop has none, and reads its settings leniently.
+    pub config: Option<Arc<Config>>,
 }
 
 impl AccessSettings {
     pub fn new(mode: AccessMode) -> Self {
-        AccessSettings { mode }
+        AccessSettings { mode, config: None }
     }
 
     /// Today's behaviour: the default until the flip.
     pub fn legacy() -> Self {
+        AccessSettings::new(AccessMode::Legacy)
+    }
+
+    /// A server whose configuration passed the startup rules.
+    pub fn for_server(config: Config) -> Self {
         AccessSettings {
-            mode: AccessMode::Legacy,
+            mode: config.mode,
+            config: Some(Arc::new(config)),
         }
     }
 }
@@ -53,7 +63,10 @@ pub fn build_guard(
     static_token: Option<String>,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Arc<Guard>, BoxError> {
-    let (config, warnings) = GuardConfig::from_env(env, bind_all, gui, port);
+    let (config, warnings) = match &settings.config {
+        Some(validated) => (GuardConfig::from_config(validated, gui), Vec::new()),
+        None => GuardConfig::from_env(env, bind_all, gui, port),
+    };
     for w in &warnings {
         log::warn!("auth: {w}");
     }
@@ -109,6 +122,7 @@ pub fn build_guard(
                 "port": port,
                 "hosts": guard.config().hosts.describe(),
                 "trustedProxies": guard.config().trusted.describe(),
+                "proxyOnly": guard.config().proxy_only,
             }),
         );
     }
@@ -333,6 +347,80 @@ mod tests {
         assert_eq!(
             d["trustedProxies"],
             serde_json::json!(["10.0.0.0/8", "192.0.2.7/32"])
+        );
+        audit::uninstall();
+    }
+
+    /// `oaiy-server` builds its guard from the configuration that passed the startup rules, and does not read the
+    /// environment again: the environment given here says nothing, and the guard is still a proxy-only one. (No socket:
+    /// the bind is an address in the configuration.)
+    #[test]
+    fn a_guard_built_for_a_server_is_made_from_its_validated_configuration_and_the_startup_event_says_so(
+    ) {
+        use super::super::exposure::{evaluate, Facts};
+        let dir = TempDir::new("runtime-server-config");
+        let vars = |name: &str| match name {
+            "OAIY_SERVER_BIND" => Some("0.0.0.0".to_string()),
+            "OAIY_PUBLIC_URL" => Some("https://dash.example.com".to_string()),
+            "OAIY_TRUSTED_PROXIES" => Some("172.30.0.0/24".to_string()),
+            "OAIY_ALLOWED_HOSTS" => Some("nas.example:9000".to_string()),
+            _ => None,
+        };
+        let evaluation = evaluate(
+            &vars,
+            &Facts {
+                owner_exists: false,
+                web_login: true,
+            },
+        );
+        let config = evaluation.config.expect("the rules allow it");
+        let settings = AccessSettings::for_server(config);
+        assert_eq!(settings.mode, AccessMode::Scoped);
+        let guard = build_guard(&settings, &dir.0, 17972, true, false, None, &no_env).unwrap();
+        let c = guard.config();
+        assert!(c.proxy_only && c.exposure == super::super::mode::Exposure::Proxied);
+        assert_eq!(c.trusted.describe(), ["172.30.0.0/24"]);
+        let text = std::fs::read_to_string(dir.0.join("auth").join("audit.jsonl")).unwrap();
+        let startup: serde_json::Value = text
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .find(|l| l["event"] == "startup")
+            .expect("a startup event");
+        let d = &startup["detail"];
+        assert_eq!(
+            (
+                d["exposure"].as_str(),
+                d["proxyOnly"].as_bool(),
+                d["mode"].as_str()
+            ),
+            (Some("proxied"), Some(true), Some("scoped"))
+        );
+        let hosts: Vec<&str> = d["hosts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h.as_str().unwrap())
+            .collect();
+        assert!(
+            hosts.contains(&"dash.example.com") && hosts.contains(&"nas.example:9000"),
+            "{hosts:?}"
+        );
+        audit::uninstall();
+        // The desktop's way (no configuration) reads what it is given, leniently, and is never proxy-only.
+        let other = TempDir::new("runtime-desktop-config");
+        let guard = build_guard(
+            &AccessSettings::new(AccessMode::Scoped),
+            &other.0,
+            17972,
+            false,
+            true,
+            None,
+            &vars,
+        )
+        .unwrap();
+        assert!(
+            !guard.config().proxy_only
+                && guard.config().exposure == super::super::mode::Exposure::Local
         );
         audit::uninstall();
     }

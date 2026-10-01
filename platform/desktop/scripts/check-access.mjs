@@ -17,6 +17,10 @@
 //      hold a dangerous scope, no relay tier does, and `control.project` never travels without
 //      `control.read`.
 //
+//   0. First, and without cargo: `check-release.mjs` reads the release and CI workflows and fails if the release builds the
+//      headless server without the `web` feature (a lan or a proxied install needs the web login, and a build without it
+//      cannot serve either), or if CI does not test that build.
+//
 // The cargo command can be replaced with OAIY_CARGO (a program and its leading arguments). On a
 // machine whose C++ tools are not on the PATH, run it through the wrapper that loads them.
 
@@ -31,6 +35,12 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const crate = path.resolve(here, '..', 'src-tauri');
 const skipBoot = process.argv.includes('--skip-boot');
 const cargo = (process.env.OAIY_CARGO ?? 'cargo').split(/\s+/).filter(Boolean);
+
+// The release builds the headless server with the web login and CI tests that build: text only, before anything is built.
+{
+  const release = spawnSync(process.execPath, [path.join(here, 'check-release.mjs')], { stdio: 'inherit' });
+  if (release.status !== 0) process.exit(release.status || 1);
+}
 
 // The tests write routes.json here, so this script knows where to read it.
 const out = fs.mkdtempSync(path.join(os.tmpdir(), 'oaiy-access-check-'));
@@ -127,3 +137,7 @@ const existing = doc.routes.filter((r) => r.since === 1).length;
 console.log(`\ncheck-access: ok. ${doc.routes.length} rows (${existing} for routes that existed before the access model, ${doc.routes.length - existing} added or reserved), ${scopeRows.size} scopes named by a row, ${Object.keys(doc.presets).length} presets, ${Object.keys(doc.relayTiers).length} relay tiers.`);
 if (process.argv.includes('--keep')) console.log(`routes.json: ${file}`);
 else fs.rmSync(out, { recursive: true, force: true });
+// Everything above listens on 127.0.0.1 only (the servers the boot tests start take a bind of their own, and the console's
+// tests talk to loopback). What needs a listener on a network address is opt-in, in `check-exposure.mjs --lan`, because
+// Windows Firewall asks the owner about each new path of an exe that listens beyond loopback.
+console.log('check-access: opened nothing on a network address. Not run, opt-in: the lan and proxy-only listener tests (node scripts/check-exposure.mjs --lan).');

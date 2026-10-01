@@ -836,6 +836,7 @@
       "calendar.json": "calendar",
       "callers.json": "callers",
       "chosen": "voices",
+      "clientip_golden.json": "not-a-store: the committed golden file of the client-address cross-check (auth/clientip_crosscheck.rs), read from the source tree by a test and never written into a data folder",
       "codex-home": "codex-signin",
       "companion": "companion",
       "completions": "link-state",

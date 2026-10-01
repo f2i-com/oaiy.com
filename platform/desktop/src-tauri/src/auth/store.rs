@@ -769,7 +769,9 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, StoreError> {
     }
 }
 
-fn read_owner(dir: &Path) -> Result<Option<OwnerFile>, StoreError> {
+/// Read `<dir>/owner.json` as the store does at open: `Ok(None)` for a file that is not there, and an error naming it
+/// for every other thing (`auth::exposure::inspect_owner_file` asks the same, so that the start and `check` agree).
+pub(crate) fn read_owner(dir: &Path) -> Result<Option<OwnerFile>, StoreError> {
     let path = dir.join("owner.json");
     let Some(bytes) = read_optional(&path)? else {
         return Ok(None);

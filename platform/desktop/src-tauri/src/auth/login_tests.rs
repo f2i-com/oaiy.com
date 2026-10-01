@@ -306,6 +306,8 @@ impl Drop for LetGo {
 
 struct Build {
     proxied: bool,
+    /// A listener bound beyond loopback with no public URL: plain HTTP, bearer only.
+    lan: bool,
     login_allow: Option<&'static str>,
     /// Reuse a data folder (a restart).
     dir: Option<TempDir>,
@@ -318,6 +320,7 @@ impl Default for Build {
     fn default() -> Self {
         Build {
             proxied: true,
+            lan: false,
             login_allow: None,
             dir: None,
             at: T0,
@@ -348,7 +351,7 @@ fn build(b: Build) -> Env {
     }
     let env_vars = vars.clone();
     let (config, warnings) =
-        GuardConfig::from_env(&move |n| vars.get(n).cloned(), false, false, 41000);
+        GuardConfig::from_env(&move |n| vars.get(n).cloned(), b.lan, false, 41000);
     assert!(warnings.is_empty(), "{warnings:?}");
     let auth = dir.0.join("auth");
     let audit = Arc::new(AuditLog::open(&auth, clock.clone(), false));
@@ -2867,6 +2870,278 @@ async fn setup_only_mode_lets_a_console_credential_through_before_there_is_an_ow
         );
     }
 }
+
+/// An existing headless install has `OAIY_SERVER_TOKEN` and no owner. On the web build (what the release ships now) its
+/// server is in setup-only mode until `oaiy-server auth init`, which answers a STRANGER `setup_required` on the public
+/// routes of the bridge. It answered the operator's own valid token that too, where the same token reached every
+/// protected route: capability discovery (which bridge clients call with the token on, `bridge-client.ts`) and the
+/// pairing routes were closed to it, and the install could not be discovered. The gate is for the unauthenticated.
+#[tokio::test]
+async fn a_token_only_install_with_no_owner_lets_its_token_through_the_setup_only_gate_and_keeps_a_stranger_out(
+) {
+    const TOKEN: &str = "Vl0JTnJtFseAe9ePKCDhuBymfRXQ8osZ-QMlM86leCU";
+    let e = build(Build {
+        static_token: Some(TOKEN),
+        ..Build::default()
+    });
+    assert!(!e.state.owner_configured());
+    // The public routes of the bridge, the ones the gate closes, and a few of the protected ones (the operator's token
+    // reached those all along: it is the `cli` preset, `system.read` and `services.read` among others).
+    let closed_to_strangers = [
+        (Method::GET, "/api/bridge/capabilities"),
+        (Method::POST, "/api/bridge/pairing"),
+        (Method::GET, "/api/bridge/pairing/x"),
+    ];
+    let protected = [
+        (Method::GET, "/api/services"),
+        (Method::GET, "/api/config"),
+        (Method::GET, "/api/node"),
+        (Method::GET, "/api/update/status"),
+        (Method::GET, "/api/auth/whoami"),
+    ];
+    let ask = |e: &Env, m: &Method, p: &str| req(e, m.clone(), p).json(json!({}));
+    for (m, p) in closed_to_strangers.iter().chain(protected.iter()) {
+        // A stranger: `setup_required`, as R11 has it.
+        let r = go(&e, ask(&e, m, p)).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (401, Some("setup_required")),
+            "a stranger: {m} {p}: {}",
+            r.text
+        );
+        // The token: the route answers (the stubs here say `ok`; `whoami` says who this is).
+        let r = go(&e, ask(&e, m, p).bearer(TOKEN)).await;
+        assert_eq!(r.status, 200, "the token: {m} {p}: {}", r.text);
+    }
+    let me = go(&e, req(&e, Method::GET, "/api/auth/whoami").bearer(TOKEN)).await;
+    assert_eq!(me.json()["kind"], "static");
+    // A stranger that carries a session cookie (a leftover one, a garbage one, a well-formed one the store has never heard
+    // of) is a stranger still: no cookie opens or changes this gate, and the cookie is not read as a credential on a route
+    // that the gate closes (it is `setup_required`, not the `token_invalid` or `csrf` that reading it would say).
+    let unknown = token::mint(Kind::Ses).unwrap().token;
+    for value in ["garbage".to_string(), unknown] {
+        let cookie = format!("{}={value}", session_cookie_name(&e));
+        for (m, p) in &closed_to_strangers {
+            let r = go(&e, ask(&e, m, p).cookie(&cookie)).await;
+            assert_eq!(
+                (r.status, r.code().as_deref()),
+                (401, Some("setup_required")),
+                "a stranger with a session cookie: {m} {p}: {}",
+                r.text
+            );
+        }
+    }
+    // A token that is not the operator's is what it is anywhere, on the public routes too: not `setup_required`, which
+    // would say nothing about the credential, and it is counted (the throttle) as a wrong bearer is.
+    for (m, p) in closed_to_strangers.iter().chain(protected.iter().take(1)) {
+        let wrong = format!("W{}", &TOKEN[1..]);
+        let r = go(&e, ask(&e, m, p).bearer(&wrong)).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (401, Some("token_invalid")),
+            "a wrong token: {m} {p}: {}",
+            r.text
+        );
+        // One that is not even a bearer is a bad request, as it is everywhere.
+        let r = go(&e, ask(&e, m, p).h("authorization", "Bearer a b")).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (400, Some("bad_request")),
+            "a malformed bearer: {m} {p}: {}",
+            r.text
+        );
+        // A scheme that is not Bearer says nothing: the caller has no credential.
+        let r = go(&e, ask(&e, m, p).h("authorization", "Basic dXNlcjpwdw==")).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (400, Some("bad_request")),
+            "not a bearer: {m} {p}: {}",
+            r.text
+        );
+    }
+    // Every wrong guess counted: a flood of them from one address is blocked, on the public routes as on the others.
+    let mut last = 0;
+    for _ in 0..30 {
+        let wrong = format!("W{}", &TOKEN[1..]);
+        let r = go(
+            &e,
+            ask(&e, &Method::GET, "/api/bridge/capabilities").bearer(&wrong),
+        )
+        .await;
+        last = r.status;
+        if last == 429 {
+            break;
+        }
+    }
+    assert_eq!(
+        last, 429,
+        "guessing the token on a public route is throttled"
+    );
+
+    // With an owner, as R11 has it: the public routes are public again, to a stranger as to the token, and the token
+    // is what it was.
+    let e = build(Build {
+        static_token: Some(TOKEN),
+        ..Build::default()
+    });
+    make_owner(&e, PASSWORD).await;
+    assert!(e.state.owner_configured());
+    for (m, p) in &closed_to_strangers {
+        let r = go(&e, ask(&e, m, p)).await;
+        assert_ne!(r.code().as_deref(), Some("setup_required"), "{m} {p}");
+        assert_eq!(
+            r.status, 200,
+            "a stranger, with an owner: {m} {p}: {}",
+            r.text
+        );
+        let r = go(&e, ask(&e, m, p).bearer(TOKEN)).await;
+        assert_eq!(
+            r.status, 200,
+            "the token, with an owner: {m} {p}: {}",
+            r.text
+        );
+    }
+    for (m, p) in &protected {
+        let r = go(&e, ask(&e, m, p)).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (401, Some("auth_required")),
+            "a stranger, with an owner: {m} {p}: {}",
+            r.text
+        );
+        let r = go(&e, ask(&e, m, p).bearer(TOKEN)).await;
+        assert_eq!(
+            r.status, 200,
+            "the token, with an owner: {m} {p}: {}",
+            r.text
+        );
+    }
+}
+
+/// The gate's exception is a valid credential, not the static token alone: a token of the store (one that was paired or
+/// made on the console) passes the gate on the public routes of the bridge as it reaches every other route, and a dead one
+/// (revoked, expired) is what it is anywhere (`401 token_revoked`, `401 token_expired`), and not `setup_required`, which
+/// says nothing of the credential. The install whose `owner.json` was deleted and whose `credentials.json` survived is
+/// this shape.
+#[tokio::test]
+async fn a_token_of_the_store_passes_the_setup_only_gate_and_a_dead_one_is_not_told_setup_required()
+{
+    let e = build(Build::default());
+    assert!(!e.state.owner_configured());
+    let gated = [
+        (Method::GET, "/api/bridge/capabilities"),
+        (Method::POST, "/api/bridge/pairing"),
+        (Method::GET, "/api/bridge/pairing/x"),
+    ];
+    let ask = |e: &Env, m: &Method, p: &str| req(e, m.clone(), p).json(json!({}));
+    let (live, revoked, expired) = (a_pat(&e), a_pat(&e), a_pat(&e));
+    assert!(e.store.revoke(&revoked.id, "revoked"));
+    for (m, p) in &gated {
+        let r = go(&e, ask(&e, m, p)).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (401, Some("setup_required")),
+            "a stranger: {m} {p}: {}",
+            r.text
+        );
+        let r = go(&e, ask(&e, m, p).bearer(&live.token)).await;
+        assert_eq!(r.status, 200, "a token of the store: {m} {p}: {}", r.text);
+        let r = go(&e, ask(&e, m, p).bearer(&revoked.token)).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (401, Some("token_revoked")),
+            "a revoked token: {m} {p}: {}",
+            r.text
+        );
+    }
+    // It is the guard's own judgement: the same token is who it is on a route that asks for a credential.
+    let me = go(
+        &e,
+        req(&e, Method::GET, "/api/auth/whoami").bearer(&live.token),
+    )
+    .await;
+    assert_eq!(
+        (me.status, me.json()["kind"].as_str()),
+        (200, Some("pat")),
+        "{}",
+        me.text
+    );
+    // One that has run out is dead too.
+    e.clock.advance(31 * 24 * HOUR);
+    for (m, p) in &gated {
+        let r = go(&e, ask(&e, m, p).bearer(&expired.token)).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (401, Some("token_expired")),
+            "an expired token: {m} {p}: {}",
+            r.text
+        );
+    }
+}
+
+/// What the operator's static token is on the web build (the `cli` preset), which is less than it reached in `legacy`:
+/// these are the routes that existed before the access model and that it cannot reach now, `403 insufficient_scope`,
+/// by the scope each asks for. They are written in the README (The headless server on the web build) and `oaiy-server
+/// check` says how many there are: this pins both to the table, so that a route the model adds or re-classifies
+/// changes what the operator is told.
+#[tokio::test]
+async fn the_static_token_loses_exactly_the_routes_the_documents_list() {
+    let cli = super::presets::Preset::Cli.scopes();
+    let mut lost: std::collections::BTreeMap<&str, usize> = Default::default();
+    let mut total = 0;
+    for r in ROUTES {
+        if r.since == 1 {
+            if let Class::Scope(s) = r.class {
+                if !cli.contains(s) {
+                    *lost.entry(s).or_default() += 1;
+                    total += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(total, super::exposure::TOKEN_ONLY_LOSES_ROUTES);
+    let scopes: Vec<&str> = lost.keys().copied().collect();
+    assert_eq!(scopes, super::exposure::TOKEN_ONLY_LOSES_SCOPES);
+    // ... and it is what the guard says to the token: a 403 naming the scope, on a sample of each scope.
+    let e = build(Build {
+        static_token: Some("Vl0JTnJtFseAe9ePKCDhuBymfRXQ8osZ-QMlM86leCU"),
+        ..Build::default()
+    });
+    make_owner(&e, PASSWORD).await;
+    for scope in &scopes {
+        let row = ROUTES
+            .iter()
+            .find(|r| r.since == 1 && matches!(r.class, Class::Scope(s) if s == *scope))
+            .unwrap();
+        let method = match row.method {
+            Verb::Get => Method::GET,
+            Verb::Post => Method::POST,
+            Verb::Put => Method::PUT,
+            Verb::Delete => Method::DELETE,
+            Verb::Patch => Method::PATCH,
+            other => panic!("{other:?}"),
+        };
+        let path: String = row
+            .pattern
+            .split('/')
+            .map(|s| if s.starts_with(':') { "x" } else { s })
+            .collect::<Vec<_>>()
+            .join("/");
+        let r = go(
+            &e,
+            req(&e, method.clone(), &path)
+                .json(json!({}))
+                .bearer("Vl0JTnJtFseAe9ePKCDhuBymfRXQ8osZ-QMlM86leCU"),
+        )
+        .await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (403, Some("insufficient_scope")),
+            "{method} {path} ({scope}): {}",
+            r.text
+        );
+    }
+}
 // ==================================== the memory bound and the allow-list =============================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3184,6 +3459,280 @@ async fn the_login_allow_list_refuses_other_addresses_before_any_hashing() {
     );
     assert_eq!(e.engine.hashes.load(Ordering::SeqCst), hashed);
     assert_eq!(login_as(&e, PASSWORD, "2001:db8:1::5").await.status, 200);
+}
+
+/// The login built from a configuration that passed the startup rules says what the environment says: the dashboard's
+/// origin, the host names the password estimate treats as guessable, and the address allow-list.
+#[test]
+fn login_options_from_a_validated_configuration_are_what_the_environment_says() {
+    use super::exposure::{evaluate, Facts};
+    let cases: [&[(&str, &str)]; 2] = [
+        &[
+            ("OAIY_PUBLIC_URL", "https://dash.example.com"),
+            ("OAIY_AGENT_URL", "https://agent.example.com:8443"),
+            ("OAIY_FLOWS_URL", "https://flows.example.com"),
+            (
+                "OAIY_LOGIN_ALLOW",
+                "203.0.113.0/24, 2001:db8::/32, 198.51.100.7",
+            ),
+        ],
+        &[],
+    ];
+    for vars in cases {
+        let map: std::collections::BTreeMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let env = move |n: &str| map.get(n).cloned();
+        let evaluation = evaluate(
+            &env,
+            &Facts {
+                owner_exists: false,
+                web_login: true,
+            },
+        );
+        let config = evaluation.config.expect("the rules allow it");
+        let built = LoginOptions::from_config(&config, 41000);
+        let read = LoginOptions::production(&env, 41000).expect("the list is one the rules allow");
+        assert_eq!(built.dash_origin, read.dash_origin, "{vars:?}");
+        assert_eq!(built.login_allow, read.login_allow, "{vars:?}");
+        let (mut a, mut b) = (built.hosts.clone(), read.hosts.clone());
+        a.sort();
+        b.sort();
+        assert_eq!(a, b, "{vars:?}");
+    }
+    // The validated form is the normalised one: lowercase, the default port dropped (the environment's own text would
+    // have been `https://Dash.Example.com:443`, which is not what a browser sends as its `Origin`).
+    let env =
+        |n: &str| (n == "OAIY_PUBLIC_URL").then(|| "https://Dash.Example.com:443".to_string());
+    let config = evaluate(
+        &env,
+        &Facts {
+            owner_exists: false,
+            web_login: true,
+        },
+    )
+    .config
+    .unwrap();
+    let built = LoginOptions::from_config(&config, 41000);
+    assert_eq!(built.dash_origin, "https://dash.example.com");
+    assert_eq!(built.hosts, ["dash.example.com"]);
+    // A local install has the loopback dashboard's name, on its port.
+    let built = LoginOptions::from_config(
+        &evaluate(
+            &|_: &str| None,
+            &Facts {
+                owner_exists: false,
+                web_login: true,
+            },
+        )
+        .config
+        .unwrap(),
+        41000,
+    );
+    assert_eq!(built.dash_origin, "http://dash.oaiy.localhost:41000");
+    assert!(built.hosts.is_empty() && built.login_allow.is_empty());
+}
+
+// ==================================== ACC-14: a lan listener has no login ============================
+
+const LAN_TOKEN: &str = "pyKvbv-kgRHhxqjS7f7IBb-MU_CUY6a7A7RmMk3s0Dg";
+
+/// The same data folder, started again as a listener bound beyond loopback with no public URL (design 3.4: plain
+/// HTTP, bearer only). The owner exists (a lan install cannot start without one).
+fn as_lan(e: Env) -> Env {
+    let at = e.clock.now_ms() + MIN;
+    let Env {
+        app,
+        state,
+        guard,
+        store,
+        dir,
+        ..
+    } = e;
+    drop((app, state, guard, store));
+    build(Build {
+        dir: Some(dir),
+        at,
+        proxied: false,
+        lan: true,
+        static_token: Some(LAN_TOKEN),
+        ..Build::default()
+    })
+}
+
+/// A request from another machine on the network to the listener's address.
+fn lan_req(e: &Env, method: Method, path: &str) -> Req {
+    req(e, method, path)
+        .host("192.168.1.5:41000")
+        .from("192.168.1.9")
+}
+
+#[tokio::test]
+async fn t45_a_lan_listener_refuses_the_sign_in_and_says_it_needs_https_and_runs_no_hash() {
+    let e = env();
+    make_owner(&e, PASSWORD).await;
+    let e = as_lan(e);
+    assert!(
+        e.guard.login_configured(),
+        "a lan install starts only with an owner"
+    );
+    for (path, body) in [
+        ("/api/auth/login", json!({ "password": PASSWORD })),
+        (
+            "/api/auth/setup",
+            json!({ "code": "M6SC-7N75-YR3H", "password": PASSWORD }),
+        ),
+        ("/api/auth/link", json!({ "code": "x".repeat(43) })),
+    ] {
+        for browser in [false, true] {
+            let mut r = lan_req(&e, Method::POST, path).json(body.clone());
+            if browser {
+                r = r
+                    .h("origin", "http://192.168.1.5:41000")
+                    .h("sec-fetch-site", "same-origin");
+            }
+            let reply = go(&e, r).await;
+            assert_eq!(
+                (reply.status, reply.code().as_deref()),
+                (403, Some("secure_channel_required")),
+                "{path} browser {browser}: {}",
+                reply.text
+            );
+            assert!(
+                reply.cookies().is_empty(),
+                "{path}: no cookie is set on plain HTTP"
+            );
+        }
+    }
+    assert_eq!(
+        (
+            e.engine.verifies.load(Ordering::SeqCst),
+            e.engine.hashes.load(Ordering::SeqCst)
+        ),
+        (0, 0),
+        "refused before any hashing"
+    );
+    // The same routes from the machine itself under a loopback name are a host that serves no app: the answer they
+    // always gave.
+    let r = go(
+        &e,
+        lan_req(&e, Method::POST, "/api/auth/login")
+            .host("127.0.0.1:41000")
+            .json(json!({ "password": PASSWORD })),
+    )
+    .await;
+    assert_eq!(r.status, 404);
+}
+
+#[tokio::test]
+async fn t45_a_lan_listener_refuses_a_session_cookie_rather_than_ignoring_it_and_a_bearer_needs_none(
+) {
+    let e = env();
+    make_owner(&e, PASSWORD).await;
+    let signed_in = login_as(&e, PASSWORD, "127.0.0.1").await;
+    let b = browser_from(&e, &signed_in);
+    let e = as_lan(e);
+    let cookie = |name: &str| format!("{name}={}", b.session);
+    // Every way a session cookie of ours can be named: refused, said why, on a route that needs a credential.
+    for name in [
+        "oaiy_dash_41000",
+        "oaiy_agent_41000",
+        "oaiy_flows_8080",
+        "__Host-oaiy_dash",
+        "__Host-oaiy_agent",
+        "__Host-oaiy_flows",
+    ] {
+        let r = go(
+            &e,
+            lan_req(&e, Method::GET, "/api/services").cookie(&cookie(name)),
+        )
+        .await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (403, Some("secure_channel_required")),
+            "{name}: {}",
+            r.text
+        );
+    }
+    // Among other cookies too.
+    let r = go(
+        &e,
+        lan_req(&e, Method::GET, "/api/services")
+            .cookie("theme=dark")
+            .cookie(&cookie("oaiy_dash_41000"))
+            .cookie("lang=en"),
+    )
+    .await;
+    assert_eq!(r.code().as_deref(), Some("secure_channel_required"));
+    // What is not a session cookie is not refused, only anonymous: another site's cookie, the device cookie, a name
+    // that only looks like ours.
+    for pair in [
+        "theme=dark",
+        "oaiy_dev_41000=x",
+        "__Host-oaiy_dev=x",
+        "oaiy_dash_=x",
+        "oaiy_dash_4x=x",
+        "oaiy_dashboard_41000=x",
+        "xoaiy_dash_41000=x",
+        "OAIY_DASH_41000=x",
+    ] {
+        let r = go(&e, lan_req(&e, Method::GET, "/api/services").cookie(pair)).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (401, Some("auth_required")),
+            "{pair}: {}",
+            r.text
+        );
+    }
+    // A bearer wins over a cookie, as everywhere: the token is honoured and the cookie never looked at.
+    let r = go(
+        &e,
+        lan_req(&e, Method::GET, "/api/auth/whoami")
+            .h("authorization", &format!("Bearer {LAN_TOKEN}"))
+            .cookie(&cookie("oaiy_dash_41000")),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.json()["kind"], "static");
+    // A public route reads no cookie: the anonymous answer, and it says the channel is not secure.
+    let r = go(
+        &e,
+        lan_req(&e, Method::GET, "/api/auth/session").cookie(&cookie("oaiy_dash_41000")),
+    )
+    .await;
+    assert_eq!(
+        (r.status, r.json()["authenticated"].clone()),
+        (200, json!(false))
+    );
+    let r = go(&e, lan_req(&e, Method::GET, "/api/auth/info")).await;
+    assert_eq!(
+        (
+            r.json()["secureChannel"].as_bool(),
+            r.json()["loginConfigured"].as_bool()
+        ),
+        (Some(false), Some(true))
+    );
+    // Nothing is a UI here: the routes of the API are all there is (the static hosts are a later step's, and answer
+    // an insecure channel with a page that says so).
+    for path in ["/", "/index.html", "/apps/dash", "/login"] {
+        let r = go(&e, lan_req(&e, Method::GET, path)).await;
+        assert_eq!(r.status, 404, "{path}");
+        assert!(!r.text.contains("<html"), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn t45_the_same_cookie_on_a_secure_channel_is_still_a_session() {
+    // The refusal is about the channel, not the cookie: behind the proxy over https, and from the machine itself on
+    // a loopback name, the cookie of the host's app works as it did.
+    let e = env();
+    make_owner(&e, PASSWORD).await;
+    let r = login_as(&e, PASSWORD, "203.0.113.9").await;
+    let b = browser_from(&e, &r);
+    let r = go(&e, as_page(&e, &b, Method::GET, "/api/auth/whoami")).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.json()["kind"], "session");
 }
 
 // ==================================== nothing secret is written ======================================

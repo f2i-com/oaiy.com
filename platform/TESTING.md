@@ -120,7 +120,25 @@ session, and after a few runs the shim can no longer start.
 (cd ui      && npm test)                 # installs the ZIPP engines if needed, then typecheck, css tokens, contracts, both engines, and the editor's own suites (OAIY's window, services, storage, landing links, engine address, sealed API keys, the service worker and its build, install and update, manifest and icons, download links, the site's pictures and metadata)
 (cd desktop && npm run build)            # tsc --noEmit + vite build
 node --test scripts/fetch-zipp-release.test.mjs   # the ZIPP installer (see "ZIPP engines")
+(cd desktop && node scripts/check-release.mjs)    # the release builds oaiy-server with --features web, CI tests that, the unit does not restart exit 78
+(cd desktop && node --test scripts/check-release.test.mjs)   # ... and that check fails for each way they lose it
+(cd desktop && node --test scripts/smoke-token.test.mjs)     # the release smoke test draws its token again when the server's own check refuses one
 ```
+
+**Nothing in a default run listens or connects beyond loopback.** A listener on `0.0.0.0` or a LAN address makes Windows
+Firewall ask the owner for an exception for that exe, and every "Allow" is a permanent inbound rule. The tests of the
+access model that need one (the `lan` bind, the proxy-only shape of `oaiy-server`, this machine's network address as a
+peer) are opt-in: `#[ignore]`d in `desktop/src-tauri/tests/access_exposure.rs` and checked against `OAIY_TEST_LAN=1`,
+and the same flag (`--lan`) on `desktop/scripts/e2e-exposure.mjs` and `desktop/scripts/check-exposure.mjs`. They say
+what they are about to do before they do it; a default run lists them as not run. The same behaviours are covered in
+process by `auth::guard_tests` (fake peer addresses, a guard built from `exposure::evaluate`) and `auth::login_tests`.
+Any server a test or a helper starts (`mysqld --bind-address=127.0.0.1`, `php -S 127.0.0.1:port`, a Node double) binds
+`127.0.0.1`, and takes `127.0.0.2` to `127.0.0.9` where it needs another peer; they are all this machine.
+
+Nor does a unit test call out. `link::open_handle` starts a heartbeat and a data-node worker that run until the process
+ends, and a store that holds a linked account (the fixtures use `https://formlogic.com`) would send that provider a
+heartbeat with a made-up key. A test of the link opens its store with `link::open_handle_without_workers` or
+`link::store_for_tests`, never `open_handle`, and gives an account no `baseUrl` beyond `127.0.0.1`.
 
 ## API end-to-end
 

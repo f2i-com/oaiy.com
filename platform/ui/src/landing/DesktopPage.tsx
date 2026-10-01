@@ -227,17 +227,18 @@ function Install() {
 
       <h3 className="lp-mini-h mt-12">On a Linux host: the headless server</h3>
       <p className="mb-5 text-sm" style={{ color: 'rgb(var(--color-text-tertiary))', lineHeight: 1.55, maxWidth: '40rem' }}>
-        <code>oaiy-server</code> is the same local API and services with no window, no tray icon and no webview, so nothing graphical needs installing, for a server that the <code>oaiy</code> command line or a web app drives. It has no Agent or flow editor to show. To listen on the network it needs a token.
+        <code>oaiy-server</code> is the same local API and services with no window, no tray icon and no webview, so nothing graphical needs installing, for a server that the <code>oaiy</code> command line or a web app drives. It has no Agent or flow editor to show. To listen on the network it needs an owner login made first (<code>oaiy-server auth init</code>), or a reverse proxy with its address in front.
       </p>
       <div className="lp-window">
         <div className="lp-window-bar">
           <span className="lp-window-file">oaiy-server-&lt;version&gt;-linux-x86_64.tar.gz</span>
         </div>
         <pre className="lp-code" style={{ ['--tone' as string]: 'var(--signal-green)' }}>
-<span className="lp-code-c"># unpack it and start it with a token</span>{'\n'}
+<span className="lp-code-c"># unpack it and start it with a token of your own (a random one: the server refuses one that is not)</span>{'\n'}
 mkdir oaiy-server &amp;&amp; tar -xzf oaiy-server-*-linux-x86_64.tar.gz -C oaiy-server{'\n'}
 cd oaiy-server{'\n'}
-OAIY_SERVER_TOKEN=change-me ./oaiy-server{'\n\n'}
+export OAIY_SERVER_TOKEN=&quot;$(openssl rand -base64 32)&quot;{'\n'}
+./oaiy-server{'\n\n'}
 <span className="lp-code-c"># in another shell</span>{'\n'}
 curl http://127.0.0.1:17972/api/health
         </pre>
