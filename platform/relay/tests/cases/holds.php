@@ -661,7 +661,11 @@ test('4.7.2 rule 5: eight polls of one credential that arrive together are not a
     usleep(300000);
     // Every request is sent but for its last two bytes, and the last two bytes are then sent to all eight in one go: a server starts
     // on a request when it has the whole header, so the eight are in the same step at the same time, all before any of them has a
-    // marker, and a check that was made before the markers were made would let every one of them through.
+    // marker, and a check that was made before the markers were made would let every one of them through. What the bound promises is how
+    // many of them RUN: at most three. It does not promise that one does: create-then-count is atomic in the other direction, so when all
+    // eight make their markers before any of them has counted, each counts seven others and every one of the eight is refused (the review
+    // measured 3 runs in 100 on SQLite and 11 in 30 on MySQL: the test of this once required at least one, and failed for that).
+    // The deterministic test above (the hook between the marker and the count) is what proves the atomicity; this one is the end to end sample.
     $pend = [];
     $socks = [];
     foreach ($servers as $s) {
@@ -679,16 +683,20 @@ test('4.7.2 rule 5: eight polls of one credential that arrive together are not a
     foreach ($pend as $p) {
         $res = holds_finish($p, 8.0);
         if ($res['status'] === 429) {
+            // the documented refusal: rate_limited, the in-flight rule, Retry-After 1
             $refused++;
+            eq('rate_limited', $res['json']['error']['code'] ?? null, $res['body']);
+            eq('in_flight', $res['json']['error']['rule'] ?? null, $res['body']);
             eq('1', $res['headers']['retry-after']);
         } else {
+            // a poll that ran: its hold was granted (superseded polls end with granted too)
             eq(200, $res['status'], $res['body']);
+            eq(true, $res['json']['hold']['granted'] ?? null, $res['body']);
             $granted++;
         }
     }
-    ok($granted >= 1 && $granted <= 3, "$granted of 8 simultaneous polls ran: at least one must (a bound that refuses all of them is a different bug), and at most three of one credential may");
-    ok($refused >= 5, "$refused of 8 were refused");
-    eq(8, $granted + $refused, 'every one of the eight was answered, one way or the other');
+    ok($granted <= 3, "$granted of 8 simultaneous polls ran: at most three of one credential may (and none is an allowed outcome: see above)");
+    eq(8, $granted + $refused, 'every one of the eight was answered, a granted poll or the documented 429, and nothing else');
     eq(0, holds_count($r));
 });
 

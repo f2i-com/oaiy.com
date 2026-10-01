@@ -6,6 +6,7 @@
  *   php tests/run.php --filter=poll    run the tests whose name contains "poll" (case-insensitive)
  *   php tests/run.php --file=poll|holds  run the tests of tests/cases/poll.php and holds.php
  *   php tests/run.php --list           list the test names
+ *   php tests/run.php --repeat=N       run every selected test N times (OAIY_TEST_REPEAT=N too): for a test that fails one run in a hundred
  *   php tests/run.php --stop           stop at the first failure
  *   php tests/run.php --verbose        print passing tests too
  *   php tests/run.php --slow           also run the slow tests (real waits and holds; a minute or more)
@@ -75,6 +76,7 @@ $list = false;
 $stop = false;
 $verbose = false;
 $slow = false;
+$repeat = (int)(getenv('OAIY_TEST_REPEAT') ?: 1);
 foreach (array_slice($_SERVER['argv'], 1) as $arg) {
     if (strpos($arg, '--filter=') === 0) {
         $filter = strtolower(substr($arg, 9));
@@ -82,6 +84,8 @@ foreach (array_slice($_SERVER['argv'], 1) as $arg) {
         $onlyFiles = explode('|', substr($arg, 7));
     } elseif ($arg === '--slow') {
         $slow = true;
+    } elseif (strpos($arg, '--repeat=') === 0) {
+        $repeat = max(1, (int)substr($arg, 9));
     } elseif ($arg === '--list') {
         $list = true;
     } elseif ($arg === '--stop') {
@@ -123,6 +127,9 @@ foreach (glob((is_string($casesDir) && $casesDir !== '' ? rtrim(str_replace('\\'
 }
 
 $tests = \OaiyTest\Registry::all();
+if ($repeat > 1 && !$list) {
+    $tests = array_merge(...array_fill(0, $repeat, $tests)); // every selected test, N times over (the filter below still applies)
+}
 if ($list) {
     foreach ($tests as $t) {
         echo $t['name'], "\n";
