@@ -201,8 +201,20 @@ It:
   whatever the server's modules: a `README`, a nested page, a dot folder (`/.git/config`), `index.php` asked for directly, an
   editor's leftover that a careless upload put in `public/`, and a path that starts like the relay's and climbs out of it. (The
   first version of this line read the request line only, and `/v1/../README` was handed out: a test sends it raw now.)
-  LiteSpeed's handling of `Require expr` was not tried; if it refuses the line, the doctor's `web.authorization` row says the web
-  server itself answered;
+  LiteSpeed's handling of `Require expr` was not tried, and a forum thread of 2017-18 that the review found says it does not
+  evaluate expressions (not reproduced here): if it ignores the line, the rewrite rules still send `/v1/...` to the front
+  controller and the deny-all files still hold, but the refusal of what is not the relay's (a `README` or a dot folder in `public/`) is
+  then not in force; if it refuses the line, it answers requests itself, which the doctor's `web.authorization` row reports as the web
+  server and not the relay answering, and that row's advice about `AllowOverride` may then point at the wrong cause (the cause would be
+  the server's reading of `Require expr`, and the server's error log says so);
+- **cannot refuse a `TRACE`**: Apache answers a `TRACE` request in its core, before the `Require` above and before any rewrite
+  rule (tried: it is `200` for any path, even one that does not exist), by echoing the request back with its headers, the
+  `Authorization` header with them, wherever `TraceEnable` is on, which is its default. Only `TraceEnable off` in the server
+  configuration (a directive `.htaccess` cannot hold, and the right line for every site on the server) stops it, and the doctor's
+  `web.trace` row warns when the host echoes one;
+- **refuses a path with a dot segment** as it was sent (`/v1/../index.php`, `/v1/./health`, and the `%2e` spellings), whatever it
+  resolves to: no client sends one, and `/v1/../index.php` is the front controller itself, served as it is by a server that has no
+  mod_rewrite. An absolute-form request line (`GET http://host/v1/health`) is judged by its path like any other;
 - **grants itself** by that same line. Apache reads the `.htaccess` of every folder on the way to a file wherever `AllowOverride`
   covers them, and many hosts set it for all of `/home` or `/var/www`, so the package root's deny-all (below) would otherwise refuse every
   request to the relay, which is what a real Apache 2.4.65 did before this was added. **This replaces any `Require` of a parent folder's

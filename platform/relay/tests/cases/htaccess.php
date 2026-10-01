@@ -101,6 +101,32 @@ function ht_public_rules(Httpd $s, string $what): void
         ok($r['status'] === 403 || $r['status'] === 404 || $r['status'] === 400, "$what: $p is refused, got " . $r['status'] . ': ' . substr($r['body'], 0, 60));
         not_contains('not a real', $r['body'], "$what: $p was handed out");
     }
+    // Dot segments in the path as it is sent: /v1/../index.php resolves to the front controller itself (served as it is on a server with
+    // no mod_rewrite, where nothing else stands in its way), /v1/./health and the %2e spellings resolve to what the relay serves. No client
+    // sends one, and all are refused as sent, whatever they resolve to. (Dots that are not a segment are the relay's: below.)
+    foreach (['/v1/../index.php', '/v1/%2e%2e/index.php', '/v1/%2E./index.php', '/v1/.%2e/index.php', '/v1/./health', '/v1/%2e/health', '/v1/health/..', '/v1/health/.', '/status.html/./'] as $p) {
+        $r = $s->request('GET', $p);
+        ok(in_array($r['status'], [400, 403, 404], true), "$what: $p is refused as sent, got " . $r['status'] . ': ' . substr($r['body'], 0, 60));
+        not_contains('Kernel::main', $r['body'], "$what: $p reached the front controller");
+    }
+    // A dot segment in the query is not in the path: the request is the relay's.
+    if (!str_contains($what, 'without mod_rewrite')) {
+        eq(200, $s->request('GET', '/v1/health?x=/../index.php')['status'], "$what: a query that looks like a path is only a query");
+    }
+    // An absolute-form request line (GET http://host/v1/health, which a proxy or a careful client sends) counts by its path, as any other.
+    $abs = 'http://127.0.0.1:' . $s->port;
+    foreach (['/README', '/.git/config', '/index.php', '/v1/../README', '/v1/../index.php', '/v1/%2e%2e/README'] as $p) {
+        $r = $s->request('GET', $abs . $p);
+        ok(in_array($r['status'], [400, 403, 404], true), "$what: $abs$p is refused, got " . $r['status'] . ': ' . substr($r['body'], 0, 60));
+        not_contains('not a real', $r['body'], "$what: $abs$p was handed out");
+        not_contains('Kernel::main', $r['body'], "$what: $abs$p reached the front controller");
+    }
+    eq(200, $s->request('GET', $abs . '/status.html')['status'], "$what: absolute-form status.html is the relay's own");
+    if (!str_contains($what, 'without mod_rewrite')) {
+        $r = $s->request('GET', $abs . '/v1/health');
+        eq(200, $r['status'], "$what: absolute-form /v1/health reaches the front controller: " . substr($r['body'], 0, 60));
+        contains('Kernel::main', $r['body']);
+    }
     eq(200, $s->request('GET', '/status.html')['status'], "$what: status.html is the relay's own");
     // /v1/ is the front controller: Apache has no PHP here, so what comes back is the file index.php itself, which is how the test sees
     // that the request got there. An item id may hold a dot or start with one (design 4.3: [A-Za-z0-9._-], never . or ..).
@@ -129,6 +155,41 @@ test('4.18.8 Apache: without mod_rewrite the same files are refused (the rules d
     ht_public_rules($s, 'without mod_rewrite');
     $rows = Oaiy\Relay\Doctor::authorizationSeen(Oaiy\Relay\HttpProbe::get($s->base() . '/v1/health', ['Authorization' => 'Bearer probe']));
     contains('mod_rewrite', $rows[0]['message'], 'the doctor says what is missing');
+});
+
+test('4.18.8 Apache: nothing in public/.htaccess can refuse a TRACE (Apache answers it in its core, before the access and rewrite rules, wherever TraceEnable is on), so the doctor says whether the host echoes one, and the README names the one line that stops it', function () {
+    $site = Tmp::dir('site');
+    ht_package($site . '/oaiy-relay');
+    $probe = static function (Httpd $s): array {
+        $canary = 'doctor-' . bin2hex(random_bytes(4));
+        return [Oaiy\Relay\Doctor::traceSeen(Oaiy\Relay\HttpProbe::request('TRACE', $s->base() . '/v1/health', ['X-OAIY-Doctor-Trace' => $canary], null, 5.0, 4096), $canary), $canary];
+    };
+    $s = ht_httpd($site . '/oaiy-relay/public', ['allowOverride' => 'All', 'allowRoot' => $site, 'extra' => "TraceEnable on\n"]);
+    // What the README says is tried here, not assumed: the request is answered 200 and echoed for the relay's own path and for every other.
+    foreach (['/v1/health', '/', '/README', '/nothing-at-all'] as $p) {
+        $r = $s->request('TRACE', $p, ['Authorization' => 'Bearer not-a-real-token']);
+        eq(200, $r['status'], "TRACE $p with TraceEnable on");
+        contains('not-a-real-token', $r['body'], "TRACE $p is echoed, Authorization header and all: nothing in the .htaccess stops it");
+    }
+    [$rows, $canary] = $probe($s);
+    eq('warn', $rows[0]['level'], 'the doctor warns: ' . $rows[0]['message']);
+    eq('web.trace', $rows[0]['name']);
+    contains('TraceEnable off', $rows[0]['message']);
+    $s->stop();
+    $s = ht_httpd($site . '/oaiy-relay/public', ['allowOverride' => 'All', 'allowRoot' => $site, 'extra' => "TraceEnable off\n"]);
+    [$rows, $canary] = $probe($s);
+    eq('ok', $rows[0]['level'], 'with TraceEnable off the doctor is satisfied: ' . $rows[0]['message']);
+    $r = $s->request('TRACE', '/v1/health', ['Authorization' => 'Bearer not-a-real-token']);
+    not_contains('not-a-real-token', $r['body'], 'and nothing is echoed (' . $r['status'] . ')');
+    $s->stop();
+    // The synthetic answers.
+    eq('warn', Oaiy\Relay\Doctor::traceSeen(['status' => 200, 'body' => "TRACE /v1/health HTTP/1.1\r\nX-OAIY-Doctor-Trace: abc\r\n", 'error' => null], 'abc')[0]['level']);
+    foreach ([['status' => 405, 'body' => '', 'error' => null], ['status' => 200, 'body' => 'the relay', 'error' => null], ['status' => 0, 'body' => '', 'error' => 'refused'], ['status' => 403, 'body' => "x-oaiy-doctor-trace: abc", 'error' => null]] as $r) {
+        eq('ok', Oaiy\Relay\Doctor::traceSeen($r, 'abc')[0]['level'], json_encode($r));
+    }
+    $readme = (string)file_get_contents(dirname(__DIR__, 2) . '/README.md');
+    contains('TraceEnable off', $readme, 'the README names the line');
+    contains('`web.trace`', $readme, 'and the doctor row');
 });
 
 test('4.18.8 Apache: AllowOverride without AuthConfig makes every request a 500 (Require is not allowed there), and with AuthConfig, FileInfo, Options and Indexes the relay is served', function () {

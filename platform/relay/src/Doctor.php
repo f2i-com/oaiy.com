@@ -329,7 +329,7 @@ final class Doctor
                 if ($r['status'] === 500) {
                     $cause = ' The web server itself answered, not the relay. On Apache this is almost always a directive in public/.htaccess that AllowOverride does not allow: it needs AuthConfig, FileInfo, Options and Indexes (or All), and the web server\'s error log names the directive.';
                 } elseif ($r['status'] === 404) {
-                    $cause = ' The web server itself answered, not the relay. On Apache the front controller in public/.htaccess needs mod_rewrite; on nginx check the try_files of the /v1/ location.';
+                    $cause = ' The web server itself answered, not the relay. On Apache the front controller in public/.htaccess needs mod_rewrite; on nginx check that the /v1/ location passes the request to index.php (the README\'s snippet sets fastcgi_param SCRIPT_FILENAME $document_root/index.php there; a try_files that looks for a file called v1 would answer 404 as well).';
                 } elseif ($r['status'] === 403) {
                     $cause = ' The web server itself refused it. On Apache the .htaccess of the package folder (which refuses everything) may be applying to public/ because of a Require of the host\'s that public/.htaccess does not replace, or the document root is not public/.';
                 }
@@ -343,6 +343,22 @@ final class Doctor
         return $j['authHeaderSeen'] === true
             ? [self::row('web.authorization', self::OK, 'the Authorization header reaches PHP')]
             : [self::row('web.authorization', self::FAIL, 'the Authorization header does NOT reach PHP. ' . $hint)];
+    }
+
+    /**
+     * A TRACE request through the real web stack, carrying a header with a value of its own: a web server that answers it by echoing the
+     * request (Apache does, in its core, before any .htaccess rule, wherever TraceEnable is on, which is its default) hands every header
+     * of a request back to whoever sent it, an Authorization header included. Nothing the relay ships can stop it: the server's
+     * configuration can.
+     * @param array{status:int,body:string,error:?string,headers?:array<string,string>} $r
+     * @return list<array{name:string,level:string,message:string}>
+     */
+    public static function traceSeen(array $r, string $canary): array
+    {
+        if ($r['status'] === 200 && strpos($r['body'], $canary) !== false) {
+            return [self::row('web.trace', self::WARN, 'the web server echoes a TRACE request, headers included (an Authorization header with them). On Apache set "TraceEnable off" in the server configuration (it is not a directive .htaccess can hold); no file of the relay can stop it.')];
+        }
+        return [self::row('web.trace', self::OK, 'the web server does not echo a TRACE request (it answered ' . ($r['status'] ?: 'nothing') . ')')];
     }
 
     /**
@@ -777,6 +793,9 @@ final class Doctor
         // 2. The Authorization header through the real stack.
         $h = HttpProbe::get($base . '/v1/health', ['Authorization' => 'Bearer probe'], 5.0, 4096);
         $out = array_merge($out, self::authorizationSeen($h));
+        // 2b. Whether the host echoes a TRACE request (Apache does, in its core, wherever TraceEnable is on).
+        $canary = 'doctor-' . bin2hex(random_bytes(6));
+        $out = array_merge($out, self::traceSeen(HttpProbe::request('TRACE', $base . '/v1/health', ['X-OAIY-Doctor-Trace' => $canary], null, 5.0, 4096), $canary));
         // 3. What the web SAPI sees (needs the admin token, from a file).
         $host = trim($p['host'], '[]');
         $urlIsLocal = $host === 'localhost' || (filter_var($host, FILTER_VALIDATE_IP) !== false && ClientIp::isNonPublic($host));

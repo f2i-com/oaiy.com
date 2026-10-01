@@ -389,7 +389,9 @@ test('4.18.8 doctor: an answer from the web server itself (no X-OAIY-Relay heade
     contains('AuthConfig, FileInfo, Options and Indexes', $m($rows));
     contains('The web server itself answered, not the relay', $m($rows));
     contains('mod_rewrite', $m($own(404, [])));
-    contains('try_files', $m($own(404, [])));
+    // The advice for nginx names what the README's snippet has (it once named a try_files that the snippet does not use).
+    contains('SCRIPT_FILENAME $document_root/index.php', $m($own(404, [])));
+    contains('fastcgi_param SCRIPT_FILENAME $document_root/index.php;', (string)file_get_contents(dirname(__DIR__, 2) . '/README.md'), 'the line the doctor names is in the README\'s nginx snippet');
     contains('Require', $m($own(403, [])));
     // The relay's own answer to the same request is the relay's: no advice about the web server.
     foreach ([500, 404, 403] as $st) {

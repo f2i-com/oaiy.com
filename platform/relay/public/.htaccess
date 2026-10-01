@@ -7,8 +7,11 @@
 # Only /v1/..., /status.html and /install.php are the relay's, and a request for anything else is refused (403), by what was asked for and
 # not by which modules the server has: a README, a nested page, a dot folder (.git/config) or an editor's leftover that a careless upload
 # put here is never handed out, with or without mod_rewrite. Two things must both hold: the request as the client sent it (THE_REQUEST) is
-# one of those, which a direct request for /index.php is not, and the path Apache resolved it to (REQUEST_URI, with the dot segments
-# taken out: GET /v1/../README is /README) is one of those too, or /index.php, which is where the rewrite below sends /v1/...
+# one of those, which a direct request for /index.php is not (an absolute-form request line, GET http://host/v1/..., counts by its path),
+# and the path Apache resolved it to (REQUEST_URI, with the dot segments taken out: GET /v1/../README is /README) is one of those too,
+# or /index.php, which is where the rewrite below sends /v1/... A request whose own path has a dot segment (/v1/../index.php, /v1/./x,
+# or the same spelled with %2e) is refused as sent, whatever it resolves to: no client sends one, and /v1/../index.php would otherwise
+# resolve to the front controller itself on a server that has no mod_rewrite.
 #
 # This folder is the one that is served. The package root above it carries a deny-all .htaccess (for a document root that is wrong), and
 # Apache reads the .htaccess of every folder on the way to a file wherever AllowOverride covers them, as it does on hosts that set it
@@ -16,7 +19,7 @@
 # a parent folder's .htaccess or of a <Directory> block of the server's configuration that covers this folder (Apache's rule for
 # Require); to limit who may use the relay, say it in a <Location> block, which Apache applies after the .htaccess files.
 <IfModule mod_authz_core.c>
-    Require expr "%{THE_REQUEST} =~ m#^[A-Z]+ /(v1/|status\.html[ ?]|install\.php[ ?])# && (%{REQUEST_URI} =~ m#^/(v1/|status\.html$|install\.php$)# || %{REQUEST_URI} == '/index.php')"
+    Require expr "%{THE_REQUEST} =~ m#^[A-Z]+ (?:https?://[^/ ?]*)?/(v1/|status\.html[ ?]|install\.php[ ?])# && %{THE_REQUEST} !~ m#^[A-Z]+ [^ ?]*/(?:\.|%2[eE]){1,2}(?:/|[ ?])# && (%{REQUEST_URI} =~ m#^/(v1/|status\.html$|install\.php$)# || %{REQUEST_URI} == '/index.php')"
 </IfModule>
 <IfModule !mod_authz_core.c>
     Order allow,deny
@@ -44,15 +47,18 @@ DirectoryIndex index.php
 <IfModule mod_rewrite.c>
     RewriteEngine On
     RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+    # (A TRACE request is not refused by anything in this file: Apache answers it in its core, before the access rules and the rewrite
+    # rules, wherever TraceEnable is on, which is its default. Only `TraceEnable off` in the server configuration stops it; the doctor's
+    # web.trace row says whether the host echoes one.)
 
     # Anything outside /v1/, /status.html and /install.php is not found (on 2.2; on 2.4 it was refused above). An item id may start with a
     # dot or hold one (GET /v1/items/.a, /v1/items/cmd.1): nothing under /v1/ is refused here.
-    RewriteCond %{THE_REQUEST} !^[A-Z]+\ /(v1/|status\.html[\ ?]|install\.php[\ ?])
+    RewriteCond %{THE_REQUEST} !^[A-Z]+\ (https?://[^/\ ?]*)?/(v1/|status\.html[\ ?]|install\.php[\ ?])
     RewriteRule ^ - [R=404,L]
 
     # Everything under /v1/ is the front controller. (The conditions read THE_REQUEST, the request as it was sent, and not REQUEST_URI: after
     # this rule's internal redirect to index.php the URI is /index.php, which the condition above would send to a 404.)
-    RewriteCond %{THE_REQUEST} ^[A-Z]+\ /v1/
+    RewriteCond %{THE_REQUEST} ^[A-Z]+\ (https?://[^/\ ?]*)?/v1/
     RewriteRule ^ index.php [L]
 </IfModule>
 
