@@ -15,6 +15,9 @@ use tokenizer::Tokenizer;
 
 pub(crate) const IM: u32 = 1;
 pub(crate) const END: u32 = 2;
+/// Prompt tokens that make the fake model arm or disarm a failing restore.
+pub(crate) const ARM: u32 = 77_778;
+pub(crate) const DISARM: u32 = 77_779;
 const FIRST: u32 = 4;
 const WORDS: u32 = 100;
 
@@ -45,6 +48,9 @@ impl FakeModel {
 
     pub fn forward(&self, tokens: &[u32], kv: &mut KvCache) -> Result<Tensor, String> {
         if self.panic_on.is_some_and(|p| tokens.contains(&p)) { panic!("injected: the device failed in the middle of a request"); }
+        // Arm or disarm the failure of the next restore (qwen_park's fixture) on this, the engine's, thread.
+        if tokens.contains(&ARM) { crate::qwen_park::fixtures::INJECT_PANIC.with(|f| f.set(true)); }
+        if tokens.contains(&DISARM) { crate::qwen_park::fixtures::INJECT_PANIC.with(|f| f.set(false)); }
         self.forwarded.fetch_add(tokens.len(), Ordering::Relaxed);
         for &t in tokens {
             let pos = kv.len as u32;
@@ -318,6 +324,54 @@ mod tests {
         let cold = Engine::start(0, None).ask(&next_a, MAX);
         assert_eq!(back.words, cold.words);
         assert_ne!(back.reuse.unwrap().1, "none", "{back:?}");
+    }
+
+    #[test]
+    fn a_parked_conversation_keeps_its_checkpoints_so_a_rerendered_reply_resumes_from_one() {
+        // The runner's A1 is set aside as B1 displaces it; its next prompt renders the last reply with
+        // something more in it, so it can only resume from a checkpoint of A1: the checkpoints must have
+        // gone into the stash with it (the order of park_displaced and the checkpoint retain in generate).
+        let e = Engine::start(BIG, None);
+        let (mut a, b) = (Chat::new(10, 3_000), Chat::new(20, 1_500));
+        let a1 = a.prompt();
+        let r1 = e.ask(&a1, MAX);
+        e.ask(&b.prompt(), MAX);
+        a.answered(&r1.words, Some(9), 200);
+        let r2 = e.ask(&a.prompt(), MAX);
+        let (cached, source, _) = r2.reuse.unwrap();
+        assert_eq!((source, cached), ("ram", a1.len() - 1), "{r2:?}");
+    }
+
+    #[test]
+    fn a_restore_the_device_refuses_falls_back_to_reading_the_prompt_in_the_real_engine() {
+        let e = Engine::start(BIG, None);
+        let (mut a, b) = (Chat::new(10, 3_000), Chat::new(20, 1_500));
+        let ra = e.ask(&a.prompt(), MAX);
+        let rb = e.ask(&b.prompt(), MAX);
+        let next_a = { a.answered(&ra.words, None, 200); a.prompt() };
+        // The tiny request sets B aside as it displaces it, and arms the failure of the next restore.
+        e.ask(&[IM, ARM], 1);
+        let failed = e.ask(&next_a, MAX);
+        assert_eq!(failed.reuse.unwrap().1, "none", "the restore failed, the prompt is read: {failed:?}");
+        e.ask(&[IM, DISARM], 1);
+        assert_eq!(failed.words, Engine::start(0, None).ask(&next_a, MAX).words);
+        // B is still in the stash, and comes back.
+        let mut b2 = Chat::new(20, 1_500);
+        b2.answered(&rb.words, None, 200);
+        let back = e.ask(&b2.prompt(), MAX);
+        assert_eq!(back.reuse.unwrap().1, "ram", "{back:?}");
+        assert_eq!(back.words, Engine::start(0, None).ask(&b2.prompt(), MAX).words);
+    }
+
+    #[test]
+    fn the_end_of_a_private_session_wipes_what_the_engine_held_of_it() {
+        let e = Engine::start(BIG, None);
+        let mut p = Chat::new(30, 3_000);
+        let r1 = e.ask_private(&p.prompt(), Some("s"), MAX);
+        let p2 = next_turn(&mut p, &r1, 200);
+        e.wipe("s");
+        let r2 = e.ask_private(&p2, Some("s"), MAX);
+        assert_eq!(r2.reuse.unwrap().1, "none", "the session's state went with the session: {r2:?}");
     }
 
     fn fuzz_seeds(default: u64) -> u64 { std::env::var("PARK_FUZZ_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(default) }
