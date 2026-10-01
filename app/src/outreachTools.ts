@@ -112,6 +112,8 @@ export function outreachTools(deps: OutreachToolDeps): SessionTool[] {
         const c = await e.create(plan, deps.origin());
         return startedText(c, plan);
       },
+      // Calls are going out (not a refused list, a declined one or a campaign of texts): the run waits on them.
+      startsCalls: (input, result) => input.kind === 'call' && result.startsWith('Started "'),
     },
     {
       spec: {
@@ -128,6 +130,7 @@ export function outreachTools(deps: OutreachToolDeps): SessionTool[] {
     {
       spec: { name: 'outreach_resume', description: 'Resume a paused outreach list (it was approved already: nothing is asked again).', parameters: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } } },
       run: async (input) => engine().resume(id(input), 'agent'),
+      startsCalls: (input, result) => result.startsWith('Resumed "') && deps.engine()?.get(s(input.id))?.kind === 'call',
     },
     {
       spec: {

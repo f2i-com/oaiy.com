@@ -642,6 +642,8 @@ async function main(): Promise<void> {
         gate,
         // The engine's provider as chosen in Settings, or ChatGPT when the desktop says the Agent runs on it.
         provider: () => agentProvider(kind()),
+        // A run that started calls is not pushed on by its plan while they are going on (the place is the one its campaigns are started from).
+        waitingOnCall: () => (kind() === 'runner' || kind() === 'project') && !!outreach?.callLiveFor(place().meta.id),
         prepare: prepareFor(kind),
         // "Set up OAIY" is a conversation: the Agent stops to ask, or to let the person do a step on screen,
         // and is not pushed on by an open plan meanwhile.

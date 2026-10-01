@@ -130,6 +130,8 @@ export const WARM_TOKENS = 32;
 const REPEAT_NUDGE = 'You gave the same reply again, and still no tool has run. Do not reply in words: your next reply must be a tool call (update_plan for a task, or the first tool the work needs).';
 /** For a reply that only announced the work. */
 const START_NUDGE = 'You said what you will do, but no tool has run yet, so nothing has started. Start now: call update_plan with the plan (for a task with several steps), then the first step\'s tools. Do not describe the work again; do it.';
+/** For a run that started calls, which are going on, and ended with no words: its plan is not pushed on (the result comes by itself), but the person is told. */
+const CALLS_GOING_NUDGE = 'The calls you started are going on, and their results come to you by themselves when they end: do not check on them. You have said nothing to the person yet: tell them in a sentence what you started and what happens next.';
 
 /**
  * Whether a reply announces work it is about to do ("I'll…", "Let me…",
@@ -344,6 +346,12 @@ export interface AgentOptions {
    * is said as the run's error, and nothing is sent.
    */
   prepare?: (signal?: AbortSignal) => Promise<void>;
+  /**
+   * Whether a call this conversation started is still going on (an outreach's): its result comes here by itself when it
+   * ends, so a run that started calls is not pushed on by its plan meanwhile (each push is a request the call's replies
+   * would wait behind). Only a run that started calls (a tool with `startsCalls`) waits so: another run's plan is its own.
+   */
+  waitingOnCall?: () => boolean;
 }
 
 /**
@@ -368,6 +376,8 @@ export interface SessionTool {
   spec: ToolSpec;
   /** The result for the model; a thrown error is reported as one. */
   run: (input: Record<string, unknown>, signal?: AbortSignal) => Promise<string>;
+  /** Whether this call (its input, and what it answered) started calls: the run is then waiting on them (see AgentOptions.waitingOnCall). */
+  startsCalls?: (input: Record<string, unknown>, result: string) => boolean;
 }
 
 function turnChars(t: Turn, charsPerToken = DEFAULT_CHARS_PER_TOKEN): number {
@@ -699,7 +709,8 @@ export class Agent {
   private async runSessionTool(call: ToolCall, signal?: AbortSignal): Promise<ToolResult> {
     const tool = this.sessionToolList.find((t) => t.spec.name === call.name)!;
     try {
-      return { id: call.id, name: call.name, content: await tool.run(call.input, signal), isError: false };
+      const content = await tool.run(call.input, signal);
+      return { id: call.id, name: call.name, content, isError: false, ...(tool.startsCalls?.(call.input, content) ? { startedCalls: true } : {}) };
     } catch (error) {
       return { id: call.id, name: call.name, content: `Error: ${(error as Error).message}`, isError: true };
     }
@@ -717,15 +728,20 @@ export class Agent {
 
   /**
    * Why the run is not done yet, if the model stopped early: plan items it
-   * set this run and did not finish, or an app whose check still fails.
+   * set this run and did not finish, or an app whose check still fails. While
+   * the run waits for the calls it started (`waiting`), its plan's open steps
+   * are not pushed (each push is a request the call's replies would wait
+   * behind, and the result comes by itself); but a reply with no words is
+   * asked to say what was started (`said`: whether this reply had any words).
    */
-  private unfinished(planThisRun: boolean, announced = false): string | null {
+  private unfinished(planThisRun: boolean, announced = false, waiting = false, said = true): string | null {
     if (this.activeFlag && !this.flagFixed(this.activeFlag.path)) {
       return `The flagged /${this.activeFlag.path} is not fixed yet: make it again, fixing what the user flagged, until it passes its review. Then you will be told what comes next.`;
     }
     // Only apps checked in this run count: an old failure should not hold up something else.
     const failing = [...this.failingApps.entries()].find(([root]) => this.checkedRoots.has(root));
     if (failing) return `The last automatic check of ${appLabel(failing[0])} still reports errors:\n${failing[1]}\nFix them and check the app again before you finish. If you cannot, say what is wrong.`;
+    if (waiting) return said ? null : CALLS_GOING_NUDGE;
     const open = planThisRun && this.plan ? this.plan.items.map((item, i) => ({ item, i })).filter(({ item }) => item.status !== 'done') : [];
     if (open.length) {
       const now = open.find(({ item }) => item.status === 'active') ?? open[0];
@@ -1800,6 +1816,8 @@ ${this.instructions}` : ''}`;
     // The last reply without a tool call, to notice the same words again.
     let lastSaid = '';
     let repeatNudged = false;
+    // This run started calls (a tool says so): their results come to it by themselves.
+    let startedCalls = false;
     const maxSteps = this.options.maxSteps ?? MAX_STEPS;
     try {
       for (let step = 1; step <= maxSteps; step++) {
@@ -1855,7 +1873,8 @@ ${this.instructions}` : ''}`;
           }
           if (reply.truncated) emit({ type: 'status', message: 'The reply was cut off at the output limit.' });
           // Stopping short of the goal: ask once or twice to carry on.
-          const unfinished = this.unfinished(planThisRun, announcesWork(reply.text));
+          // A call this run started is going on: its result comes here by itself, and polling for it would take the engine from the call.
+          const unfinished = this.unfinished(planThisRun, announcesWork(reply.text), startedCalls && !!this.options.waitingOnCall?.(), !!said);
           const progress = { done: this.plan?.items.filter((i) => i.status === 'done').length ?? 0, changed: changedThisRun.size, acted };
           idleNudges = progress.done > progressAtNudge.done || progress.changed > progressAtNudge.changed || progress.acted > progressAtNudge.acted ? 0 : idleNudges + 1;
           progressAtNudge = progress;
@@ -1942,6 +1961,7 @@ ${this.instructions}` : ''}`;
             result.content += `\n\n${guideLoaded('web')}: follow it from your next step. The page tools (page_check, page_interact, preview_screenshot, preview_viewport, …) are yours now too.`;
           }
           if (call.name === 'view_image' && !result.isError) this.noteLook(call.input);
+          if (result.startedCalls) startedCalls = true;
           // A picture for a scripted video is reviewed before anything else is made.
           if (result.review?.length && !result.isError) result.content += await this.reviewPictures(call.id, result.review, emit, signal);
           results.push(result);
