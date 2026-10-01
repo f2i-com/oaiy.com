@@ -81,13 +81,13 @@ final class Facade
     }
 
     /** The uniform refusal of a bearer: one 401 whatever was wrong, counted against the address. */
-    private static function refuse(Context $ctx, Request $req): ApiError
+    private static function refuse(Context $ctx, Request $req, string $reason): ApiError
     {
         $retry = $ctx->limiter->hit('ip.authfail:' . $req->client, 20, 60);
         if ($retry !== null) {
-            return new ApiError(429, 'rate_limited', null, 60);
+            return (new ApiError(429, 'rate_limited', null, 60))->because('address_failed_too_often');
         }
-        return new ApiError(401, 'invalid_token', 'The admission token is invalid or expired; ask for a new admission.');
+        return (new ApiError(401, 'invalid_token', 'The admission token is invalid or expired; ask for a new admission.'))->because($reason);
     }
 
     /**
@@ -102,12 +102,12 @@ final class Facade
         $bearer = $req->bearer();
         if ($bearer === null) {
             $ctx->limiter->bump('noauth');
-            throw self::refuse($ctx, $req);
+            throw self::refuse($ctx, $req, 'no_bearer');
         }
         $now = Clock::now();
         $c = Admission::verify($ctx->admissionSecret(), $bearer, $now);
         if ($c === null) {
-            throw self::refuse($ctx, $req);
+            throw self::refuse($ctx, $req, 'admission_invalid_or_expired');
         }
         if ($opensHold) {
             self::admitHold($ctx, $c); // before anything that reads or writes the database: a refusal here costs the least it can
@@ -126,7 +126,7 @@ final class Facade
         $f->exp = (int)$c['exp'];
         $f->scopes = array_values($c['scopes']);
         if (!$ctx->cfg->appAllowed($f->appId)) {
-            throw ApiError::make('forbidden'); // config.apps was narrowed after this admission was minted: the app is no longer served
+            throw ApiError::make('forbidden')->because('app_not_allowed'); // config.apps was narrowed after this admission was minted: the app is no longer served
         }
         if ($f->role === 'plugin') {
             $f->party = 'plugin';
@@ -136,7 +136,7 @@ final class Facade
             $f->deviceId = $f->dsk;
             $row = $ctx->db->one("SELECT id, revoked_at FROM devices WHERE id = ? AND role = 'desktop'", [$f->dsk]);
             if ($row === null) {
-                throw self::refuse($ctx, $req);
+                throw self::refuse($ctx, $req, 'desktop_not_found');
             }
         } else {
             $f->party = 'mobile:' . $f->holder;
@@ -144,7 +144,7 @@ final class Facade
             $f->deviceId = $f->subjectId;
             $row = $ctx->db->one("SELECT id, revoked_at, owner_desktop, app_id, thumbprint, grants FROM devices WHERE id = ? AND role = 'phone'", [$f->subjectId]);
             if ($row === null || $row['owner_desktop'] !== $f->dsk || $row['app_id'] !== $f->appId || $row['thumbprint'] !== $f->holder) {
-                throw self::refuse($ctx, $req);
+                throw self::refuse($ctx, $req, $row === null ? 'phone_not_found' : 'phone_does_not_match_admission');
             }
             // What the bearer asserts is at most what the desktop grants the phone NOW: a grant taken away (a phone cut from takeover and
             // monitor to state_read) stops being asserted at the next request, not when the 90 second bearer runs out. The bearer's own
@@ -153,16 +153,16 @@ final class Facade
             $f->scopes = array_values(array_filter($f->scopes, static fn($g): bool => is_array($current) && in_array($g, $current, true)));
         }
         if ($row['revoked_at'] !== null) {
-            throw new ApiError(401, 'revoked', 'This device was removed; pair it again.');
+            throw (new ApiError(401, 'revoked', 'This device was removed; pair it again.'))->because('device_revoked');
         }
         if ($f->role === 'mobile') {
             // A phone answers to the desktop that paired it: a removed desktop takes its phones' admissions with it.
             $owner = $ctx->db->one("SELECT revoked_at FROM devices WHERE id = ? AND role = 'desktop'", [$f->dsk]);
             if ($owner === null || $owner['revoked_at'] !== null) {
-                throw new ApiError(401, 'revoked', 'This device was removed; pair it again.');
+                throw (new ApiError(401, 'revoked', 'This device was removed; pair it again.'))->because('desktop_revoked');
             }
             if (!self::rosterLists($ctx, $f->dsk, $f->appId, $f->holder)) {
-                throw new ApiError(403, 'forbidden', 'Your PC no longer lists this phone.');
+                throw (new ApiError(403, 'forbidden', 'Your PC no longer lists this phone.'))->because('phone_not_in_roster');
             }
         }
         $f->mailbox = Party::mailbox($f->appId, $f->dsk, $f->party);

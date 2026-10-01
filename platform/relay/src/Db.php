@@ -57,7 +57,7 @@ final class Db
         try {
             $this->pdo = $this->driver === 'mysql' ? $this->connectMysql() : $this->connectSqlite();
         } catch (\PDOException $e) {
-            throw new ApiError(503, 'unavailable', null, 5);
+            throw ApiError::databaseBusy(5, 'db_open');
         }
         return $this->pdo;
     }
@@ -271,7 +271,7 @@ final class Db
                         usleep(random_int(20000, 100000));
                         continue;
                     }
-                    throw new ApiError(503, 'unavailable', null, 1);
+                    throw ApiError::databaseBusy(1, 'db_busy');
                 }
                 throw $e;
             }
@@ -398,7 +398,7 @@ final class Db
         if ($this->driver === 'mysql') {
             $locked = (int)$this->val("SELECT GET_LOCK('oaiy-relay-migrate', 20)") === 1;
             if (!$locked) {
-                throw new ApiError(503, 'unavailable', null, 5);
+                throw ApiError::databaseBusy(5, 'db_migrate_lock');
             }
         }
         try {

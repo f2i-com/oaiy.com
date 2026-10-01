@@ -118,7 +118,7 @@ final class Relay
             $j = json_decode($line, true);
             if (is_array($j) && in_array($j['event'] ?? '', ['error_site', 'internal', 'db_unavailable'], true)) {
                 $out[] = ($j['event'] === 'error_site')
-                    ? sprintf('%s %s %s at %s (relay clock %s, host clock %s, pid %s)', $j['route'] ?? '?', $j['status'] ?? '?', $j['code'] ?? '?', $j['site'] ?? '?', $j['now'] ?? '?', $j['real'] ?? '?', $j['pid'] ?? '?')
+                    ? sprintf('%s %s %s at %s because %s (relay clock %s, host clock %s, pid %s)', $j['route'] ?? '?', $j['status'] ?? '?', $j['code'] ?? '?', $j['site'] ?? '?', $j['reason'] ?? '?', $j['now'] ?? '?', $j['real'] ?? '?', $j['pid'] ?? '?')
                     : $j['event'] . ' ' . json_encode(array_diff_key($j, ['t' => 1, 'level' => 1, 'event' => 1]));
             }
         }

@@ -64,25 +64,19 @@ function dberr_break(Relay $r, Oaiy\Relay\Context $ctx): callable
     };
 }
 
-test('4.18.5 a database that is busy, locked or gone for a moment is a 503 unavailable with Retry-After on every route, in the Aokie shape on the compatibility routes, and never a 500, a 401 or a 404', function () {
-    $k = AokieRig::make();
-    $r = $k->r;
-    $d = $k->desk;
-    $a = $k->addPhone('A');
-    $k->pushRoster();
-    $plug = $k->pluginToken();
+test('4.18.5 a database that is busy, locked or gone for a moment is a 503 unavailable with Retry-After on the ordinary routes, never a 500, a 401 or a 404, and the relay works again afterwards', function () {
+    $r = Relay::make();
+    $d = $r->desktop();
     $prov = $r->provider();
     $log = $r->data . '/logs/relay.log';
     $routes = [
-        // A valid desktop token (a plain route: the credential is read in the database), a consumer poll, a post, a pairing read for a pid
-        // that is not there (which is 404 when the database works), and the three compatibility routes with a good bearer.
-        ['desktop token, poll', fn(Relay $r) => $r->call($d, 'GET', '/v1/poll'), false],
-        ['provider token, post', fn(Relay $r) => $r->call($prov, 'POST', '/v1/items', ['items' => [['to' => $d->inbox(), 'lane' => 'cmd', 'id' => 'x1', 'body' => 'x']]]), false],
-        ['a pid that is not there', fn(Relay $r) => $r->call(null, 'GET', '/v1/pair/' . str_repeat('A', 22)), false],
-        ['compatibility challenge', fn(Relay $r) => $r->call($plug, 'GET', '/v1/aokie-companion/relay/challenge'), true],
-        ['compatibility frames', fn(Relay $r) => $r->call($plug, 'GET', '/v1/aokie-companion/relay/frames', null, ['since' => '0']), true],
+        // A valid desktop token (the credential is read in the database), a post, a pairing read for a pid that is not there (which is 404
+        // when the database works).
+        ['desktop token, poll', fn(Relay $r) => $r->call($d, 'GET', '/v1/poll')],
+        ['provider token, post', fn(Relay $r) => $r->call($prov, 'POST', '/v1/items', ['items' => [['to' => $d->inbox(), 'lane' => 'cmd', 'id' => 'x1', 'body' => 'x']]])],
+        ['a pid that is not there', fn(Relay $r) => $r->call(null, 'GET', '/v1/pair/' . str_repeat('A', 22))],
     ];
-    foreach ($routes as [$what, $fire, $compat]) {
+    foreach ($routes as [$what, $fire]) {
         $ctx = $r->ctx();
         $undo = dberr_break($r, $ctx);
         try {
@@ -94,22 +88,97 @@ test('4.18.5 a database that is busy, locked or gone for a moment is a 503 unava
         }
         eq(503, $res['status'], "$what: " . $res['body'] . $r->errorSites());
         ok(isset($res['headers']['retry-after']) && (int)$res['headers']['retry-after'] >= 1, "$what: Retry-After");
-        if ($compat) {
-            eq(['error' => true, 'code' => 'unavailable', 'message' => 'The relay is busy; try again shortly.'], $res['json'], "$what: the Aokie shape");
-        } else {
-            eq('unavailable', $res['json']['error']['code'], "$what: the ordinary shape");
-        }
+        eq('unavailable', $res['json']['error']['code'], "$what: the ordinary shape");
         eq(200, $r->call($d, 'GET', '/v1/poll')['status'], "$what: the relay works again with a connection of its own");
     }
     // What it logged says what happened, and names no credential.
     $lines = array_map(fn($l) => json_decode($l, true), file($log, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: []);
     $seen = array_values(array_filter($lines, fn($j) => ($j['event'] ?? '') === 'db_unavailable'));
-    ok(count($seen) >= 5, count($seen) . ' db_unavailable lines');
+    ok(count($seen) >= 3, count($seen) . ' db_unavailable lines');
     $text = (string)file_get_contents($log);
     not_contains($d->token, $text, 'no credential in the log');
-    not_contains($plug, $text);
     // It was a 503 and so is not counted as an "internal" error either.
     eq([], array_values(array_filter($lines, fn($j) => ($j['event'] ?? '') === 'internal')), 'and no internal error was logged');
+});
+
+test('4.18.5 on the compatibility routes a database that is busy or gone is the 500 internal the shipped plugin retries and not the 503 that ends its carrier: the plugin\'s own table of what each status does is held to every request it makes', function () {
+    $k = AokieRig::make();
+    $r = $k->r;
+    $a = $k->addPhone('A');
+    $k->pushRoster();
+    $plug = $k->pluginToken();
+    $frames = '{"to":"mobile:' . $k->thumb($a) . '","frames":[{"kind":"x"}]}';
+    $requests = [
+        // plugin request => how the test makes it (the four requests of companion_relay.rs: challenge 324, tail 508, frames post 980, stream 956)
+        'challenge' => fn(Relay $r) => $r->call($plug, 'GET', '/v1/aokie-companion/relay/challenge'),
+        'tail' => fn(Relay $r) => $r->call($plug, 'GET', '/v1/aokie-companion/relay/frames', null, ['since' => '0', 'wait' => '0']),
+        'frames-post' => fn(Relay $r) => $r->call($plug, 'POST', '/v1/aokie-companion/relay/frames', $frames),
+        'stream-open' => fn(Relay $r) => $r->call($plug, 'GET', '/v1/aokie-companion/relay/stream', null, ['since' => '0'], ['Accept' => 'text/event-stream']),
+    ];
+    foreach ($requests as $what => $fire) {
+        $ctx = $r->ctx();
+        $undo = dberr_break($r, $ctx);
+        try {
+            $res = $r->onContext($ctx, fn() => $fire($r));
+        } finally {
+            $undo();
+            $ctx = null;
+            gc_collect_cycles();
+        }
+        // Exactly the answer the relay gave to such a failure before the 503 was introduced: 500, the Aokie shape, no Retry-After.
+        eq(500, $res['status'], "$what: " . $res['body'] . $r->errorSites());
+        eq(['error' => true, 'code' => 'internal', 'message' => 'The relay hit an internal error.'], $res['json'], "$what: the Aokie shape");
+        ok(!isset($res['headers']['retry-after']), "$what: no Retry-After, which the plugin ignores");
+        // And what the plugin does with it: a failure to reconnect, which its frames post retries; not "unavailable for this app".
+        $o = OaiyTest\AokiePlugin::outcome($what, $res['status']);
+        eq('reconnect', $o['kind'], "$what: the plugin's kind for 500");
+        if ($what === 'frames-post') {
+            eq(OaiyTest\AokiePlugin::POST_ATTEMPTS, $o['tries'], 'the plugin makes the frames post three times (250 ms apart) before it gives up on a 500');
+        }
+        // The contrast, so that the table is seen to tell the two apart: a 503 is a re-bootstrap, and a frames post is not retried at all.
+        $bad = OaiyTest\AokiePlugin::outcome($what, 503);
+        eq('rebootstrap', $bad['kind'], "$what: the plugin's kind for 503");
+        if ($what === 'frames-post') {
+            eq(1, $bad['tries'], 'a 503 ends the frames post at the first try, and with it the carrier and every live call');
+        }
+        eq(200, $r->call($plug, 'GET', '/v1/aokie-companion/relay/challenge')['status'], "$what: works again");
+    }
+    // The table itself: the statuses the plugin treats as a failure to reconnect, and as "unavailable for this app".
+    foreach ([401, 400, 429, 500, 502] as $status) {
+        eq('reconnect', OaiyTest\AokiePlugin::kind($status), (string)$status);
+    }
+    foreach ([403, 404, 503] as $status) {
+        eq('rebootstrap', OaiyTest\AokiePlugin::kind($status), (string)$status);
+    }
+    eq(['kind' => null, 'tries' => 3, 'result' => 'dropped', 'closesCalls' => false], OaiyTest\AokiePlugin::framesPost(429), 'a 429 on a post is retried and then dropped');
+});
+
+test('4.18.5 a database that cannot be opened at all is answered by the front controller in the shape of the route: the 500 internal of the compatibility routes in the Aokie shape, and on the ordinary routes 503 unavailable with Retry-After 5', function () {
+    $r = Relay::make();
+    $d = $r->desktop();
+    [$srv] = $r->fleet(1);
+    usleep(300000);
+    // Break the opening of the database: SQLite, the file is a folder; MySQL and MariaDB, the server named is not there.
+    if (Relay::isMysql()) {
+        $r->configure(['db' => ['dsn' => 'mysql:host=127.0.0.1;port=' . OaiyTest\Server::freePort() . ';dbname=none']]);
+    } else {
+        rename($r->data . '/relay.sqlite', $r->data . '/relay.sqlite.away');
+        foreach (['-wal', '-shm'] as $x) {
+            @rename($r->data . '/relay.sqlite' . $x, $r->data . '/relay.sqlite.away' . $x);
+        }
+        mkdir($r->data . '/relay.sqlite');
+    }
+    $native = Relay::http($srv, $d, 'GET', '/v1/poll');
+    eq(503, $native['status'], $native['body']);
+    eq('unavailable', $native['json']['error']['code']);
+    eq('5', $native['headers']['retry-after'] ?? null, 'a database that cannot be opened: five seconds');
+    $compat = Relay::http($srv, 'x', 'GET', '/v1/aokie-companion/relay/challenge');
+    eq(500, $compat['status'], $compat['body']);
+    eq(['error' => true, 'code' => 'internal', 'message' => 'The relay hit an internal error.'], $compat['json'], 'the Aokie shape');
+    ok(!isset($compat['headers']['retry-after']));
+    $stream = Relay::http($srv, 'x', 'GET', '/v1/aokie-companion/relay/stream', null, ['Accept' => 'text/event-stream']);
+    eq(500, $stream['status']);
+    $r->countersMayDrift = true; // the database was taken away from under the run
 });
 
 test('4.18.5 an error that is the relay\'s own (a table that is gone) stays 500 internal, logged with where it happened, and is not mistaken for a busy database', function () {
@@ -160,6 +229,78 @@ test('4.18.3 debug.error_sites is off unless asked for: nothing is logged for a 
     ok(count($five) === 1 && $five[0]['code'] === 'internal' && preg_match('/^Db\.php:\d+$/D', $five[0]['site']) === 1, json_encode($five));
     // And the test helper that a failing assertion shows says it in words.
     contains('poll 401 unauthorized at Auth.php:', $r->errorSites());
+});
+
+test('4.18.3 debug.error_sites gives each cause that shares a refusal its own reason, so that a 401 or a 404 can be told apart in the log though the client is told one thing; and the clocks it logs are those of the decision', function () {
+    $r = Relay::make();
+    $d = $r->desktop();
+    $log = $r->data . '/logs/relay.log';
+    $last = function () use ($log): array {
+        $rows = array_values(array_filter(array_map(fn($l) => json_decode($l, true), @file($log, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: []), fn($j) => ($j['event'] ?? '') === 'error_site'));
+        return $rows === [] ? [] : $rows[count($rows) - 1];
+    };
+    $secretFlipped = substr($d->token, 0, -1) . (substr($d->token, -1) === 'A' ? 'B' : 'A');
+    $unknownId = 'oaiyrt1.' . str_repeat('A', 11) . '.' . substr($d->token, strrpos($d->token, '.') + 1);
+    $addr = ['REMOTE_ADDR' => '203.0.113.50'];
+    $cases = [
+        // what the client is told is the same for every one of these 401s
+        'no_bearer' => fn() => $r->call(null, 'GET', '/v1/poll', null, [], [], $addr),
+        'malformed_token' => fn() => $r->call('not-a-token', 'GET', '/v1/poll', null, [], [], $addr),
+        'unknown_token_id' => fn() => $r->call($unknownId, 'GET', '/v1/poll', null, [], [], $addr),
+        'wrong_secret' => fn() => $r->call($secretFlipped, 'GET', '/v1/poll', null, [], [], $addr),
+    ];
+    $bodies = [];
+    foreach ($cases as $reason => $fire) {
+        $res = $fire();
+        eq(401, $res['status'], $reason . $r->errorSites());
+        $row = $last();
+        eq($reason, $row['reason'] ?? null, 'the reason of the 401: ' . json_encode($row));
+        eq(1, preg_match('/^Auth\.php:\d+$/D', (string)$row['site']), 'the same site for all of them: ' . ($row['site'] ?? ''));
+        $bodies[$reason] = $res['body'];
+    }
+    eq(1, count(array_unique($bodies)), 'and the client is told one thing: ' . json_encode($bodies));
+    // A locked token: twenty wrong secrets of one id from one address, the address's own failure bucket a minute apart so that the lock and not
+    // the address's 429 is what answers the next, valid one.
+    $adr = ['REMOTE_ADDR' => '203.0.113.51'];
+    for ($i = 0; $i < 19; $i++) {
+        $r->call($secretFlipped, 'GET', '/v1/poll', null, [], [], $adr);
+    }
+    Tmp::setClock(Relay::T0 + 61);
+    $r->call($secretFlipped, 'GET', '/v1/poll', null, [], [], $adr);
+    $res = $r->call($d, 'GET', '/v1/poll', null, [], [], $adr);
+    eq(401, $res['status'], 'a valid token from a locked address: ' . $res['body']);
+    eq('token_locked', $last()['reason'] ?? null);
+    Tmp::setClock(Relay::T0);
+    // The 404s of a pairing read: unknown, expired, burned and malformed are one answer and four reasons.
+    $r2 = Relay::make();
+    $d2 = $r2->desktop();
+    $c = OaiyTest\Ceremony::random($r2, $d2);
+    $c->open([], 5);
+    $unknown = OaiyTest\Ceremony::random($r2, $d2);
+    $burned = OaiyTest\Ceremony::random($r2, $d2);
+    $burned->open();
+    $burned->burn();
+    $bodies = [];
+    $log2 = $r2->data . '/logs/relay.log';
+    $last2 = function () use ($log2): array {
+        $rows = array_values(array_filter(array_map(fn($l) => json_decode($l, true), @file($log2, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: []), fn($j) => ($j['event'] ?? '') === 'error_site'));
+        return $rows === [] ? [] : $rows[count($rows) - 1];
+    };
+    Tmp::setClock(Relay::T0 + 6); // the first one is past its life
+    foreach (['pid_unknown' => $unknown->pid, 'pid_expired' => $c->pid, 'pid_ended' => $burned->pid, 'pid_malformed' => str_repeat('A', 21) . 'B'] as $reason => $pid) {
+        $res = $r2->call(null, 'GET', '/v1/pair/' . $pid, null, [], [], ['REMOTE_ADDR' => '198.51.100.' . strlen($reason)]);
+        eq(404, $res['status'], $reason . ' ' . $res['body']);
+        eq($reason, $last2()['reason'] ?? null, json_encode($last2()));
+        $bodies[$reason] = $res['body'];
+    }
+    eq(1, count(array_unique($bodies)), 'one answer to a stranger for all four: ' . json_encode($bodies));
+    // The clocks are those of the decision: an error made, then the clock moved, then the answer built: the log says when it was made.
+    Tmp::setClock(Relay::T0);
+    $e = Oaiy\Relay\ApiError::make('not_found')->because('x');
+    Tmp::setClock(Relay::T0 + 500);
+    eq(Relay::T0, $e->decidedAt, 'the relay clock at the decision');
+    ok(abs($e->decidedReal - time()) <= 5);
+    eq('x', $e->reason);
 });
 
 test('4.18.3 the test clock is read again when its file cannot be read for a moment, and an unreadable one is an error and never the host\'s own time', function () {

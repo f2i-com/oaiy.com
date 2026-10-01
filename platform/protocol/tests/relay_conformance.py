@@ -1819,8 +1819,11 @@ ok("README makes the challenge life a config value, call.challenge_s", "`call.ch
 ok("README sizes the stream open bucket at 20 refilled three a second, says why (the carriers pause one second after a failed open, ignore Retry-After and give up after three failures) and what was measured and not done",
    "a bucket of 20 opens for the party, refilled three a second" in readme and "**A carrier that cancels opens is a different case" in readme
    and "give a session up after three failures in a row" in readme and "Not done: answering an open over the bucket with a stream that ends at once" in readme)
-ok("README says a busy or gone database is 503 unavailable with Retry-After on every route and never a 500, a 401 or a 404, and names debug.error_sites for finding where an error was decided",
-   "is `503 unavailable` with `Retry-After: 1` on every route, never a `500`, a `401` or a `404`" in readme and "`Db::isTransient`" in readme and "`debug.error_sites`" in readme)
+ok("README says a busy or gone database is 503 unavailable with Retry-After on the ordinary routes, the 500 internal the plugin retries on the compatibility routes (with the plugin's lines), never a 401 or a 404, that a frames post that committed is stored again by its retry, and that debug.error_sites gives a reason code and the clocks of the decision",
+   "is `503 unavailable` with a `Retry-After` on the ordinary routes and the `500 internal` that the shipped plugin retries on the compatibility routes, and never a `401` or a `404`" in readme
+   and "`Db::isTransient`" in readme and "`relay_status_error`, `companion_relay.rs` 1093-1108" in readme and "`post_frames`, 1025-1031" in readme and "`errors.rs` 170-180" in readme
+   and "`tests/lib/AokiePlugin.php`" in readme and "stores a second set of frames under new `seq` numbers" in readme and "a reason code that tells the causes apart" in readme
+   and "as they were when the decision was made" in readme and "`debug.error_sites`" in readme)
 ok("README bounds the polls that wait of one credential to three in flight, answers the fourth 429 with Retry-After 1, and requires a client to treat that 429 as no failure and to honour Retry-After with jitter (DK-03 and MOB-21a)",
    "At most three consumer polls that wait" in readme and "A fourth is refused `429 rate_limited`, `Retry-After: 1`, before anything is read or written" in readme
    and "MUST NOT treat this `429` as a failure, and MUST honour `Retry-After`" in readme and "DK-03" in readme and "MOB-21a" in readme and "Interpretation 58" in readme

@@ -80,9 +80,10 @@ final class PairingApi
             }
         }
         $now = Clock::now();
-        $row = Pairing::live($ctx->db, $pid, $now);
+        $why = null;
+        $row = Pairing::live($ctx->db, $pid, $now, false, $why);
         if ($row === null || !$ctx->cfg->appAllowed((string)$row['app_id'])) {
-            throw ApiError::make('not_found'); // an app config.apps no longer lists is as good as gone, and says so to a stranger no differently
+            throw ApiError::make('not_found')->because($row === null ? (string)$why : 'app_not_allowed'); // an app config.apps no longer lists is as good as gone, and says so to a stranger no differently
         }
         // Each rendezvous answers 60 GETs while it is open or answered (the design's budget against a pid that is being guessed or hammered).
         // A rendezvous that has ended in an outcome (approved, denied) answers reads of it without counting them: the token was
@@ -93,9 +94,10 @@ final class PairingApi
         } else {
             $counted = $ctx->db->write(fn(Db $db): int => $db->exec("UPDATE pairings SET gets = gets + 1 WHERE pid = ? AND gets < ? AND state IN ('open', 'answered')", [$pid, Pairing::GETS_MAX]));
             if ($counted !== 1) {
-                $fresh = Pairing::live($ctx->db, $pid, $now);
+                $why = null;
+                $fresh = Pairing::live($ctx->db, $pid, $now, false, $why);
                 if ($fresh === null) {
-                    throw ApiError::make('not_found');
+                    throw ApiError::make('not_found')->because((string)$why);
                 }
                 if (!self::isOutcome($fresh)) {
                     throw new ApiError(429, 'rate_limited', null, max(1, min(60, (int)$row['exp'] - $now)));
@@ -126,7 +128,7 @@ final class PairingApi
                 $holdInfo = $superseded ? ['granted' => true, 'superseded' => true] : ['granted' => true];
                 $row = $fresh;
                 if ($row === null) {
-                    throw ApiError::make('not_found'); // it expired or was burned while the phone waited
+                    throw ApiError::make('not_found')->because('pid_gone_while_waiting'); // it expired or was burned while the phone waited
                 }
             }
         }

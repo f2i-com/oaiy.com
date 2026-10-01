@@ -43,13 +43,27 @@ final class Pairing
      * other case (unknown, expired, burned): the caller answers all of them with the same 404.
      * @return array<string,mixed>|null
      */
-    public static function live(Db $db, string $pid, int $now, bool $lock = false): ?array
+    public static function live(Db $db, string $pid, int $now, bool $lock = false, ?string &$why = null): ?array
     {
         if (B64::decN($pid, 16) === null) {
+            $why = 'pid_malformed';
             return null;
         }
         $row = $db->one('SELECT * FROM pairings WHERE pid = ?' . ($lock ? $db->forUpdate() : ''), [$pid]);
-        return $row !== null && $row['exp'] > $now && $row['state'] !== 'expired' ? $row : null;
+        // One answer to a stranger for every one of these; $why is what debug.error_sites logs, so that a 404 can be told apart.
+        if ($row === null) {
+            $why = 'pid_unknown';
+            return null;
+        }
+        if ($row['exp'] <= $now) {
+            $why = 'pid_expired';
+            return null;
+        }
+        if ($row['state'] === 'expired') {
+            $why = 'pid_ended'; // burned, or its third response was rejected
+            return null;
+        }
+        return $row;
     }
 
     /**
@@ -62,10 +76,10 @@ final class Pairing
     {
         $row = B64::decN($pid, 16) === null ? null : $db->one('SELECT * FROM pairings WHERE pid = ?' . $db->forUpdate(), [$pid]);
         if ($row === null || !hash_equals((string)$row['desktop_dev'], $p->id)) {
-            throw ApiError::make('not_found');
+            throw ApiError::make('not_found')->because($row === null ? 'pid_unknown' : 'pid_of_another_desktop');
         }
         if ($row['exp'] <= $now || ($row['state'] === 'expired' && !$allowBurned)) {
-            throw ApiError::make('expired');
+            throw ApiError::make('expired')->because($row['exp'] <= $now ? 'pid_expired' : 'pid_ended');
         }
         return $row;
     }
@@ -191,9 +205,10 @@ final class Pairing
         }
         $now = Clock::now();
         $desktop = $ctx->db->write(function (Db $db) use ($ctx, $pid, $text, $now): string {
-            $row = self::live($db, $pid, $now, true);
+            $why = null;
+            $row = self::live($db, $pid, $now, true, $why);
             if ($row === null || !$ctx->cfg->appAllowed((string)$row['app_id'])) {
-                throw ApiError::make('not_found'); // (an app that config.apps no longer lists: the same answer as an unknown pid)
+                throw ApiError::make('not_found')->because($row === null ? (string)$why : 'app_not_allowed'); // (an app that config.apps no longer lists: the same answer as an unknown pid)
             }
             if ($row['state'] !== 'open' || $row['responses'] >= self::RESPONSES_MAX) {
                 if (self::isRetryOfAccepted($db, $row, $text)) {

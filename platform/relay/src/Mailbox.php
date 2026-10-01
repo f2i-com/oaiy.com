@@ -116,7 +116,7 @@ final class Mailbox
     {
         $row = $db->one('SELECT revoked_at FROM devices WHERE id = ?' . $db->forShare(), [$deviceId]);
         if ($row === null || $row['revoked_at'] !== null) {
-            throw ApiError::make($error);
+            throw ApiError::make($error)->because($row === null ? 'device_not_found_in_transaction' : 'device_revoked_in_transaction');
         }
     }
 

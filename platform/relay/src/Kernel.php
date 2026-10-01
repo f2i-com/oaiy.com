@@ -68,6 +68,7 @@ final class Kernel
         ob_start();
         $res = null;
         $kernel = null;
+        $req = null;
         try {
             set_error_handler(static function (int $no, string $msg, string $file, int $line): bool {
                 if (!(error_reporting() & $no)) {
@@ -80,10 +81,18 @@ final class Kernel
             $kernel = new self($ctx);
             $res = $kernel->handle($req);
         } catch (ApiError $e) {
-            $res = self::finalise(Response::error($e), Clock::now());
+            // The relay could not start: before there is a Context there is no configuration to read, but the request is known, and
+            // the compatibility routes answer in their own shape and with the status their client retries (see forRoute()).
+            $compat = $req !== null && Facade::isCompatPath($req->path);
+            if ($e->database) {
+                Log::write('warn', 'db_unavailable', ['where' => 'bootstrap', 'code' => (string)$e->reason, 'site' => $e->site()]);
+            }
+            $e = self::forRoute($e, $compat);
+            $res = self::finalise($compat ? Facade::error($e) : Response::error($e), Clock::now());
         } catch (\Throwable $e) {
             Log::error($e, 'bootstrap');
-            $res = self::finalise(Response::error(ApiError::make('internal')), Clock::now());
+            $compat = $req !== null && Facade::isCompatPath($req->path);
+            $res = self::finalise($compat ? Facade::error(ApiError::make('internal')) : Response::error(ApiError::make('internal')), Clock::now());
         }
         ob_end_clean();
         $res->emit();
@@ -117,46 +126,84 @@ final class Kernel
         $req->client = ClientIp::resolve($req->server, $this->ctx->cfg->clientIpHeader(), $this->ctx->cfg->trustedProxies(), [$req, 'exactHeader']);
         $code = null;
         $site = null;
+        $reason = null;
+        $at = [null, null]; // the relay's clock and the host's at the moment the answer was decided, where the decision recorded them
         try {
             $res = $this->dispatch($req);
         } catch (ApiError $e) {
-            $code = $e->errorCode;
+            $compat = Facade::isCompatPath($req->path);
             $site = $e->site();
-            $res = Facade::isCompatPath($req->path) ? Facade::error($e) : Response::error($e);
+            $reason = $e->reason;
+            $at = [$e->decidedAt, $e->decidedReal];
+            if ($e->database) {
+                Log::write('warn', 'db_unavailable', ['where' => $this->route, 'code' => (string)$e->reason, 'site' => $site]);
+            }
+            $e = self::forRoute($e, $compat);
+            $code = $e->errorCode;
+            $res = $compat ? Facade::error($e) : Response::error($e);
             if ($e->status === 405) {
                 $res->headers['Allow'] = 'GET, POST, PUT, PATCH, DELETE';
             }
         } catch (\PDOException $e) {
-            // A database that is busy, locked, dropped the connection or refuses it for the moment is the database's state: 503 with a
-            // Retry-After, whatever route and whatever step it was in (a read outside a write transaction is not retried by Db::write
-            // and used to be a 500). A client is never told its credential or what it asked for is wrong because the database hiccuped.
+            // A database that is busy, locked, dropped the connection or refuses it for the moment is the database's state, and the
+            // client is never told that its credential or what it asked for is wrong because of it. On the ordinary routes that is a 503
+            // with a Retry-After, whatever step it was in (a read outside a write transaction is not retried by Db::write and used to be
+            // a 500); on the compatibility routes it is the 500 the shipped plugin retries (see forRoute()).
             $site = basename($e->getFile()) . ':' . $e->getLine();
+            $compat = Facade::isCompatPath($req->path);
             if (Db::isTransient($e)) {
-                $err = new ApiError(503, 'unavailable', null, 1);
+                $reason = 'db_error_' . (string)($e->errorInfo[1] ?? $e->getCode());
                 Log::write('warn', 'db_unavailable', ['where' => $this->route, 'code' => (string)($e->errorInfo[1] ?? $e->getCode()), 'site' => $site]);
-                $code = 'unavailable';
-                $res = Facade::isCompatPath($req->path) ? Facade::error($err) : Response::error($err);
+                $err = self::forRoute(ApiError::databaseBusy(1, $reason), $compat);
+                $code = $err->errorCode;
+                $res = $compat ? Facade::error($err) : Response::error($err);
+                $at = [$err->decidedAt, $err->decidedReal];
             } else {
                 Log::error($e, $this->route);
+                $reason = 'db_error_not_transient';
                 $code = 'internal';
-                $res = Facade::isCompatPath($req->path) ? Facade::error(ApiError::make('internal')) : Response::error(ApiError::make('internal'));
+                $res = $compat ? Facade::error(ApiError::make('internal')) : Response::error(ApiError::make('internal'));
             }
         } catch (\Throwable $e) {
             Log::error($e, $this->route);
             $site = basename($e->getFile()) . ':' . $e->getLine();
+            $reason = 'exception_' . (new \ReflectionClass($e))->getShortName();
             $code = 'internal';
             $res = Facade::isCompatPath($req->path) ? Facade::error(ApiError::make('internal')) : Response::error(ApiError::make('internal'));
         }
         if ($site !== null && ($res->status === 401 || $res->status === 404 || $res->status >= 500) && $this->ctx->cfg->debugErrorSites()) {
             // Off unless the owner (or a test) turns it on. A line names the route, the status, the code and the place in the code that
             // decided it, and the relay's own clock beside the host's: no credential, id, header or body.
-            Log::write('info', 'error_site', ['route' => $this->route, 'status' => $res->status, 'code' => (string)$code, 'site' => $site, 'now' => Clock::now(), 'real' => time(), 'pid' => (int)getmypid()]);
+            // $reason says which of the causes that share a site it was (an unknown token id and a wrong secret are both Auth.php's refusal), and
+            // the clocks are the ones read when it was decided; where a decision did not record them they are read now.
+            Log::write('info', 'error_site', ['route' => $this->route, 'status' => $res->status, 'code' => (string)$code, 'site' => $site, 'reason' => $reason ?? 'unspecified',
+                'now' => $at[0] ?? Clock::now(), 'real' => $at[1] ?? time(), 'pid' => (int)getmypid()]);
         }
         if ($code !== null && $code !== 'rate_limited') {
             $this->ctx->limiter->bump('rej:' . $code);
         }
         $this->defer($req, $res);
         return self::finalise($res, Clock::now());
+    }
+
+    /**
+     * What a database that is busy or gone is answered on this route. The ordinary routes say what it is: 503 unavailable with a
+     * Retry-After. The compatibility routes (/v1/aokie-companion/) answer the 500 `internal` that they always did, because that is the
+     * status the shipped plugin handles: it reads 500 as a failure to reconnect and its frames post retries it three times at 250 ms,
+     * where a 503 is "unavailable for this app" and ends the carrier at once, closing a live call over a blink of the database
+     * (companion_relay.rs relay_status_error, 1093-1108; post_frames, 1025-1031). Every other error is as it was made.
+     */
+    private static function forRoute(ApiError $e, bool $compat): ApiError
+    {
+        if (!$e->database || !$compat) {
+            return $e;
+        }
+        $n = ApiError::make('internal');
+        $n->database = true;
+        $n->reason = $e->reason;
+        $n->decidedAt = $e->decidedAt;
+        $n->decidedReal = $e->decidedReal;
+        return $n;
     }
 
     private function dispatch(Request $req): Response
