@@ -150,7 +150,8 @@ foreach ([5, 8] as $workers) {
                 ok(count($res['latency']) >= 20, 'the probes were answered: ' . count($res['latency']));
                 eq(50, array_sum($res['statuses']));
                 $refused = (int)($res['statuses'][429] ?? 0);
-                ok($refused >= 35, 'at least 35 of the 50 were refused at once, not queued and run: ' . json_encode($res['statuses']));
+                // A hold that is superseded frees its place within 50 ms, so a burst that takes a few hundred milliseconds to be answered lets more than the bucket through only by the places that come free: the bucket (and what it refills meanwhile) is the bound.
+                ok($refused >= 50 - Holds::OPEN_BUCKET - 6, 'at least ' . (50 - Holds::OPEN_BUCKET - 6) . ' of the 50 were refused at once, not queued and run: ' . json_encode($res['statuses']));
                 $passed = pool_p90($res['latency']) < 1.0 && $worst < 2.0;
             }
             ok($passed, "health checks during 50 $what opens from one bearer took a second at the 90th percentile or two at the most, in all of three tries: " . implode(' | ', $tries));
@@ -279,14 +280,16 @@ test('9.2 a party has at most three streams or frames waits running at once, the
     eq(0, $holds->inFlight('stream', $key));
 });
 
-test('9.2 the stream opens of one party are a bucket of 10 refilled at one a second, whatever admissions it holds: 429 with Retry-After, judged before the admission\'s own bucket and without a write', function () {
+test('9.2 the stream opens of one party are a bucket (Holds::OPEN_BUCKET, refilled Holds::OPEN_REFILL_PER_S a second), whatever admissions it holds: 429 with Retry-After, judged before the admission\'s own bucket and without a write, and a retry after the carriers\' one second pause is let through even when another open took a token meanwhile', function () {
+    $bucket = Holds::OPEN_BUCKET;
+    $refill = Holds::OPEN_REFILL_PER_S;
     $k = AokieRig::make();
     $a = $k->addPhone('A');
     $b = $k->addPhone('B');
     $k->pushRoster();
     $ta = $k->mobileToken($a);
     $db = $k->r->ctx()->db;
-    for ($i = 1; $i <= 10; $i++) {
+    for ($i = 1; $i <= $bucket; $i++) {
         $k->facade($ta, true);
     }
     $refuse = function (string $bearer, string $why) use ($k): ApiError {
@@ -297,14 +300,16 @@ test('9.2 the stream opens of one party are a bucket of 10 refilled at one a sec
         }
         fail("not refused: $why");
     };
-    $e = $refuse($ta, 'the eleventh');
+    $e = $refuse($ta, 'the one after the bucket');
     eq([429, 'rate_limited'], [$e->status, $e->errorCode]);
     ok($e->retryAfter >= 1 && $e->retryAfter <= 2, 'Retry-After ' . $e->retryAfter);
-    // The same party with a brand new admission (a new jti, a new 120-request bucket of its own) shares the bucket: after a second one
-    // token is back, and whichever admission takes it, the next is refused.
+    // The same party with a brand new admission (a new jti, a new 120-request bucket of its own) shares the bucket: after a second the
+    // refill is back, and whichever admission takes it, the one after it is refused.
     Tmp::setClock(Relay::T0 + 1);
     $ta2 = $k->mobileToken($a);
-    $k->facade($ta, true); // the old admission takes the token that came back
+    for ($i = 0; $i < $refill; $i++) {
+        $k->facade($i % 2 === 0 ? $ta : $ta2, true);
+    }
     $e = $refuse($ta2, 'the same party, a new admission');
     eq([429, 'rate_limited'], [$e->status, $e->errorCode]);
     $rowsBefore = $db->all("SELECT k, w, n FROM rl WHERE k LIKE 'b:adm.%' ORDER BY k");
@@ -312,15 +317,27 @@ test('9.2 the stream opens of one party are a bucket of 10 refilled at one a sec
         $refuse($ta2, "a refusal $i");
     }
     eq($rowsBefore, $db->all("SELECT k, w, n FROM rl WHERE k LIKE 'b:adm.%' ORDER BY k"), 'twenty refusals wrote nothing: neither bucket moved');
-    // Refilled at one a second.
+    // Refilled at the rate it says.
     Tmp::setClock(Relay::T0 + 4);
-    for ($i = 0; $i < 3; $i++) {
+    for ($i = 0; $i < 3 * $refill; $i++) {
         $k->facade($ta2, true);
     }
-    $refuse($ta2, 'three seconds gave three');
+    $refuse($ta2, 'three seconds gave three seconds of refill');
+    // The shipped carriers read a 429 as a failure, ignore Retry-After, pause one second and open again, and give up the session after three
+    // failures in a row: one second later the retry must find a token even if another open (an abandoned one, from a request that sat in
+    // the host's queue) took one in that second, or the carrier fails on the bucket alone.
+    Tmp::setClock(Relay::T0 + 20);
+    for ($i = 0; $i < $bucket; $i++) {
+        $k->facade($ta2, true);
+    }
+    $refuse($ta2, 'the bucket is empty again');
+    Tmp::setClock(Relay::T0 + 21);
+    $k->facade($ta, true); // another open of the party, taking a token of the second's refill
+    $k->facade($ta2, true); // the carrier's retry, one second after its refusal
+    ok($refill >= 2, 'a refill of at least two a second leaves the retry a token when one other open drew on the second');
     // Another party has a bucket of its own.
     $tb = $k->mobileToken($b);
-    for ($i = 0; $i < 10; $i++) {
+    for ($i = 0; $i < $bucket; $i++) {
         $k->facade($tb, true);
     }
     // And a request that opens nothing (a challenge, a post, a read that does not wait) never draws on it.

@@ -38,9 +38,15 @@ final class Holds
     public const STREAM_INFLIGHT_MAX = 3;
     /** The most consumer polls that wait, of one credential, that may be running at once, the ones a newer poll is superseding included. */
     public const POLL_INFLIGHT_MAX = 3;
-    /** A party's bucket of stream opens and frames waits: 10 at once, one more a second. */
-    public const OPEN_BUCKET = 10;
-    public const OPEN_REFILL_PER_S = 1;
+    /**
+     * A party's bucket of stream opens and frames waits: 20 at once, three more a second. The shipped carriers read a 429 as a failure, ignore
+     * Retry-After, pause one second and open again, and give the session up after three failures in a row; so the refill is more than the one
+     * a second their own pause would take back, which leaves a retry a token when an open that was abandoned in the host's queue (and so
+     * drew one) is served in the same second. A party that keeps to the bucket is let through about 3 opens a second at most, which at about
+     * 50 ms of worker each is a seventh of a worker.
+     */
+    public const OPEN_BUCKET = 20;
+    public const OPEN_REFILL_PER_S = 3;
 
     private string $dir;
     private Effective $eff;

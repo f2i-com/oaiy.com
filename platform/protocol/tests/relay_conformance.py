@@ -1816,6 +1816,9 @@ ok("README says consumers de-duplicate on (from, id) and never on the id alone, 
    "consumers de-duplicate on `(from, id)`" in readme and "never on `id` alone" in readme and "`(mailbox, lane, sender, id)` uniqueness for 10 minutes" in readme
    and "`(mailbox, lane, id)` uniqueness" not in readme and "A consumer de-duplicates on (from, id), after authenticating the sender" in readme)
 ok("README makes the challenge life a config value, call.challenge_s", "`call.challenge_s` (10 to 30, default 25)" in readme)
+ok("README sizes the stream open bucket at 20 refilled three a second, says why (the carriers pause one second after a failed open, ignore Retry-After and give up after three failures) and what was measured and not done",
+   "a bucket of 20 opens for the party, refilled three a second" in readme and "**A carrier that cancels opens is a different case" in readme
+   and "give a session up after three failures in a row" in readme and "Not done: answering an open over the bucket with a stream that ends at once" in readme)
 ok("README says a busy or gone database is 503 unavailable with Retry-After on every route and never a 500, a 401 or a 404, and names debug.error_sites for finding where an error was decided",
    "is `503 unavailable` with `Retry-After: 1` on every route, never a `500`, a `401` or a `404`" in readme and "`Db::isTransient`" in readme and "`debug.error_sites`" in readme)
 ok("README bounds the polls that wait of one credential to three in flight, answers the fourth 429 with Retry-After 1, and requires a client to treat that 429 as no failure and to honour Retry-After with jitter (DK-03 and MOB-21a)",
