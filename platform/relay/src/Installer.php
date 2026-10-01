@@ -96,10 +96,11 @@ XML;
      * The URL paths at which data/ would be served if some folder above it were the document root: /data (the relay folder
      * is the root), then /<relay folder>/data (the relay is one folder inside a site), then one folder more each, up to
      * CANARY_DEPTH. A relay unpacked into a folder of an existing site is exactly the layout where data/ is served under a
-     * path, and asking the site's origin for /data/ alone reports it as protected. A folder name the URL could not carry
-     * as it is ends the list.
+     * path, and asking the site's origin for /data/ alone reports it as protected. A folder name is percent-encoded as it
+     * is (`/srv/my relay/data` is asked for at `/my%20relay/data/`): a space or an accent in a folder name is common on a
+     * shared host and must not hide the layout. A drive letter, a dot folder or a name with a control character ends the list.
      *
-     * @return list<string> paths with a leading slash and none trailing
+     * @return list<string> paths with a leading slash and none trailing, each folder percent-encoded
      */
     public static function canaryPaths(string $dataDir): array
     {
@@ -111,10 +112,10 @@ XML;
             if ($s === '') {
                 continue;
             }
-            if (preg_match('#^[A-Za-z0-9._~-]+$#D', $s) !== 1 || $s === '.' || $s === '..') {
-                break; // a drive letter, a space, a dot folder: no URL path is made from it or from anything above it
+            if ($s === '.' || $s === '..' || preg_match('#^[A-Za-z]:$#D', $s) === 1 || preg_match('#[\x00-\x1F\x7F]#', $s) === 1) {
+                break; // a drive letter, a dot folder, a control character: no URL path is made from it or from anything above it
             }
-            array_unshift($tail, $s);
+            array_unshift($tail, rawurlencode($s));
             $path = '/' . implode('/', $tail);
             if (!in_array($path, $paths, true)) {
                 $paths[] = $path;
