@@ -63,10 +63,12 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<PathBuf>
     Ok(root)
 }
 
-pub fn install(launch: Launch) -> Result<(), String> {
+/// Takes the launch as this process's own (once). Not called `install`: the update guards look for that name, and this
+/// installs no package.
+pub fn adopt(launch: Launch) -> Result<(), String> {
     LAUNCH
         .set(launch)
-        .map_err(|_| "isolated launch is already installed".into())
+        .map_err(|_| "isolated launch is already adopted".into())
 }
 
 pub fn current() -> Option<&'static Launch> {

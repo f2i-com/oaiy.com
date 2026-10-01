@@ -1201,7 +1201,7 @@ pub fn run() {
             crate::isolated_webview::preflight()?;
             crate::isolated::Launch::prepare(root)
         }).transpose())
-        .and_then(|launch| match launch { Some(launch) => crate::isolated::install(launch), None => Ok(()) });
+        .and_then(|launch| match launch { Some(launch) => crate::isolated::adopt(launch), None => Ok(()) });
     if let Err(error) = prepared {
         eprintln!("isolated launch refused: {error}");
         std::process::exit(2);
@@ -1269,7 +1269,8 @@ pub fn run() {
         // identifier above gives it independent native mutex/window names.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| crate::tray::show_main(app)));
     let builder = if isolated { builder } else {
-        builder.plugin(tauri_plugin_shell::init())
+        builder
+            .plugin(tauri_plugin_shell::init())
             .plugin(tauri_plugin_dialog::init())
             .plugin(tauri_plugin_notification::init())
             .plugin(crate::update::gui::plugin())

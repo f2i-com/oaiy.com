@@ -4990,7 +4990,8 @@ fn the_window_registers_exactly_the_backup_commands_there_are() {
 #[test]
 fn the_staged_restore_is_applied_before_anything_in_the_start_up_opens_a_store() {
     let lib = source_text(include_str!("../lib.rs"));
-    let setup = lib.find(".setup(|app| {").expect("the start-up");
+    // `move`: an isolated launch's flag is carried into the closure.
+    let setup = lib.find(".setup(move |app| {").or_else(|| lib.find(".setup(|app| {")).expect("the start-up");
     let apply = lib[setup..].find("crate::backup::restore::apply_pending(&data_dir)").expect("the staged restore is applied at the start") + setup;
     // Nothing runs before the builder's setup that could read the data folder: no data folder is even known.
     let builder = &lib[lib[..setup].rfind("tauri::Builder::default()").expect("the builder")..setup];
@@ -5009,6 +5010,8 @@ fn the_staged_restore_is_applied_before_anything_in_the_start_up_opens_a_store()
         "log::info!(\"OAIY Desktop {} starting (data={})\", env!(\"CARGO_PKG_VERSION\"), data_dir.display());",
         // What a killed backup or restore left behind.
         "crate::backup::restore::sweep_leftovers(&data_dir);",
+        // An isolated plugin-qualification launch's own webview profile folder (its own root's, not this data folder).
+        ".data_directory(launch.profile.clone())",
     ];
     expected.sort();
     assert_eq!(readers, expected, "something new touches the data folder before the staged restore is applied");
