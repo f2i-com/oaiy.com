@@ -68,8 +68,9 @@ final class Facade
      * every error of a path under /v1/aokie-companion/ in the Aokie shape (error() above), counts it, logs it with the place that decided
      * it (debug.error_sites) and, for an error that is the database's state, gives it the status the shipped plugin retries instead of the
      * 503 it re-bootstraps on (Kernel::forRoute). This method used to catch the ApiError itself and answer it here, and so never let a
-     * busy database that Db::write had given up on (a 503 ApiError) reach forRoute(): five of the eight requests the plugin and the
-     * phone make still answered 503, which ends the plugin's carrier and closes a live call. Kept so that a handler of these routes is
+     * busy database that Db::write had given up on (a 503 ApiError) reach forRoute(): all eight of the requests the plugin and the
+     * phone make answered 503 then (the review found it on five; a competing writer that blocks every write finds all eight, which is
+     * what the tests make), and a 503 ends the plugin's carrier and closes a live call. Kept so that a handler of these routes is
      * written the same way whatever it does; the one place that decides is the front controller.
      * @param callable():Response $fn
      */
