@@ -130,8 +130,8 @@ export const WARM_TOKENS = 32;
 const REPEAT_NUDGE = 'You gave the same reply again, and still no tool has run. Do not reply in words: your next reply must be a tool call (update_plan for a task, or the first tool the work needs).';
 /** For a reply that only announced the work. */
 const START_NUDGE = 'You said what you will do, but no tool has run yet, so nothing has started. Start now: call update_plan with the plan (for a task with several steps), then the first step\'s tools. Do not describe the work again; do it.';
-/** For a run that started calls, which are going on, and ended with no words: its plan is not pushed on (the result comes by itself), but the person is told. */
-const CALLS_GOING_NUDGE = 'The calls you started are going on, and their results come to you by themselves when they end: do not check on them. You have said nothing to the person yet: tell them in a sentence what you started and what happens next.';
+/** For a run that started calls, which are going on, and whose reply had no words: its plan is not pushed on (the result comes by itself), but the person is told. */
+const CALLS_GOING_NUDGE = 'Your last reply had no words. The calls you started are going on, and their results come to you by themselves when they end, so do not check on them. Say in a sentence what you started and what happens next.';
 
 /**
  * Whether a reply announces work it is about to do ("I'll…", "Let me…",
@@ -160,6 +160,8 @@ Be specific and complete. Keep code only where it is essential. At most about 12
 const MAX_NUDGES = 30;
 /** …and not again after this many in a row with no progress (no step done, no file changed). */
 const MAX_IDLE_NUDGES = 2;
+/** A run waiting for its calls whose reply has no words is asked to say what it started this many times in all, whatever else it does between. */
+const MAX_SPEAK_NUDGES = 2;
 /** Steps (model replies with tool calls) on one plan step without the plan changing, before a reminder of where the work is. */
 const DRIFT_STEPS = 12;
 /** The same automatic-check errors this many times in a row stop the run. */
@@ -378,6 +380,15 @@ export interface SessionTool {
   run: (input: Record<string, unknown>, signal?: AbortSignal) => Promise<string>;
   /** Whether this call (its input, and what it answered) started calls: the run is then waiting on them (see AgentOptions.waitingOnCall). */
   startsCalls?: (input: Record<string, unknown>, result: string) => boolean;
+}
+
+/** Whether a tool says it started calls; one whose answer cannot be read, or that throws, says no (the run is nudged as on main). */
+function didStartCalls(tool: SessionTool, input: Record<string, unknown>, result: string): boolean {
+  try {
+    return !!tool.startsCalls?.(input, result);
+  } catch {
+    return false;
+  }
 }
 
 function turnChars(t: Turn, charsPerToken = DEFAULT_CHARS_PER_TOKEN): number {
@@ -710,7 +721,7 @@ export class Agent {
     const tool = this.sessionToolList.find((t) => t.spec.name === call.name)!;
     try {
       const content = await tool.run(call.input, signal);
-      return { id: call.id, name: call.name, content, isError: false, ...(tool.startsCalls?.(call.input, content) ? { startedCalls: true } : {}) };
+      return { id: call.id, name: call.name, content, isError: false, ...(didStartCalls(tool, call.input, content) ? { startedCalls: true } : {}) };
     } catch (error) {
       return { id: call.id, name: call.name, content: `Error: ${(error as Error).message}`, isError: true };
     }
@@ -1818,6 +1829,8 @@ ${this.instructions}` : ''}`;
     let repeatNudged = false;
     // This run started calls (a tool says so): their results come to it by themselves.
     let startedCalls = false;
+    // How many times it was asked to say what it started (its own limit: a tool call in between is not progress).
+    let speakNudges = 0;
     const maxSteps = this.options.maxSteps ?? MAX_STEPS;
     try {
       for (let step = 1; step <= maxSteps; step++) {
@@ -1878,8 +1891,10 @@ ${this.instructions}` : ''}`;
           const progress = { done: this.plan?.items.filter((i) => i.status === 'done').length ?? 0, changed: changedThisRun.size, acted };
           idleNudges = progress.done > progressAtNudge.done || progress.changed > progressAtNudge.changed || progress.acted > progressAtNudge.acted ? 0 : idleNudges + 1;
           progressAtNudge = progress;
-          if (unfinished && nudges < MAX_NUDGES && idleNudges < MAX_IDLE_NUDGES && !reply.truncated) {
+          const speak = unfinished === CALLS_GOING_NUDGE;
+          if (unfinished && nudges < MAX_NUDGES && (speak ? speakNudges < MAX_SPEAK_NUDGES : idleNudges < MAX_IDLE_NUDGES) && !reply.truncated) {
             nudges++;
+            if (speak) speakNudges++;
             emit({ type: 'nudge', message: unfinished.split('\n')[0] });
             this.turns.push({ role: 'user', text: `[OAIY] ${unfinished}`, automatic: true });
             continue;

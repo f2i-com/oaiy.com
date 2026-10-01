@@ -121,8 +121,9 @@ the result, and was then pushed on by its plan again and again (a nudge, a
 status check, a word, a nudge...); each of those was a request on the server,
 and the call's next reply waited behind one of them.
 
-So while a call the runner started is live, its automatic plan nudge stays
-quiet (`unfinished` in `app/src/agent/agent.ts`):
+So while a call that a run started is live, that run's automatic plan nudge stays
+quiet (`unfinished` in `app/src/agent/agent.ts`). It applies to the person's own
+conversations that can place calls: the Front desk's runner, and a project's agent:
 
 - **Which run, which calls.** The run that started them: `start_outreach` for
   a list of calls, or `outreach_resume` of a paused list of calls, and the tool
@@ -135,8 +136,9 @@ quiet (`unfinished` in `app/src/agent/agent.ts`):
   "you said you would, do it now" push that goes with it. The run ends, and the
   call's result comes to the conversation once, when it ends, as one more
   request that carries on from the plan.
-- **What does not.** A run that ends with no words is still asked, once or
-  twice (the same bound as any nudge), to say what it started. A failing app
+- **What does not.** A run whose reply has no words is still asked, at most
+  twice in all (its own limit, which a tool call in between does not reset), to
+  say what it started; then the run ends. A failing app
   check or a flagged file still pushes. Checking on a campaign
   (`outreach_status`), a start that was declined or refused, a list of texts, a
   flow that ran in the tool's place, another run's plan, and a call that is

@@ -17,10 +17,10 @@ afterEach(() => vi.unstubAllGlobals());
 
 const PLAN = { goal: 'Confirm with Jane', items: [{ text: 'Call Jane', status: 'done' }, { text: 'Report her reply', status: 'active' }] };
 const openai = { id: 'o', type: 'openai' as const, name: 'OpenAI', apiKey: 'k', modelId: 'gpt' };
-const GOING = 'The calls you started are going on';
+const GOING = 'Your last reply had no words. The calls you started are going on';
 
 /** A runner with a tool that starts calls (`startsCalls` says whether what it answered did), and a flag for whether its call is going on. */
-function runnerWith(waiting: () => boolean, tool: Partial<SessionTool> & { name?: string } = {}, toolHooks: ToolHook[] = []) {
+function runnerWith(waiting: () => boolean, tool: Partial<SessionTool> & { name?: string } = {}, toolHooks: ToolHook[] = [], more: SessionTool[] = []) {
   const name = tool.name ?? 'start_outreach';
   return new Agent({
     vfs: new Vfs(),
@@ -29,7 +29,7 @@ function runnerWith(waiting: () => boolean, tool: Partial<SessionTool> & { name?
     projectSummary: () => '',
     waitingOnCall: waiting,
     toolHooks,
-    sessionTools: [{ spec: { name, description: 'Starts calls.', parameters: { type: 'object', properties: {} } }, run: async () => 'Started "x" (outreach out-1).', startsCalls: () => true, ...tool }],
+    sessionTools: [{ spec: { name, description: 'Starts calls.', parameters: { type: 'object', properties: {} } }, run: async () => 'Started "x" (outreach out-1).', startsCalls: () => true, ...tool }, ...more],
   });
 }
 const startAndPlan = (name = 'start_outreach') => ({ calls: [{ name: 'update_plan', input: PLAN }, { name, input: {} }] });
@@ -148,6 +148,29 @@ describe('a run that started calls and ends with no words says what it started',
     expect(events.at(-1)).toMatchObject({ type: 'done', text: 'Calling Jane now.' });
   });
 
+  it('a model that alternates a tool call with an empty reply is asked at most twice in all, however much it does in between, and then the run ends', async () => {
+    const status = { calls: [{ name: 'outreach_status', input: {} }] };
+    const checker: SessionTool = { spec: { name: 'outreach_status', description: 'How the lists are going.', parameters: { type: 'object', properties: {} } }, run: async () => 'Hedge price answer: Jane is on the call.' };
+    for (const first of [startAndPlan(), { calls: [{ name: 'start_outreach', input: {} }] }]) {
+      const fake = fakeProvider('openai', [first, { text: '' }, status, { text: '' }, status, { text: '' }, status, { text: '' }, status, { text: '' }, status, { text: '' }, status, { text: '' }]);
+      const events: AgentEvent[] = [];
+      await runnerWith(() => true, {}, [], [checker]).run('Call Jane.', (e) => events.push(e));
+      expect(nudges(events)).toHaveLength(2);
+      expect(nudges(events).every((n) => n.message.startsWith(GOING))).toBe(true);
+      // The call, an empty reply (the first ask), a check, an empty reply (the second ask), a check, an empty reply: then it ends.
+      expect(fake.bodies).toHaveLength(6);
+      expect(events.at(-1)).toMatchObject({ type: 'done', text: '' });
+    }
+  });
+
+  it('the ask is accurate about what was said: one that spoke in an earlier reply is told its last reply had no words, and nothing about nothing said yet', async () => {
+    fakeProvider('openai', [{ text: 'Starting the call to Jane now.', calls: [{ name: 'start_outreach', input: {} }] }, { text: '' }, { text: 'Done: Jane is being called.' }]);
+    const events: AgentEvent[] = [];
+    await runnerWith(() => true).run('Call Jane.', (e) => events.push(e));
+    expect(nudges(events)).toHaveLength(1);
+    expect(nudges(events)[0].message).toContain('Your last reply had no words');
+    expect(nudges(events)[0].message).not.toMatch(/yet|nothing/i);
+  });
   it('a reply of only spaces has no words either', async () => {
     fakeProvider('openai', [startAndPlan(), { text: '  \n ' }, { text: 'Calling Jane now.' }]);
     const events: AgentEvent[] = [];
@@ -193,6 +216,31 @@ describe('a run that started calls and ends with no words says what it started',
   });
 });
 
+describe('the calls this run started are this run\'s', () => {
+  it('a second, unrelated run on the same agent while the call is still live is pushed by its own plan, as on main', async () => {
+    const own = { goal: 'Tidy the notes', items: [{ text: 'Rename files', status: 'active' }, { text: 'Update the index', status: 'pending' }] };
+    const fake = fakeProvider('openai', [startAndPlan(), { text: 'The call is going out now.' }]);
+    const runner = runnerWith(() => true);
+    await runner.run('Call Jane back about the price.', () => {});
+    expect(fake.bodies).toHaveLength(2);
+    const second = fakeProvider('openai', [{ calls: [{ name: 'update_plan', input: own }] }, { text: 'Renamed them.' }, { text: 'Index updated.' }, { text: 'Done now.' }]);
+    const events: AgentEvent[] = [];
+    await runner.run('Tidy my notes while the call is going.', (e) => events.push(e));
+    expect(nudges(events).length).toBeGreaterThan(0);
+    expect(JSON.stringify(second.bodies[2])).toContain('Your plan still has 2 open steps');
+  });
+
+  it('a tool that says whether it started calls but throws is taken to have started none (the start itself still succeeded)', async () => {
+    const fake = fakeProvider('openai', [startAndPlan(), { text: 'Calling now.' }, { text: 'Still waiting.' }, { text: 'Nothing yet.' }]);
+    const runner = runnerWith(() => true, { startsCalls: () => { throw new Error('cannot tell'); } });
+    const events: AgentEvent[] = [];
+    await runner.run('Call Jane.', (e) => events.push(e));
+    const results = runner.turns.flatMap((t) => (t.role === 'tool' ? t.results : [])).filter((r) => r.name === 'start_outreach');
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ isError: false, content: 'Started "x" (outreach out-1).' });
+    expect(JSON.stringify(fake.bodies[2])).toContain('Your plan still has 1 open step');
+  });
+});
 describe("a flow of the person's in front of the tool", () => {
   const before: ToolHook = { tool: 'start_outreach', mode: 'before', flowName: 'Check the list', run: async () => '' };
   const instead: ToolHook = { tool: 'start_outreach', mode: 'instead', flowName: 'Our own start', run: async () => 'Started "Our own start" (a flow ran it).' };
