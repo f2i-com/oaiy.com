@@ -126,7 +126,7 @@ knows os errors 1, 50 (`ERROR_NOT_SUPPORTED`) and 87 as "this file system cannot
 
 **What is supported, and what is claimed.** A data folder on an SMB share works: over loopback SMB (`\\localhost\c$`, the administrative share of this machine's `C:`, which is all that was tried), every step of a
 first open, two puts (a rotation), a read from the other path of the same folder, a delete and an open again returns `Ok` with the right value, for DPAPI and for the plaintext provider alike, with
-the advisory lock (`LockFileEx`) working between the share path and the local path of one folder, and every change `Unconfirmed`. **Not tested, and not claimed:** FAT, exFAT, ReFS, NFS, DFS, a share on another
+the advisory lock (`LockFileEx`) working between the share path and the local path of one folder (held exclusively through the local path, a read over the share waits ten seconds and gives up with the lock error, and works when it is let go: the test takes about twenty seconds), and every change `Unconfirmed`. **Not tested, and not claimed:** FAT, exFAT, ReFS, NFS, DFS, a share on another
 machine, Offline Files, a roaming profile with a real server; each can answer a flush of a folder differently. **Recommended against**, all the same: a vault's keys belong on a local disk. A redirected
 `%APPDATA%` is on a server whose administrators (and whoever can write to the share) can delete a key file (a caller sees `None`) or put back an older copy of a DPAPI blob (a rollback; the same user can unprotect
 it), which is the "whoever can write in the keys folder" limit below, widened to everyone with access to the share. **A deployment that uses folder redirection should give the store
@@ -139,7 +139,7 @@ the desktop crate is not edited here).
 cargo test -p oaiy-keystore --features unsafe-keyfile --test keystore -- --ignored smb --nocapture
 ```
 
-It asks the share what a flush of a folder handle says, and requires every step to be `Ok` with the right value and the durability to match (`Unconfirmed` where the flush fails, `Confirmed` where it works). Without
+It asks the share what a flush of a folder handle says, and requires every step to be `Ok` with the right value, the lock to hold between the two paths, and the durability to match (`Unconfirmed` where the flush fails, `Confirmed` where it works). Without
 the fix its first put is an `Err` with the file on disk. The flush failures are also injected on every platform, for a put, a delete and a first open, by the unit tests of `store.rs`.
 
 ## The rules of 4.5.1, and the test that carries each

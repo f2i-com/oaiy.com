@@ -1458,7 +1458,8 @@ mod windows {
     /// On a share, `FlushFileBuffers` on a folder handle fails with os error 1 (`ERROR_INVALID_FUNCTION`), and every put and delete returned `Err` **after** it had committed (and the first
     /// open failed). Now every step is `Ok` with the right value, and the durability says what the share said: `Unconfirmed` where the folder cannot be flushed, `Confirmed` where it can
     /// (the test asks the share the same question first, so that it holds on a setup where the flush works). The other process on the machine, which opens the folder by its local path, sees
-    /// the same values.
+    /// the same values, and **the advisory lock works between the two paths of one folder** (H-1 over a share): held exclusively through the local path, a read over the share waits the ten seconds
+    /// and gives up with the lock error, and works when it is let go (so the test takes about twenty seconds).
     ///
     /// Not tested: FAT, exFAT, ReFS, NFS, DFS, a share on another machine, a redirected `%APPDATA%` (the README says what follows).
     #[test]
@@ -1492,6 +1493,20 @@ mod windows {
             let local_store = open_at(scratch.keys(), choice).unwrap();
             assert_eq!(get(&*local_store, &n), Some(b"key version 2 (the rotation)".to_vec()), "{ext}: and what the local path sees");
             drop(local_store);
+            // the advisory lock between the two paths of one folder (H-1 over a share): held exclusively through the local path, a read over the share must wait for it and give up
+            // after the wait (ten seconds), and when it is let go the read works
+            let held = OpenOptions::new().read(true).write(true).open(scratch.keys().join(".lock")).unwrap();
+            held.lock().unwrap();
+            let started = std::time::Instant::now();
+            let waited = store.get(&n).expect_err("a lock held through the local path does not stop a read over the share");
+            assert!(
+                matches!(&waited, KeyError::Io { op: "lock the keys directory", source } if source.kind() == std::io::ErrorKind::TimedOut),
+                "{ext}: {waited:?}"
+            );
+            assert!(started.elapsed() >= std::time::Duration::from_secs(9), "{ext}: it gave up after {:?}, not after the wait", started.elapsed());
+            held.unlock().unwrap();
+            drop(held);
+            assert_eq!(get(&*store, &n), Some(b"key version 2 (the rotation)".to_vec()), "{ext}: and once the lock is let go the read works");
             assert_eq!(store.delete(&n).unwrap(), expected, "{ext}: delete");
             assert_eq!(get(&*store, &n), None);
             assert!(key_files(&scratch.keys()).is_empty(), "{ext}: the file is gone");
