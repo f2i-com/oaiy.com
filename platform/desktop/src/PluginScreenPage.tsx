@@ -13,6 +13,7 @@ import {
 } from './api';
 import { useToast } from './Toasts';
 import { moduleOn, useModules } from './useModules';
+import { serializePluginCallError, unwrapPluginCommandResponse, type PluginErrorDetails } from './pluginRpc';
 
 /**
  * Host for a plugin-contributed screen.
@@ -185,8 +186,37 @@ export const SCREEN_BASE_CSS =
 export const HOST_BOOTSTRAP = `
 (function () {
   var seq = 0;
-  var pending = {};
+  var pending = Object.create(null);
   var subs = [];
+  function own(value, key) {
+    if (!value || typeof value !== 'object') return undefined;
+    var descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor && descriptor.value;
+  }
+  function errorText(value) {
+    return typeof value === 'string' ? value.slice(0, 1024).replace(/[\\u0000-\\u001f\\u007f]/g, ' ').trim() : '';
+  }
+  function typedError(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    var prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) return null;
+    var keys = Reflect.ownKeys(value);
+    if (keys.some(function (key) {
+      return (key !== 'code' && key !== 'message' && key !== 'version') ||
+        !Object.prototype.hasOwnProperty.call(Object.getOwnPropertyDescriptor(value, key), 'value');
+    })) return null;
+    var code = own(value, 'code');
+    var text = errorText(own(value, 'message'));
+    var version = own(value, 'version');
+    var hasVersion = Object.prototype.hasOwnProperty.call(value, 'version');
+    if (typeof code !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,63}$/.test(code) || !text ||
+        (hasVersion && (typeof version !== 'number' || !Number.isSafeInteger(version) || version < 1))) return null;
+    var error = new Error(text);
+    error.name = 'PluginCommandError';
+    error.code = code;
+    if (hasVersion) error.version = version;
+    return error;
+  }
   // Setup mode: the host stamped the step's context into the document before
   // this ran (a wizard step). Absent on an ordinary screen.
   var SETUP = window.__oaiySetup && typeof window.__oaiySetup === 'object' ? window.__oaiySetup : null;
@@ -216,17 +246,25 @@ export const HOST_BOOTSTRAP = `
   window.addEventListener('message', function (e) {
     if (e.source !== parent) return;
     var m = e.data;
-    if (!m || !m.__pluginHost) return;
+    if (own(m, '__pluginHost') !== 1) return;
     if (m.theme) { applyTheme(m.theme); return; }
     // The page's gutters: the screen runs edge to edge and draws them itself.
     // Not in a wizard step, whose pane draws its own padding (the gutter stays 0).
     if (m.gutter) { if (!SETUP) document.documentElement.style.setProperty('--host-page-pad', m.gutter); return; }
     if (m.event) { subs.forEach(function (s) { try { s(m.event); } catch (_) {} }); return; }
-    var p = pending[m.id];
+    var id = own(m, 'id');
+    if (typeof id !== 'string' || !Object.prototype.hasOwnProperty.call(pending, id)) return;
+    var p = pending[id];
     if (!p) return;
-    delete pending[m.id];
+    delete pending[id];
     clearTimeout(p.timer);
-    if (m.ok) p.resolve(m.data); else p.reject(new Error(m.error || 'host call failed'));
+    if (own(m, 'ok') === true) p.resolve(own(m, 'data'));
+    else {
+      // Revalidate the closed scalar metadata, then create a local Error. No
+      // arbitrary properties or plugin prototypes are copied into the frame.
+      var error = typedError(own(m, 'errorDetails')) || new Error(errorText(own(m, 'error')) || 'Host call failed.');
+      p.reject(error);
+    }
   });
   window.PluginHost = {
     command: function (name, payload) { return call('command', [name, payload]); },
@@ -489,12 +527,7 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
           // fresh key per user action is the correct semantics for the rest.
           const key = `ui-${name}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
           const res = await bridge.connectorRequest(pluginId, name, payload, key);
-          if (res.ok === false) throw new Error('The desktop could not complete this plugin request.');
-          // Plugins answer with the SDK envelope { ok, data }; hand the screen
-          // the inner data, which is what its call sites expect.
-          const r = res.result as { ok?: boolean; data?: unknown } | undefined;
-          if (r?.ok === false) throw new Error(String((r as { error?: unknown }).error ?? 'The plugin could not complete this action.'));
-          return r && typeof r === 'object' && 'data' in r ? r.data : r;
+          return unwrapPluginCommandResponse(res);
         }
         case 'toast': {
           const [kind, message] = args as [string, string];
@@ -619,23 +652,28 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
 
   // RPC pump: only messages from OUR iframe are serviced.
   useEffect(() => {
+    let active = true;
     const onMessage = (e: MessageEvent) => {
       const m = e.data as { __pluginHost?: number; id?: string; method?: string; args?: unknown[] };
-      if (!m || !m.__pluginHost || !m.id || !m.method) return;
+      if (!m || m.__pluginHost !== 1 || typeof m.id !== 'string' || !m.id || m.id.length > 128 ||
+          typeof m.method !== 'string' || !m.method || (m.args !== undefined && !Array.isArray(m.args))) return;
       const frame = frameRef.current;
       if (!frame || e.source !== frame.contentWindow) return;
+      const source = frame.contentWindow;
+      const id = m.id;
+      const reply = (result: { ok: true; data: unknown } | { ok: false; error: string; errorDetails?: PluginErrorDetails }) => {
+        // A reply belongs to this mounted document, never to a replacement screen.
+        if (active && frameRef.current === frame && frame.contentWindow === source) {
+          source?.postMessage({ __pluginHost: 1, id, ...result }, '*');
+        }
+      };
       handleCall(m.method, m.args ?? [])
-        .then((data) => frame.contentWindow?.postMessage({ __pluginHost: 1, id: m.id, ok: true, data }, '*'))
-        .catch((err) =>
-          frame.contentWindow?.postMessage(
-            { __pluginHost: 1, id: m.id, ok: false, error: err instanceof Error ? err.message : String(err) },
-            '*',
-          ),
-        );
+        .then((data) => reply({ ok: true, data }))
+        .catch((err) => reply({ ok: false, ...serializePluginCallError(err) }));
     };
     window.addEventListener('message', onMessage);
-    return () => window.removeEventListener('message', onMessage);
-  }, [handleCall]);
+    return () => { active = false; window.removeEventListener('message', onMessage); };
+  }, [handleCall, attempt]);
 
   // Forward declared plugin events to the screen.
   useEffect(() => {

@@ -6,6 +6,13 @@
 //! /api/services/* and stop everything cleanly on exit.
 
 pub mod origin;
+/// Explicit, independent local plugin qualification launches.
+pub mod isolated;
+pub mod isolated_policy;
+#[cfg(feature = "gui")]
+mod isolated_acl;
+#[cfg(feature = "gui")]
+mod isolated_webview;
 /// Writing a secret to disk owner-only from its first byte (every store of a key or token uses it).
 pub mod secret_file;
 pub mod link;
@@ -368,6 +375,7 @@ fn open_url(url: String) -> Result<(), String> {
 /// The OS-default data dir (`%APPDATA%/<id>/` on Windows, etc.). This is
 /// where everything lives unless the user has chosen a custom folder.
 fn default_data_dir(app: &tauri::AppHandle) -> PathBuf {
+    if let Some(launch) = crate::isolated::current() { return launch.data.clone(); }
     app.path()
         .app_data_dir()
         .unwrap_or_else(|_| std::env::temp_dir().join("OAIY"))
@@ -378,6 +386,7 @@ fn default_data_dir(app: &tauri::AppHandle) -> PathBuf {
 /// inside the data dir itself — otherwise we couldn't find it after the
 /// user relocates their data folder.
 fn config_pointer_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    if let Some(launch) = crate::isolated::current() { return Some(launch.config.join(CONFIG_POINTER_NAME)); }
     app.path()
         .app_config_dir()
         .ok()
@@ -465,6 +474,7 @@ fn write_config_str(app: &tauri::AppHandle, key: &str, val: Option<&str>) -> Res
 
 /// The user's chosen data dir from the pointer file, if any (else OS default).
 fn read_data_dir_override(app: &tauri::AppHandle) -> Option<String> {
+    if crate::isolated::active() { return None; }
     read_config_str(app, "dataDir")
 }
 
@@ -478,6 +488,7 @@ fn write_data_dir_override(app: &tauri::AppHandle, dir: Option<&str>) -> Result<
 /// user can park a big model library on another drive without relocating
 /// venvs/templates (which can't move — absolute paths baked into venvs).
 fn read_models_dir_override(app: &tauri::AppHandle) -> Option<String> {
+    if let Some(launch) = crate::isolated::current() { return Some(launch.models.display().to_string()); }
     read_config_str(app, "modelsDir")
 }
 
@@ -514,6 +525,7 @@ fn write_service_gpus(
 /// user registers in Settings (e.g. `E:\ckpts`) so a service can scan several
 /// drives via `${modelDirs}` / `OAIY_MODEL_DIRS`. Empty when none configured.
 fn read_extra_model_dirs(app: &tauri::AppHandle) -> Vec<String> {
+    if crate::isolated::active() { return Vec::new(); }
     read_config_obj(app)
         .get("extraModelDirs")
         .and_then(|v| v.as_array())
@@ -573,6 +585,7 @@ fn model_dir_key(s: &str) -> String {
 /// pointer. Plaintext, matching the HF CLI's own `~/.cache/huggingface/token`
 /// convention for a local single-user tool.
 fn hf_token_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    if let Some(launch) = crate::isolated::current() { return Some(launch.config.join("hf-token")); }
     app.path().app_config_dir().ok().map(|d| d.join("hf-token"))
 }
 
@@ -611,6 +624,7 @@ fn write_hf_token(app: &tauri::AppHandle, token: Option<&str>) -> Result<(), Str
 /// folder can't be created), so models/venvs/services live wherever the
 /// user wants them — somewhere easy to browse, not buried in AppData.
 fn resolve_data_dir(app: &tauri::AppHandle) -> PathBuf {
+    if let Some(launch) = crate::isolated::current() { return launch.data.clone(); }
     if let Some(custom) = read_data_dir_override(app) {
         let p = PathBuf::from(&custom);
         if std::fs::create_dir_all(&p).is_ok() {
@@ -627,6 +641,7 @@ fn resolve_data_dir(app: &tauri::AppHandle) -> PathBuf {
 /// (when set + creatable) else `<dataDir>/models`. This is where downloads
 /// land and where the install scripts' `OAIY_MODELS_DIR` points.
 fn resolve_models_dir(app: &tauri::AppHandle, data_dir: &std::path::Path) -> PathBuf {
+    if let Some(launch) = crate::isolated::current() { return launch.models.clone(); }
     if let Some(custom) = read_models_dir_override(app) {
         let p = PathBuf::from(&custom);
         if std::fs::create_dir_all(&p).is_ok() {
@@ -967,6 +982,11 @@ fn set_service_gpu(
 /// another OAIY reads very differently from an unrelated program — and then
 /// exits rather than lingering as a broken window.
 async fn report_fatal_server_error(app: &tauri::AppHandle, detail: &str) {
+    if crate::isolated::active() {
+        log::error!("isolated API startup failed: {detail}");
+        app.exit(1);
+        return;
+    }
     use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
     let ours = port_holder_is_oaiy().await;
@@ -1174,6 +1194,34 @@ fn set_hf_token(
 }
 
 pub fn run() {
+    // Parse and lock the opt-in root before Tauri, single-instance registration or
+    // any normal AppData path is resolved. A malformed opt-in never launches normally.
+    let prepared = crate::isolated::parse(std::env::args_os().skip(1))
+        .and_then(|root| root.map(|root| {
+            crate::isolated_webview::preflight()?;
+            crate::isolated::Launch::prepare(root)
+        }).transpose())
+        .and_then(|launch| match launch { Some(launch) => crate::isolated::install(launch), None => Ok(()) });
+    if let Err(error) = prepared {
+        eprintln!("isolated launch refused: {error}");
+        std::process::exit(2);
+    }
+    let isolated = crate::isolated::active();
+    #[cfg(not(feature = "custom-protocol"))]
+    if isolated {
+        eprintln!("isolated launch requires a bundled build with the custom-protocol feature");
+        std::process::exit(2);
+    }
+    let mut context = tauri::generate_context!();
+    if let Some(launch) = crate::isolated::current() {
+        context.config_mut().identifier = launch.identifier.clone();
+        // A dev URL would load another process's frontend. The isolated executable
+        // always uses its embedded, matching bundle; build with tauri/custom-protocol.
+        context.config_mut().build.dev_url = None;
+        for window in &mut context.config_mut().app.windows { window.create = false; }
+        crate::isolated_acl::restrict(&mut context);
+    }
+
     // Before anything else: without this, every log:: call in the GUI went
     // nowhere. main.rs sets `windows_subsystem = "windows"` so there is no
     // console either, which is why a startup hang in this app could only be
@@ -1182,19 +1230,7 @@ pub fn run() {
     let _ = log::set_logger(&crate::applog::LOGGER);
     log::set_max_level(log::LevelFilter::Info);
 
-    tauri::Builder::default()
-        // First, so a second launch (the taskbar, the Start menu) never gets as
-        // far as binding ports: it shows the running OAIY's window and exits.
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| crate::tray::show_main(app)))
-        .plugin(tauri_plugin_shell::init())
-        .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_notification::init())
-        // Newer releases. Only its Rust API is used (update::gui): no webview is granted its commands.
-        .plugin(crate::update::gui::plugin())
-        // The agent and the flow editor, shown in the window beside the sidebar.
-        .register_uri_scheme_protocol(crate::embed::AGENT_SCHEME, |ctx, request| crate::embed::serve(ctx.app_handle(), crate::embed::Page::Agent, &request))
-        .register_uri_scheme_protocol(crate::embed::FLOWS_SCHEME, |ctx, request| crate::embed::serve(ctx.app_handle(), crate::embed::Page::Flows, &request))
-        .invoke_handler(tauri::generate_handler![
+    let handler: Box<dyn Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync> = Box::new(tauri::generate_handler![
             crate::embed::show_embedded,
             crate::embed::hide_embedded,
             crate::embed::set_theme,
@@ -1227,8 +1263,43 @@ pub fn run() {
             remove_model_dir,
             list_gpus,
             set_service_gpu
-        ])
-        .setup(|app| {
+        ]);
+    let builder = tauri::Builder::default()
+        // Keep the single-instance plugin first in both modes. The isolated
+        // identifier above gives it independent native mutex/window names.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| crate::tray::show_main(app)));
+    let builder = if isolated { builder } else {
+        builder.plugin(tauri_plugin_shell::init())
+            .plugin(tauri_plugin_dialog::init())
+            .plugin(tauri_plugin_notification::init())
+            .plugin(crate::update::gui::plugin())
+    };
+    let builder = if isolated { builder } else {
+        // These pages use the normal desktop endpoint and integration surface.
+        // An isolated launch must not serve them, even if navigated directly.
+        builder
+        .register_uri_scheme_protocol(crate::embed::AGENT_SCHEME, |ctx, request| crate::embed::serve(ctx.app_handle(), crate::embed::Page::Agent, &request))
+        .register_uri_scheme_protocol(crate::embed::FLOWS_SCHEME, |ctx, request| crate::embed::serve(ctx.app_handle(), crate::embed::Page::Flows, &request))
+    };
+    builder
+        .invoke_handler(move |invoke| {
+            if isolated && !crate::isolated_policy::ipc_allowed(invoke.message.command()) {
+                invoke.resolver.reject(crate::isolated_policy::REFUSAL);
+                true
+            } else { handler(invoke) }
+        })
+        .setup(move |app| {
+            if let Some(launch) = crate::isolated::current() {
+                let window = app.config().app.windows.first().ok_or("missing main window configuration")?;
+                tauri::WebviewWindowBuilder::from_config(app, window)?
+                    .data_directory(launch.profile.clone())
+                    .initialization_script(launch.initialization_script())
+                    .title("OAIY — isolated plugin qualification")
+                    .on_navigation(|url| {
+                        matches!((url.scheme(), url.host_str()), ("http", Some("tauri.localhost")) | ("tauri", Some("localhost")))
+                    })
+                    .build()?;
+            }
             // Build the registry once, share it with both the HTTP server
             // and Tauri-managed state. Failures here are non-fatal — we
             // fall back to an empty registry so the tray still works and
@@ -1242,11 +1313,13 @@ pub fn run() {
             log::info!("OAIY Desktop {} starting (data={})", env!("CARGO_PKG_VERSION"), data_dir.display());
             // A restore the person staged (or an undo) is put in place NOW, before anything below
             // opens a store: every store then loads what was restored, and nothing has a file open.
+            if !isolated {
             crate::backup::restore::sweep_leftovers(&data_dir);
             match crate::backup::restore::apply_pending(&data_dir) {
                 crate::backup::restore::ApplyOutcome::None => {}
                 crate::backup::restore::ApplyOutcome::Applied(done) => log::info!("backup: the staged {} was applied", done.kind),
                 crate::backup::restore::ApplyOutcome::Failed(done) | crate::backup::restore::ApplyOutcome::Expired(done) => log::warn!("backup: the staged {} was not applied: {}", done.kind, done.error.unwrap_or_default()),
+            }
             }
             // The Agent's control tools show a page in the dashboard (a plugin's
             // setup step, say) with this event; the dashboard listens for it.
@@ -1260,11 +1333,13 @@ pub fn run() {
             }
             // A caller asking for the owner, and a message left, reach them with a native
             // notification (and, for a call, the window brought up).
+            if !isolated {
             crate::ring::set_global_notifier(Some(Arc::new(crate::notify::GuiRing::of(app.handle().clone()))));
             crate::messages::set_notifier(Some(Arc::new(crate::notify::GuiMessages::of(app.handle().clone()))));
+            }
             // The engines: started on their own thread (a running studio is found
             // over HTTP, and launching one binds its ports), so the window is not kept waiting.
-            {
+            if !isolated {
                 let data_dir = data_dir.clone();
                 std::thread::spawn(move || {
                     if let Err(e) = crate::engines::start(&data_dir) {
@@ -1281,7 +1356,10 @@ pub fn run() {
                 .into_iter()
                 .map(PathBuf::from)
                 .collect();
-            let registry: RegistryHandle =
+            let registry: RegistryHandle = if isolated {
+                // Qualification owns plugins, not service packages or their migrations.
+                Arc::new(Mutex::new(Registry::empty(data_dir.clone(), models_dir.clone())))
+            } else {
                 match Registry::init(data_dir.clone(), models_dir.clone(), extra_model_dirs) {
                     Ok(r) => Arc::new(Mutex::new(r)),
                     Err(e) => {
@@ -1301,7 +1379,8 @@ pub fn run() {
                             });
                         Arc::new(Mutex::new(reg))
                     }
-                };
+                }
+            };
             if let Ok(mut r) = registry.lock() {
                 // Drop GPU pins to cards that no longer exist (removed / re-imaged box) —
                 // otherwise start() would export CUDA_VISIBLE_DEVICES at a missing index and
@@ -1311,7 +1390,7 @@ pub fn run() {
                 r.set_service_gpus(read_service_gpus(app.handle()));
                 // Backfill install-completion markers for venv services installed before the
                 // marker existed, so they don't suddenly read as not-installed.
-                r.backfill_install_markers();
+                if !isolated { r.backfill_install_markers(); }
             }
             // Build Downloads + Python + Catalog helpers from the
             // registry's data dir so all four share `${dataDir}`
@@ -1327,7 +1406,7 @@ pub fn run() {
             //
             // Nothing needs the result promptly: a stale pin only matters at the
             // next service start, which is a human action seconds away at best.
-            {
+            if !isolated {
                 let registry_for_gpus = registry.clone();
                 let app_for_gpus = app.handle().clone();
                 std::thread::spawn(move || {
@@ -1358,7 +1437,7 @@ pub fn run() {
             let downloads: DownloadsHandle = Downloads::new(models_dir.clone()).into_handle();
             // Load the saved HuggingFace token (if any) so gated downloads
             // work from the first launch without re-entering it.
-            downloads.set_token(read_hf_token(app.handle()));
+            downloads.set_token(if isolated { None } else { read_hf_token(app.handle()) });
             let python: PythonHandle = Python::new(data_dir.clone()).into_handle();
             let catalog = CatalogHandle::new(data_dir.clone());
 
@@ -1380,7 +1459,7 @@ pub fn run() {
             // the local runtime offline (a paired page's AI calls would 503 and
             // trigger-fired flows would fail until someone opened this window
             // and clicked Start on each service).
-            {
+            if !isolated {
                 let started = registry
                     .lock()
                     .map(|mut r| r.autostart_on_boot())
@@ -1414,9 +1493,10 @@ pub fn run() {
             // Both fall back to the safe value on anything unparseable. A typo in
             // a port must not silently bind a port nobody chose, and a typo in the
             // LAN flag must not silently expose the machine.
-            let server_port: u16 = read_config_str(&app_for_dialog, "serverPort")
+            let reserved_listener = crate::isolated::current().map(|launch| launch.take_listener()).transpose()?;
+            let server_port: u16 = crate::isolated::current().map(|launch| launch.port).or_else(|| read_config_str(&app_for_dialog, "serverPort")
                 .and_then(|s| s.trim().parse::<u16>().ok())
-                .filter(|p| *p != 0)
+                .filter(|p| *p != 0))
                 .unwrap_or(DESKTOP_PORT);
             // The desktop never binds beyond loopback (design 4.5.5 rule 8, 10.3): `lanAccess` is ignored, and one
             // line says so. Its Host allow-list is the loopback names on any port (`auth::host`), which is what a
@@ -1439,11 +1519,11 @@ pub fn run() {
             let feed = crate::update::FeedSource::from_env();
             let updater = crate::update::Updater::new(env!("CARGO_PKG_VERSION"), feed.clone(), std::time::Instant::now());
             // Looking for updates by itself (a little after start, then daily) is on unless the person switched it off.
-            updater.set_auto_check(read_config_str(app.handle(), "updateCheck").as_deref() != Some("off"));
+            updater.set_auto_check(!isolated && read_config_str(app.handle(), "updateCheck").as_deref() != Some("off"));
             let update_store = Arc::new(crate::update::gui::Store::default());
             app.manage(updater.clone());
             app.manage(update_store.clone());
-            crate::update::gui::spawn_scheduler(updater.clone());
+            if !isolated { crate::update::gui::spawn_scheduler(updater.clone()); }
             tauri::async_runtime::spawn(async move {
                 // Bridge state. The plugins root sits under the data dir so a
                 // relocated data folder takes its plugins with it — plugins hold
@@ -1464,6 +1544,7 @@ pub fn run() {
                 app_for_http.manage(bridge_for_http.host.clone());
                 // What an update looks at before it restarts OAIY: calls (on OAIY's own line, and what the phone plugin
                 // says), tasks, downloads, installs, the engines' media.
+                if !isolated {
                 crate::update::gui::attach(
                     &updater,
                     &app_for_http,
@@ -1482,6 +1563,7 @@ pub fn run() {
                         phone: Some(Arc::new(crate::update::phone::PluginLine::new(bridge_for_http.host.clone()))),
                     },
                 );
+                }
                 // AI provider store under <data>/ai so it moves with the data dir
                 // (like bridge/pairings.json). Holds provider API keys plaintext,
                 // guarded by the full/public split — never over the wire.
@@ -1501,7 +1583,10 @@ pub fn run() {
                 let companion_upstream_for_http = crate::companion::upstream::UpstreamStore::open(
                     data_dir_for_bridge.join("companion").join("relay.json"),
                 );
-                let link_for_http = crate::link::open_handle(data_dir_for_bridge.clone());
+                let link_for_http = if isolated {
+                    crate::link::open_handle_without_workers(data_dir_for_bridge.clone())
+                } else { crate::link::open_handle(data_dir_for_bridge.clone()) };
+                if !isolated {
                 // Serve remote-control commands the linked provider queues for
                 // this machine. Without it every action a user takes on the
                 // provider's website expires as "no desktop picked it up". The
@@ -1557,14 +1642,19 @@ pub fn run() {
                         upstream: companion_upstream_for_http.clone(),
                     },
                 );
+                }
+                let endpoint = match reserved_listener {
+                    Some(listener) => http::ServerEndpoint::Reserved(listener),
+                    None => http::ServerEndpoint::Port(server_port),
+                };
                 if let Err(e) = http::serve(
-                    server_port,
+                    endpoint,
                     server_bind,
                     config_provider,
                     // GUI: webview-origin auth, plus an OPTIONAL bearer token
                     // (set OAIY_SERVER_TOKEN) so the CLI can drive this companion
                     // without locking out the webview (gui_mode = true below).
-                    std::env::var("OAIY_SERVER_TOKEN").ok().filter(|s| !s.is_empty()),
+                    if isolated { None } else { std::env::var("OAIY_SERVER_TOKEN").ok().filter(|s| !s.is_empty()) },
                     true,
                     registry_for_http,
                     downloads_for_http,
@@ -1595,6 +1685,7 @@ pub fn run() {
             // flips from "Running" to "Stopped"/"Errored" within a tick.
             // Cheap — walks only services that think they're running or
             // installing, plus the optional Python install/venv job.
+            if !isolated {
             let registry_for_reaper = registry.clone();
             let python_for_reaper = python.clone();
             tauri::async_runtime::spawn(async move {
@@ -1650,6 +1741,7 @@ pub fn run() {
                 }
             });
 
+            }
             // Build the tray icon + menu. tray::setup hides the main
             // window on close so OAIY Desktop stays alive in the tray.
             tray::setup(app)?;
@@ -1662,7 +1754,7 @@ pub fn run() {
 
             // The agent runs from the start, hidden until its page is shown:
             // texts and calls are answered whatever the window shows.
-            crate::embed::preload(app.handle());
+            if !isolated { crate::embed::preload(app.handle()); }
 
             Ok(())
         })
@@ -1674,7 +1766,7 @@ pub fn run() {
                 let _ = window.hide();
             }
         })
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error building tauri application")
         .run(|app_handle, event| {
             match event {
@@ -1761,7 +1853,10 @@ pub fn build_bridge_state(
     let dead = bridge::deadletters::open_handle(
         data_dir.join("bridge").join("deadletters.jsonl"),
     );
-    let host = plugins::PluginHost::new(
+    let make_host = if crate::isolated::active() {
+        plugins::PluginHost::assemble
+    } else { plugins::PluginHost::new };
+    let host = make_host(
         plugins.clone(),
         ledger.clone(),
         triggers,
@@ -1781,7 +1876,9 @@ pub fn build_bridge_state(
     // The worker owns nothing the state needs back; its stop flag is dropped
     // deliberately — it runs for the process lifetime, and the ledger being
     // in-memory means there is nothing to hand over on exit.
-    let _ = bridge::Worker::start(ledger.clone(), flows.clone(), device_id.clone(), node.clone());
+    if !crate::isolated::active() {
+        let _ = bridge::Worker::start(ledger.clone(), flows.clone(), device_id.clone(), node.clone());
+    }
     bridge::BridgeState {
         ledger,
         dead,

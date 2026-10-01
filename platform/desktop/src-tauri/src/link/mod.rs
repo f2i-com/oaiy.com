@@ -276,7 +276,6 @@ pub fn open_handle(data_dir: PathBuf) -> LinkHandle {
 /// provider a heartbeat and an enrolment, with a made-up key, from then until the
 /// last test ends. A test opens no connection beyond this machine. The trusted
 /// origin is set as `open_handle` sets it.
-#[cfg(test)]
 pub(crate) fn open_handle_without_workers(data_dir: PathBuf) -> LinkHandle {
     let store = load_store(data_dir);
     set_linked_origin(store.account().as_ref().map(|a| a.base_url.as_str()));

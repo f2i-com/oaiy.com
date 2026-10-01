@@ -29,7 +29,7 @@ import {
   Workflow,
   type LucideIcon,
 } from 'lucide-react';
-import { API_BASE, openExternal, phone as phoneApi } from './api';
+import { API_BASE, DESKTOP_LAUNCH, openExternal, phone as phoneApi } from './api';
 import { moduleOn, useModules } from './useModules';
 import { arrangeSections, buildSections, newBadge, pluginPageOf, sectionOf as findSection, type Group, type NavSection } from './sections';
 import { useWaitingRequests } from './calendarRequests';
@@ -64,7 +64,7 @@ import { carryGuideDismissal, guideDismissed, onOpenSetup, openSetup, useSetupSt
  * topbar; every page keeps its own view id, so anything that opens a page by id
  * (the Overview, a plugin screen's `navigate`, the dock) still lands on it.
  *
- * The HTTP API is bound to 127.0.0.1:17972; the health poll below drives the
+ * The HTTP API uses the native launch endpoint; the health poll below drives the
  * dock. If the Rust side isn't up, everything degrades to "unreachable"
  * without crashing.
  */
@@ -329,13 +329,14 @@ function SectionTabs({ section, view, onSelect }: { section: NavSection; view: V
 }
 
 export default function App() {
+  const isolated = DESKTOP_LAUNCH.isolated;
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [healthError, setHealthError] = useState<string | null>(null);
-  const [view, setView] = useState<View>('overview');
+  const [view, setView] = useState<View>(isolated ? 'plugins' : 'overview');
   /** The phone and the calendar are there while a plugin provides them (Aokie, the AI Receptionist). `null` until known. */
   const modules = useModules();
-  const phoneOn = moduleOn(modules, 'phone');
-  const calendarOn = moduleOn(modules, 'calendar');
+  const phoneOn = !isolated && moduleOn(modules, 'phone');
+  const calendarOn = !isolated && moduleOn(modules, 'calendar');
   /**
    * The sidebar: the built-in sections, with the pages installed plugins add
    * (`/api/modules` contributions: a tab in a built-in section, a section of a
@@ -411,6 +412,7 @@ export default function App() {
   // dismissed the old setup guide is carried over here, once.
   const autoOpened = useRef(false);
   useEffect(() => {
+    if (isolated) return;
     if (!setupState || autoOpened.current) return;
     autoOpened.current = true;
     void (async () => {
@@ -420,7 +422,7 @@ export default function App() {
       setSetupReturn('overview');
       setView((v) => (v === 'overview' ? 'setup' : v));
     })();
-  }, [setupState]);
+  }, [isolated, setupState]);
 
   const setTheme = useCallback((next: ThemeMode) => {
     setThemeState(next);
@@ -596,7 +598,10 @@ export default function App() {
       };
   // A sub-menu's pages are in the sidebar: no tabs under the header too.
   const tabbed = section && !section.sub && section.tabs.length > 1 ? section : null;
-  const embedded = EMBEDDED.has(view);
+  // Keep unavailable panels from mounting effects that contact live integrations.
+  // Native HTTP and IPC enforce the same boundary independently of this UI.
+  const isolatedUnavailable = isolated && view !== 'plugins' && !pluginView;
+  const embedded = !isolated && EMBEDDED.has(view);
   const visibleSections = sections.filter((s) => s.id !== SETTINGS.id);
 
   const navButton = (s: NavSection) => {
@@ -823,6 +828,11 @@ export default function App() {
         </header>
 
         <section className={`view view-${view}`}>
+          {isolated && (
+            <div className="banner banner-pending" role="status">
+              <span><strong>Isolated local qualification.</strong> Only plugins and their screens are available. AI, accounts, engines, flows and setup are unavailable.</span>
+            </div>
+          )}
           {tabbed && <SectionTabs section={tabbed} view={view} onSelect={(v) => setView(v)} />}
           {/* A page in a webview of its own: the desktop lays it over this box. */}
           {embedded && <EmbeddedPage page={view as 'agent' | 'flows' | 'engines'} />}
@@ -837,7 +847,13 @@ export default function App() {
             className={`content-page${visited.has(view) ? ' revisit' : ''}${pluginView || view === 'setup' ? ' page-fill' : ''}`}
             key={view}
           >
-            <PairingPrompt />
+            {isolatedUnavailable ? (
+              <div className="panel">
+                <p>This page is unavailable during isolated local qualification.</p>
+                <button type="button" className="btn btn-primary" onClick={() => setView('plugins')}>Open Plugins</button>
+              </div>
+            ) : <>
+            {!isolated && <PairingPrompt />}
             {view === 'overview' && (
               <OverviewPanel
                 onNavigate={(v) => setView(v)}
@@ -878,6 +894,7 @@ export default function App() {
                 onNavigate={(v) => setView(v)}
               />
             )}
+            </>}
           </div>
         </section>
 

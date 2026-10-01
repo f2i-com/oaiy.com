@@ -1447,8 +1447,18 @@ async fn access_guard(
     }
 }
 
+/// A reserved listener keeps an isolated launch's selected port owned from
+/// bootstrap through serving. Ordinary callers still pass their existing u16.
+pub enum ServerEndpoint {
+    Port(u16),
+    Reserved(std::net::TcpListener),
+}
+impl From<u16> for ServerEndpoint {
+    fn from(port: u16) -> Self { Self::Port(port) }
+}
+
 pub async fn serve(
-    port: u16,
+    endpoint: impl Into<ServerEndpoint>,
     // The address to listen on: loopback unless the person running it said otherwise.
     //
     // Never inferred: an address other machines can reach widens the surface from "this machine" to "anything
@@ -1489,6 +1499,18 @@ pub async fn serve(
     // The access mode (`legacy` keeps every route that existed before the access model exactly as it was).
     access: crate::auth::AccessSettings,
 ) -> Result<(), BoxError> {
+    let (port, reserved) = match endpoint.into() {
+        ServerEndpoint::Port(port) => (port, None),
+        ServerEndpoint::Reserved(listener) => {
+            let address = listener.local_addr()?;
+            if address.ip() != bind || !address.ip().is_loopback() || address.port() == 0 {
+                return Err("reserved listener must match the loopback bind".into());
+            }
+            listener.set_nonblocking(true)?;
+            (address.port(), Some(listener))
+        }
+    };
+    let isolated = crate::isolated::active();
     let bind_all = !crate::auth::clientip::unmap(bind).is_loopback();
     // A server that passed the startup rules has been told what a network bind needs (an owner login, and a
     // named proxy behind a public URL): the bearer token is no stand-in for a login. Anything else that binds
@@ -1575,7 +1597,7 @@ pub async fn serve(
     let registry_for_ai = registry.clone();
     let registry_for_voice = registry.clone();
     // The backup routes (its status, and the Agent page handing over its storage) work on the data folder.
-    let backup_data_dir = registry.lock().map(|r| r.data_dir().to_path_buf()).unwrap_or_else(|_| std::env::temp_dir().join("oaiy-backup-unavailable"));
+    let backup_data_dir = data_dir_for_auth.clone();
     // The calendar lives in the data folder, beside the flows it may defer to.
     if let Ok(dir) = registry.lock().map(|r| r.data_dir().to_path_buf()) {
         crate::calendar::init(&dir);
@@ -1591,7 +1613,7 @@ pub async fn serve(
     // Whether the Agent may change OAIY when the person has not said (no `control.json`) depends on how the install
     // can be reached: on for a local one, as it has always been, off for a proxied or lan one (design 4.5.5).
     let control = crate::control::Control::with_exposure(
-        &registry.lock().map(|r| r.data_dir().to_path_buf()).unwrap_or_else(|_| std::env::temp_dir().join("oaiy-control-unavailable")),
+        &data_dir_for_auth,
         guard.config().exposure,
     );
     // Which modules (the phone, the calendar) a plugin provides: worked out now, then kept up to date.
@@ -1602,7 +1624,7 @@ pub async fn serve(
         let data_dir = registry.lock().map(|r| r.data_dir().to_path_buf()).ok();
         let plugins_root = bridge.plugins.lock().map(|r| r.root().to_path_buf()).ok();
         let providers = ai_providers.lock().map(|s| s.list()).unwrap_or_default();
-        let data_dir = data_dir.unwrap_or_else(|| std::env::temp_dir().join("oaiy-setup-unavailable"));
+        let data_dir = data_dir.unwrap_or_else(|| data_dir_for_auth.clone());
         let store = crate::setup::Store::open(&data_dir, || {
             crate::setup::in_use_signal(&data_dir, plugins_root.as_deref().unwrap_or(&data_dir.join("plugins")), &providers)
         });
@@ -1630,7 +1652,7 @@ pub async fn serve(
     let companion_routes =
         crate::companion::routes::router(companion.clone(), companion_upstream.clone());
     // The calendar syncs with FormLogic while this desktop is linked to it.
-    crate::calendar::sync::spawn(link.clone());
+    if !isolated { crate::calendar::sync::spawn(link.clone()); }
     let link_routes = crate::link::routes::router(link);
     // Calls answered by the agent: the app's side here, Aokie's on the voice gateway (17872).
     let voice = {
@@ -1648,7 +1670,7 @@ pub async fn serve(
         bridge.host.set_ring(ring.clone());
         // A caller who asks for the owner by name is asking for the owner: the name is the business's, when it is named for a person.
         ring.set_names(std::sync::Arc::new(|| crate::calendar::shared().map(|c| crate::ring::phrases::owner_names(&c.settings().business)).unwrap_or_default()));
-        if gui_mode {
+        if gui_mode && !isolated {
             ring.set_presence(std::sync::Arc::new(crate::ring::presence::IdlePresence::os(ring.settings.clone())));
         }
     }
@@ -1660,7 +1682,7 @@ pub async fn serve(
     // CRUD and the credential-injecting chat proxy need the same origin/token gate.
     let ai_state = crate::ai::AiState::new(ai_providers, registry_for_ai, ai_codex);
     // Aokie's gateway (17872): calls, and a provider's chat for Aokie's own speech lanes.
-    tokio::spawn(crate::voice::serve_gateway(voice, crate::ai::provider_chat_router(ai_state.clone())));
+    if !isolated { tokio::spawn(crate::voice::serve_gateway(voice, crate::ai::provider_chat_router(ai_state.clone()))); }
     let ai_routes = crate::ai::ai_router(ai_state);
 
     let app = Router::new()
@@ -1733,6 +1755,9 @@ pub async fn serve(
         Some(state) => app.merge(crate::auth::login::router(state.clone())),
         None => app,
     };
+    // Inside the unchanged access/CORS guards, so qualification never grants
+    // an otherwise unauthorized caller access to plugin installation or commands.
+    let app = if isolated { app.layer(middleware::from_fn(crate::isolated_policy::guard)) } else { app };
     let access_state = AccessState {
         // A network listener must never trust a forgeable Origin, even
         // when launched by the GUI. Its clients must present a credential.
@@ -1755,7 +1780,10 @@ pub async fn serve(
     control.set_router(app.clone());
 
     let addr = SocketAddr::new(bind, port);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = match reserved {
+        Some(listener) => tokio::net::TcpListener::from_std(listener)?,
+        None => tokio::net::TcpListener::bind(addr).await?,
+    };
 
     // Every bound address is logged, and the exposure with it (design 4.5.5).
     let bound = listener.local_addr().unwrap_or(addr);

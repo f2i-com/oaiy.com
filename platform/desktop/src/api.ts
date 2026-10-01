@@ -7,8 +7,11 @@
  */
 
 import { visibleText } from './visibleText';
+import { desktopLaunch } from './nativeLaunch';
 
-export const API_BASE = 'http://127.0.0.1:17972';
+/** The native bootstrap is validated once before any API client can run. */
+export const DESKTOP_LAUNCH = desktopLaunch(typeof window === 'undefined' ? undefined : window);
+export const API_BASE = DESKTOP_LAUNCH.apiBase;
 
 async function request<T>(
   path: string,

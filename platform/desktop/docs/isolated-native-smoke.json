@@ -1,0 +1,129 @@
+{
+  "passed": true,
+  "nativeVisualQualification": false,
+  "checks": [
+    "same_root_refused_original_alive",
+    "different_roots_have_independent_identity_port_and_data",
+    {
+      "route": "/api/ai/codex/status",
+      "status": 403,
+      "code": "isolated_capability_unavailable"
+    },
+    {
+      "route": "/api/engines/catalog",
+      "status": 403,
+      "code": "isolated_capability_unavailable"
+    },
+    {
+      "route": "/api/setup/plugins/example/check/foo",
+      "status": 403,
+      "code": "isolated_capability_unavailable"
+    },
+    {
+      "route": "/api/services/example/start",
+      "status": 403,
+      "code": "isolated_capability_unavailable"
+    },
+    {
+      "route": "/api/mcp",
+      "status": 403,
+      "code": "isolated_capability_unavailable"
+    },
+    {
+      "route": "/api/bridge/runs",
+      "status": 403,
+      "code": "isolated_capability_unavailable"
+    },
+    {
+      "route": "/api/update/check",
+      "status": 403,
+      "code": "isolated_capability_unavailable"
+    },
+    "plugin_install_without_origin_refused_by_auth",
+    "relative_root_refused_before_gui",
+    "network_root_refused_before_gui",
+    "foreign_root_refused_before_gui"
+  ],
+  "instances": [
+    {
+      "root": "instance-a",
+      "pid": 152704,
+      "port": 57085,
+      "identifier": "com.oaiy.isolated.ce945a90c52b429cb676bbc143da7a58e14397757783aa35",
+      "dashboardReachedApiBeforeHarness": true,
+      "ownedConfigAndPluginRoots": true,
+      "autoloadedPlugins": 0,
+      "ownedWebViewProfilePopulated": true,
+      "isolatedIdentifierAppDataAbsent": true
+    },
+    {
+      "root": "instance-b",
+      "pid": 184260,
+      "port": 54456,
+      "identifier": "com.oaiy.isolated.63ee10bc31f1231f411137052fbca613031faad2793c785f",
+      "dashboardReachedApiBeforeHarness": true,
+      "ownedConfigAndPluginRoots": true,
+      "autoloadedPlugins": 0,
+      "ownedWebViewProfilePopulated": true,
+      "isolatedIdentifierAppDataAbsent": true
+    }
+  ],
+  "cleanup": [
+    {
+      "pid": 78212,
+      "stopped": true,
+      "exitCode": 2
+    },
+    {
+      "pid": 80264,
+      "stopped": true,
+      "exitCode": 2
+    },
+    {
+      "pid": 38228,
+      "stopped": true,
+      "exitCode": 2
+    },
+    {
+      "pid": 184260,
+      "stopped": true,
+      "exitCode": 1
+    },
+    {
+      "pid": 158824,
+      "stopped": true,
+      "exitCode": 2
+    },
+    {
+      "pid": 152704,
+      "stopped": true,
+      "exitCode": 1
+    }
+  ],
+  "executableSha256": "2a5c4b8a6e848229476c83c37f9cf292fe9ca1783a3113abdd5b2e8942355213",
+  "protectedPortOwnersBefore": {
+    "17872": [
+      130900
+    ],
+    "17972": [
+      130900
+    ],
+    "17973": [
+      205088
+    ]
+  },
+  "ownedApiPortsReleased": true,
+  "remainingOwnedPorts": [],
+  "protectedPortOwnersAfter": {
+    "17872": [
+      130900
+    ],
+    "17972": [
+      130900
+    ],
+    "17973": [
+      205088
+    ]
+  },
+  "protectedPortOwnersUnchanged": true
+}
