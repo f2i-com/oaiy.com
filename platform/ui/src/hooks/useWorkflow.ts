@@ -23,6 +23,7 @@ import { SERVICE_NODE_TYPES, initialServiceFor, nodeTypeForService } from '../li
 import { currentAvailabilityEnv } from '../lib/availabilityEnv';
 import { useClipboard } from './useClipboard';
 import { workflowLogger } from '../utils/logger';
+import { RUN_OUTPUT_FIELDS } from '../utils/runOutputs';
 import { notifyStorageQuotaExceeded, markStorageWriteSucceeded } from '../lib/storageQuota';
 
 const AUTOSAVE_KEY = 'oaiy_workflow_autosave';
@@ -467,7 +468,7 @@ export function useWorkflow(options: UseWorkflowOptions = {}) {
   // that was meant to suppress this is dead in the integrated app, so without this a
   // pure run churns the project's updatedAt and revives stale outputs on reload.)
   // Excluded from BOTH the change-comparison and the saved node data.
-  const RUN_OUTPUT_FIELDS = new Set(['outputValue', 'imageUrl', 'videoUrl']);
+  // (The set is utils/runOutputs.ts: a flow that comes in from outside arrives without them too.)
 
   // Normalize a graph for comparison (temp fields + default provider fields are
   // stripped). Node POSITIONS are included (rounded to whole pixels) so a pure

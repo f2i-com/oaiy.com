@@ -31,6 +31,8 @@ import {
 import { subscribeStorageQuota } from '../lib/storageQuota';
 import { installController, useInstallState } from '../pwa';
 import DownloadDesktop from './DownloadDesktop';
+import ConnectDesktop from './ConnectDesktop';
+import { useCaps } from '../hooks/useCaps';
 import type { WorkflowGraph, GraphNode, Flow, LocalNetworkPermissionRequest, LocalNetworkPermissionResponse } from 'oaiy-core';
 import LocalNetworkPermissionDialog from './dialogs/LocalNetworkPermissionDialog';
 import { TrustDialog, DependencyDialog, PackageBrowser } from './PackageManager';
@@ -176,6 +178,8 @@ export default function OAIYApp() {
   // subscribe once here rather than in each.
   const [companion, setDesktop] = useState<DesktopInfo>(getDesktopInfo);
   useEffect(() => subscribeDesktopStatus(setDesktop), []);
+  // What the editor can do here (lib/caps.ts): no Packages section and no dock in a tab that is not linked to a desktop.
+  const caps = useCaps();
   const [showNewProjectDialog, setShowNewProjectDialog] = useState(false);
 
   // Package management hook
@@ -577,7 +581,7 @@ export default function OAIYApp() {
 
   // The editor's sections: the web rail's entries, or in OAIY's window the
   // tabs at the top. One of them shows at a time, in the main area.
-  const navItems = shellNavItems(section, setSection, { queue: <QueueCount /> });
+  const navItems = shellNavItems(section, setSection, { queue: <QueueCount /> }, caps.features);
   const newFlow = () => setNewFlowOpen(true);
   const openSettings = (page?: SettingsPage) => {
     if (page) setSettingsPage(page);
@@ -628,7 +632,7 @@ export default function OAIYApp() {
               ? `Desktop v${companion.version ?? '?'}`
               : 'Browser-only execution'
           }
-          engineAction={companion.available ? null : <DownloadDesktop variant="compact" />}
+          engineAction={<>{companion.available ? null : <DownloadDesktop variant="compact" />}<ConnectDesktop variant="compact" /></>}
           onInstall={installOffered ? () => { void installController.prompt(); } : undefined}
         />
       )}
@@ -946,7 +950,7 @@ export default function OAIYApp() {
           </div>
         </section>
 
-        {!followsOaiy && <ShellDock
+        {!followsOaiy && caps.features.dock && <ShellDock
           companionOnline={companion.available}
           endpointLabel={companion.available ? 'Local engine ready' : 'Local engine idle'}
           endpointUrl={backend.share ? backend.share.editUrl : companion.baseUrl}

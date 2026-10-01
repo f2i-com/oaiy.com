@@ -18,7 +18,8 @@ installConsoleBuffer();
 //   service:list                 — every registered service (Service Call uses this).
 //   service:list:<nodeType>      — only services tagged for the given node type;
 //                                  e.g. `service:list:ai_llm` for the AI LLM dropdown.
-import { registerDynamicOptionsResolver, registerNodeNoticeProvider } from 'oaiy-ui-components';
+import { invalidateDynamicOptions, registerDynamicOptionsResolver, registerNodeNoticeProvider } from 'oaiy-ui-components';
+import { subscribeCaps } from './lib/caps';
 import { serviceOptions } from './lib/serviceOptions';
 import { nodeNotice } from './lib/nodeAvailability';
 import { currentAvailabilityEnv } from './lib/availabilityEnv';
@@ -31,6 +32,8 @@ registerDynamicOptionsResolver('service:list', (rest: string) =>
 );
 // A node in a flow whose service is not installed says so on the node.
 registerNodeNoticeProvider((nodeType, data) => nodeNotice(nodeType, data, currentAvailabilityEnv()));
+// What the editor can do here follows the link to OAIY Desktop (lib/caps.ts): the notices on nodes that need it are drawn again when it is made or forgotten.
+subscribeCaps(() => invalidateDynamicOptions());
 
 // Dynamic module discovery - MUST be imported first before any module access
 import './dynamicModules';
@@ -38,13 +41,19 @@ import './dynamicModules';
 // Start the OAIY Desktop detection probe. Polls a fixed localhost
 // port for the OAIY Desktop app and re-renders any subscribed
 // component when the status flips. See lib/desktopDetection.ts.
+// Only where the page may look: OAIY's own window does, as it always has; a
+// tab in a browser sends nothing to this computer or its network until its
+// person presses Connect (or has a link from before). See lib/desktopLink.ts.
 import { startDesktopDetection } from './lib/desktopDetection';
 import { startDesktopServiceSync } from './lib/desktopServices';
+import { keepToTheLink } from './lib/desktopConnect';
 startDesktopDetection();
 // Mirror OAIY Desktop's running services into the service dropdowns +
 // compilers while it's available (Phase 3). No-op when OAIY Desktop
 // isn't running. See lib/desktopServices.ts.
 startDesktopServiceSync();
+// A link that goes without Disconnect (Reset in Settings) stops what it started.
+keepToTheLink();
 
 // Ask the browser to keep this site's storage (the project, macros and API keys
 // live there) rather than clear it when space is short. Once, in the

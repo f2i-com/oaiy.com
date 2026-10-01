@@ -34,7 +34,11 @@ import { TOOLS } from './agent/tools';
 import type { SessionTool, ToolHook } from './agent/agent';
 import { editPhone } from './ui/phone';
 import { startTheme } from './ui/theme';
-import { OAIY_ORIGIN, discoverOaiy, mediaAbilities, mergeDiscovered, originOf } from './agent/media';
+import { discoverOaiy, mediaAbilities, mergeDiscovered, originOf } from './agent/media';
+import { whereToFollow, whereToLook } from './agent/lookup';
+import { pageHost } from '@oaiy/shared/capabilities/host';
+import type { FeatureId } from '@oaiy/shared/capabilities/features';
+import { agentCaps } from './desktop/caps';
 import { budgetFor, contextWindow, detectContextWindow, formatTokens } from './agent/context';
 import { ChatPane } from './ui/chat';
 import { clear, h } from './ui/dom';
@@ -101,13 +105,17 @@ function embeddedDesktop(): { origin: string; token: string } | null {
   return given && typeof given.origin === 'string' && typeof given.token === 'string' && given.token ? { origin: given.origin, token: given.token } : null;
 }
 
+// Which window this is, read once as the page loads (shared/capabilities/host.ts): OAIY's own window (given the desktop, or served from OAIY's own
+// origin, exactly), the bot.computer desktop shell, or a tab in a browser. Only the first two look for OAIY on their own (agent/lookup.ts).
+const HOST = pageHost();
 /** OAIY's own window, where the app is a page beside the sidebar (it knows the desktop from its first line). */
-const IN_OAIY = location.hostname === 'oaiy.localhost' || location.protocol === 'oaiy:' || !!embeddedDesktop();
+const IN_OAIY = HOST.kind === 'oaiy-window';
 // Inside OAIY's window the page takes the window's look (styles.css, `.in-oaiy`).
 if (IN_OAIY) document.documentElement.classList.add('in-oaiy');
 // Light or dark: OAIY's (the dashboard's choice), or the system's.
 startTheme(IN_OAIY);
-const DESKTOP = IN_OAIY || location.hostname === 'botcomputer.localhost' || location.protocol === 'botcomputer:' || '__TAURI_INTERNALS__' in window;
+/** One of OAIY's own windows or the desktop shell: not a tab. */
+const DESKTOP = HOST.kind !== 'browser';
 // The browser offers to install the app as the page loads: listened for here, before anything is awaited. Never in OAIY's own window.
 const install = startInstall(window, DESKTOP);
 
@@ -144,6 +152,9 @@ function summarizeProject(meta: ProjectMeta, vfs: Vfs, gate: NetGate): string {
   return `Project "${meta.name}": ${files}${walked.truncated ? '+' : ''} files. Network gate: ${gate.mode}.\n${tree}`;
 }
 
+/** How long the welcome waits for a look at OAIY before it asks the person to set up a provider (a nearby OAIY answers at once; one that does not is not waited for). */
+const WELCOME_WAITS_MS = 1000;
+
 async function main(): Promise<void> {
   const app = document.getElementById('app')!;
   if (!crossOriginIsolated && (await registerServiceWorker())) {
@@ -171,11 +182,16 @@ async function main(): Promise<void> {
   const given = embeddedDesktop();
   let desktop: Desktop | null = given ? new Desktop(given.origin, given.token) : settings.desktop ? new Desktop(settings.desktop.origin, settings.desktop.token) : null;
   /**
+   * Whether a feature of the desktop's is on here, from where the page is and the desktop it is paired with now (desktop/caps.ts).
+   * Each control asks this AND what it needed before (a desktop to talk to, a module that is on), so this can only hide, never show.
+   */
+  const canDo = (id: FeatureId): boolean => agentCaps(HOST, desktop).features[id];
+  /**
    * OAIY Desktop's control API (its MCP server): the Agent checks and changes
    * OAIY itself through it, with the tools each kind of conversation is
    * offered (see desktop/mcp.ts).
    */
-  let control: ControlClient | null = desktop ? new ControlClient(desktop.origin, desktop.token) : null;
+  let control: ControlClient | null = desktop && canDo('control') ? new ControlClient(desktop.origin, desktop.token) : null;
   /**
    * Who answers the phone, and for whom (the receptionist's name and the
    * business's, from the desktop's calendar settings): every call, text and
@@ -224,8 +240,8 @@ async function main(): Promise<void> {
    * Receptionist). Null until the desktop has said; with no desktop, none.
    */
   let modules: Modules | null = null;
-  const phoneOn = () => isOn(modules, 'phone');
-  const calendarOn = () => isOn(modules, 'calendar');
+  const phoneOn = () => canDo('phone') && isOn(modules, 'phone');
+  const calendarOn = () => canDo('calendar') && isOn(modules, 'calendar');
   /**
    * The plugins' actions offered to the agent in `where`, as the desktop's
    * modules list them now (so they come and go with the snapshot), while the
@@ -509,9 +525,9 @@ async function main(): Promise<void> {
     if (frontDesk && (phoneOn() || project === frontDesk)) projectSelect.append(h('option', { value: FRONT_DESK.id, selected: project === frontDesk, title: "The phone's agents: calls, texts and flows' tasks" }, `📞 ${frontDesk.meta.name}`));
     // Then "Set up OAIY", once it has been opened: while there is a desktop to set up (and while it is open).
     const setup = list.find((m) => m.id === SETUP_PROJECT.id);
-    if (setup && (desktop || project?.meta.id === setup.id)) projectSelect.append(h('option', { value: setup.id, selected: setup.id === project?.meta.id, title: 'Your conversation with the Agent about setting up OAIY' }, `⚙ ${setup.name}`));
+    if (setup && ((desktop && canDo('setup')) || project?.meta.id === setup.id)) projectSelect.append(h('option', { value: setup.id, selected: setup.id === project?.meta.id, title: 'Your conversation with the Agent about setting up OAIY' }, `⚙ ${setup.name}`));
     for (const meta of list) if (meta.id !== SETUP_PROJECT.id) projectSelect.append(h('option', { value: meta.id, selected: meta.id === project?.meta.id }, meta.incognito ? `🕶 ${meta.name} (incognito)` : meta.name));
-    setupButton.hidden = !desktop;
+    setupButton.hidden = !(desktop && canDo('setup'));
   };
 
   /** Tell OAIY an incognito session has ended: it wipes what it held of it (a model not running is not started for this). */
@@ -605,7 +621,9 @@ async function main(): Promise<void> {
         // Outreach where the person is (never a call, a text, a flow's task or "Set up OAIY").
         // OAIY's own tools (its control API) after them, as this kind of conversation is offered them.
         sessionTools: () => withControl(kind(), [
-          ...(desktop ? [...flowTools, transcribe, ...(calendarOn() ? calendar : []), ...flowBuilder] : flowTools),
+          ...(canDo('flowTools') ? flowTools : []),
+          ...(desktop ? [transcribe, ...(calendarOn() ? calendar : [])] : []),
+          ...(desktop && canDo('flowTools') ? flowBuilder : []),
           ...(runner() ? phone : []),
           ...(withPreview ? pluginTools(runner() ? 'runner' : 'project') : []),
           ...(withPreview && phoneOn() && (kind() === 'runner' || kind() === 'project') ? outreachSet(kind()) : []),
@@ -967,7 +985,7 @@ async function main(): Promise<void> {
   };
 
   const editSettings = async () => {
-    const result = await openSettings({ providers, activeId, agent: agentSettings, media });
+    const result = await openSettings({ providers, activeId, agent: agentSettings, media }, { pairedDesktop: given ? null : desktop?.origin ?? null });
     if (!result) return;
     providers = result.providers;
     activeId = result.activeId;
@@ -1431,7 +1449,7 @@ A project can hold several apps, each in its own folder (any folder whose manife
   // Project actions: a row of buttons on a wide screen, a ☰ menu on a phone.
   const closeMenu = () => header.classList.remove('menu-open');
   // "Set up OAIY": the conversation with the Agent about OAIY itself (while there is a desktop to set up).
-  const setupButton = h('button.setup-oaiy', { title: 'Chat with the Agent to set OAIY up: your phone, flows, models, plugins and services', hidden: !desktop, onclick: () => void openSetup() }, 'Set up OAIY') as HTMLButtonElement;
+  const setupButton = h('button.setup-oaiy', { title: 'Chat with the Agent to set OAIY up: your phone, flows, models, plugins and services', hidden: !(desktop && canDo('setup')), onclick: () => void openSetup() }, 'Set up OAIY') as HTMLButtonElement;
   const actions = h(
     'div.actions',
     { onclick: (e: Event) => { if ((e.target as HTMLElement).closest('button')) closeMenu(); } },
@@ -1555,14 +1573,17 @@ A project can hold several apps, each in its own folder (any folder whose manife
   /**
    * OAIY on this computer: read its discovery document and set up images,
    * video and chat from it. A service set up by hand is left alone; one found
-   * before is refreshed (its models may have changed). `?OAIY=<address>` looks
-   * somewhere else; automated browsers (the tests) only look when asked to.
+   * before is refreshed (its models may have changed).
+   *
+   * Where the page looks on its own is decided in agent/lookup.ts: OAIY's own
+   * windows at OAIY's usual address, a tab in a browser only at an OAIY it
+   * found before (Settings → Find OAIY looks whenever it is pressed).
    */
   async function lookForOaiy(): Promise<void> {
-    const asked = new URLSearchParams(location.search).get('oaiy');
-    const where = asked ?? (navigator.webdriver ? null : media.discovered?.origin ?? OAIY_ORIGIN);
-    if (!where || (media.baseUrl && !media.discovered && !asked)) return;
-    const found = await discoverOaiy(where, media.apiKey, undefined, 3000).catch(() => null);
+    const target = whereToLook({ host: HOST, asked: new URLSearchParams(location.search).get('oaiy'), discovered: media.discovered?.origin, setByHand: !!media.baseUrl && !media.discovered });
+    if (!target) return;
+    // The person's key goes only to the OAIY they set up, never to an address a link named.
+    const found = await discoverOaiy(target.origin, target.withKey ? media.apiKey : '', undefined, 3000).catch(() => null);
     if (!found || found.state === 'absent') return;
     if (found.state !== 'found') {
       // OAIY is there but closed to this page: say how to open it, once per browser.
@@ -1579,6 +1600,8 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     }
     const first = !media.discovered;
     media = mergeDiscovered(media, found.media);
+    // What a link's address says about itself is kept without the key the person typed: later requests to it would carry it.
+    if (!target.withKey) media = { ...media, apiKey: '' };
     await saveMedia(media);
     followEngine(found);
     const chatProvider = oaiyProvider(providers, found);
@@ -1626,8 +1649,9 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
 
   // What Engines has chosen is looked at again now and then (it may be changed there at any time).
   setInterval(() => {
-    if (!providers.some((p) => p.followEngine) || navigator.webdriver) return;
-    const origin = media.discovered?.origin ?? OAIY_ORIGIN;
+    if (!providers.some((p) => p.followEngine)) return;
+    const origin = whereToFollow({ host: HOST, discovered: media.discovered?.origin });
+    if (!origin) return;
     void discoverOaiy(origin, media.apiKey, undefined, 3000).then((found) => {
       if (found.state === 'found') followEngine(found);
     }).catch(() => {});
@@ -1714,7 +1738,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
    * files, empty state and instructions.
    */
   async function openSetup(): Promise<void> {
-    if (!desktop) {
+    if (!desktop || !canDo('setup')) {
       chat.system('Setting up OAIY needs OAIY Desktop: pair this page with it first (the desktop chip at the top).', 'error');
       return;
     }
@@ -2060,7 +2084,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   /** The flows made tools on the desktop, as the agents' tools. */
   async function refreshFlowTools(): Promise<void> {
     const d = desktop;
-    if (!d) {
+    if (!d || !canDo('flowTools')) {
       flowTools = [];
       toolHooks = [];
       return;
@@ -2258,7 +2282,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
         void saveDesktop(d);
         desktopEvents.stop();
         // Another desktop (or none): its own control API, and its own choice of the Agent's model.
-        control = desktop ? new ControlClient(desktop.origin, desktop.token) : null;
+        control = desktop && canDo('control') ? new ControlClient(desktop.origin, desktop.token) : null;
         codexDefault = null;
         chatgptProblem = '';
         void followAgentModel();
@@ -2348,7 +2372,13 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   const sandbox = sandboxAvailable();
   if (!sandbox.ok) chat.system(`The code sandbox is unavailable: ${sandbox.reason}.`, 'error');
   else void zippModule().catch((error: unknown) => chat.system(`Could not load the Zipp engine: ${(error as Error).message}`, 'error'));
-  await lookForOaiy();
+  // A tab does not wait for its look at OAIY (design R4: nothing on the boot path waits for what leaves the site): a saved OAIY that does not
+  // answer (a network the person is not on) costs the page 3 s otherwise. The page draws and the desktop starts as it always did; what is found
+  // is applied when it arrives, and only the welcome below waits for it, for at most WELCOME_WAITS_MS. OAIY's own window (and the desktop
+  // shell) waits as it always has: OAIY is on this computer and answers at once or not at all, and a welcome that asks for a provider must not
+  // come up ahead of the OAIY that is about to be found and set up as one.
+  const lookedFor = lookForOaiy().catch(() => {});
+  if (DESKTOP) await lookedFor;
   renderPhoneChip();
   // What the Agent runs on (the desktop's choice: its engine, or ChatGPT), shown on the model chip. The welcome
   // below waits for it: a person whose Agent runs on ChatGPT has nothing to set up in Settings.
@@ -2363,7 +2393,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     // The phone's calls, its chip and call backs start once the desktop says there is a phone.
     startModules();
   } else applyModules(UNPAIRED);
-  void modelKnown.then(() => {
+  void Promise.all([modelKnown, Promise.race([lookedFor, new Promise<void>((resolve) => setTimeout(resolve, WELCOME_WAITS_MS))])]).then(() => {
     if (!agentProvider('project')) chat.system('Welcome! Set up an AI provider in ⚙ Settings to talk to the agent — a local server (Ollama, LM Studio, OAIY) keeps everything on this computer. The editor and terminal work without one.');
   });
   // Leaving the page (closing the tab, reloading, switching away on a phone): save now.

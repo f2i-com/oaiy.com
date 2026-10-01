@@ -383,12 +383,28 @@ try {
 
   await check('in OAIY own window nothing is offered, the browser event is left alone and no service worker is registered', async () => {
     const window_ = await browser.newPage();
+    // What OAIY gives its window before the page runs: the desktop's address and a token. (The page is served from this test's own server,
+    // so it is the desktop that says what it is: a name and a port of oaiy.localhost do not make a window. The desktop given is the test's
+    // model server, which answers nothing of a desktop.)
+    await window_.evaluateOnNewDocument((origin) => {
+      window.__OAIY_DESKTOP__ = Object.freeze({ origin, token: 'window-token', theme: 'dark' });
+    }, modelUrl);
     await window_.goto(`http://oaiy.localhost:${port}/`);
     await window_.waitForSelector('.menu-toggle', { timeout: 30_000 });
     expect(await offer(window_) === false, 'the page took the browser event inside OAIY window');
     same(await installItem(window_), null, 'the item in OAIY window');
     same(await window_.evaluate(async () => (await navigator.serviceWorker.getRegistrations()).length), 0, 'service workers registered');
     await window_.close();
+  });
+
+  await check('a page at oaiy.localhost on a port, given no desktop, is a tab and not OAIY\'s window: the browser event is kept and "Install app" is offered', async () => {
+    const tab = await browser.newPage();
+    await withoutBrowserOffer(tab);
+    await tab.goto(`http://oaiy.localhost:${port}/`);
+    await tab.waitForSelector('.tree-row', { timeout: 30_000 });
+    expect((await offer(tab)) === true, 'the page did not keep the browser event: it took itself for OAIY\'s window');
+    same(await installItem(tab), 'Install app', 'the item at oaiy.localhost on a port');
+    await tab.close();
   });
 
   // ---- an update ----

@@ -76,7 +76,7 @@ These tools work on files already in the project, with or without a media servic
 
 They run in the page with the browser's own video and audio codecs (WebCodecs: H.264 and AAC where the system has them, otherwise VP9 and Opus). [Mediabunny](https://mediabunny.dev) reads and writes the files. Everything is re-encoded, so cuts are exact to the frame. Nothing leaves the computer, and it works offline and in the desktop app. A model with a context window under 16k tokens doesn't get these four tools, so that its window still has room to work.
 
-- **OAIY is found on its own.** When the page opens, it asks `http://127.0.0.1:8080/v1/discovery`.
+- **OAIY is found on its own, in OAIY's own windows and the desktop app.** When the page opens there, it asks `http://127.0.0.1:8080/v1/discovery`. In a tab in a browser the page asks nothing of your computer when it opens (a look at your own network is a permission prompt in current Chrome and Edge, and a public page has no business with it): press **Settings → Images, video and audio → Find OAIY** once, and from then on the page asks OAIY at the address it found when it opens.
   - If OAIY answers, its image, video, speech, music, sound effects and 3D models, their limits (sizes, edits, seconds), its saved voices and its defaults fill **Settings → Images, video and audio**.
   - OAIY is also added as a chat provider if none points at it yet. It becomes the active one only if nothing else is.
   - Found again later, its model lists are refreshed. Your chosen models and key stay.

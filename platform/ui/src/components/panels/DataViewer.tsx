@@ -445,9 +445,14 @@ export default function DataViewer({ activeFlowId, packageId, flowName }: DataVi
       kicker="Flows"
       title="Data"
       description={
-        currentFlowId
-          ? <>What the Database nodes in <strong className="text-content-primary">{displayName}</strong> have stored.</>
-          : 'What the Database nodes in your flows have stored. Pick a flow’s database.'
+        <>
+          {currentFlowId
+            ? <>What the Database nodes in <strong className="text-content-primary">{displayName}</strong> have stored.</>
+            : 'What the Database nodes in your flows have stored. Pick a flow’s database.'}
+          {' '}
+          {/* The editor's SQLite has no persistent storage: the browser gives it only to a worker, and this runs on the page (tauri-shim/sql.ts). Said everywhere, OAIY's own window included, which shows the same build. */}
+          <strong className="text-content-primary" data-session-only>Kept for this session only:</strong> the editor keeps it in memory, and it is gone when this page is closed or reloaded.
+        </>
       }
       fill
       actions={

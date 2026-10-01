@@ -2,14 +2,20 @@
  * Browser shim for `@tauri-apps/plugin-sql`, backed by SQLite compiled to
  * WebAssembly (`@sqlite.org/sqlite-wasm`).
  *
- * Persistence uses the **OPFS SAHPool VFS** (Origin Private File System,
- * Synchronous Access Handle pool):
+ * Persistence is meant to use the **OPFS SAHPool VFS** (Origin Private File
+ * System, Synchronous Access Handle pool):
  *   - real, durable storage that survives reloads,
  *   - the exact SQLite dialect the desktop uses, so `services/database.ts`
  *     (json_extract collections, per-flow DBs, table registry) runs verbatim,
- *   - works on the main thread and — crucially — needs **no COOP/COEP
- *     headers**, which would otherwise block the app's cross-origin `fetch`es
- *     to local engines (Ollama/ComfyUI/…).
+ *   - needs **no COOP/COEP headers**, which would otherwise block the app's
+ *     cross-origin `fetch`es to local engines (Ollama/ComfyUI/…).
+ *
+ * BUT that VFS needs synchronous file handles, which a browser gives only to a
+ * Worker. On the main thread, where this runs, `installOpfsSAHPoolVfs` throws
+ * ("Missing required OPFS APIs", checked in Chromium 148), `getEnv` falls back
+ * to in-memory SQLite, and what a flow stores is gone with the page. The Data
+ * page says so, in a tab and in OAIY's window alike (both run this build). Running
+ * SQLite in a Worker is what makes it persistent.
  *
  * The desktop API surface we replicate is small:
  *   Database.load(conn) → .execute(sql, params) → { rowsAffected, lastInsertId }

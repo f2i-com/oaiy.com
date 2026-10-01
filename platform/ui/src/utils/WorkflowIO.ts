@@ -9,6 +9,7 @@ import type { Node, Edge } from '@xyflow/react';
 import dagre from 'dagre';
 import type { WorkflowGraph, NodeType } from 'oaiy-core';
 import { looksLikeSecret, redactSecretsInText } from './ProjectIO';
+import { withoutRunOutputs } from './runOutputs';
 
 /** No project-constant secrets available in this path — still catches vendor-shaped keys. */
 const NO_KNOWN_SECRETS = new Set<string>();
@@ -498,7 +499,7 @@ export function parseWorkflowJson(content: string): {
   }
 
   return {
-    nodes: wf.nodes as Array<{ id: string; type: string; position: { x: number; y: number }; data: Record<string, unknown> }>,
+    nodes: withoutRunOutputs(wf.nodes as Array<{ id: string; type: string; position: { x: number; y: number }; data: Record<string, unknown> }>),
     edges: wf.edges as Array<{ id?: string; source: string; target: string; sourceHandle?: string; targetHandle?: string }>,
     name: wf.name as string | undefined,
     version: wf.version as string | undefined,

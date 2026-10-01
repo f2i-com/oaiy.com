@@ -18,8 +18,10 @@ import {
   isRemoteEngine,
   setEngineBase,
 } from '../../../lib/engineEndpoint';
-import { subscribeDesktopStatus, type DesktopInfo } from '../../../lib/desktopDetection';
+import { mayLookOnLoad, startDesktopDetection, subscribeDesktopStatus, type DesktopInfo } from '../../../lib/desktopDetection';
+import { startDesktopServiceSync } from '../../../lib/desktopServices';
 import { Card } from '../../chrome/SectionPage';
+import ConnectDesktop from '../../ConnectDesktop';
 import DownloadDesktop from '../../DownloadDesktop';
 
 export default function EngineEndpointCard() {
@@ -37,6 +39,10 @@ export default function EngineEndpointCard() {
       setValue(next);
       setSaved(true);
       window.setTimeout(() => setSaved(false), 1800);
+      // An address of its own is a link (lib/desktopLink.ts): a tab that had none starts keeping up with the desktop there. The
+      // address change has already asked once; nothing here asks again.
+      startDesktopDetection({ probeNow: false });
+      startDesktopServiceSync({ probeNow: false });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -44,13 +50,15 @@ export default function EngineEndpointCard() {
 
   const live = status?.baseUrl ?? getEngineBase();
   const remote = isRemoteEngine(live);
+  // A tab in a browser has not looked for the desktop until its person presses Connect (or has a link): neither there nor not there.
+  const notAsked = !status?.checked && !mayLookOnLoad();
 
   return (
     <Card
       title="OAIY's engine"
       actions={
         <span className={status?.available ? 'oaiy-pill dot ok' : 'oaiy-pill dot'}>
-          {status?.available ? `connected${status.version ? ` · v${status.version}` : ''}` : 'not reachable'}
+          {status?.available ? `connected${status.version ? ` · v${status.version}` : ''}` : notAsked ? 'not connected' : 'not reachable'}
         </span>
       }
     >
@@ -96,10 +104,13 @@ export default function EngineEndpointCard() {
       </form>
 
       <p className="oaiy-help faint">
-        {status?.available ? `Answering at ${live}.` : `Nothing answers at ${live}.`}
+        {status?.available ? `Answering at ${live}.` : notAsked ? `Not looked for yet at ${live}.` : `Nothing answers at ${live}.`}
       </p>
       {error && <p className="oaiy-error-text">{error}</p>}
       {saved && !error && <p className="oaiy-ok-text">Saved. Reconnecting…</p>}
+
+      {/* A tab in a browser looks for the desktop when its person presses this, and says why. Nothing in OAIY's own window. */}
+      <ConnectDesktop variant="card" />
 
       {!status?.available && (
         /* No desktop answers: where to get one. Nothing in OAIY's own window, which is one. */

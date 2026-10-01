@@ -16,8 +16,12 @@ Two-process architecture by design:
   managing model downloads, bundling a portable Python runtime,
   running Playwright for browser automation (Phase 4).
 
-The web app polls `http://127.0.0.1:17972/api/health` on load to detect
-OAIY Desktop. When found, the palette lights up extra capabilities —
+The web app polls `http://127.0.0.1:17972/api/health` to detect OAIY
+Desktop: on load in OAIY's own window, and in a browser tab once its
+person has pressed **Connect** (Settings → Services, or the sidebar). A tab
+that has not been connected sends nothing to this computer or its network as
+it opens, because that is a permission prompt in current Chrome and Edge.
+When found, the palette lights up extra capabilities —
 OAIY-Desktop-managed services appear, browser nodes become usable.
 
 ## Roadmap

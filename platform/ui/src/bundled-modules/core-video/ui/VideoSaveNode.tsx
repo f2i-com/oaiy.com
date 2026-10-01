@@ -2,6 +2,7 @@ import { memo, useRef, useEffect, useCallback, useMemo, type ChangeEvent } from 
 import { Position } from '@xyflow/react';
 import { CollapsibleNodeWrapper, type HandleConfig } from 'oaiy-ui-components';
 import { pathToMediaUrl } from 'oaiy-core';
+import { BLOCKED_MEDIA_WORDS, mediaUrlBlocked } from '../../../lib/localMedia';
 
 
 interface VideoSaveNodeData {
@@ -124,7 +125,9 @@ function VideoSaveNode({ data }: VideoSaveNodeProps) {
                         <label className="text-slate-600 dark:text-slate-400 text-xs block mb-1">Preview</label>
                         <div className={`w-full bg-white dark:bg-slate-900 border rounded flex items-center justify-center overflow-hidden ${hasVideo ? 'border-orange-600' : 'border-slate-300 dark:border-slate-700 h-24'
                             }`}>
-                            {hasVideo ? (
+                            {hasVideo && mediaUrlBlocked(getVideoSrc) ? (
+                                <span className="text-amber-600 dark:text-amber-400 text-[10px] p-2" data-blocked-media>{BLOCKED_MEDIA_WORDS}</span>
+                            ) : hasVideo ? (
                                 <video
                                     src={getVideoSrc}
                                     className="w-full rounded"

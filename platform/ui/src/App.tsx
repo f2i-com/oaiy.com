@@ -16,6 +16,7 @@ import { openSharedFlowFromUrl, shareHashFromUrl } from './lib/openSharedFlow';
 import PasswordPromptModal from './components/dialogs/PasswordPromptModal';
 import { getCliRunConfig, type CliRunConfig } from './hooks/useCliRunMode';
 import { createLogger } from './utils/logger';
+import { flowWithoutRunOutputs } from './utils/runOutputs';
 
 const logger = createLogger('App');
 
@@ -122,7 +123,8 @@ function App() {
               description: '',
               createdAt: result.meta.created_at,
               updatedAt: result.meta.updated_at,
-              flows: Array.isArray(flowJson.flows) ? flowJson.flows : [],
+              // A shared flow arrives without the run outputs its author left in its nodes: an address there is a request when it is shown.
+              flows: Array.isArray(flowJson.flows) ? flowJson.flows.map(flowWithoutRunOutputs) : [],
               settings: flowJson.settings ?? {},
               constants: Array.isArray(flowJson.constants) ? flowJson.constants : [],
               llmEndpoints: [],

@@ -8,9 +8,11 @@ import { LOCAL_SERVERS, defaultBaseUrl, listModels, type ModelInfo } from '../ag
 import type { LocalServerKind, ProviderConfig, ProviderType } from '../agent/providers/types';
 import { contextWindow, detectContextWindow, formatTokens } from '../agent/context';
 import type { AgentSettings } from '../settings';
-import { OAIY_ORIGIN, discoverOaiy, listMediaModels, mediaAbilities, mergeDiscovered, originOf, type Discovery, type MediaSettings } from '../agent/media';
+import { EMPTY_MEDIA, OAIY_ORIGIN, discoverOaiy, listMediaModels, mediaAbilities, mergeDiscovered, originOf, type Discovery, type MediaSettings } from '../agent/media';
 import { newId } from '../vfs/projects';
+import { looksOnLoad, pageHost } from '@oaiy/shared/capabilities/host';
 import { clear, h } from './dom';
+import { findOaiyTitle, oaiyFoundWords, oaiyStateOf, pairedTabWords } from './linkWords';
 
 export interface SettingsResult {
   providers: ProviderConfig[];
@@ -56,12 +58,31 @@ const KINDS: Array<{ value: string; label: string; type: ProviderType; serverKin
   { value: 'custom', label: 'Other OpenAI-compatible API (OpenRouter, Groq, …)', type: 'custom' },
 ];
 
+/** Whether the address typed is (at) the origin that was found: an empty one, or one that is not an address, is not. */
+export function addressOf(typed: string, origin: string): boolean {
+  if (!typed.trim()) return false;
+  try {
+    return originOf(typed) === origin;
+  } catch {
+    return false;
+  }
+}
+
+/** What Forget OAIY leaves: nothing that was found, no address and no key for it. Whether the agent may use media stays as chosen. */
+export function forgetOaiy(media: MediaSettings): MediaSettings {
+  return { ...EMPTY_MEDIA, imageModels: [], videoModels: [], enabled: media.enabled };
+}
+
 function kindOf(p: ProviderConfig): string {
   if (p.type === 'local') return p.serverKind === 'lmstudio' ? 'lmstudio' : p.serverKind === 'ollama' ? 'ollama' : p.serverKind === 'oaiy' ? 'oaiy' : 'local-other';
   return p.type;
 }
 
-export function openSettings(initial: SettingsResult): Promise<SettingsResult | null> {
+/**
+ * `pairedDesktop`: the origin of the OAIY Desktop this tab is paired with (null: none). The words about how OAIY is found say what a tab
+ * that is paired keeps doing besides.
+ */
+export function openSettings(initial: SettingsResult, context: { pairedDesktop?: string | null } = {}): Promise<SettingsResult | null> {
   return new Promise((resolve) => {
     let providers = initial.providers.map((p) => ({ ...p }));
     let activeId = initial.activeId;
@@ -253,10 +274,16 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
       const status = media.discovered
         ? `${media.discovered.service} ${media.discovered.version} at ${media.discovered.origin}`
         : media.baseUrl ? 'set up by hand' : 'not set up';
+      // What was found when this was drawn: typing another address drops it, and typing the address that was found again gives it back.
+      const found = { discovered: media.discovered, endpoints: media.endpoints };
       const address = h('input', { value: media.baseUrl, placeholder: `${OAIY_ORIGIN}/v1`, oninput: () => {
         media.baseUrl = address.value.trim();
-        // A typed address is no longer the discovered one: its routes may differ.
-        if (media.discovered && media.baseUrl && originOf(media.baseUrl) !== media.discovered.origin) {
+        // The address is what makes this the OAIY that was found: another address, or none, is not that one any more (its routes may
+        // differ), and a page that has forgotten it does not ask it again when it opens or send it the key. The same address, retyped, is.
+        if (found.discovered && addressOf(media.baseUrl, found.discovered.origin)) {
+          media.discovered = found.discovered;
+          media.endpoints = found.endpoints;
+        } else if (media.discovered) {
           media.discovered = undefined;
           media.endpoints = undefined;
         }
@@ -273,7 +300,12 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
         const note = (id: string) => kind === 'speech' && media.speechModels?.find((m) => m.id === id)?.engine === 'breeze-tts-2' ? 'Breeze TTS 2: research and non-commercial use only' : undefined;
         return h('span.model-choice', input, h('datalist', { id: listId }, ...ids.map((id) => h('option', { value: id, label: note(id) }))));
       };
-      const find = h('button', { title: 'Ask OAIY for its details (/v1/discovery) and fill everything in', onclick: async () => {
+      // OAIY's own windows look for OAIY as they start; a tab in a browser only when this button is pressed (agent/lookup.ts).
+      // What this tab holds (linkWords.ts): a desktop it is paired with, and an OAIY it found or a media address typed by hand, as the
+      // dialog was drawn (Find OAIY, Forget OAIY and a saved change draw it again).
+      const oaiyState = oaiyStateOf({ own: looksOnLoad(pageHost()), desktop: context.pairedDesktop ?? null, discovered: media.discovered?.origin, withKey: !!media.apiKey, typed: media.baseUrl });
+      const pairedWords = pairedTabWords(oaiyState);
+      const find = h('button', { title: findOaiyTitle(oaiyState), onclick: async () => {
         note.textContent = 'Looking for OAIY…';
         let where = OAIY_ORIGIN;
         try {
@@ -297,6 +329,14 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
         (mediaSection.querySelector('.form-note') as HTMLElement).textContent =
           `Found ${found.service} ${found.version}: it can make ${mediaAbilities(media) || 'nothing yet'}.${chat ? ' It is in the AI providers too, for chat.' : ''}`;
       } }, 'Find OAIY');
+      // Shown while an OAIY is found: this page asks it at that address each time it opens, with the key below (if there is one).
+      const forget = h('button', { title: 'Forget the OAIY that was found: its address, what it said and the key. This page stops asking it when it opens (once you press Save).', onclick: () => {
+        const was = media.discovered?.origin;
+        const chatToo = !!was && providers.some((p) => addressOf(p.baseUrl ?? '', was));
+        media = forgetOaiy(media);
+        renderMedia();
+        (mediaSection.querySelector('.form-note') as HTMLElement).textContent = `Forgotten${was ? ` (${was})` : ''}. Press Save to keep that: this page then asks nothing of it.${chatToo ? ' Its chat provider is still in the list above; remove it there too if you do not want it.' : ''}`;
+      } }, 'Forget OAIY');
       const listButton = h('button', { title: 'Ask the server which image and video models it has', onclick: async () => {
         if (!media.baseUrl) {
           note.textContent = 'Give the address first.';
@@ -326,9 +366,11 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
       const enabled = h('input', { type: 'checkbox', checked: media.enabled, onchange: () => { media.enabled = enabled.checked; } }) as HTMLInputElement;
       mediaSection.append(
         h('strong', 'Images, video and audio'),
-        h('p.muted', `The agent can make pictures, short videos, speech, music, sound effects and 3D models with a media service: OAIY is found on its own, and any server with OpenAI's /v1/images/generations, /v1/videos and /v1/audio/speech works. Now: ${status}${media.baseUrl ? ` (${abilities || 'no models chosen'})` : ''}.`),
+        h('p.muted', `The agent can make pictures, short videos, speech, music, sound effects and 3D models with a media service: ${oaiyFoundWords(oaiyState)}, and any server with OpenAI's /v1/images/generations, /v1/videos and /v1/audio/speech works. Now: ${status}${media.baseUrl ? ` (${abilities || 'no models chosen'})` : ''}.`),
+        ...(pairedWords ? [h('p.muted.paired-note', pairedWords)] : []),
         h('div.provider-form',
-          h('label', 'Address', h('div.window-picker', address, find, listButton)),
+          // Forget OAIY is for a tab: OAIY's own window finds OAIY again at every opening, so the button would do nothing there.
+          h('label', 'Address', h('div.window-picker', address, find, listButton, ...(media.discovered && !looksOnLoad(pageHost()) ? [forget] : []))),
           h('label', 'API key', key),
           h('label', 'Images', modelInput('image')),
           h('label', 'Video', modelInput('video')),

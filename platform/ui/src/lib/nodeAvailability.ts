@@ -14,10 +14,16 @@
  * typed AI nodes stay folded into Service Call + a preset, as before, and the
  * new service nodes appear only when a service is tagged for them.
  *
+ * The nodes that only work with OAIY Desktop behind the editor (the browser
+ * nodes, Ask the Agent, Folder input) follow the same rule by where the editor
+ * is (lib/caps.ts): offered where a desktop is behind it (OAIY's window, or a
+ * tab linked to one), left out of the palette where none is.
+ *
  * A node already in a flow is never hidden or dropped: it is registered
  * either way, opens and compiles, and says what is missing on the node.
  */
 import type { CustomService } from 'oaiy-core/modules/core-service/examples';
+import { whyMissing, type FeatureId } from '@oaiy/shared/capabilities/features';
 import {
   NODE_ENGINE_KIND,
   isOaiyServiceId,
@@ -65,9 +71,27 @@ const KIND_LABEL: Readonly<Record<string, string>> = {
   transcription: 'transcription',
 };
 
+/**
+ * The nodes that need OAIY Desktop, and the feature each needs (shared/capabilities/features.ts). `browser_request` is not one:
+ * it is a plain HTTP request, made by the page.
+ */
+export const DESKTOP_NODE_FEATURE: Readonly<Record<string, FeatureId>> = {
+  browser_session: 'browserNodes',
+  browser_page: 'browserNodes',
+  browser_extract: 'browserNodes',
+  browser_action: 'browserNodes',
+  ask_agent: 'askAgent',
+  input_folder: 'inputFolder',
+};
+
 export interface AvailabilityEnv {
   /** In OAIY's window (`window.__OAIY_DESKTOP__`). */
   inOaiy: boolean;
+  /**
+   * Which of the desktop's features are on here (lib/caps.ts). Absent: all are, as they were before the editor knew where it was.
+   * A node that needs one that is off is not offered, and says what it needs.
+   */
+  features?: Readonly<Partial<Record<FeatureId, boolean>>>;
   /** The desktop's list has answered at least once. */
   loaded: boolean;
   /** The user's own services (`oaiy.customServices`). */
@@ -87,8 +111,15 @@ export function isListed(s: CustomService): boolean {
   return s.group !== 'desktop' || s.inUse !== false;
 }
 
+/** The feature of the desktop's that node type `id` needs and this editor does not have, or null. */
+function missingFeature(id: string, env: AvailabilityEnv): FeatureId | null {
+  const feature = DESKTOP_NODE_FEATURE[id];
+  return feature && env.features?.[feature] === false ? feature : null;
+}
+
 /** Whether the palette offers node type `id`. */
 export function paletteShowsNode(id: string, env: AvailabilityEnv): boolean {
+  if (missingFeature(id, env)) return false;
   if (!SERVICE_NODE_TYPES.has(id)) return true;
   const all = [...env.custom, ...env.desktop].filter(isListed);
   if (env.inOaiy) return env.loaded && servesNode(all, id as never);
@@ -108,6 +139,8 @@ function describeOaiyId(id: string): { kind: string; model: string } {
  * a guess). Covers the service-driven nodes and Service Call.
  */
 export function nodeNotice(nodeType: string, data: Record<string, unknown>, env: AvailabilityEnv): string | null {
+  const missing = missingFeature(nodeType, env);
+  if (missing) return `${whyMissing(missing)} Connect it in Settings → Services, or use another node.`;
   if (!SERVICE_NODE_TYPES.has(nodeType) && nodeType !== 'service_call') return null;
   const picked = typeof data.service === 'string' ? data.service.trim() : '';
   const id = picked || DEFAULT_SERVICE[nodeType] || '';

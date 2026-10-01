@@ -25,14 +25,32 @@
  * The engine address is a setting the person can change, so nothing here (or
  * anywhere that reaches the desktop) may keep a copy of it: ask
  * `getEngineBase()` each time, or read `DesktopInfo.baseUrl` from here.
+ *
+ * WHEN it looks. OAIY's own window (and the desktop shell) look as soon as the
+ * page opens, as they always have. A tab in a browser does not: on a public
+ * address that request is a permission prompt for the visitor and shows the
+ * site what is on their network. A tab looks when its person presses Connect
+ * (lib/desktopConnect.ts), and from then on whenever the editor opens (the
+ * link kept in lib/desktopLink.ts, or an engine address given in Settings).
+ * `refreshDesktopStatus()` is the person asking, and always asks.
  */
 
+import { looksOnLoad, pageHost } from '@oaiy/shared/capabilities/host';
 import { getEngineBase, subscribeEngineBase } from './engineEndpoint';
+import { hasSavedDesktopLink } from './desktopLink';
+
+// Which window this is, read as the page loads, before any flow or other script of the person's runs (shared/capabilities/host.ts).
+pageHost();
 
 const POLL_INTERVAL_MS = 10_000;
 const FETCH_TIMEOUT_MS = 1500;
 
 export interface DesktopInfo {
+  /**
+   * False until the desktop has been asked. A tab in a browser asks only when its person presses Connect, so until then
+   * the desktop is neither there nor not there, and the page says so.
+   */
+  checked: boolean;
   /** True if the last health probe succeeded. */
   available: boolean;
   /** Version string from OAIY Desktop, only set when `available`. */
@@ -47,6 +65,7 @@ export interface DesktopInfo {
 type Listener = (info: DesktopInfo) => void;
 
 let current: DesktopInfo = {
+  checked: false,
   available: false,
   baseUrl: getEngineBase(),
   lastChange: Date.now(),
@@ -56,12 +75,19 @@ const listeners = new Set<Listener>();
 let pollTimer: number | null = null;
 let pollPromise: Promise<void> | null = null;
 
+/** Bumped by Disconnect: an answer that was asked for before it is not about the link that is there now. */
+let generation = 0;
+
 async function probeOnce(): Promise<void> {
   // The address this probe asks about: the setting as it is now. If the person
   // changes it while the answer is on its way, that answer is about a desktop
   // they no longer point at (a probe of the new address is already running, see
   // subscribeEngineBase below) and must not be published over it.
   const base = getEngineBase();
+  // A Disconnect while this is on its way is a change of mind about the very thing it answers: its answer is dropped, as one about an address
+  // that has since changed is.
+  const gen = generation;
+  const stale = () => getEngineBase() !== base || gen !== generation;
   try {
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -85,8 +111,9 @@ async function probeOnce(): Promise<void> {
       // identity. Reporting a squatter as "available" would silently route
       // desktop-backed nodes at a stranger.
       const isOaiyCompanion = body?.product === 'oaiy-desktop';
-      if (getEngineBase() !== base) return;
+      if (stale()) return;
       const next: DesktopInfo = {
+        checked: true,
         available: isOaiyCompanion,
         version: isOaiyCompanion ? body?.version : undefined,
         baseUrl: base,
@@ -103,8 +130,9 @@ async function probeOnce(): Promise<void> {
     // available". Don't log to console; this probe runs on a 10s loop
     // and would flood the console otherwise.
   }
-  if (getEngineBase() !== base) return;
+  if (stale()) return;
   publish({
+    checked: true,
     available: false,
     baseUrl: base,
     lastChange: current.available ? Date.now() : current.lastChange,
@@ -113,6 +141,7 @@ async function probeOnce(): Promise<void> {
 
 function publish(next: DesktopInfo): void {
   if (
+    next.checked === current.checked &&
     next.available === current.available &&
     next.version === current.version &&
     next.baseUrl === current.baseUrl
@@ -137,14 +166,25 @@ function publish(next: DesktopInfo): void {
 }
 
 /**
- * Start the periodic probe. Safe to call multiple times — only one
- * underlying timer runs at any moment. The first probe fires immediately
- * so the initial UI doesn't wait for the first interval tick.
+ * Whether this page may look for the desktop as it opens: OAIY's own window and the desktop shell always may; a tab in a
+ * browser only where its person has said (a link kept from Connect, or an engine address given in Settings).
  */
-export function startDesktopDetection(): void {
+export function mayLookOnLoad(): boolean {
+  return looksOnLoad(pageHost()) || hasSavedDesktopLink();
+}
+
+/**
+ * Start the periodic probe, where this page may look (see `mayLookOnLoad`; a tab with no link does nothing here).
+ * Safe to call multiple times — only one underlying timer runs at any moment.
+ * The first probe fires immediately so the initial UI doesn't wait for the
+ * first interval tick; `probeNow: false` starts the timer alone, for a caller
+ * that has just asked (Connect).
+ */
+export function startDesktopDetection(options: { probeNow?: boolean } = {}): void {
   if (pollTimer !== null) return;
+  if (!mayLookOnLoad()) return;
   // Fire one probe right away, then on the interval.
-  pollPromise = probeOnce();
+  if (options.probeNow !== false) pollPromise = probeOnce();
   pollTimer = window.setInterval(() => {
     pollPromise = probeOnce();
   }, POLL_INTERVAL_MS);
@@ -156,6 +196,13 @@ export function stopDesktopDetection(): void {
     window.clearInterval(pollTimer);
     pollTimer = null;
   }
+}
+
+/** Disconnect: the probe stops and the desktop is neither there nor not there again, until someone asks. */
+export function resetDesktopDetection(): void {
+  generation++;
+  stopDesktopDetection();
+  publish({ checked: false, available: false, baseUrl: getEngineBase(), lastChange: current.available ? Date.now() : current.lastChange });
 }
 
 /** Snapshot of the current companion status. */
@@ -193,9 +240,11 @@ export async function refreshDesktopStatus(): Promise<DesktopInfo> {
 }
 
 // Re-probe immediately when the endpoint changes, rather than making the user
-// wait out the 10s poll after typing a new address.
+// wait out the 10s poll after typing a new address. Not when the change leaves a
+// tab with no link (Reset to the default address, with nothing kept from Connect):
+// that tab looks at nothing (see lib/desktopConnect.ts).
 subscribeEngineBase(() => {
-  void probeOnce();
+  if (mayLookOnLoad()) void probeOnce();
 });
 
 /** Internal: lets tests/dev tools await an in-flight probe. */

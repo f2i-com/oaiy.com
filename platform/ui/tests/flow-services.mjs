@@ -81,7 +81,7 @@ const bundlePath = path.join(os.tmpdir(), `oaiy-flow-services-${process.pid}.mjs
 await esbuild.build({
   stdin: {
     contents: `export { mapToCustomService, mapEngineService, combineDesktopServices } from './src/lib/desktopServices.ts';
-export { paletteShowsNode, nodeNotice, initialServiceFor, nodeTypeForService, isListed } from './src/lib/nodeAvailability.ts';
+export { paletteShowsNode, nodeNotice, initialServiceFor, nodeTypeForService, isListed, DESKTOP_NODE_FEATURE } from './src/lib/nodeAvailability.ts';
 export { serviceOptions } from './src/lib/serviceOptions.ts';
 export { resolveService, renderContractBody, nodeContract } from './src/bundled-modules/core-service/contract.ts';
 export { runContract, contractTiming } from './src/bundled-modules/core-service/contractRuntime.ts';
@@ -196,6 +196,46 @@ await check('a saved flow using a model or service that is not there says what i
   assert.equal(M.nodeNotice('music_gen', { service: 'engine:music:gone' }, env({ loaded: false })), null, 'nothing claimed before the desktop answers');
   assert.match(M.nodeNotice('model_3d', {}, env({ inOaiy: false })), /OAIY app/);
   assert.equal(M.nodeNotice('image_save', { service: 'x' }, env()), null);
+});
+
+// The nodes that need OAIY Desktop behind the editor follow what the editor can do here (lib/caps.ts, shared/capabilities).
+const DESKTOP_NODES = { browser_session: 'browserNodes', browser_page: 'browserNodes', browser_extract: 'browserNodes', browser_action: 'browserNodes', ask_agent: 'askAgent', input_folder: 'inputFolder' };
+const FEATURES_ON = { browserNodes: true, askAgent: true, inputFolder: true };
+
+await check('the nodes that need OAIY Desktop are the browser nodes, Ask the Agent and Folder input: a plain HTTP request is not one of them', () => {
+  assert.deepEqual(M.DESKTOP_NODE_FEATURE, DESKTOP_NODES);
+  assert.equal('browser_request' in M.DESKTOP_NODE_FEATURE, false);
+});
+
+await check('they are offered where their features are on, and left out of the palette where they are off, each by its own feature', () => {
+  // An env that says nothing about features (as before the editor knew where it was) offers all of them, in OAIY and outside it.
+  for (const type of Object.keys(DESKTOP_NODES)) {
+    assert.equal(M.paletteShowsNode(type, env()), true, `${type}: no features given, in OAIY`);
+    assert.equal(M.paletteShowsNode(type, env({ inOaiy: false })), true, `${type}: no features given, outside OAIY`);
+    assert.equal(M.paletteShowsNode(type, env({ features: FEATURES_ON })), true, `${type}: on`);
+  }
+  for (const feature of ['browserNodes', 'askAgent', 'inputFolder']) {
+    const off = env({ inOaiy: false, features: { ...FEATURES_ON, [feature]: false } });
+    for (const [type, needs] of Object.entries(DESKTOP_NODES)) assert.equal(M.paletteShowsNode(type, off), needs !== feature, `${type} with ${feature} off`);
+  }
+  // Everything else is untouched by the features being off: the plain nodes, the service nodes by their own rules, and a plain request.
+  const none = env({ inOaiy: false, features: { browserNodes: false, askAgent: false, inputFolder: false } });
+  for (const type of ['browser_request', 'input_text', 'input_file', 'image_view', 'service_call']) assert.equal(M.paletteShowsNode(type, none), true, type);
+  assert.equal(M.paletteShowsNode('music_gen', env({ features: { browserNodes: false } })), true, 'a service node keeps its own rule in OAIY');
+  // In OAIY's window the features are on and every one of them is offered, as it was.
+  for (const type of Object.keys(DESKTOP_NODES)) assert.equal(M.paletteShowsNode(type, env({ inOaiy: true, features: FEATURES_ON })), true, type);
+});
+
+await check('a flow that has one of them where its feature is off says what it needs and how to get it, and where it is on says nothing', () => {
+  const off = env({ inOaiy: false, features: { browserNodes: false, askAgent: false, inputFolder: false } });
+  assert.match(M.nodeNotice('browser_page', {}, off), /^Browser nodes need OAIY Desktop or an OAIY server: they drive a browser that it runs\. Connect it in Settings → Services, or use another node\.$/);
+  assert.match(M.nodeNotice('ask_agent', {}, off), /^Ask the Agent needs OAIY Desktop or an OAIY server/);
+  assert.match(M.nodeNotice('input_folder', {}, off), /^A folder input needs OAIY Desktop or an OAIY server/);
+  for (const type of Object.keys(DESKTOP_NODES)) {
+    assert.equal(M.nodeNotice(type, {}, env({ features: FEATURES_ON })), null, `${type}: on`);
+    assert.equal(M.nodeNotice(type, {}, env({ inOaiy: false })), null, `${type}: no features given`);
+  }
+  assert.equal(M.nodeNotice('browser_request', {}, off), null);
 });
 
 await check('the Service dropdown is grouped: OAIY engine, your services, custom, then "Add a service…"', () => {
