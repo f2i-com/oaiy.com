@@ -2,7 +2,9 @@
 //! function has given back, after it returns?
 //!
 //! The containers of this crate wipe themselves, the heap is covered by `zeroize.rs` and `zeroize_text.rs`, and this file looks at the one place they cannot reach. Two
-//! things are counted, for every primitive that takes or makes a key:
+//! things are counted, for every primitive that takes or makes a key, **and for the functions that read or write the text of one** (the phrase and the code: `bip39::decode` and
+//! `encode`, `RecoveryKit::decode` and `encode`, `phrase_wrap_key`; third review, L-1: they left one to three copies of the entropy and the key in the dead stack until they scrubbed),
+//! with a third needle where there is an intermediate (the Argon2 output under a phrase's wrap key, which `argon2id13_into` and `wrap_key_into` no longer leave: L-2):
 //!
 //! - **the input**: the master key, the seed, the password, the wrapping key. After `kdf::derive` returned, the reviewer found four copies of the 32-byte master key below
 //!   the caller (the BLAKE2b state copies the key into a block when it is built and is moved into `finalize`, which copies it again; dropping wipes one place, and the moves
@@ -184,15 +186,30 @@ fn run_and_scan_made(mut f: impl FnMut() -> Vec<u8>) -> usize {
 }
 struct Row {
     name: &'static str,
+    /// The first needle: the input (the key, the password, the text that was read), which must leave **none** (Ed25519 `from_seed` is the one exception, below).
     input: usize,
+    /// The second needle: what the function returned or wrote (the derived key, the entropy that was decoded, the text that was made).
     output: usize,
+    /// The third needle, if the row has one: an intermediate of the function (the Argon2 output that the wrap key is derived from), which must leave **none**.
+    extra: usize,
+}
+
+/// Runs `f` at every depth, counts the needles, prints the row and adds it to the table.
+fn measure(table: &mut Vec<Row>, configuration: &str, name: &'static str, needles: &[&[u8]], f: &mut dyn FnMut()) {
+    let counts = run_and_scan(needles, f);
+    let extra = counts.get(2).copied().unwrap_or(0);
+    table.push(Row { name, input: counts[0], output: counts[1], extra });
+    println!("ZEROIZE_STACK {configuration}: {name}: input={} output={} extra={extra}", counts[0], counts[1]);
 }
 
 #[test]
 fn no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key() {
     let configuration = if cfg!(debug_assertions) { "assertions on" } else { "assertions off" };
+    // Every needle is a run of bytes with no period: a needle that repeats (sixteen bytes of 0x5a) is found at overlapping places in one run of the same byte, which counts one copy as several
+    // and, the other way, hides how many there are (third review: the probe's own entropy was periodic).
     let master_bytes: [u8; 32] = std::array::from_fn(|i| 0xC0 + i as u8);
     let inner_bytes: [u8; 32] = std::array::from_fn(|i| 0x10 + i as u8);
+    let entropy_bytes: [u8; 16] = std::array::from_fn(|i| 0x31 + 7 * i as u8);
     // built outside the closures, so that only the library's own copies are counted
     let master = Secret::<32>::new(master_bytes);
     let seed = Secret::<32>::new(master_bytes);
@@ -203,9 +220,16 @@ fn no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_
     let aad = Aad::new(AadDomain::VaultWrap, &["u", "w", "recovery-phrase", "x"]).unwrap();
     let wrapped = aead::wrap_key(&master, &aad, &Secret::new(inner_bytes)).unwrap();
     let context = Context::new("flbkrcp1").unwrap();
-    let entropy = Entropy::from_bytes([0x5a; 16]);
+    let entropy = Entropy::from_bytes(entropy_bytes);
     let salt = [3u8; 16];
     let kit = RecoveryKit::from_bytes(Secret::new(master_bytes));
+    // the texts that the decoders read: held here, outside, as a caller holds them
+    let phrase = bip39::encode(&entropy);
+    let phrase_text = phrase.expose();
+    let phrase_bytes = phrase_text.as_bytes().to_vec();
+    let code = kit.encode();
+    let code_text = code.expose();
+    let code_bytes = code_text.as_bytes().to_vec();
 
     // the derived values, computed once, so that they can be searched for
     let d_backup = *kdf::derive(&master, Purpose::BackupRecipient).unwrap().expose();
@@ -213,6 +237,7 @@ fn no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_
     let d_kit = *kit.wrap_key().unwrap().expose();
     let d_dh = *x_secret.diffie_hellman(&x_peer).unwrap().expose();
     let d_ikm = *argon::argon2id13(entropy.expose(), &salt, 3, argon::MEM_MIN).unwrap().expose();
+    let d_ikm_of_master = *argon::argon2id13(&master_bytes, &salt, 3, argon::MEM_MIN).unwrap().expose();
     let d_phrase = *bip39::wrap_key(&entropy, &salt, 3, argon::MEM_MIN).unwrap().expose();
 
     let mut table: Vec<Row> = Vec::new();
@@ -241,148 +266,94 @@ fn no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_
     let floor_bare = run_and_scan(&[&master_bytes], || drop(deep(|| bare_return(&master_bytes))))[0];
     let controls = (positive, positive_small, positive_shaped, floor, floor_bare);
     {
-        let mut row = |name: &'static str, input: &[u8], output: &[u8], mut f: Box<dyn FnMut() + '_>| {
-            let counts = run_and_scan(&[input, output], &mut f);
-            table.push(Row { name, input: counts[0], output: counts[1] });
-            println!("ZEROIZE_STACK {configuration}: {name}: input={} output={}", counts[0], counts[1]);
-        };
+        let t = &mut table;
+        let c = configuration;
 
         // the keys that come back: by value, and in place
-        row("kdf::derive", &master_bytes, &d_backup, Box::new(|| drop(deep(|| kdf::derive(&master, Purpose::BackupRecipient)).unwrap())));
-        row(
-            "kdf::derive_into",
-            &master_bytes,
-            &d_backup,
-            Box::new(|| {
-                let mut out = Secret::zeroed();
-                deep(|| kdf::derive_into(&master, Purpose::BackupRecipient, &mut out)).unwrap();
-            }),
-        );
-        row(
-            "kdf::hkdf_sha256_secret",
-            &master_bytes,
-            &d_hkdf,
-            Box::new(|| drop(deep(|| kdf::hkdf_sha256_secret::<32>(master.expose(), Some(b"salt"), b"info")).unwrap())),
-        );
-        row(
-            "kdf::hkdf_sha256_secret_into",
-            &master_bytes,
-            &d_hkdf,
-            Box::new(|| {
-                let mut out = Secret::<32>::zeroed();
-                deep(|| kdf::hkdf_sha256_secret_into(master.expose(), Some(b"salt"), b"info", &mut out)).unwrap();
-            }),
-        );
-        row("kit.wrap_key", &master_bytes, &d_kit, Box::new(|| drop(deep(|| kit.wrap_key()).unwrap())));
-        row(
-            "kit.wrap_key_into",
-            &master_bytes,
-            &d_kit,
-            Box::new(|| {
-                let mut out = Secret::zeroed();
-                deep(|| kit.wrap_key_into(&mut out)).unwrap();
-            }),
-        );
-        row("x25519 diffie_hellman", &master_bytes, &d_dh, Box::new(|| drop(deep(|| x_secret.diffie_hellman(&x_peer)).unwrap())));
-        row(
-            "x25519 diffie_hellman_into",
-            &master_bytes,
-            &d_dh,
-            Box::new(|| {
-                let mut out = Secret::zeroed();
-                deep(|| x_secret.diffie_hellman_into(&x_peer, &mut out)).unwrap();
-            }),
-        );
-        row("aead::unwrap_key", &master_bytes, &inner_bytes, Box::new(|| drop(deep(|| aead::unwrap_key(&master, &aad, &wrapped)).unwrap())));
-        row(
-            "aead::unwrap_key_into",
-            &master_bytes,
-            &inner_bytes,
-            Box::new(|| {
-                let mut out = Secret::zeroed();
-                deep(|| aead::unwrap_key_into(&master, &aad, &wrapped, &mut out)).unwrap();
-            }),
-        );
-        row("bip39::wrap_key", &[0x5a; 16], &d_phrase, Box::new(|| drop(deep(|| bip39::wrap_key(&entropy, &salt, 3, argon::MEM_MIN)).unwrap())));
-        row(
-            "bip39::wrap_key_into",
-            &[0x5a; 16],
-            &d_phrase,
-            Box::new(|| {
-                let mut out = Secret::zeroed();
-                deep(|| bip39::wrap_key_into(&entropy, &salt, 3, argon::MEM_MIN, &mut out)).unwrap();
-            }),
-        );
-        row(
-            "argon2id13 (the key as the password)",
-            &master_bytes,
-            &d_ikm,
-            Box::new(|| drop(deep(|| argon::argon2id13(&master_bytes, &salt, 3, argon::MEM_MIN)).unwrap())),
-        );
+        measure(t, c, "kdf::derive", &[&master_bytes, &d_backup], &mut || drop(deep(|| kdf::derive(&master, Purpose::BackupRecipient)).unwrap()));
+        measure(t, c, "kdf::derive_into", &[&master_bytes, &d_backup], &mut || {
+            let mut out = Secret::zeroed();
+            deep(|| kdf::derive_into(&master, Purpose::BackupRecipient, &mut out)).unwrap();
+        });
+        measure(t, c, "kdf::hkdf_sha256_secret", &[&master_bytes, &d_hkdf], &mut || {
+            drop(deep(|| kdf::hkdf_sha256_secret::<32>(master.expose(), Some(b"salt"), b"info")).unwrap())
+        });
+        measure(t, c, "kdf::hkdf_sha256_secret_into", &[&master_bytes, &d_hkdf], &mut || {
+            let mut out = Secret::<32>::zeroed();
+            deep(|| kdf::hkdf_sha256_secret_into(master.expose(), Some(b"salt"), b"info", &mut out)).unwrap();
+        });
+        measure(t, c, "kit.wrap_key", &[&master_bytes, &d_kit], &mut || drop(deep(|| kit.wrap_key()).unwrap()));
+        measure(t, c, "kit.wrap_key_into", &[&master_bytes, &d_kit], &mut || {
+            let mut out = Secret::zeroed();
+            deep(|| kit.wrap_key_into(&mut out)).unwrap();
+        });
+        measure(t, c, "x25519 diffie_hellman", &[&master_bytes, &d_dh], &mut || drop(deep(|| x_secret.diffie_hellman(&x_peer)).unwrap()));
+        measure(t, c, "x25519 diffie_hellman_into", &[&master_bytes, &d_dh], &mut || {
+            let mut out = Secret::zeroed();
+            deep(|| x_secret.diffie_hellman_into(&x_peer, &mut out)).unwrap();
+        });
+        measure(t, c, "aead::unwrap_key", &[&master_bytes, &inner_bytes], &mut || drop(deep(|| aead::unwrap_key(&master, &aad, &wrapped)).unwrap()));
+        measure(t, c, "aead::unwrap_key_into", &[&master_bytes, &inner_bytes], &mut || {
+            let mut out = Secret::zeroed();
+            deep(|| aead::unwrap_key_into(&master, &aad, &wrapped, &mut out)).unwrap();
+        });
+        // the wrap key of a phrase: the entropy goes in, the Argon2 output is the intermediate (the third needle), the wrap key comes out
+        measure(t, c, "bip39::wrap_key", &[&entropy_bytes, &d_phrase, &d_ikm], &mut || {
+            drop(deep(|| bip39::wrap_key(&entropy, &salt, 3, argon::MEM_MIN)).unwrap())
+        });
+        measure(t, c, "bip39::wrap_key_into", &[&entropy_bytes, &d_phrase, &d_ikm], &mut || {
+            let mut out = Secret::zeroed();
+            deep(|| bip39::wrap_key_into(&entropy, &salt, 3, argon::MEM_MIN, &mut out)).unwrap();
+        });
+        measure(t, c, "argon2id13 (the key as the password)", &[&master_bytes, &d_ikm_of_master], &mut || {
+            drop(deep(|| argon::argon2id13(&master_bytes, &salt, 3, argon::MEM_MIN)).unwrap())
+        });
+        measure(t, c, "argon2id13_into (the key as the password)", &[&master_bytes, &d_ikm_of_master], &mut || {
+            let mut out = Secret::zeroed();
+            deep(|| argon::argon2id13_into(&master_bytes, &salt, 3, argon::MEM_MIN, &mut out)).unwrap();
+        });
+
+        // the texts: what is read and what is made (third review, L-1). The decoders return the entropy by value; the text goes in, and none of it may stay.
+        measure(t, c, "bip39::decode", &[&phrase_bytes, &entropy_bytes], &mut || drop(deep(|| bip39::decode(phrase_text)).unwrap()));
+        measure(t, c, "bip39::encode", &[&entropy_bytes, &phrase_bytes], &mut || drop(deep(|| bip39::encode(&entropy))));
+        measure(t, c, "RecoveryKit::decode", &[&code_bytes, &master_bytes], &mut || drop(deep(|| RecoveryKit::decode(code_text)).unwrap()));
+        measure(t, c, "RecoveryKit::encode", &[&master_bytes, &code_bytes], &mut || drop(deep(|| kit.encode())));
+        measure(t, c, "bip39::phrase_wrap_key", &[&entropy_bytes, &d_phrase, &d_ikm], &mut || {
+            drop(deep(|| bip39::phrase_wrap_key(phrase_text, &salt, 3, argon::MEM_MIN)).unwrap())
+        });
+        measure(t, c, "bip39::phrase_wrap_key_into", &[&entropy_bytes, &d_phrase, &d_ikm], &mut || {
+            let mut out = Secret::zeroed();
+            deep(|| bip39::phrase_wrap_key_into(phrase_text, &salt, 3, argon::MEM_MIN, &mut out)).unwrap();
+        });
 
         // the keys that go in, and nothing comes back that is a key
-        row(
-            "kdf::derive_subkey_into (64 bytes)",
-            &master_bytes,
-            &[0xA5; 32], // the output is the caller's own array: not counted
-            Box::new(|| {
-                let mut out = [0u8; 64];
-                deep(|| kdf::derive_subkey_into(&master, 1, &context, &mut out)).unwrap();
-            }),
-        );
-        row(
-            "kdf::hkdf_sha256",
-            &master_bytes,
-            &[0xA5; 32], // the output is the caller's own array: not counted
-            Box::new(|| {
-                let mut out = [0u8; 64];
-                deep(|| kdf::hkdf_sha256(master.expose(), Some(b"salt"), b"info", &mut out)).unwrap();
-            }),
-        );
-        row(
-            "kdf::hmac_sha256",
-            &master_bytes,
-            &master_bytes,
-            Box::new(|| {
-                let _ = deep(|| kdf::hmac_sha256(master.expose(), b"msg")).unwrap();
-            }),
-        );
-        row(
-            "kdf::hmac_sha256_verify",
-            &master_bytes,
-            &master_bytes,
-            Box::new(|| {
-                let _ = std::hint::black_box(deep(|| kdf::hmac_sha256_verify(master.expose(), b"msg", &[0u8; 32])));
-            }),
-        );
-        row(
-            "ed25519 from_seed",
-            &master_bytes,
-            &master_bytes,
-            Box::new(|| {
-                let key = deep(|| SigningKey::from_seed(KeyRole::Hazmat, &seed));
-                std::hint::black_box(&key);
-            }),
-        );
-        row(
-            "ed25519 from_seed + sign",
-            &master_bytes,
-            &master_bytes,
-            Box::new(|| {
-                let key = deep(|| SigningKey::from_seed(KeyRole::Hazmat, &seed));
-                let _ = deep(|| key.sign_raw(b"message")).unwrap();
-            }),
-        );
-        row(
-            "aead wrap + unwrap",
-            &master_bytes,
-            &master_bytes,
-            Box::new(|| {
-                let w = deep(|| aead::wrap(&master, &aad, b"a payload")).unwrap();
-                let _ = deep(|| aead::unwrap(&master, &aad, &w)).unwrap();
-            }),
-        );
-        row("sealbox open", &master_bytes, &master_bytes, Box::new(|| drop(deep(|| sealbox::open(&box_key, &box_bytes)).unwrap())));
+        measure(t, c, "kdf::derive_subkey_into (64 bytes)", &[&master_bytes, &[0xA5; 32]], &mut || {
+            let mut out = [0u8; 64];
+            deep(|| kdf::derive_subkey_into(&master, 1, &context, &mut out)).unwrap();
+        });
+        measure(t, c, "kdf::hkdf_sha256", &[&master_bytes, &[0xA5; 32]], &mut || {
+            let mut out = [0u8; 64];
+            deep(|| kdf::hkdf_sha256(master.expose(), Some(b"salt"), b"info", &mut out)).unwrap();
+        });
+        measure(t, c, "kdf::hmac_sha256", &[&master_bytes, &master_bytes], &mut || {
+            let _ = deep(|| kdf::hmac_sha256(master.expose(), b"msg")).unwrap();
+        });
+        measure(t, c, "kdf::hmac_sha256_verify", &[&master_bytes, &master_bytes], &mut || {
+            let _ = std::hint::black_box(deep(|| kdf::hmac_sha256_verify(master.expose(), b"msg", &[0u8; 32])));
+        });
+        measure(t, c, "ed25519 from_seed", &[&master_bytes, &master_bytes], &mut || {
+            let key = deep(|| SigningKey::from_seed(KeyRole::Hazmat, &seed));
+            std::hint::black_box(&key);
+        });
+        measure(t, c, "ed25519 from_seed + sign", &[&master_bytes, &master_bytes], &mut || {
+            let key = deep(|| SigningKey::from_seed(KeyRole::Hazmat, &seed));
+            let _ = deep(|| key.sign_raw(b"message")).unwrap();
+        });
+        measure(t, c, "aead wrap + unwrap", &[&master_bytes, &master_bytes], &mut || {
+            let w = deep(|| aead::wrap(&master, &aad, b"a payload")).unwrap();
+            let _ = deep(|| aead::unwrap(&master, &aad, &w)).unwrap();
+        });
+        measure(t, c, "sealbox open", &[&master_bytes, &master_bytes], &mut || drop(deep(|| sealbox::open(&box_key, &box_bytes)).unwrap()));
     }
     // the keys that are made at random: by value, so held to the floor like the rest
     let mut made: Vec<(&str, usize)> = Vec::new();
@@ -398,14 +369,12 @@ fn no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_
         one("bip39 Entropy::random", &mut || deep(Entropy::random).unwrap().expose().to_vec());
         one("RecoveryKit::generate", &mut || deep(RecoveryKit::generate).unwrap().key().expose().to_vec());
     }
-    println!(
-        "ZEROIZE_STACK {configuration}: controls (large frame, small frame, small frame then the caller's own calls, by-value floor with a Result, by-value floor) {controls:?}"
-    );
+    println!("ZEROIZE_STACK {configuration}: controls (large frame, small frame, small frame then the caller's own calls, by-value floor with a Result, by-value floor) {controls:?}");
 
     // what is asserted
     let mut failures: Vec<String> = Vec::new();
     for row in &table {
-        let is_into = row.name.ends_with("_into");
+        let is_into = row.name.contains("_into");
         // the input: never, except that Ed25519 `from_seed` **returns** a key that is the seed (the dalek key holds it), by value, so that one copy is the price of a by-value
         // return: with no optimisation it is the harness's own (the move of the result out of `deep`, which `bare_return` leaves too: `floor_bare` is 1 there), and in an optimised
         // build, where the harness leaves none (`floor_bare` is 0), it is the one that the frame of `from_seed` keeps when it moves the key out. At most one in every
@@ -413,11 +382,17 @@ fn no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_
         // (review low 1).
         let input_allowed = if row.name.starts_with("ed25519 from_seed") { floor_bare.max(1) } else { 0 };
         if row.input > input_allowed {
-            failures.push(format!("{}: {} copies of the input key", row.name, row.input));
+            failures.push(format!("{}: {} copies of the input", row.name, row.input));
         }
-        // the output: none from an `_into`; from a by-value function no more than one above the floor of a function with no cryptography in it
-        if is_into && row.output > 0 {
-            failures.push(format!("{}: {} copies of the derived key", row.name, row.output));
+        // an intermediate (the Argon2 output under a phrase's wrap key): never
+        if row.extra > 0 {
+            failures.push(format!("{}: {} copies of an intermediate key", row.name, row.extra));
+        }
+        // the output: none from an `_into`, and none of a text that was made (the phrase, the code: they are heap strings, and a copy of the text on the stack is a copy that nothing wipes);
+        // from a by-value function no more than one above the floor of a function with no cryptography in it
+        let text_made = matches!(row.name, "bip39::encode" | "RecoveryKit::encode");
+        if (is_into || text_made) && row.output > 0 {
+            failures.push(format!("{}: {} copies of what it made", row.name, row.output));
         }
         let by_value_derived = matches!(
             row.name,
@@ -427,10 +402,13 @@ fn no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_
                 | "x25519 diffie_hellman"
                 | "aead::unwrap_key"
                 | "bip39::wrap_key"
+                | "bip39::phrase_wrap_key"
+                | "bip39::decode"
+                | "RecoveryKit::decode"
                 | "argon2id13 (the key as the password)"
         );
         if by_value_derived && row.output > floor + 1 {
-            failures.push(format!("{}: {} copies of the derived key, more than one above the floor of {floor}", row.name, row.output));
+            failures.push(format!("{}: {} copies of what it returned, more than one above the floor of {floor}", row.name, row.output));
         }
     }
     // the keys made at random come back by value, so they are held to the floor as well, with room for the copy that `from_seed` keeps in an optimised build: measured, none to two

@@ -86,8 +86,16 @@ impl PartialEq for Entropy {
 
 impl Eq for Entropy {}
 
-/// The twelve words of `entropy`, separated by single spaces.
+/// The twelve words of `entropy`, separated by single spaces. The stack below the caller is overwritten when it returns (third review, L-1): the entropy passed through the frames of
+/// the hash and of the packing of the bits, and a copy of it was left in the dead stack (two, in an optimised build).
 pub fn encode(entropy: &Entropy) -> SecretString {
+    let text = encode_unscrubbed(entropy);
+    scrub_stack();
+    text
+}
+
+#[inline(never)]
+fn encode_unscrubbed(entropy: &Entropy) -> SecretString {
     let list = wordlist();
     let mut bits = [0u8; 19];
     bits[..16].copy_from_slice(entropy.expose());
@@ -109,8 +117,17 @@ pub fn encode(entropy: &Entropy) -> SecretString {
     SecretString::new(text)
 }
 
-/// Reads a phrase: `Error::PhraseLength`, `PhraseWord` or `PhraseChecksum`, in that order of precedence, or the entropy.
+/// Reads a phrase: `Error::PhraseLength`, `PhraseWord` or `PhraseChecksum`, in that order of precedence, or the entropy. The stack below the caller is overwritten when it returns
+/// (third review, L-1): the 11-bit words were packed into the entropy in the frames below this one, and three copies of it were left in the dead stack in an optimised build. The
+/// entropy itself comes back by value, which leaves what any by-value return leaves (see `kdf::derive`).
 pub fn decode(input: &str) -> Result<Entropy, Error> {
+    let result = decode_unscrubbed(input);
+    scrub_stack();
+    result
+}
+
+#[inline(never)]
+fn decode_unscrubbed(input: &str) -> Result<Entropy, Error> {
     if input.len() > MAX_INPUT_BYTES {
         return Err(Error::PhraseLength);
     }
@@ -156,28 +173,41 @@ pub fn decode(input: &str) -> Result<Entropy, Error> {
 }
 
 /// `wk = kdf(1, "flphras1", argon2id13(entropy16, salt16, ops, mem))`, the key that wraps the UMK (design 4.3). Argon2's bounds are
-/// checked before it runs (`KdfParamsOutOfRange`), and it takes the entropy, which exists only after the checksum was verified.
+/// checked before it runs (`KdfParamsOutOfRange`), and it takes the entropy, which exists only after the checksum was verified. **Neither Argon2's output nor the wrap key is left in the
+/// dead stack** (third review, L-2: the by-value `argon2id13` left the Argon2 output, the key material of `kdf::derive`, in the frame that made it): Argon2 writes into a local `Secret`
+/// that is wiped when this function returns, and the wrap key into `out`.
 pub fn wrap_key_into(entropy: &Entropy, salt: &[u8], ops: u64, mem_bytes: u64, out: &mut Secret<32>) -> Result<(), Error> {
-    let ikm = argon::argon2id13(entropy.expose(), salt, ops, mem_bytes)?;
+    let mut ikm = Secret::<32>::zeroed();
+    argon::argon2id13_into(entropy.expose(), salt, ops, mem_bytes, &mut ikm)?;
     kdf::derive_into(&ikm, Purpose::PhraseWrap, out)
 }
 
 /// [`wrap_key_into`] by value (which leaves a copy of the wrap key in the frame that made it: see `kdf::derive`).
 pub fn wrap_key(entropy: &Entropy, salt: &[u8], ops: u64, mem_bytes: u64) -> Result<Secret<32>, Error> {
-    let ikm = argon::argon2id13(entropy.expose(), salt, ops, mem_bytes)?;
-    kdf::derive(&ikm, Purpose::PhraseWrap)
+    let mut out = Secret::<32>::zeroed();
+    wrap_key_into(entropy, salt, ops, mem_bytes, &mut out)?;
+    Ok(out)
 }
 
-/// The words to the wrap key, written into `out` in place: [`decode`] (the checksum, before any KDF work), then [`wrap_key_into`].
+/// The words to the wrap key, written into `out` in place: [`decode`] (the checksum, before any KDF work), then [`wrap_key_into`]. The stack below the caller is overwritten when it
+/// returns (third review, L-1: the entropy that `decode` returned was left in this frame).
 pub fn phrase_wrap_key_into(phrase: &str, salt: &[u8], ops: u64, mem_bytes: u64, out: &mut Secret<32>) -> Result<(), Error> {
+    let result = phrase_wrap_key_unscrubbed(phrase, salt, ops, mem_bytes, out);
+    scrub_stack();
+    result
+}
+
+#[inline(never)]
+fn phrase_wrap_key_unscrubbed(phrase: &str, salt: &[u8], ops: u64, mem_bytes: u64, out: &mut Secret<32>) -> Result<(), Error> {
     let entropy = decode(phrase)?;
     wrap_key_into(&entropy, salt, ops, mem_bytes, out)
 }
 
 /// The words to the wrap key: [`decode`] (the checksum, before any KDF work), then [`wrap_key`].
 pub fn phrase_wrap_key(phrase: &str, salt: &[u8], ops: u64, mem_bytes: u64) -> Result<Secret<32>, Error> {
-    let entropy = decode(phrase)?;
-    wrap_key(&entropy, salt, ops, mem_bytes)
+    let mut out = Secret::<32>::zeroed();
+    phrase_wrap_key_into(phrase, salt, ops, mem_bytes, &mut out)?;
+    Ok(out)
 }
 
 #[cfg(test)]

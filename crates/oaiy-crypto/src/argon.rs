@@ -14,7 +14,7 @@ use argon2::{Algorithm, Argon2, Block, Params as ArgonParams, Version};
 use zeroize::Zeroize;
 
 use crate::error::Error;
-use crate::zeroize::Secret;
+use crate::zeroize::{scrub_stack, Secret};
 
 /// The fewest passes.
 pub const OPS_MIN: u64 = 3;
@@ -63,18 +63,36 @@ impl Params {
 /// Argon2id v1.3 of `password` with a 16-byte `salt`. Every parameter is checked first: a salt that is not 16 bytes is
 /// `KdfParamsOutOfRange` as well, and nothing is allocated for a refusal.
 pub fn argon2id13(password: &[u8], salt: &[u8], ops: u64, mem_bytes: u64) -> Result<Secret<32>, Error> {
+    let mut out = Secret::<32>::zeroed();
+    argon2id13_into(password, salt, ops, mem_bytes, &mut out)?;
+    Ok(out)
+}
+
+/// [`argon2id13`], written into `out` in place (third review, L-2): the output is the key material of whatever is derived from it, and the by-value function leaves a copy of it in the
+/// frame that made it. The stack below the caller is overwritten when this returns, so no copy of the output is left below it either.
+pub fn argon2id13_into(password: &[u8], salt: &[u8], ops: u64, mem_bytes: u64, out: &mut Secret<32>) -> Result<(), Error> {
     let params = Params::new(ops, mem_bytes)?;
     let salt: &[u8; SALT_LEN] = salt.try_into().map_err(|_| Error::KdfParamsOutOfRange)?;
-    derive(password, salt, params)
+    let result = derive_into(password, salt, params, out);
+    scrub_stack();
+    result
 }
 
 /// The same, with parameters already checked.
 pub fn derive(password: &[u8], salt: &[u8; SALT_LEN], params: Params) -> Result<Secret<32>, Error> {
+    let mut out = Secret::<32>::zeroed();
+    derive_into(password, salt, params, &mut out)?;
+    Ok(out)
+}
+
+/// [`derive`], written into `out`. On an error `out` is not written.
+#[inline(never)]
+fn derive_into(password: &[u8], salt: &[u8; SALT_LEN], params: Params, out: &mut Secret<32>) -> Result<(), Error> {
     let count = params.mem_kib as usize;
     let mut storage: Vec<Block> = Vec::new();
     storage.try_reserve_exact(count).map_err(|_| Error::Memory)?;
     storage.resize(count, Block::default());
-    let result = derive_in(password, salt, params.ops, params.mem_kib, &mut storage);
+    let result = derive_in(password, salt, params.ops, params.mem_kib, &mut storage, out);
     storage.zeroize();
     result
 }
@@ -95,18 +113,14 @@ fn wipe(blocks: &mut [Block]) {
 }
 
 /// Runs Argon2id in `storage` (which must hold `mem_kib` blocks) and wipes it. No bounds are checked here.
-fn derive_in(password: &[u8], salt: &[u8; SALT_LEN], ops: u32, mem_kib: u32, storage: &mut [Block]) -> Result<Secret<32>, Error> {
+fn derive_in(password: &[u8], salt: &[u8; SALT_LEN], ops: u32, mem_kib: u32, storage: &mut [Block], out: &mut Secret<32>) -> Result<(), Error> {
     #[cfg(test)]
     CALLS.with(|calls| calls.set(calls.get() + 1));
     let guard = WipeOnDrop(storage);
     let params = ArgonParams::new(mem_kib, ops, 1, Some(OUTPUT_LEN)).map_err(|_| Error::KdfParamsOutOfRange)?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut out = [0u8; OUTPUT_LEN];
-    let hashed = argon.hash_password_into_with_memory(password, salt, &mut out, &mut *guard.0);
-    let secret = Secret::new(out);
-    out.zeroize();
-    hashed.map_err(|_| Error::InvalidLength("password"))?;
-    Ok(secret)
+    // written where it lives: no plain array of the output is made here, and nothing is copied
+    argon.hash_password_into_with_memory(password, salt, out.expose_mut(), &mut *guard.0).map_err(|_| Error::InvalidLength("password"))
 }
 
 #[cfg(test)]
@@ -138,7 +152,8 @@ mod tests {
         let salt: &[u8; 16] = salt.try_into().unwrap();
         let count = (mem_bytes / 1024) as usize;
         let mut storage = vec![Block::default(); count];
-        let out = derive_in(password, salt, ops, mem_bytes / 1024, &mut storage).unwrap();
+        let mut out = Secret::<32>::zeroed();
+        derive_in(password, salt, ops, mem_bytes / 1024, &mut storage, &mut out).unwrap();
         out.expose().to_vec()
     }
 
@@ -200,8 +215,9 @@ mod tests {
     #[test]
     fn derive_in_leaves_the_storage_zeroed() {
         let mut storage = vec![Block::default(); 256];
-        let out = derive_in(b"pw", &[1u8; 16], 3, 256, &mut storage).unwrap();
-        assert_eq!(out.expose().len(), 32);
+        let mut out = Secret::<32>::zeroed();
+        derive_in(b"pw", &[1u8; 16], 3, 256, &mut storage, &mut out).unwrap();
+        assert_ne!(out.expose(), &[0u8; 32], "the output was written");
         assert!(storage.iter().all(is_zero));
     }
 

@@ -72,8 +72,16 @@ impl RecoveryKit {
         &self.0
     }
 
-    /// The code as printed: `FLRK1-XXXX-...-XXXX` (14 groups after the prefix).
+    /// The code as printed: `FLRK1-XXXX-...-XXXX` (14 groups after the prefix). The stack below the caller is overwritten when it returns (the key passed through the frames of the
+    /// Base32 and of the checksum, and one copy was left in the dead stack in an optimised build: third review, L-1).
     pub fn encode(&self) -> SecretString {
+        let text = self.encode_unscrubbed();
+        scrub_stack();
+        text
+    }
+
+    #[inline(never)]
+    fn encode_unscrubbed(&self) -> SecretString {
         let body = Zeroizing::new(base32_encode(self.0.expose()));
         // 5 + 14 x 5 characters; reserved up front so that the text never moves to a bigger block and leaves the old one unwiped (review M-4)
         let mut text = String::with_capacity(96);
@@ -89,7 +97,17 @@ impl RecoveryKit {
 
     /// Reads a code. `Error::KitFormat` for a wrong prefix, length, character or trailing bit; `Error::KitChecksum` when the
     /// checksum does not match the key (typing errors show here, before any derivation).
+    ///
+    /// The stack below the caller is overwritten when it returns (third review, L-1): the Base32 was unpacked into the key in the frames below this one, and two copies of the key
+    /// were left in the dead stack in an optimised build. The kit itself comes back by value, which leaves what any by-value return leaves (see `kdf::derive`).
     pub fn decode(display: &str) -> Result<RecoveryKit, Error> {
+        let result = RecoveryKit::decode_unscrubbed(display);
+        scrub_stack();
+        result
+    }
+
+    #[inline(never)]
+    fn decode_unscrubbed(display: &str) -> Result<RecoveryKit, Error> {
         if display.len() > MAX_INPUT_BYTES {
             return Err(Error::KitFormat);
         }
