@@ -94,6 +94,13 @@ function ht_public_rules(Httpd $s, string $what): void
         eq(403, $r['status'], "$what: $p: " . substr($r['body'], 0, 60));
         not_contains('not a real', $r['body'], "$what: $p was handed out");
     }
+    // A path that starts like the relay's and leaves it: Apache takes the dot segments out (GET /v1/../README is /README) after the request
+    // line was recorded as it came, so a grant that read only the request line would hand the file out. Sent as they are, raw.
+    foreach (['/v1/../README', '/v1/../.git/config', '/v1/../sub/inner.html', '/v1/%2e%2e/README', '/v1/..%2fREADME', '/v1/./../notes.txt', '/status.html/../README', '/install.php/../README'] as $p) {
+        $r = $s->request('GET', $p);
+        ok($r['status'] === 403 || $r['status'] === 404 || $r['status'] === 400, "$what: $p is refused, got " . $r['status'] . ': ' . substr($r['body'], 0, 60));
+        not_contains('not a real', $r['body'], "$what: $p was handed out");
+    }
     eq(200, $s->request('GET', '/status.html')['status'], "$what: status.html is the relay's own");
     // /v1/ is the front controller: Apache has no PHP here, so what comes back is the file index.php itself, which is how the test sees
     // that the request got there. An item id may hold a dot or start with one (design 4.3: [A-Za-z0-9._-], never . or ..).

@@ -6,8 +6,9 @@
 
 # Only /v1/..., /status.html and /install.php are the relay's, and a request for anything else is refused (403), by what was asked for and
 # not by which modules the server has: a README, a nested page, a dot folder (.git/config) or an editor's leftover that a careless upload
-# put here is never handed out, with or without mod_rewrite. THE_REQUEST is the request as the client sent it, so the internal redirect of
-# /v1/... to index.php below is judged as /v1/..., not as /index.php.
+# put here is never handed out, with or without mod_rewrite. Two things must both hold: the request as the client sent it (THE_REQUEST) is
+# one of those, which a direct request for /index.php is not, and the path Apache resolved it to (REQUEST_URI, with the dot segments
+# taken out: GET /v1/../README is /README) is one of those too, or /index.php, which is where the rewrite below sends /v1/...
 #
 # This folder is the one that is served. The package root above it carries a deny-all .htaccess (for a document root that is wrong), and
 # Apache reads the .htaccess of every folder on the way to a file wherever AllowOverride covers them, as it does on hosts that set it
@@ -15,7 +16,7 @@
 # a parent folder's .htaccess or of a <Directory> block of the server's configuration that covers this folder (Apache's rule for
 # Require); to limit who may use the relay, say it in a <Location> block, which Apache applies after the .htaccess files.
 <IfModule mod_authz_core.c>
-    Require expr "%{THE_REQUEST} =~ m#^[A-Z]+ /(v1/|status\.html[ ?]|install\.php[ ?])#"
+    Require expr "%{THE_REQUEST} =~ m#^[A-Z]+ /(v1/|status\.html[ ?]|install\.php[ ?])# && (%{REQUEST_URI} =~ m#^/(v1/|status\.html$|install\.php$)# || %{REQUEST_URI} == '/index.php')"
 </IfModule>
 <IfModule !mod_authz_core.c>
     Order allow,deny

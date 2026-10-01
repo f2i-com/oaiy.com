@@ -195,9 +195,14 @@ not work at all** (the file's own rewrite sent the internal redirect to `index.p
 
 It:
 
-- **allows only what is the relay's**: `Require expr` on the request line as the client sent it: `/v1/...`, `/status.html` and
-  `/install.php` are let through and **everything else is a 403**, whatever the server's modules: a `README`, a nested page, a dot
-  folder (`/.git/config`), `index.php` asked for directly, or an editor's leftover that a careless upload put in `public/`;
+- **allows only what is the relay's**: one `Require expr` that holds only if both the request line as the client sent it and the
+  path Apache resolved it to (dot segments taken out: `GET /v1/../README` is `/README`) are `/v1/...`, `/status.html` or
+  `/install.php` (the resolved path may also be `/index.php`, where the rewrite sends `/v1/...`). **Everything else is a 403**,
+  whatever the server's modules: a `README`, a nested page, a dot folder (`/.git/config`), `index.php` asked for directly, an
+  editor's leftover that a careless upload put in `public/`, and a path that starts like the relay's and climbs out of it. (The
+  first version of this line read the request line only, and `/v1/../README` was handed out: a test sends it raw now.)
+  LiteSpeed's handling of `Require expr` was not tried; if it refuses the line, the doctor's `web.authorization` row says the web
+  server itself answered;
 - **grants itself** by that same line. Apache reads the `.htaccess` of every folder on the way to a file wherever `AllowOverride`
   covers them, and many hosts set it for all of `/home` or `/var/www`, so the package root's deny-all (below) would otherwise refuse every
   request to the relay, which is what a real Apache 2.4.65 did before this was added. **This replaces any `Require` of a parent folder's
