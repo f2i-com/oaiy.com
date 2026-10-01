@@ -751,6 +751,11 @@ export class Outreach {
     return this.campaigns.some((c) => c.kind === 'call' && c.people.some((p) => p.state === 'dialling' || p.state === 'ringing' || p.state === 'on_call'));
   }
 
+  /** A call that the conversation `projectId` started is ringing or going on (or has just ended, its result not recorded yet): its result comes to that conversation by itself. */
+  callLiveFor(projectId: string): boolean {
+    return this.campaigns.some((c) => c.kind === 'call' && c.origin.projectId === projectId && c.people.some((p) => p.state === 'dialling' || p.state === 'ringing' || p.state === 'on_call' || p.state === 'ended'));
+  }
+
   /**
    * A text campaign is running, or someone it texted may still reply: this page takes the texts' lease for it. A campaign
    * that is only paused holds nothing: nobody it has not texted is answered for it, and nothing is sent by it. One that was
