@@ -1786,6 +1786,13 @@ for f in ("admission.json", "challenge.json", "frames.json", "stream.json", "err
 # A relay with a plain-http public_url is outside the schemas by design (README section 1, Interpretation 61): the relay builds http:// and ws://
 # URLs for a loopback host (test builds), the admission schemas require wss:// and https://, and everything recorded here is a deployed relay's.
 readme_all = (V1 / "README.md").read_text(encoding="utf-8")
+ok("README records what the Android emulator test of the shipped phone found: a request over 1 MiB is refused with its limit in the answer and the limit is not raised (Interpretation 63), a phone's frames in the plugin's mailbox count until they expire (64), and the 403 of an unlisted phone has the right wording (65)",
+   all(s in readme_all for s in ("63. **A request over 1 MiB is refused for its size, and says so; the limit is not raised for the phone.**", "A post may be at most 1048576 bytes in all: send fewer or smaller frames in one post.",
+                                 "(31 frames of 32 KiB,", "64. **A phone's frames in the plugin's mailbox count until they expire, whether or not the plugin has read them; the share is 256 frames and 2 MiB.**",
+                                 "**256 frames or 2 MiB in any 120 seconds, that is about 2 frames a second sustained, in bursts of up to 256**", "65. **The 403 of a phone the roster does not list says \"Your PC has not listed this phone.\"**",
+                                 "message `Your PC has not listed this phone.`")))
+ok("the recorded 403 of a phone the roster does not list says it has not listed it, and no recorded error says it no longer does",
+   any(c["response"]["body"].get("message") == "Your PC has not listed this phone." for c in aok["errors.json"]["cases"]) and not any("no longer lists" in json.dumps(c) for c in aok["errors.json"]["cases"]))
 ok("README gives the phone's reads of a rendezvous their budgets and the client's rule: 30 a minute per address, 60 counted per rendezvous (one every 10 seconds on average), 10 reads of an outcome a minute, a pause of 0 only after a granted hold that was not superseded and at least 10 seconds with jitter otherwise, and what a small wait.max does",
    all(s in readme_all for s in ("**30 requests per 60 seconds per client address**", "**60 counted `GET`s per rendezvous while it is `open` or `answered`**", "**one every 10 seconds on average**",
                                  "**10 reads of an outcome (`approved`, `denied`) per minute per address and pid**", "pauses **0 only after an answer whose `hold` is `{\"granted\":true}` without `superseded`**",

@@ -312,7 +312,7 @@
       "note": "A refused wait is 200 with hold.refused: the carrier degrades to a short poll."
     },
     {
-      "name": "a phone the desktop's roster no longer lists",
+      "name": "a phone the desktop's roster does not list",
       "request": {
         "method": "GET",
         "path": "/v1/aokie-companion/relay/challenge",
@@ -326,7 +326,7 @@
         "body": {
           "error": true,
           "code": "forbidden",
-          "message": "Your PC no longer lists this phone."
+          "message": "Your PC has not listed this phone."
         }
       }
     },

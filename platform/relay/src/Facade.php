@@ -161,7 +161,7 @@ final class Facade
                 throw (new ApiError(401, 'revoked', 'This device was removed; pair it again.'))->because('desktop_revoked');
             }
             if (!self::rosterLists($ctx, $f->dsk, $f->appId, $f->holder)) {
-                throw (new ApiError(403, 'forbidden', 'Your PC no longer lists this phone.'))->because('phone_not_in_roster');
+                throw (new ApiError(403, 'forbidden', 'Your PC has not listed this phone.'))->because('phone_not_in_roster');
             }
         }
         $f->mailbox = Party::mailbox($f->appId, $f->dsk, $f->party);

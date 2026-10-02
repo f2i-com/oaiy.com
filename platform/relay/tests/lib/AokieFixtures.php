@@ -264,7 +264,7 @@ final class AokieFixtures
         $err('a frames wait when the host has no worker to spare (not an error)', self::request('GET', self::BASE . 'frames', 'Bearer of phone A', null, ['since' => '0', 'wait' => '2']), $refused, 'A refused wait is 200 with hold.refused: the carrier degrades to a short poll.');
         // 401 revoked and 403 roster
         $k->r->ctx()->db->exec('UPDATE roster SET thumbprints = ? WHERE desktop_dev = ?', [json_encode([$k->thumb($a)]), $k->desk->id]);
-        $err('a phone the desktop\'s roster no longer lists', self::request('GET', self::BASE . 'challenge', 'Bearer of phone B'), $k->call($btok, 'GET', 'challenge'));
+        $err('a phone the desktop\'s roster does not list', self::request('GET', self::BASE . 'challenge', 'Bearer of phone B'), $k->call($btok, 'GET', 'challenge'));
         Devices::revoke($k->r->ctx(), $b->id);
         $err('a phone that was removed', self::request('GET', self::BASE . 'challenge', 'Bearer of phone B'), $k->call($btok, 'GET', 'challenge'), 'Held streams and waits of that phone end the same way.');
         $k->r->configure(['call' => ['enabled' => false]]);
