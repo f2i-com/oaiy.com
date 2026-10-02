@@ -395,7 +395,7 @@ pub fn retry_after(answer: &Answer<'_>, now_epoch: Option<i64>) -> Option<u64> {
         if let Some(t) = parse_http_date(s) {
             let reference = answer.header("date").and_then(parse_http_date).or(now_epoch);
             if let Some(r) = reference {
-                return Some((t - r).max(0) as u64);
+                return Some(t.saturating_sub(r).max(0) as u64);
             }
         }
     }
@@ -602,6 +602,15 @@ mod tests {
         ] {
             assert_eq!(parse_http_date(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn a_clock_at_the_edge_of_time_is_a_long_wait_not_an_overflow() {
+        // Found by the fuzz test: `t - now` overflowed for a client clock that read `i64::MIN`.
+        let h = headers(&[("retry-after", "Sun, 06 Nov 1994 08:49:37 GMT")]);
+        let answer = Answer { status: Some(429), headers: &h, body: None };
+        assert_eq!(retry_after(&answer, Some(i64::MIN)), Some(i64::MAX as u64));
+        assert_eq!(retry_after(&answer, Some(i64::MAX)), Some(0));
     }
 
     #[test]
