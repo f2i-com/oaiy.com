@@ -1,4 +1,4 @@
-﻿"""My own implementation of the poll decision function of README 5.1.1 (P1-P9), written from the README text alone.
+"""My own implementation of the poll decision function of README 5.1.1 (P1-P9), written from the README text alone.
 
 Input case (dict):
   state {n429,nFail,nRefused,n400}, info {pollGapMs,fallbackS}, u, since (default 0), persisted (default True),
@@ -229,7 +229,3 @@ def decide_proof(case):
     return {"outcome": "stop", "baseS": 0, "pauseS": 0.0,
             "state": {"n429": n429, "nFail": nFail, "nRefused": nRef, "n400": n400},
             "action": "report_relay_changed", "report": []}
-
-
-
-

@@ -1,4 +1,4 @@
-﻿"""F2 (a): base64url differential. Writes the corpus, runs PHP B64.php, a strict Python reference and a Node round-trip reference, and (when --compare) compares them with
+"""F2 (a): base64url differential. Writes the corpus, runs PHP B64.php, a strict Python reference and a Node round-trip reference, and (when --compare) compares them with
 the Rust runner's output (tests/rv_enc_corpus.rs, corpus_b64) in the same directory."""
 import base64, itertools, os, random, re, subprocess, sys
 
@@ -123,5 +123,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

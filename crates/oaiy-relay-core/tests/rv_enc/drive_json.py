@@ -1,4 +1,4 @@
-﻿"""F2 (b): JSON differential. Corpus -> {PHP json_decode (depth 65) and the relay's Json::decode rules, Python strict reference, Node JSON.parse, serde_json (inside the Rust runner),
+"""F2 (b): JSON differential. Corpus -> {PHP json_decode (depth 65) and the relay's Json::decode rules, Python strict reference, Node JSON.parse, serde_json (inside the Rust runner),
 this crate (general and canonical modes)}. Usage: drive_json.py gen|refs|compare [N]"""
 import json, os, random, re, subprocess, sys, collections
 
@@ -391,5 +391,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

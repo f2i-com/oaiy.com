@@ -1,4 +1,4 @@
-﻿"""Random cases for the poll-decision differential: writes cases.jsonl (inputs) and mine.jsonl (my independent implementation's decisions).
+"""Random cases for the poll-decision differential: writes cases.jsonl (inputs) and mine.jsonl (my independent implementation's decisions).
 usage: python gen_poll.py <count> <seed> <outdir>
 """
 import json, random, sys, os
@@ -297,6 +297,3 @@ with open(os.path.join(outdir, "cases.jsonl"), "w", encoding="utf-8") as fc, ope
         d["id"] = c["id"]
         fm.write(json.dumps(d) + "\n")
 print("wrote", count)
-
-
-

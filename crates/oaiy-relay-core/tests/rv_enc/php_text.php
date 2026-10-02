@@ -1,4 +1,4 @@
-﻿<?php
+<?php
 // F2: Ids.php validators and cleanName over the corpora in the directory given (ids.in, name.in); writes ids.php.out and name.php.out.
 define('OAIY_RELAY', 1);
 require __DIR__ . '/../../../../platform/relay/src/B64.php';
@@ -45,4 +45,3 @@ foreach (file("$dir/name.in", FILE_IGNORE_NEW_LINES) as $l) {
     fwrite($out, bin2hex(Ids::cleanName($s, (int)$mx)) . "\n");
 }
 fclose($out);
-

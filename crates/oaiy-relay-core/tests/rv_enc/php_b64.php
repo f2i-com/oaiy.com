@@ -1,4 +1,4 @@
-﻿<?php
+<?php
 // F2: runs the relay's B64 reader over a corpus (one hex line per input) and writes "OK:<hex>|ERR<TAB>e16 e32 e64".
 define('OAIY_RELAY', 1);
 require __DIR__ . '/../../../../platform/relay/src/B64.php';
@@ -12,4 +12,3 @@ foreach ($in as $l) {
     fwrite($out, ($d === null ? 'ERR' : 'OK:' . bin2hex($d)) . "\t" . $e . "\n");
 }
 fclose($out);
-

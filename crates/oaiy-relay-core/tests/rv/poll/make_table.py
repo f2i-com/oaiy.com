@@ -1,4 +1,4 @@
-﻿"""Builds a poll-client table (the shape of poll-client.json) from my random cases and my implementation's decisions (the flags that mimic the repository's Python reader), so that
+"""Builds a poll-client table (the shape of poll-client.json) from my random cases and my implementation's decisions (the flags that mimic the repository's Python reader), so that
 verify_poll_client.py and verify_poll_client.mjs can be run on it.  usage: python make_table.py <cases.jsonl> <out.json> [max]"""
 import json, sys, hashlib, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -63,4 +63,3 @@ doc = '{"version":1,"about":"reviewer table","constants":%s,"caseCount":%d,"idsS
     hashlib.sha256("\n".join(f"{c['id']}|{c['rule']}" for c in cases).encode()).hexdigest(), ",\n".join(ser(c) for c in cases))
 open(out, "w", encoding="utf-8").write(doc)
 print(len(cases), "cases written")
-

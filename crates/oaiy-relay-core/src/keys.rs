@@ -77,8 +77,8 @@ pub fn domain_message(domain: &str, parts: &[&[u8]]) -> Vec<u8> {
     out
 }
 
-/// The thumbprint of an Ed25519 public key: `b64u(SHA-256(`{"crv":"Ed25519","kty":"OKP","x":"<b64u>"}`))`, 43 characters (README section 2). The same function as the Aokie
-/// `endpoint_thumbprint`.
+/// The thumbprint of an Ed25519 public key: the base64url of the SHA-256 of the text `{"crv":"Ed25519","kty":"OKP","x":"<the key in base64url>"}`, 43 characters (README
+/// section 2). The same function as the Aokie `endpoint_thumbprint`.
 pub fn thumbprint_of(public_key: &[u8; 32]) -> String {
     let jwk = format!("{{\"crv\":\"Ed25519\",\"kty\":\"OKP\",\"x\":\"{}\"}}", b64::encode(public_key));
     b64::encode(&sha256(jwk.as_bytes()))

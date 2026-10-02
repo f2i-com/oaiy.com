@@ -1,4 +1,4 @@
-﻿//! Reviewer's check (F2, secrets): which public types print a secret through `{:?}`. The ones that hold a secret by design must print nothing of it; the output of the others is
+//! Reviewer's check (F2, secrets): which public types print a secret through `{:?}`. The ones that hold a secret by design must print nothing of it; the output of the others is
 //! shown. The assertions are the claim of the crate ("a credential has no Display, its Debug prints nothing of it"); a failing assertion is a finding.
 
 use oaiy_crypto::zeroize::Secret;
@@ -78,4 +78,3 @@ fn no_public_type_prints_a_secret() {
     let leaks = battery();
     assert!(leaks.is_empty(), "{leaks:?}");
 }
-

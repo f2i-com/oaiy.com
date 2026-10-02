@@ -1,4 +1,4 @@
-﻿import json, sys, collections
+import json, sys, collections
 d = sys.argv[1]
 mine = {}
 for l in open(d + "/mine.jsonl", encoding="utf-8"):
@@ -30,4 +30,3 @@ print(by.most_common(20))
 out = open(d + "/disagree.txt", "w", encoding="utf-8")
 for i, diffs in bad:
     out.write(json.dumps({"id": i, "diffs": diffs, "case": cases[i], "mine": mine[i], "crate": crate[i]}) + "\n")
-

@@ -1,4 +1,4 @@
-﻿"""F2 (c): typed code, SAS entry, identifier validators, display-name cleaning, relay URL and percent-decoding: corpora, independent Python references written from the README and
+"""F2 (c): typed code, SAS entry, identifier validators, display-name cleaning, relay URL and percent-decoding: corpora, independent Python references written from the README and
 the schemas, PHP Ids.php, and comparison with the Rust runner (tests/rv_enc_corpus.rs). Usage: drive_text.py gen | php | compare"""
 import hashlib, itertools, os, random, re, subprocess, sys, collections
 
@@ -437,4 +437,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

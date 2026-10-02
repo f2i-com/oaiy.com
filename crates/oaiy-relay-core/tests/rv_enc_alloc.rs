@@ -1,4 +1,4 @@
-﻿//! Reviewer's measurement (F2): the memory this crate's JSON parser holds for a hostile body of a given size, with a counting allocator. The HTTP layer caps a response at
+//! Reviewer's measurement (F2): the memory this crate's JSON parser holds for a hostile body of a given size, with a counting allocator. The HTTP layer caps a response at
 //! 1 MiB + 64 KiB (`client::relay::MAX_RESPONSE_BYTES`), so the figure that matters is the peak for about 1.1 MB of input; larger inputs show that it is linear. One test only:
 //! the allocator counts the whole process. Run with `-- --nocapture --test-threads 1` to read the table.
 
@@ -120,4 +120,3 @@ fn memory_for_hostile_json() {
         drop(esc);
     }
 }
-

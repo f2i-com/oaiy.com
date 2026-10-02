@@ -1,4 +1,4 @@
-﻿<?php
+<?php
 // F2: PHP json_decode (depth 65, as the relay) over a corpus; column 1 = json_decode alone, column 2 = the relay's Json::decode semantics (array at the top, no bare -0).
 define('OAIY_RELAY', 1);
 require __DIR__ . '/../../../../platform/relay/src/Json.php';
@@ -21,4 +21,3 @@ foreach ($in as $l) {
     fwrite($out, $a . "\t" . $b . "\n");
 }
 fclose($out);
-

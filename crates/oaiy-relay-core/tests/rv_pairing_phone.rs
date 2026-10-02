@@ -747,4 +747,3 @@ fn finding_a_relay_that_answers_a_hold_at_once_makes_the_phone_poll_without_a_pa
     let sleeps = w.env.clock.sleeps().len();
     assert!(sleeps >= 250, "{gets} requests in a row with {sleeps} pauses between them");
 }
-

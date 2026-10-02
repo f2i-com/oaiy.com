@@ -1,4 +1,4 @@
-﻿import json, sys, collections
+import json, sys, collections
 d = sys.argv[1]
 py = {}
 for l in open(d + "/python.jsonl", encoding="utf-8"):
@@ -29,4 +29,3 @@ print(by)
 with open(d + "/disagree.txt", "w", encoding="utf-8") as f:
     for i, why in bad:
         f.write(json.dumps({"id": i, "why": why, "py": py[i], "response": cases[i]["response"]}) + "\n")
-
