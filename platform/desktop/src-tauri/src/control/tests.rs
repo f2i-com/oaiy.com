@@ -1090,6 +1090,12 @@ fn the_link_status_tool_says_why_a_stored_link_is_not_in_use() {
     let summary = tools::link_summary(&stuck, Err("no sync".into()));
     assert_eq!((summary["linked"].clone(), summary["problem"].clone()), (json!(true), json!("the link could not be forgotten")));
 
+    // A link that was forgotten with a copy of its key left behind is not linked, and says what to do about the copy and
+    // which kind of problem it is, so the Agent tells the owner to press Remove copies and not to link again.
+    let left = "Disconnected, but a copy of the old key could not be removed: account.json.corrupt (held). Close the program that holds it and press Remove copies.";
+    let copies = tools::link_summary(&json!({"linked": false, "linkError": {"file": "link/account.json", "message": left, "kind": "copiesLeft"}}), Err("no sync".into()));
+    assert_eq!((copies["linked"].clone(), copies["problem"].clone(), copies["linkError"]["kind"].clone()), (json!(false), json!(left), json!("copiesLeft")));
+
     // Without one, the problem is what it was: the heartbeat's, then the command lane's, else none; and there is no linkError.
     let beat = tools::link_summary(&json!({"linked": true, "heartbeatError": "HTTP 500", "relayError": "late"}), Err("no sync".into()));
     assert_eq!((beat["problem"].clone(), beat["linkError"].clone()), (json!("HTTP 500"), Value::Null));

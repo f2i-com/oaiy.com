@@ -54,6 +54,7 @@ export default function ConnectionsPanel() {
   // the next poll wipes the message from the button they pressed a second ago.
   const [statusError, setStatusError] = useState<string | null>(null);
   const [linking, setLinking] = useState(false);
+  const [removingCopies, setRemovingCopies] = useState(false);
 
   const refreshRelay = useCallback(async () => {
     try {
@@ -172,13 +173,35 @@ export default function ConnectionsPanel() {
         // being removed), or a copy kept of an earlier file could not be removed. Telling the owner it worked
         // would leave a key on the disk that links this desktop again at the next start.
         const why = next.linkError?.message ?? `${name} is still linked on this computer.`;
-        setAccountError(why);
+        // A copy left behind has a banner of its own below, with the button that tries again; the same words in the
+        // plain banner as well would be a second banner with no button.
+        if (next.linkError?.kind !== 'copiesLeft') setAccountError(why);
         toast.push({ kind: 'error', title: next.linked ? `Could not disconnect ${name}` : `Disconnected ${name}, but not all of it`, body: why });
       } else {
         toast.push({ kind: 'success', title: `Disconnected ${name}` });
       }
     } catch (err) {
       setAccountError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  // The link was forgotten and a copy of its key could not be removed: try the copies again, and only them.
+  const removeCopies = async () => {
+    setAccountError(null);
+    setRemovingCopies(true);
+    try {
+      const next = await linkApi.removeCopies();
+      setAccount(next);
+      put('linkStatus', next);
+      if (next.linkError) {
+        toast.push({ kind: 'error', title: 'A copy of the old key is still there', body: next.linkError.message });
+      } else {
+        toast.push({ kind: 'success', title: 'Copies of the old key removed' });
+      }
+    } catch (err) {
+      setAccountError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRemovingCopies(false);
     }
   };
 
@@ -365,7 +388,7 @@ export default function ConnectionsPanel() {
         {/* A stored file of the link that could not be used. Not "not linked": the file is there and was left
             as it was, and this says why it is not in use, so a desktop that looks unlinked is not mistaken for
             one nobody linked. Linking again puts the file aside (it is kept as account.json.corrupt). */}
-        {account?.linkError && account.linkError.message !== (accountError ?? statusError) && (
+        {account?.linkError && account.linkError.kind !== 'copiesLeft' && account.linkError.message !== (accountError ?? statusError) && (
           <div className="banner banner-err" role="alert" data-link-error>
             <strong>{account.linked ? 'The link could not be changed.' : 'The stored link could not be used.'}</strong>{' '}
             <span>{account.linkError.message}</span>
@@ -374,6 +397,21 @@ export default function ConnectionsPanel() {
                 Nothing was deleted. Link again below to start a new one; the old file is kept beside it.
               </div>
             )}
+          </div>
+        )}
+
+        {/* The link was forgotten and a copy of its key (kept when a file could not be read) could not be removed,
+            usually because a program has it open. It is not the banner above: the account IS disconnected, there is
+            nothing to read again or to link again, and what is left is to let go of the copy and press the button.
+            It stays until the copies are gone, and the button takes the copies only: a link made since is left alone. */}
+        {account?.linkError?.kind === 'copiesLeft' && (
+          <div className="banner banner-err" role="alert" data-copies-left>
+            <strong>A copy of the old key is still on this computer.</strong> <span>{account.linkError.message}</span>
+            <div style={{ marginTop: 8 }}>
+              <button className="btn-tiny" onClick={() => void removeCopies()} disabled={removingCopies}>
+                {removingCopies ? 'Removing…' : 'Remove copies'}
+              </button>
+            </div>
           </div>
         )}
 
