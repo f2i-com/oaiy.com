@@ -1826,7 +1826,47 @@ except (OSError, subprocess.TimeoutExpired) as e:
 section("poll-client fixture (fixtures/poll-client/): the rules of README 5.1.1 for the native pollers (DK-03, MOB-21a), read twice")
 PC = FIX / "poll-client"
 pc_readme = (V1 / "README.md").read_text(encoding="utf-8")
-pc_doc = json.loads((PC / "poll-client.json").read_text(encoding="utf-8"))
+class PcSpelled:
+    """A number of a poll answer written in a way that is not an integer literal (1.0, 1e2, -0): the table says what spelling an answer has (README P2),
+    and Python's json would write -0 back as 0 and 1e2 as 100.0, so a damaged copy of the table would not be the table with one thing changed."""
+
+    def __init__(self, value, source):
+        self.value, self.source = value, source
+
+
+def pc_unspell(x):
+    if isinstance(x, PcSpelled):
+        return x.value
+    if isinstance(x, list):
+        return [pc_unspell(v) for v in x]
+    if isinstance(x, dict):
+        return {k: pc_unspell(v) for k, v in x.items()}
+    return x
+
+
+def pc_load(text):
+    """The table with the spelling of the numbers of every response body kept, and every other number a number."""
+    doc = json.loads(text, parse_int=lambda s: PcSpelled(0, s) if s == "-0" else int(s), parse_float=lambda s: PcSpelled(float(s), s))
+    out = {k: pc_unspell(v) for k, v in doc.items() if k != "cases"}
+    out["cases"] = []
+    for c in doc["cases"]:
+        kept = {k: (v if k == "response" else pc_unspell(v)) for k, v in c.items()}
+        if isinstance(c.get("response"), dict):
+            kept["response"] = {k: (v if k == "body" else pc_unspell(v)) for k, v in c["response"].items()}
+        out["cases"].append(kept)
+    return out
+
+
+def pc_dump(doc):
+    """The table as JSON text, with the spelled numbers written as they were (a sentinel string, then the quotes taken off)."""
+    def spelled(o):
+        if isinstance(o, PcSpelled):
+            return "@@RAW@@" + o.source + "@@"
+        raise TypeError(repr(o))
+    return re.sub(r'"@@RAW@@([^"@]+)@@"', r"\1", json.dumps(doc, default=spelled))
+
+
+pc_doc = pc_load((PC / "poll-client.json").read_text(encoding="utf-8"))
 # What the table holds, pinned here as the vectors' values are (DESIGN_PINS): a case that goes missing from the table, or one that is added,
 # changes these, and whoever does it changes them here on purpose. The readers check the table against its own caseCount and idsSha256, which
 # a table edited to agree with itself would satisfy; these are what that edit cannot satisfy.
@@ -2035,9 +2075,17 @@ pc_moved["layoutSha256"] = pc_layout(pc_moved)
 ok("a table with a case relabelled, or two cases swapped, and its layout digest recomputed is not the pinned one",
    pc_relabelled["layoutSha256"] != POLL_CLIENT_PINS["layoutSha256"] and pc_moved["layoutSha256"] != POLL_CLIENT_PINS["layoutSha256"])
 with tempfile.TemporaryDirectory() as tmpd:
+    # The control of every damaged table below: the table itself, written the way a damaged copy is written, is accepted by both readers, so that a damaged copy
+    # is refused for what was damaged and not for how it was written (-0 became 0 once, and every one of them was refused for that).
+    ctl = pathlib.Path(tmpd) / "control.json"
+    ctl.write_text(pc_dump(pc_doc), encoding="utf-8")
+    ok("the table written again as a damaged copy is written is the table: the spellings of its numbers are kept", ctl.read_text(encoding="utf-8").count("-0,") >= 1 or "-0" in ctl.read_text(encoding="utf-8"))
+    for label, cmd in pc_readers:
+        proc = subprocess.run(cmd + ["--file", str(ctl)], capture_output=True, text=True, encoding="utf-8", timeout=120)
+        ok(f"the {label} reader accepts the table written again as a damaged copy is written (the control of the damaged tables)", proc.returncode == 0 and " 0 mismatches" in proc.stdout, (proc.stdout + proc.stderr)[-300:])
     for i, (what, damaged) in enumerate(pc_damaged):
         f = pathlib.Path(tmpd) / f"damaged{i}.json"
-        f.write_text(json.dumps(damaged), encoding="utf-8")
+        f.write_text(pc_dump(damaged), encoding="utf-8")
         for label, cmd in pc_readers:
             proc = subprocess.run(cmd + ["--file", str(f)], capture_output=True, text=True, encoding="utf-8", timeout=120)
             ok(f"the {label} reader refuses the table with {what}", proc.returncode == 1 and "MISMATCH" in proc.stdout, (proc.stdout + proc.stderr)[-200:])
