@@ -613,7 +613,28 @@ mod tests {
         assert_eq!(parse_http_date("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
         assert_eq!(parse_http_date("Fri, 29 Feb 2008 12:00:00 GMT"), Some(1_204_286_400));
         assert_eq!(parse_http_date(" \tSun, 06 Nov 1994 08:49:37 GMT\t"), Some(784_111_777));
+        // A real date and time only (P6): the day within its month, hour 00 to 23, minute 00 to 59, second 00 to 60, year 0001 to 9999; the name of the day is not checked.
+        assert_eq!(parse_http_date("Tue, 29 Feb 2000 00:00:00 GMT"), Some(951_782_400), "2000 is a leap year");
+        assert_eq!(
+            parse_http_date("Thu, 31 Dec 1970 23:59:60 GMT"),
+            Some(31_536_000),
+            "a leap second is read as the first second of the next minute"
+        );
+        assert_eq!(parse_http_date("Wed, 06 Nov 1994 08:49:37 GMT"), Some(784_111_777), "the weekday is not checked");
+        assert_eq!(parse_http_date("Mon, 01 Jan 0001 00:00:00 GMT"), Some(-62_135_596_800));
+        assert_eq!(parse_http_date("Fri, 31 Dec 9999 23:59:59 GMT"), Some(253_402_300_799));
         for bad in [
+            "Sun, 32 Nov 1994 08:49:37 GMT",
+            "Sun, 00 Nov 1994 08:49:37 GMT",
+            "Sun, 31 Nov 1994 08:49:37 GMT",
+            "Sun, 30 Feb 2008 12:00:00 GMT",
+            "Fri, 29 Feb 1900 12:00:00 GMT",
+            "Fri, 29 Feb 2001 12:00:00 GMT",
+            "Sun, 06 Nov 1994 24:00:00 GMT",
+            "Sun, 06 Nov 1994 25:49:37 GMT",
+            "Sun, 06 Nov 1994 08:60:37 GMT",
+            "Sun, 06 Nov 1994 08:49:61 GMT",
+            "Sun, 06 Nov 0000 08:49:37 GMT",
             "Sunday, 06-Nov-94 08:49:37 GMT",
             "Sun Nov  6 08:49:37 1994",
             "Sun, 06 Nov 1994 08:49:37 UTC",

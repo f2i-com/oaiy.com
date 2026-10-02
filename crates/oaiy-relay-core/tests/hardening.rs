@@ -143,10 +143,13 @@ impl HttpClient for HeldPairReads {
 #[test]
 fn a_read_the_relay_says_it_held_is_believed_only_when_it_was_not_superseded_and_took_a_hold_s_time() {
     // The phone asks again at once only for a read that the relay says it held (`hold.granted`), that was not `superseded` (another read of the rendezvous took its place: it did not
-    // wait for the owner) and that took as long as a hold takes by the phone's own clock (here 12 s of the 20 asked for). A superseded read is paced at 10 s like any other answer
-    // that leaves the rendezvous as it was.
-    for (superseded, pauses) in [(false, 0usize), (true, 3)] {
-        let mut w = world(StubConfig { wait_default: 20, wait_max: 20, receipt_includes_grants: true, ..Default::default() });
+    // wait for the owner) and that took as long as a hold takes by the phone's own clock (here 12 s of the wait asked for). A superseded read is paced at 10 s like any other answer
+    // that leaves the rendezvous as it was. And (README 10.1) when the relay's `wait.max` is below ten seconds a granted hold is followed by the difference to ten: a phone that asked
+    // again at once after a two-second hold would spend the 60 counted reads of a rendezvous in two minutes.
+    for (wait_max, superseded, pause) in
+        [(20u64, false, None), (20, true, Some(10.0)), (2, false, Some(8.0)), (9, false, Some(1.0)), (10, false, None), (2, true, Some(10.0))]
+    {
+        let mut w = world(StubConfig { wait_default: wait_max, wait_max, receipt_includes_grants: true, ..Default::default() });
         let offer = w.new_offer();
         let target = oaiy_relay_core::pairing::PairingTarget::from_input(oaiy_relay_core::pairing::PairingInput::Key(&offer.pairing_uri)).unwrap();
         let adapter = Arc::new(HeldPairReads {
@@ -170,13 +173,37 @@ fn a_read_the_relay_says_it_held_is_believed_only_when_it_was_not_superseded_and
         w.env.clock.clear_sleeps();
         assert!(matches!(phone.wait_outcome(None, &Cancel::new()).unwrap(), oaiy_relay_core::pairing::phone::Outcome::Denied));
         let sleeps = w.env.clock.sleeps();
-        assert_eq!(sleeps.len(), pauses, "superseded {superseded}: {sleeps:?}");
-        for s in &sleeps {
-            assert!(within_jitter(s, 10.0), "a pause of ten seconds with jitter: {s:?}");
+        match pause {
+            None => assert!(sleeps.is_empty(), "wait.max {wait_max}, superseded {superseded}: {sleeps:?}"),
+            Some(base) => {
+                assert_eq!(sleeps.len(), 3, "wait.max {wait_max}, superseded {superseded}: {sleeps:?}");
+                for s in &sleeps {
+                    assert!(within_jitter(s, base), "wait.max {wait_max}, superseded {superseded}: a pause of {base} s with jitter, got {s:?}");
+                }
+            }
         }
     }
 }
 
+#[test]
+fn after_a_429_of_the_pairing_reads_the_phone_waits_the_larger_of_ten_seconds_and_the_retry_after() {
+    // README 10.1: max(10, Retry-After) with the jitter of P6. A relay that says 3 seconds is waited ten; one that says 40 is waited 40 (up to 20 percent more).
+    for (retry_after, base) in [("3", 10.0), ("40", 40.0), ("10", 10.0), ("11", 11.0)] {
+        let mut w = world(StubConfig { receipt_includes_grants: true, ..quick() });
+        let offer = w.new_offer();
+        let mut phone = w.phone(oaiy_relay_core::pairing::PairingInput::Key(&offer.pairing_uri), 9);
+        phone.fetch_offer(&Cancel::new()).unwrap();
+        phone.respond(&Cancel::new()).unwrap();
+        w.env.clock.clear_sleeps();
+        let body = format!("{{\"error\":{{\"code\":\"rate_limited\",\"message\":\"Too many reads.\",\"retryAfter\":{retry_after}}}}}");
+        w.env.stub.fail_next_on("/v1/pair/", 1, Fault::Respond(429, vec![("Retry-After".into(), retry_after.into())], body));
+        w.env.stub.fail_next_on("/v1/pair/", 1, Fault::Respond(200, vec![], "{\"v\":1,\"state\":\"denied\",\"time\":1}".into()));
+        assert!(matches!(phone.wait_outcome(None, &Cancel::new()).unwrap(), oaiy_relay_core::pairing::phone::Outcome::Denied));
+        let sleeps = w.env.clock.sleeps();
+        assert_eq!(sleeps.len(), 1, "Retry-After {retry_after}: {sleeps:?}");
+        assert!(within_jitter(&sleeps[0], base), "Retry-After {retry_after}: {base} s with jitter, got {:?}", sleeps[0]);
+    }
+}
 /// Every spelling a secret can be printed in: the raw bytes as hex, as decimal numbers, as base64url, and as the 6-bit digits are not printed either.
 fn spellings(bytes: &[u8]) -> Vec<String> {
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
@@ -193,7 +220,7 @@ fn no_secret_holding_type_prints_its_secret_in_any_spelling() {
     let pairing = [0x77u8; 16];
     let ps = PairingSecret::new(pairing);
     let typed = ps.typed_code();
-    let sas = math::Sas { raw: [0xC1; 8], chars12: "6NHNK68MQQVZ".into(), check: '5' };
+    let sas = math::Sas::from_parts([0xC1; 8], "6NHNK68MQQVZ", '5');
     let shown: Vec<(&str, String, Vec<String>)> = vec![
         ("Signer", format!("{signer:?} {signer:#?}"), spellings(&seed)),
         ("X25519Secret", format!("{x:?} {x:#?}"), spellings(&x_secret)),
