@@ -215,7 +215,7 @@ fn every_call_that_carries_a_token_is_refused_by_a_client_with_no_fresh_proof_an
         app_id: "aokie".into(),
         plugin_id: "narrator".into(),
         display_name: None,
-        endpoint: endpoint.clone(),
+        endpoint,
         approved_peers: vec![Signer::generate().unwrap().thumbprint()],
         revision: 1,
         transports: None,

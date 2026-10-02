@@ -30,8 +30,10 @@ MUTATIONS = [
     ("K04", "Ed25519 strictness", "verification is not strict (verify, not verify_strict: a small-order R or a malleated S may pass) (dependency: oaiy-crypto)", D + "ed25519.rs",
      "self.0.verify_strict(message, &DalekSignature::from_bytes(&signature.0)).map_err(|_| Error::SignatureInvalid)",
      "ed25519_dalek::Verifier::verify(&self.0, message, &DalekSignature::from_bytes(&signature.0)).map_err(|_| Error::SignatureInvalid)", "dependency"),
-    ("K05", "X25519", "an all-zero shared secret is accepted (dependency: oaiy-crypto)", D + "x25519.rs",
-     "if !shared.was_contributory() {", "if false {", "dependency"),
+    # K05 (the reviewer's: `if !shared.was_contributory()` of `SecretKey::diffie_hellman_into` made `if false`) is left out: it is an equivalent mutant. The only inputs for which the
+    # product of a clamped scalar and a u-coordinate is all zero are the points of small order, and `x25519::PublicKey::from_bytes`, the only way to make a peer key, refuses all
+    # fourteen encodings of them before a Diffie-Hellman can be asked for, so no test through the crate's API can reach the second line of defence (the unit tests of `oaiy-crypto`
+    # do not either: they ask `from_bytes`). It is reported as an equivalent mutant, not as a kill and not as a survivor.
     ("K06", "sealed box", "a box of exactly 48 bytes is refused (empty plaintext) (dependency: oaiy-crypto)", D + "sealbox.rs",
      "    if sealed.len() < SEAL_OVERHEAD {\n        return Err(Error::DecryptFailed);\n    }\n    let (ephemeral_bytes, rest)",
      "    if sealed.len() <= SEAL_OVERHEAD {\n        return Err(Error::DecryptFailed);\n    }\n    let (ephemeral_bytes, rest)", "dependency"),

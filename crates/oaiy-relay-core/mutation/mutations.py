@@ -195,4 +195,7 @@ MUTATIONS = [
 # the tests of the later commits were written to kill.
 from review_mutations import MUTATIONS as _REVIEW  # noqa: E402
 
-MUTATIONS = MUTATIONS + _REVIEW
+# The mutants of the code that the review caused to be written (see that file).
+from hardening_mutations import MUTATIONS as _HARDENING  # noqa: E402
+
+MUTATIONS = MUTATIONS + _REVIEW + _HARDENING
