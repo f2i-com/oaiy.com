@@ -4,6 +4,8 @@
 //!
 //! Everything binds `127.0.0.1` only.
 
+#![allow(clippy::type_complexity, clippy::len_zero, clippy::manual_repeat_n)]
+
 mod common;
 
 use std::io::{Read, Write};
@@ -62,7 +64,6 @@ fn raw_server(then: impl FnOnce(&mut TcpStream) + Send + 'static) -> (String, st
 /// F4-L1: a chunked body whose second chunk size is `ffffffffffffffff` overflows `decoded.len() + size` (debug: panic; release: wraps and slices out of range). A transport must
 /// return an error for any bytes a peer sends.
 #[test]
-#[ignore = "F4-L1: LoopbackHttp panics on a chunk size near usize::MAX after a first chunk (loopback.rs:161)"]
 fn finding_chunk_size_overflow_is_an_error_and_not_a_panic() {
     let (url, _h) = raw_server(|s| {
         let _ = s.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\nffffffffffffffff\r\nxxxx");
@@ -242,7 +243,6 @@ fn odd_status_lines_and_length_headers_are_errors_or_plain_answers_never_panics(
 /// F4-L2 (low): the request line is built from the URL path with no check for CR or LF, so a path with a line break splits the request. The relay client only builds paths from
 /// validated ids, so this needs a caller that passes an unvalidated id (`pair_decision`, `pair_reject` and `pair_burn` take `pid: &str` unchecked).
 #[test]
-#[ignore = "F4-L2 (low): LoopbackHttp puts a URL path with CRLF into the request line (loopback.rs:94); pair_decision/reject/burn do not validate pid"]
 fn finding_a_path_with_a_line_break_does_not_split_the_request() {
     let (listener_url, seen) = {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -399,8 +399,8 @@ fn evidence_relay_url_verdicts() {
         }
     }
     assert!(accepted_http_non_loopback.is_empty(), "{accepted_http_non_loopback:?}");
-    // Equality is on the parsed parts: an explicit default port is another value than none (fails closed in `enroll`).
-    assert_ne!(RelayUrl::parse("https://relay.example.com").unwrap(), RelayUrl::parse("https://relay.example.com:443").unwrap());
+    // Equality is on the parsed parts, and the scheme's default port is the same origin as none. (Changed with the fix: it used to assert that they differ.)
+    assert_eq!(RelayUrl::parse("https://relay.example.com").unwrap(), RelayUrl::parse("https://relay.example.com:443").unwrap());
 }
 
 // ------------------------------------------------------------------------------------------------------------------------------ the poll loop against a hostile relay
@@ -507,9 +507,10 @@ fn wait_for(what: &str, secs: u64, cond: impl Fn() -> bool) {
 }
 
 /// The measured rate of a loop whose relay says `pollGapMs: 0` and `wait.default: 0` and answers every poll at once with an empty 200. By README 5.1.1 P3 the pause after
-/// idle is `pollGapMs`, so the client has no floor of its own and polls as fast as the answers come.
+/// idle is `pollGapMs`; the client has a floor of its own (`MIN_POLL_GAP_MS`, 250 ms, P3's default) and never polls faster than four a second whatever the relay advertises.
+/// (Changed with the fix: it used to assert a tight loop, `n > 20`.)
 #[test]
-fn evidence_idle_pause_has_no_floor_when_the_relay_says_poll_gap_zero() {
+fn the_client_has_a_floor_under_a_poll_gap_of_zero() {
     let e = env(StubConfig { wait_default: 0, wait_max: 0, poll_gap_ms: 0, ..Default::default() });
     let (token, _) = e.enrol_desktop();
     let epoch = e.stub.epoch();
@@ -520,7 +521,7 @@ fn evidence_idle_pause_has_no_floor_when_the_relay_says_poll_gap_zero() {
     let n = http.polls.load(Ordering::SeqCst);
     let (end, _) = running.stop();
     println!("polls in 0.5 s with pollGapMs 0 and wait 0: {n} ({end:?})");
-    assert!(n > 20, "expected a tight loop, got {n}");
+    assert!(n <= 4, "a floor of 250 ms allows at most four polls in half a second, got {n}");
 }
 
 /// The same with the shipped numbers: 250 ms and a refused-hold style relay is paced at about four a second at most.
@@ -794,7 +795,6 @@ fn a_storm_of_stop_and_network_changed_from_many_threads_ends_the_loop() {
 /// that takes the flag proves and `continue`s), so by the time the poll section runs the flag is already taken and `network_changed` there is false. The replacement poll
 /// then starts one proof round trip after the cancelled one, which is milliseconds.
 #[test]
-#[ignore = "F4-P2: the P1 250 ms rule for a replacement poll is dead code (poll_loop.rs:197-198 takes the flag, 258-263 tests the local copy after the proof branch has continued)"]
 fn finding_a_replacement_poll_starts_no_sooner_than_250_ms_after_the_one_it_cancels() {
     let e = env(StubConfig { wait_default: 20, wait_max: 20, ..Default::default() });
     let (token, _) = e.enrol_desktop();
@@ -822,9 +822,10 @@ fn finding_a_replacement_poll_starts_no_sooner_than_250_ms_after_the_one_it_canc
     assert!(gap >= Duration::from_millis(250), "{gap:?}");
 }
 
-/// A network change flood: each change forces an identity proof; the client does not debounce.
+/// A network change flood: each change calls for an identity proof, and the client debounces them: the loop waits for the network to be quiet for 100 ms (at most 1 s) before it
+/// proves the relay on it. (Changed with the fix: it used to assert that 50 changes cost at least 25 proof requests.)
 #[test]
-fn evidence_every_network_changed_costs_a_proof_request() {
+fn a_flood_of_network_changes_is_debounced_into_a_few_proofs() {
     let e = env(quick());
     let (token, _) = e.enrol_desktop();
     let epoch = e.stub.epoch();
@@ -840,13 +841,12 @@ fn evidence_every_network_changed_costs_a_proof_request() {
     let after = http.infos.load(Ordering::SeqCst);
     let _ = running.stop();
     println!("50 network changes in 1.5 s -> {} proof requests", after - before);
-    assert!(after - before >= 25, "{}", after - before);
+    assert!((1..=4).contains(&(after - before)), "{} proof requests for 50 changes in 1.5 s", after - before);
 }
 
 /// F4-C1 (low): the epoch a store hands back is put into the query string as it is. `FilePollStore::load` checks it; a host's own `PollStore` (a database, a platform
 /// preferences file) need not, and the loop does not.
 #[test]
-#[ignore = "F4-C1 (low): PollLoop::run does not validate the epoch a PollStore returns; it is appended raw to the poll URL (relay.rs:521-524)"]
 fn finding_an_epoch_from_a_host_store_is_checked_before_it_reaches_the_request_line() {
     let e = env(quick());
     let (token, _) = e.enrol_desktop();
@@ -865,10 +865,11 @@ fn finding_an_epoch_from_a_host_store_is_checked_before_it_reaches_the_request_l
     assert!(!url.contains("since=99"), "the poll URL carries a damaged epoch as it is: {url}");
 }
 
-/// F4-P1 (low/medium): a `200` from `GET /v1/info` that is not a proof (an HTML maintenance page, a proxy's body) is "an answer that does not verify": the loop ends with
-/// `report_relay_changed` and does not retry, where a `503` of the same host would be paced and retried.
+/// F4-P1 (low/medium): a `200` from `GET /v1/info` that is not a proof (an HTML maintenance page, a proxy's body) is not an answer that does not verify: it is paced and retried
+/// like a `503` of the same host, and the loop ends only on a stop. (Changed with the fix: it used to assert that the loop ended with `report_relay_changed`.) An answer that claims
+/// to be a proof (it has the headers) and does not verify still ends the loop.
 #[test]
-fn evidence_a_non_proof_200_for_info_ends_the_loop_as_not_who_it_was() {
+fn a_non_proof_200_for_info_is_paced_and_retried_like_a_503() {
     let e = env(quick());
     let (token, _) = e.enrol_desktop();
     let page = ScriptedHttp::new(|_| {
@@ -880,9 +881,13 @@ fn evidence_a_non_proof_200_for_info_ends_the_loop_as_not_who_it_was() {
     });
     let client = client_over(&e, Arc::new(page), e.clock.clone());
     let mut lp = PollLoop::new(client, token.clone(), MemoryPollStore::new(), Arc::new(RecordingSink::new()), PollLoopConfig::default());
-    let end = lp.run();
+    let h = lp.handle();
+    let t = std::thread::spawn(move || lp.run());
+    std::thread::sleep(Duration::from_millis(300));
+    h.stop();
+    let end = t.join().unwrap();
     println!("a 200 HTML page for the proof: {end:?}");
-    assert!(matches!(end, LoopEnd::Stopped { action: oaiy_relay_core::poll::Action::ReportRelayChanged, .. }));
+    assert_eq!(end, LoopEnd::Cancelled, "the loop kept trying until it was stopped");
     // The same host answering 503 instead is a failure that is paced and retried (the loop would not end on its own).
     let down = ScriptedHttp::new(|_| Ok(json_response(503, &[("retry-after", "1")], "{}", T0)));
     let client = client_over(&e, Arc::new(down), e.clock.clone());
@@ -935,7 +940,6 @@ fn a_stop_ends_a_held_poll_over_a_real_socket_within_a_fraction_of_a_second() {
 /// F4-D1 (low): `HttpResponse` derives `Debug`, which prints the whole body; the body of `POST /v1/enroll` and `POST /v1/tokens/rotate` holds the device token. (`HttpRequest`
 /// prints no header value for this reason; its response twin does not.)
 #[test]
-#[ignore = "F4-D1 (low): HttpResponse derives Debug and prints its body, which is the token for /v1/enroll and /v1/tokens/rotate (http.rs:94)"]
 fn finding_http_response_debug_does_not_print_a_token_body() {
     let r =
         HttpResponse { status: 201, headers: vec![], body: br#"{"token":"oaiyrt1.AAAAAAAAAAA.SECRETSECRETSECRETSECRETSECRETSECRETSECR"}"#.to_vec() };
@@ -1079,7 +1083,6 @@ impl HttpClient for MixedCase {
 /// one that returns names as sent) makes `prove` fail with "no X-OAIY-Proof" - the client then reports the relay as "not who it was" and the loop ends - and silently loses
 /// `Retry-After` and `X-OAIY-Time`. One `to_ascii_lowercase` in `exchange` would remove the failure mode.
 #[test]
-#[ignore = "F4-H1: header names are matched in lower case only; an adapter that returns them as sent breaks the proof (http.rs:106, poll.rs:103, relay.rs:411)"]
 fn finding_headers_are_matched_whatever_the_adapter_did_with_their_case() {
     let e = env(quick());
     let client = client_over(&e, Arc::new(MixedCase(e.stub.clone())), e.clock.clone());

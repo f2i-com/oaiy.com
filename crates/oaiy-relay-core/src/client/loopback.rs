@@ -30,6 +30,10 @@ fn split(url: &str) -> Result<(String, SocketAddr, String), TransportError> {
     if host != "127.0.0.1" && host != "localhost" {
         return Err(TransportError::Other("loopback client: not a loopback host".into()));
     }
+    // The path goes into the request line as it is: a space, a line break or any other control or non-ASCII byte in it would split or smuggle a request.
+    if path.bytes().any(|b| b <= b' ' || b >= 0x7f) {
+        return Err(TransportError::Other("loopback client: a path with a space, a control character or a byte above 0x7e".into()));
+    }
     let addr = (if host == "localhost" { "127.0.0.1" } else { host }, port)
         .to_socket_addrs()
         .map_err(|_| TransportError::Dns)?
@@ -158,7 +162,8 @@ impl HttpClient for LoopbackHttp {
                 if size == 0 {
                     break;
                 }
-                if decoded.len() + size > req.max_response_bytes {
+                // `size` is a number the server chose: nothing is added to it before it is compared with what is allowed (a size near usize::MAX is not an overflow).
+                if size > req.max_response_bytes.saturating_sub(decoded.len()) {
                     return Err(TransportError::BodyTooLarge);
                 }
                 let need = i + 2 + size + 2;

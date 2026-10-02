@@ -51,7 +51,6 @@ impl HttpClient for Rec {
 /// F-P1: README P1: a client that cancels a running poll starts the next no sooner than 250 ms after it started the one it cancels. The loop's branch for it is guarded by
 /// `network_changed`, which a proof (always due after a network change) has consumed before the branch is reached.
 #[test]
-#[ignore = "review finding: the 250 ms replacement gap of P1 is never applied after a network change (dead branch)"]
 fn rv_a_poll_that_replaces_another_after_a_network_change_waits_for_the_250_ms_of_p1() {
     let e = env(StubConfig { wait_default: 5, wait_max: 5, ..quick() });
     let (token, _) = e.enrol_desktop();
@@ -108,7 +107,10 @@ fn rv_a_phone_answers_afresh_after_its_response_was_rejected_for_its_window() {
     assert!(matches!(out, Outcome::Rejected), "the relay returned the rendezvous to open");
     phone.respond(&cancel()).unwrap();
     let again = w.deliver();
-    assert!(again.iter().any(|e| matches!(e, PairEvent::AwaitingSas { .. })), "the second answer must be a fresh response, not the lapsed one: {again:?}");
+    assert!(
+        again.iter().any(|e| matches!(e, PairEvent::AwaitingSas { .. })),
+        "the second answer must be a fresh response, not the lapsed one: {again:?}"
+    );
 }
 
 /// F-confirm: `approve_body` documents that a retry of a decision whose answer was lost sends the same receipt, but `confirm_sas`, the documented whole gate, refuses the retry

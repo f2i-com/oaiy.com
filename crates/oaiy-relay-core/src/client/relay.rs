@@ -341,7 +341,8 @@ impl RelayClient {
         }
         let request =
             HttpRequest { method, url: self.url.join(path), headers, body, timeout, max_response_bytes: MAX_RESPONSE_BYTES, cancel: cancel.clone() };
-        let response = self.http.send(&request)?;
+        // The adapter is trusted to send and to return what it was given, not to have normalised the names of the headers.
+        let response = self.http.send(&request)?.normalised();
         self.sample_time(&response);
         Ok(response)
     }
@@ -407,11 +408,12 @@ impl RelayClient {
         if response.status != 200 {
             return Err(ProveError::NoAnswer(ClientError::Relay(self.error_of(&response))));
         }
-        let verdict = (|| {
-            let proof = response.header("x-oaiy-proof").ok_or(Error::Invalid("no X-OAIY-Proof"))?;
-            let time = response.header("x-oaiy-time").ok_or(Error::Invalid("no X-OAIY-Time"))?;
-            info::verify_proof(&response.body, &nonce, time, proof, &pin)
-        })();
+        // A `200` with no proof in it at all (a maintenance page, a proxy's body, a captive portal) is not an answer to the proof request: a failure that is paced and retried like a
+        // `503`, and not "not who it was". Only an answer that claims to be a proof and does not verify is that.
+        let (Some(proof), Some(time)) = (response.header("x-oaiy-proof"), response.header("x-oaiy-time")) else {
+            return Err(ProveError::NoAnswer(ClientError::BadAnswer("the answer carries no proof")));
+        };
+        let verdict = info::verify_proof(&response.body, &nonce, time, proof, &pin);
         match verdict {
             Ok(proved) => {
                 let mut s = lock(&self.state);
@@ -519,6 +521,10 @@ impl RelayClient {
     pub fn poll(&self, token: &Token, request: &PollRequest, cancel: &Cancel) -> Result<PollReply, ClientError> {
         let mut path = format!("/v1/poll?since={}", request.since);
         if let Some(e) = &request.epoch {
+            // The epoch goes into the query as it is, so it is the relay's own spelling or nothing (a store a host wrote may hold anything).
+            if !ids::is_epoch(e) {
+                return Err(ClientError::Request(Error::Invalid("epoch")));
+            }
             path.push_str("&epoch=");
             path.push_str(e);
         }
@@ -556,9 +562,10 @@ impl RelayClient {
 
     // ------------------------------------------------------------------------------------------------------------ admission
 
-    /// True for a relay on loopback over plain `http` in a build with the `loopback-http` feature: its admission is then read with `ws://` and `http://` on loopback accepted.
+    /// True for a relay on loopback over plain `http` (a [`RelayUrl`] is `http` only when the program called [`crate::url::allow_loopback_http`]): its admission is then read
+    /// with `ws://` and `http://` on loopback accepted.
     fn lax_transport(&self) -> bool {
-        cfg!(feature = "loopback-http") && !self.url.is_https()
+        !self.url.is_https()
     }
 
     /// `POST /v1/admission` with a phone's token: the phone's admission, read as the shipped phone reads it. `expect` is the phone's own session.

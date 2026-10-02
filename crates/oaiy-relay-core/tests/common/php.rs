@@ -89,6 +89,8 @@ fn php_command(php: &Path) -> Command {
 impl PhpRelay {
     /// Installs a relay in a scratch directory and starts `workers` servers on it. `None` (and a note on stderr) when PHP is not usable.
     pub fn start(workers: usize, wait_max: u64, call_features: bool) -> Option<PhpRelay> {
+        // The relay is on plain http on loopback: this program says so (a product build has no such call).
+        oaiy_relay_core::url::allow_loopback_http(true);
         let php = match find_php() {
             Ok(p) => p,
             Err(why) => {

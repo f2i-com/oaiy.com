@@ -36,7 +36,10 @@ fn rv_poll_differential() {
             poll::decide_proof(state, r, u, 0, asked)
         } else {
             let info = c.get("info").unwrap();
-            let info = PollInfo { poll_gap_ms: info.get("pollGapMs").and_then(Json::as_int).unwrap() as u64, fallback_s: info.get("fallbackS").and_then(Json::as_int).unwrap() as u64 };
+            let info = PollInfo {
+                poll_gap_ms: info.get("pollGapMs").and_then(Json::as_int).unwrap() as u64,
+                fallback_s: info.get("fallbackS").and_then(Json::as_int).unwrap() as u64,
+            };
             let status = c.get("status").and_then(Json::as_int).map(|s| s as u16);
             let headers: Vec<(String, String)> = c
                 .get("headers")

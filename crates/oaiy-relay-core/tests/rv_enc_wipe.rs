@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 use oaiy_crypto::zeroize::Secret;
 use oaiy_relay_core::admission::Bearer;
-use oaiy_relay_core::enrol::{EnrolmentKey, Enrolled, Role};
+use oaiy_relay_core::enrol::{Enrolled, EnrolmentKey, Role};
 use oaiy_relay_core::ids::Token;
 use oaiy_relay_core::keys::X25519Secret;
 use oaiy_relay_core::pairing::math::{parse_typed_code, typed_code, PairingKey, PairingSecret};

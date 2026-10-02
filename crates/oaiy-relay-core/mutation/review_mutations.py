@@ -137,7 +137,7 @@ MUTATIONS = [
     ("R07", "426", "every 426 stops the loop, not only one that makes the client too old", C + "poll.rs",
      "if status == Some(426) && min_client_above_ours {", "if status == Some(426) {", "own"),
     ("R08", "info clamps", "pollGapMs is clamped to 50 s, not 5 s", C + "poll.rs",
-     "poll_gap_ms: info.wait.poll_gap_ms.min(5000)", "poll_gap_ms: info.wait.poll_gap_ms.min(50000)", "own"),
+     "poll_gap_ms: info.wait.poll_gap_ms.clamp(MIN_POLL_GAP_MS, 5000)", "poll_gap_ms: info.wait.poll_gap_ms.clamp(MIN_POLL_GAP_MS, 50000)", "own"),
     ("R09", "first 400", "the first 400's Retry-After is honoured (README P5 literal)", C + "poll.rs",
      "let mut d = decision(Outcome::Failure, doubling(n, BACKOFF_FAILURE_CAP_S) as f64, u, Counters { n_fail: n, n400: 1, ..cleared }, since);",
      "let mut d = decision(Outcome::Failure, (doubling(n, BACKOFF_FAILURE_CAP_S) as f64).max(retry_after(&answer, now_epoch).map_or(0.0, |x| clamp_pause(i128::from(x)) as f64)), u, Counters { n_fail: n, n400: 1, ..cleared }, since);", "own"),
@@ -145,7 +145,7 @@ MUTATIONS = [
      "Json::Num(Number::Int(n)) => Some(*n),\n        Json::Num(Number::Big(t)) =>", "Json::Num(Number::Int(n)) => Some(*n),\n        Json::Num(Number::Other(t)) if t == \"-0\" => Some(0),\n        Json::Num(Number::Big(t)) =>", "own"),
     # ------------------------------------------------------------------------------------------------ the driver and the client
     ("L04", "P1 replace gap", "the 250 ms wait before a replacing poll is removed", C + "client/poll_loop.rs",
-     "if network_changed && wait_ms > 0 && !self.sleep(wait_ms as f64 / 1000.0) {", "if false {", "own"),
+     "if wait_ms > 0 && !self.sleep(wait_ms as f64 / 1000.0) {", "if false {", "own"),
     ("L05", "clear_epoch", "after the first 400 the in-memory epoch is not cleared (the retry sends it again)", C + "client/poll_loop.rs",
      "                        let _ = self.store.clear_epoch();\n                        cursor.epoch = None;", "                        let _ = self.store.clear_epoch();", "own"),
     ("L06", "P9", "the longest pause after a poll answer is not tracked for the proof schedule", C + "client/poll_loop.rs",

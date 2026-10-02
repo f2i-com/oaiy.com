@@ -415,7 +415,14 @@ fn attack_a_valid_response_in_an_item_of_another_lane_or_another_sender_is_not_a
         body: text.clone(),
         rp: None,
     };
-    for (lane, from) in [("cmd", "relay"), ("res", "relay"), ("sync", "relay"), ("pair", "dev-AAAAAAAAAAAAAAAAAAAAAA"), ("pair", "prov-AAAAAAAAAAAAAAAAAAAAAA"), ("pair", "")] {
+    for (lane, from) in [
+        ("cmd", "relay"),
+        ("res", "relay"),
+        ("sync", "relay"),
+        ("pair", "dev-AAAAAAAAAAAAAAAAAAAAAA"),
+        ("pair", "prov-AAAAAAAAAAAAAAAAAAAAAA"),
+        ("pair", ""),
+    ] {
         let event = w.desktop.on_pair_item(&w.env.client, &w.token, &item(lane, from), &cancel()).unwrap();
         assert!(matches!(event, PairEvent::Ignored(_)), "{lane} from {from:?}: {event:?}");
     }
@@ -439,7 +446,11 @@ fn attack_a_decision_answer_that_does_not_say_what_was_decided_is_refused() {
         let r = w.env.client.pair_decision(&w.token, "AAAAAAAAAAAAAAAAAAAAAA", "{\"approve\":true}", &cancel());
         assert!(matches!(r, Err(ClientError::BadAnswer(_))), "{body}: {r:?}");
     }
-    w.env.stub.fail_next_on("/v1/pair/", 1, Fault::Respond(200, vec![], r#"{"v":1,"state":"approved","deviceId":"dev-AAAAAAAAAAAAAAAAAAAAAA","time":1}"#.into()));
+    w.env.stub.fail_next_on(
+        "/v1/pair/",
+        1,
+        Fault::Respond(200, vec![], r#"{"v":1,"state":"approved","deviceId":"dev-AAAAAAAAAAAAAAAAAAAAAA","time":1}"#.into()),
+    );
     let ok = w.env.client.pair_decision(&w.token, "AAAAAAAAAAAAAAAAAAAAAA", "{\"approve\":true}", &cancel()).unwrap();
     assert_eq!(ok.state, "approved");
 }

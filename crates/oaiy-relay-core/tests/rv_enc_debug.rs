@@ -3,7 +3,7 @@
 
 use oaiy_crypto::zeroize::Secret;
 use oaiy_relay_core::admission::{Bearer, IceServer};
-use oaiy_relay_core::enrol::{EnrolmentKey, Enrolled, Role};
+use oaiy_relay_core::enrol::{Enrolled, EnrolmentKey, Role};
 use oaiy_relay_core::ids::Token;
 use oaiy_relay_core::keys::{Signer, X25519Secret};
 use oaiy_relay_core::pairing::math::{typed_code, PairingKey, PairingSecret};
@@ -49,7 +49,11 @@ fn battery() -> Vec<String> {
 
     // not secret by design in the crate's eyes, but holding a secret
     check("PairingInput::Key(uri) [derives Debug]", format!("{:?}", PairingInput::Key(&uri)), &[&ps_b64]);
-    check("PairingInput::Typed{code,..} [derives Debug]", format!("{:?}", PairingInput::Typed { code: &code, host: "relay.example.com" }), &[&code[..4]]);
+    check(
+        "PairingInput::Typed{code,..} [derives Debug]",
+        format!("{:?}", PairingInput::Typed { code: &code, host: "relay.example.com" }),
+        &[&code[..4]],
+    );
     let ice = IceServer {
         urls: vec!["turn:turn.example.com:3478".into()],
         username: "1790000600:opaque".into(),

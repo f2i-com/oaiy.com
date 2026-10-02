@@ -59,8 +59,13 @@ pub struct Counters {
     pub n400: u32,
 }
 
+/// The shortest pause after an idle poll this client takes, whatever the relay advertises: 250 ms, README P3's default (`info.wait.pollGapMs`, "250 by default, 0 to 5000") and
+/// the value the relay's own gap rule ships with. A relay that advertises less (0 is allowed by its configuration) would have the client poll in a tight loop, which the gap rule
+/// then refuses with `429`s; the floor is in [`PollInfo::from_info`], where a client reads `info`, and not in [`decide`], which keeps the table of P3 as written.
+pub const MIN_POLL_GAP_MS: u64 = 250;
+
 /// What the rules read of `GET /v1/info`: `wait.pollGapMs` and `wait.fallbackS`. A relay that says more than its own configuration allows is clamped to it (0 to 5000
-/// ms; 1 to 60 s).
+/// ms; 1 to 60 s), and `pollGapMs` is never below [`MIN_POLL_GAP_MS`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PollInfo {
     /// `info.wait.pollGapMs`: the pause after a poll that made no progress.
@@ -72,7 +77,7 @@ pub struct PollInfo {
 impl PollInfo {
     /// The values of a parsed `info`, clamped to what the relay's own configuration allows (`gap_ms` 0 to 5000, `fallback_s` 1 to 60).
     pub fn from_info(info: &crate::info::Info) -> PollInfo {
-        PollInfo { poll_gap_ms: info.wait.poll_gap_ms.min(5000), fallback_s: info.wait.fallback_s.clamp(1, 60) }
+        PollInfo { poll_gap_ms: info.wait.poll_gap_ms.clamp(MIN_POLL_GAP_MS, 5000), fallback_s: info.wait.fallback_s.clamp(1, 60) }
     }
 }
 
@@ -88,7 +93,7 @@ impl Default for PollInfo {
 pub struct Answer<'a> {
     /// The HTTP status, or `None` when no response came back (refused, reset, TLS error, the poll's own timeout, a body that ended early).
     pub status: Option<u16>,
-    /// The headers, names in lower case; the first of a repeated name is the one read.
+    /// The headers, names matched without regard to case; the first of a repeated name is the one read.
     pub headers: &'a [(String, String)],
     /// The body parsed as JSON, or `None` when there was none or it was not JSON.
     pub body: Option<&'a Json>,
@@ -101,12 +106,13 @@ impl Answer<'_> {
     }
 
     fn header(&self, name: &str) -> Option<&str> {
-        self.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+        self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
     }
 }
 
-/// An integer as Python's `isinstance(x, int)` and JavaScript's `Number.isInteger` see it: an integer spelling of any size (saturated here) and nothing that has a fraction,
-/// an exponent or is `-0`.
+/// An integer literal, as the README's rule reads it (Interpretation 23): digits only (an optional minus sign), no fraction, no exponent, and not `-0`; `1.0`, `1e2` and `-0` are
+/// not integers, whatever a language's `Number` would make of them. A literal of any size is an integer here (saturated to the `i128` range), so that the callers' own range
+/// checks refuse it: a `seq` or `cursor` above 2^53 - 1 is not a uint53 and is dropped (`accepted_items`, `valid_200`), not read as a smaller number.
 fn int_like(v: &Json) -> Option<i128> {
     match v {
         Json::Num(Number::Int(n)) => Some(*n),
@@ -439,6 +445,8 @@ pub enum ProofResult {
     NoAnswer,
     /// An answer that does not verify: a replayed body and signature, another key.
     Invalid,
+    /// A `429`: the relay answered, so it is never a failure (P2): the pause of P5's flow, and the 429 count rises.
+    Flow,
 }
 
 fn decision(outcome: Outcome, base_s: f64, u: f64, counters: Counters, since: u64) -> Decision {
@@ -468,6 +476,11 @@ pub fn decide_proof(counters: Counters, result: ProofResult, u: f64, since: u64,
             let mut d = decision(Outcome::Stop, 0.0, u, counters, since);
             d.action = Some(Action::ReportRelayChanged);
             d
+        }
+        ProofResult::Flow => {
+            let n = counters.n429 + 1;
+            let base = clamp_pause(asked.map_or(1, i128::from)).max(doubling(n, BACKOFF_429_CAP_S));
+            decision(Outcome::Flow, base as f64, u, Counters { n429: n, ..Counters::default() }, since)
         }
     }
 }
@@ -602,6 +615,37 @@ mod tests {
         ] {
             assert_eq!(parse_http_date(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn headers_are_read_without_regard_to_the_case_of_their_names() {
+        let h = headers(&[("Retry-After", " 12 "), ("DATE", "Sun, 06 Nov 1994 08:49:37 GMT")]);
+        let answer = Answer { status: Some(429), headers: &h, body: None };
+        assert_eq!(retry_after(&answer, None), Some(12));
+        let dated = headers(&[("RETRY-AFTER", "Sun, 06 Nov 1994 08:49:47 GMT"), ("Date", "Sun, 06 Nov 1994 08:49:37 GMT")]);
+        assert_eq!(
+            retry_after(&Answer { status: Some(429), headers: &dated, body: None }, None),
+            Some(10),
+            "the Date header of the same answer, in any spelling"
+        );
+    }
+
+    #[test]
+    fn a_429_for_the_proof_is_flow_and_never_a_failure() {
+        let c = Counters { n429: 2, n_fail: 5, n_refused: 3, n400: 1 };
+        let d = decide_proof(c, ProofResult::Flow, 0.0, 7, None);
+        assert_eq!((d.outcome, d.base_s, d.since), (Outcome::Flow, 4.0, 7), "max(clamp(1), min(30, 2^2))");
+        assert_eq!(
+            d.counters,
+            Counters { n429: 3, n_fail: 0, n_refused: 0, n400: 0 },
+            "the 429 count rises and the others are cleared, as for a poll"
+        );
+        assert!(d.reports.is_empty() && d.action.is_none(), "a 429 never reports unreachable");
+        let asked = decide_proof(Counters::default(), ProofResult::Flow, 0.5, 0, Some(50));
+        assert_eq!((asked.outcome, asked.base_s), (Outcome::Flow, 50.0));
+        assert!((asked.pause_s - 55.0).abs() < 1e-9, "{}", asked.pause_s);
+        assert_eq!(decide_proof(Counters::default(), ProofResult::Flow, 0.0, 0, Some(9999)).base_s, 120.0, "clamped as P6 says");
+        assert_eq!(decide_proof(Counters { n429: 40, ..Counters::default() }, ProofResult::Flow, 0.0, 0, None).base_s, 30.0, "the cap of P5");
     }
 
     #[test]

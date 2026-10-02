@@ -851,3 +851,27 @@ fn an_ed25519_key_in_a_non_canonical_encoding_is_refused_though_it_names_a_good_
     }
     assert!(tried >= 5, "{tried} of the small y values name a point of the prime-order group");
 }
+
+#[test]
+fn the_poll_gap_has_a_floor_of_250_ms_and_a_ceiling_of_5_s_whatever_the_relay_advertises() {
+    let v = vectors();
+    let a = v.at("A6b");
+    let nonce = b64::decode(a.s("inputs.nonce")).unwrap();
+    let proved = info::verify_proof(
+        a.s("expected.bodyText").as_bytes(),
+        &nonce,
+        &a.n("inputs.time").to_string(),
+        a.s("expected.proof"),
+        v.s("keys.ed25519Public.relay.thumbprint"),
+    )
+    .unwrap();
+    let mut i = proved.info;
+    for (advertised, used) in [(0u64, 250u64), (100, 250), (249, 250), (250, 250), (300, 300), (5000, 5000), (60_000, 5000)] {
+        i.wait.poll_gap_ms = advertised;
+        assert_eq!(oaiy_relay_core::poll::PollInfo::from_info(&i).poll_gap_ms, used, "pollGapMs {advertised}");
+    }
+    for (advertised, used) in [(0u64, 1u64), (5, 5), (60, 60), (500, 60)] {
+        i.wait.fallback_s = advertised;
+        assert_eq!(oaiy_relay_core::poll::PollInfo::from_info(&i).fallback_s, used, "fallbackS {advertised}");
+    }
+}

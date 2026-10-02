@@ -11,7 +11,6 @@ use oaiy_relay_core::url::RelayUrl;
 use oaiy_relay_core::{b64, keys::VerifyKey};
 
 #[test]
-#[ignore = "low: https://host and https://host:443 are one origin, and compare unequal (offer.relay.url against the host the owner typed)"]
 fn the_default_port_is_the_same_origin() {
     assert_eq!(RelayUrl::parse("https://relay.example.com:443").unwrap(), RelayUrl::parse("https://relay.example.com").unwrap());
 }

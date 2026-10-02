@@ -3,6 +3,8 @@
 //! `attack_*` tests assert the secure behaviour and pass today. `finding_*` tests assert what the README or the design asks for and FAIL today; they are `#[ignore]`d so that the
 //! suite stays green: `cargo test -p oaiy-relay-core --test rv_pairing_phone -- --ignored` shows each failure.
 
+#![allow(clippy::type_complexity)]
+
 mod common;
 
 use std::sync::Mutex;
@@ -153,19 +155,63 @@ fn attack_a_hostile_relay_cannot_get_a_profile_or_a_token_opened_with_a_receipt_
     assert!(Token::parse(TOKEN).is_ok());
     let stranger = Signer::generate().unwrap();
     let other_pid = b64::encode(&[9u8; 16]);
-    let sign = |signer: &Signer, app: &str, grants: &[String], at: u64, thumb: &str, pid: &str| math::sign_receipt(signer, app, grants, at, thumb, pid).unwrap();
+    let sign = |signer: &Signer, app: &str, grants: &[String], at: u64, thumb: &str, pid: &str| {
+        math::sign_receipt(signer, app, grants, at, thumb, pid).unwrap()
+    };
     let text = math::receipt_text("aokie", &g, now, &p.thumb, &pid).unwrap();
     // Each is a relay's answer `approved` that a phone must refuse with the box never opened (the box here IS for this phone: only the receipt is wrong).
     let scenarios: Vec<(&str, u64, String, Option<Vec<&str>>, PairingError)> = vec![
-        ("signed by a key that is not the desktop's", now, sign(&stranger, "aokie", &g, now, &p.thumb, &pid), Some(vec!["state_read"]), PairingError::ReceiptInvalid),
+        (
+            "signed by a key that is not the desktop's",
+            now,
+            sign(&stranger, "aokie", &g, now, &p.thumb, &pid),
+            Some(vec!["state_read"]),
+            PairingError::ReceiptInvalid,
+        ),
         ("another pairing's pid", now, sign(desk, "aokie", &g, now, &p.thumb, &other_pid), Some(vec!["state_read"]), PairingError::ReceiptInvalid),
-        ("another phone's key", now, sign(desk, "aokie", &g, now, &stranger.thumbprint(), &pid), Some(vec!["state_read"]), PairingError::ReceiptInvalid),
+        (
+            "another phone's key",
+            now,
+            sign(desk, "aokie", &g, now, &stranger.thumbprint(), &pid),
+            Some(vec!["state_read"]),
+            PairingError::ReceiptInvalid,
+        ),
         ("another app", now, sign(desk, "otherapp", &g, now, &p.thumb, &pid), Some(vec!["state_read"]), PairingError::ReceiptInvalid),
-        ("grants the desktop did not sign", now, sign(desk, "aokie", &g, now, &p.thumb, &pid), Some(vec!["state_read", "takeover"]), PairingError::ReceiptInvalid),
-        ("fewer grants than signed", now, sign(desk, "aokie", &["state_read".to_string(), "caller_read".to_string()], now, &p.thumb, &pid), Some(vec!["state_read"]), PairingError::ReceiptInvalid),
-        ("a grant that no desktop knows", now, sign(desk, "aokie", &["bogus".to_string()], now, &p.thumb, &pid), Some(vec!["bogus"]), PairingError::ReceiptInvalid),
-        ("dated 31 s in the future", now + 31, sign(desk, "aokie", &g, now + 31, &p.thumb, &pid), Some(vec!["state_read"]), PairingError::ReceiptInvalid),
-        ("dated 31 s before the phone asked", now - 31, sign(desk, "aokie", &g, now - 31, &p.thumb, &pid), Some(vec!["state_read"]), PairingError::ReceiptInvalid),
+        (
+            "grants the desktop did not sign",
+            now,
+            sign(desk, "aokie", &g, now, &p.thumb, &pid),
+            Some(vec!["state_read", "takeover"]),
+            PairingError::ReceiptInvalid,
+        ),
+        (
+            "fewer grants than signed",
+            now,
+            sign(desk, "aokie", &["state_read".to_string(), "caller_read".to_string()], now, &p.thumb, &pid),
+            Some(vec!["state_read"]),
+            PairingError::ReceiptInvalid,
+        ),
+        (
+            "a grant that no desktop knows",
+            now,
+            sign(desk, "aokie", &["bogus".to_string()], now, &p.thumb, &pid),
+            Some(vec!["bogus"]),
+            PairingError::ReceiptInvalid,
+        ),
+        (
+            "dated 31 s in the future",
+            now + 31,
+            sign(desk, "aokie", &g, now + 31, &p.thumb, &pid),
+            Some(vec!["state_read"]),
+            PairingError::ReceiptInvalid,
+        ),
+        (
+            "dated 31 s before the phone asked",
+            now - 31,
+            sign(desk, "aokie", &g, now - 31, &p.thumb, &pid),
+            Some(vec!["state_read"]),
+            PairingError::ReceiptInvalid,
+        ),
         (
             "signed under the response domain",
             now,
@@ -181,7 +227,11 @@ fn attack_a_hostile_relay_cannot_get_a_profile_or_a_token_opened_with_a_receipt_
         assert_eq!(result.err(), Some(expected), "{what}");
     }
     // Control, last (a paired phone is done): a receipt that is right in every member pairs.
-    w.env.stub.fail_next_on("/v1/pair/", 1, Fault::Respond(200, vec![], approved_body(&sealed, now, &sign(desk, "aokie", &g, now, &p.thumb, &pid), Some(&["state_read"]))));
+    w.env.stub.fail_next_on(
+        "/v1/pair/",
+        1,
+        Fault::Respond(200, vec![], approved_body(&sealed, now, &sign(desk, "aokie", &g, now, &p.thumb, &pid), Some(&["state_read"]))),
+    );
     assert!(matches!(p.pairing.wait_outcome(None, &cancel()), Ok(Outcome::Paired(_))), "control");
 }
 
@@ -622,7 +672,9 @@ fn attack_a_phone_refuses_an_offer_whose_window_is_over_or_not_yet_begun_even_wh
     // The implementer's test of an expired offer (pairing_stub.rs) passes through the stub's own 404 and never reaches the phone's window check.
     let mut w = world(quick());
     let now = w.env.client.relay_now_or_local();
-    for (what, issued) in [("issued 1,000 s ago", now - 1000), ("issued 1,000 s ahead", now + 1000), ("issued 631 s ago", now - 631), ("issued 31 s ahead", now + 31)] {
+    for (what, issued) in
+        [("issued 1,000 s ago", now - 1000), ("issued 1,000 s ahead", now + 1000), ("issued 631 s ago", now - 631), ("issued 31 s ahead", now + 31)]
+    {
         let offer = w.desktop.create_offer(&mut w.rng, issued).unwrap();
         w.desktop.open(&w.env.client, &w.token, &offer, &cancel()).unwrap();
         let mut p = w.phone(PairingInput::Key(&offer.pairing_uri), 90);

@@ -10,7 +10,8 @@
 //!   hostile or broken), and a body that ends before its `Content-Length` is [`TransportError::ShortBody`];
 //! - the request is abandoned when `timeout` has passed ([`TransportError::Timeout`]) or when `cancel` is set ([`TransportError::Cancelled`]), whichever is first: this
 //!   is how a poll that a newer one replaces (P1) is ended, and how a loop is stopped;
-//! - header names of the response are returned in lower case, and every header the server sent is returned, repeated ones included, in the order received.
+//! - every header the server sent is returned, repeated ones included, in the order received (the names in lower case if the adapter can, and in any case the client reads
+//!   them without regard to case: [`HttpResponse::normalised`]).
 
 use core::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -91,20 +92,43 @@ impl HttpRequest {
 }
 
 /// A response: a status and what came with it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The client does not trust an adapter to have lower-cased the header names (an OkHttp adapter returns them as the server sent them): it normalises them itself, once, as the
+/// response comes in ([`HttpResponse::normalised`]), and [`HttpResponse::header`] matches without regard to case in any case.
+#[derive(Clone, PartialEq, Eq)]
 pub struct HttpResponse {
     /// The status code.
     pub status: u16,
-    /// The headers, names in lower case.
+    /// The headers, names in lower case once the response has been through [`HttpResponse::normalised`].
     pub headers: Vec<(String, String)>,
-    /// The body.
+    /// The body. A body can carry a credential (the answers of `/v1/enroll` and `/v1/tokens/rotate` do): `Debug` prints its length and nothing of it.
     pub body: Vec<u8>,
 }
 
+impl fmt::Debug for HttpResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let names: Vec<&str> = self.headers.iter().map(|(k, _)| k.as_str()).collect();
+        write!(f, "HttpResponse({} headers {:?}, {} body bytes)", self.status, names, self.body.len())
+    }
+}
+
 impl HttpResponse {
-    /// The first header called `name` (give it in lower case).
+    /// A response with its header names in lower case.
+    pub fn new(status: u16, headers: Vec<(String, String)>, body: Vec<u8>) -> HttpResponse {
+        HttpResponse { status, headers, body }.normalised()
+    }
+
+    /// This response with every header name in ASCII lower case (values and order untouched).
+    pub fn normalised(mut self) -> HttpResponse {
+        for (k, _) in self.headers.iter_mut() {
+            k.make_ascii_lowercase();
+        }
+        self
+    }
+
+    /// The first header called `name`, whatever the case of either.
     pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+        self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
     }
 }
 
@@ -164,5 +188,44 @@ impl<T: HttpClient + ?Sized> HttpClient for Arc<T> {
 impl<T: HttpClient + ?Sized> HttpClient for Box<T> {
     fn send(&self, request: &HttpRequest) -> Result<HttpResponse, TransportError> {
         (**self).send(request)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_names_are_read_without_regard_to_case_and_the_response_normalises_them() {
+        let r = HttpResponse::new(
+            200,
+            vec![
+                ("X-OAIY-Proof".into(), "p".into()),
+                ("Retry-After".into(), "7".into()),
+                ("retry-after".into(), "9".into()),
+                ("X-OAIY-Time".into(), "5".into()),
+            ],
+            b"{}".to_vec(),
+        );
+        assert_eq!(r.headers.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), ["x-oaiy-proof", "retry-after", "retry-after", "x-oaiy-time"]);
+        assert_eq!(r.header("X-OAIY-Proof"), Some("p"));
+        assert_eq!(r.header("x-oaiy-proof"), Some("p"));
+        assert_eq!(r.header("RETRY-AFTER"), Some("7"), "the first of a repeated name");
+        // A literal built by hand, as an adapter might, is read the same way, and `normalised` does not touch values or order.
+        let raw = HttpResponse { status: 200, headers: vec![("Retry-After".into(), "Mixed-Case Value".into())], body: Vec::new() };
+        assert_eq!(raw.header("retry-after"), Some("Mixed-Case Value"));
+        assert_eq!(raw.normalised().headers, vec![("retry-after".to_string(), "Mixed-Case Value".to_string())]);
+    }
+
+    #[test]
+    fn debug_of_a_response_prints_no_body() {
+        let r = HttpResponse::new(
+            201,
+            vec![("content-type".into(), "application/json".into())],
+            br#"{"token":"oaiyrt1.AAAAAAAAAAA.SECRETSECRETSECRET"}"#.to_vec(),
+        );
+        let shown = format!("{r:?}");
+        assert!(!shown.contains("SECRET") && !shown.contains("83, 69, 67"), "{shown}");
+        assert!(shown.contains("201") && shown.contains(&r.body.len().to_string()), "{shown}");
     }
 }

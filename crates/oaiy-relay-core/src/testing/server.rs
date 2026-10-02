@@ -115,8 +115,11 @@ fn serve_one(stub: &StubRelay, mut stream: TcpStream, addr: SocketAddr) {
 }
 
 impl StubRelay {
-    /// Serves the stub on `127.0.0.1` at a port the operating system chooses, and sets its public URL to it.
+    /// Serves the stub on `127.0.0.1` at a port the operating system chooses, and sets its public URL to it. Only in a build with the `loopback-http` feature, and it makes this
+    /// program read plain `http` on loopback ([`crate::url::allow_loopback_http`]): the stub's own public URL is one.
+    #[cfg(feature = "loopback-http")]
     pub fn serve_loopback(&self) -> std::io::Result<StubServer> {
+        crate::url::allow_loopback_http(true);
         let listener = TcpListener::bind("127.0.0.1:0")?;
         listener.set_nonblocking(true)?;
         let addr = listener.local_addr()?;

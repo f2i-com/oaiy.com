@@ -26,6 +26,12 @@ use super::relay::{PollRequest, ProveError, RelayClient};
 use super::status::{ConnectionState, Event, StatusSink};
 use super::store::{AcceptedItem, Item, PersistBatch, PollStore};
 
+/// How long the loop waits for the network to stop changing before it proves the relay on the new one (a flapping interface signals many times a second): each further
+/// signal restarts the wait, for at most [`NETWORK_SETTLE_MAX`] in all.
+pub const NETWORK_QUIET: Duration = Duration::from_millis(100);
+/// The longest the loop waits for a flapping network to settle.
+pub const NETWORK_SETTLE_MAX: Duration = Duration::from_secs(1);
+
 /// How the loop is set.
 #[derive(Debug, Clone)]
 pub struct PollLoopConfig {
@@ -59,6 +65,8 @@ pub enum LoopEnd {
     },
     /// The store could not be read at the start: the loop did not start (a damaged cursor is never treated as a first run).
     StoreUnreadable(String),
+    /// The loop could not make a request: a defect in what it was asked to send, in words that carry no secret. It is not a stop of the handle, and it is not a rule of P2.
+    Failed(String),
 }
 
 struct HandleState {
@@ -90,7 +98,8 @@ impl PollHandle {
         self.interrupt();
     }
 
-    /// The network changed: the poll in flight (or the pause) is ended, the relay is proved again, and the next poll starts no sooner than 250 ms after the one that was ended (P1).
+    /// The network changed: the poll in flight (or the pause) is ended, the loop waits for the network to settle ([`NETWORK_QUIET`]), the relay is proved again, and the next poll
+    /// starts no sooner than 250 ms after the one that was ended (P1).
     pub fn network_changed(&self) {
         self.0.network_changed.store(true, Ordering::SeqCst);
         self.interrupt();
@@ -152,6 +161,21 @@ impl<S: PollStore> PollLoop<S> {
         self.sink.event(&e);
     }
 
+    /// Waits until no network change has been signalled for [`NETWORK_QUIET`], at most [`NETWORK_SETTLE_MAX`] in all. False when the loop was stopped meanwhile.
+    fn settle(&self) -> bool {
+        let clock = self.client.clock().clone();
+        let start = clock.monotonic();
+        loop {
+            if !self.sleep(NETWORK_QUIET.as_secs_f64()) || self.handle.stopped() {
+                return false;
+            }
+            if self.handle.take_network_changed() && clock.monotonic().saturating_sub(start) < NETWORK_SETTLE_MAX {
+                continue;
+            }
+            return true;
+        }
+    }
+
     fn sleep(&self, seconds: f64) -> bool {
         if seconds <= 0.0 {
             return !self.handle.stopped();
@@ -169,6 +193,10 @@ impl<S: PollStore> PollLoop<S> {
             Ok(c) => c,
             Err(e) => return LoopEnd::StoreUnreadable(e.to_string()),
         };
+        // An epoch a host's store hands back is the relay's spelling or nothing: it goes into the request line.
+        if cursor.epoch.as_deref().is_some_and(|e| !crate::ids::is_epoch(e)) {
+            cursor.epoch = None;
+        }
         let clock = self.client.clock().clone();
         let mut counters = Counters::default();
         let mut state = ConnectionState::Idle;
@@ -176,6 +204,7 @@ impl<S: PollStore> PollLoop<S> {
         let mut last_proof: Option<Duration> = None;
         let mut longest_pause_s = 0u64;
         let mut last_start: Option<Duration> = None;
+        let mut replace_pending = false;
         let mut warned_clock = false;
         let mut poll_info = PollInfo::default();
         let mut wait_s = 20u64;
@@ -194,7 +223,15 @@ impl<S: PollStore> PollLoop<S> {
             if self.handle.stopped() {
                 return LoopEnd::Cancelled;
             }
-            let network_changed = self.handle.take_network_changed();
+            let mut network_changed = false;
+            if self.handle.take_network_changed() {
+                network_changed = true;
+                // The poll that was in flight was cancelled by this change: the next one replaces it (P1) whatever the proof in between takes.
+                replace_pending = true;
+                if !self.settle() {
+                    return LoopEnd::Cancelled;
+                }
+            }
             let due = ProofDue {
                 process_start,
                 network_changed,
@@ -215,7 +252,12 @@ impl<S: PollStore> PollLoop<S> {
                     Err(ProveError::NoAnswer(super::relay::ClientError::Cancelled)) => continue,
                     Err(ProveError::NoAnswer(e)) => {
                         asked = e.relay().and_then(|r| r.retry_after);
-                        ProofResult::NoAnswer
+                        // A `429` of `GET /v1/info` is a `429` like any other (P2): the relay answered, so it is flow and not a failure.
+                        if e.relay().is_some_and(|r| r.status == 429) {
+                            ProofResult::Flow
+                        } else {
+                            ProofResult::NoAnswer
+                        }
                     }
                     Err(ProveError::Invalid(_)) => ProofResult::Invalid,
                 };
@@ -254,12 +296,16 @@ impl<S: PollStore> PollLoop<S> {
                 }
             }
 
-            // P1: a poll that replaces another starts no sooner than 250 ms after the one it replaces.
-            if let Some(started) = last_start {
-                let wait_ms = poll::replace_wait_ms(clock.monotonic().saturating_sub(started).as_millis() as u64);
-                if network_changed && wait_ms > 0 && !self.sleep(wait_ms as f64 / 1000.0) {
-                    return LoopEnd::Cancelled;
+            // P1: a poll that replaces another starts no sooner than 250 ms after the one it replaces. (The flag outlives the proof that a network change always calls for: the
+            // iteration that takes the change proves and goes round again, and the poll is sent by a later one.)
+            if replace_pending {
+                if let Some(started) = last_start {
+                    let wait_ms = poll::replace_wait_ms(clock.monotonic().saturating_sub(started).as_millis() as u64);
+                    if wait_ms > 0 && !self.sleep(wait_ms as f64 / 1000.0) {
+                        return LoopEnd::Cancelled;
+                    }
                 }
+                replace_pending = false;
             }
 
             let request = PollRequest { since: cursor.since, epoch: cursor.epoch.clone(), wait_s, limit: self.config.limit };
@@ -276,7 +322,7 @@ impl<S: PollStore> PollLoop<S> {
                     set_state!(ConnectionState::Suspect);
                     return LoopEnd::Stopped { action: Action::ReportRelayChanged, status: None, code: None, counters };
                 }
-                Err(_) => return LoopEnd::Cancelled,
+                Err(e) => return LoopEnd::Failed(e.to_string()),
             };
             if reply.transport == Some(TransportError::Cancelled) {
                 // A poll that this client ended (a stop, or a network change): its answer is discarded and the next poll is its replacement.
