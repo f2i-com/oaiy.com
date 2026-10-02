@@ -1783,6 +1783,24 @@ mod tests {
     }
 
     #[test]
+    fn unlinking_leaves_no_timer_behind_whatever_state_it_started_in() {
+        // The timer is for a file that could not be read, and a store with nothing linked has none to wait for. Moving a held
+        // file aside clears it on that path; this is the other, with a link in the store and a timer that has no business
+        // being there (a store that was never meant to be in this state is not one that is left in it).
+        let dir = data_dir("unlink-timer");
+        let store = load_store(dir.clone());
+        store.persist(&account()).unwrap();
+        store.inner.lock().unwrap().account = Some(account());
+        read_again_now(&store);
+        assert!(store.inner.lock().unwrap().retry.is_some());
+
+        let after = store.unlink();
+        assert!(!after.linked && after.link_error.is_none(), "{after:?}");
+        assert!(store.inner.lock().unwrap().retry.is_none(), "nothing is waited for once the link is forgotten");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_new_link_over_a_file_that_is_held_puts_it_aside_and_leaves_no_timer() {
         let dir = data_dir("persist-held");
         let file = dir.join("link").join("account.json");
