@@ -193,3 +193,9 @@ MUTATIONS = [
     ("K03", "canonical Ed25519 key", "a non-canonical encoding of a key is accepted (dependency: oaiy-crypto)", D + "ed25519.rs",
      "if inner.to_edwards().compress().to_bytes() != *bytes {", "if false {", "dependency"),
 ]
+
+# The reviewer's own mutants of the crate (and of oaiy-crypto where it delegates), kept as they were written: the 37 that survived the first review and the one that hung are the ones
+# the tests of the later commits were written to kill.
+from review_mutations import MUTATIONS as _REVIEW  # noqa: E402
+
+MUTATIONS = MUTATIONS + _REVIEW
