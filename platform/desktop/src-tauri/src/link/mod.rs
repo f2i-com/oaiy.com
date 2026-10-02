@@ -240,7 +240,10 @@ pub(crate) enum Reread<T> {
 pub(crate) fn read_again<T: serde::de::DeserializeOwned>(path: &std::path::Path, shown_as: &str) -> Reread<T> {
     #[cfg(test)]
     reads::note();
-    match read_stored_after(path, shown_as, &[], false) {
+    let read = read_stored_after(path, shown_as, &[], false);
+    #[cfg(test)]
+    after_the_read::run();
+    match read {
         Ok(read) => Reread::Read(read),
         Err(e) if e.busy => Reread::Still,
         Err(e) => {
@@ -353,7 +356,7 @@ fn copies_left(left: String) -> LinkError {
 }
 
 /// Remove one kept copy. A test makes one that cannot be removed with [`held_files`], the same on every platform.
-fn remove_copy(path: &std::path::Path) -> std::io::Result<()> {
+pub(crate) fn remove_copy(path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(test)]
     if held_files::is_held(path) {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "held by a test (os error 5)"));
@@ -432,17 +435,29 @@ pub(crate) fn put_aside(path: &std::path::Path, shown_as: &str) -> Result<(), St
 /// [`put_aside`] for a file that is being forgotten and not written over: it is moved or it is an error, and never copied. A
 /// copy made when the move fails leaves the original where it was, and a forget that took that for "gone" left a valid key in
 /// the folder that linked the desktop again at the next start. An error says the file has not been changed.
-pub(crate) fn put_aside_to_forget(path: &std::path::Path, shown_as: &str) -> Result<(), String> {
+///
+/// `Ok(true)` says that what was moved is kept aside as `<name>.corrupt`: it could not be used when it was read, and it is not a
+/// link that can be read now. `Ok(false)` says that nothing is kept: there was nothing to move, or what was moved turned out to be
+/// a link of this build (a program that held it let go between the read that found it unusable and the move) and is the link that
+/// is being forgotten, not a file of a newer build to keep, so its copy is removed (a copy that cannot be removed is left to the
+/// removal of copies that follows a forget, which says so).
+pub(crate) fn put_aside_to_forget<T: serde::de::DeserializeOwned>(path: &std::path::Path, shown_as: &str) -> Result<bool, String> {
     #[cfg(test)]
     if held_files::is_held(path) {
         return Err(format!("{shown_as} could not be moved aside (held by a test (os error 5)); it has not been changed"));
     }
     match crate::secret_file::move_aside_waiting(path) {
         Ok(aside) => {
+            // Not `read_again`, which counts the reads of a decision in the tests: this reads what was moved, not the file.
+            if matches!(read_stored_after::<T>(&aside, shown_as, &[], false), Ok(Some(_))) {
+                log::warn!("link: {shown_as} could be read by the time it was moved, and is a link: it is forgotten, and the copy is removed");
+                let _ = remove_copy(&aside);
+                return Ok(false);
+            }
             log::warn!("link: {shown_as} could not be used; it is kept as {}", aside.display());
-            Ok(())
+            Ok(true)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(format!("{shown_as} could not be moved aside ({e}); it has not been changed")),
     }
 }
@@ -922,8 +937,6 @@ impl LinkStore {
         }
         // Without the lock: the file is read, and the lanes that ask for the account meanwhile are not kept waiting.
         let read = read_again::<LinkedAccount>(&self.path, ACCOUNT_FILE);
-        #[cfg(test)]
-        after_the_read::run();
         // What was read is applied only if what it was read for is still so: a forget, or a new link, that came while the file
         // was being read has dealt with it, and a read that is older than that is not the file any more.
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -1013,18 +1026,19 @@ impl LinkStore {
     /// One read decides: a file that could not be used at that read is moved aside, one that could is removed. A file that
     /// cannot be used and cannot be moved either (a program holds it so that it can be read and not moved, say) is not
     /// forgotten, and is not copied: the original would stay and link the desktop again at the next start, and the answer
-    /// is an error with the timer that reads it again left running. A program that lets go of the file in the moment
-    /// between the read and the move leaves a link that could have been read kept as `account.json.corrupt`, as one that
-    /// could not be read is; it is a copy of the key, and the next Disconnect (or [`LinkStore::remove_copies`]) removes it.
+    /// is an error; if the file could not be read at the read, the timer that reads it again is left running. A program that
+    /// lets go of the file in the moment between the read and the move leaves a file that can be read after all: it is read
+    /// where it was moved to, and when it is a link it is removed, because it is the link that is being forgotten
+    /// ([`put_aside_to_forget`]).
     fn forget_stored(&self) -> Result<bool, String> {
         self.reread(true);
         if self.holds_unusable_file() {
-            put_aside_to_forget(&self.path, ACCOUNT_FILE).map_err(|why| {
+            let kept = put_aside_to_forget::<LinkedAccount>(&self.path, ACCOUNT_FILE).map_err(|why| {
                 log::warn!("link: {why}");
                 format!("the link could not be forgotten: {why}. It is still stored here, and would be linked again at the next start. Close whatever has it open and try again.")
             })?;
             self.dealt_with();
-            return Ok(true);
+            return Ok(kept);
         }
         match std::fs::remove_file(&self.path) {
             Ok(()) => Ok(false),
@@ -1939,16 +1953,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn a_file_that_became_a_link_between_the_read_and_the_move_is_forgotten_and_its_copy_is_not_kept() {
+        // The read that decided finds the file held (a folder stands for it), and in the moment between that read and the move the
+        // program lets go: what is moved is a link. It was kept aside as `account.json.corrupt` with the key in it and the forget
+        // said nothing (the review's h5 at 60 ms landed here). It is read where it was moved to, and a link is the one that is being
+        // forgotten: its copy is removed.
+        let dir = data_dir("let-go-before-the-move");
+        let link = dir.join("link");
+        let file = link.join("account.json");
+        std::fs::create_dir(&file).unwrap();
+        let store = load_store(dir.clone());
+        let there = file.clone();
+        after_the_read::once(move || {
+            std::fs::remove_dir(&there).unwrap();
+            std::fs::write(&there, serde_json::to_string(&account()).unwrap()).unwrap();
+        });
+
+        let after = store.unlink();
+        assert!(!after.linked && after.link_error.is_none(), "{after:?}");
+        assert!(!file.exists(), "the file is not where it was");
+        for entry in std::fs::read_dir(&link).unwrap().flatten() {
+            let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            assert!(!text.contains("flk_supersecret"), "the key is in {:?}", entry.file_name());
+        }
+        assert!(load_store(dir.clone()).account().is_none(), "and a restart finds no link");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_copy_of_the_link_that_cannot_be_removed_after_such_a_move_is_said() {
+        let dir = data_dir("let-go-copy-held");
+        let link = dir.join("link");
+        let file = link.join("account.json");
+        std::fs::create_dir(&file).unwrap();
+        let store = load_store(dir.clone());
+        let there = file.clone();
+        after_the_read::once(move || {
+            std::fs::remove_dir(&there).unwrap();
+            std::fs::write(&there, serde_json::to_string(&account()).unwrap()).unwrap();
+        });
+        let copy = link.join("account.json.corrupt");
+        let held = held_files::hold(&copy);
+
+        let after = store.unlink();
+        assert!(!after.linked && !file.exists());
+        let error = after.link_error.expect("the copy with the key could not be removed, and that is said");
+        assert_eq!(error.kind, LinkErrorKind::CopiesLeft);
+        assert!(error.message.contains("account.json.corrupt"), "{}", error.message);
+        drop(held);
+        assert!(store.remove_copies().link_error.is_none() && !copy.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(windows)]
     #[test]
     fn a_hold_that_changes_from_no_reading_to_no_moving_between_the_read_and_the_move_is_not_a_forget() {
         // The review's h5. At the read the file is held with nothing shared: it cannot be read. A moment later the program lets
         // go and holds it again for reading only (a scanner that has finished opening it and is still scanning): it can be read and
         // copied and cannot be moved. The forget waited about a second and a half, copied it, answered "forgotten" and left the
-        // valid link where it was.
+        // valid link where it was. Whatever the moment it lets go falls at (60 ms is in the gap between the two holds at one of the
+        // times the move tries, and the file is moved), the answer is one of two: not forgotten, with the file where it was and no
+        // copy, or forgotten, with the key nowhere in the folder.
         use std::os::windows::fs::OpenOptionsExt;
         let dir = data_dir("hold-changes");
-        let file = dir.join("link").join("account.json");
+        let link = dir.join("link");
+        let file = link.join("account.json");
         std::fs::write(&file, serde_json::to_string(&account()).unwrap()).unwrap();
         let exclusive = std::fs::OpenOptions::new().read(true).share_mode(0).open(&file).unwrap();
         let store = load_store(dir.clone());
@@ -1956,23 +2026,37 @@ mod tests {
         let swapper = {
             let file = file.clone();
             std::thread::spawn(move || {
-                // Not at a moment when the move tries (it tries at 0, 10, 30, 60, 100 ... ms): between the end of one hold and the
-                // start of the next the file can be moved, and a try that fell there would be a forget that worked.
-                std::thread::sleep(std::time::Duration::from_millis(75));
+                std::thread::sleep(std::time::Duration::from_millis(60));
                 drop(exclusive);
-                // FILE_SHARE_READ: no delete, no rename. The store's own attempt to move the file has it open for a moment, so this is tried again.
-                let shared = (0..200).find_map(|_| std::fs::OpenOptions::new().read(true).share_mode(1).open(&file).ok().or_else(|| { std::thread::sleep(std::time::Duration::from_millis(2)); None })).expect("the file is held again");
+                // FILE_SHARE_READ: no delete, no rename. The store's own attempt to move the file has it open for a moment, so this is
+                // tried again, and not at all if the file has been moved.
+                let shared = (0..200).find_map(|_| match std::fs::OpenOptions::new().read(true).share_mode(1).open(&file) {
+                    Ok(held) => Some(Some(held)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(None),
+                    Err(_) => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        None
+                    }
+                });
                 std::thread::sleep(std::time::Duration::from_millis(2500));
                 drop(shared);
             })
         };
         let after = store.unlink();
-        let said = after.link_error.map(|e| e.kind);
-        assert!(file.exists(), "the valid link is still where it was, so the forget cannot have said it was forgotten (it said {said:?})");
-        assert_eq!(said, Some(LinkErrorKind::NotForgotten));
-        assert!(!dir.join("link").join("account.json.corrupt").exists(), "and nothing was copied");
+        let key_in_the_folder = || std::fs::read_dir(&link).unwrap().flatten().any(|e| std::fs::read_to_string(e.path()).unwrap_or_default().contains("flk_supersecret"));
+        match after.link_error.as_ref().map(|e| e.kind) {
+            Some(kind) => {
+                assert_eq!(kind, LinkErrorKind::NotForgotten, "{after:?}");
+                assert!(file.exists(), "not forgotten, and the valid link is where it was");
+                assert!(!link.join("account.json.corrupt").exists(), "and nothing was copied");
+            }
+            None => {
+                assert!(!after.linked && !file.exists(), "{after:?}");
+                assert!(!key_in_the_folder(), "forgotten, so the key is not in the folder (it was left in a copy)");
+            }
+        }
         swapper.join().unwrap();
-        assert!(load_store(dir.clone()).account().is_some(), "a restart finds the link, and the answer was an error");
+        assert_eq!(load_store(dir.clone()).account().is_some(), after.link_error.is_some(), "a restart finds the link exactly when the answer was an error");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1125,10 +1125,11 @@ in parts through internal routes with a secret made for that one backup.
   OAIY has just kept beside a link that works; it never disconnects a linked account (it is
   `DELETE /api/link?copiesOnly=true`, and any other member in the query of `DELETE /api/link` is
   refused with 400 and not taken for a plain disconnect). A disconnect that cannot move aside a
-  file it could not read (a program holds it so that it can be read and not moved) is not a
-  disconnect: it says so, keeps the file and reads it again, and never copies it and goes on, which
-  would leave the key where it was. The link file and its copies are never in a backup (see the table
-  above).
+  file it could not use (a program holds it so that it can be read and not moved) is not a
+  disconnect: it says so and keeps the file where it is (and reads it again, if it could not be
+  read), and never copies it and goes on, which would leave the key where it was. If the file turns
+  out to be a link of this OAIY after all by the moment it is moved, it is the link being forgotten,
+  and the copy is removed. The link file and its copies are never in a backup (see the table above).
 
 ## For developers
 
