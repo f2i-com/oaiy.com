@@ -100,6 +100,29 @@ fn a_phone_pairs_from_the_receipt_alone_and_refuses_a_receipt_whose_grants_are_n
         let result = phone.wait_outcome(None, &Cancel::new());
         assert_eq!(result.err(), Some(expected), "{what}");
     }
+    // A list with a repeat that the desktop itself signed (it never does; a hostile or broken desktop might): the signature verifies over the list as it stands, and the phone refuses it
+    // all the same, because the answer is specified as a set. Only the order check of the phone can tell, since nothing is wrong with the signature.
+    let mut signed_with_a_repeat: Vec<String> = sorted.clone();
+    signed_with_a_repeat.insert(1, sorted[0].clone());
+    let issued_at = honest.get("receipt").and_then(|r| r.get_uint53("issuedAt")).expect("issuedAt");
+    let signature = oaiy_relay_core::pairing::math::sign_receipt(
+        &w.identity.endpoint,
+        "aokie",
+        &signed_with_a_repeat,
+        issued_at,
+        &phone.endpoint_thumbprint(),
+        &offer.pid,
+    )
+    .unwrap();
+    let body = with_receipt_grants(&honest, Some(signed_with_a_repeat.iter().map(String::as_str).collect()));
+    let body = body.replacen(
+        &format!("\"signature\":\"{}\"", honest.get("receipt").and_then(|r| r.get_str("signature")).unwrap()),
+        &format!("\"signature\":\"{signature}\""),
+        1,
+    );
+    assert!(body.contains(&signature), "the signature was replaced");
+    w.env.stub.fail_next_on("/v1/pair/", 1, Fault::Respond(200, vec![], body));
+    assert_eq!(phone.wait_outcome(None, &Cancel::new()).err(), Some(PairingError::ReceiptInvalid), "a repeat in a list whose signature is good");
     // The honest answer, last: the phone pairs from the receipt alone (no list from the caller), with the grants the desktop signed.
     let paired = match phone.wait_outcome(None, &Cancel::new()).unwrap() {
         Outcome::Paired(p) => p,
