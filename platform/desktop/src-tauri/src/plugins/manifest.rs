@@ -1241,6 +1241,7 @@ impl PluginManifest {
 /// approve, and a plugin that could enrol its own devices would make the
 /// owner's confirmation ceremonial.
 pub const HOST_CAPABILITIES: &[&str] = &[
+    "oaiy.ai.complete",
     "oaiy.flow.run",
     "oaiy.events.publish",
     "oaiy.services.read",

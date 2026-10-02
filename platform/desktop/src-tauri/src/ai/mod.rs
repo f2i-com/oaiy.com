@@ -20,6 +20,7 @@ pub mod egress;
 pub mod engine_services;
 pub mod gateway;
 pub mod providers;
+pub mod plugin_completion;
 pub mod routes;
 pub mod tunnel;
 

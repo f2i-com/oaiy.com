@@ -123,7 +123,7 @@ pub fn check_base_url_syntax(base_url: &str, allow_local: bool) -> Result<(), St
 /// Full request-time validation: join `base_url` + `path` (path can't escape the
 /// base), require https (or http when `allow_local`), reject creds, and reject a
 /// host that is / resolves to an internal address. Returns the outbound URL.
-pub fn validate(base_url: &str, path: &str, allow_local: bool) -> Result<reqwest::Url, String> {
+fn request_url(base_url: &str, path: &str, allow_local: bool) -> Result<reqwest::Url, String> {
     if base_url.len() > 4096 || base_url.chars().any(|c| c.is_control() || c == ' ') {
         return Err("provider base URL is invalid".into());
     }
@@ -142,6 +142,11 @@ pub fn validate(base_url: &str, path: &str, allow_local: bool) -> Result<reqwest
     };
     let url = reqwest::Url::parse(&joined).map_err(|_| "provider URL is invalid".to_string())?;
     check_scheme_and_creds(&url, allow_local)?;
+    Ok(url)
+}
+
+pub fn validate(base_url: &str, path: &str, allow_local: bool) -> Result<reqwest::Url, String> {
+    let url = request_url(base_url, path, allow_local)?;
     let host = url.host_str().unwrap(); // checked above
 
     // Bare IP literal — check directly, no DNS.
@@ -174,10 +179,37 @@ pub fn validate(base_url: &str, path: &str, allow_local: bool) -> Result<reqwest
     Ok(url)
 }
 
+/// Async request-time validation for bounded scoped calls: DNS work must not
+/// block the handler's deadline/cancel select. The resolver may complete its OS
+/// lookup in the background after cancellation, without making a provider call.
+pub(super) async fn validate_async(base_url: &str, path: &str, allow_local: bool) -> Result<reqwest::Url, String> {
+    let url = request_url(base_url, path, allow_local)?;
+    let host = url.host_str().ok_or("provider URL has no host")?;
+    if let Ok(ip) = host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>() {
+        if ip_blocked(ip, allow_local) { return Err("provider URL points at a disallowed address".into()); }
+        return Ok(url);
+    }
+    let mut saw_any = false;
+    for address in tokio::net::lookup_host((host, url.port_or_known_default().unwrap_or(443))).await
+        .map_err(|_| "cannot resolve provider host")? {
+        saw_any = true;
+        if ip_blocked(address.ip(), allow_local) { return Err("provider host resolves to a disallowed address".into()); }
+    }
+    if !saw_any { return Err("provider host did not resolve".into()); }
+    Ok(url)
+}
+
 /// A reqwest client for a provider call: redirects DISABLED (a 3xx must never be
 /// followed to an unvalidated host). Streaming omits the whole-request timeout so
 /// a long SSE response isn't cut off; non-streaming keeps the 120s cap.
 pub fn client(streaming: bool) -> Result<reqwest::Client, String> {
+    provider_client(streaming, false)
+}
+
+/// Scoped local qualification calls must not inherit a proxy that can carry
+/// loopback prompts off this computer. Ordinary configured gateways keep their
+/// existing proxy behavior.
+pub(super) fn provider_client(streaming: bool, direct: bool) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder()
         .user_agent(concat!("oaiy-desktop/", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::none())
@@ -188,6 +220,7 @@ pub fn client(streaming: bool) -> Result<reqwest::Client, String> {
     if !streaming {
         builder = builder.timeout(REQUEST_TIMEOUT);
     }
+    if direct { builder = builder.no_proxy(); }
     builder.build().map_err(|e| format!("http client build failed: {e}"))
 }
 

@@ -68,11 +68,53 @@ function connect(frame: HTMLIFrameElement) {
   new Function('window', 'parent', 'document', 'setTimeout', 'clearTimeout', HOST_BOOTSTRAP)(
     frameWindow, window, frame.contentDocument, setTimeout, clearTimeout,
   );
-  const host = (frameWindow as unknown as { PluginHost: { command: (name: string, payload?: unknown) => Promise<unknown> } }).PluginHost;
+  const host = (frameWindow as unknown as { PluginHost: {
+    command: (name: string, payload?: unknown) => Promise<unknown>;
+    aiComplete: (request: unknown) => Promise<unknown>;
+    aiCancel: (requestId: string) => Promise<unknown>;
+    aiSources: () => Promise<unknown>;
+  } }).PluginHost;
   return { host, requests, replies, receive };
 }
 
 describe('plugin command RPC through the mounted host and actual bootstrap', () => {
+  it('carries a real bounded AI request through the bootstrap and mounted plugin-owned route', async () => {
+    list.mockResolvedValue({plugins:[{...plugin,manifest:{...plugin.manifest,capabilities:['oaiy.ai.complete']}}]});
+    const {host,replies} = connect(await mount());
+    const request = {requestId:'screen-request',sourceId:'provider:test',prompt:'Synthetic evidence only.',maxOutputChars:256};
+    const result = {requestId:request.requestId,sourceId:request.sourceId,text:'Grounded answer',model:'test-model'};
+    const fetch = vi.mocked(globalThis.fetch).mockResolvedValue(new Response(JSON.stringify(result)));
+    await expect(host.aiComplete(request)).resolves.toEqual(result);
+    expect(fetch).toHaveBeenCalledWith('http://127.0.0.1:17972/api/plugins/test-plugin/ai/complete',expect.objectContaining({body:JSON.stringify(request)}));
+    expect(replies).toHaveBeenCalledExactlyOnceWith({__pluginHost:1,id:'r1',ok:true,data:result},'*');
+  });
+
+  it('delivers a typed provider refusal through the production AI bootstrap', async () => {
+    const {host} = connect(await mount());
+    vi.mocked(globalThis.fetch).mockResolvedValue(new Response(JSON.stringify({error:{code:'no_provider',message:'No scoped provider is configured.'}}), {status:404}));
+    await expect(host.aiComplete({requestId:'none',sourceId:'provider:test',prompt:'Synthetic evidence only.',maxOutputChars:256}))
+      .rejects.toMatchObject({name:'PluginCommandError',code:'no_provider',message:'No scoped provider is configured.'});
+  });
+
+  it('closing a screen aborts its completion and suppresses a delayed RPC reply', async () => {
+    const {host,replies} = connect(await mount());
+    let finish!: (value: Response) => void;
+    let signal!: AbortSignal;
+    vi.mocked(globalThis.fetch).mockImplementation((url,options) => {
+      if (String(url).endsWith('/ai/complete')) {
+        signal=options!.signal!;
+        return new Promise((resolve) => {finish=resolve;});
+      }
+      return Promise.resolve(new Response(JSON.stringify({requestId:'closing',cancelled:true})));
+    });
+    void host.aiComplete({requestId:'closing',sourceId:'provider:test',prompt:'Synthetic evidence only.',maxOutputChars:256}).catch(() => {});
+    await act(async () => root.render(<PluginScreenPage pluginId="test-plugin" navId="other" />));
+    expect(signal.aborted).toBe(true);
+    finish(new Response(JSON.stringify({requestId:'closing',sourceId:'provider:test',text:'stale'})));
+    await act(async () => {await Promise.resolve();});
+    expect(replies).not.toHaveBeenCalled();
+  });
+
   it.each([
     ['inner versioned refusal', typedRefusal],
     ['inner SDK refusal', { ok: true, result: { ok: false, error: details } }],

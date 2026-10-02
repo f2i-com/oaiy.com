@@ -88,11 +88,15 @@ fn with_json_body(rb: reqwest::RequestBuilder, value: &Value) -> Result<reqwest:
 
 /// Read an upstream response body with a hard size cap.
 async fn read_capped(resp: reqwest::Response) -> Result<Vec<u8>, GatewayError> {
+    read_capped_with_limit(resp, MAX_RESPONSE_BYTES).await
+}
+
+pub(super) async fn read_capped_with_limit(resp: reqwest::Response, limit: u64) -> Result<Vec<u8>, GatewayError> {
     let mut stream = resp.bytes_stream();
     let mut out = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| GatewayError::Upstream(format!("read failed: {e}")))?;
-        if out.len() as u64 + chunk.len() as u64 > MAX_RESPONSE_BYTES {
+        if out.len() as u64 + chunk.len() as u64 > limit.min(MAX_RESPONSE_BYTES) {
             return Err(GatewayError::Upstream("upstream response exceeded the size cap".into()));
         }
         out.extend_from_slice(&chunk);
@@ -102,7 +106,17 @@ async fn read_capped(resp: reqwest::Response) -> Result<Vec<u8>, GatewayError> {
 
 /// Non-streaming chat. Returns an OpenAI `chat.completion` JSON regardless of the
 /// provider's protocol.
-pub async fn chat(provider: &AiProvider, mut body: Value) -> Result<Value, GatewayError> {
+pub async fn chat(provider: &AiProvider, body: Value) -> Result<Value, GatewayError> {
+    chat_buffered(provider, body, MAX_RESPONSE_BYTES, false, false).await
+}
+
+/// The same credential/egress/translation path with a smaller buffered body cap.
+/// Its caller owns the deadline and can cancel by dropping this async future.
+pub(super) async fn chat_bounded(provider: &AiProvider, body: Value, max_response_bytes: u64, direct: bool) -> Result<Value, GatewayError> {
+    chat_buffered(provider, body, max_response_bytes, direct, true).await
+}
+
+async fn chat_buffered(provider: &AiProvider, mut body: Value, max_response_bytes: u64, direct: bool, text_only: bool) -> Result<Value, GatewayError> {
     ensure_model(provider, &mut body)?;
     if let Some(obj) = body.as_object_mut() {
         obj.remove("provider"); // non-OpenAI routing hint — never forward it
@@ -110,21 +124,21 @@ pub async fn chat(provider: &AiProvider, mut body: Value) -> Result<Value, Gatew
     }
 
     let key = provider.api_key.clone();
-    let target = egress::validate(&provider.base_url, chat_path(provider.protocol), provider.allow_local)
+    let target = egress::validate_async(&provider.base_url, chat_path(provider.protocol), provider.allow_local).await
         .map_err(GatewayError::BadRequest)?;
     let out_body = match provider.protocol {
         Protocol::OpenAi => body,
         Protocol::Anthropic => openai_chat_to_anthropic(&body),
     };
 
-    let client = egress::client(false).map_err(GatewayError::Upstream)?;
+    let client = egress::provider_client(false, direct).map_err(GatewayError::Upstream)?;
     let rb = apply_auth(with_json_body(client.post(target), &out_body)?, provider, key.as_deref());
     let resp = rb
         .send()
         .await
         .map_err(|e| GatewayError::Upstream(format!("request failed: {e}")))?;
     let status = resp.status();
-    let bytes = read_capped(resp).await?;
+    let bytes = read_capped_with_limit(resp, max_response_bytes).await?;
     let value: Value = serde_json::from_slice(&bytes)
         .map_err(|e| GatewayError::Upstream(format!("non-JSON upstream ({status}): {e}")))?;
     if !status.is_success() {
@@ -136,8 +150,26 @@ pub async fn chat(provider: &AiProvider, mut body: Value) -> Result<Value, Gatew
     }
     Ok(match provider.protocol {
         Protocol::OpenAi => value,
-        Protocol::Anthropic => anthropic_response_to_openai(&value),
+        Protocol::Anthropic => {
+            // Ordinary chat preserves the existing normalization contract.
+            // Scoped text completion must not flatten tool/thinking/refusal
+            // blocks or synthesize "stop" from a missing/unknown stop reason.
+            if text_only { validate_text_only_anthropic(&value)?; }
+            anthropic_response_to_openai(&value)
+        }
     })
+}
+
+fn validate_text_only_anthropic(value: &Value) -> Result<(), GatewayError> {
+    if value.get("role").and_then(Value::as_str) != Some("assistant")
+        || !matches!(value.get("stop_reason").and_then(Value::as_str), Some("end_turn" | "stop_sequence"))
+        || !value.get("content").and_then(Value::as_array).is_some_and(|content|
+            !content.is_empty() && content.iter().all(|block|
+                block.get("type").and_then(Value::as_str) == Some("text")
+                && block.get("text").is_some_and(Value::is_string))) {
+        return Err(GatewayError::Upstream("upstream did not return a complete text-only assistant response".into()));
+    }
+    Ok(())
 }
 
 /// Streaming chat — OpenAI dialect only. Returns the raw upstream `Response` so
@@ -494,5 +526,23 @@ mod tests {
         // No network: the Anthropic models() path short-circuits to the profile.
         let out = models(&anthropic_provider()).await.unwrap();
         assert_eq!(out["data"][0]["id"], "example-model");
+    }
+
+    #[test]
+    fn scoped_anthropic_text_validation_does_not_change_ordinary_normalization() {
+        let valid = json!({"role":"assistant","content":[{"type":"text","text":"hello"}],"stop_reason":"end_turn"});
+        assert!(validate_text_only_anthropic(&valid).is_ok());
+        let mut stopped = valid.clone(); stopped["stop_reason"] = json!("stop_sequence");
+        assert!(validate_text_only_anthropic(&stopped).is_ok());
+        for reason in [json!("max_tokens"),json!("tool_use"),json!("refusal"),json!("unknown"),Value::Null] {
+            let mut result = valid.clone(); result["stop_reason"] = reason;
+            assert!(validate_text_only_anthropic(&result).is_err());
+        }
+        let mut tool = valid.clone(); tool["content"].as_array_mut().unwrap().push(json!({"type":"tool_use","name":"unsafe","input":{}}));
+        assert!(validate_text_only_anthropic(&tool).is_err());
+        // The ordinary gateway still offers its original normalization.
+        assert_eq!(anthropic_response_to_openai(&tool)["choices"][0]["message"]["content"], "hello");
+        let mut malformed = valid; malformed["content"][0]["text"] = json!({"nested":"text"});
+        assert!(validate_text_only_anthropic(&malformed).is_err());
     }
 }
