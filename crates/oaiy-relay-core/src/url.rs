@@ -1,6 +1,6 @@
 //! A relay's base URL (`common#publicUrl`): `https://host[:port]`, no path, no userinfo, no query, no fragment, no trailing slash.
 //!
-//! **Plain `http` is a decision of the program, not of the build.** Only a program that calls [`allow_loopback_http`] (a function that exists only in a build with the
+//! **Plain `http` is a decision of the program, not of the build.** Only a program that calls `allow_loopback_http` (a function that exists only in a build with the
 //! `loopback-http` feature, which a product never enables) makes [`RelayUrl::parse`] read `http://127.0.0.1` or `http://localhost` at all (README section 1: "https only; plain
 //! http is accepted by a client only for loopback in test builds. There is no `.local` http exception for relay credentials"). Cargo unifies features across a whole build, so a
 //! feature alone could be switched on by any crate in it; a flag that has to be set at run time cannot be set by compiling. Without the call, and in every build without the
@@ -62,7 +62,7 @@ fn is_loopback(host: &str) -> bool {
 
 impl RelayUrl {
     /// Parses and normalises (scheme and host in lower case, the default port dropped). `https://host` or `https://host:port`; anything else is refused, `http` included unless
-    /// the program called [`allow_loopback_http`] and the host is loopback.
+    /// the program called `allow_loopback_http` and the host is loopback.
     pub fn parse(text: &str) -> Result<RelayUrl> {
         RelayUrl::parse_with(text, loopback_http_allowed())
     }

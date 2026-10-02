@@ -13,7 +13,7 @@
 //! | Pairing v3 | [`pairing`] (the math, both parties' state machines) | yes: the parties are driven by the caller |
 //! | The poll loop's rules (README 5.1.1, P1 to P9) | [`poll`] | yes: one deterministic function |
 //! | I/O behind traits | [`client`] (HTTP, clock, stores, the client, the loop) | the traits are the seam |
-//! | Test support (feature `testing`) | [`testing`] (an in-process stub relay, a scripted transport, a fake clock) | |
+//! | Test support (feature `testing`) | `testing` (an in-process stub relay, a scripted transport, a fake clock) | |
 //!
 //! It contains no `unsafe`.
 

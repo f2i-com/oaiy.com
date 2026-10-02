@@ -99,7 +99,7 @@ pub trait Rng: Send {
     }
 }
 
-/// The operating system's random generator ([`os_fill`]): what a product passes to [`crate::client::RelayClient::new`] for its jitter.
+/// The operating system's random generator (the one behind `os_fill`): what a product passes to [`crate::client::RelayClient::new`] for its jitter.
 #[derive(Debug, Default)]
 pub struct OsRng;
 
