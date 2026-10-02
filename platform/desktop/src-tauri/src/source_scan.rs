@@ -274,7 +274,8 @@ impl<'a> Sig<'a> {
     /// What ends it depends on what it is. An item with a body (`fn`, `impl`, `mod`...), a block, and a statement
     /// that is a braced construct (`if`, `match`, `loop`, `while`, `for`, with a label or not) end at the `}` that
     /// closes their body (an `if` at the end of its last `else`), with no `;` after it. A macro invoked with braces
-    /// (`thread_local! { .. }`) ends at its `}` too. A match arm whose body is a block ends there. Everything else
+    /// (`thread_local! { .. }`) ends at its `}` too, and so does a block with a label (`'blk: { .. }`). A match arm whose body is
+    /// a block, or a bare `if`, `match`, `loop`, `while`, `for` or `unsafe` block with no comma after it, ends there. Everything else
     /// (`let`, `const`, a call, a field, a variant) ends at its `;` or `,`, outside any brackets.
     fn item_end(&self, k: usize) -> usize {
         let w = self.past_modifiers(k);
@@ -283,7 +284,8 @@ impl<'a> Sig<'a> {
         if ["if", "match", "loop", "while", "for"].iter().any(|m| self.is_word(at, m)) {
             return self.brace_statement_end(at);
         }
-        let block = self.is_punct(w, '{');
+        // A block, with a label (`'blk: { .. }`) or without, ends at its `}`.
+        let block = self.is_punct(at, '{');
         let body_item = ["mod", "fn", "impl", "struct", "enum", "trait", "union", "macro_rules", "extern"].iter().any(|m| self.is_word(w, m));
         // `let`, `const`, `static`, `type` and `use` end at their `;` alone: a `,` in `HashMap<A, B>` or in `use a::{b, c}` is not their end.
         let semicolon_only = ["let", "const", "static", "type", "use"].iter().any(|m| self.is_word(w, m));
@@ -298,9 +300,11 @@ impl<'a> Sig<'a> {
                     let close = self.closing(j);
                     return if self.is_punct(close + 1, ';') { close + 1 } else { close };
                 }
-                // A match arm whose body is a block ends at the block (and the comma after it, if there is one).
-                Some('=') if depth == 0 && !semicolon_only && self.is_punct(j + 1, '>') && self.is_punct(j + 2, '{') => {
-                    let close = self.closing(j + 2);
+                // A match arm whose body is a block, or a braced construct (`if`, `match`, `loop`, `while`, `for`, `unsafe`, with a
+                // label or not), ends at the `}` that closes it (and the comma after it, if there is one): a body like that needs
+                // no comma, and the arm that follows must not be taken for part of it.
+                Some('=') if depth == 0 && !semicolon_only && self.is_punct(j + 1, '>') && self.arm_body_end(j + 2).is_some() => {
+                    let close = self.arm_body_end(j + 2).unwrap_or(j);
                     return if self.is_punct(close + 1, ',') { close + 1 } else { close };
                 }
                 Some('(' | '[' | '{') => depth += 1,
@@ -317,6 +321,22 @@ impl<'a> Sig<'a> {
             j += 1;
         }
         self.len() - 1
+    }
+
+    /// The last token of the body of a match arm that starts at `at` when the body is a block or a braced construct, and
+    /// nothing when it is anything else (a call, a path, a value: those end at the arm's comma).
+    fn arm_body_end(&self, at: usize) -> Option<usize> {
+        let label = at + 2 <= self.len() && self.tok(at).kind == Kind::Lifetime && self.is_punct(at + 1, ':');
+        let at = if label { at + 2 } else { at };
+        if self.is_punct(at, '{') {
+            Some(self.closing(at))
+        } else if ["if", "match", "loop", "while", "for"].iter().any(|m| self.is_word(at, m)) {
+            Some(self.brace_statement_end(at))
+        } else if self.is_word(at, "unsafe") && self.is_punct(at + 1, '{') {
+            Some(self.closing(at + 1))
+        } else {
+            None
+        }
     }
 
     /// The last token of a statement that is a braced construct, which starts with the keyword at `at`: the `}` that closes
@@ -677,8 +697,13 @@ mod tests {
         ("cfg(test) union / trait / type alias with where", "#[cfg(test)]\nunion U { a: u8 }\n#[cfg(test)]\ntrait Tr: Sized { fn t(); }\nfn after() {}\n", vec!["fn after()"], vec!["union", "trait"]),
         ("cfg(test) impl in the middle of a generic production impl", "impl<T> Real<T> {\n    #[cfg(test)]\n    fn t(&self) -> Vec<(u8, u8)> { vec![] }\n    fn p(&self) {}\n}\n", vec!["fn p("], vec!["fn t("]),
         ];
+        check_cases(&cases);
+    }
+
+    /// Each case: what of its source must stay in the result, and what must be gone.
+    fn check_cases(cases: &[(&str, &str, Vec<&str>, Vec<&str>)]) {
         let mut wrong = Vec::new();
-        for (name, source, visible, gone) in &cases {
+        for (name, source, visible, gone) in cases {
             let out = kept(source);
             for v in visible {
                 if !out.contains(v) {
@@ -692,6 +717,45 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{} of {} cases: {wrong:#?}", wrong.len(), cases.len());
+    }
+
+    /// The second review's cases against the scanner, 28 of them: the statements and arms that have a label, an else chain, a struct
+    /// pattern in an if let, while let or or, a move or sync move block, a body that is a bare if or match with no
+    /// comma, a block that has a label, a closure, a string that looks like an arm. The first run got three wrong, and they hid
+    /// production code: a labelled block, and an arm whose body is a bare if or match.
+    #[test]
+    fn the_second_reviews_cases_of_labels_else_chains_struct_patterns_move_and_bare_arm_bodies() {
+        let cases: Vec<(&str, &str, Vec<&str>, Vec<&str>)> = vec![
+        ("if let with a struct pattern", "fn f() {\n    #[cfg(test)]\n    if let Foo { x } = y { a_test(); }\n    real();\n}\n", vec!["real()"], vec!["a_test"]),
+        ("while let with a struct pattern", "fn f() {\n    #[cfg(test)]\n    while let Some(Foo { x }) = it.next() { a_test(); }\n    real();\n}\n", vec!["real()"], vec!["a_test"]),
+        ("for with a struct pattern", "fn f() {\n    #[cfg(test)]\n    for Foo { x } in items { a_test(); }\n    real();\n}\n", vec!["real()"], vec!["a_test"]),
+        ("else if chain", "fn f() {\n    #[cfg(test)]\n    if a { t1(); } else if b { t2(); } else { t3(); }\n    real();\n}\n", vec!["real()"], vec!["t1", "t2", "t3"]),
+        ("labelled loop", "fn f() {\n    #[cfg(test)]\n    'outer: for i in 0..3 { t(i); }\n    real();\n}\n", vec!["real()"], vec!["t(i)"]),
+        ("labelled block", "fn f() {\n    #[cfg(test)]\n    'blk: { t(); }\n    real();\n}\n", vec!["real()"], vec!["t()"]),
+        ("arm with a guard and a block", "fn f(v: u8) {\n    match v {\n        #[cfg(test)]\n        1 if cond() => { t() }\n        2 => { real_arm() }\n        _ => {}\n    }\n}\n", vec!["real_arm()"], vec!["t()"]),
+        ("arm whose body is a bare if", "fn f(v: u8) {\n    match v {\n        #[cfg(test)]\n        1 => if c { t() } else { u() }\n        2 => real_arm(),\n        _ => {}\n    }\n}\n", vec!["real_arm()"], vec!["t()"]),
+        ("arm whose body is a bare match", "fn f(v: u8) {\n    match v {\n        #[cfg(test)]\n        1 => match w { _ => t() }\n        2 => real_arm(),\n        _ => {}\n    }\n}\n", vec!["real_arm()"], vec!["t()"]),
+        ("arm whose body is a call with a comma", "fn f(v: u8) {\n    match v {\n        #[cfg(test)]\n        1 => t(a, b),\n        2 => real_arm(),\n        _ => {}\n    }\n}\n", vec!["real_arm()"], vec!["t(a"]),
+        ("async move block statement", "fn f() {\n    #[cfg(test)]\n    async move { t() }.await;\n    real();\n}\n", vec!["real()"], vec!["t()"]),
+        ("struct update chain", "fn f() {\n    #[cfg(test)]\n    S { a: 1 }.run();\n    real();\n}\n", vec!["real()"], vec!["run"]),
+        ("if as a struct field value", "fn f() {\n    let s = S {\n        #[cfg(test)]\n        a: if c { 1 } else { 2 },\n        b: 3,\n    };\n}\n", vec!["b: 3"], vec!["a: if"]),
+        ("method call on a match", "fn f() {\n    #[cfg(test)]\n    match x { _ => () }.foo();\n    real();\n}\n", vec!["real()"], vec!["match x"]),
+        ("if with a closure in the condition", "fn f() {\n    #[cfg(test)]\n    if items.iter().any(|i| { i.ok() }) { t(); }\n    real();\n}\n", vec!["real()"], vec!["t()"]),
+        ("if with a match in the condition", "fn f() {\n    #[cfg(test)]\n    if match x { _ => true } { t(); }\n    real();\n}\n", vec!["real()"], vec![]),
+        ("if with a struct literal in parentheses", "fn f() {\n    #[cfg(test)]\n    if (S { a: 1 }).ok() { t(); }\n    real();\n}\n", vec!["real()"], vec!["t()"]),
+        ("while with a block condition in parentheses", "fn f() {\n    #[cfg(test)]\n    while ({ cond() }) { t(); }\n    real();\n}\n", vec!["real()"], vec!["t()"]),
+        ("if without braces at the end of a scope", "fn f() {\n    #[cfg(test)]\n    if x { t(); }\n}\nfn after() {}\n", vec!["fn after()"], vec!["t()"]),
+        ("unsafe block with the macro rule", "fn f() {\n    #[cfg(test)]\n    unsafe { t(); }\n    #[cfg(test)]\n    dbg! { 1 }\n    real();\n}\n", vec!["real()"], vec!["dbg"]),
+        ("a string that looks like an arm", "fn f() {\n    #[cfg(test)]\n    let s = \"1 => { x }\";\n    real();\n}\n", vec!["real()"], vec!["let s"]),
+        ("let with a braced macro initialiser", "fn f() {\n    #[cfg(test)]\n    let v = vec! { 1, 2 };\n    real();\n}\n", vec!["real()"], vec!["let v"]),
+        ("static with a braced macro initialiser", "#[cfg(test)]\nstatic V: Lazy<u8> = lazy! { 1 };\nfn after() {}\n", vec!["fn after()"], vec!["static V"]),
+        ("impl block containing a braced macro", "#[cfg(test)]\nimpl X { fn t() { m! { a } } }\nfn after() {}\n", vec!["fn after()"], vec!["impl X"]),
+        ("trait with default method and where", "#[cfg(test)]\ntrait T where Self: Sized { fn t(&self) { } }\nfn after() {}\n", vec!["fn after()"], vec!["trait T"]),
+        ("a closure statement", "fn f() {\n    #[cfg(test)]\n    let c = move || { t() };\n    real();\n}\n", vec!["real()"], vec!["let c"]),
+        ("nested cfg(test) in a test mod and production between", "mod p {\n    #[cfg(test)]\n    mod t { #[cfg(test)] fn a() {} fn b() {} }\n    fn real() {}\n}\n", vec!["fn real()"], vec!["mod t"]),
+        ("cfg(test) attribute followed by an inner doc comment", "#[cfg(test)]\n//! not valid here\nfn t() {}\nfn after() {}\n", vec!["fn after()"], vec![]),
+        ];
+        check_cases(&cases);
     }
     #[test]
     fn a_comma_in_the_generics_of_a_test_const_static_type_or_let_does_not_end_it() {
