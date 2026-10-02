@@ -1,178 +1,447 @@
+Mutation run of oaiy-relay-core at commit dca04510, 2 October 2026 (Windows, two shards of 106 mutants run side by side, each in its own worktree with its own target directory).
+
+    212 mutants: 212 killed, 0 survived, 0 invalid, 0 timed out.
+    Killed by: the unit tests of the library 57, the fast integration tests 121, the other test targets of the crate 34, only the real relay 0.
+    Origin: 83 of the implementer, 88 of the independent reviewer (89, less K05), 41 of the second round (42, less H15). K05 and H15 are equivalent mutants and are not in the list:
+    see the comments in review_mutations.py and hardening_mutations.py. 6 mutants change oaiy-crypto where the crate delegates ("dependency").
+
+How the number was reached (the mutants are the same, the tests were not):
+  - the implementer's 83: all killed on LF checkouts; the reviewer's run of a sample of 20 on a CRLF checkout gave 18 killed and 2 INVALID (multi-line anchors do not match CRLF text);
+    the crate is LF everywhere since (.gitattributes) and the harness refuses a CRLF file.
+  - the reviewer's 89 on the crate as it was reviewed: 51 killed, 1 hang (not a kill), 37 survived. The 38 that were not killed, run again on the tests of c205f09b before the tests written
+    for them: 20 killed, 17 survived, 1 timed out (of 38 run); every one of them has a test now, except K05 (equivalent).
+  - the first full run after the second round (a54af7d6, 213 mutants): 208 killed, 5 survived (H07, H15, H23, H30, H32), 0 invalid, 0 timed out; H33 and H34 were killed only by the
+    real relay. H07, H23, H30, H32, H33 and H34 got tests; H15 is equivalent.
+  - this run, at dca04510: 212 of 212.
+
+Per shard (the logs of the harness, one line a mutant and the first test that failed):
+---- shard 1 ----
 P01  KILLED    own        accepted-item rule           an item whose seq equals the one before it (or `since`) is accepted
-         -> unittests src\lib.rs: poll::tests::an_item_is_accepted_only_above_since_and_above_the_one_before_it
+         -> unittests src\lib.rs: poll::tests::an_item_is_accepted_only_above_since_and_above_the_one_before_it   [3 s]
 P02  KILLED    own        accepted-item rule           a seq of 2^53 is accepted
-         -> unittests src\lib.rs: poll::tests::an_item_is_accepted_only_above_since_and_above_the_one_before_it
+         -> unittests src\lib.rs: poll::tests::an_item_is_accepted_only_above_since_and_above_the_one_before_it   [3 s]
 P03  KILLED    own        accepted-item rule           the item accepted before it no longer raises the bar (an out-of-order item is accepted)
-         -> unittests src\lib.rs: poll::tests::an_item_is_accepted_only_above_since_and_above_the_one_before_it
+         -> unittests src\lib.rs: poll::tests::an_item_is_accepted_only_above_since_and_above_the_one_before_it   [3 s]
 P04  KILLED    own        valid 200                    an epoch of any text makes a 200 valid
-         -> tests\poll_differential.rs: random_cases_agree_with_the_python_reader
+         -> tests\pairing_stub.rs: a_typed_code_with_a_typo_is_refused_before_any_request_is_made   [14 s]
 P05  KILLED    own        valid 200                    a cursor above 2^53 - 1 makes a 200 valid
-         -> tests\fuzz.rs: the_poll_rules_never_panic_and_keep_every_pause_within_its_limits
+         -> tests\fuzz.rs: the_poll_rules_never_panic_and_keep_every_pause_within_its_limits   [9 s]
 P06  KILLED    own        backoff numbers              the failure backoff caps at 61 s, not 60
-         -> tests\poll_differential.rs: random_cases_agree_with_the_python_reader
+         -> tests\poll_differential.rs: random_cases_agree_with_the_python_reader   [15 s]
 P07  KILLED    own        backoff numbers              the 429 backoff caps at 31 s, not 30
-         -> tests\client_stub.rs: a_429_is_never_a_failure_and_the_fifth_in_flight_is_a_defect_reported_once
+         -> unittests src\lib.rs: poll::tests::a_429_for_the_proof_is_flow_and_never_a_failure   [3 s]
 P08  KILLED    own        backoff numbers              the relay is unreachable after 4 failures, not 3
-         -> tests\poll_differential.rs: random_cases_agree_with_the_python_reader
+         -> tests\poll_differential.rs: random_cases_agree_with_the_python_reader   [15 s]
 P09  KILLED    own        backoff numbers              the in-flight defect is reported at the 6th 429, not the 5th
-         -> tests\poll_differential.rs: random_cases_agree_with_the_python_reader
+         -> tests\poll_differential.rs: random_cases_agree_with_the_python_reader   [15 s]
 P10  KILLED    own        backoff numbers              a Retry-After is clamped to 121 s, not 120
-         -> unittests src\lib.rs: poll::tests::clamp_and_doubling
+         -> unittests src\lib.rs: poll::tests::a_429_for_the_proof_is_flow_and_never_a_failure (+1)   [3 s]
 P11  KILLED    own        backoff numbers              the jitter is up to 25 percent, not 20
-         -> tests\client_stub.rs: a_429_is_never_a_failure_and_the_fifth_in_flight_is_a_defect_reported_once (+3)
+         -> unittests src\lib.rs: poll::tests::a_429_for_the_proof_is_flow_and_never_a_failure   [3 s]
 P12  KILLED    own        backoff numbers              the doubling starts at 2 s, not 1 s
-         -> unittests src\lib.rs: poll::tests::clamp_and_doubling
+         -> unittests src\lib.rs: poll::tests::a_429_for_the_proof_is_flow_and_never_a_failure (+1)   [4 s]
 P13  KILLED    own        refused hold                 the refused-hold pause forgets the retryAfter floor
-         -> tests\poll_differential.rs: random_cases_agree_with_the_python_reader
+         -> tests\poll_differential.rs: random_cases_agree_with_the_python_reader   [14 s]
 P14  KILLED    own        refused hold                 a refused hold with no retryAfter waits 3 s, not 2
-         -> tests\poll_differential.rs: random_cases_agree_with_the_python_reader
+         -> unittests src\lib.rs: poll::tests::a_refused_hold_pauses_at_the_fallback_however_many_were_refused_and_never_overflows   [3 s]
 P15  KILLED    own        refused hold                 consecutive refused holds are not counted
-         -> tests\client_stub.rs: a_refused_hold_is_a_short_poll_at_retry_after_doubling_to_the_fallback_2_4_5
+         -> unittests src\lib.rs: poll::tests::a_refused_hold_pauses_at_the_fallback_however_many_were_refused_and_never_overflows   [3 s]
 P16  KILLED    own        persist before acknowledge   a failed write of what was accepted is treated as persisted
-         -> tests\client_stub.rs: a_store_that_fails_moves_nothing_is_paced_as_a_failure_and_the_items_come_again
+         -> tests\client_stub.rs: a_store_that_fails_moves_nothing_is_paced_as_a_failure_and_the_items_come_again   [8 s]
 P17  KILLED    own        storage failure              a storage failure also reports the relay unreachable
-         -> tests\poll_differential.rs: random_cases_agree_with_the_python_reader
+         -> tests\poll_differential.rs: random_cases_agree_with_the_python_reader   [15 s]
 P18  KILLED    own        429                          a 429 without Retry-After waits 5 s, not 1
-         -> tests\poll_differential.rs: random_cases_agree_with_the_python_reader
+         -> tests\poll_differential.rs: random_cases_agree_with_the_python_reader   [15 s]
 P19  KILLED    own        429                          any 429 rule, not only in_flight, cancels the client's own polls
-         -> tests\poll_differential.rs: random_cases_agree_with_the_python_reader
+         -> tests\poll_differential.rs: random_cases_agree_with_the_python_reader   [15 s]
 P20  KILLED    own        429                          the in-flight defect is reported at every 429 from the 5th on, not once
-         -> tests\client_stub.rs: a_429_is_never_a_failure_and_the_fifth_in_flight_is_a_defect_reported_once
+         -> tests\client_stub.rs: a_429_is_never_a_failure_and_the_fifth_in_flight_is_a_defect_reported_once   [8 s]
 P21  KILLED    own        400                          the second 400 in a row is still a retry, not a stop
-         -> timeout in tests\client_stub.rs (a mutant that hangs)
+         -> tests\client_stub.rs: the_first_400_retries_without_the_epoch_and_the_second_in_a_row_stops_the_loop   [23 s]
 P22  KILLED    own        400                          the first 400 does not clear the stored epoch
-         -> tests\client_stub.rs: the_first_400_retries_without_the_epoch_and_the_second_in_a_row_stops_the_loop
+         -> tests\client_stub.rs: the_first_400_retries_without_the_epoch_and_the_second_in_a_row_stops_the_loop   [8 s]
 P23  KILLED    own        401                          every 401 forgets the credential, not only `revoked`
-         -> tests\poll_differential.rs: random_cases_agree_with_the_python_reader
+         -> tests\poll_differential.rs: random_cases_agree_with_the_python_reader   [18 s]
 P24  KILLED    own        4xx                          a 408 is a stop, not a failure to retry
-         -> tests\poll_differential.rs: random_cases_agree_with_the_python_reader
+         -> tests\poll_differential.rs: random_cases_agree_with_the_python_reader   [15 s]
 P25  KILLED    own        superseded                   a poll another process superseded is not told apart from one this client replaced
-         -> tests\client_stub.rs: a_second_process_with_the_same_credential_is_reported_as_duplicate_credential
+         -> tests\client_stub.rs: a_second_process_with_the_same_credential_is_reported_as_duplicate_credential   [14 s]
 P26  KILLED    own        Retry-After                  seven digits of Retry-After are read
-         -> unittests src\lib.rs: poll::tests::retry_after_precedence_and_forms
+         -> unittests src\lib.rs: poll::tests::retry_after_precedence_and_forms   [3 s]
 P27  KILLED    own        proof schedule               a pause of exactly 60 s does not call for a new proof
-         -> unittests src\lib.rs: poll::tests::replace_and_proof_rules
+         -> unittests src\lib.rs: poll::tests::replace_and_proof_rules   [3 s]
 P28  KILLED    own        proof schedule               the proof is repeated every 301 s, not 300
-         -> unittests src\lib.rs: poll::tests::replace_and_proof_rules
+         -> unittests src\lib.rs: poll::tests::replace_and_proof_rules   [3 s]
 P29  KILLED    own        idle                         an idle answer is followed by no pause at all
-         -> tests\client_stub.rs: a_503_with_retry_after_is_paced_by_the_larger_of_it_and_the_backoff (+1)
+         -> tests\client_stub.rs: a_503_with_retry_after_is_paced_by_the_larger_of_it_and_the_backoff (+1)   [8 s]
 P30  KILLED    own        failure                      a failure's Retry-After no longer raises its backoff
-         -> tests\client_stub.rs: a_503_with_retry_after_is_paced_by_the_larger_of_it_and_the_backoff
+         -> tests\client_stub.rs: a_503_with_retry_after_is_paced_by_the_larger_of_it_and_the_backoff   [8 s]
 L01  KILLED    own        poll loop                    a failed write of the accepted items is ignored (the poll that acknowledges them is sent)
-         -> tests\client_stub.rs: a_store_that_fails_moves_nothing_is_paced_as_a_failure_and_the_items_come_again
+         -> tests\client_stub.rs: a_store_that_fails_moves_nothing_is_paced_as_a_failure_and_the_items_come_again   [8 s]
 L02  KILLED    own        poll loop                    every superseded answer is taken for the client's own doing (no duplicate-credential report)
-         -> tests\client_stub.rs: a_second_process_with_the_same_credential_is_reported_as_duplicate_credential
+         -> tests\client_stub.rs: a_second_process_with_the_same_credential_is_reported_as_duplicate_credential   [14 s]
 L03  KILLED    own        poll loop                    the cursor does not advance after progress
-         -> tests\client_stub.rs: a_reset_adopts_the_servers_cursor_once_and_the_loop_goes_on (+3)
+         -> tests\client_stub.rs: a_reset_adopts_the_servers_cursor_once_and_the_loop_goes_on (+3)   [8 s]
 C01  KILLED    own        proof gate                   a relay that failed its proof is not `Suspect`
-         -> tests\client_stub.rs: no_token_is_sent_before_a_proof_after_a_failed_one_or_after_the_proof_has_lapsed
+         -> tests\client_stub.rs: every_call_that_carries_a_token_is_refused_by_a_client_with_no_fresh_proof_and_sends_nothing (+1)   [8 s]
 C02  KILLED    own        proof gate                   a token is sent without any proof of the relay
-         -> tests\client_stub.rs: no_token_is_sent_before_a_proof_after_a_failed_one_or_after_the_proof_has_lapsed
+         -> tests\client_stub.rs: every_call_that_carries_a_token_is_refused_by_a_client_with_no_fresh_proof_and_sends_nothing (+1)   [8 s]
 C03  KILLED    own        proof gate                   a proof stays good for 3000 s, not 600
-         -> tests\client_stub.rs: no_token_is_sent_before_a_proof_after_a_failed_one_or_after_the_proof_has_lapsed
+         -> tests\client_stub.rs: every_call_that_carries_a_token_is_refused_by_a_client_with_no_fresh_proof_and_sends_nothing (+1)   [8 s]
 C04  KILLED    own        relay clock                  a clock mismatch is flagged at 61 s, not 60
-         -> unittests src\lib.rs: client::clock::tests::the_verdicts
+         -> unittests src\lib.rs: client::clock::tests::the_verdicts   [3 s]
 C05  KILLED    own        relay clock                  the median is of 3 samples, not 5
-         -> unittests src\lib.rs: client::clock::tests::the_median_is_over_the_last_five_samples_and_two_wild_ones_do_not_move_it
+         -> unittests src\lib.rs: client::clock::tests::the_median_is_over_the_last_five_samples_and_two_wild_ones_do_not_move_it   [3 s]
 S01  KILLED    own        poll store                   the cursor is written before the items (a crash between the two loses items)
-         -> tests\stores.rs: a_crash_between_the_items_and_the_cursor_redelivers_and_loses_nothing
+         -> tests\stores.rs: a_crash_between_the_items_and_the_cursor_redelivers_and_loses_nothing (+1)   [16 s]
 A01  KILLED    own        SAS                          the SAS is derived with no salt (the nonce)
-         -> tests\pairing_ceremony.rs: the_recorded_ceremony_is_reproduced_request_for_request_and_ends_with_the_recorded_sas_and_token
+         -> tests\pairing_ceremony.rs: the_recorded_ceremony_is_reproduced_request_for_request_and_ends_with_the_recorded_sas_and_token   [11 s]
 A02  KILLED    own        SAS                          the two endpoint keys are taken in the other order
-         -> tests\pairing_ceremony.rs: the_recorded_ceremony_is_reproduced_request_for_request_and_ends_with_the_recorded_sas_and_token
+         -> tests\pairing_ceremony.rs: the_recorded_ceremony_is_reproduced_request_for_request_and_ends_with_the_recorded_sas_and_token   [11 s]
 A03  KILLED    own        SAS                          the SAS domain string is another
-         -> tests\pairing_ceremony.rs: the_recorded_ceremony_is_reproduced_request_for_request_and_ends_with_the_recorded_sas_and_token
+         -> tests\pairing_ceremony.rs: the_recorded_ceremony_is_reproduced_request_for_request_and_ends_with_the_recorded_sas_and_token   [12 s]
 A04  KILLED    own        SAS                          any 13 characters with a good check character are the SAS
-         -> tests\fuzz.rs: typed_codes_pairing_keys_enrolment_keys_and_sas_entries_never_panic_and_a_code_that_parses_is_the_code
+         -> tests\fuzz.rs: typed_codes_pairing_keys_enrolment_keys_and_sas_entries_never_panic_and_a_code_that_parses_is_the_code   [9 s]
 A05  KILLED    own        SAS                          an entry of 12 characters is judged, not still being typed
-         -> tests\vectors.rs: the_sas_entry_a_typo_is_not_an_attempt_and_a_wrong_code_is
+         -> tests\vectors.rs: the_sas_entry_a_typo_is_not_an_attempt_and_a_wrong_code_is   [16 s]
 A06  KILLED    own        SAS                          every entry that is not the SAS counts as an attempt
-         -> tests\vectors.rs: the_sas_entry_a_typo_is_not_an_attempt_and_a_wrong_code_is
+         -> tests\vectors.rs: the_sas_entry_a_typo_is_not_an_attempt_and_a_wrong_code_is   [17 s]
 A07  KILLED    own        SAS                          the owner has four attempts, not three
-         -> tests\pairing_stub.rs: three_wrong_codes_deny_and_burn_and_a_typo_never_counts
+         -> tests\pairing_ceremony.rs: a_wrong_code_approves_nothing_and_the_third_denies_and_burns   [12 s]
 A08  KILLED    own        typed code                   the two trailing bits of the 26th character are not checked
-         -> tests\vectors.rs: a_typed_code_has_one_spelling_the_two_unused_bits_of_the_26th_character_are_zero
+         -> tests\vectors.rs: a_typed_code_has_one_spelling_the_two_unused_bits_of_the_26th_character_are_zero   [16 s]
 A09  KILLED    own        typed code                   the typed code's check characters are not verified
-         -> tests\fuzz.rs: typed_codes_pairing_keys_enrolment_keys_and_sas_entries_never_panic_and_a_code_that_parses_is_the_code
+         -> tests\fuzz.rs: typed_codes_pairing_keys_enrolment_keys_and_sas_entries_never_panic_and_a_code_that_parses_is_the_code   [8 s]
 A10  KILLED    own        typed code                   an `O` is not read as a zero
-         -> tests\vectors.rs: the_typed_codes_the_normaliser_and_the_sas_check_characters
+         -> tests\vectors.rs: the_typed_codes_the_normaliser_and_the_sas_check_characters   [17 s]
 A11  KILLED    own        offer and response           the offer's life is 601 s, not 600
-         -> tests\pairing_ceremony.rs: the_recorded_ceremony_is_reproduced_request_for_request_and_ends_with_the_recorded_sas_and_token
+         -> tests\pairing_ceremony.rs: a_receipt_that_covers_other_grants_than_the_phone_was_told_pairs_nothing (+15)   [11 s]
 A12  KILLED    own        offer and response           the slack on an offer or response is 31 s, not 30
-         -> tests\pairing_stub.rs: a_replayed_response_a_revoked_key_and_a_response_outside_its_window_are_rejected
+         -> tests\pairing_ceremony.rs: an_offer_is_judged_against_its_own_window_also_when_there_is_no_key_expiry_beside_it (+1)   [11 s]
 A13  KILLED    own        offer and response           a response outside its lifetime is accepted
-         -> tests\pairing_stub.rs: a_replayed_response_a_revoked_key_and_a_response_outside_its_window_are_rejected
+         -> tests\pairing_ceremony.rs: a_response_outside_its_own_window_is_rejected_by_the_desktop   [11 s]
 A14  KILLED    own        offer and response           the response's MAC is computed and not enforced
-         -> tests\pairing_stub.rs: a_wrong_mac_is_rejected_and_the_rendezvous_is_open_again_for_the_real_phone
+         -> tests\pairing_ceremony.rs: a_response_with_a_flipped_mac_is_rejected_by_the_desktop_and_the_relay_is_told   [12 s]
 A15  KILLED    own        receipt                      the phone does not check the receipt's date against its own pairing
-         -> tests\pairing_stub.rs: a_hostile_relay_that_says_approved_gets_a_phone_that_stores_nothing
+         -> tests\pairing_stub.rs: a_hostile_relay_that_says_approved_gets_a_phone_that_stores_nothing (+1)   [18 s]
 D01  KILLED    own        info proof                   the relay's key is not compared with the pin
-         -> tests\client_stub.rs: a_key_for_another_relay_key_sends_nothing_and_stores_nothing (+1)
+         -> tests\client_stub.rs: a_key_for_another_relay_key_sends_nothing_and_stores_nothing (+2)   [8 s]
 D02  KILLED    own        info proof                   the nonce may be of any length
-         -> tests\vectors.rs: the_edges_the_recorded_vectors_leave_open_a_nonce_of_another_size_and_a_lifetime_one_second_too_long
+         -> tests\vectors.rs: the_edges_the_recorded_vectors_leave_open_a_nonce_of_another_size_and_a_lifetime_one_second_too_long   [17 s]
 D03  KILLED    own        info proof                   a time header with a leading zero is read
-         -> tests\vectors.rs: a6b_a_whole_info_document_through_the_proof_check_a_client_makes
+         -> tests\vectors.rs: a6b_a_whole_info_document_through_the_proof_check_a_client_makes (+1)   [21 s]
 D04  KILLED    own        info proof                   the proof does not cover the relay's time
-         -> tests\client_stub.rs: a_held_poll_returns_the_moment_an_item_is_posted (+18)
+         -> tests\client_stub.rs: a_503_with_retry_after_is_paced_by_the_larger_of_it_and_the_backoff (+25)   [4 s]
 D05  KILLED    own        ticket                       a ticket's slack is 31 s, not 30
-         -> tests\vectors.rs: a9_a_ticket
+         -> tests\vectors.rs: a9_a_ticket   [17 s]
 D06  KILLED    own        ticket                       a ticket may live 301 s, not 300
-         -> tests\vectors.rs: the_edges_the_recorded_vectors_leave_open_a_nonce_of_another_size_and_a_lifetime_one_second_too_long
+         -> tests\vectors.rs: the_edges_the_recorded_vectors_leave_open_a_nonce_of_another_size_and_a_lifetime_one_second_too_long   [17 s]
 D07  KILLED    own        rotation                     a rotation statement may live 86,401 s, not 86,400
-         -> tests\vectors.rs: the_edges_the_recorded_vectors_leave_open_a_nonce_of_another_size_and_a_lifetime_one_second_too_long
+         -> tests\vectors.rs: the_edges_the_recorded_vectors_leave_open_a_nonce_of_another_size_and_a_lifetime_one_second_too_long   [17 s]
 D08  KILLED    own        ring                         a ring may expire 301 s ahead, not 300
-         -> tests\vectors.rs: a11_a_ring_signature_and_the_ring_window
+         -> tests\vectors.rs: a11_a_ring_signature_and_the_ring_window   [17 s]
 D09  KILLED    own        info                         an info with a default wait of 301 s is accepted
-         -> tests\vectors.rs: the_edges_the_recorded_vectors_leave_open_a_nonce_of_another_size_and_a_lifetime_one_second_too_long
+         -> tests\vectors.rs: the_edges_the_recorded_vectors_leave_open_a_nonce_of_another_size_and_a_lifetime_one_second_too_long   [17 s]
 E01  KILLED    own        admission relay advertisement URLs of two origins are taken for usable compatibility routes
-         -> unittests src\lib.rs: admission::tests::the_compatibility_urls_degrade_to_none_as_the_shipped_readers_do_and_never_fail_the_admission
+         -> unittests src\lib.rs: admission::tests::the_compatibility_urls_degrade_to_none_as_the_shipped_readers_do_and_never_fail_the_admission   [3 s]
 E02  KILLED    own        admission relay advertisement a URL with credentials is taken for usable
-         -> unittests src\lib.rs: admission::tests::the_compatibility_urls_degrade_to_none_as_the_shipped_readers_do_and_never_fail_the_admission
+         -> unittests src\lib.rs: admission::tests::the_compatibility_urls_degrade_to_none_as_the_shipped_readers_do_and_never_fail_the_admission   [3 s]
 E03  KILLED    own        admission relay advertisement a URL with a fragment is taken for usable
-         -> unittests src\lib.rs: admission::tests::the_compatibility_urls_degrade_to_none_as_the_shipped_readers_do_and_never_fail_the_admission
+         -> unittests src\lib.rs: admission::tests::the_compatibility_urls_degrade_to_none_as_the_shipped_readers_do_and_never_fail_the_admission   [3 s]
 E04  KILLED    own        admission members            a phone admission must have an iceServers member (the shipped phone defaults it)
-         -> tests\aokie_fixtures.rs: an_unusable_relay_advertisement_degrades_the_carrier_and_never_fails_the_admission
+         -> tests\aokie_fixtures.rs: an_unusable_relay_advertisement_degrades_the_carrier_and_never_fails_the_admission   [4 s]
 B01  KILLED    own        base64url                    the unused bits of a 2-character tail are not checked
-         -> unittests src\lib.rs: b64::tests::refuses_a_spelling_whose_unused_low_bits_are_not_zero
+         -> unittests src\lib.rs: b64::tests::refuses_a_spelling_whose_unused_low_bits_are_not_zero   [3 s]
 B02  KILLED    own        base64url                    the unused bits of a 3-character tail are not checked
-         -> unittests src\lib.rs: b64::tests::decode_exact_checks_the_size (+3)
+         -> unittests src\lib.rs: b64::tests::decode_exact_checks_the_size (+3)   [3 s]
 B03  KILLED    own        base64url                    a length of 1 mod 4 is read
-         -> unittests src\lib.rs: b64::tests::refuses_padding_whitespace_other_alphabets_and_impossible_lengths
+         -> unittests src\lib.rs: b64::tests::refuses_padding_whitespace_other_alphabets_and_impossible_lengths   [3 s]
 B04  KILLED    own        base64url                    an empty text is a value
-         -> unittests src\lib.rs: b64::tests::refuses_padding_whitespace_other_alphabets_and_impossible_lengths
-B05  INVALID   own        base64url                    the alphabet is the standard one (+ and /), not the URL one
-         -> does not compile
+         -> unittests src\lib.rs: b64::tests::refuses_padding_whitespace_other_alphabets_and_impossible_lengths   [3 s]
+B05  KILLED    own        base64url                    the alphabet is the standard one (+ and /), not the URL one
+         -> unittests src\lib.rs: b64::tests::decode_exact_checks_the_size (+4)   [3 s]
 J01  KILLED    own        JSON                         a duplicate member name is read (the last wins)
-         -> unittests src\lib.rs: json::tests::duplicate_names_are_refused_at_any_depth_and_any_size
+         -> unittests src\lib.rs: json::tests::duplicate_names_are_refused_at_any_depth_and_any_size   [3 s]
 J02  KILLED    own        JSON                         65 levels of nesting are read
-         -> unittests src\lib.rs: json::tests::nesting_is_limited_to_64_levels
+         -> unittests src\lib.rs: json::tests::nesting_is_limited_to_64_levels   [3 s]
 J03  KILLED    own        canonical JSON               members are sorted in reverse
-         -> unittests src\lib.rs: json::tests::the_vectors_canonical_cases
+         -> unittests src\lib.rs: json::tests::canonical_members_are_sorted_by_utf8_bytes_and_not_by_utf16_code_units (+1)   [3 s]
 J04  KILLED    own        canonical JSON               control characters are escaped in upper-case hex
-         -> unittests src\lib.rs: json::tests::the_canonical_writer_escapes_only_what_the_protocol_says
+         -> unittests src\lib.rs: json::tests::the_canonical_writer_escapes_only_what_the_protocol_says   [3 s]
 J05  KILLED    own        canonical JSON               -0 is an integer
-         -> unittests src\lib.rs: json::tests::general_mode_keeps_what_canonical_mode_refuses (+1)
+         -> unittests src\lib.rs: json::tests::general_mode_keeps_what_canonical_mode_refuses (+1)   [3 s]
 J06  KILLED    own        canonical JSON               the largest canonical integer is 2^63 - 1, not 2^64 - 1
-         -> unittests src\lib.rs: json::tests::the_vectors_canonical_cases
+         -> unittests src\lib.rs: json::tests::the_vectors_canonical_cases   [3 s]
 J07  KILLED    own        JSON                         a high surrogate may be followed by any \u escape
-         -> unittests src\lib.rs: json::tests::strings_utf8_and_escapes
+         -> unittests src\lib.rs: json::tests::strings_utf8_and_escapes   [3 s]
 J08  KILLED    own        JSON                         a raw 0x1f control character is read inside a string
-         -> unittests src\lib.rs: json::tests::every_control_character_below_0x20_is_refused_raw_in_a_string_and_0x20_is_not
+         -> unittests src\lib.rs: json::tests::every_control_character_below_0x20_is_refused_raw_in_a_string_and_0x20_is_not   [3 s]
 K01  KILLED    dependency small-order X25519 key       a point of small order is accepted as a public key (dependency: oaiy-crypto)
-         -> tests\pairing_stub.rs: a_response_with_a_key_of_small_order_is_rejected_whatever_else_in_it_is_right
+         -> tests\pairing_stub.rs: a_response_with_a_key_of_small_order_is_rejected_whatever_else_in_it_is_right   [14 s]
 K02  KILLED    dependency small-order Ed25519 key      a key of small order is accepted as a verification key (dependency: oaiy-crypto)
-         -> tests\pairing_stub.rs: a_response_with_a_key_of_small_order_is_rejected_whatever_else_in_it_is_right
+         -> tests\pairing_stub.rs: a_response_with_a_key_of_small_order_is_rejected_whatever_else_in_it_is_right   [15 s]
 K03  KILLED    dependency canonical Ed25519 key        a non-canonical encoding of a key is accepted (dependency: oaiy-crypto)
-         -> tests\vectors.rs: an_ed25519_key_in_a_non_canonical_encoding_is_refused_though_it_names_a_good_point
+         -> tests\vectors.rs: an_ed25519_key_in_a_non_canonical_encoding_is_refused_though_it_names_a_good_point   [17 s]
+N01  KILLED    own        JSON depth                   65 levels of OBJECTS are read (the array limit stays 64)
+         -> unittests src\lib.rs: json::tests::nesting_is_limited_to_64_levels   [3 s]
+N02  KILLED    own        JSON numbers                 a 39-digit integer is no longer a Big spelling but an i128 parse that overflows
+         -> unittests src\lib.rs: json::tests::an_integer_of_38_digits_is_an_integer_and_one_of_39_is_a_big_spelling   [4 s]
+N03  KILLED    own        canonical JSON               members are sorted by UTF-16 code units (RFC 8785), not by UTF-8 bytes (README 1)
+         -> unittests src\lib.rs: json::tests::canonical_members_are_sorted_by_utf8_bytes_and_not_by_utf16_code_units   [4 s]
+N04  KILLED    own        canonical JSON               form feed is written as \u000c, not \f
+         -> unittests src\lib.rs: json::tests::the_canonical_writer_escapes_only_what_the_protocol_says   [4 s]
+N05  KILLED    own        canonical JSON               DEL (0x7f) is escaped as well
+         -> unittests src\lib.rs: json::tests::canonical_members_are_sorted_by_utf8_bytes_and_not_by_utf16_code_units (+3)   [3 s]
+N06  KILLED    own        JSON whitespace              a form feed counts as JSON whitespace
+         -> unittests src\lib.rs: json::tests::a_form_feed_is_not_whitespace   [4 s]
+N07  KILLED    own        JSON strings                 a DEL or any control character below 0x20 inside a string after a high surrogate is skipped (the pair check is dropped)
+         -> unittests src\lib.rs: json::tests::strings_utf8_and_escapes   [4 s]
+N08  KILLED    own        base64url                    the decode_exact length check is dropped (longer text reaches the decoder)
+         -> unittests src\lib.rs: b64::tests::decode_exact_checks_the_size   [4 s]
+N09  KILLED    own        base64url                    encoded_len of a two-byte tail is 4 characters
+         -> unittests src\lib.rs: b64::tests::every_length_round_trips (+4)   [4 s]
+K04  KILLED    dependency Ed25519 strictness           verification is not strict (verify, not verify_strict: a small-order R or a malleated S may pass) (dependency: oaiy-crypto)
+         -> tests\vectors.rs: a_signature_whose_r_has_small_order_is_refused_though_the_equation_holds   [18 s]
+K06  KILLED    dependency sealed box                   a box of exactly 48 bytes is refused (empty plaintext) (dependency: oaiy-crypto)
+         -> tests\vectors.rs: an_empty_plaintext_seals_to_48_bytes_and_opens_and_47_bytes_are_no_box   [18 s]
+K07  KILLED    dependency sealed box                   the box nonce is BLAKE2b over the recipient key only (dependency: oaiy-crypto)
+         -> tests\pairing_ceremony.rs: the_receipt_the_recording_carries_is_the_one_that_pairs (+1)   [12 s]
+D10  KILLED    own        domains                      a result container is signed and verified under the command domain
+         -> tests\vectors.rs: a8_a_command_container_signed_by_a_provider (+1)   [17 s]
+D11  KILLED    own        domains                      a sync container is signed and verified under the result domain
+         -> tests\vectors.rs: each_container_domain_is_signed_under_its_own_sign_domain_and_under_no_other   [16 s]
+D12  KILLED    own        domains                      a ring is signed and verified under the sync domain
+         -> tests\vectors.rs: a11_a_ring_signature_and_the_ring_window   [16 s]
+D13  KILLED    own        domains                      a ring is verified under the sync domain only
+         -> tests\vectors.rs: a11_a_ring_signature_and_the_ring_window   [16 s]
+D14  KILLED    own        domains                      a rotation statement is verified under the command domain
+         -> tests\vectors.rs: a10_a_provider_rotation_statement (+1)   [17 s]
+D15  KILLED    own        domains                      the approval receipt is signed under the response domain
+         -> tests\pairing_ceremony.rs: a_receipt_that_covers_other_grants_than_the_phone_was_told_pairs_nothing (+5)   [11 s]
+D16  KILLED    own        domains                      the pairing response is signed under the approval domain
+         -> tests\pairing_ceremony.rs: a_receipt_with_another_date_than_the_one_signed_pairs_nothing (+9)   [14 s]
+D17  KILLED    own        domains                      the zero byte between a domain and the text is dropped
+         -> unittests src\lib.rs: keys::tests::the_domain_strings_are_the_readmes (+1)   [5 s]
+D18  KILLED    own        domains                      the info's static signature is checked under the proof domain
+         -> tests\client_stub.rs: an_info_read_without_a_nonce_is_taken_only_from_the_pinned_key (+1)   [24 s]
+D19  KILLED    own        info                         the relay key's stated thumbprint is not compared with the key
+         -> tests\vectors.rs: the_edges_of_the_static_info_the_stated_thumbprint_a_time_member_and_the_time_header   [19 s]
+D20  KILLED    own        info                         an info that carries a `time` member is accepted
+         -> tests\vectors.rs: the_edges_of_the_static_info_the_stated_thumbprint_a_time_member_and_the_time_header   [18 s]
 
-83 mutations: 82 killed, 0 survived, 1 invalid; 816 s; tree clean
+106 mutations: 106 killed, 0 survived, 0 invalid, 0 timed out; 1142 s; tree clean
+---- shard 2 ----
+D21  KILLED    own        info                         wait.max of 301 is accepted
+         -> tests\vectors.rs: the_edges_the_recorded_vectors_leave_open_a_nonce_of_another_size_and_a_lifetime_one_second_too_long   [17 s]
+D22  KILLED    own        info                         X-OAIY-Time of 17 digits is read
+         -> tests\vectors.rs: the_edges_of_the_static_info_the_stated_thumbprint_a_time_member_and_the_time_header   [16 s]
+D23  KILLED    own        ring                         a ring that expired at exactly relay-now is inside its window
+         -> tests\vectors.rs: a11_a_ring_signature_and_the_ring_window   [17 s]
+G01  KILLED    own        SAS gate                     approve_body does not require a confirmed SAS
+         -> tests\pairing_ceremony.rs: a_wrong_code_approves_nothing_and_the_third_denies_and_burns   [12 s]
+G02  KILLED    own        SAS gate                     a wrong 13-character entry is not counted as an attempt
+         -> tests\pairing_ceremony.rs: a_wrong_code_approves_nothing_and_the_third_denies_and_burns   [12 s]
+G03  KILLED    own        SAS gate                     three wrong entries deny but do not burn the rendezvous
+         -> tests\pairing_ceremony.rs: a_wrong_code_approves_nothing_and_the_third_denies_and_burns   [11 s]
+G04  KILLED    own        SAS gate                     three wrong entries burn but do not post the denial
+         -> tests\pairing_ceremony.rs: a_wrong_code_approves_nothing_and_the_third_denies_and_burns   [12 s]
+G05  KILLED    own        SAS gate                     unknown or duplicate grants are signed into a receipt
+         -> slow tier, tests\rv_pairing_desktop.rs: attack_the_approval_refuses_grants_that_the_relay_or_the_phone_would_refuse (+1)   [52 s]
+G06  KILLED    own        SAS gate                     a revoked phone key is accepted
+         -> tests\pairing_stub.rs: a_replayed_response_a_revoked_key_and_a_response_outside_its_window_are_rejected   [15 s]
+G07  KILLED    own        response                     the phone's signature on its response is not enforced (the MAC is)
+         -> tests\pairing_ceremony.rs: a_response_with_a_flipped_signature_is_rejected_by_the_desktop_and_the_relay_is_told   [11 s]
+G08  KILLED    own        response                     the response need not carry the offer's nonce
+         -> slow tier, tests\rv_pairing_desktop.rs: attack_every_binding_of_a_response_to_its_offer_is_checked_even_when_the_mac_and_signature_are_right   [51 s]
+G09  KILLED    own        response                     the response need not carry the offer's jti
+         -> slow tier, tests\rv_pairing_desktop.rs: attack_every_binding_of_a_response_to_its_offer_is_checked_even_when_the_mac_and_signature_are_right   [52 s]
+G10  KILLED    own        response                     the response need not name the offer's desktop key
+         -> slow tier, tests\rv_pairing_desktop.rs: attack_every_binding_of_a_response_to_its_offer_is_checked_even_when_the_mac_and_signature_are_right   [52 s]
+G11  KILLED    own        response                     the response need not name the offer's desktop connection
+         -> slow tier, tests\rv_pairing_desktop.rs: attack_every_binding_of_a_response_to_its_offer_is_checked_even_when_the_mac_and_signature_are_right   [52 s]
+G12  KILLED    own        response                     a response may live 121 s
+         -> tests\pairing_ceremony.rs: a_receipt_that_covers_other_grants_than_the_phone_was_told_pairs_nothing (+9)   [12 s]
+G13  KILLED    own        receipt                      the phone does not verify the approval receipt before it opens the token
+         -> tests\pairing_ceremony.rs: a_receipt_with_a_flipped_signature_pairs_nothing (+2)   [12 s]
+G14  KILLED    own        receipt                      a receipt dated in the future is accepted
+         -> tests\pairing_stub.rs: a_receipt_dated_in_the_future_is_not_an_answer_to_this_pairing_though_it_is_signed   [14 s]
+G15  KILLED    own        offer                        an offer for another relay than the one named is accepted
+         -> tests\pairing_ceremony.rs: an_offer_for_another_relay_than_the_one_the_owner_named_is_refused_though_its_mac_and_key_are_right   [11 s]
+G16  KILLED    own        offer                        the key's relay fingerprint need not match the offer's
+         -> tests\pairing_ceremony.rs: a_key_that_names_another_relay_key_than_the_offer_does_is_refused_before_the_offer_is_used   [11 s]
+G17  KILLED    own        offer                        an offer outside its window is accepted
+         -> tests\pairing_ceremony.rs: an_offer_is_judged_against_its_own_window_also_when_there_is_no_key_expiry_beside_it   [11 s]
+G18  KILLED    own        offer                        an already answered rendezvous is read as open
+         -> tests\pairing_stub.rs: an_offer_answered_twice_is_the_second_phones_already_answered_and_a_lost_202_is_retried_with_the_same_text   [14 s]
+G19  KILLED    own        storage                      a profile that cannot be stored leaves the token behind
+         -> slow tier, tests\rv_pairing_phone.rs: attack_a_pairing_is_stored_token_first_and_a_half_made_one_is_taken_back   [56 s]
+G20  KILLED    own        receipt                      grants of the receipt are not sorted before signing
+         -> tests\pairing_ceremony.rs: a_receipt_with_another_date_than_the_one_signed_pairs_nothing (+5)   [13 s]
+G21  KILLED    own        typed code                   the normaliser keeps a space (dashes only are dropped)
+         -> tests\vectors.rs: a_typed_code_with_a_typo_is_refused_locally_before_any_network_call (+2)   [23 s]
+G22  KILLED    own        typed code                   a character outside the alphabet is not refused by the normaliser
+         -> tests\fuzz.rs: typed_codes_pairing_keys_enrolment_keys_and_sas_entries_never_panic_and_a_code_that_parses_is_the_code   [9 s]
+G23  KILLED    own        typed code                   L is not read as a one
+         -> tests\vectors.rs: the_typed_codes_the_normaliser_and_the_sas_check_characters   [17 s]
+G24  KILLED    own        SAS                          the SAS check character covers the 12 characters without its domain
+         -> tests\pairing_ceremony.rs: the_recorded_ceremony_is_reproduced_request_for_request_and_ends_with_the_recorded_sas_and_token   [11 s]
+G25  KILLED    own        typed code                   the typed code's check covers the secret without its domain
+         -> tests\pairing_ceremony.rs: a_receipt_that_covers_other_grants_than_the_phone_was_told_pairs_nothing (+15)   [15 s]
+G26  KILLED    own        pairing math                 the pid is derived with another HKDF info
+         -> tests\pairing_ceremony.rs: a_key_that_names_another_relay_key_than_the_offer_does_is_refused_before_the_offer_is_used (+15)   [11 s]
+R01  KILLED    own        Retry-After                  an empty header ends the reading (the body's retryAfter is not consulted)
+         -> tests\poll_differential.rs: random_cases_agree_with_the_python_reader   [16 s]
+R02  KILLED    own        Retry-After                  any whitespace (not only space and tab) is trimmed from a Retry-After
+         -> unittests src\lib.rs: poll::tests::a_retry_after_is_trimmed_of_spaces_and_tabs_and_of_nothing_else   [3 s]
+R03  KILLED    own        Retry-After                  a date that has passed is a huge wait, not 0
+         -> unittests src\lib.rs: poll::tests::a_clock_at_the_edge_of_time_is_a_long_wait_not_an_overflow (+1)   [4 s]
+R04  KILLED    own        Retry-After                  the Date header of the answer is ignored for a Retry-After date
+         -> unittests src\lib.rs: poll::tests::headers_are_read_without_regard_to_the_case_of_their_names (+1)   [4 s]
+R05  KILLED    own        refused hold                 the shift of the refused-hold doubling is capped at 64 (an overflow at 64 refused holds)
+         -> unittests src\lib.rs: poll::tests::a_refused_hold_pauses_at_the_fallback_however_many_were_refused_and_never_overflows   [4 s]
+R06  KILLED    own        reset                        any `reset` member, even false, is a reset
+         -> tests\poll_differential.rs: random_cases_agree_with_the_python_reader   [15 s]
+R07  KILLED    own        426                          every 426 stops the loop, not only one that makes the client too old
+         -> tests\client_stub.rs: a_426_from_a_relay_whose_min_client_is_the_clients_own_level_is_a_failure_to_retry_and_not_a_reason_to_stop   [13 s]
+R08  KILLED    own        info clamps                  pollGapMs is clamped to 50 s, not 5 s
+         -> tests\vectors.rs: the_poll_gap_has_a_floor_of_250_ms_and_a_ceiling_of_5_s_whatever_the_relay_advertises   [17 s]
+R09  KILLED    own        first 400                    the first 400's Retry-After is honoured (README P5 literal)
+         -> tests\poll_differential.rs: random_cases_agree_with_the_python_reader   [15 s]
+R10  KILLED    own        valid 200                    -0 is an integer cursor (as the Python and Node readers read it)
+         -> tests\poll_fixture.rs: a_float_a_boolean_or_a_minus_zero_is_not_an_integer_in_an_answer   [17 s]
+L04  KILLED    own        P1 replace gap               the 250 ms wait before a replacing poll is removed
+         -> slow tier, tests\rv_client_io.rs: finding_a_replacement_poll_starts_no_sooner_than_250_ms_after_the_one_it_cancels   [26 s]
+L05  KILLED    own        clear_epoch                  after the first 400 the in-memory epoch is not cleared (the retry sends it again)
+         -> tests\client_stub.rs: the_first_400_retries_without_the_epoch_and_the_second_in_a_row_stops_the_loop   [7 s]
+L06  KILLED    own        P9                           the longest pause after a poll answer is not tracked for the proof schedule
+         -> tests\client_stub.rs: a_pause_of_a_minute_or_more_after_an_answer_makes_the_loop_prove_the_relay_again_before_its_next_poll   [8 s]
+L07  KILLED    own        426                          minClient equal to the client's level makes it too old
+         -> tests\client_stub.rs: a_426_from_a_relay_whose_min_client_is_the_clients_own_level_is_a_failure_to_retry_and_not_a_reason_to_stop   [13 s]
+L08  KILLED    own        wait                         the poll's wait is the larger of default and max
+         -> tests\client_stub.rs: the_poll_asks_for_the_relays_default_wait_and_never_for_more_than_its_max   [7 s]
+L09  KILLED    own        persist                      the cursor is advanced in memory even when the write failed
+         -> tests\client_stub.rs: a_store_that_fails_moves_nothing_is_paced_as_a_failure_and_the_items_come_again   [7 s]
+C06  KILLED    own        proof gate                   poll() does not check the proof gate
+         -> tests\client_stub.rs: every_call_that_carries_a_token_is_refused_by_a_client_with_no_fresh_proof_and_sends_nothing (+1)   [9 s]
+C07  KILLED    own        proof gate                   authed calls do not check the proof gate
+         -> tests\client_stub.rs: every_call_that_carries_a_token_is_refused_by_a_client_with_no_fresh_proof_and_sends_nothing   [8 s]
+C08  KILLED    own        enrolment                    the enrolment's relayId is not compared with the proved relay's
+         -> tests\client_stub.rs: an_enrolment_answered_by_another_relay_id_than_the_one_proved_is_refused_and_nothing_is_stored   [9 s]
+C09  KILLED    own        enrolment                    an enrolment key for another relay is accepted
+         -> tests\client_stub.rs: an_enrolment_key_for_another_relay_is_refused_before_anything_is_sent   [8 s]
+C10  KILLED    own        proof gate                   a failed proof does not mark the relay suspect
+         -> tests\client_stub.rs: a_key_for_another_relay_key_sends_nothing_and_stores_nothing (+3)   [8 s]
+C11  KILLED    own        info                         read_info does not compare the relay key with the pin
+         -> tests\client_stub.rs: an_info_read_without_a_nonce_is_taken_only_from_the_pinned_key   [8 s]
+C12  KILLED    own        relay clock                  the relay clock slews 2 s a minute
+         -> unittests src\lib.rs: client::clock::tests::the_applied_offset_slews_by_at_most_a_second_a_minute   [3 s]
+C13  KILLED    own        relay clock                  the first sample is not applied at once
+         -> unittests src\lib.rs: client::clock::tests::a_step_of_the_wall_clock_does_not_move_the_remote_time (+4)   [3 s]
+T01  KILLED    own        transport                    the loopback client connects to any host
+         -> tests\loopback.rs: it_refuses_every_host_but_loopback_and_every_scheme_but_http_before_it_connects   [14 s]
+T02  KILLED    own        transport                    the loopback client's body cap is ignored for a Content-Length
+         -> tests\loopback.rs: a_body_that_is_too_large_too_short_or_too_slow_is_no_response   [11 s]
+U01  KILLED    own        url                          plain http is read for any host when the loopback feature is on
+         -> unittests src\lib.rs: url::tests::plain_http_is_for_loopback_only_even_with_the_test_feature (+1)   [3 s]
+U02  KILLED    own        url                          a port above 65535 wraps
+         -> unittests src\lib.rs: url::tests::everything_that_is_not_a_bare_origin_is_refused   [3 s]
+S03  KILLED    own        poll store                   clear_epoch keeps the epoch
+         -> tests\stores.rs: the_cursor_and_the_inbox_are_written_items_first_and_survive_a_restart   [16 s]
+S04  KILLED    own        poll store                   an epoch of any text is loaded from cursor.json
+         -> tests\stores.rs: the_cursor_and_the_inbox_are_written_items_first_and_survive_a_restart   [16 s]
+S05  KILLED    own        poll store                   any read error of cursor.json is a first run (since 0)
+         -> tests\stores.rs: a_cursor_that_cannot_be_read_is_an_error_and_never_a_first_run   [16 s]
+S06  KILLED    own        poll store                   the items are appended without a newline
+         -> tests\stores.rs: a_crash_between_the_items_and_the_cursor_redelivers_and_loses_nothing (+4)   [17 s]
+X01  KILLED    own        redaction                    a token's Debug prints the whole token
+         -> unittests src\lib.rs: ids::tests::a_token_prints_nothing_of_its_secret   [3 s]
+X02  KILLED    own        redaction                    a signer's Debug prints its seed (base64url)
+         -> slow tier, tests\hardening.rs: no_secret_holding_type_prints_its_secret_in_any_spelling   [23 s]
+X03  KILLED    own        redaction                    an X25519 secret's Debug prints the secret (base64url)
+         -> slow tier, tests\hardening.rs: no_secret_holding_type_prints_its_secret_in_any_spelling   [27 s]
+X04  KILLED    own        redaction                    a pairing secret's Debug prints the secret (base64url)
+         -> slow tier, tests\hardening.rs: no_secret_holding_type_prints_its_secret_in_any_spelling   [23 s]
+H01  KILLED    own        poll gap floor               pollGapMs has no floor: a relay that advertises 0 has the client poll in a tight loop
+         -> tests\vectors.rs: the_poll_gap_has_a_floor_of_250_ms_and_a_ceiling_of_5_s_whatever_the_relay_advertises   [18 s]
+H02  KILLED    own        429 of the proof             a 429 for the identity proof does not raise the 429 count
+         -> unittests src\lib.rs: poll::tests::a_429_for_the_proof_is_flow_and_never_a_failure   [4 s]
+H03  KILLED    own        header names                 a header of an answer is found only by its exact name
+         -> unittests src\lib.rs: poll::tests::headers_are_read_without_regard_to_the_case_of_their_names   [5 s]
+H04  KILLED    own        header names                 the response's own lookup is by exact name
+         -> unittests src\lib.rs: client::http::tests::header_names_are_read_without_regard_to_case_and_the_response_normalises_them   [5 s]
+H05  KILLED    own        header names                 the client does not normalise the names of an adapter's response headers
+         -> slow tier, tests\hardening.rs: the_headers_of_an_answer_reach_the_host_in_lower_case_whatever_the_adapter_returned   [22 s]
+H06  KILLED    own        info proof                   a 200 with no proof in it is `not who it was` and stops the loop instead of being retried
+         -> slow tier, tests\rv_client_io.rs: a_non_proof_200_for_info_is_paced_and_retried_like_a_503   [25 s]
+H07  KILLED    own        epoch                        an epoch of any text goes into the request line of a poll
+         -> tests\client_stub.rs: an_epoch_that_is_not_the_relays_spelling_never_reaches_a_request_line   [8 s]
+H08  KILLED    own        epoch                        an epoch a host's store hands back is not checked before the loop uses it
+         -> slow tier, tests\rv_client_io.rs: finding_an_epoch_from_a_host_store_is_checked_before_it_reaches_the_request_line   [28 s]
+H09  KILLED    own        proof age                    a wall clock that has been set back by more than a minute does not make the proof stale
+         -> slow tier, tests\hardening.rs: a_proof_goes_stale_when_the_wall_clock_moves_by_more_than_the_proof_allows   [81 s]
+H10  KILLED    own        proof age                    a wall clock that has moved forward does not age the proof (only the monotonic clock does)
+         -> slow tier, tests\hardening.rs: a_loop_that_slept_proves_the_relay_again_before_it_sends_a_token (+1)   [21 s]
+H11  KILLED    own        relay clock                  a first sample that is days from the wall clock is believed
+         -> unittests src\lib.rs: client::clock::tests::a_sample_a_day_or_more_from_the_wall_clock_is_not_believed   [3 s]
+H12  KILLED    own        network change               the loop does not wait for a flood of network changes to settle
+         -> slow tier, tests\rv_client_io.rs: a_flood_of_network_changes_is_debounced_into_a_few_proofs   [29 s]
+H13  KILLED    own        network change               the quiet time before a proof after a network change is nothing
+         -> slow tier, tests\rv_client_io.rs: a_flood_of_network_changes_is_debounced_into_a_few_proofs   [27 s]
+H14  KILLED    own        P1                           the replacement poll does not know that it replaces one (the flag is lost to the proof a network change calls for)
+         -> slow tier, tests\rv_client_io.rs: finding_a_replacement_poll_starts_no_sooner_than_250_ms_after_the_one_it_cancels   [28 s]
+H16  KILLED    own        poll store                   a torn last line is not cut off before the next append
+         -> tests\stores.rs: a_torn_append_is_cut_off_before_the_next_one_and_is_never_read   [18 s]
+H17  KILLED    own        poll store                   the inbox is never closed into segments
+         -> tests\stores.rs: a_full_inbox_fails_the_write_and_drops_nothing_until_it_is_drained (+1)   [17 s]
+H18  KILLED    own        poll store                   a full inbox takes more
+         -> tests\stores.rs: a_full_inbox_fails_the_write_and_drops_nothing_until_it_is_drained   [18 s]
+H19  KILLED    own        desktop window               a response is taken to an offer whose own window has passed
+         -> slow tier, tests\rv_pairing_desktop.rs: finding_the_desktop_accepts_a_fresh_response_to_an_offer_that_expired_long_ago   [52 s]
+H20  KILLED    own        desktop bounds               a second offer with the secret of one in flight replaces it
+         -> slow tier, tests\hardening.rs: an_offer_whose_secret_is_in_flight_is_never_replaced   [45 s]
+H21  KILLED    own        desktop bounds               there is no limit to the pairings in flight
+         -> slow tier, tests\hardening.rs: the_party_remembers_no_more_than_its_bounds_whatever_a_relay_delivers   [20 s]
+H22  KILLED    own        desktop bounds               what the party remembers (judged ids, consumed nonces) grows without a cap
+         -> slow tier, tests\hardening.rs: the_party_remembers_no_more_than_its_bounds_whatever_a_relay_delivers   [20 s]
+H23  KILLED    own        desktop SAS                  a wrong code typed after the right one counts as an attempt and denies
+         -> tests\pairing_stub.rs: wrong_codes_typed_after_the_right_one_never_deny_a_pairing_whose_approval_is_on_its_way   [14 s]
+H24  KILLED    own        pid in a path                burn puts a pid that is not the relay's own spelling into a path that carries the token
+         -> slow tier, tests\rv_pairing_desktop.rs: finding_the_desktops_three_pairing_calls_do_not_validate_the_pid_they_put_in_the_path   [55 s]
+H25  KILLED    own        pid in a path                reject puts a pid that is not the relay's own spelling into a path that carries the token
+         -> slow tier, tests\rv_pairing_desktop.rs: finding_the_desktops_three_pairing_calls_do_not_validate_the_pid_they_put_in_the_path   [53 s]
+H26  KILLED    own        pid in a path                the decision puts a pid that is not the relay's own spelling into a path that carries the token
+         -> slow tier, tests\rv_pairing_desktop.rs: finding_the_desktops_three_pairing_calls_do_not_validate_the_pid_they_put_in_the_path   [52 s]
+H27  KILLED    own        secrets                      the pairing secret is a constant (it is not drawn from the operating system's generator inside the crate)
+         -> slow tier, tests\hardening.rs: the_party_remembers_no_more_than_its_bounds_whatever_a_relay_delivers   [20 s]
+H28  KILLED    own        pair-wait pacing             an answer that leaves the rendezvous as it was is asked again at once (a spin)
+         -> slow tier, tests\hardening.rs: a_read_the_relay_says_it_held_is_believed_only_when_it_was_not_superseded_and_took_a_hold_s_time   [21 s]
+H29  KILLED    own        pair-wait pacing             a read the relay says it held is believed whatever time it took
+         -> slow tier, tests\rv_pairing_phone.rs: finding_a_relay_that_answers_a_hold_at_once_makes_the_phone_poll_without_a_pause   [55 s]
+H30  KILLED    own        pair-wait pacing             a read that was superseded is believed to have been held
+         -> slow tier, tests\hardening.rs: a_read_the_relay_says_it_held_is_believed_only_when_it_was_not_superseded_and_took_a_hold_s_time   [19 s]
+H31  KILLED    own        rejected response            a phone whose response was rejected resends the lapsed claims
+         -> slow tier, tests\rv_findings.rs: rv_a_phone_answers_afresh_after_its_response_was_rejected_for_its_window   [50 s]
+H32  KILLED    own        pairing key                  the pairing key's own expiry is not judged
+         -> tests\pairing_stub.rs: a_pairing_key_that_expired_before_the_offer_did_is_refused_with_thirty_seconds_of_slack   [15 s]
+H33  KILLED    own        admission and receipt        an admission whose scopes are not the grants the desktop signed is accepted
+         -> tests\aokie_fixtures.rs: a_phones_admission_is_compared_with_the_grants_the_desktop_signed_and_the_desktop_the_phone_pinned   [3 s]
+H34  KILLED    own        admission and receipt        an admission that names another desktop than the pinned one is accepted
+         -> tests\aokie_fixtures.rs: a_phones_admission_is_compared_with_the_grants_the_desktop_signed_and_the_desktop_the_phone_pinned   [3 s]
+H35  KILLED    own        ticket                       a ticket's sub is counted in bytes, as a schema's maxLength does not
+         -> slow tier, tests\rv_enc_misc.rs: a_sub_of_thirty_cjk_characters_is_within_the_schema   [62 s]
+H36  KILLED    own        ticket                       a ticket's org is not an origin
+         -> slow tier, tests\rv_enc_misc.rs: an_org_that_is_not_an_origin_is_refused   [50 s]
+H37  KILLED    own        relay url                    the default port is a port of its own (https://h and https://h:443 are two relays)
+         -> unittests src\lib.rs: url::tests::https_origins_are_accepted_and_normalised (+1)   [4 s]
+H38  KILLED    own        relay url                    an empty label is a host (a..b, a trailing dot)
+         -> unittests src\lib.rs: url::tests::everything_that_is_not_a_bare_origin_is_refused   [4 s]
+H39  KILLED    own        relay url                    a label may start with a hyphen
+         -> unittests src\lib.rs: url::tests::everything_that_is_not_a_bare_origin_is_refused   [4 s]
+H40  KILLED    own        plain http                   plain http is read on loopback without the program having asked for it
+         -> unittests src\lib.rs: url::tests::plain_http_is_read_only_after_the_program_asks_for_it   [5 s]
+H41  KILLED    own        loopback client              a chunk size near usize::MAX overflows the body-size sum
+         -> slow tier, tests\rv_client_io.rs: finding_chunk_size_overflow_is_an_error_and_not_a_panic   [25 s]
+H42  KILLED    own        loopback client              a path with a line break is put into the request line
+         -> slow tier, tests\rv_client_io.rs: finding_a_path_with_a_line_break_does_not_split_the_request   [26 s]
 
-Notes
-- B05 is reported INVALID in this run: a build failure that did not repeat (the harness now retries a failed build once before it calls a mutant invalid). Run alone with
-  `--only B05` it is KILLED (unittests src\lib.rs: b64::tests::decode_exact_checks_the_size (+4)). So 83 of 83 are killed.
-- History: the first full run, of 79 mutants, left eight standing (C05 the median of five clock samples, A08 the one spelling of a typed code, D02 a nonce of another size, D06 and D07
-  a ticket and a rotation statement one second too long, D09 a wait of 301 s in an info, J08 a raw 0x1f in a JSON string, K03 a non-canonical Ed25519 key). A test was written for each
-  (commit 37ba61d9) and all eight are killed above. E01 to E04 (the admission's relay advertisement and members) were added with the change that made the admission read them as the
-  shipped decoders do.
-- A mutant that survives the fast layers is also run against the real PHP relay (tests/relay_php.rs); none needed it in this run.
-- "dependency" mutants change oaiy-crypto (K01 to K03) and show that this crate's tests would notice the dependency losing a check.
+106 mutations: 106 killed, 0 survived, 0 invalid, 0 timed out; 2171 s; tree clean
