@@ -91,8 +91,13 @@ pub(super) async fn engine_discovery(st: &AiState) -> Result<(String, Value), St
 }
 
 pub(super) async fn resident_engine_provider(st: &AiState) -> Result<AiProvider, String> {
-    let (gateway, discovery) = engine_discovery_impl(st, true).await?;
-    Ok(engine_provider(gateway, chosen_model(&discovery)))
+    let (gateway, discovery, state) = engine_discovery_snapshot(st, true).await?;
+    let source = plugin_engine_source_snapshot(&discovery, &state)?;
+    if !source.completion_available
+        || state.pointer("/llm/paused_for_media").and_then(Value::as_bool) == Some(true) {
+        return Err("The chosen engine model is not already ready and resident.".into());
+    }
+    Ok(engine_provider(gateway, source.model))
 }
 
 async fn engine_discovery_impl(st: &AiState, require_resident: bool) -> Result<(String, Value), String> {
