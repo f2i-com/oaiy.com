@@ -194,3 +194,172 @@ fn registration_is_never_more_generous_than_the_relay_on_the_corpus_honest_keys_
     );
     assert!(relay_takes >= 150 && verifier_alone >= 450, "{relay_takes} {verifier_alone}");
 }
+
+// ---- where the registration rule is applied: every key the crate reads out of a protocol document, or is asked to register
+
+fn mixed() -> [u8; 32] {
+    key(REFUSED_BY_THE_RELAY[0])
+}
+
+fn is_refused_for_its_subgroup(e: &Error) -> bool {
+    matches!(e, Error::Invalid(w) if w.contains("prime-order"))
+}
+
+#[test]
+fn a_relay_whose_key_is_not_one_the_relay_registers_is_not_read() {
+    use common::At;
+    let v = common::load("vectors.json");
+    let text = v.s("A6b.expected.bodyText");
+    oaiy_relay_core::info::Info::parse(text.as_bytes()).expect("the recorded info");
+    let key = VerifyKey::from_bytes(&mixed()).unwrap();
+    let doc = text
+        .replace(v.s("keys.ed25519Public.relay.publicKey"), &key.to_b64u())
+        .replace(v.s("keys.ed25519Public.relay.thumbprint"), &key.thumbprint());
+    assert_ne!(doc, text);
+    let err = oaiy_relay_core::info::Info::parse(doc.as_bytes()).unwrap_err();
+    assert!(is_refused_for_its_subgroup(&err), "{err:?}");
+}
+
+#[test]
+fn an_offer_and_a_response_that_carry_a_key_the_relay_refuses_are_not_read() {
+    use common::At;
+    use oaiy_crypto::zeroize::Secret;
+    use oaiy_relay_core::keys::X25519Public;
+    use oaiy_relay_core::pairing::{Claims, Offer, OfferParams, Response};
+    use oaiy_relay_core::url::RelayUrl;
+    let v = common::load("vectors.json");
+    let seed = |path: &str| Signer::from_seed(&Secret::new(common::unhex32(v.s(path))));
+    let (desktop, host, phone) = (seed("keys.ed25519Seeds.desktopEndpoint"), seed("keys.ed25519Seeds.host"), seed("keys.ed25519Seeds.phone"));
+    let (desktop_x, host_x) =
+        (X25519Public::from_b64u(v.s("keys.x25519Public.plugin")).unwrap(), X25519Public::from_b64u(v.s("keys.x25519Public.host")).unwrap());
+    let relay = RelayUrl::parse(v.s("A3.inputs.relayUrl")).unwrap();
+    let bad = VerifyKey::from_bytes(&mixed()).unwrap();
+    let offer_with = |desktop_endpoint: &VerifyKey, host_ed25519: &VerifyKey| {
+        Offer::build(&OfferParams {
+            app_id: v.s("A3.inputs.offer.appId"),
+            desktop_connection_id: v.s("A3.inputs.offer.desktopConnectionId"),
+            desktop_name: v.s("A3.inputs.offer.desktopName"),
+            desktop_endpoint,
+            desktop_x25519: &desktop_x,
+            host_ed25519,
+            host_x25519: &host_x,
+            nonce: common::unhex32(v.s("A3.inputs.nonceHex")),
+            jti: v.s("A3.inputs.offer.jti"),
+            issued_at: v.n("A3.inputs.offer.issuedAt"),
+            relay: &relay,
+            relay_fingerprint: v.s("A3.inputs.offer.relay.fingerprint"),
+        })
+    };
+    offer_with(&desktop.verify_key(), &host.verify_key()).expect("an offer of honest keys");
+    let err = offer_with(&bad, &host.verify_key()).unwrap_err();
+    assert!(is_refused_for_its_subgroup(&err), "the desktop's endpoint key: {err:?}");
+    let err = offer_with(&desktop.verify_key(), &bad).unwrap_err();
+    assert!(is_refused_for_its_subgroup(&err), "the host's key: {err:?}");
+    // A response whose claims name such a phone key.
+    let claims = |mobile_endpoint: VerifyKey| Claims {
+        app_id: v.s("A3.inputs.claims.appId").into(),
+        desktop_connection_id: v.s("A3.inputs.claims.desktopConnectionId").into(),
+        desktop_key_thumbprint: v.s("A3.inputs.claims.desktopKeyThumbprint").into(),
+        device_id: v.s("A3.inputs.claims.deviceId").into(),
+        display_name: Some(v.s("A3.inputs.claims.displayName").into()),
+        mobile_endpoint,
+        mobile_x25519: X25519Public::from_b64u(v.s("A3.inputs.claims.mobileX25519")).unwrap(),
+        pairing_nonce: common::unhex32(v.s("A3.inputs.nonceHex")),
+        jti: v.s("A3.inputs.claims.jti").into(),
+        issued_at: v.n("A3.inputs.claims.issuedAt"),
+        expires_at: v.n("A3.inputs.claims.expiresAt"),
+    };
+    let mac_key =
+        oaiy_relay_core::pairing::math::PairingSecret::new(common::unhex(v.s("A3.inputs.secretHex")).try_into().unwrap()).derive().unwrap().mac_key;
+    let honest = Response::build(&phone, &mac_key, claims(phone.verify_key())).unwrap();
+    Response::parse(&honest.text).expect("a response of an honest key");
+    // The response text with the phone's key (and its thumbprint, so that nothing else is wrong with it) replaced by one the relay refuses: `Response::build` itself will not sign claims
+    // that name another key than the signer's, so the text is changed after it was built.
+    let changed = honest.text.replace(&phone.verify_key().to_b64u(), &bad.to_b64u()).replace(&phone.verify_key().thumbprint(), &bad.thumbprint());
+    assert_ne!(changed, honest.text);
+    let err = Response::parse(&changed).map(|_| ()).unwrap_err();
+    assert!(is_refused_for_its_subgroup(&err), "the phone's endpoint key: {err:?}");
+}
+
+#[test]
+fn a_rotation_to_a_key_the_relay_refuses_is_not_read() {
+    use common::At;
+    use oaiy_crypto::zeroize::Secret;
+    use oaiy_relay_core::keys::SignDomain;
+    let v = common::load("vectors.json");
+    let old = Signer::from_seed(&Secret::new(common::unhex32(v.s("keys.ed25519Seeds.provider"))));
+    let statement = v.s("A10.expected.statementText");
+    let resign = |text: &str| (oaiy_relay_core::b64::encode(text.as_bytes()), old.sign_b64u(SignDomain::ProviderRotate, &[text.as_bytes()]));
+    let (b, s) = resign(statement);
+    oaiy_relay_core::rotation::verify(&old.verify_key(), 0, 1_790_000_100, &b, &s).expect("the recorded statement");
+    let bad = VerifyKey::from_bytes(&mixed()).unwrap();
+    let changed = statement
+        .replace(v.s("keys.ed25519Public.provider2.publicKey"), &bad.to_b64u())
+        .replace(v.s("keys.ed25519Public.provider2.thumbprint"), &bad.thumbprint());
+    assert_ne!(changed, statement);
+    let (b, s) = resign(&changed);
+    let err = oaiy_relay_core::rotation::verify(&old.verify_key(), 0, 1_790_000_100, &b, &s).unwrap_err();
+    assert!(is_refused_for_its_subgroup(&err), "{err:?}");
+}
+
+#[test]
+fn a_stored_pairing_whose_pinned_keys_the_relay_refuses_is_not_loaded() {
+    use common::pair::world;
+    use oaiy_relay_core::client::{Cancel, RelayProfile};
+    use oaiy_relay_core::pairing::phone::Outcome;
+    use oaiy_relay_core::pairing::PairingInput;
+    use oaiy_relay_core::testing::stub::StubConfig;
+    let mut w = world(StubConfig { receipt_includes_grants: true, ..common::env::quick() });
+    let offer = w.new_offer();
+    let mut phone = w.phone(PairingInput::Key(&offer.pairing_uri), 91);
+    phone.fetch_offer(&Cancel::new()).unwrap();
+    let sas = phone.respond(&Cancel::new()).unwrap();
+    w.deliver();
+    w.desktop.confirm_sas(&w.env.client, &w.token, &offer.pid, &sas.display(), &common::pair::grants(), &Cancel::new()).unwrap();
+    let Outcome::Paired(paired) = phone.wait_outcome(None, &Cancel::new()).unwrap() else { panic!("not paired") };
+    let text = paired.profile.to_json();
+    RelayProfile::from_json(text.as_bytes()).expect("the honest profile loads");
+    let peer = paired.profile.peer.as_ref().unwrap();
+    let bad = oaiy_relay_core::b64::encode(&mixed());
+    for (what, key) in [("the desktop's endpoint key", peer.desktop_endpoint.to_b64u()), ("the host's key", peer.host_ed25519.to_b64u())] {
+        let damaged = text.replace(&key, &bad);
+        assert_ne!(damaged, text, "{what}");
+        let err = RelayProfile::from_json(damaged.as_bytes()).unwrap_err();
+        assert!(err.to_string().contains("prime-order"), "{what}: {err}");
+    }
+}
+
+#[test]
+fn a_device_key_the_relay_refuses_is_not_enrolled_and_nothing_is_sent() {
+    use oaiy_relay_core::client::Cancel;
+    use oaiy_relay_core::enrol::{EnrolmentKey, Role};
+    use oaiy_relay_core::keys::X25519Secret;
+    let e = common::env::env(common::env::quick());
+    let enrolment = EnrolmentKey::parse(&e.stub.mint_enrolment_key(Role::Desktop, 3600)).unwrap();
+    let x = X25519Secret::generate().unwrap().public_key();
+    e.stub.clear_log();
+    let bad = VerifyKey::from_bytes(&mixed()).unwrap();
+    let err = e.client.enroll(&enrolment, "PC", &bad, &x, &Cancel::new()).unwrap_err();
+    assert!(err.to_string().contains("prime-order"), "{err}");
+    assert!(e.stub.log().is_empty(), "nothing was sent: {:?}", e.stub.log());
+    // The same key made by honest hands enrols.
+    e.client.enroll(&enrolment, "PC", &Signer::generate().unwrap().verify_key(), &x, &Cancel::new()).unwrap();
+}
+
+#[test]
+fn a_plugin_admission_for_an_endpoint_key_the_relay_refuses_is_not_made() {
+    use oaiy_relay_core::admission::PluginRequest;
+    let honest = Signer::generate().unwrap().verify_key();
+    let request = |endpoint: VerifyKey| PluginRequest {
+        app_id: "aokie".into(),
+        plugin_id: "narrator".into(),
+        display_name: None,
+        endpoint,
+        approved_peers: vec![Signer::generate().unwrap().thumbprint()],
+        revision: 1,
+        transports: None,
+    };
+    request(honest).to_body().expect("an honest endpoint key");
+    let err = request(VerifyKey::from_bytes(&mixed()).unwrap()).to_body().unwrap_err();
+    assert!(err.to_string().contains("endpoint key"), "{err}");
+}
