@@ -177,30 +177,43 @@ pub(crate) enum Reread<T> {
     Unusable(LinkError),
 }
 
-/// Read a file of the link again that could not be read the first time, because another program (a scanner, an
-/// indexer, a backup) had it: at the times `retry` says, and at once when `force` is set (a write is about to
+/// Read a file of the link once more, with nothing kept between one look and the next: what it holds, nothing if
+/// it is gone, why it cannot be used, or [`Reread::Still`] if another program has it. It never waits, and it never
+/// moves, writes or removes the file.
+pub(crate) fn read_again<T: serde::de::DeserializeOwned>(path: &std::path::Path, shown_as: &str) -> Reread<T> {
+    match read_stored_after(path, shown_as, &[], false) {
+        Ok(read) => Reread::Read(read),
+        Err(e) if e.busy => Reread::Still,
+        Err(e) => {
+            log::warn!("link: {}", e.message);
+            Reread::Unusable(e)
+        }
+    }
+}
+
+/// [`read_again`] for a file whose timer its owner keeps next to it, behind a lock the owner holds for the whole
+/// call (the relay store's files): at the times `retry` says, and at once when `force` is set (a write is about to
 /// decide what to do with it). A session used to stay without its link for as long as it ran after three tries in
-/// the first moments. It never waits, and it never moves, writes or removes the file: whatever it finds is only read.
+/// the first moments.
 pub(crate) fn reread<T: serde::de::DeserializeOwned>(path: &std::path::Path, shown_as: &str, retry: &mut Option<crate::secret_file::Retry>, force: bool) -> Reread<T> {
     if !force && !retry.as_ref().is_some_and(|r| r.due()) {
         return Reread::Still;
     }
-    match read_stored_after(path, shown_as, &[], false) {
-        Ok(read) => {
+    match read_again(path, shown_as) {
+        Reread::Read(read) => {
             if retry.take().is_some() {
                 log::info!("link: {shown_as} could be read again");
             }
             Reread::Read(read)
         }
-        Err(e) if e.busy => {
+        Reread::Still => {
             match retry {
                 Some(r) => r.failed(),
                 None => *retry = Some(crate::secret_file::Retry::began(&crate::secret_file::Patience::default())),
             }
             Reread::Still
         }
-        Err(e) => {
-            log::warn!("link: {}", e.message);
+        Reread::Unusable(e) => {
             *retry = None;
             Reread::Unusable(e)
         }
@@ -715,24 +728,35 @@ impl LinkStore {
     /// one that cannot be used is reported; one that is still held waits for the next time. It only ever reads:
     /// a link that is perfectly good is not moved aside, written over or removed by it.
     fn reread(&self, force: bool) {
-        let mut retry = {
-            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // Decided under the lock, and the timer left where it is: the lanes that ask for the account call this at the
+        // top of their loops with no pause before it, so a second caller meets the first one's read in progress, and a
+        // timer taken out for the length of a read and put back after it was lost to whoever took `None` in between.
+        {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             if inner.account.is_some() || inner.error.is_none() {
                 return;
             }
-            inner.retry.take()
-        };
+            if !force && !inner.retry.as_ref().is_some_and(|r| r.due()) {
+                return;
+            }
+        }
         // Without the lock: the file is read, and the lanes that ask for the account meanwhile are not kept waiting.
-        let read = reread::<LinkedAccount>(&self.path, ACCOUNT_FILE, &mut retry, force);
+        let read = read_again::<LinkedAccount>(&self.path, ACCOUNT_FILE);
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.account.is_some() {
+        if inner.account.is_some() || inner.error.is_none() {
             return;
         }
         match read {
-            Reread::Still => inner.retry = retry,
+            // Still held: the next time is later, and the timer is changed in place.
+            Reread::Still => match inner.retry.as_mut() {
+                Some(r) => r.failed(),
+                None => inner.retry = Some(crate::secret_file::Retry::began(&crate::secret_file::Patience::default())),
+            },
             Reread::Read(account) => {
+                if inner.retry.take().is_some() {
+                    log::info!("link: {ACCOUNT_FILE} could be read again");
+                }
                 inner.error = None;
-                inner.retry = None;
                 if let Some(account) = account {
                     set_linked_origin(Some(account.base_url.as_str()));
                     inner.account = Some(account);
@@ -1495,6 +1519,55 @@ mod tests {
         assert_eq!(store.account().unwrap().credential, "flk_supersecret");
         assert!(!dir.join("link").join("account.json.corrupt").exists(), "a good file was read, not moved aside");
         assert!(store.inner.lock().unwrap().retry.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_held_file_is_read_again_however_many_lanes_ask_at_once() {
+        // The lanes that read the account at the top of their loops (the command lane, the flow runner, the sealed flows, the
+        // AI tunnel) have no pause before it, and the screen asks for the status as well. Eight threads in a tight loop meet
+        // each other's read inside microseconds. A timer taken out of the lock for the length of a read and put back after it
+        // was lost to whoever took `None` in between, and the link then never came back for as long as the session ran.
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let dir = data_dir("held-race");
+        let file = dir.join("link").join("account.json");
+        std::fs::write(&file, serde_json::to_string(&account()).unwrap()).unwrap();
+        // A good file that cannot be read for now, and that is let go of in one step (so that there is no moment when it is missing).
+        let Some(held) = crate::secret_file::testing::make_unreadable(&file) else { return };
+        let store = load_store(dir.clone());
+        read_again_now(&store);
+        let (stop, linked) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)));
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let (store, stop, linked) = (store.clone(), stop.clone(), linked.clone());
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let back = if i == 7 { store.status().linked } else { store.account().is_some() };
+                        if back {
+                            linked.fetch_add(1, Ordering::SeqCst);
+                            return;
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        // They meet each other against the held file for a while; then it is let go of.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert_eq!(linked.load(Ordering::SeqCst), 0, "held: nobody has a link yet");
+        drop(held);
+
+        // Every one of them gets it, soon.
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while linked.load(Ordering::SeqCst) < 8 && Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        stop.store(true, Ordering::Relaxed);
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(linked.load(Ordering::SeqCst), 8, "the link came back to every lane that asked: the timer was not lost");
+        assert!(store.inner.lock().unwrap().retry.is_none(), "and the timer is done with");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
