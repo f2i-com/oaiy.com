@@ -56,6 +56,18 @@ def damages():
         steps(c)[5]["response"]["body"]["receipt"]["signature"] = steps(c)[4]["request"]["body"]["receipt"]["signature"]
     yield d("the approval receipt's signature is damaged (in the request and in what the phone reads)", receipt)
 
+    # The receipt the phone reads carries the grants it was signed over (README Interpretation 60); each change of them is refused.
+    read = lambda c: steps(c)[5]["response"]["body"]["receipt"]
+    yield d("the grants are missing from the receipt the phone reads", lambda s, c: read(c).pop("grants"))
+    yield d("the grants of the receipt the phone reads are in another order", lambda s, c: read(c).update(grants=list(reversed(read(c)["grants"]))))
+    yield d("a grant is added to the receipt the phone reads", lambda s, c: read(c)["grants"].append("takeover"))
+    yield d("a grant is taken from the receipt the phone reads", lambda s, c: read(c)["grants"].pop(0))
+    yield d("one grant of the receipt the phone reads is altered", lambda s, c: read(c)["grants"].__setitem__(0, "end_caller"))
+    yield d("a grant appears twice in the receipt the phone reads", lambda s, c: read(c)["grants"].insert(0, read(c)["grants"][0]))
+    yield d("the receipt the phone reads names a grant nobody knows", lambda s, c: read(c)["grants"].append("zzz_unknown"))
+    yield d("the grants of the decision are altered (they are no longer the ones signed and returned)", lambda s, c: steps(c)[4]["request"]["body"]["grants"].append("takeover"))
+    yield d("the grants of the receipt the phone reads are an empty list", lambda s, c: read(c).update(grants=[]))
+
     def keys(s, c):
         steps(c)[4]["request"]["body"]["phone"]["ed25519"] = SEALED["wrongRecipient"]["x25519Public"]
     yield d("the approval names another Ed25519 key than the phone answered with", keys)

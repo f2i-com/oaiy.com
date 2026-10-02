@@ -11,7 +11,7 @@ box is not one of those: its ephemeral key is random, so no two are alike. The f
 | `rust-check/` | a stand-alone Rust crate that opens `sealed-token.json` with the `crypto_box` crate | a first Rust reader, to copy from |
 | `pairing-ceremony.json` | one whole pairing (Appendix A3's keys and values) as the requests a desktop and a phone make and the answers the relay gives | a Rust stub relay, a phone double, a host client |
 | `verify_fixtures.py`, `verify_fixtures.mjs` | two independent checks of the two files above, with no libsodium | the conformance suite (`../../../tests/relay_conformance.py`) |
-| `selftest_fixtures.py` | runs those two checks on sixteen damaged copies of the two files (a flipped bit, a wrong hash, a bad receipt, a good box among the refused ones, ...) and requires each to refuse each | the conformance suite |
+| `selftest_fixtures.py` | runs those two checks on twenty-five damaged copies of the two files (a flipped bit, a wrong hash, a bad receipt, the grants of the receipt the phone reads missing, reordered, added to, taken from, altered, repeated, unknown or empty, a good box among the refused ones, ...) and requires each to refuse each | the conformance suite |
 | `aokie/` | what the relay answers to the shipped Aokie plugin and phone (admissions, challenges, frames, streams, errors, ICE) and the rules of their decoders applied to it; its own [`README.md`](aokie/README.md) | a Rust contract test in the Aokie repository, and the conformance suite |
 | `poll-client/poll-client.json` | **not a recording**: a hand-written table of what the poll loop of a native client does with each answer of the relay (rules P1 to P9 of `README.md` section 5.1.1) | the desktop's relay client (DK-03), the phone's (MOB-21a), and the two readers below |
 | `poll-client/verify_poll_client.py`, `poll-client/verify_poll_client.mjs` | two readings of those rules, written from the README alone in two languages, each recomputing every case of the table; the conformance suite also runs both on forty-eight damaged tables (a clamp, a backoff cap, a jitter or a count that is wrong, a case that went missing, was relabelled or moved, constants that are not the README's, and a wrong answer to each rule settled in 5.1.1) and pins the number of cases and the digest of their names and requires each to refuse each | the conformance suite |
@@ -51,7 +51,9 @@ A reader MUST
 3. open the box, and only then look at the plaintext: 63 bytes matching `oaiyrt1\.[A-Za-z0-9_-]{11}\.[A-Za-z0-9_-]{43}`, whose
    SHA-256 is `plaintextSha256`;
 4. verify the approval receipt (`pairing-fetch-response.receipt`) with the desktop key it pinned from the MAC-verified offer
-   **before** it stores a profile. A sealed box is anonymous: anyone can seal something to a phone's public key, so the box proves
+   **before** it stores a profile, over the canonical document built from **the grants the receipt carries** (`receipt.grants`: sorted, no repeats, each one of the fourteen names of
+   `README.md` section 4.14; the phone refuses the receipt otherwise), its own app, the `pid`, the `issuedAt` of the receipt and the thumbprint of its own
+   endpoint key: the phone never sees the desktop's decision, so the grants cannot come from anywhere else (Interpretation 60). A sealed box is anonymous: anyone can seal something to a phone's public key, so the box proves
    nothing about who made it; the receipt proves the desktop approved this phone.
 
 In Rust (`crypto_box` with its `seal` feature, which the desktop's `Cargo.toml` does not yet enable; check the version in the
@@ -71,11 +73,12 @@ open the same way, which is the reverse fixture `vectors.json` interpretation 17
 the desktop's poll returns the `pair` item, the desktop approves, the phone reads the outcome. Each step has the `request`
 (method, path and body; the desktop's own requests carry its device token, which is not recorded) and the relay's `response`
 (status and body). Everything in it that is deterministic is Appendix A3's: the pairing secret, the 778 byte offer and its MAC,
-the response claims, signature and MAC, the receipt and the short authentication string. What varies between recordings is the
-phone's relay device id and the sealed token.
+the response claims, signature and MAC, the receipt (with the grants it carries when the phone reads it: sorted, where the decision listed them in the
+desktop's own order) and the short authentication string. What varies between recordings is the phone's relay device id, the relay's epoch and the sealed token.
 
 The verifiers re-derive the pid, both MACs, both signatures, the canonical receipt document and the SAS from the secret and the
-keys, and open the sealed token.
+keys, and open the sealed token. They verify the receipt twice: over the grants of the desktop's decision, and as the phone does, from the receipt
+it reads alone (its own app, pid and thumbprint, the desktop key of the offer and the grants the receipt carries).
 
 ## `poll-client/poll-client.json`
 

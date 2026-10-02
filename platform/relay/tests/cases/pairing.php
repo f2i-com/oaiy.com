@@ -90,7 +90,10 @@ test('4.10.3 the ceremony of Appendix A3 runs through the relay byte for byte: t
     eq(200, $d['status'], $d['body']);
     $g = $c->get();
     eq('approved', $g['json']['state']);
-    eq(['issuedAt' => 1790000040, 'signature' => $v['expected']['receiptSignature']], $g['json']['receipt']);
+    $sorted = Grants::DEFAULT;
+    sort($sorted, SORT_STRING);
+    eq(['issuedAt' => 1790000040, 'signature' => $v['expected']['receiptSignature'], 'grants' => $sorted], $g['json']['receipt'], 'the receipt, with the grants it was signed over, sorted');
+    eq(null, $c->phoneRefusesReceipt($g['json']['receipt']), 'and the phone verifies it from what it reads alone');
     $tok = $c->openToken($g['json']['sealedToken']);
     ok($tok !== null, 'the phone\'s key opens it');
     eq(200, $r->call($tok, 'GET', '/v1/poll')['status'], 'and what it opens is the phone\'s token');
@@ -867,12 +870,59 @@ test('4.10.3 steps 7 and 8: an approval creates the phone\'s device, mints its t
     $g = $c->get();
     eq('approved', $g['json']['state']);
     eq($id, $g['json']['deviceId']);
-    eq($doc['receipt'], $g['json']['receipt'], 'the receipt comes back as the desktop signed it');
+    $sorted = Grants::DEFAULT;
+    sort($sorted, SORT_STRING);
+    eq($doc['receipt'] + ['grants' => $sorted], $g['json']['receipt'], 'the receipt comes back as the desktop signed it, with the grants it signed over, sorted');
     $token = $c->openToken($g['json']['sealedToken']);
     ok($token !== null && preg_match('/^oaiyrt1\.[A-Za-z0-9_-]{11}\.[A-Za-z0-9_-]{43}$/D', $token) === 1, 'the phone opens a token');
     $poll = $r->call($token, 'GET', '/v1/poll');
     eq(200, $poll['status'], 'and it is the new device\'s: ' . $poll['body']);
     eq(1, pair_phones($r, $d));
+});
+
+test('4.10.2 the receipt the phone reads carries the grants it was signed over (Interpretation 60): sorted, exactly the approval\'s set, so that the phone verifies it from what it reads alone, and any change of them is refused by the phone\'s rules', function () {
+    [$r, $d, $c] = pair_setup();
+    $c->open();
+    $c->answer();
+    // The desktop lists the grants in an order of its own and signs them (the relay sorts before it checks); the phone reads them sorted.
+    $given = ['rtc_signal', 'state_read', 'assistance_respond', 'assistance_read', 'caller_read', 'captions_read', 'takeover'];
+    $res = $c->decide($c->decisionDoc($given));
+    eq(200, $res['status'], $res['body']);
+    $g = $c->get();
+    $receipt = $g['json']['receipt'];
+    $want = $given;
+    sort($want, SORT_STRING);
+    eq(['issuedAt', 'signature', 'grants'], array_keys($receipt), 'the receipt: issuedAt, signature and the grants');
+    eq($want, $receipt['grants'], 'the grants the desktop signed, sorted, and no others');
+    eq(null, $c->phoneRefusesReceipt($receipt), 'the phone verifies the receipt from what it reads alone');
+    // What the phone must refuse, one change at a time (the signature covers the grants, so each is also a signature that does not verify
+    // except the order, which is the phone's own rule).
+    $altered = $receipt['grants'];
+    $altered[0] = 'monitor';
+    foreach ([
+        'grants missing' => array_diff_key($receipt, ['grants' => 1]),
+        'grants reordered' => array_merge($receipt, ['grants' => array_reverse($receipt['grants'])]),
+        'a grant added' => array_merge($receipt, ['grants' => array_merge($receipt['grants'], ['monitor'])]),
+        'a grant removed' => array_merge($receipt, ['grants' => array_slice($receipt['grants'], 1)]),
+        'one grant altered' => array_merge($receipt, ['grants' => $altered]),
+        'a grant twice' => array_merge($receipt, ['grants' => array_merge($receipt['grants'], [$receipt['grants'][0]])]),
+        'a name nobody knows' => array_merge($receipt, ['grants' => array_merge($receipt['grants'], ['zzz_unknown'])]),
+        'grants an object' => array_merge($receipt, ['grants' => (object)[]]),
+    ] as $what => $bad) {
+        ok($c->phoneRefusesReceipt(json_decode(json_encode($bad), true)) !== null, "the phone refuses a receipt with $what");
+    }
+    // A decision with no grants at all is allowed; its receipt has an empty list, which verifies (and is a list, not an object).
+    [$r2, $d2, $c2] = pair_setup();
+    $c2->open();
+    $c2->answer();
+    eq(200, $c2->decide($c2->decisionDoc([]))['status']);
+    $g2 = $c2->get();
+    eq([], $g2['json']['receipt']['grants']);
+    contains('"grants":[]', $g2['body'], 'an empty list, not an object');
+    eq(null, $c2->phoneRefusesReceipt($g2['json']['receipt']));
+    // The row in the database holds what is returned: the grants are stored with the receipt, sorted.
+    $stored = json_decode((string)$r->ctx()->db->val('SELECT receipt FROM pairings WHERE pid = ?', [$c->pid]), true);
+    eq($want, $stored['grants']);
 });
 
 test('4.10.3 step 8: the plaintext token exists inside the decision and nowhere else: not in the database, not in any answer, not in the log', function () {

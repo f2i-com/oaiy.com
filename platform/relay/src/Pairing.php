@@ -87,6 +87,9 @@ final class Pairing
     /**
      * What GET /v1/pair/{pid} tells the phone (pairing-fetch-response). No secret is in it: the offer and its MAC are public
      * material, and the sealed token opens only with the phone's own key.
+     * The receipt of an approved rendezvous is {issuedAt, signature, grants}: the grants are the sorted set the desktop signed (the phone never
+     * sees the decision, and verifies the receipt over exactly these; Interpretation 60). A receipt stored before that member existed is
+     * returned as it was, without it, and the phone refuses it.
      * @param array<string,mixed> $row
      * @return array<string,mixed>
      */
@@ -339,9 +342,14 @@ final class Pairing
             ]);
             $sealed = self::sealAndWipe($token, $phone['x']); // the plaintext token has done its one job: it is in the box, and nowhere else
             unset($token);
+            // The receipt the phone reads carries the grants it was signed over, sorted, exactly the set the desktop signed (the signature
+            // covers them, so a relay that lies about them fails the phone's verification): the desktop signs the grants and the phone
+            // never sees the decision, so without them it cannot verify the receipt it is given.
+            $signedGrants = $phone['grants'];
+            sort($signedGrants, SORT_STRING);
             $db->exec(
                 "UPDATE pairings SET state = 'approved', phone_dev = ?, sealed_token = ?, receipt = ?, response = NULL WHERE pid = ? AND state = 'answered'",
-                [$id, B64::enc($sealed), Json::encode(['issuedAt' => $phone['issuedAt'], 'signature' => $phone['signature']]), $pid]
+                [$id, B64::enc($sealed), Json::encode(['issuedAt' => $phone['issuedAt'], 'signature' => $phone['signature'], 'grants' => array_values($signedGrants)]), $pid]
             );
             $revokeAfter = $same;
             return ['state' => 'approved', 'deviceId' => $id];

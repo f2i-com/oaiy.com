@@ -34,17 +34,28 @@
     },
     "receipt": {
       "type": "object",
+      "description": "The desktop's approval receipt (README section 4.10.2), with the grants it was signed over: the desktop signs the grants and the phone never sees the decision, so the relay returns the sorted set, exactly the one the signature covers. The phone verifies the signature over exactly these grants (a relay that changes them fails the verification) and refuses a name it does not know.",
       "properties": {
         "issuedAt": {
           "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
         },
         "signature": {
           "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/signature"
+        },
+        "grants": {
+          "type": "array",
+          "description": "The grants of the approval, sorted (code-point order of the names), without repeats: the set in the canonical receipt document the signature covers.",
+          "items": {
+            "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/grant"
+          },
+          "maxItems": 16,
+          "uniqueItems": true
         }
       },
       "required": [
         "issuedAt",
-        "signature"
+        "signature",
+        "grants"
       ],
       "additionalProperties": true
     },
