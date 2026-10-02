@@ -1105,22 +1105,26 @@ mod tests {
         let mut f = fixture().await;
         let ready = Arc::new(AtomicBool::new(false));
         let chosen = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
         let oversized = Arc::new(AtomicBool::new(false));
+        let discovery = Arc::new(Mutex::new(json!({"defaults":{"llm":"selected"},"models":{"llm":[{"id":"selected","files_present":true}]}})));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let gateway = format!("{base}/gw");
         let state_ready = ready.clone();
         let state_chosen = chosen.clone();
+        let state_paused = paused.clone();
         let discovery_oversized = oversized.clone();
+        let document = discovery.clone();
         let asked = f.asked.clone();
         let engine = Router::new()
-            .route("/api/state",get(move || { let ready=state_ready.clone(); let chosen=state_chosen.clone(); let gateway=gateway.clone(); async move {
+            .route("/api/state",get(move || { let ready=state_ready.clone(); let chosen=state_chosen.clone(); let paused=state_paused.clone(); let gateway=gateway.clone(); async move {
                 Json(json!({"gateway_url":gateway,"llm":{"state":if ready.load(Ordering::SeqCst) {"ready"} else {"stopped"},
-                    "resident":if chosen.load(Ordering::SeqCst) {"selected"} else {"other"}}}))
+                    "resident":if chosen.load(Ordering::SeqCst) {"selected"} else {"other"},"paused_for_media":paused.load(Ordering::SeqCst)}}))
             }}))
-            .route("/gw/v1/discovery",get(move || { let oversized=discovery_oversized.clone(); async move {
+            .route("/gw/v1/discovery",get(move || { let oversized=discovery_oversized.clone(); let document=document.clone(); async move {
                 Json(if oversized.load(Ordering::SeqCst) {json!({"defaults":{"llm":"selected"},"padding":"x".repeat(64*1024)})}
-                    else {json!({"defaults":{"llm":"selected"}})})
+                    else {document.lock().unwrap().clone()})
             }}))
             .route("/gw/v1/chat/completions",post(move |Json(body):Json<Value>| { let asked=asked.clone(); async move {
                 asked.lock().unwrap().push(body); Json(json!({"choices":[{"message":{"role":"assistant","content":"resident answer"},"finish_reason":"stop"}]}))
@@ -1162,13 +1166,56 @@ mod tests {
         assert_eq!(value["text"], "resident answer");
         assert_eq!(value["model"], "selected");
         assert_eq!(f.asked.lock().unwrap()[0]["model"], "selected");
+        // A direct completion cannot bypass the catalogue's refusal, even if
+        // no catalogue read preceded it and the same model remains resident.
+        for (index, files) in [json!(false), Value::Null, json!("true"), json!(1), json!({}), json!([])].into_iter().enumerate() {
+            discovery.lock().unwrap()["models"]["llm"][0]["files_present"] = files;
+            let mut request = input(&format!("invalid-files-{index}"), "hello");
+            request["sourceId"] = json!(format!("provider:{ENGINE_PROVIDER_ID}"));
+            let (status, value) = ask(f.app.clone(), "POST", "/api/plugins/probe/ai/complete", request).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(value["error"]["code"], "engine_unavailable");
+            assert_eq!(f.asked.lock().unwrap().len(), 1, "invalid files flags cannot start inference");
+        }
+        *discovery.lock().unwrap() = json!({"defaults":{"llm":"selected"},"models":{"llm":[{"id":"selected","files_present":true}]}});
+        paused.store(true, Ordering::SeqCst);
+        let mut request = input("paused-modern", "hello");
+        request["sourceId"] = json!(format!("provider:{ENGINE_PROVIDER_ID}"));
+        assert_eq!(ask(f.app.clone(), "POST", "/api/plugins/probe/ai/complete", request).await.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(f.asked.lock().unwrap().len(), 1, "paused media work cannot start inference");
+        paused.store(false, Ordering::SeqCst);
+        for (index, legacy) in [
+            json!({"defaults":{"llm":"selected"},"models":{"llm":[{"id":"selected","loaded":false}]}}),
+            json!({"defaults":{"llm":"selected"},"models":{"llm":[{"id":"selected"}]}}),
+            json!({"defaults":{"llm":"selected"},"models":{"llm":[{"id":"other","loaded":true}]}}),
+        ].into_iter().enumerate() {
+            *discovery.lock().unwrap() = legacy;
+            let mut request = input(&format!("unconfirmed-legacy-{index}"), "hello");
+            request["sourceId"] = json!(format!("provider:{ENGINE_PROVIDER_ID}"));
+            assert_eq!(ask(f.app.clone(), "POST", "/api/plugins/probe/ai/complete", request).await.0, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(f.asked.lock().unwrap().len(), 1, "unconfirmed legacy metadata cannot start inference");
+        }
+        *discovery.lock().unwrap() = json!({"defaults":{"llm":"selected"},"models":{"llm":[{"id":"selected","loaded":true}]}});
+        let (_, catalogue) = ask(f.app.clone(), "GET", "/api/plugins/probe/ai/sources", Value::Null).await;
+        let source = catalogue["sources"].as_array().unwrap().iter().find(|source| source["providerId"] == ENGINE_PROVIDER_ID).unwrap();
+        assert_eq!(source["completionAvailable"], true);
+        assert_eq!(source["model"], "selected");
+        assert_eq!(f.asked.lock().unwrap().len(), 1, "legacy catalogue reads cannot start inference");
+        let mut request = input("resident-legacy", "hello");
+        request["sourceId"] = json!(format!("provider:{ENGINE_PROVIDER_ID}"));
+        let (status, value) = ask(f.app.clone(), "POST", "/api/plugins/probe/ai/complete", request).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["text"], "resident answer");
+        assert_eq!(value["model"], "selected");
+        assert_eq!(f.asked.lock().unwrap().len(), 2);
+        assert_eq!(f.asked.lock().unwrap()[1]["model"], "selected");
         oversized.store(true, Ordering::SeqCst);
         let mut request = input("oversized-discovery", "hello");
         request["sourceId"] = json!(format!("provider:{ENGINE_PROVIDER_ID}"));
         let (status, value) = ask(f.app.clone(), "POST", "/api/plugins/probe/ai/complete", request).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(value["error"]["code"], "engine_unavailable");
-        assert_eq!(f.asked.lock().unwrap().len(), 1, "oversized discovery must not start an inference request");
+        assert_eq!(f.asked.lock().unwrap().len(), 2, "oversized discovery must not start an inference request");
         server.abort();
     }
 
