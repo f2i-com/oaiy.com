@@ -130,6 +130,10 @@ pub struct LinkError {
     pub file: String,
     /// What is wrong with it and what has been done about it. Never holds what is in the file.
     pub message: String,
+    /// The file could not be read at all, which is what another program holding it open looks like: it is read
+    /// again later (see [`reread`]), and a file that was read and was not a link is not.
+    #[serde(skip)]
+    pub(crate) busy: bool,
 }
 
 /// The one file of the provider link, under the data folder.
@@ -138,21 +142,90 @@ const ACCOUNT_FILE: &str = "link/account.json";
 /// Read a JSON file of the link's (the provider's `account.json`, or one of the relay's sibling files,
 /// [`crate::relay::link_store`]). No file is `Ok(None)`. One that is there and cannot be used is an
 /// error and is left exactly as it is: it may be perfectly good (another program has it open) or the
-/// only copy of a link that a newer build wrote.
+/// only copy of a link that a newer build wrote. A file that cannot be read is tried again a few times in the
+/// first second (the pauses of [`crate::secret_file::Patience`]), and after that by [`reread`].
 pub(crate) fn read_stored<T: serde::de::DeserializeOwned>(path: &std::path::Path, shown_as: &str) -> Result<Option<T>, LinkError> {
-    use crate::secret_file::{read_text_patiently, Patience, Text};
-    let unusable = |why: String| {
-        let error = LinkError { file: shown_as.to_string(), message: format!("{shown_as} {why}. It has not been changed.") };
+    read_stored_after(path, shown_as, &crate::secret_file::Patience::default().start, true)
+}
+
+/// [`read_stored`], waiting for a file that cannot be read as `pauses` say, and saying so in the log when `log` is set.
+fn read_stored_after<T: serde::de::DeserializeOwned>(path: &std::path::Path, shown_as: &str, pauses: &[std::time::Duration], log: bool) -> Result<Option<T>, LinkError> {
+    use crate::secret_file::{read_text_patiently, Text};
+    let unusable = |why: String, busy: bool| {
+        let error = LinkError { file: shown_as.to_string(), message: format!("{shown_as} {why}. It has not been changed."), busy };
         // The log says what the status says and no more, so what a test finds in one is all there is in the other.
-        log::warn!("link: {}", error.message);
+        if log {
+            log::warn!("link: {}", error.message);
+        }
         error
     };
-    match read_text_patiently(path, &Patience::default().start) {
+    match read_text_patiently(path, pauses) {
         Text::Missing => Ok(None),
-        Text::Text(text) => serde_json::from_str(&text).map(Some).map_err(|e| unusable(format!("is not a link this version of OAIY understands ({})", describe(&e)))),
-        Text::Undecodable(why) => Err(unusable(format!("is not text ({why})"))),
-        Text::Unreadable(e) => Err(unusable(format!("could not be read ({e}): another program may have it open"))),
+        Text::Text(text) => serde_json::from_str(&text).map(Some).map_err(|e| unusable(format!("is not a link this version of OAIY understands ({})", describe(&e)), false)),
+        Text::Undecodable(why) => Err(unusable(format!("is not text ({why})"), false)),
+        Text::Unreadable(e) => Err(unusable(format!("could not be read ({e}): another program may have it open and it is read again"), true)),
     }
+}
+
+/// What reading a file again found.
+pub(crate) enum Reread<T> {
+    /// It is not time, or it is still held: nothing is different.
+    Still,
+    /// It was read: the file's content, or nothing if there is no file now.
+    Read(Option<T>),
+    /// It is there and cannot be used for another reason than being held.
+    Unusable(LinkError),
+}
+
+/// Read a file of the link again that could not be read the first time, because another program (a scanner, an
+/// indexer, a backup) had it: at the times `retry` says, and at once when `force` is set (a write is about to
+/// decide what to do with it). A session used to stay without its link for as long as it ran after three tries in
+/// the first moments. It never waits, and it never moves, writes or removes the file: whatever it finds is only read.
+pub(crate) fn reread<T: serde::de::DeserializeOwned>(path: &std::path::Path, shown_as: &str, retry: &mut Option<crate::secret_file::Retry>, force: bool) -> Reread<T> {
+    if !force && !retry.as_ref().is_some_and(|r| r.due()) {
+        return Reread::Still;
+    }
+    match read_stored_after(path, shown_as, &[], false) {
+        Ok(read) => {
+            if retry.take().is_some() {
+                log::info!("link: {shown_as} could be read again");
+            }
+            Reread::Read(read)
+        }
+        Err(e) if e.busy => {
+            match retry {
+                Some(r) => r.failed(),
+                None => *retry = Some(crate::secret_file::Retry::began(&crate::secret_file::Patience::default())),
+            }
+            Reread::Still
+        }
+        Err(e) => {
+            log::warn!("link: {}", e.message);
+            *retry = None;
+            Reread::Unusable(e)
+        }
+    }
+}
+
+/// Remove what was put aside from `path` (`<name>.corrupt`, `<name>.corrupt.1`, ...): a link that is forgotten
+/// takes with it the copies of itself that were kept when it could not be read, which can hold the key it had.
+pub(crate) fn purge_asides(path: &std::path::Path) -> Result<(), String> {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().map(|n| n.to_string_lossy().into_owned())) else {
+        return Ok(());
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else { return Ok(()) };
+    let stem = format!("{name}.corrupt");
+    let mut failed = Vec::new();
+    for entry in entries.flatten() {
+        let found = entry.file_name().to_string_lossy().into_owned();
+        let numbered = found.strip_prefix(&format!("{stem}.")).is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+        if (found == stem || numbered) && entry.path().is_file() {
+            if let Err(e) = std::fs::remove_file(entry.path()) {
+                failed.push(format!("{found} ({e})"));
+            }
+        }
+    }
+    if failed.is_empty() { Ok(()) } else { Err(failed.join(", ")) }
 }
 
 /// Why a file failed to parse, without a word of what is in it: serde quotes the value in `invalid type:
@@ -313,6 +386,8 @@ struct Inner {
     account: Option<LinkedAccount>,
     /// Why `account.json` was not read, or why the link could not be forgotten (see [`LinkError`]).
     error: Option<LinkError>,
+    /// When `account.json` is read again, if the first reads found another program holding it (see [`reread`]).
+    retry: Option<crate::secret_file::Retry>,
     attempt: LinkPhase,
     /// Set while a ceremony is running, so a second Link click cannot open a
     /// second browser tab racing the first for the same one-use code.
@@ -372,12 +447,15 @@ fn load_store(data_dir: PathBuf) -> LinkHandle {
         Ok(account) => (account, None),
         Err(e) => (None, Some(e)),
     };
+    // A file another program holds is read again later, by whoever asks next (`reread`).
+    let retry = error.as_ref().filter(|e| e.busy).map(|_| crate::secret_file::Retry::began(&crate::secret_file::Patience::default()));
     let store = Arc::new(LinkStore {
         path,
         data_dir,
         inner: Mutex::new(Inner {
             account,
             error,
+            retry,
             attempt: LinkPhase::Idle,
             in_flight: false,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -417,6 +495,7 @@ pub(crate) fn store_for_tests(data_dir: PathBuf, account: Option<LinkedAccount>)
         inner: Mutex::new(Inner {
             account,
             error: None,
+            retry: None,
             attempt: LinkPhase::Idle,
             in_flight: false,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -436,6 +515,7 @@ pub(crate) fn store_for_tests(data_dir: PathBuf, account: Option<LinkedAccount>)
 
 impl LinkStore {
     pub fn status(&self) -> LinkStatus {
+        self.reread(false);
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let descriptors = descriptor::load_all(&self.data_dir);
         let available = descriptors
@@ -629,8 +709,45 @@ impl LinkStore {
         inner.heartbeat_error = error;
     }
 
+    /// Read `account.json` again if it could not be read when the store opened, because another program
+    /// had it: when it is time, or at once when `force` is set. A scanner's hold in the first moments used to leave
+    /// the desktop without its link for as long as it ran. A file that reads as a link is the link from then on;
+    /// one that cannot be used is reported; one that is still held waits for the next time. It only ever reads:
+    /// a link that is perfectly good is not moved aside, written over or removed by it.
+    fn reread(&self, force: bool) {
+        let mut retry = {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if inner.account.is_some() || inner.error.is_none() {
+                return;
+            }
+            inner.retry.take()
+        };
+        // Without the lock: the file is read, and the lanes that ask for the account meanwhile are not kept waiting.
+        let read = reread::<LinkedAccount>(&self.path, ACCOUNT_FILE, &mut retry, force);
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.account.is_some() {
+            return;
+        }
+        match read {
+            Reread::Still => inner.retry = retry,
+            Reread::Read(account) => {
+                inner.error = None;
+                inner.retry = None;
+                if let Some(account) = account {
+                    set_linked_origin(Some(account.base_url.as_str()));
+                    inner.account = Some(account);
+                }
+            }
+            Reread::Unusable(e) => {
+                inner.error = Some(e);
+                inner.retry = None;
+            }
+        }
+    }
+
     /// The stored credential, for whoever needs to call the provider.
     pub fn account(&self) -> Option<LinkedAccount> {
+        self.reread(false);
         self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -652,6 +769,9 @@ impl LinkStore {
     /// `account.json.corrupt` first, and a failure to do that stops the write. Nothing to do
     /// when the file was fine.
     fn make_way(&self) -> Result<(), String> {
+        // It may have become readable since (another program let go of it): then it is a link, and no file is
+        // put aside for a write that replaces it.
+        self.reread(true);
         let unusable = {
             let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.account.is_none() && inner.error.is_some()
@@ -664,20 +784,21 @@ impl LinkStore {
         Ok(())
     }
 
-    /// Take the stored link away: `Err` says why it is still there. A file that could not be
-    /// used is put aside rather than deleted (what is in it may be a link a newer build can read);
-    /// a link that is not there to remove is forgotten all the same.
-    fn forget_stored(&self) -> Result<(), String> {
+    /// Take the stored link away: `Err` says why it is still there, and `Ok(true)` that the file could not be
+    /// used and was put aside rather than deleted (what is in it may be a link a newer build can read). A link
+    /// that is not there to remove is forgotten all the same.
+    fn forget_stored(&self) -> Result<bool, String> {
+        self.reread(true);
         let unusable = {
             let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.account.is_none() && inner.error.is_some()
         };
         if unusable {
-            return self.make_way();
+            return self.make_way().map(|()| true);
         }
         match std::fs::remove_file(&self.path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(()) => Ok(false),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => {
                 log::warn!("link: {ACCOUNT_FILE} could not be removed: {e}");
                 Err(format!("the link could not be forgotten: {ACCOUNT_FILE} could not be removed ({e}). It is still linked here, and would be again at the next start. Close whatever has it open and try again."))
@@ -691,14 +812,25 @@ impl LinkStore {
     /// ([`LinkStatus::link_error`]): going on as if it had been forgotten would leave the key on
     /// disk to link the desktop again at the next start, and the one who asked would never know.
     pub fn unlink(&self) -> LinkStatus {
-        if let Err(message) = self.forget_stored() {
-            self.inner.lock().unwrap_or_else(|e| e.into_inner()).error = Some(LinkError { file: ACCOUNT_FILE.to_string(), message });
-            return self.status();
-        }
+        let put_aside = match self.forget_stored() {
+            Ok(put_aside) => put_aside,
+            Err(message) => {
+                self.inner.lock().unwrap_or_else(|e| e.into_inner()).error = Some(LinkError { file: ACCOUNT_FILE.to_string(), message, busy: false });
+                return self.status();
+            }
+        };
+        // The copies kept when the link could not be read can hold the key it had: forgetting the link takes them
+        // too. Not when this very call put an unreadable file aside, which is the one thing kept.
+        let left_behind = if put_aside { Ok(()) } else { purge_asides(&self.path) };
         {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.account = None;
-            inner.error = None;
+            inner.error = left_behind.err().map(|left| LinkError {
+                file: ACCOUNT_FILE.to_string(),
+                message: format!("the link was forgotten, but {left} could not be removed: a copy that was kept of it can hold the key it had"),
+                busy: false,
+            });
+            inner.retry = None;
             inner.attempt = LinkPhase::Idle;
             inner.last_heartbeat_at = None;
             inner.heartbeat_error = None;
@@ -1180,6 +1312,7 @@ mod tests {
                 name: "Reception PC".into(),
                 enrolled_at: chrono::Utc::now(),
                 calibration: None,
+                other: Default::default(),
             })
             .unwrap();
         relay.set_routes(crate::relay::link_store::Routes { commands: crate::relay::link_store::Route::Relay, ..Default::default() }).unwrap();
@@ -1330,6 +1463,86 @@ mod tests {
         // The file went away since it was found unusable: nothing to keep, and the write goes on.
         let dir = data_dir("aside-gone");
         put_aside(&dir.join("link").join("account.json"), "link/account.json").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Say when the account file is read again: at once.
+    fn read_again_now(store: &LinkStore) {
+        store.inner.lock().unwrap().retry = Some(crate::secret_file::Retry::began(&crate::secret_file::Patience {
+            start: vec![],
+            later: vec![std::time::Duration::ZERO],
+            window: std::time::Duration::ZERO,
+        }));
+    }
+
+    #[test]
+    fn a_file_another_program_held_at_start_is_read_again_and_the_link_comes_back() {
+        // Three tries in the first moments and never again left the session without its link for as long as it ran.
+        // A folder where the file belongs cannot be read, as a file a scanner holds cannot.
+        let dir = data_dir("held-then-let-go");
+        let file = dir.join("link").join("account.json");
+        std::fs::create_dir(&file).unwrap();
+        let store = load_store(dir.clone());
+        assert!(store.account().is_none() && store.status().link_error.is_some(), "held: no link, and why");
+        assert!(file.is_dir(), "and nothing is done to it");
+
+        std::fs::remove_dir(&file).unwrap();
+        std::fs::write(&file, serde_json::to_string(&account()).unwrap()).unwrap();
+        assert!(store.account().is_none(), "it is not time to read it again");
+        read_again_now(&store);
+        let status = store.status();
+        assert!(status.linked && status.link_error.is_none(), "{status:?}");
+        assert_eq!(store.account().unwrap().credential, "flk_supersecret");
+        assert!(!dir.join("link").join("account.json.corrupt").exists(), "a good file was read, not moved aside");
+        assert!(store.inner.lock().unwrap().retry.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_new_link_does_not_put_aside_a_file_that_can_be_read_by_then_and_a_forgotten_one_goes() {
+        let dir = data_dir("held-then-linked");
+        let file = dir.join("link").join("account.json");
+        std::fs::create_dir(&file).unwrap();
+        let store = load_store(dir.clone());
+        assert!(store.status().link_error.is_some());
+
+        // Let go of, and not yet read again: a link made now replaces the file; it is not a bad file to keep.
+        std::fs::remove_dir(&file).unwrap();
+        std::fs::write(&file, serde_json::to_string(&account()).unwrap()).unwrap();
+        let mut renewed = account();
+        renewed.credential = "flk_renewed".into();
+        store.persist(&renewed).unwrap();
+        assert!(!dir.join("link").join("account.json.corrupt").exists(), "nothing readable was put aside");
+        assert_eq!(load_store(dir.clone()).account().unwrap().credential, "flk_renewed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forgetting_a_link_takes_the_copies_kept_of_earlier_files_and_no_other_file() {
+        // The dialog says the key is forgotten, and a copy kept of a file that could not be read can hold the one it had.
+        let dir = data_dir("forget-copies");
+        let link = dir.join("link");
+        let store = load_store(dir.clone());
+        store.persist(&account()).unwrap();
+        store.inner.lock().unwrap().account = Some(account());
+        for kept in ["account.json.corrupt", "account.json.corrupt.1", "account.json.corrupt.30", "account.json.corrupt.x", "account.json.bak-baseurl", "app-logic-storage.json"] {
+            std::fs::write(link.join(kept), r#"{"credential":"flk_THE_PREVIOUS_KEY"}"#).unwrap();
+        }
+        let after = store.unlink();
+        assert!(!after.linked && after.link_error.is_none(), "{after:?}");
+        let mut left: Vec<String> = std::fs::read_dir(&link).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, ["account.json.bak-baseurl", "account.json.corrupt.x", "app-logic-storage.json"]);
+
+        // A folder named like a copy is not a file of ours and is left alone; the copies that are files go.
+        let stuck = link.join("account.json.corrupt.2");
+        std::fs::create_dir_all(stuck.join("held")).unwrap();
+        std::fs::write(link.join("account.json.corrupt.3"), "x").unwrap();
+        store.persist(&account()).unwrap();
+        store.inner.lock().unwrap().account = Some(account());
+        let after = store.unlink();
+        assert!(!after.linked && after.link_error.is_none(), "{after:?}");
+        assert!(stuck.is_dir() && !link.join("account.json.corrupt.3").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

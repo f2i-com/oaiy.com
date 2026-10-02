@@ -2026,6 +2026,7 @@ mod tests {
                 name: "Reception PC".into(),
                 enrolled_at: chrono::Utc::now(),
                 calibration: None,
+                other: Default::default(),
             })
             .unwrap();
         for origin in ["https://relay.example.com", "https://relay.example.com:443", "https://relay.example.com:8443", "http://relay.example.com", "http://relay.local"] {
