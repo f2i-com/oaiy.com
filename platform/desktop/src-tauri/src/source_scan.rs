@@ -250,7 +250,7 @@ impl<'a> Sig<'a> {
                 if self.is_punct(w, '(') {
                     w = self.closing(w) + 1;
                 }
-            } else if ["unsafe", "async", "default"].iter().any(|m| self.is_word(w, m)) {
+            } else if ["unsafe", "async", "default", "move"].iter().any(|m| self.is_word(w, m)) {
                 w += 1;
             } else if self.is_word(w, "extern") && self.tok_is_str(w + 1) {
                 w += 2;
@@ -270,8 +270,19 @@ impl<'a> Sig<'a> {
 
     /// The index of the last token of the item, statement, field or arm that starts at `k` (after its
     /// attributes), or `k - 1` when there is nothing there (an attribute at the end of a scope).
+    ///
+    /// What ends it depends on what it is. An item with a body (`fn`, `impl`, `mod`...), a block, and a statement
+    /// that is a braced construct (`if`, `match`, `loop`, `while`, `for`, with a label or not) end at the `}` that
+    /// closes their body (an `if` at the end of its last `else`), with no `;` after it. A macro invoked with braces
+    /// (`thread_local! { .. }`) ends at its `}` too. A match arm whose body is a block ends there. Everything else
+    /// (`let`, `const`, a call, a field, a variant) ends at its `;` or `,`, outside any brackets.
     fn item_end(&self, k: usize) -> usize {
         let w = self.past_modifiers(k);
+        let label = w + 2 <= self.len() && self.tok(w).kind == Kind::Lifetime && self.is_punct(w + 1, ':');
+        let at = if label { w + 2 } else { w };
+        if ["if", "match", "loop", "while", "for"].iter().any(|m| self.is_word(at, m)) {
+            return self.brace_statement_end(at);
+        }
         let block = self.is_punct(w, '{');
         let body_item = ["mod", "fn", "impl", "struct", "enum", "trait", "union", "macro_rules", "extern"].iter().any(|m| self.is_word(w, m));
         // `let`, `const`, `static`, `type` and `use` end at their `;` alone: a `,` in `HashMap<A, B>` or in `use a::{b, c}` is not their end.
@@ -282,6 +293,16 @@ impl<'a> Sig<'a> {
         while j < self.len() {
             match self.punct(j) {
                 Some('{') if depth == 0 && (block || body_item) => return self.closing(j),
+                // A macro invoked with braces is an item or a statement of its own: it ends at its `}`, with a `;` after it or not.
+                Some('{') if depth == 0 && !semicolon_only && j > k && self.is_punct(j - 1, '!') => {
+                    let close = self.closing(j);
+                    return if self.is_punct(close + 1, ';') { close + 1 } else { close };
+                }
+                // A match arm whose body is a block ends at the block (and the comma after it, if there is one).
+                Some('=') if depth == 0 && !semicolon_only && self.is_punct(j + 1, '>') && self.is_punct(j + 2, '{') => {
+                    let close = self.closing(j + 2);
+                    return if self.is_punct(close + 1, ',') { close + 1 } else { close };
+                }
                 Some('(' | '[' | '{') => depth += 1,
                 Some(')' | ']' | '}') => {
                     if depth == 0 {
@@ -298,6 +319,53 @@ impl<'a> Sig<'a> {
         self.len() - 1
     }
 
+    /// The last token of a statement that is a braced construct, which starts with the keyword at `at`: the `}` that closes
+    /// its body, or the last of the `else` blocks of an `if`. A `{` in the header of an `if let`, a `while let` or a `for` is
+    /// a struct pattern (`if let Foo { x } = y {`), not the body; one inside brackets is part of the expression.
+    fn brace_statement_end(&self, at: usize) -> usize {
+        let mut keyword = self.word(at).unwrap_or_default();
+        let mut j = at + 1;
+        loop {
+            let mut depth = 0i32;
+            let mut pattern = keyword == "for" || (matches!(keyword.as_str(), "if" | "while") && self.is_word(j, "let"));
+            let body = loop {
+                if j >= self.len() {
+                    return self.len() - 1;
+                }
+                match self.punct(j) {
+                    Some('(' | '[') => depth += 1,
+                    Some('{') if depth > 0 => depth += 1,
+                    Some('{') if pattern => {
+                        j = self.closing(j);
+                    }
+                    Some('{') => break j,
+                    Some(')' | ']' | '}') => {
+                        if depth == 0 {
+                            return j.wrapping_sub(1);
+                        }
+                        depth -= 1;
+                    }
+                    Some(';') if depth == 0 => return j,
+                    Some('=') if depth == 0 && pattern && keyword != "for" && !self.is_punct(j + 1, '=') && !self.is_punct(j + 1, '>') && !self.is_punct(j.wrapping_sub(1), '=') => pattern = false,
+                    _ if depth == 0 && pattern && keyword == "for" && self.is_word(j, "in") => pattern = false,
+                    _ => {}
+                }
+                j += 1;
+            };
+            let close = self.closing(body);
+            if keyword == "if" && self.is_word(close + 1, "else") {
+                j = close + 2;
+                keyword = if self.is_word(j, "if") {
+                    j += 1;
+                    "if".to_string()
+                } else {
+                    "else".to_string()
+                };
+                continue;
+            }
+            return close;
+        }
+    }
     fn tok_is_str(&self, k: usize) -> bool {
         k < self.len() && self.tok(k).kind == Kind::Str
     }
@@ -546,6 +614,94 @@ mod tests {
         assert_eq!(code.lines().count(), source.lines().count());
     }
 
+    /// What the reviewer of this scanner tried against it, one case to a line: (what it is, a source, what of it is code that must
+    /// stay in the result, what of it is test code that must be gone). Each case that the first version got wrong is here: a braced
+    /// macro item, and a braced statement (`if`, `match`, loop) or a block arm under `#[cfg(test)]`, which ran on to the next `;`
+    /// and hid the production code after it.
+    #[test]
+    fn the_cases_that_tried_to_hide_production_code_from_the_scan_or_leave_test_code_in_it() {
+        let cases: Vec<(&str, &str, Vec<&str>, Vec<&str>)> = vec![
+        ("braced item macro, no semicolon", "#[cfg(test)]\nthread_local! { static X: u8 = 1; }\nfn real() { \"hidden.json\"; }\nconst C: u8 = 1;\n", vec!["fn real()", "hidden.json", "const C"], vec!["thread_local"]),
+        ("lazy_static style braced macro", "#[cfg(test)]\nlazy_static! { static ref X: u8 = 1; }\nfn real() { \"hidden.json\"; }\nstatic S: u8 = 2;\n", vec!["fn real()", "hidden.json"], vec!["lazy_static"]),
+        ("cfg(test) if statement then production statement", "fn f() {\n    #[cfg(test)]\n    if probe() { return; }\n    real_call(\"x.json\");\n    other();\n}\n", vec!["real_call", "other()"], vec!["probe"]),
+        ("cfg(test) if then tail expression", "fn f() -> u8 {\n    #[cfg(test)]\n    if probe() { return 1; }\n    tail_expr()\n}\n", vec!["tail_expr()"], vec!["probe"]),
+        ("cfg(test) if let then tail", "fn f() -> bool {\n    #[cfg(test)]\n    if let Some(on) = gate() { return on; }\n    snapshot().on()\n}\n", vec!["snapshot().on()"], vec!["gate()"]),
+        ("cfg(test) match statement", "fn f() {\n    #[cfg(test)]\n    match x { _ => {} }\n    real_call();\n}\n", vec!["real_call()"], vec!["match x"]),
+        ("cfg(test) loop / while / for", "fn f() {\n    #[cfg(test)]\n    loop { break; }\n    a_real();\n    #[cfg(test)]\n    for i in 0..3 { t(i); }\n    b_real();\n    #[cfg(test)]\n    while c() { }\n    c_real();\n}\n", vec!["a_real()", "b_real()", "c_real()"], vec!["loop", "for i", "while c"]),
+        ("cfg(test) unsafe block then code", "fn f() {\n    #[cfg(test)]\n    unsafe { t(); }\n    real();\n}\n", vec!["real()"], vec!["unsafe"]),
+        ("block arm without a comma", "fn f(v: u8) {\n    match v {\n        #[cfg(test)]\n        1 => { t() }\n        2 => { real_arm() }\n        _ => {}\n    }\n}\n", vec!["real_arm()"], vec!["t()"]),
+        ("arm with a comma", "fn f(v: u8) {\n    match v {\n        #[cfg(test)]\n        1 => t(),\n        2 => real_arm(),\n        _ => {}\n    }\n}\n", vec!["real_arm()"], vec!["t()"]),
+        ("cfg_attr(test) is not a test item", "#[cfg_attr(test, derive(Debug))]\nstruct S { a: u8 }\nfn after() {}\n", vec!["struct S", "fn after()"], vec![]),
+        ("cfg(not(test)) kept", "#[cfg(not(test))]\nfn real() { \"x.json\"; }\n", vec!["fn real()", "x.json"], vec![]),
+        ("cfg(all(test, x)) kept", "#[cfg(all(test, windows))]\nfn w() { \"w.json\"; }\n", vec!["w.json"], vec![]),
+        ("cfg(any(test, x)) kept", "#[cfg(any(test, windows))]\nfn w() { \"w.json\"; }\n", vec!["w.json"], vec![]),
+        ("cfg(test) with spaces and a comment inside", "#[ cfg ( /* c */ test ) ]\nfn gone() {}\nfn kept() {}\n", vec!["fn kept()"], vec!["fn gone"]),
+        ("attribute in a doc comment", "/// #[cfg(test)]\nfn kept() {}\n/** #[cfg(test)] */\nfn kept2() {}\n", vec!["fn kept()", "fn kept2()"], vec![]),
+        ("attribute in a string", "fn kept() { let s = \"#[cfg(test)] fn x() {}\"; }\nfn also() {}\n", vec!["fn also()"], vec![]),
+        ("attribute in a raw string with hashes", "fn kept() { let s = r##\"#[cfg(test)]\nfn x() {\"##; }\nfn also() {}\n", vec!["fn also()"], vec![]),
+        ("raw string with hashes in a test mod", "#[cfg(test)]\nmod t { fn f() { let a = r##\"} \"# }\"##; let b = br#\"}\"#; let c = b\"}\"; let d = c\"}\"; } }\nfn after() {}\n", vec!["fn after()"], vec!["mod t"]),
+        ("char literals with brace and quote", "#[cfg(test)]\nmod t { fn f() { let a = '}'; let b = '\"'; let c = '\\''; let d = '\\u{7d}'; let e = b'}'; } }\nfn after() {}\n", vec!["fn after()"], vec!["mod t"]),
+        ("lifetimes and labels in a test mod", "#[cfg(test)]\nmod t { fn f<'a>(x: &'a str) { 'outer: loop { break 'outer; } let c = 'a'; } }\nfn after() {}\n", vec!["fn after()"], vec!["mod t"]),
+        ("lifetime in production before a char", "fn f<'a>(x: &'a str) -> char { 'z' }\n#[cfg(test)]\nfn t() {}\nfn after() {}\n", vec!["fn f<'a>", "fn after()"], vec!["fn t"]),
+        ("nested block comment with brace", "#[cfg(test)]\nmod t { /* } /* } */ } */ fn f() {} }\nfn after() {}\n", vec!["fn after()"], vec!["mod t"]),
+        ("line comment with brace and apostrophe", "#[cfg(test)]\nmod t { // don't } me\n fn f() {} }\nfn after() {}\n", vec!["fn after()"], vec!["mod t"]),
+        ("stacked attributes", "#[cfg(test)]\n#[allow(dead_code)]\n#[derive(Debug)]\nstruct S;\nfn after() {}\n", vec!["fn after()"], vec!["struct S"]),
+        ("cfg(test) then other attributes then item with generics and where", "#[cfg(test)]\nimpl<T: Clone> Foo<T> for Bar where T: Send, { fn f(&self) {} }\nfn after() {}\n", vec!["fn after()"], vec!["impl<T"]),
+        ("cfg(test) const with array", "#[cfg(test)]\nconst A: [(&str, u8); 2] = [(\"a\", 1), (\"b\", 2)];\nfn after() {}\n", vec!["fn after()"], vec!["const A"]),
+        ("cfg(test) macro_rules", "#[cfg(test)]\nmacro_rules! m { () => { 1 } }\nfn after() {}\n", vec!["fn after()"], vec!["macro_rules"]),
+        ("cfg(test) paren macro item", "#[cfg(test)]\nfoo!(a, b);\nfn after() {}\n", vec!["fn after()"], vec!["foo!"]),
+        ("cfg(test) extern crate / use group", "#[cfg(test)]\nextern crate foo;\n#[cfg(test)]\nuse a::{b, c};\nfn after() {}\n", vec!["fn after()"], vec!["extern", "use a"]),
+        ("cfg(test) struct field with a generic comma", "struct S {\n    #[cfg(test)]\n    m: HashMap<String, u8>,\n    real: u8,\n}\n", vec!["real: u8"], vec!["HashMap"]),
+        ("cfg(test) enum variant with data", "enum E {\n    #[cfg(test)]\n    A { x: u8 },\n    B,\n}\n", vec!["B,"], vec!["A {"]),
+        ("cfg(test) trait method declaration", "trait T {\n    #[cfg(test)]\n    fn t(&self);\n    fn p(&self);\n}\n", vec!["fn p("], vec!["fn t("]),
+        ("cfg(test) fn with a return type that has braces in an array length", "#[cfg(test)]\nfn f() -> [u8; { 3 }] { [0; 3] }\nfn after() {}\n", vec!["fn after()"], vec!["fn f()"]),
+        ("cfg(test) fn with a const generic default in braces", "#[cfg(test)]\nfn f<const N: usize = { 3 }>() {}\nfn after() {}\n", vec!["fn after()"], vec![]),
+        ("inner attribute later in the file", "fn a() {}\nmod m {\n    #![cfg(test)]\n    fn t() {}\n}\nfn after() {}\n", vec!["fn after()"], vec![]),
+        ("a file that starts with an inner cfg(test)", "//! doc\n#![cfg(test)]\nfn t() { \"x.json\"; }\n", vec![], vec!["x.json"]),
+        ("cfg(test) in front of a closing brace", "fn f() {\n    real();\n    #[cfg(test)]\n}\nfn after() {}\n", vec!["real()", "fn after()"], vec![]),
+        ("cfg(test) on an expression statement with a try", "fn f() -> R {\n    #[cfg(test)]\n    inject()?;\n    real()?;\n    Ok(())\n}\n", vec!["real()?", "Ok(())"], vec!["inject"]),
+        ("cfg(test) on a let with a closure block", "fn f() {\n    #[cfg(test)]\n    let t = || { 1 };\n    real();\n}\n", vec!["real()"], vec!["let t"]),
+        ("cfg(test) on a statement macro with braces", "fn f() {\n    #[cfg(test)]\n    println! { \"x\" }\n    real();\n}\n", vec!["real()"], vec![]),
+        ("cfg(test) mod with a string containing a closing brace and quotes", "#[cfg(test)]\nmod t { fn f() { let s = \"\\\"}\"; } }\nfn after() {}\n", vec!["fn after()"], vec!["mod t"]),
+        ("crlf line endings", "fn a() {}\r\n#[cfg(test)]\r\nmod t {\r\n  fn f() {}\r\n}\r\nfn after() {}\r\n", vec!["fn after()"], vec!["mod t"]),
+        ("non-ascii identifiers and chars", "#[cfg(test)]\nmod t { fn f() { let é = 'é'; let e = '😀'; } }\nfn après() {}\n", vec!["fn après()"], vec!["mod t"]),
+        ("unterminated block comment at the end", "fn a() {}\n/* never closed\n#[cfg(test)]\nfn x() {}\n", vec!["fn a()"], vec![]),
+        ("unterminated string at the end", "fn a() {}\nconst S: &str = \"never closed;\n#[cfg(test)]\nfn x() {}\n", vec!["fn a()"], vec![]),
+        ("cfg(test) with nothing after it at end of file", "fn a() {}\n#[cfg(test)]\n", vec!["fn a()"], vec![]),
+        ("cfg(test) mod declared with a path attribute", "#[cfg(test)]\n#[path = \"x.rs\"]\nmod tests;\nfn after() {}\n", vec!["fn after()"], vec!["mod tests"]),
+        ("a doc comment after the cfg attribute", "#[cfg(test)]\n/// docs\nfn t() {}\nfn after() {}\n", vec!["fn after()"], vec!["fn t"]),
+        ("cfg(test) pub(in crate::x) fn", "#[cfg(test)]\npub(in crate::x) fn t() { }\nfn after() {}\n", vec!["fn after()"], vec!["fn t"]),
+        ("cfg(test) async fn / unsafe impl / extern fn", "#[cfg(test)]\nasync fn a() {}\n#[cfg(test)]\nunsafe impl Send for X {}\n#[cfg(test)]\nextern \"C\" fn c() {}\nfn after() {}\n", vec!["fn after()"], vec!["async", "unsafe impl", "extern"]),
+        ("cfg(test) extern block", "#[cfg(test)]\nextern \"C\" { fn x(); }\nfn after() {}\n", vec!["fn after()"], vec!["extern"]),
+        ("cfg(test) static mut with a block initialiser", "#[cfg(test)]\nstatic X: Mutex<u8> = Mutex::new({ 1 });\nfn after() {}\n", vec!["fn after()"], vec!["static X"]),
+        ("cfg(test) union / trait / type alias with where", "#[cfg(test)]\nunion U { a: u8 }\n#[cfg(test)]\ntrait Tr: Sized { fn t(); }\nfn after() {}\n", vec!["fn after()"], vec!["union", "trait"]),
+        ("cfg(test) impl in the middle of a generic production impl", "impl<T> Real<T> {\n    #[cfg(test)]\n    fn t(&self) -> Vec<(u8, u8)> { vec![] }\n    fn p(&self) {}\n}\n", vec!["fn p("], vec!["fn t("]),
+        ];
+        let mut wrong = Vec::new();
+        for (name, source, visible, gone) in &cases {
+            let out = kept(source);
+            for v in visible {
+                if !out.contains(v) {
+                    wrong.push(format!("{name}: production text {v:?} is hidden; kept: {out}"));
+                }
+            }
+            for g in gone {
+                if out.contains(g) {
+                    wrong.push(format!("{name}: test text {g:?} is left in; kept: {out}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{} of {} cases: {wrong:#?}", wrong.len(), cases.len());
+    }
+    #[test]
+    fn a_comma_in_the_generics_of_a_test_const_static_type_or_let_does_not_end_it() {
+        // The `,` of `HashMap<String, Vec<u8>>` is outside every bracket, and is not the end of what it is in: these end at their `;`.
+        let source = "#[cfg(test)]\nconst M: HashMap<String, Vec<u8>> = HashMap::new();\nfn a() {}\n#[cfg(test)]\nstatic S: Mutex<HashMap<u8, u8>> = Mutex::new(HashMap::new());\nfn b() {}\n#[cfg(test)]\ntype T<A, B> = (A, B);\nfn c() {}\nfn f() {\n    #[cfg(test)]\n    let m: HashMap<String, u8> = HashMap::new();\n    real();\n}\n";
+        assert_eq!(kept(source), "fn a() {} fn b() {} fn c() {} fn f() { real(); }");
+        // A field has no `;`: it ends at its first comma outside a bracket, and what is left of its generics after that (`u8>,`) names nothing.
+        let fields = kept("struct S {\n    #[cfg(test)]\n    m: HashMap<String, u8>,\n    real: u8,\n}\n");
+        assert!(fields.contains("real: u8") && !fields.contains("HashMap"), "{fields}");
+    }
     #[test]
     fn a_lifetime_is_not_the_start_of_a_character() {
         let source = "fn f<'a>(x: &'a str) -> &'a str { x }\n#[cfg(test)]\nmod tests { fn t<'a>() { let c = '{'; } }\nfn g() {}\n";
