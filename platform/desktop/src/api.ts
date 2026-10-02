@@ -413,6 +413,8 @@ export interface PluginRecord {
     description?: string;
     connectors?: Array<{ id: string; commands: string[] }>;
     events?: string[];
+    /** Declared host permissions; each call is still gated server-side. */
+    capabilities?: string[];
     /** Commands with effects a retry must not repeat. */
     commands?: { journalled?: string[] };
     /** schemaVersion 4: the built-in modules it provides (the phone, the calendar). */

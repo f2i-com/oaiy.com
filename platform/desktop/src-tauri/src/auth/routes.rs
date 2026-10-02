@@ -387,6 +387,9 @@ pub static ROUTES: &[Route] = &[
     ),
     // ai.read
     scope(Verb::Get, "/api/ai/sources", "ai.read"),
+    // Plugin screens use the same legacy desktop credential lane as the AI
+    // gateway. Their handlers add the live package/capability gate.
+    scope(Verb::Get, "/api/plugins/:id/ai/sources", "ai.read"),
     scope(Verb::Get, "/api/ai/providers", "ai.read"),
     scope(Verb::Get, "/api/ai/v1/models", "ai.read"),
     scope(Verb::Get, "/api/ai/providers/:id/v1/models", "ai.read"),
@@ -394,6 +397,8 @@ pub static ROUTES: &[Route] = &[
     scope(Verb::Get, "/api/ai/engine/services", "ai.read"),
     // ai.use
     scope(Verb::Post, "/api/ai/v1/chat/completions", "ai.use"),
+    scope(Verb::Post, "/api/plugins/:id/ai/complete", "ai.use"),
+    scope(Verb::Post, "/api/plugins/:id/ai/cancel", "ai.use"),
     scope(
         Verb::Post,
         "/api/ai/providers/:id/v1/chat/completions",
@@ -965,6 +970,27 @@ mod tests {
     }
 
     #[test]
+    fn plugin_ai_reads_and_completion_keep_separate_scopes_and_legacy_patterns() {
+        use axum::http::Method;
+        for (method, pattern, required) in [
+            (Method::GET, "/api/plugins/:id/ai/sources", "ai.read"),
+            (Method::HEAD, "/api/plugins/:id/ai/sources", "ai.read"),
+            (Method::POST, "/api/plugins/:id/ai/complete", "ai.use"),
+            (Method::POST, "/api/plugins/:id/ai/cancel", "ai.use"),
+        ] {
+            assert_eq!(route_class(&method, pattern), Class::Scope(required));
+            assert!(pattern_existed_before(pattern), "the legacy desktop credential lane must handle {method} {pattern}");
+        }
+        for (method, pattern) in [
+            (Method::POST, "/api/plugins/:id/ai/sources"),
+            (Method::GET, "/api/plugins/:id/ai/complete"),
+            (Method::GET, "/api/plugins/:id/ai/cancel"),
+        ] {
+            assert_eq!(route_class(&method, pattern), Class::Unclassified);
+        }
+    }
+
+    #[test]
     fn the_rows_that_hold_no_scope_are_the_ones_the_design_lists() {
         let mut classes: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
         for r in ROUTES {
@@ -1088,12 +1114,12 @@ mod tests {
         // seven of the receptionist's transfers and messages).
         assert_eq!(
             want.len(),
-            161 + 41 + 60 - 1 + 4 + 7 + 8,
+            161 + 41 + 60 - 1 + 4 + 7 + 8 + 3,
             "the rows of the design and its documented differences"
         );
         assert_eq!(
-            added, 19,
-            "the routes added since the appendix are the nineteen the file lists"
+            added, 22,
+            "the routes added since the appendix are the twenty-two the file lists"
         );
         // Four rows the appendix reserves were built (the messages and the ring's settings): the scope is the
         // design's and the `since` is 1, since the routes exist.
@@ -1154,6 +1180,9 @@ mod tests {
             "/api/config",
             "/api/health",
             "/api/ai/engine/gateway/*path",
+            "/api/plugins/:id/ai/sources",
+            "/api/plugins/:id/ai/complete",
+            "/api/plugins/:id/ai/cancel",
         ] {
             assert!(pattern_existed_before(old), "{old}");
         }

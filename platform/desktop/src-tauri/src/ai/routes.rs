@@ -87,12 +87,35 @@ async fn engine_now(st: &AiState) -> Result<(String, String), String> {
 /// The engines' gateway and its discovery document, asked of the engines now. Only
 /// asks: nothing is started (the gateway answers discovery from its configuration).
 pub(super) async fn engine_discovery(st: &AiState) -> Result<(String, Value), String> {
+    engine_discovery_impl(st, false).await
+}
+
+pub(super) async fn resident_engine_provider(st: &AiState) -> Result<AiProvider, String> {
+    let (gateway, discovery) = engine_discovery_impl(st, true).await?;
+    Ok(engine_provider(gateway, chosen_model(&discovery)))
+}
+
+async fn engine_discovery_impl(st: &AiState, require_resident: bool) -> Result<(String, Value), String> {
     let ui = st.engines_ui().ok_or("OAIY's engines are not running")?;
-    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(4)).build().map_err(|e| e.to_string())?;
-    let state: Value = client.get(format!("{}/api/state", ui.trim_end_matches('/'))).send().await.map_err(|e| format!("the engines did not answer: {e}"))?.json().await.map_err(|e| e.to_string())?;
+    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(4));
+    if require_resident { builder = builder.no_proxy().redirect(reqwest::redirect::Policy::none()); }
+    let client = builder.build().map_err(|e| e.to_string())?;
+    let state = engine_json(&client, format!("{}/api/state", ui.trim_end_matches('/')), require_resident).await?;
     let gateway = state.get("gateway_url").and_then(Value::as_str).filter(|g| !g.is_empty()).ok_or("the engines have no gateway yet")?.trim_end_matches('/').to_string();
-    let discovery: Value = client.get(format!("{gateway}/v1/discovery")).send().await.map_err(|e| format!("the engines' gateway did not answer: {e}"))?.json().await.map_err(|e| e.to_string())?;
+    let discovery = engine_json(&client, format!("{gateway}/v1/discovery"), require_resident).await?;
+    if require_resident && (state.pointer("/llm/state").and_then(Value::as_str) != Some("ready")
+        || state.pointer("/llm/resident").and_then(Value::as_str).filter(|model| !model.is_empty()) != Some(chosen_model(&discovery).as_str())) {
+        return Err("The chosen engine model is not already ready and resident.".into());
+    }
     Ok((gateway, discovery))
+}
+
+async fn engine_json(client: &reqwest::Client, url: String, bounded: bool) -> Result<Value, String> {
+    let response = client.get(url).send().await.map_err(|e| format!("the engines did not answer: {e}"))?;
+    if !bounded { return response.json().await.map_err(|e| e.to_string()); }
+    if !response.status().is_success() { return Err("the engines did not return a successful discovery response".into()); }
+    let bytes = gateway::read_capped_with_limit(response, 64 * 1024).await.map_err(|_| "the engine discovery response exceeded its bounded transport".to_string())?;
+    serde_json::from_slice(&bytes).map_err(|_| "the engines returned invalid discovery JSON".into())
 }
 
 /// The model chosen in Engines, from the gateway's discovery: `defaults.llm`, else
@@ -314,37 +337,12 @@ async fn chat_impl(st: &AiState, provider_id: Option<&str>, mut body: Value) -> 
         let codex = st.codex.clone();
         return codex_answer(body, codex_alias, move |body, alias, emit| codex.chat_streaming(body, alias, emit)).await;
     }
-    // Resolve the FULL provider under the lock, drop the guard before await.
-    let provider = if provider_id == Some(ENGINE_PROVIDER_ID) {
-        match engine_now(st).await {
-            // The engine answers with the model chosen in Engines: a model named here would load another.
-            Ok((gateway, model)) => {
-                if let Some(obj) = body.as_object_mut() {
-                    obj.remove("model");
-                }
-                Some(engine_provider(gateway, model))
-            }
-            Err(e) => return ai_error(StatusCode::SERVICE_UNAVAILABLE, "engine_unavailable", e),
-        }
-    } else {
-        let store = st.providers.lock().unwrap_or_else(|e| e.into_inner());
-        match provider_id {
-            Some(id) => store.get_full(id).filter(|p| p.supports(Capability::Chat)),
-            None => store.default_for(Capability::Chat),
-        }
+    let p = match resolve_chat_provider(st, provider_id).await {
+        Ok(p) => p,
+        Err((status, code, message)) => return ai_error(status, code, message),
     };
-    let Some(p) = provider else {
-        return ai_error(
-            StatusCode::NOT_FOUND,
-            "no_provider",
-            "no AI provider is configured for chat — add one in OAIY Desktop → Providers".into(),
-        );
-    };
-    if !p.enabled {
-        return ai_error(StatusCode::BAD_REQUEST, "invalid_request", format!("provider {:?} is disabled", p.id));
-    }
-    if !p.has_key() && !p.allow_local {
-        return ai_error(StatusCode::BAD_REQUEST, "invalid_request", format!("provider {:?} has no API key", p.id));
+    if provider_id == Some(ENGINE_PROVIDER_ID) {
+        if let Some(obj) = body.as_object_mut() { obj.remove("model"); }
     }
     if let Some(obj) = body.as_object_mut() {
         obj.remove("provider"); // OAIY is flat — drop any routing hint
@@ -371,6 +369,29 @@ async fn chat_impl(st: &AiState, provider_id: Option<&str>, mut body: Value) -> 
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => gateway_err(e),
     }
+}
+
+/// Resolve only the host's named provider records or its chosen engine. A
+/// caller's catalogue metadata is never used as a provider configuration.
+pub(super) async fn resolve_chat_provider(st: &AiState, provider_id: Option<&str>) -> Result<AiProvider, (StatusCode, &'static str, String)> {
+    let provider = if provider_id == Some(ENGINE_PROVIDER_ID) {
+        let (gateway, model) = engine_now(st).await.map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, "engine_unavailable", e))?;
+        Some(engine_provider(gateway, model))
+    } else {
+        let store = st.providers.lock().unwrap_or_else(|e| e.into_inner());
+        match provider_id {
+            Some(id) => store.get_full(id).filter(|p| p.supports(Capability::Chat)),
+            None => store.default_for(Capability::Chat),
+        }
+    };
+    let p = provider.ok_or((StatusCode::NOT_FOUND, "no_provider", "No enabled AI chat provider is configured for this source.".into()))?;
+    if !p.enabled {
+        return Err((StatusCode::BAD_REQUEST, "invalid_request", "The configured provider is disabled.".into()));
+    }
+    if !p.has_key() && !p.allow_local {
+        return Err((StatusCode::BAD_REQUEST, "invalid_request", "The configured provider has no API key.".into()));
+    }
+    Ok(p)
 }
 
 async fn models_default(State(st): State<AiState>) -> Response {
