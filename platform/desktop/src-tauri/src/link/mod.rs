@@ -15,6 +15,7 @@
 
 pub mod app_logic;
 pub mod condition;
+pub mod creds;
 pub mod data_node;
 pub mod descriptor;
 pub mod flow_runner;
