@@ -61,7 +61,7 @@ fn battery() -> Vec<String> {
         expires_at: Some(1790000600),
     };
     check("IceServer (TURN credential) [derives Debug]", format!("{ice:?}"), &["TURN-CREDENTIAL-SECRET"]);
-    let sas = Sas { raw: [1; 8], chars12: "6NHNK68MQQVZ".into(), check: '5' };
+    let sas = Sas::from_parts([1; 8], "6NHNK68MQQVZ", '5');
     check("Sas [custom Debug]", format!("{sas:?}"), &["6NHN-K68M-QQVZ-5"]);
 
     println!("leaks: {leaks:?}");

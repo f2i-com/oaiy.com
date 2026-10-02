@@ -247,9 +247,9 @@ fn a3_the_sas_is_computed_from_the_raw_bytes_of_the_pid() {
     let d = a.secret.derive().unwrap();
     let nonce = unhex32(v.s("A3.inputs.nonceHex"));
     let sas = math::sas(&a.desktop_endpoint.verify_key().to_bytes(), &a.phone_endpoint.verify_key().to_bytes(), &nonce, &d.pid).unwrap();
-    assert_eq!(hex(&sas.raw), v.s("A3.expected.sasRawHex"));
-    assert_eq!(sas.chars12, v.s("A3.expected.sas12"));
-    assert_eq!(sas.check.to_string(), v.s("A3.expected.sasCheckChar"));
+    assert_eq!(hex(sas.raw()), v.s("A3.expected.sasRawHex"));
+    assert_eq!(sas.chars12(), v.s("A3.expected.sas12"));
+    assert_eq!(sas.check().to_string(), v.s("A3.expected.sasCheckChar"));
     assert_eq!(sas.display(), v.s("A3.expected.sasDisplay"));
     let ceremony = load("fixtures/pairing-ceremony.json");
     assert_eq!(sas.display(), ceremony.s("sas"));
@@ -271,9 +271,9 @@ fn a3_the_sas_is_computed_from_the_raw_bytes_of_the_pid() {
             .find(|w| w.s("reading").contains(if reading == "text" { "b64u text" } else { "lower-case hex" }))
             .unwrap();
         assert_eq!(hex(&wrong), want.s("sasRawHex"), "{reading}");
-        assert_ne!(wrong, sas.raw, "{reading}");
+        assert_ne!(&wrong, sas.raw(), "{reading}");
         assert_ne!(
-            math::sas(&a.desktop_endpoint.verify_key().to_bytes(), &a.phone_endpoint.verify_key().to_bytes(), &nonce, &d.pid).unwrap().chars12,
+            math::sas(&a.desktop_endpoint.verify_key().to_bytes(), &a.phone_endpoint.verify_key().to_bytes(), &nonce, &d.pid).unwrap().chars12(),
             want.s("sas12")
         );
     }

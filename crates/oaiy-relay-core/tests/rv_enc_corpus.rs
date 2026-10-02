@@ -121,7 +121,7 @@ fn corpus_sas_entry() {
             out.push_str("SKIP\n");
             continue;
         };
-        let expected = Sas { raw: [0; 8], chars12: chars12.to_string(), check: math::sas_check_char(chars12) };
+        let expected = Sas::from_parts([0; 8], chars12.to_string(), math::sas_check_char(chars12));
         writeln!(out, "{:?}", math::judge_sas_entry(&expected, s)).unwrap();
     }
     std::fs::write(d.join("sas.rust.out"), out).unwrap();

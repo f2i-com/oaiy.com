@@ -191,11 +191,11 @@ pub fn parse_typed_code(text: &str) -> Result<PairingSecret> {
 #[derive(Clone, PartialEq, Eq)]
 pub struct Sas {
     /// `HKDF-SHA256(IKM = desktopEd25519Pub || phoneEd25519Pub, salt = nonce, info = "oaiy/pairing/3/sas" || 0x00 || pid, L = 8)`.
-    pub raw: [u8; 8],
+    raw: [u8; 8],
     /// The top 60 bits of `raw` as 12 Crockford characters.
-    pub chars12: String,
+    chars12: String,
     /// The check character: `Crockford32[SHA-256("oaiy/pairing/3/sas-check" || 0x00 || chars12)[0] >> 3]`.
-    pub check: char,
+    check: char,
 }
 
 /// The code the owner is shown and types is what makes a pairing the owner's: its `Debug` prints nothing of it.
@@ -214,8 +214,29 @@ impl Drop for Sas {
 }
 
 impl Sas {
-    /// `XXXX-XXXX-XXXX-C`, as the phone shows it. A value that [`sas`] made has 12 characters; for any other (the fields are public) the groups are whatever is there, and
-    /// this never panics.
+    /// A value from its parts (a test, or a host that keeps the parts): the one [`sas`] makes is the only one that means anything for a pairing, and this does not check that the parts
+    /// belong together. The fields are private, so that nothing can change a value that was made.
+    pub fn from_parts(raw: [u8; 8], chars12: impl Into<String>, check: char) -> Sas {
+        Sas { raw, chars12: chars12.into(), check }
+    }
+
+    /// The 8 bytes the SAS is made of.
+    pub fn raw(&self) -> &[u8; 8] {
+        &self.raw
+    }
+
+    /// The 12 characters (without the check character, without dashes).
+    pub fn chars12(&self) -> &str {
+        &self.chars12
+    }
+
+    /// The check character.
+    pub fn check(&self) -> char {
+        self.check
+    }
+
+    /// `XXXX-XXXX-XXXX-C`, as the phone shows it. A value that [`sas`] made has 12 characters; for any other ([`Sas::from_parts`] takes what it is given) the groups are whatever is there,
+    /// and this never panics.
     pub fn display(&self) -> String {
         let part = |from: usize, to: usize| self.chars12.get(from..to).or_else(|| self.chars12.get(from..)).unwrap_or("");
         format!("{}-{}-{}-{}", part(0, 4), part(4, 8), part(8, 12), self.check)

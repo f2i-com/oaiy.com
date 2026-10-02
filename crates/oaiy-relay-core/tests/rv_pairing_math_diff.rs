@@ -29,9 +29,9 @@ fn the_pairing_arithmetic_equals_an_independent_recomputation() {
         assert_eq!(secret.typed_code(), e["typed"].as_str().unwrap());
         let sas =
             math::sas(&unhex(c["dk"].as_str().unwrap()), &unhex(c["pk"].as_str().unwrap()), &unhex(c["nonce"].as_str().unwrap()), &d.pid).unwrap();
-        assert_eq!(hex(&sas.raw), e["sas_raw"].as_str().unwrap());
-        assert_eq!(sas.chars12, e["sas_chars12"].as_str().unwrap());
-        assert_eq!(sas.check.to_string(), e["sas_check"].as_str().unwrap());
+        assert_eq!(hex(sas.raw()), e["sas_raw"].as_str().unwrap());
+        assert_eq!(sas.chars12(), e["sas_chars12"].as_str().unwrap());
+        assert_eq!(sas.check().to_string(), e["sas_check"].as_str().unwrap());
         assert_eq!(sas.display(), e["sas_display"].as_str().unwrap());
         assert_eq!(math::offer_mac(&d.mac_key, c["offer_text"].as_str().unwrap()).unwrap(), e["offer_mac"].as_str().unwrap());
         assert_eq!(math::response_mac(&d.mac_key, c["claims_text"].as_str().unwrap()).unwrap(), e["response_mac"].as_str().unwrap());

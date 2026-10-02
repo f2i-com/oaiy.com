@@ -56,12 +56,12 @@ fn awaiting_sas(w: &mut World) -> (NewOffer, Sas) {
 }
 
 fn code_of(sas: &Sas) -> String {
-    format!("{}{}", sas.chars12, sas.check)
+    format!("{}{}", sas.chars12(), sas.check())
 }
 
 /// 13 characters that are well formed (the check character is right) but are not `sas`.
 fn wrong_code(sas: &Sas, salt: usize) -> String {
-    let mut chars: Vec<char> = sas.chars12.chars().collect();
+    let mut chars: Vec<char> = sas.chars12().chars().collect();
     let i = salt % 12;
     chars[i] = if chars[i] == '0' { '1' } else { '0' };
     let twelve: String = chars.into_iter().collect();
@@ -115,13 +115,13 @@ fn attack_malformed_entries_never_count_and_normalisation_does_not_widen_the_cod
             1 => format!("{}\n", code_of(&sas)),
             2 => format!("{}X", code_of(&sas)),
             3 => format!("\u{410}{}", code_of(&sas)),
-            _ => format!("{}{}", sas.chars12, if sas.check == 'Z' { 'Y' } else { 'Z' }),
+            _ => format!("{}{}", sas.chars12(), if sas.check() == 'Z' { 'Y' } else { 'Z' }),
         };
         let step = w.desktop.submit_sas(&a.pid, &typed).unwrap();
         assert!(!matches!(step, SasStep::Wrong { .. } | SasStep::Exhausted | SasStep::Confirmed), "entry {i} {typed:?}: {step:?}");
     }
     // Separators, case and the look-alikes of Crockford are the same code; 'U' is not part of any code.
-    let lower = format!("{}-{}-{}-{}", &sas.chars12[0..4], &sas.chars12[4..8], &sas.chars12[8..12], sas.check).to_lowercase();
+    let lower = format!("{}-{}-{}-{}", &sas.chars12()[0..4], &sas.chars12()[4..8], &sas.chars12()[8..12], sas.check()).to_lowercase();
     assert_eq!(math::judge_sas_entry(&sas, &lower), SasEntry::Right);
     assert_eq!(math::judge_sas_entry(&sas, &format!(" {} ", code_of(&sas))), SasEntry::Right);
     assert_eq!(math::judge_sas_entry(&sas, &code_of(&sas).replace('0', "O").replace('1', "l")), SasEntry::Right);
@@ -163,12 +163,12 @@ fn attack_single_character_errors_in_the_typed_code_and_in_the_sas_are_caught_lo
     let (mut caught, mut counted, mut checks_caught) = (0, 0, 0);
     for pos in 0..12 {
         for c in ALPHABET.chars() {
-            if sas.chars12.chars().nth(pos) == Some(c) {
+            if sas.chars12().chars().nth(pos) == Some(c) {
                 continue;
             }
-            let mut v: Vec<char> = sas.chars12.chars().collect();
+            let mut v: Vec<char> = sas.chars12().chars().collect();
             v[pos] = c;
-            let typed: String = v.into_iter().collect::<String>() + &sas.check.to_string();
+            let typed: String = v.into_iter().collect::<String>() + &sas.check().to_string();
             match math::judge_sas_entry(&sas, &typed) {
                 SasEntry::BadCheck => caught += 1,
                 SasEntry::Wrong => counted += 1,
@@ -176,8 +176,8 @@ fn attack_single_character_errors_in_the_typed_code_and_in_the_sas_are_caught_lo
             }
         }
     }
-    for c in ALPHABET.chars().filter(|c| *c != sas.check) {
-        let typed = format!("{}{}", sas.chars12, c);
+    for c in ALPHABET.chars().filter(|c| *c != sas.check()) {
+        let typed = format!("{}{}", sas.chars12(), c);
         assert_eq!(math::judge_sas_entry(&sas, &typed), SasEntry::BadCheck);
         checks_caught += 1;
     }
@@ -361,7 +361,7 @@ fn attack_three_wrong_codes_tell_the_relay_to_deny_and_to_burn() {
     w.deliver();
     w.env.stub.clear_log();
     let wrong = |i: usize| {
-        let mut chars: Vec<char> = sas.chars12.chars().collect();
+        let mut chars: Vec<char> = sas.chars12().chars().collect();
         chars[i] = if chars[i] == '0' { '1' } else { '0' };
         let twelve: String = chars.into_iter().collect();
         format!("{twelve}{}", math::sas_check_char(&twelve))
@@ -587,7 +587,7 @@ fn attack_the_sas_depends_on_both_endpoint_keys_in_order_the_nonce_and_the_raw_p
     other_pid[0] ^= 1;
     let s5 = math::sas(&dk, &k1, &offer.offer.nonce, &other_pid).unwrap();
     for (name, s) in [("other phone key", &s2), ("keys swapped", &s3), ("other nonce", &s4), ("other pid", &s5)] {
-        assert_ne!(s.raw, s1.raw, "{name}");
+        assert_ne!(s.raw(), s1.raw(), "{name}");
     }
     // The formula of README 10.1, computed here once more: HKDF(IKM = desktop || phone, salt = nonce, info = "oaiy/pairing/3/sas" 0x00 pid-raw, L = 8).
     let mut ikm = [0u8; 64];
@@ -598,15 +598,15 @@ fn attack_the_sas_depends_on_both_endpoint_keys_in_order_the_nonce_and_the_raw_p
     assert_eq!(info.len(), 35);
     let mut raw = [0u8; 8];
     oaiy_crypto::kdf::hkdf_sha256(&ikm, Some(&offer.offer.nonce), &info, &mut raw).unwrap();
-    assert_eq!(raw, s1.raw);
+    assert_eq!(&raw, s1.raw());
     // Reading the pid as its 22-character text (the mistake of Interpretation 21) gives another value.
     let mut wrong_info = b"oaiy/pairing/3/sas\0".to_vec();
     wrong_info.extend_from_slice(math::pid_text(&d.pid).as_bytes());
     assert_eq!(wrong_info.len(), 41);
     let mut wrong = [0u8; 8];
     oaiy_crypto::kdf::hkdf_sha256(&ikm, Some(&offer.offer.nonce), &wrong_info, &mut wrong).unwrap();
-    assert_ne!(wrong, s1.raw);
+    assert_ne!(&wrong, s1.raw());
     // Twelve characters carry the top 60 bits, and the display is 13 characters in groups of four.
-    assert_eq!(s1.chars12.len(), 12);
+    assert_eq!(s1.chars12().len(), 12);
     assert_eq!(s1.display().len(), 16);
 }

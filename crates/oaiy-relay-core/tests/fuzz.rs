@@ -369,7 +369,11 @@ fn typed_codes_pairing_keys_enrolment_keys_and_sas_entries_never_panic_and_a_cod
     fuzz("sas entry", 0xD7, &[s(&shown), s(&shown.to_lowercase()), s("0000-0000-0000-0")], |b| {
         let t = text(b);
         let judged = math::judge_sas_entry(&sas, &t);
-        assert_eq!(judged == SasEntry::Right, math::normalise(&t).is_some_and(|n| n.as_str() == format!("{}{}", sas.chars12, sas.check)), "{t:?}");
+        assert_eq!(
+            judged == SasEntry::Right,
+            math::normalise(&t).is_some_and(|n| n.as_str() == format!("{}{}", sas.chars12(), sas.check())),
+            "{t:?}"
+        );
     });
 }
 

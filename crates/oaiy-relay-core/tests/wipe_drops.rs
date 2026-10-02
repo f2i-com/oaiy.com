@@ -187,7 +187,7 @@ fn what_a_drop_wipes() {
             Needle { name: "chars12", bytes: b"6NHNK68MQQVZ".to_vec() },
             Needle { name: "raw", bytes: vec![0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8] },
         ],
-        || Sas { raw: [0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8], chars12: String::from_utf8(b"6NHNK68MQQVZ".to_vec()).unwrap(), check: '5' },
+        || Sas::from_parts([0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8], String::from_utf8(b"6NHNK68MQQVZ".to_vec()).unwrap(), '5'),
     );
     assert_eq!(leaks(&r), 0, "a dropped Sas left its characters in a freed block: {r:?}");
 
