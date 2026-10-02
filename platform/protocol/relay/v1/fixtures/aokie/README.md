@@ -68,7 +68,7 @@ no control character). Anything else is read as a bare HTTP status.
 
 ## What a Rust contract test in the Aokie repository needs
 
-None of this was run: this package has no Cargo build of the Aokie workspace, and the Aokie repository was only read.
+None of this was written in the Aokie repository from here: this package has no Cargo build of the Aokie workspace, and the Aokie repository was only read. **The phone side has since been run** by an Android emulator test of the shipped phone (outside this repository), which exercises the phone's real decoders and carrier against a loopback relay of this package and against these fixtures; the plugin side has not been run. The loopback relay is plain http, so its admission carries `ws://` and `http://` URLs, which these fixtures (a deployed relay's) do not (protocol `README.md`, Interpretation 61).
 
 1. **The plugin.** A test in `crates/aokie-plugin/src/companion_gateway/tests.rs` (the types are `pub(super)`): for each 200 plugin
    case of `admission.json`, `serde_json::from_value::<AdmissionResponse>(body)` and `into_credentials(Some(app_id), plugin_id,

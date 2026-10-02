@@ -498,9 +498,14 @@ design's vectors and against FormLogic's own known answers, the sealed tokens of
 
 **Not run:**
 
-- **No Aokie code was run.** The plugin's and the phone's decoders were read, not compiled: the fixtures are checked by a Python
-  transcription of their rules (`fixtures/aokie/aokie_decoders.py`), which can be wrong where the Rust differs from my reading.
-  A Rust contract test against the same fixtures is listed in `fixtures/aokie/README.md` and was not written.
+- **The shipped phone has been run against this relay; the shipped plugin has not.** An Android emulator test of the shipped phone (not part of
+  this repository) runs the phone's real decoders and carrier, against a loopback relay of this package and against the recorded
+  fixtures, and found what Interpretations 61 to 65 of the protocol README record: the http loopback relay's ws:// and http:// URLs
+  (outside the schemas by design), the budgets of the pairing reads, the 413 of a post the phone may legitimately send, the
+  backpressure of a phone's posts to the plugin's mailbox, and a 403 whose message was wrong. The plugin's decoders and carrier were
+  only read, not compiled or run, here: for them the fixtures are still checked by a Python transcription of their rules
+  (`fixtures/aokie/aokie_decoders.py`), which can be wrong where the Rust differs from my reading. A Rust contract test of the plugin
+  against the same fixtures is listed in `fixtures/aokie/README.md` and was not written.
 - **No coturn was run**, so no real allocation was made with these credentials; the credential is the HMAC that coturn's
   `use-auth-secret` computes, and it agrees with FormLogic's own computed answers and with Python's `hmac`.
 - The framed stream was tested against `php -S` on Windows only. How a real host's web server, PHP-FPM, LiteSpeed or a CDN buffers
