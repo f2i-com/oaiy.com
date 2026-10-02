@@ -89,14 +89,11 @@ MUTATIONS = [
     ("C05", "relay clock", "the median is of 3 samples, not 5", C + "client/clock.rs",
      "pub const SAMPLES: usize = 5;", "pub const SAMPLES: usize = 3;", "own"),
     ("S01", "poll store", "the cursor is written before the items (a crash between the two loses items)", C + "client/store.rs",
-     "        fs::create_dir_all(&self.dir)?;\n        if !batch.items.is_empty() {\n            let mut f = fs::OpenOptions::new().create(true).append(true).open(self.inbox_path())?;\n"
-     "            for it in batch.items {\n                f.write_all(it.raw.to_compact().as_bytes())?;\n                f.write_all(b\"\\n\")?;\n            }\n            f.sync_all()?;\n        }\n"
+     "        fs::create_dir_all(&self.dir)?;\n        if !batch.items.is_empty() {\n            self.append(batch)?;\n        }\n"
      "        self.write_cursor(&PollCursor { since: batch.since, epoch: Some(batch.epoch.to_string()) }, batch.reset)\n",
      "        fs::create_dir_all(&self.dir)?;\n"
      "        self.write_cursor(&PollCursor { since: batch.since, epoch: Some(batch.epoch.to_string()) }, batch.reset)?;\n"
-     "        if !batch.items.is_empty() {\n            let mut f = fs::OpenOptions::new().create(true).append(true).open(self.inbox_path())?;\n"
-     "            for it in batch.items {\n                f.write_all(it.raw.to_compact().as_bytes())?;\n                f.write_all(b\"\\n\")?;\n            }\n            f.sync_all()?;\n        }\n"
-     "        Ok(())\n", "own"),
+     "        if !batch.items.is_empty() {\n            self.append(batch)?;\n        }\n        Ok(())\n", "own"),
     # ---------------------------------------------------------------------------------------------------------------- pairing, the SAS and the typed code
     ("A01", "SAS", "the SAS is derived with no salt (the nonce)", C + "pairing/math.rs",
      "hkdf_sha256(&ikm, Some(nonce), &info, &mut raw)?;", "hkdf_sha256(&ikm, None, &info, &mut raw)?;", "own"),

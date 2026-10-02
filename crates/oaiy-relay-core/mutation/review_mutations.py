@@ -188,7 +188,7 @@ MUTATIONS = [
     ("S05", "poll store", "any read error of cursor.json is a first run (since 0)", C + "client/store.rs",
      "Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(PollCursor::default()),\n            Err(e) => Err(e.into()),\n        }\n    }\n\n    fn persist(", "Err(_) => Ok(PollCursor::default()),\n        }\n    }\n\n    fn persist(", "own"),
     ("S06", "poll store", "the items are appended without a newline", C + "client/store.rs",
-     "                f.write_all(b\"\\n\")?;", "                f.write_all(b\"\")?;", "own"),
+     "lines.push(b'\\n');", "lines.extend_from_slice(b\"\");", "own"),
     ("X01", "redaction", "a token's Debug prints the whole token", C + "ids.rs",
      "write!(f, \"Token({}.., redacted)\", &self.0[..TOKEN_PREFIX.len() + 11])", "write!(f, \"Token({}.., redacted)\", &self.0[..])", "own"),
     ("X02", "redaction", "a signer's Debug prints its seed (base64url)", C + "keys.rs",

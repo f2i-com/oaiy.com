@@ -4,6 +4,8 @@
 use std::fs;
 use std::path::PathBuf;
 
+mod common;
+
 use oaiy_relay_core::client::keystore::KeystoreSecrets;
 use oaiy_relay_core::client::store::write_atomic;
 use oaiy_relay_core::client::*;
@@ -217,4 +219,116 @@ fn memory_stores_say_never_stored_and_cannot_read_apart() {
     secrets.broken.store(false, std::sync::atomic::Ordering::SeqCst);
     secrets.put("relay.token", b"x").unwrap();
     assert!(secrets.get("relay.token").unwrap().is_some());
+}
+
+fn accepted(seq: u64, id: &str, body: &str) -> AcceptedItem {
+    let raw =
+        json::parse(format!(r#"{{"seq":{seq},"id":"{id}","lane":"cmd","from":"relay","at":1,"exp":99,"hdr":{{}},"body":"{body}"}}"#).as_bytes())
+            .unwrap();
+    AcceptedItem { seq, item: Item::from_json(&raw), raw }
+}
+
+fn ids_of(items: &[oaiy_relay_core::json::Json]) -> Vec<String> {
+    items.iter().map(|i| i.get_str("id").unwrap().to_string()).collect()
+}
+
+#[test]
+fn a_torn_append_is_cut_off_before_the_next_one_and_is_never_read() {
+    // A crash in the middle of an append leaves a last line with no newline, of any length (also longer than the block the repair reads, and also the whole file).
+    for fragment in [r#"{"seq":1,"id":"a","lane":"cmd","fro"#.to_string(), "x".repeat(10_000)] {
+        let dir = scratch("torn");
+        let mut store = FilePollStore::new(&*dir);
+        let first = accepted(1, "a", "b");
+        store.persist(&PersistBatch { items: std::slice::from_ref(&first), since: 1, epoch: "eVp54C0-EJY", reset: false }).unwrap();
+        let mut bytes = fs::read(dir.join("inbox.jsonl")).unwrap();
+        bytes.extend_from_slice(fragment.as_bytes());
+        fs::write(dir.join("inbox.jsonl"), &bytes).unwrap();
+        assert_eq!(ids_of(&store.read_inbox().unwrap()), ["a"], "the torn line is not read");
+        // The items that come again are appended after the complete lines, not after the fragment.
+        let second = accepted(2, "c", "d");
+        store.persist(&PersistBatch { items: std::slice::from_ref(&second), since: 2, epoch: "eVp54C0-EJY", reset: false }).unwrap();
+        assert_eq!(ids_of(&store.read_inbox().unwrap()), ["a", "c"]);
+        // And a file that is nothing but a fragment loses nothing but the fragment.
+        fs::write(dir.join("inbox.jsonl"), fragment.as_bytes()).unwrap();
+        store.persist(&PersistBatch { items: std::slice::from_ref(&second), since: 3, epoch: "eVp54C0-EJY", reset: false }).unwrap();
+        assert_eq!(ids_of(&store.read_inbox().unwrap()), ["c"]);
+    }
+}
+
+#[test]
+fn the_inbox_is_closed_into_segments_that_the_consumer_drains_without_touching_the_open_file() {
+    let dir = scratch("segments");
+    let mut store = FilePollStore::with_limits(&*dir, 300, 100_000);
+    for i in 1..=12u64 {
+        let item = accepted(i, &format!("i{i:02}"), &"x".repeat(60));
+        store.persist(&PersistBatch { items: std::slice::from_ref(&item), since: i, epoch: "eVp54C0-EJY", reset: false }).unwrap();
+    }
+    let segments = store.closed_segments().unwrap();
+    assert!(segments.len() >= 3, "{segments:?}");
+    // Everything is still there, in order, whether it is in a segment or not.
+    let all = ids_of(&store.read_inbox().unwrap());
+    assert_eq!(all, (1..=12).map(|i| format!("i{i:02}")).collect::<Vec<_>>());
+    // A segment is complete and is never appended to: the same bytes after more items.
+    let before = fs::read(&segments[0]).unwrap();
+    let more = accepted(13, "i13", &"x".repeat(60));
+    store.persist(&PersistBatch { items: std::slice::from_ref(&more), since: 13, epoch: "eVp54C0-EJY", reset: false }).unwrap();
+    assert_eq!(fs::read(&segments[0]).unwrap(), before);
+    // The consumer reads a segment, deletes it, and nothing else goes: only a closed segment can be named.
+    let first = store.read_segment(&segments[0]).unwrap();
+    assert!(!first.is_empty());
+    assert!(store.read_segment(&dir.join("inbox.jsonl")).is_err() && store.discard_segment(&dir.join("inbox.jsonl")).is_err());
+    assert!(store.discard_segment(&dir.join("cursor.json")).is_err());
+    let count = store.closed_segments().unwrap().len();
+    store.discard_segment(&segments[0]).unwrap();
+    assert_eq!(store.closed_segments().unwrap().len(), count - 1);
+    let rest = ids_of(&store.read_inbox().unwrap());
+    assert_eq!(rest.len(), 13 - first.len());
+    assert_eq!(rest.last().map(String::as_str), Some("i13"));
+}
+
+#[test]
+fn a_full_inbox_fails_the_write_and_drops_nothing_until_it_is_drained() {
+    let dir = scratch("full");
+    // Room for about two items in all.
+    let mut store = FilePollStore::with_limits(&*dir, 150, 400);
+    let item = |i: u64| accepted(i, &format!("i{i}"), &"y".repeat(60));
+    let mut written = 0;
+    let mut refused = None;
+    for i in 1..=10u64 {
+        match store.persist(&PersistBatch { items: std::slice::from_ref(&item(i)), since: i, epoch: "eVp54C0-EJY", reset: false }) {
+            Ok(()) => written = i,
+            Err(e) => {
+                refused = Some((i, e));
+                break;
+            }
+        }
+    }
+    let (at, error) = refused.expect("the inbox filled up");
+    assert!(error.to_string().contains("full"), "{error}");
+    assert!((2..10).contains(&written));
+    // Nothing was dropped, and the cursor did not move past what was written.
+    assert_eq!(store.read_inbox().unwrap().len() as u64, written);
+    assert_eq!(store.load().unwrap().since, written);
+    // The consumer drains the closed segments and the writes go on, with the item that was refused.
+    for s in store.closed_segments().unwrap() {
+        store.discard_segment(&s).unwrap();
+    }
+    store.persist(&PersistBatch { items: std::slice::from_ref(&item(at)), since: at, epoch: "eVp54C0-EJY", reset: false }).unwrap();
+    assert_eq!(store.load().unwrap().since, at);
+    assert!(ids_of(&store.read_inbox().unwrap()).contains(&format!("i{at}")));
+}
+
+#[test]
+fn a_cursor_that_cannot_be_read_is_an_error_and_never_a_first_run() {
+    let dir = scratch("cursor-unreadable");
+    let mut store = FilePollStore::new(&*dir);
+    assert_eq!(store.load().unwrap(), PollCursor::default(), "never stored: a first run");
+    // A directory where the file should be: not "not found", so not a first run (the loop would start again from 0 and take every item twice).
+    fs::create_dir_all(dir.join("cursor.json")).unwrap();
+    assert!(store.load().is_err());
+    // The same through a loop: it does not start.
+    let e = common::env::env(common::env::quick());
+    let (token, _) = e.enrol_desktop();
+    let mut lp = PollLoop::new(e.client.clone(), token, FilePollStore::new(&*dir), std::sync::Arc::new(NullSink), PollLoopConfig::default());
+    assert!(matches!(lp.run(), LoopEnd::StoreUnreadable(_)));
 }

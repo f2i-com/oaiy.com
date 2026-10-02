@@ -547,10 +547,11 @@ fn scratch_dir(name: &str) -> PathBuf {
     dir
 }
 
-/// A relay that has a fresh 1 MiB batch of items for every poll, for ever: the client accepts, writes and acknowledges each batch with no pause and no cap, and the file store
-/// keeps everything (nothing in the crate removes or limits `inbox.jsonl`).
+/// A relay that has a fresh 1 MiB batch of items for every poll, for ever: the client accepts, writes and acknowledges each batch with no pause, and the file store closes the
+/// inbox into segments of about 1 MiB that the consumer can drain, and caps the whole (the cap itself is tested in `stores.rs`). (Changed with the fix: it used to assert that
+/// `inbox.jsonl` alone grows past 25 MiB, because nothing limited or rotated it.)
 #[test]
-fn evidence_an_endless_stream_of_items_is_accepted_without_pause_and_without_a_cap() {
+fn an_endless_stream_of_items_is_accepted_without_pause_and_the_inbox_is_closed_into_segments() {
     let e = env(quick());
     let (token, _) = e.enrol_desktop();
     let epoch = e.stub.epoch();
@@ -580,9 +581,18 @@ fn evidence_an_endless_stream_of_items_is_accepted_without_pause_and_without_a_c
     wait_for("30 one-MiB batches", 60, || http.polls.load(Ordering::SeqCst) >= 30);
     let took = started.elapsed();
     let (_, _) = running.stop();
-    let size = std::fs::metadata(dir.join("inbox.jsonl")).map(|m| m.len()).unwrap_or(0);
-    println!("30 batches in {took:?}; inbox.jsonl is {} MiB; no pause between batches", size / (1 << 20));
+    let active = std::fs::metadata(dir.join("inbox.jsonl")).map(|m| m.len()).unwrap_or(0);
+    let store = FilePollStore::new(&dir);
+    let segments = store.closed_segments().unwrap();
+    let size = active + segments.iter().map(|s| std::fs::metadata(s).unwrap().len()).sum::<u64>();
+    println!(
+        "30 batches in {took:?}; the inbox is {} MiB, {} segments and an open file of {} KiB; no pause between batches",
+        size / (1 << 20),
+        segments.len(),
+        active / 1024
+    );
     assert!(size > 25 * (1 << 20));
+    assert!(!segments.is_empty() && active <= 2 * (1 << 20), "the open file is {active} bytes");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -994,7 +1004,6 @@ fn evidence_a_locked_cursor_file_fails_the_write_cleanly_and_the_items_are_appen
 /// F4-S1: a crash in the middle of an append to `inbox.jsonl` leaves a partial last line with no newline. The cursor was not advanced, so the same items are delivered again and are
 /// appended after the fragment: the first re-delivered item shares a line with the fragment, the line cannot be parsed, and `read_inbox` fails for the whole file.
 #[test]
-#[ignore = "F4-S1: a torn append is never repaired; the next append fuses with it (store.rs:553-558) and read_inbox fails for the whole inbox"]
 fn finding_a_torn_inbox_line_does_not_corrupt_the_items_that_come_again() {
     let dir = scratch_dir("torn");
     let mut store = FilePollStore::new(&dir);

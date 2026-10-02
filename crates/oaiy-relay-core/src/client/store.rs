@@ -277,7 +277,8 @@ impl ProfileStore for MemoryProfileStore {
 }
 
 /// Writes `bytes` to `path` so that a reader sees the old file or the new one and never half of either: a temporary file in the same directory, flushed to the device, then renamed
-/// over the target.
+/// over the target, and (where the platform lets a program do it: Unix) the directory flushed so that the rename itself survives a crash. On Windows `std` cannot flush a
+/// directory and the rename is `MoveFileEx` without write-through: a power cut right after it can leave the old file, which for a cursor is a re-delivery and loses nothing.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
     let dir = path.parent().ok_or_else(|| StoreError("no parent directory".into()))?;
     fs::create_dir_all(dir)?;
@@ -290,6 +291,19 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
     if let Err(e) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
         return Err(e.into());
+    }
+    sync_dir(dir)
+}
+
+/// Flushes a directory so that a rename or a new file in it is on the device (Unix); nothing elsewhere (see [`write_atomic`]).
+fn sync_dir(dir: &Path) -> Result<(), StoreError> {
+    #[cfg(unix)]
+    {
+        fs::File::open(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
     }
     Ok(())
 }
@@ -476,17 +490,36 @@ impl PollStore for MemoryPollStore {
     }
 }
 
+/// The most bytes the inbox may hold in all (the file being appended to and the closed segments): a [`FilePollStore`] whose inbox is full fails `persist`, which the loop paces as a
+/// storage failure (the relay keeps the items and delivers them again) until the consumer has drained it. Nothing is ever dropped to make room.
+pub const DEFAULT_INBOX_BYTES: u64 = 64 << 20;
+/// A segment of the inbox is closed (renamed to `inbox-NNNNNN.jsonl`, and never written to again) when the next batch would take the file past this many bytes.
+pub const DEFAULT_SEGMENT_BYTES: u64 = 1 << 20;
+
 /// The cursor as `cursor.json` and the accepted items appended to `inbox.jsonl` (one JSON object per line: the item as received), in a directory. The items are written and
 /// flushed **before** the cursor, so a crash between the two re-delivers and loses nothing (a consumer de-duplicates on `(from, id)`). A host that has a ledger of its own
 /// implements [`PollStore`] over it instead.
+///
+/// **A crash in the middle of an append** leaves a last line with no newline. The next `persist` cuts it off before it appends (the cursor never moved past it, so its items come
+/// again), and [`FilePollStore::read_inbox`] does not read it. **The inbox is bounded and drained by segments**: when the file reaches [`DEFAULT_SEGMENT_BYTES`] it is closed
+/// and a new one is started; the consumer reads the closed segments ([`FilePollStore::closed_segments`]), handles them and deletes them
+/// ([`FilePollStore::discard_segment`]) without ever touching the file the loop writes to, so no lock is needed; when everything together would pass the limit, `persist` fails
+/// and nothing is dropped.
 pub struct FilePollStore {
     dir: PathBuf,
+    segment_bytes: u64,
+    total_bytes: u64,
 }
 
 impl FilePollStore {
-    /// A store in `dir` (created when first written).
+    /// A store in `dir` (created when first written), with the default limits.
     pub fn new(dir: impl Into<PathBuf>) -> FilePollStore {
-        FilePollStore { dir: dir.into() }
+        FilePollStore::with_limits(dir, DEFAULT_SEGMENT_BYTES, DEFAULT_INBOX_BYTES)
+    }
+
+    /// A store with its own limits: the size at which a segment is closed and the size of the whole inbox.
+    pub fn with_limits(dir: impl Into<PathBuf>, segment_bytes: u64, total_bytes: u64) -> FilePollStore {
+        FilePollStore { dir: dir.into(), segment_bytes, total_bytes }
     }
 
     fn cursor_path(&self) -> PathBuf {
@@ -508,14 +541,146 @@ impl FilePollStore {
         write_atomic(&self.cursor_path(), Json::Obj(m).to_compact().as_bytes())
     }
 
-    /// The items appended so far, as received.
-    pub fn read_inbox(&self) -> Result<Vec<Json>, StoreError> {
-        match fs::read(self.inbox_path()) {
-            Ok(bytes) => bytes.split(|b| *b == b'\n').filter(|l| !l.is_empty()).map(|l| json::parse(l).map_err(StoreError::from_json)).collect(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(e) => Err(e.into()),
+    /// The closed segments of the inbox, oldest first: files the loop will never write to again, which the consumer may read and delete.
+    pub fn closed_segments(&self) -> Result<Vec<PathBuf>, StoreError> {
+        let mut found: Vec<(u64, PathBuf)> = Vec::new();
+        match fs::read_dir(&self.dir) {
+            Ok(entries) => {
+                for e in entries {
+                    let e = e?;
+                    if let Some(n) = segment_number(&e.path()) {
+                        found.push((n, e.path()));
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
         }
+        found.sort();
+        Ok(found.into_iter().map(|(_, p)| p).collect())
     }
+
+    /// The items of one closed segment, as received.
+    pub fn read_segment(&self, segment: &Path) -> Result<Vec<Json>, StoreError> {
+        if !self.closed_segments()?.iter().any(|p| p == segment) {
+            return Err(StoreError("not a closed segment of this inbox".into()));
+        }
+        parse_lines(&fs::read(segment)?, false)
+    }
+
+    /// Deletes a closed segment the consumer has handled. Only a closed segment can be deleted (never the file being appended to).
+    pub fn discard_segment(&self, segment: &Path) -> Result<(), StoreError> {
+        if !self.closed_segments()?.iter().any(|p| p == segment) {
+            return Err(StoreError("not a closed segment of this inbox".into()));
+        }
+        fs::remove_file(segment)?;
+        sync_dir(&self.dir)
+    }
+
+    /// Everything in the inbox, in order: the closed segments and then the file being appended to (a last line without a newline, which is what a crash in an append leaves, is
+    /// not read). An unreadable line anywhere else is an error.
+    pub fn read_inbox(&self) -> Result<Vec<Json>, StoreError> {
+        let mut out = Vec::new();
+        for s in self.closed_segments()? {
+            out.extend(parse_lines(&fs::read(s)?, false)?);
+        }
+        match fs::read(self.inbox_path()) {
+            Ok(bytes) => out.extend(parse_lines(&bytes, true)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        Ok(out)
+    }
+
+    /// Cuts a torn last line off the file being appended to, and returns its length then.
+    fn repair_active(&self, f: &mut fs::File) -> Result<u64, StoreError> {
+        use std::io::{Read, Seek, SeekFrom};
+        let len = f.seek(SeekFrom::End(0))?;
+        if len == 0 {
+            return Ok(0);
+        }
+        f.seek(SeekFrom::End(-1))?;
+        let mut last = [0u8; 1];
+        f.read_exact(&mut last)?;
+        if last[0] == b'\n' {
+            return Ok(len);
+        }
+        // The last line is not complete: everything after the last newline goes.
+        let mut keep = 0u64;
+        let mut pos = len;
+        let mut buf = [0u8; 4096];
+        while pos > 0 {
+            let start = pos.saturating_sub(buf.len() as u64);
+            f.seek(SeekFrom::Start(start))?;
+            let chunk = &mut buf[..(pos - start) as usize];
+            f.read_exact(chunk)?;
+            if let Some(i) = chunk.iter().rposition(|b| *b == b'\n') {
+                keep = start + i as u64 + 1;
+                break;
+            }
+            pos = start;
+        }
+        f.set_len(keep)?;
+        f.sync_all()?;
+        Ok(keep)
+    }
+
+    fn inbox_size(&self) -> Result<u64, StoreError> {
+        let mut total = match fs::metadata(self.inbox_path()) {
+            Ok(m) => m.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(e.into()),
+        };
+        for s in self.closed_segments()? {
+            total += fs::metadata(s)?.len();
+        }
+        Ok(total)
+    }
+
+    fn append(&self, batch: &PersistBatch<'_>) -> Result<(), StoreError> {
+        use std::io::{Seek, SeekFrom};
+        let mut lines = Vec::new();
+        for it in batch.items {
+            lines.extend_from_slice(it.raw.to_compact().as_bytes());
+            lines.push(b'\n');
+        }
+        let open = || fs::OpenOptions::new().create(true).read(true).write(true).truncate(false).open(self.inbox_path());
+        let mut f = open()?;
+        let mut active = self.repair_active(&mut f)?;
+        if self.inbox_size()?.saturating_add(lines.len() as u64) > self.total_bytes {
+            return Err(StoreError("the inbox is full: the consumer has to drain it (closed_segments, discard_segment)".into()));
+        }
+        if active > 0 && active + lines.len() as u64 > self.segment_bytes {
+            // Close the segment: it is renamed, and never written to again.
+            drop(f);
+            let next = self.closed_segments()?.iter().filter_map(|p| segment_number(p)).max().unwrap_or(0) + 1;
+            fs::rename(self.inbox_path(), self.dir.join(format!("inbox-{next:06}.jsonl")))?;
+            sync_dir(&self.dir)?;
+            f = open()?;
+            active = 0;
+        }
+        f.seek(SeekFrom::Start(active))?;
+        f.write_all(&lines)?;
+        f.sync_all()?;
+        sync_dir(&self.dir)
+    }
+}
+
+/// `N` of a file called `inbox-NNNNNN.jsonl`.
+fn segment_number(p: &Path) -> Option<u64> {
+    let name = p.file_name()?.to_string_lossy().into_owned();
+    name.strip_prefix("inbox-")?.strip_suffix(".jsonl")?.parse().ok()
+}
+
+/// The lines of an inbox file as JSON. `tolerate_torn_tail`: a last line with no newline is the remains of a crash in an append and is skipped.
+fn parse_lines(bytes: &[u8], tolerate_torn_tail: bool) -> Result<Vec<Json>, StoreError> {
+    let mut lines: Vec<&[u8]> = bytes.split(|b| *b == b'\n').collect();
+    // `split` leaves a last element: empty when the file ends with a newline, the torn line when it does not.
+    let tail = lines.pop().unwrap_or(&[]);
+    if !tail.is_empty() && !tolerate_torn_tail {
+        return Err(StoreError("damaged inbox: a last line without a newline".into()));
+    }
+    lines.into_iter().filter(|l| !l.is_empty()).map(|l| json::parse(l).map_err(StoreError::from_json)).collect()
 }
 
 impl StoreError {
@@ -550,12 +715,7 @@ impl PollStore for FilePollStore {
     fn persist(&mut self, batch: &PersistBatch<'_>) -> Result<(), StoreError> {
         fs::create_dir_all(&self.dir)?;
         if !batch.items.is_empty() {
-            let mut f = fs::OpenOptions::new().create(true).append(true).open(self.inbox_path())?;
-            for it in batch.items {
-                f.write_all(it.raw.to_compact().as_bytes())?;
-                f.write_all(b"\n")?;
-            }
-            f.sync_all()?;
+            self.append(batch)?;
         }
         self.write_cursor(&PollCursor { since: batch.since, epoch: Some(batch.epoch.to_string()) }, batch.reset)
     }
