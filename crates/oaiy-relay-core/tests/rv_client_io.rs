@@ -944,6 +944,20 @@ fn finding_http_response_debug_does_not_print_a_token_body() {
     assert!(!printed.contains("83, 69, 67, 82, 69, 84"), "Debug of an HttpResponse prints the body bytes");
 }
 
+/// F4-D2 (low): `IceServer` derives `Debug`, and `MobileAdmission` and `PluginAdmission` derive it over their `ice_servers`, so `{:?}` of an admission prints the TURN credential
+/// (the admission bearer itself is redacted). The README says no secret is in `Debug` output.
+#[test]
+#[ignore = "F4-D2 (low): IceServer derives Debug and prints the TURN credential (admission.rs:201)"]
+fn finding_the_debug_of_an_ice_server_does_not_print_its_turn_credential() {
+    let s = oaiy_relay_core::admission::IceServer {
+        urls: vec!["turns:turn.example.com:443".into()],
+        username: "1790000000:abc".into(),
+        credential: "TURN-SECRET-CREDENTIAL".into(),
+        expires_at: Some(1_790_000_000),
+    };
+    assert!(!format!("{s:?}").contains("TURN-SECRET-CREDENTIAL"));
+}
+
 /// What a failed cursor write does (a file another process holds without delete sharing, as a virus scanner or a backup tool can): the write fails, the temporary file is
 /// removed, the loop paces it as a failure; and the items that were appended first are appended again by every re-delivery.
 #[cfg(windows)]
