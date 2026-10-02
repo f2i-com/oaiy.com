@@ -66,10 +66,33 @@ pub fn set_linked_origin_for_tests(base_url: Option<&str>) {
 }
 
 fn set_linked_origin(base_url: Option<&str>) {
+    // Store the ORIGIN, not the base: a provider served under a path still
+    // sends `Origin: scheme://host[:port]`.
+    let origin = base_url.and_then(origin_of);
+    #[cfg(test)]
+    trusted_once::note(origin.as_deref());
     if let Ok(mut guard) = LINKED_ORIGIN.write() {
-        // Store the ORIGIN, not the base: a provider served under a path still
-        // sends `Origin: scheme://host[:port]`.
-        *guard = base_url.and_then(origin_of);
+        *guard = origin;
+    }
+}
+
+/// Every origin that was ever trusted in this test run. `LINKED_ORIGIN` is one cell for the process and every test that
+/// links or forgets writes it, so a test cannot read it back and know it was its own write that it found: it gives its
+/// provider an origin no other test has and asks whether that one was ever trusted.
+#[cfg(test)]
+pub(crate) mod trusted_once {
+    use std::sync::Mutex;
+
+    static TRUSTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    pub(super) fn note(origin: Option<&str>) {
+        if let Some(origin) = origin {
+            TRUSTED.lock().unwrap_or_else(|e| e.into_inner()).push(origin.to_string());
+        }
+    }
+
+    pub(crate) fn was(origin: &str) -> bool {
+        TRUSTED.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|o| o == origin)
     }
 }
 
@@ -1605,6 +1628,129 @@ mod tests {
     }
 
     #[test]
+    fn a_file_held_when_the_store_opens_starts_a_timer_and_one_that_is_not_held_does_not() {
+        // The timer is what brings the link back after a scanner lets go. The tests that read the file again install a
+        // timer of their own that is due at once, so that a store which never started one passes them: this is the
+        // check that the store does.
+        let dir = data_dir("timer-at-start");
+        let file = dir.join("link").join("account.json");
+        std::fs::create_dir(&file).unwrap();
+        let held = load_store(dir.clone());
+        {
+            let inner = held.inner.lock().unwrap();
+            assert!(inner.retry.is_some(), "a file another program holds is read again later");
+            assert!(inner.error.as_ref().is_some_and(|e| e.busy && e.kind == LinkErrorKind::Unusable));
+        }
+        std::fs::remove_dir(&file).unwrap();
+
+        // A file that was read and is not a link is not read again: reading it again finds what it found.
+        std::fs::write(&file, br#"{"connectorId":"formlogic","futureField":1}"#).unwrap();
+        let unusable = load_store(dir.clone());
+        {
+            let inner = unusable.inner.lock().unwrap();
+            assert!(inner.error.as_ref().is_some_and(|e| !e.busy), "{:?}", inner.error);
+            assert!(inner.retry.is_none(), "a file that is not a link has no timer");
+        }
+        // Nor is a link, nor no file at all.
+        std::fs::write(&file, serde_json::to_string(&account()).unwrap()).unwrap();
+        assert!(load_store(dir.clone()).inner.lock().unwrap().retry.is_none());
+        std::fs::remove_file(&file).unwrap();
+        assert!(load_store(dir.clone()).inner.lock().unwrap().retry.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_lanes_get_the_link_back_from_a_file_held_at_start_and_the_provider_is_trusted_again() {
+        // What the lanes ask is `account()`, not the status: the command lane, the flow runner and the sealed flows read the
+        // account at the top of their loops and nothing reads the status for them. And the provider's origin is what the
+        // dashboard's web app is let in by, set when a link is made and when it is read from the disk: a link that came
+        // back without it would be linked and shut out of its own provider's page.
+        let dir = data_dir("lanes-after-held");
+        let file = dir.join("link").join("account.json");
+        std::fs::create_dir(&file).unwrap();
+        let store = load_store(dir.clone());
+        assert!(store.account().is_none(), "held");
+
+        let mut back = account();
+        back.base_url = "https://lanes-after-held.example.test".into();
+        std::fs::remove_dir(&file).unwrap();
+        std::fs::write(&file, serde_json::to_string(&back).unwrap()).unwrap();
+        assert!(!trusted_once::was("https://lanes-after-held.example.test"));
+        read_again_now(&store);
+        assert_eq!(store.account().map(|a| a.credential), Some("flk_supersecret".to_string()), "the lane that asked has it");
+        assert!(trusted_once::was("https://lanes-after-held.example.test"), "and its provider is trusted from then on");
+        assert!(store.inner.lock().unwrap().error.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_that_is_still_held_when_it_is_read_again_keeps_its_timer_and_what_was_said() {
+        // A scanner holds a file for a minute: each read finds it held, and what is left to do is to wait. Taking it for
+        // a file that cannot be used (the answer for a file that was read and is not a link) ends the timer and the link
+        // never comes back.
+        let dir = data_dir("still-held");
+        let file = dir.join("link").join("account.json");
+        std::fs::create_dir(&file).unwrap();
+        let store = load_store(dir.clone());
+        let said = store.status().link_error.expect("held, and said");
+
+        for _ in 0..3 {
+            read_again_now(&store);
+            assert!(store.account().is_none(), "still held");
+            let inner = store.inner.lock().unwrap();
+            assert!(inner.retry.is_some(), "it will be read again");
+            assert_eq!(inner.error.as_ref(), Some(&said), "and nothing is said that was not");
+            assert!(inner.error.as_ref().is_some_and(|e| e.busy));
+        }
+        // Let go of: the next time is its time.
+        std::fs::remove_dir(&file).unwrap();
+        std::fs::write(&file, serde_json::to_string(&account()).unwrap()).unwrap();
+        read_again_now(&store);
+        assert!(store.account().is_some());
+        assert!(store.inner.lock().unwrap().retry.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_forget_that_comes_when_the_file_has_just_become_readable_removes_it() {
+        // Held when the store opened, let go of since, and the timer is not due: forgetting reads the file itself. Without
+        // that read the file was taken for one that cannot be used, put aside "to be kept" and the key left in the
+        // folder, and Disconnect said it was gone.
+        let dir = data_dir("forget-after-release");
+        let file = dir.join("link").join("account.json");
+        std::fs::create_dir(&file).unwrap();
+        let store = load_store(dir.clone());
+        std::fs::remove_dir(&file).unwrap();
+        std::fs::write(&file, serde_json::to_string(&account()).unwrap()).unwrap();
+
+        let after = store.unlink();
+        assert!(!after.linked && after.link_error.is_none(), "{after:?}");
+        assert!(!file.exists(), "the file is gone, and does not link the desktop at the next start");
+        assert!(!dir.join("link").join("account.json.corrupt").exists(), "a link that could be read is forgotten, not kept");
+        assert!(load_store(dir.clone()).account().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forgetting_a_file_that_is_held_puts_it_aside_and_leaves_no_timer() {
+        // The file could not be read and is not read again after it was put aside: the timer that was for it goes, so
+        // that nothing reads a file that was forgotten and nothing is left running in a store that has nothing to wait for.
+        let dir = data_dir("forget-held");
+        let file = dir.join("link").join("account.json");
+        std::fs::create_dir(&file).unwrap();
+        let store = load_store(dir.clone());
+        assert!(store.inner.lock().unwrap().retry.is_some());
+
+        let after = store.unlink();
+        assert!(!after.linked && after.link_error.is_none(), "{after:?}");
+        assert!(dir.join("link").join("account.json.corrupt").exists(), "what could not be read is kept");
+        assert!(store.inner.lock().unwrap().retry.is_none(), "and no timer is left for a file that is not there");
+        std::fs::write(&file, serde_json::to_string(&account()).unwrap()).unwrap();
+        assert!(store.account().is_none(), "a file that appears after it was forgotten is not read as the link");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_held_file_is_read_again_however_many_lanes_ask_at_once() {
         // The lanes that read the account at the top of their loops (the command lane, the flow runner, the sealed flows, the
         // AI tunnel) have no pause before it, and the screen asks for the status as well. Eight threads in a tight loop meet
@@ -1736,6 +1882,10 @@ mod tests {
         assert_eq!(store.unlink().link_error.map(|e| e.kind), Some(LinkErrorKind::CopiesLeft));
         // As does the retry that only takes the copies.
         assert_eq!(store.remove_copies().link_error.map(|e| e.kind), Some(LinkErrorKind::CopiesLeft));
+        // A read of account.json that is forced (what a new link or a forget does first) finds no file, and that is not
+        // an answer to what was said of a copy: the error is not about account.json and is not read again.
+        store.reread(true);
+        assert_eq!(store.status().link_error.map(|e| e.kind), Some(LinkErrorKind::CopiesLeft));
 
         drop(held);
         let after = store.remove_copies();
