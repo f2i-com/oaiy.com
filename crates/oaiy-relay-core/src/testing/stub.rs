@@ -728,7 +728,7 @@ impl StubRelay {
         }
         let Some(keys) = doc.get("keys") else { return err(400, "invalid_request", "keys are required.") };
         let (Some(ed), Some(x)) = (keys.get_str("ed25519"), keys.get_str("x25519")) else { return err(400, "invalid_request", "keys are required.") };
-        let (Ok(ed), Ok(_x)) = (VerifyKey::from_b64u(ed), X25519Public::from_b64u(x)) else {
+        let (Ok(ed), Ok(_x)) = (VerifyKey::from_b64u_registrable(ed), X25519Public::from_b64u(x)) else {
             return err(422, "unprocessable", "A key of small order.");
         };
         st.enrol_keys[idx].used = true;

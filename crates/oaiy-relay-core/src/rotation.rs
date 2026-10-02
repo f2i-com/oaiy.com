@@ -54,7 +54,7 @@ pub fn verify(pinned: &VerifyKey, last_serial: u64, provider_now: i64, b: &str, 
     if new_members.len() != 3 {
         return Err(Error::Invalid("rotation: new"));
     }
-    let new_ed25519 = VerifyKey::from_b64u(new.get_str("ed25519").ok_or(Error::Invalid("rotation: new.ed25519"))?)?;
+    let new_ed25519 = VerifyKey::from_b64u_registrable(new.get_str("ed25519").ok_or(Error::Invalid("rotation: new.ed25519"))?)?;
     let new_x25519 = X25519Public::from_b64u(new.get_str("x25519").ok_or(Error::Invalid("rotation: new.x25519"))?)?;
     if new.get_str("thumbprint") != Some(new_ed25519.thumbprint().as_str()) {
         return Err(Error::Mismatch("rotation: new.thumbprint"));

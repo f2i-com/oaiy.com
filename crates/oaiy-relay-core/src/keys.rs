@@ -8,6 +8,15 @@
 //! **Keys of small order, and verification, are refused by `oaiy-crypto`** and are not repeated here: [`VerifyKey::from_bytes`] cannot be built from an Ed25519 key that
 //! is not in its canonical encoding or is of small order, every verification is strict (a malleated `S`, a small-order `R`), and [`X25519Public::from_bytes`] cannot be
 //! built from one of the fourteen encodings (seven values, each with and without bit 255) whose Diffie-Hellman result is all zero (vector A12).
+//!
+//! **Two questions about an Ed25519 key, and who answers each.** *Does a signature verify under it?* That is libsodium' verdict (the relay's and the shipped readers'), and
+//! [`VerifyKey::from_bytes`] and every `verify` give exactly it (the differential of `tools/run-differentials.ps1` shows no difference on 249 edge cases): a key with a component of
+//! small order beside its prime-order part can verify a signature in libsodium, and verifies it here. *May it be pinned, registered or paired with?* That is the relay's rule,
+//! `Crypto::isValidEd25519Public`: 32 bytes, not of small order, and in the prime-order subgroup (libsodium's `crypto_sign_ed25519_pk_to_curve25519` takes nothing else). A key
+//! that the relay would refuse must never be pinned by a client that then pairs with it and finds the relay refusing it later, so every key the crate reads out of a protocol
+//! document or is given to register is read with [`VerifyKey::from_bytes_registrable`] / [`VerifyKey::from_b64u_registrable`], which is the relay's rule **and** the canonical
+//! encoding (the relay also takes a second, non-canonical spelling of a prime-order key, which gives the same point another thumbprint and which libsodium will not verify with:
+//! the crate refuses it, which is stricter and is on purpose; see the README of the crate).
 
 use oaiy_crypto::ed25519::{KeyRole, Signature, SigningKey, VerifyingKey};
 use oaiy_crypto::kdf::sha256;
@@ -95,6 +104,12 @@ pub fn signature_from_b64u(text: &str) -> Result<Signature> {
     Ok(Signature::from_bytes(&bytes))
 }
 
+/// Whether the 32 bytes are a point of the prime-order subgroup of the curve (it decompresses, and has no component of small order): libsodium's `ge25519_is_on_main_subgroup`, which
+/// the relay's `isValidEd25519Public` reaches through `crypto_sign_ed25519_pk_to_curve25519`. Public data: nothing here is secret.
+fn in_prime_order_subgroup(bytes: &[u8; 32]) -> bool {
+    curve25519_dalek::edwards::CompressedEdwardsY(*bytes).decompress().is_some_and(|p| p.is_torsion_free())
+}
+
 /// An Ed25519 public key that is in its canonical encoding and is not of small order: the only kind this crate holds. Every verification with it is strict.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct VerifyKey(VerifyingKey);
@@ -108,6 +123,26 @@ impl VerifyKey {
     /// From the 43 characters of canonical base64url.
     pub fn from_b64u(text: &str) -> Result<VerifyKey> {
         VerifyKey::from_bytes(&b64::decode_exact::<32>(text)?)
+    }
+
+    /// From 32 bytes, for a key that is to be **pinned, registered or paired with**: [`VerifyKey::from_bytes`] and also in the prime-order subgroup, as the relay's
+    /// `Crypto::isValidEd25519Public` requires (`Error::Invalid` for a key with a component of small order beside its prime-order part). Verification with it is the same.
+    pub fn from_bytes_registrable(bytes: &[u8; 32]) -> Result<VerifyKey> {
+        let key = VerifyKey::from_bytes(bytes)?;
+        if !in_prime_order_subgroup(bytes) {
+            return Err(Error::Invalid("ed25519 key: not in the prime-order subgroup (the relay refuses it)"));
+        }
+        Ok(key)
+    }
+
+    /// [`VerifyKey::from_bytes_registrable`] from the 43 characters of canonical base64url.
+    pub fn from_b64u_registrable(text: &str) -> Result<VerifyKey> {
+        VerifyKey::from_bytes_registrable(&b64::decode_exact::<32>(text)?)
+    }
+
+    /// True when this key is one the relay would register (see [`VerifyKey::from_bytes_registrable`]); a key made by [`VerifyKey::from_bytes`] may not be.
+    pub fn is_registrable(&self) -> bool {
+        in_prime_order_subgroup(&self.0.to_bytes())
     }
 
     /// The 32 bytes.

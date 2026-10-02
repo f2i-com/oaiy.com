@@ -29,6 +29,21 @@ pub fn relay_root() -> PathBuf {
     }
 }
 
+/// The PHP binary for a test that needs the relay's own PHP code (not a running relay): `None`, **loudly** (a banner that says SKIPPED), where there is none, and a panic where
+/// `OAIY_REQUIRE_PHP=1` says a lane must have it.
+pub fn php_or_skip(test: &str) -> Option<PathBuf> {
+    match find_php() {
+        Ok(p) => Some(p),
+        Err(why) => {
+            if std::env::var("OAIY_REQUIRE_PHP").is_ok_and(|v| !v.is_empty() && v != "0") {
+                panic!("OAIY_REQUIRE_PHP is set and {test} cannot run: {why}");
+            }
+            eprintln!("\n=====================================================================\nSKIPPED: {test} did NOT run: {why}\n(OAIY_REQUIRE_PHP=1 makes this a failure)\n=====================================================================");
+            None
+        }
+    }
+}
+
 /// The PHP binary, or why there is none.
 pub fn find_php() -> Result<PathBuf, String> {
     let mut candidates: Vec<PathBuf> = Vec::new();

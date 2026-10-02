@@ -112,7 +112,7 @@ impl Info {
         if rk.get_str("algorithm") != Some("ed25519") {
             return Err(Error::Invalid("info: relayKey.algorithm"));
         }
-        let relay_key = VerifyKey::from_b64u(rk.get_str("publicKey").ok_or(Error::Invalid("info: relayKey.publicKey"))?)?;
+        let relay_key = VerifyKey::from_b64u_registrable(rk.get_str("publicKey").ok_or(Error::Invalid("info: relayKey.publicKey"))?)?;
         let stated = rk.get_str("thumbprint").ok_or(Error::Invalid("info: relayKey.thumbprint"))?;
         if !ct_eq(stated.as_bytes(), relay_key.thumbprint().as_bytes()) {
             return Err(Error::Mismatch("info: relayKey.thumbprint is not the thumbprint of relayKey.publicKey"));

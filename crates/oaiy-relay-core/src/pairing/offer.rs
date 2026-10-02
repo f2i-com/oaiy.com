@@ -89,7 +89,7 @@ pub(crate) fn read_endpoint_key(v: &Json, what: &'static str) -> Result<VerifyKe
     if members.len() != 3 || v.get_str("algorithm") != Some("ed25519") {
         return Err(Error::Invalid(what));
     }
-    let key = VerifyKey::from_b64u(v.get_str("publicKey").ok_or(Error::Invalid(what))?)?;
+    let key = VerifyKey::from_b64u_registrable(v.get_str("publicKey").ok_or(Error::Invalid(what))?)?;
     if v.get_str("thumbprint") != Some(key.thumbprint().as_str()) {
         return Err(Error::Mismatch(what));
     }
@@ -181,7 +181,7 @@ impl Offer {
             return Err(Error::Invalid("offer: hostIdentity"));
         }
         let host_ed_bytes = key32(host, "ed25519", "offer: hostIdentity.ed25519")?;
-        let host_ed25519 = VerifyKey::from_bytes(&host_ed_bytes)?;
+        let host_ed25519 = VerifyKey::from_bytes_registrable(&host_ed_bytes)?;
         if host.get_str("thumbprint") != Some(thumbprint_of(&host_ed_bytes).as_str()) {
             return Err(Error::Mismatch("offer: hostIdentity.thumbprint"));
         }

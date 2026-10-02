@@ -1848,6 +1848,7 @@ dependencies = [
 name = "oaiy-relay-core"
 version = "0.1.0"
 dependencies = [
+ "curve25519-dalek",
  "oaiy-crypto",
  "oaiy-keystore",
  "oaiy-relay-core",

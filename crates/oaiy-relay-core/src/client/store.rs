@@ -228,9 +228,9 @@ impl RelayProfile {
                     desktop_connection_id: s("desktopConnectionId")
                         .and_then(|v| if ids::is_device_id(v) { Ok(v.to_string()) } else { Err(bad()) })?,
                     desktop_name: s("desktopName")?.to_string(),
-                    desktop_endpoint: VerifyKey::from_b64u(s("desktopEndpoint")?)?,
+                    desktop_endpoint: VerifyKey::from_b64u_registrable(s("desktopEndpoint")?)?,
                     desktop_x25519: X25519Public::from_b64u(s("desktopX25519")?)?,
-                    host_ed25519: VerifyKey::from_b64u(s("hostEd25519")?)?,
+                    host_ed25519: VerifyKey::from_b64u_registrable(s("hostEd25519")?)?,
                     host_x25519: X25519Public::from_b64u(s("hostX25519")?)?,
                 })
             }

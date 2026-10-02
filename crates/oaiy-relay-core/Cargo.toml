@@ -11,6 +11,9 @@ publish = false
 # no dependency of their own (`loopback-http` and `testing` are std-only); `keystore` adds `oaiy-keystore`. No unsafe code.
 [dependencies]
 oaiy-crypto = { path = "../oaiy-crypto" }
+# One question `oaiy-crypto` does not answer: whether a public key is in the prime-order subgroup (the relay refuses a key that is not: `Crypto::isValidEd25519Public`). The same dalek
+# crate and version that `oaiy-crypto` already builds on (it is in the lock file), with no feature: only the point and `is_torsion_free`. Meant to move into `oaiy-crypto`.
+curve25519-dalek = { version = "4.1.3", default-features = false }
 zeroize = "1.8.2"
 oaiy-keystore = { path = "../oaiy-keystore", optional = true }
 

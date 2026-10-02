@@ -500,6 +500,10 @@ impl RelayClient {
         if key.relay != self.url {
             return Err(ClientError::Request(Error::Mismatch("the enrolment key is for another relay")));
         }
+        // The relay refuses a device key that is not in the prime-order subgroup (`Crypto::isValidEd25519Public`): nothing is sent for one.
+        if !ed25519.is_registrable() {
+            return Err(ClientError::Request(Error::Invalid("the device key is not one the relay registers (not in the prime-order subgroup)")));
+        }
         self.pin(&key.relay_thumbprint)?;
         let proved = match self.prove(cancel) {
             Ok(p) => p,

@@ -175,6 +175,10 @@ impl PluginRequest {
         if !ids::is_app_id(&self.app_id) || !ids::is_app_id(&self.plugin_id) || self.approved_peers.is_empty() || self.revision == 0 {
             return Err(Error::Invalid("plugin admission request"));
         }
+        // The relay refuses an endpoint key that is not in the prime-order subgroup (`AdmissionApi`, `Crypto::isValidEd25519Public`).
+        if !self.endpoint.is_registrable() {
+            return Err(Error::Invalid("plugin admission request: the endpoint key is not one the relay registers"));
+        }
         crate::roster::check(&own, self.revision, &self.approved_peers)?;
         let mut m = vec![("appId", Json::str(self.app_id.clone())), ("pluginId", Json::str(self.plugin_id.clone()))];
         if let Some(n) = &self.display_name {
