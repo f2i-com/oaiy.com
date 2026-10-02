@@ -42,8 +42,10 @@ MUTATIONS = [
      "pub const NETWORK_QUIET: Duration = Duration::from_millis(100);", "pub const NETWORK_QUIET: Duration = Duration::from_millis(0);", "own"),
     ("H14", "P1", "the replacement poll does not know that it replaces one (the flag is lost to the proof a network change calls for)", C + "client/poll_loop.rs",
      "replace_pending = true;\n                if !self.settle() {", "if !self.settle() {", "own"),
-    ("H15", "poll loop", "a poll that cannot be made is reported as a cancel", C + "client/poll_loop.rs",
-     "Err(e) => return LoopEnd::Failed(e.to_string()),", "Err(_) => return LoopEnd::Cancelled,", "own"),
+    # H15 (the poll loop's `Err(e) => return LoopEnd::Failed(e.to_string())` made `Err(_) => return LoopEnd::Cancelled`) is left out: it is an equivalent mutant. `RelayClient::poll` can
+    # fail with nothing but the two errors of its gate (`NotProved`, `Suspect`), which the loop handles in the arms above this one, and with `Request(Invalid("epoch"))`, which the loop
+    # makes impossible by dropping an epoch that is not the relay's spelling before its first poll (H08) and by only ever taking a later one from an answer that passed `valid_200`.
+    # The arm stays so that a future error of that call is reported as a failure and never mistaken for a cancel; no input reaches it today.
     # ---------------------------------------------------------------------------------------------------------------- the file store
     ("H16", "poll store", "a torn last line is not cut off before the next append", C + "client/store.rs",
      "if last[0] == b'\\n' {", "if true {", "own"),

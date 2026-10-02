@@ -270,3 +270,37 @@ fn a_request_a_client_would_send_is_checked_before_it_is_sent() {
     twice.transports = Some(vec![]);
     assert!(twice.to_body().is_err());
 }
+
+#[test]
+fn a_phones_admission_is_compared_with_the_grants_the_desktop_signed_and_the_desktop_the_phone_pinned() {
+    // `MobileAdmission::check_against`, on every recorded phone admission: the scopes are exactly the grants of the approval receipt (as a set), and the expected peer is the desktop
+    // that was pinned from the offer. More, fewer, a repeat, another peer and a thumbprint that is no thumbprint are each refused.
+    let mut checked = 0;
+    for case in cases().into_iter().filter(|c| c.s("role") != "plugin") {
+        let req = mobile_request(case.at("request.body"));
+        let expect = MobileExpect { app_id: &req.app_id, device_id: &req.device_id, holder_thumbprint: &req.holder_thumbprint };
+        let adm = MobileAdmission::parse(case.at("response.body").to_compact().as_bytes(), &expect, NOW).unwrap();
+        let (grants, peer) = (adm.scopes.clone(), adm.expected_peer_thumbprint.clone());
+        adm.check_against(&grants, &peer).unwrap_or_else(|e| panic!("{}: {e}", case.s("name")));
+        let reversed: Vec<String> = grants.iter().rev().cloned().collect();
+        adm.check_against(&reversed, &peer).expect("a set, not a list");
+        let mut more = grants.clone();
+        more.push("assistance_respond".to_string());
+        let fewer = grants[1..].to_vec();
+        let mut repeated = grants.clone();
+        repeated.push(grants[0].clone());
+        for (what, g) in [("more grants than the scopes", &more), ("fewer", &fewer), ("a repeated grant", &repeated), ("none", &Vec::new())] {
+            if what == "more grants than the scopes" && grants.iter().any(|x| x == "assistance_respond") {
+                continue; // the recorded scopes already hold it: nothing is added
+            }
+            assert!(adm.check_against(g, &peer).is_err(), "{}: {what}", case.s("name"));
+        }
+        let other_peer = "Zq7e1o0c2mS4N5t-XvB9aLkJ3dYhPfRwU6iGg8TnQpA";
+        assert_ne!(other_peer, peer);
+        assert!(adm.check_against(&grants, other_peer).is_err(), "{}: another desktop", case.s("name"));
+        assert!(adm.check_against(&grants, "not a thumbprint").is_err());
+        assert!(adm.check_against(&grants, "").is_err());
+        checked += 1;
+    }
+    assert_eq!(checked, 5);
+}

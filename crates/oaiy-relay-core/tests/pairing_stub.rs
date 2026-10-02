@@ -15,7 +15,7 @@ use oaiy_relay_core::b64;
 use oaiy_relay_core::client::*;
 use oaiy_relay_core::json::{self, Json};
 use oaiy_relay_core::keys::{SignDomain, Signer};
-use oaiy_relay_core::pairing::math::{self, PairingSecret};
+use oaiy_relay_core::pairing::math::{self, PairingKey, PairingSecret};
 use oaiy_relay_core::pairing::phone::{store_paired, Outcome};
 use oaiy_relay_core::pairing::{Claims, PairEvent, PairingError, PairingInput, PairingTarget, PhonePairing, Response, SasOutcome};
 use oaiy_relay_core::testing::stub::{Fault, StubConfig};
@@ -636,4 +636,56 @@ fn a_phone_that_waits_for_the_owner_holds_one_pairing_read_at_a_time_as_the_rela
     assert!(with_one >= 30, "the phone's read was held in {with_one} of the samples");
     assert!(matches!(result.unwrap(), Outcome::Paired(_)));
     assert_eq!(held_requests(&w.env.stub, &w.token), (0, 0, 0), "nothing is held once the phone has its answer");
+}
+
+#[test]
+fn a_pairing_key_that_expired_before_the_offer_did_is_refused_with_thirty_seconds_of_slack() {
+    // The key carries its own expiry (`x`), which can be earlier than the offer's (a QR that was photographed and kept): it is judged by the phone against the relay's time, with the
+    // same 30 seconds of slack as the offer's window, whatever the offer's own window says.
+    let mut w = world(quick());
+    let offer = w.new_offer();
+    let key = PairingKey::parse(&offer.pairing_uri).unwrap();
+    w.env.clock.advance(Duration::from_secs(100));
+    let now = w.env.client.relay_now_or_local();
+    for (x_offset, accepted) in [(-29i64, true), (-30, false), (-200, false), (30, true)] {
+        let uri = PairingKey::to_uri(&key.relay, key.relay_thumbprint.as_deref().unwrap(), &key.secret, (now + x_offset) as u64);
+        let mut phone = w.phone(PairingInput::Key(&uri), 70);
+        let result = phone.fetch_offer(&cancel());
+        assert_eq!(result.is_ok(), accepted, "a key that expires {x_offset} s from now: {:?}", result.as_ref().err());
+        if !accepted {
+            assert!(matches!(result.unwrap_err(), PairingError::Protocol(oaiy_relay_core::Error::OutsideWindow(_))));
+        }
+    }
+}
+
+#[test]
+fn wrong_codes_typed_after_the_right_one_never_deny_a_pairing_whose_approval_is_on_its_way() {
+    // The right code was typed and the decision sent, but its answer was lost: the relay may have approved already, and a denial after that is a conflict. Wrong entries from now on
+    // cost nothing and never deny or burn; the right code again approves with the same receipt.
+    let mut w = world(StubConfig { receipt_includes_grants: true, ..quick() });
+    let offer = w.new_offer();
+    let mut phone = w.phone(PairingInput::Key(&offer.pairing_uri), 71);
+    phone.fetch_offer(&cancel()).unwrap();
+    let sas = phone.respond(&cancel()).unwrap();
+    assert!(matches!(w.deliver()[0], PairEvent::AwaitingSas { .. }));
+    w.env.stub.fail_next_on("/v1/pair/", 1, Fault::Drop);
+    assert!(
+        w.desktop.confirm_sas(&w.env.client, &w.token, &offer.pid, &sas.display(), &grants(), &cancel()).is_err(),
+        "the decision's answer was lost"
+    );
+    w.env.stub.clear_log();
+    let wrong = math::sas(&[1u8; 32], &[2u8; 32], &[3u8; 32], &[4u8; 16]).unwrap().display();
+    assert_ne!(wrong, sas.display());
+    for _ in 0..4 {
+        let outcome = w.desktop.confirm_sas(&w.env.client, &w.token, &offer.pid, &wrong, &grants(), &cancel()).unwrap();
+        assert_eq!(outcome, SasOutcome::Wrong { attempts_left: 3 }, "no attempt is used up once the approval has been sent");
+    }
+    assert!(
+        w.env.stub.log().iter().all(|r| !r.target.ends_with("/burn") && !r.body.contains("\"approve\":false")),
+        "nothing was denied or burned: {:?}",
+        w.env.stub.log()
+    );
+    let outcome = w.desktop.confirm_sas(&w.env.client, &w.token, &offer.pid, &sas.display(), &grants(), &cancel()).unwrap();
+    assert!(matches!(outcome, SasOutcome::Approved { .. }), "{outcome:?}");
+    assert!(matches!(phone.wait_outcome(None, &cancel()).unwrap(), Outcome::Paired(_)));
 }

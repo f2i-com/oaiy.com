@@ -17,7 +17,7 @@ use oaiy_relay_core::pairing::desktop::{MAX_CONSUMED, MAX_PENDING};
 use oaiy_relay_core::pairing::math::{self, PairingSecret};
 use oaiy_relay_core::pairing::{PairEvent, PairingError};
 use oaiy_relay_core::poll::Outcome;
-use oaiy_relay_core::testing::stub::Fault;
+use oaiy_relay_core::testing::stub::{Fault, StubConfig};
 use oaiy_relay_core::testing::SeededRng;
 use oaiy_relay_core::url::RelayUrl;
 
@@ -98,6 +98,83 @@ fn the_headers_of_an_answer_reach_the_host_in_lower_case_whatever_the_adapter_re
     let names: Vec<&str> = reply.headers.iter().map(|(k, _)| k.as_str()).collect();
     assert_eq!(names, ["retry-after", "x-oaiy-time", "content-type"], "lower case, in the order they came");
     assert!(reply.headers.iter().any(|(k, v)| k == "retry-after" && v == "7"));
+}
+
+/// An adapter whose reads of a rendezvous with a wait take 12 seconds of the phone's clock and answer `answered` with a hold that was granted (and, if asked, superseded), so that the
+/// phone's pacing can be told apart by what the relay says and not only by how long the request took. Everything else goes to the stub.
+struct HeldPairReads {
+    stub: oaiy_relay_core::testing::stub::StubRelay,
+    clock: Arc<oaiy_relay_core::testing::FakeClock>,
+    answered: oaiy_relay_core::pairing::NewOffer,
+    superseded: bool,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl HttpClient for HeldPairReads {
+    fn send(&self, req: &HttpRequest) -> Result<HttpResponse, TransportError> {
+        if req.method.as_str() == "GET" && req.url.contains("/v1/pair/") && req.url.contains("wait=") {
+            self.clock.advance(Duration::from_secs(12));
+            let n = self.reads.fetch_add(1, Ordering::SeqCst);
+            let now = self.clock.unix_now();
+            let body = if n < 3 {
+                let mut hold = vec![("granted", oaiy_relay_core::json::Json::Bool(true))];
+                if self.superseded {
+                    hold.push(("superseded", oaiy_relay_core::json::Json::Bool(true)));
+                }
+                oaiy_relay_core::json::Json::obj([
+                    ("v", oaiy_relay_core::json::Json::int(1)),
+                    ("state", oaiy_relay_core::json::Json::str("answered")),
+                    ("offer", oaiy_relay_core::json::Json::str(self.answered.offer.text.clone())),
+                    ("mac", oaiy_relay_core::json::Json::str(self.answered.mac.clone())),
+                    ("exp", oaiy_relay_core::json::Json::int(self.answered.offer.expires_at)),
+                    ("time", oaiy_relay_core::json::Json::int(now)),
+                    ("hold", oaiy_relay_core::json::Json::Obj(hold.into_iter().map(|(k, v)| (k.to_string(), v)).collect())),
+                ])
+                .to_compact()
+            } else {
+                format!("{{\"v\":1,\"state\":\"denied\",\"time\":{now}}}")
+            };
+            return Ok(oaiy_relay_core::testing::json_response(200, &[], &body, now));
+        }
+        self.stub.handle(req)
+    }
+}
+
+#[test]
+fn a_read_the_relay_says_it_held_is_believed_only_when_it_was_not_superseded_and_took_a_hold_s_time() {
+    // The phone asks again at once only for a read that the relay says it held (`hold.granted`), that was not `superseded` (another read of the rendezvous took its place: it did not
+    // wait for the owner) and that took as long as a hold takes by the phone's own clock (here 12 s of the 20 asked for). A superseded read is paced at 10 s like any other answer
+    // that leaves the rendezvous as it was.
+    for (superseded, pauses) in [(false, 0usize), (true, 3)] {
+        let mut w = world(StubConfig { wait_default: 20, wait_max: 20, receipt_includes_grants: true, ..Default::default() });
+        let offer = w.new_offer();
+        let target = oaiy_relay_core::pairing::PairingTarget::from_input(oaiy_relay_core::pairing::PairingInput::Key(&offer.pairing_uri)).unwrap();
+        let adapter = Arc::new(HeldPairReads {
+            stub: w.env.stub.clone(),
+            clock: w.env.clock.clone(),
+            answered: offer,
+            superseded,
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let client = Arc::new(RelayClient::new(
+            target.relay.clone(),
+            None,
+            adapter,
+            w.env.clock.clone(),
+            Box::new(SeededRng::new(5)),
+            ClientConfig::default(),
+        ));
+        let mut phone = oaiy_relay_core::pairing::PhonePairing::new(client, target, common::pair::phone_identity(5)).unwrap();
+        phone.fetch_offer(&Cancel::new()).unwrap();
+        phone.respond(&Cancel::new()).unwrap();
+        w.env.clock.clear_sleeps();
+        assert!(matches!(phone.wait_outcome(None, &Cancel::new()).unwrap(), oaiy_relay_core::pairing::phone::Outcome::Denied));
+        let sleeps = w.env.clock.sleeps();
+        assert_eq!(sleeps.len(), pauses, "superseded {superseded}: {sleeps:?}");
+        for s in &sleeps {
+            assert!(within_jitter(s, 10.0), "a pause of ten seconds with jitter: {s:?}");
+        }
+    }
 }
 
 /// Every spelling a secret can be printed in: the raw bytes as hex, as decimal numbers, as base64url, and as the 6-bit digits are not printed either.

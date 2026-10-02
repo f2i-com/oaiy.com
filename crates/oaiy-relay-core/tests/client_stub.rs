@@ -284,6 +284,22 @@ fn every_call_that_carries_a_token_is_refused_by_a_client_with_no_fresh_proof_an
     nothing_sent(&impostor, before, "suspect", "any call");
 }
 #[test]
+fn an_epoch_that_is_not_the_relays_spelling_never_reaches_a_request_line() {
+    // The epoch goes into the query of a poll as it is: a store a host wrote may hold anything, and `&since=99`, a space, a line break or a path would change the request.
+    let e = env(quick());
+    let (token, _) = e.enrol_desktop();
+    e.stub.clear_log();
+    for bad in ["x&since=99", "a b", "", "eVp54C0-EJ", "eVp54C0-EJY1", "eVp54C0\r\nX: y", "../../v1/admin/status", "eVp54C0+EJY"] {
+        let request = PollRequest { since: 0, epoch: Some(bad.to_string()), wait_s: 0, limit: 32 };
+        let result = e.client.poll(&token, &request, &Cancel::new());
+        assert!(matches!(result, Err(ClientError::Request(_))), "{bad:?}: {result:?}");
+    }
+    assert!(e.stub.log().is_empty(), "nothing was sent for any of them: {:?}", e.stub.log());
+    let good = PollRequest { since: 0, epoch: Some(e.stub.epoch()), wait_s: 0, limit: 32 };
+    assert_eq!(e.client.poll(&token, &good, &Cancel::new()).unwrap().status, Some(200), "the relay's own spelling goes through");
+}
+
+#[test]
 fn a_replayed_info_with_a_new_nonce_does_not_prove_the_relay() {
     // A man in the middle who recorded the relay's answer to one nonce and serves it for every later one: the body and the static signature are good, the proof is not.
     let e = env(quick());
