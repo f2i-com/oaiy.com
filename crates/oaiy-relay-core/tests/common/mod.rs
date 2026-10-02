@@ -2,9 +2,13 @@
 
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use oaiy_relay_core::json::{self, Json};
+
+pub mod poll_cases;
+#[allow(unused_imports)]
+pub use poll_cases::{counters, float, run_poll_cases};
 
 /// `platform/protocol/relay/v1` of this repository: the contract, read in place so that a change to it shows up as a failing test here.
 pub fn protocol_dir() -> PathBuf {
@@ -20,6 +24,12 @@ pub fn read_text(relative: &str) -> String {
 /// A JSON file of the protocol package, parsed by this crate's own parser (which refuses duplicate members, so a fixture that has one fails to load).
 pub fn load(relative: &str) -> Json {
     json::parse(read_text(relative).as_bytes()).unwrap_or_else(|e| panic!("{relative}: {e}"))
+}
+
+/// Any JSON file, parsed by this crate's parser.
+pub fn load_path(path: &Path) -> Json {
+    json::parse(&std::fs::read(path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display())))
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
 /// Walking a document by a dotted path (`A3.expected.pid`); a number in the path indexes an array.

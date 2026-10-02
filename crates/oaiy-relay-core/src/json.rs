@@ -428,6 +428,15 @@ impl Json {
         self.as_u64().filter(|n| *n <= MAX_SAFE_INT)
     }
 
+    /// Any number as an `f64` (an integer too): for the few places a fraction is read (`limits.bulkShare`, a figure in a table). Never for anything signed or compared.
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Json::Num(Number::Int(n)) => Some(*n as f64),
+            Json::Num(Number::Big(t) | Number::Other(t)) => t.parse().ok(),
+            _ => None,
+        }
+    }
+
     /// A boolean.
     pub fn as_bool(&self) -> Option<bool> {
         match self {

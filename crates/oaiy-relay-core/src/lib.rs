@@ -29,6 +29,7 @@ pub mod info;
 pub mod json;
 pub mod keys;
 pub mod pairing;
+pub mod poll;
 pub mod ring;
 pub mod roster;
 pub mod rotation;
