@@ -1786,6 +1786,10 @@ for f in ("admission.json", "challenge.json", "frames.json", "stream.json", "err
 # A relay with a plain-http public_url is outside the schemas by design (README section 1, Interpretation 61): the relay builds http:// and ws://
 # URLs for a loopback host (test builds), the admission schemas require wss:// and https://, and everything recorded here is a deployed relay's.
 readme_all = (V1 / "README.md").read_text(encoding="utf-8")
+ok("README gives the phone's reads of a rendezvous their budgets and the client's rule: 30 a minute per address, 60 counted per rendezvous (one every 10 seconds on average), 10 reads of an outcome a minute, a pause of 0 only after a granted hold that was not superseded and at least 10 seconds with jitter otherwise, and what a small wait.max does",
+   all(s in readme_all for s in ("**30 requests per 60 seconds per client address**", "**60 counted `GET`s per rendezvous while it is `open` or `answered`**", "**one every 10 seconds on average**",
+                                 "**10 reads of an outcome (`approved`, `denied`) per minute per address and pid**", "pauses **0 only after an answer whose `hold` is `{\"granted\":true}` without `superseded`**",
+                                 "it pauses **at least 10 seconds, with the jitter of P6**", "with `wait.max` of 2, the configuration of the Android emulator test", "62. **The phone's reads of a rendezvous are budgeted three ways")))
 ok("README says a plain-http relay is outside the schemas by design: loopback only, test builds, and no schema is loosened for it",
    "**A relay with a plain-http base is outside the schemas by design**" in readme_all and "61. **A plain-http relay is outside the schemas, by design.**" in readme_all)
 for adm in ("admission-plugin-response", "admission-mobile-response"):

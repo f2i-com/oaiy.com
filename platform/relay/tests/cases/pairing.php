@@ -1616,6 +1616,27 @@ test('4.10.6 a rendezvous answers 60 GETs in its life; the 61st is 429 rate_limi
     eq(202, $c->answer(null, ['REMOTE_ADDR' => '198.51.100.98'])['status'], 'the budget is for GETs: the answer still goes through');
 });
 
+test('4.10.6 the README states the budgets of a phone\'s reads as the relay enforces them (Interpretation 62): 30 requests per 60 seconds per address, shared with the response post, 60 counted reads per rendezvous, 10 reads of an outcome a minute', function () {
+    $readme = (string)file_get_contents(dirname(__DIR__, 3) . '/protocol/relay/v1/README.md');
+    contains('**30 requests per 60 seconds per client address**', $readme);
+    contains('**' . Pairing::GETS_MAX . ' counted `GET`s per rendezvous while it is `open` or `answered`**', $readme);
+    contains('**' . Pairing::OUTCOME_READS_PER_MINUTE . ' reads of an outcome (`approved`, `denied`) per minute per address and pid**', $readme);
+    contains('(the default `ttl`) that is **one every 10 seconds on average**', $readme);
+    eq(10, intdiv(Pairing::TTL_DEFAULT, Pairing::GETS_MAX), 'ten seconds is the default ttl over the reads');
+    // The address bucket: 30 in a minute from one address, the 31st is refused, and the response post of that address is refused with it.
+    [$r, $d, $c] = pair_setup();
+    $c->open();
+    $a = ['REMOTE_ADDR' => '203.0.113.5'];
+    for ($i = 1; $i <= 30; $i++) {
+        eq(200, $c->get([], $a)['status'], "read $i of the address");
+    }
+    $res = $c->get([], $a);
+    eq(429, $res['status'], 'the 31st read of one address in a minute');
+    ok((int)$res['headers']['retry-after'] >= 1 && (int)$res['headers']['retry-after'] <= 60);
+    eq(429, $c->answer(null, $a)['status'], 'the response post of the same address is spent with it');
+    eq(30, (int)pair_row($r, $c->pid)['gets'], 'the refused read was not counted against the rendezvous');
+});
+
 // A note on what this test cannot tell (the review's mutant D20, "the counting UPDATE counts terminal states again", survives it, and is
 // equivalent): the UPDATE that counts a GET also says AND state IN ('open', 'answered'), a second guard for a rendezvous that reaches an
 // outcome between the read of its row and the update. A request whose read already shows an outcome never reaches that UPDATE (it
