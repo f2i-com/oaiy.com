@@ -187,9 +187,9 @@ Pipeline 'poll' @('python') {
     $d = Join-Path $work 'poll'
     New-Item -ItemType Directory -Path $d | Out-Null
     # The generator's own implementation of the README is strict by default (a calendar date that does not exist is no date, a seq above 2^53 - 1 counts, -0 is 0). The flags make
-    # it follow the three readings the README now fixes and the repository's two readers share: dates are added as they stand (timegm), a seq above 2^53 - 1 is dropped, -0 is not an integer
-    # (Interpretation 23), and a failure that the client itself caused (invalid_request, storage_failure) does not take the pause the relay asked for.
-    $env:RV_FLAGS = 'lenient_date,seq_cap,no_d_on_own,neg_zero_not_int'
+    # it follow the readings the README fixes and the repository's two readers share: a seq above 2^53 - 1 is dropped, -0 is not an integer (P2), and a failure that the client itself
+    # caused (invalid_request, storage_failure) does not take the pause the relay asked for. A date that does not exist is no date in both (P6): no flag.
+    $env:RV_FLAGS = 'seq_cap,no_d_on_own,neg_zero_not_int'
     try { $null = Run $py @((Join-Path $wt 'rv\poll\gen_poll.py'), "$PollCases", '1', $d) } finally { $env:RV_FLAGS = $null }
     Driver 'rv_poll_diff' @('rv_poll_differential') @{ RV_POLL_IN = (Join-Path $d 'cases.jsonl'); RV_POLL_OUT = (Join-Path $d 'crate.jsonl') }
     $report = Run $py @((Join-Path $wt 'rv\poll\compare_poll.py'), $d)

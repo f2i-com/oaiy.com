@@ -351,9 +351,8 @@ fn days_to_month_start(year: i64, month: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-/// P6: an IMF-fixdate (RFC 9110: `Sun, 06 Nov 1994 08:49:37 GMT`) as Unix seconds. Nothing else is a date: no other format, no zone but `GMT`, no trailing text. The weekday is
-/// not checked against the date, and a day, hour, minute or second that is past its range is added as it stands (`calendar.timegm` does the same), as the two readers of the
-/// table do.
+/// P6: an IMF-fixdate (RFC 9110: `Sun, 06 Nov 1994 08:49:37 GMT`) as Unix seconds, **when it is a real date and time**: the year 0001 to 9999, the day within its month, hour 00 to 23,
+/// minute 00 to 59, second 00 to 60. Nothing else is a date: no other format, no zone but `GMT`, no trailing text, no 32 November. The weekday is not checked against the date.
 pub fn parse_http_date(text: &str) -> Option<i64> {
     let t = text.trim_matches(|c| c == ' ' || c == '\t');
     let b = t.as_bytes();
@@ -385,6 +384,17 @@ pub fn parse_http_date(text: &str) -> Option<i64> {
     let month = MONTHS.iter().position(|m| *m == &t[8..11])? as i64 + 1;
     let year = num(&t[12..16])?;
     let (hh, mm, ss) = (num(&t[17..19])?, num(&t[20..22])?, num(&t[23..25])?);
+    // A real date and time (P6): the year 0001 to 9999, the day within its month (29 February only in a leap year), hour 00 to 23, minute 00 to 59, second 00 to 60 (a leap second).
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let days_in_month = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if !(1..=9999).contains(&year) || !(1..=days_in_month).contains(&day) || hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
     Some((days_to_month_start(year, month) + day - 1) * 86_400 + hh * 3600 + mm * 60 + ss)
 }
 

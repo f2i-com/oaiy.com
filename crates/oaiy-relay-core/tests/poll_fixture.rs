@@ -56,7 +56,7 @@ fn the_tables_own_digests_say_no_case_is_missing_relabelled_or_moved() {
     let doc = load("fixtures/poll-client/poll-client.json");
     let cases = doc.at("cases").as_array().unwrap();
     assert_eq!(doc.n("caseCount") as usize, cases.len());
-    assert_eq!(cases.len(), 135, "a case went missing or was added: update this number with the table");
+    assert_eq!(cases.len(), 162, "a case went missing or was added: update this number with the table");
     let ids: Vec<&str> = cases.iter().map(|c| c.s("id")).collect();
     let unique: BTreeSet<&str> = ids.iter().copied().collect();
     assert_eq!(unique.len(), ids.len(), "ids are unique");
@@ -74,7 +74,7 @@ fn the_tables_own_digests_say_no_case_is_missing_relabelled_or_moved() {
 #[test]
 fn every_case_of_the_table() {
     let doc = load("fixtures/poll-client/poll-client.json");
-    assert_eq!(run_poll_cases(&doc), 135);
+    assert_eq!(run_poll_cases(&doc), 162);
 }
 
 #[test]

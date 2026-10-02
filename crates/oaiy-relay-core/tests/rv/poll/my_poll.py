@@ -39,7 +39,7 @@ def parse_imf(s):
     _, d, mon, y, hh, mm, ss = m.groups()
     d, y, hh, mm, ss = int(d), int(y), int(hh), int(mm), int(ss)
     mon = MONTHS[mon]
-    if not FLAGS["lenient_date"] and (hh > 23 or mm > 59 or ss > 60):
+    if not FLAGS["lenient_date"] and (y < 1 or hh > 23 or mm > 59 or ss > 60):   # P6: the year is 0001 to 9999
         return None
     leap = (y % 4 == 0 and y % 100 != 0) or y % 400 == 0
     mdays = [31, 29 if leap else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][mon - 1]
