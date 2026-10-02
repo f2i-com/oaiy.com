@@ -8,6 +8,7 @@ use oaiy_relay_core::json::{self, Json};
 
 pub mod env;
 pub mod pair;
+pub mod php;
 pub mod poll_cases;
 #[allow(unused_imports)]
 pub use poll_cases::{counters, float, run_poll_cases};

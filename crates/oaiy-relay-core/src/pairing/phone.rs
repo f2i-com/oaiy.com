@@ -73,7 +73,9 @@ impl PairingTarget {
             }
             PairingInput::Typed { code, host } => {
                 let secret = math::parse_typed_code(code)?;
-                let relay = RelayUrl::parse(&format!("https://{}", host.trim().trim_end_matches('/')))?;
+                // The owner types a host name. A scheme is accepted only where `RelayUrl` accepts it: `http://127.0.0.1:port` in a build with the loopback test feature, and never otherwise.
+                let host = host.trim().trim_end_matches('/');
+                let relay = RelayUrl::parse(&if host.contains("://") { host.to_string() } else { format!("https://{host}") })?;
                 Ok(PairingTarget { relay, fingerprint: None, secret })
             }
         }

@@ -556,6 +556,11 @@ impl RelayClient {
 
     // ------------------------------------------------------------------------------------------------------------ admission
 
+    /// True for a relay on loopback over plain `http` in a build with the `loopback-http` feature: its admission is then read with `ws://` and `http://` on loopback accepted.
+    fn lax_transport(&self) -> bool {
+        cfg!(feature = "loopback-http") && !self.url.is_https()
+    }
+
     /// `POST /v1/admission` with a phone's token: the phone's admission, read as the shipped phone reads it. `expect` is the phone's own session.
     pub fn admission_mobile(
         &self,
@@ -569,7 +574,7 @@ impl RelayClient {
         if response.status != 200 {
             return Err(ClientError::Relay(self.error_of(&response)));
         }
-        MobileAdmission::parse(&response.body, expect, self.relay_now_or_local()).map_err(ClientError::Protocol)
+        MobileAdmission::parse_with(&response.body, expect, self.relay_now_or_local(), self.lax_transport()).map_err(ClientError::Protocol)
     }
 
     /// `POST /v1/admission` with a desktop's token: the plugin's admission.
@@ -579,7 +584,7 @@ impl RelayClient {
         if response.status != 200 {
             return Err(ClientError::Relay(self.error_of(&response)));
         }
-        PluginAdmission::parse(&response.body, request, self.relay_now_or_local()).map_err(ClientError::Protocol)
+        PluginAdmission::parse_with(&response.body, request, self.relay_now_or_local(), self.lax_transport()).map_err(ClientError::Protocol)
     }
 }
 

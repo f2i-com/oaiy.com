@@ -290,13 +290,14 @@ pub struct RelayEndpoints {
     pub poll_mode: bool,
 }
 
-fn parse_endpoints(v: &Json) -> Result<RelayEndpoints> {
+fn parse_endpoints(v: &Json, lax: bool) -> Result<RelayEndpoints> {
     let bad = Error::Invalid("admission: relay");
     let members = v.as_object().ok_or(bad.clone())?;
     if members.iter().any(|(k, _)| !matches!(k.as_str(), "challengeUrl" | "framesUrl" | "streamUrl" | "mode")) {
         return Err(bad);
     }
-    let url = |k: &str| v.get_str(k).filter(|u| u.starts_with("https://")).map(str::to_string).ok_or(bad.clone());
+    let url =
+        |k: &str| v.get_str(k).filter(|u| u.starts_with("https://") || (lax && loopback_origin(u, "http://"))).map(str::to_string).ok_or(bad.clone());
     let poll_mode = match v.get("mode") {
         None => false,
         Some(m) if m.as_str() == Some("poll") => true,
@@ -305,9 +306,18 @@ fn parse_endpoints(v: &Json) -> Result<RelayEndpoints> {
     Ok(RelayEndpoints { challenge_url: url("challengeUrl")?, frames_url: url("framesUrl")?, stream_url: url("streamUrl")?, poll_mode })
 }
 
-fn gateway_ok(url: &str) -> bool {
-    url.strip_prefix("wss://")
-        .and_then(|r| r.strip_suffix("/v2/realtime"))
+/// `scheme` followed by a loopback host (`127.0.0.1` or `localhost`, with or without a port) and then a path or nothing: what a relay installed on loopback over plain
+/// `http` writes (a test build only; the shipped readers take `https` and `wss` alone).
+fn loopback_origin(url: &str, scheme: &str) -> bool {
+    let Some(rest) = url.strip_prefix(scheme) else { return false };
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = authority.split(':').next().unwrap_or("");
+    matches!(host, "127.0.0.1" | "localhost")
+}
+
+fn gateway_ok(url: &str, lax: bool) -> bool {
+    let rest = url.strip_prefix("wss://").or_else(|| if lax && loopback_origin(url, "ws://") { url.strip_prefix("ws://") } else { None });
+    rest.and_then(|r| r.strip_suffix("/v2/realtime"))
         .is_some_and(|h| !h.is_empty() && h.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':')))
 }
 
@@ -379,6 +389,12 @@ pub struct MobileAdmission {
 impl MobileAdmission {
     /// Reads and checks the answer, with `now` the relay-corrected time.
     pub fn parse(body: &[u8], expect: &MobileExpect<'_>, now: i64) -> Result<MobileAdmission> {
+        MobileAdmission::parse_with(body, expect, now, false)
+    }
+
+    /// [`MobileAdmission::parse`], where `lax` (a client of a relay on loopback over plain `http`, in a build with the `loopback-http` feature) also takes `ws://` and
+    /// `http://` on loopback for the URLs the relay writes from its own base. Everything else is read as the shipped phone reads it.
+    pub fn parse_with(body: &[u8], expect: &MobileExpect<'_>, now: i64, lax: bool) -> Result<MobileAdmission> {
         const ALL: [&str; 16] = [
             "accessToken",
             "tokenType",
@@ -410,7 +426,7 @@ impl MobileAdmission {
             .get_uint53("expiresAt")
             .filter(|e| (*e as i64) > now && (*e as i64) <= now + 300)
             .ok_or(Error::OutsideWindow("admission expiresAt"))?;
-        let gateway_url = doc.get_str("gatewayUrl").filter(|g| gateway_ok(g)).ok_or(Error::Invalid("gatewayUrl"))?.to_string();
+        let gateway_url = doc.get_str("gatewayUrl").filter(|g| gateway_ok(g, lax)).ok_or(Error::Invalid("gatewayUrl"))?.to_string();
         let app_id = doc.get_str("appId").filter(|a| *a == expect.app_id).ok_or(Error::Mismatch("admission: appId"))?.to_string();
         let subject_id = doc.get_str("subjectId").filter(|a| *a == expect.device_id).ok_or(Error::Mismatch("admission: subjectId"))?.to_string();
         let holder = doc
@@ -456,7 +472,7 @@ impl MobileAdmission {
         if device_grants != scopes {
             return Err(Error::Mismatch("admission: device.grants are not the scopes"));
         }
-        let relay = parse_endpoints(doc.get("relay").ok_or(Error::Invalid("relay"))?)?;
+        let relay = parse_endpoints(doc.get("relay").ok_or(Error::Invalid("relay"))?, lax)?;
         Ok(MobileAdmission {
             bearer,
             expires_in,
@@ -504,6 +520,11 @@ pub struct PluginAdmission {
 impl PluginAdmission {
     /// Reads and checks the answer against what the broker sent.
     pub fn parse(body: &[u8], sent: &PluginRequest, now: i64) -> Result<PluginAdmission> {
+        PluginAdmission::parse_with(body, sent, now, false)
+    }
+
+    /// [`PluginAdmission::parse`] with the `lax` of [`MobileAdmission::parse_with`].
+    pub fn parse_with(body: &[u8], sent: &PluginRequest, now: i64, lax: bool) -> Result<PluginAdmission> {
         const ALL: [&str; 19] = [
             "accessToken",
             "tokenType",
@@ -538,7 +559,7 @@ impl PluginAdmission {
             .get_uint53("expiresAt")
             .filter(|e| (*e as i64) - now > 10 && (*e as i64) - now <= 300)
             .ok_or(Error::OutsideWindow("admission expiresAt"))?;
-        if !doc.get_str("gatewayUrl").is_some_and(gateway_ok) {
+        if !doc.get_str("gatewayUrl").is_some_and(|g| gateway_ok(g, lax)) {
             return Err(Error::Invalid("gatewayUrl"));
         }
         if doc.get_str("appId") != Some(&sent.app_id) || doc.get_str("subjectId") != Some(&sent.plugin_id) {
@@ -574,7 +595,38 @@ impl PluginAdmission {
         if turn_at != earliest {
             return Err(Error::Mismatch("turnCredentialExpiresAt is not the earliest TURN expiry"));
         }
-        let relay = parse_endpoints(doc.get("relay").ok_or(Error::Invalid("relay"))?)?;
+        let relay = parse_endpoints(doc.get("relay").ok_or(Error::Invalid("relay"))?, lax)?;
         Ok(PluginAdmission { bearer, expires_in, expires_at, scopes, ice_servers, relay_only, relay })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_gateway_url_is_wss_unless_a_loopback_test_build_says_otherwise() {
+        for strict in [true, false] {
+            assert!(gateway_ok("wss://relay.example.com/v2/realtime", !strict));
+            assert!(gateway_ok("wss://relay.example.com:8443/v2/realtime", !strict));
+            assert!(!gateway_ok("wss://relay.example.com/v2/realtime/", !strict));
+            assert!(!gateway_ok("wss://user@relay.example.com/v2/realtime", !strict));
+            assert!(!gateway_ok("wss:///v2/realtime", !strict));
+        }
+        assert!(!gateway_ok("ws://127.0.0.1:8080/v2/realtime", false), "plain ws is refused as the shipped readers refuse it");
+        assert!(gateway_ok("ws://127.0.0.1:8080/v2/realtime", true));
+        assert!(gateway_ok("ws://localhost/v2/realtime", true));
+        assert!(!gateway_ok("ws://relay.example.com/v2/realtime", true), "plain ws is for loopback only, even in a test build");
+        assert!(!gateway_ok("ws://127.0.0.1.example.com/v2/realtime", true));
+    }
+
+    #[test]
+    fn the_compatibility_urls_are_https_unless_a_loopback_test_build_says_otherwise() {
+        let ad = |u: &str| json::parse(format!("{{\"challengeUrl\":\"{u}/a\",\"framesUrl\":\"{u}/b\",\"streamUrl\":\"{u}/c\"}}").as_bytes()).unwrap();
+        assert!(parse_endpoints(&ad("https://relay.example.com"), false).is_ok());
+        assert!(parse_endpoints(&ad("http://127.0.0.1:9"), false).is_err());
+        assert!(parse_endpoints(&ad("http://127.0.0.1:9"), true).is_ok());
+        assert!(parse_endpoints(&ad("http://relay.example.com"), true).is_err());
+        assert!(parse_endpoints(&ad("http://127.0.0.1.example.com"), true).is_err());
     }
 }
