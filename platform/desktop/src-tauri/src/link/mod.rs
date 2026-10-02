@@ -114,6 +114,78 @@ pub struct LinkedAccount {
     pub instance_id: Option<String>,
 }
 
+/// A stored file of the link that this build could not use, said in plain words.
+///
+/// The file is KEPT as it is. It is not read as "not linked": an `account.json` that fails to
+/// parse used to be dropped by `.ok()` and the desktop went on as if nobody had linked it, so a
+/// build rolled back past a newer file shape, a half-restored folder or a file another program held
+/// for a moment unlinked the desktop without a word. Now the status carries this, nothing writes
+/// over the file until it has been put aside as `<name>.corrupt` (see [`LinkStore::make_way`]), and
+/// forgetting a link that cannot be removed says so instead of going on as if it had been.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkError {
+    /// The file, as a path under the data folder: `link/account.json`.
+    pub file: String,
+    /// What is wrong with it and what has been done about it. Never holds what is in the file.
+    pub message: String,
+}
+
+/// The one file of the provider link, under the data folder.
+const ACCOUNT_FILE: &str = "link/account.json";
+
+/// Read a JSON file of the link's (the provider's `account.json`, or one of the relay's sibling files,
+/// [`crate::relay::link_store`]). No file is `Ok(None)`. One that is there and cannot be used is an
+/// error and is left exactly as it is: it may be perfectly good (another program has it open) or the
+/// only copy of a link that a newer build wrote.
+pub(crate) fn read_stored<T: serde::de::DeserializeOwned>(path: &std::path::Path, shown_as: &str) -> Result<Option<T>, LinkError> {
+    use crate::secret_file::{read_text_patiently, Patience, Text};
+    let unusable = |why: String| {
+        log::warn!("link: {shown_as} {why}; it is kept as it is and not used");
+        LinkError { file: shown_as.to_string(), message: format!("{shown_as} {why}. It has not been changed.") }
+    };
+    match read_text_patiently(path, &Patience::default().start) {
+        Text::Missing => Ok(None),
+        Text::Text(text) => serde_json::from_str(&text).map(Some).map_err(|e| unusable(format!("is not a link this version of OAIY understands ({})", describe(&e)))),
+        Text::Undecodable(why) => Err(unusable(format!("is not text ({why})"))),
+        Text::Unreadable(e) => Err(unusable(format!("could not be read ({e}): another program may have it open"))),
+    }
+}
+
+/// Why a file failed to parse, without a word of what is in it: a message that quotes a value
+/// (`invalid type: string "flk_..."`) would put a credential into a status or a log. Only the two
+/// messages that name a field of ours are quoted.
+fn describe(e: &serde_json::Error) -> String {
+    use serde_json::error::Category;
+    let at = format!("line {}, column {}", e.line(), e.column());
+    match e.classify() {
+        Category::Data => {
+            let said = e.to_string();
+            if said.starts_with("unknown field") || said.starts_with("missing field") {
+                said
+            } else {
+                format!("a value has the wrong form, {at}")
+            }
+        }
+        Category::Syntax | Category::Eof => format!("it is not valid JSON, {at}"),
+        Category::Io => "it could not be read".to_string(),
+    }
+}
+
+/// Put `path`, a file of the link that could not be used, aside as `<name>.corrupt` so that the
+/// store can write a new one: what was in it is never thrown away. A file that is no longer there
+/// needs nothing. An error says the file is still where it was, and must stop the write.
+pub(crate) fn put_aside(path: &std::path::Path, shown_as: &str) -> Result<(), String> {
+    match crate::secret_file::keep_aside(path) {
+        Ok(aside) => {
+            log::warn!("link: {shown_as} could not be used; it is kept as {}", aside.display());
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("{shown_as} could not be used and could not be put aside ({e}); it has not been changed and nothing was written")),
+    }
+}
+
 /// Where a link attempt has got to.
 ///
 /// Reported by polling rather than pushed: the ceremony happens in the user's
@@ -207,6 +279,10 @@ pub struct LinkStatus {
     pub data_node_supported: bool,
     /// Plugin events kept for the account until FormLogic can take them.
     pub outbox: outbox::Status,
+    /// A stored file of the link that could not be used, or a link that could not be forgotten. An
+    /// unlinked desktop with this is NOT one nobody linked: its file is there and has been left alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_error: Option<LinkError>,
     /// The in-flight attempt, if any.
     pub attempt: LinkPhase,
     /// Every provider this build can link to.
@@ -230,6 +306,8 @@ pub struct AvailableConnector {
 
 struct Inner {
     account: Option<LinkedAccount>,
+    /// Why `account.json` was not read, or why the link could not be forgotten (see [`LinkError`]).
+    error: Option<LinkError>,
     attempt: LinkPhase,
     /// Set while a ceremony is running, so a second Link click cannot open a
     /// second browser tab racing the first for the same one-use code.
@@ -284,14 +362,17 @@ pub(crate) fn open_handle_without_workers(data_dir: PathBuf) -> LinkHandle {
 
 fn load_store(data_dir: PathBuf) -> LinkHandle {
     let path = data_dir.join("link").join("account.json");
-    let account = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<LinkedAccount>(&raw).ok());
+    // A file that is there and cannot be used is reported and left alone, never read as no link.
+    let (account, error) = match read_stored::<LinkedAccount>(&path, ACCOUNT_FILE) {
+        Ok(account) => (account, None),
+        Err(e) => (None, Some(e)),
+    };
     let store = Arc::new(LinkStore {
         path,
         data_dir,
         inner: Mutex::new(Inner {
             account,
+            error,
             attempt: LinkPhase::Idle,
             in_flight: false,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -330,6 +411,7 @@ pub(crate) fn store_for_tests(data_dir: PathBuf, account: Option<LinkedAccount>)
         data_dir,
         inner: Mutex::new(Inner {
             account,
+            error: None,
             attempt: LinkPhase::Idle,
             in_flight: false,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -391,6 +473,7 @@ impl LinkStore {
                 data_node_error: None,
                 data_node_supported: false,
                 outbox: outbox::current_status(),
+                link_error: inner.error.clone(),
                 attempt: inner.attempt.clone(),
                 available,
             },
@@ -431,6 +514,7 @@ impl LinkStore {
                     data_node_error: inner.data_node_error.clone(),
                     data_node_supported: d.is_some_and(|d| d.data_node.is_some()),
                     outbox: outbox::current_status(),
+                    link_error: inner.error.clone(),
                     attempt: inner.attempt.clone(),
                     available,
                 }
@@ -552,18 +636,64 @@ impl LinkStore {
     fn persist(&self, account: &LinkedAccount) -> Result<(), String> {
         let raw = serde_json::to_string_pretty(account)
             .map_err(|e| format!("could not encode the link: {e}"))?;
+        self.make_way()?;
         // The account's key is in this file: owner-only from its first byte, and
         // replaced whole so a reader on another thread never meets half of it.
         crate::secret_file::write(&self.path, raw)
             .map_err(|e| format!("could not save the link: {e}"))
     }
 
+    /// A file that could not be used is never written over: it is put aside as
+    /// `account.json.corrupt` first, and a failure to do that stops the write. Nothing to do
+    /// when the file was fine.
+    fn make_way(&self) -> Result<(), String> {
+        let unusable = {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.account.is_none() && inner.error.is_some()
+        };
+        if !unusable {
+            return Ok(());
+        }
+        put_aside(&self.path, ACCOUNT_FILE)?;
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).error = None;
+        Ok(())
+    }
+
+    /// Take the stored link away: `Err` says why it is still there. A file that could not be
+    /// used is put aside rather than deleted (what is in it may be a link a newer build can read);
+    /// a link that is not there to remove is forgotten all the same.
+    fn forget_stored(&self) -> Result<(), String> {
+        let unusable = {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.account.is_none() && inner.error.is_some()
+        };
+        if unusable {
+            return self.make_way();
+        }
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => {
+                log::warn!("link: {ACCOUNT_FILE} could not be removed: {e}");
+                Err(format!("the link could not be forgotten: {ACCOUNT_FILE} could not be removed ({e}). It is still linked here, and would be again at the next start. Close whatever has it open and try again."))
+            }
+        }
+    }
+
     /// Forget the link. Local only — see the note on the route.
+    ///
+    /// The file is removed FIRST, and a link that cannot be removed stays linked and says so
+    /// ([`LinkStatus::link_error`]): going on as if it had been forgotten would leave the key on
+    /// disk to link the desktop again at the next start, and the one who asked would never know.
     pub fn unlink(&self) -> LinkStatus {
-        let _ = std::fs::remove_file(&self.path);
+        if let Err(message) = self.forget_stored() {
+            self.inner.lock().unwrap_or_else(|e| e.into_inner()).error = Some(LinkError { file: ACCOUNT_FILE.to_string(), message });
+            return self.status();
+        }
         {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.account = None;
+            inner.error = None;
             inner.attempt = LinkPhase::Idle;
             inner.last_heartbeat_at = None;
             inner.heartbeat_error = None;
@@ -767,6 +897,7 @@ pub fn start_link(
                     set_linked_origin(Some(account.base_url.as_str()));
                     let mut inner = for_thread.inner.lock().unwrap_or_else(|e| e.into_inner());
                     inner.account = Some(account);
+                    inner.error = None;
                     inner.attempt = LinkPhase::Linked;
                 }
                 Err(e) => for_thread.set_phase(LinkPhase::Failed { message: e }),
@@ -1000,6 +1131,135 @@ mod tests {
 
         assert!(!reopened.unlink().linked);
         assert!(open_handle_without_workers(dir.clone()).account().is_none(), "unlink must be durable");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- a link that cannot be used is kept and reported, never read as no link ---------------
+
+    /// An empty data folder with its `link` folder made.
+    fn data_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("oaiy-link-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("link")).unwrap();
+        dir
+    }
+
+    /// A store over a data folder whose `link/account.json` holds `body`. It is made with
+    /// `load_store`, not `open_handle_without_workers`: that one also sets the trusted origin every
+    /// other test reads.
+    fn store_over(tag: &str, body: &[u8]) -> (std::path::PathBuf, LinkHandle) {
+        let dir = data_dir(tag);
+        std::fs::write(dir.join("link").join("account.json"), body).unwrap();
+        (dir.clone(), load_store(dir))
+    }
+
+    #[test]
+    fn an_account_file_that_cannot_be_understood_is_kept_reported_and_not_read_as_no_link() {
+        // `.ok()` used to turn each of these into "nobody has linked this desktop": a build rolled back past
+        // a newer shape of the file, a restore that cut it, a file that is not text. The link was gone from
+        // the screen and the key sat on the disk, with nothing said.
+        let newer = br#"{"connectorId":"formlogic","baseUrl":"https://formlogic.com","credential":"flk_a","linkedAt":"2026-09-01T00:00:00Z","futureField":1}"#;
+        for (what, body, says) in [
+            ("a newer shape", &newer[..], "unknown field `futureField`"),
+            ("a cut file", &br#"{"connectorId":"formlogic","baseUrl":"#[..], "not valid JSON"),
+            ("not text", &[0xC3, 0x28, 0xA0][..], "is not text"),
+        ] {
+            let (dir, store) = store_over("kept", body);
+            let status = store.status();
+            assert!(!status.linked && store.account().is_none(), "{what}");
+            let error = status.link_error.unwrap_or_else(|| panic!("{what}: nothing was said"));
+            assert_eq!(error.file, "link/account.json", "{what}");
+            assert!(error.message.contains(says), "{what}: {}", error.message);
+            assert!(error.message.contains("It has not been changed"), "{what}: {}", error.message);
+            assert_eq!(std::fs::read(dir.join("link").join("account.json")).unwrap(), body, "{what}: the file is as it was");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn a_file_another_program_holds_is_reported_too_and_not_taken_for_no_link() {
+        // A folder where the file belongs cannot be read, as a file another program has open cannot.
+        let dir = data_dir("held");
+        std::fs::create_dir(dir.join("link").join("account.json")).unwrap();
+        let store = load_store(dir.clone());
+        let error = store.status().link_error.expect("it could not be read, and that is said");
+        assert!(error.message.contains("could not be read"), "{}", error.message);
+        assert!(dir.join("link").join("account.json").is_dir(), "and left where it was");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn what_is_reported_never_quotes_what_is_in_the_file() {
+        // serde's own message for a value of the wrong type quotes the value, and a status is read by the
+        // dashboard and the Agent: a key in the wrong field must not reach them.
+        let body = br#"{"connectorId":"formlogic","baseUrl":"https://formlogic.com","credential":"flk_TOPSECRET","linkedAt":"flk_TOPSECRET"}"#;
+        let (dir, store) = store_over("quote", body);
+        let status = store.status();
+        let error = status.link_error.clone().expect("the date is not one");
+        assert!(!error.message.contains("TOPSECRET"), "{}", error.message);
+        assert!(!serde_json::to_string(&status).unwrap().contains("TOPSECRET"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_new_link_puts_a_file_that_could_not_be_used_aside_and_never_writes_over_it() {
+        let newer = br#"{"connectorId":"formlogic","futureField":1}"#;
+        let (dir, store) = store_over("aside", newer);
+        assert!(store.status().link_error.is_some());
+
+        store.persist(&account()).unwrap();
+        let link = dir.join("link");
+        assert_eq!(std::fs::read(link.join("account.json.corrupt")).unwrap(), newer, "what was there is kept");
+        assert_eq!(load_store(dir.clone()).account().unwrap().credential, "flk_supersecret", "and the new link is the file now");
+        assert!(store.status().link_error.is_none(), "it is dealt with");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_put_aside_stops_the_write_and_one_that_is_gone_needs_nothing() {
+        // The write is refused, so what is in the file is never lost for want of a place to keep it.
+        let refused = put_aside(std::path::Path::new("/"), "link/account.json").unwrap_err();
+        assert!(refused.contains("nothing was written"), "{refused}");
+        // The file went away since it was found unusable: nothing to keep, and the write goes on.
+        let dir = data_dir("aside-gone");
+        put_aside(&dir.join("link").join("account.json"), "link/account.json").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forgetting_a_file_that_could_not_be_used_keeps_it_aside() {
+        let newer = br#"{"connectorId":"formlogic","futureField":1}"#;
+        let (dir, store) = store_over("forget-bad", newer);
+        let after = store.unlink();
+        assert!(!after.linked && after.link_error.is_none());
+        let link = dir.join("link");
+        assert!(!link.join("account.json").exists(), "it is not the link now");
+        assert_eq!(std::fs::read(link.join("account.json.corrupt")).unwrap(), newer, "and it is not thrown away");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_link_that_cannot_be_removed_stays_linked_and_says_so() {
+        // `let _ = remove_file(..)` forgot the link in memory whatever happened to the file: the key stayed
+        // on the disk, the screen said unlinked, and the next start linked the desktop again.
+        let dir = data_dir("stuck");
+        let store = load_store(dir.clone());
+        let file = dir.join("link").join("account.json");
+        // A file that is a folder with something in it cannot be removed, on any system.
+        std::fs::create_dir_all(file.join("held")).unwrap();
+        store.inner.lock().unwrap().account = Some(account());
+        store.inner.lock().unwrap().error = None;
+
+        let after = store.unlink();
+        assert!(after.linked, "it is still linked, and the screen says so");
+        let error = after.link_error.expect("and why");
+        assert!(error.message.contains("could not be forgotten"), "{}", error.message);
+        assert!(store.account().is_some(), "the lanes go on with a link that is still stored");
+
+        // Once the file can be removed the next try forgets it, and the error goes with the link.
+        std::fs::remove_dir_all(&file).unwrap();
+        let after = store.unlink();
+        assert!(!after.linked && after.link_error.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
