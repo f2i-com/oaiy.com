@@ -84,6 +84,19 @@ impl fmt::Debug for HttpRequest {
     }
 }
 
+/// A request carries the bearer in a header (and a body can carry a secret too): both are wiped when the request is dropped. (A copy an adapter makes is the adapter's.)
+impl Drop for HttpRequest {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        for (_, v) in self.headers.iter_mut() {
+            v.zeroize();
+        }
+        if let Some(b) = self.body.as_mut() {
+            b.zeroize();
+        }
+    }
+}
+
 impl HttpRequest {
     /// The value of the request header `name` (case-insensitive), for a test that looks at what was sent.
     pub fn header(&self, name: &str) -> Option<&str> {

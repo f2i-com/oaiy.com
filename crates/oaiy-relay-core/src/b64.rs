@@ -5,6 +5,8 @@
 //! and is refused). This module is the same rule, for every value, fixed-length or not: the two ends of a signature or a MAC must never be able to disagree about which
 //! text a byte string is.
 
+use zeroize::Zeroizing;
+
 use crate::error::B64Error;
 
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -58,13 +60,20 @@ pub fn encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Decodes canonical base64url. An empty text is refused (no value of the protocol is zero bytes of base64url).
+/// Decodes canonical base64url. An empty text is refused (no value of the protocol is zero bytes of base64url). The result is the caller's: for a secret use
+/// [`decode_zeroizing`] (or [`decode_exact`], which leaves no copy behind), so that no copy of it is left in freed memory.
 pub fn decode(text: &str) -> Result<Vec<u8>, B64Error> {
+    Ok(decode_zeroizing(text)?.to_vec())
+}
+
+/// [`decode`] into a buffer that is wiped when it is dropped, with the six-bit digits it works through wiped too. Both buffers are sized once, so that growing one never
+/// leaves a copy of the secret in a block that was given back.
+pub fn decode_zeroizing(text: &str) -> Result<Zeroizing<Vec<u8>>, B64Error> {
     let bytes = text.as_bytes();
     if bytes.is_empty() {
         return Err(B64Error::Length);
     }
-    let mut values = Vec::with_capacity(bytes.len());
+    let mut values = Zeroizing::new(Vec::with_capacity(bytes.len()));
     for &b in bytes {
         let v = DECODE[usize::from(b)];
         if v == 255 {
@@ -76,7 +85,7 @@ pub fn decode(text: &str) -> Result<Vec<u8>, B64Error> {
     if rem == 1 {
         return Err(B64Error::Length);
     }
-    let mut out = Vec::with_capacity(values.len() / 4 * 3 + 2);
+    let mut out = Zeroizing::new(Vec::with_capacity(values.len() / 4 * 3 + 2));
     let mut groups = values.chunks_exact(4);
     for g in &mut groups {
         let n = (u32::from(g[0]) << 18) | (u32::from(g[1]) << 12) | (u32::from(g[2]) << 6) | u32::from(g[3]);
@@ -111,7 +120,7 @@ pub fn decode_exact<const N: usize>(text: &str) -> Result<[u8; N], B64Error> {
     if text.len() != encoded_len(N) {
         return Err(if text.bytes().all(|b| DECODE[usize::from(b)] != 255) { B64Error::WrongSize } else { B64Error::Alphabet });
     }
-    let bytes = decode(text)?;
+    let bytes = decode_zeroizing(text)?;
     <[u8; N]>::try_from(bytes.as_slice()).map_err(|_| B64Error::WrongSize)
 }
 

@@ -438,7 +438,7 @@ fn attack_a_phone_refuses_an_offer_that_names_another_relay_key_before_it_posts_
 fn attack_the_windows_of_an_offer_and_of_a_response_are_30_seconds_either_side_and_not_a_second_more() {
     let mut w = world(quick());
     let now = w.env.client.relay_now_or_local();
-    let offer = w.desktop.create_offer(&mut w.rng, now).unwrap();
+    let offer = w.desktop.create_offer(now).unwrap();
     let (i, e) = (offer.offer.issued_at as i64, offer.offer.expires_at as i64);
     assert!(offer.offer.check_window(i - 30).is_ok() && offer.offer.check_window(i - 31).is_err());
     assert!(offer.offer.check_window(e + 29).is_ok() && offer.offer.check_window(e + 30).is_err());
@@ -675,7 +675,7 @@ fn attack_a_phone_refuses_an_offer_whose_window_is_over_or_not_yet_begun_even_wh
     for (what, issued) in
         [("issued 1,000 s ago", now - 1000), ("issued 1,000 s ahead", now + 1000), ("issued 631 s ago", now - 631), ("issued 31 s ahead", now + 31)]
     {
-        let offer = w.desktop.create_offer(&mut w.rng, issued).unwrap();
+        let offer = w.desktop.create_offer(issued).unwrap();
         w.desktop.open(&w.env.client, &w.token, &offer, &cancel()).unwrap();
         let mut p = w.phone(PairingInput::Key(&offer.pairing_uri), 90);
         let r = p.fetch_offer(&cancel());
@@ -683,7 +683,7 @@ fn attack_a_phone_refuses_an_offer_whose_window_is_over_or_not_yet_begun_even_wh
     }
     // Control: 599 s ago and 30 s ahead are inside the window.
     for issued in [now - 599, now + 30] {
-        let offer = w.desktop.create_offer(&mut w.rng, issued).unwrap();
+        let offer = w.desktop.create_offer(issued).unwrap();
         w.desktop.open(&w.env.client, &w.token, &offer, &cancel()).unwrap();
         let mut p = w.phone(PairingInput::Key(&offer.pairing_uri), 91);
         assert!(p.fetch_offer(&cancel()).is_ok());

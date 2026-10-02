@@ -203,7 +203,6 @@ fn unwiped_copies_of_secrets() {
 
 /// Fails today (run with `--ignored`): every scenario of the table must show no unwiped copy of a secret. A failure names the scenarios that still leave one.
 #[test]
-#[ignore = "a finding: Token::parse, Enrolled::parse, the pairing and enrolment key parsers and the typed code leave unwiped copies of their secrets in freed heap blocks"]
 fn no_scenario_leaves_an_unwiped_copy() {
     let bad: Vec<String> = scenarios().into_iter().filter(|(l, n)| *n > 0 && !l.starts_with("control")).map(|(l, n)| format!("{l}: {n}")).collect();
     assert!(bad.is_empty(), "{bad:#?}");

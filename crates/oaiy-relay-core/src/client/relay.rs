@@ -256,14 +256,9 @@ impl RelayClient {
         lock(&self.state).pin.clone()
     }
 
-    /// A random draw `u` for a jittered pause, from 0 up to but not including 1.
+    /// A random draw `u` for a jittered pause, from 0 up to but not including 1: the only thing the host's [`Rng`] is asked for.
     pub fn jitter(&self) -> f64 {
         lock(&self.rng).unit()
-    }
-
-    /// Random bytes.
-    pub fn random(&self, buf: &mut [u8]) {
-        lock(&self.rng).fill(buf);
     }
 
     /// The `info` of the last good proof.
@@ -401,7 +396,7 @@ impl RelayClient {
     pub fn prove(&self, cancel: &Cancel) -> Result<Proved, ProveError> {
         let pin = lock(&self.state).pin.clone().ok_or(ProveError::NoAnswer(ClientError::NoPin))?;
         let mut nonce = [0u8; 16];
-        self.random(&mut nonce);
+        super::clock::os_fill(&mut nonce);
         let response = self
             .exchange(Method::Get, "/v1/info", None, None, &[("X-OAIY-Nonce", b64::encode(&nonce))], self.config.request_timeout, cancel)
             .map_err(|e| ProveError::NoAnswer(e.into()))?;
@@ -493,9 +488,9 @@ impl RelayClient {
             Err(ProveError::Invalid(_)) => return Err(ClientError::Suspect),
         };
         let mut nonce = [0u8; 16];
-        self.random(&mut nonce);
+        super::clock::os_fill(&mut nonce);
         let request = enrol::build_request(key, name, ed25519, x25519, &nonce).map_err(ClientError::Request)?;
-        let response = self.exchange(
+        let mut response = self.exchange(
             Method::Post,
             "/v1/enroll",
             Some(request.body.into_bytes()),
@@ -504,14 +499,19 @@ impl RelayClient {
             self.config.request_timeout,
             cancel,
         )?;
-        if response.status != 201 {
-            return Err(ClientError::Relay(self.error_of(&response)));
-        }
-        let enrolled = Enrolled::parse(&response.body, key.role).map_err(ClientError::Protocol)?;
-        if enrolled.relay_id != proved.info.relay_id {
-            return Err(ClientError::BadAnswer("relayId is not the relay that was proved"));
-        }
-        Ok(enrolled)
+        // The answer holds the device token as text: the body is wiped when this call is over, whatever it returns.
+        let result = (|| {
+            if response.status != 201 {
+                return Err(ClientError::Relay(self.error_of(&response)));
+            }
+            let enrolled = Enrolled::parse(&response.body, key.role).map_err(ClientError::Protocol)?;
+            if enrolled.relay_id != proved.info.relay_id {
+                return Err(ClientError::BadAnswer("relayId is not the relay that was proved"));
+            }
+            Ok(enrolled)
+        })();
+        zeroize::Zeroize::zeroize(&mut response.body);
+        result
     }
 
     // ------------------------------------------------------------------------------------------------------------ poll
@@ -553,11 +553,16 @@ impl RelayClient {
 
     /// `POST /v1/tokens/rotate`: a new token; the old one works for ten more minutes (`graceUntil`).
     pub fn rotate_token(&self, token: &Token, cancel: &Cancel) -> Result<(Token, u64), ClientError> {
-        let response = self.authed(token, Method::Post, "/v1/tokens/rotate", Some(b"{}".to_vec()), None, cancel)?;
-        let doc = self.success_json(&response, &[200])?;
-        let new = Token::parse(doc.get_str("token").ok_or(ClientError::BadAnswer("token"))?).map_err(ClientError::Protocol)?;
-        let grace = doc.get_uint53("graceUntil").ok_or(ClientError::BadAnswer("graceUntil"))?;
-        Ok((new, grace))
+        let mut response = self.authed(token, Method::Post, "/v1/tokens/rotate", Some(b"{}".to_vec()), None, cancel)?;
+        // The answer holds the new token as text: the body and the tree parsed from it are wiped when this call is over.
+        let result = (|| {
+            let doc = json::Wiped(self.success_json(&response, &[200])?);
+            let new = Token::parse(doc.get_str("token").ok_or(ClientError::BadAnswer("token"))?).map_err(ClientError::Protocol)?;
+            let grace = doc.get_uint53("graceUntil").ok_or(ClientError::BadAnswer("graceUntil"))?;
+            Ok((new, grace))
+        })();
+        zeroize::Zeroize::zeroize(&mut response.body);
+        result
     }
 
     // ------------------------------------------------------------------------------------------------------------ admission

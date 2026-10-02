@@ -50,7 +50,7 @@ pub fn default_world() -> World {
 impl World {
     /// Opens a rendezvous as the desktop.
     pub fn new_offer(&mut self) -> NewOffer {
-        let offer = self.desktop.create_offer(&mut self.rng, self.env.client.relay_now_or_local()).unwrap();
+        let offer = self.desktop.create_offer(self.env.client.relay_now_or_local()).unwrap();
         self.desktop.open(&self.env.client, &self.token, &offer, &Cancel::new()).unwrap();
         offer
     }
@@ -59,7 +59,7 @@ impl World {
     pub fn phone(&self, input: PairingInput<'_>, seed: u64) -> PhonePairing {
         let target = PairingTarget::from_input(input).unwrap();
         let client = client_for_target(&self.env, &target, seed);
-        let identity = oaiy_relay_core::pairing::phone::new_identity(Some("Test phone"), &mut SeededRng::new(seed)).unwrap();
+        let identity = oaiy_relay_core::pairing::phone::new_identity(Some("Test phone")).unwrap();
         PhonePairing::new(client, target, identity).unwrap()
     }
 
@@ -93,6 +93,6 @@ pub fn client_for_target(env: &Env, target: &PairingTarget, seed: u64) -> Arc<Re
     c
 }
 
-pub fn phone_identity(seed: u64) -> PhoneIdentity {
-    oaiy_relay_core::pairing::phone::new_identity(Some("Test phone"), &mut SeededRng::new(seed)).unwrap()
+pub fn phone_identity(_seed: u64) -> PhoneIdentity {
+    oaiy_relay_core::pairing::phone::new_identity(Some("Test phone")).unwrap()
 }

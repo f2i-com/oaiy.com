@@ -47,29 +47,32 @@ fn the_secret_holding_types_print_nothing_of_the_secret() {
     assert!(!format!("{request:?}").contains(secret_part));
 }
 
+/// Inverted with the fix, as the test's own comment said to do: this used to assert that these three derived `Debug` impls print a secret in the clear.
 #[test]
-fn but_a_few_derived_debug_impls_print_a_secret_in_the_clear() {
-    // 1. The pairing secret, as the owner types it or as the pairing key carries it, is in `PairingInput`'s derived Debug (a host that logs the input with `{:?}` logs the secret).
+fn and_the_three_derived_debug_impls_no_longer_print_a_secret() {
+    // 1. The pairing secret, as the owner types it or as the pairing key carries it, is not in `PairingInput`'s Debug.
     let s = PairingSecret::new([0x77; 16]);
     let typed = s.typed_code();
     let dbg = format!("{:?}", PairingInput::Typed { code: &typed, host: "relay.example.com" });
-    assert!(dbg.contains(&typed), "{dbg}");
+    assert!(!dbg.contains(&typed) && !dbg.contains(&typed[..4]) && dbg.contains("relay.example.com"), "{dbg}");
     let uri = format!("oaiy://pair?v=3&u=https%3A%2F%2Frelay.example.com&s={}", s.b64u());
-    assert!(format!("{:?}", PairingInput::Key(&uri)).contains(&s.b64u()));
+    let dbg = format!("{:?}", PairingInput::Key(&uri));
+    assert!(!dbg.contains(&s.b64u()) && !dbg.contains("oaiy://"), "{dbg}");
 
-    // 2. A TURN credential of an admission, in `IceServer`'s derived Debug (and so in `MobileAdmission`'s and `PluginAdmission`'s).
+    // 2. A TURN credential of an admission is not in `IceServer`'s Debug.
     let ice = IceServer {
         urls: vec!["turns:turn.example.com:443".into()],
         username: "1790000600:abc".into(),
         credential: "TURN-CREDENTIAL-1234".into(),
         expires_at: Some(1_790_000_600),
     };
-    assert!(format!("{ice:?}").contains("TURN-CREDENTIAL-1234"));
+    let dbg = format!("{ice:?}");
+    assert!(!dbg.contains("TURN-CREDENTIAL-1234") && dbg.contains("turns:turn.example.com:443"), "{dbg}");
 
-    // 3. A response body that carries the device token (`POST /v1/enroll`, `POST /v1/tokens/rotate`) is in `HttpResponse`'s derived Debug, as the decimal bytes of the text.
+    // 3. A response body that carries the device token is not in `HttpResponse`'s Debug, in any spelling.
     let body = format!("{{\"deviceId\":\"dev-x\",\"token\":\"{TOKEN}\"}}").into_bytes();
     let response = HttpResponse { status: 201, headers: vec![], body: body.clone() };
     let dbg = format!("{response:?}");
     let token_bytes = format!("{:?}", TOKEN.as_bytes());
-    assert!(dbg.contains(&token_bytes[1..token_bytes.len() - 1]), "the token is in the Debug of the response");
+    assert!(!dbg.contains(&token_bytes[1..token_bytes.len() - 1]) && !dbg.contains(TOKEN) && !dbg.contains(&TOKEN[20..]), "{dbg}");
 }

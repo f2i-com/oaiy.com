@@ -10,7 +10,7 @@
 //! `jti`s that an approval has consumed (a response is used once), and the thumbprints of phone keys that were revoked (a response from one is refused). A host that restarts
 //! between the two loses the pending offers (they live ten minutes and are made again); it persists the consumed set and the revoked keys itself if it wants them across restarts.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use oaiy_crypto::zeroize::Secret;
@@ -19,7 +19,7 @@ use crate::b64;
 use crate::client::http::Cancel;
 use crate::client::pair::PairCreate;
 use crate::client::store::Item;
-use crate::client::{RelayClient, Rng};
+use crate::client::RelayClient;
 use crate::ids::{self, Token};
 use crate::json::Json;
 use crate::keys::{Signer, VerifyKey, X25519Public};
@@ -31,6 +31,11 @@ use crate::url::RelayUrl;
 
 /// The attempts the owner has at the SAS before the pairing is denied.
 pub const SAS_ATTEMPTS: u8 = 3;
+/// The most pairings in flight at once (an offer lives ten minutes; a desktop shows one at a time): a new offer is refused beyond it, after the finished and the expired ones are
+/// dropped.
+pub const MAX_PENDING: usize = 32;
+/// The most nonces and `jti`s that approvals consumed that the party remembers (the oldest are forgotten first: an offer is good for ten minutes, so an old one cannot come back).
+pub const MAX_CONSUMED: usize = 1024;
 
 /// The desktop's identity as pairing uses it.
 pub struct DesktopIdentity {
@@ -48,7 +53,7 @@ pub struct DesktopIdentity {
     pub host_x25519: X25519Public,
 }
 
-/// A new offer: what the owner is shown (the QR, the link, the typed code) and what is sent to the relay.
+/// A new offer: what the owner is shown (the QR, the link, the typed code) and what is sent to the relay. The two texts that hold the secret are wiped when it is dropped.
 pub struct NewOffer {
     /// The `pid`, 22 characters.
     pub pid: String,
@@ -110,6 +115,14 @@ pub enum SasOutcome {
     },
 }
 
+impl Drop for NewOffer {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.pairing_uri.zeroize();
+        self.typed_code.zeroize();
+    }
+}
+
 struct Verified {
     claims: crate::pairing::response::Claims,
     sas: Sas,
@@ -121,8 +134,10 @@ struct Verified {
 enum Phase {
     AwaitingResponse,
     AwaitingSas(Verified),
-    /// The approval is made and being sent: the body is kept so that a retry sends the same receipt.
+    /// The approval is made and being sent: the body is kept so that a retry sends the same receipt, and the verified response with the SAS so that a retry is judged against the
+    /// code the owner types again.
     Approving {
+        v: Verified,
         body: String,
     },
     Done,
@@ -135,6 +150,50 @@ struct Pending {
     phase: Phase,
 }
 
+impl Pending {
+    /// The pairing is over: its MAC key is wiped now and not at some later drop.
+    fn finish(&mut self) {
+        self.phase = Phase::Done;
+        self.mac_key = Secret::new([0u8; 32]);
+    }
+}
+
+/// An insertion-ordered set with a cap: when it is full the oldest member is forgotten.
+struct Bounded<T: std::hash::Hash + Eq + Clone> {
+    set: HashSet<T>,
+    order: VecDeque<T>,
+    cap: usize,
+}
+
+impl<T: std::hash::Hash + Eq + Clone> Bounded<T> {
+    fn new(cap: usize) -> Self {
+        Bounded { set: HashSet::new(), order: VecDeque::new(), cap }
+    }
+
+    fn contains(&self, v: &T) -> bool {
+        self.set.contains(v)
+    }
+
+    /// True when it was not there.
+    fn insert(&mut self, v: T) -> bool {
+        if !self.set.insert(v.clone()) {
+            return false;
+        }
+        self.order.push_back(v);
+        while self.order.len() > self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+        true
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {
+        self.order.retain(|v| keep(v));
+        self.set.retain(|v| self.order.contains(v));
+    }
+}
+
 /// The desktop's pairings in flight.
 pub struct DesktopPairing {
     identity: Arc<DesktopIdentity>,
@@ -142,11 +201,11 @@ pub struct DesktopPairing {
     relay: RelayUrl,
     relay_fingerprint: String,
     pending: HashMap<String, Pending>,
-    consumed: HashSet<(String, String)>,
+    consumed: Bounded<(String, String)>,
     revoked: HashSet<String>,
     /// The ids of the pair items already judged: a poll delivers at least once, and a response that was judged and rejected must not be judged (and rejected) again, which would
-    /// return a later, good response of the same rendezvous to open under the phone.
-    seen: HashSet<String>,
+    /// return a later, good response of the same rendezvous to open under the phone. Only items of a pairing in flight are remembered, and they go with it.
+    seen: Bounded<String>,
 }
 
 /// The pid an item id names: `pid`, `pid.2` or `pid.3` (Interpretation 26: the second and third responses of a rendezvous that was reopened by a reject).
@@ -164,9 +223,9 @@ impl DesktopPairing {
             relay,
             relay_fingerprint: relay_fingerprint.to_string(),
             pending: HashMap::new(),
-            consumed: HashSet::new(),
+            consumed: Bounded::new(MAX_CONSUMED),
             revoked: HashSet::new(),
-            seen: HashSet::new(),
+            seen: Bounded::new(4 * MAX_PENDING),
         }
     }
 
@@ -177,14 +236,22 @@ impl DesktopPairing {
 
     /// The nonces and `jti`s that approvals have consumed, for a host that keeps them across restarts.
     pub fn consumed(&self) -> Vec<(String, String)> {
-        let mut v: Vec<_> = self.consumed.iter().cloned().collect();
+        let mut v: Vec<_> = self.consumed.order.iter().cloned().collect();
         v.sort();
         v
     }
 
     /// Restores consumed nonces and `jti`s.
     pub fn restore_consumed(&mut self, consumed: impl IntoIterator<Item = (String, String)>) {
-        self.consumed.extend(consumed);
+        for c in consumed {
+            self.consumed.insert(c);
+        }
+    }
+
+    /// How much this party remembers, as `(pairings, judged item ids, consumed nonces)`: each is bounded ([`MAX_PENDING`], four times that, [`MAX_CONSUMED`]), whatever a relay
+    /// delivers.
+    pub fn remembered(&self) -> (usize, usize, usize) {
+        (self.pending.len(), self.seen.order.len(), self.consumed.order.len())
     }
 
     /// The number of rendezvous this party has not finished.
@@ -192,21 +259,38 @@ impl DesktopPairing {
         self.pending.values().filter(|p| !matches!(p.phase, Phase::Done)).count()
     }
 
-    /// Makes an offer with a secret, a nonce and a `jti` drawn from `rng`, at `relay_now`.
-    pub fn create_offer(&mut self, rng: &mut dyn Rng, relay_now: i64) -> Result<NewOffer, PairingError> {
-        let mut secret = [0u8; 16];
-        let mut nonce = [0u8; 32];
-        let mut jti = [0u8; 12];
-        rng.fill(&mut secret);
-        rng.fill(&mut nonce);
-        rng.fill(&mut jti);
-        self.create_offer_with(secret, nonce, format!("pair-{}", b64::encode(&jti)), relay_now)
+    /// Makes an offer at `relay_now`, with a secret, a nonce and a `jti` that the operating system's random generator draws **inside this crate**: the host passes no random
+    /// source for them, so that no host can make the pairing secret predictable (a seeded generator in a test, a poor one on a platform).
+    pub fn create_offer(&mut self, relay_now: i64) -> Result<NewOffer, PairingError> {
+        let secret = Secret::<16>::random().map_err(crate::Error::from)?;
+        let nonce = Secret::<32>::random().map_err(crate::Error::from)?;
+        let jti = Secret::<12>::random().map_err(crate::Error::from)?;
+        self.make_offer(*secret.expose(), *nonce.expose(), format!("pair-{}", b64::encode(jti.expose())), relay_now)
     }
 
-    /// Makes an offer from given randomness (what the recorded ceremony and the vectors fix).
+    /// Makes an offer from given randomness: what the recorded ceremony and the vectors fix, and nothing else. **Only in a build with the `testing` feature**, which a product does
+    /// not enable: it is the one way to make an offer whose secret a caller chose, and a secret a caller chose is a secret the caller can guess.
+    #[cfg(any(test, feature = "testing"))]
+    #[doc(hidden)]
     pub fn create_offer_with(&mut self, secret: [u8; 16], nonce: [u8; 32], jti: String, relay_now: i64) -> Result<NewOffer, PairingError> {
+        self.make_offer(secret, nonce, jti, relay_now)
+    }
+
+    fn make_offer(&mut self, secret: [u8; 16], nonce: [u8; 32], jti: String, relay_now: i64) -> Result<NewOffer, PairingError> {
         let secret = PairingSecret::new(secret);
         let derived = secret.derive()?;
+        let pid = math::pid_text(&derived.pid);
+        // The finished and the expired pairings are dropped first; one that is still in flight under this pid is never replaced (that would hand it three new attempts at the SAS),
+        // and there is a limit to how many are open at once.
+        self.pending.retain(|_, p| !matches!(p.phase, Phase::Done) && (p.offer.expires_at as i64) + crate::pairing::offer::SKEW_S > relay_now);
+        let pending = &self.pending;
+        self.seen.retain(|item| pid_of_item(item).is_some_and(|p| pending.contains_key(p)));
+        if self.pending.contains_key(&pid) {
+            return Err(PairingError::WrongState("a pairing with this secret is in flight"));
+        }
+        if self.pending.len() >= MAX_PENDING {
+            return Err(PairingError::WrongState("too many pairings are in flight"));
+        }
         let id = &self.identity;
         let offer = Offer::build(&OfferParams {
             app_id: &self.app_id,
@@ -222,7 +306,6 @@ impl DesktopPairing {
             relay: &self.relay,
             relay_fingerprint: &self.relay_fingerprint,
         })?;
-        let pid = math::pid_text(&derived.pid);
         let mac = offer.mac(&derived.mac_key)?;
         let create = PairCreate {
             pid: pid.clone(),
@@ -256,16 +339,22 @@ impl DesktopPairing {
         let Some(pid) = pid_of_item(item_id).map(str::to_string) else {
             return PairEvent::Ignored("not a pairing item");
         };
-        if !self.seen.insert(item_id.to_string()) {
-            return PairEvent::Ignored("this item was judged already");
-        }
+        // An item is remembered only if it belongs to a pairing in flight (a relay cannot make the party remember anything by naming pairings that do not exist).
         let Some(p) = self.pending.get_mut(&pid) else {
             return PairEvent::Ignored("no such pairing");
         };
+        if self.seen.contains(&item_id.to_string()) {
+            return PairEvent::Ignored("this item was judged already");
+        }
         if !matches!(p.phase, Phase::AwaitingResponse) {
             return PairEvent::Ignored("this pairing is not waiting for a response");
         }
+        self.seen.insert(item_id.to_string());
         let reject = |reason: &'static str| PairEvent::Rejected { pid: pid.clone(), reason };
+        // The offer's own window (README 10.1 step 5, the live challenge): a response is not taken to an offer that has expired, whatever the response's own window says.
+        if p.offer.check_window(relay_now).is_err() {
+            return reject("window");
+        }
         let response = match Response::parse(body) {
             Ok(r) => r,
             Err(crate::Error::Crypto(_)) => return reject("key"),
@@ -319,30 +408,35 @@ impl DesktopPairing {
     /// and burn (`confirm_sas` does).
     pub fn submit_sas(&mut self, pid: &str, typed: &str) -> Result<SasStep, PairingError> {
         let p = self.pending.get_mut(pid).ok_or(PairingError::UnknownPairing)?;
-        let Phase::AwaitingSas(v) = &mut p.phase else {
-            return Err(PairingError::WrongState("no response is waiting for a code"));
+        // What the owner types is judged **every time**, also after the code was right once: a pairing that is confirmed and not yet approved (a grant list the host refused) or being
+        // approved (a decision whose answer was lost) is approved only by the code, typed again, and never by whatever comes next.
+        let (v, counting) = match &mut p.phase {
+            Phase::AwaitingSas(v) => (v, true),
+            Phase::Approving { v, .. } => (v, false),
+            _ => return Err(PairingError::WrongState("no response is waiting for a code")),
         };
-        if v.confirmed {
-            return Ok(SasStep::Confirmed);
-        }
-        Ok(match math::judge_sas_entry(&v.sas, typed) {
+        let step = match math::judge_sas_entry(&v.sas, typed) {
             SasEntry::Incomplete => SasStep::Incomplete,
             SasEntry::Invalid => SasStep::Invalid,
             SasEntry::BadCheck => SasStep::BadCheck,
+            SasEntry::Wrong if !counting => {
+                // An approval has been sent: a wrong entry now costs nothing and never denies (the relay may have approved already, and a denial after it is a conflict).
+                SasStep::Wrong { attempts_left: SAS_ATTEMPTS.saturating_sub(v.attempts) }
+            }
             SasEntry::Wrong => {
                 v.attempts += 1;
                 if v.attempts >= SAS_ATTEMPTS {
-                    p.phase = Phase::Done;
-                    SasStep::Exhausted
-                } else {
-                    SasStep::Wrong { attempts_left: SAS_ATTEMPTS - v.attempts }
+                    p.finish();
+                    return Ok(SasStep::Exhausted);
                 }
+                SasStep::Wrong { attempts_left: SAS_ATTEMPTS - v.attempts }
             }
             SasEntry::Right => {
                 v.confirmed = true;
                 SasStep::Confirmed
             }
-        })
+        };
+        Ok(step)
     }
 
     /// The approval body for a pairing whose SAS was typed correctly: `{"approve":true,"phone":{...},"name","appId","grants","receipt":{"issuedAt","signature"}}` with the receipt signed by
@@ -350,7 +444,7 @@ impl DesktopPairing {
     /// and `jti`. Calling it again for the same pairing returns the same body (a retry of a decision whose answer was lost sends the same receipt).
     pub fn approve_body(&mut self, pid: &str, grants: &[String], relay_now: i64) -> Result<String, PairingError> {
         let p = self.pending.get_mut(pid).ok_or(PairingError::UnknownPairing)?;
-        if let Phase::Approving { body } = &p.phase {
+        if let Phase::Approving { body, .. } = &p.phase {
             return Ok(body.clone());
         }
         let Phase::AwaitingSas(v) = &p.phase else {
@@ -384,14 +478,17 @@ impl DesktopPairing {
         ])
         .to_compact();
         self.consumed.insert((b64::encode(&c.pairing_nonce), c.jti.clone()));
-        p.phase = Phase::Approving { body: body.clone() };
+        let Phase::AwaitingSas(v) = std::mem::replace(&mut p.phase, Phase::Done) else {
+            return Err(PairingError::WrongState("no response is waiting for a decision"));
+        };
+        p.phase = Phase::Approving { v, body: body.clone() };
         Ok(body)
     }
 
     /// Marks an approval as delivered.
     pub fn approved(&mut self, pid: &str) {
         if let Some(p) = self.pending.get_mut(pid) {
-            p.phase = Phase::Done;
+            p.finish();
         }
     }
 

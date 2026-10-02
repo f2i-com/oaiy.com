@@ -23,14 +23,19 @@ pub struct Bearer {
     claims: Json,
 }
 
-fn unhex(text: &str) -> Option<Vec<u8>> {
+fn unhex(text: &str) -> Option<Zeroizing<Vec<u8>>> {
     // (`len() % 2` and not `is_multiple_of`, which is newer than the toolchains this crate is built with elsewhere.)
     #[allow(clippy::manual_is_multiple_of)]
     let odd = text.len() % 2 != 0;
     if odd || !text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
         return None;
     }
-    text.as_bytes().chunks(2).map(|p| u8::from_str_radix(core::str::from_utf8(p).ok()?, 16).ok()).collect()
+    // Wiped when dropped, and sized once: the 32 bytes of the bearer's MAC are in it.
+    let mut out = Zeroizing::new(Vec::with_capacity(text.len() / 2));
+    for p in text.as_bytes().chunks(2) {
+        out.push(u8::from_str_radix(core::str::from_utf8(p).ok()?, 16).ok()?);
+    }
+    Some(out)
 }
 
 impl Bearer {
@@ -197,8 +202,9 @@ impl PluginRequest {
     }
 }
 
-/// One entry of `iceServers`, validated by the rules both shipped decoders apply (and `aokie-media`'s `IceServerConfig::validate_all`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One entry of `iceServers`, validated by the rules both shipped decoders apply (and `aokie-media`'s `IceServerConfig::validate_all`). A TURN entry's credential is a secret:
+/// `Debug` prints that there is one and nothing of it, so neither does the `Debug` of an admission, which holds these; the credential is wiped when the entry is dropped.
+#[derive(Clone, PartialEq, Eq)]
 pub struct IceServer {
     /// 1 to 8 URLs of at most 2,048 bytes beginning `stun:`, `stuns:`, `turn:` or `turns:`, none mixing STUN and TURN.
     pub urls: Vec<String>,
@@ -208,6 +214,24 @@ pub struct IceServer {
     pub credential: String,
     /// A TURN entry's expiry, 31 seconds to 24 hours ahead.
     pub expires_at: Option<u64>,
+}
+
+impl core::fmt::Debug for IceServer {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("IceServer")
+            .field("urls", &self.urls)
+            .field("username", &self.username)
+            .field("credential", &if self.credential.is_empty() { "none" } else { "redacted" })
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+impl Drop for IceServer {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.credential.zeroize();
+    }
 }
 
 impl IceServer {

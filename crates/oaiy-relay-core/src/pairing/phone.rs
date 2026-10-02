@@ -39,8 +39,9 @@ pub struct PhoneIdentity {
     pub display_name: Option<String>,
 }
 
-/// What the owner gave: a scanned or pasted pairing key, or a typed code and the relay's host name.
-#[derive(Debug, Clone, Copy)]
+/// What the owner gave: a scanned or pasted pairing key, or a typed code and the relay's host name. **Both hold the pairing secret**, so `Debug` prints their length and the host,
+/// and nothing of the secret.
+#[derive(Clone, Copy)]
 pub enum PairingInput<'a> {
     /// `oaiy://pair?v=3&u=...&s=...`.
     Key(&'a str),
@@ -51,6 +52,15 @@ pub enum PairingInput<'a> {
         /// The host, as the owner typed it (`relay.example.com`).
         host: &'a str,
     },
+}
+
+impl core::fmt::Debug for PairingInput<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            PairingInput::Key(uri) => write!(f, "PairingInput::Key({} characters, redacted)", uri.len()),
+            PairingInput::Typed { code, host } => write!(f, "PairingInput::Typed {{ code: {} characters, redacted, host: {host:?} }}", code.len()),
+        }
+    }
 }
 
 /// Where the pairing is, from the input alone: made without any network call (a typo in a typed code costs nothing).
@@ -73,7 +83,8 @@ impl PairingTarget {
             }
             PairingInput::Typed { code, host } => {
                 let secret = math::parse_typed_code(code)?;
-                // The owner types a host name. A scheme is accepted only where `RelayUrl` accepts it: `http://127.0.0.1:port` in a build with the loopback test feature, and never otherwise.
+                // The owner types a host name. A scheme is accepted only where `RelayUrl` accepts it: `http://127.0.0.1:port` once the program called `allow_loopback_http`
+                // (a test build), and never otherwise.
                 let host = host.trim().trim_end_matches('/');
                 let relay = RelayUrl::parse(&if host.contains("://") { host.to_string() } else { format!("https://{host}") })?;
                 Ok(PairingTarget { relay, fingerprint: None, secret })
@@ -426,9 +437,9 @@ pub fn store_paired(paired: &Paired, secrets: &dyn SecretStore, profiles: &dyn P
 }
 
 /// The phone's keys for a pairing, made fresh.
-pub fn new_identity(display_name: Option<&str>, random: &mut dyn crate::client::Rng) -> Result<PhoneIdentity, PairingError> {
+pub fn new_identity(display_name: Option<&str>) -> Result<PhoneIdentity, PairingError> {
     let mut id = [0u8; 16];
-    random.fill(&mut id);
+    crate::client::clock::os_fill(&mut id);
     Ok(PhoneIdentity {
         endpoint: Signer::generate()?,
         x25519: X25519Secret::generate()?,

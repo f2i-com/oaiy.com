@@ -80,19 +80,22 @@ fn desktop() -> DesktopPairing {
     DesktopPairing::new(std::sync::Arc::new(identity), "aokie", RelayUrl::parse("https://relay.example.com").unwrap(), &thumb)
 }
 
+/// Changed with the fix (M1): this used to assert that the secret, the nonce and the `jti` are a function of the `Rng` the host passes, which is the finding. `create_offer` takes
+/// no random source now; they come from the operating system's generator inside the crate, so they are never a function of anything a host or a test controls.
 #[test]
-fn the_pairing_secret_is_whatever_the_hosts_rng_says() {
-    // The secret is the first 16 bytes the Rng gives, the nonce the next 32, the jti the 12 after: with a seeded generator all three are known in advance.
+fn the_pairing_secret_is_not_a_function_of_any_hosts_rng() {
+    // What a host's seeded generator would have given as the secret, the nonce and the jti.
     let mut replay = SeededRng::new(5);
     let mut secret = [0u8; 16];
+    let mut nonce = [0u8; 32];
     replay.fill(&mut secret);
+    replay.fill(&mut nonce);
     let predicted = math::typed_code(&secret);
-    let a = desktop().create_offer(&mut SeededRng::new(5), 1_790_000_000).unwrap();
-    let b = desktop().create_offer(&mut SeededRng::new(5), 1_790_000_000).unwrap();
-    assert_eq!(a.typed_code, predicted, "the typed code (the secret) is a function of the Rng alone");
-    assert_eq!(a.typed_code, b.typed_code);
-    assert_eq!(a.offer.nonce, b.offer.nonce);
-    // and the crate's own OS-random constructor is not what create_offer uses
-    let os = math::PairingSecret::generate().unwrap();
-    assert_ne!(os.typed_code(), a.typed_code);
+    let a = desktop().create_offer(1_790_000_000).unwrap();
+    let b = desktop().create_offer(1_790_000_000).unwrap();
+    assert_ne!(a.typed_code, predicted, "the typed code (the secret) is not what the seeded generator gives");
+    assert_ne!(a.offer.nonce, nonce);
+    assert_ne!(a.typed_code, b.typed_code, "two offers made the same way do not share a secret");
+    assert_ne!(a.offer.nonce, b.offer.nonce);
+    assert_ne!(a.offer.jti, b.offer.jti);
 }

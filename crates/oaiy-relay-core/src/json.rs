@@ -96,6 +96,54 @@ pub enum Json {
     Obj(Vec<(String, Json)>),
 }
 
+impl Json {
+    /// Overwrites every string of the tree (member names and number spellings too) with zeros and empties the tree. For a document that held a secret (the answer of
+    /// `POST /v1/enroll` holds the device token): the parser's strings are not wiped when they are dropped, so the one who parsed a secret wipes it.
+    pub fn wipe(&mut self) {
+        use zeroize::Zeroize;
+        match self {
+            Json::Null | Json::Bool(_) | Json::Num(Number::Int(_)) => {}
+            Json::Num(Number::Big(t)) | Json::Num(Number::Other(t)) | Json::Str(t) => t.zeroize(),
+            Json::Arr(items) => {
+                for i in items.iter_mut() {
+                    i.wipe();
+                }
+                items.clear();
+            }
+            Json::Obj(members) => {
+                for (k, v) in members.iter_mut() {
+                    k.zeroize();
+                    v.wipe();
+                }
+                members.clear();
+            }
+        }
+        *self = Json::Null;
+    }
+}
+
+/// A parsed document that is wiped ([`Json::wipe`]) when it is dropped: what a caller holds an answer that contains a secret in.
+#[derive(Debug)]
+pub struct Wiped(pub Json);
+
+impl core::ops::Deref for Wiped {
+    type Target = Json;
+    fn deref(&self) -> &Json {
+        &self.0
+    }
+}
+
+impl Drop for Wiped {
+    fn drop(&mut self) {
+        self.0.wipe();
+    }
+}
+
+/// [`parse`], into a document that is wiped when it is dropped.
+pub fn parse_wiped(input: &[u8]) -> Result<Wiped, JsonError> {
+    parse(input).map(Wiped)
+}
+
 /// Parses `input` (general mode: any spelling of a number is read, and kept as written).
 pub fn parse(input: &[u8]) -> Result<Json, JsonError> {
     Parser::run(input, false)
@@ -254,7 +302,9 @@ impl<'a> Parser<'a> {
 
     fn string(&mut self) -> Result<String, JsonError> {
         self.eat(b'"')?;
-        let mut out = String::new();
+        // The first run of ordinary bytes is the whole string unless it has an escape in it: sized once, so that a secret in a string is never copied by a growing buffer.
+        let first = self.b[self.i..].iter().position(|&c| c == b'"' || c == b'\\' || c < 0x20).unwrap_or(0);
+        let mut out = String::with_capacity(first);
         loop {
             // A run of ordinary bytes is copied whole: the input was checked to be UTF-8 and a quote, a backslash or a control byte is never part of a multi-byte character.
             let start = self.i;

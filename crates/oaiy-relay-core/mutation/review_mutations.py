@@ -118,7 +118,7 @@ MUTATIONS = [
     ("G24", "SAS", "the SAS check character covers the 12 characters without its domain", C + "pairing/math.rs",
      "let digest = sha256(&domain_message(SAS_CHECK_DOMAIN, &[chars12.as_bytes()]));", "let digest = sha256(chars12.as_bytes());", "own"),
     ("G25", "typed code", "the typed code's check covers the secret without its domain", C + "pairing/math.rs",
-     "let digest = sha256(&domain_message(TYPED_DOMAIN, &[secret]));", "let digest = sha256(secret);", "own"),
+     "let message = Zeroizing::new(domain_message(TYPED_DOMAIN, &[secret]));", "let message = Zeroizing::new(secret.to_vec());", "own"),
     ("G26", "pairing math", "the pid is derived with another HKDF info", C + "pairing/math.rs",
      "hkdf_sha256(self.0.expose(), Some(HKDF_SALT), b\"rendezvous\", &mut pid)?;", "hkdf_sha256(self.0.expose(), Some(HKDF_SALT), b\"rendezvouz\", &mut pid)?;", "own"),
     # ------------------------------------------------------------------------------------------------ poll rules and numbers

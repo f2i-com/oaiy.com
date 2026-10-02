@@ -340,7 +340,7 @@ fn the_typed_codes_the_normaliser_and_the_sas_check_characters() {
         let got = math::normalise(n.s("input"));
         match n.at("output") {
             Json::Null => assert!(got.is_none(), "{}", n.s("input")),
-            out => assert_eq!(got.as_deref(), out.as_str(), "{}", n.s("input")),
+            out => assert_eq!(got.as_ref().map(|s| s.as_str()), out.as_str(), "{}", n.s("input")),
         }
     }
     for c in v.at("extras.sasCheck.samples").as_array().unwrap() {

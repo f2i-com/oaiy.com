@@ -5,8 +5,11 @@
 //! sent (`X-OAIY-Proof = b64u(Ed25519(seed, "oaiy/relay/1/enroll" || 0x00 || body))`), so the member order [`EnrolRequest`] writes is part of what is signed. The client
 //! proves the relay's identity (README 8) before it sends anything.
 
+use core::fmt::Write as _;
 use oaiy_crypto::kdf::hkdf_sha256_secret;
+
 use oaiy_crypto::zeroize::Secret;
+use zeroize::Zeroizing;
 
 use crate::b64;
 use crate::error::{Error, Result};
@@ -118,15 +121,21 @@ impl EnrolmentKey {
     pub fn to_uri(relay: &RelayUrl, relay_thumbprint: &str, secret: &[u8; 16], role: Role, expires_at: u64) -> Result<String> {
         let s = Secret::<16>::new(*secret);
         let id: Secret<8> = derive(&s, "id")?;
-        Ok(format!(
+        // Built in a buffer sized for the longest key a reader takes, so that it is never copied by growing; the text of the secret that goes into it is wiped.
+        let secret_text = Zeroizing::new(b64::encode(secret));
+        let mut out = String::with_capacity(MAX_URI_LEN);
+        write!(
+            out,
             "oaiy://enroll?v=1&u={}&f={}&k={}&s={}&r={}&x={}",
             percent_encode(&relay.origin()),
             relay_thumbprint,
             b64::encode(id.expose()),
-            b64::encode(secret),
+            secret_text.as_str(),
             role.as_str(),
             expires_at
-        ))
+        )
+        .map_err(|_| Error::Uri("enrolment key"))?;
+        Ok(out)
     }
 
     /// The signer derived from the secret (`HKDF(info = "sig", L = 32)` as an Ed25519 seed): it signs the one enrolment request.
@@ -185,7 +194,8 @@ impl core::fmt::Debug for Enrolled {
 impl Enrolled {
     /// Reads and checks the answer for `role`.
     pub fn parse(body: &[u8], role: Role) -> Result<Enrolled> {
-        let doc = json::parse(body)?;
+        // The tree holds the token as a string: it is wiped when this call is over.
+        let doc = json::parse_wiped(body)?;
         let device_id = doc.get_str("deviceId").ok_or(Error::Invalid("enrol answer: deviceId"))?;
         let id_ok = match role {
             Role::Desktop => ids::is_device_id(device_id),

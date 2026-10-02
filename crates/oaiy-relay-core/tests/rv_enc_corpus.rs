@@ -95,7 +95,7 @@ fn corpus_typed() {
             out.push_str("SKIP\n");
             continue;
         };
-        let norm = math::normalise(s).map_or("NONE".to_string(), |n| format!("OK:{n}"));
+        let norm = math::normalise(s).map_or("NONE".to_string(), |n| format!("OK:{}", n.as_str()));
         let parsed = match math::parse_typed_code(s) {
             Ok(secret) => format!("OK:{}", hex(secret.expose())),
             Err(e) => format!("ERR:{e}"),

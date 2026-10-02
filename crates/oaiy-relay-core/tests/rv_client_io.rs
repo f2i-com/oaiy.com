@@ -951,7 +951,6 @@ fn finding_http_response_debug_does_not_print_a_token_body() {
 /// F4-D2 (low): `IceServer` derives `Debug`, and `MobileAdmission` and `PluginAdmission` derive it over their `ice_servers`, so `{:?}` of an admission prints the TURN credential
 /// (the admission bearer itself is redacted). The README says no secret is in `Debug` output.
 #[test]
-#[ignore = "F4-D2 (low): IceServer derives Debug and prints the TURN credential (admission.rs:201)"]
 fn finding_the_debug_of_an_ice_server_does_not_print_its_turn_credential() {
     let s = oaiy_relay_core::admission::IceServer {
         urls: vec!["turns:turn.example.com:443".into()],

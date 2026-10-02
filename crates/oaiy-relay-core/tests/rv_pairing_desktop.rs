@@ -46,7 +46,7 @@ fn response_text(offer: &NewOffer, phone: &Signer, claims: Claims) -> String {
 /// A pending pairing that has a good response (from an attacker with `s`) and so waits for the SAS; returns the offer and the SAS the "phone" would show.
 fn awaiting_sas(w: &mut World) -> (NewOffer, Sas) {
     let now = w.env.client.relay_now_or_local();
-    let offer = w.desktop.create_offer(&mut w.rng, now).unwrap();
+    let offer = w.desktop.create_offer(now).unwrap();
     let phone = Signer::generate().unwrap();
     let text = response_text(&offer, &phone, claims_for(&offer, &phone, now as u64));
     let event = w.desktop.receive_response(&offer.pid, &text, now);
@@ -201,7 +201,7 @@ fn attack_every_binding_of_a_response_to_its_offer_is_checked_even_when_the_mac_
         ("jti", Box::new(|c: &mut Claims| c.jti = "pair-AAAAAAAAAAAAAAAA".into())),
     ];
     for (what, alter) in cases {
-        let offer = w.desktop.create_offer(&mut w.rng, now).unwrap();
+        let offer = w.desktop.create_offer(now).unwrap();
         let phone = Signer::generate().unwrap();
         let mut claims = claims_for(&offer, &phone, now as u64);
         alter(&mut claims);
@@ -209,7 +209,7 @@ fn attack_every_binding_of_a_response_to_its_offer_is_checked_even_when_the_mac_
         assert_eq!(w.desktop.receive_response(&offer.pid, &text, now), PairEvent::Rejected { pid: offer.pid.clone(), reason: "binding" }, "{what}");
     }
     // Control: the same attacker, unaltered claims, is a response like any other.
-    let offer = w.desktop.create_offer(&mut w.rng, now).unwrap();
+    let offer = w.desktop.create_offer(now).unwrap();
     let phone = Signer::generate().unwrap();
     let text = response_text(&offer, &phone, claims_for(&offer, &phone, now as u64));
     assert!(matches!(w.desktop.receive_response(&offer.pid, &text, now), PairEvent::AwaitingSas { .. }));
@@ -219,7 +219,7 @@ fn attack_every_binding_of_a_response_to_its_offer_is_checked_even_when_the_mac_
 fn attack_a_second_response_cannot_replace_the_one_the_owner_is_checking() {
     let mut w = world(quick());
     let now = w.env.client.relay_now_or_local();
-    let offer = w.desktop.create_offer(&mut w.rng, now).unwrap();
+    let offer = w.desktop.create_offer(now).unwrap();
     let (first, second) = (Signer::generate().unwrap(), Signer::generate().unwrap());
     let t1 = response_text(&offer, &first, claims_for(&offer, &first, now as u64));
     let t2 = response_text(&offer, &second, claims_for(&offer, &second, now as u64));
@@ -240,7 +240,7 @@ fn attack_a_second_response_cannot_replace_the_one_the_owner_is_checking() {
 fn attack_a_response_that_is_malformed_in_any_member_is_rejected_before_any_check_of_its_value() {
     let mut w = world(quick());
     let now = w.env.client.relay_now_or_local();
-    let offer = w.desktop.create_offer(&mut w.rng, now).unwrap();
+    let offer = w.desktop.create_offer(now).unwrap();
     let phone = Signer::generate().unwrap();
     let good = response_text(&offer, &phone, claims_for(&offer, &phone, now as u64));
     let bad: Vec<(&str, String)> = vec![
@@ -401,7 +401,7 @@ fn attack_a_valid_response_in_an_item_of_another_lane_or_another_sender_is_not_a
     // The pending offer waits for a response (so that nothing but the item filter can stop the item), and the body is a response an attacker with `s` could make.
     let mut w = world(quick());
     let now = w.env.client.relay_now_or_local();
-    let offer = w.desktop.create_offer(&mut w.rng, now).unwrap();
+    let offer = w.desktop.create_offer(now).unwrap();
     let phone = Signer::generate().unwrap();
     let text = response_text(&offer, &phone, claims_for(&offer, &phone, now as u64));
     let item = |lane: &str, from: &str| Item {
@@ -458,7 +458,6 @@ fn attack_a_decision_answer_that_does_not_say_what_was_decided_is_refused() {
 // ------------------------------------------------------------------------------------------------------------------ findings
 
 #[test]
-#[ignore = "finding: the desktop never expires a pending offer"]
 fn finding_the_desktop_accepts_a_fresh_response_to_an_offer_that_expired_long_ago() {
     // An attacker who has the secret of an old QR (photographed, a screenshot) and a relay that delivers what it is given (a hostile or compromised one): the offer's window is 600 s
     // (README 10.1) and the desktop is the only party that knows the offer is over, but `receive_response` judges only the response's own 120 s window.
@@ -472,7 +471,6 @@ fn finding_the_desktop_accepts_a_fresh_response_to_an_offer_that_expired_long_ag
 }
 
 #[test]
-#[ignore = "finding: confirm_sas cannot be retried after a failed decision"]
 fn finding_confirm_sas_strands_the_pairing_after_one_failed_decision_request() {
     let mut w = world(quick());
     let offer = w.new_offer();
@@ -540,7 +538,6 @@ fn finding_the_stub_does_not_answer_the_same_approval_again_as_the_relay_does() 
 }
 
 #[test]
-#[ignore = "finding: a confirmed pairing approves for any typed text"]
 fn finding_once_the_code_was_right_any_later_entry_approves() {
     let mut w = world(quick());
     let offer = w.new_offer();
@@ -557,7 +554,6 @@ fn finding_once_the_code_was_right_any_later_entry_approves() {
 }
 
 #[test]
-#[ignore = "finding: create_offer_with replaces a pending pairing of the same pid and resets its attempts"]
 fn finding_a_second_offer_with_the_same_secret_resets_the_attempt_counter() {
     let mut w = world(quick());
     let now = w.env.client.relay_now_or_local();
@@ -579,7 +575,7 @@ fn attack_the_sas_depends_on_both_endpoint_keys_in_order_the_nonce_and_the_raw_p
     // A relay that substitutes the phone's key (so that the desktop would show other numbers than the phone) is seen by the owner: the SAS of two phone keys differ.
     let mut w = world(quick());
     let now = w.env.client.relay_now_or_local();
-    let offer = w.desktop.create_offer(&mut w.rng, now).unwrap();
+    let offer = w.desktop.create_offer(now).unwrap();
     let d = derived(&offer);
     let (k1, k2) = (Signer::generate().unwrap().verify_key().to_bytes(), Signer::generate().unwrap().verify_key().to_bytes());
     let dk = offer.offer.desktop_endpoint.to_bytes();

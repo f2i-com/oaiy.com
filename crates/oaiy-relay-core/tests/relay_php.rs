@@ -327,12 +327,11 @@ fn a_whole_pairing_between_the_desktop_party_and_the_phone_party_on_the_real_rel
     let mut since = 0u64;
 
     // ---- by the scanned key
-    let offer = desktop.create_offer(&mut OsRng, dclient.relay_now_or_local()).unwrap();
+    let offer = desktop.create_offer(dclient.relay_now_or_local()).unwrap();
     desktop.open(&dclient, &dtoken, &offer, &Cancel::new()).expect("the real relay opens the rendezvous");
     let target = PairingTarget::from_input(PairingInput::Key(&offer.pairing_uri)).unwrap();
     let pclient = real.client(None, 3);
-    let mut phone =
-        PhonePairing::new(pclient.clone(), target, oaiy_relay_core::pairing::phone::new_identity(Some("Test phone"), &mut OsRng).unwrap()).unwrap();
+    let mut phone = PhonePairing::new(pclient.clone(), target, oaiy_relay_core::pairing::phone::new_identity(Some("Test phone")).unwrap()).unwrap();
     let summary = phone.fetch_offer(&Cancel::new()).expect("the offer the real relay serves verifies");
     assert_eq!((summary.desktop_name.as_str(), summary.app_id.as_str()), ("Front desk PC", "aokie"));
     let sas = phone.respond(&Cancel::new()).expect("the real relay takes the response");
@@ -442,12 +441,11 @@ fn a_whole_pairing_between_the_desktop_party_and_the_phone_party_on_the_real_rel
     assert_eq!(forged[0].code.as_deref(), Some("invalid_item"));
 
     // ---- by the typed code, with the host as the owner types it
-    let second = desktop.create_offer(&mut OsRng, dclient.relay_now_or_local()).unwrap();
+    let second = desktop.create_offer(dclient.relay_now_or_local()).unwrap();
     desktop.open(&dclient, &dtoken, &second, &Cancel::new()).unwrap();
     let target = PairingTarget::from_input(PairingInput::Typed { code: &second.typed_code, host: &real.relay.public_url() }).unwrap();
     let mut typed =
-        PhonePairing::new(real.client(None, 4), target, oaiy_relay_core::pairing::phone::new_identity(Some("Second phone"), &mut OsRng).unwrap())
-            .unwrap();
+        PhonePairing::new(real.client(None, 4), target, oaiy_relay_core::pairing::phone::new_identity(Some("Second phone")).unwrap()).unwrap();
     typed.fetch_offer(&Cancel::new()).unwrap();
     let sas2 = typed.respond(&Cancel::new()).unwrap();
     for i in pair_items(&dclient, &dtoken, &mut since).iter().filter(|i| i.lane == "pair") {
@@ -461,6 +459,6 @@ fn a_whole_pairing_between_the_desktop_party_and_the_phone_party_on_the_real_rel
 
     // A pairing is single use: the first offer's rendezvous reads as ended or already decided to anyone who asks again.
     let late = PairingTarget::from_input(PairingInput::Key(&offer.pairing_uri)).unwrap();
-    let mut again = PhonePairing::new(real.client(None, 5), late, oaiy_relay_core::pairing::phone::new_identity(None, &mut OsRng).unwrap()).unwrap();
+    let mut again = PhonePairing::new(real.client(None, 5), late, oaiy_relay_core::pairing::phone::new_identity(None).unwrap()).unwrap();
     assert!(again.fetch_offer(&Cancel::new()).is_err());
 }

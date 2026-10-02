@@ -16,7 +16,6 @@ fn the_default_port_is_the_same_origin() {
 }
 
 #[test]
-#[ignore = "low: Sas has public fields and display() slices chars12[0..4], [4..8], [8..12], so a Sas built by a host panics, in Debug too"]
 fn a_sas_built_by_a_host_does_not_panic() {
     let sas = Sas { raw: [0; 8], chars12: "AB".into(), check: '0' };
     assert!(std::panic::catch_unwind(|| sas.display()).is_ok());

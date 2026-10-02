@@ -65,7 +65,18 @@ impl Clock for SystemClock {
     }
 }
 
-/// A source of random bytes and of the jitter draw `u`.
+/// Fills `buf` from the operating system's random generator (through `oaiy-crypto`, the one place this workspace asks for it). A failure of the generator is a panic: no
+/// protocol value may be made from weaker randomness, and it does not fail on any platform this ships on.
+pub(crate) fn os_fill(buf: &mut [u8]) {
+    for chunk in buf.chunks_mut(32) {
+        let random = oaiy_crypto::zeroize::Secret::<32>::random().expect("the operating system's random generator");
+        chunk.copy_from_slice(&random.expose()[..chunk.len()]);
+    }
+}
+
+/// A source of the jitter draw `u` of the pauses (README P6), and of nothing else. **No secret and no protocol value is drawn from it**: the pairing secret, the offer's nonce
+/// and `jti`, the proof nonces, the identity keys and the device ids all come from the operating system's generator inside this crate (`oaiy-crypto`), whatever a host passes
+/// here, so that a predictable generator (a seeded one in a test, a poor one on a platform) can only make the pauses predictable.
 pub trait Rng: Send {
     /// Fills `buf`.
     fn fill(&mut self, buf: &mut [u8]);
@@ -78,17 +89,13 @@ pub trait Rng: Send {
     }
 }
 
-/// The operating system's random generator (through `oaiy-crypto`, the one place this workspace asks for it). A failure of the generator is a panic: no protocol value
-/// may be made from weaker randomness, and it does not fail on any platform this ships on.
+/// The operating system's random generator ([`os_fill`]): what a product passes to [`crate::client::RelayClient::new`] for its jitter.
 #[derive(Debug, Default)]
 pub struct OsRng;
 
 impl Rng for OsRng {
     fn fill(&mut self, buf: &mut [u8]) {
-        for chunk in buf.chunks_mut(32) {
-            let random = oaiy_crypto::zeroize::Secret::<32>::random().expect("the operating system's random generator");
-            chunk.copy_from_slice(&random.expose()[..chunk.len()]);
-        }
+        os_fill(buf);
     }
 }
 

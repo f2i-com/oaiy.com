@@ -116,7 +116,6 @@ fn rv_a_phone_answers_afresh_after_its_response_was_rejected_for_its_window() {
 /// F-confirm: `approve_body` documents that a retry of a decision whose answer was lost sends the same receipt, but `confirm_sas`, the documented whole gate, refuses the retry
 /// because `approve_body` already moved the pairing out of the phase `submit_sas` reads.
 #[test]
-#[ignore = "review finding: confirm_sas cannot be retried after a failed decision POST"]
 fn rv_confirm_sas_is_retryable_when_the_decision_post_was_lost() {
     let mut w = world(StubConfig { receipt_includes_grants: true, ..quick() });
     let offer = w.new_offer();

@@ -77,7 +77,6 @@ fn what_debug_prints() {
 
 /// Fails today (run with `--ignored`): `PairingInput` (the scanned key or the typed code), `IceServer` (a TURN credential) and `Sas` print what they hold.
 #[test]
-#[ignore = "a finding: PairingInput, IceServer and Sas derive or implement a Debug that prints a secret"]
 fn no_public_type_prints_a_secret() {
     let leaks = battery();
     assert!(leaks.is_empty(), "{leaks:?}");

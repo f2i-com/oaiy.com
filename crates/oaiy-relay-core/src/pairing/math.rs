@@ -7,6 +7,7 @@
 
 use oaiy_crypto::kdf::{hkdf_sha256, hkdf_sha256_secret, hmac_sha256, hmac_sha256_verify, sha256};
 use oaiy_crypto::zeroize::{ct_eq, Secret};
+use zeroize::Zeroizing;
 
 use crate::b64;
 use crate::error::{Error, Result};
@@ -92,6 +93,12 @@ pub fn pid_text(pid: &[u8; 16]) -> String {
 /// Writes `bits` (most significant first) as Crockford characters, five bits each; the last group is padded with zero bits.
 fn crockford_encode(bytes: &[u8], bit_count: usize) -> String {
     let mut out = String::with_capacity(bit_count.div_ceil(5));
+    crockford_push(&mut out, bytes, bit_count);
+    out
+}
+
+/// [`crockford_encode`] onto the end of `out` (a buffer the caller wipes, for a secret: no temporary holds a copy).
+fn crockford_push(out: &mut String, bytes: &[u8], bit_count: usize) {
     let mut pos = 0;
     while pos < bit_count {
         let mut v = 0u8;
@@ -103,7 +110,6 @@ fn crockford_encode(bytes: &[u8], bit_count: usize) -> String {
         out.push(char::from(CROCKFORD[usize::from(v)]));
         pos += 5;
     }
-    out
 }
 
 /// The 5-bit value of a Crockford character (already normalised: upper case, `I`/`L`/`O` mapped), `None` outside the alphabet.
@@ -111,9 +117,10 @@ fn crockford_value(c: char) -> Option<u8> {
     CROCKFORD.iter().position(|&a| char::from(a) == c).map(|i| i as u8)
 }
 
-/// Upper-cases, reads `I` and `L` as `1` and `O` as `0`, drops dashes and spaces, and refuses `U` and anything else outside the alphabet. `None` is "not a code".
-pub fn normalise(text: &str) -> Option<String> {
-    let mut out = String::with_capacity(text.len());
+/// Upper-cases, reads `I` and `L` as `1` and `O` as `0`, drops dashes and spaces, and refuses `U` and anything else outside the alphabet. `None` is "not a code". The result
+/// is wiped when it is dropped: it is a pairing secret or the SAS the owner types.
+pub fn normalise(text: &str) -> Option<Zeroizing<String>> {
+    let mut out = Zeroizing::new(String::with_capacity(text.len()));
     for c in text.chars() {
         let c = match c.to_ascii_uppercase() {
             '-' | ' ' => continue,
@@ -127,15 +134,18 @@ pub fn normalise(text: &str) -> Option<String> {
     Some(out)
 }
 
-fn typed_check(secret: &[u8; 16]) -> String {
-    let digest = sha256(&domain_message(TYPED_DOMAIN, &[secret]));
-    crockford_encode(&digest, 10)
+fn typed_check(secret: &[u8; 16]) -> Zeroizing<String> {
+    // The message holds the secret and the digest is a function of it: both are wiped.
+    let message = Zeroizing::new(domain_message(TYPED_DOMAIN, &[secret]));
+    let digest = Zeroizing::new(sha256(&message));
+    Zeroizing::new(crockford_encode(&*digest, 10))
 }
 
 /// The typed code of `secret`: 26 characters carrying its 128 bits (the last two bits zero) and 2 check characters (the first 10 bits of
 /// `SHA-256("oaiy/pairing/3/typed" || 0x00 || s)`), in seven groups of four separated by dashes.
 pub fn typed_code(secret: &[u8; 16]) -> String {
-    let mut chars = crockford_encode(secret, 128);
+    let mut chars = Zeroizing::new(String::with_capacity(28));
+    crockford_push(&mut chars, secret, 128);
     chars.push_str(&typed_check(secret));
     let mut out = String::with_capacity(34);
     for (i, c) in chars.chars().enumerate() {
@@ -151,6 +161,7 @@ pub fn typed_code(secret: &[u8; 16]) -> String {
 /// locally before any network call, so a typo costs nothing. `Err` is "not a pairing code" and says no more than that.
 pub fn parse_typed_code(text: &str) -> Result<PairingSecret> {
     let chars = normalise(text).ok_or(Error::Invalid("typed code: characters"))?;
+    // (`bits` and `secret` are stack arrays; every heap copy is wiped.)
     if chars.len() != 28 {
         return Err(Error::Invalid("typed code: length"));
     }
@@ -187,16 +198,27 @@ pub struct Sas {
     pub check: char,
 }
 
+/// The code the owner is shown and types is what makes a pairing the owner's: its `Debug` prints nothing of it.
 impl core::fmt::Debug for Sas {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "Sas({})", self.display())
+        f.write_str("Sas(redacted)")
+    }
+}
+
+impl Drop for Sas {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.raw.zeroize();
+        self.chars12.zeroize();
     }
 }
 
 impl Sas {
-    /// `XXXX-XXXX-XXXX-C`, as the phone shows it.
+    /// `XXXX-XXXX-XXXX-C`, as the phone shows it. A value that [`sas`] made has 12 characters; for any other (the fields are public) the groups are whatever is there, and
+    /// this never panics.
     pub fn display(&self) -> String {
-        format!("{}-{}-{}-{}", &self.chars12[0..4], &self.chars12[4..8], &self.chars12[8..12], self.check)
+        let part = |from: usize, to: usize| self.chars12.get(from..to).or_else(|| self.chars12.get(from..)).unwrap_or("");
+        format!("{}-{}-{}-{}", part(0, 4), part(4, 8), part(8, 12), self.check)
     }
 }
 
@@ -401,6 +423,12 @@ impl PairingKey {
 
     /// Writes a pairing key in the canonical order `v, u, f, s, x`.
     pub fn to_uri(relay: &RelayUrl, relay_thumbprint: &str, secret: &PairingSecret, expires_at: u64) -> String {
-        format!("oaiy://pair?v=3&u={}&f={}&s={}&x={}", percent_encode(&relay.origin()), relay_thumbprint, secret.b64u(), expires_at)
+        use core::fmt::Write as _;
+        // In a buffer sized for the longest key a reader takes (it is never copied by growing), and the text of the secret that goes into it is wiped.
+        let secret_text = Zeroizing::new(secret.b64u());
+        let mut out = String::with_capacity(MAX_URI_LEN);
+        let _ =
+            write!(out, "oaiy://pair?v=3&u={}&f={}&s={}&x={}", percent_encode(&relay.origin()), relay_thumbprint, secret_text.as_str(), expires_at);
+        out
     }
 }
