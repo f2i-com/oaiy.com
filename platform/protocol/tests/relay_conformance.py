@@ -1798,13 +1798,22 @@ pc_doc = json.loads((PC / "poll-client.json").read_text(encoding="utf-8"))
 # What the table holds, pinned here as the vectors' values are (DESIGN_PINS): a case that goes missing from the table, or one that is added,
 # changes these, and whoever does it changes them here on purpose. The readers check the table against its own caseCount and idsSha256, which
 # a table edited to agree with itself would satisfy; these are what that edit cannot satisfy.
-POLL_CLIENT_PINS = {"cases": 111, "idsSha256": "e9ce737bd8df32d166aa61cd5dfdc6aea038f72437063be9d1d3633613a4c34d"}
+POLL_CLIENT_PINS = {"cases": 135, "idsSha256": "9c82ed60bdf576fd414ef432e3f9df7f4e617cc563a0cf10e74e4de572f20479",
+                    "layoutSha256": "6558668de8734e3cb5add52fb88bd96e0225ca22ebfc7e5f4c9c15ebdaf4853b"}
 ok("README has the section and states each of the rules P1 to P9 by its number",
    "### 5.1.1 The poll loop of a native client (DK-03 and MOB-21a)" in pc_readme and all(f"**P{i}. " in pc_readme for i in range(1, 10)))
 pc_ids = [x["id"] for x in pc_doc["cases"]]
 ok("the table holds exactly the cases that are pinned here, by their number and the digest of their names (a case that went missing is noticed)",
    len(pc_ids) == POLL_CLIENT_PINS["cases"] and len(set(pc_ids)) == len(pc_ids) and hashlib.sha256("\n".join(sorted(pc_ids)).encode("utf-8")).hexdigest() == POLL_CLIENT_PINS["idsSha256"]
    and pc_doc["caseCount"] == len(pc_ids) and pc_doc["idsSha256"] == POLL_CLIENT_PINS["idsSha256"])
+
+
+def pc_layout(doc) -> str:
+    return hashlib.sha256("\n".join(f"{x['id']}|{x['rule']}" for x in doc["cases"]).encode("utf-8")).hexdigest()
+
+
+ok("the table holds the cases with the rule labels, in the order, that are pinned here (a case that was relabelled or moved is noticed)",
+   pc_layout(pc_doc) == POLL_CLIENT_PINS["layoutSha256"] == pc_doc.get("layoutSha256"))
 ok("README says what DK-03 and MOB-21a are, since nothing else in the repository does",
    "DK-03 is the work package that builds the desktop's relay client" in pc_readme and "MOB-21a the one that builds the phone's" in pc_readme)
 ok("every rule P1 to P9 has cases in the table",
@@ -1818,6 +1827,62 @@ ok("README states the numbers the table pins: clamp 1 to 120, jitter up to 20 pe
    all(s in pc_readme for s in ("`clamp(x)` is `x` limited to 1 to 120", "`pause = base * (1 + 0.2 * u)`", "`base = max(clamp(D), min(30, 2^(n-1)))`: 1, 2, 4, 8, 16, 30, 30...",
                                 "`base = min(60, 2^(n-1))`: 1, 2, 4, 8, 16, 32, 60, 60...", "after three failures in a row", "when the fifth `429` in a row says `rule: \"in_flight\"`",
                                 "no sooner than 250 ms after it started the one it cancels")))
+
+
+def pc_readme_constants(text: str) -> dict:
+    """Every number of the table's `constants` block, read out of the README's own words (None where the README does not say it as expected)."""
+    words = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "fifth": 5, "six": 6, "seven": 7}
+
+    def find(pattern, group=1, conv=int):
+        m = re.search(pattern, text)
+        if m is None:
+            return None
+        v = m.group(group)
+        return words.get(v) if v in words else conv(v)
+
+    lo_hi = re.search(r"`clamp\(x\)` is `x` limited to (\d+) to (\d+)", text)
+    return {
+        "replaceMinMs": find(r"no sooner than (\d+) ms after it started the one it cancels"),
+        "clampMin": int(lo_hi.group(1)) if lo_hi else None,
+        "clampMax": int(lo_hi.group(2)) if lo_hi else None,
+        "retryAfterBodyMax": find(r"`error\.retryAfter` when that is an integer from 0 to (\d+)"),
+        "retryAfterDigitsMax": find(r"one to (\w+) decimal digits"),
+        "jitter": find(r"`pause = base \* \(1 \+ ([0-9.]+) \* u\)`", conv=float),
+        "backoff429Cap": find(r"\*\*flow:\*\* `base = max\(clamp\(D\), min\((\d+), 2\^\(n-1\)\)\)`"),
+        "backoffFailureCap": find(r"\*\*failure:\*\* `base = min\((\d+), 2\^\(n-1\)\)`"),
+        "unreachableAfter": find(r"after (\w+) failures in a row \(about"),
+        "inFlightDefectAfter": find(r"The (\w+) `429` in a row, when it says `rule: \"in_flight\"`"),
+        "refusedHoldDefaultS": find(r"\((\d+) when it is absent or not an integer"),
+        "proofEveryS": find(r"at least every (\d+) seconds while it polls"),
+        "proofAfterPauseS": find(r"after any pause of (\d+) seconds or more"),
+        "pollTimeoutExtraS": find(r"own timeout is `wait \+ (\d+)` seconds"),
+    }
+
+
+import ast  # noqa: E402
+
+pc_from_readme = pc_readme_constants(pc_readme)
+pc_py_src = ast.parse((PC / "verify_poll_client.py").read_text(encoding="utf-8"))
+pc_py_expected = next(ast.literal_eval(n.value) for n in pc_py_src.body if isinstance(n, ast.Assign) and any(getattr(t, "id", "") == "EXPECTED" for t in n.targets))
+pc_mjs_block = re.search(r"const EXPECTED = \{(.*?)\};", (PC / "verify_poll_client.mjs").read_text(encoding="utf-8"), re.S).group(1)
+pc_mjs_expected = {k: (float(v) if "." in v else int(v)) for k, v in re.findall(r"(\w+):\s*([0-9.]+)", pc_mjs_block)}
+ok("every number of the table's constants is said by the README's own words, as the table says it (the two readers' own copies are not what is held to)",
+   None not in pc_from_readme.values() and pc_from_readme == pc_doc["constants"], f"README {pc_from_readme}, table {pc_doc['constants']}")
+ok("and the Python reader's EXPECTED is the README's numbers", pc_py_expected == pc_from_readme, f"reader {pc_py_expected}, README {pc_from_readme}")
+ok("and the Node reader's EXPECTED is the README's numbers", pc_mjs_expected == pc_from_readme, f"reader {pc_mjs_expected}, README {pc_from_readme}")
+ok("README settles what the clean-room readings of 5.1.1 disagreed on: what a valid 200 is (and that a reset with no usable epoch or cursor is a failure that adopts nothing), which items are accepted, that the rows are tried in order, the pause and the report of a storage failure, which failures never say unreachable, the action of an in_flight 429, what a proof does to the counters, and that a burst can be refused beyond the surplus",
+   all(s in pc_readme for s in ("whose `epoch` is a string of 11 characters of the base64url alphabet (8 bytes) and whose `cursor` is an integer from 0 to 2^53 - 1", "a reset that carries no usable `epoch` or `cursor` is one: nothing is adopted",
+                                "**An item is accepted** when its `seq` is an integer above the `since` the poll carried and above the `seq` of the item accepted before it in the same answer",
+                                "The rows are tried in the order of the table and the first that fits is the answer", "a refused hold, or a superseded answer, that carries an accepted item is progress",
+                                "and the answer is a **failure** for the pause", "a valid `200` whose accepted items (or whose reset) could not be written to the client's store (see to persist, below)", "it reports `storage_failure`, and never `unreachable`", "never carries `unreachable`: the first `400`",
+                                "(the action `cancel_own_polls`, on every `429` that says `in_flight`)", "`cancel_own_polls` (P4)", "the failure count is cleared (it proves the relay answered, as P7 says of a success), while the 429 count, the count of refused holds and the 400 count stay as they were",
+                                "Polls that arrive in the same instant can be refused beyond the surplus", "a burst of four refusing two and a burst of five refusing four")))
+# Every epoch the table gives is what the schema says an epoch is (8 bytes: 11 characters), except where a case is a bad epoch on purpose and expects a failure.
+pc_epoch = re.compile(r"[A-Za-z0-9_-]{11}")
+pc_bad_epochs = [x["id"] for x in pc_doc["cases"] if isinstance(x.get("response", {}).get("body"), dict) and isinstance(x["response"]["body"].get("epoch"), str)
+                 and pc_epoch.fullmatch(x["response"]["body"]["epoch"]) is None]
+ok("the epochs of the table are 8 bytes (11 characters) as common.schema.json says, but for the cases that are a bad epoch on purpose and expect a failure",
+   all(i.startswith("p2-") and next(x for x in pc_doc["cases"] if x["id"] == i)["expect"]["outcome"] == "failure" for i in pc_bad_epochs) and 0 < len(pc_bad_epochs) <= 2, str(pc_bad_epochs))
 ok("README says how the two refusals of a poll are told apart (error.rule: gap, in_flight), that a 429 is neither a success nor a failure, how Retry-After is read (digits, HTTP-date, the body, none) and what the shipped carriers do, with their lines",
    all(s in pc_readme for s in ("`\"rule\":\"gap\"`", "`\"rule\":\"in_flight\"`", "A **429 is never a failure**", "an HTTP-date (the IMF-fixdate of RFC 9110", "`error.retryAfter` when that is an integer from 0 to 86400",
                                 "plugin `companion_relay.rs` 50-52 and 670-677; phone 70-72 and 458-460", "plugin 53-56 and 745-755; phone 73-76 and 560-564", "(`post_frames`, 980-1031)")))
@@ -1879,6 +1944,29 @@ pc_damaged = [
     ("a table whose constants say a clamp of 100", dict(copy.deepcopy(pc_doc), constants=dict(pc_doc["constants"], clampMax=100))),
     ("a table whose constants say a jitter of 30 percent", dict(copy.deepcopy(pc_doc), constants=dict(pc_doc["constants"], jitter=0.3))),
     ("a table whose constants say a failure backoff capped at 120", dict(copy.deepcopy(pc_doc), constants=dict(pc_doc["constants"], backoffFailureCap=120))),
+    # (no rule of the table uses this number: nothing but the guard on the constants block can see it)
+    ("a table whose constants say a poll's own timeout of wait + 20", dict(copy.deepcopy(pc_doc), constants=dict(pc_doc["constants"], pollTimeoutExtraS=20))),
+    ("a table whose constants hold a number the README does not state", dict(copy.deepcopy(pc_doc), constants=dict(pc_doc["constants"], invented=1))),
+    ("a table whose constants lack one", dict(copy.deepcopy(pc_doc), constants={k: v for k, v in pc_doc["constants"].items() if k != "proofEveryS"})),
+    ("a case relabelled as another rule (the digest of the layout as it was)", dict(copy.deepcopy(pc_doc), cases=[dict(pc_doc["cases"][0], rule="P9")] + pc_doc["cases"][1:])),
+    ("two cases that were swapped (the digest of the layout as it was)", dict(copy.deepcopy(pc_doc), cases=[pc_doc["cases"][1], pc_doc["cases"][0]] + pc_doc["cases"][2:])),
+    ("a refused hold that carries an accepted item and is called idle", pc_damage("p2-refused-hold-with-items", ("expect", "outcome"), "idle")),
+    ("an item at or below the since that is accepted", pc_damage("p2-items-not-above-since", ("expect", "outcome"), "progress")),
+    ("an item that is not above the one accepted before it that is accepted too", pc_damage("p2-items-out-of-order", ("expect", "since"), 3)),
+    ("a reset with no cursor that is adopted", pc_damage("p2-reset-no-cursor", ("expect", "outcome"), "progress")),
+    ("a reset with a short epoch that is adopted", pc_damage("p2-reset-short-epoch", ("expect", "outcome"), "progress")),
+    ("a reset that does not adopt a cursor lower than the since", pc_damage("p2-reset-lower-cursor", ("expect", "since"), 50)),
+    ("a storage failure that is not paced", pc_damage("p2-storage-failure", ("expect", "baseS"), 0)),
+    ("a storage failure that is reported unreachable", pc_damage("p2-storage-failure", ("expect", "report"), ["storage_failure", "unreachable"])),
+    ("a storage failure that advances since", pc_damage("p2-storage-failure-first", ("expect", "since"), 6)),
+    ("an in_flight 429 that does not cancel the client's own polls", pc_damage("p4-in-flight-cancels-own-polls", ("expect", "action"), None)),
+    ("a fifth 429 with no rule that is reported as the in_flight defect", pc_damage("p7-429-5-no-rule", ("expect", "report"), ["in_flight_defect"])),
+    ("a fifth 429 with a rule nobody knows that is reported as the in_flight defect", pc_damage("p7-429-5-unknown-rule", ("expect", "report"), ["in_flight_defect"])),
+    ("a failure after a first 400 that is not reported unreachable at the fourth", pc_damage("p7-500-after-400-reports-unreachable", ("expect", "report"), [])),
+    ("a first 400 that is reported unreachable at the third failure", pc_damage("p2-400-first-after-failures", ("expect", "report"), ["invalid_request", "unreachable"])),
+    ("a verified proof that clears the 429 count", pc_damage("p9-proof-verified", ("expect", "state", "n429"), 0)),
+    ("a proof that gets no answer and keeps the 429 count", pc_damage("p9-proof-no-answer", ("expect", "state", "n429"), 2)),
+    ("a proof that does not verify and clears the failure count", pc_damage("p9-proof-wrong-key", ("expect", "state", "nFail"), 0)),
 ]
 # A table that was edited to agree with itself (a case removed, its count and digest recomputed) is accepted by the readers, which is why the
 # pins above exist: it does not agree with them.
@@ -1888,6 +1976,14 @@ pc_edited["caseCount"] = len(pc_edited["cases"])
 pc_edited["idsSha256"] = hashlib.sha256("\n".join(sorted(x["id"] for x in pc_edited["cases"])).encode("utf-8")).hexdigest()
 ok("a table edited to agree with itself (a case removed, its count and digest recomputed) is not the pinned one",
    pc_edited["idsSha256"] != POLL_CLIENT_PINS["idsSha256"] and pc_edited["caseCount"] != POLL_CLIENT_PINS["cases"])
+pc_relabelled = copy.deepcopy(pc_doc)
+pc_relabelled["cases"][0]["rule"] = "P9"
+pc_relabelled["layoutSha256"] = pc_layout(pc_relabelled)
+pc_moved = copy.deepcopy(pc_doc)
+pc_moved["cases"][0], pc_moved["cases"][1] = pc_moved["cases"][1], pc_moved["cases"][0]
+pc_moved["layoutSha256"] = pc_layout(pc_moved)
+ok("a table with a case relabelled, or two cases swapped, and its layout digest recomputed is not the pinned one",
+   pc_relabelled["layoutSha256"] != POLL_CLIENT_PINS["layoutSha256"] and pc_moved["layoutSha256"] != POLL_CLIENT_PINS["layoutSha256"])
 with tempfile.TemporaryDirectory() as tmpd:
     for i, (what, damaged) in enumerate(pc_damaged):
         f = pathlib.Path(tmpd) / f"damaged{i}.json"

@@ -17,6 +17,10 @@ namespace OaiyTest;
  * in their command line, by the pid it found in the table: nothing else on the machine is looked at beyond the table's own rows, and a process
  * that is neither is never touched. What it cannot see is a process that is neither a descendant nor marked (a daemon started with a
  * command line that does not name the root): every launcher in the harness names it.
+ *
+ * What a test run declares with keep() (the shared database server, which lives from the first test that needs it to the end of the run) is
+ * exempt together with every process below it, in every mode and by either way of finding a process: a server can be a launcher with a
+ * child that has the same data folder in its command line (MySQL's on Windows), and the child is the server's as much as the launcher is.
  */
 final class Procs
 {
@@ -39,6 +43,12 @@ final class Procs
         if ($pid > 0) {
             self::$kept[$pid] = true;
         }
+    }
+
+    /** Take back keep() for one process (a test of the exemption does this for the process it made, and leaves the rest of what is kept alone). */
+    public static function unkeep(int $pid): void
+    {
+        unset(self::$kept[$pid]);
     }
 
     /** The end of the run: what was meant to live until now has had its chance to stop, and is judged like the rest. */
@@ -138,13 +148,46 @@ final class Procs
         if ($root !== '') {
             $needle = self::norm($root);
             $me = getmypid();
+            $exempt = self::exempt($rows);
             foreach ($rows as $pid => [, $cmd]) {
-                if ($pid !== $me && !isset(self::$kept[$pid]) && !isset($found[$pid]) && strpos(self::norm($cmd), $needle) !== false) {
+                if ($pid !== $me && !isset($exempt[$pid]) && !isset($found[$pid]) && strpos(self::norm($cmd), $needle) !== false) {
                     $found[$pid] = $cmd;
                 }
             }
         }
         return $found;
+    }
+
+    /**
+     * What is meant to outlive a test: the processes that were registered with keep() and everything below them in the process tree. A server
+     * can be a launcher with a child that has the same command line (Windows' mysqld runs as a monitor and a server with the same data
+     * directory), and the child is as much the server's as the launcher is, whether it is found as a descendant or by the root its command line names.
+     *
+     * @param array<int,array{0:int,1:string}> $rows
+     * @return array<int,true> pid => true
+     */
+    private static function exempt(array $rows): array
+    {
+        if (self::$kept === []) {
+            return [];
+        }
+        $kids = [];
+        foreach ($rows as $pid => [$ppid]) {
+            $kids[$ppid][] = $pid;
+        }
+        $out = [];
+        $queue = array_keys(self::$kept);
+        while ($queue) {
+            $at = array_shift($queue);
+            if (isset($out[$at])) {
+                continue;
+            }
+            $out[$at] = true;
+            foreach ($kids[$at] ?? [] as $child) {
+                $queue[] = $child;
+            }
+        }
+        return $out;
     }
 
     /** Forward slashes and lower case, so that a command line from the process table and a path from PHP compare. */
@@ -164,11 +207,12 @@ final class Procs
             $kids[$ppid][] = $pid;
         }
         $found = [];
+        $exempt = self::exempt($rows);
         $queue = [getmypid()];
         while ($queue) {
             $at = array_shift($queue);
             foreach ($kids[$at] ?? [] as $child) {
-                if (isset(self::$kept[$child]) || isset($found[$child])) {
+                if (isset($exempt[$child]) || isset($found[$child])) {
                     continue;
                 }
                 $found[$child] = $rows[$child][1];

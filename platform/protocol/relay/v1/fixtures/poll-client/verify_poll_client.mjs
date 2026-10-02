@@ -6,7 +6,8 @@
 //   node verify_poll_client.mjs [--file poll-client.json]
 //
 // Beyond each case it enforces the table's `constants` block (exactly the numbers the README states, EXPECTED below; every rule takes its number
-// from that block) and its `caseCount` and `idsSha256` (a case that went missing is noticed; the conformance suite pins both).
+// from that block) and its `caseCount`, `idsSha256` and `layoutSha256` (a case that went missing, or was relabelled or moved, is noticed; the
+// conformance suite pins all three and checks EXPECTED below against the README's own text).
 //
 // Prints "N checks, M mismatches" and exits 1 on any mismatch.
 import { createHash } from 'node:crypto';
@@ -27,6 +28,8 @@ const EXPECTED = {
 const ZERO = { n429: 0, nFail: 0, nRefused: 0, n400: 0 };
 
 const isInt = (x) => typeof x === 'number' && Number.isInteger(x);
+const EPOCH = /^[A-Za-z0-9_-]{11}$/; // 8 bytes, base64url (common.schema.json)
+const MAX_SAFE = 2 ** 53 - 1; // the largest cursor and seq (uint53)
 const isObj = (x) => x !== null && typeof x === 'object' && !Array.isArray(x);
 const trim = (s) => s.replace(/^[ \t]+|[ \t]+$/g, '');
 
@@ -34,6 +37,22 @@ function httpDate(text) {
   const m = IMF.exec(trim(text));
   if (!m) return null;
   return Date.UTC(+m[3], MONTHS[m[2]], +m[1], +m[4], +m[5], +m[6]) / 1000;
+}
+
+// README P2: a 200 is valid when its body is an object whose items is an array, whose epoch is 11 base64url characters and whose cursor is an integer from 0 to 2^53 - 1.
+const valid200 = (b) => isObj(b) && Array.isArray(b.items) && typeof b.epoch === 'string' && EPOCH.test(b.epoch) && isInt(b.cursor) && b.cursor >= 0 && b.cursor <= MAX_SAFE;
+// README P2: an item is accepted when its seq is an integer above the since the poll carried and above the seq accepted before it in the answer.
+function acceptedSeqs(items, since) {
+  let last = since;
+  const got = [];
+  for (const it of items) {
+    const s = isObj(it) ? it.seq : undefined;
+    if (isInt(s) && s > last && s <= MAX_SAFE) {
+      got.push(s);
+      last = s;
+    }
+  }
+  return got;
 }
 
 function make(K) {
@@ -62,7 +81,9 @@ function make(K) {
   function decide(c) {
     const { n429, nFail, nRefused, n400 } = c.state;
     const u = c.u;
-    const out = { action: null, report: [] };
+    const since = c.since === undefined ? 0 : c.since;
+    const persisted = c.persisted !== false;
+    const out = { action: null, report: [], since };
     const result = (outcome, base, state) => Object.assign(out, { outcome, baseS: base, pauseS: base * (1 + K.jitter * u), state });
     const failBackoff = (n, d) => {
       const base = Math.min(K.backoffFailureCap, 2 ** (n - 1));
@@ -88,9 +109,25 @@ function make(K) {
     const now = c.nowEpoch;
     const cleared = { ...ZERO };
 
-    if (status === 200 && isObj(body) && Array.isArray(body.items)) {
+    if (status === 200 && valid200(body)) {
       const hold = isObj(body.hold) ? body.hold : {};
-      if (body.items.length > 0 || body.reset === true) return result('progress', 0, cleared);
+      let adopted = null; // a reset adopts the cursor of the answer once, and it may be lower than the since the client had
+      if (body.reset === true) adopted = body.cursor;
+      else {
+        const got = acceptedSeqs(body.items, since);
+        if (got.length > 0) adopted = got[got.length - 1];
+      }
+      if (adopted !== null) {
+        // progress comes first in the table, so a refused or superseded answer that carries an accepted item is this
+        if (!persisted) {
+          // what was accepted could not be written: nothing advances, and the failure is paced like any other
+          out.report = ['storage_failure'];
+          const n = nFail + 1;
+          return result('failure', failBackoff(n), { ...cleared, nFail: n });
+        }
+        out.since = adopted;
+        return result('progress', 0, cleared);
+      }
       if (hold.superseded === true) {
         if (c.weReplaced === false) {
           out.report = ['duplicate_credential'];
@@ -109,7 +146,10 @@ function make(K) {
       let d = retryAfter(headers, body, now);
       d = clamp(d === null ? 1 : d);
       const rule = isObj(body) && isObj(body.error) ? body.error.rule : undefined;
-      if (rule === 'in_flight' && n === K.inFlightDefectAfter) out.report = ['in_flight_defect'];
+      if (rule === 'in_flight') {
+        out.action = 'cancel_own_polls';
+        if (n === K.inFlightDefectAfter) out.report = ['in_flight_defect'];
+      }
       return result('flow', Math.max(d, Math.min(K.backoff429Cap, 2 ** (n - 1))), { ...cleared, n429: n });
     }
     if (status === 400) {
@@ -161,6 +201,8 @@ const ids = doc.cases.map((c) => c.id);
 check('caseCount', 'the table holds the number of cases it says', doc.caseCount === ids.length, `says ${doc.caseCount}, holds ${ids.length}`);
 const digest = createHash('sha256').update([...ids].sort().join('\n'), 'utf8').digest('hex');
 check('idsSha256', 'the digest of the case names is the one the table says (a case went missing, or was added)', doc.idsSha256 === digest);
+const layout = createHash('sha256').update(doc.cases.map((c) => `${c.id}|${c.rule}`).join('\n'), 'utf8').digest('hex'); // `id|rule` in the table's own order
+check('layoutSha256', "the digest of the case names with their rule labels, in the table's order, is the one the table says (a case was relabelled or moved)", doc.layoutSha256 === layout);
 const used = { ...EXPECTED };
 for (const k of Object.keys(EXPECTED)) if (K[k] !== undefined) used[k] = K[k];
 const { decide, replaceWaitMs, proofDue } = make(used);
@@ -187,6 +229,7 @@ for (const c of doc.cases) {
   check(c.id, 'state', sortedKeys(got.state) === sortedKeys(want.state), `got ${JSON.stringify(got.state)}, table ${JSON.stringify(want.state)}`);
   check(c.id, 'action', got.action === want.action, `got ${got.action}, table ${want.action}`);
   check(c.id, 'report', same([...got.report].sort(), [...want.report].sort()), `got ${got.report}, table ${want.report}`);
+  if (want.since !== undefined) check(c.id, 'since', got.since === want.since, `got ${got.since}, table ${want.since}`);
 }
 const rules = new Set(doc.cases.map((c) => c.rule));
 for (const rule of ['P1', 'P2', 'P3', 'P4', 'P5', 'P6', 'P7', 'P8', 'P9']) check(rule, 'has a case', rules.has(rule));
