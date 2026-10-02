@@ -232,7 +232,7 @@ final class Kernel
         $this->route = $route[2];
         if ($req->bodyTooLarge) {
             // The request is over the one limit every host can be asked for (section 4.1), whatever lane or frames it carries: say so, with the
-            // number, and not that a lane's cap was passed. On the compatibility routes it is the code of FormLogic's own too-large answer, with the
+            // number, and not that a lane's cap was passed. On the compatibility routes it is the code those routes already use for a 413, with the
             // size a post may have in all (a frames post of 64 frames of 32 KiB is 2 MiB and can never fit: 31 of them do). Interpretation 63.
             throw Facade::isCompatPath($req->path)
                 ? new ApiError(413, 'relay_frame_too_large', 'A post may be at most ' . Request::MAX_BODY . ' bytes in all: send fewer or smaller frames in one post.')

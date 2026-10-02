@@ -1949,7 +1949,7 @@ ok("README settles what the clean-room readings of 5.1.1 disagreed on: what a va
                                 "and the answer is a **failure** for the pause", "a valid `200` whose accepted items (or whose reset) could not be written to the client's store (see to persist, below)", "it reports `storage_failure`, and never `unreachable`", "never carries `unreachable`: the first `400`",
                                 "(the action `cancel_own_polls`, on every `429` that says `in_flight`)", "`cancel_own_polls` (P4)", "the failure count is cleared (it proves the relay answered, as P7 says of a success), while the 429 count, the count of refused holds and the 400 count stay as they were",
                                 "Polls that arrive in the same instant can be refused beyond the surplus", "a burst of four refusing two and a burst of five refusing four",
-                                "**An integer** in a poll answer (`cursor`, `seq`, `retryAfter` and `hold.retryAfter`) is an integer literal: digits only, with an optional minus sign, with no fraction, no exponent and no `-0`",
+                                "**An integer** in a poll answer (`cursor`, `seq`, `retryAfter` and `hold.retryAfter`) is an integer literal: digits only, no fraction, no exponent and no `-0`",
                                 "a date that does not exist such as hour 25, day 32 or year 0000", "the name of the day is not checked",
                                 "except for the first `400` and for a failed write (P2), which are paced by the backoff alone")))
 # Every epoch the table gives is what the schema says an epoch is (8 bytes: 11 characters), except where a case is a bad epoch on purpose and expects a failure.
