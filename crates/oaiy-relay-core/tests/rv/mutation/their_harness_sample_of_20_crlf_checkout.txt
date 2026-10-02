@@ -1,0 +1,42 @@
+P02  KILLED    own        accepted-item rule           a seq of 2^53 is accepted
+         -> unittests src\lib.rs: poll::tests::an_item_is_accepted_only_above_since_and_above_the_one_before_it
+P03  INVALID   own        accepted-item rule           the item accepted before it no longer raises the bar (an out-of-order item is accepted)
+         -> the old text occurs 0 times in crates/oaiy-relay-core/src/poll.rs
+P11  KILLED    own        backoff numbers              the jitter is up to 25 percent, not 20
+         -> tests\client_stub.rs: a_429_is_never_a_failure_and_the_fifth_in_flight_is_a_defect_reported_once (+3)
+P12  KILLED    own        backoff numbers              the doubling starts at 2 s, not 1 s
+         -> unittests src\lib.rs: poll::tests::clamp_and_doubling
+P15  KILLED    own        refused hold                 consecutive refused holds are not counted
+         -> tests\client_stub.rs: a_refused_hold_is_a_short_poll_at_retry_after_doubling_to_the_fallback_2_4_5
+P19  KILLED    own        429                          any 429 rule, not only in_flight, cancels the client's own polls
+         -> tests\poll_differential.rs: random_cases_agree_with_the_python_reader
+P21  KILLED    own        400                          the second 400 in a row is still a retry, not a stop
+         -> timeout in tests\client_stub.rs (a mutant that hangs)
+P27  KILLED    own        proof schedule               a pause of exactly 60 s does not call for a new proof
+         -> unittests src\lib.rs: poll::tests::replace_and_proof_rules
+C02  KILLED    own        proof gate                   a token is sent without any proof of the relay
+         -> tests\client_stub.rs: no_token_is_sent_before_a_proof_after_a_failed_one_or_after_the_proof_has_lapsed
+C04  KILLED    own        relay clock                  a clock mismatch is flagged at 61 s, not 60
+         -> unittests src\lib.rs: client::clock::tests::the_verdicts
+A02  INVALID   own        SAS                          the two endpoint keys are taken in the other order
+         -> the old text occurs 0 times in crates/oaiy-relay-core/src/pairing/math.rs
+A07  KILLED    own        SAS                          the owner has four attempts, not three
+         -> tests\pairing_stub.rs: three_wrong_codes_deny_and_burn_and_a_typo_never_counts
+A09  KILLED    own        typed code                   the typed code's check characters are not verified
+         -> tests\fuzz.rs: typed_codes_pairing_keys_enrolment_keys_and_sas_entries_never_panic_and_a_code_that_parses_is_the_code
+A10  KILLED    own        typed code                   an `O` is not read as a zero
+         -> tests\vectors.rs: the_typed_codes_the_normaliser_and_the_sas_check_characters
+A13  KILLED    own        offer and response           a response outside its lifetime is accepted
+         -> tests\pairing_stub.rs: a_replayed_response_a_revoked_key_and_a_response_outside_its_window_are_rejected
+D04  KILLED    own        info proof                   the proof does not cover the relay's time
+         -> tests\client_stub.rs: a_426_makes_the_client_re_read_info_and_stop_when_it_is_too_old (+18)
+D08  KILLED    own        ring                         a ring may expire 301 s ahead, not 300
+         -> tests\vectors.rs: a11_a_ring_signature_and_the_ring_window
+E01  KILLED    own        admission relay advertisement URLs of two origins are taken for usable compatibility routes
+         -> unittests src\lib.rs: admission::tests::the_compatibility_urls_degrade_to_none_as_the_shipped_readers_do_and_never_fail_the_admission
+B03  KILLED    own        base64url                    a length of 1 mod 4 is read
+         -> unittests src\lib.rs: b64::tests::refuses_padding_whitespace_other_alphabets_and_impossible_lengths
+J02  KILLED    own        JSON                         65 levels of nesting are read
+         -> unittests src\lib.rs: json::tests::nesting_is_limited_to_64_levels
+
+20 mutations: 18 killed, 0 survived, 2 invalid; 348 s; tree clean
