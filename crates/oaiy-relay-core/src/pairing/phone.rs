@@ -344,7 +344,9 @@ impl PhonePairing {
                         PairState::Answered
                             if wait > 0 && f.hold_granted && !f.hold_superseded && took.as_secs_f64() >= (wait as f64 / 2.0).min(10.0) =>
                         {
-                            0.0
+                            // README 10.1: pause 0 after a granted hold, and when `info.wait.max` is below ten seconds the difference to ten (a client that asks again at once after a
+                            // two-second hold spends the 60 counted reads of a rendezvous in two minutes).
+                            (UNHELD_PAIR_PAUSE_S as u64).saturating_sub(wait) as f64
                         }
                         PairState::Answered => UNHELD_PAIR_PAUSE_S,
                         PairState::Open => {
@@ -373,7 +375,8 @@ impl PhonePairing {
                     }
                     Some((429, ask)) => {
                         failures = 0;
-                        ask.unwrap_or(1).clamp(1, 120) as f64
+                        // README 10.1: after a 429 of the pairing reads, max(10, Retry-After) with the jitter of P6.
+                        ask.unwrap_or(1).clamp(1, 120).max(UNHELD_PAIR_PAUSE_S as u64) as f64
                     }
                     Some((s, _)) if (400..500).contains(&s) && s != 408 => return Err(PairingError::Client(e)),
                     _ => {
