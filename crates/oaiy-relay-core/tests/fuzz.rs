@@ -85,7 +85,7 @@ fn mutate(rng: &mut Rng, base: &[u8], donors: &[Vec<u8>]) -> Vec<u8> {
                 v[i] = *rng.pick(&INTERESTING);
             }
             7 => {
-                let c = *rng.pick(&[b'[', b'{', b'(', b'"']);
+                let c = *rng.pick(b"[{(\"");
                 let n = rng.below(200) as usize + 1;
                 let at = rng.below(len + 1) as usize;
                 for k in 0..n {
@@ -124,16 +124,8 @@ fn random_input(rng: &mut Rng) -> Vec<u8> {
         _ => {
             let mut v = b"{\"a\":".to_vec();
             for _ in 0..rng.below(400) {
-                v.extend_from_slice(*rng.pick(&[
-                    b"[".as_slice(),
-                    b"{\"k\":",
-                    b"\"",
-                    b"\\u",
-                    b"\\ud800",
-                    b"1e999",
-                    b"-0",
-                    b"123456789012345678901234567890",
-                ]));
+                const PIECES: [&[u8]; 8] = [b"[", b"{\"k\":", b"\"", b"\\u", b"\\ud800", b"1e999", b"-0", b"123456789012345678901234567890"];
+                v.extend_from_slice(PIECES[rng.below(PIECES.len() as u64) as usize]);
             }
             v
         }

@@ -290,22 +290,43 @@ pub struct RelayEndpoints {
     pub poll_mode: bool,
 }
 
-fn parse_endpoints(v: &Json, lax: bool) -> Result<RelayEndpoints> {
-    let bad = Error::Invalid("admission: relay");
-    let members = v.as_object().ok_or(bad.clone())?;
-    if members.iter().any(|(k, _)| !matches!(k.as_str(), "challengeUrl" | "framesUrl" | "streamUrl" | "mode")) {
-        return Err(bad);
+/// The shipped readers' `usable_relay_endpoints`: the three URLs when the advertisement is an object that has them as strings (other members are ignored, as `RelayEndpoints` does
+/// not deny unknown fields), every one of them is safe (`https`, no credentials, no fragment) and the three share one origin; otherwise `None`, and the carrier degrades to the
+/// WebSocket gateway instead of failing the admission. `mode: "poll"` is this relay's own addition: the relay offers the poll mode.
+fn usable_endpoints(v: Option<&Json>, lax: bool) -> Option<RelayEndpoints> {
+    let v = v.filter(|v| v.is_object())?;
+    let url = |k: &str| v.get_str(k).map(str::to_string);
+    let (challenge_url, frames_url, stream_url) = (url("challengeUrl")?, url("framesUrl")?, url("streamUrl")?);
+    let origin = origin_of(&challenge_url, lax)?;
+    if origin_of(&frames_url, lax)? != origin || origin_of(&stream_url, lax)? != origin {
+        return None;
     }
-    let url =
-        |k: &str| v.get_str(k).filter(|u| u.starts_with("https://") || (lax && loopback_origin(u, "http://"))).map(str::to_string).ok_or(bad.clone());
-    let poll_mode = match v.get("mode") {
-        None => false,
-        Some(m) if m.as_str() == Some("poll") => true,
-        Some(_) => return Err(bad),
-    };
-    Ok(RelayEndpoints { challenge_url: url("challengeUrl")?, frames_url: url("framesUrl")?, stream_url: url("streamUrl")?, poll_mode })
+    Some(RelayEndpoints { challenge_url, frames_url, stream_url, poll_mode: v.get_str("mode") == Some("poll") })
 }
 
+/// `(scheme, host in lower case, port)` of a URL that is safe to use (`https`, or `http` on loopback when `lax`; no credentials, no fragment), else `None`.
+fn origin_of(url: &str, lax: bool) -> Option<(&'static str, String, u16)> {
+    let (scheme, rest) = match url.strip_prefix("https://") {
+        Some(r) => ("https", r),
+        None if lax && loopback_origin(url, "http://") => ("http", &url["http://".len()..]),
+        None => return None,
+    };
+    if url.contains('#') {
+        return None;
+    }
+    let authority = rest.split(['/', '?']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse::<u16>().ok()?),
+        None => (authority, if scheme == "https" { 443 } else { 80 }),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some((scheme, host.to_ascii_lowercase(), port))
+}
 /// `scheme` followed by a loopback host (`127.0.0.1` or `localhost`, with or without a port) and then a path or nothing: what a relay installed on loopback over plain
 /// `http` writes (a test build only; the shipped readers take `https` and `wss` alone).
 fn loopback_origin(url: &str, scheme: &str) -> bool {
@@ -382,8 +403,8 @@ pub struct MobileAdmission {
     pub holder_thumbprint: String,
     /// `expectedPeerKeyThumbprint`: advisory.
     pub expected_peer_thumbprint: String,
-    /// `relay`.
-    pub relay: RelayEndpoints,
+    /// `relay`: the compatibility routes, or `None` when the relay did not advertise usable ones (the carrier then uses the WebSocket gateway).
+    pub relay: Option<RelayEndpoints>,
 }
 
 impl MobileAdmission {
@@ -414,7 +435,9 @@ impl MobileAdmission {
             "device",
         ];
         let doc = json::parse(body)?;
-        if !members_are(&doc, &ALL, &ALL) {
+        // As the shipped phone: `iceServers` and `relay` may be absent (no ICE servers; no compatibility routes), every other member is required, and none outside the list is allowed.
+        let required: Vec<&str> = ALL.iter().copied().filter(|m| !matches!(*m, "iceServers" | "relay")).collect();
+        if !members_are(&doc, &ALL, &required) {
             return Err(Error::Invalid("mobile admission: members"));
         }
         let bearer = Bearer::parse(doc.get_str("accessToken").ok_or(Error::Invalid("accessToken"))?)?;
@@ -444,7 +467,8 @@ impl MobileAdmission {
             return Err(Error::Invalid("admission: scopes"));
         }
         let relay_only = doc.get("relayOnly").and_then(Json::as_bool).ok_or(Error::Invalid("relayOnly"))?;
-        let (ice_servers, earliest) = parse_ice(doc.get("iceServers").ok_or(Error::Invalid("iceServers"))?, relay_only, now)?;
+        let no_ice = Json::Arr(Vec::new());
+        let (ice_servers, earliest) = parse_ice(doc.get("iceServers").unwrap_or(&no_ice), relay_only, now)?;
         let turn_credential_expires_at = match doc.get("turnCredentialExpiresAt") {
             Some(Json::Null) => None,
             Some(v) => Some(v.as_uint53().ok_or(Error::Invalid("turnCredentialExpiresAt"))?),
@@ -472,7 +496,7 @@ impl MobileAdmission {
         if device_grants != scopes {
             return Err(Error::Mismatch("admission: device.grants are not the scopes"));
         }
-        let relay = parse_endpoints(doc.get("relay").ok_or(Error::Invalid("relay"))?, lax)?;
+        let relay = usable_endpoints(doc.get("relay"), lax);
         Ok(MobileAdmission {
             bearer,
             expires_in,
@@ -513,8 +537,8 @@ pub struct PluginAdmission {
     pub ice_servers: Vec<IceServer>,
     /// `relayOnly`.
     pub relay_only: bool,
-    /// `relay`.
-    pub relay: RelayEndpoints,
+    /// `relay`: as for the phone.
+    pub relay: Option<RelayEndpoints>,
 }
 
 impl PluginAdmission {
@@ -547,7 +571,9 @@ impl PluginAdmission {
             "relay",
         ];
         let doc = json::parse(body)?;
-        if !members_are(&doc, &ALL, &ALL) {
+        // As the shipped plugin: only `relay` may be absent.
+        let required: Vec<&str> = ALL.iter().copied().filter(|m| *m != "relay").collect();
+        if !members_are(&doc, &ALL, &required) {
             return Err(Error::Invalid("plugin admission: members"));
         }
         let bearer = Bearer::parse(doc.get_str("accessToken").ok_or(Error::Invalid("accessToken"))?)?;
@@ -595,7 +621,7 @@ impl PluginAdmission {
         if turn_at != earliest {
             return Err(Error::Mismatch("turnCredentialExpiresAt is not the earliest TURN expiry"));
         }
-        let relay = parse_endpoints(doc.get("relay").ok_or(Error::Invalid("relay"))?, lax)?;
+        let relay = usable_endpoints(doc.get("relay"), lax);
         Ok(PluginAdmission { bearer, expires_in, expires_at, scopes, ice_servers, relay_only, relay })
     }
 }
@@ -621,12 +647,33 @@ mod tests {
     }
 
     #[test]
-    fn the_compatibility_urls_are_https_unless_a_loopback_test_build_says_otherwise() {
+    fn the_compatibility_urls_degrade_to_none_as_the_shipped_readers_do_and_never_fail_the_admission() {
         let ad = |u: &str| json::parse(format!("{{\"challengeUrl\":\"{u}/a\",\"framesUrl\":\"{u}/b\",\"streamUrl\":\"{u}/c\"}}").as_bytes()).unwrap();
-        assert!(parse_endpoints(&ad("https://relay.example.com"), false).is_ok());
-        assert!(parse_endpoints(&ad("http://127.0.0.1:9"), false).is_err());
-        assert!(parse_endpoints(&ad("http://127.0.0.1:9"), true).is_ok());
-        assert!(parse_endpoints(&ad("http://relay.example.com"), true).is_err());
-        assert!(parse_endpoints(&ad("http://127.0.0.1.example.com"), true).is_err());
+        let some = |d: &Json, lax: bool| usable_endpoints(Some(d), lax);
+        assert!(some(&ad("https://relay.example.com"), false).is_some());
+        assert!(some(&ad("https://relay.example.com:8443"), false).is_some());
+        assert!(some(&ad("http://127.0.0.1:9"), false).is_none());
+        assert!(some(&ad("http://127.0.0.1:9"), true).is_some());
+        assert!(some(&ad("http://relay.example.com"), true).is_none());
+        assert!(some(&ad("http://127.0.0.1.example.com"), true).is_none());
+        assert!(some(&ad("https://user@relay.example.com"), false).is_none(), "credentials");
+        assert!(some(&ad("https://relay.example.com#x"), false).is_none(), "a fragment");
+        assert!(usable_endpoints(None, false).is_none() && usable_endpoints(Some(&Json::Null), false).is_none());
+        assert!(usable_endpoints(Some(&Json::str("https://relay.example.com")), false).is_none(), "not an object");
+        // One origin for the three, with the default port and the case of the host not telling two origins apart.
+        let mixed =
+            json::parse(br#"{"challengeUrl":"https://a.example.com/a","framesUrl":"https://b.example.com/b","streamUrl":"https://a.example.com/c"}"#)
+                .unwrap();
+        assert!(some(&mixed, false).is_none());
+        let same = json::parse(br#"{"challengeUrl":"https://A.example.com/a","framesUrl":"https://a.example.com:443/b","streamUrl":"https://a.example.com/c","extra":1,"mode":"poll"}"#).unwrap();
+        let ok = some(&same, false).expect("the same origin, an unknown member ignored");
+        assert!(ok.poll_mode);
+        let two_ports = json::parse(
+            br#"{"challengeUrl":"https://a.example.com/a","framesUrl":"https://a.example.com:8443/b","streamUrl":"https://a.example.com/c"}"#,
+        )
+        .unwrap();
+        assert!(some(&two_ports, false).is_none());
+        let missing = json::parse(br#"{"challengeUrl":"https://a.example.com/a","framesUrl":"https://a.example.com/b"}"#).unwrap();
+        assert!(some(&missing, false).is_none());
     }
 }

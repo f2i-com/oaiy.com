@@ -381,7 +381,7 @@ fn a_whole_pairing_between_the_desktop_party_and_the_phone_party_on_the_real_rel
         )
         .expect("a mobile admission from the real relay");
     assert_eq!(admission.scopes, grants);
-    assert!(admission.relay.poll_mode, "this host passed no streaming probe: the relay offers the poll mode");
+    assert!(admission.relay.as_ref().is_some_and(|r| r.poll_mode), "this host passed no streaming probe: the relay offers the poll mode");
     assert_eq!(admission.expected_peer_thumbprint, identity.endpoint.thumbprint(), "the relay's record of the desktop it was paired with");
     // The plugin's admission with the desktop's token, with the roster of the one phone.
     let plugin = PluginRequest {
@@ -394,7 +394,7 @@ fn a_whole_pairing_between_the_desktop_party_and_the_phone_party_on_the_real_rel
         transports: Some(vec![Transport::RelayPoll]),
     };
     let plugin_admission = dclient.admission_plugin(&dtoken, &plugin, &Cancel::new()).expect("a plugin admission from the real relay");
-    assert!(plugin_admission.relay.poll_mode);
+    assert!(plugin_admission.relay.as_ref().is_some_and(|r| r.poll_mode));
     let _: &PluginAdmission = &plugin_admission;
 
     // A ring: the desktop signs the body text with the host identity it registered, the relay verifies it, the phone verifies it again with the host key it pinned from the offer.

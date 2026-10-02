@@ -53,7 +53,7 @@ fn every_recorded_request_is_rebuilt_byte_for_byte_and_every_recorded_answer_is_
             assert_eq!(req.to_body().unwrap(), body.to_compact(), "{}: the request", case.s("name"));
             let parsed = PluginAdmission::parse(answer.to_compact().as_bytes(), &req, NOW).unwrap_or_else(|e| panic!("{}: {e}", case.s("name")));
             assert_eq!(parsed.expires_in, 90);
-            assert_eq!(parsed.relay.poll_mode, answer.at("relay").get("mode").is_some());
+            assert_eq!(parsed.relay.as_ref().expect("usable endpoints").poll_mode, answer.at("relay").get("mode").is_some());
             plugins += 1;
         } else {
             let req = mobile_request(body);
@@ -115,7 +115,6 @@ fn damaged_phone_admissions_are_refused_by_the_rules_of_the_shipped_decoder() {
     let mut damages: Vec<(&str, Json)> = vec![
         ("an unknown member", damage(&good, "extra", n(1))),
         ("no accessToken", damage(&good, "accessToken", None)),
-        ("no relay member", damage(&good, "relay", None)),
         ("a bearer of another shape", damage(&good, "accessToken", s("aokie-adm-v2.zz.00"))),
         ("tokenType Basic", damage(&good, "tokenType", s("Basic"))),
         ("role plugin", damage(&good, "role", s("plugin"))),
@@ -138,8 +137,6 @@ fn damaged_phone_admissions_are_refused_by_the_rules_of_the_shipped_decoder() {
         ("a device display name of 121 bytes", damage(&good, "device.displayName", s(&"x".repeat(121)))),
         ("a stun entry with a credential", damage(&good, "iceServers.0.credential", s("x"))),
         ("a turnCredentialExpiresAt that is not the earliest", damage(&good, "turnCredentialExpiresAt", n(1_790_000_700))),
-        ("relay urls on http", damage(&good, "relay.framesUrl", s("http://relay.example.com/x"))),
-        ("an unknown relay member", damage(&good, "relay.extra", s("x"))),
     ];
     // ICE entries inside the array need their own path handling: replace the whole list.
     let ice = good.get("iceServers").unwrap().as_array().unwrap().to_vec();
@@ -168,6 +165,50 @@ fn damaged_phone_admissions_are_refused_by_the_rules_of_the_shipped_decoder() {
     assert!(parse(&damage(&doc, "relayOnly", Some(Json::Bool(true))), NOW).is_err());
 }
 
+#[test]
+fn an_unusable_relay_advertisement_degrades_the_carrier_and_never_fails_the_admission() {
+    // The shipped readers (`usable_relay_endpoints`): `relay` may be absent or null; one that does not decode, has an unsafe URL or has URLs of two origins is dropped, and the
+    // carrier falls back to the WebSocket gateway; an unknown member of it is ignored. The phone's `iceServers` may be absent too.
+    let case = cases().into_iter().find(|c| c.s("name") == "phone A, stream, STUN and TURN").unwrap();
+    let good = case.at("response.body").clone();
+    let req = mobile_request(case.at("request.body"));
+    let expect = MobileExpect { app_id: &req.app_id, device_id: &req.device_id, holder_thumbprint: &req.holder_thumbprint };
+    let parse = |d: &Json| MobileAdmission::parse(d.to_compact().as_bytes(), &expect, NOW);
+    let s = |t: &str| Some(Json::str(t));
+    assert!(parse(&good).unwrap().relay.is_some());
+    for (what, doc, usable) in [
+        ("no relay member", damage(&good, "relay", None), false),
+        ("a null relay", damage(&good, "relay", Some(Json::Null)), false),
+        ("a relay that is a string", damage(&good, "relay", s("x")), false),
+        ("a frames url on http", damage(&good, "relay.framesUrl", s("http://relay.example.com/x")), false),
+        ("a url with credentials", damage(&good, "relay.framesUrl", s("https://user:pw@relay.example.com/x")), false),
+        ("a url with a fragment", damage(&good, "relay.framesUrl", s("https://relay.example.com/x#y")), false),
+        ("urls of two origins", damage(&good, "relay.framesUrl", s("https://other.example.com/x")), false),
+        ("a missing url", damage(&good, "relay.streamUrl", None), false),
+        ("an unknown relay member", damage(&good, "relay.extra", s("x")), true),
+    ] {
+        let parsed = parse(&doc).unwrap_or_else(|e| panic!("refused, though the shipped phone only degrades: {what}: {e}"));
+        assert_eq!(parsed.relay.is_some(), usable, "{what}");
+    }
+    let no_ice = parse(&damage(&good, "iceServers", None));
+    assert!(
+        no_ice.is_err(),
+        "this admission has a TURN expiry, so the missing list is a mismatch (turnCredentialExpiresAt is not the earliest TURN expiry)"
+    );
+    let stun_only = cases().into_iter().find(|c| c.s("name") == "phone A, STUN only (no TURN configured)").unwrap();
+    let doc = damage(stun_only.at("response.body"), "iceServers", None);
+    let parsed = parse(&doc).expect("an admission with no iceServers member is an admission with no ICE servers");
+    assert!(parsed.ice_servers.is_empty());
+
+    // The plugin's, the same.
+    let case = cases().into_iter().find(|c| c.s("name") == "plugin, stream, STUN and TURN").unwrap();
+    let good = case.at("response.body").clone();
+    let req = plugin_request(case.at("request.body"));
+    let parse = |d: &Json| PluginAdmission::parse(d.to_compact().as_bytes(), &req, NOW);
+    assert!(parse(&damage(&good, "relay", None)).unwrap().relay.is_none());
+    assert!(parse(&damage(&good, "relay.framesUrl", s("http://relay.example.com/x"))).unwrap().relay.is_none());
+    assert!(parse(&damage(&good, "iceServers", None)).is_err(), "the plugin requires iceServers");
+}
 #[test]
 fn damaged_plugin_admissions_are_refused_and_an_echo_of_another_roster_is_a_mismatch() {
     let case = cases().into_iter().find(|c| c.s("name") == "plugin, stream, STUN and TURN").unwrap();
