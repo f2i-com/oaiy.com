@@ -236,7 +236,10 @@ impl<S: PollStore> PollLoop<S> {
                 process_start,
                 network_changed,
                 longest_pause_s,
-                seconds_since_proof: last_proof.map_or(u64::MAX, |t| clock.monotonic().saturating_sub(t).as_secs()),
+                // The larger of the age on the monotonic clock and on the wall clock (`RelayClient::proof_age_s`): a device that slept or whose clock was set is not trusted on a
+                // monotonic clock that stood still.
+                seconds_since_proof: last_proof
+                    .map_or(u64::MAX, |t| self.client.proof_age_s().unwrap_or(u64::MAX).max(clock.monotonic().saturating_sub(t).as_secs())),
             };
             // P9: the relay's identity before any token is sent.
             if poll::proof_due(&due) {

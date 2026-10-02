@@ -1023,8 +1023,10 @@ fn evidence_the_file_store_only_grows() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Changed with the fix (a sample a day or more from the wall clock is not believed): this used to assert that the first sample is applied in full whatever it says, a relay that
+/// says ten years ahead included. Now `relay_now` stays empty (the local clock is used) and the clocks are reported as differing.
 #[test]
-fn evidence_the_first_relay_time_sample_is_applied_at_once_whatever_it_says() {
+fn the_first_relay_time_sample_is_not_believed_when_it_is_a_day_or_more_from_the_wall_clock() {
     // `GET /v1/health` needs no proof and no credential, and every response is sampled.
     let clock = Arc::new(oaiy_relay_core::testing::FakeClock::new(T0));
     let lie = Arc::new(Mutex::new(T0 + 10 * 365 * 86_400));
@@ -1039,22 +1041,27 @@ fn evidence_the_first_relay_time_sample_is_applied_at_once_whatever_it_says() {
         ClientConfig::default(),
     );
     client.health(&Cancel::new()).unwrap();
-    let now = client.relay_now().unwrap();
-    println!("after one response: relay_now is local + {} days; clock_mismatch = {}", (now - T0) / 86_400, client.clock_mismatch());
-    assert!(now - T0 > 3000 * 86_400, "the first sample is applied in full");
+    println!("after one response: relay_now = {:?}; clock_mismatch = {}", client.relay_now(), client.clock_mismatch());
+    assert_eq!(client.relay_now(), None, "a relay that says it is ten years later does not set the time windows are judged by");
+    assert_eq!(client.relay_now_or_local(), T0, "the local clock is used");
     assert!(client.clock_mismatch());
     // A relay at the largest time the header grammar allows (16 digits) does not overflow anything.
     *lie.lock().unwrap() = 9_999_999_999_999_999;
     for _ in 0..8 {
         client.health(&Cancel::new()).unwrap();
     }
-    assert!(client.relay_now().unwrap() > T0);
+    assert_eq!(client.relay_now(), None);
     // And a relay that goes back to the past.
     *lie.lock().unwrap() = 0;
     for _ in 0..8 {
         client.health(&Cancel::new()).unwrap();
     }
-    assert!(client.relay_now().is_some());
+    assert_eq!(client.relay_now(), None);
+    // A relay that tells the time (a few seconds off) is believed from its next answer.
+    *lie.lock().unwrap() = T0 + 3;
+    client.health(&Cancel::new()).unwrap();
+    assert_eq!(client.relay_now(), Some(T0 + 3));
+    assert!(!client.clock_mismatch());
 }
 
 /// An adapter that returns header names as the server wrote them (`X-OAIY-Proof`, as OkHttp and many HTTP/1 stacks do) and not in lower case, which the `HttpClient` contract
@@ -1095,7 +1102,6 @@ fn finding_headers_are_matched_whatever_the_adapter_did_with_their_case() {
 /// `local_wall + offset`, so a step of the wall clock moves the relay time 1:1, and the offset (median of the last five samples, slewed 1 s a minute) takes
 /// `step / 1 s/min` to follow: a step of one hour leaves the relay time an hour wrong for about sixty hours. `FakeClock::step_wall` exists for this and no test uses it.
 #[test]
-#[ignore = "F4-K1: relay_now follows a wall-clock step 1:1 and recovers at 1 s a minute (clock.rs:167-169); the doc comment says a step does not move it"]
 fn finding_the_relay_time_does_not_follow_a_step_of_the_wall_clock() {
     let clock = Arc::new(oaiy_relay_core::testing::FakeClock::new(T0));
     let truth = {

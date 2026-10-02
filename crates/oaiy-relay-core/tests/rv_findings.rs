@@ -21,7 +21,6 @@ fn cancel() -> Cancel {
 
 /// F-clock: the proof's age is measured on the monotonic clock only, which on Linux and Android (`Instant`) and macOS does not run while the device sleeps.
 #[test]
-#[ignore = "review finding: a proof does not age across a suspend (monotonic clock stands still, the wall clock moves)"]
 fn rv_a_proof_eight_hours_old_by_the_wall_clock_is_not_good_enough_to_send_a_token() {
     let e = env(quick());
     let (token, _) = e.enrol_desktop();

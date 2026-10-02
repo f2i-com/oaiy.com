@@ -3,6 +3,8 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::env::{env, quick, run_loop};
@@ -16,6 +18,8 @@ use oaiy_relay_core::pairing::math::{self, PairingSecret};
 use oaiy_relay_core::pairing::{PairEvent, PairingError};
 use oaiy_relay_core::poll::Outcome;
 use oaiy_relay_core::testing::stub::Fault;
+use oaiy_relay_core::testing::SeededRng;
+use oaiy_relay_core::url::RelayUrl;
 
 fn secs(d: &Duration) -> f64 {
     d.as_secs_f64()
@@ -128,4 +132,73 @@ fn an_offer_whose_secret_is_in_flight_is_never_replaced() {
     assert!(matches!(again, Err(PairingError::WrongState(_))), "the pairing in flight was replaced");
     assert_eq!(w.desktop.remembered().0, 1);
     drop(first);
+}
+
+fn poll_request() -> PollRequest {
+    PollRequest { since: 0, epoch: None, wait_s: 0, limit: 32 }
+}
+
+#[test]
+fn a_proof_goes_stale_when_the_wall_clock_moves_by_more_than_the_proof_allows() {
+    // The proof is good for 600 seconds by the monotonic clock and by the wall clock alike; a wall clock that goes back by more than a minute leaves nothing to measure it by.
+    for (step, good) in
+        [(0i64, true), (599, true), (600, true), (601, false), (8 * 3600, false), (-59, true), (-60, true), (-61, false), (-8 * 3600, false)]
+    {
+        let e = env(quick());
+        let (token, _) = e.enrol_desktop();
+        e.clock.step_wall(step);
+        let r = e.client.poll(&token, &poll_request(), &Cancel::new());
+        assert_eq!(r.is_ok(), good, "the wall clock stepped by {step} s: {:?}", r.as_ref().map(|r| r.status));
+        if !good {
+            assert!(matches!(r, Err(ClientError::NotProved)), "{r:?}");
+            // And a fresh proof makes it good again.
+            e.client.prove(&Cancel::new()).unwrap();
+            assert!(e.client.poll(&token, &poll_request(), &Cancel::new()).is_ok());
+        }
+    }
+}
+
+/// An adapter that steps the wall clock once, in the middle of the first poll it carries (the device slept while the request was out), and notes every URL it is given.
+struct SleepsDuringAPoll {
+    inner: Arc<dyn HttpClient>,
+    clock: Arc<oaiy_relay_core::testing::FakeClock>,
+    slept: AtomicBool,
+    urls: Mutex<Vec<String>>,
+}
+
+impl HttpClient for SleepsDuringAPoll {
+    fn send(&self, request: &HttpRequest) -> Result<HttpResponse, TransportError> {
+        self.urls.lock().unwrap().push(request.url.clone());
+        if request.url.contains("/v1/poll") && !self.slept.swap(true, Ordering::SeqCst) {
+            self.clock.step_wall(8 * 3600);
+        }
+        self.inner.send(request)
+    }
+}
+
+#[test]
+fn a_loop_that_slept_proves_the_relay_again_before_it_sends_a_token() {
+    let e = env(quick());
+    let (token, _) = e.enrol_desktop();
+    let http = Arc::new(SleepsDuringAPoll {
+        inner: Arc::new(e.stub.clone()),
+        clock: e.clock.clone(),
+        slept: AtomicBool::new(false),
+        urls: Mutex::new(Vec::new()),
+    });
+    let client = Arc::new(RelayClient::new(
+        RelayUrl::parse(&e.stub.public_url()).unwrap(),
+        Some(e.stub.relay_thumbprint()),
+        http.clone(),
+        e.clock.clone(),
+        Box::new(SeededRng::new(5)),
+        ClientConfig::default(),
+    ));
+    let running = run_loop(&client, &token, MemoryPollStore::new());
+    running.wait_for("polls after the sleep", |_| http.urls.lock().unwrap().iter().filter(|u| u.contains("/v1/poll")).count() >= 3);
+    let _ = running.finish();
+    let urls = http.urls.lock().unwrap().clone();
+    let kinds: Vec<&str> = urls.iter().map(|u| if u.contains("/v1/info") { "info" } else { "poll" }).collect();
+    // info (the first proof), poll (during which the device slept), then the proof again, and only then the next poll that carries the token.
+    assert_eq!(&kinds[..4], ["info", "poll", "info", "poll"], "{urls:?}");
 }

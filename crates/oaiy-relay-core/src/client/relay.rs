@@ -34,6 +34,8 @@ use super::status::Health;
 
 /// The longest a proof may be before an authenticated call is refused: twice the loop's schedule (`PROOF_EVERY_S`), a safety net and not the schedule.
 pub const PROOF_MAX_AGE_S: u64 = 2 * poll::PROOF_EVERY_S;
+/// How far back the wall clock may go after a proof before the proof is taken for stale (a clock corrected by NTP goes back a little).
+pub const WALL_BACK_TOLERANCE_S: i64 = 60;
 /// The most a response body may be: the poll's `maxBytes` ceiling (1 MiB) and room for the rest of the answer.
 pub const MAX_RESPONSE_BYTES: usize = 1_048_576 + 65_536;
 
@@ -179,7 +181,11 @@ impl PollReply {
 }
 
 struct ProofRecord {
+    /// The monotonic time of the proof.
     at: Duration,
+    /// The wall clock's time of the proof: the proof is aged by this too, so that a device that slept (a monotonic clock that stands still) or whose wall clock was stepped cannot
+    /// go on using a proof that is old by the wall clock.
+    wall: i64,
     info: Info,
 }
 
@@ -200,6 +206,17 @@ pub struct RelayClient {
     rng: Mutex<Box<dyn Rng>>,
     config: ClientConfig,
     state: Mutex<Shared>,
+}
+
+/// How old a proof is: the larger of its age on the monotonic clock and on the wall clock. A wall clock that has gone back by more than [`WALL_BACK_TOLERANCE_S`] since the proof
+/// makes it as old as can be (the owner set the clock back, or it was reset: nothing says how long ago the proof was); a smaller step back is a clock that was corrected a little.
+fn proof_age(p: &ProofRecord, mono: Duration, wall: i64) -> u64 {
+    let by_mono = mono.saturating_sub(p.at).as_secs();
+    let elapsed = wall.saturating_sub(p.wall);
+    if elapsed < -WALL_BACK_TOLERANCE_S {
+        return u64::MAX;
+    }
+    by_mono.max(elapsed.max(0) as u64)
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -266,10 +283,11 @@ impl RelayClient {
         lock(&self.state).proof.as_ref().map(|p| p.info.clone())
     }
 
-    /// Seconds since the last good proof.
+    /// Seconds since the last good proof: the larger of the age on the monotonic clock and the age on the wall clock (a wall clock that went back by more than a minute since
+    /// the proof is as old as can be: `u64::MAX`).
     pub fn proof_age_s(&self) -> Option<u64> {
-        let now = self.clock.monotonic();
-        lock(&self.state).proof.as_ref().map(|p| now.saturating_sub(p.at).as_secs())
+        let (mono, wall) = (self.clock.monotonic(), self.clock.unix_now());
+        lock(&self.state).proof.as_ref().map(|p| proof_age(p, mono, wall))
     }
 
     /// True after a proof that did not verify and before one that does.
@@ -277,10 +295,11 @@ impl RelayClient {
         lock(&self.state).suspect
     }
 
-    /// The relay's clock now (`X-OAIY-Time` corrected as README section 1 says), or `None` before any sample.
+    /// The relay's clock now (`X-OAIY-Time` kept on the monotonic clock as README section 1 says: a step of the local wall clock does not move it), or `None` before any
+    /// believed sample (a sample a day or more from the wall clock is not believed).
     pub fn relay_now(&self) -> Option<i64> {
         let mono = self.clock.monotonic();
-        lock(&self.state).clock.remote_now(self.clock.unix_now(), mono)
+        lock(&self.state).clock.remote_now(mono)
     }
 
     /// The relay's time if a sample was taken, else the local clock's: for a window that must be judged at all (a response that arrived judges a window with the time of
@@ -291,14 +310,14 @@ impl RelayClient {
 
     /// True when the relay's clock differs from ours by more than 60 seconds (a warning for the owner; nothing is judged by it).
     pub fn clock_mismatch(&self) -> bool {
-        let mono = self.clock.monotonic();
-        lock(&self.state).clock.mismatch(mono)
+        let (mono, wall) = (self.clock.monotonic(), self.clock.unix_now());
+        lock(&self.state).clock.mismatch(wall, mono)
     }
 
     /// The relay offset in seconds, when sampled.
     pub fn relay_offset_s(&self) -> Option<f64> {
-        let mono = self.clock.monotonic();
-        lock(&self.state).clock.offset(mono)
+        let (mono, wall) = (self.clock.monotonic(), self.clock.unix_now());
+        lock(&self.state).clock.offset(wall, mono)
     }
 
     fn sample_time(&self, response: &HttpResponse) {
@@ -343,13 +362,13 @@ impl RelayClient {
     }
 
     pub(crate) fn gate(&self) -> Result<(), ClientError> {
-        let now = self.clock.monotonic();
+        let (mono, wall) = (self.clock.monotonic(), self.clock.unix_now());
         let s = lock(&self.state);
         if s.suspect {
             return Err(ClientError::Suspect);
         }
         match &s.proof {
-            Some(p) if now.saturating_sub(p.at).as_secs() <= PROOF_MAX_AGE_S => Ok(()),
+            Some(p) if proof_age(p, mono, wall) <= PROOF_MAX_AGE_S => Ok(()),
             _ => Err(ClientError::NotProved),
         }
     }
@@ -413,7 +432,7 @@ impl RelayClient {
             Ok(proved) => {
                 let mut s = lock(&self.state);
                 s.suspect = false;
-                s.proof = Some(ProofRecord { at: self.clock.monotonic(), info: proved.info.clone() });
+                s.proof = Some(ProofRecord { at: self.clock.monotonic(), wall: self.clock.unix_now(), info: proved.info.clone() });
                 s.info_read = Some(proved.info.clone());
                 Ok(proved)
             }

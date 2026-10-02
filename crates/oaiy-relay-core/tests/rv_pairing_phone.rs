@@ -540,10 +540,11 @@ fn attack_the_typed_route_builds_only_an_https_origin_of_the_host_the_owner_type
     ] {
         assert!(host(bad).is_err(), "{bad:?} gave {:?}", host(bad));
     }
-    // A host with a trailing dot is another origin than the offer's, so the offer is refused and nothing is posted (no fuzzy match).
-    let dotted = host("relay.stub.test.").unwrap();
-    assert_eq!(dotted, "https://relay.stub.test.");
-    assert_ne!(dotted, "https://relay.stub.test");
+    // A host with a trailing dot (or an empty label) is not a host a relay URL has: refused when the owner types it, so that it cannot be another origin than the offer's.
+    // (Changed with the fix: it used to assert that `relay.stub.test.` is accepted as an origin of its own.)
+    for dotted in ["relay.stub.test.", "relay..stub.test", ".relay.stub.test", "."] {
+        assert!(host(dotted).is_err(), "{dotted:?} gave {:?}", host(dotted));
+    }
 }
 
 // ------------------------------------------------------------------------------------------------------------------ the order of the phone's steps
