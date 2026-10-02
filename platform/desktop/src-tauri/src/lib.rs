@@ -16,6 +16,8 @@ mod isolated_webview;
 /// Writing a secret to disk owner-only from its first byte (every store of a key or token uses it).
 pub mod secret_file;
 pub mod link;
+/// The owner-run relay's side of the desktop: its files so far (see `relay::link_store`).
+pub mod relay;
 pub mod ai;
 pub mod http;
 pub mod services;

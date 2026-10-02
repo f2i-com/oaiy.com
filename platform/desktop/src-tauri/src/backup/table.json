@@ -87,6 +87,14 @@
       "reason": "The FormLogic link's own state (events waiting to be sent, delivery markers, its cache): it belongs to the link, which you make again."
     },
     {
+      "id": "relay-link",
+      "class": "excluded",
+      "paths": ["relay/**"],
+      "what": "The link to your own relay: this computer's token there, which lanes use it, and the provider keys it pinned",
+      "reason": "The link to your own relay: this computer's token and identity at the relay, and the provider keys it pinned on your word. A second live copy would clash with the original, and a key or a pin is never copied into a backup.",
+      "redo": "Enrol this computer at your relay again, and confirm your provider's keys again."
+    },
+    {
       "id": "keys",
       "class": "excluded",
       "paths": ["keys/**", "vault/**"],
@@ -907,7 +915,7 @@
       "ring-attempts.json": "ring-attempts",
       "ring.json": "ring",
       "roster.json": "companion",
-      "routes.json": "not-a-store: the route table as the access model exports it for its checks: not a file of the data folder",
+      "routes.json": "relay-link",
       "script-profile.json": "link-state",
       "scripts": "rebuilt",
       "services-autostart.json": "autostart",

@@ -1134,6 +1134,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `LinkedAccount` as a build from before the relay's files holds it: it refuses a field it does
+    /// not know, so a field added to `account.json` would unlink that build (and, until `LinkError`,
+    /// without a word).
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct LinkedAccountBeforeTheRelay {
+        connector_id: String,
+        base_url: String,
+        credential: String,
+        #[serde(default)]
+        account_id: Option<String>,
+        #[serde(default)]
+        account_name: Option<String>,
+        #[serde(default)]
+        granted_scopes: Option<String>,
+        linked_at: chrono::DateTime<chrono::Utc>,
+        #[serde(default)]
+        instance_id: Option<String>,
+    }
+
+    #[test]
+    fn a_build_from_before_the_relay_still_reads_the_link_and_finds_nothing_new_in_its_folder() {
+        // The relay's files are beside the provider's (design 4.16.2), so `account.json` is written exactly
+        // as it always was and a rolled-back build reads it, with the relay linked or not.
+        let (dir, s) = store("downgrade");
+        s.persist(&account()).unwrap();
+        let file = dir.join("link").join("account.json");
+        let before = std::fs::read(&file).unwrap();
+
+        let relay = crate::relay::link_store::RelayStore::open(&dir);
+        relay
+            .set_relay(crate::relay::link_store::RelayLink {
+                relay_url: "https://relay.example.com".into(),
+                relay_id: "rly-1".into(),
+                relay_thumbprint: "t".repeat(43),
+                device_id: "dev-1".into(),
+                token: "oaiyrt1.TOKEN".into(),
+                name: "Reception PC".into(),
+                enrolled_at: chrono::Utc::now(),
+                calibration: None,
+            })
+            .unwrap();
+        relay.set_routes(crate::relay::link_store::Routes { commands: crate::relay::link_store::Route::Relay, ..Default::default() }).unwrap();
+        relay.set_pins(Default::default()).unwrap();
+
+        assert_eq!(std::fs::read(&file).unwrap(), before, "the relay's files do not touch account.json");
+        let old: LinkedAccountBeforeTheRelay = serde_json::from_slice(&before).expect("the old struct reads what this build writes");
+        assert_eq!((old.credential.as_str(), old.connector_id.as_str()), ("flk_supersecret", "formlogic"));
+        // And a link this build rewrites later (a renewed key, a new instance id) is still that shape.
+        let mut renewed = account();
+        renewed.credential = "flk_renewed".into();
+        s.persist(&renewed).unwrap();
+        serde_json::from_slice::<LinkedAccountBeforeTheRelay>(&std::fs::read(&file).unwrap()).expect("and so is the next one");
+
+        let names = |folder: &std::path::Path| -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(folder).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            names.sort();
+            names
+        };
+        assert_eq!(names(&dir.join("link")), ["account.json"], "nothing new in the provider's folder");
+        assert_eq!(names(&dir.join("relay")), ["providers.json", "relay.json", "routes.json"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // --- a link that cannot be used is kept and reported, never read as no link ---------------
 
     /// An empty data folder with its `link` folder made.
