@@ -1,17 +1,18 @@
 // A release build does not start a plugin nobody signed until the person trusts that exact
-// package. The card says so, and offers "Trust this plugin" for that and nothing else: a
+// package. Developer builds can run it, but AI access still requires explicit trust.
+// The card offers "Trust this plugin" for either unsigned state: a
 // package that carries a signature is verified or quarantined by it alone.
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const m = vi.hoisted(() => ({ list: vi.fn(), trust: vi.fn(), start: vi.fn(), push: vi.fn(), install: vi.fn() }));
+const m = vi.hoisted(() => ({ list: vi.fn(), trust: vi.fn(), start: vi.fn(), stop: vi.fn(), push: vi.fn(), install: vi.fn() }));
 
 vi.mock('./api', async (importOriginal) => {
   const real = await importOriginal<typeof import('./api')>();
   return {
     ...real,
-    plugins: { ...real.plugins, list: m.list, trust: m.trust, start: m.start, install: m.install },
+    plugins: { ...real.plugins, list: m.list, trust: m.trust, start: m.start, stop: m.stop, install: m.install },
     serviceDefinitions: { list: vi.fn().mockResolvedValue({ definitions: [] }) },
     setup: {
       ...real.setup,
@@ -74,6 +75,7 @@ beforeEach(() => {
   invalidate('pluginsSnapshot');
   m.trust.mockReset().mockResolvedValue({});
   m.start.mockReset();
+  m.stop.mockReset();
   m.push.mockReset();
   m.install.mockReset();
   host = document.createElement('div');
@@ -169,7 +171,6 @@ describe('the trust action is for an unsigned package and nothing else', () => {
 
   it.each([
     ['verified', { state: 'verified', publisher: 'Aokie', keyId: 'fl-aokie-2026a' } as PackageTrust],
-    ['unsigned-dev', { state: 'unsigned-dev', reason: 'Not signed. It runs because this is a developer build.' } as PackageTrust],
     ['trusted-local', { state: 'trusted-local', reason: 'You trusted this exact package.' } as PackageTrust],
     ['no verdict (the manifest could not be loaded)', undefined],
   ])('is not offered for %s', async (_name, trust) => {
@@ -192,6 +193,38 @@ describe('the trust action is for an unsigned package and nothing else', () => {
     expect(button('Trust this plugin')).toBeUndefined();
     expect(host.querySelector('.card-reason')?.textContent).toContain('Quarantined: digest mismatch');
     expect(button('Stop')).toBeDefined();
+  });
+});
+
+describe('an unsigned plugin in a developer build', () => {
+  it.each(['installed', 'running'] as const)('offers explicit package trust while %s without restarting it', async (state) => {
+    const record: PluginRecord = {
+      id: 'narrator', state, dir: 'C:/plugins/narrator', userDisabled: false, restartAttempts: 0,
+      manifest: { name: 'Narrator', version: '0.2.0', capabilities: ['oaiy.ai.complete'] },
+      trust: { state: 'unsigned-dev', reason: 'Not signed. It runs because this is a developer build.' },
+    };
+    await render([record]);
+    expect(button('Trust this plugin')).toBeDefined();
+    expect(host.textContent).toContain('AI access requires you to trust this exact package');
+    if (state === 'installed') expect(button('Start')!.disabled).toBe(false);
+    else expect(button('Stop')).toBeDefined();
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    await act(async () => { button('Trust this plugin')!.click(); });
+    await settle();
+    expect(m.trust).not.toHaveBeenCalled();
+    expect(confirmSpy.mock.calls[0][0]).toContain('AI completion access to your configured providers');
+    confirmSpy.mockReturnValue(true);
+    m.list.mockResolvedValue({ root: 'C:/plugins', plugins: [{ ...record, trust: { state: 'trusted-local' } }] });
+    await act(async () => { button('Trust this plugin')!.click(); });
+    await settle();
+    expect(m.trust).toHaveBeenCalledExactlyOnceWith('narrator');
+    expect(m.start).not.toHaveBeenCalled();
+    expect(m.stop).not.toHaveBeenCalled();
+    expect(button('Trust this plugin')).toBeUndefined();
+    expect(host.querySelector('.badge[data-trust="trusted-local"]')?.textContent).toBe('trusted by you');
+    expect(m.push).toHaveBeenCalledWith(expect.objectContaining({
+      title: 'Trusted Narrator', body: state === 'running' ? 'Return to the plugin and read its host models again.' : 'Click Start to run it.',
+    }));
   });
 });
 

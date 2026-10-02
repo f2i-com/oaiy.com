@@ -3872,6 +3872,42 @@ process.stdin.on("data", (chunk) => {
         assert!(host.holds_screen_capability("probe","oaiy.ai.complete",&current)); host.stop("probe").unwrap();
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn running_developer_plugin_catalog_requires_exact_package_trust_without_a_restart() {
+        use axum::{body::Body, http::{Request, StatusCode}};
+        use tower::ServiceExt;
+        let (sb, host, trust) = trusting_host("dev-screen-ai-trust", TrustPolicy::developer(), Publishers::default());
+        let Some(dir) = node_plugin(&sb, "probe") else { panic!("Node is required for this real-process qualification test"); };
+        let path = dir.join("manifest.json");
+        let mut manifest: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        manifest["capabilities"] = json!(["oaiy.ai.complete"]);
+        std::fs::write(path, manifest.to_string()).unwrap();
+        host.start("probe").unwrap();
+        wait_running(&host, "probe");
+        assert_eq!(trust_of(&host, "probe"), Some(TrustState::UnsignedDev));
+        let original_process = host.procs.lock().unwrap().running.get("probe").unwrap().clone();
+        let services = Arc::new(Mutex::new(crate::services::registry::Registry::empty(sb.0.join("data"), sb.0.join("models"))));
+        let ai = crate::ai::routes::AiState::new(crate::ai::providers::new_handle(), services, crate::ai::codex::absent_for_tests()).with_engines_at(None);
+        let app = crate::ai::plugin_completion::router(ai, host.clone(), true);
+        let read = || app.clone().oneshot(Request::builder().uri("/api/plugins/probe/ai/sources").body(Body::empty()).unwrap());
+        assert_eq!(read().await.unwrap().status(), StatusCode::FORBIDDEN);
+        trust.trust_local(&dir, "probe").unwrap();
+        host.registry.lock().unwrap().scan();
+        assert_eq!(trust_of(&host, "probe"), Some(TrustState::TrustedLocal));
+        assert_eq!(read().await.unwrap().status(), StatusCode::OK);
+        let lease = host.screen_capability("probe", "oaiy.ai.complete").unwrap();
+        assert!(Arc::ptr_eq(&original_process, &lease.process), "explicit trust must preserve the running process");
+        let script = dir.join("plugin.mjs");
+        let mut changed = std::fs::read_to_string(&script).unwrap();
+        changed.push_str("\n// changed after trust\n");
+        std::fs::write(script, changed).unwrap();
+        host.registry.lock().unwrap().scan();
+        assert_eq!(read().await.unwrap().status(), StatusCode::FORBIDDEN);
+        assert!(!host.holds_screen_capability("probe", "oaiy.ai.complete", &lease));
+        host.stop("probe").unwrap();
+    }
+
     /// Rewrite a file with other bytes of the same length and put its modified time back.
     #[cfg(windows)]
     fn swap_keeping_size_and_time(path: &std::path::Path, bytes: &[u8]) {

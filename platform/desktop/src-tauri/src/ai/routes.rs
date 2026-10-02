@@ -96,18 +96,64 @@ pub(super) async fn resident_engine_provider(st: &AiState) -> Result<AiProvider,
 }
 
 async fn engine_discovery_impl(st: &AiState, require_resident: bool) -> Result<(String, Value), String> {
-    let ui = st.engines_ui().ok_or("OAIY's engines are not running")?;
-    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(4));
-    if require_resident { builder = builder.no_proxy().redirect(reqwest::redirect::Policy::none()); }
-    let client = builder.build().map_err(|e| e.to_string())?;
-    let state = engine_json(&client, format!("{}/api/state", ui.trim_end_matches('/')), require_resident).await?;
-    let gateway = state.get("gateway_url").and_then(Value::as_str).filter(|g| !g.is_empty()).ok_or("the engines have no gateway yet")?.trim_end_matches('/').to_string();
-    let discovery = engine_json(&client, format!("{gateway}/v1/discovery"), require_resident).await?;
-    if require_resident && (state.pointer("/llm/state").and_then(Value::as_str) != Some("ready")
-        || state.pointer("/llm/resident").and_then(Value::as_str).filter(|model| !model.is_empty()) != Some(chosen_model(&discovery).as_str())) {
+    let (gateway, discovery, state) = engine_discovery_snapshot(st, require_resident).await?;
+    if require_resident && !engine_model_resident(&state, &chosen_model(&discovery)) {
         return Err("The chosen engine model is not already ready and resident.".into());
     }
     Ok((gateway, discovery))
+}
+
+fn engine_model_resident(state: &Value, model: &str) -> bool {
+    !model.is_empty()
+        && state.pointer("/llm/state").and_then(Value::as_str) == Some("ready")
+        && state.pointer("/llm/resident").and_then(Value::as_str) == Some(model)
+}
+
+/// Metadata for the selected local engine model. Reading this never loads it;
+/// completion still independently requires the exact model to be resident.
+pub(super) struct PluginEngineSource {
+    pub model: String,
+    pub completion_available: bool,
+    pub unavailable_reason: Option<&'static str>,
+}
+
+pub(super) async fn plugin_engine_source(st: &AiState) -> Result<PluginEngineSource, String> {
+    let (_, discovery, state) = engine_discovery_snapshot(st, true).await?;
+    let model = chosen_model(&discovery);
+    if model.trim().is_empty() || model.len() > 256 || model.chars().any(char::is_control) {
+        return Err("the engines have no bounded selected language model".into());
+    }
+    let selected = discovery.pointer("/models/llm").and_then(Value::as_array)
+        .and_then(|models| models.iter().find(|entry| entry.get("id").and_then(Value::as_str) == Some(model.as_str())))
+        .ok_or("the selected language model is not in the engine catalogue")?;
+    let files_present = selected.get("files_present").and_then(Value::as_bool) == Some(true);
+    let completion_available = files_present && engine_model_resident(&state, &model);
+    let unavailable_reason = if completion_available {
+        None
+    } else if !files_present {
+        Some("The selected local model's files are missing. Check its files in OAIY Engines before starting it.")
+    } else if state.pointer("/llm/paused_for_media").and_then(Value::as_bool) == Some(true) {
+        Some("The local language model is paused for media work. Wait for that work to finish, then read host models again.")
+    } else {
+        Some(match state.pointer("/llm/state").and_then(Value::as_str) {
+            Some("starting") => "The selected local model is loading. Wait until OAIY Engines shows it is ready, then read host models again.",
+            Some("ready") => "A different local model is resident. Check the selected default in OAIY Engines before changing or restarting models.",
+            Some("failed") => "The selected local model failed to start. Check OAIY Engines for the error before trying again.",
+            _ => "The selected local model is not loaded. In OAIY Engines, check the selected default and start it when other work is idle, then read host models again.",
+        })
+    };
+    Ok(PluginEngineSource { model, completion_available, unavailable_reason })
+}
+
+async fn engine_discovery_snapshot(st: &AiState, bounded: bool) -> Result<(String, Value, Value), String> {
+    let ui = st.engines_ui().ok_or("OAIY's engines are not running")?;
+    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(4));
+    if bounded { builder = builder.no_proxy().redirect(reqwest::redirect::Policy::none()); }
+    let client = builder.build().map_err(|e| e.to_string())?;
+    let state = engine_json(&client, format!("{}/api/state", ui.trim_end_matches('/')), bounded).await?;
+    let gateway = state.get("gateway_url").and_then(Value::as_str).filter(|g| !g.is_empty()).ok_or("the engines have no gateway yet")?.trim_end_matches('/').to_string();
+    let discovery = engine_json(&client, format!("{gateway}/v1/discovery"), bounded).await?;
+    Ok((gateway, discovery, state))
 }
 
 async fn engine_json(client: &reqwest::Client, url: String, bounded: bool) -> Result<Value, String> {

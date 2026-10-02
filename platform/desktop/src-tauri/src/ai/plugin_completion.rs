@@ -301,14 +301,16 @@ async fn sources(State(st): State<PluginAi>, Path(plugin): Path<String>) -> Resp
     // Engine discovery is deliberately absent in isolation. The normal route
     // asks the same existing engine service as the named-provider gateway.
     if !st.isolated {
-        if let Ok(Ok(p)) = tokio::time::timeout(
+        if let Ok(Ok(engine)) = tokio::time::timeout(
             Duration::from_secs(4),
-            super::routes::resident_engine_provider(&st.ai),
+            super::routes::plugin_engine_source(&st.ai),
         )
         .await
         {
-            sources.push(json!({"id":format!("provider:{ENGINE_PROVIDER_ID}"),"kind":"provider","providerId":ENGINE_PROVIDER_ID,
-                "name":"OAIY engine","model":p.model.filter(|model| model.len() <= 256),"capabilities":["chat"],"gatewayCapabilities":["chat"],"enabled":true,"completionAvailable":true}));
+            let mut source = json!({"id":format!("provider:{ENGINE_PROVIDER_ID}"),"kind":"provider","providerId":ENGINE_PROVIDER_ID,
+                "name":"OAIY engine","model":engine.model,"capabilities":["chat"],"gatewayCapabilities":["chat"],"enabled":true,"completionAvailable":engine.completion_available});
+            if let Some(reason) = engine.unavailable_reason { source["unavailableReason"] = json!(reason); }
+            sources.push(source);
         }
     }
     if !lease.valid() {
@@ -974,6 +976,128 @@ mod tests {
         provider.protocol = Protocol::OpenAi;
         provider.model = None;
         assert!(!isolated_provider(&provider));
+    }
+
+    #[tokio::test]
+    async fn engine_catalogue_reports_readiness_without_loading_and_is_bounded_and_isolated() {
+        use axum::response::IntoResponse;
+        use std::sync::atomic::AtomicUsize;
+        let mut f = fixture().await;
+        let llm = Arc::new(Mutex::new(json!({"state":"stopped","resident":"","paused_for_media":false})));
+        let discovery = Arc::new(Mutex::new(json!({"defaults":{"llm":"selected"},"models":{"llm":[{"id":"selected","files_present":true}]}})));
+        let mode = Arc::new(AtomicUsize::new(0));
+        let traffic: Arc<Mutex<Vec<String>>> = Default::default();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let gateway = format!("{base}/gw");
+        let state_llm = llm.clone();
+        let state_mode = mode.clone();
+        let state_entered = entered.clone();
+        let state_release = release.clone();
+        let discovery_mode = mode.clone();
+        let document = discovery.clone();
+        let requests = traffic.clone();
+        let engine = Router::new()
+            .route("/api/state", get(move || {
+                let llm = state_llm.clone(); let mode = state_mode.clone(); let gateway = gateway.clone();
+                let entered = state_entered.clone(); let release = state_release.clone();
+                async move {
+                    if mode.load(Ordering::SeqCst) == 5 { std::future::pending::<()>().await; }
+                    if mode.load(Ordering::SeqCst) == 6 { entered.notify_one(); release.notified().await; }
+                    Json(json!({"gateway_url":gateway,"llm":llm.lock().unwrap().clone()}))
+                }
+            }))
+            .route("/gw/v1/discovery", get(move || {
+                let mode = discovery_mode.clone(); let document = document.clone();
+                async move {
+                    match mode.load(Ordering::SeqCst) {
+                        1 => Json(json!({"padding":"x".repeat(64*1024)})).into_response(),
+                        2 => (StatusCode::FOUND, [("location", "/gw/redirected")], "redirect").into_response(),
+                        3 => "invalid JSON".into_response(),
+                        4 => (StatusCode::BAD_GATEWAY, "private engine failure at http://private.invalid").into_response(),
+                        _ => Json(document.lock().unwrap().clone()).into_response(),
+                    }
+                }
+            }))
+            .fallback(|| async { StatusCode::METHOD_NOT_ALLOWED })
+            .layer(axum::middleware::from_fn(move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let requests = requests.clone();
+                async move {
+                    requests.lock().unwrap().push(format!("{} {}", request.method(), request.uri().path()));
+                    next.run(request).await
+                }
+            }));
+        let server = tokio::spawn(async move { axum::serve(listener, engine).await.unwrap(); });
+        f.state.ai = f.state.ai.clone().with_engines_at(Some(base));
+        f.app = routes(f.state.clone());
+        let read = |app| ask(app, "GET", "/api/plugins/probe/ai/sources", Value::Null);
+        fn engine_source(value: &Value) -> Option<&Value> {
+            value["sources"].as_array().unwrap().iter().find(|source| source["providerId"] == ENGINE_PROVIDER_ID)
+        }
+        let (status, value) = read(f.app.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(engine_source(&value).is_none());
+        assert!(traffic.lock().unwrap().is_empty(), "isolated catalogue must not contact even a configured engine URL");
+        f.state.isolated = false;
+        f.app = routes(f.state.clone());
+        f.gate.store(false, Ordering::SeqCst);
+        assert_eq!(read(f.app.clone()).await.0, StatusCode::FORBIDDEN);
+        assert!(traffic.lock().unwrap().is_empty(), "untrusted catalogue must not contact engines");
+        f.gate.store(true, Ordering::SeqCst);
+        for (state, resident, paused, reason) in [
+            ("stopped", "", false, "not loaded"),
+            ("starting", "", false, "loading"),
+            ("failed", "", false, "failed to start"),
+            ("stopped", "selected", true, "paused for media"),
+            ("ready", "other", false, "different local model"),
+        ] {
+            *llm.lock().unwrap() = json!({"state":state,"resident":resident,"paused_for_media":paused});
+            let (status, value) = read(f.app.clone()).await;
+            assert_eq!(status, StatusCode::OK);
+            let source = engine_source(&value).unwrap();
+            assert_eq!(source["model"], "selected");
+            assert_eq!(source["completionAvailable"], false);
+            assert!(source["unavailableReason"].as_str().unwrap().contains(reason));
+        }
+        *llm.lock().unwrap() = json!({"state":"ready","resident":"selected"});
+        let (_, value) = read(f.app.clone()).await;
+        let source = engine_source(&value).unwrap();
+        assert_eq!(source["completionAvailable"], true);
+        assert!(source.get("unavailableReason").is_none());
+        discovery.lock().unwrap()["models"]["llm"][0]["files_present"] = json!(false);
+        let (_, value) = read(f.app.clone()).await;
+        let source = engine_source(&value).unwrap();
+        assert_eq!(source["completionAvailable"], false);
+        assert!(source["unavailableReason"].as_str().unwrap().contains("files are missing"));
+        for invalid in [
+            json!({"defaults":{"llm":"disabled"},"models":{"llm":[{"id":"selected","files_present":true}]}}),
+            json!({"defaults":{"llm":"x".repeat(257)},"models":{"llm":[]}}),
+            json!({"defaults":{"llm":"bad\nmodel"},"models":{"llm":[{"id":"bad\nmodel","files_present":true}]}}),
+        ] {
+            *discovery.lock().unwrap() = invalid;
+            assert!(engine_source(&read(f.app.clone()).await.1).is_none());
+        }
+        *discovery.lock().unwrap() = json!({"defaults":{"llm":"selected"},"models":{"llm":[{"id":"selected","files_present":true}]}});
+        for failed_transport in 1..=5 {
+            mode.store(failed_transport, Ordering::SeqCst);
+            let started = Instant::now();
+            let (status, value) = read(f.app.clone()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(engine_source(&value).is_none());
+            assert!(started.elapsed() < Duration::from_secs(6), "catalogue discovery must have a whole-operation deadline");
+            assert!(!value.to_string().contains("private.invalid"));
+        }
+        mode.store(6, Ordering::SeqCst);
+        let pending = tokio::spawn(read(f.app.clone()));
+        tokio::time::timeout(Duration::from_secs(2), entered.notified()).await.unwrap();
+        f.gate.store(false, Ordering::SeqCst);
+        release.notify_one();
+        assert_eq!(pending.await.unwrap().0, StatusCode::FORBIDDEN, "a lost trust lease cannot publish stale model metadata");
+        assert!(traffic.lock().unwrap().iter().all(|path| path == "GET /api/state" || path == "GET /gw/v1/discovery"), "catalogue reads cannot follow redirects, load models, or start inference");
+        assert!(f.asked.lock().unwrap().is_empty());
+        server.abort();
     }
 
     #[tokio::test]
