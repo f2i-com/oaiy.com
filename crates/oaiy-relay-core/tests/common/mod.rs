@@ -63,6 +63,15 @@ impl At for Json {
     }
 }
 
+/// A test that needs a tool this machine does not have (python, node) says so **loudly** and passes, unless `OAIY_REQUIRE_TOOLS=1`, which makes it a failure: the CI lane that has the
+/// tools sets it, so that a lane that lost them goes red and never passes by doing nothing.
+pub fn tool_missing(test: &str, why: &str) {
+    if std::env::var("OAIY_REQUIRE_TOOLS").is_ok_and(|v| !v.is_empty() && v != "0") {
+        panic!("OAIY_REQUIRE_TOOLS is set and {test} cannot run: {why}");
+    }
+    eprintln!("\n=====================================================================\nSKIPPED: {test} did NOT run: {why}\n(OAIY_REQUIRE_TOOLS=1 makes this a failure)\n=====================================================================");
+}
+
 /// A small seeded generator (SplitMix64): the tests that generate input are reproducible from their seed, which is printed when they fail.
 pub struct Rng(pub u64);
 

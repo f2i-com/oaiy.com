@@ -458,6 +458,8 @@ jobs:
           php --version | head -n 1
           echo "OAIY_PHP=php" >> "$GITHUB_ENV"
           echo "OAIY_REQUIRE_PHP=1" >> "$GITHUB_ENV"
+          # The differential tests of the poll rules run python and node, which this lane has (setup-node above, python3 on the runner): a lane that loses them is red, not green.
+          echo "OAIY_REQUIRE_TOOLS=1" >> "$GITHUB_ENV"
       # Both suites, as a product is built (no `unsafe-keyfile`: the refusal of the unsafe name is tested here), with the tests that look at memory (the allocator and dead-stack
       # probes) and the two-process, FIFO and symlink tests of the keystore; and then the keystore with `unsafe-keyfile`, which is the same on Unix and, on Windows, everything.
       - name: Tests
