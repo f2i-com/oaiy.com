@@ -63,6 +63,43 @@ fn a_retry_after_is_honoured_in_whatever_case_the_adapter_returns_it() {
     assert!(e.clock.sleeps().iter().any(|s| within_jitter(s, 40.0)), "{:?}", e.clock.sleeps());
 }
 
+#[test]
+fn the_headers_of_an_answer_reach_the_host_in_lower_case_whatever_the_adapter_returned() {
+    // An OkHttp adapter returns the names as the server wrote them: the client normalises them as the response comes in, so that what it hands on (`PollReply::headers`, which the
+    // decision core reads) is in lower case and a consumer never has to know what the adapter did.
+    let e = env(quick());
+    let (token, _) = e.enrol_desktop();
+    let stub = e.stub.clone();
+    let adapter = oaiy_relay_core::testing::ScriptedHttp::new(move |req| {
+        if req.url.contains("/v1/poll") {
+            return Ok(HttpResponse {
+                status: 429,
+                headers: vec![
+                    ("Retry-After".into(), "7".into()),
+                    ("X-OAIY-Time".into(), "1790000000".into()),
+                    ("CONTENT-TYPE".into(), "application/json".into()),
+                ],
+                body: b"{}".to_vec(),
+            });
+        }
+        stub.handle(req)
+    });
+    let client = RelayClient::new(
+        e.client.url().clone(),
+        Some(e.stub.relay_thumbprint()),
+        Arc::new(adapter),
+        e.clock.clone(),
+        Box::new(SeededRng::new(77)),
+        ClientConfig::default(),
+    );
+    client.prove(&Cancel::new()).unwrap();
+    let reply = client.poll(&token, &PollRequest { since: 0, epoch: None, wait_s: 0, limit: 32 }, &Cancel::new()).unwrap();
+    assert_eq!(reply.status, Some(429));
+    let names: Vec<&str> = reply.headers.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(names, ["retry-after", "x-oaiy-time", "content-type"], "lower case, in the order they came");
+    assert!(reply.headers.iter().any(|(k, v)| k == "retry-after" && v == "7"));
+}
+
 /// Every spelling a secret can be printed in: the raw bytes as hex, as decimal numbers, as base64url, and as the 6-bit digits are not printed either.
 fn spellings(bytes: &[u8]) -> Vec<String> {
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
