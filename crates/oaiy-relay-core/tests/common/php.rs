@@ -94,7 +94,11 @@ impl PhpRelay {
         let php = match find_php() {
             Ok(p) => p,
             Err(why) => {
-                eprintln!("SKIPPED: {why}");
+                // A lane that is meant to have PHP says so (`OAIY_REQUIRE_PHP=1`): there a missing PHP is a failure and never a quiet pass.
+                if std::env::var("OAIY_REQUIRE_PHP").is_ok_and(|v| !v.is_empty() && v != "0") {
+                    panic!("OAIY_REQUIRE_PHP is set and the real relay cannot be started: {why}");
+                }
+                eprintln!("\n=====================================================================\nSKIPPED: the REAL PHP RELAY is NOT tested in this run: {why}\n(set OAIY_PHP to a php with sodium and pdo_sqlite; OAIY_REQUIRE_PHP=1 makes this a failure)\n=====================================================================");
                 return None;
             }
         };

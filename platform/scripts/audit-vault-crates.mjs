@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Audits the dependencies of the two vault crates, oaiy-crypto and oaiy-keystore, and of nothing else in the workspace.
+// Audits the dependencies of the vault crates, oaiy-crypto and oaiy-keystore, and of the relay client core that builds on them (oaiy-relay-core), and of nothing else in the workspace.
 //
 //   node platform/scripts/audit-vault-crates.mjs
 //
@@ -17,7 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const CRATES = ['oaiy-crypto', 'oaiy-keystore'];
+const CRATES = ['oaiy-crypto', 'oaiy-keystore', 'oaiy-relay-core'];
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 function run(args, options) {
