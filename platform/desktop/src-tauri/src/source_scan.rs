@@ -360,6 +360,22 @@ pub(crate) fn production_code(source: &str) -> String {
     strip_tests(source).code
 }
 
+/// [`production_code`] without the comments either (doc comments too), for a guard on what the code DOES: a
+/// comment may say "credential" or "Bearer" about a lane that applies none.
+pub(crate) fn code_without_comments(source: &str) -> String {
+    let code = production_code(source);
+    let b: Vec<char> = code.chars().collect();
+    let mut out = b.clone();
+    for t in tokenize(&b).iter().filter(|t| t.kind == Kind::Comment) {
+        for c in &mut out[t.start..t.end] {
+            if *c != '\n' {
+                *c = ' ';
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
 /// The files, among `sources` (a path under `src/` with `/` in it, and the text), that are test code from
 /// their first line: those a `#[cfg(test)] mod name;` declares, and everything under them. A test helper kept
 /// in a file of its own has `#[test]` functions and fixtures at its top level, which no attribute in the file
@@ -519,6 +535,15 @@ mod tests {
             only,
             ["auth/fixtures/mod.rs", "auth/fixtures/more.rs", "auth/route_coverage.rs", "auth/route_coverage/deeper.rs", "link/testkit.rs", "ring/limits/checks.rs", "source_scan.rs"]
         );
+    }
+
+    #[test]
+    fn comments_can_be_taken_out_too_and_a_string_with_slashes_in_it_is_not_one() {
+        let source = "// Bearer in a comment\nfn f() { let url = \"https://x.test/a\"; /* credential */ g(url) } /// doc credential\n#[cfg(test)]\nmod tests { fn t() { \"credential\"; } }\n";
+        let code = code_without_comments(source);
+        assert!(!code.to_lowercase().contains("bearer") && !code.contains("credential"), "{code}");
+        assert!(code.contains("\"https://x.test/a\"") && code.contains("g(url)"), "{code}");
+        assert_eq!(code.lines().count(), source.lines().count());
     }
 
     #[test]

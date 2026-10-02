@@ -496,22 +496,83 @@ mod tests {
         assert!(seen.iter().all(|r| r.header("cookie").is_none()), "no cookie is kept for the next request");
     }
 
+    #[test]
+    fn the_header_is_sensitive_and_it_replaces_every_authorization_the_request_had() {
+        // Marked sensitive, so nothing prints it (a debug print of a request, a log of its headers); and one
+        // header, not one beside another that the caller put there.
+        let mut creds = Creds::default();
+        creds.register(CredKind::Provider, "https://formlogic.com", "flk_SECRET").unwrap();
+        let http = client_builder(Keep::Between).build().unwrap();
+        let building = || http.get("https://formlogic.com/x").header("authorization", "Bearer other").header("Authorization", "Bearer another");
+
+        let request = building().with_creds(&creds, CredKind::Provider).unwrap().build().unwrap();
+        let held: Vec<&HeaderValue> = request.headers().get_all(AUTHORIZATION).iter().collect();
+        assert_eq!(held.len(), 1, "the ones the caller set are gone: {held:?}");
+        assert_eq!(held[0], "Bearer flk_SECRET");
+        assert!(held[0].is_sensitive(), "a sensitive header prints as nothing");
+        assert!(!format!("{request:?}").contains("flk_SECRET"), "{request:?}");
+
+        // The same through `apply`, the one place a bearer is put on a request.
+        let auth = creds.for_url(&url("https://formlogic.com/x"), CredKind::Provider).unwrap();
+        let request = building().apply(auth).unwrap().build().unwrap();
+        let held: Vec<&HeaderValue> = request.headers().get_all(AUTHORIZATION).iter().collect();
+        assert!(held.len() == 1 && held[0] == "Bearer flk_SECRET" && held[0].is_sensitive(), "{held:?}");
+    }
+
     /// The lanes that have been converted, with their source: a lane here applies no credential of its own.
     /// Converting a lane adds it to this list; the last step of the conversion replaces the list with a scan of
     /// every file of the crate (design 4.16.3).
     const CONVERTED: &[(&str, &str)] = &[("link/heartbeat.rs", include_str!("heartbeat.rs"))];
 
+    /// What the code of a converted lane does with a credential that only this module may do: it names one (any
+    /// case, any spelling of the scheme), puts a header on a request by hand or builds a header map. The code
+    /// is what is not a comment and not under `#[cfg(test)]`, wherever in the file either is.
+    fn what_a_lane_does_that_only_creds_may(source: &str) -> Vec<&'static str> {
+        let code = crate::source_scan::code_without_comments(source).to_lowercase();
+        ["credential", "authorization", "bearer", "basic_auth", "x-api-key", ".header(", ".headers(", "headermap", "headervalue", "headername"]
+            .into_iter()
+            .filter(|forbidden| code.contains(forbidden))
+            .collect()
+    }
+
+    /// What a converted lane has to do instead.
+    fn what_a_lane_leaves_undone(source: &str) -> Vec<&'static str> {
+        let code = crate::source_scan::code_without_comments(source);
+        ["with_creds(", "client_builder("].into_iter().filter(|needed| !code.contains(needed)).collect()
+    }
+
     #[test]
     fn a_converted_lane_reads_its_credential_nowhere_but_here() {
         for (name, source) in CONVERTED {
-            // The code that runs: what is not under `#[cfg(test)]`, wherever in the file that is.
-            let code = &crate::source_scan::production_code(source);
-            assert!(code != source, "{name}: there are no tests in it, or the source was not read as it is");
-            for forbidden in ["bearer_auth", ".credential", "AUTHORIZATION", "\"Bearer", "Bearer {", "\"authorization\"", "basic_auth"] {
-                assert!(!code.contains(forbidden), "{name} puts a credential on a request itself ({forbidden}): it goes through creds.rs");
-            }
-            assert!(code.contains("with_creds("), "{name} does not take its credential from creds.rs");
-            assert!(code.contains("client_builder("), "{name} builds its client by hand: a credentialed client comes from creds::client_builder");
+            assert_eq!(what_a_lane_does_that_only_creds_may(source), Vec::<&str>::new(), "{name} puts a credential on a request itself: it goes through creds.rs");
+            assert_eq!(what_a_lane_leaves_undone(source), Vec::<&str>::new(), "{name} does not take its credential from creds.rs, or builds its client by hand");
         }
+    }
+
+    #[test]
+    fn the_guard_sees_a_credential_however_it_is_put_on_and_wherever_in_the_file() {
+        let real = include_str!("heartbeat.rs");
+        // Each way a lane could put one on itself, as a function added to the real source at its end, after its
+        // test module, where a scan that stops at the first `#[cfg(test)]` does not look.
+        for (what, leak, found) in [
+            ("bearer_auth", "fn leak(a: &LinkedAccount, c: &reqwest::blocking::Client) { c.get(\"x\").bearer_auth(&a.credential); }", "bearer"),
+            ("a capitalised header name", "fn leak(c: &reqwest::blocking::Client, k: &str) { c.get(\"x\").header(\"Authorization\", k); }", "authorization"),
+            ("a header map of its own", "fn leak(c: &reqwest::blocking::Client, v: reqwest::header::HeaderValue) { let mut h = reqwest::header::HeaderMap::new(); h.insert(\"x-api-key\", v); c.get(\"x\").headers(h); }", "headermap"),
+            ("the field alone", "fn leak(a: LinkedAccount) -> String { let LinkedAccount { credential, .. } = a; credential }", "credential"),
+            ("basic auth", "fn leak(c: &reqwest::blocking::Client) { c.get(\"x\").basic_auth(\"u\", Some(\"p\")); }", "basic_auth"),
+        ] {
+            let source = format!("{real}\n{leak}\n");
+            assert!(what_a_lane_does_that_only_creds_may(&source).contains(&found), "{what} was not seen in the code after the test module");
+            // And in the middle of the file, among the production code.
+            let middle = real.replacen("pub fn spawn(", &format!("{leak}\npub fn spawn("), 1);
+            assert!(what_a_lane_does_that_only_creds_may(&middle).contains(&found), "{what} was not seen in the middle of the file");
+        }
+        // What is not code does not count: the same words in a comment, and in a function under `#[cfg(test)]`.
+        let quiet = format!("{real}\n// bearer_auth(&account.credential) with an Authorization header\n#[cfg(test)]\nfn only_in_tests(a: &LinkedAccount, c: &reqwest::blocking::Client) {{ c.get(\"x\").bearer_auth(&a.credential); }}\nfn after() {{}}\n");
+        assert_eq!(what_a_lane_does_that_only_creds_may(&quiet), Vec::<&str>::new());
+        assert_eq!(what_a_lane_does_that_only_creds_may(real), Vec::<&str>::new(), "the lane as it is");
+        // A lane that stops going through creds is seen too.
+        assert_eq!(what_a_lane_leaves_undone(&real.replace("with_creds(", "with_nothing(")), ["with_creds("]);
+        assert_eq!(what_a_lane_leaves_undone(&real.replace("client_builder(", "blocking_builder(")), ["client_builder("]);
     }
 }

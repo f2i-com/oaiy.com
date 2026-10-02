@@ -941,33 +941,7 @@ impl PluginHost {
         // A broker plugin signs as this desktop's companion endpoint, so it is
         // handed that identity at init. Every other plugin gets None, and so
         // does a broker with no approved device — see `private_bootstrap`.
-        let (companion_bootstrap, roster_held) = match self
-            .companion
-            .lock()
-            .ok()
-            .and_then(|g| g.clone())
-            .filter(|_| {
-                self.registry
-                    .lock()
-                    .map(|reg| reg.grants(id, "oaiy.companion.admission"))
-                    .unwrap_or(false)
-            })
-            .and_then(|b| b.companion.identity_for(id).ok())
-            .and_then(|identity| identity.private_bootstrap_with_roster(plugin_api_version as u16))
-        {
-            Some((bootstrap, roster)) => (Some(bootstrap), Some(roster)),
-            None => (None, None),
-        };
-        // The roster this plugin is handed is the roster it holds until it is started again: it accepts an admission
-        // only if it equals that one, so that is what `companion.admission` presents for it (and a plugin started with
-        // none holds none, so it is not kept from an earlier run). Kept BEFORE the handshake, which is the last
-        // moment the plugin can ask.
-        if let Ok(mut t) = self.procs.lock() {
-            match roster_held {
-                Some(roster) => t.rosters.insert(id.to_string(), roster),
-                None => t.rosters.remove(id),
-            };
-        }
+        let companion_bootstrap = self.init_bootstrap(id, plugin_api_version);
         match process.init(
             plugin_api_version,
             &super::runner::plugin_data_dir(&dir),
@@ -1005,6 +979,33 @@ impl PluginHost {
         Ok(())
     }
 
+    /// The private bootstrap `plugin.init` hands a broker plugin (its endpoint identity and its roster of phones),
+    /// or `None` for a plugin that is not a broker and for a broker with nobody approved. The roster in it is the
+    /// roster the plugin holds until it is started again: it accepts an admission only if it equals that one, so that
+    /// is what `companion.admission` presents for it. It is kept here, in the same step as the bootstrap is made,
+    /// and BEFORE the handshake, the last moment the plugin can ask; a plugin started with none holds none, and what
+    /// an earlier run of it held is let go.
+    fn init_bootstrap(&self, id: &str, plugin_api_version: u32) -> Option<Value> {
+        let (bootstrap, roster) = match self
+            .companion
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .filter(|_| self.registry.lock().map(|reg| reg.grants(id, "oaiy.companion.admission")).unwrap_or(false))
+            .and_then(|b| b.companion.identity_for(id).ok())
+            .and_then(|identity| identity.private_bootstrap_with_roster(plugin_api_version as u16))
+        {
+            Some((bootstrap, roster)) => (Some(bootstrap), Some(roster)),
+            None => (None, None),
+        };
+        if let Ok(mut t) = self.procs.lock() {
+            match roster {
+                Some(roster) => t.rosters.insert(id.to_string(), roster),
+                None => t.rosters.remove(id),
+            };
+        }
+        bootstrap
+    }
     /// Stop a plugin gracefully. Also cancels a scheduled crash-restart and
     /// overrides a start that is still mid-handshake — a stop that can be
     /// outraced by its own plugin coming up is not a stop.
@@ -2758,6 +2759,55 @@ mod tests {
         host.procs.lock().unwrap().rosters.remove("aokie");
         identity.approve_for_tests(&phone_key(6));
         assert_eq!(admit("one phone and a plugin that holds none").0.len(), 1, "no held roster: the roster as it is");
+    }
+
+    #[test]
+    fn what_start_hands_a_plugin_at_init_is_the_roster_it_is_presented_with_no_process_to_start() {
+        // `start` makes the bootstrap for the handshake with `init_bootstrap`, which also keeps the roster in it. This is
+        // that step on its own, so a platform with no Node to run the stand-in plugin below checks it too.
+        use crate::companion::identity::testing::phone_key;
+        let (a, b, c, d) = (phone_key(1), phone_key(2), phone_key(3), phone_key(4));
+        let (_sb, host, identity, issuer) = admitting_host("adm-init");
+        let asked = || {
+            host.handle_plugin_request("aokie", "companion.admission", json!({})).unwrap();
+            asked_to_bind(&issuer)
+        };
+        let held = |host: &PluginHost| host.procs.lock().unwrap().rosters.get("aokie").cloned();
+
+        // Nobody approved: no bootstrap, and nothing held.
+        assert!(host.init_bootstrap("aokie", 1).is_none() && held(&host).is_none());
+
+        identity.approve_for_tests(&b);
+        identity.approve_for_tests(&a);
+        let handed = host.init_bootstrap("aokie", 1).expect("a bootstrap once phones are approved");
+        let roster = &handed["approvedMobileRoster"];
+        let (thumbprints, revision, hash) = asked();
+        assert_eq!((revision, hash.as_str()), (roster["revision"].as_u64().unwrap(), roster["rosterHash"].as_str().unwrap()), "what it was handed is what is presented");
+        assert_eq!(held(&host).map(|r| r.thumbprints), Some(thumbprints.clone()));
+
+        // A phone approved, and one revoked, since: the held roster stays while it can, and goes to the live one when it cannot.
+        identity.approve_for_tests(&c);
+        assert_eq!(asked(), (thumbprints.clone(), revision, hash.clone()));
+        identity.revoke(&a.thumbprint).unwrap();
+        assert!(!asked().0.contains(&a.thumbprint));
+
+        // Handed again, it holds the roster as it is now.
+        let again = host.init_bootstrap("aokie", 1).unwrap();
+        assert_ne!(again["approvedMobileRoster"]["rosterHash"], roster["rosterHash"]);
+        let (now, now_revision, _) = asked();
+        assert_eq!(now_revision, again["approvedMobileRoster"]["revision"].as_u64().unwrap());
+        identity.approve_for_tests(&d);
+        assert_eq!(asked().0, now, "a phone approved after the second init is not in what it holds");
+
+        // Started with nobody approved, a plugin holds nothing, and what an earlier run held is let go.
+        for k in [&b, &c, &d] {
+            identity.revoke(&k.thumbprint).unwrap();
+        }
+        assert!(host.init_bootstrap("aokie", 1).is_none());
+        assert!(held(&host).is_none(), "the roster of the earlier run is not kept");
+        // A plugin that is not a broker is handed nothing and holds nothing.
+        assert!(host.init_bootstrap("some-other-plugin", 1).is_none());
+        assert!(host.procs.lock().unwrap().rosters.get("some-other-plugin").is_none());
     }
 
     #[test]
