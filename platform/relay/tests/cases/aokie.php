@@ -277,14 +277,15 @@ test('4.14.4 revoking the desktop ends the plugin\'s bearer and, with or without
     }
 });
 
-test('4.14.4 a phone the desktop\'s roster no longer lists is 403 forbidden on every route while the others go on; a desktop with no roster row has excluded nobody', function () {
+test('4.14.4 a phone the desktop\'s roster does not list (it exists and was never listed: a push that omits a phone revokes it, 401, and never leaves one that is 403) is 403 forbidden on every route while the others go on, and the message does not say it was removed; a desktop with no roster row has excluded nobody', function () {
     [$k, $a, $b, $plug, $ta, $tb] = aok_pair();
     $db = $k->r->ctx()->db;
     $db->exec('UPDATE roster SET thumbprints = ? WHERE desktop_dev = ?', [json_encode([$k->thumb($b)]), $k->desk->id]);
     foreach (AOK_ROUTES as [$method, $route]) {
         $res = aok_call($k, $ta, $method, $route, $method === 'POST' ? '{"to":"plugin","frames":[{}]}' : null);
         eq([403, 'forbidden'], [$res['status'], aok_err($res)['code'] ?? ''], "$method $route");
-        contains('no longer lists', $res['json']['message']);
+        eq('Your PC has not listed this phone.', $res['json']['message'], 'a phone that was never listed, not one that was removed');
+        not_contains('no longer', $res['json']['message']);
     }
     eq(200, aok_call($k, $tb, 'GET', 'challenge')['status']);
     eq(200, aok_call($k, $plug, 'GET', 'challenge')['status']);
@@ -293,6 +294,18 @@ test('4.14.4 a phone the desktop\'s roster no longer lists is 403 forbidden on e
     eq(0, aok_count($k), 'and nothing was stored');
     $db->exec('DELETE FROM roster');
     eq(200, aok_call($k, $ta, 'GET', 'challenge')['status'], 'no row: nobody excluded');
+});
+
+test('4.14.4 a phone that a roster push leaves out is revoked by the push: 401 revoked on every compatibility route, with the message of a removed device, and never the 403 of a phone that was not listed', function () {
+    [$k, $a, $b, $plug, $ta, $tb] = aok_pair();
+    $res = $k->pushRoster([$b], 2);
+    eq(200, $res['status'], $res['body']);
+    foreach (AOK_ROUTES as [$method, $route]) {
+        $res = aok_call($k, $ta, $method, $route, $method === 'POST' ? '{"to":"plugin","frames":[{}]}' : null);
+        eq([401, 'revoked'], [$res['status'], aok_err($res)['code'] ?? ''], "$method $route");
+        eq('This device was removed; pair it again.', $res['json']['message']);
+    }
+    eq(200, aok_call($k, $tb, 'GET', 'challenge')['status'], 'the phone the push kept goes on');
 });
 
 test('4.14.4 every request of one admission draws on its own bucket: 120, then 429 rate_limited with Retry-After; refilled at 10 a second; another admission is not affected', function () {
@@ -686,7 +699,28 @@ test('4.14.4 a batch is at most 64 frames; a request body of more than 1 MiB is 
     $res = Relay::http($srv, $ta, 'POST', '/v1/aokie-companion/relay/frames', $big);
     eq(413, $res['status'], substr($res['body'], 0, 200));
     ok(aok_err($res) !== null, 'the Aokie shape: ' . $res['body']);
+    eq(['relay_frame_too_large', 'A post may be at most 1048576 bytes in all: send fewer or smaller frames in one post.'], [aok_err($res)['code'], aok_err($res)['message']], 'it says what the limit is, and is not about a lane');
     eq(0, aok_count($k));
+});
+
+test('4.14.4 what the shipped phone can send in one post (Interpretation 63): its frames are at most 32 KiB, so 31 of them fit the 1 MiB of a request and 32 do not, and a post of 64 frames of 32 KiB (2 MiB, what its carrier allows) is 413 relay_frame_too_large, answered without storing anything', function () {
+    [$k, $a, $b, $plug, $ta] = aok_pair();
+    $srv = $k->r->serve();
+    $frame = '{"p":"' . str_repeat('x', 32768 - 8) . '"}'; // exactly 32 KiB as sent: the phone's own ceiling (MAX_RELAY_FRAME_BYTES), which the relay's cap for a frame (192 KiB) is above
+    eq(32768, strlen($frame));
+    foreach ([[1, 200], [31, 200], [32, 413], [64, 413]] as [$n, $status]) {
+        $res = Relay::http($srv, $ta, 'POST', '/v1/aokie-companion/relay/frames', '{"to":"plugin","frames":[' . implode(',', array_fill(0, $n, $frame)) . ']}');
+        eq($status, $res['status'], "$n frames of 32 KiB: " . substr($res['body'], 0, 160));
+        if ($status === 413) {
+            eq('relay_frame_too_large', aok_err($res)['code'] ?? null, "$n frames");
+        }
+    }
+    eq(32, aok_count($k), 'one frame and 31 frames were stored, and nothing of the posts that were refused');
+    // On the native routes the same refusal says the limit too, and is not about a lane.
+    $d = $k->r->desktop();
+    $res = Relay::http($srv, $d, 'POST', '/v1/items', str_repeat(' ', Oaiy\Relay\Request::MAX_BODY + 1));
+    eq([413, 'item_too_large'], [$res['status'], $res['json']['error']['code'] ?? null]);
+    eq('The request body is larger than 1048576 bytes.', $res['json']['error']['message']);
 });
 
 // ------------------------------------------------------------------------------------------------ GET frames
@@ -820,6 +854,27 @@ test('4.14.4 a mailbox holds at most mailboxBytes; the plugin\'s mailbox, which 
     eq(4, aok_count($k, "SELECT COUNT(*) FROM items WHERE mailbox LIKE ?", ['%/plugin']));
     // The phone's mailbox has one possible sender: the whole of it is the plugin's.
     eq(200, $k->send($plug, 'mobile:' . $k->thumb($a), array_fill(0, 8, '{}'))['status']);
+});
+
+test('4.14.4 the default share, as the Android emulator test of the shipped phone met it (Interpretation 64): a phone may have 256 frames in the plugin\'s mailbox (four batches of 64), the fifth batch is 429 relay_backpressure with Retry-After 5 and stores none, the plugin\'s reads free nothing, another phone is not affected, and the room comes back when the frames expire, 120 seconds after they were posted', function () {
+    [$k, $a, $b, $plug, $ta, $tb] = aok_pair();
+    for ($i = 1; $i <= 4; $i++) {
+        $res = $k->send($ta, 'plugin', array_fill(0, 64, '{}'));
+        eq([200, 64], [$res['status'], $res['json']['accepted'] ?? 0], "batch $i of 64");
+    }
+    $res = $k->send($ta, 'plugin', array_fill(0, 64, '{}'));
+    eq([429, 'relay_backpressure'], [$res['status'], aok_err($res)['code'] ?? ''], 'the fifth batch: ' . $res['body']);
+    eq('5', $res['headers']['retry-after']);
+    eq(256, aok_count($k, "SELECT COUNT(*) FROM items WHERE mailbox LIKE ?", ['%/plugin']), 'and it stored none');
+    // The plugin reads everything (a page, and the whole mailbox by stream): the frames are still live, and count, until they expire.
+    $page = $k->read($plug, 0);
+    eq(200, $page['status'], $page['body']);
+    eq(429, $k->send($ta, 'plugin', ['{}'])['status'], 'reading frees nothing: not even one frame');
+    eq(200, $k->send($tb, 'plugin', array_fill(0, 64, '{}'))['status'], 'another phone has a share of its own');
+    Tmp::setClock(Relay::T0 + 119);
+    eq(429, $k->send($k->mobileToken($a), 'plugin', ['{}'])['status'], 'at 119 seconds the frames are still live');
+    Tmp::setClock(Relay::T0 + 121);
+    eq(200, $k->send($k->mobileToken($a), 'plugin', array_fill(0, 64, '{}'))['status'], 'at 121 seconds they have expired: a batch of 64 goes in again');
 });
 
 test('4.14.4 the byte limit works the same way: a quarter of mailboxBytes for one phone in the plugin\'s mailbox, the whole of it for the plugin in a phone\'s', function () {

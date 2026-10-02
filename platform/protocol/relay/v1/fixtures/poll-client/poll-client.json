@@ -1,6 +1,6 @@
 {
  "version": 1,
- "about": "Known answers for the poll loop of a native client (README section 5.1.1: DK-03, MOB-21a). Each case gives the client's counters before the answer, what the relay answered (or that nothing came), the jitter draw u, and what the rules lead to: the outcome (P2), the pause before jitter and after it (P3, P5, P6), the counters after, what the loop does when it ends (P8) and what it reports (P7). A case with `replace` is rule P1 (the earliest a replacement poll may start); one with `proof` is the answer to the identity proof of P9; one with `proofDue` says whether a proof is due. `caseCount` and `idsSha256` (the digest of the sorted case names, one per line) say what the table holds, so that a case that goes missing is noticed; `layoutSha256` (the digest of the lines id|rule in the table's own order) says which rule each case checks and in what order, so that a case that was relabelled or moved is noticed too. Both readers recompute every case from the rules, not from this file's other cases, and refuse constants that are not the numbers of the README.",
+ "about": "Known answers for the poll loop of a native client (README section 5.1.1: DK-03, MOB-21a). Each case gives the client's counters before the answer, what the relay answered (or that nothing came), the jitter draw u, and what the rules lead to: the outcome (P2), the pause before jitter and after it (P3, P5, P6), the counters after, what the loop does when it ends (P8) and what it reports (P7). A case with `replace` is rule P1 (the earliest a replacement poll may start); one with `proof` is the answer to the identity proof of P9; one with `proofDue` says whether a proof is due. A number inside a response body is written as the answer spells it (`1.0`, `5.0`, `1e2` and `-0` are numbers and are not integers: README P2), and the readers keep the spelling there; elsewhere a number is a number. `caseCount` and `idsSha256` (the digest of the sorted case names, one per line) say what the table holds, so that a case that goes missing is noticed; `layoutSha256` (the digest of the lines id|rule in the table's own order) says which rule each case checks and in what order, so that a case that was relabelled or moved is noticed too. Both readers recompute every case from the rules, not from this file's other cases, and refuse constants that are not the numbers of the README.",
  "constants": {
   "replaceMinMs": 250,
   "clampMin": 1,
@@ -17,9 +17,9 @@
   "proofAfterPauseS": 60,
   "pollTimeoutExtraS": 10
  },
- "caseCount": 135,
- "idsSha256": "9c82ed60bdf576fd414ef432e3f9df7f4e617cc563a0cf10e74e4de572f20479",
- "layoutSha256": "6558668de8734e3cb5add52fb88bd96e0225ca22ebfc7e5f4c9c15ebdaf4853b",
+ "caseCount": 162,
+ "idsSha256": "cac9204ceb2127c9a1bb4d0edfa844e3dc7588ca86a518a9a923e6e5bb825f57",
+ "layoutSha256": "f36166842f0fadd043987b836c0e7e6c82501882ee53704e0b361616052c3ee9",
  "cases": [
   {
    "id": "p1-replace-at-once",
@@ -5313,6 +5313,1203 @@
     "state": {
      "n429": 5,
      "nFail": 0,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p2-reset-cursor-spelled-minus-0",
+   "rule": "P2",
+   "what": "a reset whose cursor is written -0 is not an integer, so not a valid 200: a failure that adopts nothing",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAA",
+     "cursor": -0,
+     "items": [],
+     "more": false,
+     "time": 1790000000,
+     "reset": true
+    }
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [],
+    "since": 50
+   },
+   "since": 50
+  },
+  {
+   "id": "p2-reset-cursor-spelled-1-point-0",
+   "rule": "P2",
+   "what": "a reset whose cursor is written 1.0 is not an integer, so not a valid 200: a failure that adopts nothing",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAA",
+     "cursor": 1.0,
+     "items": [],
+     "more": false,
+     "time": 1790000000,
+     "reset": true
+    }
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [],
+    "since": 50
+   },
+   "since": 50
+  },
+  {
+   "id": "p2-reset-cursor-spelled-5-point-0",
+   "rule": "P2",
+   "what": "a reset whose cursor is written 5.0 is not an integer, so not a valid 200: a failure that adopts nothing",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAA",
+     "cursor": 5.0,
+     "items": [],
+     "more": false,
+     "time": 1790000000,
+     "reset": true
+    }
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [],
+    "since": 50
+   },
+   "since": 50
+  },
+  {
+   "id": "p2-reset-cursor-spelled-1e2",
+   "rule": "P2",
+   "what": "a reset whose cursor is written 1e2 is not an integer, so not a valid 200: a failure that adopts nothing",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAA",
+     "cursor": 1e2,
+     "items": [],
+     "more": false,
+     "time": 1790000000,
+     "reset": true
+    }
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [],
+    "since": 50
+   },
+   "since": 50
+  },
+  {
+   "id": "p2-reset-cursor-spelled-1E2",
+   "rule": "P2",
+   "what": "a reset whose cursor is written 1E2 is not an integer, so not a valid 200: a failure that adopts nothing",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAA",
+     "cursor": 1E2,
+     "items": [],
+     "more": false,
+     "time": 1790000000,
+     "reset": true
+    }
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [],
+    "since": 50
+   },
+   "since": 50
+  },
+  {
+   "id": "p2-item-seq-spelled-1-point-0",
+   "rule": "P2",
+   "what": "an item whose seq is written 1.0 is not an integer: it is not accepted",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAA",
+     "cursor": 1,
+     "items": [
+      {
+       "seq": 1.0
+      }
+     ],
+     "more": false,
+     "time": 1790000000
+    }
+   },
+   "expect": {
+    "outcome": "idle",
+    "baseS": 0.25,
+    "pauseS": 0.25,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [],
+    "since": 0
+   },
+   "since": 0
+  },
+  {
+   "id": "p2-item-seq-spelled-1e0",
+   "rule": "P2",
+   "what": "an item whose seq is written 1e0 is not an integer: it is not accepted",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAA",
+     "cursor": 1,
+     "items": [
+      {
+       "seq": 1e0
+      }
+     ],
+     "more": false,
+     "time": 1790000000
+    }
+   },
+   "expect": {
+    "outcome": "idle",
+    "baseS": 0.25,
+    "pauseS": 0.25,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [],
+    "since": 0
+   },
+   "since": 0
+  },
+  {
+   "id": "p2-item-seq-spelled-2E0",
+   "rule": "P2",
+   "what": "an item whose seq is written 2E0 is not an integer: it is not accepted",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAA",
+     "cursor": 1,
+     "items": [
+      {
+       "seq": 2E0
+      }
+     ],
+     "more": false,
+     "time": 1790000000
+    }
+   },
+   "expect": {
+    "outcome": "idle",
+    "baseS": 0.25,
+    "pauseS": 0.25,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [],
+    "since": 0
+   },
+   "since": 0
+  },
+  {
+   "id": "p2-item-seq-above-uint53",
+   "rule": "P2",
+   "what": "a seq above 2^53 - 1 is not accepted (a seq is a uint53)",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAA",
+     "cursor": 1,
+     "items": [
+      {
+       "seq": 9007199254740992
+      }
+     ],
+     "more": false,
+     "time": 1790000000
+    }
+   },
+   "expect": {
+    "outcome": "idle",
+    "baseS": 0.25,
+    "pauseS": 0.25,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [],
+    "since": 5
+   },
+   "since": 5
+  },
+  {
+   "id": "p2-item-seq-uint53-max",
+   "rule": "P2",
+   "what": "2^53 - 1 itself is the largest seq that is",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAA",
+     "cursor": 9007199254740991,
+     "items": [
+      {
+       "seq": 9007199254740991
+      }
+     ],
+     "more": false,
+     "time": 1790000000
+    }
+   },
+   "expect": {
+    "outcome": "progress",
+    "baseS": 0,
+    "pauseS": 0,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [],
+    "since": 9007199254740991
+   },
+   "since": 5
+  },
+  {
+   "id": "p2-item-seq-uint53-max-then-above",
+   "rule": "P2",
+   "what": "the one above it is dropped and the one at the limit is kept",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAA",
+     "cursor": 9007199254740991,
+     "items": [
+      {
+       "seq": 9007199254740991
+      },
+      {
+       "seq": 9007199254740992
+      }
+     ],
+     "more": false,
+     "time": 1790000000
+    }
+   },
+   "expect": {
+    "outcome": "progress",
+    "baseS": 0,
+    "pauseS": 0,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [],
+    "since": 9007199254740991
+   },
+   "since": 5
+  },
+  {
+   "id": "p3-refused-spelled-retryafter",
+   "rule": "P3",
+   "what": "a hold.retryAfter written 5.0 is not an integer: it is read as absent (2), not 5",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAA",
+     "cursor": 0,
+     "items": [],
+     "more": false,
+     "time": 1790000000,
+     "hold": {
+      "refused": true,
+      "retryAfter": 5.0
+     }
+    }
+   },
+   "expect": {
+    "outcome": "idle",
+    "baseS": 2,
+    "pauseS": 2,
+    "state": {
+     "n429": 0,
+     "nFail": 0,
+     "nRefused": 1,
+     "n400": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p6-body-retryafter-spelled-float",
+   "rule": "P6",
+   "what": "an error.retryAfter written 4.0 is not an integer: it is not read, so 1 second for a 429",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {},
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 4.0
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p6-body-retryafter-spelled-exponent",
+   "rule": "P6",
+   "what": "and one written 1e1 is not read either (10 would have been its value)",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {},
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 1e1
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p6-http-date-invalid-hour-25",
+   "rule": "P6",
+   "what": "an HTTP-date with hour 25 is no header (it is not a date): the body's 4 is read",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "Sun, 06 Nov 1994 25:49:47 GMT",
+     "date": "Sun, 06 Nov 1994 08:49:37 GMT"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 4
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 4,
+    "pauseS": 4,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p6-http-date-invalid-minute-60",
+   "rule": "P6",
+   "what": "an HTTP-date with minute 60 is no header (it is not a date): the body's 4 is read",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "Sun, 06 Nov 1994 08:60:47 GMT",
+     "date": "Sun, 06 Nov 1994 08:49:37 GMT"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 4
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 4,
+    "pauseS": 4,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p6-http-date-invalid-second-61",
+   "rule": "P6",
+   "what": "an HTTP-date with second 61 is no header (it is not a date): the body's 4 is read",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "Sun, 06 Nov 1994 08:49:61 GMT",
+     "date": "Sun, 06 Nov 1994 08:49:37 GMT"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 4
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 4,
+    "pauseS": 4,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p6-http-date-invalid-day-32",
+   "rule": "P6",
+   "what": "an HTTP-date with day 32 is no header (it is not a date): the body's 4 is read",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "Sun, 32 Nov 1994 08:49:47 GMT",
+     "date": "Sun, 06 Nov 1994 08:49:37 GMT"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 4
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 4,
+    "pauseS": 4,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p6-http-date-invalid-february-30",
+   "rule": "P6",
+   "what": "an HTTP-date with 30 February is no header (it is not a date): the body's 4 is read",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "Wed, 30 Feb 1994 08:49:47 GMT",
+     "date": "Sun, 06 Nov 1994 08:49:37 GMT"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 4
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 4,
+    "pauseS": 4,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p6-http-date-invalid-day-0",
+   "rule": "P6",
+   "what": "an HTTP-date with day 00 is no header (it is not a date): the body's 4 is read",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "Sun, 00 Nov 1994 08:49:47 GMT",
+     "date": "Sun, 06 Nov 1994 08:49:37 GMT"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 4
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 4,
+    "pauseS": 4,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p6-http-date-invalid-year-0000",
+   "rule": "P6",
+   "what": "an HTTP-date with year 0000 is no header (it is not a date): the body's 4 is read",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "Sun, 06 Nov 0000 08:49:47 GMT",
+     "date": "Sun, 06 Nov 1994 08:49:37 GMT"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 4
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 4,
+    "pauseS": 4,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p6-http-date-leap-second",
+   "rule": "P6",
+   "what": "second 60 is a date (a leap second): 08:49:60 is 23 seconds after 08:49:37",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "Sun, 06 Nov 1994 08:49:60 GMT",
+     "date": "Sun, 06 Nov 1994 08:49:37 GMT"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 4
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 23,
+    "pauseS": 23,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p6-http-date-weekday-ignored",
+   "rule": "P6",
+   "what": "the name of the day is not checked: Monday for a Sunday is read as the date it is (10 seconds)",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "Mon, 06 Nov 1994 08:49:47 GMT",
+     "date": "Sun, 06 Nov 1994 08:49:37 GMT"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 4
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 10,
+    "pauseS": 10,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p6-http-date-february-29-leap-year",
+   "rule": "P6",
+   "what": "29 February of a leap year is a date (the Date header is 1996-02-29 08:49:37, so 10 seconds)",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 429,
+    "headers": {
+     "retry-after": "Thu, 29 Feb 1996 08:49:47 GMT",
+     "date": "Thu, 29 Feb 1996 08:49:37 GMT"
+    },
+    "body": {
+     "error": {
+      "code": "rate_limited",
+      "message": "x",
+      "retryAfter": 4
+     }
+    }
+   },
+   "expect": {
+    "outcome": "flow",
+    "baseS": 10,
+    "pauseS": 10,
+    "state": {
+     "n429": 1,
+     "nFail": 0,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": []
+   }
+  },
+  {
+   "id": "p5-400-first-ignores-retry-after",
+   "rule": "P5",
+   "what": "the first 400 is paced by the backoff alone: a Retry-After of 30 on it is not honoured (pause 1)",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 400,
+    "headers": {
+     "retry-after": "30"
+    },
+    "body": {
+     "error": {
+      "code": "invalid_request",
+      "message": "x"
+     }
+    }
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0,
+     "n400": 1
+    },
+    "action": "clear_epoch",
+    "report": [
+     "invalid_request"
+    ]
+   }
+  },
+  {
+   "id": "p5-storage-failure-ignores-retry-after",
+   "rule": "P5",
+   "what": "a failed write is paced by the backoff alone too, whatever header the answer had (pause 1)",
+   "state": {
+    "n429": 0,
+    "nFail": 0,
+    "nRefused": 0,
+    "n400": 0
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 200,
+    "headers": {
+     "retry-after": "30"
+    },
+    "body": {
+     "v": 1,
+     "epoch": "AAAAAAAAAAA",
+     "cursor": 6,
+     "items": [
+      {
+       "seq": 6
+      }
+     ],
+     "more": false,
+     "time": 1790000000
+    }
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 1,
+    "pauseS": 1,
+    "state": {
+     "n429": 0,
+     "nFail": 1,
+     "nRefused": 0,
+     "n400": 0
+    },
+    "action": null,
+    "report": [
+     "storage_failure"
+    ],
+    "since": 5
+   },
+   "since": 5,
+   "persisted": false
+  },
+  {
+   "id": "p5-503-honours-retry-after-after-a-400",
+   "rule": "P5",
+   "what": "and the failures that are the relay's keep honouring it: a 503 with Retry-After 30 after a 400 pauses 30",
+   "state": {
+    "n429": 0,
+    "nFail": 1,
+    "nRefused": 0,
+    "n400": 1
+   },
+   "info": {
+    "pollGapMs": 250,
+    "fallbackS": 5
+   },
+   "u": 0.0,
+   "response": {
+    "status": 503,
+    "headers": {
+     "retry-after": "30"
+    },
+    "body": {
+     "error": {
+      "code": "unavailable",
+      "message": "x",
+      "retryAfter": 30
+     }
+    }
+   },
+   "expect": {
+    "outcome": "failure",
+    "baseS": 30,
+    "pauseS": 30,
+    "state": {
+     "n429": 0,
+     "nFail": 2,
      "nRefused": 0,
      "n400": 0
     },

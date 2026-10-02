@@ -226,6 +226,11 @@ def sealed_file() -> None:
     check("sealed: the three recorded boxes are all different", len({c["sealedToken"] for c in doc["opens"]}) == len(doc["opens"]))
 
 
+# The fourteen grant names of README section 4.14 (the vocabulary of the shipped decoders): a receipt that names another is refused.
+KNOWN_GRANTS = ("state_read", "caller_read", "captions_read", "assistance_read", "assistance_respond", "monitor", "consult", "takeover", "resume_aokie",
+                "end_caller", "rtc_signal", "participants_read", "participant_identity_read", "audio_levels_read")
+
+
 def ceremony_file() -> None:
     doc = json.loads((FIXDIR / "pairing-ceremony.json").read_text(encoding="utf-8"))
     a3 = vec["A3"]
@@ -272,8 +277,17 @@ def ceremony_file() -> None:
     check("ceremony: the decision answers approved with a device id", decision["response"]["body"]["state"] == "approved" and decision["response"]["body"]["deviceId"].startswith("dev-"))
     # what the phone reads
     out = approved["response"]["body"]
+    read = out["receipt"]
     check("ceremony: the phone reads the same device id, the receipt as signed and a sealed token",
-          out["deviceId"] == decision["response"]["body"]["deviceId"] and out["receipt"] == d["receipt"] and out["state"] == "approved")
+          out["deviceId"] == decision["response"]["body"]["deviceId"] and {k: v for k, v in read.items() if k != "grants"} == d["receipt"] and out["state"] == "approved")
+    # The phone never sees the decision: it verifies the receipt over the grants the receipt it reads carries (README Interpretation 60), built from
+    # what it knows itself (its app from the offer, the pid, its own thumbprint from its own response) and the desktop key it pinned from the offer.
+    got = read.get("grants")
+    check("ceremony: the receipt the phone reads carries grants that are sorted, without repeats, all of the fourteen names, and exactly the sorted grants of the decision",
+          isinstance(got, list) and got == sorted(got) and len(set(got)) == len(got) and all(g in KNOWN_GRANTS for g in got) and got == grants)
+    phone_doc = canonical({"appId": offer["appId"], "grants": got if isinstance(got, list) else [], "issuedAt": read["issuedAt"], "phoneThumbprint": resp["claims"]["mobileEndpointKey"]["thumbprint"], "pid": pid})
+    check("ceremony: the phone verifies the receipt from what it reads alone: the document it builds is Appendix A3's and the signature verifies under the desktop key",
+          phone_doc == a3["expected"]["receiptText"] and ed_verify(desktop_pub, b"oaiy/pairing/3/approval\x00" + phone_doc.encode(), unb64u(read["signature"])))
     phone_sk = bytes.fromhex(vec["keys"]["x25519Secrets"]["phone"])
     phone_x_pub = X25519PrivateKey.from_private_bytes(phone_sk).public_key().public_bytes_raw()
     check("ceremony: the phone X25519 key of the response is the test phone's", b64u(phone_x_pub) == resp["claims"]["mobileX25519"])

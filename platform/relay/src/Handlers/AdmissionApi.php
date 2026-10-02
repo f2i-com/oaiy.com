@@ -237,7 +237,7 @@ final class AdmissionApi
             throw ApiError::make('forbidden');
         }
         if (!Facade::rosterLists($ctx, $own, $appId, $holder)) {
-            throw new ApiError(403, 'forbidden', 'Your PC no longer lists this phone.');
+            throw new ApiError(403, 'forbidden', 'Your PC has not listed this phone.');
         }
         $desk = $ctx->db->one("SELECT id FROM devices WHERE id = ? AND role = 'desktop' AND revoked_at IS NULL", [$own]);
         if ($desk === null || !Ids::isThumbprint($peer) || $peer === $holder) {

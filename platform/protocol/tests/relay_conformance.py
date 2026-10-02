@@ -938,7 +938,8 @@ pos("push-register-request", "remove", {"remove": True})
 pos("pairing-create-request", "the A3 offer", {"pid": A3["expected"]["pid"], "offer": A3["expected"]["offerText"], "mac": A3["expected"]["offerMac"], "ttl": 600, "appId": "aokie", "desktopThumbprint": DESK_TH})
 pos("pairing-create-response", "a rendezvous", {"pid": A3["expected"]["pid"], "exp": NOW + 600, "time": NOW})
 pos("pairing-fetch-response", "open", {"v": 1, "state": "open", "offer": A3["expected"]["offerText"], "mac": A3["expected"]["offerMac"], "exp": NOW + 600, "time": NOW})
-pos("pairing-fetch-response", "approved", {"v": 1, "state": "approved", "deviceId": PHONEID, "sealedToken": b64u(b"x" * 100), "receipt": {"issuedAt": NOW, "signature": SIG64}, "time": NOW})
+pos("pairing-fetch-response", "approved", {"v": 1, "state": "approved", "deviceId": PHONEID, "sealedToken": b64u(b"x" * 100), "receipt": {"issuedAt": NOW, "signature": SIG64, "grants": ["assistance_read", "state_read"]}, "time": NOW})
+pos("pairing-fetch-response", "approved with no grants at all", {"v": 1, "state": "approved", "deviceId": PHONEID, "sealedToken": b64u(b"x" * 100), "receipt": {"issuedAt": NOW, "signature": SIG64, "grants": []}, "time": NOW})
 pos("pairing-fetch-response", "denied", {"v": 1, "state": "denied", "time": NOW})
 pos("pairing-answer-request", "the A3 response", {"response": json.dumps(PAIR_RESPONSE)})
 pos("pairing-answer-response", "answered", {"state": "answered", "time": NOW})
@@ -1268,6 +1269,12 @@ neg("pairing-state-response", "v 2", {"v": 2, "state": "open", "time": NOW}, "v"
 neg("pairing-fetch-response", "a hold both granted and refused", dict(p1("pairing-fetch-response"), hold={"granted": True, "refused": True, "retryAfter": 2}), "hold")
 neg("pairing-fetch-response", "a refused hold without retryAfter", dict(p1("pairing-fetch-response"), hold={"refused": True}), "hold")
 neg("pairing-fetch-response", "an approval without the receipt", mut(p1("pairing-fetch-response", 1), "receipt"), "receipt")
+_rc = p1("pairing-fetch-response", 1)["receipt"]
+neg("pairing-fetch-response", "a receipt without the grants it was signed over", dict(p1("pairing-fetch-response", 1), receipt=mut(_rc, "grants")), "grants")
+neg("pairing-fetch-response", "a receipt whose grants are an object", dict(p1("pairing-fetch-response", 1), receipt=dict(_rc, grants={})), "grants")
+neg("pairing-fetch-response", "a receipt with a grant twice", dict(p1("pairing-fetch-response", 1), receipt=dict(_rc, grants=["state_read", "state_read"])), "grants")
+neg("pairing-fetch-response", "a receipt with a grant that is not a name", dict(p1("pairing-fetch-response", 1), receipt=dict(_rc, grants=["State-Read"])), "grants")
+neg("pairing-fetch-response", "a receipt with seventeen grants", dict(p1("pairing-fetch-response", 1), receipt=dict(_rc, grants=["g%02d" % i for i in range(17)])), "grants")
 neg("pairing-fetch-response", "an answered rendezvous without its MAC", mut(dict(p1("pairing-fetch-response"), state="answered"), "mac"), "mac")
 neg("sealed-token-fixture", "a sealed token of 147 characters", mut(SEALED_FIXTURE, "opens.0.sealedToken", SEALED_FIXTURE["opens"][0]["sealedToken"][:147]), "sealedToken")
 neg("sealed-token-fixture", "a plaintext length that is not a token's", mut(SEALED_FIXTURE, "opens.0.plaintextLength", 64), "plaintextLength")
@@ -1776,6 +1783,31 @@ print(f"\n  {n_aok_docs} documents of the Aokie fixtures validated")
 aok_readme = (AOK / "README.md").read_text(encoding="utf-8")
 for f in ("admission.json", "challenge.json", "frames.json", "stream.json", "errors.json", "ice.json", "aokie_decoders.py", "verify_aokie_fixtures.py"):
     ok(f"fixtures/aokie/README.md describes {f}", f"`{f}`" in aok_readme)
+# A relay with a plain-http public_url is outside the schemas by design (README section 1, Interpretation 61): the relay builds http:// and ws://
+# URLs for a loopback host (test builds), the admission schemas require wss:// and https://, and everything recorded here is a deployed relay's.
+readme_all = (V1 / "README.md").read_text(encoding="utf-8")
+ok("README records what the Android emulator test of the shipped phone found: a request over 1 MiB is refused with its limit in the answer and the limit is not raised (Interpretation 63), a phone's frames in the plugin's mailbox count until they expire (64), and the 403 of an unlisted phone has the right wording (65)",
+   all(s in readme_all for s in ("63. **A request over 1 MiB is refused for its size, and says so; the limit is not raised for the phone.**", "A post may be at most 1048576 bytes in all: send fewer or smaller frames in one post.",
+                                 "(31 frames of 32 KiB,", "64. **A phone's frames in the plugin's mailbox count until they expire, whether or not the plugin has read them; the share is 256 frames and 2 MiB.**",
+                                 "**256 frames or 2 MiB in any 120 seconds, that is about 2 frames a second sustained, in bursts of up to 256**", "65. **The 403 of a phone the roster does not list says \"Your PC has not listed this phone.\"**",
+                                 "message `Your PC has not listed this phone.`")))
+ok("the recorded 403 of a phone the roster does not list says it has not listed it, and no recorded error says it no longer does",
+   any(c["response"]["body"].get("message") == "Your PC has not listed this phone." for c in aok["errors.json"]["cases"]) and not any("no longer lists" in json.dumps(c) for c in aok["errors.json"]["cases"]))
+ok("README gives the phone's reads of a rendezvous their budgets and the client's rule: 30 a minute per address, 60 counted per rendezvous (one every 10 seconds on average), 10 reads of an outcome a minute, a pause of 0 only after a granted hold that was not superseded and at least 10 seconds with jitter otherwise, and what a small wait.max does",
+   all(s in readme_all for s in ("**30 requests per 60 seconds per client address**", "**60 counted `GET`s per rendezvous while it is `open` or `answered`**", "**one every 10 seconds on average**",
+                                 "**10 reads of an outcome (`approved`, `denied`) per minute per address and pid**", "pauses **0 only after an answer whose `hold` is `{\"granted\":true}` without `superseded`**",
+                                 "it pauses **at least 10 seconds, with the jitter of P6**", "with `wait.max` of 2, the configuration of the Android emulator test", "62. **The phone's reads of a rendezvous are budgeted three ways")))
+ok("README says a plain-http relay is outside the schemas by design: loopback only, test builds, and no schema is loosened for it",
+   "**A relay with a plain-http base is outside the schemas by design**" in readme_all and "61. **A plain-http relay is outside the schemas, by design.**" in readme_all)
+for adm in ("admission-plugin-response", "admission-mobile-response"):
+    sch = schemas[adm + ".schema.json"]
+    ok(f"{adm}.schema.json requires wss:// for the gateway and https:// for the three relay URLs (a plain-http relay is not claimed to validate)",
+       sch["properties"]["gatewayUrl"]["pattern"].startswith("^wss://") and all(sch["properties"]["relay"]["properties"][k]["pattern"] == "^https://" for k in ("challengeUrl", "framesUrl", "streamUrl")),
+       adm)
+    ok(f"{adm}.schema.json says in its description that a plain-http relay is outside it", "outside this schema by design" in sch["description"])
+ok("every admission of the Aokie fixtures is a deployed relay's: wss:// gateway and https:// relay URLs",
+   all(c["response"]["body"]["gatewayUrl"].startswith("wss://") and all(c["response"]["body"]["relay"][k].startswith("https://") for k in ("challengeUrl", "framesUrl", "streamUrl"))
+       for c in aok["admission.json"]["cases"] if c["response"]["status"] == 200))
 ok("every admission of the Aokie fixtures carries the same three relay URLs (the plugin's cursor domain)",
    len({json.dumps({k: v for k, v in c["response"]["body"]["relay"].items() if k != "mode"}, sort_keys=True) for c in aok["admission.json"]["cases"] if c["response"]["status"] == 200}) == 1)
 aok_neg = 0
@@ -1794,12 +1826,52 @@ except (OSError, subprocess.TimeoutExpired) as e:
 section("poll-client fixture (fixtures/poll-client/): the rules of README 5.1.1 for the native pollers (DK-03, MOB-21a), read twice")
 PC = FIX / "poll-client"
 pc_readme = (V1 / "README.md").read_text(encoding="utf-8")
-pc_doc = json.loads((PC / "poll-client.json").read_text(encoding="utf-8"))
+class PcSpelled:
+    """A number of a poll answer written in a way that is not an integer literal (1.0, 1e2, -0): the table says what spelling an answer has (README P2),
+    and Python's json would write -0 back as 0 and 1e2 as 100.0, so a damaged copy of the table would not be the table with one thing changed."""
+
+    def __init__(self, value, source):
+        self.value, self.source = value, source
+
+
+def pc_unspell(x):
+    if isinstance(x, PcSpelled):
+        return x.value
+    if isinstance(x, list):
+        return [pc_unspell(v) for v in x]
+    if isinstance(x, dict):
+        return {k: pc_unspell(v) for k, v in x.items()}
+    return x
+
+
+def pc_load(text):
+    """The table with the spelling of the numbers of every response body kept, and every other number a number."""
+    doc = json.loads(text, parse_int=lambda s: PcSpelled(0, s) if s == "-0" else int(s), parse_float=lambda s: PcSpelled(float(s), s))
+    out = {k: pc_unspell(v) for k, v in doc.items() if k != "cases"}
+    out["cases"] = []
+    for c in doc["cases"]:
+        kept = {k: (v if k == "response" else pc_unspell(v)) for k, v in c.items()}
+        if isinstance(c.get("response"), dict):
+            kept["response"] = {k: (v if k == "body" else pc_unspell(v)) for k, v in c["response"].items()}
+        out["cases"].append(kept)
+    return out
+
+
+def pc_dump(doc):
+    """The table as JSON text, with the spelled numbers written as they were (a sentinel string, then the quotes taken off)."""
+    def spelled(o):
+        if isinstance(o, PcSpelled):
+            return "@@RAW@@" + o.source + "@@"
+        raise TypeError(repr(o))
+    return re.sub(r'"@@RAW@@([^"@]+)@@"', r"\1", json.dumps(doc, default=spelled))
+
+
+pc_doc = pc_load((PC / "poll-client.json").read_text(encoding="utf-8"))
 # What the table holds, pinned here as the vectors' values are (DESIGN_PINS): a case that goes missing from the table, or one that is added,
 # changes these, and whoever does it changes them here on purpose. The readers check the table against its own caseCount and idsSha256, which
 # a table edited to agree with itself would satisfy; these are what that edit cannot satisfy.
-POLL_CLIENT_PINS = {"cases": 135, "idsSha256": "9c82ed60bdf576fd414ef432e3f9df7f4e617cc563a0cf10e74e4de572f20479",
-                    "layoutSha256": "6558668de8734e3cb5add52fb88bd96e0225ca22ebfc7e5f4c9c15ebdaf4853b"}
+POLL_CLIENT_PINS = {"cases": 162, "idsSha256": "cac9204ceb2127c9a1bb4d0edfa844e3dc7588ca86a518a9a923e6e5bb825f57",
+                    "layoutSha256": "f36166842f0fadd043987b836c0e7e6c82501882ee53704e0b361616052c3ee9"}
 ok("README has the section and states each of the rules P1 to P9 by its number",
    "### 5.1.1 The poll loop of a native client (DK-03 and MOB-21a)" in pc_readme and all(f"**P{i}. " in pc_readme for i in range(1, 10)))
 pc_ids = [x["id"] for x in pc_doc["cases"]]
@@ -1876,7 +1948,10 @@ ok("README settles what the clean-room readings of 5.1.1 disagreed on: what a va
                                 "The rows are tried in the order of the table and the first that fits is the answer", "a refused hold, or a superseded answer, that carries an accepted item is progress",
                                 "and the answer is a **failure** for the pause", "a valid `200` whose accepted items (or whose reset) could not be written to the client's store (see to persist, below)", "it reports `storage_failure`, and never `unreachable`", "never carries `unreachable`: the first `400`",
                                 "(the action `cancel_own_polls`, on every `429` that says `in_flight`)", "`cancel_own_polls` (P4)", "the failure count is cleared (it proves the relay answered, as P7 says of a success), while the 429 count, the count of refused holds and the 400 count stay as they were",
-                                "Polls that arrive in the same instant can be refused beyond the surplus", "a burst of four refusing two and a burst of five refusing four")))
+                                "Polls that arrive in the same instant can be refused beyond the surplus", "a burst of four refusing two and a burst of five refusing four",
+                                "**An integer** in a poll answer (`cursor`, `seq`, `retryAfter` and `hold.retryAfter`) is an integer literal: digits only, no fraction, no exponent and no `-0`",
+                                "a date that does not exist such as hour 25, day 32 or year 0000", "the name of the day is not checked",
+                                "except for the first `400` and for a failed write (P2), which are paced by the backoff alone")))
 # Every epoch the table gives is what the schema says an epoch is (8 bytes: 11 characters), except where a case is a bad epoch on purpose and expects a failure.
 pc_epoch = re.compile(r"[A-Za-z0-9_-]{11}")
 pc_bad_epochs = [x["id"] for x in pc_doc["cases"] if isinstance(x.get("response", {}).get("body"), dict) and isinstance(x["response"]["body"].get("epoch"), str)
@@ -1967,6 +2042,21 @@ pc_damaged = [
     ("a verified proof that clears the 429 count", pc_damage("p9-proof-verified", ("expect", "state", "n429"), 0)),
     ("a proof that gets no answer and keeps the 429 count", pc_damage("p9-proof-no-answer", ("expect", "state", "n429"), 2)),
     ("a proof that does not verify and clears the failure count", pc_damage("p9-proof-wrong-key", ("expect", "state", "nFail"), 0)),
+    ("a cursor written -0 that is adopted", pc_damage("p2-reset-cursor-spelled-minus-0", ("expect", "outcome"), "progress")),
+    ("a cursor written 1.0 that is adopted", pc_damage("p2-reset-cursor-spelled-1-point-0", ("expect", "outcome"), "progress")),
+    ("a cursor written 1e2 that is adopted", pc_damage("p2-reset-cursor-spelled-1e2", ("expect", "outcome"), "progress")),
+    ("a seq written 1.0 that is accepted", pc_damage("p2-item-seq-spelled-1-point-0", ("expect", "outcome"), "progress")),
+    ("a seq above 2^53 - 1 that is accepted", pc_damage("p2-item-seq-above-uint53", ("expect", "outcome"), "progress")),
+    ("a seq of 2^53 - 1 that is dropped", pc_damage("p2-item-seq-uint53-max", ("expect", "outcome"), "idle")),
+    ("an error.retryAfter written 4.0 that is read", pc_damage("p6-body-retryafter-spelled-float", ("expect", "baseS"), 4)),
+    ("a hold.retryAfter written 5.0 that is read", pc_damage("p3-refused-spelled-retryafter", ("expect", "baseS"), 5)),
+    ("an HTTP-date with hour 25 that is read", pc_damage("p6-http-date-invalid-hour-25", ("expect", "baseS"), 120)),
+    ("an HTTP-date with day 32 that is read", pc_damage("p6-http-date-invalid-day-32", ("expect", "baseS"), 120)),
+    ("an HTTP-date of 30 February that is read", pc_damage("p6-http-date-invalid-february-30", ("expect", "baseS"), 120)),
+    ("an HTTP-date of year 0000 that is read", pc_damage("p6-http-date-invalid-year-0000", ("expect", "baseS"), 120)),
+    ("a leap second that is not read", pc_damage("p6-http-date-leap-second", ("expect", "baseS"), 4)),
+    ("a first 400 that honours Retry-After", pc_damage("p5-400-first-ignores-retry-after", ("expect", "baseS"), 30)),
+    ("a failed write that honours Retry-After", pc_damage("p5-storage-failure-ignores-retry-after", ("expect", "baseS"), 30)),
 ]
 # A table that was edited to agree with itself (a case removed, its count and digest recomputed) is accepted by the readers, which is why the
 # pins above exist: it does not agree with them.
@@ -1985,9 +2075,17 @@ pc_moved["layoutSha256"] = pc_layout(pc_moved)
 ok("a table with a case relabelled, or two cases swapped, and its layout digest recomputed is not the pinned one",
    pc_relabelled["layoutSha256"] != POLL_CLIENT_PINS["layoutSha256"] and pc_moved["layoutSha256"] != POLL_CLIENT_PINS["layoutSha256"])
 with tempfile.TemporaryDirectory() as tmpd:
+    # The control of every damaged table below: the table itself, written the way a damaged copy is written, is accepted by both readers, so that a damaged copy
+    # is refused for what was damaged and not for how it was written (-0 became 0 once, and every one of them was refused for that).
+    ctl = pathlib.Path(tmpd) / "control.json"
+    ctl.write_text(pc_dump(pc_doc), encoding="utf-8")
+    ok("the table written again as a damaged copy is written is the table: the spellings of its numbers are kept", ctl.read_text(encoding="utf-8").count("-0,") >= 1 or "-0" in ctl.read_text(encoding="utf-8"))
+    for label, cmd in pc_readers:
+        proc = subprocess.run(cmd + ["--file", str(ctl)], capture_output=True, text=True, encoding="utf-8", timeout=120)
+        ok(f"the {label} reader accepts the table written again as a damaged copy is written (the control of the damaged tables)", proc.returncode == 0 and " 0 mismatches" in proc.stdout, (proc.stdout + proc.stderr)[-300:])
     for i, (what, damaged) in enumerate(pc_damaged):
         f = pathlib.Path(tmpd) / f"damaged{i}.json"
-        f.write_text(json.dumps(damaged), encoding="utf-8")
+        f.write_text(pc_dump(damaged), encoding="utf-8")
         for label, cmd in pc_readers:
             proc = subprocess.run(cmd + ["--file", str(f)], capture_output=True, text=True, encoding="utf-8", timeout=120)
             ok(f"the {label} reader refuses the table with {what}", proc.returncode == 1 and "MISMATCH" in proc.stdout, (proc.stdout + proc.stderr)[-200:])
