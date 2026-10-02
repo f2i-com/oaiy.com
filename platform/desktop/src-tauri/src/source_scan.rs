@@ -754,6 +754,11 @@ mod tests {
         ("a closure statement", "fn f() {\n    #[cfg(test)]\n    let c = move || { t() };\n    real();\n}\n", vec!["real()"], vec!["let c"]),
         ("nested cfg(test) in a test mod and production between", "mod p {\n    #[cfg(test)]\n    mod t { #[cfg(test)] fn a() {} fn b() {} }\n    fn real() {}\n}\n", vec!["fn real()"], vec!["mod t"]),
         ("cfg(test) attribute followed by an inner doc comment", "#[cfg(test)]\n//! not valid here\nfn t() {}\nfn after() {}\n", vec!["fn after()"], vec![]),
+        // And three that the mutants of the scanner (a `move` that is not skipped, an arm that is an `unsafe` block or has a label)
+        // got through the 28: a block that is a statement with no `;` after it, and an arm with no comma.
+        ("async move block with no semicolon", "fn f() {\n    #[cfg(test)]\n    async move { t(); }\n    real();\n}\n", vec!["real()"], vec!["t()"]),
+        ("arm whose body is an unsafe block", "fn f(v: u8) {\n    match v {\n        #[cfg(test)]\n        1 => unsafe { t() }\n        2 => real_arm(),\n        _ => {}\n    }\n}\n", vec!["real_arm()"], vec!["t()"]),
+        ("arm whose body is a labelled loop", "fn f(v: u8) {\n    match v {\n        #[cfg(test)]\n        1 => 'a: loop { t(); break 'a; }\n        2 => real_arm(),\n        _ => {}\n    }\n}\n", vec!["real_arm()"], vec!["t()"]),
         ];
         check_cases(&cases);
     }
