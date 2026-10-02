@@ -332,7 +332,21 @@ fn make_room_aside(path: &Path, name: &str) -> io::Result<()> {
 /// Answers where it went. If the file cannot be moved, its bytes are copied there (the original stays, and is safe to
 /// replace once a copy exists). When neither works the answer is an error, and the caller must not write to `path`: the
 /// file is all that is left of what was in it.
+///
+/// It does not wait for a file another program holds: the stores of the messages and of the ring call it while the
+/// desktop starts, and a file a scanner has open must not hold the start for as long as a wait takes. For a file that a
+/// person asked to be moved (a link made or forgotten) see [`keep_aside_waiting`].
 pub fn keep_aside(path: &Path) -> io::Result<PathBuf> {
+    keep_aside_by(path, |from, to| std::fs::rename(from, to))
+}
+
+/// [`keep_aside`], waiting for a file that another program holds for a moment (a scanner, an indexer) as [`write`] waits for
+/// its target, up to about a second and a half, and moved rather than copied when it is let go of.
+pub fn keep_aside_waiting(path: &Path) -> io::Result<PathBuf> {
+    keep_aside_by(path, rename_over)
+}
+
+fn keep_aside_by(path: &Path, rename: impl Fn(&Path, &Path) -> io::Result<()>) -> io::Result<PathBuf> {
     let name = path
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("{} has no file name", path.display())))?
@@ -348,7 +362,7 @@ pub fn keep_aside(path: &Path) -> io::Result<PathBuf> {
             free().ok_or_else(|| io::Error::new(io::ErrorKind::AlreadyExists, format!("{ASIDE_NAMES} files kept aside as {name}.corrupt are there already")))?
         }
     };
-    match std::fs::rename(path, &aside) {
+    match rename(path, &aside) {
         Ok(()) => Ok(aside),
         Err(rename_failed) => match std::fs::copy(path, &aside) {
             Ok(_) => Ok(aside),
@@ -816,11 +830,36 @@ mod tests {
         let held = std::fs::OpenOptions::new().read(true).share_mode(1).open(&path).unwrap(); // FILE_SHARE_READ: no delete, no rename
         let moved = std::fs::rename(dir.0.join("ring.json"), dir.0.join("elsewhere.json"));
         assert!(moved.is_err(), "the test needs a file that cannot be moved");
+        // Without a wait: this is what a store does while the desktop starts, and a file a scanner has open must not hold the
+        // start (waiting for it to be let go of takes about a second and a half).
+        let began = std::time::Instant::now();
         let aside = keep_aside(&path).unwrap();
+        assert!(began.elapsed() < std::time::Duration::from_millis(1000), "it waited for a held file: {:?}", began.elapsed());
         assert_eq!(aside.file_name().unwrap(), "ring.json.corrupt");
         assert_eq!(std::fs::read(&aside).unwrap(), [0xC3, 0x28, 0x29], "a copy is kept");
         assert!(path.exists(), "and the original is where it was");
         drop(held);
+    }
+
+    /// A scanner holds a file for a moment: it is moved aside when the hold is let go, as a write waits for its target,
+    /// and not copied with the original left where it was.
+    #[cfg(windows)]
+    #[test]
+    fn a_file_held_for_a_moment_is_moved_aside_when_it_is_let_go() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        let dir = TempDir::new("aside-held-briefly");
+        let path = dir.0.join("account.json");
+        std::fs::write(&path, [0xC3, 0x28, 0x29]).unwrap();
+        let held = std::fs::OpenOptions::new().read(true).share_mode(1).open(&path).unwrap(); // FILE_SHARE_READ: no delete, no rename
+        assert!(std::fs::rename(&path, dir.0.join("elsewhere.json")).is_err(), "the test needs a file that cannot be moved");
+        let letting_go = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(held);
+        });
+        let aside = keep_aside_waiting(&path).unwrap();
+        letting_go.join().unwrap();
+        assert_eq!(std::fs::read(&aside).unwrap(), [0xC3, 0x28, 0x29]);
+        assert!(!path.exists(), "it was moved, not copied: nothing is left of it where it was");
     }
 
     #[test]

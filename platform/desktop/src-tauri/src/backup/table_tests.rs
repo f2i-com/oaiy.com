@@ -407,21 +407,17 @@ fn rust_sources(dir: &Path) -> Vec<(String, String)> {
     }
     let mut out = Vec::new();
     walk(dir, dir, &mut out);
+    // A file that a `#[cfg(test)] mod name;` declares is test code from its first line.
+    let tests = crate::source_scan::test_only_files(&out);
+    out.retain(|(rel, _)| !tests.contains(rel));
     out
 }
 
-/// The part of a source file that is not its test module.
-fn production_part(source: &str) -> &str {
-    let mut from = 0;
-    while let Some(at) = source[from..].find("#[cfg(test)]") {
-        let start = from + at;
-        let rest = source[start + "#[cfg(test)]".len()..].trim_start();
-        if rest.starts_with("mod ") || rest.starts_with("pub mod ") || rest.starts_with("pub(crate) mod ") {
-            return &source[..start];
-        }
-        from = start + 1;
-    }
-    source
+/// The code of a source file that runs: everything but the items under `#[cfg(test)]`. It used to be the text before
+/// the first `#[cfg(test)]` that began a module, which ended at a `mod x;` declared in another file and left
+/// everything after it unread (see `crate::source_scan`).
+fn production_part(source: &str) -> String {
+    crate::source_scan::production_code(source)
 }
 
 /// Every plain string literal of some Rust source, and whether it is the argument of a `.join(` call.
@@ -545,7 +541,7 @@ fn every_name_the_desktop_uses_for_a_store_is_classified_or_declared_not_a_store
     let mut missing: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for (file, source) in rust_sources(&manifest_dir().join("src")) {
-        for (literal, after_join) in rust_literals(production_part(&source)) {
+        for (literal, after_join) in rust_literals(&production_part(&source)) {
             if !store_like(&literal, after_join) {
                 continue;
             }

@@ -784,6 +784,9 @@ export type LinkPhase =
   | { phase: 'linked' }
   | { phase: 'failed'; message: string }
   | { phase: 'cancelled' };
+/** What a `LinkStatus.linkError` is about: see there. */
+export type LinkErrorKind = 'unusable' | 'notForgotten' | 'copiesLeft';
+
 export interface LinkStatus {
   linked: boolean;
   connectorId?: string;
@@ -834,6 +837,14 @@ export interface LinkStatus {
   dataNodeSupported?: boolean;
   /** Plugin events kept for the account until FormLogic can take them. */
   outbox?: { waiting: number; oldestAt?: string | null; lastError?: string | null; lastSentAt?: string | null; nextAttemptAt?: string | null };
+  /** A stored file of the link that could not be used, a link that could not be
+   *  forgotten, or a copy of an earlier key that forgetting it could not remove. `kind`
+   *  says which. With `unusable` and `linked: false` it is NOT "nobody linked this
+   *  desktop": the file is there, was left as it was, and a new link puts it aside. With
+   *  `notForgotten` the key is still stored and `linked` is true. With `copiesLeft` the
+   *  link was forgotten and a copy of the key is still on the disk: `link.removeCopies`
+   *  tries again. The message never holds what is in the file. */
+  linkError?: { file: string; message: string; kind: LinkErrorKind };
   attempt: LinkPhase;
   /** Every provider this build can link to — the UI hardcodes no list. */
   available: LinkConnector[];
@@ -849,6 +860,9 @@ export const link = {
       body: JSON.stringify({ connectorId, baseUrl }),
     }),
   unlink: () => request<LinkStatus>('/api/link', { method: 'DELETE' }),
+  /** Try again to remove the copies of an earlier key that `unlink` could not (the
+   *  `copiesLeft` error). Only the copies: a link there is now is not forgotten by it. */
+  removeCopies: () => request<LinkStatus>('/api/link?copiesOnly=true', { method: 'DELETE' }),
   /** Abandon an attempt in flight. Distinct from unlink, which throws away a
    *  credential we already hold. */
   cancel: () => request<LinkStatus>('/api/link/cancel', { method: 'POST' }),

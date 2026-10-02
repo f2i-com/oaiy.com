@@ -22,5 +22,5 @@ pub use pairing::{
 };
 pub use identity::{
     peer_roster_hash, ApprovedMobile, EndpointIdentity, EndpointIdentityHandle, EndpointPublicKey,
-    IdentityStatus, KeyProtection, PendingMobileApproval,
+    IdentityStatus, KeyProtection, PendingMobileApproval, RosterSnapshot,
 };

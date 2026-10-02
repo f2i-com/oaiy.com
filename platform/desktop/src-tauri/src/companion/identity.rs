@@ -189,6 +189,49 @@ pub struct IdentityStatus {
     pub warning: Option<String>,
 }
 
+/// A roster as it is presented to an issuer, and as a plugin holds it from `plugin.init` until it is started
+/// again: this desktop's endpoint key, the revision, the hash that binds them, and the approved phones'
+/// thumbprints SORTED bytewise and unique.
+///
+/// The order matters to everything that reads it. The relay requires the thumbprints strictly ascending
+/// (so does FormLogic's issuer), the host compares what it sent with what the issuer echoed, and the plugin
+/// compares the echo with a sorted list of its own. The roster is kept in the order phones were approved,
+/// and thumbprints are random, so a roster of n phones was sent in the right order one time in n! and the
+/// admission failed otherwise: every desktop with two phones or more.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RosterSnapshot {
+    pub endpoint_key: EndpointPublicKey,
+    pub revision: u64,
+    pub hash: String,
+    pub thumbprints: Vec<String>,
+}
+
+impl RosterSnapshot {
+    fn new(endpoint_key: EndpointPublicKey, revision: u64, thumbprints: Vec<String>) -> Self {
+        let mut thumbprints = thumbprints;
+        thumbprints.sort();
+        thumbprints.dedup();
+        let hash = peer_roster_hash(revision, &thumbprints);
+        Self { endpoint_key, revision, hash, thumbprints }
+    }
+
+    /// The roster as it is now, or `None` for an identity with no key.
+    pub fn of(status: &IdentityStatus) -> Option<Self> {
+        let thumbprints = status.approved_mobiles.iter().map(|m| m.endpoint_key.thumbprint.clone()).collect();
+        Some(Self::new(status.endpoint_key.clone()?, status.roster_revision, thumbprints))
+    }
+
+    /// Whether a plugin that holds `self` can still be presented it beside `live`, the roster as it is now:
+    /// the key is the same and every phone in it is still approved. A phone approved since is not in it, and
+    /// the plugin does not know that phone either, so nothing is lost by leaving it out until the plugin is
+    /// started again. A phone revoked since IS in it, and a roster that names a revoked phone must not be
+    /// presented: it would have the issuer admit that phone to a plugin that still trusts it. Then `live` is
+    /// what is presented, which the plugin refuses (it fails closed until it is started again, as it always has).
+    pub fn still_holds_in(&self, live: &RosterSnapshot) -> bool {
+        self.endpoint_key == live.endpoint_key && self.thumbprints.iter().all(|t| live.thumbprints.binary_search(t).is_ok())
+    }
+}
+
 /// A published pairing offer: the payload, the text to paste, and a QR of it.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -298,6 +341,14 @@ impl EndpointIdentity {
     /// so a short-lived credential is never baked into a handshake that happens
     /// once at launch.
     pub fn private_bootstrap(&self, plugin_api_version: u16) -> Option<serde_json::Value> {
+        self.private_bootstrap_with_roster(plugin_api_version).map(|(bootstrap, _)| bootstrap)
+    }
+
+    /// [`EndpointIdentity::private_bootstrap`], and with it the roster it carries as a [`RosterSnapshot`]:
+    /// the host keeps that to present for the plugin until the plugin is started again. Made from one
+    /// reading of the roster, so the snapshot is exactly what the plugin was handed, and not what the roster
+    /// is a moment later after an approval or a revoke.
+    pub fn private_bootstrap_with_roster(&self, plugin_api_version: u16) -> Option<(serde_json::Value, RosterSnapshot)> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let key = inner.signing_key.as_ref()?;
         if inner.roster.approved.is_empty() || inner.roster.approved.len() > 64 {
@@ -317,7 +368,8 @@ impl EndpointIdentity {
             .map(|m| &m.endpoint_key)
             .collect();
         let _ = plugin_api_version;
-        Some(serde_json::json!({
+        let roster = RosterSnapshot::new(public.clone(), inner.roster.revision, thumbprints);
+        let bootstrap = serde_json::json!({
             "schemaVersion": SCHEMA_VERSION,
             "pluginId": self.owner_plugin,
             "endpointIdentity": {
@@ -327,11 +379,12 @@ impl EndpointIdentity {
                 "privateKeySeed": URL_SAFE_NO_PAD.encode(key.to_bytes()),
             },
             "approvedMobileRoster": {
-                "revision": inner.roster.revision,
-                "rosterHash": peer_roster_hash(inner.roster.revision, &thumbprints),
+                "revision": roster.revision,
+                "rosterHash": roster.hash,
                 "keys": keys,
             },
-        }))
+        });
+        Some((bootstrap, roster))
     }
 
     fn dir(&self) -> PathBuf {
@@ -779,6 +832,34 @@ fn mint_key(dir: &std::path::Path) -> Result<(SigningKey, KeyProtection), String
     crate::secret_file::write(&path, URL_SAFE_NO_PAD.encode(seed))
         .map_err(|e| format!("write {}: {e}", path.display()))?;
     Ok((key, KeyProtection::SoftwareFile))
+}
+
+/// What the tests of the roster, here and in the plugin host, need: a key made from a seed, and a phone approved
+/// without the pairing ceremony, which is not what they are about.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+
+    pub fn phone_key(seed: u8) -> EndpointPublicKey {
+        EndpointPublicKey::from_verifying_key(&SigningKey::from_bytes(&[seed; 32]).verifying_key())
+    }
+
+    impl EndpointIdentity {
+        /// Approve a phone with `key` as the owner does after a pairing: it goes last in the roster, as an approval does.
+        pub fn approve_for_tests(&self, key: &EndpointPublicKey) -> ApprovedMobile {
+            let id = format!("p-{}", random_id(8).unwrap());
+            self.inner.lock().unwrap().pending.push(PendingMobileApproval {
+                id: id.clone(),
+                device_id: format!("phone-{}", &key.thumbprint[..8]),
+                display_name: "Test phone".into(),
+                endpoint_key: key.clone(),
+                thumbprint: key.thumbprint.clone(),
+                fingerprint: display_fingerprint(key).unwrap(),
+                received_at: Utc::now(),
+            });
+            self.approve(&id).unwrap()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1242,6 +1323,87 @@ mod tests {
         // rather than something that slips through looking new.
         assert_eq!(id.inner.lock().unwrap().roster.revoked.len(), 1);
         assert!(id.revoke(&k.thumbprint).is_err(), "revoking twice is an error");
+    }
+
+    /// `n` seeds from 1 in an order that depends on `round`: the order phones are approved in is what is under
+    /// test, so it is varied the same way every run.
+    fn seeds_in_an_order(n: usize, round: u64) -> Vec<u8> {
+        let mut seeds: Vec<u8> = (1..=n as u8).collect();
+        let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ round.wrapping_mul(0xBF58_476D_1CE4_E5B9) ^ n as u64;
+        for i in (1..seeds.len()).rev() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            seeds.swap(i, (state % (i as u64 + 1)) as usize);
+        }
+        seeds
+    }
+
+    #[test]
+    fn a_roster_is_presented_sorted_and_unique_however_many_phones_there_are_and_in_whatever_order_they_were_approved() {
+        // A roster is kept in the order phones were approved, and thumbprints are random: 2 phones to 64, in
+        // several orders each. The presented roster is the same for every order, strictly ascending, and its hash
+        // is the one the protocol derives.
+        let mut out_of_order = 0;
+        for n in [1usize, 2, 3, 5, 16, 64] {
+            let mut presented: Option<RosterSnapshot> = None;
+            for round in 0..4 {
+                let dir = Dir::new("sorted");
+                let id = EndpointIdentity::open(dir.0.clone(), "aokie");
+                for seed in seeds_in_an_order(n, round) {
+                    id.approve_for_tests(&testing::phone_key(seed));
+                }
+                let status = id.status();
+                let kept: Vec<&str> = status.approved_mobiles.iter().map(|m| m.endpoint_key.thumbprint.as_str()).collect();
+                out_of_order += usize::from(kept.windows(2).any(|w| w[0] > w[1]));
+
+                let roster = RosterSnapshot::of(&status).expect("there is a key");
+                assert_eq!(roster.thumbprints.len(), n, "n={n}");
+                assert!(roster.thumbprints.windows(2).all(|w| w[0] < w[1]), "n={n}: strictly ascending, so sorted and unique");
+                assert_eq!((roster.revision, roster.hash.as_str()), (status.roster_revision, status.roster_hash.as_str()), "n={n}: the hash of what is presented");
+                assert_eq!(roster.hash, peer_roster_hash(roster.revision, &roster.thumbprints));
+                assert_eq!(roster.endpoint_key, status.endpoint_key.unwrap());
+                match &presented {
+                    None => presented = Some(roster),
+                    Some(first) => assert_eq!(first.thumbprints, roster.thumbprints, "n={n}: the same phones are the same roster in any order"),
+                }
+            }
+        }
+        assert!(out_of_order > 0, "the orders approved in were never out of order: the test shows nothing");
+    }
+
+    #[test]
+    fn the_roster_a_plugin_is_handed_is_kept_as_it_was_and_holds_through_an_approval_but_not_a_revoke_or_a_rotation() {
+        let dir = Dir::new("held");
+        let id = EndpointIdentity::open(dir.0.clone(), "aokie");
+        let (a, b, c) = (testing::phone_key(1), testing::phone_key(2), testing::phone_key(3));
+        id.approve_for_tests(&a);
+        id.approve_for_tests(&b);
+
+        // One reading: the roster in the bootstrap and the roster kept for the plugin are the same, sorted, and the
+        // bootstrap is what it was before there was a snapshot.
+        let (bootstrap, held) = id.private_bootstrap_with_roster(1).expect("a bootstrap once phones are approved");
+        assert_eq!(Some(&bootstrap), id.private_bootstrap(1).as_ref());
+        assert_eq!(bootstrap["approvedMobileRoster"]["rosterHash"], held.hash.as_str());
+        assert_eq!(bootstrap["approvedMobileRoster"]["revision"], held.revision);
+        assert_eq!(held.thumbprints.len(), 2);
+        assert!(held.thumbprints.windows(2).all(|w| w[0] < w[1]));
+        assert!(held.still_holds_in(&RosterSnapshot::of(&id.status()).unwrap()), "as handed over");
+
+        // A phone approved since is not in it, and it still holds: the plugin does not know that phone either.
+        id.approve_for_tests(&c);
+        let live = RosterSnapshot::of(&id.status()).unwrap();
+        assert!(held.still_holds_in(&live));
+        assert_ne!((held.revision, &held.hash), (live.revision, &live.hash), "and the roster is not the one it holds");
+
+        // A phone revoked since is in it, and it does not hold: it would be admitted again.
+        id.revoke(&a.thumbprint).unwrap();
+        assert!(!held.still_holds_in(&RosterSnapshot::of(&id.status()).unwrap()));
+
+        // And a new key is a new identity, whichever phones are approved under it.
+        let mut other_key = held.clone();
+        other_key.endpoint_key = testing::phone_key(9);
+        assert!(!other_key.still_holds_in(&held));
     }
 
     #[test]
