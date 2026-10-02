@@ -84,7 +84,7 @@
         "status": 200,
         "body": {
           "v": 1,
-          "epoch": "eVp54C0-EJY",
+          "epoch": "Ag6PunvG82w",
           "cursor": 1,
           "items": [
             {
@@ -140,7 +140,7 @@
         "body": {
           "v": 1,
           "state": "approved",
-          "deviceId": "dev-TxXQa40XN9imHY90HR6_Zw",
+          "deviceId": "dev-glShV2cqhxGg8zIgaLvsoQ",
           "time": 1790000000
         }
       },
@@ -158,11 +158,19 @@
         "body": {
           "v": 1,
           "state": "approved",
-          "deviceId": "dev-TxXQa40XN9imHY90HR6_Zw",
-          "sealedToken": "IUwkc-ECVm2xHI7cj3zqQAO4ghRP4xFqkGO3hq1BkX-D2nxuK8wJoL1z4YeCYfp_FanpwTdtOmhPAPngOxvevHjv_sR0NBwW3z214TW2w8QjSSywECdSUzEPTqYE8u4gEVQe7BBBA7ViHLYc8G6B",
+          "deviceId": "dev-glShV2cqhxGg8zIgaLvsoQ",
+          "sealedToken": "QRbWxPtdAN-uyocAKy54Fvpd4zNEYMd5QM_5y9HeZhSb5q33oGPZbaJuRKirVxIkMtSzDBAiD1EroLbSY9Ob5I5SZjNGrVWEe0_29Vyj4HL2zkr_BaeE7lXg538CykjZKZ0vOHz_tx2F75GPJCcY",
           "receipt": {
             "issuedAt": 1790000040,
-            "signature": "FU2PKdtj23VkPpxZfw-DcqwSBNWlL8OvFfPFiJ-kSufrDGbpBPKfKy0c9MfhD3IZyM_5pVgAmeiMGNep93mtDg"
+            "signature": "FU2PKdtj23VkPpxZfw-DcqwSBNWlL8OvFfPFiJ-kSufrDGbpBPKfKy0c9MfhD3IZyM_5pVgAmeiMGNep93mtDg",
+            "grants": [
+              "assistance_read",
+              "assistance_respond",
+              "caller_read",
+              "captions_read",
+              "rtc_signal",
+              "state_read"
+            ]
           },
           "time": 1790000000
         }

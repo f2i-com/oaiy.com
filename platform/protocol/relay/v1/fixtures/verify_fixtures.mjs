@@ -264,8 +264,19 @@ const canon = (o) => {
   check('ceremony: the receipt verifies under the desktop key of the offer', edVerify(desktopPub, cat('oaiy/pairing/3/approval\0', receiptDoc), unb64u(d.receipt.signature)));
   check('ceremony: the approval names the keys the phone answered with', d.phone.ed25519 === resp.claims.mobileEndpointKey.publicKey && d.phone.x25519 === resp.claims.mobileX25519);
   const out = approved.response.body;
+  const { grants: readGrants, ...readRest } = out.receipt;
   check('ceremony: the phone reads the same device id, the receipt as signed and a sealed token',
-    out.deviceId === decision.response.body.deviceId && JSON.stringify(out.receipt) === JSON.stringify(d.receipt) && out.state === 'approved');
+    out.deviceId === decision.response.body.deviceId && JSON.stringify(readRest) === JSON.stringify(d.receipt) && out.state === 'approved');
+  // The phone never sees the decision: it verifies the receipt over the grants the receipt it reads carries (README Interpretation 60), built from what it
+  // knows itself (its app from the offer, the pid, its own thumbprint from its own response) and the desktop key it pinned from the offer.
+  const KNOWN_GRANTS = ['state_read', 'caller_read', 'captions_read', 'assistance_read', 'assistance_respond', 'monitor', 'consult', 'takeover', 'resume_aokie',
+    'end_caller', 'rtc_signal', 'participants_read', 'participant_identity_read', 'audio_levels_read'];
+  const grantsOk = Array.isArray(readGrants) && JSON.stringify(readGrants) === JSON.stringify([...readGrants].sort()) && new Set(readGrants).size === readGrants.length
+    && readGrants.every((g) => KNOWN_GRANTS.includes(g)) && JSON.stringify(readGrants) === JSON.stringify([...d.grants].sort());
+  check('ceremony: the receipt the phone reads carries grants that are sorted, without repeats, all of the fourteen names, and exactly the sorted grants of the decision', grantsOk);
+  const phoneDoc = canon({ appId: offer.appId, grants: Array.isArray(readGrants) ? readGrants : [], issuedAt: out.receipt.issuedAt, phoneThumbprint: resp.claims.mobileEndpointKey.thumbprint, pid });
+  check('ceremony: the phone verifies the receipt from what it reads alone: the document it builds is Appendix A3\'s and the signature verifies under the desktop key',
+    phoneDoc === a3.expected.receiptText && edVerify(desktopPub, cat('oaiy/pairing/3/approval\0', phoneDoc), unb64u(out.receipt.signature)));
   const phoneSk = Buffer.from(V.keys.x25519Secrets.phone, 'hex');
   const token = sealOpen(unb64u(out.sealedToken), phoneSk, xPublicOf(phoneSk));
   check('ceremony: the sealed token opens with the phone\'s key to a device token', token !== null && TOKEN_RE.test(token.toString('latin1')));

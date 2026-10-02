@@ -39,6 +39,51 @@ def is_int(x) -> bool:
     return isinstance(x, int) and not isinstance(x, bool)
 
 
+class Spelled:
+    """A number of a poll answer whose spelling is not an integer literal (`1.0`, `1e2`, `-0`): a number to JSON and not an integer to a poll answer
+    (README P2: an integer is digits only, with no fraction, no exponent and no `-0`). Python's int() and float() would read all of them as numbers
+    that compare equal to integers, which is the mistake this is here to show a client how not to make."""
+
+    __slots__ = ("value", "source")
+
+    def __init__(self, value, source: str) -> None:
+        self.value, self.source = value, source
+
+
+def parse_int(s: str):
+    return Spelled(int(s), s) if s == "-0" else int(s)  # (the grammar of JSON has no leading zero or plus: the only integer literal that is not one is -0)
+
+
+def parse_float(s: str):
+    return Spelled(float(s), s)
+
+
+def unspell(x):
+    """The numbers of the table that are not in a response body are numbers as they are written (the jitter 0.2, a pause of 4.2, a clock): unwrap them."""
+    if isinstance(x, Spelled):
+        return x.value
+    if isinstance(x, list):
+        return [unspell(v) for v in x]
+    if isinstance(x, dict):
+        return {k: unspell(v) for k, v in x.items()}
+    return x
+
+
+def load_table(text: str):
+    """The table, with the spelling of every number in a response body kept (a body is the text a client receives: `1.0` in it is not an integer)."""
+    doc = json.loads(text, parse_int=parse_int, parse_float=parse_float)
+    cases = doc.get("cases") if isinstance(doc, dict) else None
+    out = {k: unspell(v) for k, v in doc.items() if k != "cases"}
+    out["cases"] = []
+    for c in cases or []:
+        resp = c.get("response")
+        kept = {k: (v if k == "response" else unspell(v)) for k, v in c.items()}
+        if isinstance(resp, dict):
+            kept["response"] = {k: (v if k == "body" else unspell(v)) for k, v in resp.items()}
+        out["cases"].append(kept)
+    return out
+
+
 EPOCH = re.compile(r"[A-Za-z0-9_-]{11}")  # 8 bytes, base64url (common.schema.json)
 MAX_SAFE = 2 ** 53 - 1  # the largest cursor and seq (uint53)
 
@@ -61,11 +106,16 @@ def accepted_seqs(items, since):
 
 
 def http_date(text: str):
+    """README P6: the IMF-fixdate of RFC 9110, and a real date and time: day within the month, hour 00 to 23, minute 00 to 59, second 00 to 60, year 0001 to 9999
+    (anything else is no header). The name of the day is not checked."""
     m = IMF.fullmatch(text.strip(" \t"))
     if not m:
         return None
     d, mon, y, hh, mm, ss = m.groups()
-    return calendar.timegm((int(y), MONTHS[mon], int(d), int(hh), int(mm), int(ss)))
+    d, y, hh, mm, ss = int(d), int(y), int(hh), int(mm), int(ss)
+    if not (1 <= y <= 9999 and 0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss <= 60 and 1 <= d <= calendar.monthrange(y, MONTHS[mon])[1]):
+        return None
+    return calendar.timegm((y, MONTHS[mon], d, hh, mm, ss))
 
 
 def make(K: dict):
@@ -208,7 +258,7 @@ def main() -> int:
     path = HERE / "poll-client.json"
     if "--file" in sys.argv:
         path = pathlib.Path(sys.argv[sys.argv.index("--file") + 1])
-    doc = json.loads(path.read_text(encoding="utf-8"))
+    doc = load_table(path.read_text(encoding="utf-8"))
     checks = 0
     bad: list[str] = []
 

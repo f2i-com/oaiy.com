@@ -70,6 +70,17 @@ test('4.10.3 fixtures: the checks catch damage: a flipped bit, a swapped token, 
     $bad = $c;
     $bad['steps'][5]['response']['body']['receipt']['signature'] = str_repeat('A', 86);
     ok(count(Fixtures::checkCeremony($bad)) >= 1, 'a receipt that is not the vector\'s');
+    // The receipt the phone reads carries the grants it was signed over (Interpretation 60): missing, reordered, added to or altered is caught.
+    $g = $c['steps'][5]['response']['body']['receipt']['grants'];
+    foreach (['missing' => null, 'reordered' => array_reverse($g), 'added to' => array_merge($g, ['takeover']), 'taken from' => array_slice($g, 1), 'altered' => array_merge(['end_caller'], array_slice($g, 1))] as $what => $set) {
+        $bad = $c;
+        if ($set === null) {
+            unset($bad['steps'][5]['response']['body']['receipt']['grants']);
+        } else {
+            $bad['steps'][5]['response']['body']['receipt']['grants'] = $set;
+        }
+        ok(count(Fixtures::checkCeremony($bad)) >= 1, "the grants of the receipt the phone reads $what");
+    }
     $bad = $c;
     array_pop($bad['steps']);
     ok(count(Fixtures::checkCeremony($bad)) >= 1, 'a missing step');

@@ -292,6 +292,40 @@ final class Ceremony
         return ['issuedAt' => $issuedAt, 'signature' => B64::enc(Crypto::sign(Crypto::signKeypairFromSeed($this->deskSeed)[1], "oaiy/pairing/3/approval\0" . $text))];
     }
 
+    /**
+     * What the phone does with the receipt it reads from GET /v1/pair/{pid} (section 4.10.2, Interpretation 60), from what it can see: its own
+     * app, the pid, its own thumbprint, and the desktop key it pinned from the offer. It never sees the decision, so the grants are the receipt's
+     * own, and must be sorted, without repeats, all of the fourteen names it knows, and the ones the signature covers.
+     * Returns why it refuses the receipt, or null when it accepts it.
+     * @param array<string,mixed> $receipt
+     */
+    public function phoneRefusesReceipt(array $receipt): ?string
+    {
+        $g = $receipt['grants'] ?? null;
+        if (!is_array($g) || !Json::isList($g)) {
+            return 'no grants';
+        }
+        foreach ($g as $name) {
+            if (!Grants::isKnown($name)) {
+                return 'a grant it does not know';
+            }
+        }
+        $sorted = $g;
+        sort($sorted, SORT_STRING);
+        if ($sorted !== $g) {
+            return 'grants that are not sorted';
+        }
+        if (count(array_unique($g)) !== count($g)) {
+            return 'a grant twice';
+        }
+        $sig = is_string($receipt['signature'] ?? null) ? B64::decN($receipt['signature'], 64) : null;
+        if (!is_int($receipt['issuedAt'] ?? null) || $sig === null) {
+            return 'a receipt that is not shaped';
+        }
+        $text = \Oaiy\Relay\Pairing::receiptText($this->app, $g, $receipt['issuedAt'], $this->phoneThumb(), $this->pid);
+        return Crypto::verify($this->deskPk, "oaiy/pairing/3/approval\0" . $text, $sig) ? null : 'a signature that does not verify over these grants';
+    }
+
     /** @return array<string,mixed> */
     public function decisionDoc(array $grants = Grants::DEFAULT, ?int $issuedAt = null): array
     {

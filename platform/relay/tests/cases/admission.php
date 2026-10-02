@@ -533,11 +533,11 @@ test('4.14.2 mobile admission: the phone must be itself (deviceId, key, app), li
         eq(403, $res['status'], $label . ': ' . $res['body']);
         eq('forbidden', adm_code($res));
     }
-    // The desktop leaves A out of its roster: 403 "your PC no longer lists this phone".
+    // A phone the desktop's roster does not list (it exists: a push that left it out would have revoked it): 403 "Your PC has not listed this phone."
     $k->r->ctx()->db->exec('UPDATE roster SET thumbprints = ? WHERE desktop_dev = ?', [json_encode([$k->thumb($b)]), $k->desk->id]);
     $res = $k->mobile($a);
     eq(403, $res['status']);
-    contains('no longer lists', $res['json']['message']);
+    eq('Your PC has not listed this phone.', $res['json']['message']);
     eq(200, $k->mobile($b)['status'], 'B is listed');
     $k->r->ctx()->db->exec('DELETE FROM roster');
     eq(200, $k->mobile($a)['status'], 'with no roster row the desktop has excluded nobody');
