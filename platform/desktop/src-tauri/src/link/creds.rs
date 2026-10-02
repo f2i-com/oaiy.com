@@ -499,7 +499,7 @@ mod tests {
     /// The lanes that have been converted, with their source: a lane here applies no credential of its own.
     /// Converting a lane adds it to this list; the last step of the conversion replaces the list with a scan of
     /// every file of the crate (design 4.16.3).
-    const CONVERTED: &[(&str, &str)] = &[];
+    const CONVERTED: &[(&str, &str)] = &[("link/heartbeat.rs", include_str!("heartbeat.rs"))];
 
     #[test]
     fn a_converted_lane_reads_its_credential_nowhere_but_here() {
