@@ -1783,6 +1783,20 @@ print(f"\n  {n_aok_docs} documents of the Aokie fixtures validated")
 aok_readme = (AOK / "README.md").read_text(encoding="utf-8")
 for f in ("admission.json", "challenge.json", "frames.json", "stream.json", "errors.json", "ice.json", "aokie_decoders.py", "verify_aokie_fixtures.py"):
     ok(f"fixtures/aokie/README.md describes {f}", f"`{f}`" in aok_readme)
+# A relay with a plain-http public_url is outside the schemas by design (README section 1, Interpretation 61): the relay builds http:// and ws://
+# URLs for a loopback host (test builds), the admission schemas require wss:// and https://, and everything recorded here is a deployed relay's.
+readme_all = (V1 / "README.md").read_text(encoding="utf-8")
+ok("README says a plain-http relay is outside the schemas by design: loopback only, test builds, and no schema is loosened for it",
+   "**A relay with a plain-http base is outside the schemas by design**" in readme_all and "61. **A plain-http relay is outside the schemas, by design.**" in readme_all)
+for adm in ("admission-plugin-response", "admission-mobile-response"):
+    sch = schemas[adm + ".schema.json"]
+    ok(f"{adm}.schema.json requires wss:// for the gateway and https:// for the three relay URLs (a plain-http relay is not claimed to validate)",
+       sch["properties"]["gatewayUrl"]["pattern"].startswith("^wss://") and all(sch["properties"]["relay"]["properties"][k]["pattern"] == "^https://" for k in ("challengeUrl", "framesUrl", "streamUrl")),
+       adm)
+    ok(f"{adm}.schema.json says in its description that a plain-http relay is outside it", "outside this schema by design" in sch["description"])
+ok("every admission of the Aokie fixtures is a deployed relay's: wss:// gateway and https:// relay URLs",
+   all(c["response"]["body"]["gatewayUrl"].startswith("wss://") and all(c["response"]["body"]["relay"][k].startswith("https://") for k in ("challengeUrl", "framesUrl", "streamUrl"))
+       for c in aok["admission.json"]["cases"] if c["response"]["status"] == 200))
 ok("every admission of the Aokie fixtures carries the same three relay URLs (the plugin's cursor domain)",
    len({json.dumps({k: v for k, v in c["response"]["body"]["relay"].items() if k != "mode"}, sort_keys=True) for c in aok["admission.json"]["cases"] if c["response"]["status"] == 200}) == 1)
 aok_neg = 0
