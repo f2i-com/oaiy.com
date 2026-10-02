@@ -85,6 +85,27 @@
       }
     },
     {
+      "name": "a post of more than 1 MiB in all",
+      "request": {
+        "method": "POST",
+        "path": "/v1/aokie-companion/relay/frames",
+        "auth": "Bearer of phone A",
+        "bodyNote": "a request body of more than 1,048,576 bytes, for example 64 frames of 32 KiB (2 MiB); the answer comes before the body is read. 31 frames of 32 KiB fit, 32 do not."
+      },
+      "response": {
+        "status": 413,
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "body": {
+          "error": true,
+          "code": "relay_frame_too_large",
+          "message": "A post may be at most 1048576 bytes in all: send fewer or smaller frames in one post."
+        }
+      },
+      "note": "The phone retries any status but a 429 three times, which cannot help: a post this large is never accepted. The shipped phone posts one frame at a time, so it does not meet this."
+    },
+    {
       "name": "no frames",
       "request": {
         "method": "POST",

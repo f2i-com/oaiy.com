@@ -240,6 +240,14 @@ final class AokieFixtures
         $bigReq = self::request('POST', self::BASE . 'frames', 'Bearer of phone A', null);
         $bigReq['bodyNote'] = 'one frame of 196,618 bytes once encoded (the cap is 196,608): {"to":"plugin","frames":[{"p":"' . str_repeat('x', 3) . '... 196,610 x characters ..."}]}';
         $err('a frame over the cap', $bigReq, $bigRes);
+        // A request over the 1 MiB every host can be asked for is refused for its size before it is read (Interpretation 63): the answer says what the limit is.
+        $tooLarge = new \Oaiy\Relay\Request('POST', self::BASE . 'frames', [], ['REMOTE_ADDR' => '127.0.0.1', 'REQUEST_METHOD' => 'POST', 'CONTENT_TYPE' => 'application/json', 'HTTP_AUTHORIZATION' => 'Bearer ' . $atok], '', null);
+        $tooLarge->bodyTooLarge = true;
+        $cut = (new \Oaiy\Relay\Kernel($k->r->ctx()))->handle($tooLarge);
+        $cutRes = ['status' => $cut->status, 'headers' => array_change_key_case($cut->headers, CASE_LOWER), 'body' => $cut->body, 'json' => json_decode($cut->body, true)];
+        $cutReq = self::request('POST', self::BASE . 'frames', 'Bearer of phone A', null);
+        $cutReq['bodyNote'] = 'a request body of more than 1,048,576 bytes, for example 64 frames of 32 KiB (2 MiB); the answer comes before the body is read. 31 frames of 32 KiB fit, 32 do not.';
+        $err('a post of more than 1 MiB in all', $cutReq, $cutRes, 'The phone retries any status but a 429 three times, which cannot help: a post this large is never accepted. The shipped phone posts one frame at a time, so it does not meet this.');
         $err('no frames', self::request('POST', self::BASE . 'frames', 'Bearer of phone A', '{"to":"plugin","frames":[]}'), $k->call($atok, 'POST', 'frames', '{"to":"plugin","frames":[]}'));
         $err('an admission for a transport this relay cannot serve', self::request('POST', '/v1/aokie-companion/admission', 'the phone\'s device token', $k->mobileRequest($a, ['supportedTransports' => ['websocket']])),
             $k->r->call($a, 'POST', '/v1/aokie-companion/admission', $k->mobileRequest($a, ['supportedTransports' => ['websocket']])));
