@@ -63,10 +63,14 @@ thread_local! {
 }
 
 /// The linked provider's origin, for the origin allow-list.
+#[cfg(not(test))]
 pub fn linked_origin() -> Option<String> {
-    #[cfg(not(test))]
-    return LINKED_ORIGIN.read().ok().and_then(|g| g.clone());
-    #[cfg(test)]
+    LINKED_ORIGIN.read().ok().and_then(|g| g.clone())
+}
+
+/// The linked provider's origin, for the origin allow-list: this thread's, in the tests.
+#[cfg(test)]
+pub fn linked_origin() -> Option<String> {
     LINKED_ORIGIN.with(|cell| cell.borrow().clone())
 }
 
@@ -76,16 +80,18 @@ pub fn set_linked_origin_for_tests(base_url: Option<&str>) {
     set_linked_origin(base_url);
 }
 
+#[cfg(not(test))]
 fn set_linked_origin(base_url: Option<&str>) {
-    // Store the ORIGIN, not the base: a provider served under a path still
-    // sends `Origin: scheme://host[:port]`.
-    let origin = base_url.and_then(origin_of);
-    #[cfg(not(test))]
     if let Ok(mut guard) = LINKED_ORIGIN.write() {
-        *guard = origin;
+        // Store the ORIGIN, not the base: a provider served under a path still
+        // sends `Origin: scheme://host[:port]`.
+        *guard = base_url.and_then(origin_of);
     }
-    #[cfg(test)]
-    LINKED_ORIGIN.with(|cell| *cell.borrow_mut() = origin);
+}
+
+#[cfg(test)]
+fn set_linked_origin(base_url: Option<&str>) {
+    LINKED_ORIGIN.with(|cell| *cell.borrow_mut() = base_url.and_then(origin_of));
 }
 
 /// `scheme://host[:port]` from a base URL, or `None` if it is not one we would

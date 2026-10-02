@@ -247,10 +247,18 @@ impl<T: serde::de::DeserializeOwned> Slot<T> {
     fn make_way(&mut self, dir: &Path) -> Result<(), String> {
         self.refresh(dir, true);
         if self.error.is_some() {
-            put_aside(&dir.join(self.name), &self.shown())?;
-            self.error = None;
-            self.retry = None;
+            self.put_unusable_aside(dir)?;
         }
+        Ok(())
+    }
+
+    /// Move the file that could not be used aside, and say nothing more of it. What decides is the read that came just before
+    /// (see [`Slot::refresh`]): this does not read again, so that a caller's decision is made on one read and not on two that
+    /// can differ.
+    fn put_unusable_aside(&mut self, dir: &Path) -> Result<(), String> {
+        put_aside(&dir.join(self.name), &self.shown())?;
+        self.error = None;
+        self.retry = None;
         Ok(())
     }
 
@@ -361,7 +369,9 @@ impl RelayStore {
         held.relay.refresh(&self.dir, true);
         let put_aside_now = held.relay.error.is_some();
         if put_aside_now {
-            held.relay.make_way(&self.dir)?;
+            // The read that decided is the one that is acted on: a file that is let go of since is moved aside all the same,
+            // and not left where it was with its token while the link is said to be forgotten.
+            held.relay.put_unusable_aside(&self.dir)?;
         } else {
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
@@ -698,6 +708,25 @@ mod tests {
         store.forget_relay().unwrap();
         assert_eq!(std::fs::read(folder.join("relay.json.corrupt")).unwrap(), b"{ not json");
         assert!(store.problems().is_empty() && !folder.join("relay.json").exists());
+    }
+
+    #[test]
+    fn forgetting_a_relay_file_that_is_held_reads_it_once_and_acts_on_that_read() {
+        // The same as the provider link's: a read that finds the file unusable and a second one inside `make_way` that finds it
+        // readable (a program let go of it between them) left `relay.json` and its token in the folder, with the link said
+        // to be forgotten and nothing purged.
+        let dir = TempDir::new("relay-forget-held");
+        let folder = folder(&dir);
+        std::fs::create_dir(folder.join("relay.json")).unwrap();
+        let store = RelayStore::open(&dir.0);
+        assert!(store.relay().is_err(), "held");
+
+        let reads = crate::link::reads::so_far();
+        store.forget_relay().unwrap();
+        assert_eq!(crate::link::reads::so_far() - reads, 1, "the file is read once to decide, not again to act");
+        assert!(folder.join("relay.json.corrupt").is_dir(), "what could not be read is kept");
+        assert!(!folder.join("relay.json").exists());
+        assert!(store.problems().is_empty() && store.relay().unwrap().is_none());
     }
 
     #[test]
