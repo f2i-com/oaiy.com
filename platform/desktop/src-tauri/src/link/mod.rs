@@ -142,8 +142,10 @@ const ACCOUNT_FILE: &str = "link/account.json";
 pub(crate) fn read_stored<T: serde::de::DeserializeOwned>(path: &std::path::Path, shown_as: &str) -> Result<Option<T>, LinkError> {
     use crate::secret_file::{read_text_patiently, Patience, Text};
     let unusable = |why: String| {
-        log::warn!("link: {shown_as} {why}; it is kept as it is and not used");
-        LinkError { file: shown_as.to_string(), message: format!("{shown_as} {why}. It has not been changed.") }
+        let error = LinkError { file: shown_as.to_string(), message: format!("{shown_as} {why}. It has not been changed.") };
+        // The log says what the status says and no more, so what a test finds in one is all there is in the other.
+        log::warn!("link: {}", error.message);
+        error
     };
     match read_text_patiently(path, &Patience::default().start) {
         Text::Missing => Ok(None),
@@ -153,17 +155,19 @@ pub(crate) fn read_stored<T: serde::de::DeserializeOwned>(path: &std::path::Path
     }
 }
 
-/// Why a file failed to parse, without a word of what is in it: a message that quotes a value
-/// (`invalid type: string "flk_..."`) would put a credential into a status or a log. Only the two
-/// messages that name a field of ours are quoted.
+/// Why a file failed to parse, without a word of what is in it: serde quotes the value in `invalid type:
+/// string "flk_..."`, the name in `unknown variant` and `unknown field`, and any of them can be a key
+/// pasted into the wrong place. Only a field the program itself names (`missing field`) is quoted.
 fn describe(e: &serde_json::Error) -> String {
     use serde_json::error::Category;
     let at = format!("line {}, column {}", e.line(), e.column());
     match e.classify() {
         Category::Data => {
             let said = e.to_string();
-            if said.starts_with("unknown field") || said.starts_with("missing field") {
+            if said.starts_with("missing field") {
                 said
+            } else if said.starts_with("unknown field") {
+                format!("an unknown field, {at}")
             } else {
                 format!("a value has the wrong form, {at}")
             }
@@ -1226,7 +1230,7 @@ mod tests {
         // the screen and the key sat on the disk, with nothing said.
         let newer = br#"{"connectorId":"formlogic","baseUrl":"https://formlogic.com","credential":"flk_a","linkedAt":"2026-09-01T00:00:00Z","futureField":1}"#;
         for (what, body, says) in [
-            ("a newer shape", &newer[..], "unknown field `futureField`"),
+            ("a newer shape", &newer[..], "an unknown field, line 1"),
             ("a cut file", &br#"{"connectorId":"formlogic","baseUrl":"#[..], "not valid JSON"),
             ("not text", &[0xC3, 0x28, 0xA0][..], "is not text"),
         ] {
@@ -1238,6 +1242,43 @@ mod tests {
             assert!(error.message.contains(says), "{what}: {}", error.message);
             assert!(error.message.contains("It has not been changed"), "{what}: {}", error.message);
             assert_eq!(std::fs::read(dir.join("link").join("account.json")).unwrap(), body, "{what}: the file is as it was");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn what_serde_quotes_back_never_reaches_the_status_or_the_log() {
+        // serde's own message quotes the value (`invalid type: string "flk_..."`), the name of an unknown
+        // variant, the name of an unknown field and a number: any of them can be a key pasted into the wrong
+        // place. What is said of a file is `describe`'s and nothing of serde's, and the log line is the status's.
+        use crate::relay::link_store::{ProviderPins, Routes};
+        const SECRET: &str = "flk_TOPSECRET";
+        let file = |tail: &str| format!(r#"{{"connectorId":"formlogic","baseUrl":"https://formlogic.com","credential":"{SECRET}","linkedAt":"2026-09-01T00:00:00Z"{tail}}}"#);
+        fn from<T: serde::de::DeserializeOwned>(raw: &str) -> serde_json::Error {
+            serde_json::from_str::<T>(raw).map(|_| ()).unwrap_err()
+        }
+        // What goes wrong, serde's error for it, what `describe` must say, and what serde itself quotes of it.
+        let cases: Vec<(&str, serde_json::Error, &str, &str)> = vec![
+            ("an unknown field", from::<LinkedAccount>(&file(&format!(r#","{SECRET}":1"#))), "an unknown field", "TOPSECRET"),
+            ("a string where a number belongs", from::<ProviderPins>(&format!(r#"{{"pins":[{{"providerId":"p","ed25519":"e","x25519":"x","thumbprint":"t","serial":"{SECRET}","pinnedAt":"2026-09-01T00:00:00Z"}}]}}"#)), "a value has the wrong form", "TOPSECRET"),
+            ("an unknown variant", from::<Routes>(&format!(r#"{{"commands":"{SECRET}"}}"#)), "a value has the wrong form", "TOPSECRET"),
+            ("a number where a string belongs", from::<LinkedAccount>(&file(r#","accountId":13371337"#)), "a value has the wrong form", "13371337"),
+        ];
+        for (what, error, says, quoted) in cases {
+            let said = describe(&error);
+            assert!(said.contains(says), "{what}: {said}");
+            assert!(!said.contains("TOPSECRET") && !said.contains("13371337"), "{what}: {said}");
+            assert!(error.to_string().contains(quoted), "{what}: this case means nothing unless serde quotes it, and it said {error}");
+        }
+        // And through the whole path: the status, what the screen is told, and the line that goes to the log.
+        for body in [file(&format!(r#","{SECRET}":1"#)), file(r#","accountId":13371337"#)] {
+            let (dir, store) = store_over("quote-path", body.as_bytes());
+            let status = store.status();
+            let shown = serde_json::to_string(&status).unwrap();
+            assert!(!shown.contains("TOPSECRET") && !shown.contains("13371337"), "{shown}");
+            let from_file: Result<Option<LinkedAccount>, LinkError> = read_stored(&dir.join("link").join("account.json"), "link/account.json");
+            let error = from_file.unwrap_err();
+            assert_eq!(Some(&error), status.link_error.as_ref(), "the status and the log line are one message");
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
