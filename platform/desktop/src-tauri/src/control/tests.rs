@@ -1073,3 +1073,28 @@ async fn setup_finish_after_the_hand_off_succeeds_without_changing_anything() {
     assert_eq!(puts.lock().unwrap().len(), 1);
     assert_eq!(control.audit().read(1)[0]["ok"], true);
 }
+
+#[test]
+fn the_link_status_tool_says_why_a_stored_link_is_not_in_use() {
+    // `linked: false` with a `linkError` is a link file that could not be read, or a link that could not be forgotten:
+    // the Agent that is asked "is this linked?" must not answer "no" and stop there.
+    let why = "link/account.json is not a link this version of OAIY understands (an unknown field, line 1, column 99). It has not been changed.";
+    let unusable = json!({"linked": false, "linkError": {"file": "link/account.json", "message": why}});
+    let summary = tools::link_summary(&unusable, Err("no sync".into()));
+    assert_eq!(summary["linked"], json!(false));
+    assert_eq!(summary["linkError"]["message"], json!(why));
+    assert_eq!(summary["problem"], json!(why), "the one line the tool leads with");
+
+    // A link that could not be forgotten is still linked, and says so.
+    let stuck = json!({"linked": true, "connectorName": "FormLogic", "heartbeatError": "HTTP 500", "linkError": {"file": "link/account.json", "message": "the link could not be forgotten"}});
+    let summary = tools::link_summary(&stuck, Err("no sync".into()));
+    assert_eq!((summary["linked"].clone(), summary["problem"].clone()), (json!(true), json!("the link could not be forgotten")));
+
+    // Without one, the problem is what it was: the heartbeat's, then the command lane's, else none; and there is no linkError.
+    let beat = tools::link_summary(&json!({"linked": true, "heartbeatError": "HTTP 500", "relayError": "late"}), Err("no sync".into()));
+    assert_eq!((beat["problem"].clone(), beat["linkError"].clone()), (json!("HTTP 500"), Value::Null));
+    let lane = tools::link_summary(&json!({"linked": true, "relayError": "late"}), Err("no sync".into()));
+    assert_eq!(lane["problem"], json!("late"));
+    let fine = tools::link_summary(&json!({"linked": true, "linkError": null}), Err("no sync".into()));
+    assert_eq!((fine["problem"].clone(), fine["linkError"].clone()), (Value::Null, Value::Null));
+}

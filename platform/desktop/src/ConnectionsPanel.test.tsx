@@ -416,6 +416,79 @@ describe('ConnectionsPanel · Linked account', () => {
     expect(msg).toContain('does not revoke it at the provider');
     expect(unlinkMock).toHaveBeenCalled();
   });
+
+  const LINKED = {
+    linked: true,
+    connectorName: 'Acme Cloud',
+    baseUrl: 'https://acme.example',
+    accountName: 'Reception PC',
+    attempt: { phase: 'linked' },
+    available: [CONNECTOR],
+  };
+
+  it('says Disconnected only when the key was forgotten', async () => {
+    linkStatusMock.mockResolvedValue(LINKED);
+    unlinkMock.mockResolvedValue(IDLE);
+    await mount();
+    await click('Disconnect');
+    expect(pushMock).toHaveBeenCalledWith({ kind: 'success', title: 'Disconnected Acme Cloud' });
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+  });
+
+  it('does not say Disconnected when the host could not remove the stored link, and keeps the account on the card', async () => {
+    // A program holding account.json without delete sharing (a scanner, an indexer) makes the removal fail. The
+    // host answers with the link still in place and says why; a green "Disconnected" would tell the owner the
+    // key is gone when it is on the disk and links this desktop again at the next start.
+    const why = 'the link could not be forgotten: link/account.json could not be removed (Access is denied. (os error 5)). It is still linked here.';
+    linkStatusMock.mockResolvedValue(LINKED);
+    unlinkMock.mockResolvedValue({ ...LINKED, linkError: { file: 'link/account.json', message: why } });
+    await mount();
+    await click('Disconnect');
+
+    expect(pushMock).not.toHaveBeenCalledWith(expect.objectContaining({ kind: 'success' }));
+    expect(pushMock.mock.calls.some(([t]) => /^Disconnected /.test(t.title) && !/but not all/.test(t.title))).toBe(false);
+    expect(pushMock).toHaveBeenCalledWith(expect.objectContaining({ kind: 'error', title: 'Could not disconnect Acme Cloud', body: why }));
+    const alert = container.querySelector('[role="alert"]');
+    expect(alert?.textContent).toContain('could not be removed');
+    // Still linked: the card, its account and its Disconnect button are there to try again.
+    expect(container.textContent).toContain('Reception PC');
+    expect(Array.from(container.querySelectorAll('button')).some((b) => b.textContent?.trim() === 'Disconnect')).toBe(true);
+  });
+
+  it('says so when the link was forgotten and a copy of it could not be removed', async () => {
+    const why = 'the link was forgotten, but account.json.corrupt (Access is denied.) could not be removed: a copy that was kept of it can hold the key it had';
+    linkStatusMock.mockResolvedValue(LINKED);
+    unlinkMock.mockResolvedValue({ ...IDLE, linkError: { file: 'link/account.json', message: why } });
+    await mount();
+    await click('Disconnect');
+    expect(pushMock).not.toHaveBeenCalledWith(expect.objectContaining({ kind: 'success' }));
+    expect(pushMock).toHaveBeenCalledWith(expect.objectContaining({ kind: 'error', title: 'Disconnected Acme Cloud, but not all of it', body: why }));
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain('could not be removed');
+  });
+
+  it('shows why a stored link is not in use, rather than looking as if nobody had linked this desktop', async () => {
+    // An unreadable or newer-shaped account.json used to read as "not linked" with no word said: the link was on
+    // the disk and gone from the screen. The file is kept, and the panel says what is wrong with it.
+    linkStatusMock.mockResolvedValue({
+      ...IDLE,
+      linkError: { file: 'link/account.json', message: 'link/account.json is not a link this version of OAIY understands (an unknown field, line 1, column 99). It has not been changed.' },
+    });
+    await mount();
+    const alert = container.querySelector('[data-link-error]');
+    expect(alert?.getAttribute('role')).toBe('alert');
+    expect(alert?.textContent).toContain('The stored link could not be used.');
+    expect(alert?.textContent).toContain('an unknown field');
+    expect(alert?.textContent).toContain('Nothing was deleted');
+    // It can still be linked again from here.
+    expect(Array.from(container.querySelectorAll('button')).some((b) => b.textContent?.trim() === 'Link account')).toBe(true);
+  });
+
+  it('says nothing about a stored link that is fine', async () => {
+    linkStatusMock.mockResolvedValue(LINKED);
+    await mount();
+    expect(container.querySelector('[data-link-error]')).toBeNull();
+    expect(container.textContent).not.toContain('could not be used');
+  });
 });
 
 describe('ConnectionsPanel · Companion relay', () => {

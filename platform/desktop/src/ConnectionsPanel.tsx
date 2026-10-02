@@ -167,7 +167,16 @@ export default function ConnectionsPanel() {
       const next = await linkApi.unlink();
       setAccount(next);
       put('linkStatus', next);
-      toast.push({ kind: 'success', title: `Disconnected ${name}` });
+      if (next.linked || next.linkError) {
+        // The host answered, and did not do it: the key is still stored (a program holding the file keeps it from
+        // being removed), or a copy kept of an earlier file could not be removed. Telling the owner it worked
+        // would leave a key on the disk that links this desktop again at the next start.
+        const why = next.linkError?.message ?? `${name} is still linked on this computer.`;
+        setAccountError(why);
+        toast.push({ kind: 'error', title: next.linked ? `Could not disconnect ${name}` : `Disconnected ${name}, but not all of it`, body: why });
+      } else {
+        toast.push({ kind: 'success', title: `Disconnected ${name}` });
+      }
     } catch (err) {
       setAccountError(err instanceof Error ? err.message : String(err));
     }
@@ -351,6 +360,20 @@ export default function ConnectionsPanel() {
         {(accountError ?? statusError) && (
           <div className="banner banner-err" role="alert">
             {accountError ?? statusError}
+          </div>
+        )}
+        {/* A stored file of the link that could not be used. Not "not linked": the file is there and was left
+            as it was, and this says why it is not in use, so a desktop that looks unlinked is not mistaken for
+            one nobody linked. Linking again puts the file aside (it is kept as account.json.corrupt). */}
+        {account?.linkError && account.linkError.message !== (accountError ?? statusError) && (
+          <div className="banner banner-err" role="alert" data-link-error>
+            <strong>{account.linked ? 'The link could not be changed.' : 'The stored link could not be used.'}</strong>{' '}
+            <span>{account.linkError.message}</span>
+            {!account.linked && (
+              <div style={{ marginTop: 6, fontSize: 12.5 }}>
+                Nothing was deleted. Link again below to start a new one; the old file is kept beside it.
+              </div>
+            )}
           </div>
         )}
 

@@ -834,6 +834,11 @@ export interface LinkStatus {
   dataNodeSupported?: boolean;
   /** Plugin events kept for the account until FormLogic can take them. */
   outbox?: { waiting: number; oldestAt?: string | null; lastError?: string | null; lastSentAt?: string | null; nextAttemptAt?: string | null };
+  /** A stored file of the link that could not be used, or a link that could not be
+   *  forgotten. With `linked: false` it is NOT "nobody linked this desktop": the file
+   *  is there, was left as it was, and a new link puts it aside. With `linked: true`
+   *  the key is still stored. The message never holds what is in the file. */
+  linkError?: { file: string; message: string };
   attempt: LinkPhase;
   /** Every provider this build can link to — the UI hardcodes no list. */
   available: LinkConnector[];

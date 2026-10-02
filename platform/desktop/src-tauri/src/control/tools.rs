@@ -1173,14 +1173,18 @@ fn sync_summary(r: &Value) -> Value {
     })
 }
 
-fn link_summary(l: &Value, sync: Result<Value, String>) -> Value {
+pub(super) fn link_summary(l: &Value, sync: Result<Value, String>) -> Value {
+    // A stored link that could not be used, or could not be forgotten: with `linked` false it is NOT a desktop that
+    // nobody linked (its file is there and was left alone), and the Agent must be told so, or it answers "not linked".
+    let link_error = l.get("linkError").filter(|e| !e.is_null());
     json!({
         "linked": l.get("linked"),
         "provider": l.get("connectorName").or_else(|| l.get("connectorId")),
         "address": l.get("baseUrl"),
         "account": l.get("accountName"),
         "linkedAt": l.get("linkedAt"),
-        "problem": l.get("heartbeatError").or_else(|| l.get("relayError")),
+        "linkError": link_error,
+        "problem": link_error.and_then(|e| e.get("message")).or_else(|| l.get("heartbeatError")).or_else(|| l.get("relayError")),
         "calendarSync": part(sync, |r| sync_summary(&r)),
     })
 }
