@@ -11,11 +11,39 @@ use oaiy_relay_core::json;
 use oaiy_relay_core::keys::{Signer, X25519Secret};
 use oaiy_relay_core::url::RelayUrl;
 
-fn scratch(name: &str) -> PathBuf {
+/// A scratch directory under the target directory's `tmp`, removed when the test ends (also when it fails).
+struct Scratch(PathBuf);
+
+impl std::ops::Deref for Scratch {
+    type Target = PathBuf;
+    fn deref(&self) -> &PathBuf {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for Scratch {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl From<&Scratch> for PathBuf {
+    fn from(s: &Scratch) -> PathBuf {
+        s.0.clone()
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn scratch(name: &str) -> Scratch {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("stores-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
-    dir
+    Scratch(dir)
 }
 
 fn profile() -> RelayProfile {

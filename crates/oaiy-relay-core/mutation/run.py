@@ -63,6 +63,9 @@ def test(extra, name):
     base = ["test", "-p", "oaiy-relay-core", "--locked", *extra]
     code, out, _ = run(base + ["--no-run"], TIMEOUT_BUILD)
     if code != 0:
+        # One more try: a build can fail for a reason that is not the mutant (a file held by another process); a mutant that does not compile fails twice.
+        code, out, _ = run(base + ["--no-run"], TIMEOUT_BUILD)
+    if code != 0:
         return "INVALID", "does not compile"
     code, out, timed_out = run(base + ["--", "--test-threads", "4"], TIMEOUT_TEST)
     if code == 0:
