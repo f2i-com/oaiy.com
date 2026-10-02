@@ -1114,6 +1114,14 @@ in parts through internal routes with a secret made for that one backup.
   message to update.
 - Plugin data is backed up only for plugins OAIY has been taught about (today Aokie's settings
   file); another plugin's data is listed as left out.
+- **Disconnecting FormLogic removes the copies OAIY kept of its link file.** When `link/account.json`
+  cannot be used (a newer OAIY wrote it and you went back to this one, a restore cut it, a program
+  held it open) OAIY keeps it as `account.json.corrupt` (`.corrupt.1` and so on) instead of writing
+  over it, and those copies can hold the key. Disconnect in Connections removes them with the link,
+  including a copy of a link that a newer OAIY wrote and that you kept after going back; to keep
+  one, copy it out of the `link` folder before you disconnect. A copy that cannot be removed (a
+  program has it open) is said on the Connections screen, with a Remove copies button that tries
+  again. The link file and its copies are never in a backup (see the table above).
 
 ## For developers
 

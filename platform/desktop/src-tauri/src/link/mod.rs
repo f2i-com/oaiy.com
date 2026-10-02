@@ -272,6 +272,8 @@ pub(crate) fn reread<T: serde::de::DeserializeOwned>(path: &std::path::Path, sho
 
 /// Remove what was put aside from `path` (`<name>.corrupt`, `<name>.corrupt.1`, ...): a link that is forgotten
 /// takes with it the copies of itself that were kept when it could not be read, which can hold the key it had.
+/// That includes a copy of a link that a newer build wrote and that was kept after a rollback: the owner is told so
+/// (`docs/BACKUP.md`, "Known limits") and can copy it out of the folder first.
 pub(crate) fn purge_asides(path: &std::path::Path) -> Result<(), String> {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name().map(|n| n.to_string_lossy().into_owned())) else {
         return Ok(());
