@@ -250,6 +250,28 @@ pub(crate) fn read_again<T: serde::de::DeserializeOwned>(path: &std::path::Path,
     }
 }
 
+/// What a test does in the moment a read of the file has been made and its result has not yet been applied (the lock is not
+/// held there, and is what lets the lanes that ask for the account go on while a file is read): once, on this thread.
+#[cfg(test)]
+pub(crate) mod after_the_read {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn once(what: impl FnOnce() + 'static) {
+        HOOK.with(|hook| *hook.borrow_mut() = Some(Box::new(what)));
+    }
+
+    pub(super) fn run() {
+        let what = HOOK.with(|hook| hook.borrow_mut().take());
+        if let Some(what) = what {
+            what();
+        }
+    }
+}
+
 /// How many times this thread has read a file of the link again: for the tests that say a decision is made on one read.
 #[cfg(test)]
 pub(crate) mod reads {
@@ -900,6 +922,10 @@ impl LinkStore {
         }
         // Without the lock: the file is read, and the lanes that ask for the account meanwhile are not kept waiting.
         let read = read_again::<LinkedAccount>(&self.path, ACCOUNT_FILE);
+        #[cfg(test)]
+        after_the_read::run();
+        // What was read is applied only if what it was read for is still so: a forget, or a new link, that came while the file
+        // was being read has dealt with it, and a read that is older than that is not the file any more.
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if !inner.holds_unusable_file() {
             return;
@@ -1969,6 +1995,174 @@ mod tests {
     }
 
     #[test]
+    fn a_read_that_a_forget_overtook_is_not_applied_and_does_not_bring_the_link_back() {
+        // A lane read the file (a link now, since the program that held it let go) and, before it took the lock to apply what it
+        // found, a forget came and finished: the file is gone and nothing is linked. What the lane found is the file as it was,
+        // and applying it would link a desktop that was just disconnected, with its key in memory and none on the disk.
+        let dir = data_dir("overtaken");
+        let file = dir.join("link").join("account.json");
+        std::fs::create_dir(&file).unwrap();
+        let store = load_store(dir.clone());
+        std::fs::remove_dir(&file).unwrap();
+        std::fs::write(&file, serde_json::to_string(&account()).unwrap()).unwrap();
+        read_again_now(&store);
+
+        let forgetter = store.clone();
+        after_the_read::once(move || {
+            let after = forgetter.unlink();
+            assert!(!after.linked && after.link_error.is_none(), "{after:?}");
+        });
+        assert!(store.account().is_none(), "the lane that read the file before the forget is not handed the link");
+        assert!(!file.exists());
+        let status = store.status();
+        assert!(!status.linked && status.link_error.is_none(), "{status:?}");
+        assert!(store.inner.lock().unwrap().account.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_pause_between_reads_of_a_file_that_stays_held_grows() {
+        // Each read that finds it held makes the next one later (the pauses are the patience's `later`, the last for ever), so
+        // that a file a scanner holds for an hour is not read every second for the hour.
+        let dir = data_dir("pauses");
+        let file = dir.join("link").join("account.json");
+        std::fs::create_dir(&file).unwrap();
+        let store = load_store(dir.clone());
+        let ms = std::time::Duration::from_millis;
+        store.inner.lock().unwrap().retry = Some(crate::secret_file::Retry::began(&crate::secret_file::Patience { start: vec![], later: vec![ms(40), std::time::Duration::from_secs(3600)], window: std::time::Duration::ZERO }));
+        std::thread::sleep(ms(70));
+        assert!(store.inner.lock().unwrap().retry.as_ref().unwrap().due(), "the first pause is over");
+
+        assert!(store.account().is_none(), "held: it is read, and it is held");
+        std::thread::sleep(ms(70));
+        assert!(!store.inner.lock().unwrap().retry.as_ref().unwrap().due(), "the next pause is the longer one, and it is not over");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The link file as the lanes and the screen meet it while another program holds it and lets go at a moment nobody chose.
+    /// Not a test of a result that can be told in advance: many rounds of many threads, each asked what it can be asked.
+    #[test]
+    fn many_rounds_of_many_lanes_get_the_link_back_from_a_file_that_is_let_go_at_a_random_moment() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let probe_dir = data_dir("hammer-probe");
+        let probe = probe_dir.join("link").join("account.json");
+        std::fs::write(&probe, "x").unwrap();
+        let Some(can_hold_a_file) = crate::secret_file::testing::make_unreadable(&probe) else { return };
+        drop(can_hold_a_file);
+        let _ = std::fs::remove_dir_all(&probe_dir);
+        let mut failures = Vec::new();
+        for round in 0..40u64 {
+            let dir = data_dir("hammer-back");
+            let file = dir.join("link").join("account.json");
+            std::fs::write(&file, serde_json::to_string(&account()).unwrap()).unwrap();
+            let held = crate::secret_file::testing::make_unreadable(&file).unwrap();
+            let store = load_store(dir.clone());
+            read_again_now(&store);
+            let (stop, got) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)));
+            let n = 4 + (round % 13) as usize;
+            let threads: Vec<_> = (0..n)
+                .map(|i| {
+                    let (store, stop, got) = (store.clone(), stop.clone(), got.clone());
+                    std::thread::spawn(move || {
+                        while !stop.load(Ordering::Relaxed) {
+                            let back = match i % 3 {
+                                0 => store.account().is_some(),
+                                1 => store.status().linked,
+                                _ => {
+                                    let _ = store.status();
+                                    store.account().is_some()
+                                }
+                            };
+                            if back {
+                                got.fetch_add(1, Ordering::SeqCst);
+                                return;
+                            }
+                        }
+                    })
+                })
+                .collect();
+            std::thread::sleep(std::time::Duration::from_millis(round % 7));
+            drop(held);
+            let deadline = Instant::now() + std::time::Duration::from_secs(5);
+            while got.load(Ordering::SeqCst) < n && Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            stop.store(true, Ordering::Relaxed);
+            for t in threads {
+                t.join().unwrap();
+            }
+            let inner = store.inner.lock().unwrap();
+            if got.load(Ordering::SeqCst) != n || inner.retry.is_some() || inner.error.is_some() {
+                failures.push(format!("round {round}: {} of {n} got the link; timer={} error={}", got.load(Ordering::SeqCst), inner.retry.is_some(), inner.error.is_some()));
+            }
+            drop(inner);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// Readers hammer, the file is let go of at a moment of its own, and the link is forgotten at another: once the forget has
+    /// answered "forgotten" the file is not where it was and no reader is handed the link again.
+    #[test]
+    fn a_forget_while_readers_hammer_and_the_file_is_let_go_of_leaves_nothing_forgotten_but_there() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let probe_dir = data_dir("hammer-probe2");
+        let probe = probe_dir.join("link").join("account.json");
+        std::fs::write(&probe, "x").unwrap();
+        let Some(can_hold_a_file) = crate::secret_file::testing::make_unreadable(&probe) else { return };
+        drop(can_hold_a_file);
+        let _ = std::fs::remove_dir_all(&probe_dir);
+        let mut bad = Vec::new();
+        for round in 0..40u64 {
+            let dir = data_dir("hammer-forget");
+            let file = dir.join("link").join("account.json");
+            std::fs::write(&file, serde_json::to_string(&account()).unwrap()).unwrap();
+            let held = crate::secret_file::testing::make_unreadable(&file).unwrap();
+            let store = load_store(dir.clone());
+            read_again_now(&store);
+            let (stop, forgotten, resurrected) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)));
+            let threads: Vec<_> = (0..6)
+                .map(|i| {
+                    let (store, stop, forgotten, resurrected) = (store.clone(), stop.clone(), forgotten.clone(), resurrected.clone());
+                    std::thread::spawn(move || {
+                        while !stop.load(Ordering::Relaxed) {
+                            let had = if i % 2 == 0 { store.account().is_some() } else { store.status().linked };
+                            // A reader that asks after the forget was answered is never handed the link (it is asked again, in case the
+                            // first answer was of a read that began before).
+                            if forgotten.load(Ordering::SeqCst) && had && store.account().is_some() {
+                                resurrected.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
+                    })
+                })
+                .collect();
+            let releaser = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(round % 5));
+                drop(held);
+            });
+            std::thread::sleep(std::time::Duration::from_millis((round * 3) % 11));
+            let after = store.unlink();
+            if !after.linked && after.link_error.is_none() {
+                forgotten.store(true, Ordering::SeqCst);
+                if file.exists() {
+                    bad.push(format!("round {round}: forgotten, and account.json is still there"));
+                }
+            }
+            releaser.join().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            stop.store(true, Ordering::Relaxed);
+            for t in threads {
+                t.join().unwrap();
+            }
+            if resurrected.load(Ordering::SeqCst) > 0 {
+                bad.push(format!("round {round}: a reader was handed the link {} times after the forget was answered", resurrected.load(Ordering::SeqCst)));
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        assert!(bad.is_empty(), "{bad:#?}");
+    }
+
+    #[test]
     fn a_held_file_is_read_again_however_many_lanes_ask_at_once() {
         // The lanes that read the account at the top of their loops (the command lane, the flow runner, the sealed flows, the
         // AI tunnel) have no pause before it, and the screen asks for the status as well. Eight threads in a tight loop meet
@@ -2044,14 +2238,21 @@ mod tests {
         let store = load_store(dir.clone());
         store.persist(&account()).unwrap();
         store.inner.lock().unwrap().account = Some(account());
-        for kept in ["account.json.corrupt", "account.json.corrupt.1", "account.json.corrupt.30", "account.json.corrupt.x", "account.json.bak-baseurl", "app-logic-storage.json"] {
+        let mut not_copies = vec!["account.json.corrupt.x", "account.json.bak-baseurl", "app-logic-storage.json"];
+        // A name that ends in `.corrupt.` with nothing after it is not a numbered copy. Windows takes the dot off the end of a name, so
+        // there it is the first copy under another spelling and cannot be told apart: it is made where it can exist.
+        if cfg!(unix) {
+            not_copies.push("account.json.corrupt.");
+        }
+        for kept in ["account.json.corrupt", "account.json.corrupt.1", "account.json.corrupt.30"].iter().chain(not_copies.iter()) {
             std::fs::write(link.join(kept), r#"{"credential":"flk_THE_PREVIOUS_KEY"}"#).unwrap();
         }
         let after = store.unlink();
         assert!(!after.linked && after.link_error.is_none(), "{after:?}");
         let mut left: Vec<String> = std::fs::read_dir(&link).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         left.sort();
-        assert_eq!(left, ["account.json.bak-baseurl", "account.json.corrupt.x", "app-logic-storage.json"]);
+        not_copies.sort();
+        assert_eq!(left, not_copies);
 
         // A folder named like a copy is not a file of ours and is left alone; the copies that are files go.
         let stuck = link.join("account.json.corrupt.2");
@@ -2269,6 +2470,10 @@ mod tests {
         assert!(after.linked, "it is still linked, and the screen says so");
         let error = after.link_error.expect("and why");
         assert!(error.message.contains("could not be forgotten"), "{}", error.message);
+        // Of its own kind: a link that was not forgotten is not a file that could not be used (which the screen answers with a
+        // new link, and the store with a read again), and the panel and the Agent tell them apart by it.
+        assert_eq!(error.kind, LinkErrorKind::NotForgotten);
+        assert_eq!(serde_json::to_value(&error).unwrap()["kind"], "notForgotten");
         assert!(store.account().is_some(), "the lanes go on with a link that is still stored");
 
         // Once the file can be removed the next try forgets it, and the error goes with the link.
