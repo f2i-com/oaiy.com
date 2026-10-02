@@ -24,7 +24,7 @@ is fixed in one place is fixed for both. A future `oaiy-mobile-core` (JNI) would
 
 ### Features and dependencies
 
-- Dependencies: `oaiy-crypto` (the repository's audited cryptography surface, by path), `zeroize`, and optionally `oaiy-keystore`. No `tokio`, no HTTP or TLS crate, no `serde`,
+- Dependencies: `oaiy-crypto` (the repository's audited cryptography surface, by path), `zeroize`, `curve25519-dalek` (for one question `oaiy-crypto` does not answer, whether an Ed25519 key is in the prime-order subgroup; the crate and version `oaiy-crypto` already builds on, no feature; it belongs in `oaiy-crypto` and should move there), and optionally `oaiy-keystore`. No `tokio`, no HTTP or TLS crate, no `serde`,
   no `unsafe` (`#![forbid(unsafe_code)]`). Dev-dependency: `serde_json` (already in `Cargo.lock`), for the differential tests.
 - `loopback-http`: a blocking HTTP/1.1 client over `std::net::TcpStream` that talks to loopback only (no redirects, a body cap, a timeout, cancellation), and the plain `http://`
   relay URL for loopback. **Test builds only: it has no TLS.** Plain `http` is read only after the program calls `url::allow_loopback_http(true)` (a function that exists only with
@@ -88,10 +88,13 @@ Three promises, and what the crate does so that a host that breaks one of them c
 3. `PollLoop` with the paired token, and `RelayClient::admission_for_profile` for the phone's admission: it is read as the shipped phone reads it **and** compared with what the owner
    approved (its scopes are the receipt's signed grants, its expected peer is the desktop that was pinned from the offer).
 
-**The receipt's grants.** The desktop signs `{appId, grants, issuedAt, phoneThumbprint, pid}` into the receipt. The shipped relay returns `receipt: {issuedAt, signature}` only, so
-the phone needs the grants from elsewhere (`wait_outcome(Some(grants))`); a relay that returns `receipt.grants` is believed over the caller's list, because the signature
-protects it (a relay that lies makes the receipt fail). The relay is to be changed to return them (see "Findings"); until then `wait_outcome(None)` fails closed with
-`ReceiptGrantsUnknown`, and the test that shows the phone pairing from what the real relay returns is `#[ignore]`d and marked TODO.
+**The receipt's grants.** The desktop signs `{appId, grants, issuedAt, phoneThumbprint, pid}` into the receipt, and the relay returns the grants with it (`receipt: {issuedAt, signature, grants}`; the
+schema of the answer requires them: the sorted set, without a repeat). The phone verifies the signature over exactly those grants and builds its profile from them, so **a phone pairs
+from the receipt alone**. What it refuses (`ReceiptInvalid`, no profile, the sealed token not opened): grants that are not sorted in code-point order or repeat a name (the signature is over
+the sorted set, so an unsorted list would verify, and is refused all the same), a name it does not know, a set that is not the one that was signed (one more, one fewer, any other), and
+a receipt that is not dated within the pairing's window; a receipt with no `grants` at all and no list from the caller is refused too (`ReceiptGrantsUnknown`). The list a caller may still
+pass to `wait_outcome(Some(grants))` is for a relay of the earlier shape, which returned none; when the relay returns grants they win. `tests/receipt_grants.rs` pairs through eight damaged
+answers and then the honest one, and `relay_php.rs` does the whole pairing from the receipt alone against the real relay.
 
 ## What the client refuses to do
 
@@ -100,7 +103,7 @@ protects it (a relay that lies makes the receipt fail). The relay is to be chang
   admissions, the four pairing calls of the desktop).
 - **No acknowledgement before the write.** An item is persisted before the poll that carries its `seq` is sent; a failed write is a failure, never `unreachable`.
 - **No profile without a receipt.** The phone verifies the desktop's signed receipt before it makes a profile, and opens the sealed token only after that.
-- **No signature outside a domain, no non-strict verification, no key of small order.**
+- **No signature outside a domain, no non-strict verification, no key of small order, and no key to pin or register that the relay would refuse** (see "Ed25519 keys").
 - **No redirect, no plain `http` outside loopback.** And no secret in `Debug` output (next section).
 
 ## Secrets: what is redacted and what is wiped
@@ -123,6 +126,29 @@ offer the owner is shown (`NewOffer`) and the pairing's MAC key when the pairing
 - `Item` bodies (sealed content, opened elsewhere) and the poll store's files, which hold what the relay delivered;
 - memory a buffer gave back by growing (`realloc`) outside the paths above.
 
+## Ed25519 keys: who is authoritative for what
+
+There are two questions about a key, and two authorities. The crate never lets the answer to one stand in for the other.
+
+| Purpose | Authority | Where | What it means |
+|---|---|---|---|
+| **Verifying a signature** | libsodium's verdict (the relay's and the shipped readers') | `VerifyKey::from_bytes`, every `verify` | Unchanged and strict: the canonical encoding, not of small order, a strict equation. The differential on 249 hand-built edge cases (`tools/run-differentials.ps1`) shows the crate accepts exactly what libsodium accepts, including a key with a component of small order beside its prime-order part when the signature happens to verify |
+| **Pinning, registering or pairing with a key** | **The relay's rule**: `Crypto::isValidEd25519Public`, so that a client never pins a key that the relay later refuses | `VerifyKey::from_bytes_registrable`, `from_b64u_registrable`, `is_registrable` | The canonical encoding, not of small order, **and in the prime-order subgroup**. Used for every key the crate reads from a protocol document (the relay's key in `info`, the desktop's and the host's key in an offer, the phone's key in a response, a rotation's new key, the keys a stored pairing pins) and for the keys it is asked to register (a device key at enrolment, the endpoint key of a plugin admission), and by the stub relay |
+
+The registration rule is **never more generous than the relay's**: `tests/ed25519_keys.rs` lists the exact keys of the review on which the two disagreed (33 keys the crate used to take and the relay
+refuses, all a prime-order key plus a point of order 4 or 8; 2 keys the relay takes and the crate refuses) and runs the relay's own `Crypto.php` on 1,385 keys (honest keys, an honest key plus each point of small
+order, random bytes): the crate registers none that the relay refuses, and every honest key is registered by both. Where the crate is **stricter** on purpose:
+
+- A **second, non-canonical spelling** of a key (`y + p`, which exists for 19 values of `y`): the relay takes it, the crate does not. It is the same point with another thumbprint (the thumbprint is
+  a hash of the text), so a revoked or pinned key could come back under a name that was not revoked or pinned, and libsodium will not verify a signature with it, so it can never sign.
+- A key with a component of **order 2** beside its prime-order part: the relay takes it (all 150 of the honest keys plus a point of order 2 that the differential tried), the crate does not. No key made from a
+  seed has one, so no honest party is turned away.
+
+**For the relay engineer (relay or protocol):** `isValidEd25519Public` is more generous than its own comment ("not a small-order point ... also rejects points that are not in the prime-order subgroup"). Its last
+line, `sodium_crypto_sign_ed25519_pk_to_curve25519`, lets through (libsodium 1.0.20) a key whose component of small order is of order 1 or **2** (libsodium's subgroup test looks at whether `X` is zero after
+multiplying by the group order, and the point of order 2, `(0, -1)`, has `X = 0`), and a non-canonical spelling of such a key (`2^255 - 10` is `p + 9`, the second spelling of the key whose canonical `y` is 9, which
+has a component of order 2: the two keys on which the relay takes what the crate refuses). If the relay means one thumbprint per key, add a canonical check (the bytes with bit 255 cleared are below `p`) and a
+subgroup test that does not stop at `X = 0` (multiply by the group order and require the identity, or compare with `crypto_core_ed25519_is_valid_point` and test it on `y = 9`).
 ## Pacing, with the numbers
 
 The poll rules are README 5.1.1 (P1 to P9) and `poll::decide` is the table of them, tested against the repository's own fixture and two readers. Two things the table leaves out:
@@ -132,11 +158,15 @@ The poll rules are README 5.1.1 (P1 to P9) and `poll::decide` is the table of th
 - **The phone's wait for the owner (`GET /v1/pair/{pid}`).** The relay's budgets are 30 requests a minute per address, **60 counted `GET`s per rendezvous** (about 10 s apart over its
   600 s) and **10 outcome reads a minute**. The phone asks again at once only when the relay says it held the request (`hold.granted`, not `superseded`) **and** the request took
   as long as a hold takes by the phone's own clock (at least half the wait, at most 10 s); every other answer that leaves the rendezvous as it was is followed by a pause of **10 s
-  with up to 20 percent jitter**, so a relay or a proxy that answers at once and says it held never makes the phone spin. A refused hold is paced as a poll's (2, 4, 5 s); a `429`
-  waits its `Retry-After`; a failure backs off 1, 2, 4 ... 60 s. (The contract does not say how fast a phone may ask for an `answered` rendezvous with `wait=0`; see "Findings".)
+  with up to 20 percent jitter**, so a relay or a proxy that answers at once and says it held never makes the phone spin. After a granted hold the pause is nothing, **or, when the relay's
+  `wait.max` is below ten seconds, the difference to ten** (a phone that asks again at once after a two-second hold spends the 60 counted reads in two minutes). A refused hold is paced
+  as a poll's (2, 4, 5 s); a `429` waits **the larger of 10 s and its `Retry-After`** with the same jitter; a failure backs off 1, 2, 4 ... 60 s. This is the client rule of the protocol README
+  (10.1, which main now has).
+- **A real date.** An HTTP-date in a `Retry-After` or `Date` is read only when it is a real date and time: the year 0001 to 9999, the day within its month (29 February only in a leap year), hour 00
+  to 23, minute 00 to 59, second 00 to 60; the name of the day is not checked. A date that does not exist is no date, and the header is read as absent (P6).
 - **An integer is an integer literal** (Interpretation 23 of the poll rules): digits only, with an optional minus sign, no fraction, no exponent and not `-0`. `1.0`, `1e2` and `-0`
   are not integers, whatever a language's `Number` makes of them; a `seq` or `cursor` above 2^53 - 1 is not a uint53 and is dropped, not read as a smaller number. The crate follows
-  this; the Node reader of the fixtures does not (see "Findings").
+  this, and so do both readers of the fixtures now (main reads the text of an answer).
 
 ## The poll store
 
@@ -150,7 +180,7 @@ cannot be read is an error and not a first run.
 ## Tests, by layer
 
 Run everything with `cargo test -p oaiy-relay-core` (features are on for this crate's own tests). `--test-threads 4` is plenty. The counts are those of the last full run
-(`2 October 2026`): **313 tests pass**, 14 are `#[ignore]`d on purpose (listed below), none are skipped quietly.
+(`3 October 2026`): **326 tests pass**, 13 are `#[ignore]`d on purpose (listed below), none are skipped quietly.
 
 | Layer | Where | Tests | What it shows |
 |---|---|---|---|
@@ -158,15 +188,16 @@ Run everything with `cargo test -p oaiy-relay-core` (features are on for this cr
 | L1 known answers | `tests/vectors.rs` | 35 | Every vector A0 to A12 of `vectors.json` (A5 is the TURN credential, not part of the client), the sealed-token and ceremony recordings, and the edges the vectors leave open (the info's thumbprint, a `time` member, a small-order R, an empty sealed box, a sync container's domain) |
 | L2 fixtures | `tests/poll_fixture.rs`, `pairing_ceremony.rs`, `aokie_fixtures.rs` | 5 + 16 + 6 | All 135 cases of `poll-client.json`; the recorded pairing ceremony reproduced **byte for byte** by the two parties, ending with the recorded SAS and token, **and played again with one artifact damaged at a time** (an offer's MAC or text or window, the relay it names, a response's signature, MAC or window, the typed code, a receipt's signature, date or grants, the sealed token), each of which must be refused at its step with nothing sent that should not be; the recorded Aokie admissions accepted, about 40 damaged ones refused |
 | differential, self-contained | `tests/json_differential.rs`, `poll_differential.rs` | 3 + 2 | The JSON parser against `serde_json`; `decide` against the repository's Python reader on 18,000 random cases and its Node reader on 6,000 (SKIPPED loudly without python and node, a failure where `OAIY_REQUIRE_TOOLS=1`) |
-| L3 stub relay | `tests/client_stub.rs`, `pairing_stub.rs`, `stores.rs`, `loopback.rs`, `hardening.rs`, `wipe_drops.rs` | 32 + 21 + 11 + 7 + 9 + 1 | The client against an in-process relay: outage pacing (1, 2, 4 ... 32 s), 429 rules, refused holds (2, 4, 5), reset, revoke, 426, a failing store, a duplicate credential, a woken hold, the proof gate on every call that carries a token, **the relay's own count of held requests (one for a loop, one for a phone, never two)**, both pairings (key and typed code), a receipt dated ahead, the file store after a crash and when full, the loopback transport against raw sockets that misbehave, the hardening round (a 429 for the proof, header names, wall-clock steps, bounds), and the drop-time wipe |
-| **L4 real relay** | `tests/relay_php.rs` | 7 (+1 ignored) | The client against the **real PHP relay** (see below) |
+| L3 stub relay | `tests/client_stub.rs`, `pairing_stub.rs`, `stores.rs`, `loopback.rs`, `hardening.rs`, `wipe_drops.rs` | 32 + 21 + 11 + 7 + 10 + 1 | The client against an in-process relay: outage pacing (1, 2, 4 ... 32 s), 429 rules, refused holds (2, 4, 5), reset, revoke, 426, a failing store, a duplicate credential, a woken hold, the proof gate on every call that carries a token, **the relay's own count of held requests (one for a loop, one for a phone, never two)**, both pairings (key and typed code), a receipt dated ahead, the file store after a crash and when full, the loopback transport against raw sockets that misbehave, the hardening round (a 429 for the proof, header names, wall-clock steps, bounds), and the drop-time wipe |
+| keys and receipts | `tests/ed25519_keys.rs`, `receipt_grants.rs` | 10 + 1 | Which Ed25519 keys are registered (against the relay's own `Crypto.php`) and where the rule is applied; a phone pairing from the receipt alone and refusing eight damaged receipts |
+| **L4 real relay** | `tests/relay_php.rs` | 8 | The client against the **real PHP relay** (see below), including a whole pairing from the receipt's grants alone |
 | fuzz | `tests/fuzz.rs` | 9 | Every decoder on random bytes and on damaged copies of the protocol's corpus: no panic, no hang, and the round-trip and range properties of what is accepted |
 | the review | `tests/rv_*.rs` | 95 | The independent review's tests: 33 on the client's I/O, 41 on the two pairing parties, the secrets (what `Debug` prints, what freed memory holds, which generator they come from), encoding, allocation, the findings (each was `#[ignore]`d until its fix landed, and none is ignored now) |
-| mutation | `mutation/` | 212 mutants | Each breakage must make the tests fail (see below) |
+| mutation | `mutation/` | 233 mutants | Each breakage must make the tests fail (see below) |
 
 **Ignored on purpose:** the 13 drivers of the differential tests (`rv_enc_corpus` 7, `rv_ed25519_diff`, `rv_x25519_diff`, `rv_pairing_math_diff`, `rv_sealed_diff`'s driver,
-`rv_poll_diff`, `rv_admission_diff`), which need generated input and fail loudly when they are run without it (they are run by `tools/run-differentials.ps1`, below), and
-`relay_php::the_phone_pairs_from_the_grants_the_real_relay_returns_with_the_receipt`, a **TODO** for the relay change (the relay does not return `receipt.grants` yet).
+`rv_poll_diff`, `rv_admission_diff`), which need generated input and fail loudly when they are run without it (they are run by `tools/run-differentials.ps1`, below). Nothing else is ignored: the test that
+a phone pairs from the receipt's grants against the real relay, which was a TODO for the relay change, runs now that the relay returns them.
 
 ### L4: the real PHP relay
 
@@ -183,7 +214,7 @@ It covers: enrolment and the identity proof; the poll loop with real holds and a
 a revocation by `bin/relay.php revoke`; an outage (every server killed, then restarted) with the paced retries and the `unreachable` report; the gap rule and the bound of three
 polls that wait; two processes with one credential; a command and its result between a provider and a desktop; a client pinned to another key refused before any token is sent;
 two whole pairings (key and typed code) between the desktop party and the phone party, including the real relay's sealed token, the phone's and the plugin's admission, a response
-the desktop rejected and the phone's fresh answer under `pid.2`, and a ring signed with the host key that the relay verifies and the phone verifies again.
+the desktop rejected and the phone's fresh answer under `pid.2`, a whole pairing from the receipt's grants alone, and a ring signed with the host key that the relay verifies and the phone verifies again.
 
 ### Differentials against what the rest of the system uses
 
@@ -193,11 +224,11 @@ corpora in a scratch copy of the generators (the repository stays clean), runs t
 
 | Pipeline | Against | Result |
 |---|---|---|
-| ed25519 | libsodium (PHP), OpenSSL (Node, Python `cryptography`) on 249 hand-built edge cases | the crate accepts exactly what libsodium accepts (0 differences). Beside it: the crate's `VerifyKey::from_bytes` refuses what the relay's `Crypto::isValidEd25519Public` accepts in 2 cases (non-canonical encodings) and accepts what it refuses in 72 (keys with a component of small order that the relay will not enrol); signature verdicts are libsodium's in all of them |
+| ed25519 | libsodium (PHP), OpenSSL (Node, Python `cryptography`) on 249 hand-built edge cases | the crate's verifier accepts exactly what libsodium accepts (0 differences). Beside it, as the review found it: the verifier took 72 rows (33 keys) that the relay's `Crypto::isValidEd25519Public` refuses, and refused 2 keys that it takes; **registration is now the relay's rule and never more generous (see "Ed25519 keys")**, which `tests/ed25519_keys.rs` checks against the relay's own PHP |
 | x25519 | libsodium, 3,054 u-coordinates (14 low-order encodings, the edge of the field) | refuses the 18 that libsodium refuses, equal shared secrets on the rest |
 | math | an independent recomputation of the pairing arithmetic | equal (300 cases, 95 typed-code variants, 13 SAS entries) |
 | sealed | libsodium's sealed boxes (430) and the crate's (12) | all open, both ways |
-| poll | the reviewer's second implementation of the README, 20,000 cases | 0 disagreements, with the readings the README now fixes (dates added as they stand, a `seq` above 2^53 - 1 dropped, `-0` not an integer, no `Retry-After` for a failure the client caused) |
+| poll | the reviewer's second implementation of the README, 20,000 cases | 0 disagreements, with the readings the README fixes (a date that does not exist is no date, a `seq` above 2^53 - 1 dropped, `-0` not an integer, no `Retry-After` for a failure the client caused) |
 | admission | the Python port of the shipped decoders, 20,000 damaged copies of the recorded admissions | **1,005 differ, pinned**: the crate is stricter in 485 (the bearer and the scopes, and ICE servers, gateway URLs and the peer thumbprint where the damage is) and looser in 516 and 4 relay advertisements (see the last section) |
 | b64 | PHP `B64.php`, a strict Python reference, Node, 1,010,908 inputs | 0 differences |
 | json | PHP `json_decode` and the relay's `Json::decode`, Python, Node, `serde_json`, 200,000 inputs | the general reader accepts exactly what the strict Python reference accepts and writes the same text (0 differences); it is stricter than the others on purpose (a duplicate member, a lone surrogate, more than 64 levels) and reads `1e999` as Python does and `serde_json` does not |
@@ -205,33 +236,34 @@ corpora in a scratch copy of the generators (the repository stays clean), runs t
 
 ### Fuzzing
 
-`OAIY_FUZZ_ROUNDS` (default 2000 per target) raises the rounds; 200,000 rounds in a release build (27 s) and 100,000 in a debug build (which has overflow checks; 70 s) pass. The fuzz test found one defect, now fixed with its own test: a `Retry-After` date read against a client
+`OAIY_FUZZ_ROUNDS` (default 2000 per target) raises the rounds; 200,000 rounds in a release build (26 s) and 100,000 in a debug build (which has overflow checks; 200 s) pass. The fuzz test found one defect, now fixed with its own test: a `Retry-After` date read against a client
 clock at `i64::MIN` overflowed.
 
 ### Mutation testing
 
 `python crates/oaiy-relay-core/mutation/run.py` (Windows: it ends a hung run with `taskkill`; `--check` verifies every anchor without a build, `--only`, `--from`, `--no-php`, `--out`)
-applies the 212 mutations of `mutation/mutations.py`, `review_mutations.py` and `hardening_mutations.py` one at a time (a changed constant, a removed check, an inverted
+applies the 233 mutations of `mutation/mutations.py`, `review_mutations.py` and `hardening_mutations.py` one at a time (a changed constant, a removed check, an inverted
 comparison, a reordered write), builds, and runs the tests in three tiers (the fast ones, every other test target of the crate, the real relay) until one fails. The outcomes are
 **KILLED, SURVIVED, INVALID** (the anchor is not there exactly once, or the mutant does not compile, retried once) **and TIMEOUT** (a run that did not end in 240 s: reported apart and
 **never counted as a kill**); the exit status is 0 only when every mutant is KILLED. A file with CRLF line ends is refused. It changes files in place and restores them: run it in a
 worktree nobody else builds in, with a `CARGO_TARGET_DIR` of its own.
 
-**Result of the last full run (commit `dca04510`, 2 October 2026, `mutation/results.txt`): 212 mutants, 212 killed, 0 survived, 0 invalid, 0 timed out.** The unit tests of the
-library killed 57, the fast integration tests 121, the other test targets of the crate 34, and **none was left to the real relay** (the harness names only the first test that fails,
-so a kill by a test that is sensitive to many things, such as the wipe table of `rv_enc_wipe`, is a kill by the harness's definition and not an attribution). The 212 are the 83 of the
-implementer, 88 of the independent reviewer and 41 written for the second round; **two mutants are left out as equivalent, and the reasons are written beside them in the files**:
-the reviewer's `K05` (an all-zero Diffie-Hellman result: no peer key that could produce one can be built, since all fourteen small-order encodings are refused first) and `H15` (the poll
-loop's failure arm: nothing reaches it, since the loop drops an epoch that is not the relay's spelling and `RelayClient::poll` can fail with nothing else the loop does not handle above).
-Six mutants change `oaiy-crypto` where the crate delegates (`dependency`).
+**Result of the last full run (the merged tree, commit `8471de5a`, 3 October 2026; `mutation/results.txt`): 233 mutants, 232 killed, 1 survived (H52), 0 invalid, 0 timed out; the survivor is
+killed by a test added afterwards and the 15 mutants of the registration, the pacing and the receipt's grants were run again on the final commit (`bc603b61`): 233 of 233.** The unit tests of the
+library killed 63, the fast integration tests 121, the other test targets of the crate 48, and **none was left to the real relay** (the harness names only the first test that fails, so a kill by a test
+that is sensitive to many things, such as the wipe table of `rv_enc_wipe`, is a kill by the harness's definition and not an attribution). The 233 are the 83 of the implementer, 88 of the independent
+reviewer and 62 written for the two rounds that followed the review; **two mutants are left out as equivalent, and the reasons are written beside them in the files**: the reviewer's `K05` (an all-zero
+Diffie-Hellman result: no peer key that could produce one can be built, since all fourteen small-order encodings are refused first) and `H15` (the poll loop's failure arm: nothing reaches it, since the
+loop drops an epoch that is not the relay's spelling and `RelayClient::poll` can fail with nothing else the loop does not handle above). Six mutants change `oaiy-crypto` where the crate delegates
+(`dependency`). The previous full run, before the merge with main and the work that followed it (`dca04510`, 212 mutants), was 212 of 212; the run before that, on the tree the review had seen (`a54af7d6`),
+left 5 standing and 2 that only the real relay killed.
 
 How the number was reached, because "83 of 83" was true and incomplete: the implementer's 83 were all killed on LF checkouts, but the reviewer's run of a sample of 20 of them on a CRLF
 checkout gave 18 killed and **2 INVALID** (an anchor that spans lines does not match CRLF text); the crate is LF in every checkout since (`.gitattributes`) and the harness refuses a CRLF
 file. The reviewer's own 89, run on the crate as it was reviewed, gave 51 killed, 1 hang (reported apart and not a kill) and 37 survived; the 38 that were not killed, run again on the
-tests of `c205f09b`, gave 20 killed, 17 survived and 1 timed out, and each now has a test. The first full run after the second round (`a54af7d6`, 213 mutants) left 5 standing and 2 that only the real relay killed; they got tests, and the run above
-is the second. The ceremony tests alone (`tests/pairing_ceremony.rs`, which plays the recorded pairing byte for byte and then once for each damaged artifact) were checked against the
-pairing mutants one at a time: they kill the SAS gate (an approval without the code, a wrong code not counted, no denial, no burn), the response's MAC and signature and window, the
-receipt's check, the offer's window with and without a key expiry, the relay the offer names and the relay key it states.
+tests of `c205f09b`, gave 20 killed, 17 survived and 1 timed out, and each now has a test. The ceremony tests alone (`tests/pairing_ceremony.rs`, which plays the recorded pairing byte for byte and
+then once for each damaged artifact) were checked against the pairing mutants one at a time: they kill the SAS gate (an approval without the code, a wrong code not counted, no denial, no burn),
+the response's MAC and signature and window, the receipt's check, the offer's window with and without a key expiry, the relay the offer names and the relay key it states.
 
 ## Not covered, and not verified
 
@@ -250,54 +282,38 @@ receipt's check, the offer's window with and without a key expiry, the relay the
 - **Directory flushes on Windows.** The store flushes the directory after a rename where the platform has a way to (Unix); Windows has none, and this was not tested by a crash.
 - **Platform behaviour**: doze, network changes (`PollHandle::network_changed` is exercised against the stub and the real relay), the phone's keystore, and the desktop's keystore
   adapter on a real OS keystore are not tested here.
-- **Mutation score is not proof.** The survivors and equivalent mutants are listed above, and 212 hand-made mutants are a sample of the ways to be wrong.
-- **Lows of the review not done:** `Sas` keeps its three fields public (its `Debug` prints nothing, its `Drop` wipes it and `display()` cannot panic on one built by hand).
+- **Mutation score is not proof.** The survivors and equivalent mutants are listed above, and 233 hand-made mutants are a sample of the ways to be wrong.
+- **Lows of the review:** all done (`Sas` has private fields and accessors now). The one thing the review asked for that this crate cannot do alone is to have `oaiy-crypto` answer the subgroup question (it is asked of `curve25519-dalek` directly, see "Dependencies").
 
 ## Findings about the contract
 
 Gaps and disagreements found while building and testing this. The contract (`platform/protocol/relay/v1`, `platform/relay`) is not changed by this crate; what needs a change there is
 marked **relay** or **protocol**.
 
-**Since this branch was cut (`e0eb2e96`), `origin/main` has taken findings 1 to 4** (the relay returns `receipt.grants`, `972f0c31`; the integer rule and real dates only in the poll rules and both
-readers, `369fdcd6`; the three read budgets and the client's pacing, `21c3ad8c`; plain http outside the schemas, `0638478f`; the same five are in `05ad1f0a`). This branch does not contain them. When
-the two meet, the crate needs these changes, which were made and run in a throwaway merge (314 tests pass there, the 13 differential drivers aside): `parse_http_date` refuses a date that does
-not exist (day within its month, hour 00 to 23, minute 00 to 59, second 00 to 60, year 0001 to 9999) where it now adds an out-of-range field as it stands; `tests/poll_fixture.rs` pins the new
-table (162 cases); the pairing wait pauses `max(10, Retry-After)` after a `429` and, after a granted hold when `info.wait.max` is below ten seconds, the difference to ten; the test of the whole
-pairing from the real relay's grants (`relay_php.rs`) is no longer `#[ignore]`d and compares the grants sorted (the relay returns them sorted); the ceremony test that adds a `grants` member
-to the receipt replaces the recorded one; the reviewer's poll implementation refuses year 0000 and the differentials script drops its `lenient_date` flag. The findings below stay as they were
-written for the branch.
+**Main has taken findings 1 to 4 and this branch contains it** (merged at `05ad1f0a`: the relay returns `receipt.grants`, the integer literal and real dates only, the pair-read budgets and the client's pacing,
+the plain-http note). The crate follows: real dates, the 162-case poll table, the pacing rule, and a phone that pairs from the receipt alone are in the commits after the merge. What is left is finding 7.
 
-1. **The receipt covers the grants, and the relay does not return them to the phone. (Decided: the relay returns `receipt.grants`. Relay change.)** The desktop signs the grants into
-   the receipt, but `GET /v1/pair/{pid}` answers with `receipt: {issuedAt, signature}` only (`platform/relay/src/Pairing.php`: `approval()` verifies the grants and keeps `issuedAt` and
-   `signature`). The change is small and safe, because the signature covers the grants and the schema allows extra members: **relay** `Pairing.php:343-345` (store the sorted grants in
-   the receipt JSON), `pairing-fetch-response.schema.json` (the receipt object), README step 9 (lines 410 and 412), `tests/cases/pairing.php`, `pairing-ceremony.json` (line 163) and
-   its two readers (`verify_fixtures.py` 264-276, `verify_fixtures.mjs` 262) and the pinned digests in `relay_conformance.py`. This crate already verifies from the grants the relay
-   returns when it does and keeps the explicit-grants path; `relay_php.rs` has an `#[ignore]`d TODO test of the whole pairing from what the real relay returns, to be enabled with the change.
-2. **A relay installed on an `http://` base writes `ws://` and `http://` URLs that the schemas and the shipped readers refuse. (Decided: outside the schemas by design; test builds only.)**
-   See "Features and dependencies".
-3. **An integer is an integer literal. (Decided. Protocol and relay, the fixtures' Node reader.)** The two poll-client readers disagreed on whole-number floats:
-   `verify_poll_client.mjs` reads `1.0`, `1e2` and `5.0` as integers (JavaScript cannot tell them from `1`, `100` and `5`), the Python reader and this crate do not. The README rule is
-   now "an integer literal: digits only, no fraction, exponent or `-0`" (Interpretation 23); **protocol:** write it into P2 and make the Node reader look at the lexeme. The 135
-   cases of the table do not contain such a value, so both pass today.
-4. **The pairing wait needs a pacing rule. (Decided: the numbers above. Protocol.)** The contract does not say how fast a phone may read an `answered` rendezvous with `wait=0`; a phone
-   that did so spun (a test of this crate did, until it was given a pause). The relay's budgets are 30 requests a minute per address, 60 counted `GET`s per rendezvous and 10 outcome
-   reads a minute; **protocol:** put these numbers and the 10 s pause into the protocol README.
+1. **The receipt covers the grants, and the relay returns them to the phone. (Done on main; the crate follows.)** The desktop signs the grants into the receipt; `GET /v1/pair/{pid}` now answers with
+   `receipt: {issuedAt, signature, grants}`, the grants sorted. See "How the phone uses it".
+2. **A relay installed on an `http://` base writes `ws://` and `http://` URLs that the schemas and the shipped readers refuse. (Outside the schemas by design; test builds only.)** See "Features and dependencies".
+3. **An integer is an integer literal. (Done on main, in the README and both readers.)** The crate has followed the rule since the review (a `seq` above 2^53 - 1 is dropped, `1.0`, `1e2` and `-0` are not integers).
+4. **The pairing wait needs a pacing rule. (Done on main: the three read budgets and the client's pacing.)** The crate follows it (see "Pacing").
 5. **`php -S` on Windows cannot serve a hold and another request at once** (design 9.4), so any single-process development relay deadlocks a poll against a post. Documented in the
    design; noted here because the L4 harness needs a fleet to work around it.
 6. **Canonical JSON is not RFC 8785.** The README (line 48) sorts members by the UTF-8 bytes of their names, as the relay does; RFC 8785 sorts by UTF-16 code units. They differ only for
    names with a character above U+FFFF beside one in U+E000 to U+FFFF (839 keys of the 200,000-input corpus; none of the protocol's own, which are ASCII). This crate follows the README
    and says so; a signer in another language that implements RFC 8785 would sign other bytes for such a name.
-7. **Key validity differs between the relay and the crate** (see the Ed25519 row above): the relay's `isValidEd25519Public` refuses keys that the crate builds (those with a component of
-   small order) and builds two non-canonical encodings that the crate refuses. Signature verdicts are libsodium's either way. **Relay or protocol** if the two rules are meant to be
-   one: this crate would adopt the relay's.
+7. **Key validity differed between the relay and the crate. (Decided and done in the crate; a finding for the relay.)** See "Ed25519 keys": verification is libsodium's, registration is the relay's rule and never more
+   generous. **Relay (one decision):** `isValidEd25519Public` takes a key with a component of order 2 and the non-canonical spelling of one, which its comment says it does not; if the relay means one thumbprint per key
+   and the prime-order subgroup, it needs a canonical check and a subgroup test that does not stop at `X = 0`. The crate does not depend on the answer: it is stricter either way.
 
 ## Android and wasm
 
 **Android** (NDK 27.0.12077973; `cargo check` and `cargo build --lib`): `aarch64-linux-android` and `x86_64-linux-android` pass with the default features, with `keystore` (which
-builds `oaiy-keystore` for Android) and with all features (re-run on 2 October 2026 after the last change to the library). These are compile checks: nothing was linked or run on a device or an emulator.
+builds `oaiy-keystore` for Android) and with all features (re-run on 3 October 2026 on the merged tree). These are compile checks: nothing was linked or run on a device or an emulator.
 
 **wasm32-unknown-unknown**: the default build **fails in `getrandom` 0.3** (under `oaiy-crypto`'s OS random source), which has no backend for that target until the final application sets
-`--cfg getrandom_backend="wasm_js"` and enables getrandom's `wasm_js` feature; `oaiy-crypto` was not changed. With a custom getrandom backend (compile check only) this crate checks
+`--cfg getrandom_backend="wasm_js"` and enables getrandom's `wasm_js` feature; `oaiy-crypto` was not changed. With a custom getrandom backend (`RUSTFLAGS='--cfg getrandom_backend="custom"'`, compile check only; re-run on 3 October 2026 with `curve25519-dalek` added) this crate checks
 cleanly with the default features and with `testing` and `loopback-http`. `std::net` and `SystemTime` compile for that target and fail at run time, so a green check does not mean
 `LoopbackHttp` or `SystemClock` work there: a web client brings its own `HttpClient` and `Clock`. The `keystore` feature does not build for wasm32 (`oaiy-keystore` has no platform
 module for it), so a wasm build leaves it off. No feature gate was needed in this crate.
