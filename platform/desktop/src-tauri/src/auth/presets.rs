@@ -619,7 +619,9 @@ mod tests {
     /// holds every scope, reaches eleven more, `agent`, which holds the first two, five, and `companion` (the
     /// interim LAN preset), which holds `calls.read` alone, four. No other preset holds any of them. The encrypted backup adds eight routes: the
     /// status (`system.read`, which `owner`, `cli`, `cli-admin` and `readonly` hold: one more each) and the Agent page's seven hand-over routes
-    /// (`agent.serve`, which `owner` and `agent` alone hold: seven more each).
+    /// (`agent.serve`, which `owner` and `agent` alone hold: seven more each). The plugin screens' scoped AI completion adds three routes
+    /// (the sources read, `ai.read`, and the completion and its cancel, `ai.use`): the nine presets that hold both scopes (`owner`, `agent`,
+    /// `flows`, `flows-host`, `flows-web`, `formlogic`, `cli`, `cli-admin`, `run`) reach three more each, and no other preset holds either.
     #[test]
     fn what_each_preset_reaches_of_the_routes_that_existed() {
         let reaches: Vec<(&str, usize)> = ALL_PRESETS
@@ -629,18 +631,18 @@ mod tests {
         assert_eq!(
             reaches,
             [
-                ("owner", 165 + 11 + 8),
-                ("agent", 78 + 5 + 7),
-                ("flows", 64),
-                ("flows-host", 54),
-                ("flows-web", 38),
-                ("formlogic", 36),
-                ("cli", 75 + 1),
-                ("cli-admin", 86 + 1),
+                ("owner", 165 + 11 + 8 + 3),
+                ("agent", 78 + 5 + 7 + 3),
+                ("flows", 64 + 3),
+                ("flows-host", 54 + 3),
+                ("flows-web", 38 + 3),
+                ("formlogic", 36 + 3),
+                ("cli", 75 + 1 + 3),
+                ("cli-admin", 86 + 1 + 3),
                 ("mcp", 7),
                 ("readonly", 28 + 1),
                 ("companion", 17 + 4),
-                ("run", 32),
+                ("run", 32 + 3),
                 ("ceremony", 4),
             ]
         );
