@@ -258,6 +258,15 @@ receipt's check, the offer's window with and without a key expiry, the relay the
 Gaps and disagreements found while building and testing this. The contract (`platform/protocol/relay/v1`, `platform/relay`) is not changed by this crate; what needs a change there is
 marked **relay** or **protocol**.
 
+**Since this branch was cut (`e0eb2e96`), `origin/main` has taken findings 1 to 4** (the relay returns `receipt.grants`, `972f0c31`; the integer rule and real dates only in the poll rules and both
+readers, `369fdcd6`; the three read budgets and the client's pacing, `21c3ad8c`; plain http outside the schemas, `0638478f`; the same five are in `05ad1f0a`). This branch does not contain them. When
+the two meet, the crate needs these changes, which were made and run in a throwaway merge (314 tests pass there, the 13 differential drivers aside): `parse_http_date` refuses a date that does
+not exist (day within its month, hour 00 to 23, minute 00 to 59, second 00 to 60, year 0001 to 9999) where it now adds an out-of-range field as it stands; `tests/poll_fixture.rs` pins the new
+table (162 cases); the pairing wait pauses `max(10, Retry-After)` after a `429` and, after a granted hold when `info.wait.max` is below ten seconds, the difference to ten; the test of the whole
+pairing from the real relay's grants (`relay_php.rs`) is no longer `#[ignore]`d and compares the grants sorted (the relay returns them sorted); the ceremony test that adds a `grants` member
+to the receipt replaces the recorded one; the reviewer's poll implementation refuses year 0000 and the differentials script drops its `lenient_date` flag. The findings below stay as they were
+written for the branch.
+
 1. **The receipt covers the grants, and the relay does not return them to the phone. (Decided: the relay returns `receipt.grants`. Relay change.)** The desktop signs the grants into
    the receipt, but `GET /v1/pair/{pid}` answers with `receipt: {issuedAt, signature}` only (`platform/relay/src/Pairing.php`: `approval()` verifies the grants and keeps `issuedAt` and
    `signature`). The change is small and safe, because the signature covers the grants and the schema allows extra members: **relay** `Pairing.php:343-345` (store the sorted grants in
