@@ -772,3 +772,82 @@ fn sealed_tokens_three_open_ten_do_not() {
     let a_token_and_more = b64::encode(&recipient.public_key().seal(b"oaiyrt1.AQIDBAUGBwg.ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8\n").unwrap());
     assert!(sealed::open_token(&recipient, &a_token_and_more).is_err());
 }
+
+#[test]
+fn a_typed_code_has_one_spelling_the_two_unused_bits_of_the_26th_character_are_zero() {
+    let good = vectors().s("A3.expected.typedCode").to_string();
+    let chars: Vec<char> = good.chars().filter(|c| *c != '-').collect();
+    let alphabet: Vec<char> = String::from_utf8(math::CROCKFORD.to_vec()).unwrap().chars().collect();
+    let value = alphabet.iter().position(|c| *c == chars[25]).unwrap();
+    assert_eq!(value & 3, 0, "the 26th character of a code this crate writes ends in two zero bits");
+    for flip in 1..4 {
+        let mut t = chars.clone();
+        t[25] = alphabet[value | flip];
+        // The 128 bits of the secret are the same and so are the two check characters: only the spelling differs, and a second spelling of one secret is refused.
+        assert!(math::parse_typed_code(&t.iter().collect::<String>()).is_err(), "unused bits {flip}");
+    }
+}
+
+#[test]
+fn the_edges_the_recorded_vectors_leave_open_a_nonce_of_another_size_and_a_lifetime_one_second_too_long() {
+    let v = vectors();
+    // A proof that verifies, for a nonce of the wrong size, is refused for the size and for nothing else: the same proof procedure is good for 16 and 32 bytes.
+    let a = v.at("A6b");
+    let body = a.s("expected.bodyText").as_bytes();
+    let relay = signer(v.s("keys.ed25519Seeds.relay"));
+    let pinned = v.s("keys.ed25519Public.relay.thumbprint");
+    let digest = sha256(body);
+    for (len, good) in [(15usize, false), (16, true), (32, true), (33, false)] {
+        let nonce = vec![7u8; len];
+        let proof = relay.sign_b64u(SignDomain::InfoProof, &[&nonce[..], &digest[..], b"1790000000".as_slice()]);
+        assert_eq!(info::verify_proof(body, &nonce, "1790000000", &proof, pinned).is_ok(), good, "a nonce of {len} bytes");
+    }
+    // The wait of an info is 300 seconds at most, each of the two on its own.
+    let text = a.s("expected.bodyText");
+    let wait = "\"wait\":{\"default\":20,\"max\":20,";
+    assert!(text.contains(wait));
+    for (replacement, good) in [
+        ("\"wait\":{\"default\":300,\"max\":300,", true),
+        ("\"wait\":{\"default\":301,\"max\":300,", false),
+        ("\"wait\":{\"default\":300,\"max\":301,", false),
+    ] {
+        assert_eq!(Info::parse(text.replace(wait, replacement).as_bytes()).is_ok(), good, "{replacement}");
+    }
+    // A ticket lives 300 seconds at most.
+    let provider = signer(v.s("keys.ed25519Seeds.provider")).verify_key();
+    let claims = ticket::verify_signature(v.s("A9.expected.ticket"), &provider).unwrap();
+    let ok = ticket::Context { relay_id: v.s("keys.ids.relay"), desktop: v.s("keys.ids.desktopDevice"), provider_now: 1_790_000_100 };
+    assert_eq!(claims.exp - claims.iat, 300);
+    claims.check(&ok).unwrap();
+    assert!(ticket::Claims { exp: claims.exp + 1, ..claims.clone() }.check(&ok).is_err(), "exp - iat of 301");
+    // A rotation statement lives 24 hours at most: the statement of the vector, re-signed by the pinned key with the one second added, is refused.
+    let old = signer(v.s("keys.ed25519Seeds.provider"));
+    let statement = v.s("A10.expected.statementText");
+    let resign = |text: &str| (b64::encode(text.as_bytes()), old.sign_b64u(SignDomain::ProviderRotate, &[text.as_bytes()]));
+    let (b, s) = resign(statement);
+    assert_eq!(s, v.s("A10.expected.signature"), "Ed25519 is deterministic: the re-signed vector is the vector");
+    rotation::verify(&old.verify_key(), 0, 1_790_000_100, &b, &s).unwrap();
+    let longer = statement.replace("\"exp\":1790086400", "\"exp\":1790086401");
+    assert_ne!(longer, statement);
+    let (b, s) = resign(&longer);
+    assert!(rotation::verify(&old.verify_key(), 0, 1_790_000_100, &b, &s).is_err(), "a statement that lives 86,401 seconds");
+}
+
+#[test]
+fn an_ed25519_key_in_a_non_canonical_encoding_is_refused_though_it_names_a_good_point() {
+    // For y below 19 the numbers y and y + p are the same field element, so `y + p` is a second spelling of the same point; only the first is canonical.
+    let mut tried = 0;
+    for y in 2u8..19 {
+        let mut canonical = [0u8; 32];
+        canonical[0] = y;
+        if VerifyKey::from_bytes(&canonical).is_err() {
+            continue; // not a point, or a point of small order
+        }
+        let mut second = [0xffu8; 32];
+        second[0] = 0xed + y;
+        second[31] = 0x7f;
+        assert!(VerifyKey::from_bytes(&second).is_err(), "y + p for y = {y}");
+        tried += 1;
+    }
+    assert!(tried >= 5, "{tried} of the small y values name a point of the prime-order group");
+}

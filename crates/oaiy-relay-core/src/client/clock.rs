@@ -224,6 +224,18 @@ mod tests {
     }
 
     #[test]
+    fn the_median_is_over_the_last_five_samples_and_two_wild_ones_do_not_move_it() {
+        let mut c = OffsetClock::new();
+        // Offsets 10, 10, 500, 500, 10: the median of five is 10 (the median of the last three would be 500).
+        for (i, off) in [10i64, 10, 500, 500, 10].iter().enumerate() {
+            c.observe(1000 + i as i64 + off, 1000 + i as i64, s(i as u64));
+        }
+        assert_eq!(c.median(), 10);
+        // A sixth sample pushes the oldest out: 10, 500, 500, 10, 500.
+        c.observe(1005 + 500, 1005, s(5));
+        assert_eq!(c.median(), 500);
+    }
+    #[test]
     fn the_applied_offset_slews_by_at_most_a_second_a_minute() {
         let mut c = OffsetClock::new();
         c.observe(1000, 1000, s(0));

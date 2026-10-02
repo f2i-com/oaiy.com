@@ -628,6 +628,15 @@ mod tests {
     }
 
     #[test]
+    fn every_control_character_below_0x20_is_refused_raw_in_a_string_and_0x20_is_not() {
+        for c in 0u8..0x20 {
+            assert_eq!(parse(&[b'"', c, b'"']), Err(JsonError::Control), "0x{c:02x}");
+        }
+        assert_eq!(parse(b"\" \""), Ok(Json::Str(" ".into())));
+        // Escaped, the same characters are fine.
+        assert_eq!(parse(br#""\u001f""#), Ok(Json::Str("\u{1f}".into())));
+    }
+    #[test]
     fn duplicate_names_are_refused_at_any_depth_and_any_size() {
         assert_eq!(parse(br#"{"a":1,"a":2}"#), Err(JsonError::DuplicateKey));
         assert_eq!(parse(br#"{"x":{"a":1,"b":2,"a":3}}"#), Err(JsonError::DuplicateKey));
