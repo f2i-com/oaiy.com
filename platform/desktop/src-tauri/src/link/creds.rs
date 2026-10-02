@@ -68,8 +68,12 @@ pub enum CredError {
     NoCredentialForOrigin { kind: CredKind, origin: String },
     /// The URL is not an origin a credential can be bound to: it is not http or https, or it has no host.
     NotAnOrigin(String),
-    /// The URL carries a user name or a password. `https://relay.example.com@evil.test/` reads as the relay to
-    /// a person and goes to evil.test; none is accepted, whatever host it names.
+    /// The URL given to [`Creds::register`] or [`Creds::for_url`] carries a user name or a password.
+    /// `https://relay.example.com@evil.test/` reads as the relay to a person and goes to evil.test; none is
+    /// accepted, whatever host it names. It does NOT arise from a request made with [`AuthedRequest::with_creds`]:
+    /// reqwest takes the user name and password out of a request's URL when it builds the request and puts them in a
+    /// Basic `Authorization` header, which `with_creds` replaces with the credential it chose (so a request never
+    /// carries both).
     UserInfo,
     /// A credential of this kind is registered for this origin already.
     Duplicate { kind: CredKind, origin: String },
@@ -90,7 +94,7 @@ impl std::fmt::Display for CredError {
                 write!(f, "no {} credential is held for {origin}, so nothing was sent", kind.name())
             }
             CredError::NotAnOrigin(why) => write!(f, "that address is not one a credential can be sent to ({why})"),
-            CredError::UserInfo => write!(f, "an address with a user name or a password in it is never sent a credential"),
+            CredError::UserInfo => write!(f, "an address with a user name or a password in it is never given a credential to hold or to send"),
             CredError::Duplicate { kind, origin } => write!(f, "a {} credential is held for {origin} already", kind.name()),
             CredError::RelayOriginShared { origin } => {
                 write!(f, "{origin} is shared with another credential, and a relay's own hostname is never shared: give the relay a hostname of its own")
@@ -257,9 +261,10 @@ const USER_AGENT: &str = concat!("oaiy-desktop/", env!("CARGO_PKG_VERSION"));
 
 /// A blocking client as a credentialed lane keeps it: the settings every lane shares ([`super::net::blocking_builder`]),
 /// and redirects OFF, so a server a credential was given to cannot send it on to another by a redirect (a client that
-/// follows one drops the header only for another host or port; a change of scheme alone keeps it); a user agent that
-/// is the same everywhere; and no cookie store (the client is built without that feature, and the tests look for the
-/// header). The credential is not on the client: it goes on each request ([`AuthedRequest`]).
+/// follows one drops the header when the host or the port (the scheme's own, if none is written) changes, which a change
+/// of scheme alone does not: `https://h:8443` to `http://h:8443` keeps it); a user agent that is the same everywhere;
+/// and no cookie store (the client is built without that feature, and the tests look for the header). The credential is
+/// not on the client: it goes on each request ([`AuthedRequest`]).
 pub fn client_builder(keep: Keep) -> reqwest::blocking::ClientBuilder {
     super::net::blocking_builder(keep).redirect(reqwest::redirect::Policy::none()).user_agent(USER_AGENT)
 }
@@ -470,8 +475,9 @@ mod tests {
     #[test]
     fn a_credentialed_client_follows_no_redirect_sends_one_user_agent_and_keeps_no_cookie() {
         // The credential went to the server the request was for; a server that answers with a redirect does not get
-        // to move it. (A client that follows one drops the header for another host or port and keeps it for a change
-        // of scheme alone; this one does not follow at all.)
+        // to move it. (A client that follows one drops the header when the host or the port changes, the scheme's own
+        // port when none is written, and keeps it when only the scheme does and the port is written the same; this
+        // one does not follow at all.)
         let elsewhere = Provider::start(|_| Reply::ok("{}"));
         let moved_to = format!("{}/moved", elsewhere.base);
         let home = Provider::start(move |req| {
@@ -517,6 +523,32 @@ mod tests {
         let request = building().apply(auth).unwrap().build().unwrap();
         let held: Vec<&HeaderValue> = request.headers().get_all(AUTHORIZATION).iter().collect();
         assert!(held.len() == 1 && held[0] == "Bearer flk_SECRET" && held[0].is_sensitive(), "{held:?}");
+    }
+
+    #[test]
+    fn a_request_whose_url_has_a_user_name_and_password_never_carries_both_them_and_the_credential() {
+        // reqwest takes the user name and password out of a URL when the request is built and makes a Basic
+        // `Authorization` header of them. The credential replaces that header, so what reaches the server is the
+        // credential alone, and the password is on no header at all.
+        let server = Provider::start(|_| Reply::ok("{}"));
+        let mut creds = Creds::default();
+        creds.register(CredKind::Provider, &server.base, "flk_RIGHT").unwrap();
+        let http = client_builder(Keep::Between).build().unwrap();
+        let with_userinfo = format!("http://user:hunter2@{}/x", server.base.trim_start_matches("http://"));
+
+        let request = http.get(&with_userinfo).with_creds(&creds, CredKind::Provider).unwrap().build().unwrap();
+        let held: Vec<&HeaderValue> = request.headers().get_all(AUTHORIZATION).iter().collect();
+        assert!(held.len() == 1 && held[0] == "Bearer flk_RIGHT", "the credential alone: {held:?}");
+        assert!(request.url().username().is_empty() && request.url().password().is_none(), "and nothing of it is left in the address: {}", request.url());
+
+        http.get(&with_userinfo).with_creds(&creds, CredKind::Provider).unwrap().send().unwrap();
+        let seen = server.requests();
+        assert_eq!(seen[0].header("authorization"), Some("Bearer flk_RIGHT"));
+        assert!(!seen[0].target.contains("hunter2") && !seen[0].headers.values().any(|v| v.contains("hunter2") || v.contains("dXNlcjpodW50ZXIy")), "{:?}", seen[0]);
+
+        // Asked for by URL, which is how a base address is registered, userinfo is refused: that is where `UserInfo` arises.
+        assert_eq!(asked(&creds, &with_userinfo, CredKind::Provider), Err(CredError::UserInfo));
+        assert_eq!(Creds::default().register(CredKind::Provider, &with_userinfo, "flk_x"), Err(CredError::UserInfo));
     }
 
     /// The lanes that have been converted, with their source: a lane here applies no credential of its own.
