@@ -337,16 +337,24 @@ fn make_room_aside(path: &Path, name: &str) -> io::Result<()> {
 /// desktop starts, and a file a scanner has open must not hold the start for as long as a wait takes. For a file that a
 /// person asked to be moved (a link made or forgotten) see [`keep_aside_waiting`].
 pub fn keep_aside(path: &Path) -> io::Result<PathBuf> {
-    keep_aside_by(path, |from, to| std::fs::rename(from, to))
+    keep_aside_by(path, |from, to| std::fs::rename(from, to), true)
 }
 
 /// [`keep_aside`], waiting for a file that another program holds for a moment (a scanner, an indexer) as [`write`] waits for
-/// its target, up to about a second and a half, and moved rather than copied when it is let go of.
+/// its target, up to about a second and a half, and moved rather than copied when it is let go of. It still copies a file that
+/// cannot be moved in the end, which is right for a file that the store writes over next.
 pub fn keep_aside_waiting(path: &Path) -> io::Result<PathBuf> {
-    keep_aside_by(path, rename_over)
+    keep_aside_by(path, rename_over, true)
 }
 
-fn keep_aside_by(path: &Path, rename: impl Fn(&Path, &Path) -> io::Result<()>) -> io::Result<PathBuf> {
+/// [`keep_aside_waiting`] for a file that is to be gone from where it is (a link that is forgotten): it is moved or it is an
+/// error, and never copied. A copy beside an original that stays is a second copy of what the caller meant to be rid of,
+/// and a caller that took the answer for "it is gone" left a valid key in the folder.
+pub fn move_aside_waiting(path: &Path) -> io::Result<PathBuf> {
+    keep_aside_by(path, rename_over, false)
+}
+
+fn keep_aside_by(path: &Path, rename: impl Fn(&Path, &Path) -> io::Result<()>, copy_what_cannot_be_moved: bool) -> io::Result<PathBuf> {
     let name = path
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("{} has no file name", path.display())))?
@@ -364,6 +372,7 @@ fn keep_aside_by(path: &Path, rename: impl Fn(&Path, &Path) -> io::Result<()>) -
     };
     match rename(path, &aside) {
         Ok(()) => Ok(aside),
+        Err(rename_failed) if !copy_what_cannot_be_moved => Err(rename_failed),
         Err(rename_failed) => match std::fs::copy(path, &aside) {
             Ok(_) => Ok(aside),
             Err(_) => Err(rename_failed),
@@ -839,6 +848,26 @@ mod tests {
         assert_eq!(std::fs::read(&aside).unwrap(), [0xC3, 0x28, 0x29], "a copy is kept");
         assert!(path.exists(), "and the original is where it was");
         drop(held);
+    }
+
+    /// What the caller says it is going to do with the file decides what a move that cannot be made becomes: a file that is written
+    /// over next is copied (it is safe to replace once a copy exists), and one that is to be gone from where it is is an error, with
+    /// nothing copied and the original as it was.
+    #[test]
+    fn a_file_that_cannot_be_moved_is_copied_only_for_a_caller_that_writes_over_it() {
+        let dir = TempDir::new("aside-move-or-copy");
+        let path = dir.0.join("account.json");
+        std::fs::write(&path, "the key").unwrap();
+        let denied = |_: &Path, _: &Path| Err(io::Error::new(io::ErrorKind::PermissionDenied, "held"));
+
+        let refused = keep_aside_by(&path, denied, false).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "the key", "the original is as it was");
+        assert!(!dir.0.join("account.json.corrupt").exists(), "and nothing was copied");
+
+        let aside = keep_aside_by(&path, denied, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&aside).unwrap(), "the key", "a copy is kept for a caller that writes over it");
+        assert!(path.exists(), "and the original stays");
     }
 
     /// A scanner holds a file for a moment: it is moved aside when the hold is let go, as a write waits for its target,
