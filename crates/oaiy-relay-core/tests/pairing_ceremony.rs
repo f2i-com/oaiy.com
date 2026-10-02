@@ -576,6 +576,7 @@ fn a_receipt_that_covers_other_grants_than_the_phone_was_told_pairs_nothing() {
     // the desktop signed fails the receipt.
     let (_r, result) = phone_reads_the_outcome(|s| {
         if let Json::Obj(m) = slot(s.get_mut(5).unwrap(), "response.body.receipt") {
+            m.retain(|(k, _)| k != "grants");
             m.push(("grants".to_string(), Json::Arr(vec![Json::str("state_read")])));
         }
     });

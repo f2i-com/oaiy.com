@@ -527,11 +527,10 @@ fn a_response_the_desktop_rejected_is_answered_afresh_and_accepted_under_the_ids
     };
     assert_eq!(paired.profile.grants, grants);
 }
-/// TODO (after the relay change merges): the relay returns `receipt.grants` in `GET /v1/pair/{pid}` (a separate branch; `platform/relay/src/Pairing.php` keeps the verified grants of an
-/// approval and drops them from the stored receipt), and the phone then verifies the receipt from them and pairs with no out-of-band grants at all. This is the test that pins that;
-/// it fails against today's relay, which is why it is ignored. Un-ignore it when the change has merged, and then the `relay_returns_grants` branch above is the only one left.
+/// The relay returns `receipt.grants` in `GET /v1/pair/{pid}` (`platform/relay/src/Pairing.php`, sorted: the set the desktop signed), and the phone then verifies the receipt from them and
+/// pairs with no out-of-band grants at all. This is the test that pins that, against the real relay; the `relay_returns_grants` branch of the whole-pairing test above is the other
+/// one that is left.
 #[test]
-#[ignore = "waits for the relay change: GET /v1/pair/{pid} returning receipt.grants (relay branch, Pairing.php approval()); un-ignore when it merges"]
 fn the_phone_pairs_from_the_grants_the_real_relay_returns_with_the_receipt() {
     let Some(real) = start(4, 2) else { return };
     let (dclient, dtoken, profile, host, host_x) = real.enrol_desktop();
@@ -558,7 +557,11 @@ fn the_phone_pairs_from_the_grants_the_real_relay_returns_with_the_receipt() {
     let grants: Vec<String> = ["state_read", "rtc_signal"].iter().map(|g| g.to_string()).collect();
     desktop.confirm_sas(&dclient, &dtoken, &offer.pid, &sas.display(), &grants, &Cancel::new()).unwrap();
     match phone.wait_outcome(None, &Cancel::new()) {
-        Ok(Outcome::Paired(p)) => assert_eq!(p.profile.grants, grants),
-        other => panic!("the phone did not pair from the receipt''s grants: {:?}", other.err()),
+        Ok(Outcome::Paired(p)) => {
+            let mut want = grants.clone();
+            want.sort();
+            assert_eq!(p.profile.grants, want, "the relay returns the signed set, sorted");
+        }
+        other => panic!("the phone did not pair from the receipt's grants: {:?}", other.err()),
     }
 }
