@@ -575,6 +575,25 @@ describe('ConnectionsPanel · Linked account', () => {
     expect(container.querySelector('[data-copies-left]')).toBeNull();
   });
 
+  it('does not send Remove copies again while it is running', async () => {
+    const left = { file: 'link/account.json', message: 'Disconnected, but a copy of the old key could not be removed: account.json.corrupt (held). Close the program that holds it and press Remove copies.', kind: 'copiesLeft' };
+    linkStatusMock.mockResolvedValue({ ...IDLE, linkError: left });
+    let release: (status: unknown) => void = () => {};
+    removeCopiesMock.mockReturnValue(new Promise((resolve) => { release = resolve; }));
+    await mount();
+
+    await click('Remove copies');
+    const running = Array.from(container.querySelectorAll('button')).find((b) => b.textContent?.trim() === 'Removing…');
+    expect(running?.disabled).toBe(true);
+    await act(async () => {
+      running?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    expect(removeCopiesMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => release(IDLE));
+    expect(container.querySelector('[data-copies-left]')).toBeNull();
+  });
+
   it('shows the host’s answer when Remove copies cannot even be asked, and keeps the button', async () => {
     const left = { file: 'link/account.json', message: 'Disconnected, but a copy of the old key could not be removed: account.json.corrupt (held). Close the program that holds it and press Remove copies.', kind: 'copiesLeft' };
     linkStatusMock.mockResolvedValue({ ...IDLE, linkError: left });
