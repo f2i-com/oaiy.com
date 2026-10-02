@@ -340,6 +340,16 @@ impl StubRelay {
             self.0.cv.notify_all();
             return ok(Json::obj([("v", Json::int(1)), ("state", Json::str("denied")), ("time", Json::int(now))]));
         }
+        if p.state == PState::Approved {
+            // The same approval again (the desktop's outbox retries) answers the same; one for another key is a conflict (Pairing::decide of the relay).
+            let thumb = doc.get("phone").and_then(|p| p.get_str("thumbprint")).unwrap_or("");
+            let device = p.phone_dev.clone().unwrap_or_default();
+            let same = !thumb.is_empty() && st.devices.iter().find(|d| d.id == device).and_then(|d| d.thumbprint.as_deref()) == Some(thumb);
+            if !same {
+                return err(409, "conflict", "This rendezvous was approved for another phone.");
+            }
+            return ok(Json::obj([("v", Json::int(1)), ("state", Json::str("approved")), ("deviceId", Json::str(device)), ("time", Json::int(now))]));
+        }
         if p.state != PState::Answered {
             return err(409, "conflict", "There is no response to approve.");
         }

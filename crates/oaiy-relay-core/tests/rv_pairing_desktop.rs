@@ -508,7 +508,6 @@ fn attack_the_lower_level_retry_of_a_failed_decision_works_and_sends_the_same_re
 }
 
 #[test]
-#[ignore = "finding: pair_decision, pair_reject and pair_burn put the pid into the path without validating it"]
 fn finding_the_desktops_three_pairing_calls_do_not_validate_the_pid_they_put_in_the_path() {
     // `pair_create`, `pair_fetch` and `pair_respond` refuse a pid that is not 22 characters of the alphabet; these three, which carry the desktop's token, do not (and
     // `DesktopPairing::burn` passes whatever it is given, pending or not).
@@ -523,7 +522,6 @@ fn finding_the_desktops_three_pairing_calls_do_not_validate_the_pid_they_put_in_
 }
 
 #[test]
-#[ignore = "finding: the stub answers 409 to the same approval again, the real relay 200 (README 10.1 table)"]
 fn finding_the_stub_does_not_answer_the_same_approval_again_as_the_relay_does() {
     let mut w = world(quick());
     let offer = w.new_offer();

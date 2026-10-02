@@ -42,14 +42,12 @@ fn a_plain_ticket_verifies() {
 }
 
 #[test]
-#[ignore = "low: ticket-claims.schema.json allows a sub of 64 characters; ticket.rs:102 counts bytes (30 CJK characters are 90 bytes)"]
 fn a_sub_of_thirty_cjk_characters_is_within_the_schema() {
     let (t, k) = ticket_with(&"\u{65e5}".repeat(30), "https://app.example.com");
     assert!(ticket::verify_signature(&t, &k).is_ok());
 }
 
 #[test]
-#[ignore = "low: ticket.rs:96-99 accepts an org such as https://a:b: or https://a: that the schema's origin pattern ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ refuses"]
 fn an_org_that_is_not_an_origin_is_refused() {
     for org in ["https://a:", "https://a:b:c", "https://a:123456789", "https://:", "https://a:-"] {
         let (t, k) = ticket_with("member-42", org);

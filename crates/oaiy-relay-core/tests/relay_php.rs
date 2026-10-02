@@ -347,17 +347,25 @@ fn a_whole_pairing_between_the_desktop_party_and_the_phone_party_on_the_real_rel
     let approved = desktop.confirm_sas(&dclient, &dtoken, &offer.pid, &sas.display(), &grants, &Cancel::new()).unwrap();
     let SasOutcome::Approved { device_id } = approved else { panic!("{approved:?}") };
 
-    // The finding, on the real relay: the receipt covers the grants and the relay's answer to the phone does not carry them, so the phone cannot verify it by itself and fails closed.
-    assert_eq!(
-        phone.wait_outcome(None, &Cancel::new()).err(),
-        Some(PairingError::ReceiptGrantsUnknown),
-        "the real relay returns {{issuedAt, signature}} only"
-    );
-    // With the grants the desktop approved, from a source the relay cannot forge (here: the test), the receipt verifies and the real sealed token opens.
-    let paired = match phone.wait_outcome(Some(&grants), &Cancel::new()).unwrap() {
-        Outcome::Paired(p) => p,
-        _ => panic!("not paired"),
+    // The finding, on the real relay (README 10.1; decision: the relay will return `receipt.grants`): the receipt covers the grants, and until the relay's answer to the phone carries
+    // them the phone cannot verify it by itself and fails closed. This asserts what the relay does today, and what it will do once the change has merged: whichever it is, the phone
+    // must end up paired with the grants the desktop signed (see also the ignored test below, which pins the changed relay alone).
+    let relay_returns_grants = pclient.pair_fetch(phone.pid(), None, None, &Cancel::new()).unwrap().receipt.and_then(|r| r.grants).is_some();
+    let first = phone.wait_outcome(None, &Cancel::new());
+    let paired = if relay_returns_grants {
+        match first {
+            Ok(Outcome::Paired(p)) => p,
+            other => panic!("the relay returns the receipt's grants and the phone did not pair from them: {:?}", other.err()),
+        }
+    } else {
+        assert_eq!(first.err(), Some(PairingError::ReceiptGrantsUnknown), "the real relay returns {{issuedAt, signature}} only");
+        // With the grants the desktop approved, from a source the relay cannot forge (here: the test), the receipt verifies and the real sealed token opens.
+        match phone.wait_outcome(Some(&grants), &Cancel::new()).unwrap() {
+            Outcome::Paired(p) => p,
+            _ => panic!("not paired"),
+        }
     };
+    assert_eq!(paired.profile.grants.len(), grants.len());
     assert_eq!(paired.profile.device_id, device_id);
     store_paired(&paired, &MemorySecretStore::new(), &MemoryProfileStore::new()).unwrap();
 
@@ -380,6 +388,14 @@ fn a_whole_pairing_between_the_desktop_party_and_the_phone_party_on_the_real_rel
         )
         .expect("a mobile admission from the real relay");
     assert_eq!(admission.scopes, grants);
+    // The same through the profile, which also compares the answer with what the owner approved: the grants of the receipt and the desktop that was pinned.
+    std::thread::sleep(Duration::from_millis(300));
+    let checked = pclient
+        .admission_for_profile(&paired.token, &paired.profile, &holder, Some("Test phone"), &Cancel::new())
+        .expect("the real relay's admission is what the owner approved");
+    assert_eq!(checked.scopes, grants);
+    assert!(admission.check_against(&["state_read".to_string()], &identity.endpoint.thumbprint()).is_err(), "other grants than the admission's");
+    assert!(admission.check_against(&grants, &host.thumbprint()).is_err(), "another desktop than the one the relay names");
     assert!(admission.relay.as_ref().is_some_and(|r| r.poll_mode), "this host passed no streaming probe: the relay offers the poll mode");
     assert_eq!(admission.expected_peer_thumbprint, identity.endpoint.thumbprint(), "the relay's record of the desktop it was paired with");
     // The plugin's admission with the desktop's token, with the roster of the one phone.
@@ -461,4 +477,88 @@ fn a_whole_pairing_between_the_desktop_party_and_the_phone_party_on_the_real_rel
     let late = PairingTarget::from_input(PairingInput::Key(&offer.pairing_uri)).unwrap();
     let mut again = PhonePairing::new(real.client(None, 5), late, oaiy_relay_core::pairing::phone::new_identity(None).unwrap()).unwrap();
     assert!(again.fetch_offer(&Cancel::new()).is_err());
+}
+
+#[test]
+fn a_response_the_desktop_rejected_is_answered_afresh_and_accepted_under_the_ids_the_real_relay_gives() {
+    let Some(real) = start(4, 2) else { return };
+    let (dclient, dtoken, profile, host, host_x) = real.enrol_desktop();
+    let identity = Arc::new(DesktopIdentity {
+        device_id: profile.device_id.clone(),
+        name: "Front desk PC".into(),
+        endpoint: Signer::generate().unwrap(),
+        endpoint_x25519: X25519Secret::generate().unwrap().public_key(),
+        host_ed25519: host.verify_key(),
+        host_x25519: host_x.public_key(),
+    });
+    let mut desktop = DesktopPairing::new(identity, "aokie", profile.relay.clone(), &profile.relay_thumbprint);
+    let offer = desktop.create_offer(dclient.relay_now_or_local()).unwrap();
+    desktop.open(&dclient, &dtoken, &offer, &Cancel::new()).unwrap();
+    let target = PairingTarget::from_input(PairingInput::Key(&offer.pairing_uri)).unwrap();
+    let mut phone =
+        PhonePairing::new(real.client(None, 3), target, oaiy_relay_core::pairing::phone::new_identity(Some("Test phone")).unwrap()).unwrap();
+    phone.fetch_offer(&Cancel::new()).unwrap();
+    let first_sas = phone.respond(&Cancel::new()).unwrap();
+    // The desktop's poll delivers the response under the pid; the desktop returns the rendezvous to `open` (it could not take the response: its window, say).
+    let mut since = 0u64;
+    let items: Vec<Item> = pair_items(&dclient, &dtoken, &mut since).into_iter().filter(|i| i.lane == "pair").collect();
+    assert_eq!(
+        items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+        [offer.pid.as_str()],
+        "the first response is the item with the pid as its id"
+    );
+    dclient.pair_reject(&dtoken, &offer.pid, "window", &Cancel::new()).unwrap();
+    // The phone is told, answers afresh (new claims, signature and MAC: not the text that was rejected), and the relay delivers it under the next id of the rendezvous.
+    assert!(matches!(phone.wait_outcome(None, &Cancel::new()).unwrap(), Outcome::Rejected));
+    let second_sas = phone.respond(&Cancel::new()).unwrap();
+    assert_eq!(first_sas.display(), second_sas.display(), "the same keys and the same offer: the same code");
+    let items: Vec<Item> = pair_items(&dclient, &dtoken, &mut since).into_iter().filter(|i| i.lane == "pair").collect();
+    assert_eq!(items.iter().map(|i| i.id.clone()).collect::<Vec<_>>(), [format!("{}.2", offer.pid)], "the second response is the item `pid.2`");
+    let event = desktop.on_pair_item(&dclient, &dtoken, &items[0], &Cancel::new()).unwrap();
+    assert!(matches!(event, PairEvent::AwaitingSas { .. }), "the desktop takes the second response: {event:?}");
+    let grants: Vec<String> = ["state_read"].iter().map(|g| g.to_string()).collect();
+    assert!(matches!(
+        desktop.confirm_sas(&dclient, &dtoken, &offer.pid, &second_sas.display(), &grants, &Cancel::new()).unwrap(),
+        SasOutcome::Approved { .. }
+    ));
+    let paired = match phone.wait_outcome(Some(&grants), &Cancel::new()) {
+        Ok(Outcome::Paired(p)) => p,
+        other => panic!("{:?}", other.err()),
+    };
+    assert_eq!(paired.profile.grants, grants);
+}
+/// TODO (after the relay change merges): the relay returns `receipt.grants` in `GET /v1/pair/{pid}` (a separate branch; `platform/relay/src/Pairing.php` keeps the verified grants of an
+/// approval and drops them from the stored receipt), and the phone then verifies the receipt from them and pairs with no out-of-band grants at all. This is the test that pins that;
+/// it fails against today's relay, which is why it is ignored. Un-ignore it when the change has merged, and then the `relay_returns_grants` branch above is the only one left.
+#[test]
+#[ignore = "waits for the relay change: GET /v1/pair/{pid} returning receipt.grants (relay branch, Pairing.php approval()); un-ignore when it merges"]
+fn the_phone_pairs_from_the_grants_the_real_relay_returns_with_the_receipt() {
+    let Some(real) = start(4, 2) else { return };
+    let (dclient, dtoken, profile, host, host_x) = real.enrol_desktop();
+    let identity = Arc::new(DesktopIdentity {
+        device_id: profile.device_id.clone(),
+        name: "Front desk PC".into(),
+        endpoint: Signer::generate().unwrap(),
+        endpoint_x25519: X25519Secret::generate().unwrap().public_key(),
+        host_ed25519: host.verify_key(),
+        host_x25519: host_x.public_key(),
+    });
+    let mut desktop = DesktopPairing::new(identity, "aokie", profile.relay.clone(), &profile.relay_thumbprint);
+    let offer = desktop.create_offer(dclient.relay_now_or_local()).unwrap();
+    desktop.open(&dclient, &dtoken, &offer, &Cancel::new()).unwrap();
+    let target = PairingTarget::from_input(PairingInput::Key(&offer.pairing_uri)).unwrap();
+    let mut phone =
+        PhonePairing::new(real.client(None, 3), target, oaiy_relay_core::pairing::phone::new_identity(Some("Test phone")).unwrap()).unwrap();
+    phone.fetch_offer(&Cancel::new()).unwrap();
+    let sas = phone.respond(&Cancel::new()).unwrap();
+    let mut since = 0u64;
+    for i in pair_items(&dclient, &dtoken, &mut since).iter().filter(|i| i.lane == "pair") {
+        desktop.on_pair_item(&dclient, &dtoken, i, &Cancel::new()).unwrap();
+    }
+    let grants: Vec<String> = ["state_read", "rtc_signal"].iter().map(|g| g.to_string()).collect();
+    desktop.confirm_sas(&dclient, &dtoken, &offer.pid, &sas.display(), &grants, &Cancel::new()).unwrap();
+    match phone.wait_outcome(None, &Cancel::new()) {
+        Ok(Outcome::Paired(p)) => assert_eq!(p.profile.grants, grants),
+        other => panic!("the phone did not pair from the receipt''s grants: {:?}", other.err()),
+    }
 }

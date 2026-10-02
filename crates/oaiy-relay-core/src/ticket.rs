@@ -93,14 +93,21 @@ fn parse_claims(doc: &Json) -> Result<Claims> {
         org: text("org")?,
         eph: text("eph")?,
     };
-    let origin_ok = claims
-        .org
-        .strip_prefix("https://")
-        .is_some_and(|h| !h.is_empty() && h.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':')));
+    // `common#origin`: `^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$`.
+    let origin_ok = claims.org.strip_prefix("https://").is_some_and(|rest| {
+        let (host, port) = match rest.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (rest, None),
+        };
+        !host.is_empty()
+            && host.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+            && port.is_none_or(|p| (1..=5).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_digit()))
+    });
     if !ids::is_provider_id(&claims.iss)
         || !ids::is_relay_id(&claims.aud)
-        || !(1..=64).contains(&claims.sub.len())
-        || !(1..=64).contains(&claims.jti.len())
+        // `maxLength` of a JSON Schema counts characters, not bytes: a `sub` of thirty CJK characters is 90 bytes and within the schema.
+        || !(1..=64).contains(&claims.sub.chars().count())
+        || !(1..=64).contains(&claims.jti.chars().count())
         || claims.lane != "ai"
         || !ids::is_device_id(&claims.dev)
         || !origin_ok

@@ -587,8 +587,10 @@ fn attack_a_relay_that_answers_forever_cannot_keep_the_phone_waiting_past_the_of
     let outcome = p.wait_outcome(None, &cancel()).unwrap();
     assert!(matches!(outcome, Outcome::Expired));
     let gets = w.env.stub.log().iter().filter(|r| r.method == "GET" && r.target.starts_with("/v1/pair/")).count();
-    assert!((1000..=1800).contains(&gets), "{gets} requests for 1,500 seconds");
-    assert!(w.env.clock.sleeps().iter().all(|d| *d >= Duration::from_secs(1)), "never faster than a second");
+    // Changed with the pacing decision (an answer the relay did not hold is followed by a pause of about ten seconds, not one): this used to assert 1,000 to 1,800 requests, a
+    // second apart. The relay counts 60 reads of a rendezvous in its life, about ten seconds apart over its ten minutes.
+    assert!((120..=155).contains(&gets), "{gets} requests for 1,500 seconds");
+    assert!(w.env.clock.sleeps().iter().all(|d| *d >= Duration::from_secs(10)), "never faster than ten seconds after an answer that was not held");
 }
 
 // ------------------------------------------------------------------------------------------------------------------ what is stored, and in what order
@@ -755,7 +757,6 @@ fn attack_an_approved_answer_without_a_device_or_a_box_is_not_an_answer() {
 // ------------------------------------------------------------------------------------------------------------------ findings
 
 #[test]
-#[ignore = "finding: respond() after a reject re-sends the same, stale, claims"]
 fn finding_a_phone_that_is_rejected_answers_again_with_the_claims_it_had_and_so_is_rejected_again() {
     let mut w = world(quick());
     let offer = w.new_offer();
@@ -782,7 +783,6 @@ fn finding_a_phone_that_is_rejected_answers_again_with_the_claims_it_had_and_so_
 }
 
 #[test]
-#[ignore = "finding: wait_outcome has no pause when a relay answers a requested hold at once"]
 fn finding_a_relay_that_answers_a_hold_at_once_makes_the_phone_poll_without_a_pause() {
     let mut w = world(StubConfig { receipt_includes_grants: true, wait_default: 20, wait_max: 20, ..Default::default() });
     let offer = w.new_offer();
@@ -791,12 +791,13 @@ fn finding_a_relay_that_answers_a_hold_at_once_makes_the_phone_poll_without_a_pa
     p.respond(&cancel()).unwrap();
     w.env.clock.clear_sleeps();
     w.env.stub.clear_log();
-    // 300 answers of "still answered", each at once and each claiming the hold was granted (a proxy that does not hold, a relay behind a buffering CDN, a hostile relay).
-    w.env.stub.fail_next_on("/v1/pair/", 300, Fault::Respond(200, vec![], answered_body(&offer, true)));
+    // 100 answers of "still answered", each at once and each claiming the hold was granted (a proxy that does not hold, a relay behind a buffering CDN, a hostile relay). (Changed
+    // with the pacing decision: it used to be 300 answers and 250 pauses; 300 pauses of ten seconds are longer than the 1,500 seconds the phone waits at most.)
+    w.env.stub.fail_next_on("/v1/pair/", 100, Fault::Respond(200, vec![], answered_body(&offer, true)));
     w.env.stub.fail_next_on("/v1/pair/", 1, Fault::Respond(200, vec![], r#"{"v":1,"state":"denied","time":1}"#.into()));
     assert!(matches!(p.wait_outcome(None, &cancel()).unwrap(), Outcome::Denied));
     let gets = w.env.stub.log().iter().filter(|r| r.method == "GET" && r.target.contains("wait=20")).count();
-    assert_eq!(gets, 301);
+    assert_eq!(gets, 101);
     let sleeps = w.env.clock.sleeps().len();
-    assert!(sleeps >= 250, "{gets} requests in a row with {sleeps} pauses between them");
+    assert!(sleeps >= 90, "{gets} requests in a row with {sleeps} pauses between them");
 }

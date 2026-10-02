@@ -39,6 +39,10 @@ pub struct PhoneIdentity {
     pub display_name: Option<String>,
 }
 
+/// The pause between two reads of an answered rendezvous that the relay did not hold (README 10.1 and the relay's budgets: 30 requests a minute and address, 60 counted reads of
+/// one rendezvous while it is open or answered, which is about ten seconds apart over its ten minutes, and 10 outcome reads a minute).
+pub const UNHELD_PAIR_PAUSE_S: f64 = 10.0;
+
 /// What the owner gave: a scanned or pasted pairing key, or a typed code and the relay's host name. **Both hold the pairing secret**, so `Debug` prints their length and the host,
 /// and nothing of the secret.
 #[derive(Clone, Copy)]
@@ -69,6 +73,8 @@ pub struct PairingTarget {
     pub relay: RelayUrl,
     /// The thumbprint the relay's key must have, when the input carried it (a key does, a typed code does not).
     pub fingerprint: Option<String>,
+    /// When the key expires (`x`, relay time), when the input was a key that says: the phone judges it once it has the relay's time ([`PhonePairing::fetch_offer`]).
+    pub expires_at: Option<u64>,
     secret: PairingSecret,
 }
 
@@ -79,7 +85,7 @@ impl PairingTarget {
         match input {
             PairingInput::Key(uri) => {
                 let k = PairingKey::parse(uri)?;
-                Ok(PairingTarget { relay: k.relay, fingerprint: k.relay_thumbprint, secret: k.secret })
+                Ok(PairingTarget { relay: k.relay, fingerprint: k.relay_thumbprint, expires_at: k.expires_at, secret: k.secret })
             }
             PairingInput::Typed { code, host } => {
                 let secret = math::parse_typed_code(code)?;
@@ -87,7 +93,7 @@ impl PairingTarget {
                 // (a test build), and never otherwise.
                 let host = host.trim().trim_end_matches('/');
                 let relay = RelayUrl::parse(&if host.contains("://") { host.to_string() } else { format!("https://{host}") })?;
-                Ok(PairingTarget { relay, fingerprint: None, secret })
+                Ok(PairingTarget { relay, fingerprint: None, expires_at: None, secret })
             }
         }
     }
@@ -230,7 +236,12 @@ impl PhonePairing {
                 self.prove(cancel)?;
             }
         }
-        offer.check_window(self.client.relay_now_or_local())?;
+        let now = self.client.relay_now_or_local();
+        offer.check_window(now)?;
+        // The key's own expiry (`x`): a QR that was photographed and kept is no longer the way in, with the same 30 seconds of slack as the offer's window.
+        if self.target.expires_at.is_some_and(|x| (x as i64).saturating_add(crate::pairing::offer::SKEW_S) <= now) {
+            return Err(PairingError::Protocol(crate::Error::OutsideWindow("pairing key")));
+        }
         let summary = OfferSummary {
             relay_host: self.target.relay.host().to_string(),
             desktop_name: offer.desktop_name.clone(),
@@ -309,7 +320,9 @@ impl PhonePairing {
                 self.state = State::Done;
                 return Ok(Outcome::Expired);
             }
+            let asked_at = self.client.clock().monotonic();
             let reply = self.client.pair_fetch(&self.pid, Some(wait), Some(PairState::Answered), cancel);
+            let took = self.client.clock().monotonic().saturating_sub(asked_at);
             let pause = match reply {
                 Ok(f) if f.hold_refused_retry_after.is_some() && f.state == PairState::Answered => {
                     let r = f.hold_refused_retry_after.unwrap_or(2).clamp(1, 120);
@@ -324,12 +337,21 @@ impl PhonePairing {
                     failures = 0;
                     refusals = 0;
                     match f.state {
-                        // Held for `wait` seconds and unchanged: ask again at once. A relay that does not hold (`wait` 0, or a request answered at once) is a short poll, paced at the
-                        // poll gap and never faster than a second, so that an owner who takes minutes costs a request a second and not a spin.
-                        PairState::Answered if wait > 0 => 0.0,
-                        PairState::Answered => self.client.info().map_or(1.0, |i| (i.wait.poll_gap_ms as f64 / 1000.0).max(1.0)),
+                        // Held and unchanged: ask again at once, and only then. The relay says it held the request (`hold.granted`, not `superseded`) **and the request took as long
+                        // as a hold takes by the phone's own clock**: a relay or a proxy that answers at once and says it held (a buffering CDN, a hostile relay) is not believed. Any
+                        // other answer that leaves the rendezvous as it was is paced at [`UNHELD_PAIR_PAUSE_S`] with jitter: the relay counts 60 reads of a rendezvous in its life
+                        // (about 10 seconds apart over its 600) and 10 outcome reads a minute, so this is never a spin on anything that answers at once.
+                        PairState::Answered
+                            if wait > 0 && f.hold_granted && !f.hold_superseded && took.as_secs_f64() >= (wait as f64 / 2.0).min(10.0) =>
+                        {
+                            0.0
+                        }
+                        PairState::Answered => UNHELD_PAIR_PAUSE_S,
                         PairState::Open => {
+                            // The desktop returned the rendezvous to `open`. The claims that were rejected have lapsed or were refused: the phone answers afresh (`respond` builds new
+                            // claims, signs and MACs them again) and never sends the same text a second time.
                             self.state = State::Offered;
+                            self.response = None;
                             return Ok(Outcome::Rejected);
                         }
                         PairState::Denied => {
@@ -373,6 +395,8 @@ impl PhonePairing {
     fn accept(&self, f: &PairFetch, out_of_band: Option<&[String]>) -> Result<Paired, PairingError> {
         let offer = self.offer_ref()?;
         let receipt = f.receipt.as_ref().ok_or(PairingError::ReceiptInvalid)?;
+        // The grants the receipt covers: the ones the relay returns with it when it does (the signature protects them: a relay that lies about them fails the receipt below, and
+        // the caller's list is not consulted), else the caller's.
         let grants: Vec<String> = match (&receipt.grants, out_of_band) {
             (Some(g), _) => g.clone(),
             (None, Some(g)) => g.to_vec(),

@@ -102,7 +102,7 @@ MUTATIONS = [
     ("G16", "offer", "the key's relay fingerprint need not match the offer's", C + "pairing/phone.rs",
      "Some(f) if *f != offer.relay_fingerprint => {", "Some(f) if false && *f != offer.relay_fingerprint => {", "own"),
     ("G17", "offer", "an offer outside its window is accepted", C + "pairing/phone.rs",
-     "offer.check_window(self.client.relay_now_or_local())?;", "let _ = offer.check_window(self.client.relay_now_or_local());", "own"),
+     "offer.check_window(now)?;", "let _ = offer.check_window(now);", "own"),
     ("G18", "offer", "an already answered rendezvous is read as open", C + "pairing/phone.rs",
      "PairState::Answered => return Err(PairingError::AlreadyAnswered),", "PairState::Answered => {}", "own"),
     ("G19", "storage", "a profile that cannot be stored leaves the token behind", C + "pairing/phone.rs",

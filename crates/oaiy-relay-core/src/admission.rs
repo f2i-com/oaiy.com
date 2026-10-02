@@ -437,6 +437,22 @@ impl MobileAdmission {
         MobileAdmission::parse_with(body, expect, now, false)
     }
 
+    /// Compares the admission with what the phone holds from its pairing: the `scopes` are exactly the grants the desktop signed into the approval receipt (as sets), and
+    /// `expectedPeerKeyThumbprint` is the thumbprint of the desktop endpoint key the phone pinned from the MAC-verified offer. A relay that grants a phone more than the owner
+    /// approved, or names another desktop as its peer, is refused here; [`MobileAdmission::parse`] reads the answer and does not know what was approved.
+    pub fn check_against(&self, grants: &[String], desktop_endpoint_thumbprint: &str) -> Result<()> {
+        let (mut a, mut b) = (self.scopes.clone(), grants.to_vec());
+        a.sort();
+        b.sort();
+        if a != b {
+            return Err(Error::Mismatch("admission: the scopes are not the grants the desktop signed"));
+        }
+        if !crate::ids::is_thumbprint(desktop_endpoint_thumbprint) || self.expected_peer_thumbprint != desktop_endpoint_thumbprint {
+            return Err(Error::Mismatch("admission: the expected peer is not the desktop the phone pinned"));
+        }
+        Ok(())
+    }
+
     /// [`MobileAdmission::parse`], where `lax` (a client of a relay on loopback over plain `http`, in a build with the `loopback-http` feature) also takes `ws://` and
     /// `http://` on loopback for the URLs the relay writes from its own base. Everything else is read as the shipped phone reads it.
     pub fn parse_with(body: &[u8], expect: &MobileExpect<'_>, now: i64, lax: bool) -> Result<MobileAdmission> {

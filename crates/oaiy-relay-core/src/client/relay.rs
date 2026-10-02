@@ -608,6 +608,32 @@ impl RelayClient {
         MobileAdmission::parse_with(&response.body, expect, self.relay_now_or_local(), self.lax_transport()).map_err(ClientError::Protocol)
     }
 
+    /// `POST /v1/admission` for a paired phone: the request and the expectation are made from the phone's profile, and the answer is **also** compared with what the owner approved
+    /// (the profile's grants are the receipt's signed grants; its peer is the desktop pinned from the offer): scopes that are not those grants, or another expected peer, are an
+    /// error ([`MobileAdmission::check_against`]). `holder_thumbprint` is the thumbprint of the phone's endpoint key.
+    pub fn admission_for_profile(
+        &self,
+        token: &Token,
+        profile: &super::store::RelayProfile,
+        holder_thumbprint: &str,
+        display_name: Option<&str>,
+        cancel: &Cancel,
+    ) -> Result<MobileAdmission, ClientError> {
+        let app_id = profile.app_id.clone().ok_or(ClientError::Request(Error::Invalid("the profile is not a phone's: no app")))?;
+        let peer = profile.peer.as_ref().ok_or(ClientError::Request(Error::Invalid("the profile is not a phone's: no pinned desktop")))?;
+        let request = MobileRequest {
+            app_id: app_id.clone(),
+            device_id: profile.device_id.clone(),
+            display_name: display_name.map(str::to_string),
+            holder_thumbprint: holder_thumbprint.to_string(),
+            transports: Some(vec![crate::admission::Transport::RelayPoll]),
+        };
+        let expect = MobileExpect { app_id: &app_id, device_id: &profile.device_id, holder_thumbprint };
+        let admission = self.admission_mobile(token, &request, &expect, cancel)?;
+        admission.check_against(&profile.grants, &peer.desktop_endpoint.thumbprint()).map_err(ClientError::Protocol)?;
+        Ok(admission)
+    }
+
     /// `POST /v1/admission` with a desktop's token: the plugin's admission.
     pub fn admission_plugin(&self, token: &Token, request: &PluginRequest, cancel: &Cancel) -> Result<PluginAdmission, ClientError> {
         let body = request.to_body().map_err(ClientError::Request)?;

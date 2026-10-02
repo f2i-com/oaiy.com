@@ -91,7 +91,6 @@ fn rv_a_poll_that_replaces_another_after_a_network_change_waits_for_the_250_ms_o
 /// F-respond: after the desktop rejects a response for its window (a desktop that was offline), the phone is told `Rejected` ("the phone may answer again"), but `respond()` resends the
 /// first response text, whose claims have lapsed, so the pairing can never complete.
 #[test]
-#[ignore = "review finding: PhonePairing::respond after Outcome::Rejected resends the stale response"]
 fn rv_a_phone_answers_afresh_after_its_response_was_rejected_for_its_window() {
     let mut w = world(StubConfig { receipt_includes_grants: true, ..quick() });
     let offer = w.new_offer();
@@ -132,7 +131,6 @@ fn rv_confirm_sas_is_retryable_when_the_decision_post_was_lost() {
 /// F-pairwait: after a held `GET /v1/pair/{pid}?wait=..&state=answered` the phone asks again at once, whatever came back. A relay (or a proxy that does not hold) that answers at once
 /// makes it a loop with no pause; the real relay bounds it with a 30-per-minute bucket per address.
 #[test]
-#[ignore = "review finding: PhonePairing::wait_outcome asks again with no pause after an answer that was not held"]
 fn rv_the_phone_does_not_spin_on_a_relay_that_answers_a_pairing_wait_at_once() {
     let mut w = world(StubConfig { wait_default: 1, wait_max: 1, receipt_includes_grants: true, ..quick() });
     let offer = w.new_offer();

@@ -108,6 +108,10 @@ pub struct PairFetch {
     pub receipt: Option<ReceiptWire>,
     /// `hold.refused`'s `retryAfter`, when the relay refused the hold and answered at once.
     pub hold_refused_retry_after: Option<u64>,
+    /// `hold.granted`: the relay says it held the request (for as long as it says, which the caller checks against its own clock).
+    pub hold_granted: bool,
+    /// `hold.superseded`: a newer request of the same party replaced this one, which was ended early.
+    pub hold_superseded: bool,
     /// The relay's time.
     pub time: u64,
 }
@@ -135,6 +139,8 @@ fn parse_fetch(doc: &Json) -> Result<PairFetch, ClientError> {
         sealed_token: text("sealedToken"),
         receipt: None,
         hold_refused_retry_after: None,
+        hold_granted: false,
+        hold_superseded: false,
         time,
     };
     if matches!(state, PairState::Open | PairState::Answered) && (fetch.offer.is_none() || fetch.mac.is_none() || fetch.exp.is_none()) {
@@ -165,6 +171,8 @@ fn parse_fetch(doc: &Json) -> Result<PairFetch, ClientError> {
         if h.get("refused").and_then(Json::as_bool) == Some(true) {
             fetch.hold_refused_retry_after = Some(h.get("retryAfter").and_then(Json::as_uint53).unwrap_or(2));
         }
+        fetch.hold_granted = h.get("granted").and_then(Json::as_bool) == Some(true);
+        fetch.hold_superseded = h.get("superseded").and_then(Json::as_bool) == Some(true);
     }
     Ok(fetch)
 }
@@ -237,6 +245,10 @@ impl RelayClient {
 
     /// `POST /v1/pair/{pid}/decision` (desktop token) with a body the caller built (`{"approve":true,...}` or `{"approve":false}`).
     pub fn pair_decision(&self, token: &Token, pid: &str, body: &str, cancel: &Cancel) -> Result<PairAck, ClientError> {
+        // The pid goes into the path of a request that carries the desktop's token: it is the relay's own spelling or nothing.
+        if !ids::is_pid(pid) {
+            return Err(ClientError::Request(Error::Invalid("pid")));
+        }
         let response = self.authed(token, Method::Post, &format!("/v1/pair/{pid}/decision"), Some(body.as_bytes().to_vec()), None, cancel)?;
         let doc = self.success_json(&response, &[200])?;
         let state = doc.get_str("state").filter(|s| matches!(*s, "approved" | "denied")).ok_or(ClientError::BadAnswer("pair: state"))?;
@@ -249,6 +261,9 @@ impl RelayClient {
 
     /// `POST /v1/pair/{pid}/reject` (desktop token): returns an `answered` rendezvous to `open` (at most twice; the third ends it).
     pub fn pair_reject(&self, token: &Token, pid: &str, reason: &str, cancel: &Cancel) -> Result<PairAck, ClientError> {
+        if !ids::is_pid(pid) {
+            return Err(ClientError::Request(Error::Invalid("pid")));
+        }
         let body = Json::obj([("reason", Json::str(reason.chars().take(200).collect::<String>()))]).to_compact();
         let response = self.authed(token, Method::Post, &format!("/v1/pair/{pid}/reject"), Some(body.into_bytes()), None, cancel)?;
         let doc = self.success_json(&response, &[200])?;
@@ -257,6 +272,9 @@ impl RelayClient {
 
     /// `POST /v1/pair/{pid}/burn` (desktop token): ends the rendezvous now.
     pub fn pair_burn(&self, token: &Token, pid: &str, cancel: &Cancel) -> Result<PairAck, ClientError> {
+        if !ids::is_pid(pid) {
+            return Err(ClientError::Request(Error::Invalid("pid")));
+        }
         let response = self.authed(token, Method::Post, &format!("/v1/pair/{pid}/burn"), Some(b"{}".to_vec()), None, cancel)?;
         let doc = self.success_json(&response, &[200])?;
         Ok(PairAck { state: doc.get_str("state").ok_or(ClientError::BadAnswer("pair: state"))?.to_string(), device_id: None })
