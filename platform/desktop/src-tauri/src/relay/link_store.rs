@@ -62,8 +62,28 @@ pub struct RelayLink {
     /// the calibration gives it a type.
     pub calibration: Option<serde_json::Value>,
     /// Members of the file that this build does not know (a newer build wrote them), kept as they were so that
-    /// rewriting the file here does not drop them.
+    /// rewriting the file here does not drop them. A member is kept as `serde_json` reads it: a number that is an
+    /// integer of 64 bits or fewer, or a decimal that a `f64` holds, comes back as the same number; one beyond that (an
+    /// integer over 64 bits, a decimal of more than 17 significant digits) comes back as the nearest `f64`, and the members
+    /// of an object are written in sorted order. A name this build writes itself (see [`RelayStore::set_relay`]) is
+    /// not one it does not know, and is refused here.
     pub other: serde_json::Map<String, serde_json::Value>,
+}
+
+/// The members `relay.json` has of its own: a name in [`RelayLink::other`] that is one of these would be written twice.
+const RELAY_MEMBERS: &[&str] = &["relayUrl", "relayId", "relayThumbprint", "deviceId", "token", "name", "enrolledAt", "calibration"];
+/// The same for `routes.json`, a pin of `providers.json` and `providers.json`.
+const ROUTES_MEMBERS: &[&str] = &["commands", "chat", "companion"];
+const PIN_MEMBERS: &[&str] = &["providerId", "ed25519", "x25519", "thumbprint", "serial", "suspended", "pinnedAt"];
+const PINS_MEMBERS: &[&str] = &["pins"];
+
+/// A member that this build does not know cannot have the name of one it writes: both would be written, the file would
+/// have two members of that name (a token, say), and which of them is read back is not decided by anything.
+fn refuse_own_names(file: &str, other: &serde_json::Map<String, serde_json::Value>, own: &[&str]) -> Result<(), String> {
+    match other.keys().find(|name| own.contains(&name.as_str())) {
+        Some(name) => Err(format!("could not save {file}: {name:?} is a member this build writes itself, and is not one it does not know")),
+        None => Ok(()),
+    }
 }
 
 impl std::fmt::Debug for RelayLink {
@@ -302,7 +322,9 @@ impl RelayStore {
         [held.relay.error.clone(), held.routes.error.clone(), held.pins.error.clone()].into_iter().flatten().collect()
     }
 
+    /// Replace `relay.json`. `link.other` cannot have a name that the file has of its own (`token` among them).
     pub fn set_relay(&self, link: RelayLink) -> Result<(), String> {
+        refuse_own_names(&format!("{DIR}/{RELAY_FILE}"), &link.other, RELAY_MEMBERS)?;
         let mut held = self.held();
         let stored = StoredRelayLink::from(&link);
         self.write(&mut held.relay, &stored)?;
@@ -311,6 +333,7 @@ impl RelayStore {
     }
 
     pub fn set_routes(&self, routes: Routes) -> Result<(), String> {
+        refuse_own_names(&format!("{DIR}/{ROUTES_FILE}"), &routes.other, ROUTES_MEMBERS)?;
         let mut held = self.held();
         self.write(&mut held.routes, &routes)?;
         held.routes.value = Some(routes);
@@ -318,6 +341,11 @@ impl RelayStore {
     }
 
     pub fn set_pins(&self, pins: ProviderPins) -> Result<(), String> {
+        let file = format!("{DIR}/{PROVIDERS_FILE}");
+        refuse_own_names(&file, &pins.other, PINS_MEMBERS)?;
+        for pin in &pins.pins {
+            refuse_own_names(&file, &pin.other, PIN_MEMBERS)?;
+        }
         let mut held = self.held();
         self.write(&mut held.pins, &pins)?;
         held.pins.value = Some(pins);
@@ -539,6 +567,93 @@ mod tests {
         assert_eq!((read("relay.json")["fromTheFuture"].clone(), read("relay.json")["name"].clone()), (serde_json::json!({"a": [1, 2]}), serde_json::json!("Renamed")));
         assert_eq!((read("routes.json")["later"].clone(), read("routes.json")["chat"].clone()), (serde_json::json!(true), serde_json::json!("relay")));
         assert_eq!((read("providers.json")["revision"].clone(), read("providers.json")["pins"][0]["pinNote"].clone(), read("providers.json")["pins"][0]["serial"].clone()), (serde_json::json!(9), serde_json::json!("kept"), serde_json::json!(2)));
+    }
+
+    #[test]
+    fn what_a_newer_build_added_is_kept_as_far_as_json_values_keep_it_and_no_further() {
+        // The limit that `RelayLink::other` says it has: a value is kept as `serde_json` reads it. What a newer build wrote
+        // as a number of 64 bits or fewer, or as a decimal a `f64` holds, comes back as it was; an integer over 64 bits is
+        // the nearest `f64`, and the members of an object come back sorted. If this changes (a `RawValue` that keeps the
+        // text and the order), the doc on `other` changes with it.
+        let dir = TempDir::new("relay-numbers");
+        let folder = folder(&dir);
+        std::fs::write(
+            folder.join("routes.json"),
+            r#"{"commands":"relay","u":18446744073709551615,"i":-9223372036854775808,"f":0.1,"big":18446744073709551616,"z":{"b":1,"a":2}}"#,
+        )
+        .unwrap();
+        let store = RelayStore::open(&dir.0);
+        let routes = store.routes().unwrap();
+        store.set_routes(routes).unwrap();
+        let text = std::fs::read_to_string(folder.join("routes.json")).unwrap();
+        for kept in ["18446744073709551615", "-9223372036854775808", "0.1"] {
+            assert!(text.contains(kept), "{kept} is kept: {text}");
+        }
+        assert!(!text.contains("18446744073709551616") && text.contains("1.8446744073709552e+19"), "an integer over 64 bits is the nearest f64: {text}");
+        assert!(text.find("\"a\": 2").unwrap() < text.find("\"b\": 1").unwrap(), "the members of an object are sorted: {text}");
+    }
+
+    #[test]
+    fn a_member_this_build_does_not_know_cannot_have_the_name_of_one_it_writes() {
+        // Both would be written: a file with two `token` members, and a reader that takes the first or the last.
+        let dir = TempDir::new("relay-own-names");
+        let store = RelayStore::open(&dir.0);
+        let first = relay();
+        store.set_relay(first.clone()).unwrap();
+        let before = std::fs::read(dir.0.join("relay").join("relay.json")).unwrap();
+
+        for own in RELAY_MEMBERS {
+            let mut link = first.clone();
+            link.other.insert((*own).to_string(), serde_json::json!("x"));
+            let refused = store.set_relay(link).unwrap_err();
+            assert!(refused.contains(&format!("{own:?}")) && refused.contains("relay/relay.json"), "{own}: {refused}");
+            assert!(!refused.contains("TOPSECRETTOKEN"), "{refused}");
+        }
+        assert_eq!(std::fs::read(dir.0.join("relay").join("relay.json")).unwrap(), before, "a refused one writes nothing");
+        assert_eq!(store.relay().unwrap(), Some(first), "and changes nothing held");
+
+        for own in ROUTES_MEMBERS {
+            let mut routes = Routes::default();
+            routes.other.insert((*own).to_string(), serde_json::json!(1));
+            assert!(store.set_routes(routes).is_err(), "{own}");
+        }
+        for own in PINS_MEMBERS {
+            let mut held = pins();
+            held.other.insert((*own).to_string(), serde_json::json!(1));
+            assert!(store.set_pins(held).is_err(), "{own}");
+        }
+        for own in PIN_MEMBERS {
+            let mut held = pins();
+            held.pins[0].other.insert((*own).to_string(), serde_json::json!(1));
+            assert!(store.set_pins(held).is_err(), "{own}");
+        }
+        assert!(!dir.0.join("relay").join("routes.json").exists() && !dir.0.join("relay").join("providers.json").exists());
+
+        // A name that is not one of the file's own is kept, as before.
+        let mut link = store.relay().unwrap().unwrap();
+        link.other.insert("fromTheFuture".into(), serde_json::json!(true));
+        store.set_relay(link).unwrap();
+        assert!(std::fs::read_to_string(dir.0.join("relay").join("relay.json")).unwrap().contains("fromTheFuture"));
+    }
+
+    #[test]
+    fn the_names_that_are_refused_are_the_names_the_files_write() {
+        // The lists are kept by hand next to the structs: a member added to a struct and not to its list would be a name that
+        // can be written twice again. This is the file's own idea of its names, written out.
+        fn names(value: &impl Serialize) -> Vec<String> {
+            let mut names: Vec<String> = serde_json::to_value(value).unwrap().as_object().unwrap().keys().cloned().collect();
+            names.sort();
+            names
+        }
+        fn sorted(list: &[&str]) -> Vec<String> {
+            let mut list: Vec<String> = list.iter().map(|s| s.to_string()).collect();
+            list.sort();
+            list
+        }
+        assert_eq!(names(&StoredRelayLink::from(&relay())), sorted(RELAY_MEMBERS));
+        assert_eq!(names(&Routes::default()), sorted(ROUTES_MEMBERS));
+        assert_eq!(names(&pins().pins[0]), sorted(PIN_MEMBERS));
+        assert_eq!(names(&pins()), sorted(PINS_MEMBERS));
     }
 
     #[test]

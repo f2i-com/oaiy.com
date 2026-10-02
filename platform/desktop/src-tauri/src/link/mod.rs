@@ -52,11 +52,22 @@ pub use descriptor::ConnectorDescriptor;
 /// and its web app is the surface they then expect to manage this desktop from.
 /// Deriving the trusted origin FROM the link means no address is ever hardcoded
 /// and unlinking withdraws the trust in the same action.
+#[cfg(not(test))]
 static LINKED_ORIGIN: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+// In the tests there is one cell for each thread and not one for the process: every test that links or forgets writes
+// it (most of the suite opens a link store), so a test that set it and asked a rule about it, or one that compared two
+// rules that read it, met another test's write in between, and failed one run in some.
+#[cfg(test)]
+thread_local! {
+    static LINKED_ORIGIN: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
 
 /// The linked provider's origin, for the origin allow-list.
 pub fn linked_origin() -> Option<String> {
-    LINKED_ORIGIN.read().ok().and_then(|g| g.clone())
+    #[cfg(not(test))]
+    return LINKED_ORIGIN.read().ok().and_then(|g| g.clone());
+    #[cfg(test)]
+    LINKED_ORIGIN.with(|cell| cell.borrow().clone())
 }
 
 /// Set the trusted origin directly, for tests in other modules.
@@ -69,31 +80,12 @@ fn set_linked_origin(base_url: Option<&str>) {
     // Store the ORIGIN, not the base: a provider served under a path still
     // sends `Origin: scheme://host[:port]`.
     let origin = base_url.and_then(origin_of);
-    #[cfg(test)]
-    trusted_once::note(origin.as_deref());
+    #[cfg(not(test))]
     if let Ok(mut guard) = LINKED_ORIGIN.write() {
         *guard = origin;
     }
-}
-
-/// Every origin that was ever trusted in this test run. `LINKED_ORIGIN` is one cell for the process and every test that
-/// links or forgets writes it, so a test cannot read it back and know it was its own write that it found: it gives its
-/// provider an origin no other test has and asks whether that one was ever trusted.
-#[cfg(test)]
-pub(crate) mod trusted_once {
-    use std::sync::Mutex;
-
-    static TRUSTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-    pub(super) fn note(origin: Option<&str>) {
-        if let Some(origin) = origin {
-            TRUSTED.lock().unwrap_or_else(|e| e.into_inner()).push(origin.to_string());
-        }
-    }
-
-    pub(crate) fn was(origin: &str) -> bool {
-        TRUSTED.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|o| o == origin)
-    }
+    #[cfg(test)]
+    LINKED_ORIGIN.with(|cell| *cell.borrow_mut() = origin);
 }
 
 /// `scheme://host[:port]` from a base URL, or `None` if it is not one we would
@@ -219,6 +211,8 @@ pub(crate) enum Reread<T> {
 /// it is gone, why it cannot be used, or [`Reread::Still`] if another program has it. It never waits, and it never
 /// moves, writes or removes the file.
 pub(crate) fn read_again<T: serde::de::DeserializeOwned>(path: &std::path::Path, shown_as: &str) -> Reread<T> {
+    #[cfg(test)]
+    reads::note();
     match read_stored_after(path, shown_as, &[], false) {
         Ok(read) => Reread::Read(read),
         Err(e) if e.busy => Reread::Still,
@@ -226,6 +220,24 @@ pub(crate) fn read_again<T: serde::de::DeserializeOwned>(path: &std::path::Path,
             log::warn!("link: {}", e.message);
             Reread::Unusable(e)
         }
+    }
+}
+
+/// How many times this thread has read a file of the link again: for the tests that say a decision is made on one read.
+#[cfg(test)]
+pub(crate) mod reads {
+    use std::cell::Cell;
+
+    thread_local! {
+        static READS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn note() {
+        READS.with(|r| r.set(r.get() + 1));
+    }
+
+    pub(crate) fn so_far() -> usize {
+        READS.with(Cell::get)
     }
 }
 
@@ -350,8 +362,12 @@ fn describe(e: &serde_json::Error) -> String {
 /// Put `path`, a file of the link that could not be used, aside as `<name>.corrupt` so that the
 /// store can write a new one: what was in it is never thrown away. A file that is no longer there
 /// needs nothing. An error says the file is still where it was, and must stop the write.
+///
+/// A file another program holds for a moment is waited for (about a second and a half at most): what asks for this is a link
+/// made or forgotten, which a person is waiting for, and never the start of the desktop, where the stores of the messages
+/// and of the ring put a file aside without waiting.
 pub(crate) fn put_aside(path: &std::path::Path, shown_as: &str) -> Result<(), String> {
-    match crate::secret_file::keep_aside(path) {
+    match crate::secret_file::keep_aside_waiting(path) {
         Ok(aside) => {
             log::warn!("link: {shown_as} could not be used; it is kept as {}", aside.display());
             Ok(())
@@ -888,29 +904,39 @@ impl LinkStore {
         // It may have become readable since (another program let go of it): then it is a link, and no file is
         // put aside for a write that replaces it.
         self.reread(true);
-        let unusable = {
-            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            inner.holds_unusable_file()
-        };
-        if !unusable {
+        if !self.holds_unusable_file() {
             return Ok(());
         }
+        self.put_unusable_aside()
+    }
+
+    /// Whether `account.json` is there and could not be used, as the store knows it now.
+    fn holds_unusable_file(&self) -> bool {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).holds_unusable_file()
+    }
+
+    /// Move the file that could not be used aside, and say nothing more of it. What decides is the read that came just
+    /// before: this does not read again, so that a caller's decision is made on one read and not on two that can differ.
+    fn put_unusable_aside(&self) -> Result<(), String> {
         put_aside(&self.path, ACCOUNT_FILE)?;
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).error = None;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.error = None;
+        inner.retry = None;
         Ok(())
     }
 
     /// Take the stored link away: `Err` says why it is still there, and `Ok(true)` that the file could not be
     /// used and was put aside rather than deleted (what is in it may be a link a newer build can read). A link
     /// that is not there to remove is forgotten all the same.
+    ///
+    /// One read decides: a file that could not be used at that read is moved aside, one that could is removed. A program
+    /// that lets go of the file in the moment between that read and the move leaves a link that could have been read kept
+    /// as `account.json.corrupt`, as one that could not be read is; it is a copy of the key, and the next Disconnect
+    /// (or [`LinkStore::remove_copies`]) removes it.
     fn forget_stored(&self) -> Result<bool, String> {
         self.reread(true);
-        let unusable = {
-            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            inner.holds_unusable_file()
-        };
-        if unusable {
-            return self.make_way().map(|()| true);
+        if self.holds_unusable_file() {
+            return self.put_unusable_aside().map(|()| true);
         }
         match std::fs::remove_file(&self.path) {
             Ok(()) => Ok(false),
@@ -1675,10 +1701,10 @@ mod tests {
         back.base_url = "https://lanes-after-held.example.test".into();
         std::fs::remove_dir(&file).unwrap();
         std::fs::write(&file, serde_json::to_string(&back).unwrap()).unwrap();
-        assert!(!trusted_once::was("https://lanes-after-held.example.test"));
+        assert_ne!(linked_origin().as_deref(), Some("https://lanes-after-held.example.test"));
         read_again_now(&store);
         assert_eq!(store.account().map(|a| a.credential), Some("flk_supersecret".to_string()), "the lane that asked has it");
-        assert!(trusted_once::was("https://lanes-after-held.example.test"), "and its provider is trusted from then on");
+        assert_eq!(linked_origin().as_deref(), Some("https://lanes-after-held.example.test"), "and its provider is trusted from then on");
         assert!(store.inner.lock().unwrap().error.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1741,12 +1767,34 @@ mod tests {
         let store = load_store(dir.clone());
         assert!(store.inner.lock().unwrap().retry.is_some());
 
+        let reads = reads::so_far();
         let after = store.unlink();
         assert!(!after.linked && after.link_error.is_none(), "{after:?}");
+        // One read decides what is done with the file: two that can differ (the file let go of between them) left a link
+        // that was readable by the second one neither removed nor put aside, with the key in the folder.
+        assert_eq!(reads::so_far() - reads, 1, "the file is read once to decide, not again to act");
         assert!(dir.join("link").join("account.json.corrupt").exists(), "what could not be read is kept");
         assert!(store.inner.lock().unwrap().retry.is_none(), "and no timer is left for a file that is not there");
         std::fs::write(&file, serde_json::to_string(&account()).unwrap()).unwrap();
         assert!(store.account().is_none(), "a file that appears after it was forgotten is not read as the link");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_new_link_over_a_file_that_is_held_puts_it_aside_and_leaves_no_timer() {
+        let dir = data_dir("persist-held");
+        let file = dir.join("link").join("account.json");
+        std::fs::create_dir(&file).unwrap();
+        let store = load_store(dir.clone());
+        assert!(store.inner.lock().unwrap().retry.is_some());
+
+        store.persist(&account()).unwrap();
+        {
+            let inner = store.inner.lock().unwrap();
+            assert!(inner.error.is_none() && inner.retry.is_none(), "dealt with: nothing is said and nothing is waited for");
+        }
+        assert!(dir.join("link").join("account.json.corrupt").is_dir(), "what could not be read is kept");
+        assert_eq!(load_store(dir.clone()).account().unwrap().credential, "flk_supersecret", "and the new link is the file");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1985,6 +2033,27 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn a_file_a_scanner_holds_for_a_moment_is_moved_aside_by_a_link_that_is_made_and_not_copied() {
+        // A person is waiting for the link: the file is waited for, a second and a half at most, and moved when it is let go
+        // of. (The stores of the messages and the ring, which run while the desktop starts, do not wait.)
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = data_dir("aside-waits");
+        let file = dir.join("link").join("account.json");
+        std::fs::write(&file, [0xC3, 0x28, 0x29]).unwrap();
+        let held = std::fs::OpenOptions::new().read(true).share_mode(1).open(&file).unwrap(); // FILE_SHARE_READ: no delete, no rename
+        let letting_go = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(held);
+        });
+        put_aside(&file, ACCOUNT_FILE).unwrap();
+        letting_go.join().unwrap();
+        assert!(!file.exists(), "it was moved, not copied: nothing is left where it was");
+        assert_eq!(std::fs::read(dir.join("link").join("account.json.corrupt")).unwrap(), [0xC3, 0x28, 0x29]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn a_copy_another_program_really_holds_is_said_too() {
         // As above with the operating system's own hold: a copy opened without delete sharing cannot be removed.
         use std::os::windows::fs::OpenOptionsExt;
@@ -2158,6 +2227,23 @@ mod tests {
         assert_eq!(status.available[0].id, "formlogic");
         assert!(!status.available[0].scopes.is_empty(), "the UI shows what is granted");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_trusted_origin_of_a_test_is_not_written_over_by_another_thread() {
+        // `http::the_linked_providers_origin_is_trusted_and_nothing_else_new_is` sets it and asks the allow-list; `http::legacy_neutrality`
+        // asks two rules the same question thousands of times; most of the rest of the suite links or forgets. With one cell for the
+        // process each met another's write in between, and one run in twenty of the second failed (on the main branch too).
+        set_linked_origin(Some("https://thread-a.example.test"));
+        std::thread::spawn(|| {
+            assert_eq!(linked_origin(), None, "the other thread's cell is its own");
+            set_linked_origin(Some("https://thread-b.example.test"));
+            set_linked_origin(None);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(linked_origin().as_deref(), Some("https://thread-a.example.test"), "and what it writes is not seen here");
+        set_linked_origin(None);
     }
 
     #[test]
