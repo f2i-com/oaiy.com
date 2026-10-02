@@ -408,7 +408,7 @@ jobs:
         working-directory: platform/desktop/src-tauri
         run: cargo test --locked --no-default-features
       # The headless server ships WITH the web login (release.yml builds it with `--features web`): its tests too.
-      - name: Native tests (shipping headless server: the web login)
+      - name: 'Native tests (shipping headless server: the web login)'
         working-directory: platform/desktop/src-tauri
         run: cargo test --locked --no-default-features --features web
       - name: Native tests (shipping GUI features)
