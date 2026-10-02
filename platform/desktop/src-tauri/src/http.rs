@@ -1122,7 +1122,7 @@ fn is_bridge_exec_path(path: &str) -> bool {
 /// and `/api/ai/{v1,providers/:id/v1}/*` (the gateway). GET reads are handled by
 /// `is_restricted_read_path`, not here.
 fn is_ai_exec_path(path: &str) -> bool {
-    path.starts_with("/api/ai/") || crate::ai::plugin_completion::is_route(path)
+    path.starts_with("/api/ai/") || crate::ai::plugin_completion::is_route(path) || crate::voice::plugin_session::is_route(path)
 }
 
 /// GET /api/services/:id/export returns the FULL ServiceTemplate — including `run.env` (which a
@@ -1188,7 +1188,7 @@ fn is_restricted_read_path(path: &str) -> bool {
         // The AI gateway's reads: sources union + provider listing (names, base
         // URLs, hasKey/enabled — no secret) and the models proxy. Not for an
         // arbitrary remote page; a paired token or a trusted origin passes.
-        || path.starts_with("/api/ai/") || crate::ai::plugin_completion::is_route(path)
+        || path.starts_with("/api/ai/") || crate::ai::plugin_completion::is_route(path) || crate::voice::plugin_session::is_route(path)
         || is_personal_path(path)
         // The Agent's model (engine or ChatGPT). Already under `/api/agent/`,
         // named so it stays gated if that prefix ever narrows.
@@ -1596,6 +1596,7 @@ pub async fn serve(
     // before `registry` is moved into AppState below.
     let registry_for_ai = registry.clone();
     let registry_for_voice = registry.clone();
+    let registry_for_plugin_voice = registry.clone();
     // The backup routes (its status, and the Agent page handing over its storage) work on the data folder.
     let backup_data_dir = data_dir_for_auth.clone();
     // The calendar lives in the data folder, beside the flows it may defer to.
@@ -1663,6 +1664,7 @@ pub async fn serve(
         })
     };
     let voice_routes = crate::voice::app_router(voice.clone());
+    let plugin_voice_routes = crate::voice::plugin_session::router(registry_for_plugin_voice, bridge.host.clone(), isolated);
     // Putting a caller through to the owner: which Companions could take the call, and whether the owner is at the computer
     // (only where there is a window to ring).
     if let Some(ring) = crate::ring::shared() {
@@ -1731,6 +1733,7 @@ pub async fn serve(
         // would leave them ungated — reachable by any web page the user has open.
         .merge(bridge_routes)
         .merge(voice_routes)
+        .merge(plugin_voice_routes)
         .merge(crate::voice::contacts::routes::router(crate::voice::contacts::shared()))
         .merge(ring_routes)
         .merge(crate::messages::routes::router(crate::messages::shared()))
@@ -2383,6 +2386,11 @@ mod tests {
             (Method::POST, "/api/plugins/probe/ai/complete"),
             (Method::POST, "/api/plugins/%70robe/ai/complete"),
             (Method::POST, "/api/plugins/probe/ai/cancel"),
+            (Method::POST, "/api/plugins/%70robe/voice/transcribe"),
+            (Method::POST, "/api/plugins/probe/voice/speak"),
+            (Method::POST, "/api/plugins/probe/voice/cancel"),
+            (Method::POST, "/api/plugins/probe/voice/open"),
+            (Method::POST, "/api/plugins/probe/voice/close"),
         ] {
             assert!(is_privileged_path(&m, path), "{m} {path} must be privileged");
         }
@@ -2395,6 +2403,7 @@ mod tests {
             "/api/ai/providers/openai/v1/models",
             "/api/plugins/probe/ai/sources",
             "/api/plugins/%70robe/ai/sources",
+            "/api/plugins/%70robe/voice/status",
         ] {
             assert!(is_restricted_read_path(path), "{path} must be a restricted read");
         }
@@ -2407,7 +2416,10 @@ mod tests {
         let app = Router::new().fallback(any(|| async { "called" })).layer(middleware::from_fn_with_state(
             AuthConfig { token:Some("test-owner".into()), gui_mode:true, pairing:None }, super::origin_guard));
         for (method,path) in [("POST","/api/plugins/%70robe/ai/complete"),("POST","/api/plugins/probe/ai/cancel"),
-            ("GET","/api/plugins/%70robe/ai/sources"),("HEAD","/api/plugins/probe/ai/sources")] {
+            ("GET","/api/plugins/%70robe/ai/sources"),("HEAD","/api/plugins/probe/ai/sources"),
+            ("GET","/api/plugins/%70robe/voice/status"),("HEAD","/api/plugins/probe/voice/status"),
+            ("POST","/api/plugins/probe/voice/open"),("POST","/api/plugins/%70robe/voice/transcribe"),
+            ("POST","/api/plugins/probe/voice/speak"),("POST","/api/plugins/probe/voice/cancel"),("POST","/api/plugins/probe/voice/close")] {
             for origin in [None,Some("https://untrusted.example"),Some("http://untrusted.example:3000")] {
                 let mut req = Request::builder().method(method).uri(path);
                 if let Some(origin) = origin { req = req.header("origin",origin); }

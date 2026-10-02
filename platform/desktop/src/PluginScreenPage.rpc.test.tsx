@@ -73,11 +73,49 @@ function connect(frame: HTMLIFrameElement) {
     aiComplete: (request: unknown) => Promise<unknown>;
     aiCancel: (requestId: string) => Promise<unknown>;
     aiSources: () => Promise<unknown>;
+    voice: {status:()=>Promise<unknown>;open:()=>Promise<{sessionId:string}>;record:(request:unknown)=>Promise<unknown>;subscribe:(callback:(event:unknown)=>void)=>Promise<{unsubscribe():void}>};
   } }).PluginHost;
   return { host, requests, replies, receive };
 }
 
 describe('plugin command RPC through the mounted host and actual bootstrap', () => {
+  it('the production voice bootstrap opens a parent consent bar without acquiring a microphone or expanding iframe permissions',async()=>{
+    list.mockResolvedValue({plugins:[{...plugin,manifest:{...plugin.manifest,capabilities:['oaiy.voice.session']}}]});
+    const {host}=connect(await mount());
+    vi.mocked(globalThis.fetch).mockImplementation((url,options)=>Promise.resolve(new Response(JSON.stringify(String(url).endsWith('/status')?{sttReady:true,ttsReady:true,reason:null}:JSON.parse(String(options?.body))))));
+    let opened!:{sessionId:string};await act(async()=>{opened=await host.voice.open();});
+    expect(container.textContent).toContain('Enable microphone session');expect(container.textContent).toContain('native microphone permission');
+    const frame=container.querySelector('iframe')!;expect(frame.getAttribute('sandbox')).toBe('allow-scripts allow-forms allow-modals');expect(frame.getAttribute('allow')).toBeNull();expect(frame.srcdoc).toContain("connect-src 'none'");
+    await expect(host.voice.record({sessionId:opened.sessionId,requestId:'before-owner'})).rejects.toThrow('owner must explicitly enable');
+    expect(vi.mocked(globalThis.fetch).mock.calls.some(([url])=>String(url).endsWith('/transcribe'))).toBe(false);
+  });
+
+  it('private voice events verify parent source, current session/request and suppress terminal duplicates',async()=>{
+    list.mockResolvedValue({plugins:[{...plugin,manifest:{...plugin.manifest,capabilities:['oaiy.voice.session']}}]});
+    const {host,receive}=connect(await mount());const callback=vi.fn();await host.voice.subscribe(callback);
+    vi.mocked(globalThis.fetch).mockImplementation((url,options)=>Promise.resolve(new Response(JSON.stringify(String(url).endsWith('/status')?{sttReady:true,ttsReady:true,reason:null}:JSON.parse(String(options?.body))))));
+    let opened!:{sessionId:string};await act(async()=>{opened=await host.voice.open();});
+    const event={sessionId:opened.sessionId,type:'enabled'};
+    receive({__pluginHost:1,voiceEvent:event},null);receive({__pluginHost:1,voiceEvent:{...event,sessionId:crypto.randomUUID()}});expect(callback).not.toHaveBeenCalled();
+    receive({__pluginHost:1,voiceEvent:event});expect(callback).toHaveBeenCalledExactlyOnceWith(event);
+    receive({__pluginHost:1,voiceEvent:{sessionId:opened.sessionId,requestId:'unknown',type:'transcript',text:'bad'}});expect(callback).toHaveBeenCalledTimes(1);
+    // Register an accepted RPC ID through the actual bootstrap, but hold its
+    // parent reply so the private callback ledger can be exercised directly.
+    vi.spyOn(window,'postMessage').mockImplementation(()=>{});void host.voice.record({sessionId:opened.sessionId,requestId:'one'}).catch(()=>{});
+    const transcript={sessionId:opened.sessionId,requestId:'one',type:'transcript',text:'Bounded transcript'};
+    receive({__pluginHost:1,voiceEvent:{...transcript,audio:'forbidden'}});expect(callback).toHaveBeenCalledTimes(1);
+    receive({__pluginHost:1,voiceEvent:transcript});receive({__pluginHost:1,voiceEvent:transcript});expect(callback).toHaveBeenCalledTimes(2);expect(callback).toHaveBeenLastCalledWith(transcript);
+  });
+  it('the real parent Enable button surfaces native microphone denial without claiming an enabled session',async()=>{
+    list.mockResolvedValue({plugins:[{...plugin,manifest:{...plugin.manifest,capabilities:['oaiy.voice.session']}}]});
+    const {host}=connect(await mount());const callback=vi.fn();await host.voice.subscribe(callback);
+    vi.mocked(globalThis.fetch).mockImplementation((url,options)=>Promise.resolve(new Response(JSON.stringify(String(url).endsWith('/status')?{sttReady:true,ttsReady:true,reason:null}:JSON.parse(String(options?.body))))));
+    await act(async()=>{await host.voice.open();});
+    const enable=Array.from(container.querySelectorAll('button')).find(b=>b.textContent==='Enable microphone session')!;
+    await act(async()=>{enable.click();});
+    expect(container.textContent).toContain('Microphone permission was declined or is unavailable');
+    expect(callback).toHaveBeenCalledWith(expect.objectContaining({type:'failed',code:'microphone_denied'}));expect(callback.mock.calls.some(([event])=>event.type==='enabled')).toBe(false);
+  });
   it('carries a real bounded AI request through the bootstrap and mounted plugin-owned route', async () => {
     list.mockResolvedValue({plugins:[{...plugin,manifest:{...plugin.manifest,capabilities:['oaiy.ai.complete']}}]});
     const {host,replies} = connect(await mount());

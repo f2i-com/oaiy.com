@@ -214,11 +214,13 @@ export default function PluginsPanel() {
     async (p: PluginRecord) => {
       const name = p.manifest?.name ?? p.id;
       const declaresAi = p.manifest?.capabilities?.includes('oaiy.ai.complete') === true;
+      const declaresVoice = p.manifest?.capabilities?.includes('oaiy.voice.session') === true;
       if (
         !confirm(
           `Trust the "${name}" plugin?\n\nIt is not signed, so OAIY cannot tell who made it. Trusting it lets it run as native code with your permissions. ` +
             'The trust is for this exact package only: if any of its files change, you are asked again.\n\n' +
             (declaresAi ? 'This package declares AI completion access to your configured providers. Trusting it enables that access.\n\n' : '') +
+            (declaresVoice ? 'This package declares local voice session access. Trusting it permits ready local speech; microphone capture still requires explicit consent in each session and native microphone permission.\n\n' : '') +
             'Only trust a plugin you built yourself or got from someone you trust.',
         )
       )
@@ -502,6 +504,7 @@ function PluginCard({
       {unsignedDev && p.manifest?.capabilities?.includes('oaiy.ai.complete') && (
         <p className="card-meta">This developer build lets the unsigned plugin run. Its AI access requires you to trust this exact package.</p>
       )}
+      {unsignedDev && p.manifest?.capabilities?.includes('oaiy.voice.session') && <p className="card-meta">Its local voice access requires you to trust this exact package. Microphone capture needs explicit consent in each session.</p>}
 
       <div className="card-actions">
         {pending ? (

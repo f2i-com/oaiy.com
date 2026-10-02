@@ -15,6 +15,8 @@ import { useToast } from './Toasts';
 import { moduleOn, useModules } from './useModules';
 import { serializePluginCallError, unwrapPluginCommandResponse, type PluginErrorDetails } from './pluginRpc';
 import { PluginAiSession } from './pluginAi';
+import { PluginVoiceSession, type VoiceView } from './pluginVoice';
+import { PluginVoiceControls } from './PluginVoiceControls';
 
 /**
  * Host for a plugin-contributed screen.
@@ -189,6 +191,34 @@ export const HOST_BOOTSTRAP = `
   var seq = 0;
   var pending = Object.create(null);
   var subs = [];
+  var voiceSubs = [];
+  var voiceSessions = Object.create(null);
+  function voiceEvent(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(function (key) {
+      return ['sessionId','requestId','type','text','code','message','elapsedMs'].indexOf(key) < 0;
+    })) return null;
+    var sessionId = own(value, 'sessionId');
+    var session = voiceSessions[sessionId];
+    var type = own(value, 'type');
+    var requestId = own(value, 'requestId');
+    if (typeof sessionId !== 'string' || !session || ['enabled','recording','transcribing','transcript','speaking','finished','cancelled','closed','failed'].indexOf(type) < 0 ||
+        (requestId !== undefined && (typeof requestId !== 'string' || !session[requestId])) ||
+        (['recording','transcribing','transcript','speaking','finished','cancelled'].indexOf(type) >= 0 && !requestId)) return null;
+    var text = own(value, 'text'); var code = own(value, 'code'); var message = own(value, 'message'); var elapsed = own(value, 'elapsedMs');
+    if ((type === 'transcript' && (typeof text !== 'string' || !text.trim() || text.length > 4000 || Array.from(text).length > 2000 || !requestId)) ||
+        (type !== 'transcript' && text !== undefined) ||
+        (code !== undefined && (typeof code !== 'string' || !/^[a-zA-Z0-9_.:-]{1,64}$/.test(code))) ||
+        (message !== undefined && (typeof message !== 'string' || message.length > 300)) ||
+        (elapsed !== undefined && (typeof elapsed !== 'number' || !Number.isFinite(elapsed) || elapsed < 0 || elapsed > 15000))) return null;
+    return value;
+  }
+  function voiceRequest(method, request) {
+    var session = request && typeof request.sessionId === 'string' && voiceSessions[request.sessionId];
+    var id = request && request.requestId;
+    if (!session || typeof id !== 'string' || !/^[a-zA-Z0-9_.:-]{1,96}$/.test(id) || Object.keys(session).length >= 512 || session[id]) return Promise.reject(new Error('Supply a current voice session and fresh bounded request ID.'));
+    session[id] = true;
+    return call(method, [request]).catch(function (error) {delete session[id];throw error;});
+  }
   function own(value, key) {
     if (!value || typeof value !== 'object') return undefined;
     var descriptor = Object.getOwnPropertyDescriptor(value, key);
@@ -255,6 +285,15 @@ export const HOST_BOOTSTRAP = `
     // The page's gutters: the screen runs edge to edge and draws them itself.
     // Not in a wizard step, whose pane draws its own padding (the gutter stays 0).
     if (m.gutter) { if (!SETUP) document.documentElement.style.setProperty('--host-page-pad', m.gutter); return; }
+    if (m.voiceEvent) {
+      var event = voiceEvent(m.voiceEvent);
+      if (event) {
+        if (['transcript','finished','cancelled','failed'].indexOf(event.type) >= 0 && event.requestId) delete voiceSessions[event.sessionId][event.requestId];
+        voiceSubs.forEach(function (s) {try {s(event);} catch (_) {}});
+        if (event.type === 'closed') delete voiceSessions[event.sessionId];
+      }
+      return;
+    }
     if (m.event) { subs.forEach(function (s) { try { s(m.event); } catch (_) {} }); return; }
     var id = own(m, 'id');
     if (typeof id !== 'string' || !Object.prototype.hasOwnProperty.call(pending, id)) return;
@@ -277,6 +316,19 @@ export const HOST_BOOTSTRAP = `
     aiSources: function () { return call('aiSources', []); },
     aiComplete: function (request) { return call('aiComplete', [request]); },
     aiCancel: function (requestId) { return call('aiCancel', [requestId]); },
+    voice: {
+      status: function () { return call('voice.status', []); },
+      open: function () { return call('voice.open', []).then(function (session) {voiceSessions[session.sessionId] = Object.create(null); return session;}); },
+      record: function (request) { return voiceRequest('voice.record', request); },
+      speak: function (request) { return voiceRequest('voice.speak', request); },
+      cancel: function (request) { return call('voice.cancel', [request]); },
+      close: function (sessionId) { return call('voice.close', [sessionId]).then(function (result) {delete voiceSessions[sessionId]; return result;}); },
+      subscribe: function (cb) {
+        if (typeof cb !== 'function') return Promise.reject(new Error('Supply a voice event callback.'));
+        voiceSubs.push(cb);
+        return call('voice.subscribe', []).then(function () {return {unsubscribe:function () {voiceSubs = voiceSubs.filter(function (s) {return s !== cb;}); if (!voiceSubs.length) call('voice.unsubscribe', []).catch(function () {});}};},function (error) {voiceSubs = voiceSubs.filter(function (s) {return s !== cb;});throw error;});
+      }
+    },
     restartPlugin: function () { return call('restartPlugin', []); },
     // Open one of the dashboard's own pages ('agent', 'calendar', 'engines',
     // ...). The frame cannot navigate itself out of the sandbox, so the host
@@ -422,6 +474,8 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
   const recordRef = useRef(record);
   recordRef.current = record;
   const aiSession = useRef<PluginAiSession | null>(null);
+  const voiceSession = useRef<PluginVoiceSession | null>(null);
+  const [voiceView, setVoiceView] = useState<VoiceView | null>(null);
   // The manifest selects and assembles the iframe once. Runtime status changes
   // separately so a health refresh cannot remount a call console or transcript.
   const [runtimeStatus, setRuntimeStatus] = useState<Pick<PluginRecord, 'state' | 'reason'> | null>();
@@ -573,6 +627,23 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
         case 'aiCancel':
           if (args.length !== 1 || !aiSession.current) throw new Error('The AI completion screen is unavailable.');
           return await aiSession.current.cancel(args[0]);
+        case 'voice.status': case 'voice.open': case 'voice.record': case 'voice.speak': case 'voice.cancel': case 'voice.close': case 'voice.subscribe': case 'voice.unsubscribe': {
+          const session = voiceSession.current;
+          if (!session || !recordRef.current?.manifest?.capabilities?.includes('oaiy.voice.session')) throw new Error('The plugin does not declare the voice session capability.');
+          const methodName = method.slice(6);
+          const needsArgument = ['record','speak','cancel','close'].includes(methodName);
+          if (args.length !== (needsArgument ? 1 : 0)) throw new Error('Supply the bounded voice session arguments.');
+          switch (methodName) {
+            case 'status': return await session.status();
+            case 'open': return await session.open();
+            case 'record': return session.record(args[0]);
+            case 'speak': return session.speak(args[0]);
+            case 'cancel': return await session.cancel(args[0]);
+            case 'close': return await session.close(args[0]);
+            case 'subscribe': return session.subscribe();
+            default: return session.unsubscribe();
+          }
+        }
         case 'restartPlugin':
           await plugins.stop(pluginId).catch(() => {});
           await plugins.start(pluginId);
@@ -675,6 +746,13 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
     let active = true;
     const session = new PluginAiSession(pluginId, API_BASE);
     aiSession.current = session;
+    const ownedFrame = frameRef.current;
+    const ownedSource = ownedFrame?.contentWindow;
+    const voice = new PluginVoiceSession(pluginId, API_BASE, (event) => {
+      if (active && ownedFrame && frameRef.current === ownedFrame && ownedFrame.contentWindow === ownedSource) ownedSource?.postMessage({__pluginHost:1,voiceEvent:event},'*');
+    }, view => {if (active) setVoiceView(view);});
+    voiceSession.current = voice;
+    setVoiceView(null);
     const onMessage = (e: MessageEvent) => {
       const m = e.data as { __pluginHost?: number; id?: string; method?: string; args?: unknown[] };
       if (!m || m.__pluginHost !== 1 || typeof m.id !== 'string' || !m.id || m.id.length > 128 ||
@@ -697,7 +775,9 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
     return () => {
       active = false;
       session.dispose();
+      voice.dispose();
       if (aiSession.current === session) aiSession.current = null;
+      if (voiceSession.current === voice) voiceSession.current = null;
       window.removeEventListener('message', onMessage);
     };
   }, [handleCall, attempt, doc, pluginId]);
@@ -791,6 +871,7 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
           </span>
         </div>
       )}
+      <PluginVoiceControls view={voiceView} session={voiceSession.current} pluginName={record.manifest?.name ?? record.id} />
       {doc === null ? (
         <div className="empty-state" role="status">Loading screen…</div>
       ) : (

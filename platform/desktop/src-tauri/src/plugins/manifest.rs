@@ -1242,6 +1242,7 @@ impl PluginManifest {
 /// owner's confirmation ceremonial.
 pub const HOST_CAPABILITIES: &[&str] = &[
     "oaiy.ai.complete",
+    "oaiy.voice.session",
     "oaiy.flow.run",
     "oaiy.events.publish",
     "oaiy.services.read",

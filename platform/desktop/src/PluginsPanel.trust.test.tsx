@@ -90,6 +90,14 @@ afterEach(() => {
 });
 
 describe('an unsigned plugin in a release build', () => {
+  it('names persistent voice access and separate native microphone consent before exact-package trust',async()=>{
+    await render([held({...UNSIGNED,state:'unsigned-dev'},{state:'running',manifest:{name:'Voice plugin',version:'0.4.0',capabilities:['oaiy.voice.session']}})]);
+    const confirmSpy=vi.spyOn(window,'confirm').mockReturnValue(false);
+    await act(async()=>{button('Trust this plugin')!.click();});
+    expect(confirmSpy.mock.calls[0][0]).toContain('local voice session access');
+    expect(confirmSpy.mock.calls[0][0]).toContain('explicit consent in each session and native microphone permission');
+    expect(m.trust).not.toHaveBeenCalled();expect(m.start).not.toHaveBeenCalled();expect(m.stop).not.toHaveBeenCalled();
+  });
   it('shows the unsigned badge and its reason, cannot be started, and offers to be trusted', async () => {
     await render([held(UNSIGNED)]);
     expect(host.querySelector('.card-head .badge[data-trust="unsigned"]')?.textContent).toBe('unsigned');
