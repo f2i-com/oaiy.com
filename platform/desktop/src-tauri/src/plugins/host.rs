@@ -1585,29 +1585,27 @@ impl PluginHost {
         let status = identity.status();
 
         // OUR roster, not the plugin's.
-        let approved: Vec<String> = status
-            .approved_mobiles
-            .iter()
-            .map(|m| m.endpoint_key.thumbprint.clone())
-            .collect();
-        if approved.is_empty() {
+        if status.approved_mobiles.is_empty() {
             return Err((
                 "not_paired".into(),
                 "no Companion device has been approved on this desktop yet".into(),
             ));
         }
-        let endpoint_key = status.endpoint_key.clone().ok_or_else(|| {
+        // Sorted: the issuer needs the thumbprints strictly ascending and checks that what it echoes is what was
+        // sent, and the plugin compares the echo with a sorted list. The roster is kept in the order phones were
+        // approved, so two phones or more failed here at random.
+        let roster = crate::companion::RosterSnapshot::of(&status).ok_or_else(|| {
             (
                 "unavailable".to_string(),
                 "the desktop endpoint identity is unavailable".to_string(),
             )
         })?;
         let binding = serde_json::json!({
-            "endpointPublicKey": endpoint_key,
-            "holderKeyThumbprint": endpoint_key.thumbprint,
-            "approvedPeerKeyThumbprints": approved,
-            "peerRosterRevision": status.roster_revision,
-            "peerRosterHash": status.roster_hash,
+            "endpointPublicKey": roster.endpoint_key,
+            "holderKeyThumbprint": roster.endpoint_key.thumbprint,
+            "approvedPeerKeyThumbprints": roster.thumbprints,
+            "peerRosterRevision": roster.revision,
+            "peerRosterHash": roster.hash,
         });
 
         let config = broker.upstream.get().ok_or_else(|| {
@@ -2580,6 +2578,91 @@ mod tests {
             .unwrap_err();
         assert_eq!(code, "not_paired");
         assert!(message.contains("approved"), "{message}");
+    }
+
+    /// An issuer as the relay's and FormLogic's are: it refuses a roster whose thumbprints are not strictly ascending
+    /// or whose hash is not the protocol's for them, and otherwise echoes what it was asked to bind.
+    fn strict_issuer() -> crate::link::testkit::Provider {
+        use crate::link::testkit::{Provider, Reply};
+        Provider::start(|req| {
+            let body: Value = serde_json::from_str(&req.body).unwrap_or(Value::Null);
+            let thumbprints: Vec<String> = body["approvedPeerKeyThumbprints"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|t| t.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            if thumbprints.is_empty() || !thumbprints.windows(2).all(|w| w[0] < w[1]) {
+                return Reply::status(400, r#"{"error":"approvedPeerKeyThumbprints must be strictly ascending"}"#);
+            }
+            let revision = body["peerRosterRevision"].as_u64().unwrap_or(0);
+            if body["peerRosterHash"] != json!(crate::companion::peer_roster_hash(revision, &thumbprints)) {
+                return Reply::status(400, r#"{"error":"peerRosterHash is not the hash of that roster"}"#);
+            }
+            let mut echoed = body.clone();
+            echoed["accessToken"] = json!("admission-token");
+            Reply::ok(&echoed.to_string())
+        })
+    }
+
+    /// A host with `aokie` installed, a broker whose issuer is [`strict_issuer`], and the identity phones are approved on.
+    fn admitting_host(tag: &str) -> (Sandbox, Arc<PluginHost>, crate::companion::EndpointIdentityHandle, crate::link::testkit::Provider) {
+        let (sb, host) = host_with(tag, vec![]);
+        install_plugin(&sb, "aokie", &["companion.admission"]);
+        host.registry.lock().unwrap().scan();
+        let companion = broker_for(&sb, &host);
+        let issuer = strict_issuer();
+        let broker = host.companion.lock().unwrap().clone().unwrap();
+        broker
+            .upstream
+            .set(crate::companion::upstream::UpstreamConfig { base_url: issuer.base.clone(), token: "flk_issuer".into(), app_id: Some("app_1".into()) })
+            .unwrap();
+        let identity = companion.identity_for("aokie").unwrap();
+        (sb, host, identity, issuer)
+    }
+
+    /// The roster the issuer was last asked to bind, as `(thumbprints, revision, hash)`.
+    fn asked_to_bind(issuer: &crate::link::testkit::Provider) -> (Vec<String>, u64, String) {
+        let last = issuer.requests().pop().expect("the issuer was asked");
+        let body: Value = serde_json::from_str(&last.body).unwrap();
+        let thumbprints = body["approvedPeerKeyThumbprints"].as_array().unwrap().iter().map(|t| t.as_str().unwrap().to_string()).collect();
+        (thumbprints, body["peerRosterRevision"].as_u64().unwrap(), body["peerRosterHash"].as_str().unwrap().to_string())
+    }
+
+    #[test]
+    fn two_phones_or_more_are_admitted_with_a_sorted_roster_however_they_were_approved() {
+        // The host used to send the roster in the order phones were approved. The relay and FormLogic's issuer need
+        // it strictly ascending and the plugin compares the echo with a sorted list, so with two phones or more the
+        // admission failed unless the thumbprints happened to be in order (one time in n!).
+        use crate::companion::identity::testing::phone_key;
+        let (a, b) = (phone_key(1), phone_key(2));
+        // The phone approved later has the smaller thumbprint: the roster is kept in the wrong order.
+        let (first, second) = if a.thumbprint > b.thumbprint { (a, b) } else { (b, a) };
+        let (_sb, host, identity, issuer) = admitting_host("adm-two");
+        identity.approve_for_tests(&first);
+        identity.approve_for_tests(&second);
+        let kept: Vec<String> = identity.status().approved_mobiles.iter().map(|m| m.endpoint_key.thumbprint.clone()).collect();
+        assert_eq!(kept, [first.thumbprint.clone(), second.thumbprint.clone()], "kept in the order approved, which is not sorted");
+
+        let admission = host.handle_plugin_request("aokie", "companion.admission", json!({})).expect("the issuer accepts what it is sent");
+        assert_eq!(admission["accessToken"], "admission-token");
+        let (thumbprints, revision, hash) = asked_to_bind(&issuer);
+        assert_eq!(thumbprints, [second.thumbprint.clone(), first.thumbprint.clone()], "sorted");
+        assert_eq!(revision, 2);
+        assert_eq!(hash, crate::companion::peer_roster_hash(2, &thumbprints));
+
+        // Up to the relay's sixteen, in any order.
+        for n in [3usize, 5, 16] {
+            let (_sb, host, identity, issuer) = admitting_host("adm-many");
+            for seed in (1..=n as u8).rev() {
+                identity.approve_for_tests(&phone_key(seed));
+            }
+            let kept: Vec<String> = identity.status().approved_mobiles.iter().map(|m| m.endpoint_key.thumbprint.clone()).collect();
+            assert_eq!(kept.len(), n);
+            assert!(kept.windows(2).any(|w| w[0] > w[1]), "{n} phones: kept out of order");
+            host.handle_plugin_request("aokie", "companion.admission", json!({})).unwrap_or_else(|e| panic!("{n} phones: {e:?}"));
+            let (thumbprints, _, _) = asked_to_bind(&issuer);
+            assert_eq!(thumbprints.len(), n);
+            assert!(thumbprints.windows(2).all(|w| w[0] < w[1]), "{thumbprints:?}");
+        }
     }
 
     #[test]
