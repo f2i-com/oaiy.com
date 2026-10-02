@@ -57,6 +57,10 @@ members = [
     # yet, and `cargo test -p oaiy-crypto -p oaiy-keystore` runs them.
     "crates/oaiy-crypto",
     "crates/oaiy-keystore",
+    # The relay client, once for the desktop and the phone (docs: design/relay.final.md 4.16.1, work package DK-03; design/mobile.final.md MOB-08, MOB-21a, MOB-22a):
+    # strict JSON and base64url, the protocol's signed objects, pairing v3 for both parties, the poll loop's rules (README 5.1.1) and the client behind traits.
+    # A library on `oaiy-crypto` with no consumer yet, so a member and not a default member, like the two above.
+    "crates/oaiy-relay-core",
 ]
 default-members = [
     "crates/oaiy-engine",

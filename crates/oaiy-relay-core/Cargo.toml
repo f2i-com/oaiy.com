@@ -1,0 +1,31 @@
+[package]
+name = "oaiy-relay-core"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "The shared OAIY relay client core: strict JSON and base64url, the protocol's signed objects, pairing v3 for both parties, the poll loop's decision rules (README 5.1.1) and a relay client behind traits, for the desktop and the phone"
+publish = false
+
+# Not std-only like the engine core (CONVENTIONS.md): the protocol's cryptography is `oaiy-crypto` (the audited RustCrypto and dalek crates behind one reviewed
+# surface), and nothing here writes its own. Everything else is this crate's own code: no serde, no tokio, no HTTP client, no TLS. The two optional features add
+# no dependency of their own (`loopback-http` and `testing` are std-only); `keystore` adds `oaiy-keystore`. No unsafe code.
+[dependencies]
+oaiy-crypto = { path = "../oaiy-crypto" }
+zeroize = "1.8.2"
+oaiy-keystore = { path = "../oaiy-keystore", optional = true }
+
+[features]
+default = []
+# A blocking HTTP/1.1 client over std::net::TcpStream that refuses every host but loopback, and the plain `http://` relay URL that only loopback may use (README
+# section 1: "plain http is accepted by a client only for loopback in test builds"). For tests, the end-to-end harness and nothing else: it has no TLS.
+loopback-http = []
+# The in-process stub relay, the scripted transport, the fake clock and the seeded random source that this crate's own tests use, public so that a consumer's
+# integration tests (the desktop's, the phone's, the end-to-end harness) can drive the client without PHP.
+testing = []
+# `SecretStore` over `oaiy-keystore`'s `KeyStore` (the desktop's K1).
+keystore = ["dep:oaiy-keystore"]
+
+[dev-dependencies]
+oaiy-relay-core = { path = ".", features = ["testing", "loopback-http", "keystore"] }
+# A second, independent JSON implementation, for the differential tests of this crate's own parser. Already in the workspace lockfile.
+serde_json = "1.0.151"
