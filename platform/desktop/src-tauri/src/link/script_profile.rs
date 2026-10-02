@@ -1204,8 +1204,7 @@ mod tests {
 
     #[test]
     fn no_provider_name_is_written_into_this_module() {
-        let source = include_str!("script_profile.rs").replace("\r\n", "\n");
-        let code_only = source.split("#[cfg(test)]\nmod tests").next().unwrap().to_string();
+        let code_only = crate::source_scan::production_code(include_str!("script_profile.rs"));
         for forbidden in ["formlogic", "FormLogic", "validators", "logic-engine", "__flBinding"] {
             assert!(
                 !code_only.contains(forbidden),

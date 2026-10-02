@@ -56,6 +56,7 @@
 
 use std::time::{Duration, Instant};
 
+use super::creds::{AuthedRequest, CredKind, Creds};
 use super::descriptor::{self, HeartbeatSpec, ScriptProfileSpec};
 use super::script_profile::ProfileCache;
 use super::{LinkHandle, LinkedAccount};
@@ -388,7 +389,8 @@ static HTTP: super::net::LaneClient<reqwest::blocking::Client> =
     super::net::LaneClient::new(build_client);
 
 fn build_client() -> Result<reqwest::blocking::Client, String> {
-    super::net::blocking_builder(super::net::Keep::Never)
+    // A credentialed client: redirects off and one user agent (see `creds`).
+    super::creds::client_builder(super::net::Keep::Never)
         // On the client, as it always was: the only request this lane makes.
         .timeout(BEAT_TIMEOUT)
         .build()
@@ -429,10 +431,14 @@ fn send(
         );
     }
 
+    // The provider's key, for the provider's origin: chosen by `creds` from where the beat is going, and
+    // refused before anything is sent if the link's address is not one a credential can go to.
+    let creds = Creds::for_account(account).map_err(|e| e.to_string())?;
     let resp = client
         .post(&url)
-        .bearer_auth(&account.credential)
         .json(&serde_json::Value::Object(body))
+        .with_creds(&creds, CredKind::Provider)
+        .map_err(|e| format!("the heartbeat was not sent: {e}"))?
         .send()
         .map_err(|e| super::net::unreachable(&e))?;
 
@@ -830,6 +836,23 @@ mod tests {
         send(&linked(server.base.clone(), "flk_beat"), &spec(), "oaiy-test", &[]).unwrap();
         let held = server.closed_after_reply(0, Duration::from_secs(15));
         assert!(held < Duration::from_secs(2), "the connection was held open {held:?} after its reply");
+    }
+
+    #[test]
+    fn a_beat_is_not_taken_on_by_a_redirect_and_is_not_sent_to_an_address_a_credential_cannot_go_to() {
+        // The beat's client follows no redirect (`creds::client_builder`): a provider that answers with one gets
+        // its answer back as the answer, and the key does not follow it, whichever scheme or port it points at.
+        let elsewhere = Provider::start(|_| Reply::ok("{}"));
+        let moved_to = format!("{}/moved", elsewhere.base);
+        let provider = Provider::start(move |_| Reply::redirect(307, &moved_to));
+        let error = send(&linked(provider.base.clone(), "flk_beat"), &spec(), "oaiy-test", &[]).unwrap_err();
+        assert!(error.starts_with("HTTP 307"), "{error}");
+        assert_eq!(provider.requests()[0].header("authorization"), Some("Bearer flk_beat"));
+        assert!(elsewhere.requests().is_empty(), "nothing was sent where it pointed: {:?}", elsewhere.lines());
+
+        // A link whose address is not an origin a credential goes to sends nothing at all.
+        let error = send(&linked("ftp://formlogic.com".into(), "flk_beat"), &spec(), "oaiy-test", &[]).unwrap_err();
+        assert!(error.contains("not one a credential can be sent to"), "{error}");
     }
 
     #[test]

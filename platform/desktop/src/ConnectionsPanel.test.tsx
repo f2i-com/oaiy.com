@@ -13,7 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const {
   relayStatusMock, setRelayMock, clearRelayMock,
-  linkStatusMock, linkStartMock, unlinkMock, cancelLinkMock,
+  linkStatusMock, linkStartMock, unlinkMock, removeCopiesMock, cancelLinkMock,
   pendingMock, pairedMock, pushMock,
 } = vi.hoisted(() => ({
   relayStatusMock: vi.fn(),
@@ -22,6 +22,7 @@ const {
   linkStatusMock: vi.fn(),
   linkStartMock: vi.fn(),
   unlinkMock: vi.fn(),
+  removeCopiesMock: vi.fn(),
   cancelLinkMock: vi.fn(),
   pendingMock: vi.fn(),
   pairedMock: vi.fn(),
@@ -38,6 +39,7 @@ vi.mock('./api', () => ({
     status: linkStatusMock,
     start: linkStartMock,
     unlink: unlinkMock,
+    removeCopies: removeCopiesMock,
     cancel: cancelLinkMock,
   },
   pairing: {
@@ -105,6 +107,7 @@ beforeEach(() => {
   linkStatusMock.mockResolvedValue(IDLE);
   linkStartMock.mockResolvedValue({ authorizeUrl: 'https://acme.example/authorize?x=1' });
   unlinkMock.mockResolvedValue(IDLE);
+  removeCopiesMock.mockResolvedValue(IDLE);
   cancelLinkMock.mockResolvedValue({ ...IDLE, attempt: { phase: 'cancelled' } });
   vi.stubGlobal('confirm', vi.fn().mockReturnValue(true));
 });
@@ -415,6 +418,200 @@ describe('ConnectionsPanel · Linked account', () => {
     const msg = (globalThis.confirm as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
     expect(msg).toContain('does not revoke it at the provider');
     expect(unlinkMock).toHaveBeenCalled();
+  });
+
+  const LINKED = {
+    linked: true,
+    connectorName: 'Acme Cloud',
+    baseUrl: 'https://acme.example',
+    accountName: 'Reception PC',
+    attempt: { phase: 'linked' },
+    available: [CONNECTOR],
+  };
+
+  it('says Disconnected only when the key was forgotten', async () => {
+    linkStatusMock.mockResolvedValue(LINKED);
+    unlinkMock.mockResolvedValue(IDLE);
+    await mount();
+    await click('Disconnect');
+    expect(pushMock).toHaveBeenCalledWith({ kind: 'success', title: 'Disconnected Acme Cloud' });
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+  });
+
+  it('does not say Disconnected when the host could not remove the stored link, and keeps the account on the card', async () => {
+    // A program holding account.json without delete sharing (a scanner, an indexer) makes the removal fail. The
+    // host answers with the link still in place and says why; a green "Disconnected" would tell the owner the
+    // key is gone when it is on the disk and links this desktop again at the next start.
+    const why = 'the link could not be forgotten: link/account.json could not be removed (Access is denied. (os error 5)). It is still linked here.';
+    linkStatusMock.mockResolvedValue(LINKED);
+    unlinkMock.mockResolvedValue({ ...LINKED, linkError: { file: 'link/account.json', message: why, kind: 'notForgotten' } });
+    await mount();
+    await click('Disconnect');
+
+    expect(pushMock).not.toHaveBeenCalledWith(expect.objectContaining({ kind: 'success' }));
+    expect(pushMock.mock.calls.some(([t]) => /^Disconnected /.test(t.title) && !/but not all/.test(t.title))).toBe(false);
+    expect(pushMock).toHaveBeenCalledWith(expect.objectContaining({ kind: 'error', title: 'Could not disconnect Acme Cloud', body: why }));
+    // The reason is said once, in the banner for what the owner just did: the status carries it too, and a second
+    // banner with the same words under the first would be noise (and one that says it without the other is a bug).
+    const alerts = container.querySelectorAll('[role="alert"]');
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0].textContent).toContain('could not be removed');
+    expect(container.querySelector('[data-link-error]')).toBeNull();
+    // Still linked: the card, its account and its Disconnect button are there to try again.
+    expect(container.textContent).toContain('Reception PC');
+    expect(Array.from(container.querySelectorAll('button')).some((b) => b.textContent?.trim() === 'Disconnect')).toBe(true);
+    expect(container.querySelector('[data-copies-left]')).toBeNull();
+  });
+
+  it('does not say Disconnected when the host answers with the account still linked and gives no reason', async () => {
+    // Whatever the host leaves out, an answer that still has the account linked is not a disconnect: the owner is
+    // told so in a sentence of the panel's own, and nothing green is shown.
+    linkStatusMock.mockResolvedValue(LINKED);
+    unlinkMock.mockResolvedValue(LINKED);
+    await mount();
+    await click('Disconnect');
+
+    expect(pushMock).not.toHaveBeenCalledWith(expect.objectContaining({ kind: 'success' }));
+    expect(pushMock).toHaveBeenCalledWith({ kind: 'error', title: 'Could not disconnect Acme Cloud', body: 'Acme Cloud is still linked on this computer.' });
+    const alerts = container.querySelectorAll('[role="alert"]');
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0].textContent).toBe('Acme Cloud is still linked on this computer.');
+    expect(container.textContent).toContain('Reception PC');
+  });
+
+  it('says so, and offers Remove copies, when the link was forgotten and a copy of its key could not be removed', async () => {
+    const why = 'Disconnected, but a copy of the old key could not be removed: account.json.corrupt (Access is denied. (os error 5)). Close the program that holds it and press Remove copies.';
+    linkStatusMock.mockResolvedValue(LINKED);
+    unlinkMock.mockResolvedValue({ ...IDLE, linkError: { file: 'link/account.json', message: why, kind: 'copiesLeft' } });
+    await mount();
+    await click('Disconnect');
+    expect(pushMock).not.toHaveBeenCalledWith(expect.objectContaining({ kind: 'success' }));
+    expect(pushMock).toHaveBeenCalledWith(expect.objectContaining({ kind: 'error', title: 'Disconnected Acme Cloud, but not all of it', body: why }));
+
+    // One banner, its own: the words, and the button that tries again. Not the "stored link could not be used"
+    // one (nothing is stored and nothing is to be read again), and not a second one with the same words and no button.
+    const alerts = container.querySelectorAll('[role="alert"]');
+    expect(alerts).toHaveLength(1);
+    const banner = container.querySelector('[data-copies-left]')!;
+    expect(banner).toBe(alerts[0]);
+    expect(banner.textContent).toContain('a copy of the old key could not be removed: account.json.corrupt');
+    expect(banner.textContent).not.toContain('The stored link could not be used');
+    expect(banner.textContent).not.toContain('Nothing was deleted');
+    expect(container.querySelector('[data-link-error]')).toBeNull();
+    expect(Array.from(container.querySelectorAll('button')).some((b) => b.textContent?.trim() === 'Remove copies')).toBe(true);
+    // It is disconnected: the account can be linked again, and the card is gone.
+    expect(Array.from(container.querySelectorAll('button')).some((b) => b.textContent?.trim() === 'Link account')).toBe(true);
+    expect(container.textContent).not.toContain('Reception PC');
+  });
+
+  it('removes the copies on Remove copies, asks for nothing else to be forgotten, and says so when it worked', async () => {
+    const left = { file: 'link/account.json', message: 'Disconnected, but a copy of the old key could not be removed: account.json.corrupt (held). Close the program that holds it and press Remove copies.', kind: 'copiesLeft' };
+    linkStatusMock.mockResolvedValue({ ...IDLE, linkError: left });
+    removeCopiesMock.mockResolvedValue(IDLE);
+    await mount();
+    expect(container.querySelector('[data-copies-left]')).not.toBeNull();
+
+    await click('Remove copies');
+    // The copies only: not the call that forgets a link, and nothing asked of the owner first.
+    expect(removeCopiesMock).toHaveBeenCalledTimes(1);
+    expect(unlinkMock).not.toHaveBeenCalled();
+    expect(globalThis.confirm).not.toHaveBeenCalled();
+    expect(pushMock).toHaveBeenCalledWith({ kind: 'success', title: 'Copies of the old key removed' });
+    // And what was said is gone with them, the plain panel of a desktop nobody linked is what is left.
+    expect(container.querySelector('[data-copies-left]')).toBeNull();
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    expect(Array.from(container.querySelectorAll('button')).some((b) => b.textContent?.trim() === 'Remove copies')).toBe(false);
+  });
+
+  it('keeps saying it when a copy is still held, and lets the owner press Remove copies again', async () => {
+    const left = { file: 'link/account.json', message: 'Disconnected, but a copy of the old key could not be removed: account.json.corrupt (held). Close the program that holds it and press Remove copies.', kind: 'copiesLeft' };
+    linkStatusMock.mockResolvedValue({ ...IDLE, linkError: left });
+    removeCopiesMock.mockResolvedValue({ ...IDLE, linkError: left });
+    await mount();
+
+    await click('Remove copies');
+    expect(pushMock).toHaveBeenCalledWith({ kind: 'error', title: 'A copy of the old key is still there', body: left.message });
+    expect(pushMock).not.toHaveBeenCalledWith(expect.objectContaining({ kind: 'success' }));
+    expect(container.querySelector('[data-copies-left]')?.textContent).toContain('account.json.corrupt (held)');
+    expect(container.querySelectorAll('[role="alert"]')).toHaveLength(1);
+    // Not left "Removing…" and disabled.
+    const button = Array.from(container.querySelectorAll('button')).find((b) => b.textContent?.trim() === 'Remove copies');
+    expect(button?.disabled).toBe(false);
+
+    // Let go of it, press again: it is gone.
+    removeCopiesMock.mockResolvedValue(IDLE);
+    await click('Remove copies');
+    expect(removeCopiesMock).toHaveBeenCalledTimes(2);
+    expect(container.querySelector('[data-copies-left]')).toBeNull();
+  });
+
+  it('shows the host’s answer when Remove copies cannot even be asked, and keeps the button', async () => {
+    const left = { file: 'link/account.json', message: 'Disconnected, but a copy of the old key could not be removed: account.json.corrupt (held). Close the program that holds it and press Remove copies.', kind: 'copiesLeft' };
+    linkStatusMock.mockResolvedValue({ ...IDLE, linkError: left });
+    removeCopiesMock.mockRejectedValue(new Error('the desktop did not answer'));
+    await mount();
+    await click('Remove copies');
+    const texts = Array.from(container.querySelectorAll('[role="alert"]')).map((a) => a.textContent);
+    expect(texts.some((t) => t?.includes('the desktop did not answer'))).toBe(true);
+    expect(container.querySelector('[data-copies-left]')).not.toBeNull();
+    const button = Array.from(container.querySelectorAll('button')).find((b) => b.textContent?.trim() === 'Remove copies');
+    expect(button?.disabled).toBe(false);
+  });
+
+  it('offers Remove copies for a copy left behind and for nothing else', async () => {
+    const files = { file: 'link/account.json', message: 'x' };
+    for (const [what, status] of [
+      ['an unusable file', { ...IDLE, linkError: { ...files, kind: 'unusable' } }],
+      ['a link not forgotten', { ...LINKED, linkError: { ...files, kind: 'notForgotten' } }],
+      ['a link', LINKED],
+      ['no link', IDLE],
+    ] as const) {
+      linkStatusMock.mockResolvedValue(status);
+      await mount();
+      expect(Array.from(container.querySelectorAll('button')).some((b) => b.textContent?.trim() === 'Remove copies'), what).toBe(false);
+      await act(async () => root.unmount());
+      container.remove();
+    }
+  });
+
+  it('shows why a stored link is not in use, rather than looking as if nobody had linked this desktop', async () => {
+    // An unreadable or newer-shaped account.json used to read as "not linked" with no word said: the link was on
+    // the disk and gone from the screen. The file is kept, and the panel says what is wrong with it.
+    linkStatusMock.mockResolvedValue({
+      ...IDLE,
+      linkError: { file: 'link/account.json', message: 'link/account.json is not a link this version of OAIY understands (an unknown field, line 1, column 99). It has not been changed.', kind: 'unusable' },
+    });
+    await mount();
+    const alert = container.querySelector('[data-link-error]');
+    expect(alert?.getAttribute('role')).toBe('alert');
+    expect(alert?.textContent).toContain('The stored link could not be used.');
+    expect(alert?.textContent).toContain('an unknown field');
+    expect(alert?.textContent).toContain('Nothing was deleted');
+    // It can still be linked again from here.
+    expect(Array.from(container.querySelectorAll('button')).some((b) => b.textContent?.trim() === 'Link account')).toBe(true);
+  });
+
+  it('says that a link that could not be changed is still there, in words that are not the stored link one', async () => {
+    // A linked desktop with an error of its own (the status says it after a forget that failed and the panel was
+    // opened again): its heading is not "stored link could not be used", and "Nothing was deleted. Link again" is
+    // not said to someone whose link is working.
+    const why = 'the link could not be forgotten: link/account.json could not be removed (Access is denied. (os error 5)). It is still linked here.';
+    linkStatusMock.mockResolvedValue({ ...LINKED, linkError: { file: 'link/account.json', message: why, kind: 'notForgotten' } });
+    await mount();
+    const alert = container.querySelector('[data-link-error]');
+    expect(alert?.textContent).toContain('The link could not be changed.');
+    expect(alert?.textContent).toContain(why);
+    expect(alert?.textContent).not.toContain('The stored link could not be used.');
+    expect(alert?.textContent).not.toContain('Nothing was deleted');
+    expect(container.querySelector('[data-copies-left]')).toBeNull();
+  });
+
+  it('says nothing about a stored link that is fine', async () => {
+    linkStatusMock.mockResolvedValue(LINKED);
+    await mount();
+    expect(container.querySelector('[data-link-error]')).toBeNull();
+    expect(container.querySelector('[data-copies-left]')).toBeNull();
+    expect(container.textContent).not.toContain('could not be used');
   });
 });
 

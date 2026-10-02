@@ -109,6 +109,7 @@ A path is matched without regard to case. The first row that matches counts; a p
 | `hf-token` | excluded | Never | The Hugging Face token. To do again: Enter your Hugging Face token again if you use one. |
 | `ai/providers.json` | excluded | Never, unless the keys box is ticked when the backup is made | Your API provider keys. Tick "Include my API provider keys" to add them. To do again: Enter your API provider keys again. |
 | `link/**` | excluded | Never | The FormLogic link's own state (events waiting to be sent, delivery markers, its cache): it belongs to the link, which you make again. |
+| `relay/**` | excluded | Never | The link to your own relay: this computer's token and identity at the relay, and the provider keys it pinned on your word. A second live copy would clash with the original, and a key or a pin is never copied into a backup. To do again: Enrol this computer at your relay again, and confirm your provider's keys again. |
 | `keys/**` | excluded | Never | Key and vault files: Keys and vault files are never put into a backup. |
 | `*.key, *.pem, *.dpapi, auth.json, and in plugin data anything named *token*, *secret*, *credential*, *password*, *pairing*, *outbox*` | excluded | Never | Anything that looks like a key, a sign-in or something a plugin ties to this computer: Looks like a key, a sign-in or something a plugin ties to this computer: those cannot be restored on another, and a backup never holds a credential. To do again: Sign in or pair again in each plugin that asks. |
 | `models/**, python/**, venvs/**, node/**, bin/**` | excluded | Never | Programs and downloaded models: large, and installed or downloaded again. |
@@ -1113,6 +1114,14 @@ in parts through internal routes with a secret made for that one backup.
   message to update.
 - Plugin data is backed up only for plugins OAIY has been taught about (today Aokie's settings
   file); another plugin's data is listed as left out.
+- **Disconnecting FormLogic removes the copies OAIY kept of its link file.** When `link/account.json`
+  cannot be used (a newer OAIY wrote it and you went back to this one, a restore cut it, a program
+  held it open) OAIY keeps it as `account.json.corrupt` (`.corrupt.1` and so on) instead of writing
+  over it, and those copies can hold the key. Disconnect in Connections removes them with the link,
+  including a copy of a link that a newer OAIY wrote and that you kept after going back; to keep
+  one, copy it out of the `link` folder before you disconnect. A copy that cannot be removed (a
+  program has it open) is said on the Connections screen, with a Remove copies button that tries
+  again. The link file and its copies are never in a backup (see the table above).
 
 ## For developers
 

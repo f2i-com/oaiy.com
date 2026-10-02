@@ -1441,12 +1441,7 @@ mod tests {
         // The single most important constraint, asserted against the source
         // rather than trusted. Test fixtures are allowed a provider name; the
         // executing code is not.
-        let source = include_str!("flow_runner.rs").replace("\r\n", "\n");
-        let code_only: String = source
-            .split("#[cfg(test)]\nmod tests")
-            .next()
-            .unwrap()
-            .to_string();
+        let code_only = crate::source_scan::production_code(include_str!("flow_runner.rs"));
         for forbidden in ["formlogic", "FormLogic", "formlogic_list_responses", "llm_chat"] {
             assert!(
                 !code_only.contains(forbidden),

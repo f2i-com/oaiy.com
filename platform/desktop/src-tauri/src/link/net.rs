@@ -540,11 +540,10 @@ mod client_tests {
             ("ai/tunnel.rs", include_str!("../ai/tunnel.rs")),
             ("calendar/sync.rs", include_str!("../calendar/sync.rs")),
         ] {
-            // Everything before the module of tests (a lane may have a helper of
-            // its own for them above it).
-            let source = source.replace("\r\n", "\n");
-            let code = source.split("#[cfg(test)]\nmod tests").next().unwrap();
-            assert!(code.len() < source.len(), "{name}: the module of tests was not found");
+            // The code that runs: what is not under `#[cfg(test)]`, a helper for the tests
+            // above the module of tests and anything after it included.
+            let code = &crate::source_scan::production_code(source);
+            assert!(code != source, "{name}: there are no tests in it, or the source was not read as it is");
             for forbidden in ["Client::builder()", "Client::new()"] {
                 assert!(!code.contains(forbidden), "{name} builds its own client with {forbidden}");
             }

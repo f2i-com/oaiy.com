@@ -16,6 +16,11 @@ mod isolated_webview;
 /// Writing a secret to disk owner-only from its first byte (every store of a key or token uses it).
 pub mod secret_file;
 pub mod link;
+/// The owner-run relay's side of the desktop: its files so far (see `relay::link_store`).
+pub mod relay;
+/// Reading the crate's sources in a test without reading its test code (the guards that scan them use it).
+#[cfg(test)]
+mod source_scan;
 pub mod ai;
 pub mod http;
 pub mod services;

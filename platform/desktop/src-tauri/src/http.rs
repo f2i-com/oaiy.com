@@ -1999,9 +1999,42 @@ mod tests {
         assert!(!is_allowed_origin("http://evil.formlogic.local"));
         assert!(!is_allowed_origin("https://formlogic.local"));
         assert!(!is_allowed_origin("http://formlogic.local:8080"));
+        // The trust is the broad kind only: a page of the linked provider is not one of OAIY's own windows, so the
+        // routes that define code or destroy data (and `/api/relay/*`, design 4.16.7) do not take it.
+        assert!(!is_allowed_origin_privileged("http://formlogic.local"));
 
         crate::link::set_linked_origin_for_tests(None);
         assert!(!is_allowed_origin("http://formlogic.local"), "unlinking withdraws it");
+    }
+
+    #[test]
+    fn a_relay_is_never_a_trusted_web_origin_however_it_is_linked() {
+        // Design 4.16.6. The relay's address is kept in a type of its own, `relay::link_store::RelayLink`, which no rule
+        // of this file reads: a relay is a place this desktop sends its token to, not a page that may drive it. So a relay
+        // enrolled at an address is no more trusted than the same address was before, by either rule, whatever the port
+        // or the scheme, and enrolling one does not touch the cell that trusts the provider's origin.
+        let dir = std::env::temp_dir().join(format!("oaiy-http-relay-origin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let relay = crate::relay::link_store::RelayStore::open(&dir);
+        relay
+            .set_relay(crate::relay::link_store::RelayLink {
+                relay_url: "https://relay.example.com".into(),
+                relay_id: "rly-1".into(),
+                relay_thumbprint: "t".repeat(43),
+                device_id: "dev-1".into(),
+                token: "oaiyrt1.TOKEN".into(),
+                name: "Reception PC".into(),
+                enrolled_at: chrono::Utc::now(),
+                calibration: None,
+                other: Default::default(),
+            })
+            .unwrap();
+        for origin in ["https://relay.example.com", "https://relay.example.com:443", "https://relay.example.com:8443", "http://relay.example.com", "http://relay.local"] {
+            assert!(!is_allowed_origin(origin), "{origin}");
+            assert!(!is_allowed_origin_privileged(origin), "{origin}");
+        }
+        assert_ne!(crate::link::linked_origin().as_deref(), Some("https://relay.example.com"), "enrolling a relay is not linking a provider");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

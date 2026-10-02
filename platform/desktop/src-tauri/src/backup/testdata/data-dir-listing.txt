@@ -66,6 +66,10 @@ plugins/trusted-plugins.json	excluded
 plugins/disabled.json	excluded
 relay-log.jsonl	excluded
 relay-reads.jsonl	excluded
+relay/relay.json	excluded
+relay/routes.json	excluded
+relay/providers.json	excluded
+relay/relay.json.corrupt	excluded
 restore/pending.json	excluded
 backup/status.json	excluded
 scripts/install-krea2.ps1	excluded

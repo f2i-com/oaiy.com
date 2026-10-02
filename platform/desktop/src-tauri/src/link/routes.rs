@@ -5,7 +5,7 @@
 //! a local web page should be able to do by being on loopback.
 
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -55,8 +55,20 @@ async fn start(
 /// provider's business and needs a route this descriptor does not describe;
 /// pretending otherwise would tell the user their key was dead when it was not.
 /// The UI says so.
-async fn unlink(State(store): State<LinkHandle>) -> Json<LinkStatus> {
-    Json(store.unlink())
+///
+/// With `?copiesOnly=true` it only tries again to remove the copies kept of an earlier key that a previous forget
+/// could not remove (`linkError.kind` is `copiesLeft`), which is the panel's "Remove copies". A link there is now is
+/// left alone, so a screen that has not heard of it yet cannot disconnect it by retrying. It is the same route and
+/// the same scope, so the table of routes has nothing new to learn.
+async fn unlink(State(store): State<LinkHandle>, Query(q): Query<UnlinkQuery>) -> Json<LinkStatus> {
+    Json(if q.copies_only { store.remove_copies() } else { store.unlink() })
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UnlinkQuery {
+    #[serde(default)]
+    copies_only: bool,
 }
 
 /// Hand an authorize URL to the user's browser.
