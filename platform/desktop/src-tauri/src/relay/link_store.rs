@@ -389,9 +389,8 @@ mod tests {
         let mut read = 0;
         for entry in std::fs::read_dir(&folder).unwrap() {
             let path = entry.unwrap().path();
-            let source = std::fs::read_to_string(&path).unwrap().replace("\r\n", "\n");
             // This test names them; everything else must not.
-            let code = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+            let code = crate::source_scan::production_code(&std::fs::read_to_string(&path).unwrap());
             for name in ["linked_origin", "set_linked_origin", "is_allowed_origin", "LINKED_ORIGIN"] {
                 assert!(!code.contains(name), "{} names {name}", path.display());
             }

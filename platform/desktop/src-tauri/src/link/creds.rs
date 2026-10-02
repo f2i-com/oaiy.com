@@ -504,10 +504,9 @@ mod tests {
     #[test]
     fn a_converted_lane_reads_its_credential_nowhere_but_here() {
         for (name, source) in CONVERTED {
-            // Everything before the module of tests: the code that runs.
-            let source = source.replace("\r\n", "\n");
-            let code = source.split("#[cfg(test)]\nmod tests").next().unwrap();
-            assert!(code.len() < source.len(), "{name}: the module of tests was not found");
+            // The code that runs: what is not under `#[cfg(test)]`, wherever in the file that is.
+            let code = &crate::source_scan::production_code(source);
+            assert!(code != source, "{name}: there are no tests in it, or the source was not read as it is");
             for forbidden in ["bearer_auth", ".credential", "AUTHORIZATION", "\"Bearer", "Bearer {", "\"authorization\"", "basic_auth"] {
                 assert!(!code.contains(forbidden), "{name} puts a credential on a request itself ({forbidden}): it goes through creds.rs");
             }

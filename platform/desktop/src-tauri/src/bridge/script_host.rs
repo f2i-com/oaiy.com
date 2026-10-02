@@ -1921,16 +1921,11 @@ rl.on('close', () => {{ if (!IGNORE_SHUTDOWN) queue.then(() => process.exit(0));
         // one identifier of a provider's standard library, would make this
         // desktop a client of ONE provider — and the profile exists precisely
         // so that none of that has to be written down anywhere.
-        // `include_str!` reads this file as it sits in the checkout, and
-        // nothing pins `*.rs` to LF, so a Windows checkout hands it CRLF.
-        // Normalise before splitting: the marker below is written with a
-        // bare newline and matches nothing in CRLF bytes, so `split` yields
-        // the whole file and the scan then reads its OWN forbidden list —
-        // failing on every platform that checks out CRLF, and only there.
-        // Both escapes have to BE escapes: written as real newlines the
-        // normalisation is a no-op, which is what hid this.
-        let source = include_str!("script_host.rs").replace("\r\n", "\n");
-        let code_only = source.split("#[cfg(test)]\nmod tests").next().unwrap().to_string();
+        // The code that runs, read as the lexer reads it, so that a checkout with CRLF line endings and a
+        // test helper in the middle of the file are the same to it as an LF one with the tests at the end:
+        // a scan that read this test's own forbidden list would fail on Windows alone, and one that stopped
+        // at the first `#[cfg(test)]` would not read the rest.
+        let code_only = crate::source_scan::production_code(include_str!("script_host.rs"));
         for forbidden in ["formlogic", "FormLogic", "aokie", "validators", "isEmpty"] {
             assert!(!code_only.contains(forbidden), "{forbidden:?} must not appear outside the tests");
         }
