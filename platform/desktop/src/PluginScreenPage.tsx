@@ -14,6 +14,7 @@ import {
 import { useToast } from './Toasts';
 import { moduleOn, useModules } from './useModules';
 import { serializePluginCallError, unwrapPluginCommandResponse, type PluginErrorDetails } from './pluginRpc';
+import { PluginAiSession } from './pluginAi';
 
 /**
  * Host for a plugin-contributed screen.
@@ -226,6 +227,9 @@ export const HOST_BOOTSTRAP = `
       pending[id] = { resolve: resolve, reject: reject };
       pending[id].timer = setTimeout(function () {
         delete pending[id];
+        if (method === 'aiComplete' && args && args[0] && typeof args[0].requestId === 'string') {
+          parent.postMessage({ __pluginHost: 1, id: 'cancel-' + id, method: 'aiCancel', args: [args[0].requestId] }, '*');
+        }
         reject(new Error('The desktop did not respond. The outcome may be unknown; check its status before trying the action again.'));
       }, 20000);
       parent.postMessage({ __pluginHost: 1, id: id, method: method, args: args || [] }, '*');
@@ -271,6 +275,8 @@ export const HOST_BOOTSTRAP = `
     toast: function (kind, message) { return call('toast', [kind, message]); },
     snapshot: function () { return call('snapshot', []); },
     aiSources: function () { return call('aiSources', []); },
+    aiComplete: function (request) { return call('aiComplete', [request]); },
+    aiCancel: function (requestId) { return call('aiCancel', [requestId]); },
     restartPlugin: function () { return call('restartPlugin', []); },
     // Open one of the dashboard's own pages ('agent', 'calendar', 'engines',
     // ...). The frame cannot navigate itself out of the sandbox, so the host
@@ -413,6 +419,9 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
   const modulesRef = useRef(modules);
   modulesRef.current = modules;
   const [record, setRecord] = useState<PluginRecord | null | undefined>(undefined);
+  const recordRef = useRef(record);
+  recordRef.current = record;
+  const aiSession = useRef<PluginAiSession | null>(null);
   // The manifest selects and assembles the iframe once. Runtime status changes
   // separately so a health refresh cannot remount a call console or transcript.
   const [runtimeStatus, setRuntimeStatus] = useState<Pick<PluginRecord, 'state' | 'reason'> | null>();
@@ -552,7 +561,18 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
           return current;
         }
         case 'aiSources':
+          // Older screens keep their metadata-only catalogue. The new
+          // completion capability uses the scoped server catalogue instead.
+          if (recordRef.current?.manifest?.capabilities?.includes('oaiy.ai.complete')) {
+            return await aiSession.current?.sources() ?? [];
+          }
           return pluginAiSources((await bridge.aiSources()).sources);
+        case 'aiComplete':
+          if (args.length !== 1 || !aiSession.current) throw new Error('The AI completion screen is unavailable.');
+          return await aiSession.current.complete(args[0]);
+        case 'aiCancel':
+          if (args.length !== 1 || !aiSession.current) throw new Error('The AI completion screen is unavailable.');
+          return await aiSession.current.cancel(args[0]);
         case 'restartPlugin':
           await plugins.stop(pluginId).catch(() => {});
           await plugins.start(pluginId);
@@ -653,6 +673,8 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
   // RPC pump: only messages from OUR iframe are serviced.
   useEffect(() => {
     let active = true;
+    const session = new PluginAiSession(pluginId, API_BASE);
+    aiSession.current = session;
     const onMessage = (e: MessageEvent) => {
       const m = e.data as { __pluginHost?: number; id?: string; method?: string; args?: unknown[] };
       if (!m || m.__pluginHost !== 1 || typeof m.id !== 'string' || !m.id || m.id.length > 128 ||
@@ -672,8 +694,13 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
         .catch((err) => reply({ ok: false, ...serializePluginCallError(err) }));
     };
     window.addEventListener('message', onMessage);
-    return () => { active = false; window.removeEventListener('message', onMessage); };
-  }, [handleCall, attempt]);
+    return () => {
+      active = false;
+      session.dispose();
+      if (aiSession.current === session) aiSession.current = null;
+      window.removeEventListener('message', onMessage);
+    };
+  }, [handleCall, attempt, doc, pluginId]);
 
   // Forward declared plugin events to the screen.
   useEffect(() => {

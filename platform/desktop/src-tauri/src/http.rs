@@ -1122,7 +1122,7 @@ fn is_bridge_exec_path(path: &str) -> bool {
 /// and `/api/ai/{v1,providers/:id/v1}/*` (the gateway). GET reads are handled by
 /// `is_restricted_read_path`, not here.
 fn is_ai_exec_path(path: &str) -> bool {
-    path.starts_with("/api/ai/")
+    path.starts_with("/api/ai/") || crate::ai::plugin_completion::is_route(path)
 }
 
 /// GET /api/services/:id/export returns the FULL ServiceTemplate — including `run.env` (which a
@@ -1188,7 +1188,7 @@ fn is_restricted_read_path(path: &str) -> bool {
         // The AI gateway's reads: sources union + provider listing (names, base
         // URLs, hasKey/enabled — no secret) and the models proxy. Not for an
         // arbitrary remote page; a paired token or a trusted origin passes.
-        || path.starts_with("/api/ai/")
+        || path.starts_with("/api/ai/") || crate::ai::plugin_completion::is_route(path)
         || is_personal_path(path)
         // The Agent's model (engine or ChatGPT). Already under `/api/agent/`,
         // named so it stays gated if that prefix ever narrows.
@@ -1675,15 +1675,17 @@ pub async fn serve(
         }
     }
     let ring_routes = crate::ring::routes::router(crate::ring::shared().unwrap_or_else(|| crate::ring::Ring::in_memory(Default::default())));
+    let plugin_ai_host = bridge.host.clone();
     let bridge_routes = crate::bridge::bridge_router(bridge);
 
     // The AI gateway is its own sub-router with its own state (provider store +
     // registry clone), merged INSIDE the guard layers like the bridge — provider
     // CRUD and the credential-injecting chat proxy need the same origin/token gate.
     let ai_state = crate::ai::AiState::new(ai_providers, registry_for_ai, ai_codex);
+    let plugin_ai_routes = crate::ai::plugin_completion::router(ai_state.clone(), plugin_ai_host, isolated);
     // Aokie's gateway (17872): calls, and a provider's chat for Aokie's own speech lanes.
     if !isolated { tokio::spawn(crate::voice::serve_gateway(voice, crate::ai::provider_chat_router(ai_state.clone()))); }
-    let ai_routes = crate::ai::ai_router(ai_state);
+    let ai_routes = crate::ai::ai_router(ai_state).merge(plugin_ai_routes);
 
     let app = Router::new()
         .route("/api/health", get(health))
@@ -2378,6 +2380,9 @@ mod tests {
             (Method::POST, "/api/ai/providers/openai/test"),
             (Method::POST, "/api/ai/v1/chat/completions"),
             (Method::POST, "/api/ai/providers/openai/v1/chat/completions"),
+            (Method::POST, "/api/plugins/probe/ai/complete"),
+            (Method::POST, "/api/plugins/%70robe/ai/complete"),
+            (Method::POST, "/api/plugins/probe/ai/cancel"),
         ] {
             assert!(is_privileged_path(&m, path), "{m} {path} must be privileged");
         }
@@ -2388,8 +2393,33 @@ mod tests {
             "/api/ai/providers",
             "/api/ai/v1/models",
             "/api/ai/providers/openai/v1/models",
+            "/api/plugins/probe/ai/sources",
+            "/api/plugins/%70robe/ai/sources",
         ] {
             assert!(is_restricted_read_path(path), "{path} must be a restricted read");
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_plugin_ai_rejects_missing_or_remote_origins_including_encoded_ids() {
+        use axum::{body::Body, http::Request, middleware, routing::any, Router};
+        use tower::ServiceExt;
+        let app = Router::new().fallback(any(|| async { "called" })).layer(middleware::from_fn_with_state(
+            AuthConfig { token:Some("test-owner".into()), gui_mode:true, pairing:None }, super::origin_guard));
+        for (method,path) in [("POST","/api/plugins/%70robe/ai/complete"),("POST","/api/plugins/probe/ai/cancel"),
+            ("GET","/api/plugins/%70robe/ai/sources"),("HEAD","/api/plugins/probe/ai/sources")] {
+            for origin in [None,Some("https://untrusted.example"),Some("http://untrusted.example:3000")] {
+                let mut req = Request::builder().method(method).uri(path);
+                if let Some(origin) = origin { req = req.header("origin",origin); }
+                assert_eq!(app.clone().oneshot(req.body(Body::empty()).unwrap()).await.unwrap().status(),403,"{method} {path} {origin:?}");
+            }
+            let req = Request::builder().method(method).uri(path).header("origin","http://localhost:3000").body(Body::empty()).unwrap();
+            assert_eq!(app.clone().oneshot(req).await.unwrap().status().as_u16(),if cfg!(debug_assertions) {200} else {403},"the existing debug UI exception is preserved");
+            for auth in [false,true] {
+                let mut req = Request::builder().method(method).uri(path);
+                req = if auth { req.header("authorization","Bearer test-owner") } else { req.header("origin","http://tauri.localhost") };
+                assert_eq!(app.clone().oneshot(req.body(Body::empty()).unwrap()).await.unwrap().status(),200);
+            }
         }
     }
 

@@ -28,6 +28,10 @@ pub fn http_allowed(method: &str, path: &str) -> bool {
         ("GET", ["api", "plugins", _, "logs"]) => true,
         ("GET", ["api", "plugins", _, "ui", _, rest @ ..]) => !rest.is_empty(),
         ("POST", ["api", "bridge", "connectors", _, "request"]) => true,
+        // The scoped handler still requires a trusted live plugin, its manifest
+        // capability and an explicitly configured keyless loopback provider.
+        ("GET", ["api", "plugins", _, "ai", "sources"]) => true,
+        ("POST", ["api", "plugins", _, "ai", "complete" | "cancel"]) => true,
         _ => false,
     }
 }
@@ -67,6 +71,11 @@ mod tests {
             ("POST", "/api/plugins/example/start", 200), ("POST", "/api/plugins/example/stop", 200),
             ("GET", "/api/plugins/example/ui/main/assets/app.js", 200),
             ("POST", "/api/bridge/connectors/example/request", 200),
+            ("GET", "/api/plugins/example/ai/sources", 200),
+            ("POST", "/api/plugins/example/ai/complete", 200),
+            ("POST", "/api/plugins/example/ai/cancel", 200),
+            ("POST", "/api/ai/providers/test/v1/chat/completions", 403),
+            ("POST", "/api/ai/providers", 403),
             ("GET", "/api/ai/codex/status", 403), ("GET", "/api/engines/catalog", 403),
             ("POST", "/api/services/example/start", 403), ("GET", "/api/bridge/status", 403),
             ("POST", "/api/mcp", 403), ("POST", "/api/bridge/runs", 403),

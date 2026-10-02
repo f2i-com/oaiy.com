@@ -517,6 +517,13 @@ pub struct PluginHost {
     ring: Mutex<Option<Arc<crate::ring::Ring>>>,
 }
 
+/// A screen's capability belongs to the exact process the host started from a
+/// verified package. Holding the Arc prevents an old process's identity being
+/// reused after stop/restart while a completion is still in flight.
+pub(crate) struct ScreenCapabilityLease {
+    process: Arc<PluginProcess>,
+}
+
 /// What the host needs to answer `companion.admission`: this desktop's own
 /// device trust, and the upstream that turns it into a gateway admission.
 #[derive(Clone)]
@@ -526,6 +533,34 @@ pub struct CompanionBroker {
 }
 
 impl PluginHost {
+    pub(crate) fn screen_capability(&self, id: &str, capability: &str) -> Result<ScreenCapabilityLease, (&'static str, &'static str)> {
+        {
+            let reg = self.registry.lock().map_err(|_| ("capability_unavailable", "The plugin registry is unavailable."))?;
+            let rec = reg.get(id).ok_or(("capability_unavailable", "The plugin is not installed."))?;
+            if rec.user_disabled || !rec.state.accepts_commands() || !rec.trust.as_ref().is_some_and(|trust|
+                matches!(trust.state, crate::plugins::trust::TrustState::Verified | crate::plugins::trust::TrustState::TrustedLocal)) {
+                return Err(("capability_unavailable", "Trust and start the plugin in Plugins before using AI completion."));
+            }
+            // Adding a spending capability must not retroactively grant it to
+            // an older broad host wildcard. This screen contract requires its
+            // literal name in the package the owner reviewed.
+            if !reg.grants(id, capability) || !rec.manifest.as_ref().is_some_and(|manifest|
+                manifest.capabilities.iter().any(|declared| declared == capability)) {
+                return Err(("capability_denied", "The plugin does not declare the required host capability."));
+            }
+        }
+        let process = self.procs.lock().map_err(|_| ("capability_unavailable", "The plugin process is unavailable."))?
+            .running.get(id).cloned().ok_or(("capability_unavailable", "The plugin process is not running."))?;
+        if process.check_exited().is_some() {
+            return Err(("capability_unavailable", "The plugin process has exited."));
+        }
+        Ok(ScreenCapabilityLease { process })
+    }
+
+    pub(crate) fn holds_screen_capability(&self, id: &str, capability: &str, lease: &ScreenCapabilityLease) -> bool {
+        self.screen_capability(id, capability).is_ok_and(|current| Arc::ptr_eq(&current.process, &lease.process))
+    }
+
     /// Build the host, start its background threads (events, outbox, shed,
     /// supervisor) and start the plugins that start at boot.
     pub fn new(
@@ -3809,6 +3844,32 @@ process.stdin.on("data", (chunk) => {
         let err = host.start("probe").unwrap_err();
         assert!(err.contains("changed since you trusted it"), "{err}");
         assert_eq!(state_of(&host, "probe"), PluginState::Disabled);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn screen_ai_capability_requires_trust_declaration_and_the_same_live_process() {
+        let (sb,host,trust) = trusting_host("screen-ai",TrustPolicy::release(),Publishers::default());
+        let Some(dir) = node_plugin(&sb,"probe") else { panic!("Node is required for this real-process qualification test"); };
+        assert!(host.screen_capability("probe","oaiy.ai.complete").is_err());
+        trust.trust_local(&dir,"probe").unwrap(); host.start("probe").unwrap(); wait_running(&host,"probe");
+        assert_eq!(host.screen_capability("probe","oaiy.ai.complete").err().unwrap().0,"capability_denied");
+        host.stop("probe").unwrap();
+        let path = dir.join("manifest.json");
+        let mut manifest: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        manifest["capabilities"] = json!(["oaiy.*"]); std::fs::write(&path,manifest.to_string()).unwrap();
+        trust.trust_local(&dir,"probe").unwrap(); host.start("probe").unwrap(); wait_running(&host,"probe");
+        assert_eq!(host.screen_capability("probe","oaiy.ai.complete").err().unwrap().0,"capability_denied","a historical wildcard cannot grant spending");
+        host.stop("probe").unwrap();
+        manifest["capabilities"] = json!(["oaiy.ai.complete"]); std::fs::write(path,manifest.to_string()).unwrap();
+        trust.trust_local(&dir,"probe").unwrap(); host.start("probe").unwrap(); wait_running(&host,"probe");
+        let lease = host.screen_capability("probe","oaiy.ai.complete").unwrap();
+        assert!(host.holds_screen_capability("probe","oaiy.ai.complete",&lease));
+        host.stop("probe").unwrap(); assert!(!host.holds_screen_capability("probe","oaiy.ai.complete",&lease));
+        host.start("probe").unwrap(); wait_running(&host,"probe");
+        assert!(!host.holds_screen_capability("probe","oaiy.ai.complete",&lease),"restart cannot revive the old lease");
+        let current = host.screen_capability("probe","oaiy.ai.complete").unwrap();
+        assert!(host.holds_screen_capability("probe","oaiy.ai.complete",&current)); host.stop("probe").unwrap();
     }
 
     /// Rewrite a file with other bytes of the same length and put its modified time back.

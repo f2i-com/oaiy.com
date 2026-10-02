@@ -700,7 +700,7 @@ fn the_walker_finds_the_routes_the_design_counted_and_the_ones_added_since() {
     // `info`, `whoami` and `derive`, and the web login's fifteen (`login.rs`, `console.rs`).
     assert_eq!(
         pairs.len(),
-        165 + 11 + 8 + 3 + 15,
+        165 + 11 + 8 + 3 + 15 + 3,
         "main-router (method, path) pairs"
     );
     let mut built: Vec<String> = ROUTES
@@ -741,6 +741,9 @@ fn the_walker_finds_the_routes_the_design_counted_and_the_ones_added_since() {
         (Verb::Post, "/api/update/agent-flushed"),
         (Verb::Any, "/api/ai/engine/gateway/*path"),
         (Verb::Get, "/api/plugins/:id/ui/:screen/*path"),
+        (Verb::Get, "/api/plugins/:id/ai/sources"),
+        (Verb::Post, "/api/plugins/:id/ai/complete"),
+        (Verb::Post, "/api/plugins/:id/ai/cancel"),
     ] {
         assert!(
             pairs.contains(&(verb, pattern.to_string())),
@@ -757,7 +760,7 @@ fn the_table_has_a_row_for_every_route_the_boot_test_probes_and_the_counts_the_d
     let existing = ROUTES.iter().filter(|r| r.since == 1).count();
     let new_or_reserved = ROUTES.iter().filter(|r| r.since == 2).count();
     // 161 in the design, the eleven routes the code gained since (see above), and the eight of the encrypted backup.
-    assert_eq!(existing, 165 + 11 + 8);
+    assert_eq!(existing, 165 + 11 + 8 + 3);
     // 41 new and 60 reserved in the design; `GET /api/update` (reserved) is gone, replaced by the
     // real `GET /api/update/status`, and four reserved rows (`GET|PATCH /api/messages`,
     // `GET|PUT /api/ring/settings`) are `since: 1` now that their routes exist.

@@ -97,7 +97,14 @@ fn build_stub_routes() -> Router {
 
 /// Every path pattern the table knows, old or new, as a request path.
 fn all_patterns() -> Vec<String> {
-    let mut patterns: Vec<String> = ROUTES.iter().map(|r| concrete(r.pattern)).collect();
+    // The scoped plugin AI endpoints were added after this historical guard
+    // was frozen. They deliberately retain the desktop's legacy credential
+    // lane, with a new strict origin gate tested by plugin_completion. They
+    // have no historical behavior to compare here.
+    let mut patterns: Vec<String> = ROUTES.iter()
+        .filter(|r| !matches!(r.pattern,
+            "/api/plugins/:id/ai/sources" | "/api/plugins/:id/ai/complete" | "/api/plugins/:id/ai/cancel"))
+        .map(|r| concrete(r.pattern)).collect();
     patterns.sort_unstable();
     patterns.dedup();
     patterns
