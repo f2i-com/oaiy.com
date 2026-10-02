@@ -456,6 +456,10 @@ struct ProcTable {
     /// exit for the same reason and the same LogBuffer type. Replaced on the
     /// next spawn, so a restarted plugin does not show its previous life.
     log_rings: HashMap<String, LogBuffer>,
+    /// The roster each broker plugin was handed at its last `plugin.init`, which is the roster it holds (it learns
+    /// it only then, and refuses an admission that differs from it). Replaced, or taken away when the plugin was
+    /// started with none, by each start; see `handle_companion_admission`.
+    rosters: HashMap<String, crate::companion::RosterSnapshot>,
     /// Set by `stop_all`: the app is exiting. Nothing may spawn a child after
     /// it — the autostart loop and a due crash-restart would otherwise start a
     /// plugin with nobody left to stop it.
@@ -937,7 +941,7 @@ impl PluginHost {
         // A broker plugin signs as this desktop's companion endpoint, so it is
         // handed that identity at init. Every other plugin gets None, and so
         // does a broker with no approved device — see `private_bootstrap`.
-        let companion_bootstrap = self
+        let (companion_bootstrap, roster_held) = match self
             .companion
             .lock()
             .ok()
@@ -949,7 +953,21 @@ impl PluginHost {
                     .unwrap_or(false)
             })
             .and_then(|b| b.companion.identity_for(id).ok())
-            .and_then(|identity| identity.private_bootstrap(plugin_api_version as u16));
+            .and_then(|identity| identity.private_bootstrap_with_roster(plugin_api_version as u16))
+        {
+            Some((bootstrap, roster)) => (Some(bootstrap), Some(roster)),
+            None => (None, None),
+        };
+        // The roster this plugin is handed is the roster it holds until it is started again: it accepts an admission
+        // only if it equals that one, so that is what `companion.admission` presents for it (and a plugin started with
+        // none holds none, so it is not kept from an earlier run). Kept BEFORE the handshake, which is the last
+        // moment the plugin can ask.
+        if let Ok(mut t) = self.procs.lock() {
+            match roster_held {
+                Some(roster) => t.rosters.insert(id.to_string(), roster),
+                None => t.rosters.remove(id),
+            };
+        }
         match process.init(
             plugin_api_version,
             &super::runner::plugin_data_dir(&dir),
@@ -1594,12 +1612,23 @@ impl PluginHost {
         // Sorted: the issuer needs the thumbprints strictly ascending and checks that what it echoes is what was
         // sent, and the plugin compares the echo with a sorted list. The roster is kept in the order phones were
         // approved, so two phones or more failed here at random.
-        let roster = crate::companion::RosterSnapshot::of(&status).ok_or_else(|| {
+        let live = crate::companion::RosterSnapshot::of(&status).ok_or_else(|| {
             (
                 "unavailable".to_string(),
                 "the desktop endpoint identity is unavailable".to_string(),
             )
         })?;
+        // What the plugin holds, not what the roster is now. The plugin learns its roster once, at `plugin.init`, and
+        // refuses an admission that differs from it, so a phone approved after that used to break the admissions of every
+        // phone until the plugin was started again. The roster it was handed is presented while every phone in it is
+        // still approved; a phone approved since waits for the next start with the plugin, which does not know it either.
+        // A phone revoked since is NOT presented again: the roster as it is now goes to the issuer, which the plugin
+        // refuses, as it always has, until it is started again.
+        let held = self.procs.lock().ok().and_then(|t| t.rosters.get(plugin_id).cloned());
+        let roster = match held {
+            Some(held) if held.still_holds_in(&live) => held,
+            _ => live,
+        };
         let binding = serde_json::json!({
             "endpointPublicKey": roster.endpoint_key,
             "holderKeyThumbprint": roster.endpoint_key.thumbprint,
@@ -2663,6 +2692,88 @@ mod tests {
             assert_eq!(thumbprints.len(), n);
             assert!(thumbprints.windows(2).all(|w| w[0] < w[1]), "{thumbprints:?}");
         }
+    }
+
+    /// What `start` records for a broker plugin at its `plugin.init`, for a test that has no process to start.
+    fn plugin_initialised(host: &PluginHost, identity: &crate::companion::EndpointIdentityHandle) {
+        let (_, roster) = identity.private_bootstrap_with_roster(1).expect("a roster to hand over");
+        host.procs.lock().unwrap().rosters.insert("aokie".into(), roster);
+    }
+
+    #[test]
+    fn a_running_plugin_is_presented_the_roster_it_was_handed_until_it_is_started_again() {
+        use crate::companion::identity::testing::phone_key;
+        let (a, b, c) = (phone_key(1), phone_key(2), phone_key(3));
+        let (_sb, host, identity, issuer) = admitting_host("adm-held");
+        let sorted = |keys: &[&crate::companion::EndpointPublicKey]| -> Vec<String> {
+            let mut thumbprints: Vec<String> = keys.iter().map(|k| k.thumbprint.clone()).collect();
+            thumbprints.sort();
+            thumbprints
+        };
+        let admit = |what: &str| {
+            host.handle_plugin_request("aokie", "companion.admission", json!({})).unwrap_or_else(|e| panic!("{what}: {e:?}"));
+            asked_to_bind(&issuer)
+        };
+
+        // Two phones, the plugin starts and is handed them.
+        identity.approve_for_tests(&b);
+        identity.approve_for_tests(&a);
+        plugin_initialised(&host, &identity);
+        let (handed, revision, hash) = admit("two phones");
+        assert_eq!(handed, sorted(&[&a, &b]));
+        assert_eq!(revision, 2);
+
+        // A third is approved. The plugin does not know it, and goes on being admitted for the two it does: the
+        // issuer is asked for the roster the plugin was handed, to the byte, and not for a roster of three that the
+        // plugin would refuse.
+        identity.approve_for_tests(&c);
+        assert_eq!(identity.status().approved_mobiles.len(), 3);
+        assert_eq!(admit("a phone approved after init"), (handed.clone(), revision, hash.clone()));
+
+        // A phone is revoked. The roster the plugin holds names it, so that roster is not presented: the issuer is
+        // asked for the roster as it is now (which the plugin refuses, and fails closed until it is started again),
+        // never for one that admits the revoked phone.
+        identity.revoke(&a.thumbprint).unwrap();
+        let (now, now_revision, now_hash) = admit("a phone revoked after init");
+        assert_eq!(now, sorted(&[&b, &c]));
+        assert!(!now.contains(&a.thumbprint), "the revoked phone is not in what the issuer is asked to admit");
+        assert_ne!((now_revision, now_hash), (revision, hash));
+
+        // The plugin is started again: it is handed the roster as it is, and that is what it is presented, whatever
+        // is approved or revoked after.
+        plugin_initialised(&host, &identity);
+        let (restarted, restarted_revision, restarted_hash) = admit("after a restart");
+        assert_eq!(restarted, sorted(&[&b, &c]));
+        let d = phone_key(5);
+        identity.approve_for_tests(&d);
+        assert_eq!(admit("a fourth phone approved after the restart"), (restarted, restarted_revision, restarted_hash));
+
+        // Nobody approved is nobody admitted, whatever the plugin was handed before; and a plugin that was started with
+        // nobody holds nothing, so what it is presented is the roster as it is.
+        for k in [&b, &c, &d] {
+            identity.revoke(&k.thumbprint).unwrap();
+        }
+        let (code, _) = host.handle_plugin_request("aokie", "companion.admission", json!({})).unwrap_err();
+        assert_eq!(code, "not_paired", "an empty roster is still not paired");
+        host.procs.lock().unwrap().rosters.remove("aokie");
+        identity.approve_for_tests(&phone_key(6));
+        assert_eq!(admit("one phone and a plugin that holds none").0.len(), 1, "no held roster: the roster as it is");
+    }
+
+    #[test]
+    fn a_new_key_is_never_presented_a_roster_of_the_old_one() {
+        // `rotate` mints a new key and clears the roster: every phone has to pair again, and a plugin that holds
+        // the old key and the old phones must not have them admitted under it.
+        use crate::companion::identity::testing::phone_key;
+        let (_sb, host, identity, issuer) = admitting_host("adm-rotated");
+        identity.approve_for_tests(&phone_key(1));
+        plugin_initialised(&host, &identity);
+        identity.rotate().unwrap();
+        identity.approve_for_tests(&phone_key(1));
+        host.handle_plugin_request("aokie", "companion.admission", json!({})).unwrap();
+        let sent: Value = serde_json::from_str(&issuer.requests()[0].body).unwrap();
+        let new_key = identity.status().endpoint_key.unwrap();
+        assert_eq!(sent["endpointPublicKey"]["publicKey"], new_key.public_key.as_str(), "the key it is presented under is the key it has");
     }
 
     #[test]
@@ -3871,6 +3982,121 @@ process.stdin.on("data", (chunk) => {
         // A plan the plugin never asked for rings nothing, even from a plugin that holds the capability.
         let stray = host.handle_ring_request("aokie", "oaiy.ring.opened", json!({"planId": "plan_made_up", "requestId": "assist_3", "callId": "call_1", "callEpoch": 1, "ownerEpoch": 1, "expiresAt": expires})).unwrap_err();
         assert_eq!(stray.0, "unknown_plan");
+        host.stop("aokie").unwrap();
+    }
+
+    /// A phone plugin that answers the handshake in a real child process and writes what `plugin.init` sent it to
+    /// `init.json` in its data folder, so that a test can see the roster it was handed. `None` where there is no Node.
+    #[cfg(windows)]
+    fn admission_plugin(sb: &Sandbox) -> Option<PathBuf> {
+        let has_node = std::process::Command::new("node").arg("--version").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
+        if !has_node {
+            return None;
+        }
+        let dir = sb.0.join("plugins").join("aokie");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("plugin.mjs"),
+            r#"
+import fs from "node:fs";
+import path from "node:path";
+const send = (o) => process.stdout.write(JSON.stringify(o) + "\n");
+let buf = "";
+process.stdin.on("data", (chunk) => {
+  buf += chunk;
+  let i;
+  while ((i = buf.indexOf("\n")) >= 0) {
+    const line = buf.slice(0, i); buf = buf.slice(i + 1);
+    if (!line.trim()) continue;
+    let msg; try { msg = JSON.parse(line); } catch { continue; }
+    if (msg.method === "plugin.init") {
+      fs.mkdirSync(msg.params.dataDir, { recursive: true });
+      fs.writeFileSync(path.join(msg.params.dataDir, "init.json"), JSON.stringify(msg.params));
+      send({ jsonrpc: "2.0", id: msg.id, result: { ok: true } });
+    }
+    else if (msg.method === "plugin.health") send({ jsonrpc: "2.0", id: msg.id, result: { status: "ok" } });
+    else if (msg.method === "plugin.shutdown") process.exit(0);
+    else if (msg.id !== undefined) send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "unknown method" } });
+  }
+});
+"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("plugin.cmd"), "@echo off\r\nnode \"%~dp0plugin.mjs\" %*\r\n").unwrap();
+        let manifest = json!({
+            "schemaVersion": 3, "id": "aokie", "name": "aokie plugin", "version": "0.1.0",
+            "pluginApiVersion": 1, "entry": { "kind": "process", "command": "plugin.cmd" },
+            "capabilities": ["oaiy.companion.admission"], "connectors": [], "events": [],
+        });
+        std::fs::write(dir.join("manifest.json"), manifest.to_string()).unwrap();
+        Some(dir)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_started_plugin_is_presented_the_roster_its_init_handed_it_and_a_new_start_takes_the_new_one() {
+        // The whole path with a real process: the roster in the `plugin.init` the plugin received is the roster the issuer is
+        // asked to bind while it runs, whatever is approved or revoked meanwhile, and starting it again takes the roster as it is.
+        use crate::companion::identity::testing::phone_key;
+        let (sb, host, _trust) = trusting_host("adm-process", TrustPolicy::developer(), Publishers::default());
+        let Some(dir) = admission_plugin(&sb) else { return };
+        host.registry.lock().unwrap().scan();
+        let companion = broker_for(&sb, &host);
+        let issuer = strict_issuer();
+        host.companion
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap()
+            .upstream
+            .set(crate::companion::upstream::UpstreamConfig { base_url: issuer.base.clone(), token: "flk_issuer".into(), app_id: Some("app_1".into()) })
+            .unwrap();
+        let identity = companion.identity_for("aokie").expect("the plugin declares the capability");
+        let (a, b, c) = (phone_key(1), phone_key(2), phone_key(3));
+        // Two phones, approved in the order that is not the sorted one.
+        let (first, second) = if a.thumbprint > b.thumbprint { (&a, &b) } else { (&b, &a) };
+        identity.approve_for_tests(first);
+        identity.approve_for_tests(second);
+
+        // The roster in the last `plugin.init` the plugin received.
+        let handed = || -> Value {
+            let written = std::fs::read_to_string(crate::plugins::runner::plugin_data_dir(&dir).join("init.json")).expect("the plugin wrote what it was sent");
+            serde_json::from_str::<Value>(&written).unwrap()["privateBootstrap"]["approvedMobileRoster"].clone()
+        };
+        let admit = || {
+            host.handle_plugin_request("aokie", "companion.admission", json!({})).unwrap_or_else(|e| panic!("{e:?}"));
+            asked_to_bind(&issuer)
+        };
+
+        host.start("aokie").expect("the stand-in starts");
+        wait_running(&host, "aokie");
+        let init = handed();
+        let presented = admit();
+        assert_eq!(presented.1, init["revision"].as_u64().unwrap());
+        assert_eq!(presented.2, init["rosterHash"].as_str().unwrap(), "what the plugin was handed is what is presented for it");
+        let mut handed_keys: Vec<String> = init["keys"].as_array().unwrap().iter().map(|k| k["thumbprint"].as_str().unwrap().to_string()).collect();
+        handed_keys.sort();
+        assert_eq!(presented.0, handed_keys);
+
+        // A phone approved while it runs: it is not in what the plugin holds, and what is presented does not change.
+        identity.approve_for_tests(&c);
+        assert_eq!(admit(), presented);
+        // A phone revoked while it runs: the roster the plugin holds names it, so it is not presented again.
+        identity.revoke(&a.thumbprint).unwrap();
+        let after_revoke = admit();
+        assert!(!after_revoke.0.contains(&a.thumbprint) && after_revoke != presented, "{after_revoke:?}");
+
+        // Started again, it is handed the roster as it is, and that is what it is presented.
+        host.stop("aokie").unwrap();
+        host.start("aokie").expect("and starts again");
+        wait_running(&host, "aokie");
+        let again = handed();
+        assert_ne!(again["rosterHash"], init["rosterHash"]);
+        let presented = admit();
+        assert_eq!((presented.1, presented.2.as_str()), (again["revision"].as_u64().unwrap(), again["rosterHash"].as_str().unwrap()));
+        let mut expected = vec![b.thumbprint.clone(), c.thumbprint.clone()];
+        expected.sort();
+        assert_eq!(presented.0, expected);
         host.stop("aokie").unwrap();
     }
 

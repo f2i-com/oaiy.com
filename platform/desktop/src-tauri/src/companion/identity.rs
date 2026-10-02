@@ -189,8 +189,9 @@ pub struct IdentityStatus {
     pub warning: Option<String>,
 }
 
-/// A roster as it is presented to an issuer: this desktop's endpoint key, the revision, the hash that binds
-/// them, and the approved phones' thumbprints SORTED bytewise and unique.
+/// A roster as it is presented to an issuer, and as a plugin holds it from `plugin.init` until it is started
+/// again: this desktop's endpoint key, the revision, the hash that binds them, and the approved phones'
+/// thumbprints SORTED bytewise and unique.
 ///
 /// The order matters to everything that reads it. The relay requires the thumbprints strictly ascending
 /// (so does FormLogic's issuer), the host compares what it sent with what the issuer echoed, and the plugin
@@ -218,6 +219,16 @@ impl RosterSnapshot {
     pub fn of(status: &IdentityStatus) -> Option<Self> {
         let thumbprints = status.approved_mobiles.iter().map(|m| m.endpoint_key.thumbprint.clone()).collect();
         Some(Self::new(status.endpoint_key.clone()?, status.roster_revision, thumbprints))
+    }
+
+    /// Whether a plugin that holds `self` can still be presented it beside `live`, the roster as it is now:
+    /// the key is the same and every phone in it is still approved. A phone approved since is not in it, and
+    /// the plugin does not know that phone either, so nothing is lost by leaving it out until the plugin is
+    /// started again. A phone revoked since IS in it, and a roster that names a revoked phone must not be
+    /// presented: it would have the issuer admit that phone to a plugin that still trusts it. Then `live` is
+    /// what is presented, which the plugin refuses (it fails closed until it is started again, as it always has).
+    pub fn still_holds_in(&self, live: &RosterSnapshot) -> bool {
+        self.endpoint_key == live.endpoint_key && self.thumbprints.iter().all(|t| live.thumbprints.binary_search(t).is_ok())
     }
 }
 
@@ -330,6 +341,14 @@ impl EndpointIdentity {
     /// so a short-lived credential is never baked into a handshake that happens
     /// once at launch.
     pub fn private_bootstrap(&self, plugin_api_version: u16) -> Option<serde_json::Value> {
+        self.private_bootstrap_with_roster(plugin_api_version).map(|(bootstrap, _)| bootstrap)
+    }
+
+    /// [`EndpointIdentity::private_bootstrap`], and with it the roster it carries as a [`RosterSnapshot`]:
+    /// the host keeps that to present for the plugin until the plugin is started again. Made from one
+    /// reading of the roster, so the snapshot is exactly what the plugin was handed, and not what the roster
+    /// is a moment later after an approval or a revoke.
+    pub fn private_bootstrap_with_roster(&self, plugin_api_version: u16) -> Option<(serde_json::Value, RosterSnapshot)> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let key = inner.signing_key.as_ref()?;
         if inner.roster.approved.is_empty() || inner.roster.approved.len() > 64 {
@@ -349,7 +368,8 @@ impl EndpointIdentity {
             .map(|m| &m.endpoint_key)
             .collect();
         let _ = plugin_api_version;
-        Some(serde_json::json!({
+        let roster = RosterSnapshot::new(public.clone(), inner.roster.revision, thumbprints);
+        let bootstrap = serde_json::json!({
             "schemaVersion": SCHEMA_VERSION,
             "pluginId": self.owner_plugin,
             "endpointIdentity": {
@@ -359,11 +379,12 @@ impl EndpointIdentity {
                 "privateKeySeed": URL_SAFE_NO_PAD.encode(key.to_bytes()),
             },
             "approvedMobileRoster": {
-                "revision": inner.roster.revision,
-                "rosterHash": peer_roster_hash(inner.roster.revision, &thumbprints),
+                "revision": roster.revision,
+                "rosterHash": roster.hash,
                 "keys": keys,
             },
-        }))
+        });
+        Some((bootstrap, roster))
     }
 
     fn dir(&self) -> PathBuf {
@@ -1349,6 +1370,40 @@ mod tests {
             }
         }
         assert!(out_of_order > 0, "the orders approved in were never out of order: the test shows nothing");
+    }
+
+    #[test]
+    fn the_roster_a_plugin_is_handed_is_kept_as_it_was_and_holds_through_an_approval_but_not_a_revoke_or_a_rotation() {
+        let dir = Dir::new("held");
+        let id = EndpointIdentity::open(dir.0.clone(), "aokie");
+        let (a, b, c) = (testing::phone_key(1), testing::phone_key(2), testing::phone_key(3));
+        id.approve_for_tests(&a);
+        id.approve_for_tests(&b);
+
+        // One reading: the roster in the bootstrap and the roster kept for the plugin are the same, sorted, and the
+        // bootstrap is what it was before there was a snapshot.
+        let (bootstrap, held) = id.private_bootstrap_with_roster(1).expect("a bootstrap once phones are approved");
+        assert_eq!(Some(&bootstrap), id.private_bootstrap(1).as_ref());
+        assert_eq!(bootstrap["approvedMobileRoster"]["rosterHash"], held.hash.as_str());
+        assert_eq!(bootstrap["approvedMobileRoster"]["revision"], held.revision);
+        assert_eq!(held.thumbprints.len(), 2);
+        assert!(held.thumbprints.windows(2).all(|w| w[0] < w[1]));
+        assert!(held.still_holds_in(&RosterSnapshot::of(&id.status()).unwrap()), "as handed over");
+
+        // A phone approved since is not in it, and it still holds: the plugin does not know that phone either.
+        id.approve_for_tests(&c);
+        let live = RosterSnapshot::of(&id.status()).unwrap();
+        assert!(held.still_holds_in(&live));
+        assert_ne!((held.revision, &held.hash), (live.revision, &live.hash), "and the roster is not the one it holds");
+
+        // A phone revoked since is in it, and it does not hold: it would be admitted again.
+        id.revoke(&a.thumbprint).unwrap();
+        assert!(!held.still_holds_in(&RosterSnapshot::of(&id.status()).unwrap()));
+
+        // And a new key is a new identity, whichever phones are approved under it.
+        let mut other_key = held.clone();
+        other_key.endpoint_key = testing::phone_key(9);
+        assert!(!other_key.still_holds_in(&held));
     }
 
     #[test]
