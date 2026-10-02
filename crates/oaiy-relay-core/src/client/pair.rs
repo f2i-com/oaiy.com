@@ -77,8 +77,9 @@ impl PairState {
     }
 }
 
-/// The approval receipt as the relay returns it: `{"issuedAt","signature"}`, and `grants` **when the relay includes them** (the schema allows extra members; the shipped relay
-/// does not, and the desktop's signature covers them: see the README of this crate).
+/// The approval receipt as the relay returns it: `{"issuedAt","signature","grants"}`. The schema of the answer now requires `grants` (the sorted set the desktop signed, so that a phone
+/// can verify the receipt from what it reads alone); the member stays optional here so that a relay of the earlier shape, which returned none, is read and the caller's own list is used
+/// (`PhonePairing::wait_outcome`), and a receipt with none and no list from the caller is refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiptWire {
     /// `issuedAt`.

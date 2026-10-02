@@ -297,7 +297,7 @@ fn attack_grants_from_the_relay_win_over_grants_from_the_caller_and_are_only_as_
     w.desktop.confirm_sas(&w.env.client, &w.token, &offer.pid, &sas.display(), &grants(), &cancel()).unwrap();
     // A caller that passes other grants out of band is ignored when the relay returns them: the receipt (checked over the relay's list) is what decides.
     let Ok(Outcome::Paired(paired)) = p.wait_outcome(Some(&["takeover".to_string()]), &cancel()) else { panic!("not paired") };
-    assert_eq!(paired.profile.grants, grants());
+    assert_eq!(paired.profile.grants, common::pair::sorted_grants());
 }
 
 #[test]

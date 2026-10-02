@@ -401,7 +401,14 @@ impl PhonePairing {
         // The grants the receipt covers: the ones the relay returns with it when it does (the signature protects them: a relay that lies about them fails the receipt below, and
         // the caller's list is not consulted), else the caller's.
         let grants: Vec<String> = match (&receipt.grants, out_of_band) {
-            (Some(g), _) => g.clone(),
+            // What the relay returns is the set the desktop signed, **sorted (code-point order) and without a repeat** (the schema of the answer): a list that is not is not what
+            // the relay is specified to send, and is refused whatever its signature says (the signature is over the sorted set, so an unsorted list would verify).
+            (Some(g), _) => {
+                if !g.windows(2).all(|w| w[0] < w[1]) {
+                    return Err(PairingError::ReceiptInvalid);
+                }
+                g.clone()
+            }
             (None, Some(g)) => g.to_vec(),
             (None, None) => return Err(PairingError::ReceiptGrantsUnknown),
         };

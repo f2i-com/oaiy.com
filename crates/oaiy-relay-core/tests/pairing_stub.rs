@@ -57,7 +57,7 @@ fn a_whole_pairing_by_scanning_the_key_ends_with_a_phone_that_polls_and_is_admit
     let result = paired(phone.wait_outcome(None, &cancel()).unwrap());
     assert_eq!(result.profile.device_id, device_id);
     assert_eq!(result.profile.kind, ProfileKind::Phone);
-    assert_eq!(result.profile.grants, grants());
+    assert_eq!(result.profile.grants, common::pair::sorted_grants(), "the grants of the receipt, as the relay returns them: sorted");
     let peer = result.profile.peer.clone().unwrap();
     assert_eq!(peer.desktop_endpoint, w.identity.endpoint.verify_key(), "the pin comes from the MAC-verified offer");
     assert_eq!(peer.host_ed25519, w.identity.host_ed25519);

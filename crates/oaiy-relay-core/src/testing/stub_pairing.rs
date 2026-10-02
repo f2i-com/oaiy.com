@@ -104,7 +104,7 @@ impl StubRelay {
         if offer_app != app || offer_thumb != thumb || conn != who.device {
             return err(400, "invalid_request", "The offer does not say what the request says.");
         }
-        let Ok(desktop_ed) = VerifyKey::from_b64u(key.and_then(|k| k.get_str("publicKey")).unwrap_or("")) else {
+        let Ok(desktop_ed) = VerifyKey::from_b64u_registrable(key.and_then(|k| k.get_str("publicKey")).unwrap_or("")) else {
             return err(422, "unprocessable", "A desktop key of small order.");
         };
         if desktop_ed.thumbprint() != thumb {
@@ -382,7 +382,7 @@ impl StubRelay {
         {
             return err(400, "invalid_request", "grants or name");
         }
-        let (Ok(ed), Ok(x)) = (VerifyKey::from_b64u(ed_text), X25519Public::from_b64u(x_text)) else {
+        let (Ok(ed), Ok(x)) = (VerifyKey::from_b64u_registrable(ed_text), X25519Public::from_b64u(x_text)) else {
             return err(422, "unprocessable", "A phone key of small order.");
         };
         if app != p.app_id || ed.thumbprint() != thumb || grants.iter().any(|g| !ids::is_known_grant(g)) {
@@ -414,6 +414,9 @@ impl StubRelay {
             p.state = PState::Approved;
             p.phone_dev = Some(device.clone());
             p.sealed = Some(b64::encode(&sealed));
+            // The relay returns the grants sorted (`Pairing.php`: `sort($signedGrants, SORT_STRING)`), the set the desktop signed.
+            let mut grants = grants;
+            grants.sort();
             p.receipt = Some((issued, sig.to_string(), grants));
             p.response = None;
         }

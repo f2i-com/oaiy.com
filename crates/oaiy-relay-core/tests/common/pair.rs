@@ -19,6 +19,13 @@ pub fn grants() -> Vec<String> {
     GRANTS.iter().map(|g| g.to_string()).collect()
 }
 
+/// The grants as the relay returns them with a receipt: the set the desktop signed, sorted (code-point order), where `grants()` is in the order the desktop holds them.
+pub fn sorted_grants() -> Vec<String> {
+    let mut g = grants();
+    g.sort();
+    g
+}
+
 pub struct World {
     pub env: Env,
     pub token: Token,
