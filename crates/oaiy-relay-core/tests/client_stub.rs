@@ -8,7 +8,7 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::env::{env, quick, run_loop, wait_until, T0};
+use common::env::{env, held_requests, quick, run_loop, wait_until, T0};
 use oaiy_relay_core::client::*;
 use oaiy_relay_core::enrol::{EnrolmentKey, Role};
 use oaiy_relay_core::json::Json;
@@ -83,6 +83,70 @@ fn a_key_for_another_relay_key_sends_nothing_and_stores_nothing() {
 }
 
 #[test]
+fn an_enrolment_key_for_another_relay_is_refused_before_anything_is_sent() {
+    // The key names `https://other.stub.test`; the client talks to `https://relay.stub.test`, whose key is the same (the stub's seed), so that the thumbprint would pass: only the
+    // relay's own address in the key can tell, and the client must look at it before it sends anything.
+    let e = env(quick());
+    let other = StubRelay::with_clocks(
+        StubConfig { public_url: "https://other.stub.test".into(), wait_default: 0, wait_max: 0, ..Default::default() },
+        || T0,
+        || Duration::ZERO,
+    );
+    let key = EnrolmentKey::parse(&other.mint_enrolment_key(Role::Desktop, 3600)).unwrap();
+    assert_eq!(key.relay_thumbprint, e.stub.relay_thumbprint(), "the same relay key: the thumbprint cannot tell them apart");
+    let ed = Signer::generate().unwrap().verify_key();
+    let x = X25519Secret::generate().unwrap().public_key();
+    let client = RelayClient::new(
+        RelayUrl::parse("https://relay.stub.test").unwrap(),
+        None,
+        Arc::new(e.stub.clone()),
+        e.clock.clone(),
+        Box::new(oaiy_relay_core::testing::SeededRng::new(10)),
+        ClientConfig::default(),
+    );
+    let err = client.enroll(&key, "PC", &ed, &x, &Cancel::new()).unwrap_err();
+    assert!(matches!(err, ClientError::Request(oaiy_relay_core::Error::Mismatch(_))), "{err:?}");
+    assert!(e.stub.log().is_empty(), "nothing was sent to the relay the key is not for: {:?}", e.stub.log());
+    assert!(client.pinned().is_none(), "and nothing was pinned from it");
+}
+
+#[test]
+fn an_enrolment_answered_by_another_relay_id_than_the_one_proved_is_refused_and_nothing_is_stored() {
+    // The relay proved its identity (the right key) and then answered the enrolment as another relay: a device id and a token that are not this relay's are not stored.
+    let e = env(quick());
+    let key = EnrolmentKey::parse(&e.stub.mint_enrolment_key(Role::Desktop, 3600)).unwrap();
+    let token = format!("oaiyrt1.{}.{}", oaiy_relay_core::b64::encode(&[1u8, 2, 3, 4, 5, 6, 7, 8]), oaiy_relay_core::b64::encode(&[0xB7u8; 32]));
+    let body =
+        format!("{{\"deviceId\":\"dev-AAAAAAAAAAAAAAAAAAAAAA\",\"token\":\"{token}\",\"relayId\":\"rly-AAAAAAAAAAAAAAAAAAAAAA\",\"time\":{T0}}}");
+    assert_ne!(e.stub.relay_id(), "rly-AAAAAAAAAAAAAAAAAAAAAA");
+    e.stub.fail_next_on("/v1/enroll", 1, Fault::Respond(201, vec![], body));
+    let ed = Signer::generate().unwrap().verify_key();
+    let x = X25519Secret::generate().unwrap().public_key();
+    let err = enrol_and_store(&e.client, &key, "PC", &ed, &x, &*e.secrets, &*e.profiles, &Cancel::new()).unwrap_err();
+    assert_eq!(err, ClientError::BadAnswer("relayId is not the relay that was proved"));
+    assert!(e.secrets.get(SECRET_TOKEN).unwrap().is_none() && e.profiles.load().unwrap().is_none(), "nothing was stored");
+}
+
+#[test]
+fn an_info_read_without_a_nonce_is_taken_only_from_the_pinned_key() {
+    // `read_info` (after a 426) is not the identity proof, but it is not a way round the pin: an info whose relay key is not the pinned one is refused, however well it is signed.
+    let e = env(quick());
+    let impostor =
+        StubRelay::with_clocks(StubConfig { relay_seed: [0x44; 32], wait_default: 0, wait_max: 0, ..Default::default() }, || T0, || Duration::ZERO);
+    let client = RelayClient::new(
+        RelayUrl::parse("https://relay.stub.test").unwrap(),
+        Some(e.stub.relay_thumbprint()),
+        Arc::new(impostor.clone()),
+        e.clock.clone(),
+        Box::new(oaiy_relay_core::testing::SeededRng::new(11)),
+        ClientConfig::default(),
+    );
+    assert_eq!(client.read_info(&Cancel::new()).unwrap_err(), ClientError::Suspect);
+    assert!(client.info().is_none(), "the impostor's info was not kept");
+    // The pinned relay's own is read.
+    assert_eq!(e.client.read_info(&Cancel::new()).unwrap().relay_id, e.stub.relay_id());
+}
+#[test]
 fn a_profile_that_cannot_be_stored_takes_the_token_back_out() {
     struct Failing;
     impl ProfileStore for Failing {
@@ -137,6 +201,88 @@ fn no_token_is_sent_before_a_proof_after_a_failed_one_or_after_the_proof_has_lap
     assert!(impostor.log().iter().all(|r| r.authorization.is_none()), "the impostor never saw a token");
 }
 
+#[test]
+fn every_call_that_carries_a_token_is_refused_by_a_client_with_no_fresh_proof_and_sends_nothing() {
+    // Not only the poll: a post, a rotation, both admissions and the four pairing calls of a desktop carry the token, and each of them stops at the gate. Three clients that have no
+    // good proof: one that never proved the relay, one whose proof lapsed (601 s), and one whose relay failed its proof.
+    use oaiy_relay_core::admission::{MobileExpect, MobileRequest, PluginRequest, Transport};
+
+    let mut w = common::pair::world(quick());
+    let offer = w.desktop.create_offer(w.env.client.relay_now_or_local()).unwrap();
+    let (token, device) = (w.token.clone(), w.profile.device_id.clone());
+    let endpoint = Signer::generate().unwrap().verify_key();
+    let plugin = PluginRequest {
+        app_id: "aokie".into(),
+        plugin_id: "narrator".into(),
+        display_name: None,
+        endpoint: endpoint.clone(),
+        approved_peers: vec![Signer::generate().unwrap().thumbprint()],
+        revision: 1,
+        transports: None,
+    };
+    let mobile = MobileRequest {
+        app_id: "aokie".into(),
+        device_id: device.clone(),
+        display_name: None,
+        holder_thumbprint: endpoint.thumbprint(),
+        transports: Some(vec![Transport::RelayPoll]),
+    };
+    let calls = |c: &RelayClient| -> Vec<(&'static str, Result<(), ClientError>)> {
+        let item = PostItem { to: format!("dev:{device}"), lane: "cmd".into(), id: "c1".into(), ttl: None, hdr: Hdr::new(), body: "b".into() };
+        let expect = MobileExpect { app_id: "aokie", device_id: &device, holder_thumbprint: &mobile.holder_thumbprint };
+        let cancel = Cancel::new();
+        vec![
+            ("poll", c.poll(&token, &PollRequest { since: 0, epoch: None, wait_s: 0, limit: 32 }, &cancel).map(|_| ())),
+            ("post_items", c.post_items(&token, &[item], &cancel).map(|_| ())),
+            ("rotate_token", c.rotate_token(&token, &cancel).map(|_| ())),
+            ("admission_plugin", c.admission_plugin(&token, &plugin, &cancel).map(|_| ())),
+            ("admission_mobile", c.admission_mobile(&token, &mobile, &expect, &cancel).map(|_| ())),
+            ("pair_create", c.pair_create(&token, &offer.create, &cancel).map(|_| ())),
+            ("pair_decision", c.pair_decision(&token, &offer.pid, "{\"approve\":false}", &cancel).map(|_| ())),
+            ("pair_reject", c.pair_reject(&token, &offer.pid, "test", &cancel).map(|_| ())),
+            ("pair_burn", c.pair_burn(&token, &offer.pid, &cancel).map(|_| ())),
+        ]
+    };
+    let nothing_sent = |stub: &StubRelay, before: usize, who: &str, name: &str| {
+        let log = stub.log();
+        assert!(log.len() == before && log.iter().all(|r| r.authorization.is_none()), "{who}: {name} sent a request");
+    };
+    // Never proved.
+    let never = common::env::client_for(&w.env.stub, &w.env.clock, &w.env.stub.public_url(), 71);
+    let before = w.env.stub.log().len();
+    for (name, result) in calls(&never) {
+        assert_eq!(result.unwrap_err(), ClientError::NotProved, "never proved: {name}");
+    }
+    nothing_sent(&w.env.stub, before, "never proved", "any call");
+    // A proof that lapsed.
+    let lapsed = w.env.other_client(72);
+    w.env.clock.advance(Duration::from_secs(601));
+    let before = w.env.stub.log().len();
+    for (name, result) in calls(&lapsed) {
+        assert_eq!(result.unwrap_err(), ClientError::NotProved, "lapsed: {name}");
+    }
+    assert_eq!(w.env.stub.log().len(), before, "a lapsed proof sent nothing");
+    // A relay that failed its proof.
+    let impostor = StubRelay::with_clocks(
+        StubConfig { relay_seed: [0x44; 32], wait_default: 0, wait_max: 0, ..Default::default() },
+        || T0 + 601,
+        || Duration::ZERO,
+    );
+    let suspect = RelayClient::new(
+        RelayUrl::parse("https://relay.stub.test").unwrap(),
+        Some(w.env.stub.relay_thumbprint()),
+        Arc::new(impostor.clone()),
+        w.env.clock.clone(),
+        Box::new(oaiy_relay_core::testing::SeededRng::new(73)),
+        ClientConfig::default(),
+    );
+    assert!(suspect.prove(&Cancel::new()).is_err());
+    let before = impostor.log().len();
+    for (name, result) in calls(&suspect) {
+        assert_eq!(result.unwrap_err(), ClientError::Suspect, "suspect: {name}");
+    }
+    nothing_sent(&impostor, before, "suspect", "any call");
+}
 #[test]
 fn a_replayed_info_with_a_new_nonce_does_not_prove_the_relay() {
     // A man in the middle who recorded the relay's answer to one nonce and serves it for every later one: the body and the static signature are good, the proof is not.
@@ -421,6 +567,55 @@ fn a_426_makes_the_client_re_read_info_and_stop_when_it_is_too_old() {
 }
 
 #[test]
+fn a_426_from_a_relay_whose_min_client_is_the_clients_own_level_is_a_failure_to_retry_and_not_a_reason_to_stop() {
+    // The client's level is 1 and the relay's `minClient` is 1: the client is not too old, whatever a 426 says, so after it re-reads `info` it paces a failure and goes on.
+    let e = env(quick());
+    let (token, _) = e.enrol_desktop();
+    e.client.ensure_proved(&Cancel::new()).unwrap();
+    assert_eq!((e.client.info().unwrap().min_client, ClientConfig::default().level), (1, 1));
+    e.stub.fail_next_on("/v1/poll", 1, Fault::Respond(426, vec![], r#"{"error":{"code":"upgrade_required","message":"x"}}"#.into()));
+    let running = run_loop(&e.client, &token, MemoryPollStore::new());
+    running.wait_for("a poll after the 426", |_| e.stub.log().iter().filter(|r| r.target.starts_with("/v1/poll") && r.status == 200).count() >= 1);
+    let sink = running.sink.clone();
+    let (end, _) = running.finish();
+    assert_eq!(end, LoopEnd::Cancelled, "the loop went on");
+    assert!(!sink.states().contains(&ConnectionState::UpgradeRequired));
+    assert!(e.stub.log().iter().any(|r| r.status == 426), "the 426 was served");
+}
+
+#[test]
+fn a_pause_of_a_minute_or_more_after_an_answer_makes_the_loop_prove_the_relay_again_before_its_next_poll() {
+    // P9: a proof after any pause of 60 seconds or more. A 429 that asks for 100 seconds is such a pause (the age of the proof, 100 s, is below the 300 s schedule, so the pause is what
+    // calls for it); one that asks for 30 is not.
+    let sequence = |retry_after: &str| -> Vec<String> {
+        let e = env(quick());
+        let (token, _) = e.enrol_desktop();
+        e.stub.clear_log();
+        let body = format!("{{\"error\":{{\"code\":\"rate_limited\",\"message\":\"slow\",\"retryAfter\":{retry_after}}}}}");
+        e.stub.fail_next_on("/v1/poll", 1, Fault::Respond(429, vec![("Retry-After".into(), retry_after.into())], body));
+        let running = run_loop(&e.client, &token, MemoryPollStore::new());
+        running.wait_for("the poll after the pause", |_| e.stub.log().iter().filter(|r| r.target.starts_with("/v1/poll")).count() >= 2);
+        running.finish();
+        e.stub.log().iter().map(|r| r.target.split('?').next().unwrap_or("").to_string()).take(4).collect()
+    };
+    assert_eq!(sequence("100"), ["/v1/info", "/v1/poll", "/v1/info", "/v1/poll"], "proof, the 429, the proof again, the poll");
+    assert_eq!(&sequence("30")[..3], ["/v1/info", "/v1/poll", "/v1/poll"], "a pause of 30 s is no reason to prove again");
+}
+
+#[test]
+fn the_poll_asks_for_the_relays_default_wait_and_never_for_more_than_its_max() {
+    for (default, max, want) in [(1u64, 3u64, 1u64), (3, 1, 1), (2, 2, 2)] {
+        let e = env(StubConfig { wait_default: default, wait_max: max, ..Default::default() });
+        let (token, _) = e.enrol_desktop();
+        e.stub.clear_log();
+        let running = run_loop(&e.client, &token, MemoryPollStore::new());
+        running.wait_for("the first poll", |_| e.stub.log().iter().any(|r| r.target.starts_with("/v1/poll")));
+        running.finish();
+        let first = e.stub.log().into_iter().find(|r| r.target.starts_with("/v1/poll")).unwrap();
+        assert!(first.target.contains(&format!("wait={want}&")), "default {default}, max {max}: {}", first.target);
+    }
+}
+#[test]
 fn a_store_that_fails_moves_nothing_is_paced_as_a_failure_and_the_items_come_again() {
     let e = env(quick());
     let (token, profile) = e.enrol_desktop();
@@ -493,6 +688,35 @@ fn a_held_poll_returns_the_moment_an_item_is_posted() {
     assert_eq!(store.accepted.len(), 1);
 }
 
+#[test]
+fn the_poll_loop_holds_one_request_at_a_time_as_the_relays_own_count_shows_across_holds_and_a_network_change() {
+    // MOB-21a: the relay counts the requests it holds open (`GET /v1/admin/status`, `holds`): a client that polls holds one, not two, and a replaced poll is gone when the next
+    // one is held. The count is read with the desktop's token while the loop runs, many times, in real time (a hold is two seconds).
+    let e = env(StubConfig { wait_default: 2, wait_max: 2, ..Default::default() });
+    let (token, _) = e.enrol_desktop();
+    assert_eq!(held_requests(&e.stub, &token), (0, 0, 0), "nothing is held before the loop starts");
+    let running = run_loop(&e.client, &token, MemoryPollStore::new());
+    let start = std::time::Instant::now();
+    let (mut most, mut with_one, mut changed) = (0u64, 0u32, false);
+    while start.elapsed() < Duration::from_millis(3500) {
+        let (live, polls, pairs) = held_requests(&e.stub, &token);
+        assert_eq!(pairs, 0, "a poll loop holds no pairing read");
+        assert!(polls <= 1, "{polls} polls held at once");
+        most = most.max(live);
+        with_one += u32::from(live == 1);
+        if !changed && start.elapsed() > Duration::from_millis(700) {
+            // The network changed under a held poll: the loop proves the relay again and replaces the poll (P1: after 250 ms), and never holds two.
+            running.handle.network_changed();
+            changed = true;
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    let (end, _) = running.finish();
+    assert_eq!(end, LoopEnd::Cancelled);
+    assert_eq!(most, 1, "never more than one request held");
+    assert!(with_one >= 30, "the loop did hold its poll: one request was held in {with_one} of the samples");
+    assert_eq!(held_requests(&e.stub, &token), (0, 0, 0), "a stopped loop holds nothing");
+}
 #[test]
 fn the_relay_clock_is_sampled_from_x_oaiy_time_and_a_difference_over_a_minute_is_warned_about() {
     let clock = Arc::new(oaiy_relay_core::testing::FakeClock::new(T0));

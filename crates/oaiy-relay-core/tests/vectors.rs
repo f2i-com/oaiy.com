@@ -507,6 +507,87 @@ fn a6b_a_whole_info_document_through_the_proof_check_a_client_makes() {
 }
 
 #[test]
+fn each_container_domain_is_signed_under_its_own_sign_domain_and_under_no_other() {
+    // A command is signed under `cmd`, a result under `res` and a `sync` item under `sync`: made and checked with the key directly, so that a wrong mapping in `sealed` (which
+    // builds and verifies by the same mapping) is seen.
+    let v = vectors();
+    let key = signer(v.s("keys.ed25519Seeds.host"));
+    let bytes = b"{\"what\":\"sync\"}";
+    let all = [(ContainerDomain::Cmd, SignDomain::Cmd), (ContainerDomain::Res, SignDomain::Res), (ContainerDomain::Sync, SignDomain::Sync)];
+    for (container_domain, sign_domain) in all {
+        let text = sealed::build_container(&key, container_domain, bytes, false, |_| {});
+        let c = Container::parse(text.as_bytes()).unwrap();
+        key.verify_key()
+            .verify(sign_domain, &[bytes], &c.signature)
+            .unwrap_or_else(|e| panic!("{container_domain:?} is not signed under {sign_domain:?}: {e}"));
+        for (other_container, other_sign) in all {
+            if other_sign != sign_domain {
+                assert!(
+                    key.verify_key().verify(other_sign, &[bytes], &c.signature).is_err(),
+                    "{container_domain:?} also verifies under {other_sign:?}"
+                );
+                assert!(c.verify(other_container, &key.verify_key()).is_err(), "{container_domain:?} is taken for {other_container:?}");
+            }
+        }
+        assert_eq!(c.verify(container_domain, &key.verify_key()).unwrap(), bytes);
+        // And a signature made under the domain itself, put in a container by hand, is accepted as that kind of container.
+        let direct = key.sign_b64u(sign_domain, &[bytes]);
+        let by_hand = format!("{{\"k\":\"{}\",\"b\":\"{}\",\"s\":\"{}\"}}", key.thumbprint(), b64::encode(bytes), direct);
+        assert_eq!(Container::parse(by_hand.as_bytes()).unwrap().verify(container_domain, &key.verify_key()).unwrap(), bytes);
+    }
+}
+#[test]
+fn a_signature_whose_r_has_small_order_is_refused_though_the_equation_holds() {
+    // From the review's corpus (`rv/ed25519`, case R_small/125): R is the identity and S = k*a, so that [S]B = R + [k]A holds as points. A verifier that is not strict accepts it
+    // (OpenSSL in Python's `cryptography`, ed25519-dalek's `verify`); libsodium, Node and `verify_strict` refuse it, and so must the crate, which has to judge a signature as the relay does.
+    let pk: [u8; 32] = unhex32("23e289dea03c0a6596a3a82d5ed3aeb27565690abe2e2f3ea8fb55f62b07cac5");
+    let msg = unhex("522d736d616c6c2030");
+    let key = VerifyKey::from_bytes(&pk).expect("a key of the prime-order group");
+    for sig in [
+        "010000000000000000000000000000000000000000000000000000000000000023162ab7620156b91f9d5502e9a6a9385a78ca3a00dcff5eded6f5d87c6c4406",
+        "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f3bae63c20371d524601d88991873bb84fa5daa8fb968cb8299754bd64089a10a",
+    ] {
+        let sig: [u8; 64] = unhex(sig).try_into().unwrap();
+        assert!(key.verify_raw(&msg, &oaiy_crypto::ed25519::Signature::from_bytes(&sig)).is_err(), "R of small order");
+    }
+}
+
+#[test]
+fn an_empty_plaintext_seals_to_48_bytes_and_opens_and_47_bytes_are_no_box() {
+    let secret = X25519Secret::generate().unwrap();
+    let public = secret.public_key();
+    let sealed = public.seal(&[]).unwrap();
+    assert_eq!(sealed.len(), 48, "the ephemeral key (32) and the tag (16)");
+    assert_eq!(secret.open_sealed(&sealed).unwrap().expose().len(), 0, "an empty plaintext opens");
+    assert!(secret.open_sealed(&sealed[..47]).is_err());
+    assert!(secret.open_sealed(&[]).is_err());
+    let one = public.seal(b"x").unwrap();
+    assert_eq!(one.len(), 49);
+    assert_eq!(secret.open_sealed(&one).unwrap().expose(), b"x");
+}
+#[test]
+fn the_edges_of_the_static_info_the_stated_thumbprint_a_time_member_and_the_time_header() {
+    let v = vectors();
+    let text = v.s("A6b.expected.bodyText");
+    Info::parse(text.as_bytes()).expect("the recorded info");
+    // `relayKey.thumbprint` is compared with the thumbprint of the key beside it: another thumbprint is a mismatch, whatever else is right.
+    let stated = v.s("keys.ed25519Public.relay.thumbprint");
+    assert_eq!(text.matches(stated).count(), 1, "the thumbprint is stated once");
+    let other = v.s("keys.ed25519Public.provider.thumbprint");
+    assert!(matches!(Info::parse(text.replace(stated, other).as_bytes()), Err(oaiy_relay_core::Error::Mismatch(_))));
+    // The static body has no `time` (the time is in the header, under the proof): a document that has one is refused, with any value.
+    for with_time in ["{\"time\":1790000000,", "{\"time\":null,", "{\"time\":\"x\","] {
+        let doc = text.replacen('{', with_time, 1);
+        assert!(Info::parse(doc.as_bytes()).is_err(), "{with_time}");
+    }
+    // `X-OAIY-Time` is at most 16 digits in their canonical spelling.
+    assert_eq!(info::parse_time_header("1234567890123456").unwrap(), 1_234_567_890_123_456);
+    assert_eq!(info::parse_time_header("0").unwrap(), 0);
+    for bad in ["12345678901234567", "", "01", "00", "-1", "+1", " 1", "1 ", "1.0", "1e3", "١٢٣", "٠"] {
+        assert!(info::parse_time_header(bad).is_err(), "{bad:?}");
+    }
+}
+#[test]
 fn a7_the_enrolment_key_its_request_and_its_proof() {
     let v = vectors();
     let a = v.at("A7");

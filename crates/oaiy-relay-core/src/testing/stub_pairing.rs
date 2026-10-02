@@ -200,28 +200,37 @@ impl StubRelay {
             Some(_) => return err(400, "invalid_request", "wait"),
         };
         let deadline = Instant::now() + Duration::from_secs(wait);
-        let mut waited = false;
+        // Counted in `GET /v1/admin/status` as a held request for as long as it waits.
+        let mut counted = false;
         loop {
             let now = self.now();
             let live = ids::is_pid(pid) && st.pairings.get(pid).is_some_and(|p| p.exp > now && p.state != PState::Ended);
             if !live {
+                if counted {
+                    st.pair_waiting = st.pair_waiting.saturating_sub(1);
+                }
                 return not_found();
             }
             let p = &st.pairings[pid];
             let waitable = matches!(p.state, PState::Open | PState::Answered) && seen.is_none_or(|s| s == p.state);
             if wait > 0 && waitable && Instant::now() < deadline && !req.cancel.is_cancelled() {
-                waited = true;
+                if !counted {
+                    counted = true;
+                    st.pair_waiting += 1;
+                }
                 let (g, _) = self.0.cv.wait_timeout(st, Duration::from_millis(40)).unwrap_or_else(|e| e.into_inner());
                 st = g;
                 continue;
             }
             let mut body = self.fetch_body(p, now);
+            if counted {
+                st.pair_waiting = st.pair_waiting.saturating_sub(1);
+            }
             if wait > 0 {
                 if let Json::Obj(m) = &mut body {
                     m.push(("hold".to_string(), Json::obj([("granted", Json::Bool(true))])));
                 }
             }
-            let _ = waited;
             return ok(body);
         }
     }

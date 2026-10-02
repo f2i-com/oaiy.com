@@ -708,6 +708,13 @@ mod tests {
         let too_deep = format!("{}1{}", "[".repeat(65), "]".repeat(65));
         assert_eq!(parse(too_deep.as_bytes()), Err(JsonError::Depth));
         // An input far deeper than any stack could take is refused at the 65th level, not parsed.
+        // The same for objects: 64 levels are read and the 65th is refused (the limit is the same for both).
+        let objects = |n: usize| format!("{}1{}", "{\"a\":".repeat(n), "}".repeat(n));
+        assert!(parse(objects(64).as_bytes()).is_ok());
+        assert_eq!(parse(objects(65).as_bytes()), Err(JsonError::Depth));
+        let mixed = |n: usize| format!("{}1{}", "[{\"a\":".repeat(n / 2), "}]".repeat(n / 2));
+        assert!(parse(mixed(64).as_bytes()).is_ok());
+        assert_eq!(parse(mixed(66).as_bytes()), Err(JsonError::Depth));
         let bomb = "[".repeat(1_000_000);
         assert_eq!(parse(bomb.as_bytes()), Err(JsonError::Depth));
         let bomb = "{\"a\":".repeat(100_000);
@@ -718,6 +725,10 @@ mod tests {
     fn strings_utf8_and_escapes() {
         assert_eq!(parse(br#""\ud83d\ude00""#).unwrap(), Json::Str("\u{1f600}".into()));
         assert_eq!(parse("\"\u{1f600}\"".as_bytes()).unwrap(), Json::Str("\u{1f600}".into()));
+        // A high surrogate is followed by `\u` and a low one and by nothing else: two characters of any kind are not skipped to get to a low surrogate.
+        for bad in [r#""\ud83dxxdc00""#, "\"\\ud83d\u{1}\u{1}dc00\"", "\"\\ud83d\u{7f}\u{7f}dc00\"", r#""\ud83d\\ude00""#, r#""\ud83d\n\ude00""#] {
+            assert!(parse(bad.as_bytes()).is_err(), "{bad:?}");
+        }
         for bad in [r#""\ud83d""#, r#""\ud83dx""#, r#""\ude00""#, r#""\ud83d\u0041""#, r#""\u12""#, r#""\u12G4""#, r#""\x41""#, r#""\ ""#] {
             assert_eq!(parse(bad.as_bytes()), Err(JsonError::BadEscape), "{bad}");
         }
@@ -728,6 +739,44 @@ mod tests {
         assert_eq!(parse(b"\"\xc0\xaf\""), Err(JsonError::Utf8), "an overlong slash");
         assert_eq!(parse(b"\"\xed\xa0\x80\""), Err(JsonError::Utf8), "a surrogate written as UTF-8");
         assert_eq!(parse(b"\xef\xbb\xbf{}"), Err(JsonError::Syntax), "a byte-order mark");
+    }
+
+    #[test]
+    fn an_integer_of_38_digits_is_an_integer_and_one_of_39_is_a_big_spelling() {
+        let thirty_eight = format!("1{}", "0".repeat(37));
+        let thirty_nine = format!("1{}", "0".repeat(38));
+        assert_eq!(parse(thirty_eight.as_bytes()).unwrap().as_int(), Some(10i128.pow(37)));
+        assert_eq!(
+            parse(thirty_nine.as_bytes()).unwrap(),
+            Json::Num(Number::Big(thirty_nine.clone())),
+            "1e38 is below the i128 limit and is still a big spelling"
+        );
+        let nines = "9".repeat(39);
+        assert_eq!(parse(nines.as_bytes()).unwrap(), Json::Num(Number::Big(nines.clone())), "a 39-digit integer above i128 is read, not refused");
+        assert_eq!(parse(format!("-{nines}").as_bytes()).unwrap(), Json::Num(Number::Big(format!("-{nines}"))));
+        assert_eq!(canon(&format!("{{\"n\":{thirty_nine}}}")), Err(JsonError::IntegerRange));
+    }
+
+    #[test]
+    fn canonical_members_are_sorted_by_utf8_bytes_and_not_by_utf16_code_units() {
+        // U+E000 is EE 80 80 in UTF-8 and U+10000 is F0 90 80 80, so the first sorts first; in UTF-16 the second (D800 DC00) would sort before the first (E000), as RFC 8785 has it.
+        // The README (line 48) says bytes, and the relay's own `Json::canonical` sorts bytes.
+        assert_eq!(canon("{\"\u{10000}\":1,\"\u{e000}\":2}").unwrap(), "{\"\u{e000}\":2,\"\u{10000}\":1}");
+        assert_eq!(canon("{\"\u{e000}\":2,\"\u{10000}\":1}").unwrap(), "{\"\u{e000}\":2,\"\u{10000}\":1}");
+        // Within the basic plane both orders agree; a prefix sorts first.
+        assert_eq!(canon(r#"{"ab":1,"a":2,"b":3}"#).unwrap(), r#"{"a":2,"ab":1,"b":3}"#);
+    }
+
+    #[test]
+    fn a_form_feed_is_not_whitespace() {
+        for ws in ["\u{c}", "\u{b}", "\u{a0}", "\u{feff}", "\u{2028}"] {
+            assert!(parse(format!("{ws}1").as_bytes()).is_err(), "{ws:?} before a value");
+            assert!(parse(format!("[1,{ws}2]").as_bytes()).is_err(), "{ws:?} inside an array");
+            assert!(parse(format!("{{\"a\"{ws}:1}}").as_bytes()).is_err(), "{ws:?} inside an object");
+        }
+        for ws in [" ", "\t", "\n", "\r"] {
+            assert!(parse(format!("{ws}[{ws}1{ws},{ws}2{ws}]{ws}").as_bytes()).is_ok(), "{ws:?}");
+        }
     }
 
     #[test]

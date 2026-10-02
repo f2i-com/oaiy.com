@@ -80,6 +80,28 @@ impl Env {
     }
 }
 
+/// What the relay says it is holding open at this moment, read from `GET /v1/admin/status` with a desktop's token: `(live, polls, pairing reads)`. It is the relay's own count, so it
+/// shows what a client does to the relay and not what it says it does.
+pub fn held_requests(stub: &StubRelay, token: &Token) -> (u64, u64, u64) {
+    let request = oaiy_relay_core::client::HttpRequest {
+        method: oaiy_relay_core::client::Method::Get,
+        url: format!("{}/v1/admin/status", stub.public_url()),
+        headers: vec![("Authorization".to_string(), format!("Bearer {}", token.expose()))],
+        body: None,
+        timeout: Duration::from_secs(2),
+        max_response_bytes: 1 << 20,
+        cancel: Cancel::new(),
+    };
+    let response = oaiy_relay_core::client::HttpClient::send(stub, &request).expect("the status");
+    assert_eq!(response.status, 200, "{}", String::from_utf8_lossy(&response.body));
+    let doc = oaiy_relay_core::json::parse(&response.body).expect("a JSON status");
+    let holds = doc.get("holds").expect("holds");
+    let kind = |k: &str| holds.get("byKind").and_then(|b| b.get_uint53(k)).expect("byKind");
+    let (live, polls, pairs) = (holds.get_uint53("live").expect("live"), kind("poll"), kind("pair"));
+    assert_eq!(live, polls + pairs, "the kinds add up to the live count");
+    (live, polls, pairs)
+}
+
 /// Runs a loop on a thread; `finish` stops it and returns how it ended and its store.
 pub struct Running {
     pub handle: PollHandle,
@@ -114,12 +136,27 @@ impl Running {
     /// Stops the loop and returns how it ended and what it stored.
     pub fn finish(mut self) -> (LoopEnd, MemoryPollStore) {
         self.handle.stop();
-        self.thread.take().unwrap().join().expect("the loop thread")
+        self.ended("after it was stopped")
     }
 
     /// Waits for the loop to end on its own.
     pub fn join(mut self) -> (LoopEnd, MemoryPollStore) {
-        self.thread.take().unwrap().join().expect("the loop thread")
+        self.ended("on its own")
+    }
+
+    /// The loop's thread, joined: **with a deadline** (20 s of real time), so that a loop that does not end (a mutant of the crate that makes it retry for ever) fails the test that waits
+    /// for it, with the events it had, instead of hanging the whole run.
+    fn ended(&mut self, how: &str) -> (LoopEnd, MemoryPollStore) {
+        let thread = self.thread.take().unwrap();
+        let start = Instant::now();
+        while !thread.is_finished() {
+            if start.elapsed() > Duration::from_secs(20) {
+                self.handle.stop();
+                panic!("the poll loop did not end {how} in 20 s; events: {:#?}", self.sink.events());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        thread.join().expect("the loop thread")
     }
 }
 

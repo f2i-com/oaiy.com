@@ -173,6 +173,8 @@ pub(crate) struct State {
     pub(crate) pairings: HashMap<String, super::stub_pairing::Pairing>,
     id_counter: u64,
     seed: u64,
+    /// Pairing reads that are being held open (`GET /v1/pair/{pid}?wait=`), for `GET /v1/admin/status`.
+    pub(crate) pair_waiting: u32,
 }
 
 pub(crate) struct Inner {
@@ -277,6 +279,7 @@ impl StubRelay {
             pairings: HashMap::new(),
             id_counter: 1,
             seed: 0x0a1b_2c3d_4e5f_6071,
+            pair_waiting: 0,
         };
         StubRelay(Arc::new(Inner {
             cfg: Mutex::new(config),
@@ -611,6 +614,7 @@ impl StubRelay {
             ("GET", "/v1/poll") => self.poll(req, q),
             ("POST", "/v1/items") => self.post_items(req),
             ("POST", "/v1/tokens/rotate") => self.rotate(req),
+            ("GET", "/v1/admin/status") => self.admin_status(req),
             ("POST", "/v1/admission") | ("POST", "/v1/aokie-companion/admission") => self.admission(req),
             (m, p) if p.starts_with("/v1/pair") => self.pairing_route(req, m, p, q),
             ("POST", p) if p.starts_with("/v1/devices/") && p.ends_with("/revoke") => self.revoke_route(req, p),
@@ -1020,6 +1024,61 @@ impl StubRelay {
         ok(Json::obj([
             ("token", Json::str(format!("oaiyrt1.{token_id}.{}", b64::encode(&secret)))),
             ("graceUntil", Json::int(now + 600)),
+            ("time", Json::int(now)),
+        ]))
+    }
+
+    /// `GET /v1/admin/status` (the token of a desktop): the document of `admin-status.schema.json` with what a test of a client looks at filled in truly: **`holds`**, how many requests the
+    /// relay is holding open at this moment (`live`) and of what kind (`byKind`: `poll`, `pair`), which is how a test sees that a client keeps one request open and not two (MOB-21a), the
+    /// unrevoked devices, and the number of live items. What a stub has no way to measure (the PHP and database facts, the rejection counters) is present and empty, as the schema wants.
+    fn admin_status(&self, req: &HttpRequest) -> Resp {
+        let st = self.lock();
+        let who = match self.principal(&st, req) {
+            Ok(p) => p,
+            Err(r) => return r,
+        };
+        if who.role != "desktop" {
+            return err(403, "forbidden", "Only a desktop reads the status.");
+        }
+        let polls: u32 = st.holds.values().map(|h| h.waiting).sum();
+        let pairs = st.pair_waiting;
+        let devices: Vec<Json> = st
+            .devices
+            .iter()
+            .filter(|d| !d.revoked)
+            .map(|d| {
+                Json::obj([
+                    ("id", Json::str(d.id.clone())),
+                    ("role", Json::str(d.role.clone())),
+                    ("name", Json::str(d.name.clone())),
+                    ("online", Json::Bool(false)),
+                ])
+            })
+            .collect();
+        let now = self.now();
+        let live_items: usize = st.mailboxes.values().map(|m| m.items.iter().filter(|i| !i.acked && i.exp > now).count()).sum();
+        let bytes: usize = st.mailboxes.values().flat_map(|m| m.items.iter().filter(|i| !i.acked && i.exp > now)).map(|i| i.body.len()).sum();
+        ok(Json::obj([
+            ("v", Json::int(1)),
+            ("version", Json::str("oaiy-relay-stub 0.1.0")),
+            ("php", Json::obj([("version", Json::str("0")), ("sapi", Json::str("stub")), ("extensions", Json::Arr(vec![]))])),
+            ("db", Json::obj([("driver", Json::str("sqlite"))])),
+            ("items", Json::obj([("live", Json::int(live_items as u64)), ("bytes", Json::int(bytes as u64)), ("oldestAgeS", Json::Null)])),
+            ("devices", Json::Arr(devices)),
+            (
+                "holds",
+                Json::obj([
+                    ("soft", Json::int(3)),
+                    ("hard", Json::int(4)),
+                    ("measured", Json::Bool(false)),
+                    ("byKind", Json::obj([("poll", Json::int(polls)), ("pair", Json::int(pairs))])),
+                    ("live", Json::int(polls + pairs)),
+                ]),
+            ),
+            ("rejected24h", Json::Obj(vec![])),
+            ("noAuthHeader24h", Json::int(0)),
+            ("tokensOlderThan90d", Json::Arr(vec![])),
+            ("warnings", Json::Arr(vec![])),
             ("time", Json::int(now)),
         ]))
     }

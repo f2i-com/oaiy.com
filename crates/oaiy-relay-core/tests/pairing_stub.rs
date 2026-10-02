@@ -5,9 +5,10 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use common::env::quick;
+use common::env::{held_requests, quick};
 use common::pair::{grants, phone_identity, world, World};
 use oaiy_relay_core::admission::{MobileExpect, MobileRequest, Transport};
 use oaiy_relay_core::b64;
@@ -18,6 +19,7 @@ use oaiy_relay_core::pairing::math::{self, PairingSecret};
 use oaiy_relay_core::pairing::phone::{store_paired, Outcome};
 use oaiy_relay_core::pairing::{Claims, PairEvent, PairingError, PairingInput, PairingTarget, PhonePairing, Response, SasOutcome};
 use oaiy_relay_core::testing::stub::{Fault, StubConfig};
+use oaiy_relay_core::testing::{FakeClock, SeededRng};
 
 fn fixed(w: &World) -> StubConfig {
     let _ = w;
@@ -331,14 +333,10 @@ fn a_replayed_response_a_revoked_key_and_a_response_outside_its_window_are_rejec
         PairEvent::Rejected { pid: o2.pid.clone(), reason: "window" },
         "issued in the future"
     );
-    // A response that the approval consumed is not a response any more: restore the consumed set on a party that never saw it.
+    // Inside both windows the same response is taken (a response is judged once per item id, and `.3` is a new one).
     assert!(matches!(fresh.desktop.receive_response(&format!("{}.3", o2.pid), &item2.body, t), PairEvent::AwaitingSas { .. }));
-    let consumed = vec![(b64::encode(&o2.offer.nonce), o2.offer.jti.clone())];
-    let mut other_party =
-        oaiy_relay_core::pairing::DesktopPairing::new(fresh.identity.clone(), "aokie", fresh.profile.relay.clone(), &fresh.profile.relay_thumbprint);
-    other_party.restore_consumed(consumed);
-    // (a party that has no such pending offer ignores the item; the check that matters is on the pending one)
-    assert!(matches!(other_party.receive_response(&item2.id, &item2.body, t), PairEvent::Ignored(_)));
+    // (That a nonce an approval consumed is not a response any more is `a_nonce_that_an_approval_consumed_cannot_be_used_again`, and that a party that restored the consumed set refuses
+    // it is `attack_a_consumed_nonce_and_jti_are_refused_by_a_party_that_restored_them`: the lines that stood here only showed that a party with no such offer ignores an item.)
 }
 
 #[test]
@@ -524,10 +522,25 @@ fn the_typed_route_to_a_host_that_serves_no_valid_offer_is_not_found() {
         ),
     );
     assert!(phone.fetch_offer(&cancel()).is_err());
-    // An offer that expired.
+    // An offer that expired, 700 seconds on. The honest relay no longer has the rendezvous (it answers 404, which is `NotFound`), which says nothing about the phone's own check, so a
+    // relay that still serves the offer, with its right MAC, is played too: the phone's window refuses it whatever the relay says.
     let mut phone = w.phone(PairingInput::Key(&offer.pairing_uri), 23);
     w.env.clock.advance(Duration::from_secs(700));
-    assert!(phone.fetch_offer(&cancel()).is_err());
+    assert_eq!(phone.fetch_offer(&cancel()).err(), Some(PairingError::NotFound), "the stub forgot the rendezvous");
+    let mut phone = w.phone(PairingInput::Key(&offer.pairing_uri), 24);
+    let still_served = Json::obj([
+        ("v", Json::int(1)),
+        ("state", Json::str("open")),
+        ("offer", Json::str(offer.offer.text.clone())),
+        ("mac", Json::str(offer.mac.clone())),
+        ("exp", Json::int(offer.offer.expires_at)),
+        ("time", Json::int(w.env.client.relay_now_or_local())),
+    ])
+    .to_compact();
+    w.env.stub.fail_next_on("/v1/pair/", 1, Fault::Respond(200, vec![], still_served));
+    let err = phone.fetch_offer(&cancel()).unwrap_err();
+    assert!(matches!(err, PairingError::Protocol(oaiy_relay_core::Error::OutsideWindow(_))), "{err:?}");
+    assert!(w.env.stub.log().iter().all(|r| !r.target.ends_with("/response")), "an expired offer is not answered");
 }
 
 #[test]
@@ -541,4 +554,86 @@ fn the_desktop_party_retries_opening_a_rendezvous_with_the_same_request_and_gets
     let mut other = offer.create.clone();
     other.mac = b64::encode(&[7u8; 32]);
     assert_eq!(w.env.client.pair_create(&w.token, &other, &cancel()).unwrap_err().code(), Some("conflict"));
+}
+
+#[test]
+fn a_receipt_dated_in_the_future_is_not_an_answer_to_this_pairing_though_it_is_signed() {
+    // The desktop's own clock is 200 seconds ahead of the relay's and the phone's (it samples the relay's time and then its monotonic clock runs on): the receipt it signs is dated
+    // 200 seconds ahead of what the phone knows the time to be, and with 30 seconds of slack that is not an answer to a pairing that was asked a moment ago. The signature is right:
+    // only the date can refuse it.
+    let mut w = world(StubConfig { receipt_includes_grants: true, ..quick() });
+    let desk_clock = Arc::new(FakeClock::new(common::env::T0));
+    let desk_client = Arc::new(RelayClient::new(
+        w.profile.relay.clone(),
+        Some(w.profile.relay_thumbprint.clone()),
+        Arc::new(w.env.stub.clone()),
+        desk_clock.clone(),
+        Box::new(SeededRng::new(55)),
+        ClientConfig::default(),
+    ));
+    desk_client.prove(&cancel()).unwrap();
+    let offer = w.new_offer();
+    let mut phone = w.phone(PairingInput::Key(&offer.pairing_uri), 62);
+    phone.fetch_offer(&cancel()).unwrap();
+    let sas = phone.respond(&cancel()).unwrap();
+    assert!(matches!(w.deliver()[0], PairEvent::AwaitingSas { .. }));
+    desk_clock.advance(Duration::from_secs(200));
+    let outcome = w.desktop.confirm_sas(&desk_client, &w.token, &offer.pid, &sas.display(), &grants(), &cancel()).unwrap();
+    assert!(matches!(outcome, SasOutcome::Approved { .. }));
+    assert_eq!(phone.wait_outcome(None, &cancel()).err(), Some(PairingError::ReceiptInvalid));
+
+    // The same with the desktop 20 seconds ahead (inside the 30 of slack): the phone pairs.
+    let mut w = world(StubConfig { receipt_includes_grants: true, ..quick() });
+    let desk_clock = Arc::new(FakeClock::new(common::env::T0));
+    let desk_client = Arc::new(RelayClient::new(
+        w.profile.relay.clone(),
+        Some(w.profile.relay_thumbprint.clone()),
+        Arc::new(w.env.stub.clone()),
+        desk_clock.clone(),
+        Box::new(SeededRng::new(56)),
+        ClientConfig::default(),
+    ));
+    desk_client.prove(&cancel()).unwrap();
+    let offer = w.new_offer();
+    let mut phone = w.phone(PairingInput::Key(&offer.pairing_uri), 63);
+    phone.fetch_offer(&cancel()).unwrap();
+    let sas = phone.respond(&cancel()).unwrap();
+    assert!(matches!(w.deliver()[0], PairEvent::AwaitingSas { .. }));
+    desk_clock.advance(Duration::from_secs(20));
+    w.desktop.confirm_sas(&desk_client, &w.token, &offer.pid, &sas.display(), &grants(), &cancel()).unwrap();
+    assert!(matches!(phone.wait_outcome(None, &cancel()).unwrap(), Outcome::Paired(_)));
+}
+
+#[test]
+fn a_phone_that_waits_for_the_owner_holds_one_pairing_read_at_a_time_as_the_relays_own_count_shows() {
+    // MOB-21a, the phone's side: while the owner has not typed the code the phone's read of the rendezvous is held by the relay, and the relay's count (`GET /v1/admin/status`) shows one
+    // such request, never two, and no poll (the phone has no token yet).
+    let mut w = world(StubConfig { wait_default: 2, wait_max: 2, receipt_includes_grants: true, ..Default::default() });
+    let offer = w.new_offer();
+    let mut phone = w.phone(PairingInput::Key(&offer.pairing_uri), 61);
+    phone.fetch_offer(&cancel()).unwrap();
+    let sas = phone.respond(&cancel()).unwrap();
+    assert!(matches!(w.deliver()[0], PairEvent::AwaitingSas { .. }));
+    assert_eq!(held_requests(&w.env.stub, &w.token), (0, 0, 0), "nothing is held before the phone waits");
+    let (stub, token) = (w.env.stub.clone(), w.token.clone());
+    let (most, with_one, result) = std::thread::scope(|s| {
+        let waiting = s.spawn(|| phone.wait_outcome(None, &cancel()));
+        let start = std::time::Instant::now();
+        let (mut most, mut with_one) = (0u64, 0u32);
+        while start.elapsed() < Duration::from_millis(2600) {
+            let (live, polls, pairs) = held_requests(&stub, &token);
+            assert_eq!((polls, live), (0, pairs), "the phone holds no poll");
+            most = most.max(pairs);
+            with_one += u32::from(pairs == 1);
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        // The owner types the code: the approval wakes the held read, which ends the wait.
+        let outcome = w.desktop.confirm_sas(&w.env.client, &w.token, &offer.pid, &sas.display(), &grants(), &cancel()).unwrap();
+        assert!(matches!(outcome, SasOutcome::Approved { .. }));
+        (most, with_one, waiting.join().unwrap())
+    });
+    assert_eq!(most, 1, "never more than one pairing read held");
+    assert!(with_one >= 30, "the phone's read was held in {with_one} of the samples");
+    assert!(matches!(result.unwrap(), Outcome::Paired(_)));
+    assert_eq!(held_requests(&w.env.stub, &w.token), (0, 0, 0), "nothing is held once the phone has its answer");
 }

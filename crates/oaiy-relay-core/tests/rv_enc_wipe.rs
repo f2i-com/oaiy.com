@@ -94,7 +94,11 @@ fn measure<R>(results: &mut Vec<(String, usize)>, label: &str, needles: Vec<Need
     results.push((label.to_string(), total));
 }
 
+/// The allocator counts the whole process, so two tests that arm it at once would count each other's blocks: the tests of this file take this lock for the whole of a measurement.
+static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn scenarios() -> Vec<(String, usize)> {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut r: Vec<(String, usize)> = Vec::new();
     // ---- controls
     let probe = b"PROBE-PROBE-PROBE-0123456789".to_vec();
@@ -201,7 +205,7 @@ fn unwiped_copies_of_secrets() {
     assert_eq!(r[1].1, 0, "the negative control was detected");
 }
 
-/// Fails today (run with `--ignored`): every scenario of the table must show no unwiped copy of a secret. A failure names the scenarios that still leave one.
+/// Every scenario of the table must show no unwiped copy of a secret (it failed on the crate as it was reviewed, and is no longer ignored). A failure names the scenarios that still leave one.
 #[test]
 fn no_scenario_leaves_an_unwiped_copy() {
     let bad: Vec<String> = scenarios().into_iter().filter(|(l, n)| *n > 0 && !l.starts_with("control")).map(|(l, n)| format!("{l}: {n}")).collect();

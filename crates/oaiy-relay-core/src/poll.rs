@@ -631,6 +631,59 @@ mod tests {
     }
 
     #[test]
+    fn a_retry_after_is_trimmed_of_spaces_and_tabs_and_of_nothing_else() {
+        for (text, want) in [
+            (" 12 ", Some(12)),
+            ("\t12\t", Some(12)),
+            (" \t 7", Some(7)),
+            ("12\n", None),
+            ("\n12", None),
+            ("12\r", None),
+            ("\u{b}12", None),
+            ("12\u{c}", None),
+            ("\u{a0}12", None),
+            ("\u{2003}12", None),
+            ("", None),
+            (" ", None),
+        ] {
+            let h = headers(&[("retry-after", text)]);
+            assert_eq!(retry_after(&Answer { status: Some(429), headers: &h, body: None }, None), want, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_refused_hold_pauses_at_the_fallback_however_many_were_refused_and_never_overflows() {
+        let refused = Json::obj([
+            ("v", Json::int(1)),
+            ("epoch", Json::str("AAAAAAAAAAA")),
+            ("cursor", Json::int(0)),
+            ("items", Json::Arr(vec![])),
+            ("hold", Json::obj([("refused", Json::Bool(true))])),
+        ]);
+        let info = PollInfo { poll_gap_ms: 250, fallback_s: 5 };
+        for n_refused in [0u32, 1, 2, 29, 30, 31, 63, 64, 65, 200, u32::MAX - 1] {
+            let d = decide(&DecideInput {
+                counters: Counters { n_refused, ..Counters::default() },
+                info,
+                answer: Answer { status: Some(200), headers: &[], body: Some(&refused) },
+                since: 0,
+                persisted: true,
+                we_replaced: true,
+                min_client_above_ours: false,
+                now_epoch: None,
+                u: 0.0,
+            });
+            // 2 (the default retryAfter of a refused hold), then 4, then the fallback of 5 and never more.
+            let want = match n_refused {
+                0 => 2.0,
+                1 => 4.0,
+                _ => 5.0,
+            };
+            assert_eq!((d.outcome, d.base_s), (Outcome::Idle, want), "after {n_refused} refused holds");
+            assert_eq!(d.counters.n_refused, n_refused + 1);
+        }
+    }
+    #[test]
     fn a_429_for_the_proof_is_flow_and_never_a_failure() {
         let c = Counters { n429: 2, n_fail: 5, n_refused: 3, n400: 1 };
         let d = decide_proof(c, ProofResult::Flow, 0.0, 7, None);
