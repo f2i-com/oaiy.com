@@ -237,6 +237,12 @@ impl Rig {
         PhonePairing::new(self.client(2, None), target, self.identity()).unwrap()
     }
 
+    /// The phone, from the typed code and the relay's host: no pairing key, so no key expiry (`x`) beside the offer's own window.
+    fn phone_typed(&self) -> PhonePairing {
+        let target = PairingTarget::from_input(PairingInput::Typed { code: &self.offer.typed_code, host: "relay.example.com" }).unwrap();
+        PhonePairing::new(self.client(4, None), target, self.identity()).unwrap()
+    }
+
     /// The phone fetches the offer and answers it at T0 + 30, as the recording does (steps 1 and 2).
     fn phone_answers(&self) -> (PhonePairing, oaiy_relay_core::pairing::math::Sas) {
         let mut phone = self.phone();
@@ -353,6 +359,62 @@ fn an_offer_is_judged_against_its_own_window_at_relay_time_with_thirty_seconds_o
 }
 
 #[test]
+fn an_offer_is_judged_against_its_own_window_also_when_there_is_no_key_expiry_beside_it() {
+    // The scanned key carries the offer's expiry (`x`), which refuses a late phone by itself; a typed code has none, so here the offer's own window is the only judge.
+    let r = rig(false, |_| {});
+    r.clock.advance(std::time::Duration::from_secs(629));
+    let mut phone = r.phone_typed();
+    phone.fetch_offer(&Cancel::new()).expect("29 seconds past the expiry is inside the slack");
+    let r = rig(false, |_| {});
+    r.clock.advance(std::time::Duration::from_secs(630));
+    let mut phone = r.phone_typed();
+    let err = phone.fetch_offer(&Cancel::new()).unwrap_err();
+    assert!(matches!(err, PairingError::Protocol(Error::OutsideWindow(_))), "{err:?}");
+    assert!(r.sent_with("response").iter().all(|l| !l.ends_with("/response")), "nothing was answered");
+}
+
+#[test]
+fn an_offer_for_another_relay_than_the_one_the_owner_named_is_refused_though_its_mac_and_key_are_right() {
+    // The offer is made by the desktop's own party for `https://other.example.com` (the same relay key and the same secret, so a MAC that verifies); the key the phone scanned names
+    // `https://relay.example.com`. The phone must see that the offer is for another relay, and answer nothing.
+    let r = rig(false, |_| {});
+    let other_relay = RelayUrl::parse("https://other.example.com").unwrap();
+    let mut other_party = DesktopPairing::new(
+        Arc::new(DesktopIdentity {
+            device_id: r.vectors.s("keys.ids.desktopDevice").into(),
+            name: "Front desk PC".into(),
+            endpoint: seed(&r.vectors, "keys.ed25519Seeds.desktopEndpoint"),
+            endpoint_x25519: X25519Public::from_b64u(r.vectors.s("keys.x25519Public.plugin")).unwrap(),
+            host_ed25519: seed(&r.vectors, "keys.ed25519Seeds.host").verify_key(),
+            host_x25519: X25519Public::from_b64u(r.vectors.s("keys.x25519Public.host")).unwrap(),
+        }),
+        "aokie",
+        other_relay,
+        &r.relay_fingerprint,
+    );
+    let offer = other_party
+        .create_offer_with(
+            unhex(r.vectors.s("A3.inputs.secretHex")).try_into().unwrap(),
+            unhex32(r.vectors.s("A3.inputs.nonceHex")),
+            r.vectors.s("A3.inputs.offer.jti").into(),
+            T0,
+        )
+        .unwrap();
+    assert_eq!(offer.pid, r.offer.pid, "the same secret: the same rendezvous");
+    let served = {
+        let mut steps = r.steps.clone();
+        edit_text(&mut steps[1], "response.body.offer", |_| offer.offer.text.clone());
+        edit_text(&mut steps[1], "response.body.mac", |_| offer.mac.clone());
+        steps
+    };
+    let r = rig(false, |s| *s = served);
+    let mut phone = r.phone();
+    let err = phone.fetch_offer(&Cancel::new()).unwrap_err();
+    assert!(matches!(err, PairingError::Protocol(Error::Mismatch(_))), "{err:?}");
+    assert!(r.sent_with("response").iter().all(|l| !l.ends_with("/response")));
+}
+
+#[test]
 fn a_key_that_names_another_relay_key_than_the_offer_does_is_refused_before_the_offer_is_used() {
     // The key's `f` (what the phone proves the relay against) is the right relay's; the offer, which carries its own MAC, was made by a desktop that was told another fingerprint.
     let r = rig(false, |_| {});
@@ -450,6 +512,9 @@ fn a_wrong_code_approves_nothing_and_the_third_denies_and_burns() {
     assert_ne!(wrong, right);
     let grants = r.grants();
     let pid = r.offer.pid.clone();
+    // No approval can be made for a pairing whose code has not been typed, by any call.
+    assert_eq!(r.desktop.approve_body(&pid, &grants, T0 + 40).unwrap_err(), PairingError::SasRequired);
+    assert!(r.sent_with("approve").is_empty());
     let confirm = |r: &mut Rig, typed: &str| r.desktop.confirm_sas(&r.desktop_client, &r.token, &pid, typed, &grants, &Cancel::new()).unwrap();
     assert_eq!(confirm(&mut r, &wrong), SasOutcome::Wrong { attempts_left: 2 });
     assert_eq!(confirm(&mut r, &wrong), SasOutcome::Wrong { attempts_left: 1 });
