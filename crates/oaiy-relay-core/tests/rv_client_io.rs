@@ -585,6 +585,35 @@ fn evidence_an_endless_stream_of_items_is_accepted_without_pause_and_without_a_c
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// One answer of about 0.9 MiB that holds 60,000 items (`{"seq":N}`, each accepted although the client asked for `limit=32`): processed in linear time, all of them accepted.
+#[test]
+fn a_poll_answer_with_sixty_thousand_tiny_items_is_processed_quickly_and_all_accepted() {
+    let e = env(quick());
+    let (token, _) = e.enrol_desktop();
+    let epoch = e.stub.epoch();
+    let items: Vec<String> = (1..=60_000).map(|i| format!(r#"{{"seq":{i}}}"#)).collect();
+    let items = items.join(",");
+    let sent = Arc::new(AtomicBool::new(false));
+    let s2 = sent.clone();
+    let http = Hybrid::new(&e.stub, move |r| {
+        let since = since_of(&r.url).unwrap_or(0);
+        if since == 0 && !s2.swap(true, Ordering::SeqCst) {
+            Ok(json_response(200, &[], &ok_body(&epoch, 60_000, &items), T0))
+        } else {
+            Ok(json_response(200, &[], &ok_body(&epoch, since, ""), T0))
+        }
+    });
+    let client = client_over(&e, http.clone(), Arc::new(SystemClock::new()));
+    let running = run(&client, &token, MemoryPollStore::new());
+    let started = Instant::now();
+    wait_for("the big answer to be accepted", 20, || running.sink.events().iter().any(|ev| matches!(ev, Event::Accepted { count: 60_000, .. })));
+    println!("60,000 items accepted {:?} after the loop started", started.elapsed());
+    let (_, store) = running.stop();
+    let store = store.downcast::<MemoryPollStore>().unwrap();
+    assert_eq!(store.accepted.len(), 60_000);
+    assert_eq!(store.cursor().since, 60_000);
+}
+
 /// A relay that answers every poll `429` for ever: the pause reaches its cap (30 s with up to 20 percent jitter) and stays there; the counters do not wrap in any realistic run.
 #[test]
 fn an_endless_429_is_paced_at_the_cap_and_nothing_grows() {
