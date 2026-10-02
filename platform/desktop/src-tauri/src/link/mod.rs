@@ -52,26 +52,49 @@ pub use descriptor::ConnectorDescriptor;
 /// and its web app is the surface they then expect to manage this desktop from.
 /// Deriving the trusted origin FROM the link means no address is ever hardcoded
 /// and unlinking withdraws the trust in the same action.
+///
+/// The same cell, read and written by the same code, in the build and in the tests: only where the cell is kept differs
+/// ([`with_origin_cell`]), so that what the tests check of the getter and the setter is what the build runs.
+type OriginCell = std::sync::RwLock<Option<String>>;
+
 #[cfg(not(test))]
-static LINKED_ORIGIN: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+static LINKED_ORIGIN: OriginCell = std::sync::RwLock::new(None);
 // In the tests there is one cell for each thread and not one for the process: every test that links or forgets writes
 // it (most of the suite opens a link store), so a test that set it and asked a rule about it, or one that compared two
-// rules that read it, met another test's write in between, and failed one run in some.
+// rules that read it, met another test's write in between, and failed one run in some. The limit of that is the reverse
+// of its use: a test that sets the origin on its own thread and then asks a server that runs on another (a spawned task,
+// a worker of a runtime, a lane's thread) is asking an empty cell, and an assertion that the origin is NOT trusted passes
+// for that reason and none other. A test that needs the other threads to see it builds its runtime with
+// `runtime_seeing_this_threads_origin`.
 #[cfg(test)]
 thread_local! {
-    static LINKED_ORIGIN: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    static LINKED_ORIGIN: OriginCell = const { std::sync::RwLock::new(None) };
+}
+
+/// The cell of the process, or of this thread in the tests: the one place the two differ.
+#[cfg(not(test))]
+fn with_origin_cell<R>(use_cell: impl FnOnce(&OriginCell) -> R) -> R {
+    use_cell(&LINKED_ORIGIN)
+}
+
+#[cfg(test)]
+fn with_origin_cell<R>(use_cell: impl FnOnce(&OriginCell) -> R) -> R {
+    LINKED_ORIGIN.with(use_cell)
 }
 
 /// The linked provider's origin, for the origin allow-list.
-#[cfg(not(test))]
 pub fn linked_origin() -> Option<String> {
-    LINKED_ORIGIN.read().ok().and_then(|g| g.clone())
+    with_origin_cell(|cell| cell.read().ok().and_then(|g| g.clone()))
 }
 
-/// The linked provider's origin, for the origin allow-list: this thread's, in the tests.
-#[cfg(test)]
-pub fn linked_origin() -> Option<String> {
-    LINKED_ORIGIN.with(|cell| cell.borrow().clone())
+fn set_linked_origin(base_url: Option<&str>) {
+    with_origin_cell(|cell| {
+        if let Ok(mut guard) = cell.write() {
+            // Store the ORIGIN, not the base: a provider served under a path still
+            // sends `Origin: scheme://host[:port]`.
+            *guard = base_url.and_then(origin_of);
+        }
+    });
 }
 
 /// Set the trusted origin directly, for tests in other modules.
@@ -80,18 +103,16 @@ pub fn set_linked_origin_for_tests(base_url: Option<&str>) {
     set_linked_origin(base_url);
 }
 
-#[cfg(not(test))]
-fn set_linked_origin(base_url: Option<&str>) {
-    if let Ok(mut guard) = LINKED_ORIGIN.write() {
-        // Store the ORIGIN, not the base: a provider served under a path still
-        // sends `Origin: scheme://host[:port]`.
-        *guard = base_url.and_then(origin_of);
-    }
-}
-
+/// A runtime of several threads, each of which starts with the origin this thread has trusted at the moment: for a test that
+/// asks a server or a rule from tasks that run on its workers and means the answer to depend on the origin (see the cell).
 #[cfg(test)]
-fn set_linked_origin(base_url: Option<&str>) {
-    LINKED_ORIGIN.with(|cell| *cell.borrow_mut() = base_url.and_then(origin_of));
+pub(crate) fn runtime_seeing_this_threads_origin() -> tokio::runtime::Runtime {
+    let origin = linked_origin();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .on_thread_start(move || with_origin_cell(|cell| *cell.write().unwrap_or_else(|e| e.into_inner()) = origin.clone()))
+        .build()
+        .expect("a runtime of its own")
 }
 
 /// `scheme://host[:port]` from a base URL, or `None` if it is not one we would
@@ -2393,6 +2414,19 @@ mod tests {
         .unwrap();
         assert_eq!(linked_origin().as_deref(), Some("https://thread-a.example.test"), "and what it writes is not seen here");
         set_linked_origin(None);
+    }
+
+    #[test]
+    fn a_runtime_built_for_it_sees_the_origin_this_thread_trusts_and_a_plain_one_does_not() {
+        // The limit of one cell for each thread, in the open: a task on a worker of an ordinary runtime asks an empty cell, so an
+        // assertion that an origin is not trusted would hold there for that reason and no other. A runtime built with
+        // `runtime_seeing_this_threads_origin` has the origin on its workers.
+        set_linked_origin(Some("https://seen.example.test"));
+        let ask = |runtime: tokio::runtime::Runtime| runtime.block_on(async { tokio::spawn(async { linked_origin() }).await.unwrap() });
+        assert_eq!(ask(runtime_seeing_this_threads_origin()).as_deref(), Some("https://seen.example.test"));
+        assert_eq!(ask(tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap()), None, "an ordinary runtime does not");
+        set_linked_origin(None);
+        assert_eq!(ask(runtime_seeing_this_threads_origin()), None, "and it has what this thread has, which is nothing now");
     }
 
     #[test]
