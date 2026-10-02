@@ -1,6 +1,6 @@
 import json, sys, collections, pathlib
 d = sys.argv[1]
-AOKIE = pathlib.Path(r"E:\repos\oaiy-relay-core\platform\protocol\relay\v1\fixtures\aokie")
+AOKIE = pathlib.Path(__file__).resolve().parents[5] / "platform" / "protocol" / "relay" / "v1" / "fixtures" / "aokie"
 adm = json.loads((AOKIE / "admission.json").read_text(encoding="utf-8"))
 orig = {c["name"]: c["response"]["body"] for c in adm["cases"] if c["response"]["status"] == 200}
 rows = [json.loads(l) for l in open(d + "/disagree.txt", encoding="utf-8")]

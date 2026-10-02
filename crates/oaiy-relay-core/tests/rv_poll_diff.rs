@@ -1,5 +1,5 @@
 //! Reviewer's differential harness (not part of the crate's own suite): reads the JSON lines of `RV_POLL_IN` (cases written by the reviewer's own generator), runs
-//! `oaiy_relay_core::poll::decide` / `decide_proof` on each, and writes one JSON line per case to `RV_POLL_OUT`. Skipped when the variables are not set.
+//! `oaiy_relay_core::poll::decide` / `decide_proof` on each, and writes one JSON line per case to `RV_POLL_OUT`. Ignored, and fails loudly when the variables are not set (`tools/run-differentials.ps1` runs it).
 
 use oaiy_relay_core::json::{self, Json};
 use oaiy_relay_core::poll::{self, Answer, Counters, DecideInput, PollInfo, ProofResult};
@@ -14,11 +14,12 @@ fn f64_of(v: &Json) -> f64 {
 }
 
 #[test]
+#[ignore = "driver of tools/run-differentials.ps1: needs the generated inputs (RV_*) and python, node and php; run it through that script"]
 fn rv_poll_differential() {
-    let (Ok(inp), Ok(outp)) = (std::env::var("RV_POLL_IN"), std::env::var("RV_POLL_OUT")) else {
-        eprintln!("SKIPPED: RV_POLL_IN / RV_POLL_OUT not set");
-        return;
-    };
+    let (inp, outp) = (
+        std::env::var("RV_POLL_IN").expect("RV_POLL_IN is not set: run this through tools/run-differentials.ps1"),
+        std::env::var("RV_POLL_OUT").expect("RV_POLL_OUT is not set: run this through tools/run-differentials.ps1"),
+    );
     let text = std::fs::read_to_string(inp).unwrap();
     let mut out = String::new();
     for line in text.lines() {

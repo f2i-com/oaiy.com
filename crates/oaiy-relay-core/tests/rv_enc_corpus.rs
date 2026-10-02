@@ -1,6 +1,6 @@
 //! Reviewer's corpus runners (F2, encoding): each test reads a corpus written by the reviewer's Python driver from the directory in `RV_DIR` (one input per line, as hex of
 //! the raw bytes), runs this crate's function on every line and writes one result line per input next to it. The driver compares the results with PHP's `B64.php`, `Ids.php`,
-//! `json_decode`, Python's `base64` and `json`, Node's `Buffer` and `JSON`, and `serde_json`. Without `RV_DIR` every test returns at once.
+//! `json_decode`, Python's `base64` and `json`, Node's `Buffer` and `JSON`, and `serde_json`. The tests are ignored (they are the drivers of `tools/run-differentials.ps1`) and fail loudly when `RV_DIR` is not set.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -9,8 +9,8 @@ use oaiy_relay_core::json::{self, Json};
 use oaiy_relay_core::pairing::math::{self, Sas};
 use oaiy_relay_core::{b64, ids, url};
 
-fn dir() -> Option<PathBuf> {
-    std::env::var_os("RV_DIR").map(PathBuf::from)
+fn dir() -> PathBuf {
+    PathBuf::from(std::env::var_os("RV_DIR").expect("RV_DIR is not set: run this through tools/run-differentials.ps1"))
 }
 
 fn unhex(s: &str) -> Vec<u8> {
@@ -25,15 +25,16 @@ fn hex(b: &[u8]) -> String {
     s
 }
 
-fn lines(name: &str) -> Option<(PathBuf, Vec<String>)> {
-    let d = dir()?;
+fn lines(name: &str) -> (PathBuf, Vec<String>) {
+    let d = dir();
     let text = std::fs::read_to_string(d.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
-    Some((d, text.lines().map(str::to_string).collect()))
+    (d, text.lines().map(str::to_string).collect())
 }
 
 #[test]
+#[ignore = "driver of tools/run-differentials.ps1: needs the generated inputs (RV_*) and python, node and php; run it through that script"]
 fn corpus_b64() {
-    let Some((d, input)) = lines("b64.in") else { return };
+    let (d, input) = lines("b64.in");
     let mut out = String::new();
     for l in &input {
         let raw = unhex(l);
@@ -63,8 +64,9 @@ fn jerr(e: json::JsonError) -> String {
 }
 
 #[test]
+#[ignore = "driver of tools/run-differentials.ps1: needs the generated inputs (RV_*) and python, node and php; run it through that script"]
 fn corpus_json() {
-    let Some((d, input)) = lines("json.in") else { return };
+    let (d, input) = lines("json.in");
     let mut out = String::new();
     for l in &input {
         let raw = unhex(l);
@@ -86,8 +88,9 @@ fn corpus_json() {
 }
 
 #[test]
+#[ignore = "driver of tools/run-differentials.ps1: needs the generated inputs (RV_*) and python, node and php; run it through that script"]
 fn corpus_typed() {
-    let Some((d, input)) = lines("typed.in") else { return };
+    let (d, input) = lines("typed.in");
     let mut out = String::new();
     for l in &input {
         let raw = unhex(l);
@@ -106,8 +109,9 @@ fn corpus_typed() {
 }
 
 #[test]
+#[ignore = "driver of tools/run-differentials.ps1: needs the generated inputs (RV_*) and python, node and php; run it through that script"]
 fn corpus_sas_entry() {
-    let Some((d, input)) = lines("sas.in") else { return };
+    let (d, input) = lines("sas.in");
     let mut out = String::new();
     for l in &input {
         // "<12 expected chars>\t<hex of typed>"
@@ -124,8 +128,9 @@ fn corpus_sas_entry() {
 }
 
 #[test]
+#[ignore = "driver of tools/run-differentials.ps1: needs the generated inputs (RV_*) and python, node and php; run it through that script"]
 fn corpus_ids() {
-    let Some((d, input)) = lines("ids.in") else { return };
+    let (d, input) = lines("ids.in");
     let mut out = String::new();
     for l in &input {
         let (f, h) = l.split_once('\t').unwrap();
@@ -155,8 +160,9 @@ fn corpus_ids() {
 }
 
 #[test]
+#[ignore = "driver of tools/run-differentials.ps1: needs the generated inputs (RV_*) and python, node and php; run it through that script"]
 fn corpus_name() {
-    let Some((d, input)) = lines("name.in") else { return };
+    let (d, input) = lines("name.in");
     let mut out = String::new();
     for l in &input {
         let (max, h) = l.split_once('\t').unwrap();
@@ -171,8 +177,9 @@ fn corpus_name() {
 }
 
 #[test]
+#[ignore = "driver of tools/run-differentials.ps1: needs the generated inputs (RV_*) and python, node and php; run it through that script"]
 fn corpus_url() {
-    let Some((d, input)) = lines("url.in") else { return };
+    let (d, input) = lines("url.in");
     let mut out = String::new();
     for l in &input {
         let raw = unhex(l);

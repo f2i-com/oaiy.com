@@ -2,7 +2,7 @@
 usage: python gen_adm.py <count per case> <seed> <outdir>   writes cases.jsonl and python.jsonl"""
 import copy, json, random, sys, os, pathlib
 
-AOKIE = pathlib.Path(r"E:\repos\oaiy-relay-core\platform\protocol\relay\v1\fixtures\aokie")
+AOKIE = pathlib.Path(__file__).resolve().parents[5] / "platform" / "protocol" / "relay" / "v1" / "fixtures" / "aokie"
 sys.path.insert(0, str(AOKIE))
 import aokie_decoders as D
 

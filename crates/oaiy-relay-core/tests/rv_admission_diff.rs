@@ -1,5 +1,5 @@
 //! Reviewer's differential harness: the crate's admission readers on the damaged copies written by `tests/rv/admission/gen_adm.py` (read from `RV_ADM_IN`, one JSON object a line:
-//! `id`, `kind` (`plugin` or `phone`), the recorded `request` body and the damaged `response` text), one verdict a line to `RV_ADM_OUT`. Skipped unless both variables are set.
+//! `id`, `kind` (`plugin` or `phone`), the recorded `request` body and the damaged `response` text), one verdict a line to `RV_ADM_OUT`. Ignored, and fails loudly unless both variables are set (`tools/run-differentials.ps1` runs it).
 
 use oaiy_relay_core::admission::{MobileAdmission, MobileExpect, PluginAdmission, PluginRequest, Transport};
 use oaiy_relay_core::json::{self, Json};
@@ -24,11 +24,12 @@ fn plugin_request(body: &Json) -> PluginRequest {
 }
 
 #[test]
+#[ignore = "driver of tools/run-differentials.ps1: needs the generated inputs (RV_*) and python, node and php; run it through that script"]
 fn rv_admission_differential() {
-    let (Ok(inp), Ok(outp)) = (std::env::var("RV_ADM_IN"), std::env::var("RV_ADM_OUT")) else {
-        eprintln!("SKIPPED: RV_ADM_IN / RV_ADM_OUT not set");
-        return;
-    };
+    let (inp, outp) = (
+        std::env::var("RV_ADM_IN").expect("RV_ADM_IN is not set: run this through tools/run-differentials.ps1"),
+        std::env::var("RV_ADM_OUT").expect("RV_ADM_OUT is not set: run this through tools/run-differentials.ps1"),
+    );
     let text = std::fs::read_to_string(inp).unwrap();
     let mut out = String::new();
     for line in text.lines() {

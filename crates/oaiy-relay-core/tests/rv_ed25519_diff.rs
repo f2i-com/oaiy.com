@@ -1,6 +1,6 @@
 //! Review test (F1): the crate's Ed25519 verdicts on hand-built edge cases, written to a JSON file so that a script can set them beside libsodium's (PHP), OpenSSL's (Node and
-//! Python `cryptography`). The cases are made by `rv/ed25519/gen_cases.py`; this test only runs them. Set `RV_ED_CASES` (input) and `RV_ED_OUT` (output); without them the
-//! test says so and does nothing.
+//! Python `cryptography`). The cases are made by `rv/ed25519/gen_cases.py`; this test only runs them. Set `RV_ED_CASES` (input) and `RV_ED_OUT` (output), and `RV_ED_SODIUM` (libsodium's verdicts) to turn it into a check; the test is ignored and fails loudly without
+//! the first two (`tools/run-differentials.ps1` runs it with all three).
 
 use oaiy_crypto::ed25519::Signature;
 use oaiy_relay_core::keys::VerifyKey;
@@ -10,11 +10,12 @@ fn unhex(s: &str) -> Vec<u8> {
 }
 
 #[test]
+#[ignore = "driver of tools/run-differentials.ps1: needs the generated inputs (RV_*) and python, node and php; run it through that script"]
 fn the_crates_verdicts_on_the_edge_cases() {
-    let (Ok(input), Ok(output)) = (std::env::var("RV_ED_CASES"), std::env::var("RV_ED_OUT")) else {
-        eprintln!("SKIPPED: RV_ED_CASES and RV_ED_OUT are not set");
-        return;
-    };
+    let (input, output) = (
+        std::env::var("RV_ED_CASES").expect("RV_ED_CASES is not set: run this through tools/run-differentials.ps1"),
+        std::env::var("RV_ED_OUT").expect("RV_ED_OUT is not set: run this through tools/run-differentials.ps1"),
+    );
     let cases: serde_json::Value = serde_json::from_slice(&std::fs::read(input).unwrap()).unwrap();
     let mut out = serde_json::Map::new();
     for c in cases.as_array().unwrap() {

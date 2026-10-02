@@ -1,6 +1,6 @@
 //! Review test (F1): the arithmetic of pairing v3 (`pairing::math`) against an independent recomputation from the README text (`rv/pairing_math/gen_math.py`, Python's
 //! `hashlib` and `hmac` and its own HKDF): the pid and MAC key, the typed code, the SAS with its check character, the two MACs and the approval receipt's text, for 300 random
-//! inputs, the reading of 60 variants of a typed code and the judgement of SAS entries. Set `RV_MATH_IN`; without it the test says so and does nothing.
+//! inputs, the reading of 60 variants of a typed code and the judgement of SAS entries. Set `RV_MATH_IN`; the test is ignored and fails loudly without it (`tools/run-differentials.ps1` runs it).
 
 use oaiy_crypto::kdf::hmac_sha256;
 use oaiy_relay_core::pairing::math::{self, PairingSecret, SasEntry};
@@ -15,11 +15,9 @@ fn hex(b: &[u8]) -> String {
 }
 
 #[test]
+#[ignore = "driver of tools/run-differentials.ps1: needs the generated inputs (RV_*) and python, node and php; run it through that script"]
 fn the_pairing_arithmetic_equals_an_independent_recomputation() {
-    let Ok(input) = std::env::var("RV_MATH_IN") else {
-        eprintln!("SKIPPED: RV_MATH_IN is not set");
-        return;
-    };
+    let input = std::env::var("RV_MATH_IN").expect("RV_MATH_IN is not set: run this through tools/run-differentials.ps1");
     let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(input).unwrap()).unwrap();
     let mut n = 0;
     for c in doc["cases"].as_array().unwrap() {

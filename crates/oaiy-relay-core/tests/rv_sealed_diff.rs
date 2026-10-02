@@ -1,6 +1,6 @@
 //! Review test (F1): `sealed1` against libsodium. `rv/sealed/seal_gen.php` (PHP, libsodium) writes sealed boxes and damaged copies with libsodium's own verdict on each; this test
 //! opens every one with the crate and requires the same verdict and the same plaintext, then seals messages of many sizes with the crate and writes them for
-//! `rv/sealed/seal_check.php` to open with `sodium_crypto_box_seal_open`. Set `RV_SEAL_IN` and `RV_SEAL_OUT`; without them the test says so and does nothing.
+//! `rv/sealed/seal_check.php` to open with `sodium_crypto_box_seal_open`. Set `RV_SEAL_IN` and `RV_SEAL_OUT`; the test is ignored and fails loudly without them (`tools/run-differentials.ps1` runs it).
 
 use oaiy_crypto::zeroize::Secret;
 use oaiy_relay_core::keys::{X25519Public, X25519Secret};
@@ -34,11 +34,12 @@ fn huge_and_degenerate_inputs_are_refused_without_a_panic_and_a_big_box_round_tr
 }
 
 #[test]
+#[ignore = "driver of tools/run-differentials.ps1: needs the generated inputs (RV_*) and python, node and php; run it through that script"]
 fn libsodiums_sealed_boxes_open_here_and_the_crates_open_in_libsodium() {
-    let (Ok(input), Ok(output)) = (std::env::var("RV_SEAL_IN"), std::env::var("RV_SEAL_OUT")) else {
-        eprintln!("SKIPPED: RV_SEAL_IN and RV_SEAL_OUT are not set");
-        return;
-    };
+    let (input, output) = (
+        std::env::var("RV_SEAL_IN").expect("RV_SEAL_IN is not set: run this through tools/run-differentials.ps1"),
+        std::env::var("RV_SEAL_OUT").expect("RV_SEAL_OUT is not set: run this through tools/run-differentials.ps1"),
+    );
     let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(input).unwrap()).unwrap();
     let sk: [u8; 32] = unhex(doc["sk"].as_str().unwrap()).try_into().unwrap();
     let pk: [u8; 32] = unhex(doc["pk"].as_str().unwrap()).try_into().unwrap();

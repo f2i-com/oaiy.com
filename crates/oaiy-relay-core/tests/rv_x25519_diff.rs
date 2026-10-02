@@ -1,5 +1,5 @@
 //! Review test (F1): which X25519 public keys the crate refuses and what its Diffie-Hellman gives, against libsodium (`rv/x25519/x25519_gen.php`: `sodium_crypto_scalarmult` on 3,000 random u-coordinates, the fourteen
-//! low-order encodings and the values at the edge of the field). Set `RV_X_IN`; without it the test says so and does nothing.
+//! low-order encodings and the values at the edge of the field). Set `RV_X_IN` (the test is ignored and fails loudly without it; `tools/run-differentials.ps1` runs it).
 
 use oaiy_crypto::x25519::SecretKey;
 use oaiy_relay_core::keys::X25519Public;
@@ -10,11 +10,9 @@ fn unhex<const N: usize>(s: &str) -> [u8; N] {
 }
 
 #[test]
+#[ignore = "driver of tools/run-differentials.ps1: needs the generated inputs (RV_*) and python, node and php; run it through that script"]
 fn the_crate_refuses_what_libsodium_refuses_and_agrees_on_the_rest() {
-    let Ok(input) = std::env::var("RV_X_IN") else {
-        eprintln!("SKIPPED: RV_X_IN is not set");
-        return;
-    };
+    let input = std::env::var("RV_X_IN").expect("RV_X_IN is not set: run this through tools/run-differentials.ps1");
     let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(input).unwrap()).unwrap();
     let sk = SecretKey::from_bytes(unhex(doc["sk"].as_str().unwrap()));
     let (mut refused, mut accepted) = (0, 0);
