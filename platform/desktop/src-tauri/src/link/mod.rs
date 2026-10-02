@@ -2386,6 +2386,11 @@ mod tests {
         // Anything else in the query is refused rather than read as a plain forget.
         assert_eq!(delete("?copiesOnly=maybe").await.0.as_u16(), 400);
         assert_eq!(delete("?everything=true").await.0.as_u16(), 400);
+        // The value is `true` or `false` and nothing else, and a name is not repeated: what is not one of those is refused and
+        // is never a plain forget by another name.
+        for refused in ["?copiesOnly=TRUE", "?copiesOnly=1", "?copiesOnly=yes", "?copiesOnly=", "?copiesOnly", "?copiesonly=true", "?copies_only=true", "?copiesOnly=true&copiesOnly=false", "?copiesOnly=true&x=1"] {
+            assert_eq!(delete(refused).await.0.as_u16(), 400, "{refused}");
+        }
         assert!(store.status().linked, "refused requests forgot nothing");
 
         // Without it the link is forgotten, with a copy held it says so, and the retry that takes the copies answers.
