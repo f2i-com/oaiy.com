@@ -28,15 +28,57 @@ const EXPECTED = {
 const ZERO = { n429: 0, nFail: 0, nRefused: 0, n400: 0 };
 
 const isInt = (x) => typeof x === 'number' && Number.isInteger(x);
+
+// A number of a poll answer whose spelling is not an integer literal (`1.0`, `1e2`, `-0`): a number to JSON and not an integer to a poll answer
+// (README P2: an integer is digits only, with no fraction, no exponent and no `-0`). JSON.parse reads all of them as numbers that are integers
+// (`1.0` is 1, `-0` is -0), which is the mistake this is here to show a client how not to make: the reviver sees the source text (Node 21 and later).
+class Spelled {
+  constructor(value, source) {
+    this.value = value;
+    this.source = source;
+  }
+}
+const INT_LITERAL = /^(0|-?[1-9][0-9]*)$/; // the grammar of JSON for an integer, without a fraction or exponent, and not -0
+function unspell(x) {
+  if (x instanceof Spelled) return x.value;
+  if (Array.isArray(x)) return x.map(unspell);
+  if (x !== null && typeof x === 'object') return Object.fromEntries(Object.entries(x).map(([k, v]) => [k, unspell(v)]));
+  return x;
+}
+// The table, with the spelling of every number in a response body kept (a body is the text a client receives); the numbers elsewhere are numbers.
+function loadTable(text) {
+  const doc = JSON.parse(text, (key, value, context) => (typeof value === 'number' && !INT_LITERAL.test(context.source) ? new Spelled(value, context.source) : value));
+  const out = {};
+  for (const [k, v] of Object.entries(doc)) if (k !== 'cases') out[k] = unspell(v);
+  out.cases = (doc.cases || []).map((c) => {
+    const kept = {};
+    for (const [k, v] of Object.entries(c)) {
+      if (k === 'response' && v !== null && typeof v === 'object') {
+        kept[k] = {};
+        for (const [rk, rv] of Object.entries(v)) kept[k][rk] = rk === 'body' ? rv : unspell(rv);
+      } else kept[k] = unspell(v);
+    }
+    return kept;
+  });
+  return out;
+}
 const EPOCH = /^[A-Za-z0-9_-]{11}$/; // 8 bytes, base64url (common.schema.json)
 const MAX_SAFE = 2 ** 53 - 1; // the largest cursor and seq (uint53)
-const isObj = (x) => x !== null && typeof x === 'object' && !Array.isArray(x);
+const isObj = (x) => x !== null && typeof x === 'object' && !Array.isArray(x) && !(x instanceof Spelled);
 const trim = (s) => s.replace(/^[ \t]+|[ \t]+$/g, '');
 
+// README P6: the IMF-fixdate of RFC 9110, and a real date and time: day within the month, hour 00 to 23, minute 00 to 59, second 00 to 60, year 0001 to 9999
+// (anything else is no header). The name of the day is not checked.
 function httpDate(text) {
   const m = IMF.exec(trim(text));
   if (!m) return null;
-  return Date.UTC(+m[3], MONTHS[m[2]], +m[1], +m[4], +m[5], +m[6]) / 1000;
+  const [day, mon, year, hh, mm, ss] = [+m[1], MONTHS[m[2]], +m[3], +m[4], +m[5], +m[6]];
+  if (!(year >= 1 && year <= 9999 && hh <= 23 && mm <= 59 && ss <= 60)) return null;
+  const when = new Date(0); // (Date.UTC would read the years 0 to 99 as 1900 to 1999)
+  when.setUTCFullYear(year, mon, day);
+  if (when.getUTCFullYear() !== year || when.getUTCMonth() !== mon || when.getUTCDate() !== day) return null;
+  when.setUTCHours(hh, mm, ss, 0);
+  return when.getTime() / 1000;
 }
 
 // README P2: a 200 is valid when its body is an object whose items is an array, whose epoch is 11 base64url characters and whose cursor is an integer from 0 to 2^53 - 1.
@@ -185,7 +227,7 @@ function make(K) {
 
 const argv = process.argv.slice(2);
 const path = argv.includes('--file') ? argv[argv.indexOf('--file') + 1] : join(HERE, 'poll-client.json');
-const doc = JSON.parse(readFileSync(path, 'utf8'));
+const doc = loadTable(readFileSync(path, 'utf8'));
 let checks = 0;
 const bad = [];
 const check = (id, what, ok, detail = '') => {

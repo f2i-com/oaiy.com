@@ -1805,8 +1805,8 @@ pc_doc = json.loads((PC / "poll-client.json").read_text(encoding="utf-8"))
 # What the table holds, pinned here as the vectors' values are (DESIGN_PINS): a case that goes missing from the table, or one that is added,
 # changes these, and whoever does it changes them here on purpose. The readers check the table against its own caseCount and idsSha256, which
 # a table edited to agree with itself would satisfy; these are what that edit cannot satisfy.
-POLL_CLIENT_PINS = {"cases": 135, "idsSha256": "9c82ed60bdf576fd414ef432e3f9df7f4e617cc563a0cf10e74e4de572f20479",
-                    "layoutSha256": "6558668de8734e3cb5add52fb88bd96e0225ca22ebfc7e5f4c9c15ebdaf4853b"}
+POLL_CLIENT_PINS = {"cases": 162, "idsSha256": "cac9204ceb2127c9a1bb4d0edfa844e3dc7588ca86a518a9a923e6e5bb825f57",
+                    "layoutSha256": "f36166842f0fadd043987b836c0e7e6c82501882ee53704e0b361616052c3ee9"}
 ok("README has the section and states each of the rules P1 to P9 by its number",
    "### 5.1.1 The poll loop of a native client (DK-03 and MOB-21a)" in pc_readme and all(f"**P{i}. " in pc_readme for i in range(1, 10)))
 pc_ids = [x["id"] for x in pc_doc["cases"]]
@@ -1883,7 +1883,10 @@ ok("README settles what the clean-room readings of 5.1.1 disagreed on: what a va
                                 "The rows are tried in the order of the table and the first that fits is the answer", "a refused hold, or a superseded answer, that carries an accepted item is progress",
                                 "and the answer is a **failure** for the pause", "a valid `200` whose accepted items (or whose reset) could not be written to the client's store (see to persist, below)", "it reports `storage_failure`, and never `unreachable`", "never carries `unreachable`: the first `400`",
                                 "(the action `cancel_own_polls`, on every `429` that says `in_flight`)", "`cancel_own_polls` (P4)", "the failure count is cleared (it proves the relay answered, as P7 says of a success), while the 429 count, the count of refused holds and the 400 count stay as they were",
-                                "Polls that arrive in the same instant can be refused beyond the surplus", "a burst of four refusing two and a burst of five refusing four")))
+                                "Polls that arrive in the same instant can be refused beyond the surplus", "a burst of four refusing two and a burst of five refusing four",
+                                "**An integer** in a poll answer (`cursor`, `seq`, `retryAfter` and `hold.retryAfter`) is an integer literal: digits only, with an optional minus sign, with no fraction, no exponent and no `-0`",
+                                "a date that does not exist such as hour 25, day 32 or year 0000", "the name of the day is not checked",
+                                "except for the first `400` and for a failed write (P2), which are paced by the backoff alone")))
 # Every epoch the table gives is what the schema says an epoch is (8 bytes: 11 characters), except where a case is a bad epoch on purpose and expects a failure.
 pc_epoch = re.compile(r"[A-Za-z0-9_-]{11}")
 pc_bad_epochs = [x["id"] for x in pc_doc["cases"] if isinstance(x.get("response", {}).get("body"), dict) and isinstance(x["response"]["body"].get("epoch"), str)
@@ -1974,6 +1977,21 @@ pc_damaged = [
     ("a verified proof that clears the 429 count", pc_damage("p9-proof-verified", ("expect", "state", "n429"), 0)),
     ("a proof that gets no answer and keeps the 429 count", pc_damage("p9-proof-no-answer", ("expect", "state", "n429"), 2)),
     ("a proof that does not verify and clears the failure count", pc_damage("p9-proof-wrong-key", ("expect", "state", "nFail"), 0)),
+    ("a cursor written -0 that is adopted", pc_damage("p2-reset-cursor-spelled-minus-0", ("expect", "outcome"), "progress")),
+    ("a cursor written 1.0 that is adopted", pc_damage("p2-reset-cursor-spelled-1-point-0", ("expect", "outcome"), "progress")),
+    ("a cursor written 1e2 that is adopted", pc_damage("p2-reset-cursor-spelled-1e2", ("expect", "outcome"), "progress")),
+    ("a seq written 1.0 that is accepted", pc_damage("p2-item-seq-spelled-1-point-0", ("expect", "outcome"), "progress")),
+    ("a seq above 2^53 - 1 that is accepted", pc_damage("p2-item-seq-above-uint53", ("expect", "outcome"), "progress")),
+    ("a seq of 2^53 - 1 that is dropped", pc_damage("p2-item-seq-uint53-max", ("expect", "outcome"), "idle")),
+    ("an error.retryAfter written 4.0 that is read", pc_damage("p6-body-retryafter-spelled-float", ("expect", "baseS"), 4)),
+    ("a hold.retryAfter written 5.0 that is read", pc_damage("p3-refused-spelled-retryafter", ("expect", "baseS"), 5)),
+    ("an HTTP-date with hour 25 that is read", pc_damage("p6-http-date-invalid-hour-25", ("expect", "baseS"), 120)),
+    ("an HTTP-date with day 32 that is read", pc_damage("p6-http-date-invalid-day-32", ("expect", "baseS"), 120)),
+    ("an HTTP-date of 30 February that is read", pc_damage("p6-http-date-invalid-february-30", ("expect", "baseS"), 120)),
+    ("an HTTP-date of year 0000 that is read", pc_damage("p6-http-date-invalid-year-0000", ("expect", "baseS"), 120)),
+    ("a leap second that is not read", pc_damage("p6-http-date-leap-second", ("expect", "baseS"), 4)),
+    ("a first 400 that honours Retry-After", pc_damage("p5-400-first-ignores-retry-after", ("expect", "baseS"), 30)),
+    ("a failed write that honours Retry-After", pc_damage("p5-storage-failure-ignores-retry-after", ("expect", "baseS"), 30)),
 ]
 # A table that was edited to agree with itself (a case removed, its count and digest recomputed) is accepted by the readers, which is why the
 # pins above exist: it does not agree with them.
