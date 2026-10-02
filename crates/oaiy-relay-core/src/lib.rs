@@ -22,6 +22,7 @@
 
 pub mod admission;
 pub mod b64;
+pub mod client;
 pub mod enrol;
 pub mod error;
 pub mod ids;
@@ -34,6 +35,8 @@ pub mod ring;
 pub mod roster;
 pub mod rotation;
 pub mod sealed;
+#[cfg(feature = "testing")]
+pub mod testing;
 pub mod ticket;
 pub mod url;
 

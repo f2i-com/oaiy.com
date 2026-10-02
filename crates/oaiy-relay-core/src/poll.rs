@@ -446,14 +446,19 @@ fn decision(outcome: Outcome, base_s: f64, u: f64, counters: Counters, since: u6
 }
 
 /// P9: what the answer to the identity proof leads to. A proof that verifies sets the time of the proof and clears the failure count (the relay answered), and leaves the
-/// other counts: a proof is not an answer to a poll. No answer is a failure like any other. An answer that does not verify is a stop, `report_relay_changed`.
-pub fn decide_proof(counters: Counters, result: ProofResult, u: f64, since: u64) -> Decision {
+/// other counts: a proof is not an answer to a poll. No answer is a failure like any other (and when the relay did answer, with a status that is not a proof, and asked for a wait,
+/// `asked` is that wait as P6 reads it: the pause is the larger of it and the backoff, as P5 says of any failure). An answer that does not verify is a stop,
+/// `report_relay_changed`.
+pub fn decide_proof(counters: Counters, result: ProofResult, u: f64, since: u64, asked: Option<u64>) -> Decision {
     match result {
         ProofResult::Verified => decision(Outcome::Proved, 0.0, u, Counters { n_fail: 0, ..counters }, since),
         ProofResult::NoAnswer => {
             let n = counters.n_fail + 1;
-            let mut d =
-                decision(Outcome::Failure, doubling(n, BACKOFF_FAILURE_CAP_S) as f64, u, Counters { n_fail: n, ..Counters::default() }, since);
+            let mut base = doubling(n, BACKOFF_FAILURE_CAP_S);
+            if let Some(a) = asked {
+                base = base.max(clamp_pause(i128::from(a)));
+            }
+            let mut d = decision(Outcome::Failure, base as f64, u, Counters { n_fail: n, ..Counters::default() }, since);
             if n >= UNREACHABLE_AFTER {
                 d.reports.push(Report::Unreachable);
             }

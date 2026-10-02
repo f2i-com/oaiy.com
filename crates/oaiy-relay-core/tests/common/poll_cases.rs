@@ -69,7 +69,7 @@ pub fn run_poll_cases(doc: &Json) -> usize {
                 "invalid" => ProofResult::Invalid,
                 other => panic!("{id}: {other}"),
             };
-            check_decision(c, &poll::decide_proof(state, result, u, since));
+            check_decision(c, &poll::decide_proof(state, result, u, since, None));
             checked += 1;
             continue;
         }

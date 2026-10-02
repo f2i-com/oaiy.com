@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use oaiy_relay_core::json::{self, Json};
 
+pub mod env;
 pub mod poll_cases;
 #[allow(unused_imports)]
 pub use poll_cases::{counters, float, run_poll_cases};
