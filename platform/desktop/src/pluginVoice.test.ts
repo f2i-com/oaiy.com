@@ -1,16 +1,18 @@
 import {afterEach,beforeEach,describe,expect,it,vi} from 'vitest';
-import {PluginVoiceSession,type PluginVoiceEvent,type VoiceView} from './pluginVoice';
+import {PluginVoiceSession,type PluginVoiceEvent,type VoiceView,type VoiceAvailability} from './pluginVoice';
 import {voiceWav,type VoiceMedia} from './pluginVoiceMedia';
 
 const sessions:PluginVoiceSession[]=[];
-const ready={sttReady:true,ttsReady:true,reason:null};
+const ready:VoiceAvailability={sttReady:true,ttsReady:true,reason:null};
+const isStatus=(url:string)=>new URL(url).pathname.endsWith('/status');
+const metadata=(url:string,value=ready,live=true)=>({...value,...(new URL(url).searchParams.has('sessionId')?{sessionLeaseValid:live}:{})});
 const flush=async()=>{await vi.advanceTimersByTimeAsync(0);};
 let fetcher:ReturnType<typeof vi.fn>;
 beforeEach(()=>{
   vi.useFakeTimers();
   fetcher=vi.fn().mockImplementation((url:string,options?:RequestInit)=>{
     const data=options?.body?JSON.parse(String(options.body)):{};
-    if(url.endsWith('/status'))return Promise.resolve(new Response(JSON.stringify(ready)));
+    if(isStatus(url))return Promise.resolve(new Response(JSON.stringify(metadata(url))));
     if(url.endsWith('/speak'))return Promise.resolve(new Response(new Uint8Array([0,0,1,0]),{headers:{'Content-Type':'audio/pcm','X-Sample-Rate':'24000'}}));
     return Promise.resolve(new Response(JSON.stringify(url.endsWith('/transcribe')?{sessionId:data.sessionId,requestId:data.requestId,text:'Synthetic source-grounded question'}:data)));
   });vi.stubGlobal('fetch',fetcher);
@@ -87,25 +89,55 @@ describe('trusted-parent scoped voice sessions',()=>{
   });
   it('native permission revocation closes active parent capture',async()=>{
     const f=await fixture();await f.session.enable();f.session.record(f.request());await f.session.start();
-    fetcher.mockImplementation((url:string)=>Promise.resolve(new Response(JSON.stringify(url.endsWith('/status')?{error:{code:'capability_unavailable',message:'Permission revoked.'}}:{}),{status:url.endsWith('/status')?403:200})));
+    fetcher.mockImplementation((url:string)=>Promise.resolve(new Response(JSON.stringify(isStatus(url)?{error:{code:'capability_unavailable',message:'Permission revoked.'}}:{}),{status:isStatus(url)?403:200})));
     await vi.advanceTimersByTimeAsync(2000);expect(f.recording.cancel).toHaveBeenCalled();expect(f.media.dispose).toHaveBeenCalled();expect(f.view()).toBeNull();
   });
   it('loaded lane loss stops capture before sending audio',async()=>{
     const f=await fixture();await f.session.enable();f.session.record(f.request());await f.session.start();
-    fetcher.mockResolvedValue(new Response(JSON.stringify({sttReady:false,ttsReady:false,reason:'Local lane unavailable.'})));
+    fetcher.mockImplementation((url:string)=>Promise.resolve(new Response(JSON.stringify(metadata(url,{sttReady:false,ttsReady:false,reason:'Local lane unavailable.'})))));
     await vi.advanceTimersByTimeAsync(2000);expect(f.recording.cancel).toHaveBeenCalledOnce();expect(f.emit).toHaveBeenCalledWith(expect.objectContaining({type:'failed',code:'voice_unavailable'}));expect(fetcher.mock.calls.some(([url])=>url.endsWith('/transcribe'))).toBe(false);
   });
   it.each(['transcribing','speaking'])('busy health during our own %s does not cancel an admitted request',async(lane)=>{
     const f=await fixture();await f.session.enable();let finish!:(r:Response)=>void;let signal!:AbortSignal;
     fetcher.mockImplementation((url:string,options:RequestInit)=>{
       if(url.endsWith(lane==='transcribing'?'/transcribe':'/speak')){signal=options.signal!;return new Promise(r=>{finish=r;});}
-      return Promise.resolve(new Response(JSON.stringify({sttReady:false,ttsReady:false,reason:'Local lane busy.'})));
+      return Promise.resolve(new Response(JSON.stringify(metadata(url,{sttReady:false,ttsReady:false,reason:'Local lane busy.'}))));
     });
     let stopping:Promise<void>|undefined;
     if(lane==='transcribing'){f.session.record(f.request());await f.session.start();stopping=f.session.stop();}else f.session.speak({...f.request(),text:'Grounded narration'});
     await flush();await vi.advanceTimersByTimeAsync(2000);expect(signal.aborted).toBe(false);expect(f.emit.mock.calls.some(([e])=>e.type==='failed')).toBe(false);
     finish(lane==='transcribing'?new Response(JSON.stringify({...f.request(),text:'Fresh transcript'})):new Response(new Uint8Array([0,0]),{headers:{'Content-Type':'audio/pcm','X-Sample-Rate':'24000'}}));await stopping;await flush();
     expect(f.emit.mock.calls.some(([e])=>e.type===(lane==='transcribing'?'transcript':'finished'))).toBe(true);
+  });
+  it.each(['phone-busy','service-gone','service-replaced'])('%s during buffered playback stops parent audio and suppresses a late finished callback',async(reason)=>{
+    const f=await fixture();await f.session.enable();let finish!:()=>void;let signal!:AbortSignal;
+    vi.mocked(f.media.play).mockImplementation((_audio,s)=>{signal=s;return new Promise(r=>{finish=r;});});
+    f.session.speak({...f.request(),text:'Grounded narration'});await flush();
+    expect(f.media.play).toHaveBeenCalledOnce();
+    fetcher.mockImplementation((url:string)=>Promise.resolve(new Response(JSON.stringify(isStatus(url)?metadata(url,{sttReady:false,ttsReady:false,reason},false):{}))));
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(signal.aborted).toBe(true);expect(f.media.dispose).toHaveBeenCalledOnce();expect(f.view()).toBeNull();
+    expect(fetcher.mock.calls.some(([url])=>new URL(url).searchParams.get('sessionId')===f.opened.sessionId)).toBe(true);
+    expect(f.emit).toHaveBeenCalledWith({sessionId:f.opened.sessionId,type:'closed'});
+    const count=f.emit.mock.calls.length;finish();await flush();
+    expect(f.emit).toHaveBeenCalledTimes(count);expect(f.emit.mock.calls.some(([event])=>event.type==='finished')).toBe(false);
+  });
+  it('busy lane health with a valid original lease does not stop buffered playback or leak internal lease fields',async()=>{
+    const f=await fixture();await f.session.enable();let finish!:()=>void;let signal!:AbortSignal;
+    vi.mocked(f.media.play).mockImplementation((_audio,s)=>{signal=s;return new Promise(r=>{finish=r;});});
+    f.session.speak({...f.request(),text:'Grounded narration'});await flush();
+    const busy={sttReady:false,ttsReady:false,reason:'Local lane busy.'};
+    fetcher.mockImplementation((url:string)=>Promise.resolve(new Response(JSON.stringify(metadata(url,busy)))));
+    await vi.advanceTimersByTimeAsync(2000);expect(signal.aborted).toBe(false);expect(f.media.dispose).not.toHaveBeenCalled();
+    expect(await f.session.status()).toEqual(busy);expect(f.view()).not.toHaveProperty('sessionLeaseValid');
+    finish();await flush();expect(f.emit).toHaveBeenCalledWith({...f.request(),type:'finished'});
+  });
+  it('missing internal session-lease metadata fails closed during buffered playback',async()=>{
+    const f=await fixture();await f.session.enable();let signal!:AbortSignal;
+    vi.mocked(f.media.play).mockImplementation((_audio,s)=>{signal=s;return new Promise(()=>{});});
+    f.session.speak({...f.request(),text:'Grounded narration'});await flush();
+    fetcher.mockImplementation(()=>Promise.resolve(new Response(JSON.stringify(ready))));
+    await vi.advanceTimersByTimeAsync(2000);expect(signal.aborted).toBe(true);expect(f.media.dispose).toHaveBeenCalledOnce();
   });
   it('two global active requests and one per mounted screen are enforced',async()=>{
     const a=await fixture('a'),b=await fixture('b'),c=await fixture('c');for(const f of [a,b,c])await f.session.enable();

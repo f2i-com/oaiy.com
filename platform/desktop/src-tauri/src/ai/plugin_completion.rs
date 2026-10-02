@@ -1051,6 +1051,7 @@ mod tests {
             ("starting", "", false, "loading"),
             ("failed", "", false, "failed to start"),
             ("stopped", "selected", true, "paused for media"),
+            ("ready", "selected", true, "paused for media"),
             ("ready", "other", false, "different local model"),
         ] {
             *llm.lock().unwrap() = json!({"state":state,"resident":resident,"paused_for_media":paused});

@@ -4,7 +4,7 @@
 use crate::{plugins::PluginHost, services::registry::RegistryHandle};
 use axum::{
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -98,6 +98,7 @@ impl Services for RegisteredServices {
 }
 struct Session {
     valid: Valid,
+    service: Option<Service>,
     at: Instant,
 }
 #[derive(Default)]
@@ -160,6 +161,11 @@ struct SessionInput {
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StatusInput {
+    session_id: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RequestInput {
     session_id: String,
     request_id: String,
@@ -179,11 +185,55 @@ struct SpeakInput {
     text: String,
 }
 
-async fn status(State(st): State<Voice>, Path(plugin): Path<String>) -> Response {
+// Retain the original process/service lease beyond native download, so trusted
+// parent playback cannot follow a stopped or replaced service into a new lease.
+fn session_service(st: &Voice, plugin: &str, id: &str) -> Option<Service> {
+    if super::live_call_count() > 0 {
+        return None;
+    }
+    let (valid, service) = st.memory.lock().ok().and_then(|memory| {
+        memory
+            .sessions
+            .get(&(plugin.to_string(), id.to_string()))
+            .filter(|session| session.at.elapsed() < Duration::from_secs(900))
+            .map(|session| (session.valid.clone(), session.service.clone()))
+    })?;
+    service.filter(|service| valid() && (service.valid)())
+}
+async fn status(
+    State(st): State<Voice>,
+    Path(plugin): Path<String>,
+    query: Result<Query<StatusInput>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let Query(input) = match query {
+        Ok(input) => input,
+        Err(_) => return error(invalid()),
+    };
+    if input.session_id.as_ref().is_some_and(|id| !session_id(id)) {
+        return error(invalid());
+    }
     let valid = match initiation(&st, &plugin) {
         Ok(v) => v,
         Err(e) => return error(e),
     };
+    if let Some(id) = input.session_id {
+        let result = if let Some(service) = session_service(&st, &plugin, &id) {
+            tokio::time::timeout(Duration::from_secs(4), ready_service(service, true))
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .map(|(_, metadata, _)| metadata)
+        } else {
+            None
+        };
+        let live = valid() && session_service(&st, &plugin, &id).is_some();
+        let mut metadata = result
+            .filter(|_| live)
+            .unwrap_or_else(|| json!({"sttReady":false,"ttsReady":false,"reason":UNAVAILABLE}));
+        // Internal parent-only projection; never included in PluginHost.voice.
+        metadata["sessionLeaseValid"] = json!(live);
+        return Json(metadata).into_response();
+    }
     let result = tokio::time::timeout(Duration::from_secs(4), ready(&st, true)).await;
     if !valid() {
         return error((
@@ -213,6 +263,7 @@ async fn open(
         Ok(v) => v,
         Err(e) => return error(e),
     };
+    let service = st.services.current();
     let mut memory = st.memory.lock().unwrap_or_else(|e| e.into_inner());
     memory.prune();
     if memory.sessions.len() >= 32
@@ -234,6 +285,7 @@ async fn open(
         (plugin, input.session_id.clone()),
         Session {
             valid,
+            service,
             at: Instant::now(),
         },
     );
@@ -244,6 +296,7 @@ struct Claim {
     key: Key,
     rx: watch::Receiver<bool>,
     valid: Valid,
+    service: Service,
     service_valid: Arc<Mutex<Option<Valid>>>,
 }
 impl Claim {
@@ -275,15 +328,24 @@ fn claim(st: &Voice, plugin: String, session: String, request: String) -> Result
     let _ = initiation(st, &plugin)?;
     let mut m = st.memory.lock().unwrap_or_else(|e| e.into_inner());
     m.prune();
-    let valid = m
+    let saved = m
         .sessions
         .get(&(plugin.clone(), session.clone()))
-        .map(|s| s.valid.clone())
-        .filter(|valid| valid())
+        .filter(|session| (session.valid)())
         .ok_or((
             StatusCode::FORBIDDEN,
             "voice_session_unavailable",
             "Enable a current voice session before recording or speaking.",
+        ))?;
+    let valid = saved.valid.clone();
+    let service = saved
+        .service
+        .clone()
+        .filter(|service| (service.valid)())
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "voice_unavailable",
+            UNAVAILABLE,
         ))?;
     let key = (plugin, session, request);
     if m.recent.contains_key(&key) {
@@ -308,7 +370,8 @@ fn claim(st: &Voice, plugin: String, session: String, request: String) -> Result
         key,
         rx,
         valid,
-        service_valid: Default::default(),
+        service_valid: Arc::new(Mutex::new(Some(service.valid.clone()))),
+        service,
     })
 }
 fn client() -> Result<reqwest::Client, Failure> {
@@ -369,6 +432,19 @@ async fn ready(st: &Voice, need_voice: bool) -> Result<(Service, Value, Option<S
         "voice_unavailable",
         UNAVAILABLE,
     ))?;
+    ready_service(service, need_voice).await
+}
+async fn ready_service(
+    service: Service,
+    need_voice: bool,
+) -> Result<(Service, Value, Option<String>), Failure> {
+    if super::live_call_count() > 0 {
+        return Err((
+            StatusCode::CONFLICT,
+            "voice_busy",
+            "OAIY is handling a phone call. Wait for it to finish before using plugin voice.",
+        ));
+    }
     if !(service.valid)() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -501,17 +577,20 @@ async fn transcribe(
     let allowed = owned.valid.clone();
     let session = owned.key.1.clone();
     let service_valid = owned.service_valid.clone();
+    let original_service = owned.service.clone();
     let future = async {
-        let (service, metadata, _) =
-            tokio::time::timeout(Duration::from_secs(4), ready(&st, false))
-                .await
-                .map_err(|_| {
-                    (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "voice_unavailable",
-                        UNAVAILABLE,
-                    )
-                })??;
+        let (service, metadata, _) = tokio::time::timeout(
+            Duration::from_secs(4),
+            ready_service(original_service, false),
+        )
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "voice_unavailable",
+                UNAVAILABLE,
+            )
+        })??;
         if metadata["sttReady"] != true || !allowed() || super::live_call_count() > 0 {
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -584,17 +663,20 @@ async fn speak(
     let allowed = owned.valid.clone();
     let started = Instant::now();
     let service_valid = owned.service_valid.clone();
+    let original_service = owned.service.clone();
     let future = async {
-        let (service, metadata, voice) =
-            tokio::time::timeout(Duration::from_secs(4), ready(&st, true))
-                .await
-                .map_err(|_| {
-                    (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "voice_unavailable",
-                        UNAVAILABLE,
-                    )
-                })??;
+        let (service, metadata, voice) = tokio::time::timeout(
+            Duration::from_secs(4),
+            ready_service(original_service, true),
+        )
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "voice_unavailable",
+                UNAVAILABLE,
+            )
+        })??;
         if metadata["ttsReady"] != true || !allowed() || super::live_call_count() > 0 {
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -892,12 +974,15 @@ mod tests {
         let valid = Arc::new(AtomicBool::new(true));
         let probes = Arc::new(AtomicUsize::new(0));
         let current = valid.clone();
+        let running = available.clone();
         let state = Voice {
             gate: Arc::new(TestGate(gate.clone())),
             services: Arc::new(TestServices {
                 service: Service {
                     base,
-                    valid: Arc::new(move || current.load(Ordering::SeqCst)),
+                    valid: Arc::new(move || {
+                        current.load(Ordering::SeqCst) && running.load(Ordering::SeqCst)
+                    }),
                 },
                 available: available.clone(),
                 probes: probes.clone(),
@@ -1001,6 +1086,104 @@ mod tests {
             json!({"input":"Synthetic grounded text.","voice":"Synthetic","response_format":"pcm"})
         );
         assert!(f.state.memory.lock().unwrap().pending.is_empty());
+    }
+    #[tokio::test]
+    async fn scoped_status_retains_original_lease_after_download_and_never_adopts_replacement() {
+        let f = fixture().await;
+        opened(&f).await;
+        assert_eq!(
+            request(f.app.clone(), "POST", "speak", speech("downloaded"))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert!(f.state.memory.lock().unwrap().pending.is_empty());
+        let action = format!("status?sessionId={SESSION}");
+        assert_eq!(
+            ask(f.app.clone(), "GET", &action, Value::Null).await.1["sessionLeaseValid"],
+            true
+        );
+        f.valid.store(false, Ordering::SeqCst);
+        let mut replacement = f.state.clone();
+        let mut service = replacement.services.current().unwrap();
+        service.valid = Arc::new(|| true);
+        let new_probes = Arc::new(AtomicUsize::new(0));
+        replacement.services = Arc::new(TestServices {
+            service,
+            available: Arc::new(AtomicBool::new(true)),
+            probes: new_probes.clone(),
+        });
+        let app = routes(replacement);
+        assert_eq!(
+            ask(app.clone(), "GET", "status", Value::Null).await.1["ttsReady"],
+            true
+        );
+        assert_eq!(new_probes.load(Ordering::SeqCst), 1);
+        let (_, metadata) = ask(app.clone(), "GET", &action, Value::Null).await;
+        assert_eq!(metadata["sessionLeaseValid"], false);
+        assert_eq!(metadata["ttsReady"], false);
+        assert_eq!(
+            new_probes.load(Ordering::SeqCst),
+            1,
+            "scoped status must not probe a replacement service"
+        );
+        assert_eq!(
+            request(app, "POST", "speak", speech("replacement"))
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            f.posted.lock().unwrap().len(),
+            1,
+            "no second inference on a replacement lease"
+        );
+    }
+    #[tokio::test]
+    async fn scoped_status_distinguishes_own_busy_health_from_lost_or_closed_session() {
+        let f = fixture().await;
+        opened(&f).await;
+        *f.health.lock().unwrap() = json!({"status":"ok","stt":true,"tts":true,"lanes":{"stt":{"loadState":"busy"},"tts":{"loadState":"busy"}}});
+        let action = format!("status?sessionId={SESSION}");
+        let (_, metadata) = ask(f.app.clone(), "GET", &action, Value::Null).await;
+        assert_eq!(metadata["sttReady"], false);
+        assert_eq!(metadata["ttsReady"], false);
+        assert_eq!(
+            metadata["sessionLeaseValid"], true,
+            "own engine busy is not lease revocation"
+        );
+        assert_eq!(
+            ask(f.app.clone(), "GET", "status", Value::Null)
+                .await
+                .1
+                .as_object()
+                .unwrap()
+                .len(),
+            3
+        );
+        ask(f.app.clone(), "POST", "close", json!({"sessionId":SESSION})).await;
+        assert_eq!(
+            ask(f.app.clone(), "GET", &action, Value::Null).await.1["sessionLeaseValid"],
+            false
+        );
+        assert_eq!(
+            ask(
+                f.app.clone(),
+                "GET",
+                "status?sessionId=not-a-uuid",
+                Value::Null
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            ask(f.app.clone(), "GET", "status?extra=1", Value::Null)
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(f.posted.lock().unwrap().is_empty());
     }
     #[tokio::test]
     async fn stopped_unloaded_busy_fallback_and_missing_voice_never_post() {

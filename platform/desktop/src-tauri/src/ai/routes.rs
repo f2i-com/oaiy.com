@@ -145,12 +145,13 @@ fn plugin_engine_source_snapshot(discovery: &Value, state: &Value) -> Result<Plu
         None => legacy_ready,
         _ => false,
     };
-    let completion_available = files_available && engine_model_resident(&state, &model);
+    let paused = state.pointer("/llm/paused_for_media").and_then(Value::as_bool) == Some(true);
+    let completion_available = files_available && !paused && engine_model_resident(&state, &model);
     let unavailable_reason = if completion_available {
         None
     } else if files_present.is_some() && files_present != Some(&Value::Bool(true)) {
         Some("The selected local model's files are missing. Check its files in OAIY Engines before starting it.")
-    } else if state.pointer("/llm/paused_for_media").and_then(Value::as_bool) == Some(true) {
+    } else if paused {
         Some("The local language model is paused for media work. Wait for that work to finish, then read host models again.")
     } else if files_present.is_none() && !legacy_ready {
         Some("The legacy engine catalogue did not confirm that the selected model is loaded and unpaused. Check OAIY Engines before trying again.")
@@ -991,11 +992,17 @@ mod tests {
     }
 
     #[test]
-    fn plugin_engine_catalogue_preserves_modern_true_residency_checks() {
+    fn plugin_engine_catalogue_modern_true_requires_residency_and_refuses_explicit_pause() {
         let (mut discovery, mut state) = legacy_catalogue();
         discovery["models"]["llm"][0]["files_present"] = json!(true);
         discovery["models"]["llm"][0].as_object_mut().unwrap().remove("loaded");
         state["llm"].as_object_mut().unwrap().remove("paused_for_media");
+        assert!(plugin_engine_source_snapshot(&discovery, &state).unwrap().completion_available);
+        state["llm"]["paused_for_media"] = json!(true);
+        let paused = plugin_engine_source_snapshot(&discovery, &state).unwrap();
+        assert!(!paused.completion_available);
+        assert!(paused.unavailable_reason.unwrap().contains("paused for media"));
+        state["llm"]["paused_for_media"] = json!(false);
         assert!(plugin_engine_source_snapshot(&discovery, &state).unwrap().completion_available);
         state["llm"]["resident"] = json!("other");
         assert!(!plugin_engine_source_snapshot(&discovery, &state).unwrap().completion_available);

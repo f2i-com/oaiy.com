@@ -12,6 +12,7 @@ vi.mock('./Toasts', () => ({ useToast: () => toast }));
 vi.mock('./useModules', () => ({ useModules: () => null, moduleOn: () => false }));
 
 import PluginScreenPage, { HOST_BOOTSTRAP } from './PluginScreenPage';
+import { testMessageEvent, installTestChannel } from './pluginScreenRpc.testTransport';
 
 const details = { code: 'revision_conflict', message: 'The saved revision has changed.', version: 1 };
 const typedRefusal = { ok: true, result: { ok: false, data: { version: 1, error: { code: details.code, message: details.message } } } };
@@ -52,22 +53,32 @@ async function mount(navId = 'settings') {
   return frame;
 }
 
+function documentNonce(frame: HTMLIFrameElement) {
+  return JSON.parse(frame.srcdoc.match(/window\.__oaiyDocumentNonce=("[^"]+")/)![1]) as string;
+}
+
 /** Execute the production bootstrap inside the mounted frame. jsdom does not
  * execute srcdoc scripts or supply real postMessage source identities, so the
  * two message transports below provide those identities. Both real message
  * listeners, command dispatch, envelope handling and serialization still run. */
 function connect(frame: HTMLIFrameElement) {
   const frameWindow = frame.contentWindow!;
+  const nonce = documentNonce(frame);
+  Object.defineProperty(frameWindow, '__oaiyDocumentNonce', { configurable: true, value: nonce });
+  const ports = installTestChannel(frameWindow);
   const receive = (data: unknown, source: Window | null = window) => {
-    frameWindow.dispatchEvent(new MessageEvent('message', { source, data }));
+    const message = { documentNonce: nonce, ...(data as Record<string, unknown>) };
+    if (source === window) ports().port1.deliver(message);
+    else frameWindow.dispatchEvent(testMessageEvent({ source, data: message }));
   };
-  const requests = vi.spyOn(window, 'postMessage').mockImplementation((data: unknown) => {
-    window.dispatchEvent(new MessageEvent('message', { source: frameWindow, data }));
+  vi.spyOn(window, 'postMessage').mockImplementation((data: unknown, _target?: string | WindowPostMessageOptions, transfer?: Transferable[]) => {
+    window.dispatchEvent(testMessageEvent({ source: frameWindow, data, ports: (transfer ?? []) as MessagePort[] }));
   });
-  const replies = vi.spyOn(frameWindow, 'postMessage').mockImplementation((data: unknown) => receive(data));
   new Function('window', 'parent', 'document', 'setTimeout', 'clearTimeout', HOST_BOOTSTRAP)(
     frameWindow, window, frame.contentDocument, setTimeout, clearTimeout,
   );
+  const requests = vi.spyOn(ports().port1, 'postMessage');
+  const replies = vi.spyOn(ports().port2, 'postMessage');
   const host = (frameWindow as unknown as { PluginHost: {
     command: (name: string, payload?: unknown) => Promise<unknown>;
     aiComplete: (request: unknown) => Promise<unknown>;
@@ -75,7 +86,7 @@ function connect(frame: HTMLIFrameElement) {
     aiSources: () => Promise<unknown>;
     voice: {status:()=>Promise<unknown>;open:()=>Promise<{sessionId:string}>;record:(request:unknown)=>Promise<unknown>;subscribe:(callback:(event:unknown)=>void)=>Promise<{unsubscribe():void}>};
   } }).PluginHost;
-  return { host, requests, replies, receive };
+  return { host, requests, replies, receive, nonce };
 }
 
 describe('plugin command RPC through the mounted host and actual bootstrap', () => {
@@ -92,16 +103,16 @@ describe('plugin command RPC through the mounted host and actual bootstrap', () 
 
   it('private voice events verify parent source, current session/request and suppress terminal duplicates',async()=>{
     list.mockResolvedValue({plugins:[{...plugin,manifest:{...plugin.manifest,capabilities:['oaiy.voice.session']}}]});
-    const {host,receive}=connect(await mount());const callback=vi.fn();await host.voice.subscribe(callback);
+    const {host,receive,requests}=connect(await mount());const callback=vi.fn();await host.voice.subscribe(callback);
     vi.mocked(globalThis.fetch).mockImplementation((url,options)=>Promise.resolve(new Response(JSON.stringify(String(url).endsWith('/status')?{sttReady:true,ttsReady:true,reason:null}:JSON.parse(String(options?.body))))));
     let opened!:{sessionId:string};await act(async()=>{opened=await host.voice.open();});
     const event={sessionId:opened.sessionId,type:'enabled'};
-    receive({__pluginHost:1,voiceEvent:event},null);receive({__pluginHost:1,voiceEvent:{...event,sessionId:crypto.randomUUID()}});expect(callback).not.toHaveBeenCalled();
+    receive({__pluginHost:1,voiceEvent:event},null);receive({__pluginHost:1,voiceEvent:{...event,sessionId:crypto.randomUUID()}});receive({__pluginHost:1,documentNonce:'different-document',voiceEvent:event});expect(callback).not.toHaveBeenCalled();
     receive({__pluginHost:1,voiceEvent:event});expect(callback).toHaveBeenCalledExactlyOnceWith(event);
     receive({__pluginHost:1,voiceEvent:{sessionId:opened.sessionId,requestId:'unknown',type:'transcript',text:'bad'}});expect(callback).toHaveBeenCalledTimes(1);
     // Register an accepted RPC ID through the actual bootstrap, but hold its
     // parent reply so the private callback ledger can be exercised directly.
-    vi.spyOn(window,'postMessage').mockImplementation(()=>{});void host.voice.record({sessionId:opened.sessionId,requestId:'one'}).catch(()=>{});
+    requests.mockImplementation(()=>{});void host.voice.record({sessionId:opened.sessionId,requestId:'one'}).catch(()=>{});
     const transcript={sessionId:opened.sessionId,requestId:'one',type:'transcript',text:'Bounded transcript'};
     receive({__pluginHost:1,voiceEvent:{...transcript,audio:'forbidden'}});expect(callback).toHaveBeenCalledTimes(1);
     receive({__pluginHost:1,voiceEvent:transcript});receive({__pluginHost:1,voiceEvent:transcript});expect(callback).toHaveBeenCalledTimes(2);expect(callback).toHaveBeenLastCalledWith(transcript);
@@ -124,7 +135,7 @@ describe('plugin command RPC through the mounted host and actual bootstrap', () 
     const fetch = vi.mocked(globalThis.fetch).mockResolvedValue(new Response(JSON.stringify(result)));
     await expect(host.aiComplete(request)).resolves.toEqual(result);
     expect(fetch).toHaveBeenCalledWith('http://127.0.0.1:17972/api/plugins/test-plugin/ai/complete',expect.objectContaining({body:JSON.stringify(request)}));
-    expect(replies).toHaveBeenCalledExactlyOnceWith({__pluginHost:1,id:'r1',ok:true,data:result},'*');
+    expect(replies).toHaveBeenCalledExactlyOnceWith({__pluginHost:1,documentNonce:expect.any(String),id:'r1',ok:true,data:result});
   });
 
   it('delivers a typed provider refusal through the production AI bootstrap', async () => {
@@ -169,8 +180,8 @@ describe('plugin command RPC through the mounted host and actual bootstrap', () 
     expect(vi.getTimerCount()).toBe(timers);
     expect(connectorRequest).toHaveBeenCalledWith('test-plugin', 'settings.save', { revision: 1 }, expect.stringMatching(/^ui-settings\.save-/));
     expect(replies).toHaveBeenCalledExactlyOnceWith({
-      __pluginHost: 1, id: 'r1', ok: false, error: details.message, errorDetails: details,
-    }, '*');
+      __pluginHost: 1, documentNonce: expect.any(String), id: 'r1', ok: false, error: details.message, errorDetails: details,
+    });
   });
 
   it.each([
@@ -186,7 +197,7 @@ describe('plugin command RPC through the mounted host and actual bootstrap', () 
     expect(error).toBeInstanceOf(Error);
     expect(error).toMatchObject({ name: 'Error', message });
     expect(error).not.toHaveProperty('code');
-    expect(replies).toHaveBeenCalledExactlyOnceWith({ __pluginHost: 1, id: 'r1', ok: false, error: message }, '*');
+    expect(replies).toHaveBeenCalledExactlyOnceWith({ __pluginHost: 1, documentNonce: expect.any(String), id: 'r1', ok: false, error: message });
   });
 
   it.each([
@@ -198,7 +209,7 @@ describe('plugin command RPC through the mounted host and actual bootstrap', () 
     const { host, replies } = connect(await mount());
     connectorRequest.mockResolvedValue({ ok: true, result });
     await expect(host.command('settings.read')).resolves.toEqual(expected);
-    expect(replies).toHaveBeenCalledExactlyOnceWith({ __pluginHost: 1, id: 'r1', ok: true, data: expected }, '*');
+    expect(replies).toHaveBeenCalledExactlyOnceWith({ __pluginHost: 1, documentNonce: expect.any(String), id: 'r1', ok: true, data: expected });
   });
 
   it('allows an explicit retry after rejection with a new correlation and idempotency key', async () => {
@@ -208,8 +219,8 @@ describe('plugin command RPC through the mounted host and actual bootstrap', () 
     vi.setSystemTime(Date.now() + 1);
     await expect(host.command('settings.save')).resolves.toEqual({ saved: true });
     expect(replies.mock.calls.map(([reply]) => reply)).toEqual([
-      { __pluginHost: 1, id: 'r1', ok: false, error: details.message, errorDetails: details },
-      { __pluginHost: 1, id: 'r2', ok: true, data: { saved: true } },
+      { __pluginHost: 1, documentNonce: expect.any(String), id: 'r1', ok: false, error: details.message, errorDetails: details },
+      { __pluginHost: 1, documentNonce: expect.any(String), id: 'r2', ok: true, data: { saved: true } },
     ]);
     expect(connectorRequest.mock.calls[0][3]).not.toBe(connectorRequest.mock.calls[1][3]);
   });
@@ -218,12 +229,12 @@ describe('plugin command RPC through the mounted host and actual bootstrap', () 
     const frame = await mount();
     const foreign = document.createElement('iframe');
     container.appendChild(foreign);
-    const request = { __pluginHost: 1, id: 'r1', method: 'command', args: ['settings.save'] };
-    window.dispatchEvent(new MessageEvent('message', { source: foreign.contentWindow, data: request }));
+    const request = { __pluginHost: 1, documentNonce: documentNonce(frame), id: 'r1', method: 'command', args: ['settings.save'] };
+    window.dispatchEvent(testMessageEvent({ source: foreign.contentWindow, data: request }));
     for (const data of [
       { ...request, __pluginHost: 2 }, { ...request, id: {} }, { ...request, id: '' },
       { ...request, id: 'x'.repeat(129) }, { ...request, method: {} }, { ...request, args: {} },
-    ]) window.dispatchEvent(new MessageEvent('message', { source: frame.contentWindow, data }));
+    ]) window.dispatchEvent(testMessageEvent({ source: frame.contentWindow, data }));
     expect(connectorRequest).not.toHaveBeenCalled();
     foreign.remove();
   });
@@ -299,6 +310,7 @@ describe('actual bootstrap reply validation and recovery', () => {
     const settled = vi.fn();
     const result = host.command('settings.save').then(settled, (error: unknown) => error);
     receive({ __pluginHost: 1, id: 'r1', ok: true, data: 'forged' }, null);
+    receive({ __pluginHost: 1, documentNonce: 'different-document', id: 'r1', ok: true, data: 'forged' });
     for (const reply of [
       { __pluginHost: 2, id: 'r1' }, { __pluginHost: 1, id: 'r2' },
       { __pluginHost: 1, id: '__proto__' }, { __pluginHost: 1, id: 'constructor' },

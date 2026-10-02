@@ -50,9 +50,13 @@ export class PluginVoiceSession {
   subscribe(): boolean {if (this.disposed) throw fail('voice_session_unavailable','The plugin screen closed.'); this.subscribed = true; return true;}
   unsubscribe(): boolean {this.subscribed = false; return true;}
   async status(): Promise<VoiceAvailability> {
-    const value = await this.json('status', undefined, undefined, 4000) as VoiceAvailability;
-    if (!value || Object.keys(value).some(k => !['sttReady','ttsReady','reason'].includes(k)) || typeof value.sttReady !== 'boolean' || typeof value.ttsReady !== 'boolean' || (value.reason !== null && (typeof value.reason !== 'string' || value.reason.length > 300))) throw fail('voice_invalid_response','The desktop returned invalid voice availability.');
-    return value;
+    return (await this.availability()).ready;
+  }
+  private async availability(id?: string): Promise<{ready:VoiceAvailability;live:boolean}> {
+    const value = await this.json(id ? `status?sessionId=${encodeURIComponent(id)}` : 'status', undefined, undefined, 4000) as VoiceAvailability & {sessionLeaseValid?:boolean};
+    if (!value || Object.keys(value).some(k => !['sttReady','ttsReady','reason',...(id ? ['sessionLeaseValid'] : [])].includes(k)) || typeof value.sttReady !== 'boolean' || typeof value.ttsReady !== 'boolean' || (value.reason !== null && (typeof value.reason !== 'string' || value.reason.length > 300)) || (id && typeof value.sessionLeaseValid !== 'boolean')) throw fail('voice_invalid_response','The desktop returned invalid voice availability.');
+    // Internal lease state stays in the trusted parent, outside the SDK/view.
+    return {ready:{sttReady:value.sttReady,ttsReady:value.ttsReady,reason:value.reason},live:id ? value.sessionLeaseValid! : true};
   }
   async open(): Promise<{sessionId:string;state:'awaiting-opt-in';sttReady:boolean;ttsReady:boolean}> {
     if (this.disposed || this.view || this.opening) throw fail('voice_busy','Close the current voice session before opening another.');
@@ -68,13 +72,17 @@ export class PluginVoiceSession {
       let probing = false;
       this.monitor = window.setInterval(() => {
         if (probing || !this.view) return; probing = true;
-        void this.status().then(availability => {
+        void this.availability(id).then(({ready:availability,live}) => {
           if (this.view?.sessionId !== id) return;
+          // Check the session's original owned-service/process lease through
+          // buffered playback, after the native request has already completed.
+          if (!live) {void this.close(id);return;}
           this.render(availability);
           const pending=this.pending;
           // Aokie's busy health reflects the mutex held by our own admitted
           // inference. Stop capture on lost readiness; native process/service
-          // leases fence an already admitted STT/TTS operation continuously.
+          // leases fence an already admitted STT/TTS operation continuously,
+          // and the independent session lease also fences parent playback.
           if (pending && ['awaiting-start','recording'].includes(this.view.state) && !availability.sttReady) {
             pending.controller.abort();pending.recording?.cancel();
             this.publish({sessionId:id,requestId:pending.requestId,type:'failed',code:'voice_unavailable',message:'The local voice lane is no longer ready. This request stopped.'});

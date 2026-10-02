@@ -8,6 +8,8 @@
 // boundary, so the plugin screens rendered light under every theme.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { assembleScreenDocument, HOST_BOOTSTRAP, isPluginNavTarget, pluginAiSources, pluginFontCss, pluginNavAllowed, pluginOaiyStatus } from './PluginScreenPage';
+import { installTestChannel, type testPorts } from './pluginScreenRpc.testTransport';
+let latestTestPorts: ReturnType<typeof testPorts>;
 import { API_BASE, engines, voices, type ModulesSnapshot } from './api';
 
 describe('plugin AI source gateway routes', () => {
@@ -36,12 +38,17 @@ describe('plugin AI source gateway routes', () => {
 
 /** Run the real bootstrap source against this document, as the iframe would.
  *  Bare: no setup stamp (an ordinary screen). */
+const TEST_DOCUMENT_NONCE = '11111111-1111-4111-8111-111111111111';
 function boot(): void {
   // `parent.postMessage` is the only thing it touches on load.
   (window as unknown as { parent: unknown }).parent = { postMessage: vi.fn() };
   delete (window as unknown as { __oaiySetup?: unknown }).__oaiySetup;
   delete (window as unknown as { PluginHost?: unknown }).PluginHost;
+  const readPorts = installTestChannel(window, data => window.parent.postMessage(data, '*'));
+  Object.defineProperty(window, '__oaiyDocumentNonce', { configurable: true, value: TEST_DOCUMENT_NONCE });
   new Function(HOST_BOOTSTRAP)();
+  latestTestPorts = readPorts();
+  vi.mocked(window.parent.postMessage).mockClear();
 }
 
 /** The same, in a document the host stamped as a setup wizard step. */
@@ -58,16 +65,20 @@ function bootSetup(stamp: unknown = { mode: 'setup', step: 'pair', view: 'phone'
     add.call(window, type, fn, options);
   }) as typeof window.addEventListener;
   try {
-    new Function(HOST_BOOTSTRAP)();
+    const readPorts = installTestChannel(window, data => window.parent.postMessage(data, '*'));
+  Object.defineProperty(window, '__oaiyDocumentNonce', { configurable: true, value: TEST_DOCUMENT_NONCE });
+  new Function(HOST_BOOTSTRAP)();
+  latestTestPorts = readPorts();
+  vi.mocked(window.parent.postMessage).mockClear();
   } finally {
     window.addEventListener = add;
     delete (window as unknown as { __oaiySetup?: unknown }).__oaiySetup;
   }
-  return (e) => handler?.(e);
+  return (e) => latestTestPorts.port1.deliver(e.data);
 }
 
 function send(message: unknown): void {
-  window.dispatchEvent(new MessageEvent('message', { data: message, source: window.parent }));
+  latestTestPorts.port1.deliver({ documentNonce: TEST_DOCUMENT_NONCE, ...(message as Record<string, unknown>) });
 }
 
 describe('plugin iframe bootstrap: theme', () => {
@@ -128,7 +139,7 @@ describe('plugin iframe bootstrap: theme', () => {
   });
 
   it('ignores a protocol message from a window other than its parent', () => {
-    window.dispatchEvent(new MessageEvent('message', { data: { __pluginHost: 1, theme: 'dark' }, source: null }));
+    window.dispatchEvent(new MessageEvent('message', { data: { __pluginHost: 1, documentNonce: TEST_DOCUMENT_NONCE, theme: 'dark' }, source: null }));
     expect(document.documentElement.classList.contains('fl-dark')).toBe(false);
   });
 });
@@ -273,10 +284,10 @@ describe('plugin iframe bootstrap: setup mode', () => {
   it('keeps the gutter at 0 in a wizard step: the pane draws its own', () => {
     const handle = bootSetup();
     document.documentElement.style.setProperty('--host-page-pad', '0');
-    handle(new MessageEvent('message', { data: { __pluginHost: 1, gutter: '18px 16px 30px' }, source: window.parent as unknown as Window }));
+    handle(new MessageEvent('message', { data: { __pluginHost: 1, documentNonce: TEST_DOCUMENT_NONCE, gutter: '18px 16px 30px' }, source: window.parent as unknown as Window }));
     expect(document.documentElement.style.getPropertyValue('--host-page-pad')).toBe('0');
     // While a theme still applies.
-    handle(new MessageEvent('message', { data: { __pluginHost: 1, theme: 'dark' }, source: window.parent as unknown as Window }));
+    handle(new MessageEvent('message', { data: { __pluginHost: 1, documentNonce: TEST_DOCUMENT_NONCE, theme: 'dark' }, source: window.parent as unknown as Window }));
     expect(document.documentElement.classList.contains('fl-dark')).toBe(true);
     document.documentElement.className = '';
   });
@@ -284,6 +295,26 @@ describe('plugin iframe bootstrap: setup mode', () => {
 
 describe('plugin screen document', () => {
   const parts = { body: '<main id="rcp-root"></main>', css: '.x{}', fonts: '', scripts: ['window.a = 1;', 'x("</script>")'], dark: true, gutter: '24px 30px 40px' };
+
+  it('binds the private SDK before any inline body or manifest script can navigate', () => {
+    const inline = '<script>window.bodyCodeRuns=true;</script>';
+    const doc = assembleScreenDocument({ ...parts, body: inline });
+    expect(doc.indexOf('window.__oaiyDocumentNonce=')).toBeLessThan(doc.indexOf(HOST_BOOTSTRAP));
+    expect(doc.indexOf(HOST_BOOTSTRAP)).toBeLessThan(doc.indexOf(inline));
+    expect(doc.indexOf(inline)).toBeLessThan(doc.indexOf('<script>window.a = 1;</script>'));
+  });
+
+  it('keeps closing-style injection in CSS and font text from executing before the bootstrap', () => {
+    const injection = '</StYlE><script>window.beforeBootstrap=true;</script><style>';
+    for (const field of ['css', 'fonts'] as const) {
+      const html = assembleScreenDocument({ ...parts, [field]: injection });
+      const parsed = new DOMParser().parseFromString(html, 'text/html');
+      expect(parsed.head.querySelectorAll('script')).toHaveLength(1);
+      expect(parsed.head.querySelector('script')?.textContent).toContain('window.__oaiyDocumentNonce=');
+      expect(parsed.head.querySelector('style')?.textContent).toContain('<\\/style><script>window.beforeBootstrap=true;');
+      expect(parsed.body.querySelector('script')?.textContent).toBe(HOST_BOOTSTRAP);
+    }
+  });
 
   it('an ordinary screen has the page gutters, and no setup stamp', () => {
     const doc = assembleScreenDocument(parts);
