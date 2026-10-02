@@ -46,6 +46,9 @@ pub struct StubConfig {
     pub call_features: bool,
     /// Whether the streaming probe passed (`compat.sse-framed-poll`): without it an admission that offers only `relay` is `422`.
     pub stream_probe: bool,
+    /// Whether `GET /v1/pair/{pid}` returns `grants` inside `receipt` once the owner has approved. **The shipped relay does not** (its receipt is `{issuedAt, signature}`), which is why
+    /// a phone cannot verify the receipt it is given without the grants from somewhere else; a test turns this on to show what the one-line fix of the relay would do.
+    pub receipt_includes_grants: bool,
     /// The relay's public URL, as written in an enrolment key.
     pub public_url: String,
     /// The relay's signing seed.
@@ -64,6 +67,7 @@ impl Default for StubConfig {
             min_client: 1,
             call_features: true,
             stream_probe: false,
+            receipt_includes_grants: false,
             public_url: "https://relay.stub.test".into(),
             // The seed and id of the protocol package's vectors (`keys.ed25519Seeds.relay`, `keys.ids.relay`): the thumbprint is `b7dKD2-DlMApkGljz-RJwDdNcyxwyFBpSmhz2cRBnaw`.
             relay_seed: [0x33; 32],
@@ -107,6 +111,8 @@ pub(crate) struct Device {
     pub owner_desktop: Option<String>,
     pub app_id: Option<String>,
     pub grants: Vec<String>,
+    /// The thumbprint of the desktop endpoint key a phone paired with (its pin; the admission's expectedPeerKeyThumbprint).
+    pub peer_thumbprint: Option<String>,
     pub revoked: bool,
 }
 
@@ -164,6 +170,7 @@ pub(crate) struct State {
     faults: VecDeque<(Option<String>, Fault)>,
     refuse_holds: u32,
     pub log: Vec<LoggedRequest>,
+    pub(crate) pairings: HashMap<String, super::stub_pairing::Pairing>,
     id_counter: u64,
     seed: u64,
 }
@@ -267,6 +274,7 @@ impl StubRelay {
             faults: VecDeque::new(),
             refuse_holds: 0,
             log: Vec::new(),
+            pairings: HashMap::new(),
             id_counter: 1,
             seed: 0x0a1b_2c3d_4e5f_6071,
         };
@@ -458,6 +466,7 @@ impl StubRelay {
             owner_desktop: owner_desktop.map(str::to_string),
             app_id: app_id.map(str::to_string),
             grants: grants.iter().map(|g| g.to_string()).collect(),
+            peer_thumbprint: None,
             revoked: false,
         });
         st.tokens.push(TokenRec { id: token_id.clone(), secret_sha: sha256(&secret), device: id.clone(), not_after: None });
@@ -513,7 +522,7 @@ impl StubRelay {
         json_response(r.status, &extra, &body, r.time.unwrap_or_else(|| self.now()))
     }
 
-    fn principal(&self, st: &State, req: &HttpRequest) -> Result<Principal, Resp> {
+    pub(crate) fn principal(&self, st: &State, req: &HttpRequest) -> Result<Principal, Resp> {
         let unauthorized = || err(401, "unauthorized", "The credential is not accepted.");
         let header = req.header("authorization").ok_or_else(unauthorized)?;
         let token = header.strip_prefix("Bearer ").ok_or_else(unauthorized)?;
@@ -603,6 +612,7 @@ impl StubRelay {
             ("POST", "/v1/items") => self.post_items(req),
             ("POST", "/v1/tokens/rotate") => self.rotate(req),
             ("POST", "/v1/admission") | ("POST", "/v1/aokie-companion/admission") => self.admission(req),
+            (m, p) if p.starts_with("/v1/pair") => self.pairing_route(req, m, p, q),
             ("POST", p) if p.starts_with("/v1/devices/") && p.ends_with("/revoke") => self.revoke_route(req, p),
             _ => err(404, "not_found", "No such route."),
         }
@@ -1099,7 +1109,7 @@ impl StubRelay {
                 if !device.grants.iter().any(|g| g == "state_read") {
                     return err(403, "forbidden", "No state_read.");
                 }
-                let peer = owner.thumbprint.clone().unwrap_or_default();
+                let peer = device.peer_thumbprint.clone().or_else(|| owner.thumbprint.clone()).unwrap_or_default();
                 let claims = Json::obj([
                     ("aud", Json::str("aokie-v2-gateway")),
                     ("appId", Json::str(app)),

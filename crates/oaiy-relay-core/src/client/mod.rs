@@ -15,6 +15,7 @@ pub mod http;
 pub mod keystore;
 #[cfg(feature = "loopback-http")]
 pub mod loopback;
+pub mod pair;
 pub mod poll_loop;
 pub mod relay;
 pub mod status;
@@ -22,6 +23,7 @@ pub mod store;
 
 pub use clock::{Clock, OffsetClock, OsRng, ProviderClock, Rng, SystemClock};
 pub use http::{Cancel, HttpClient, HttpRequest, HttpResponse, Method, TransportError};
+pub use pair::{PairAck, PairCreate, PairCreated, PairFetch, PairState, ReceiptWire};
 pub use poll_loop::{LoopEnd, PollHandle, PollLoop, PollLoopConfig};
 pub use relay::{ClientConfig, ClientError, Hdr, PollReply, PollRequest, PostItem, PostResult, PostStatus, ProveError, RelayClient, RelayError};
 pub use status::{ConnectionState, Event, Health, NullSink, RecordingSink, StatusSink};

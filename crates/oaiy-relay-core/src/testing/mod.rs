@@ -6,6 +6,7 @@
 
 pub mod server;
 pub mod stub;
+pub(crate) mod stub_pairing;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;

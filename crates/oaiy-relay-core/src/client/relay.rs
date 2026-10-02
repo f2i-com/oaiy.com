@@ -315,7 +315,7 @@ impl RelayClient {
 
     /// One exchange, with the headers every request carries, and the relay clock sampled from the response.
     #[allow(clippy::too_many_arguments)]
-    fn exchange(
+    pub(crate) fn exchange(
         &self,
         method: Method,
         path: &str,
@@ -346,7 +346,7 @@ impl RelayClient {
         Ok(response)
     }
 
-    fn gate(&self) -> Result<(), ClientError> {
+    pub(crate) fn gate(&self) -> Result<(), ClientError> {
         let now = self.clock.monotonic();
         let s = lock(&self.state);
         if s.suspect {
@@ -358,7 +358,7 @@ impl RelayClient {
         }
     }
 
-    fn authed(
+    pub(crate) fn authed(
         &self,
         token: &Token,
         method: Method,
@@ -386,7 +386,7 @@ impl RelayClient {
         }
     }
 
-    fn success_json(&self, response: &HttpResponse, ok: &[u16]) -> Result<Json, ClientError> {
+    pub(crate) fn success_json(&self, response: &HttpResponse, ok: &[u16]) -> Result<Json, ClientError> {
         if !ok.contains(&response.status) {
             return Err(ClientError::Relay(self.error_of(response)));
         }
