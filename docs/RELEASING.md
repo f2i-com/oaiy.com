@@ -367,7 +367,7 @@ a release matter here:
   server that was told only `OAIY_SERVER_TOKEN` (no owner, no public URL) starts as before, in setup-only mode, and:
   a caller with no credential is told `401 setup_required` by every route but health and the login routes (capability
   discovery, the pairing routes and `GET /api/update/status` included); its token is not a stranger and reaches
-  them as it reaches the rest; the token is the `cli` preset, so the 108 routes of voice, messages and transfers, calendar, contacts, the Agent,
+  them as it reaches the rest; the token is the `cli` preset, so the 113 routes of voice, messages and transfers, calendar, contacts, the Agent,
   setup, the control settings, the account link, pairings, the companion relay, AI provider keys and the installs answer
   it `403 insufficient_scope`, which a server without the web login let it reach. There is no setting that brings that
   back: `oaiy-server auth init`, then `oaiy-server auth token create --preset cli --scope <scope>` for the jobs that need

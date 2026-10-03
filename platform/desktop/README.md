@@ -325,7 +325,7 @@ a setting undoes:
 3. **The token is the `cli` preset, which is less than a server without the web login let it reach.** The web build's
    access mode is `scoped`, and it refuses `legacy`. The token holds `system.read`, `logs.read`, `services.read` and
    `.control`, `models.read` and `.write`, `plugins.read` and `.control`, `flows.read` and `.write`, `runs.read` and
-   `.write`, `ai.read`, `ai.use` and `events.read`: what the CLI and a bridge client do. **108 routes that a server without the web login let a token reach
+   `.write`, `ai.read`, `ai.use` and `events.read`: what the CLI and a bridge client do. **113 routes that a server without the web login let a token reach
    answer it `403 insufficient_scope`**, by the scope they ask for: `services.define` (defining,
    uninstalling and exporting services), `runtimes.install` and `plugins.install` (Python and Node installs, installing,
    removing and trusting a plugin: native code), `ai.admin` (provider keys and the ChatGPT login), `connectors.use`,

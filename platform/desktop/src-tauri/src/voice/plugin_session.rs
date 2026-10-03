@@ -76,6 +76,11 @@ struct Service {
 }
 trait Services: Send + Sync {
     fn current(&self) -> Option<Service>;
+    /// Phone calls live now: a call has the voice engine, so plugin voice waits for it to end. The desktop asks every hub of
+    /// the process; a test asks its own, so that a call another test holds in the same process is not this test's.
+    fn live_calls(&self) -> usize {
+        super::live_call_count()
+    }
 }
 struct RegisteredServices(RegistryHandle);
 impl Services for RegisteredServices {
@@ -188,7 +193,7 @@ struct SpeakInput {
 // Retain the original process/service lease beyond native download, so trusted
 // parent playback cannot follow a stopped or replaced service into a new lease.
 fn session_service(st: &Voice, plugin: &str, id: &str) -> Option<Service> {
-    if super::live_call_count() > 0 {
+    if st.services.live_calls() > 0 {
         return None;
     }
     let (valid, service) = st.memory.lock().ok().and_then(|memory| {
@@ -218,7 +223,7 @@ async fn status(
     };
     if let Some(id) = input.session_id {
         let result = if let Some(service) = session_service(&st, &plugin, &id) {
-            tokio::time::timeout(Duration::from_secs(4), ready_service(service, true))
+            tokio::time::timeout(Duration::from_secs(4), ready_service(&st, service, true))
                 .await
                 .ok()
                 .and_then(Result::ok)
@@ -302,7 +307,7 @@ struct Claim {
 impl Claim {
     fn live(&self) -> bool {
         !*self.rx.borrow()
-            && super::live_call_count() == 0
+            && self.state.services.live_calls() == 0
             && (self.valid)()
             && self
                 .service_valid
@@ -420,7 +425,7 @@ async fn bounded_json(response: reqwest::Response) -> Result<Value, Failure> {
     })
 }
 async fn ready(st: &Voice, need_voice: bool) -> Result<(Service, Value, Option<String>), Failure> {
-    if super::live_call_count() > 0 {
+    if st.services.live_calls() > 0 {
         return Err((
             StatusCode::CONFLICT,
             "voice_busy",
@@ -432,13 +437,14 @@ async fn ready(st: &Voice, need_voice: bool) -> Result<(Service, Value, Option<S
         "voice_unavailable",
         UNAVAILABLE,
     ))?;
-    ready_service(service, need_voice).await
+    ready_service(st, service, need_voice).await
 }
 async fn ready_service(
+    st: &Voice,
     service: Service,
     need_voice: bool,
 ) -> Result<(Service, Value, Option<String>), Failure> {
-    if super::live_call_count() > 0 {
+    if st.services.live_calls() > 0 {
         return Err((
             StatusCode::CONFLICT,
             "voice_busy",
@@ -581,7 +587,7 @@ async fn transcribe(
     let future = async {
         let (service, metadata, _) = tokio::time::timeout(
             Duration::from_secs(4),
-            ready_service(original_service, false),
+            ready_service(&st, original_service, false),
         )
         .await
         .map_err(|_| {
@@ -591,7 +597,7 @@ async fn transcribe(
                 UNAVAILABLE,
             )
         })??;
-        if metadata["sttReady"] != true || !allowed() || super::live_call_count() > 0 {
+        if metadata["sttReady"] != true || !allowed() || st.services.live_calls() > 0 {
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 "voice_unavailable",
@@ -667,7 +673,7 @@ async fn speak(
     let future = async {
         let (service, metadata, voice) = tokio::time::timeout(
             Duration::from_secs(4),
-            ready_service(original_service, true),
+            ready_service(&st, original_service, true),
         )
         .await
         .map_err(|_| {
@@ -677,7 +683,7 @@ async fn speak(
                 UNAVAILABLE,
             )
         })??;
-        if metadata["ttsReady"] != true || !allowed() || super::live_call_count() > 0 {
+        if metadata["ttsReady"] != true || !allowed() || st.services.live_calls() > 0 {
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 "voice_unavailable",
@@ -865,6 +871,11 @@ mod tests {
             self.available
                 .load(Ordering::SeqCst)
                 .then(|| self.service.clone())
+        }
+        // No call is live in these tests. The process-wide count would see the calls that other tests of the binary hold
+        // while these run beside them, and every request here would then be refused as busy.
+        fn live_calls(&self) -> usize {
+            0
         }
     }
     struct Fixture {
