@@ -13,13 +13,21 @@ an owned live plugin process. A completion holds that exact process identity,
 checks its capability every 250 ms and checks it before returning. Stop, restart,
 revocation and screen replacement suppress old results.
 
+In developer builds an `unsigned-dev` package can run before the owner trusts
+it, but this does not grant AI access. Plugins offers **Trust this plugin** for
+both unsigned states, with the existing exact-package confirmation and a notice
+when the package declares AI completion. Trusting a running developer plugin
+refreshes its trust record without stopping or restarting it. Return to its
+screen and read host models again.
+
 ```js
 const sources = await PluginHost.aiSources();
-// Pick a returned source with completionAvailable === true.
+const source = sources.find(source => source.completionAvailable === true);
+if (!source) throw new Error('No ready completion source. Check OAIY Engines or provider settings.');
 const requestId = 'screen-' + crypto.randomUUID();
 const result = await PluginHost.aiComplete({
   requestId,
-  sourceId: sources[0].id, // "provider:<configured-id>"
+  sourceId: source.id, // "provider:<configured-id>"
   prompt: 'Produce text using only the evidence supplied in this prompt.',
   maxOutputChars: 2048
 });
@@ -58,7 +66,7 @@ model-generated code or tools and does not establish that a claim is grounded.
 
 For a package declaring this capability, `aiSources()` reads the scoped source
 catalogue: bounded IDs, names, optional model metadata, `capabilities: ['chat']`
-and `completionAvailable: true`. It supplies neither URLs nor secrets. The
+and a boolean `completionAvailable`. It supplies neither URLs nor secrets. The
 catalogue is presentation metadata; completion resolves the source again against
 the current host configuration. Older plugins retain their existing metadata
 catalogue behavior, which grants no completion permission. Configured-provider
@@ -67,11 +75,21 @@ the screen rejects HTTP response bodies above 64 KiB before JSON parsing.
 
 Normal launches support enabled configured OpenAI-compatible and Anthropic chat
 providers through the existing credential/egress/normalization gateway. They
-also support `provider:oaiy-engine` when the model chosen in Engines is already
-ready and resident. The scoped surface does not offer model selection, load,
+also list `provider:oaiy-engine` when the selected model is present in the
+engine's language-model catalogue. Its `model` is the selected bounded ID;
+`completionAvailable` is true only when its files are present and engine state
+reports that exact model ready and resident. Otherwise it is false, with an
+optional `unavailableReason` containing fixed, bounded owner recovery text.
+Consumers must disable completion for unavailable entries and display the
+reason. A transport failure, malformed catalogue or absent selected model omits
+the engine entry. Catalogue reads fetch metadata only and never load a model.
+The scoped surface does not offer model selection, load,
 unload, restart or provider administration. Engine state may change after its
 readiness check; the engine gateway remains responsible for its own lifecycle.
-Scoped engine state and discovery reads are each capped at 64 KiB.
+Scoped engine state and discovery reads are each capped at 64 KiB, disable
+redirects/proxies, and share a four-second catalogue deadline regardless of
+readiness. The catalogue is a snapshot, not a reservation against a concurrent
+model change.
 Managed Codex/ChatGPT agent sources and their call aliases are explicitly refused:
 their blocking child turns and tool authority need a separate cancellation and
 permission contract. No model IDs are hardcoded.
@@ -130,11 +148,17 @@ HTTP providers through the actual gateway for bounded requests, failure bodies,
 overlarge responses, token limits, cancellation, replay and the real deadline.
 `plugins::host::tests::screen_ai_capability_requires_trust_declaration_and_the_same_live_process`
 uses a synthetic Node plugin process to check trust, literal permission and
-restart identity. HTTP, isolated-policy and auth-route tests check the outer
+restart identity. The developer-package regression uses the actual host gate
+and scoped router to verify denial before trust, access after exact-package
+trust without process replacement, and revocation after package bytes change.
+Engine catalogue regression tests use a separate synthetic HTTP engine to
+cover readiness, files, selected IDs, transport bounds, zero engine contact in
+isolation, and trust revocation during discovery. Mounted PluginsPanel tests
+verify confirmation and no automatic start or stop. HTTP, isolated-policy and auth-route tests check the outer
 origin/scopes boundary. These are transport/regression tests; their synthetic
 provider replies are not live-model quality evidence.
 
-The review qualification passed 13 native completion tests and 120 distinct
+The earlier scoped-completion review qualification passed 13 native completion tests and 120 distinct
 native boundary/regression tests, including a real synthetic plugin process.
 The three focused frontend files passed 116 tests. TypeScript, direct Vite
 bundling and the headless `web`-feature Rust check also passed:
@@ -153,3 +177,10 @@ checkout it stopped at absent CLI build assets and CLI dependencies, before
 frontend validation; the direct TypeScript/Vite checks above passed without
 installing or changing that unrelated CLI. This qualification did not deploy a
 desktop build, connect real model providers, load models or measure model quality.
+
+The local-model recovery change passed 14 native completion tests, both real
+plugin-process trust tests, and 80 tests across the four focused frontend files
+(`PluginsPanel.trust`, `PluginScreenPage.status`, `PluginScreenPage.rpc`, and
+`pluginAi`). TypeScript and direct Vite bundling also passed. Its engine fixtures
+were synthetic; this verification did not contact the running installation or
+change installed-package trust or model state.

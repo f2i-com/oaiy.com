@@ -16,6 +16,7 @@ pub mod call;
 pub mod callers;
 pub mod contacts;
 pub mod engines;
+pub mod plugin_session;
 pub mod transfer;
 pub mod voices;
 

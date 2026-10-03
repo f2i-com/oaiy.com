@@ -543,7 +543,7 @@ impl PluginHost {
             let rec = reg.get(id).ok_or(("capability_unavailable", "The plugin is not installed."))?;
             if rec.user_disabled || !rec.state.accepts_commands() || !rec.trust.as_ref().is_some_and(|trust|
                 matches!(trust.state, crate::plugins::trust::TrustState::Verified | crate::plugins::trust::TrustState::TrustedLocal)) {
-                return Err(("capability_unavailable", "Trust and start the plugin in Plugins before using AI completion."));
+                return Err(("capability_unavailable", "Trust and start the plugin in Plugins before using scoped host access."));
             }
             // Adding a spending capability must not retroactively grant it to
             // an older broad host wildcard. This screen contract requires its
@@ -4229,6 +4229,71 @@ process.stdin.on("data", (chunk) => {
         assert!(!host.holds_screen_capability("probe","oaiy.ai.complete",&lease),"restart cannot revive the old lease");
         let current = host.screen_capability("probe","oaiy.ai.complete").unwrap();
         assert!(host.holds_screen_capability("probe","oaiy.ai.complete",&current)); host.stop("probe").unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn running_developer_plugin_catalog_requires_exact_package_trust_without_a_restart() {
+        use axum::{body::Body, http::{Request, StatusCode}};
+        use tower::ServiceExt;
+        let (sb, host, trust) = trusting_host("dev-screen-ai-trust", TrustPolicy::developer(), Publishers::default());
+        let Some(dir) = node_plugin(&sb, "probe") else { panic!("Node is required for this real-process qualification test"); };
+        let path = dir.join("manifest.json");
+        let mut manifest: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        manifest["capabilities"] = json!(["oaiy.ai.complete"]);
+        std::fs::write(path, manifest.to_string()).unwrap();
+        host.start("probe").unwrap();
+        wait_running(&host, "probe");
+        assert_eq!(trust_of(&host, "probe"), Some(TrustState::UnsignedDev));
+        let original_process = host.procs.lock().unwrap().running.get("probe").unwrap().clone();
+        let services = Arc::new(Mutex::new(crate::services::registry::Registry::empty(sb.0.join("data"), sb.0.join("models"))));
+        let ai = crate::ai::routes::AiState::new(crate::ai::providers::new_handle(), services, crate::ai::codex::absent_for_tests()).with_engines_at(None);
+        let app = crate::ai::plugin_completion::router(ai, host.clone(), true);
+        let read = || app.clone().oneshot(Request::builder().uri("/api/plugins/probe/ai/sources").body(Body::empty()).unwrap());
+        assert_eq!(read().await.unwrap().status(), StatusCode::FORBIDDEN);
+        trust.trust_local(&dir, "probe").unwrap();
+        host.registry.lock().unwrap().scan();
+        assert_eq!(trust_of(&host, "probe"), Some(TrustState::TrustedLocal));
+        assert_eq!(read().await.unwrap().status(), StatusCode::OK);
+        let lease = host.screen_capability("probe", "oaiy.ai.complete").unwrap();
+        assert!(Arc::ptr_eq(&original_process, &lease.process), "explicit trust must preserve the running process");
+        let script = dir.join("plugin.mjs");
+        let mut changed = std::fs::read_to_string(&script).unwrap();
+        changed.push_str("\n// changed after trust\n");
+        std::fs::write(script, changed).unwrap();
+        host.registry.lock().unwrap().scan();
+        assert_eq!(read().await.unwrap().status(), StatusCode::FORBIDDEN);
+        assert!(!host.holds_screen_capability("probe", "oaiy.ai.complete", &lease));
+        host.stop("probe").unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn scoped_voice_requires_literal_trust_and_current_process_without_service_start() {
+        use axum::{body::Body,http::{Request,StatusCode}};
+        use tower::ServiceExt;
+        let (sb,host,trust)=trusting_host("dev-screen-voice-trust",TrustPolicy::developer(),Publishers::default());
+        let Some(dir)=node_plugin(&sb,"probe") else {panic!("Node is required for this real-process qualification test");};
+        let path=dir.join("manifest.json");
+        let mut manifest:Value=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        manifest["capabilities"]=json!(["oaiy.voice.session"]);std::fs::write(&path,manifest.to_string()).unwrap();
+        host.start("probe").unwrap();wait_running(&host,"probe");
+        let services=Arc::new(Mutex::new(crate::services::registry::Registry::empty(sb.0.join("data"),sb.0.join("models"))));
+        let app=crate::voice::plugin_session::router(services.clone(),host.clone(),false);
+        let read=||app.clone().oneshot(Request::builder().uri("/api/plugins/probe/voice/status").body(Body::empty()).unwrap());
+        assert_eq!(read().await.unwrap().status(),StatusCode::FORBIDDEN);
+        trust.trust_local(&dir,"probe").unwrap();host.registry.lock().unwrap().scan();
+        let lease=host.screen_capability("probe","oaiy.voice.session").unwrap();
+        let response=read().await.unwrap();assert_eq!(response.status(),StatusCode::OK);
+        let value:Value=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),16384).await.unwrap()).unwrap();
+        assert_eq!(value["sttReady"],false);assert_eq!(value["ttsReady"],false);
+        assert!(services.lock().unwrap().running_ids().is_empty(),"voice catalogue cannot start a service");
+        host.stop("probe").unwrap();assert!(!host.holds_screen_capability("probe","oaiy.voice.session",&lease));
+        host.start("probe").unwrap();wait_running(&host,"probe");assert!(!host.holds_screen_capability("probe","oaiy.voice.session",&lease));
+        std::fs::write(dir.join("plugin.mjs"),format!("{}\n// changed after trust\n",std::fs::read_to_string(dir.join("plugin.mjs")).unwrap())).unwrap();
+        host.registry.lock().unwrap().scan();assert_eq!(read().await.unwrap().status(),StatusCode::FORBIDDEN);host.stop("probe").unwrap();
+        manifest["capabilities"]=json!(["oaiy.*"]);std::fs::write(path,manifest.to_string()).unwrap();trust.trust_local(&dir,"probe").unwrap();
+        host.start("probe").unwrap();wait_running(&host,"probe");assert!(host.screen_capability("probe","oaiy.voice.session").is_err());host.stop("probe").unwrap();
     }
 
     /// Rewrite a file with other bytes of the same length and put its modified time back.

@@ -622,6 +622,7 @@ mod tests {
     /// (`agent.serve`, which `owner` and `agent` alone hold: seven more each). The plugin screens' scoped AI completion adds three routes
     /// (the sources read, `ai.read`, and the completion and its cancel, `ai.use`): the nine presets that hold both scopes (`owner`, `agent`,
     /// `flows`, `flows-host`, `flows-web`, `formlogic`, `cli`, `cli-admin`, `run`) reach three more each, and no other preset holds either.
+    /// Scoped plugin voice adds one services.read status and five speech.use actions.
     #[test]
     fn what_each_preset_reaches_of_the_routes_that_existed() {
         let reaches: Vec<(&str, usize)> = ALL_PRESETS
@@ -631,18 +632,18 @@ mod tests {
         assert_eq!(
             reaches,
             [
-                ("owner", 165 + 11 + 8 + 3),
-                ("agent", 78 + 5 + 7 + 3),
-                ("flows", 64 + 3),
-                ("flows-host", 54 + 3),
-                ("flows-web", 38 + 3),
-                ("formlogic", 36 + 3),
-                ("cli", 75 + 1 + 3),
-                ("cli-admin", 86 + 1 + 3),
+                ("owner", 165 + 11 + 8 + 3 + 6),
+                ("agent", 78 + 5 + 7 + 3 + 5),
+                ("flows", 64 + 3 + 6),
+                ("flows-host", 54 + 3 + 6),
+                ("flows-web", 38 + 3 + 6),
+                ("formlogic", 36 + 3 + 1),
+                ("cli", 75 + 1 + 3 + 1),
+                ("cli-admin", 86 + 1 + 3 + 1),
                 ("mcp", 7),
-                ("readonly", 28 + 1),
+                ("readonly", 28 + 1 + 1),
                 ("companion", 17 + 4),
-                ("run", 32 + 3),
+                ("run", 32 + 3 + 6),
                 ("ceremony", 4),
             ]
         );

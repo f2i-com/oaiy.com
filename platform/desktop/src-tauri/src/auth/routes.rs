@@ -415,6 +415,12 @@ pub static ROUTES: &[Route] = &[
     scope(Verb::Post, "/api/ai/codex/logout", "ai.admin"),
     // speech.use
     scope(Verb::Post, "/api/voice/transcribe", "speech.use"),
+    scope(Verb::Get, "/api/plugins/:id/voice/status", "services.read"),
+    scope(Verb::Post, "/api/plugins/:id/voice/open", "speech.use"),
+    scope(Verb::Post, "/api/plugins/:id/voice/transcribe", "speech.use"),
+    scope(Verb::Post, "/api/plugins/:id/voice/speak", "speech.use"),
+    scope(Verb::Post, "/api/plugins/:id/voice/cancel", "speech.use"),
+    scope(Verb::Post, "/api/plugins/:id/voice/close", "speech.use"),
     // calls.read
     scope(Verb::Get, "/api/voice/events", "calls.read"),
     scope(Verb::Get, "/api/voice/calls", "calls.read"),
@@ -991,6 +997,19 @@ mod tests {
     }
 
     #[test]
+    fn plugin_voice_is_metadata_or_speech_and_never_a_phone_permission() {
+        use axum::http::Method;
+        assert_eq!(route_class(&Method::GET,"/api/plugins/:id/voice/status"),Class::Scope("services.read"));
+        assert_eq!(route_class(&Method::HEAD,"/api/plugins/:id/voice/status"),Class::Scope("services.read"));
+        for action in ["open","transcribe","speak","cancel","close"] {
+            let path=format!("/api/plugins/:id/voice/{action}");
+            assert_eq!(route_class(&Method::POST,&path),Class::Scope("speech.use"));
+            assert_eq!(route_class(&Method::GET,&path),Class::Unclassified);
+            assert!(pattern_existed_before(&path));
+        }
+    }
+
+    #[test]
     fn the_rows_that_hold_no_scope_are_the_ones_the_design_lists() {
         let mut classes: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
         for r in ROUTES {
@@ -1114,12 +1133,12 @@ mod tests {
         // seven of the receptionist's transfers and messages).
         assert_eq!(
             want.len(),
-            161 + 41 + 60 - 1 + 4 + 7 + 8 + 3,
+            161 + 41 + 60 - 1 + 4 + 7 + 8 + 3 + 6,
             "the rows of the design and its documented differences"
         );
         assert_eq!(
-            added, 22,
-            "the routes added since the appendix are the twenty-two the file lists"
+            added, 28,
+            "the routes added since the appendix are the twenty-eight the file lists"
         );
         // Four rows the appendix reserves were built (the messages and the ring's settings): the scope is the
         // design's and the `since` is 1, since the routes exist.

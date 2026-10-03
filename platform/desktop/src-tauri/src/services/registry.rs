@@ -190,6 +190,13 @@ pub struct ServiceRuntime {
     pub last_crash: Option<ExitDiagnostics>,
 }
 
+/// An already running service identity. Acquiring this never starts a process.
+#[derive(Clone)]
+pub(crate) struct RunningServiceLease {
+    pub port: u16,
+    runner: Arc<Runner>,
+}
+
 /// A structured record of an unexpected exit, preserved across restarts.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -966,6 +973,18 @@ impl Registry {
     /// The live port of a service by id (e.g. to reach OAIY Voice's own API).
     pub fn service_port(&self, id: &str) -> Option<u16> {
         self.services.get(id).map(|s| s.port)
+    }
+
+    pub(crate) fn running_service_lease(&self, id: &str) -> Option<RunningServiceLease> {
+        let service = self.services.get(id)?;
+        let runner = service.runner.as_ref()?;
+        (service.status == ServiceStatus::Running && service.port != 0 && runner.is_running())
+            .then(|| RunningServiceLease { port: service.port, runner: runner.clone() })
+    }
+
+    pub(crate) fn holds_running_service(&self, id: &str, lease: &RunningServiceLease) -> bool {
+        self.running_service_lease(id).is_some_and(|current|
+            current.port == lease.port && Arc::ptr_eq(&current.runner, &lease.runner))
     }
 
     /// True when `p` resolves inside a managed root (`${dataDir}` — which

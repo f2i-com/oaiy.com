@@ -91,23 +91,90 @@ pub(super) async fn engine_discovery(st: &AiState) -> Result<(String, Value), St
 }
 
 pub(super) async fn resident_engine_provider(st: &AiState) -> Result<AiProvider, String> {
-    let (gateway, discovery) = engine_discovery_impl(st, true).await?;
-    Ok(engine_provider(gateway, chosen_model(&discovery)))
+    let (gateway, discovery, state) = engine_discovery_snapshot(st, true).await?;
+    let source = plugin_engine_source_snapshot(&discovery, &state)?;
+    if !source.completion_available
+        || state.pointer("/llm/paused_for_media").and_then(Value::as_bool) == Some(true) {
+        return Err("The chosen engine model is not already ready and resident.".into());
+    }
+    Ok(engine_provider(gateway, source.model))
 }
 
 async fn engine_discovery_impl(st: &AiState, require_resident: bool) -> Result<(String, Value), String> {
-    let ui = st.engines_ui().ok_or("OAIY's engines are not running")?;
-    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(4));
-    if require_resident { builder = builder.no_proxy().redirect(reqwest::redirect::Policy::none()); }
-    let client = builder.build().map_err(|e| e.to_string())?;
-    let state = engine_json(&client, format!("{}/api/state", ui.trim_end_matches('/')), require_resident).await?;
-    let gateway = state.get("gateway_url").and_then(Value::as_str).filter(|g| !g.is_empty()).ok_or("the engines have no gateway yet")?.trim_end_matches('/').to_string();
-    let discovery = engine_json(&client, format!("{gateway}/v1/discovery"), require_resident).await?;
-    if require_resident && (state.pointer("/llm/state").and_then(Value::as_str) != Some("ready")
-        || state.pointer("/llm/resident").and_then(Value::as_str).filter(|model| !model.is_empty()) != Some(chosen_model(&discovery).as_str())) {
+    let (gateway, discovery, state) = engine_discovery_snapshot(st, require_resident).await?;
+    if require_resident && !engine_model_resident(&state, &chosen_model(&discovery)) {
         return Err("The chosen engine model is not already ready and resident.".into());
     }
     Ok((gateway, discovery))
+}
+
+fn engine_model_resident(state: &Value, model: &str) -> bool {
+    !model.is_empty()
+        && state.pointer("/llm/state").and_then(Value::as_str) == Some("ready")
+        && state.pointer("/llm/resident").and_then(Value::as_str) == Some(model)
+}
+
+/// Metadata for the selected local engine model. Reading this never loads it;
+/// completion still independently requires the exact model to be resident.
+pub(super) struct PluginEngineSource {
+    pub model: String,
+    pub completion_available: bool,
+    pub unavailable_reason: Option<&'static str>,
+}
+
+pub(super) async fn plugin_engine_source(st: &AiState) -> Result<PluginEngineSource, String> {
+    let (_, discovery, state) = engine_discovery_snapshot(st, true).await?;
+    plugin_engine_source_snapshot(&discovery, &state)
+}
+
+fn plugin_engine_source_snapshot(discovery: &Value, state: &Value) -> Result<PluginEngineSource, String> {
+    let model = chosen_model(&discovery);
+    if model.trim().is_empty() || model.len() > 256 || model.chars().any(char::is_control) {
+        return Err("the engines have no bounded selected language model".into());
+    }
+    let selected = discovery.pointer("/models/llm").and_then(Value::as_array)
+        .and_then(|models| models.iter().find(|entry| entry.get("id").and_then(Value::as_str) == Some(model.as_str())))
+        .ok_or("the selected language model is not in the engine catalogue")?;
+    let files_present = selected.get("files_present");
+    // Studio 0.1.0 omits this field. Only that absence may use its explicit
+    // loaded/unpaused evidence; false, null and malformed flags remain denied.
+    let legacy_ready = selected.get("loaded").and_then(Value::as_bool) == Some(true)
+        && state.pointer("/llm/paused_for_media").and_then(Value::as_bool) == Some(false);
+    let files_available = match files_present {
+        Some(Value::Bool(true)) => true,
+        None => legacy_ready,
+        _ => false,
+    };
+    let paused = state.pointer("/llm/paused_for_media").and_then(Value::as_bool) == Some(true);
+    let completion_available = files_available && !paused && engine_model_resident(&state, &model);
+    let unavailable_reason = if completion_available {
+        None
+    } else if files_present.is_some() && files_present != Some(&Value::Bool(true)) {
+        Some("The selected local model's files are missing. Check its files in OAIY Engines before starting it.")
+    } else if paused {
+        Some("The local language model is paused for media work. Wait for that work to finish, then read host models again.")
+    } else if files_present.is_none() && !legacy_ready {
+        Some("The legacy engine catalogue did not confirm that the selected model is loaded and unpaused. Check OAIY Engines before trying again.")
+    } else {
+        Some(match state.pointer("/llm/state").and_then(Value::as_str) {
+            Some("starting") => "The selected local model is loading. Wait until OAIY Engines shows it is ready, then read host models again.",
+            Some("ready") => "A different local model is resident. Check the selected default in OAIY Engines before changing or restarting models.",
+            Some("failed") => "The selected local model failed to start. Check OAIY Engines for the error before trying again.",
+            _ => "The selected local model is not loaded. In OAIY Engines, check the selected default and start it when other work is idle, then read host models again.",
+        })
+    };
+    Ok(PluginEngineSource { model, completion_available, unavailable_reason })
+}
+
+async fn engine_discovery_snapshot(st: &AiState, bounded: bool) -> Result<(String, Value, Value), String> {
+    let ui = st.engines_ui().ok_or("OAIY's engines are not running")?;
+    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(4));
+    if bounded { builder = builder.no_proxy().redirect(reqwest::redirect::Policy::none()); }
+    let client = builder.build().map_err(|e| e.to_string())?;
+    let state = engine_json(&client, format!("{}/api/state", ui.trim_end_matches('/')), bounded).await?;
+    let gateway = state.get("gateway_url").and_then(Value::as_str).filter(|g| !g.is_empty()).ok_or("the engines have no gateway yet")?.trim_end_matches('/').to_string();
+    let discovery = engine_json(&client, format!("{gateway}/v1/discovery"), bounded).await?;
+    Ok((gateway, discovery, state))
 }
 
 async fn engine_json(client: &reqwest::Client, url: String, bounded: bool) -> Result<Value, String> {
@@ -847,6 +914,113 @@ mod tests {
         assert_eq!(chosen_model(&json!({})), "");
         let p = engine_provider("http://127.0.0.1:8080".into(), "b".into());
         assert_eq!((p.id.as_str(), p.model.as_deref(), p.allow_local), (ENGINE_PROVIDER_ID, Some("b"), true));
+    }
+
+    fn legacy_catalogue() -> (Value, Value) {
+        (
+            json!({"defaults": {"llm": "selected"}, "models": {"llm": [{"id": "selected", "loaded": true}]}}),
+            json!({"llm": {"state": "ready", "resident": "selected", "paused_for_media": false}}),
+        )
+    }
+
+    #[test]
+    fn plugin_engine_catalogue_accepts_only_confirmed_legacy_residency() {
+        let (discovery, state) = legacy_catalogue();
+        let source = plugin_engine_source_snapshot(&discovery, &state).unwrap();
+        assert_eq!(source.model, "selected");
+        assert!(source.completion_available);
+        assert_eq!(source.unavailable_reason, None);
+        // The existing default-entry fallback selects the same known model.
+        let mut fallback = discovery.clone();
+        fallback.as_object_mut().unwrap().remove("defaults");
+        fallback["models"]["llm"][0]["default"] = json!(true);
+        assert!(plugin_engine_source_snapshot(&fallback, &state).unwrap().completion_available);
+    }
+
+    #[test]
+    fn plugin_engine_catalogue_rejects_legacy_unconfirmed_loaded_flag() {
+        let (discovery, state) = legacy_catalogue();
+        for loaded in [json!(false), Value::Null, json!("true"), json!(1), json!({})] {
+            let mut changed = discovery.clone();
+            changed["models"]["llm"][0]["loaded"] = loaded;
+            let source = plugin_engine_source_snapshot(&changed, &state).unwrap();
+            assert!(!source.completion_available, "{changed}");
+            assert!(source.unavailable_reason.is_some());
+        }
+        let mut missing = discovery;
+        missing["models"]["llm"][0].as_object_mut().unwrap().remove("loaded");
+        assert!(!plugin_engine_source_snapshot(&missing, &state).unwrap().completion_available);
+    }
+
+    #[test]
+    fn plugin_engine_catalogue_rejects_legacy_unconfirmed_unpaused_flag() {
+        let (discovery, state) = legacy_catalogue();
+        for paused in [json!(true), Value::Null, json!("false"), json!(0), json!({})] {
+            let mut changed = state.clone();
+            changed["llm"]["paused_for_media"] = paused;
+            assert!(!plugin_engine_source_snapshot(&discovery, &changed).unwrap().completion_available, "{changed}");
+        }
+        let mut missing = state;
+        missing["llm"].as_object_mut().unwrap().remove("paused_for_media");
+        assert!(!plugin_engine_source_snapshot(&discovery, &missing).unwrap().completion_available);
+    }
+
+    #[test]
+    fn plugin_engine_catalogue_rejects_nonresident_or_malformed_state() {
+        let (discovery, state) = legacy_catalogue();
+        for status in [json!("stopped"), json!("starting"), json!("failed"), Value::Null, json!(true)] {
+            let mut changed = state.clone();
+            changed["llm"]["state"] = status;
+            assert!(!plugin_engine_source_snapshot(&discovery, &changed).unwrap().completion_available, "{changed}");
+        }
+        for resident in [json!("other"), json!(""), Value::Null, json!(true)] {
+            let mut changed = state.clone();
+            changed["llm"]["resident"] = resident;
+            assert!(!plugin_engine_source_snapshot(&discovery, &changed).unwrap().completion_available, "{changed}");
+        }
+        assert!(!plugin_engine_source_snapshot(&discovery, &json!({})).unwrap().completion_available);
+    }
+
+    #[test]
+    fn plugin_engine_catalogue_never_treats_present_invalid_files_flag_as_legacy() {
+        let (discovery, state) = legacy_catalogue();
+        for files in [json!(false), Value::Null, json!("true"), json!(1), json!({}), json!([])] {
+            let mut changed = discovery.clone();
+            changed["models"]["llm"][0]["files_present"] = files;
+            assert!(!plugin_engine_source_snapshot(&changed, &state).unwrap().completion_available, "{changed}");
+        }
+    }
+
+    #[test]
+    fn plugin_engine_catalogue_modern_true_requires_residency_and_refuses_explicit_pause() {
+        let (mut discovery, mut state) = legacy_catalogue();
+        discovery["models"]["llm"][0]["files_present"] = json!(true);
+        discovery["models"]["llm"][0].as_object_mut().unwrap().remove("loaded");
+        state["llm"].as_object_mut().unwrap().remove("paused_for_media");
+        assert!(plugin_engine_source_snapshot(&discovery, &state).unwrap().completion_available);
+        state["llm"]["paused_for_media"] = json!(true);
+        let paused = plugin_engine_source_snapshot(&discovery, &state).unwrap();
+        assert!(!paused.completion_available);
+        assert!(paused.unavailable_reason.unwrap().contains("paused for media"));
+        state["llm"]["paused_for_media"] = json!(false);
+        assert!(plugin_engine_source_snapshot(&discovery, &state).unwrap().completion_available);
+        state["llm"]["resident"] = json!("other");
+        assert!(!plugin_engine_source_snapshot(&discovery, &state).unwrap().completion_available);
+        state["llm"]["resident"] = json!("selected");
+        state["llm"]["state"] = json!("stopped");
+        assert!(!plugin_engine_source_snapshot(&discovery, &state).unwrap().completion_available);
+    }
+
+    #[test]
+    fn plugin_engine_catalogue_requires_a_bounded_default_in_the_catalogue() {
+        let (mut discovery, state) = legacy_catalogue();
+        discovery["models"]["llm"].as_array_mut().unwrap().push(json!({"id": "other", "loaded": true}));
+        discovery["defaults"]["llm"] = json!("other");
+        assert!(!plugin_engine_source_snapshot(&discovery, &state).unwrap().completion_available);
+        for selected in ["unknown".to_string(), "".to_string(), "x".repeat(257), "bad\nmodel".to_string()] {
+            discovery["defaults"]["llm"] = json!(selected);
+            assert!(plugin_engine_source_snapshot(&discovery, &state).is_err());
+        }
     }
 
     // ---- ChatGPT's streamed answer, against a fake codex ----

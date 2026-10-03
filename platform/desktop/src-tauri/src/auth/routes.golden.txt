@@ -312,6 +312,12 @@ POST /api/plugins/:id/trust scope:plugins.install 1 all  # added since the appen
 GET /api/plugins/:id/ai/sources scope:ai.read 1 all  # added since the appendix
 POST /api/plugins/:id/ai/complete scope:ai.use 1 all  # added since the appendix
 POST /api/plugins/:id/ai/cancel scope:ai.use 1 all  # added since the appendix
+GET /api/plugins/:id/voice/status scope:services.read 1 all  # added since the appendix
+POST /api/plugins/:id/voice/open scope:speech.use 1 all  # added since the appendix
+POST /api/plugins/:id/voice/transcribe scope:speech.use 1 all  # added since the appendix
+POST /api/plugins/:id/voice/speak scope:speech.use 1 all  # added since the appendix
+POST /api/plugins/:id/voice/cancel scope:speech.use 1 all  # added since the appendix
+POST /api/plugins/:id/voice/close scope:speech.use 1 all  # added since the appendix
 GET /api/messages/:id scope:calls.read 1 all  # added since the appendix
 DELETE /api/messages/:id scope:calls.manage 1 all  # added since the appendix
 GET /api/ring/preview scope:calls.read 1 all  # added since the appendix

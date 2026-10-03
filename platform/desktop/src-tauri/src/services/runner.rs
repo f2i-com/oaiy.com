@@ -226,6 +226,19 @@ impl Runner {
         self.child.lock().map(|g| g.is_some()).unwrap_or(false)
     }
 
+    /// Current OS process liveness, without starting/replacing a process.
+    /// A scoped service lease fails closed before a supervisor tick, including
+    /// when another listener could otherwise reuse an exited child's port.
+    pub(crate) fn is_running(&self) -> bool {
+        let Ok(mut slot) = self.child.lock() else {return false;};
+        let Some(child) = slot.as_mut() else {return false;};
+        match child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(_)) => {*slot = None; false},
+            Err(_) => false,
+        }
+    }
+
     /// Send SIGTERM (Unix) or TerminateProcess (Windows) and wait briefly.
     /// Returns Ok even if the child was already gone.
     pub fn stop(&self) -> std::io::Result<()> {
@@ -324,6 +337,20 @@ mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn scoped_service_liveness_observes_real_child_exit_before_a_supervisor_tick() {
+        struct Owned(Runner);
+        impl Drop for Owned {fn drop(&mut self){let _=self.0.stop();}}
+        let args=vec!["-e".into(),"setInterval(function(){},1000)".into()];
+        let env=HashMap::new();
+        let owned=Owned(Runner::spawn(SpawnConfig{command:if cfg!(windows){"node.exe"}else{"node"},args:&args,env:&env,cwd:None}).expect("Node is required for the real process liveness fixture"));
+        assert!(owned.0.is_running());
+        owned.0.child.lock().unwrap().as_mut().unwrap().kill().unwrap();
+        let start=Instant::now();
+        while owned.0.is_running() && start.elapsed()<Duration::from_secs(2) {std::thread::sleep(Duration::from_millis(10));}
+        assert!(!owned.0.is_running());assert!(!owned.0.is_alive());
+    }
 
     #[test]
     fn oaiy_tokens_are_recognised_by_name_and_only_those() {

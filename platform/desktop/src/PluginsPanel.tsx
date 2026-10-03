@@ -213,16 +213,22 @@ export default function PluginsPanel() {
   const trustPlugin = useCallback(
     async (p: PluginRecord) => {
       const name = p.manifest?.name ?? p.id;
+      const declaresAi = p.manifest?.capabilities?.includes('oaiy.ai.complete') === true;
+      const declaresVoice = p.manifest?.capabilities?.includes('oaiy.voice.session') === true;
       if (
         !confirm(
-          `Trust the “${name}” plugin?\n\nIt is not signed, so OAIY cannot tell who made it. Trusting it lets it run as native code with your permissions. ` +
-            'The trust is for this exact package only: if any of its files change, you are asked again.\n\nOnly trust a plugin you built yourself or got from someone you trust.',
+          `Trust the "${name}" plugin?\n\nIt is not signed, so OAIY cannot tell who made it. Trusting it lets it run as native code with your permissions. ` +
+            'The trust is for this exact package only: if any of its files change, you are asked again.\n\n' +
+            (declaresAi ? 'This package declares AI completion access to your configured providers. Trusting it enables that access.\n\n' : '') +
+            (declaresVoice ? 'This package declares local voice session access. Trusting it permits ready local speech; microphone capture still requires explicit consent in each session and native microphone permission.\n\n' : '') +
+            'Only trust a plugin you built yourself or got from someone you trust.',
         )
       )
         return;
       await runAction(p.id, async () => {
         await plugins.trust(p.id);
-        toast.push({ kind: 'success', title: `Trusted ${name}`, body: 'Click Start to run it.' });
+        const running = p.state === 'running' || p.state === 'unhealthy' || p.state === 'starting';
+        toast.push({ kind: 'success', title: `Trusted ${name}`, body: running ? (declaresAi ? 'Return to the plugin and read its host models again.' : 'The plugin is already running.') : 'Click Start to run it.' });
       });
     },
     [runAction, toast],
@@ -395,7 +401,7 @@ interface CardProps {
   onStop: () => void;
   onToggleEnabled: () => void;
   onViewLogs: () => void;
-  /** Trust this exact, unsigned package (offered only when a release build is holding it back). */
+  /** Trust this exact, unsigned package, including one running in a developer build. */
   onTrust: () => void;
   onUninstall: () => void;
 }
@@ -421,6 +427,8 @@ function PluginCard({
   // unsigned one can, and only this build's policy holds it back.
   const quarantined = p.trust?.state === 'quarantined';
   const unsigned = p.trust?.state === 'unsigned';
+  const unsignedDev = p.trust?.state === 'unsigned-dev';
+  const canTrust = unsigned || unsignedDev;
   const heldBack = quarantined || unsigned;
   const connectorCount =
     p.manifest?.connectors?.reduce((n, c) => n + c.commands.length, 0) ?? 0;
@@ -493,6 +501,11 @@ function PluginCard({
         </p>
       )}
 
+      {unsignedDev && p.manifest?.capabilities?.includes('oaiy.ai.complete') && (
+        <p className="card-meta">This developer build lets the unsigned plugin run. Its AI access requires you to trust this exact package.</p>
+      )}
+      {unsignedDev && p.manifest?.capabilities?.includes('oaiy.voice.session') && <p className="card-meta">Its local voice access requires you to trust this exact package. Microphone capture needs explicit consent in each session.</p>}
+
       <div className="card-actions">
         {pending ? (
           <button className="btn btn-secondary" disabled>
@@ -523,9 +536,9 @@ function PluginCard({
           </button>
         )}
 
-        {/* Only for a package nobody signed, in a build that holds it back. A package
+        {/* Only for a package nobody signed, including one allowed to run in development. A package
             that carries a signature is verified or quarantined by that signature alone. */}
-        {unsigned && !pending && (
+        {canTrust && !pending && (
           <button className="btn btn-secondary" onClick={onTrust} title="Let this exact package run. A change to any of its files asks again.">
             <ShieldCheck size={14} /> Trust this plugin
           </button>

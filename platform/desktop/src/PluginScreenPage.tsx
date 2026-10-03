@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { TriangleAlert } from 'lucide-react';
 import {
   API_BASE,
@@ -15,6 +15,9 @@ import { useToast } from './Toasts';
 import { moduleOn, useModules } from './useModules';
 import { serializePluginCallError, unwrapPluginCommandResponse, type PluginErrorDetails } from './pluginRpc';
 import { PluginAiSession } from './pluginAi';
+import { PluginVoiceSession, type VoiceView } from './pluginVoice';
+import { PluginVoiceControls } from './PluginVoiceControls';
+import { PluginScreenDocument } from './pluginScreenRpc';
 
 /**
  * Host for a plugin-contributed screen.
@@ -186,9 +189,43 @@ export const SCREEN_BASE_CSS =
  *  runs before any transform, and self-contained: the iframe has no imports. */
 export const HOST_BOOTSTRAP = `
 (function () {
+  var documentNonce = own(window, '__oaiyDocumentNonce');
+  delete window.__oaiyDocumentNonce;
+  var documentActive = typeof documentNonce === 'string' && /^[a-zA-Z0-9-]{16,100}$/.test(documentNonce);
+  var transport = documentActive && typeof window.MessageChannel === 'function' ? new window.MessageChannel() : null;
+  if (!transport) documentActive = false;
+  function post(value) { if (transport) transport.port1.postMessage(value); }
   var seq = 0;
   var pending = Object.create(null);
   var subs = [];
+  var voiceSubs = [];
+  var voiceSessions = Object.create(null);
+  function voiceEvent(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(function (key) {
+      return ['sessionId','requestId','type','text','code','message','elapsedMs'].indexOf(key) < 0;
+    })) return null;
+    var sessionId = own(value, 'sessionId');
+    var session = voiceSessions[sessionId];
+    var type = own(value, 'type');
+    var requestId = own(value, 'requestId');
+    if (typeof sessionId !== 'string' || !session || ['enabled','recording','transcribing','transcript','speaking','finished','cancelled','closed','failed'].indexOf(type) < 0 ||
+        (requestId !== undefined && (typeof requestId !== 'string' || !session[requestId])) ||
+        (['recording','transcribing','transcript','speaking','finished','cancelled'].indexOf(type) >= 0 && !requestId)) return null;
+    var text = own(value, 'text'); var code = own(value, 'code'); var message = own(value, 'message'); var elapsed = own(value, 'elapsedMs');
+    if ((type === 'transcript' && (typeof text !== 'string' || !text.trim() || text.length > 4000 || Array.from(text).length > 2000 || !requestId)) ||
+        (type !== 'transcript' && text !== undefined) ||
+        (code !== undefined && (typeof code !== 'string' || !/^[a-zA-Z0-9_.:-]{1,64}$/.test(code))) ||
+        (message !== undefined && (typeof message !== 'string' || message.length > 300)) ||
+        (elapsed !== undefined && (typeof elapsed !== 'number' || !Number.isFinite(elapsed) || elapsed < 0 || elapsed > 15000))) return null;
+    return value;
+  }
+  function voiceRequest(method, request) {
+    var session = request && typeof request.sessionId === 'string' && voiceSessions[request.sessionId];
+    var id = request && request.requestId;
+    if (!session || typeof id !== 'string' || !/^[a-zA-Z0-9_.:-]{1,96}$/.test(id) || Object.keys(session).length >= 512 || session[id]) return Promise.reject(new Error('Supply a current voice session and fresh bounded request ID.'));
+    session[id] = true;
+    return call(method, [request]).catch(function (error) {delete session[id];throw error;});
+  }
   function own(value, key) {
     if (!value || typeof value !== 'object') return undefined;
     var descriptor = Object.getOwnPropertyDescriptor(value, key);
@@ -222,17 +259,18 @@ export const HOST_BOOTSTRAP = `
   // this ran (a wizard step). Absent on an ordinary screen.
   var SETUP = window.__oaiySetup && typeof window.__oaiySetup === 'object' ? window.__oaiySetup : null;
   function call(method, args) {
+    if (!documentActive) return Promise.reject(new Error('This plugin document is no longer current. Reopen it from OAIY.'));
     return new Promise(function (resolve, reject) {
       var id = 'r' + ++seq;
       pending[id] = { resolve: resolve, reject: reject };
       pending[id].timer = setTimeout(function () {
         delete pending[id];
         if (method === 'aiComplete' && args && args[0] && typeof args[0].requestId === 'string') {
-          parent.postMessage({ __pluginHost: 1, id: 'cancel-' + id, method: 'aiCancel', args: [args[0].requestId] }, '*');
+          post({ __pluginHost: 1, documentNonce: documentNonce, id: 'cancel-' + id, method: 'aiCancel', args: [args[0].requestId] });
         }
         reject(new Error('The desktop did not respond. The outcome may be unknown; check its status before trying the action again.'));
       }, 20000);
-      parent.postMessage({ __pluginHost: 1, id: id, method: method, args: args || [] }, '*');
+      post({ __pluginHost: 1, documentNonce: documentNonce, id: id, method: method, args: args || [] });
     });
   }
   // The plugin document is opaque-origin, so the host cannot reach in and
@@ -247,14 +285,22 @@ export const HOST_BOOTSTRAP = `
     else el.classList.remove('fl-dark');
     el.setAttribute('data-theme', mode === 'dark' ? 'dark' : 'light');
   }
-  window.addEventListener('message', function (e) {
-    if (e.source !== parent) return;
+  if (transport) transport.port1.addEventListener('message', function (e) {
     var m = e.data;
-    if (own(m, '__pluginHost') !== 1) return;
+    if (!documentActive || own(m, '__pluginHost') !== 1 || own(m, 'documentNonce') !== documentNonce) return;
     if (m.theme) { applyTheme(m.theme); return; }
     // The page's gutters: the screen runs edge to edge and draws them itself.
     // Not in a wizard step, whose pane draws its own padding (the gutter stays 0).
     if (m.gutter) { if (!SETUP) document.documentElement.style.setProperty('--host-page-pad', m.gutter); return; }
+    if (m.voiceEvent) {
+      var event = voiceEvent(m.voiceEvent);
+      if (event) {
+        if (['transcript','finished','cancelled','failed'].indexOf(event.type) >= 0 && event.requestId) delete voiceSessions[event.sessionId][event.requestId];
+        voiceSubs.forEach(function (s) {try {s(event);} catch (_) {}});
+        if (event.type === 'closed') delete voiceSessions[event.sessionId];
+      }
+      return;
+    }
     if (m.event) { subs.forEach(function (s) { try { s(m.event); } catch (_) {} }); return; }
     var id = own(m, 'id');
     if (typeof id !== 'string' || !Object.prototype.hasOwnProperty.call(pending, id)) return;
@@ -270,6 +316,20 @@ export const HOST_BOOTSTRAP = `
       p.reject(error);
     }
   });
+  if (transport) {
+    transport.port1.start();
+    parent.postMessage({__pluginHost:1,documentNonce:documentNonce,id:'document-connect',method:'document.connect',args:[]},'*',[transport.port2]);
+  }
+  function retireDocument() {
+    if (!documentActive) return;
+    documentActive = false;
+    post({__pluginHost:1,documentNonce:documentNonce,id:'document-close',method:'document.close',args:[]});
+    Object.keys(pending).forEach(function (id) {var request=pending[id];delete pending[id];clearTimeout(request.timer);request.reject(new Error('The plugin document closed. Pending delivery was cancelled; an action already sent may still finish.'));});
+    subs=[];voiceSubs=[];voiceSessions=Object.create(null);
+    if (transport) transport.port1.close();
+  }
+  window.addEventListener('pagehide',retireDocument,{once:true});
+  window.addEventListener('beforeunload',retireDocument,{once:true});
   window.PluginHost = {
     command: function (name, payload) { return call('command', [name, payload]); },
     toast: function (kind, message) { return call('toast', [kind, message]); },
@@ -277,6 +337,19 @@ export const HOST_BOOTSTRAP = `
     aiSources: function () { return call('aiSources', []); },
     aiComplete: function (request) { return call('aiComplete', [request]); },
     aiCancel: function (requestId) { return call('aiCancel', [requestId]); },
+    voice: {
+      status: function () { return call('voice.status', []); },
+      open: function () { return call('voice.open', []).then(function (session) {voiceSessions[session.sessionId] = Object.create(null); return session;}); },
+      record: function (request) { return voiceRequest('voice.record', request); },
+      speak: function (request) { return voiceRequest('voice.speak', request); },
+      cancel: function (request) { return call('voice.cancel', [request]); },
+      close: function (sessionId) { return call('voice.close', [sessionId]).then(function (result) {delete voiceSessions[sessionId]; return result;}); },
+      subscribe: function (cb) {
+        if (typeof cb !== 'function') return Promise.reject(new Error('Supply a voice event callback.'));
+        voiceSubs.push(cb);
+        return call('voice.subscribe', []).then(function () {return {unsubscribe:function () {voiceSubs = voiceSubs.filter(function (s) {return s !== cb;}); if (!voiceSubs.length) call('voice.unsubscribe', []).catch(function () {});}};},function (error) {voiceSubs = voiceSubs.filter(function (s) {return s !== cb;});throw error;});
+      }
+    },
     restartPlugin: function () { return call('restartPlugin', []); },
     // Open one of the dashboard's own pages ('agent', 'calendar', 'engines',
     // ...). The frame cannot navigate itself out of the sandbox, so the host
@@ -356,6 +429,8 @@ function attr(text: string): string {
 
 /** The pieces of a plugin screen's document. */
 export interface ScreenParts {
+  /** Private transport identity, consumed before plugin scripts execute. */
+  documentNonce?: string;
   /** The screen's body fragment. */
   body: string;
   /** Its css, then the host's fonts. */
@@ -379,6 +454,7 @@ export interface ScreenParts {
  * `PluginHost.setup`), and a gutter of 0 (the wizard pane draws its own).
  */
 export function assembleScreenDocument(parts: ScreenParts): string {
+  const documentNonce = parts.documentNonce ?? crypto.randomUUID();
   const theme = parts.dark ? ' class="fl-dark" data-theme="dark"' : ' data-theme="light"';
   const setupAttr = parts.setup ? ` data-oaiy-setup="${attr(parts.setup.view)}"` : '';
   const pad = parts.setup ? '0' : parts.gutter;
@@ -387,12 +463,15 @@ export function assembleScreenDocument(parts: ScreenParts): string {
     ? `<script>window.__oaiySetup=${JSON.stringify({ mode: 'setup', step: parts.setup.step, view: parts.setup.view }).replace(/</g, '\\u003c')};</script>`
     : '';
   const scripts = parts.scripts.map((s) => `<script>${s.replace(/<\/script/gi, '<\\/script')}</script>`).join('');
+  // Plugin CSS must stay raw text: closing the style tag could run code before
+  // the document bootstrap consumes its nonce and transfers the private port.
+  const styles = `${SCREEN_BASE_CSS}\n${parts.fonts}\n${parts.css}`.replace(/<\/style/gi, '<\\/style');
   return (
     `<!doctype html><html${theme}${setupAttr} style="--host-page-pad: ${attr(pad)}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">` +
     // No external anything: the plugin ships inline SVG and its own CSS.
     `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'">` +
-    `<style>${SCREEN_BASE_CSS}\n${parts.fonts}\n${parts.css}</style>${stamp}</head><body>${parts.body}` +
-    `<script>${HOST_BOOTSTRAP}</script>${scripts}</body></html>`
+    `<style>${styles}</style>${stamp}<script>window.__oaiyDocumentNonce=${JSON.stringify(documentNonce).replace(/</g, '\\u003c')};</script></head><body>` +
+    `<script>${HOST_BOOTSTRAP}</script>${parts.body}${scripts}</body></html>`
   );
 }
 
@@ -422,15 +501,20 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
   const recordRef = useRef(record);
   recordRef.current = record;
   const aiSession = useRef<PluginAiSession | null>(null);
+  const voiceSession = useRef<PluginVoiceSession | null>(null);
+  const [voiceView, setVoiceView] = useState<VoiceView | null>(null);
   // The manifest selects and assembles the iframe once. Runtime status changes
   // separately so a health refresh cannot remount a call console or transcript.
   const [runtimeStatus, setRuntimeStatus] = useState<Pick<PluginRecord, 'state' | 'reason'> | null>();
   const snapshotGeneration = useRef(0);
   const snapshotSequence = useRef(0);
-  const [doc, setDoc] = useState<string | null>(null);
+  const [doc, setDoc] = useState<{ html: string; nonce: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
   const frameRef = useRef<HTMLIFrameElement>(null);
+  const documentChannel = useRef<PluginScreenDocument | null>(null);
+  const documentLoads = useRef<{ nonce: string; count: number } | null>(null);
+  const [documentRevoked, setDocumentRevoked] = useState(false);
   /** Event names the screen subscribed to, and the poll cursor. */
   const subscribed = useRef<string[]>([]);
   const cursor = useRef<number>(0);
@@ -510,7 +594,9 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
         // theme flip would re-assemble srcdoc and remount the plugin — losing a
         // live call console mid-call to change a colour.
         const dark = document.documentElement.getAttribute('data-theme') !== 'light';
-        setDoc(assembleScreenDocument({ body, css, fonts, scripts: sources, dark, gutter: pageGutter(), setup: setupContext }));
+        const nonce = crypto.randomUUID();
+        documentLoads.current = { nonce, count: 0 };
+        setDoc({ nonce, html: assembleScreenDocument({ body, css, fonts, scripts: sources, dark, gutter: pageGutter(), setup: setupContext, documentNonce: nonce }) });
         setError(null);
       } catch (e) {
         if (!cancelled) setError(controller.signal.aborted ? 'Loading took too long. Check the desktop connection and try again.' : e instanceof Error ? e.message : String(e));
@@ -527,7 +613,8 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
 
   /** Service one RPC from the screen. */
   const handleCall = useCallback(
-    async (method: string, args: unknown[]): Promise<unknown> => {
+    async (method: string, args: unknown[], signal: AbortSignal): Promise<unknown> => {
+      signal.throwIfAborted();
       switch (method) {
         case 'command': {
           const [name, payload] = args as [string, unknown];
@@ -536,6 +623,7 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
           // fresh key per user action is the correct semantics for the rest.
           const key = `ui-${name}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
           const res = await bridge.connectorRequest(pluginId, name, payload, key);
+          signal.throwIfAborted();
           return unwrapPluginCommandResponse(res);
         }
         case 'toast': {
@@ -551,6 +639,7 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
           const sequence = ++snapshotSequence.current;
           const snap = await plugins.list();
           const current = snap.plugins.find((p) => p.id === pluginId) ?? null;
+          signal.throwIfAborted();
           if (generation === snapshotGeneration.current && sequence === snapshotSequence.current) {
             setRuntimeStatus((previous) => {
               if (!current) return null;
@@ -573,8 +662,26 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
         case 'aiCancel':
           if (args.length !== 1 || !aiSession.current) throw new Error('The AI completion screen is unavailable.');
           return await aiSession.current.cancel(args[0]);
+        case 'voice.status': case 'voice.open': case 'voice.record': case 'voice.speak': case 'voice.cancel': case 'voice.close': case 'voice.subscribe': case 'voice.unsubscribe': {
+          const session = voiceSession.current;
+          if (!session || !recordRef.current?.manifest?.capabilities?.includes('oaiy.voice.session')) throw new Error('The plugin does not declare the voice session capability.');
+          const methodName = method.slice(6);
+          const needsArgument = ['record','speak','cancel','close'].includes(methodName);
+          if (args.length !== (needsArgument ? 1 : 0)) throw new Error('Supply the bounded voice session arguments.');
+          switch (methodName) {
+            case 'status': return await session.status();
+            case 'open': return await session.open();
+            case 'record': return session.record(args[0]);
+            case 'speak': return session.speak(args[0]);
+            case 'cancel': return await session.cancel(args[0]);
+            case 'close': return await session.close(args[0]);
+            case 'subscribe': return session.subscribe();
+            default: return session.unsubscribe();
+          }
+        }
         case 'restartPlugin':
           await plugins.stop(pluginId).catch(() => {});
+          signal.throwIfAborted();
           await plugins.start(pluginId);
           return true;
         case 'navigate': {
@@ -611,7 +718,9 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
           const [names] = args as [string[]];
           subscribed.current = Array.isArray(names) ? names : [];
           // Start from the tail so a screen doesn't replay history on open.
-          cursor.current = (await bridge.events(0, 1)).next;
+          const tail = await bridge.events(0, 1);
+          signal.throwIfAborted();
+          cursor.current = tail.next;
           return true;
         }
         // The setup wizard's calls: only a wizard step answers them.
@@ -650,7 +759,7 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
   useEffect(() => {
     const send = () => {
       const mode = document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark';
-      frameRef.current?.contentWindow?.postMessage({ __pluginHost: 1, theme: mode }, '*');
+      documentChannel.current?.post({ theme: mode });
     };
     const observer = new MutationObserver(send);
     observer.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
@@ -664,40 +773,68 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
   // wizard step: its pane draws its own padding, and the screen's stays 0.
   useEffect(() => {
     if (setupContext) return;
-    const send = () => frameRef.current?.contentWindow?.postMessage({ __pluginHost: 1, gutter: pageGutter() }, '*');
+    const send = () => documentChannel.current?.post({ gutter: pageGutter() });
     window.addEventListener('resize', send);
     send();
     return () => window.removeEventListener('resize', send);
   }, [doc, setupContext]);
 
   // RPC pump: only messages from OUR iframe are serviced.
-  useEffect(() => {
+  useLayoutEffect(() => {
+    if (!doc) return;
     let active = true;
     const session = new PluginAiSession(pluginId, API_BASE);
     aiSession.current = session;
-    const onMessage = (e: MessageEvent) => {
-      const m = e.data as { __pluginHost?: number; id?: string; method?: string; args?: unknown[] };
+    const ownedFrame = frameRef.current;
+    const ownedSource = ownedFrame?.contentWindow;
+    const channel = new PluginScreenDocument(doc.nonce, ownedSource ?? null, () => {
+      active = false;
+      session.dispose();
+      voice.dispose();
+      subscribed.current = []; cursor.current = 0;
+      snapshotGeneration.current++;
+      if (aiSession.current === session) aiSession.current = null;
+      if (voiceSession.current === voice) voiceSession.current = null;
+      setVoiceView(null); setDocumentRevoked(true);
+    });
+    documentChannel.current = channel; setDocumentRevoked(false);
+    const voice = new PluginVoiceSession(pluginId, API_BASE, (event) => {
+      if (active && ownedFrame && frameRef.current === ownedFrame && ownedFrame.contentWindow === ownedSource) channel.post({ voiceEvent: event });
+    }, view => {if (active) setVoiceView(view);});
+    voiceSession.current = voice;
+    setVoiceView(null);
+    if (documentLoads.current?.nonce === doc.nonce) {
+      for (let i = 0; i < documentLoads.current.count; i++) channel.loaded();
+    }
+    const onCall = (e: MessageEvent) => {
+      const m = e.data as { __pluginHost?: number; documentNonce?: string; id?: string; method?: string; args?: unknown[] };
       if (!m || m.__pluginHost !== 1 || typeof m.id !== 'string' || !m.id || m.id.length > 128 ||
           typeof m.method !== 'string' || !m.method || (m.args !== undefined && !Array.isArray(m.args))) return;
       const frame = frameRef.current;
-      if (!frame || e.source !== frame.contentWindow) return;
+      if (!frame || channel.signal.aborted) return;
+      if (m.method === 'document.close') { channel.revoke(); return; }
       const source = frame.contentWindow;
       const id = m.id;
       const reply = (result: { ok: true; data: unknown } | { ok: false; error: string; errorDetails?: PluginErrorDetails }) => {
         // A reply belongs to this mounted document, never to a replacement screen.
         if (active && frameRef.current === frame && frame.contentWindow === source) {
-          source?.postMessage({ __pluginHost: 1, id, ...result }, '*');
+          channel.post({ id, ...result });
         }
       };
-      handleCall(m.method, m.args ?? [])
+      handleCall(m.method, m.args ?? [], channel.signal)
         .then((data) => reply({ ok: true, data }))
         .catch((err) => reply({ ok: false, ...serializePluginCallError(err) }));
     };
+    const onMessage = (event: MessageEvent) => {
+      const data = event.data;
+      if (data?.__pluginHost === 1 && data.method === 'document.connect') channel.connect(event, onCall);
+    };
     window.addEventListener('message', onMessage);
     return () => {
-      active = false;
-      session.dispose();
+      channel.revoke();
+      if (documentChannel.current === channel) documentChannel.current = null;
       if (aiSession.current === session) aiSession.current = null;
+      if (voiceSession.current === voice) voiceSession.current = null;
       window.removeEventListener('message', onMessage);
     };
   }, [handleCall, attempt, doc, pluginId]);
@@ -708,15 +845,18 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
     let cancelled = false;
     const id = window.setInterval(async () => {
       if (busy || document.hidden || subscribed.current.length === 0) return;
+      const channel = documentChannel.current;
+      if (!channel || channel.signal.aborted) return;
+      const names = [...subscribed.current];
       busy = true;
       try {
         const res = await bridge.events(cursor.current, 100);
-        if (cancelled) return;
+        if (cancelled || channel.signal.aborted || documentChannel.current !== channel) return;
         cursor.current = res.next;
         for (const e of res.events) {
           const env = e.envelope as { name?: string };
-          if (env?.name && subscribed.current.includes(env.name)) {
-            frameRef.current?.contentWindow?.postMessage({ __pluginHost: 1, event: env }, '*');
+          if (env?.name && names.includes(env.name)) {
+            channel.post({ event: env });
           }
         }
       } catch {
@@ -726,7 +866,7 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
       }
     }, 2000);
     return () => { cancelled = true; window.clearInterval(id); };
-  }, [attempt]);
+  }, [attempt, doc]);
 
   if (error) {
     return (
@@ -791,15 +931,23 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
           </span>
         </div>
       )}
+      <PluginVoiceControls view={voiceView} session={voiceSession.current} pluginName={record.manifest?.name ?? record.id} />
+      {documentRevoked && <div className="banner banner-err" role="alert">This plugin document navigated or closed. Its voice permission and pending deliveries were revoked. Reopen the screen from OAIY to continue; actions already sent may still finish.</div>}
       {doc === null ? (
         <div className="empty-state" role="status">Loading screen…</div>
       ) : (
         <iframe
-          key={attempt}
+          key={`${attempt}:${doc.nonce}`}
           ref={frameRef}
           className="plugin-screen"
           title={screen.title ?? screenId ?? navId}
-          srcDoc={doc}
+          srcDoc={doc.html}
+          onLoad={() => {
+            const loads = documentLoads.current;
+            if (loads?.nonce !== doc.nonce) return;
+            loads.count++;
+            if (documentChannel.current?.nonce === doc.nonce) documentChannel.current.loaded();
+          }}
           /* allow-scripts WITHOUT allow-same-origin: the screen runs at an opaque
              origin, so it has no access to the host's storage or the local API
              except through the PluginHost bridge above. */

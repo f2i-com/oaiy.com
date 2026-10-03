@@ -10,6 +10,8 @@ vi.mock('./api', () => ({
 vi.mock('./Toasts', () => ({ useToast: () => toast }));
 
 import PluginScreenPage from './PluginScreenPage';
+import { testMessageEvent, testPorts } from './pluginScreenRpc.testTransport';
+const transports = new WeakMap<HTMLIFrameElement, ReturnType<typeof testPorts>>();
 
 const plugin = (state: string, reason?: string) => ({
   id: 'aokie', state, reason,
@@ -51,10 +53,13 @@ async function mount() {
 }
 
 function snapshot(frame: HTMLIFrameElement, id: string) {
-  window.dispatchEvent(new MessageEvent('message', {
-    source: frame.contentWindow,
-    data: { __pluginHost: 1, id, method: 'snapshot', args: [] },
-  }));
+  const nonce = JSON.parse(frame.srcdoc.match(/window\.__oaiyDocumentNonce=("[^"]+")/)![1]);
+  let ports = transports.get(frame);
+  if (!ports) {
+    ports = testPorts(); transports.set(frame, ports);
+    window.dispatchEvent(testMessageEvent({ source: frame.contentWindow, ports: [ports.port2 as unknown as MessagePort], data: { __pluginHost: 1, documentNonce: nonce, method: 'document.connect' } }));
+  }
+  ports.port1.postMessage({ __pluginHost: 1, documentNonce: nonce, id, method: 'snapshot', args: [] });
 }
 
 describe('plugin screen runtime status', () => {
