@@ -31,7 +31,7 @@ use std::sync::Mutex;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::link::{purge_asides, put_aside, read_stored, reread, LinkError, Reread};
+use crate::link::{purge_asides, put_aside, put_aside_to_forget, read_stored, reread, LinkError, Reread};
 use crate::secret_file::{Patience, Retry};
 
 /// The folder of these files, under the data folder.
@@ -262,6 +262,18 @@ impl<T: serde::de::DeserializeOwned> Slot<T> {
         Ok(())
     }
 
+    /// [`Slot::put_unusable_aside`] for a file that is being forgotten and not written over: it is moved or it is an error, and
+    /// never copied, because a copy beside an original that stays is a link that is not forgotten. The slot is left as it was
+    /// (the file is still there, and is read again if another program held it) when the move cannot be made. `true` is that what
+    /// was moved is kept aside, and `false` that it was a link after all (a program let go of it between the read and the move)
+    /// and its copy was removed: see [`put_aside_to_forget`].
+    fn forget_unusable(&mut self, dir: &Path) -> Result<bool, String> {
+        let kept = put_aside_to_forget::<T>(&dir.join(self.name), &self.shown()).map_err(|why| format!("the relay link could not be forgotten: {why}. It is still stored here, and would be used again at the next start. Close whatever has it open and try again."))?;
+        self.error = None;
+        self.retry = None;
+        Ok(kept)
+    }
+
     fn get(&self) -> Result<Option<&T>, LinkError> {
         match &self.error {
             Some(e) => Err(e.clone()),
@@ -361,17 +373,18 @@ impl RelayStore {
     }
 
     /// Forget the relay link: the file is removed first, and one that cannot be removed is an error and stays in
-    /// force. A file that could not be used is put aside, not thrown away. The copies kept of earlier unusable files
+    /// force. A file that could not be used is put aside, not thrown away, and one that cannot be moved aside is an
+    /// error too (it is never copied and left where it is: the token would stay). The copies kept of earlier unusable files
     /// (`relay.json.corrupt`, ...) are removed with the link: they can hold its token.
     pub fn forget_relay(&self) -> Result<(), String> {
         let mut held = self.held();
         let (path, shown) = (self.dir.join(RELAY_FILE), held.relay.shown());
         held.relay.refresh(&self.dir, true);
-        let put_aside_now = held.relay.error.is_some();
-        if put_aside_now {
-            // The read that decided is the one that is acted on: a file that is let go of since is moved aside all the same,
-            // and not left where it was with its token while the link is said to be forgotten.
-            held.relay.put_unusable_aside(&self.dir)?;
+        let mut kept_aside = false;
+        if held.relay.error.is_some() {
+            // The read that decided is the one that is acted on: a file that is let go of since is moved aside all the same, and
+            // what was moved is read where it is: a link (the token is in it) is removed, and what cannot be read is kept.
+            kept_aside = held.relay.forget_unusable(&self.dir)?;
         } else {
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
@@ -380,7 +393,7 @@ impl RelayStore {
             }
         }
         held.relay.value = None;
-        if put_aside_now {
+        if kept_aside {
             return Ok(());
         }
         purge_asides(&path).map_err(|left| format!("the relay link was forgotten, but {left} could not be removed: a copy that was kept of it can hold its token"))
@@ -729,6 +742,97 @@ mod tests {
         assert!(store.problems().is_empty() && store.relay().unwrap().is_none());
     }
 
+    #[test]
+    fn a_relay_file_that_cannot_be_moved_aside_is_not_forgotten_and_not_copied() {
+        // As the provider link's: the token is in the file, and a copy beside an original that stays is a link that is not
+        // forgotten. `forget_relay` answered Ok with `relay.json` still in the folder.
+        let dir = TempDir::new("relay-forget-held-move");
+        let folder = folder(&dir);
+        std::fs::write(folder.join("relay.json"), b"{ not json").unwrap();
+        let store = RelayStore::open(&dir.0);
+        assert_eq!(store.problems().len(), 1);
+        let held = crate::link::held_files::hold(&folder.join("relay.json"));
+
+        let refused = store.forget_relay().unwrap_err();
+        assert!(refused.starts_with("the relay link could not be forgotten: relay/relay.json could not be moved aside"), "{refused}");
+        assert_eq!(std::fs::read(folder.join("relay.json")).unwrap(), b"{ not json", "the file is where it was");
+        assert!(!folder.join("relay.json.corrupt").exists(), "and no copy of it was made");
+        assert_eq!(store.problems().len(), 1, "and it is still said of it that it cannot be used");
+
+        drop(held);
+        store.forget_relay().unwrap();
+        assert_eq!(std::fs::read(folder.join("relay.json.corrupt")).unwrap(), b"{ not json");
+        assert!(!folder.join("relay.json").exists() && store.problems().is_empty());
+    }
+
+    #[test]
+    fn a_relay_file_that_became_a_link_between_the_read_and_the_move_is_forgotten_and_its_copy_is_not_kept() {
+        // As the provider link's: a program lets go of a held relay.json between the read that found it unusable and the move, and
+        // what is moved is the relay link with its token in it.
+        let dir = TempDir::new("relay-let-go-before-the-move");
+        let folder = folder(&dir);
+        let file = folder.join("relay.json");
+        std::fs::create_dir(&file).unwrap();
+        let store = RelayStore::open(&dir.0);
+        assert!(store.relay().is_err(), "held");
+        let (there, text) = (file.clone(), serde_json::to_string_pretty(&StoredRelayLink::from(&relay())).unwrap());
+        crate::link::after_the_read::once(move || {
+            std::fs::remove_dir(&there).unwrap();
+            std::fs::write(&there, text).unwrap();
+        });
+
+        store.forget_relay().unwrap();
+        assert!(!file.exists(), "the file is not where it was");
+        for entry in std::fs::read_dir(&folder).unwrap().flatten() {
+            let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            assert!(!text.contains("TOPSECRETTOKEN"), "the token is in {:?}", entry.file_name());
+        }
+        assert!(store.problems().is_empty() && RelayStore::open(&dir.0).relay().unwrap().is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_relay_file_whose_hold_changes_from_no_reading_to_no_moving_is_not_forgotten() {
+        // The review's h6: the same change of hold between the read and the move as for the provider's file, with the same two
+        // answers that are allowed: not forgotten with the file where it was, or forgotten with the token nowhere in the folder.
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = TempDir::new("relay-forget-hold-changes");
+        let folder = folder(&dir);
+        let file = folder.join("relay.json");
+        RelayStore::open(&dir.0).set_relay(relay()).unwrap();
+        let exclusive = std::fs::OpenOptions::new().read(true).share_mode(0).open(&file).unwrap();
+        let store = RelayStore::open(&dir.0);
+        assert!(store.relay().is_err());
+        let swapper = {
+            let file = file.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(60));
+                drop(exclusive);
+                // FILE_SHARE_READ: no delete, no rename. The store's own attempt to move the file has it open for a moment, so this is
+                // tried again, and not at all if the file has been moved.
+                let shared = (0..200).find_map(|_| match std::fs::OpenOptions::new().read(true).share_mode(1).open(&file) {
+                    Ok(held) => Some(Some(held)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(None),
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_millis(2));
+                        None
+                    }
+                });
+                std::thread::sleep(Duration::from_millis(2500));
+                drop(shared);
+            })
+        };
+        let answer = store.forget_relay();
+        let token_in_the_folder = || std::fs::read_dir(&folder).unwrap().flatten().any(|e| std::fs::read_to_string(e.path()).unwrap_or_default().contains("TOPSECRETTOKEN"));
+        match &answer {
+            Err(_) => {
+                assert!(file.exists(), "not forgotten, and the token is where it was");
+                assert!(!folder.join("relay.json.corrupt").exists(), "and nothing was copied");
+            }
+            Ok(()) => assert!(!file.exists() && !token_in_the_folder(), "forgotten, so the token is not in the folder"),
+        }
+        swapper.join().unwrap();
+    }
     #[test]
     fn forgetting_the_relay_takes_the_copies_kept_of_it_and_no_others() {
         // A copy kept of an unusable `relay.json` can hold the token: forgetting the link is what the owner asked for.

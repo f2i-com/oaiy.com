@@ -52,26 +52,49 @@ pub use descriptor::ConnectorDescriptor;
 /// and its web app is the surface they then expect to manage this desktop from.
 /// Deriving the trusted origin FROM the link means no address is ever hardcoded
 /// and unlinking withdraws the trust in the same action.
+///
+/// The same cell, read and written by the same code, in the build and in the tests: only where the cell is kept differs
+/// ([`with_origin_cell`]), so that what the tests check of the getter and the setter is what the build runs.
+type OriginCell = std::sync::RwLock<Option<String>>;
+
 #[cfg(not(test))]
-static LINKED_ORIGIN: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+static LINKED_ORIGIN: OriginCell = std::sync::RwLock::new(None);
 // In the tests there is one cell for each thread and not one for the process: every test that links or forgets writes
 // it (most of the suite opens a link store), so a test that set it and asked a rule about it, or one that compared two
-// rules that read it, met another test's write in between, and failed one run in some.
+// rules that read it, met another test's write in between, and failed one run in some. The limit of that is the reverse
+// of its use: a test that sets the origin on its own thread and then asks a server that runs on another (a spawned task,
+// a worker of a runtime, a lane's thread) is asking an empty cell, and an assertion that the origin is NOT trusted passes
+// for that reason and none other. A test that needs the other threads to see it builds its runtime with
+// `runtime_seeing_this_threads_origin`.
 #[cfg(test)]
 thread_local! {
-    static LINKED_ORIGIN: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    static LINKED_ORIGIN: OriginCell = const { std::sync::RwLock::new(None) };
+}
+
+/// The cell of the process, or of this thread in the tests: the one place the two differ.
+#[cfg(not(test))]
+fn with_origin_cell<R>(use_cell: impl FnOnce(&OriginCell) -> R) -> R {
+    use_cell(&LINKED_ORIGIN)
+}
+
+#[cfg(test)]
+fn with_origin_cell<R>(use_cell: impl FnOnce(&OriginCell) -> R) -> R {
+    LINKED_ORIGIN.with(use_cell)
 }
 
 /// The linked provider's origin, for the origin allow-list.
-#[cfg(not(test))]
 pub fn linked_origin() -> Option<String> {
-    LINKED_ORIGIN.read().ok().and_then(|g| g.clone())
+    with_origin_cell(|cell| cell.read().ok().and_then(|g| g.clone()))
 }
 
-/// The linked provider's origin, for the origin allow-list: this thread's, in the tests.
-#[cfg(test)]
-pub fn linked_origin() -> Option<String> {
-    LINKED_ORIGIN.with(|cell| cell.borrow().clone())
+fn set_linked_origin(base_url: Option<&str>) {
+    with_origin_cell(|cell| {
+        if let Ok(mut guard) = cell.write() {
+            // Store the ORIGIN, not the base: a provider served under a path still
+            // sends `Origin: scheme://host[:port]`.
+            *guard = base_url.and_then(origin_of);
+        }
+    });
 }
 
 /// Set the trusted origin directly, for tests in other modules.
@@ -80,18 +103,16 @@ pub fn set_linked_origin_for_tests(base_url: Option<&str>) {
     set_linked_origin(base_url);
 }
 
-#[cfg(not(test))]
-fn set_linked_origin(base_url: Option<&str>) {
-    if let Ok(mut guard) = LINKED_ORIGIN.write() {
-        // Store the ORIGIN, not the base: a provider served under a path still
-        // sends `Origin: scheme://host[:port]`.
-        *guard = base_url.and_then(origin_of);
-    }
-}
-
+/// A runtime of several threads, each of which starts with the origin this thread has trusted at the moment: for a test that
+/// asks a server or a rule from tasks that run on its workers and means the answer to depend on the origin (see the cell).
 #[cfg(test)]
-fn set_linked_origin(base_url: Option<&str>) {
-    LINKED_ORIGIN.with(|cell| *cell.borrow_mut() = base_url.and_then(origin_of));
+pub(crate) fn runtime_seeing_this_threads_origin() -> tokio::runtime::Runtime {
+    let origin = linked_origin();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .on_thread_start(move || with_origin_cell(|cell| *cell.write().unwrap_or_else(|e| e.into_inner()) = origin.clone()))
+        .build()
+        .expect("a runtime of its own")
 }
 
 /// `scheme://host[:port]` from a base URL, or `None` if it is not one we would
@@ -219,12 +240,37 @@ pub(crate) enum Reread<T> {
 pub(crate) fn read_again<T: serde::de::DeserializeOwned>(path: &std::path::Path, shown_as: &str) -> Reread<T> {
     #[cfg(test)]
     reads::note();
-    match read_stored_after(path, shown_as, &[], false) {
+    let read = read_stored_after(path, shown_as, &[], false);
+    #[cfg(test)]
+    after_the_read::run();
+    match read {
         Ok(read) => Reread::Read(read),
         Err(e) if e.busy => Reread::Still,
         Err(e) => {
             log::warn!("link: {}", e.message);
             Reread::Unusable(e)
+        }
+    }
+}
+
+/// What a test does in the moment a read of the file has been made and its result has not yet been applied (the lock is not
+/// held there, and is what lets the lanes that ask for the account go on while a file is read): once, on this thread.
+#[cfg(test)]
+pub(crate) mod after_the_read {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn once(what: impl FnOnce() + 'static) {
+        HOOK.with(|hook| *hook.borrow_mut() = Some(Box::new(what)));
+    }
+
+    pub(super) fn run() {
+        let what = HOOK.with(|hook| hook.borrow_mut().take());
+        if let Some(what) = what {
+            what();
         }
     }
 }
@@ -309,18 +355,19 @@ fn copies_left(left: String) -> LinkError {
     }
 }
 
-/// Remove one kept copy. A test makes one that cannot be removed with [`held_copies`], the same on every platform.
-fn remove_copy(path: &std::path::Path) -> std::io::Result<()> {
+/// Remove one kept copy. A test makes one that cannot be removed with [`held_files`], the same on every platform.
+pub(crate) fn remove_copy(path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(test)]
-    if held_copies::is_held(path) {
+    if held_files::is_held(path) {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "held by a test (os error 5)"));
     }
     std::fs::remove_file(path)
 }
 
-/// Files that cannot be removed until they are let go of, for the tests of a purge that fails.
+/// Files that cannot be removed or moved until they are let go of, for the tests of a purge or a forget that fails, the same on
+/// every platform.
 #[cfg(test)]
-pub(crate) mod held_copies {
+pub(crate) mod held_files {
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
@@ -330,7 +377,7 @@ pub(crate) mod held_copies {
         HELD.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|p| p == path)
     }
 
-    /// `path` cannot be removed by [`super::purge_asides`] until the guard is dropped.
+    /// `path` cannot be removed by [`super::purge_asides`] or moved by [`super::put_aside_to_forget`] until the guard is dropped.
     pub(crate) struct Held(PathBuf);
 
     pub(crate) fn hold(path: &Path) -> Held {
@@ -382,6 +429,36 @@ pub(crate) fn put_aside(path: &std::path::Path, shown_as: &str) -> Result<(), St
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("{shown_as} could not be used and could not be put aside ({e}); it has not been changed and nothing was written")),
+    }
+}
+
+/// [`put_aside`] for a file that is being forgotten and not written over: it is moved or it is an error, and never copied. A
+/// copy made when the move fails leaves the original where it was, and a forget that took that for "gone" left a valid key in
+/// the folder that linked the desktop again at the next start. An error says the file has not been changed.
+///
+/// `Ok(true)` says that what was moved is kept aside as `<name>.corrupt`: it could not be used when it was read, and it is not a
+/// link that can be read now. `Ok(false)` says that nothing is kept: there was nothing to move, or what was moved turned out to be
+/// a link of this build (a program that held it let go between the read that found it unusable and the move) and is the link that
+/// is being forgotten, not a file of a newer build to keep, so its copy is removed (a copy that cannot be removed is left to the
+/// removal of copies that follows a forget, which says so).
+pub(crate) fn put_aside_to_forget<T: serde::de::DeserializeOwned>(path: &std::path::Path, shown_as: &str) -> Result<bool, String> {
+    #[cfg(test)]
+    if held_files::is_held(path) {
+        return Err(format!("{shown_as} could not be moved aside (held by a test (os error 5)); it has not been changed"));
+    }
+    match crate::secret_file::move_aside_waiting(path) {
+        Ok(aside) => {
+            // Not `read_again`, which counts the reads of a decision in the tests: this reads what was moved, not the file.
+            if matches!(read_stored_after::<T>(&aside, shown_as, &[], false), Ok(Some(_))) {
+                log::warn!("link: {shown_as} could be read by the time it was moved, and is a link: it is forgotten, and the copy is removed");
+                let _ = remove_copy(&aside);
+                return Ok(false);
+            }
+            log::warn!("link: {shown_as} could not be used; it is kept as {}", aside.display());
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("{shown_as} could not be moved aside ({e}); it has not been changed")),
     }
 }
 
@@ -529,10 +606,12 @@ struct Inner {
 }
 
 impl Inner {
-    /// There is no link because `account.json` is there and could not be used. Not any other error: a link that could
-    /// not be forgotten is still a link, and a copy that could not be removed is not a file to be read again.
+    /// There is no link because `account.json` is there and could not be used, or because it was and a forget could not move
+    /// it aside ([`LinkErrorKind::NotForgotten`] with nothing linked: the file is still there, and is read again like one that
+    /// could not be read, and becomes the link if it can be). Not a link that could not be forgotten (that is a link), and not
+    /// a copy that could not be removed, which is not a file to be read again.
     fn holds_unusable_file(&self) -> bool {
-        self.account.is_none() && self.error.as_ref().is_some_and(|e| e.kind == LinkErrorKind::Unusable)
+        self.account.is_none() && self.error.as_ref().is_some_and(|e| matches!(e.kind, LinkErrorKind::Unusable | LinkErrorKind::NotForgotten))
     }
 }
 
@@ -858,6 +937,8 @@ impl LinkStore {
         }
         // Without the lock: the file is read, and the lanes that ask for the account meanwhile are not kept waiting.
         let read = read_again::<LinkedAccount>(&self.path, ACCOUNT_FILE);
+        // What was read is applied only if what it was read for is still so: a forget, or a new link, that came while the file
+        // was being read has dealt with it, and a read that is older than that is not the file any more.
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if !inner.holds_unusable_file() {
             return;
@@ -927,24 +1008,37 @@ impl LinkStore {
     /// before: this does not read again, so that a caller's decision is made on one read and not on two that can differ.
     fn put_unusable_aside(&self) -> Result<(), String> {
         put_aside(&self.path, ACCOUNT_FILE)?;
+        self.dealt_with();
+        Ok(())
+    }
+
+    /// Nothing is said of `account.json` any more and nothing waits to read it.
+    fn dealt_with(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.error = None;
         inner.retry = None;
-        Ok(())
     }
 
     /// Take the stored link away: `Err` says why it is still there, and `Ok(true)` that the file could not be
     /// used and was put aside rather than deleted (what is in it may be a link a newer build can read). A link
     /// that is not there to remove is forgotten all the same.
     ///
-    /// One read decides: a file that could not be used at that read is moved aside, one that could is removed. A program
-    /// that lets go of the file in the moment between that read and the move leaves a link that could have been read kept
-    /// as `account.json.corrupt`, as one that could not be read is; it is a copy of the key, and the next Disconnect
-    /// (or [`LinkStore::remove_copies`]) removes it.
+    /// One read decides: a file that could not be used at that read is moved aside, one that could is removed. A file that
+    /// cannot be used and cannot be moved either (a program holds it so that it can be read and not moved, say) is not
+    /// forgotten, and is not copied: the original would stay and link the desktop again at the next start, and the answer
+    /// is an error; if the file could not be read at the read, the timer that reads it again is left running. A program that
+    /// lets go of the file in the moment between the read and the move leaves a file that can be read after all: it is read
+    /// where it was moved to, and when it is a link it is removed, because it is the link that is being forgotten
+    /// ([`put_aside_to_forget`]).
     fn forget_stored(&self) -> Result<bool, String> {
         self.reread(true);
         if self.holds_unusable_file() {
-            return self.put_unusable_aside().map(|()| true);
+            let kept = put_aside_to_forget::<LinkedAccount>(&self.path, ACCOUNT_FILE).map_err(|why| {
+                log::warn!("link: {why}");
+                format!("the link could not be forgotten: {why}. It is still stored here, and would be linked again at the next start. Close whatever has it open and try again.")
+            })?;
+            self.dealt_with();
+            return Ok(kept);
         }
         match std::fs::remove_file(&self.path) {
             Ok(()) => Ok(false),
@@ -1807,6 +1901,166 @@ mod tests {
     }
 
     #[test]
+    fn a_file_that_cannot_be_moved_aside_is_not_forgotten_and_not_copied() {
+        // The file could not be used when it was read, and a program holds it so that it cannot be moved. A forget that copied
+        // it and said "forgotten" left the original where it was, and the next start linked the desktop again.
+        let bytes = br#"{"connectorId":"formlogic","futureField":1}"#;
+        let (dir, store) = store_over("not-moved", bytes);
+        let file = dir.join("link").join("account.json");
+        let held = held_files::hold(&file);
+
+        let after = store.unlink();
+        let error = after.link_error.clone().expect("it was not forgotten, and that is said");
+        assert_eq!(error.kind, LinkErrorKind::NotForgotten);
+        assert!(error.message.starts_with("the link could not be forgotten: link/account.json could not be moved aside"), "{}", error.message);
+        assert!(error.message.contains("still stored here"), "{}", error.message);
+        assert_eq!(std::fs::read(&file).unwrap(), bytes, "the file is where it was, as it was");
+        assert!(!dir.join("link").join("account.json.corrupt").exists(), "and no copy of it was made");
+        assert_eq!(store.status().link_error.map(|e| e.kind), Some(LinkErrorKind::NotForgotten), "it stays said");
+
+        // Let go of: the same request moves it, and it is forgotten.
+        drop(held);
+        let after = store.unlink();
+        assert!(!after.linked && after.link_error.is_none(), "{after:?}");
+        assert!(!file.exists());
+        assert_eq!(std::fs::read(dir.join("link").join("account.json.corrupt")).unwrap(), bytes, "what could not be used is kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_forget_that_could_not_move_the_file_leaves_the_store_reading_it_and_the_link_comes_back() {
+        // Held when the store opened (nothing is linked yet), and still held when a forget comes: it cannot be moved. The file is a
+        // link that the next start finds, so the store goes on reading it as it does a file that could not be read, and has the
+        // link when it can, with nothing said that is not so.
+        let dir = data_dir("not-moved-then-read");
+        let file = dir.join("link").join("account.json");
+        std::fs::create_dir(&file).unwrap();
+        let store = load_store(dir.clone());
+        let held = held_files::hold(&file);
+
+        let after = store.unlink();
+        assert_eq!(after.link_error.map(|e| e.kind), Some(LinkErrorKind::NotForgotten));
+        assert!(file.is_dir(), "it was not moved");
+        assert!(store.inner.lock().unwrap().retry.is_some(), "and it is read again");
+        drop(held);
+
+        std::fs::remove_dir(&file).unwrap();
+        std::fs::write(&file, serde_json::to_string(&account()).unwrap()).unwrap();
+        read_again_now(&store);
+        assert_eq!(store.account().map(|a| a.credential), Some("flk_supersecret".to_string()), "the link that the file holds is the link");
+        assert!(store.status().link_error.is_none());
+        assert!(!dir.join("link").join("account.json.corrupt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_that_became_a_link_between_the_read_and_the_move_is_forgotten_and_its_copy_is_not_kept() {
+        // The read that decided finds the file held (a folder stands for it), and in the moment between that read and the move the
+        // program lets go: what is moved is a link. It was kept aside as `account.json.corrupt` with the key in it and the forget
+        // said nothing (the review's h5 at 60 ms landed here). It is read where it was moved to, and a link is the one that is being
+        // forgotten: its copy is removed.
+        let dir = data_dir("let-go-before-the-move");
+        let link = dir.join("link");
+        let file = link.join("account.json");
+        std::fs::create_dir(&file).unwrap();
+        let store = load_store(dir.clone());
+        let there = file.clone();
+        after_the_read::once(move || {
+            std::fs::remove_dir(&there).unwrap();
+            std::fs::write(&there, serde_json::to_string(&account()).unwrap()).unwrap();
+        });
+
+        let after = store.unlink();
+        assert!(!after.linked && after.link_error.is_none(), "{after:?}");
+        assert!(!file.exists(), "the file is not where it was");
+        for entry in std::fs::read_dir(&link).unwrap().flatten() {
+            let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            assert!(!text.contains("flk_supersecret"), "the key is in {:?}", entry.file_name());
+        }
+        assert!(load_store(dir.clone()).account().is_none(), "and a restart finds no link");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_copy_of_the_link_that_cannot_be_removed_after_such_a_move_is_said() {
+        let dir = data_dir("let-go-copy-held");
+        let link = dir.join("link");
+        let file = link.join("account.json");
+        std::fs::create_dir(&file).unwrap();
+        let store = load_store(dir.clone());
+        let there = file.clone();
+        after_the_read::once(move || {
+            std::fs::remove_dir(&there).unwrap();
+            std::fs::write(&there, serde_json::to_string(&account()).unwrap()).unwrap();
+        });
+        let copy = link.join("account.json.corrupt");
+        let held = held_files::hold(&copy);
+
+        let after = store.unlink();
+        assert!(!after.linked && !file.exists());
+        let error = after.link_error.expect("the copy with the key could not be removed, and that is said");
+        assert_eq!(error.kind, LinkErrorKind::CopiesLeft);
+        assert!(error.message.contains("account.json.corrupt"), "{}", error.message);
+        drop(held);
+        assert!(store.remove_copies().link_error.is_none() && !copy.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_hold_that_changes_from_no_reading_to_no_moving_between_the_read_and_the_move_is_not_a_forget() {
+        // The review's h5. At the read the file is held with nothing shared: it cannot be read. A moment later the program lets
+        // go and holds it again for reading only (a scanner that has finished opening it and is still scanning): it can be read and
+        // copied and cannot be moved. The forget waited about a second and a half, copied it, answered "forgotten" and left the
+        // valid link where it was. Whatever the moment it lets go falls at (60 ms is in the gap between the two holds at one of the
+        // times the move tries, and the file is moved), the answer is one of two: not forgotten, with the file where it was and no
+        // copy, or forgotten, with the key nowhere in the folder.
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = data_dir("hold-changes");
+        let link = dir.join("link");
+        let file = link.join("account.json");
+        std::fs::write(&file, serde_json::to_string(&account()).unwrap()).unwrap();
+        let exclusive = std::fs::OpenOptions::new().read(true).share_mode(0).open(&file).unwrap();
+        let store = load_store(dir.clone());
+        assert!(store.status().link_error.is_some(), "held and unreadable at the read");
+        let swapper = {
+            let file = file.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                drop(exclusive);
+                // FILE_SHARE_READ: no delete, no rename. The store's own attempt to move the file has it open for a moment, so this is
+                // tried again, and not at all if the file has been moved.
+                let shared = (0..200).find_map(|_| match std::fs::OpenOptions::new().read(true).share_mode(1).open(&file) {
+                    Ok(held) => Some(Some(held)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(None),
+                    Err(_) => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        None
+                    }
+                });
+                std::thread::sleep(std::time::Duration::from_millis(2500));
+                drop(shared);
+            })
+        };
+        let after = store.unlink();
+        let key_in_the_folder = || std::fs::read_dir(&link).unwrap().flatten().any(|e| std::fs::read_to_string(e.path()).unwrap_or_default().contains("flk_supersecret"));
+        match after.link_error.as_ref().map(|e| e.kind) {
+            Some(kind) => {
+                assert_eq!(kind, LinkErrorKind::NotForgotten, "{after:?}");
+                assert!(file.exists(), "not forgotten, and the valid link is where it was");
+                assert!(!link.join("account.json.corrupt").exists(), "and nothing was copied");
+            }
+            None => {
+                assert!(!after.linked && !file.exists(), "{after:?}");
+                assert!(!key_in_the_folder(), "forgotten, so the key is not in the folder (it was left in a copy)");
+            }
+        }
+        swapper.join().unwrap();
+        assert_eq!(load_store(dir.clone()).account().is_some(), after.link_error.is_some(), "a restart finds the link exactly when the answer was an error");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_new_link_over_a_file_that_is_held_puts_it_aside_and_leaves_no_timer() {
         let dir = data_dir("persist-held");
         let file = dir.join("link").join("account.json");
@@ -1822,6 +2076,174 @@ mod tests {
         assert!(dir.join("link").join("account.json.corrupt").is_dir(), "what could not be read is kept");
         assert_eq!(load_store(dir.clone()).account().unwrap().credential, "flk_supersecret", "and the new link is the file");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_read_that_a_forget_overtook_is_not_applied_and_does_not_bring_the_link_back() {
+        // A lane read the file (a link now, since the program that held it let go) and, before it took the lock to apply what it
+        // found, a forget came and finished: the file is gone and nothing is linked. What the lane found is the file as it was,
+        // and applying it would link a desktop that was just disconnected, with its key in memory and none on the disk.
+        let dir = data_dir("overtaken");
+        let file = dir.join("link").join("account.json");
+        std::fs::create_dir(&file).unwrap();
+        let store = load_store(dir.clone());
+        std::fs::remove_dir(&file).unwrap();
+        std::fs::write(&file, serde_json::to_string(&account()).unwrap()).unwrap();
+        read_again_now(&store);
+
+        let forgetter = store.clone();
+        after_the_read::once(move || {
+            let after = forgetter.unlink();
+            assert!(!after.linked && after.link_error.is_none(), "{after:?}");
+        });
+        assert!(store.account().is_none(), "the lane that read the file before the forget is not handed the link");
+        assert!(!file.exists());
+        let status = store.status();
+        assert!(!status.linked && status.link_error.is_none(), "{status:?}");
+        assert!(store.inner.lock().unwrap().account.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_pause_between_reads_of_a_file_that_stays_held_grows() {
+        // Each read that finds it held makes the next one later (the pauses are the patience's `later`, the last for ever), so
+        // that a file a scanner holds for an hour is not read every second for the hour.
+        let dir = data_dir("pauses");
+        let file = dir.join("link").join("account.json");
+        std::fs::create_dir(&file).unwrap();
+        let store = load_store(dir.clone());
+        let ms = std::time::Duration::from_millis;
+        store.inner.lock().unwrap().retry = Some(crate::secret_file::Retry::began(&crate::secret_file::Patience { start: vec![], later: vec![ms(40), std::time::Duration::from_secs(3600)], window: std::time::Duration::ZERO }));
+        std::thread::sleep(ms(70));
+        assert!(store.inner.lock().unwrap().retry.as_ref().unwrap().due(), "the first pause is over");
+
+        assert!(store.account().is_none(), "held: it is read, and it is held");
+        std::thread::sleep(ms(70));
+        assert!(!store.inner.lock().unwrap().retry.as_ref().unwrap().due(), "the next pause is the longer one, and it is not over");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The link file as the lanes and the screen meet it while another program holds it and lets go at a moment nobody chose.
+    /// Not a test of a result that can be told in advance: many rounds of many threads, each asked what it can be asked.
+    #[test]
+    fn many_rounds_of_many_lanes_get_the_link_back_from_a_file_that_is_let_go_at_a_random_moment() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let probe_dir = data_dir("hammer-probe");
+        let probe = probe_dir.join("link").join("account.json");
+        std::fs::write(&probe, "x").unwrap();
+        let Some(can_hold_a_file) = crate::secret_file::testing::make_unreadable(&probe) else { return };
+        drop(can_hold_a_file);
+        let _ = std::fs::remove_dir_all(&probe_dir);
+        let mut failures = Vec::new();
+        for round in 0..40u64 {
+            let dir = data_dir("hammer-back");
+            let file = dir.join("link").join("account.json");
+            std::fs::write(&file, serde_json::to_string(&account()).unwrap()).unwrap();
+            let held = crate::secret_file::testing::make_unreadable(&file).unwrap();
+            let store = load_store(dir.clone());
+            read_again_now(&store);
+            let (stop, got) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)));
+            let n = 4 + (round % 13) as usize;
+            let threads: Vec<_> = (0..n)
+                .map(|i| {
+                    let (store, stop, got) = (store.clone(), stop.clone(), got.clone());
+                    std::thread::spawn(move || {
+                        while !stop.load(Ordering::Relaxed) {
+                            let back = match i % 3 {
+                                0 => store.account().is_some(),
+                                1 => store.status().linked,
+                                _ => {
+                                    let _ = store.status();
+                                    store.account().is_some()
+                                }
+                            };
+                            if back {
+                                got.fetch_add(1, Ordering::SeqCst);
+                                return;
+                            }
+                        }
+                    })
+                })
+                .collect();
+            std::thread::sleep(std::time::Duration::from_millis(round % 7));
+            drop(held);
+            let deadline = Instant::now() + std::time::Duration::from_secs(5);
+            while got.load(Ordering::SeqCst) < n && Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            stop.store(true, Ordering::Relaxed);
+            for t in threads {
+                t.join().unwrap();
+            }
+            let inner = store.inner.lock().unwrap();
+            if got.load(Ordering::SeqCst) != n || inner.retry.is_some() || inner.error.is_some() {
+                failures.push(format!("round {round}: {} of {n} got the link; timer={} error={}", got.load(Ordering::SeqCst), inner.retry.is_some(), inner.error.is_some()));
+            }
+            drop(inner);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// Readers hammer, the file is let go of at a moment of its own, and the link is forgotten at another: once the forget has
+    /// answered "forgotten" the file is not where it was and no reader is handed the link again.
+    #[test]
+    fn a_forget_while_readers_hammer_and_the_file_is_let_go_of_leaves_nothing_forgotten_but_there() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let probe_dir = data_dir("hammer-probe2");
+        let probe = probe_dir.join("link").join("account.json");
+        std::fs::write(&probe, "x").unwrap();
+        let Some(can_hold_a_file) = crate::secret_file::testing::make_unreadable(&probe) else { return };
+        drop(can_hold_a_file);
+        let _ = std::fs::remove_dir_all(&probe_dir);
+        let mut bad = Vec::new();
+        for round in 0..40u64 {
+            let dir = data_dir("hammer-forget");
+            let file = dir.join("link").join("account.json");
+            std::fs::write(&file, serde_json::to_string(&account()).unwrap()).unwrap();
+            let held = crate::secret_file::testing::make_unreadable(&file).unwrap();
+            let store = load_store(dir.clone());
+            read_again_now(&store);
+            let (stop, forgotten, resurrected) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)));
+            let threads: Vec<_> = (0..6)
+                .map(|i| {
+                    let (store, stop, forgotten, resurrected) = (store.clone(), stop.clone(), forgotten.clone(), resurrected.clone());
+                    std::thread::spawn(move || {
+                        while !stop.load(Ordering::Relaxed) {
+                            let had = if i % 2 == 0 { store.account().is_some() } else { store.status().linked };
+                            // A reader that asks after the forget was answered is never handed the link (it is asked again, in case the
+                            // first answer was of a read that began before).
+                            if forgotten.load(Ordering::SeqCst) && had && store.account().is_some() {
+                                resurrected.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
+                    })
+                })
+                .collect();
+            let releaser = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(round % 5));
+                drop(held);
+            });
+            std::thread::sleep(std::time::Duration::from_millis((round * 3) % 11));
+            let after = store.unlink();
+            if !after.linked && after.link_error.is_none() {
+                forgotten.store(true, Ordering::SeqCst);
+                if file.exists() {
+                    bad.push(format!("round {round}: forgotten, and account.json is still there"));
+                }
+            }
+            releaser.join().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            stop.store(true, Ordering::Relaxed);
+            for t in threads {
+                t.join().unwrap();
+            }
+            if resurrected.load(Ordering::SeqCst) > 0 {
+                bad.push(format!("round {round}: a reader was handed the link {} times after the forget was answered", resurrected.load(Ordering::SeqCst)));
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        assert!(bad.is_empty(), "{bad:#?}");
     }
 
     #[test]
@@ -1900,14 +2322,21 @@ mod tests {
         let store = load_store(dir.clone());
         store.persist(&account()).unwrap();
         store.inner.lock().unwrap().account = Some(account());
-        for kept in ["account.json.corrupt", "account.json.corrupt.1", "account.json.corrupt.30", "account.json.corrupt.x", "account.json.bak-baseurl", "app-logic-storage.json"] {
+        let mut not_copies = vec!["account.json.corrupt.x", "account.json.bak-baseurl", "app-logic-storage.json"];
+        // A name that ends in `.corrupt.` with nothing after it is not a numbered copy. Windows takes the dot off the end of a name, so
+        // there it is the first copy under another spelling and cannot be told apart: it is made where it can exist.
+        if cfg!(unix) {
+            not_copies.push("account.json.corrupt.");
+        }
+        for kept in ["account.json.corrupt", "account.json.corrupt.1", "account.json.corrupt.30"].iter().chain(not_copies.iter()) {
             std::fs::write(link.join(kept), r#"{"credential":"flk_THE_PREVIOUS_KEY"}"#).unwrap();
         }
         let after = store.unlink();
         assert!(!after.linked && after.link_error.is_none(), "{after:?}");
         let mut left: Vec<String> = std::fs::read_dir(&link).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         left.sort();
-        assert_eq!(left, ["account.json.bak-baseurl", "account.json.corrupt.x", "app-logic-storage.json"]);
+        not_copies.sort();
+        assert_eq!(left, not_copies);
 
         // A folder named like a copy is not a file of ours and is left alone; the copies that are files go.
         let stuck = link.join("account.json.corrupt.2");
@@ -1933,7 +2362,7 @@ mod tests {
         store.inner.lock().unwrap().account = Some(account());
         let copy = link.join("account.json.corrupt");
         std::fs::write(&copy, r#"{"credential":"flk_THE_PREVIOUS_KEY"}"#).unwrap();
-        let held = held_copies::hold(&copy);
+        let held = held_files::hold(&copy);
 
         let after = store.unlink();
         assert!(!after.linked, "the link was forgotten");
@@ -1969,7 +2398,7 @@ mod tests {
 
         // Forgetting again, with a copy held again, is the same retry.
         std::fs::write(&copy, "x").unwrap();
-        let held = held_copies::hold(&copy);
+        let held = held_files::hold(&copy);
         assert_eq!(store.unlink().link_error.map(|e| e.kind), Some(LinkErrorKind::CopiesLeft));
         drop(held);
         assert!(store.unlink().link_error.is_none() && !copy.exists());
@@ -1993,7 +2422,7 @@ mod tests {
         assert!(!copy.exists(), "the copy was removed");
         // And a copy that cannot be removed is not said while linked: that is about a Disconnect that was never made.
         std::fs::write(&copy, "x").unwrap();
-        let held = held_copies::hold(&copy);
+        let held = held_files::hold(&copy);
         assert!(store.remove_copies().link_error.is_none());
         drop(held);
 
@@ -2001,7 +2430,7 @@ mod tests {
         let (dir2, store2) = store_over("copies-only-unusable", b"{ not a link");
         let copy2 = dir2.join("link").join("account.json.corrupt");
         std::fs::write(&copy2, "x").unwrap();
-        let held = held_copies::hold(&copy2);
+        let held = held_files::hold(&copy2);
         let after = store2.remove_copies();
         assert_eq!(after.link_error.map(|e| e.kind), Some(LinkErrorKind::Unusable));
         drop(held);
@@ -2041,11 +2470,16 @@ mod tests {
         // Anything else in the query is refused rather than read as a plain forget.
         assert_eq!(delete("?copiesOnly=maybe").await.0.as_u16(), 400);
         assert_eq!(delete("?everything=true").await.0.as_u16(), 400);
+        // The value is `true` or `false` and nothing else, and a name is not repeated: what is not one of those is refused and
+        // is never a plain forget by another name.
+        for refused in ["?copiesOnly=TRUE", "?copiesOnly=1", "?copiesOnly=yes", "?copiesOnly=", "?copiesOnly", "?copiesonly=true", "?copies_only=true", "?copiesOnly=true&copiesOnly=false", "?copiesOnly=true&x=1"] {
+            assert_eq!(delete(refused).await.0.as_u16(), 400, "{refused}");
+        }
         assert!(store.status().linked, "refused requests forgot nothing");
 
         // Without it the link is forgotten, with a copy held it says so, and the retry that takes the copies answers.
         std::fs::write(&copy, "x").unwrap();
-        let held = held_copies::hold(&copy);
+        let held = held_files::hold(&copy);
         let (_, body) = delete("").await;
         assert_eq!((body["linked"].clone(), body["linkError"]["kind"].clone()), (serde_json::json!(false), serde_json::json!("copiesLeft")));
         let (_, body) = delete("?copiesOnly=true").await;
@@ -2125,6 +2559,10 @@ mod tests {
         assert!(after.linked, "it is still linked, and the screen says so");
         let error = after.link_error.expect("and why");
         assert!(error.message.contains("could not be forgotten"), "{}", error.message);
+        // Of its own kind: a link that was not forgotten is not a file that could not be used (which the screen answers with a
+        // new link, and the store with a read again), and the panel and the Agent tell them apart by it.
+        assert_eq!(error.kind, LinkErrorKind::NotForgotten);
+        assert_eq!(serde_json::to_value(&error).unwrap()["kind"], "notForgotten");
         assert!(store.account().is_some(), "the lanes go on with a link that is still stored");
 
         // Once the file can be removed the next try forgets it, and the error goes with the link.
@@ -2270,6 +2708,19 @@ mod tests {
         .unwrap();
         assert_eq!(linked_origin().as_deref(), Some("https://thread-a.example.test"), "and what it writes is not seen here");
         set_linked_origin(None);
+    }
+
+    #[test]
+    fn a_runtime_built_for_it_sees_the_origin_this_thread_trusts_and_a_plain_one_does_not() {
+        // The limit of one cell for each thread, in the open: a task on a worker of an ordinary runtime asks an empty cell, so an
+        // assertion that an origin is not trusted would hold there for that reason and no other. A runtime built with
+        // `runtime_seeing_this_threads_origin` has the origin on its workers.
+        set_linked_origin(Some("https://seen.example.test"));
+        let ask = |runtime: tokio::runtime::Runtime| runtime.block_on(async { tokio::spawn(async { linked_origin() }).await.unwrap() });
+        assert_eq!(ask(runtime_seeing_this_threads_origin()).as_deref(), Some("https://seen.example.test"));
+        assert_eq!(ask(tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap()), None, "an ordinary runtime does not");
+        set_linked_origin(None);
+        assert_eq!(ask(runtime_seeing_this_threads_origin()), None, "and it has what this thread has, which is nothing now");
     }
 
     #[test]

@@ -60,6 +60,9 @@ async fn start(
 /// could not remove (`linkError.kind` is `copiesLeft`), which is the panel's "Remove copies". A link there is now is
 /// left alone, so a screen that has not heard of it yet cannot disconnect it by retrying. It is the same route and
 /// the same scope, so the table of routes has nothing new to learn.
+///
+/// Any other member in the query is a 400 (`deny_unknown_fields`) and not a plain forget: a misspelt `copiesOnly`
+/// must not become a disconnect that nobody asked for. `copiesOnly` takes `true` or `false` and nothing else.
 async fn unlink(State(store): State<LinkHandle>, Query(q): Query<UnlinkQuery>) -> Json<LinkStatus> {
     Json(if q.copies_only { store.remove_copies() } else { store.unlink() })
 }

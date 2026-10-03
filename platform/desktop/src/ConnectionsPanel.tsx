@@ -176,7 +176,9 @@ export default function ConnectionsPanel() {
         // A copy left behind has a banner of its own below, with the button that tries again; the same words in the
         // plain banner as well would be a second banner with no button.
         if (next.linkError?.kind !== 'copiesLeft') setAccountError(why);
-        toast.push({ kind: 'error', title: next.linked ? `Could not disconnect ${name}` : `Disconnected ${name}, but not all of it`, body: why });
+        // By what the host says it is and not by whether the account is still shown linked: a file that could not be moved
+        // aside is not forgotten and shows no account (it could not be read).
+        toast.push({ kind: 'error', title: next.linkError?.kind === 'copiesLeft' ? `Disconnected ${name}, but not all of it` : `Could not disconnect ${name}`, body: why });
       } else {
         toast.push({ kind: 'success', title: `Disconnected ${name}` });
       }
@@ -390,9 +392,9 @@ export default function ConnectionsPanel() {
             one nobody linked. Linking again puts the file aside (it is kept as account.json.corrupt). */}
         {account?.linkError && account.linkError.kind !== 'copiesLeft' && account.linkError.message !== (accountError ?? statusError) && (
           <div className="banner banner-err" role="alert" data-link-error>
-            <strong>{account.linked ? 'The link could not be changed.' : 'The stored link could not be used.'}</strong>{' '}
+            <strong>{account.linkError.kind === 'notForgotten' ? 'The link could not be changed.' : 'The stored link could not be used.'}</strong>{' '}
             <span>{account.linkError.message}</span>
-            {!account.linked && (
+            {account.linkError.kind === 'unusable' && (
               <div style={{ marginTop: 6, fontSize: 12.5 }}>
                 Nothing was deleted. Link again below to start a new one; the old file is kept beside it.
               </div>

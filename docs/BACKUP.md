@@ -1121,7 +1121,15 @@ in parts through internal routes with a secret made for that one backup.
   including a copy of a link that a newer OAIY wrote and that you kept after going back; to keep
   one, copy it out of the `link` folder before you disconnect. A copy that cannot be removed (a
   program has it open) is said on the Connections screen, with a Remove copies button that tries
-  again. The link file and its copies are never in a backup (see the table above).
+  again. Remove copies takes the copies whatever state the link is in, including a copy that a newer
+  OAIY has just kept beside a link that works; it never disconnects a linked account (it is
+  `DELETE /api/link?copiesOnly=true`, and any other member in the query of `DELETE /api/link` is
+  refused with 400 and not taken for a plain disconnect). A disconnect that cannot move aside a
+  file it could not use (a program holds it so that it can be read and not moved) is not a
+  disconnect: it says so and keeps the file where it is (and reads it again, if it could not be
+  read), and never copies it and goes on, which would leave the key where it was. If the file turns
+  out to be a link of this OAIY after all by the moment it is moved, it is the link being forgotten,
+  and the copy is removed. The link file and its copies are never in a backup (see the table above).
 
 ## For developers
 

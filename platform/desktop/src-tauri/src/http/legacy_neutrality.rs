@@ -280,9 +280,15 @@ const ORIGINS: [Option<&str>; 12] = [
     Some("http://formlogic.local"),
 ];
 
-#[tokio::test(flavor = "multi_thread")]
-async fn in_legacy_mode_every_route_that_existed_before_the_access_model_is_answered_as_the_old_guard_answered_it(
-) {
+/// What the two guards were asked and what they answered: how many answers were compared, how many of each status, and the
+/// first that differ.
+type Compared = (usize, std::collections::BTreeMap<u16, usize>, Vec<String>);
+
+/// Every request of the matrix, with every credential and each of `origins`, to the live guard and to the frozen one, in a
+/// GUI and a headless build, with a token and without. It runs on the threads of the runtime it is awaited in: the linked
+/// provider's origin is one cell for each thread in the tests (see `link::linked_origin`), so the threads that answer decide
+/// whether it is set, and a test that wants it set builds its runtime for that.
+async fn compare_the_guards(origins: &'static [Option<&'static str>]) -> Compared {
     let (pairing, paired) = a_paired_token();
     let internal = crate::internal_token().to_string();
     assert!(!internal.is_empty(), "the process has an internal token");
@@ -334,7 +340,8 @@ async fn in_legacy_mode_every_route_that_existed_before_the_access_model_is_answ
                 let mut differences = Vec::new();
                 for (method, path) in requests.iter() {
                     for credential in credentials.iter() {
-                        for origin in ORIGINS {
+                        for origin in origins {
+                            let origin = *origin;
                             let a = ask(&new, method, path, credential.as_deref(), origin).await;
                             let b = ask(&old, method, path, credential.as_deref(), origin).await;
                             compared += 1;
@@ -360,6 +367,15 @@ async fn in_legacy_mode_every_route_that_existed_before_the_access_model_is_answ
         }
         differences.extend(d);
     }
+    (compared, statuses, differences)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_legacy_mode_every_route_that_existed_before_the_access_model_is_answered_as_the_old_guard_answered_it(
+) {
+    // The threads of this runtime have no linked provider (the cell is empty on each: nothing here links), so a request from
+    // `http://formlogic.local` is one from an origin nobody trusted, for both guards, however the rest of the suite is going.
+    let (compared, statuses, differences) = compare_the_guards(&ORIGINS).await;
     assert!(
         differences.is_empty(),
         "{} of {compared} answers differ; the first:\n{}",
@@ -381,6 +397,27 @@ async fn in_legacy_mode_every_route_that_existed_before_the_access_model_is_answ
         statuses.get(&405).copied().unwrap_or(0) > 20_000,
         "the methods a route does not have are asked: {statuses:?}"
     );
+}
+
+#[test]
+fn with_the_linked_providers_origin_trusted_the_two_guards_still_answer_alike() {
+    // The same comparison for the one origin that is trusted when a provider is linked at it: set on this thread, and on the
+    // threads of the runtime that answers (which each start with this thread's), so that it is the answer for a trusted
+    // origin that is compared, and not for one that is not.
+    let origin: &'static [Option<&'static str>] = &[Some("http://formlogic.local")];
+    crate::link::set_linked_origin_for_tests(Some("http://formlogic.local"));
+    assert!(crate::http::is_allowed_origin("http://formlogic.local"), "trusted on this thread");
+    let runtime = crate::link::runtime_seeing_this_threads_origin();
+    let (compared, statuses, differences) = runtime.block_on(async {
+        let on_a_worker = tokio::spawn(async { crate::link::linked_origin() }).await.unwrap();
+        assert_eq!(on_a_worker.as_deref(), Some("http://formlogic.local"), "and on a worker of the runtime that answers");
+        compare_the_guards(origin).await
+    });
+    crate::link::set_linked_origin_for_tests(None);
+    assert!(differences.is_empty(), "{} of {compared} answers differ; the first:\n{}", differences.len(), differences.join("\n"));
+    assert!(compared > 50_000, "{compared} answers compared");
+    // The origin is trusted: the broad routes let it in, and the privileged ones still do not.
+    assert!(statuses.get(&200).copied().unwrap_or(0) > 500 && statuses.get(&403).copied().unwrap_or(0) > 500, "{statuses:?}");
 }
 
 #[tokio::test]

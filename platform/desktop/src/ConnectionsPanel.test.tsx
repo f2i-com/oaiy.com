@@ -479,6 +479,36 @@ describe('ConnectionsPanel · Linked account', () => {
     expect(container.textContent).toContain('Reception PC');
   });
 
+  it('does not say Disconnected when the file could not be moved aside, though no account is shown for it', async () => {
+    // A stored link that could not be read was held by a program that also kept it from being moved: it was not forgotten, and
+    // nothing is shown linked because the file could not be read. The host says what it is (`notForgotten`); the panel does not
+    // take "not linked" for "forgotten".
+    const why = 'the link could not be forgotten: link/account.json could not be moved aside (Access is denied. (os error 5)); it has not been changed. It is still stored here, and would be linked again at the next start. Close whatever has it open and try again.';
+    linkStatusMock.mockResolvedValue(LINKED);
+    unlinkMock.mockResolvedValue({ ...IDLE, linkError: { file: 'link/account.json', message: why, kind: 'notForgotten' } });
+    await mount();
+    await click('Disconnect');
+
+    expect(pushMock).not.toHaveBeenCalledWith(expect.objectContaining({ kind: 'success' }));
+    expect(pushMock).toHaveBeenCalledWith({ kind: 'error', title: 'Could not disconnect Acme Cloud', body: why });
+    expect(pushMock.mock.calls.some(([t]) => /but not all/.test(t.title))).toBe(false);
+    const alerts = container.querySelectorAll('[role="alert"]');
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0].textContent).toContain('could not be moved aside');
+    expect(container.querySelector('[data-copies-left]')).toBeNull();
+  });
+
+  it('calls a link that could not be changed that, with no "nothing was deleted" and no account shown for it', async () => {
+    const why = 'the link could not be forgotten: link/account.json could not be moved aside (held); it has not been changed.';
+    linkStatusMock.mockResolvedValue({ ...IDLE, linkError: { file: 'link/account.json', message: why, kind: 'notForgotten' } });
+    await mount();
+    const alert = container.querySelector('[data-link-error]');
+    expect(alert?.textContent).toContain('The link could not be changed.');
+    expect(alert?.textContent).toContain(why);
+    expect(alert?.textContent).not.toContain('The stored link could not be used.');
+    expect(alert?.textContent).not.toContain('Nothing was deleted');
+  });
+
   it('says so, and offers Remove copies, when the link was forgotten and a copy of its key could not be removed', async () => {
     const why = 'Disconnected, but a copy of the old key could not be removed: account.json.corrupt (Access is denied. (os error 5)). Close the program that holds it and press Remove copies.';
     linkStatusMock.mockResolvedValue(LINKED);
@@ -542,6 +572,25 @@ describe('ConnectionsPanel · Linked account', () => {
     removeCopiesMock.mockResolvedValue(IDLE);
     await click('Remove copies');
     expect(removeCopiesMock).toHaveBeenCalledTimes(2);
+    expect(container.querySelector('[data-copies-left]')).toBeNull();
+  });
+
+  it('does not send Remove copies again while it is running', async () => {
+    const left = { file: 'link/account.json', message: 'Disconnected, but a copy of the old key could not be removed: account.json.corrupt (held). Close the program that holds it and press Remove copies.', kind: 'copiesLeft' };
+    linkStatusMock.mockResolvedValue({ ...IDLE, linkError: left });
+    let release: (status: unknown) => void = () => {};
+    removeCopiesMock.mockReturnValue(new Promise((resolve) => { release = resolve; }));
+    await mount();
+
+    await click('Remove copies');
+    const running = Array.from(container.querySelectorAll('button')).find((b) => b.textContent?.trim() === 'Removing…');
+    expect(running?.disabled).toBe(true);
+    await act(async () => {
+      running?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    expect(removeCopiesMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => release(IDLE));
     expect(container.querySelector('[data-copies-left]')).toBeNull();
   });
 
