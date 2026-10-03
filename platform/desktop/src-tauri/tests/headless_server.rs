@@ -300,18 +300,24 @@ fn a_fresh_server_keeps_its_data_folder_keys_and_provider_store_to_its_owner() {
     let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&data), 0o700, "the data folder the server made");
 
-    // A provider's API key, saved over the API as the dashboard does.
+    // A provider's API key, saved over the API as the dashboard does. With the web login the static token is the `cli`
+    // preset, which does not hold `ai.admin` (the provider keys are among the routes it loses, as the README says), so
+    // there the save is refused; the store is written by the same code in both builds and checked in the one without it.
     let (status, saved) = server.post(
         "/api/ai/providers",
         json!({ "id": "openai", "name": "OpenAI", "baseUrl": "https://api.openai.com" }),
     );
-    assert_eq!(status, 200, "{saved}");
-    let (status, _) = server.post("/api/ai/providers/openai/key", json!({ "key": "sk-not-a-real-key" }));
-    assert_eq!(status, 204);
-    let store = data.join("ai").join("providers.json");
-    assert!(std::fs::read_to_string(&store).unwrap().contains("sk-not-a-real-key"), "the key is what the file is for");
-    assert_eq!(mode(&store), 0o600, "providers.json is readable by others");
-    assert_eq!(mode(store.parent().unwrap()), 0o700, "and so is the folder the server made for it");
+    if cfg!(feature = "web") {
+        assert_eq!((status, saved["required"].as_str()), (403, Some("ai.admin")), "{saved}");
+    } else {
+        assert_eq!(status, 200, "{saved}");
+        let (status, _) = server.post("/api/ai/providers/openai/key", json!({ "key": "sk-not-a-real-key" }));
+        assert_eq!(status, 204);
+        let store = data.join("ai").join("providers.json");
+        assert!(std::fs::read_to_string(&store).unwrap().contains("sk-not-a-real-key"), "the key is what the file is for");
+        assert_eq!(mode(&store), 0o600, "providers.json is readable by others");
+        assert_eq!(mode(store.parent().unwrap()), 0o700, "and so is the folder the server made for it");
+    }
 
     // The keys are minted on threads of their own as the server comes up.
     let keys = |data: &Path| -> Vec<PathBuf> {
