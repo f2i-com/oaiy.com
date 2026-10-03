@@ -7,3 +7,9 @@ docs/contracts/transfer/** text eol=lf
 # would each fail in a way that looks like a bug in the code. `text=auto` leaves binary files (fonts, images) alone.
 /web/** text=auto eol=lf
 /shared/** text=auto eol=lf
+
+# The relay client core: LF in every checkout. A machine with core.autocrlf=true would otherwise check the crate out with CRLF, and its mutation harness (multi-line anchors),
+# its fixtures and the generators under tests/ would each fail in a way that looks like a bug in the code.
+crates/oaiy-relay-core/** text eol=lf
+# and the three files of its dependency that the harness's dependency mutants patch (the crate's tests of its small-order and sealed-box checks).
+crates/oaiy-crypto/src/** text eol=lf
