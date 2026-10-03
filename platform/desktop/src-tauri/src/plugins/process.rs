@@ -1260,11 +1260,10 @@ sleep 300
 
             fn spawn(&self) -> PluginProcess {
                 PluginProcess::spawn(
-                    &self.manifest,
-                    &self.dir,
                     SpawnOptions {
                         desktop_version: "0.1.0".into(),
                         dev_mode: false,
+                        permit: LaunchPermit::unchecked_for_tests(&self.dir, self.manifest.clone()),
                         events: Arc::new(|_name, _payload| {}),
                         requests: Arc::new(|_method, _params| Ok(serde_json::json!({}))),
                     },

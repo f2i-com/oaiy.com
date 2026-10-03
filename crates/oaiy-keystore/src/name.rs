@@ -192,7 +192,7 @@ mod tests {
     fn a_name_is_always_one_plain_path_component() {
         let mut checked = 0u32;
         for a in 0u8..128 {
-            for b in [b'a', b'.', b'-', b'_', b'0'] {
+            for b in *b"a.-_0" {
                 let text = format!("{}{}", char::from(a), char::from(b));
                 if Name::new(&text).is_ok() {
                     checked += 1;

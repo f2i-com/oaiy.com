@@ -35,14 +35,14 @@ pub const fn encoded_len(n: usize) -> usize {
 /// Encodes `bytes` as base64url with no padding.
 pub fn encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(encoded_len(bytes.len()));
-    let mut chunks = bytes.chunks_exact(3);
-    for c in &mut chunks {
+    let (chunks, tail) = bytes.as_chunks::<3>();
+    for c in chunks {
         let n = (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2]);
         for shift in [18, 12, 6, 0] {
             out.push(char::from(ALPHABET[((n >> shift) & 63) as usize]));
         }
     }
-    match chunks.remainder() {
+    match tail {
         [a] => {
             let n = u32::from(*a) << 16;
             for shift in [18, 12] {
@@ -86,14 +86,14 @@ pub fn decode_zeroizing(text: &str) -> Result<Zeroizing<Vec<u8>>, B64Error> {
         return Err(B64Error::Length);
     }
     let mut out = Zeroizing::new(Vec::with_capacity(values.len() / 4 * 3 + 2));
-    let mut groups = values.chunks_exact(4);
-    for g in &mut groups {
+    let (groups, tail) = values.as_chunks::<4>();
+    for g in groups {
         let n = (u32::from(g[0]) << 18) | (u32::from(g[1]) << 12) | (u32::from(g[2]) << 6) | u32::from(g[3]);
         out.push((n >> 16) as u8);
         out.push((n >> 8) as u8);
         out.push(n as u8);
     }
-    match groups.remainder() {
+    match tail {
         [a, b] => {
             // 12 bits carry one byte: the low four bits of the second character are unused and must be zero.
             if b & 0x0f != 0 {
