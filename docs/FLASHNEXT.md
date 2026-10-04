@@ -59,9 +59,9 @@ What an adapter can change:
 An adapter tensor with no matrix to go to is an error, rather than being silently left
 out.
 
-For example, `chenrm/qwen3.8-flash-next-abliterated-lora` (rank 2, 2,656 projections: the
-attention and DeltaNet outputs, the shared experts' down projections, and every expert's
-down projection in five layers) loads in the same time and decodes at about 103 tokens/s.
+For example, an adapter of rank 2 on 2,656 projections (the attention and DeltaNet outputs,
+the shared experts' down projections, and every expert's down projection in five layers)
+loads in the same time and decodes at about 103 tokens/s.
 
 ## Two conversations on one model
 

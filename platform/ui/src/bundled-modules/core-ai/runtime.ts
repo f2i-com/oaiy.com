@@ -447,8 +447,8 @@ async function tryEagerLlmUnload(modelId: string): Promise<void> {
  * Vision Projector field blank. Scans the model's containing
  * directory, filters to `mmproj-*.gguf`, and ranks by longest common
  * prefix with the model filename — so
- * `MiniCPM-V-4.6-Abliterated-AND-Disinhibited-Q4_K_M.gguf` resolves
- * to `mmproj-MiniCPM-V-4.6-Abliterated-AND-Disinhibited-F16.gguf`
+ * `MiniCPM-V-4.6-Q4_K_M.gguf` resolves
+ * to `mmproj-MiniCPM-V-4.6-F16.gguf`
  * rather than an unrelated mmproj that happens to share the dir.
  *
  * Only runs when the model path is absolute (rooted or UNC) — for
@@ -762,7 +762,7 @@ async function chat(
     // Auto-resolve a companion mmproj when the user wired images but
     // left the Vision Projector field blank. Works for ANY
     // `mmproj-*.gguf` file sitting next to the model (no hardcoded
-    // names — handles Abliterated / Distil / community-rebrand
+    // names — handles fine-tuned / distilled / renamed
     // variants by scanning the model's directory for an mmproj file
     // and matching by longest common prefix). Only attempts when (a)
     // images are connected, (b) projector is empty, (c) the model id
