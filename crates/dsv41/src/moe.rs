@@ -130,6 +130,7 @@ impl Moe {
         // Their records, read on several threads at once: an SSD serves a queue of reads several times faster than one
         // at a time (the cache reads a record outside its lock, and the store keeps a scratch buffer a read).
         let acquire = |e: u32| experts.cache.acquire(self.layer, e, experts.store.as_ref());
+        let reading = std::time::Instant::now();
         let leases: Vec<oaiy_engine::ecache::HostLease> = if used.len() <= 1 {
             used.iter().map(|&e| acquire(e)).collect::<Result<Vec<_>>>()?
         } else {
@@ -148,13 +149,17 @@ impl Moe {
             });
             got.into_iter().collect::<Result<Vec<_>>>()?
         };
+        crate::profile::add(crate::profile::Part::ExpertRead, reading);
         let outs: Vec<(Vec<usize>, Vec<f32>)> = match (&experts.pool, t) {
             // A decode step: the token's experts at once on the workers.
             (Some(pool), 1) => {
                 let r = &routes[0];
                 let weights: Vec<f32> = used.iter().map(|e| r.weights[r.experts.iter().position(|x| x == e).expect("a used expert is routed")]).collect();
                 let records: Vec<_> = leases.iter().map(|l| l.to_arc()).collect();
-                pool.forward(&records, &weights, x, cfg.swiglu_limit).into_iter().map(|out| (vec![0], out)).collect()
+                let computing = std::time::Instant::now();
+                let outs = pool.forward(&records, &weights, x, cfg.swiglu_limit).into_iter().map(|out| (vec![0], out)).collect();
+                crate::profile::add(crate::profile::Part::ExpertCpu, computing);
+                outs
             }
             // A prompt: each expert's tokens as one batch, the busy experts' on the GPU when there is one, the rest
             // spread over threads.
@@ -180,7 +185,10 @@ impl Moe {
                     for group in busy.chunks(GPU_GROUP) {
                         let jobs: Vec<crate::expert::ExpertJob<'_>> =
                             group.iter().map(|&j| crate::expert::ExpertJob { record: &leases[j], x: &gathered[j].1, weights: &gathered[j].2 }).collect();
-                        for (&j, out) in group.iter().zip(gpu.forward(&jobs, cfg.swiglu_limit)) {
+                        let computing = std::time::Instant::now();
+                        let got = gpu.forward(&jobs, cfg.swiglu_limit);
+                        crate::profile::add(crate::profile::Part::ExpertGpu, computing);
+                        for (&j, out) in group.iter().zip(got) {
                             done[j] = Some(out);
                         }
                     }
@@ -188,6 +196,7 @@ impl Moe {
                 let rest: Vec<usize> = (0..used.len()).filter(|&j| done[j].is_none()).collect();
                 let batch = |j: usize| (j, expert_forward_batch(&leases[j], &gathered[j].1, Some(&gathered[j].2), cfg.swiglu_limit));
                 let threads = if experts.pool.is_some() { std::thread::available_parallelism().map_or(1, |n| n.get()) } else { 1 };
+                let computing = std::time::Instant::now();
                 let computed: Vec<(usize, Vec<f32>)> = if threads <= 1 || rest.len() <= 1 {
                     rest.iter().map(|&j| batch(j)).collect()
                 } else {
@@ -197,6 +206,9 @@ impl Moe {
                         handles.into_iter().flat_map(|h| h.join().expect("an expert worker panicked")).collect()
                     })
                 };
+                if !rest.is_empty() {
+                    crate::profile::add(crate::profile::Part::ExpertCpu, computing);
+                }
                 for (j, out) in computed {
                     done[j] = Some(out);
                 }

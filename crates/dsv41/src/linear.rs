@@ -148,8 +148,10 @@ impl Weight {
             Weight::Fp8 { .. } | Weight::Device { fp8: true, .. } => (fake_quant_fp8(x, FP8_BLOCK), Out::Bf16),
             _ => (x.to_vec(), out),
         };
+        let start = std::time::Instant::now();
         if let Weight::Device { kernel, .. } = self {
             let mut y = kernel.forward_rows(&xin, t, rows);
+            crate::profile::add(crate::profile::Part::DeviceDense, start);
             if out == Out::Bf16 {
                 for v in &mut y {
                     *v = to_bf16(*v);
@@ -179,6 +181,7 @@ impl Weight {
                 }
             }
         });
+        crate::profile::add(crate::profile::Part::HostDense, start);
         y.into_inner().unwrap_or_else(|p| p.into_inner())
     }
 }

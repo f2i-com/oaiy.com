@@ -329,6 +329,7 @@ impl Attention {
         // threads (the same sums in the same order whichever thread makes them). Serial, it was most of a prompt's
         // time on the CPU and most of a decode step's attention.
         let scale = (hd as f32).powf(-0.5);
+        let attending = std::time::Instant::now();
         let o = Mutex::new(vec![0.0f32; t * nh * hd]);
         parallel_rows(t * nh, 1, &|b, e| {
             let mut buf = vec![0.0f32; (e - b) * hd];
@@ -341,6 +342,7 @@ impl Attention {
             o.lock().unwrap_or_else(|p| p.into_inner())[b * hd..e * hd].copy_from_slice(&buf);
         });
         let o = o.into_inner().unwrap_or_else(|p| p.into_inner());
+        crate::profile::add(crate::profile::Part::SparseAttention, attending);
 
         // grouped low-rank output: wo_a is block-diagonal over o_groups
         let (g, gd, orank) = (cfg.o_groups, nh * hd / cfg.o_groups, cfg.o_lora_rank);
@@ -451,6 +453,7 @@ pub enum CandidateRole {
 /// Indexer scores, `[t][n_t]` flattened, without the causal mask:
 /// `bf16(sum_h bf16(relu(bf16(q_h . k)) * w_h))` per (query, key).
 pub fn index_scores(q: &[f32], keys: &[f32], weights: &[f32], inh: usize, ihd: usize) -> Vec<f32> {
+    let scoring = std::time::Instant::now();
     let (t, n_t) = (q.len() / (inh * ihd), keys.len() / ihd);
     // Every (query, key) cell on its own, spread over the threads; each summed as before.
     let out = Mutex::new(vec![0.0f32; t * n_t]);
@@ -469,6 +472,7 @@ pub fn index_scores(q: &[f32], keys: &[f32], weights: &[f32], inh: usize, ihd: u
         }
         out.lock().unwrap_or_else(|p| p.into_inner())[b..e].copy_from_slice(&buf);
     });
+    crate::profile::add(crate::profile::Part::IndexScores, scoring);
     out.into_inner().unwrap_or_else(|p| p.into_inner())
 }
 

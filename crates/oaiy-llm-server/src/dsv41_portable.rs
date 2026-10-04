@@ -404,14 +404,17 @@ mod tests {
         let report = |label: &str, secs: f64, before: oaiy_engine::ecache::CacheStats, after: oaiy_engine::ecache::CacheStats, spans: &BTreeMap<&'static str, f64>| {
             let read = after.bytes_read - before.bytes_read;
             eprintln!(
-                "{label}: {secs:.2} s; read {:.2} GB, {} hits / {} misses; {}",
+                "{label}: {secs:.2} s; read {:.2} GB, {} hits / {} misses; {}
+    {}",
                 read as f64 / 1e9,
                 after.hits - before.hits,
                 after.misses - before.misses,
-                spans.iter().map(|(k, v)| format!("{k} {v:.2} s")).collect::<Vec<_>>().join(", ")
+                spans.iter().map(|(k, v)| format!("{k} {v:.2} s")).collect::<Vec<_>>().join(", "),
+                dsv41::profile::take_line()
             );
         };
         let before = model.expert_cache().stats();
+        dsv41::profile::take();
         *last.borrow_mut() = Instant::now();
         let t = Instant::now();
         let mut logits = model.forward(&ids, 0, &mut trace).unwrap();
