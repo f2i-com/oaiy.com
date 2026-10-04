@@ -8,6 +8,15 @@ pub trait PackedLinear: std::fmt::Debug + Send + Sync {
     fn nbytes(&self) -> usize;
 }
 
+/// A MoE layer's EXL3 experts, the shared one last: `forward(x, logits, top_k)` routes each row of `x` (`[rows,
+/// hidden]`) by its router logits (`[rows, experts + 1]`, the shared expert's gate last) to its `top_k` experts,
+/// softmax-weighted, plus the shared expert weighted by the sigmoid of its gate, and sums what they give (`[rows,
+/// hidden]`). Each expert is `down(silu(gate(x)) * up(x))`. On CUDA (`ggml_rs_cuda::exl3::Exl3Experts`), or on any
+/// GPU through WebGPU and the CPU (`ggml_rs_wgpu::exl3`).
+pub trait Experts: std::fmt::Debug + Send + Sync {
+    fn forward(&self, x: &Tensor, logits: &Tensor, top_k: usize) -> Tensor;
+}
+
 #[derive(Debug)]
 pub struct Exl3Data {
     pub words: Vec<u32>,

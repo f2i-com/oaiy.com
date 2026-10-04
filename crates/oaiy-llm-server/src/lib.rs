@@ -40,7 +40,6 @@ mod orcasaq;
 // Qwen3.8-Flash-Next (qwen4_exp, EXL3 on CUDA).
 #[cfg(feature = "cuda")]
 mod flashnext;
-#[cfg(feature = "cuda")]
 mod lora;
 mod qwen_cache;
 // Conversations Qwen3.8-Flash-Next sets aside in host RAM.

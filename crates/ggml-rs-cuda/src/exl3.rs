@@ -488,6 +488,12 @@ struct ExpertLora {
     rank: usize,
 }
 
+impl ggml_rs::exl3::Experts for Exl3Experts {
+    fn forward(&self, x: &Tensor, logits: &Tensor, top_k: usize) -> Tensor {
+        Exl3Experts::forward(self, x, logits, top_k)
+    }
+}
+
 impl Exl3Experts {
     /// Add a LoRA to projection `which` (0 gate, 1 up, 2 down) of the experts `slot_of` names
     /// (`u32::MAX` for none): A `[slots, rank, k]`, B `[slots, n, rank]`, scaled already.

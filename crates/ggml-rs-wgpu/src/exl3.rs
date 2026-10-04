@@ -160,16 +160,29 @@ impl PackedLinear for Exl3Cpu {
         for (row, out) in data.chunks_exact(k).zip(xh.chunks_exact_mut(k)) {
             self.t.pre(row, out);
         }
+        let mut y = self.matmul(&xh, m, std::thread::available_parallelism().map_or(4, |n| n.get()));
+        let mut out = vec![0f32; m * n];
+        for (yr, or) in y.chunks_exact_mut(n).zip(out.chunks_exact_mut(n)) {
+            self.t.post(yr, or);
+        }
+        Tensor::from_vec(out, shape)
+    }
+}
+
+impl Exl3Cpu {
+    /// The matmul's sums `[m, n]` for `m` prepared rows, on up to `threads` threads.
+    fn matmul(&self, xh: &[f32], m: usize, threads: usize) -> Vec<f32> {
+        let (k, n) = (self.t.k, self.t.n);
         let (ktiles, ntiles, nw) = (k / 16, n / 16, self.tile_words / 2);
         let pos = positions(self.tile_words);
         // Each thread takes a run of tile columns, all rows: its sums are its own.
-        let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(ntiles).max(1);
+        let threads = threads.min(ntiles).max(1);
         let per = ntiles.div_ceil(threads);
         let mut y = vec![0f32; m * n];
         let parts: Vec<Vec<f32>> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..threads)
                 .map(|th| {
-                    let (xh, pos, words) = (&xh, &pos, &self.words);
+                    let (pos, words) = (&pos, &self.words);
                     scope.spawn(move || {
                         let (a, b) = (th * per, ((th + 1) * per).min(ntiles));
                         let width = b.saturating_sub(a) * 16;
@@ -207,11 +220,7 @@ impl PackedLinear for Exl3Cpu {
                 y[row * n + a..row * n + a + width].copy_from_slice(&acc[row * width..(row + 1) * width]);
             }
         }
-        let mut out = vec![0f32; m * n];
-        for (yr, or) in y.chunks_exact_mut(n).zip(out.chunks_exact_mut(n)) {
-            self.t.post(yr, or);
-        }
-        Tensor::from_vec(out, shape)
+        y
     }
 }
 
@@ -438,13 +447,13 @@ impl Exl3Gpu {
         }
     }
 
-    /// One pass: `rows` (at most [`ROWS`]) prepared input rows, their matmul sums `[rows, n]`.
-    fn pass(&self, xh: &[f32], rows: usize) -> Vec<f32> {
+    /// Record one pass into `enc`: `rows` (at most [`ROWS`]) prepared input rows. Its partial sums are in the
+    /// returned buffer once `enc` has run ([`Recorded`]).
+    fn record(&self, enc: &mut wgpu::CommandEncoder, xh: &[f32], rows: usize) -> Recorded {
         let (k, n) = (self.t.k, self.t.n);
         let gpu = &self.gpu;
         let pipeline = gpu.exl3_pipeline(rows > 1);
         let slots: usize = self.chunks.iter().map(|c| c.3 as usize).sum();
-        let _one = self.serial.lock().unwrap_or_else(|p| p.into_inner());
         let bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
         let xbuf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("oaiy-exl3-x"),
@@ -458,12 +467,6 @@ impl Exl3Gpu {
             label: Some("oaiy-exl3-partial"),
             size: psize,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("oaiy-exl3-read"),
-            size: psize,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let ntiles = (n / 16) as u32;
@@ -494,7 +497,6 @@ impl Exl3Gpu {
             });
             groups.push((group, *splits));
         }
-        let mut enc = gpu.device.create_command_encoder(&Default::default());
         {
             let mut pass = enc.begin_compute_pass(&Default::default());
             pass.set_pipeline(&pipeline);
@@ -503,18 +505,60 @@ impl Exl3Gpu {
                 pass.dispatch_workgroups(ntiles.min(65535), ntiles.div_ceil(65535), *splits);
             }
         }
-        enc.copy_buffer_to_buffer(&pbuf, 0, &staging, 0, psize);
-        gpu.queue.submit([enc.finish()]);
-        let raw = gpu.map_read(&staging, psize);
-        let part: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-        let mut y = vec![0f32; rows * n];
-        for slot in part.chunks_exact(rows * n) {
-            for (a, b) in y.iter_mut().zip(slot) {
-                *a += b;
-            }
-        }
-        y
+        Recorded { part: pbuf, size: psize, rows, n, slots }
     }
+
+    /// One pass: `rows` (at most [`ROWS`]) prepared input rows, their matmul sums `[rows, n]`.
+    fn pass(&self, xh: &[f32], rows: usize) -> Vec<f32> {
+        let _one = self.serial.lock().unwrap_or_else(|p| p.into_inner());
+        let mut enc = self.gpu.device.create_command_encoder(&Default::default());
+        let recorded = self.record(&mut enc, xh, rows);
+        read_back(&self.gpu, enc, &[recorded]).pop().expect("one pass, one result")
+    }
+}
+
+/// A pass recorded into an encoder: its partial sums' buffer, `slots` of `[rows, n]`.
+struct Recorded {
+    part: wgpu::Buffer,
+    size: u64,
+    rows: usize,
+    n: usize,
+    slots: usize,
+}
+
+/// Run `enc`, which recorded `passes`, and read every pass's sums back with one submit and one mapping: each one's
+/// slots added up, `[rows, n]`.
+fn read_back(gpu: &Gpu, mut enc: wgpu::CommandEncoder, passes: &[Recorded]) -> Vec<Vec<f32>> {
+    let total: u64 = passes.iter().map(|r| r.size).sum();
+    let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("oaiy-exl3-read"),
+        size: total.max(4),
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut at = 0;
+    for r in passes {
+        enc.copy_buffer_to_buffer(&r.part, 0, &staging, at, r.size);
+        at += r.size;
+    }
+    gpu.queue.submit([enc.finish()]);
+    let raw = gpu.map_read(&staging, total.max(4));
+    let all: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let mut at = 0;
+    passes
+        .iter()
+        .map(|r| {
+            let len = r.slots * r.rows * r.n;
+            let mut y = vec![0f32; r.rows * r.n];
+            for slot in all[at..at + len].chunks_exact(r.rows * r.n) {
+                for (a, b) in y.iter_mut().zip(slot) {
+                    *a += b;
+                }
+            }
+            at += len;
+            y
+        })
+        .collect()
 }
 
 impl PackedLinear for Exl3Gpu {
@@ -544,6 +588,220 @@ impl PackedLinear for Exl3Gpu {
     }
 }
 
+/// One projection of an expert: its packed weights on the GPU, or decoded on the CPU.
+#[derive(Debug)]
+enum Proj {
+    Gpu(Exl3Gpu),
+    Cpu(Exl3Cpu),
+}
+
+impl Proj {
+    fn t(&self) -> &Transform {
+        match self {
+            Proj::Gpu(g) => &g.t,
+            Proj::Cpu(c) => &c.t,
+        }
+    }
+}
+
+/// A MoE layer's EXL3 experts (the shared one last) without CUDA: each projection on the GPU while the weight budget
+/// holds it, else decoded on the CPU, routed on the host exactly as `ggml_rs_cuda::exl3::Exl3Experts` routes.
+///
+/// A layer's work goes as two batches: every expert's gate and up projections for the rows routed to it, then every
+/// down projection. The GPU's of a batch are recorded into one command encoder and read back together, one submit
+/// for the lot (a decode step of Qwen3.8-Flash-Next would otherwise wait on 33 a layer); the CPU's run meanwhile, an
+/// expert a thread.
+pub struct Exl3MoeHost {
+    experts: Vec<[Proj; 3]>,
+    hidden: usize,
+    ff: usize,
+    gpu: Option<(Arc<Gpu>, Arc<Mutex<()>>)>,
+}
+
+impl std::fmt::Debug for Exl3MoeHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let on_gpu = self.experts.iter().flatten().filter(|p| matches!(p, Proj::Gpu(_))).count();
+        write!(f, "Exl3MoeHost({} experts of {}x{}, {} of {} projections on the GPU)", self.experts.len(), self.hidden, self.ff, on_gpu, 3 * self.experts.len())
+    }
+}
+
+/// One row's experts and their weights, as the CUDA routing gives them: the `top_k` of the routed experts by logit
+/// (a tie to the lower index), softmax-weighted among themselves, then the shared expert (index `routed`) weighted by
+/// the sigmoid of its gate.
+fn route(logits: &[f32], top_k: usize) -> Vec<(usize, f32)> {
+    let routed = logits.len() - 1;
+    let mut order: Vec<usize> = (0..routed).collect();
+    order.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
+    let top = &order[..top_k.min(routed)];
+    let max = logits[top[0]];
+    let sum: f32 = top.iter().map(|&e| (logits[e] - max).exp()).sum();
+    let mut out: Vec<(usize, f32)> = top.iter().map(|&e| (e, (logits[e] - max).exp() / sum)).collect();
+    out.push((routed, 1.0 / (1.0 + (-logits[routed]).exp())));
+    out
+}
+
+impl Exl3MoeHost {
+    fn new(experts: Vec<[Proj; 3]>, gpu: Option<(Arc<Gpu>, Arc<Mutex<()>>)>) -> Result<Self, String> {
+        let first = experts.first().ok_or("no experts")?;
+        let (hidden, ff) = (first[0].t().k, first[0].t().n);
+        for e in &experts {
+            let shapes = [e[0].t(), e[1].t(), e[2].t()].map(|t| (t.k, t.n));
+            if shapes != [(hidden, ff), (hidden, ff), (ff, hidden)] {
+                return Err("every expert needs gate and up of hidden -> ff, and down of ff -> hidden".into());
+            }
+        }
+        Ok(Self { experts, hidden, ff, gpu })
+    }
+
+    /// Each job's projection applied to its prepared rows: `(expert, which projection, rows [count, k])`. The GPU's
+    /// in one submit, the CPU's on threads meanwhile; each result post-transformed, `[count, n]`, in job order.
+    fn batch(&self, jobs: &[(usize, usize, Vec<f32>)]) -> Vec<Vec<f32>> {
+        let mut out: Vec<Option<Vec<f32>>> = (0..jobs.len()).map(|_| None).collect();
+        let cpu_jobs: Vec<usize> = (0..jobs.len()).filter(|&i| matches!(self.experts[jobs[i].0][jobs[i].1], Proj::Cpu(_))).collect();
+        let gpu_jobs: Vec<usize> = (0..jobs.len()).filter(|&i| matches!(self.experts[jobs[i].0][jobs[i].1], Proj::Gpu(_))).collect();
+        let finish = |i: usize, mut y: Vec<f32>| -> Vec<f32> {
+            let t = self.experts[jobs[i].0][jobs[i].1].t();
+            let rows = jobs[i].2.len() / t.k;
+            let mut o = vec![0f32; rows * t.n];
+            for (yr, or) in y.chunks_exact_mut(t.n).zip(o.chunks_exact_mut(t.n)) {
+                t.post(yr, or);
+            }
+            o
+        };
+        std::thread::scope(|scope| {
+            // The CPU's experts, one a thread, while the GPU works.
+            let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).max(1);
+            let per = cpu_jobs.len().div_ceil(threads).max(1);
+            let cpu_work: Vec<_> = cpu_jobs
+                .chunks(per)
+                .map(|part| {
+                    scope.spawn(move || {
+                        part.iter()
+                            .map(|&i| {
+                                let Proj::Cpu(c) = &self.experts[jobs[i].0][jobs[i].1] else { unreachable!() };
+                                (i, c.matmul(&jobs[i].2, jobs[i].2.len() / c.t.k, 1))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            if let (Some((gpu, serial)), false) = (&self.gpu, gpu_jobs.is_empty()) {
+                let _one = serial.lock().unwrap_or_else(|p| p.into_inner());
+                let mut enc = gpu.device.create_command_encoder(&Default::default());
+                // A job of more rows than a pass takes goes as several passes.
+                let mut passes = Vec::new();
+                let mut owner = Vec::new();
+                for &i in &gpu_jobs {
+                    let Proj::Gpu(g) = &self.experts[jobs[i].0][jobs[i].1] else { unreachable!() };
+                    let rows = jobs[i].2.len() / g.t.k;
+                    for start in (0..rows).step_by(ROWS) {
+                        let count = ROWS.min(rows - start);
+                        passes.push(g.record(&mut enc, &jobs[i].2[start * g.t.k..(start + count) * g.t.k], count));
+                        owner.push(i);
+                    }
+                }
+                for (i, y) in owner.into_iter().zip(read_back(gpu, enc, &passes)) {
+                    out[i].get_or_insert_with(Vec::new).extend(y);
+                }
+            }
+            for w in cpu_work {
+                for (i, y) in w.join().expect("an EXL3 expert worker panicked") {
+                    out[i] = Some(y);
+                }
+            }
+        });
+        out.into_iter().enumerate().map(|(i, y)| finish(i, y.expect("every job ran"))).collect()
+    }
+}
+
+impl ggml_rs::exl3::Experts for Exl3MoeHost {
+    fn forward(&self, x: &Tensor, logits: &Tensor, top_k: usize) -> Tensor {
+        let (h, f) = (self.hidden, self.ff);
+        let x = x.to_host();
+        let logits = logits.to_host();
+        let rows = x.numel() / h;
+        let width = self.experts.len();
+        // Each row's (expert, weight) assignments, in the row's own order.
+        let assign: Vec<Vec<(usize, f32)>> = (0..rows).map(|r| route(&logits.data()[r * width..(r + 1) * width], top_k)).collect();
+        // The rows routed to each expert, in row order: (row, its place among the row's assignments).
+        let mut by_expert: Vec<Vec<(usize, usize)>> = vec![Vec::new(); width];
+        for (r, a) in assign.iter().enumerate() {
+            for (j, &(e, _)) in a.iter().enumerate() {
+                by_expert[e].push((r, j));
+            }
+        }
+        let used: Vec<usize> = (0..width).filter(|&e| !by_expert[e].is_empty()).collect();
+        // Gate and up, every expert's rows at once.
+        let mut jobs = Vec::new();
+        for &e in &used {
+            for which in 0..2 {
+                let t = self.experts[e][which].t();
+                let mut xh = vec![0f32; by_expert[e].len() * h];
+                for (slot, &(r, _)) in by_expert[e].iter().enumerate() {
+                    t.pre(&x.data()[r * h..(r + 1) * h], &mut xh[slot * h..(slot + 1) * h]);
+                }
+                jobs.push((e, which, xh));
+            }
+        }
+        let gu = self.batch(&jobs);
+        // silu(gate) * up, then down, every expert's rows at once.
+        let mut jobs = Vec::new();
+        for (n, &e) in used.iter().enumerate() {
+            let (g, u) = (&gu[2 * n], &gu[2 * n + 1]);
+            let hidden: Vec<f32> = g.iter().zip(u).map(|(&g, &u)| g / (1.0 + (-g).exp()) * u).collect();
+            let t = self.experts[e][2].t();
+            let mut xh = vec![0f32; by_expert[e].len() * f];
+            for slot in 0..by_expert[e].len() {
+                t.pre(&hidden[slot * f..(slot + 1) * f], &mut xh[slot * f..(slot + 1) * f]);
+            }
+            jobs.push((e, 2, xh));
+        }
+        let down = self.batch(&jobs);
+        // Each row's experts summed in its own order, each weighted: the same sum every run.
+        let mut placed: Vec<Vec<Option<&[f32]>>> = assign.iter().map(|a| vec![None; a.len()]).collect();
+        for (n, &e) in used.iter().enumerate() {
+            for (slot, &(r, j)) in by_expert[e].iter().enumerate() {
+                placed[r][j] = Some(&down[n][slot * h..(slot + 1) * h]);
+            }
+        }
+        let mut out = vec![0f32; rows * h];
+        for (r, row) in out.chunks_exact_mut(h).enumerate() {
+            for (j, &(_, w)) in assign[r].iter().enumerate() {
+                let y = placed[r][j].expect("every assignment computed");
+                for (o, v) in row.iter_mut().zip(y) {
+                    *o += w * v;
+                }
+            }
+        }
+        Tensor::from_vec(out, vec![rows, h])
+    }
+}
+
+impl WgpuBackend {
+    /// A MoE layer's EXL3 experts (`experts[e]` its gate, up and down; the shared one last): each projection on the
+    /// GPU while the weight budget holds it, else on the CPU.
+    pub fn exl3_experts(&self, experts: Vec<[Exl3Data; 3]>) -> Result<Box<dyn ggml_rs::exl3::Experts>, String> {
+        let mut out = Vec::with_capacity(experts.len());
+        for e in experts {
+            let [g, u, d] = e;
+            out.push([self.proj(g)?, self.proj(u)?, self.proj(d)?]);
+        }
+        Ok(Box::new(Exl3MoeHost::new(out, Some((Arc::clone(&self.gpu), Arc::clone(&self.serial))))?))
+    }
+
+    fn proj(&self, data: Exl3Data) -> Result<Proj, String> {
+        data.validate()?;
+        let nbytes = data.words.len() as u64 * 4;
+        let fits_binding = (data.svh.len() / 16 * data.tile_words / 2 * 4) as u64 <= chunk_limit(&self.gpu.limits);
+        let prev = self.used.fetch_add(nbytes, Ordering::Relaxed);
+        if !fits_binding || prev + nbytes > self.budget {
+            self.used.fetch_sub(nbytes, Ordering::Relaxed);
+            return Ok(Proj::Cpu(Exl3Cpu::new(data)?));
+        }
+        Ok(Proj::Gpu(Exl3Gpu::upload(self, data, None)))
+    }
+}
+
 impl WgpuBackend {
     /// An EXL3 projection: on the GPU while the weight budget holds it, else on the CPU.
     pub fn exl3(&self, data: Exl3Data) -> Result<Arc<dyn PackedLinear>, String> {
@@ -567,6 +825,16 @@ impl WgpuBackend {
 /// An EXL3 projection on the CPU, for a computer without a GPU.
 pub fn exl3_cpu(data: Exl3Data) -> Result<Arc<dyn PackedLinear>, String> {
     Ok(Arc::new(Exl3Cpu::new(data)?))
+}
+
+/// A MoE layer's EXL3 experts on the CPU, for a computer without a GPU.
+pub fn exl3_experts_cpu(experts: Vec<[Exl3Data; 3]>) -> Result<Box<dyn ggml_rs::exl3::Experts>, String> {
+    let mut out = Vec::with_capacity(experts.len());
+    for e in experts {
+        let [g, u, d] = e;
+        out.push([Proj::Cpu(Exl3Cpu::new(g)?), Proj::Cpu(Exl3Cpu::new(u)?), Proj::Cpu(Exl3Cpu::new(d)?)]);
+    }
+    Ok(Box::new(Exl3MoeHost::new(out, None)?))
 }
 
 #[cfg(test)]
@@ -729,6 +997,90 @@ mod tests {
         let x = Tensor::from_vec((0..3 * k).map(|i| ((i * 17 % 73) as f32 - 36.0) / 37.0).collect(), vec![3, k]);
         let (g, c) = (gpu.linear(&x), cpu.linear(&x));
         close(g.data(), c.data(), "gpu vs cpu");
+    }
+
+    fn random_exl3(k: usize, n: usize, tw: usize, seed: u32) -> Exl3Data {
+        let mut s = seed;
+        let mut next = || {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            s
+        };
+        let words = (0..k / 16 * n / 16 * (tw / 2)).map(|_| next()).collect();
+        let mut scale = |len: usize, mag: f32| (0..len).map(|_| if next() & 1 == 0 { mag } else { -mag }).collect::<Vec<f32>>();
+        Exl3Data { suh: scale(k, 0.25), svh: scale(n, 0.125), words, tile_words: tw, input_map: (0..k as u32).collect(), output_map: (0..n as u32).collect() }
+    }
+
+    /// `count` experts plus the shared one, each `[gate, up, down]`.
+    fn experts(count: usize, hidden: usize, ff: usize, tw: usize) -> Vec<[Exl3Data; 3]> {
+        (0..=count as u32).map(|e| [random_exl3(hidden, ff, tw, 11 + e * 3), random_exl3(hidden, ff, tw, 12 + e * 3), random_exl3(ff, hidden, tw, 13 + e * 3)]).collect()
+    }
+
+    /// The MoE as its definition reads, from standalone projections: each row's top-k routed experts by logit (ties to
+    /// the lower index), softmax-weighted, plus the shared expert by the sigmoid of its gate.
+    fn reference(experts: Vec<[Exl3Data; 3]>, x: &[f32], logits: &[f32], top_k: usize) -> Vec<f32> {
+        let p: Vec<[Exl3Cpu; 3]> = experts.into_iter().map(|[g, u, d]| [Exl3Cpu::new(g).unwrap(), Exl3Cpu::new(u).unwrap(), Exl3Cpu::new(d).unwrap()]).collect();
+        let (h, width) = (p[0][0].t.k, p.len());
+        let mut out = vec![];
+        for (r, row) in x.chunks_exact(h).enumerate() {
+            let l = &logits[r * width..(r + 1) * width];
+            let mut idx: Vec<usize> = (0..width - 1).collect();
+            idx.sort_by(|&a, &b| l[b].partial_cmp(&l[a]).unwrap().then(a.cmp(&b)));
+            let top = &idx[..top_k];
+            let z: f32 = top.iter().map(|&e| (l[e] - l[top[0]]).exp()).sum();
+            let mut picks: Vec<(usize, f32)> = top.iter().map(|&e| (e, (l[e] - l[top[0]]).exp() / z)).collect();
+            picks.push((width - 1, 1.0 / (1.0 + (-l[width - 1]).exp())));
+            let mut acc = vec![0f32; h];
+            let xr = Tensor::from_vec(row.to_vec(), vec![1, h]);
+            for (e, w) in picks {
+                let g = p[e][0].linear(&xr);
+                let u = p[e][1].linear(&xr);
+                let hid: Vec<f32> = g.data().iter().zip(u.data()).map(|(&g, &u)| g / (1.0 + (-g).exp()) * u).collect();
+                let f = hid.len();
+                let d = p[e][2].linear(&Tensor::from_vec(hid, vec![1, f]));
+                for (a, v) in acc.iter_mut().zip(d.data()) {
+                    *a += w * v;
+                }
+            }
+            out.extend(acc);
+        }
+        out
+    }
+
+    #[test]
+    fn a_moe_layer_routes_and_mixes_as_its_definition_on_the_gpu_on_the_cpu_and_split_between_them() {
+        let (count, hidden, ff, top_k) = (8, 256, 128, 3);
+        for tw in [48, 80] {
+            for rows in [1, 7] {
+                let x: Vec<f32> = (0..rows * hidden).map(|i| ((i * 37 % 101) as f32 - 50.0) / 60.0).collect();
+                let logits: Vec<f32> = (0..rows * (count + 1)).map(|i| ((i * 53 % 29) as f32 - 14.0) / 7.0).collect();
+                let want = reference(experts(count, hidden, ff, tw), &x, &logits, top_k);
+                let xt = Tensor::from_vec(x.clone(), vec![rows, hidden]);
+                let lt = Tensor::from_vec(logits.clone(), vec![rows, count + 1]);
+                let cpu = exl3_experts_cpu(experts(count, hidden, ff, tw)).unwrap();
+                close(cpu.forward(&xt, &lt, top_k).data(), &want, &format!("cpu moe tw={tw} rows={rows}"));
+                let Some(b) = backend() else { continue };
+                let gpu = b.exl3_experts(experts(count, hidden, ff, tw)).unwrap();
+                assert!(format!("{gpu:?}").contains(&format!("{} of {} projections on the GPU", 3 * (count + 1), 3 * (count + 1))), "{gpu:?}");
+                close(gpu.forward(&xt, &lt, top_k).data(), &want, &format!("gpu moe tw={tw} rows={rows}"));
+                drop(gpu);
+                // A budget for some of the experts: the rest decode on the CPU, and the layer is the same.
+                let one = (hidden * ff * tw / 128) as u64;
+                let Ok(small) = WgpuBackend::new(Some(one * 10)) else { continue };
+                let split = small.exl3_experts(experts(count, hidden, ff, tw)).unwrap();
+                assert!(format!("{split:?}").contains("10 of 27 projections on the GPU"), "{split:?}");
+                close(split.forward(&xt, &lt, top_k).data(), &want, &format!("split moe tw={tw} rows={rows}"));
+            }
+        }
+    }
+
+    #[test]
+    fn routing_takes_the_top_k_ties_to_the_lower_index_and_the_shared_expert_by_its_gate() {
+        let r = route(&[1.0, 3.0, 3.0, 2.0, 0.0], 2);
+        assert_eq!(r.iter().map(|p| p.0).collect::<Vec<_>>(), vec![1, 2, 4]);
+        assert!((r[0].1 - 0.5).abs() < 1e-6 && (r[1].1 - 0.5).abs() < 1e-6, "{r:?}");
+        assert!((r[2].1 - 0.5).abs() < 1e-6, "sigmoid(0) for the shared expert: {r:?}");
+        let r = route(&[0.0, 0.0, 0.0, 5.0], 1);
+        assert_eq!(r[0], (0, 1.0), "a three-way tie goes to the lowest index");
     }
 
     #[test]

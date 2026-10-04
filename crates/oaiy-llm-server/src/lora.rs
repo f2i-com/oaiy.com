@@ -867,6 +867,7 @@ mod tests {
     fn adapter_math_and_channel_maps_match_dense_equation() {
         compare(Arc::new(CpuBackend::new()));
     }
+    #[cfg(feature = "cuda")]
     #[test]
     fn cuda_adapter_math_matches_dense_equation() {
         if let Ok(backend) = ggml_rs_cuda::CudaBackend::new(0) {
