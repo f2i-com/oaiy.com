@@ -310,7 +310,7 @@ impl StreamExperts {
     }
 
     /// VRAM held back on each card: room for the activations, the pinned staging
-    /// ring, cuBLAS workspaces and the driver's own overhead.
+    /// ring, the kernels' workspaces and the driver's own overhead.
     ///
     /// Decode activations are tiny -- a 4 x 4096 residual stream is 64 KB, the
     /// widest FFN intermediate 8 KB -- but a matvec still needs somewhere to put

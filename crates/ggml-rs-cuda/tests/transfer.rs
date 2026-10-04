@@ -183,7 +183,7 @@ fn overlap_smoke() {
     let spin_cycles = (0.002 / per_spin * 1_000_000.0) as i64; // ~2 ms each
     let spin_iters = 40; // ~80 ms of queued compute
 
-    // --- compute payload B (report-only): saturating cuBLAS GEMMs.
+    // --- compute payload B (report-only): saturating GEMMs (gemm_f32).
     let w = cuda.to_device(Tensor::from_vec(
         deterministic_floats(4096 * 4096, 0.02, 7),
         vec![4096, 4096],
@@ -265,7 +265,7 @@ fn overlap_smoke() {
         t0.elapsed()
     };
 
-    // Warm both phases once (allocator pools, cublas heuristics), then judge
+    // Warm both phases once (allocator pools), then judge
     // the best of 3 measured trials.
     let _ = run_phase(false, true);
     let _ = run_phase(false, false);

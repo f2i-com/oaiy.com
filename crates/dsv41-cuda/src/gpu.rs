@@ -18,10 +18,10 @@ use cudarc::driver::{
     sys, CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtrMut, DeviceRepr,
     LaunchConfig, PushKernelArg, ValidAsZeroBits,
 };
-use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use oaiy_engine::{Error, Result};
 
-const SRC: &str = concat!(include_str!("kernels.cu"), "\nextern \"C\" {\n", include_str!("ternary.cuh"), "\n}\n");
+// `kernel_image(cc)`: kernels.cu and ternary.cuh compiled at build time (build.rs), one picked for a device.
+include!(concat!(env!("OUT_DIR"), "/dsv41_images.rs"));
 const KERNELS: &[&str] = &[
     "act_quant_fp8",
     "act_quant_fp8_to",
@@ -183,20 +183,10 @@ impl Gpu {
         // PERF-02), which at thousands of launches per token dominates decode.
         unsafe { ctx.disable_event_tracking() };
         let stream = ctx.default_stream();
-        // compile for this device, so the kernels can use its instructions
-        // (e.g. the sm_89+ fp8 -> f16 conversion); unknown ones keep NVRTC's default
-        let arch = match cu(ctx.compute_capability())? {
-            (12, 0) => Some("compute_120"),
-            (10, 0) => Some("compute_100"),
-            (9, 0) => Some("compute_90"),
-            (8, 9) => Some("compute_89"),
-            (8, 6) => Some("compute_86"),
-            (8, 0) => Some("compute_80"),
-            _ => None,
-        };
-        let opts = CompileOptions { fmad: Some(false), arch, ..Default::default() };
-        let ptx = cu(compile_ptx_with_opts(SRC, opts))?;
-        let module = cu(ctx.load_module(ptx))?;
+        // machine code for this device, compiled at build time (build.rs) with
+        // --fmad=false, so the kernels use its instructions (e.g. the sm_89+ fp8 -> f16
+        // conversion); no NVRTC at run time
+        let module = cu(ctx.load_module_image(kernel_image(cu(ctx.compute_capability())?)))?;
         let mut funcs = HashMap::new();
         for &k in KERNELS {
             funcs.insert(k, cu(module.load_function(k))?);

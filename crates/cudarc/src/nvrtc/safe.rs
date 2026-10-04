@@ -86,6 +86,9 @@ pub(crate) enum PtxKind {
     File(PathBuf),
 
     /// Binary CUBIN data
+    // VENDORED-LOCAL: only the driver's `load_module` reads it; the engines' build-time
+    // compiler (crates/oaiy-cuda-build) uses NVRTC without the driver.
+    #[cfg_attr(not(feature = "driver"), allow(dead_code))]
     Binary(Vec<u8>),
 }
 

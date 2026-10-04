@@ -42,6 +42,9 @@ members = [
     # needs a CUDA toolchain (cudarc dynamic-linking), so the default build
     # stays CPU-only. Opt in with `cargo build -p oaiy-llm-cli --features cuda`.
     "crates/ggml-rs-cuda",
+    # Their kernels' build-time compiler (NVRTC to a cubin per GPU architecture), a
+    # build-dependency of ggml-rs-cuda and dsv41-cuda: like them, not a default member.
+    "crates/oaiy-cuda-build",
     # WebGPU backend (VENDORED-LOCAL addition beside ggml-rs-cuda): quantized
     # matmuls on any wgpu adapter for machines without CUDA. A member, not a
     # default member: wgpu adds minutes to every default build.

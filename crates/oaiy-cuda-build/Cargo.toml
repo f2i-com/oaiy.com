@@ -1,0 +1,14 @@
+[package]
+name        = "oaiy-cuda-build"
+version     = "0.0.1"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+description = "Build-time CUDA kernel compilation for the engines: NVRTC to a cubin per GPU architecture, and PTX."
+publish     = false
+
+# A build-dependency of ggml-rs-cuda and dsv41-cuda only, so NVRTC is needed where the
+# engines are built and not where they run. `dynamic-loading`: the build script loads
+# NVRTC from the CUDA toolkit (resolver 2 keeps these features apart from the engines'
+# `dynamic-linking` cudarc).
+[dependencies]
+cudarc = { version = "0.19", features = ["cuda-version-from-build-system", "nvrtc", "dynamic-loading"], default-features = false }

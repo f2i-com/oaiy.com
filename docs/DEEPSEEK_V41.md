@@ -189,7 +189,8 @@ the chat encoder and serving in item 7.
    - hc mixes + Sinkhorn.
    - Compressor pooling, indexer scoring, Engram gather and gate.
    - FP8/FP4 act-quant simulation.
-   - All compile via NVRTC for sm_120.
+   - All compiled through NVRTC (since 2026-10-05 at build time, a cubin per GPU
+     architecture: `crates/oaiy-cuda-build`).
 4. **Kernels, CPU:** the AVX-512 MXFP4 expert kernel (hybrid path).
 5. **The V4.1 forward** (`model.py` → Rust, ~3–5k lines). The Engram precompute
    exists (`oracle.py` writes `engram_meta.safetensors`). No converter is needed:
@@ -288,7 +289,8 @@ the chat encoder and serving in item 7.
 - **Where it lives:** `crates/dsv41-cuda`, a member but not a default member (it needs
   CUDA). It holds the only `unsafe`: cudarc kernel launches, one typed wrapper each,
   with a SAFETY note and length asserts.
-- **Kernels:** 20 NVRTC kernels (`src/kernels.cu`, `--fmad=false`). Each is tested
+- **Kernels:** 20 kernels (`src/kernels.cu`, `--fmad=false`), compiled through NVRTC at
+  build time into a cubin per GPU architecture (`build.rs`). Each is tested
   against its `dsv41` CPU function (`tests/kernels.rs`):
   - The fp8/fp4 quantizers, RoPE and hc pre/post are bit-exact.
   - GEMVs, norms, attention, pooling and the Engram gate are bit-exact after bf16

@@ -664,6 +664,7 @@ version = "0.1.0"
 dependencies = [
  "cudarc 0.19.8",
  "dsv41",
+ "oaiy-cuda-build",
  "oaiy-engine",
 ]
 
@@ -1170,6 +1171,7 @@ dependencies = [
  "ggml-quants",
  "ggml-rs",
  "half",
+ "oaiy-cuda-build",
  "rayon",
  "thiserror 1.0.69",
 ]
@@ -1774,6 +1776,13 @@ dependencies = [
  "unicode-normalization",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "oaiy-cuda-build"
+version = "0.0.1"
+dependencies = [
+ "cudarc 0.19.8",
 ]
 
 [[package]]

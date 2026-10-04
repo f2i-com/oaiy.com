@@ -444,7 +444,8 @@ Recommended work:
 - use vectorized/coalesced loads and architecture-appropriate integer dot instructions;
 - add tiled dequantize-and-GEMM/tensor-core paths for prompt blocks and batched decode;
 - keep activations in FP16/BF16 where error gates allow it;
-- cache compiled kernels by device architecture rather than compiling all NVRTC code at every startup;
+- ~~cache compiled kernels by device architecture rather than compiling all NVRTC code at every startup~~
+  (done 2026-10-05: they are compiled at build time, a cubin per architecture, `crates/oaiy-cuda-build`);
 - benchmark or adapt proven kernels from projects such as llama.cpp, CUTLASS, or cuBLASLt after license and layout review;
 - retain a slow reference kernel for differential tests.
 

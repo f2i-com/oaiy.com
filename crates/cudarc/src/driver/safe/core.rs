@@ -2318,6 +2318,15 @@ impl Drop for CudaModule {
 }
 
 impl CudaContext {
+    /// VENDORED-LOCAL: load a module compiled ahead of time (a cubin, or PTX text ending
+    /// in a NUL), without the `nvrtc` feature: the OAIY engines build their kernels at
+    /// compile time (crates/oaiy-cuda-build) and ship without NVRTC.
+    pub fn load_module_image(self: &Arc<Self>, image: &[u8]) -> Result<Arc<CudaModule>, result::DriverError> {
+        self.bind_to_thread()?;
+        let cu_module = unsafe { result::module::load_data(image.as_ptr() as *const _) }?;
+        Ok(Arc::new(CudaModule { cu_module, ctx: self.clone() }))
+    }
+
     /// Dynamically load a compiled ptx into this context.
     ///
     /// - `ptx` contains the compiled ptx

@@ -126,7 +126,8 @@ Observed validation on the two RTX 5090s:
   added to conceal these model outputs.
 
 The optimized image encoder uses GPU axial/interleaved position rotations and
-cuBLAS batched full-attention products. The score scratch is bounded to 384 MiB
+batched full-attention products (the tiled `gemm_f32` that replaced cuBLAS, at about
+92% of its speed there). The score scratch is bounded to 384 MiB
 (324 MiB for this tower); causal/long-context attention keeps its existing path.
 Qwen prompt processing uses batches of up to 512 tokens, reducing repeated EXL3
 weight reconstruction. The 260K capacity test also exercises this image batch.

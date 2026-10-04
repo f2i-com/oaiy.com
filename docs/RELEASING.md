@@ -342,7 +342,9 @@ a release matter here:
 
 - **The CUDA engines.** The programs that run models fastest on an NVIDIA card:
   `oaiy-llm-server` and `oaiy-media`, built with CUDA 12.8 and the Visual Studio 2022 C++
-  tools (the NVIDIA libraries they need come to about 850 MB); the `oaiy-studio` host and
+  tools. `oaiy-llm-server` needs nothing from NVIDIA but the driver's `nvcuda.dll` (its
+  kernels are compiled at build time, a cubin per GPU architecture, and its GEMM is its own;
+  26 MB); `oaiy-media` still loads cuBLAS, cuRAND and the CUDA runtime (about 840 MB); the `oaiy-studio` host and
   its tray; and `oaiy-voice`, the speech server for calls. `tools/qwen-image/build.ps1`
   builds all of them on Windows but `oaiy-voice`, which is a crate of its own (its `cuda`
   and `flash-attn` features put it on the GPU). They are built by hand: they are a separate

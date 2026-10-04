@@ -1772,3 +1772,45 @@ fn swiglu_clamped_matches_cpu() {
     // pre-activation: silu(clamp(5)=2) = 1.7616
     assert!((b.data()[0] - 1.7616).abs() < 1e-3, "got {}", b.data()[0]);
 }
+
+#[test]
+fn a_large_linear_matches_cpu_across_partial_tiles() {
+    // Above the 100M-FLOP line `linear` takes its tiled GEMM, with no size a multiple of the tiles.
+    let Some(cuda) = try_cuda() else { return };
+    let cpu = CpuBackend::new();
+    let (m, n, k) = (257, 1001, 777);
+    let x = Tensor::from_vec(deterministic_floats(m * k, 1.0, 41), vec![m, k]);
+    let w = Tensor::from_vec(deterministic_floats(n * k, 1.0, 42), vec![n, k]);
+    let cpu_y = cpu.linear(&x, &w);
+    let cuda_y = cuda.linear(&cuda.to_device(x), &cuda.to_device(w));
+    assert_tensors_close(&cuda_y, &cpu_y, 1e-4);
+}
+
+/// How long a prefill-sized F32 linear and a full vision attention take (`--ignored --nocapture`).
+#[test]
+#[ignore = "timing"]
+fn time_a_prefill_linear_and_vision_attention() {
+    let Some(cuda) = try_cuda() else { return };
+    for (m, n, k) in [(512, 4096, 4096), (2048, 4096, 4096), (2048, 11008, 4096)] {
+        let x = cuda.to_device(Tensor::from_vec(deterministic_floats(m * k, 1.0, 7), vec![m, k]));
+        let w = cuda.to_device(Tensor::from_vec(deterministic_floats(n * k, 1.0, 8), vec![n, k]));
+        for _ in 0..3 { cuda.linear(&x, &w); }
+        cuda.synchronize();
+        let t = std::time::Instant::now();
+        for _ in 0..20 { cuda.linear(&x, &w); }
+        cuda.synchronize();
+        let s = t.elapsed().as_secs_f64() / 20.0;
+        eprintln!("linear {m}x{n}x{k}: {:.3} ms, {:.1} TFLOP/s", s * 1e3, 2.0 * (m * n * k) as f64 / s / 1e12);
+    }
+    for (seq, heads, hd) in [(1024, 16, 64), (4096, 16, 80)] {
+        let make = |seed| cuda.to_device(Tensor::from_vec(deterministic_floats(seq * heads * hd, 1.0, seed), vec![seq, heads, hd]));
+        let (q, kk, v) = (make(1), make(2), make(3));
+        let scale = 1.0 / (hd as f32).sqrt();
+        for _ in 0..2 { cuda.attention(&q, &kk, &v, seq, scale, seq, None); }
+        cuda.synchronize();
+        let t = std::time::Instant::now();
+        for _ in 0..10 { cuda.attention(&q, &kk, &v, seq, scale, seq, None); }
+        cuda.synchronize();
+        eprintln!("vision attention seq {seq}, {heads} heads of {hd}: {:.3} ms", t.elapsed().as_secs_f64() * 100.0);
+    }
+}

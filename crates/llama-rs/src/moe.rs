@@ -8,7 +8,7 @@
 //!
 //! Performance note: this first implementation is a host-driven loop over
 //! (token, expert) pairs — correct but un-fused. Each expert dispatch goes
-//! through the existing `linear` op which uses cuBLAS / coop GEMV. For decode
+//! through the existing `linear` op (a tiled GEMM / coop GEMV). For decode
 //! (seq=1, top-K typically 2 or 8), that's K expert FFNs per layer per token —
 //! manageable. Prefill is the pain point: O(seq × top_k) dispatches per layer.
 //! A future fused-MoE CUDA kernel (one launch handles routing + dispatch +

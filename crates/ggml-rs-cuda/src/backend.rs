@@ -13,30 +13,23 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
-use cudarc::cublas::sys::cublasOperation_t;
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
-use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use ggml_quants::GgmlType;
 use ggml_rs::backend::{Backend, RopeType};
 use ggml_rs::quantized::{QuantizedDeviceStorage, QuantizedTensor};
 use ggml_rs::tensor::{DeviceStorage, Tensor};
 use thiserror::Error;
 
-use crate::kernels::{KERNEL_NAMES, KERNEL_SRC};
+use crate::kernels::{kernel_image, KERNEL_NAMES};
 
 #[derive(Debug, Error)]
 pub enum CudaError {
     #[error("cuda driver error: {0:?}")]
     Driver(cudarc::driver::DriverError),
 
-    #[error("nvrtc compile error: {0:?}")]
-    Nvrtc(cudarc::nvrtc::CompileError),
 
-    #[error("cublas error: {0}")]
-    Cublas(String),
 
     #[error("kernel `{0}` not found in compiled module")]
     MissingKernel(&'static str),
@@ -44,12 +37,6 @@ pub enum CudaError {
 
 impl From<cudarc::driver::DriverError> for CudaError {
     fn from(e: cudarc::driver::DriverError) -> Self { Self::Driver(e) }
-}
-impl From<cudarc::nvrtc::CompileError> for CudaError {
-    fn from(e: cudarc::nvrtc::CompileError) -> Self { Self::Nvrtc(e) }
-}
-impl From<cudarc::cublas::result::CublasError> for CudaError {
-    fn from(e: cudarc::cublas::result::CublasError) -> Self { Self::Cublas(format!("{e:?}")) }
 }
 
 // ----- Device storage -------------------------------------------------------
@@ -155,7 +142,6 @@ pub struct CudaBackend {
     #[allow(dead_code)]
     module: Arc<CudaModule>,
     funcs:  HashMap<&'static str, CudaFunction>,
-    blas:   CudaBlas,
     // VENDORED-LOCAL: GPU-02 — dedicated non-blocking H2D transfer stream and
     // a recycling pool of completion events (steady-state decode must not
     // create a CUDA event per upload).
@@ -382,32 +368,17 @@ impl CudaBackend {
         let ctx = CudaContext::new(device_ordinal)?;
         let stream = if own { ctx.new_stream()? } else { ctx.default_stream() };
 
-        // VENDORED-LOCAL: target the installed GPU so EXL3 can sum four
-        // codebook bytes with one DP4A instruction. Older devices keep the
-        // scalar fallback; no relaxed floating-point compiler flags are used.
-        let arch = match ctx.compute_capability()? {
-            (12, 0) => Some("compute_120"),
-            (10, 0) => Some("compute_100"),
-            (9, 0) => Some("compute_90"),
-            (8, 9) => Some("compute_89"),
-            (8, 6) => Some("compute_86"),
-            (8, 0) => Some("compute_80"),
-            (7, 5) => Some("compute_75"),
-            (7, 0) => Some("compute_70"),
-            (6, 1) => Some("compute_61"),
-            _ => None,
-        };
-        let ptx = compile_ptx_with_opts(format!("{}\n{}\n{}", KERNEL_SRC, include_str!("exl3.cu"), include_str!("long_attention.cu")),
-            CompileOptions { arch, ..Default::default() })?;
-        let module = ctx.load_module(ptx)?;
+        // VENDORED-LOCAL: machine code for the installed GPU, compiled at build
+        // time (build.rs), so EXL3 can sum four codebook bytes with one DP4A
+        // instruction; older devices keep the scalar fallback, and no relaxed
+        // floating-point compiler flags are used. No NVRTC at run time.
+        let module = ctx.load_module_image(kernel_image(ctx.compute_capability()?))?;
 
         let mut funcs = HashMap::with_capacity(KERNEL_NAMES.len());
         for &n in KERNEL_NAMES {
             let f = module.load_function(n).map_err(|_| CudaError::MissingKernel(n))?;
             funcs.insert(n, f);
         }
-
-        let blas = CudaBlas::new(stream.clone())?;
 
         // VENDORED-LOCAL: GPU-02/PERF-02 — turn cudarc's per-slice event
         // tracking OFF for the whole context. With tracking on (the cudarc
@@ -440,7 +411,6 @@ impl CudaBackend {
             stream,
             module,
             funcs,
-            blas,
             h2d: Default::default(), // created lazily — see the field comment
             event_pool: Default::default(),
             rope_positions: Default::default(),
@@ -567,6 +537,32 @@ impl CudaBackend {
 
     // VENDORED-LOCAL: MOE-01/02 — pub(crate) for the moe module's launches.
     pub(crate) fn func(&self, name: &'static str) -> &CudaFunction { &self.funcs[name] }
+
+    /// VENDORED-LOCAL: `gemm_f32` (kernels.cu), the GEMM cuBLAS ran: for each of `batch`
+    /// batches, `c[m*ldc + n] = alpha * Σ_k a[m*lda + k] · B(k, n)`, B(k, n) being
+    /// `b[n*ldb + k]` when `b_nk` and `b[k*ldb + n]` otherwise, batch z's operands offset by
+    /// z times their strides `(batch, sa, sb, sc)`.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm(&self, a: &CudaSlice<f32>, b: &CudaSlice<f32>, c: &mut CudaSlice<f32>, (m, n, k): (usize, usize, usize),
+            (lda, ldb, ldc): (usize, usize, usize), b_nk: bool, (batch, sa, sb, sc): (usize, usize, usize, usize), alpha: f32) {
+        let cfg = LaunchConfig {
+            grid_dim: ((n as u32).div_ceil(128), (m as u32).div_ceil(128), batch as u32),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (mi, ni, ki, lda, ldb, ldc, b_nk) = (m as i32, n as i32, k as i32, lda as i32, ldb as i32, ldc as i32, b_nk as i32);
+        let (sa, sb, sc) = (sa as i64, sb as i64, sc as i64);
+        // SAFETY: the callers size a, b and c for these shapes, strides and batches; every
+        // element of C in range is written; one ordered stream.
+        unsafe {
+            self.stream.launch_builder(self.func("gemm_f32"))
+                .arg(a).arg(b).arg(c)
+                .arg(&mi).arg(&ni).arg(&ki).arg(&lda).arg(&ldb).arg(&ldc).arg(&b_nk)
+                .arg(&sa).arg(&sb).arg(&sc).arg(&alpha)
+                .launch(cfg)
+                .expect("gemm_f32 launch");
+        }
+    }
     // VENDORED-LOCAL: MOE-01/02 — pub(crate) for the moe module's launches.
     pub(crate) fn func_dyn(&self, name: &str) -> &CudaFunction {
         self.funcs.get(name).unwrap_or_else(|| panic!("CUDA kernel `{name}` not loaded"))
@@ -1016,10 +1012,10 @@ impl Backend for CudaBackend {
         //
         // Dispatch by problem size:
         //   * < ~100M FLOPs (tiny models, decode step): our naive 16×16 kernel
-        //     wins because cuBLAS's per-call setup dominates the compute.
-        //   * ≥ 100M FLOPs (real-world prefill on ~1B+ models): cuBLAS Sgemm.
-        //     Column-major math: Y_cm[n,m] = Σ_k W_cm[k,n] * X_cm[k,m]
-        //     = op_T(W_cm) · X_cm with m=N, n=M, k=K.
+        //     wins (the line was measured against cuBLAS's per-call setup;
+        //     the tiled GEMM that replaced it keeps it).
+        //   * ≥ 100M FLOPs (real-world prefill on ~1B+ models): the tiled
+        //     `gemm_f32` (VENDORED-LOCAL: it replaced cuBLAS Sgemm).
         //
         // The crossover was measured empirically on RTX 5090 / sm_120; we
         // expect to revisit when we add quantized matmul or change kernels.
@@ -1034,7 +1030,7 @@ impl Backend for CudaBackend {
         let mut c = self.alloc_uninit(m_rows * out);
 
         // Decode-time GEMV fast path: same coop pattern as the quantized kernels,
-        // but for dense F32 weights. Below the cuBLAS threshold the alternative
+        // but for dense F32 weights. Below the GEMM threshold the alternative
         // is the naive 16×16 kernel which only has 1 productive thread per warp
         // at M=1; the coop version uses all 32. Used by Qwen3.6 27B's F32
         // ssm_ba matmul (96×5120, 48× per token).
@@ -1108,22 +1104,7 @@ impl Backend for CudaBackend {
 
         let flops = (m_rows as u64) * (out as u64) * (in_ as u64);
         if flops >= 100_000_000 {
-            let cfg = GemmConfig {
-                transa: cublasOperation_t::CUBLAS_OP_T,
-                transb: cublasOperation_t::CUBLAS_OP_N,
-                m: out as i32,
-                n: m_rows as i32,
-                k: in_ as i32,
-                alpha: 1.0f32,
-                beta: 0.0f32,
-                lda: in_ as i32,
-                ldb: in_ as i32,
-                ldc: out as i32,
-            };
-            unsafe {
-                self.blas.gemm(cfg, b.as_ref(), a.as_ref(), &mut c)
-                    .expect("cublas sgemm");
-            }
+            self.gemm(a.as_ref(), b.as_ref(), &mut c, (m_rows, out, in_), (in_, in_, out), true, (1, 0, 0, 0), 1.0);
         } else {
             let block = (16u32, 16u32, 1u32);
             let grid = (
@@ -1155,7 +1136,7 @@ impl Backend for CudaBackend {
     }
 
     // VENDORED-LOCAL: eliminate two output allocations, their zero fills, and
-    // a separate add for each decode-time adapter. Prefill retains cuBLAS GEMM.
+    // a separate add for each decode-time adapter. Prefill keeps the tiled GEMM.
     fn add_lora(&self, y: &mut Tensor, x: &Tensor, a: &Tensor, b: &Tensor) {
         let k = a.dim(1);
         let rank = a.dim(0);
@@ -2659,38 +2640,25 @@ impl Backend for CudaBackend {
         }
 
         // VENDORED-LOCAL: full bidirectional vision attention. A bounded score
-        // matrix lets cuBLAS reuse tiles instead of rereading K/V per query.
+        // matrix lets the tiled GEMM reuse tiles instead of rereading K/V per query.
         // Never select this path for causal decoding or long-context attention.
         if seq>=128 && seq==kv_len && n_h_q==n_h_kv && past>=kv_len
             && sliding_window.is_none() && seq.checked_mul(seq).and_then(|n|n.checked_mul(n_h_q)).is_some_and(|n|n<=96*1024*1024) {
             let q=self.cuda_input(q);
             let k=self.cuda_input(k_buffer);
             let v=self.cuda_input(v_buffer);
-            // SAFETY: both GEMMs fully write their outputs with beta=0.
+            // SAFETY: both GEMMs write every element of their outputs.
             let mut scores=unsafe { self.stream.alloc::<f32>(seq*seq*n_h_q) }.expect("vision scores");
-            // SAFETY: PV GEMM writes every output element with beta=0.
+            // SAFETY: the PV GEMM writes every output element.
             let mut out=unsafe { self.stream.alloc::<f32>(seq*n_h_q*hd) }.expect("vision attention output");
-            let cfg=StridedBatchedConfig {
-                gemm:GemmConfig {transa:cublasOperation_t::CUBLAS_OP_T,transb:cublasOperation_t::CUBLAS_OP_N,
-                    m:seq as i32,n:seq as i32,k:hd as i32,alpha:scale,beta:0.0,
-                    lda:(n_h_q*hd) as i32,ldb:(n_h_q*hd) as i32,ldc:seq as i32},
-                batch_size:n_h_q as i32,stride_a:hd as i64,stride_b:hd as i64,stride_c:(seq*seq) as i64,
-            };
-            // SAFETY: input views are [head_dim,seq] columns with interleaved
-            // heads; each output head owns seq*seq contiguous score elements.
-            unsafe { self.blas.gemm_strided_batched(cfg,k.as_ref(),q.as_ref(),&mut scores).expect("vision QK GEMM"); }
+            // Head h: scores[h][i][j] = scale * sum_d q[i,h,d] k[j,h,d] (q and k rows heads*hd apart).
+            let w=n_h_q*hd;
+            self.gemm(q.as_ref(),k.as_ref(),&mut scores,(seq,seq,hd),(w,w,seq),true,(n_h_q,hd,hd,seq*seq),scale);
             let mut scores=self.make_tensor(scores,vec![n_h_q,seq,seq]);
             self.softmax_last(&mut scores);
             let scores=self.cuda_input(&scores);
-            let cfg=StridedBatchedConfig {
-                gemm:GemmConfig {transa:cublasOperation_t::CUBLAS_OP_N,transb:cublasOperation_t::CUBLAS_OP_N,
-                    m:hd as i32,n:seq as i32,k:seq as i32,alpha:1.0,beta:0.0,
-                    lda:(n_h_q*hd) as i32,ldb:seq as i32,ldc:(n_h_q*hd) as i32},
-                batch_size:n_h_q as i32,stride_a:hd as i64,stride_b:(seq*seq) as i64,stride_c:hd as i64,
-            };
-            // SAFETY: head h writes columns at row*heads*hd+h*hd. Heads own
-            // disjoint elements even though their column spans interleave.
-            unsafe { self.blas.gemm_strided_batched(cfg,v.as_ref(),scores.as_ref(),&mut out).expect("vision PV GEMM"); }
+            // out[i,h,d] = sum_j scores[h][i][j] v[j,h,d]: each head writes its own hd columns of every row.
+            self.gemm(scores.as_ref(),v.as_ref(),&mut out,(seq,hd,seq),(seq,w,w),false,(n_h_q,seq*seq,hd,hd),1.0);
             return self.make_tensor(out,vec![seq,n_h_q,hd]);
         }
 
