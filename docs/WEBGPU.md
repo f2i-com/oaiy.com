@@ -79,30 +79,52 @@ and DeepSeek-V4.1 run on it too (below).
 
 The CPU model (`dsv41::model`, the reference the CUDA path is tested against) serves it,
 with what measured slowest on the CPU moved (docs/DEEPSEEK_V41.md, "The CPU model,
-measured"): its dense trunk, the 390 fp8 and bf16 matrices of 9.7 GB, on the adapter
-(`ggml_rs_wgpu::dense`; the activation still quantized and the result still rounded by
-the CPU model, so the answer matches: cosine 1.000000 and the same greedy tokens); a
-prompt's busy routed experts (eight tokens or more) there too, MXFP4 uploaded for the
-prompt, gate and up of a group of experts in one submit and the downs in another; the
-sparse attention and the indexer's scores spread over the CPU's threads (they were
-serial, and most of a prompt's time); a layer's expert records read eight at a time. A
-decode step's experts stay on the CPU's tiers (RAM, then the drive). A conversation's
-next turn continues the state the last prompt left (a checkpoint a token short of its
-end, since the next prompt writes the last reply its own way), reading only the new
-tail in one chunk (`dsv41` continues a sequence by a chunk exactly as it would token by
-token).
+measured"; `dsv41::profile` says where a pass's time goes):
 
-On the RTX 5090 (2026-10-05), 27 GiB budget, 192 GB of RAM, the checkpoint on a USB SSD
-(about 1.2 GB/s, the bound of every read below):
+- Its dense trunk, the 390 fp8 and bf16 matrices of 9.7 GB, on the adapter
+  (`ggml_rs_wgpu::dense`; the activation still quantized and the result still rounded by
+  the CPU model, so the answer matches: cosine 1.000000 and the same greedy tokens).
+  Projections of one input go in one submit (a layer's eight `wo_a` groups, `wq_a` with
+  `wkv`, the router with the shared expert's gate and up): a decode step's 667 round
+  trips became 270.
+- Its routed experts there too (`WgpuExperts`). A prompt's busy ones (eight tokens or
+  more) pass through slots made once, each record uploaded as stored and its MXFP4
+  matrices read in place with their e8m0 scales (`RecordSlots`); a prompt's MoE hands
+  each record over as it is read, the busy ones to the GPU a group of 32 at a time and
+  the rest to the CPU's workers meanwhile, so the reads and the matmuls overlap. What
+  the budget has left after the trunk and the slots keeps the experts used most between
+  passes, by the CUDA engine's VRAM policy (LFRU counted in tokens, aged every 128
+  steps; a prompt's most used taken in from RAM once it is read): 935 of them on a
+  32 GB card with a 27 GiB budget. A decode step's held experts (about 110 of its 240)
+  are computed there while the CPU reads and computes the rest.
+- The sparse attention, the indexer's scores and the hyper-connections' mixing spread
+  over the CPU's threads (serial, the attention was most of a prompt's time and the
+  mixing's dot products 29 s of it); a layer's expert records read eight at a time.
 
-| | CPU only | + trunk on the GPU | + parallel attention | + GPU experts, parallel reads |
-|---|---:|---:|---:|---:|
-| 2,000-token prompt | 1,294 s | 1,081 s | 558 s | 490 s (attention 81 s, MoE 402 s) |
-| Warm decode | 2.06 s a token | 1.47 s | 1.21 s | 1.19 s |
+A conversation's next turn continues the state the last prompt left (a checkpoint a
+token short of its end, since the next prompt writes the last reply its own way),
+reading only the new tail in one chunk (`dsv41` continues a sequence by a chunk exactly
+as it would token by token).
 
-An Agent's tool call end to end: a 285-token prompt in 229 s and its call at 1.3 tokens
-a second; the next turn (the tool's result) reused 284 tokens and took 52 s. On an
-internal NVMe the reads, most of what is left, would be several times faster.
+On the RTX 5090 (2026-10-05), 27 GiB budget, 96 GB of RAM for experts, the checkpoint on
+a USB SSD (a Samsung T9 on a 20 Gbps port: 1.4 GB/s unbuffered, one reader or eight):
+
+| | CPU only | + trunk on the GPU | + parallel attention | + GPU experts, parallel reads | + overlapped MoE, record slots, VRAM tier, one submit a group of projections |
+|---|---:|---:|---:|---:|---:|
+| 2,000-token prompt | 1,294 s | 1,081 s | 558 s | 490 s (attention 81 s, MoE 402 s) | 261 s (attention 68 s, MoE 188 s) |
+| Warm decode | 2.06 s a token | 1.47 s | 1.21 s | 1.19 s | 1.02 s |
+
+Both are now the drive's. The prompt reads 230 GB of expert records, 164 s at its rate,
+and its MoE takes 188; the GPU's part of it (55 s since the prompt kernel keeps its sums
+in registers, 81 s before) is hidden under the reads. A warm decode step reads about
+1 GB of records the RAM and the GPU do not hold (0.4 to 1.2 GB, which its time follows).
+Cosine 0.998825 to the CPU model's logits and the same greedy tokens (an expert's
+outputs on the GPU are the CPU's to the bit but one in 170,000).
+
+An Agent's tool call end to end (before the overlapped MoE): a 285-token prompt in
+229 s and its call at 1.3 tokens a second; the next turn (the tool's result) reused 284
+tokens and took 52 s. On an internal NVMe the reads, most of what is left, would be
+several times faster.
 
 ## EXL3 (OrcaSAQ) without CUDA
 

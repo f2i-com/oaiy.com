@@ -758,8 +758,13 @@ What the portable build does about it (docs/WEBGPU.md, "DeepSeek-V4.1 without CU
 the trunk on the WebGPU adapter took the prompt to 1,081 s and showed the attention's
 remaining 600 s to be its serial sparse attention and index scores, which spread over
 the threads took it to 558 s; a prompt's busy experts on the GPU and the records read
-eight at a time took it to 490 s, the reads now most of it (the checkpoint here is on a
-USB SSD, about 1.2 GB/s). Warm decode went from 2.06 to 1.19 s a token.
+eight at a time took it to 490 s. Profiled (`dsv41::profile`), that was 165 s of reads,
+171 s of experts on the GPU (most of it uploading) and 36 s on the CPU, one after
+another: the MoE overlapping its reads with its matmuls, the records uploaded as stored
+into slots made once, a VRAM tier of the experts used most and the mixing spread over
+the threads took it to 261 s, the drive's now (the checkpoint here is on a USB SSD,
+1.4 GB/s). Warm decode went from 2.06 to 1.02 s a token, about 110 of a step's 240
+experts computed on the GPU.
 
 ## Phases
 
