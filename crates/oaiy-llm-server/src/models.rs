@@ -118,8 +118,9 @@ pub enum Flavour {
     Deepseek(Arc<dsv41::tokenizer::Tokenizer>),
     Gguf(Arc<tokenizer::Tokenizer>),
     Qwen(Arc<tokenizer::Tokenizer>),
-    /// A dense GGUF (Llama, Mistral, Qwen2, Qwen3, Gemma 3 / 3n / 4): its own architecture's template.
-    Dense(Arc<tokenizer::Tokenizer>, llama_rs::Architecture),
+    /// A dense GGUF (Llama, Mistral, Qwen2, Qwen3, Gemma 3 / 3n / 4): its own architecture's template, and whether
+    /// its own template opens the reply on an empty thought channel (see `dense_prompt`).
+    Dense(Arc<tokenizer::Tokenizer>, llama_rs::Architecture, bool),
 }
 
 impl Flavour {
@@ -127,7 +128,7 @@ impl Flavour {
         match self {
             Self::Deepseek(t) => t.encode(text),
             // llama-rs applies BOS through the template, so not again here.
-            Self::Gguf(t) | Self::Qwen(t) | Self::Dense(t, _) => t.encode(text, false).unwrap_or_default(),
+            Self::Gguf(t) | Self::Qwen(t) | Self::Dense(t, ..) => t.encode(text, false).unwrap_or_default(),
         }
     }
 
@@ -166,8 +167,8 @@ impl Flavour {
                     images: Vec::new(),
                 })
             }
-            Self::Dense(_, arch) => Ok(dsv41::chat::Encoded {
-                prompt: dense_prompt(arch, &llama_messages(msgs), opts.mode == dsv41::chat::Mode::Thinking),
+            Self::Dense(_, arch, empty_thought) => Ok(dsv41::chat::Encoded {
+                prompt: dense_prompt(arch, &llama_messages(msgs), opts.mode == dsv41::chat::Mode::Thinking, *empty_thought),
                 images: Vec::new(),
             }),
         }
@@ -196,20 +197,28 @@ fn llama_messages(msgs: &[oaiy_engine::json::Json]) -> Vec<llama_rs::ChatMessage
 /// think block, as the official one does), answers directly.
 ///
 /// Gemma 4 reasons in a channel of its own (`<|channel>thought … <channel|>`), which the reasoning split does not
-/// read, so it always answers directly: its reply opens on an empty thought channel, as its official template opens
-/// it when thinking is off. Without it the MoE Gemma 4 (26B-A4B) wrote its channel's name into the answer ("thought
-/// The capital of France is Paris.").
-fn dense_prompt(arch: &llama_rs::Architecture, msgs: &[llama_rs::ChatMessage], thinking: bool) -> String {
+/// read, so it always answers directly: its reply opens on an empty thought channel when its own template opens it so
+/// with thinking off (`empty_thought`, read from the GGUF by `opens_empty_thought`). The 26B-A4B and 31B templates do,
+/// and without it the 26B-A4B wrote its channel's name into the answer ("thought The capital of France is Paris.");
+/// the E2B and E4B templates do not, and with it the E2B reasoned aloud in its answer.
+fn dense_prompt(arch: &llama_rs::Architecture, msgs: &[llama_rs::ChatMessage], thinking: bool, empty_thought: bool) -> String {
     if thinking && *arch == llama_rs::Architecture::Qwen3 {
         let mut p = llama_rs::apply_chat_template(&llama_rs::Architecture::Qwen2, msgs, true);
         p.push_str("<think>");
         return p;
     }
     let mut p = llama_rs::apply_chat_template(arch, msgs, true);
-    if *arch == llama_rs::Architecture::Gemma4 {
+    if empty_thought && *arch == llama_rs::Architecture::Gemma4 {
         p.push_str("<|channel>thought\n<channel|>");
     }
     p
+}
+
+/// Whether a GGUF's chat template writes an empty Gemma 4 thought channel (as one string, its newline a Jinja escape
+/// or a newline): the 26B-A4B's and 31B's do after `<|turn>model`, when thinking is off. The E2B's names the channel
+/// only around earlier reasoning (`'<|channel>thought\n' + thinking_text + '\n<channel|>'`), which this does not match.
+fn opens_empty_thought(template: &str) -> bool {
+    template.contains(r"<|channel>thought\n<channel|>") || template.contains("<|channel>thought\n<channel|>")
 }
 
 /// The architecture of a dense GGUF, which is loaded whole (see `load_gguf`); None for Qwen3.5 (a path of its
@@ -900,6 +909,7 @@ impl Models {
         // GLM and Qwen3.5 formats only, so the Agent's tools need one of those.
         if let Some(arch) = dense_arch(&gguf) {
             let model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).map_err(|e| Error::Arg(e.to_string()))?;
+            let empty_thought = gguf.get_str("tokenizer.chat_template").is_ok_and(opens_empty_thought);
             drop(gguf);
             let tok = Arc::new(model.tokenizer().clone());
             // Bound the initial KV allocation, as for dense Qwen3.5: a full context of an 8B model is gigabytes.
@@ -908,7 +918,7 @@ impl Models {
             let (jobs, rx) = std::sync::mpsc::channel();
             let e = glm::GlmEngine::new(model, Arc::clone(&tok), max_seq, !o.quiet && !o.silent);
             let thread = std::thread::Builder::new().name("model".into()).spawn(move || e.run(rx)).map_err(Error::Io)?;
-            return Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Dense(tok, arch)) });
+            return Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Dense(tok, arch, empty_thought)) });
         }
         drop(gguf);
         let budget = o.expert_cache_bytes();
@@ -1166,12 +1176,12 @@ mod dense_tests {
 
     #[test]
     fn each_dense_family_is_asked_in_its_own_template_and_its_turn_is_left_open() {
-        let llama = dense_prompt(&A::Llama, &msgs(), false);
+        let llama = dense_prompt(&A::Llama, &msgs(), false, false);
         assert!(llama.contains("<|start_header_id|>user<|end_header_id|>") && llama.contains("Capital of France?"), "{llama}");
         assert!(llama.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"), "{llama:?}");
-        let gemma = dense_prompt(&A::Gemma3, &msgs(), false);
+        let gemma = dense_prompt(&A::Gemma3, &msgs(), false, false);
         assert!(gemma.contains("<start_of_turn>user") && gemma.trim_end().ends_with("<start_of_turn>model"), "{gemma:?}");
-        let mistral = dense_prompt(&A::Mistral, &msgs(), false);
+        let mistral = dense_prompt(&A::Mistral, &msgs(), false, false);
         assert!(mistral.contains("[INST]") && mistral.contains("Capital of France?"), "{mistral:?}");
         for prompt in [&llama, &gemma, &mistral] {
             assert!(!prompt.contains("<think>"), "no family but Qwen3 opens reasoning: {prompt:?}");
@@ -1180,21 +1190,35 @@ mod dense_tests {
 
     #[test]
     fn qwen3_answers_directly_in_a_chat_and_opens_its_reasoning_only_when_asked_to_think() {
-        let chat = dense_prompt(&A::Qwen3, &msgs(), false);
+        let chat = dense_prompt(&A::Qwen3, &msgs(), false, false);
         assert!(chat.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"), "{chat:?}");
-        let thinking = dense_prompt(&A::Qwen3, &msgs(), true);
+        let thinking = dense_prompt(&A::Qwen3, &msgs(), true, false);
         assert!(thinking.ends_with("<|im_start|>assistant\n<think>"), "{thinking:?}");
         // Thinking is Qwen3's alone: another family asked to think still answers in its own template.
-        assert_eq!(dense_prompt(&A::Llama, &msgs(), true), dense_prompt(&A::Llama, &msgs(), false));
+        assert_eq!(dense_prompt(&A::Llama, &msgs(), true, false), dense_prompt(&A::Llama, &msgs(), false, false));
     }
 
     #[test]
-    fn gemma4_opens_its_reply_on_an_empty_thought_channel_as_its_template_does_without_thinking() {
+    fn gemma4_opens_its_reply_on_an_empty_thought_channel_only_where_its_template_does() {
         for thinking in [false, true] {
-            let p = dense_prompt(&A::Gemma4, &msgs(), thinking);
+            let p = dense_prompt(&A::Gemma4, &msgs(), thinking, true);
             assert!(p.contains("<|turn>user\nCapital of France?<turn|>"), "{p:?}");
             assert!(p.ends_with("<|turn>model\n<|channel>thought\n<channel|>"), "{p:?}");
+            let p = dense_prompt(&A::Gemma4, &msgs(), thinking, false);
+            assert!(p.ends_with("<|turn>model\n"), "{p:?}");
         }
+        // Only Gemma 4 has the channel.
+        assert_eq!(dense_prompt(&A::Gemma3, &msgs(), false, true), dense_prompt(&A::Gemma3, &msgs(), false, false));
+    }
+
+    #[test]
+    fn the_empty_thought_channel_is_read_from_the_template_not_from_where_it_wraps_earlier_reasoning() {
+        // The 26B-A4B's generation prompt, and the E2B's (which names the channel only around earlier reasoning).
+        let big = r"{{- '<|turn>model\n' -}}{%- if not enable_thinking | default(false) -%}{{- '<|channel>thought\n<channel|>' -}}{%- endif -%}";
+        let small = r"{{- '<|channel>thought\n' + thinking_text + '\n<channel|>' -}}{%- if add_generation_prompt -%}{{- '<|turn>model\n' -}}{%- endif -%}";
+        assert!(opens_empty_thought(big));
+        assert!(!opens_empty_thought(small));
+        assert!(opens_empty_thought("<|channel>thought\n<channel|>"));
     }
 
     #[test]
