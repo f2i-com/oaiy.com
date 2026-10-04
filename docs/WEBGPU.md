@@ -69,11 +69,31 @@ In **OAIY**, Settings → Language model → *Runs on*:
 
 The Overview page shows what the model actually runs on.
 
-`oaiy-llm-server-webgpu` serves GGUF models only, of the types above: a file with
-IQ1, IQ2 or IQ3 tensors (unsloth's smaller "UD" quants mix them in, even UD-Q4_K_M)
-does not load, and OAIY's setup refuses one before it is added. DeepSeek-V4.1
-checkpoints, OrcaSAQ (EXL3) and the observer are CUDA engines, and it says so
-rather than trying.
+`oaiy-llm-server-webgpu` serves GGUF models of the types above, and OrcaSAQ (EXL3,
+below). A GGUF with IQ1, IQ2 or IQ3 tensors (unsloth's smaller "UD" quants mix them
+in, even UD-Q4_K_M) does not load, and OAIY's setup refuses one before it is added.
+DeepSeek-V4.1 checkpoints, Qwen3.8-Flash-Next and the observer are CUDA engines,
+and it says so rather than trying.
+
+## EXL3 (OrcaSAQ) without CUDA
+
+`ggml_rs_wgpu::exl3` keeps an EXL3 projection's packed trellis words on the GPU (VRAM
+use equals the checkpoint's) and decodes them inside the matmul, in WGSL: one kernel
+for a decode step's single row (thread `(r, c)` decodes weight `(r, c)` of each 16x16
+tile into one sum), one for a prompt's rows (each tile decoded once into workgroup
+memory, 32 rows a pass). Each weight is decoded exactly as `Exl3Data::value`: the
+mul1 product `(1024 + bytesum) * 1774/2^18` is exact in f32 and the one rounding to
+f16 is written out by hand, so no driver's f16 rules come into it. The two Hadamard-128
+transforms, the channel maps and exllamav3's f16 roundings run on the host. A weight
+beyond the budget, or a computer without a GPU, decodes on the CPU (`Exl3Cpu`), slowly.
+The tests check both against an independent bit-by-bit packing oracle at all eleven
+supported bitrates, on the RTX 5090 and the Radeon iGPU.
+
+OrcaSAQ-2-27B through `oaiy-llm-server-webgpu` on the RTX 5090 (2026-10-05): loaded in
+19 s with 10.7 GB of EXL3 weights on the GPU; a 162-token prompt in 21.7 s and 3.9
+tokens a second, against 17 s and 4.5 for Qwen3.8 27B Q4_K_M on the same path (the
+rest is the host's share of every portable model); tool calls made and answered. No
+PEFT adapters and no vision tower without CUDA.
 Image and video generation (`oaiy-media`) still need CUDA for useful speed.
 
 ## Measured (2026-09-26)

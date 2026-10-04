@@ -455,9 +455,14 @@ impl Models {
             Kind::OrcaSaq => self.load_orcasaq(&spec),
             #[cfg(feature = "cuda")]
             Kind::FlashNext => self.load_flashnext(&spec),
+            // OrcaSAQ's EXL3 projections on any GPU through WebGPU (else the CPU).
+            #[cfg(all(not(feature = "cuda"), feature = "webgpu"))]
+            Kind::OrcaSaq => self.load_orcasaq_portable(&spec),
+            #[cfg(all(not(feature = "cuda"), not(feature = "webgpu")))]
+            Kind::OrcaSaq => Err(Error::Arg(format!("{} is an EXL3 checkpoint, which needs the CUDA or the WebGPU build", spec.name))),
             #[cfg(not(feature = "cuda"))]
-            Kind::Deepseek | Kind::OrcaSaq | Kind::FlashNext => Err(Error::Arg(format!(
-                "{} is a DeepSeek or EXL3 checkpoint, which needs the CUDA build (oaiy-llm-server); this build serves GGUF models",
+            Kind::Deepseek | Kind::FlashNext => Err(Error::Arg(format!(
+                "{} is a DeepSeek or Flash-Next checkpoint, which needs the CUDA build (oaiy-llm-server); this build serves GGUF models and OrcaSAQ",
                 spec.name
             ))),
             Kind::Gguf => self.load_gguf(&spec),
@@ -735,6 +740,55 @@ impl Models {
         }
         let thread=std::thread::Builder::new().name("orcasaq-model".into()).spawn(move||e.run(rx))?;
         Ok(Live{name:spec.name.clone(),jobs,thread,cfg:Arc::new(cfg),flavour:Arc::new(Flavour::Qwen(tok))})
+    }
+
+    /// OrcaSAQ without CUDA: its packed EXL3 projections on the WebGPU adapter while the weight budget holds them,
+    /// the rest decoded on the CPU, everything else on the host as in any portable model. No PEFT adapters and no
+    /// vision tower (both CUDA's); its prompt states are kept as on CUDA, under a fingerprint of their own.
+    #[cfg(all(not(feature = "cuda"), feature = "webgpu"))]
+    fn load_orcasaq_portable(&self, spec: &Spec) -> Result<Live> {
+        let o = &self.opts;
+        if o.lora_adapters.contains_key(&spec.name) {
+            return Err(Error::Arg(format!("{}: LoRA adapters need the CUDA build", spec.name)));
+        }
+        let picked = crate::backend::open(o, &o.devices)?;
+        self.say(format!("{} runs on {} (EXL3, decoded in the matmul)", spec.name, picked.label));
+        let wgpu = picked.backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>();
+        let packed = |data: ggml_rs::exl3::Exl3Data| match wgpu {
+            Some(b) => b.exl3(data),
+            None => ggml_rs_wgpu::exl3::exl3_cpu(data),
+        };
+        let model = crate::orcasaq::load_portable(&spec.path, Arc::clone(&picked.backend), &packed)?;
+        if let Some((used, budget)) = wgpu.map(|b| b.usage()) {
+            self.say(format!("{}: {:.1} GB of EXL3 weights on the GPU (budget {:.0} GB)", spec.name, used as f64 / 1e9, budget as f64 / 1e9));
+        }
+        let tok = Arc::new(model.tokenizer().clone());
+        // The cache is on the host: bound it as the other portable models are.
+        let max_seq = self.context(model.config().context_length).min(16384);
+        let mut cfg = self.base_cfg(spec, max_seq);
+        cfg.image_token_id = tok.token_id("<|image_pad|>").ok_or_else(|| Error::Arg("Orca tokenizer lacks image_pad".into()))?;
+        let (jobs, rx) = std::sync::mpsc::channel();
+        let mut e = crate::qwen::QwenEngine::new(model, None, max_seq, !o.quiet && !o.silent);
+        if let Some(dir) = &o.prompt_cache {
+            let mut fp = disk::fnv(b"orcasaq2-exl3-qwen-state-portable-v1", 0);
+            fp = disk::fnv(spec.path.as_os_str().as_encoded_bytes(), fp);
+            let mut files: Vec<_> = std::fs::read_dir(&spec.path)?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|x| x == "safetensors" || x == "json"))
+                .collect();
+            files.sort();
+            for p in files {
+                let meta = std::fs::metadata(&p)?;
+                fp = disk::fnv(p.as_os_str().as_encoded_bytes(), fp);
+                fp = disk::fnv(&meta.len().to_le_bytes(), fp);
+            }
+            match disk::DiskCache::open(dir, fp, (o.prompt_cache_gb * 1e9) as u64) {
+                Ok(cache) => e.disk = Some(cache),
+                Err(err) => self.say(format!("OrcaSAQ prompt cache unavailable: {err}")),
+            }
+        }
+        let thread = std::thread::Builder::new().name("orcasaq-model".into()).spawn(move || e.run(rx))?;
+        Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Qwen(tok)) })
     }
 
     // ---------------------------------------------------------------- GGUF

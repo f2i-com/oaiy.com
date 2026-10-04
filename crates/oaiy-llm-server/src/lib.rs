@@ -35,8 +35,7 @@ pub mod glm;
 pub mod models;
 mod http;
 mod qwen;
-// OrcaSAQ (EXL3 on CUDA), its PEFT adapters and its Qwen vision tower.
-#[cfg(feature = "cuda")]
+// OrcaSAQ (EXL3: packed on CUDA, or on any GPU through WebGPU), its PEFT adapters (CUDA) and its Qwen vision tower (CUDA).
 mod orcasaq;
 // Qwen3.8-Flash-Next (qwen4_exp, EXL3 on CUDA).
 #[cfg(feature = "cuda")]

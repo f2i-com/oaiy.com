@@ -14,6 +14,7 @@
 
 // VENDORED-LOCAL: this crate is OAIY's addition beside ggml-rs-cuda.
 
+pub mod exl3;
 pub mod shaders;
 
 use ggml_quants::GgmlType;
@@ -37,6 +38,8 @@ struct Gpu {
     layout: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
     pipelines: Mutex<HashMap<GgmlType, Arc<wgpu::ComputePipeline>>>,
+    /// The EXL3 matmul's pipelines (`exl3::shader`): for one row, and for several. Made when first used.
+    exl3: Mutex<[Option<Arc<wgpu::ComputePipeline>>; 2]>,
     limits: wgpu::Limits,
     /// Upload bytes written since the queue was last flushed.
     staged: AtomicU64,
@@ -168,6 +171,28 @@ impl Gpu {
         chunks
     }
 
+    fn exl3_pipeline(&self, many: bool) -> Arc<wgpu::ComputePipeline> {
+        let mut slots = self.exl3.lock().unwrap_or_else(|p| p.into_inner());
+        let slot = &mut slots[many as usize];
+        if let Some(p) = slot.as_ref() {
+            return Arc::clone(p);
+        }
+        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("oaiy-exl3"),
+            source: wgpu::ShaderSource::Wgsl(exl3::shader(many).into()),
+        });
+        let pipeline = Arc::new(self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("oaiy-exl3"),
+            layout: Some(&self.pipeline_layout),
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        }));
+        *slot = Some(Arc::clone(&pipeline));
+        pipeline
+    }
+
     fn pipeline(&self, dtype: GgmlType) -> Option<Arc<wgpu::ComputePipeline>> {
         let mut cache = self.pipelines.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(p) = cache.get(&dtype) {
@@ -205,8 +230,8 @@ pub struct WgpuBackend {
     budget: u64,
     used: Arc<AtomicU64>,
     summary: AdapterSummary,
-    /// One projection at a time: the dispatch and read-back share the queue.
-    serial: Mutex<()>,
+    /// One projection at a time: the dispatch and read-back share the queue (EXL3 weights hold it too).
+    serial: Arc<Mutex<()>>,
 }
 
 impl std::fmt::Debug for WgpuBackend {
@@ -287,11 +312,11 @@ impl WgpuBackend {
         });
         Ok(Self {
             cpu: CpuBackend::new(),
-            gpu: Arc::new(Gpu { device, queue, layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), limits, staged: AtomicU64::new(0) }),
+            gpu: Arc::new(Gpu { device, queue, layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), limits, staged: AtomicU64::new(0) }),
             budget,
             used: Arc::new(AtomicU64::new(0)),
             summary,
-            serial: Mutex::new(()),
+            serial: Arc::new(Mutex::new(())),
         })
     }
 

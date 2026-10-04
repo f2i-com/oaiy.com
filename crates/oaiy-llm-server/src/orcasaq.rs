@@ -1,6 +1,11 @@
 //! Read OrcaSAQ2's original sharded EXL3 checkpoint. No Python runtime/conversion.
+//!
+//! On CUDA (`load`, `load_with_adapter`) its projections stay packed on the card (`Exl3Matrix`), PEFT adapters
+//! applied; elsewhere (`load_portable`) they are whatever the caller makes of each `Exl3Data`: packed on any GPU
+//! through WebGPU, or decoded on the CPU (`ggml_rs_wgpu::exl3`).
 use dsv41::safetensors::{Dtype, StIndex};
-use ggml_rs::{exl3::Exl3Data, Backend, Tensor};
+use ggml_rs::{exl3::{Exl3Data, PackedLinear}, Backend, Tensor};
+#[cfg(feature = "cuda")]
 use ggml_rs_cuda::{exl3::Exl3Matrix, CudaBackend};
 use llama_rs::{
     loader::{FfnPair, Weight},
@@ -14,7 +19,7 @@ fn bad(s: impl Into<String>) -> Error {
     Error::Format(s.into())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 mod runtime_tests {
     use super::*;
     fn model_path() -> std::path::PathBuf {
@@ -178,11 +183,62 @@ pub fn detect(path: &Path) -> bool {
     })
 }
 
+/// Makes a projection of its packed EXL3 weights: on the card the model runs on.
+type Packer<'a> = &'a dyn Fn(Exl3Data) -> std::result::Result<Arc<dyn PackedLinear>, String>;
+
+/// The PEFT adapters applied as the weights load, together and in order: the CUDA build's; a portable build has none.
+struct Adapters<'a> {
+    #[cfg(feature = "cuda")]
+    list: &'a [crate::lora::Adapter],
+    #[cfg(not(feature = "cuda"))]
+    list: std::marker::PhantomData<&'a ()>,
+}
+impl<'a> Adapters<'a> {
+    #[cfg(feature = "cuda")]
+    fn of(list: &'a [crate::lora::Adapter]) -> Self {
+        Self { list }
+    }
+    #[cfg_attr(feature = "cuda", allow(dead_code))]
+    fn none() -> Self {
+        #[cfg(feature = "cuda")]
+        return Self { list: &[] };
+        #[cfg(not(feature = "cuda"))]
+        Self { list: std::marker::PhantomData }
+    }
+    /// Each adapter wraps what the one before made (an adapter without this weight leaves it).
+    fn wrap(&self, name: &str, w: Weight, backend: &Arc<dyn Backend>, input: Option<&[u32]>, output: Option<&[u32]>) -> Result<Weight> {
+        #[cfg(feature = "cuda")]
+        return self.list.iter().try_fold(w, |w, adapter| adapter.wrap(name, w, backend.clone(), input, output));
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (name, backend, input, output);
+            Ok(w)
+        }
+    }
+    fn merge_dense(&self, name: &str, w: Tensor, backend: &dyn Backend, map: Option<&[u32]>) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        return self.list.iter().try_fold(w, |w, adapter| adapter.merge_dense(name, w, backend, map));
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (name, backend, map);
+            Ok(w)
+        }
+    }
+    /// Every adapter's targets were found.
+    fn finish(&self) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        for adapter in self.list {
+            adapter.finish()?;
+        }
+        Ok(())
+    }
+}
+
 struct Loader<'a> {
-    /// Adapters applied together, in order.
-    lora: &'a [crate::lora::Adapter],
+    adapters: &'a Adapters<'a>,
     idx: StIndex,
-    backend: Arc<CudaBackend>,
+    backend: Arc<dyn Backend>,
+    packed: Packer<'a>,
 }
 impl Loader<'_> {
     fn tensor(
@@ -253,9 +309,8 @@ impl Loader<'_> {
             input_map: input.clone().unwrap_or_else(|| (0..k as u32).collect()),
             output_map: output.clone().unwrap_or_else(|| (0..n as u32).collect()),
         };
-        let base=Weight::Packed(Arc::new(Exl3Matrix::upload(self.backend.clone(), data).map_err(bad)?));
-        // Each adapter wraps what the one before made (an adapter without this weight leaves it).
-        self.lora.iter().try_fold(base, |w, adapter| adapter.wrap(name,w,self.backend.clone(),input.as_deref(),output.as_deref()))
+        let base = Weight::Packed((self.packed)(data).map_err(bad)?);
+        self.adapters.wrap(name, base, &self.backend, input.as_deref(), output.as_deref())
     }
 }
 
@@ -409,10 +464,35 @@ mod tests {
     }
 }
 
+#[cfg(feature = "cuda")]
 pub fn load(path: &Path, devices: &[usize]) -> Result<Model> {
     load_with_adapter(path,devices,&[])
 }
+#[cfg(feature = "cuda")]
 pub(crate) fn load_with_adapter(path: &Path, devices: &[usize], lora:&[crate::lora::Adapter]) -> Result<Model> {
+    let device = devices.first().copied().unwrap_or(0);
+    let cuda = Arc::new(CudaBackend::new(device).map_err(|e| bad(e.to_string()))?);
+    let backend: Arc<dyn Backend> = cuda.clone();
+    let mut cache_devices: Vec<Arc<dyn Backend>> = vec![backend.clone()];
+    for &other in devices.iter().skip(1) {
+        if other != device {
+            cache_devices.push(Arc::new(
+                CudaBackend::new(other).map_err(|e| bad(e.to_string()))?,
+            ));
+        }
+    }
+    let packed = |data: Exl3Data| Exl3Matrix::upload(cuda.clone(), data).map(|m| Arc::new(m) as Arc<dyn PackedLinear>);
+    build(path, backend, cache_devices, &packed, &Adapters::of(lora))
+}
+
+/// OrcaSAQ without CUDA: its tensors on `backend`, each packed projection as `packed` makes it (on any GPU through
+/// WebGPU, else on the CPU), no PEFT adapters, its attention cache beside it. (A CUDA build loads it on the card.)
+#[cfg_attr(feature = "cuda", allow(dead_code))]
+pub(crate) fn load_portable(path: &Path, backend: Arc<dyn Backend>, packed: Packer<'_>) -> Result<Model> {
+    build(path, backend.clone(), vec![backend], packed, &Adapters::none())
+}
+
+fn build(path: &Path, backend: Arc<dyn Backend>, cache_devices: Vec<Arc<dyn Backend>>, packed: Packer<'_>, adapters: &Adapters<'_>) -> Result<Model> {
     let raw = json(&path.join("config.json"))?;
     if !detect(path) {
         return Err(bad("not a Qwen3.5-family EXL3 checkpoint"));
@@ -478,20 +558,11 @@ pub(crate) fn load_with_adapter(path: &Path, devices: &[usize], lora:&[crate::lo
         recurrent_layers: None,
     };
     let tok = tokenizer(path, vocab)?;
-    let device = devices.first().copied().unwrap_or(0);
-    let backend = Arc::new(CudaBackend::new(device).map_err(|e| bad(e.to_string()))?);
-    let mut cache_devices: Vec<Arc<dyn Backend>> = vec![backend.clone()];
-    for &other in devices.iter().skip(1) {
-        if other != device {
-            cache_devices.push(Arc::new(
-                CudaBackend::new(other).map_err(|e| bad(e.to_string()))?,
-            ));
-        }
-    }
     let l = Loader {
-        lora,
+        adapters,
         idx: StIndex::open(path)?,
         backend: backend.clone(),
+        packed,
     };
     let prefix = "model.language_model";
     let qkey = format!("{prefix}.embed_tokens.qweight");
@@ -557,7 +628,7 @@ pub(crate) fn load_with_adapter(path: &Path, devices: &[usize], lora:&[crate::lo
                 let dense = |suffix:&str| -> Result<Tensor> {
                     let name=format!("{a}.{suffix}");
                     let base=l.tensor(&format!("{name}.weight"), &[nv,h],false,Some(&hm))?;
-                    let merged=lora.iter().try_fold(base, |w, adapter| adapter.merge_dense(&name,w,backend.as_ref(),Some(&hm)))?;
+                    let merged=adapters.merge_dense(&name,base,backend.as_ref(),Some(&hm))?;
                     Ok(merged.to_host())
                 };
                 let beta=dense("in_proj_b")?;
@@ -612,7 +683,7 @@ pub(crate) fn load_with_adapter(path: &Path, devices: &[usize], lora:&[crate::lo
             _ => return Err(bad("unsupported layer type")),
         }
     }
-    for adapter in lora {adapter.finish()?;}
+    adapters.finish()?;
     let mut attention_index = 0;
     let cache_backends = attention_layers
         .iter()

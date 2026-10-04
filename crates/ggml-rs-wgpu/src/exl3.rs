@@ -1,0 +1,748 @@
+//! EXL3 projections (exllamav3's mul1 trellis, as OrcaSAQ ships them) without CUDA: the packed weights on the GPU
+//! through WebGPU, decoded inside the matmul, or on the CPU beyond the budget or without a GPU.
+//!
+//! A projection is `y = U · (W · (V · x))`: the input mapped and scaled by `suh`, a Hadamard-128 transform, the
+//! trellis-decoded matrix, a second Hadamard-128 transform, then scaled by `svh` and mapped back, each step rounded to
+//! f16 where exllamav3 rounds. The two transforms and the maps are a few thousand operations a row and run on the host,
+//! as the rest of this backend's activations do; the matmul, which reads every packed weight, runs in WGSL
+//! ([`shader`]: one kernel for a decode step's single row, one for a prompt's many), or tile by tile on the CPU. Both decode a weight as `ggml_rs::exl3::Exl3Data::value` does, to the bit:
+//! `f16((1024 + bytesum(code · 0x83dcd12d)) · 1774/2^18 − 10.3828125)`, whose product is exact in f32, so the one
+//! rounding (round to nearest even, by hand) is the reference's.
+
+use crate::{chunk_limit, Gpu, WgpuBackend};
+use ggml_rs::exl3::{Exl3Data, PackedLinear};
+use ggml_rs::Tensor;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+/// 1/√128: the Hadamard transforms' normalisation.
+const ISQRT128: f32 = 0.088_388_35;
+/// Input rows one GPU pass multiplies: a prompt's rows decode each weight once a pass. 32 is what [`MANY`]'s two
+/// rows a thread give a workgroup of 256.
+const ROWS: usize = 32;
+
+fn half(x: f32) -> f32 {
+    half::f16::from_f32(x).to_f32()
+}
+
+/// The unnormalised Walsh-Hadamard transform of each 128-wide block, as exllamav3's `had` kernel computes it.
+fn had(x: &mut [f32]) {
+    for block in x.chunks_exact_mut(128) {
+        let mut s = 1;
+        while s < 128 {
+            for i in 0..128 {
+                if i & s == 0 {
+                    let (a, b) = (block[i], block[i + s]);
+                    block[i] = a + b;
+                    block[i + s] = a - b;
+                }
+            }
+            s *= 2;
+        }
+    }
+}
+
+/// What both halves of a projection need on the host: the maps and the scales.
+#[derive(Debug)]
+struct Transform {
+    k: usize,
+    n: usize,
+    suh: Vec<f32>,
+    svh: Vec<f32>,
+    input_map: Vec<u32>,
+    output_map: Vec<u32>,
+}
+
+impl Transform {
+    /// The input row as the matmul takes it: mapped, scaled, transformed and rounded.
+    fn pre(&self, x: &[f32], out: &mut [f32]) {
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = half(x[self.input_map[i] as usize]) * self.suh[i];
+        }
+        had(out);
+        for v in out.iter_mut() {
+            *v = half(*v * ISQRT128);
+        }
+    }
+
+    /// The matmul's sums for one row as the caller takes them: rounded, transformed, scaled and mapped back.
+    fn post(&self, y: &mut [f32], out: &mut [f32]) {
+        for v in y.iter_mut() {
+            *v = half(*v);
+        }
+        had(y);
+        for (c, v) in y.iter_mut().enumerate() {
+            *v = half(*v * ISQRT128 * self.svh[c]);
+        }
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = y[self.output_map[i] as usize];
+        }
+    }
+
+    /// `x` as host rows, `[m, k]`.
+    fn rows<'a>(&self, x: &'a Tensor, host: &'a mut Option<Tensor>) -> (&'a [f32], usize, Vec<usize>) {
+        if x.is_device() {
+            *host = Some(x.to_host());
+        }
+        let host: &'a Option<Tensor> = host;
+        let x = host.as_ref().unwrap_or(x);
+        let m = x.numel() / self.k;
+        let mut shape = x.shape().to_vec();
+        *shape.last_mut().expect("x has a last axis") = self.n;
+        (x.data(), m, shape)
+    }
+}
+
+/// Where each of a 16×16 tile's 256 weights starts in its tile's bit stream, for a bitrate: `(first word, second word,
+/// right shift of the pair)`, indexed by `row * 16 + column`.
+fn positions(tile_words: usize) -> Vec<(usize, usize, u32)> {
+    let nw = tile_words / 2;
+    (0..256)
+        .map(|t| {
+            let (r, c) = (t / 16, t % 16);
+            let lane = (r % 8 / 2) + 4 * (c % 8);
+            let j = (r % 2) + 2 * (r / 8) + 4 * (c / 8);
+            let i = lane * 8 + j;
+            let end = (i + 1) * (tile_words / 16) + if tile_words % 16 == 8 { i.div_ceil(2) } else { 0 };
+            let start = (end + nw * 32 - 16) % (nw * 32);
+            (start / 32, (start / 32 + 1) % nw, (48 - start % 32) as u32)
+        })
+        .collect()
+}
+
+/// mul1's decode of a 16-bit code, as `ggml_rs::exl3::mul1` (in the closed form the CUDA kernel uses).
+#[inline]
+fn decode(code: u32) -> f32 {
+    let x = code.wrapping_mul(0x83dc_d12d);
+    let sum = (x & 255) + ((x >> 8) & 255) + ((x >> 16) & 255) + (x >> 24);
+    half((1024 + sum) as f32 * (1774.0 / 262_144.0) - 10.382_812_5)
+}
+
+// ---------------------------------------------------------------------------
+// On the CPU
+// ---------------------------------------------------------------------------
+
+/// An EXL3 projection decoded on the CPU, tile by tile, every call: for a weight beyond the GPU budget, or a computer
+/// without a GPU. Slow (each weight is decoded for each row), but the model still runs.
+#[derive(Debug)]
+pub struct Exl3Cpu {
+    t: Transform,
+    words: Vec<u32>,
+    tile_words: usize,
+    shape: [usize; 2],
+}
+
+impl Exl3Cpu {
+    pub fn new(data: Exl3Data) -> Result<Self, String> {
+        data.validate()?;
+        let (k, n) = (data.suh.len(), data.svh.len());
+        Ok(Self {
+            shape: [n, k],
+            tile_words: data.tile_words,
+            words: data.words,
+            t: Transform { k, n, suh: data.suh, svh: data.svh, input_map: data.input_map, output_map: data.output_map },
+        })
+    }
+}
+
+impl PackedLinear for Exl3Cpu {
+    fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+    fn nbytes(&self) -> usize {
+        self.words.len() * 4 + (self.t.k + self.t.n) * 8
+    }
+    fn linear(&self, x: &Tensor) -> Tensor {
+        let (k, n) = (self.t.k, self.t.n);
+        let mut host = None;
+        let (data, m, shape) = self.t.rows(x, &mut host);
+        let mut xh = vec![0f32; m * k];
+        for (row, out) in data.chunks_exact(k).zip(xh.chunks_exact_mut(k)) {
+            self.t.pre(row, out);
+        }
+        let (ktiles, ntiles, nw) = (k / 16, n / 16, self.tile_words / 2);
+        let pos = positions(self.tile_words);
+        // Each thread takes a run of tile columns, all rows: its sums are its own.
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(ntiles).max(1);
+        let per = ntiles.div_ceil(threads);
+        let mut y = vec![0f32; m * n];
+        let parts: Vec<Vec<f32>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..threads)
+                .map(|th| {
+                    let (xh, pos, words) = (&xh, &pos, &self.words);
+                    scope.spawn(move || {
+                        let (a, b) = (th * per, ((th + 1) * per).min(ntiles));
+                        let width = b.saturating_sub(a) * 16;
+                        let mut acc = vec![0f32; m * width];
+                        let mut w = [0f32; 256];
+                        for kt in 0..ktiles {
+                            for nt in a..b {
+                                let tile = &words[(kt * ntiles + nt) * nw..(kt * ntiles + nt + 1) * nw];
+                                for (slot, &(w0, w1, sh)) in pos.iter().enumerate() {
+                                    let pair = ((tile[w0] as u64) << 32) | tile[w1] as u64;
+                                    w[slot] = decode((pair >> sh) as u32 & 0xffff);
+                                }
+                                for row in 0..m {
+                                    let xs = &xh[row * k + kt * 16..row * k + kt * 16 + 16];
+                                    let out = &mut acc[row * width + (nt - a) * 16..row * width + (nt - a) * 16 + 16];
+                                    for r in 0..16 {
+                                        let xv = xs[r];
+                                        for c in 0..16 {
+                                            out[c] += xv * w[r * 16 + c];
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        acc
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("an EXL3 CPU worker panicked")).collect()
+        });
+        for (th, acc) in parts.into_iter().enumerate() {
+            let a = th * per * 16;
+            let width = acc.len() / m.max(1);
+            for row in 0..m {
+                y[row * n + a..row * n + a + width].copy_from_slice(&acc[row * width..(row + 1) * width]);
+            }
+        }
+        let mut out = vec![0f32; m * n];
+        for (yr, or) in y.chunks_exact_mut(n).zip(out.chunks_exact_mut(n)) {
+            self.t.post(yr, or);
+        }
+        Tensor::from_vec(out, shape)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// On the GPU
+// ---------------------------------------------------------------------------
+
+/// The parts both kernels share: the parameters, the bindings, and where a thread's weight starts in its tile.
+const COMMON: &str = r#"
+struct Params {
+    n: u32,
+    k: u32,
+    kt0: u32,
+    kts: u32,
+    tw: u32,
+    rows: u32,
+    splits: u32,
+    slot0: u32,
+};
+@group(0) @binding(0) var<storage, read> words: array<u32>;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> part: array<f32>;
+@group(0) @binding(3) var<uniform> p: Params;
+
+var<workgroup> tile: array<u32, 64>;
+
+// f32 to f16 and back, rounding to nearest even: exact for the decoded weights, which are normal f16 values.
+fn round_f16(v: f32) -> f32 {
+    let b = bitcast<u32>(v);
+    return bitcast<f32>((b + 0xfffu + ((b >> 13u) & 1u)) & 0xffffe000u);
+}
+
+// Weight (r, c) of the tile in `tile`: its 16-bit code from the bit stream, decoded as mul1.
+fn weight(r: u32, c: u32) -> f32 {
+    let nw = p.tw / 2u;
+    let lane = (r % 8u) / 2u + 4u * (c % 8u);
+    let j = (r % 2u) + 2u * (r / 8u) + 4u * (c / 8u);
+    let i = lane * 8u + j;
+    var end = (i + 1u) * (p.tw / 16u);
+    if (p.tw % 16u == 8u) {
+        end = end + (i + 1u) / 2u;
+    }
+    let start = (end + nw * 32u - 16u) % (nw * 32u);
+    let w0 = start / 32u;
+    let sh = 48u - start % 32u;
+    let a = tile[w0];
+    let b = tile[(w0 + 1u) % nw];
+    var code: u32;
+    if (sh >= 32u) {
+        code = a >> (sh - 32u);
+    } else {
+        code = (a << (32u - sh)) | (b >> sh);
+    }
+    let hx = (code & 0xffffu) * 0x83dcd12du;
+    let sum = (hx & 255u) + ((hx >> 8u) & 255u) + ((hx >> 16u) & 255u) + (hx >> 24u);
+    return round_f16(f32(1024u + sum) * 0.00676727294921875 - 10.3828125);
+}
+"#;
+
+/// One input row (a decode step): a workgroup of 256 threads takes one 16-wide tile column and a run of its tile rows
+/// (one split); thread `(r, c)` decodes weight `(r, c)` of each tile into one sum, and the 16 threads of a column then
+/// add theirs up. Each split writes its partial sums to a slot of its own, which the host adds up.
+const ONE: &str = r#"
+var<workgroup> xs: array<f32, 16>;
+var<workgroup> red: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    let ntiles = p.n / 16u;
+    let nt = wg.x + wg.y * 65535u;
+    if (nt >= ntiles) {
+        return;
+    }
+    let s = wg.z;
+    let r = t / 16u;
+    let c = t % 16u;
+    let nw = p.tw / 2u;
+    let per = (p.kts + p.splits - 1u) / p.splits;
+    let ks = s * per;
+    let ke = min(p.kts, ks + per);
+    var acc = 0.0;
+    for (var kt = ks; kt < ke; kt = kt + 1u) {
+        if (t < nw) {
+            tile[t] = words[(kt * ntiles + nt) * nw + t];
+        }
+        if (t < 16u) {
+            xs[t] = x[(p.kt0 + kt) * 16u + t];
+        }
+        workgroupBarrier();
+        acc = acc + xs[r] * weight(r, c);
+        workgroupBarrier();
+    }
+    red[t] = acc;
+    workgroupBarrier();
+    if (r == 0u) {
+        var total = 0.0;
+        for (var q = 0u; q < 16u; q = q + 1u) {
+            total = total + red[q * 16u + c];
+        }
+        part[(p.slot0 + s) * p.n + nt * 16u + c] = total;
+    }
+}
+"#;
+
+/// Up to [`ROWS`] input rows (a prompt): each tile's 256 weights are decoded once into the workgroup's memory, and
+/// thread `(r, c)` sums column `c` for rows `r` and `r + 16`, sixteen products a tile each. Each split writes its
+/// partial sums to a slot of its own, which the host adds up.
+const MANY: &str = r#"
+var<workgroup> xs: array<f32, 512>;
+var<workgroup> wt: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    let ntiles = p.n / 16u;
+    let nt = wg.x + wg.y * 65535u;
+    if (nt >= ntiles) {
+        return;
+    }
+    let s = wg.z;
+    let r = t / 16u;
+    let c = t % 16u;
+    let nw = p.tw / 2u;
+    let per = (p.kts + p.splits - 1u) / p.splits;
+    let ks = s * per;
+    let ke = min(p.kts, ks + per);
+    let a = r < p.rows;
+    let b = r + 16u < p.rows;
+    var acc0 = 0.0;
+    var acc1 = 0.0;
+    for (var kt = ks; kt < ke; kt = kt + 1u) {
+        if (t < nw) {
+            tile[t] = words[(kt * ntiles + nt) * nw + t];
+        }
+        for (var q = t; q < p.rows * 16u; q = q + 256u) {
+            xs[q] = x[(q / 16u) * p.k + (p.kt0 + kt) * 16u + (q % 16u)];
+        }
+        workgroupBarrier();
+        wt[t] = weight(r, c);
+        workgroupBarrier();
+        if (a) {
+            for (var kk = 0u; kk < 16u; kk = kk + 1u) {
+                acc0 = acc0 + xs[r * 16u + kk] * wt[kk * 16u + c];
+            }
+        }
+        if (b) {
+            for (var kk = 0u; kk < 16u; kk = kk + 1u) {
+                acc1 = acc1 + xs[(r + 16u) * 16u + kk] * wt[kk * 16u + c];
+            }
+        }
+        workgroupBarrier();
+    }
+    if (a) {
+        part[((p.slot0 + s) * p.rows + r) * p.n + nt * 16u + c] = acc0;
+    }
+    if (b) {
+        part[((p.slot0 + s) * p.rows + r + 16u) * p.n + nt * 16u + c] = acc1;
+    }
+}
+"#;
+
+/// The kernel for one row, and the one for several, as WGSL.
+pub fn shader(many: bool) -> String {
+    format!("{COMMON}{}", if many { MANY } else { ONE })
+}
+
+/// An EXL3 projection with its packed weights on the GPU, in buffers of whole tile rows below the binding limit.
+pub struct Exl3Gpu {
+    gpu: Arc<Gpu>,
+    serial: Arc<Mutex<()>>,
+    t: Transform,
+    tile_words: usize,
+    /// `(buffer, first tile row, tile rows, splits)`.
+    chunks: Vec<(wgpu::Buffer, u32, u32, u32)>,
+    shape: [usize; 2],
+    nbytes: usize,
+    used: Arc<AtomicU64>,
+}
+
+impl std::fmt::Debug for Exl3Gpu {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Exl3Gpu({}x{}, {} words/tile, {} chunk(s))", self.shape[0], self.shape[1], self.tile_words, self.chunks.len())
+    }
+}
+
+impl Drop for Exl3Gpu {
+    fn drop(&mut self) {
+        self.used.fetch_sub(self.nbytes as u64, Ordering::Relaxed);
+    }
+}
+
+impl Exl3Gpu {
+    /// Upload `data`, `max_tile_rows` tile rows a buffer at most (the binding limit otherwise; tests make it small).
+    fn upload(backend: &WgpuBackend, data: Exl3Data, max_tile_rows: Option<usize>) -> Self {
+        let gpu = Arc::clone(&backend.gpu);
+        let (k, n, tw) = (data.suh.len(), data.svh.len(), data.tile_words);
+        let (ktiles, ntiles, nw) = (k / 16, n / 16, tw / 2);
+        // A tile row (every tile column of 16 input channels) is the unit a buffer holds: as many as the binding
+        // limit allows, or `max_tile_rows` (tests make it small, as a small adapter's limit would).
+        let row_bytes = ntiles * nw * 4;
+        let limit = (chunk_limit(&gpu.limits) as usize / row_bytes).max(1);
+        let per = max_tile_rows.map_or(limit, |m| m.min(limit)).max(1);
+        let bytes: Vec<u8> = data.words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut chunks = Vec::new();
+        let mut first = 0;
+        while first < ktiles {
+            let rows = per.min(ktiles - first);
+            let slice = &bytes[first * row_bytes..(first + rows) * row_bytes];
+            let (buffer, _, _) = gpu.upload_rows(slice, slice.len(), 1).remove(0);
+            // As the CUDA kernel splits: enough workgroups to fill a large GPU, at most 8 slots of partial sums.
+            let splits = 4096usize.div_ceil(ntiles).next_power_of_two().min(8).min(rows).max(1);
+            chunks.push((buffer, first as u32, rows as u32, splits as u32));
+            first += rows;
+        }
+        let nbytes = data.words.len() * 4;
+        Self {
+            gpu,
+            serial: Arc::clone(&backend.serial),
+            t: Transform { k, n, suh: data.suh, svh: data.svh, input_map: data.input_map, output_map: data.output_map },
+            tile_words: tw,
+            chunks,
+            shape: [n, k],
+            nbytes,
+            used: Arc::clone(&backend.used),
+        }
+    }
+
+    /// One pass: `rows` (at most [`ROWS`]) prepared input rows, their matmul sums `[rows, n]`.
+    fn pass(&self, xh: &[f32], rows: usize) -> Vec<f32> {
+        let (k, n) = (self.t.k, self.t.n);
+        let gpu = &self.gpu;
+        let pipeline = gpu.exl3_pipeline(rows > 1);
+        let slots: usize = self.chunks.iter().map(|c| c.3 as usize).sum();
+        let _one = self.serial.lock().unwrap_or_else(|p| p.into_inner());
+        let bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+        let xbuf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("oaiy-exl3-x"),
+            size: (rows * k * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        gpu.queue.write_buffer(&xbuf, 0, &bytes(xh));
+        let psize = (slots * rows * n * 4) as u64;
+        let pbuf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("oaiy-exl3-partial"),
+            size: psize,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("oaiy-exl3-read"),
+            size: psize,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let ntiles = (n / 16) as u32;
+        let mut groups = Vec::new();
+        let mut slot0 = 0u32;
+        for (buffer, first, tile_rows, splits) in &self.chunks {
+            let params: Vec<u8> = [n as u32, k as u32, *first, *tile_rows, self.tile_words as u32, rows as u32, *splits, slot0]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            slot0 += splits;
+            let ubuf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("oaiy-exl3-params"),
+                size: params.len() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            gpu.queue.write_buffer(&ubuf, 0, &params);
+            let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("oaiy-exl3"),
+                layout: &gpu.layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: xbuf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: pbuf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: ubuf.as_entire_binding() },
+                ],
+            });
+            groups.push((group, *splits));
+        }
+        let mut enc = gpu.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            for (group, splits) in &groups {
+                pass.set_bind_group(0, group, &[]);
+                pass.dispatch_workgroups(ntiles.min(65535), ntiles.div_ceil(65535), *splits);
+            }
+        }
+        enc.copy_buffer_to_buffer(&pbuf, 0, &staging, 0, psize);
+        gpu.queue.submit([enc.finish()]);
+        let raw = gpu.map_read(&staging, psize);
+        let part: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let mut y = vec![0f32; rows * n];
+        for slot in part.chunks_exact(rows * n) {
+            for (a, b) in y.iter_mut().zip(slot) {
+                *a += b;
+            }
+        }
+        y
+    }
+}
+
+impl PackedLinear for Exl3Gpu {
+    fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+    fn nbytes(&self) -> usize {
+        self.nbytes + (self.t.k + self.t.n) * 8
+    }
+    fn linear(&self, x: &Tensor) -> Tensor {
+        let (k, n) = (self.t.k, self.t.n);
+        let mut host = None;
+        let (data, m, shape) = self.t.rows(x, &mut host);
+        let mut out = vec![0f32; m * n];
+        let mut xh = vec![0f32; ROWS * k];
+        for start in (0..m).step_by(ROWS) {
+            let rows = ROWS.min(m - start);
+            for r in 0..rows {
+                self.t.pre(&data[(start + r) * k..(start + r + 1) * k], &mut xh[r * k..(r + 1) * k]);
+            }
+            let mut y = self.pass(&xh[..rows * k], rows);
+            for r in 0..rows {
+                self.t.post(&mut y[r * n..(r + 1) * n], &mut out[(start + r) * n..(start + r + 1) * n]);
+            }
+        }
+        Tensor::from_vec(out, shape)
+    }
+}
+
+impl WgpuBackend {
+    /// An EXL3 projection: on the GPU while the weight budget holds it, else on the CPU.
+    pub fn exl3(&self, data: Exl3Data) -> Result<Arc<dyn PackedLinear>, String> {
+        self.exl3_with(data, None)
+    }
+
+    pub(crate) fn exl3_with(&self, data: Exl3Data, max_tile_rows: Option<usize>) -> Result<Arc<dyn PackedLinear>, String> {
+        data.validate()?;
+        let (ntiles, nw) = (data.svh.len() / 16, data.tile_words / 2);
+        let nbytes = data.words.len() as u64 * 4;
+        let fits_binding = (ntiles * nw * 4) as u64 <= chunk_limit(&self.gpu.limits);
+        let prev = self.used.fetch_add(nbytes, Ordering::Relaxed);
+        if !fits_binding || prev + nbytes > self.budget {
+            self.used.fetch_sub(nbytes, Ordering::Relaxed);
+            return Ok(Arc::new(Exl3Cpu::new(data)?));
+        }
+        Ok(Arc::new(Exl3Gpu::upload(self, data, max_tile_rows)))
+    }
+}
+
+/// An EXL3 projection on the CPU, for a computer without a GPU.
+pub fn exl3_cpu(data: Exl3Data) -> Result<Arc<dyn PackedLinear>, String> {
+    Ok(Arc::new(Exl3Cpu::new(data)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ggml_rs::exl3::mul1;
+
+    /// An independent packing oracle: each weight's bits written MSB first into its tile's stream, and the dense
+    /// matrix they decode to (the same construction as ggml-rs-cuda's EXL3 test, which checks the CUDA kernels).
+    fn oracle(tw: usize, k: usize, n: usize) -> (Exl3Data, Vec<f32>) {
+        let nw = tw / 2;
+        let mut words = vec![0u32; k / 16 * n / 16 * nw];
+        let mut dense = vec![0f32; k * n];
+        for kt in 0..k / 16 {
+            for nt in 0..n / 16 {
+                let mut stream = vec![];
+                for i in 0..256 {
+                    let bits = tw / 16 + if tw % 16 == 8 { i % 2 } else { 0 };
+                    let v = (i * 17 + kt * 43 + nt * 11 + 3) as u32 & ((1 << bits) - 1);
+                    for bit in (0..bits).rev() {
+                        stream.push((v >> bit) & 1);
+                    }
+                }
+                let base = (kt * (n / 16) + nt) * nw;
+                for (i, &bit) in stream.iter().enumerate() {
+                    words[base + i / 32] |= bit << (31 - i % 32);
+                }
+                let mut end = 0;
+                for i in 0..256 {
+                    end += tw / 16 + if tw % 16 == 8 { i % 2 } else { 0 };
+                    let mut code = 0;
+                    for j in 0..16 {
+                        code = (code << 1) | stream[(end + stream.len() - 16 + j) % stream.len()];
+                    }
+                    let lane = i / 8;
+                    let j = i % 8;
+                    let r = (lane % 4) * 2 + (j % 2) + if j & 2 != 0 { 8 } else { 0 };
+                    let c = lane / 4 + if j & 4 != 0 { 8 } else { 0 };
+                    dense[(kt * 16 + r) * n + nt * 16 + c] = mul1(code);
+                }
+            }
+        }
+        let data = Exl3Data {
+            words,
+            suh: (0..k).map(|i| if i % 3 == 0 { -0.5 } else { 0.5 }).collect(),
+            svh: (0..n).map(|i| if i % 5 == 0 { -0.25 } else { 0.25 }).collect(),
+            tile_words: tw,
+            input_map: (0..k as u32).rev().collect(),
+            output_map: (0..n as u32).rev().collect(),
+        };
+        (data, dense)
+    }
+
+    fn inputs(rows: usize, k: usize) -> Vec<f32> {
+        (0..rows * k).map(|i| ((i % k * 7 + i / k * 13) % 23) as f32 / 32.0 - 0.25).collect()
+    }
+
+    /// The projection the oracle's dense matrix gives, step by step as exllamav3 rounds.
+    fn expected(data: &Exl3Data, dense: &[f32], x: &[f32]) -> Vec<f32> {
+        let (k, n) = (data.suh.len(), data.svh.len());
+        let mut out = vec![];
+        for row in x.chunks_exact(k) {
+            let mut xh: Vec<f32> = data.input_map.iter().enumerate().map(|(i, &j)| half(row[j as usize]) * data.suh[i]).collect();
+            had(&mut xh);
+            for v in &mut xh {
+                *v = half(*v * ISQRT128);
+            }
+            let mut y: Vec<f32> = (0..n).map(|j| half((0..k).map(|i| xh[i] * dense[i * n + j]).sum())).collect();
+            had(&mut y);
+            out.extend(data.output_map.iter().map(|&j| half(y[j as usize] * ISQRT128 * data.svh[j as usize])));
+        }
+        out
+    }
+
+    fn close(actual: &[f32], expected: &[f32], what: &str) {
+        assert_eq!(actual.len(), expected.len(), "{what}");
+        for (i, (a, e)) in actual.iter().zip(expected).enumerate() {
+            assert!((a - e).abs() < 0.003, "{what} [{i}]: {a} != {e}");
+        }
+    }
+
+    const RATES: [usize; 11] = [16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128];
+
+    #[test]
+    fn the_cpu_projection_matches_the_independent_oracle_at_every_rate() {
+        for tw in RATES {
+            let (k, n) = (128, 256);
+            let (data, dense) = oracle(tw, k, n);
+            for i in 0..k {
+                for j in 0..n {
+                    assert_eq!(data.value(i, j), dense[i * n + j], "the oracle and Exl3Data::value disagree: tw={tw} k={i} n={j}");
+                    let (w0, w1, sh) = positions(tw)[(i % 16) * 16 + j % 16];
+                    let base = ((i / 16) * (n / 16) + j / 16) * (tw / 2);
+                    let pair = ((data.words[base + w0] as u64) << 32) | data.words[base + w1] as u64;
+                    assert_eq!(decode((pair >> sh) as u32 & 0xffff), dense[i * n + j], "decode: tw={tw} k={i} n={j}");
+                }
+            }
+            for rows in [1, 5] {
+                let x = inputs(rows, k);
+                let want = expected(&data, &dense, &x);
+                let cpu = Exl3Cpu::new(Exl3Data { words: data.words.clone(), suh: data.suh.clone(), svh: data.svh.clone(), tile_words: tw, input_map: data.input_map.clone(), output_map: data.output_map.clone() }).unwrap();
+                let y = cpu.linear(&Tensor::from_vec(x, vec![rows, k]));
+                assert_eq!(y.shape(), &[rows, n]);
+                close(y.data(), &want, &format!("cpu tw={tw} rows={rows}"));
+            }
+        }
+    }
+
+    fn backend() -> Option<WgpuBackend> {
+        match WgpuBackend::new(Some(1 << 30)) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                eprintln!("skipping WebGPU EXL3 tests: {e}");
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn the_gpu_projection_matches_the_independent_oracle_at_every_rate() {
+        let Some(b) = backend() else { return };
+        for tw in RATES {
+            let (k, n) = (128, 256);
+            let (data, dense) = oracle(tw, k, n);
+            // More rows than one pass takes (32), and fewer.
+            for rows in [1, 5, 37] {
+                let x = inputs(rows, k);
+                let want = expected(&data, &dense, &x);
+                let w = b.exl3(Exl3Data { words: data.words.clone(), suh: data.suh.clone(), svh: data.svh.clone(), tile_words: tw, input_map: data.input_map.clone(), output_map: data.output_map.clone() }).unwrap();
+                assert!(format!("{w:?}").starts_with("Exl3Gpu"), "on the GPU: {w:?}");
+                let y = w.linear(&Tensor::from_vec(x, vec![rows, k]));
+                close(y.data(), &want, &format!("gpu tw={tw} rows={rows}"));
+            }
+        }
+    }
+
+    #[test]
+    fn a_projection_over_several_buffers_and_splits_agrees_with_the_cpu() {
+        let Some(b) = backend() else { return };
+        // A model-like width, buffers of 3 tile rows (as a small binding limit would make them), split work.
+        let (k, n, tw) = (1024, 512, 48);
+        let mut seed = 13_234_567u32;
+        let words: Vec<u32> = (0..k / 16 * n / 16 * (tw / 2))
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                seed
+            })
+            .collect();
+        let data = || Exl3Data {
+            words: words.clone(),
+            suh: (0..k).map(|i| if i % 3 == 0 { -0.25 } else { 0.25 }).collect(),
+            svh: vec![0.125; n],
+            tile_words: tw,
+            input_map: (0..k as u32).rev().collect(),
+            output_map: (0..n as u32).rev().collect(),
+        };
+        let gpu = b.exl3_with(data(), Some(3)).unwrap();
+        assert!(format!("{gpu:?}").contains("chunk(s)") && !format!("{gpu:?}").contains(" 1 chunk"), "{gpu:?}");
+        let cpu = exl3_cpu(data()).unwrap();
+        let x = Tensor::from_vec((0..3 * k).map(|i| ((i * 17 % 73) as f32 - 36.0) / 37.0).collect(), vec![3, k]);
+        let (g, c) = (gpu.linear(&x), cpu.linear(&x));
+        close(g.data(), c.data(), "gpu vs cpu");
+    }
+
+    #[test]
+    fn a_weight_beyond_the_budget_runs_on_the_cpu_and_the_budget_is_returned() {
+        let Ok(b) = WgpuBackend::new(Some(4096)) else { return };
+        let (data, _) = oracle(48, 128, 256);
+        let w = b.exl3(data).unwrap();
+        assert!(format!("{w:?}").starts_with("Exl3Cpu"), "{w:?}");
+        assert_eq!(b.usage().0, 0);
+        let Some(b) = backend() else { return };
+        let (data, _) = oracle(48, 128, 256);
+        let w = b.exl3(data).unwrap();
+        assert!(b.usage().0 > 0);
+        drop(w);
+        assert_eq!(b.usage().0, 0, "dropping the weight returns its bytes");
+    }
+}

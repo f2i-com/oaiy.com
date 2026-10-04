@@ -43,6 +43,13 @@ is reused; changing project/settings automatically restarts it after its
 current request completes. `coder-cli --workspace PATH oaiy start` also starts
 it explicitly. No separate Python/vLLM server is needed.
 
+## Without CUDA
+
+`oaiy-llm-server-webgpu` loads the same folder on any GPU through WebGPU, its packed
+weights decoded inside a WGSL matmul, else on the CPU: see
+[WEBGPU.md](WEBGPU.md#exl3-orcasaq-without-cuda). On the RTX 5090 it decodes at 3.9
+tokens a second. PEFT adapters and the vision tower need the CUDA build.
+
 ## Implementation and limits
 
 ### Optional image reading
