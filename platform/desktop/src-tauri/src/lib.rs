@@ -231,6 +231,7 @@ pub mod companion;
 mod embed;
 #[cfg(feature = "gui")]
 mod engines;
+#[cfg(feature = "gui")]
 mod nvidia_engine;
 #[cfg(feature = "gui")]
 mod migrate;
