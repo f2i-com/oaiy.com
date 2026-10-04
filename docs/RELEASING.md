@@ -25,8 +25,13 @@ it carries the CLI that runs flows (`resources/cli`), the Agent (`resources/app`
 on `index.html`) and the flow editor (`resources/flows`, opening on `app.html`), which the
 desktop serves into its own window. Building an installer stops if either page is missing,
 empty or incomplete (`platform/desktop/scripts/stage-pages.mjs`), so there is no installer
-that opens on "the page is not built". What OAIY needs at run time (language and other
-models, the portable Python and the Node runtime) is downloaded on first use, not shipped.
+that opens on "the page is not built". It also carries the portable language-model engine
+(`resources/engines/oaiy-llm-server-webgpu`: GGUF models on any graphics card through
+WebGPU, else the CPU, about 12 MB), so the model the setup downloads runs with nothing else
+to install; building an installer stops if it is not built
+(`platform/desktop/scripts/stage-engines.mjs`). What OAIY needs at run time (language and
+other models, the portable Python and the Node runtime) is downloaded on first use, not
+shipped.
 
 ## The updater key
 
@@ -335,15 +340,17 @@ a release matter here:
 
 ## What is not in a release
 
-- **The engines.** The programs that run models: `oaiy-llm-server` and `oaiy-media`, built
-  with CUDA 12.8 and the Visual Studio 2022 C++ tools; `oaiy-llm-server-webgpu`, the same
-  server without CUDA, for a computer that lacks it; the `oaiy-studio` host and its tray;
-  and `oaiy-voice`, the speech server for calls. `tools/qwen-image/build.ps1` builds all of
-  them on Windows but `oaiy-voice`, which is a crate of its own (its `cuda` and
-  `flash-attn` features put it on the GPU). They are built by hand: they are a separate
+- **The CUDA engines.** The programs that run models fastest on an NVIDIA card:
+  `oaiy-llm-server` and `oaiy-media`, built with CUDA 12.8 and the Visual Studio 2022 C++
+  tools (the NVIDIA libraries they need come to about 850 MB); the `oaiy-studio` host and
+  its tray; and `oaiy-voice`, the speech server for calls. `tools/qwen-image/build.ps1`
+  builds all of them on Windows but `oaiy-voice`, which is a crate of its own (its `cuda`
+  and `flash-attn` features put it on the GPU). They are built by hand: they are a separate
   channel, and no workflow here builds them. The desktop finds them beside itself, in an
-  `engines` folder there, or where `OAIY_ENGINES_DIR` points. An install without them has
-  no models of its own on the computer; the Agent can still use ChatGPT or a provider.
+  `engines` folder there, or where `OAIY_ENGINES_DIR` points, and prefers them to the
+  portable language-model engine the installer carries. Without them an install runs
+  language models on that portable engine, and has no image, video or speech models of its
+  own.
 - **Aokie**, the phone plugin. It is a separate product: OAIY installs it from a folder or
   an archive, and no release of OAIY contains it.
 - **Windows code signing.** The installers are not signed with a certificate
@@ -400,7 +407,10 @@ the previous OAIY, before the merge.
 
 The same build, unsigned, without the workflow (the commands are in
 [the desktop's README](../platform/desktop/README.md#production-build)): build the Agent
-(`npm run build:desktop` in `app/`), the flow editor and the CLI, then `npm run tauri:build`
-in `platform/desktop`. It writes the installers to
-`platform/desktop/src-tauri/target/release/bundle/`, and stops if a page is not built. Do not
+(`npm run build:desktop` in `app/`), the flow editor, the CLI and the portable
+language-model engine (`cargo build --release -p oaiy-llm-server --no-default-features
+--features webgpu --bin oaiy-llm-server-webgpu` at the repository's root), then
+`npm run tauri:build` in `platform/desktop`. It writes the installers to
+`platform/desktop/src-tauri/target/release/bundle/`, and stops if a page or the engine is
+not built. Do not
 run one beside another OAIY: they listen on the same ports.

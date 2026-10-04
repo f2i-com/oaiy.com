@@ -237,6 +237,7 @@ as the dashboard and the CLI, so their builds come first (from the repository's 
 cd app; npm ci; npm run build:desktop; cd ..             # the Agent, and the SoftN runtime its app preview needs
 cd platform/ui; npm ci; npm run build; cd ../..          # the flow editor
 cd platform/cli; npm ci; npm run build; cd ../..         # the CLI
+cargo build --release -p oaiy-llm-server --no-default-features --features webgpu --bin oaiy-llm-server-webgpu   # the portable language-model engine
 cd platform/desktop; npm ci; npm run tauri:build
 ```
 
@@ -246,9 +247,14 @@ builds into `src-tauri/resources/app` (`app/dist`) and `src-tauri/resources/flow
 builds the dashboard. It stops when a page is missing, empty or incomplete, so an
 installer never goes without one. Tauri keeps the `resources/` of a bundled folder, so an
 installed OAIY finds the pages in `<install>/resources/app` and `<install>/resources/flows`,
-where `src/embed.rs` looks (`OAIY_APP_DIST` and `OAIY_FLOWS_DIST` override it). `tauri dev`,
-`cargo test` and CI need none of them staged: `build.rs` makes the two folders, empty, and
-in a debug build the pages come from their build folders.
+where `src/embed.rs` looks (`OAIY_APP_DIST` and `OAIY_FLOWS_DIST` override it). Then
+`npm run stage-engines` copies the portable language-model engine
+(`target/release/oaiy-llm-server-webgpu`) into `src-tauri/resources/engines`, and stops when
+it is not built: an installed OAIY runs the model its setup downloads on it, from
+`<install>/resources/engines`, unless a CUDA build of `oaiy-llm-server` is beside the program
+(`src/engines.rs`). `tauri dev`, `cargo test` and CI need none of them staged: `build.rs`
+makes the three folders, empty, and in a debug build the pages come from their build
+folders.
 
 Output is the installers (Windows NSIS and MSI; Linux AppImage, deb and rpm, on Linux)
 under `src-tauri/target/release/bundle/`. The engines' programs are not in them:

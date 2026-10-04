@@ -44,7 +44,8 @@
     "resources": [
       "resources/cli/**/*",
       "resources/app",
-      "resources/flows"
+      "resources/flows",
+      "resources/engines"
     ]
   },
   "plugins": {

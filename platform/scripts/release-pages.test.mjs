@@ -22,6 +22,7 @@ describe('the desktop legs of the release', () => {
   const agent = at((step) => step.name === 'Install and build the Agent');
   const flows = at((step) => step.name === 'Install and build the flow editor');
   const tauri = at((step) => step.name === 'Build OAIY Desktop');
+  const engine = at((step) => step.name === 'Build the portable language-model engine');
 
   it('build the Agent and the flow editor before tauri build stages them', () => {
     assert.ok(agent >= 0 && flows >= 0 && tauri >= 0, JSON.stringify({ agent, flows, tauri }));
@@ -31,6 +32,16 @@ describe('the desktop legs of the release', () => {
     assert.equal(desktop[flows].workingDirectory, 'platform/ui');
     assert.match(desktop[flows].run, /^npm ci\nnpm run build\n$/);
     assert.equal(desktop[tauri].workingDirectory, 'platform/desktop');
+  });
+
+  it('build the portable language-model engine before tauri build stages it', () => {
+    // platform/desktop/scripts/stage-engines.mjs copies target/release/oaiy-llm-server-webgpu, and stops when it is missing.
+    assert.ok(engine >= 0 && engine < tauri, JSON.stringify({ engine, tauri }));
+    assert.equal(desktop[engine].workingDirectory, undefined, 'the repository\'s workspace, at its root');
+    assert.equal(
+      desktop[engine].run.trim(),
+      'cargo build --release --locked -p oaiy-llm-server --no-default-features --features webgpu --bin oaiy-llm-server-webgpu',
+    );
   });
 
   it('build the flow editor with the release’s ZIPP, and standalone', () => {

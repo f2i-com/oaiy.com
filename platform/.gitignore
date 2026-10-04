@@ -78,6 +78,10 @@ desktop/src-tauri/resources/cli/
 desktop/src-tauri/resources/app/
 desktop/src-tauri/resources/flows/
 
+# Staged at build time by desktop/scripts/stage-engines.mjs: a copy of the
+# portable language-model engine (target/release/oaiy-llm-server-webgpu).
+desktop/src-tauri/resources/engines/
+
 # Scratch measurement/probe harnesses written at the repo root of ui/.
 # Real tooling lives in ui/tests/ or ui/scripts/, so anything loose here is
 # throwaway by definition.

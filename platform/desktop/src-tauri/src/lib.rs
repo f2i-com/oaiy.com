@@ -1346,6 +1346,10 @@ pub fn run() {
             // The engines: started on their own thread (a running studio is found
             // over HTTP, and launching one binds its ports), so the window is not kept waiting.
             if !isolated {
+                // The portable engine the installer carries (`bundle.resources`, resources/engines).
+                if let Ok(resources) = app.path().resource_dir() {
+                    crate::engines::set_bundled(resources.join("resources").join("engines"));
+                }
                 let data_dir = data_dir.clone();
                 std::thread::spawn(move || {
                     if let Err(e) = crate::engines::start(&data_dir) {

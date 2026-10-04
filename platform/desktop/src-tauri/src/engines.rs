@@ -20,6 +20,14 @@ use std::sync::{Mutex, OnceLock};
 
 static RUNNING: Mutex<Option<oaiy_studio::Running>> = Mutex::new(None);
 static UI_URL: OnceLock<String> = OnceLock::new();
+static BUNDLED: OnceLock<PathBuf> = OnceLock::new();
+
+/// The engines an installer carries, `<resources>/resources/engines`: the portable language-model server
+/// (`oaiy-llm-server-webgpu`, GGUF models on any graphics card through WebGPU, else the CPU), so an installed OAIY
+/// runs a model with nothing else to install. The app sets it from its resource folder before the engines start.
+pub fn set_bundled(dir: PathBuf) {
+    let _ = BUNDLED.set(dir);
+}
 
 /// How the desktop treats the engines (see the module docs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,7 +58,6 @@ fn exe(name: &str) -> String {
 
 /// Where the engine programs are.
 pub fn programs_dir() -> Option<PathBuf> {
-    let has = |d: &Path| d.join(exe("oaiy-llm-server")).is_file() || d.join(exe("oaiy-media")).is_file();
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(dir) = std::env::var("OAIY_ENGINES_DIR") {
         candidates.push(PathBuf::from(dir));
@@ -59,8 +66,20 @@ pub fn programs_dir() -> Option<PathBuf> {
         candidates.push(dir.join("engines"));
         candidates.push(dir);
     }
+    // The portable engine the installer carries: after a CUDA build put beside the program, which is faster on an
+    // NVIDIA card and is still the one used when it is there.
+    if let Some(dir) = BUNDLED.get() {
+        candidates.push(dir.clone());
+    }
     // A build from the repository: platform/desktop/src-tauri → the workspace's release build.
     candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../target/release"));
+    first_with_programs(candidates)
+}
+
+/// The first of `candidates` that holds an engine program: the CUDA or the portable language-model server, or the
+/// media worker.
+fn first_with_programs(candidates: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    let has = |d: &Path| ["oaiy-llm-server", "oaiy-llm-server-webgpu", "oaiy-media"].iter().any(|p| d.join(exe(p)).is_file());
     candidates.into_iter().find(|d| has(d)).map(|d| std::path::absolute(&d).unwrap_or(d))
 }
 
@@ -236,6 +255,25 @@ pub fn stop() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_portable_engine_an_installer_carries_is_found_and_a_cuda_build_before_it_is_preferred() {
+        let base = std::env::temp_dir().join(format!("oaiy-engine-dirs-{}", std::process::id()));
+        let (empty, cuda, bundled) = (base.join("empty"), base.join("cuda"), base.join("bundled"));
+        for d in [&empty, &cuda, &bundled] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(bundled.join(exe("oaiy-llm-server-webgpu")), b"x").unwrap();
+        // The bundled portable server alone is enough: it was not a program here before, so an installer's was never found.
+        let found = first_with_programs([empty.clone(), bundled.clone()]).unwrap();
+        assert!(found.ends_with("bundled"), "{}", found.display());
+        // A CUDA build earlier in the list wins.
+        std::fs::write(cuda.join(exe("oaiy-llm-server")), b"x").unwrap();
+        assert!(first_with_programs([empty.clone(), cuda.clone(), bundled.clone()]).unwrap().ends_with("cuda"));
+        // Nothing anywhere: none.
+        assert_eq!(first_with_programs([empty.clone()]), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn the_configuration_lives_in_the_data_folder() {

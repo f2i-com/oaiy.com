@@ -258,8 +258,11 @@ npm run tauri:build    # the installers, under src-tauri/target/release/bundle/
 ```
 
 `tauri:build` first stages the Agent's and the flow editor's builds into
-`src-tauri/resources/app` and `resources/flows` (`npm run stage-pages`), so the installers
-carry both, and it stops if either is missing or incomplete. `tauri:dev` needs none of
+`src-tauri/resources/app` and `resources/flows` (`npm run stage-pages`), and the portable
+language-model engine into `resources/engines` (`npm run stage-engines`; build it first
+with `cargo build --release -p oaiy-llm-server --no-default-features --features webgpu
+--bin oaiy-llm-server-webgpu`), so the installers carry them, and it stops if any is
+missing or incomplete. `tauri:dev` needs none of
 that: it serves them from their build folders. [docs/RELEASING.md](docs/RELEASING.md) says
 what a release contains and how to make one.
 

@@ -330,7 +330,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
-          workspaces: platform/desktop/src-tauri
+          workspaces: |
+            platform/desktop/src-tauri
+            . -> target
 
       - name: Linux build dependencies
         if: matrix.label == 'linux'
@@ -398,6 +400,15 @@ jobs:
       - name: Install the desktop app's dependencies
         working-directory: platform/desktop
         run: npm ci
+
+      # The installer carries the portable language-model engine (no CUDA: GGUF
+      # models on any graphics card through WebGPU, else the CPU), so an installed
+      # OAIY can run the model its setup downloads. tauri build stages it
+      # (platform/desktop/scripts/stage-engines.mjs, from beforeBuildCommand) and
+      # stops if it is not built. It is the repository's own workspace, apart from
+      # the desktop's. The CUDA build stays a separate, hand-built channel.
+      - name: Build the portable language-model engine
+        run: cargo build --release --locked -p oaiy-llm-server --no-default-features --features webgpu --bin oaiy-llm-server-webgpu
 
       # The installers are built UNSIGNED, on every run, tag or branch. This step runs
       # the project's npm packages and Rust crates, so it is given no secret at all: the

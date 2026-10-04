@@ -103,7 +103,7 @@ describe('the pages, as the desktop names them', () => {
     for (const page of PAGES) expect(config.bundle.resources, page.folder).toContain(`resources/${page.folder}`);
     // Tauri runs beforeBuildCommand whichever way it is started, so this is what stops `npx tauri build` too.
     expect(config.build.beforeBuildCommand).toBe('npm run build:bundle');
-    expect(manifest.scripts['build:bundle']).toMatch(/^npm run stage-pages && npm run build$/);
+    expect(manifest.scripts['build:bundle']).toMatch(/^npm run stage-pages && npm run stage-engines && npm run build$/);
     expect(manifest.scripts['stage-pages']).toBe('node scripts/stage-pages.mjs');
     expect(manifest.scripts['tauri:build']).toMatch(/^tauri build\b/);
     // The plain build stays what the checks run: the pages are the installer's, not the tests'.

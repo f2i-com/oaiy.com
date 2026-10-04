@@ -8,7 +8,7 @@
   "scripts": {
     "dev": "vite",
     "build": "node scripts/sync-cli.mjs && tsc --noEmit && vite build",
-    "build:bundle": "npm run stage-pages && npm run build",
+    "build:bundle": "npm run stage-pages && npm run stage-engines && npm run build",
     "test": "vitest run && npm run test:shell",
     "test:shell": "node --test scripts/oaiyctl.test.mjs scripts/check-release.test.mjs scripts/smoke-token.test.mjs",
     "test:unit": "vitest",
@@ -18,6 +18,7 @@
     "tauri:dev": "tauri dev --features gui",
     "tauri:build": "tauri build --features gui,custom-protocol",
     "sync-cli": "node scripts/sync-cli.mjs",
+    "stage-engines": "node scripts/stage-engines.mjs",
     "stage-pages": "node scripts/stage-pages.mjs"
   },
   "dependencies": {
