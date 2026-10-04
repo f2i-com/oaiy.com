@@ -118,6 +118,8 @@ pub enum Flavour {
     Deepseek(Arc<dsv41::tokenizer::Tokenizer>),
     Gguf(Arc<tokenizer::Tokenizer>),
     Qwen(Arc<tokenizer::Tokenizer>),
+    /// A dense GGUF (Llama, Mistral, Qwen2, Qwen3, Gemma 3 / 3n / 4): its own architecture's template.
+    Dense(Arc<tokenizer::Tokenizer>, llama_rs::Architecture),
 }
 
 impl Flavour {
@@ -125,7 +127,7 @@ impl Flavour {
         match self {
             Self::Deepseek(t) => t.encode(text),
             // llama-rs applies BOS through the template, so not again here.
-            Self::Gguf(t) | Self::Qwen(t) => t.encode(text, false).unwrap_or_default(),
+            Self::Gguf(t) | Self::Qwen(t) | Self::Dense(t, _) => t.encode(text, false).unwrap_or_default(),
         }
     }
 
@@ -152,21 +154,7 @@ impl Flavour {
                     34..=66 => llama_rs::ReasoningEffort::High,
                     _ => llama_rs::ReasoningEffort::Max,
                 };
-                let mut out = Vec::new();
-                for m in msgs {
-                    let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user");
-                    let content = m
-                        .get("content")
-                        .and_then(|c| c.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    let role = match role {
-                        "system" => llama_rs::Role::System,
-                        "assistant" => llama_rs::Role::Assistant,
-                        _ => llama_rs::Role::User,
-                    };
-                    out.push(llama_rs::ChatMessage { role, content });
-                }
+                let out = llama_messages(msgs);
                 // The mode decides which generation prompt: `Thinking` opens
                 // `<think>` for the model to reason in, `Chat` pre-fills
                 // `<think></think>` so it answers directly. Ignoring this was worth
@@ -178,7 +166,53 @@ impl Flavour {
                     images: Vec::new(),
                 })
             }
+            Self::Dense(_, arch) => Ok(dsv41::chat::Encoded {
+                prompt: dense_prompt(arch, &llama_messages(msgs), opts.mode == dsv41::chat::Mode::Thinking),
+                images: Vec::new(),
+            }),
         }
+    }
+}
+
+/// A chat request's messages as llama-rs's templates take them: the text of each, by role.
+fn llama_messages(msgs: &[oaiy_engine::json::Json]) -> Vec<llama_rs::ChatMessage> {
+    msgs.iter()
+        .map(|m| {
+            let content = m.get("content").and_then(|c| c.as_str()).unwrap_or_default().to_string();
+            let role = match m.get("role").and_then(|r| r.as_str()).unwrap_or("user") {
+                "system" => llama_rs::Role::System,
+                "assistant" => llama_rs::Role::Assistant,
+                _ => llama_rs::Role::User,
+            };
+            llama_rs::ChatMessage { role, content }
+        })
+        .collect()
+}
+
+/// A dense model's prompt, in its own architecture's template.
+///
+/// Qwen3 reasons when asked: ChatML with `<think>` opened, as the GLM prompt opens it, so the reply's reasoning is
+/// told apart by the same token. Every other dense family, and Qwen3 in a plain chat (its template pre-fills an empty
+/// think block, as the official one does), answers directly.
+fn dense_prompt(arch: &llama_rs::Architecture, msgs: &[llama_rs::ChatMessage], thinking: bool) -> String {
+    if thinking && *arch == llama_rs::Architecture::Qwen3 {
+        let mut p = llama_rs::apply_chat_template(&llama_rs::Architecture::Qwen2, msgs, true);
+        p.push_str("<think>");
+        return p;
+    }
+    llama_rs::apply_chat_template(arch, msgs, true)
+}
+
+/// The architecture of a dense GGUF, which is loaded whole (see `load_gguf`); None for Qwen3.5 (a path of its
+/// own), the MoE families expert streaming serves, and what llama-rs does not know.
+fn dense_arch(gguf: &gguf::GgufFile) -> Option<llama_rs::Architecture> {
+    use llama_rs::Architecture as A;
+    let name = gguf.get_str("general.architecture").ok()?;
+    let experts = gguf.get_u64(&format!("{name}.expert_count")).unwrap_or(0) > 0;
+    match A::from_str(name) {
+        arch @ (A::Llama | A::Mistral | A::Qwen2) if !experts => Some(arch),
+        arch @ (A::Qwen3 | A::Gemma3 | A::Gemma3n | A::Gemma4) => Some(arch),
+        _ => None,
     }
 }
 
@@ -745,6 +779,23 @@ impl Models {
             let thread = std::thread::Builder::new().name("qwen-model".into()).spawn(move || e.run(rx)).map_err(Error::Io)?;
             return Ok(Live {name:spec.name.clone(),jobs,thread,cfg:Arc::new(cfg),flavour:Arc::new(Flavour::Qwen(tok))});
         }
+        // Dense models (Llama, Mistral and Qwen2 without experts, Qwen3, Gemma 3, 3n and 4) are loaded whole onto
+        // the backend, as Qwen3.5 is above, and answer in their own template with their own stop tokens. Expert
+        // streaming below is for the MoE families only and refused every dense model, so a Llama or Gemma GGUF (most of
+        // what people keep, and most of the catalog) could not be served at all. They chat; tool calls are read in the
+        // GLM and Qwen3.5 formats only, so the Agent's tools need one of those.
+        if let Some(arch) = dense_arch(&gguf) {
+            let model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).map_err(|e| Error::Arg(e.to_string()))?;
+            drop(gguf);
+            let tok = Arc::new(model.tokenizer().clone());
+            // Bound the initial KV allocation, as for dense Qwen3.5: a full context of an 8B model is gigabytes.
+            let max_seq = self.context(model.config().context_length).min(16384);
+            let cfg = self.base_cfg(spec, max_seq);
+            let (jobs, rx) = std::sync::mpsc::channel();
+            let e = glm::GlmEngine::new(model, Arc::clone(&tok), max_seq, !o.quiet && !o.silent);
+            let thread = std::thread::Builder::new().name("model".into()).spawn(move || e.run(rx)).map_err(Error::Io)?;
+            return Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Dense(tok, arch)) });
+        }
         drop(gguf);
         let budget = o.expert_cache_bytes();
         if o.ram_gb == 0 {
@@ -985,4 +1036,48 @@ fn gpu_selection_adapts_to_single_device() {
     assert_eq!(available_devices(&[],2).unwrap(),vec![0,1]);
     assert_eq!(available_devices(&[1],1).unwrap(),vec![0]);
     assert!(available_devices(&[],0).is_err());
+}
+
+#[cfg(test)]
+mod dense_tests {
+    use super::*;
+    use llama_rs::Architecture as A;
+
+    fn msgs() -> Vec<llama_rs::ChatMessage> {
+        llama_messages(&[
+            oaiy_engine::json::Json::parse(br#"{"role":"system","content":"Be brief."}"#).unwrap(),
+            oaiy_engine::json::Json::parse(br#"{"role":"user","content":"Capital of France?"}"#).unwrap(),
+        ])
+    }
+
+    #[test]
+    fn each_dense_family_is_asked_in_its_own_template_and_its_turn_is_left_open() {
+        let llama = dense_prompt(&A::Llama, &msgs(), false);
+        assert!(llama.contains("<|start_header_id|>user<|end_header_id|>") && llama.contains("Capital of France?"), "{llama}");
+        assert!(llama.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"), "{llama:?}");
+        let gemma = dense_prompt(&A::Gemma3, &msgs(), false);
+        assert!(gemma.contains("<start_of_turn>user") && gemma.trim_end().ends_with("<start_of_turn>model"), "{gemma:?}");
+        let mistral = dense_prompt(&A::Mistral, &msgs(), false);
+        assert!(mistral.contains("[INST]") && mistral.contains("Capital of France?"), "{mistral:?}");
+        for prompt in [&llama, &gemma, &mistral] {
+            assert!(!prompt.contains("<think>"), "no family but Qwen3 opens reasoning: {prompt:?}");
+        }
+    }
+
+    #[test]
+    fn qwen3_answers_directly_in_a_chat_and_opens_its_reasoning_only_when_asked_to_think() {
+        let chat = dense_prompt(&A::Qwen3, &msgs(), false);
+        assert!(chat.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"), "{chat:?}");
+        let thinking = dense_prompt(&A::Qwen3, &msgs(), true);
+        assert!(thinking.ends_with("<|im_start|>assistant\n<think>"), "{thinking:?}");
+        // Thinking is Qwen3's alone: another family asked to think still answers in its own template.
+        assert_eq!(dense_prompt(&A::Llama, &msgs(), true), dense_prompt(&A::Llama, &msgs(), false));
+    }
+
+    #[test]
+    fn a_message_keeps_its_role_and_its_text() {
+        let m = msgs();
+        assert!(matches!(m[0].role, llama_rs::Role::System) && m[0].content == "Be brief.");
+        assert!(matches!(m[1].role, llama_rs::Role::User) && m[1].content == "Capital of France?");
+    }
 }

@@ -150,11 +150,12 @@ impl GlmEngine {
     /// `max_len` bounds the state the model was opened with.
     pub fn new(model: Model, tok: Arc<Tokenizer>, max_len: usize, log: bool) -> Self {
         let kv = model.new_kv_cache(max_len);
-        // GLM's markers. `chat_stop_tokens` gives the strings; only the ids matter
-        // here, and a missing one simply means that feature is off.
+        // The model's own markers (GLM's for GLM, `<|eot_id|>` for Llama, `<end_of_turn>` for Gemma, `<|im_end|>`
+        // for Qwen): `chat_stop_tokens` gives the strings; only the ids matter here, and a missing one simply means
+        // that feature is off.
         let think_start = tok.token_id("<think>");
         let think_end = tok.token_id("</think>");
-        let mut eos: Vec<u32> = llama_rs::chat_stop_tokens(&llama_rs::Architecture::Glm5Next)
+        let mut eos: Vec<u32> = llama_rs::chat_stop_tokens(&model.config().arch)
             .iter()
             .filter_map(|s| tok.token_id(s))
             .collect();
@@ -578,6 +579,10 @@ impl GlmEngine {
     /// one's logits, which is all a prompt needs.
     fn forward_many(&mut self, ids: &[u32]) -> Result<Vec<f32>> {
         let t = self.model.forward(ids, &mut self.kv);
+        // A dense model on a CUDA card leaves its logits on the card; the streamed MoE models hand them back on the host.
+        if t.device_storage().is_some() {
+            return Ok(t.to_host().data().to_vec());
+        }
         Ok(t.data().to_vec())
     }
 }
