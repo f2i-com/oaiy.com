@@ -23,6 +23,9 @@ use crate::safetensors::StIndex;
 pub struct Experts {
     pub store: Arc<dyn WeightStore>,
     pub cache: Ecache,
+    /// Workers for a decode step's routed experts, all of a token's at once (the same results as one at a time);
+    /// none: one after another on the caller's thread.
+    pub pool: Option<crate::cpu_experts::CpuExperts>,
 }
 
 pub struct Moe {
@@ -103,18 +106,46 @@ impl Moe {
         let mut used: Vec<u32> = routes.iter().flat_map(|r| r.experts.iter().copied()).collect();
         used.sort_unstable();
         used.dedup();
-        for e in used {
-            let rec = experts.cache.acquire(self.layer, e, experts.store.as_ref())?;
-            // every token routed to e, in token order, as one batch
-            let (mut toks, mut xs, mut ws) = (Vec::new(), Vec::new(), Vec::new());
-            for (i, r) in routes.iter().enumerate() {
-                if let Some(k) = r.experts.iter().position(|&x| x == e) {
-                    toks.push(i);
-                    xs.extend_from_slice(&x[i * d..(i + 1) * d]);
-                    ws.push(r.weights[k]);
+        // Each expert's (tokens, outputs), every expert's computed before any is added, then added in ascending
+        // expert order, as one at a time added them: the same sums either way.
+        let leases = used.iter().map(|&e| experts.cache.acquire(self.layer, e, experts.store.as_ref())).collect::<Result<Vec<_>>>()?;
+        let outs: Vec<(Vec<usize>, Vec<f32>)> = match (&experts.pool, t) {
+            // A decode step: the token's experts at once on the workers.
+            (Some(pool), 1) => {
+                let r = &routes[0];
+                let weights: Vec<f32> = used.iter().map(|e| r.weights[r.experts.iter().position(|x| x == e).expect("a used expert is routed")]).collect();
+                let records: Vec<_> = leases.iter().map(|l| l.to_arc()).collect();
+                pool.forward(&records, &weights, x, cfg.swiglu_limit).into_iter().map(|out| (vec![0], out)).collect()
+            }
+            // A prompt: each expert's tokens as one batch, the experts spread over threads.
+            _ => {
+                let batch = |(e, rec): (&u32, &oaiy_engine::ecache::HostLease)| {
+                    // every token routed to e, in token order, as one batch
+                    let (mut toks, mut xs, mut ws) = (Vec::new(), Vec::new(), Vec::new());
+                    for (i, r) in routes.iter().enumerate() {
+                        if let Some(k) = r.experts.iter().position(|x| x == e) {
+                            toks.push(i);
+                            xs.extend_from_slice(&x[i * d..(i + 1) * d]);
+                            ws.push(r.weights[k]);
+                        }
+                    }
+                    let out = expert_forward_batch(rec, &xs, Some(&ws), cfg.swiglu_limit);
+                    (toks, out)
+                };
+                let threads = if experts.pool.is_some() { std::thread::available_parallelism().map_or(1, |n| n.get()) } else { 1 };
+                if threads <= 1 || used.len() <= 1 {
+                    used.iter().zip(&leases).map(batch).collect()
+                } else {
+                    let per = used.len().div_ceil(threads);
+                    let jobs: Vec<(&u32, &oaiy_engine::ecache::HostLease)> = used.iter().zip(&leases).collect();
+                    std::thread::scope(|scope| {
+                        let handles: Vec<_> = jobs.chunks(per).map(|part| scope.spawn(move || part.iter().map(|&j| batch(j)).collect::<Vec<_>>())).collect();
+                        handles.into_iter().flat_map(|h| h.join().expect("an expert worker panicked")).collect()
+                    })
                 }
             }
-            let out = expert_forward_batch(&rec, &xs, Some(&ws), cfg.swiglu_limit);
+        };
+        for (toks, out) in outs {
             for (j, &i) in toks.iter().enumerate() {
                 for (acc, v) in y[i * d..(i + 1) * d].iter_mut().zip(&out[j * d..(j + 1) * d]) {
                     *acc += v;

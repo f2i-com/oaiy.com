@@ -132,6 +132,8 @@ impl Model {
             states,
             shared: Shared::default(),
             experts: Experts {
+                // Every hardware thread for the routed experts (a decode step's at once, a prompt's spread out).
+                pool: Some(crate::cpu_experts::CpuExperts::new(0)),
                 store: Arc::new(store),
                 cache: Ecache::new(opts.expert_cache_bytes, RECORD_BYTES, CachePolicy::Lfru),
             },
