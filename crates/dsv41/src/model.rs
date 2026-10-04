@@ -134,6 +134,7 @@ impl Model {
             experts: Experts {
                 // Every hardware thread for the routed experts (a decode step's at once, a prompt's spread out).
                 pool: Some(crate::cpu_experts::CpuExperts::new(0)),
+                gpu: None,
                 store: Arc::new(store),
                 cache: Ecache::new(opts.expert_cache_bytes, RECORD_BYTES, CachePolicy::Lfru),
             },
@@ -251,6 +252,66 @@ impl Model {
         trace(&format!("layer{l:02}.route_w"), &routes.iter().flat_map(|r| r.weights.iter().copied()).collect::<Vec<_>>());
         let h2: Vec<f32> = (0..t).flat_map(|i| hc::post(&m[i * d..(i + 1) * d], &h1[tok(i)], &ffn_mix[i])).collect();
         Ok((h2, ffn_mix.iter().map(|m| m.pre).collect(), routes))
+    }
+}
+
+/// What the model's state holds after some tokens, to come back to with [`Model::restore`]: a conversation's next turn
+/// starts with the prompt the last one read but not with the reply's tokens (its chat template writes the reply its own
+/// way), so the state the reply moved on from is the one it can use. Every layer's caches and the n-gram history.
+#[derive(Clone)]
+pub struct Checkpoint {
+    states: Vec<AttnState>,
+    history: Vec<i64>,
+}
+
+impl Model {
+    /// The state as it stands (the caller knows how many tokens it covers).
+    pub fn checkpoint(&self) -> Checkpoint {
+        Checkpoint { states: self.states.clone(), history: self.hasher.history().to_vec() }
+    }
+
+    /// Back to `c`: the next forward continues from the tokens it covered.
+    pub fn restore(&mut self, c: &Checkpoint) {
+        self.states.clone_from(&c.states);
+        self.hasher.set_cache(&c.history);
+    }
+
+    /// Have a prompt's busy routed experts' matmuls made by `kernel` (a GPU's: see [`crate::moe::Experts::gpu`]).
+    pub fn set_experts_kernel(&mut self, kernel: Option<Arc<dyn crate::expert::ExpertsKernel>>) {
+        self.experts.gpu = kernel;
+    }
+
+    /// Hand the trunk's dense weights to `place` (a GPU's), each with its name (`layers.<l>.attn.wq_b`, `head`): the
+    /// weight it returns replaces the one it was given (a [`Weight::Device`]), None leaves it here. The embedding stays
+    /// (a prompt reads rows of it). How many were placed, and their bytes as stored.
+    pub fn offload(&mut self, mut place: impl FnMut(&str, &Weight) -> Option<Weight>) -> (usize, u64) {
+        let (mut count, mut bytes) = (0usize, 0u64);
+        let mut each = |name: String, w: &mut Weight| {
+            let size = match w {
+                Weight::Fp8 { w, s, .. } => (w.len() + s.len()) as u64,
+                Weight::Bf16 { w, .. } => w.len() as u64 * 2,
+                Weight::F32 { w, .. } => w.len() as u64 * 4,
+                Weight::Device { .. } => return,
+            };
+            if let Some(new) = place(&name, w) {
+                *w = new;
+                count += 1;
+                bytes += size;
+            }
+        };
+        for (l, layer) in self.layers.iter_mut().enumerate() {
+            for (name, w) in layer.attn.weights_mut() {
+                each(format!("layers.{l}.attn.{name}"), w);
+            }
+            for (name, w) in layer.moe.weights_mut() {
+                each(format!("layers.{l}.ffn.{name}"), w);
+            }
+            if let Some(e) = &mut layer.engram {
+                each(format!("layers.{l}.engram.wkv"), e.weight_mut());
+            }
+        }
+        each("head".into(), &mut self.head);
+        (count, bytes)
     }
 }
 

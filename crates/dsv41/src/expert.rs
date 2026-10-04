@@ -257,9 +257,16 @@ pub fn expert_forward_batch(record: &[u8], x: &[f32], route_weights: Option<&[f3
     let xq = fake_quant_fp8(x, BLOCK);
     let gate = fp4_matmul(&xq, nt, &record[W1], &record[S1], INTER, DIM);
     let up = fp4_matmul(&xq, nt, &record[W3], &record[S3], INTER, DIM);
-    let h: Vec<f32> = gate
-        .iter()
-        .zip(&up)
+    let hq = fake_quant_fp8(&swiglu(&gate, &up, route_weights, swiglu_limit), BLOCK);
+    fp4_matmul(&hq, nt, &record[W2], &record[S2], DIM, INTER).into_iter().map(to_bf16).collect()
+}
+
+/// The middle of [`expert_forward_batch`]: from the gate and up sums (`[rows, INTER]`, f32) to the activation the down
+/// projection takes (before its fp8 quantization): each rounded to bf16, clamped, `silu(gate) * up`, times the row's
+/// routing weight, rounded again.
+pub fn swiglu(gate: &[f32], up: &[f32], route_weights: Option<&[f32]>, swiglu_limit: f32) -> Vec<f32> {
+    gate.iter()
+        .zip(up)
         .enumerate()
         .map(|(i, (&g, &u))| {
             let (mut g, mut u) = (to_bf16(g), to_bf16(u));
@@ -273,7 +280,20 @@ pub fn expert_forward_batch(record: &[u8], x: &[f32], route_weights: Option<&[f3
             }
             to_bf16(v)
         })
-        .collect();
-    let hq = fake_quant_fp8(&h, BLOCK);
-    fp4_matmul(&hq, nt, &record[W2], &record[S2], DIM, INTER).into_iter().map(to_bf16).collect()
+        .collect()
+}
+
+/// One expert's share of a prompt for an [`ExpertsKernel`]: its record, its tokens' rows (`[rows, DIM]`) and their
+/// routing weights.
+pub struct ExpertJob<'a> {
+    pub record: &'a [u8],
+    pub x: &'a [f32],
+    pub weights: &'a [f32],
+}
+
+/// [`expert_forward_batch`] for several experts at once, their matmuls made elsewhere (a GPU's): each job's output,
+/// `[rows, DIM]`, in order. It quantizes the activations and takes the SwiGLU as [`expert_forward_batch`] does (with
+/// `fake_quant_fp8` and [`swiglu`]), so only the sums are made there.
+pub trait ExpertsKernel: Send + Sync {
+    fn forward(&self, jobs: &[ExpertJob<'_>], swiglu_limit: f32) -> Vec<Vec<f32>>;
 }

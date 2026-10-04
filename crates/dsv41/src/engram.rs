@@ -50,6 +50,16 @@ pub struct NgramHasher {
 }
 
 impl NgramHasher {
+    /// The token history it hashes from, for a [`crate::model::Checkpoint`].
+    pub(crate) fn history(&self) -> &[i64] {
+        &self.cache
+    }
+
+    /// Put back a history taken by [`history`](Self::history).
+    pub(crate) fn set_cache(&mut self, cache: &[i64]) {
+        self.cache.copy_from_slice(cache);
+    }
+
     /// Load the precompute written by `oracle.py`.
     pub fn load(meta: &Path, cfg: &Config, max_seq: usize) -> Result<NgramHasher> {
         let m = StIndex::open_file(meta)?;
@@ -256,6 +266,11 @@ pub struct Engram {
 }
 
 impl Engram {
+    /// Its dense weight, for [`crate::model::Model::offload`].
+    pub(crate) fn weight_mut(&mut self) -> &mut Weight {
+        &mut self.wkv
+    }
+
     pub fn load(idx: &StIndex, cfg: &Config, layer: usize) -> Result<Engram> {
         let p = format!("layers.{layer}.engram");
         let q = idx.read_f32(&format!("{p}.q_weight"))?;

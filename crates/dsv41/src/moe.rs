@@ -26,13 +26,32 @@ pub struct Experts {
     /// Workers for a decode step's routed experts, all of a token's at once (the same results as one at a time);
     /// none: one after another on the caller's thread.
     pub pool: Option<crate::cpu_experts::CpuExperts>,
+    /// Where a prompt's busy experts (those [`GPU_MIN_ROWS`] or more of its tokens chose) have their matmuls made, a
+    /// group of [`GPU_GROUP`] a call: a GPU's (`crate::expert::ExpertsKernel`). None: all on the CPU.
+    pub gpu: Option<Arc<dyn crate::expert::ExpertsKernel>>,
 }
+
+/// Tokens of a prompt an expert needs before a GPU is worth its record's upload (18.8 MB): with fewer, the CPU's
+/// matmuls of a few rows are quicker than the copy.
+pub const GPU_MIN_ROWS: usize = 8;
+/// Experts a GPU takes in one call: their records' upload bounded (about 600 MB), the matmuls a stage's round trip.
+pub const GPU_GROUP: usize = 32;
+/// Threads reading a layer's expert records from the drive at once.
+const READERS: usize = 8;
 
 pub struct Moe {
     layer: u32,
     gate: Weight,
     bias: Vec<f32>,
     shared: [Weight; 3],
+}
+
+impl Moe {
+    /// Its dense weights by name (the router and the shared expert), for [`crate::model::Model::offload`].
+    pub(crate) fn weights_mut(&mut self) -> Vec<(&'static str, &mut Weight)> {
+        let [w1, w2, w3] = &mut self.shared;
+        vec![("gate", &mut self.gate), ("shared.w1", w1), ("shared.w2", w2), ("shared.w3", w3)]
+    }
 }
 
 /// Routed experts one token was sent to, with their weights.
@@ -108,7 +127,27 @@ impl Moe {
         used.dedup();
         // Each expert's (tokens, outputs), every expert's computed before any is added, then added in ascending
         // expert order, as one at a time added them: the same sums either way.
-        let leases = used.iter().map(|&e| experts.cache.acquire(self.layer, e, experts.store.as_ref())).collect::<Result<Vec<_>>>()?;
+        // Their records, read on several threads at once: an SSD serves a queue of reads several times faster than one
+        // at a time (the cache reads a record outside its lock, and the store keeps a scratch buffer a read).
+        let acquire = |e: u32| experts.cache.acquire(self.layer, e, experts.store.as_ref());
+        let leases: Vec<oaiy_engine::ecache::HostLease> = if used.len() <= 1 {
+            used.iter().map(|&e| acquire(e)).collect::<Result<Vec<_>>>()?
+        } else {
+            let readers = READERS.min(used.len());
+            let got: Vec<Result<oaiy_engine::ecache::HostLease>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..readers)
+                    .map(|r| {
+                        let used = &used;
+                        let acquire = &acquire;
+                        scope.spawn(move || (r..used.len()).step_by(readers).map(|i| (i, acquire(used[i]))).collect::<Vec<_>>())
+                    })
+                    .collect();
+                let mut all: Vec<(usize, Result<oaiy_engine::ecache::HostLease>)> = handles.into_iter().flat_map(|h| h.join().expect("an expert reader panicked")).collect();
+                all.sort_by_key(|(i, _)| *i);
+                all.into_iter().map(|(_, r)| r).collect()
+            });
+            got.into_iter().collect::<Result<Vec<_>>>()?
+        };
         let outs: Vec<(Vec<usize>, Vec<f32>)> = match (&experts.pool, t) {
             // A decode step: the token's experts at once on the workers.
             (Some(pool), 1) => {
@@ -117,32 +156,51 @@ impl Moe {
                 let records: Vec<_> = leases.iter().map(|l| l.to_arc()).collect();
                 pool.forward(&records, &weights, x, cfg.swiglu_limit).into_iter().map(|out| (vec![0], out)).collect()
             }
-            // A prompt: each expert's tokens as one batch, the experts spread over threads.
+            // A prompt: each expert's tokens as one batch, the busy experts' on the GPU when there is one, the rest
+            // spread over threads.
             _ => {
-                let batch = |(e, rec): (&u32, &oaiy_engine::ecache::HostLease)| {
-                    // every token routed to e, in token order, as one batch
-                    let (mut toks, mut xs, mut ws) = (Vec::new(), Vec::new(), Vec::new());
-                    for (i, r) in routes.iter().enumerate() {
-                        if let Some(k) = r.experts.iter().position(|x| x == e) {
-                            toks.push(i);
-                            xs.extend_from_slice(&x[i * d..(i + 1) * d]);
-                            ws.push(r.weights[k]);
+                // every token routed to each expert, in token order
+                let gathered: Vec<(Vec<usize>, Vec<f32>, Vec<f32>)> = used
+                    .iter()
+                    .map(|e| {
+                        let (mut toks, mut xs, mut ws) = (Vec::new(), Vec::new(), Vec::new());
+                        for (i, r) in routes.iter().enumerate() {
+                            if let Some(k) = r.experts.iter().position(|x| x == e) {
+                                toks.push(i);
+                                xs.extend_from_slice(&x[i * d..(i + 1) * d]);
+                                ws.push(r.weights[k]);
+                            }
+                        }
+                        (toks, xs, ws)
+                    })
+                    .collect();
+                let mut done: Vec<Option<Vec<f32>>> = (0..used.len()).map(|_| None).collect();
+                if let Some(gpu) = &experts.gpu {
+                    let busy: Vec<usize> = (0..used.len()).filter(|&j| gathered[j].0.len() >= GPU_MIN_ROWS).collect();
+                    for group in busy.chunks(GPU_GROUP) {
+                        let jobs: Vec<crate::expert::ExpertJob<'_>> =
+                            group.iter().map(|&j| crate::expert::ExpertJob { record: &leases[j], x: &gathered[j].1, weights: &gathered[j].2 }).collect();
+                        for (&j, out) in group.iter().zip(gpu.forward(&jobs, cfg.swiglu_limit)) {
+                            done[j] = Some(out);
                         }
                     }
-                    let out = expert_forward_batch(rec, &xs, Some(&ws), cfg.swiglu_limit);
-                    (toks, out)
-                };
+                }
+                let rest: Vec<usize> = (0..used.len()).filter(|&j| done[j].is_none()).collect();
+                let batch = |j: usize| (j, expert_forward_batch(&leases[j], &gathered[j].1, Some(&gathered[j].2), cfg.swiglu_limit));
                 let threads = if experts.pool.is_some() { std::thread::available_parallelism().map_or(1, |n| n.get()) } else { 1 };
-                if threads <= 1 || used.len() <= 1 {
-                    used.iter().zip(&leases).map(batch).collect()
+                let computed: Vec<(usize, Vec<f32>)> = if threads <= 1 || rest.len() <= 1 {
+                    rest.iter().map(|&j| batch(j)).collect()
                 } else {
-                    let per = used.len().div_ceil(threads);
-                    let jobs: Vec<(&u32, &oaiy_engine::ecache::HostLease)> = used.iter().zip(&leases).collect();
+                    let per = rest.len().div_ceil(threads);
                     std::thread::scope(|scope| {
-                        let handles: Vec<_> = jobs.chunks(per).map(|part| scope.spawn(move || part.iter().map(|&j| batch(j)).collect::<Vec<_>>())).collect();
+                        let handles: Vec<_> = rest.chunks(per).map(|part| scope.spawn(move || part.iter().map(|&j| batch(j)).collect::<Vec<_>>())).collect();
                         handles.into_iter().flat_map(|h| h.join().expect("an expert worker panicked")).collect()
                     })
+                };
+                for (j, out) in computed {
+                    done[j] = Some(out);
                 }
+                gathered.into_iter().zip(done).map(|((toks, _, _), out)| (toks, out.expect("every expert computed"))).collect()
             }
         };
         for (toks, out) in outs {

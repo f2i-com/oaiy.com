@@ -382,6 +382,7 @@ impl DW {
             Weight::Fp8 { w, s, n, k } => DW::Fp8 { w: g.upload(w)?, s: g.upload(s)?, n: *n, k: *k },
             Weight::Bf16 { w, n, k } => DW::Bf16 { w: g.upload(w)?, n: *n, k: *k },
             Weight::F32 { .. } => return Err(Error::Unsupported("f32 dense weight on the device".into())),
+            Weight::Device { .. } => return Err(Error::Unsupported("a dense weight already on another device".into())),
         })
     }
 

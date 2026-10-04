@@ -22,10 +22,15 @@
 //! and `wo_b`.
 //!
 //! Prefill runs at `start_pos == 0` over the whole prompt; decode is one
-//! token at a time — the same contract as the reference.
+//! token at a time — the same contract as the reference. A chunk of several
+//! tokens can also continue a sequence (a conversation's next turn, read in one
+//! pass rather than a token at a time): each of its tokens attends to exactly
+//! what a decode step at its position would, in the same order, so the result
+//! is the same as decoding it token by token.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use oaiy_engine::backend::parallel_rows;
 use oaiy_engine::{Error, Result};
 
 use crate::config::Config;
@@ -35,6 +40,7 @@ use crate::ops::{rmsnorm, Rope};
 use crate::safetensors::StIndex;
 
 /// Per-layer caches.
+#[derive(Clone)]
 pub struct AttnState {
     /// Sliding-window ring, `[window][head_dim]`.
     window: Vec<f32>,
@@ -92,6 +98,26 @@ pub struct Attention {
 }
 
 impl Attention {
+    /// Its dense weights by name, for [`crate::model::Model::offload`].
+    pub(crate) fn weights_mut(&mut self) -> Vec<(&'static str, &mut Weight)> {
+        let mut out: Vec<(&'static str, &mut Weight)> =
+            vec![("wq_a", &mut self.wq_a), ("wq_b", &mut self.wq_b), ("wkv", &mut self.wkv), ("wo_a", &mut self.wo_a), ("wo_b", &mut self.wo_b)];
+        if let Some(c) = &mut self.compressor {
+            out.push(("compressor.wkv", &mut c.wkv));
+            if let Some(g) = &mut c.wgate {
+                out.push(("compressor.wgate", g));
+            }
+        }
+        if let Some(i) = &mut self.indexer {
+            out.push(("indexer.wq_b", &mut i.wq_b));
+            out.push(("indexer.weights_proj", &mut i.weights_proj));
+            if let Some(k) = &mut i.wk {
+                out.push(("indexer.wk", k));
+            }
+        }
+        out
+    }
+
     pub fn load(idx: &StIndex, cfg: &Config, layer: usize, rope: Arc<Rope>) -> Result<Attention> {
         let p = format!("layers.{layer}.attn");
         let ratio = cfg.ratio(layer);
@@ -171,8 +197,8 @@ impl Attention {
         shared: &mut Shared,
     ) -> Result<Vec<f32>> {
         let (hd, nh, rd, win) = (cfg.head_dim, cfg.n_heads, cfg.rope_head_dim, cfg.window_size);
-        if start_pos > 0 && t != 1 {
-            return Err(Error::Arg("after prefill, decode one token at a time".into()));
+        if t == 0 {
+            return Err(Error::Arg("no tokens".into()));
         }
         if start_pos + t > self.rope.max_pos() {
             return Err(Error::Arg(format!("position {} past max_seq {}", start_pos + t, self.rope.max_pos())));
@@ -212,7 +238,7 @@ impl Attention {
                 })
                 .collect();
             (kv, idxs)
-        } else {
+        } else if t == 1 {
             state.window[(start_pos % win) * hd..(start_pos % win + 1) * hd].copy_from_slice(&kv);
             let oldest = start_pos % win + 1;
             let ring: Vec<i32> = (oldest..win)
@@ -220,6 +246,38 @@ impl Attention {
                 .map(|s| if s > start_pos { -1 } else { s as i32 })
                 .collect();
             (state.window.clone(), vec![ring])
+        } else {
+            // A chunk continuing the sequence: the ring as the chunk found it (the `win` positions before it), then the
+            // chunk's own rows. Token i (position p) lists the ring's slots in a decode step's order, oldest first, each
+            // slot standing for the latest position <= p it would hold then: a position before the chunk is read from
+            // the ring, one in it from the chunk's rows, one before the sequence's start is -1.
+            let mut window_kv = state.window.clone();
+            window_kv.extend_from_slice(&kv);
+            let idxs = (0..t)
+                .map(|i| {
+                    let p = start_pos + i;
+                    let oldest = p % win + 1;
+                    (oldest..win)
+                        .chain(0..oldest)
+                        .map(|s| {
+                            let back = (p + win - s) % win;
+                            if back > p {
+                                -1
+                            } else if p - back >= start_pos {
+                                (win + p - back - start_pos) as i32
+                            } else {
+                                s as i32
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            // Then the ring takes the chunk's last `win` rows, each at its position's slot.
+            for i in t.saturating_sub(win)..t {
+                let s = (start_pos + i) % win;
+                state.window[s * hd..(s + 1) * hd].copy_from_slice(&kv[i * hd..(i + 1) * hd]);
+            }
+            (window_kv, idxs)
         };
         let offset = window_kv.len() / hd;
 
@@ -267,17 +325,22 @@ impl Attention {
             }
         }
 
-        // sparse attention with sink, then undo the query rotation
+        // sparse attention with sink, then undo the query rotation: every (token, head) on its own, so spread over the
+        // threads (the same sums in the same order whichever thread makes them). Serial, it was most of a prompt's
+        // time on the CPU and most of a decode step's attention.
         let scale = (hd as f32).powf(-0.5);
-        let mut o = vec![0.0f32; t * nh * hd];
-        for i in 0..t {
-            for h in 0..nh {
-                let qh = &q[(i * nh + h) * hd..(i * nh + h + 1) * hd];
-                let out = &mut o[(i * nh + h) * hd..(i * nh + h + 1) * hd];
-                sparse_attend(qh, &kv_all, hd, &idxs[i], self.attn_sink[h], scale, out);
+        let o = Mutex::new(vec![0.0f32; t * nh * hd]);
+        parallel_rows(t * nh, 1, &|b, e| {
+            let mut buf = vec![0.0f32; (e - b) * hd];
+            for r in b..e {
+                let (i, h) = (r / nh, r % nh);
+                let out = &mut buf[(r - b) * hd..(r - b + 1) * hd];
+                sparse_attend(&q[r * hd..(r + 1) * hd], &kv_all, hd, &idxs[i], self.attn_sink[h], scale, out);
                 self.rope.apply(&mut out[hd - rd..], start_pos + i, true);
             }
-        }
+            o.lock().unwrap_or_else(|p| p.into_inner())[b * hd..e * hd].copy_from_slice(&buf);
+        });
+        let o = o.into_inner().unwrap_or_else(|p| p.into_inner());
 
         // grouped low-rank output: wo_a is block-diagonal over o_groups
         let (g, gd, orank) = (cfg.o_groups, nh * hd / cfg.o_groups, cfg.o_lora_rank);
@@ -389,9 +452,12 @@ pub enum CandidateRole {
 /// `bf16(sum_h bf16(relu(bf16(q_h . k)) * w_h))` per (query, key).
 pub fn index_scores(q: &[f32], keys: &[f32], weights: &[f32], inh: usize, ihd: usize) -> Vec<f32> {
     let (t, n_t) = (q.len() / (inh * ihd), keys.len() / ihd);
-    let mut out = vec![0.0f32; t * n_t];
-    for i in 0..t {
-        for tt in 0..n_t {
+    // Every (query, key) cell on its own, spread over the threads; each summed as before.
+    let out = Mutex::new(vec![0.0f32; t * n_t]);
+    parallel_rows(t * n_t, 64, &|b, e| {
+        let mut buf = vec![0.0f32; e - b];
+        for (c, cell) in (b..e).zip(buf.iter_mut()) {
+            let (i, tt) = (c / n_t, c % n_t);
             let key = &keys[tt * ihd..(tt + 1) * ihd];
             let mut acc = 0.0f32;
             for h in 0..inh {
@@ -399,10 +465,11 @@ pub fn index_scores(q: &[f32], keys: &[f32], weights: &[f32], inh: usize, ihd: u
                 let d = to_bf16(qh.iter().zip(key).map(|(a, b)| a * b).sum::<f32>()).max(0.0);
                 acc += to_bf16(d * weights[i * inh + h]);
             }
-            out[i * n_t + tt] = to_bf16(acc);
+            *cell = to_bf16(acc);
         }
-    }
-    out
+        out.lock().unwrap_or_else(|p| p.into_inner())[b..e].copy_from_slice(&buf);
+    });
+    out.into_inner().unwrap_or_else(|p| p.into_inner())
 }
 
 /// From indexer scores to each query's compressed positions: causal mask
@@ -501,7 +568,7 @@ impl Compressor {
                 out.extend(pool(&kv[grp * r * hd..(grp + 1) * r * hd], &score[grp * r * hd..(grp + 1) * r * hd], r, hd));
             }
             out
-        } else {
+        } else if t == 1 {
             let slot = start_pos % r;
             st.kv_state[slot * hd..(slot + 1) * hd].copy_from_slice(&kv);
             st.score_state[slot * hd..(slot + 1) * hd].copy_from_slice(&score);
@@ -509,6 +576,27 @@ impl Compressor {
                 return None;
             }
             pool(&st.kv_state, &st.score_state, r, hd)
+        } else {
+            // A chunk continuing the sequence (as the CUDA path does it): the partial group the state holds
+            // (start_pos % r rows) first, then the chunk's rows; every complete group is pooled, the rest waits.
+            let p = start_pos % r;
+            let mut ckv = st.kv_state[..p * hd].to_vec();
+            ckv.extend_from_slice(&kv);
+            let mut csc = st.score_state[..p * hd].to_vec();
+            csc.extend_from_slice(&score);
+            let n = p + t;
+            let rem = n % r;
+            let cutoff = n - rem;
+            st.kv_state[..rem * hd].copy_from_slice(&ckv[cutoff * hd..]);
+            st.score_state[..rem * hd].copy_from_slice(&csc[cutoff * hd..]);
+            if n < r {
+                return None;
+            }
+            let mut out = Vec::with_capacity(cutoff / r * hd);
+            for grp in 0..cutoff / r {
+                out.extend(pool(&ckv[grp * r * hd..(grp + 1) * r * hd], &csc[grp * r * hd..(grp + 1) * r * hd], r, hd));
+            }
+            out
         };
         let bf: Vec<f32> = pooled.into_iter().map(to_bf16).collect();
         Some(rmsnorm(&bf, &self.norm, cfg.norm_eps))

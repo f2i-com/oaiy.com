@@ -14,8 +14,12 @@
 //! Weights stay in their stored form in RAM (fp8 is 1 byte/weight) and each
 //! output row is dequantized once per call, then dotted with every token's
 //! activation, so a prefill of t tokens reads the weight once.
+//!
+//! A weight can also be held elsewhere ([`Weight::Device`], a GPU's: see
+//! [`crate::model::Model::offload`]): the activation is still quantized here and the
+//! result rounded here, so only the sums are made there.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use oaiy_engine::backend::parallel_rows;
 use oaiy_engine::{Error, Result};
@@ -35,10 +39,19 @@ pub enum Out {
     F32,
 }
 
+/// A dense weight held elsewhere (on a GPU), which [`Weight::Device`] runs: the f32 sums of `x` (`[t, k]`, already
+/// quantized as the reference quantizes it for an fp8 weight) against rows `rows`, `[t, rows.len()]`.
+pub trait DenseKernel: Send + Sync {
+    fn forward_rows(&self, x: &[f32], t: usize, rows: std::ops::Range<usize>) -> Vec<f32>;
+}
+
 pub enum Weight {
     Fp8 { w: Vec<u8>, s: Vec<u8>, n: usize, k: usize },
     Bf16 { w: Vec<u16>, n: usize, k: usize },
     F32 { w: Vec<f32>, n: usize, k: usize },
+    /// Held by `kernel` (a GPU's), with what the forward pass still does here: `fp8` says the activation is quantized
+    /// and the result rounded to bf16 as for [`Weight::Fp8`]. It has no host rows.
+    Device { kernel: Arc<dyn DenseKernel>, n: usize, k: usize, fp8: bool },
 }
 
 impl Weight {
@@ -84,13 +97,13 @@ impl Weight {
 
     pub fn n(&self) -> usize {
         match self {
-            Weight::Fp8 { n, .. } | Weight::Bf16 { n, .. } | Weight::F32 { n, .. } => *n,
+            Weight::Fp8 { n, .. } | Weight::Bf16 { n, .. } | Weight::F32 { n, .. } | Weight::Device { n, .. } => *n,
         }
     }
 
     pub fn k(&self) -> usize {
         match self {
-            Weight::Fp8 { k, .. } | Weight::Bf16 { k, .. } | Weight::F32 { k, .. } => *k,
+            Weight::Fp8 { k, .. } | Weight::Bf16 { k, .. } | Weight::F32 { k, .. } | Weight::Device { k, .. } => *k,
         }
     }
 
@@ -113,6 +126,7 @@ impl Weight {
                 }
             }
             Weight::F32 { w, k, .. } => dst.copy_from_slice(&w[r * k..(r + 1) * k]),
+            Weight::Device { .. } => panic!("a weight on a device has no host rows (the embedding is never offloaded)"),
         }
     }
 
@@ -131,9 +145,18 @@ impl Weight {
         assert!(rows.end <= self.n(), "linear: row range past the weight");
         let (first, n) = (rows.start, rows.len());
         let (xin, out) = match self {
-            Weight::Fp8 { .. } => (fake_quant_fp8(x, FP8_BLOCK), Out::Bf16),
+            Weight::Fp8 { .. } | Weight::Device { fp8: true, .. } => (fake_quant_fp8(x, FP8_BLOCK), Out::Bf16),
             _ => (x.to_vec(), out),
         };
+        if let Weight::Device { kernel, .. } = self {
+            let mut y = kernel.forward_rows(&xin, t, rows);
+            if out == Out::Bf16 {
+                for v in &mut y {
+                    *v = to_bf16(*v);
+                }
+            }
+            return y;
+        }
         let y = Mutex::new(vec![0.0f32; t * n]);
         parallel_rows(n, 16, &|b, e| {
             let mut row = vec![0.0f32; k];
