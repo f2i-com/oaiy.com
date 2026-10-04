@@ -188,6 +188,15 @@ export function pluginSetupStatus(
   return now === true ? 'set-up' : now === false ? 'needs-setup' : 'checking';
 }
 
+/**
+ * Is an unhealthy plugin only waiting for its setup? A plugin such as Aokie reports itself unhealthy until its
+ * setup has recorded what it needs (the person's consent, a device), so before its setup is finished that is
+ * the next step to take, not a fault to warn about.
+ */
+export function waitingForSetup(record: PluginRecord, status: PluginSetupStatus): boolean {
+  return record.state === 'unhealthy' && status === 'needs-setup';
+}
+
 /** Does `record` need its setup run? Its setup version is newer than the one last finished, and its live checks (given `live`) do not all pass. */
 export function pluginNeedsSetup(record: PluginRecord, state: SetupState | null | undefined, live?: Record<string, boolean | null | undefined>): boolean {
   return pluginSetupStatus(record, state, live) === 'needs-setup';

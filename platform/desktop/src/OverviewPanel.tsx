@@ -36,6 +36,9 @@ import {
 import { bindText, pollsOf, usePluginPolls, type BindContext } from './bind';
 import { PLUGIN_ICONS } from './sections';
 import { useModules } from './useModules';
+import { pluginSetupStatus, waitingForSetup } from './setupFlow';
+import { useLiveSetup } from './useLiveSetup';
+import { useSetupState } from './useSetupState';
 
 /**
  * Overview — the control centre. One screen that answers "is this machine ready
@@ -154,7 +157,13 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
 
   const runningSvc = (svc ?? []).filter((s) => s.status === 'running').length;
   const runningPlug = (plug ?? []).filter((p) => p.state === 'running').length;
-  const crashedPlug = (plug ?? []).filter((p) => p.state === 'crashed' || p.state === 'unhealthy');
+  // A plugin unhealthy only because its setup has not recorded what it needs is waiting for that setup (the guide
+  // above offers it), not a fault to raise an alarm about.
+  const setupState = useSetupState();
+  const live = useLiveSetup(plug ?? null, setupState);
+  const crashedPlug = (plug ?? []).filter(
+    (p) => p.state === 'crashed' || (p.state === 'unhealthy' && !waitingForSetup(p, pluginSetupStatus(p, setupState, live))),
+  );
   const readyProv = (provs ?? []).filter((p) => p.enabled && (p.hasKey || p.allowLocal)).length + (codexConnected ? 1 : 0);
   // The plugins' own cards, as the desktop serves them (none from a plugin turned off, or for a module that is off).
   const modules = useModules();

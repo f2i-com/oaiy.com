@@ -25,7 +25,7 @@ import {
   type ServiceDefinition,
 } from './api';
 import { refetchModules } from './useModules';
-import { pluginSetupStatus, readSetup, type PluginSetupStatus } from './setupFlow';
+import { pluginSetupStatus, readSetup, waitingForSetup, type PluginSetupStatus } from './setupFlow';
 import { useLiveSetup } from './useLiveSetup';
 import { openSetup, refetchSetup, useSetupState } from './useSetupState';
 import { peek, put } from './useCached';
@@ -82,6 +82,8 @@ export default function PluginsPanel() {
   // not on every poll — same pattern the Services panel uses.
   const seen = useRef<Map<string, PluginState>>(new Map());
   const firstPoll = useRef(true);
+  // The setup state as last rendered, for the poll: a plugin waiting for its setup is not toasted as unhealthy.
+  const setupInfo = useRef<{ state: ReturnType<typeof useSetupState>; live: ReturnType<typeof useLiveSetup> }>({ state: null, live: {} });
 
   const refresh = useCallback(async () => {
     try {
@@ -98,7 +100,7 @@ export default function PluginsPanel() {
             });
           } else if (p.state === 'running' && prev !== 'running') {
             toast.push({ kind: 'success', title: `Plugin "${p.id}" is running` });
-          } else if (p.state === 'unhealthy') {
+          } else if (p.state === 'unhealthy' && !waitingForSetup(p, pluginSetupStatus(p, setupInfo.current.state, setupInfo.current.live))) {
             toast.push({
               kind: 'error',
               title: `Plugin "${p.id}" is unhealthy`,
@@ -161,6 +163,7 @@ export default function PluginsPanel() {
   const setupState = useSetupState();
   // A plugin set up by hand (or before the wizard) counts as set up once its steps' checks all pass.
   const live = useLiveSetup(snapshot?.plugins ?? null, setupState);
+  setupInfo.current = { state: setupState, live };
 
   const installPlugin = useCallback(async () => {
     const source = installSource.trim();
@@ -421,6 +424,8 @@ function PluginCard({
 }: CardProps) {
   const loadable = isLoadable(p);
   const needsSetup = setupStatus === 'needs-setup';
+  // Unhealthy only because its setup has not recorded what it needs yet: the next step, not a fault.
+  const waiting = waitingForSetup(p, setupStatus);
   const running = p.state === 'running' || p.state === 'unhealthy' || p.state === 'starting';
   // The host will not start this package: it failed its signature, or it has none and
   // this is a release build. A quarantined package cannot be trusted by hand; an
@@ -434,11 +439,11 @@ function PluginCard({
     p.manifest?.connectors?.reduce((n, c) => n + c.commands.length, 0) ?? 0;
 
   return (
-    <div className={`service-card service-card-${cardStatus(p.state)}`}>
+    <div className={`service-card service-card-${waiting ? 'starting' : cardStatus(p.state)}`}>
       <div className="card-head">
         <CircleDot size={14} aria-hidden />
         <strong className="card-title">{p.manifest?.name ?? p.id}</strong>
-        <span className={badgeClass(p.state)}>{p.state}</span>
+        <span className={waiting ? 'badge badge-pending' : badgeClass(p.state)}>{waiting ? 'needs setup' : p.state}</span>
         {p.manifest?.version && (
           <span className="card-note">v{p.manifest.version}</span>
         )}

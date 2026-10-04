@@ -6,7 +6,11 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const m = vi.hoisted(() => ({ list: vi.fn(), setupGet: vi.fn(), check: vi.fn() }));
+const m = vi.hoisted(() => {
+  const push = vi.fn();
+  // One object, as the real useToast's memoised context value is: a new one each render would re-create the panel's poll.
+  return { list: vi.fn(), setupGet: vi.fn(), check: vi.fn(), push, toast: { push } };
+});
 
 vi.mock('./api', async (importOriginal) => {
   const real = await importOriginal<typeof import('./api')>();
@@ -17,7 +21,7 @@ vi.mock('./api', async (importOriginal) => {
     setup: { ...real.setup, get: m.setupGet, check: m.check },
   };
 });
-vi.mock('./Toasts', () => ({ useToast: () => ({ push: vi.fn() }) }));
+vi.mock('./Toasts', () => ({ useToast: () => m.toast }));
 
 import PluginsPanel from './PluginsPanel';
 import { invalidate } from './useCached';
@@ -74,6 +78,7 @@ beforeEach(() => {
   // No setup version recorded for it: the wizard never ran on this desktop.
   m.setupGet.mockReset().mockResolvedValue({ firstRun: { finished: true, skipped: [], chosenPlugins: [] }, plugins: {} });
   m.check.mockReset();
+  m.push.mockReset();
   host = document.createElement('div');
   document.body.appendChild(host);
   root = createRoot(host);
@@ -114,4 +119,51 @@ describe('a plugin card’s setup, from live checks', () => {
     expect(host.textContent).not.toContain('Finish setting up');
     expect(host.textContent).toContain('Set up…');
   });
+});
+
+// A fresh Aokie is unhealthy until its setup records the person's consent: it says so, and that is the next step,
+// not a fault. The card says "needs setup" (not a red "unhealthy"), and turning unhealthy then is not toasted.
+describe('a plugin unhealthy only because its setup is not done', () => {
+  const unhealthy: PluginRecord = { ...AOKIE, state: 'unhealthy', reason: 'consent required: no consent has been recorded for this device' };
+  const unhealthyToast = () => m.push.mock.calls.filter(([t]) => String(t?.title ?? '').includes('is unhealthy'));
+
+  async function turnUnhealthy() {
+    // Running until the card has settled, then unhealthy at the panel's next poll (every 2 s).
+    let now: PluginRecord = AOKIE;
+    m.list.mockReset().mockImplementation(async () => ({ root: 'C:/plugins', plugins: [now] }));
+    await render();
+    // The setup record and the live checks are answered before the plugin turns unhealthy, as they are in the
+    // window (Aokie turns unhealthy only after three 10 s health probes): React applies them before the next poll.
+    for (let i = 0; i < 100 && !host.textContent?.includes('Finish setting up') && !host.querySelector('.card-head .badge-ok[title]'); i++) {
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 10));
+      });
+    }
+    now = unhealthy;
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 2300));
+    });
+    await render();
+  }
+
+  it('shows "needs setup", with its reason, and is not toasted as unhealthy', async () => {
+    m.check.mockImplementation(async (_id: string, _step: string, which: string) => ({ passed: false, detail: which === 'when' ? '' : 'not yet' }));
+    await turnUnhealthy();
+    const badge = host.querySelector('.card-head > .badge:not([data-trust])');
+    expect(badge?.textContent).toBe('needs setup');
+    expect(badge?.className).toContain('badge-pending');
+    expect(host.querySelector('.service-card')?.className).toContain('service-card-starting');
+    expect(host.textContent).toContain('Finish setting up Aokie Phone Bridge.');
+    expect(host.textContent).toContain('consent required: no consent has been recorded for this device');
+    expect(unhealthyToast()).toEqual([]);
+  }, 10_000);
+
+  it('is still unhealthy, in red and toasted, once its setup is done (the positive control)', async () => {
+    m.setupGet.mockReset().mockResolvedValue({ firstRun: { finished: true, skipped: [], chosenPlugins: [] }, plugins: { aokie: { version: 1 } } });
+    await turnUnhealthy();
+    const badge = host.querySelector('.card-head > .badge:not([data-trust])');
+    expect(badge?.textContent).toBe('unhealthy');
+    expect(badge?.className).toContain('badge-err');
+    expect(unhealthyToast()).toHaveLength(1);
+  }, 10_000);
 });

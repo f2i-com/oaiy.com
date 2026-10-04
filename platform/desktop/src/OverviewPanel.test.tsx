@@ -26,6 +26,8 @@ const modulesMock = vi.hoisted(() => vi.fn());
 const connectorMock = vi.hoisted(() => vi.fn());
 const updateStatusMock = vi.hoisted(() => vi.fn());
 const backupStatusMock = vi.hoisted(() => vi.fn());
+const setupGetMock = vi.hoisted(() => vi.fn());
+const setupCheckMock = vi.hoisted(() => vi.fn());
 vi.mock('./api', () => ({
   // The update banner: nothing to install unless a test says so.
   updates: { status: (...a: unknown[]) => updateStatusMock(...a) },
@@ -44,11 +46,14 @@ vi.mock('./api', () => ({
   calendar: { get: (...a: unknown[]) => calendarMock(...a), syncStatus: (...a: unknown[]) => syncMock(...a) },
   link: { status: (...a: unknown[]) => linkMock(...a) },
   engines: { status: vi.fn().mockRejectedValue(new Error('no engines')) },
+  // The setup record and its live checks: unread unless a test says so.
+  setup: { get: (...a: unknown[]) => setupGetMock(...a), check: (...a: unknown[]) => setupCheckMock(...a) },
 }));
 
 import OverviewPanel from './OverviewPanel';
 import { invalidate, peek } from './useCached';
 import { resetModules } from './useModules';
+import { resetSetupState } from './useSetupState';
 
 /** The desktop's modules: the phone and the calendar on or off. */
 const modulesOn = (phone: boolean, calendar: boolean) => ({
@@ -118,6 +123,8 @@ beforeEach(() => {
   backupStatusMock.mockRejectedValue(new Error('no backup status'));
   linkMock.mockResolvedValue({ linked: false, attempt: { phase: 'idle' }, available: [] });
   updateStatusMock.mockResolvedValue(noUpdate);
+  setupGetMock.mockRejectedValue(new Error('no setup record'));
+  setupCheckMock.mockResolvedValue({ passed: false, detail: '' });
   localStorage.clear();
   resetModules();
   modulesMock.mockResolvedValue(modulesOn(true, true));
@@ -468,5 +475,42 @@ describe('the Overview line about backups', () => {
     expect(backupStatusMock).toHaveBeenCalled();
     expect(text()).not.toContain('backup');
     expect(text()).toContain('This machine');
+  });
+});
+
+// A fresh Aokie is unhealthy until its setup records the person's consent. The setup guide offers that setup; the
+// red "Plugin is unhealthy" banner is for a plugin that is set up and failing.
+describe('A plugin waiting for its setup', () => {
+  const aokie = (state: string) => ({
+    id: 'aokie', state, dir: 'x', userDisabled: false, restartAttempts: 0,
+    reason: 'consent required: no consent has been recorded for this device',
+    manifest: {
+      name: 'Aokie Phone Bridge', version: '0.0.1',
+      connectors: [{ id: 'aokie', commands: ['consent.get'] }],
+      setup: { version: 1, title: 'Set up the AI Receptionist', steps: [{ id: 'consent', kind: 'screen', title: 'Consent', screen: 'receptionist-home', view: 'consent', done: { command: 'consent.get', path: 'mode', equals: 'enforce' } }] },
+    },
+  });
+  const settle = async () => {
+    for (let i = 0; i < 10; i++) await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
+  };
+  afterEach(() => resetSetupState());
+  /** Every red banner on the page (the failed runs have one too). */
+  const alarms = () => Array.from(host.querySelectorAll('.banner-err')).map((b) => b.textContent).join(' | ');
+
+  it('raises no alarm while its setup is not done', async () => {
+    setupGetMock.mockResolvedValue({ firstRun: { finished: true, skipped: [], chosenPlugins: [] }, plugins: {} });
+    pluginsMock.mockResolvedValue({ plugins: [aokie('unhealthy')] });
+    await mount();
+    await settle();
+    expect(alarms()).not.toContain('aokie');
+    expect(alarms()).toContain('runs have failed'); // the page's other alarms still show
+  });
+
+  it('still raises it once its setup is done (the positive control)', async () => {
+    setupGetMock.mockResolvedValue({ firstRun: { finished: true, skipped: [], chosenPlugins: [] }, plugins: { aokie: { version: 1 } } });
+    pluginsMock.mockResolvedValue({ plugins: [aokie('unhealthy')] });
+    await mount();
+    await settle();
+    expect(alarms()).toContain('Plugin "aokie" is unhealthy.');
   });
 });
