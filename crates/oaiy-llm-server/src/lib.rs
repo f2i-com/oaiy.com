@@ -40,6 +40,9 @@ mod orcasaq;
 // Qwen3.8-Flash-Next (qwen4_exp, EXL3: on CUDA, or on any GPU through WebGPU).
 #[cfg(any(feature = "cuda", feature = "webgpu"))]
 mod flashnext;
+// DeepSeek-V4.1 without CUDA: the CPU model with its dense trunk on the WebGPU adapter.
+#[cfg(all(not(feature = "cuda"), feature = "webgpu"))]
+mod dsv41_portable;
 mod lora;
 mod qwen_cache;
 // Conversations Qwen3.8-Flash-Next sets aside in host RAM.

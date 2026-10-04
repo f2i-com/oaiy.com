@@ -752,7 +752,14 @@ decode the attention is a second of compute that a GPU holding the 9.9 GB trunk 
 all but remove, and the MoE is mostly its misses. A WebGPU port therefore puts the FP8
 trunk on the GPU first, then the MXFP4 experts (a VRAM tier, and the prompt's batched
 matmuls). A portable serving engine on the CPU model alone would make an Agent wait
-21 minutes for its first answer, so none was built.
+21 minutes for its first answer.
+
+What the portable build does about it (docs/WEBGPU.md, "DeepSeek-V4.1 without CUDA"):
+the trunk on the WebGPU adapter took the prompt to 1,081 s and showed the attention's
+remaining 600 s to be its serial sparse attention and index scores, which spread over
+the threads took it to 558 s; a prompt's busy experts on the GPU and the records read
+eight at a time took it to 490 s, the reads now most of it (the checkpoint here is on a
+USB SSD, about 1.2 GB/s). Warm decode went from 2.06 to 1.19 s a token.
 
 ## Phases
 

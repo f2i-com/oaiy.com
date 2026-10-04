@@ -41,20 +41,20 @@ use crate::engine::{sample, Event, Finish, Job};
 /// spent inside the `<think>` block the prompt opened and, at the budget, put the
 /// closing tag in place of the next one so a model going in circles stops and
 /// answers.
-struct ThinkBudget {
-    thinking: bool,
+pub(crate) struct ThinkBudget {
+    pub(crate) thinking: bool,
     end: Option<u32>,
-    used: usize,
-    budget: Option<usize>,
+    pub(crate) used: usize,
+    pub(crate) budget: Option<usize>,
 }
 
 impl ThinkBudget {
-    fn new(thinking: bool, end: Option<u32>, budget: Option<usize>) -> Self {
+    pub(crate) fn new(thinking: bool, end: Option<u32>, budget: Option<usize>) -> Self {
         Self { thinking, end, used: 0, budget }
     }
 
     /// `(token, forced)` — `forced` when the budget replaced the sampled token.
-    fn pass(&mut self, next: u32) -> (u32, bool) {
+    pub(crate) fn pass(&mut self, next: u32) -> (u32, bool) {
         if !self.thinking {
             return (next, false);
         }
@@ -74,7 +74,7 @@ impl ThinkBudget {
 }
 
 /// How often a long reasoning block reports progress, in tokens.
-const THINKING_EVERY: usize = 32;
+pub(crate) const THINKING_EVERY: usize = 32;
 
 pub struct GlmEngine {
     model: Model,

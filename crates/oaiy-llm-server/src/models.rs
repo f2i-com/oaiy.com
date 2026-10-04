@@ -472,9 +472,12 @@ impl Models {
             Kind::FlashNext => self.load_flashnext_portable(&spec),
             #[cfg(all(not(feature = "cuda"), not(feature = "webgpu")))]
             Kind::OrcaSaq | Kind::FlashNext => Err(Error::Arg(format!("{} is an EXL3 checkpoint, which needs the CUDA or the WebGPU build", spec.name))),
-            #[cfg(not(feature = "cuda"))]
+            // DeepSeek-V4.1's CPU model with its dense trunk on any GPU through WebGPU (else the CPU).
+            #[cfg(all(not(feature = "cuda"), feature = "webgpu"))]
+            Kind::Deepseek => self.load_deepseek_portable(&spec),
+            #[cfg(all(not(feature = "cuda"), not(feature = "webgpu")))]
             Kind::Deepseek => Err(Error::Arg(format!(
-                "{} is a DeepSeek checkpoint, which needs the CUDA build (oaiy-llm-server); this build serves GGUF, OrcaSAQ and Flash-Next models",
+                "{} is a DeepSeek checkpoint, which needs the CUDA or the WebGPU build; this build serves GGUF models",
                 spec.name
             ))),
             Kind::Gguf => self.load_gguf(&spec),
@@ -796,6 +799,39 @@ impl Models {
         let e = crate::qwen::QwenEngine::new(crate::qwen::Hybrid::Flash(Box::new(model)), None, max_seq, !o.quiet && !o.silent).park_up_to(park);
         let thread = std::thread::Builder::new().name("flashnext-model".into()).spawn(move || e.run(rx))?;
         Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Qwen(tok)) })
+    }
+
+    /// DeepSeek-V4.1 without CUDA: the CPU model (`dsv41::model`, the reference the CUDA path is tested against), its
+    /// experts streamed through the host cache from RAM and the drive, and its dense trunk (attention projections,
+    /// shared experts, router, head: about 9.7 GB) on the WebGPU adapter while the budget holds it. No images and no
+    /// observer (both CUDA's); a conversation's next turn continues the state rather than reading it all again.
+    #[cfg(all(not(feature = "cuda"), feature = "webgpu"))]
+    fn load_deepseek_portable(&self, spec: &Spec) -> Result<Live> {
+        let o = &self.opts;
+        let tok = Arc::new(dsv41::tokenizer::Tokenizer::load(&spec.path)?);
+        // As the CUDA build: the server's default context unless one is asked for.
+        let max_seq = if o.ctx == 0 { crate::DEFAULT_CTX } else { o.ctx };
+        let engram_meta = o.engram_meta.clone().unwrap_or_else(|| spec.path.join("engram_meta.safetensors"));
+        let opts = dsv41::model::ModelOptions { max_seq, expert_cache_bytes: o.expert_cache_bytes() as usize, direct_io: true };
+        self.say(format!("expert host cache: {:.2} GiB", opts.expert_cache_bytes as f64 / (1u64 << 30) as f64));
+        let mut model = dsv41::model::Model::load(&spec.path, &engram_meta, &opts)?;
+        let picked = crate::backend::open(o, &o.devices)?;
+        match picked.backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>() {
+            Some(b) => {
+                let (count, bytes) = crate::dsv41_portable::offload(&mut model, b);
+                // A prompt's busy experts there too (uploaded for the prompt); a decode step's stay on the CPU's tiers.
+                model.set_experts_kernel(Some(Arc::new(crate::dsv41_portable::WgpuExperts(Arc::clone(&picked.backend)))));
+                self.say(format!("{} runs on {}: {count} dense matrices ({:.1} GB) there, and a prompt's busy experts; a decode step's experts on the CPU", spec.name, picked.label, bytes as f64 / 1e9));
+            }
+            None => self.say(format!("{} runs on the CPU", spec.name)),
+        }
+        let mut cfg = self.base_cfg(spec, max_seq);
+        // Its own placeholder (as the CUDA build): the default, token 0, is DeepSeek's start of sequence.
+        cfg.image_token_id = model.cfg.image_token_id;
+        let (jobs, rx) = std::sync::mpsc::channel();
+        let e = crate::dsv41_portable::Engine::new(model, Arc::clone(&tok), !o.quiet && !o.silent);
+        let thread = std::thread::Builder::new().name("deepseek-model".into()).spawn(move || e.run(rx)).map_err(Error::Io)?;
+        Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Deepseek(tok)) })
     }
 
     /// OrcaSAQ without CUDA: its packed EXL3 projections on the WebGPU adapter while the weight budget holds them,

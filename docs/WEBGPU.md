@@ -72,8 +72,37 @@ The Overview page shows what the model actually runs on.
 `oaiy-llm-server-webgpu` serves GGUF models of the types above, and OrcaSAQ (EXL3,
 below). A GGUF with IQ1, IQ2 or IQ3 tensors (unsloth's smaller "UD" quants mix them
 in, even UD-Q4_K_M) does not load, and OAIY's setup refuses one before it is added.
-DeepSeek-V4.1 checkpoints and the observer are CUDA engines, and it says so rather
-than trying. Qwen3.8-Flash-Next runs on it too (below).
+The observer is a CUDA engine, and it says so rather than trying. Qwen3.8-Flash-Next
+and DeepSeek-V4.1 run on it too (below).
+
+## DeepSeek-V4.1 without CUDA
+
+The CPU model (`dsv41::model`, the reference the CUDA path is tested against) serves it,
+with what measured slowest on the CPU moved (docs/DEEPSEEK_V41.md, "The CPU model,
+measured"): its dense trunk, the 390 fp8 and bf16 matrices of 9.7 GB, on the adapter
+(`ggml_rs_wgpu::dense`; the activation still quantized and the result still rounded by
+the CPU model, so the answer matches: cosine 1.000000 and the same greedy tokens); a
+prompt's busy routed experts (eight tokens or more) there too, MXFP4 uploaded for the
+prompt, gate and up of a group of experts in one submit and the downs in another; the
+sparse attention and the indexer's scores spread over the CPU's threads (they were
+serial, and most of a prompt's time); a layer's expert records read eight at a time. A
+decode step's experts stay on the CPU's tiers (RAM, then the drive). A conversation's
+next turn continues the state the last prompt left (a checkpoint a token short of its
+end, since the next prompt writes the last reply its own way), reading only the new
+tail in one chunk (`dsv41` continues a sequence by a chunk exactly as it would token by
+token).
+
+On the RTX 5090 (2026-10-05), 27 GiB budget, 192 GB of RAM, the checkpoint on a USB SSD
+(about 1.2 GB/s, the bound of every read below):
+
+| | CPU only | + trunk on the GPU | + parallel attention | + GPU experts, parallel reads |
+|---|---:|---:|---:|---:|
+| 2,000-token prompt | 1,294 s | 1,081 s | 558 s | 490 s (attention 81 s, MoE 402 s) |
+| Warm decode | 2.06 s a token | 1.47 s | 1.21 s | 1.19 s |
+
+An Agent's tool call end to end: a 285-token prompt in 229 s and its call at 1.3 tokens
+a second; the next turn (the tool's result) reused 284 tokens and took 52 s. On an
+internal NVMe the reads, most of what is left, would be several times faster.
 
 ## EXL3 (OrcaSAQ) without CUDA
 
