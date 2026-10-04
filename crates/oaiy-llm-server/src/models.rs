@@ -155,7 +155,7 @@ impl Flavour {
                     34..=66 => llama_rs::ReasoningEffort::High,
                     _ => llama_rs::ReasoningEffort::Max,
                 };
-                let out = llama_messages(msgs);
+                let out = llama_messages(msgs)?;
                 // The mode decides which generation prompt: `Thinking` opens
                 // `<think>` for the model to reason in, `Chat` pre-fills
                 // `<think></think>` so it answers directly. Ignoring this was worth
@@ -168,24 +168,47 @@ impl Flavour {
                 })
             }
             Self::Dense(_, arch, empty_thought) => Ok(dsv41::chat::Encoded {
-                prompt: dense_prompt(arch, &llama_messages(msgs), opts.mode == dsv41::chat::Mode::Thinking, *empty_thought),
+                prompt: dense_prompt(arch, &llama_messages(msgs)?, opts.mode == dsv41::chat::Mode::Thinking, *empty_thought),
                 images: Vec::new(),
             }),
         }
     }
 }
 
-/// A chat request's messages as llama-rs's templates take them: the text of each, by role.
-fn llama_messages(msgs: &[oaiy_engine::json::Json]) -> Vec<llama_rs::ChatMessage> {
+/// A chat request's messages as llama-rs's templates take them: the text of each, by role. Content may be a string
+/// or a list of parts (OpenAI's `[{"type":"text","text":…}]`), whose texts are joined as DeepSeek's encoder joins
+/// them; these models read no images, so a part that is one is refused rather than dropped.
+fn llama_messages(msgs: &[oaiy_engine::json::Json]) -> std::result::Result<Vec<llama_rs::ChatMessage>, String> {
+    use oaiy_engine::json::Json;
     msgs.iter()
-        .map(|m| {
-            let content = m.get("content").and_then(|c| c.as_str()).unwrap_or_default().to_string();
+        .enumerate()
+        .map(|(i, m)| {
+            let content = match m.get("content") {
+                None | Some(Json::Null) => String::new(),
+                Some(Json::Str(s)) => s.clone(),
+                Some(Json::Arr(parts)) => {
+                    let mut texts = Vec::with_capacity(parts.len());
+                    for p in parts {
+                        match p.get("type").and_then(Json::as_str) {
+                            Some("text" | "input_text") => texts.push(p.get("text").and_then(Json::as_str).unwrap_or_default()),
+                            Some("image_url" | "input_image" | "image") => {
+                                return Err(format!("this model reads text only, and message {} holds an image", i + 1));
+                            }
+                            other => return Err(format!("message {}: unsupported content part {other:?}", i + 1)),
+                        }
+                    }
+                    texts.join("
+
+")
+                }
+                Some(_) => return Err(format!("message {}: content must be text or a list of parts", i + 1)),
+            };
             let role = match m.get("role").and_then(|r| r.as_str()).unwrap_or("user") {
                 "system" => llama_rs::Role::System,
                 "assistant" => llama_rs::Role::Assistant,
                 _ => llama_rs::Role::User,
             };
-            llama_rs::ChatMessage { role, content }
+            Ok(llama_rs::ChatMessage { role, content })
         })
         .collect()
 }
@@ -1208,6 +1231,7 @@ mod dense_tests {
             oaiy_engine::json::Json::parse(br#"{"role":"system","content":"Be brief."}"#).unwrap(),
             oaiy_engine::json::Json::parse(br#"{"role":"user","content":"Capital of France?"}"#).unwrap(),
         ])
+        .unwrap()
     }
 
     #[test]
@@ -1262,5 +1286,22 @@ mod dense_tests {
         let m = msgs();
         assert!(matches!(m[0].role, llama_rs::Role::System) && m[0].content == "Be brief.");
         assert!(matches!(m[1].role, llama_rs::Role::User) && m[1].content == "Capital of France?");
+    }
+
+    #[test]
+    fn a_message_of_parts_keeps_their_text_and_an_image_is_refused_not_dropped() {
+        let parse = |s: &[u8]| oaiy_engine::json::Json::parse(s).unwrap();
+        let m = llama_messages(&[parse(br#"{"role":"user","content":[{"type":"text","text":"Capital"},{"type":"text","text":"of France?"}]}"#)]).unwrap();
+        assert_eq!(m[0].content, "Capital
+
+of France?");
+        let m = llama_messages(&[parse(br#"{"role":"assistant","content":null}"#)]).unwrap();
+        assert!(matches!(m[0].role, llama_rs::Role::Assistant) && m[0].content.is_empty());
+        let e = llama_messages(&[
+            parse(br#"{"role":"user","content":"look"}"#),
+            parse(br#"{"role":"tool","content":[{"type":"text","text":"screen"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}"#),
+        ])
+        .unwrap_err();
+        assert!(e.contains("text only") && e.contains("message 2"), "{e}");
     }
 }
