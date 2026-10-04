@@ -763,10 +763,24 @@ mod tests {
                 assert!(!str_or(p, "repo", "").is_empty() || (!str_or(p, "url", "").is_empty() && !str_or(p, "file", "").is_empty()), "{id}: a part names no source");
             }
             assert!(!strings(e.get("add")).is_empty(), "{id}: nothing to add");
+            // Whether the Agent can use its tools with a language model: the engine reads tool calls in the
+            // Qwen3.5 and GLM formats only, and the setup wizard labels each model by it.
+            assert!(e.get("agent_tools").is_none_or(|t| matches!(t, Json::Bool(_))), "{id}: agent_tools is not a boolean");
             for n in strings(e.get("needs")) {
                 assert!(ids.contains(&n.as_str()), "{id} needs {n}, which is not in the catalog");
             }
         }
+    }
+
+    #[test]
+    fn the_recommended_language_model_can_use_the_agents_tools() {
+        // The setup wizard preselects it for the Agent, whose work is tool calls.
+        let llms: Vec<&Json> = entries().iter().filter(|e| str_or(e, "group", "") == "llm").collect();
+        let recommended: Vec<&&Json> = llms.iter().filter(|e| e.get("recommended").and_then(Json::as_bool) == Some(true)).collect();
+        assert_eq!(recommended.len(), 1);
+        assert_eq!(recommended[0].get("agent_tools").and_then(Json::as_bool), Some(true), "{}", str_or(recommended[0], "id", ""));
+        // And the catalog offers one small enough for a modest GPU that can too.
+        assert!(llms.iter().any(|e| e.get("agent_tools").and_then(Json::as_bool) == Some(true) && e.get("vram_gb").and_then(Json::as_f64).is_some_and(|v| v <= 4.)));
     }
 
     #[test]

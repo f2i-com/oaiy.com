@@ -244,6 +244,89 @@ fn parse_activity(state: &serde_json::Value, downloads: &serde_json::Value) -> R
     Ok((media, running))
 }
 
+/// GGUF architectures the language-model engine loads (oaiy-llm-server's `load_gguf`): Qwen3.5, the dense families it
+/// loads whole, and the MoE families whose experts it streams. A file of another is refused when it is added, rather
+/// than chosen and failing on the first message.
+const ENGINE_RUNS: [&str; 11] = ["qwen35", "llama", "mistral", "qwen2", "qwen3", "gemma3", "gemma3n", "gemma4", "qwen3moe", "qwen3vlmoe", "glm5next"];
+/// Of those, the ones whose tool calls the engine reads (the Qwen3.5 and GLM formats): the Agent's tools need one.
+/// The others chat.
+const ENGINE_TOOLS: [&str; 2] = ["qwen35", "glm5next"];
+
+/// A language model file the person named, as typed or pasted (Windows' "Copy as path" quotes it): a whole path to a
+/// `.gguf` file that is there; of a model split into files, the first.
+pub fn model_file(raw: &str) -> Result<PathBuf, String> {
+    let trimmed = raw.trim();
+    let unquoted = ['"', '\''].iter().find_map(|q| trimmed.strip_prefix(*q).and_then(|s| s.strip_suffix(*q))).unwrap_or(trimmed).trim();
+    if unquoted.is_empty() {
+        return Err("Choose a model file first.".into());
+    }
+    let path = PathBuf::from(unquoted);
+    if !path.is_absolute() {
+        return Err(format!("{unquoted} is not a whole path: choose the file, or paste its full path."));
+    }
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if !name.to_ascii_lowercase().ends_with(".gguf") {
+        return Err(format!("{name} is not a GGUF file: the engine runs language models from a .gguf file."));
+    }
+    if let Some((part, of)) = split_part(&name) {
+        if part != 1 {
+            return Err(format!("{name} is part {part} of {of} of a model split into files: choose the first part, the one ending -00001-of-{of:05}.gguf."));
+        }
+    }
+    if !path.is_file() {
+        return Err(format!("{} is not there.", path.display()));
+    }
+    Ok(path)
+}
+
+/// `…-00002-of-00004.gguf`: the part and the count of a model split into files, as llama.cpp names them.
+fn split_part(name: &str) -> Option<(u32, u32)> {
+    let stem = name.get(..name.len().checked_sub(".gguf".len())?)?;
+    let (rest, of) = stem.rsplit_once("-of-")?;
+    let (_, part) = rest.rsplit_once('-')?;
+    let digits = |s: &str| s.len() == 5 && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(part) || !digits(of) {
+        return None;
+    }
+    Some((part.parse().ok()?, of.parse().ok()?))
+}
+
+/// What the engines detected in a file (`/api/detect`), checked: a language model, not a part of one or a picture
+/// model, of an architecture the engine loads. Its architecture, and whether the Agent can use its tools with it.
+fn runnable(detected: &serde_json::Value, name: &str) -> Result<(String, bool), String> {
+    let text = |key: &str| detected.get(key).and_then(|v| v.as_str()).unwrap_or("");
+    if text("section") != "llm" {
+        return Err(if text("kind") == "vision_projector" {
+            format!("{name} is a vision projector, a part of a model: choose the language model's own file beside it.")
+        } else {
+            format!("{name} is not a language model: {}.", text("summary"))
+        });
+    }
+    let arch = text("architecture");
+    if !ENGINE_RUNS.contains(&arch) {
+        return Err(format!(
+            "{name} is a {} model, which OAIY's engine does not run yet. It runs Qwen3.5, Qwen3, Qwen2, Llama, Mistral, Gemma 3 and 4, and GLM models.",
+            if arch.is_empty() { "kind of" } else { arch }
+        ));
+    }
+    Ok((arch.to_string(), ENGINE_TOOLS.contains(&arch)))
+}
+
+/// Add a language model file the person already has to the engines (`/api/models/add`), once they have said what it
+/// is (`/api/detect`), so a file the engine cannot run is refused before anything is written. The engines choose it
+/// when none is chosen. Its name in Engines, its architecture, and whether the Agent can use its tools with it.
+pub async fn add_model_file(raw: &str) -> Result<serde_json::Value, String> {
+    let path = model_file(raw)?;
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let ui = crate::http::engines_ui().ok_or("The engines are not running: they start with OAIY.")?;
+    let body = serde_json::json!({ "path": path.to_string_lossy() });
+    let detected = crate::http::studio_json(&ui, reqwest::Method::POST, "/api/detect", Some(body.clone())).await.map_err(|(_, e)| e)?;
+    let (arch, tools) = runnable(&detected, &name)?;
+    let added = crate::http::studio_json(&ui, reqwest::Method::POST, "/api/models/add", Some(body)).await.map_err(|(_, e)| e)?;
+    log::info!("engines: added the language model {} ({arch})", path.display());
+    Ok(serde_json::json!({ "name": added.get("name"), "architecture": arch, "tools": tools }))
+}
+
 /// Stop the engines this desktop started (a studio that was already running is left running).
 pub fn stop() {
     if let Some(running) = RUNNING.lock().unwrap_or_else(|e| e.into_inner()).take() {
@@ -255,6 +338,61 @@ pub fn stop() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_model_file_is_a_whole_path_to_a_gguf_that_is_there_quoted_or_not() {
+        let dir = std::env::temp_dir().join(format!("oaiy-model-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("Qwen3.5-4B-Q4_K_M.gguf");
+        std::fs::write(&file, b"GGUF").unwrap();
+        let shown = file.display().to_string();
+        // As picked, typed with spaces around it, or pasted from Windows' "Copy as path".
+        for raw in [shown.clone(), format!("  {shown} "), format!("\"{shown}\""), format!("'{shown}'")] {
+            assert_eq!(model_file(&raw).unwrap(), file, "{raw}");
+        }
+        assert!(model_file("  ").unwrap_err().contains("Choose a model file"));
+        assert!(model_file("models/x.gguf").unwrap_err().contains("not a whole path"));
+        let not_gguf = dir.join("model.safetensors");
+        std::fs::write(&not_gguf, b"x").unwrap();
+        assert!(model_file(&not_gguf.display().to_string()).unwrap_err().contains("not a GGUF file"));
+        assert!(model_file(&dir.join("gone.gguf").display().to_string()).unwrap_err().contains("is not there"));
+        // A model split into files: its first part, never another.
+        let first = dir.join("Big-Q4_K_M-00001-of-00003.gguf");
+        let second = dir.join("Big-Q4_K_M-00002-of-00003.gguf");
+        std::fs::write(&first, b"GGUF").unwrap();
+        std::fs::write(&second, b"GGUF").unwrap();
+        assert_eq!(model_file(&first.display().to_string()).unwrap(), first);
+        let refused = model_file(&second.display().to_string()).unwrap_err();
+        assert!(refused.contains("part 2 of 3") && refused.contains("-00001-of-00003.gguf"), "{refused}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn split_parts_are_read_from_llama_cpps_names_only() {
+        assert_eq!(split_part("m-00001-of-00004.gguf"), Some((1, 4)));
+        assert_eq!(split_part("Qwen3-235B-Q4_K_M-00004-of-00004.gguf"), Some((4, 4)));
+        assert_eq!(split_part("m.gguf"), None);
+        assert_eq!(split_part("m-1-of-4.gguf"), None);
+        assert_eq!(split_part("m-0000a-of-00004.gguf"), None);
+    }
+
+    #[test]
+    fn only_a_language_model_the_engine_loads_is_added_and_the_agent_tools_follow_its_architecture() {
+        let llm = |arch: &str| serde_json::json!({ "kind": "llm", "section": "llm", "summary": "x — GGUF LLM", "architecture": arch });
+        assert_eq!(runnable(&llm("qwen35"), "a.gguf").unwrap(), ("qwen35".to_string(), true));
+        assert_eq!(runnable(&llm("glm5next"), "a.gguf").unwrap(), ("glm5next".to_string(), true));
+        for arch in ["llama", "mistral", "qwen2", "qwen3", "gemma3", "gemma3n", "gemma4", "qwen3moe"] {
+            assert_eq!(runnable(&llm(arch), "a.gguf").unwrap(), (arch.to_string(), false), "{arch} chats only");
+        }
+        let phi = runnable(&llm("phi3"), "phi.gguf").unwrap_err();
+        assert!(phi.contains("phi3 model") && phi.contains("does not run yet"), "{phi}");
+        // A studio older than the architecture in /api/detect: refused, not guessed.
+        assert!(runnable(&serde_json::json!({ "section": "llm" }), "a.gguf").is_err());
+        let projector = serde_json::json!({ "kind": "vision_projector", "section": "component", "summary": "Vision projector" });
+        assert!(runnable(&projector, "mmproj-F16.gguf").unwrap_err().contains("vision projector"));
+        let image = serde_json::json!({ "kind": "image", "section": "image", "summary": "Qwen Image transformer" });
+        assert!(runnable(&image, "qwen-image.gguf").unwrap_err().contains("not a language model: Qwen Image transformer"));
+    }
 
     #[test]
     fn the_portable_engine_an_installer_carries_is_found_and_a_cuda_build_before_it_is_preferred() {

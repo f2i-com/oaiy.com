@@ -160,7 +160,14 @@ export function YourAiStep({
       </div>
       {choice === 'engine' && (
         <div className="setup-reqs">
-          <EngineModelCard group="llm" catalog={catalog} onChanged={onCatalogChanged} onOpenEngines={onOpenEngines} why="The Agent uses the language model chosen in Engines, whatever it is." />
+          <EngineModelCard
+            group="llm"
+            catalog={catalog}
+            gpuGb={gpus.length > 0 ? Math.max(...gpus.map((g) => g.totalGb)) : undefined}
+            onChanged={onCatalogChanged}
+            onOpenEngines={onOpenEngines}
+            why="The Agent uses the language model chosen in Engines, whatever it is."
+          />
         </div>
       )}
       {choice === 'chatgpt' && (

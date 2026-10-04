@@ -20,8 +20,21 @@
       "size_gb": 5.7,
       "vram_gb": 8,
       "recommended": true,
+      "agent_tools": true,
       "parts": [{ "repo": "unsloth/Qwen3.5-9B-GGUF", "include": ["Qwen3.5-9B-Q4_K_M.gguf"], "into": "Qwen3.5-9B-GGUF" }],
       "add": ["Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf"]
+    },
+    {
+      "id": "qwen3.5-4b",
+      "group": "llm",
+      "name": "Qwen3.5 4B",
+      "about": "The small Qwen3.5: reasoning and tool use, for a GPU with 6 GB or less, or the CPU.",
+      "license": "Apache-2.0",
+      "size_gb": 2.7,
+      "vram_gb": 4,
+      "agent_tools": true,
+      "parts": [{ "repo": "unsloth/Qwen3.5-4B-GGUF", "include": ["Qwen3.5-4B-Q4_K_M.gguf"], "into": "Qwen3.5-4B-GGUF" }],
+      "add": ["Qwen3.5-4B-GGUF/Qwen3.5-4B-Q4_K_M.gguf"]
     },
     {
       "id": "qwen3-8b",
@@ -48,8 +61,8 @@
     {
       "id": "gemma-4-e2b",
       "group": "llm",
-      "name": "Gemma 4 E2B (with vision)",
-      "about": "Google's compact Gemma 4: chat that also reads pictures you attach.",
+      "name": "Gemma 4 E2B",
+      "about": "Google's compact Gemma 4, for chat. (OAIY's engine does not read pictures with it yet.)",
       "license": "Apache-2.0",
       "size_gb": 4.1,
       "vram_gb": 5,
@@ -59,8 +72,8 @@
     {
       "id": "gemma-3-4b",
       "group": "llm",
-      "name": "Gemma 3 4B (with vision)",
-      "about": "Google's Gemma 3 at 4B: chat that also reads pictures you attach.",
+      "name": "Gemma 3 4B",
+      "about": "Google's Gemma 3 at 4B, for chat. (OAIY's engine does not read pictures with it yet.)",
       "license": "Gemma Terms of Use",
       "size_gb": 3.3,
       "vram_gb": 5,

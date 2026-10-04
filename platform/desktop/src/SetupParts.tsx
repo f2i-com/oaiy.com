@@ -1,21 +1,26 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
-import { Check, CircleDashed, Cpu, Download, ExternalLink, Loader2, Mic, Play, RotateCcw, SkipForward, TriangleAlert } from 'lucide-react';
+import { Check, CircleDashed, Cpu, Download, ExternalLink, FolderSearch, Loader2, Mic, Play, RotateCcw, SkipForward, TriangleAlert } from 'lucide-react';
 import ChatGptConnector from './ChatGptConnector';
 import {
   engines,
   formatBytes,
+  isTauri,
   services as servicesApi,
+  type AddedModelFile,
   type EngineCatalog,
+  type EngineCatalogModel,
+  type EngineDownload,
   type ServiceSnapshot,
 } from './api';
-import { chosenModel, recommendedModel, type StepState } from './setupFlow';
+import { chosenModel, groupModels, recommendedModel, type StepState } from './setupFlow';
 
 /**
  * The setup wizard's shared parts: its frame (the step list, the pane, Back /
  * Skip / Next), and the cards the engine step and a plugin's requirements step
  * both use: a service (OAIY Voice) installed with progress, and the engines'
  * model for a group, which is the one chosen in Engines (only when there is
- * none does the wizard offer the catalog's recommended one to download).
+ * none does the wizard offer the catalog's models to download, the recommended
+ * one selected, or a language model file the computer already has).
  */
 
 /** A value asked for now and every `ms` while the window is visible. */
@@ -328,29 +333,127 @@ function groupLabel(catalog: EngineCatalog | null, group: string): string {
   return catalog?.groups?.find((g) => g.id === group)?.name ?? group;
 }
 
+/** A model's download size, the GPU memory it needs, whether that fits the largest GPU (`gpuGb`), and its license. */
+function modelFacts(m: EngineCatalogModel, gpuGb?: number): string {
+  const fit = gpuGb && m.vramGb ? (m.vramGb <= gpuGb ? 'fits your GPU' : `more than your GPU’s ${gpuGb} GB`) : null;
+  return [m.sizeGb ? `${m.sizeGb} GB download` : null, m.vramGb ? `needs ${m.vramGb} GB of GPU memory` : null, fit, m.license].filter(Boolean).join(' · ');
+}
+
+/** A download as it goes: a bar, and how far. */
+function DownloadProgress({ name, dl }: { name: string; dl: EngineDownload }) {
+  return (
+    <span className="setup-req-progress">
+      <span className="setup-progress" role="progressbar" aria-label={`Downloading ${name}`} aria-valuenow={dl.total ? Math.round((dl.done / dl.total) * 100) : undefined}>
+        <i className={dl.total ? undefined : 'is-indeterminate'} style={dl.total ? { width: `${Math.min(100, (dl.done / dl.total) * 100)}%` } : undefined} />
+      </span>
+      <small className="setup-mono">
+        {dl.status === 'queued' ? 'Waiting to start…' : dl.status === 'adding' ? 'Adding it to Engines…' : `${formatBytes(dl.done)} of ${formatBytes(dl.total)}`}
+        {dl.speed ? ` · ${dl.speed} MB/s` : ''}
+        {dl.filesTotal && dl.filesTotal > 1 ? ` · file ${Math.min((dl.filesDone ?? 0) + 1, dl.filesTotal)} of ${dl.filesTotal}` : ''}
+      </small>
+    </span>
+  );
+}
+
+/**
+ * A language model file this computer already has (LM Studio's, a download of the person's own), added to the
+ * engines through the desktop's window: typed, pasted or picked, and refused there when the engine cannot run it.
+ */
+function OwnModelFile({ onAdded }: { onAdded: (added: AddedModelFile) => void }) {
+  const [path, setPath] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const browse = async () => {
+    setError(null);
+    try {
+      const picked = await engines.pickModelFile();
+      if (picked) setPath(picked);
+    } catch (e) {
+      setError(errorText(e));
+    }
+  };
+  const add = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      onAdded(await engines.addModelFile(path));
+      setPath('');
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <form
+      className="setup-own-model"
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (path.trim() && !busy) void add();
+      }}
+    >
+      <strong>Or use a model file you already have</strong>
+      <div className="folder-change-row">
+        <input type="text" aria-label="Model file" placeholder="The .gguf file’s full path" value={path} onChange={(e) => setPath(e.target.value)} disabled={busy} />
+        <button type="button" className="btn btn-secondary" onClick={() => void browse()} disabled={busy}>
+          <FolderSearch size={14} /> Choose…
+        </button>
+        <button type="submit" className="btn btn-primary" disabled={busy || !path.trim()}>
+          {busy && <Loader2 size={14} className="spin" />} Use this file
+        </button>
+      </div>
+      <small className="form-hint">
+        A language model in a .gguf file, such as one LM Studio downloaded (of a model split into files, the first). The engine runs Qwen3.5, Qwen3, Qwen2, Llama, Mistral, Gemma
+        3 and 4, and GLM models; the Agent can use its tools with Qwen3.5 and GLM, and chats with the others.
+      </small>
+      {error && (
+        <p className="card-warn" role="alert">
+          {error}
+        </p>
+      )}
+    </form>
+  );
+}
+
 /**
  * The engines' model for `group`: the one chosen in Engines, whatever it is.
- * Only when none is chosen does it offer the catalog's recommended entry, with
- * its size and the GPU memory it needs, downloaded through the desktop.
+ * Only when none is chosen does it offer the catalog's models for the group to
+ * download, the recommended one selected, each with its size and the GPU memory
+ * it needs; for a language model, which the Agent can use its tools with, and a
+ * file this computer already has instead.
  */
 export function EngineModelCard({
   group,
   why,
   catalog,
+  gpuGb,
   onChanged,
   onOpenEngines,
 }: {
   group: string;
   why?: string;
   catalog: EngineCatalog | null;
+  /** The largest GPU's memory, to say whether each model fits it. */
+  gpuGb?: number;
   onChanged: () => void;
   onOpenEngines: () => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [picked, setPicked] = useState<string | null>(null);
+  const [added, setAdded] = useState<AddedModelFile | null>(null);
   const chosen = chosenModel(catalog, group);
-  const offer = chosen ? null : recommendedModel(catalog, group);
+  const options = chosen ? [] : groupModels(catalog, group);
+  // A download under way holds the choice: it is the one shown, and the others wait.
+  const active = options.find((m) => m.download && ACTIVE.has(m.download.status)) ?? null;
+  const offer = active ?? options.find((m) => m.id === picked) ?? recommendedModel(catalog, group);
   const dl = offer?.download ?? null;
+  const llm = group === 'llm';
+  const ownFile = llm && isTauri();
+  const addedFile = (a: AddedModelFile) => {
+    setAdded(a);
+    onChanged();
+  };
 
   const download = async () => {
     if (!offer) return;
@@ -377,37 +480,52 @@ export function EngineModelCard({
     );
   else if (chosen)
     body = (
-      <span className="setup-chosen">
-        <span className="badge badge-ok">Chosen in Engines</span> <strong>{chosen}</strong>
-      </span>
+      <>
+        <span className="setup-chosen">
+          <span className="badge badge-ok">Chosen in Engines</span> <strong>{chosen}</strong>
+        </span>
+        {added && added.name === chosen && !added.tools && (
+          <p className="card-warn setup-chat-only">The Agent chats with {chosen} but cannot use its tools with it: they need a Qwen3.5 or GLM model.</p>
+        )}
+      </>
     );
-  else if (!offer) body = <span className="form-hint">Nothing is chosen in Engines, and the catalog has no model for this. Add one in Engines.</span>;
-  else {
-    const sizes = [offer.sizeGb ? `${offer.sizeGb} GB download` : null, offer.vramGb ? `needs ${offer.vramGb} GB of GPU memory` : null, offer.license].filter(Boolean).join(' · ');
+  else if (!offer)
     body = (
       <div className="setup-offer">
-        <p className="form-hint">Nothing is chosen in Engines yet. The catalog recommends:</p>
-        <div className="setup-offer-card">
-          <strong>
-            {offer.name} {offer.recommended && <span className="badge badge-pending">Recommended</span>}
-          </strong>
-          {offer.about && <small>{offer.about}</small>}
-          {sizes && <small className="setup-mono">{sizes}</small>}
+        <span className="form-hint">Nothing is chosen in Engines, and the catalog has no model for this. Add one in Engines.</span>
+        {ownFile && <OwnModelFile onAdded={addedFile} />}
+      </div>
+    );
+  else {
+    body = (
+      <div className="setup-offer">
+        <p className="form-hint">{options.length > 1 ? 'Nothing is chosen in Engines yet. Choose one to download:' : 'Nothing is chosen in Engines yet. The catalog recommends:'}</p>
+        <div className="setup-model-list" role="radiogroup" aria-label={`${groupLabel(catalog, group)} to download`}>
+          {options.map((m) => {
+            const selected = m.id === offer.id;
+            return (
+              <label key={m.id} className={`setup-offer-card setup-model-option${selected ? ' is-selected' : ''}`}>
+                {options.length > 1 && (
+                  <input type="radio" name={`engine-model-${group}`} value={m.id} checked={selected} disabled={!!active || busy} onChange={() => setPicked(m.id)} />
+                )}
+                <span className="setup-model-text">
+                  <strong>
+                    {m.name} {m.recommended && <span className="badge badge-pending">Recommended</span>}
+                    {llm && (m.agentTools ? <span className="badge badge-ok">Agent tools</span> : <span className="badge badge-neutral">Chat only</span>)}
+                    {m.installed && <span className="badge badge-ok">Downloaded</span>}
+                  </strong>
+                  {m.about && <small>{m.about}</small>}
+                  <small className="setup-mono">{modelFacts(m, gpuGb)}</small>
+                </span>
+              </label>
+            );
+          })}
         </div>
-        {dl && ACTIVE.has(dl.status) && (
-          <span className="setup-req-progress">
-            <span className="setup-progress" role="progressbar" aria-label={`Downloading ${offer.name}`} aria-valuenow={dl.total ? Math.round((dl.done / dl.total) * 100) : undefined}>
-              <i className={dl.total ? undefined : 'is-indeterminate'} style={dl.total ? { width: `${Math.min(100, (dl.done / dl.total) * 100)}%` } : undefined} />
-            </span>
-            <small className="setup-mono">
-              {dl.status === 'queued' ? 'Waiting to start…' : dl.status === 'adding' ? 'Adding it to Engines…' : `${formatBytes(dl.done)} of ${formatBytes(dl.total)}`}
-              {dl.speed ? ` · ${dl.speed} MB/s` : ''}
-              {dl.filesTotal && dl.filesTotal > 1 ? ` · file ${Math.min((dl.filesDone ?? 0) + 1, dl.filesTotal)} of ${dl.filesTotal}` : ''}
-            </small>
-          </span>
-        )}
+        {llm && options.length > 1 && <small className="form-hint">The Agent works OAIY with tools, which it can use with the models marked Agent tools; with the others it chats only.</small>}
+        {dl && ACTIVE.has(dl.status) && <DownloadProgress name={offer.name} dl={dl} />}
         {dl?.status === 'failed' && dl.error && <p className="card-warn">{dl.error}</p>}
         {offer.installed && <p className="form-hint">Downloaded. Choose it in Engines to use it.</p>}
+        {ownFile && <OwnModelFile onAdded={addedFile} />}
       </div>
     );
     if (!offer.installed && !(dl && ACTIVE.has(dl.status)))

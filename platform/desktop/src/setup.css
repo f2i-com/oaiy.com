@@ -294,6 +294,17 @@
 .setup-offer-card small { color: var(--muted); font-size: 12px; line-height: 1.5; }
 .setup-offer-card small.setup-mono { color: var(--faint); font-size: 11.5px; }
 .setup-retry { flex-wrap: wrap; margin: 0; }
+/* The models to choose from when nothing is chosen in Engines: one card each, the chosen one marked. */
+.setup-model-list { display: flex; max-width: 560px; flex-direction: column; gap: 6px; }
+.setup-model-option { flex-direction: row; align-items: flex-start; gap: 10px; max-width: none; cursor: pointer; }
+.setup-model-option > input[type='radio'] { flex: none; width: 15px; height: 15px; margin: 2px 0 0; cursor: pointer; }
+.setup-model-option.is-selected { border-style: solid; border-color: color-mix(in srgb, var(--primary) 55%, var(--strong-border)); }
+.setup-model-text { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 3px; }
+.setup-model-text strong .badge { margin-left: 0; }
+.setup-model-text strong .badge-pending::before { animation: none; }
+.setup-own-model { display: flex; max-width: 560px; flex-direction: column; gap: 6px; border-top: 1px solid var(--border); margin-top: 4px; padding-top: 10px; }
+.setup-own-model > strong { font-size: 13px; font-weight: 620; }
+.setup-chat-only { flex-basis: 100%; margin: 0; }
 
 details.setup-more-source {
   border: 1px solid var(--border);

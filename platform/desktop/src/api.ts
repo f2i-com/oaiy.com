@@ -2038,10 +2038,22 @@ export interface EngineCatalogModel {
   sizeGb?: number;
   vramGb?: number;
   recommended: boolean;
+  /** A language model the Agent can use its tools with (the engine reads its tool calls); the others chat only. */
+  agentTools?: boolean;
   needs: string[];
   installed: boolean;
   partial: boolean;
   download: EngineDownload | null;
+}
+
+/** A language model file added to the engines from this computer. */
+export interface AddedModelFile {
+  /** Its name in Engines. */
+  name: string | null;
+  /** Its GGUF architecture ("qwen35", "llama"). */
+  architecture: string;
+  /** The Agent can use its tools with it; otherwise it chats only. */
+  tools: boolean;
 }
 
 /** The engines' catalog, and the model chosen in Engines for each group (`null`: none). */
@@ -2063,6 +2075,13 @@ export const engines = {
   /** Download a catalog model into the engines' own folder. */
   download: (id: string) =>
     request<{ running: boolean; downloads: EngineDownload[] }>('/api/engines/downloads', { method: 'POST', body: JSON.stringify({ id }) }),
+  /** A native picker for a language model file (.gguf); `null` when it was closed. The desktop's window only. */
+  pickModelFile: () => tauriInvoke<string | null>('pick_model_file'),
+  /**
+   * Add a language model file this computer already has to the engines, which choose it when none is chosen. A
+   * command of the desktop's window, not a route: the desktop refuses a file the engine cannot run.
+   */
+  addModelFile: (path: string) => tauriInvoke<AddedModelFile>('add_engine_model', { path }),
 };
 
 // ----- setup (the wizard's record, on the desktop) -----

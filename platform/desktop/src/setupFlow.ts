@@ -226,6 +226,12 @@ export function connectorFor(record: PluginRecord | null | undefined, command: s
 // Requirements, met live
 // ---------------------------------------------------------------------------
 
+/** The catalog's models for `group`, to choose one to download: the recommended one first, then in the catalog's order. */
+export function groupModels(catalog: EngineCatalog | null, group: string): EngineCatalogModel[] {
+  const models = (catalog?.models ?? []).filter((m) => m.group === group);
+  return [...models.filter((m) => m.recommended), ...models.filter((m) => !m.recommended)];
+}
+
 /** The catalog's recommended model for `group` (else its first), to offer when nothing is chosen. */
 export function recommendedModel(catalog: EngineCatalog | null, group: string): EngineCatalogModel | null {
   const models = (catalog?.models ?? []).filter((m) => m.group === group);

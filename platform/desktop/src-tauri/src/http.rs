@@ -926,6 +926,8 @@ fn engine_model(m: &serde_json::Value) -> serde_json::Value {
         "sizeGb": m.get("size_gb"),
         "vramGb": m.get("vram_gb"),
         "recommended": m.get("recommended").and_then(|r| r.as_bool()).unwrap_or(false),
+        // A language model the Agent can use its tools with (the catalog's `agent_tools`); the others chat.
+        "agentTools": m.get("agent_tools").and_then(|r| r.as_bool()).unwrap_or(false),
         "needs": m.get("needs").cloned().unwrap_or_else(|| serde_json::json!([])),
         "installed": m.get("installed").and_then(|r| r.as_bool()).unwrap_or(false),
         "partial": m.get("partial").and_then(|r| r.as_bool()).unwrap_or(false),
@@ -2714,7 +2716,7 @@ mod tests {
                 "groups": [{ "id": "llm", "name": "Chat", "about": "Language models." }],
                 "models": [
                     { "id": "qwen3.5-9b", "group": "llm", "name": "Qwen3.5 9B", "about": "A strong all-round chat model.", "license": "Apache-2.0",
-                      "size_gb": 5.7, "vram_gb": 8, "recommended": true, "installed": false, "partial": false,
+                      "size_gb": 5.7, "vram_gb": 8, "recommended": true, "agent_tools": true, "installed": false, "partial": false,
                       "download": { "id": "qwen3.5-9b", "dir": "D:/models", "status": "downloading", "done": 1024, "total": 4096, "file": "Qwen3.5-9B-Q4_K_M.gguf",
                                     "files_done": 0, "files_total": 1, "speed": 2.5, "error": null, "added": [] } },
                     { "id": "qwen3-4b", "group": "llm", "name": "Qwen3 4B", "size_gb": 2.5, "vram_gb": 4, "installed": true, "partial": false, "download": null }
@@ -2751,6 +2753,8 @@ mod tests {
         let first = &v["models"][0];
         assert_eq!(first["id"], "qwen3.5-9b");
         assert_eq!(first["recommended"], true);
+        // Whether the Agent can use its tools with it; a model that does not say chats only.
+        assert_eq!((first["agentTools"].as_bool(), v["models"][1]["agentTools"].as_bool()), (Some(true), Some(false)));
         assert_eq!((first["sizeGb"].as_f64(), first["vramGb"].as_i64()), (Some(5.7), Some(8)));
         assert_eq!(first["download"]["filesTotal"], 1);
         assert_eq!(first["download"]["done"], 1024);

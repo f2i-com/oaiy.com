@@ -52,6 +52,10 @@ pub struct Detected {
     pub fields: Vec<(String, Json)>,
     /// Fields the entry still needs before it can run.
     pub missing: Vec<String>,
+    /// A GGUF language model's `general.architecture` ("qwen35", "llama"): which the
+    /// engine loads and which reads tool calls is the engine's to say, so a caller can
+    /// tell a file it cannot run before it is added.
+    pub architecture: Option<String>,
 }
 
 impl Detected {
@@ -77,12 +81,13 @@ impl Detected {
             ("summary", Json::str(&self.summary)),
             ("fields", Json::Obj(self.fields.clone())),
             ("missing", Json::Arr(self.missing.iter().map(Json::str).collect())),
+            ("architecture", self.architecture.as_deref().map_or(Json::Null, Json::str)),
         ])
     }
 }
 
 fn detected(role: Role, format: &'static str, summary: String, fields: Vec<(&str, Json)>) -> Detected {
-    Detected { role, format, summary, fields: fields.into_iter().map(|(k, v)| (k.to_string(), v)).collect(), missing: Vec::new() }
+    Detected { role, format, summary, fields: fields.into_iter().map(|(k, v)| (k.to_string(), v)).collect(), missing: Vec::new(), architecture: None }
 }
 
 /// A path as configuration text. On Windows a path picked with `/` keeps `/`
@@ -250,7 +255,9 @@ fn gguf_file(path: &Path) -> Result<Detected, String> {
         return Ok(detected(Role::Component { kind: "music_lm" }, "gguf",
             format!("MiniMax Music 3 language model, {} ({label})", get("music3.quant")), vec![("language_model", path_json(path))]));
     }
-    Ok(detected(Role::Llm, "gguf", format!("{label} — GGUF LLM ({arch})"), vec![("path", path_json(path))]))
+    let mut d = detected(Role::Llm, "gguf", format!("{label} — GGUF LLM ({arch})"), vec![("path", path_json(path))]);
+    d.architecture = Some(arch);
+    Ok(d)
 }
 
 // ---------------------------------------------------------- safetensors
@@ -729,9 +736,13 @@ mod tests {
         let r = detect(&llm).unwrap();
         assert_eq!(r.role, Role::Llm);
         assert!(r.summary.contains("qwen3"));
+        // Its architecture, for a caller deciding whether the engine runs it.
+        assert_eq!(r.architecture.as_deref(), Some("qwen3"));
+        assert_eq!(r.to_json().get("architecture").and_then(Json::as_str), Some("qwen3"));
         let proj = d.0.join("mmproj-F16.gguf");
         gguf(&proj, &[("general.architecture", "clip"), ("general.type", "mmproj")], &[]);
         assert_eq!(detect(&proj).unwrap().kind(), "vision_projector");
+        assert_eq!(detect(&proj).unwrap().to_json().get("architecture"), Some(&Json::Null));
         let image = d.0.join("qwen-image-Q4.gguf");
         gguf(&image, &[("general.architecture", "qwen_image21")], &["img_in.weight"]);
         let r = detect(&image).unwrap();

@@ -1074,6 +1074,25 @@ async fn pick_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
     Ok(picked.and_then(|fp| fp.as_path().map(|p| p.display().to_string())))
 }
 
+/// Tauri command: a native picker for a language model file (`.gguf`): its path, or None when cancelled.
+#[tauri::command]
+async fn pick_model_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().set_title("Choose a language model file").add_filter("GGUF language model", &["gguf"]).pick_file(move |f| {
+        let _ = tx.send(f);
+    });
+    let picked = rx.await.map_err(|e| e.to_string())?;
+    Ok(picked.and_then(|fp| fp.as_path().map(|p| p.display().to_string())))
+}
+
+/// Tauri command: add a language model file the person already has to the engines (`engines::add_model_file`). A
+/// command of the dashboard's own window, not a route, so no page or token can point the engines at a file.
+#[tauri::command]
+async fn add_engine_model(path: String) -> Result<serde_json::Value, String> {
+    crate::engines::add_model_file(&path).await
+}
+
 /// Tauri command: relaunch the app so a new data/models dir takes effect.
 ///
 /// A packaged build relaunches its own binary and reloads the bundled frontend
@@ -1253,6 +1272,8 @@ pub fn run() {
             set_data_dir,
             set_models_dir,
             pick_folder,
+            pick_model_file,
+            add_engine_model,
             restart_app,
             migration_plan,
             start_migration,
