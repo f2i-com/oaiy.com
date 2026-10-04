@@ -7,6 +7,7 @@ import type { EngineCatalog, EngineRecommendation, PluginRecord, ServiceSnapshot
 import {
   aiChoices,
   aiReady,
+  canRun,
   canMoveOn,
   canSkip,
   changeTime,
@@ -203,6 +204,14 @@ describe('requirements, met live', () => {
     expect(recommendedModel(catalog(null), 'image')?.id).toBe('z-image');
     expect(recommendedModel(catalog(null), 'music')).toBeNull();
     expect(recommendedModel(null, 'llm')).toBeNull();
+    // A recommended model no engine here runs is passed over for one that is.
+    const cudaFirst = { ...catalog(null), engines: { cuda: false, webgpu: true }, models: [
+      { id: 'big', group: 'llm', name: 'Big', recommended: true, engines: ['cuda' as const], needs: [], installed: false, partial: false, download: null },
+      { id: 'small', group: 'llm', name: 'Small', recommended: false, needs: [], installed: false, partial: false, download: null },
+    ] };
+    expect(recommendedModel(cudaFirst, 'llm')?.id).toBe('small');
+    expect(canRun(cudaFirst, cudaFirst.models[0])).toBe(false);
+    expect(canRun({ ...cudaFirst, engines: undefined }, cudaFirst.models[0])).toBe(true);
   });
 });
 

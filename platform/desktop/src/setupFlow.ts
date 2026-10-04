@@ -232,9 +232,19 @@ export function groupModels(catalog: EngineCatalog | null, group: string): Engin
   return [...models.filter((m) => m.recommended), ...models.filter((m) => !m.recommended)];
 }
 
-/** The catalog's recommended model for `group` (else its first), to offer when nothing is chosen. */
+/**
+ * Can an engine this OAIY has run `m`? A model for the CUDA engine alone (DeepSeek-V4.1, the EXL3 models,
+ * GLM-5.3-Flash) cannot on an install with only the portable one. An older desktop does not say: every model can.
+ */
+export function canRun(catalog: EngineCatalog | null, m: EngineCatalogModel): boolean {
+  const here = catalog?.engines;
+  if (!here) return true;
+  return (m.engines ?? ['cuda', 'webgpu']).some((e) => here[e]);
+}
+
+/** The catalog's recommended model for `group` (else its first) that an engine here runs, to offer when nothing is chosen. */
 export function recommendedModel(catalog: EngineCatalog | null, group: string): EngineCatalogModel | null {
-  const models = (catalog?.models ?? []).filter((m) => m.group === group);
+  const models = (catalog?.models ?? []).filter((m) => m.group === group && canRun(catalog, m));
   return models.find((m) => m.recommended) ?? models[0] ?? null;
 }
 

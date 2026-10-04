@@ -2045,6 +2045,12 @@ export interface EngineCatalogModel {
   recommended: boolean;
   /** A language model the Agent can use its tools with (the engine reads its tool calls); the others chat only. */
   agentTools?: boolean;
+  /** The engines that run it: `cuda` (NVIDIA), `webgpu` (any GPU, else the CPU). Both when absent. */
+  engines?: Array<'cuda' | 'webgpu'>;
+  /** The computer's memory it needs, in GB, when that is more than a usual computer's. */
+  ramGb?: number | null;
+  /** The GPUs it takes, when more than one. */
+  gpuCount?: number | null;
   needs: string[];
   installed: boolean;
   partial: boolean;
@@ -2070,6 +2076,8 @@ export interface EngineCatalog {
   groups?: Array<{ id: string; name: string; about?: string }>;
   models?: EngineCatalogModel[];
   defaults?: Record<string, string | null>;
+  /** The engines this OAIY can start; absent from an older desktop (every model is then offered). */
+  engines?: { cuda: boolean; webgpu: boolean } | null;
 }
 
 export const engines = {

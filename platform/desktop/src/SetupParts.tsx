@@ -12,7 +12,7 @@ import {
   type EngineDownload,
   type ServiceSnapshot,
 } from './api';
-import { chosenModel, groupModels, recommendedModel, type StepState } from './setupFlow';
+import { canRun, chosenModel, groupModels, recommendedModel, type StepState } from './setupFlow';
 
 /**
  * The setup wizard's shared parts: its frame (the step list, the pane, Back /
@@ -333,11 +333,23 @@ function groupLabel(catalog: EngineCatalog | null, group: string): string {
   return catalog?.groups?.find((g) => g.id === group)?.name ?? group;
 }
 
-/** A model's download size, the GPU memory it needs, whether that fits the largest GPU (`gpuGb`), and its license. */
+/** A model's download size, the GPU memory it needs, whether that fits the largest GPU (`gpuGb`), the RAM and GPUs it takes, and its license. */
 function modelFacts(m: EngineCatalogModel, gpuGb?: number): string {
   const fit = gpuGb && m.vramGb ? (m.vramGb <= gpuGb ? 'fits your GPU' : `more than your GPU’s ${gpuGb} GB`) : null;
-  return [m.sizeGb ? `${m.sizeGb} GB download` : null, m.vramGb ? `needs ${m.vramGb} GB of GPU memory` : null, fit, m.license].filter(Boolean).join(' · ');
+  return [
+    m.sizeGb ? `${m.sizeGb} GB download` : null,
+    m.vramGb ? `needs ${m.vramGb} GB of GPU memory` : null,
+    fit,
+    m.gpuCount && m.gpuCount > 1 ? `${m.gpuCount} GPUs` : null,
+    m.ramGb ? `${m.ramGb} GB of RAM` : null,
+    m.license,
+  ]
+    .filter(Boolean)
+    .join(' · ');
 }
+
+/** Only NVIDIA cards run it (OAIY's CUDA engine), rather than any GPU. */
+const cudaOnly = (m: EngineCatalogModel) => !!m.engines && !m.engines.includes('webgpu');
 
 /** A download as it goes: a bar, and how far. */
 function DownloadProgress({ name, dl }: { name: string; dl: EngineDownload }) {
@@ -446,7 +458,7 @@ export function EngineModelCard({
   const options = chosen ? [] : groupModels(catalog, group);
   // A download under way holds the choice: it is the one shown, and the others wait.
   const active = options.find((m) => m.download && ACTIVE.has(m.download.status)) ?? null;
-  const offer = active ?? options.find((m) => m.id === picked) ?? recommendedModel(catalog, group);
+  const offer = active ?? options.find((m) => m.id === picked && canRun(catalog, m)) ?? recommendedModel(catalog, group);
   const dl = offer?.download ?? null;
   const llm = group === 'llm';
   const ownFile = llm && isTauri();
@@ -503,19 +515,22 @@ export function EngineModelCard({
         <div className="setup-model-list" role="radiogroup" aria-label={`${groupLabel(catalog, group)} to download`}>
           {options.map((m) => {
             const selected = m.id === offer.id;
+            const runs = canRun(catalog, m);
             return (
-              <label key={m.id} className={`setup-offer-card setup-model-option${selected ? ' is-selected' : ''}`}>
+              <label key={m.id} className={`setup-offer-card setup-model-option${selected ? ' is-selected' : ''}${runs ? '' : ' is-unavailable'}`}>
                 {options.length > 1 && (
-                  <input type="radio" name={`engine-model-${group}`} value={m.id} checked={selected} disabled={!!active || busy} onChange={() => setPicked(m.id)} />
+                  <input type="radio" name={`engine-model-${group}`} value={m.id} checked={selected} disabled={!!active || busy || !runs} onChange={() => setPicked(m.id)} />
                 )}
                 <span className="setup-model-text">
                   <strong>
                     {m.name} {m.recommended && <span className="badge badge-pending">Recommended</span>}
                     {llm && (m.agentTools ? <span className="badge badge-ok">Agent tools</span> : <span className="badge badge-neutral">Chat only</span>)}
+                    {cudaOnly(m) && <span className="badge badge-neutral">NVIDIA only</span>}
                     {m.installed && <span className="badge badge-ok">Downloaded</span>}
                   </strong>
                   {m.about && <small>{m.about}</small>}
                   <small className="setup-mono">{modelFacts(m, gpuGb)}</small>
+                  {!runs && <small className="card-warn">It runs on OAIY’s CUDA engine for NVIDIA cards, which this OAIY does not have.</small>}
                 </span>
               </label>
             );

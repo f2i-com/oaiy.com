@@ -159,6 +159,32 @@ describe('the engine model card, with nothing chosen in Engines', () => {
     expect(onChanged).not.toHaveBeenCalled();
   });
 
+  it('shows a model only the CUDA engine runs, but not to download, on an OAIY with only the portable engine', async () => {
+    const portableOnly: EngineCatalog = {
+      ...catalog(null, [
+        model({ id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', sizeGb: 510, vramGb: 32, ramGb: 192, gpuCount: 2, recommended: true, agentTools: true, engines: ['cuda'] }),
+        model({ id: 'qwen3.5-9b', name: 'Qwen3.5 9B', sizeGb: 5.7, vramGb: 8, agentTools: true }),
+      ]),
+      engines: { cuda: false, webgpu: true },
+    };
+    await render({ catalog: portableOnly });
+    const [deepseek, qwen] = options();
+    expect(deepseek.textContent).toContain('NVIDIA only');
+    expect(deepseek.textContent).toContain('2 GPUs · 192 GB of RAM');
+    expect(deepseek.textContent).toContain('which this OAIY does not have');
+    expect(deepseek.querySelector('input')!.disabled).toBe(true);
+    // The recommended one cannot run here: the first that can is chosen, and downloaded.
+    expect(qwen.querySelector('input')!.checked).toBe(true);
+    await click(button(/^Download/));
+    expect(m.download).toHaveBeenCalledWith('qwen3.5-9b');
+    // With the CUDA engine it is offered, and still says it is for NVIDIA cards.
+    await render({ catalog: { ...portableOnly, engines: { cuda: true, webgpu: true } } });
+    expect(options()[0].querySelector('input')!.disabled).toBe(false);
+    expect(options()[0].querySelector('input')!.checked).toBe(true);
+    expect(options()[0].textContent).toContain('NVIDIA only');
+    expect(options()[0].textContent).not.toContain('does not have');
+  });
+
   it('offers no file outside the desktop’s window, nor for another group', async () => {
     delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
     await render();
