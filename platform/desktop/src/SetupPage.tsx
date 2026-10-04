@@ -17,6 +17,7 @@ import {
   type PluginRecord,
 } from './api';
 import { askAgent, useControlSettings } from './AgentAccess';
+import type { ProviderPick } from './AgentProviderPicker';
 import PluginWizard from './PluginSetup';
 import type { PluginNavTarget } from './PluginScreenPage';
 import {
@@ -43,7 +44,8 @@ import { setSetupState, useSetupState } from './useSetupState';
  * The setup page: the first-run wizard, or one plugin's own wizard.
  *
  * First run is the essentials: welcome; your AI (a language model on this
- * computer, or ChatGPT, the recommended one first); what the Agent may change
+ * computer, or ChatGPT, the recommended one first, or an AI provider such as
+ * LM Studio); what the Agent may change
  * (one switch); then "Continue with the Agent", which hands the person to the
  * Agent to set up the rest in a chat. "Set up the rest myself" goes on step by
  * step instead: plugins to install, each chosen plugin's own setup, connecting
@@ -94,6 +96,10 @@ function FirstRunWizard({ initialStep, onExit, onNavigate }: { initialStep: stri
   const [rest, setRest] = useState(() => inTheRest(asked));
   const [aiChoice, setAiChoice] = useState<AgentModelSource | null>(null);
   const choice = aiChoice ?? (rec && prefs !== undefined ? initialAiChoice(rec, prefs, catalog) : null);
+  // The provider and model chosen here; until then, the ones the Agent is on.
+  const [picked, setPicked] = useState<ProviderPick | null>(null);
+  const onProvider = prefs?.model.source === 'provider' && prefs.model.provider && prefs.model.model ? prefs.model : null;
+  const providerPick = picked ?? (onProvider ? { provider: onProvider.provider!, model: onProvider.model!, name: prefs?.providerName ?? onProvider.provider! } : null);
 
   const guide = useMemo(() => ({ codexConnected: codexOn, runtime: null, providers: null, services: null, plugins, connected: paired }), [codexOn, plugins, paired]);
   const steps = useMemo(
@@ -156,8 +162,15 @@ function FirstRunWizard({ initialStep, onExit, onNavigate }: { initialStep: stri
 
   /** The Agent's model follows the choice made here (a desktop that keeps none has nothing to set). */
   const commitAi = async (source: AgentModelSource) => {
-    if (!prefs || prefs.model.source === source) return;
-    await agentPreferences.set({ model: { source } });
+    if (!prefs) return;
+    if (source === 'provider') {
+      const pick = providerPick;
+      if (!pick || (prefs.model.source === 'provider' && prefs.model.provider === pick.provider && prefs.model.model === pick.model)) return;
+      await agentPreferences.set({ model: { source: 'provider', provider: pick.provider, model: pick.model } });
+    } else {
+      if (prefs.model.source === source) return;
+      await agentPreferences.set({ model: { source } });
+    }
     await refreshPrefs();
   };
   const signedIn = () => {
@@ -223,7 +236,7 @@ function FirstRunWizard({ initialStep, onExit, onNavigate }: { initialStep: stri
       footer = <StepFooter status={status} onNext={nextStep} nextLabel="Get started" />;
       break;
     case 'ai': {
-      const chosenReady = choice === 'engine' ? line.kind === 'chosen' : choice === 'chatgpt' ? codexOn : false;
+      const chosenReady = choice === 'engine' ? line.kind === 'chosen' : choice === 'chatgpt' ? codexOn : choice === 'provider' ? !!providerPick : false;
       content = (
         <YourAiStep
           kicker={kicker}
@@ -236,9 +249,12 @@ function FirstRunWizard({ initialStep, onExit, onNavigate }: { initialStep: stri
           onCatalogChanged={() => void refreshCatalog()}
           onSignedIn={signedIn}
           onOpenEngines={() => onNavigate('engines')}
+          providerPick={providerPick}
+          onProviderPick={prefs ? setPicked : undefined}
         />
       );
-      const waiting = choice === 'chatgpt' ? 'Sign in with ChatGPT to use it' : 'Waiting for a language model in Engines';
+      const waiting =
+        choice === 'chatgpt' ? 'Sign in with ChatGPT to use it' : choice === 'provider' ? 'Connect a provider and choose its model' : 'Waiting for a language model in Engines';
       footer = (
         <StepFooter
           onBack={() => go(index - 1)}
@@ -264,7 +280,13 @@ function FirstRunWizard({ initialStep, onExit, onNavigate }: { initialStep: stri
     case 'handoff': {
       const source = prefs?.model.source ?? (line.kind === 'chosen' ? 'engine' : codexOn ? 'chatgpt' : null);
       const aiLine =
-        source === 'chatgpt' ? `ChatGPT${codexStatus?.email ? `, signed in as ${codexStatus.email}` : ''}.` : line.kind === 'chosen' ? `On this computer: ${line.name}, chosen in Engines.` : modelLineText(line);
+        source === 'chatgpt'
+          ? `ChatGPT${codexStatus?.email ? `, signed in as ${codexStatus.email}` : ''}.`
+          : source === 'provider' && prefs?.model.provider
+            ? `${prefs.providerName ?? prefs.model.provider}: ${prefs.model.model}.`
+            : line.kind === 'chosen'
+              ? `On this computer: ${line.name}, chosen in Engines.`
+              : modelLineText(line);
       content = (
         <HandoffStep
           kicker={kicker}

@@ -1,6 +1,7 @@
-// What the Agent runs on: the desktop's choice (its engine, or ChatGPT through
-// OAIY's Codex connector), the provider each kind of conversation takes from
-// it, and what the person is told when OAIY is not signed in to ChatGPT.
+// What the Agent runs on: the desktop's choice (its engine, ChatGPT through
+// OAIY's Codex connector, or one of its AI providers through its gateway), the
+// provider each kind of conversation takes from it, and what the person is told
+// when OAIY is not signed in to ChatGPT.
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Agent, type AgentEvent } from '../../src/agent/agent';
 import { sendTurn } from '../../src/agent/protocol';
@@ -16,6 +17,7 @@ import {
   callRoute,
   chatgptProvider,
   codexDefaultModel,
+  desktopProvider,
   modelChipText,
   parseAgentModel,
   pickCodexModel,
@@ -47,6 +49,24 @@ describe("the desktop's choice", () => {
     expect(sameModel({ source: 'chatgpt', model: 'a' }, { source: 'chatgpt', model: 'a' })).toBe(true);
     expect(sameModel({ source: 'chatgpt', model: 'a' }, { source: 'chatgpt' })).toBe(false);
     expect(sameModel(ENGINE, { source: 'chatgpt' })).toBe(false);
+  });
+
+  it('reads a provider with its model and the name the desktop gives it; one without either is not a choice', () => {
+    expect(parseAgentModel({ model: { source: 'provider', provider: 'lm-studio', model: ' qwen3.5-9b ' }, providerName: 'LM Studio' })).toEqual({
+      source: 'provider',
+      provider: 'lm-studio',
+      model: 'qwen3.5-9b',
+      name: 'LM Studio',
+    });
+    expect(parseAgentModel({ model: { source: 'provider', provider: 'ollama', model: 'gemma4' } })).toEqual({ source: 'provider', provider: 'ollama', model: 'gemma4' });
+    expect(parseAgentModel({ model: { source: 'provider', provider: 'lm-studio' } })).toBeNull();
+    expect(parseAgentModel({ model: { source: 'provider', model: 'm' } })).toBeNull();
+    const lm = { source: 'provider', provider: 'lm-studio', model: 'a' } as const;
+    // Renamed, the same; another model or provider, not.
+    expect(sameModel(lm, { ...lm, name: 'LM Studio' })).toBe(true);
+    expect(sameModel(lm, { ...lm, model: 'b' })).toBe(false);
+    expect(sameModel(lm, { ...lm, provider: 'ollama' })).toBe(false);
+    expect(sameModel(lm, { source: 'chatgpt', model: 'a' })).toBe(false);
   });
 
   it('asks the desktop with its token; an older desktop (404) means the engine; one that cannot be asked keeps what was known (null)', async () => {
@@ -86,6 +106,30 @@ describe('the provider each kind of conversation runs on', () => {
       });
       expect(p.followEngine).toBeUndefined();
     }
+  });
+
+  it('on a desktop AI provider: every conversation, calls included, through its gateway route with the desktop token, on the model chosen', () => {
+    const choice = { source: 'provider', provider: 'lm-studio', model: 'qwen3.5-9b', name: 'LM Studio' } as const;
+    for (const kind of KINDS) {
+      const p = providerFor(kind, choice, ENGINE_PROVIDER, DESK, 'gpt-5.5')!;
+      expect(p).toEqual(desktopProvider(DESK, choice));
+      expect(p).toMatchObject({
+        id: 'oaiy-provider-lm-studio',
+        type: 'custom',
+        serverKind: 'other',
+        name: 'LM Studio',
+        apiKey: 'desk-token',
+        baseUrl: 'http://127.0.0.1:17972/api/ai/providers/lm-studio/v1',
+        modelId: 'qwen3.5-9b',
+        parallelAgents: 1,
+      });
+      expect(p.followEngine).toBeUndefined();
+    }
+    expect(modelChipText(desktopProvider(DESK, choice))).toBe('LM Studio · qwen3.5-9b');
+    // No name from the desktop: its id.
+    expect(desktopProvider(DESK, { source: 'provider', provider: 'ollama', model: 'gemma4' }).name).toBe('ollama');
+    // No desktop to reach it by: the engine.
+    expect(providerFor('project', choice, ENGINE_PROVIDER, null, null)).toBe(ENGINE_PROVIDER);
   });
 
   it("on ChatGPT with no model named: Codex's default, once it is known (and until then, none: the run looks it up first)", () => {

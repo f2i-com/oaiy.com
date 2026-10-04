@@ -398,14 +398,17 @@ export interface FirstRunInput {
 
 /**
  * The Agent has a model to think with: the one the Agent is set to use is
- * ready (a language model chosen in Engines, or ChatGPT signed in). A desktop
- * that keeps no preference is ready with either.
+ * ready (a language model chosen in Engines, ChatGPT signed in, or an AI
+ * provider with its model). A desktop that keeps no preference is ready with
+ * either of the first two.
  */
 export function aiReady(input: { catalog: EngineCatalog | null; prefs?: AgentPreferences | null; codexConnected: boolean }): boolean {
   const local = !!chosenModel(input.catalog, 'llm');
   switch (input.prefs?.model?.source) {
     case 'chatgpt':
       return input.codexConnected;
+    case 'provider':
+      return !!input.prefs.model.provider && !!input.prefs.model.model;
     case 'engine':
       return local;
     default:
@@ -426,7 +429,7 @@ export function firstRunSteps(input: FirstRunInput): FirstRunStep[] {
   const ready = aiReady({ catalog: input.catalog, prefs: input.prefs, codexConnected: input.guide.codexConnected === true });
   const steps: FirstRunStep[] = [
     { id: 'welcome', title: 'Welcome', hint: 'What OAIY sets up', state: mark('welcome', passed('welcome')), optional: false },
-    { id: 'ai', title: 'Your AI', hint: 'On this computer, or ChatGPT', state: mark('ai', ready), optional: false },
+    { id: 'ai', title: 'Your AI', hint: 'On this computer, ChatGPT or a provider', state: mark('ai', ready), optional: false },
     { id: 'agent', title: 'The Agent', hint: 'What it may change', state: mark('agent', passed('agent')), optional: false },
     { id: 'handoff', title: 'Continue with the Agent', hint: 'It sets up the rest with you', state: fr?.finished ? 'done' : 'todo', optional: false },
   ];
@@ -497,14 +500,19 @@ export function recommendationOrFallback(rec: EngineRecommendation | null, catal
   };
 }
 
-/** The two choices, the recommended one first (the other stays there to choose). */
-export function aiChoices(rec: EngineRecommendation): AgentModelSource[] {
-  return rec.recommend === 'chatgpt' ? ['chatgpt', 'engine'] : ['engine', 'chatgpt'];
+/**
+ * The choices, the recommended one first (the other stays there to choose); an
+ * AI provider last, on a desktop that can keep it as the Agent's model.
+ */
+export function aiChoices(rec: EngineRecommendation, withProvider = false): AgentModelSource[] {
+  const two: AgentModelSource[] = rec.recommend === 'chatgpt' ? ['chatgpt', 'engine'] : ['engine', 'chatgpt'];
+  return withProvider ? [...two, 'provider'] : two;
 }
 
-/** The choice the step opens on: ChatGPT when the Agent already uses it, local when Engines has a model chosen, else the recommendation. */
+/** The choice the step opens on: ChatGPT or a provider when the Agent already uses it, local when Engines has a model chosen, else the recommendation. */
 export function initialAiChoice(rec: EngineRecommendation, prefs: AgentPreferences | null | undefined, catalog: EngineCatalog | null): AgentModelSource {
   if (prefs?.model?.source === 'chatgpt') return 'chatgpt';
+  if (prefs?.model?.source === 'provider') return 'provider';
   if (chosenModel(catalog, 'llm') || rec.local.chosen) return 'engine';
   return rec.recommend;
 }

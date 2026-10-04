@@ -1148,6 +1148,11 @@ export const aiProviders = {
    *  (the API returns 502) otherwise. */
   test: (id: string) =>
     request<{ ok: boolean }>(`/api/ai/providers/${encodeURIComponent(id)}/test`, { method: 'POST' }),
+  /** The models the provider lists (its `/v1/models`, through the desktop's gateway): reaching it says it answers and takes the key. */
+  models: (id: string) =>
+    request<{ data?: Array<{ id: string }> }>(`/api/ai/providers/${encodeURIComponent(id)}/v1/models`).then((r) =>
+      (r?.data ?? []).map((m) => m.id).filter((m): m is string => typeof m === 'string' && m.trim() !== ''),
+    ),
 };
 
 // ----- updates -----
@@ -2243,14 +2248,21 @@ export const control = {
   },
 };
 
-/** What the Agent thinks with: the engine's language model, or ChatGPT (Codex's default model when `model` is left out). */
-export type AgentModelSource = 'engine' | 'chatgpt';
+/**
+ * What the Agent thinks with: the engine's language model, ChatGPT (Codex's default model when `model` is left out), or
+ * one of the AI providers (`provider`, by id, with its `model`: LM Studio, Ollama, an API key).
+ */
+export type AgentModelSource = 'engine' | 'chatgpt' | 'provider';
 export interface AgentModelPreference {
   source: AgentModelSource;
+  /** The AI provider's id, for `provider`. */
+  provider?: string | null;
   model?: string | null;
 }
 export interface AgentPreferences {
   model: AgentModelPreference;
+  /** The provider's name, beside a `provider` choice (the desktop's answer only). */
+  providerName?: string;
 }
 
 export const agentPreferences = {

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
-import { Check, Cpu, ExternalLink, Loader2, MessageSquare, RotateCcw, TriangleAlert, X } from 'lucide-react';
+import { Check, Cpu, ExternalLink, Loader2, MessageSquare, Plug, RotateCcw, TriangleAlert, X } from 'lucide-react';
+import { AgentProviderPicker, type ProviderPick } from './AgentProviderPicker';
 import ChatGptConnector from './ChatGptConnector';
 import {
   agentPreferences,
@@ -19,8 +20,8 @@ import { answered, errorText, usePoll } from './SetupParts';
 
 /**
  * Settings → Agent: what the Agent may change in OAIY (the switch), the model
- * it thinks with (the engine's, or ChatGPT with a model from Codex's
- * catalogue), and every change it made through the MCP API, newest first.
+ * it thinks with (the engine's, ChatGPT with a model from Codex's catalogue, or
+ * an AI provider's), and every change it made through the MCP API, newest first.
  *
  * Each part reads a route a desktop may not have yet; without it, the part
  * says so plainly (the switch shows as on, the log shows nothing yet).
@@ -54,6 +55,13 @@ function AgentModelSection({ onOpenEngines }: { onOpenEngines: () => void }) {
   const [error, setError] = useState<string | null>(null);
   const source = picked ?? prefs?.model.source ?? 'engine';
   const line = localModelLine(rec, catalog);
+  const onProvider = prefs?.model.source === 'provider' && prefs.model.provider && prefs.model.model ? prefs.model : null;
+  const providerPick: ProviderPick | null = onProvider ? { provider: onProvider.provider!, model: onProvider.model!, name: prefs?.providerName ?? onProvider.provider! } : null;
+  /** A provider and model chosen: the Agent's model, unless it is that already. */
+  const pickProvider = (p: ProviderPick) => {
+    if (providerPick && providerPick.provider === p.provider && providerPick.model === p.model) return;
+    void save({ model: { source: 'provider', provider: p.provider, model: p.model } });
+  };
 
   useEffect(() => {
     if (connected) void refreshModels();
@@ -76,7 +84,7 @@ function AgentModelSection({ onOpenEngines }: { onOpenEngines: () => void }) {
 
   const choose = (next: AgentModelSource) => {
     setPicked(next);
-    // ChatGPT is set once it is signed in (the Agent could not answer with it before).
+    // ChatGPT is set once it is signed in (the Agent could not answer with it before); a provider once it and a model are chosen.
     if (next === 'engine' && prefs?.model.source !== 'engine') void save({ model: { source: 'engine' } });
     if (next === 'chatgpt' && connected && prefs?.model.source !== 'chatgpt') void save({ model: { source: 'chatgpt' } });
   };
@@ -169,6 +177,23 @@ function AgentModelSection({ onOpenEngines }: { onOpenEngines: () => void }) {
                     }}
                   />
                 )}
+              </div>
+            )}
+          </div>
+          <div className={`ai-choice${source === 'provider' ? ' is-selected' : ''}`}>
+            <label className="ai-choice-head">
+              <input type="radio" name="agent-model" checked={source === 'provider'} disabled={saving} onChange={() => choose('provider')} />
+              <span className="setup-req-icon" aria-hidden>
+                <Plug size={16} />
+              </span>
+              <span className="ai-choice-text">
+                <strong>An AI provider</strong>
+                <small className="ai-choice-fact">{providerPick ? `${providerPick.name} · ${providerPick.model}` : 'LM Studio, Ollama, or an API key (OpenAI, OpenRouter, Gemini).'}</small>
+              </span>
+            </label>
+            {source === 'provider' && (
+              <div className="ai-choice-body">
+                <AgentProviderPicker value={providerPick} onPick={pickProvider} disabled={saving} />
               </div>
             )}
           </div>

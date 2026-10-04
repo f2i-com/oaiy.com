@@ -208,20 +208,26 @@
     "readOnlyHint": false,
     "title": "Choose the Agent's model"
    },
-   "description": "Choose what the Agent itself runs on: source engine (the model chosen in Engines) or chatgpt (the person's ChatGPT sign-in; model is optional, Codex's own default when left out). Live phone calls keep their own fast route either way.",
+   "description": "Choose what the Agent itself runs on: source engine (the model chosen in Engines), chatgpt (the person's ChatGPT sign-in; model is optional, Codex's own default when left out) or provider (one of the AI providers ai_sources_list shows, such as LM Studio or Ollama, by its id; an OpenAI-compatible one, since the Agent works with tool calls; model is optional, the provider's own when left out). Live phone calls keep their own fast route on ChatGPT.",
    "inputSchema": {
     "additionalProperties": false,
     "properties": {
      "model": {
-      "description": "chatgpt only: a model from Codex's catalogue.",
+      "description": "chatgpt: a model from Codex's catalogue; provider: a model the provider lists.",
+      "minLength": 1,
+      "type": "string"
+     },
+     "provider": {
+      "description": "provider only: the AI provider's id.",
       "minLength": 1,
       "type": "string"
      },
      "source": {
-      "description": "engine or chatgpt.",
+      "description": "engine, chatgpt or provider.",
       "enum": [
        "engine",
-       "chatgpt"
+       "chatgpt",
+       "provider"
       ],
       "type": "string"
      }

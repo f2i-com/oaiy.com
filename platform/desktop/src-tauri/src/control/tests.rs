@@ -480,7 +480,12 @@ async fn every_tool_runs_and_a_desktop_without_its_routes_is_explained() {
     let r = call(&app, None, "agent_model_set", json!({ "source": "chatgpt" })).await;
     assert!(is_error(&r) && text(&r).contains("no PUT /api/agent/preferences"), "{r}");
     let r = call(&app, None, "agent_model_set", json!({ "source": "engine", "model": "gpt-5.5" })).await;
-    assert!(is_error(&r) && text(&r).contains("chatgpt only"), "{r}");
+    assert!(is_error(&r) && text(&r).contains("model goes with chatgpt or provider"), "{r}");
+    // A provider is named by its id, and only with source provider.
+    let r = call(&app, None, "agent_model_set", json!({ "source": "provider" })).await;
+    assert!(is_error(&r) && text(&r).contains("name the provider"), "{r}");
+    let r = call(&app, None, "agent_model_set", json!({ "source": "chatgpt", "provider": "lm-studio" })).await;
+    assert!(is_error(&r) && text(&r).contains("provider goes with source provider only"), "{r}");
     // Headless: no dashboard to show a page in, said honestly.
     let r = call(&app, None, "ui_open", json!({ "view": "plugins" })).await;
     assert!(is_error(&r) && text(&r).contains("headless"), "{r}");

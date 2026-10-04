@@ -3,7 +3,9 @@
  * (`GET /api/agent/preferences`, set in its setup wizard and Settings →
  * Agent). `engine` is the model chosen in OAIY's Engines, reached as the app
  * always has (the OAIY provider that follows Engines); `chatgpt` is the
- * person's ChatGPT sign-in, through OAIY's Codex connector.
+ * person's ChatGPT sign-in, through OAIY's Codex connector; `provider` is one
+ * of the desktop's AI providers (LM Studio, Ollama, an API key), through its
+ * gateway, with the model chosen there.
  *
  * On ChatGPT a live phone call keeps its own route: one of the connector's
  * live-call aliases, which pins a fast model and effort (and still takes the
@@ -15,7 +17,10 @@ import { CHATGPT_SIGN_IN, signInNeeded } from '../agent/providers/chatgpt';
 import type { ProviderConfig } from '../agent/providers/types';
 
 /** The person's choice, as the desktop keeps it. */
-export type AgentModel = { source: 'engine' } | { source: 'chatgpt'; model?: string };
+export type AgentModel = { source: 'engine' } | { source: 'chatgpt'; model?: string } | ProviderChoice;
+
+/** One of the desktop's AI providers, by id, and the model the Agent runs on there (`name`: the provider's, as the desktop answers it beside the choice). */
+export type ProviderChoice = { source: 'provider'; provider: string; model: string; name?: string };
 
 export const ENGINE: AgentModel = { source: 'engine' };
 
@@ -39,13 +44,19 @@ type Send = (input: string, init: RequestInit) => Promise<Response>;
 const send: Send = (input, init) => fetch(input, init);
 const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 
-/** The choice in the desktop's answer (`{model: {source, model?}}`), or null when it is not one. */
+/** The choice in the desktop's answer (`{model: {source, provider?, model?}, providerName?}`), or null when it is not one. */
 export function parseAgentModel(body: unknown): AgentModel | null {
   const model = isRecord(body) ? body.model : null;
   if (!isRecord(model)) return null;
   if (model.source === 'engine') return ENGINE;
-  if (model.source !== 'chatgpt') return null;
   const name = typeof model.model === 'string' ? model.model.trim() : '';
+  if (model.source === 'provider') {
+    const provider = typeof model.provider === 'string' ? model.provider.trim() : '';
+    if (!provider || !name) return null;
+    const label = isRecord(body) && typeof body.providerName === 'string' ? body.providerName.trim() : '';
+    return label ? { source: 'provider', provider, model: name, name: label } : { source: 'provider', provider, model: name };
+  }
+  if (model.source !== 'chatgpt') return null;
   return name ? { source: 'chatgpt', model: name } : { source: 'chatgpt' };
 }
 
@@ -64,9 +75,12 @@ export async function readAgentModel(desktop: { origin: string; token: string },
   }
 }
 
-/** The same choice? */
+/** The same choice? (A provider renamed is the same one.) */
 export function sameModel(a: AgentModel, b: AgentModel): boolean {
-  return a.source === b.source && (a.source === 'engine' || a.model === (b as { model?: string }).model);
+  if (a.source !== b.source) return false;
+  if (a.source === 'engine') return true;
+  if (a.source === 'provider') return a.provider === (b as ProviderChoice).provider && a.model === (b as ProviderChoice).model;
+  return a.model === (b as { model?: string }).model;
 }
 
 /** The live-call alias for a call on ChatGPT: Luna's when the choice names Luna, else the default one. */
@@ -102,9 +116,31 @@ export function chatgptProvider(desktop: { origin: string; token: string }, kind
   };
 }
 
-/** The provider a conversation of `kind` runs on: the engine's (the app's own, as chosen in Settings) or ChatGPT's. */
+/**
+ * One of the desktop's AI providers, through its gateway (the same route as
+ * ChatGPT's, by the provider's id; the desktop's token is the key, and the
+ * desktop adds the provider's own). Every conversation, a call's too, runs on
+ * the model chosen for it.
+ */
+export function desktopProvider(desktop: { origin: string; token: string }, choice: ProviderChoice): ProviderConfig {
+  return {
+    id: `oaiy-provider-${choice.provider}`,
+    // As ChatGPT's: the desktop's gateway speaks OpenAI's API, whatever the server behind it is.
+    type: 'custom',
+    serverKind: 'other',
+    name: choice.name || choice.provider,
+    apiKey: desktop.token,
+    baseUrl: codexBase(desktop.origin, choice.provider),
+    modelId: choice.model,
+    // A local server (LM Studio, Ollama) answers one request at a time.
+    parallelAgents: 1,
+  };
+}
+
+/** The provider a conversation of `kind` runs on: the engine's (the app's own, as chosen in Settings), ChatGPT's, or a desktop AI provider's. */
 export function providerFor(kind: AgentKind, choice: AgentModel, engine: ProviderConfig | null, desktop: { origin: string; token: string } | null, codexDefault: string | null): ProviderConfig | null {
   if (choice.source === 'engine' || !desktop) return engine;
+  if (choice.source === 'provider') return desktopProvider(desktop, choice);
   return chatgptProvider(desktop, kind, choice.model ?? codexDefault);
 }
 

@@ -304,6 +304,9 @@ describe('the first-run wizard: the essentials, then the Agent or the rest by ha
     expect(aiReady({ catalog: chosen, prefs: { model: { source: 'engine' } }, codexConnected: false })).toBe(true);
     expect(aiReady({ catalog: chosen, prefs: { model: { source: 'chatgpt' } }, codexConnected: false })).toBe(false);
     expect(aiReady({ catalog: null, prefs: { model: { source: 'chatgpt', model: 'x' } }, codexConnected: true })).toBe(true);
+    // A provider with its model is ready; the engine's state and ChatGPT's do not matter to it.
+    expect(aiReady({ catalog: null, prefs: { model: { source: 'provider', provider: 'lm-studio', model: 'm' } }, codexConnected: false })).toBe(true);
+    expect(aiReady({ catalog: chosen, prefs: { model: { source: 'provider', provider: 'lm-studio' } }, codexConnected: true })).toBe(false);
     expect(stateOf({ state: state(), plugins: [], catalog: chosen, guide: noAi }, 'ai')).toBe('done');
     expect(stateOf({ state: state(), plugins: [], catalog: null, guide: { ...noAi, codexConnected: true }, prefs: { model: { source: 'chatgpt' } } }, 'ai')).toBe('done');
   });
@@ -409,6 +412,8 @@ describe('your AI: on this computer, or ChatGPT', () => {
   it('puts the recommended choice first and keeps the other', () => {
     expect(aiChoices(rec())).toEqual(['engine', 'chatgpt']);
     expect(aiChoices(rec({ recommend: 'chatgpt' }))).toEqual(['chatgpt', 'engine']);
+    // A provider last, where the desktop can keep it.
+    expect(aiChoices(rec({ recommend: 'chatgpt' }), true)).toEqual(['chatgpt', 'engine', 'provider']);
   });
 
   it('without a recommendation from the desktop: local if Engines has a model chosen, else ChatGPT', () => {
@@ -423,6 +428,7 @@ describe('your AI: on this computer, or ChatGPT', () => {
 
   it('opens on ChatGPT when the Agent uses it, on local when Engines has a model, else on the recommendation', () => {
     expect(initialAiChoice(rec({ recommend: 'engine' }), { model: { source: 'chatgpt' } }, catalog('M'))).toBe('chatgpt');
+    expect(initialAiChoice(rec({ recommend: 'engine' }), { model: { source: 'provider', provider: 'lm-studio', model: 'm' } }, catalog('M'))).toBe('provider');
     expect(initialAiChoice(rec({ recommend: 'chatgpt' }), { model: { source: 'engine' } }, catalog('M'))).toBe('engine');
     expect(initialAiChoice(rec({ recommend: 'chatgpt' }), null, catalog(null))).toBe('chatgpt');
     expect(initialAiChoice(rec({ recommend: 'engine' }), undefined, null)).toBe('engine');

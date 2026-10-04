@@ -561,6 +561,15 @@ details.setup-more-source > summary:hover { color: var(--text); }
 .ai-choices { display: flex; flex-direction: column; gap: 10px; }
 /* The wizard's two choices side by side, so both show; what the chosen one needs goes below. */
 .ai-choices.is-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: stretch; }
+/* With an AI provider, three; one above another where three do not fit. */
+.ai-choices.is-trio { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: stretch; }
+.ai-choices.is-trio .ai-choice-head > input[type='radio'] { margin-top: 3px; }
+@media (max-width: 980px) {
+  .ai-choices.is-trio { grid-template-columns: minmax(0, 1fr); }
+}
+.agent-provider { display: flex; max-width: 560px; flex-direction: column; gap: 10px; }
+.agent-provider-add { display: flex; flex-direction: column; gap: 8px; }
+.agent-provider-add .form-actions { margin: 0; }
 .ai-choice {
   border: 1px solid var(--border);
   border-radius: var(--r-card);

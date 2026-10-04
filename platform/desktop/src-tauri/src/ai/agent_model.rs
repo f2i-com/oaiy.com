@@ -6,10 +6,16 @@
 //!   ```json
 //!   { "model": { "source": "engine" } }
 //!   { "model": { "source": "chatgpt", "model": "gpt-5.5" } }
+//!   { "model": { "source": "provider", "provider": "lm-studio", "model": "qwen3.5-9b" } }
 //!   ```
 //!   `engine` (the default) is OAIY's own engine, answering with the model
 //!   chosen in Engines. `chatgpt` is the Codex connector's generic route; with
 //!   no `model` it runs Codex's own default (its catalogue's `isDefault`).
+//!   `provider` is one of the AI providers (LM Studio, Ollama, an API key),
+//!   reached through the desktop's gateway, with the model named or the one
+//!   the provider was set up with. The Agent's work is tool calls, which the
+//!   gateway relays to OpenAI-compatible providers only, so an Anthropic one
+//!   is refused here. A `GET` answers the provider's name beside the choice.
 //! - `GET /api/engines/recommendation`: whether the engine or ChatGPT suits
 //!   this computer, from what Engines already reports (its GPUs, the model
 //!   chosen there, its catalog's recommended language model) and whether
@@ -40,6 +46,8 @@ pub const FILE: &str = "agent.json";
 pub enum Source {
     Engine,
     Chatgpt,
+    /// One of the AI providers, by id.
+    Provider,
 }
 
 impl Source {
@@ -47,6 +55,7 @@ impl Source {
         match self {
             Source::Engine => "engine",
             Source::Chatgpt => "chatgpt",
+            Source::Provider => "provider",
         }
     }
 }
@@ -55,38 +64,61 @@ impl Source {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelChoice {
     pub source: Source,
-    /// ChatGPT's model; `None` is Codex's own default. Always `None` for the
-    /// engine, which answers with the model chosen in Engines.
+    /// ChatGPT's model, `None` being Codex's own default; or the provider's.
+    /// Always `None` for the engine, which answers with the model chosen in
+    /// Engines.
     pub model: Option<String>,
+    /// The AI provider's id, for `provider`; `None` for the others.
+    pub provider: Option<String>,
 }
 
 impl Default for ModelChoice {
     fn default() -> Self {
-        Self { source: Source::Engine, model: None }
+        Self { source: Source::Engine, model: None, provider: None }
     }
+}
+
+/// An AI provider's id as the provider store keeps them: lowercase letters, digits or dash, 1-64.
+fn provider_id(id: &str) -> bool {
+    (1..=64).contains(&id.len()) && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 impl ModelChoice {
     pub fn to_json(&self) -> Value {
         let mut m = json!({ "source": self.source.as_str() });
+        if let Some(provider) = &self.provider {
+            m["provider"] = json!(provider);
+        }
         if let Some(model) = &self.model {
             m["model"] = json!(model);
         }
         m
     }
 
-    /// Read `{source, model?}`, refusing anything else with a message that
-    /// names the fix (an MCP tool relays it to a model, which acts on it).
+    /// Read `{source, provider?, model?}`, refusing anything else with a
+    /// message that names the fix (an MCP tool relays it to a model, which
+    /// acts on it).
     pub fn parse(v: &Value) -> Result<Self, String> {
-        let obj = v.as_object().ok_or("`model` must be an object: { \"source\": \"engine\" | \"chatgpt\", \"model\"?: string }")?;
-        if let Some(key) = obj.keys().find(|k| *k != "source" && *k != "model") {
-            return Err(format!("`model.{key}` is not a setting: only `source` and `model` are"));
+        let obj = v.as_object().ok_or("`model` must be an object: { \"source\": \"engine\" | \"chatgpt\" | \"provider\", \"provider\"?: string, \"model\"?: string }")?;
+        if let Some(key) = obj.keys().find(|k| !matches!(k.as_str(), "source" | "model" | "provider")) {
+            return Err(format!("`model.{key}` is not a setting: only `source`, `provider` and `model` are"));
         }
         let source = match obj.get("source").and_then(Value::as_str) {
             Some("engine") => Source::Engine,
             Some("chatgpt") => Source::Chatgpt,
-            _ => return Err("`model.source` must be \"engine\" or \"chatgpt\"".into()),
+            Some("provider") => Source::Provider,
+            _ => return Err("`model.source` must be \"engine\", \"chatgpt\" or \"provider\"".into()),
         };
+        let provider = match obj.get("provider") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) if provider_id(s.trim()) => Some(s.trim().to_string()),
+            Some(_) => return Err("`model.provider` must be an AI provider's id (lowercase letters, digits or dash)".into()),
+        };
+        match (source, &provider) {
+            (Source::Provider, None) => return Err("`model.provider` is missing: name the AI provider (its id in AI providers)".into()),
+            (Source::Engine | Source::Chatgpt, Some(_)) => return Err("`model.provider` goes with \"provider\" only".into()),
+            _ => {}
+        }
         let model = match obj.get("model") {
             None | Some(Value::Null) => None,
             Some(Value::String(s)) => {
@@ -104,7 +136,33 @@ impl ModelChoice {
         if source == Source::Engine && model.is_some() {
             return Err("the engine answers with the model chosen in Engines: choose it there (model_set_default for the llm group), and send no `model` with \"engine\"".into());
         }
-        Ok(Self { source, model })
+        Ok(Self { source, model, provider })
+    }
+
+    /// A `provider` choice checked against the AI providers: there, on, able to
+    /// chat, and OpenAI-compatible (the Agent's tool calls are relayed to those
+    /// only). With no model named, the one the provider was set up with. Other
+    /// choices are as they are.
+    pub fn against(self, providers: &super::providers::ProviderStore) -> Result<Self, String> {
+        let Some(id) = self.provider.clone().filter(|_| self.source == Source::Provider) else { return Ok(self) };
+        let p = providers.get_full(&id).ok_or_else(|| format!("there is no AI provider {id}: add it in AI providers first"))?;
+        if !p.enabled {
+            return Err(format!("the AI provider {} is turned off: turn it on in AI providers", p.name));
+        }
+        if !p.supports(super::providers::Capability::Chat) {
+            return Err(format!("the AI provider {} is not set up for chat", p.name));
+        }
+        if p.protocol != super::providers::Protocol::OpenAi {
+            return Err(format!(
+                "the Agent works with tool calls, which OAIY relays to OpenAI-compatible providers only (LM Studio, Ollama, OpenAI, OpenRouter and the like); {} speaks Anthropic's API, which flows can use but the Agent cannot yet",
+                p.name
+            ));
+        }
+        let model = self.model.or_else(|| p.model.clone().map(|m| m.trim().to_string()).filter(|m| !m.is_empty()));
+        if model.is_none() {
+            return Err(format!("name the model for the Agent to use on {}: one its model list offers", p.name));
+        }
+        Ok(Self { model, ..self })
     }
 }
 
@@ -169,36 +227,51 @@ impl Store {
     }
 }
 
-/// `{ "model": {…} }`, as both routes answer.
-fn preferences(store: &Store) -> Value {
-    json!({ "model": store.model().to_json() })
+/// `{ "model": {…} }`, as both routes answer; on a provider, its name beside it
+/// (`providerName`, for what the Agent shows), when it is still there.
+fn preferences(prefs: &Prefs) -> Value {
+    let model = prefs.store.model();
+    let mut answer = json!({ "model": model.to_json() });
+    if let Some(id) = model.provider.as_deref() {
+        if let Some(p) = prefs.providers.lock().unwrap_or_else(|e| e.into_inner()).get_full(id) {
+            answer["providerName"] = json!(p.name);
+        }
+    }
+    answer
 }
 
 /// The routes: the preference, and the recommendation.
 pub fn router(state: AiState) -> Router {
     let data_dir = state.registry.lock().unwrap_or_else(|e| e.into_inner()).data_dir().to_path_buf();
     let store = Arc::new(Store::open(&data_dir));
-    preferences_router(store).merge(
+    preferences_router(Prefs { store, providers: state.providers.clone() }).merge(
         Router::new()
             .route("/api/engines/recommendation", get(recommendation))
             .with_state(Recommend { codex: state.codex, data_dir }),
     )
 }
 
-fn preferences_router(store: Arc<Store>) -> Router {
+/// The preference and the AI providers a `provider` choice names.
+#[derive(Clone)]
+struct Prefs {
+    store: Arc<Store>,
+    providers: super::providers::ProviderStoreHandle,
+}
+
+fn preferences_router(prefs: Prefs) -> Router {
     Router::new()
         .route("/api/agent/preferences", get(get_preferences).put(put_preferences))
-        .with_state(store)
+        .with_state(prefs)
 }
 
-async fn get_preferences(State(store): State<Arc<Store>>) -> Response {
-    Json(preferences(&store)).into_response()
+async fn get_preferences(State(prefs): State<Prefs>) -> Response {
+    Json(preferences(&prefs)).into_response()
 }
 
-async fn put_preferences(State(store): State<Arc<Store>>, body: Option<Json<Value>>) -> Response {
+async fn put_preferences(State(prefs): State<Prefs>, body: Option<Json<Value>>) -> Response {
     let bad = |m: String| ai_error(StatusCode::BAD_REQUEST, "invalid_request", m);
     let Some(Json(body)) = body else {
-        return bad("send JSON: { \"model\": { \"source\": \"engine\" | \"chatgpt\", \"model\"?: string } }".into());
+        return bad("send JSON: { \"model\": { \"source\": \"engine\" | \"chatgpt\" | \"provider\", \"provider\"?: string, \"model\"?: string } }".into());
     };
     let Some(obj) = body.as_object() else {
         return bad("send an object: { \"model\": { … } }".into());
@@ -209,13 +282,13 @@ async fn put_preferences(State(store): State<Arc<Store>>, body: Option<Json<Valu
     let Some(model) = obj.get("model") else {
         return bad("`model` is missing: { \"model\": { \"source\": \"engine\" | \"chatgpt\" } }".into());
     };
-    let choice = match ModelChoice::parse(model) {
+    let choice = match ModelChoice::parse(model).and_then(|c| c.against(&prefs.providers.lock().unwrap_or_else(|e| e.into_inner()))) {
         Ok(c) => c,
         Err(e) => return bad(e),
     };
-    let saving = store.clone();
+    let saving = prefs.store.clone();
     match tokio::task::spawn_blocking(move || saving.set_model(&choice)).await {
-        Ok(Ok(())) => Json(preferences(&store)).into_response(),
+        Ok(Ok(())) => Json(preferences(&prefs)).into_response(),
         Ok(Err(e)) => ai_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e),
         Err(e) => ai_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     }
@@ -433,7 +506,7 @@ mod tests {
         assert_eq!(ModelChoice::parse(&json!({ "source": "engine" })).unwrap(), ModelChoice::default());
         assert_eq!(
             ModelChoice::parse(&json!({ "source": "chatgpt", "model": " gpt-5.5 " })).unwrap(),
-            ModelChoice { source: Source::Chatgpt, model: Some("gpt-5.5".into()) }
+            ModelChoice { source: Source::Chatgpt, model: Some("gpt-5.5".into()), provider: None }
         );
         // No model is ChatGPT's own default; null says the same.
         for v in [json!({ "source": "chatgpt" }), json!({ "source": "chatgpt", "model": null })] {
@@ -452,11 +525,57 @@ mod tests {
             json!({ "source": "chatgpt", "effort": "high" }),
             // The engine's model is the one chosen in Engines, never one named here.
             json!({ "source": "engine", "model": "qwen3.5-9b" }),
+            // A provider is named by its id, and only with "provider".
+            json!({ "source": "provider" }),
+            json!({ "source": "provider", "provider": "LM Studio" }),
+            json!({ "source": "provider", "provider": 3 }),
+            json!({ "source": "chatgpt", "provider": "lm-studio" }),
+            json!({ "source": "engine", "provider": "lm-studio" }),
         ] {
             assert!(ModelChoice::parse(&bad).is_err(), "{bad}");
         }
         let why = ModelChoice::parse(&json!({ "source": "engine", "model": "m" })).unwrap_err();
         assert!(why.contains("model_set_default"), "the refusal names the fix: {why}");
+        // A provider, with its model or (until it is checked against the providers) without one.
+        let lm = ModelChoice::parse(&json!({ "source": "provider", "provider": "lm-studio", "model": "qwen3.5-9b" })).unwrap();
+        assert_eq!(lm, ModelChoice { source: Source::Provider, model: Some("qwen3.5-9b".into()), provider: Some("lm-studio".into()) });
+        assert_eq!(lm.to_json(), json!({ "source": "provider", "provider": "lm-studio", "model": "qwen3.5-9b" }));
+        assert_eq!(ModelChoice::parse(&json!({ "source": "provider", "provider": "ollama" })).unwrap().model, None);
+    }
+
+    fn provider(id: &str, protocol: super::super::providers::Protocol, model: Option<&str>, enabled: bool) -> super::super::providers::AiProviderInput {
+        serde_json::from_value(json!({
+            "id": id, "name": format!("{id} server"), "protocol": protocol, "baseUrl": "http://localhost:1234/v1",
+            "model": model, "enabled": enabled, "allowLocal": true,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_provider_choice_is_checked_against_the_ai_providers() {
+        use super::super::providers::{ProviderStore, Protocol};
+        let mut store = ProviderStore::new();
+        store.upsert(provider("lm-studio", Protocol::OpenAi, Some("qwen3.5-9b"), true)).unwrap();
+        store.upsert(provider("bare", Protocol::OpenAi, None, true)).unwrap();
+        store.upsert(provider("off", Protocol::OpenAi, Some("m"), false)).unwrap();
+        store.upsert(provider("claude", Protocol::Anthropic, Some("claude-sonnet"), true)).unwrap();
+        let choose = |id: &str, model: Option<&str>| {
+            let mut v = json!({ "source": "provider", "provider": id });
+            if let Some(m) = model {
+                v["model"] = json!(m);
+            }
+            ModelChoice::parse(&v).unwrap().against(&store)
+        };
+        // The model named, or the provider's own.
+        assert_eq!(choose("lm-studio", Some("gemma-4")).unwrap().model.as_deref(), Some("gemma-4"));
+        assert_eq!(choose("lm-studio", None).unwrap().model.as_deref(), Some("qwen3.5-9b"));
+        assert!(choose("bare", None).unwrap_err().contains("name the model"));
+        assert!(choose("gone", Some("m")).unwrap_err().contains("there is no AI provider gone"));
+        assert!(choose("off", None).unwrap_err().contains("turned off"));
+        let anthropic = choose("claude", None).unwrap_err();
+        assert!(anthropic.contains("OpenAI-compatible") && anthropic.contains("tool calls"), "{anthropic}");
+        // The others need no provider.
+        assert_eq!(ModelChoice::default().against(&store).unwrap(), ModelChoice::default());
     }
 
     #[test]
@@ -464,7 +583,7 @@ mod tests {
         let dir = Scratch::new("store");
         let store = Store::open(&dir.0);
         assert_eq!(store.model(), ModelChoice::default(), "no file: the engine");
-        let chatgpt = ModelChoice { source: Source::Chatgpt, model: Some("gpt-5.5".into()) };
+        let chatgpt = ModelChoice { source: Source::Chatgpt, model: Some("gpt-5.5".into()), provider: None };
         store.set_model(&chatgpt).unwrap();
         assert_eq!(Store::open(&dir.0).model(), chatgpt, "kept across a restart");
         let on_disk: Value = serde_json::from_str(&std::fs::read_to_string(dir.0.join(FILE)).unwrap()).unwrap();
@@ -473,7 +592,7 @@ mod tests {
 
         // Whatever else the file holds is kept.
         std::fs::write(dir.0.join(FILE), "\u{feff}{\"later\":{\"x\":1},\"model\":{\"source\":\"chatgpt\"}}").unwrap();
-        assert_eq!(store.model(), ModelChoice { source: Source::Chatgpt, model: None }, "a byte-order mark is read through");
+        assert_eq!(store.model(), ModelChoice { source: Source::Chatgpt, model: None, provider: None }, "a byte-order mark is read through");
         store.set_model(&ModelChoice::default()).unwrap();
         let on_disk: Value = serde_json::from_str(&std::fs::read_to_string(dir.0.join(FILE)).unwrap()).unwrap();
         assert_eq!(on_disk, json!({ "later": { "x": 1 }, "model": { "source": "engine" } }));
@@ -494,7 +613,9 @@ mod tests {
     #[tokio::test]
     async fn the_preference_round_trips_over_http() {
         let dir = Scratch::new("http");
-        let (base, server) = serve(preferences_router(Arc::new(Store::open(&dir.0)))).await;
+        let providers = super::super::providers::new_handle();
+        providers.lock().unwrap().upsert(provider("lm-studio", super::super::providers::Protocol::OpenAi, Some("qwen3.5-9b"), true)).unwrap();
+        let (base, server) = serve(preferences_router(Prefs { store: Arc::new(Store::open(&dir.0)), providers })).await;
         let url = format!("{base}/api/agent/preferences");
         let http = reqwest::Client::new();
 
@@ -524,6 +645,15 @@ mod tests {
         // A refused change changes nothing.
         let v: Value = http.get(&url).send().await.unwrap().json().await.unwrap();
         assert_eq!(v, json!({ "model": { "source": "chatgpt", "model": "gpt-5.5" } }));
+
+        // A provider: kept with the model it was set up with, and answered with its name.
+        let lm = http.put(&url).json(&json!({ "model": { "source": "provider", "provider": "lm-studio" } })).send().await.unwrap();
+        assert_eq!(lm.status(), 200);
+        let lm = json!({ "model": { "source": "provider", "provider": "lm-studio", "model": "qwen3.5-9b" }, "providerName": "lm-studio server" });
+        assert_eq!(http.get(&url).send().await.unwrap().json::<Value>().await.unwrap(), lm);
+        let gone = http.put(&url).json(&json!({ "model": { "source": "provider", "provider": "gone", "model": "m" } })).send().await.unwrap();
+        assert_eq!(gone.status(), 400);
+        assert_eq!(http.get(&url).send().await.unwrap().json::<Value>().await.unwrap(), lm, "a refused provider changes nothing");
 
         let back = http.put(&url).json(&json!({ "model": { "source": "engine" } })).send().await.unwrap();
         assert_eq!(back.json::<Value>().await.unwrap(), json!({ "model": { "source": "engine" } }));

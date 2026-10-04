@@ -1696,7 +1696,14 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     if (lookUp && next.source === 'chatgpt' && !next.model && !codexDefault) await lookUpCodexDefault(AbortSignal.timeout(10_000)).catch(() => {});
     if (!changed) return;
     renderChips();
-    if (announce) chat.system(next.source === 'chatgpt' ? `The Agent now runs on ChatGPT${next.model ?? codexDefault ? ` (${next.model ?? codexDefault})` : ''}, as chosen in OAIY. Calls use a fast ChatGPT route of their own.` : "The Agent now runs on OAIY's engine, as chosen in OAIY.");
+    if (announce)
+      chat.system(
+        next.source === 'chatgpt'
+          ? `The Agent now runs on ChatGPT${next.model ?? codexDefault ? ` (${next.model ?? codexDefault})` : ''}, as chosen in OAIY. Calls use a fast ChatGPT route of their own.`
+          : next.source === 'provider'
+            ? `The Agent now runs on ${next.name || next.provider} (${next.model}), as chosen in OAIY.`
+            : "The Agent now runs on OAIY's engine, as chosen in OAIY.",
+      );
   }
   // The Agent's model is looked at again every minute (it may be changed in OAIY at any time).
   setInterval(() => void followAgentModel(), 60_000);

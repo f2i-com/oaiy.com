@@ -129,10 +129,11 @@ pub(crate) fn defs() -> &'static [ToolDef] {
                 "The AI sources flows and the Agent can use: OAIY's engine, configured providers and local AI services, ChatGPT (signed in or not, and as whom), and the Agent's own model preference.",
                 none()),
             def("agent_model_set", "Choose the Agent's model", Change,
-                "Choose what the Agent itself runs on: source engine (the model chosen in Engines) or chatgpt (the person's ChatGPT sign-in; model is optional, Codex's own default when left out). Live phone calls keep their own fast route either way.",
+                "Choose what the Agent itself runs on: source engine (the model chosen in Engines), chatgpt (the person's ChatGPT sign-in; model is optional, Codex's own default when left out) or provider (one of the AI providers ai_sources_list shows, such as LM Studio or Ollama, by its id; an OpenAI-compatible one, since the Agent works with tool calls; model is optional, the provider's own when left out). Live phone calls keep their own fast route on ChatGPT.",
                 object(json!({
-                    "source": { "type": "string", "enum": ["engine", "chatgpt"], "description": "engine or chatgpt." },
-                    "model": { "type": "string", "minLength": 1, "description": "chatgpt only: a model from Codex's catalogue." }
+                    "source": { "type": "string", "enum": ["engine", "chatgpt", "provider"], "description": "engine, chatgpt or provider." },
+                    "provider": { "type": "string", "minLength": 1, "description": "provider only: the AI provider's id." },
+                    "model": { "type": "string", "minLength": 1, "description": "chatgpt: a model from Codex's catalogue; provider: a model the provider lists." }
                 }), &["source"])),
             def("chatgpt_sign_in", "Sign in to ChatGPT", Change,
                 "Start signing OAIY in to ChatGPT (its Codex connector). Answers the address for the person to open and sign in at (with deviceCode, a code for them to type instead); ai_sources_list shows when they have.",
@@ -515,10 +516,20 @@ async fn run(d: &Desk, control: &Control, name: &str, a: &Args<'_>) -> Result<Do
         "agent_model_set" => {
             let source = a.req("source");
             let model = a.str("model");
+            let provider = a.str("provider");
             if source == "engine" && model.is_some() {
-                return Err("model goes with chatgpt only: on the engine the Agent uses the model chosen in Engines (model_set_default for llm).".into());
+                return Err("model goes with chatgpt or provider: on the engine the Agent uses the model chosen in Engines (model_set_default for llm).".into());
+            }
+            if source != "provider" && provider.is_some() {
+                return Err("provider goes with source provider only.".into());
+            }
+            if source == "provider" && provider.is_none() {
+                return Err("name the provider: its id, as ai_sources_list shows it.".into());
             }
             let mut pref = json!({ "source": source });
+            if let Some(p) = provider {
+                pref["provider"] = json!(p);
+            }
             if let Some(m) = model {
                 pref["model"] = json!(m);
             }
@@ -526,6 +537,11 @@ async fn run(d: &Desk, control: &Control, name: &str, a: &Args<'_>) -> Result<Do
             let on = match (source, model) {
                 ("chatgpt", Some(m)) => format!("ChatGPT ({m})"),
                 ("chatgpt", None) => "ChatGPT (Codex's default model)".to_string(),
+                ("provider", _) => {
+                    let name = v.get("providerName").and_then(Value::as_str).or(provider).unwrap_or("the provider");
+                    let model = v.pointer("/model/model").and_then(Value::as_str).unwrap_or("its model");
+                    format!("{name} ({model})")
+                }
                 _ => "the engine (the model chosen in Engines)".to_string(),
             };
             done(format!("The Agent now runs on {on}."), v)

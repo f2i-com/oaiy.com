@@ -1,5 +1,6 @@
 import { useState, type ReactNode } from 'react';
-import { Bot, Check, Cpu, MessageSquare, Puzzle, ShieldCheck, Sparkles, TriangleAlert } from 'lucide-react';
+import { Bot, Check, Cpu, MessageSquare, Plug, Puzzle, ShieldCheck, Sparkles, TriangleAlert } from 'lucide-react';
+import { AgentProviderPicker, type ProviderPick } from './AgentProviderPicker';
 import ChatGptConnector from './ChatGptConnector';
 import { bridge, nodeRuntime, type AgentModelSource, type CodexStatus, type EngineCatalog, type EngineRecommendation } from './api';
 import { AgentMaySwitch, type ControlSwitch } from './AgentAccess';
@@ -8,8 +9,9 @@ import { EngineModelCard, StepHeader, usePoll } from './SetupParts';
 
 /**
  * The first-run wizard's essentials: welcome, the Agent's AI (on this
- * computer, or ChatGPT), what the Agent may change, and the hand-off to the
- * Agent, which sets up the rest with the person in a chat.
+ * computer, ChatGPT, or an AI provider such as LM Studio), what the Agent may
+ * change, and the hand-off to the Agent, which sets up the rest with the
+ * person in a chat.
  */
 
 export function WelcomeStep({ kicker }: { kicker: string }) {
@@ -17,7 +19,7 @@ export function WelcomeStep({ kicker }: { kicker: string }) {
   const [installing, setInstalling] = useState(false);
   const node = runtime?.nodeRuntime;
   const parts: Array<{ icon: ReactNode; title: string; text: string }> = [
-    { icon: <Sparkles size={17} />, title: 'Your AI', text: 'What the Agent thinks with: a language model on this computer, or your ChatGPT account.' },
+    { icon: <Sparkles size={17} />, title: 'Your AI', text: 'What the Agent thinks with: a language model on this computer, your ChatGPT account, or a provider such as LM Studio.' },
     { icon: <Bot size={17} />, title: 'The Agent', text: 'Your assistant in OAIY. You choose whether it may set up and change OAIY for you.' },
     { icon: <Puzzle size={17} />, title: 'The rest, with the Agent', text: 'Plugins such as the AI receptionist, your phone, your business hours and your apps: the Agent sets them up with you in a chat.' },
   ];
@@ -85,6 +87,8 @@ export function YourAiStep({
   onCatalogChanged,
   onSignedIn,
   onOpenEngines,
+  providerPick,
+  onProviderPick,
 }: {
   kicker: string;
   state: FirstRunStep['state'];
@@ -97,6 +101,10 @@ export function YourAiStep({
   onCatalogChanged: () => void;
   onSignedIn: (s: CodexStatus) => void;
   onOpenEngines: () => void;
+  /** The provider and model chosen here, or the ones the Agent is on. */
+  providerPick?: ProviderPick | null;
+  /** Given, the provider is a choice (a desktop that keeps the Agent's model). */
+  onProviderPick?: (p: ProviderPick) => void;
 }) {
   const line = localModelLine(rec, catalog);
   const gpus = rec?.local.gpus ?? [];
@@ -105,7 +113,7 @@ export function YourAiStep({
       kicker={kicker}
       title="Your AI"
       state={state}
-      description="What the Agent thinks with: a language model on this computer, or your ChatGPT account. You can change it any time in Settings → Agent."
+      description={`What the Agent thinks with: a language model on this computer, your ChatGPT account${onProviderPick ? ', or an AI provider such as LM Studio' : ''}. You can change it any time in Settings → Agent.`}
     />
   );
   if (!rec) {
@@ -120,6 +128,28 @@ export function YourAiStep({
   const option = (source: AgentModelSource): ReactNode => {
     const selected = choice === source;
     const recommended = rec.recommend === source;
+    if (source === 'provider') {
+      return (
+        <label key={source} className={`ai-choice ai-choice-head${selected ? ' is-selected' : ''}`}>
+          <input type="radio" name="ai-source" value={source} checked={selected} onChange={() => onChoose(source)} />
+          <span className="ai-choice-text">
+            <strong>
+              <span className="ai-choice-icon" aria-hidden>
+                <Plug size={15} />
+              </span>
+              An AI provider
+              {providerPick && (
+                <span className="badge badge-ok">
+                  <Check size={11} strokeWidth={2.6} /> Ready
+                </span>
+              )}
+            </strong>
+            <small>LM Studio or Ollama on this computer, or an API key (OpenAI, OpenRouter, Gemini): the models you already run or pay for. Keys stay on this computer.</small>
+            {providerPick && <small className="ai-choice-fact">{`${providerPick.name} · ${providerPick.model}`}</small>}
+          </span>
+        </label>
+      );
+    }
     const local = source === 'engine';
     const ready = local ? line.kind === 'chosen' : codex?.connected === true;
     return (
@@ -155,8 +185,8 @@ export function YourAiStep({
   return (
     <>
       {head}
-      <div className="ai-choices is-pair" role="radiogroup" aria-label="What the Agent thinks with">
-        {aiChoices(rec).map(option)}
+      <div className={`ai-choices ${onProviderPick ? 'is-trio' : 'is-pair'}`} role="radiogroup" aria-label="What the Agent thinks with">
+        {aiChoices(rec, !!onProviderPick).map(option)}
       </div>
       {choice === 'engine' && (
         <div className="setup-reqs">
@@ -168,6 +198,13 @@ export function YourAiStep({
             onOpenEngines={onOpenEngines}
             why="The Agent uses the language model chosen in Engines, whatever it is."
           />
+        </div>
+      )}
+      {choice === 'provider' && onProviderPick && (
+        <div className="setup-req ai-provider">
+          <div className="setup-req-body">
+            <AgentProviderPicker value={providerPick ?? null} onPick={onProviderPick} />
+          </div>
         </div>
       )}
       {choice === 'chatgpt' && (

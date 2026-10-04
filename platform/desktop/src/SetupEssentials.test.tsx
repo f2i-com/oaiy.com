@@ -20,6 +20,8 @@ const m = vi.hoisted(() => ({
   setupGet: vi.fn(),
   putFirstRun: vi.fn(),
   push: vi.fn(),
+  providers: vi.fn(),
+  providerModels: vi.fn(),
 }));
 
 vi.mock('./api', async (importOriginal) => {
@@ -36,6 +38,7 @@ vi.mock('./api', async (importOriginal) => {
     plugins: { ...real.plugins, list: vi.fn().mockResolvedValue({ root: 'x', plugins: [] }) },
     bridge: { ...real.bridge, status: vi.fn().mockResolvedValue({ ready: true, flowRuntime: { cliResolved: true, cliKind: 'node' } }) },
     setup: { ...real.setup, get: m.setupGet, putFirstRun: m.putFirstRun, catalog: vi.fn().mockResolvedValue({ plugins: [] }), check: vi.fn() },
+    aiProviders: { ...real.aiProviders, list: m.providers, models: m.providerModels },
   };
 });
 vi.mock('./Toasts', () => ({ useToast: () => ({ push: m.push }) }));
@@ -115,6 +118,8 @@ afterEach(() => {
 describe('first run, on a desktop without the new routes', () => {
   it('is the essentials only, and falls back to ChatGPT first when Engines has nothing chosen', async () => {
     await render();
+    // A desktop that keeps no Agent model cannot keep a provider as one: two choices.
+    expect(host.querySelector('.ai-choices.is-trio')).toBeNull();
     expect(rail()).toEqual(['Welcome', 'Your AI', 'The Agent', 'Continue with the Agent']);
     expect(heading()).toBe('Welcome to OAIY');
     await click(button('Get started'));
@@ -201,6 +206,27 @@ describe('first run, with the desktop’s new routes', () => {
     m.controlGet.mockResolvedValue({ agentMayChange: true });
     m.controlSet.mockImplementation(async (s: unknown) => s);
     m.codexStatus.mockResolvedValue({ available: true, connected: true, email: 'owner@example.com' });
+  });
+
+  it('offers an AI provider as a third choice, and sets the Agent to its model on Next', async () => {
+    m.setupGet.mockResolvedValue(record({ position: 'ai' }));
+    m.providers.mockResolvedValue({
+      providers: [{ id: 'lm-studio', name: 'LM Studio', protocol: 'openai', baseUrl: 'http://localhost:1234/v1', capabilities: [], enabled: true, allowLocal: true, hasKey: false }],
+    });
+    m.providerModels.mockResolvedValue(['qwen3.5-9b']);
+    await render();
+    expect(choices()).toHaveLength(3);
+    expect(choices()[2].textContent).toContain('An AI provider');
+    expect(host.querySelector('.ai-choices.is-trio')).toBeTruthy();
+    await click(choices()[2].querySelector('input'));
+    // The picker below: LM Studio, set up already, on the model it lists.
+    expect(host.querySelector('.ai-provider')).toBeTruthy();
+    expect(m.providerModels).toHaveBeenCalledWith('lm-studio');
+    expect(choices()[2].textContent).toContain('LM Studio · qwen3.5-9b');
+    expect(button('Next')!.disabled).toBe(false);
+    await click(button('Next'));
+    expect(m.prefsSet).toHaveBeenCalledWith({ model: { source: 'provider', provider: 'lm-studio', model: 'qwen3.5-9b' } });
+    expect(heading()).toBe('The Agent');
   });
 
   it('orders by the recommendation, says why, and sets the Agent to ChatGPT on Next', async () => {
