@@ -16,11 +16,46 @@
 //!   the chosen tokens.
 //!
 //! The Gated DeltaNet's output gate is `sigmoid(z)` here (Qwen3.5's is `silu(z)`).
+//!
+//! On CUDA (`load_with_adapters`) the layers split over the cards, PEFT adapters applied, and a decode step runs as
+//! a graph per card. Without CUDA (`load_portable`) every EXL3 matrix, the experts' too, is whatever the caller makes
+//! of it (on any GPU through WebGPU, else decoded on the CPU: `ggml_rs_wgpu::exl3`), on one backend, uncaptured.
 use crate::lora::{adapted, stacked, Adapter, Base, Part, VHeads};
 use crate::orcasaq::{inverse, tokenizer, value_map};
 use dsv41::safetensors::{Dtype, StIndex};
-use ggml_rs::{exl3::Exl3Data, tensor::round_f16, Backend, Tensor};
+use ggml_rs::{exl3::{Exl3Data, Experts, PackedLinear}, Backend, Tensor};
+use ggml_rs::tensor::round_f16;
+#[cfg(feature = "cuda")]
 use ggml_rs_cuda::{exl3::{Exl3Experts, Exl3Matrix, HalfMatrix}, CudaBackend};
+
+/// The CUDA cards a decode step is captured on, as graphs.
+#[cfg(feature = "cuda")]
+pub type Card = CudaBackend;
+/// A build without CUDA has no cards to capture on: nothing asks it to (`graphs_enabled` is false).
+#[cfg(not(feature = "cuda"))]
+pub type Card = NoCard;
+
+#[cfg(not(feature = "cuda"))]
+pub struct NoCard;
+#[cfg(not(feature = "cuda"))]
+impl NoCard {
+    fn graph_begin(&self) -> bool {
+        false
+    }
+    fn graph_end(&self) {}
+    fn graph_finish(&self) {}
+    fn graph_launch(&self) {}
+    fn device_address(&self, _: &Tensor) -> u64 {
+        0
+    }
+    fn write_at(&self, _: u64, _: &[f32]) {}
+    fn prime_rope_positions(&self, _: &[u32]) {}
+}
+
+/// Makes an EXL3 matrix on a device (by its index): packed on the card, or as a portable build places it.
+pub type Packer<'a> = &'a (dyn Fn(usize) -> Box<dyn Fn(Exl3Data) -> std::result::Result<Arc<dyn PackedLinear>, String> + Send + Sync + 'a> + Sync);
+/// Makes a layer's experts (the shared one last) on a device, given the layer's MLP prefix (for its adapters).
+pub type ExpertMaker<'a> = &'a (dyn Fn(usize, &str, Vec<[Exl3Data; 3]>) -> Result<Box<dyn Experts>> + Sync);
 use llama_rs::{
     loader::Weight,
     KvCache,
@@ -208,8 +243,9 @@ enum Mixer {
 struct Moe {
     /// The router, then the shared expert's gate: `[routed + 1, hidden]`.
     router: Weight,
-    /// The routed experts, then the shared one, stacked: the MoE runs on the GPU in a few launches.
-    experts: Exl3Experts,
+    /// The routed experts, then the shared one: on CUDA stacked, the MoE in a few launches; elsewhere batched a
+    /// layer at a time.
+    experts: Box<dyn Experts>,
 }
 
 struct Layer {
@@ -367,8 +403,8 @@ pub struct FlashNext {
     collapse: HyperMix,
     head: Weight,
     pub devices: Vec<Arc<dyn Backend>>,
-    /// The same GPUs, for what uploads EXL3 matrices (the vision tower).
-    pub cudas: Vec<Arc<CudaBackend>>,
+    /// The same GPUs, for what uploads EXL3 matrices (the vision tower) and the decode graphs; none without CUDA.
+    pub cudas: Vec<Arc<Card>>,
     /// Whether a decode step has run (uncaptured), making the scratch its matrices keep.
     decoded: std::sync::atomic::AtomicBool,
 }
@@ -377,14 +413,19 @@ pub struct FlashNext {
 /// channels optionally reordered.
 /// A dense `rows x cols` matrix: kept as f16 (half the memory and reading) when every value is
 /// one, as the checkpoint's f16 weights are; f32 otherwise.
-fn half_or_dense(backend: &Arc<CudaBackend>, values: Vec<f32>, rows: usize, cols: usize) -> Weight {
-    if cols % 2 == 0 && values.iter().all(|&v| ggml_rs::tensor::round_f16(v) == v) {
-        Weight::Packed(Arc::new(HalfMatrix::upload(backend.clone(), &values, rows, cols)))
-    } else {
-        Weight::Dense(backend.to_device(Tensor::from_vec(values, vec![rows, cols])))
+/// Without a card, f32 on `backend`.
+fn half_or_dense(card: Option<&Arc<Card>>, backend: &Arc<dyn Backend>, values: Vec<f32>, rows: usize, cols: usize) -> Weight {
+    #[cfg(feature = "cuda")]
+    if let Some(card) = card {
+        if cols % 2 == 0 && values.iter().all(|&v| round_f16(v) == v) {
+            return Weight::Packed(Arc::new(HalfMatrix::upload(card.clone(), &values, rows, cols)));
+        }
     }
+    let _ = card;
+    Weight::Dense(backend.to_device(Tensor::from_vec(values, vec![rows, cols])))
 }
 
+#[cfg(feature = "cuda")]
 pub(crate) fn exl3_weight(idx: &StIndex, backend: &Arc<CudaBackend>, name: &str, k: usize, n: usize, input: Option<Vec<u32>>, output: Option<Vec<u32>>) -> Result<Weight> {
     let data = exl3_data(idx, name, k, n, input, output)?;
     Ok(Weight::Packed(Arc::new(Exl3Matrix::upload(backend.clone(), data).map_err(bad)?)))
@@ -420,9 +461,13 @@ fn exl3_data(idx: &StIndex, name: &str, k: usize, n: usize, input: Option<Vec<u3
 
 struct Loader<'a> {
     idx: &'a StIndex,
-    backend: Arc<CudaBackend>,
+    backend: Arc<dyn Backend>,
+    /// The device's CUDA card (none without CUDA).
+    card: Option<Arc<Card>>,
     /// LoRA adapters, applied together.
     lora: &'a [Adapter],
+    /// Makes this device's EXL3 matrices.
+    packed: Box<dyn Fn(Exl3Data) -> std::result::Result<Arc<dyn PackedLinear>, String> + Send + Sync + 'a>,
 }
 
 impl Loader<'_> {
@@ -446,7 +491,7 @@ impl Loader<'_> {
         Ok(self.backend.to_device(Tensor::from_vec(data, shape.to_vec())))
     }
     fn dense(&self, name: &str, rows: usize, cols: usize) -> Result<Weight> {
-        let base = half_or_dense(&self.backend, self.host(name, rows * cols, false, None)?, rows, cols);
+        let base = half_or_dense(self.card.as_ref(), &self.backend, self.host(name, rows * cols, false, None)?, rows, cols);
         let target = name.strip_suffix(".weight").unwrap_or(name);
         self.adapt(base, &[Part { name: target.into(), offset: 0, rows, output: None }], cols, rows, None)
     }
@@ -464,7 +509,7 @@ impl Loader<'_> {
     /// As `weight`, with LoRA also for `more` parts of it (Hugging Face matrices llama.cpp
     /// splits it into).
     fn weight_parts(&self, name: &str, k: usize, n: usize, input: Option<Vec<u32>>, output: Option<Vec<u32>>, more: &[Part<'_>]) -> Result<Weight> {
-        let base = exl3_weight(self.idx, &self.backend, name, k, n, input.clone(), output.clone())?;
+        let base = Weight::Packed((self.packed)(exl3_data(self.idx, name, k, n, input.clone(), output.clone())?).map_err(bad)?);
         let mut parts = vec![Part { name: name.into(), offset: 0, rows: n, output: output.as_deref() }];
         parts.extend(more.iter().map(|p| Part { name: p.name.clone(), offset: p.offset, rows: p.rows, output: p.output }));
         self.adapt(base, &parts, k, n, input.as_deref())
@@ -530,23 +575,53 @@ fn expert_lora(lora: &[Adapter], m: &str, cfg: &Config, which: usize) -> Result<
 }
 
 /// Load the model, its layers split evenly over `devices` (in order).
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 pub fn load(path: &Path, devices: &[usize]) -> Result<FlashNext> {
     load_with_adapters(path, devices, &[])
 }
 
 /// As `load`, with LoRA adapters (from `Adapter::open_for` with `lora_base`) applied together.
+#[cfg(feature = "cuda")]
 pub(crate) fn load_with_adapters(path: &Path, devices: &[usize], lora: &[Adapter]) -> Result<FlashNext> {
+    let cfg = Config::read(path)?;
+    let ids: Vec<usize> = if devices.is_empty() { vec![0] } else { devices.to_vec() };
+    // Streams of their own, so that decode steps can run as graphs.
+    let cudas: Vec<Arc<CudaBackend>> = ids.iter().map(|&d| CudaBackend::new_graphable(d).map(Arc::new).map_err(|e| bad(e.to_string()))).collect::<Result<_>>()?;
+    let backends: Vec<Arc<dyn Backend>> = cudas.iter().map(|c| c.clone() as Arc<dyn Backend>).collect();
+    let packed = |d: usize| -> Box<dyn Fn(Exl3Data) -> std::result::Result<Arc<dyn PackedLinear>, String> + Send + Sync> {
+        let card = cudas[d].clone();
+        Box::new(move |data| Exl3Matrix::upload(card.clone(), data).map(|m| Arc::new(m) as Arc<dyn PackedLinear>))
+    };
+    let experts = |d: usize, m: &str, list: Vec<[Exl3Data; 3]>| -> Result<Box<dyn Experts>> {
+        let mut experts = Exl3Experts::upload(cudas[d].clone(), list).map_err(bad)?;
+        if !lora.is_empty() {
+            for which in 0..3 {
+                if let Some((slot_of, a, b, rank)) = expert_lora(lora, m, &cfg, which)? {
+                    experts.set_lora(which, &slot_of, &a, &b, rank).map_err(bad)?;
+                }
+            }
+        }
+        Ok(Box::new(experts))
+    };
+    build(path, backends, cudas.clone(), lora, &packed, &experts)
+}
+
+/// Flash-Next without CUDA: every tensor on `backend`, each EXL3 matrix as `packed` makes it and each layer's experts
+/// as `experts` does (on any GPU through WebGPU, else on the CPU), no PEFT adapters, a decode step uncaptured.
+/// (A CUDA build loads it on the cards.)
+#[cfg_attr(feature = "cuda", allow(dead_code))]
+pub(crate) fn load_portable(path: &Path, backend: Arc<dyn Backend>, packed: Packer<'_>, experts: ExpertMaker<'_>) -> Result<FlashNext> {
+    build(path, vec![backend], Vec::new(), &[], packed, experts)
+}
+
+fn build(path: &Path, backends: Vec<Arc<dyn Backend>>, cudas: Vec<Arc<Card>>, lora: &[Adapter], packed: Packer<'_>, make_experts: ExpertMaker<'_>) -> Result<FlashNext> {
     if !detect(path) {
         return Err(bad("not a Qwen3.8-Flash-Next EXL3 checkpoint"));
     }
     let cfg = Config::read(path)?;
     let tok = tokenizer(path, cfg.vocab)?;
     let idx = StIndex::open(path)?;
-    let ids: Vec<usize> = if devices.is_empty() { vec![0] } else { devices.to_vec() };
-    // Streams of their own, so that decode steps can run as graphs.
-    let cudas: Vec<Arc<CudaBackend>> = ids.iter().map(|&d| CudaBackend::new_graphable(d).map(Arc::new).map_err(|e| bad(e.to_string()))).collect::<Result<_>>()?;
-    let on = |d: usize| Loader { idx: &idx, backend: cudas[d].clone(), lora };
+    let on = |d: usize| Loader { idx: &idx, backend: backends[d].clone(), card: cudas.get(d).cloned(), lora, packed: packed(d) };
     let p = "model.language_model";
     let h = cfg.hidden;
 
@@ -563,7 +638,7 @@ pub(crate) fn load_with_adapters(path: &Path, devices: &[usize], lora: &[Adapter
     // A layer is independent of the others: four load at once (the reads, the stacking of its
     // experts and the uploads overlap, on both GPUs).
     let load_layer = |i: usize| -> Result<Layer> {
-        let device = i * cudas.len() / cfg.layers;
+        let device = i * backends.len() / cfg.layers;
         let l = on(device);
         let lp = format!("{p}.layers.{i}");
         let mixer = if cfg.attention[i] {
@@ -595,11 +670,11 @@ pub(crate) fn load_with_adapters(path: &Path, devices: &[usize], lora: &[Adapter
             Mixer::Gdn(Gdn {
                 qkv: l.weight(&format!("{a}.in_proj_qkv"), h, qkv, None, Some(qm.clone()))?,
                 z: l.weight(&format!("{a}.in_proj_z"), h, nv * vd, None, Some(vm.clone()))?,
-                ba: l.adapt(half_or_dense(&cudas[device], ba.data().to_vec(), 2 * nv, h), &[
+                ba: l.adapt(half_or_dense(cudas.get(device), &backends[device], ba.data().to_vec(), 2 * nv, h), &[
                     Part { name: format!("{a}.in_proj_b"), offset: 0, rows: nv, output: Some(&hm) },
                     Part { name: format!("{a}.in_proj_a"), offset: nv, rows: nv, output: Some(&hm) },
                 ], h, 2 * nv, None)?,
-                a: cudas[device].to_device(Tensor::from_vec(av, vec![nv])),
+                a: backends[device].to_device(Tensor::from_vec(av, vec![nv])),
                 dt_bias: l.tensor(&format!("{a}.dt_bias"), &[nv], false, Some(&hm))?,
                 conv: l.tensor(&format!("{a}.conv1d.weight"), &[qkv, conv], false, Some(&qm))?,
                 norm: l.tensor(&format!("{a}.norm.weight"), &[vd], false, None)?,
@@ -626,16 +701,9 @@ pub(crate) fn load_with_adapters(path: &Path, devices: &[usize], lora: &[Adapter
         })?.into_iter().flatten().collect();
         let mut router = l.host(&format!("{m}.gate.weight"), cfg.experts * h, false, None)?;
         router.extend(l.host(&format!("{m}.shared_expert_gate.weight"), h, false, None)?);
-        let mut experts = Exl3Experts::upload(cudas[device].clone(), experts).map_err(bad)?;
-        if !lora.is_empty() {
-            for which in 0..3 {
-                if let Some((slot_of, a, b, rank)) = expert_lora(lora, &m, &cfg, which)? {
-                    experts.set_lora(which, &slot_of, &a, &b, rank).map_err(bad)?;
-                }
-            }
-        }
+        let experts = make_experts(device, &m, experts)?;
         let moe = Moe {
-            router: l.adapt(half_or_dense(&cudas[device], router, cfg.experts + 1, h), &[
+            router: l.adapt(half_or_dense(cudas.get(device), &backends[device], router, cfg.experts + 1, h), &[
                 Part { name: format!("{m}.gate"), offset: 0, rows: cfg.experts, output: None },
                 Part { name: format!("{m}.shared_expert_gate"), offset: cfg.experts, rows: 1, output: None },
             ], h, cfg.experts + 1, None)?,
@@ -682,7 +750,7 @@ pub(crate) fn load_with_adapters(path: &Path, devices: &[usize], lora: &[Adapter
         conv: l.tensor(&format!("{pp}.conv1d.weight"), &[width, cfg.ple_kernel], false, None)?,
     };
 
-    let last = on(cudas.len() - 1);
+    let last = on(backends.len() - 1);
     let collapse = last.hyper(&format!("{p}.hyper_connection_mixer"), &cfg, false)?;
     let head = last.weight("lm_head", h, cfg.vocab, None, None)?;
     // Every target of every adapter found its matrix.
@@ -695,7 +763,7 @@ pub(crate) fn load_with_adapters(path: &Path, devices: &[usize], lora: &[Adapter
         ple,
         collapse,
         head,
-        devices: cudas.iter().map(|c| c.clone() as Arc<dyn Backend>).collect(),
+        devices: backends,
         cudas,
         decoded: Default::default(),
         config: cfg,
@@ -1057,7 +1125,8 @@ impl FlashNext {
 /// Whether decode steps run as graphs (FLASHNEXT_GRAPHS=0 turns them off).
 fn graphs_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("FLASHNEXT_GRAPHS").map_or(true, |v| v != "0"))
+    // Graphs are CUDA's: a build without it runs every step uncaptured.
+    *ON.get_or_init(|| cfg!(feature = "cuda") && std::env::var("FLASHNEXT_GRAPHS").map_or(true, |v| v != "0"))
 }
 
 /// Where a forward's time goes, when `FLASHNEXT_PROFILE` is set: each part synchronizes the
@@ -1105,7 +1174,7 @@ mod profile {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
 
@@ -1179,7 +1248,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 mod bench {
     use super::*;
     /// Prefill and decode speed (FLASHNEXT_MODEL, FLASHNEXT_REFERENCE for its prompt ids,
@@ -1217,7 +1286,7 @@ mod bench {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 mod unload_tests {
     fn used() -> String {
         let out = std::process::Command::new("nvidia-smi").args(["--query-gpu=memory.used", "--format=csv,noheader"]).output().unwrap();

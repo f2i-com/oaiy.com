@@ -458,11 +458,14 @@ impl Models {
             // OrcaSAQ's EXL3 projections on any GPU through WebGPU (else the CPU).
             #[cfg(all(not(feature = "cuda"), feature = "webgpu"))]
             Kind::OrcaSaq => self.load_orcasaq_portable(&spec),
+            // Flash-Next's EXL3 matrices and experts too.
+            #[cfg(all(not(feature = "cuda"), feature = "webgpu"))]
+            Kind::FlashNext => self.load_flashnext_portable(&spec),
             #[cfg(all(not(feature = "cuda"), not(feature = "webgpu")))]
-            Kind::OrcaSaq => Err(Error::Arg(format!("{} is an EXL3 checkpoint, which needs the CUDA or the WebGPU build", spec.name))),
+            Kind::OrcaSaq | Kind::FlashNext => Err(Error::Arg(format!("{} is an EXL3 checkpoint, which needs the CUDA or the WebGPU build", spec.name))),
             #[cfg(not(feature = "cuda"))]
-            Kind::Deepseek | Kind::FlashNext => Err(Error::Arg(format!(
-                "{} is a DeepSeek or Flash-Next checkpoint, which needs the CUDA build (oaiy-llm-server); this build serves GGUF models and OrcaSAQ",
+            Kind::Deepseek => Err(Error::Arg(format!(
+                "{} is a DeepSeek checkpoint, which needs the CUDA build (oaiy-llm-server); this build serves GGUF, OrcaSAQ and Flash-Next models",
                 spec.name
             ))),
             Kind::Gguf => self.load_gguf(&spec),
@@ -740,6 +743,48 @@ impl Models {
         }
         let thread=std::thread::Builder::new().name("orcasaq-model".into()).spawn(move||e.run(rx))?;
         Ok(Live{name:spec.name.clone(),jobs,thread,cfg:Arc::new(cfg),flavour:Arc::new(Flavour::Qwen(tok))})
+    }
+
+    /// Qwen3.8-Flash-Next without CUDA: its EXL3 matrices and experts on the WebGPU adapter while the weight budget
+    /// holds them (the first layers' experts), the rest decoded on the CPU, everything else on the host. No PEFT
+    /// adapters and no vision tower (both CUDA's); conversations set aside in host RAM as on CUDA.
+    #[cfg(all(not(feature = "cuda"), feature = "webgpu"))]
+    fn load_flashnext_portable(&self, spec: &Spec) -> Result<Live> {
+        let o = &self.opts;
+        if o.lora_adapters.contains_key(&spec.name) {
+            return Err(Error::Arg(format!("{}: LoRA adapters need the CUDA build", spec.name)));
+        }
+        let picked = crate::backend::open(o, &o.devices)?;
+        self.say(format!("{} runs on {} (EXL3 experts decoded in the matmul, a layer's in two batches)", spec.name, picked.label));
+        let wgpu = picked.backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>();
+        type Make<'a> = Box<dyn Fn(ggml_rs::exl3::Exl3Data) -> std::result::Result<Arc<dyn ggml_rs::exl3::PackedLinear>, String> + Send + Sync + 'a>;
+        let packed = |_device: usize| -> Make<'_> {
+            match wgpu {
+                Some(b) => Box::new(move |d| b.exl3(d)),
+                None => Box::new(ggml_rs_wgpu::exl3::exl3_cpu),
+            }
+        };
+        let experts = |_device: usize, _layer: &str, list: Vec<[ggml_rs::exl3::Exl3Data; 3]>| -> Result<Box<dyn ggml_rs::exl3::Experts>> {
+            match wgpu {
+                Some(b) => b.exl3_experts(list),
+                None => ggml_rs_wgpu::exl3::exl3_experts_cpu(list),
+            }
+            .map_err(Error::Arg)
+        };
+        let model = crate::flashnext::load_portable(&spec.path, Arc::clone(&picked.backend), &packed, &experts)?;
+        if let Some((used, budget)) = wgpu.map(|b| b.usage()) {
+            self.say(format!("{}: {:.1} GB of EXL3 weights on the GPU (budget {:.0} GB), the rest on the CPU", spec.name, used as f64 / 1e9, budget as f64 / 1e9));
+        }
+        let tok = Arc::new(model.tokenizer.clone());
+        // The cache is on the host: bound it as the other portable models are.
+        let max_seq = self.context(model.config.context_length).min(16384);
+        let mut cfg = self.base_cfg(spec, max_seq);
+        cfg.image_token_id = tok.token_id("<|image_pad|>").ok_or_else(|| Error::Arg("Flash-Next tokenizer lacks image_pad".into()))?;
+        let (jobs, rx) = std::sync::mpsc::channel();
+        let park = crate::qwen_park::budget(o.park_gb, ggml_rs_wgpu::host_memory().map(|(free, _)| free as u64));
+        let e = crate::qwen::QwenEngine::new(crate::qwen::Hybrid::Flash(Box::new(model)), None, max_seq, !o.quiet && !o.silent).park_up_to(park);
+        let thread = std::thread::Builder::new().name("flashnext-model".into()).spawn(move || e.run(rx))?;
+        Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Qwen(tok)) })
     }
 
     /// OrcaSAQ without CUDA: its packed EXL3 projections on the WebGPU adapter while the weight budget holds them,

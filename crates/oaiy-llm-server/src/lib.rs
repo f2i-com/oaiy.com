@@ -37,8 +37,8 @@ mod http;
 mod qwen;
 // OrcaSAQ (EXL3: packed on CUDA, or on any GPU through WebGPU), its PEFT adapters (CUDA) and its Qwen vision tower (CUDA).
 mod orcasaq;
-// Qwen3.8-Flash-Next (qwen4_exp, EXL3 on CUDA).
-#[cfg(feature = "cuda")]
+// Qwen3.8-Flash-Next (qwen4_exp, EXL3: on CUDA, or on any GPU through WebGPU).
+#[cfg(any(feature = "cuda", feature = "webgpu"))]
 mod flashnext;
 mod lora;
 mod qwen_cache;

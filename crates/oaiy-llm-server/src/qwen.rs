@@ -252,7 +252,7 @@ pub fn prepare_images(records: &[Json], prompt: Vec<u32>, image_id: u32, cfg: &M
 /// What the engine runs: a Qwen3.5 hybrid (llama-rs), or Qwen3.8-Flash-Next.
 pub enum Hybrid {
     Qwen35(Model),
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "webgpu"))]
     Flash(Box<crate::flashnext::FlashNext>),
     #[cfg(test)]
     Fake(Box<crate::qwen_real::FakeModel>),
@@ -271,7 +271,7 @@ impl Hybrid {
         match self {
             Self::Qwen35(Model::Qwen35(m)) => Ok(&m.tokenizer),
             Self::Qwen35(_) => Err("not a dense Qwen hybrid".into()),
-            #[cfg(feature = "cuda")]
+            #[cfg(any(feature = "cuda", feature = "webgpu"))]
             Self::Flash(f) => Ok(&f.tokenizer),
             #[cfg(test)]
             Self::Fake(f) => Ok(&f.tok),
@@ -280,7 +280,7 @@ impl Hybrid {
     fn width(&self) -> usize {
         match self {
             Self::Qwen35(m) => m.config().embedding_dim,
-            #[cfg(feature = "cuda")]
+            #[cfg(any(feature = "cuda", feature = "webgpu"))]
             Self::Flash(f) => f.config.hidden,
             #[cfg(test)]
             Self::Fake(f) => f.width,
@@ -292,7 +292,7 @@ impl Hybrid {
     fn parks(&self) -> bool {
         match self {
             Self::Qwen35(_) => false,
-            #[cfg(feature = "cuda")]
+            #[cfg(any(feature = "cuda", feature = "webgpu"))]
             Self::Flash(_) => true,
             #[cfg(test)]
             Self::Fake(_) => true,
@@ -301,7 +301,7 @@ impl Hybrid {
     fn new_kv_cache(&self, max_seq: usize) -> KvCache {
         match self {
             Self::Qwen35(m) => m.new_kv_cache(max_seq),
-            #[cfg(feature = "cuda")]
+            #[cfg(any(feature = "cuda", feature = "webgpu"))]
             Self::Flash(f) => f.new_kv_cache(max_seq),
             #[cfg(test)]
             Self::Fake(_) => crate::qwen_real::new_kv(max_seq),
@@ -312,7 +312,7 @@ impl Hybrid {
         match self {
             Self::Qwen35(Model::Qwen35(m)) => Ok(m.embed_text(tokens).to_host()),
             Self::Qwen35(_) => Err("not a dense Qwen hybrid".into()),
-            #[cfg(feature = "cuda")]
+            #[cfg(any(feature = "cuda", feature = "webgpu"))]
             Self::Flash(f) => f.embed_text(tokens).map_err(|e| e.to_string()),
             #[cfg(test)]
             Self::Fake(f) => Ok(Tensor::zeros(vec![tokens.len(), f.width])),
@@ -326,7 +326,7 @@ impl Hybrid {
                 Ok(m.forward_embeds_positions(&embeds, tokens.len(), kv, positions).map_err(|e| e.to_string())?.to_host())
             }
             Self::Qwen35(_) => Err("not a dense Qwen hybrid".into()),
-            #[cfg(feature = "cuda")]
+            #[cfg(any(feature = "cuda", feature = "webgpu"))]
             Self::Flash(f) => f.forward(tokens, &embeds, kv, positions).map_err(|e| e.to_string()),
             #[cfg(test)]
             Self::Fake(f) => f.forward(tokens, kv),

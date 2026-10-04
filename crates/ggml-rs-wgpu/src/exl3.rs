@@ -216,6 +216,11 @@ impl Exl3Cpu {
         for (th, acc) in parts.into_iter().enumerate() {
             let a = th * per * 16;
             let width = acc.len() / m.max(1);
+            // A thread past the last tile column (40 columns over 32 threads leaves the last ones none) has no sums,
+            // and its offset is past the row's end.
+            if width == 0 {
+                continue;
+            }
             for row in 0..m {
                 y[row * n + a..row * n + a + width].copy_from_slice(&acc[row * width..(row + 1) * width]);
             }
@@ -1081,6 +1086,24 @@ mod tests {
         assert!((r[2].1 - 0.5).abs() < 1e-6, "sigmoid(0) for the shared expert: {r:?}");
         let r = route(&[0.0, 0.0, 0.0, 5.0], 1);
         assert_eq!(r[0], (0, 1.0), "a three-way tie goes to the lowest index");
+    }
+
+    #[test]
+    fn the_cpu_projection_spreads_any_width_over_any_threads() {
+        // 40 tile columns over 32 threads: two each, so the last threads have none (it panicked on a prompt's last row).
+        let (k, n, tw) = (256, 640, 48);
+        let data = random_exl3(k, n, tw, 7);
+        let x: Vec<f32> = (0..9 * k).map(|i| ((i * 13 % 37) as f32 - 18.0) / 20.0).collect();
+        let cpu = Exl3Cpu::new(data).unwrap();
+        let mut xh = vec![0f32; 9 * k];
+        for (row, out) in x.chunks_exact(k).zip(xh.chunks_exact_mut(k)) {
+            cpu.t.pre(row, out);
+        }
+        let one = cpu.matmul(&xh, 9, 1);
+        for threads in [2, 3, 7, 32, 64] {
+            let many = cpu.matmul(&xh, 9, threads);
+            close(&many, &one, &format!("{threads} threads"));
+        }
     }
 
     #[test]
