@@ -543,8 +543,10 @@ fn a_ring_nobody_reports_the_end_of_is_over_after_its_time_and_a_grace() {
     // The phone gave the request a second to live.
     r.ring.opened(&opened(&plan, "assist_1", CALL, 1, &r.ring)).unwrap();
     assert_eq!(r.ring.active().len(), 1);
+    // The timer's thread ends the ring, then tells the notifier and asks the phone to drop it, in that order: wait for the last
+    // of them, or a busy machine reads the notification before it is sent.
     let until = std::time::Instant::now() + Duration::from_secs(5);
-    while !r.ring.active().is_empty() && std::time::Instant::now() < until {
+    while (!r.ring.active().is_empty() || r.calls.cancels.lock().unwrap().is_empty()) && std::time::Instant::now() < until {
         std::thread::sleep(Duration::from_millis(25));
     }
     assert!(r.ring.active().is_empty(), "the dialog does not ring for ever");
