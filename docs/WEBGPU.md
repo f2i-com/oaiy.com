@@ -104,15 +104,22 @@ time), the routing on the host exactly as the CUDA kernel routes. A layer's expe
 run as two batches (every gate and up, then every down), the GPU's recorded in one
 encoder and read back with one submit, the CPU's an expert a thread meanwhile. The
 attention, delta-net and head matrices keep their share of the budget
-(`flashnext::dense_exl3_bytes`); the sigmoid-gated delta-net step runs on the host,
-a head a thread, checked against the CUDA kernel; the hyper-connection matrices are
-f32 on the host (unpacked once, where the host op unpacked f16 every call).
+(`flashnext::dense_exl3_bytes`, which leaves out the n-gram table: its rows are
+trellis-quantized too, but it is read from the disk); the sigmoid-gated delta-net
+step runs on the host, a head a thread, checked against the CUDA kernel; the
+hyper-connection matrices are f32 on the host (unpacked once, where the host op
+unpacked f16 every call).
 
-On the RTX 5090 (2026-10-05), 27 GiB budget, 192 GB of RAM: loaded in 22 s with
-29 GB of its weights on the GPU; 1.2 tokens a second and a 162-token prompt in 28 s;
-tool calls made and answered. A decode step's time goes mostly to the MoE (0.43 s),
-the delta-net layers (0.28 s: in place a projection waits about 2 ms, against 0.4 ms
-alone) and the hyper-connections (0.12 s). On two GPUs with CUDA it is far faster.
+On the RTX 5090 (2026-10-05), 27 GiB budget: loaded in 22 s with 27.9 GB of its
+weights in VRAM and 23 GB of RAM in use (its working set; Windows also charges the
+VRAM to its commit, 52 GB in all); 1.0 tokens a second and a 162-token prompt in
+35 s; tool calls made and answered. A decode step's time goes mostly to the MoE
+(0.64 s), the delta-net layers (0.24 s: in place a projection waits about 2 ms,
+against 0.4 ms alone) and the hyper-connections (0.12 s). With every expert on the
+CPU instead it was a little faster here (1.2 tokens a second, the prompt in 28 s:
+sixteen fast cores beat a layer's two GPU round trips) but took 48 GB of RAM; that
+is how it ran until the reserve stopped counting the 32.6 GB n-gram table, which
+left the experts none of the budget. On two GPUs with CUDA it is far faster.
 No PEFT adapters and no vision tower without CUDA.
 Image and video generation (`oaiy-media`) still need CUDA for useful speed.
 

@@ -632,12 +632,37 @@ pub(crate) fn load_with_adapters(path: &Path, devices: &[usize], lora: &[Adapter
 #[cfg_attr(feature = "cuda", allow(dead_code))]
 pub(crate) fn dense_exl3_bytes(path: &Path) -> Result<u64> {
     let idx = StIndex::open(path)?;
-    Ok(idx
-        .names()
-        .filter(|n| n.ends_with(".trellis") && n.starts_with("model.language_model.") || *n == "lm_head.trellis")
-        .filter(|n| !n.contains(".experts.") && !n.contains(".shared_expert."))
-        .filter_map(|n| idx.get(n).map(|i| i.nbytes))
-        .sum())
+    Ok(idx.names().filter(|n| reserved(n)).filter_map(|n| idx.get(n).map(|i| i.nbytes)).sum())
+}
+
+/// Whether a tensor is one of the matrices `dense_exl3_bytes` keeps GPU budget for. Not the experts, and not the n-gram
+/// table: its rows are trellis-quantized too, but it is read from the disk as needed and never placed on the GPU, and
+/// counted (32.6 GB) it left the experts none of a 27 GiB budget.
+#[cfg_attr(feature = "cuda", allow(dead_code))]
+fn reserved(name: &str) -> bool {
+    (name.ends_with(".trellis") && name.starts_with("model.language_model.") || name == "lm_head.trellis")
+        && !name.contains(".experts.")
+        && !name.contains(".shared_expert.")
+        && !name.contains(".ngram_embedding.")
+}
+
+#[cfg(test)]
+mod reserve_tests {
+    #[test]
+    fn the_reserve_counts_the_dense_matrices_and_the_head_not_the_experts_or_the_ngram_table() {
+        let p = "model.language_model.layers.1";
+        for name in [format!("{p}.self_attn.q_proj.trellis"), format!("{p}.linear_attn.in_proj_qkv.trellis"), "lm_head.trellis".into()] {
+            assert!(super::reserved(&name), "{name}");
+        }
+        for name in [
+            format!("{p}.mlp.experts.7.gate_proj.trellis"),
+            format!("{p}.mlp.shared_expert.down_proj.trellis"),
+            format!("{p}.ple.ple_embedding.ngram_embedding.shard_0.trellis"),
+            format!("{p}.self_attn.q_proj.suh"),
+        ] {
+            assert!(!super::reserved(&name), "{name}");
+        }
+    }
 }
 
 /// Flash-Next without CUDA: every tensor on `backend`, each EXL3 matrix as `packed` makes it and each layer's experts
