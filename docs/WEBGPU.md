@@ -131,6 +131,11 @@ Through `oaiy-llm-server-webgpu` the 9B loads in 4.1 s and answers chat requests
 Forcing Direct3D 12 (`WGPU_BACKEND=dx12`) passes the same parity test and gives
 the same 1B tokens at 16.8 tok/s.
 
+Only Vulkan, D3D12 and Metal are opened unless `WGPU_BACKEND` names others (`gl`
+adds OpenGL). With OpenGL too, each instance started a thread in NVIDIA's GL
+driver whose exit, as the instance dropped, deadlocked on the Windows loader lock
+against another thread opening Vulkan: about one test run in forty hung.
+
 Two adapters have been tested: this RTX 5090 and the Ryzen's integrated AMD Radeon
 (RDNA 2, 2 GB), each through Vulkan and D3D12 (2026-10-04,
 `OAIY_WEBGPU_ADAPTER=radeon`, with and without `WGPU_BACKEND=dx12`). Every type's

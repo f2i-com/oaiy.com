@@ -247,8 +247,15 @@ impl WgpuBackend {
     /// more than one GPU. `budget_bytes` caps the weights placed on it (WebGPU
     /// cannot report free memory); `None` picks a default by adapter type:
     /// 8 GiB discrete, 2 GiB integrated, none for software.
+    ///
+    /// Vulkan, D3D12 and Metal only, unless `WGPU_BACKEND` names others: an
+    /// instance with OpenGL too starts a WGL thread in NVIDIA's GL driver, and
+    /// that thread's exit, as an instance drops, deadlocked on the loader lock
+    /// against another thread opening Vulkan (one test run in about forty hung).
     pub fn new(budget_bytes: Option<u64>) -> Result<Self, String> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        desc.backends = wgpu::Backends::PRIMARY;
+        let instance = wgpu::Instance::new(desc.with_env());
         let adapter = match std::env::var("OAIY_WEBGPU_ADAPTER").ok().map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()) {
             Some(wanted) => {
                 let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
