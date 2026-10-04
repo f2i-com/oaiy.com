@@ -126,7 +126,7 @@
       "id": "deepseek-v4.1-flash",
       "group": "llm",
       "name": "DeepSeek V4.1 Flash",
-      "about": "DeepSeek's 552B mixture of experts, read from its FP8 checkpoint, with tool use: its experts stream from RAM and the disk, so it needs a fast SSD and a lot of memory. Fastest over two NVIDIA GPUs with CUDA, about 29 tokens a second once warm with 192 GB of RAM; through WebGPU on one GPU of any kind, its dense layers (9.7 GB) there and its experts on the CPU, about a token a second, a long first prompt taking minutes.",
+      "about": "DeepSeek's 552B mixture of experts, read from its FP8 checkpoint, with tool use: its experts stream from RAM and the disk, so it needs a fast SSD and a lot of memory. Fastest over two NVIDIA GPUs with CUDA, about 29 tokens a second once warm with 192 GB of RAM; through WebGPU on one GPU of any kind (12 GB or more), its dense layers (up to 9.7 GB) there and its experts on the CPU, about a token a second, a long first prompt taking minutes.",
       "license": "MIT",
       "size_gb": 510.3,
       "vram_gb": 12,
