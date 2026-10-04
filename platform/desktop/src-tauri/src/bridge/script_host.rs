@@ -1793,6 +1793,9 @@ rl.on('close', () => {{ if (!IGNORE_SHUTDOWN) queue.then(() => process.exit(0));
         };
         let (dir, script) = stub_serve("hang", &stub_capabilities(), false);
         let host = host_for(script, &node);
+        // The child is up before the clock starts, so what is timed is the batch and its deadline, and not how long a busy
+        // machine takes to start Node twice (the engine probe and the child) before the batch is sent.
+        assert_eq!(host.warm().health, Health::Ready);
         let started = Instant::now();
         let deadline = Duration::from_millis(600);
         match host.evaluate_within(&batch_request(vec![job("a", "hang")]), deadline) {

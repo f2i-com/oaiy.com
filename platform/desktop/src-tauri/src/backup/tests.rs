@@ -5662,7 +5662,9 @@ fn a_file_of_a_hundred_thousand_entries_is_refused_at_once() {
     let (result, _, took_quarter) = peak::measured(|| restore::stage(&dst.0, &small, PASS, &Ticks::all(), &lifted));
     assert_eq!(result.unwrap().files, 0);
     eprintln!("25,000 entries took {took_quarter:?}, 100,000 took {took:?}");
-    assert!(took < took_quarter * 6 + std::time::Duration::from_secs(3), "four times the entries took {took:?} against {took_quarter:?}: the time grows with the square of the size");
+    // The line is eight times, as far from four (linear) as from sixteen (the square) by ratio: a busy CI runner has taken 6.4 times
+    // for a linear run (95 s against 15 s), where a quiet machine takes 4.0.
+    assert!(took < took_quarter * 8 + std::time::Duration::from_secs(3), "four times the entries took {took:?} against {took_quarter:?}: the time grows with the square of the size");
     assert!(took < std::time::Duration::from_secs(240), "100,000 entries took {took:?}");
 }
 
