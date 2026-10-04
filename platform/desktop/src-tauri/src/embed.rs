@@ -448,7 +448,9 @@ mod tests {
         use crate::http::is_embedded_origin;
         for page in Page::SERVED {
             let url = page.url();
-            assert!(is_embedded_origin(&url.origin().ascii_serialization()), "{url}");
+            // `Url::origin()` is opaque for a custom scheme (the pages' address off Windows); scheme and host are what a browser sends.
+            let origin = format!("{}://{}", url.scheme(), url.host_str().expect("a host"));
+            assert!(is_embedded_origin(&origin), "{url}");
         }
         assert!(!is_embedded_origin("http://evil.localhost"));
         assert!(!is_embedded_origin("https://oaiy.com"));
