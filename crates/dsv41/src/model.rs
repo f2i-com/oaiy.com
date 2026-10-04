@@ -238,7 +238,7 @@ impl Model {
         // token i's [HC, dim] stream inside a [t, HC, dim] buffer
         let tok = |i: usize| i * HC * d..(i + 1) * HC * d;
         // Each token's mixing on its own, so spread over the threads: the same results. One by one, a 2,000-token
-        // prompt's took about a minute (24 dot products of HC * dim a token, twice a layer).
+        // prompt's dot products alone took 29 s (24 of HC * dim a token, twice a layer; `hc`'s timing test).
         let mixes = |x: &[f32], p: &HcParams| -> Vec<Mix> { per_token(t, |i| hc::mixes(&x[tok(i)], p, eps, cfg.hc_sinkhorn_iters, cfg.hc_eps)) };
 
         let mixing = std::time::Instant::now();

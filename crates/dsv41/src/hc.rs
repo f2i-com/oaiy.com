@@ -157,4 +157,26 @@ mod tests {
             assert!(m.pre[j] > 0.0 && m.post[j] > 0.0 && m.post[j] < 2.0);
         }
     }
+
+    /// What one token's mixing costs on one thread, at DeepSeek-V4.1's width (HC streams of 5,120): a prompt's tokens
+    /// take it twice a layer, 40 layers.
+    #[test]
+    #[ignore = "a timing; run with --nocapture"]
+    fn measure_a_tokens_mixing() {
+        let n = HC * 5120;
+        let p = HcParams {
+            fn_: (0..MIX * n).map(|i| ((i * 7919 % 101) as f32 - 50.0) / 5000.0).collect(),
+            base: (0..MIX).map(|i| i as f32 * 0.1 - 1.0).collect(),
+            scale: vec![0.5, 0.7, 1.3],
+        };
+        let x: Vec<f32> = (0..n).map(|i| ((i % 33) as f32 - 16.0) / 10.0).collect();
+        let tokens = 2000;
+        let t = std::time::Instant::now();
+        let mut keep = 0.0;
+        for _ in 0..tokens {
+            keep += mixes(std::hint::black_box(&x), &p, 1e-6, 20, 1e-6).pre[0];
+        }
+        let secs = t.elapsed().as_secs_f64();
+        eprintln!("{tokens} tokens' mixing in {secs:.2} s on one thread: a 2,000-token prompt's 80 would take {:.0} s ({keep})", secs * 80.0);
+    }
 }
