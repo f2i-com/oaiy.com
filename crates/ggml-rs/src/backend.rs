@@ -19,6 +19,127 @@ pub enum RopeType {
     /// Pairs are `(x[k], x[k + head_dim/2])`. The HF / Llama / Qwen / Gemma default.
     NeoX,
 }
+/// The delta-net step on the host (`Backend::delta_net_step`'s and `delta_net_step_sigmoid`'s default), a token at a
+/// time as the CUDA kernels go: depthwise conv1d, the per-head autoregressive update, the norm-gated output (silu(z),
+/// or sigmoid(z) for Qwen3.8-Flash-Next). The output `[seq, num_v_heads * head_v_dim]`, then the conv and recurrent
+/// state after the last token, all on the host.
+#[allow(clippy::too_many_arguments)]
+fn host_delta_net(
+    mixed_qkv:   &Tensor,
+    z_in:        &Tensor,
+    beta_alpha:  &Tensor,
+    conv_weight: &Tensor,
+    ssm_a:       &Tensor,
+    dt_bias:     &Tensor,
+    ssm_norm:    &Tensor,
+    conv_state:  &Tensor,
+    state:       &Tensor,
+    seq:         usize,
+    num_v_heads: usize,
+    num_k_heads: usize,
+    head_v_dim:  usize,
+    head_k_dim:  usize,
+    scale_q:     f32,
+    eps:         f32,
+    sigmoid_gate: bool,
+) -> (Tensor, Tensor, Tensor) {
+    assert!(head_k_dim <= 128 && head_v_dim <= 128, "delta-net heads of at most 128 on the host");
+    // Host fallback: per-token loop matching the CUDA kernels.
+    let conv_dim    = mixed_qkv.numel() / seq;
+    let conv_kernel = conv_weight.dim(1);
+    let mqkv_h = mixed_qkv.to_host();   let mqkv = mqkv_h.data();
+    let z_full_h = z_in.to_host();      let z_full = z_full_h.data();
+    let ba_full_h = beta_alpha.to_host(); let ba_full = ba_full_h.data();
+    let cw_h   = conv_weight.to_host(); let cw  = cw_h.data();
+    let sa_h   = ssm_a.to_host();       let sa  = sa_h.data();
+    let dt_h_  = dt_bias.to_host();     let dt  = dt_h_.data();
+    let nm_h   = ssm_norm.to_host();    let nm  = nm_h.data();
+
+    let mut conv_h  = conv_state.to_host();
+    let cs          = conv_h.data_mut();
+    let mut state_h = state.to_host();
+    let st          = state_h.data_mut();
+    let mut output  = vec![0.0f32; seq * num_v_heads * head_v_dim];
+    let mut conv_out = vec![0.0f32; conv_dim];
+
+    let q_base = 0;
+    let k_base = num_k_heads * head_k_dim;
+    let v_base = 2 * num_k_heads * head_k_dim;
+
+    for t in 0..seq {
+        // ---- conv1d for this token ------------------------------------
+        let mqkv_t = &mqkv[t * conv_dim..(t + 1) * conv_dim];
+        for c in 0..conv_dim {
+            let mut acc = 0.0f32;
+            for k in 0..(conv_kernel - 1) {
+                acc += cs[k * conv_dim + c] * cw[c * conv_kernel + k];
+            }
+            acc += mqkv_t[c] * cw[c * conv_kernel + (conv_kernel - 1)];
+            conv_out[c] = acc / (1.0 + (-acc).exp());
+            for k in 0..(conv_kernel - 2) {
+                cs[k * conv_dim + c] = cs[(k + 1) * conv_dim + c];
+            }
+            cs[(conv_kernel - 2) * conv_dim + c] = mqkv_t[c];
+        }
+        // ---- per-head delta-net step (TILED V order) ------------------
+        let z_t  = &z_full[t * num_v_heads * head_v_dim..(t + 1) * num_v_heads * head_v_dim];
+        let ba_t = &ba_full[t * 2 * num_v_heads..(t + 1) * 2 * num_v_heads];
+        let out_t = &mut output[t * num_v_heads * head_v_dim..(t + 1) * num_v_heads * head_v_dim];
+        for h_v in 0..num_v_heads {
+            let h_k = h_v % num_k_heads;
+            let q_h = &conv_out[q_base + h_k * head_k_dim..q_base + (h_k + 1) * head_k_dim];
+            let k_h = &conv_out[k_base + h_k * head_k_dim..k_base + (h_k + 1) * head_k_dim];
+            let v_h = &conv_out[v_base + h_v * head_v_dim..v_base + (h_v + 1) * head_v_dim];
+            let z_h = &z_t[h_v * head_v_dim..(h_v + 1) * head_v_dim];
+
+            let inv_q = 1.0 / (q_h.iter().map(|v| v * v).sum::<f32>() + eps).sqrt();
+            let inv_k = 1.0 / (k_h.iter().map(|v| v * v).sum::<f32>() + eps).sqrt();
+            let mut q_n = [0.0f32; 128]; let mut k_n = [0.0f32; 128];
+            for i in 0..head_k_dim { q_n[i] = q_h[i] * inv_q * scale_q; k_n[i] = k_h[i] * inv_k; }
+
+            let bh = 1.0 / (1.0 + (-ba_t[h_v]).exp());
+            let alph_b = ba_t[num_v_heads + h_v] + dt[h_v];
+            let alph_sp = if alph_b > 20.0 { alph_b } else { alph_b.exp().ln_1p() };
+            let g_t = (alph_sp * sa[h_v]).exp();
+
+            let st_off = h_v * head_v_dim * head_v_dim;
+            let st_h = &mut st[st_off..st_off + head_v_dim * head_v_dim];
+            for s in st_h.iter_mut() { *s *= g_t; }
+
+            let mut kv_mem = [0.0f32; 128];
+            for i in 0..head_v_dim {
+                let row = &st_h[i * head_v_dim..(i + 1) * head_v_dim];
+                let mut acc = 0.0f32;
+                for j in 0..head_k_dim { acc += row[j] * k_n[j]; }
+                kv_mem[i] = acc;
+            }
+            let mut delta = [0.0f32; 128];
+            for i in 0..head_v_dim { delta[i] = (v_h[i] - kv_mem[i]) * bh; }
+            for i in 0..head_v_dim {
+                let row = &mut st_h[i * head_v_dim..(i + 1) * head_v_dim];
+                let di = delta[i];
+                for j in 0..head_k_dim { row[j] += di * k_n[j]; }
+            }
+            let mut core = [0.0f32; 128];
+            for i in 0..head_v_dim {
+                let row = &st_h[i * head_v_dim..(i + 1) * head_v_dim];
+                let mut acc = 0.0f32;
+                for j in 0..head_k_dim { acc += row[j] * q_n[j]; }
+                core[i] = acc;
+            }
+            let mean_sq = core[..head_v_dim].iter().map(|v| v * v).sum::<f32>() / head_v_dim as f32;
+            let inv_rms = 1.0 / (mean_sq + eps).sqrt();
+            let dst_off = h_v * head_v_dim;
+            for i in 0..head_v_dim {
+                let normed = core[i] * inv_rms * nm[i];
+                let gate = if sigmoid_gate { 1.0 / (1.0 + (-z_h[i]).exp()) } else { z_h[i] / (1.0 + (-z_h[i]).exp()) };
+                out_t[dst_off + i] = normed * gate;
+            }
+        }
+    }
+    (Tensor::from_vec(output, vec![seq, num_v_heads * head_v_dim]), conv_h, state_h)
+}
+
 
 /// Operations needed by a transformer forward pass.
 pub trait Backend: Send + Sync + Debug + 'static {
@@ -796,104 +917,14 @@ pub trait Backend: Send + Sync + Debug + 'static {
         scale_q:     f32,
         eps:         f32,
     ) -> Tensor {
-        // Host fallback: per-token loop matching the CUDA kernels.
-        let conv_dim    = mixed_qkv.numel() / seq;
-        let conv_kernel = conv_weight.dim(1);
-        let mqkv_h = mixed_qkv.to_host();   let mqkv = mqkv_h.data();
-        let z_full_h = z_in.to_host();      let z_full = z_full_h.data();
-        let ba_full_h = beta_alpha.to_host(); let ba_full = ba_full_h.data();
-        let cw_h   = conv_weight.to_host(); let cw  = cw_h.data();
-        let sa_h   = ssm_a.to_host();       let sa  = sa_h.data();
-        let dt_h_  = dt_bias.to_host();     let dt  = dt_h_.data();
-        let nm_h   = ssm_norm.to_host();    let nm  = nm_h.data();
-
-        let mut conv_h  = std::mem::replace(conv_state, Tensor::zeros(vec![1])).to_host();
-        let cs          = conv_h.data_mut();
-        let mut state_h = std::mem::replace(state, Tensor::zeros(vec![1])).to_host();
-        let st          = state_h.data_mut();
-        let mut output  = vec![0.0f32; seq * num_v_heads * head_v_dim];
-        let mut conv_out = vec![0.0f32; conv_dim];
-
-        let q_base = 0;
-        let k_base = num_k_heads * head_k_dim;
-        let v_base = 2 * num_k_heads * head_k_dim;
+        // Host fallback: per-token loop matching the CUDA kernels (TILED V order: head h_v reads key head h_v % num_k_heads).
         let _ = v_per_k;
-
-        for t in 0..seq {
-            // ---- conv1d for this token ------------------------------------
-            let mqkv_t = &mqkv[t * conv_dim..(t + 1) * conv_dim];
-            for c in 0..conv_dim {
-                let mut acc = 0.0f32;
-                for k in 0..(conv_kernel - 1) {
-                    acc += cs[k * conv_dim + c] * cw[c * conv_kernel + k];
-                }
-                acc += mqkv_t[c] * cw[c * conv_kernel + (conv_kernel - 1)];
-                conv_out[c] = acc / (1.0 + (-acc).exp());
-                for k in 0..(conv_kernel - 2) {
-                    cs[k * conv_dim + c] = cs[(k + 1) * conv_dim + c];
-                }
-                cs[(conv_kernel - 2) * conv_dim + c] = mqkv_t[c];
-            }
-            // ---- per-head delta-net step (TILED V order) ------------------
-            let z_t  = &z_full[t * num_v_heads * head_v_dim..(t + 1) * num_v_heads * head_v_dim];
-            let ba_t = &ba_full[t * 2 * num_v_heads..(t + 1) * 2 * num_v_heads];
-            let out_t = &mut output[t * num_v_heads * head_v_dim..(t + 1) * num_v_heads * head_v_dim];
-            for h_v in 0..num_v_heads {
-                let h_k = h_v % num_k_heads;
-                let q_h = &conv_out[q_base + h_k * head_k_dim..q_base + (h_k + 1) * head_k_dim];
-                let k_h = &conv_out[k_base + h_k * head_k_dim..k_base + (h_k + 1) * head_k_dim];
-                let v_h = &conv_out[v_base + h_v * head_v_dim..v_base + (h_v + 1) * head_v_dim];
-                let z_h = &z_t[h_v * head_v_dim..(h_v + 1) * head_v_dim];
-
-                let inv_q = 1.0 / (q_h.iter().map(|v| v * v).sum::<f32>() + eps).sqrt();
-                let inv_k = 1.0 / (k_h.iter().map(|v| v * v).sum::<f32>() + eps).sqrt();
-                let mut q_n = [0.0f32; 128]; let mut k_n = [0.0f32; 128];
-                for i in 0..head_k_dim { q_n[i] = q_h[i] * inv_q * scale_q; k_n[i] = k_h[i] * inv_k; }
-
-                let bh = 1.0 / (1.0 + (-ba_t[h_v]).exp());
-                let alph_b = ba_t[num_v_heads + h_v] + dt[h_v];
-                let alph_sp = if alph_b > 20.0 { alph_b } else { alph_b.exp().ln_1p() };
-                let g_t = (alph_sp * sa[h_v]).exp();
-
-                let st_off = h_v * head_v_dim * head_v_dim;
-                let st_h = &mut st[st_off..st_off + head_v_dim * head_v_dim];
-                for s in st_h.iter_mut() { *s *= g_t; }
-
-                let mut kv_mem = [0.0f32; 128];
-                for i in 0..head_v_dim {
-                    let row = &st_h[i * head_v_dim..(i + 1) * head_v_dim];
-                    let mut acc = 0.0f32;
-                    for j in 0..head_k_dim { acc += row[j] * k_n[j]; }
-                    kv_mem[i] = acc;
-                }
-                let mut delta = [0.0f32; 128];
-                for i in 0..head_v_dim { delta[i] = (v_h[i] - kv_mem[i]) * bh; }
-                for i in 0..head_v_dim {
-                    let row = &mut st_h[i * head_v_dim..(i + 1) * head_v_dim];
-                    let di = delta[i];
-                    for j in 0..head_k_dim { row[j] += di * k_n[j]; }
-                }
-                let mut core = [0.0f32; 128];
-                for i in 0..head_v_dim {
-                    let row = &st_h[i * head_v_dim..(i + 1) * head_v_dim];
-                    let mut acc = 0.0f32;
-                    for j in 0..head_k_dim { acc += row[j] * q_n[j]; }
-                    core[i] = acc;
-                }
-                let mean_sq = core[..head_v_dim].iter().map(|v| v * v).sum::<f32>() / head_v_dim as f32;
-                let inv_rms = 1.0 / (mean_sq + eps).sqrt();
-                let dst_off = h_v * head_v_dim;
-                for i in 0..head_v_dim {
-                    let normed = core[i] * inv_rms * nm[i];
-                    let silu_z = z_h[i] / (1.0 + (-z_h[i]).exp());
-                    out_t[dst_off + i] = normed * silu_z;
-                }
-            }
-        }
-
+        let (out, conv_h, state_h) = host_delta_net(mixed_qkv, z_in, beta_alpha, conv_weight, ssm_a, dt_bias, ssm_norm,
+            &std::mem::replace(conv_state, Tensor::zeros(vec![1])), &std::mem::replace(state, Tensor::zeros(vec![1])),
+            seq, num_v_heads, num_k_heads, head_v_dim, head_k_dim, scale_q, eps, false);
         *conv_state = self.to_device(conv_h);
         *state = self.to_device(state_h);
-        self.to_device(Tensor::from_vec(output, vec![seq, num_v_heads * head_v_dim]))
+        self.to_device(out)
     }
 
     /// Split a fused `[seq, 3*d]` QKV projection (per-row layout `[Q_d | K_d | V_d]`)
@@ -952,9 +983,15 @@ pub trait Backend: Send + Sync + Debug + 'static {
         scale_q:     f32,
         eps:         f32,
     ) -> Tensor {
-        let _ = (mixed_qkv, z_in, beta_alpha, conv_weight, ssm_a, dt_bias, ssm_norm, conv_state, state,
-                 seq, num_v_heads, num_k_heads, head_v_dim, head_k_dim, v_per_k, scale_q, eps);
-        panic!("{}: the sigmoid-gated delta-net step needs the CUDA backend", self.name())
+        // Host fallback: the same per-token loop as `delta_net_step`'s, gated by sigmoid(z) (what the CUDA kernel's
+        // gate flag selects), so Flash-Next runs on a backend without CUDA.
+        let _ = v_per_k;
+        let (out, conv_h, state_h) = host_delta_net(mixed_qkv, z_in, beta_alpha, conv_weight, ssm_a, dt_bias, ssm_norm,
+            &std::mem::replace(conv_state, Tensor::zeros(vec![1])), &std::mem::replace(state, Tensor::zeros(vec![1])),
+            seq, num_v_heads, num_k_heads, head_v_dim, head_k_dim, scale_q, eps, true);
+        *conv_state = self.to_device(conv_h);
+        *state = self.to_device(state_h);
+        self.to_device(out)
     }
 
     /// VENDORED-LOCAL: split each row of `x` (`[rows, a + b]`) into its first `a` and last `b`
