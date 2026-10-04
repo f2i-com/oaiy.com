@@ -85,7 +85,11 @@ fn host_delta_net(
         let z_t  = &z_full[t * num_v_heads * head_v_dim..(t + 1) * num_v_heads * head_v_dim];
         let ba_t = &ba_full[t * 2 * num_v_heads..(t + 1) * 2 * num_v_heads];
         let out_t = &mut output[t * num_v_heads * head_v_dim..(t + 1) * num_v_heads * head_v_dim];
-        for h_v in 0..num_v_heads {
+        let conv_out = &conv_out;
+        // The heads are independent within a token: each takes its own state and output (rayon), where one thread
+        // did all 48 of a Flash-Next layer.
+        use rayon::prelude::*;
+        st.par_chunks_mut(head_v_dim * head_v_dim).zip(out_t.par_chunks_mut(head_v_dim)).enumerate().for_each(|(h_v, (st_h, out_h))| {
             let h_k = h_v % num_k_heads;
             let q_h = &conv_out[q_base + h_k * head_k_dim..q_base + (h_k + 1) * head_k_dim];
             let k_h = &conv_out[k_base + h_k * head_k_dim..k_base + (h_k + 1) * head_k_dim];
@@ -102,8 +106,6 @@ fn host_delta_net(
             let alph_sp = if alph_b > 20.0 { alph_b } else { alph_b.exp().ln_1p() };
             let g_t = (alph_sp * sa[h_v]).exp();
 
-            let st_off = h_v * head_v_dim * head_v_dim;
-            let st_h = &mut st[st_off..st_off + head_v_dim * head_v_dim];
             for s in st_h.iter_mut() { *s *= g_t; }
 
             let mut kv_mem = [0.0f32; 128];
@@ -129,13 +131,12 @@ fn host_delta_net(
             }
             let mean_sq = core[..head_v_dim].iter().map(|v| v * v).sum::<f32>() / head_v_dim as f32;
             let inv_rms = 1.0 / (mean_sq + eps).sqrt();
-            let dst_off = h_v * head_v_dim;
             for i in 0..head_v_dim {
                 let normed = core[i] * inv_rms * nm[i];
                 let gate = if sigmoid_gate { 1.0 / (1.0 + (-z_h[i]).exp()) } else { z_h[i] / (1.0 + (-z_h[i]).exp()) };
-                out_t[dst_off + i] = normed * gate;
+                out_h[i] = normed * gate;
             }
-        }
+        });
     }
     (Tensor::from_vec(output, vec![seq, num_v_heads * head_v_dim]), conv_h, state_h)
 }

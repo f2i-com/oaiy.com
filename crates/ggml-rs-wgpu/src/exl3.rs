@@ -118,6 +118,13 @@ fn decode(code: u32) -> f32 {
     half((1024 + sum) as f32 * (1774.0 / 262_144.0) - 10.382_812_5)
 }
 
+/// Every code's weight, decoded once: the CPU's matmul looks each one up (256 KB, in cache), where decoding (its f16
+/// rounding in software) was most of a CPU-resident expert's time.
+fn codebook() -> &'static [f32] {
+    static TABLE: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| (0..65536).map(decode).collect())
+}
+
 // ---------------------------------------------------------------------------
 // On the CPU
 // ---------------------------------------------------------------------------
@@ -175,6 +182,7 @@ impl Exl3Cpu {
         let (k, n) = (self.t.k, self.t.n);
         let (ktiles, ntiles, nw) = (k / 16, n / 16, self.tile_words / 2);
         let pos = positions(self.tile_words);
+        let book = codebook();
         // Each thread takes a run of tile columns, all rows: its sums are its own.
         let threads = threads.min(ntiles).max(1);
         let per = ntiles.div_ceil(threads);
@@ -193,7 +201,7 @@ impl Exl3Cpu {
                                 let tile = &words[(kt * ntiles + nt) * nw..(kt * ntiles + nt + 1) * nw];
                                 for (slot, &(w0, w1, sh)) in pos.iter().enumerate() {
                                     let pair = ((tile[w0] as u64) << 32) | tile[w1] as u64;
-                                    w[slot] = decode((pair >> sh) as u32 & 0xffff);
+                                    w[slot] = book[((pair >> sh) & 0xffff) as usize];
                                 }
                                 for row in 0..m {
                                     let xs = &xh[row * k + kt * 16..row * k + kt * 16 + 16];
@@ -786,20 +794,25 @@ impl WgpuBackend {
     /// A MoE layer's EXL3 experts (`experts[e]` its gate, up and down; the shared one last): each projection on the
     /// GPU while the weight budget holds it, else on the CPU.
     pub fn exl3_experts(&self, experts: Vec<[Exl3Data; 3]>) -> Result<Box<dyn ggml_rs::exl3::Experts>, String> {
+        self.exl3_experts_leaving(experts, 0)
+    }
+
+    /// As `exl3_experts`, leaving `reserve` bytes of the budget for the model's other matrices (loaded after).
+    pub fn exl3_experts_leaving(&self, experts: Vec<[Exl3Data; 3]>, reserve: u64) -> Result<Box<dyn ggml_rs::exl3::Experts>, String> {
         let mut out = Vec::with_capacity(experts.len());
         for e in experts {
             let [g, u, d] = e;
-            out.push([self.proj(g)?, self.proj(u)?, self.proj(d)?]);
+            out.push([self.proj(g, reserve)?, self.proj(u, reserve)?, self.proj(d, reserve)?]);
         }
         Ok(Box::new(Exl3MoeHost::new(out, Some((Arc::clone(&self.gpu), Arc::clone(&self.serial))))?))
     }
 
-    fn proj(&self, data: Exl3Data) -> Result<Proj, String> {
+    fn proj(&self, data: Exl3Data, reserve: u64) -> Result<Proj, String> {
         data.validate()?;
         let nbytes = data.words.len() as u64 * 4;
         let fits_binding = (data.svh.len() / 16 * data.tile_words / 2 * 4) as u64 <= chunk_limit(&self.gpu.limits);
         let prev = self.used.fetch_add(nbytes, Ordering::Relaxed);
-        if !fits_binding || prev + nbytes > self.budget {
+        if !fits_binding || prev + nbytes > self.budget.saturating_sub(reserve) {
             self.used.fetch_sub(nbytes, Ordering::Relaxed);
             return Ok(Proj::Cpu(Exl3Cpu::new(data)?));
         }
@@ -1103,6 +1116,33 @@ mod tests {
         for threads in [2, 3, 7, 32, 64] {
             let many = cpu.matmul(&xh, 9, threads);
             close(&many, &one, &format!("{threads} threads"));
+        }
+    }
+
+    /// How long a decode step's projection takes, and how much of it is waiting for the GPU (`--ignored --nocapture`).
+    #[test]
+    #[ignore = "timing"]
+    fn time_a_decode_projection() {
+        let Some(b) = backend() else { return };
+        for (k, n) in [(2560, 10240), (6144, 2560), (2560, 640)] {
+            let w = b.exl3(random_exl3(k, n, 48, 5)).unwrap();
+            let x = Tensor::from_vec(vec![0.1; k], vec![1, k]);
+            for _ in 0..5 {
+                w.linear(&x);
+            }
+            let t = std::time::Instant::now();
+            for _ in 0..50 {
+                w.linear(&x);
+            }
+            let each = t.elapsed().as_secs_f64() * 1000.0 / 50.0;
+            // The same with nothing to compute: an empty submit and wait.
+            let t = std::time::Instant::now();
+            for _ in 0..50 {
+                b.gpu.queue.submit([]);
+                let _ = b.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+            }
+            let idle = t.elapsed().as_secs_f64() * 1000.0 / 50.0;
+            eprintln!("{k}x{n}: {each:.3} ms a call; an empty submit and wait {idle:.3} ms");
         }
     }
 

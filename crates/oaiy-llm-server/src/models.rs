@@ -764,9 +764,11 @@ impl Models {
                 None => Box::new(ggml_rs_wgpu::exl3::exl3_cpu),
             }
         };
+        // The experts take what the attention, delta-net and head matrices leave of the budget.
+        let reserve = crate::flashnext::dense_exl3_bytes(&spec.path)?;
         let experts = |_device: usize, _layer: &str, list: Vec<[ggml_rs::exl3::Exl3Data; 3]>| -> Result<Box<dyn ggml_rs::exl3::Experts>> {
             match wgpu {
-                Some(b) => b.exl3_experts(list),
+                Some(b) => b.exl3_experts_leaving(list, reserve),
                 None => ggml_rs_wgpu::exl3::exl3_experts_cpu(list),
             }
             .map_err(Error::Arg)

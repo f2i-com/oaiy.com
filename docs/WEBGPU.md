@@ -72,8 +72,8 @@ The Overview page shows what the model actually runs on.
 `oaiy-llm-server-webgpu` serves GGUF models of the types above, and OrcaSAQ (EXL3,
 below). A GGUF with IQ1, IQ2 or IQ3 tensors (unsloth's smaller "UD" quants mix them
 in, even UD-Q4_K_M) does not load, and OAIY's setup refuses one before it is added.
-DeepSeek-V4.1 checkpoints, Qwen3.8-Flash-Next and the observer are CUDA engines,
-and it says so rather than trying.
+DeepSeek-V4.1 checkpoints and the observer are CUDA engines, and it says so rather
+than trying. Qwen3.8-Flash-Next runs on it too (below).
 
 ## EXL3 (OrcaSAQ) without CUDA
 
@@ -94,6 +94,26 @@ OrcaSAQ-2-27B through `oaiy-llm-server-webgpu` on the RTX 5090 (2026-10-05): loa
 tokens a second, against 17 s and 4.5 for Qwen3.8 27B Q4_K_M on the same path (the
 rest is the host's share of every portable model); tool calls made and answered. No
 PEFT adapters and no vision tower without CUDA.
+
+## Qwen3.8-Flash-Next without CUDA
+
+Its 512 experts a layer (and the shared one) are `ggml_rs_wgpu::exl3::Exl3MoeHost`:
+each projection on the GPU while the budget holds it, the rest decoded on the CPU
+(through a 65,536-entry table of mul1's values, where decoding was most of their
+time), the routing on the host exactly as the CUDA kernel routes. A layer's experts
+run as two batches (every gate and up, then every down), the GPU's recorded in one
+encoder and read back with one submit, the CPU's an expert a thread meanwhile. The
+attention, delta-net and head matrices keep their share of the budget
+(`flashnext::dense_exl3_bytes`); the sigmoid-gated delta-net step runs on the host,
+a head a thread, checked against the CUDA kernel; the hyper-connection matrices are
+f32 on the host (unpacked once, where the host op unpacked f16 every call).
+
+On the RTX 5090 (2026-10-05), 27 GiB budget, 192 GB of RAM: loaded in 22 s with
+29 GB of its weights on the GPU; 1.2 tokens a second and a 162-token prompt in 28 s;
+tool calls made and answered. A decode step's time goes mostly to the MoE (0.43 s),
+the delta-net layers (0.28 s: in place a projection waits about 2 ms, against 0.4 ms
+alone) and the hyper-connections (0.12 s). On two GPUs with CUDA it is far faster.
+No PEFT adapters and no vision tower without CUDA.
 Image and video generation (`oaiy-media`) still need CUDA for useful speed.
 
 ## Measured (2026-09-26)

@@ -188,6 +188,9 @@ struct HyperMix {
     rank: usize,
     /// Whether it writes back into the streams (a site) or only collapses them.
     site: bool,
+    /// Whether `down` and `up` are f16 packed two to a word (a card's), or f32: without a card they are unpacked
+    /// once at load, where the host ops unpacked them on every call (a second of each decode step).
+    packed: bool,
 }
 
 impl HyperMix {
@@ -201,9 +204,16 @@ impl HyperMix {
             None => b.hc_norm(x, &self.norm, streams, eps),
         };
         prof.lap("hc:norm");
-        let (t, post) = b.hc_down_gates(&normed, &self.down, self.rank, if self.site { streams } else { 0 }, streams);
+        let writes = if self.site { streams } else { 0 };
+        let (t, post) = if self.packed {
+            b.hc_down_gates(&normed, &self.down, self.rank, writes, streams)
+        } else {
+            let mut t = b.linear(&normed, &self.down);
+            let post = b.hc_gates(&mut t, self.rank, writes, streams);
+            (t, post)
+        };
         prof.lap("hc:down");
-        let mixed = b.hc_up_mix(&t, &self.up, &normed, streams);
+        let mixed = if self.packed { b.hc_up_mix(&t, &self.up, &normed, streams) } else { b.hc_mix(&b.linear(&t, &self.up), &normed, streams) };
         prof.lap("hc:up");
         (mixed, self.site.then_some(post))
     }
@@ -529,13 +539,23 @@ impl Loader<'_> {
             padded.extend_from_slice(row);
             padded.extend(std::iter::repeat_n(0.0, writes));
         }
+        // f16 in the checkpoint: kept so on a card, two to a word (half the memory and reading); f32 elsewhere.
+        let packed = self.card.is_some();
+        let (down, up) = if packed {
+            (
+                Tensor::from_vec(ggml_rs::tensor::pack_f16(&down), vec![rank + writes, width / 2]),
+                Tensor::from_vec(ggml_rs::tensor::pack_f16(&padded), vec![width, (rank + writes) / 2]),
+            )
+        } else {
+            (Tensor::from_vec(down, vec![rank + writes, width]), Tensor::from_vec(padded, vec![width, rank + writes]))
+        };
         Ok(HyperMix {
             norm: self.tensor(&format!("{p}.hc_norm.weight"), &[width], true, None)?,
-            // f16 in the checkpoint: kept so, two to a word (half the memory and reading).
-            down: self.backend.to_device(Tensor::from_vec(ggml_rs::tensor::pack_f16(&down), vec![rank + writes, width / 2])),
-            up: self.backend.to_device(Tensor::from_vec(ggml_rs::tensor::pack_f16(&padded), vec![width, (rank + writes) / 2])),
+            down: self.backend.to_device(down),
+            up: self.backend.to_device(up),
             rank,
             site,
+            packed,
         })
     }
 }
@@ -604,6 +624,20 @@ pub(crate) fn load_with_adapters(path: &Path, devices: &[usize], lora: &[Adapter
         Ok(Box::new(experts))
     };
     build(path, backends, cudas.clone(), lora, &packed, &experts)
+}
+
+/// The bytes of Flash-Next's EXL3 matrices outside its experts (attention, delta-net, the head): a portable build keeps
+/// that much of the GPU budget for them, where the experts, loaded first, took it all and left the 248k-row head to the
+/// CPU.
+#[cfg_attr(feature = "cuda", allow(dead_code))]
+pub(crate) fn dense_exl3_bytes(path: &Path) -> Result<u64> {
+    let idx = StIndex::open(path)?;
+    Ok(idx
+        .names()
+        .filter(|n| n.ends_with(".trellis") && n.starts_with("model.language_model.") || *n == "lm_head.trellis")
+        .filter(|n| !n.contains(".experts.") && !n.contains(".shared_expert."))
+        .filter_map(|n| idx.get(n).map(|i| i.nbytes))
+        .sum())
 }
 
 /// Flash-Next without CUDA: every tensor on `backend`, each EXL3 matrix as `packed` makes it and each layer's experts

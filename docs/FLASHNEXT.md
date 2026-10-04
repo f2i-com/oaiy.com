@@ -16,6 +16,11 @@ hf download turboderp/Qwen3.8-Flash-Next-exl3 --revision 3.05bpw_h5_ng5 --local-
 target/release/oaiy-llm-server.exe --model E:\models\Qwen3.8-Flash-Next\exl3-3.05bpw --name Qwen3.8-Flash-Next --devices 0,1
 ```
 
+Without CUDA, `oaiy-llm-server-webgpu` runs it on one GPU of any kind through WebGPU, the
+experts that do not fit decoded on the CPU, at about a token a second (see
+[WEBGPU.md](WEBGPU.md#qwen38-flash-next-without-cuda)); added with no GPUs of its own, the
+CUDA build takes the first two.
+
 In Studio, add it as a model with GPUs of its own, so the others keep theirs:
 
 ```json
