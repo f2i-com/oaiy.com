@@ -167,10 +167,13 @@ describe('the engine model card, with nothing chosen in Engines', () => {
       ]),
       engines: { cuda: false, webgpu: true },
     };
-    await render({ catalog: portableOnly });
+    await render({ catalog: portableOnly, gpuGb: 32 });
     const [deepseek, qwen] = options();
     expect(deepseek.textContent).toContain('NVIDIA only');
-    expect(deepseek.textContent).toContain('2 GPUs · 192 GB of RAM');
+    // On each of its GPUs, and no word on fitting: only the largest GPU is known.
+    expect(deepseek.textContent).toContain('needs 32 GB of GPU memory on each of 2 GPUs · 192 GB of RAM');
+    expect(deepseek.textContent).not.toContain('fits your GPU');
+    expect(qwen.textContent).toContain('fits your GPU');
     expect(deepseek.textContent).toContain('which this OAIY does not have');
     expect(deepseek.querySelector('input')!.disabled).toBe(true);
     // The recommended one cannot run here: the first that can is chosen, and downloaded.

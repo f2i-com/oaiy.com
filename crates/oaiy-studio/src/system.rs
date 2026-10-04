@@ -117,6 +117,7 @@ fn vendor_of(id: &str) -> &'static str {
 /// Windows: the display class's adapters, `DriverDesc|HardwareInformation.qwMemorySize|MatchingDeviceId` a line, as
 /// [`other_gpus`] reads them. The 64-bit memory size is the dedicated memory every vendor's driver writes (WMI's
 /// `AdapterRAM` stops at 4 GB). Remote and basic display adapters, which have none, are left out.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn parse_windows_adapters(text: &str) -> Vec<Json> {
     let mut out = Vec::new();
     for line in text.lines() {
@@ -269,6 +270,20 @@ fn roots() -> Vec<Json> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The adapters this computer's OS lists, read for real (`--ignored --nocapture` to see them): the reader that a
+    /// computer without an NVIDIA driver relies on, run where it can be checked.
+    #[test]
+    #[ignore = "reads this computer's display adapters"]
+    fn print_the_display_adapters_the_os_lists() {
+        let gpus = other_gpus();
+        for g in &gpus {
+            eprintln!("{} | {} | {:?} MB", g.get("name").and_then(Json::as_str).unwrap_or(""), g.get("vendor").and_then(Json::as_str).unwrap_or(""), g.get("memory_total_mb").and_then(Json::as_i64));
+        }
+        if cfg!(windows) {
+            assert!(!gpus.is_empty(), "a Windows computer lists at least one display adapter with memory");
+        }
+    }
 
     #[test]
     fn without_an_nvidia_driver_the_display_adapters_are_read_with_their_vendor_and_memory() {

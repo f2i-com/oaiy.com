@@ -333,14 +333,18 @@ function groupLabel(catalog: EngineCatalog | null, group: string): string {
   return catalog?.groups?.find((g) => g.id === group)?.name ?? group;
 }
 
-/** A model's download size, the GPU memory it needs, whether that fits the largest GPU (`gpuGb`), the RAM and GPUs it takes, and its license. */
+/**
+ * A model's download size, the GPU memory it needs (on each GPU, for one that takes several), whether that fits the
+ * largest GPU (`gpuGb`; not said for a model of several GPUs, as only the largest is known), the RAM it takes, and its
+ * license.
+ */
 function modelFacts(m: EngineCatalogModel, gpuGb?: number): string {
-  const fit = gpuGb && m.vramGb ? (m.vramGb <= gpuGb ? 'fits your GPU' : `more than your GPU’s ${gpuGb} GB`) : null;
+  const several = !!m.gpuCount && m.gpuCount > 1;
+  const fit = gpuGb && m.vramGb && !several ? (m.vramGb <= gpuGb ? 'fits your GPU' : `more than your GPU’s ${gpuGb} GB`) : null;
   return [
     m.sizeGb ? `${m.sizeGb} GB download` : null,
-    m.vramGb ? `needs ${m.vramGb} GB of GPU memory` : null,
+    m.vramGb ? `needs ${m.vramGb} GB of GPU memory${several ? ` on each of ${m.gpuCount} GPUs` : ''}` : null,
     fit,
-    m.gpuCount && m.gpuCount > 1 ? `${m.gpuCount} GPUs` : null,
     m.ramGb ? `${m.ramGb} GB of RAM` : null,
     m.license,
   ]

@@ -424,6 +424,39 @@ mod tests {
         }
     }
 
+    /// The Agent on an AI provider, against a real local one: a streamed request with tools, relayed as the Agent's
+    /// is (`chat_stream`), to the Ollama on this computer (`OAIY_OLLAMA_MODEL`, default llama3.1:8b). It must stream a
+    /// tool call back. Run with `--ignored --nocapture` where Ollama is serving.
+    #[tokio::test]
+    #[ignore = "needs Ollama serving on localhost:11434"]
+    async fn a_streamed_tool_call_is_relayed_from_a_local_openai_compatible_server() {
+        let model = std::env::var("OAIY_OLLAMA_MODEL").unwrap_or_else(|_| "llama3.1:8b".into());
+        let ollama = AiProvider {
+            id: "ollama".into(),
+            name: "Ollama".into(),
+            category: None,
+            protocol: Protocol::OpenAi,
+            base_url: "http://localhost:11434/v1".into(),
+            model: Some(model.clone()),
+            capabilities: vec![],
+            enabled: true,
+            allow_local: true,
+            api_key: None,
+        };
+        let body = json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": "What is the weather in Paris right now? Use the tool." }],
+            "tools": [{ "type": "function", "function": { "name": "get_weather", "description": "The current weather in a city.",
+                "parameters": { "type": "object", "properties": { "city": { "type": "string" } }, "required": ["city"] } } }],
+        });
+        let resp = chat_stream(&ollama, body).await.expect("Ollama answers");
+        let text = resp.text().await.unwrap();
+        eprintln!("{}", text.lines().filter(|l| l.contains("tool_calls")).take(3).collect::<Vec<_>>().join("
+"));
+        assert!(text.contains("data:"), "an event stream: {text:.300}");
+        assert!(text.contains("\"tool_calls\"") && text.contains("get_weather"), "a tool call came back: {text:.600}");
+    }
+
     #[test]
     fn anthropic_is_not_streamable_but_openai_is() {
         assert!(!streamable(&anthropic_provider()));
