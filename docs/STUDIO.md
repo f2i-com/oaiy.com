@@ -103,7 +103,7 @@ The catalog lists mainstream releases only, with their licences:
 
 | Group | Models |
 |---|---|
-| Chat | Qwen3.5 9B and 4B (the Agent can use its tools with them), Qwen3 8B, Qwen3 4B, Gemma 4 E2B, Gemma 3 4B, Llama 3.2 3B (chat only): 4-bit GGUF |
+| Chat | On any GPU (GGUF): Qwen3.5 9B, 4B and 27B, Qwen3.8 27B at 4, 8 and 3 bits (the Agent can use its tools with these), Qwen3 8B and 4B, Gemma 4 E2B, Gemma 3 4B, Llama 3.2 3B (chat only). On NVIDIA with the CUDA engine: Qwen3.8 27B as 3.21-bit OrcaSAQ, Qwen3.8-Flash-Next (two GPUs) and DeepSeek V4.1 Flash (192 GB of RAM), all with tool use. The setup shows a CUDA-only model as NVIDIA only, and not to download where there is no CUDA engine. |
 | Images | Qwen Image 2.1 with Viggle's turbo adapter; Stable Diffusion XL 1.0 with its CLIP tokenizer |
 | Video | LTX 2.5 (its BF16 transformer, Gemma 4 text encoder, and video and audio VAEs) |
 | Speech | Qwen3-TTS 1.7B (VoiceDesign and Base); Breeze TTS 2 |
