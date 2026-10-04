@@ -733,6 +733,27 @@ whose positions all carry `<｜deepseek_image｜>`.
   - Image tokens run token by token like other short stretches: 2.7 tok/s cold (the
     vision-biased experts are not cached yet), 8.5 tok/s warm.
 
+## The CPU model, measured for a port off CUDA (2026-10-05)
+
+`dsv41::model` (the reference the CUDA path is tested against) runs the whole checkpoint
+on the CPU, its experts through the same LFRU host cache. Measured with
+`crates/dsv41/tests/cpu_speed.rs` (`measure_where_prefill_and_warm_decode_time_goes`,
+96 GB expert cache, 2,000 tokens of this repository's docs), split by the trace hook's
+timestamps:
+
+| | Time | Attention (hc mix, norm, the FP8 dense trunk's projections, attention) | MoE | Read from the drive |
+|---|---:|---:|---:|---|
+| Prompt of 2,000 tokens | 1,294 s | 784 s | 502 s | 226.6 GB, every expert a miss |
+| Warm decode (the last 16 of 32 steps) | 2.06 s a token | 1.0 s, flat | 0.76-0.9 s | 0.45-0.66 GB a token, 85-90% of the experts from RAM |
+
+So a prompt is compute-bound on the CPU: attention costs more than the MoE, and the
+reads (226.6 GB, about a minute at this drive's rate) are a fraction of either. In
+decode the attention is a second of compute that a GPU holding the 9.9 GB trunk would
+all but remove, and the MoE is mostly its misses. A WebGPU port therefore puts the FP8
+trunk on the GPU first, then the MXFP4 experts (a VRAM tier, and the prompt's batched
+matmuls). A portable serving engine on the CPU model alone would make an Agent wait
+21 minutes for its first answer, so none was built.
+
 ## Phases
 
 Each phase ends in something measurable. Effort figures are rough.
