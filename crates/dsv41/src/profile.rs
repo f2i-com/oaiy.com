@@ -8,11 +8,12 @@ use std::time::Instant;
 /// A region of the forward pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Part {
-    /// Waiting for a layer's routed experts' records (the cache, or the drive).
+    /// Waiting for a layer's routed experts' records (the cache, or the drive): a decode step's all, a prompt's each
+    /// (its reads overlap its matmuls, so this is what they did not hide).
     ExpertRead,
     /// Routed experts' matmuls on a GPU (`moe::Experts::gpu`).
     ExpertGpu,
-    /// Routed experts' matmuls on the CPU.
+    /// Routed experts' matmuls on the CPU: a decode step's; a prompt's, the wait for them once its records are all in.
     ExpertCpu,
     /// A dense weight held on a device (`linear::Weight::Device`): one call.
     DeviceDense,
@@ -22,11 +23,31 @@ pub enum Part {
     SparseAttention,
     /// The indexer's scores.
     IndexScores,
+    /// The indexer, its dense calls and scores among it.
+    Indexer,
+    /// The compressor, its dense calls among it.
+    Compressor,
+    /// The hyper-connections' mixing around each sublayer (`hc`).
+    Mixing,
+    /// An Engram layer's lookup and gate, its dense calls among it.
+    Engram,
 }
 
-const PARTS: [Part; 7] = [Part::ExpertRead, Part::ExpertGpu, Part::ExpertCpu, Part::DeviceDense, Part::HostDense, Part::SparseAttention, Part::IndexScores];
-static NANOS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
-static CALLS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+const PARTS: [Part; 11] = [
+    Part::ExpertRead,
+    Part::ExpertGpu,
+    Part::ExpertCpu,
+    Part::DeviceDense,
+    Part::HostDense,
+    Part::SparseAttention,
+    Part::IndexScores,
+    Part::Indexer,
+    Part::Compressor,
+    Part::Mixing,
+    Part::Engram,
+];
+static NANOS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+static CALLS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
 impl Part {
     fn index(self) -> usize {
@@ -42,6 +63,10 @@ impl Part {
             Part::HostDense => "dense on the CPU",
             Part::SparseAttention => "sparse attention",
             Part::IndexScores => "index scores",
+            Part::Indexer => "indexer",
+            Part::Compressor => "compressor",
+            Part::Mixing => "mixing",
+            Part::Engram => "engram",
         }
     }
 }

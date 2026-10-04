@@ -41,8 +41,49 @@ pub enum Out {
 
 /// A dense weight held elsewhere (on a GPU), which [`Weight::Device`] runs: the f32 sums of `x` (`[t, k]`, already
 /// quantized as the reference quantizes it for an fp8 weight) against rows `rows`, `[t, rows.len()]`.
-pub trait DenseKernel: Send + Sync {
+pub trait DenseKernel: Send + Sync + std::any::Any {
     fn forward_rows(&self, x: &[f32], t: usize, rows: std::ops::Range<usize>) -> Vec<f32>;
+
+    /// Several kernels' sums in one call of this kernel's kind (a GPU's: one submit, one round trip for all), each
+    /// `(kernel, x, t, rows)`'s in order; None when it cannot take them together (another kind among them), and the
+    /// caller makes them one at a time.
+    fn forward_many(&self, items: &[(&dyn DenseKernel, &[f32], usize, std::ops::Range<usize>)]) -> Option<Vec<Vec<f32>>> {
+        let _ = items;
+        None
+    }
+}
+
+/// Several weights' [`Weight::forward_rows`] at once, each `(weight, x, t, rows, out)`'s result in order and the same
+/// as alone. Weights a device holds go in one call when its kernel takes them together: a decode step's dense calls
+/// were each a round trip to the GPU, 667 of them a token, a third of them the eight groups of each layer's `wo_a`.
+pub fn forward_together(items: &[(&Weight, &[f32], usize, std::ops::Range<usize>, Out)]) -> Vec<Vec<f32>> {
+    let kernels: Option<Vec<&dyn DenseKernel>> =
+        items.iter().map(|(w, ..)| if let Weight::Device { kernel, .. } = w { Some(&**kernel) } else { None }).collect();
+    if let Some(kernels) = kernels.filter(|k| k.len() > 1) {
+        let prepared: Vec<(Vec<f32>, Out)> = items
+            .iter()
+            .map(|(w, x, t, rows, out)| {
+                assert_eq!(x.len(), t * w.k(), "linear: input is not [t, k]");
+                assert!(rows.end <= w.n(), "linear: row range past the weight");
+                w.prepare(x, *out)
+            })
+            .collect();
+        let many: Vec<(&dyn DenseKernel, &[f32], usize, std::ops::Range<usize>)> =
+            kernels.iter().zip(items).zip(&prepared).map(|((k, (_, _, t, rows, _)), (x, _))| (*k, x.as_slice(), *t, rows.clone())).collect();
+        let start = std::time::Instant::now();
+        if let Some(mut ys) = kernels[0].forward_many(&many) {
+            crate::profile::add(crate::profile::Part::DeviceDense, start);
+            for (y, (_, out)) in ys.iter_mut().zip(&prepared) {
+                if *out == Out::Bf16 {
+                    for v in y.iter_mut() {
+                        *v = to_bf16(*v);
+                    }
+                }
+            }
+            return ys;
+        }
+    }
+    items.iter().map(|(w, x, t, rows, out)| w.forward_rows(x, *t, rows.clone(), *out)).collect()
 }
 
 pub enum Weight {
@@ -137,6 +178,15 @@ impl Weight {
         self.forward_rows(x, t, 0..self.n(), out)
     }
 
+    /// The activation as this weight takes it, and the rounding of its result: an fp8 weight's quantized and its
+    /// result bf16, as the reference does.
+    fn prepare(&self, x: &[f32], out: Out) -> (Vec<f32>, Out) {
+        match self {
+            Weight::Fp8 { .. } | Weight::Device { fp8: true, .. } => (fake_quant_fp8(x, FP8_BLOCK), Out::Bf16),
+            _ => (x.to_vec(), out),
+        }
+    }
+
     /// [`forward`](Self::forward) restricted to output rows `rows`, giving
     /// `[t, rows.len()]` — one group of a block-diagonal projection (`wo_a`).
     pub fn forward_rows(&self, x: &[f32], t: usize, rows: std::ops::Range<usize>, out: Out) -> Vec<f32> {
@@ -144,10 +194,7 @@ impl Weight {
         assert_eq!(x.len(), t * k, "linear: input is not [t, k]");
         assert!(rows.end <= self.n(), "linear: row range past the weight");
         let (first, n) = (rows.start, rows.len());
-        let (xin, out) = match self {
-            Weight::Fp8 { .. } | Weight::Device { fp8: true, .. } => (fake_quant_fp8(x, FP8_BLOCK), Out::Bf16),
-            _ => (x.to_vec(), out),
-        };
+        let (xin, out) = self.prepare(x, out);
         let start = std::time::Instant::now();
         if let Weight::Device { kernel, .. } = self {
             let mut y = kernel.forward_rows(&xin, t, rows);

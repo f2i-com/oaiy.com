@@ -204,8 +204,16 @@ impl Attention {
             return Err(Error::Arg(format!("position {} past max_seq {}", start_pos + t, self.rope.max_pos())));
         }
 
+        // the queries' and the window's projections of x, together
+        let [qa, kva]: [Vec<f32>; 2] = crate::linear::forward_together(&[
+            (&self.wq_a, x, t, 0..self.wq_a.n(), Out::Bf16),
+            (&self.wkv, x, t, 0..self.wkv.n(), Out::Bf16),
+        ])
+        .try_into()
+        .expect("two projections");
+
         // queries
-        let qr = rmsnorm(&self.wq_a.forward(x, t, Out::Bf16), &self.q_norm, cfg.norm_eps);
+        let qr = rmsnorm(&qa, &self.q_norm, cfg.norm_eps);
         let mut q = self.wq_b.forward(&qr, t, Out::Bf16);
         for i in 0..t {
             for h in 0..nh {
@@ -215,7 +223,7 @@ impl Attention {
         }
 
         // sliding-window KV: normalize, rotate, fp8 round trip
-        let mut kv = rmsnorm(&self.wkv.forward(x, t, Out::Bf16), &self.kv_norm, cfg.norm_eps);
+        let mut kv = rmsnorm(&kva, &self.kv_norm, cfg.norm_eps);
         for i in 0..t {
             let row = &mut kv[i * hd..(i + 1) * hd];
             self.rope.apply(&mut row[hd - rd..], start_pos + i, false);
@@ -289,7 +297,10 @@ impl Attention {
             let latent = match &self.compressor {
                 Some(c) => {
                     shared.compress_src = Some(self.layer);
-                    c.forward(cfg, x, t, start_pos, &mut states[self.layer])
+                    let compressing = std::time::Instant::now();
+                    let latent = c.forward(cfg, x, t, start_pos, &mut states[self.layer]);
+                    crate::profile::add(crate::profile::Part::Compressor, compressing);
+                    latent
                 }
                 None => None,
             };
@@ -298,7 +309,10 @@ impl Attention {
                     let got = if compress_len == 0 {
                         vec![Vec::new(); t]
                     } else {
-                        self.indexer_forward(ix, cfg, x, &qr, latent.as_deref(), t, start_pos, offset, states, shared)?
+                        let indexing = std::time::Instant::now();
+                        let got = self.indexer_forward(ix, cfg, x, &qr, latent.as_deref(), t, start_pos, offset, states, shared)?;
+                        crate::profile::add(crate::profile::Part::Indexer, indexing);
+                        got
                     };
                     shared.topk = got.clone();
                     got
@@ -347,9 +361,10 @@ impl Attention {
         // grouped low-rank output: wo_a is block-diagonal over o_groups
         let (g, gd, orank) = (cfg.o_groups, nh * hd / cfg.o_groups, cfg.o_lora_rank);
         let mut og = vec![0.0f32; t * g * orank];
-        for grp in 0..g {
-            let xg: Vec<f32> = (0..t).flat_map(|i| o[(i * g + grp) * gd..(i * g + grp + 1) * gd].iter().copied()).collect();
-            let yg = self.wo_a.forward_rows(&xg, t, grp * orank..(grp + 1) * orank, Out::Bf16);
+        let xgs: Vec<Vec<f32>> = (0..g).map(|grp| (0..t).flat_map(|i| o[(i * g + grp) * gd..(i * g + grp + 1) * gd].iter().copied()).collect()).collect();
+        let groups: Vec<(&Weight, &[f32], usize, std::ops::Range<usize>, Out)> =
+            xgs.iter().enumerate().map(|(grp, xg)| (&self.wo_a, xg.as_slice(), t, grp * orank..(grp + 1) * orank, Out::Bf16)).collect();
+        for (grp, yg) in crate::linear::forward_together(&groups).into_iter().enumerate() {
             for i in 0..t {
                 og[(i * g + grp) * orank..(i * g + grp + 1) * orank].copy_from_slice(&yg[i * orank..(i + 1) * orank]);
             }

@@ -296,4 +296,30 @@ pub struct ExpertJob<'a> {
 /// `fake_quant_fp8` and [`swiglu`]), so only the sums are made there.
 pub trait ExpertsKernel: Send + Sync {
     fn forward(&self, jobs: &[ExpertJob<'_>], swiglu_limit: f32) -> Vec<Vec<f32>>;
+
+    /// Which of a layer's `experts`, each used by `tokens[i]` of a pass's tokens, the device keeps (their records
+    /// resident there, so nobody need read them): [`Self::forward_held`] computes those. Every use counts toward what
+    /// it keeps, held or not. By default it keeps none.
+    fn holds(&self, layer: u32, experts: &[u32], tokens: &[usize]) -> Vec<bool> {
+        let _ = (layer, tokens);
+        vec![false; experts.len()]
+    }
+
+    /// [`Self::forward`] for experts it holds, `(expert, x, weights)` each, from their resident records.
+    fn forward_held(&self, layer: u32, jobs: &[(u32, &[f32], &[f32])], swiglu_limit: f32) -> Vec<Vec<f32>> {
+        let _ = (layer, jobs, swiglu_limit);
+        panic!("this experts kernel holds no experts")
+    }
+
+    /// Records a decode step has just read for experts it did not hold: it keeps any used more often than what it
+    /// would replace.
+    fn offer(&self, layer: u32, records: &[(u32, &[u8])]) {
+        let _ = (layer, records);
+    }
+
+    /// A forward pass of `tokens` tokens has ended: after a prompt it may take in the experts the prompt used most
+    /// (from `cache`, the RAM tier, never from the drive), after a decode step age what it counts.
+    fn pass_done(&self, tokens: usize, cache: &oaiy_engine::ecache::Ecache, store: &dyn WeightStore) {
+        let _ = (tokens, cache, store);
+    }
 }

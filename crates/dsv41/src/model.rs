@@ -197,7 +197,9 @@ impl Model {
                 let hs: Vec<i64> = (0..t)
                     .flat_map(|i| hashes[(i * n_eng + eg.hash_index) * cols..(i * n_eng + eg.hash_index + 1) * cols].iter().copied())
                     .collect();
+                let looking_up = std::time::Instant::now();
                 h = eg.forward(&self.cfg, &h, t, &hs)?;
+                crate::profile::add(crate::profile::Part::Engram, looking_up);
             }
             let (out, next_pre, _routes) = self.block(l, &h, t, start_pos, &pre_mix, trace)?;
             h = out;
@@ -206,6 +208,9 @@ impl Model {
             trace(&format!("layer{l:02}.pre_mix"), &pre_mix.iter().flatten().copied().collect::<Vec<_>>());
         }
 
+        if let Some(gpu) = &self.experts.gpu {
+            gpu.pass_done(t, &self.experts.cache, self.experts.store.as_ref());
+        }
         let last = t - 1;
         let x = hc::pre(&h[last * HC * d..(last + 1) * HC * d], &pre_mix[last]);
         let x = rmsnorm(&x, &self.norm, self.cfg.norm_eps);
@@ -232,27 +237,46 @@ impl Model {
         let (d, eps) = (cfg.dim, cfg.norm_eps);
         // token i's [HC, dim] stream inside a [t, HC, dim] buffer
         let tok = |i: usize| i * HC * d..(i + 1) * HC * d;
-        let mixes = |x: &[f32], p: &HcParams| -> Vec<Mix> {
-            (0..t).map(|i| hc::mixes(&x[tok(i)], p, eps, cfg.hc_sinkhorn_iters, cfg.hc_eps)).collect()
-        };
+        // Each token's mixing on its own, so spread over the threads: the same results. One by one, a 2,000-token
+        // prompt's took about a minute (24 dot products of HC * dim a token, twice a layer).
+        let mixes = |x: &[f32], p: &HcParams| -> Vec<Mix> { per_token(t, |i| hc::mixes(&x[tok(i)], p, eps, cfg.hc_sinkhorn_iters, cfg.hc_eps)) };
 
+        let mixing = std::time::Instant::now();
         let attn_mix = mixes(h, &ly.hc_attn);
-        let x: Vec<f32> = (0..t).flat_map(|i| hc::pre(&h[tok(i)], &pre_mix[i])).collect();
+        let x: Vec<f32> = per_token(t, |i| hc::pre(&h[tok(i)], &pre_mix[i])).concat();
+        crate::profile::add(crate::profile::Part::Mixing, mixing);
         let x = rmsnorm(&x, &ly.attn_norm, eps);
         let a = ly.attn.forward(cfg, &x, t, start_pos, states, shared)?;
         trace(&format!("layer{l:02}.attn_out"), &a);
-        let h1: Vec<f32> = (0..t).flat_map(|i| hc::post(&a[i * d..(i + 1) * d], &h[tok(i)], &attn_mix[i])).collect();
+        let mixing = std::time::Instant::now();
+        let h1: Vec<f32> = per_token(t, |i| hc::post(&a[i * d..(i + 1) * d], &h[tok(i)], &attn_mix[i])).concat();
 
         let ffn_mix = mixes(&h1, &ly.hc_ffn);
-        let x: Vec<f32> = (0..t).flat_map(|i| hc::pre(&h1[tok(i)], &attn_mix[i].pre)).collect();
+        let x: Vec<f32> = per_token(t, |i| hc::pre(&h1[tok(i)], &attn_mix[i].pre)).concat();
+        crate::profile::add(crate::profile::Part::Mixing, mixing);
         let x = rmsnorm(&x, &ly.ffn_norm, eps);
         let (m, routes) = ly.moe.forward(cfg, &x, t, experts)?;
         trace(&format!("layer{l:02}.moe_out"), &m);
         trace(&format!("layer{l:02}.route_ids"), &routes.iter().flat_map(|r| r.experts.iter().map(|&e| e as f32)).collect::<Vec<_>>());
         trace(&format!("layer{l:02}.route_w"), &routes.iter().flat_map(|r| r.weights.iter().copied()).collect::<Vec<_>>());
-        let h2: Vec<f32> = (0..t).flat_map(|i| hc::post(&m[i * d..(i + 1) * d], &h1[tok(i)], &ffn_mix[i])).collect();
+        let mixing = std::time::Instant::now();
+        let h2: Vec<f32> = per_token(t, |i| hc::post(&m[i * d..(i + 1) * d], &h1[tok(i)], &ffn_mix[i])).concat();
+        crate::profile::add(crate::profile::Part::Mixing, mixing);
         Ok((h2, ffn_mix.iter().map(|m| m.pre).collect(), routes))
     }
+}
+
+/// `f(i)` for each of `t` tokens, in order, spread over the threads (each token's on its own, so the same results as
+/// one by one).
+fn per_token<T: Send>(t: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    let parts: std::sync::Mutex<Vec<(usize, Vec<T>)>> = std::sync::Mutex::new(Vec::new());
+    oaiy_engine::backend::parallel_rows(t, 8, &|b, e| {
+        let part: Vec<T> = (b..e).map(&f).collect();
+        parts.lock().unwrap_or_else(|p| p.into_inner()).push((b, part));
+    });
+    let mut parts = parts.into_inner().unwrap_or_else(|p| p.into_inner());
+    parts.sort_by_key(|(b, _)| *b);
+    parts.into_iter().flat_map(|(_, part)| part).collect()
 }
 
 /// What the model's state holds after some tokens, to come back to with [`Model::restore`]: a conversation's next turn

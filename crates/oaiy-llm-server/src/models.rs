@@ -842,9 +842,18 @@ impl Models {
         match picked.backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>() {
             Some(b) => {
                 let (count, bytes) = crate::dsv41_portable::offload(&mut model, b);
-                // A prompt's busy experts there too (uploaded for the prompt); a decode step's stay on the CPU's tiers.
-                model.set_experts_kernel(Some(Arc::new(crate::dsv41_portable::WgpuExperts(Arc::clone(&picked.backend)))));
-                self.say(format!("{} runs on {}: {count} dense matrices ({:.1} GB) there, and a prompt's busy experts; a decode step's experts on the CPU", spec.name, picked.label, bytes as f64 / 1e9));
+                // A prompt's busy experts there too, through record slots in what the budget has left after the trunk,
+                // and the experts used most kept there in what is left after those (a decode step's computed there while
+                // the CPU reads and computes the rest).
+                let experts = match crate::dsv41_portable::WgpuExperts::new(b) {
+                    Some(k) => {
+                        let (n, kept) = (k.slots(), k.tier().0);
+                        model.set_experts_kernel(Some(Arc::new(k)));
+                        format!("a prompt's busy experts ({n} at a time) and {kept} experts kept there between requests; the rest on the CPU")
+                    }
+                    None => "no room left there for experts; they run on the CPU".into(),
+                };
+                self.say(format!("{} runs on {}: {count} dense matrices ({:.1} GB) there, {experts}", spec.name, picked.label, bytes as f64 / 1e9));
             }
             None => self.say(format!("{} runs on the CPU", spec.name)),
         }

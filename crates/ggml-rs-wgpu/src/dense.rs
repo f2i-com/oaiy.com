@@ -9,6 +9,10 @@
 //! the same buffer). A call records a dispatch per buffer its rows touch and the copy back in one submit, and
 //! [`forward_batch`] does that for several weights at once (a layer's experts): a kernel for a few tokens (a decode
 //! step: 32 lanes a row, 8 rows a workgroup) and a tiled one for more (64 tokens by 64 rows, 32 of `k` a step).
+//!
+//! A routed expert's record can also be read as stored ([`RecordSlots`]): uploaded whole into a slot made once, its
+//! MXFP4 matrices read in place with their e8m0 scales (a byte each), so a prompt's busy experts cost one write each
+//! and no conversion on the host.
 
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,12 +33,14 @@ pub enum DenseData {
     Mxfp4 { w: Vec<u8>, scales: Vec<f32>, n: usize, k: usize },
 }
 
-/// Which of the three; also the kernels' `kind`.
+/// Which of the three, and MXFP4 as a record holds it (its scales e8m0 bytes, in the same buffer); also the kernels'
+/// `kind`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     Fp8 = 0,
     Bf16 = 1,
     Mxfp4 = 2,
+    Record = 3,
 }
 
 impl DenseData {
@@ -50,8 +56,9 @@ const COMMON: &str = r#"
 @group(0) @binding(1) var<storage, read> x: array<f32>;
 @group(0) @binding(2) var<storage, read_write> y: array<f32>;
 // k, tokens, the buffer's first row, its rows, the first row asked for, the rows asked for, where its scales start
-// (words), and the kind (0 fp8, 1 bf16, 2 mxfp4).
-@group(0) @binding(3) var<uniform> p: array<vec4<u32>, 2>;
+// (words; bytes for a record), the kind (0 fp8, 1 bf16, 2 mxfp4, 3 a record's mxfp4), and where its weights start
+// (words; 0 but in a record).
+@group(0) @binding(3) var<uniform> p: array<vec4<u32>, 3>;
 
 fn fp8(b: u32) -> f32 {
     let e = (b >> 3u) & 15u;
@@ -77,21 +84,32 @@ fn fp4(n: u32) -> f32 {
 
 // Weights a word holds: 4 fp8, 2 bf16, 8 e2m1.
 fn wide(kind: u32) -> u32 {
-    return select(select(4u, 2u, kind == 1u), 8u, kind == 2u);
+    return select(select(4u, 2u, kind == 1u), 8u, kind >= 2u);
 }
 
 // The j-th weight of a word.
 fn weight(word: u32, kind: u32, j: u32) -> f32 {
     if (kind == 0u) { return fp8((word >> (8u * j)) & 255u); }
-    if (kind == 2u) { return fp4((word >> (4u * j)) & 15u); }
+    if (kind >= 2u) { return fp4((word >> (4u * j)) & 15u); }
     return select(bitcast<f32>(word & 0xffff0000u), bitcast<f32>(word << 16u), j == 0u);
 }
 
-// The scale of the weights of row `local` (in this buffer) at k column `c`: a 32x32 tile's (fp8), a row's 32 (mxfp4),
-// none (bf16).
+// An e8m0 byte as the reference decodes it: 2^(e - 127), 0 the f32 subnormal 2^-127, 255 NaN.
+fn e8m0(e: u32) -> f32 {
+    if (e == 255u) { return bitcast<f32>(0x7fc00000u); }
+    if (e == 0u) { return bitcast<f32>(0x00400000u); }
+    return bitcast<f32>(e << 23u);
+}
+
+// The scale of the weights of row `local` (in this buffer) at k column `c`: a 32x32 tile's (fp8), a row's 32 (mxfp4,
+// as f32; a record's, as an e8m0 byte), none (bf16).
 fn scale(kind: u32, soff: u32, local: u32, c: u32, kb: u32) -> f32 {
     if (kind == 0u) { return bitcast<f32>(wbuf[soff + (local / 32u) * kb + c / 32u]); }
     if (kind == 2u) { return bitcast<f32>(wbuf[soff + local * kb + c / 32u]); }
+    if (kind == 3u) {
+        let b = soff + local * kb + c / 32u;
+        return e8m0((wbuf[b / 4u] >> (8u * (b % 4u))) & 255u);
+    }
     return 1.0;
 }
 "#;
@@ -104,6 +122,7 @@ var<workgroup> part: array<f32, 2048>;
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
     let k = p[0].x; let t = p[0].y; let first = p[0].z; let rows = p[0].w;
     let lo = p[1].x; let count = p[1].y; let soff = p[1].z; let kind = p[1].w;
+    let woff = p[2].x;
     let lane = li & 31u;
     let slot = li >> 5u;
     // The rows this buffer and the call share: [max(first, lo), min(first + rows, lo + count)).
@@ -118,7 +137,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         let per = k / wd;
         let kb = k / 32u;
         for (var w = lane; w < per; w += 32u) {
-            let word = wbuf[local * per + w];
+            let word = wbuf[woff + local * per + w];
             let c = w * wd;
             let s = scale(kind, soff, local, c, kb);
             for (var tt = 0u; tt < t; tt++) {
@@ -149,6 +168,7 @@ var<workgroup> wt: array<f32, 2048>;
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
     let k = p[0].x; let t = p[0].y; let first = p[0].z; let rows = p[0].w;
     let lo = p[1].x; let count = p[1].y; let soff = p[1].z; let kind = p[1].w;
+    let woff = p[2].x;
     let start = max(first, lo);
     let end = min(first + rows, lo + count);
     let r0 = start + wg.x * 64u;
@@ -181,7 +201,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
             var s = 0.0;
             if (live) {
                 let local = row - first;
-                word = wbuf[local * per + k0 / wd + q];
+                word = wbuf[woff + local * per + k0 / wd + q];
                 s = scale(kind, soff, local, k0, kb);
             }
             for (var j = 0u; j < wd; j++) {
@@ -215,8 +235,9 @@ fn shader(many: bool) -> String {
 pub struct DenseGpu {
     gpu: Arc<Gpu>,
     serial: Arc<Mutex<()>>,
-    /// `(buffer, first row, rows, where its scales start in words)`; each buffer whole 32-row tiles.
-    chunks: Vec<(wgpu::Buffer, u32, u32, u32)>,
+    /// `(buffer, first row, rows, where its scales start, where its weights start)` (see the kernels' `p`); each
+    /// buffer whole 32-row tiles.
+    chunks: Vec<(wgpu::Buffer, u32, u32, u32, u32)>,
     n: usize,
     k: usize,
     kind: Kind,
@@ -251,27 +272,24 @@ impl DenseGpu {
         self.k
     }
 
+    /// Whether `other` is on the same adapter, so the two can go in one [`forward_batch`].
+    pub fn same_device(&self, other: &DenseGpu) -> bool {
+        Arc::ptr_eq(&self.gpu, &other.gpu)
+    }
+
     /// `[t, rows.len()]`: the sums of `x` (`[t, k]`, as given) against rows `rows` of the weight, in f32.
     pub fn forward(&self, x: &[f32], t: usize, rows: Range<usize>) -> Vec<f32> {
         forward_batch(&[(self, x, t, rows)]).pop().expect("one weight, one result")
     }
 
-    /// Record the dispatches for `x` (`[t, k]`) against rows `rows` into `pass`, writing a new output buffer.
-    fn record(&self, enc: &mut wgpu::CommandEncoder, x: &[f32], t: usize, rows: Range<usize>) -> Pass {
+    /// Record the dispatches for `xbuf` (`[t, k]`, uploaded) against rows `rows` into `pass`, writing a new output
+    /// buffer.
+    fn record(&self, enc: &mut wgpu::CommandEncoder, xbuf: &wgpu::Buffer, t: usize, rows: Range<usize>) -> Pass {
         let (k, count) = (self.k, rows.len());
-        assert_eq!(x.len(), t * k, "dense: the input is not [t, k]");
         assert!(rows.end <= self.n, "dense: rows past the weight");
         let gpu = &self.gpu;
         let many = t > FEW;
         let pipeline = gpu.named_pipeline(if many { "dense-many" } else { "dense-few" }, || shader(many));
-        let bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let xbuf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("oaiy-dense-x"),
-            size: bytes.len().max(4) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        gpu.queue.write_buffer(&xbuf, 0, &bytes);
         let size = (t * count * 4).max(4) as u64;
         let ybuf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("oaiy-dense-y"),
@@ -280,12 +298,12 @@ impl DenseGpu {
             mapped_at_creation: false,
         });
         let mut groups = Vec::new();
-        for (buffer, first, n_rows, soff) in &self.chunks {
+        for (buffer, first, n_rows, soff, woff) in &self.chunks {
             let (a, b) = ((*first as usize).max(rows.start), (*first as usize + *n_rows as usize).min(rows.end));
             if a >= b {
                 continue;
             }
-            let params: Vec<u8> = [k as u32, t as u32, *first, *n_rows, rows.start as u32, count as u32, *soff, self.kind as u32]
+            let params: Vec<u8> = [k as u32, t as u32, *first, *n_rows, rows.start as u32, count as u32, *soff, self.kind as u32, *woff, 0, 0, 0]
                 .iter()
                 .flat_map(|v| v.to_le_bytes())
                 .collect();
@@ -328,9 +346,18 @@ pub fn forward_batch(items: &[(&DenseGpu, &[f32], usize, Range<usize>)]) -> Vec<
     let gpu = &first.0.gpu;
     assert!(items.iter().all(|(w, ..)| Arc::ptr_eq(&w.gpu, gpu)), "dense: a batch on more than one GPU");
     let _one = first.0.serial.lock().unwrap_or_else(|p| p.into_inner());
+    // Each input once, however many weights take it (an expert's gate and up take the same).
+    let mut inputs: Vec<((*const f32, usize), wgpu::Buffer)> = Vec::new();
+    for (w, x, t, rows) in items {
+        assert_eq!(x.len(), t * w.k, "dense: the input is not [t, k]");
+        if *t > 0 && !rows.is_empty() && !inputs.iter().any(|(key, _)| *key == (x.as_ptr(), x.len())) {
+            inputs.push(((x.as_ptr(), x.len()), upload_f32(gpu, x)));
+        }
+    }
+    let input = |x: &[f32]| &inputs.iter().find(|(key, _)| *key == (x.as_ptr(), x.len())).expect("every input uploaded").1;
     let mut enc = gpu.device.create_command_encoder(&Default::default());
     let passes: Vec<Option<Pass>> =
-        items.iter().map(|(w, x, t, rows)| (*t > 0 && !rows.is_empty()).then(|| w.record(&mut enc, x, *t, rows.clone()))).collect();
+        items.iter().map(|(w, x, t, rows)| (*t > 0 && !rows.is_empty()).then(|| w.record(&mut enc, input(x), *t, rows.clone()))).collect();
     let total: u64 = passes.iter().flatten().map(|p| p.size).sum();
     if total == 0 {
         return items.iter().map(|_| Vec::new()).collect();
@@ -362,7 +389,103 @@ pub fn forward_batch(items: &[(&DenseGpu, &[f32], usize, Range<usize>)]) -> Vec<
         .collect()
 }
 
+/// `x` in a new storage buffer.
+fn upload_f32(gpu: &Gpu, x: &[f32]) -> wgpu::Buffer {
+    let mut bytes = Vec::with_capacity(x.len() * 4);
+    for v in x {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    let buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("oaiy-dense-x"),
+        size: bytes.len().max(4) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    gpu.queue.write_buffer(&buf, 0, &bytes);
+    buf
+}
+
+/// Routed experts' records on the GPU, a slot a record, made once and written call after call: a prompt's busy experts
+/// pass through them a group at a time. A record goes up as stored, one write, and its MXFP4 matrices are read in place
+/// with their e8m0 scales, so nothing is converted on the host. The slots count against the weight budget while they
+/// live.
+pub struct RecordSlots {
+    gpu: Arc<Gpu>,
+    serial: Arc<Mutex<()>>,
+    slots: Vec<wgpu::Buffer>,
+    record_bytes: usize,
+    nbytes: u64,
+    used: Arc<AtomicU64>,
+}
+
+impl Drop for RecordSlots {
+    fn drop(&mut self) {
+        self.used.fetch_sub(self.nbytes, Ordering::Relaxed);
+    }
+}
+
+impl RecordSlots {
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// Queue `record`'s upload into slot `i`: it lands before the matmuls of the next call, and starts over the link at
+    /// once (an empty submit), so one record goes up while the next is written.
+    pub fn write(&self, i: usize, record: &[u8]) {
+        assert_eq!(record.len(), self.record_bytes, "dense: a record of another size");
+        self.gpu.queue.write_buffer(&self.slots[i], 0, record);
+        self.gpu.queue.submit([]);
+    }
+
+    /// Slot `i`'s MXFP4 matrix `[n, k]`: its nibbles from byte `w` (`[n, k]`, two to a byte, low first), its e8m0 scales
+    /// from byte `s` (`[n, k/32]`). It reads whatever the slot holds when it is used.
+    pub fn mxfp4(&self, i: usize, w: usize, s: usize, n: usize, k: usize) -> DenseGpu {
+        assert!(k % 32 == 0 && w % 4 == 0, "dense: a record's matrix off its words");
+        assert!(w + n * k / 2 <= self.record_bytes && s + n * (k / 32) <= self.record_bytes, "dense: a matrix past its record");
+        DenseGpu {
+            gpu: Arc::clone(&self.gpu),
+            serial: Arc::clone(&self.serial),
+            chunks: vec![(self.slots[i].clone(), 0, n as u32, s as u32, (w / 4) as u32)],
+            n,
+            k,
+            kind: Kind::Record,
+            nbytes: 0,
+            used: Arc::clone(&self.used),
+        }
+    }
+}
+
 impl WgpuBackend {
+    /// Up to `count` slots for records of `record_bytes`, as many as the weight budget has room for; None if not one,
+    /// or if a record is not whole words or is past the binding limit.
+    pub fn record_slots(&self, count: usize, record_bytes: usize) -> Option<RecordSlots> {
+        if record_bytes == 0 || record_bytes % 4 != 0 || record_bytes as u64 > chunk_limit(&self.gpu.limits) {
+            return None;
+        }
+        let free = self.budget.saturating_sub(self.used.load(Ordering::Relaxed));
+        let n = count.min((free / record_bytes as u64) as usize);
+        if n == 0 {
+            return None;
+        }
+        let nbytes = (n * record_bytes) as u64;
+        self.used.fetch_add(nbytes, Ordering::Relaxed);
+        let slots = (0..n)
+            .map(|_| {
+                self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("oaiy-record"),
+                    size: record_bytes as u64,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            })
+            .collect();
+        Some(RecordSlots { gpu: Arc::clone(&self.gpu), serial: Arc::clone(&self.serial), slots, record_bytes, nbytes, used: Arc::clone(&self.used) })
+    }
+
     /// A dense weight on the GPU while the weight budget holds it: None beyond it (the caller keeps it on the CPU), or
     /// when `k` is not a multiple of 32 (the tiles' edge).
     pub fn dense(&self, data: DenseData) -> Result<Option<Arc<DenseGpu>>, String> {
@@ -430,7 +553,7 @@ impl WgpuBackend {
                 }
             };
             let (buffer, _, _) = gpu.upload_rows(&bytes, bytes.len(), 1).remove(0);
-            chunks.push((buffer, first as u32, rows as u32, soff));
+            chunks.push((buffer, first as u32, rows as u32, soff, 0));
             first += rows;
         }
         Ok(Some(Arc::new(DenseGpu { gpu: Arc::clone(gpu), serial: Arc::clone(&self.serial), chunks, n, k, kind, nbytes, used: Arc::clone(&self.used) })))
@@ -612,5 +735,84 @@ mod tests {
         assert!(b.usage().0 > 0);
         drop(g);
         assert_eq!(b.usage().0, 0);
+    }
+
+    #[test]
+    fn every_e8m0_scale_of_a_record_decodes_as_the_reference_decodes_it() {
+        let Some(b) = backend() else { return };
+        // A record of one matrix [256, 32]: every weight the nibble 2 (1.0), row r's scale the byte r. A one-hot input
+        // reads each row's scale back.
+        let (n, k) = (256, 32);
+        let w_bytes = n * k / 2;
+        let mut record = vec![0x22u8; w_bytes];
+        record.extend((0..n).map(|r| r as u8));
+        let slots = b.record_slots(1, record.len()).expect("room for a slot");
+        slots.write(0, &record);
+        let m = slots.mxfp4(0, 0, w_bytes, n, k);
+        let mut x = vec![0.0f32; k];
+        x[5] = 1.0;
+        let y = m.forward(&x, 1, 0..n);
+        // Every byte but 255, NaN, which no checkpoint holds (and which WGSL lets a GPU treat as a number).
+        for e in 1..255usize {
+            assert_eq!(y[e].to_bits(), (e as u32) << 23, "byte {e}");
+        }
+        // 2^-127 is an f32 subnormal: a GPU may flush it to zero in the product, as no checkpoint's scale comes near.
+        assert!(y[0] == f32::from_bits(0x0040_0000) || y[0] == 0.0, "{}", y[0]);
+    }
+
+    #[test]
+    fn a_records_matrices_read_in_place_give_what_the_same_weights_uploaded_alone_give() {
+        let Some(b) = backend() else { return };
+        // Two matrices in one record, at word offsets, their scales after them; the same weights as Mxfp4 with f32
+        // scales give the same sums, to the bit (the kernels add in the same order).
+        let (n1, k1, n2, k2) = (96usize, 64usize, 64usize, 96usize);
+        let mut next = rng(11);
+        let w1: Vec<u8> = (0..n1 * k1 / 2).map(|_| (next() & 255) as u8).collect();
+        let w2: Vec<u8> = (0..n2 * k2 / 2).map(|_| (next() & 255) as u8).collect();
+        let s1: Vec<u8> = (0..n1 * k1 / 32).map(|_| 118 + (next() % 8) as u8).collect();
+        let s2: Vec<u8> = (0..n2 * k2 / 32).map(|_| 118 + (next() % 8) as u8).collect();
+        let record: Vec<u8> = [w1.as_slice(), &w2, &s1, &s2].concat();
+        let (o2, os1, os2) = (w1.len(), w1.len() + w2.len(), w1.len() + w2.len() + s1.len());
+        let slots = b.record_slots(2, record.len()).expect("room for two slots");
+        assert_eq!(slots.len(), 2);
+        slots.write(1, &record);
+        let f32s = |s: &[u8]| s.iter().map(|&e| f32::from_bits((e as u32) << 23)).collect::<Vec<f32>>();
+        let alone1 = b.dense(DenseData::Mxfp4 { w: w1.clone(), scales: f32s(&s1), n: n1, k: k1 }).unwrap().unwrap();
+        let alone2 = b.dense(DenseData::Mxfp4 { w: w2.clone(), scales: f32s(&s2), n: n2, k: k2 }).unwrap().unwrap();
+        let (m1, m2) = (slots.mxfp4(1, 0, os1, n1, k1), slots.mxfp4(1, o2, os2, n2, k2));
+        for t in [1usize, 9, 70] {
+            let (x1, x2) = (input(t, k1, t as u64), input(t, k2, t as u64 + 1));
+            let got = forward_batch(&[(&m1, &x1, t, 0..n1), (&m2, &x2, t, 3..n2), (&m1, &x1, t, 7..20)]);
+            assert_eq!(got[0], alone1.forward(&x1, t, 0..n1), "t={t}");
+            assert_eq!(got[1], alone2.forward(&x2, t, 3..n2), "t={t}");
+            assert_eq!(got[2], alone1.forward(&x1, t, 7..20), "t={t}");
+        }
+        let held = b.usage().0;
+        drop(slots);
+        assert_eq!(b.usage().0, held - 2 * record.len() as u64, "the slots' bytes come back to the budget");
+    }
+
+    /// What the link to the adapter carries: 32 expert-sized writes (600 MB) into buffers made once, then waited for.
+    #[test]
+    #[ignore = "a timing; run with --nocapture"]
+    fn measure_the_upload_rate() {
+        let Some(b) = backend() else { return };
+        let gpu = &b.gpu;
+        let size = 18_874_368u64;
+        let host = vec![7u8; size as usize];
+        let bufs: Vec<wgpu::Buffer> = (0..32)
+            .map(|_| gpu.device.create_buffer(&wgpu::BufferDescriptor { label: None, size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }))
+            .collect();
+        for round in 0..4 {
+            let t = std::time::Instant::now();
+            for buf in &bufs {
+                gpu.queue.write_buffer(buf, 0, &host);
+            }
+            let queued = t.elapsed().as_secs_f64();
+            gpu.queue.submit([]);
+            let _ = gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+            let secs = t.elapsed().as_secs_f64();
+            eprintln!("round {round}: {:.0} MB in {secs:.3} s ({:.2} GB/s; the writes queued in {queued:.3} s)", 32.0 * size as f64 / 1e6, 32.0 * size as f64 / secs / 1e9);
+        }
     }
 }
