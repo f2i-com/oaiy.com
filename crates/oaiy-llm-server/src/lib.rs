@@ -214,11 +214,14 @@ impl Options {
     /// else, which is what "most of it" ought to mean.
     ///
     /// 32 GB when the machine will not say -- small enough to start anywhere, and
-    /// `--ram-gb` is there for a caller who knows better.
+    /// `--ram-gb` is there for a caller who knows better. The portable build asks
+    /// the same way (`ggml_rs_wgpu::host_memory`): it used to assume 32 GB always.
     pub fn expert_cache_bytes(&self) -> u64 {
         #[cfg(feature = "cuda")]
         let free = ggml_rs_cuda::host_memory().map(|(free, _)| free as u64);
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(all(not(feature = "cuda"), feature = "webgpu"))]
+        let free = ggml_rs_wgpu::host_memory().map(|(free, _)| free as u64);
+        #[cfg(not(any(feature = "cuda", feature = "webgpu")))]
         let free = None;
         host_cache_budget(self.ram_gb, free)
     }
