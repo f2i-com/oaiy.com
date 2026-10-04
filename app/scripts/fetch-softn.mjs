@@ -20,9 +20,9 @@ import { fileURLToPath } from 'node:url';
 import { installBridge } from './softn-bridge/install.mjs';
 import { unzipSync } from 'fflate';
 
-const RELEASE = 'v0.0.17';
+const RELEASE = 'v0.0.18';
 const ZIP = `softn-formlogic-runtime-${RELEASE}.zip`;
-const ZIP_SHA256 = process.env.SOFTN_ZIP_SHA256 || 'bf906d324e1055be73723faa2c0526f9335ee9c7b554fea417c4192b88122170';
+const ZIP_SHA256 = process.env.SOFTN_ZIP_SHA256 || 'b5c45629bf3a442ec37890547c1eb72937024ebaef6901fea8f409c88f71c0dc';
 const PREFIX = 'hosted-runtime/';
 const SKIP = [/ort-wasm/, /\/speech\//];
 
