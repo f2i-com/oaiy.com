@@ -637,8 +637,12 @@ impl Models {
     #[cfg(feature = "cuda")]
     fn load_flashnext(&self, spec: &Spec) -> Result<Live> {
         let o = &self.opts;
-        self.say(format!("loading {}: Qwen3.8-Flash-Next, native EXL3 over {} GPU(s)", spec.name, o.model_devices.get(&spec.name).unwrap_or(&o.devices).len().max(1)));
-        let devices = o.model_devices.get(&spec.name).unwrap_or(&o.devices);
+        let configured = o.model_devices.get(&spec.name).unwrap_or(&o.devices);
+        // None configured (a model added from the catalog): the first two GPUs, as DeepSeek takes them. It needs about
+        // 50 GB, more than one card holds, and on GPU 0 alone it could not load.
+        let devices = if configured.is_empty() { available_devices(&[], dsv41_cuda::gpu::device_count()?)? } else { configured.clone() };
+        self.say(format!("loading {}: Qwen3.8-Flash-Next, native EXL3 over {} GPU(s)", spec.name, devices.len()));
+        let devices = &devices;
         // Every adapter for the alias, applied together, each at its strength (else the alias's).
         let default_strength = o.lora_strengths.get(&spec.name).copied().unwrap_or(1.0);
         let base = crate::flashnext::lora_base(&spec.path)?;
