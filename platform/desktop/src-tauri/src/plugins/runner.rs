@@ -82,6 +82,12 @@ const OS_ENV_ALLOW_LIST: &[&str] = &[
 #[cfg(not(windows))]
 const OS_ENV_ALLOW_LIST: &[&str] = &["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "TZ"];
 
+/// Variables forwarded to one plugin only, named by its id: an operator's opt-in that plugin documents, set on the
+/// machine before OAIY starts. Aokie's managed-beta build installs the dongle's driver from a catalog it signs itself
+/// only when the operator sets `AOKIE_ALLOW_SELF_SIGNED_DRIVER=1` (Aokie's README, "Managed-beta driver build"); its
+/// production build ignores the variable. No other plugin sees it.
+const PLUGIN_OPT_INS: &[(&str, &str)] = &[("aokie", "AOKIE_ALLOW_SELF_SIGNED_DRIVER")];
+
 /// Names that must never reach a plugin even if they appear on the allow-list.
 ///
 /// Belt and braces: the allow-list above is the control, but a future edit adding
@@ -133,6 +139,12 @@ where
             .any(|allow| allow.eq_ignore_ascii_case(key))
         {
             env.insert(key.to_string(), v.as_ref().to_string());
+        }
+        if let Some((_, name)) = PLUGIN_OPT_INS
+            .iter()
+            .find(|(id, name)| *id == plugin_id && name.eq_ignore_ascii_case(key))
+        {
+            env.insert((*name).to_string(), v.as_ref().to_string());
         }
     }
 
@@ -466,6 +478,19 @@ mod tests {
             false,
         );
         assert_eq!(env.get("OAIY_PLUGIN_ID").map(String::as_str), Some("aokie"));
+    }
+
+    #[test]
+    fn an_operators_opt_in_reaches_the_plugin_that_documents_it_and_no_other() {
+        let mut host = host_env();
+        host.push(("aokie_allow_self_signed_driver", "1"));
+        let aokie = plugin_env(host.clone(), "aokie", Path::new("/d"), "0.1.0", 1, false, true);
+        assert_eq!(aokie.get("AOKIE_ALLOW_SELF_SIGNED_DRIVER").map(String::as_str), Some("1"), "{aokie:?}");
+        let other = plugin_env(host, "weather", Path::new("/d"), "0.1.0", 1, false, false);
+        assert!(!other.keys().any(|k| k.eq_ignore_ascii_case("AOKIE_ALLOW_SELF_SIGNED_DRIVER")), "{other:?}");
+        // Not set on the machine: nothing is invented.
+        let unset = plugin_env(host_env(), "aokie", Path::new("/d"), "0.1.0", 1, false, true);
+        assert!(!unset.contains_key("AOKIE_ALLOW_SELF_SIGNED_DRIVER"), "{unset:?}");
     }
 
     #[test]

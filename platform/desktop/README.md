@@ -168,7 +168,9 @@ refused/dropped before the plugin is involved.
 Supervision: 10s health probes (3 consecutive misses → `unhealthy`, still
 serving), crash detection with bounded 1s/4s/16s restarts, graceful shutdown
 (`plugin.shutdown` → 5s grace → kill). Children get an allow-listed environment
-— no host secrets — and a per-plugin data dir beside the plugins folder
+— no host secrets — and Aokie alone also gets the operator's
+`AOKIE_ALLOW_SELF_SIGNED_DRIVER` when it is set (its managed-beta driver opt-in),
+and a per-plugin data dir beside the plugins folder
 (`<data>/plugin-data/<id>`), outside the bundle, which a signed package may not
 change (see [Package trust](../../docs/PLUGINS.md#package-trust)). A package is
 verified when it is scanned and installed and again just before each launch.
