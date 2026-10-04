@@ -1822,6 +1822,7 @@ mod tests {
     /// If only the first is wrong, the fault is at a chunk boundary. If the first two
     /// are wrong and the third is right, it is in `forward_chunk` itself. If all three
     /// are wrong, it is neither, and length alone is doing it.
+    #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "needs the released weights and a card"]
     fn print_long_prompt_three_ways() {
@@ -1927,6 +1928,7 @@ mod tests {
     /// So: one prompt, both generation prompts, short and long. If the closed form is
     /// the fault, the `<think>` column answers and the `<think></think>` column does
     /// not, and the long prompt makes it worse rather than causing it.
+    #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "needs the released weights and a card"]
     fn print_both_generation_prompts() {
