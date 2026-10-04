@@ -795,6 +795,29 @@ mod tests {
     }
 
     #[test]
+    fn the_catalog_offers_official_models_and_plain_quantizations_of_them_only() {
+        // Not a community fine-tune made to refuse less: an entry names its publisher's model, or a quantization of it.
+        for e in entries() {
+            let text = format!("{e:?}").to_lowercase();
+            for word in ["uncensor", "abliterat", "disinhibit"] {
+                assert!(!text.contains(word), "{}: names a {word}ed model", str_or(e, "id", ""));
+            }
+        }
+        // GLM-5.3-Flash is unsloth's 4-bit dynamic GGUF of Z.ai's weights: its six shards and nothing else.
+        let glm = entries().iter().find(|e| str_or(e, "id", "") == "glm-5.3-flash").expect("GLM-5.3-Flash is in the catalog");
+        let part = &glm.get("parts").and_then(Json::as_array).unwrap()[0];
+        assert_eq!(str_or(part, "repo", ""), "unsloth/GLM-5.3-Flash-GGUF");
+        let include = strings(part.get("include"));
+        for n in 1..=6 {
+            assert!(include.iter().any(|g| glob(g, &format!("UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-0000{n}-of-00006.gguf"))));
+        }
+        for other in ["UD-Q2_K_XL/GLM-5.3-Flash-UD-Q2_K_XL-00001-of-00004.gguf", "mmproj-F16.gguf", "BF16/GLM-5.3-Flash-BF16-00001-of-00010.gguf"] {
+            assert!(!include.iter().any(|g| glob(g, other)), "{other} is not downloaded");
+        }
+        assert_eq!(strings(glm.get("add")), ["GLM-5.3-Flash-GGUF/UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf"]);
+    }
+
+    #[test]
     fn the_engines_here_are_the_programs_the_configuration_can_start() {
         let d = std::env::temp_dir().join(format!("oaiy-engines-here-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();

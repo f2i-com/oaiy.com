@@ -123,6 +123,17 @@ left the experts none of the budget. On two GPUs with CUDA it is far faster.
 No PEFT adapters and no vision tower without CUDA.
 Image and video generation (`oaiy-media`) still need CUDA for useful speed.
 
+## GLM-5.3-Flash without CUDA
+
+Its GGUF (`glm5next`) streams its experts on the CPU, from RAM and the drive, as the
+CUDA build streams them to the cards, and puts its dense layers on the WebGPU adapter.
+The catalog's is unsloth's 4-bit dynamic GGUF of Z.ai's weights (UD-Q4_K_XL, 199.7 GB:
+Q4_K, Q5_K, Q6_K and Q8_0 tensors, read from its headers). On the RTX 5090 (2026-10-05,
+a GGUF of the same architecture and tensor types, 192 GB of RAM): loaded in 11 s with
+6.2 GB on the GPU; the expert cache then filled to a 65 GB working set (it takes a share
+of the free RAM, so a smaller computer holds fewer experts and reads more); a short
+answer at 0.5 tokens a second cold and 1.3 warm.
+
 ## Measured (2026-09-26)
 
 On a Ryzen 9 9950X3D with an RTX 5090 reached through Vulkan (WebGPU picked it

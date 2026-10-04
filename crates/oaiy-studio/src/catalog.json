@@ -110,6 +110,19 @@
       "add": ["Qwen3.8-Flash-Next-exl3"]
     },
     {
+      "id": "glm-5.3-flash",
+      "group": "llm",
+      "name": "GLM-5.3-Flash",
+      "about": "Z.ai's large mixture of experts with tool use, as unsloth's 4-bit dynamic GGUF of the official weights: its experts stream from RAM and the disk as they are needed, so it wants a fast SSD and plenty of RAM. On any GPU through WebGPU about a token a second once warm, its dense layers in about 6 GB of VRAM.",
+      "license": "MIT",
+      "size_gb": 199.7,
+      "vram_gb": 8,
+      "ram_gb": 64,
+      "agent_tools": true,
+      "parts": [{ "repo": "unsloth/GLM-5.3-Flash-GGUF", "revision": "621d456e93e926e4b52f85cff5f634358c1828f9", "include": ["UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-*.gguf"], "into": "GLM-5.3-Flash-GGUF" }],
+      "add": ["GLM-5.3-Flash-GGUF/UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf"]
+    },
+    {
       "id": "deepseek-v4.1-flash",
       "group": "llm",
       "name": "DeepSeek V4.1 Flash",
