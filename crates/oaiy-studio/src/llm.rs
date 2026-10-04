@@ -114,6 +114,18 @@ pub fn launches(llm: &Json, root: &Path, nvidia: bool) -> Vec<Launch> {
     }
 }
 
+/// The weights the portable engine may put on the GPU when the configuration does not say (`llm.webgpu_gb`): the
+/// largest GPU's memory, less `llm.vram_headroom_gb` and 2 GB for the cache and the work buffers. WebGPU cannot report
+/// free memory, so the engine otherwise assumes 8 GiB of any discrete card, and a 27B model ran mostly on the CPU of a
+/// 32 GB card. None (the engine's own default) when no GPU says, or the result would be under 4 GB (an integrated GPU,
+/// whose memory is the computer's). A CUDA build takes the flag and does not use it.
+pub fn auto_webgpu_gb(gpus: &Json, llm: &Json) -> Option<i64> {
+    let largest_mb = gpus.as_array()?.iter().filter_map(|g| g.get("memory_total_mb").and_then(Json::as_i64)).max()?;
+    let headroom = int_or(llm, "vram_headroom_gb", 2).max(0);
+    let gb = largest_mb / 1024 - headroom - 2;
+    (gb >= 4).then_some(gb)
+}
+
 pub struct Llm {
     inner: Mutex<Inner>,
     changed: Condvar,
@@ -332,7 +344,8 @@ impl Llm {
         let gateway_host = cfg.get("gateway").map_or("127.0.0.1", |g| str_or(g, "host", "127.0.0.1"));
         let loopback = gateway_host == "localhost" || gateway_host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
         let (mut args, names) = arguments(llm, root, port, &key, loopback)?;
-        if let Some(gb) = llm.get("webgpu_gb").and_then(Json::as_i64).filter(|n| *n > 0) {
+        let webgpu_gb = llm.get("webgpu_gb").and_then(Json::as_i64).filter(|n| *n > 0).or_else(|| auto_webgpu_gb(&crate::system::System::new().gpus(), llm));
+        if let Some(gb) = webgpu_gb {
             args.push("--webgpu-gb".into());
             args.push(gb.to_string());
         }
@@ -557,6 +570,23 @@ impl Drop for Llm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_portable_engines_gpu_budget_follows_the_largest_gpu_unless_configured() {
+        let gpus = |mbs: &[i64]| Json::Arr(mbs.iter().map(|m| Json::obj([("memory_total_mb", Json::Int(*m))])).collect());
+        let llm = |headroom: Option<i64>| match headroom {
+            Some(h) => Json::obj([("vram_headroom_gb", Json::Int(h))]),
+            None => Json::Obj(Vec::new()),
+        };
+        // A 32 GB RTX 5090 beside a 2 GB Radeon: the 5090's 31 GiB, less 2 of headroom and 2 for the cache.
+        assert_eq!(auto_webgpu_gb(&gpus(&[2048, 32607]), &llm(None)), Some(27));
+        assert_eq!(auto_webgpu_gb(&gpus(&[16288]), &llm(Some(1))), Some(12));
+        assert_eq!(auto_webgpu_gb(&gpus(&[8192]), &llm(None)), Some(4));
+        // An integrated GPU, or none that says: the engine's own default.
+        assert_eq!(auto_webgpu_gb(&gpus(&[2048]), &llm(None)), None);
+        assert_eq!(auto_webgpu_gb(&gpus(&[]), &llm(None)), None);
+        assert_eq!(auto_webgpu_gb(&Json::Arr(vec![Json::obj([("memory_total_mb", Json::Null)])]), &llm(None)), None);
+    }
 
     #[test]
     fn the_default_model_leads_and_extras_follow() {

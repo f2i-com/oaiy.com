@@ -217,16 +217,28 @@ impl std::fmt::Debug for WgpuBackend {
 }
 
 impl WgpuBackend {
-    /// Open the best adapter wgpu finds. `budget_bytes` caps the weights placed
-    /// on it (WebGPU cannot report free memory); `None` picks a default by
-    /// adapter type: 8 GiB discrete, 2 GiB integrated, none for software.
+    /// Open the best adapter wgpu finds, or the one `OAIY_WEBGPU_ADAPTER` names
+    /// (part of its name, any case: "radeon", "arc", "5090"), for a computer with
+    /// more than one GPU. `budget_bytes` caps the weights placed on it (WebGPU
+    /// cannot report free memory); `None` picks a default by adapter type:
+    /// 8 GiB discrete, 2 GiB integrated, none for software.
     pub fn new(budget_bytes: Option<u64>) -> Result<Self, String> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            ..Default::default()
-        }))
-        .map_err(|e| format!("no WebGPU adapter: {e}"))?;
+        let adapter = match std::env::var("OAIY_WEBGPU_ADAPTER").ok().map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()) {
+            Some(wanted) => {
+                let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
+                let names: Vec<String> = adapters.iter().map(|a| { let i = a.get_info(); format!("{} ({:?})", i.name, i.backend) }).collect();
+                adapters
+                    .into_iter()
+                    .find(|a| a.get_info().name.to_lowercase().contains(&wanted))
+                    .ok_or_else(|| format!("OAIY_WEBGPU_ADAPTER={wanted}: no WebGPU adapter has that in its name; there are {}", names.join(", ")))?
+            }
+            None => pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                ..Default::default()
+            }))
+            .map_err(|e| format!("no WebGPU adapter: {e}"))?,
+        };
         let info = adapter.get_info();
         let summary = AdapterSummary {
             name: info.name.clone(),

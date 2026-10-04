@@ -1,5 +1,6 @@
-//! What the machine has: GPUs (through `nvidia-smi`), RAM, and a directory
-//! listing for the UI's file picker.
+//! What the machine has: GPUs (through `nvidia-smi`; without an NVIDIA driver,
+//! the display adapters the OS knows, AMD and Intel among them), RAM, and a
+//! directory listing for the UI's file picker.
 
 use oaiy_engine::json::Json;
 use std::path::{Path, PathBuf};
@@ -44,15 +45,23 @@ impl System {
         v
     }
 
-    /// `[{index, name, memory_used_mb, memory_total_mb, utilization, temperature}]`,
-    /// empty when there is no NVIDIA driver.
+    /// `[{index, name, memory_used_mb, memory_total_mb, utilization, temperature}]`
+    /// from `nvidia-smi`. Without an NVIDIA driver, the display adapters the OS
+    /// knows (an AMD or Intel GPU, which the portable engine runs on through
+    /// WebGPU), with their `vendor` and total memory only: `index` is then their
+    /// place in that list, not a CUDA device. Empty when neither says.
     pub fn gpus(&self) -> Json {
         Self::cached(&self.gpus, GPU_TTL, || {
             let out = quiet("nvidia-smi")
                 .args(["--query-gpu=index,name,memory.used,memory.total,utilization.gpu,temperature.gpu", "--format=csv,noheader,nounits"])
                 .output();
-            let Ok(out) = out else { return Json::Arr(Vec::new()) };
-            Json::Arr(String::from_utf8_lossy(&out.stdout).lines().filter_map(parse_gpu).collect())
+            let nvidia: Vec<Json> = out.map(|o| String::from_utf8_lossy(&o.stdout).lines().filter_map(parse_gpu).collect()).unwrap_or_default();
+            if !nvidia.is_empty() {
+                return Json::Arr(nvidia);
+            }
+            // Adapters do not come and go: asked once.
+            static OTHERS: std::sync::OnceLock<Vec<Json>> = std::sync::OnceLock::new();
+            Json::Arr(OTHERS.get_or_init(other_gpus).clone())
         })
     }
 
@@ -80,6 +89,85 @@ fn parse_gpu(line: &str) -> Option<Json> {
         ("utilization", n(f[4])),
         ("temperature", n(f[5])),
     ]))
+}
+
+/// A display adapter the OS knows, in the shape `nvidia-smi`'s give.
+fn adapter(index: usize, name: &str, vendor: &str, total_mb: Option<u64>) -> Json {
+    Json::obj([
+        ("index", Json::Int(index as i64)),
+        ("name", Json::str(name)),
+        ("vendor", Json::str(vendor)),
+        ("memory_used_mb", Json::Null),
+        ("memory_total_mb", total_mb.map_or(Json::Null, |m| Json::Int(m as i64))),
+        ("utilization", Json::Null),
+        ("temperature", Json::Null),
+    ])
+}
+
+/// A PCI vendor id's name ("1002" is AMD's).
+fn vendor_of(id: &str) -> &'static str {
+    match id.trim_start_matches("0x").to_ascii_lowercase().as_str() {
+        "1002" | "1022" => "amd",
+        "8086" => "intel",
+        "10de" => "nvidia",
+        _ => "other",
+    }
+}
+
+/// Windows: the display class's adapters, `DriverDesc|HardwareInformation.qwMemorySize|MatchingDeviceId` a line, as
+/// [`other_gpus`] reads them. The 64-bit memory size is the dedicated memory every vendor's driver writes (WMI's
+/// `AdapterRAM` stops at 4 GB). Remote and basic display adapters, which have none, are left out.
+fn parse_windows_adapters(text: &str) -> Vec<Json> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let f: Vec<&str> = line.trim().split('|').collect();
+        let (Some(name), Some(bytes), Some(id)) = (f.first(), f.get(1), f.get(2)) else { continue };
+        let Ok(bytes) = bytes.trim().parse::<u64>() else { continue };
+        if bytes == 0 || name.trim().is_empty() || name.starts_with("Microsoft") {
+            continue;
+        }
+        let vendor = id.to_ascii_lowercase().split("ven_").nth(1).map(|v| vendor_of(&v[..v.len().min(4)])).unwrap_or("other");
+        out.push(adapter(out.len(), name.trim(), vendor, Some(bytes / (1024 * 1024))));
+    }
+    out
+}
+
+#[cfg(windows)]
+fn other_gpus() -> Vec<Json> {
+    let script = "Get-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}\\0*' -ErrorAction SilentlyContinue | ForEach-Object { \"$($_.DriverDesc)|$($_.'HardwareInformation.qwMemorySize')|$($_.MatchingDeviceId)\" }";
+    let Ok(out) = quiet("powershell").args(["-NoProfile", "-NonInteractive", "-Command", script]).output() else { return Vec::new() };
+    parse_windows_adapters(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Linux: the DRM cards' PCI vendors, and an AMD card's VRAM (amdgpu's `mem_info_vram_total`). Other vendors' memory
+/// is not in sysfs in a form every driver writes, so it stays unknown.
+#[cfg(target_os = "linux")]
+fn other_gpus() -> Vec<Json> {
+    let Ok(dir) = std::fs::read_dir("/sys/class/drm") else { return Vec::new() };
+    let mut cards: Vec<PathBuf> = dir
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("card") && n[4..].chars().all(|c| c.is_ascii_digit())))
+        .collect();
+    cards.sort();
+    let mut out = Vec::new();
+    for card in cards {
+        let read = |f: &str| std::fs::read_to_string(card.join("device").join(f)).ok().map(|s| s.trim().to_string());
+        let Some(vendor) = read("vendor").map(|v| vendor_of(&v)) else { continue };
+        let total = read("mem_info_vram_total").and_then(|v| v.parse::<u64>().ok()).filter(|b| *b > 0).map(|b| b / (1024 * 1024));
+        let name = read("product_name").filter(|n| !n.is_empty()).unwrap_or_else(|| match vendor {
+            "amd" => "AMD GPU".to_string(),
+            "intel" => "Intel GPU".to_string(),
+            "nvidia" => "NVIDIA GPU".to_string(),
+            _ => "GPU".to_string(),
+        });
+        out.push(adapter(out.len(), &name, vendor, total));
+    }
+    out
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn other_gpus() -> Vec<Json> {
+    Vec::new()
 }
 
 #[cfg(target_os = "linux")]
@@ -181,6 +269,34 @@ fn roots() -> Vec<Json> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn without_an_nvidia_driver_the_display_adapters_are_read_with_their_vendor_and_memory() {
+        // As this computer's registry answers: the Ryzen's Radeon, two RTX 5090s, and remote adapters with no memory.
+        let text = "AMD Radeon(TM) Graphics|2147483648|PCI\\VEN_1002&DEV_13C0&SUBSYS_88771043&REV_C9\r\n\
+                    NVIDIA GeForce RTX 5090|34190917632|pci\\ven_10de&dev_2b85\r\n\
+                    Intel(R) Arc(TM) A770 Graphics|17079205888|PCI\\VEN_8086&DEV_56A0\r\n\
+                    Microsoft Remote Display Adapter||RdpIdd_IndirectDisplay\r\n\
+                    Microsoft Basic Display Adapter|0|ROOT\\BasicDisplay\r\n";
+        let gpus = parse_windows_adapters(text);
+        let got: Vec<(i64, &str, &str, Option<i64>)> = gpus
+            .iter()
+            .map(|g| (g.get("index").and_then(Json::as_i64).unwrap(), g.get("name").and_then(Json::as_str).unwrap(), g.get("vendor").and_then(Json::as_str).unwrap(), g.get("memory_total_mb").and_then(Json::as_i64)))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (0, "AMD Radeon(TM) Graphics", "amd", Some(2048)),
+                (1, "NVIDIA GeForce RTX 5090", "nvidia", Some(32607)),
+                (2, "Intel(R) Arc(TM) A770 Graphics", "intel", Some(16288)),
+            ]
+        );
+        // What nvidia-smi gives and these leave unknown.
+        assert_eq!(gpus[0].get("utilization"), Some(&Json::Null));
+        assert!(parse_windows_adapters("").is_empty());
+        assert_eq!(vendor_of("0x1002"), "amd");
+        assert_eq!(vendor_of("0x8086"), "intel");
+    }
 
     #[test]
     fn nvidia_smi_lines_parse_and_listings_filter_to_models() {

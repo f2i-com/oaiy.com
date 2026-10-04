@@ -1649,7 +1649,7 @@ mod tests {
         assert_eq!(fit(1792, 1024, 1024, 128, 32), (1024, 576));
         assert_eq!(fit(720, 1280, 1024, 128, 32), (576, 1024));
         assert_eq!(fit(512, 320, 1024, 128, 32), (512, 320));
-        let root = std::env::temp_dir().join(format!("oaiy-studio-files-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("oaiy-studio-media-files-{}", std::process::id()));
         std::fs::create_dir_all(root.join("images")).unwrap();
         let file = root.join("images").join("a b.png");
         std::fs::write(&file, b"x").unwrap();

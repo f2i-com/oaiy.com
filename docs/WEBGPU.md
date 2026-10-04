@@ -23,6 +23,16 @@ RAM.
   placed on the GPU: 8 GiB on a discrete GPU, 2 GiB on an integrated one, or
   `--webgpu-gb N`. Weights past it (and types without a shader) stay in RAM and
   use the CPU path. A model bigger than the GPU still runs, split between the two.
+  In OAIY the studio passes `--webgpu-gb` itself when `llm.webgpu_gb` is not set:
+  the largest GPU's memory less `llm.vram_headroom_gb` and 2 GB for the cache and
+  work buffers (27 on a 32 GB card), and nothing under 4 (an integrated GPU keeps
+  the engine's default). It learns the GPUs from `nvidia-smi`, or, without an
+  NVIDIA driver, from the display adapters the OS lists (on Windows the driver's
+  `HardwareInformation.qwMemorySize`, on Linux amdgpu's `mem_info_vram_total`), so
+  an AMD or Intel card gets a budget and the setup's "fits your GPU" labels too.
+- **Which GPU:** the high-performance adapter, or the one `OAIY_WEBGPU_ADAPTER`
+  names (part of its name, any case: `radeon`, `arc`, `5090`). An unknown name
+  fails with the list of adapters wgpu found.
 - **Large tensors** are split by rows below the adapter's binding limit (a
   152k-vocabulary Q6_K output head is about 640 MB).
 
@@ -59,8 +69,11 @@ In **OAIY**, Settings → Language model → *Runs on*:
 
 The Overview page shows what the model actually runs on.
 
-`oaiy-llm-server-webgpu` serves GGUF models only. DeepSeek-V4.1 checkpoints, OrcaSAQ
-(EXL3) and the observer are CUDA engines, and it says so rather than trying.
+`oaiy-llm-server-webgpu` serves GGUF models only, of the types above: a file with
+IQ1, IQ2 or IQ3 tensors (unsloth's smaller "UD" quants mix them in, even UD-Q4_K_M)
+does not load, and OAIY's setup refuses one before it is added. DeepSeek-V4.1
+checkpoints, OrcaSAQ (EXL3) and the observer are CUDA engines, and it says so
+rather than trying.
 Image and video generation (`oaiy-media`) still need CUDA for useful speed.
 
 ## Measured (2026-09-26)
@@ -78,12 +91,17 @@ Through `oaiy-llm-server-webgpu` the 9B loads in 4.1 s and answers chat requests
 Forcing Direct3D 12 (`WGPU_BACKEND=dx12`) passes the same parity test and gives
 the same 1B tokens at 16.8 tok/s.
 
-Only this NVIDIA card has been tested, through Vulkan and D3D12. The shaders are
-plain WGSL, but driver compilers differ, so run `cargo test -p ggml-rs-wgpu` on a
-new adapter before trusting it. The 8 GiB / 2 GiB default budgets are starting
-points, not measurements: drivers often spill oversubscribed buffers to system
-memory silently, so they get slower rather than failing. Set `--webgpu-gb` to the
-card's real memory.
+Two adapters have been tested: this RTX 5090 and the Ryzen's integrated AMD Radeon
+(RDNA 2, 2 GB), each through Vulkan and D3D12 (2026-10-04,
+`OAIY_WEBGPU_ADAPTER=radeon`, with and without `WGPU_BACKEND=dx12`). Every type's
+parity test passes on both, and Qwen3.5 4B answered correctly on the Radeon,
+slowly (36 s for its first seven tokens, most of it the prompt on a small iGPU).
+Through the studio's own budget (27 GiB on the 5090), Qwen3.5 27B and Qwen3.8 27B
+Q4_K_M load in 10-20 s and make and answer tool calls. No discrete AMD or Intel
+card has been tried. The shaders are plain WGSL, but driver compilers differ, so
+run `cargo test -p ggml-rs-wgpu` on a new adapter before trusting it. The budgets
+are not measurements: drivers often spill oversubscribed buffers to system memory
+silently, so they get slower rather than failing.
 
 These runs gave the same tokens as the CPU, but that is not guaranteed in
 general: the GPU sums each dot product in a different order, so a near-tie
