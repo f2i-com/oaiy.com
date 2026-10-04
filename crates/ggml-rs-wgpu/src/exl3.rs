@@ -1142,7 +1142,38 @@ mod tests {
                 let _ = b.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
             }
             let idle = t.elapsed().as_secs_f64() * 1000.0 / 50.0;
-            eprintln!("{k}x{n}: {each:.3} ms a call; an empty submit and wait {idle:.3} ms");
+            // As in a model: the host computes between calls (here 3 ms of spinning), so the GPU waits idle between them.
+            let spin = |ms: f64| {
+                let t = std::time::Instant::now();
+                while t.elapsed().as_secs_f64() * 1000.0 < ms {
+                    std::hint::spin_loop();
+                }
+            };
+            let mut gapped = 0.0;
+            for _ in 0..50 {
+                spin(3.0);
+                let t = std::time::Instant::now();
+                w.linear(&x);
+                gapped += t.elapsed().as_secs_f64() * 1000.0;
+            }
+            // And with every other core busy, as a model's host threads keep them.
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            let busy = std::thread::scope(|s| {
+                for _ in 1..std::thread::available_parallelism().map_or(4, |n| n.get()) {
+                    s.spawn(|| {
+                        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            std::hint::spin_loop();
+                        }
+                    });
+                }
+                let t = std::time::Instant::now();
+                for _ in 0..50 {
+                    w.linear(&x);
+                }
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                t.elapsed().as_secs_f64() * 1000.0 / 50.0
+            });
+            eprintln!("{k}x{n}: {each:.3} ms a call back to back; {:.3} ms after 3 ms of host work; {busy:.3} ms with every core busy; an empty submit and wait {idle:.3} ms", gapped / 50.0);
         }
     }
 

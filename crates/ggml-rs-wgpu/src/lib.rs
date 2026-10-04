@@ -14,6 +14,7 @@
 
 // VENDORED-LOCAL: this crate is OAIY's addition beside ggml-rs-cuda.
 
+pub mod dense;
 pub mod exl3;
 pub mod shaders;
 
@@ -40,6 +41,8 @@ struct Gpu {
     pipelines: Mutex<HashMap<GgmlType, Arc<wgpu::ComputePipeline>>>,
     /// The EXL3 matmul's pipelines (`exl3::shader`): for one row, and for several. Made when first used.
     exl3: Mutex<[Option<Arc<wgpu::ComputePipeline>>; 2]>,
+    /// Other kernels' pipelines by name (`dense`), made when first used.
+    named: Mutex<HashMap<&'static str, Arc<wgpu::ComputePipeline>>>,
     limits: wgpu::Limits,
     /// Upload bytes written since the queue was last flushed.
     staged: AtomicU64,
@@ -193,6 +196,25 @@ impl Gpu {
         pipeline
     }
 
+    /// The pipeline `name`, made from the WGSL `source` gives the first time it is asked for.
+    fn named_pipeline(&self, name: &'static str, source: impl FnOnce() -> String) -> Arc<wgpu::ComputePipeline> {
+        let mut cache = self.named.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(p) = cache.get(name) {
+            return Arc::clone(p);
+        }
+        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(name), source: wgpu::ShaderSource::Wgsl(source().into()) });
+        let pipeline = Arc::new(self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(name),
+            layout: Some(&self.pipeline_layout),
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        }));
+        cache.insert(name, Arc::clone(&pipeline));
+        pipeline
+    }
+
     fn pipeline(&self, dtype: GgmlType) -> Option<Arc<wgpu::ComputePipeline>> {
         let mut cache = self.pipelines.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(p) = cache.get(&dtype) {
@@ -319,7 +341,7 @@ impl WgpuBackend {
         });
         Ok(Self {
             cpu: CpuBackend::new(),
-            gpu: Arc::new(Gpu { device, queue, layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), limits, staged: AtomicU64::new(0) }),
+            gpu: Arc::new(Gpu { device, queue, layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), limits, staged: AtomicU64::new(0) }),
             budget,
             used: Arc::new(AtomicU64::new(0)),
             summary,
