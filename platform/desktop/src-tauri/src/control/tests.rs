@@ -486,6 +486,9 @@ async fn every_tool_runs_and_a_desktop_without_its_routes_is_explained() {
     assert!(is_error(&r) && text(&r).contains("name the provider"), "{r}");
     let r = call(&app, None, "agent_model_set", json!({ "source": "chatgpt", "provider": "lm-studio" })).await;
     assert!(is_error(&r) && text(&r).contains("provider goes with source provider only"), "{r}");
+    // ai_sources_list's id form is read as the bare id: the request reaches the preference route, which this OAIY lacks.
+    let r = call(&app, None, "agent_model_set", json!({ "source": "provider", "provider": "provider:lm-studio" })).await;
+    assert!(is_error(&r) && text(&r).contains("no PUT /api/agent/preferences"), "{r}");
     // Headless: no dashboard to show a page in, said honestly.
     let r = call(&app, None, "ui_open", json!({ "view": "plugins" })).await;
     assert!(is_error(&r) && text(&r).contains("headless"), "{r}");

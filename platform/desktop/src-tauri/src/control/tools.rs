@@ -129,10 +129,10 @@ pub(crate) fn defs() -> &'static [ToolDef] {
                 "The AI sources flows and the Agent can use: OAIY's engine, configured providers and local AI services, ChatGPT (signed in or not, and as whom), and the Agent's own model preference.",
                 none()),
             def("agent_model_set", "Choose the Agent's model", Change,
-                "Choose what the Agent itself runs on: source engine (the model chosen in Engines), chatgpt (the person's ChatGPT sign-in; model is optional, Codex's own default when left out) or provider (one of the AI providers ai_sources_list shows, such as LM Studio or Ollama, by its id; an OpenAI-compatible one, since the Agent works with tool calls; model is optional, the provider's own when left out). Live phone calls keep their own fast route on ChatGPT.",
+                "Choose what the Agent itself runs on: source engine (the model chosen in Engines), chatgpt (the person's ChatGPT sign-in; model is optional, Codex's own default when left out) or provider (one of the AI providers ai_sources_list shows, such as LM Studio or Ollama, by its providerId; an OpenAI-compatible one, since the Agent works with tool calls; model is optional, the provider's own when left out). Live phone calls keep their own fast route on ChatGPT.",
                 object(json!({
                     "source": { "type": "string", "enum": ["engine", "chatgpt", "provider"], "description": "engine, chatgpt or provider." },
-                    "provider": { "type": "string", "minLength": 1, "description": "provider only: the AI provider's id." },
+                    "provider": { "type": "string", "minLength": 1, "description": "provider only: the AI provider's providerId (provider:<id> is read too)." },
                     "model": { "type": "string", "minLength": 1, "description": "chatgpt: a model from Codex's catalogue; provider: a model the provider lists." }
                 }), &["source"])),
             def("chatgpt_sign_in", "Sign in to ChatGPT", Change,
@@ -516,7 +516,8 @@ async fn run(d: &Desk, control: &Control, name: &str, a: &Args<'_>) -> Result<Do
         "agent_model_set" => {
             let source = a.req("source");
             let model = a.str("model");
-            let provider = a.str("provider");
+            // As ai_sources_list's id names it, or bare.
+            let provider = a.str("provider").map(|p| p.strip_prefix("provider:").unwrap_or(p));
             if source == "engine" && model.is_some() {
                 return Err("model goes with chatgpt or provider: on the engine the Agent uses the model chosen in Engines (model_set_default for llm).".into());
             }
@@ -1300,10 +1301,17 @@ async fn ai_sources_list(d: &Desk) -> Result<Done, String> {
     let rows: Vec<Value> = list
         .iter()
         .map(|x| {
-            json!({
+            let mut row = json!({
                 "id": x.get("id"), "kind": x.get("kind"), "name": x.get("name"), "status": x.get("status"),
                 "model": x.get("model"), "capabilities": x.get("capabilities"),
-            })
+            });
+            // An AI provider: the id agent_model_set takes, and its protocol (the Agent needs an OpenAI-compatible one).
+            for key in ["providerId", "protocol"] {
+                if let Some(v) = x.get(key).filter(|v| !v.is_null()) {
+                    row[key] = v.clone();
+                }
+            }
+            row
         })
         .collect();
     data(json!({
