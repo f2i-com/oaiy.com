@@ -299,6 +299,8 @@ jobs:
     outputs:
       windows-setup-sha256: ${{ steps.digests.outputs.windows-setup-sha256 }}
       linux-appimage-sha256: ${{ steps.digests.outputs.linux-appimage-sha256 }}
+      windows-cuda-engine-sha256: ${{ steps.engine-digest.outputs.windows-cuda-engine-sha256 }}
+      linux-cuda-engine-sha256: ${{ steps.engine-digest.outputs.linux-cuda-engine-sha256 }}
     env:
       ZIPP_RELEASE: ${{ needs.meta.outputs.zipp-release }}
       ZIPP_SUMS_SHA256: ${{ needs.meta.outputs.zipp-sums-sha256 }}
@@ -410,6 +412,60 @@ jobs:
       - name: Build the portable language-model engine
         run: cargo build --release --locked -p oaiy-llm-server --no-default-features --features webgpu --bin oaiy-llm-server-webgpu
 
+      # The NVIDIA engine: the CUDA build of the language-model server. The installer does not carry it: OAIY Desktop
+      # fetches it from this release when asked, on a computer with an NVIDIA card, and keeps it only when its signature
+      # (the sign job's, with the updater key) was made for this version's asset (src-tauri/src/nvidia_engine.rs). Where it
+      # runs it needs nothing from NVIDIA but the driver: its kernels are compiled here, through NVRTC, into a cubin per GPU
+      # architecture (crates/oaiy-cuda-build), and its GEMM is its own. Its build takes CUDA 12.8's compiler driver (cudarc
+      # reads its version), NVRTC and the driver's link library: from NVIDIA's network installer (Windows) or apt repository
+      # (Linux), each checked against the digest pinned here.
+      - name: Install CUDA 12.8 for the NVIDIA engine (Windows)
+        if: matrix.label == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:RUNNER_TEMP 'cuda_12.8.0_windows_network.exe'
+          Invoke-WebRequest -Uri 'https://developer.download.nvidia.com/compute/cuda/12.8.0/network_installers/cuda_12.8.0_windows_network.exe' -OutFile $installer
+          $sha = (Get-FileHash -Algorithm SHA256 $installer).Hash.ToLowerInvariant()
+          if ($sha -ne '89e7c44b526b6e30ec5089f221e918090d11f1d5b33c48fbfe08c6ac13f8a95c') { throw "the CUDA installer's digest is $sha, not the one pinned here" }
+          $p = Start-Process -FilePath $installer -ArgumentList '-s', 'nvcc_12.8', 'nvrtc_12.8', 'nvrtc_dev_12.8', 'cudart_12.8', '-n' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "the CUDA installer exited with $($p.ExitCode)" }
+          $cuda = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8'
+          if (-not (Test-Path "$cuda\bin\nvcc.exe")) { throw "CUDA 12.8 did not install: no nvcc in $cuda\bin" }
+          "CUDA_PATH=$cuda" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "$cuda\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Install CUDA 12.8 for the NVIDIA engine (Linux)
+        if: matrix.label == 'linux'
+        run: |
+          set -euo pipefail
+          keyring="$RUNNER_TEMP/cuda-keyring_1.1-1_all.deb"
+          curl -sSfL -o "$keyring" https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          echo "d93190d50b98ad4699ff40f4f7af50f16a76dac3bb8da1eaaf366d47898ff8df  $keyring" | sha256sum -c -
+          sudo dpkg -i "$keyring"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cuda-nvcc-12-8 cuda-nvrtc-dev-12-8 cuda-cudart-dev-12-8 cuda-driver-dev-12-8
+          cuda=/usr/local/cuda-12.8
+          [[ -x "$cuda/bin/nvcc" ]] || { echo "::error::CUDA 12.8 did not install: no nvcc in $cuda/bin"; exit 1; }
+          echo "CUDA_PATH=$cuda" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          echo "$cuda/bin" >> "$GITHUB_PATH"
+
+      # And proven to need nothing from NVIDIA but the driver: the runner has none, so starting it could not show that.
+      - name: Build the NVIDIA engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p oaiy-llm-server
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            node platform/scripts/pe-imports.mjs target/release/oaiy-llm-server.exe --only-nvidia-driver
+          else
+            needed="$(readelf -d target/release/oaiy-llm-server | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p')"
+            echo "$needed"
+            beyond="$(echo "$needed" | grep -E '^lib(cu|nv)' | grep -vx 'libcuda.so.1' || true)"
+            [[ -z "$beyond" ]] || { echo "::error::the NVIDIA engine needs $beyond: it must need nothing from NVIDIA but the driver's libcuda.so.1"; exit 1; }
+          fi
+
       # The installers are built UNSIGNED, on every run, tag or branch. This step runs
       # the project's npm packages and Rust crates, so it is given no secret at all: the
       # updater key is used in the `sign` job, which only signs what these builds made
@@ -490,6 +546,40 @@ jobs:
             name="windows-setup-sha256"; file="release/oaiy-desktop-$VERSION-windows-x64-setup.exe"
           else
             name="linux-appimage-sha256"; file="release/oaiy-desktop-$VERSION-linux-x86_64.AppImage"
+          fi
+          [[ -s "$file" ]] || { echo "::error::$file is not there to record"; exit 1; }
+          echo "$name=$(sha256sum "$file" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      # The NVIDIA engine, beside the installers in release/ (so the evidence covers it), under the name the desktop asks for:
+      # the program alone at the archive's root.
+      - name: Package the NVIDIA engine
+        shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          LABEL: ${{ matrix.label }}
+        run: |
+          set -euo pipefail
+          out="$PWD/release"
+          if [[ "$LABEL" == "windows" ]]; then
+            ( cd target/release && 7z a -tzip -bd "$out/oaiy-cuda-engine-$VERSION-windows-x64.zip" oaiy-llm-server.exe >/dev/null )
+          else
+            tar -C target/release -czf "$out/oaiy-cuda-engine-$VERSION-linux-x86_64.tar.gz" oaiy-llm-server
+          fi
+          ls -l "$out"/oaiy-cuda-engine-*
+
+      # As the installer's: the sign job signs the bytes that have this digest, and no others.
+      - name: Record the NVIDIA engine's digest
+        id: engine-digest
+        shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          LABEL: ${{ matrix.label }}
+        run: |
+          set -euo pipefail
+          if [[ "$LABEL" == "windows" ]]; then
+            name="windows-cuda-engine-sha256"; file="release/oaiy-cuda-engine-$VERSION-windows-x64.zip"
+          else
+            name="linux-cuda-engine-sha256"; file="release/oaiy-cuda-engine-$VERSION-linux-x86_64.tar.gz"
           fi
           [[ -s "$file" ]] || { echo "::error::$file is not there to record"; exit 1; }
           echo "$name=$(sha256sum "$file" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
@@ -594,13 +684,15 @@ jobs:
         working-directory: platform/desktop
         run: npm ci --ignore-scripts
 
-      - name: Sign the setup.exe and the AppImage
+      - name: Sign the setup.exe, the AppImage and the NVIDIA engines
         shell: bash
         env:
           VERSION: ${{ needs.meta.outputs.version }}
-          # What the desktop legs recorded of the installers they made (job outputs of the build, not of the artifact).
+          # What the desktop legs recorded of the installers and the NVIDIA engines they made (job outputs of the build, not of the artifact).
           WINDOWS_SETUP_SHA256: ${{ needs.desktop.outputs.windows-setup-sha256 }}
           LINUX_APPIMAGE_SHA256: ${{ needs.desktop.outputs.linux-appimage-sha256 }}
+          WINDOWS_CUDA_ENGINE_SHA256: ${{ needs.desktop.outputs.windows-cuda-engine-sha256 }}
+          LINUX_CUDA_ENGINE_SHA256: ${{ needs.desktop.outputs.linux-cuda-engine-sha256 }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
@@ -637,6 +729,18 @@ jobs:
           }
           check_input "$artifacts/windows" "oaiy-desktop-$VERSION-windows-x64-setup.exe" "$WINDOWS_SETUP_SHA256"
           check_input "$artifacts/linux" "oaiy-desktop-$VERSION-linux-x86_64.AppImage" "$LINUX_APPIMAGE_SHA256"
+          # The NVIDIA engines the same way: one a leg, by the digest it recorded, with no signature beside it.
+          check_engine() {
+            local dir="$1" asset="$2" expected="$3" extra actual
+            [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || refuse "the desktop build recorded no digest for $asset, so it is not signed"
+            [[ -s "$dir/$asset" ]] || refuse "$asset is not among the desktop builds' artifacts"
+            actual="$(sha256sum "$dir/$asset" | cut -d' ' -f1)"
+            [[ "$actual" == "$expected" ]] || refuse "$asset is not what the desktop build made: its digest is $actual and the build recorded $expected"
+            extra="$(find "$dir" -type f -name 'oaiy-cuda-engine-*' ! -name "$asset")"
+            [[ -z "$extra" ]] || refuse "the desktop build's artifacts hold ${extra%%$'\n'*} beside $asset: nothing but the engine is signed, and no signature comes from a build"
+          }
+          check_engine "$artifacts/windows" "oaiy-cuda-engine-$VERSION-windows-x64.zip" "$WINDOWS_CUDA_ENGINE_SHA256"
+          check_engine "$artifacts/linux" "oaiy-cuda-engine-$VERSION-linux-x86_64.tar.gz" "$LINUX_CUDA_ENGINE_SHA256"
           sign_as() {
             local dir="$1" asset="$2" bundled="$3"
             cp "$dir/$asset" "$work/$bundled"
@@ -646,6 +750,9 @@ jobs:
           }
           sign_as "$artifacts/windows" "oaiy-desktop-$VERSION-windows-x64-setup.exe" "OAIY_${VERSION}_x64-setup.exe"
           sign_as "$artifacts/linux" "oaiy-desktop-$VERSION-linux-x86_64.AppImage" "OAIY_${VERSION}_amd64.AppImage"
+          # Under their own release names, which the desktop asks for: it takes an engine only when its signature names this version's asset.
+          sign_as "$artifacts/windows" "oaiy-cuda-engine-$VERSION-windows-x64.zip" "oaiy-cuda-engine-$VERSION-windows-x64.zip"
+          sign_as "$artifacts/linux" "oaiy-cuda-engine-$VERSION-linux-x86_64.tar.gz" "oaiy-cuda-engine-$VERSION-linux-x86_64.tar.gz"
           ls -l "$out"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -731,6 +838,21 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: node platform/scripts/make-latest-json.mjs --dir artifacts --version "$VERSION" --tag "$TAG" --repo "$GITHUB_REPOSITORY" --conf platform/desktop/src-tauri/tauri.conf.json
 
+      # The NVIDIA engines' signatures, as OAIY Desktop checks them before it keeps one: against the public key in tauri.conf.json (the
+      # release stops when the secrets held another key, as the feed's check stops it for an installer), and made for the asset's own name.
+      - name: Check the NVIDIA engines' signatures
+        working-directory: artifacts
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          for asset in "oaiy-cuda-engine-$VERSION-windows-x64.zip" "oaiy-cuda-engine-$VERSION-linux-x86_64.tar.gz"; do
+            [[ -s "$asset" && -s "$asset.sig" ]] || { echo "::error::$asset or its signature is not among the artifacts"; exit 1; }
+            node ../platform/scripts/verify-signature.mjs "$asset"
+            base64 -d < "$asset.sig" | sed -n 's/^trusted comment: //p' | tr '\t' '\n' | grep -qxF "file:$asset" \
+              || { echo "::error::the signature of $asset was not made for $asset: the desktop would refuse it"; exit 1; }
+          done
+
       - name: Checksums
         working-directory: artifacts
         run: |
@@ -761,6 +883,12 @@ jobs:
           - OAIY Desktop looks here for a newer version (\`latest.json\`, with the \`.sig\` signatures of
             the setup.exe and the AppImage) and installs one only when you press the button in Settings.
             The \`.msi\`, \`.deb\` and \`.rpm\` are not updated from inside OAIY: download a newer one.
+
+          **The NVIDIA engine** — \`oaiy-cuda-engine-$VERSION-windows-x64.zip\` and
+          \`oaiy-cuda-engine-$VERSION-linux-x86_64.tar.gz\`, the CUDA build of the language-model server, with
+          their \`.sig\` signatures. OAIY Desktop fetches the one for its platform when asked, on a computer with
+          an NVIDIA card, and keeps it only when the signature was made for this version's file. It needs nothing
+          from NVIDIA but the driver.
 
           **oaiy-server** — the same local API with no window, tray or GTK, for a Linux or
           Windows host that the CLI or a hosted web app drives. See \`platform/desktop/README.md\`.

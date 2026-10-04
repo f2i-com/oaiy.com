@@ -39,7 +39,7 @@ const runBash = (script, env, cwd) => spawnSync('bash', ['--noprofile', '--norc'
 const SECRET = 'TAURI_SIGNING_PRIVATE_KEY';
 const PASSWORD = 'TAURI_SIGNING_PRIVATE_KEY_PASSWORD';
 const SIGN_JOB = 'sign';
-const SIGN_STEP = 'Sign the setup.exe and the AppImage';
+const SIGN_STEP = 'Sign the setup.exe, the AppImage and the NVIDIA engines';
 const VERSION = '0.1.0';
 
 describe('the updater signing key in release.yml', () => {
@@ -204,7 +204,16 @@ describe('the signing step, run for real with a stand-in Tauri CLI', { skip: !ba
   const [SETUP_ASSET, APPIMAGE_ASSET] = platformAssets(VERSION).map((p) => p.asset);
   const dirOf = (w, asset) => path.join(w.ws, 'artifacts', asset === SETUP_ASSET ? 'windows' : 'linux');
   /** What the desktop legs recorded of what they made, as job outputs: the environment the sign step is given. */
-  const recorded = { WINDOWS_SETUP_SHA256: sha256(bytesOf(SETUP_ASSET)), LINUX_APPIMAGE_SHA256: sha256(bytesOf(APPIMAGE_ASSET)) };
+  // The NVIDIA engines (the CUDA language-model server), one a leg, signed under their own names: the desktop asks for them by those.
+  const WINDOWS_ENGINE = `oaiy-cuda-engine-${VERSION}-windows-x64.zip`;
+  const LINUX_ENGINE = `oaiy-cuda-engine-${VERSION}-linux-x86_64.tar.gz`;
+  const engineDir = (w, asset) => path.join(w.ws, 'artifacts', asset === WINDOWS_ENGINE ? 'windows' : 'linux');
+  const recorded = {
+    WINDOWS_SETUP_SHA256: sha256(bytesOf(SETUP_ASSET)),
+    LINUX_APPIMAGE_SHA256: sha256(bytesOf(APPIMAGE_ASSET)),
+    WINDOWS_CUDA_ENGINE_SHA256: sha256(bytesOf(WINDOWS_ENGINE)),
+    LINUX_CUDA_ENGINE_SHA256: sha256(bytesOf(LINUX_ENGINE)),
+  };
 
   /** A workspace as the sign job has it after the downloads: each desktop leg's artifacts in a folder of its own, and a stand-in Tauri CLI where npm ci puts it. */
   function workspace({ skip = [] } = {}) {
@@ -214,6 +223,7 @@ describe('the signing step, run for real with a stand-in Tauri CLI', { skip: !ba
     fs.mkdirSync(path.join(dirs.ws, 'artifacts', 'windows'), { recursive: true });
     fs.mkdirSync(path.join(dirs.ws, 'artifacts', 'linux'), { recursive: true });
     for (const asset of [SETUP_ASSET, APPIMAGE_ASSET]) if (!skip.includes(asset)) fs.writeFileSync(path.join(dirOf({ ws: dirs.ws }, asset), asset), bytesOf(asset));
+    for (const asset of [WINDOWS_ENGINE, LINUX_ENGINE]) if (!skip.includes(asset)) fs.writeFileSync(path.join(engineDir({ ws: dirs.ws }, asset), asset), bytesOf(asset));
     // What else a leg's artifact holds (the MSI, the server, the evidence) and the sign job does not sign.
     fs.writeFileSync(path.join(dirs.ws, 'artifacts', 'windows', `oaiy-desktop-${VERSION}-windows-x64.msi`), 'the msi');
     fs.writeFileSync(path.join(dirs.ws, 'artifacts', 'windows', 'release-evidence-windows.json'), '{}');
@@ -243,7 +253,7 @@ describe('the signing step, run for real with a stand-in Tauri CLI', { skip: !ba
   const run = (w, env = {}) =>
     runBash(step.run, { ...process.env, GITHUB_WORKSPACE: slashes(w.ws), RUNNER_TEMP: slashes(w.tmp), VERSION, ...recorded, [SECRET]: KEY, [PASSWORD]: PASSWORD_VALUE, ...env }, w.ws);
 
-  it('signs the two installers, each as the bundler names it, and writes each signature under the release asset’s name', () => {
+  it('signs the two installers, each as the bundler names it, and the NVIDIA engines under their own names, and writes each signature under the release asset’s name', () => {
     const w = workspace();
     const result = run(w);
     assert.equal(result.status, 0, result.stdout + result.stderr);
@@ -251,8 +261,15 @@ describe('the signing step, run for real with a stand-in Tauri CLI', { skip: !ba
     assert.deepEqual(calls, [
       `tauri signer sign ${slashes(w.tmp)}/signing/OAIY_${VERSION}_x64-setup.exe`,
       `tauri signer sign ${slashes(w.tmp)}/signing/OAIY_${VERSION}_amd64.AppImage`,
+      `tauri signer sign ${slashes(w.tmp)}/signing/${WINDOWS_ENGINE}`,
+      `tauri signer sign ${slashes(w.tmp)}/signing/${LINUX_ENGINE}`,
     ]);
-    assert.deepEqual(fs.readdirSync(path.join(w.ws, 'signatures')).sort(), platformAssets(VERSION).map((p) => `${p.asset}.sig`).sort());
+    assert.deepEqual(fs.readdirSync(path.join(w.ws, 'signatures')).sort(), [...platformAssets(VERSION).map((p) => `${p.asset}.sig`), `${WINDOWS_ENGINE}.sig`, `${LINUX_ENGINE}.sig`].sort());
+    // Each engine's signature names its own asset, which is what the desktop takes.
+    for (const asset of [WINDOWS_ENGINE, LINUX_ENGINE]) {
+      const text = Buffer.from(fs.readFileSync(path.join(w.ws, 'signatures', `${asset}.sig`), 'utf8'), 'base64').toString('utf8');
+      assert.match(text, new RegExp(`trusted comment: .*\\tfile:${asset.replace(/\./g, '\\.')}\\n`));
+    }
     // Neither the key nor the password is ever printed.
     assert.ok(!(result.stdout + result.stderr).includes(PASSWORD_VALUE) && !(result.stdout + result.stderr).includes(keys.keyId.toString('hex')), 'a secret was printed');
   });
@@ -290,7 +307,7 @@ describe('the signing step, run for real with a stand-in Tauri CLI', { skip: !ba
         const w = workspace();
         const result = run(w, env);
         assert.equal(result.status, 0, `${what} with ${JSON.stringify(ending)}: ${result.stdout}${result.stderr}`);
-        assert.equal(fs.readdirSync(path.join(w.ws, 'signatures')).length, 2);
+        assert.equal(fs.readdirSync(path.join(w.ws, 'signatures')).length, 4);
         assert.ok(!(result.stdout + result.stderr).includes(PASSWORD_VALUE), 'the password was printed');
       }
     }
@@ -385,6 +402,36 @@ describe('the signing step, run for real with a stand-in Tauri CLI', { skip: !ba
     // What else a leg's artifact holds is left alone (the MSI, the packages, the evidence): the good case above signed with them there.
   });
 
+  it('signs only the NVIDIA engines the desktop build recorded, one a leg, and nothing when one is not', () => {
+    // An engine altered after the build recorded it, one platform at a time: refused before anything is signed.
+    for (const asset of [WINDOWS_ENGINE, LINUX_ENGINE]) {
+      const w = workspace();
+      fs.appendFileSync(path.join(engineDir(w, asset), asset), '!');
+      const result = run(w);
+      assert.equal(result.status, 1, result.stdout + result.stderr);
+      assert.match(result.stdout, new RegExp(`::error::${asset.replace(/\./g, '\\.')} is not what the desktop build made`));
+      assert.equal(fs.existsSync(w.log), false, 'nothing was signed');
+    }
+    // No digest recorded, or no engine there.
+    for (const [env, asset] of [[{ WINDOWS_CUDA_ENGINE_SHA256: '' }, WINDOWS_ENGINE], [{ LINUX_CUDA_ENGINE_SHA256: 'not a digest' }, LINUX_ENGINE]]) {
+      const result = run(workspace(), env);
+      assert.equal(result.status, 1);
+      assert.match(result.stdout, new RegExp(`::error::the desktop build recorded no digest for ${asset.replace(/\./g, '\\.')}, so it is not signed`));
+    }
+    const missing = run(workspace({ skip: [LINUX_ENGINE] }));
+    assert.equal(missing.status, 1);
+    assert.match(missing.stdout, new RegExp(`::error::${LINUX_ENGINE.replace(/\./g, '\\.')} is not among the desktop builds' artifacts`));
+    // Another engine archive beside it (an older one, a signature of it) is refused too.
+    for (const [dir, extra] of [['windows', `oaiy-cuda-engine-0.0.9-windows-x64.zip`], ['linux', `${LINUX_ENGINE}.sig`]]) {
+      const w = workspace();
+      fs.writeFileSync(path.join(w.ws, 'artifacts', dir, extra), 'planted');
+      const result = run(w);
+      assert.equal(result.status, 1, `${dir}/${extra}`);
+      assert.match(result.stdout, /::error::the desktop build's artifacts hold .*oaiy-cuda-engine-/);
+      assert.equal(fs.existsSync(w.log), false, 'nothing was signed');
+    }
+  });
+
   it('fails when an installer is not among the builds’ artifacts, or the signer fails, and publishes nothing', () => {
     const setup = platformAssets(VERSION)[0].asset;
     const missing = workspace({ skip: [setup] });
@@ -409,10 +456,14 @@ describe('the digest of each installer, from the build to the sign job', () => {
     assert.deepEqual(document.jobs.desktop.outputs, {
       'windows-setup-sha256': '${{ steps.digests.outputs.windows-setup-sha256 }}',
       'linux-appimage-sha256': '${{ steps.digests.outputs.linux-appimage-sha256 }}',
+      'windows-cuda-engine-sha256': '${{ steps.engine-digest.outputs.windows-cuda-engine-sha256 }}',
+      'linux-cuda-engine-sha256': '${{ steps.engine-digest.outputs.linux-cuda-engine-sha256 }}',
     });
     const signing = stepNamed(SIGN_JOB, SIGN_STEP);
     assert.equal(signing.env.WINDOWS_SETUP_SHA256, '${{ needs.desktop.outputs.windows-setup-sha256 }}');
     assert.equal(signing.env.LINUX_APPIMAGE_SHA256, '${{ needs.desktop.outputs.linux-appimage-sha256 }}');
+    assert.equal(signing.env.WINDOWS_CUDA_ENGINE_SHA256, '${{ needs.desktop.outputs.windows-cuda-engine-sha256 }}');
+    assert.equal(signing.env.LINUX_CUDA_ENGINE_SHA256, '${{ needs.desktop.outputs.linux-cuda-engine-sha256 }}');
     assert.ok(document.jobs[SIGN_JOB].needs.includes('desktop'));
   });
 
@@ -423,6 +474,44 @@ describe('the digest of each installer, from the build to the sign job', () => {
     assert.ok(record < legs.findIndex((name) => name.startsWith('Release evidence')), 'before the evidence');
     assert.ok(record < legs.findIndex((name) => name.startsWith('actions/upload-artifact@')), 'before the upload');
     assert.equal(stepNamed('desktop', "Record the installer's digest").id, 'digests');
+    // The NVIDIA engine's likewise: packaged into release/ after Collect, recorded after that, both before the evidence and the upload.
+    const pack = legs.indexOf('Package the NVIDIA engine');
+    const engine = legs.indexOf("Record the NVIDIA engine's digest");
+    assert.ok(pack > legs.indexOf('Collect') && engine > pack, 'packaged after Collect, recorded after it is packaged');
+    assert.ok(engine < legs.findIndex((name) => name.startsWith('Release evidence')) && engine < legs.findIndex((name) => name.startsWith('actions/upload-artifact@')));
+    assert.ok(legs.indexOf('Build the NVIDIA engine') < pack && legs.indexOf('Build the NVIDIA engine') > legs.indexOf('Build the portable language-model engine'));
+    assert.equal(stepNamed('desktop', "Record the NVIDIA engine's digest").id, 'engine-digest');
+  });
+
+  it("records the NVIDIA engine's digest from its own leg's archive, and stops when it is not there", { skip: !bash && 'bash is needed' }, () => {
+    const step = stepNamed('desktop', "Record the NVIDIA engine's digest");
+    for (const [label, asset, name, other] of [
+      ['windows', `oaiy-cuda-engine-${VERSION}-windows-x64.zip`, 'windows-cuda-engine-sha256', 'linux-cuda-engine-sha256'],
+      ['linux', `oaiy-cuda-engine-${VERSION}-linux-x86_64.tar.gz`, 'linux-cuda-engine-sha256', 'windows-cuda-engine-sha256'],
+    ]) {
+      const dir = fs.mkdtempSync(path.join(scratch, `engine-${label}-`));
+      fs.mkdirSync(path.join(dir, 'release'));
+      fs.writeFileSync(path.join(dir, 'release', asset), `the ${label} engine`);
+      const output = path.join(dir, 'output');
+      fs.writeFileSync(output, '');
+      const result = runBash(step.run, { ...process.env, VERSION, LABEL: label, GITHUB_OUTPUT: slashes(output) }, dir);
+      assert.equal(result.status, 0, result.stdout + result.stderr);
+      assert.equal(fs.readFileSync(output, 'utf8'), `${name}=${crypto.createHash('sha256').update(`the ${label} engine`).digest('hex')}\n`);
+      assert.ok(!fs.readFileSync(output, 'utf8').includes(other));
+      fs.rmSync(path.join(dir, 'release', asset));
+      fs.writeFileSync(output, '');
+      assert.equal(runBash(step.run, { ...process.env, VERSION, LABEL: label, GITHUB_OUTPUT: slashes(output) }, dir).status, 1);
+      assert.equal(fs.readFileSync(output, 'utf8'), '');
+    }
+  });
+
+  it('checks the NVIDIA engines’ signatures in the release job, against the key every installed OAIY carries, before the checksums', () => {
+    const release = steps.filter((s) => s.job === 'release').map((s) => s.name);
+    const check = release.indexOf("Check the NVIDIA engines' signatures");
+    assert.ok(check > release.indexOf('Attest release evidence from the completed verification') && check < release.indexOf('Checksums'));
+    const step = stepNamed('release', "Check the NVIDIA engines' signatures");
+    assert.match(step.run, /node \.\.\/platform\/scripts\/verify-signature\.mjs "\$asset"/);
+    assert.match(step.run, /grep -qxF "file:\$asset"/);
   });
 
   const record = stepNamed('desktop', "Record the installer's digest");

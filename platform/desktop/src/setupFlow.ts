@@ -233,8 +233,8 @@ export function groupModels(catalog: EngineCatalog | null, group: string): Engin
 }
 
 /**
- * Can an engine this OAIY has run `m`? A model for the CUDA engine alone (DeepSeek-V4.1, the EXL3 models,
- * GLM-5.3-Flash) cannot on an install with only the portable one. An older desktop does not say: every model can.
+ * Can an engine this OAIY has run `m`? A model for the CUDA engine alone (DeepSeek-V4.1) cannot on an install with
+ * only the portable one, until the NVIDIA engine is fetched. An older desktop does not say: every model can.
  */
 export function canRun(catalog: EngineCatalog | null, m: EngineCatalogModel): boolean {
   const here = catalog?.engines;

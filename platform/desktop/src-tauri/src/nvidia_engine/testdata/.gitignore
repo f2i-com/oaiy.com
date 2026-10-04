@@ -1,0 +1,3 @@
+# The repository ignores *.bin (build outputs); these are test fixtures: the bytes the .sig files beside them sign.
+!engine-windows.zip.bin
+!engine-linux.tar.gz.bin

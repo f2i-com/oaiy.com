@@ -2080,6 +2080,21 @@ export interface EngineCatalog {
   engines?: { cuda: boolean; webgpu: boolean } | null;
 }
 
+/**
+ * The NVIDIA engine: the CUDA language-model server, which the installer does not carry and the desktop fetches on
+ * request (its window's commands, not routes).
+ */
+export interface NvidiaEngine {
+  /** A CUDA build is made for this kind of computer (Windows and Linux on x86-64). */
+  offered: boolean;
+  /** This computer has an NVIDIA GPU with its driver. */
+  nvidia: boolean;
+  /** This version's engine has been fetched. */
+  installed: boolean;
+  version: string;
+  fetch: { state: 'idle' | 'downloading' | 'checking' | 'done' | 'failed'; got: number; total: number | null; error: string | null };
+}
+
 export const engines = {
   status: () => request<EnginesStatus>('/api/engines'),
   /** The catalog and the models chosen in Engines. */
@@ -2095,6 +2110,10 @@ export const engines = {
    * command of the desktop's window, not a route: the desktop refuses a file the engine cannot run.
    */
   addModelFile: (path: string) => tauriInvoke<AddedModelFile>('add_engine_model', { path }),
+  /** The NVIDIA engine's state. The desktop's window only. */
+  nvidia: () => tauriInvoke<NvidiaEngine>('nvidia_engine_status'),
+  /** Fetch the NVIDIA engine, check its signature and have the engines run it; resolves when it is done. */
+  fetchNvidia: () => tauriInvoke<NvidiaEngine>('fetch_nvidia_engine'),
 };
 
 // ----- setup (the wizard's record, on the desktop) -----

@@ -72,7 +72,7 @@ pub struct Launch {
 }
 
 /// Whether an NVIDIA driver answers (`nvidia-smi -L` lists a GPU).
-fn nvidia_present() -> bool {
+pub(crate) fn nvidia_present() -> bool {
     let mut c = Command::new("nvidia-smi");
     c.arg("-L").stdin(Stdio::null()).stderr(Stdio::null());
     #[cfg(windows)]

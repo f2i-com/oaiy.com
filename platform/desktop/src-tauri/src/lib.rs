@@ -231,6 +231,7 @@ pub mod companion;
 mod embed;
 #[cfg(feature = "gui")]
 mod engines;
+mod nvidia_engine;
 #[cfg(feature = "gui")]
 mod migrate;
 #[cfg(feature = "gui")]
@@ -1093,6 +1094,24 @@ async fn add_engine_model(path: String) -> Result<serde_json::Value, String> {
     crate::engines::add_model_file(&path).await
 }
 
+/// Tauri command: the NVIDIA engine (the CUDA language-model server, an optional download): whether this computer
+/// takes it, whether it is here, and a fetch's progress.
+#[tauri::command]
+fn nvidia_engine_status(app: tauri::AppHandle) -> crate::nvidia_engine::Status {
+    crate::nvidia_engine::status(&resolve_data_dir(&app))
+}
+
+/// Tauri command: fetch this version's NVIDIA engine, check its signature with the key updates are checked with, and
+/// have the engines run it. Returns when it is done or has failed; the window polls the status meanwhile.
+#[tauri::command]
+async fn fetch_nvidia_engine(app: tauri::AppHandle) -> Result<crate::nvidia_engine::Status, String> {
+    let data_dir = resolve_data_dir(&app);
+    let config = app.config().plugins.0.get("updater").cloned().unwrap_or_default();
+    let pubkey = config.get("pubkey").and_then(|k| k.as_str()).unwrap_or_default().to_string();
+    crate::nvidia_engine::fetch(data_dir.clone(), pubkey).await?;
+    Ok(crate::nvidia_engine::status(&data_dir))
+}
+
 /// Tauri command: relaunch the app so a new data/models dir takes effect.
 ///
 /// A packaged build relaunches its own binary and reloads the bundled frontend
@@ -1274,6 +1293,8 @@ pub fn run() {
             pick_folder,
             pick_model_file,
             add_engine_model,
+            nvidia_engine_status,
+            fetch_nvidia_engine,
             restart_app,
             migration_plan,
             start_migration,

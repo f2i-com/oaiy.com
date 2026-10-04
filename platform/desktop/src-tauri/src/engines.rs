@@ -98,6 +98,10 @@ fn start_with(data_dir: &Path, m: Mode) -> Result<String, String> {
         // this makes the folder it is owner-only (unix), and the studio saves the file the same.
         crate::secret_file::create_private_dir(dir).map_err(|e| format!("could not make {}: {e}", dir.display()))?;
     }
+    // The NVIDIA engine this version fetched (an optional download), or none: another version's is set aside.
+    if let Err(e) = crate::nvidia_engine::reconcile(&config, data_dir, env!("CARGO_PKG_VERSION")) {
+        log::warn!("engines: {e}");
+    }
     if let Some(programs) = programs_dir() {
         if oaiy_studio::use_programs_from(&config, &programs)? {
             log::info!("engines: the programs are in {}", programs.display());

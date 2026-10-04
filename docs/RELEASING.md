@@ -14,6 +14,7 @@ by hand on its own, because automatic CI is paused).
 | `oaiy-desktop-<v>-linux-x86_64.AppImage`, `-linux-amd64.deb`, and `-linux-x86_64.rpm` when the build made one (the workflow copies it only if it is there, so a release may have none) | OAIY Desktop for Linux. The AppImage can update itself; the deb and rpm are manual downloads. |
 | `oaiy-desktop-<v>-windows-x64-setup.exe.sig`, `oaiy-desktop-<v>-linux-x86_64.AppImage.sig` | The signature of each installer an update can install, made with the updater key. |
 | `latest.json` | The update feed: the version, the notes, the date, and for `windows-x86_64` and `linux-x86_64` the installer's URL and signature. OAIY Desktop reads it from `releases/latest/download/latest.json`. |
+| `oaiy-cuda-engine-<v>-windows-x64.zip`, `oaiy-cuda-engine-<v>-linux-x86_64.tar.gz`, and their `.sig` | The NVIDIA engine: the CUDA build of the language-model server, about 10 MB packed. The installer does not carry it; OAIY Desktop fetches its platform's on a computer with an NVIDIA card, when asked, and keeps it only when the signature (the updater key's) was made for this version's file. It needs nothing from NVIDIA but the driver. |
 | `oaiy-server-<v>-windows-x64.zip`, `oaiy-server-<v>-linux-x86_64.tar.gz` | The headless server: the same local API with no window, for a host the CLI or a web app drives. It has no Agent or flow editor to show. |
 | `oaiy-cli-<v>.tar.gz` | The CLI alone, for a product that embeds it |
 | `oaiy-web-<v>.zip`, `oaiy-web-<v>.tar.gz` | The flow editor's site (landing page, `/app.html`, `/desktop.html`), for any static host, built for this release: its download buttons name this release's files (see [The web site](#the-web-site)) |
@@ -29,7 +30,12 @@ that opens on "the page is not built". It also carries the portable language-mod
 (`resources/engines/oaiy-llm-server-webgpu`: GGUF models on any graphics card through
 WebGPU, else the CPU, about 12 MB), so the model the setup downloads runs with nothing else
 to install; building an installer stops if it is not built
-(`platform/desktop/scripts/stage-engines.mjs`). What OAIY needs at run time (language and
+(`platform/desktop/scripts/stage-engines.mjs`). The NVIDIA engine is the release's other
+language-model engine, fetched on request rather than carried (above): the desktop legs
+install CUDA 12.8's compiler driver and NVRTC from NVIDIA (pinned by digest) to build it,
+check that it imports nothing from NVIDIA but the driver (`platform/scripts/pe-imports.mjs`
+on Windows, `readelf` on Linux), and the sign job signs it with the installers, under its
+own name (`src-tauri/src/nvidia_engine.rs` checks that name). What OAIY needs at run time (language and
 other models, the portable Python and the Node runtime) is downloaded on first use, not
 shipped.
 
@@ -51,8 +57,9 @@ What keeps the key from everything that does not need it:
 - **Nothing that builds has it.** The `desktop` job runs the project's npm packages, its Rust
   crates and the builds of the Agent and the flow editor. It is given no secret at all and
   builds the installers UNSIGNED, on a tag and on a branch alike. The `sign` job is the only
-  place the two secrets are named, in one step ("Sign the setup.exe and the AppImage"), and
-  the job does nothing but `tauri signer sign` on the two installers the builds made: the Tauri
+  place the two secrets are named, in one step ("Sign the setup.exe, the AppImage and the
+  NVIDIA engines"), and the job does nothing but `tauri signer sign` on the two installers and
+  the two NVIDIA engine archives the builds made: the Tauri
   CLI is installed from the desktop app's lockfile with no install scripts (`npm ci
   --ignore-scripts`: `@tauri-apps/cli` has none, and its Linux binding is an optional package
   the lockfile pins; only esbuild's and fsevents' scripts are skipped, and this job needs
@@ -340,19 +347,16 @@ a release matter here:
 
 ## What is not in a release
 
-- **The CUDA engines.** The programs that run models fastest on an NVIDIA card:
-  `oaiy-llm-server` and `oaiy-media`, built with CUDA 12.8 and the Visual Studio 2022 C++
-  tools. `oaiy-llm-server` needs nothing from NVIDIA but the driver's `nvcuda.dll` (its
-  kernels are compiled at build time, a cubin per GPU architecture, and its GEMM is its own;
-  26 MB); `oaiy-media` still loads cuBLAS, cuRAND and the CUDA runtime (about 840 MB); the `oaiy-studio` host and
-  its tray; and `oaiy-voice`, the speech server for calls. `tools/qwen-image/build.ps1`
-  builds all of them on Windows but `oaiy-voice`, which is a crate of its own (its `cuda`
-  and `flash-attn` features put it on the GPU). They are built by hand: they are a separate
-  channel, and no workflow here builds them. The desktop finds them beside itself, in an
-  `engines` folder there, or where `OAIY_ENGINES_DIR` points, and prefers them to the
-  portable language-model engine the installer carries. Without them an install runs
-  language models on that portable engine, and has no image, video or speech models of its
-  own.
+- **The other CUDA engines.** The NVIDIA language-model engine is in a release (above). The
+  rest is built by hand, a separate channel that no workflow here builds: `oaiy-media`
+  (pictures, video and sound, built with CUDA 12.8 and the Visual Studio 2022 C++ tools; it
+  still loads cuBLAS, cuRAND and the CUDA runtime, about 840 MB), the `oaiy-studio` host and
+  its tray, and `oaiy-voice`, the speech server for calls (a crate of its own, whose `cuda`
+  and `flash-attn` features put it on the GPU). `tools/qwen-image/build.ps1` builds them on
+  Windows, all but `oaiy-voice`. The desktop finds them beside itself, in an `engines` folder
+  there, or where `OAIY_ENGINES_DIR` points; a hand-built `oaiy-llm-server` found there runs
+  language models until the NVIDIA engine is fetched. Without them an install has no image,
+  video or speech models of its own.
 - **Aokie**, the phone plugin. It is a separate product: OAIY installs it from a folder or
   an archive, and no release of OAIY contains it.
 - **Windows code signing.** The installers are not signed with a certificate

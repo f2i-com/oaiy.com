@@ -867,6 +867,7 @@
       "disabled.json": "plugins",
       "endpoint.key": "companion",
       "engines": "engines",
+      "cuda": "engines",
       "flows": "flows",
       "graph.json": "not-a-store: a file in the scratch folder of one flow run, deleted when it ends",
       "hf-token": "hf-token",
