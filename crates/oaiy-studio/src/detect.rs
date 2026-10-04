@@ -56,6 +56,11 @@ pub struct Detected {
     /// engine loads and which reads tool calls is the engine's to say, so a caller can
     /// tell a file it cannot run before it is added.
     pub architecture: Option<String>,
+    /// A GGUF language model's tensor types ("Q4_K", "Q6_K", "F32"), every tensor's,
+    /// for the same: the engine decodes some quantizations and not others.
+    pub tensor_types: Vec<String>,
+    /// A GGUF language model's experts per MoE layer (`{arch}.expert_count`), when it has them.
+    pub experts: Option<i64>,
 }
 
 impl Detected {
@@ -82,12 +87,14 @@ impl Detected {
             ("fields", Json::Obj(self.fields.clone())),
             ("missing", Json::Arr(self.missing.iter().map(Json::str).collect())),
             ("architecture", self.architecture.as_deref().map_or(Json::Null, Json::str)),
+            ("tensorTypes", Json::Arr(self.tensor_types.iter().map(Json::str).collect())),
+            ("experts", self.experts.map_or(Json::Null, Json::Int)),
         ])
     }
 }
 
 fn detected(role: Role, format: &'static str, summary: String, fields: Vec<(&str, Json)>) -> Detected {
-    Detected { role, format, summary, fields: fields.into_iter().map(|(k, v)| (k.to_string(), v)).collect(), missing: Vec::new(), architecture: None }
+    Detected { role, format, summary, fields: fields.into_iter().map(|(k, v)| (k.to_string(), v)).collect(), missing: Vec::new(), architecture: None, tensor_types: Vec::new(), experts: None }
 }
 
 /// A path as configuration text. On Windows a path picked with `/` keeps `/`
@@ -130,7 +137,23 @@ pub fn detect(path: &Path) -> Result<Detected, String> {
 
 struct Gguf {
     kv: Vec<(String, Json)>,
+    /// The first tensors' names (as many as were asked for).
     tensors: Vec<String>,
+    /// Every tensor's type, by its GGML id, once each.
+    types: std::collections::BTreeSet<u32>,
+}
+
+/// A GGML tensor type's name, as llama.cpp names it.
+fn ggml_type(t: u32) -> String {
+    let name = match t {
+        0 => "F32", 1 => "F16", 2 => "Q4_0", 3 => "Q4_1", 6 => "Q5_0", 7 => "Q5_1", 8 => "Q8_0", 9 => "Q8_1",
+        10 => "Q2_K", 11 => "Q3_K", 12 => "Q4_K", 13 => "Q5_K", 14 => "Q6_K", 15 => "Q8_K",
+        16 => "IQ2_XXS", 17 => "IQ2_XS", 18 => "IQ3_XXS", 19 => "IQ1_S", 20 => "IQ4_NL", 21 => "IQ3_S", 22 => "IQ2_S",
+        23 => "IQ4_XS", 24 => "I8", 25 => "I16", 26 => "I32", 27 => "I64", 28 => "F64", 29 => "IQ1_M", 30 => "BF16",
+        34 => "TQ1_0", 35 => "TQ2_0", 39 => "MXFP4",
+        other => return format!("type {other}"),
+    };
+    name.to_string()
 }
 
 /// The metadata key/values (strings and numbers; arrays summarised as their
@@ -221,13 +244,23 @@ fn read_gguf(path: &Path, max_tensors: usize) -> Result<Gguf, String> {
         };
         kv.push((key, value));
     }
+    // Every tensor's type (its header is a few dozen bytes); the first ones' names.
     let mut tensors = Vec::new();
-    for _ in 0..n_tensors.min(max_tensors as u64) {
-        tensors.push(string(&mut r, true).map_err(|e| bad(&e))?);
+    let mut types = std::collections::BTreeSet::new();
+    for i in 0..n_tensors {
+        let name = string(&mut r, (i as usize) < max_tensors).map_err(|e| bad(&e))?;
+        if (i as usize) < max_tensors {
+            tensors.push(name);
+        }
         let dims = u32_(&mut r)?;
-        r.seek_relative(8 * dims as i64 + 12).map_err(|e| bad(&e.to_string()))?;
+        if dims > 8 {
+            return Err(bad("implausible tensor"));
+        }
+        r.seek_relative(8 * dims as i64).map_err(|e| bad(&e.to_string()))?;
+        types.insert(u32_(&mut r)?);
+        r.seek_relative(8).map_err(|e| bad(&e.to_string()))?;
     }
-    Ok(Gguf { kv, tensors })
+    Ok(Gguf { kv, tensors, types })
 }
 
 fn gguf_file(path: &Path) -> Result<Detected, String> {
@@ -256,6 +289,8 @@ fn gguf_file(path: &Path) -> Result<Detected, String> {
             format!("MiniMax Music 3 language model, {} ({label})", get("music3.quant")), vec![("language_model", path_json(path))]));
     }
     let mut d = detected(Role::Llm, "gguf", format!("{label} — GGUF LLM ({arch})"), vec![("path", path_json(path))]);
+    d.experts = g.kv.iter().find(|(k, _)| *k == format!("{arch}.expert_count")).and_then(|(_, v)| v.as_i64()).filter(|n| *n > 0);
+    d.tensor_types = g.types.iter().map(|t| ggml_type(*t)).collect();
     d.architecture = Some(arch);
     Ok(d)
 }
@@ -736,9 +771,11 @@ mod tests {
         let r = detect(&llm).unwrap();
         assert_eq!(r.role, Role::Llm);
         assert!(r.summary.contains("qwen3"));
-        // Its architecture, for a caller deciding whether the engine runs it.
+        // Its architecture and tensor types, for a caller deciding whether the engine runs it.
         assert_eq!(r.architecture.as_deref(), Some("qwen3"));
         assert_eq!(r.to_json().get("architecture").and_then(Json::as_str), Some("qwen3"));
+        assert_eq!(r.tensor_types, vec!["F32".to_string()], "the test writer's tensors are type 0");
+        assert_eq!(r.experts, None);
         let proj = d.0.join("mmproj-F16.gguf");
         gguf(&proj, &[("general.architecture", "clip"), ("general.type", "mmproj")], &[]);
         assert_eq!(detect(&proj).unwrap().kind(), "vision_projector");

@@ -251,6 +251,9 @@ const ENGINE_RUNS: [&str; 11] = ["qwen35", "llama", "mistral", "qwen2", "qwen3",
 /// Of those, the ones whose tool calls the engine reads (the Qwen3.5 and GLM formats): the Agent's tools need one.
 /// The others chat.
 const ENGINE_TOOLS: [&str; 2] = ["qwen35", "glm5next"];
+/// The tensor types the engine decodes (`ggml_quants::is_supported`): the K-quants, the legacy ones, IQ4 and the
+/// floats. The other IQ types (IQ1, IQ2, IQ3), the ternary ones and MXFP4 fail when the model loads.
+const ENGINE_TYPES: [&str; 15] = ["F32", "F16", "BF16", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0", "IQ4_NL", "IQ4_XS", "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K"];
 
 /// A language model file the person named, as typed or pasted (Windows' "Copy as path" quotes it): a whole path to a
 /// `.gguf` file that is there; of a model split into files, the first.
@@ -307,6 +310,14 @@ fn runnable(detected: &serde_json::Value, name: &str) -> Result<(String, bool), 
         return Err(format!(
             "{name} is a {} model, which OAIY's engine does not run yet. It runs Qwen3.5, Qwen3, Qwen2, Llama, Mistral, Gemma 3 and 4, and GLM models.",
             if arch.is_empty() { "kind of" } else { arch }
+        ));
+    }
+    let types: Vec<&str> = detected.get("tensorTypes").and_then(|t| t.as_array()).map(|t| t.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+    let unread: Vec<&str> = types.into_iter().filter(|t| !ENGINE_TYPES.contains(t)).collect();
+    if !unread.is_empty() {
+        return Err(format!(
+            "{name} is quantized as {}, which OAIY's engine does not decode yet: choose a Q4_K_M, Q5_K_M, Q6_K or Q8_0 file of the model instead.",
+            unread.join(", ")
         ));
     }
     Ok((arch.to_string(), ENGINE_TOOLS.contains(&arch)))
@@ -392,6 +403,21 @@ mod tests {
         assert!(runnable(&projector, "mmproj-F16.gguf").unwrap_err().contains("vision projector"));
         let image = serde_json::json!({ "kind": "image", "section": "image", "summary": "Qwen Image transformer" });
         assert!(runnable(&image, "qwen-image.gguf").unwrap_err().contains("not a language model: Qwen Image transformer"));
+    }
+
+    #[test]
+    fn a_quantization_the_engine_does_not_decode_is_refused_and_the_quants_it_does_are_named() {
+        let llm = |types: &[&str]| serde_json::json!({ "section": "llm", "architecture": "qwen35", "tensorTypes": types });
+        // A K-quant, Q8_0, IQ4 and the floats: decoded.
+        assert!(runnable(&llm(&["F32", "Q4_K", "Q6_K"]), "a.gguf").is_ok());
+        assert!(runnable(&llm(&["F32", "Q8_0", "BF16", "IQ4_XS", "IQ4_NL", "Q2_K", "Q3_K", "Q5_K"]), "a.gguf").is_ok());
+        // Unsloth's smaller "UD" quants mix in IQ2 and IQ3 tensors, which fail when the model loads.
+        let iq = runnable(&llm(&["F32", "IQ3_XXS", "Q4_K", "IQ2_S"]), "Qwen3.8-27B-UD-IQ3_XXS.gguf").unwrap_err();
+        assert!(iq.contains("quantized as IQ3_XXS, IQ2_S") && iq.contains("Q4_K_M, Q5_K_M, Q6_K or Q8_0"), "{iq}");
+        assert!(runnable(&llm(&["MXFP4", "F32"]), "gpt-oss.gguf").unwrap_err().contains("MXFP4"));
+        assert!(runnable(&llm(&["TQ1_0"]), "t.gguf").unwrap_err().contains("TQ1_0"));
+        // A studio that does not list them: the architecture decides.
+        assert!(runnable(&serde_json::json!({ "section": "llm", "architecture": "llama" }), "a.gguf").is_ok());
     }
 
     #[test]

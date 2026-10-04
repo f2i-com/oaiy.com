@@ -194,13 +194,22 @@ fn llama_messages(msgs: &[oaiy_engine::json::Json]) -> Vec<llama_rs::ChatMessage
 /// Qwen3 reasons when asked: ChatML with `<think>` opened, as the GLM prompt opens it, so the reply's reasoning is
 /// told apart by the same token. Every other dense family, and Qwen3 in a plain chat (its template pre-fills an empty
 /// think block, as the official one does), answers directly.
+///
+/// Gemma 4 reasons in a channel of its own (`<|channel>thought … <channel|>`), which the reasoning split does not
+/// read, so it always answers directly: its reply opens on an empty thought channel, as its official template opens
+/// it when thinking is off. Without it the MoE Gemma 4 (26B-A4B) wrote its channel's name into the answer ("thought
+/// The capital of France is Paris.").
 fn dense_prompt(arch: &llama_rs::Architecture, msgs: &[llama_rs::ChatMessage], thinking: bool) -> String {
     if thinking && *arch == llama_rs::Architecture::Qwen3 {
         let mut p = llama_rs::apply_chat_template(&llama_rs::Architecture::Qwen2, msgs, true);
         p.push_str("<think>");
         return p;
     }
-    llama_rs::apply_chat_template(arch, msgs, true)
+    let mut p = llama_rs::apply_chat_template(arch, msgs, true);
+    if *arch == llama_rs::Architecture::Gemma4 {
+        p.push_str("<|channel>thought\n<channel|>");
+    }
+    p
 }
 
 /// The architecture of a dense GGUF, which is loaded whole (see `load_gguf`); None for Qwen3.5 (a path of its
@@ -1072,6 +1081,15 @@ mod dense_tests {
         assert!(thinking.ends_with("<|im_start|>assistant\n<think>"), "{thinking:?}");
         // Thinking is Qwen3's alone: another family asked to think still answers in its own template.
         assert_eq!(dense_prompt(&A::Llama, &msgs(), true), dense_prompt(&A::Llama, &msgs(), false));
+    }
+
+    #[test]
+    fn gemma4_opens_its_reply_on_an_empty_thought_channel_as_its_template_does_without_thinking() {
+        for thinking in [false, true] {
+            let p = dense_prompt(&A::Gemma4, &msgs(), thinking);
+            assert!(p.contains("<|turn>user\nCapital of France?<turn|>"), "{p:?}");
+            assert!(p.ends_with("<|turn>model\n<|channel>thought\n<channel|>"), "{p:?}");
+        }
     }
 
     #[test]
