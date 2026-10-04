@@ -16,7 +16,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "tauri dev --features gui",
-    "tauri:build": "tauri build --features gui",
+    "tauri:build": "tauri build --features gui,custom-protocol",
     "sync-cli": "node scripts/sync-cli.mjs",
     "stage-pages": "node scripts/stage-pages.mjs"
   },
