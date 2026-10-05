@@ -1477,7 +1477,8 @@ fn main(@builtin(local_invocation_index) t: u32) {
 #[derive(Clone, Copy)]
 enum Order<'a> {
     Jobs,
-    Many(&'a DeviceVec, usize),
+    /// The order, its blocks, and the jobs a block.
+    Many(&'a DeviceVec, usize, usize),
     Few(&'a DeviceVec, usize, usize),
 }
 
@@ -1533,6 +1534,14 @@ pub(crate) fn coop_on(gpu: &Gpu) -> bool {
 /// one fragment of the tensor cores), else [`moe_block`]'s.
 fn many_rows(gpu: &Gpu) -> usize {
     if coop_on(gpu) { 16 } else { moe_block() }
+}
+
+/// The jobs a block of a prompt's experts grouped on the GPU takes: about three times the jobs an expert has on
+/// average (16 to 128), so a busy expert's tiles are decoded for as few blocks as a quiet one's empty places cost
+/// columns (Qwen3.8-Flash-Next's chunk of 512, some 10 jobs an expert: blocks of 32 308 ms, of 16 337, of 64 339).
+fn moe_rows_for(pairs: usize, experts: usize) -> usize {
+    let target = 3 * pairs / experts.max(1);
+    [16, 32, 64, 128].into_iter().find(|&b| b >= target).unwrap_or(128)
 }
 
 /// Each job's output transform, a workgroup a (128-block, job): its splits' partial sums added up (in order),
@@ -1807,10 +1816,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 "#;
 
 /// A prompt's routed jobs grouped by expert on the GPU, as [`many_order`] groups them on the host: each expert's down
-/// jobs in blocks of 16 (a block one expert's, its unused places [`NONE`]; the blocks in the experts' order, a job's
-/// place among its expert's as the atomics fall), and their gate and up jobs in blocks `2 b` and `2 b + 1`. `od`: the
-/// down order (`p[0].y` blocks of 16), then each expert's count, first block and filled places (`p[0].z` experts);
-/// `og` the gate and up order. First every place unused and every count 0.
+/// jobs in blocks of `p[0].w` (a block one expert's, its unused places [`NONE`]; the blocks in the experts' order, a
+/// job's place among its expert's as the atomics fall), and their gate and up jobs in blocks `2 b` and `2 b + 1`.
+/// `od`: the down order (`p[0].y` blocks), then each expert's count, first block and filled places (`p[0].z`
+/// experts); `og` the gate and up order. First every place unused and every count 0.
 const MANY_CLEAR: &str = r#"
 @group(0) @binding(6) var<storage, read_write> og: array<u32>;
 @group(0) @binding(7) var<storage, read_write> od: array<u32>;
@@ -1819,7 +1828,7 @@ const MANY_CLEAR: &str = r#"
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let i = id.x + id.y * 65535u * 256u;
-    let places = 16u * p[0].y;
+    let places = p[0].w * p[0].y;
     if (i < 2u * places) { og[i] = 0xffffffffu; }
     if (i < places) { od[i] = 0xffffffffu; }
     if (i < 3u * p[0].z) { od[places + i] = 0u; }
@@ -1836,12 +1845,12 @@ const MANY_COUNT: &str = r#"
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let j = id.x;
     if (j >= p[0].x) { return; }
-    atomicAdd(&od[16u * p[0].y + jd[2u * j]], 1u);
+    atomicAdd(&od[p[0].w * p[0].y + jd[2u * j]], 1u);
 }
 "#;
 
-/// [`MANY_CLEAR`]'s third: each expert's first block, the blocks of the experts before it (16 jobs a block), one
-/// workgroup a thread an expert (1024 at most). `p[0]`: the pairs, the blocks, the experts.
+/// [`MANY_CLEAR`]'s third: each expert's first block, the blocks of the experts before it, one workgroup a thread an
+/// expert (1024 at most). `p[0]`: the pairs, the blocks, the experts, the jobs a block.
 const MANY_SCAN: &str = r#"
 @group(0) @binding(7) var<storage, read_write> od: array<u32>;
 @group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
@@ -1850,10 +1859,11 @@ var<workgroup> sums: array<u32, 1024>;
 
 @compute @workgroup_size(1024)
 fn main(@builtin(local_invocation_index) e: u32) {
-    let at = 16u * p[0].y;
+    let bs = p[0].w;
+    let at = bs * p[0].y;
     let ne = p[0].z;
     var nb = 0u;
-    if (e < ne) { nb = (od[at + e] + 15u) / 16u; }
+    if (e < ne) { nb = (od[at + e] + bs - 1u) / bs; }
     sums[e] = nb;
     workgroupBarrier();
     for (var st = 1u; st < 1024u; st *= 2u) {
@@ -1879,15 +1889,16 @@ const MANY_SCATTER: &str = r#"
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let j = id.x;
     if (j >= p[0].x) { return; }
-    let at = 16u * p[0].y;
+    let bs = p[0].w;
+    let at = bs * p[0].y;
     let ne = p[0].z;
     let e = jd[2u * j];
     let pos = atomicAdd(&od[at + 2u * ne + e], 1u);
-    let b = atomicLoad(&od[at + ne + e]) + pos / 16u;
-    let slot = pos % 16u;
-    atomicStore(&od[b * 16u + slot], j);
-    og[2u * b * 16u + slot] = 2u * j;
-    og[(2u * b + 1u) * 16u + slot] = 2u * j + 1u;
+    let b = atomicLoad(&od[at + ne + e]) + pos / bs;
+    let slot = pos % bs;
+    atomicStore(&od[b * bs + slot], j);
+    og[2u * b * bs + slot] = 2u * j;
+    og[(2u * b + 1u) * bs + slot] = 2u * j + 1u;
 }
 "#;
 
@@ -2101,9 +2112,8 @@ impl Exl3MoeGrouped {
         // as many jobs (or blocks) a pass as the grid's third axis takes
         let per = (65535 / splits) as usize;
         match order {
-            Order::Many(order, blocks) => {
+            Order::Many(order, blocks, rows) => {
                 let ob = buf(order);
-                let rows = many_rows(rec.gpu());
                 for first in (0..blocks).step_by(per) {
                     let these = per.min(blocks - first) as u32;
                     if coop_on(rec.gpu()) {
@@ -2169,7 +2179,7 @@ impl Exl3MoeGrouped {
         };
         let orders = (rows > 1).then(|| (order(&jobs_gu), order(&jobs_d)));
         let (ogu, od) = match &orders {
-            Some(((g, gn), (d, dn))) => (Order::Many(g, *gn), Order::Many(d, *dn)),
+            Some(((g, gn), (d, dn))) => (Order::Many(g, *gn, block), Order::Many(d, *dn, block)),
             None => (Order::Jobs, Order::Jobs),
         };
         self.run(rec, &st, x, out, rows, ogu, od, None);
@@ -2213,18 +2223,21 @@ impl Exl3MoeGrouped {
         rec.dispatch_wide("moe-down-jobs", DOWN_JOBS, [&buf(&st.jobs_gu), &d, &d, &d, &d, &d, &buf(&st.jobs_d), &drw], &[(rows * top_k) as u32], (1, 1, 1));
         let pairs = rows * top_k;
         if many {
-            // the most blocks of 16 the experts could fill (a part-filled one each at most), the grid that wide
-            let blocks = pairs.div_ceil(16) + self.routed;
-            let (og, od) = (rec.scratch(2 * 16 * blocks), rec.scratch(16 * blocks + 3 * self.routed));
-            let words = [pairs as u32, blocks as u32, self.routed as u32];
-            let clear = (2 * 16 * blocks) as u32;
+            // blocks of as many jobs as an expert has on average (16 to 64: an expert's tiles decoded once a block,
+            // what an empty place of it costs a fragment's columns); the most blocks the experts could fill (a
+            // part-filled one each at most), the grid that wide
+            let bs = moe_rows_for(pairs, self.routed);
+            let blocks = pairs.div_ceil(bs) + self.routed;
+            let (og, od) = (rec.scratch(2 * bs * blocks), rec.scratch(bs * blocks + 3 * self.routed));
+            let words = [pairs as u32, blocks as u32, self.routed as u32, bs as u32];
+            let clear = (2 * bs * blocks) as u32;
             let groups = clear.div_ceil(256);
             let jd = buf(&st.jobs_d);
             rec.dispatch_wide("moe-many-clear", MANY_CLEAR, [&d, &d, &d, &d, &d, &d, &buf(&og), &buf(&od)], &words, (groups.min(65535), groups.div_ceil(65535), 1));
             rec.dispatch_wide("moe-many-count", MANY_COUNT, [&jd, &d, &d, &d, &d, &d, &drw, &buf(&od)], &words, ((pairs as u32).div_ceil(256), 1, 1));
             rec.dispatch_wide("moe-many-scan", MANY_SCAN, [&d, &d, &d, &d, &d, &d, &drw, &buf(&od)], &words, (1, 1, 1));
             rec.dispatch_wide("moe-many-scatter", MANY_SCATTER, [&jd, &d, &d, &d, &d, &d, &buf(&og), &buf(&od)], &words, ((pairs as u32).div_ceil(256), 1, 1));
-            self.run(rec, &st, x, out, rows, Order::Many(&og, 2 * blocks), Order::Many(&od, blocks), into);
+            self.run(rec, &st, x, out, rows, Order::Many(&og, 2 * blocks, bs), Order::Many(&od, blocks, bs), into);
             return true;
         }
         // a check's few rows: an expert the rows share decoded once for them (its jobs one block; OAIY_MOE_UNGROUPED:

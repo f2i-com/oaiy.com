@@ -1883,7 +1883,9 @@ mod dense_webgpu_timing {
         let mut at = 0;
         // FLASHNEXT_PAST: chunks of 512 up to that many positions first (past QSA's dense span at 2,052)
         let past_span: usize = std::env::var("FLASHNEXT_PAST").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-        let mut chunks: Vec<usize> = vec![512, 512, 64];
+        // FLASHNEXT_CHUNK: the prompt's chunks that long (512 as the server sends them)
+        let chunk: usize = std::env::var("FLASHNEXT_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
+        let mut chunks: Vec<usize> = vec![chunk, chunk, 64];
         if past_span > 0 {
             chunks = std::iter::repeat_n(512, past_span / 512).chain([past_span % 512]).filter(|&n| n > 0).collect();
         }
