@@ -25,7 +25,7 @@ use crate::kv_cache::KvCache;
 use crate::loader::{FfnPair, Weight};
 use crate::qwen35::{Qwen35Block, Qwen35Model};
 
-/// Rows a submit takes at most (the server's prompt chunks are 512).
+/// Rows a submit takes at most over two cards (the server's prompt chunks are 512), twice that on one.
 const MAX_ROWS: usize = 512;
 
 /// The most a prompt's attention scratch may take: a chunk's rows are cut to fit it (at 16K positions, 24 heads of
@@ -987,13 +987,16 @@ impl Qwen35Chain {
             embeds.data()
         };
         let s = st.dims;
-        // the chunks: each as many rows as the attention's scratch has room for over the positions they reach
+        // the chunks: each as many rows as the attention's scratch has room for over the positions they reach, up to
+        // a chunk of 1,024 on one card (some 1% the faster), 512 where a second one takes their later layers (the more
+        // chunks the more of them run together)
+        let most = if self.second.get().is_some() { MAX_ROWS } else { 2 * MAX_ROWS };
         let mut chunks = Vec::new();
         let mut at = 0;
         while at < rows {
             let runs = (kv.len + at + rows).div_ceil(256).max(1);
             let per_row = (s.n_h * runs * (s.hd + 2) + s.n_h * s.hd) * 4;
-            let t = (ATTENTION_SCRATCH / per_row).clamp(1, MAX_ROWS).min(rows - at);
+            let t = (ATTENTION_SCRATCH / per_row).clamp(1, most).min(rows - at);
             chunks.push((at, t));
             at += t;
         }

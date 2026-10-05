@@ -2392,7 +2392,9 @@ mod dense_webgpu_timing {
         let warm = std::time::Instant::now();
         assert!(m.warm_up());
         eprintln!("warmed up (the second's layers copied) in {:.1} s", warm.elapsed().as_secs_f64());
-        let tokens: Vec<u32> = (0..2148u32).map(|i| 1000 + (i * 7919) % 20000).collect();
+        // (QWEN35_LEN: the first prompt's tokens, 2,148 unless asked)
+        let len: u32 = std::env::var("QWEN35_LEN").ok().and_then(|v| v.parse().ok()).unwrap_or(2148);
+        let tokens: Vec<u32> = (0..len).map(|i| 1000 + (i * 7919) % 20000).collect();
         let more: Vec<u32> = (0..1100u32).map(|i| 1500 + (i * 104729) % 30000).collect();
         let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
         let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
@@ -2455,7 +2457,9 @@ mod dense_webgpu_timing {
         let gguf = gguf::GgufFile::open(&path).unwrap();
         let model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap();
         let llama_rs::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
-        let tokens: Vec<u32> = (0..2148u32).map(|i| 1000 + (i * 7919) % 20000).collect();
+        // (QWEN35_LEN: the prompt's tokens, 2,148 unless asked)
+        let len: u32 = std::env::var("QWEN35_LEN").ok().and_then(|v| v.parse().ok()).unwrap_or(2148);
+        let tokens: Vec<u32> = (0..len).map(|i| 1000 + (i * 7919) % 20000).collect();
         let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
         let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
         let mut results = Vec::new();
@@ -2467,8 +2471,9 @@ mod dense_webgpu_timing {
                     let e = m.embed_text(&tokens).to_host();
                     m.forward_embeds_positions(&e, tokens.len(), &mut kv, None).unwrap().to_host()
                 } else {
+                    // (a chunk a call as the chain cuts a run on one card)
                     let mut l = None;
-                    for chunk in tokens.chunks(512) {
+                    for chunk in tokens.chunks(1024) {
                         let e = m.embed_text(chunk).to_host();
                         l = Some(m.forward_embeds_positions(&e, chunk.len(), &mut kv, None).unwrap().to_host());
                     }
