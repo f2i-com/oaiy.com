@@ -12,6 +12,7 @@
 #![allow(non_camel_case_types)]
 
 pub mod backend;
+pub mod chain;
 pub mod exl3;
 pub mod cpu;
 pub mod ops;
@@ -19,6 +20,7 @@ pub mod quantized;
 pub mod tensor;
 
 pub use backend::{Backend, RopeType};
+pub use chain::{ChainRecorder, DeviceChain, DeviceVec};
 pub use cpu::CpuBackend;
 pub use quantized::{QuantizedDeviceStorage, QuantizedStorage, QuantizedTensor};
 pub use tensor::{DeviceStorage, Shape, Tensor, TensorError, TensorStorage};

@@ -440,9 +440,11 @@ impl Backend for CpuBackend {
         let n_rep = n_h_q / n_h_kv;
         let (qd, kd, vd) = (q.data(), k_buffer.data(), v_buffer.data());
         let mut out = vec![0.0f32; seq * n_h_q * hd];
-        out.par_chunks_mut(hd).enumerate().for_each_init(Vec::new, |scores: &mut Vec<f32>, (sh, row)| {
-            let (s, h) = (sh / n_h_q, sh % n_h_q);
-            let kh = h / n_rep;
+        // A task a (query, KV head): the group's n_rep query heads read each of the head's K and V rows once between
+        // them (each row was read n_rep times, one task a query head: 3 times for a 3B Llama, most of its decode
+        // step's attention at long context). Each query's sums in the same order as one task a query head.
+        out.par_chunks_mut(n_rep * hd).enumerate().for_each_init(Vec::new, |scores: &mut Vec<f32>, (skh, rows)| {
+            let (s, kh) = (skh / n_h_kv, skh % n_h_kv);
             let q_pos = past + s;
             // the positions this query sees: causal, and within the window if there is one
             let hi = (q_pos + 1).min(kv_len);
@@ -450,28 +452,38 @@ impl Backend for CpuBackend {
             if lo == hi {
                 return;
             }
-            let qv = &qd[sh * hd..(sh + 1) * hd];
+            let span = hi - lo;
+            let q0 = (s * n_h_q + kh * n_rep) * hd;
             scores.clear();
-            let mut m = f32::NEG_INFINITY;
+            scores.resize(n_rep * span, 0.0);
+            let mut m = vec![f32::NEG_INFINITY; n_rep];
             for t in lo..hi {
                 let kv = &kd[(t * n_h_kv + kh) * hd..(t * n_h_kv + kh + 1) * hd];
-                let sc = dot8(qv, kv) * scale;
-                if sc > m {
-                    m = sc;
+                for r in 0..n_rep {
+                    let sc = dot8(&qd[q0 + r * hd..q0 + (r + 1) * hd], kv) * scale;
+                    if sc > m[r] {
+                        m[r] = sc;
+                    }
+                    scores[r * span + (t - lo)] = sc;
                 }
-                scores.push(sc);
             }
-            let mut sum = 0.0f32;
-            for sc in scores.iter_mut() {
-                *sc = (*sc - m).exp();
-                sum += *sc;
+            let mut inv = vec![0.0f32; n_rep];
+            for r in 0..n_rep {
+                let mut sum = 0.0f32;
+                for sc in scores[r * span..(r + 1) * span].iter_mut() {
+                    *sc = (*sc - m[r]).exp();
+                    sum += *sc;
+                }
+                inv[r] = 1.0 / sum;
             }
-            let inv = 1.0 / sum;
-            for (t, p) in (lo..hi).zip(scores.iter()) {
-                let p = p * inv;
+            for t in lo..hi {
                 let vv = &vd[(t * n_h_kv + kh) * hd..(t * n_h_kv + kh + 1) * hd];
-                for d in 0..hd {
-                    row[d] += p * vv[d];
+                for r in 0..n_rep {
+                    let p = scores[r * span + (t - lo)] * inv[r];
+                    let row = &mut rows[r * hd..(r + 1) * hd];
+                    for d in 0..hd {
+                        row[d] += p * vv[d];
+                    }
                 }
             }
         });
@@ -593,6 +605,27 @@ mod tests {
                 let worst = a.data().iter().zip(b.data()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
                 assert!(worst < 1e-5, "seq {seq} past {past} window {window:?}: {worst}");
             }
+        }
+    }
+
+    /// Attention at a 3B Llama's shape (24 query heads, 8 KV heads of 128) over 2,000 positions: a decode step's (one
+    /// query) and a prompt's (2,000, causal).
+    #[test]
+    #[ignore = "a timing; run with --nocapture"]
+    fn measure_attention_at_a_3b_llamas_shape() {
+        let (n_h_q, n_h_kv, hd, kv_len) = (24, 8, 128, 2000);
+        let k = Tensor::from_vec((0..kv_len * n_h_kv * hd).map(|i| ((i % 97) as f32 - 48.0) / 97.0).collect(), vec![kv_len, n_h_kv, hd]);
+        let v = Tensor::from_vec((0..kv_len * n_h_kv * hd).map(|i| ((i % 89) as f32 - 44.0) / 89.0).collect(), vec![kv_len, n_h_kv, hd]);
+        let cpu = CpuBackend::new();
+        for (seq, calls) in [(1usize, 200usize), (kv_len, 5)] {
+            let q = Tensor::from_vec((0..seq * n_h_q * hd).map(|i| ((i % 31) as f32 - 15.0) / 31.0).collect(), vec![seq, n_h_q, hd]);
+            let past = kv_len - seq;
+            cpu.attention(&q, &k, &v, kv_len, 0.088, past, None);
+            let t = std::time::Instant::now();
+            for _ in 0..calls {
+                std::hint::black_box(cpu.attention(&q, &k, &v, kv_len, 0.088, past, None));
+            }
+            eprintln!("{seq} queries over {kv_len} positions: {:.3} ms a call", t.elapsed().as_secs_f64() * 1e3 / calls as f64);
         }
     }
 

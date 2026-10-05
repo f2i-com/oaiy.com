@@ -1243,7 +1243,8 @@ mod dense_webgpu_timing {
         let gguf = gguf::GgufFile::open(&path).unwrap();
         let model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap();
         let mut kv = model.new_kv_cache(4096);
-        let prompt: Vec<u32> = (0..512u32).map(|i| 1000 + (i * 7919) % 20000).collect();
+        let n: u32 = std::env::var("DENSE_PROMPT").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
+        let prompt: Vec<u32> = (0..n).map(|i| 1000 + (i * 7919) % 20000).collect();
         ggml_rs_wgpu::profile::take_line();
         let t = Instant::now();
         let mut logits = model.forward(&prompt, &mut kv);
@@ -1257,6 +1258,51 @@ mod dense_webgpu_timing {
         }
         let secs = t.elapsed().as_secs_f64();
         eprintln!("{steps} decode steps: {:.1} ms a step; {}", secs * 1e3 / steps as f64, ggml_rs_wgpu::profile::take_line());
+    }
+
+    /// A Llama decode step chained on the GPU answers as the host path does: from the same prompt, 64 greedy steps
+    /// each way give the same tokens, every step's logits close (cosine 0.9999 or more).
+    #[test]
+    #[ignore = "needs a WebGPU adapter and the 3B Llama GGUF (E:/models/llama-3.2-3b-q4_k_m.gguf, or DENSE_MODEL)"]
+    fn a_chained_decode_step_answers_as_the_host_path() {
+        use std::sync::Arc;
+        let path = std::env::var("DENSE_MODEL").unwrap_or_else(|_| r"E:\models\llama-3.2-3b-q4_k_m.gguf".into());
+        let Ok(b) = ggml_rs_wgpu::WgpuBackend::new(Some(8 << 30)) else { return };
+        let backend: Arc<dyn ggml_rs::Backend> = Arc::new(b);
+        let gguf = gguf::GgufFile::open(&path).unwrap();
+        let llama_rs::Model::Llama(model) = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap() else { panic!("a Llama") };
+        let n: u32 = std::env::var("DENSE_PROMPT").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+        let prompt: Vec<u32> = (0..n).map(|i| 1000 + (i * 7919) % 20000).collect();
+        let argmax = |l: &ggml_rs::Tensor| l.data().iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
+        let run = |chained: bool| {
+            let mut kv = model.new_kv_cache(prompt.len() + 80);
+            let l = model.forward_host(&prompt, &mut kv);
+            let mut next = argmax(&model.last_logits(&l));
+            let (mut tokens, mut all) = (Vec::new(), Vec::new());
+            for _ in 0..64 {
+                let l = if chained { model.forward(&[next], &mut kv) } else { model.forward_host(&[next], &mut kv) };
+                let l = model.last_logits(&l).data().to_vec();
+                next = l.iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
+                tokens.push(next);
+                all.push(l);
+            }
+            (tokens, all)
+        };
+        let t = std::time::Instant::now();
+        let (host_tokens, host_logits) = run(false);
+        let host_s = t.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        let (chain_tokens, chain_logits) = run(true);
+        let chain_s = t.elapsed().as_secs_f64();
+        let cosine = |a: &[f32], b: &[f32]| {
+            let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
+            let n = |v: &[f32]| v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            dot / (n(a) * n(b))
+        };
+        let worst = host_logits.iter().zip(&chain_logits).map(|(a, b)| cosine(a, b)).fold(1.0f64, f64::min);
+        eprintln!("prompt {n}: host {host_s:.2} s, chained {chain_s:.2} s for 64 steps; worst logits cosine {worst:.6}");
+        assert_eq!(host_tokens, chain_tokens);
+        assert!(worst >= 0.9999, "{worst}");
     }
 }
 

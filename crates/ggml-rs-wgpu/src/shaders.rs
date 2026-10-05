@@ -191,12 +191,22 @@ pub fn source_many(dtype: GgmlType) -> Option<String> {
 
 /// The complete shader for `dtype`.
 pub fn source(dtype: GgmlType) -> Option<String> {
+    source_rows(dtype, M_TILE)
+}
+
+/// The one-row kernel for a decode step's single row of `x`: the same kernel with one row's sums, where eight were
+/// kept and reduced whatever the rows (a dense model's decode step on WebGPU is its matmuls one row at a time).
+pub fn source_decode(dtype: GgmlType) -> Option<String> {
+    source_rows(dtype, 1)
+}
+
+fn source_rows(dtype: GgmlType, m_tile: u32) -> Option<String> {
     let (elems, bytes, dequant) = layout(dtype)?;
     let head = COMMON
-        .replace("THREADS_X_MTILE", &(THREADS * M_TILE).to_string());
+        .replace("THREADS_X_MTILE", &(THREADS * m_tile).to_string());
     let body = BODY
         .replace("THREADS", &format!("{THREADS}u"))
-        .replace("MTILE", &format!("{M_TILE}u"))
+        .replace("MTILE", &format!("{m_tile}u"))
         .replace("SUBS", &format!("{}u", elems / 32))
         .replace("BLOCK_BYTES", &format!("{bytes}u"));
     // `@workgroup_size` takes a plain literal.

@@ -14,6 +14,7 @@
 
 // VENDORED-LOCAL: this crate is OAIY's addition beside ggml-rs-cuda.
 
+pub mod chain;
 pub mod dense;
 pub mod exl3;
 pub mod shaders;
@@ -62,7 +63,7 @@ struct Gpu {
     queue: wgpu::Queue,
     layout: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
-    pipelines: Mutex<HashMap<(GgmlType, bool), Arc<wgpu::ComputePipeline>>>,
+    pipelines: Mutex<HashMap<(GgmlType, u8), Arc<wgpu::ComputePipeline>>>,
     /// The EXL3 matmul's pipelines (`exl3::shader`): for one row, and for several. Made when first used.
     exl3: Mutex<[Option<Arc<wgpu::ComputePipeline>>; 2]>,
     /// Other kernels' pipelines by name (`dense`), made when first used.
@@ -239,13 +240,19 @@ impl Gpu {
         pipeline
     }
 
-    /// `dtype`'s kernel: the one-row kernel, or with `many` the tiled one a prompt takes.
-    fn pipeline(&self, dtype: GgmlType, many: bool) -> Option<Arc<wgpu::ComputePipeline>> {
+    /// `dtype`'s kernel for `m` rows of `x`: the decode kernel for one, the one-row kernel for a few, the tiled one
+    /// a prompt takes.
+    fn pipeline(&self, dtype: GgmlType, m: usize) -> Option<Arc<wgpu::ComputePipeline>> {
+        let kind = if m >= shaders::MANY_FROM { 1u8 } else if m == 1 { 2 } else { 0 };
         let mut cache = self.pipelines.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(p) = cache.get(&(dtype, many)) {
+        if let Some(p) = cache.get(&(dtype, kind)) {
             return Some(Arc::clone(p));
         }
-        let source = if many { shaders::source_many(dtype)? } else { shaders::source(dtype)? };
+        let source = match kind {
+            1 => shaders::source_many(dtype)?,
+            2 => shaders::source_decode(dtype)?,
+            _ => shaders::source(dtype)?,
+        };
         let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("oaiy-linear-q"),
             source: wgpu::ShaderSource::Wgsl(source.into()),
@@ -258,7 +265,7 @@ impl Gpu {
             compilation_options: Default::default(),
             cache: None,
         }));
-        cache.insert((dtype, many), Arc::clone(&pipeline));
+        cache.insert((dtype, kind), Arc::clone(&pipeline));
         Some(pipeline)
     }
 }
@@ -390,7 +397,7 @@ impl WgpuBackend {
 
     fn upload(&self, w: QuantizedTensor) -> QuantizedTensor {
         let Some((elems, block_bytes, _)) = shaders::layout(w.dtype()) else { return w };
-        if w.is_device() || w.rank() != 2 || w.dim(1) % elems as usize != 0 || self.gpu.pipeline(w.dtype(), false).is_none() {
+        if w.is_device() || w.rank() != 2 || w.dim(1) % elems as usize != 0 || self.gpu.pipeline(w.dtype(), 2).is_none() {
             return w;
         }
         let row_bytes = w.dim(1) / elems as usize * block_bytes as usize;
@@ -479,7 +486,7 @@ impl WgpuBackend {
         let mut ybufs = Vec::with_capacity(ws.len());
         for ((q, shape), &ysize) in ws.iter().zip(&sizes) {
             let n = shape[0];
-            let pipeline = gpu.pipeline(q.dtype, many).expect("uploaded weights have a pipeline");
+            let pipeline = gpu.pipeline(q.dtype, m).expect("uploaded weights have a pipeline");
             let ybuf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("oaiy-y"),
                 size: ysize,
@@ -520,10 +527,10 @@ impl WgpuBackend {
                         pass.dispatch_workgroups(rows.div_ceil(shaders::MANY_TILE), (m as u32).div_ceil(shaders::MANY_TILE), 1);
                         continue;
                     }
-                    // Rows beyond 65535 wrap into the second grid axis.
+                    // Rows beyond 65535 wrap into the second grid axis; the decode kernel takes one row of x.
                     let gx = (*rows).min(65535);
                     let gy = rows.div_ceil(65535);
-                    let gz = (m as u32).div_ceil(shaders::M_TILE);
+                    let gz = if m == 1 { 1 } else { (m as u32).div_ceil(shaders::M_TILE) };
                     pass.dispatch_workgroups(gx, gy, gz);
                 }
             }
@@ -619,6 +626,9 @@ impl Backend for WgpuBackend {
     }
     fn silu_mul_split(&self, fused: &Tensor, ff: usize) -> Tensor {
         self.cpu.silu_mul_split(fused, ff)
+    }
+    fn chain(&self) -> Option<&dyn ggml_rs::chain::DeviceChain> {
+        Some(self)
     }
     fn gelu_approx_mul_split(&self, fused: &Tensor, ff: usize) -> Tensor {
         self.cpu.gelu_approx_mul_split(fused, ff)
