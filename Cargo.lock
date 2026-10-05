@@ -1180,6 +1180,7 @@ dependencies = [
 name = "ggml-rs-wgpu"
 version = "0.0.1"
 dependencies = [
+ "bytemuck",
  "ggml-quants",
  "ggml-rs",
  "half",

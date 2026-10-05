@@ -2405,6 +2405,7 @@ impl Recorder<'_> {
             T::Q4_K => "chain-coop-Q4_K",
             T::Q5_K => "chain-coop-Q5_K",
             T::Q6_K => "chain-coop-Q6_K",
+            T::Q8_0 => "chain-coop-Q8_0",
             _ => return false,
         };
         if !self.gpu().device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) || k % 256 != 0 {
@@ -3026,7 +3027,9 @@ impl ChainRecorder for Recorder<'_> {
             .iter()
             .map(|(_, _, staging, len)| {
                 let view = staging.slice(..(*len as u64 * 4).max(4)).get_mapped_range().expect("webgpu: mapping a finished buffer");
-                let v: Vec<f32> = view.chunks_exact(4).take(*len).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                // copied as bytes (a 512-row chunk's cache rows, 64 MB: a value at a time some 15 ms)
+                let mut v = vec![0f32; *len];
+                bytemuck::cast_slice_mut::<f32, u8>(&mut v).copy_from_slice(&view[..*len * 4]);
                 drop(view);
                 staging.unmap();
                 v
@@ -3845,8 +3848,8 @@ fn main() {
         }
     }
 
-    /// The K-quants' tensor-core matmuls (where the device has them) give their f32 tiled kernels' sums within f16's
-    /// rounding: Q3_K, Q4_K, Q5_K and Q6_K, a tile's worth of tokens and a tile and a bit (the edge), rows off the tile.
+    /// The tensor-core matmuls (where the device has them) give their f32 tiled kernels' sums within f16's rounding:
+    /// Q3_K, Q4_K, Q5_K, Q6_K and Q8_0, a tile's worth of tokens and a tile and a bit (the edge), rows off the tile.
     #[test]
     fn the_tensor_core_matmuls_are_the_f32_ones() {
         let Ok(b) = WgpuBackend::new(Some(2 << 30)) else { return };
@@ -3854,11 +3857,11 @@ fn main() {
             return;
         }
         // the f16 scales' places in each type's block (d, and dmin where it has one)
-        for (dtype, bytes, scales) in [(GgmlType::Q3_K, 110usize, &[108usize][..]), (GgmlType::Q4_K, 144, &[0, 2][..]), (GgmlType::Q5_K, 176, &[0, 2][..]), (GgmlType::Q6_K, 210, &[208][..])] {
+        for (dtype, bytes, scales) in [(GgmlType::Q3_K, 110usize, &[108usize][..]), (GgmlType::Q4_K, 144, &[0, 2][..]), (GgmlType::Q5_K, 176, &[0, 2][..]), (GgmlType::Q6_K, 210, &[208][..]), (GgmlType::Q8_0, 34, &[0][..])] {
             for k in [512usize, 2048] {
             let n = 200usize;
             let mut next = rng(n as u32 + bytes as u32 + k as u32);
-            let mut raw = vec![0u8; n * (k / 256) * bytes];
+            let mut raw = vec![0u8; n * (k / if dtype == GgmlType::Q8_0 { 32 } else { 256 }) * bytes];
             for v in raw.iter_mut() {
                 *v = ((next() + 1.0) * 100.0) as u8;
             }
@@ -3940,8 +3943,8 @@ fn main() {
         // attention's q (384), k and v (32 each), output (160, k 6144)
         assert_eq!(coop_splits(1088, 170, 160), 1);
         assert_eq!(coop_splits(160, 170, 544), 1);
-        assert_eq!(coop_splits(192, 170, 160), 3);
-        assert_eq!(coop_splits(384, 170, 160), 2);
+        assert_eq!(coop_splits(192, 170, 160), 5);
+        assert_eq!(coop_splits(384, 170, 160), 3);
         assert_eq!(coop_splits(32, 170, 160), 5);
         assert_eq!(coop_splits(160, 170, 192), 1);
         // splits of 8 steps or more
@@ -4007,6 +4010,38 @@ fn main() {
             }
             let ms = t.elapsed().as_secs_f64() / 12.0 * 1e3;
             eprintln!("{name}: {ms:.2} ms ({:.1} TFLOPS)", 2.0 * (m * n * k) as f64 / ms / 1e9);
+        }
+    }
+
+    /// What a dispatch costs of itself (`--ignored --nocapture`): 1,000 copies of 256 values, each reading what the
+    /// last wrote (a barrier between each two), and each into a vector of its own.
+    #[test]
+    #[ignore = "a measurement"]
+    fn measure_dispatch_overhead() {
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        let (x, y) = (b.vec(256), b.vec(256));
+        let many: Vec<DeviceVec> = (0..1000).map(|_| b.vec(256)).collect();
+        for dependent in [true, false] {
+            let run = || {
+                let mut rec = b.begin();
+                rec.keep_groups(false);
+                for i in 0..1000 {
+                    if dependent {
+                        let (s, d) = if i % 2 == 0 { (&x, &y) } else { (&y, &x) };
+                        rec.copy(s, 0, d, 0, 256);
+                    } else {
+                        rec.copy(&x, 0, &many[i], 0, 256);
+                    }
+                }
+                rec.read_range(&x, 0, 1);
+                rec.finish();
+            };
+            run();
+            let t = std::time::Instant::now();
+            for _ in 0..3 {
+                run();
+            }
+            eprintln!("1,000 copies, {}: {:.1} us a dispatch", if dependent { "each after the last" } else { "none after another" }, t.elapsed().as_secs_f64() / 3.0 / 1000.0 * 1e6);
         }
     }
 

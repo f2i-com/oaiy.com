@@ -788,15 +788,16 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 /// The splits of a tensor-core matmul's `steps` (of 32) for `groups` workgroups on a GPU of `units` (its SMs: a
 /// workgroup alone on one runs about twice as fast as two together): the fewest of those that take least time, each
 /// wave of `units` workgroups taking as long however full, and each split's sums written and read again besides (as
-/// much as the matmul's own time `4 s / k` per FLOP of the GPU's per byte, taken as 100), at most 8 splits of 8 steps
-/// or more; and how many that is with none empty.
+/// much as the matmul's own time `4 s / k` per FLOP of the GPU's per byte, taken as 50: the parts mostly in its L2, as
+/// [`crate::chain`]'s `measure_coop_splits` finds), at most 8 splits of 8 steps or more; and how many that is with
+/// none empty.
 pub fn coop_splits(groups: u32, units: u32, steps: u32) -> u32 {
     let slots = units.max(1);
     let k = (steps * 32) as f64;
     let cost = |s: u32| {
         let w = groups * s;
         let waves = w.div_ceil(slots) * slots;
-        waves as f64 / w as f64 + if s > 1 { 400.0 * s as f64 / k } else { 0.0 }
+        waves as f64 / w as f64 + if s > 1 { 200.0 * s as f64 / k } else { 0.0 }
     };
     let most = (steps / 8).clamp(1, 8);
     let s = (1..=most).fold(1, |best, s| if cost(s) < cost(best) - 1e-9 { s } else { best });
@@ -1142,6 +1143,20 @@ const COOP_Q3K_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
             for (var i = 0u; i < 4u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }
         }"#;
 
+/// Q8_0's decode for [`coop_tiled`] (its 34-byte blocks read as words, [`COOP_Q6K_HELPERS`]'): a step one block, a
+/// thread's half of it its scale times its 16 int8s (each byte's sign bit flipped: its value plus 128).
+const COOP_Q8_0_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
+        if (rr < p.rows) {
+            let base = rr * p.row_bytes + b * 34u;
+            let d = unpack2x16float(byte(base) | (byte(base + 1u) << 8u)).x;
+            let q = base + 2u + lh * 16u;
+            for (var wi = 0u; wi < 4u; wi++) {
+                wt[at4 + wi] = vec4<f16>(d * byte_less(word_at(q + 4u * wi) ^ 0x80808080u, 128.0));
+            }
+        } else {
+            for (var i = 0u; i < 4u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }
+        }"#;
+
 /// A prompt's matmul on the tensor cores (WGSL's cooperative matrices, f16 into f32): a workgroup a tile of
 /// [`COOP_TILE`] weight rows by as many tokens, `k` 32 at a time; each step the tile's weights decoded to f16 and its
 /// tokens' rows (as [`X_F16`] gives them, padded to the tile) copied into the workgroup's memory, the next step's
@@ -1157,6 +1172,7 @@ pub fn coop_tiled(dtype: GgmlType) -> Option<String> {
         GgmlType::Q4_K => (vec4s, COOP_K_HELPERS, COOP_Q4K_REGS, COOP_Q4K_LOAD, COOP_Q4K_STEP),
         GgmlType::Q5_K => (vec4s, COOP_K_HELPERS, COOP_Q5K_REGS, COOP_Q5K_LOAD, COOP_Q5K_STEP),
         GgmlType::Q6_K => ("@group(0) @binding(0) var<storage, read> w: array<u32>;", COOP_Q6K_HELPERS, "", "", COOP_Q6K_STEP),
+        GgmlType::Q8_0 => ("@group(0) @binding(0) var<storage, read> w: array<u32>;", COOP_Q6K_HELPERS, "", "", COOP_Q8_0_STEP),
         _ => return None,
     };
     let frags = [("c00", 0u32, 0u32), ("c01", 0, 16), ("c02", 0, 32), ("c03", 0, 48), ("c10", 16, 0), ("c11", 16, 16), ("c12", 16, 32), ("c13", 16, 48)];
