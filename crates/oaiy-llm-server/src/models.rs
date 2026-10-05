@@ -2321,11 +2321,12 @@ mod dense_webgpu_timing {
             }
         }
         let steps = 32;
+        let _ = ggml_rs_wgpu::profile::take_line();
         let t = Instant::now();
         for _ in 0..steps {
             forward(1, &mut kv);
         }
-        eprintln!("{steps} decode steps: {:.2} ms a step", t.elapsed().as_secs_f64() * 1e3 / steps as f64);
+        eprintln!("{steps} decode steps: {:.2} ms a step; {}", t.elapsed().as_secs_f64() * 1e3 / steps as f64, ggml_rs_wgpu::profile::take_line());
         // what checking drafted tokens costs: a run of 2, 3, 4 and 5 rows against a step's one (each the best of 8)
         let _ = ggml_rs_wgpu::profile::take_kernels();
         for n in [1usize, 2, 3, 4, 5] {

@@ -2507,8 +2507,8 @@ impl Recorder<'_> {
             "chain: a prompt's attention's buffers"
         );
         let (q16, kv16) = self.attention_f16(q, kv, rows, kv_len, qs, row);
-        let pipeline = self.gpu().named_pipeline(name, || attention_coop(head_dim));
         let words = [n_h as u32, n_kv as u32, past as u32, rows as u32, kv_len as u32, scale.to_bits(), 0, 0];
+        let pipeline = self.gpu().named_pipeline(name, || attention_coop(head_dim));
         self.dispatch_kept(&pipeline, buffer(&kv16), buffer(&q16), buffer(out), &words, (n_h as u32, (rows.div_ceil(32)) as u32, 1));
         self.att16 = Some((q16, kv16));
         true
@@ -3639,6 +3639,45 @@ mod tests {
         }
     }
 
+    /// A prompt's attention on the tensor cores (`--ignored --nocapture`): Qwen3.8 27B's (24 heads of 256, 4 kv) for a
+    /// chunk of 512 at several places, and what it does a second (its scores twice and its values once).
+    #[test]
+    #[ignore = "a measurement"]
+    fn measure_prompt_attention() {
+        let Ok(b) = WgpuBackend::new(Some(2 << 30)) else { return };
+        if !b.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+            return;
+        }
+        let (n_h, n_kv, hd, rows) = (24usize, 4usize, 256usize, 512usize);
+        for past in [0usize, 1024, 2048, 4096] {
+            let (qd, row, kv_len) = (n_h * hd, 2 * n_kv * hd, past + rows);
+            let mut next = rng(past as u32 + 5);
+            let (qv, kv) = (b.vec(rows * qd), b.vec(kv_len * row));
+            DeviceChain::upload(&b, &qv, &(0..rows * qd).map(|_| next()).collect::<Vec<_>>());
+            DeviceChain::upload(&b, &kv, &(0..kv_len * row).map(|_| next()).collect::<Vec<_>>());
+            let out = b.vec(b.attention_rows_out_len(rows, n_h, hd, kv_len));
+            let scale = 1.0 / (hd as f32).sqrt();
+            let run = || {
+                let mut rec = Recorder::new(&b);
+                for _ in 0..8 {
+                    assert!(rec.attention_rows_coop(&qv, &kv, &out, rows, n_h, n_kv, hd, past, None, scale));
+                }
+                rec.read_range(&out, 0, 1);
+                Box::new(rec).finish();
+            };
+            run();
+            let t = std::time::Instant::now();
+            for _ in 0..3 {
+                run();
+            }
+            let ms = t.elapsed().as_secs_f64() / 24.0 * 1e3;
+            // each query's keys up to its own: scores (twice) and values, 2 FLOPs a multiply-add
+            let pairs: f64 = (0..rows).map(|r| (past + r + 1) as f64).sum();
+            let flops = 3.0 * 2.0 * pairs * (n_h * hd) as f64;
+            eprintln!("512 rows after {past}: {ms:.3} ms a layer ({:.0} TFLOPS)", flops / ms / 1e9);
+        }
+    }
+
     /// RoPE, a store into a cache and attention over it give the CPU backend's answer (GQA): a few positions in, and
     /// past 512 (three runs of the split attention put together).
     #[test]
@@ -4498,6 +4537,94 @@ fn main() {
             }
             let ms = t.elapsed().as_secs_f64() / 24.0 * 1e3;
             eprintln!("{name}: {ms:.3} ms ({:.0} TFLOPS)", 2.0 * (m * n * k) as f64 / ms / 1e9);
+        }
+    }
+
+    /// The tensor-core matmul's skeleton (no decode: the weights the first step's, the tokens loaded every step) in
+    /// shapes of a workgroup and its subgroups (`--ignored --nocapture`): what the loop alone runs at, f16 sums.
+    #[test]
+    #[ignore = "a measurement"]
+    fn measure_coop_skeletons() {
+        let Ok(b) = WgpuBackend::new(Some(4 << 30)) else { return };
+        if !b.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+            return;
+        }
+        let (m, n, k) = (512usize, 34816usize, 5120usize);
+        let x16 = b.vec(m * k / 2);
+        let w16 = b.vec(n * k / 2);
+        let y = b.vec(m * n);
+        // (warps down the rows, across the tokens; fragments each down, across): the tile 128 by 128 either way
+        for (wr, wc, fr, fc) in [(4u32, 2u32, 2u32, 4u32), (2, 2, 4, 4), (2, 4, 4, 2), (4, 4, 2, 2)] {
+            let threads = 32 * wr * wc;
+            let mut src = String::new();
+            src += "enable f16;\nenable wgpu_cooperative_matrix;\n";
+            src += "struct Params { k: u32, n: u32, m: u32, row0: u32, rows: u32, row_bytes: u32, splits: u32, _pad1: u32, }\n";
+            src += "@group(0) @binding(0) var<storage, read> w16: array<vec4<f16>>;\n@group(0) @binding(1) var<storage, read> x16: array<vec4<f16>>;\n@group(0) @binding(2) var<storage, read_write> y: array<f16>;\n@group(0) @binding(3) var<uniform> p: Params;\n";
+            src += "const S4: u32 = 10u;\nconst BUF4: u32 = 1280u;\nvar<workgroup> wt: array<vec4<f16>, 2560>;\nvar<workgroup> xt: array<vec4<f16>, 2560>;\n";
+            src += &format!("@compute @workgroup_size({threads})\nfn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {{\n");
+            src += "    let r0 = wg.x * 128u;\n    let t0 = wg.y * 128u;\n    let sg = li / 32u;\n";
+            src += &format!("    let sr = (sg % {wr}u) * {}u;\n    let st = (sg / {wr}u) * {}u;\n", 16 * fr, 16 * fc);
+            // a thread's share of a step's 128 x 32 tokens (and, once, weights): `per` vec4s
+            let per = 128 * 8 / threads;
+            src += &format!("    let padded = ((p.m + 127u) / 128u) * 128u;\n    let xs = padded * 8u;\n");
+            for r in 0..fr {
+                for c in 0..fc {
+                    src += &format!("    var h{r}{c} = coop_mat16x16<f16, C>();\n");
+                }
+            }
+            // the weights once (whatever is there), the first step's tokens
+            src += &format!("    for (var e = li; e < 1024u; e += {threads}u) {{ let row = e / 8u; let q = e % 8u; wt[row * S4 + q] = w16[(r0 + row) * (p.k / 4u) + q]; wt[BUF4 + row * S4 + q] = w16[(r0 + row) * (p.k / 4u) + q]; xt[row * S4 + q] = x16[(t0 + row) * 8u + q]; }}\n");
+            src += "    workgroupBarrier();\n    let all = p.k / 32u;\n";
+            for v in 0..per {
+                src += &format!("    var xr{v} = vec4<f16>();\n");
+            }
+            src += "    for (var b0 = 0u; b0 < all; b0++) {\n        let b = min(b0 + 1u, all - 1u);\n        let buf = ((b0 + 1u) % 2u) * BUF4;\n        let cur = (b0 % 2u) * BUF4;\n";
+            for v in 0..per {
+                src += &format!("        let e{v} = li + {}u;\n        xr{v} = x16[b * xs + (t0 + e{v} / 8u) * 8u + e{v} % 8u];\n", v * threads);
+            }
+            for kk in [0u32, 16] {
+                src += "        {\n            let s10 = S4;\n";
+                for r in 0..fr {
+                    src += &format!("            let ia{r} = cur + (sr + {}u) * S4 + {}u;\n            let a{r} = coopLoadT<coop_mat16x16<f16, A>>(&wt[ia{r}], s10);\n", 16 * r, kk / 4);
+                }
+                for c in 0..fc {
+                    src += &format!("            let ib{c} = cur + (st + {}u) * S4 + {}u;\n            let b{c} = coopLoad<coop_mat16x16<f16, B>>(&xt[ib{c}], s10);\n", 16 * c, kk / 4);
+                }
+                for r in 0..fr {
+                    for c in 0..fc {
+                        src += &format!("            h{r}{c} = coopMultiplyAdd(a{r}, b{c}, h{r}{c});\n");
+                    }
+                }
+                src += "        }\n";
+            }
+            for v in 0..per {
+                src += &format!("        xt[buf + (e{v} / 8u) * S4 + e{v} % 8u] = xr{v};\n");
+            }
+            src += "        workgroupBarrier();\n    }\n";
+            for r in 0..fr {
+                for c in 0..fc {
+                    src += &format!("    {{\n        let o = (t0 + st + {}u) * p.n + r0 + sr + {}u;\n        let ns = p.n;\n        coopStore(h{r}{c}, &y[o], ns);\n    }}\n", 16 * c, 16 * r);
+                }
+            }
+            src += "}\n";
+            let name: &'static str = Box::leak(format!("bench-coop-skeleton-{wr}x{wc}-{fr}x{fc}").into_boxed_str());
+            let pipeline = b.gpu.named_pipeline(name, || src.clone());
+            let run = || {
+                let mut rec = Recorder::new(&b);
+                for _ in 0..8 {
+                    let words = [k as u32, n as u32, m as u32, 0, n as u32, 0, 1, 0];
+                    rec.dispatch_kept(&pipeline, buffer(&w16), buffer(&x16), buffer(&y), &words, ((n as u32).div_ceil(128), (m as u32).div_ceil(128), 1));
+                }
+                rec.read_range(&y, 0, 1);
+                Box::new(rec).finish();
+            };
+            run();
+            let t = std::time::Instant::now();
+            for _ in 0..3 {
+                run();
+            }
+            let ms = t.elapsed().as_secs_f64() / 24.0 * 1e3;
+            eprintln!("{name} ({threads} threads): {ms:.3} ms ({:.0} TFLOPS)", 2.0 * (m * n * k) as f64 / ms / 1e9);
         }
     }
 
