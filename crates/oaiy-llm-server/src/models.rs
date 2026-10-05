@@ -1321,6 +1321,63 @@ mod dense_webgpu_timing {
         assert!(worst >= 0.9999, "{worst}");
     }
 
+    /// Qwen3.8-Flash-Next's decode step chained on the GPUs (its layers over every discrete one) answers as its own
+    /// path does, step by step on the same tokens (the host path's greedy ones): each step's logits close, the same
+    /// greedy token (bar near-ties), and the chain ran. FLASHNEXT_MODEL: the EXL3 checkpoint.
+    #[test]
+    #[ignore = "needs WebGPU adapters with room for Qwen3.8-Flash-Next and its checkpoint (FLASHNEXT_MODEL)"]
+    fn a_chained_flashnext_step_answers_as_its_own_path() {
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+        let path = std::env::var("FLASHNEXT_MODEL").unwrap_or_else(|_| r"E:\models\Qwen3.8-Flash-Next\exl3-3.05bpw".into());
+        let Ok(b0) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
+        let others: Vec<Arc<ggml_rs_wgpu::WgpuBackend>> = b0.others(None).into_iter().map(Arc::new).collect();
+        let b0 = Arc::new(b0);
+        let gpus: Vec<&ggml_rs_wgpu::WgpuBackend> = std::iter::once(b0.as_ref()).chain(others.iter().map(|g| g.as_ref())).collect();
+        let backends: Vec<Arc<dyn ggml_rs::Backend>> = std::iter::once(Arc::clone(&b0) as Arc<dyn ggml_rs::Backend>).chain(others.iter().map(|g| Arc::clone(g) as Arc<dyn ggml_rs::Backend>)).collect();
+        type Make<'a> = Box<dyn Fn(ggml_rs::exl3::Exl3Data) -> std::result::Result<Arc<dyn ggml_rs::exl3::PackedLinear>, String> + Send + Sync + 'a>;
+        let packed = |device: usize| -> Make<'_> {
+            let b = gpus[device];
+            Box::new(move |d| b.exl3(d))
+        };
+        let p = std::path::Path::new(&path);
+        let reserve = crate::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
+        let experts = |device: usize, _layer: &str, list: Vec<[ggml_rs::exl3::Exl3Data; 3]>| -> oaiy_engine::Result<Box<dyn ggml_rs::exl3::Experts>> {
+            gpus[device].exl3_experts_leaving(list, reserve).map_err(oaiy_engine::Error::Arg)
+        };
+        let model = crate::flashnext::load_portable(p, backends, &packed, &experts).unwrap();
+        let steps: usize = std::env::var("FLASHNEXT_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(48);
+        let prompt: Vec<u32> = model.tokenizer.encode("Write a short story about a cat called Moss who lives on a boat.", false).unwrap();
+        let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
+        let cosine = |a: &[f32], b: &[f32]| {
+            let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
+            let n = |v: &[f32]| v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            dot / (n(a) * n(b))
+        };
+        let (mut kh, mut kc) = (model.new_kv_cache(prompt.len() + steps + 8), model.new_kv_cache(prompt.len() + steps + 8));
+        let e = model.embed_text(&prompt).unwrap();
+        let lh = model.forward_host(&prompt, &e, &mut kh, None).unwrap();
+        let _ = model.forward_host(&prompt, &e, &mut kc, None).unwrap();
+        let mut next = argmax(lh.data());
+        let (mut worst, mut same, mut th, mut tc) = (1.0f64, 0usize, 0f64, 0f64);
+        for _ in 0..steps {
+            let e = model.embed_text(&[next]).unwrap();
+            let t = std::time::Instant::now();
+            let host = model.forward_host(&[next], &e, &mut kh, None).unwrap();
+            th += t.elapsed().as_secs_f64();
+            let t = std::time::Instant::now();
+            let chained = model.forward(&[next], &e, &mut kc, None).unwrap();
+            tc += t.elapsed().as_secs_f64();
+            worst = worst.min(cosine(host.data(), chained.data()));
+            same += (argmax(host.data()) == argmax(chained.data())) as usize;
+            next = argmax(host.data());
+        }
+        let runs = model.chain_runs();
+        eprintln!("{steps} steps: host {:.1} ms a step, chained {:.1} ms ({runs} chained); worst logits cosine {worst:.6}; the same greedy token {same} of {steps}", th * 1e3 / steps as f64, tc * 1e3 / steps as f64);
+        assert_eq!(runs, steps, "every step chained");
+        assert!(worst > 0.99, "{worst}");
+    }
+
     /// Where a chained Qwen3.5 run's time goes (QWEN35_MODEL): prompt chunks of a few tokens as the server's
     /// checkpoints cut them, a checkpoint's read of the recurrent state, decode steps, and a chunk of 512.
     #[test]

@@ -668,8 +668,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 "#;
 
 /// The matmul of each job's transformed row ([`ONE`]'s, the matrices a group's: matrix `m`'s words from `m *
-/// p[1].x`): a workgroup a (tile column, job and split), its partial sums to `part[(j * splits + s) * n..]`.
-/// `p[0]`: n, k, tile words, splits; `p[1]`: words a matrix.
+/// p[1].x`): a workgroup a (tile column, job and split), its partial sums to `part[(j * splits + s) * n..]`, the
+/// jobs from `p[1].y` (a pass of a long list: 65535 workgroups an axis). `p[0]`: n, k, tile words, splits; `p[1]`:
+/// words a matrix, the pass's first job.
 const G_MM: &str = r#"
 @group(0) @binding(0) var<storage, read> words: array<u32>;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
@@ -722,7 +723,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     if (nt >= ntiles) {
         return;
     }
-    let j = wg.z / splits;
+    let j = p[1].y + wg.z / splits;
     let s = wg.z % splits;
     let base = jobs[2u * j] * p[1].x;
     let r = t / 16u;
@@ -1060,6 +1061,10 @@ impl Exl3MoeGrouped {
         Ok(Some(Exl3MoeGrouped { b: b.clone(), routed: routed.len(), hidden, ff, gu, down, shared, step: Mutex::new(None) }))
     }
 
+    pub(crate) fn is_on(&self, gpu: &Arc<Gpu>) -> bool {
+        Arc::ptr_eq(&self.b.gpu, gpu)
+    }
+
     /// Scratch for `rows` rows of `top_k` experts.
     fn scratch(&self, rows: usize, top_k: usize) -> Step {
         let b = &self.b;
@@ -1105,7 +1110,12 @@ impl Exl3MoeGrouped {
         let (suh, svh) = (buf(&g.suh), buf(&g.svh));
         rec.dispatch_wide("exl3-pre", &chain_shader("pre"), [&xb, &suh, &d, &jb, &d, &d, &xhb, &drw], &[g.k as u32, 1], ((g.k / 128) as u32, count as u32, 1));
         let ntiles = (g.n / 16) as u32;
-        rec.dispatch_wide("exl3-mm", &chain_shader("mm"), [&g.words, &xhb, &jb, &d, &d, &d, &pb, &drw], &[g.n as u32, g.k as u32, g.tw as u32, g.splits, g.mwords as u32], (ntiles.min(65535), ntiles.div_ceil(65535), count as u32 * g.splits));
+        // as many jobs a pass as the grid's third axis takes
+        let per = (65535 / g.splits) as usize;
+        for first in (0..count).step_by(per) {
+            let jobs = per.min(count - first) as u32;
+            rec.dispatch_wide("exl3-mm", &chain_shader("mm"), [&g.words, &xhb, &jb, &d, &d, &d, &pb, &drw], &[g.n as u32, g.k as u32, g.tw as u32, g.splits, g.mwords as u32, first as u32], (ntiles.min(65535), ntiles.div_ceil(65535), jobs * g.splits));
+        }
         rec.dispatch_wide("exl3-post", &chain_shader("post"), [&pb, &svh, &jb, &d, &d, &d, &yb, &drw], &[g.n as u32, g.splits], ((g.n / 128) as u32, count as u32, 1));
     }
 
@@ -1217,20 +1227,7 @@ impl std::fmt::Debug for Exl3MoeHost {
     }
 }
 
-/// One row's experts and their weights, as the CUDA routing gives them: the `top_k` of the routed experts by logit
-/// (a tie to the lower index), softmax-weighted among themselves, then the shared expert (index `routed`) weighted by
-/// the sigmoid of its gate.
-fn route(logits: &[f32], top_k: usize) -> Vec<(usize, f32)> {
-    let routed = logits.len() - 1;
-    let mut order: Vec<usize> = (0..routed).collect();
-    order.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
-    let top = &order[..top_k.min(routed)];
-    let max = logits[top[0]];
-    let sum: f32 = top.iter().map(|&e| (logits[e] - max).exp()).sum();
-    let mut out: Vec<(usize, f32)> = top.iter().map(|&e| (e, (logits[e] - max).exp() / sum)).collect();
-    out.push((routed, 1.0 / (1.0 + (-logits[routed]).exp())));
-    out
-}
+use ggml_rs::exl3::route;
 
 impl Exl3MoeHost {
     fn new(experts: Vec<[Proj; 3]>, gpu: Option<(Arc<Gpu>, Arc<Mutex<()>>)>) -> Result<Self, String> {

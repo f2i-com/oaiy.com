@@ -25,6 +25,21 @@ pub trait Experts: std::fmt::Debug + Send + Sync {
     }
 }
 
+/// VENDORED-LOCAL: one row's experts and their weights, as the CUDA routing gives them: the `top_k` of the routed
+/// experts by logit (a tie to the lower index), softmax-weighted among themselves, then the shared expert (index
+/// `logits.len() - 1`) weighted by the sigmoid of its gate.
+pub fn route(logits: &[f32], top_k: usize) -> Vec<(usize, f32)> {
+    let routed = logits.len() - 1;
+    let mut order: Vec<usize> = (0..routed).collect();
+    order.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
+    let top = &order[..top_k.min(routed)];
+    let max = logits[top[0]];
+    let sum: f32 = top.iter().map(|&e| (logits[e] - max).exp()).sum();
+    let mut out: Vec<(usize, f32)> = top.iter().map(|&e| (e, (logits[e] - max).exp() / sum)).collect();
+    out.push((routed, 1.0 / (1.0 + (-logits[routed]).exp())));
+    out
+}
+
 #[derive(Debug)]
 pub struct Exl3Data {
     pub words: Vec<u32>,

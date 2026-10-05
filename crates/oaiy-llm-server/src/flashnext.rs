@@ -417,6 +417,8 @@ pub struct FlashNext {
     pub cudas: Vec<Arc<Card>>,
     /// Whether a decode step has run (uncaptured), making the scratch its matrices keep.
     decoded: std::sync::atomic::AtomicBool,
+    /// A decode step chained on the devices (WebGPU), made at the first step that can use one.
+    chain: std::sync::OnceLock<Option<FnChain>>,
 }
 
 /// The EXL3 matrix `name` (`k -> n`, mul1 codebook) on `backend`, its input and output
@@ -826,6 +828,7 @@ fn build(path: &Path, backends: Vec<Arc<dyn Backend>>, cudas: Vec<Arc<Card>>, lo
         devices: backends,
         cudas,
         decoded: Default::default(),
+        chain: Default::default(),
         config: cfg,
     })
 }
@@ -874,6 +877,18 @@ impl FlashNext {
     /// what `kv` holds: the last position's logits, on the host. `positions`: the multimodal
     /// rope positions, when the prompt has images.
     pub fn forward(&self, tokens: &[u32], embeds: &Tensor, kv: &mut KvCache, positions: Option<&[[u32; 3]]>) -> Result<Tensor> {
+        // VENDORED-LOCAL: a decode step chained on the GPUs where they can (WebGPU)
+        if tokens.len() == 1 && positions.is_none() && !profile::on() {
+            if let Some(logits) = self.forward_chained(tokens[0], embeds, kv) {
+                return Ok(logits);
+            }
+        }
+        self.forward_host(tokens, embeds, kv, positions)
+    }
+
+    /// [`Self::forward`] op by op (and on CUDA, captured as graphs), never chained: what a chained step is checked
+    /// against.
+    pub fn forward_host(&self, tokens: &[u32], embeds: &Tensor, kv: &mut KvCache, positions: Option<&[[u32; 3]]>) -> Result<Tensor> {
         let cfg = &self.config;
         let seq = tokens.len();
         let past = kv.len;
@@ -1179,6 +1194,429 @@ impl FlashNext {
         b.ple_conv(&mut out, &gated, &conv_in, &mut window, &ple.conv, cfg.ple_kernel, cfg.ngram);
         kv.ssm_conv[slot] = Some(window);
         out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A decode step chained on the GPUs (WebGPU)
+// ---------------------------------------------------------------------------
+
+/// A hyper-connection's matrices on its layer's device (f32: `down` `[rank + writes, streams * hidden]`, `up`
+/// `[streams * hidden, rank + writes]`), and its norm (`1 + w`).
+struct HcVecs {
+    norm: ggml_rs::DeviceVec,
+    down: ggml_rs::DeviceVec,
+    up: ggml_rs::DeviceVec,
+    rank: usize,
+    writes: usize,
+}
+
+/// A layer's own vectors on its device.
+struct ChainLayer {
+    attn_hc: HcVecs,
+    mlp_hc: HcVecs,
+    mixer: ChainMixer,
+    /// The router, then the shared expert's gate, f32 `[experts + 1, hidden]`.
+    router: ggml_rs::DeviceVec,
+}
+
+enum ChainMixer {
+    /// The beta-alpha projection (f32), the conv's weights, `A`, `dt_bias`, the output norm, and which of the
+    /// recurrent states' pool is this layer's.
+    Gdn { ba: ggml_rs::DeviceVec, conv: ggml_rs::DeviceVec, a: ggml_rs::DeviceVec, dt: ggml_rs::DeviceVec, norm: ggml_rs::DeviceVec, slot: usize },
+    /// The per-head norms, and which of its device's copy of the cache is this layer's.
+    Attn { q_norm: ggml_rs::DeviceVec, k_norm: ggml_rs::DeviceVec, slot: usize },
+}
+
+/// A device's working vectors for a step (one row).
+struct ChainDev {
+    x: ggml_rs::DeviceVec,
+    normed: ggml_rs::DeviceVec,
+    t: ggml_rs::DeviceVec,
+    post: ggml_rs::DeviceVec,
+    post2: ggml_rs::DeviceVec,
+    logits: ggml_rs::DeviceVec,
+    y_in: ggml_rs::DeviceVec,
+    y_out: ggml_rs::DeviceVec,
+    y2_in: ggml_rs::DeviceVec,
+    moe_out: ggml_rs::DeviceVec,
+    router: ggml_rs::DeviceVec,
+    qkv: ggml_rs::DeviceVec,
+    z: ggml_rs::DeviceVec,
+    ba: ggml_rs::DeviceVec,
+    conv: ggml_rs::DeviceVec,
+    core: ggml_rs::DeviceVec,
+    qfull: ggml_rs::DeviceVec,
+    q: ggml_rs::DeviceVec,
+    gate: ggml_rs::DeviceVec,
+    k: ggml_rs::DeviceVec,
+    v: ggml_rs::DeviceVec,
+    qn: ggml_rs::DeviceVec,
+    kn: ggml_rs::DeviceVec,
+    gated: ggml_rs::DeviceVec,
+    index: ggml_rs::DeviceVec,
+    table: ggml_rs::DeviceVec,
+    mixed: ggml_rs::DeviceVec,
+    head: ggml_rs::DeviceVec,
+}
+
+/// A device's copy of its attention layers' caches (row `t`: K `[kv_heads, head_dim]` then V), `cap` rows.
+struct ChainKv {
+    layers: Vec<ggml_rs::DeviceVec>,
+    cap: usize,
+    out: ggml_rs::DeviceVec,
+    /// The `KvCache::id` the rows are a copy of (0: none).
+    owner: u64,
+}
+
+/// What a chained step changes: the devices' copies of the cache, and the recurrent states the cache's tensors alias.
+struct ChainMut {
+    kv: Vec<ChainKv>,
+    pool: Vec<(ggml_rs::DeviceVec, ggml_rs::DeviceVec)>,
+}
+
+pub(crate) struct FnChain {
+    layers: Vec<ChainLayer>,
+    devs: Vec<ChainDev>,
+    /// Each device's attention layers, in its copy's order.
+    attn_of: Vec<Vec<usize>>,
+    /// The delta-net layers, in the pool's order.
+    gdn: Vec<usize>,
+    collapse: HcVecs,
+    m: std::sync::Mutex<ChainMut>,
+    /// Steps the chain took, for a test that has to know it ran.
+    pub(crate) runs: std::sync::atomic::AtomicUsize,
+}
+
+fn chain_packed(w: &Weight) -> Option<&dyn PackedLinear> {
+    match w {
+        Weight::Packed(p) => Some(p.as_ref()),
+        _ => None,
+    }
+}
+
+impl FlashNext {
+    /// The chained step's state, made at the first step that can use one: None when a device has no chain, or a
+    /// matrix or a layer's experts are not where a chain reads them.
+    fn chain_state(&self) -> Option<&FnChain> {
+        self.chain
+            .get_or_init(|| {
+                let cfg = &self.config;
+                let (h, s) = (cfg.hidden, cfg.streams);
+                let chains: Vec<&dyn ggml_rs::DeviceChain> = self.devices.iter().map(|b| b.chain()).collect::<Option<_>>()?;
+                let held = |d: usize, w: &Weight| chain_packed(w).is_some_and(|p| chains[d].holds_exl3(p));
+                if cfg.kd != cfg.vd || ![16, 32, 64, 128].contains(&cfg.kd) || !(2..=8).contains(&cfg.conv) || cfg.rope_dim == 0 || cfg.rope_dim > cfg.head_dim {
+                    return None;
+                }
+                let up = |d: usize, t: &Tensor| {
+                    let t = if t.is_device() { t.to_host() } else { t.clone() };
+                    let v = chains[d].vec(t.numel());
+                    chains[d].upload(&v, t.data());
+                    v
+                };
+                let hc = |d: usize, m: &HyperMix| -> Option<HcVecs> {
+                    if m.packed {
+                        return None;
+                    }
+                    let writes = if m.site { s } else { 0 };
+                    Some(HcVecs { norm: up(d, &m.norm), down: up(d, &m.down), up: up(d, &m.up), rank: m.rank, writes })
+                };
+                let mut attn_of = vec![Vec::new(); self.devices.len()];
+                let mut gdn = Vec::new();
+                let mut layers = Vec::with_capacity(cfg.layers);
+                for (i, l) in self.layers.iter().enumerate() {
+                    let d = l.device;
+                    let dense = |w: &Weight| match w {
+                        Weight::Dense(t) => Some(up(d, t)),
+                        _ => None,
+                    };
+                    let mixer = match &l.mixer {
+                        Mixer::Gdn(g) => {
+                            if ![&g.qkv, &g.z, &g.out].iter().all(|w| held(d, w)) {
+                                return None;
+                            }
+                            gdn.push(i);
+                            ChainMixer::Gdn { ba: dense(&g.ba)?, conv: up(d, &g.conv), a: up(d, &g.a), dt: up(d, &g.dt_bias), norm: up(d, &g.norm), slot: gdn.len() - 1 }
+                        }
+                        Mixer::Attn(a) => {
+                            if ![&a.q, &a.k, &a.v, &a.o, &a.index_qk].iter().all(|w| held(d, w)) {
+                                return None;
+                            }
+                            attn_of[d].push(i);
+                            ChainMixer::Attn { q_norm: up(d, &a.q_norm), k_norm: up(d, &a.k_norm), slot: attn_of[d].len() - 1 }
+                        }
+                    };
+                    if !chains[d].holds_experts(l.moe.experts.as_ref()) {
+                        return None;
+                    }
+                    layers.push(ChainLayer { attn_hc: hc(d, &l.attn_hc)?, mlp_hc: hc(d, &l.mlp_hc)?, mixer, router: dense(&l.moe.router)? });
+                }
+                let last = self.devices.len() - 1;
+                if !held(last, &self.head) {
+                    return None;
+                }
+                let collapse = hc(last, &self.collapse)?;
+                let (nh, nkv, hd) = (cfg.heads, cfg.kv_heads, cfg.head_dim);
+                let conv_dim = 2 * cfg.nk * cfg.kd + cfg.nv * cfg.vd;
+                let rank = layers.iter().map(|l| l.attn_hc.rank.max(l.mlp_hc.rank)).max().unwrap_or(0).max(collapse.rank);
+                let devs = chains
+                    .iter()
+                    .map(|c| {
+                        let v = |n: usize| c.vec(n);
+                        ChainDev {
+                            x: v(s * h),
+                            normed: v(s * h),
+                            t: v(rank + s),
+                            post: v(s),
+                            post2: v(s),
+                            logits: v(s * h),
+                            y_in: v(h),
+                            y_out: v(h),
+                            y2_in: v(h),
+                            moe_out: v(h),
+                            router: v(cfg.experts + 1),
+                            qkv: v(conv_dim),
+                            z: v(cfg.nv * cfg.vd),
+                            ba: v(2 * cfg.nv),
+                            conv: v(conv_dim),
+                            core: v(cfg.nv * cfg.vd),
+                            qfull: v(2 * nh * hd),
+                            q: v(nh * hd),
+                            gate: v(nh * hd),
+                            k: v(nkv * hd),
+                            v: v(nkv * hd),
+                            qn: v(nh * hd),
+                            kn: v(nkv * hd),
+                            gated: v(nh * hd),
+                            index: v((cfg.index_heads + 1) * cfg.index_dim),
+                            table: v(cfg.rope_dim),
+                            mixed: v(h),
+                            head: v(cfg.vocab),
+                        }
+                    })
+                    .collect();
+                let kv = chains.iter().map(|c| ChainKv { layers: Vec::new(), cap: 0, out: c.vec(1), owner: 0 }).collect();
+                let pool = gdn
+                    .iter()
+                    .map(|&i| {
+                        let c = chains[self.layers[i].device];
+                        (c.vec(cfg.nv * cfg.vd * cfg.kd), c.vec((cfg.conv - 1) * conv_dim))
+                    })
+                    .collect();
+                Some(FnChain { layers, devs, attn_of, gdn, collapse, m: std::sync::Mutex::new(ChainMut { kv, pool }), runs: Default::default() })
+            })
+            .as_ref()
+    }
+
+    /// Steps the chain has taken (a test's check that it ran).
+    #[allow(dead_code)]
+    pub(crate) fn chain_runs(&self) -> usize {
+        self.chain.get().and_then(|c| c.as_ref()).map_or(0, |c| c.runs.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// One decode step of `token` (its embedding `embeds`), chained, if the devices can: one submit a layer, the
+    /// layer's work all on its GPU (the previous layer's experts as the host routed them, the hyper-connections'
+    /// write-back, norm, gates and mix, the delta net or the attention, the router), only the router's logits coming
+    /// back (and an attention layer's K, V and indexer key for the host's cache); the n-gram features before their
+    /// layer and the hand-over between devices through the host. None leaves the step to `forward`'s own path: past
+    /// the dense span (QSA's sparse attention), or with images.
+    fn forward_chained(&self, token: u32, embeds: &Tensor, kv: &mut KvCache) -> Option<Tensor> {
+        use ggml_rs::{ChainRecorder, DeltaNet};
+        use std::sync::atomic::Ordering;
+        if std::env::var_os("OAIY_NO_CHAIN").is_some() {
+            return None;
+        }
+        let cfg = &self.config;
+        let past = kv.len;
+        let ratio = cfg.index_ratio;
+        if past + 1 > cfg.index_budget / ratio * ratio + ratio - 1 {
+            return None;
+        }
+        let st = self.chain_state()?;
+        let chains: Vec<&dyn ggml_rs::DeviceChain> = self.devices.iter().map(|b| b.chain()).collect::<Option<_>>()?;
+        let (h, s) = (cfg.hidden, cfg.streams);
+        let (nh, nkv, hd, rot) = (cfg.heads, cfg.kv_heads, cfg.head_dim, cfg.rope_dim);
+        let (kvd, row) = (nkv * hd, 2 * nkv * hd);
+        let conv_dim = 2 * cfg.nk * cfg.kd + cfg.nv * cfg.vd;
+        let eps = cfg.eps;
+        let mut m = st.m.lock().unwrap_or_else(|p| p.into_inner());
+        // the devices' copies of the attention caches: room for this step, the rows the host wrote since
+        for (d, layers) in st.attn_of.iter().enumerate() {
+            let g = &mut m.kv[d];
+            if g.cap < past + 1 {
+                let cap = (past + 1).next_power_of_two().max(256);
+                g.layers = (0..layers.len()).map(|i| match g.layers.get(i) { Some(old) => chains[d].resize(old, cap * row), None => chains[d].vec(cap * row) }).collect();
+                g.out = chains[d].vec(chains[d].attention_out_len(nh, hd, cap));
+                g.cap = cap;
+            }
+            let from = if g.owner == kv.id { kv.dirty_from.min(past) } else { 0 };
+            if from < past {
+                for (slot, &l) in layers.iter().enumerate() {
+                    let (kh, vh) = (kv.k_buffer(l).to_host(), kv.v_buffer(l).to_host());
+                    let mut rows = Vec::with_capacity((past - from) * row);
+                    for t in from..past {
+                        rows.extend_from_slice(&kh.data()[t * kvd..(t + 1) * kvd]);
+                        rows.extend_from_slice(&vh.data()[t * kvd..(t + 1) * kvd]);
+                    }
+                    chains[d].upload_at(&g.layers[slot], from * row, &rows);
+                }
+            }
+            g.owner = kv.id;
+        }
+        // the delta-net layers' recurrent states as the chain's vectors (the cache aliasing them)
+        let mut states = Vec::with_capacity(st.gdn.len());
+        for (slot, &l) in st.gdn.iter().enumerate() {
+            let c = chains[self.layers[l].device];
+            let (ps, pc) = &mut m.pool[slot];
+            let adopt = |pool: &mut ggml_rs::DeviceVec, t: &mut Option<Tensor>, shape: Vec<usize>| -> ggml_rs::DeviceVec {
+                let len: usize = shape.iter().product();
+                if let Some(v) = t.as_ref().and_then(|t| c.aliased(t)).filter(|v| v.len == len) {
+                    return v;
+                }
+                let host = t.take().map(|t| t.to_host());
+                if Arc::strong_count(&pool.inner) > 1 {
+                    *pool = c.vec(len);
+                }
+                match host.filter(|h| h.numel() == len) {
+                    Some(h) => c.upload(pool, h.data()),
+                    None => c.zero(pool),
+                }
+                *t = Some(c.alias(pool, shape));
+                pool.clone()
+            };
+            let sv = adopt(ps, &mut kv.ssm_state[l], vec![cfg.nv, cfg.vd, cfg.kd]);
+            let cv = adopt(pc, &mut kv.ssm_conv[l], vec![cfg.conv - 1, conv_dim]);
+            states.push((sv, cv));
+        }
+        // the partial RoPE's sines and cosines at this position, on every device
+        let table: Vec<f32> = (0..rot / 2)
+            .flat_map(|k| {
+                let (sn, cs) = (past as f32 * cfg.rope_theta.powf(-2.0 * k as f32 / rot as f32)).sin_cos();
+                [sn, cs]
+            })
+            .collect();
+        for (c, dv) in chains.iter().zip(&st.devs) {
+            c.upload(&dv.table, &table);
+        }
+        // the n-gram features, then the embedding in every stream
+        let ple_device = self.layers[cfg.ple_layer].device;
+        let ple_emb = self.ple_embed(self.devices[ple_device].as_ref(), &[token], kv).ok()?;
+        let e = embeds.to_host();
+        let x0: Vec<f32> = (0..s).flat_map(|_| e.data()[..h].iter().copied()).collect();
+        let mut d = self.layers[0].device;
+        chains[d].upload(&st.devs[d].x, &x0);
+        let hc = |rec: &mut dyn ChainRecorder, dv: &ChainDev, hcv: &HcVecs, pending: Option<(&ggml_rs::DeviceVec, &ggml_rs::DeviceVec)>, post: &ggml_rs::DeviceVec, out: &ggml_rs::DeviceVec| {
+            if let Some((y, p)) = pending {
+                rec.stream_apply(&dv.x, y, p, 1, s, h);
+            }
+            rec.rmsnorm_streams(&dv.x, &hcv.norm, &dv.normed, 1, s, eps);
+            rec.matmul_f32_rows(&hcv.down, hcv.rank + hcv.writes, s * h, &dv.normed, &dv.t, 1);
+            rec.hc_gates(&dv.t, post, 1, hcv.rank, hcv.writes, s);
+            rec.matmul_f32_rows(&hcv.up, s * h, hcv.rank + hcv.writes, &dv.t, &dv.logits, 1);
+            rec.hc_mix(&dv.logits, &dv.normed, out, 1, s, h);
+        };
+        let mut pending: Option<Vec<(usize, f32)>> = None;
+        for (i, (layer, cl)) in self.layers.iter().zip(&st.layers).enumerate() {
+            let dev = layer.device;
+            if dev != d || i == cfg.ple_layer {
+                // what this device has pending, then the streams through the host (to the next device, or the
+                // n-gram layer)
+                let dv = &st.devs[d];
+                let mut rec = chains[d].begin();
+                if let Some(assign) = pending.take() {
+                    rec.moe_rows(self.layers[i - 1].moe.experts.as_ref(), &dv.y2_in, &dv.moe_out, &[assign]);
+                    rec.stream_apply(&dv.x, &dv.moe_out, &dv.post2, 1, s, h);
+                }
+                rec.read(&dv.x);
+                let mut x = Tensor::from_vec(rec.finish().pop().expect("the streams"), vec![1, s * h]);
+                if i == cfg.ple_layer {
+                    let b = self.devices[dev].as_ref();
+                    x = self.ple_forward(b, &b.to_device(x), &ple_emb, kv).to_host();
+                }
+                d = dev;
+                chains[d].upload(&st.devs[d].x, x.data());
+            }
+            let dv = &st.devs[d];
+            let mut rec = chains[d].begin();
+            let applied = pending.take();
+            if let Some(assign) = &applied {
+                rec.moe_rows(self.layers[i - 1].moe.experts.as_ref(), &dv.y2_in, &dv.moe_out, std::slice::from_ref(assign));
+            }
+            hc(&mut *rec, dv, &cl.attn_hc, applied.as_ref().map(|_| (&dv.moe_out, &dv.post2)), &dv.post, &dv.y_in);
+            match (&layer.mixer, &cl.mixer) {
+                (Mixer::Gdn(g), ChainMixer::Gdn { ba, conv, a, dt, norm, slot }) => {
+                    let (sv, cv) = &states[*slot];
+                    rec.exl3_rows(chain_packed(&g.qkv)?, &dv.y_in, &dv.qkv, 1);
+                    rec.exl3_rows(chain_packed(&g.z)?, &dv.y_in, &dv.z, 1);
+                    rec.matmul_f32_rows(ba, 2 * cfg.nv, h, &dv.y_in, &dv.ba, 1);
+                    rec.ssm_conv(&dv.qkv, conv, cv, &dv.conv, 1, conv_dim, cfg.conv);
+                    let dn = DeltaNet { rows: 1, v_heads: cfg.nv, k_heads: cfg.nk, k_dim: cfg.kd, v_dim: cfg.vd, scale_q: 1.0 / (cfg.vd as f32).sqrt(), eps, sigmoid_gate: true };
+                    rec.delta_net(&dv.conv, &dv.z, &dv.ba, a, dt, norm, sv, &dv.core, dn);
+                    rec.exl3_rows(chain_packed(&g.out)?, &dv.core, &dv.y_out, 1);
+                }
+                (Mixer::Attn(a), ChainMixer::Attn { q_norm, k_norm, slot }) => {
+                    let g = &m.kv[d];
+                    let kvl = &g.layers[*slot];
+                    rec.exl3_rows(chain_packed(&a.q)?, &dv.y_in, &dv.qfull, 1);
+                    rec.exl3_rows(chain_packed(&a.k)?, &dv.y_in, &dv.k, 1);
+                    rec.exl3_rows(chain_packed(&a.v)?, &dv.y_in, &dv.v, 1);
+                    rec.exl3_rows(chain_packed(&a.index_qk)?, &dv.y_in, &dv.index, 1);
+                    rec.copy_cols(&dv.qfull, &dv.q, nh, hd, 2 * hd, 0);
+                    rec.copy_cols(&dv.qfull, &dv.gate, nh, hd, 2 * hd, hd);
+                    rec.rmsnorm_rows(&dv.q, q_norm, &dv.qn, nh, eps);
+                    rec.rmsnorm_rows(&dv.k, k_norm, &dv.kn, nkv, eps);
+                    rec.rope_partial_rows(&dv.qn, 1, nh, hd, rot, &dv.table);
+                    rec.rope_partial_rows(&dv.kn, 1, nkv, hd, rot, &dv.table);
+                    rec.store_rows(&dv.kn, kvl, 1, kvd, past, row, 0);
+                    rec.store_rows(&dv.v, kvl, 1, kvd, past, row, kvd);
+                    rec.attention(&dv.qn, kvl, &g.out, nh, nkv, hd, 0, past + 1, g.cap, 1.0 / (hd as f32).sqrt());
+                    rec.mul_sigmoid(&g.out, &dv.gate, &dv.gated, nh * hd);
+                    rec.exl3_rows(chain_packed(&a.o)?, &dv.gated, &dv.y_out, 1);
+                }
+                _ => unreachable!("layer {i}'s vectors are its mixer's"),
+            }
+            hc(&mut *rec, dv, &cl.mlp_hc, Some((&dv.y_out, &dv.post)), &dv.post2, &dv.y2_in);
+            rec.matmul_f32_rows(&cl.router, cfg.experts + 1, h, &dv.y2_in, &dv.router, 1);
+            rec.read(&dv.router);
+            let attn_slot = match &cl.mixer {
+                ChainMixer::Attn { slot, .. } => {
+                    rec.read_range(&m.kv[d].layers[*slot], past * row, row);
+                    rec.read_range(&dv.index, cfg.index_heads * cfg.index_dim, cfg.index_dim);
+                    true
+                }
+                _ => false,
+            };
+            let mut got = rec.finish().into_iter();
+            let logits = got.next().expect("the router's logits");
+            if attn_slot {
+                let (kvrow, raw) = (got.next().expect("the step's K and V"), got.next().expect("the step's indexer key"));
+                let Mixer::Attn(a) = &layer.mixer else { unreachable!() };
+                let b = self.devices[dev].as_ref();
+                kv.append(b, a.index_slot, &Tensor::from_vec(raw.clone(), vec![1, 1, cfg.index_dim]), &Tensor::from_vec(raw, vec![1, 1, cfg.index_dim]));
+                kv.append(b, i, &Tensor::from_vec(kvrow[..kvd].to_vec(), vec![1, nkv, hd]), &Tensor::from_vec(kvrow[kvd..].to_vec(), vec![1, nkv, hd]));
+            }
+            pending = Some(ggml_rs::exl3::route(&logits, cfg.top_k));
+        }
+        // the last layer's experts, its write-back, the streams' collapse and the head, on the last device
+        let last = self.devices.len() - 1;
+        if d != last {
+            return None;
+        }
+        let dv = &st.devs[d];
+        let mut rec = chains[d].begin();
+        if let Some(assign) = pending.take() {
+            rec.moe_rows(self.layers[cfg.layers - 1].moe.experts.as_ref(), &dv.y2_in, &dv.moe_out, &[assign]);
+            rec.stream_apply(&dv.x, &dv.moe_out, &dv.post2, 1, s, h);
+        }
+        hc(&mut *rec, dv, &st.collapse, None, &dv.post, &dv.mixed);
+        rec.exl3_rows(chain_packed(&self.head)?, &dv.mixed, &dv.head, 1);
+        rec.read(&dv.head);
+        let logits = rec.finish().pop().expect("the logits");
+        kv.commit(1);
+        kv.dirty_from = usize::MAX;
+        self.decoded.store(true, Ordering::Relaxed);
+        st.runs.fetch_add(1, Ordering::Relaxed);
+        Some(Tensor::from_vec(logits, vec![1, cfg.vocab]))
     }
 }
 

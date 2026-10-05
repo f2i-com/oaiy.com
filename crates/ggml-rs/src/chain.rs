@@ -63,6 +63,8 @@ pub trait DeviceChain: Send + Sync {
     fn holds(&self, w: &QuantizedTensor) -> bool;
     /// Whether this device holds the EXL3 projection `w` where [`ChainRecorder::exl3_rows`] reads it.
     fn holds_exl3(&self, w: &dyn crate::exl3::PackedLinear) -> bool;
+    /// Whether this device holds a MoE layer's experts as groups [`ChainRecorder::moe_rows`] runs.
+    fn holds_experts(&self, e: &dyn crate::exl3::Experts) -> bool;
     /// The length [`ChainRecorder::attention`]'s `out` needs for `n_h` heads of `head_dim` over a cache of `cap` rows:
     /// the result and the device's scratch.
     fn attention_out_len(&self, n_h: usize, head_dim: usize, cap: usize) -> usize;

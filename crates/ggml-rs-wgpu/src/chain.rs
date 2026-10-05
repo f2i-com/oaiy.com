@@ -771,6 +771,10 @@ impl DeviceChain for WgpuBackend {
             .is_some_and(|g| g.is_on(&self.gpu) && g.single_chunk().is_some())
     }
 
+    fn holds_experts(&self, e: &dyn ggml_rs::exl3::Experts) -> bool {
+        e.as_any().and_then(|a| a.downcast_ref::<crate::exl3::Exl3MoeGrouped>()).is_some_and(|g| g.is_on(&self.gpu))
+    }
+
     fn holds(&self, w: &QuantizedTensor) -> bool {
         w.device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).is_some_and(|q| Arc::ptr_eq(&q.gpu, &self.gpu))
     }
