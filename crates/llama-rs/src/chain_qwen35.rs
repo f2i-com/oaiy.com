@@ -594,8 +594,14 @@ impl Qwen35Chain {
         let mut rec = chain.begin();
         // a prompt's vectors are its own: no bind groups kept to hold them
         rec.keep_groups(t == 1);
+        // each residual's add waits for the norm after it (the next layer's, or the output's): one dispatch for both
+        let mut added = false;
         for (l, (b, lv)) in m.blocks.iter().zip(&st.layers).enumerate() {
-            rec.rmsnorm_rows(&w.x, &lv.attn_norm, &w.xn, t, eps);
+            if added {
+                rec.add_rmsnorm_rows(&w.x, &w.proj, &lv.attn_norm, &w.xn, t, eps);
+            } else {
+                rec.rmsnorm_rows(&w.x, &lv.attn_norm, &w.xn, t, eps);
+            }
             let (ffn_pair, ffn_down) = match (b, &lv.mixer) {
                 (Qwen35Block::Attention { attn_q, attn_k, attn_v, attn_output, ffn_pair, ffn_down, .. }, Mixer::Attention { q_norm, k_norm, slot }) => {
                     let kvl = &g.layers[*slot];
@@ -644,8 +650,7 @@ impl Qwen35Chain {
                 }
                 _ => unreachable!("layer {l}'s vectors are its block's"),
             };
-            rec.add(&w.x, &w.proj);
-            rec.rmsnorm_rows(&w.x, &lv.post_norm, &w.xn, t, eps);
+            rec.add_rmsnorm_rows(&w.x, &w.proj, &lv.post_norm, &w.xn, t, eps);
             match ffn_pair {
                 FfnPair::Fused(gu) => {
                     rec.matmul_rows(quant(gu), &w.xn, &w.ffa, t);
@@ -658,11 +663,15 @@ impl Qwen35Chain {
                 }
             }
             rec.matmul_rows(quant(ffn_down), &w.act, &w.proj, t);
-            rec.add(&w.x, &w.proj);
+            added = true;
         }
         // the head of the last row only, or of a check's every row; with a prediction layer, the hidden states after the
         // output norm kept (a check's rows, or the last), and a prompt's chunk through the layer too (its cache)
-        rec.rmsnorm_rows(&w.x, &st.output_norm, &w.xn, t, eps);
+        if added {
+            rec.add_rmsnorm_rows(&w.x, &w.proj, &st.output_norm, &w.xn, t, eps);
+        } else {
+            rec.rmsnorm_rows(&w.x, &st.output_norm, &w.xn, t, eps);
+        }
         if let Some(sp) = &st.spec {
             let rows = if checking { t } else { 1 };
             rec.copy(&w.xn, (t - rows) * s.d, &sp.hid, 0, rows * s.d);
@@ -919,8 +928,7 @@ fn mtp_block(m: &Qwen35Model, mtp: &crate::qwen35::Qwen35Mtp, sp: &Spec, s: &Dim
     }
     rec.mul_sigmoid(&w.att, &w.gate, &w.gated, t * qh);
     rec.matmul_rows(quant(attn_output), &w.gated, &w.proj, t);
-    rec.add(&w.x, &w.proj);
-    rec.rmsnorm_rows(&w.x, &sp.post_norm, &w.xn, t, eps);
+    rec.add_rmsnorm_rows(&w.x, &w.proj, &sp.post_norm, &w.xn, t, eps);
     match ffn_pair {
         FfnPair::Fused(gu) => {
             rec.matmul_rows(quant(gu), &w.xn, &w.ffa, t);

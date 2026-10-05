@@ -63,6 +63,66 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 }
 "#;
 
+/// [`RMSNORM_ROWS`] of rows a multiple of 4 long: vec4 loads, a thread's squares in four running sums (its loads in
+/// flight together, where one sum waited on each load in turn). `p[0]`: n, the bits of eps, weight rows.
+const RMSNORM_ROWS4: &str = r#"
+@group(0) @binding(0) var<storage, read> w4: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> x4: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> y4: array<vec4<f32>>;
+@group(0) @binding(3) var<uniform> p: array<vec4<u32>, 2>;
+var<workgroup> part: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let n4 = p[0].x / 4u;
+    let at = wg.x * n4;
+    var wrows = p[0].z;
+    if (wrows == 0u) { wrows = 1u; }
+    let wat = (wg.x % wrows) * n4;
+    var s = vec4<f32>(0.0);
+    for (var i = li; i < n4; i += 256u) { let v = x4[at + i]; s += v * v; }
+    part[li] = s.x + s.y + s.z + s.w;
+    workgroupBarrier();
+    for (var stride = 128u; stride > 0u; stride /= 2u) {
+        if (li < stride) { part[li] += part[li + stride]; }
+        workgroupBarrier();
+    }
+    let inv = 1.0 / sqrt(part[0] / f32(p[0].x) + bitcast<f32>(p[0].y));
+    for (var i = li; i < n4; i += 256u) { y4[at + i] = x4[at + i] * inv * w4[wat + i]; }
+}
+"#;
+
+/// `x += y`, then each row of `x` RMS-normed into `out` with `w` (`[n]`, one for every row), rows a multiple of 4
+/// long: a residual's add and the next norm in one dispatch. `p[0]`: n, the bits of eps.
+const ADD_RMSNORM_ROWS4: &str = r#"
+@group(0) @binding(0) var<storage, read> yv: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> w4: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read_write> x4: array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read_write> out: array<vec4<f32>>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+var<workgroup> part: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let n4 = p[0].x / 4u;
+    let at = wg.x * n4;
+    var s = vec4<f32>(0.0);
+    for (var i = li; i < n4; i += 256u) {
+        let v = x4[at + i] + yv[at + i];
+        x4[at + i] = v;
+        s += v * v;
+    }
+    part[li] = s.x + s.y + s.z + s.w;
+    workgroupBarrier();
+    for (var stride = 128u; stride > 0u; stride /= 2u) {
+        if (li < stride) { part[li] += part[li + stride]; }
+        workgroupBarrier();
+    }
+    let inv = 1.0 / sqrt(part[0] / f32(p[0].x) + bitcast<f32>(p[0].y));
+    for (var i = li; i < n4; i += 256u) { out[at + i] = x4[at + i] * inv * w4[i]; }
+}
+"#;
+
 /// A hyper-connection's gates, `p[0]`: rank, writes, streams, rows. `t` (binding 6) `[rows, rank + writes]`: its first
 /// `rank` become `silu(t / streams)`, the rest 0; `post` (binding 7) `[rows, writes]` gets their `2 sigmoid(t /
 /// streams)`. As the host's `hc_gates`.
@@ -504,24 +564,27 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
-/// [`MATMUL_F32`] of one row with f16 weights two to a word (`DeviceChain::vec_f16`'s): each output's products summed
-/// as it sums them. `p[0]`: n, k.
+/// [`MATVEC_F32_4`] with f16 weights two to a word (`DeviceChain::vec_f16`'s), `k` a multiple of 4: each output's
+/// products summed as it sums them. `p[0]`: n, k.
 const MATVEC_F16: &str = r#"
+@group(0) @binding(0) var<storage, read> w2: array<vec2<u32>>;
+@group(0) @binding(1) var<storage, read> x4: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> p: array<vec4<u32>, 2>;
 var<workgroup> part: array<f32, 256>;
-
-fn wv(e: u32) -> f32 {
-    let pr = unpack2x16float(w[e / 2u]);
-    return select(pr.x, pr.y, (e & 1u) == 1u);
-}
 
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
-    let n = p[0].x;
-    let k = p[0].y;
+    let k4 = p[0].y / 4u;
     let o = wg.x;
-    var s = 0.0;
-    for (var i = li; i < k; i += 256u) { s += wv(o * k + i) * x[i]; }
-    part[li] = s;
+    var s = vec4<f32>(0.0);
+    for (var i = li; i < k4; i += 256u) {
+        let pr = w2[o * k4 + i];
+        let a = unpack2x16float(pr.x);
+        let b = unpack2x16float(pr.y);
+        s += vec4<f32>(a.x, a.y, b.x, b.y) * x4[i];
+    }
+    part[li] = s.x + s.y + s.z + s.w;
     workgroupBarrier();
     for (var st = 128u; st > 0u; st /= 2u) {
         if (li < st) { part[li] += part[li + st]; }
@@ -558,6 +621,31 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         for (var j = 0u; j < 8u; j++) { t += part[li + j]; }
         y[o] = t;
     }
+}
+"#;
+
+/// [`MATMUL_F32`] of one row with `k` a multiple of 4: vec4 loads, a thread's products in four running sums (its
+/// loads in flight together). `p[0]`: n, k.
+const MATVEC_F32_4: &str = r#"
+@group(0) @binding(0) var<storage, read> w4: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> x4: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> p: array<vec4<u32>, 2>;
+var<workgroup> part: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let k4 = p[0].y / 4u;
+    let o = wg.x;
+    var s = vec4<f32>(0.0);
+    for (var i = li; i < k4; i += 256u) { s += w4[o * k4 + i] * x4[i]; }
+    part[li] = s.x + s.y + s.z + s.w;
+    workgroupBarrier();
+    for (var st = 128u; st > 0u; st /= 2u) {
+        if (li < st) { part[li] += part[li + st]; }
+        workgroupBarrier();
+    }
+    if (li == 0u) { y[o] = part[0]; }
 }
 "#;
 
@@ -854,6 +942,97 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         var acc = 0.0;
         for (var i = 0u; i < n; i++) { acc += sc[i] * bitcast<f32>(w[(start + i) * row + kvd + kh * hd + d]); }
         y[part + d] = acc;
+    }
+    if (li == 0u) {
+        let ml = n_h * hd + n_h * runs * hd + (h * runs + run) * 2u;
+        y[ml] = m;
+        y[ml + 1u] = l;
+    }
+}
+"#;
+
+/// [`ATTENTION_PART`] for a head size a multiple of 4 (at most 512): the query in the workgroup's memory, each key read
+/// a vec4 at a time with four running sums, and each value column's products in four running sums (a run's positions
+/// in fours), where every load waited on the sum before it. The same parts and largest and sum as it leaves for the
+/// join.
+const ATTENTION_PART4: &str = r#"
+@group(0) @binding(0) var<storage, read> kv4: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> q4: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> p: array<vec4<u32>, 2>;
+var<workgroup> qs: array<vec4<f32>, 128>;
+var<workgroup> sc: array<f32, 256>;
+var<workgroup> red: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let n_h = p[0].x;
+    let n_kv = p[0].y;
+    let hd = p[0].z;
+    let hi = p[0].w;
+    let lo = p[1].x;
+    let runs = p[1].y;
+    let scale = bitcast<f32>(p[1].z);
+    let h = wg.x;
+    let run = wg.y;
+    let kh = h / (n_h / n_kv);
+    let hd4 = hd / 4u;
+    let kvd4 = n_kv * hd4;
+    let row4 = 2u * kvd4;
+    if (li < hd4) {
+        qs[li] = q4[h * hd4 + li];
+    }
+    workgroupBarrier();
+    let start = lo + run * 256u;
+    let end = min(start + 256u, hi);
+    let t = start + li;
+    var s = -3.4e38;
+    if (t < end) {
+        let kb = t * row4 + kh * hd4;
+        var a = vec4<f32>(0.0);
+        for (var d = 0u; d < hd4; d++) { a += qs[d] * kv4[kb + d]; }
+        s = (a.x + a.y + a.z + a.w) * scale;
+    }
+    red[li] = s;
+    workgroupBarrier();
+    for (var st = 128u; st > 0u; st /= 2u) {
+        if (li < st) { red[li] = max(red[li], red[li + st]); }
+        workgroupBarrier();
+    }
+    let m = red[0];
+    workgroupBarrier();
+    var e = 0.0;
+    if (t < end) { e = exp(s - m); }
+    sc[li] = e;
+    red[li] = e;
+    workgroupBarrier();
+    for (var st = 128u; st > 0u; st /= 2u) {
+        if (li < st) { red[li] += red[li + st]; }
+        workgroupBarrier();
+    }
+    let l = red[0];
+    let part = n_h * hd + (h * runs + run) * hd;
+    let n = end - start;
+    // a value column a thread (its 4 columns where the head is wider than 256 columns' threads... 4 at a time)
+    for (var d4 = li; d4 < hd4; d4 += 256u) {
+        var a0 = vec4<f32>(0.0);
+        var a1 = vec4<f32>(0.0);
+        var a2 = vec4<f32>(0.0);
+        var a3 = vec4<f32>(0.0);
+        let vb = start * row4 + kvd4 + kh * hd4 + d4;
+        var i = 0u;
+        for (; i + 4u <= n; i += 4u) {
+            a0 += sc[i] * kv4[vb + i * row4];
+            a1 += sc[i + 1u] * kv4[vb + (i + 1u) * row4];
+            a2 += sc[i + 2u] * kv4[vb + (i + 2u) * row4];
+            a3 += sc[i + 3u] * kv4[vb + (i + 3u) * row4];
+        }
+        for (; i < n; i++) { a0 += sc[i] * kv4[vb + i * row4]; }
+        let o = (a0 + a1) + (a2 + a3);
+        y[part + d4 * 4u] = o.x;
+        y[part + d4 * 4u + 1u] = o.y;
+        y[part + d4 * 4u + 2u] = o.z;
+        y[part + d4 * 4u + 3u] = o.w;
     }
     if (li == 0u) {
         let ml = n_h * hd + n_h * runs * hd + (h * runs + run) * 2u;
@@ -1200,6 +1379,33 @@ impl Recorder<'_> {
         self.push((Arc::clone(pipeline), group, groups));
     }
 
+    /// `y[r] = W x[r]` as [`ChainRecorder::matmul_rows`], from `x`'s rows as int8 (quantized into `xq`, a vector of
+    /// [`crate::shaders::q8_len`]): the int8 kernels' (Q3_K so far). False for a type without one.
+    #[cfg(test)]
+    pub(crate) fn matmul_rows_q8(&mut self, w: &QuantizedTensor, x: &DeviceVec, y: &DeviceVec, m: usize, xq: &DeviceVec) -> bool {
+        let q = w.device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).expect("a weight this adapter holds");
+        let (n, k) = (w.shape()[0], w.shape()[1]);
+        if q.dtype != ggml_quants::GgmlType::Q3_K || k % 256 != 0 {
+            return false;
+        }
+        let (len, xs_at) = crate::shaders::q8_len(m, k);
+        assert!(xq.len >= len && x.len >= m * k && y.len >= m * n, "chain: an int8 matmul [{n}, {k}] of {m} rows");
+        let quant = self.gpu().named_pipeline("chain-q8-quantize", || crate::shaders::QUANT_Q8.to_string());
+        let blocks = (m * k / 32) as u32;
+        let groups = blocks.div_ceil(256);
+        let d = self.gpu().dummy().clone();
+        self.dispatch_kept(&quant, &d, buffer(x), buffer(xq), &[k as u32, m as u32, xs_at as u32], (groups.min(65535), groups.div_ceil(65535), 1));
+        let mr = if m == 1 { 1 } else { crate::shaders::MULTI_ROWS };
+        let name = if mr == 1 { "chain-q8-Q3_K-decode" } else { "chain-q8-Q3_K-multi" };
+        let pipeline = self.gpu().named_pipeline(name, || crate::shaders::rb_kernel_q8(q.dtype, crate::shaders::rb_rows(q.dtype, mr), mr).expect("Q3_K's int8 kernel"));
+        for (chunk, row0, rows) in &q.chunks {
+            let words = [k as u32, n as u32, m as u32, *row0, *rows, q.row_bytes as u32, xs_at as u32, 0];
+            let groups = crate::shaders::grid(q.dtype, m, *rows);
+            self.dispatch_kept(&pipeline, chunk, buffer(xq), buffer(y), &words, groups);
+        }
+        true
+    }
+
     pub(crate) fn named(&self, name: &'static str, body: &'static str) -> Arc<wgpu::ComputePipeline> {
         self.gpu().named_pipeline(name, || format!("{HEAD}{body}"))
     }
@@ -1251,8 +1457,21 @@ impl ChainRecorder for Recorder<'_> {
 
     fn rmsnorm_rows(&mut self, x: &DeviceVec, w: &DeviceVec, out: &DeviceVec, rows: usize, eps: f32) {
         assert!(rows > 0 && x.len % rows == 0 && w.len >= x.len / rows && out.len >= x.len, "chain: rmsnorm of {rows} rows of {}", x.len);
-        let pipeline = self.named("chain-rmsnorm-rows", RMSNORM_ROWS);
-        self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(out), &[(x.len / rows) as u32, eps.to_bits()], (rows as u32, 1, 1));
+        let n = x.len / rows;
+        // rows a multiple of 4 long (a model's width, a head's): vec4 loads
+        let pipeline = if n % 4 == 0 { self.gpu().named_pipeline("chain-rmsnorm-rows4", || RMSNORM_ROWS4.to_string()) } else { self.named("chain-rmsnorm-rows", RMSNORM_ROWS) };
+        self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(out), &[n as u32, eps.to_bits()], (rows as u32, 1, 1));
+    }
+
+    fn add_rmsnorm_rows(&mut self, x: &DeviceVec, y: &DeviceVec, w: &DeviceVec, out: &DeviceVec, rows: usize, eps: f32) {
+        let n = x.len / rows.max(1);
+        if rows == 0 || n % 4 != 0 || n * rows != x.len || y.len < x.len || w.len < n || out.len < x.len || Arc::ptr_eq(&x.inner, &out.inner) {
+            self.add(x, y);
+            self.rmsnorm_rows(x, w, out, rows, eps);
+            return;
+        }
+        let d = self.gpu().dummy().clone();
+        self.dispatch_wide("chain-add-rmsnorm-rows4", ADD_RMSNORM_ROWS4, [buffer(y), buffer(w), &d, &d, &d, &d, buffer(x), buffer(out)], &[n as u32, eps.to_bits()], (rows as u32, 1, 1));
     }
 
     fn add(&mut self, acc: &DeviceVec, y: &DeviceVec) {
@@ -1416,8 +1635,8 @@ impl ChainRecorder for Recorder<'_> {
         assert!(k % 2 == 0 && w.len * 2 >= n * k && x.len >= rows * k && y.len >= rows * n && n <= 65535 && rows <= 65535, "chain: an f16 matmul [{n}, {k}] of {rows} rows");
         if rows == 1 {
             // a long row a workgroup (as the f32 one sums it); short ones eight threads each, 32 a workgroup
-            if k >= 2048 {
-                let pipeline = self.named("chain-matvec-f16", MATVEC_F16);
+            if k >= 2048 && k % 4 == 0 {
+                let pipeline = self.gpu().named_pipeline("chain-matvec-f16-4", || MATVEC_F16.to_string());
                 self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(y), &[n as u32, k as u32], (n as u32, 1, 1));
             } else {
                 let pipeline = self.named("chain-matvec-f16-narrow", MATVEC_F16_NARROW);
@@ -1447,7 +1666,7 @@ impl ChainRecorder for Recorder<'_> {
     fn matmul_f32_rows(&mut self, w: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize) {
         assert!(w.len >= n * k && x.len >= rows * k && y.len >= rows * n && n <= 65535 && rows <= 65535, "chain: an f32 matmul [{n}, {k}] of {rows} rows");
         if rows == 1 {
-            let pipeline = self.named("chain-matmul-f32", MATMUL_F32);
+            let pipeline = if k % 4 == 0 { self.gpu().named_pipeline("chain-matvec-f32-4", || MATVEC_F32_4.to_string()) } else { self.named("chain-matmul-f32", MATMUL_F32) };
             self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(y), &[n as u32, k as u32], (n as u32, 1, 1));
             return;
         }
@@ -1540,7 +1759,8 @@ impl ChainRecorder for Recorder<'_> {
             "chain: attention's buffers"
         );
         let params = self.uniform(&[n_h as u32, n_kv as u32, head_dim as u32, kv_len as u32, lo as u32, runs as u32, scale.to_bits()]);
-        let part = self.named("chain-attention-part", ATTENTION_PART);
+        // a head a multiple of 4 wide (at most 512): the vec4 kernel
+        let part = if head_dim % 4 == 0 && head_dim <= 512 { self.gpu().named_pipeline("chain-attention-part4", || ATTENTION_PART4.to_string()) } else { self.named("chain-attention-part", ATTENTION_PART) };
         self.dispatch(&part, buffer(kv), buffer(q), buffer(out), &params, (n_h as u32, runs as u32, 1));
         let join = self.named("chain-attention-join", ATTENTION_JOIN);
         self.dispatch(&join, buffer(kv), buffer(q), buffer(out), &params, (n_h as u32, 1, 1));
@@ -2254,6 +2474,220 @@ mod tests {
             close(&win_got, window.data(), "the window");
             // the next run's window is the CPU's (as a step after a prompt starts from the prompt's)
             DeviceChain::upload(&b, &dwin, window.data());
+        }
+    }
+
+    /// Q3_K's int8 kernel against its f32 one (Qwen3.8 27B's FFN gate, [17408, 5120]): the same sums within int8's
+    /// rounding, and their times, 1 to 4 rows (`--ignored --nocapture`).
+    #[test]
+    #[ignore = "a measurement"]
+    fn measure_q8_matmuls() {
+        let Ok(b) = WgpuBackend::new(Some(4 << 30)) else { return };
+        let (dtype, n, k, block, bytes) = (GgmlType::Q3_K, 17408usize, 5120usize, 256usize, 110usize);
+        let nbytes = n * (k / block) * bytes;
+        let mut next = rng(n as u32);
+        let mut raw = vec![0u8; nbytes];
+        for v in raw.iter_mut() {
+            *v = ((next() + 1.0) * 100.0) as u8;
+        }
+        // sane block scales (the f16 d of each block, bytes 108..110): small and finite
+        for blk in raw.chunks_exact_mut(bytes) {
+            let d = half::f16::from_f32(0.01 + (blk[0] as f32) * 1e-4).to_bits().to_le_bytes();
+            blk[108] = d[0];
+            blk[109] = d[1];
+        }
+        // eight matrices in turn (392 MB, past the L2's 96 MB), as a model's layers stream from memory
+        let ws: Vec<_> = (0..8u8)
+            .map(|i| {
+                let mut r = raw.clone();
+                for v in r.iter_mut().step_by(7) {
+                    *v = v.wrapping_add(i);
+                }
+                ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(r, vec![n, k], dtype))
+            })
+            .collect();
+        let w = &ws[0];
+        for m in [1usize, 2, 3, 4] {
+            let (x, y, y8) = (b.vec(m * k), b.vec(m * n), b.vec(m * n));
+            let xq = b.vec(crate::shaders::q8_len(m, k).0);
+            DeviceChain::upload(&b, &x, &(0..m * k).map(|_| next()).collect::<Vec<_>>());
+            let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new() };
+            assert!(rq.matmul_rows_q8(w, &x, &y8, m, &xq));
+            rq.read(&y8);
+            let got = Box::new(rq).finish().pop().unwrap();
+            let mut rec = b.begin();
+            rec.matmul_rows(w, &x, &y, m);
+            rec.read(&y);
+            let want = rec.finish().pop().unwrap();
+            let scale = want.iter().fold(1e-6f32, |a, v| a.max(v.abs()));
+            let worst = got.iter().zip(&want).map(|(a, e)| (a - e).abs() / scale).fold(0f32, f32::max);
+            let dot: f64 = got.iter().zip(&want).map(|(a, e)| *a as f64 * *e as f64).sum();
+            let norm = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+            let cos = dot / (norm(&got) * norm(&want));
+            let reps = 28;
+            let time = |q8: bool| {
+                let run = || {
+                    let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new() };
+                    for i in 0..reps {
+                        let w = &ws[i % ws.len()];
+                        if q8 {
+                            rq.matmul_rows_q8(w, &x, &y8, m, &xq);
+                        } else {
+                            rq.matmul_rows(w, &x, &y, m);
+                        }
+                    }
+                    rq.read_range(&y, 0, 1);
+                    Box::new(rq).finish();
+                };
+                run();
+                let t = std::time::Instant::now();
+                for _ in 0..5 {
+                    run();
+                }
+                t.elapsed().as_secs_f64() / 5.0 / reps as f64
+            };
+            let (f, q) = (time(false), time(true));
+            eprintln!("{dtype:?} [{n}, {k}] x {m} rows: f32 {:.1} us ({:.0} GB/s), int8 {:.1} us ({:.0} GB/s; quantizing included); worst {worst:.2e} of the largest, cosine {cos:.6}", f * 1e6, nbytes as f64 / f / 1e9, q * 1e6, nbytes as f64 / q / 1e9);
+        }
+    }
+
+    /// The one-row K-quant kernel's weight rows a lane, from memory (eight matrices in turn, past the L2): Qwen3.8 27B's
+    /// Q3_K FFN gate and Q4_K down, Q5_K qkv, Q6_K (`--ignored --nocapture`).
+    #[test]
+    #[ignore = "a measurement"]
+    fn measure_decode_rows_a_lane() {
+        let Ok(b) = WgpuBackend::new(Some(8 << 30)) else { return };
+        for (dtype, n, k, bytes) in [(GgmlType::Q3_K, 17408usize, 5120usize, 112usize), (GgmlType::Q4_K, 5120, 17408, 144), (GgmlType::Q5_K, 10240, 5120, 176), (GgmlType::Q6_K, 5120, 6144, 210)] {
+            let mut next = rng(n as u32 ^ k as u32);
+            let raw_bytes = if dtype == GgmlType::Q3_K { 110 } else { bytes };
+            let nbytes = n * (k / 256) * raw_bytes;
+            let mut raw = vec![0u8; nbytes];
+            for v in raw.iter_mut() {
+                *v = ((next() + 1.0) * 100.0) as u8;
+            }
+            let ws: Vec<_> = (0..8u8)
+                .map(|i| {
+                    let mut r = raw.clone();
+                    for v in r.iter_mut().step_by(7) {
+                        *v = v.wrapping_add(i);
+                    }
+                    ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(r, vec![n, k], dtype))
+                })
+                .collect();
+            let (x, y) = (b.vec(k), b.vec(n));
+            DeviceChain::upload(&b, &x, &(0..k).map(|_| next()).collect::<Vec<_>>());
+            for (r, ks) in [(1u32, 1u32), (2, 1), (4, 1), (1, 2), (2, 2), (4, 2), (1, 4), (2, 4), (4, 4)] {
+                let Some(src) = crate::shaders::rb_kernel_for_test(dtype, r, 1, ks) else { continue };
+                let pipeline = b.gpu.named_pipeline(Box::leak(format!("test-rb-{dtype:?}-{r}-{ks}").into_boxed_str()), || src);
+                let reps = 32;
+                let run = || {
+                    let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new() };
+                    for i in 0..reps {
+                        let q = ws[i % ws.len()].device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).unwrap();
+                        for (chunk, row0, rows) in &q.chunks {
+                            let words = [k as u32, n as u32, 1, *row0, *rows, q.row_bytes as u32, 0, 0];
+                            let groups = rows.div_ceil(4 * r);
+                            rq.dispatch_kept(&pipeline, chunk, buffer(&x), buffer(&y), &words, (1, groups.min(65535), groups.div_ceil(65535)));
+                        }
+                    }
+                    rq.read_range(&y, 0, 1);
+                    Box::new(rq).finish();
+                };
+                run();
+                let t = std::time::Instant::now();
+                for _ in 0..5 {
+                    run();
+                }
+                let secs = t.elapsed().as_secs_f64() / 5.0 / reps as f64;
+                eprintln!("{dtype:?} [{n}, {k}] one row, {r} weight rows a lane, {ks} along k: {:.1} us, {:.0} GB/s", secs * 1e6, nbytes as f64 / secs / 1e9);
+            }
+        }
+    }
+
+    /// What reading memory reaches on this adapter through WebGPU: a kernel that sums 400 MB in vec4s, with 1, 2 and
+    /// 4 loads in flight a thread, at 4 and 8 warps a workgroup (`--ignored --nocapture`).
+    #[test]
+    #[ignore = "a measurement"]
+    fn measure_read_bandwidth() {
+        let Ok(b) = WgpuBackend::new(Some(8 << 30)) else { return };
+        let len = 100usize << 20; // 400 MB of f32
+        let src = b.vec(len);
+        let out = b.vec(1 << 20);
+        for (unroll, wg) in [(1u32, 128u32), (2, 128), (4, 128), (4, 256), (8, 256)] {
+            let body = format!(
+                r#"
+@group(0) @binding(0) var<storage, read> s4: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> unused: array<f32>;
+@group(0) @binding(2) var<storage, read_write> o: array<f32>;
+@group(0) @binding(3) var<uniform> p: array<vec4<u32>, 2>;
+@compute @workgroup_size({wg})
+fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {{
+    let n4 = p[0].x;
+    let threads = nw.x * {wg}u;
+    var acc = vec4<f32>(0.0);
+    var i = id.x;
+    loop {{
+        if (i + {last}u * threads >= n4) {{ break; }}
+{loads}
+        i += {unroll}u * threads;
+    }}
+    o[id.x % 1048576u] = acc.x + acc.y + acc.z + acc.w;
+}}
+"#,
+                last = unroll - 1,
+                loads = (0..unroll).map(|u| format!("        acc += s4[i + {u}u * threads];")).collect::<Vec<_>>().join("\n"),
+            );
+            let name: &'static str = Box::leak(format!("test-read-{unroll}-{wg}").into_boxed_str());
+            let pipeline = b.gpu.named_pipeline(name, || body);
+            let groups = 170 * 16;
+            let run = || {
+                let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new() };
+                for _ in 0..8 {
+                    rq.dispatch_kept(&pipeline, buffer(&src), buffer(&src), buffer(&out), &[(len / 4) as u32], (groups, 1, 1));
+                }
+                rq.read_range(&out, 0, 1);
+                Box::new(rq).finish();
+            };
+            run();
+            let t = std::time::Instant::now();
+            for _ in 0..3 {
+                run();
+            }
+            let secs = t.elapsed().as_secs_f64() / 3.0 / 8.0;
+            eprintln!("reading 400 MB, {unroll} loads in flight a thread, {wg} threads a workgroup: {:.0} GB/s", (len * 4) as f64 / secs / 1e9);
+        }
+    }
+
+    /// A residual's add and the next norm in one dispatch give the two ops' answer; the vec4 norm gives the scalar
+    /// one's (within an f32 step: its sums run in another order).
+    #[test]
+    fn an_add_and_norm_in_one_are_the_two() {
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        let mut r = rng(31);
+        for (rows, n) in [(1usize, 5120usize), (3, 256), (2, 20)] {
+            let (x0, y0, w0): (Vec<f32>, Vec<f32>, Vec<f32>) = ((0..rows * n).map(|_| r()).collect(), (0..rows * n).map(|_| r()).collect(), (0..n).map(|_| r()).collect());
+            let up = |v: &[f32]| {
+                let d = b.vec(v.len());
+                DeviceChain::upload(&b, &d, v);
+                d
+            };
+            let (xa, xb, y, w, oa, ob) = (up(&x0), up(&x0), up(&y0), up(&w0), b.vec(rows * n), b.vec(rows * n));
+            let mut rec = b.begin();
+            rec.add(&xa, &y);
+            rec.rmsnorm_rows(&xa, &w, &oa, rows, 1e-6);
+            rec.add_rmsnorm_rows(&xb, &y, &w, &ob, rows, 1e-6);
+            for v in [&xa, &xb, &oa, &ob] {
+                rec.read(v);
+            }
+            let got = rec.finish();
+            assert_eq!(got[0], got[1], "the sums alike, {rows} rows of {n}");
+            // the expected norm on the host
+            let want: Vec<f32> = got[0].chunks_exact(n).flat_map(|row| {
+                let inv = 1.0 / (row.iter().map(|v| v * v).sum::<f32>() / n as f32 + 1e-6).sqrt();
+                row.iter().zip(&w0).map(move |(v, g)| v * inv * g).collect::<Vec<_>>()
+            }).collect();
+            close(&got[2], &want, "the two ops");
+            close(&got[3], &want, "in one");
         }
     }
 

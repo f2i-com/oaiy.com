@@ -94,6 +94,11 @@ pub trait ChainRecorder {
     fn rmsnorm_rows(&mut self, x: &DeviceVec, w: &DeviceVec, out: &DeviceVec, rows: usize, eps: f32);
     /// `acc += y`.
     fn add(&mut self, acc: &DeviceVec, y: &DeviceVec);
+    /// `x += y`, then `out` its rows' [`Self::rmsnorm_rows`] with `w`: a residual's add and the next norm in one.
+    fn add_rmsnorm_rows(&mut self, x: &DeviceVec, y: &DeviceVec, w: &DeviceVec, out: &DeviceVec, rows: usize, eps: f32) {
+        self.add(x, y);
+        self.rmsnorm_rows(x, w, out, rows, eps);
+    }
     /// `out = silu(fused[..ff]) * fused[ff..]`, `ff = out.len`.
     fn silu_mul_split(&mut self, fused: &DeviceVec, out: &DeviceVec) {
         self.silu_mul_split_rows(fused, out, 1)

@@ -1754,7 +1754,10 @@ mod dense_webgpu_timing {
             eprintln!("a run of {n} rows: {best:.2} ms");
             let k = ggml_rs_wgpu::profile::take_kernels();
             if !k.is_empty() {
-                for (name, ms, c) in k.iter().take(6) {
+                let all: f64 = k.iter().map(|e| e.1).sum();
+                let count: u64 = k.iter().map(|e| e.2).sum();
+                eprintln!("    every kernel: {:.2} ms a run ({} dispatches)", all / 8.0, count / 8);
+                for (name, ms, c) in k.iter().take(if n == 1 { 24 } else { 6 }) {
                     eprintln!("    {name:<28} {:>8.2} ms a run ({} dispatches)", ms / 8.0, c / 8);
                 }
             }

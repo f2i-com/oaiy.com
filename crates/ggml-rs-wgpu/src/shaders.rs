@@ -240,7 +240,7 @@ fn source_rb(dtype: GgmlType, mr: u32) -> Option<String> {
 /// RTX 5090 (Qwen3.8 27B's and a 3B Llama's shapes, 1, 2 and 4 weight rows a lane): 4 for Q3_K, Q4_K and Q5_K (one
 /// row of `x`: Q3_K [17408, 5120] in 26 us where a row a lane took 35); Q6_K, whose words take more work a weight,
 /// 1 for one row of `x` and 2 for several.
-fn rb_rows(dtype: GgmlType, mr: u32) -> u32 {
+pub(crate) fn rb_rows(dtype: GgmlType, mr: u32) -> u32 {
     match (dtype, mr) {
         (GgmlType::Q6_K, 1) => 1,
         (GgmlType::Q6_K, _) => 2,
@@ -306,12 +306,184 @@ pub fn decode_rows_per_group(dtype: GgmlType, m: usize) -> u32 {
     }
 }
 
+/// Rows of `x` as int8 for the int8 kernels ([`rb_kernel_q8`]): each 32 of a row by its own scale (its largest
+/// magnitude over 127), rounded, four to a word; then each block's scale and its two halves' sums (as `d * sum`), a
+/// vec4 a block (`d`, the first 16's, the last 16's, 0) from vec4 `p[0].z` on. A thread a block. `p[0]`: k, rows,
+/// where the scales start (in vec4s).
+pub const QUANT_Q8: &str = r#"
+@group(0) @binding(0) var<storage, read> unused: array<u32>;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> q: array<u32>;
+@group(0) @binding(3) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let k = p[0].x;
+    let rows = p[0].y;
+    let xs_at = p[0].z;
+    let b = id.x + id.y * 65535u * 256u;
+    if (b >= rows * (k / 32u)) {
+        return;
+    }
+    let base = b * 32u;
+    var amax = 0.0;
+    for (var i = 0u; i < 32u; i++) {
+        amax = max(amax, abs(x[base + i]));
+    }
+    let d = amax / 127.0;
+    let inv = select(0.0, 1.0 / d, d > 0.0);
+    var s0 = 0;
+    var s1 = 0;
+    for (var w = 0u; w < 8u; w++) {
+        var word = 0u;
+        for (var e = 0u; e < 4u; e++) {
+            let qv = clamp(i32(round(x[base + w * 4u + e] * inv)), -127, 127);
+            if (w < 4u) {
+                s0 += qv;
+            } else {
+                s1 += qv;
+            }
+            word |= (bitcast<u32>(qv) & 0xffu) << (8u * e);
+        }
+        q[b * 8u + w] = word;
+    }
+    let at = (xs_at + b) * 4u;
+    q[at] = bitcast<u32>(d);
+    q[at + 1u] = bitcast<u32>(d * f32(s0));
+    q[at + 2u] = bitcast<u32>(d * f32(s1));
+    q[at + 3u] = 0u;
+}
+"#;
+
+/// Elements (4-byte) a buffer of [`QUANT_Q8`]'s output takes for `rows` rows of `k`: the packed rows, then the blocks'
+/// scales and sums; and where the scales start, in vec4s.
+pub fn q8_len(rows: usize, k: usize) -> (usize, usize) {
+    (rows * k / 4 + rows * k / 32 * 4, rows * k / 16)
+}
+
+/// [`rb_kernel`]'s matmul from rows of `x` as int8 ([`QUANT_Q8`]'s): a weight run's values packed as bytes and each 4 of
+/// them against 4 of a row's in one `dot4I8Packed`, a block's scale and its halves' sums for the offsets; the same
+/// lanes, runs and rows. Q3_K so far.
+pub fn rb_kernel_q8(dtype: GgmlType, r: u32, mr: u32) -> Option<String> {
+    if dtype != GgmlType::Q3_K {
+        return None;
+    }
+    let tasks = 8u32;
+    let mut s = String::new();
+    let mut l = |line: &str| {
+        s.push_str(line);
+        s.push('\n');
+    };
+    l("struct Params { k: u32, n: u32, m: u32, row0: u32, rows: u32, row_bytes: u32, xs_at: u32, _pad1: u32, }");
+    l("@group(0) @binding(0) var<storage, read> w4: array<vec4<u32>>;");
+    l("@group(0) @binding(1) var<storage, read> x8: array<vec4<u32>>;");
+    l("@group(0) @binding(2) var<storage, read_write> y: array<f32>;");
+    l("@group(0) @binding(3) var<uniform> p: Params;");
+    l(&format!("var<workgroup> partial: array<f32, {}>;", 128 * r * mr));
+    l(RB_HELPERS);
+    l("// Q3_K: four weights of run `j` (their 2 low bits at shift 2j, their high bit j + 4h) as bytes 0..7 (each plus 4).");
+    l("fn q3_bytes(qw: u32, hw: u32, j: u32, h: u32) -> u32 {");
+    l("    return ((qw >> (2u * j)) & 0x03030303u) | (((hw >> (j + 4u * h)) & 0x01010101u) << 2u);");
+    l("}");
+    l("@compute @workgroup_size(128)");
+    l("fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {");
+    l("    let lane = li & 31u;");
+    l(&format!("    let rbase = (wg.y + wg.z * 65535u) * {}u + (li >> 5u) * {r}u;", 4 * r));
+    l(&format!("    let m0 = wg.x * {mr}u;"));
+    l(&format!("    let mn = min({mr}u, p.m - m0);"));
+    l("    let k16 = p.k / 16u;");
+    l("    let k32 = p.k / 32u;");
+    l("    let blocks = p.k / 256u;");
+    for i in 0..r {
+        l(&format!("    let rr{i} = min(rbase + {i}u, p.rows - 1u);"));
+    }
+    for m in 0..mr {
+        l(&format!("    let xr{m} = min(m0 + {m}u, p.m - 1u);"));
+    }
+    for i in 0..r {
+        for m in 0..mr {
+            l(&format!("    var acc{i}_{m} = 0.0;"));
+        }
+    }
+    l(&format!("    for (var c = lane; c < blocks * {tasks}u; c += 32u) {{"));
+    l("        let blk = c / 8u;");
+    l("        let t = c % 8u;");
+    l("        let h = t / 4u;");
+    l("        let g = (t / 2u) % 2u;");
+    l("        let j0 = 2u * (t % 2u);");
+    l("        // the two 32-blocks of x the run reaches (shifts j0 and j0 + 1), their half g");
+    l("        let b0 = blk * 8u + h * 4u + j0;");
+    for m in 0..mr {
+        l(&format!("        let xa{m} = x8[xr{m} * k16 + b0 * 2u + g];"));
+        l(&format!("        let xb{m} = x8[xr{m} * k16 + (b0 + 1u) * 2u + g];"));
+        l(&format!("        let sa{m} = bitcast<vec4<f32>>(x8[p.xs_at + xr{m} * k32 + b0]);"));
+        l(&format!("        let sb{m} = bitcast<vec4<f32>>(x8[p.xs_at + xr{m} * k32 + b0 + 1u]);"));
+        l(&format!("        let ha{m} = select(sa{m}.y, sa{m}.z, g == 1u);"));
+        l(&format!("        let hb{m} = select(sb{m}.y, sb{m}.z, g == 1u);"));
+    }
+    for i in 0..r {
+        l(&format!("        let b4_{i} = rr{i} * (p.row_bytes / 16u) + blk * 7u;"));
+        l(&format!("        let hm{i} = w4[b4_{i} + g];"));
+        l(&format!("        let qs{i} = w4[b4_{i} + 2u + 2u * h + g];"));
+        l(&format!("        let sd{i} = w4[b4_{i} + 6u];"));
+        for (wi, comp) in ["x", "y", "z", "w"].iter().enumerate() {
+            l(&format!("        let v0_{i}_{wi} = q3_bytes(qs{i}.{comp}, hm{i}.{comp}, j0, h);"));
+            l(&format!("        let v1_{i}_{wi} = q3_bytes(qs{i}.{comp}, hm{i}.{comp}, j0 + 1u, h);"));
+        }
+        for m in 0..mr {
+            let d0: Vec<String> = ["x", "y", "z", "w"].iter().enumerate().map(|(wi, comp)| format!("dot4I8Packed(v0_{i}_{wi}, xa{m}.{comp})")).collect();
+            let d1: Vec<String> = ["x", "y", "z", "w"].iter().enumerate().map(|(wi, comp)| format!("dot4I8Packed(v1_{i}_{wi}, xb{m}.{comp})")).collect();
+            l(&format!("        let p0_{i}_{m} = {};", d0.join(" + ")));
+            l(&format!("        let p1_{i}_{m} = {};", d1.join(" + ")));
+        }
+        l(&format!("        let d{i} = unpack2x16float(sd{i}.w & 0xffffu).x;"));
+        l(&format!("        let sc{i} = q3_scales(sd{i}, h, g, j0);"));
+        for m in 0..mr {
+            l(&format!("        acc{i}_{m} += d{i} * (sc{i}.x * (sa{m}.x * f32(p0_{i}_{m}) - 4.0 * ha{m}) + sc{i}.y * (sb{m}.x * f32(p1_{i}_{m}) - 4.0 * hb{m}));"));
+        }
+    }
+    l("    }");
+    for i in 0..r {
+        for m in 0..mr {
+            l(&format!("    partial[{}u * 128u + li] = acc{i}_{m};", i * mr + m));
+        }
+    }
+    l("    workgroupBarrier();");
+    l("    for (var st = 16u; st > 0u; st /= 2u) {");
+    l("        if (lane < st) {");
+    l(&format!("            for (var v = 0u; v < {}u; v++) {{ partial[v * 128u + li] += partial[v * 128u + li + st]; }}", r * mr));
+    l("        }");
+    l("        workgroupBarrier();");
+    l("    }");
+    l("    if (lane == 0u) {");
+    for i in 0..r {
+        l(&format!("        if (rbase + {i}u < p.rows) {{"));
+        l(&format!("            for (var mm = 0u; mm < mn; mm++) {{ y[(m0 + mm) * p.n + p.row0 + rbase + {i}u] = partial[({i}u * {mr}u + mm) * 128u + li]; }}"));
+        l("        }");
+    }
+    l("    }");
+    l("}");
+    Some(s)
+}
+
+/// [`rb_kernel`] for a measurement of its shapes.
+#[cfg(test)]
+pub(crate) fn rb_kernel_for_test(dtype: GgmlType, r: u32, mr: u32, ks: u32) -> Option<String> {
+    rb_kernel_ks(dtype, r, mr, ks)
+}
+
 /// The K-quants' matmul for few rows of `x` (a decode step's one, a draft's check's few), its weights read wide and
 /// every value it loads used more than once: a lane takes a run of a block's quants (Q3_K, Q4_K, Q5_K: 32 weights
 /// from vec4 loads; Q6_K: 16 from words, its 210-byte blocks two bytes off in every other one) for each of `r` weight
 /// rows, and the same run of `x` for each of `mr` rows; 4 warps a workgroup, `4 r` weight rows. Generated unrolled,
 /// every per-row value its own variable, so they stay in registers.
 fn rb_kernel(dtype: GgmlType, r: u32, mr: u32) -> Option<String> {
+    rb_kernel_ks(dtype, r, mr, 1)
+}
+
+/// [`rb_kernel`] with `ks` groups of 4 warps a workgroup, each taking every `ks`th run of 32 lanes' tasks along `k` for
+/// the same weight rows (more threads in flight for the same rows), their sums added at the end.
+fn rb_kernel_ks(dtype: GgmlType, r: u32, mr: u32, ks: u32) -> Option<String> {
     let (vec4_weights, tasks) = match dtype {
         GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K => (true, 8u32),
         GgmlType::Q6_K => (false, 16u32),
@@ -327,15 +499,18 @@ fn rb_kernel(dtype: GgmlType, r: u32, mr: u32) -> Option<String> {
     l("@group(0) @binding(1) var<storage, read> x4: array<vec4<f32>>;");
     l("@group(0) @binding(2) var<storage, read_write> y: array<f32>;");
     l("@group(0) @binding(3) var<uniform> p: Params;");
-    l(&format!("var<workgroup> partial: array<f32, {}>;", 128 * r * mr));
+    let wgs = 128 * ks;
+    l(&format!("var<workgroup> partial: array<f32, {}>;", wgs * r * mr));
     l(RB_HELPERS);
     if !vec4_weights {
         l(RB_Q6K_HELPERS);
     }
-    l("@compute @workgroup_size(128)");
+    l(&format!("@compute @workgroup_size({wgs})"));
     l("fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {");
     l("    let lane = li & 31u;");
-    l(&format!("    let rbase = (wg.y + wg.z * 65535u) * {}u + (li >> 5u) * {r}u;", 4 * r));
+    l("    let group = (li >> 5u) % 4u;");
+    l("    let kpart = li >> 7u;");
+    l(&format!("    let rbase = (wg.y + wg.z * 65535u) * {}u + group * {r}u;", 4 * r));
     l(&format!("    let m0 = wg.x * {mr}u;"));
     l(&format!("    let mn = min({mr}u, p.m - m0);"));
     l("    let k4 = p.k / 4u;");
@@ -351,7 +526,7 @@ fn rb_kernel(dtype: GgmlType, r: u32, mr: u32) -> Option<String> {
             l(&format!("    var acc{i}_{m} = 0.0;"));
         }
     }
-    l(&format!("    for (var c = lane; c < blocks * {tasks}u; c += 32u) {{"));
+    l(&format!("    for (var c = lane + kpart * 32u; c < blocks * {tasks}u; c += {}u) {{", 32 * ks));
     match dtype {
         GgmlType::Q4_K | GgmlType::Q5_K => {
             let q5 = dtype == GgmlType::Q5_K;
@@ -504,20 +679,21 @@ fn rb_kernel(dtype: GgmlType, r: u32, mr: u32) -> Option<String> {
     l("    }");
     for i in 0..r {
         for m in 0..mr {
-            l(&format!("    partial[{}u * 128u + li] = acc{i}_{m};", i * mr + m));
+            l(&format!("    partial[{}u * {wgs}u + li] = acc{i}_{m};", i * mr + m));
         }
     }
     l("    workgroupBarrier();");
     l("    for (var st = 16u; st > 0u; st /= 2u) {");
     l("        if (lane < st) {");
-    l(&format!("            for (var v = 0u; v < {}u; v++) {{ partial[v * 128u + li] += partial[v * 128u + li + st]; }}", r * mr));
+    l(&format!("            for (var v = 0u; v < {}u; v++) {{ partial[v * {wgs}u + li] += partial[v * {wgs}u + li + st]; }}", r * mr));
     l("        }");
     l("        workgroupBarrier();");
     l("    }");
-    l("    if (lane == 0u) {");
+    l("    if (lane == 0u && kpart == 0u) {");
     for i in 0..r {
         l(&format!("        if (rbase + {i}u < p.rows) {{"));
-        l(&format!("            for (var mm = 0u; mm < mn; mm++) {{ y[(m0 + mm) * p.n + p.row0 + rbase + {i}u] = partial[({i}u * {mr}u + mm) * 128u + li]; }}"));
+        let sum: Vec<String> = (0..ks).map(|kp| format!("partial[({i}u * {mr}u + mm) * {wgs}u + {}u + group * 32u]", kp * 128)).collect();
+        l(&format!("            for (var mm = 0u; mm < mn; mm++) {{ y[(m0 + mm) * p.n + p.row0 + rbase + {i}u] = {}; }}", sum.join(" + ")));
         l("        }");
     }
     l("    }");
