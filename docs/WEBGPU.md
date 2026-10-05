@@ -12,8 +12,9 @@ activations by quantized weight matrices (`linear_q`). The WebGPU backend
 uploads those matrices to the GPU **in their GGML block layout**, so they take
 the same memory as the file. It runs the multiply in WGSL. A prompt's other work
 (norms, RoPE, attention, recurrent state) runs on the CPU backend, with
-activations in RAM. A Llama's, Qwen3's or Gemma 3's decode step runs whole on the
-GPU, in one submit ("Dense models' decode on the GPU", below).
+activations in RAM. A Llama's, Qwen3's or Gemma 3's decode step, and each of its
+prompt's chunks, runs whole on the GPU in one submit ("Dense models on the GPU",
+below).
 
 - **Types:** Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K
   and IQ4_XS. Each shader's block decode is a line-by-line port of
@@ -229,7 +230,7 @@ Those numbers were the op-by-op path: every projection one upload, one dispatch
 and one read-back, dozens a token. The next section is what replaced it for the
 dense families.
 
-## Dense models' decode on the GPU (2026-10-05)
+## Dense models on the GPU (2026-10-05)
 
 A Llama's, Qwen3's or Gemma 3's decode step is one submit (`ggml_rs::chain`, a
 `DeviceChain` the WebGPU backend implements; `llama-rs`'s `chain_decode`): every
@@ -242,8 +243,10 @@ projection, residual, FFN (SwiGLU, or Gemma's GeGLU) and residual (Gemma 3's
 post-norms before each), then the head. Only the logits and the step's K and V
 rows (for the host's cache) come back. The GPU's copy of the cache is brought up
 to date with the rows the host wrote since (a prompt's: `KvCache::dirty_from`).
-It runs when every weight a step reads is on the GPU; otherwise, and with
-`OAIY_NO_CHAIN`, the op-by-op path.
+A prompt's chunk is one submit too, every layer's rows at once: RoPE from a table
+of the chunk's positions, its K and V stored into the GPU's copy of the cache, and
+the causal attention over it. Both run when every weight a step reads is on the
+GPU; otherwise, and with `OAIY_NO_CHAIN`, the op-by-op path.
 
 Also for the dense models on WebGPU: the CPU's attention runs in one pass (each
 KV head's rows read once for its group of query heads; the default copied the
@@ -256,14 +259,14 @@ On the RTX 5090 (Vulkan), Q4_K_M, greedy:
 
 | Model | Decode, op by op | Decode, one submit | A 2,000-token prompt |
 |---|---:|---:|---:|
-| Llama 3.2 3B | 35 tok/s (11.6 at 512 tokens of context before the changes above) | 73 tok/s; 60 at 512 tokens of context | 10.8 s (59.2 before) |
-| Qwen3 0.6B | 53 tok/s | 182 tok/s | |
+| Llama 3.2 3B | 35 tok/s (11.6 at 512 tokens of context before the changes above) | 73-81 tok/s; 70 at 2,000 tokens of context | 1.5 s (59.2 before the day's changes, 8.4 op by op) |
+| Qwen3 0.6B | 53 tok/s | 182 tok/s | 0.8 s through the server |
 | Gemma 3 4B | 28.5 tok/s | 60 tok/s | |
 
-Each chained model gives the op-by-op path's 64 greedy tokens at 64 and 1,500 or
-2,000 tokens of context (past Gemma 3's 1,024-token window), every step's logits
-cosine 1.000000, and the same two-turn conversation word for word (Gemma 3's
-second turn reusing 130 tokens of the first's state). A steady Llama 3.2 3B step
+Each chained model gives the op-by-op path's 64 greedy tokens after 64- and
+1,500-token prompts (past Gemma 3's 1,024-token window), the prompt's logits and
+every step's cosine 1.000000, and the same two-turn conversation word for word
+(Gemma 3's second turn reusing 130 tokens of the first's state). A steady Llama 3.2 3B step
 is 0.4 ms of recording and 14 ms on the GPU; the one-row matmul reads its weights
 at 170-280 GB/s however its lanes are laid out (measured each way), so a kernel
 of wide loads is what would take it further.
