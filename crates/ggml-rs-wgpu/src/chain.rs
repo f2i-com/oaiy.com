@@ -2065,7 +2065,7 @@ impl Recorder<'_> {
             let list: Vec<u32> = (0..rows as u32).flat_map(|r| [0, r]).collect();
             let jobs = self.scratch(list.len());
             crate::exl3::upload_u32(self.backend, &jobs, &list);
-            let lens = [rows * k, rows * splits as usize * n, rows * n];
+            let lens = [rows * k, rows * (splits as usize).max(COOP_SPLITS_MAX) * n, rows * n];
             let [xh, part, yt] = match self.exl3_tmp.take() {
                 Some(t) if t.iter().zip(lens).all(|(v, len)| v.len >= len) => t,
                 Some([a, b, c]) => {
@@ -2090,18 +2090,25 @@ impl Recorder<'_> {
         let ntiles = (n / 16) as u32;
         let grid = |z: usize| (ntiles.min(65535), ntiles.div_ceil(65535), z as u32 * splits);
         let mm = crate::exl3::chain_shader("mm");
-        // a prompt's rows on the tensor cores, in blocks of 128 (one split)
+        // a prompt's rows on the tensor cores, in blocks of 128, split along k where its workgroups are too few to fill
+        // the GPU twice over (a block of 128 rows of a projection 2,048 wide is 16 of them)
         let coop = rows > crate::exl3::FEW_MAX && crate::exl3::coop_on(self.gpu());
+        let mut coop_splits = 1;
         if coop {
             const BLOCK: usize = 128;
             let many: Vec<u32> = (0..rows as u32).collect::<Vec<_>>().chunks(BLOCK).flat_map(|b| b.iter().copied().chain(std::iter::repeat(crate::exl3::NONE)).take(BLOCK)).collect();
             let order = self.scratch(many.len());
             crate::exl3::upload_u32(self.backend, &order, &many);
             let blocks = many.len() / BLOCK;
+            let groups = ntiles.div_ceil(8) as usize * blocks;
+            let kts = k / 16;
+            let want = (2 * self.gpu().coop_units() as usize).div_ceil(groups).clamp(1, (kts / 8).clamp(1, COOP_SPLITS_MAX));
+            coop_splits = kts.div_ceil(kts.div_ceil(want));
             let src = crate::exl3::g_coop(BLOCK);
-            for first in (0..blocks).step_by(65535) {
-                let these = 65535.min(blocks - first) as u32;
-                self.dispatch_wide(crate::exl3::coop_name(BLOCK), &src, [words, buffer(&xh), buffer(&jobs), buffer(&order), &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, 1, 0, first as u32], (ntiles.div_ceil(8), 1, these));
+            let per = 65535 / coop_splits;
+            for first in (0..blocks).step_by(per) {
+                let these = (per.min(blocks - first) * coop_splits) as u32;
+                self.dispatch_wide(crate::exl3::coop_name(BLOCK), &src, [words, buffer(&xh), buffer(&jobs), buffer(&order), &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, coop_splits as u32, 0, first as u32], (ntiles.div_ceil(8), 1, these));
             }
         } else if rows == 1 {
             self.dispatch_wide("exl3-mm", mm, [words, buffer(&xh), buffer(&jobs), &d, &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, splits, 0], grid(1));
@@ -2135,7 +2142,7 @@ impl Recorder<'_> {
         }
         let post = crate::exl3::chain_shader("post");
         let post_out = if c.omap.is_some() { buffer(&yt) } else { buffer(y) };
-        let parts = if coop { 1 } else { splits };
+        let parts = if coop { coop_splits as u32 } else { splits };
         self.dispatch_wide("exl3-post", post, [buffer(&part), buffer(&c.svh), buffer(&jobs), &d, &d, &d, post_out, &drw], &[n as u32, parts], ((n / 128) as u32, rows as u32, 1));
         if let Some(omap) = &c.omap {
             let gather = crate::exl3::chain_shader("gather");
@@ -2171,6 +2178,9 @@ const KEEP_GROUPS: usize = 16384;
 
 /// Dispatches a piece of a run submits ([`Recorder::finish`]'s).
 const PIECE: usize = 128;
+
+/// The most splits along k of a prompt's EXL3 projection on the tensor cores.
+const COOP_SPLITS_MAX: usize = 8;
 
 pub(crate) struct Recorder<'a> {
     backend: &'a WgpuBackend,

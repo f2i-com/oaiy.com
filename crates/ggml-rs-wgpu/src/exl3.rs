@@ -1018,7 +1018,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 /// four words they lie in) into the workgroup's memory as f16 (each an f16 exactly) and the block's inputs (f16 too,
 /// as the input transform rounds them) beside them, the next step's words and inputs loaded as this one's are
 /// multiplied; each warp its 16 outputs by the block's rows. Each job's sums to `part[j * n..]` (one split), through a
-/// warp's staging. The sums are a matmul's, not the one-row kernel's bit for bit. `p` as for [`g_many`].
+/// warp's staging (split `s` of `p[0].w` along k to its own part, `part[(j * splits + s) * n..]`, as [`g_mm_source`]'s).
+/// The sums are a matmul's, not the one-row kernel's bit for bit. `p` as for [`g_many`].
 pub(crate) fn g_coop(rows: usize) -> String {
     assert!(matches!(rows, 16 | 32 | 64 | 128), "a block of 16, 32, 64 or 128 rows");
     let f = rows / 16;
@@ -1028,7 +1029,7 @@ pub(crate) fn g_coop(rows: usize) -> String {
     let mma = each(&|i| format!("        {{\n            let ib = cur + {}u * S2;\n            let bf = coopLoad<coop_mat16x16<f16, B>>(&xt[ib], s2);\n            c{i} = coopMultiplyAdd(af, bf, c{i});\n        }}\n", i * 16));
     let out = each(&|i| {
         format!(
-            "    {{\n        let so = warp * 256u;\n        coopStore(c{i}, &stage[so], 16u);\n        workgroupBarrier();\n        for (var e = l; e < 256u; e += 32u) {{\n            let id = ids[{}u + e / 16u];\n            if (id != 0xffffffffu && live) {{ part[id * n + tc * 16u + e % 16u] = stage[so + e]; }}\n        }}\n        workgroupBarrier();\n    }}\n",
+            "    {{\n        let so = warp * 256u;\n        coopStore(c{i}, &stage[so], 16u);\n        workgroupBarrier();\n        for (var e = l; e < 256u; e += 32u) {{\n            let id = ids[{}u + e / 16u];\n            if (id != 0xffffffffu && live) {{ part[(id * splits + sp) * n + tc * 16u + e % 16u] = stage[so + e]; }}\n        }}\n        workgroupBarrier();\n    }}\n",
             i * 16
         )
     });
@@ -1107,7 +1108,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     let tw = p[0].z;
     let nw = tw / 2u;
     let ntiles = n / 16u;
-    let blk = p[1].y + wg.z;
+    // the block, and its split of k (`p[0].w` of them, none empty)
+    let splits = p[0].w;
+    let blk = p[1].y + wg.z / splits;
+    let sp = wg.z % splits;
     let first = window(8u * (t / 8u), tw).x;
     places[t] = place(t, tw, first);
     if (t % 8u == 0u) {{
@@ -1141,29 +1145,35 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     let wo0 = (warp * 16u + l / 4u) * S2 + l % 4u;
     let wo1 = wo0 + 8u * S2;
     let kts = k / 16u;
+    let per = (kts + splits - 1u) / splits;
+    let ks = sp * per;
+    let ke = min(kts, ks + per);
 {decl}{xdecl}    var q0 = 0u;
     var q1 = 0u;
     var q2 = 0u;
     var q3 = 0u;
     // the first step's
     {{
-        let kn = 0u;
+        let kn = ks;
         let wb = base + (kn * ntiles + tcl) * nw;
         q0 = words[wb + w0 % nw];
         q1 = words[wb + (w0 + 1u) % nw];
         q2 = words[wb + (w0 + 2u) % nw];
         q3 = words[wb + (w0 + 3u) % nw];
-{xload}        let nb = 0u;
+{xload}        let nb = (ks % 2u) * {half_wt}u;
         wt[nb + wo0] = vec2<f16>(f16(decode_at(code_in(q0, q1, q2, q3, a0))), f16(decode_at(code_in(q0, q1, q2, q3, a1))));
         wt[nb + wo0 + 4u] = vec2<f16>(f16(decode_at(code_in(q0, q1, q2, q3, a2))), f16(decode_at(code_in(q0, q1, q2, q3, a3))));
         wt[nb + wo1] = vec2<f16>(f16(decode_at(code_in(q0, q1, q2, q3, a4))), f16(decode_at(code_in(q0, q1, q2, q3, a5))));
         wt[nb + wo1 + 4u] = vec2<f16>(f16(decode_at(code_in(q0, q1, q2, q3, a6))), f16(decode_at(code_in(q0, q1, q2, q3, a7))));
-{xstore}    }}
+        {{
+            let nb = (ks % 2u) * {half_xt}u;
+{xstore}        }}
+    }}
     workgroupBarrier();
-    for (var kt = 0u; kt < kts; kt++) {{
+    for (var kt = ks; kt < ke; kt++) {{
         // the next step (the last's own again, into the buffer no one reads after): loaded before this one's are
         // multiplied, decoded and stored after, with no branch between
-        let kn = min(kt + 1u, kts - 1u);
+        let kn = min(kt + 1u, ke - 1u);
         let wb = base + (kn * ntiles + tcl) * nw;
         q0 = words[wb + w0 % nw];
         q1 = words[wb + (w0 + 1u) % nw];
