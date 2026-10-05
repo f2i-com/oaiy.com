@@ -2086,11 +2086,43 @@ impl FlashNext {
         // whatever else it reads)
         let mut open: Option<Box<dyn ChainRecorder + '_>> = None;
         let mut attn_reads: Vec<usize> = Vec::new();
+        // a device's attention layers' rows and keys read at its handoff, into the host's cache once the next device's
+        // layers are recorded (as that device runs them)
+        let mut to_store: Vec<(usize, Vec<f32>, Vec<f32>)> = Vec::new();
+        // a device's recording (its work submitted, its reads its streams and its layers' rows) whose streams go up
+        // to the next device (its work held until they do), and its attention layers read
+        let mut handoffs: Vec<(Box<dyn ChainRecorder + '_>, usize, Vec<usize>)> = Vec::new();
         let mut pending: Option<Routed> = None;
         for (i, (layer, cl)) in self.layers.iter().zip(&st.layers).enumerate() {
             let dev = layer.device;
             let ple_here = i == cfg.ple_layer;
-            if dev != d || ple_here && ple_vs.is_none() {
+            if dev != d && pending.is_none() && !(ple_here && ple_vs.is_none()) {
+                // the next device's layers recorded as this one runs its own (its streams uploaded to the next once
+                // it has, the next's work held until then)
+                let mut rec = open.take().unwrap_or_else(|| {
+                    let mut r = chains[d].begin();
+                    r.keep_groups(keep);
+                    r
+                });
+                rec.read(&devs[d].x);
+                rec.flush();
+                handoffs.push((rec, dev, std::mem::take(&mut attn_reads)));
+                d = dev;
+                let mut r = chains[d].begin();
+                r.keep_groups(keep);
+                r.hold();
+                open = Some(r);
+            } else if dev != d || ple_here && ple_vs.is_none() {
+                // (a handoff before this one's first: its streams up to its next device before that one's held work
+                // is finished below)
+                for (from, to, reads) in handoffs.drain(..) {
+                    let mut got = from.finish().into_iter();
+                    for &a in &reads {
+                        let (kvrows, raw) = (got.next().expect("a layer's K and V"), got.next().expect("its indexer keys"));
+                        to_store.push((a, kvrows, raw));
+                    }
+                    chains[to].upload(&devs[to].x, &got.next().expect("the streams"));
+                }
                 // what this device has pending, then the streams through the host (to the next device, or the
                 // n-gram layer where it is not chained)
                 let dv = &devs[d];
@@ -2107,7 +2139,7 @@ impl FlashNext {
                 let mut got = rec.finish().into_iter();
                 for &a in &attn_reads {
                     let (kvrows, raw) = (got.next().expect("a layer's K and V"), got.next().expect("its indexer keys"));
-                    to_cache(a, kvrows, raw, kv);
+                    to_store.push((a, kvrows, raw));
                 }
                 attn_reads.clear();
                 let mut x = Tensor::from_vec(got.next().expect("the streams"), vec![t, s * h]);
@@ -2313,6 +2345,20 @@ impl FlashNext {
             hc(&mut *rec, one, 1, &st.collapse, None, &one.post, &one.mixed);
             rec.exl3_rows(chain_packed(&self.head)?, &one.mixed, &one.head, 1);
             rec.read(&one.head);
+        }
+        // each handoff in turn: its device's streams (once it has run) up to the next, whose held work then goes
+        for (from, to, reads) in handoffs.drain(..) {
+            let mut got = from.finish().into_iter();
+            for &a in &reads {
+                let (kvrows, raw) = (got.next().expect("a layer's K and V"), got.next().expect("its indexer keys"));
+                to_store.push((a, kvrows, raw));
+            }
+            chains[to].upload(&devs[to].x, &got.next().expect("the streams"));
+        }
+        // the last device's work going (held till its streams were up) as the host stores the others' rows
+        rec.flush();
+        for (a, kvrows, raw) in to_store.drain(..) {
+            to_cache(a, kvrows, raw, kv);
         }
         let mut got = rec.finish().into_iter();
         for &a in &attn_reads {

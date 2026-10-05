@@ -122,6 +122,13 @@ pub trait ChainRecorder {
     fn keep_groups(&mut self, keep: bool) {
         let _ = keep;
     }
+    /// Hold what is recorded until [`Self::finish`] submits it all (none of it submitted as it is recorded): a
+    /// recording whose inputs are uploaded after it, as the next device's of a chain over several is while the last
+    /// device runs.
+    fn hold(&mut self) {}
+    /// Submit what is recorded so far (its reads still [`Self::finish`]'s): a device's work running while the next
+    /// device's is recorded.
+    fn flush(&mut self) {}
     /// Rotate `x` (`[heads, head_dim]`) in place: pair `k` of each head by `table[2k]` (sine) and `table[2k + 1]`
     /// (cosine), the pairs `(2k, 2k + 1)` or with `neox` `(k, k + head_dim / 2)`.
     fn rope(&mut self, x: &DeviceVec, heads: usize, head_dim: usize, table: &DeviceVec, neox: bool) {
