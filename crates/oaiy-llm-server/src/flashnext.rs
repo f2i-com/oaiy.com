@@ -285,6 +285,7 @@ struct NgramTable {
 const ROW_DIM: usize = 160;
 const MUL1: u64 = 0x83DC_D12D;
 
+
 /// The 65536 decoded `mul1` values, as fp16 (bit-exact with EXL3's codebook).
 fn mul1_codebook() -> Vec<f32> {
     let k_inv = dsv41::formats::f16_to_f32(0x1eee);
@@ -294,6 +295,32 @@ fn mul1_codebook() -> Vec<f32> {
         let sum = (p & 255) + ((p >> 8) & 255) + ((p >> 16) & 255) + ((p >> 24) & 255);
         round_f16((1024 + sum) as f32 * k_inv + k_bias)
     }).collect()
+}
+
+/// The most u16 words an n-gram table's row takes (its scale, then `ROW_DIM` codes of up to 8 bits).
+const ROW_WORDS_MAX: usize = 1 + ROW_DIM * 8 / 16;
+
+/// A trellis row of the n-gram table (`bytes`: its f16 scale, then `ROW_DIM` codes of `k` bits, each value's 16-bit
+/// state its own code and those of the `16 / k` before it, the row a ring) decoded into `out` with its head's `bias`:
+/// each code read once, each state its codes shifted together (where each state's 16 bits were read one at a time).
+fn decode_row(bytes: &[u8], k: usize, codebook: &[f32], bias: &[f32], out: &mut [f32]) {
+    let word = |i: usize| bytes.get(2 * i..2 * i + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]])) as u32;
+    let scale = dsv41::formats::f16_to_f32(word(0) as u16);
+    let mask = (1u32 << k) - 1;
+    let mut codes = [0u32; ROW_DIM];
+    for (j, c) in codes.iter_mut().enumerate() {
+        let b = j * k;
+        let w = word(1 + b / 16) | (word(2 + b / 16) << 16);
+        *c = (w >> (b % 16)) & mask;
+    }
+    let groups = 16usize.div_ceil(k);
+    for (i, o) in out.iter_mut().enumerate().take(ROW_DIM) {
+        let mut state = 0u32;
+        for g in 0..groups {
+            state |= codes[(i + ROW_DIM - g) % ROW_DIM] << (g * k);
+        }
+        *o = codebook[(state & 0xffff) as usize] * scale + bias[i];
+    }
 }
 
 impl NgramTable {
@@ -309,7 +336,7 @@ impl NgramTable {
         }
         let row_words = first.shape[1];
         let bits = (row_words - 1) * 16 / ROW_DIM;
-        if 1 + ROW_DIM * bits / 16 != row_words {
+        if 1 + ROW_DIM * bits / 16 != row_words || !(1..=8).contains(&bits) {
             return Err(bad("n-gram table: unexpected row width"));
         }
         // The shards sit back to back in one file: one table.
@@ -347,21 +374,12 @@ impl NgramTable {
         if row >= self.rows {
             return Err(bad("n-gram row out of range"));
         }
-        let mut buf = vec![0u8; self.row_words * 2];
+        // (a row's 62 bytes or so: on the stack)
+        let mut buf = [0u8; 2 * ROW_WORDS_MAX];
+        let bytes = &mut buf[..self.row_words * 2];
         let file = &self.files[rayon::current_thread_index().unwrap_or(0) % self.files.len()];
-        read_at(file, &mut buf, self.start + row * (self.row_words * 2) as u64)?;
-        let words: Vec<u16> = buf.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-        let scale = dsv41::formats::f16_to_f32(words[0]);
-        let k = self.bits;
-        let bit = |i: usize| (words[1 + i / 16] >> (i % 16)) & 1;
-        for (i, o) in out.iter_mut().enumerate() {
-            let mut state = 0usize;
-            for m in 0..16 {
-                let src = ((i + ROW_DIM * 16 - m / k) % ROW_DIM) * k + m % k;
-                state |= (bit(src) as usize) << m;
-            }
-            *o = self.codebook[state] * scale + self.bias[head * ROW_DIM + i];
-        }
+        read_at(file, bytes, self.start + row * (self.row_words * 2) as u64)?;
+        decode_row(bytes, self.bits, &self.codebook, &self.bias[head * ROW_DIM..(head + 1) * ROW_DIM], out);
         Ok(())
     }
 }
@@ -1226,6 +1244,11 @@ impl FlashNext {
     /// The n-gram layer's features for `tokens` (`[tokens, ple_dim]`, on `b`), carrying its
     /// context (the last `ngram - 1` ids) on in the cache.
     fn ple_embed(&self, b: &dyn Backend, tokens: &[u32], kv: &mut KvCache) -> Result<Tensor> {
+        Ok(b.to_device(Tensor::from_vec(self.ple_embed_host(tokens, kv)?, vec![tokens.len(), self.config.ple_dim])))
+    }
+
+    /// [`Self::ple_embed`]'s features on the host (`[tokens, ple_dim]`), for a chain to upload as they are.
+    fn ple_embed_host(&self, tokens: &[u32], kv: &mut KvCache) -> Result<Vec<f32>> {
         let cfg = &self.config;
         let ctx = cfg.ngram - 1;
         let slot = ple_slot(cfg);
@@ -1239,7 +1262,7 @@ impl FlashNext {
         let n = history.len();
         let emb = self.ngram_embedding(&history)?;
         kv.ssm_state[slot] = Some(Tensor::from_vec(history[n - ctx..].iter().map(|&v| v as f32).collect(), vec![ctx]));
-        Ok(b.to_device(Tensor::from_vec(emb, vec![tokens.len(), cfg.ple_dim])))
+        Ok(emb)
     }
 
     /// The n-gram layer: the streams plus their gate against the n-gram features `emb`, and
@@ -2003,7 +2026,8 @@ impl FlashNext {
         let prompt_qsa: Vec<Option<QsaVecs>> = chains.iter().enumerate().map(|(d, c)| (sparse && t > CHECK_ROWS && !st.attn_of[d].is_empty()).then(|| self.qsa_vecs(*c, t, m.kv[d].cap))).collect();
         let prompt_keys: Vec<Option<ggml_rs::DeviceVec>> = chains.iter().enumerate().map(|(d, c)| (t > CHECK_ROWS && !st.attn_of[d].is_empty()).then(|| c.vec(t * id_dim))).collect();
         // the n-gram features (on the n-gram layer's device, where it is chained), then the embedding in every stream
-        let ple_emb = self.ple_embed(self.devices[ple_device].as_ref(), tokens, kv).ok()?;
+        let ple_emb = self.ple_embed_host(tokens, kv).ok()?;
+
         let ple_owned: Option<PleVecs>;
         let ple_vs: Option<(&ChainPle, &PleVecs)> = match &st.ple {
             Some((p, step)) if t == 1 => Some((p, step)),
@@ -2015,7 +2039,7 @@ impl FlashNext {
             None => None,
         };
         if let Some((_, v)) = ple_vs {
-            chains[ple_device].upload(&v.emb, ple_emb.to_host().data());
+            chains[ple_device].upload(&v.emb, &ple_emb);
         }
         let e = embeds.to_host();
         let mut x0 = Vec::with_capacity(t * s * h);
@@ -2036,10 +2060,11 @@ impl FlashNext {
             hcv.up.mul(&mut *rec, s * h, hcv.rank + hcv.writes, &dv.t, &dv.logits, rows);
             rec.hc_mix(&dv.logits, &dv.normed, out, rows, s, h);
         };
-        // A step's experts are routed on their GPU (each layer's router then its experts, a device's layers one
-        // submit); a prompt's rows by the host between a layer's submits (how many rows each expert takes is what the
-        // dispatches are sized by). OAIY_HOST_ROUTE routes a step on the host too.
-        let on_gpu = keep && cfg.experts <= 1024 && cfg.top_k <= 32 && std::env::var_os("OAIY_HOST_ROUTE").is_none();
+        // The experts are routed on their GPU (each layer's router then its experts, a device's layers one submit; a
+        // prompt's rows grouped by expert there too, where the tensor cores take them), else by the host between a
+        // layer's submits (how many rows each expert takes is what the dispatches are sized by). OAIY_HOST_ROUTE
+        // routes on the host.
+        let on_gpu = cfg.experts <= 1024 && cfg.top_k <= 32 && std::env::var_os("OAIY_HOST_ROUTE").is_none();
         let undo = m.undo.as_ref().filter(|_| check);
         // a prompt's rows as the host routed them (between a layer's submits); on the GPU, each layer's are recorded
         // after its router, their sums added to the streams there
@@ -2088,7 +2113,8 @@ impl FlashNext {
                 let mut x = Tensor::from_vec(got.next().expect("the streams"), vec![t, s * h]);
                 if ple_here && ple_vs.is_none() {
                     let b = self.devices[dev].as_ref();
-                    x = self.ple_forward(b, &b.to_device(x), &ple_emb, kv).to_host();
+                    let emb = b.to_device(Tensor::from_vec(ple_emb.clone(), vec![t, cfg.ple_dim]));
+                    x = self.ple_forward(b, &b.to_device(x), &emb, kv).to_host();
                 }
                 d = dev;
                 chains[d].upload(&devs[d].x, x.data());
@@ -2143,10 +2169,12 @@ impl FlashNext {
                     rec.exl3_rows(chain_packed(&a.v)?, &dv.y_in, &dv.v, t);
                     rec.exl3_rows(chain_packed(&a.index_qk)?, &dv.y_in, &dv.index, t);
                     if on_gpu {
-                        // the run's indexer keys out of the vector the device's next attention layer writes
+                        // the run's indexer keys out of the vector the device's next attention layer writes (a
+                        // prompt's are read from the device's copy of them)
                         match few_set {
                             Some(f) => rec.copy_cols(&dv.index, &f.keys[d][*slot], t, id, iq + id, iq),
-                            None => rec.copy(&dv.index, iq, &st.keys[d], slot * id, id),
+                            None if t == 1 => rec.copy(&dv.index, iq, &st.keys[d], slot * id, id),
+                            None => {}
                         }
                     }
                     // and into the device's copy of the raw keys (QSA's pool reads them past the dense span)
@@ -2213,14 +2241,14 @@ impl FlashNext {
             }
             hc(&mut *rec, dv, t, &cl.mlp_hc, Some((&dv.y_out, &dv.post)), &dv.post2, &dv.y2_in);
             cl.router.mul(&mut *rec, cfg.experts + 1, h, &dv.y2_in, &dv.router, t);
-            if on_gpu {
+            if on_gpu && rec.moe_routed_into(layer.moe.experts.as_ref(), &dv.y2_in, &dv.x, &dv.post2, &dv.router, cfg.top_k, t, s) {
                 // the experts after it, on the device, their sums into the streams; the recording goes on
-                assert!(rec.moe_routed_into(layer.moe.experts.as_ref(), &dv.y2_in, &dv.x, &dv.post2, &dv.router, cfg.top_k, t, s), "a chain's experts route on their GPU");
                 if let ChainMixer::Attn { slot, .. } = &cl.mixer {
                     rec.read_range(&m.kv[d].layers[*slot], past * row, t * row);
                     match few_set {
                         Some(f) => rec.read(&f.keys[d][*slot]),
-                        None => rec.read_range(&st.keys[d], slot * id, id),
+                        None if t == 1 => rec.read_range(&st.keys[d], slot * id, id),
+                        None => rec.read_range(&m.kv[d].raw[*slot], past * id, t * id),
                     }
                     attn_reads.push(i);
                 }
@@ -2728,5 +2756,49 @@ mod unload_tests {
         eprintln!("dropped on another thread: {}", used());
         let first = |s: String| s.split_whitespace().next().unwrap().parse::<u64>().unwrap();
         assert!(first(used()) < 2048, "the model's GPU memory was not released");
+    }
+}
+
+#[cfg(test)]
+mod row_tests {
+    use super::*;
+
+    /// A trellis row of the n-gram table decodes as reading each value's state a bit at a time does (the code the
+    /// decode replaced): every width of code, a row of random bytes.
+    #[test]
+    fn a_trellis_row_decodes_as_its_states_read_a_bit_at_a_time() {
+        let codebook = mul1_codebook();
+        let bias: Vec<f32> = (0..ROW_DIM).map(|i| i as f32 * 0.01 - 0.5).collect();
+        let mut seed = 12345u32;
+        for k in 1..=8usize {
+            let words = 1 + ROW_DIM * k / 16;
+            let bytes: Vec<u8> = (0..2 * words)
+                .map(|i| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    // a sane f16 scale in the first word
+                    match i {
+                        0 => 0x00,
+                        1 => 0x3c,
+                        _ => (seed >> 24) as u8,
+                    }
+                })
+                .collect();
+            let w: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+            let scale = dsv41::formats::f16_to_f32(w[0]);
+            let bit = |i: usize| (w[1 + i / 16] >> (i % 16)) & 1;
+            let want: Vec<f32> = (0..ROW_DIM)
+                .map(|i| {
+                    let mut state = 0usize;
+                    for m in 0..16 {
+                        let src = ((i + ROW_DIM * 16 - m / k) % ROW_DIM) * k + m % k;
+                        state |= (bit(src) as usize) << m;
+                    }
+                    codebook[state] * scale + bias[i]
+                })
+                .collect();
+            let mut got = vec![0f32; ROW_DIM];
+            decode_row(&bytes, k, &codebook, &bias, &mut got);
+            assert_eq!(got, want, "codes of {k} bits");
+        }
     }
 }

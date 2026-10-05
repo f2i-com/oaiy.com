@@ -1117,6 +1117,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
         ids[t] = order[blk * {rows}u + t];
     }}
     workgroupBarrier();
+    // a block the order left unused (a GPU's grouping sizes the grid for the most blocks it could fill)
+    if (workgroupUniformLoad(&ids[0]) == 0xffffffffu) {{
+        return;
+    }}
     let base = jobs[2u * ids[0]] * p[1].x;
     let warp = t / 32u;
     let l = t % 32u;
@@ -1802,6 +1806,91 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 }
 "#;
 
+/// A prompt's routed jobs grouped by expert on the GPU, as [`many_order`] groups them on the host: each expert's down
+/// jobs in blocks of 16 (a block one expert's, its unused places [`NONE`]; the blocks in the experts' order, a job's
+/// place among its expert's as the atomics fall), and their gate and up jobs in blocks `2 b` and `2 b + 1`. `od`: the
+/// down order (`p[0].y` blocks of 16), then each expert's count, first block and filled places (`p[0].z` experts);
+/// `og` the gate and up order. First every place unused and every count 0.
+const MANY_CLEAR: &str = r#"
+@group(0) @binding(6) var<storage, read_write> og: array<u32>;
+@group(0) @binding(7) var<storage, read_write> od: array<u32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 65535u * 256u;
+    let places = 16u * p[0].y;
+    if (i < 2u * places) { og[i] = 0xffffffffu; }
+    if (i < places) { od[i] = 0xffffffffu; }
+    if (i < 3u * p[0].z) { od[places + i] = 0u; }
+}
+"#;
+
+/// [`MANY_CLEAR`]'s second pass: each expert's jobs counted, a thread a pair. `p[0]`: the pairs, the blocks.
+const MANY_COUNT: &str = r#"
+@group(0) @binding(0) var<storage, read> jd: array<u32>;
+@group(0) @binding(7) var<storage, read_write> od: array<atomic<u32>>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let j = id.x;
+    if (j >= p[0].x) { return; }
+    atomicAdd(&od[16u * p[0].y + jd[2u * j]], 1u);
+}
+"#;
+
+/// [`MANY_CLEAR`]'s third: each expert's first block, the blocks of the experts before it (16 jobs a block), one
+/// workgroup a thread an expert (1024 at most). `p[0]`: the pairs, the blocks, the experts.
+const MANY_SCAN: &str = r#"
+@group(0) @binding(7) var<storage, read_write> od: array<u32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> sums: array<u32, 1024>;
+
+@compute @workgroup_size(1024)
+fn main(@builtin(local_invocation_index) e: u32) {
+    let at = 16u * p[0].y;
+    let ne = p[0].z;
+    var nb = 0u;
+    if (e < ne) { nb = (od[at + e] + 15u) / 16u; }
+    sums[e] = nb;
+    workgroupBarrier();
+    for (var st = 1u; st < 1024u; st *= 2u) {
+        var v = sums[e];
+        if (e >= st) { v += sums[e - st]; }
+        workgroupBarrier();
+        sums[e] = v;
+        workgroupBarrier();
+    }
+    if (e < ne) { od[at + ne + e] = sums[e] - nb; }
+}
+"#;
+
+/// [`MANY_CLEAR`]'s last: each pair's down job into its expert's blocks, and its gate and up jobs (`2 j`, `2 j + 1`)
+/// into theirs, a thread a pair. `p[0]`: the pairs, the blocks, the experts.
+const MANY_SCATTER: &str = r#"
+@group(0) @binding(0) var<storage, read> jd: array<u32>;
+@group(0) @binding(6) var<storage, read_write> og: array<u32>;
+@group(0) @binding(7) var<storage, read_write> od: array<atomic<u32>>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let j = id.x;
+    if (j >= p[0].x) { return; }
+    let at = 16u * p[0].y;
+    let ne = p[0].z;
+    let e = jd[2u * j];
+    let pos = atomicAdd(&od[at + 2u * ne + e], 1u);
+    let b = atomicLoad(&od[at + ne + e]) + pos / 16u;
+    let slot = pos % 16u;
+    atomicStore(&od[b * 16u + slot], j);
+    og[2u * b * 16u + slot] = 2u * j;
+    og[(2u * b + 1u) * 16u + slot] = 2u * j + 1u;
+}
+"#;
+
 /// The down projections' jobs of routed rows from their gate and up jobs ([`ROUTE`]'s): pair `j`'s expert `e` on
 /// hidden row `j`, `[e, j]`. `p[0]`: the pairs (rows times k).
 const DOWN_JOBS: &str = r#"
@@ -2092,19 +2181,54 @@ impl Exl3MoeGrouped {
     /// its streams (the streams, their write weights, how many) where it would be `out`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_routed(&self, rec: &mut crate::chain::Recorder<'_>, x: &DeviceVec, out: &DeviceVec, logits: &DeviceVec, top_k: usize, rows: usize, into: Option<(&DeviceVec, &DeviceVec, usize)>) -> bool {
-        if self.routed > 1024 || top_k == 0 || top_k > 32.min(self.routed) || rows == 0 || rows > 64 || logits.len < rows * (self.routed + 1) {
+        // a prompt's rows (more than a check's) grouped by expert on the GPU, where the tensor cores take its blocks
+        let many = rows > FEW_MAX && coop_on(rec.gpu());
+        if self.routed > 1024 || top_k == 0 || top_k > 32.min(self.routed) || rows == 0 || (rows > 64 && !many) || rows > 65535 || logits.len < rows * (self.routed + 1) {
             return false;
         }
         assert!(x.len >= rows * self.hidden && (into.is_some() || out.len >= rows * self.hidden), "moe: {rows} rows of {}", self.hidden);
-        let st = if rec.keeps() { self.step(rows, top_k) } else { Arc::new(self.scratch(&mut |n| rec.scratch(n), rows, top_k, true)) };
+        // (a prompt's orders its own: the scratch's are a check's; its scratch the recording's, each layer's in turn)
+        let st = if rec.keeps() && !many {
+            self.step(rows, top_k)
+        } else if many {
+            let key = [rows, top_k, self.hidden, self.ff];
+            match rec.moe_tmp.take() {
+                Some((k, st)) if k == key => {
+                    rec.moe_tmp = Some((k, Arc::clone(&st)));
+                    st
+                }
+                _ => {
+                    let st = Arc::new(self.scratch(&mut |n| rec.scratch(n), rows, top_k, false));
+                    rec.moe_tmp = Some((key, Arc::clone(&st)));
+                    st
+                }
+            }
+        } else {
+            Arc::new(self.scratch(&mut |n| rec.scratch(n), rows, top_k, true))
+        };
         let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
         let d = rec.gpu().dummy().clone();
         let drw = rec.gpu().dummy_rw().clone();
         rec.dispatch_wide("moe-route", ROUTE, [&buf(logits), &d, &d, &d, &d, &d, &buf(&st.jobs_gu), &buf(&st.w)], &[self.routed as u32, top_k as u32], (rows as u32, 1, 1));
         rec.dispatch_wide("moe-down-jobs", DOWN_JOBS, [&buf(&st.jobs_gu), &d, &d, &d, &d, &d, &buf(&st.jobs_d), &drw], &[(rows * top_k) as u32], (1, 1, 1));
+        let pairs = rows * top_k;
+        if many {
+            // the most blocks of 16 the experts could fill (a part-filled one each at most), the grid that wide
+            let blocks = pairs.div_ceil(16) + self.routed;
+            let (og, od) = (rec.scratch(2 * 16 * blocks), rec.scratch(16 * blocks + 3 * self.routed));
+            let words = [pairs as u32, blocks as u32, self.routed as u32];
+            let clear = (2 * 16 * blocks) as u32;
+            let groups = clear.div_ceil(256);
+            let jd = buf(&st.jobs_d);
+            rec.dispatch_wide("moe-many-clear", MANY_CLEAR, [&d, &d, &d, &d, &d, &d, &buf(&og), &buf(&od)], &words, (groups.min(65535), groups.div_ceil(65535), 1));
+            rec.dispatch_wide("moe-many-count", MANY_COUNT, [&jd, &d, &d, &d, &d, &d, &drw, &buf(&od)], &words, ((pairs as u32).div_ceil(256), 1, 1));
+            rec.dispatch_wide("moe-many-scan", MANY_SCAN, [&d, &d, &d, &d, &d, &d, &drw, &buf(&od)], &words, (1, 1, 1));
+            rec.dispatch_wide("moe-many-scatter", MANY_SCATTER, [&jd, &d, &d, &d, &d, &d, &buf(&og), &buf(&od)], &words, ((pairs as u32).div_ceil(256), 1, 1));
+            self.run(rec, &st, x, out, rows, Order::Many(&og, 2 * blocks), Order::Many(&od, blocks), into);
+            return true;
+        }
         // a check's few rows: an expert the rows share decoded once for them (its jobs one block; OAIY_MOE_UNGROUPED:
         // a job each)
-        let pairs = rows * top_k;
         let grouped = (2..=FEW_MAX).contains(&rows) && pairs <= 256 && std::env::var_os("OAIY_MOE_UNGROUPED").is_none();
         let (ogu, od) = if grouped {
             rec.dispatch_wide("moe-group", GROUP, [&buf(&st.jobs_d), &d, &d, &d, &d, &d, &buf(&st.order_gu), &buf(&st.order_d)], &[pairs as u32, rows as u32], (1, 1, 1));
@@ -3016,6 +3140,47 @@ mod tests {
         assert!(order[65..96].iter().all(|&j| j == NONE));
         assert_eq!(order[96], 35);
         assert!(order[97..].iter().all(|&j| j == NONE));
+    }
+
+    /// A prompt's experts routed and grouped by expert on the GPU (where the tensor cores take a prompt's blocks) give
+    /// what routing and grouping them on the host gives, and the MoE's definition: rows more than a check's, experts
+    /// on more rows than a block's 16 and on none, the sums into the streams as well.
+    #[test]
+    fn a_prompts_experts_routed_and_grouped_on_the_gpu_are_the_hosts() {
+        let Some(b) = backend() else { return };
+        if !coop_on(&b.gpu) {
+            return;
+        }
+        let (count, hidden, ff, top_k) = (40, 256, 128, 6);
+        let gpu = b.exl3_experts(experts(count, hidden, ff, 48)).unwrap();
+        for rows in [9usize, 40, 130] {
+            let xs: Vec<f32> = (0..rows * hidden).map(|i| ((i * 29 % 97) as f32 - 48.0) / 50.0).collect();
+            // expert 3 on every row, expert 39 on none, the rest spread
+            let ls: Vec<f32> = (0..rows * (count + 1))
+                .map(|i| match i % (count + 1) {
+                    3 => 4.0,
+                    39 => -9.0,
+                    e => (((i / (count + 1)) * 7 + e * 13) % 31) as f32 / 10.0 - 1.5,
+                })
+                .collect();
+            let assign: Vec<Vec<(usize, f32)>> = (0..rows).map(|r| route(&ls[r * (count + 1)..(r + 1) * (count + 1)], top_k)).collect();
+            let (xr, lr, on_gpu, on_host) = (b.vec(rows * hidden), b.vec(rows * (count + 1)), b.vec(rows * hidden), b.vec(rows * hidden));
+            DeviceChain::upload(&b, &xr, &xs);
+            DeviceChain::upload(&b, &lr, &ls);
+            let mut rec = b.begin();
+            rec.keep_groups(false);
+            assert!(rec.moe_routed(gpu.as_ref(), &xr, &on_gpu, &lr, top_k, rows), "{rows} rows route on the GPU");
+            rec.moe_rows(gpu.as_ref(), &xr, &on_host, &assign);
+            rec.read(&on_gpu);
+            rec.read(&on_host);
+            let mut got = rec.finish();
+            let (h, g) = (got.pop().unwrap(), got.pop().unwrap());
+            let scale = h.iter().fold(1e-3f32, |m, v| m.max(v.abs()));
+            for (i, (a, e)) in g.iter().zip(&h).enumerate() {
+                assert!((a - e).abs() <= 1e-5 * scale, "{rows} rows [{i}]: {a} against {e}");
+            }
+            close(&g, &reference(experts(count, hidden, ff, 48), &xs, &ls, top_k), &format!("{rows} rows routed on the GPU against the definition"));
+        }
     }
 
     /// A step's experts routed on the GPU from the router's logits give what routing on the host gives: the same

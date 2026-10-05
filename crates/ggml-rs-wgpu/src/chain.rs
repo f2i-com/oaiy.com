@@ -2039,7 +2039,7 @@ impl DeviceChain for WgpuBackend {
     }
 
     fn begin(&self) -> Box<dyn ChainRecorder + '_> {
-        Box::new(Recorder { backend: self, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None })
+        Box::new(Recorder { backend: self, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None })
     }
 }
 
@@ -2065,7 +2065,17 @@ impl Recorder<'_> {
             let list: Vec<u32> = (0..rows as u32).flat_map(|r| [0, r]).collect();
             let jobs = self.scratch(list.len());
             crate::exl3::upload_u32(self.backend, &jobs, &list);
-            (self.scratch(rows * k), self.scratch(rows * splits as usize * n), self.scratch(rows * n), jobs)
+            let lens = [rows * k, rows * splits as usize * n, rows * n];
+            let [xh, part, yt] = match self.exl3_tmp.take() {
+                Some(t) if t.iter().zip(lens).all(|(v, len)| v.len >= len) => t,
+                Some([a, b, c]) => {
+                    let grow = |v: DeviceVec, len: usize, r: &mut Self| if v.len >= len { v } else { r.scratch(len.max(v.len)) };
+                    [grow(a, lens[0], self), grow(b, lens[1], self), grow(c, lens[2], self)]
+                }
+                None => [self.scratch(lens[0]), self.scratch(lens[1]), self.scratch(lens[2])],
+            };
+            self.exl3_tmp = Some([xh.clone(), part.clone(), yt.clone()]);
+            (xh, part, yt, jobs)
         };
         let d = self.gpu().dummy().clone();
         let drw = self.gpu().dummy_rw().clone();
@@ -2143,7 +2153,7 @@ impl<'a> Recorder<'a> {
     /// A recording on `backend`, its bind groups kept (the crate's own measurements record kernels directly).
     #[cfg(test)]
     pub(crate) fn new(backend: &'a WgpuBackend) -> Self {
-        Recorder { backend, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None }
+        Recorder { backend, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None }
     }
 }
 
@@ -2181,6 +2191,11 @@ pub(crate) struct Recorder<'a> {
     att16: Option<(DeviceVec, DeviceVec)>,
     /// The parts of a tensor-core matmul split along k, each split matmul's in turn.
     parts: Option<DeviceVec>,
+    /// A prompt's EXL3 projections' scratch (transformed inputs, partial sums, outputs before the map), each
+    /// projection's in turn (a device's layers one recording: each its own, they would all be held to its end).
+    exl3_tmp: Option<[DeviceVec; 3]>,
+    /// A prompt's routed experts' scratch, each layer's in turn (its shape: rows, top k, hidden, ff).
+    pub(crate) moe_tmp: Option<([usize; 4], std::sync::Arc<crate::exl3::Step>)>,
 }
 
 impl Recorder<'_> {
@@ -4360,7 +4375,7 @@ fn main() {
         for m in [1usize, 2, 3, 4] {
             let (x, y, y8) = (b.vec(m * k), b.vec(m * n), b.vec(m * n));
             DeviceChain::upload(&b, &x, &(0..m * k).map(|_| next()).collect::<Vec<_>>());
-            let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None };
+            let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None };
             assert!(rq.matmul_rows_q8(w, &x, &y8, m));
             rq.read(&y8);
             let got = Box::new(rq).finish().pop().unwrap();
@@ -4376,7 +4391,7 @@ fn main() {
             let reps = 28;
             let time = |q8: bool| {
                 let run = || {
-                    let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None };
+                    let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None };
                     for i in 0..reps {
                         let w = &ws[i % ws.len()];
                         if q8 {
@@ -4522,7 +4537,7 @@ fn main() {
                 let pipeline = b.gpu.named_pipeline(Box::leak(format!("test-rb-{dtype:?}-{r}-{ks}").into_boxed_str()), || src);
                 let reps = 32;
                 let run = || {
-                    let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None };
+                    let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None };
                     for i in 0..reps {
                         let q = ws[i % ws.len()].device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).unwrap();
                         for (chunk, row0, rows) in &q.chunks {
@@ -4582,7 +4597,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) n
             let pipeline = b.gpu.named_pipeline(name, || body);
             let groups = 170 * 16;
             let run = || {
-                let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None };
+                let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None };
                 for _ in 0..8 {
                     rq.dispatch_kept(&pipeline, buffer(&src), buffer(&src), buffer(&out), &[(len / 4) as u32], (groups, 1, 1));
                 }
