@@ -1868,8 +1868,8 @@ mod dense_webgpu_timing {
             gpus[device].exl3_experts_leaving(list, reserve).map_err(oaiy_engine::Error::Arg)
         };
         let model = crate::flashnext::load_portable(p, backends, &packed, &experts, false).unwrap();
-        let tokens: Vec<u32> = (0..4200u32).map(|i| 1000 + (i * 7919) % 20000).collect();
-        let mut kv = model.new_kv_cache(4096);
+        let tokens: Vec<u32> = (0..16_400u32).map(|i| 1000 + (i * 7919) % 20000).collect();
+        let mut kv = model.new_kv_cache(16_384);
         let report = |what: &str, wall: f64| {
             let k = ggml_rs_wgpu::profile::take_kernels();
             let gpu: f64 = k.iter().map(|e| e.1).sum();

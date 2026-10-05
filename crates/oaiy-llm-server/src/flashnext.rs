@@ -1835,6 +1835,10 @@ impl FlashNext {
             return None;
         }
         let sparse = past + t > cfg.index_budget / ratio * ratio + ratio - 1;
+        // a device without QSA's kernels (a workgroup's memory too small for its selection) leaves it to the host path
+        if sparse && self.devices.iter().filter_map(|b| b.chain()).any(|c| c.qsa_attention_out_len(1, cfg.heads, cfg.head_dim, cfg.index_budget / ratio, ratio) == 0) {
+            return None;
+        }
         let st = self.chain_state()?;
         let chains: Vec<&dyn ggml_rs::DeviceChain> = self.devices.iter().map(|b| b.chain()).collect::<Option<_>>()?;
         let (h, s) = (cfg.hidden, cfg.streams);

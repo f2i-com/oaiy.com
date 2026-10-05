@@ -1649,6 +1649,10 @@ impl DeviceChain for WgpuBackend {
     }
 
     fn qsa_attention_out_len(&self, rows: usize, n_h: usize, head_dim: usize, keep: usize, ratio: usize) -> usize {
+        // the selection sorts 4096 blocks' keys and indices in a workgroup's memory (32 KB, past WebGPU's default 16)
+        if self.gpu.limits.max_compute_workgroup_storage_size < 32768 {
+            return 0;
+        }
         rows * n_h * head_dim + rows * n_h * (keep * ratio + ratio).div_ceil(256) * (head_dim + 2)
     }
 
@@ -3012,8 +3016,8 @@ mod tests {
 
     /// QSA chained gives the host's: the pooled block keys bit for bit, the block scores within rounding, each query's
     /// chosen blocks the same, and its attention over them and its tail within rounding (Qwen3.8-Flash-Next's 4 index
-    /// heads of 128, 24 heads of 256 over 2 kv heads, blocks of 4, 64 kept of 750); and where a query keeps every
-    /// block, the dense decode attention's bits.
+    /// heads of 128, 24 heads of 256 over 2 kv heads, blocks of 4, 64 kept of 750); the selection of 512 of 4096 blocks
+    /// and of 3001; and where a query keeps every block, the dense decode attention's bits.
     #[test]
     fn qsa_chained_is_the_hosts() {
         use ggml_rs::Backend;
@@ -3077,6 +3081,32 @@ mod tests {
         let scale_out = want_out.data().iter().fold(1e-6f32, |m, x| m.max(x.abs()));
         for (i, (g, w)) in got_out.iter().zip(want_out.data()).enumerate() {
             assert!((g - w).abs() <= 1e-5 * scale_out, "attention {i}: {g} against {w}");
+        }
+        // the selection at its limits: 4096 blocks (the sort filling the workgroup's memory) and an odd count
+        for nb in [4096usize, 3001] {
+            let first = nb * ratio - 2;
+            let sc: Vec<f32> = (0..2 * nb).map(|_| r().abs() * 4.0).collect();
+            let (sd, ld) = (up(&sc), b.vec(2 * keep));
+            let mut rec = b.begin();
+            rec.qsa_select(&sd, &ld, 2, nb, first, ratio, keep);
+            rec.read(&ld);
+            let got = rec.finish().pop().unwrap();
+            // what a selection must be (the host's picks among equal scores are its own): `keep` of the blocks the
+            // row sees, ascending, none dropped above one kept, and of equals the lower kept first
+            for row in 0..2 {
+                let visible = ((first + row + 1) / ratio).min(nb);
+                let got_row: Vec<usize> = got[row * keep..(row + 1) * keep].iter().map(|v| v.to_bits() as usize).collect();
+                assert!(got_row.windows(2).all(|w| w[0] < w[1]) && got_row.iter().all(|&j| j < visible), "{nb} blocks: row {row}'s ascending, seen");
+                let kept: std::collections::BTreeSet<usize> = got_row.iter().copied().collect();
+                let s_row = &sc[row * nb..row * nb + visible];
+                let worst_kept = kept.iter().map(|&j| s_row[j]).fold(f32::INFINITY, f32::min);
+                for j in (0..visible).filter(|j| !kept.contains(j)) {
+                    assert!(s_row[j] <= worst_kept, "{nb} blocks: row {row} dropped {j} ({}) above a kept {worst_kept}", s_row[j]);
+                    if s_row[j] == worst_kept {
+                        assert!(kept.iter().filter(|&&k| s_row[k] == worst_kept).all(|&k| k < j), "{nb} blocks: row {row}: of equals the lower first");
+                    }
+                }
+            }
         }
         // every block kept: the dense decode attention, bit for bit
         let (few, at) = (40usize, 37usize);
