@@ -2080,7 +2080,20 @@ impl Recorder<'_> {
         let ntiles = (n / 16) as u32;
         let grid = |z: usize| (ntiles.min(65535), ntiles.div_ceil(65535), z as u32 * splits);
         let mm = crate::exl3::chain_shader("mm");
-        if rows == 1 {
+        // a prompt's rows on the tensor cores, in blocks of 128 (one split)
+        let coop = rows > crate::exl3::FEW_MAX && crate::exl3::coop_on(self.gpu());
+        if coop {
+            const BLOCK: usize = 128;
+            let many: Vec<u32> = (0..rows as u32).collect::<Vec<_>>().chunks(BLOCK).flat_map(|b| b.iter().copied().chain(std::iter::repeat(crate::exl3::NONE)).take(BLOCK)).collect();
+            let order = self.scratch(many.len());
+            crate::exl3::upload_u32(self.backend, &order, &many);
+            let blocks = many.len() / BLOCK;
+            let src = crate::exl3::g_coop(BLOCK);
+            for first in (0..blocks).step_by(65535) {
+                let these = 65535.min(blocks - first) as u32;
+                self.dispatch_wide(crate::exl3::coop_name(BLOCK), &src, [words, buffer(&xh), buffer(&jobs), buffer(&order), &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, 1, 0, first as u32], (ntiles.div_ceil(8), 1, these));
+            }
+        } else if rows == 1 {
             self.dispatch_wide("exl3-mm", mm, [words, buffer(&xh), buffer(&jobs), &d, &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, splits, 0], grid(1));
         } else if rows <= crate::exl3::FEW_MAX {
             // a few rows (a check of drafts): each tile decoded once for all of them, each row summed as one row is
@@ -2112,7 +2125,8 @@ impl Recorder<'_> {
         }
         let post = crate::exl3::chain_shader("post");
         let post_out = if c.omap.is_some() { buffer(&yt) } else { buffer(y) };
-        self.dispatch_wide("exl3-post", post, [buffer(&part), buffer(&c.svh), buffer(&jobs), &d, &d, &d, post_out, &drw], &[n as u32, splits], ((n / 128) as u32, rows as u32, 1));
+        let parts = if coop { 1 } else { splits };
+        self.dispatch_wide("exl3-post", post, [buffer(&part), buffer(&c.svh), buffer(&jobs), &d, &d, &d, post_out, &drw], &[n as u32, parts], ((n / 128) as u32, rows as u32, 1));
         if let Some(omap) = &c.omap {
             let gather = crate::exl3::chain_shader("gather");
             self.dispatch_wide("exl3-gather", gather, [buffer(&yt), buffer(omap), buffer(&jobs), &d, &d, &d, buffer(y), &drw], &[n as u32], ((n as u32).div_ceil(256), rows as u32, 1));

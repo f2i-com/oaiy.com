@@ -1012,6 +1012,196 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     )
 }
 
+/// [`g_many`] on the tensor cores (WGSL's cooperative matrices, f16 into f32), for blocks of `rows` (16, 32, 64 or
+/// 128) jobs of one matrix: a workgroup 8 tile columns (128 outputs) of a block, `k` a tile row (16) at a time; each
+/// step a warp decodes its tile column's 256 codes (a lane its 8, as the one-row kernel's lanes hold them, from the
+/// four words they lie in) into the workgroup's memory as f16 (each an f16 exactly) and the block's inputs (f16 too,
+/// as the input transform rounds them) beside them, the next step's words and inputs loaded as this one's are
+/// multiplied; each warp its 16 outputs by the block's rows. Each job's sums to `part[j * n..]` (one split), through a
+/// warp's staging. The sums are a matmul's, not the one-row kernel's bit for bit. `p` as for [`g_many`].
+pub(crate) fn g_coop(rows: usize) -> String {
+    assert!(matches!(rows, 16 | 32 | 64 | 128), "a block of 16, 32, 64 or 128 rows");
+    let f = rows / 16;
+    let pairs = rows * 8;
+    let each = |g: &dyn Fn(usize) -> String| (0..f).map(g).collect::<String>();
+    let decl = each(&|i| format!("    var c{i} = coop_mat16x16<f32, C>();\n"));
+    let mma = each(&|i| format!("        {{\n            let ib = cur + {}u * S2;\n            let bf = coopLoad<coop_mat16x16<f16, B>>(&xt[ib], s2);\n            c{i} = coopMultiplyAdd(af, bf, c{i});\n        }}\n", i * 16));
+    let out = each(&|i| {
+        format!(
+            "    {{\n        let so = warp * 256u;\n        coopStore(c{i}, &stage[so], 16u);\n        workgroupBarrier();\n        for (var e = l; e < 256u; e += 32u) {{\n            let id = ids[{}u + e / 16u];\n            if (id != 0xffffffffu && live) {{ part[id * n + tc * 16u + e % 16u] = stage[so + e]; }}\n        }}\n        workgroupBarrier();\n    }}\n",
+            i * 16
+        )
+    });
+    // the inputs a thread loads a step: pairs `t + 256 i` of the block's rows by 16 of k
+    let per = pairs.div_ceil(256);
+    let xdecl: String = (0..per).map(|i| format!("    var xp{i} = vec2<f32>(0.0);\n")).collect();
+    let xload: String = (0..per)
+        .map(|i| format!("        {{\n            let q = t + {}u;\n            if (q < {pairs}u) {{\n                let id = ids[q / 8u];\n                xp{i} = vec2<f32>(0.0);\n                if (id != 0xffffffffu) {{ xp{i} = x2[(id * k + kn * 16u) / 2u + q % 8u]; }}\n            }}\n        }}\n", 256 * i))
+        .collect();
+    let xstore: String = (0..per)
+        .map(|i| format!("        {{\n            let q = t + {}u;\n            if (q < {pairs}u) {{ xt[nb + (q / 8u) * S2 + q % 8u] = vec2<f16>(xp{i}); }}\n        }}\n", 256 * i))
+        .collect();
+    format!(
+        r#"enable f16;
+enable wgpu_cooperative_matrix;
+@group(0) @binding(0) var<storage, read> words: array<u32>;
+@group(0) @binding(1) var<storage, read> x2: array<vec2<f32>>;
+@group(0) @binding(2) var<storage, read> jobs: array<u32>;
+@group(0) @binding(3) var<storage, read> order: array<u32>;
+@group(0) @binding(6) var<storage, read_write> part: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+// a row's stride in the tiles, as f16 pairs: 16 of k and 8 against bank conflicts
+const S2: u32 = 12u;
+// two steps' weights [output][k] and inputs [row][k]
+var<workgroup> wt: array<vec2<f16>, {wt_len}>;
+var<workgroup> xt: array<vec2<f16>, {xt_len}>;
+var<workgroup> stage: array<f32, 2048>;
+// every code's place in a tile, and each lane's first word (the same in every tile)
+var<workgroup> places: array<u32, 256>;
+var<workgroup> firsts: array<u32, 32>;
+var<workgroup> ids: array<u32, {rows}>;
+
+fn round_f16(v: f32) -> f32 {{
+    let b = bitcast<u32>(v);
+    return bitcast<f32>((b + 0xfffu + ((b >> 13u) & 1u)) & 0xffffe000u);
+}}
+
+// The 16-bit window of code `i` of a tile of `tw` words: (its first word, its shift).
+fn window(i: u32, tw: u32) -> vec2<u32> {{
+    let nw = tw / 2u;
+    var end = (i + 1u) * (tw / 16u);
+    if (tw % 16u == 8u) {{
+        end = end + (i + 1u) / 2u;
+    }}
+    let start = (end + nw * 32u - 16u) % (nw * 32u);
+    return vec2<u32>(start / 32u, 48u - start % 32u);
+}}
+
+// Code `i`'s word after `w0` (0, 1 or 2) and its shift, packed.
+fn place(i: u32, tw: u32, w0: u32) -> u32 {{
+    let nw = tw / 2u;
+    let wd = window(i, tw);
+    return ((wd.x + nw - w0) % nw) | (wd.y << 8u);
+}}
+
+// A code from the four words `q0..q3` (from a lane's first) at its packed place.
+fn code_in(q0: u32, q1: u32, q2: u32, q3: u32, at: u32) -> u32 {{
+    let d = at & 3u;
+    let sh = at >> 8u;
+    let a = select(select(q0, q1, d == 1u), q2, d >= 2u);
+    let b = select(select(q1, q2, d == 1u), q3, d >= 2u);
+    return select((a << (32u - sh)) | (b >> sh), a >> (sh - 32u), sh >= 32u);
+}}
+
+fn decode_at(code: u32) -> f32 {{
+    let hx = (code & 0xffffu) * 0x83dcd12du;
+    let sum = dot4U8Packed(hx, 0x01010101u);
+    return round_f16(f32(1024u + sum) * 0.00676727294921875 - 10.3828125);
+}}
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {{
+    let n = p[0].x;
+    let k = p[0].y;
+    let tw = p[0].z;
+    let nw = tw / 2u;
+    let ntiles = n / 16u;
+    let blk = p[1].y + wg.z;
+    let first = window(8u * (t / 8u), tw).x;
+    places[t] = place(t, tw, first);
+    if (t % 8u == 0u) {{
+        firsts[t / 8u] = first;
+    }}
+    if (t < {rows}u) {{
+        ids[t] = order[blk * {rows}u + t];
+    }}
+    workgroupBarrier();
+    let base = jobs[2u * ids[0]] * p[1].x;
+    let warp = t / 32u;
+    let l = t % 32u;
+    // the warp's tile column (past the matrix: the last, its sums not stored), the lane's codes' places
+    let tc = wg.x * 8u + warp;
+    let live = tc < ntiles;
+    let tcl = min(tc, ntiles - 1u);
+    let w0 = firsts[l];
+    let a0 = places[8u * l];
+    let a1 = places[8u * l + 1u];
+    let a2 = places[8u * l + 2u];
+    let a3 = places[8u * l + 3u];
+    let a4 = places[8u * l + 4u];
+    let a5 = places[8u * l + 5u];
+    let a6 = places[8u * l + 6u];
+    let a7 = places[8u * l + 7u];
+    // where its codes go: weights (k 2 (l % 4) + {{0, 1, 8, 9}}, output l / 4 + {{0, 8}}) of the warp's 16
+    let wo0 = (warp * 16u + l / 4u) * S2 + l % 4u;
+    let wo1 = wo0 + 8u * S2;
+    let kts = k / 16u;
+{decl}{xdecl}    var q0 = 0u;
+    var q1 = 0u;
+    var q2 = 0u;
+    var q3 = 0u;
+    // the first step's
+    {{
+        let kn = 0u;
+        let wb = base + (kn * ntiles + tcl) * nw;
+        q0 = words[wb + w0 % nw];
+        q1 = words[wb + (w0 + 1u) % nw];
+        q2 = words[wb + (w0 + 2u) % nw];
+        q3 = words[wb + (w0 + 3u) % nw];
+{xload}        let nb = 0u;
+        wt[nb + wo0] = vec2<f16>(f16(decode_at(code_in(q0, q1, q2, q3, a0))), f16(decode_at(code_in(q0, q1, q2, q3, a1))));
+        wt[nb + wo0 + 4u] = vec2<f16>(f16(decode_at(code_in(q0, q1, q2, q3, a2))), f16(decode_at(code_in(q0, q1, q2, q3, a3))));
+        wt[nb + wo1] = vec2<f16>(f16(decode_at(code_in(q0, q1, q2, q3, a4))), f16(decode_at(code_in(q0, q1, q2, q3, a5))));
+        wt[nb + wo1 + 4u] = vec2<f16>(f16(decode_at(code_in(q0, q1, q2, q3, a6))), f16(decode_at(code_in(q0, q1, q2, q3, a7))));
+{xstore}    }}
+    workgroupBarrier();
+    for (var kt = 0u; kt < kts; kt++) {{
+        // the next step (the last's own again, into the buffer no one reads after): loaded before this one's are
+        // multiplied, decoded and stored after, with no branch between
+        let kn = min(kt + 1u, kts - 1u);
+        let wb = base + (kn * ntiles + tcl) * nw;
+        q0 = words[wb + w0 % nw];
+        q1 = words[wb + (w0 + 1u) % nw];
+        q2 = words[wb + (w0 + 2u) % nw];
+        q3 = words[wb + (w0 + 3u) % nw];
+{xload}        let cur = (kt % 2u) * {half_wt}u;
+        let curx = (kt % 2u) * {half_xt}u;
+        let s2 = S2;
+        let ia = cur + warp * 16u * S2;
+        let af = coopLoadT<coop_mat16x16<f16, A>>(&wt[ia], s2);
+        {{
+            let cur = curx;
+{mma}        }}
+        let nb = ((kt + 1u) % 2u) * {half_wt}u;
+        wt[nb + wo0] = vec2<f16>(f16(decode_at(code_in(q0, q1, q2, q3, a0))), f16(decode_at(code_in(q0, q1, q2, q3, a1))));
+        wt[nb + wo0 + 4u] = vec2<f16>(f16(decode_at(code_in(q0, q1, q2, q3, a2))), f16(decode_at(code_in(q0, q1, q2, q3, a3))));
+        wt[nb + wo1] = vec2<f16>(f16(decode_at(code_in(q0, q1, q2, q3, a4))), f16(decode_at(code_in(q0, q1, q2, q3, a5))));
+        wt[nb + wo1 + 4u] = vec2<f16>(f16(decode_at(code_in(q0, q1, q2, q3, a6))), f16(decode_at(code_in(q0, q1, q2, q3, a7))));
+        {{
+            let nb = ((kt + 1u) % 2u) * {half_xt}u;
+{xstore}        }}
+        workgroupBarrier();
+    }}
+{out}}}
+"#,
+        wt_len = 2 * 128 * 12,
+        xt_len = 2 * rows * 12,
+        half_wt = 128 * 12,
+        half_xt = rows * 12,
+    )
+}
+
+/// The pipeline name of [`g_coop`]'s kernel for blocks of `rows`.
+pub(crate) fn coop_name(rows: usize) -> &'static str {
+    match rows {
+        16 => "exl3-coop-16",
+        32 => "exl3-coop-32",
+        64 => "exl3-coop-64",
+        _ => "exl3-coop-128",
+    }
+}
+
 /// The most rows [`g_few`] takes a block.
 pub(crate) const FEW_MAX: usize = 8;
 
@@ -1328,6 +1518,17 @@ fn moe_block() -> usize {
         Some(16) => 16,
         _ => 32,
     })
+}
+
+/// Whether a prompt's EXL3 matmuls go through the tensor cores ([`g_coop`]): where the device has them.
+pub(crate) fn coop_on(gpu: &Gpu) -> bool {
+    gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+}
+
+/// Rows a block of a prompt's experts' jobs takes: [`g_coop`]'s 16 (an expert's some 10 rows of a 512-row chunk in
+/// one fragment of the tensor cores), else [`moe_block`]'s.
+fn many_rows(gpu: &Gpu) -> usize {
+    if coop_on(gpu) { 16 } else { moe_block() }
 }
 
 /// Each job's output transform, a workgroup a (128-block, job): its splits' partial sums added up (in order),
@@ -1813,10 +2014,16 @@ impl Exl3MoeGrouped {
         match order {
             Order::Many(order, blocks) => {
                 let ob = buf(order);
-                let rows = moe_block();
+                let rows = many_rows(rec.gpu());
                 for first in (0..blocks).step_by(per) {
                     let these = per.min(blocks - first) as u32;
-                    rec.dispatch_wide(many_name(rows), &g_many(rows), [&g.words, &xhb, &jb, &ob, &d, &d, &pb, &drw], &[g.n as u32, g.k as u32, g.tw as u32, splits, g.mwords as u32, first as u32], (ntiles.min(65535), ntiles.div_ceil(65535), these * splits));
+                    if coop_on(rec.gpu()) {
+                        // 8 tile columns a workgroup on the tensor cores
+                        let src = g_coop(rows);
+                        rec.dispatch_wide(coop_name(rows), &src, [&g.words, &xhb, &jb, &ob, &d, &d, &pb, &drw], &[g.n as u32, g.k as u32, g.tw as u32, 1, g.mwords as u32, first as u32], (ntiles.div_ceil(8), 1, these));
+                    } else {
+                        rec.dispatch_wide(many_name(rows), &g_many(rows), [&g.words, &xhb, &jb, &ob, &d, &d, &pb, &drw], &[g.n as u32, g.k as u32, g.tw as u32, splits, g.mwords as u32, first as u32], (ntiles.min(65535), ntiles.div_ceil(65535), these * splits));
+                    }
                 }
             }
             Order::Few(order, blocks, rows) => {
@@ -1864,11 +2071,12 @@ impl Exl3MoeGrouped {
         up(&st.jobs_d, &jobs_d);
         DeviceChain::upload(&b, &st.w, &w);
         // a prompt's rows: each expert's in blocks, a tile decoded once a block
+        let block = many_rows(rec.gpu());
         let mut order = |jobs: &[u32]| {
-            let o = many_order(jobs, moe_block());
+            let o = many_order(jobs, block);
             let v = rec.scratch(o.len());
             up(&v, &o);
-            (v, o.len() / moe_block())
+            (v, o.len() / block)
         };
         let orders = (rows > 1).then(|| (order(&jobs_gu), order(&jobs_d)));
         let (ogu, od) = match &orders {
@@ -2596,6 +2804,16 @@ mod tests {
                     rec.exl3_rows(w.as_ref(), &x, &y, rows);
                     rec.read(&y);
                     let got = rec.finish().pop().unwrap();
+                    if rows > FEW_MAX && coop_on(&b.gpu) {
+                        // a prompt's rows on the tensor cores: a matmul's sums (the same products, f16 exactly)
+                        let dot: f64 = got.iter().zip(want.data()).map(|(a, e)| *a as f64 * *e as f64).sum();
+                        let norm = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+                        let cos = dot / (norm(&got) * norm(want.data()));
+                        let top = want.data().iter().fold(0f32, |m, v| m.max(v.abs()));
+                        let worst = got.iter().zip(want.data()).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
+                        assert!(cos > 0.99999 && worst <= 2e-3 * top, "tw={tw} maps={maps} rows={rows}: cosine {cos}, worst {worst} of {top}");
+                        continue;
+                    }
                     let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
                     assert_eq!(bits(&got), bits(want.data()), "tw={tw} maps={maps} rows={rows}");
                 }
