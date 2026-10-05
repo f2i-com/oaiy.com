@@ -2246,6 +2246,12 @@ impl FlashNext {
             let rec: &mut dyn ChainRecorder = &mut **open.get_or_insert_with(|| {
                 let mut r = chains[d].begin();
                 r.keep_groups(keep);
+                // a prompt's chunk's work on its first device held till its handoff too, then let go at once: its
+                // pieces submitted one by one as they were recorded ran the GPU's kernels some three times as long
+                // (a chunk of 512 some 340 ms of them where held 100; a step's own few go as they are)
+                if t > CHECK_ROWS && self.devices.len() > 1 {
+                    r.hold();
+                }
                 r
             });
             if let (true, Some((p, v)), Some(window)) = (ple_here, ple_vs, &ple_window) {
