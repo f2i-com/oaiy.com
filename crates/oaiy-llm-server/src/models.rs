@@ -797,11 +797,24 @@ impl Models {
                 None => Box::new(ggml_rs_wgpu::exl3::exl3_cpu),
             }
         };
-        // The experts take what the attention, delta-net and head matrices leave of the budget.
+        // The experts take what the attention, delta-net and head matrices leave of the budget; a layer's that the
+        // first GPU cannot hold whole go to the computer's other discrete GPUs (two 32 GB cards hold all 46 GB of
+        // them, where the CPU decoded what the first could not: most of a decode step).
         let reserve = crate::flashnext::dense_exl3_bytes(&spec.path)?;
+        let others: Vec<ggml_rs_wgpu::WgpuBackend> = wgpu.map(|b| b.others(o.webgpu_gb.map(|g| g << 30))).unwrap_or_default();
         let experts = |_device: usize, _layer: &str, list: Vec<[ggml_rs::exl3::Exl3Data; 3]>| -> Result<Box<dyn ggml_rs::exl3::Experts>> {
             match wgpu {
-                Some(b) => b.exl3_experts_leaving(list, reserve),
+                Some(b) => {
+                    let bytes: u64 = list.iter().flatten().map(|d| d.words.len() as u64 * 4).sum();
+                    let room = |g: &ggml_rs_wgpu::WgpuBackend, keep: u64| {
+                        let (used, budget) = g.usage();
+                        used + bytes + keep <= budget
+                    };
+                    match others.iter().find(|g| !room(b, reserve) && room(g, 0)) {
+                        Some(g) => g.exl3_experts(list),
+                        None => b.exl3_experts_leaving(list, reserve),
+                    }
+                }
                 None => ggml_rs_wgpu::exl3::exl3_experts_cpu(list),
             }
             .map_err(Error::Arg)
@@ -809,6 +822,12 @@ impl Models {
         let model = crate::flashnext::load_portable(&spec.path, Arc::clone(&picked.backend), &packed, &experts)?;
         if let Some((used, budget)) = wgpu.map(|b| b.usage()) {
             self.say(format!("{}: {:.1} GB of EXL3 weights on the GPU (budget {:.0} GB), the rest on the CPU", spec.name, used as f64 / 1e9, budget as f64 / 1e9));
+        }
+        for g in &others {
+            let (used, budget) = g.usage();
+            if used > 0 {
+                self.say(format!("{}: {:.1} GB of its experts on {} at {} (budget {:.0} GB)", spec.name, used as f64 / 1e9, g.adapter().name, g.adapter().pci_bus_id, budget as f64 / 1e9));
+            }
         }
         let tok = Arc::new(model.tokenizer.clone());
         // The cache is on the host: bound it as the other portable models are.

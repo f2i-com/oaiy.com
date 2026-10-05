@@ -356,6 +356,8 @@ pub struct AdapterSummary {
     pub name: String,
     pub backend: String,
     pub device_type: String,
+    /// Where the adapter sits on the PCI bus, as the API says (two cards of one model differ only here).
+    pub pci_bus_id: String,
 }
 
 pub struct WgpuBackend {
@@ -460,11 +462,39 @@ impl WgpuBackend {
             }))
             .map_err(|e| format!("no WebGPU adapter: {e}"))?,
         };
+        Self::open(adapter, budget_bytes)
+    }
+
+    /// The computer's other discrete GPUs on this one's API, each opened as a backend of its own (a budget each, as
+    /// `new` picks one): two cards of one model differ only in where they sit on the PCI bus. For a model whose
+    /// weights do not fit one card (Qwen3.8-Flash-Next's 46 GB of experts).
+    pub fn others(&self, budget_bytes: Option<u64>) -> Vec<WgpuBackend> {
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        desc.backends = wgpu::Backends::PRIMARY;
+        let instance = wgpu::Instance::new(desc.with_env());
+        let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::PRIMARY));
+        let mut out = Vec::new();
+        for adapter in adapters {
+            let info = adapter.get_info();
+            let same_api = format!("{:?}", info.backend) == self.summary.backend;
+            if !same_api || info.device_type != wgpu::DeviceType::DiscreteGpu || info.device_pci_bus_id == self.summary.pci_bus_id {
+                continue;
+            }
+            if let Ok(b) = Self::open(adapter, budget_bytes) {
+                out.push(b);
+            }
+        }
+        out
+    }
+
+    /// A backend on `adapter`.
+    fn open(adapter: wgpu::Adapter, budget_bytes: Option<u64>) -> Result<Self, String> {
         let info = adapter.get_info();
         let summary = AdapterSummary {
             name: info.name.clone(),
             backend: format!("{:?}", info.backend),
             device_type: format!("{:?}", info.device_type),
+            pci_bus_id: info.device_pci_bus_id.clone(),
         };
         let limits = adapter.limits();
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
