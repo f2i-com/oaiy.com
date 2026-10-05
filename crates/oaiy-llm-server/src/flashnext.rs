@@ -1510,6 +1510,7 @@ impl FlashNext {
         warmed
     }
 
+    #[cfg(test)]
     pub(crate) fn chain_runs(&self) -> usize {
         self.chain.get().and_then(|c| c.as_ref()).map_or(0, |c| c.runs.load(std::sync::atomic::Ordering::Relaxed))
     }

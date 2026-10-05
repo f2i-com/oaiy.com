@@ -939,7 +939,20 @@ impl Models {
         let backend: Arc<dyn ggml_rs::Backend> = Arc::clone(&picked.backend);
         let gguf = gguf::GgufFile::open(&path).map_err(|e| Error::Arg(e.to_string()))?;
         if gguf.get_str("general.architecture").ok() == Some("qwen35") {
-            let model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).map_err(|e| Error::Arg(e.to_string()))?;
+            let mut model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).map_err(|e| Error::Arg(e.to_string()))?;
+            // Its multi-token-prediction layer, where asked for: it drafts tokens a chained run checks.
+            if o.mtp.contains(&spec.name) {
+                if let llama_rs::Model::Qwen35(m) = &mut model {
+                    match m.load_mtp(&gguf) {
+                        Ok(Some(layer)) => {
+                            m.mtp = Some(layer);
+                            self.say(format!("{}: drafts tokens with its multi-token-prediction layer (--mtp)", spec.name));
+                        }
+                        Ok(None) => self.say(format!("{}: --mtp asked for, but its GGUF has no multi-token-prediction layer", spec.name)),
+                        Err(e) => self.say(format!("{}: its multi-token-prediction layer did not load ({e})", spec.name)),
+                    }
+                }
+            }
             let tok = Arc::new(model.tokenizer().clone());
             // Dense Qwen fits one card; bound the initial KV allocation.
             let max_seq = self.context(model.config().context_length).min(16384);
@@ -1471,11 +1484,13 @@ mod dense_webgpu_timing {
     fn measure_qwen35_mtp_acceptance() {
         use std::sync::Arc;
         let path = std::env::var("QWEN35_MODEL").unwrap_or_else(|_| r"E:\models\Qwen3.8-27B-Q3_K_M.gguf".into());
-        std::env::set_var("OAIY_MTP", "1");
         let Ok(b) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
         let backend: Arc<dyn ggml_rs::Backend> = Arc::new(b);
         let gguf = gguf::GgufFile::open(&path).unwrap();
-        let model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap();
+        let mut model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap();
+        if let llama_rs::Model::Qwen35(m) = &mut model {
+            m.mtp = m.load_mtp(&gguf).unwrap();
+        }
         let llama_rs::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
         let Some(mtp) = m.mtp.as_ref() else { panic!("no MTP layer in {path}") };
         let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0 as u32;
@@ -1540,11 +1555,13 @@ mod dense_webgpu_timing {
     fn measure_qwen35_mtp_depth() {
         use std::sync::Arc;
         let path = std::env::var("QWEN35_MODEL").unwrap_or_else(|_| r"E:\models\Qwen3.8-27B-Q3_K_M.gguf".into());
-        std::env::set_var("OAIY_MTP", "1");
         let Ok(b) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
         let backend: Arc<dyn ggml_rs::Backend> = Arc::new(b);
         let gguf = gguf::GgufFile::open(&path).unwrap();
-        let model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap();
+        let mut model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap();
+        if let llama_rs::Model::Qwen35(m) = &mut model {
+            m.mtp = m.load_mtp(&gguf).unwrap();
+        }
         let llama_rs::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
         let Some(mtp) = m.mtp.as_ref() else { panic!("no MTP layer in {path}") };
         let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0 as u32;
@@ -1610,11 +1627,13 @@ mod dense_webgpu_timing {
         let path = std::env::var("QWEN35_MODEL").unwrap_or_else(|_| r"E:\models\Qwen3.8-27B-Q3_K_M.gguf".into());
         let k: usize = std::env::var("QWEN35_DRAFTS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
         // the layer is loaded where asked for
-        std::env::set_var("OAIY_MTP", "1");
         let Ok(b) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
         let backend: Arc<dyn ggml_rs::Backend> = Arc::new(b);
         let gguf = gguf::GgufFile::open(&path).unwrap();
-        let model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap();
+        let mut model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap();
+        if let llama_rs::Model::Qwen35(m) = &mut model {
+            m.mtp = m.load_mtp(&gguf).unwrap();
+        }
         let llama_rs::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
         let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0 as u32;
         let prompt: Vec<u32> = m.tokenizer.encode("<|im_start|>user\nExplain how a refrigerator keeps food cold, in a few short paragraphs.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", false).unwrap();

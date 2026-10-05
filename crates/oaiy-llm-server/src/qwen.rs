@@ -524,13 +524,31 @@ impl QwenEngine {
         let mut finish = Finish::Length;
         // Where decoding's time goes, for the log: sampling, the text (decode and stream), the model.
         let (mut t_sample, mut t_text, mut t_model) = (0f64, 0f64, 0f64);
+        // Drafting (a Qwen3.5 model with its multi-token-prediction layer, chained; text only): each token sampled is
+        // run with the drafts after it in one check, and while the sampler picks what was drafted its logits are the
+        // check's (sampling the model's distribution and taking a draft only where it is the token sampled is that
+        // distribution's sampling still); where it picks another, the check's rows from there are undone.
+        let drafter = self.model.qwen35().filter(|m| job.images.is_empty() && m.drafts());
+        let mut pending: std::collections::VecDeque<(u32, Tensor)> = Default::default();
+        let (mut check_rows, mut drafts_checked, mut drafts_taken) = (0usize, 0usize, 0usize);
         while generated.len() < job.max_tokens && self.kv.len < self.kv.max_len {
-            if job.cancel.load(Ordering::Relaxed) { return Ok(()); }
+            if job.cancel.load(Ordering::Relaxed) {
+                if let (Some(m), false) = (drafter, pending.is_empty()) { m.rollback(&mut self.kv, check_rows, check_rows - pending.len()); }
+                return Ok(());
+            }
             let clock = std::time::Instant::now();
             let mut next = sample(logits.data(), &job.sampling, &mut rng);
             t_sample += clock.elapsed().as_secs_f64();
             if thinking && job.think_budget.is_some_and(|n|think_used >= n) { if let Some(end) = think_end { next = end; } }
-            if next == eos || Some(next) == tok.eos() { finish = Finish::Stop; break; }
+            let stop = next == eos || Some(next) == tok.eos();
+            // the check ran this token already where it is the next draft; else its rows from here on are undone
+            let ran = !stop && pending.front().is_some_and(|(d, _)| *d == next);
+            if !ran && !pending.is_empty() {
+                let m = drafter.expect("drafts are a drafter's");
+                m.rollback(&mut self.kv, check_rows, check_rows - pending.len());
+                pending.clear();
+            }
+            if stop { finish = Finish::Stop; break; }
             generated.push(next);
             let clock = std::time::Instant::now();
             let decoded = tok.decode(&generated);
@@ -549,23 +567,54 @@ impl QwenEngine {
             if thinking && generated.len() % 16 == 0 { let _ = job.events.send(Event::Thinking { used: think_used, budget: job.think_budget, done: false }); }
             t_text += clock.elapsed().as_secs_f64();
             let clock = std::time::Instant::now();
-            let embeds = hybrid.embed(&[next])?;
-            logits = hybrid.forward(&[next], embeds, &mut self.kv, (!job.images.is_empty()).then_some(&[[next_position;3]]))?;
+            if ran {
+                let (_, after) = pending.pop_front().expect("the draft just matched");
+                logits = after;
+                drafts_taken += 1;
+            } else {
+                // its drafts, then the token and them in one check; else the token alone
+                let checked = drafter.filter(|_| self.kv.len + 1 + DRAFTS <= self.kv.max_len).and_then(|m| {
+                    let recent: Vec<u32> = self.covered[self.covered.len().saturating_sub(llama_rs::SPEC_ROWS)..].iter().map(|&k| k as u32).chain([next]).collect();
+                    let drafts = m.draft(&self.kv, &recent, DRAFTS)?;
+                    let rows: Vec<u32> = std::iter::once(next).chain(drafts.iter().copied()).collect();
+                    Some((drafts, m.check(&rows, &mut self.kv)?))
+                });
+                match checked {
+                    Some((drafts, mut rows)) => {
+                        check_rows = rows.len();
+                        drafts_checked += drafts.len();
+                        logits = rows.remove(0);
+                        pending = drafts.into_iter().zip(rows).collect();
+                    }
+                    None => {
+                        let embeds = hybrid.embed(&[next])?;
+                        logits = hybrid.forward(&[next], embeds, &mut self.kv, (!job.images.is_empty()).then_some(&[[next_position;3]]))?;
+                    }
+                }
+            }
             t_model += clock.elapsed().as_secs_f64();
             next_position += 1;
             self.covered.push(next as u64);
+        }
+        // a check's rows no token reached
+        if let (Some(m), false) = (drafter, pending.is_empty()) {
+            m.rollback(&mut self.kv, check_rows, check_rows - pending.len());
         }
         let raw = tok.decode(&generated);
         // The client is told what the model wrote, so a rejected call can be read
         // and fixed; the server log never holds it.
         let text = stream.push(&raw, &job.tools, true)
             .map_err(|e| format!("tool_contract_error: {e}; no tool from this batch was executed. The model wrote: {}", call_excerpt(&raw)))?;
-        if self.log { eprintln!("  Qwen: {} prompt tokens ({} cached) in {:.2}s; {} generated in {:.2}s (sampling {t_sample:.2}s, text {t_text:.2}s, model {t_model:.2}s)", job.prompt.len(),start,prefill_secs,generated.len(),decode_clock.elapsed().as_secs_f64()); }
+        if self.log { eprintln!("  Qwen: {} prompt tokens ({} cached) in {:.2}s; {} generated in {:.2}s (sampling {t_sample:.2}s, text {t_text:.2}s, model {t_model:.2}s){}", job.prompt.len(),start,prefill_secs,generated.len(),decode_clock.elapsed().as_secs_f64(), if drafts_checked > 0 { format!("; {drafts_taken} of {drafts_checked} drafts taken") } else { String::new() }); }
         if !text.is_empty() { let _ = job.events.send(Event::Text(text)); }
         let _ = job.events.send(Event::Done { finish, completion_tokens: generated.len() });
         Ok(())
     }
 }
+
+/// Tokens drafted a check, where a model drafts (its multi-token-prediction layer): Qwen3.8 27B's take 0.86, 0.73
+/// and 0.65 in turn (each where the ones before it were).
+const DRAFTS: usize = 3;
 
 fn trim_checkpoints(checkpoints: &mut Vec<(Vec<u64>, RecurrentSnapshot, bool)>) {
     while checkpoints.len() > 1 && (checkpoints.len() > 3 ||

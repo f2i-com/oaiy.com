@@ -80,6 +80,9 @@ const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|
   --lora-strength NAME=X      strength of NAME's adapters that give none (default 1; -4..4)
   --vision-projector NAME=PATH  GGUF projector, or original Qwen vision directory for Orca
   --devices-for NAME=0,1  the GPUs for NAME, instead of --devices (a model too big for one)
+  --mtp NAME           NAME (a Qwen3.5 GGUF with a multi-token-prediction layer, on
+                       WebGPU) drafts tokens with that layer and checks them in one
+                       run; repeat for more models
   --no-vision          skip the vision tower (images are refused)
   --local-images on|off  let requests name image files on this machine (paths,
                        file:// URLs); default on when listening on loopback only
@@ -179,6 +182,9 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Options, Stri
                 let list = list.split(',').map(|d| d.trim().parse().map_err(|_| format!("--devices-for: bad ordinal {d:?}"))).collect::<Result<Vec<usize>, _>>()?;
                 a.model_devices.insert(name.into(), list);
             }
+            "--mtp" => {
+                a.mtp.insert(val()?);
+            }
             "--vision-projector" => {
                 let value=val()?;
                 let (name,path)=value.split_once('=').filter(|(n,p)|!n.is_empty() && !p.is_empty()).ok_or("--vision-projector wants NAME=PATH")?;
@@ -271,6 +277,13 @@ mod tests {
             assert!(parse(&["--park-gb", bad]).is_err(), "{bad:?}");
         }
         assert!(parse(&["--park-gb"]).is_err());
+    }
+    #[test]
+    fn mtp_names_the_models_that_draft() {
+        let a = parse_args_from(["--model", "m", "--name", "q", "--mtp", "q", "--mtp", "other"].into_iter().map(str::to_owned)).unwrap();
+        assert_eq!(a.mtp.iter().map(String::as_str).collect::<Vec<_>>(), ["other", "q"]);
+        assert!(parse_args_from(["--model", "m"].into_iter().map(str::to_owned)).unwrap().mtp.is_empty());
+        assert!(parse_args_from(["--model", "m", "--mtp"].into_iter().map(str::to_owned)).is_err());
     }
 }
 

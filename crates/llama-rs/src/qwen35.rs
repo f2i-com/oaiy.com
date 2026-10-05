@@ -172,7 +172,8 @@ pub struct Qwen35Model {
     /// VENDORED-LOCAL: text runs chained on the backend's device when it has a chain for this model.
     pub chain: crate::chain_qwen35::Qwen35Chain,
     /// VENDORED-LOCAL: the multi-token-prediction layer its GGUF has, for drafting tokens a chained run then checks:
-    /// asked for (OAIY_MTP), as a check of several rows costs nearly twice a step's one with the K-quants' kernels.
+    /// put here where asked for ([`Self::load_mtp`]; the server's `--mtp`), as a check of several rows costs nearly
+    /// twice a step's one with the K-quants' kernels.
     pub mtp: Option<Qwen35Mtp>,
 }
 
@@ -384,16 +385,12 @@ impl Qwen35Model {
         let output      = output.to_device(&*backend);
         let blocks: Vec<Qwen35Block> = blocks.into_iter().map(|b| upload_block(b, &*backend)).collect();
 
-        let mut model = Self {
+        Ok(Self {
             config, ssm_cfg, attention_layers,
             tokenizer, blocks,
             tok_embd, packed_tok_embd, int8_tok_embd: None, cache_backends: Vec::new(), output_norm, output,
             backend, chain: Default::default(), mtp: None,
-        };
-        if std::env::var_os("OAIY_MTP").is_some() {
-            model.mtp = model.load_mtp(g)?;
-        }
-        Ok(model)
+        })
     }
 
     /// Forward — **partial implementation**: full-attention layers are

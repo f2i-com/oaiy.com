@@ -121,6 +121,9 @@ pub struct Options {
     pub vision_projectors: std::collections::BTreeMap<String, PathBuf>,
     /// GPUs for one model, keyed by name, instead of `devices` (a model too big for one).
     pub model_devices: std::collections::BTreeMap<String, Vec<usize>>,
+    /// Models (by name) that draft tokens with their multi-token-prediction layer, checking them in one run (a
+    /// Qwen3.5 GGUF with one, chained on WebGPU).
+    pub mtp: std::collections::BTreeSet<String>,
     /// LoRA adapters per Orca or Flash-Next model alias (PEFT folders; for Flash-Next also
     /// llama.cpp GGUF LoRAs), applied together in order, each with its own strength when it
     /// was given one.
@@ -247,6 +250,7 @@ impl Default for Options {
             extra_models: Vec::new(),
             vision_projectors: std::collections::BTreeMap::new(),
             model_devices: std::collections::BTreeMap::new(),
+            mtp: std::collections::BTreeSet::new(),
             lora_adapters: std::collections::BTreeMap::new(),
             lora_strengths: std::collections::BTreeMap::new(),
             start_model: None,

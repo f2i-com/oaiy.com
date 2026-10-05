@@ -178,6 +178,10 @@ pub fn arguments(llm: &Json, root: &Path, port: u16, key: &str, local_images: bo
         if !str_or(m, "vision_projector", "").trim().is_empty() {
             push("--vision-projector", format!("{name}={}", path(m, "vision_projector")));
         }
+        // Drafting with its multi-token-prediction layer (a Qwen3.5 GGUF with one), where ticked.
+        if bool_or(m, "mtp", false) {
+            push("--mtp", name.into());
+        }
         // Its own GPUs (a model too big for one), instead of the LLM's `devices`.
         let own: Vec<String> = m.get("devices").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(Json::as_i64).map(|d| d.to_string()).collect();
         if !own.is_empty() {
@@ -586,6 +590,14 @@ mod tests {
         assert_eq!(auto_webgpu_gb(&gpus(&[2048]), &llm(None)), None);
         assert_eq!(auto_webgpu_gb(&gpus(&[]), &llm(None)), None);
         assert_eq!(auto_webgpu_gb(&Json::Arr(vec![Json::obj([("memory_total_mb", Json::Null)])]), &llm(None)), None);
+    }
+
+    #[test]
+    fn a_model_ticked_to_draft_is_named_for_mtp() {
+        let llm = Json::parse(br#"{"models": [{"name": "q", "path": "q.gguf", "mtp": true}, {"name": "p", "path": "p.gguf"}, {"name": "r", "path": "r.gguf", "mtp": false}]}"#).unwrap();
+        let args = arguments(&llm, Path::new("/install"), 1, "k", true).unwrap().0;
+        let mtp: Vec<&str> = args.windows(2).filter(|w| w[0] == "--mtp").map(|w| w[1].as_str()).collect();
+        assert_eq!(mtp, ["q"]);
     }
 
     #[test]
