@@ -10,15 +10,19 @@ through **WebGPU**, and on a machine with no usable GPU, on the **CPU**.
 GGUF model spends nearly all of its time in one operation: multiplying
 activations by quantized weight matrices (`linear_q`). The WebGPU backend
 uploads those matrices to the GPU **in their GGML block layout**, so they take
-the same memory as the file. It runs the multiply in WGSL. Everything else (norms,
-RoPE, attention, recurrent state) runs on the CPU backend, with activations in
-RAM.
+the same memory as the file. It runs the multiply in WGSL. A prompt's other work
+(norms, RoPE, attention, recurrent state) runs on the CPU backend, with
+activations in RAM. A Llama's, Qwen3's or Gemma 3's decode step runs whole on the
+GPU, in one submit ("Dense models' decode on the GPU", below).
 
 - **Types:** Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K
   and IQ4_XS. Each shader's block decode is a line-by-line port of
   `ggml-quants`' `dequantize_block`, so the weights are the CPU's exactly. The
   parity test (`cargo test -p ggml-rs-wgpu`) checks every type against the CPU
-  dequantization for 1, 5 and 9 input rows.
+  dequantization for 1, 5, 9 and 70 input rows. A prompt (more than 8 rows) takes
+  a tiled kernel: 64 tokens by 64 weight rows a workgroup, each type's own decode
+  into workgroup memory and its sums in registers (a 4096 x 4096 Q4_K weight
+  against 512 tokens in 7.0 ms where a row a workgroup took 24.2).
 - **Budget:** WebGPU cannot report free memory, so a budget caps the weights
   placed on the GPU: 8 GiB on a discrete GPU, 2 GiB on an integrated one, or
   `--webgpu-gb N`. Weights past it (and types without a shader) stay in RAM and
@@ -221,7 +225,52 @@ These runs gave the same tokens as the CPU, but that is not guaranteed in
 general: the GPU sums each dot product in a different order, so a near-tie
 between two tokens can eventually go the other way.
 
-Speed is bounded by design: every projection is one upload, one dispatch and one
-read-back, dozens a token, so WebGPU decode runs several times slower than
-CUDA's. Keeping activations on the GPU between projections (norms and attention
-in WGSL too) is the next step if it needs to be faster.
+Those numbers were the op-by-op path: every projection one upload, one dispatch
+and one read-back, dozens a token. The next section is what replaced it for the
+dense families.
+
+## Dense models' decode on the GPU (2026-10-05)
+
+A Llama's, Qwen3's or Gemma 3's decode step is one submit (`ggml_rs::chain`, a
+`DeviceChain` the WebGPU backend implements; `llama-rs`'s `chain_decode`): every
+layer's norm, q, k and v (Qwen3's and Gemma 3's per-head norms), RoPE (its sines
+and cosines made on the host as the CPU's rope makes them, a table each base and
+scaling among the layers), the K and V stored into a copy of the KV cache kept on
+the GPU, attention over it (split in runs of 256 positions across workgroups and
+put together after; Gemma 3's local layers within their window), the output
+projection, residual, FFN (SwiGLU, or Gemma's GeGLU) and residual (Gemma 3's
+post-norms before each), then the head. Only the logits and the step's K and V
+rows (for the host's cache) come back. The GPU's copy of the cache is brought up
+to date with the rows the host wrote since (a prompt's: `KvCache::dirty_from`).
+It runs when every weight a step reads is on the GPU; otherwise, and with
+`OAIY_NO_CHAIN`, the op-by-op path.
+
+Also for the dense models on WebGPU: the CPU's attention runs in one pass (each
+KV head's rows read once for its group of query heads; the default copied the
+cache and took the softmax on one thread), a tied head heads with the GGUF's
+packed table on the GPU (it was 1.6 GB of f32 read on the CPU every token), a
+layer's q, k and v go in one submit, the CPU's RMSNorm, RoPE and SwiGLU spread a
+prompt's rows over the threads, and a prompt goes in chunks of 512 tokens.
+
+On the RTX 5090 (Vulkan), Q4_K_M, greedy:
+
+| Model | Decode, op by op | Decode, one submit | A 2,000-token prompt |
+|---|---:|---:|---:|
+| Llama 3.2 3B | 35 tok/s (11.6 at 512 tokens of context before the changes above) | 73 tok/s; 60 at 512 tokens of context | 10.8 s (59.2 before) |
+| Qwen3 0.6B | 53 tok/s | 182 tok/s | |
+| Gemma 3 4B | 28.5 tok/s | 60 tok/s | |
+
+Each chained model gives the op-by-op path's 64 greedy tokens at 64 and 1,500 or
+2,000 tokens of context (past Gemma 3's 1,024-token window), every step's logits
+cosine 1.000000, and the same two-turn conversation word for word (Gemma 3's
+second turn reusing 130 tokens of the first's state). A steady Llama 3.2 3B step
+is 0.4 ms of recording and 14 ms on the GPU; the one-row matmul reads its weights
+at 170-280 GB/s however its lanes are laid out (measured each way), so a kernel
+of wide loads is what would take it further.
+
+Gemma 3 itself was wrong on every backend until this day: one RoPE base on every
+layer, where its sliding-window layers take 10,000 and its global ones
+`rope.freq_base` with the GGUF's linear scaling, and its SentencePiece tokens
+were not llama.cpp's (a space before every line, merges out of score order,
+newlines dropped from replies). Gemma 3 4B answered a markdown prompt of a few
+hundred tokens with fragments of it; it answers as llama.cpp does now.
