@@ -32,6 +32,36 @@ pub struct Experts {
     pub gpu: Option<Arc<dyn crate::expert::ExpertsKernel>>,
 }
 
+/// Tokens a pass needs before its layers' experts are read while their attention runs: a prompt this long uses most of
+/// every layer's experts (a 2,000-token one, 80% of them), and the drive is idle otherwise; a shorter pass would fill
+/// the cache with experts it does not use.
+pub const PREFETCH_TOKENS: usize = 256;
+
+impl Experts {
+    /// Read `layer`'s routed experts into the RAM cache until `stop` (its router has chosen): those not cached already,
+    /// in the order the GPU's kernel gives (what it holds left out), on [`READERS`] threads. A record its MoE then asks
+    /// for is a hit, or, still being read, waited for rather than read again.
+    pub fn prefetch(&self, layer: u32, experts: u32, stop: &std::sync::atomic::AtomicBool) {
+        let order: Vec<u32> = match &self.gpu {
+            Some(g) => g.prefetch_order(layer, experts),
+            None => (0..experts).collect(),
+        };
+        let order: Vec<u32> = order.into_iter().filter(|&e| !self.cache.probe(layer, e)).collect();
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..READERS.min(order.len()) {
+                scope.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        let Some(&e) = order.get(next.fetch_add(1, Ordering::Relaxed)) else { break };
+                        // the lease dropped at once: a leased record is never evicted
+                        let _ = self.cache.acquire(layer, e, self.store.as_ref());
+                    }
+                });
+            }
+        });
+    }
+}
+
 /// Tokens of a prompt an expert needs before a GPU is worth its record's upload (18.8 MB): with fewer, the CPU's
 /// matmuls of a few rows are quicker than the copy.
 pub const GPU_MIN_ROWS: usize = 8;

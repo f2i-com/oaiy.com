@@ -215,6 +215,8 @@ impl Engine {
 pub(crate) struct WgpuExperts {
     group: Mutex<RecordSlots>,
     resident: Option<Mutex<Resident>>,
+    /// Whether a decode step's misses may come in (each an upload of a record); a prompt's always may.
+    admit_on_decode: std::sync::atomic::AtomicBool,
 }
 
 /// Decode steps after which every count halves (as the CUDA engine's tier): without aging, an old topic's experts would
@@ -233,7 +235,12 @@ impl WgpuExperts {
         let (used, budget) = gpu.usage();
         let room = (budget.saturating_sub(used).saturating_sub(MARGIN) / record as u64) as usize;
         let resident = (room > 0).then(|| gpu.record_slots(room, record)).flatten().map(|slots| Mutex::new(Resident::new(slots)));
-        Some(WgpuExperts { group: Mutex::new(group), resident })
+        Some(WgpuExperts { group: Mutex::new(group), resident, admit_on_decode: std::sync::atomic::AtomicBool::new(true) })
+    }
+
+    /// Let a decode step's misses come in, or not (to measure what their uploads cost).
+    pub(crate) fn set_admit_on_decode(&self, on: bool) {
+        self.admit_on_decode.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Experts a prompt's call takes at once.
@@ -297,7 +304,18 @@ impl dsv41::expert::ExpertsKernel for WgpuExperts {
         picks.chunks(dsv41::moe::GPU_GROUP).flat_map(|part| run(&r.slots, part, swiglu_limit)).collect()
     }
 
+    fn prefetch_order(&self, layer: u32, experts: u32) -> Vec<u32> {
+        let Some(r) = &self.resident else { return (0..experts).collect() };
+        let r = r.lock().unwrap_or_else(|p| p.into_inner());
+        let mut order: Vec<u32> = (0..experts).filter(|&e| !r.index.contains_key(&(layer, e))).collect();
+        order.sort_by_key(|&e| std::cmp::Reverse(r.freq((layer, e))));
+        order
+    }
+
     fn offer(&self, layer: u32, records: &[(u32, &[u8])]) {
+        if !self.admit_on_decode.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         if let Some(r) = &self.resident {
             let mut r = r.lock().unwrap_or_else(|p| p.into_inner());
             for &(e, record) in records {
@@ -464,7 +482,14 @@ mod tests {
     fn prompt(dir: &std::path::Path, tokens: usize) -> Vec<u32> {
         let tok = dsv41::tokenizer::Tokenizer::load(dir).unwrap();
         let docs = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs");
-        let text: String = ["WEBGPU.md", "STUDIO.md", "FLASHNEXT.md", "ORCASAQ.md"].iter().filter_map(|f| std::fs::read_to_string(format!("{docs}/{f}")).ok()).collect();
+        // LF whatever the checkout wrote: a CRLF copy of the same docs is another prompt (other tokens, other experts).
+        let text: String = ["WEBGPU.md", "STUDIO.md", "FLASHNEXT.md", "ORCASAQ.md"]
+            .iter()
+            .filter_map(|f| std::fs::read_to_string(format!("{docs}/{f}")).ok())
+            .map(|t| t.replace("
+", "
+"))
+            .collect();
         let mut ids = vec![0u32];
         ids.extend(tok.encode(&text));
         ids.truncate(tokens);
@@ -600,9 +625,14 @@ mod tests {
         let backend: Arc<dyn ggml_rs::Backend> = Arc::new(gpu());
         let mut model = Model::load(&dir, &meta, &opts).unwrap();
         let (count, bytes) = offload(&mut model, backend.as_any().downcast_ref::<WgpuBackend>().unwrap());
-        model.set_experts_kernel(Some(Arc::new(WgpuExperts::new(backend.as_any().downcast_ref::<WgpuBackend>().unwrap()).unwrap())));
-        eprintln!("{count} dense matrices on the GPU, {:.2} GB, and a prompt's busy experts", bytes as f64 / 1e9);
+        let kernel = Arc::new(WgpuExperts::new(backend.as_any().downcast_ref::<WgpuBackend>().unwrap()).unwrap());
+        model.set_experts_kernel(Some(Arc::clone(&kernel) as Arc<dyn dsv41::expert::ExpertsKernel>));
+        eprintln!("{count} dense matrices on the GPU, {:.2} GB, and the experts", bytes as f64 / 1e9);
         let (gpu_logits, gpu_tokens) = run(&mut model);
+        let (slots, hits, misses, admitted) = kernel.tier();
+        eprintln!("the experts kept on the GPU: {hits} hits / {misses} misses, {admitted} taken in, {slots} slots");
+        // The decode steps computed some of their experts there, so the same tokens cover those too.
+        assert!(hits > 0, "no expert was computed from the GPU's tier");
         let dot: f64 = cpu_logits.iter().zip(&gpu_logits).map(|(a, b)| *a as f64 * *b as f64).sum();
         let norm = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
         let cosine = dot / (norm(&cpu_logits) * norm(&gpu_logits));
@@ -639,6 +669,10 @@ mod tests {
         if std::env::var("DSV41_GPU_EXPERTS").map_or(true, |v| v != "0") {
             let k = Arc::new(WgpuExperts::new(backend.as_any().downcast_ref::<WgpuBackend>().unwrap()).expect("room for a record"));
             eprintln!("{} record slots for a prompt's experts, {} kept between passes", k.slots(), k.tier().0);
+            if std::env::var("DSV41_TIER_ADMIT").is_ok_and(|v| v == "0") {
+                k.set_admit_on_decode(false);
+                eprintln!("a decode step's misses kept out of the tier");
+            }
             model.set_experts_kernel(Some(Arc::clone(&k) as Arc<dyn dsv41::expert::ExpertsKernel>));
             kernel = Some(k);
             eprintln!("a prompt's busy experts on the GPU");

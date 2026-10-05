@@ -241,28 +241,40 @@ impl Model {
         // prompt's dot products alone took 29 s (24 of HC * dim a token, twice a layer; `hc`'s timing test).
         let mixes = |x: &[f32], p: &HcParams| -> Vec<Mix> { per_token(t, |i| hc::mixes(&x[tok(i)], p, eps, cfg.hc_sinkhorn_iters, cfg.hc_eps)) };
 
-        let mixing = std::time::Instant::now();
-        let attn_mix = mixes(h, &ly.hc_attn);
-        let x: Vec<f32> = per_token(t, |i| hc::pre(&h[tok(i)], &pre_mix[i])).concat();
-        crate::profile::add(crate::profile::Part::Mixing, mixing);
-        let x = rmsnorm(&x, &ly.attn_norm, eps);
-        let a = ly.attn.forward(cfg, &x, t, start_pos, states, shared)?;
-        trace(&format!("layer{l:02}.attn_out"), &a);
-        let mixing = std::time::Instant::now();
-        let h1: Vec<f32> = per_token(t, |i| hc::post(&a[i * d..(i + 1) * d], &h[tok(i)], &attn_mix[i])).concat();
+        // A long prompt's experts of this layer are read while its attention runs, until its router has chosen.
+        let experts: &Experts = experts;
+        let n_experts = cfg.n_routed_experts as u32;
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            if t >= crate::moe::PREFETCH_TOKENS {
+                let stop = &stop;
+                scope.spawn(move || experts.prefetch(l as u32, n_experts, stop));
+            }
+            let mixing = std::time::Instant::now();
+            let attn_mix = mixes(h, &ly.hc_attn);
+            let x: Vec<f32> = per_token(t, |i| hc::pre(&h[tok(i)], &pre_mix[i])).concat();
+            crate::profile::add(crate::profile::Part::Mixing, mixing);
+            let x = rmsnorm(&x, &ly.attn_norm, eps);
+            let a = ly.attn.forward(cfg, &x, t, start_pos, states, shared);
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let a = a?;
+            trace(&format!("layer{l:02}.attn_out"), &a);
+            let mixing = std::time::Instant::now();
+            let h1: Vec<f32> = per_token(t, |i| hc::post(&a[i * d..(i + 1) * d], &h[tok(i)], &attn_mix[i])).concat();
 
-        let ffn_mix = mixes(&h1, &ly.hc_ffn);
-        let x: Vec<f32> = per_token(t, |i| hc::pre(&h1[tok(i)], &attn_mix[i].pre)).concat();
-        crate::profile::add(crate::profile::Part::Mixing, mixing);
-        let x = rmsnorm(&x, &ly.ffn_norm, eps);
-        let (m, routes) = ly.moe.forward(cfg, &x, t, experts)?;
-        trace(&format!("layer{l:02}.moe_out"), &m);
-        trace(&format!("layer{l:02}.route_ids"), &routes.iter().flat_map(|r| r.experts.iter().map(|&e| e as f32)).collect::<Vec<_>>());
-        trace(&format!("layer{l:02}.route_w"), &routes.iter().flat_map(|r| r.weights.iter().copied()).collect::<Vec<_>>());
-        let mixing = std::time::Instant::now();
-        let h2: Vec<f32> = per_token(t, |i| hc::post(&m[i * d..(i + 1) * d], &h1[tok(i)], &ffn_mix[i])).concat();
-        crate::profile::add(crate::profile::Part::Mixing, mixing);
-        Ok((h2, ffn_mix.iter().map(|m| m.pre).collect(), routes))
+            let ffn_mix = mixes(&h1, &ly.hc_ffn);
+            let x: Vec<f32> = per_token(t, |i| hc::pre(&h1[tok(i)], &attn_mix[i].pre)).concat();
+            crate::profile::add(crate::profile::Part::Mixing, mixing);
+            let x = rmsnorm(&x, &ly.ffn_norm, eps);
+            let (m, routes) = ly.moe.forward(cfg, &x, t, experts)?;
+            trace(&format!("layer{l:02}.moe_out"), &m);
+            trace(&format!("layer{l:02}.route_ids"), &routes.iter().flat_map(|r| r.experts.iter().map(|&e| e as f32)).collect::<Vec<_>>());
+            trace(&format!("layer{l:02}.route_w"), &routes.iter().flat_map(|r| r.weights.iter().copied()).collect::<Vec<_>>());
+            let mixing = std::time::Instant::now();
+            let h2: Vec<f32> = per_token(t, |i| hc::post(&m[i * d..(i + 1) * d], &h1[tok(i)], &ffn_mix[i])).concat();
+            crate::profile::add(crate::profile::Part::Mixing, mixing);
+            Ok((h2, ffn_mix.iter().map(|m| m.pre).collect(), routes))
+        })
     }
 }
 

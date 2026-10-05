@@ -311,6 +311,13 @@ pub trait ExpertsKernel: Send + Sync {
         panic!("this experts kernel holds no experts")
     }
 
+    /// The order to read a layer's `experts` in before its router has chosen (a prompt's, while its attention runs):
+    /// those it holds left out, the rest most used first. By default all of them, by id.
+    fn prefetch_order(&self, layer: u32, experts: u32) -> Vec<u32> {
+        let _ = layer;
+        (0..experts).collect()
+    }
+
     /// Records a decode step has just read for experts it did not hold: it keeps any used more often than what it
     /// would replace.
     fn offer(&self, layer: u32, records: &[(u32, &[u8])]) {
