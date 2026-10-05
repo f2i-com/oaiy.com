@@ -99,8 +99,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
-/// RoPE in place on `y` (`[p[0].x heads, p[0].y head_dim]`): pair `k` by the sine `w[2k]` and cosine `w[2k + 1]`
-/// (made on the host, as the CPU's rope makes them), the pairs `(2k, 2k + 1)` or with `p[0].z` `(k, k + half)`.
+/// RoPE in place on `y` (`[p[0].w rows, p[0].x heads, p[0].y head_dim]`): row `r`'s pair `k` by the sine
+/// `w[r * hd + 2k]` and cosine `w[r * hd + 2k + 1]` (made on the host, as the CPU's rope makes them), the pairs
+/// `(2k, 2k + 1)` or with `p[0].z` `(k, k + half)`.
 const ROPE: &str = r#"
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -108,21 +109,145 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let hd = p[0].y;
     let half = hd / 2u;
     let i = id.x;
-    if (i >= heads * half) { return; }
-    let h = i / half;
+    if (i >= p[0].w * heads * half) { return; }
+    let r = i / (heads * half);
+    let h = (i / half) % heads;
     let k = i % half;
-    let s = bitcast<f32>(w[2u * k]);
-    let c = bitcast<f32>(w[2u * k + 1u]);
-    var ia = h * hd + 2u * k;
+    let s = bitcast<f32>(w[r * hd + 2u * k]);
+    let c = bitcast<f32>(w[r * hd + 2u * k + 1u]);
+    let base = (r * heads + h) * hd;
+    var ia = base + 2u * k;
     var ib = ia + 1u;
     if (p[0].z != 0u) {
-        ia = h * hd + k;
+        ia = base + k;
         ib = ia + half;
     }
     let a = y[ia];
     let b = y[ib];
     y[ia] = a * c - b * s;
     y[ib] = a * s + b * c;
+}
+"#;
+
+/// `p[1].x` rows of `p[0].x` from `x` into `y`'s rows from `p[0].y`, each `p[0].z` long, at `p[0].w` in it.
+const STORE_ROWS: &str = r#"
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x;
+    let len = p[0].x;
+    if (i < len * p[1].x) {
+        let r = i / len;
+        y[(p[0].y + r) * p[0].z + p[0].w + i % len] = x[i];
+    }
+}
+"#;
+
+/// A prompt's attention over positions split in runs of 256, a workgroup a (query head `h`, run, query `s`): as
+/// [`ATTENTION_PART`] for query `s` at position `past + s`, over positions up to its own and (with a window) its last
+/// `window`; a run past them writes nothing to add. `y`: the output `[rows, n_h, hd]`, then each (query, head, run)'s
+/// `hd` weighted values, then its `m` and `l`. `p[0]`: `n_h`, `n_kv`, `hd`, `past`; `p[1]`: the window (0: none), the
+/// runs, the bits of the scale, the rows.
+const ATTENTION_ROWS_PART: &str = r#"
+var<workgroup> sc: array<f32, 256>;
+var<workgroup> red: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let n_h = p[0].x;
+    let n_kv = p[0].y;
+    let hd = p[0].z;
+    let past = p[0].w;
+    let window = p[1].x;
+    let runs = p[1].y;
+    let scale = bitcast<f32>(p[1].z);
+    let rows = p[1].w;
+    let h = wg.x;
+    let run = wg.y;
+    let s = wg.z;
+    let kh = h / (n_h / n_kv);
+    let kvd = n_kv * hd;
+    let row = 2u * kvd;
+    let hi = past + s + 1u;
+    var lo = 0u;
+    if (window != 0u && hi > window) { lo = hi - window; }
+    let start = run * 256u;
+    let end = min(start + 256u, hi);
+    let qb = (s * n_h + h) * hd;
+    let t = start + li;
+    let live = t >= lo && t < end;
+    var sv = -3.4e38;
+    if (live) {
+        let kb = t * row + kh * hd;
+        var d0 = 0.0;
+        for (var d = 0u; d < hd; d++) { d0 += x[qb + d] * bitcast<f32>(w[kb + d]); }
+        sv = d0 * scale;
+    }
+    red[li] = sv;
+    workgroupBarrier();
+    for (var st = 128u; st > 0u; st /= 2u) {
+        if (li < st) { red[li] = max(red[li], red[li + st]); }
+        workgroupBarrier();
+    }
+    let m = red[0];
+    workgroupBarrier();
+    var e = 0.0;
+    if (live) { e = exp(sv - m); }
+    sc[li] = e;
+    red[li] = e;
+    workgroupBarrier();
+    for (var st = 128u; st > 0u; st /= 2u) {
+        if (li < st) { red[li] += red[li + st]; }
+        workgroupBarrier();
+    }
+    let l = red[0];
+    let unit = (s * n_h + h) * runs + run;
+    let part = rows * n_h * hd + unit * hd;
+    var n = 0u;
+    if (end > start) { n = end - start; }
+    for (var d = li; d < hd; d += 256u) {
+        var acc = 0.0;
+        for (var i = 0u; i < n; i++) { acc += sc[i] * bitcast<f32>(w[(start + i) * row + kvd + kh * hd + d]); }
+        y[part + d] = acc;
+    }
+    if (li == 0u) {
+        let ml = rows * n_h * hd + rows * n_h * runs * hd + unit * 2u;
+        y[ml] = m;
+        y[ml + 1u] = l;
+    }
+}
+"#;
+
+/// The runs of [`ATTENTION_ROWS_PART`] put together, a workgroup a (head, query); a run with nothing (`l` 0) adds
+/// nothing. `p` as for the parts.
+const ATTENTION_ROWS_JOIN: &str = r#"
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let n_h = p[0].x;
+    let hd = p[0].z;
+    let runs = p[1].y;
+    let rows = p[1].w;
+    let h = wg.x;
+    let s = wg.y;
+    let first = (s * n_h + h) * runs;
+    let ml = rows * n_h * hd + rows * n_h * runs * hd + first * 2u;
+    var m = -3.4e38;
+    for (var r = 0u; r < runs; r++) {
+        if (y[ml + r * 2u + 1u] > 0.0) { m = max(m, y[ml + r * 2u]); }
+    }
+    var l = 0.0;
+    for (var r = 0u; r < runs; r++) {
+        let lr = y[ml + r * 2u + 1u];
+        if (lr > 0.0) { l += exp(y[ml + r * 2u] - m) * lr; }
+    }
+    for (var d = li; d < hd; d += 256u) {
+        var acc = 0.0;
+        for (var r = 0u; r < runs; r++) {
+            if (y[ml + r * 2u + 1u] > 0.0) {
+                acc += exp(y[ml + r * 2u] - m) * y[rows * n_h * hd + (first + r) * hd + d];
+            }
+        }
+        y[(s * n_h + h) * hd + d] = acc / l;
+    }
 }
 "#;
 
@@ -281,6 +406,10 @@ impl DeviceChain for WgpuBackend {
         n_h * head_dim + n_h * cap.div_ceil(SPLIT).max(1) * (head_dim + 2)
     }
 
+    fn attention_rows_out_len(&self, rows: usize, n_h: usize, head_dim: usize, kv_len: usize) -> usize {
+        rows * n_h * head_dim + rows * n_h * kv_len.div_ceil(SPLIT).max(1) * (head_dim + 2)
+    }
+
     fn holds(&self, w: &QuantizedTensor) -> bool {
         w.device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).is_some_and(|q| Arc::ptr_eq(&q.gpu, &self.gpu))
     }
@@ -426,10 +555,32 @@ impl ChainRecorder for Recorder<'_> {
         self.dispatch_kept(&pipeline, buffer(fused), buffer(fused), buffer(out), &[ff as u32, rows as u32], ((out.len as u32).div_ceil(256), 1, 1));
     }
 
-    fn rope(&mut self, x: &DeviceVec, heads: usize, head_dim: usize, table: &DeviceVec, neox: bool) {
+    fn rope_rows(&mut self, x: &DeviceVec, rows: usize, heads: usize, head_dim: usize, table: &DeviceVec, neox: bool) {
+        assert!(x.len >= rows * heads * head_dim && table.len >= rows * head_dim, "chain: RoPE of {rows} rows");
         let pipeline = self.named("chain-rope", ROPE);
-        let pairs = (heads * head_dim / 2) as u32;
-        self.dispatch_kept(&pipeline, buffer(table), buffer(table), buffer(x), &[heads as u32, head_dim as u32, neox as u32], (pairs.div_ceil(256), 1, 1));
+        let pairs = (rows * heads * head_dim / 2) as u32;
+        self.dispatch_kept(&pipeline, buffer(table), buffer(table), buffer(x), &[heads as u32, head_dim as u32, neox as u32, rows as u32], (pairs.div_ceil(256), 1, 1));
+    }
+
+    fn store_rows(&mut self, src: &DeviceVec, dst: &DeviceVec, rows: usize, len: usize, start: usize, stride: usize, at: usize) {
+        assert!(src.len >= rows * len && at + len <= stride && dst.len >= (start + rows) * stride, "chain: storing {rows} rows");
+        let pipeline = self.named("chain-store-rows", STORE_ROWS);
+        let params = self.uniform(&[len as u32, start as u32, stride as u32, at as u32, rows as u32]);
+        self.dispatch(&pipeline, buffer(src), buffer(src), buffer(dst), &params, (((rows * len) as u32).div_ceil(256), 1, 1));
+    }
+
+    fn attention_rows(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, past: usize, window: Option<usize>, scale: f32) {
+        let kv_len = past + rows;
+        let runs = kv_len.div_ceil(SPLIT).max(1);
+        assert!(
+            kv.len >= kv_len * 2 * n_kv * head_dim && q.len >= rows * n_h * head_dim && out.len >= rows * n_h * head_dim + rows * n_h * runs * (head_dim + 2),
+            "chain: a prompt's attention's buffers"
+        );
+        let params = self.uniform(&[n_h as u32, n_kv as u32, head_dim as u32, past as u32, window.unwrap_or(0) as u32, runs as u32, scale.to_bits(), rows as u32]);
+        let part = self.named("chain-attention-rows-part", ATTENTION_ROWS_PART);
+        self.dispatch(&part, buffer(kv), buffer(q), buffer(out), &params, (n_h as u32, runs as u32, rows as u32));
+        let join = self.named("chain-attention-rows-join", ATTENTION_ROWS_JOIN);
+        self.dispatch(&join, buffer(kv), buffer(q), buffer(out), &params, (n_h as u32, rows as u32, 1));
     }
 
     fn copy(&mut self, src: &DeviceVec, src_at: usize, dst: &DeviceVec, dst_at: usize, len: usize) {
@@ -617,6 +768,73 @@ mod tests {
             run();
         }
         eprintln!("an add of 3072 in a chain: {:.1} us", t.elapsed().as_secs_f64() / 5.0 / (28.0 * 8.0) * 1e6);
+    }
+
+    /// A prompt's RoPE, its rows stored into a cache, and its causal attention over the cache (with and without a
+    /// window) give the CPU backend's answer: 37 queries after 300 positions (two runs of 256).
+    #[test]
+    fn a_prompts_rope_store_and_attention_match_the_cpus() {
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        let cpu = ggml_rs::CpuBackend::new();
+        let (n_h, n_kv, hd, past, rows) = (8usize, 2usize, 64usize, 300usize, 37usize);
+        let (qd, kvd, cap) = (n_h * hd, n_kv * hd, 512usize);
+        let mut next = rng(91);
+        let ks: Vec<f32> = (0..cap * kvd).map(|_| next()).collect();
+        let vs: Vec<f32> = (0..cap * kvd).map(|_| next()).collect();
+        let q: Vec<f32> = (0..rows * qd).map(|_| next()).collect();
+        let k: Vec<f32> = (0..rows * kvd).map(|_| next()).collect();
+        let v: Vec<f32> = (0..rows * kvd).map(|_| next()).collect();
+        let theta = 10000.0f32;
+        let positions: Vec<u32> = (past..past + rows).map(|p| p as u32).collect();
+        let table: Vec<f32> = positions
+            .iter()
+            .flat_map(|&pos| (0..hd / 2).flat_map(move |j| {
+                let (s, c) = (pos as f32 * theta.powf(-2.0 * j as f32 / hd as f32)).sin_cos();
+                [s, c]
+            }))
+            .collect();
+        for window in [None, Some(100)] {
+            let mut qc = ggml_rs::Tensor::from_vec(q.clone(), vec![rows, n_h, hd]);
+            let mut kc = ggml_rs::Tensor::from_vec(k.clone(), vec![rows, n_kv, hd]);
+            ggml_rs::Backend::rope(&cpu, &mut qc, &positions, hd, ggml_rs::RopeType::NeoX, theta, None);
+            ggml_rs::Backend::rope(&cpu, &mut kc, &positions, hd, ggml_rs::RopeType::NeoX, theta, None);
+            let (mut kcache, mut vcache) = (ks.clone(), vs.clone());
+            kcache[past * kvd..(past + rows) * kvd].copy_from_slice(kc.data());
+            vcache[past * kvd..(past + rows) * kvd].copy_from_slice(&v);
+            let want = ggml_rs::Backend::attention(
+                &cpu,
+                &qc,
+                &ggml_rs::Tensor::from_vec(kcache, vec![cap, n_kv, hd]),
+                &ggml_rs::Tensor::from_vec(vcache, vec![cap, n_kv, hd]),
+                past + rows,
+                0.125,
+                past,
+                window,
+            );
+            let mut interleaved = Vec::with_capacity(cap * 2 * kvd);
+            for t in 0..cap {
+                interleaved.extend_from_slice(&ks[t * kvd..(t + 1) * kvd]);
+                interleaved.extend_from_slice(&vs[t * kvd..(t + 1) * kvd]);
+            }
+            let (qv, kv_, vv, tab, cache) = (b.vec(rows * qd), b.vec(rows * kvd), b.vec(rows * kvd), b.vec(rows * hd), b.vec(cap * 2 * kvd));
+            let out = b.vec(b.attention_rows_out_len(rows, n_h, hd, past + rows));
+            DeviceChain::upload(&b, &qv, &q);
+            DeviceChain::upload(&b, &kv_, &k);
+            DeviceChain::upload(&b, &vv, &v);
+            DeviceChain::upload(&b, &tab, &table);
+            DeviceChain::upload(&b, &cache, &interleaved);
+            let mut rec = b.begin();
+            rec.rope_rows(&qv, rows, n_h, hd, &tab, true);
+            rec.rope_rows(&kv_, rows, n_kv, hd, &tab, true);
+            rec.store_rows(&kv_, &cache, rows, kvd, past, 2 * kvd, 0);
+            rec.store_rows(&vv, &cache, rows, kvd, past, 2 * kvd, kvd);
+            rec.attention_rows(&qv, &cache, &out, rows, n_h, n_kv, hd, past, window, 0.125);
+            rec.read_range(&out, 0, rows * qd);
+            rec.read_range(&cache, past * 2 * kvd, kvd);
+            let got = rec.finish();
+            close(&got[1], &kc.data()[..kvd], "the first stored key");
+            close(&got[0], want.data(), &format!("a prompt's attention, window {window:?}"));
+        }
     }
 
     /// RoPE, a store into a cache and attention over it give the CPU backend's answer (GQA): a few positions in, and

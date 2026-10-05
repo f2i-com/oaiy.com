@@ -41,6 +41,8 @@ pub trait DeviceChain: Send + Sync {
     /// The length [`ChainRecorder::attention`]'s `out` needs for `n_h` heads of `head_dim` over a cache of `cap` rows:
     /// the result and the device's scratch.
     fn attention_out_len(&self, n_h: usize, head_dim: usize, cap: usize) -> usize;
+    /// The length [`ChainRecorder::attention_rows`]'s `out` needs for `rows` queries over `kv_len` positions.
+    fn attention_rows_out_len(&self, rows: usize, n_h: usize, head_dim: usize, kv_len: usize) -> usize;
     /// Start recording.
     fn begin(&self) -> Box<dyn ChainRecorder + '_>;
 }
@@ -73,7 +75,19 @@ pub trait ChainRecorder {
     fn gelu_mul_split_rows(&mut self, fused: &DeviceVec, out: &DeviceVec, rows: usize);
     /// Rotate `x` (`[heads, head_dim]`) in place: pair `k` of each head by `table[2k]` (sine) and `table[2k + 1]`
     /// (cosine), the pairs `(2k, 2k + 1)` or with `neox` `(k, k + head_dim / 2)`.
-    fn rope(&mut self, x: &DeviceVec, heads: usize, head_dim: usize, table: &DeviceVec, neox: bool);
+    fn rope(&mut self, x: &DeviceVec, heads: usize, head_dim: usize, table: &DeviceVec, neox: bool) {
+        self.rope_rows(x, 1, heads, head_dim, table, neox)
+    }
+    /// [`Self::rope`] of each of `rows` rows (`x` `[rows, heads, head_dim]`), row `r` by `table[r * head_dim..]`.
+    fn rope_rows(&mut self, x: &DeviceVec, rows: usize, heads: usize, head_dim: usize, table: &DeviceVec, neox: bool);
+    /// `rows` rows of `len` from `src` into `dst`'s rows `start..start + rows`, a row `stride` long, at `at` in it.
+    #[allow(clippy::too_many_arguments)]
+    fn store_rows(&mut self, src: &DeviceVec, dst: &DeviceVec, rows: usize, len: usize, start: usize, stride: usize, at: usize);
+    /// A prompt's attention: query `s` of `rows` (`q` `[rows, n_h, head_dim]`, at position `past + s`) over the cache
+    /// `kv` (as [`Self::attention`]'s), positions up to its own and, with `window`, its last `window`; `out` the result
+    /// `[rows, n_h, head_dim]` then scratch ([`DeviceChain::attention_rows_out_len`] long).
+    #[allow(clippy::too_many_arguments)]
+    fn attention_rows(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, past: usize, window: Option<usize>, scale: f32);
     /// `dst[offset..offset + src.len] = src`.
     fn store(&mut self, src: &DeviceVec, dst: &DeviceVec, offset: usize) {
         self.copy(src, 0, dst, offset, src.len)

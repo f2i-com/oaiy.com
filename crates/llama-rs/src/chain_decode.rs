@@ -114,6 +114,67 @@ struct ChainState {
     logits: DeviceVec,
 }
 
+/// Room in the device's copy of the cache for `needed` rows (grown to a power of two, its rows kept).
+fn reserve(chain: &dyn ggml_rs::DeviceChain, g: &mut ChainKv, cfg: &ModelConfig, needed: usize) {
+    if g.cap >= needed {
+        return;
+    }
+    let row = 2 * cfg.n_kv_heads * cfg.head_dim;
+    let cap = needed.next_power_of_two().max(256);
+    g.layers = (0..cfg.n_layers)
+        .map(|l| match g.layers.get(l) {
+            Some(old) => chain.resize(old, cap * row),
+            None => chain.vec(cap * row),
+        })
+        .collect();
+    g.out = chain.vec(chain.attention_out_len(cfg.n_heads, cfg.head_dim, cap));
+    g.cap = cap;
+}
+
+/// Bring the device's copy of the cache up to `past` rows: the rows the host wrote since (all of them for a cache the
+/// copy is not of).
+fn sync(chain: &dyn ggml_rs::DeviceChain, g: &mut ChainKv, cfg: &ModelConfig, kv: &KvCache, past: usize) {
+    let (kvd, row) = (cfg.n_kv_heads * cfg.head_dim, 2 * cfg.n_kv_heads * cfg.head_dim);
+    let from = if g.owner == kv.id { kv.dirty_from.min(past) } else { 0 };
+    if from < past {
+        for l in 0..cfg.n_layers {
+            // the host's buffers read in place (a copy of one was its whole capacity: 0.3 s for 512 rows)
+            let (kh, vh) = (kv.k_buffer(l), kv.v_buffer(l));
+            let (kown, vown);
+            let kd = if kh.is_device() { kown = kh.to_host(); kown.data() } else { kh.data() };
+            let vd = if vh.is_device() { vown = vh.to_host(); vown.data() } else { vh.data() };
+            let mut rows = Vec::with_capacity((past - from) * row);
+            for t in from..past {
+                rows.extend_from_slice(&kd[t * kvd..(t + 1) * kvd]);
+                rows.extend_from_slice(&vd[t * kvd..(t + 1) * kvd]);
+            }
+            chain.upload_at(&g.layers[l], from * row, &rows);
+        }
+    }
+    g.owner = kv.id;
+}
+
+/// Each distinct RoPE's sines and cosines for positions `past..past + rows`, `[rows, head_dim]`, as the CPU's rope
+/// makes them.
+fn rope_tables(m: &Dense<'_>, past: usize, rows: usize) -> Vec<Vec<f32>> {
+    let hd = m.cfg.head_dim;
+    m.ropes()
+        .0
+        .iter()
+        .map(|(theta, factors)| {
+            (past..past + rows)
+                .flat_map(|pos| {
+                    (0..hd / 2).flat_map(move |j| {
+                        let factor = factors.map(|f| f[j]).unwrap_or(1.0);
+                        let (s, c) = (pos as f32 * theta.powf(-2.0 * j as f32 / hd as f32) / factor).sin_cos();
+                        [s, c]
+                    })
+                })
+                .collect()
+        })
+        .collect()
+}
+
 fn quant(w: &Weight) -> &QuantizedTensor {
     match w {
         Weight::Quant(q) => q,
@@ -177,11 +238,13 @@ impl ChainDecoder {
             .as_ref()
     }
 
-    /// A prompt's chunk of `tokens`, chained a layer a submit, if the backend can: the last token's logits `[1, vocab]`;
-    /// None leaves it to the model's own path. The residual stream stays on the device; a layer's q, k and v come back
-    /// for the host's RoPE, KV cache and attention, whose output goes up for the rest of the layer and the next one's
-    /// q, k and v. Op by op, every projection's input went up and its output came back, the FFN's too: of a 3B Llama's
-    /// 2,000-token prompt (8.4 s), 3 s on the host making and reading those.
+    /// A prompt's chunk of `tokens`, chained in one submit, if the backend can: the last token's logits `[1, vocab]`;
+    /// None leaves it to the model's own path. Every layer on the device as a decode step's is, its rows at once: RoPE
+    /// from a table of the chunk's positions, the K and V stored into the device's copy of the cache, the causal
+    /// attention over it (Gemma 3's local layers within their window); the logits and the chunk's K and V rows (for
+    /// the host's cache) come back. Op by op, every projection's input went up and its output came back: of a 3B
+    /// Llama's 2,000-token prompt (8.4 s), 3 s on the host making and reading those; a layer a submit with the
+    /// attention on the host, 3.8 s, 2.4 of it the attention.
     pub(crate) fn prompt(&self, backend: &dyn Backend, m: &Dense<'_>, tokens: &[u32], kv: &mut KvCache) -> Option<Tensor> {
         if std::env::var_os("OAIY_NO_CHAIN").is_some() || tokens.len() < 2 {
             return None;
@@ -191,14 +254,26 @@ impl ChainDecoder {
         let cfg = m.cfg;
         let t = tokens.len();
         let (n_h, n_kv, hd, d) = (cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, cfg.embedding_dim);
-        let (qd, kvd) = (n_h * hd, n_kv * hd);
+        let (qd, kvd, row) = (n_h * hd, n_kv * hd, 2 * n_kv * hd);
         let ff = m.common.blocks[0].ffn_pair.ff();
         let past = kv.len;
         let scale = 1.0 / (hd as f32).sqrt();
-        let rope_type = cfg.arch.rope_type();
-        let positions: Vec<u32> = (past..past + t).map(|p| p as u32).collect();
-        let [x, xn, q, k, v, qn, kn, attn, proj, proj_n, gate_up, act] =
-            [t * d, t * d, t * qd, t * kvd, t * kvd, t * qd, t * kvd, t * qd, t * d, t * d, t * 2 * ff, t * ff].map(|len| chain.vec(len));
+        let neox = matches!(cfg.arch.rope_type(), ggml_rs::RopeType::NeoX);
+        let mut g = st.kv.lock().unwrap_or_else(|p| p.into_inner());
+        reserve(chain, &mut g, cfg, past + t);
+        sync(chain, &mut g, cfg, kv, past);
+        let rope_of = m.ropes().1;
+        let tables: Vec<DeviceVec> = rope_tables(m, past, t)
+            .iter()
+            .map(|values| {
+                let table = chain.vec(values.len());
+                chain.upload(&table, values);
+                table
+            })
+            .collect();
+        let [x, xn, q, k, v, qn, kn, proj, proj_n, gate_up, act] =
+            [t * d, t * d, t * qd, t * kvd, t * kvd, t * qd, t * kvd, t * d, t * d, t * 2 * ff, t * ff].map(|len| chain.vec(len));
+        let attn = chain.vec(chain.attention_rows_out_len(t, n_h, hd, past + t));
         let (last, logits) = (chain.vec(d), chain.vec(cfg.vocab_size));
         let emb = backend.embed_lookup(&m.common.tok_embd, tokens, cfg.embedding_dim);
         let mut emb = if emb.is_device() { emb.to_host() } else { emb };
@@ -206,46 +281,27 @@ impl ChainDecoder {
             emb.data_mut().iter_mut().for_each(|e| *e *= s);
         }
         chain.upload(&x, emb.data());
-        // a layer's norm, q, k and v (and their per-head norms), read back
-        let head = |rec: &mut dyn ggml_rs::ChainRecorder, l: usize| {
+        let mut rec = chain.begin();
+        for l in 0..cfg.n_layers {
             let b = &m.common.blocks[l];
             rec.rmsnorm_rows(&x, &st.attn_norms[l], &xn, t, cfg.rms_eps);
             rec.matmul_rows(quant(&b.attn_q), &xn, &q, t);
             rec.matmul_rows(quant(&b.attn_k), &xn, &k, t);
             rec.matmul_rows(quant(&b.attn_v), &xn, &v, t);
-            match &st.qk_norms {
+            let (qq, kk) = match &st.qk_norms {
                 Some(norms) => {
                     rec.rmsnorm_rows(&q, &norms[l].0, &qn, t * n_h, cfg.rms_eps);
                     rec.rmsnorm_rows(&k, &norms[l].1, &kn, t * n_kv, cfg.rms_eps);
-                    rec.read(&qn);
-                    rec.read(&kn);
+                    (&qn, &kn)
                 }
-                None => {
-                    rec.read(&q);
-                    rec.read(&k);
-                }
-            }
-            rec.read(&v);
-        };
-        let mut rec = chain.begin();
-        head(&mut *rec, 0);
-        let mut got = rec.finish();
-        for l in 0..cfg.n_layers {
-            let b = &m.common.blocks[l];
-            let vh = got.pop().expect("v");
-            let kh = got.pop().expect("k");
-            let qh = got.pop().expect("q");
-            let mut qt = Tensor::from_vec(qh, vec![t, n_h, hd]);
-            let mut kt = Tensor::from_vec(kh, vec![t, n_kv, hd]);
-            let vt = Tensor::from_vec(vh, vec![t, n_kv, hd]);
-            let (theta, factors, window) = m.layer(l);
-            ggml_rs::ops::rope_with_factors(backend, &mut qt, &positions, hd, rope_type, theta, factors);
-            ggml_rs::ops::rope_with_factors(backend, &mut kt, &positions, hd, rope_type, theta, factors);
-            kv.append(backend, l, &kt, &vt);
-            let a = ggml_rs::ops::attention_swa(backend, &qt, kv.k_buffer(l), kv.v_buffer(l), kv.len + t, scale, past, window);
-            let a = if a.is_device() { a.to_host() } else { a };
-            chain.upload(&attn, a.data());
-            let mut rec = chain.begin();
+                None => (&q, &k),
+            };
+            let table = &tables[rope_of[l]];
+            rec.rope_rows(qq, t, n_h, hd, table, neox);
+            rec.rope_rows(kk, t, n_kv, hd, table, neox);
+            rec.store_rows(kk, &g.layers[l], t, kvd, past, row, 0);
+            rec.store_rows(&v, &g.layers[l], t, kvd, past, row, kvd);
+            rec.attention_rows(qq, &g.layers[l], &attn, t, n_h, n_kv, hd, past, m.layer(l).2, scale);
             rec.matmul_rows(quant(&b.attn_output), &attn, &proj, t);
             match &st.post_norms {
                 Some(norms) => {
@@ -270,19 +326,28 @@ impl ChainDecoder {
                 }
                 None => rec.add(&x, &proj),
             }
-            if l + 1 < cfg.n_layers {
-                head(&mut *rec, l + 1);
-            } else {
-                // the head of the last token's row only
-                rec.rmsnorm_rows(&x, &st.output_norm, &xn, t, cfg.rms_eps);
-                rec.copy(&xn, (t - 1) * d, &last, 0, d);
-                rec.matmul(quant(&m.common.output), &last, &logits);
-                rec.read(&logits);
+        }
+        // the head of the last token's row only
+        rec.rmsnorm_rows(&x, &st.output_norm, &xn, t, cfg.rms_eps);
+        rec.copy(&xn, (t - 1) * d, &last, 0, d);
+        rec.matmul(quant(&m.common.output), &last, &logits);
+        rec.read(&logits);
+        for l in 0..cfg.n_layers {
+            rec.read_range(&g.layers[l], past * row, t * row);
+        }
+        let mut got = rec.finish().into_iter();
+        let mut out = got.next().expect("the logits");
+        // the chunk's K and V rows into the host's cache too, which the copy already holds
+        for (l, rows) in got.enumerate() {
+            let (mut kh, mut vh) = (Vec::with_capacity(t * kvd), Vec::with_capacity(t * kvd));
+            for r in rows.chunks_exact(row) {
+                kh.extend_from_slice(&r[..kvd]);
+                vh.extend_from_slice(&r[kvd..]);
             }
-            got = rec.finish();
+            kv.append(backend, l, &Tensor::from_vec(kh, vec![t, n_kv, hd]), &Tensor::from_vec(vh, vec![t, n_kv, hd]));
         }
         kv.commit(t);
-        let mut out = got.pop().expect("the logits");
+        kv.dirty_from = usize::MAX;
         if let Some(c) = m.softcap {
             out.iter_mut().for_each(|v| *v = (*v * (1.0 / c)).tanh() * c);
         }
@@ -303,47 +368,12 @@ impl ChainDecoder {
         let past = kv.len;
         let scale = 1.0 / (hd as f32).sqrt();
         let mut g = st.kv.lock().unwrap_or_else(|p| p.into_inner());
-        // room for this step's row
-        if g.cap < past + 1 {
-            let cap = (past + 1).next_power_of_two().max(256);
-            g.layers = (0..cfg.n_layers)
-                .map(|l| match g.layers.get(l) {
-                    Some(old) => chain.resize(old, cap * row),
-                    None => chain.vec(cap * row),
-                })
-                .collect();
-            g.out = chain.vec(chain.attention_out_len(n_h, hd, cap));
-            g.cap = cap;
-        }
-        // the rows the host wrote since (all of them for a cache the copy is not of)
-        let from = if g.owner == kv.id { kv.dirty_from.min(past) } else { 0 };
-        if from < past {
-            for l in 0..cfg.n_layers {
-                // the host's buffers read in place (a copy of one was its whole capacity: 0.3 s for 512 rows)
-                let (kh, vh) = (kv.k_buffer(l), kv.v_buffer(l));
-                let (kown, vown);
-                let kd = if kh.is_device() { kown = kh.to_host(); kown.data() } else { kh.data() };
-                let vd = if vh.is_device() { vown = vh.to_host(); vown.data() } else { vh.data() };
-                let mut rows = Vec::with_capacity((past - from) * row);
-                for t in from..past {
-                    rows.extend_from_slice(&kd[t * kvd..(t + 1) * kvd]);
-                    rows.extend_from_slice(&vd[t * kvd..(t + 1) * kvd]);
-                }
-                chain.upload_at(&g.layers[l], from * row, &rows);
-            }
-        }
-        g.owner = kv.id;
-        // each RoPE's sines and cosines at this position, as the CPU's rope makes them
-        let (ropes, rope_of) = m.ropes();
-        for ((theta, factors), table) in ropes.iter().zip(&st.rope_tables) {
-            let values: Vec<f32> = (0..hd / 2)
-                .flat_map(|j| {
-                    let factor = factors.map(|f| f[j]).unwrap_or(1.0);
-                    let (s, c) = (past as f32 * theta.powf(-2.0 * j as f32 / hd as f32) / factor).sin_cos();
-                    [s, c]
-                })
-                .collect();
-            chain.upload(table, &values);
+        reserve(chain, &mut g, cfg, past + 1);
+        sync(chain, &mut g, cfg, kv, past);
+        // each RoPE's sines and cosines at this position
+        let rope_of = m.ropes().1;
+        for (values, table) in rope_tables(m, past, 1).iter().zip(&st.rope_tables) {
+            chain.upload(table, values);
         }
         let neox = matches!(cfg.arch.rope_type(), ggml_rs::RopeType::NeoX);
         let emb = backend.embed_lookup(&m.common.tok_embd, &[token], cfg.embedding_dim);
