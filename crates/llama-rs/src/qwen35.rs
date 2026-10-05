@@ -216,8 +216,8 @@ impl Qwen35Model {
     }
 
     /// VENDORED-LOCAL: its chained runs' kernels compiled before a first request waits on them: a short prompt and a
-    /// step on a cache of their own, and where it drafts a draft, a check of two rows and its rollback. False where it
-    /// runs no chain.
+    /// step on a cache of their own, and where it drafts a draft, a check of two rows and its rollback; with a second
+    /// device for prompts, a prompt over both. False where it runs no chain.
     pub fn warm_up(&self) -> bool {
         let Ok(tokens) = self.tokenizer.encode("The river town kept its market on the north bank.", false) else { return false };
         if tokens.is_empty() {
@@ -247,6 +247,8 @@ impl Qwen35Model {
                 drop(checked);
             }
         }
+        // with a second device for prompts: its share of the layers made there, and its kernels compiled
+        self.chain.warm_split(self, &tokens);
         self.chain.runs.store(0, std::sync::atomic::Ordering::Relaxed);
         true
     }

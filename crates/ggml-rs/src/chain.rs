@@ -71,6 +71,12 @@ pub trait DeviceChain: Send + Sync {
     fn holds_exl3(&self, w: &dyn crate::exl3::PackedLinear) -> bool;
     /// Whether this device holds a MoE layer's experts as groups [`ChainRecorder::moe_rows`] runs.
     fn holds_experts(&self, e: &dyn crate::exl3::Experts) -> bool;
+    /// A copy of `w`, a weight another device of this one's API holds, here (as that one holds it, read back and put
+    /// here): None where it cannot be (another API's weight, this device's own, or no room for it).
+    fn copy_weight(&self, w: &QuantizedTensor) -> Option<QuantizedTensor> {
+        let _ = w;
+        None
+    }
     /// The length [`ChainRecorder::attention`]'s `out` needs for `n_h` heads of `head_dim` over a cache of `cap` rows:
     /// the result and the device's scratch.
     fn attention_out_len(&self, n_h: usize, head_dim: usize, cap: usize) -> usize;

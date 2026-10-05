@@ -14,7 +14,8 @@
 //! does not pick is undone ([`Qwen35Chain::rollback`]): each delta net's state and conv window as they were before the
 //! check (kept then), its accepted rows run through them again.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use ggml_rs::chain::DeltaNet;
@@ -38,6 +39,12 @@ pub struct Qwen35Chain {
     state: OnceLock<Option<State>>,
     /// Runs the chain took (a step or a prompt's chunk), for a test that has to know it ran.
     pub runs: AtomicUsize,
+    /// A second device for prompts ([`Self::split_onto`]), and its share of their layers, made at the first prompt
+    /// that can use it.
+    second: OnceLock<Arc<dyn Backend>>,
+    split: OnceLock<Option<Split>>,
+    /// Prompts on the first device alone all the same (a test's comparison).
+    pub split_off: AtomicBool,
 }
 
 impl std::fmt::Debug for Qwen35Chain {
@@ -100,6 +107,122 @@ struct Kv {
 struct Pool {
     states: Vec<DeviceVec>,
     convs: Vec<DeviceVec>,
+}
+
+/// A layer's quantized weights a run reads: the model's own (on the first device), or their copies on the second.
+#[derive(Clone, Copy)]
+enum LayerW<'a> {
+    Attention { q: &'a QuantizedTensor, k: &'a QuantizedTensor, v: &'a QuantizedTensor, o: &'a QuantizedTensor, ffn: FfnW<'a>, down: &'a QuantizedTensor },
+    /// `ba` none where the fused beta-alpha projection's weights are f32 (the layer's vectors hold them)
+    Ssm { qkv: &'a QuantizedTensor, gate: &'a QuantizedTensor, ba: Option<&'a QuantizedTensor>, out: &'a QuantizedTensor, ffn: FfnW<'a>, down: &'a QuantizedTensor },
+}
+
+/// An FFN's gate and up projections: fused, or a pair.
+#[derive(Clone, Copy)]
+enum FfnW<'a> {
+    Fused(&'a QuantizedTensor),
+    Split(&'a QuantizedTensor, &'a QuantizedTensor),
+}
+
+impl<'a> LayerW<'a> {
+    /// The model's own block's.
+    fn of(b: &'a Qwen35Block) -> Self {
+        let ffn = |p: &'a FfnPair| match p {
+            FfnPair::Fused(w) => FfnW::Fused(quant(w)),
+            FfnPair::Split { gate, up } => FfnW::Split(quant(gate), quant(up)),
+        };
+        match b {
+            Qwen35Block::Attention { attn_q, attn_k, attn_v, attn_output, ffn_pair, ffn_down, .. } => {
+                LayerW::Attention { q: quant(attn_q), k: quant(attn_k), v: quant(attn_v), o: quant(attn_output), ffn: ffn(ffn_pair), down: quant(ffn_down) }
+            }
+            Qwen35Block::Ssm { attn_qkv, attn_gate, ssm_ba, ssm_out, ffn_pair, ffn_down, .. } => LayerW::Ssm {
+                qkv: quant(attn_qkv),
+                gate: quant(attn_gate),
+                ba: match ssm_ba {
+                    Weight::Quant(q) => Some(q),
+                    _ => None,
+                },
+                out: quant(ssm_out),
+                ffn: ffn(ffn_pair),
+                down: quant(ffn_down),
+            },
+        }
+    }
+}
+
+/// A layer's quantized weights copied to the second device ([`LayerW`]'s, owned).
+enum SplitW {
+    Attention { q: QuantizedTensor, k: QuantizedTensor, v: QuantizedTensor, o: QuantizedTensor, ffn: SplitFfn, down: QuantizedTensor },
+    Ssm { qkv: QuantizedTensor, gate: QuantizedTensor, ba: Option<QuantizedTensor>, out: QuantizedTensor, ffn: SplitFfn, down: QuantizedTensor },
+}
+
+enum SplitFfn {
+    Fused(QuantizedTensor),
+    Split(QuantizedTensor, QuantizedTensor),
+}
+
+impl SplitW {
+    /// `w`'s copies on `chain`'s device: None where one cannot be made there.
+    fn copy(chain: &dyn DeviceChain, w: LayerW<'_>) -> Option<SplitW> {
+        let c = |q: &QuantizedTensor| chain.copy_weight(q);
+        let ffn = |f: FfnW<'_>| -> Option<SplitFfn> {
+            Some(match f {
+                FfnW::Fused(gu) => SplitFfn::Fused(c(gu)?),
+                FfnW::Split(g, u) => SplitFfn::Split(c(g)?, c(u)?),
+            })
+        };
+        Some(match w {
+            LayerW::Attention { q, k, v, o, ffn: f, down } => SplitW::Attention { q: c(q)?, k: c(k)?, v: c(v)?, o: c(o)?, ffn: ffn(f)?, down: c(down)? },
+            LayerW::Ssm { qkv, gate, ba, out, ffn: f, down } => SplitW::Ssm {
+                qkv: c(qkv)?,
+                gate: c(gate)?,
+                ba: match ba {
+                    Some(b) => Some(c(b)?),
+                    None => None,
+                },
+                out: c(out)?,
+                ffn: ffn(f)?,
+                down: c(down)?,
+            },
+        })
+    }
+
+    fn view(&self) -> LayerW<'_> {
+        fn ffn(f: &SplitFfn) -> FfnW<'_> {
+            match f {
+                SplitFfn::Fused(gu) => FfnW::Fused(gu),
+                SplitFfn::Split(g, u) => FfnW::Split(g, u),
+            }
+        }
+        match self {
+            SplitW::Attention { q, k, v, o, ffn: f, down } => LayerW::Attention { q, k, v, o, ffn: ffn(f), down },
+            SplitW::Ssm { qkv, gate, ba, out, ffn: f, down } => LayerW::Ssm { qkv, gate, ba: ba.as_ref(), out, ffn: ffn(f), down },
+        }
+    }
+}
+
+/// The layers from `from` on and the head, copied to a second device for prompts: each chunk's first layers run on
+/// the first device as the second runs the chunk before's last ones (steps and checks run on the first, which holds
+/// every layer).
+struct Split {
+    from: usize,
+    weights: Vec<SplitW>,
+    /// the layers' vectors there, their slots the second's own
+    layers: Vec<LayerVecs>,
+    /// for each of the second's attention slots and recurrent states, the first's
+    attention_slots: Vec<usize>,
+    ssm_slots: Vec<usize>,
+    output_norm: DeviceVec,
+    output: QuantizedTensor,
+    logits: DeviceVec,
+    kv: Mutex<SplitKv>,
+    pool: Pool,
+}
+
+/// The second device's copy of its layers' attention cache: its rows up to `upto` are the cache's (`kv.owner`'s).
+struct SplitKv {
+    kv: Kv,
+    upto: usize,
 }
 
 /// Rows a check of drafted tokens takes at most (the sampled token and its drafts).
@@ -287,8 +410,14 @@ fn reserve(chain: &dyn DeviceChain, g: &mut Kv, s: &Dims, slots: usize, needed: 
 /// Bring the chain's copy of the attention cache up to `past` rows: the rows the host wrote since (all of them for a
 /// cache the copy is not of).
 fn sync(chain: &dyn DeviceChain, g: &mut Kv, s: &Dims, layers: &[usize], kv: &KvCache, past: usize) {
-    let (kvd, row) = (s.n_kv * s.hd, 2 * s.n_kv * s.hd);
     let from = if g.owner == kv.id { kv.dirty_from.min(past) } else { 0 };
+    upload_rows(chain, g, s, layers, kv, from, past);
+    g.owner = kv.id;
+}
+
+/// Rows `from..past` of the host's cache, of `layers` (a buffer of `g`'s each, in turn), into the chain's copy.
+fn upload_rows(chain: &dyn DeviceChain, g: &Kv, s: &Dims, layers: &[usize], kv: &KvCache, from: usize, past: usize) {
+    let (kvd, row) = (s.n_kv * s.hd, 2 * s.n_kv * s.hd);
     if from < past {
         for (slot, &l) in layers.iter().enumerate() {
             let (kh, vh) = (kv.k_buffer(l), kv.v_buffer(l));
@@ -303,7 +432,6 @@ fn sync(chain: &dyn DeviceChain, g: &mut Kv, s: &Dims, layers: &[usize], kv: &Kv
             chain.upload_at(&g.layers[slot], from * row, &rows);
         }
     }
-    g.owner = kv.id;
 }
 
 /// The vector behind a recurrent tensor of the cache, `len` long: the one it aliases, or (a tensor the host put
@@ -328,6 +456,348 @@ fn adopt(chain: &dyn DeviceChain, pool: &mut DeviceVec, slot: &mut Option<Tensor
     }
     *slot = Some(chain.alias(&v, shape));
     v
+}
+
+/// `t`'s values in a vector of `chain`'s.
+fn upload_tensor(chain: &dyn DeviceChain, t: &Tensor) -> DeviceVec {
+    let t = if t.is_device() { t.to_host() } else { t.clone() };
+    let v = chain.vec(t.numel());
+    chain.upload(&v, t.data());
+    v
+}
+
+/// Block `b`'s vectors on `chain`'s device, `slot` its attention cache's buffer or its recurrent state (whichever it
+/// has).
+fn layer_vecs(chain: &dyn DeviceChain, b: &Qwen35Block, slot: usize) -> LayerVecs {
+    let up = |t: &Tensor| upload_tensor(chain, t);
+    match b {
+        Qwen35Block::Attention { attn_norm, attn_q_norm, attn_k_norm, post_norm, .. } => {
+            LayerVecs { attn_norm: up(attn_norm), post_norm: up(post_norm), mixer: Mixer::Attention { q_norm: up(attn_q_norm), k_norm: up(attn_k_norm), slot } }
+        }
+        Qwen35Block::Ssm { attn_norm, ssm_conv1d, ssm_a, ssm_ba, ssm_dt_bias, ssm_norm, post_norm, .. } => {
+            let ba_f32 = match ssm_ba {
+                Weight::Dense(t) => Some(up(t)),
+                _ => None,
+            };
+            LayerVecs {
+                attn_norm: up(attn_norm),
+                post_norm: up(post_norm),
+                mixer: Mixer::Ssm { conv_w: up(ssm_conv1d), a: up(ssm_a), dt: up(ssm_dt_bias), norm: up(ssm_norm), ba_f32, slot },
+            }
+        }
+    }
+}
+
+/// What a run's layers use besides their weights and vectors: the attention cache's copy (a buffer a slot, room for
+/// `cap` rows), each delta net's state and conv window (by slot), the run's vectors, and its attention's output and
+/// scratch.
+struct Bound<'a> {
+    kvl: &'a [DeviceVec],
+    cap: usize,
+    states: &'a [(DeviceVec, DeviceVec)],
+    w: &'a Work,
+    attn: &'a DeviceVec,
+}
+
+/// `layers` of a run of `t` rows at `past`, each its weights and vectors; `added` whether a residual's add is pending
+/// (fused with the norm after it), as it is after them. With `check` (a check of drafts) each delta net's state and
+/// window before it and its inputs are kept, what a rollback starts over from.
+#[allow(clippy::too_many_arguments)]
+fn record_layers<'w>(rec: &mut dyn ggml_rs::ChainRecorder, s: &Dims, eps: f32, layers: impl Iterator<Item = (LayerW<'w>, &'w LayerVecs)>, b: &Bound<'_>, t: usize, past: usize, check: Option<&Spec>, added: &mut bool) {
+    let (kvd, row) = (s.n_kv * s.hd, 2 * s.n_kv * s.hd);
+    let scale = 1.0 / (s.hd as f32).sqrt();
+    let delta = DeltaNet { rows: t, v_heads: s.nv, k_heads: s.nk, k_dim: s.dk, v_dim: s.dv, scale_q: 1.0 / (s.dv as f32).sqrt(), eps, sigmoid_gate: false };
+    let w = b.w;
+    for (lw, lv) in layers {
+        if *added {
+            rec.add_rmsnorm_rows(&w.x, &w.proj, &lv.attn_norm, &w.xn, t, eps);
+        } else {
+            rec.rmsnorm_rows(&w.x, &lv.attn_norm, &w.xn, t, eps);
+        }
+        let (ffn, down) = match (lw, &lv.mixer) {
+            (LayerW::Attention { q, k, v, o, ffn, down }, Mixer::Attention { q_norm, k_norm, slot }) => {
+                let kvl = &b.kvl[*slot];
+                rec.matmul_rows(q, &w.xn, &w.qfull, t);
+                rec.matmul_rows(k, &w.xn, &w.k, t);
+                rec.matmul_rows(v, &w.xn, &w.v, t);
+                // each head's q is its query then its gate
+                rec.copy_cols(&w.qfull, &w.q, t * s.n_h, s.hd, 2 * s.hd, 0);
+                rec.copy_cols(&w.qfull, &w.gate, t * s.n_h, s.hd, 2 * s.hd, s.hd);
+                rec.rmsnorm_rows(&w.q, q_norm, &w.qn, t * s.n_h, eps);
+                rec.rmsnorm_rows(&w.k, k_norm, &w.kn, t * s.n_kv, eps);
+                rec.rope_partial_rows(&w.qn, t, s.n_h, s.hd, s.rot, &w.table);
+                rec.rope_partial_rows(&w.kn, t, s.n_kv, s.hd, s.rot, &w.table);
+                rec.store_rows(&w.kn, kvl, t, kvd, past, row, 0);
+                rec.store_rows(&w.v, kvl, t, kvd, past, row, kvd);
+                if t == 1 {
+                    rec.attention(&w.qn, kvl, b.attn, s.n_h, s.n_kv, s.hd, 0, past + 1, b.cap, scale);
+                } else {
+                    rec.attention_rows(&w.qn, kvl, b.attn, t, s.n_h, s.n_kv, s.hd, past, None, scale);
+                }
+                rec.mul_sigmoid(b.attn, &w.gate, &w.gated, t * s.n_h * s.hd);
+                rec.matmul_rows(o, &w.gated, &w.proj, t);
+                (ffn, down)
+            }
+            (LayerW::Ssm { qkv, gate, ba, out, ffn, down }, Mixer::Ssm { conv_w, a, dt, norm, ba_f32, slot }) => {
+                let (state, conv) = &b.states[*slot];
+                rec.matmul_rows(qkv, &w.xn, &w.qkv, t);
+                rec.matmul_rows(gate, &w.xn, &w.z, t);
+                match (ba_f32, ba) {
+                    (Some(wf), _) => rec.matmul_f32_rows(wf, 2 * s.nv, s.d, &w.xn, &w.ba, t),
+                    (None, Some(q)) => rec.matmul_rows(q, &w.xn, &w.ba, t),
+                    (None, None) => unreachable!("a delta net's beta-alpha projection is f32 or quantized"),
+                }
+                if let Some(sp) = check {
+                    // what a rollback starts over from: the state and window before, the rows' inputs
+                    let (bs, bc) = &sp.backups[*slot];
+                    let (qkv, ba) = &sp.inputs[*slot];
+                    rec.copy(state, 0, bs, 0, state.len);
+                    rec.copy(conv, 0, bc, 0, conv.len);
+                    rec.copy(&w.qkv, 0, qkv, 0, t * s.ch);
+                    rec.copy(&w.ba, 0, ba, 0, t * 2 * s.nv);
+                }
+                rec.ssm_conv(&w.qkv, conv_w, conv, &w.conv, t, s.ch, s.kern);
+                rec.delta_net(&w.conv, &w.z, &w.ba, a, dt, norm, state, &w.core, delta);
+                rec.matmul_rows(out, &w.core, &w.proj, t);
+                (ffn, down)
+            }
+            _ => unreachable!("a layer's vectors are its block's"),
+        };
+        rec.add_rmsnorm_rows(&w.x, &w.proj, &lv.post_norm, &w.xn, t, eps);
+        match ffn {
+            FfnW::Fused(gu) => {
+                rec.matmul_rows(gu, &w.xn, &w.ffa, t);
+                rec.silu_mul_split_rows(&w.ffa, &w.act, t);
+            }
+            FfnW::Split(gate, up) => {
+                rec.matmul_rows(gate, &w.xn, &w.ffa, t);
+                rec.matmul_rows(up, &w.xn, &w.ffb, t);
+                rec.silu_mul(&w.ffa, &w.ffb, &w.act, t * s.ff);
+            }
+        }
+        rec.matmul_rows(down, &w.act, &w.proj, t);
+        *added = true;
+    }
+}
+
+/// A run's K and V rows of layer `l` (`t` of them from `at`, as the chain's copy holds them) into the host's cache.
+fn cache_rows(backend: &dyn Backend, kv: &mut KvCache, l: usize, at: usize, t: usize, rows: &[f32]) {
+    let len = kv.len;
+    kv.len = at;
+    kv.append_rows(backend, l, rows, t);
+    kv.len = len;
+}
+
+/// A split prompt's run ([`Qwen35Chain::forward_split`]): what its chunks share.
+struct SplitRun<'a> {
+    chained: &'a Qwen35Chain,
+    m: &'a Qwen35Model,
+    st: &'a State,
+    sp: &'a Split,
+    chain: &'a dyn DeviceChain,
+    chain1: &'a dyn DeviceChain,
+    emb: &'a [f32],
+    /// each chunk's first row (of the prompt's) and rows; the cache's rows before the prompt
+    chunks: &'a [(usize, usize)],
+    past0: usize,
+    /// the first's copy of the attention cache (its buffers, and rows of room), and the second's of its layers
+    kv0: (&'a [DeviceVec], usize),
+    kv1: (&'a [DeviceVec], usize),
+    states: &'a [(DeviceVec, DeviceVec)],
+    states1: &'a [(DeviceVec, DeviceVec)],
+    /// the first's attention slots of the layers it runs, and the layer of each of the second's slots
+    slots0: Vec<usize>,
+    layers1: &'a [usize],
+    owner: u64,
+    /// Whether the second's recurrent states go up from the first's (else they are zero: a new conversation's)
+    states_up: bool,
+    /// OAIY_SPLIT_LOG: when each step began and ended (ms from the run's start), for the log
+    log: Option<(std::time::Instant, std::cell::RefCell<Vec<String>>)>,
+}
+
+/// A split run's chunk gone to the first device: its recording (its reads the residual stream and the last layer's
+/// output, at the first chunk the second's recurrent states, then the first's layers' K and V rows).
+struct FirstRun<'a> {
+    rec: Box<dyn ggml_rs::ChainRecorder + 'a>,
+    i: usize,
+}
+
+/// A split run's chunk gone to the second device: its recording (its reads the last chunk's logits, the hidden states
+/// where a prediction layer's cache takes them, the second's layers' K and V rows, at the last chunk its recurrent
+/// states).
+struct SecondRun<'a> {
+    rec: Box<dyn ggml_rs::ChainRecorder + 'a>,
+    i: usize,
+}
+
+impl<'a> SplitRun<'a> {
+    /// The time since the run began, ms (for the log).
+    fn now(&self) -> f64 {
+        self.log.as_ref().map_or(0.0, |(t, _)| t.elapsed().as_secs_f64() * 1e3)
+    }
+
+    fn note(&self, what: String) {
+        if let Some((_, l)) = &self.log {
+            l.borrow_mut().push(what);
+        }
+    }
+
+    /// Chunk `i`'s layers before the split's, gone to the first device after the prediction layer's work for the
+    /// chunks whose hidden states are back (`due`).
+    fn first(&self, i: usize, due: &mut Vec<(usize, Vec<f32>)>) -> FirstRun<'a> {
+        let t0 = self.now();
+        let (s, cfg) = (self.st.dims, &self.m.config);
+        let (at, t) = self.chunks[i];
+        let pos = self.past0 + at;
+        let row = 2 * s.n_kv * s.hd;
+        let c = self.chain;
+        let w = Work::new(c, &s, t);
+        let attn = c.vec(c.attention_rows_out_len(t, s.n_h, s.hd, pos + t));
+        c.upload(&w.table, &rope_table(cfg.rope_theta, s.rot, pos, t));
+        c.upload(&w.x, &self.emb[at * s.d..(at + t) * s.d]);
+        let mut rec = c.begin();
+        rec.keep_groups(false);
+        for (j, hidden) in due.drain(..) {
+            self.mtp(&mut *rec, j, &hidden);
+        }
+        let mut added = false;
+        let bound = Bound { kvl: self.kv0.0, cap: self.kv0.1, states: self.states, w: &w, attn: &attn };
+        let from = self.sp.from;
+        record_layers(&mut *rec, &s, cfg.rms_eps, self.m.blocks[..from].iter().map(LayerW::of).zip(&self.st.layers[..from]), &bound, t, pos, None, &mut added);
+        // to the second: the residual stream and the last layer's output (their add fused with its first layer's norm)
+        rec.read(&w.x);
+        rec.read(&w.proj);
+        if i == 0 && self.states_up {
+            for &j in &self.sp.ssm_slots {
+                rec.read(&self.states[j].0);
+                rec.read(&self.states[j].1);
+            }
+        }
+        for &a in &self.slots0 {
+            rec.read_range(&self.kv0.0[a], pos * row, t * row);
+        }
+        rec.flush();
+        self.note(format!("first {i}: recorded {t0:.1}..{:.1}", self.now()));
+        FirstRun { rec, i }
+    }
+
+    /// Chunk `f`'s layers from the split's on and the head, recorded on the second device as the first runs its first
+    /// ones, gone once those have run and their output is up (their K and V rows into the host's cache).
+    fn hand_off(&self, f: FirstRun<'a>, kv: &mut KvCache) -> SecondRun<'a> {
+        let t0 = self.now();
+        let (s, cfg) = (self.st.dims, &self.m.config);
+        let i = f.i;
+        let (at, t) = self.chunks[i];
+        let pos = self.past0 + at;
+        let last = i + 1 == self.chunks.len();
+        let row = 2 * s.n_kv * s.hd;
+        let c = self.chain1;
+        let w = Work::new(c, &s, t);
+        let attn = c.vec(c.attention_rows_out_len(t, s.n_h, s.hd, pos + t));
+        c.upload(&w.table, &rope_table(cfg.rope_theta, s.rot, pos, t));
+        let mut rec = c.begin();
+        rec.keep_groups(false);
+        rec.hold();
+        let mut added = true;
+        let bound = Bound { kvl: self.kv1.0, cap: self.kv1.1, states: self.states1, w: &w, attn: &attn };
+        record_layers(&mut *rec, &s, cfg.rms_eps, self.sp.weights.iter().map(SplitW::view).zip(&self.sp.layers), &bound, t, pos, None, &mut added);
+        rec.add_rmsnorm_rows(&w.x, &w.proj, &self.sp.output_norm, &w.xn, t, cfg.rms_eps);
+        if last {
+            rec.copy(&w.xn, (t - 1) * s.d, &w.last, 0, s.d);
+            rec.matmul(&self.sp.output, &w.last, &self.sp.logits);
+            rec.read(&self.sp.logits);
+        }
+        if self.st.spec.is_some() {
+            rec.read(&w.xn);
+        }
+        for a in 0..self.layers1.len() {
+            rec.read_range(&self.kv1.0[a], pos * row, t * row);
+        }
+        if last {
+            for (state, conv) in self.states1 {
+                rec.read(state);
+                rec.read(conv);
+            }
+        }
+        // the first's part done: its output up, the second's going, then the first's layers' rows into the host's cache
+        let t1 = self.now();
+        let mut got = f.rec.finish().into_iter();
+        let t2 = self.now();
+        c.upload(&w.x, &got.next().expect("the residual stream"));
+        c.upload(&w.proj, &got.next().expect("the last layer's output"));
+        if i == 0 && self.states_up {
+            for (state, conv) in self.states1 {
+                c.upload(state, &got.next().expect("a recurrent state"));
+                c.upload(conv, &got.next().expect("its conv window"));
+            }
+        }
+        rec.flush();
+        let t3 = self.now();
+        for &a in &self.slots0 {
+            cache_rows(&*self.m.backend, kv, self.st.attention_layers[a], pos, t, &got.next().expect("a layer's K and V"));
+        }
+        self.note(format!("hand off {i}: recorded {t0:.1}..{t1:.1}, the first's done {t2:.1}, the second's gone {t3:.1}, stored {:.1}", self.now()));
+        SecondRun { rec, i }
+    }
+
+    /// Chunk `r` done on the second device: its layers' K and V rows into the host's cache and the first's copy, its
+    /// hidden states due for the prediction layer's cache, at the last chunk its logits and the recurrent states back
+    /// on the first.
+    fn finish(&self, r: SecondRun<'a>, kv: &mut KvCache, due: &mut Vec<(usize, Vec<f32>)>, logits: &mut Option<Vec<f32>>) {
+        let s = self.st.dims;
+        let (at, t) = self.chunks[r.i];
+        let pos = self.past0 + at;
+        let last = r.i + 1 == self.chunks.len();
+        let row = 2 * s.n_kv * s.hd;
+        let t0 = self.now();
+        let mut got = r.rec.finish().into_iter();
+        let t1 = self.now();
+        if last {
+            *logits = got.next();
+        }
+        if self.st.spec.is_some() {
+            due.push((r.i, got.next().expect("the hidden states")));
+        }
+        for (k, &l) in self.layers1.iter().enumerate() {
+            let rows = got.next().expect("a layer's K and V");
+            self.chain.upload_at(&self.kv0.0[self.sp.attention_slots[k]], pos * row, &rows);
+            cache_rows(&*self.m.backend, kv, l, pos, t, &rows);
+        }
+        if last {
+            for &j in &self.sp.ssm_slots {
+                self.chain.upload(&self.states[j].0, &got.next().expect("a recurrent state"));
+                self.chain.upload(&self.states[j].1, &got.next().expect("its conv window"));
+            }
+        }
+        self.note(format!("finish {}: waited {t0:.1}..{t1:.1}, stored {:.1}", r.i, self.now()));
+    }
+
+    /// The prediction layer's cache at chunk `j` (its hidden states after the output norm back from the second), and
+    /// the chunk's last hidden state kept: as a run on the first device alone does.
+    fn mtp(&self, rec: &mut dyn ggml_rs::ChainRecorder, j: usize, hidden: &[f32]) {
+        let Some(spec) = &self.st.spec else { return };
+        let s = self.st.dims;
+        let (at, t) = self.chunks[j];
+        let pos = self.past0 + at;
+        let hv = self.chain.vec(t * s.d);
+        self.chain.upload(&hv, hidden);
+        if t > 1 {
+            self.chained.mtp_prompt(self.m, self.st, spec, self.chain, rec, &self.emb[at * s.d..(at + t) * s.d], &hv, t, pos, self.owner);
+        }
+        rec.copy(&hv, (t - 1) * s.d, &spec.hid, 0, s.d);
+        *spec.hid_at.lock().unwrap_or_else(|p| p.into_inner()) = (pos + t - 1, 1);
+    }
+
+    /// The prediction layer's work for the chunks `due`, on the first device (which has run its last chunk), gone.
+    fn mtp_only(&self, due: &mut Vec<(usize, Vec<f32>)>) -> Box<dyn ggml_rs::ChainRecorder + 'a> {
+        let mut rec = self.chain.begin();
+        rec.keep_groups(false);
+        for (j, hidden) in due.drain(..) {
+            self.mtp(&mut *rec, j, &hidden);
+        }
+        rec.flush();
+        rec
+    }
 }
 
 /// A chained run gone to the GPU: its recording (its reads the logits, then each attention layer's rows), and where
@@ -405,39 +875,25 @@ impl Qwen35Chain {
                         return None;
                     }
                 }
-                let upload = |t: &Tensor| {
-                    let t = if t.is_device() { t.to_host() } else { t.clone() };
-                    let v = chain.vec(t.numel());
-                    chain.upload(&v, t.data());
-                    v
-                };
+                let upload = |t: &Tensor| upload_tensor(chain, t);
                 let dims = Dims { d, n_h, n_kv, hd, rot: cfg.rope_dim, ff, nv, nk, dk, dv, ch, kern: sc.conv_kernel, vocab: cfg.vocab_size };
                 let (mut attention_layers, mut ssm_layers) = (Vec::new(), Vec::new());
                 let layers = m
                     .blocks
                     .iter()
                     .enumerate()
-                    .map(|(l, b)| match b {
-                        Qwen35Block::Attention { attn_norm, attn_q_norm, attn_k_norm, post_norm, .. } => {
-                            attention_layers.push(l);
-                            LayerVecs {
-                                attn_norm: upload(attn_norm),
-                                post_norm: upload(post_norm),
-                                mixer: Mixer::Attention { q_norm: upload(attn_q_norm), k_norm: upload(attn_k_norm), slot: attention_layers.len() - 1 },
+                    .map(|(l, b)| {
+                        let slot = match b {
+                            Qwen35Block::Attention { .. } => {
+                                attention_layers.push(l);
+                                attention_layers.len() - 1
                             }
-                        }
-                        Qwen35Block::Ssm { attn_norm, ssm_conv1d, ssm_a, ssm_ba, ssm_dt_bias, ssm_norm, post_norm, .. } => {
-                            ssm_layers.push(l);
-                            let ba_f32 = match ssm_ba {
-                                Weight::Dense(t) => Some(upload(t)),
-                                _ => None,
-                            };
-                            LayerVecs {
-                                attn_norm: upload(attn_norm),
-                                post_norm: upload(post_norm),
-                                mixer: Mixer::Ssm { conv_w: upload(ssm_conv1d), a: upload(ssm_a), dt: upload(ssm_dt_bias), norm: upload(ssm_norm), ba_f32, slot: ssm_layers.len() - 1 },
+                            Qwen35Block::Ssm { .. } => {
+                                ssm_layers.push(l);
+                                ssm_layers.len() - 1
                             }
-                        }
+                        };
+                        layer_vecs(chain, b, slot)
                     })
                     .collect();
                 let pool = Pool {
@@ -531,23 +987,218 @@ impl Qwen35Chain {
             embeds.data()
         };
         let s = st.dims;
+        // the chunks: each as many rows as the attention's scratch has room for over the positions they reach
+        let mut chunks = Vec::new();
+        let mut at = 0;
+        while at < rows {
+            let runs = (kv.len + at + rows).div_ceil(256).max(1);
+            let per_row = (s.n_h * runs * (s.hd + 2) + s.n_h * s.hd) * 4;
+            let t = (ATTENTION_SCRATCH / per_row).clamp(1, MAX_ROWS).min(rows - at);
+            chunks.push((at, t));
+            at += t;
+        }
+        if chunks.len() > 1 {
+            if let (Some(sp), Some(chain1)) = (self.split(m, st), self.second.get().and_then(|b| b.chain())) {
+                return Some(self.forward_split(m, st, sp, chain, chain1, emb, &chunks, kv));
+            }
+        }
         let backend: &dyn Backend = &*m.backend;
         // each chunk recorded and gone to the GPU as the chunk before runs, the chunk before's rows read back and
         // into the host's cache as this one runs
         let mut pending: Option<Qwen35Run<'_>> = None;
-        let mut at = 0;
-        while at < rows {
-            // a chunk's rows, as many as the attention's scratch has room for over the positions they reach
-            let runs = (kv.len + rows).div_ceil(256).max(1);
-            let per_row = (s.n_h * runs * (s.hd + 2) + s.n_h * s.hd) * 4;
-            let t = (ATTENTION_SCRATCH / per_row).clamp(1, MAX_ROWS).min(rows - at);
+        for &(at, t) in &chunks {
             let run = self.run_begin(m, st, chain, &emb[at * s.d..(at + t) * s.d], t, kv, false);
             if let Some(p) = pending.replace(run) {
                 p.finish(backend, kv);
             }
-            at += t;
         }
         pending.map(|p| p.finish(backend, kv).pop().expect("the logits"))
+    }
+
+    /// A second device for prompts: a prompt's chunks run over both ([`Self::forward`]), the layers from the middle
+    /// on and the head copied there at the first prompt that can use them (steps and checks stay on the model's own).
+    pub fn split_onto(&self, backend: Arc<dyn Backend>) {
+        let _ = self.second.set(backend);
+    }
+
+    /// The second device's share of a prompt's layers, made at the first prompt that can use it: None where there
+    /// is no second device, no room on it for them, or prompts are not split (`split_off`, OAIY_NO_SPLIT).
+    fn split(&self, m: &Qwen35Model, st: &State) -> Option<&Split> {
+        if self.split_off.load(Ordering::Relaxed) || std::env::var_os("OAIY_NO_SPLIT").is_some() {
+            return None;
+        }
+        self.split
+            .get_or_init(|| {
+                let chain = self.second.get()?.chain()?;
+                let s = st.dims;
+                let n = m.blocks.len();
+                // half the layers on each, unless asked otherwise (OAIY_SPLIT_AT: the second's first layer)
+                let from = std::env::var("OAIY_SPLIT_AT").ok().and_then(|v| v.parse().ok()).unwrap_or(n / 2);
+                if from == 0 || from >= n {
+                    return None;
+                }
+                let output = chain.copy_weight(quant(&m.output))?;
+                let weights = m.blocks[from..].iter().map(|b| SplitW::copy(chain, LayerW::of(b))).collect::<Option<Vec<_>>>()?;
+                let (mut attention_slots, mut ssm_slots) = (Vec::new(), Vec::new());
+                let layers = (from..n)
+                    .map(|l| {
+                        let slot = match &st.layers[l].mixer {
+                            Mixer::Attention { slot, .. } => {
+                                attention_slots.push(*slot);
+                                attention_slots.len() - 1
+                            }
+                            Mixer::Ssm { slot, .. } => {
+                                ssm_slots.push(*slot);
+                                ssm_slots.len() - 1
+                            }
+                        };
+                        layer_vecs(chain, &m.blocks[l], slot)
+                    })
+                    .collect();
+                let pool = Pool { states: ssm_slots.iter().map(|_| chain.vec(s.nv * s.dk * s.dv)).collect(), convs: ssm_slots.iter().map(|_| chain.vec((s.kern - 1) * s.ch)).collect() };
+                Some(Split {
+                    from,
+                    weights,
+                    layers,
+                    attention_slots,
+                    ssm_slots,
+                    output_norm: upload_tensor(chain, &m.output_norm),
+                    output,
+                    logits: chain.vec(s.vocab),
+                    kv: Mutex::new(SplitKv { kv: Kv { layers: Vec::new(), cap: 0, out: chain.vec(1), owner: 0 }, upto: 0 }),
+                    pool,
+                })
+            })
+            .as_ref()
+    }
+
+    /// The second device's share of a prompt's layers made (their weights copied there) and its kernels compiled: a
+    /// prompt of two chunks over both devices, on a cache of its own (`tokens` repeated). False where prompts do not
+    /// split.
+    pub(crate) fn warm_split(&self, m: &Qwen35Model, tokens: &[u32]) -> bool {
+        let (Some(st), Some(chain)) = (self.state(m), m.backend.chain()) else { return false };
+        let (Some(sp), Some(chain1)) = (self.split(m, st), self.second.get().and_then(|b| b.chain())) else { return false };
+        let rows = 2 * 64;
+        let tokens: Vec<u32> = tokens.iter().copied().cycle().take(rows).collect();
+        if tokens.len() < rows {
+            return false;
+        }
+        let e = m.embed_text(&tokens).to_host();
+        let mut kv = KvCache::new(&*m.backend, m.config.n_layers, rows + 16, m.config.n_kv_heads, m.config.head_dim);
+        self.forward_split(m, st, sp, chain, chain1, e.data(), &[(0, 64), (64, 64)], &mut kv);
+        true
+    }
+
+    /// Rows of `kv` from `past` on written on the first device alone (a step, a check, a prompt there): the second's
+    /// copy of its layers' cache holds the cache's up to there at most (and none the host wrote since).
+    fn split_written(&self, kv: &KvCache, past: usize) {
+        if let Some(Some(sp)) = self.split.get() {
+            let mut g1 = sp.kv.lock().unwrap_or_else(|p| p.into_inner());
+            if g1.kv.owner == kv.id {
+                g1.upto = g1.upto.min(kv.dirty_from).min(past);
+            }
+        }
+    }
+
+    /// [`Self::forward`]'s `chunks` (each its first row of the prompt's and its rows) over two devices: each chunk's
+    /// layers before the split's on the first as the second runs the chunk before's from there on, and the head. The
+    /// second's copy of its layers' attention cache is brought up to the prompt first, and its recurrent states are
+    /// the first's (read back at the first chunk's handoff), the first's again after (steps run there); its layers'
+    /// K and V rows go into the host's cache and the first's copy. With a prediction layer each chunk's hidden states
+    /// come back to the first for the layer's cache. The last chunk's logits.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_split(&self, m: &Qwen35Model, st: &State, sp: &Split, chain: &dyn DeviceChain, chain1: &dyn DeviceChain, emb: &[f32], chunks: &[(usize, usize)], kv: &mut KvCache) -> Tensor {
+        let s = st.dims;
+        let past0 = kv.len;
+        let end = past0 + chunks.iter().map(|c| c.1).sum::<usize>();
+        // the first's copy of the cache (every layer's) up to the prompt, and room for all of it
+        let mut g = st.kv.lock().unwrap_or_else(|p| p.into_inner());
+        reserve(chain, &mut g, &s, st.attention_layers.len(), end);
+        sync(chain, &mut g, &s, &st.attention_layers, kv, past0);
+        // the second's, of its layers: the rows it lacks (the host's since, and those the first wrote)
+        let mut g1 = sp.kv.lock().unwrap_or_else(|p| p.into_inner());
+        let layers1: Vec<usize> = sp.attention_slots.iter().map(|&a| st.attention_layers[a]).collect();
+        reserve(chain1, &mut g1.kv, &s, layers1.len(), end);
+        let from1 = if g1.kv.owner == kv.id { g1.upto.min(kv.dirty_from).min(past0) } else { 0 };
+        upload_rows(chain1, &g1.kv, &s, &layers1, kv, from1, past0);
+        g1.kv.owner = kv.id;
+        kv.dirty_from = usize::MAX;
+        // the recurrent states the cache holds, as the first's vectors; the second's sent up from them, or zero for a
+        // new conversation's
+        let fresh = sp.ssm_slots.iter().all(|&j| kv.ssm_state[st.ssm_layers[j]].is_none() && kv.ssm_conv[st.ssm_layers[j]].is_none());
+        let mut pool = st.pool.lock().unwrap_or_else(|p| p.into_inner());
+        let states: Vec<(DeviceVec, DeviceVec)> = st
+            .ssm_layers
+            .iter()
+            .enumerate()
+            .map(|(i, &l)| (adopt(chain, &mut pool.states[i], &mut kv.ssm_state[l], vec![s.nv, s.dv, s.dk]), adopt(chain, &mut pool.convs[i], &mut kv.ssm_conv[l], vec![s.kern - 1, s.ch])))
+            .collect();
+        drop(pool);
+        let states1: Vec<(DeviceVec, DeviceVec)> = sp.pool.states.iter().cloned().zip(sp.pool.convs.iter().cloned()).collect();
+        if fresh {
+            for (state, conv) in &states1 {
+                chain1.zero(state);
+                chain1.zero(conv);
+            }
+        }
+        let n = chunks.len();
+        let mut logits = None;
+        {
+            let run = SplitRun {
+                chained: self,
+                m,
+                st,
+                sp,
+                chain,
+                chain1,
+                emb,
+                chunks,
+                past0,
+                kv0: (&g.layers, g.cap),
+                kv1: (&g1.kv.layers, g1.kv.cap),
+                states: &states,
+                states1: &states1,
+                slots0: (0..st.attention_layers.len()).filter(|&a| st.attention_layers[a] < sp.from).collect(),
+                layers1: &layers1,
+                owner: kv.id,
+                states_up: !fresh,
+                log: std::env::var_os("OAIY_SPLIT_LOG").map(|_| (std::time::Instant::now(), Default::default())),
+            };
+            // each chunk's first layers gone as the first runs the chunk before's, whose last ones then go to the
+            // second as it runs the one before that
+            let (mut firsts, mut seconds) = (VecDeque::new(), VecDeque::new());
+            // the chunks whose hidden states are back for the prediction layer's cache, and its work on the first
+            // after that one's last chunk
+            let mut due = Vec::new();
+            let mut tail = Vec::new();
+            for i in 0..n {
+                firsts.push_back(run.first(i, &mut due));
+                if i >= 1 {
+                    seconds.push_back(run.hand_off(firsts.pop_front().expect("a chunk"), kv));
+                }
+                if i >= 2 {
+                    run.finish(seconds.pop_front().expect("a chunk"), kv, &mut due, &mut logits);
+                }
+            }
+            seconds.push_back(run.hand_off(firsts.pop_front().expect("a chunk"), kv));
+            while let Some(r) = seconds.pop_front() {
+                run.finish(r, kv, &mut due, &mut logits);
+                if !due.is_empty() {
+                    tail.push(run.mtp_only(&mut due));
+                }
+            }
+            for r in tail {
+                r.finish();
+            }
+            if let Some((t, l)) = &run.log {
+                eprintln!("split run of {n} chunks, {:.1} ms:\n  {}", t.elapsed().as_secs_f64() * 1e3, l.borrow().join("\n  "));
+            }
+        }
+        g1.upto = end;
+        kv.len = end;
+        kv.dirty_from = usize::MAX;
+        self.runs.fetch_add(n, Ordering::Relaxed);
+        Tensor::from_vec(logits.expect("the last chunk's logits"), vec![1, s.vocab])
     }
 
     /// Whether the chain drafts and checks tokens (the model's multi-token-prediction layer on the device).
@@ -610,11 +1261,10 @@ impl Qwen35Chain {
     fn run_begin<'a>(&self, m: &Qwen35Model, st: &State, chain: &'a dyn DeviceChain, emb: &[f32], t: usize, kv: &mut KvCache, checking: bool) -> Qwen35Run<'a> {
         let s = st.dims;
         let cfg = &m.config;
-        let (kvd, row) = (s.n_kv * s.hd, 2 * s.n_kv * s.hd);
+        let row = 2 * s.n_kv * s.hd;
         let past = kv.len;
         let eps = cfg.rms_eps;
-        let scale = 1.0 / (s.hd as f32).sqrt();
-        let delta = DeltaNet { rows: t, v_heads: s.nv, k_heads: s.nk, k_dim: s.dk, v_dim: s.dv, scale_q: 1.0 / (s.dv as f32).sqrt(), eps, sigmoid_gate: false };
+        self.split_written(kv, past);
         let mut g = st.kv.lock().unwrap_or_else(|p| p.into_inner());
         reserve(chain, &mut g, &s, st.attention_layers.len(), past + t);
         sync(chain, &mut g, &s, &st.attention_layers, kv, past);
@@ -642,75 +1292,9 @@ impl Qwen35Chain {
         rec.keep_groups(t == 1);
         // each residual's add waits for the norm after it (the next layer's, or the output's): one dispatch for both
         let mut added = false;
-        for (l, (b, lv)) in m.blocks.iter().zip(&st.layers).enumerate() {
-            if added {
-                rec.add_rmsnorm_rows(&w.x, &w.proj, &lv.attn_norm, &w.xn, t, eps);
-            } else {
-                rec.rmsnorm_rows(&w.x, &lv.attn_norm, &w.xn, t, eps);
-            }
-            let (ffn_pair, ffn_down) = match (b, &lv.mixer) {
-                (Qwen35Block::Attention { attn_q, attn_k, attn_v, attn_output, ffn_pair, ffn_down, .. }, Mixer::Attention { q_norm, k_norm, slot }) => {
-                    let kvl = &g.layers[*slot];
-                    rec.matmul_rows(quant(attn_q), &w.xn, &w.qfull, t);
-                    rec.matmul_rows(quant(attn_k), &w.xn, &w.k, t);
-                    rec.matmul_rows(quant(attn_v), &w.xn, &w.v, t);
-                    // each head's q is its query then its gate
-                    rec.copy_cols(&w.qfull, &w.q, t * s.n_h, s.hd, 2 * s.hd, 0);
-                    rec.copy_cols(&w.qfull, &w.gate, t * s.n_h, s.hd, 2 * s.hd, s.hd);
-                    rec.rmsnorm_rows(&w.q, q_norm, &w.qn, t * s.n_h, eps);
-                    rec.rmsnorm_rows(&w.k, k_norm, &w.kn, t * s.n_kv, eps);
-                    rec.rope_partial_rows(&w.qn, t, s.n_h, s.hd, s.rot, &w.table);
-                    rec.rope_partial_rows(&w.kn, t, s.n_kv, s.hd, s.rot, &w.table);
-                    rec.store_rows(&w.kn, kvl, t, kvd, past, row, 0);
-                    rec.store_rows(&w.v, kvl, t, kvd, past, row, kvd);
-                    if t == 1 {
-                        rec.attention(&w.qn, kvl, &attn, s.n_h, s.n_kv, s.hd, 0, past + 1, g.cap, scale);
-                    } else {
-                        rec.attention_rows(&w.qn, kvl, &attn, t, s.n_h, s.n_kv, s.hd, past, None, scale);
-                    }
-                    rec.mul_sigmoid(&attn, &w.gate, &w.gated, t * s.n_h * s.hd);
-                    rec.matmul_rows(quant(attn_output), &w.gated, &w.proj, t);
-                    (ffn_pair, ffn_down)
-                }
-                (Qwen35Block::Ssm { attn_qkv, attn_gate, ssm_ba, ssm_out, ffn_pair, ffn_down, .. }, Mixer::Ssm { conv_w, a, dt, norm, ba_f32, slot }) => {
-                    let (state, conv) = &states[*slot];
-                    rec.matmul_rows(quant(attn_qkv), &w.xn, &w.qkv, t);
-                    rec.matmul_rows(quant(attn_gate), &w.xn, &w.z, t);
-                    match ba_f32 {
-                        Some(wf) => rec.matmul_f32_rows(wf, 2 * s.nv, s.d, &w.xn, &w.ba, t),
-                        None => rec.matmul_rows(quant(ssm_ba), &w.xn, &w.ba, t),
-                    }
-                    if let (true, Some(sp)) = (checking, &st.spec) {
-                        // what a rollback starts over from: the state and window before, the rows' inputs
-                        let (bs, bc) = &sp.backups[*slot];
-                        let (qkv, ba) = &sp.inputs[*slot];
-                        rec.copy(state, 0, bs, 0, state.len);
-                        rec.copy(conv, 0, bc, 0, conv.len);
-                        rec.copy(&w.qkv, 0, qkv, 0, t * s.ch);
-                        rec.copy(&w.ba, 0, ba, 0, t * 2 * s.nv);
-                    }
-                    rec.ssm_conv(&w.qkv, conv_w, conv, &w.conv, t, s.ch, s.kern);
-                    rec.delta_net(&w.conv, &w.z, &w.ba, a, dt, norm, state, &w.core, delta);
-                    rec.matmul_rows(quant(ssm_out), &w.core, &w.proj, t);
-                    (ffn_pair, ffn_down)
-                }
-                _ => unreachable!("layer {l}'s vectors are its block's"),
-            };
-            rec.add_rmsnorm_rows(&w.x, &w.proj, &lv.post_norm, &w.xn, t, eps);
-            match ffn_pair {
-                FfnPair::Fused(gu) => {
-                    rec.matmul_rows(quant(gu), &w.xn, &w.ffa, t);
-                    rec.silu_mul_split_rows(&w.ffa, &w.act, t);
-                }
-                FfnPair::Split { gate, up } => {
-                    rec.matmul_rows(quant(gate), &w.xn, &w.ffa, t);
-                    rec.matmul_rows(quant(up), &w.xn, &w.ffb, t);
-                    rec.silu_mul(&w.ffa, &w.ffb, &w.act, t * s.ff);
-                }
-            }
-            rec.matmul_rows(quant(ffn_down), &w.act, &w.proj, t);
-            added = true;
-        }
+        let bound = Bound { kvl: &g.layers, cap: g.cap, states: &states, w, attn: &attn };
+        let check = if checking { st.spec.as_ref() } else { None };
+        record_layers(&mut *rec, &s, eps, m.blocks.iter().map(LayerW::of).zip(&st.layers), &bound, t, past, check, &mut added);
         // the head of the last row only, or of a check's every row; with a prediction layer, the hidden states after the
         // output norm kept (a check's rows, or the last), and a prompt's chunk through the layer too (its cache)
         if added {
@@ -720,11 +1304,12 @@ impl Qwen35Chain {
         }
         if let Some(sp) = &st.spec {
             let rows = if checking { t } else { 1 };
-            rec.copy(&w.xn, (t - rows) * s.d, &sp.hid, 0, rows * s.d);
-            *sp.hid_at.lock().unwrap_or_else(|p| p.into_inner()) = (past + t - rows, rows);
+            // (the layer's cache first: a chunk's carries on from the hidden state the run before kept)
             if !checking && t > 1 {
                 self.mtp_prompt(m, st, sp, chain, &mut *rec, emb, &w.xn, t, past, kv.id);
             }
+            rec.copy(&w.xn, (t - rows) * s.d, &sp.hid, 0, rows * s.d);
+            *sp.hid_at.lock().unwrap_or_else(|p| p.into_inner()) = (past + t - rows, rows);
         }
         if checking {
             let sp = st.spec.as_ref().expect("a check is a drafting chain's");
@@ -753,14 +1338,18 @@ impl Qwen35Chain {
     /// The prediction layer's cache at a prompt's chunk (`t` rows at `past`, its embeddings `emb`, its hidden states
     /// after the output norm `hidden`): its entries for the chunk's positions but the last (whose next token the chunk
     /// does not have), each from the row's hidden state and the next row's token, where its entries run unbroken from
-    /// the cache's start up to the chunk (else its entries start over at the chunk).
+    /// the cache's start up to the chunk (else its entries start over at the chunk). Where they run up to the position
+    /// before it, and the run before kept its hidden state there (the chunk before's last row), that position's entry
+    /// too: its next token is the chunk's first.
     #[allow(clippy::too_many_arguments)]
     fn mtp_prompt(&self, m: &Qwen35Model, st: &State, sp: &Spec, chain: &dyn DeviceChain, rec: &mut dyn ggml_rs::ChainRecorder, emb: &[f32], hidden: &DeviceVec, t: usize, past: usize, owner: u64) {
         let s = st.dims;
         let mtp = m.mtp.as_ref().expect("a drafting chain's model has its layer");
         let mut g = sp.kv.lock().unwrap_or_else(|p| p.into_inner());
         mtp_reserve(chain, &mut g, &s, past + t);
-        if g.owner != owner || g.valid != past || g.start != 0 {
+        let (hid_at, hid_rows) = *sp.hid_at.lock().unwrap_or_else(|p| p.into_inner());
+        let carry = past > 0 && g.owner == owner && g.start == 0 && g.valid + 1 == past && hid_rows > 0 && hid_at + hid_rows == past;
+        if !carry && (g.owner != owner || g.valid != past || g.start != 0) {
             // a chunk's attention reaches back to the cache's start: entries from 0, or none
             if past != 0 {
                 g.owner = 0;
@@ -770,26 +1359,47 @@ impl Qwen35Chain {
             g.start = 0;
         }
         g.owner = owner;
-        let rows = t - 1;
+        let lead = usize::from(carry);
+        let rows = t - 1 + lead;
         if rows == 0 {
             return;
         }
-        // the next tokens' embeddings and the hidden states, rows 0..t - 1, in a prompt's own vectors
+        let at = past - lead;
+        // the next tokens' embeddings and the hidden states (the kept one carried, then the chunk's rows but its last),
+        // in a prompt's own vectors
         let v = |n: usize| chain.vec(n);
         let (e, en, hn, cat, x, xn) = (v(rows * s.d), v(rows * s.d), v(rows * s.d), v(rows * 2 * s.d), v(rows * s.d), v(rows * s.d));
-        chain.upload(&e, &emb[s.d..t * s.d]);
+        chain.upload(&e, &emb[(1 - lead) * s.d..t * s.d]);
         let eps = m.config.rms_eps;
+        let hid = if carry {
+            let h = v(rows * s.d);
+            rec.copy(&sp.hid, (hid_rows - 1) * s.d, &h, 0, s.d);
+            rec.copy(hidden, 0, &h, s.d, (t - 1) * s.d);
+            h
+        } else {
+            first(hidden, rows * s.d)
+        };
         rec.rmsnorm_rows(&e, &sp.enorm, &en, rows, eps);
-        rec.rmsnorm_rows(&first(hidden, rows * s.d), &sp.hnorm, &hn, rows, eps);
+        rec.rmsnorm_rows(&hid, &sp.hnorm, &hn, rows, eps);
         for r in 0..rows {
             rec.copy(&en, r * s.d, &cat, r * 2 * s.d, s.d);
             rec.copy(&hn, r * s.d, &cat, r * 2 * s.d + s.d, s.d);
         }
         rec.matmul_rows(quant(&mtp.eh_proj), &cat, &x, rows);
-        let w = MtpRows { x, xn, qfull: v(rows * s.n_h * 2 * s.hd), q: v(rows * s.n_h * s.hd), gate: v(rows * s.n_h * s.hd), k: v(rows * s.n_kv * s.hd), vv: v(rows * s.n_kv * s.hd), qn: v(rows * s.n_h * s.hd), kn: v(rows * s.n_kv * s.hd), att: v(chain.attention_rows_out_len(rows, s.n_h, s.hd, past + rows)), gated: v(rows * s.n_h * s.hd), proj: v(rows * s.d), ffa: v(rows * 2 * s.ff), ffb: v(rows * s.ff), act: v(rows * s.ff), table: v(rows * s.rot) };
-        chain.upload(&w.table, &rope_table(m.config.rope_theta, s.rot, past, rows));
-        mtp_block(m, mtp, sp, &s, rec, &g, &w, rows, past, None);
-        g.valid = past + rows;
+        // its K and V into its cache (as its block makes them: the rest of the block, whose output nothing reads
+        // here, not run)
+        let Qwen35Block::Attention { attn_k, attn_v, .. } = &mtp.block else { unreachable!("the prediction layer attends") };
+        let (kvd, row) = (s.n_kv * s.hd, 2 * s.n_kv * s.hd);
+        let (k, vv, kn, table) = (v(rows * kvd), v(rows * kvd), v(rows * kvd), v(rows * s.rot));
+        chain.upload(&table, &rope_table(m.config.rope_theta, s.rot, at, rows));
+        rec.rmsnorm_rows(&x, &sp.attn_norm, &xn, rows, eps);
+        rec.matmul_rows(quant(attn_k), &xn, &k, rows);
+        rec.matmul_rows(quant(attn_v), &xn, &vv, rows);
+        rec.rmsnorm_rows(&k, &sp.k_norm, &kn, rows * s.n_kv, eps);
+        rec.rope_partial_rows(&kn, rows, s.n_kv, s.hd, s.rot, &table);
+        rec.store_rows(&kn, &g.layer, rows, kvd, at, row, 0);
+        rec.store_rows(&vv, &g.layer, rows, kvd, at, row, kvd);
+        g.valid = at + rows;
     }
 
     /// Draft up to `k` tokens after `next` (the token sampled for position `kv.len`): the prediction layer's entries

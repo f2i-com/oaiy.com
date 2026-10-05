@@ -2086,8 +2086,12 @@ impl DeviceChain for WgpuBackend {
         w.device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).is_some_and(|q| Arc::ptr_eq(&q.gpu, &self.gpu))
     }
 
+    fn copy_weight(&self, w: &QuantizedTensor) -> Option<QuantizedTensor> {
+        WgpuBackend::copy_weight(self, w)
+    }
+
     fn begin(&self) -> Box<dyn ChainRecorder + '_> {
-        Box::new(Recorder { backend: self, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None })
+        Box::new(Recorder { backend: self, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None })
     }
 }
 
@@ -2208,7 +2212,7 @@ impl<'a> Recorder<'a> {
     /// A recording on `backend`, its bind groups kept (the crate's own measurements record kernels directly).
     #[cfg(test)]
     pub(crate) fn new(backend: &'a WgpuBackend) -> Self {
-        Recorder { backend, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None }
+        Recorder { backend, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None }
     }
 }
 
@@ -2240,6 +2244,9 @@ pub(crate) struct Recorder<'a> {
     keep: bool,
     /// The scratch it took from the GPU's pool ([`Recorder::scratch`]), given back when it has run.
     pooled: Vec<(u64, wgpu::Buffer)>,
+    /// Of that, what nothing recorded after reads (an input's f16 or int8 rows once the input is written): taken
+    /// again before the pool's (a prompt's 27B chunk made 256 f16 copies, 3.6 GB held to its end).
+    spare: Vec<(u64, wgpu::Buffer)>,
     /// Inputs of several rows quantized to int8 for the int8 kernels so far (the vector, its rows and width, the int8
     /// rows): each quantized once for the matmuls that read it, until something writes it.
     q8: Vec<(wgpu::Buffer, usize, usize, DeviceVec)>,
@@ -2304,6 +2311,10 @@ impl Recorder<'_> {
     /// recording has run, so nothing may keep it. Its values are whatever it last held.
     pub(crate) fn scratch(&mut self, len: usize) -> DeviceVec {
         let bytes = ((len.max(1) * 4) as u64).next_power_of_two().max(256);
+        if let Some(i) = self.spare.iter().position(|(b, _)| *b == bytes) {
+            let (_, b) = self.spare.swap_remove(i);
+            return DeviceVec { len, inner: Arc::new(b) };
+        }
         let b = self.gpu().pooled(bytes);
         self.pooled.push((bytes, b.clone()));
         DeviceVec { len, inner: Arc::new(b) }
@@ -2339,11 +2350,20 @@ impl Recorder<'_> {
     /// A dispatch whose bind group is the same every step (its buffers and parameters): made once and kept.
     /// `b` written by what was just recorded: its int8 rows (if quantized) are stale.
     fn wrote(&mut self, b: &wgpu::Buffer) {
+        let spare = &mut self.spare;
+        let mut stale = |(x, _, _, v): &(wgpu::Buffer, usize, usize, DeviceVec)| {
+            if x != b {
+                return true;
+            }
+            // what read its rows is recorded: the scratch may be written again (wgpu orders the two)
+            spare.push((buffer(v).size(), buffer(v).clone()));
+            false
+        };
         if !self.q8.is_empty() {
-            self.q8.retain(|(x, ..)| x != b);
+            self.q8.retain(&mut stale);
         }
         if !self.x16.is_empty() {
-            self.x16.retain(|(x, ..)| x != b);
+            self.x16.retain(&mut stale);
         }
     }
 
@@ -4287,6 +4307,19 @@ fn main() {
         }
     }
 
+    /// How fast the host's bytes go up to each card and come back (`--ignored --nocapture`).
+    #[test]
+    #[ignore = "a measurement"]
+    fn measure_transfer_rates() {
+        let Ok(b) = WgpuBackend::new(None) else { return };
+        let others = b.others(None);
+        for g in std::iter::once(&b).chain(&others) {
+            let (up, down) = g.transfer_rates();
+            let (again_up, again_down) = g.transfer_rates();
+            eprintln!("{} at {}: up {up:.1} and {again_up:.1} GB/s, down {down:.1} and {again_down:.1} GB/s", g.adapter().name, g.adapter().pci_bus_id);
+        }
+    }
+
     /// What a dispatch costs of itself (`--ignored --nocapture`): 1,000 copies of 256 values, each reading what the
     /// last wrote (a barrier between each two), and each into a vector of its own.
     #[test]
@@ -4620,7 +4653,7 @@ fn main() {
         for m in [1usize, 2, 3, 4] {
             let (x, y, y8) = (b.vec(m * k), b.vec(m * n), b.vec(m * n));
             DeviceChain::upload(&b, &x, &(0..m * k).map(|_| next()).collect::<Vec<_>>());
-            let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None };
+            let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None };
             assert!(rq.matmul_rows_q8(w, &x, &y8, m));
             rq.read(&y8);
             let got = Box::new(rq).finish().pop().unwrap();
@@ -4636,7 +4669,7 @@ fn main() {
             let reps = 28;
             let time = |q8: bool| {
                 let run = || {
-                    let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None };
+                    let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None };
                     for i in 0..reps {
                         let w = &ws[i % ws.len()];
                         if q8 {
@@ -4782,7 +4815,7 @@ fn main() {
                 let pipeline = b.gpu.named_pipeline(Box::leak(format!("test-rb-{dtype:?}-{r}-{ks}").into_boxed_str()), || src);
                 let reps = 32;
                 let run = || {
-                    let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None };
+                    let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None };
                     for i in 0..reps {
                         let q = ws[i % ws.len()].device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).unwrap();
                         for (chunk, row0, rows) in &q.chunks {
@@ -4842,7 +4875,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) n
             let pipeline = b.gpu.named_pipeline(name, || body);
             let groups = 170 * 16;
             let run = || {
-                let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None };
+                let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None };
                 for _ in 0..8 {
                     rq.dispatch_kept(&pipeline, buffer(&src), buffer(&src), buffer(&out), &[(len / 4) as u32], (groups, 1, 1));
                 }

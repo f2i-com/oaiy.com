@@ -942,6 +942,23 @@ impl Models {
         let backend: Arc<dyn ggml_rs::Backend> = Arc::clone(&picked.backend);
         let gguf = gguf::GgufFile::open(&path).map_err(|e| Error::Arg(e.to_string()))?;
         if gguf.get_str("general.architecture").ok() == Some("qwen35") {
+            // With a second GPU, a prompt's later layers go to it (copies of their weights and the head): each
+            // chunk's first layers run on one as the other runs the chunk before's. The card the host's bytes reach
+            // faster carries the model (it moves the more: the cache's rows, the steps), the other the later layers.
+            #[allow(unused_mut)]
+            let (mut backend, mut helper): (Arc<dyn ggml_rs::Backend>, Option<Arc<dyn ggml_rs::Backend>>) = (backend, None);
+            #[cfg(feature = "webgpu")]
+            if let Some(b) = backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>().filter(|_| std::env::var_os("OAIY_NO_SPLIT").is_none()) {
+                if let Some(other) = b.others(o.webgpu_gb.map(|g| g << 30)).into_iter().next() {
+                    let (mine, theirs) = (b.transfer_rates().0, other.transfer_rates().0);
+                    let (bus, other_bus) = (b.adapter().pci_bus_id.clone(), other.adapter().pci_bus_id.clone());
+                    let other: Arc<dyn ggml_rs::Backend> = Arc::new(other);
+                    let swap = theirs > mine * 1.2;
+                    let (main_at, main_rate, helper_at, helper_rate) = if swap { (other_bus, theirs, bus, mine) } else { (bus, mine, other_bus, theirs) };
+                    self.say(format!("{}: the GPU at {main_at} carries it ({main_rate:.0} GB/s from the host), the one at {helper_at} a prompt's later layers ({helper_rate:.0} GB/s)", spec.name));
+                    helper = Some(if swap { std::mem::replace(&mut backend, other) } else { other });
+                }
+            }
             let mut model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).map_err(|e| Error::Arg(e.to_string()))?;
             // Its multi-token-prediction layer, where asked for: it drafts tokens a chained run checks.
             if o.mtp.contains(&spec.name) {
@@ -955,6 +972,9 @@ impl Models {
                         Err(e) => self.say(format!("{}: its multi-token-prediction layer did not load ({e})", spec.name)),
                     }
                 }
+            }
+            if let (llama_rs::Model::Qwen35(m), Some(h)) = (&model, helper) {
+                m.chain.split_onto(h);
             }
             // its chained runs' kernels compiled before the first request waits on them
             if let llama_rs::Model::Qwen35(m) = &model {
@@ -2335,6 +2355,83 @@ mod dense_webgpu_timing {
                 for (name, ms, c) in k.iter().take(16) {
                     eprintln!("    {name:<28} {ms:>8.2} ms ({c} dispatches)");
                 }
+            }
+        }
+    }
+
+    /// A Qwen3.5 hybrid's prompt over two GPUs (its later layers and head copied to the second, each chunk's first
+    /// layers run as the second runs the chunk before's) answers as on the first alone: 2,148 tokens (QWEN35_MODEL),
+    /// the last logits, 8 steps after and drafts with its MTP layer bit for bit, a second prompt after them too (the
+    /// second's copy of the cache brought up to the steps the first ran), and how long each takes.
+    #[test]
+    #[ignore = "needs two WebGPU adapters and a Qwen3.5 GGUF (QWEN35_MODEL); run with --nocapture"]
+    fn a_qwen35_prompt_over_two_gpus_answers_as_on_one() {
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+        let path = std::env::var("QWEN35_MODEL").unwrap_or_else(|_| r"E:\models\Qwen3.8-27B-Q3_K_M.gguf".into());
+        let Ok(b0) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
+        let Some(b1) = b0.others(None).into_iter().next() else { return };
+        // (QWEN35_SWAP: the other GPU first)
+        let (b0, b1) = if std::env::var_os("QWEN35_SWAP").is_some() { (b1, b0) } else { (b0, b1) };
+        let (w0, w1) = (Arc::new(b0), Arc::new(b1));
+        let backend: Arc<dyn ggml_rs::Backend> = w0.clone();
+        let gguf = gguf::GgufFile::open(&path).unwrap();
+        let mut model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap();
+        if let llama_rs::Model::Qwen35(m) = &mut model {
+            m.mtp = m.load_mtp(&gguf).unwrap();
+        }
+        let llama_rs::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
+        m.chain.split_onto(w1.clone());
+        let gib = |b: &ggml_rs_wgpu::WgpuBackend| b.memory_budget().map_or("?".to_string(), |(budget, used)| format!("{:.1} of {:.1} GiB", used as f64 / (1u64 << 30) as f64, budget as f64 / (1u64 << 30) as f64));
+        let warm = std::time::Instant::now();
+        assert!(m.warm_up());
+        eprintln!("warmed up (the second's layers copied) in {:.1} s", warm.elapsed().as_secs_f64());
+        let tokens: Vec<u32> = (0..2148u32).map(|i| 1000 + (i * 7919) % 20000).collect();
+        let more: Vec<u32> = (0..1100u32).map(|i| 1500 + (i * 104729) % 30000).collect();
+        let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+        let mut results = Vec::new();
+        // (QWEN35_ROUNDS, QWEN35_STEPS: how many rounds, and steps after each prompt)
+        let rounds: usize = std::env::var("QWEN35_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+        let steps: usize = std::env::var("QWEN35_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+        for round in 0..rounds {
+            for split in [false, true] {
+                m.chain.split_off.store(!split, Ordering::Relaxed);
+                let mut kv = model.new_kv_cache(8192);
+                let mut out = Vec::new();
+                let mut history = Vec::new();
+                for (turn, prompt) in [&tokens, &more].into_iter().enumerate() {
+                    let t = std::time::Instant::now();
+                    let e = m.embed_text(prompt).to_host();
+                    let last = m.forward_embeds_positions(&e, prompt.len(), &mut kv, None).unwrap().to_host();
+                    let secs = t.elapsed().as_secs_f64();
+                    eprintln!("round {round}, {}, turn {turn}: {} tokens in {:.0} ms ({:.0} tokens a second); memory {} and {}", if split { "two GPUs" } else { "one" }, prompt.len(), secs * 1e3, prompt.len() as f64 / secs, gib(&w0), gib(&w1));
+                    if ggml_rs_wgpu::profile::chain_on() {
+                        for (name, ms, n) in ggml_rs_wgpu::profile::take_kernels().into_iter().take(10) {
+                            eprintln!("    {name}: {ms:.1} ms ({n})");
+                        }
+                    }
+                    history.extend_from_slice(prompt);
+                    out.push(bits(last.data()));
+                    let mut next = argmax(last.data());
+                    for _ in 0..steps {
+                        history.push(next);
+                        let drafts = m.draft(&kv, &history[history.len() - 8..], 3).unwrap_or_default();
+                        out.push(drafts.clone());
+                        let e = m.embed_text(&[next]);
+                        let l = m.forward_embeds_positions(&e, 1, &mut kv, None).unwrap().to_host();
+                        next = argmax(l.data());
+                        out.push(bits(l.data()));
+                    }
+                }
+                results.push((out, kv.len));
+            }
+        }
+        m.chain.split_off.store(false, Ordering::Relaxed);
+        for pair in results.chunks(2) {
+            assert_eq!(pair[0].1, pair[1].1, "the same rows in the caches");
+            for (i, (a, b)) in pair[0].0.iter().zip(&pair[1].0).enumerate() {
+                assert!(a == b, "result {i} (logits or drafts) bit for bit");
             }
         }
     }

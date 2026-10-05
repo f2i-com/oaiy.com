@@ -15,5 +15,7 @@ half        = { version = "2.4" }
 rayon       = "1.10"
 # a chain's reads copied out as bytes
 bytemuck    = "1.16"
+# Vulkan's memory budget (VK_EXT_memory_budget), through wgpu's own instance (its version, so its types)
+ash         = "0.38"
 
 [dev-dependencies]

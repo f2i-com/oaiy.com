@@ -96,6 +96,31 @@ fn device_memory(adapter: &wgpu::Adapter) -> Option<u64> {
     }
 }
 
+/// Vulkan's budget for this process on the adapter's largest device-local heap (VK_EXT_memory_budget: what the OS
+/// lets it keep there, the rest of the computer's use of the card taken off) and its use of it now. None on other
+/// APIs.
+fn heap_budget(adapter: &wgpu::Adapter) -> Option<(u64, u64)> {
+    #[cfg(any(windows, target_os = "linux"))]
+    {
+        // SAFETY: the adapter's handles are only read, by a query that creates and frees nothing.
+        let a = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }?;
+        let instance = a.shared_instance().raw_instance();
+        let mut budget = ash::vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        let heaps = {
+            let mut props = ash::vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+            unsafe { instance.get_physical_device_memory_properties2(a.raw_physical_device(), &mut props) };
+            props.memory_properties
+        };
+        let n = (heaps.memory_heap_count as usize).min(heaps.memory_heaps.len());
+        (0..n).filter(|&i| heaps.memory_heaps[i].flags.contains(ash::vk::MemoryHeapFlags::DEVICE_LOCAL)).map(|i| (budget.heap_budget[i], budget.heap_usage[i])).max_by_key(|&(b, _)| b)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = adapter;
+        None
+    }
+}
+
 /// The weights a discrete card with `memory` bytes holds by default: all but 4 GiB (the cache, the work buffers and
 /// the rest of the computer's use of it), or half of a card under 8 GiB.
 fn discrete_budget(memory: u64) -> u64 {
@@ -508,13 +533,15 @@ pub struct WgpuBackend {
     summary: AdapterSummary,
     /// One projection at a time: the dispatch and read-back share the queue (EXL3 weights hold it too).
     serial: Arc<Mutex<()>>,
+    /// The adapter it was opened on (its memory budget asked of it).
+    raw_adapter: wgpu::Adapter,
 }
 
 /// Another handle on the same adapter (its device, its budget's count and its lock shared): what a model's parts keep
 /// to record chains of their own (an expert group).
 impl Clone for WgpuBackend {
     fn clone(&self) -> Self {
-        Self { cpu: CpuBackend::new(), gpu: Arc::clone(&self.gpu), budget: self.budget, used: Arc::clone(&self.used), summary: self.summary.clone(), serial: Arc::clone(&self.serial) }
+        Self { cpu: CpuBackend::new(), gpu: Arc::clone(&self.gpu), budget: self.budget, used: Arc::clone(&self.used), summary: self.summary.clone(), serial: Arc::clone(&self.serial), raw_adapter: self.raw_adapter.clone() }
     }
 }
 
@@ -701,6 +728,7 @@ impl WgpuBackend {
             used: Arc::new(AtomicU64::new(0)),
             summary,
             serial: Arc::new(Mutex::new(())),
+            raw_adapter: adapter,
         })
     }
 
@@ -708,9 +736,62 @@ impl WgpuBackend {
         &self.summary
     }
 
+    /// How fast the host's bytes go up to the card and come back (GB/s each, timed on 64 MB three times): a card on
+    /// fewer PCIe lanes is the slower (Qwen3.8 27B's prompts over two cards put the one that moves more on the faster).
+    pub fn transfer_rates(&self) -> (f64, f64) {
+        let len = 64usize << 20;
+        let data = vec![0u8; len];
+        let buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("oaiy-transfer-probe"),
+            size: len as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let up = || {
+            self.gpu.queue.write_buffer(&buf, 0, &data);
+            let i = self.gpu.queue.submit([]);
+            let _ = self.gpu.device.poll(wgpu::PollType::Wait { submission_index: Some(i), timeout: None });
+        };
+        up();
+        let _ = self.gpu.read(&buf, len as u64);
+        let t = std::time::Instant::now();
+        for _ in 0..3 {
+            up();
+        }
+        let up_rate = 3.0 * len as f64 / t.elapsed().as_secs_f64() / 1e9;
+        let t = std::time::Instant::now();
+        for _ in 0..3 {
+            let _ = self.gpu.read(&buf, len as u64);
+        }
+        (up_rate, 3.0 * len as f64 / t.elapsed().as_secs_f64() / 1e9)
+    }
+
+    /// The OS's budget for this process on the card's memory, and its use of it now (Vulkan's): None where the API
+    /// does not say.
+    pub fn memory_budget(&self) -> Option<(u64, u64)> {
+        heap_budget(&self.raw_adapter)
+    }
+
     /// Bytes of weights placed on the GPU, and the budget.
     pub fn usage(&self) -> (u64, u64) {
         (self.used.load(Ordering::Relaxed), self.budget)
+    }
+
+    /// [`ggml_rs::DeviceChain::copy_weight`]: `w`'s buffers as another adapter holds them (blocks padded alike) read
+    /// back and put on this one, within its budget.
+    pub(crate) fn copy_weight(&self, w: &QuantizedTensor) -> Option<QuantizedTensor> {
+        let q = w.device_storage()?.as_any().downcast_ref::<WgpuQuant>()?;
+        if Arc::ptr_eq(&q.gpu, &self.gpu) {
+            return None;
+        }
+        let prev = self.used.fetch_add(q.nbytes as u64, Ordering::Relaxed);
+        if prev + q.nbytes as u64 > self.budget {
+            self.used.fetch_sub(q.nbytes as u64, Ordering::Relaxed);
+            return None;
+        }
+        let chunks = self.gpu.upload_rows(&q.gpu_bytes(), q.row_bytes, 1);
+        let storage = WgpuQuant { gpu: Arc::clone(&self.gpu), dtype: q.dtype, chunks, row_bytes: q.row_bytes, nbytes: q.nbytes, used: Arc::clone(&self.used) };
+        Some(QuantizedTensor::from_device(Box::new(storage), w.shape().to_vec()))
     }
 
     /// Whether `dtype` has a GPU kernel.
