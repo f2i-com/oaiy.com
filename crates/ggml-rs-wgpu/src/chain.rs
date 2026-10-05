@@ -1106,24 +1106,26 @@ mod tests {
                 *v = ((next() + 1.0) * 100.0) as u8;
             }
             let w = ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(raw, vec![n, k], dtype));
-            let (x, y) = (b.vec(k), b.vec(n));
-            DeviceChain::upload(&b, &x, &(0..k).map(|_| next()).collect::<Vec<_>>());
-            let reps = 28;
-            let run = || {
-                let mut rec = b.begin();
-                for _ in 0..reps {
-                    rec.matmul(&w, &x, &y);
-                }
-                rec.read_range(&y, 0, 1);
-                rec.finish();
-            };
-            run();
-            let t = std::time::Instant::now();
-            for _ in 0..5 {
+            for m in [1usize, 2, 3, 4] {
+                let (x, y) = (b.vec(m * k), b.vec(m * n));
+                DeviceChain::upload(&b, &x, &(0..m * k).map(|_| next()).collect::<Vec<_>>());
+                let reps = 28;
+                let run = || {
+                    let mut rec = b.begin();
+                    for _ in 0..reps {
+                        rec.matmul_rows(&w, &x, &y, m);
+                    }
+                    rec.read_range(&y, 0, 1);
+                    rec.finish();
+                };
                 run();
+                let t = std::time::Instant::now();
+                for _ in 0..5 {
+                    run();
+                }
+                let secs = t.elapsed().as_secs_f64() / 5.0 / reps as f64;
+                eprintln!("{dtype:?} [{n}, {k}] ({:.1} MB) x {m} rows: {:.1} us a matmul in a chain, {:.0} GB/s", nbytes as f64 / 1e6, secs * 1e6, nbytes as f64 / secs / 1e9);
             }
-            let secs = t.elapsed().as_secs_f64() / 5.0 / reps as f64;
-            eprintln!("{dtype:?} [{n}, {k}] ({:.1} MB): {:.1} us a matmul in a chain, {:.0} GB/s", nbytes as f64 / 1e6, secs * 1e6, nbytes as f64 / secs / 1e9);
         }
         let (a, c) = (b.vec(3072), b.vec(3072));
         let run = || {
