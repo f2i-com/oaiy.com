@@ -500,6 +500,54 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+/// [`ATTENTION_COOP`] for QSA's queries past its dense span ([`ChainRecorder::qsa_attention`] of a prompt's rows): every
+/// position up to the query's own on the tensor cores, those of a block the query did not keep left out (its blocks
+/// of `p._pad0` positions, a bit each in `mask`, `p._pad1` words a query: its incomplete tail block's always in).
+fn attention_coop_masked(hd: usize) -> String {
+    attention_coop(hd)
+        .replace("@group(0) @binding(2) var<storage, read_write> y: array<f32>;", "@group(0) @binding(2) var<storage, read> mask: array<u32>;\n@group(0) @binding(6) var<storage, read_write> y: array<f32>;")
+        .replace("@group(0) @binding(3) var<uniform> p: Params;", "@group(0) @binding(8) var<uniform> p: Params;\n\n// whether query `row` (at `qpos`) attends to position `kp`: its tail block's, or a block it kept\nfn kept(row: u32, qpos: u32, kp: u32) -> bool {\n    let b = kp / p._pad0;\n    if (b >= (qpos + 1u) / p._pad0) { return true; }\n    return ((mask[row * p._pad1 + b / 32u] >> (b % 32u)) & 1u) == 1u;\n}")
+        .replace("if (kp <= qpos && kp < p.kv_len) {", "if (kp <= qpos && kp < p.kv_len && kept(q0 + tr, qpos, kp)) {")
+}
+
+/// QSA's kept blocks of each query (`list`: `keep` a query, ascending, its first `min(visible, keep)` its own) as a
+/// bitmask (`mask`: `p[0].z` words a query), a thread a word: its blocks found in the list by bisection. `p[0]`: the
+/// queries, keep, words a query, the first query's position; `p[1].x`: the positions a block.
+const QSA_MASK: &str = r#"
+@group(0) @binding(0) var<storage, read> list: array<u32>;
+@group(0) @binding(6) var<storage, read_write> mask: array<u32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let rows = p[0].x;
+    let keep = p[0].y;
+    let mw = p[0].z;
+    let first = p[0].w;
+    let ratio = p[1].x;
+    let i = id.x + id.y * 65535u * 256u;
+    if (i >= rows * mw) { return; }
+    let r = i / mw;
+    let w = i % mw;
+    let count = min((first + r + 1u) / ratio, keep);
+    let base = r * keep;
+    // the first kept block at or past 32 w
+    var lo = 0u;
+    var hi = count;
+    while (lo < hi) {
+        let mid = (lo + hi) / 2u;
+        if (list[base + mid] < 32u * w) { lo = mid + 1u; } else { hi = mid; }
+    }
+    var bits = 0u;
+    for (var j = lo; j < count; j++) {
+        let b = list[base + j];
+        if (b >= 32u * w + 32u) { break; }
+        bits |= 1u << (b - 32u * w);
+    }
+    mask[i] = bits;
+}
+"#;
+
 /// The runs of [`ATTENTION_ROWS_PART`] put together, a workgroup a (head, query); a run with nothing (`l` 0) adds
 /// nothing. `p` as for the parts.
 const ATTENTION_ROWS_JOIN: &str = r#"
@@ -2380,13 +2428,25 @@ impl Recorder<'_> {
         }
         let kv_len = past + rows;
         let (qs, row) = (n_h * head_dim, 2 * n_kv * head_dim);
-        let (rp, kp) = (rows.div_ceil(32) * 32, kv_len.div_ceil(32) * 32);
+        let rp = rows.div_ceil(32) * 32;
         // the padding's rows are stored past the output, in its scratch (at least as long: 16 rows or more)
         assert!(
             kv.len >= kv_len * row && q.len >= rows * qs && out.len >= rp * qs && out.len >= self.backend.attention_rows_out_len(rows, n_h, head_dim, kv_len),
             "chain: a prompt's attention's buffers"
         );
-        // the f16 copies: one pair a recording, grown as it needs (each attention's converted as it runs)
+        let (q16, kv16) = self.attention_f16(q, kv, rows, kv_len, qs, row);
+        let pipeline = self.gpu().named_pipeline(name, || attention_coop(head_dim));
+        let words = [n_h as u32, n_kv as u32, past as u32, rows as u32, kv_len as u32, scale.to_bits(), 0, 0];
+        self.dispatch_kept(&pipeline, buffer(&kv16), buffer(&q16), buffer(out), &words, (n_h as u32, (rows.div_ceil(32)) as u32, 1));
+        self.att16 = Some((q16, kv16));
+        true
+    }
+
+    /// A prompt's queries (`rows` of `qs`) and its cache's rows (`kv_len` of `row`) as f16 for the tensor cores'
+    /// attention, each padded to 32 (the copies one pair a recording, grown as it needs: each attention's converted
+    /// as it runs; put back in `att16` once used).
+    fn attention_f16(&mut self, q: &DeviceVec, kv: &DeviceVec, rows: usize, kv_len: usize, qs: usize, row: usize) -> (DeviceVec, DeviceVec) {
+        let (rp, kp) = (rows.div_ceil(32) * 32, kv_len.div_ceil(32) * 32);
         let (q16, kv16) = match self.att16.take() {
             Some((a, b)) if a.len >= rp * qs / 2 && b.len >= kp * row / 2 => (a, b),
             _ => (self.scratch(rp * qs / 2), self.scratch(kp * row / 2)),
@@ -2397,9 +2457,57 @@ impl Recorder<'_> {
             let groups = ((padded * width / 2) as u32).div_ceil(256);
             self.dispatch_kept(&conv, &d, buffer(src), buffer(dst), &[width as u32, n as u32, padded as u32], (groups.min(65535), groups.div_ceil(65535), 1));
         }
-        let pipeline = self.gpu().named_pipeline(name, || attention_coop(head_dim));
-        let words = [n_h as u32, n_kv as u32, past as u32, rows as u32, kv_len as u32, scale.to_bits(), 0, 0];
-        self.dispatch_kept(&pipeline, buffer(&kv16), buffer(&q16), buffer(out), &words, (n_h as u32, (rp / 32) as u32, 1));
+        (q16, kv16)
+    }
+
+    /// [`ChainRecorder::qsa_attention`] in f32 ([`QSA_ATTENTION_PART`]): a query's entries in runs of 256, a workgroup
+    /// a (head, run, query), the runs joined.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn qsa_attention_f32(&mut self, q: &DeviceVec, kv: &DeviceVec, list: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, first: usize, ratio: usize, keep: usize, scale: f32) {
+        let runs = (keep * ratio + ratio).div_ceil(256);
+        assert!(
+            head_dim % 4 == 0 && head_dim <= 512 && q.len >= rows * n_h * head_dim && kv.len >= (first + rows) * 2 * n_kv * head_dim && list.len >= rows * keep && out.len >= self.backend.qsa_attention_out_len(rows, n_h, head_dim, keep, ratio),
+            "chain: QSA's attention's buffers"
+        );
+        let dd = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        let words = [n_h as u32, n_kv as u32, head_dim as u32, first as u32, ratio as u32, runs as u32, scale.to_bits(), keep as u32];
+        self.dispatch_wide("chain-qsa-attention-part", QSA_ATTENTION_PART, [buffer(kv), buffer(q), buffer(list), &dd, &dd, &dd, buffer(out), &drw], &words, (n_h as u32, runs as u32, rows as u32));
+        // the runs joined as a prompt's are (an empty run's sum 0 adds nothing)
+        let params = self.uniform(&[n_h as u32, n_kv as u32, head_dim as u32, first as u32, 0, runs as u32, scale.to_bits(), rows as u32]);
+        let join = self.named("chain-attention-rows-join", ATTENTION_ROWS_JOIN);
+        self.dispatch(&join, buffer(kv), buffer(q), buffer(out), &params, (n_h as u32, rows as u32, 1));
+    }
+
+    /// [`ChainRecorder::qsa_attention`] of a prompt's rows on the tensor cores ([`attention_coop_masked`]): the kept
+    /// blocks as each query's bitmask ([`QSA_MASK`]), then every position up to the query's on the tensor cores but
+    /// those of a block it did not keep (the dense span's work past it, which the tensor cores still do the sooner:
+    /// 512 of some 640 blocks kept at 2,560 positions). False (nothing recorded) as [`Self::attention_rows_coop`] is.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn qsa_attention_coop(&mut self, q: &DeviceVec, kv: &DeviceVec, list: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, first: usize, ratio: usize, keep: usize, scale: f32) -> bool {
+        let name = match head_dim {
+            64 => "chain-qsa-attention-coop-64",
+            128 => "chain-qsa-attention-coop-128",
+            256 => "chain-qsa-attention-coop-256",
+            _ => return false,
+        };
+        if rows < 16 || ratio == 0 || n_kv == 0 || n_h % n_kv != 0 || !self.gpu().device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+            return false;
+        }
+        let kv_len = first + rows;
+        let (qs, row) = (n_h * head_dim, 2 * n_kv * head_dim);
+        // the padding's rows go past the output, in its scratch (at least as long as they: 16 rows or more)
+        assert!(out.len >= rows.div_ceil(32) * 32 * qs, "chain: QSA's attention's buffers");
+        let mw = (kv_len / ratio).div_ceil(32).max(1);
+        let mask = self.scratch(rows * mw);
+        let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
+        let words = (rows * mw) as u32;
+        let groups = words.div_ceil(256);
+        self.dispatch_wide("chain-qsa-mask", QSA_MASK, [buffer(list), &d, &d, &d, &d, &d, buffer(&mask), &drw], &[rows as u32, keep as u32, mw as u32, first as u32, ratio as u32], (groups.min(65535), groups.div_ceil(65535), 1));
+        let (q16, kv16) = self.attention_f16(q, kv, rows, kv_len, qs, row);
+        let src = attention_coop_masked(head_dim);
+        let words = [n_h as u32, n_kv as u32, first as u32, rows as u32, kv_len as u32, scale.to_bits(), ratio as u32, mw as u32];
+        self.dispatch_wide(name, &src, [buffer(&kv16), buffer(&q16), buffer(&mask), &d, &d, &d, buffer(out), &drw], &words, (n_h as u32, rows.div_ceil(32) as u32, 1));
         self.att16 = Some((q16, kv16));
         true
     }
@@ -2990,19 +3098,11 @@ impl ChainRecorder for Recorder<'_> {
     }
 
     fn qsa_attention(&mut self, q: &DeviceVec, kv: &DeviceVec, list: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, first: usize, ratio: usize, keep: usize, scale: f32) {
-        let runs = (keep * ratio + ratio).div_ceil(256);
-        assert!(
-            head_dim % 4 == 0 && head_dim <= 512 && q.len >= rows * n_h * head_dim && kv.len >= (first + rows) * 2 * n_kv * head_dim && list.len >= rows * keep && out.len >= self.backend.qsa_attention_out_len(rows, n_h, head_dim, keep, ratio),
-            "chain: QSA's attention's buffers"
-        );
-        let dd = self.gpu().dummy().clone();
-        let drw = self.gpu().dummy_rw().clone();
-        let words = [n_h as u32, n_kv as u32, head_dim as u32, first as u32, ratio as u32, runs as u32, scale.to_bits(), keep as u32];
-        self.dispatch_wide("chain-qsa-attention-part", QSA_ATTENTION_PART, [buffer(kv), buffer(q), buffer(list), &dd, &dd, &dd, buffer(out), &drw], &words, (n_h as u32, runs as u32, rows as u32));
-        // the runs joined as a prompt's are (an empty run's sum 0 adds nothing)
-        let params = self.uniform(&[n_h as u32, n_kv as u32, head_dim as u32, first as u32, 0, runs as u32, scale.to_bits(), rows as u32]);
-        let join = self.named("chain-attention-rows-join", ATTENTION_ROWS_JOIN);
-        self.dispatch(&join, buffer(kv), buffer(q), buffer(out), &params, (n_h as u32, rows as u32, 1));
+        // a prompt's rows on the tensor cores where the device has them (a check's few as a step's)
+        if rows > 8 && self.qsa_attention_coop(q, kv, list, out, rows, n_h, n_kv, head_dim, first, ratio, keep, scale) {
+            return;
+        }
+        self.qsa_attention_f32(q, kv, list, out, rows, n_h, n_kv, head_dim, first, ratio, keep, scale);
     }
 
     fn argmax_softmax(&mut self, x: &DeviceVec, out: &DeviceVec) {
@@ -3332,6 +3432,56 @@ mod tests {
             let got = Box::new(rec).finish();
             close(&got[1], &kc.data()[..kvd], "the first stored key");
             close(&got[0], want.data(), &format!("a prompt's attention, window {window:?}"));
+        }
+    }
+
+    /// QSA's attention of a prompt's rows on the tensor cores gives the f32 kernel's within f16's rounding: each
+    /// query's kept blocks (of 4 positions) a spread of its visible ones, every visible one where they are no more
+    /// than it keeps, its tail block's positions too; GQA, heads 128 and 256 wide, rows a tile's multiple and not.
+    #[test]
+    fn qsa_attention_on_the_tensor_cores_is_the_f32_kernels() {
+        let Ok(b) = WgpuBackend::new(Some(2 << 30)) else { return };
+        if !b.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+            return;
+        }
+        let ratio = 4usize;
+        for (n_h, n_kv, hd, first, rows, keep) in [(8usize, 2usize, 128usize, 300usize, 37usize, 24usize), (16, 2, 256, 2600, 64, 512), (16, 2, 256, 1000, 100, 2048)] {
+            let (qd, row, kv_len) = (n_h * hd, 2 * n_kv * hd, first + rows);
+            let mut next = rng((qd + first + keep) as u32);
+            let q: Vec<f32> = (0..rows * qd).map(|_| next() * 2.0).collect();
+            let cache: Vec<f32> = (0..kv_len * row).map(|_| next() * 2.0).collect();
+            // a query's kept blocks: every visible one where it keeps as many, else a spread of them (ascending)
+            let mut list = vec![0f32; rows * keep];
+            for r in 0..rows {
+                let visible = (first + r + 1) / ratio;
+                let count = visible.min(keep);
+                // (a spread, strictly ascending and below the visible: from the first on even rows, the last on odd)
+                for i in 0..count {
+                    let blk = if visible <= keep { i } else if r % 2 == 0 { i * visible / count } else { visible - 1 - (count - 1 - i) * visible / count };
+                    list[r * keep + i] = f32::from_bits(blk as u32);
+                }
+            }
+            let (qv, kv, lv) = (b.vec(rows * qd), b.vec(kv_len * row), b.vec(rows * keep));
+            DeviceChain::upload(&b, &qv, &q);
+            DeviceChain::upload(&b, &kv, &cache);
+            DeviceChain::upload(&b, &lv, &list);
+            let scale = 1.0 / (hd as f32).sqrt();
+            let len = b.qsa_attention_out_len(rows, n_h, hd, keep, ratio).max(rows.div_ceil(32) * 32 * qd);
+            let (want, got) = (b.vec(len), b.vec(len));
+            let mut rec = Recorder::new(&b);
+            rec.qsa_attention_f32(&qv, &kv, &lv, &want, rows, n_h, n_kv, hd, first, ratio, keep, scale);
+            assert!(rec.qsa_attention_coop(&qv, &kv, &lv, &got, rows, n_h, n_kv, hd, first, ratio, keep, scale), "on the tensor cores");
+            rec.read_range(&want, 0, rows * qd);
+            rec.read_range(&got, 0, rows * qd);
+            let r = Box::new(rec).finish();
+            let (want, got) = (&r[0], &r[1]);
+            let dot: f64 = got.iter().zip(want).map(|(a, e)| *a as f64 * *e as f64).sum();
+            let norm = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+            let cos = dot / (norm(got) * norm(want));
+            let top = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let worst = got.iter().zip(want).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
+            eprintln!("{n_h} heads ({n_kv} kv) {hd} wide, {rows} rows after {first}, keeping {keep}: cosine {cos:.7}, worst {worst:.2e} of {top:.2}");
+            assert!(cos > 0.99999 && worst <= 4e-3 * top, "{rows} rows after {first} keeping {keep}: cosine {cos}, worst {worst} of {top}");
         }
     }
 
