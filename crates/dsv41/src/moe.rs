@@ -225,9 +225,15 @@ impl Moe {
                             outs[j] = out;
                         }
                     }
-                    if let Some(gpu) = gpu {
+                    // What the GPU takes in leaves the RAM tier (once the leases are gone): the two hold different
+                    // experts, so between them more.
+                    let taken = gpu.map_or_else(Vec::new, |gpu| {
                         let read: Vec<(u32, &[u8])> = ids.iter().zip(&leases).map(|(&e, l)| (e, &**l)).collect();
-                        gpu.offer(self.layer, &read);
+                        gpu.offer(self.layer, &read)
+                    });
+                    drop(leases);
+                    for e in taken {
+                        experts.cache.remove(self.layer, e);
                     }
                     Ok(())
                 })?;

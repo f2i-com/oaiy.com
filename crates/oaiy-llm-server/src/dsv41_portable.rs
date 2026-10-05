@@ -217,6 +217,10 @@ pub(crate) struct WgpuExperts {
     resident: Option<Mutex<Resident>>,
     /// Whether a decode step's misses may come in (each an upload of a record); a prompt's always may.
     admit_on_decode: std::sync::atomic::AtomicBool,
+    /// Whether what comes in leaves the RAM tier (the tiers exclusive), or stays in both (the default). Measured on
+    /// 32 decode steps of the same prompt (the same tokens): exclusive read 35.8 GB, inclusive 34.2. A decode step
+    /// takes experts in and lets others go, and one let go was then in neither tier.
+    exclusive: std::sync::atomic::AtomicBool,
 }
 
 /// Decode steps after which every count halves (as the CUDA engine's tier): without aging, an old topic's experts would
@@ -235,7 +239,17 @@ impl WgpuExperts {
         let (used, budget) = gpu.usage();
         let room = (budget.saturating_sub(used).saturating_sub(MARGIN) / record as u64) as usize;
         let resident = (room > 0).then(|| gpu.record_slots(room, record)).flatten().map(|slots| Mutex::new(Resident::new(slots)));
-        Some(WgpuExperts { group: Mutex::new(group), resident, admit_on_decode: std::sync::atomic::AtomicBool::new(true) })
+        Some(WgpuExperts {
+            group: Mutex::new(group),
+            resident,
+            admit_on_decode: std::sync::atomic::AtomicBool::new(true),
+            exclusive: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// Keep what comes in out of the RAM tier, or in both (the default).
+    pub(crate) fn set_exclusive(&self, on: bool) {
+        self.exclusive.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Let a decode step's misses come in, or not (to measure what their uploads cost).
@@ -312,21 +326,20 @@ impl dsv41::expert::ExpertsKernel for WgpuExperts {
         order
     }
 
-    fn offer(&self, layer: u32, records: &[(u32, &[u8])]) {
+    fn offer(&self, layer: u32, records: &[(u32, &[u8])]) -> Vec<u32> {
         if !self.admit_on_decode.load(std::sync::atomic::Ordering::Relaxed) {
-            return;
+            return Vec::new();
         }
-        if let Some(r) = &self.resident {
-            let mut r = r.lock().unwrap_or_else(|p| p.into_inner());
-            for &(e, record) in records {
-                r.admit((layer, e), record);
-            }
-        }
+        let Some(r) = &self.resident else { return Vec::new() };
+        let mut r = r.lock().unwrap_or_else(|p| p.into_inner());
+        let taken: Vec<u32> = records.iter().filter(|&&(e, record)| r.admit((layer, e), record)).map(|&(e, _)| e).collect();
+        if self.exclusive.load(std::sync::atomic::Ordering::Relaxed) { taken } else { Vec::new() }
     }
 
     fn pass_done(&self, tokens: usize, cache: &oaiy_engine::ecache::Ecache, store: &dyn oaiy_engine::store::WeightStore) {
         if let Some(r) = &self.resident {
-            r.lock().unwrap_or_else(|p| p.into_inner()).pass_done(tokens, cache, store);
+            let exclusive = self.exclusive.load(std::sync::atomic::Ordering::Relaxed);
+            r.lock().unwrap_or_else(|p| p.into_inner()).pass_done(tokens, cache, store, exclusive);
         }
     }
 }
@@ -335,7 +348,8 @@ impl dsv41::expert::ExpertsKernel for WgpuExperts {
 /// slot a record; the one to replace the least used, and of equals the longest unused (LFRU); uses counted in tokens (a
 /// prompt's expert that 300 tokens chose counts 300) and halved every [`AGE_TOKENS`] decode steps. A decode step's
 /// misses come in when they are used more than what they would replace; a prompt's are noted and, once it is read, the
-/// most used come in from RAM (taking them in during the pass would evict experts the same pass needs later).
+/// most used come in from RAM (taking them in during the pass would evict experts the same pass needs later). What
+/// comes in can leave the RAM tier, as the CUDA engine's tiers do (`WgpuExperts::set_exclusive`), but by default stays.
 struct Resident {
     slots: RecordSlots,
     keys: Vec<Option<(u32, u32)>>,
@@ -425,7 +439,7 @@ impl Resident {
         true
     }
 
-    fn pass_done(&mut self, tokens: usize, cache: &oaiy_engine::ecache::Ecache, store: &dyn oaiy_engine::store::WeightStore) {
+    fn pass_done(&mut self, tokens: usize, cache: &oaiy_engine::ecache::Ecache, store: &dyn oaiy_engine::store::WeightStore, exclusive: bool) {
         let mut pending = std::mem::take(&mut self.pending);
         if tokens > 1 {
             pending.sort_unstable();
@@ -439,6 +453,11 @@ impl Resident {
                 // most used first: once one does not beat what it would replace, none after it will
                 if !self.admit(key, &record) {
                     break;
+                }
+                // held here now, so out of RAM: the two tiers hold different experts
+                drop(record);
+                if exclusive {
+                    cache.remove(key.0, key.1);
                 }
             }
         } else {
@@ -483,13 +502,15 @@ mod tests {
         let tok = dsv41::tokenizer::Tokenizer::load(dir).unwrap();
         let docs = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs");
         // LF whatever the checkout wrote: a CRLF copy of the same docs is another prompt (other tokens, other experts).
-        let text: String = ["WEBGPU.md", "STUDIO.md", "FLASHNEXT.md", "ORCASAQ.md"]
-            .iter()
-            .filter_map(|f| std::fs::read_to_string(format!("{docs}/{f}")).ok())
-            .map(|t| t.replace("
-", "
-"))
-            .collect();
+        // DSV41_PROMPT_FILE pins the text, so a measurement compares with an earlier one whatever the docs say now.
+        let text: String = match std::env::var("DSV41_PROMPT_FILE") {
+            Ok(file) => std::fs::read_to_string(file).expect("DSV41_PROMPT_FILE").replace("\r\n", "\n"),
+            Err(_) => ["WEBGPU.md", "STUDIO.md", "FLASHNEXT.md", "ORCASAQ.md"]
+                .iter()
+                .filter_map(|f| std::fs::read_to_string(format!("{docs}/{f}")).ok())
+                .map(|t| t.replace("\r\n", "\n"))
+                .collect(),
+        };
         let mut ids = vec![0u32];
         ids.extend(tok.encode(&text));
         ids.truncate(tokens);
@@ -669,6 +690,10 @@ mod tests {
         if std::env::var("DSV41_GPU_EXPERTS").map_or(true, |v| v != "0") {
             let k = Arc::new(WgpuExperts::new(backend.as_any().downcast_ref::<WgpuBackend>().unwrap()).expect("room for a record"));
             eprintln!("{} record slots for a prompt's experts, {} kept between passes", k.slots(), k.tier().0);
+            if std::env::var("DSV41_TIER_EXCLUSIVE").is_ok_and(|v| v == "1") {
+                k.set_exclusive(true);
+                eprintln!("what the tier takes in leaves RAM");
+            }
             if std::env::var("DSV41_TIER_ADMIT").is_ok_and(|v| v == "0") {
                 k.set_admit_on_decode(false);
                 eprintln!("a decode step's misses kept out of the tier");

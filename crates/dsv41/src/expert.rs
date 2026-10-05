@@ -319,9 +319,11 @@ pub trait ExpertsKernel: Send + Sync {
     }
 
     /// Records a decode step has just read for experts it did not hold: it keeps any used more often than what it
-    /// would replace.
-    fn offer(&self, layer: u32, records: &[(u32, &[u8])]) {
+    /// would replace, and says which, so the caller can drop its own copies (each tier then holds what the other does
+    /// not).
+    fn offer(&self, layer: u32, records: &[(u32, &[u8])]) -> Vec<u32> {
         let _ = (layer, records);
+        Vec::new()
     }
 
     /// A forward pass of `tokens` tokens has ended: after a prompt it may take in the experts the prompt used most
