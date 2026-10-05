@@ -813,6 +813,10 @@ impl Models {
             .map_err(Error::Arg)
         };
         let model = crate::flashnext::load_portable(&spec.path, backends, &packed, &experts)?;
+        let warm = std::time::Instant::now();
+        if model.warm_up() {
+            self.say(format!("{}: its chained steps ready in {:.1} s", spec.name, warm.elapsed().as_secs_f64()));
+        }
         for (d, g) in gpus.iter().enumerate() {
             let (used, budget) = g.usage();
             self.say(format!("{}: {:.1} GB of EXL3 weights on GPU {d} ({} at {}, budget {:.0} GB), the rest on the CPU", spec.name, used as f64 / 1e9, g.adapter().name, g.adapter().pci_bus_id, budget as f64 / 1e9));

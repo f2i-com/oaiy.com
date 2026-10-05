@@ -1210,12 +1210,18 @@ struct ChainMat {
 
 impl ChainMat {
     fn new(c: &dyn ggml_rs::DeviceChain, t: &Tensor) -> Self {
-        let t = if t.is_device() { t.to_host() } else { t.clone() };
-        if let Some(v) = c.vec_f16(t.data()) {
+        let host;
+        let values = if t.is_device() {
+            host = t.to_host();
+            host.data()
+        } else {
+            t.data()
+        };
+        if let Some(v) = c.vec_f16(values) {
             return ChainMat { v, half: true };
         }
-        let v = c.vec(t.numel());
-        c.upload(&v, t.data());
+        let v = c.vec(values.len());
+        c.upload(&v, values);
         ChainMat { v, half: false }
     }
 
@@ -1402,6 +1408,7 @@ impl FlashNext {
     fn chain_state(&self) -> Option<&FnChain> {
         self.chain
             .get_or_init(|| {
+
                 let cfg = &self.config;
                 let s = cfg.streams;
                 let chains: Vec<&dyn ggml_rs::DeviceChain> = self.devices.iter().map(|b| b.chain()).collect::<Option<_>>()?;
@@ -1488,6 +1495,21 @@ impl FlashNext {
 
     /// Steps the chain has taken (a test's check that it ran).
     #[allow(dead_code)]
+    /// The chain made and its kernels compiled before a first request would wait on them (its matrices packed and
+    /// uploaded, some 30 pipelines built): a short prompt and a step on a cache of their own. False where nothing is
+    /// chained.
+    pub fn warm_up(&self) -> bool {
+        if self.chain_state().is_none() {
+            return false;
+        }
+        let Ok(tokens) = self.tokenizer.encode("The river town kept its market on the north bank.", false) else { return false };
+        let mut kv = self.new_kv_cache(tokens.len() + 2);
+        let step = |tokens: &[u32], kv: &mut KvCache| self.embed_text(tokens).and_then(|e| self.forward(tokens, &e, kv, None)).is_ok();
+        let warmed = step(&tokens, &mut kv) && step(&tokens[..1], &mut kv);
+        self.chain.get().and_then(|c| c.as_ref()).inspect(|c| c.runs.store(0, std::sync::atomic::Ordering::Relaxed));
+        warmed
+    }
+
     pub(crate) fn chain_runs(&self) -> usize {
         self.chain.get().and_then(|c| c.as_ref()).map_or(0, |c| c.runs.load(std::sync::atomic::Ordering::Relaxed))
     }

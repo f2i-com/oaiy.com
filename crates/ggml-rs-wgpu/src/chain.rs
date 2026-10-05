@@ -987,11 +987,13 @@ impl DeviceChain for WgpuBackend {
     }
 
     fn vec_f16(&self, values: &[f32]) -> Option<DeviceVec> {
-        let exact = values.len() % 2 == 0 && values.iter().all(|&v| half::f16::from_f32(v).to_f32().to_bits() == v.to_bits());
+        use rayon::prelude::*;
+        // checked and packed on every core (a model's hyper-connections are some 700 million values)
+        let exact = values.len() % 2 == 0 && values.par_chunks(1 << 16).all(|c| c.iter().all(|&v| half::f16::from_f32(v).to_f32().to_bits() == v.to_bits()));
         if !exact {
             return None;
         }
-        let words: Vec<f32> = values.chunks_exact(2).map(|p| f32::from_bits(half::f16::from_f32(p[0]).to_bits() as u32 | (half::f16::from_f32(p[1]).to_bits() as u32) << 16)).collect();
+        let words: Vec<f32> = values.par_chunks_exact(2).map(|p| f32::from_bits(half::f16::from_f32(p[0]).to_bits() as u32 | (half::f16::from_f32(p[1]).to_bits() as u32) << 16)).collect();
         let v = self.vec(words.len());
         DeviceChain::upload(self, &v, &words);
         Some(v)

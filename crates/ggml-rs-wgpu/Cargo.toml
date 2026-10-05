@@ -12,5 +12,6 @@ wgpu        = "30"
 pollster    = "0.4"
 # f16 rounding of EXL3 projections' activations, as exllamav3 rounds them.
 half        = { version = "2.4" }
+rayon       = "1.10"
 
 [dev-dependencies]
