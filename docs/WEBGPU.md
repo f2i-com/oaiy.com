@@ -14,7 +14,8 @@ the same memory as the file. It runs the multiply in WGSL. A prompt's other work
 (norms, RoPE, attention, recurrent state) runs on the CPU backend, with
 activations in RAM. A Llama's, Qwen3's or Gemma 3's decode step, and each of its
 prompt's chunks, runs whole on the GPU in one submit ("Dense models on the GPU",
-below).
+below), and so does Qwen3.5's and Qwen3.8 27B's ("Qwen3.5 and Qwen3.8 27B on the
+GPU").
 
 - **Types:** Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K
   and IQ4_XS. Each shader's block decode is a line-by-line port of
@@ -24,6 +25,16 @@ below).
   a tiled kernel: 64 tokens by 64 weight rows a workgroup, each type's own decode
   into workgroup memory and its sums in registers (a 4096 x 4096 Q4_K weight
   against 512 tokens in 7.0 ms where a row a workgroup took 24.2).
+- **The K-quants (Q3_K, Q4_K, Q5_K, Q6_K)** have kernels of their own that read
+  the weights wide (vec4 or word loads, where the generic kernels read a byte a
+  load): for a decode step's one row of `x` (8 weight rows a workgroup, 32 lanes
+  a row: 1,100-1,400 GB/s, where the generic one read 170-280), for up to 24 rows
+  (the same lanes, each weight they decode applied to 8 rows of `x` a workgroup: a
+  prompt's chunk of 6 tokens of Qwen3.8 27B in 73 ms where 358), and a tiled one
+  for more (64 values of `k` a step, all 256 threads decoding: its chunk of 512 in
+  1.3 s where the generic tiled kernel took 2.4). Q3_K's 110-byte blocks are
+  padded to 112 on the GPU so they are seven vec4s, and unpadded when the weights
+  come back to the host.
 - **Budget:** WebGPU cannot report free memory, so a budget caps the weights
   placed on the GPU: a discrete card's memory less 4 GiB where Vulkan reports it
   (its largest device-local heap: 27.8 GiB of a 32 GB card), else 8 GiB; 2 GiB on
@@ -262,7 +273,7 @@ On the RTX 5090 (Vulkan), Q4_K_M, greedy:
 
 | Model | Decode, op by op | Decode, one submit | A 2,000-token prompt |
 |---|---:|---:|---:|
-| Llama 3.2 3B | 35 tok/s (11.6 at 512 tokens of context before the changes above) | 73-81 tok/s; 70 at 2,000 tokens of context | 1.5 s (59.2 before the day's changes, 8.4 op by op) |
+| Llama 3.2 3B | 35 tok/s (11.6 at 512 tokens of context before the changes above) | 128 tok/s with the wide K-quant kernels (73-81 before them) | 1.5 s (59.2 before the day's changes, 8.4 op by op) |
 | Qwen3 0.6B | 53 tok/s | 182 tok/s | 0.8 s through the server |
 | Gemma 3 4B | 28.5 tok/s | 60 tok/s | |
 
@@ -270,9 +281,45 @@ Each chained model gives the op-by-op path's 64 greedy tokens after 64- and
 1,500-token prompts (past Gemma 3's 1,024-token window), the prompt's logits and
 every step's cosine 1.000000, and the same two-turn conversation word for word
 (Gemma 3's second turn reusing 130 tokens of the first's state). A steady Llama 3.2 3B step
-is 0.4 ms of recording and 14 ms on the GPU; the one-row matmul reads its weights
-at 170-280 GB/s however its lanes are laid out (measured each way), so a kernel
-of wide loads is what would take it further.
+was 0.4 ms of recording and 14 ms on the GPU, the one-row matmul reading its
+weights at 170-280 GB/s however its lanes were laid out; the K-quants' wide
+kernels (above) made it 7.7 ms.
+
+## Qwen3.5 and Qwen3.8 27B on the GPU (2026-10-05)
+
+Qwen3.5's hybrid (Qwen3.5 4B, 9B and 27B, Qwen3.8 27B: `llama-rs`'s
+`chain_qwen35`) runs a decode step or a prompt's chunk in one submit too. Its
+gated delta net layers' projections, causal conv and recurrence run on the GPU:
+a workgroup a value head, a thread a row of its state, the row held in registers
+through the run's tokens (43 us a layer for a step of Qwen3.8 27B when each
+token read it from memory, 11 us held), then the head's norm and its `silu(z)`
+gate. Its attention layers' q and gate halves, per-head norms, partial RoPE (64
+of 256 dims), the K and V into the GPU's copy of the cache, attention, the
+sigmoid gate; every layer's FFN (a gate and up of two types too) and residuals;
+then the head. Qwen3.8 27B's beta-alpha projection is f32 and has a kernel of its
+own. A Qwen3.5 GGUF with no output weight (the 4B's) is headed by its packed
+token table, on the GPU.
+
+The recurrent state stays on the GPU between steps: the cache's state tensors
+are the chain's own buffers (`DeviceChain::alias`), so what reads them there (a
+checkpoint, a conversation set aside, a disk state) reads them back (Qwen3.8
+27B's 157 MB in 42 ms), and a state the host puts there (a restore, or the host
+path's, which a prompt with an image still takes) is taken up at the next run.
+
+On the RTX 5090 (Vulkan), greedy, through `oaiy-llm-server-webgpu`:
+
+| Model | Decode, op by op | Decode, one submit | A prompt |
+|---|---:|---:|---:|
+| Qwen3.8 27B Q3_K_M | 6.0 tok/s (2.0 with the old 8 GiB budget) | 57 tok/s | 2,011 tokens in 5.4 s; a short turn in 0.4-0.7 s |
+| Qwen3.5 9B Q4_K_M | 9.2 tok/s | 124 tok/s | a chunk of 512 tokens in 0.4 s |
+| Qwen3.5 4B Q4_K_M | 9 tok/s | 169 tok/s | a chunk of 512 tokens in 0.24 s |
+
+Each gives the host path's tokens after 64- and 1,500-token prompts, the prompt's
+logits and every step's cosine 1.000000 (`a_chained_qwen35_run_answers_as_the_host_path`,
+which also checks that the chain ran); the same replies through a conversation
+that goes back to a checkpoint as with `OAIY_NO_CHAIN`; and Qwen3.8 27B the right
+answer after up to 2,011 tokens. Its decode step is about 17 ms on the GPU, 12 of
+them the matmuls (Q3_K, 8 GB of its 13.4, at 1,090 GB/s).
 
 Gemma 3 itself was wrong on every backend until this day: one RoPE base on every
 layer, where its sliding-window layers take 10,000 and its global ones
