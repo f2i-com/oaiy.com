@@ -545,10 +545,16 @@ impl WgpuBackend {
         }
         let waiting = std::time::Instant::now();
         gpu.queue.submit([enc.finish()]);
-        let raw = gpu.map_read(&staging, total);
+        let slice = staging.slice(..total);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).expect("webgpu: device lost while waiting for a result");
         profile::add(&profile::LINEAR_WAIT, waiting);
+        // each output made straight from the mapped bytes (a copy of them first was a second pass over a prompt's
+        // outputs, up to 131 MB a call)
+        let raw = slice.get_mapped_range().expect("webgpu: mapping a finished buffer");
         let mut at = 0usize;
-        ws.iter()
+        let out = ws
+            .iter()
             .zip(&sizes)
             .map(|((_, shape), &ysize)| {
                 let y: Vec<f32> = raw[at..at + ysize as usize].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
@@ -557,7 +563,10 @@ impl WgpuBackend {
                 *out_shape.last_mut().expect("x has a last axis") = shape[0];
                 Tensor::from_vec(y, out_shape)
             })
-            .collect()
+            .collect();
+        drop(raw);
+        staging.unmap();
+        out
     }
 }
 
