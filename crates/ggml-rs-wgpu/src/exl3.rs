@@ -802,6 +802,46 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 }
 "#;
 
+/// [`G_PRE`] of a SwiGLU's output computed as it is read: job `j`'s row `xr` is `silu(g) * u`, `g` row `p[0].z xr +
+/// p[0].w` of `x` and `u` row `p[1].x xr + p[1].y` of `up` (an expert group's gate and up rows `2 xr` and `2 xr + 1` of
+/// one vector; a shared expert's row `xr` of two), as the SwiGLU kernels compute it: a dispatch fewer.
+const G_PRE_SWIGLU: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> suh: array<f32>;
+@group(0) @binding(2) var<storage, read> imap: array<u32>;
+@group(0) @binding(3) var<storage, read> jobs: array<u32>;
+@group(0) @binding(4) var<storage, read> up: array<f32>;
+@group(0) @binding(6) var<storage, read_write> xh: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> sh: array<f32, 128>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    let k = p[0].x;
+    let j = wg.y;
+    let m = jobs[2u * j];
+    let xr = jobs[2u * j + 1u];
+    let i = wg.x * 128u + t;
+    var src = i;
+    if (p[0].y == 0u) { src = imap[m * k + i]; }
+    let g = x[(p[0].z * xr + p[0].w) * k + src];
+    let u = up[(p[1].x * xr + p[1].y) * k + src];
+    sh[t] = half((g / (1.0 + exp(-g))) * u) * suh[m * k + i];
+    workgroupBarrier();
+    for (var s = 1u; s < 128u; s *= 2u) {
+        if ((t & s) == 0u) {
+            let a = sh[t];
+            let b = sh[t + s];
+            sh[t] = a + b;
+            sh[t + s] = a - b;
+        }
+        workgroupBarrier();
+    }
+    xh[j * k + i] = half(sh[t] * bitcast<f32>(0x3db504f4u));
+}
+"#;
+
 /// The matmul of each job's transformed row (the host's one-row kernel's, [`one_source`]; the matrices a group's:
 /// matrix `m`'s words from `m * p[1].x`): a workgroup a (tile column, job and split), its partial sums to `part[(j *
 /// splits + s) * n..]`, the jobs from `p[1].y` (a pass of a long list: 65535 workgroups an axis). `p[0]`: n, k, tile
@@ -1345,15 +1385,18 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
-/// The chain's kernels as WGSL: the input transform, the matmul (a row a job; a prompt's is [`g_many`]), the output
-/// transform and its map.
-pub(crate) fn chain_shader(which: &str) -> String {
-    match which {
-        "pre" => format!("{HALF}{G_PRE}"),
-        "mm" => g_mm_source(),
-        "post" => format!("{HALF}{G_POST}"),
-        _ => G_GATHER.to_string(),
-    }
+/// The chain's kernels as WGSL: the input transform (of a SwiGLU's output, "pre-swiglu"), the matmul (a row a job; a
+/// prompt's is [`g_many`]), the output transform and its map; each made once.
+pub(crate) fn chain_shader(which: &str) -> &'static str {
+    static SOURCES: [std::sync::OnceLock<String>; 5] = [const { std::sync::OnceLock::new() }; 5];
+    let (at, make): (usize, fn() -> String) = match which {
+        "pre" => (0, || format!("{HALF}{G_PRE}")),
+        "pre-swiglu" => (1, || format!("{HALF}{G_PRE_SWIGLU}")),
+        "mm" => (2, g_mm_source),
+        "post" => (3, || format!("{HALF}{G_POST}")),
+        _ => (4, || G_GATHER.to_string()),
+    };
+    SOURCES[at].get_or_init(make)
 }
 
 /// What a chain needs of a projection on the GPU, made when it is first chained: its transforms' tables (the maps
@@ -1430,21 +1473,6 @@ impl Exl3Gpu {
     }
 }
 
-/// `act[j, i] = silu(o[2j, i]) * o[2j + 1, i]`: each expert's gate and up outputs (rows `2j` and `2j + 1` of `x`) into
-/// its hidden row (`y`), `p[0]`: ff, pairs. As the host's `g / (1 + exp(-g)) * u`.
-const SILU_PAIRS: &str = r#"
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let ff = p[0].x;
-    let i = id.x;
-    if (i >= ff * p[0].y) { return; }
-    let j = i / ff;
-    let c = i % ff;
-    let g = x[(2u * j) * ff + c];
-    y[i] = (g / (1.0 + exp(-g))) * x[(2u * j + 1u) * ff + c];
-}
-"#;
-
 /// Each row's experts summed in its own order, each weighted (as `Exl3MoeHost::forward`): `out[r, i] = sum over j < K
 /// of w[r, j] * d[r K + j, i]`, then `+ w[r, K] * sh[r, i]` (the shared expert). `p[0]`: hidden, K, rows.
 const WSUM_ROWS: &str = r#"
@@ -1466,6 +1494,35 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     for (var j = 0u; j < kk; j++) { acc += w[r * (kk + 1u) + j] * d[(r * kk + j) * h + c]; }
     acc += w[r * (kk + 1u) + kk] * sh[r * h + c];
     out[i] = acc;
+}
+"#;
+
+/// [`WSUM_ROWS`] with each row's sum added to its streams (`xs[r, s] += post[r, s] * sum`, `p[0].w` streams), as
+/// `ChainRecorder::stream_apply` writes it back. `p[0]`: hidden, K, rows, streams.
+const WSUM_APPLY: &str = r#"
+@group(0) @binding(0) var<storage, read> d: array<f32>;
+@group(0) @binding(1) var<storage, read> sh: array<f32>;
+@group(0) @binding(2) var<storage, read> w: array<f32>;
+@group(0) @binding(3) var<storage, read> post: array<f32>;
+@group(0) @binding(6) var<storage, read_write> xs: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let h = p[0].x;
+    let kk = p[0].y;
+    let streams = p[0].w;
+    let i = id.x;
+    if (i >= h * p[0].z) { return; }
+    let r = i / h;
+    let c = i % h;
+    var acc = 0.0;
+    for (var j = 0u; j < kk; j++) { acc += w[r * (kk + 1u) + j] * d[(r * kk + j) * h + c]; }
+    acc += w[r * (kk + 1u) + kk] * sh[r * h + c];
+    for (var s = 0u; s < streams; s++) {
+        let at = (r * streams + s) * h + c;
+        xs[at] = xs[at] + post[r * streams + s] * acc;
+    }
 }
 "#;
 
@@ -1583,13 +1640,11 @@ pub(crate) struct Step {
     xh_gu: DeviceVec,
     part_gu: DeviceVec,
     out_gu: DeviceVec,
-    act: DeviceVec,
     xh_d: DeviceVec,
     part_d: DeviceVec,
     out_d: DeviceVec,
     sg: DeviceVec,
     su: DeviceVec,
-    sa: DeviceVec,
     sd: DeviceVec,
     /// A check's jobs grouped by matrix ([`GROUP`]): gate and up, down.
     order_gu: DeviceVec,
@@ -1710,13 +1765,11 @@ impl Exl3MoeGrouped {
             xh_gu: vec(2 * pairs * h),
             part_gu: vec(2 * pairs * sgu * f),
             out_gu: vec(2 * pairs * f),
-            act: vec(pairs * f),
             xh_d: vec(pairs * f),
             part_d: vec(pairs * sd * h),
             out_d: vec(pairs * h),
             sg: vec(rows * f),
             su: vec(rows * f),
-            sa: vec(rows * f),
             sd: vec(rows * h),
             order_gu: vec(if one && rows > 1 { 2 * pairs * rows } else { 1 }),
             order_d: vec(if one && rows > 1 { pairs * rows } else { 1 }),
@@ -1740,13 +1793,19 @@ impl Exl3MoeGrouped {
     /// `order`: a prompt's jobs in blocks of one matrix (and the blocks' count), each tile decoded once a block, in one
     /// split (a prompt has workgroups enough without, and its partial sums are the smaller).
     #[allow(clippy::too_many_arguments)]
-    fn group_pass(&self, rec: &mut crate::chain::Recorder<'_>, g: &Group, x: &DeviceVec, jobs: &DeviceVec, count: usize, order: Order<'_>, xh: &DeviceVec, part: &DeviceVec, y: &DeviceVec) {
+    /// `pairs`: `x` the gate and up rows of each hidden row (`2 r` and `2 r + 1`), the input their SwiGLU.
+    #[allow(clippy::too_many_arguments)]
+    fn group_pass(&self, rec: &mut crate::chain::Recorder<'_>, g: &Group, x: &DeviceVec, pairs: bool, jobs: &DeviceVec, count: usize, order: Order<'_>, xh: &DeviceVec, part: &DeviceVec, y: &DeviceVec) {
         let d = rec.gpu().dummy().clone();
         let drw = rec.gpu().dummy_rw().clone();
         let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
         let (xb, jb, xhb, pb, yb) = (buf(x), buf(jobs), buf(xh), buf(part), buf(y));
         let (suh, svh) = (buf(&g.suh), buf(&g.svh));
-        rec.dispatch_wide("exl3-pre", &chain_shader("pre"), [&xb, &suh, &d, &jb, &d, &d, &xhb, &drw], &[g.k as u32, 1], ((g.k / 128) as u32, count as u32, 1));
+        if pairs {
+            rec.dispatch_wide("exl3-pre-swiglu", chain_shader("pre-swiglu"), [&xb, &suh, &d, &jb, &xb, &d, &xhb, &drw], &[g.k as u32, 1, 2, 0, 2, 1], ((g.k / 128) as u32, count as u32, 1));
+        } else {
+            rec.dispatch_wide("exl3-pre", chain_shader("pre"), [&xb, &suh, &d, &jb, &d, &d, &xhb, &drw], &[g.k as u32, 1], ((g.k / 128) as u32, count as u32, 1));
+        }
         let ntiles = (g.n / 16) as u32;
         let splits = if matches!(order, Order::Many(..)) { 1 } else { g.splits };
         // as many jobs (or blocks) a pass as the grid's third axis takes
@@ -1770,11 +1829,11 @@ impl Exl3MoeGrouped {
             Order::Jobs => {
                 for first in (0..count).step_by(per) {
                     let jobs = per.min(count - first) as u32;
-                    rec.dispatch_wide("exl3-mm", &chain_shader("mm"), [&g.words, &xhb, &jb, &d, &d, &d, &pb, &drw], &[g.n as u32, g.k as u32, g.tw as u32, g.splits, g.mwords as u32, first as u32], (ntiles.min(65535), ntiles.div_ceil(65535), jobs * g.splits));
+                    rec.dispatch_wide("exl3-mm", chain_shader("mm"), [&g.words, &xhb, &jb, &d, &d, &d, &pb, &drw], &[g.n as u32, g.k as u32, g.tw as u32, g.splits, g.mwords as u32, first as u32], (ntiles.min(65535), ntiles.div_ceil(65535), jobs * g.splits));
                 }
             }
         }
-        rec.dispatch_wide("exl3-post", &chain_shader("post"), [&pb, &svh, &jb, &d, &d, &d, &yb, &drw], &[g.n as u32, splits], ((g.n / 128) as u32, count as u32, 1));
+        rec.dispatch_wide("exl3-post", chain_shader("post"), [&pb, &svh, &jb, &d, &d, &d, &yb, &drw], &[g.n as u32, splits], ((g.n / 128) as u32, count as u32, 1));
     }
 
     /// Record `assign`'s experts for each row of `x` into `out` (see `ChainRecorder::moe_rows`).
@@ -1816,18 +1875,19 @@ impl Exl3MoeGrouped {
             Some(((g, gn), (d, dn))) => (Order::Many(g, *gn), Order::Many(d, *dn)),
             None => (Order::Jobs, Order::Jobs),
         };
-        self.run(rec, &st, x, out, rows, ogu, od);
+        self.run(rec, &st, x, out, rows, ogu, od, None);
     }
 
     /// `rows` rows' experts (a step's one, a check's few) routed on the GPU from the router's `logits` (`[rows, routed +
     /// 1]`) and recorded into `out` (see `ChainRecorder::moe_routed`): [`ROUTE`] writes the jobs and weights where
-    /// [`Self::record`] uploads them, each job one row (so each row's sums are a step's).
+    /// [`Self::record`] uploads them, each job one row (so each row's sums are a step's). `into`: each row's sum added to
+    /// its streams (the streams, their write weights, how many) where it would be `out`.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn record_routed(&self, rec: &mut crate::chain::Recorder<'_>, x: &DeviceVec, out: &DeviceVec, logits: &DeviceVec, top_k: usize, rows: usize) -> bool {
+    pub(crate) fn record_routed(&self, rec: &mut crate::chain::Recorder<'_>, x: &DeviceVec, out: &DeviceVec, logits: &DeviceVec, top_k: usize, rows: usize, into: Option<(&DeviceVec, &DeviceVec, usize)>) -> bool {
         if self.routed > 1024 || top_k == 0 || top_k > 32.min(self.routed) || rows == 0 || rows > 64 || logits.len < rows * (self.routed + 1) {
             return false;
         }
-        assert!(x.len >= rows * self.hidden && out.len >= rows * self.hidden, "moe: {rows} rows of {}", self.hidden);
+        assert!(x.len >= rows * self.hidden && (into.is_some() || out.len >= rows * self.hidden), "moe: {rows} rows of {}", self.hidden);
         let st = if rec.keeps() { self.step(rows, top_k) } else { Arc::new(self.scratch(&mut |n| rec.scratch(n), rows, top_k, true)) };
         let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
         let d = rec.gpu().dummy().clone();
@@ -1844,32 +1904,35 @@ impl Exl3MoeGrouped {
         } else {
             (Order::Jobs, Order::Jobs)
         };
-        self.run(rec, &st, x, out, rows, ogu, od);
+        self.run(rec, &st, x, out, rows, ogu, od, into);
         true
     }
 
     /// The experts' work once `st` holds the jobs and weights: gate and up, SwiGLU, down, the shared expert on every
-    /// row, and each row's weighted sum; the gate and up jobs taken as `ogu` has them, the down jobs as `od`.
+    /// row, and each row's weighted sum (into `out`, or added to the streams `into` names); the gate and up jobs taken as
+    /// `ogu` has them, the down jobs as `od`, each SwiGLU computed as its down projection reads it.
     #[allow(clippy::too_many_arguments)]
-    fn run(&self, rec: &mut crate::chain::Recorder<'_>, st: &Step, x: &DeviceVec, out: &DeviceVec, rows: usize, ogu: Order<'_>, od: Order<'_>) {
+    fn run(&self, rec: &mut crate::chain::Recorder<'_>, st: &Step, x: &DeviceVec, out: &DeviceVec, rows: usize, ogu: Order<'_>, od: Order<'_>, into: Option<(&DeviceVec, &DeviceVec, usize)>) {
         use ggml_rs::ChainRecorder;
-        let (h, f, top_k) = (self.hidden, self.ff, st.top_k);
+        let (h, top_k) = (self.hidden, st.top_k);
         let pairs = rows * top_k;
-        let (jgu, jd, wv, xh_gu, part_gu, out_gu, act, xh_d, part_d, out_d, sg, su, sa, sd) =
-            (&st.jobs_gu, &st.jobs_d, &st.w, &st.xh_gu, &st.part_gu, &st.out_gu, &st.act, &st.xh_d, &st.part_d, &st.out_d, &st.sg, &st.su, &st.sa, &st.sd);
-        self.group_pass(rec, &self.gu, x, jgu, 2 * pairs, ogu, xh_gu, part_gu, out_gu);
-        let silu = rec.named("moe-silu-pairs", SILU_PAIRS);
-        let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
-        let d = rec.gpu().dummy().clone();
-        rec.dispatch_kept(&silu, &d, &buf(out_gu), &buf(act), &[f as u32, pairs as u32], (((pairs * f) as u32).div_ceil(256), 1, 1));
-        self.group_pass(rec, &self.down, act, jd, pairs, od, xh_d, part_d, out_d);
+        let (jgu, jd, wv, xh_gu, part_gu, out_gu, xh_d, part_d, out_d, sg, su, sd) = (&st.jobs_gu, &st.jobs_d, &st.w, &st.xh_gu, &st.part_gu, &st.out_gu, &st.xh_d, &st.part_d, &st.out_d, &st.sg, &st.su, &st.sd);
+        self.group_pass(rec, &self.gu, x, false, jgu, 2 * pairs, ogu, xh_gu, part_gu, out_gu);
+        self.group_pass(rec, &self.down, out_gu, true, jd, pairs, od, xh_d, part_d, out_d);
         // the shared expert on every row
         rec.exl3_rows(&self.shared[0], x, sg, rows);
         rec.exl3_rows(&self.shared[1], x, su, rows);
-        rec.silu_mul(sg, su, sa, rows * f);
-        rec.exl3_rows(&self.shared[2], sa, sd, rows);
+        rec.exl3_rows_swiglu(&self.shared[2], sg, su, sd, rows);
+        let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
+        let d = rec.gpu().dummy().clone();
         let drw = rec.gpu().dummy_rw().clone();
-        rec.dispatch_wide("moe-wsum-rows", WSUM_ROWS, [&buf(out_d), &buf(sd), &buf(wv), &d, &d, &d, &buf(out), &drw], &[h as u32, top_k as u32, rows as u32], (((rows * h) as u32).div_ceil(256), 1, 1));
+        match into {
+            Some((xs, post, streams)) => {
+                assert!(xs.len >= rows * streams * h && post.len >= rows * streams, "moe: {rows} rows' {streams} streams");
+                rec.dispatch_wide("moe-wsum-apply", WSUM_APPLY, [&buf(out_d), &buf(sd), &buf(wv), &buf(post), &d, &d, &buf(xs), &drw], &[h as u32, top_k as u32, rows as u32, streams as u32], (((rows * h) as u32).div_ceil(256), 1, 1));
+            }
+            None => rec.dispatch_wide("moe-wsum-rows", WSUM_ROWS, [&buf(out_d), &buf(sd), &buf(wv), &d, &d, &d, &buf(out), &drw], &[h as u32, top_k as u32, rows as u32], (((rows * h) as u32).div_ceil(256), 1, 1)),
+        }
     }
 }
 
@@ -2666,7 +2729,7 @@ mod tests {
                     let mut rec = crate::chain::Recorder::new(&b);
                     for _ in 0..48 {
                         let o = if few { Order::Few(&st.order_gu, blocks, rows) } else { Order::Jobs };
-                        g.group_pass(&mut rec, &g.gu, &x, &st.jobs_gu, n, o, &st.xh_gu, &st.part_gu, &st.out_gu);
+                        g.group_pass(&mut rec, &g.gu, &x, false, &st.jobs_gu, n, o, &st.xh_gu, &st.part_gu, &st.out_gu);
                     }
                     rec.read_range(&st.out_gu, 0, 1);
                     Box::new(rec).finish();
@@ -2802,6 +2865,26 @@ mod tests {
                     let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
                     assert_eq!(bits(&got[r * hidden..(r + 1) * hidden]), bits(&want), "{rows} rows keep {keep}: row {r}");
                 }
+                // the sums added to each row's streams as a site's write-back adds them: the same bits as the sums,
+                // then the write-back
+                let streams = 3;
+                let base: Vec<f32> = (0..rows * streams * hidden).map(|i| ((i * 13 % 47) as f32 - 23.0) / 9.0).collect();
+                let post: Vec<f32> = (0..rows * streams).map(|i| (i as f32 - 2.0) / 3.0).collect();
+                let (xa, xb, pd, sums) = (b.vec(base.len()), b.vec(base.len()), b.vec(post.len()), b.vec(rows * hidden));
+                DeviceChain::upload(&b, &xa, &base);
+                DeviceChain::upload(&b, &xb, &base);
+                DeviceChain::upload(&b, &pd, &post);
+                let mut rec = b.begin();
+                rec.keep_groups(keep);
+                assert!(rec.moe_routed(gpu.as_ref(), &xr, &sums, &lr, top_k, rows));
+                rec.stream_apply(&xa, &sums, &pd, rows, streams, hidden);
+                assert!(rec.moe_routed_into(gpu.as_ref(), &xr, &xb, &pd, &lr, top_k, rows, streams));
+                rec.read(&xa);
+                rec.read(&xb);
+                let mut got = rec.finish();
+                let (into, apart) = (got.pop().unwrap(), got.pop().unwrap());
+                let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+                assert_eq!(bits(&into), bits(&apart), "{rows} rows keep {keep}: into the streams");
             }
         }
     }

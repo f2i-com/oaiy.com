@@ -224,6 +224,14 @@ pub trait ChainRecorder {
         let _ = (experts, x, out, logits, top_k, rows);
         false
     }
+    /// [`Self::moe_routed`] with each row's sum added to its streams as a hyper-connection site writes it back
+    /// ([`Self::stream_apply`]: `streams_x[r, s] += post[r, s] * sum[r]`, `streams` of them), where `moe_routed` puts
+    /// it in a vector for a write-back after: a dispatch fewer. False where the device cannot (nothing recorded).
+    #[allow(clippy::too_many_arguments)]
+    fn moe_routed_into(&mut self, experts: &dyn crate::exl3::Experts, x: &DeviceVec, streams_x: &DeviceVec, post: &DeviceVec, logits: &DeviceVec, top_k: usize, rows: usize, streams: usize) -> bool {
+        let _ = (experts, x, streams_x, post, logits, top_k, rows, streams);
+        false
+    }
     /// `acc[i] += weights[at] * y[i]` for `i < len`: a weighted sum's term, its weight read from the device (an
     /// expert's, written by the host before the chain runs).
     fn axpy_at(&mut self, acc: &DeviceVec, y: &DeviceVec, weights: &DeviceVec, at: usize, len: usize);

@@ -1578,6 +1578,8 @@ mod dense_webgpu_timing {
             dot / (n(a) * n(b))
         };
         let gen: usize = std::env::var("FLASHNEXT_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(160);
+        // FLASHNEXT_DRAFTS: drafts a check (the server's 3)
+        let drafts_a_check: usize = std::env::var("FLASHNEXT_DRAFTS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
         for prompt in [
             "<|im_start|>user\nList ten facts about the planet Mars, one a line.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
             "<|im_start|>user\nWrite a short story about a cat called Moss who lives on a boat.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
@@ -1623,7 +1625,7 @@ mod dense_webgpu_timing {
                     src += 1;
                     continue;
                 }
-                let drafted = model.draft(&kv, &seq[seq.len().saturating_sub(crate::flashnext::CHECK_ROWS + 1)..], 3).filter(|d| !d.is_empty());
+                let drafted = model.draft(&kv, &seq[seq.len().saturating_sub(crate::flashnext::CHECK_ROWS + 1)..], drafts_a_check).filter(|d| !d.is_empty());
                 match drafted.and_then(|d| {
                     let rows: Vec<u32> = std::iter::once(next).chain(d.iter().copied()).collect();
                     Some((d, model.check(&rows, &mut kv)?))

@@ -1994,13 +1994,13 @@ impl FlashNext {
         // dispatches are sized by). OAIY_HOST_ROUTE routes a step on the host too.
         let on_gpu = keep && cfg.experts <= 1024 && cfg.top_k <= 32 && std::env::var_os("OAIY_HOST_ROUTE").is_none();
         let undo = m.undo.as_ref().filter(|_| check);
+        // a prompt's rows as the host routed them (between a layer's submits); on the GPU, each layer's are recorded
+        // after its router, their sums added to the streams there
         enum Routed {
             Host(Vec<Vec<(usize, f32)>>),
-            Device,
         }
         let experts = |rec: &mut dyn ChainRecorder, dv: &ChainDev, layer: usize, routed: Routed| match routed {
             Routed::Host(assign) => rec.moe_rows(self.layers[layer].moe.experts.as_ref(), &dv.y2_in, &dv.moe_out, &assign),
-            Routed::Device => assert!(rec.moe_routed(self.layers[layer].moe.experts.as_ref(), &dv.y2_in, &dv.moe_out, &dv.router, cfg.top_k, t), "a chain's experts route on their GPU"),
         };
         // an attention layer's K and V rows and its indexer keys (`[t, index_dim]`), read back, into the host's cache
         let (iq, id) = (cfg.index_heads * cfg.index_dim, cfg.index_dim);
@@ -2145,7 +2145,8 @@ impl FlashNext {
             hc(&mut *rec, dv, t, &cl.mlp_hc, Some((&dv.y_out, &dv.post)), &dv.post2, &dv.y2_in);
             cl.router.mul(&mut *rec, cfg.experts + 1, h, &dv.y2_in, &dv.router, t);
             if on_gpu {
-                // the experts are recorded after it, on the device; the recording goes on
+                // the experts after it, on the device, their sums into the streams; the recording goes on
+                assert!(rec.moe_routed_into(layer.moe.experts.as_ref(), &dv.y2_in, &dv.x, &dv.post2, &dv.router, cfg.top_k, t, s), "a chain's experts route on their GPU");
                 if let ChainMixer::Attn { slot, .. } = &cl.mixer {
                     rec.read_range(&m.kv[d].layers[*slot], past * row, t * row);
                     match few_set {
@@ -2154,7 +2155,6 @@ impl FlashNext {
                     }
                     attn_reads.push(i);
                 }
-                pending = Some(Routed::Device);
                 continue;
             }
             rec.read(&dv.router);
@@ -2426,8 +2426,7 @@ impl FlashNext {
             // the experts, their write the layer's output streams
             hc(&mut *rec, &mc.mlp_hc, Some((&dv.y_out, &dv.post)), &dv.post2, &dv.y2_in, dv, rows);
             mc.router.mul(&mut *rec, cfg.experts + 1, h, &dv.y2_in, &dv.router, rows);
-            assert!(rec.moe_routed(mp.experts.as_ref(), &dv.y2_in, &dv.moe_out, &dv.router, cfg.top_k, rows), "the prediction layer's experts route on their GPU");
-            rec.stream_apply(&dv.x, &dv.moe_out, &dv.post2, rows, s, h);
+            assert!(rec.moe_routed_into(mp.experts.as_ref(), &dv.y2_in, &dv.x, &dv.post2, &dv.router, cfg.top_k, rows, s), "the prediction layer's experts route on their GPU");
             // the last row's streams (the next pass's input), collapsed, then the head: the next draft
             if rows > 1 {
                 rec.copy(&dv.x, (rows - 1) * s * h, &one.dv.x, 0, s * h);

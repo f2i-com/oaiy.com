@@ -1410,6 +1410,88 @@ impl DeviceChain for WgpuBackend {
     }
 }
 
+impl Recorder<'_> {
+    /// [`ChainRecorder::exl3_rows`], the input `x`, or (`up` given) the SwiGLU `silu(x) * up` computed as the input
+    /// transform reads it (a shared expert's down projection: a dispatch fewer).
+    pub(crate) fn exl3_rows_of(&mut self, w: &dyn ggml_rs::exl3::PackedLinear, x: &DeviceVec, up: Option<&DeviceVec>, y: &DeviceVec, rows: usize) {
+        let g = w.as_any().and_then(|a| a.downcast_ref::<crate::exl3::Exl3Gpu>()).expect("an EXL3 projection this adapter holds");
+        assert!(g.is_on(&self.backend.gpu), "chain: an EXL3 projection of another adapter");
+        let (words, splits) = g.single_chunk().expect("an EXL3 projection in one buffer");
+        let (k, n) = g.kn();
+        assert!(rows > 0 && x.len >= rows * k && y.len >= rows * n && rows <= 65535, "chain: an EXL3 [{n}, {k}] of {rows} rows");
+        let c = g.chain(self.backend);
+        // a step's one row: the projection's own scratch (its bind groups kept); a check's few rows the device's shared
+        // few-rows scratch (kept too); else this call's
+        let few = (2..=crate::exl3::FEW_MAX).contains(&rows) && self.keep && crate::exl3::FewScratch::fits(k, n, splits as usize);
+        let (xh, part, yt, jobs) = if rows == 1 && self.keep {
+            (c.xh.clone(), c.part.clone(), c.yt.clone(), c.jobs1.clone())
+        } else if few {
+            let f = self.gpu().few(self.backend);
+            (f.xh.clone(), f.part.clone(), f.yt.clone(), f.jobs.clone())
+        } else {
+            let list: Vec<u32> = (0..rows as u32).flat_map(|r| [0, r]).collect();
+            let jobs = self.scratch(list.len());
+            crate::exl3::upload_u32(self.backend, &jobs, &list);
+            (self.scratch(rows * k), self.scratch(rows * splits as usize * n), self.scratch(rows * n), jobs)
+        };
+        let d = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        let imap = c.imap.as_ref().map_or(&d, buffer).clone();
+        match up {
+            Some(u) => {
+                assert!(x.len >= rows * k && u.len >= rows * k, "chain: a SwiGLU's {rows} rows of {k}");
+                self.dispatch_wide("exl3-pre-swiglu", crate::exl3::chain_shader("pre-swiglu"), [buffer(x), buffer(&c.suh), &imap, buffer(&jobs), buffer(u), &d, buffer(&xh), &drw], &[k as u32, c.imap.is_none() as u32, 1, 0, 1, 0], ((k / 128) as u32, rows as u32, 1));
+            }
+            None => self.dispatch_wide("exl3-pre", crate::exl3::chain_shader("pre"), [buffer(x), buffer(&c.suh), &imap, buffer(&jobs), &d, &d, buffer(&xh), &drw], &[k as u32, c.imap.is_none() as u32], ((k / 128) as u32, rows as u32, 1)),
+        }
+        let ntiles = (n / 16) as u32;
+        let grid = |z: usize| (ntiles.min(65535), ntiles.div_ceil(65535), z as u32 * splits);
+        let mm = crate::exl3::chain_shader("mm");
+        if rows == 1 {
+            self.dispatch_wide("exl3-mm", mm, [words, buffer(&xh), buffer(&jobs), &d, &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, splits, 0], grid(1));
+        } else if rows <= crate::exl3::FEW_MAX {
+            // a few rows (a check of drafts): each tile decoded once for all of them, each row summed as one row is
+            let order = if few {
+                self.gpu().few(self.backend).order.clone()
+            } else {
+                let order = self.scratch(rows);
+                crate::exl3::upload_u32(self.backend, &order, &(0..rows as u32).collect::<Vec<_>>());
+                order
+            };
+            self.dispatch_wide(crate::exl3::few_name(rows), crate::exl3::g_few(rows), [words, buffer(&xh), buffer(&jobs), buffer(&order), &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, splits, 0, 0], grid(1));
+        } else {
+            // a prompt's rows summed as the projection's own passes sum them (each tile decoded once for 64 of them here),
+            // and a last lone row of a pass as one row is
+            const BLOCK: usize = 64;
+            let lone = rows % 32 == 1;
+            let many: Vec<u32> = (0..(rows - lone as usize) as u32).collect::<Vec<_>>().chunks(BLOCK).flat_map(|b| b.iter().copied().chain(std::iter::repeat(crate::exl3::NONE)).take(BLOCK)).collect();
+            let order = self.scratch(many.len());
+            crate::exl3::upload_u32(self.backend, &order, &many);
+            let per = 65535 / splits as usize;
+            let blocks = many.len() / BLOCK;
+            let kernel = crate::exl3::g_many(BLOCK);
+            for first in (0..blocks).step_by(per) {
+                self.dispatch_wide(crate::exl3::many_name(BLOCK), &kernel, [words, buffer(&xh), buffer(&jobs), buffer(&order), &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, splits, 0, first as u32], grid(per.min(blocks - first)));
+            }
+            if lone {
+                self.dispatch_wide("exl3-mm", mm, [words, buffer(&xh), buffer(&jobs), &d, &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, splits, 0, rows as u32 - 1], grid(1));
+            }
+        }
+        let post = crate::exl3::chain_shader("post");
+        let post_out = if c.omap.is_some() { buffer(&yt) } else { buffer(y) };
+        self.dispatch_wide("exl3-post", post, [buffer(&part), buffer(&c.svh), buffer(&jobs), &d, &d, &d, post_out, &drw], &[n as u32, splits], ((n / 128) as u32, rows as u32, 1));
+        if let Some(omap) = &c.omap {
+            let gather = crate::exl3::chain_shader("gather");
+            self.dispatch_wide("exl3-gather", gather, [buffer(&yt), buffer(omap), buffer(&jobs), &d, &d, &d, buffer(y), &drw], &[n as u32], ((n as u32).div_ceil(256), rows as u32, 1));
+        }
+    }
+
+    /// [`Self::exl3_rows_of`] of a SwiGLU: `silu(gate) * up`'s rows.
+    pub(crate) fn exl3_rows_swiglu(&mut self, w: &dyn ggml_rs::exl3::PackedLinear, gate: &DeviceVec, up: &DeviceVec, y: &DeviceVec, rows: usize) {
+        self.exl3_rows_of(w, gate, Some(up), y, rows);
+    }
+}
+
 impl<'a> Recorder<'a> {
     /// A recording on `backend`, its bind groups kept (the crate's own measurements record kernels directly).
     #[cfg(test)]
@@ -1718,71 +1800,7 @@ impl ChainRecorder for Recorder<'_> {
     }
 
     fn exl3_rows(&mut self, w: &dyn ggml_rs::exl3::PackedLinear, x: &DeviceVec, y: &DeviceVec, rows: usize) {
-        let g = w.as_any().and_then(|a| a.downcast_ref::<crate::exl3::Exl3Gpu>()).expect("an EXL3 projection this adapter holds");
-        assert!(g.is_on(&self.backend.gpu), "chain: an EXL3 projection of another adapter");
-        let (words, splits) = g.single_chunk().expect("an EXL3 projection in one buffer");
-        let (k, n) = g.kn();
-        assert!(rows > 0 && x.len >= rows * k && y.len >= rows * n && rows <= 65535, "chain: an EXL3 [{n}, {k}] of {rows} rows");
-        let c = g.chain(self.backend);
-        // a step's one row: the projection's own scratch (its bind groups kept); a check's few rows the device's shared
-        // few-rows scratch (kept too); else this call's
-        let few = (2..=crate::exl3::FEW_MAX).contains(&rows) && self.keep && crate::exl3::FewScratch::fits(k, n, splits as usize);
-        let (xh, part, yt, jobs) = if rows == 1 && self.keep {
-            (c.xh.clone(), c.part.clone(), c.yt.clone(), c.jobs1.clone())
-        } else if few {
-            let f = self.gpu().few(self.backend);
-            (f.xh.clone(), f.part.clone(), f.yt.clone(), f.jobs.clone())
-        } else {
-            let list: Vec<u32> = (0..rows as u32).flat_map(|r| [0, r]).collect();
-            let jobs = self.scratch(list.len());
-            crate::exl3::upload_u32(self.backend, &jobs, &list);
-            (self.scratch(rows * k), self.scratch(rows * splits as usize * n), self.scratch(rows * n), jobs)
-        };
-        let d = self.gpu().dummy().clone();
-        let drw = self.gpu().dummy_rw().clone();
-        let imap = c.imap.as_ref().map_or(&d, buffer).clone();
-        let pre = crate::exl3::chain_shader("pre");
-        self.dispatch_wide("exl3-pre", &pre, [buffer(x), buffer(&c.suh), &imap, buffer(&jobs), &d, &d, buffer(&xh), &drw], &[k as u32, c.imap.is_none() as u32], ((k / 128) as u32, rows as u32, 1));
-        let ntiles = (n / 16) as u32;
-        let grid = |z: usize| (ntiles.min(65535), ntiles.div_ceil(65535), z as u32 * splits);
-        let mm = crate::exl3::chain_shader("mm");
-        if rows == 1 {
-            self.dispatch_wide("exl3-mm", &mm, [words, buffer(&xh), buffer(&jobs), &d, &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, splits, 0], grid(1));
-        } else if rows <= crate::exl3::FEW_MAX {
-            // a few rows (a check of drafts): each tile decoded once for all of them, each row summed as one row is
-            let order = if few {
-                self.gpu().few(self.backend).order.clone()
-            } else {
-                let order = self.scratch(rows);
-                crate::exl3::upload_u32(self.backend, &order, &(0..rows as u32).collect::<Vec<_>>());
-                order
-            };
-            self.dispatch_wide(crate::exl3::few_name(rows), crate::exl3::g_few(rows), [words, buffer(&xh), buffer(&jobs), buffer(&order), &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, splits, 0, 0], grid(1));
-        } else {
-            // a prompt's rows summed as the projection's own passes sum them (each tile decoded once for 64 of them here),
-            // and a last lone row of a pass as one row is
-            const BLOCK: usize = 64;
-            let lone = rows % 32 == 1;
-            let many: Vec<u32> = (0..(rows - lone as usize) as u32).collect::<Vec<_>>().chunks(BLOCK).flat_map(|b| b.iter().copied().chain(std::iter::repeat(crate::exl3::NONE)).take(BLOCK)).collect();
-            let order = self.scratch(many.len());
-            crate::exl3::upload_u32(self.backend, &order, &many);
-            let per = 65535 / splits as usize;
-            let blocks = many.len() / BLOCK;
-            let kernel = crate::exl3::g_many(BLOCK);
-            for first in (0..blocks).step_by(per) {
-                self.dispatch_wide(crate::exl3::many_name(BLOCK), &kernel, [words, buffer(&xh), buffer(&jobs), buffer(&order), &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, splits, 0, first as u32], grid(per.min(blocks - first)));
-            }
-            if lone {
-                self.dispatch_wide("exl3-mm", &mm, [words, buffer(&xh), buffer(&jobs), &d, &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, splits, 0, rows as u32 - 1], grid(1));
-            }
-        }
-        let post = crate::exl3::chain_shader("post");
-        let post_out = if c.omap.is_some() { buffer(&yt) } else { buffer(y) };
-        self.dispatch_wide("exl3-post", &post, [buffer(&part), buffer(&c.svh), buffer(&jobs), &d, &d, &d, post_out, &drw], &[n as u32, splits], ((n / 128) as u32, rows as u32, 1));
-        if let Some(omap) = &c.omap {
-            let gather = crate::exl3::chain_shader("gather");
-            self.dispatch_wide("exl3-gather", &gather, [buffer(&yt), buffer(omap), buffer(&jobs), &d, &d, &d, buffer(y), &drw], &[n as u32], ((n as u32).div_ceil(256), rows as u32, 1));
-        }
+        self.exl3_rows_of(w, x, None, y, rows);
     }
 
     fn rmsnorm_streams(&mut self, x: &DeviceVec, w: &DeviceVec, out: &DeviceVec, rows: usize, streams: usize, eps: f32) {
@@ -1819,7 +1837,15 @@ impl ChainRecorder for Recorder<'_> {
 
     fn moe_routed(&mut self, experts: &dyn ggml_rs::exl3::Experts, x: &DeviceVec, out: &DeviceVec, logits: &DeviceVec, top_k: usize, rows: usize) -> bool {
         let Some(g) = experts.as_any().and_then(|a| a.downcast_ref::<crate::exl3::Exl3MoeGrouped>()) else { return false };
-        g.record_routed(self, x, out, logits, top_k, rows)
+        g.record_routed(self, x, out, logits, top_k, rows, None)
+    }
+
+    fn moe_routed_into(&mut self, experts: &dyn ggml_rs::exl3::Experts, x: &DeviceVec, streams_x: &DeviceVec, post: &DeviceVec, logits: &DeviceVec, top_k: usize, rows: usize, streams: usize) -> bool {
+        let Some(g) = experts.as_any().and_then(|a| a.downcast_ref::<crate::exl3::Exl3MoeGrouped>()) else { return false };
+        // no vector for the sums: they go into the streams
+        let none = self.gpu().dummy_rw().clone();
+        let out = DeviceVec { len: 0, inner: Arc::new(none) };
+        g.record_routed(self, x, &out, logits, top_k, rows, Some((streams_x, post, streams)))
     }
 
     fn axpy_at(&mut self, acc: &DeviceVec, y: &DeviceVec, weights: &DeviceVec, at: usize, len: usize) {
