@@ -20,8 +20,12 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 # Mesh simplification for 3D models (meshoptimizer, MIT).
 meshopt = "0.6"
+# The WebGPU chain (Qwen Image's transformer on any GPU wgpu reaches: Vulkan, Metal, Direct3D 12).
+ggml-rs = { path = "../ggml-rs", optional = true }
+ggml-rs-wgpu = { path = "../ggml-rs-wgpu", optional = true }
 
 [features]
 default = []
 cuda = ["candle-core/cuda", "candle-nn/cuda", "oaiy-tts/cuda"]
 flash-attn = ["cuda", "dep:candle-flash-attn", "oaiy-tts/flash-attn"]
+webgpu = ["dep:ggml-rs", "dep:ggml-rs-wgpu"]

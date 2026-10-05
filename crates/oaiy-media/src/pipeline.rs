@@ -32,6 +32,9 @@ pub struct Request {
     pub reference_size: usize,
     /// Where the transformer and text-encoder blocks live: GPU, RAM or SSD.
     pub budget: Budget,
+    /// The transformer on WebGPU (`backend` "webgpu": any GPU wgpu reaches, OAIY_WEBGPU_ADAPTER picking one), the text
+    /// encoder and VAE on the build's own device.
+    pub webgpu: bool,
 }
 impl Request {
     pub fn parse(j: &Json) -> std::result::Result<Self, String> {
@@ -118,6 +121,12 @@ impl Request {
             device: number("device", 0)?,
             cfg,
             budget: Budget::parse(j)?,
+            webgpu: match j.get("backend").and_then(Json::as_str) {
+                None | Some("cuda" | "cpu") => false,
+                Some("webgpu") if cfg!(feature = "webgpu") => true,
+                Some("webgpu") => return Err("this build has no WebGPU (the webgpu feature)".into()),
+                Some(other) => return Err(format!("backend must be cuda, cpu or webgpu, not {other}")),
+            },
         };
         r.validate()?;
         Ok(r)
@@ -177,6 +186,9 @@ impl Request {
                 return Err(format!("LoRA strength must be between -4 and 4 ({})", path.display()));
             }
         }
+        if self.webgpu && !self.images.is_empty() {
+            return Err("reference images are not supported on WebGPU yet".into());
+        }
         for path in [&self.base, &self.transformer]
             .into_iter()
             .chain(self.adapter.iter()).chain(self.text_encoder.iter()).chain(self.loras.iter().map(|(p, _)| p))
@@ -186,6 +198,57 @@ impl Request {
             }
         }
         Ok(())
+    }
+}
+
+/// The transformer on its device: Candle's (CUDA or the CPU) or the WebGPU chain's.
+enum Model {
+    Candle(Transformer),
+    #[cfg(feature = "webgpu")]
+    Wgpu(crate::qwen_wgpu::WgpuTransformer),
+}
+
+/// A prompt's conditioning, as its model made it.
+enum Prefix {
+    Candle(crate::transformer::Prefix),
+    #[cfg(feature = "webgpu")]
+    Wgpu(crate::qwen_wgpu::WgpuPrefix),
+}
+
+impl Model {
+    fn prepare(&mut self, text: &crate::text::Conditioning, refs: &[(Tensor, usize, usize)]) -> Result<Prefix> {
+        match self {
+            Model::Candle(m) => m.prepare(text, refs).map(Prefix::Candle),
+            #[cfg(feature = "webgpu")]
+            Model::Wgpu(m) => m.prepare(text, refs).map(Prefix::Wgpu),
+        }
+    }
+
+    /// The velocity at `sigma`, on `latent`'s device and in its dtype.
+    fn conditioned(&mut self, latent: &Tensor, prefix: &Prefix, sigma: f64, h: usize, w: usize) -> Result<Tensor> {
+        match (self, prefix) {
+            (Model::Candle(m), Prefix::Candle(p)) => m.conditioned(latent, p, sigma, h, w),
+            #[cfg(feature = "webgpu")]
+            (Model::Wgpu(m), Prefix::Wgpu(p)) => m.conditioned(latent, p, sigma, h, w)?.to_device(latent.device())?.to_dtype(latent.dtype()),
+            #[cfg(feature = "webgpu")]
+            _ => candle_core::bail!("a prompt's conditioning from another model"),
+        }
+    }
+
+    fn lora_notes(&self) -> &[String] {
+        match self {
+            Model::Candle(m) => m.lora_notes(),
+            #[cfg(feature = "webgpu")]
+            Model::Wgpu(m) => m.lora_notes(),
+        }
+    }
+
+    fn residency(&self) -> Json {
+        match self {
+            Model::Candle(m) => m.residency(),
+            #[cfg(feature = "webgpu")]
+            Model::Wgpu(_) => Json::obj([("device", Json::str("webgpu"))]),
+        }
     }
 }
 
@@ -294,13 +357,21 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
     let encoding_seconds = encoding_start.elapsed().as_secs_f64();
     event(Json::obj([("stage", Json::str("loading_transformer"))]));
     let load_start = Instant::now();
-    let mut model = Transformer::load(&r.transformer, r.adapter.as_deref(), &r.loras, &dev, dtype, &r.budget, |n| {
+    let progress = |n: usize| {
         event(Json::obj([
             ("stage", Json::str("loading_transformer")),
             ("block", Json::Int(n as i64)),
             ("blocks", Json::Int(32)),
         ]))
-    })?;
+    };
+    #[cfg(feature = "webgpu")]
+    let mut model = if r.webgpu {
+        Model::Wgpu(crate::qwen_wgpu::WgpuTransformer::load(&r.transformer, r.adapter.as_deref(), &r.loras, progress)?)
+    } else {
+        Model::Candle(Transformer::load(&r.transformer, r.adapter.as_deref(), &r.loras, &dev, dtype, &r.budget, progress)?)
+    };
+    #[cfg(not(feature = "webgpu"))]
+    let mut model = Model::Candle(Transformer::load(&r.transformer, r.adapter.as_deref(), &r.loras, &dev, dtype, &r.budget, progress)?);
     dev.synchronize()?;
     let transformer_load_seconds = load_start.elapsed().as_secs_f64();
     for note in model.lora_notes() {

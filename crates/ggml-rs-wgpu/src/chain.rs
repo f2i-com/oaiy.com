@@ -38,18 +38,20 @@ fn main(@builtin(local_invocation_index) li: u32) {
 }
 "#;
 
-/// [`RMSNORM`] of row `wg.x` of `x` (rows of `p[0].x`), every row with the same weights `w`, or with `p[0].z` rows of
-/// them the row's `wg.x % p[0].z` (a hyper-connection's streams).
+/// [`RMSNORM`] of row `wg.x + 65535 wg.y` of `x` (rows of `p[0].x`, `p[0].w` of them), every row with the same
+/// weights `w`, or with `p[0].z` rows of them the row's `row % p[0].z` (a hyper-connection's streams).
 const RMSNORM_ROWS: &str = r#"
 var<workgroup> part: array<f32, 256>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
     let n = p[0].x;
-    let at = wg.x * n;
+    let row = wg.x + wg.y * 65535u;
+    if (row >= p[0].w) { return; }
+    let at = row * n;
     var wrows = p[0].z;
     if (wrows == 0u) { wrows = 1u; }
-    let wat = (wg.x % wrows) * n;
+    let wat = (row % wrows) * n;
     var s = 0.0;
     for (var i = li; i < n; i += 256u) { let v = x[at + i]; s += v * v; }
     part[li] = s;
@@ -64,7 +66,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 "#;
 
 /// [`RMSNORM_ROWS`] of rows a multiple of 4 long: vec4 loads, a thread's squares in four running sums (its loads in
-/// flight together, where one sum waited on each load in turn). `p[0]`: n, the bits of eps, weight rows.
+/// flight together, where one sum waited on each load in turn). `p[0]`: n, the bits of eps, weight rows, rows.
 const RMSNORM_ROWS4: &str = r#"
 @group(0) @binding(0) var<storage, read> w4: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read> x4: array<vec4<f32>>;
@@ -75,10 +77,12 @@ var<workgroup> part: array<f32, 256>;
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
     let n4 = p[0].x / 4u;
-    let at = wg.x * n4;
+    let row = wg.x + wg.y * 65535u;
+    if (row >= p[0].w) { return; }
+    let at = row * n4;
     var wrows = p[0].z;
     if (wrows == 0u) { wrows = 1u; }
-    let wat = (wg.x % wrows) * n4;
+    let wat = (row % wrows) * n4;
     var s = vec4<f32>(0.0);
     for (var i = li; i < n4; i += 256u) { let v = x4[at + i]; s += v * v; }
     part[li] = s.x + s.y + s.z + s.w;
@@ -105,7 +109,9 @@ var<workgroup> part: array<f32, 256>;
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
     let n4 = p[0].x / 4u;
-    let at = wg.x * n4;
+    let row = wg.x + wg.y * 65535u;
+    if (row >= p[0].z) { return; }
+    let at = row * n4;
     var s = vec4<f32>(0.0);
     for (var i = li; i < n4; i += 256u) {
         let v = x4[at + i] + yv[at + i];
@@ -272,7 +278,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 const STORE_ROWS: &str = r#"
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let i = id.x;
+    let i = id.x + id.y * 16776960u;
     let len = p[0].x;
     if (i < len * p[1].x) {
         let r = i / len;
@@ -487,6 +493,14 @@ fn attention_coop(hd: usize) -> String {
         .replace("STORES\n", &stores)
 }
 
+/// [`attention_coop`] with no causal mask: every query over all `kv_len` positions.
+fn attention_coop_full(hd: usize) -> String {
+    let causal = "    let qpos = p.past + q0 + tr;\n    // the blocks the last query sees\n    let hi = min(p.kv_len, p.past + q0 + 32u);\n";
+    let src = attention_coop(hd);
+    assert_eq!(src.matches(causal).count(), 1, "the causal limit");
+    src.replace(causal, "    // every position, the last query's and the first's alike\n    let qpos = p.kv_len;\n    let hi = p.kv_len;\n")
+}
+
 /// A split tensor-core matmul's sums put together: `y[i]` the sum of `x`'s `p[0].y` parts of `p[0].x` each.
 const COOP_SUM: &str = r#"
 @compute @workgroup_size(256)
@@ -652,6 +666,81 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let width = p[0].x;
     let i = id.x + id.y * 16776960u;
     if (i < width * p[0].y) { y[i] = x[(i / width) * p[0].z + p[0].w + i % width]; }
+}
+"#;
+
+/// Each row of `x` (rows of `p[0].x`, a workgroup a row: `wg.x + wg.y * 65535`) layer-normed (no weights, `eps` the
+/// bits of `p[0].y` added to the variance: the mean, then the mean square of the deviations) into `y`, times `1 +
+/// mods[p[0].z + i]` and plus `mods[p[0].w + i]` unless `p[0].w` is all ones. `p[1].x`: the rows.
+const LAYERNORM_MOD_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> mods: array<f32>;
+@group(0) @binding(6) var<storage, read_write> y: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+var<workgroup> part: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let n = p[0].x;
+    let r = wg.x + wg.y * 65535u;
+    if (r >= p[1].x) { return; }
+    let at = r * n;
+    var s = 0.0;
+    for (var i = li; i < n; i += 256u) { s += x[at + i]; }
+    part[li] = s;
+    workgroupBarrier();
+    for (var stride = 128u; stride > 0u; stride /= 2u) {
+        if (li < stride) { part[li] += part[li + stride]; }
+        workgroupBarrier();
+    }
+    let mean = part[0] / f32(n);
+    workgroupBarrier();
+    var q = 0.0;
+    for (var i = li; i < n; i += 256u) { let d = x[at + i] - mean; q += d * d; }
+    part[li] = q;
+    workgroupBarrier();
+    for (var stride = 128u; stride > 0u; stride /= 2u) {
+        if (li < stride) { part[li] += part[li + stride]; }
+        workgroupBarrier();
+    }
+    let inv = 1.0 / sqrt(part[0] / f32(n) + bitcast<f32>(p[0].y));
+    let shifted = p[0].w != 0xffffffffu;
+    for (var i = li; i < n; i += 256u) {
+        var v = (x[at + i] - mean) * inv * (1.0 + mods[p[0].z + i]);
+        if (shifted) { v += mods[p[0].w + i]; }
+        y[at + i] = v;
+    }
+}
+"#;
+
+/// `x[i] += y[i] * g` for `i < p[0].x * p[0].y` (rows of `p[0].x`), `g` `mods[p[0].z + i % p[0].x]`, its tanh where
+/// `p[0].w` is 1.
+const ADD_GATED_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> yv: array<f32>;
+@group(0) @binding(1) var<storage, read> mods: array<f32>;
+@group(0) @binding(6) var<storage, read_write> x: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    if (i >= p[0].x * p[0].y) { return; }
+    var g = mods[p[0].z + i % p[0].x];
+    if (p[0].w == 1u) { g = tanh(g); }
+    x[i] += yv[i] * g;
+}
+"#;
+
+/// `y[i] = gelu(x[i])` for `i < p[0].x`, the tanh approximation (as [`GELU_MUL_SPLIT`]'s).
+const GELU: &str = r#"
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    if (i < p[0].x) {
+        let g = x[i];
+        let inner = 0.7978845608028654 * (g + 0.044715 * g * g * g);
+        y[i] = 0.5 * g * (1.0 + tanh(inner));
+    }
 }
 "#;
 
@@ -2027,6 +2116,26 @@ impl DeviceChain for WgpuBackend {
         Some(v)
     }
 
+    fn attention_rows_full_out_len(&self, rows: usize, n_h: usize, head_dim: usize, kv_len: usize) -> usize {
+        // the tensor cores' kernel writes its rows padded to 32 and keeps nothing else there
+        if rows >= 16 && matches!(head_dim, 64 | 128 | 256) && self.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+            rows.div_ceil(32) * 32 * n_h * head_dim
+        } else {
+            self.attention_rows_out_len(rows, n_h, head_dim, kv_len)
+        }
+    }
+
+    fn vec_f16_rounded(&self, values: &[f32]) -> Option<DeviceVec> {
+        use rayon::prelude::*;
+        if values.len() % 2 != 0 || values.par_chunks(1 << 16).any(|c| c.iter().any(|v| !v.is_finite() || v.abs() > 65504.0)) {
+            return None;
+        }
+        let words: Vec<f32> = values.par_chunks_exact(2).map(|p| f32::from_bits(half::f16::from_f32(p[0]).to_bits() as u32 | (half::f16::from_f32(p[1]).to_bits() as u32) << 16)).collect();
+        let v = self.vec(words.len());
+        DeviceChain::upload(self, &v, &words);
+        Some(v)
+    }
+
     fn zero(&self, v: &DeviceVec) {
         let mut enc = self.gpu.device.create_command_encoder(&Default::default());
         enc.clear_buffer(buffer(v), 0, None);
@@ -2048,6 +2157,12 @@ impl DeviceChain for WgpuBackend {
         assert!(offset + data.len() <= v.len, "chain: {} values at {offset} into a vector of {}", data.len(), v.len);
         if !data.is_empty() {
             self.gpu.queue.write_buffer(buffer(v), (offset * 4) as u64, &le_bytes(data));
+            // a large write's staging (device memory, with Resizable BAR) let go now: a model's weights uploaded in
+            // turn held it all until the next submit (Qwen Image's 14 GB took 31 of a 32 GB card)
+            if data.len() >= 16 << 20 {
+                self.gpu.queue.submit([]);
+                let _ = self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+            }
         }
     }
 
@@ -2471,6 +2586,12 @@ impl Recorder<'_> {
     /// [`ChainRecorder::attention_rows`] in f32: the positions in runs of 256 a workgroup a (head, run, query), then the
     /// runs joined.
     pub(crate) fn attention_rows_f32(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, past: usize, window: Option<usize>, scale: f32) {
+        self.attention_rows_f32_masked(q, kv, out, rows, n_h, n_kv, head_dim, past, window, scale, false)
+    }
+
+    /// [`Self::attention_rows_f32`], with `full` every query over every position (no causal mask).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn attention_rows_f32_masked(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, past: usize, window: Option<usize>, scale: f32, full: bool) {
         let kv_len = past + rows;
         let runs = kv_len.div_ceil(SPLIT).max(1);
         assert!(
@@ -2478,7 +2599,16 @@ impl Recorder<'_> {
             "chain: a prompt's attention's buffers"
         );
         let params = self.uniform(&[n_h as u32, n_kv as u32, head_dim as u32, past as u32, window.unwrap_or(0) as u32, runs as u32, scale.to_bits(), rows as u32]);
-        let part = self.named("chain-attention-rows-part", ATTENTION_ROWS_PART);
+        let part = if full {
+            // every query's positions all `past + rows` of them
+            self.gpu().named_pipeline("chain-attention-rows-part-full", || {
+                let body = ATTENTION_ROWS_PART.replace("    let hi = past + s + 1u;\n", "    let hi = past + rows;\n");
+                assert_ne!(body, ATTENTION_ROWS_PART, "the parts' causal limit");
+                format!("{HEAD}{body}")
+            })
+        } else {
+            self.named("chain-attention-rows-part", ATTENTION_ROWS_PART)
+        };
         self.dispatch(&part, buffer(kv), buffer(q), buffer(out), &params, (n_h as u32, runs as u32, rows as u32));
         let join = self.named("chain-attention-rows-join", ATTENTION_ROWS_JOIN);
         self.dispatch(&join, buffer(kv), buffer(q), buffer(out), &params, (n_h as u32, rows as u32, 1));
@@ -2489,10 +2619,19 @@ impl Recorder<'_> {
     /// softmax in f32, its weights f16. False (nothing recorded) where the device has no tensor cores, a window is
     /// kept, the head is not 64, 128 or 256 wide, or there are fewer than 16 rows.
     pub(crate) fn attention_rows_coop(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, past: usize, window: Option<usize>, scale: f32) -> bool {
-        let name = match head_dim {
-            64 => "chain-attention-coop-64",
-            128 => "chain-attention-coop-128",
-            256 => "chain-attention-coop-256",
+        self.attention_rows_coop_masked(q, kv, out, rows, n_h, n_kv, head_dim, past, window, scale, false)
+    }
+
+    /// [`Self::attention_rows_coop`], with `full` every query over every position (no causal mask).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn attention_rows_coop_masked(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, past: usize, window: Option<usize>, scale: f32, full: bool) -> bool {
+        let name = match (head_dim, full) {
+            (64, false) => "chain-attention-coop-64",
+            (128, false) => "chain-attention-coop-128",
+            (256, false) => "chain-attention-coop-256",
+            (64, true) => "chain-attention-coop-full-64",
+            (128, true) => "chain-attention-coop-full-128",
+            (256, true) => "chain-attention-coop-full-256",
             _ => return false,
         };
         if window.is_some() || rows < 16 || n_kv == 0 || n_h % n_kv != 0 || !self.gpu().device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
@@ -2501,14 +2640,15 @@ impl Recorder<'_> {
         let kv_len = past + rows;
         let (qs, row) = (n_h * head_dim, 2 * n_kv * head_dim);
         let rp = rows.div_ceil(32) * 32;
-        // the padding's rows are stored past the output, in its scratch (at least as long: 16 rows or more)
+        // the padding's rows are stored past the output (in a causal attention's scratch, at least as long: 16 rows or
+        // more; a full one's out is as long as they need, `attention_rows_full_out_len`)
         assert!(
-            kv.len >= kv_len * row && q.len >= rows * qs && out.len >= rp * qs && out.len >= self.backend.attention_rows_out_len(rows, n_h, head_dim, kv_len),
+            kv.len >= kv_len * row && q.len >= rows * qs && out.len >= rp * qs && (full || out.len >= self.backend.attention_rows_out_len(rows, n_h, head_dim, kv_len)),
             "chain: a prompt's attention's buffers"
         );
         let (q16, kv16) = self.attention_f16(q, kv, rows, kv_len, qs, row);
         let words = [n_h as u32, n_kv as u32, past as u32, rows as u32, kv_len as u32, scale.to_bits(), 0, 0];
-        let pipeline = self.gpu().named_pipeline(name, || attention_coop(head_dim));
+        let pipeline = self.gpu().named_pipeline(name, || if full { attention_coop_full(head_dim) } else { attention_coop(head_dim) });
         self.dispatch_kept(&pipeline, buffer(&kv16), buffer(&q16), buffer(out), &words, (n_h as u32, (rows.div_ceil(32)) as u32, 1));
         self.att16 = Some((q16, kv16));
         true
@@ -2898,7 +3038,8 @@ impl ChainRecorder for Recorder<'_> {
         let n = x.len / rows;
         // rows a multiple of 4 long (a model's width, a head's): vec4 loads
         let pipeline = if n % 4 == 0 { self.gpu().named_pipeline("chain-rmsnorm-rows4", || RMSNORM_ROWS4.to_string()) } else { self.named("chain-rmsnorm-rows", RMSNORM_ROWS) };
-        self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(out), &[n as u32, eps.to_bits()], (rows as u32, 1, 1));
+        let r = rows as u32;
+        self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(out), &[n as u32, eps.to_bits(), 0, r], (r.min(65535), r.div_ceil(65535), 1));
     }
 
     fn add_rmsnorm_rows(&mut self, x: &DeviceVec, y: &DeviceVec, w: &DeviceVec, out: &DeviceVec, rows: usize, eps: f32) {
@@ -2909,7 +3050,8 @@ impl ChainRecorder for Recorder<'_> {
             return;
         }
         let d = self.gpu().dummy().clone();
-        self.dispatch_wide("chain-add-rmsnorm-rows4", ADD_RMSNORM_ROWS4, [buffer(y), buffer(w), &d, &d, &d, &d, buffer(x), buffer(out)], &[n as u32, eps.to_bits()], (rows as u32, 1, 1));
+        let r = rows as u32;
+        self.dispatch_wide("chain-add-rmsnorm-rows4", ADD_RMSNORM_ROWS4, [buffer(y), buffer(w), &d, &d, &d, &d, buffer(x), buffer(out)], &[n as u32, eps.to_bits(), r], (r.min(65535), r.div_ceil(65535), 1));
     }
 
     fn add(&mut self, acc: &DeviceVec, y: &DeviceVec) {
@@ -2971,7 +3113,8 @@ impl ChainRecorder for Recorder<'_> {
         let n = x.len / (rows * streams).max(1);
         assert!(rows > 0 && streams > 0 && n * rows * streams == x.len && w.len >= streams * n && out.len >= x.len, "chain: a norm of {rows} rows of {streams} streams");
         let pipeline = self.named("chain-rmsnorm-rows", RMSNORM_ROWS);
-        self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(out), &[n as u32, eps.to_bits(), streams as u32], ((rows * streams) as u32, 1, 1));
+        let r = (rows * streams) as u32;
+        self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(out), &[n as u32, eps.to_bits(), streams as u32, r], (r.min(65535), r.div_ceil(65535), 1));
     }
 
     fn hc_gates(&mut self, t: &DeviceVec, post: &DeviceVec, rows: usize, rank: usize, writes: usize, streams: usize) {
@@ -3029,6 +3172,45 @@ impl ChainRecorder for Recorder<'_> {
         let pipeline = self.named("chain-rope", ROPE);
         let pairs = (rows * heads * rot / 2) as u32;
         self.dispatch_kept(&pipeline, buffer(table), buffer(table), buffer(x), &[heads as u32, head_dim as u32, 1, rows as u32, rot as u32], grid(pairs.div_ceil(256)));
+    }
+
+    fn matmul_f16_rows_f32(&mut self, w: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize) {
+        if rows <= 8 {
+            self.matmul_f16_rows(w, n, k, x, y, rows);
+        } else {
+            assert!(k % 2 == 0 && w.len * 2 >= n * k && x.len >= rows * k && y.len >= rows * n && n <= 65535 && rows <= 65535, "chain: an f16 matmul [{n}, {k}] of {rows} rows");
+            self.matmul_f16_tiled(w, n, k, x, y, rows);
+        }
+    }
+
+    fn layernorm_mod_rows(&mut self, x: &DeviceVec, out: &DeviceVec, rows: usize, n: usize, mods: &DeviceVec, scale_at: usize, shift_at: Option<usize>, eps: f32) {
+        assert!(rows > 0 && x.len >= rows * n && out.len >= rows * n && mods.len >= scale_at + n && shift_at.is_none_or(|s| mods.len >= s + n), "chain: a modulated layer norm of {rows} rows of {n}");
+        let d = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        let words = [n as u32, eps.to_bits(), scale_at as u32, shift_at.map_or(u32::MAX, |s| s as u32), rows as u32];
+        let r = rows as u32;
+        self.dispatch_wide("chain-layernorm-mod-rows", LAYERNORM_MOD_ROWS, [buffer(x), buffer(mods), &d, &d, &d, &d, buffer(out), &drw], &words, (r.min(65535), r.div_ceil(65535), 1));
+    }
+
+    fn add_gated_rows(&mut self, x: &DeviceVec, y: &DeviceVec, rows: usize, n: usize, mods: &DeviceVec, gate_at: usize, tanh: bool) {
+        assert!(x.len >= rows * n && y.len >= rows * n && mods.len >= gate_at + n, "chain: a gated residual of {rows} rows of {n}");
+        let d = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        self.dispatch_wide("chain-add-gated-rows", ADD_GATED_ROWS, [buffer(y), buffer(mods), &d, &d, &d, &d, buffer(x), &drw], &[n as u32, rows as u32, gate_at as u32, tanh as u32], grid(((rows * n) as u32).div_ceil(256)));
+    }
+
+    fn gelu(&mut self, x: &DeviceVec, out: &DeviceVec, len: usize) {
+        assert!(x.len >= len && out.len >= len, "chain: a GELU of {len}");
+        let pipeline = self.named("chain-gelu", GELU);
+        self.dispatch_kept(&pipeline, buffer(x), buffer(x), buffer(out), &[len as u32], grid((len as u32).div_ceil(256)));
+    }
+
+    fn attention_rows_full(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, kv_len: usize, scale: f32) {
+        assert!(rows > 0 && kv_len >= rows, "chain: a full attention of {rows} queries over {kv_len} positions");
+        let past = kv_len - rows;
+        if !self.attention_rows_coop_masked(q, kv, out, rows, n_h, n_kv, head_dim, past, None, scale, true) {
+            self.attention_rows_f32_masked(q, kv, out, rows, n_h, n_kv, head_dim, past, None, scale, true);
+        }
     }
 
     fn mul_sigmoid(&mut self, x: &DeviceVec, gate: &DeviceVec, out: &DeviceVec, len: usize) {
@@ -3177,7 +3359,7 @@ impl ChainRecorder for Recorder<'_> {
         assert!(src.len >= rows * len && at + len <= stride && dst.len >= (start + rows) * stride, "chain: storing {rows} rows");
         let pipeline = self.named("chain-store-rows", STORE_ROWS);
         let params = self.uniform(&[len as u32, start as u32, stride as u32, at as u32, rows as u32]);
-        self.dispatch(&pipeline, buffer(src), buffer(src), buffer(dst), &params, (((rows * len) as u32).div_ceil(256), 1, 1));
+        self.dispatch(&pipeline, buffer(src), buffer(src), buffer(dst), &params, grid(((rows * len) as u32).div_ceil(256)));
     }
 
     fn attention_rows(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, past: usize, window: Option<usize>, scale: f32) {
@@ -4067,6 +4249,124 @@ mod tests {
                 let scale = (k as f32).sqrt();
                 for (i, (g, e)) in got.iter().zip(&want).enumerate() {
                     assert!((g - e).abs() <= 1e-4 * scale, "[{n}, {k}] of {rows} rows [{i}]: {g} against {e}");
+                }
+            }
+        }
+    }
+
+    /// A diffusion transformer's ops as the host computes them: the modulated layer norm (with and without a shift,
+    /// rows of 4,096 and of 100), the gated residual (its gate's tanh or not), GELU, and a BF16 weight's f16 rounding
+    /// (its tiny values to the nearest f16, a value past f16's range refused).
+    #[test]
+    fn a_diffusion_transformers_ops_are_the_hosts() {
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        let mut r = rng(77);
+        for (rows, n) in [(37usize, 4096usize), (5, 100)] {
+            let x: Vec<f32> = (0..rows * n).map(|_| r() * 3.0 + 0.5).collect();
+            let mods: Vec<f32> = (0..4 * n).map(|_| r()).collect();
+            let (xd, md, out) = (b.vec(rows * n), b.vec(4 * n), b.vec(rows * n));
+            DeviceChain::upload(&b, &xd, &x);
+            DeviceChain::upload(&b, &md, &mods);
+            for shift in [None, Some(3 * n)] {
+                let mut rec = b.begin();
+                rec.layernorm_mod_rows(&xd, &out, rows, n, &md, n, shift, 1e-6);
+                rec.read(&out);
+                let got = rec.finish().pop().unwrap();
+                for row in 0..rows {
+                    let v = &x[row * n..(row + 1) * n];
+                    let mean = v.iter().map(|&a| a as f64).sum::<f64>() / n as f64;
+                    let var = v.iter().map(|&a| (a as f64 - mean).powi(2)).sum::<f64>() / n as f64;
+                    for i in 0..n {
+                        let want = (v[i] as f64 - mean) / (var + 1e-6).sqrt() * (1.0 + mods[n + i] as f64) + shift.map_or(0.0, |s| mods[s + i] as f64);
+                        let g = got[row * n + i] as f64;
+                        assert!((g - want).abs() <= 1e-4 * (1.0 + want.abs()), "layer norm row {row} [{i}] shift {shift:?}: {g} against {want}");
+                    }
+                }
+            }
+            for tanh in [true, false] {
+                let y: Vec<f32> = (0..rows * n).map(|_| r()).collect();
+                let yd = b.vec(rows * n);
+                DeviceChain::upload(&b, &yd, &y);
+                DeviceChain::upload(&b, &xd, &x);
+                let mut rec = b.begin();
+                rec.add_gated_rows(&xd, &yd, rows, n, &md, 2 * n, tanh);
+                rec.read(&xd);
+                let got = rec.finish().pop().unwrap();
+                for (i, g) in got.iter().enumerate() {
+                    let gate = mods[2 * n + i % n];
+                    let want = x[i] + y[i] * if tanh { gate.tanh() } else { gate };
+                    assert!((g - want).abs() <= 1e-5 * (1.0 + want.abs()), "gated residual [{i}] tanh {tanh}: {g} against {want}");
+                }
+            }
+        }
+        let x: Vec<f32> = (0..1000).map(|_| r() * 6.0).collect();
+        let (xd, yd) = (b.vec(1000), b.vec(1000));
+        DeviceChain::upload(&b, &xd, &x);
+        let mut rec = b.begin();
+        rec.gelu(&xd, &yd, 1000);
+        rec.read(&yd);
+        let got = rec.finish().pop().unwrap();
+        for (g, &v) in got.iter().zip(&x) {
+            let want = 0.5 * v * (1.0 + (0.797_884_6 * (v + 0.044715 * v * v * v)).tanh());
+            assert!((g - want).abs() <= 1e-5 * (1.0 + want.abs()), "gelu({v}): {g} against {want}");
+        }
+        // a BF16 weight's tiny values to the nearest f16; a value past f16's range refused
+        let w = [1.5f32, -3.0e-7, 7.0e-9, 0.333_333_34, 65504.0, -2.0];
+        let wd = b.vec_f16_rounded(&w).expect("values within f16's range");
+        let mut rec = b.begin();
+        rec.read(&wd);
+        let words = rec.finish().pop().unwrap();
+        let back: Vec<f32> = words.iter().flat_map(|v| [half::f16::from_bits(v.to_bits() as u16).to_f32(), half::f16::from_bits((v.to_bits() >> 16) as u16).to_f32()]).collect();
+        assert_eq!(back, w.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect::<Vec<_>>());
+        assert!(b.vec_f16_rounded(&[1.0, 70000.0]).is_none(), "past f16's range");
+        assert!(b.vec_f16_rounded(&[1.0, f32::NAN]).is_none(), "not a number");
+    }
+
+    /// Full (unmasked) attention as the host computes it: every query over all of a text prefix's positions and the
+    /// queries' own (Qwen-Image's image tokens: 32 heads of 128, here 4), on the tensor cores (a ragged 70 queries
+    /// over 23 + 70) and in f32 (the same, and 5 queries), and a causal one beside it unchanged.
+    #[test]
+    fn full_attention_is_the_hosts() {
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        let mut r = rng(91);
+        let (n_h, hd, scale) = (4usize, 128usize, 1.0 / (128f32).sqrt());
+        for (rows, prefix) in [(70usize, 23usize), (5, 9)] {
+            let kv_len = prefix + rows;
+            let q: Vec<f32> = (0..rows * n_h * hd).map(|_| r()).collect();
+            let kv: Vec<f32> = (0..kv_len * 2 * n_h * hd).map(|_| r()).collect();
+            let row = 2 * n_h * hd;
+            let mut want = vec![0f64; rows * n_h * hd];
+            for s in 0..rows {
+                for h in 0..n_h {
+                    let qv = &q[(s * n_h + h) * hd..(s * n_h + h + 1) * hd];
+                    let scores: Vec<f64> = (0..kv_len).map(|t| (0..hd).map(|d| qv[d] as f64 * kv[t * row + h * hd + d] as f64).sum::<f64>() * scale as f64).collect();
+                    let m = scores.iter().cloned().fold(f64::MIN, f64::max);
+                    let e: Vec<f64> = scores.iter().map(|v| (v - m).exp()).collect();
+                    let l: f64 = e.iter().sum();
+                    for d in 0..hd {
+                        want[(s * n_h + h) * hd + d] = (0..kv_len).map(|t| e[t] * kv[t * row + n_h * hd + h * hd + d] as f64).sum::<f64>() / l;
+                    }
+                }
+            }
+            let (qd, kvd) = (b.vec(q.len()), b.vec(kv.len()));
+            DeviceChain::upload(&b, &qd, &q);
+            DeviceChain::upload(&b, &kvd, &kv);
+            for coop in [true, false] {
+                if coop && (rows < 16 || !b.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)) {
+                    continue;
+                }
+                let out = b.vec(b.attention_rows_out_len(rows.div_ceil(32) * 32, n_h, hd, kv_len));
+                let mut rec = Recorder::new(&b);
+                if coop {
+                    assert!(rec.attention_rows_coop_masked(&qd, &kvd, &out, rows, n_h, n_h, hd, prefix, None, scale, true));
+                } else {
+                    rec.attention_rows_f32_masked(&qd, &kvd, &out, rows, n_h, n_h, hd, prefix, None, scale, true);
+                }
+                rec.read_range(&out, 0, rows * n_h * hd);
+                let got = Box::new(rec).finish().pop().unwrap();
+                let tol = if coop { 2e-3 } else { 1e-5 };
+                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert!((*g as f64 - w).abs() <= tol, "{} {rows} queries over {kv_len} [{i}]: {g} against {w}", if coop { "tensor cores" } else { "f32" });
                 }
             }
         }

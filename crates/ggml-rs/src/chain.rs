@@ -50,6 +50,17 @@ pub trait DeviceChain: Send + Sync {
         let _ = values;
         None
     }
+    /// [`Self::vec_f16`] with each value rounded to the nearest f16 (a BF16 checkpoint's weights, its smallest values
+    /// f16 holds only nearly). None where a value is past f16's range, or the device keeps no f16 matrices.
+    fn vec_f16_rounded(&self, values: &[f32]) -> Option<DeviceVec> {
+        let _ = values;
+        None
+    }
+    /// The length [`ChainRecorder::attention_rows_full`]'s `out` takes (the result, then any scratch its kernels
+    /// keep there).
+    fn attention_rows_full_out_len(&self, rows: usize, n_h: usize, head_dim: usize, kv_len: usize) -> usize {
+        self.attention_rows_out_len(rows, n_h, head_dim, kv_len)
+    }
     /// Zero `v` (before whatever is recorded next runs).
     fn zero(&self, v: &DeviceVec);
     /// A tensor of `shape` whose storage is `v` itself, not a copy (a model's recurrent state kept on the device in its
@@ -287,6 +298,39 @@ pub trait ChainRecorder {
     fn qsa_attention(&mut self, q: &DeviceVec, kv: &DeviceVec, list: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, first: usize, ratio: usize, keep: usize, scale: f32) {
         let _ = (q, kv, list, out, rows, n_h, n_kv, head_dim, first, ratio, keep, scale);
         unimplemented!("QSA on this device")
+    }
+    /// [`Self::matmul_f16_rows`] with `x`'s values as they are (f32), never rounded to f16 on the way: an activation
+    /// that may pass f16's range (a diffusion transformer's text prefix).
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_f16_rows_f32(&mut self, w: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize) {
+        self.matmul_f16_rows(w, n, k, x, y, rows)
+    }
+    /// Each of `rows` rows of `x` (`[rows, n]`) layer-normed (no weights; `eps` added to the variance) into `out`, then
+    /// times `1 + mods[scale_at..scale_at + n]` and, where `shift_at` is given, plus `mods[shift_at..shift_at + n]`: a
+    /// diffusion transformer's modulated norm, every row by the same modulation.
+    #[allow(clippy::too_many_arguments)]
+    fn layernorm_mod_rows(&mut self, x: &DeviceVec, out: &DeviceVec, rows: usize, n: usize, mods: &DeviceVec, scale_at: usize, shift_at: Option<usize>, eps: f32) {
+        let _ = (x, out, rows, n, mods, scale_at, shift_at, eps);
+        unimplemented!("a modulated layer norm on this device")
+    }
+    /// `x[r] += y[r] * g` for each of `rows` rows of `n`, `g` `mods[gate_at..gate_at + n]` or (with `tanh`) its tanh:
+    /// a diffusion transformer's gated residual.
+    #[allow(clippy::too_many_arguments)]
+    fn add_gated_rows(&mut self, x: &DeviceVec, y: &DeviceVec, rows: usize, n: usize, mods: &DeviceVec, gate_at: usize, tanh: bool) {
+        let _ = (x, y, rows, n, mods, gate_at, tanh);
+        unimplemented!("a gated residual on this device")
+    }
+    /// `out[i] = gelu(x[i])` (the tanh approximation) for `i < len`.
+    fn gelu(&mut self, x: &DeviceVec, out: &DeviceVec, len: usize) {
+        let _ = (x, out, len);
+        unimplemented!("GELU on this device")
+    }
+    /// [`Self::attention_rows`] with no causal mask: each of `rows` queries over all `kv_len` positions of `kv` (a
+    /// diffusion transformer's image tokens over a text prefix's and their own); `out` as there.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_rows_full(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, kv_len: usize, scale: f32) {
+        let _ = (q, kv, out, rows, n_h, n_kv, head_dim, kv_len, scale);
+        unimplemented!("full attention on this device")
     }
     /// Read `v` back once the chain has run.
     fn read(&mut self, v: &DeviceVec) {

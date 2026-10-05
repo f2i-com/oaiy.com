@@ -9,6 +9,8 @@ pub mod residency;
 pub mod schedule;
 pub mod text;
 pub mod transformer;
+#[cfg(feature = "webgpu")]
+pub mod qwen_wgpu;
 pub mod vae;
 pub mod vision;
 pub mod weights;

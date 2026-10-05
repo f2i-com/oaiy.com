@@ -1846,6 +1846,8 @@ dependencies = [
  "candle-flash-attn",
  "candle-nn",
  "dsv41",
+ "ggml-rs",
+ "ggml-rs-wgpu",
  "half",
  "image",
  "meshopt",
