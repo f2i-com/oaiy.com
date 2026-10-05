@@ -758,10 +758,55 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 /// Weight rows (and tokens) a workgroup of [`coop_tiled`] takes.
 pub const COOP_TILE: u32 = 128;
 
+/// How many workgroups of 1024 threads run at once (a GPU's SMs or compute units, where one holds one of them; their
+/// tensor cores are what a matmul's workgroups share): each works a while (`p[0].x` dependent multiply-adds), and
+/// those that start before any has finished are counted (`c[0]`; `c[1]` those finished).
+pub const COOP_UNITS_PROBE: &str = r#"
+@group(0) @binding(0) var<storage, read> unused0: array<u32>;
+@group(0) @binding(1) var<storage, read> unused1: array<u32>;
+@group(0) @binding(2) var<storage, read_write> c: array<atomic<u32>>;
+@group(0) @binding(3) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> pad: array<f32, 1024>;
+
+@compute @workgroup_size(1024)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    var before = 1u;
+    if (li == 0u) { before = atomicLoad(&c[1]); }
+    var acc = f32(li) * 1e-3;
+    for (var i = 0u; i < p[0].x; i++) { acc = fma(acc, 0.9999, 1e-4); }
+    pad[li] = acc;
+    workgroupBarrier();
+    if (li == 0u) {
+        if (before == 0u) { atomicAdd(&c[0], 1u); }
+        atomicAdd(&c[1], 1u);
+        if (pad[(wg.x * 7u) % 1024u] == 12345.0) { atomicAdd(&c[2], 1u); }
+    }
+}
+"#;
+
+/// The splits of a tensor-core matmul's `steps` (of 64) for `groups` workgroups on a GPU of `units` (its SMs: a
+/// workgroup alone on one runs about twice as fast as two together): the fewest of those that take least time, each
+/// wave of `units` workgroups taking as long however full, and each split's sums written and read again besides (as
+/// much as the matmul's own time `4 s / k` per FLOP of the GPU's per byte, taken as 100), at most 8 splits of 4 steps
+/// or more; and how many that is with none empty.
+pub fn coop_splits(groups: u32, units: u32, steps: u32) -> u32 {
+    let slots = units.max(1);
+    let k = (steps * 64) as f64;
+    let cost = |s: u32| {
+        let w = groups * s;
+        let waves = w.div_ceil(slots) * slots;
+        waves as f64 / w as f64 + if s > 1 { 400.0 * s as f64 / k } else { 0.0 }
+    };
+    let most = (steps / 4).clamp(1, 8);
+    let s = (1..=most).fold(1, |best, s| if cost(s) < cost(best) - 1e-9 { s } else { best });
+    steps.div_ceil(steps.div_ceil(s))
+}
+
 /// [`coop_tiled`]'s kernel before its type's decode is put in.
 const COOP_KERNEL: &str = r#"enable f16;
 enable wgpu_cooperative_matrix;
-struct Params { k: u32, n: u32, m: u32, row0: u32, rows: u32, row_bytes: u32, _pad0: u32, _pad1: u32, }
+struct Params { k: u32, n: u32, m: u32, row0: u32, rows: u32, row_bytes: u32, splits: u32, _pad1: u32, }
 WEIGHTS_BINDING
 @group(0) @binding(1) var<storage, read> x16: array<f16>;
 @group(0) @binding(2) var<storage, read_write> y: array<f32>;
@@ -796,7 +841,12 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let lh = li % 2u;
     let rr = r0 + lr;
     let kx = p.k;
-    let steps = p.k / 64u;
+    // the workgroup's split of the steps (`wg.z` of `p.splits`, none empty), its sums that split's part of `y`
+    let all = p.k / 64u;
+    let per = (all + p.splits - 1u) / p.splits;
+    let s0 = wg.z * per;
+    let s1 = min(all, s0 + per);
+    let zo = wg.z * p.m * p.n;
     var c00 = coop_mat16x16<f32, C>();
     var c01 = coop_mat16x16<f32, C>();
     var c02 = coop_mat16x16<f32, C>();
@@ -807,13 +857,13 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     var c13 = coop_mat16x16<f32, C>();
     // the first step's weights, then each step's next decoded as it multiplies
     {
-        let b = 0u;
-        let buf = 0u;
+        let b = s0;
+        let buf = (s0 % 2u) * BUF4;
         DECODE_STEP
     }
     workgroupBarrier();
-    for (var b0 = 0u; b0 < steps; b0++) {
-        if (b0 + 1u < steps) {
+    for (var b0 = s0; b0 < s1; b0++) {
+        if (b0 + 1u < s1) {
             let b = b0 + 1u;
             let buf = (b % 2u) * BUF4;
             DECODE_STEP
@@ -850,7 +900,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let ns = p.n;
     let full = r0 + 128u <= p.rows && t0 + 128u <= p.m;
     if (full) {
-        let o = (t0 + st) * ns + p.row0 + r0 + sr;
+        let o = zo + (t0 + st) * ns + p.row0 + r0 + sr;
         let o01 = o + 16u * ns;
         let o02 = o + 32u * ns;
         let o03 = o + 48u * ns;
@@ -881,7 +931,7 @@ const COOP_EDGE: &str = r#"        {
             for (var e = lane; e < 256u; e += 32u) {
                 let row = r0 + sr + FR + e % 16u;
                 let t = t0 + st + FT + e / 16u;
-                if (row < p.rows && t < p.m) { y[t * p.n + p.row0 + row] = edge[sg * 256u + e]; }
+                if (row < p.rows && t < p.m) { y[zo + t * p.n + p.row0 + row] = edge[sg * 256u + e]; }
             }
             workgroupBarrier();
         }

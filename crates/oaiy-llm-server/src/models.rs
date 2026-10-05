@@ -2206,9 +2206,11 @@ mod dense_webgpu_timing {
         let mut kv = model.new_kv_cache(4096);
         let tokens: Vec<u32> = (0..2048u32).map(|i| 1000 + (i * 7919) % 20000).collect();
         let mut at = 0;
+        let embed_ms = std::cell::Cell::new(0.0f64);
         let mut forward = |n: usize, kv: &mut llama_rs::KvCache| {
             let t = Instant::now();
             let e = m.embed_text(&tokens[at..at + n]);
+            embed_ms.set(t.elapsed().as_secs_f64() * 1e3);
             let l = m.forward_embeds_positions(&e, n, kv, None).unwrap();
             at += n;
             let _ = l.to_host();
@@ -2251,7 +2253,9 @@ mod dense_webgpu_timing {
         for n in [512usize, 512] {
             let past = kv.len;
             let _ = ggml_rs_wgpu::profile::take_kernels();
+            let _ = ggml_rs_wgpu::profile::take_line();
             eprintln!("a chunk of {n} at {past}: {:.1} ms", forward(n, &mut kv));
+            eprintln!("    its embedding {:.1} ms; {}", embed_ms.get(), ggml_rs_wgpu::profile::take_line());
             let k = ggml_rs_wgpu::profile::take_kernels();
             if !k.is_empty() {
                 let all: f64 = k.iter().map(|e| e.1).sum();

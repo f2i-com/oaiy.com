@@ -140,6 +140,8 @@ struct Gpu {
     /// Grouped experts' kept scratch of a step or a check (rows, top k, hidden, ff and the groups' splits): one for
     /// every layer of that shape.
     moe_steps: Mutex<Vec<([usize; 6], Arc<exl3::Step>)>>,
+    /// How many units (SMs) the tensor cores' matmuls share out ([`Gpu::coop_units`]), counted when first asked.
+    coop_units: std::sync::OnceLock<u32>,
 }
 
 /// A weight matrix on the GPU: its rows in one or more buffers.
@@ -219,6 +221,48 @@ impl Gpu {
     /// The EXL3 projections' few-rows scratch ([`exl3::FewScratch`]), made by `b` when first asked for.
     pub(crate) fn few(&self, b: &WgpuBackend) -> &exl3::FewScratch {
         self.few.get_or_init(|| exl3::FewScratch::new(b))
+    }
+
+    /// How many units (SMs) the GPU's workgroups are shared out to ([`shaders::COOP_UNITS_PROBE`]'s count of 4,096
+    /// workgroups of 1024 threads that each work about 0.1 ms: those started before any had finished), counted once
+    /// (a millisecond or so); 1 where a workgroup cannot be that large.
+    pub(crate) fn coop_units(&self) -> u32 {
+        *self.coop_units.get_or_init(|| {
+            if self.limits.max_compute_invocations_per_workgroup < 1024 || self.limits.max_compute_workgroup_size_x < 1024 {
+                return 1;
+            }
+            let pipeline = self.named_pipeline("coop-units-probe", || shaders::COOP_UNITS_PROBE.to_string());
+            let counts = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("oaiy-coop-units"),
+                size: 16,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let params = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("oaiy-coop-units-params"), size: 32, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+            let mut words = [0u8; 32];
+            words[..4].copy_from_slice(&65536u32.to_le_bytes());
+            self.queue.write_buffer(&params, 0, &words);
+            let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("oaiy-coop-units"),
+                layout: &self.layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.dummy().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: self.dummy().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: counts.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: params.as_entire_binding() },
+                ],
+            });
+            let mut enc = self.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &group, &[]);
+                pass.dispatch_workgroups(4096, 1, 1);
+            }
+            self.queue.submit([enc.finish()]);
+            let got = self.read(&counts, 8);
+            u32::from_le_bytes([got[0], got[1], got[2], got[3]]).max(1)
+        })
     }
 
     /// Copy `len` bytes of `src` back to the host.
@@ -652,7 +696,7 @@ impl WgpuBackend {
         });
         Ok(Self {
             cpu: CpuBackend::new(),
-            gpu: Arc::new(Gpu { device, queue, layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), names: Mutex::new(HashMap::new()), pool: Mutex::new(Vec::new()), chain_groups: Mutex::new(HashMap::new()), wide: std::sync::OnceLock::new(), chain_groups_wide: Mutex::new(HashMap::new()), dummy: std::sync::OnceLock::new(), dummy_rw: std::sync::OnceLock::new(), limits, staged: AtomicU64::new(0), few: std::sync::OnceLock::new(), moe_steps: Mutex::new(Vec::new()) }),
+            gpu: Arc::new(Gpu { device, queue, layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), names: Mutex::new(HashMap::new()), pool: Mutex::new(Vec::new()), chain_groups: Mutex::new(HashMap::new()), wide: std::sync::OnceLock::new(), chain_groups_wide: Mutex::new(HashMap::new()), dummy: std::sync::OnceLock::new(), dummy_rw: std::sync::OnceLock::new(), limits, staged: AtomicU64::new(0), few: std::sync::OnceLock::new(), moe_steps: Mutex::new(Vec::new()), coop_units: std::sync::OnceLock::new() }),
             budget,
             used: Arc::new(AtomicU64::new(0)),
             summary,
