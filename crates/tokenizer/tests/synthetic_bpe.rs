@@ -90,11 +90,14 @@ fn bpe_decode_arbitrary_bytes() {
 }
 
 #[test]
-fn spm_greedy_longest_match() {
-    // Synthetic SPM vocab: ▁hello, ▁world, h, e, l, o, w, r, d, ▁, plus byte fallbacks.
+fn spm_merges_pairs_into_whole_words() {
+    // Synthetic SPM vocab: ▁hello, ▁world and the pieces SentencePiece merges them through (a pair merges only into a
+    // piece of the vocabulary), h, e, l, o, w, r, d, ▁, plus byte fallbacks. No scores: earlier pieces merge first.
     let tokens: Vec<String> = vec![
         "▁hello".into(),
         "▁world".into(),
+        "▁hell".into(), "▁hel".into(), "▁he".into(), "▁h".into(),
+        "▁worl".into(), "▁wor".into(), "▁wo".into(), "▁w".into(),
         "▁".into(),
         "h".into(), "e".into(), "l".into(), "o".into(),
         "w".into(), "r".into(), "d".into(),

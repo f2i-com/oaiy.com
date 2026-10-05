@@ -296,7 +296,11 @@ impl Gemma3nModel {
             let q_3d = q_flat.reshape(vec![seq, n_h, hd]).expect("q reshape");
             let mut q = ops::rmsnorm(backend, &q_3d, &gx.attn_q_norm, cfg.rms_eps);
             let rope_type = cfg.arch.rope_type();
-            ops::rope(backend, &mut q, &positions, hd, rope_type, cfg.rope_theta);
+            // The local (sliding-window) layers rotate with base 10,000, as llama.cpp sets Gemma 3n
+            // (`rope_freq_base_train_swa`) unless the GGUF says; only the global ones with `rope.freq_base`
+            // (1,000,000). A shared-KV layer reads the cache of a layer of its own kind, rotated the same way.
+            let theta = if cfg.layer_uses_sliding_window(layer) { cfg.rope_theta_swa.unwrap_or(10000.0) } else { cfg.rope_theta };
+            ops::rope(backend, &mut q, &positions, hd, rope_type, theta);
 
             // K/V: compute fresh for non-shared layers; reuse from source layer's
             // KV cache for shared layers.
@@ -313,7 +317,7 @@ impl Gemma3nModel {
                     let v = v_flat_normed.reshape(vec![seq, n_kv, hd]).expect("v reshape");
 
                     let mut k = ops::rmsnorm(backend, &k_3d, &gx.attn_k_norm, cfg.rms_eps);
-                    ops::rope(backend, &mut k, &positions, hd, rope_type, cfg.rope_theta);
+                    ops::rope(backend, &mut k, &positions, hd, rope_type, theta);
 
                     kv.append(backend, layer, &k, &v);
                     layer

@@ -27,6 +27,17 @@ pub struct Gemma3Model {
     /// Pre-computed `[1]`-shape device tensor holding `sqrt(embedding_dim)`,
     /// used to scale embeddings without round-tripping the constant per call.
     embed_scale_const: Option<f32>,
+    /// RoPE base of the sliding-window ("local") layers: 10,000 as llama.cpp
+    /// sets it for Gemma 3 (`rope_freq_base_train_swa`), unless the GGUF says
+    /// (`rope.freq_base_swa`). Only the global layers use `rope.freq_base`
+    /// (1,000,000). One base for every layer rotated the local layers' keys with
+    /// the global layers' frequencies, and Gemma 3 4B lost the thread of a
+    /// prompt of a few hundred tokens (markdown answered with fragments of it).
+    rope_theta_local: f32,
+    /// The global layers' linear RoPE scaling as per-frequency divisors
+    /// (`rope.scaling.type = linear`, `rope.scaling.factor`: 8 on the 4B, 12B
+    /// and 27B; none on the 1B). The local layers are not scaled.
+    rope_global_factors: Option<Vec<f32>>,
 }
 
 impl std::fmt::Debug for Gemma3Model {
@@ -74,7 +85,13 @@ impl Gemma3Model {
             None
         };
 
-        Ok(Self { config, tokenizer, common, extras, backend, embed_scale_const })
+        let ns = g.get_str("general.architecture").unwrap_or("gemma3");
+        let rope_theta_local = config.rope_theta_swa.unwrap_or(10000.0);
+        let linear = g.get_str(&format!("{ns}.rope.scaling.type")).is_ok_and(|t| t == "linear");
+        let factor = g.get_f32(&format!("{ns}.rope.scaling.factor")).unwrap_or(1.0);
+        let rope_global_factors = (linear && factor > 0.0 && factor != 1.0).then(|| vec![factor; config.head_dim / 2]);
+
+        Ok(Self { config, tokenizer, common, extras, backend, embed_scale_const, rope_theta_local, rope_global_factors })
     }
 
     /// Look up token embeddings and apply Gemma 3's per-token `sqrt(d)` scaling.
@@ -178,19 +195,22 @@ impl Gemma3Model {
             let mut q = ops::rmsnorm(backend, &q_3d, &gx.attn_q_norm, cfg.rms_eps);
             let mut k = ops::rmsnorm(backend, &k_3d, &gx.attn_k_norm, cfg.rms_eps);
 
+            // Gemma 3 alternates local (sliding-window) and global attention layers, each with its own RoPE: the
+            // local ones base 10,000 unscaled, the global ones `rope.freq_base` with the linear scaling.
+            let local = cfg.layer_uses_sliding_window(layer);
+            let (theta, factors) = if local {
+                (self.rope_theta_local, None)
+            } else {
+                (cfg.rope_theta, self.rope_global_factors.as_deref())
+            };
             let rope_type = cfg.arch.rope_type();
-            ops::rope(backend, &mut q, &positions, hd, rope_type, cfg.rope_theta);
-            ops::rope(backend, &mut k, &positions, hd, rope_type, cfg.rope_theta);
+            ops::rope_with_factors(backend, &mut q, &positions, hd, rope_type, theta, factors);
+            ops::rope_with_factors(backend, &mut k, &positions, hd, rope_type, theta, factors);
 
             kv.append(backend, layer, &k, &v);
             let _ = n_rep;
             let kv_len = kv.len + seq;
-            // Gemma 3 alternates local (sliding-window) and global attention layers.
-            let sw = if cfg.layer_uses_sliding_window(layer) {
-                cfg.sliding_window
-            } else {
-                None
-            };
+            let sw = if local { cfg.sliding_window } else { None };
             let attn_out = ops::attention_swa(
                 backend, &q, kv.k_buffer(layer), kv.v_buffer(layer),
                 kv_len, scale, past, sw,

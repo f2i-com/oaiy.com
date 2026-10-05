@@ -3,9 +3,9 @@
 //! Two encoders are supported:
 //!   * **GPT2 / Llama-3 / Qwen / Gemma** (`tokenizer.ggml.model = "gpt2"`):
 //!     byte-level BPE with merges loaded from the GGUF.
-//!   * **Llama-1/2 / SentencePiece** (`tokenizer.ggml.model = "llama"`):
-//!     scored unigram-style longest-match (we use the simpler greedy variant —
-//!     close enough for most cases; a strict Viterbi pass is on the roadmap).
+//!   * **SentencePiece** (`tokenizer.ggml.model = "llama"`, Gemma 4's `"gemma4"`):
+//!     llama.cpp's encoder — special tokens split out first, then pairs of
+//!     symbols merged by score (see [`spm`]).
 //!
 //! Decoding is straightforward in both: look up token strings, concatenate,
 //! and (for byte-level) reverse the byte→Unicode mapping.
@@ -64,11 +64,19 @@ pub struct Tokenizer {
     /// Reverse lookup: token string -> token id.
     token_to_id: HashMap<String, u32>,
 
-    /// SentencePiece scores (one per token), if present. Used by SPM encoder
-    /// (for tie-breaking in a Viterbi pass — currently unused by the greedy
-    /// encoder but loaded so a future Viterbi can drop in without changes).
-    #[allow(dead_code)]
+    /// SentencePiece scores (one per token), if present: the SPM encoder merges
+    /// the pair whose piece scores highest first.
     scores: Option<Vec<f32>>,
+
+    /// Whether SPM text after a special token (or at the start) takes a leading
+    /// space: `tokenizer.ggml.add_space_prefix`, true when absent (llama.cpp's
+    /// default for SentencePiece); Gemma's GGUFs say false.
+    add_space_prefix: bool,
+
+    /// Whether the SPM encoder merges by merge rank rather than by score:
+    /// Gemma 4 (`"gemma4"`), whose pieces all score the same and whose merges
+    /// carry the order.
+    spm_by_merge_rank: bool,
 
     /// Token type per id (1=normal, 2=unknown, 3=control, 4=user-defined,
     /// 5=unused, 6=byte). Used for special-token detection (TODO).
@@ -104,16 +112,17 @@ impl Tokenizer {
         let merges_rank=merges.into_iter().enumerate().map(|(i,m)|(m,i as u32)).collect();
         let mut special_tokens:Vec<_>=special_ids.into_iter().map(|i|(tokens[i as usize].clone(),i)).collect();
         special_tokens.sort_by(|a,b|b.0.len().cmp(&a.0.len()));
-        Ok(Self{qwen3_pre:true,model:TokenizerModel::Gpt2,tokens,token_to_id,scores:None,token_types:None,
+        Ok(Self{qwen3_pre:true,model:TokenizerModel::Gpt2,tokens,token_to_id,scores:None,add_space_prefix:false,spm_by_merge_rank:false,token_types:None,
             merges_rank,bos:None,eos:Some(eos),unk:None,pad:None,special_tokens})
     }
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
-        let model = match gguf.get_str("tokenizer.ggml.model").unwrap_or("llama") {
+        let model_name = gguf.get_str("tokenizer.ggml.model").unwrap_or("llama");
+        let model = match model_name {
             "gpt2" => TokenizerModel::Gpt2,
             // "llama" is the SentencePiece-based llama.cpp identifier; "gemma4"
-            // ships with both scores (SPM) and merges (BPE) but the canonical
-            // encoder is SentencePiece-style — mapping to the Llama path lets
-            // the existing SPM encoder handle it.
+            // ships with both scores (all equal) and merges (BPE in
+            // SentencePiece's alphabet): the SPM path takes it, merging by rank
+            // (`spm_by_merge_rank`).
             "llama" | "gemma4" => TokenizerModel::Llama,
             "bert" => TokenizerModel::Bert,
             "rwkv" => TokenizerModel::Rwkv,
@@ -159,6 +168,8 @@ impl Tokenizer {
         let eos = gguf.get_u64("tokenizer.ggml.eos_token_id").ok().map(|v| v as u32);
         let unk = gguf.get_u64("tokenizer.ggml.unknown_token_id").ok().map(|v| v as u32);
         let pad = gguf.get_u64("tokenizer.ggml.padding_token_id").ok().map(|v| v as u32);
+        let add_space_prefix = gguf.get_bool("tokenizer.ggml.add_space_prefix").unwrap_or(true);
+        let spm_by_merge_rank = model_name == "gemma4" && !merges_rank.is_empty();
 
         // Build the special-token table: any token with type 3 (CONTROL) or 4
         // (USER_DEFINED). These need literal-string matching before BPE so multi-
@@ -184,6 +195,8 @@ impl Tokenizer {
             tokens,
             token_to_id,
             scores,
+            add_space_prefix,
+            spm_by_merge_rank,
             token_types,
             merges_rank,
             bos,
@@ -254,9 +267,16 @@ impl Tokenizer {
         &self.merges_rank
     }
 
-    #[allow(dead_code)]
     pub(crate) fn scores(&self) -> Option<&[f32]> {
         self.scores.as_deref()
+    }
+
+    pub(crate) fn add_space_prefix(&self) -> bool {
+        self.add_space_prefix
+    }
+
+    pub(crate) fn spm_by_merge_rank(&self) -> bool {
+        self.spm_by_merge_rank
     }
 
     #[allow(dead_code)]
