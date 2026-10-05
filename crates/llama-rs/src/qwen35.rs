@@ -171,9 +171,103 @@ pub struct Qwen35Model {
     pub backend:   Arc<dyn Backend>,
     /// VENDORED-LOCAL: text runs chained on the backend's device when it has a chain for this model.
     pub chain: crate::chain_qwen35::Qwen35Chain,
+    /// VENDORED-LOCAL: the multi-token-prediction layer its GGUF has, for drafting tokens a chained run then checks:
+    /// asked for (OAIY_MTP), as a check of several rows costs nearly twice a step's one with the K-quants' kernels.
+    pub mtp: Option<Qwen35Mtp>,
+}
+
+/// VENDORED-LOCAL: the multi-token-prediction layer (`blk.{n_layers}`, `nextn_predict_layers` 1): the next token's
+/// embedding and the trunk's hidden state, each normed (`enorm`, `hnorm`), joined and projected (`eh_proj`), through
+/// a full-attention block with a cache of its own, normed (`shared_head_norm`) and headed by the model's own head:
+/// the logits of the token after the next.
+#[derive(Debug)]
+pub struct Qwen35Mtp {
+    pub enorm: Tensor,
+    pub hnorm: Tensor,
+    pub eh_proj: Weight,
+    pub head_norm: Tensor,
+    pub block: Qwen35Block,
 }
 
 impl Qwen35Model {
+    /// VENDORED-LOCAL: whether its text runs draft tokens and check them (chained, with its multi-token-prediction
+    /// layer on the device).
+    pub fn drafts(&self) -> bool {
+        self.chain.drafts(self)
+    }
+
+    /// VENDORED-LOCAL: `k` tokens drafted after `next`, the token sampled for position `kv.len`: `recent` the tokens
+    /// up to it, ending with it (the last few are the layer's input). None where it does not draft here.
+    pub fn draft(&self, kv: &KvCache, recent: &[u32], k: usize) -> Option<Vec<u32>> {
+        self.chain.draft(self, kv, recent, k)
+    }
+
+    /// VENDORED-LOCAL: run `tokens` (a sampled token and its drafts) after what `kv` holds, chained: every row's logits,
+    /// the run undoable by [`Self::rollback`]. None where it does not draft here.
+    pub fn check(&self, tokens: &[u32], kv: &mut KvCache) -> Option<Vec<Tensor>> {
+        let e = self.embed_text(tokens);
+        self.chain.check(self, &e, tokens.len(), kv)
+    }
+
+    /// VENDORED-LOCAL: keep only the first `keep` of a check's `rows` rows (the sampled token and the drafts accepted).
+    pub fn rollback(&self, kv: &mut KvCache, rows: usize, keep: usize) {
+        self.chain.rollback(self, kv, rows, keep)
+    }
+
+    /// The model's multi-token-prediction layer, if its GGUF has one.
+    pub fn load_mtp(&self, g: &GgufFile) -> Result<Option<Qwen35Mtp>> {
+        let i = self.config.n_layers;
+        if g.tensor_by_name(&format!("blk.{i}.nextn.eh_proj.weight")).is_none() {
+            return Ok(None);
+        }
+        let idx = TensorIndex::new(g);
+        let backend = &*self.backend;
+        let t = |name: &str| -> Result<Tensor> { Ok(backend.to_device(idx.take(&format!("blk.{i}.{name}"), &[])?)) };
+        let w = |name: &str| -> Result<Weight> { Ok(idx.take_weight(&format!("blk.{i}.{name}"), &[])?.to_device(backend)) };
+        let block = Qwen35Block::Attention {
+            attn_norm: t("attn_norm.weight")?,
+            attn_q: w("attn_q.weight")?,
+            attn_q_norm: t("attn_q_norm.weight")?,
+            attn_k: w("attn_k.weight")?,
+            attn_k_norm: t("attn_k_norm.weight")?,
+            attn_v: w("attn_v.weight")?,
+            attn_output: w("attn_output.weight")?,
+            post_norm: t("post_attention_norm.weight")?,
+            ffn_pair: FfnPair::Split { gate: w("ffn_gate.weight")?, up: w("ffn_up.weight")? },
+            ffn_down: w("ffn_down.weight")?,
+        };
+        Ok(Some(Qwen35Mtp { enorm: t("nextn.enorm.weight")?, hnorm: t("nextn.hnorm.weight")?, eh_proj: w("nextn.eh_proj.weight")?, head_norm: t("nextn.shared_head_norm.weight")?, block }))
+    }
+
+    /// The prediction layer's logits for `rows` rows (`[rows, vocab]`): row `r` from the trunk's hidden state `hidden[r]`
+    /// and the next token's embedding `next[r]` (each `[rows, d]`), through its block at `positions` (its own cache
+    /// `kv`, one layer); `embed_first` joins the embedding then the hidden state (else the other way).
+    pub fn mtp_logits_host(&self, mtp: &Qwen35Mtp, hidden: &Tensor, next: &Tensor, kv: &mut KvCache, positions: &[u32], embed_first: bool) -> Result<Tensor> {
+        Ok(self.mtp_host(mtp, hidden, next, kv, positions, embed_first)?.1)
+    }
+
+    /// [`Self::mtp_logits_host`], and the layer's own output before its head's norm (what a further draft starts from).
+    pub fn mtp_host(&self, mtp: &Qwen35Mtp, hidden: &Tensor, next: &Tensor, kv: &mut KvCache, positions: &[u32], embed_first: bool) -> Result<(Tensor, Tensor)> {
+        let backend = &*self.backend;
+        let eps = self.config.rms_eps;
+        let rows = hidden.dim(0);
+        let d = self.config.embedding_dim;
+        let e = ops::rmsnorm(backend, next, &mtp.enorm, eps).to_host();
+        let h = ops::rmsnorm(backend, hidden, &mtp.hnorm, eps).to_host();
+        let mut joined = Vec::with_capacity(rows * 2 * d);
+        for r in 0..rows {
+            let (a, b) = if embed_first { (&e, &h) } else { (&h, &e) };
+            joined.extend_from_slice(&a.data()[r * d..(r + 1) * d]);
+            joined.extend_from_slice(&b.data()[r * d..(r + 1) * d]);
+        }
+        let mut x = mtp.eh_proj.linear(backend, &backend.to_device(Tensor::from_vec(joined, vec![rows, 2 * d])));
+        self.attention_block_host(&mtp.block, 0, &mut x, rows, kv, positions, None);
+        kv.commit(rows);
+        let normed = ops::rmsnorm(backend, &x, &mtp.head_norm, eps);
+        let logits = self.output.linear(backend, &normed);
+        Ok((x, logits))
+    }
+
     pub fn from_gguf(g: &GgufFile, backend: Arc<dyn Backend>) -> Result<Self> {
         // MoE detection: Qwen3.6-35B-A3B uses arch=qwen35 + `qwen35.expert_count > 0`.
         // The dense Qwen3.5/3.6 loader doesn't handle per-expert FFN tensors,
@@ -290,12 +384,16 @@ impl Qwen35Model {
         let output      = output.to_device(&*backend);
         let blocks: Vec<Qwen35Block> = blocks.into_iter().map(|b| upload_block(b, &*backend)).collect();
 
-        Ok(Self {
+        let mut model = Self {
             config, ssm_cfg, attention_layers,
             tokenizer, blocks,
             tok_embd, packed_tok_embd, int8_tok_embd: None, cache_backends: Vec::new(), output_norm, output,
-            backend, chain: Default::default(),
-        })
+            backend, chain: Default::default(), mtp: None,
+        };
+        if std::env::var_os("OAIY_MTP").is_some() {
+            model.mtp = model.load_mtp(g)?;
+        }
+        Ok(model)
     }
 
     /// Forward — **partial implementation**: full-attention layers are
@@ -410,6 +508,15 @@ impl Qwen35Model {
     /// VENDORED-LOCAL: [`Self::forward_embeds_positions`] op by op through the backend, never chained (what a chained
     /// run is checked against).
     pub fn forward_embeds_host(&self, embeds: &Tensor, seq: usize, kv: &mut KvCache, multimodal: Option<&[[u32; 3]]>) -> Result<Tensor> {
+        let x = self.trunk_host(embeds, seq, kv, multimodal)?;
+        let backend = &*self.backend;
+        let x = ops::rmsnorm(backend, &x, &self.output_norm, self.config.rms_eps);
+        let x_last = if seq > 1 { backend.slice_axis0_range(&x, seq - 1, 1) } else { x };
+        Ok(self.output.linear(backend, &x_last))
+    }
+
+    /// VENDORED-LOCAL: [`Self::forward_embeds_host`]'s trunk: every row's last hidden state, before the output norm.
+    pub fn trunk_host(&self, embeds: &Tensor, seq: usize, kv: &mut KvCache, multimodal: Option<&[[u32; 3]]>) -> Result<Tensor> {
         let cfg = &self.config;
         let backend = &*self.backend;
         let past = kv.len;
@@ -417,7 +524,6 @@ impl Qwen35Model {
             "embeds first dim {} doesn't match seq {seq}", embeds.dim(0));
 
         let head_dim = cfg.head_dim;             // 256
-        let n_h_kv  = cfg.n_kv_heads;            // 4
         // Per qwen3next.cpp: q dim per head is 2 × head_dim. First half is
         // the actual query (matched to k's head_dim); second half is a
         // per-channel gate that gets sigmoid'd and element-wise multiplied
@@ -425,79 +531,14 @@ impl Qwen35Model {
         let q_per_head_full = self.first_attn_q_out_dim() / cfg.n_heads;  // 512 for 9B
         debug_assert_eq!(q_per_head_full, 2 * head_dim,
             "expected q_per_head_full=2*head_dim; got {q_per_head_full} vs {}", 2 * head_dim);
-        let n_h = cfg.n_heads;                   // 16
-        let scale = 1.0 / (head_dim as f32).sqrt();
 
         let mut x = embeds.clone();
         let positions: Vec<u32> = (past..past + seq).map(|p| p as u32).collect();
 
         for (layer, blk) in self.blocks.iter().enumerate() {
             match blk {
-                Qwen35Block::Attention { attn_norm, attn_q, attn_q_norm, attn_k, attn_k_norm,
-                                         attn_v, attn_output, post_norm, ffn_pair, ffn_down } => {
-                    let xn = ops::rmsnorm(backend, &x, attn_norm, cfg.rms_eps);
-                    let q_full = attn_q.linear(backend, &xn);    // [seq, n_h * 2 * head_dim]
-                    let k_flat = attn_k.linear(backend, &xn);
-                    let v_flat = attn_v.linear(backend, &xn);
-
-                    // Split q_full per head: first head_dim → query, second head_dim → gate.
-                    // On CUDA this is a single kernel writing both halves directly on
-                    // device — eliminates the per-attention-layer host roundtrip.
-                    let (q_only, q_gate) = backend.split_q_and_gate(&q_full, n_h, head_dim);
-                    let q_3d = q_only.reshape(vec![seq, n_h, head_dim]).expect("q reshape");
-                    let k_3d = k_flat.reshape(vec![seq, n_h_kv, head_dim]).expect("k reshape");
-                    let v_3d = v_flat.reshape(vec![seq, n_h_kv, head_dim]).expect("v reshape");
-
-                    let mut q = ops::rmsnorm(backend, &q_3d, attn_q_norm, cfg.rms_eps);
-                    let mut k = ops::rmsnorm(backend, &k_3d, attn_k_norm, cfg.rms_eps);
-
-                    // Qwen3.5: partial RoPE — only the first `cfg.rope_dim` dims of
-                    // each head's `head_dim`-wide slice get rotated (the
-                    // "rope.dimension_count" metadata = 64; head_dim = 256 ⇒ rotates
-                    // only 25%, leaves the back 192 dims untouched). MRoPE
-                    // (mrope_section=[11,11,10]) collapses to standard NeoX RoPE for
-                    // text-only inference (no image positions).
-                    if let Some(positions) = multimodal {
-                        crate::multimodal_rope::text(backend, &mut q, positions, cfg.rope_dim, cfg.rope_theta);
-                        crate::multimodal_rope::text(backend, &mut k, positions, cfg.rope_dim, cfg.rope_theta);
-                    } else if cfg.rope_dim < head_dim {
-                        backend.rope_partial_neox(&mut q, &positions, head_dim, cfg.rope_dim, cfg.rope_theta);
-                        backend.rope_partial_neox(&mut k, &positions, head_dim, cfg.rope_dim, cfg.rope_theta);
-                    } else {
-                        let rope_type = cfg.arch.rope_type();
-                        ops::rope(backend, &mut q, &positions, head_dim, rope_type, cfg.rope_theta);
-                        ops::rope(backend, &mut k, &positions, head_dim, rope_type, cfg.rope_theta);
-                    }
-
-                    let kv_len = kv.len + seq;
-                    let cache_backend = kv.layer_backends.get(layer).cloned();
-                    let remote = cache_backend.as_ref().filter(|b| !Arc::ptr_eq(b, &self.backend));
-                    let attn_out = if let Some(b) = remote {
-                        // Explicit host staging: CUDA tensors from distinct devices
-                        // must never be passed to kernels on the model's device.
-                        let q = b.to_device(q.to_host());
-                        let k = b.to_device(k.to_host());
-                        let v = b.to_device(v_3d.to_host());
-                        kv.append(b.as_ref(), layer, &k, &v);
-                        let out = ops::attention(b.as_ref(), &q, kv.k_buffer(layer), kv.v_buffer(layer), kv_len, scale, past);
-                        backend.to_device(out.to_host())
-                    } else {
-                        kv.append(backend, layer, &k, &v_3d);
-                        ops::attention(backend, &q, kv.k_buffer(layer), kv.v_buffer(layer), kv_len, scale, past)
-                    };
-
-                    // Gate the attention output: `attn_out *= sigmoid(q_gate)`,
-                    // fused into a single kernel.
-                    let mut attn_t = attn_out.reshape(vec![seq, n_h * head_dim]).expect("attn reshape");
-                    backend.mul_sigmoid_inplace(&mut attn_t, &q_gate);
-
-                    let attn_proj = attn_output.linear(backend, &attn_t);
-                    // FFN (SwiGLU). post_attention_norm is the *pre-FFN* norm
-                    // (qwen3next convention; equivalent to qwen3's ffn_norm).
-                    let xn2 = ops::add_inplace_then_rmsnorm(backend, &mut x, &attn_proj, post_norm, cfg.rms_eps);
-                    let activated = ffn_pair.swiglu(backend, &xn2);
-                    let ffn_out = ffn_down.linear(backend, &activated);
-                    ops::add_inplace(backend, &mut x, &ffn_out);
+                Qwen35Block::Attention { .. } => {
+                    self.attention_block_host(blk, layer, &mut x, seq, kv, &positions, multimodal);
                 }
                 Qwen35Block::Ssm { attn_norm, attn_qkv, attn_gate, ssm_conv1d, ssm_a,
                                    ssm_ba, ssm_dt_bias, ssm_norm, ssm_out,
@@ -559,9 +600,86 @@ impl Qwen35Model {
         }
 
         kv.commit(seq);
-        let x = ops::rmsnorm(backend, &x, &self.output_norm, cfg.rms_eps);
-        let x_last = if seq > 1 { backend.slice_axis0_range(&x, seq - 1, 1) } else { x };
-        Ok(self.output.linear(backend, &x_last))
+        Ok(x)
+    }
+
+    /// VENDORED-LOCAL: a full-attention block (`blk`) on `x` (`seq` rows at `positions`), cache layer `layer` of `kv`,
+    /// op by op: [`Self::forward_embeds_host`]'s, and the multi-token-prediction layer's.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_block_host(&self, blk: &Qwen35Block, layer: usize, x: &mut Tensor, seq: usize, kv: &mut KvCache, positions: &[u32], multimodal: Option<&[[u32; 3]]>) {
+        let Qwen35Block::Attention { attn_norm, attn_q, attn_q_norm, attn_k, attn_k_norm, attn_v, attn_output, post_norm, ffn_pair, ffn_down } = blk else {
+            unreachable!("an attention block")
+        };
+        let cfg = &self.config;
+        let backend = &*self.backend;
+        let past = kv.len;
+        let head_dim = cfg.head_dim;
+        let n_h_kv = cfg.n_kv_heads;
+        let n_h = cfg.n_heads;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let xn = ops::rmsnorm(backend, x, attn_norm, cfg.rms_eps);
+        let q_full = attn_q.linear(backend, &xn);    // [seq, n_h * 2 * head_dim]
+        let k_flat = attn_k.linear(backend, &xn);
+        let v_flat = attn_v.linear(backend, &xn);
+
+        // Split q_full per head: first head_dim → query, second head_dim → gate.
+        // On CUDA this is a single kernel writing both halves directly on
+        // device — eliminates the per-attention-layer host roundtrip.
+        let (q_only, q_gate) = backend.split_q_and_gate(&q_full, n_h, head_dim);
+        let q_3d = q_only.reshape(vec![seq, n_h, head_dim]).expect("q reshape");
+        let k_3d = k_flat.reshape(vec![seq, n_h_kv, head_dim]).expect("k reshape");
+        let v_3d = v_flat.reshape(vec![seq, n_h_kv, head_dim]).expect("v reshape");
+
+        let mut q = ops::rmsnorm(backend, &q_3d, attn_q_norm, cfg.rms_eps);
+        let mut k = ops::rmsnorm(backend, &k_3d, attn_k_norm, cfg.rms_eps);
+
+        // Qwen3.5: partial RoPE — only the first `cfg.rope_dim` dims of
+        // each head's `head_dim`-wide slice get rotated (the
+        // "rope.dimension_count" metadata = 64; head_dim = 256 ⇒ rotates
+        // only 25%, leaves the back 192 dims untouched). MRoPE
+        // (mrope_section=[11,11,10]) collapses to standard NeoX RoPE for
+        // text-only inference (no image positions).
+        if let Some(positions) = multimodal {
+            crate::multimodal_rope::text(backend, &mut q, positions, cfg.rope_dim, cfg.rope_theta);
+            crate::multimodal_rope::text(backend, &mut k, positions, cfg.rope_dim, cfg.rope_theta);
+        } else if cfg.rope_dim < head_dim {
+            backend.rope_partial_neox(&mut q, positions, head_dim, cfg.rope_dim, cfg.rope_theta);
+            backend.rope_partial_neox(&mut k, positions, head_dim, cfg.rope_dim, cfg.rope_theta);
+        } else {
+            let rope_type = cfg.arch.rope_type();
+            ops::rope(backend, &mut q, positions, head_dim, rope_type, cfg.rope_theta);
+            ops::rope(backend, &mut k, positions, head_dim, rope_type, cfg.rope_theta);
+        }
+
+        let kv_len = kv.len + seq;
+        let cache_backend = kv.layer_backends.get(layer).cloned();
+        let remote = cache_backend.as_ref().filter(|b| !Arc::ptr_eq(b, &self.backend));
+        let attn_out = if let Some(b) = remote {
+            // Explicit host staging: CUDA tensors from distinct devices
+            // must never be passed to kernels on the model's device.
+            let q = b.to_device(q.to_host());
+            let k = b.to_device(k.to_host());
+            let v = b.to_device(v_3d.to_host());
+            kv.append(b.as_ref(), layer, &k, &v);
+            let out = ops::attention(b.as_ref(), &q, kv.k_buffer(layer), kv.v_buffer(layer), kv_len, scale, past);
+            backend.to_device(out.to_host())
+        } else {
+            kv.append(backend, layer, &k, &v_3d);
+            ops::attention(backend, &q, kv.k_buffer(layer), kv.v_buffer(layer), kv_len, scale, past)
+        };
+
+        // Gate the attention output: `attn_out *= sigmoid(q_gate)`,
+        // fused into a single kernel.
+        let mut attn_t = attn_out.reshape(vec![seq, n_h * head_dim]).expect("attn reshape");
+        backend.mul_sigmoid_inplace(&mut attn_t, &q_gate);
+
+        let attn_proj = attn_output.linear(backend, &attn_t);
+        // FFN (SwiGLU). post_attention_norm is the *pre-FFN* norm
+        // (qwen3next convention; equivalent to qwen3's ffn_norm).
+        let xn2 = ops::add_inplace_then_rmsnorm(backend, x, &attn_proj, post_norm, cfg.rms_eps);
+        let activated = ffn_pair.swiglu(backend, &xn2);
+        let ffn_out = ffn_down.linear(backend, &activated);
+        ops::add_inplace(backend, x, &ffn_out);
     }
 
     /// Look up the q-projection's output dim from the first attention layer.

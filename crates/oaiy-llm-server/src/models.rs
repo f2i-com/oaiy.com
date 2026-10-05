@@ -1462,6 +1462,229 @@ mod dense_webgpu_timing {
         assert_eq!(model.chain_runs(), 7, "every run chained");
     }
 
+    /// How often a Qwen3.5 GGUF's multi-token-prediction layer (QWEN35_MODEL) drafts the token its trunk then picks:
+    /// the trunk's greedy continuation of a prompt, then teacher-forced, the layer's argmax for each position against
+    /// the token two on, for the ways its inputs could be wired (the trunk's hidden state before or after the output
+    /// norm; the embedding joined first or second; the layer's rope position that of the hidden state or the next).
+    #[test]
+    #[ignore = "a measurement; needs a WebGPU adapter and a Qwen3.5 GGUF with an MTP layer; run with --nocapture"]
+    fn measure_qwen35_mtp_acceptance() {
+        use std::sync::Arc;
+        let path = std::env::var("QWEN35_MODEL").unwrap_or_else(|_| r"E:\models\Qwen3.8-27B-Q3_K_M.gguf".into());
+        std::env::set_var("OAIY_MTP", "1");
+        let Ok(b) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
+        let backend: Arc<dyn ggml_rs::Backend> = Arc::new(b);
+        let gguf = gguf::GgufFile::open(&path).unwrap();
+        let model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap();
+        let llama_rs::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
+        let Some(mtp) = m.mtp.as_ref() else { panic!("no MTP layer in {path}") };
+        let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0 as u32;
+        let prompts = [
+            "<|im_start|>user\nExplain how a refrigerator keeps food cold, in a few short paragraphs.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+            "<|im_start|>user\nWrite a Python function that returns the n-th Fibonacci number iteratively, with a docstring.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        ];
+        let gen = 96usize;
+        let mut totals = std::collections::BTreeMap::<String, (usize, usize)>::new();
+        for prompt in prompts {
+            let p: Vec<u32> = m.tokenizer.encode(prompt, false).unwrap();
+            // the trunk's greedy continuation (chained)
+            let mut kv = model.new_kv_cache(p.len() + gen + 8);
+            let mut seq = p.clone();
+            let mut l = m.forward_embeds_positions(&m.embed_text(&p), p.len(), &mut kv, None).unwrap().to_host();
+            for _ in 0..gen {
+                let t = argmax(l.data());
+                seq.push(t);
+                l = m.forward_embeds_positions(&m.embed_text(&[t]), 1, &mut kv, None).unwrap().to_host();
+            }
+            // teacher-forced: every position's hidden state, before and after the output norm
+            let n = seq.len();
+            let mut kh = model.new_kv_cache(n + 8);
+            let hidden = m.trunk_host(&m.embed_text(&seq), n, &mut kh, None).unwrap();
+            let normed = ggml_rs::ops::rmsnorm(backend.as_ref(), &hidden, &m.output_norm, m.config.rms_eps);
+            let rows = n - 1;
+            let first = |t: &ggml_rs::Tensor| backend.slice_axis0_range(t, 0, rows);
+            let next = m.embed_text(&seq[1..]);
+            for (hname, h) in [("pre-norm", first(&hidden)), ("post-norm", first(&normed))] {
+                for embed_first in [true, false] {
+                    for offset in [0u32, 1] {
+                        let mut mkv = llama_rs::KvCache::new(backend.as_ref(), 1, rows + 8, m.config.n_kv_heads, m.config.head_dim);
+                        let positions: Vec<u32> = (0..rows as u32).map(|r| r + offset).collect();
+                        let logits = m.mtp_logits_host(mtp, &h, &next, &mut mkv, &positions, embed_first).unwrap().to_host();
+                        let v = logits.numel() / rows;
+                        // row t drafts seq[t + 2]; count the continuation's
+                        let (mut hit, mut all) = (0, 0);
+                        for t in p.len() - 1..rows - 1 {
+                            hit += (argmax(&logits.data()[t * v..(t + 1) * v]) == seq[t + 2]) as usize;
+                            all += 1;
+                        }
+                        let key = format!("hidden {hname}, embedding {}, rope at {}", if embed_first { "first" } else { "second" }, if offset == 0 { "t" } else { "t + 1" });
+                        let e = totals.entry(key).or_default();
+                        e.0 += hit;
+                        e.1 += all;
+                    }
+                }
+            }
+        }
+        for (k, (hit, all)) in &totals {
+            eprintln!("{k}: {hit} of {all} drafts the trunk's next token ({:.2})", *hit as f64 / *all as f64);
+        }
+    }
+
+    /// A Qwen3.5 GGUF's multi-token-prediction layer drafting further on its own (QWEN35_MODEL): from the trunk's
+    /// hidden state (after the output norm, the embedding joined first, as `measure_qwen35_mtp_acceptance` finds), a
+    /// first draft, then each next from the layer's own output and the draft before; teacher-forced on the trunk's
+    /// greedy continuation, how often draft `d` is the trunk's token where the drafts before it were (each depth a
+    /// pass of its own over the sequence: an estimate, its cache that pass's).
+    #[test]
+    #[ignore = "a measurement; needs a WebGPU adapter and a Qwen3.5 GGUF with an MTP layer; run with --nocapture"]
+    fn measure_qwen35_mtp_depth() {
+        use std::sync::Arc;
+        let path = std::env::var("QWEN35_MODEL").unwrap_or_else(|_| r"E:\models\Qwen3.8-27B-Q3_K_M.gguf".into());
+        std::env::set_var("OAIY_MTP", "1");
+        let Ok(b) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
+        let backend: Arc<dyn ggml_rs::Backend> = Arc::new(b);
+        let gguf = gguf::GgufFile::open(&path).unwrap();
+        let model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap();
+        let llama_rs::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
+        let Some(mtp) = m.mtp.as_ref() else { panic!("no MTP layer in {path}") };
+        let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0 as u32;
+        let prompts = [
+            "<|im_start|>user\nExplain how a refrigerator keeps food cold, in a few short paragraphs.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+            "<|im_start|>user\nWrite a Python function that returns the n-th Fibonacci number iteratively, with a docstring.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+            "<|im_start|>user\nList five tips for staying focused while studying, one line each.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        ];
+        let (gen, depth) = (96usize, 3usize);
+        let mut hits = vec![(0usize, 0usize); depth];
+        for prompt in prompts {
+            let p: Vec<u32> = m.tokenizer.encode(prompt, false).unwrap();
+            let mut kv = model.new_kv_cache(p.len() + gen + 8);
+            let mut seq = p.clone();
+            let mut l = m.forward_embeds_positions(&m.embed_text(&p), p.len(), &mut kv, None).unwrap().to_host();
+            for _ in 0..gen {
+                let t = argmax(l.data());
+                seq.push(t);
+                l = m.forward_embeds_positions(&m.embed_text(&[t]), 1, &mut kv, None).unwrap().to_host();
+            }
+            let n = seq.len();
+            let mut kh = model.new_kv_cache(n + 8);
+            let hidden = m.trunk_host(&m.embed_text(&seq), n, &mut kh, None).unwrap();
+            let normed = ggml_rs::ops::rmsnorm(backend.as_ref(), &hidden, &m.output_norm, m.config.rms_eps);
+            // depth d: rows t (positions t + d), the hidden state the depth before's (the trunk's at d = 0), the token
+            // at t + d + 1; it drafts the token at t + d + 2
+            let mut h = backend.slice_axis0_range(&normed, 0, n - 1);
+            let mut drafts_ok: Vec<bool> = vec![true; n];
+            for d in 0..depth {
+                let rows = n - 1 - d;
+                let h_rows = backend.slice_axis0_range(&h, 0, rows);
+                let next = m.embed_text(&seq[d + 1..d + 1 + rows]);
+                let mut mkv = llama_rs::KvCache::new(backend.as_ref(), 1, rows + 8, m.config.n_kv_heads, m.config.head_dim);
+                let positions: Vec<u32> = (0..rows as u32).map(|r| r + d as u32).collect();
+                let (out, logits) = m.mtp_host(mtp, &h_rows, &next, &mut mkv, &positions, true).unwrap();
+                let logits = logits.to_host();
+                let v = logits.numel() / rows;
+                for t in p.len() - 1..rows.saturating_sub(1) {
+                    if t + d + 2 >= n || !drafts_ok[t] {
+                        continue;
+                    }
+                    let ok = argmax(&logits.data()[t * v..(t + 1) * v]) == seq[t + d + 2];
+                    hits[d].0 += ok as usize;
+                    hits[d].1 += 1;
+                    drafts_ok[t] = ok;
+                }
+                h = out;
+            }
+        }
+        for (d, (hit, all)) in hits.iter().enumerate() {
+            eprintln!("draft {}: {hit} of {all} the trunk's token where the drafts before it were ({:.2})", d + 1, *hit as f64 / (*all).max(1) as f64);
+        }
+    }
+
+    /// A Qwen3.5 GGUF with a multi-token-prediction layer (QWEN35_MODEL), greedy, drafting `k` tokens a step and
+    /// checking them (QWEN35_DRAFTS, default 3): the tokens a step at a time give, drafted or not (bar near-ties: a
+    /// check's attention sums as a prompt's does); how many drafts the checks take, and the time a token.
+    #[test]
+    #[ignore = "needs a WebGPU adapter and a Qwen3.5 GGUF with an MTP layer; run with --nocapture"]
+    fn a_drafting_qwen35_answers_as_its_steps_do() {
+        use std::sync::Arc;
+        use std::time::Instant;
+        let path = std::env::var("QWEN35_MODEL").unwrap_or_else(|_| r"E:\models\Qwen3.8-27B-Q3_K_M.gguf".into());
+        let k: usize = std::env::var("QWEN35_DRAFTS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+        // the layer is loaded where asked for
+        std::env::set_var("OAIY_MTP", "1");
+        let Ok(b) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
+        let backend: Arc<dyn ggml_rs::Backend> = Arc::new(b);
+        let gguf = gguf::GgufFile::open(&path).unwrap();
+        let model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap();
+        let llama_rs::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
+        let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0 as u32;
+        let prompt: Vec<u32> = m.tokenizer.encode("<|im_start|>user\nExplain how a refrigerator keeps food cold, in a few short paragraphs.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", false).unwrap();
+        let gen = 160usize;
+        // a step at a time
+        let mut kv = model.new_kv_cache(prompt.len() + gen + 16);
+        let mut l = m.forward_embeds_positions(&m.embed_text(&prompt), prompt.len(), &mut kv, None).unwrap().to_host();
+        let (mut plain, clock) = (Vec::new(), Instant::now());
+        for _ in 0..gen {
+            let t = argmax(l.data());
+            plain.push(t);
+            l = m.forward_embeds_positions(&m.embed_text(&[t]), 1, &mut kv, None).unwrap().to_host();
+        }
+        let plain_s = clock.elapsed().as_secs_f64();
+        assert!(m.drafts(), "the chain drafts with the model's MTP layer");
+        // drafted and checked
+        let mut kv = model.new_kv_cache(prompt.len() + gen + 16);
+        let mut logits = m.forward_embeds_positions(&m.embed_text(&prompt), prompt.len(), &mut kv, None).unwrap().to_host();
+        let mut history = prompt.clone();
+        let (mut out, mut checks, mut accepted, clock) = (Vec::new(), 0usize, 0usize, Instant::now());
+        let (mut t_draft, mut t_check, mut t_back) = (0f64, 0f64, 0f64);
+        let mut check_kernels = std::collections::BTreeMap::<&'static str, (f64, u64)>::new();
+        let _ = ggml_rs_wgpu::profile::take_kernels();
+        while out.len() < gen {
+            let next = argmax(logits.data());
+            out.push(next);
+            history.push(next);
+            let c = Instant::now();
+            let drafts = m.draft(&kv, &history, k).expect("drafts");
+            t_draft += c.elapsed().as_secs_f64();
+            let mut rows = vec![next];
+            rows.extend(&drafts);
+            let before = ggml_rs_wgpu::profile::take_kernels();
+            let c = Instant::now();
+            let checked = m.check(&rows, &mut kv).expect("a check");
+            t_check += c.elapsed().as_secs_f64();
+            for (name, ms, n) in ggml_rs_wgpu::profile::take_kernels() {
+                let e = check_kernels.entry(name).or_insert((0.0, 0));
+                e.0 += ms;
+                e.1 += n;
+            }
+            drop(before);
+            checks += 1;
+            let mut j = 0;
+            while j < drafts.len() && out.len() < gen && argmax(checked[j].data()) == drafts[j] {
+                out.push(drafts[j]);
+                history.push(drafts[j]);
+                j += 1;
+            }
+            accepted += j;
+            let c = Instant::now();
+            m.rollback(&mut kv, rows.len(), j + 1);
+            t_back += c.elapsed().as_secs_f64();
+            logits = checked[j].clone();
+        }
+        let spec_s = clock.elapsed().as_secs_f64();
+        eprintln!("a check's round: drafting {:.1} ms, the check {:.1} ms, rollbacks {:.1} ms", t_draft * 1e3 / checks as f64, t_check * 1e3 / checks as f64, t_back * 1e3 / checks as f64);
+        let mut ck: Vec<_> = check_kernels.into_iter().collect();
+        ck.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0));
+        for (name, (ms, c)) in ck.iter().take(12) {
+            eprintln!("    check: {name:<28} {:>8.2} ms ({} dispatches)", ms / checks as f64, c / checks as u64);
+        }
+        out.truncate(gen);
+        let same = plain.iter().zip(&out).take_while(|(a, b)| a == b).count();
+        eprintln!("{gen} tokens: a step at a time {:.1} ms a token; drafting {k} {:.1} ms a token ({checks} checks, {accepted} drafts taken of {}, {:.2} a check); the same tokens for the first {same}", plain_s * 1e3 / gen as f64, spec_s * 1e3 / gen as f64, checks * k, accepted as f64 / checks as f64);
+        eprintln!("plain:   {:?}", m.tokenizer.decode(&plain[..48.min(gen)]));
+        eprintln!("drafted: {:?}", m.tokenizer.decode(&out[..48.min(gen)]));
+        assert!(same >= 32, "the first {same} tokens agree");
+    }
+
     /// Where a chained Qwen3.5 run's time goes (QWEN35_MODEL): prompt chunks of a few tokens as the server's
     /// checkpoints cut them, a checkpoint's read of the recurrent state, decode steps, and a chunk of 512.
     #[test]
@@ -1505,6 +1728,18 @@ mod dense_webgpu_timing {
             forward(1, &mut kv);
         }
         eprintln!("{steps} decode steps: {:.2} ms a step", t.elapsed().as_secs_f64() * 1e3 / steps as f64);
+        // what checking drafted tokens costs: a run of 2, 3, 4 and 5 rows against a step's one (each the best of 8)
+        let _ = ggml_rs_wgpu::profile::take_kernels();
+        for n in [1usize, 2, 3, 4, 5] {
+            let best = (0..8).map(|_| forward(n, &mut kv)).fold(f64::MAX, f64::min);
+            eprintln!("a run of {n} rows: {best:.2} ms");
+            let k = ggml_rs_wgpu::profile::take_kernels();
+            if !k.is_empty() {
+                for (name, ms, c) in k.iter().take(6) {
+                    eprintln!("    {name:<28} {:>8.2} ms a run ({} dispatches)", ms / 8.0, c / 8);
+                }
+            }
+        }
         for n in [512usize, 512] {
             let past = kv.len;
             eprintln!("a chunk of {n} at {past}: {:.1} ms", forward(n, &mut kv));

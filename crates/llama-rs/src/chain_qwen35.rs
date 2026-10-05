@@ -8,6 +8,11 @@
 //! The recurrent state stays on the device between steps: the cache's state tensors are the chain's own vectors
 //! ([`DeviceChain::alias`]), so what reads them there (a checkpoint, a conversation set aside, a disk state) reads them
 //! back, and a state put there from the host (a restore, the host path's) is taken up again at the next run.
+//!
+//! With the model's multi-token-prediction layer the chain also drafts tokens ([`Qwen35Chain::draft`]) and checks them
+//! ([`Qwen35Chain::check`]): a run of the sampled token and its drafts, every row's logits back; a draft the sampler
+//! does not pick is undone ([`Qwen35Chain::rollback`]): each delta net's state and conv window as they were before the
+//! check (kept then), its accepted rows run through them again.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -97,6 +102,73 @@ struct Pool {
     convs: Vec<DeviceVec>,
 }
 
+/// Rows a check of drafted tokens takes at most (the sampled token and its drafts).
+pub const SPEC_ROWS: usize = 8;
+
+/// The multi-token-prediction layer's own copy of its attention cache (row `p`: its K then V), `cap` rows, and a
+/// row's attention output and scratch; its entries for positions `start..valid` are the layer's at those positions
+/// (from the trunk's hidden state and the token after), of the cache `owner`.
+struct MtpKv {
+    layer: DeviceVec,
+    cap: usize,
+    out: DeviceVec,
+    start: usize,
+    valid: usize,
+    owner: u64,
+}
+
+/// The layer's vectors for up to [`SPEC_ROWS`] rows.
+struct MtpWork {
+    e: DeviceVec,
+    h: DeviceVec,
+    en: DeviceVec,
+    hn: DeviceVec,
+    cat: DeviceVec,
+    x: DeviceVec,
+    xn: DeviceVec,
+    qfull: DeviceVec,
+    q: DeviceVec,
+    gate: DeviceVec,
+    k: DeviceVec,
+    v: DeviceVec,
+    qn: DeviceVec,
+    kn: DeviceVec,
+    q1: DeviceVec,
+    att: DeviceVec,
+    gated: DeviceVec,
+    proj: DeviceVec,
+    ffa: DeviceVec,
+    ffb: DeviceVec,
+    act: DeviceVec,
+    table: DeviceVec,
+    last: DeviceVec,
+    logits: DeviceVec,
+}
+
+/// What drafting and checking drafts need on the device: the multi-token-prediction layer's norms, its cache and
+/// vectors; every row's hidden state after the output norm, of the last run (a check's rows, or a run's last); a
+/// check's logits; and each delta net's state and conv window as they were before the last check, with the check's
+/// inputs to them (its rows' qkv and beta-alpha).
+struct Spec {
+    enorm: DeviceVec,
+    hnorm: DeviceVec,
+    head_norm: DeviceVec,
+    attn_norm: DeviceVec,
+    post_norm: DeviceVec,
+    q_norm: DeviceVec,
+    k_norm: DeviceVec,
+    kv: Mutex<MtpKv>,
+    work: MtpWork,
+    hid: DeviceVec,
+    /// Where `hid`'s rows are: the position of its first, and how many.
+    hid_at: Mutex<(usize, usize)>,
+    logits: DeviceVec,
+    backups: Vec<(DeviceVec, DeviceVec)>,
+    inputs: Vec<(DeviceVec, DeviceVec)>,
+    scratch_conv: DeviceVec,
+    scratch_core: DeviceVec,
+}
+
 /// A run's vectors for its rows.
 struct Work {
     x: DeviceVec,
@@ -166,6 +238,8 @@ struct State {
     /// A decode step's vectors, kept (and so their bind groups).
     step: Work,
     logits: DeviceVec,
+    /// Drafting and checking, where the model has a multi-token-prediction layer the device holds.
+    spec: Option<Spec>,
 }
 
 fn quant(w: &Weight) -> &QuantizedTensor {
@@ -337,6 +411,59 @@ impl Qwen35Chain {
                     states: ssm_layers.iter().map(|_| chain.vec(nv * dk * dv)).collect(),
                     convs: ssm_layers.iter().map(|_| chain.vec((sc.conv_kernel - 1) * ch)).collect(),
                 };
+                let spec = m.mtp.as_ref().and_then(|mtp| {
+                    let Qwen35Block::Attention { attn_norm, attn_q, attn_q_norm, attn_k, attn_k_norm, attn_v, attn_output, post_norm, ffn_pair, ffn_down } = &mtp.block else { return None };
+                    let ok = [&mtp.eh_proj, attn_q, attn_k, attn_v, attn_output, ffn_down].into_iter().all(held) && pair_held(ffn_pair) && ffn_pair.ff() == ff && attn_q.shape()[0] == 2 * n_h * hd;
+                    if !ok {
+                        return None;
+                    }
+                    let r = SPEC_ROWS;
+                    let v = |n: usize| chain.vec(n);
+                    let work = MtpWork {
+                        e: v(r * d),
+                        h: v(r * d),
+                        en: v(r * d),
+                        hn: v(r * d),
+                        cat: v(r * 2 * d),
+                        x: v(r * d),
+                        xn: v(r * d),
+                        qfull: v(r * n_h * 2 * hd),
+                        q: v(r * n_h * hd),
+                        gate: v(r * n_h * hd),
+                        k: v(r * n_kv * hd),
+                        v: v(r * n_kv * hd),
+                        qn: v(r * n_h * hd),
+                        kn: v(r * n_kv * hd),
+                        q1: v(n_h * hd),
+                        att: v(r * n_h * hd),
+                        gated: v(r * n_h * hd),
+                        proj: v(r * d),
+                        ffa: v(r * 2 * ff),
+                        ffb: v(r * ff),
+                        act: v(r * ff),
+                        table: v(r * cfg.rope_dim),
+                        last: v(d),
+                        logits: v(cfg.vocab_size),
+                    };
+                    Some(Spec {
+                        enorm: upload(&mtp.enorm),
+                        hnorm: upload(&mtp.hnorm),
+                        head_norm: upload(&mtp.head_norm),
+                        attn_norm: upload(attn_norm),
+                        post_norm: upload(post_norm),
+                        q_norm: upload(attn_q_norm),
+                        k_norm: upload(attn_k_norm),
+                        kv: Mutex::new(MtpKv { layer: chain.vec(1), cap: 0, out: chain.vec(1), start: 0, valid: 0, owner: 0 }),
+                        work,
+                        hid: v(r * d),
+                        hid_at: Mutex::new((0, 0)),
+                        logits: v(r * cfg.vocab_size),
+                        backups: ssm_layers.iter().map(|_| (v(nv * dk * dv), v((sc.conv_kernel - 1) * ch))).collect(),
+                        inputs: ssm_layers.iter().map(|_| (v(r * ch), v(r * 2 * nv))).collect(),
+                        scratch_conv: v(r * ch),
+                        scratch_core: v(r * nv * dv),
+                    })
+                });
                 Some(State {
                     dims,
                     layers,
@@ -347,6 +474,7 @@ impl Qwen35Chain {
                     pool: Mutex::new(pool),
                     step: Work::new(chain, &dims, 1),
                     logits: chain.vec(cfg.vocab_size),
+                    spec,
                 })
             })
             .as_ref()
@@ -376,14 +504,63 @@ impl Qwen35Chain {
             let runs = (kv.len + rows).div_ceil(256).max(1);
             let per_row = (s.n_h * runs * (s.hd + 2) + s.n_h * s.hd) * 4;
             let t = (ATTENTION_SCRATCH / per_row).clamp(1, MAX_ROWS).min(rows - at);
-            logits = Some(self.run(m, st, chain, &emb[at * s.d..(at + t) * s.d], t, kv));
+            logits = Some(self.run(m, st, chain, &emb[at * s.d..(at + t) * s.d], t, kv, false).pop().expect("the logits"));
             at += t;
         }
         logits
     }
 
-    /// One submit of `t` rows.
-    fn run(&self, m: &Qwen35Model, st: &State, chain: &dyn DeviceChain, emb: &[f32], t: usize, kv: &mut KvCache) -> Tensor {
+    /// Whether the chain drafts and checks tokens (the model's multi-token-prediction layer on the device).
+    pub(crate) fn drafts(&self, m: &Qwen35Model) -> bool {
+        std::env::var_os("OAIY_NO_CHAIN").is_none() && self.state(m).is_some_and(|st| st.spec.is_some())
+    }
+
+    /// A check of `rows` tokens (`embeds` `[rows, d]`: the token sampled, then its drafts; at most [`SPEC_ROWS`]) after
+    /// what `kv` holds: every row's logits (`[1, vocab]` each). The run is kept undoable ([`Self::rollback`]).
+    pub(crate) fn check(&self, m: &Qwen35Model, embeds: &Tensor, rows: usize, kv: &mut KvCache) -> Option<Vec<Tensor>> {
+        if !self.drafts(m) || rows == 0 || rows > SPEC_ROWS || embeds.numel() != rows * m.config.embedding_dim || kv.len + rows > kv.max_len {
+            return None;
+        }
+        let st = self.state(m)?;
+        let chain = m.backend.chain()?;
+        let h = embeds.to_host();
+        Some(self.run(m, st, chain, h.data(), rows, kv, true))
+    }
+
+    /// Undo a check's rows past its first `keep` (the sampled token and the drafts accepted): each delta net's state
+    /// and conv window as they were before it, its first `keep` rows run through them again, and the caches cut back.
+    pub(crate) fn rollback(&self, m: &Qwen35Model, kv: &mut KvCache, rows: usize, keep: usize) {
+        let (Some(st), Some(chain)) = (self.state(m), m.backend.chain()) else { return };
+        let Some(sp) = &st.spec else { return };
+        assert!(keep >= 1 && keep <= rows && rows <= kv.len, "a rollback of {rows} rows to {keep}");
+        if keep == rows {
+            return;
+        }
+        let s = st.dims;
+        let delta = DeltaNet { rows: keep, v_heads: s.nv, k_heads: s.nk, k_dim: s.dk, v_dim: s.dv, scale_q: 1.0 / (s.dv as f32).sqrt(), eps: m.config.rms_eps, sigmoid_gate: false };
+        let mut rec = chain.begin();
+        for (slot, &l) in st.ssm_layers.iter().enumerate() {
+            let (Some(state), Some(conv)) = (kv.ssm_state[l].as_ref().and_then(|t| chain.aliased(t)), kv.ssm_conv[l].as_ref().and_then(|t| chain.aliased(t))) else {
+                unreachable!("a check left layer {l}'s state the chain's")
+            };
+            let Mixer::Ssm { conv_w, a, dt, norm, .. } = &st.layers[l].mixer else { unreachable!("layer {l} is a delta net") };
+            let (bs, bc) = &sp.backups[slot];
+            let (qkv, ba) = &sp.inputs[slot];
+            rec.copy(bs, 0, &state, 0, state.len);
+            rec.copy(bc, 0, &conv, 0, conv.len);
+            rec.ssm_conv(qkv, conv_w, &conv, &sp.scratch_conv, keep, s.ch, s.kern);
+            // the outputs are not wanted: the check's were the accepted rows' already
+            rec.delta_net(&sp.scratch_conv, &sp.scratch_conv, ba, a, dt, norm, &state, &sp.scratch_core, delta);
+        }
+        rec.finish();
+        kv.len -= rows - keep;
+        let mut at = sp.hid_at.lock().unwrap_or_else(|p| p.into_inner());
+        at.1 = at.1.min(keep);
+    }
+
+    /// One submit of `t` rows: the last row's logits, or (a check) every row's.
+    #[allow(clippy::too_many_arguments)]
+    fn run(&self, m: &Qwen35Model, st: &State, chain: &dyn DeviceChain, emb: &[f32], t: usize, kv: &mut KvCache, checking: bool) -> Vec<Tensor> {
         let s = st.dims;
         let cfg = &m.config;
         let backend: &dyn Backend = &*m.backend;
@@ -451,6 +628,15 @@ impl Qwen35Chain {
                         Some(wf) => rec.matmul_f32_rows(wf, 2 * s.nv, s.d, &w.xn, &w.ba, t),
                         None => rec.matmul_rows(quant(ssm_ba), &w.xn, &w.ba, t),
                     }
+                    if let (true, Some(sp)) = (checking, &st.spec) {
+                        // what a rollback starts over from: the state and window before, the rows' inputs
+                        let (bs, bc) = &sp.backups[*slot];
+                        let (qkv, ba) = &sp.inputs[*slot];
+                        rec.copy(state, 0, bs, 0, state.len);
+                        rec.copy(conv, 0, bc, 0, conv.len);
+                        rec.copy(&w.qkv, 0, qkv, 0, t * s.ch);
+                        rec.copy(&w.ba, 0, ba, 0, t * 2 * s.nv);
+                    }
                     rec.ssm_conv(&w.qkv, conv_w, conv, &w.conv, t, s.ch, s.kern);
                     rec.delta_net(&w.conv, &w.z, &w.ba, a, dt, norm, state, &w.core, delta);
                     rec.matmul_rows(quant(ssm_out), &w.core, &w.proj, t);
@@ -474,21 +660,37 @@ impl Qwen35Chain {
             rec.matmul_rows(quant(ffn_down), &w.act, &w.proj, t);
             rec.add(&w.x, &w.proj);
         }
-        // the head of the last row only
+        // the head of the last row only, or of a check's every row; with a prediction layer, the hidden states after the
+        // output norm kept (a check's rows, or the last), and a prompt's chunk through the layer too (its cache)
         rec.rmsnorm_rows(&w.x, &st.output_norm, &w.xn, t, eps);
-        let last = if t == 1 {
-            &w.xn
+        if let Some(sp) = &st.spec {
+            let rows = if checking { t } else { 1 };
+            rec.copy(&w.xn, (t - rows) * s.d, &sp.hid, 0, rows * s.d);
+            *sp.hid_at.lock().unwrap_or_else(|p| p.into_inner()) = (past + t - rows, rows);
+            if !checking && t > 1 {
+                self.mtp_prompt(m, st, sp, chain, &mut *rec, emb, &w.xn, t, past, kv.id);
+            }
+        }
+        if checking {
+            let sp = st.spec.as_ref().expect("a check is a drafting chain's");
+            rec.matmul_rows(quant(&m.output), &w.xn, &sp.logits, t);
+            rec.read_range(&sp.logits, 0, t * s.vocab);
         } else {
-            rec.copy(&w.xn, (t - 1) * s.d, &w.last, 0, s.d);
-            &w.last
-        };
-        rec.matmul(quant(&m.output), last, &st.logits);
-        rec.read(&st.logits);
+            let last = if t == 1 {
+                &w.xn
+            } else {
+                rec.copy(&w.xn, (t - 1) * s.d, &w.last, 0, s.d);
+                &w.last
+            };
+            rec.matmul(quant(&m.output), last, &st.logits);
+            rec.read(&st.logits);
+        }
         for slot in 0..st.attention_layers.len() {
             rec.read_range(&g.layers[slot], past * row, t * row);
         }
         let mut got = rec.finish().into_iter();
         let logits = got.next().expect("the logits");
+        let logits: Vec<Tensor> = logits.chunks_exact(s.vocab).map(|l| Tensor::from_vec(l.to_vec(), vec![1, s.vocab])).collect();
         // the run's K and V rows into the host's cache too, which the copy already holds
         for (&l, rows) in st.attention_layers.iter().zip(got) {
             let (mut kh, mut vh) = (Vec::with_capacity(t * kvd), Vec::with_capacity(t * kvd));
@@ -501,6 +703,235 @@ impl Qwen35Chain {
         kv.commit(t);
         kv.dirty_from = usize::MAX;
         self.runs.fetch_add(1, Ordering::Relaxed);
-        Tensor::from_vec(logits, vec![1, s.vocab])
+        logits
     }
+
+    /// The prediction layer's cache at a prompt's chunk (`t` rows at `past`, its embeddings `emb`, its hidden states
+    /// after the output norm `hidden`): its entries for the chunk's positions but the last (whose next token the chunk
+    /// does not have), each from the row's hidden state and the next row's token, where its entries run unbroken from
+    /// the cache's start up to the chunk (else its entries start over at the chunk).
+    #[allow(clippy::too_many_arguments)]
+    fn mtp_prompt(&self, m: &Qwen35Model, st: &State, sp: &Spec, chain: &dyn DeviceChain, rec: &mut dyn ggml_rs::ChainRecorder, emb: &[f32], hidden: &DeviceVec, t: usize, past: usize, owner: u64) {
+        let s = st.dims;
+        let mtp = m.mtp.as_ref().expect("a drafting chain's model has its layer");
+        let mut g = sp.kv.lock().unwrap_or_else(|p| p.into_inner());
+        mtp_reserve(chain, &mut g, &s, past + t);
+        if g.owner != owner || g.valid != past || g.start != 0 {
+            // a chunk's attention reaches back to the cache's start: entries from 0, or none
+            if past != 0 {
+                g.owner = 0;
+                g.valid = 0;
+                return;
+            }
+            g.start = 0;
+        }
+        g.owner = owner;
+        let rows = t - 1;
+        if rows == 0 {
+            return;
+        }
+        // the next tokens' embeddings and the hidden states, rows 0..t - 1, in a prompt's own vectors
+        let v = |n: usize| chain.vec(n);
+        let (e, en, hn, cat, x, xn) = (v(rows * s.d), v(rows * s.d), v(rows * s.d), v(rows * 2 * s.d), v(rows * s.d), v(rows * s.d));
+        chain.upload(&e, &emb[s.d..t * s.d]);
+        let eps = m.config.rms_eps;
+        rec.rmsnorm_rows(&e, &sp.enorm, &en, rows, eps);
+        rec.rmsnorm_rows(&first(hidden, rows * s.d), &sp.hnorm, &hn, rows, eps);
+        for r in 0..rows {
+            rec.copy(&en, r * s.d, &cat, r * 2 * s.d, s.d);
+            rec.copy(&hn, r * s.d, &cat, r * 2 * s.d + s.d, s.d);
+        }
+        rec.matmul_rows(quant(&mtp.eh_proj), &cat, &x, rows);
+        let w = MtpRows { x, xn, qfull: v(rows * s.n_h * 2 * s.hd), q: v(rows * s.n_h * s.hd), gate: v(rows * s.n_h * s.hd), k: v(rows * s.n_kv * s.hd), vv: v(rows * s.n_kv * s.hd), qn: v(rows * s.n_h * s.hd), kn: v(rows * s.n_kv * s.hd), att: v(chain.attention_rows_out_len(rows, s.n_h, s.hd, past + rows)), gated: v(rows * s.n_h * s.hd), proj: v(rows * s.d), ffa: v(rows * 2 * s.ff), ffb: v(rows * s.ff), act: v(rows * s.ff), table: v(rows * s.rot) };
+        chain.upload(&w.table, &rope_table(m.config.rope_theta, s.rot, past, rows));
+        mtp_block(m, mtp, sp, &s, rec, &g, &w, rows, past, None);
+        g.valid = past + rows;
+    }
+
+    /// Draft `k` tokens after `next` (the token sampled for position `kv.len`): the prediction layer's entries caught
+    /// up to it first (each position from the trunk's hidden state there, kept from the last run, and the token after,
+    /// `tokens` the tokens at positions `hidden's first + 1..=kv.len`, ending with `next`), its last giving the first
+    /// draft; each further draft from the layer's own output and the draft before. None where the chain does not draft
+    /// or the hidden states it needs are not kept.
+    pub(crate) fn draft(&self, m: &Qwen35Model, kv: &KvCache, tokens: &[u32], k: usize) -> Option<Vec<u32>> {
+        if !self.drafts(m) || k == 0 {
+            return None;
+        }
+        let st = self.state(m)?;
+        let chain = m.backend.chain()?;
+        let sp = st.spec.as_ref()?;
+        let s = st.dims;
+        let mtp = m.mtp.as_ref()?;
+        let n = kv.len;
+        let (hid_at, hid_rows) = *sp.hid_at.lock().unwrap_or_else(|p| p.into_inner());
+        // the rows the hidden states cover, up to the trunk's last position
+        if hid_rows == 0 || hid_at + hid_rows != n || tokens.len() < hid_rows {
+            return None;
+        }
+        let tokens = &tokens[tokens.len() - hid_rows..];
+        let mut g = sp.kv.lock().unwrap_or_else(|p| p.into_inner());
+        mtp_reserve(chain, &mut g, &s, n + k + 1);
+        // entries from the hidden states' first row on; before it, the run of true ones if it reaches it, else none
+        if g.owner != kv.id || g.valid < hid_at || g.valid > n {
+            g.start = hid_at;
+        }
+        g.owner = kv.id;
+        let eps = m.config.rms_eps;
+        let argmax = |l: &[f32]| l.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0 as u32;
+        let wk = &sp.work;
+        let mut drafts = Vec::with_capacity(k);
+        // pass 0: the caught-up rows (the hidden states kept); then a row a draft (the layer's own output)
+        for pass in 0..k {
+            let (rows, at) = if pass == 0 { (hid_rows, hid_at) } else { (1, n + pass - 1) };
+            let next_tokens: Vec<u32> = if pass == 0 { tokens.to_vec() } else { vec![drafts[pass - 1]] };
+            let e = m.embed_text(&next_tokens).to_host();
+            chain.upload(&wk.e, e.data());
+            chain.upload(&wk.table, &rope_table(m.config.rope_theta, s.rot, at, rows));
+            let (ev, hv, env, hnv, cat) = (first(&wk.e, rows * s.d), first(&wk.h, rows * s.d), first(&wk.en, rows * s.d), first(&wk.hn, rows * s.d), first(&wk.cat, rows * 2 * s.d));
+            let mut rec = chain.begin();
+            if pass == 0 {
+                rec.copy(&sp.hid, 0, &hv, 0, rows * s.d);
+            } else {
+                rec.copy(&wk.last, 0, &hv, 0, s.d);
+            }
+            rec.rmsnorm_rows(&ev, &sp.enorm, &env, rows, eps);
+            rec.rmsnorm_rows(&hv, &sp.hnorm, &hnv, rows, eps);
+            for r in 0..rows {
+                rec.copy(&env, r * s.d, &cat, r * 2 * s.d, s.d);
+                rec.copy(&hnv, r * s.d, &cat, r * 2 * s.d + s.d, s.d);
+            }
+            let w = MtpRows::of(wk, &s, rows);
+            rec.matmul_rows(quant(&mtp.eh_proj), &cat, &w.x, rows);
+            mtp_block(m, mtp, sp, &s, &mut *rec, &g, &w, rows, at, Some((&wk.q1, g.start)));
+            // the head of the last row: the next draft; the layer's own output of it, the next pass's hidden state
+            rec.copy(&w.x, (rows - 1) * s.d, &wk.last, 0, s.d);
+            let xn1 = first(&wk.xn, s.d);
+            rec.rmsnorm_rows(&wk.last, &sp.head_norm, &xn1, 1, eps);
+            rec.matmul(quant(&m.output), &xn1, &wk.logits);
+            rec.read(&wk.logits);
+            let logits = rec.finish().pop().expect("the draft's logits");
+            drafts.push(argmax(&logits));
+            if pass == 0 {
+                // the layer's entries are its own up to the trunk's last position
+                g.valid = n;
+            }
+        }
+        Some(drafts)
+    }
+}
+
+/// `v`'s first `len` elements, as a vector of their own (the same buffer): a chain's ops take their sizes from their
+/// vectors' lengths, and the layer's are kept for [`SPEC_ROWS`] rows.
+fn first(v: &DeviceVec, len: usize) -> DeviceVec {
+    assert!(len <= v.len, "{len} of a vector of {}", v.len);
+    DeviceVec { len, inner: Arc::clone(&v.inner) }
+}
+
+/// The prediction layer's vectors for a pass's rows.
+struct MtpRows {
+    x: DeviceVec,
+    xn: DeviceVec,
+    qfull: DeviceVec,
+    q: DeviceVec,
+    gate: DeviceVec,
+    k: DeviceVec,
+    vv: DeviceVec,
+    qn: DeviceVec,
+    kn: DeviceVec,
+    att: DeviceVec,
+    gated: DeviceVec,
+    proj: DeviceVec,
+    ffa: DeviceVec,
+    ffb: DeviceVec,
+    act: DeviceVec,
+    table: DeviceVec,
+}
+
+impl MtpRows {
+    /// A pass's `rows` of the kept vectors.
+    fn of(wk: &MtpWork, s: &Dims, rows: usize) -> MtpRows {
+        let qh = s.n_h * s.hd;
+        MtpRows {
+            x: first(&wk.x, rows * s.d),
+            xn: first(&wk.xn, rows * s.d),
+            qfull: first(&wk.qfull, rows * 2 * qh),
+            q: first(&wk.q, rows * qh),
+            gate: first(&wk.gate, rows * qh),
+            k: first(&wk.k, rows * s.n_kv * s.hd),
+            vv: first(&wk.v, rows * s.n_kv * s.hd),
+            qn: first(&wk.qn, rows * qh),
+            kn: first(&wk.kn, rows * s.n_kv * s.hd),
+            att: first(&wk.att, rows * qh),
+            gated: first(&wk.gated, rows * qh),
+            proj: first(&wk.proj, rows * s.d),
+            ffa: first(&wk.ffa, rows * 2 * s.ff),
+            ffb: first(&wk.ffb, rows * s.ff),
+            act: first(&wk.act, rows * s.ff),
+            table: first(&wk.table, rows * s.rot),
+        }
+    }
+}
+
+/// Room in the prediction layer's cache for `needed` rows (its rows kept).
+fn mtp_reserve(chain: &dyn DeviceChain, g: &mut MtpKv, s: &Dims, needed: usize) {
+    if g.cap >= needed {
+        return;
+    }
+    let row = 2 * s.n_kv * s.hd;
+    let cap = needed.next_power_of_two().max(256);
+    g.layer = if g.cap == 0 { chain.vec(cap * row) } else { chain.resize(&g.layer, cap * row) };
+    g.out = chain.vec(chain.attention_out_len(s.n_h, s.hd, cap));
+    g.cap = cap;
+}
+
+/// The prediction layer's block on `rows` rows of `w.x` at positions `at..at + rows` (its RoPE table in `w.table`):
+/// its attention over its cache (each row over the positions before it from `lo`, a row at a time, where `one` gives
+/// a query's vector and `lo`; else a prompt's from the cache's start), then its FFN, `w.x` the block's output.
+#[allow(clippy::too_many_arguments)]
+fn mtp_block(m: &Qwen35Model, mtp: &crate::qwen35::Qwen35Mtp, sp: &Spec, s: &Dims, rec: &mut dyn ggml_rs::ChainRecorder, g: &MtpKv, w: &MtpRows, rows: usize, at: usize, one: Option<(&DeviceVec, usize)>) {
+    let Qwen35Block::Attention { attn_q, attn_k, attn_v, attn_output, ffn_pair, ffn_down, .. } = &mtp.block else { unreachable!("the prediction layer attends") };
+    let eps = m.config.rms_eps;
+    let (kvd, row) = (s.n_kv * s.hd, 2 * s.n_kv * s.hd);
+    let scale = 1.0 / (s.hd as f32).sqrt();
+    let t = rows;
+    rec.rmsnorm_rows(&w.x, &sp.attn_norm, &w.xn, t, eps);
+    rec.matmul_rows(quant(attn_q), &w.xn, &w.qfull, t);
+    rec.matmul_rows(quant(attn_k), &w.xn, &w.k, t);
+    rec.matmul_rows(quant(attn_v), &w.xn, &w.vv, t);
+    rec.copy_cols(&w.qfull, &w.q, t * s.n_h, s.hd, 2 * s.hd, 0);
+    rec.copy_cols(&w.qfull, &w.gate, t * s.n_h, s.hd, 2 * s.hd, s.hd);
+    rec.rmsnorm_rows(&w.q, &sp.q_norm, &w.qn, t * s.n_h, eps);
+    rec.rmsnorm_rows(&w.k, &sp.k_norm, &w.kn, t * s.n_kv, eps);
+    rec.rope_partial_rows(&w.qn, t, s.n_h, s.hd, s.rot, &w.table);
+    rec.rope_partial_rows(&w.kn, t, s.n_kv, s.hd, s.rot, &w.table);
+    rec.store_rows(&w.kn, &g.layer, t, kvd, at, row, 0);
+    rec.store_rows(&w.vv, &g.layer, t, kvd, at, row, kvd);
+    let qh = s.n_h * s.hd;
+    match one {
+        Some((q1, lo)) => {
+            for r in 0..t {
+                rec.copy(&w.qn, r * qh, q1, 0, qh);
+                rec.attention(q1, &g.layer, &g.out, s.n_h, s.n_kv, s.hd, lo.min(at + r), at + r + 1, g.cap, scale);
+                rec.copy(&g.out, 0, &w.att, r * qh, qh);
+            }
+        }
+        None => rec.attention_rows(&w.qn, &g.layer, &w.att, t, s.n_h, s.n_kv, s.hd, at, None, scale),
+    }
+    rec.mul_sigmoid(&w.att, &w.gate, &w.gated, t * qh);
+    rec.matmul_rows(quant(attn_output), &w.gated, &w.proj, t);
+    rec.add(&w.x, &w.proj);
+    rec.rmsnorm_rows(&w.x, &sp.post_norm, &w.xn, t, eps);
+    match ffn_pair {
+        FfnPair::Fused(gu) => {
+            rec.matmul_rows(quant(gu), &w.xn, &w.ffa, t);
+            rec.silu_mul_split_rows(&w.ffa, &w.act, t);
+        }
+        FfnPair::Split { gate, up } => {
+            rec.matmul_rows(quant(gate), &w.xn, &w.ffa, t);
+            rec.matmul_rows(quant(up), &w.xn, &w.ffb, t);
+            rec.silu_mul(&w.ffa, &w.ffb, &w.act, t * s.ff);
+        }
+    }
+    rec.matmul_rows(quant(ffn_down), &w.act, &w.proj, t);
+    rec.add(&w.x, &w.proj);
 }
