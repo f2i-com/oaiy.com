@@ -1321,13 +1321,12 @@ mod dense_webgpu_timing {
         assert!(worst >= 0.9999, "{worst}");
     }
 
-    /// Qwen3.8-Flash-Next's decode step chained on the GPUs (its layers over every discrete one) answers as its own
-    /// path does, step by step on the same tokens (the host path's greedy ones): each step's logits close, the same
-    /// greedy token (bar near-ties), and the chain ran. FLASHNEXT_MODEL: the EXL3 checkpoint.
+    /// Qwen3.8-Flash-Next chained on the GPUs (its layers over every discrete one) answers as its own path does: the
+    /// prompt as one chunk, then step by step on the same tokens (the host path's greedy ones): each step's logits
+    /// close, the same greedy token (bar near-ties), and the chain ran. FLASHNEXT_MODEL: the EXL3 checkpoint.
     #[test]
     #[ignore = "needs WebGPU adapters with room for Qwen3.8-Flash-Next and its checkpoint (FLASHNEXT_MODEL)"]
     fn a_chained_flashnext_step_answers_as_its_own_path() {
-        use std::sync::atomic::Ordering;
         use std::sync::Arc;
         let path = std::env::var("FLASHNEXT_MODEL").unwrap_or_else(|_| r"E:\models\Qwen3.8-Flash-Next\exl3-3.05bpw".into());
         let Ok(b0) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
@@ -1354,10 +1353,17 @@ mod dense_webgpu_timing {
             let n = |v: &[f32]| v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
             dot / (n(a) * n(b))
         };
-        let (mut kh, mut kc) = (model.new_kv_cache(prompt.len() + steps + 8), model.new_kv_cache(prompt.len() + steps + 8));
+        let (mut kh, mut kc) = (model.new_kv_cache(prompt.len() + steps + 64), model.new_kv_cache(prompt.len() + steps + 64));
         let e = model.embed_text(&prompt).unwrap();
+        let t = std::time::Instant::now();
         let lh = model.forward_host(&prompt, &e, &mut kh, None).unwrap();
-        let _ = model.forward_host(&prompt, &e, &mut kc, None).unwrap();
+        let ph = t.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        let lc = model.forward(&prompt, &e, &mut kc, None).unwrap();
+        let pc = t.elapsed().as_secs_f64();
+        let prompt_cos = cosine(lh.data(), lc.data());
+        eprintln!("the prompt's {} tokens: host {:.0} ms, chained {:.0} ms; logits cosine {prompt_cos:.6}, the same greedy token {}", prompt.len(), ph * 1e3, pc * 1e3, argmax(lh.data()) == argmax(lc.data()));
+        assert!(prompt_cos > 0.99, "{prompt_cos}");
         let mut next = argmax(lh.data());
         let (mut worst, mut same, mut th, mut tc) = (1.0f64, 0usize, 0f64, 0f64);
         for _ in 0..steps {
@@ -1374,8 +1380,25 @@ mod dense_webgpu_timing {
         }
         let runs = model.chain_runs();
         eprintln!("{steps} steps: host {:.1} ms a step, chained {:.1} ms ({runs} chained); worst logits cosine {worst:.6}; the same greedy token {same} of {steps}", th * 1e3 / steps as f64, tc * 1e3 / steps as f64);
-        assert_eq!(runs, steps, "every step chained");
+        assert_eq!(runs, steps + 1, "the prompt and every step chained");
         assert!(worst > 0.99, "{worst}");
+        // a later chunk: after the chained steps (the state the chain's, the cache's rows its own), and after a prompt
+        // the host path ran (its state adopted, the cache's rows the host's), as a turn after a checkpoint's restore
+        let more: Vec<u32> = model.tokenizer.encode(" Now tell me what Moss likes to eat, and where on the boat Moss sleeps when it rains.", false).unwrap();
+        let e = model.embed_text(&more).unwrap();
+        let lh = model.forward_host(&more, &e, &mut kh, None).unwrap();
+        let lc = model.forward(&more, &e, &mut kc, None).unwrap();
+        let after_steps = cosine(lh.data(), lc.data());
+        let (mut kh2, mut kc2) = (model.new_kv_cache(prompt.len() + more.len() + 8), model.new_kv_cache(prompt.len() + more.len() + 8));
+        let e1 = model.embed_text(&prompt).unwrap();
+        let _ = model.forward_host(&prompt, &e1, &mut kh2, None).unwrap();
+        let _ = model.forward_host(&prompt, &e1, &mut kc2, None).unwrap();
+        let lh2 = model.forward_host(&more, &e, &mut kh2, None).unwrap();
+        let lc2 = model.forward(&more, &e, &mut kc2, None).unwrap();
+        let after_host = cosine(lh2.data(), lc2.data());
+        eprintln!("a later chunk of {}: after the chained steps logits cosine {after_steps:.6} (the same greedy token {}), after the host's prompt {after_host:.6} ({})", more.len(), argmax(lh.data()) == argmax(lc.data()), argmax(lh2.data()) == argmax(lc2.data()));
+        assert_eq!(model.chain_runs(), steps + 3, "both chunks chained");
+        assert!(after_steps > 0.99 && after_host > 0.99, "{after_steps} {after_host}");
     }
 
     /// Where a chained Qwen3.5 run's time goes (QWEN35_MODEL): prompt chunks of a few tokens as the server's
