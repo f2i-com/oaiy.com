@@ -42,19 +42,31 @@ pub struct LlamaModel {
     chain: std::sync::OnceLock<Option<ChainState>>,
 }
 
-/// VENDORED-LOCAL: what a chained decode step keeps on the device: the norms' weights and its activations.
+/// VENDORED-LOCAL: a chained decode step's copy of a KV cache on the device, a buffer a layer (row `t`: its K
+/// `[n_kv, head_dim]` then its V), `cap` rows of them, and the attention's output and scratch.
+struct ChainKv {
+    layers: Vec<ggml_rs::DeviceVec>,
+    cap: usize,
+    out: ggml_rs::DeviceVec,
+    /// The [`KvCache::id`] the rows are a copy of (0: none).
+    owner: u64,
+}
+
+/// VENDORED-LOCAL: what a chained decode step keeps on the device: the norms' weights, its activations and a copy of
+/// the KV cache.
 struct ChainState {
+    kv: std::sync::Mutex<ChainKv>,
+    rope_table: ggml_rs::DeviceVec,
     attn_norms: Vec<ggml_rs::DeviceVec>,
     ffn_norms: Vec<ggml_rs::DeviceVec>,
     output_norm: ggml_rs::DeviceVec,
-    /// the residual stream, the normed input, q, k, v, the attention's output, a projection's output, the fused
-    /// gate-up, the SwiGLU, the logits
+    /// the residual stream, the normed input, q, k, v, a projection's output, the fused gate-up, the SwiGLU, the
+    /// logits
     x: ggml_rs::DeviceVec,
     xn: ggml_rs::DeviceVec,
     q: ggml_rs::DeviceVec,
     k: ggml_rs::DeviceVec,
     v: ggml_rs::DeviceVec,
-    attn: ggml_rs::DeviceVec,
     proj: ggml_rs::DeviceVec,
     gate_up: ggml_rs::DeviceVec,
     act: ggml_rs::DeviceVec,
@@ -138,6 +150,8 @@ impl LlamaModel {
                 let ff = self.weights.blocks[0].ffn_pair.ff();
                 let (d, qd, kvd) = (cfg.embedding_dim, cfg.n_heads * cfg.head_dim, cfg.n_kv_heads * cfg.head_dim);
                 Some(ChainState {
+                    kv: std::sync::Mutex::new(ChainKv { layers: Vec::new(), cap: 0, out: chain.vec(1), owner: 0 }),
+                    rope_table: chain.vec(cfg.head_dim),
                     attn_norms: self.weights.blocks.iter().map(|b| upload(&b.attn_norm)).collect(),
                     ffn_norms: self.weights.blocks.iter().map(|b| upload(&b.ffn_norm)).collect(),
                     output_norm: upload(&self.weights.output_norm),
@@ -146,7 +160,6 @@ impl LlamaModel {
                     q: chain.vec(qd),
                     k: chain.vec(kvd),
                     v: chain.vec(kvd),
-                    attn: chain.vec(qd),
                     proj: chain.vec(d),
                     gate_up: chain.vec(2 * ff),
                     act: chain.vec(ff),
@@ -156,82 +169,102 @@ impl LlamaModel {
             .as_ref()
     }
 
-    /// VENDORED-LOCAL: a decode step with each layer's weights chained on the device, one submit a layer: the last
-    /// layer's output projection, residual, FFN norm, gate-up, SwiGLU, down and residual, then this layer's norm and
-    /// q, k and v, which alone come back for the host's RoPE, KV cache and attention. The step's 113 round trips on
-    /// WebGPU (a 3B Llama) became 29. The same ops as [`Self::forward`]'s, their sums in the device's order.
+    /// VENDORED-LOCAL: a decode step chained on the device in one submit: every layer's norm, q, k and v, RoPE (its
+    /// sines and cosines made here as the CPU's rope makes them), the K and V stored into a copy of the cache kept on
+    /// the device, attention over it, the output projection, residual, FFN and residual, then the head; only the
+    /// logits and the step's K and V rows (for the host's cache) come back. The copy is brought up to date first with
+    /// the rows the host wrote since (a prompt's; [`KvCache::dirty_from`]). A layer a submit (113 round trips a step
+    /// on WebGPU for a 3B Llama before) took 24.5 ms a step; the host's attention over 2,000 positions alone was 23.5.
     fn forward_chained(&self, token: u32, kv: &mut KvCache, st: &ChainState) -> Tensor {
         let cfg = &self.config;
         let backend = &*self.backend;
         let chain = backend.chain().expect("a chain state comes from a chain");
         let (n_h, n_kv, hd) = (cfg.n_heads, cfg.n_kv_heads, cfg.head_dim);
+        let (kvd, row) = (n_kv * hd, 2 * n_kv * hd);
         let past = kv.len;
         let scale = 1.0 / (hd as f32).sqrt();
-        let positions = [past as u32];
-        let rope_type = cfg.arch.rope_type();
         fn quant(w: &crate::loader::Weight) -> &ggml_rs::QuantizedTensor {
             match w {
                 crate::loader::Weight::Quant(q) => q,
                 _ => unreachable!("chain_state checked every weight"),
             }
         }
+        let mut g = st.kv.lock().unwrap_or_else(|p| p.into_inner());
+        // room for this step's row
+        if g.cap < past + 1 {
+            let cap = (past + 1).next_power_of_two().max(256);
+            g.layers = (0..cfg.n_layers).map(|l| match g.layers.get(l) {
+                Some(old) => chain.resize(old, cap * row),
+                None => chain.vec(cap * row),
+            }).collect();
+            g.out = chain.vec(chain.attention_out_len(n_h, hd, cap));
+            g.cap = cap;
+        }
+        // the rows the host wrote since (all of them for a cache the copy is not of)
+        let from = if g.owner == kv.id { kv.dirty_from.min(past) } else { 0 };
+        if from < past {
+            for l in 0..cfg.n_layers {
+                let (kh, vh) = (kv.k_buffer(l), kv.v_buffer(l));
+                let (kh, vh) = (if kh.is_device() { kh.to_host() } else { kh.clone() }, if vh.is_device() { vh.to_host() } else { vh.clone() });
+                let mut rows = Vec::with_capacity((past - from) * row);
+                for t in from..past {
+                    rows.extend_from_slice(&kh.data()[t * kvd..(t + 1) * kvd]);
+                    rows.extend_from_slice(&vh.data()[t * kvd..(t + 1) * kvd]);
+                }
+                chain.upload_at(&g.layers[l], from * row, &rows);
+            }
+        }
+        g.owner = kv.id;
+        let theta = cfg.rope_theta;
+        let table: Vec<f32> = (0..hd / 2)
+            .flat_map(|j| {
+                let (s, c) = (past as f32 * theta.powf(-2.0 * j as f32 / hd as f32) / 1.0).sin_cos();
+                [s, c]
+            })
+            .collect();
+        chain.upload(&st.rope_table, &table);
+        let neox = matches!(cfg.arch.rope_type(), ggml_rs::RopeType::NeoX);
         let emb = backend.embed_lookup(&self.weights.tok_embd, &[token], cfg.embedding_dim);
         let emb = if emb.is_device() { emb.to_host() } else { emb };
         chain.upload(&st.x, emb.data());
-        // layer 0's norm and q, k, v
         let mut rec = chain.begin();
-        let b0 = &self.weights.blocks[0];
-        rec.rmsnorm(&st.x, &st.attn_norms[0], &st.xn, cfg.rms_eps);
-        rec.matmul(quant(&b0.attn_q), &st.xn, &st.q);
-        rec.matmul(quant(&b0.attn_k), &st.xn, &st.k);
-        rec.matmul(quant(&b0.attn_v), &st.xn, &st.v);
-        rec.read(&st.q);
-        rec.read(&st.k);
-        rec.read(&st.v);
-        let mut got = rec.finish();
-        for layer in 0..cfg.n_layers {
-            let b = &self.weights.blocks[layer];
-            let v_host = got.pop().expect("v");
-            let k_host = got.pop().expect("k");
-            let q_host = got.pop().expect("q");
-            let mut q = Tensor::from_vec(q_host, vec![1, n_h, hd]);
-            let mut k = Tensor::from_vec(k_host, vec![1, n_kv, hd]);
-            let v = Tensor::from_vec(v_host, vec![1, n_kv, hd]);
-            ops::rope(backend, &mut q, &positions, hd, rope_type, cfg.rope_theta);
-            ops::rope(backend, &mut k, &positions, hd, rope_type, cfg.rope_theta);
-            kv.append(backend, layer, &k, &v);
-            let attn = ops::attention(backend, &q, kv.k_buffer(layer), kv.v_buffer(layer), kv.len + 1, scale, past);
-            let attn = if attn.is_device() { attn.to_host() } else { attn };
-            chain.upload(&st.attn, attn.data());
-            let mut rec = chain.begin();
-            // this layer's tail
-            rec.matmul(quant(&b.attn_output), &st.attn, &st.proj);
+        for l in 0..cfg.n_layers {
+            let b = &self.weights.blocks[l];
+            rec.rmsnorm(&st.x, &st.attn_norms[l], &st.xn, cfg.rms_eps);
+            rec.matmul(quant(&b.attn_q), &st.xn, &st.q);
+            rec.matmul(quant(&b.attn_k), &st.xn, &st.k);
+            rec.matmul(quant(&b.attn_v), &st.xn, &st.v);
+            rec.rope(&st.q, n_h, hd, &st.rope_table, neox);
+            rec.rope(&st.k, n_kv, hd, &st.rope_table, neox);
+            rec.store(&st.k, &g.layers[l], past * row);
+            rec.store(&st.v, &g.layers[l], past * row + kvd);
+            rec.attention(&st.q, &g.layers[l], &g.out, n_h, n_kv, hd, 0, past + 1, g.cap, scale);
+            rec.matmul(quant(&b.attn_output), &g.out, &st.proj);
             rec.add(&st.x, &st.proj);
-            rec.rmsnorm(&st.x, &st.ffn_norms[layer], &st.xn, cfg.rms_eps);
+            rec.rmsnorm(&st.x, &st.ffn_norms[l], &st.xn, cfg.rms_eps);
             let crate::loader::FfnPair::Fused(gu) = &b.ffn_pair else { unreachable!("chain_state checked the pair") };
             rec.matmul(quant(gu), &st.xn, &st.gate_up);
             rec.silu_mul_split(&st.gate_up, &st.act);
             rec.matmul(quant(&b.ffn_down), &st.act, &st.proj);
             rec.add(&st.x, &st.proj);
-            if layer + 1 < cfg.n_layers {
-                // the next layer's head
-                let nb = &self.weights.blocks[layer + 1];
-                rec.rmsnorm(&st.x, &st.attn_norms[layer + 1], &st.xn, cfg.rms_eps);
-                rec.matmul(quant(&nb.attn_q), &st.xn, &st.q);
-                rec.matmul(quant(&nb.attn_k), &st.xn, &st.k);
-                rec.matmul(quant(&nb.attn_v), &st.xn, &st.v);
-                rec.read(&st.q);
-                rec.read(&st.k);
-                rec.read(&st.v);
-            } else {
-                rec.rmsnorm(&st.x, &st.output_norm, &st.xn, cfg.rms_eps);
-                rec.matmul(quant(&self.weights.output), &st.xn, &st.logits);
-                rec.read(&st.logits);
-            }
-            got = rec.finish();
+        }
+        rec.rmsnorm(&st.x, &st.output_norm, &st.xn, cfg.rms_eps);
+        rec.matmul(quant(&self.weights.output), &st.xn, &st.logits);
+        rec.read(&st.logits);
+        for l in 0..cfg.n_layers {
+            rec.read_range(&g.layers[l], past * row, row);
+        }
+        let mut got = rec.finish().into_iter();
+        let logits = got.next().expect("the logits");
+        // the step's K and V rows into the host's cache too, which the copy already holds
+        for (l, kvrow) in got.enumerate() {
+            let k = Tensor::from_vec(kvrow[..kvd].to_vec(), vec![1, n_kv, hd]);
+            let v = Tensor::from_vec(kvrow[kvd..].to_vec(), vec![1, n_kv, hd]);
+            kv.append(backend, l, &k, &v);
         }
         kv.commit(1);
-        Tensor::from_vec(got.pop().expect("the logits"), vec![1, cfg.vocab_size])
+        kv.dirty_from = usize::MAX;
+        Tensor::from_vec(logits, vec![1, cfg.vocab_size])
     }
 
     pub fn forward(&self, tokens: &[u32], kv: &mut KvCache) -> Tensor {

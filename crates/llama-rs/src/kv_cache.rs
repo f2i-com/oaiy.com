@@ -8,7 +8,11 @@
 //! good GPU perf, since it eliminates two ops (slice + repeat_kv) per layer.
 
 use ggml_rs::{Backend, Tensor};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// VENDORED-LOCAL: each cache's [`KvCache::id`].
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 pub struct KvCache {
@@ -40,6 +44,12 @@ pub struct KvCache {
     /// Per-layer conv1d sliding-window state `[conv_kernel - 1, conv_dim]`,
     /// holding the last `K-1` time steps of the projected qkv concatenation.
     pub ssm_conv:    Vec<Option<Tensor>>,
+
+    /// VENDORED-LOCAL: for a copy of this cache kept elsewhere (a chained decode step's, on the device): which cache
+    /// it is, and the first row [`KvCache::append`] has written since the copy was last brought up to date (0: all of
+    /// them; `usize::MAX`: none).
+    pub id:          u64,
+    pub dirty_from:  usize,
 }
 
 impl KvCache {
@@ -96,10 +106,13 @@ impl KvCache {
             head_dims: head_dims.to_vec(),
             ssm_state: (0..n_layers).map(|_| None).collect(),
             ssm_conv:  (0..n_layers).map(|_| None).collect(),
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            dirty_from: 0,
         }
     }
 
     pub fn reset(&mut self) {
+        self.dirty_from = 0;
         self.len = 0;
         for s in &mut self.ssm_state { *s = None; }
         for c in &mut self.ssm_conv  { *c = None; }
@@ -115,7 +128,8 @@ impl KvCache {
             n_kv_heads: heads.iter().copied().max().unwrap_or(0),
             n_kv_heads_per_layer: heads.to_vec(), head_dims: dims.to_vec(),
             ssm_state: (0..heads.len()).map(|_| None).collect(),
-            ssm_conv: (0..heads.len()).map(|_| None).collect(), layer_backends: backends }
+            ssm_conv: (0..heads.len()).map(|_| None).collect(), layer_backends: backends,
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed), dirty_from: 0 }
     }
 
     pub fn reserve_layer(&mut self, backend: &dyn Backend, layer: usize, needed: usize) {
@@ -155,6 +169,7 @@ impl KvCache {
         self.reserve_layer(backend, layer, self.len + seq);
         backend.copy_axis0_into(&mut self.k[layer], self.len, new_k);
         backend.copy_axis0_into(&mut self.v[layer], self.len, new_v);
+        self.dirty_from = self.dirty_from.min(self.len);
     }
 
     pub fn n_kv_heads_for(&self, layer: usize) -> usize {
