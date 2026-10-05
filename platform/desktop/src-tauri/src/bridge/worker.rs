@@ -327,8 +327,10 @@ pub fn parse_capabilities(v: &Value) -> Result<EngineIdentity, String> {
 }
 
 /// How long `capabilities --json` may take. It hashes and compiles the staged
-/// wasm (~8 MB) — a second or two — and never runs a flow.
-pub(crate) const PROBE_DEADLINE: Duration = Duration::from_secs(15);
+/// wasm (~8 MB) — a second or two — and never runs a flow. The tests' stub CLIs
+/// are Node scripts, and a busy Windows runner took more than 15 s to start one
+/// in the third of the release check's test passes: they get a minute.
+pub(crate) const PROBE_DEADLINE: Duration = Duration::from_secs(if cfg!(test) { 60 } else { 15 });
 /// How long a refusal is remembered before the CLI is asked again, so a fixed
 /// install recovers without a restart. A `Ready` answer is kept until the CLI
 /// file itself changes, or until a RUN finds the engine gone
