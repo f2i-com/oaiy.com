@@ -44,6 +44,12 @@ pub struct DeltaNet {
 pub trait DeviceChain: Send + Sync {
     /// A zeroed vector of `len`.
     fn vec(&self, len: usize) -> DeviceVec;
+    /// `values` (a matrix's, an even number) as f16, two to a word, if each is an f16 value exactly (a checkpoint's
+    /// f16 weights held as f32): for [`ChainRecorder::matmul_f16_rows`]. None where the device keeps no such matrices.
+    fn vec_f16(&self, values: &[f32]) -> Option<DeviceVec> {
+        let _ = values;
+        None
+    }
     /// Zero `v` (before whatever is recorded next runs).
     fn zero(&self, v: &DeviceVec);
     /// A tensor of `shape` whose storage is `v` itself, not a copy (a model's recurrent state kept on the device in its
@@ -145,6 +151,28 @@ pub trait ChainRecorder {
     /// `y[r] = W x[r]` for `rows` rows of `x` (`[rows, k]`), `W` f32 weights `[n, k]` (row-major) held in `w`.
     #[allow(clippy::too_many_arguments)]
     fn matmul_f32_rows(&mut self, w: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize);
+    /// An n-gram layer's gate ([`crate::Backend::ple_gate`]) of `rows` rows of `streams` streams of `d`: `gated` and
+    /// `conv_in` (each `[rows, streams * d]`) from `key` and `x` (`[rows, streams * d]`), `value` (`[rows, d]`) and the
+    /// norms (`[streams * d]`).
+    #[allow(clippy::too_many_arguments)]
+    fn ple_gate(&mut self, key: &DeviceVec, x: &DeviceVec, value: &DeviceVec, norm_key: &DeviceVec, norm_query: &DeviceVec, norm_conv: &DeviceVec, gated: &DeviceVec, conv_in: &DeviceVec, rows: usize, streams: usize, d: usize, eps: f32) {
+        let _ = (key, x, value, norm_key, norm_query, norm_conv, gated, conv_in, rows, streams, d, eps);
+        unreachable!("an n-gram layer's gate on a device without one")
+    }
+    /// An n-gram layer's dilated causal conv ([`crate::Backend::ple_conv`]) of `rows` rows of `width`: `x += gated +
+    /// silu(conv)` over `window` (`[(kernel - 1) * dilation, width]`, left with the stream's last rows) then `conv_in`,
+    /// `weight` `[width, kernel]`.
+    #[allow(clippy::too_many_arguments)]
+    fn ple_conv(&mut self, x: &DeviceVec, gated: &DeviceVec, conv_in: &DeviceVec, window: &DeviceVec, weight: &DeviceVec, rows: usize, width: usize, kernel: usize, dilation: usize) {
+        let _ = (x, gated, conv_in, window, weight, rows, width, kernel, dilation);
+        unreachable!("an n-gram layer's conv on a device without one")
+    }
+    /// [`Self::matmul_f32_rows`] of a matrix [`DeviceChain::vec_f16`] made (`k` even): half the bytes read.
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_f16_rows(&mut self, w: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize) {
+        let _ = (w, n, k, x, y, rows);
+        unreachable!("a device that makes no f16 matrices has none to multiply")
+    }
     /// A gated delta net's causal depthwise conv over `rows` tokens of `qkv` (`[rows, channels]`) after the
     /// `kernel - 1` inputs `state` holds (`[kernel - 1, channels]`, oldest first), with `weight` (`[channels, kernel]`),
     /// through SiLU into `out` (`[rows, channels]`); `state` then holds the last `kernel - 1` inputs. As the host's
@@ -182,6 +210,14 @@ pub trait ChainRecorder {
     /// row `r`'s experts `assign[r]` (expert, weight; the routed ones, then the shared one last, as
     /// `Experts::forward` routes them), their weighted outputs summed in that order into `out` (`[rows, hidden]`).
     fn moe_rows(&mut self, experts: &dyn crate::exl3::Experts, x: &DeviceVec, out: &DeviceVec, assign: &[Vec<(usize, f32)>]);
+    /// [`Self::moe_rows`] of one row, its experts routed on the device from the router's logits `logits` (`[routed +
+    /// 1]`, the shared expert's gate last) as [`crate::exl3::route`] routes them, `top_k` of them: no trip to the host
+    /// between a layer's router and its experts. False where the device cannot (and nothing is recorded): the caller
+    /// routes on the host.
+    fn moe_routed(&mut self, experts: &dyn crate::exl3::Experts, x: &DeviceVec, out: &DeviceVec, logits: &DeviceVec, top_k: usize) -> bool {
+        let _ = (experts, x, out, logits, top_k);
+        false
+    }
     /// `acc[i] += weights[at] * y[i]` for `i < len`: a weighted sum's term, its weight read from the device (an
     /// expert's, written by the host before the chain runs).
     fn axpy_at(&mut self, acc: &DeviceVec, y: &DeviceVec, weights: &DeviceVec, at: usize, len: usize);

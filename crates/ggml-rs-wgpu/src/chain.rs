@@ -392,6 +392,175 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 }
 "#;
 
+/// An n-gram layer's gate (`Backend::ple_gate`), a workgroup a (row, stream): the stream's key and query RMS-normed and
+/// scaled by their norms, their dot over `sqrt(d)`, its signed square root's sigmoid the gate; `gated` the gate times
+/// the row's value, `conv_in` that RMS-normed, scaled by the conv's norm and rounded to f16. `p[0]`: d, streams, the
+/// bits of eps.
+const PLE_GATE: &str = r#"
+@group(0) @binding(0) var<storage, read> key: array<f32>;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read> value: array<f32>;
+@group(0) @binding(3) var<storage, read> nk: array<f32>;
+@group(0) @binding(4) var<storage, read> nq: array<f32>;
+@group(0) @binding(5) var<storage, read> nc: array<f32>;
+@group(0) @binding(6) var<storage, read_write> gated: array<f32>;
+@group(0) @binding(7) var<storage, read_write> conv_in: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> red: array<vec2<f32>, 256>;
+
+fn total(v: vec2<f32>, t: u32) -> vec2<f32> {
+    red[t] = v;
+    workgroupBarrier();
+    for (var st = 128u; st > 0u; st /= 2u) {
+        if (t < st) { red[t] += red[t + st]; }
+        workgroupBarrier();
+    }
+    let out = red[0];
+    workgroupBarrier();
+    return out;
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    let d = p[0].x;
+    let streams = p[0].y;
+    let eps = bitcast<f32>(p[0].z);
+    let r = wg.x / streams;
+    let s = wg.x % streams;
+    let o = r * streams * d + s * d;
+    var sq = vec2<f32>(0.0);
+    for (var j = t; j < d; j += 256u) {
+        let kk = key[o + j];
+        let qq = x[o + j];
+        sq += vec2<f32>(kk * kk, qq * qq);
+    }
+    let ss = total(sq, t);
+    let ik = 1.0 / sqrt(ss.x / f32(d) + eps);
+    let iq = 1.0 / sqrt(ss.y / f32(d) + eps);
+    var dot = 0.0;
+    for (var j = t; j < d; j += 256u) {
+        dot += (key[o + j] * ik * nk[s * d + j]) * (x[o + j] * iq * nq[s * d + j]);
+    }
+    let g = total(vec2<f32>(dot, 0.0), t).x / sqrt(f32(d));
+    var sg = 0.0;
+    if (g != 0.0) {
+        sg = sign(g) * sqrt(max(abs(g), 1e-6));
+    }
+    let gate = 1.0 / (1.0 + exp(-sg));
+    var gs = 0.0;
+    for (var j = t; j < d; j += 256u) {
+        let gv = gate * value[r * d + j];
+        gated[o + j] = gv;
+        gs += gv * gv;
+    }
+    let inv = 1.0 / sqrt(total(vec2<f32>(gs, 0.0), t).x / f32(d) + eps);
+    for (var j = t; j < d; j += 256u) {
+        conv_in[o + j] = half(gate * value[r * d + j] * inv * nc[s * d + j]);
+    }
+}
+"#;
+
+/// An n-gram layer's dilated causal conv (`Backend::ple_conv`), a thread a channel through the rows: over the stream
+/// of the window's rows then `conv_in`'s, `x[r, c] += gated[r, c] + silu(sum over j of w[c, j] stream[r + j dilation,
+/// c])`; the window then the stream's last rows. `p[0]`: width, rows, kernel, dilation.
+const PLE_CONV: &str = r#"
+@group(0) @binding(0) var<storage, read> gated: array<f32>;
+@group(0) @binding(1) var<storage, read> conv_in: array<f32>;
+@group(0) @binding(2) var<storage, read> wc: array<f32>;
+@group(0) @binding(6) var<storage, read_write> x: array<f32>;
+@group(0) @binding(7) var<storage, read_write> win: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+fn stream_at(q: u32, c: u32, width: u32, state: u32) -> f32 {
+    if (q < state) {
+        return win[q * width + c];
+    }
+    return conv_in[(q - state) * width + c];
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let width = p[0].x;
+    let rows = p[0].y;
+    let kernel = p[0].z;
+    let dil = p[0].w;
+    let c = id.x;
+    if (c >= width) {
+        return;
+    }
+    let state = (kernel - 1u) * dil;
+    for (var r = 0u; r < rows; r++) {
+        var acc = 0.0;
+        for (var j = 0u; j < kernel; j++) {
+            acc += wc[c * kernel + j] * stream_at(r + j * dil, c, width, state);
+        }
+        x[r * width + c] = x[r * width + c] + (gated[r * width + c] + acc / (1.0 + exp(-acc)));
+    }
+    // each place read before it is written: the new row i is the stream's row rows + i, later than i
+    for (var i = 0u; i < state; i++) {
+        win[i * width + c] = stream_at(rows + i, c, width, state);
+    }
+}
+"#;
+
+/// [`MATMUL_F32`] of one row with f16 weights two to a word (`DeviceChain::vec_f16`'s): each output's products summed
+/// as it sums them. `p[0]`: n, k.
+const MATVEC_F16: &str = r#"
+var<workgroup> part: array<f32, 256>;
+
+fn wv(e: u32) -> f32 {
+    let pr = unpack2x16float(w[e / 2u]);
+    return select(pr.x, pr.y, (e & 1u) == 1u);
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let n = p[0].x;
+    let k = p[0].y;
+    let o = wg.x;
+    var s = 0.0;
+    for (var i = li; i < k; i += 256u) { s += wv(o * k + i) * x[i]; }
+    part[li] = s;
+    workgroupBarrier();
+    for (var st = 128u; st > 0u; st /= 2u) {
+        if (li < st) { part[li] += part[li + st]; }
+        workgroupBarrier();
+    }
+    if (li == 0u) { y[o] = part[0]; }
+}
+"#;
+
+/// [`MATVEC_F16`] for a short row (`k` under 2048): eight threads an output (a word, two weights, at a time), 32 outputs
+/// a workgroup. `p[0]`: n, k.
+const MATVEC_F16_NARROW: &str = r#"
+var<workgroup> part: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let n = p[0].x;
+    let k = p[0].y;
+    let o = wg.x * 32u + li / 8u;
+    let q = li % 8u;
+    let pairs = k / 2u;
+    var s = 0.0;
+    if (o < n) {
+        for (var i = q; i < pairs; i += 8u) {
+            let pr = unpack2x16float(w[o * pairs + i]);
+            s = s + pr.x * x[2u * i];
+            s = s + pr.y * x[2u * i + 1u];
+        }
+    }
+    part[li] = s;
+    workgroupBarrier();
+    if (q == 0u && o < n) {
+        var t = 0.0;
+        for (var j = 0u; j < 8u; j++) { t += part[li + j]; }
+        y[o] = t;
+    }
+}
+"#;
+
 /// `y[r, o] = sum over i of x[r, i] w[o, i]` for a prompt's rows ([`MATMUL_F32`]'s, of several): a workgroup a 64x64
 /// tile of `y` (64 rows by 64 outputs), a thread 4x4 of it, `k` 16 at a time through the workgroup's memory; split
 /// over `k` (the grid's third axis, `p[0].w` of it each), split `s`'s sums to part `s` of `y` (`[splits, rows, n]`)
@@ -817,6 +986,17 @@ impl DeviceChain for WgpuBackend {
         DeviceVec { len, inner: Arc::new(vec_buffer(&self.gpu, len)) }
     }
 
+    fn vec_f16(&self, values: &[f32]) -> Option<DeviceVec> {
+        let exact = values.len() % 2 == 0 && values.iter().all(|&v| half::f16::from_f32(v).to_f32().to_bits() == v.to_bits());
+        if !exact {
+            return None;
+        }
+        let words: Vec<f32> = values.chunks_exact(2).map(|p| f32::from_bits(half::f16::from_f32(p[0]).to_bits() as u32 | (half::f16::from_f32(p[1]).to_bits() as u32) << 16)).collect();
+        let v = self.vec(words.len());
+        DeviceChain::upload(self, &v, &words);
+        Some(v)
+    }
+
     fn zero(&self, v: &DeviceVec) {
         let mut enc = self.gpu.device.create_command_encoder(&Default::default());
         enc.clear_buffer(buffer(v), 0, None);
@@ -891,6 +1071,9 @@ pub(crate) type WideKey = (usize, [wgpu::Buffer; 8], [u32; 8]);
 /// Bind groups kept before the cache starts over (a cache grown from buffers that were replaced).
 const KEEP_GROUPS: usize = 16384;
 
+/// Dispatches a piece of a run submits ([`Recorder::finish`]'s).
+const PIECE: usize = 128;
+
 pub(crate) struct Recorder<'a> {
     backend: &'a WgpuBackend,
     /// Every op's dispatch, in order, run in one compute pass (a pass an op cost more than the ops).
@@ -904,6 +1087,29 @@ pub(crate) struct Recorder<'a> {
 }
 
 impl Recorder<'_> {
+    /// A dispatch recorded; a piece of [`PIECE`] submitted as soon as it is recorded (unless profiled), so the GPU runs
+    /// a run's first ops while the CPU records the rest. A later upload (`Queue::write_buffer`) lands after the pieces
+    /// already submitted and before the ones after, as the recording's order has it.
+    fn push(&mut self, d: Dispatch) {
+        self.dispatches.push(d);
+        if self.dispatches.len() >= PIECE && !crate::profile::chain_on() {
+            let _one = self.backend.serial.lock().unwrap_or_else(|p| p.into_inner());
+            let start = std::time::Instant::now();
+            let mut piece = self.gpu().device.create_command_encoder(&Default::default());
+            {
+                let mut pass = piece.begin_compute_pass(&Default::default());
+                for (pipeline, group, (x, y, z)) in &self.dispatches {
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, group, &[]);
+                    pass.dispatch_workgroups(*x, *y, *z);
+                }
+            }
+            self.gpu().queue.submit([piece.finish()]);
+            self.dispatches.clear();
+            crate::profile::add(&crate::profile::CHAIN_ENCODE, start);
+        }
+    }
+
     /// A vector of `len` for this recording alone (a prompt's scratch): from the GPU's pool, given back when the
     /// recording has run, so nothing may keep it. Its values are whatever it last held.
     pub(crate) fn scratch(&mut self, len: usize) -> DeviceVec {
@@ -962,7 +1168,7 @@ impl Recorder<'_> {
                 group
             }
         };
-        self.dispatches.push((Arc::clone(pipeline), group, groups));
+        self.push((Arc::clone(pipeline), group, groups));
     }
 
     fn group(&self, at0: &wgpu::Buffer, at1: &wgpu::Buffer, at2: &wgpu::Buffer, params: &wgpu::Buffer) -> wgpu::BindGroup {
@@ -989,7 +1195,7 @@ impl Recorder<'_> {
                 wgpu::BindGroupEntry { binding: 3, resource: params.as_entire_binding() },
             ],
         });
-        self.dispatches.push((Arc::clone(pipeline), group, groups));
+        self.push((Arc::clone(pipeline), group, groups));
     }
 
     pub(crate) fn named(&self, name: &'static str, body: &'static str) -> Arc<wgpu::ComputePipeline> {
@@ -1018,7 +1224,7 @@ impl Recorder<'_> {
                 group
             }
         };
-        self.dispatches.push((pipeline, group, groups));
+        self.push((pipeline, group, groups));
     }
 }
 
@@ -1155,6 +1361,11 @@ impl ChainRecorder for Recorder<'_> {
         g.record(self, x, out, assign);
     }
 
+    fn moe_routed(&mut self, experts: &dyn ggml_rs::exl3::Experts, x: &DeviceVec, out: &DeviceVec, logits: &DeviceVec, top_k: usize) -> bool {
+        let Some(g) = experts.as_any().and_then(|a| a.downcast_ref::<crate::exl3::Exl3MoeGrouped>()) else { return false };
+        g.record_routed(self, x, out, logits, top_k)
+    }
+
     fn axpy_at(&mut self, acc: &DeviceVec, y: &DeviceVec, weights: &DeviceVec, at: usize, len: usize) {
         assert!(acc.len >= len && y.len >= len && weights.len > at, "chain: a weighted term of {len}");
         let pipeline = self.named("chain-axpy-at", AXPY_AT);
@@ -1184,6 +1395,51 @@ impl ChainRecorder for Recorder<'_> {
         assert!(gate.len >= len && up.len >= len && out.len >= len, "chain: a SwiGLU of {len}");
         let pipeline = self.named("chain-silu-mul", SILU_MUL);
         self.dispatch_kept(&pipeline, buffer(gate), buffer(up), buffer(out), &[len as u32], ((len as u32).div_ceil(256), 1, 1));
+    }
+
+    fn ple_gate(&mut self, key: &DeviceVec, x: &DeviceVec, value: &DeviceVec, norm_key: &DeviceVec, norm_query: &DeviceVec, norm_conv: &DeviceVec, gated: &DeviceVec, conv_in: &DeviceVec, rows: usize, streams: usize, d: usize, eps: f32) {
+        let width = streams * d;
+        assert!(key.len >= rows * width && x.len >= rows * width && value.len >= rows * d && norm_key.len >= width && norm_query.len >= width && norm_conv.len >= width && gated.len >= rows * width && conv_in.len >= rows * width, "chain: an n-gram gate of {rows} rows of {streams} streams of {d}");
+        let body = format!("{}{PLE_GATE}", crate::exl3::HALF);
+        self.dispatch_wide("chain-ple-gate", &body, [buffer(key), buffer(x), buffer(value), buffer(norm_key), buffer(norm_query), buffer(norm_conv), buffer(gated), buffer(conv_in)], &[d as u32, streams as u32, eps.to_bits()], ((rows * streams) as u32, 1, 1));
+    }
+
+    fn ple_conv(&mut self, x: &DeviceVec, gated: &DeviceVec, conv_in: &DeviceVec, window: &DeviceVec, weight: &DeviceVec, rows: usize, width: usize, kernel: usize, dilation: usize) {
+        assert!(kernel >= 1 && x.len >= rows * width && gated.len >= rows * width && conv_in.len >= rows * width && window.len >= (kernel - 1) * dilation * width && weight.len >= width * kernel, "chain: an n-gram conv of {rows} rows of {width}");
+        let d = self.gpu().dummy().clone();
+        self.dispatch_wide("chain-ple-conv", PLE_CONV, [buffer(gated), buffer(conv_in), buffer(weight), &d, &d, &d, buffer(x), buffer(window)], &[width as u32, rows as u32, kernel as u32, dilation as u32], ((width as u32).div_ceil(256), 1, 1));
+    }
+
+    fn matmul_f16_rows(&mut self, w: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize) {
+        assert!(k % 2 == 0 && w.len * 2 >= n * k && x.len >= rows * k && y.len >= rows * n && n <= 65535 && rows <= 65535, "chain: an f16 matmul [{n}, {k}] of {rows} rows");
+        if rows == 1 {
+            // a long row a workgroup (as the f32 one sums it); short ones eight threads each, 32 a workgroup
+            if k >= 2048 {
+                let pipeline = self.named("chain-matvec-f16", MATVEC_F16);
+                self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(y), &[n as u32, k as u32], (n as u32, 1, 1));
+            } else {
+                let pipeline = self.named("chain-matvec-f16-narrow", MATVEC_F16_NARROW);
+                self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(y), &[n as u32, k as u32], ((n as u32).div_ceil(32), 1, 1));
+            }
+            return;
+        }
+        let tiles = n.div_ceil(64) * rows.div_ceil(64);
+        let want = 1024usize.div_ceil(tiles).min(k / 256).max(1);
+        let kc = k.div_ceil(want).div_ceil(16) * 16;
+        let splits = k.div_ceil(kc);
+        let d = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        let grid = (n.div_ceil(64) as u32, rows.div_ceil(64) as u32, splits as u32);
+        let words = [n as u32, k as u32, rows as u32, kc as u32];
+        let tiled = MATMUL_F32_TILED.replace("var<storage, read> w: array<f32>;", "var<storage, read> w: array<u32>;\nfn wv(e: u32) -> f32 {\n    let pr = unpack2x16float(w[e / 2u]);\n    return select(pr.x, pr.y, (e & 1u) == 1u);\n}").replace("u = w[(o0 + rr) * k + gk];", "u = wv((o0 + rr) * k + gk);");
+        if splits == 1 {
+            self.dispatch_wide("chain-matmul-f16-tiled", &tiled, [buffer(w), buffer(x), &d, &d, &d, &d, buffer(y), &drw], &words, grid);
+        } else {
+            let part = self.scratch(splits * rows * n);
+            self.dispatch_wide("chain-matmul-f16-tiled", &tiled, [buffer(w), buffer(x), &d, &d, &d, &d, buffer(&part), &drw], &words, grid);
+            let len = (rows * n) as u32;
+            self.dispatch_wide("chain-sum-splits", SUM_SPLITS, [buffer(&part), &d, &d, &d, &d, &d, buffer(y), &drw], &[len, splits as u32], (len.div_ceil(256).min(65535), len.div_ceil(256 * 65535), 1));
+        }
     }
 
     fn matmul_f32_rows(&mut self, w: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize) {
@@ -1326,6 +1582,7 @@ impl ChainRecorder for Recorder<'_> {
             }
             stamps = Some((staging, n));
         } else {
+            // what the pieces submitted while recording left (`push`), with the reads
             let mut pass = enc.begin_compute_pass(&Default::default());
             for (pipeline, group, (x, y, z)) in &self.dispatches {
                 pass.set_pipeline(pipeline);
@@ -1338,7 +1595,10 @@ impl ChainRecorder for Recorder<'_> {
                 enc.copy_buffer_to_buffer(from, (*offset * 4) as u64, staging, 0, (*len * 4) as u64);
             }
         }
-        self.gpu().queue.submit([enc.finish()]);
+        let command = enc.finish();
+        crate::profile::add(&crate::profile::CHAIN_ENCODE, start);
+        let submitted = std::time::Instant::now();
+        self.gpu().queue.submit([command]);
         for (_, _, staging, len) in &self.reads {
             staging.slice(..(*len as u64 * 4).max(4)).map_async(wgpu::MapMode::Read, |_| {});
         }
@@ -1346,6 +1606,7 @@ impl ChainRecorder for Recorder<'_> {
             staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
         }
         self.gpu().device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).expect("webgpu: device lost while waiting for a chain");
+        crate::profile::add(&crate::profile::CHAIN_WAIT, submitted);
         let pooled = std::mem::take(&mut self.pooled);
         self.gpu().unpool(pooled);
         if let Some((staging, n)) = stamps {
@@ -1905,6 +2166,92 @@ mod tests {
                     assert!((g - e).abs() <= 1e-4 * scale, "[{n}, {k}] of {rows} rows [{i}]: {g} against {e}");
                 }
             }
+        }
+    }
+
+    /// A matrix of f16 values held as f16 (two to a word) multiplies as it does held as f32: a long row's step the same
+    /// bits (summed the same way), a short row's and a prompt's within rounding; a matrix not all f16 values is not
+    /// made.
+    #[test]
+    fn an_f16_matrix_multiplies_as_its_f32_one() {
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        let mut r = rng(57);
+        assert!(b.vec_f16(&[0.1, 0.5]).is_none(), "0.1 is no f16");
+        for (n, k, rows) in [(324usize, 10240usize, 1usize), (513, 2560, 1), (1030, 324, 1), (70, 100, 1), (324, 10240, 70), (1030, 324, 65)] {
+            let w: Vec<f32> = (0..n * k).map(|_| half::f16::from_f32(r()).to_f32()).collect();
+            let x: Vec<f32> = (0..rows * k).map(|_| r()).collect();
+            let (w32, xd, y32, y16) = (b.vec(n * k), b.vec(rows * k), b.vec(rows * n), b.vec(rows * n));
+            DeviceChain::upload(&b, &w32, &w);
+            DeviceChain::upload(&b, &xd, &x);
+            let w16 = b.vec_f16(&w).expect("f16 values");
+            let mut rec = b.begin();
+            rec.matmul_f32_rows(&w32, n, k, &xd, &y32, rows);
+            rec.matmul_f16_rows(&w16, n, k, &xd, &y16, rows);
+            rec.read(&y32);
+            rec.read(&y16);
+            let mut got = rec.finish();
+            let (h, f) = (got.pop().unwrap(), got.pop().unwrap());
+            if rows == 1 && k >= 2048 {
+                assert_eq!(h.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), f.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "[{n}, {k}]: the same sums");
+            } else {
+                let scale = (k as f32).sqrt();
+                for (i, (a, e)) in h.iter().zip(&f).enumerate() {
+                    assert!((a - e).abs() <= 1e-4 * scale, "[{n}, {k}] of {rows} rows [{i}]: {a} against {e}");
+                }
+            }
+        }
+    }
+
+    /// An n-gram layer's gate and conv chained give the CPU's: two rows (a prompt's) then one (a step's), its window
+    /// carried from the first to the second.
+    #[test]
+    fn an_ngram_layers_gate_and_conv_match_the_cpus() {
+        use ggml_rs::Backend;
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        let cpu = ggml_rs::CpuBackend::new();
+        let mut r = rng(23);
+        let (streams, d, kernel, dil) = (4usize, 320usize, 4usize, 3usize);
+        let width = streams * d;
+        let state = (kernel - 1) * dil;
+        let mut v = |n: usize| (0..n).map(|_| r()).collect::<Vec<f32>>();
+        let (nk, nq, nc, wc) = (v(width), v(width), v(width), v(width * kernel));
+        let (dnk, dnq, dnc, dwc) = (b.vec(width), b.vec(width), b.vec(width), b.vec(width * kernel));
+        for (dv, h) in [(&dnk, &nk), (&dnq, &nq), (&dnc, &nc), (&dwc, &wc)] {
+            DeviceChain::upload(&b, dv, h);
+        }
+        let mut window = Tensor::from_vec(v(state * width), vec![state, width]);
+        let dwin = b.vec(state * width);
+        DeviceChain::upload(&b, &dwin, window.data());
+        for rows in [2usize, 1] {
+            let (key, x, value) = (v(rows * width), v(rows * width), v(rows * d));
+            let t = |h: &[f32], shape: Vec<usize>| Tensor::from_vec(h.to_vec(), shape);
+            let (gated, conv_in) = cpu.ple_gate(&t(&key, vec![rows, width]), &t(&x, vec![rows, width]), &t(&value, vec![rows, d]), &t(&nk, vec![width]), &t(&nq, vec![width]), &t(&nc, vec![width]), streams, 1e-6);
+            let mut want = t(&x, vec![rows, width]);
+            cpu.ple_conv(&mut want, &gated, &conv_in, &mut window, &t(&wc, vec![width, kernel]), kernel, dil);
+            let (dk, dx, dval, dg, dci) = (b.vec(rows * width), b.vec(rows * width), b.vec(rows * d), b.vec(rows * width), b.vec(rows * width));
+            DeviceChain::upload(&b, &dk, &key);
+            DeviceChain::upload(&b, &dx, &x);
+            DeviceChain::upload(&b, &dval, &value);
+            let mut rec = b.begin();
+            rec.ple_gate(&dk, &dx, &dval, &dnk, &dnq, &dnc, &dg, &dci, rows, streams, d, 1e-6);
+            rec.read(&dg);
+            rec.read(&dci);
+            rec.ple_conv(&dx, &dg, &dci, &dwin, &dwc, rows, width, kernel, dil);
+            rec.read(&dx);
+            rec.read(&dwin);
+            let mut got = rec.finish();
+            let (win_got, x_got, ci_got, g_got) = (got.pop().unwrap(), got.pop().unwrap(), got.pop().unwrap(), got.pop().unwrap());
+            close(&g_got, gated.data(), "gated");
+            // conv_in is rounded to f16: an f16 step apart where the sums round differently
+            for (i, (a, e)) in ci_got.iter().zip(conv_in.data()).enumerate() {
+                assert!((a - e).abs() <= 2e-3 * e.abs().max(1.0), "conv_in [{i}]: {a} against {e}");
+            }
+            for (i, (a, e)) in x_got.iter().zip(want.data()).enumerate() {
+                assert!((a - e).abs() <= 1e-2 * e.abs().max(1.0), "x [{i}] of {rows} rows: {a} against {e}");
+            }
+            close(&win_got, window.data(), "the window");
+            // the next run's window is the CPU's (as a step after a prompt starts from the prompt's)
+            DeviceChain::upload(&b, &dwin, window.data());
         }
     }
 

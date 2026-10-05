@@ -1430,7 +1430,7 @@ mod dense_webgpu_timing {
         let report = |what: &str, wall: f64| {
             let k = ggml_rs_wgpu::profile::take_kernels();
             let gpu: f64 = k.iter().map(|e| e.1).sum();
-            eprintln!("{what}: {wall:.1} ms, of it the GPU's kernels {gpu:.1} ms");
+            eprintln!("{what}: {wall:.1} ms, of it the GPU's kernels {gpu:.1} ms; {}", ggml_rs_wgpu::profile::take_line());
             for (name, ms, n) in k.iter().take(14) {
                 eprintln!("  {name:<28} {ms:>9.2} ms {n:>6}");
             }
@@ -1438,7 +1438,7 @@ mod dense_webgpu_timing {
         let mut at = 0;
         for (i, n) in [512usize, 512, 64].into_iter().enumerate() {
             let e = model.embed_text(&tokens[at..at + n]).unwrap();
-            let _ = ggml_rs_wgpu::profile::take_kernels();
+            let _ = (ggml_rs_wgpu::profile::take_kernels(), ggml_rs_wgpu::profile::take_line());
             let t = Instant::now();
             let _ = model.forward(&tokens[at..at + n], &e, &mut kv, None).unwrap();
             report(&format!("chunk {i} of {n} at {at}"), t.elapsed().as_secs_f64() * 1e3);
@@ -1447,7 +1447,7 @@ mod dense_webgpu_timing {
         let mut next = 1234u32;
         for step in 0..4 {
             let e = model.embed_text(&[next]).unwrap();
-            let _ = ggml_rs_wgpu::profile::take_kernels();
+            let _ = (ggml_rs_wgpu::profile::take_kernels(), ggml_rs_wgpu::profile::take_line());
             let t = Instant::now();
             let l = model.forward(&[next], &e, &mut kv, None).unwrap();
             if step == 3 {

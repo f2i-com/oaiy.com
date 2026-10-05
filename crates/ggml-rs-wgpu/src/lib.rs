@@ -29,6 +29,9 @@ pub mod profile {
     pub static LINEAR_WAIT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
     /// The attention (on the CPU: the cache is on the host).
     pub static ATTENTION: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    /// A chain's run: encoding its dispatches (to the submit), and the GPU's part (the submit to its reads mapped).
+    pub static CHAIN_ENCODE: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    pub static CHAIN_WAIT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
     pub(crate) fn add(counter: &[AtomicU64; 2], start: Instant) {
         counter[0].fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -39,7 +42,8 @@ pub mod profile {
     pub fn take_line() -> String {
         let take = |c: &[AtomicU64; 2]| (c[0].swap(0, Ordering::Relaxed) as f64 / 1e9, c[1].swap(0, Ordering::Relaxed));
         let (l, w, a) = (take(&LINEAR), take(&LINEAR_WAIT), take(&ATTENTION));
-        format!("projections {:.3} s ({}), of it waiting for the GPU {:.3} s; attention {:.3} s ({})", l.0, l.1, w.0, a.0, a.1)
+        let (e, cw) = (take(&CHAIN_ENCODE), take(&CHAIN_WAIT));
+        format!("projections {:.3} s ({}), of it waiting for the GPU {:.3} s; attention {:.3} s ({}); chains encoding {:.3} s ({}), on the GPU {:.3} s", l.0, l.1, w.0, a.0, a.1, e.0, e.1, cw.0)
     }
 
     /// A chain's kernels timed on the GPU (`OAIY_CHAIN_PROFILE`): each dispatch in a pass of its own between two
