@@ -52,6 +52,31 @@ use std::sync::{Arc, Mutex};
 
 const GIB: u64 = 1 << 30;
 
+/// The adapter's own memory where its API says: Vulkan's largest device-local heap (a discrete card's VRAM). None on
+/// Direct3D 12 and Metal.
+fn device_memory(adapter: &wgpu::Adapter) -> Option<u64> {
+    #[cfg(any(windows, target_os = "linux"))]
+    {
+        // SAFETY: the adapter's handles are only read, by a query that creates and frees nothing.
+        let a = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }?;
+        let props = unsafe { a.shared_instance().raw_instance().get_physical_device_memory_properties(a.raw_physical_device()) };
+        let heaps = &props.memory_heaps[..(props.memory_heap_count as usize).min(props.memory_heaps.len())];
+        // VK_MEMORY_HEAP_DEVICE_LOCAL_BIT
+        heaps.iter().filter(|h| h.flags.as_raw() & 1 != 0).map(|h| h.size).max()
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = adapter;
+        None
+    }
+}
+
+/// The weights a discrete card with `memory` bytes holds by default: all but 4 GiB (the cache, the work buffers and
+/// the rest of the computer's use of it), or half of a card under 8 GiB.
+fn discrete_budget(memory: u64) -> u64 {
+    memory.saturating_sub(4 * GIB).max(memory / 2)
+}
+
 /// Weight bytes one storage binding may cover: rows are split across buffers
 /// below the adapter's binding limit (a 152k-vocab Q6_K output is ~640 MB).
 fn chunk_limit(limits: &wgpu::Limits) -> u64 {
@@ -301,8 +326,9 @@ impl WgpuBackend {
     /// Open the best adapter wgpu finds, or the one `OAIY_WEBGPU_ADAPTER` names
     /// (part of its name, any case: "radeon", "arc", "5090"), for a computer with
     /// more than one GPU. `budget_bytes` caps the weights placed on it (WebGPU
-    /// cannot report free memory); `None` picks a default by adapter type:
-    /// 8 GiB discrete, 2 GiB integrated, none for software.
+    /// cannot report free memory); `None` picks a default: a discrete card's
+    /// memory less 4 GiB where Vulkan says how much it has (27.8 GiB of a 32 GB
+    /// card), else 8 GiB; 2 GiB integrated, none for software.
     ///
     /// Vulkan, D3D12 and Metal only, unless `WGPU_BACKEND` names others: an
     /// instance with OpenGL too starts a WGL thread in NVIDIA's GL driver, and
@@ -369,7 +395,7 @@ impl WgpuBackend {
             immediate_size: 0,
         });
         let budget = budget_bytes.unwrap_or(match info.device_type {
-            wgpu::DeviceType::DiscreteGpu => 8 * GIB,
+            wgpu::DeviceType::DiscreteGpu => device_memory(&adapter).map_or(8 * GIB, discrete_budget),
             wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::VirtualGpu => 2 * GIB,
             _ => 0,
         });

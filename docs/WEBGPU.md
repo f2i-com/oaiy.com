@@ -25,8 +25,11 @@ below).
   into workgroup memory and its sums in registers (a 4096 x 4096 Q4_K weight
   against 512 tokens in 7.0 ms where a row a workgroup took 24.2).
 - **Budget:** WebGPU cannot report free memory, so a budget caps the weights
-  placed on the GPU: 8 GiB on a discrete GPU, 2 GiB on an integrated one, or
-  `--webgpu-gb N`. Weights past it (and types without a shader) stay in RAM and
+  placed on the GPU: a discrete card's memory less 4 GiB where Vulkan reports it
+  (its largest device-local heap: 27.8 GiB of a 32 GB card), else 8 GiB; 2 GiB on
+  an integrated GPU; or `--webgpu-gb N`. The old 8 GiB of any discrete card kept
+  5 GB of Qwen3.8 27B Q3_K_M (13.4 GB) on the CPU of a 32 GB card: 2.0 tokens a
+  second where the whole model on the GPU made 6.0. Weights past it (and types without a shader) stay in RAM and
   use the CPU path. A model bigger than the GPU still runs, split between the two.
   In OAIY the studio passes `--webgpu-gb` itself when `llm.webgpu_gb` is not set:
   the largest GPU's memory less `llm.vram_headroom_gb` and 2 GB for the cache and

@@ -91,7 +91,8 @@ const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|
   --backend B          GGUF backend: auto (default), cuda, webgpu or cpu. auto is
                        CUDA in a CUDA build; in oaiy-llm-server-webgpu it is the
                        first WebGPU adapter, else the CPU
-  --webgpu-gb N        weights WebGPU may hold (default: 8 discrete, 2 integrated);
+  --webgpu-gb N        weights WebGPU may hold (default: a discrete card's memory
+                       less 4 GiB where Vulkan reports it, else 8; 2 integrated);
                        the rest run on the CPU
   --watch-stdin        exit when stdin closes: a supervisor (oaiy-studio) holds
                        the other end, so the server cannot outlive it

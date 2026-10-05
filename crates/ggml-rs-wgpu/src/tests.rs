@@ -160,3 +160,13 @@ fn usage_is_returned_when_weights_are_dropped() {
     drop(qt);
     assert_eq!(b.usage().0, 0);
 }
+
+#[test]
+fn a_discrete_cards_default_budget_leaves_room() {
+    use super::discrete_budget;
+    const G: u64 = 1 << 30;
+    assert_eq!(discrete_budget(32 * G), 28 * G);
+    assert_eq!(discrete_budget(8 * G), 4 * G);
+    assert_eq!(discrete_budget(6 * G), 3 * G);
+    assert_eq!(discrete_budget(0), 0);
+}
