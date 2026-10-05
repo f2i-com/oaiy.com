@@ -11,7 +11,7 @@
 
 use crate::{chunk_limit, Gpu, WgpuBackend};
 use ggml_rs::exl3::{Exl3Data, PackedLinear};
-use ggml_rs::{DeviceVec, Tensor};
+use ggml_rs::{DeviceChain, DeviceVec, Tensor};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -891,6 +891,295 @@ impl Exl3Gpu {
     }
 }
 
+/// `act[j, i] = silu(o[2j, i]) * o[2j + 1, i]`: each expert's gate and up outputs (rows `2j` and `2j + 1` of `x`) into
+/// its hidden row (`y`), `p[0]`: ff, pairs. As the host's `g / (1 + exp(-g)) * u`.
+const SILU_PAIRS: &str = r#"
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let ff = p[0].x;
+    let i = id.x;
+    if (i >= ff * p[0].y) { return; }
+    let j = i / ff;
+    let c = i % ff;
+    let g = x[(2u * j) * ff + c];
+    y[i] = (g / (1.0 + exp(-g))) * x[(2u * j + 1u) * ff + c];
+}
+"#;
+
+/// Each row's experts summed in its own order, each weighted (as `Exl3MoeHost::forward`): `out[r, i] = sum over j < K
+/// of w[r, j] * d[r K + j, i]`, then `+ w[r, K] * sh[r, i]` (the shared expert). `p[0]`: hidden, K, rows.
+const WSUM_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> d: array<f32>;
+@group(0) @binding(1) var<storage, read> sh: array<f32>;
+@group(0) @binding(2) var<storage, read> w: array<f32>;
+@group(0) @binding(6) var<storage, read_write> out: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let h = p[0].x;
+    let kk = p[0].y;
+    let i = id.x;
+    if (i >= h * p[0].z) { return; }
+    let r = i / h;
+    let c = i % h;
+    var acc = 0.0;
+    for (var j = 0u; j < kk; j++) { acc += w[r * (kk + 1u) + j] * d[(r * kk + j) * h + c]; }
+    acc += w[r * (kk + 1u) + kk] * sh[r * h + c];
+    out[i] = acc;
+}
+"#;
+
+/// One kind of a layer's routed experts' projection as a group (their gate and up matrices, or their down ones): their
+/// words in one buffer, a matrix's after another, and their transforms' tables (the maps the identity).
+struct Group {
+    words: wgpu::Buffer,
+    suh: DeviceVec,
+    svh: DeviceVec,
+    k: usize,
+    n: usize,
+    tw: usize,
+    /// Words a matrix.
+    mwords: usize,
+    splits: u32,
+}
+
+/// A decode step's scratch: one row, `top_k` experts (the bind groups of a step made once).
+struct Step {
+    top_k: usize,
+    jobs_gu: DeviceVec,
+    jobs_d: DeviceVec,
+    w: DeviceVec,
+    xh_gu: DeviceVec,
+    part_gu: DeviceVec,
+    out_gu: DeviceVec,
+    act: DeviceVec,
+    xh_d: DeviceVec,
+    part_d: DeviceVec,
+    out_d: DeviceVec,
+    sg: DeviceVec,
+    su: DeviceVec,
+    sa: DeviceVec,
+    sd: DeviceVec,
+}
+
+/// A MoE layer's experts on the GPU as groups (Qwen3.8-Flash-Next's 512 routed ones): their gate and up matrices in
+/// one buffer (matrix `2e` expert `e`'s gate, `2e + 1` its up), their down matrices in another, each group's
+/// transforms' tables beside it; the shared expert as projections of its own. A row's (a step's) experts run in a
+/// few dispatches from a job list, their transforms on the GPU too, where a projection was a dispatch (and its
+/// transforms the host's) in a layer's two round trips.
+pub struct Exl3MoeGrouped {
+    b: WgpuBackend,
+    routed: usize,
+    hidden: usize,
+    ff: usize,
+    gu: Group,
+    down: Group,
+    shared: [Exl3Gpu; 3],
+    step: Mutex<Option<Arc<Step>>>,
+}
+
+impl std::fmt::Debug for Exl3MoeGrouped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Exl3MoeGrouped({} routed experts of {}x{} as two groups, and the shared one)", self.routed, self.hidden, self.ff)
+    }
+}
+
+impl Exl3MoeGrouped {
+    /// The layer's experts as groups on `b`, if they can be: every routed expert's projections of one shape and
+    /// bitrate, their maps the identity, each group within a binding, and all of them within the budget less `reserve`.
+    /// None leaves them to [`Exl3MoeHost`].
+    fn try_new(b: &WgpuBackend, experts: &[[Exl3Data; 3]], reserve: u64) -> Result<Option<Exl3MoeGrouped>, String> {
+        let Some((shared, routed)) = experts.split_last() else { return Ok(None) };
+        let Some(first) = routed.first() else { return Ok(None) };
+        let (hidden, ff) = (first[0].suh.len(), first[0].svh.len());
+        let identity = |m: &[u32]| m.iter().enumerate().all(|(i, &v)| v as usize == i);
+        for e in routed.iter().chain([shared]) {
+            for d in e.iter() {
+                d.validate()?;
+            }
+        }
+        let same = routed.iter().all(|e| {
+            [(hidden, ff), (hidden, ff), (ff, hidden)].iter().zip(e.iter()).all(|(&(k, n), d)| d.suh.len() == k && d.svh.len() == n && d.tile_words == e[0].tile_words && identity(&d.input_map) && identity(&d.output_map))
+                && e[0].tile_words == first[0].tile_words
+                && e[2].tile_words == first[2].tile_words
+        });
+        let shapes = [(hidden, ff), (hidden, ff), (ff, hidden)];
+        if !same || shared.iter().zip(shapes).any(|(d, (k, n))| d.suh.len() != k || d.svh.len() != n) {
+            return Ok(None);
+        }
+        let limit = chunk_limit(&b.gpu.limits);
+        let mwords = |k: usize, n: usize, tw: usize| k / 16 * n / 16 * (tw / 2);
+        let (gu_words, d_words) = (mwords(hidden, ff, first[0].tile_words), mwords(ff, hidden, first[2].tile_words));
+        let gu_bytes = (2 * routed.len() * gu_words * 4) as u64;
+        let d_bytes = (routed.len() * d_words * 4) as u64;
+        let shared_bytes: u64 = shared.iter().map(|d| d.words.len() as u64 * 4).sum();
+        let tables = (routed.len() * 3 * (hidden + ff) * 4) as u64;
+        let total = gu_bytes + d_bytes + shared_bytes + tables;
+        if gu_bytes > limit || d_bytes > limit {
+            return Ok(None);
+        }
+        let prev = b.used.fetch_add(total, Ordering::Relaxed);
+        if prev + total > b.budget.saturating_sub(reserve) {
+            b.used.fetch_sub(total, Ordering::Relaxed);
+            return Ok(None);
+        }
+        // the groups' words and tables; the shared expert's projections count themselves, so their share is given back
+        b.used.fetch_sub(shared_bytes, Ordering::Relaxed);
+        let group = |which: &[usize], k: usize, n: usize, tw: usize| -> Group {
+            let mw = mwords(k, n, tw);
+            let mut bytes = Vec::with_capacity(routed.len() * which.len() * mw * 4);
+            let (mut suh, mut svh) = (Vec::new(), Vec::new());
+            for e in routed {
+                for &p in which {
+                    bytes.extend(e[p].words.iter().flat_map(|w| w.to_le_bytes()));
+                    suh.extend_from_slice(&e[p].suh);
+                    svh.extend_from_slice(&e[p].svh);
+                }
+            }
+            let words = b.gpu.upload_rows(&bytes, bytes.len(), 1).remove(0).0;
+            let up = |v: &[f32]| {
+                use ggml_rs::DeviceChain;
+                let d = b.vec(v.len());
+                DeviceChain::upload(b, &d, v);
+                d
+            };
+            let ntiles = n / 16;
+            let splits = 4096usize.div_ceil(ntiles).next_power_of_two().min(8).min(k / 16).max(1) as u32;
+            Group { words, suh: up(&suh), svh: up(&svh), k, n, tw, mwords: mw, splits }
+        };
+        let gu = group(&[0, 1], hidden, ff, first[0].tile_words);
+        let down = group(&[2], ff, hidden, first[2].tile_words);
+        let [sg, su, sd] = shared;
+        let one = |d: &Exl3Data| Exl3Gpu::upload(b, Exl3Data { words: d.words.clone(), suh: d.suh.clone(), svh: d.svh.clone(), tile_words: d.tile_words, input_map: d.input_map.clone(), output_map: d.output_map.clone() }, None);
+        let shared = [one(sg), one(su), one(sd)];
+        if shared.iter().any(|s| s.single_chunk().is_none()) {
+            return Ok(None);
+        }
+        // the routed groups' bytes stay counted as long as the layer lives
+        Ok(Some(Exl3MoeGrouped { b: b.clone(), routed: routed.len(), hidden, ff, gu, down, shared, step: Mutex::new(None) }))
+    }
+
+    /// Scratch for `rows` rows of `top_k` experts.
+    fn scratch(&self, rows: usize, top_k: usize) -> Step {
+        let b = &self.b;
+        let (h, f) = (self.hidden, self.ff);
+        let pairs = rows * top_k;
+        Step {
+            top_k,
+            jobs_gu: b.vec(4 * pairs),
+            jobs_d: b.vec(2 * pairs),
+            w: b.vec(rows * (top_k + 1)),
+            xh_gu: b.vec(2 * pairs * h),
+            part_gu: b.vec(2 * pairs * self.gu.splits as usize * f),
+            out_gu: b.vec(2 * pairs * f),
+            act: b.vec(pairs * f),
+            xh_d: b.vec(pairs * f),
+            part_d: b.vec(pairs * self.down.splits as usize * h),
+            out_d: b.vec(pairs * h),
+            sg: b.vec(rows * f),
+            su: b.vec(rows * f),
+            sa: b.vec(rows * f),
+            sd: b.vec(rows * h),
+        }
+    }
+
+    /// A step's scratch (one row), kept so its bind groups are.
+    fn step(&self, top_k: usize) -> Arc<Step> {
+        let mut s = self.step.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(st) = s.as_ref().filter(|st| st.top_k == top_k) {
+            return Arc::clone(st);
+        }
+        let st = Arc::new(self.scratch(1, top_k));
+        *s = Some(Arc::clone(&st));
+        st
+    }
+
+    /// One group's jobs (`jobs`, `count` of them) on `x`: its input transforms, matmul and output transforms into `y`.
+    #[allow(clippy::too_many_arguments)]
+    fn group_pass(&self, rec: &mut crate::chain::Recorder<'_>, g: &Group, x: &DeviceVec, jobs: &DeviceVec, count: usize, xh: &DeviceVec, part: &DeviceVec, y: &DeviceVec) {
+        let d = rec.gpu().dummy().clone();
+        let drw = rec.gpu().dummy_rw().clone();
+        let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
+        let (xb, jb, xhb, pb, yb) = (buf(x), buf(jobs), buf(xh), buf(part), buf(y));
+        let (suh, svh) = (buf(&g.suh), buf(&g.svh));
+        rec.dispatch_wide("exl3-pre", &chain_shader("pre"), [&xb, &suh, &d, &jb, &d, &d, &xhb, &drw], &[g.k as u32, 1], ((g.k / 128) as u32, count as u32, 1));
+        let ntiles = (g.n / 16) as u32;
+        rec.dispatch_wide("exl3-mm", &chain_shader("mm"), [&g.words, &xhb, &jb, &d, &d, &d, &pb, &drw], &[g.n as u32, g.k as u32, g.tw as u32, g.splits, g.mwords as u32], (ntiles.min(65535), ntiles.div_ceil(65535), count as u32 * g.splits));
+        rec.dispatch_wide("exl3-post", &chain_shader("post"), [&pb, &svh, &jb, &d, &d, &d, &yb, &drw], &[g.n as u32, g.splits], ((g.n / 128) as u32, count as u32, 1));
+    }
+
+    /// Record `assign`'s experts for each row of `x` into `out` (see `ChainRecorder::moe_rows`).
+    pub(crate) fn record(&self, rec: &mut crate::chain::Recorder<'_>, x: &DeviceVec, out: &DeviceVec, assign: &[Vec<(usize, f32)>]) {
+        use ggml_rs::ChainRecorder;
+        let rows = assign.len();
+        let (h, f) = (self.hidden, self.ff);
+        let top_k = assign.first().map_or(0, |a| a.len().saturating_sub(1));
+        assert!(rows > 0 && top_k > 0 && assign.iter().all(|a| a.len() == top_k + 1 && a[top_k].0 == self.routed), "moe: each row's routed experts, then the shared one");
+        assert!(x.len >= rows * h && out.len >= rows * h, "moe: {rows} rows of {h}");
+        // the jobs: gate and up of each (row, expert) on its row of x, then down of each on its hidden row
+        let mut jobs_gu = Vec::with_capacity(4 * rows * top_k);
+        let mut jobs_d = Vec::with_capacity(2 * rows * top_k);
+        let mut w = Vec::with_capacity(rows * (top_k + 1));
+        for (r, a) in assign.iter().enumerate() {
+            for (j, &(e, wt)) in a[..top_k].iter().enumerate() {
+                jobs_gu.extend([2 * e as u32, r as u32, 2 * e as u32 + 1, r as u32]);
+                jobs_d.extend([e as u32, (r * top_k + j) as u32]);
+                w.push(wt);
+            }
+            w.push(a[top_k].1);
+        }
+        let b = rec.backend().clone();
+        let pairs = rows * top_k;
+        // a step's one row: the kept scratch (its bind groups kept); else this call's (the bind groups hold its buffers
+        // until the GPU has run)
+        let st = if rows == 1 && rec.keeps() { self.step(top_k) } else { Arc::new(self.scratch(rows, top_k)) };
+        let up = |v: &DeviceVec, data: &[u32]| DeviceChain::upload(&b, v, &data.iter().map(|&u| f32::from_bits(u)).collect::<Vec<_>>());
+        up(&st.jobs_gu, &jobs_gu);
+        up(&st.jobs_d, &jobs_d);
+        DeviceChain::upload(&b, &st.w, &w);
+        let (jgu, jd, wv, xh_gu, part_gu, out_gu, act, xh_d, part_d, out_d, sg, su, sa, sd) =
+            (&st.jobs_gu, &st.jobs_d, &st.w, &st.xh_gu, &st.part_gu, &st.out_gu, &st.act, &st.xh_d, &st.part_d, &st.out_d, &st.sg, &st.su, &st.sa, &st.sd);
+        self.group_pass(rec, &self.gu, x, jgu, 2 * pairs, xh_gu, part_gu, out_gu);
+        let silu = rec.named("moe-silu-pairs", SILU_PAIRS);
+        let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
+        let d = rec.gpu().dummy().clone();
+        rec.dispatch_kept(&silu, &d, &buf(out_gu), &buf(act), &[f as u32, pairs as u32], (((pairs * f) as u32).div_ceil(256), 1, 1));
+        self.group_pass(rec, &self.down, act, jd, pairs, xh_d, part_d, out_d);
+        // the shared expert on every row
+        rec.exl3_rows(&self.shared[0], x, sg, rows);
+        rec.exl3_rows(&self.shared[1], x, su, rows);
+        rec.silu_mul(sg, su, sa, rows * f);
+        rec.exl3_rows(&self.shared[2], sa, sd, rows);
+        let drw = rec.gpu().dummy_rw().clone();
+        rec.dispatch_wide("moe-wsum-rows", WSUM_ROWS, [&buf(out_d), &buf(sd), &buf(wv), &d, &d, &d, &buf(out), &drw], &[h as u32, top_k as u32, rows as u32], (((rows * h) as u32).div_ceil(256), 1, 1));
+    }
+}
+
+impl ggml_rs::exl3::Experts for Exl3MoeGrouped {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
+    fn forward(&self, x: &Tensor, logits: &Tensor, top_k: usize) -> Tensor {
+        let h = self.hidden;
+        let x = x.to_host();
+        let logits = logits.to_host();
+        let rows = x.numel() / h;
+        let width = self.routed + 1;
+        let assign: Vec<Vec<(usize, f32)>> = (0..rows).map(|r| route(&logits.data()[r * width..(r + 1) * width], top_k)).collect();
+        let b = &self.b;
+        let (xd, out) = (b.vec(rows * h), b.vec(rows * h));
+        DeviceChain::upload(b, &xd, x.data());
+        let mut rec = b.begin();
+        rec.keep_groups(false);
+        rec.moe_rows(self, &xd, &out, &assign);
+        rec.read(&out);
+        let y = rec.finish().pop().expect("the experts' sum");
+        Tensor::from_vec(y, vec![rows, h])
+    }
+}
+
 /// One projection of an expert: its packed weights on the GPU, or decoded on the CPU.
 #[derive(Debug)]
 enum Proj {
@@ -1087,8 +1376,14 @@ impl WgpuBackend {
         self.exl3_experts_leaving(experts, 0)
     }
 
-    /// As `exl3_experts`, leaving `reserve` bytes of the budget for the model's other matrices (loaded after).
+    /// As `exl3_experts`, leaving `reserve` bytes of the budget for the model's other matrices (loaded after). Routed
+    /// experts of one shape and bitrate go up as groups (`Exl3MoeGrouped`) while the budget holds them all.
     pub fn exl3_experts_leaving(&self, experts: Vec<[Exl3Data; 3]>, reserve: u64) -> Result<Box<dyn ggml_rs::exl3::Experts>, String> {
+        if std::env::var_os("OAIY_EXL3_UNGROUPED").is_none() {
+            if let Some(g) = Exl3MoeGrouped::try_new(self, &experts, reserve)? {
+                return Ok(Box::new(g));
+            }
+        }
         let mut out = Vec::with_capacity(experts.len());
         for e in experts {
             let [g, u, d] = e;
@@ -1367,10 +1662,30 @@ mod tests {
                 let cpu = exl3_experts_cpu(experts(count, hidden, ff, tw)).unwrap();
                 close(cpu.forward(&xt, &lt, top_k).data(), &want, &format!("cpu moe tw={tw} rows={rows}"));
                 let Some(b) = backend() else { continue };
+                // the routed experts as groups (one shape and bitrate), their transforms on the GPU
                 let gpu = b.exl3_experts(experts(count, hidden, ff, tw)).unwrap();
-                assert!(format!("{gpu:?}").contains(&format!("{} of {} projections on the GPU", 3 * (count + 1), 3 * (count + 1))), "{gpu:?}");
-                close(gpu.forward(&xt, &lt, top_k).data(), &want, &format!("gpu moe tw={tw} rows={rows}"));
+                assert!(format!("{gpu:?}").contains("Exl3MoeGrouped"), "{gpu:?}");
+                close(gpu.forward(&xt, &lt, top_k).data(), &want, &format!("grouped moe tw={tw} rows={rows}"));
+                if rows == 1 {
+                    // chained, a step's kept scratch, twice
+                    let assign = vec![route(&logits, top_k)];
+                    let (xd, out) = (b.vec(hidden), b.vec(hidden));
+                    DeviceChain::upload(&b, &xd, &x);
+                    for _ in 0..2 {
+                        let mut rec = b.begin();
+                        rec.moe_rows(gpu.as_ref(), &xd, &out, &assign);
+                        rec.read(&out);
+                        close(&rec.finish().pop().unwrap(), &want, &format!("chained moe tw={tw}"));
+                    }
+                }
                 drop(gpu);
+                // projections a dispatch each, as a layer whose experts differ in shape or bitrate goes
+                std::env::set_var("OAIY_EXL3_UNGROUPED", "1");
+                let host = b.exl3_experts(experts(count, hidden, ff, tw)).unwrap();
+                std::env::remove_var("OAIY_EXL3_UNGROUPED");
+                assert!(format!("{host:?}").contains(&format!("{} of {} projections on the GPU", 3 * (count + 1), 3 * (count + 1))), "{host:?}");
+                close(host.forward(&xt, &lt, top_k).data(), &want, &format!("gpu moe tw={tw} rows={rows}"));
+                drop(host);
                 // A budget for some of the experts: the rest decode on the CPU, and the layer is the same.
                 let one = (hidden * ff * tw / 128) as u64;
                 let Ok(small) = WgpuBackend::new(Some(one * 10)) else { continue };
@@ -1487,7 +1802,6 @@ mod tests {
     /// kept) bit for bit, and three, with and without maps, at 3 and 5 bits.
     #[test]
     fn a_chained_projection_matches_the_projection() {
-        use ggml_rs::{ChainRecorder, DeviceChain};
         let Some(b) = backend() else { return };
         let (k, n) = (512usize, 384usize);
         for (tw, maps) in [(48usize, false), (80, true)] {

@@ -387,6 +387,14 @@ pub struct WgpuBackend {
     serial: Arc<Mutex<()>>,
 }
 
+/// Another handle on the same adapter (its device, its budget's count and its lock shared): what a model's parts keep
+/// to record chains of their own (an expert group).
+impl Clone for WgpuBackend {
+    fn clone(&self) -> Self {
+        Self { cpu: CpuBackend::new(), gpu: Arc::clone(&self.gpu), budget: self.budget, used: Arc::clone(&self.used), summary: self.summary.clone(), serial: Arc::clone(&self.serial) }
+    }
+}
+
 impl std::fmt::Debug for WgpuBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "WgpuBackend({} via {}, {} of {} GiB used)", self.summary.name, self.summary.backend,

@@ -176,6 +176,10 @@ pub trait ChainRecorder {
     /// A hyper-connection site's write-back (`Backend::stream_apply`): `x[r, s] += post[r, s] * y[r]`, rows of `d`.
     #[allow(clippy::too_many_arguments)]
     fn stream_apply(&mut self, x: &DeviceVec, y: &DeviceVec, post: &DeviceVec, rows: usize, streams: usize, d: usize);
+    /// A MoE layer's experts the device holds as groups, for each of `assign.len()` rows of `x` (`[rows, hidden]`):
+    /// row `r`'s experts `assign[r]` (expert, weight; the routed ones, then the shared one last, as
+    /// `Experts::forward` routes them), their weighted outputs summed in that order into `out` (`[rows, hidden]`).
+    fn moe_rows(&mut self, experts: &dyn crate::exl3::Experts, x: &DeviceVec, out: &DeviceVec, assign: &[Vec<(usize, f32)>]);
     /// `acc[i] += weights[at] * y[i]` for `i < len`: a weighted sum's term, its weight read from the device (an
     /// expert's, written by the host before the chain runs).
     fn axpy_at(&mut self, acc: &DeviceVec, y: &DeviceVec, weights: &DeviceVec, at: usize, len: usize);

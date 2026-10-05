@@ -792,7 +792,7 @@ pub(crate) type WideKey = (usize, [wgpu::Buffer; 8], [u32; 8]);
 /// Bind groups kept before the cache starts over (a cache grown from buffers that were replaced).
 const KEEP_GROUPS: usize = 16384;
 
-struct Recorder<'a> {
+pub(crate) struct Recorder<'a> {
     backend: &'a WgpuBackend,
     /// Every op's dispatch, in order, run in one compute pass (a pass an op cost more than the ops).
     dispatches: Vec<Dispatch>,
@@ -803,7 +803,17 @@ struct Recorder<'a> {
 }
 
 impl Recorder<'_> {
-    fn gpu(&self) -> &Gpu {
+    /// The backend recorded on.
+    pub(crate) fn backend(&self) -> &WgpuBackend {
+        self.backend
+    }
+
+    /// Whether this recording keeps its bind groups.
+    pub(crate) fn keeps(&self) -> bool {
+        self.keep
+    }
+
+    pub(crate) fn gpu(&self) -> &Gpu {
         &self.backend.gpu
     }
 
@@ -821,7 +831,7 @@ impl Recorder<'_> {
     }
 
     /// A dispatch whose bind group is the same every step (its buffers and parameters): made once and kept.
-    fn dispatch_kept(&mut self, pipeline: &Arc<wgpu::ComputePipeline>, at0: &wgpu::Buffer, at1: &wgpu::Buffer, at2: &wgpu::Buffer, words: &[u32], groups: (u32, u32, u32)) {
+    pub(crate) fn dispatch_kept(&mut self, pipeline: &Arc<wgpu::ComputePipeline>, at0: &wgpu::Buffer, at1: &wgpu::Buffer, at2: &wgpu::Buffer, words: &[u32], groups: (u32, u32, u32)) {
         if !self.keep {
             let params = self.uniform(words);
             self.dispatch(pipeline, at0, at1, at2, &params, groups);
@@ -872,12 +882,12 @@ impl Recorder<'_> {
         self.dispatches.push((Arc::clone(pipeline), group, groups));
     }
 
-    fn named(&self, name: &'static str, body: &'static str) -> Arc<wgpu::ComputePipeline> {
+    pub(crate) fn named(&self, name: &'static str, body: &'static str) -> Arc<wgpu::ComputePipeline> {
         self.gpu().named_pipeline(name, || format!("{HEAD}{body}"))
     }
 
     /// A dispatch of an eight-buffer kernel (`Gpu::wide_layout`), its bind group kept as `dispatch_kept`'s.
-    fn dispatch_wide(&mut self, name: &'static str, body: &str, bufs: [&wgpu::Buffer; 8], words: &[u32], groups: (u32, u32, u32)) {
+    pub(crate) fn dispatch_wide(&mut self, name: &'static str, body: &str, bufs: [&wgpu::Buffer; 8], words: &[u32], groups: (u32, u32, u32)) {
         let pipeline = self.gpu().named_pipeline_wide(name, || body.to_string());
         let key: WideKey = (Arc::as_ptr(&pipeline) as usize, bufs.map(|b| b.clone()), words8(words));
         let kept = if self.keep { self.gpu().chain_groups_wide.lock().unwrap_or_else(|p| p.into_inner()).get(&key).cloned() } else { None };
@@ -1006,6 +1016,11 @@ impl ChainRecorder for Recorder<'_> {
         assert!(x.len >= rows * streams * d && y.len >= rows * d && post.len >= rows * streams, "chain: a hyper-connection's write-back");
         let pipeline = self.named("chain-stream-apply", STREAM_APPLY);
         self.dispatch_kept(&pipeline, buffer(post), buffer(y), buffer(x), &[d as u32, streams as u32, rows as u32], (((rows * streams * d) as u32).div_ceil(256), 1, 1));
+    }
+
+    fn moe_rows(&mut self, experts: &dyn ggml_rs::exl3::Experts, x: &DeviceVec, out: &DeviceVec, assign: &[Vec<(usize, f32)>]) {
+        let g = experts.as_any().and_then(|a| a.downcast_ref::<crate::exl3::Exl3MoeGrouped>()).expect("experts this adapter holds as groups");
+        g.record(self, x, out, assign);
     }
 
     fn axpy_at(&mut self, acc: &DeviceVec, y: &DeviceVec, weights: &DeviceVec, at: usize, len: usize) {
