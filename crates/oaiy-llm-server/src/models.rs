@@ -1313,6 +1313,116 @@ mod dense_webgpu_timing {
         assert_eq!(host_tokens, chain_tokens);
         assert!(worst >= 0.9999, "{worst}");
     }
+
+    /// Where a chained Qwen3.5 run's time goes (QWEN35_MODEL): prompt chunks of a few tokens as the server's
+    /// checkpoints cut them, a checkpoint's read of the recurrent state, decode steps, and a chunk of 512.
+    #[test]
+    #[ignore = "a timing; needs a WebGPU adapter and a Qwen3.5 GGUF; run with --nocapture"]
+    fn measure_a_chained_qwen35() {
+        use std::sync::Arc;
+        use std::time::Instant;
+        let path = std::env::var("QWEN35_MODEL").unwrap_or_else(|_| r"E:\models\Qwen3.8-27B-Q3_K_M.gguf".into());
+        let Ok(b) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
+        let backend: Arc<dyn ggml_rs::Backend> = Arc::new(b);
+        let gguf = gguf::GgufFile::open(&path).unwrap();
+        let model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap();
+        let llama_rs::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
+        let mut kv = model.new_kv_cache(4096);
+        let tokens: Vec<u32> = (0..2048u32).map(|i| 1000 + (i * 7919) % 20000).collect();
+        let mut at = 0;
+        let mut forward = |n: usize, kv: &mut llama_rs::KvCache| {
+            let t = Instant::now();
+            let e = m.embed_text(&tokens[at..at + n]);
+            let l = m.forward_embeds_positions(&e, n, kv, None).unwrap();
+            at += n;
+            let _ = l.to_host();
+            t.elapsed().as_secs_f64() * 1e3
+        };
+        let capture = |kv: &llama_rs::KvCache| {
+            let t = Instant::now();
+            let n: usize = kv.ssm_state.iter().chain(&kv.ssm_conv).flatten().map(|s| s.to_host().numel()).sum();
+            (t.elapsed().as_secs_f64() * 1e3, n * 4)
+        };
+        for (label, n) in [("first 26", 26usize), ("then 6", 6), ("then 1", 1), ("then 22", 22), ("then 6", 6), ("then 1", 1)] {
+            let ms = forward(n, &mut kv);
+            eprintln!("{label} tokens: {ms:.1} ms");
+            if n > 1 {
+                let (ms, bytes) = capture(&kv);
+                eprintln!("  a checkpoint's read of the state ({:.0} MB): {ms:.1} ms", bytes as f64 / 1e6);
+            }
+        }
+        let steps = 32;
+        let t = Instant::now();
+        for _ in 0..steps {
+            forward(1, &mut kv);
+        }
+        eprintln!("{steps} decode steps: {:.2} ms a step", t.elapsed().as_secs_f64() * 1e3 / steps as f64);
+        for n in [512usize, 512] {
+            let past = kv.len;
+            eprintln!("a chunk of {n} at {past}: {:.1} ms", forward(n, &mut kv));
+        }
+    }
+
+    /// Qwen3.5's hybrid chained on the GPU (QWEN35_MODEL: the 9B, or Qwen3.8 27B) answers as its host path does: the
+    /// same prompt (QWEN35_PROMPT tokens, in chunks of 512 as the server sends them) then 64 greedy steps each way
+    /// give the same tokens, every step's logits close; and the chain did run.
+    #[test]
+    #[ignore = "needs a WebGPU adapter and a Qwen3.5 GGUF (E:/models/Qwen3.5-9B-Q4_K_M.gguf, or QWEN35_MODEL)"]
+    fn a_chained_qwen35_run_answers_as_the_host_path() {
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+        let path = std::env::var("QWEN35_MODEL").unwrap_or_else(|_| r"E:\models\Qwen3.5-9B-Q4_K_M.gguf".into());
+        let Ok(b) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
+        let backend: Arc<dyn ggml_rs::Backend> = Arc::new(b);
+        let gguf = gguf::GgufFile::open(&path).unwrap();
+        let model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap();
+        let llama_rs::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
+        let n: u32 = std::env::var("QWEN35_PROMPT").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+        let steps: usize = std::env::var("QWEN35_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+        let prompt: Vec<u32> = (0..n).map(|i| 1000 + (i * 7919) % 20000).collect();
+        let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
+        let run = |chained: bool| {
+            let mut kv = model.new_kv_cache(prompt.len() + steps + 16);
+            let forward = |t: &[u32], kv: &mut llama_rs::KvCache| {
+                let e = m.embed_text(t);
+                let l = if chained { m.forward_embeds_positions(&e, t.len(), kv, None) } else { m.forward_embeds_host(&e, t.len(), kv, None) };
+                l.unwrap().to_host().data().to_vec()
+            };
+            let mut l = Vec::new();
+            for chunk in prompt.chunks(512) {
+                l = forward(chunk, &mut kv);
+            }
+            let mut next = argmax(&l);
+            let (mut tokens, mut all) = (vec![next], vec![l]);
+            for _ in 0..steps {
+                let l = forward(&[next], &mut kv);
+                next = argmax(&l);
+                tokens.push(next);
+                all.push(l);
+            }
+            (tokens, all)
+        };
+        let t = std::time::Instant::now();
+        let (host_tokens, host_logits) = run(false);
+        let host_s = t.elapsed().as_secs_f64();
+        assert_eq!(m.chain.runs.load(Ordering::Relaxed), 0, "the host path never chains");
+        let t = std::time::Instant::now();
+        let (chain_tokens, chain_logits) = run(true);
+        let chain_s = t.elapsed().as_secs_f64();
+        let runs = m.chain.runs.load(Ordering::Relaxed);
+        let cosine = |a: &[f32], b: &[f32]| {
+            let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
+            let n = |v: &[f32]| v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            dot / (n(a) * n(b))
+        };
+        let each: Vec<f64> = host_logits.iter().zip(&chain_logits).map(|(a, b)| cosine(a, b)).collect();
+        let worst = each.iter().copied().fold(1.0f64, f64::min);
+        let first_diff = host_tokens.iter().zip(&chain_tokens).position(|(a, b)| a != b);
+        eprintln!("prompt {n}: host {host_s:.2} s, chained {chain_s:.2} s ({runs} runs) for {steps} steps; prompt logits cosine {:.6}, worst {worst:.6}; first differing token {first_diff:?}", each[0]);
+        assert!(runs > prompt.len().div_ceil(512), "the chain ran ({runs} runs)");
+        assert_eq!(host_tokens, chain_tokens);
+        assert!(worst >= 0.9999, "{worst}");
+    }
 }
 
 #[cfg(test)]

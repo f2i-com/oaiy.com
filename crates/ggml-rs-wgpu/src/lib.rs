@@ -95,6 +95,10 @@ struct Gpu {
     named: Mutex<HashMap<&'static str, Arc<wgpu::ComputePipeline>>>,
     /// A chain's bind groups that are the same step after step (`chain`): by pipeline, buffers and parameters.
     chain_groups: Mutex<HashMap<chain::GroupKey, wgpu::BindGroup>>,
+    /// The layout of the chain's kernels of eight buffers (a gated delta net's: six read, two written, then the
+    /// parameters), made when first used, and their bind groups as `chain_groups`.
+    wide: std::sync::OnceLock<(wgpu::BindGroupLayout, wgpu::PipelineLayout)>,
+    chain_groups_wide: Mutex<HashMap<chain::WideKey, wgpu::BindGroup>>,
     limits: wgpu::Limits,
     /// Upload bytes written since the queue was last flushed.
     staged: AtomicU64,
@@ -250,6 +254,42 @@ impl Gpu {
 
     /// The pipeline `name`, made from the WGSL `source` gives the first time it is asked for.
     fn named_pipeline(&self, name: &'static str, source: impl FnOnce() -> String) -> Arc<wgpu::ComputePipeline> {
+        self.named_pipeline_in(name, &self.pipeline_layout, source)
+    }
+
+    /// The layout of eight storage buffers (the first six read, the last two written) and the parameters at 8.
+    fn wide_layout(&self) -> &(wgpu::BindGroupLayout, wgpu::PipelineLayout) {
+        self.wide.get_or_init(|| {
+            let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only }, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            };
+            let mut entries: Vec<wgpu::BindGroupLayoutEntry> = (0..8).map(|b| storage(b, b < 6)).collect();
+            entries.push(wgpu::BindGroupLayoutEntry {
+                binding: 8,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            });
+            let layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("oaiy-chain-wide"), entries: &entries });
+            let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("oaiy-chain-wide"),
+                bind_group_layouts: &[Some(&layout)],
+                immediate_size: 0,
+            });
+            (layout, pipeline_layout)
+        })
+    }
+
+    /// A named kernel of eight buffers ([`Gpu::wide_layout`]).
+    fn named_pipeline_wide(&self, name: &'static str, source: impl FnOnce() -> String) -> Arc<wgpu::ComputePipeline> {
+        let layout = &self.wide_layout().1;
+        self.named_pipeline_in(name, layout, source)
+    }
+
+    fn named_pipeline_in(&self, name: &'static str, layout: &wgpu::PipelineLayout, source: impl FnOnce() -> String) -> Arc<wgpu::ComputePipeline> {
         let mut cache = self.named.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(p) = cache.get(name) {
             return Arc::clone(p);
@@ -257,7 +297,7 @@ impl Gpu {
         let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(name), source: wgpu::ShaderSource::Wgsl(source().into()) });
         let pipeline = Arc::new(self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(name),
-            layout: Some(&self.pipeline_layout),
+            layout: Some(layout),
             module: &module,
             entry_point: Some("main"),
             compilation_options: Default::default(),
@@ -401,7 +441,7 @@ impl WgpuBackend {
         });
         Ok(Self {
             cpu: CpuBackend::new(),
-            gpu: Arc::new(Gpu { device, queue, layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), chain_groups: Mutex::new(HashMap::new()), limits, staged: AtomicU64::new(0) }),
+            gpu: Arc::new(Gpu { device, queue, layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), chain_groups: Mutex::new(HashMap::new()), wide: std::sync::OnceLock::new(), chain_groups_wide: Mutex::new(HashMap::new()), limits, staged: AtomicU64::new(0) }),
             budget,
             used: Arc::new(AtomicU64::new(0)),
             summary,

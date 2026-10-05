@@ -169,6 +169,8 @@ pub struct Qwen35Model {
     pub output_norm: Tensor,
     pub output:    Weight,
     pub backend:   Arc<dyn Backend>,
+    /// VENDORED-LOCAL: text runs chained on the backend's device when it has a chain for this model.
+    pub chain: crate::chain_qwen35::Qwen35Chain,
 }
 
 impl Qwen35Model {
@@ -288,7 +290,7 @@ impl Qwen35Model {
             config, ssm_cfg, attention_layers,
             tokenizer, blocks,
             tok_embd, packed_tok_embd, int8_tok_embd: None, cache_backends: Vec::new(), output_norm, output,
-            backend,
+            backend, chain: Default::default(),
         })
     }
 
@@ -391,6 +393,19 @@ impl Qwen35Model {
 
     /// Explicit MRoPE coordinates for image patches and subsequent text.
     pub fn forward_embeds_positions(&self, embeds: &Tensor, seq: usize, kv: &mut KvCache, multimodal: Option<&[[u32; 3]]>) -> Result<Tensor> {
+        // VENDORED-LOCAL: text chained on the device when the backend has a chain for this model (a prompt with an
+        // image, its positions in three axes, takes the path below).
+        if multimodal.is_none() {
+            if let Some(logits) = self.chain.forward(self, embeds, seq, kv) {
+                return Ok(logits);
+            }
+        }
+        self.forward_embeds_host(embeds, seq, kv, multimodal)
+    }
+
+    /// VENDORED-LOCAL: [`Self::forward_embeds_positions`] op by op through the backend, never chained (what a chained
+    /// run is checked against).
+    pub fn forward_embeds_host(&self, embeds: &Tensor, seq: usize, kv: &mut KvCache, multimodal: Option<&[[u32; 3]]>) -> Result<Tensor> {
         let cfg = &self.config;
         let backend = &*self.backend;
         let past = kv.len;

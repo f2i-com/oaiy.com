@@ -17,6 +17,8 @@
 #![deny(rust_2018_idioms)]
 
 mod chain_decode;
+mod chain_qwen35;
+pub use chain_qwen35::Qwen35Chain;
 pub mod chat;
 pub mod config;
 pub mod gemma3;

@@ -716,5 +716,6 @@ fn build(path: &Path, backend: Arc<dyn Backend>, cache_devices: Vec<Arc<dyn Back
         output_norm,
         output,
         backend,
+        chain: Default::default(),
     }))
 }

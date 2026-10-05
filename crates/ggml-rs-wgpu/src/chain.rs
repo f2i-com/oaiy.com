@@ -4,10 +4,10 @@
 //! cache and a decode step's attention have kernels of their own here, on the same bind group layout (weights, a
 //! table or a cache at 0, the input at 1, the output at 2, the parameters at 3).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use ggml_rs::chain::{ChainRecorder, DeviceChain, DeviceVec};
-use ggml_rs::QuantizedTensor;
+use ggml_rs::chain::{ChainRecorder, DeltaNet, DeviceChain, DeviceVec};
+use ggml_rs::{QuantizedTensor, Tensor};
 
 use crate::{Gpu, WgpuBackend, WgpuQuant};
 
@@ -99,22 +99,24 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
-/// RoPE in place on `y` (`[p[0].w rows, p[0].x heads, p[0].y head_dim]`): row `r`'s pair `k` by the sine
-/// `w[r * hd + 2k]` and cosine `w[r * hd + 2k + 1]` (made on the host, as the CPU's rope makes them), the pairs
-/// `(2k, 2k + 1)` or with `p[0].z` `(k, k + half)`.
+/// RoPE in place on `y` (`[p[0].w rows, p[0].x heads, p[0].y head_dim]`), on the first `rot` (`p[1].x`, 0: all) of
+/// each head: row `r`'s pair `k` by the sine `w[r * rot + 2k]` and cosine `w[r * rot + 2k + 1]` (made on the host, as
+/// the CPU's rope makes them), the pairs `(2k, 2k + 1)` or with `p[0].z` `(k, k + rot / 2)`.
 const ROPE: &str = r#"
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let heads = p[0].x;
     let hd = p[0].y;
-    let half = hd / 2u;
+    var rot = p[1].x;
+    if (rot == 0u) { rot = hd; }
+    let half = rot / 2u;
     let i = id.x;
     if (i >= p[0].w * heads * half) { return; }
     let r = i / (heads * half);
     let h = (i / half) % heads;
     let k = i % half;
-    let s = bitcast<f32>(w[r * hd + 2u * k]);
-    let c = bitcast<f32>(w[r * hd + 2u * k + 1u]);
+    let s = bitcast<f32>(w[r * rot + 2u * k]);
+    let c = bitcast<f32>(w[r * rot + 2u * k + 1u]);
     let base = (r * heads + h) * hd;
     var ia = base + 2u * k;
     var ib = ia + 1u;
@@ -260,6 +262,196 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+/// `y[r * p[0].x + i] = x[r * p[0].z + p[0].w + i]` for `r < p[0].y` rows of `p[0].x`: columns of each row.
+const COPY_COLS: &str = r#"
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let width = p[0].x;
+    let i = id.x;
+    if (i < width * p[0].y) { y[i] = x[(i / width) * p[0].z + p[0].w + i % width]; }
+}
+"#;
+
+/// `y[i] = w[i] * sigmoid(x[i])` for `i < p[0].x` (`w` the values, `x` the gate), as the CPU's mul_sigmoid.
+const MUL_SIGMOID: &str = r#"
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x;
+    if (i < p[0].x) { y[i] = bitcast<f32>(w[i]) * (1.0 / (1.0 + exp(-x[i]))); }
+}
+"#;
+
+/// `y[i] = silu(w[i]) * x[i]` for `i < p[0].x` (`w` the gate, `x` the up projection).
+const SILU_MUL: &str = r#"
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x;
+    if (i < p[0].x) {
+        let g = bitcast<f32>(w[i]);
+        y[i] = (g / (1.0 + exp(-g))) * x[i];
+    }
+}
+"#;
+
+/// `y[r * n + o] = dot(w[o], x[r])` for f32 weights `w` (`[n, k]`, `p[0]`: `n`, `k`), a workgroup an (output, row).
+const MATMUL_F32: &str = r#"
+var<workgroup> part: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let n = p[0].x;
+    let k = p[0].y;
+    let o = wg.x;
+    let r = wg.y;
+    var s = 0.0;
+    for (var i = li; i < k; i += 256u) { s += bitcast<f32>(w[o * k + i]) * x[r * k + i]; }
+    part[li] = s;
+    workgroupBarrier();
+    for (var st = 128u; st > 0u; st /= 2u) {
+        if (li < st) { part[li] += part[li + st]; }
+        workgroupBarrier();
+    }
+    if (li == 0u) { y[r * n + o] = part[0]; }
+}
+"#;
+
+/// A gated delta net's causal depthwise conv, a thread a channel through the run's tokens (as the host's): its
+/// `kernel - 1` inputs before them from the state, each output through SiLU, the state left with the last inputs.
+/// `p[0]`: the channels, the tokens, the kernel.
+const SSM_CONV: &str = r#"
+@group(0) @binding(0) var<storage, read> qkv: array<f32>;
+@group(0) @binding(1) var<storage, read> cw: array<f32>;
+@group(0) @binding(6) var<storage, read_write> cs: array<f32>;
+@group(0) @binding(7) var<storage, read_write> out: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let ch = p[0].x;
+    let rows = p[0].y;
+    let kern = p[0].z;
+    let c = id.x;
+    if (c >= ch) { return; }
+    var win: array<f32, 8>;
+    for (var k = 0u; k + 1u < kern; k++) { win[k] = cs[k * ch + c]; }
+    for (var t = 0u; t < rows; t++) {
+        let xin = qkv[t * ch + c];
+        var acc = 0.0;
+        for (var k = 0u; k + 1u < kern; k++) { acc += win[k] * cw[c * kern + k]; }
+        acc += xin * cw[c * kern + kern - 1u];
+        out[t * ch + c] = acc / (1.0 + exp(-acc));
+        for (var k = 0u; k + 2u < kern; k++) { win[k] = win[k + 1u]; }
+        win[kern - 2u] = xin;
+    }
+    for (var k = 0u; k + 1u < kern; k++) { cs[k * ch + c] = win[k]; }
+}
+"#;
+
+/// A gated delta net's recurrence through the run's tokens, a workgroup a value head and a thread a row of its state
+/// (as the host's `delta_net_step`), the row held in registers from the run's start to its end: each token's q and k
+/// (its key head's) L2-normed, the state decayed by `exp(softplus(alpha + dt_bias) * a)`, the delta rule's update by
+/// `sigmoid(beta)`, the state read by q, and the result RMS-normed over the head and gated by `silu(z)` (or
+/// `sigmoid(z)`). `DK` (the heads' size, `k_dim` = `v_dim`) is made a constant. `p[0]`: the value heads, the key heads;
+/// `p[1]`: the tokens, the bits of the q scale and of eps, the sigmoid gate. (A row read from memory at each token:
+/// 43 us a layer for a decode step of Qwen3.8 27B, 30 us a token of a prompt.)
+const DELTA_NET: &str = r#"
+@group(0) @binding(0) var<storage, read> cv: array<f32>;
+@group(0) @binding(1) var<storage, read> zz: array<f32>;
+@group(0) @binding(2) var<storage, read> ba: array<f32>;
+@group(0) @binding(3) var<storage, read> sa: array<f32>;
+@group(0) @binding(4) var<storage, read> dt: array<f32>;
+@group(0) @binding(5) var<storage, read> nm: array<f32>;
+@group(0) @binding(6) var<storage, read_write> st: array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read_write> out: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+const DK: u32 = DK_VALUEu;
+const DK4: u32 = DK_VALUEu / 4u;
+
+var<workgroup> qn: array<vec4<f32>, DK4>;
+var<workgroup> kn: array<vec4<f32>, DK4>;
+var<workgroup> red: array<f32, 2 * DK>;
+
+@compute @workgroup_size(DK)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) i: u32) {
+    let nv = p[0].x;
+    let nk = p[0].y;
+    let rows = p[1].x;
+    let scale_q = bitcast<f32>(p[1].y);
+    let eps = bitcast<f32>(p[1].z);
+    let sig = p[1].w;
+    let h = wg.x;
+    let hk = h % nk;
+    let ch = 2u * nk * DK + nv * DK;
+    let base = (h * DK + i) * DK4;
+    var row: array<vec4<f32>, DK4>;
+    for (var c = 0u; c < DK4; c++) { row[c] = st[base + c]; }
+    for (var t = 0u; t < rows; t++) {
+        let r0 = t * ch;
+        let q = cv[r0 + hk * DK + i];
+        let k = cv[r0 + nk * DK + hk * DK + i];
+        red[i] = q * q;
+        red[DK + i] = k * k;
+        workgroupBarrier();
+        for (var s = DK / 2u; s > 0u; s /= 2u) {
+            if (i < s) {
+                red[i] += red[i + s];
+                red[DK + i] += red[DK + i + s];
+            }
+            workgroupBarrier();
+        }
+        let inv_q = 1.0 / sqrt(red[0] + eps);
+        let inv_k = 1.0 / sqrt(red[DK] + eps);
+        qn[i / 4u][i % 4u] = q * inv_q * scale_q;
+        kn[i / 4u][i % 4u] = k * inv_k;
+        workgroupBarrier();
+        let bt = 1.0 / (1.0 + exp(-ba[t * 2u * nv + h]));
+        let ab = ba[t * 2u * nv + nv + h] + dt[h];
+        var sp = ab;
+        if (ab <= 20.0) {
+            let e = exp(ab);
+            // ln(1 + e) as ln_1p gives it, where 1 + e would round e away
+            sp = select(log(1.0 + e), e * (1.0 - 0.5 * e), e < 1e-4);
+        }
+        let g = exp(sp * sa[h]);
+        // the decayed row read by k, its sums in the host's order
+        var kv = 0.0;
+        for (var c = 0u; c < DK4; c++) {
+            let s = row[c] * g;
+            let kk = kn[c];
+            kv += s.x * kk.x;
+            kv += s.y * kk.y;
+            kv += s.z * kk.z;
+            kv += s.w * kk.w;
+        }
+        let delta = (cv[r0 + 2u * nk * DK + h * DK + i] - kv) * bt;
+        var core = 0.0;
+        for (var c = 0u; c < DK4; c++) {
+            let s = row[c] * g + delta * kn[c];
+            row[c] = s;
+            let qq = qn[c];
+            core += s.x * qq.x;
+            core += s.y * qq.y;
+            core += s.z * qq.z;
+            core += s.w * qq.w;
+        }
+        red[i] = core * core;
+        workgroupBarrier();
+        for (var s = DK / 2u; s > 0u; s /= 2u) {
+            if (i < s) { red[i] += red[i + s]; }
+            workgroupBarrier();
+        }
+        let inv = 1.0 / sqrt(red[0] / f32(DK) + eps);
+        let zv = zz[t * nv * DK + h * DK + i];
+        var gate = zv / (1.0 + exp(-zv));
+        if (sig != 0u) { gate = 1.0 / (1.0 + exp(-zv)); }
+        out[t * nv * DK + h * DK + i] = core * inv * nm[i] * gate;
+        workgroupBarrier();
+    }
+    for (var c = 0u; c < DK4; c++) { st[base + c] = row[c]; }
+}
+"#;
+
 /// Positions a workgroup of [`ATTENTION_PART`] takes.
 const SPLIT: usize = 256;
 
@@ -365,6 +557,81 @@ fn buffer(v: &DeviceVec) -> &wgpu::Buffer {
     v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector")
 }
 
+/// A tensor that is a chain's vector itself ([`DeviceChain::alias`]), read back when the host asks for it.
+struct Aliased {
+    v: DeviceVec,
+    gpu: Arc<Gpu>,
+    serial: Arc<Mutex<()>>,
+}
+
+impl std::fmt::Debug for Aliased {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Aliased({})", self.v.len)
+    }
+}
+
+/// A buffer for a chain's vector of `len`.
+fn vec_buffer(gpu: &Gpu, len: usize) -> wgpu::Buffer {
+    gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("oaiy-chain-vec"),
+        size: (len.max(1) * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    })
+}
+
+impl ggml_rs::DeviceStorage for Aliased {
+    fn len(&self) -> usize {
+        self.v.len
+    }
+
+    fn device_name(&self) -> &str {
+        "webgpu"
+    }
+
+    fn copy_to_host(&self) -> Vec<f32> {
+        let _one = self.serial.lock().unwrap_or_else(|p| p.into_inner());
+        let len = self.v.len;
+        let staging = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("oaiy-chain-alias-read"),
+            size: (len.max(1) * 4) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = self.gpu.device.create_command_encoder(&Default::default());
+        if len > 0 {
+            enc.copy_buffer_to_buffer(buffer(&self.v), 0, &staging, 0, (len * 4) as u64);
+        }
+        self.gpu.queue.submit([enc.finish()]);
+        staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).expect("webgpu: device lost while reading a chain's vector");
+        let view = staging.slice(..).get_mapped_range().expect("webgpu: mapping a finished buffer");
+        let host: Vec<f32> = view.chunks_exact(4).take(len).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        drop(view);
+        staging.unmap();
+        host
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    fn clone_to_device(&self) -> Box<dyn ggml_rs::DeviceStorage> {
+        let _one = self.serial.lock().unwrap_or_else(|p| p.into_inner());
+        let copy = vec_buffer(&self.gpu, self.v.len);
+        let mut enc = self.gpu.device.create_command_encoder(&Default::default());
+        if self.v.len > 0 {
+            enc.copy_buffer_to_buffer(buffer(&self.v), 0, &copy, 0, (self.v.len * 4) as u64);
+        }
+        self.gpu.queue.submit([enc.finish()]);
+        Box::new(Aliased { v: DeviceVec { len: self.v.len, inner: Arc::new(copy) }, gpu: Arc::clone(&self.gpu), serial: Arc::clone(&self.serial) })
+    }
+}
+
 fn le_bytes(data: &[f32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(data.len() * 4);
     for f in data {
@@ -375,13 +642,24 @@ fn le_bytes(data: &[f32]) -> Vec<u8> {
 
 impl DeviceChain for WgpuBackend {
     fn vec(&self, len: usize) -> DeviceVec {
-        let buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("oaiy-chain-vec"),
-            size: (len.max(1) * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        DeviceVec { len, inner: Arc::new(buf) }
+        DeviceVec { len, inner: Arc::new(vec_buffer(&self.gpu, len)) }
+    }
+
+    fn zero(&self, v: &DeviceVec) {
+        let mut enc = self.gpu.device.create_command_encoder(&Default::default());
+        enc.clear_buffer(buffer(v), 0, None);
+        self.gpu.queue.submit([enc.finish()]);
+    }
+
+    fn alias(&self, v: &DeviceVec, shape: Vec<usize>) -> Tensor {
+        assert_eq!(shape.iter().product::<usize>(), v.len, "chain: an alias of {} values as {shape:?}", v.len);
+        let storage = Aliased { v: v.clone(), gpu: Arc::clone(&self.gpu), serial: Arc::clone(&self.serial) };
+        Tensor::from_device(Box::new(storage), shape)
+    }
+
+    fn aliased(&self, t: &Tensor) -> Option<DeviceVec> {
+        let a = t.device_storage()?.as_any().downcast_ref::<Aliased>()?;
+        Arc::ptr_eq(&a.gpu, &self.gpu).then(|| a.v.clone())
     }
 
     fn upload_at(&self, v: &DeviceVec, offset: usize, data: &[f32]) {
@@ -415,7 +693,7 @@ impl DeviceChain for WgpuBackend {
     }
 
     fn begin(&self) -> Box<dyn ChainRecorder + '_> {
-        Box::new(Recorder { backend: self, dispatches: Vec::new(), reads: Vec::new() })
+        Box::new(Recorder { backend: self, dispatches: Vec::new(), reads: Vec::new(), keep: true })
     }
 }
 
@@ -424,6 +702,9 @@ type Dispatch = (Arc<wgpu::ComputePipeline>, wgpu::BindGroup, (u32, u32, u32));
 
 /// A bind group a chain makes again step after step: its pipeline, its three buffers and its parameters.
 pub(crate) type GroupKey = (usize, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, [u32; 8]);
+
+/// A bind group of the eight-buffer layout a chain makes again step after step (`Gpu::wide_layout`).
+pub(crate) type WideKey = (usize, [wgpu::Buffer; 8], [u32; 8]);
 
 /// Bind groups kept before the cache starts over (a cache grown from buffers that were replaced).
 const KEEP_GROUPS: usize = 16384;
@@ -434,6 +715,8 @@ struct Recorder<'a> {
     dispatches: Vec<Dispatch>,
     /// What to read back once they have run: the vector, the element it starts at, a staging buffer, the length.
     reads: Vec<(wgpu::Buffer, usize, wgpu::Buffer, usize)>,
+    /// Whether bind groups are kept for the steps after ([`ChainRecorder::keep_groups`]).
+    keep: bool,
 }
 
 impl Recorder<'_> {
@@ -456,6 +739,11 @@ impl Recorder<'_> {
 
     /// A dispatch whose bind group is the same every step (its buffers and parameters): made once and kept.
     fn dispatch_kept(&mut self, pipeline: &Arc<wgpu::ComputePipeline>, at0: &wgpu::Buffer, at1: &wgpu::Buffer, at2: &wgpu::Buffer, words: &[u32], groups: (u32, u32, u32)) {
+        if !self.keep {
+            let params = self.uniform(words);
+            self.dispatch(pipeline, at0, at1, at2, &params, groups);
+            return;
+        }
         let key: GroupKey = (Arc::as_ptr(pipeline) as usize, at0.clone(), at1.clone(), at2.clone(), words8(words));
         let kept = self.gpu().chain_groups.lock().unwrap_or_else(|p| p.into_inner()).get(&key).cloned();
         let group = match kept {
@@ -503,6 +791,31 @@ impl Recorder<'_> {
 
     fn named(&self, name: &'static str, body: &'static str) -> Arc<wgpu::ComputePipeline> {
         self.gpu().named_pipeline(name, || format!("{HEAD}{body}"))
+    }
+
+    /// A dispatch of an eight-buffer kernel (`Gpu::wide_layout`), its bind group kept as `dispatch_kept`'s.
+    fn dispatch_wide(&mut self, name: &'static str, body: &str, bufs: [&wgpu::Buffer; 8], words: &[u32], groups: (u32, u32, u32)) {
+        let pipeline = self.gpu().named_pipeline_wide(name, || body.to_string());
+        let key: WideKey = (Arc::as_ptr(&pipeline) as usize, bufs.map(|b| b.clone()), words8(words));
+        let kept = if self.keep { self.gpu().chain_groups_wide.lock().unwrap_or_else(|p| p.into_inner()).get(&key).cloned() } else { None };
+        let group = match kept {
+            Some(group) => group,
+            None => {
+                let params = self.uniform(words);
+                let mut entries: Vec<wgpu::BindGroupEntry> = bufs.iter().enumerate().map(|(i, b)| wgpu::BindGroupEntry { binding: i as u32, resource: b.as_entire_binding() }).collect();
+                entries.push(wgpu::BindGroupEntry { binding: 8, resource: params.as_entire_binding() });
+                let group = self.gpu().device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("oaiy-chain-wide"), layout: &self.gpu().wide_layout().0, entries: &entries });
+                if self.keep {
+                    let mut groups = self.gpu().chain_groups_wide.lock().unwrap_or_else(|p| p.into_inner());
+                    if groups.len() >= KEEP_GROUPS {
+                        groups.clear();
+                    }
+                    groups.insert(key, group.clone());
+                }
+                group
+            }
+        };
+        self.dispatches.push((pipeline, group, groups));
     }
 }
 
@@ -556,6 +869,68 @@ impl ChainRecorder for Recorder<'_> {
         assert!(rows > 0 && out.len == rows * ff && fused.len >= 2 * out.len, "chain: GeGLU of {rows} rows");
         let pipeline = self.named("chain-gelu-mul-split", GELU_MUL_SPLIT);
         self.dispatch_kept(&pipeline, buffer(fused), buffer(fused), buffer(out), &[ff as u32, rows as u32], ((out.len as u32).div_ceil(256), 1, 1));
+    }
+
+    fn keep_groups(&mut self, keep: bool) {
+        self.keep = keep;
+    }
+
+    fn copy_cols(&mut self, src: &DeviceVec, dst: &DeviceVec, rows: usize, width: usize, stride: usize, at: usize) {
+        assert!(rows > 0 && at + width <= stride && src.len >= rows * stride && dst.len >= rows * width, "chain: {rows} rows' columns {at}..{} of {stride}", at + width);
+        let pipeline = self.named("chain-copy-cols", COPY_COLS);
+        self.dispatch_kept(&pipeline, buffer(src), buffer(src), buffer(dst), &[width as u32, rows as u32, stride as u32, at as u32], (((rows * width) as u32).div_ceil(256), 1, 1));
+    }
+
+    fn rope_partial_rows(&mut self, x: &DeviceVec, rows: usize, heads: usize, head_dim: usize, rot: usize, table: &DeviceVec) {
+        assert!(rot > 0 && rot % 2 == 0 && rot <= head_dim && x.len >= rows * heads * head_dim && table.len >= rows * rot, "chain: RoPE of {rot} of {head_dim}");
+        let pipeline = self.named("chain-rope", ROPE);
+        let pairs = (rows * heads * rot / 2) as u32;
+        self.dispatch_kept(&pipeline, buffer(table), buffer(table), buffer(x), &[heads as u32, head_dim as u32, 1, rows as u32, rot as u32], (pairs.div_ceil(256), 1, 1));
+    }
+
+    fn mul_sigmoid(&mut self, x: &DeviceVec, gate: &DeviceVec, out: &DeviceVec, len: usize) {
+        assert!(x.len >= len && gate.len >= len && out.len >= len && !Arc::ptr_eq(&x.inner, &out.inner), "chain: a gate of {len}");
+        let pipeline = self.named("chain-mul-sigmoid", MUL_SIGMOID);
+        self.dispatch_kept(&pipeline, buffer(x), buffer(gate), buffer(out), &[len as u32], ((len as u32).div_ceil(256), 1, 1));
+    }
+
+    fn silu_mul(&mut self, gate: &DeviceVec, up: &DeviceVec, out: &DeviceVec, len: usize) {
+        assert!(gate.len >= len && up.len >= len && out.len >= len, "chain: a SwiGLU of {len}");
+        let pipeline = self.named("chain-silu-mul", SILU_MUL);
+        self.dispatch_kept(&pipeline, buffer(gate), buffer(up), buffer(out), &[len as u32], ((len as u32).div_ceil(256), 1, 1));
+    }
+
+    fn matmul_f32_rows(&mut self, w: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize) {
+        assert!(w.len >= n * k && x.len >= rows * k && y.len >= rows * n && n <= 65535 && rows <= 65535, "chain: an f32 matmul [{n}, {k}] of {rows} rows");
+        let pipeline = self.named("chain-matmul-f32", MATMUL_F32);
+        self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(y), &[n as u32, k as u32], (n as u32, rows as u32, 1));
+    }
+
+    fn ssm_conv(&mut self, qkv: &DeviceVec, weight: &DeviceVec, state: &DeviceVec, out: &DeviceVec, rows: usize, channels: usize, kernel: usize) {
+        assert!((2..=8).contains(&kernel) && qkv.len >= rows * channels && weight.len >= channels * kernel && state.len >= (kernel - 1) * channels && out.len >= rows * channels, "chain: a conv of {kernel} over {rows} rows of {channels}");
+        let q = buffer(qkv);
+        self.dispatch_wide("chain-ssm-conv", SSM_CONV, [q, buffer(weight), q, q, q, q, buffer(state), buffer(out)], &[channels as u32, rows as u32, kernel as u32], ((channels as u32).div_ceil(256), 1, 1));
+    }
+
+    fn delta_net(&mut self, conv: &DeviceVec, z: &DeviceVec, beta_alpha: &DeviceVec, ssm_a: &DeviceVec, dt_bias: &DeviceVec, norm: &DeviceVec, state: &DeviceVec, out: &DeviceVec, d: DeltaNet) {
+        let ch = 2 * d.k_heads * d.k_dim + d.v_heads * d.v_dim;
+        // a pipeline a head size, the size a constant of it
+        let name: &'static str = match d.k_dim {
+            16 => "chain-delta-net-16",
+            32 => "chain-delta-net-32",
+            64 => "chain-delta-net-64",
+            128 => "chain-delta-net-128",
+            other => panic!("chain: a delta net of heads of {other} (16, 32, 64 or 128)"),
+        };
+        assert!(d.k_dim == d.v_dim && d.k_heads > 0, "chain: a delta net of heads of {} and {} (one size)", d.k_dim, d.v_dim);
+        assert!(
+            conv.len >= d.rows * ch && z.len >= d.rows * d.v_heads * d.v_dim && beta_alpha.len >= d.rows * 2 * d.v_heads && ssm_a.len >= d.v_heads && dt_bias.len >= d.v_heads
+                && norm.len >= d.v_dim && state.len >= d.v_heads * d.k_dim * d.v_dim && out.len >= d.rows * d.v_heads * d.v_dim,
+            "chain: a delta net's buffers"
+        );
+        let words = [d.v_heads as u32, d.k_heads as u32, d.k_dim as u32, d.v_dim as u32, d.rows as u32, d.scale_q.to_bits(), d.eps.to_bits(), d.sigmoid_gate as u32];
+        let source = DELTA_NET.replace("DK_VALUE", &d.k_dim.to_string());
+        self.dispatch_wide(name, &source, [buffer(conv), buffer(z), buffer(beta_alpha), buffer(ssm_a), buffer(dt_bias), buffer(norm), buffer(state), buffer(out)], &words, (d.v_heads as u32, 1, 1));
     }
 
     fn rope_rows(&mut self, x: &DeviceVec, rows: usize, heads: usize, head_dim: usize, table: &DeviceVec, neox: bool) {
@@ -773,6 +1148,39 @@ mod tests {
             run();
         }
         eprintln!("an add of 3072 in a chain: {:.1} us", t.elapsed().as_secs_f64() / 5.0 / (28.0 * 8.0) * 1e6);
+        // Qwen3.8 27B's gated delta net, a decode step's and a prompt chunk's, 48 layers' worth in a chain
+        let (nv, nk, dim, kern) = (48usize, 16usize, 128usize, 4usize);
+        let ch = 2 * nk * dim + nv * dim;
+        for rows in [1usize, 6, 64] {
+            let v = |n: usize| {
+                let v = b.vec(n);
+                DeviceChain::upload(&b, &v, &(0..n).map(|i| ((i % 17) as f32 - 8.0) * 0.01).collect::<Vec<_>>());
+                v
+            };
+            let (qkv, z, ba, cw, a, dt, nm, conv, state) = (v(rows * ch), v(rows * nv * dim), v(rows * 2 * nv), v(ch * kern), v(nv), v(nv), v(dim), v((kern - 1) * ch), v(nv * dim * dim));
+            let (co, out) = (b.vec(rows * ch), b.vec(rows * nv * dim));
+            let d = DeltaNet { rows, v_heads: nv, k_heads: nk, k_dim: dim, v_dim: dim, scale_q: 0.088, eps: 1e-6, sigmoid_gate: false };
+            for (what, conv_too) in [("conv", true), ("delta net", false)] {
+                let run = || {
+                    let mut rec = b.begin();
+                    for _ in 0..48 {
+                        if conv_too {
+                            rec.ssm_conv(&qkv, &cw, &conv, &co, rows, ch, kern);
+                        } else {
+                            rec.delta_net(&co, &z, &ba, &a, &dt, &nm, &state, &out, d);
+                        }
+                    }
+                    rec.read_range(&out, 0, 1);
+                    rec.finish();
+                };
+                run();
+                let t = std::time::Instant::now();
+                for _ in 0..5 {
+                    run();
+                }
+                eprintln!("Qwen3.8 27B's {what} of {rows} rows: {:.1} us a layer", t.elapsed().as_secs_f64() / 5.0 / 48.0 * 1e6);
+            }
+        }
     }
 
     /// A prompt's RoPE, its rows stored into a cache, and its causal attention over the cache (with and without a
@@ -917,5 +1325,139 @@ mod tests {
             close(&got[1], kc.data(), "the stored key");
             close(&got[0], want.data(), "the attention");
         }
+    }
+
+    /// A gated delta net's conv and recurrence give the host's answer (`Backend::delta_net_step`, the CPU's): the
+    /// output, the conv state and the recurrent state after a decode step and after a run of tokens, from states the
+    /// host made, at a small shape and at Qwen3.8 27B's (48 value heads on 16 key heads of 128).
+    #[test]
+    fn a_delta_net_matches_the_hosts() {
+        use ggml_rs::Backend;
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        let cpu = ggml_rs::CpuBackend::new();
+        for (nv, nk, dim, kern, rows) in [(8usize, 4usize, 32usize, 4usize, 1usize), (8, 4, 32, 4, 7), (48, 16, 128, 4, 1), (48, 16, 128, 4, 5)] {
+            let ch = 2 * nk * dim + nv * dim;
+            let mut next = rng((nv * 31 + rows) as u32);
+            let mut vals = |n: usize, s: f32| (0..n).map(|_| next() * s).collect::<Vec<f32>>();
+            let qkv = vals(rows * ch, 1.0);
+            let z = vals(rows * nv * dim, 1.0);
+            let ba = vals(rows * 2 * nv, 2.0);
+            let cw = vals(ch * kern, 0.5);
+            let a = vals(nv, 1.0).iter().map(|v| -v.abs() - 0.1).collect::<Vec<f32>>();
+            let dt = vals(nv, 1.0);
+            let nm = vals(dim, 1.0).iter().map(|v| v + 1.0).collect::<Vec<f32>>();
+            let conv0 = vals((kern - 1) * ch, 1.0);
+            let state0 = vals(nv * dim * dim, 0.1);
+            let (scale, eps) = (1.0 / (dim as f32).sqrt(), 1e-6f32);
+            let t = |d: &[f32], shape: Vec<usize>| ggml_rs::Tensor::from_vec(d.to_vec(), shape);
+            let mut conv_c = t(&conv0, vec![kern - 1, ch]);
+            let mut state_c = t(&state0, vec![nv, dim, dim]);
+            let want = cpu.delta_net_step(&t(&qkv, vec![rows, ch]), &t(&z, vec![rows, nv * dim]), &t(&ba, vec![rows, 2 * nv]), &t(&cw, vec![ch, kern]),
+                &t(&a, vec![nv]), &t(&dt, vec![nv]), &t(&nm, vec![dim]), &mut conv_c, &mut state_c, rows, nv, nk, dim, dim, nv / nk, scale, eps);
+            let up = |d: &[f32]| {
+                let v = b.vec(d.len());
+                DeviceChain::upload(&b, &v, d);
+                v
+            };
+            let (qkv_d, z_d, ba_d, cw_d, a_d, dt_d, nm_d, conv_d) = (up(&qkv), up(&z), up(&ba), up(&cw), up(&a), up(&dt), up(&nm), up(&conv0));
+            let state_d = up(&state0);
+            let (conv_out, out) = (b.vec(rows * ch), b.vec(rows * nv * dim));
+            let mut rec = b.begin();
+            rec.ssm_conv(&qkv_d, &cw_d, &conv_d, &conv_out, rows, ch, kern);
+            rec.delta_net(&conv_out, &z_d, &ba_d, &a_d, &dt_d, &nm_d, &state_d, &out, DeltaNet { rows, v_heads: nv, k_heads: nk, k_dim: dim, v_dim: dim, scale_q: scale, eps, sigmoid_gate: false });
+            rec.read(&out);
+            rec.read(&conv_d);
+            let got = rec.finish();
+            let what = format!("{nv} heads of {dim}, {rows} rows");
+            close(&got[0], want.data(), &format!("{what}: the output"));
+            close(&got[1], conv_c.data(), &format!("{what}: the conv state"));
+            // the recurrent state, through the alias the host would read it by
+            let state = b.alias(&state_d, vec![nv, dim, dim]);
+            close(state.to_host().data(), state_c.data(), &format!("{what}: the state"));
+            assert!(b.aliased(&state).is_some_and(|v| Arc::ptr_eq(&v.inner, &state_d.inner)));
+        }
+    }
+
+    /// An alias reads its vector as it is when read, and a clone of it is a copy that does not follow the vector.
+    #[test]
+    fn an_alias_reads_its_vector_and_a_clone_is_a_copy() {
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        let v = b.vec(8);
+        DeviceChain::upload(&b, &v, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        let t = b.alias(&v, vec![2, 2, 2]);
+        assert_eq!(t.to_host().data(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        let copy = t.clone();
+        DeviceChain::upload(&b, &v, &[0.0; 8]);
+        assert_eq!(t.to_host().data(), &[0.0; 8]);
+        assert_eq!(copy.to_host().data(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        assert!(b.aliased(&copy).is_some_and(|c| !Arc::ptr_eq(&c.inner, &v.inner)));
+        assert!(b.aliased(&ggml_rs::Tensor::zeros(vec![8])).is_none());
+        b.zero(&b.aliased(&copy).unwrap());
+        assert_eq!(copy.to_host().data(), &[0.0; 8]);
+    }
+
+    /// Qwen3.5's partial RoPE, its q/gate split, gate and SwiGLU of two weights, and an f32 matmul give the CPU's
+    /// answers.
+    #[test]
+    fn qwen35s_small_ops_match_the_cpus() {
+        use ggml_rs::Backend;
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        let cpu = ggml_rs::CpuBackend::new();
+        let (rows, heads, hd, rot, theta) = (3usize, 4usize, 32usize, 8usize, 1e7f32);
+        let mut next = rng(77);
+        let x: Vec<f32> = (0..rows * heads * 2 * hd).map(|_| next()).collect();
+        let up = |d: &[f32]| {
+            let v = b.vec(d.len());
+            DeviceChain::upload(&b, &v, d);
+            v
+        };
+        let xd = up(&x);
+        let (q, g) = (b.vec(rows * heads * hd), b.vec(rows * heads * hd));
+        let past = 17usize;
+        let table: Vec<f32> = (past..past + rows)
+            .flat_map(|pos| (0..rot / 2).flat_map(move |k| {
+                let (s, c) = (pos as f32 * theta.powf(-2.0 * k as f32 / rot as f32)).sin_cos();
+                [s, c]
+            }))
+            .collect();
+        let td = up(&table);
+        let gated = b.vec(rows * heads * hd);
+        let (gate_v, up_v, act) = (up(&x[..64]), up(&x[64..128]), b.vec(64));
+        let (n, k) = (5usize, 48usize);
+        let wf: Vec<f32> = (0..n * k).map(|_| next()).collect();
+        let (wd, xf, yf) = (up(&wf), up(&x[..2 * k]), b.vec(2 * n));
+        let mut rec = b.begin();
+        rec.copy_cols(&xd, &q, rows * heads, hd, 2 * hd, 0);
+        rec.copy_cols(&xd, &g, rows * heads, hd, 2 * hd, hd);
+        rec.rope_partial_rows(&q, rows, heads, hd, rot, &td);
+        rec.mul_sigmoid(&q, &g, &gated, rows * heads * hd);
+        rec.silu_mul(&gate_v, &up_v, &act, 64);
+        rec.matmul_f32_rows(&wd, n, k, &xf, &yf, 2);
+        for v in [&q, &g, &gated, &act, &yf] {
+            rec.read(v);
+        }
+        let got = rec.finish();
+        let (mut qh, mut gh) = (Vec::new(), Vec::new());
+        for r in x.chunks_exact(2 * hd) {
+            qh.extend_from_slice(&r[..hd]);
+            gh.extend_from_slice(&r[hd..]);
+        }
+        let mut qt = ggml_rs::Tensor::from_vec(qh, vec![rows, heads, hd]);
+        let positions: Vec<u32> = (past..past + rows).map(|p| p as u32).collect();
+        cpu.rope_partial_neox(&mut qt, &positions, hd, rot, theta);
+        close(&got[0], qt.data(), "the partially rotated query");
+        close(&got[1], &gh, "the gate half");
+        let mut gt = qt.clone();
+        cpu.mul_sigmoid_inplace(&mut gt, &ggml_rs::Tensor::from_vec(gh, vec![rows, heads, hd]));
+        close(&got[2], gt.data(), "the gated output");
+        let sw = cpu.silu_mul(&ggml_rs::Tensor::from_vec(x[..64].to_vec(), vec![64]), &ggml_rs::Tensor::from_vec(x[64..128].to_vec(), vec![64]));
+        close(&got[3], sw.data(), "the SwiGLU");
+        let mut want = Vec::new();
+        for r in 0..2 {
+            for o in 0..n {
+                want.push((0..k).map(|i| wf[o * k + i] * x[r * k + i]).sum::<f32>());
+            }
+        }
+        close(&got[4], &want, "the f32 matmul");
     }
 }

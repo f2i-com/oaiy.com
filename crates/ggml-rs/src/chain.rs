@@ -10,6 +10,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use crate::quantized::QuantizedTensor;
+use crate::tensor::Tensor;
 
 /// An f32 vector held by a [`DeviceChain`]'s device: the backend's own buffer behind it.
 #[derive(Clone)]
@@ -24,10 +25,32 @@ impl std::fmt::Debug for DeviceVec {
     }
 }
 
+/// The shape of a gated delta net's recurrence over a run of tokens ([`ChainRecorder::delta_net`]).
+#[derive(Clone, Copy, Debug)]
+pub struct DeltaNet {
+    /// Tokens in the run.
+    pub rows: usize,
+    pub v_heads: usize,
+    pub k_heads: usize,
+    pub k_dim: usize,
+    pub v_dim: usize,
+    pub scale_q: f32,
+    pub eps: f32,
+    /// The output gated by `sigmoid(z)` (Qwen3.8-Flash-Next) where Qwen3.5's is `silu(z)`.
+    pub sigmoid_gate: bool,
+}
+
 /// A device that runs a chain of ops on vectors it holds.
 pub trait DeviceChain: Send + Sync {
     /// A zeroed vector of `len`.
     fn vec(&self, len: usize) -> DeviceVec;
+    /// Zero `v` (before whatever is recorded next runs).
+    fn zero(&self, v: &DeviceVec);
+    /// A tensor of `shape` whose storage is `v` itself, not a copy (a model's recurrent state kept on the device in its
+    /// cache between steps): its host copy reads `v` back as it is then, and a clone of it is a copy of `v`.
+    fn alias(&self, v: &DeviceVec, shape: Vec<usize>) -> Tensor;
+    /// The vector `t` is, if [`DeviceChain::alias`] made it on this device.
+    fn aliased(&self, t: &Tensor) -> Option<DeviceVec>;
     /// Write `data` into `v` from element `offset` (before whatever is recorded next runs).
     fn upload_at(&self, v: &DeviceVec, offset: usize, data: &[f32]);
     /// Write `data` into `v` from its start.
@@ -73,6 +96,11 @@ pub trait ChainRecorder {
     fn silu_mul_split_rows(&mut self, fused: &DeviceVec, out: &DeviceVec, rows: usize);
     /// [`Self::gelu_mul_split`] of each of `rows` rows.
     fn gelu_mul_split_rows(&mut self, fused: &DeviceVec, out: &DeviceVec, rows: usize);
+    /// Whether this recording's bind groups are kept for the steps after (true at first). A prompt's chunk, whose
+    /// vectors are its own, keeps none, so they do not hold its buffers' memory after it.
+    fn keep_groups(&mut self, keep: bool) {
+        let _ = keep;
+    }
     /// Rotate `x` (`[heads, head_dim]`) in place: pair `k` of each head by `table[2k]` (sine) and `table[2k + 1]`
     /// (cosine), the pairs `(2k, 2k + 1)` or with `neox` `(k, k + head_dim / 2)`.
     fn rope(&mut self, x: &DeviceVec, heads: usize, head_dim: usize, table: &DeviceVec, neox: bool) {
@@ -99,6 +127,33 @@ pub trait ChainRecorder {
     /// of `out` scratch ([`DeviceChain::attention_out_len`] long, `cap` the cache's rows).
     #[allow(clippy::too_many_arguments)]
     fn attention(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, n_h: usize, n_kv: usize, head_dim: usize, lo: usize, kv_len: usize, cap: usize, scale: f32);
+    /// `dst[r * width + i] = src[r * stride + at + i]` for each of `rows` rows: a run of columns of each row of `src`
+    /// (the query or the gate half of each head of Qwen3.5's q).
+    #[allow(clippy::too_many_arguments)]
+    fn copy_cols(&mut self, src: &DeviceVec, dst: &DeviceVec, rows: usize, width: usize, stride: usize, at: usize);
+    /// RoPE on the first `rot` of each head's `head_dim` in place, NeoX pairs `(k, k + rot / 2)`, row `r` of `rows` by
+    /// `table[r * rot..]` (each pair's sine then cosine); the rest of each head as it is (Qwen3.5's partial rotation).
+    fn rope_partial_rows(&mut self, x: &DeviceVec, rows: usize, heads: usize, head_dim: usize, rot: usize, table: &DeviceVec);
+    /// `out[i] = x[i] * sigmoid(gate[i])` for `i < len` (Qwen3.5's gated attention output).
+    fn mul_sigmoid(&mut self, x: &DeviceVec, gate: &DeviceVec, out: &DeviceVec, len: usize);
+    /// `out[i] = silu(gate[i]) * up[i]` for `i < len` (a SwiGLU whose gate and up are two weights).
+    fn silu_mul(&mut self, gate: &DeviceVec, up: &DeviceVec, out: &DeviceVec, len: usize);
+    /// `y[r] = W x[r]` for `rows` rows of `x` (`[rows, k]`), `W` f32 weights `[n, k]` (row-major) held in `w`.
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_f32_rows(&mut self, w: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize);
+    /// A gated delta net's causal depthwise conv over `rows` tokens of `qkv` (`[rows, channels]`) after the
+    /// `kernel - 1` inputs `state` holds (`[kernel - 1, channels]`, oldest first), with `weight` (`[channels, kernel]`),
+    /// through SiLU into `out` (`[rows, channels]`); `state` then holds the last `kernel - 1` inputs. As the host's
+    /// (`Backend::delta_net_step`).
+    #[allow(clippy::too_many_arguments)]
+    fn ssm_conv(&mut self, qkv: &DeviceVec, weight: &DeviceVec, state: &DeviceVec, out: &DeviceVec, rows: usize, channels: usize, kernel: usize);
+    /// A gated delta net's recurrence over `d.rows` tokens, as the host's (`Backend::delta_net_step`): each token's
+    /// conv output `conv` (`[rows, 2 k_heads k_dim + v_heads v_dim]`: q, k, v), gate `z` (`[rows, v_heads v_dim]`)
+    /// and `beta_alpha` (`[rows, 2 v_heads]`) with the layer's `ssm_a`, `dt_bias` (`[v_heads]`) and `norm`
+    /// (`[v_dim]`) update `state` (`[v_heads, v_dim, k_dim]`, the host's layout) and give the norm-gated output `out`
+    /// (`[rows, v_heads v_dim]`). Head `h` reads key head `h % k_heads`.
+    #[allow(clippy::too_many_arguments)]
+    fn delta_net(&mut self, conv: &DeviceVec, z: &DeviceVec, beta_alpha: &DeviceVec, ssm_a: &DeviceVec, dt_bias: &DeviceVec, norm: &DeviceVec, state: &DeviceVec, out: &DeviceVec, d: DeltaNet);
     /// Read `v` back once the chain has run.
     fn read(&mut self, v: &DeviceVec) {
         self.read_range(v, 0, v.len)

@@ -282,6 +282,8 @@ impl ChainDecoder {
         }
         chain.upload(&x, emb.data());
         let mut rec = chain.begin();
+        // the chunk's vectors are its own: no bind groups kept to hold their memory after it
+        rec.keep_groups(false);
         for l in 0..cfg.n_layers {
             let b = &m.common.blocks[l];
             rec.rmsnorm_rows(&x, &st.attn_norms[l], &xn, t, cfg.rms_eps);
