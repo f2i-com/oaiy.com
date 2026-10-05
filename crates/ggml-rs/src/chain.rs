@@ -215,12 +215,13 @@ pub trait ChainRecorder {
     /// row `r`'s experts `assign[r]` (expert, weight; the routed ones, then the shared one last, as
     /// `Experts::forward` routes them), their weighted outputs summed in that order into `out` (`[rows, hidden]`).
     fn moe_rows(&mut self, experts: &dyn crate::exl3::Experts, x: &DeviceVec, out: &DeviceVec, assign: &[Vec<(usize, f32)>]);
-    /// [`Self::moe_rows`] of one row, its experts routed on the device from the router's logits `logits` (`[routed +
-    /// 1]`, the shared expert's gate last) as [`crate::exl3::route`] routes them, `top_k` of them: no trip to the host
-    /// between a layer's router and its experts. False where the device cannot (and nothing is recorded): the caller
-    /// routes on the host.
-    fn moe_routed(&mut self, experts: &dyn crate::exl3::Experts, x: &DeviceVec, out: &DeviceVec, logits: &DeviceVec, top_k: usize) -> bool {
-        let _ = (experts, x, out, logits, top_k);
+    /// [`Self::moe_rows`] of `rows` rows (a step's one, a check's few), their experts routed on the device from the
+    /// router's logits `logits` (`[rows, routed + 1]`, the shared expert's gate last) as [`crate::exl3::route`] routes
+    /// them, `top_k` of them: no trip to the host between a layer's router and its experts. False where the device
+    /// cannot (and nothing is recorded): the caller routes on the host.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_routed(&mut self, experts: &dyn crate::exl3::Experts, x: &DeviceVec, out: &DeviceVec, logits: &DeviceVec, top_k: usize, rows: usize) -> bool {
+        let _ = (experts, x, out, logits, top_k, rows);
         false
     }
     /// `acc[i] += weights[at] * y[i]` for `i < len`: a weighted sum's term, its weight read from the device (an

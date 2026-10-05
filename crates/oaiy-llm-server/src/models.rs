@@ -812,10 +812,13 @@ impl Models {
             }
             .map_err(Error::Arg)
         };
-        let model = crate::flashnext::load_portable(&spec.path, backends, &packed, &experts)?;
+        let model = crate::flashnext::load_portable(&spec.path, backends, &packed, &experts, o.mtp.contains(&spec.name))?;
         let warm = std::time::Instant::now();
         if model.warm_up() {
-            self.say(format!("{}: its chained steps ready in {:.1} s", spec.name, warm.elapsed().as_secs_f64()));
+            self.say(format!("{}: its chained steps ready in {:.1} s{}", spec.name, warm.elapsed().as_secs_f64(), if model.drafts() { ", drafting with its MTP layer" } else { "" }));
+        }
+        if o.mtp.contains(&spec.name) && !model.drafts() {
+            self.say(format!("{}: its MTP layer is not all on a GPU, so it does not draft", spec.name));
         }
         for (d, g) in gpus.iter().enumerate() {
             let (used, budget) = g.usage();
@@ -1368,7 +1371,7 @@ mod dense_webgpu_timing {
         let experts = |device: usize, _layer: &str, list: Vec<[ggml_rs::exl3::Exl3Data; 3]>| -> oaiy_engine::Result<Box<dyn ggml_rs::exl3::Experts>> {
             gpus[device].exl3_experts_leaving(list, reserve).map_err(oaiy_engine::Error::Arg)
         };
-        let model = crate::flashnext::load_portable(p, backends, &packed, &experts).unwrap();
+        let model = crate::flashnext::load_portable(p, backends, &packed, &experts, false).unwrap();
         let steps: usize = std::env::var("FLASHNEXT_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(48);
         let prompt: Vec<u32> = model.tokenizer.encode("Write a short story about a cat called Moss who lives on a boat.", false).unwrap();
         let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
@@ -1425,6 +1428,331 @@ mod dense_webgpu_timing {
         assert!(after_steps > 0.99 && after_host > 0.99, "{after_steps} {after_host}");
     }
 
+    /// A chained Qwen3.8-Flash-Next check of a few tokens (FLASHNEXT_MODEL) gives each row's logits as steps on the same
+    /// tokens do, bit for bit, and undone past its first rows leaves the state those rows would: a check of four of the
+    /// steps' greedy tokens, rolled back to two, a check of the next three, a step, then checks of 2 to 4 rows each kept
+    /// in part or whole (FLASHNEXT_CHECK_AT steps in; FLASHNEXT_DRAFT: with a draft before the first two); and what checks
+    /// of 2 to 4 rows cost against a step.
+    #[test]
+    #[ignore = "needs WebGPU adapters with room for Qwen3.8-Flash-Next and its checkpoint (FLASHNEXT_MODEL); run with --nocapture"]
+    fn a_flashnext_check_answers_as_its_steps_do() {
+        use std::sync::Arc;
+        let path = std::env::var("FLASHNEXT_MODEL").unwrap_or_else(|_| r"E:\models\Qwen3.8-Flash-Next\exl3-3.05bpw".into());
+        let Ok(b0) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
+        let others: Vec<Arc<ggml_rs_wgpu::WgpuBackend>> = b0.others(None).into_iter().map(Arc::new).collect();
+        let b0 = Arc::new(b0);
+        let gpus: Vec<&ggml_rs_wgpu::WgpuBackend> = std::iter::once(b0.as_ref()).chain(others.iter().map(|g| g.as_ref())).collect();
+        let backends: Vec<Arc<dyn ggml_rs::Backend>> = std::iter::once(Arc::clone(&b0) as Arc<dyn ggml_rs::Backend>).chain(others.iter().map(|g| Arc::clone(g) as Arc<dyn ggml_rs::Backend>)).collect();
+        type Make<'a> = Box<dyn Fn(ggml_rs::exl3::Exl3Data) -> std::result::Result<Arc<dyn ggml_rs::exl3::PackedLinear>, String> + Send + Sync + 'a>;
+        let packed = |device: usize| -> Make<'_> {
+            let b = gpus[device];
+            Box::new(move |d| b.exl3(d))
+        };
+        let p = std::path::Path::new(&path);
+        let reserve = crate::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
+        let experts = |device: usize, _layer: &str, list: Vec<[ggml_rs::exl3::Exl3Data; 3]>| -> oaiy_engine::Result<Box<dyn ggml_rs::exl3::Experts>> {
+            gpus[device].exl3_experts_leaving(list, reserve).map_err(oaiy_engine::Error::Arg)
+        };
+        // FLASHNEXT_DRAFT: with the prediction layer, a draft before each check (it changes nothing a check reads)
+        let drafting = std::env::var_os("FLASHNEXT_DRAFT").is_some();
+        let model = crate::flashnext::load_portable(p, backends, &packed, &experts, drafting).unwrap();
+        let prompt: Vec<u32> = model.tokenizer.encode("Write a short story about a cat called Moss who lives on a boat.", false).unwrap();
+        let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
+        let cosine = |a: &[f32], b: &[f32]| {
+            let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
+            let n = |v: &[f32]| v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            dot / (n(a) * n(b))
+        };
+        let step = |t: u32, kv: &mut llama_rs::KvCache| model.forward(&[t], &model.embed_text(&[t]).unwrap(), kv, None).unwrap();
+        // the steps' greedy tokens g and their logits l (l[i] after g[i])
+        let (mut ks, mut kc) = (model.new_kv_cache(prompt.len() + 512), model.new_kv_cache(prompt.len() + 512));
+        let e = model.embed_text(&prompt).unwrap();
+        let mut g = vec![argmax(model.forward(&prompt, &e, &mut ks, None).unwrap().data())];
+        let _ = model.forward(&prompt, &e, &mut kc, None).unwrap();
+        // FLASHNEXT_CHECK_AT: that many greedy steps on both first
+        let pre: usize = std::env::var("FLASHNEXT_CHECK_AT").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        for _ in 0..pre {
+            let t = *g.last().unwrap();
+            let _ = step(t, &mut kc);
+            g = vec![argmax(step(t, &mut ks).data())];
+        }
+        let mut l: Vec<Vec<f32>> = Vec::new();
+        for i in 0..40 {
+            let out = step(g[i], &mut ks);
+            g.push(argmax(out.data()));
+            l.push(out.data().to_vec());
+        }
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+        let (mut rows_seen, mut exact) = (0, 0);
+        let mut compare = |what: &str, rows: &[ggml_rs::Tensor], from: usize| {
+            for (r, row) in rows.iter().enumerate() {
+                let same_bits = bits(row.data()) == bits(&l[from + r]);
+                rows_seen += 1;
+                exact += same_bits as usize;
+                if !same_bits {
+                    eprintln!("{what} row {r}: cosine {:.6} against step {}, the same greedy token {}", cosine(row.data(), &l[from + r]), from + r, argmax(row.data()) == argmax(&l[from + r]));
+                }
+            }
+        };
+        if drafting {
+            let _ = model.draft_above(&kc, &[g[0]], 3, 0.0);
+        }
+        let a = model.check(&g[0..4], &mut kc).expect("a check of four");
+        compare("check A", &a, 0);
+        model.rollback(&mut kc, 2);
+        assert_eq!(kc.len, prompt.len() + pre + 2, "rolled back to its first two rows");
+        if drafting {
+            let _ = model.draft_above(&kc, &g[1..3], 3, 0.0);
+        }
+        let b = model.check(&g[2..5], &mut kc).expect("a check of three");
+        compare("check B (after the rollback)", &b, 2);
+        let after = step(g[5], &mut kc);
+        assert_eq!(bits(after.data()), bits(&l[5]), "the step after the checks");
+        // a run of checks as drafting makes them: (rows, kept), each from where the last left off
+        let mut at = 6;
+        for (rows, keep) in [(2usize, 2usize), (2, 1), (4, 4), (3, 2), (2, 2), (4, 1), (4, 3), (3, 3), (2, 1), (4, 4)] {
+            let got = model.check(&g[at..at + rows], &mut kc).expect("a check");
+            compare(&format!("check of {rows} keeping {keep} at {at}"), &got, at);
+            model.rollback(&mut kc, keep);
+            at += keep;
+        }
+        eprintln!("{exact} of {rows_seen} check rows a step's bit for bit");
+        assert_eq!(exact, rows_seen, "every check row a step's");
+        // what a check costs: each of 2, 3 and 4 rows, rolled back to its first, against a step
+        let (mut kt, at) = (kc, g[6]);
+        let time = |f: &mut dyn FnMut()| {
+            f();
+            let t = std::time::Instant::now();
+            for _ in 0..8 {
+                f();
+            }
+            t.elapsed().as_secs_f64() * 1e3 / 8.0
+        };
+        let one = time(&mut || {
+            let _ = step(at, &mut kt);
+            kt.len -= 1;
+        });
+        let mut line = format!("a step {one:.1} ms;");
+        for rows in 2..=4usize {
+            let toks: Vec<u32> = (0..rows).map(|i| g[(6 + i) % g.len()]).collect();
+            let ms = time(&mut || {
+                let _ = model.check(&toks, &mut kt).unwrap();
+                model.rollback(&mut kt, 1);
+                kt.len -= 1;
+            });
+            line += &format!(" a check of {rows} {ms:.1} ms ({:.2} steps);", ms / one);
+        }
+        eprintln!("{line}");
+    }
+
+    /// Qwen3.8-Flash-Next drafting with its multi-token-prediction layer (FLASHNEXT_MODEL) answers as its steps do: greedy
+    /// decoding as the server's loop drafts (three drafts a check, each taken while it is the token picked, the check's
+    /// rows past it undone) gives the steps' tokens, every logits row it used a step's on the same tokens; and its time
+    /// a token against steps'.
+    #[test]
+    #[ignore = "needs WebGPU adapters with room for Qwen3.8-Flash-Next and its layer (FLASHNEXT_MODEL); run with --nocapture"]
+    fn a_drafting_flashnext_answers_as_its_steps_do() {
+        use std::sync::Arc;
+        let path = std::env::var("FLASHNEXT_MODEL").unwrap_or_else(|_| r"E:\models\Qwen3.8-Flash-Next\exl3-3.05bpw".into());
+        let Ok(b0) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
+        let others: Vec<Arc<ggml_rs_wgpu::WgpuBackend>> = b0.others(None).into_iter().map(Arc::new).collect();
+        let b0 = Arc::new(b0);
+        let gpus: Vec<&ggml_rs_wgpu::WgpuBackend> = std::iter::once(b0.as_ref()).chain(others.iter().map(|g| g.as_ref())).collect();
+        let backends: Vec<Arc<dyn ggml_rs::Backend>> = std::iter::once(Arc::clone(&b0) as Arc<dyn ggml_rs::Backend>).chain(others.iter().map(|g| Arc::clone(g) as Arc<dyn ggml_rs::Backend>)).collect();
+        type Make<'a> = Box<dyn Fn(ggml_rs::exl3::Exl3Data) -> std::result::Result<Arc<dyn ggml_rs::exl3::PackedLinear>, String> + Send + Sync + 'a>;
+        let packed = |device: usize| -> Make<'_> {
+            let b = gpus[device];
+            Box::new(move |d| b.exl3(d))
+        };
+        let p = std::path::Path::new(&path);
+        let reserve = crate::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
+        let experts = |device: usize, _layer: &str, list: Vec<[ggml_rs::exl3::Exl3Data; 3]>| -> oaiy_engine::Result<Box<dyn ggml_rs::exl3::Experts>> {
+            gpus[device].exl3_experts_leaving(list, reserve).map_err(oaiy_engine::Error::Arg)
+        };
+        let model = crate::flashnext::load_portable(p, backends, &packed, &experts, true).unwrap();
+        assert!(model.warm_up() && model.drafts(), "the layer chained");
+        let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
+        let cosine = |a: &[f32], b: &[f32]| {
+            let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
+            let n = |v: &[f32]| v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            dot / (n(a) * n(b))
+        };
+        let gen: usize = std::env::var("FLASHNEXT_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(160);
+        for prompt in [
+            "<|im_start|>user\nList ten facts about the planet Mars, one a line.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+            "<|im_start|>user\nWrite a short story about a cat called Moss who lives on a boat.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        ] {
+            let pt: Vec<u32> = model.tokenizer.encode(prompt, false).unwrap();
+            let e = model.embed_text(&pt).unwrap();
+            let step = |t: u32, kv: &mut llama_rs::KvCache| model.forward(&[t], &model.embed_text(&[t]).unwrap(), kv, None).unwrap();
+            // plain steps
+            let mut kv = model.new_kv_cache(pt.len() + gen + 16);
+            let mut l = model.forward(&pt, &e, &mut kv, None).unwrap();
+            let t0 = std::time::Instant::now();
+            let mut plain = Vec::new();
+            for _ in 0..gen {
+                let next = argmax(l.data());
+                plain.push(next);
+                l = step(next, &mut kv);
+            }
+            let plain_s = t0.elapsed().as_secs_f64();
+            // drafting, as the server's loop does it
+            let mut kv = model.new_kv_cache(pt.len() + gen + 16);
+            let mut logits = model.forward(&pt, &e, &mut kv, None).unwrap().data().to_vec();
+            let mut seq = pt.clone();
+            let mut used: Vec<Vec<f32>> = Vec::new();
+            // where each logits row came from: a step (0), a check's first row (1), a check's row r + 1 (r + 2)
+            let mut from: Vec<usize> = Vec::new();
+            let mut src = 0usize;
+            let mut pending: std::collections::VecDeque<(u32, ggml_rs::Tensor)> = Default::default();
+            let (mut check_rows, mut checked, mut taken) = (0usize, 0usize, 0usize);
+            let t0 = std::time::Instant::now();
+            while seq.len() - pt.len() < gen {
+                let next = argmax(&logits);
+                used.push(logits.clone());
+                from.push(src);
+                let ran = pending.front().is_some_and(|(d, _)| *d == next);
+                if !ran && !pending.is_empty() {
+                    model.rollback(&mut kv, check_rows - pending.len());
+                    pending.clear();
+                }
+                seq.push(next);
+                if ran {
+                    logits = pending.pop_front().unwrap().1.data().to_vec();
+                    taken += 1;
+                    src += 1;
+                    continue;
+                }
+                let drafted = model.draft(&kv, &seq[seq.len().saturating_sub(crate::flashnext::CHECK_ROWS + 1)..], 3).filter(|d| !d.is_empty());
+                match drafted.and_then(|d| {
+                    let rows: Vec<u32> = std::iter::once(next).chain(d.iter().copied()).collect();
+                    Some((d, model.check(&rows, &mut kv)?))
+                }) {
+                    Some((d, mut rows)) => {
+                        check_rows = rows.len();
+                        checked += d.len();
+                        logits = rows.remove(0).data().to_vec();
+                        pending = d.into_iter().zip(rows).collect();
+                        src = 1;
+                    }
+                    None => {
+                        logits = step(next, &mut kv).data().to_vec();
+                        src = 0;
+                    }
+                }
+            }
+            if !pending.is_empty() {
+                model.rollback(&mut kv, check_rows - pending.len());
+            }
+            let draft_s = t0.elapsed().as_secs_f64();
+            let out = &seq[pt.len()..];
+            let same = out.iter().zip(&plain).take_while(|(a, b)| a == b).count();
+            // the logits it used against steps on its own tokens
+            let mut kv = model.new_kv_cache(pt.len() + gen + 16);
+            let mut l = model.forward(&pt, &e, &mut kv, None).unwrap();
+            let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+            let (mut worst, mut exact) = (1.0f64, 0usize);
+            let mut each = Vec::new();
+            for (i, &t) in out.iter().enumerate() {
+                let c = cosine(l.data(), &used[i]);
+                worst = worst.min(c);
+                exact += (bits(l.data()) == bits(&used[i])) as usize;
+                each.push((c, i, from[i]));
+                l = step(t, &mut kv);
+            }
+            each.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            if exact < out.len() {
+                eprintln!("  the worst rows (cosine, token, from: 0 a step, 1 a check's first row, r + 1 its row r): {:?}", &each[..6.min(each.len())]);
+            }
+            eprintln!(
+                "{gen} tokens: steps {:.1} ms a token, drafting {:.1} ms ({taken} of {checked} drafts taken); the same tokens for {same}; {exact} logits rows a step's bit for bit, the worst cosine {worst:.6}",
+                plain_s * 1e3 / gen as f64,
+                draft_s * 1e3 / gen as f64
+            );
+            eprintln!("  {}", model.tokenizer.decode(out).chars().take(160).collect::<String>().replace('\n', " "));
+            assert_eq!(same, gen, "the same tokens");
+            assert_eq!(exact, out.len(), "every logits row a step's, bit for bit");
+        }
+    }
+
+    /// How often Qwen3.8-Flash-Next's multi-token-prediction layer (FLASHNEXT_MODEL) drafts what its trunk then picks:
+    /// the trunk's greedy continuation of two prompts, then teacher-forced, the layer's three drafts at each position
+    /// against the tokens after (each where the ones before it were), with the probability the layer gives each; what a
+    /// draft costs, and the GPUs' memory with the layer.
+    #[test]
+    #[ignore = "a measurement; needs WebGPU adapters with room for Qwen3.8-Flash-Next and its layer; run with --nocapture"]
+    fn measure_flashnext_mtp_acceptance() {
+        use std::sync::Arc;
+        let path = std::env::var("FLASHNEXT_MODEL").unwrap_or_else(|_| r"E:\models\Qwen3.8-Flash-Next\exl3-3.05bpw".into());
+        let Ok(b0) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
+        let others: Vec<Arc<ggml_rs_wgpu::WgpuBackend>> = b0.others(None).into_iter().map(Arc::new).collect();
+        let b0 = Arc::new(b0);
+        let gpus: Vec<&ggml_rs_wgpu::WgpuBackend> = std::iter::once(b0.as_ref()).chain(others.iter().map(|g| g.as_ref())).collect();
+        let backends: Vec<Arc<dyn ggml_rs::Backend>> = std::iter::once(Arc::clone(&b0) as Arc<dyn ggml_rs::Backend>).chain(others.iter().map(|g| Arc::clone(g) as Arc<dyn ggml_rs::Backend>)).collect();
+        type Make<'a> = Box<dyn Fn(ggml_rs::exl3::Exl3Data) -> std::result::Result<Arc<dyn ggml_rs::exl3::PackedLinear>, String> + Send + Sync + 'a>;
+        let packed = |device: usize| -> Make<'_> {
+            let b = gpus[device];
+            Box::new(move |d| b.exl3(d))
+        };
+        let p = std::path::Path::new(&path);
+        let reserve = crate::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
+        let experts = |device: usize, _layer: &str, list: Vec<[ggml_rs::exl3::Exl3Data; 3]>| -> oaiy_engine::Result<Box<dyn ggml_rs::exl3::Experts>> {
+            gpus[device].exl3_experts_leaving(list, reserve).map_err(oaiy_engine::Error::Arg)
+        };
+        let model = crate::flashnext::load_portable(p, backends, &packed, &experts, true).unwrap();
+        for (d, g) in gpus.iter().enumerate() {
+            let (used, budget) = g.usage();
+            eprintln!("GPU {d}: {:.1} GB of {:.1} GB", used as f64 / 1e9, budget as f64 / 1e9);
+        }
+        assert!(model.drafts(), "the layer chained");
+        let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
+        let prompts = [
+            "<|im_start|>user\nExplain how a refrigerator keeps food cold, in a few short paragraphs.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+            "<|im_start|>user\nWrite a Python function that returns the n-th Fibonacci number iteratively, with a docstring.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        ];
+        let gen = 96usize;
+        let (mut hit, mut tried) = ([0usize; 3], [0usize; 3]);
+        let (mut drafting, mut drafts_made) = (0f64, 0usize);
+        for prompt in prompts {
+            let pt: Vec<u32> = model.tokenizer.encode(prompt, false).unwrap();
+            let mut kv = model.new_kv_cache(pt.len() + gen + 16);
+            let mut l = model.forward(&pt, &model.embed_text(&pt).unwrap(), &mut kv, None).unwrap();
+            let mut seq = pt.clone();
+            // the trunk's greedy tokens, each step's drafts made before the next step
+            let mut made: Vec<Vec<u32>> = Vec::new();
+            for _ in 0..gen {
+                let next = argmax(l.data());
+                seq.push(next);
+                let t = std::time::Instant::now();
+                // every draft the layer makes, however unlikely
+                let d = model.draft_above(&kv, &seq[seq.len() - 8..], 3, 0.0).expect("drafts after a step");
+                drafting += t.elapsed().as_secs_f64();
+                drafts_made += d.len();
+                made.push(d);
+                l = model.forward(&[next], &model.embed_text(&[next]).unwrap(), &mut kv, None).unwrap();
+            }
+            // drafts made with token i sampled guess tokens i + 1, i + 2, i + 3
+            let out = &seq[pt.len()..];
+            for (i, d) in made.iter().enumerate() {
+                for (j, &dj) in d.iter().enumerate() {
+                    if i + 1 + j >= out.len() {
+                        break;
+                    }
+                    tried[j] += 1;
+                    if dj != out[i + 1 + j] {
+                        break;
+                    }
+                    hit[j] += 1;
+                }
+            }
+            eprintln!("{}", model.tokenizer.decode(out).chars().take(200).collect::<String>().replace('\n', " "));
+        }
+        let rates: Vec<String> = (0..3).map(|j| format!("{:.2} ({} of {})", hit[j] as f64 / tried[j].max(1) as f64, hit[j], tried[j])).collect();
+        eprintln!("drafts taken, by depth (each where the ones before it were): {}", rates.join(", "));
+        eprintln!("a draft {:.2} ms", drafting * 1e3 / drafts_made.max(1) as f64);
+        assert!(hit[0] * 2 > tried[0], "the first draft is the trunk's token at least half the time");
+    }
+
     /// Where a chained Qwen3.8-Flash-Next run's time goes (FLASHNEXT_MODEL): a prompt's chunk of 512 and decode steps,
     /// each kernel's GPU time with OAIY_CHAIN_PROFILE set (`ggml_rs_wgpu::profile::take_kernels`).
     #[test]
@@ -1448,7 +1776,7 @@ mod dense_webgpu_timing {
         let experts = |device: usize, _layer: &str, list: Vec<[ggml_rs::exl3::Exl3Data; 3]>| -> oaiy_engine::Result<Box<dyn ggml_rs::exl3::Experts>> {
             gpus[device].exl3_experts_leaving(list, reserve).map_err(oaiy_engine::Error::Arg)
         };
-        let model = crate::flashnext::load_portable(p, backends, &packed, &experts).unwrap();
+        let model = crate::flashnext::load_portable(p, backends, &packed, &experts, false).unwrap();
         let tokens: Vec<u32> = (0..1100u32).map(|i| 1000 + (i * 7919) % 20000).collect();
         let mut kv = model.new_kv_cache(2048);
         let report = |what: &str, wall: f64| {
@@ -1479,7 +1807,28 @@ mod dense_webgpu_timing {
             }
             next = l.data().iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
         }
-        assert_eq!(model.chain_runs(), 7, "every run chained");
+        // runs of a few rows (what a check of drafts would be): each a mean of 6 after one to warm
+        let mut runs = 7;
+        for rows in [1usize, 2, 3, 4, 8] {
+            let mut wall = 0.0;
+            for rep in 0..7 {
+                let toks: Vec<u32> = (0..rows as u32).map(|i| 2000 + i * 31 + rep * 7).collect();
+                let e = model.embed_text(&toks).unwrap();
+                let _ = (ggml_rs_wgpu::profile::take_kernels(), ggml_rs_wgpu::profile::take_line());
+                let t = Instant::now();
+                let _ = model.forward(&toks, &e, &mut kv, None).unwrap();
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                if rep > 0 {
+                    wall += ms;
+                }
+                if rep == 6 && rows == 4 {
+                    report("a run of 4 rows", ms);
+                }
+                runs += 1;
+            }
+            eprintln!("a run of {rows} rows: {:.1} ms", wall / 6.0);
+        }
+        assert_eq!(model.chain_runs(), runs, "every run chained");
     }
 
     /// How often a Qwen3.5 GGUF's multi-token-prediction layer (QWEN35_MODEL) drafts the token its trunk then picks:

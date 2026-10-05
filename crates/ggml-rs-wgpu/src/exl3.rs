@@ -299,7 +299,7 @@ fn code_in(q0: u32, q1: u32, q2: u32, q3: u32, at: u32) -> u32 {{
 
 fn decode_at(code: u32) -> f32 {{
     let hx = (code & 0xffffu) * 0x83dcd12du;
-    let sum = (hx & 255u) + ((hx >> 8u) & 255u) + ((hx >> 16u) & 255u) + (hx >> 24u);
+    let sum = dot4U8Packed(hx, 0x01010101u);
     return round_f16(f32(1024u + sum) * 0.00676727294921875 - 10.3828125);
 }}
 
@@ -395,7 +395,7 @@ fn code_at(r: u32, c: u32, tw: u32) -> vec3<u32> {
 fn decode_at(a: u32, b: u32, sh: u32) -> f32 {
     let code = select((a << (32u - sh)) | (b >> sh), a >> (sh - 32u), sh >= 32u);
     let hx = (code & 0xffffu) * 0x83dcd12du;
-    let sum = (hx & 255u) + ((hx >> 8u) & 255u) + ((hx >> 16u) & 255u) + (hx >> 24u);
+    let sum = dot4U8Packed(hx, 0x01010101u);
     return round_f16(f32(1024u + sum) * 0.00676727294921875 - 10.3828125);
 }
 
@@ -474,7 +474,7 @@ fn weight(r: u32, c: u32) -> f32 {
         code = (a << (32u - sh)) | (b >> sh);
     }
     let hx = (code & 0xffffu) * 0x83dcd12du;
-    let sum = (hx & 255u) + ((hx >> 8u) & 255u) + ((hx >> 16u) & 255u) + (hx >> 24u);
+    let sum = dot4U8Packed(hx, 0x01010101u);
     return round_f16(f32(1024u + sum) * 0.00676727294921875 - 10.3828125);
 }
 
@@ -913,7 +913,7 @@ fn weight(r: u32, c: u32, tw: u32, buf: u32) -> f32 {{
         code = (a << (32u - sh)) | (b >> sh);
     }}
     let hx = (code & 0xffffu) * 0x83dcd12du;
-    let sum = (hx & 255u) + ((hx >> 8u) & 255u) + ((hx >> 16u) & 255u) + (hx >> 24u);
+    let sum = dot4U8Packed(hx, 0x01010101u);
     return round_f16(f32(1024u + sum) * 0.00676727294921875 - 10.3828125);
 }}
 
@@ -972,6 +972,217 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 "#,
         xs_len = rows * 4,
     )
+}
+
+/// The most rows [`g_few`] takes a block.
+pub(crate) const FEW_MAX: usize = 8;
+
+/// The matmul for a few rows of one matrix (a check of drafted tokens, a short chunk): [`g_mm_source`]'s lanes, each
+/// decoding its eight codes of a tile once and summing them against every row's inputs in the order the one-row
+/// kernel sums them (so each row's sums are that kernel's bit for bit). A workgroup a (tile column, block and split);
+/// a block is `rows` jobs of one matrix from `order` (its unused places [`NONE`]), each job's partial sums to `part[(j
+/// * splits + s) * n..]` as [`g_mm_source`]'s. `p[0]`: n, k, tile words, splits; `p[1]`: words a matrix, the pass's
+/// first block.
+pub(crate) fn g_few(rows: usize) -> &'static str {
+    static SOURCES: [std::sync::OnceLock<String>; FEW_MAX - 1] = [const { std::sync::OnceLock::new() }; FEW_MAX - 1];
+    assert!((2..=FEW_MAX).contains(&rows), "a block of 2 to {FEW_MAX} rows");
+    SOURCES[rows - 2].get_or_init(|| g_few_source(rows))
+}
+
+fn g_few_source(rows: usize) -> String {
+    let each = |f: &dyn Fn(usize) -> String| (0..rows).map(f).collect::<Vec<_>>().join("\n");
+    let ids = each(&|i| format!("    let j{i} = order[blk * {rows}u + {i}u];"));
+    let regs = each(&|i| format!("    var lo{i} = 0.0;\n    var hi{i} = 0.0;"));
+    let sums = each(&|i| {
+        format!(
+            "        if (j{i} != 0xffffffffu) {{
+            let xo = (j{i} * k + kt * 16u + rb) / 2u;
+            let xa = x2[xo];
+            let xb = x2[xo + 4u];
+            lo{i} = lo{i} + xa.x * c0;
+            lo{i} = lo{i} + xa.y * c1;
+            lo{i} = lo{i} + xb.x * c2;
+            lo{i} = lo{i} + xb.y * c3;
+            hi{i} = hi{i} + xa.x * c4;
+            hi{i} = hi{i} + xa.y * c5;
+            hi{i} = hi{i} + xb.x * c6;
+            hi{i} = hi{i} + xb.y * c7;
+        }}"
+        )
+    });
+    let reds = each(&|i| format!("    red[{i}u * 256u + t] = vec2<f32>(lo{i}, hi{i});"));
+    let outs = each(&|i| format!("        if (r == {i}u) {{ j = j{i}; }}"));
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read> words: array<u32>;
+@group(0) @binding(1) var<storage, read> x2: array<vec2<f32>>;
+@group(0) @binding(2) var<storage, read> jobs: array<u32>;
+@group(0) @binding(3) var<storage, read> order: array<u32>;
+@group(0) @binding(6) var<storage, read_write> part: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> red: array<vec2<f32>, {red_len}>;
+// every code's place in a tile (`place`), the workgroup's threads one each: the same in every tile
+var<workgroup> places: array<u32, 256>;
+var<workgroup> firsts: array<u32, 32>;
+
+fn round_f16(v: f32) -> f32 {{
+    let b = bitcast<u32>(v);
+    return bitcast<f32>((b + 0xfffu + ((b >> 13u) & 1u)) & 0xffffe000u);
+}}
+
+fn window(i: u32, tw: u32) -> vec2<u32> {{
+    let nw = tw / 2u;
+    var end = (i + 1u) * (tw / 16u);
+    if (tw % 16u == 8u) {{
+        end = end + (i + 1u) / 2u;
+    }}
+    let start = (end + nw * 32u - 16u) % (nw * 32u);
+    return vec2<u32>(start / 32u, 48u - start % 32u);
+}}
+
+fn place(i: u32, tw: u32, w0: u32) -> u32 {{
+    let nw = tw / 2u;
+    let wd = window(i, tw);
+    return ((wd.x + nw - w0) % nw) | (wd.y << 8u);
+}}
+
+fn code_in(q0: u32, q1: u32, q2: u32, q3: u32, at: u32) -> u32 {{
+    let d = at & 3u;
+    let sh = at >> 8u;
+    let a = select(select(q0, q1, d == 1u), q2, d >= 2u);
+    let b = select(select(q1, q2, d == 1u), q3, d >= 2u);
+    return select((a << (32u - sh)) | (b >> sh), a >> (sh - 32u), sh >= 32u);
+}}
+
+fn decode_at(code: u32) -> f32 {{
+    let hx = (code & 0xffffu) * 0x83dcd12du;
+    let sum = dot4U8Packed(hx, 0x01010101u);
+    return round_f16(f32(1024u + sum) * 0.00676727294921875 - 10.3828125);
+}}
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {{
+    let n = p[0].x;
+    let k = p[0].y;
+    let tw = p[0].z;
+    let splits = p[0].w;
+    let ntiles = n / 16u;
+    let nt = wg.x + wg.y * 65535u;
+    if (nt >= ntiles) {{
+        return;
+    }}
+    let blk = p[1].y + wg.z / splits;
+    let s = wg.z % splits;
+{ids}
+    let base = jobs[2u * j0] * p[1].x;
+    let kts = k / 16u;
+    let per = (kts + splits - 1u) / splits;
+    let ks = s * per;
+    let ke = min(kts, ks + per);
+    let warp = t / 32u;
+    let l = t % 32u;
+    let nw = tw / 2u;
+    let rb = 2u * (l % 4u);
+    let first = window(8u * (t / 8u), tw).x;
+    places[t] = place(t, tw, first);
+    if (t % 8u == 0u) {{
+        firsts[t / 8u] = first;
+    }}
+    workgroupBarrier();
+    let w0 = firsts[l];
+    let o1 = (w0 + 1u) % nw;
+    let o2 = (w0 + 2u) % nw;
+    let o3 = (w0 + 3u) % nw;
+    let a0 = places[8u * l];
+    let a1 = places[8u * l + 1u];
+    let a2 = places[8u * l + 2u];
+    let a3 = places[8u * l + 3u];
+    let a4 = places[8u * l + 4u];
+    let a5 = places[8u * l + 5u];
+    let a6 = places[8u * l + 6u];
+    let a7 = places[8u * l + 7u];
+{regs}
+    for (var kt = ks + warp; kt < ke; kt = kt + 8u) {{
+        let tile = base + (kt * ntiles + nt) * nw;
+        let q0 = words[tile + w0];
+        let q1 = words[tile + o1];
+        let q2 = words[tile + o2];
+        let q3 = words[tile + o3];
+        let c0 = decode_at(code_in(q0, q1, q2, q3, a0));
+        let c1 = decode_at(code_in(q0, q1, q2, q3, a1));
+        let c2 = decode_at(code_in(q0, q1, q2, q3, a2));
+        let c3 = decode_at(code_in(q0, q1, q2, q3, a3));
+        let c4 = decode_at(code_in(q0, q1, q2, q3, a4));
+        let c5 = decode_at(code_in(q0, q1, q2, q3, a5));
+        let c6 = decode_at(code_in(q0, q1, q2, q3, a6));
+        let c7 = decode_at(code_in(q0, q1, q2, q3, a7));
+{sums}
+    }}
+{reds}
+    workgroupBarrier();
+    // row r's column c: each warp's four lanes of it, the warps in order (as the one-row kernel's `column`)
+    if (t < {rows}u * 16u) {{
+        let r = t / 16u;
+        let c = t % 16u;
+        var j = 0xffffffffu;
+{outs}
+        if (j != 0xffffffffu) {{
+            let half = c / 8u;
+            let cl = c % 8u;
+            var total = 0.0;
+            for (var w = 0u; w < 8u; w = w + 1u) {{
+                for (var q = 0u; q < 4u; q = q + 1u) {{
+                    let v = red[r * 256u + w * 32u + cl * 4u + q];
+                    total = total + select(v.x, v.y, half == 1u);
+                }}
+            }}
+            part[(j * splits + s) * n + nt * 16u + c] = total;
+        }}
+    }}
+}}
+"#,
+        red_len = rows * 256,
+    )
+}
+
+/// What the EXL3 projections chained for a few rows share on a device (their bind groups kept, as a step's are): the
+/// job list `[0, r]` and the order `r` of [`FEW_MAX`] rows, and the transformed inputs, partial sums and unmapped
+/// outputs of a projection of up to [`FewScratch::K`] inputs, [`FewScratch::PART`] partial sums a row (outputs times
+/// splits) and [`FewScratch::N`] outputs.
+pub(crate) struct FewScratch {
+    pub jobs: DeviceVec,
+    pub order: DeviceVec,
+    pub xh: DeviceVec,
+    pub part: DeviceVec,
+    pub yt: DeviceVec,
+}
+
+impl FewScratch {
+    pub const K: usize = 16384;
+    pub const PART: usize = 1 << 18;
+    pub const N: usize = 1 << 18;
+
+    pub(crate) fn new(b: &WgpuBackend) -> Self {
+        let rows = FEW_MAX as u32;
+        FewScratch {
+            jobs: u32_vec(b, &(0..rows).flat_map(|r| [0, r]).collect::<Vec<_>>()),
+            order: u32_vec(b, &(0..rows).collect::<Vec<_>>()),
+            xh: ggml_rs::DeviceChain::vec(b, FEW_MAX * Self::K),
+            part: ggml_rs::DeviceChain::vec(b, FEW_MAX * Self::PART),
+            yt: ggml_rs::DeviceChain::vec(b, FEW_MAX * Self::N),
+        }
+    }
+
+    /// Whether a projection of `k` inputs, `n` outputs and `splits` fits.
+    pub(crate) fn fits(k: usize, n: usize, splits: usize) -> bool {
+        k <= Self::K && n <= Self::N && n * splits <= Self::PART
+    }
+}
+
+/// The pipeline name of [`g_few`]'s kernel for blocks of `rows`.
+pub(crate) fn few_name(rows: usize) -> &'static str {
+    ["exl3-few-2", "exl3-few-3", "exl3-few-4", "exl3-few-5", "exl3-few-6", "exl3-few-7", "exl3-few-8"][rows - 2]
 }
 
 /// An unused place in a block of [`g_many`]'s job order.
@@ -1191,11 +1402,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
-/// A decode step's routing on the GPU, as `ggml_rs::exl3::route` routes (one workgroup): the top `p[0].y` of the
-/// router's `p[0].x` routed logits by logit, a tie to the lower index (each logit placed by how many beat it), their
-/// weights a softmax among themselves summed in their order, the shared expert (the logit after them) weighted by its
-/// gate's sigmoid; then one row's jobs as the grouped experts take them: gate and up `[2e, 0, 2e + 1, 0]` an expert
-/// (`jobs`), the weights `w` (the top k's, the shared one's last). `p[0]`: routed (at most 1024), k (at most 32).
+/// A decode step's routing on the GPU, as `ggml_rs::exl3::route` routes (a workgroup a row `r`): the top `p[0].y` of
+/// the router's `p[0].x` routed logits by logit, a tie to the lower index (each logit placed by how many beat it),
+/// their weights a softmax among themselves summed in their order, the shared expert (the logit after them) weighted
+/// by its gate's sigmoid; then the row's jobs as the grouped experts take them: gate and up `[2e, r, 2e + 1, r]` an
+/// expert (`jobs`, from pair `r k`), the weights `w` (from `r (k + 1)`: the top k's, the shared one's last). `p[0]`:
+/// routed (at most 1024), k (at most 32).
 const ROUTE: &str = r#"
 @group(0) @binding(0) var<storage, read> logits: array<f32>;
 @group(0) @binding(6) var<storage, read_write> jobs: array<u32>;
@@ -1222,15 +1434,17 @@ fn beaten(v: f32, i: u32, quads: u32) -> u32 {
 }
 
 @compute @workgroup_size(256)
-fn main(@builtin(local_invocation_index) t: u32) {
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
     let n = p[0].x;
     let k = p[0].y;
+    let r = wg.x;
+    let lr = r * (n + 1u);
     let quads = (n + 3u) / 4u;
     // past the last logit, -inf (beats none)
     for (var i = t; i < 4u * quads; i += 256u) {
         var v = bitcast<f32>(0xff800000u);
         if (i < n) {
-            v = logits[i];
+            v = logits[lr + i];
         }
         l[i] = v;
         l4[i / 4u][i % 4u] = v;
@@ -1251,19 +1465,20 @@ fn main(@builtin(local_invocation_index) t: u32) {
         }
         for (var j = 0u; j < k; j++) {
             let e = top[j];
-            w[j] = exp(l[e] - mx) / sum;
-            jobs[4u * j] = 2u * e;
-            jobs[4u * j + 1u] = 0u;
-            jobs[4u * j + 2u] = 2u * e + 1u;
-            jobs[4u * j + 3u] = 0u;
+            w[r * (k + 1u) + j] = exp(l[e] - mx) / sum;
+            let at = 4u * (r * k + j);
+            jobs[at] = 2u * e;
+            jobs[at + 1u] = r;
+            jobs[at + 2u] = 2u * e + 1u;
+            jobs[at + 3u] = r;
         }
-        w[k] = 1.0 / (1.0 + exp(-logits[n]));
+        w[r * (k + 1u) + k] = 1.0 / (1.0 + exp(-logits[lr + n]));
     }
 }
 "#;
 
-/// The down projections' jobs of a routed row from its gate and up jobs ([`ROUTE`]'s): expert `e`'s on hidden row
-/// `j`, `[e, j]`. `p[0]`: k.
+/// The down projections' jobs of routed rows from their gate and up jobs ([`ROUTE`]'s): pair `j`'s expert `e` on
+/// hidden row `j`, `[e, j]`. `p[0]`: the pairs (rows times k).
 const DOWN_JOBS: &str = r#"
 @group(0) @binding(0) var<storage, read> gu: array<u32>;
 @group(0) @binding(6) var<storage, read_write> jobs: array<u32>;
@@ -1271,9 +1486,9 @@ const DOWN_JOBS: &str = r#"
 
 @compute @workgroup_size(64)
 fn main(@builtin(local_invocation_index) t: u32) {
-    if (t < p[0].x) {
-        jobs[2u * t] = gu[4u * t] / 2u;
-        jobs[2u * t + 1u] = t;
+    for (var j = t; j < p[0].x; j += 64u) {
+        jobs[2u * j] = gu[4u * j] / 2u;
+        jobs[2u * j + 1u] = j;
     }
 }
 "#;
@@ -1293,7 +1508,7 @@ struct Group {
 }
 
 /// A decode step's scratch: one row, `top_k` experts (the bind groups of a step made once).
-struct Step {
+pub(crate) struct Step {
     top_k: usize,
     jobs_gu: DeviceVec,
     jobs_d: DeviceVec,
@@ -1324,7 +1539,6 @@ pub struct Exl3MoeGrouped {
     gu: Group,
     down: Group,
     shared: [Exl3Gpu; 3],
-    step: Mutex<Option<Arc<Step>>>,
 }
 
 impl std::fmt::Debug for Exl3MoeGrouped {
@@ -1405,19 +1619,19 @@ impl Exl3MoeGrouped {
             return Ok(None);
         }
         // the routed groups' bytes stay counted as long as the layer lives
-        Ok(Some(Exl3MoeGrouped { b: b.clone(), routed: routed.len(), hidden, ff, gu, down, shared, step: Mutex::new(None) }))
+        Ok(Some(Exl3MoeGrouped { b: b.clone(), routed: routed.len(), hidden, ff, gu, down, shared }))
     }
 
     pub(crate) fn is_on(&self, gpu: &Arc<Gpu>) -> bool {
         Arc::ptr_eq(&self.b.gpu, gpu)
     }
 
-    /// Scratch for `rows` rows of `top_k` experts, from `vec`: a step's (one row) the groups' splits, a prompt's (each
-    /// expert's rows in blocks) one split.
-    fn scratch(&self, vec: &mut dyn FnMut(usize) -> DeviceVec, rows: usize, top_k: usize) -> Step {
+    /// Scratch for `rows` rows of `top_k` experts, from `vec`: each job one row (`one`: a step's, a check's) the groups'
+    /// splits, a prompt's (each expert's rows in blocks) one split.
+    fn scratch(&self, vec: &mut dyn FnMut(usize) -> DeviceVec, rows: usize, top_k: usize, one: bool) -> Step {
         let (h, f) = (self.hidden, self.ff);
         let pairs = rows * top_k;
-        let (sgu, sd) = if rows > 1 { (1, 1) } else { (self.gu.splits as usize, self.down.splits as usize) };
+        let (sgu, sd) = if one { (self.gu.splits as usize, self.down.splits as usize) } else { (1, 1) };
         Step {
             top_k,
             jobs_gu: vec(4 * pairs),
@@ -1437,14 +1651,16 @@ impl Exl3MoeGrouped {
         }
     }
 
-    /// A step's scratch (one row), kept so its bind groups are.
-    fn step(&self, top_k: usize) -> Arc<Step> {
-        let mut s = self.step.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(st) = s.as_ref().filter(|st| st.top_k == top_k) {
+    /// The kept scratch of `rows` routed rows (a step's one, a check's few), each job one row: one for every layer of
+    /// this shape on the device (a layer's experts are done before the next layer's start), its bind groups kept.
+    fn step(&self, rows: usize, top_k: usize) -> Arc<Step> {
+        let key = [rows, top_k, self.hidden, self.ff, self.gu.splits as usize, self.down.splits as usize];
+        let mut s = self.b.gpu.moe_steps.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((_, st)) = s.iter().find(|(k, _)| *k == key) {
             return Arc::clone(st);
         }
-        let st = Arc::new(self.scratch(&mut |n| self.b.vec(n), 1, top_k));
-        *s = Some(Arc::clone(&st));
+        let st = Arc::new(self.scratch(&mut |n| self.b.vec(n), rows, top_k, true));
+        s.push((key, Arc::clone(&st)));
         st
     }
 
@@ -1504,7 +1720,7 @@ impl Exl3MoeGrouped {
         let b = rec.backend().clone();
         // a step's one row: the kept scratch (its bind groups kept); else this call's (from the pool, given back when
         // the recording has run)
-        let st = if rows == 1 && rec.keeps() { self.step(top_k) } else { Arc::new(self.scratch(&mut |n| rec.scratch(n), rows, top_k)) };
+        let st = if rows == 1 && rec.keeps() { self.step(1, top_k) } else { Arc::new(self.scratch(&mut |n| rec.scratch(n), rows, top_k, rows == 1)) };
         let up = |v: &DeviceVec, data: &[u32]| DeviceChain::upload(&b, v, &data.iter().map(|&u| f32::from_bits(u)).collect::<Vec<_>>());
         up(&st.jobs_gu, &jobs_gu);
         up(&st.jobs_d, &jobs_d);
@@ -1520,20 +1736,22 @@ impl Exl3MoeGrouped {
         self.run(rec, &st, x, out, rows, orders.as_ref().map(|((g, gn), (d, dn))| ((g, *gn), (d, *dn))));
     }
 
-    /// One row's experts routed on the GPU from the router's `logits` (`[routed + 1]`) and recorded into `out` (see
-    /// `ChainRecorder::moe_routed`): [`ROUTE`] writes the step's jobs and weights where [`Self::record`] uploads them.
-    pub(crate) fn record_routed(&self, rec: &mut crate::chain::Recorder<'_>, x: &DeviceVec, out: &DeviceVec, logits: &DeviceVec, top_k: usize) -> bool {
-        if self.routed > 1024 || top_k == 0 || top_k > 32.min(self.routed) || logits.len < self.routed + 1 {
+    /// `rows` rows' experts (a step's one, a check's few) routed on the GPU from the router's `logits` (`[rows, routed +
+    /// 1]`) and recorded into `out` (see `ChainRecorder::moe_routed`): [`ROUTE`] writes the jobs and weights where
+    /// [`Self::record`] uploads them, each job one row (so each row's sums are a step's).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_routed(&self, rec: &mut crate::chain::Recorder<'_>, x: &DeviceVec, out: &DeviceVec, logits: &DeviceVec, top_k: usize, rows: usize) -> bool {
+        if self.routed > 1024 || top_k == 0 || top_k > 32.min(self.routed) || rows == 0 || rows > 64 || logits.len < rows * (self.routed + 1) {
             return false;
         }
-        assert!(x.len >= self.hidden && out.len >= self.hidden, "moe: a row of {}", self.hidden);
-        let st = if rec.keeps() { self.step(top_k) } else { Arc::new(self.scratch(&mut |n| rec.scratch(n), 1, top_k)) };
+        assert!(x.len >= rows * self.hidden && out.len >= rows * self.hidden, "moe: {rows} rows of {}", self.hidden);
+        let st = if rec.keeps() { self.step(rows, top_k) } else { Arc::new(self.scratch(&mut |n| rec.scratch(n), rows, top_k, true)) };
         let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
         let d = rec.gpu().dummy().clone();
         let drw = rec.gpu().dummy_rw().clone();
-        rec.dispatch_wide("moe-route", ROUTE, [&buf(logits), &d, &d, &d, &d, &d, &buf(&st.jobs_gu), &buf(&st.w)], &[self.routed as u32, top_k as u32], (1, 1, 1));
-        rec.dispatch_wide("moe-down-jobs", DOWN_JOBS, [&buf(&st.jobs_gu), &d, &d, &d, &d, &d, &buf(&st.jobs_d), &drw], &[top_k as u32], (1, 1, 1));
-        self.run(rec, &st, x, out, 1, None);
+        rec.dispatch_wide("moe-route", ROUTE, [&buf(logits), &d, &d, &d, &d, &d, &buf(&st.jobs_gu), &buf(&st.w)], &[self.routed as u32, top_k as u32], (rows as u32, 1, 1));
+        rec.dispatch_wide("moe-down-jobs", DOWN_JOBS, [&buf(&st.jobs_gu), &d, &d, &d, &d, &d, &buf(&st.jobs_d), &drw], &[(rows * top_k) as u32], (1, 1, 1));
+        self.run(rec, &st, x, out, rows, None);
         true
     }
 
@@ -2192,8 +2410,8 @@ mod tests {
 
     /// A projection chained on the GPU, its transforms there too (the maps gathered, the Hadamard transforms and their
     /// f16 roundings), gives the projection's own answer (its transforms on the host) bit for bit: one row (a step's,
-    /// its scratch kept), and a prompt's rows as its passes take them (32 at a time, a last lone row as one row), with
-    /// and without maps, at 3 and 5 bits.
+    /// its scratch kept), a few rows (a check of drafts: each row as one row alone), and a prompt's rows as its passes
+    /// take them (32 at a time, a last lone row as one row), with and without maps, at 3 and 5 bits.
     #[test]
     fn a_chained_projection_matches_the_projection() {
         let Some(b) = backend() else { return };
@@ -2206,9 +2424,14 @@ mod tests {
             }
             let w = b.exl3(data).unwrap();
             assert!(b.holds_exl3(w.as_ref()), "the adapter holds it");
-            for rows in [1usize, 2, 3, 32, 33, 70, 129] {
+            for rows in [1usize, 2, 3, 5, 8, 9, 32, 33, 70, 129] {
                 let xs: Vec<f32> = (0..rows * k).map(|i| ((i * 37 % 101) as f32 - 50.0) / 31.0).collect();
-                let want = w.linear(&Tensor::from_vec(xs.clone(), vec![rows, k]));
+                let want = if (2..=FEW_MAX).contains(&rows) {
+                    let each: Vec<f32> = xs.chunks_exact(k).flat_map(|r| w.linear(&Tensor::from_vec(r.to_vec(), vec![1, k])).data().to_vec()).collect();
+                    Tensor::from_vec(each, vec![rows, n])
+                } else {
+                    w.linear(&Tensor::from_vec(xs.clone(), vec![rows, k]))
+                };
                 let (x, y) = (b.vec(rows * k), b.vec(rows * n));
                 DeviceChain::upload(&b, &x, &xs);
                 // twice: the second from the kept scratch
@@ -2223,6 +2446,45 @@ mod tests {
             }
         }
     }
+    /// A chained projection's time for a few rows (`--ignored --nocapture`): Qwen3.8-Flash-Next's delta nets' qkv, z and
+    /// output, its attention's q, and an expert's gate and down, at 3 bits, matrices in turn past the L2 as a model's
+    /// layers are.
+    #[test]
+    #[ignore = "a measurement"]
+    fn measure_chained_projections() {
+        let Some(b) = backend() else { return };
+        for (k, n, count) in [(2560usize, 10240usize, 8usize), (2560, 6144, 12), (6144, 2560, 12), (2560, 12288, 8), (2560, 640, 96), (640, 2560, 96)] {
+            let ws: Vec<_> = (0..count as u32).map(|i| b.exl3(random_exl3(k, n, 48, 900 + i)).unwrap()).collect();
+            let bytes = (k / 16 * n / 16 * 24 * 4) as f64;
+            let mut line = format!("[{n}, {k}]:");
+            let mut one = 0.0;
+            for rows in [1usize, 2, 3, 4, 8] {
+                let (x, y) = (b.vec(rows * k), b.vec(rows * n));
+                DeviceChain::upload(&b, &x, &(0..rows * k).map(|i| ((i * 37 % 101) as f32 - 50.0) / 31.0).collect::<Vec<_>>());
+                let reps = 4 * count;
+                let run = || {
+                    let mut rec = b.begin();
+                    for i in 0..reps {
+                        rec.exl3_rows(ws[i % count].as_ref(), &x, &y, rows);
+                    }
+                    rec.read_range(&y, 0, 1);
+                    rec.finish();
+                };
+                run();
+                let t = std::time::Instant::now();
+                for _ in 0..5 {
+                    run();
+                }
+                let each = t.elapsed().as_secs_f64() / 5.0 / reps as f64;
+                if rows == 1 {
+                    one = each;
+                }
+                line += &format!(" {rows} rows {:.1} us ({:.2}x, {:.0} GB/s);", each * 1e6, each / one, bytes / each / 1e9);
+            }
+            eprintln!("{line}");
+        }
+    }
+
     /// A prompt's rows through grouped experts, each expert's in blocks of 32 (a tile decoded once a block): an expert
     /// with more rows than a block (two blocks), one with a single row, the rest a few each, as the definition gives.
     #[test]
@@ -2304,7 +2566,7 @@ mod tests {
                 let mut rec = b.begin();
                 rec.keep_groups(keep);
                 rec.moe_rows(gpu.as_ref(), &xd, &on_host, &[route(&logits, top_k)]);
-                assert!(rec.moe_routed(gpu.as_ref(), &xd, &on_gpu, &ld, top_k), "the grouped experts route on the GPU");
+                assert!(rec.moe_routed(gpu.as_ref(), &xd, &on_gpu, &ld, top_k, 1), "the grouped experts route on the GPU");
                 rec.read(&on_host);
                 rec.read(&on_gpu);
                 let mut got = rec.finish();
@@ -2315,6 +2577,33 @@ mod tests {
                 }
                 if case == 0 {
                     close(&g, &reference(experts(count, hidden, ff, 48), &x, &logits, top_k), "routed on the GPU against the definition");
+                }
+            }
+        }
+        // a check's few rows, each routed on its own: each row's sums its own step's
+        for rows in [2usize, 3, 5] {
+            let xs: Vec<f32> = (0..rows * hidden).map(|i| ((i * 29 % 97) as f32 - 48.0) / 50.0).collect();
+            let ls: Vec<f32> = (0..rows * (count + 1)).map(|i| ((i * 53 % 89) as f32 - 44.0) / 15.0).collect();
+            let (xr, lr, yr) = (b.vec(rows * hidden), b.vec(rows * (count + 1)), b.vec(rows * hidden));
+            DeviceChain::upload(&b, &xr, &xs);
+            DeviceChain::upload(&b, &lr, &ls);
+            for keep in [true, false] {
+                let mut rec = b.begin();
+                rec.keep_groups(keep);
+                assert!(rec.moe_routed(gpu.as_ref(), &xr, &yr, &lr, top_k, rows), "{rows} rows route on the GPU");
+                rec.read(&yr);
+                let got = rec.finish().pop().unwrap();
+                for r in 0..rows {
+                    let (x1, l1, y1) = (b.vec(hidden), b.vec(count + 1), b.vec(hidden));
+                    DeviceChain::upload(&b, &x1, &xs[r * hidden..(r + 1) * hidden]);
+                    DeviceChain::upload(&b, &l1, &ls[r * (count + 1)..(r + 1) * (count + 1)]);
+                    let mut rec = b.begin();
+                    rec.keep_groups(keep);
+                    assert!(rec.moe_routed(gpu.as_ref(), &x1, &y1, &l1, top_k, 1));
+                    rec.read(&y1);
+                    let want = rec.finish().pop().unwrap();
+                    let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+                    assert_eq!(bits(&got[r * hidden..(r + 1) * hidden]), bits(&want), "{rows} rows keep {keep}: row {r}");
                 }
             }
         }

@@ -594,6 +594,89 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 }
 "#;
 
+/// [`MATVEC_F16`] (`narrow`: [`MATVEC_F16_NARROW`]) for `rows` rows (2 to 8, a check of drafts): each weight read once
+/// for all of them, each row's products summed in the one-row kernel's order (so a row's outputs are its bit for bit).
+/// `p[0]`: n, k.
+fn matvec_f16_rows(rows: usize, narrow: bool) -> String {
+    assert!((2..=8).contains(&rows), "a few rows (2 to 8)");
+    let each = |f: &dyn Fn(usize) -> String| (0..rows).map(f).collect::<Vec<_>>().join("\n");
+    if narrow {
+        let regs = each(&|r| format!("    var s{r} = 0.0;"));
+        let sums = each(&|r| format!("            s{r} = s{r} + pr.x * x[{r}u * k + 2u * i];\n            s{r} = s{r} + pr.y * x[{r}u * k + 2u * i + 1u];"));
+        let parts = each(&|r| format!("    part[{r}u * 256u + li] = s{r};"));
+        let outs = each(&|r| format!("        var t{r} = 0.0;\n        for (var j = 0u; j < 8u; j++) {{ t{r} += part[{r}u * 256u + li + j]; }}\n        y[{r}u * n + o] = t{r};"));
+        return format!(
+            r#"
+@group(0) @binding(0) var<storage, read> w: array<u32>;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> p: array<vec4<u32>, 2>;
+var<workgroup> part: array<f32, {len}>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {{
+    let n = p[0].x;
+    let k = p[0].y;
+    let o = wg.x * 32u + li / 8u;
+    let q = li % 8u;
+    let pairs = k / 2u;
+{regs}
+    if (o < n) {{
+        for (var i = q; i < pairs; i += 8u) {{
+            let pr = unpack2x16float(w[o * pairs + i]);
+{sums}
+        }}
+    }}
+{parts}
+    workgroupBarrier();
+    if (q == 0u && o < n) {{
+{outs}
+    }}
+}}
+"#,
+            len = rows * 256
+        );
+    }
+    let regs = each(&|r| format!("    var s{r} = vec4<f32>(0.0);"));
+    let sums = each(&|r| format!("        s{r} += wv * x4[{r}u * k4 + i];"));
+    let parts = each(&|r| format!("    part[{r}u * 256u + li] = s{r}.x + s{r}.y + s{r}.z + s{r}.w;"));
+    let adds = each(&|r| format!("            part[{r}u * 256u + li] += part[{r}u * 256u + li + st];"));
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read> w2: array<vec2<u32>>;
+@group(0) @binding(1) var<storage, read> x4: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> p: array<vec4<u32>, 2>;
+var<workgroup> part: array<f32, {len}>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {{
+    let n = p[0].x;
+    let k4 = p[0].y / 4u;
+    let o = wg.x;
+{regs}
+    for (var i = li; i < k4; i += 256u) {{
+        let pr = w2[o * k4 + i];
+        let a = unpack2x16float(pr.x);
+        let b = unpack2x16float(pr.y);
+        let wv = vec4<f32>(a.x, a.y, b.x, b.y);
+{sums}
+    }}
+{parts}
+    workgroupBarrier();
+    for (var st = 128u; st > 0u; st /= 2u) {{
+        if (li < st) {{
+{adds}
+        }}
+        workgroupBarrier();
+    }}
+    if (li < {rows}u) {{ y[li * n + o] = part[li * 256u]; }}
+}}
+"#,
+        len = rows * 256
+    )
+}
+
 /// [`MATVEC_F16`] for a short row (`k` under 2048): eight threads an output (a word, two weights, at a time), 32 outputs
 /// a workgroup. `p[0]`: n, k.
 const MATVEC_F16_NARROW: &str = r#"
@@ -1579,9 +1662,14 @@ impl ChainRecorder for Recorder<'_> {
         let (k, n) = g.kn();
         assert!(rows > 0 && x.len >= rows * k && y.len >= rows * n && rows <= 65535, "chain: an EXL3 [{n}, {k}] of {rows} rows");
         let c = g.chain(self.backend);
-        // a step's one row: the projection's own scratch (its bind groups kept); else this call's
+        // a step's one row: the projection's own scratch (its bind groups kept); a check's few rows the device's shared
+        // few-rows scratch (kept too); else this call's
+        let few = (2..=crate::exl3::FEW_MAX).contains(&rows) && self.keep && crate::exl3::FewScratch::fits(k, n, splits as usize);
         let (xh, part, yt, jobs) = if rows == 1 && self.keep {
             (c.xh.clone(), c.part.clone(), c.yt.clone(), c.jobs1.clone())
+        } else if few {
+            let f = self.gpu().few(self.backend);
+            (f.xh.clone(), f.part.clone(), f.yt.clone(), f.jobs.clone())
         } else {
             let list: Vec<u32> = (0..rows as u32).flat_map(|r| [0, r]).collect();
             let jobs = self.scratch(list.len());
@@ -1598,6 +1686,16 @@ impl ChainRecorder for Recorder<'_> {
         let mm = crate::exl3::chain_shader("mm");
         if rows == 1 {
             self.dispatch_wide("exl3-mm", &mm, [words, buffer(&xh), buffer(&jobs), &d, &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, splits, 0], grid(1));
+        } else if rows <= crate::exl3::FEW_MAX {
+            // a few rows (a check of drafts): each tile decoded once for all of them, each row summed as one row is
+            let order = if few {
+                self.gpu().few(self.backend).order.clone()
+            } else {
+                let order = self.scratch(rows);
+                crate::exl3::upload_u32(self.backend, &order, &(0..rows as u32).collect::<Vec<_>>());
+                order
+            };
+            self.dispatch_wide(crate::exl3::few_name(rows), crate::exl3::g_few(rows), [words, buffer(&xh), buffer(&jobs), buffer(&order), &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, splits, 0, 0], grid(1));
         } else {
             // a prompt's rows summed as the projection's own passes sum them (each tile decoded once for 64 of them here),
             // and a last lone row of a pass as one row is
@@ -1657,9 +1755,9 @@ impl ChainRecorder for Recorder<'_> {
         g.record(self, x, out, assign);
     }
 
-    fn moe_routed(&mut self, experts: &dyn ggml_rs::exl3::Experts, x: &DeviceVec, out: &DeviceVec, logits: &DeviceVec, top_k: usize) -> bool {
+    fn moe_routed(&mut self, experts: &dyn ggml_rs::exl3::Experts, x: &DeviceVec, out: &DeviceVec, logits: &DeviceVec, top_k: usize, rows: usize) -> bool {
         let Some(g) = experts.as_any().and_then(|a| a.downcast_ref::<crate::exl3::Exl3MoeGrouped>()) else { return false };
-        g.record_routed(self, x, out, logits, top_k)
+        g.record_routed(self, x, out, logits, top_k, rows)
     }
 
     fn axpy_at(&mut self, acc: &DeviceVec, y: &DeviceVec, weights: &DeviceVec, at: usize, len: usize) {
@@ -1717,6 +1815,18 @@ impl ChainRecorder for Recorder<'_> {
                 let pipeline = self.named("chain-matvec-f16-narrow", MATVEC_F16_NARROW);
                 self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(y), &[n as u32, k as u32], ((n as u32).div_ceil(32), 1, 1));
             }
+            return;
+        }
+        // a few rows (a check of drafts): each weight read once for all of them, each row summed as one row is
+        if rows <= 8 {
+            const NAMES: [[&str; 7]; 2] = [
+                ["chain-matvec-f16-rows-2", "chain-matvec-f16-rows-3", "chain-matvec-f16-rows-4", "chain-matvec-f16-rows-5", "chain-matvec-f16-rows-6", "chain-matvec-f16-rows-7", "chain-matvec-f16-rows-8"],
+                ["chain-matvec-f16-narrow-2", "chain-matvec-f16-narrow-3", "chain-matvec-f16-narrow-4", "chain-matvec-f16-narrow-5", "chain-matvec-f16-narrow-6", "chain-matvec-f16-narrow-7", "chain-matvec-f16-narrow-8"],
+            ];
+            let wide = k >= 2048 && k % 4 == 0;
+            let pipeline = self.gpu().named_pipeline(NAMES[!wide as usize][rows - 2], || matvec_f16_rows(rows, !wide));
+            let groups = if wide { n as u32 } else { (n as u32).div_ceil(32) };
+            self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(y), &[n as u32, k as u32], (groups, 1, 1));
             return;
         }
         let tiles = n.div_ceil(64) * rows.div_ceil(64);
@@ -2502,6 +2612,37 @@ mod tests {
                 for (i, (a, e)) in h.iter().zip(&f).enumerate() {
                     assert!((a - e).abs() <= 1e-4 * scale, "[{n}, {k}] of {rows} rows [{i}]: {a} against {e}");
                 }
+            }
+        }
+    }
+
+    /// A few rows of an f16 matrix (a check of drafts) give each row's one-row sums bit for bit: long rows (the
+    /// hyper-connections' down matrices, the router) and short ones (their up matrices), 2 to 8 rows.
+    #[test]
+    fn a_few_rows_of_an_f16_matrix_are_each_row_alone() {
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        let mut r = rng(61);
+        for (n, k) in [(324usize, 10240usize), (513, 2560), (10240, 324), (70, 100)] {
+            let w: Vec<f32> = (0..n * k).map(|_| half::f16::from_f32(r()).to_f32()).collect();
+            let w16 = b.vec_f16(&w).expect("f16 values");
+            for rows in 2..=8usize {
+                let x: Vec<f32> = (0..rows * k).map(|_| r()).collect();
+                let (xd, yd) = (b.vec(rows * k), b.vec(rows * n));
+                DeviceChain::upload(&b, &xd, &x);
+                let mut rec = b.begin();
+                rec.matmul_f16_rows(&w16, n, k, &xd, &yd, rows);
+                rec.read(&yd);
+                let got = rec.finish().pop().unwrap();
+                let mut want = Vec::new();
+                for row in x.chunks_exact(k) {
+                    let (x1, y1) = (b.vec(k), b.vec(n));
+                    DeviceChain::upload(&b, &x1, row);
+                    let mut rec = b.begin();
+                    rec.matmul_f16_rows(&w16, n, k, &x1, &y1, 1);
+                    rec.read(&y1);
+                    want.extend(rec.finish().pop().unwrap());
+                }
+                assert_eq!(got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "[{n}, {k}] of {rows} rows");
             }
         }
     }

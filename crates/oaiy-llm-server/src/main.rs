@@ -80,9 +80,9 @@ const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|
   --lora-strength NAME=X      strength of NAME's adapters that give none (default 1; -4..4)
   --vision-projector NAME=PATH  GGUF projector, or original Qwen vision directory for Orca
   --devices-for NAME=0,1  the GPUs for NAME, instead of --devices (a model too big for one)
-  --mtp NAME           NAME (a Qwen3.5 GGUF with a multi-token-prediction layer, on
-                       WebGPU) drafts tokens with that layer and checks them in one
-                       run; repeat for more models
+  --mtp NAME           NAME (a Qwen3.5 GGUF with a multi-token-prediction layer, or
+                       Qwen3.8-Flash-Next, on WebGPU) drafts tokens with that layer
+                       and checks them in one run; repeat for more models
   --no-vision          skip the vision tower (images are refused)
   --local-images on|off  let requests name image files on this machine (paths,
                        file:// URLs); default on when listening on loopback only

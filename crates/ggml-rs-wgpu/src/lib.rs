@@ -135,6 +135,11 @@ struct Gpu {
     limits: wgpu::Limits,
     /// Upload bytes written since the queue was last flushed.
     staged: AtomicU64,
+    /// The EXL3 projections' scratch for a few rows (a check of drafts), shared by them all, made when first used.
+    few: std::sync::OnceLock<exl3::FewScratch>,
+    /// Grouped experts' kept scratch of a step or a check (rows, top k, hidden, ff and the groups' splits): one for
+    /// every layer of that shape.
+    moe_steps: Mutex<Vec<([usize; 6], Arc<exl3::Step>)>>,
 }
 
 /// A weight matrix on the GPU: its rows in one or more buffers.
@@ -211,6 +216,11 @@ impl QuantizedDeviceStorage for WgpuQuant {
 }
 
 impl Gpu {
+    /// The EXL3 projections' few-rows scratch ([`exl3::FewScratch`]), made by `b` when first asked for.
+    pub(crate) fn few(&self, b: &WgpuBackend) -> &exl3::FewScratch {
+        self.few.get_or_init(|| exl3::FewScratch::new(b))
+    }
+
     /// Copy `len` bytes of `src` back to the host.
     fn read(&self, src: &wgpu::Buffer, len: u64) -> Vec<u8> {
         let len = len.div_ceil(4) * 4;
@@ -634,7 +644,7 @@ impl WgpuBackend {
         });
         Ok(Self {
             cpu: CpuBackend::new(),
-            gpu: Arc::new(Gpu { device, queue, layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), names: Mutex::new(HashMap::new()), pool: Mutex::new(Vec::new()), chain_groups: Mutex::new(HashMap::new()), wide: std::sync::OnceLock::new(), chain_groups_wide: Mutex::new(HashMap::new()), dummy: std::sync::OnceLock::new(), dummy_rw: std::sync::OnceLock::new(), limits, staged: AtomicU64::new(0) }),
+            gpu: Arc::new(Gpu { device, queue, layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), names: Mutex::new(HashMap::new()), pool: Mutex::new(Vec::new()), chain_groups: Mutex::new(HashMap::new()), wide: std::sync::OnceLock::new(), chain_groups_wide: Mutex::new(HashMap::new()), dummy: std::sync::OnceLock::new(), dummy_rw: std::sync::OnceLock::new(), limits, staged: AtomicU64::new(0), few: std::sync::OnceLock::new(), moe_steps: Mutex::new(Vec::new()) }),
             budget,
             used: Arc::new(AtomicU64::new(0)),
             summary,

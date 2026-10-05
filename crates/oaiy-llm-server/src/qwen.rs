@@ -318,6 +318,53 @@ impl Hybrid {
             Self::Fake(f) => Ok(Tensor::zeros(vec![tokens.len(), f.width])),
         }
     }
+    /// Whether the model drafts tokens a check takes (its multi-token-prediction layer, chained).
+    fn drafts(&self) -> bool {
+        match self {
+            Self::Qwen35(Model::Qwen35(m)) => m.drafts(),
+            #[cfg(any(feature = "cuda", feature = "webgpu"))]
+            Self::Flash(f) => f.drafts(),
+            _ => false,
+        }
+    }
+    /// The tokens before a draft's `next` it may need (its layer catches up on the last run's rows): at most this many.
+    fn draft_window(&self) -> usize {
+        match self {
+            #[cfg(any(feature = "cuda", feature = "webgpu"))]
+            Self::Flash(_) => crate::flashnext::CHECK_ROWS,
+            _ => llama_rs::SPEC_ROWS,
+        }
+    }
+    /// Up to `k` drafts after the last of `recent` (the token sampled for position `kv.len`); None or none: a step.
+    fn draft(&self, kv: &KvCache, recent: &[u32], k: usize) -> Option<Vec<u32>> {
+        match self {
+            Self::Qwen35(Model::Qwen35(m)) => m.draft(kv, recent, k),
+            #[cfg(any(feature = "cuda", feature = "webgpu"))]
+            Self::Flash(f) => f.draft(kv, recent, k),
+            _ => None,
+        }
+    }
+    /// A check of `rows` (the token sampled, then its drafts): every row's logits, undoable ([`Self::rollback`]).
+    fn check(&self, rows: &[u32], kv: &mut KvCache) -> Option<Vec<Tensor>> {
+        match self {
+            Self::Qwen35(Model::Qwen35(m)) => m.check(rows, kv),
+            #[cfg(any(feature = "cuda", feature = "webgpu"))]
+            Self::Flash(f) => f.check(rows, kv),
+            _ => None,
+        }
+    }
+    /// Undo the last check's `rows` past its first `keep`.
+    fn rollback(&self, kv: &mut KvCache, rows: usize, keep: usize) {
+        match self {
+            Self::Qwen35(Model::Qwen35(m)) => m.rollback(kv, rows, keep),
+            #[cfg(any(feature = "cuda", feature = "webgpu"))]
+            Self::Flash(f) => {
+                let _ = rows;
+                f.rollback(kv, keep)
+            }
+            _ => {}
+        }
+    }
     /// Run `tokens` (embedded as `embeds`, on the host) after what `kv` holds: the last logits, on the host.
     fn forward(&self, tokens: &[u32], embeds: Tensor, kv: &mut KvCache, positions: Option<&[[u32; 3]]>) -> Result<Tensor, String> {
         match self {
@@ -524,11 +571,11 @@ impl QwenEngine {
         let mut finish = Finish::Length;
         // Where decoding's time goes, for the log: sampling, the text (decode and stream), the model.
         let (mut t_sample, mut t_text, mut t_model) = (0f64, 0f64, 0f64);
-        // Drafting (a Qwen3.5 model with its multi-token-prediction layer, chained; text only): each token sampled is
-        // run with the drafts after it in one check, and while the sampler picks what was drafted its logits are the
-        // check's (sampling the model's distribution and taking a draft only where it is the token sampled is that
-        // distribution's sampling still); where it picks another, the check's rows from there are undone.
-        let drafter = self.model.qwen35().filter(|m| job.images.is_empty() && m.drafts());
+        // Drafting (a model with its multi-token-prediction layer, chained: a Qwen3.5 GGUF's, Flash-Next's; text only):
+        // each token sampled is run with the drafts after it in one check, and while the sampler picks what was drafted
+        // its logits are the check's (sampling the model's distribution and taking a draft only where it is the token
+        // sampled is that distribution's sampling still); where it picks another, the check's rows from there are undone.
+        let drafter = (job.images.is_empty() && hybrid.drafts()).then_some(hybrid);
         let mut pending: std::collections::VecDeque<(u32, Tensor)> = Default::default();
         let (mut check_rows, mut drafts_checked, mut drafts_taken) = (0usize, 0usize, 0usize);
         while generated.len() < job.max_tokens && self.kv.len < self.kv.max_len {
@@ -574,7 +621,7 @@ impl QwenEngine {
             } else {
                 // its drafts, then the token and them in one check; else the token alone
                 let checked = drafter.filter(|_| self.kv.len + 1 + DRAFTS <= self.kv.max_len).and_then(|m| {
-                    let recent: Vec<u32> = self.covered[self.covered.len().saturating_sub(llama_rs::SPEC_ROWS)..].iter().map(|&k| k as u32).chain([next]).collect();
+                    let recent: Vec<u32> = self.covered[self.covered.len().saturating_sub(m.draft_window())..].iter().map(|&k| k as u32).chain([next]).collect();
                     // none the layer is sure enough of: a step of the token alone
                     let drafts = m.draft(&self.kv, &recent, DRAFTS).filter(|d| !d.is_empty())?;
                     let rows: Vec<u32> = std::iter::once(next).chain(drafts.iter().copied()).collect();
