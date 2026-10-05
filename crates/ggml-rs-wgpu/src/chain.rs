@@ -1097,17 +1097,18 @@ impl ChainRecorder for Recorder<'_> {
         if rows == 1 {
             self.dispatch_wide("exl3-mm", &mm, [words, buffer(&xh), buffer(&jobs), &d, &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, splits, 0], grid(1));
         } else {
-            // a prompt's rows as the projection's own passes take them: 32 at a time, each tile decoded once a pass, and a
-            // last lone row as one row is
+            // a prompt's rows summed as the projection's own passes sum them (each tile decoded once for 64 of them here),
+            // and a last lone row of a pass as one row is
+            const BLOCK: usize = 64;
             let lone = rows % 32 == 1;
-            let many: Vec<u32> = (0..(rows - lone as usize) as u32).collect::<Vec<_>>().chunks(32).flat_map(|b| b.iter().copied().chain(std::iter::repeat(crate::exl3::NONE)).take(32)).collect();
+            let many: Vec<u32> = (0..(rows - lone as usize) as u32).collect::<Vec<_>>().chunks(BLOCK).flat_map(|b| b.iter().copied().chain(std::iter::repeat(crate::exl3::NONE)).take(BLOCK)).collect();
             let order = self.scratch(many.len());
             crate::exl3::upload_u32(self.backend, &order, &many);
             let per = 65535 / splits as usize;
-            let blocks = many.len() / 32;
-            let kernel = crate::exl3::chain_shader("many");
+            let blocks = many.len() / BLOCK;
+            let kernel = crate::exl3::g_many(BLOCK);
             for first in (0..blocks).step_by(per) {
-                self.dispatch_wide("exl3-many", &kernel, [words, buffer(&xh), buffer(&jobs), buffer(&order), &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, splits, 0, first as u32], grid(per.min(blocks - first)));
+                self.dispatch_wide(crate::exl3::many_name(BLOCK), &kernel, [words, buffer(&xh), buffer(&jobs), buffer(&order), &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, splits, 0, first as u32], grid(per.min(blocks - first)));
             }
             if lone {
                 self.dispatch_wide("exl3-mm", &mm, [words, buffer(&xh), buffer(&jobs), &d, &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, splits, 0, rows as u32 - 1], grid(1));

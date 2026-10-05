@@ -757,13 +757,31 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 }
 "#;
 
-/// [`MANY`]'s matmul in a chain, for a prompt's rows: up to 32 jobs of one matrix at a time, from `order` in blocks of
-/// 32 (a block's jobs one matrix's, its unused places [`NONE`]; see [`many_order`]). Each tile's 256 weights are decoded
-/// once into the workgroup's memory and thread `(r, c)` sums column `c` for the block's jobs `r` and `r + 16`, sixteen
-/// products a tile each, as `MANY` sums: a workgroup a (tile column, block and split), each job's partial sums to
-/// `part[(j * splits + s) * n..]` as [`G_MM`]'s. `p[0]`: n, k, tile words, splits; `p[1]`: words a matrix, the pass's
-/// first block.
-const G_MANY: &str = r#"
+/// [`MANY`]'s matmul in a chain, for a prompt's rows: `rows` (16, 32 or 64) jobs of one matrix at a time, from
+/// `order` in blocks of `rows` (a block's jobs one matrix's, its unused places [`NONE`]; see [`many_order`]). Each
+/// tile's 256 weights are decoded once into the workgroup's memory and thread `(r, c)` sums column `c` for the block's
+/// jobs `r`, `r + 16`, .., sixteen products a tile each in `MANY`'s order (so a projection's rows are its own kernel's
+/// bit for bit): a workgroup a (tile column, block and split), each job's partial sums to `part[(j * splits + s) *
+/// n..]` as [`G_MM`]'s. The next tile's words and inputs load while this one's are summed, through two sets of the
+/// workgroup's buffers. `p[0]`: n, k, tile words, splits; `p[1]`: words a matrix, the pass's first block.
+pub(crate) fn g_many(rows: usize) -> String {
+    assert!(matches!(rows, 16 | 32 | 64), "a block of 16, 32 or 64 rows");
+    let m = rows / 16;
+    let each = |f: &dyn Fn(usize) -> String| (0..m).map(f).collect::<Vec<_>>().join("\n");
+    let ids = each(&|i| format!("    let j{i} = ids[r + {}u];", 16 * i));
+    let regs = each(&|i| format!("    var xn{i} = 0.0;\n    var acc{i} = 0.0;"));
+    let first = each(&|i| format!("        if (j{i} != 0xffffffffu) {{ xn{i} = x[j{i} * k + ks * 16u + c]; }}"));
+    let store = each(&|i| format!("        xs[b][(r + {}u) * 4u + c / 4u][c % 4u] = xn{i};", 16 * i));
+    let next = each(&|i| format!("            if (j{i} != 0xffffffffu) {{ xn{i} = x[j{i} * k + (kt + 1u) * 16u + c]; }}"));
+    let sums = each(&|i| {
+        format!(
+            "            let x{i} = xs[b][(r + {}u) * 4u + q];\n            acc{i} = acc{i} + x{i}.x * w4.x;\n            acc{i} = acc{i} + x{i}.y * w4.y;\n            acc{i} = acc{i} + x{i}.z * w4.z;\n            acc{i} = acc{i} + x{i}.w * w4.w;",
+            16 * i
+        )
+    });
+    let out = each(&|i| format!("    if (j{i} != 0xffffffffu) {{ part[(j{i} * splits + s) * n + nt * 16u + c] = acc{i}; }}"));
+    format!(
+        r#"
 @group(0) @binding(0) var<storage, read> words: array<u32>;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
 @group(0) @binding(2) var<storage, read> jobs: array<u32>;
@@ -771,57 +789,59 @@ const G_MANY: &str = r#"
 @group(0) @binding(6) var<storage, read_write> part: array<f32>;
 @group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
 
-var<workgroup> tile: array<u32, 64>;
-var<workgroup> xs: array<f32, 512>;
-var<workgroup> wt: array<f32, 256>;
-var<workgroup> ids: array<u32, 32>;
+var<workgroup> tile: array<array<u32, 64>, 2>;
+// a block's inputs, [row][16 of k]
+var<workgroup> xs: array<array<vec4<f32>, {xs_len}>, 2>;
+// the decoded tile, [column][16 of k] (20 apart, against bank conflicts)
+var<workgroup> wt: array<array<vec4<f32>, 80>, 2>;
+var<workgroup> ids: array<u32, {rows}>;
 
-fn round_f16(v: f32) -> f32 {
+fn round_f16(v: f32) -> f32 {{
     let b = bitcast<u32>(v);
     return bitcast<f32>((b + 0xfffu + ((b >> 13u) & 1u)) & 0xffffe000u);
-}
+}}
 
-fn weight(r: u32, c: u32, tw: u32) -> f32 {
+fn weight(r: u32, c: u32, tw: u32, buf: u32) -> f32 {{
     let nw = tw / 2u;
     let lane = (r % 8u) / 2u + 4u * (c % 8u);
     let jj = (r % 2u) + 2u * (r / 8u) + 4u * (c / 8u);
     let i = lane * 8u + jj;
     var end = (i + 1u) * (tw / 16u);
-    if (tw % 16u == 8u) {
+    if (tw % 16u == 8u) {{
         end = end + (i + 1u) / 2u;
-    }
+    }}
     let start = (end + nw * 32u - 16u) % (nw * 32u);
     let w0 = start / 32u;
     let sh = 48u - start % 32u;
-    let a = tile[w0];
-    let b = tile[(w0 + 1u) % nw];
+    let a = tile[buf][w0];
+    let b = tile[buf][(w0 + 1u) % nw];
     var code: u32;
-    if (sh >= 32u) {
+    if (sh >= 32u) {{
         code = a >> (sh - 32u);
-    } else {
+    }} else {{
         code = (a << (32u - sh)) | (b >> sh);
-    }
+    }}
     let hx = (code & 0xffffu) * 0x83dcd12du;
     let sum = (hx & 255u) + ((hx >> 8u) & 255u) + ((hx >> 16u) & 255u) + (hx >> 24u);
     return round_f16(f32(1024u + sum) * 0.00676727294921875 - 10.3828125);
-}
+}}
 
 @compute @workgroup_size(256)
-fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {{
     let n = p[0].x;
     let k = p[0].y;
     let tw = p[0].z;
     let splits = p[0].w;
     let ntiles = n / 16u;
     let nt = wg.x + wg.y * 65535u;
-    if (nt >= ntiles) {
+    if (nt >= ntiles) {{
         return;
-    }
+    }}
     let blk = p[1].y + wg.z / splits;
     let s = wg.z % splits;
-    if (t < 32u) {
-        ids[t] = order[blk * 32u + t];
-    }
+    if (t < {rows}u) {{
+        ids[t] = order[blk * {rows}u + t];
+    }}
     workgroupBarrier();
     let base = jobs[2u * ids[0]] * p[1].x;
     let r = t / 16u;
@@ -831,62 +851,74 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     let per = (kts + splits - 1u) / splits;
     let ks = s * per;
     let ke = min(kts, ks + per);
-    let ja = ids[r];
-    let jb = ids[r + 16u];
-    let a = ja != 0xffffffffu;
-    let b = jb != 0xffffffffu;
-    var acc0 = 0.0;
-    var acc1 = 0.0;
-    for (var kt = ks; kt < ke; kt = kt + 1u) {
-        if (t < nw) {
-            tile[t] = words[base + (kt * ntiles + nt) * nw + t];
-        }
-        for (var q = t; q < 512u; q = q + 256u) {
-            let jq = ids[q / 16u];
-            if (jq != 0xffffffffu) {
-                xs[q] = x[jq * k + kt * 16u + (q % 16u)];
-            }
-        }
+    // this thread's rows r + 16 i: it loads their inputs at column c, and sums their outputs at column c
+{ids}
+{regs}
+    var wn = 0u;
+    if (ks < ke) {{
+        if (t < nw) {{ wn = words[base + (ks * ntiles + nt) * nw + t]; }}
+{first}
+    }}
+    var b = 0u;
+    for (var kt = ks; kt < ke; kt = kt + 1u) {{
+        if (t < nw) {{ tile[b][t] = wn; }}
+{store}
         workgroupBarrier();
-        wt[t] = weight(r, c, tw);
+        if (kt + 1u < ke) {{
+            if (t < nw) {{ wn = words[base + ((kt + 1u) * ntiles + nt) * nw + t]; }}
+{next}
+        }}
+        wt[b][c * 5u + r / 4u][r % 4u] = weight(r, c, tw, b);
         workgroupBarrier();
-        if (a) {
-            for (var kk = 0u; kk < 16u; kk = kk + 1u) {
-                acc0 = acc0 + xs[r * 16u + kk] * wt[kk * 16u + c];
-            }
-        }
-        if (b) {
-            for (var kk = 0u; kk < 16u; kk = kk + 1u) {
-                acc1 = acc1 + xs[(r + 16u) * 16u + kk] * wt[kk * 16u + c];
-            }
-        }
-        workgroupBarrier();
-    }
-    if (a) {
-        part[(ja * splits + s) * n + nt * 16u + c] = acc0;
-    }
-    if (b) {
-        part[(jb * splits + s) * n + nt * 16u + c] = acc1;
-    }
+        for (var q = 0u; q < 4u; q = q + 1u) {{
+            let w4 = wt[b][c * 5u + q];
+{sums}
+        }}
+        b = 1u - b;
+    }}
+{out}
+}}
+"#,
+        xs_len = rows * 4,
+    )
 }
-"#;
 
-/// An unused place in a block of [`G_MANY`]'s job order.
+/// An unused place in a block of [`g_many`]'s job order.
 pub(crate) const NONE: u32 = u32::MAX;
 
-/// A job list's (`jobs`: pairs of matrix and input row) order for [`G_MANY`]: its jobs grouped by matrix (each
-/// matrix's in their list's order), in blocks of 32, a block one matrix's and its unused places [`NONE`].
-pub(crate) fn many_order(jobs: &[u32]) -> Vec<u32> {
+/// A job list's (`jobs`: pairs of matrix and input row) order for [`g_many`]: its jobs grouped by matrix (each
+/// matrix's in their list's order), in blocks of `rows`, a block one matrix's and its unused places [`NONE`].
+pub(crate) fn many_order(jobs: &[u32], rows: usize) -> Vec<u32> {
     let mut idx: Vec<u32> = (0..(jobs.len() / 2) as u32).collect();
     idx.sort_by_key(|&j| jobs[2 * j as usize]);
-    let mut order = Vec::with_capacity(idx.len() + 32);
+    let mut order = Vec::with_capacity(idx.len() + rows);
     for same in idx.chunk_by(|&a, &b| jobs[2 * a as usize] == jobs[2 * b as usize]) {
-        for block in same.chunks(32) {
+        for block in same.chunks(rows) {
             order.extend_from_slice(block);
-            order.resize(order.len().next_multiple_of(32), NONE);
+            order.resize(order.len().next_multiple_of(rows), NONE);
         }
     }
     order
+}
+
+/// The pipeline name of [`g_many`]'s kernel for blocks of `rows`.
+pub(crate) fn many_name(rows: usize) -> &'static str {
+    match rows {
+        16 => "exl3-many-16",
+        32 => "exl3-many-32",
+        _ => "exl3-many-64",
+    }
+}
+
+/// Rows a block of a MoE layer's experts takes: a prompt routes a few rows to each, and a block decodes its expert's
+/// weights whatever its rows (Qwen3.8-Flash-Next's chunk of 512, about 10 rows an expert: its experts 276 ms in blocks
+/// of 32, 378 in blocks of 16; OAIY_EXL3_MOE_BLOCK=16 for those).
+fn moe_block() -> usize {
+    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ROWS.get_or_init(|| match std::env::var("OAIY_EXL3_MOE_BLOCK").ok().and_then(|v| v.parse().ok()) {
+        Some(16) => 16,
+        _ => 32,
+    })
 }
 
 /// Each job's output transform, a workgroup a (128-block, job): its splits' partial sums added up (in order),
@@ -944,13 +976,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
-/// The chain's kernels as WGSL: the input transform, the matmul (a row a job, or a prompt's), the output transform and
-/// its map.
+/// The chain's kernels as WGSL: the input transform, the matmul (a row a job; a prompt's is [`g_many`]), the output
+/// transform and its map.
 pub(crate) fn chain_shader(which: &str) -> String {
     match which {
         "pre" => format!("{HALF}{G_PRE}"),
         "mm" => G_MM.to_string(),
-        "many" => G_MANY.to_string(),
         "post" => format!("{HALF}{G_POST}"),
         _ => G_GATHER.to_string(),
     }
@@ -1257,9 +1288,10 @@ impl Exl3MoeGrouped {
         match order {
             Some((order, blocks)) => {
                 let ob = buf(order);
+                let rows = moe_block();
                 for first in (0..blocks).step_by(per) {
                     let these = per.min(blocks - first) as u32;
-                    rec.dispatch_wide("exl3-many", &chain_shader("many"), [&g.words, &xhb, &jb, &ob, &d, &d, &pb, &drw], &[g.n as u32, g.k as u32, g.tw as u32, splits, g.mwords as u32, first as u32], (ntiles.min(65535), ntiles.div_ceil(65535), these * splits));
+                    rec.dispatch_wide(many_name(rows), &g_many(rows), [&g.words, &xhb, &jb, &ob, &d, &d, &pb, &drw], &[g.n as u32, g.k as u32, g.tw as u32, splits, g.mwords as u32, first as u32], (ntiles.min(65535), ntiles.div_ceil(65535), these * splits));
                 }
             }
             None => {
@@ -1305,10 +1337,10 @@ impl Exl3MoeGrouped {
             (&st.jobs_gu, &st.jobs_d, &st.w, &st.xh_gu, &st.part_gu, &st.out_gu, &st.act, &st.xh_d, &st.part_d, &st.out_d, &st.sg, &st.su, &st.sa, &st.sd);
         // a prompt's rows: each expert's in blocks, a tile decoded once a block
         let mut order = |jobs: &[u32]| {
-            let o = many_order(jobs);
+            let o = many_order(jobs, moe_block());
             let v = rec.scratch(o.len());
             up(&v, &o);
-            (v, o.len() / 32)
+            (v, o.len() / moe_block())
         };
         let (order_gu, order_d) = if rows > 1 { (Some(order(&jobs_gu)), Some(order(&jobs_d))) } else { (None, None) };
         self.group_pass(rec, &self.gu, x, jgu, 2 * pairs, order_gu.as_ref().map(|(v, n)| (v, *n)), xh_gu, part_gu, out_gu);
@@ -1971,7 +2003,7 @@ mod tests {
             }
             let w = b.exl3(data).unwrap();
             assert!(b.holds_exl3(w.as_ref()), "the adapter holds it");
-            for rows in [1usize, 2, 3, 32, 33, 70] {
+            for rows in [1usize, 2, 3, 32, 33, 70, 129] {
                 let xs: Vec<f32> = (0..rows * k).map(|i| ((i * 37 % 101) as f32 - 50.0) / 31.0).collect();
                 let want = w.linear(&Tensor::from_vec(xs.clone(), vec![rows, k]));
                 let (x, y) = (b.vec(rows * k), b.vec(rows * n));
@@ -2031,7 +2063,7 @@ mod tests {
             };
             jobs.extend([m, j]);
         }
-        let order = many_order(&jobs);
+        let order = many_order(&jobs, 32);
         assert_eq!(order.len(), 4 * 32, "a block for matrix 0, two for matrix 1, one for matrix 7");
         assert_eq!(&order[..3], &[3, 20, NONE]);
         assert!(order[2..32].iter().all(|&j| j == NONE));
