@@ -41,6 +41,24 @@ pub mod profile {
         let (l, w, a) = (take(&LINEAR), take(&LINEAR_WAIT), take(&ATTENTION));
         format!("projections {:.3} s ({}), of it waiting for the GPU {:.3} s; attention {:.3} s ({})", l.0, l.1, w.0, a.0, a.1)
     }
+
+    /// A chain's kernels timed on the GPU (`OAIY_CHAIN_PROFILE`): each dispatch in a pass of its own between two
+    /// timestamps (which costs a little), its time added to its kernel's.
+    pub fn chain_on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("OAIY_CHAIN_PROFILE").is_some())
+    }
+
+    /// Each kernel's GPU time (ns) and dispatches.
+    pub(crate) static KERNELS: std::sync::Mutex<std::collections::BTreeMap<&'static str, (u64, u64)>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+    /// The kernels' GPU time since the last call (ms, and dispatches), the most first, and reset.
+    pub fn take_kernels() -> Vec<(&'static str, f64, u64)> {
+        let mut k = KERNELS.lock().unwrap_or_else(|p| p.into_inner());
+        let mut v: Vec<(&'static str, f64, u64)> = std::mem::take(&mut *k).into_iter().map(|(n, (ns, c))| (n, ns as f64 / 1e6, c)).collect();
+        v.sort_by(|a, b| b.1.total_cmp(&a.1));
+        v
+    }
 }
 
 use ggml_quants::GgmlType;
@@ -51,6 +69,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 const GIB: u64 = 1 << 30;
+/// The scratch a GPU's pool keeps between chains' runs: a prompt's layer's (Qwen3.8-Flash-Next's at 512 rows about
+/// 0.6 GiB), within the 4 GiB a card's budget leaves.
+const POOL_BYTES: u64 = 3 * GIB / 2;
 
 /// The adapter's own memory where its API says: Vulkan's largest device-local heap (a discrete card's VRAM). None on
 /// Direct3D 12 and Metal.
@@ -93,6 +114,11 @@ struct Gpu {
     exl3: Mutex<[Option<Arc<wgpu::ComputePipeline>>; 2]>,
     /// Other kernels' pipelines by name (`dense`), made when first used.
     named: Mutex<HashMap<&'static str, Arc<wgpu::ComputePipeline>>>,
+    /// The pipelines' names by address, for a chain's profile.
+    names: Mutex<HashMap<usize, &'static str>>,
+    /// Chains' scratch buffers between their runs (bytes, buffer): a prompt's layer takes the last one's, where a new
+    /// buffer is allocated and cleared before its first use.
+    pool: Mutex<Vec<(u64, wgpu::Buffer)>>,
     /// A chain's bind groups that are the same step after step (`chain`): by pipeline, buffers and parameters.
     chain_groups: Mutex<HashMap<chain::GroupKey, wgpu::BindGroup>>,
     /// The layout of the chain's kernels of eight buffers (a gated delta net's: six read, two written, then the
@@ -313,6 +339,41 @@ impl Gpu {
     }
 
     /// A named kernel of eight buffers ([`Gpu::wide_layout`]).
+    /// A scratch buffer of `bytes` (a power of two) from the pool, or a new one.
+    pub(crate) fn pooled(&self, bytes: u64) -> wgpu::Buffer {
+        let taken = {
+            let mut pool = self.pool.lock().unwrap_or_else(|p| p.into_inner());
+            pool.iter().position(|(b, _)| *b == bytes).map(|i| pool.swap_remove(i).1)
+        };
+        taken.unwrap_or_else(|| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("oaiy-chain-scratch"),
+                size: bytes,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        })
+    }
+
+    /// Scratch buffers back to the pool, once what used them has run; past [`POOL_BYTES`] the largest are let go.
+    pub(crate) fn unpool(&self, buffers: Vec<(u64, wgpu::Buffer)>) {
+        let mut pool = self.pool.lock().unwrap_or_else(|p| p.into_inner());
+        pool.extend(buffers);
+        let mut total: u64 = pool.iter().map(|(b, _)| b).sum();
+        if total > POOL_BYTES {
+            pool.sort_by_key(|(b, _)| *b);
+            while total > POOL_BYTES {
+                let Some((b, _)) = pool.pop() else { break };
+                total -= b;
+            }
+        }
+    }
+
+    /// A pipeline's name, for a chain's profile.
+    pub(crate) fn name_of(&self, pipeline: &Arc<wgpu::ComputePipeline>) -> &'static str {
+        self.names.lock().unwrap_or_else(|p| p.into_inner()).get(&(Arc::as_ptr(pipeline) as usize)).copied().unwrap_or("other")
+    }
+
     fn named_pipeline_wide(&self, name: &'static str, source: impl FnOnce() -> String) -> Arc<wgpu::ComputePipeline> {
         let layout = &self.wide_layout().1;
         self.named_pipeline_in(name, layout, source)
@@ -333,6 +394,7 @@ impl Gpu {
             cache: None,
         }));
         cache.insert(name, Arc::clone(&pipeline));
+        self.names.lock().unwrap_or_else(|p| p.into_inner()).insert(Arc::as_ptr(&pipeline) as usize, name);
         pipeline
     }
 
@@ -363,6 +425,9 @@ impl Gpu {
             cache: None,
         }));
         cache.insert((dtype, kind), Arc::clone(&pipeline));
+        // a name for a chain's profile (a few, made once each)
+        let name: &'static str = Box::leak(format!("matmul-{dtype:?}-{}", ["one", "tiled", "decode", "multi"][kind as usize]).into_boxed_str());
+        self.names.lock().unwrap_or_else(|p| p.into_inner()).insert(Arc::as_ptr(&pipeline) as usize, name);
         Some(pipeline)
     }
 }
@@ -522,8 +587,10 @@ impl WgpuBackend {
             pci_bus_id: info.device_pci_bus_id.clone(),
         };
         let limits = adapter.limits();
+        let timestamps = if profile::chain_on() { adapter.features() & wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() };
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("oaiy"),
+            required_features: timestamps,
             required_limits: limits.clone(),
             ..Default::default()
         }))
@@ -563,7 +630,7 @@ impl WgpuBackend {
         });
         Ok(Self {
             cpu: CpuBackend::new(),
-            gpu: Arc::new(Gpu { device, queue, layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), chain_groups: Mutex::new(HashMap::new()), wide: std::sync::OnceLock::new(), chain_groups_wide: Mutex::new(HashMap::new()), dummy: std::sync::OnceLock::new(), dummy_rw: std::sync::OnceLock::new(), limits, staged: AtomicU64::new(0) }),
+            gpu: Arc::new(Gpu { device, queue, layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), names: Mutex::new(HashMap::new()), pool: Mutex::new(Vec::new()), chain_groups: Mutex::new(HashMap::new()), wide: std::sync::OnceLock::new(), chain_groups_wide: Mutex::new(HashMap::new()), dummy: std::sync::OnceLock::new(), dummy_rw: std::sync::OnceLock::new(), limits, staged: AtomicU64::new(0) }),
             budget,
             used: Arc::new(AtomicU64::new(0)),
             summary,

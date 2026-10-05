@@ -392,6 +392,101 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 }
 "#;
 
+/// `y[r, o] = sum over i of x[r, i] w[o, i]` for a prompt's rows ([`MATMUL_F32`]'s, of several): a workgroup a 64x64
+/// tile of `y` (64 rows by 64 outputs), a thread 4x4 of it, `k` 16 at a time through the workgroup's memory; split
+/// over `k` (the grid's third axis, `p[0].w` of it each), split `s`'s sums to part `s` of `y` (`[splits, rows, n]`)
+/// for [`SUM_SPLITS`] to add up. `p[0]`: n, k, rows, k a split.
+const MATMUL_F32_TILED: &str = r#"
+@group(0) @binding(0) var<storage, read> w: array<f32>;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(6) var<storage, read_write> y: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+// [16 of k][64 rows (or outputs)], a row of 17 vec4s (the 17th padding, against bank conflicts)
+var<workgroup> xs: array<vec4<f32>, 272>;
+var<workgroup> ws: array<vec4<f32>, 272>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    let n = p[0].x;
+    let k = p[0].y;
+    let rows = p[0].z;
+    let kc = p[0].w;
+    let o0 = wg.x * 64u;
+    let r0 = wg.y * 64u;
+    let k0 = wg.z * kc;
+    let k1 = min(k, k0 + kc);
+    let tr = t / 16u;
+    let to = t % 16u;
+    var a0 = vec4<f32>(0.0);
+    var a1 = vec4<f32>(0.0);
+    var a2 = vec4<f32>(0.0);
+    var a3 = vec4<f32>(0.0);
+    for (var kb = k0; kb < k1; kb += 16u) {
+        for (var q = 0u; q < 4u; q++) {
+            let idx = t + q * 256u;
+            let rr = idx / 16u;
+            let kk = idx % 16u;
+            let gk = kb + kk;
+            var v = 0.0;
+            if (r0 + rr < rows && gk < k1) {
+                v = x[(r0 + rr) * k + gk];
+            }
+            xs[kk * 17u + rr / 4u][rr % 4u] = v;
+            var u = 0.0;
+            if (o0 + rr < n && gk < k1) {
+                u = w[(o0 + rr) * k + gk];
+            }
+            ws[kk * 17u + rr / 4u][rr % 4u] = u;
+        }
+        workgroupBarrier();
+        for (var kk = 0u; kk < 16u; kk++) {
+            let xv = xs[kk * 17u + tr];
+            let wv = ws[kk * 17u + to];
+            a0 += xv.x * wv;
+            a1 += xv.y * wv;
+            a2 += xv.z * wv;
+            a3 += xv.w * wv;
+        }
+        workgroupBarrier();
+    }
+    let base = wg.z * rows * n;
+    let o = o0 + to * 4u;
+    let r = r0 + tr * 4u;
+    let acc = array<vec4<f32>, 4>(a0, a1, a2, a3);
+    for (var i = 0u; i < 4u; i++) {
+        if (r + i < rows) {
+            for (var j = 0u; j < 4u; j++) {
+                if (o + j < n) {
+                    y[base + (r + i) * n + o + j] = acc[i][j];
+                }
+            }
+        }
+    }
+}
+"#;
+
+/// `y[i] = sum over s of part[s * len + i]`, the splits in order. `p[0]`: len, splits.
+const SUM_SPLITS: &str = r#"
+@group(0) @binding(0) var<storage, read> part: array<f32>;
+@group(0) @binding(6) var<storage, read_write> y: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let len = p[0].x;
+    let i = id.x + id.y * 65535u * 256u;
+    if (i >= len) {
+        return;
+    }
+    var acc = 0.0;
+    for (var s = 0u; s < p[0].y; s++) {
+        acc += part[s * len + i];
+    }
+    y[i] = acc;
+}
+"#;
+
 /// A gated delta net's causal depthwise conv, a thread a channel through the run's tokens (as the host's): its
 /// `kernel - 1` inputs before them from the state, each output through SiLU, the state left with the last inputs.
 /// `p[0]`: the channels, the tokens, the kernel.
@@ -780,7 +875,7 @@ impl DeviceChain for WgpuBackend {
     }
 
     fn begin(&self) -> Box<dyn ChainRecorder + '_> {
-        Box::new(Recorder { backend: self, dispatches: Vec::new(), reads: Vec::new(), keep: true })
+        Box::new(Recorder { backend: self, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new() })
     }
 }
 
@@ -804,9 +899,20 @@ pub(crate) struct Recorder<'a> {
     reads: Vec<(wgpu::Buffer, usize, wgpu::Buffer, usize)>,
     /// Whether bind groups are kept for the steps after ([`ChainRecorder::keep_groups`]).
     keep: bool,
+    /// The scratch it took from the GPU's pool ([`Recorder::scratch`]), given back when it has run.
+    pooled: Vec<(u64, wgpu::Buffer)>,
 }
 
 impl Recorder<'_> {
+    /// A vector of `len` for this recording alone (a prompt's scratch): from the GPU's pool, given back when the
+    /// recording has run, so nothing may keep it. Its values are whatever it last held.
+    pub(crate) fn scratch(&mut self, len: usize) -> DeviceVec {
+        let bytes = ((len.max(1) * 4) as u64).next_power_of_two().max(256);
+        let b = self.gpu().pooled(bytes);
+        self.pooled.push((bytes, b.clone()));
+        DeviceVec { len, inner: Arc::new(b) }
+    }
+
     /// The backend recorded on.
     pub(crate) fn backend(&self) -> &WgpuBackend {
         self.backend
@@ -975,8 +1081,10 @@ impl ChainRecorder for Recorder<'_> {
         let (xh, part, yt, jobs) = if rows == 1 && self.keep {
             (c.xh.clone(), c.part.clone(), c.yt.clone(), c.jobs1.clone())
         } else {
-            let jobs: Vec<u32> = (0..rows as u32).flat_map(|r| [0, r]).collect();
-            (self.backend.vec(rows * k), self.backend.vec(rows * splits as usize * n), self.backend.vec(rows * n), crate::exl3::u32_vec(self.backend, &jobs))
+            let list: Vec<u32> = (0..rows as u32).flat_map(|r| [0, r]).collect();
+            let jobs = self.scratch(list.len());
+            crate::exl3::upload_u32(self.backend, &jobs, &list);
+            (self.scratch(rows * k), self.scratch(rows * splits as usize * n), self.scratch(rows * n), jobs)
         };
         let d = self.gpu().dummy().clone();
         let drw = self.gpu().dummy_rw().clone();
@@ -993,7 +1101,8 @@ impl ChainRecorder for Recorder<'_> {
             // last lone row as one row is
             let lone = rows % 32 == 1;
             let many: Vec<u32> = (0..(rows - lone as usize) as u32).collect::<Vec<_>>().chunks(32).flat_map(|b| b.iter().copied().chain(std::iter::repeat(crate::exl3::NONE)).take(32)).collect();
-            let order = crate::exl3::u32_vec(self.backend, &many);
+            let order = self.scratch(many.len());
+            crate::exl3::upload_u32(self.backend, &order, &many);
             let per = 65535 / splits as usize;
             let blocks = many.len() / 32;
             let kernel = crate::exl3::chain_shader("many");
@@ -1078,8 +1187,29 @@ impl ChainRecorder for Recorder<'_> {
 
     fn matmul_f32_rows(&mut self, w: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize) {
         assert!(w.len >= n * k && x.len >= rows * k && y.len >= rows * n && n <= 65535 && rows <= 65535, "chain: an f32 matmul [{n}, {k}] of {rows} rows");
-        let pipeline = self.named("chain-matmul-f32", MATMUL_F32);
-        self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(y), &[n as u32, k as u32], (n as u32, rows as u32, 1));
+        if rows == 1 {
+            let pipeline = self.named("chain-matmul-f32", MATMUL_F32);
+            self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(y), &[n as u32, k as u32], (n as u32, 1, 1));
+            return;
+        }
+        // a prompt's rows in 64x64 tiles; few tiles (few outputs) split k for a second pass to add up, enough
+        // workgroups to fill the GPU, 256 of k a split at least
+        let tiles = n.div_ceil(64) * rows.div_ceil(64);
+        let want = 1024usize.div_ceil(tiles).min(k / 256).max(1);
+        let kc = k.div_ceil(want).div_ceil(16) * 16;
+        let splits = k.div_ceil(kc);
+        let d = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        let grid = (n.div_ceil(64) as u32, rows.div_ceil(64) as u32, splits as u32);
+        let words = [n as u32, k as u32, rows as u32, kc as u32];
+        if splits == 1 {
+            self.dispatch_wide("chain-matmul-f32-tiled", MATMUL_F32_TILED, [buffer(w), buffer(x), &d, &d, &d, &d, buffer(y), &drw], &words, grid);
+        } else {
+            let part = self.scratch(splits * rows * n);
+            self.dispatch_wide("chain-matmul-f32-tiled", MATMUL_F32_TILED, [buffer(w), buffer(x), &d, &d, &d, &d, buffer(&part), &drw], &words, grid);
+            let len = (rows * n) as u32;
+            self.dispatch_wide("chain-sum-splits", SUM_SPLITS, [buffer(&part), &d, &d, &d, &d, &d, buffer(y), &drw], &[len, splits as u32], (len.div_ceil(256).min(65535), len.div_ceil(256 * 65535), 1));
+        }
     }
 
     fn ssm_conv(&mut self, qkv: &DeviceVec, weight: &DeviceVec, state: &DeviceVec, out: &DeviceVec, rows: usize, channels: usize, kernel: usize) {
@@ -1168,11 +1298,33 @@ impl ChainRecorder for Recorder<'_> {
         self.reads.push((buffer(v).clone(), offset, staging, len));
     }
 
-    fn finish(self: Box<Self>) -> Vec<Vec<f32>> {
+    fn finish(mut self: Box<Self>) -> Vec<Vec<f32>> {
         let _one = self.backend.serial.lock().unwrap_or_else(|p| p.into_inner());
         let start = std::time::Instant::now();
         let mut enc = self.gpu().device.create_command_encoder(&Default::default());
-        {
+        // profiled: each dispatch a pass between two timestamps (up to the query set's 4096)
+        let timed = crate::profile::chain_on() && self.gpu().device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        let mut stamps = None;
+        if timed {
+            let n = self.dispatches.len().min(wgpu::QUERY_SET_MAX_QUERIES as usize / 2);
+            let device = &self.gpu().device;
+            let set = device.create_query_set(&wgpu::QuerySetDescriptor { label: Some("oaiy-chain-profile"), ty: wgpu::QueryType::Timestamp, count: (2 * n).max(2) as u32 });
+            for (i, (pipeline, group, (x, y, z))) in self.dispatches.iter().enumerate() {
+                let timestamp_writes = (i < n).then(|| wgpu::ComputePassTimestampWrites { query_set: &set, beginning_of_pass_write_index: Some(2 * i as u32), end_of_pass_write_index: Some(2 * i as u32 + 1) });
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes });
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, group, &[]);
+                pass.dispatch_workgroups(*x, *y, *z);
+            }
+            let bytes = (16 * n).max(16) as u64;
+            let resolved = device.create_buffer(&wgpu::BufferDescriptor { label: Some("oaiy-chain-profile"), size: bytes, usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+            let staging = device.create_buffer(&wgpu::BufferDescriptor { label: Some("oaiy-chain-profile-read"), size: bytes, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+            if n > 0 {
+                enc.resolve_query_set(&set, 0..2 * n as u32, &resolved, 0);
+                enc.copy_buffer_to_buffer(&resolved, 0, &staging, 0, bytes);
+            }
+            stamps = Some((staging, n));
+        } else {
             let mut pass = enc.begin_compute_pass(&Default::default());
             for (pipeline, group, (x, y, z)) in &self.dispatches {
                 pass.set_pipeline(pipeline);
@@ -1189,7 +1341,26 @@ impl ChainRecorder for Recorder<'_> {
         for (_, _, staging, len) in &self.reads {
             staging.slice(..(*len as u64 * 4).max(4)).map_async(wgpu::MapMode::Read, |_| {});
         }
+        if let Some((staging, _)) = &stamps {
+            staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        }
         self.gpu().device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).expect("webgpu: device lost while waiting for a chain");
+        let pooled = std::mem::take(&mut self.pooled);
+        self.gpu().unpool(pooled);
+        if let Some((staging, n)) = stamps {
+            let period = self.gpu().queue.get_timestamp_period() as f64;
+            let view = staging.slice(..).get_mapped_range().expect("webgpu: mapping the profile");
+            let ticks: Vec<u64> = view.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().expect("8 bytes"))).collect();
+            drop(view);
+            staging.unmap();
+            let mut k = crate::profile::KERNELS.lock().unwrap_or_else(|p| p.into_inner());
+            for (i, (pipeline, _, _)) in self.dispatches.iter().take(n).enumerate() {
+                let ns = (ticks[2 * i + 1].saturating_sub(ticks[2 * i]) as f64 * period) as u64;
+                let e = k.entry(self.gpu().name_of(pipeline)).or_default();
+                e.0 += ns;
+                e.1 += 1;
+            }
+        }
         let out = self
             .reads
             .iter()
@@ -1708,4 +1879,32 @@ mod tests {
         let want_acc: Vec<f32> = y.iter().map(|v| v + -1.25 * v).collect();
         close(&got[5], &want_acc, "the weighted term");
     }
+    /// A prompt's f32 matmul (64x64 tiles, `k` split where the tiles are few) gives the CPU's sums: shapes off the tiles'
+    /// edges, a long `k` over few outputs (Qwen3.8-Flash-Next's hyper-connections' and router's), a short one over many;
+    /// twice, the second from the pool's scratch as the first left it.
+    #[test]
+    fn a_prompts_f32_matmul_tiles_and_splits_as_the_cpu() {
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        let mut r = rng(91);
+        for (n, k, rows) in [(5usize, 37usize, 3usize), (70, 100, 65), (324, 10240, 70), (513, 2560, 129), (1030, 324, 64)] {
+            let w: Vec<f32> = (0..n * k).map(|_| r()).collect();
+            let x: Vec<f32> = (0..rows * k).map(|_| r()).collect();
+            let want: Vec<f32> = (0..rows).flat_map(|i| (0..n).map(|o| (0..k).map(|j| w[o * k + j] as f64 * x[i * k + j] as f64).sum::<f64>() as f32).collect::<Vec<_>>()).collect();
+            let (wd, xd, yd) = (b.vec(n * k), b.vec(rows * k), b.vec(rows * n));
+            DeviceChain::upload(&b, &wd, &w);
+            DeviceChain::upload(&b, &xd, &x);
+            for _ in 0..2 {
+                let mut rec = b.begin();
+                rec.keep_groups(false);
+                rec.matmul_f32_rows(&wd, n, k, &xd, &yd, rows);
+                rec.read(&yd);
+                let got = rec.finish().pop().unwrap();
+                let scale = (k as f32).sqrt();
+                for (i, (g, e)) in got.iter().zip(&want).enumerate() {
+                    assert!((g - e).abs() <= 1e-4 * scale, "[{n}, {k}] of {rows} rows [{i}]: {g} against {e}");
+                }
+            }
+        }
+    }
+
 }

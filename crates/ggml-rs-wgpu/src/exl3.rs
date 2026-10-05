@@ -972,11 +972,15 @@ pub(crate) struct Exl3Chain {
 
 /// `values` (u32s) as a chain's vector (their bits).
 pub(crate) fn u32_vec(b: &WgpuBackend, values: &[u32]) -> DeviceVec {
-    use ggml_rs::DeviceChain;
-    let v = b.vec(values.len());
-    let as_f32: Vec<f32> = values.iter().map(|&w| f32::from_bits(w)).collect();
-    DeviceChain::upload(b, &v, &as_f32);
+    let v = ggml_rs::DeviceChain::vec(b, values.len());
+    upload_u32(b, &v, values);
     v
+}
+
+/// `values` (u32s) into a chain's vector `v` (their bits).
+pub(crate) fn upload_u32(b: &WgpuBackend, v: &DeviceVec, values: &[u32]) {
+    let as_f32: Vec<f32> = values.iter().map(|&w| f32::from_bits(w)).collect();
+    ggml_rs::DeviceChain::upload(b, v, &as_f32);
 }
 
 impl Exl3Gpu {
@@ -1199,27 +1203,28 @@ impl Exl3MoeGrouped {
         Arc::ptr_eq(&self.b.gpu, gpu)
     }
 
-    /// Scratch for `rows` rows of `top_k` experts.
-    fn scratch(&self, rows: usize, top_k: usize) -> Step {
-        let b = &self.b;
+    /// Scratch for `rows` rows of `top_k` experts, from `vec`: a step's (one row) the groups' splits, a prompt's (each
+    /// expert's rows in blocks) one split.
+    fn scratch(&self, vec: &mut dyn FnMut(usize) -> DeviceVec, rows: usize, top_k: usize) -> Step {
         let (h, f) = (self.hidden, self.ff);
         let pairs = rows * top_k;
+        let (sgu, sd) = if rows > 1 { (1, 1) } else { (self.gu.splits as usize, self.down.splits as usize) };
         Step {
             top_k,
-            jobs_gu: b.vec(4 * pairs),
-            jobs_d: b.vec(2 * pairs),
-            w: b.vec(rows * (top_k + 1)),
-            xh_gu: b.vec(2 * pairs * h),
-            part_gu: b.vec(2 * pairs * self.gu.splits as usize * f),
-            out_gu: b.vec(2 * pairs * f),
-            act: b.vec(pairs * f),
-            xh_d: b.vec(pairs * f),
-            part_d: b.vec(pairs * self.down.splits as usize * h),
-            out_d: b.vec(pairs * h),
-            sg: b.vec(rows * f),
-            su: b.vec(rows * f),
-            sa: b.vec(rows * f),
-            sd: b.vec(rows * h),
+            jobs_gu: vec(4 * pairs),
+            jobs_d: vec(2 * pairs),
+            w: vec(rows * (top_k + 1)),
+            xh_gu: vec(2 * pairs * h),
+            part_gu: vec(2 * pairs * sgu * f),
+            out_gu: vec(2 * pairs * f),
+            act: vec(pairs * f),
+            xh_d: vec(pairs * f),
+            part_d: vec(pairs * sd * h),
+            out_d: vec(pairs * h),
+            sg: vec(rows * f),
+            su: vec(rows * f),
+            sa: vec(rows * f),
+            sd: vec(rows * h),
         }
     }
 
@@ -1229,13 +1234,14 @@ impl Exl3MoeGrouped {
         if let Some(st) = s.as_ref().filter(|st| st.top_k == top_k) {
             return Arc::clone(st);
         }
-        let st = Arc::new(self.scratch(1, top_k));
+        let st = Arc::new(self.scratch(&mut |n| self.b.vec(n), 1, top_k));
         *s = Some(Arc::clone(&st));
         st
     }
 
     /// One group's jobs (`jobs`, `count` of them) on `x`: its input transforms, matmul and output transforms into `y`.
-    /// `order`: a prompt's jobs in blocks of one matrix (and the blocks' count), each tile decoded once a block.
+    /// `order`: a prompt's jobs in blocks of one matrix (and the blocks' count), each tile decoded once a block, in one
+    /// split (a prompt has workgroups enough without, and its partial sums are the smaller).
     #[allow(clippy::too_many_arguments)]
     fn group_pass(&self, rec: &mut crate::chain::Recorder<'_>, g: &Group, x: &DeviceVec, jobs: &DeviceVec, count: usize, order: Option<(&DeviceVec, usize)>, xh: &DeviceVec, part: &DeviceVec, y: &DeviceVec) {
         let d = rec.gpu().dummy().clone();
@@ -1245,14 +1251,15 @@ impl Exl3MoeGrouped {
         let (suh, svh) = (buf(&g.suh), buf(&g.svh));
         rec.dispatch_wide("exl3-pre", &chain_shader("pre"), [&xb, &suh, &d, &jb, &d, &d, &xhb, &drw], &[g.k as u32, 1], ((g.k / 128) as u32, count as u32, 1));
         let ntiles = (g.n / 16) as u32;
+        let splits = if order.is_some() { 1 } else { g.splits };
         // as many jobs (or blocks) a pass as the grid's third axis takes
-        let per = (65535 / g.splits) as usize;
+        let per = (65535 / splits) as usize;
         match order {
             Some((order, blocks)) => {
                 let ob = buf(order);
                 for first in (0..blocks).step_by(per) {
                     let these = per.min(blocks - first) as u32;
-                    rec.dispatch_wide("exl3-many", &chain_shader("many"), [&g.words, &xhb, &jb, &ob, &d, &d, &pb, &drw], &[g.n as u32, g.k as u32, g.tw as u32, g.splits, g.mwords as u32, first as u32], (ntiles.min(65535), ntiles.div_ceil(65535), these * g.splits));
+                    rec.dispatch_wide("exl3-many", &chain_shader("many"), [&g.words, &xhb, &jb, &ob, &d, &d, &pb, &drw], &[g.n as u32, g.k as u32, g.tw as u32, splits, g.mwords as u32, first as u32], (ntiles.min(65535), ntiles.div_ceil(65535), these * splits));
                 }
             }
             None => {
@@ -1262,7 +1269,7 @@ impl Exl3MoeGrouped {
                 }
             }
         }
-        rec.dispatch_wide("exl3-post", &chain_shader("post"), [&pb, &svh, &jb, &d, &d, &d, &yb, &drw], &[g.n as u32, g.splits], ((g.n / 128) as u32, count as u32, 1));
+        rec.dispatch_wide("exl3-post", &chain_shader("post"), [&pb, &svh, &jb, &d, &d, &d, &yb, &drw], &[g.n as u32, splits], ((g.n / 128) as u32, count as u32, 1));
     }
 
     /// Record `assign`'s experts for each row of `x` into `out` (see `ChainRecorder::moe_rows`).
@@ -1289,7 +1296,7 @@ impl Exl3MoeGrouped {
         let pairs = rows * top_k;
         // a step's one row: the kept scratch (its bind groups kept); else this call's (the bind groups hold its buffers
         // until the GPU has run)
-        let st = if rows == 1 && rec.keeps() { self.step(top_k) } else { Arc::new(self.scratch(rows, top_k)) };
+        let st = if rows == 1 && rec.keeps() { self.step(top_k) } else { Arc::new(self.scratch(&mut |n| rec.scratch(n), rows, top_k)) };
         let up = |v: &DeviceVec, data: &[u32]| DeviceChain::upload(&b, v, &data.iter().map(|&u| f32::from_bits(u)).collect::<Vec<_>>());
         up(&st.jobs_gu, &jobs_gu);
         up(&st.jobs_d, &jobs_d);
@@ -1297,9 +1304,9 @@ impl Exl3MoeGrouped {
         let (jgu, jd, wv, xh_gu, part_gu, out_gu, act, xh_d, part_d, out_d, sg, su, sa, sd) =
             (&st.jobs_gu, &st.jobs_d, &st.w, &st.xh_gu, &st.part_gu, &st.out_gu, &st.act, &st.xh_d, &st.part_d, &st.out_d, &st.sg, &st.su, &st.sa, &st.sd);
         // a prompt's rows: each expert's in blocks, a tile decoded once a block
-        let order = |jobs: &[u32]| {
+        let mut order = |jobs: &[u32]| {
             let o = many_order(jobs);
-            let v = b.vec(o.len());
+            let v = rec.scratch(o.len());
             up(&v, &o);
             (v, o.len() / 32)
         };

@@ -30,9 +30,18 @@ pub trait Experts: std::fmt::Debug + Send + Sync {
 /// `logits.len() - 1`) weighted by the sigmoid of its gate.
 pub fn route(logits: &[f32], top_k: usize) -> Vec<(usize, f32)> {
     let routed = logits.len() - 1;
-    let mut order: Vec<usize> = (0..routed).collect();
-    order.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
-    let top = &order[..top_k.min(routed)];
+    let k = top_k.min(routed);
+    // the top k in one pass (a prompt routes each of its rows at every layer): the list kept by logit, a tie after the
+    // lower index already in it, as the experts come in order
+    let mut top: Vec<usize> = Vec::with_capacity(k + 1);
+    for (e, &v) in logits[..routed].iter().enumerate() {
+        if top.len() == k && (k == 0 || v <= logits[top[k - 1]]) {
+            continue;
+        }
+        let at = top.partition_point(|&o| logits[o] >= v);
+        top.insert(at, e);
+        top.truncate(k);
+    }
     let max = logits[top[0]];
     let sum: f32 = top.iter().map(|&e| (logits[e] - max).exp()).sum();
     let mut out: Vec<(usize, f32)> = top.iter().map(|&e| (e, (logits[e] - max).exp() / sum)).collect();
@@ -146,5 +155,35 @@ mod tests {
         d.suh[0] = 1.0;
         d.tile_words = 52;
         assert!(d.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::route;
+
+    /// The routing's top k against a full sort's (by logit, a tie to the lower index), ties and all.
+    #[test]
+    fn routing_picks_what_a_full_sort_picks() {
+        let mut s = 12_345u32;
+        for case in 0..400 {
+            let n = [9usize, 65, 513][case % 3];
+            // few distinct values in some cases, so ties are common
+            let levels = [3u32, 50, 1 << 20][case % 3];
+            let logits: Vec<f32> = (0..n)
+                .map(|_| {
+                    s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (s >> 8) as f32 % levels as f32 / levels as f32 * 8.0 - 4.0
+                })
+                .collect();
+            for top_k in [1, 2, 8, 10] {
+                let mut order: Vec<usize> = (0..n - 1).collect();
+                order.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap().then(a.cmp(&b)));
+                let want: Vec<usize> = order[..top_k.min(n - 1)].to_vec();
+                let got: Vec<usize> = route(&logits, top_k).iter().map(|p| p.0).collect();
+                assert_eq!(&got[..got.len() - 1], &want[..], "case {case}, top {top_k}");
+                assert_eq!(got[got.len() - 1], n - 1, "the shared expert last");
+            }
+        }
     }
 }

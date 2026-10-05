@@ -1401,6 +1401,63 @@ mod dense_webgpu_timing {
         assert!(after_steps > 0.99 && after_host > 0.99, "{after_steps} {after_host}");
     }
 
+    /// Where a chained Qwen3.8-Flash-Next run's time goes (FLASHNEXT_MODEL): a prompt's chunk of 512 and decode steps,
+    /// each kernel's GPU time with OAIY_CHAIN_PROFILE set (`ggml_rs_wgpu::profile::take_kernels`).
+    #[test]
+    #[ignore = "a timing; needs WebGPU adapters with room for Qwen3.8-Flash-Next (FLASHNEXT_MODEL); run with --nocapture"]
+    fn measure_a_chained_flashnext() {
+        use std::sync::Arc;
+        use std::time::Instant;
+        let path = std::env::var("FLASHNEXT_MODEL").unwrap_or_else(|_| r"E:\models\Qwen3.8-Flash-Next\exl3-3.05bpw".into());
+        let Ok(b0) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
+        let others: Vec<Arc<ggml_rs_wgpu::WgpuBackend>> = b0.others(None).into_iter().map(Arc::new).collect();
+        let b0 = Arc::new(b0);
+        let gpus: Vec<&ggml_rs_wgpu::WgpuBackend> = std::iter::once(b0.as_ref()).chain(others.iter().map(|g| g.as_ref())).collect();
+        let backends: Vec<Arc<dyn ggml_rs::Backend>> = std::iter::once(Arc::clone(&b0) as Arc<dyn ggml_rs::Backend>).chain(others.iter().map(|g| Arc::clone(g) as Arc<dyn ggml_rs::Backend>)).collect();
+        type Make<'a> = Box<dyn Fn(ggml_rs::exl3::Exl3Data) -> std::result::Result<Arc<dyn ggml_rs::exl3::PackedLinear>, String> + Send + Sync + 'a>;
+        let packed = |device: usize| -> Make<'_> {
+            let b = gpus[device];
+            Box::new(move |d| b.exl3(d))
+        };
+        let p = std::path::Path::new(&path);
+        let reserve = crate::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
+        let experts = |device: usize, _layer: &str, list: Vec<[ggml_rs::exl3::Exl3Data; 3]>| -> oaiy_engine::Result<Box<dyn ggml_rs::exl3::Experts>> {
+            gpus[device].exl3_experts_leaving(list, reserve).map_err(oaiy_engine::Error::Arg)
+        };
+        let model = crate::flashnext::load_portable(p, backends, &packed, &experts).unwrap();
+        let tokens: Vec<u32> = (0..1100u32).map(|i| 1000 + (i * 7919) % 20000).collect();
+        let mut kv = model.new_kv_cache(2048);
+        let report = |what: &str, wall: f64| {
+            let k = ggml_rs_wgpu::profile::take_kernels();
+            let gpu: f64 = k.iter().map(|e| e.1).sum();
+            eprintln!("{what}: {wall:.1} ms, of it the GPU's kernels {gpu:.1} ms");
+            for (name, ms, n) in k.iter().take(14) {
+                eprintln!("  {name:<28} {ms:>9.2} ms {n:>6}");
+            }
+        };
+        let mut at = 0;
+        for (i, n) in [512usize, 512, 64].into_iter().enumerate() {
+            let e = model.embed_text(&tokens[at..at + n]).unwrap();
+            let _ = ggml_rs_wgpu::profile::take_kernels();
+            let t = Instant::now();
+            let _ = model.forward(&tokens[at..at + n], &e, &mut kv, None).unwrap();
+            report(&format!("chunk {i} of {n} at {at}"), t.elapsed().as_secs_f64() * 1e3);
+            at += n;
+        }
+        let mut next = 1234u32;
+        for step in 0..4 {
+            let e = model.embed_text(&[next]).unwrap();
+            let _ = ggml_rs_wgpu::profile::take_kernels();
+            let t = Instant::now();
+            let l = model.forward(&[next], &e, &mut kv, None).unwrap();
+            if step == 3 {
+                report("a decode step", t.elapsed().as_secs_f64() * 1e3);
+            }
+            next = l.data().iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
+        }
+        assert_eq!(model.chain_runs(), 7, "every run chained");
+    }
+
     /// Where a chained Qwen3.5 run's time goes (QWEN35_MODEL): prompt chunks of a few tokens as the server's
     /// checkpoints cut them, a checkpoint's read of the recurrent state, decode steps, and a chunk of 512.
     #[test]
