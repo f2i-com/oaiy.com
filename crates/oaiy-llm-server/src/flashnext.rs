@@ -665,12 +665,13 @@ mod reserve_tests {
     }
 }
 
-/// Flash-Next without CUDA: every tensor on `backend`, each EXL3 matrix as `packed` makes it and each layer's experts
-/// as `experts` does (on any GPU through WebGPU, else on the CPU), no PEFT adapters, a decode step uncaptured.
-/// (A CUDA build loads it on the cards.)
+/// Flash-Next without CUDA: its layers split over `backends` (a whole layer, its experts too, on each; the head on
+/// the last), each EXL3 matrix as `packed` makes it on its device and each layer's experts as `experts` does (on any
+/// GPU through WebGPU, else on the CPU), no PEFT adapters, a decode step uncaptured. (A CUDA build loads it on the
+/// cards.)
 #[cfg_attr(feature = "cuda", allow(dead_code))]
-pub(crate) fn load_portable(path: &Path, backend: Arc<dyn Backend>, packed: Packer<'_>, experts: ExpertMaker<'_>) -> Result<FlashNext> {
-    build(path, vec![backend], Vec::new(), &[], packed, experts)
+pub(crate) fn load_portable(path: &Path, backends: Vec<Arc<dyn Backend>>, packed: Packer<'_>, experts: ExpertMaker<'_>) -> Result<FlashNext> {
+    build(path, backends, Vec::new(), &[], packed, experts)
 }
 
 fn build(path: &Path, backends: Vec<Arc<dyn Backend>>, cudas: Vec<Arc<Card>>, lora: &[Adapter], packed: Packer<'_>, make_experts: ExpertMaker<'_>) -> Result<FlashNext> {
