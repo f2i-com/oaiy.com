@@ -785,20 +785,20 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 }
 "#;
 
-/// The splits of a tensor-core matmul's `steps` (of 64) for `groups` workgroups on a GPU of `units` (its SMs: a
+/// The splits of a tensor-core matmul's `steps` (of 32) for `groups` workgroups on a GPU of `units` (its SMs: a
 /// workgroup alone on one runs about twice as fast as two together): the fewest of those that take least time, each
 /// wave of `units` workgroups taking as long however full, and each split's sums written and read again besides (as
-/// much as the matmul's own time `4 s / k` per FLOP of the GPU's per byte, taken as 100), at most 8 splits of 4 steps
+/// much as the matmul's own time `4 s / k` per FLOP of the GPU's per byte, taken as 100), at most 8 splits of 8 steps
 /// or more; and how many that is with none empty.
 pub fn coop_splits(groups: u32, units: u32, steps: u32) -> u32 {
     let slots = units.max(1);
-    let k = (steps * 64) as f64;
+    let k = (steps * 32) as f64;
     let cost = |s: u32| {
         let w = groups * s;
         let waves = w.div_ceil(slots) * slots;
         waves as f64 / w as f64 + if s > 1 { 400.0 * s as f64 / k } else { 0.0 }
     };
-    let most = (steps / 4).clamp(1, 8);
+    let most = (steps / 8).clamp(1, 8);
     let s = (1..=most).fold(1, |best, s| if cost(s) < cost(best) - 1e-9 { s } else { best });
     steps.div_ceil(steps.div_ceil(s))
 }
@@ -808,15 +808,17 @@ const COOP_KERNEL: &str = r#"enable f16;
 enable wgpu_cooperative_matrix;
 struct Params { k: u32, n: u32, m: u32, row0: u32, rows: u32, row_bytes: u32, splits: u32, _pad1: u32, }
 WEIGHTS_BINDING
-@group(0) @binding(1) var<storage, read> x16: array<f16>;
+@group(0) @binding(1) var<storage, read> x16: array<vec4<f16>>;
 @group(0) @binding(2) var<storage, read_write> y: array<f32>;
 @group(0) @binding(3) var<uniform> p: Params;
 
-// two steps' weights [row][k] as f16, four to a vec4, a row 18 vec4s apart (16 bytes past the step's 64, against bank
-// conflicts): one decoded while the other's are multiplied; a subgroup's fragment staged at a tile's edge
-const STRIDE4: u32 = 18u;
-const BUF4: u32 = 2304u;
-var<workgroup> wt: array<vec4<f16>, 4608>;
+// two steps' weights [row][k] and tokens [token][k] as f16, four to a vec4, a row 10 vec4s apart (8 halves past the
+// step's 32: a fragment's 8 rows a load in banks of their own): one step's loaded and stored while the other's are
+// multiplied; a subgroup's fragment staged at a tile's edge
+const S4: u32 = 10u;
+const BUF4: u32 = 1280u;
+var<workgroup> wt: array<vec4<f16>, 2560>;
+var<workgroup> xt: array<vec4<f16>, 2560>;
 var<workgroup> edge: array<f32, 2048>;
 
 DECODE_HELPERS
@@ -836,17 +838,19 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     // the subgroup's 32 rows by 64 tokens of the tile
     let sr = (sg % 4u) * 32u;
     let st = (sg / 4u) * 64u;
-    // what this thread decodes: weight row lr's 32-block lh of a step
+    // what this thread decodes and copies: weight row lr's half lh of a step's 32, and token row lr's
     let lr = li / 2u;
     let lh = li % 2u;
     let rr = r0 + lr;
+    let rl = min(rr, p.rows - 1u);
     let kx = p.k;
     // the workgroup's split of the steps (`wg.z` of `p.splits`, none empty), its sums that split's part of `y`
-    let all = p.k / 64u;
+    let all = p.k / 32u;
     let per = (all + p.splits - 1u) / p.splits;
     let s0 = wg.z * per;
     let s1 = min(all, s0 + per);
     let zo = wg.z * p.m * p.n;
+    let xo = ((t0 + lr) * kx + lh * 16u) / 4u;
     var c00 = coop_mat16x16<f32, C>();
     var c01 = coop_mat16x16<f32, C>();
     var c02 = coop_mat16x16<f32, C>();
@@ -855,36 +859,65 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     var c11 = coop_mat16x16<f32, C>();
     var c12 = coop_mat16x16<f32, C>();
     var c13 = coop_mat16x16<f32, C>();
-    // the first step's weights, then each step's next decoded as it multiplies
+    // the words of a step's weights and tokens this thread decodes and copies, loaded a step ahead
+DECODE_REGS
+    var xr0 = vec4<f16>();
+    var xr1 = vec4<f16>();
+    var xr2 = vec4<f16>();
+    var xr3 = vec4<f16>();
+    // the first step's; then each step's next loaded before it multiplies (the loads in flight as it does) and stored
+    // after
+    {
+        let b = s0;
+        LOAD_BLOCK
+        let xb = xo + b * 8u;
+        xr0 = x16[xb];
+        xr1 = x16[xb + 1u];
+        xr2 = x16[xb + 2u];
+        xr3 = x16[xb + 3u];
+    }
     {
         let b = s0;
         let buf = (s0 % 2u) * BUF4;
         DECODE_STEP
+        let xa = buf + lr * S4 + lh * 4u;
+        xt[xa] = xr0;
+        xt[xa + 1u] = xr1;
+        xt[xa + 2u] = xr2;
+        xt[xa + 3u] = xr3;
     }
     workgroupBarrier();
     for (var b0 = s0; b0 < s1; b0++) {
-        if (b0 + 1u < s1) {
-            let b = b0 + 1u;
-            let buf = (b % 2u) * BUF4;
-            DECODE_STEP
+        // the next step (the last's own again, stored where no one reads it after): loaded, multiplied, stored, with
+        // no branch between (a branch lets the compiler sink the loads to their stores, past the multiplies)
+        let b = min(b0 + 1u, s1 - 1u);
+        let buf = ((b0 + 1u) % 2u) * BUF4;
+        if (b % 8u == 0u && b != b0) {
+            LOAD_BLOCK
         }
+        let xb = xo + b * 8u;
+        xr0 = x16[xb];
+        xr1 = x16[xb + 1u];
+        xr2 = x16[xb + 2u];
+        xr3 = x16[xb + 3u];
         let cur = (b0 % 2u) * BUF4;
         // (every index and stride a `let` of its own: naga's SPIR-V wants a cooperative load's and store's operands
-        // emitted before them); the tokens' fragments straight from their f16 rows (padded to the tile)
-        for (var kk = 0u; kk < 64u; kk += 16u) {
-            let s18 = STRIDE4;
-            let ia0 = cur + sr * STRIDE4 + kk / 4u;
-            let ia1 = cur + (sr + 16u) * STRIDE4 + kk / 4u;
-            let ib0 = (t0 + st) * kx + b0 * 64u + kk;
-            let ib1 = ib0 + 16u * kx;
-            let ib2 = ib0 + 32u * kx;
-            let ib3 = ib0 + 48u * kx;
-            let a0 = coopLoadT<coop_mat16x16<f16, A>>(&wt[ia0], s18);
-            let a1 = coopLoadT<coop_mat16x16<f16, A>>(&wt[ia1], s18);
-            let b0f = coopLoad<coop_mat16x16<f16, B>>(&x16[ib0], kx);
-            let b1f = coopLoad<coop_mat16x16<f16, B>>(&x16[ib1], kx);
-            let b2f = coopLoad<coop_mat16x16<f16, B>>(&x16[ib2], kx);
-            let b3f = coopLoad<coop_mat16x16<f16, B>>(&x16[ib3], kx);
+        // emitted before them); k's two halves of 16 written out
+        {
+            let kk = 0u;
+            let s10 = S4;
+            let ia0 = cur + sr * S4 + kk / 4u;
+            let ia1 = cur + (sr + 16u) * S4 + kk / 4u;
+            let ib0 = cur + st * S4 + kk / 4u;
+            let ib1 = ib0 + 16u * S4;
+            let ib2 = ib0 + 32u * S4;
+            let ib3 = ib0 + 48u * S4;
+            let a0 = coopLoadT<coop_mat16x16<f16, A>>(&wt[ia0], s10);
+            let a1 = coopLoadT<coop_mat16x16<f16, A>>(&wt[ia1], s10);
+            let b0f = coopLoad<coop_mat16x16<f16, B>>(&xt[ib0], s10);
+            let b1f = coopLoad<coop_mat16x16<f16, B>>(&xt[ib1], s10);
+            let b2f = coopLoad<coop_mat16x16<f16, B>>(&xt[ib2], s10);
+            let b3f = coopLoad<coop_mat16x16<f16, B>>(&xt[ib3], s10);
             c00 = coopMultiplyAdd(a0, b0f, c00);
             c01 = coopMultiplyAdd(a0, b1f, c01);
             c02 = coopMultiplyAdd(a0, b2f, c02);
@@ -894,6 +927,36 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
             c12 = coopMultiplyAdd(a1, b2f, c12);
             c13 = coopMultiplyAdd(a1, b3f, c13);
         }
+        {
+            let kk = 16u;
+            let s10 = S4;
+            let ia0 = cur + sr * S4 + kk / 4u;
+            let ia1 = cur + (sr + 16u) * S4 + kk / 4u;
+            let ib0 = cur + st * S4 + kk / 4u;
+            let ib1 = ib0 + 16u * S4;
+            let ib2 = ib0 + 32u * S4;
+            let ib3 = ib0 + 48u * S4;
+            let a0 = coopLoadT<coop_mat16x16<f16, A>>(&wt[ia0], s10);
+            let a1 = coopLoadT<coop_mat16x16<f16, A>>(&wt[ia1], s10);
+            let b0f = coopLoad<coop_mat16x16<f16, B>>(&xt[ib0], s10);
+            let b1f = coopLoad<coop_mat16x16<f16, B>>(&xt[ib1], s10);
+            let b2f = coopLoad<coop_mat16x16<f16, B>>(&xt[ib2], s10);
+            let b3f = coopLoad<coop_mat16x16<f16, B>>(&xt[ib3], s10);
+            c00 = coopMultiplyAdd(a0, b0f, c00);
+            c01 = coopMultiplyAdd(a0, b1f, c01);
+            c02 = coopMultiplyAdd(a0, b2f, c02);
+            c03 = coopMultiplyAdd(a0, b3f, c03);
+            c10 = coopMultiplyAdd(a1, b0f, c10);
+            c11 = coopMultiplyAdd(a1, b1f, c11);
+            c12 = coopMultiplyAdd(a1, b2f, c12);
+            c13 = coopMultiplyAdd(a1, b3f, c13);
+        }
+        DECODE_STEP
+        let xa = buf + lr * S4 + lh * 4u;
+        xt[xa] = xr0;
+        xt[xa + 1u] = xr1;
+        xt[xa + 2u] = xr2;
+        xt[xa + 3u] = xr3;
         workgroupBarrier();
     }
     // out: y[token, row] is the tile's (row, token) column-major, a token's rows `n` apart
@@ -968,59 +1031,63 @@ fn scale_min(h: vec4<u32>, j: u32) -> vec2<f32> {
     return vec2<f32>(f32(sc), f32(mn));
 }
 "#;
-const COOP_Q4K_STEP: &str = r#"let at4 = buf + lr * STRIDE4 + lh * 8u;
+const COOP_Q4K_REGS: &str = r#"    var hdw = vec4<u32>();
+    var q0w = vec4<u32>();
+    var q1w = vec4<u32>();
+    var q2w = vec4<u32>();
+    var q3w = vec4<u32>();"#;
+const COOP_Q4K_LOAD: &str = r#"let lb4 = rl * (p.row_bytes / 16u) + (b / 8u) * 9u;
+        hdw = w4[lb4];
+        q0w = w4[lb4 + 1u + lh];
+        q1w = w4[lb4 + 3u + lh];
+        q2w = w4[lb4 + 5u + lh];
+        q3w = w4[lb4 + 7u + lh];"#;
+const COOP_Q4K_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
         if (rr < p.rows) {
-            let bb = 2u * b + lh;
-            let blk = bb / 8u;
-            let sb = bb % 8u;
-            let pr = sb / 2u;
+            let sb = b % 8u;
             let sh = 4u * (sb % 2u);
-            let b4 = rr * (p.row_bytes / 16u) + blk * 9u;
-            let hd = w4[b4];
-            let qa = w4[b4 + 1u + 2u * pr];
-            let qb = w4[b4 + 2u + 2u * pr];
-            let dm = unpack2x16float(hd.x);
-            let smn = scale_min(hd, sb);
+            let pr = sb / 2u;
+            let qw = select(select(q0w, q1w, pr == 1u), select(q2w, q3w, pr == 3u), pr >= 2u);
+            let dm = unpack2x16float(hdw.x);
+            let smn = scale_min(hdw, sb);
             let dsc = dm.x * smn.x;
             let dmn = vec4<f32>(dm.y * smn.y);
-            wt[at4] = vec4<f16>(dsc * byte_less((qa.x >> sh) & 0x0f0f0f0fu, 0.0) - dmn);
-            wt[at4 + 1u] = vec4<f16>(dsc * byte_less((qa.y >> sh) & 0x0f0f0f0fu, 0.0) - dmn);
-            wt[at4 + 2u] = vec4<f16>(dsc * byte_less((qa.z >> sh) & 0x0f0f0f0fu, 0.0) - dmn);
-            wt[at4 + 3u] = vec4<f16>(dsc * byte_less((qa.w >> sh) & 0x0f0f0f0fu, 0.0) - dmn);
-            wt[at4 + 4u] = vec4<f16>(dsc * byte_less((qb.x >> sh) & 0x0f0f0f0fu, 0.0) - dmn);
-            wt[at4 + 5u] = vec4<f16>(dsc * byte_less((qb.y >> sh) & 0x0f0f0f0fu, 0.0) - dmn);
-            wt[at4 + 6u] = vec4<f16>(dsc * byte_less((qb.z >> sh) & 0x0f0f0f0fu, 0.0) - dmn);
-            wt[at4 + 7u] = vec4<f16>(dsc * byte_less((qb.w >> sh) & 0x0f0f0f0fu, 0.0) - dmn);
+            wt[at4] = vec4<f16>(dsc * byte_less((qw.x >> sh) & 0x0f0f0f0fu, 0.0) - dmn);
+            wt[at4 + 1u] = vec4<f16>(dsc * byte_less((qw.y >> sh) & 0x0f0f0f0fu, 0.0) - dmn);
+            wt[at4 + 2u] = vec4<f16>(dsc * byte_less((qw.z >> sh) & 0x0f0f0f0fu, 0.0) - dmn);
+            wt[at4 + 3u] = vec4<f16>(dsc * byte_less((qw.w >> sh) & 0x0f0f0f0fu, 0.0) - dmn);
         } else {
-            for (var i = 0u; i < 8u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }
+            for (var i = 0u; i < 4u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }
         }"#;
-const COOP_Q5K_STEP: &str = r#"let at4 = buf + lr * STRIDE4 + lh * 8u;
+const COOP_Q5K_REGS: &str = r#"    var hdw = vec4<u32>();
+    var hw = vec4<u32>();
+    var q0w = vec4<u32>();
+    var q1w = vec4<u32>();
+    var q2w = vec4<u32>();
+    var q3w = vec4<u32>();"#;
+const COOP_Q5K_LOAD: &str = r#"let lb4 = rl * (p.row_bytes / 16u) + (b / 8u) * 11u;
+        hdw = w4[lb4];
+        hw = w4[lb4 + 1u + lh];
+        q0w = w4[lb4 + 3u + lh];
+        q1w = w4[lb4 + 5u + lh];
+        q2w = w4[lb4 + 7u + lh];
+        q3w = w4[lb4 + 9u + lh];"#;
+const COOP_Q5K_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
         if (rr < p.rows) {
-            let bb = 2u * b + lh;
-            let blk = bb / 8u;
-            let sb = bb % 8u;
-            let pr = sb / 2u;
+            let sb = b % 8u;
             let sh = 4u * (sb % 2u);
-            let b4 = rr * (p.row_bytes / 16u) + blk * 11u;
-            let hd = w4[b4];
-            let h0 = w4[b4 + 1u];
-            let h1 = w4[b4 + 2u];
-            let qa = w4[b4 + 3u + 2u * pr];
-            let qb = w4[b4 + 4u + 2u * pr];
-            let dm = unpack2x16float(hd.x);
-            let smn = scale_min(hd, sb);
+            let pr = sb / 2u;
+            let qw = select(select(q0w, q1w, pr == 1u), select(q2w, q3w, pr == 3u), pr >= 2u);
+            let dm = unpack2x16float(hdw.x);
+            let smn = scale_min(hdw, sb);
             let dsc = dm.x * smn.x;
             let dmn = vec4<f32>(dm.y * smn.y);
-            wt[at4] = vec4<f16>(dsc * byte_less(((qa.x >> sh) & 0x0f0f0f0fu) | (((h0.x >> sb) & 0x01010101u) << 4u), 0.0) - dmn);
-            wt[at4 + 1u] = vec4<f16>(dsc * byte_less(((qa.y >> sh) & 0x0f0f0f0fu) | (((h0.y >> sb) & 0x01010101u) << 4u), 0.0) - dmn);
-            wt[at4 + 2u] = vec4<f16>(dsc * byte_less(((qa.z >> sh) & 0x0f0f0f0fu) | (((h0.z >> sb) & 0x01010101u) << 4u), 0.0) - dmn);
-            wt[at4 + 3u] = vec4<f16>(dsc * byte_less(((qa.w >> sh) & 0x0f0f0f0fu) | (((h0.w >> sb) & 0x01010101u) << 4u), 0.0) - dmn);
-            wt[at4 + 4u] = vec4<f16>(dsc * byte_less(((qb.x >> sh) & 0x0f0f0f0fu) | (((h1.x >> sb) & 0x01010101u) << 4u), 0.0) - dmn);
-            wt[at4 + 5u] = vec4<f16>(dsc * byte_less(((qb.y >> sh) & 0x0f0f0f0fu) | (((h1.y >> sb) & 0x01010101u) << 4u), 0.0) - dmn);
-            wt[at4 + 6u] = vec4<f16>(dsc * byte_less(((qb.z >> sh) & 0x0f0f0f0fu) | (((h1.z >> sb) & 0x01010101u) << 4u), 0.0) - dmn);
-            wt[at4 + 7u] = vec4<f16>(dsc * byte_less(((qb.w >> sh) & 0x0f0f0f0fu) | (((h1.w >> sb) & 0x01010101u) << 4u), 0.0) - dmn);
+            wt[at4] = vec4<f16>(dsc * byte_less(((qw.x >> sh) & 0x0f0f0f0fu) | (((hw.x >> sb) & 0x01010101u) << 4u), 0.0) - dmn);
+            wt[at4 + 1u] = vec4<f16>(dsc * byte_less(((qw.y >> sh) & 0x0f0f0f0fu) | (((hw.y >> sb) & 0x01010101u) << 4u), 0.0) - dmn);
+            wt[at4 + 2u] = vec4<f16>(dsc * byte_less(((qw.z >> sh) & 0x0f0f0f0fu) | (((hw.z >> sb) & 0x01010101u) << 4u), 0.0) - dmn);
+            wt[at4 + 3u] = vec4<f16>(dsc * byte_less(((qw.w >> sh) & 0x0f0f0f0fu) | (((hw.w >> sb) & 0x01010101u) << 4u), 0.0) - dmn);
         } else {
-            for (var i = 0u; i < 8u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }
+            for (var i = 0u; i < 4u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }
         }"#;
 const COOP_Q6K_HELPERS: &str = r#"fn byte(o: u32) -> u32 { return (w[o >> 2u] >> ((o & 3u) * 8u)) & 0xffu; }
 // The four bytes at `o`, an even offset (a word, or the halves of two).
@@ -1030,73 +1097,79 @@ fn word_at(o: u32) -> u32 {
     return (w[i] >> 16u) | (w[i + 1u] << 16u);
 }
 "#;
-const COOP_Q6K_STEP: &str = r#"let at4 = buf + lr * STRIDE4 + lh * 8u;
+const COOP_Q6K_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
         if (rr < p.rows) {
-            let bb = 2u * b + lh;
-            let blk = bb / 8u;
-            let sub = bb % 8u;
+            let sub = b % 8u;
             let h = sub / 4u;
             let qd = sub % 4u;
             let lshift = select(0u, 4u, qd >= 2u);
             let hshift = 2u * qd;
-            let base = rr * p.row_bytes + blk * 210u;
+            let base = rr * p.row_bytes + (b / 8u) * 210u;
             let d = unpack2x16float(byte(base + 208u) | (byte(base + 209u) << 8u)).x;
-            for (var hf = 0u; hf < 2u; hf++) {
-                let ql = base + h * 64u + (qd & 1u) * 32u + hf * 16u;
-                let qh = base + 128u + h * 32u + hf * 16u;
-                let scb = byte(base + 192u + h * 8u + 2u * qd + hf);
-                let sc = d * f32(i32(scb) - select(0, 256, scb >= 128u));
-                for (var wi = 0u; wi < 4u; wi++) {
-                    let q = ((word_at(ql + 4u * wi) >> lshift) & 0x0f0f0f0fu) | (((word_at(qh + 4u * wi) >> hshift) & 0x03030303u) << 4u);
-                    wt[at4 + hf * 4u + wi] = vec4<f16>(sc * byte_less(q, 32.0));
-                }
+            let ql = base + h * 64u + (qd & 1u) * 32u + lh * 16u;
+            let qh = base + 128u + h * 32u + lh * 16u;
+            let scb = byte(base + 192u + h * 8u + 2u * qd + lh);
+            let sc = d * f32(i32(scb) - select(0, 256, scb >= 128u));
+            for (var wi = 0u; wi < 4u; wi++) {
+                let q = ((word_at(ql + 4u * wi) >> lshift) & 0x0f0f0f0fu) | (((word_at(qh + 4u * wi) >> hshift) & 0x03030303u) << 4u);
+                wt[at4 + wi] = vec4<f16>(sc * byte_less(q, 32.0));
             }
         } else {
-            for (var i = 0u; i < 8u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }
+            for (var i = 0u; i < 4u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }
         }"#;
-const COOP_Q3K_STEP: &str = r#"let at4 = buf + lr * STRIDE4 + lh * 8u;
+const COOP_Q3K_REGS: &str = r#"    var hmw = vec4<u32>();
+    var qs0w = vec4<u32>();
+    var qs1w = vec4<u32>();
+    var sdw = vec4<u32>();"#;
+const COOP_Q3K_LOAD: &str = r#"let lb4 = rl * (p.row_bytes / 16u) + (b / 8u) * 7u;
+        hmw = w4[lb4 + lh];
+        qs0w = w4[lb4 + 2u + lh];
+        qs1w = w4[lb4 + 4u + lh];
+        sdw = w4[lb4 + 6u];"#;
+const COOP_Q3K_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
         if (rr < p.rows) {
-            let bb = 2u * b + lh;
-            let blk = bb / 8u;
-            let q = bb % 8u;
+            let q = b % 8u;
             let h = q / 4u;
             let j = q % 4u;
-            let b4 = rr * (p.row_bytes / 16u) + blk * 7u;
-            let hm0 = w4[b4];
-            let hm1 = w4[b4 + 1u];
-            let qs0 = w4[b4 + 2u + 2u * h];
-            let qs1 = w4[b4 + 3u + 2u * h];
-            let sd = w4[b4 + 6u];
-            let sc = q3_scales32(sd, h, j) * unpack2x16float(sd.w & 0xffffu).x;
-            wt[at4] = vec4<f16>(sc.x * byte_less(q3_bytes(qs0.x, hm0.x, j, h), 4.0));
-            wt[at4 + 1u] = vec4<f16>(sc.x * byte_less(q3_bytes(qs0.y, hm0.y, j, h), 4.0));
-            wt[at4 + 2u] = vec4<f16>(sc.x * byte_less(q3_bytes(qs0.z, hm0.z, j, h), 4.0));
-            wt[at4 + 3u] = vec4<f16>(sc.x * byte_less(q3_bytes(qs0.w, hm0.w, j, h), 4.0));
-            wt[at4 + 4u] = vec4<f16>(sc.y * byte_less(q3_bytes(qs1.x, hm1.x, j, h), 4.0));
-            wt[at4 + 5u] = vec4<f16>(sc.y * byte_less(q3_bytes(qs1.y, hm1.y, j, h), 4.0));
-            wt[at4 + 6u] = vec4<f16>(sc.y * byte_less(q3_bytes(qs1.z, hm1.z, j, h), 4.0));
-            wt[at4 + 7u] = vec4<f16>(sc.y * byte_less(q3_bytes(qs1.w, hm1.w, j, h), 4.0));
+            let scs = q3_scales32(sdw, h, j) * unpack2x16float(sdw.w & 0xffffu).x;
+            let sc = select(scs.x, scs.y, lh == 1u);
+            let qsw = select(qs0w, qs1w, h == 1u);
+            wt[at4] = vec4<f16>(sc * byte_less(q3_bytes(qsw.x, hmw.x, j, h), 4.0));
+            wt[at4 + 1u] = vec4<f16>(sc * byte_less(q3_bytes(qsw.y, hmw.y, j, h), 4.0));
+            wt[at4 + 2u] = vec4<f16>(sc * byte_less(q3_bytes(qsw.z, hmw.z, j, h), 4.0));
+            wt[at4 + 3u] = vec4<f16>(sc * byte_less(q3_bytes(qsw.w, hmw.w, j, h), 4.0));
         } else {
-            for (var i = 0u; i < 8u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }
+            for (var i = 0u; i < 4u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }
         }"#;
 
 /// A prompt's matmul on the tensor cores (WGSL's cooperative matrices, f16 into f32): a workgroup a tile of
-/// [`COOP_TILE`] weight rows by as many tokens, `k` 64 at a time; each step the tile's weights decoded to f16 in the
-/// workgroup's memory, then each of its 8 subgroups multiplies its 32 rows by 64 tokens as 2 by 4 fragments of 16x16,
-/// the tokens' fragments read straight from their rows as f16 ([`X_F16`]'s, padded to the tile); the sums stored
-/// straight into `y` (a tile at the edge through a fragment's staging). None for a type without one.
+/// [`COOP_TILE`] weight rows by as many tokens, `k` 32 at a time; each step the tile's weights decoded to f16 and its
+/// tokens' rows (as [`X_F16`] gives them, padded to the tile) copied into the workgroup's memory, the next step's
+/// loaded as this one's are multiplied, each of its 8 subgroups its 32 rows by 64 tokens as 2 by 4 fragments of 16x16
+/// (the tokens' fragments read from their rows in memory where they were the f16 rows in place: 141 TFLOPS without a
+/// decode, the loop 207 with both in the workgroup's); the sums stored straight into `y` (a tile at the edge through a
+/// fragment's staging). None for a type without one.
 pub fn coop_tiled(dtype: GgmlType) -> Option<String> {
     let vec4s = "@group(0) @binding(0) var<storage, read> w4: array<vec4<u32>>;";
-    let (binding, helpers, step) = match dtype {
-        GgmlType::Q3_K => (vec4s, COOP_Q3K_HELPERS, COOP_Q3K_STEP),
-        GgmlType::Q4_K => (vec4s, COOP_K_HELPERS, COOP_Q4K_STEP),
-        GgmlType::Q5_K => (vec4s, COOP_K_HELPERS, COOP_Q5K_STEP),
-        GgmlType::Q6_K => ("@group(0) @binding(0) var<storage, read> w: array<u32>;", COOP_Q6K_HELPERS, COOP_Q6K_STEP),
+    // (Q6_K's words, 210-byte blocks two bytes off in every other, loaded as they are decoded)
+    let (binding, helpers, regs, load, step) = match dtype {
+        GgmlType::Q3_K => (vec4s, COOP_Q3K_HELPERS, COOP_Q3K_REGS, COOP_Q3K_LOAD, COOP_Q3K_STEP),
+        GgmlType::Q4_K => (vec4s, COOP_K_HELPERS, COOP_Q4K_REGS, COOP_Q4K_LOAD, COOP_Q4K_STEP),
+        GgmlType::Q5_K => (vec4s, COOP_K_HELPERS, COOP_Q5K_REGS, COOP_Q5K_LOAD, COOP_Q5K_STEP),
+        GgmlType::Q6_K => ("@group(0) @binding(0) var<storage, read> w: array<u32>;", COOP_Q6K_HELPERS, "", "", COOP_Q6K_STEP),
         _ => return None,
     };
     let frags = [("c00", 0u32, 0u32), ("c01", 0, 16), ("c02", 0, 32), ("c03", 0, 48), ("c10", 16, 0), ("c11", 16, 16), ("c12", 16, 32), ("c13", 16, 48)];
     let edges: String = frags.iter().map(|(cf, fr, ft)| COOP_EDGE.replace("CF", cf).replace("FR", &format!("{fr}u")).replace("FT", &format!("{ft}u"))).collect();
-    Some(COOP_KERNEL.replace("WEIGHTS_BINDING", binding).replace("DECODE_HELPERS", helpers).replace("DECODE_STEP", step).replace("EDGE_STORES", &edges))
+    Some(
+        COOP_KERNEL
+            .replace("WEIGHTS_BINDING", binding)
+            .replace("DECODE_HELPERS", helpers)
+            .replace("DECODE_REGS", regs)
+            .replace("LOAD_BLOCK", load)
+            .replace("DECODE_STEP", step)
+            .replace("EDGE_STORES", &edges),
+    )
 }
 
 /// [`rb_kernel`] for a measurement of its shapes.

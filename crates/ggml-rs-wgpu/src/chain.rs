@@ -2433,7 +2433,7 @@ impl Recorder<'_> {
         // a matmul of too few tiles to fill the GPU's last wave split along k: each split's sums into a part of
         // scratch, then the parts added into y
         let units = self.gpu().coop_units();
-        let steps = (k / 64) as u32;
+        let steps = (k / 32) as u32;
         let tiles = q.chunks.iter().map(|(_, _, rows)| rows.div_ceil(tile)).max().unwrap_or(1) * (m as u32).div_ceil(tile);
         let splits = split.unwrap_or_else(|| crate::shaders::coop_splits(tiles, units, steps));
         // (one buffer of parts a recording, grown as it needs: its matmuls run in turn)
@@ -3907,7 +3907,7 @@ fn main() {
             let w = ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(raw, vec![n, k], GgmlType::Q3_K));
             let (x, y) = (b.vec(m * k), b.vec(m * n));
             let units = b.gpu.coop_units();
-            let chosen = crate::shaders::coop_splits((n as u32).div_ceil(128) * (m as u32).div_ceil(128), units, (k / 64) as u32);
+            let chosen = crate::shaders::coop_splits((n as u32).div_ceil(128) * (m as u32).div_ceil(128), units, (k / 32) as u32);
             let mut line = format!("{what} [{n}, {k}] (chosen {chosen}):");
             for split in [None, Some(1), Some(2), Some(3), Some(4)] {
                 let run = || {
@@ -3936,18 +3936,19 @@ fn main() {
     #[test]
     fn a_tensor_core_matmul_is_split_to_fill_the_gpu() {
         use crate::shaders::coop_splits;
-        // its FFN's gate and up (1088 tiles), down (160 tiles, k 17408), a delta net's gate (192), attention's q (384),
-        // k and v (32 each), output (160, k 6144)
-        assert_eq!(coop_splits(1088, 170, 80), 1);
-        assert_eq!(coop_splits(160, 170, 272), 1);
-        assert_eq!(coop_splits(192, 170, 80), 3);
-        assert_eq!(coop_splits(384, 170, 80), 2);
-        assert_eq!(coop_splits(32, 170, 80), 5);
-        assert_eq!(coop_splits(160, 170, 96), 1);
-        // 9 steps in 4 would leave one empty: 2 of 5 and 4
-        assert_eq!(coop_splits(1, 170, 16), 4);
-        assert_eq!(coop_splits(1, 170, 9), 2);
-        assert_eq!(coop_splits(1, 1, 80), 1);
+        // its FFN's gate and up (1088 tiles, k 5120 in 160 steps), down (160 tiles, k 17408), a delta net's gate (192),
+        // attention's q (384), k and v (32 each), output (160, k 6144)
+        assert_eq!(coop_splits(1088, 170, 160), 1);
+        assert_eq!(coop_splits(160, 170, 544), 1);
+        assert_eq!(coop_splits(192, 170, 160), 3);
+        assert_eq!(coop_splits(384, 170, 160), 2);
+        assert_eq!(coop_splits(32, 170, 160), 5);
+        assert_eq!(coop_splits(160, 170, 192), 1);
+        // splits of 8 steps or more
+        assert_eq!(coop_splits(1, 170, 32), 4);
+        assert_eq!(coop_splits(1, 170, 18), 2);
+        assert_eq!(coop_splits(1, 170, 15), 1);
+        assert_eq!(coop_splits(1, 1, 160), 1);
         let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
         if b.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
             let units = b.gpu.coop_units();
@@ -3977,8 +3978,9 @@ fn main() {
         let (x16, y) = (b.vec(m * k / 2), b.vec(m * n));
         DeviceChain::upload(&b, &x16, &vec![f32::from_bits(0x3c003c00); m * k / 2]);
         let full = crate::shaders::coop_tiled(GgmlType::Q3_K).unwrap();
-        let step = &full[full.find("let at4 = buf").unwrap()..full.find("        } else {\n            for (var i = 0u; i < 8u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }\n        }").unwrap() + "        } else {\n            for (var i = 0u; i < 8u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }\n        }".len()];
-        let constants = full.replace(step, "let at4 = buf + lr * STRIDE4 + lh * 8u;\n        for (var i = 0u; i < 8u; i++) { wt[at4 + i] = vec4<f16>(0.5h); }");
+        let tail = "        } else {\n            for (var i = 0u; i < 4u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }\n        }";
+        let step = &full[full.find("let at4 = buf").unwrap()..full.find(tail).unwrap() + tail.len()];
+        let constants = full.replace(step, "let at4 = buf + lr * S4 + lh * 4u;\n        for (var i = 0u; i < 4u; i++) { wt[at4 + i] = vec4<f16>(0.5h); }");
         let nothing = full.replace(step, "");
         let mut no_mma = full.clone();
         for (c, a, bf) in [("c00", "a0", "b0f"), ("c01", "a0", "b1f"), ("c02", "a0", "b2f"), ("c03", "a0", "b3f"), ("c10", "a1", "b0f"), ("c11", "a1", "b1f"), ("c12", "a1", "b2f"), ("c13", "a1", "b3f")] {
@@ -4005,6 +4007,77 @@ fn main() {
             }
             let ms = t.elapsed().as_secs_f64() / 12.0 * 1e3;
             eprintln!("{name}: {ms:.2} ms ({:.1} TFLOPS)", 2.0 * (m * n * k) as f64 / ms / 1e9);
+        }
+    }
+
+    /// What a matmul's loop reaches on the tensor cores with both its tiles in the workgroup's memory (`--ignored
+    /// --nocapture`): a workgroup's tile of rows by tokens, its subgroups' shares of it, the k step, each step's
+    /// fragments loaded from the tiles (filled once) and multiplied, a barrier a step; 2 workgroups an SM of 170.
+    #[test]
+    #[ignore = "a measurement"]
+    fn measure_coop_tiles() {
+        use ggml_rs::ChainRecorder;
+        let Ok(b) = WgpuBackend::new(Some(4 << 30)) else { return };
+        if !b.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+            return;
+        }
+        // (rows, tokens of the workgroup's tile; subgroups down the rows, across the tokens; k a step)
+        for (rows, tokens, wr, wt, ks) in [(128u32, 128u32, 4u32, 2u32, 64u32), (128, 128, 2, 2, 64), (128, 128, 2, 4, 64), (128, 128, 2, 2, 32), (256, 128, 4, 2, 32), (128, 256, 2, 4, 32), (128, 128, 4, 2, 32)] {
+            let (fr, ft) = (rows / wr / 16, tokens / wt / 16);
+            let threads = 32 * wr * wt;
+            let stride4 = (ks + 8) / 4;
+            let (a4, b4) = (rows * stride4, tokens * stride4);
+            let mut body = String::new();
+            for r in 0..fr {
+                for t in 0..ft {
+                    body += &format!("    var c{r}_{t} = coop_mat16x16<f32, C>();\n");
+                }
+            }
+            body += "    for (var it = 0u; it < p[0].x; it++) {\n        for (var kk = 0u; kk < KSu; kk += 16u) {\n            let s4 = STRIDE4u;\n";
+            for r in 0..fr {
+                body += &format!("            let ia{r} = (wr0 + {}u) * STRIDE4u + kk / 4u;\n            let a{r} = coopLoadT<coop_mat16x16<f16, A>>(&at[ia{r}], s4);\n", r * 16);
+            }
+            for t in 0..ft {
+                body += &format!("            let ib{t} = (wt0 + {}u) * STRIDE4u + kk / 4u;\n            let b{t} = coopLoad<coop_mat16x16<f16, B>>(&bt[ib{t}], s4);\n", t * 16);
+            }
+            for r in 0..fr {
+                for t in 0..ft {
+                    body += &format!("            c{r}_{t} = coopMultiplyAdd(a{r}, b{t}, c{r}_{t});\n");
+                }
+            }
+            body += "        }\n        workgroupBarrier();\n    }\n";
+            for r in 0..fr {
+                for t in 0..ft {
+                    body += &format!("    {{\n        let o = ((wg.x * {threads}u / 32u + sg) * {} + {}u) * 256u;\n        coopStoreT(c{r}_{t}, &c[o], 16u);\n    }}\n", fr * ft, r * ft + t);
+                }
+            }
+            let src = format!(
+                "enable f16;\nenable wgpu_cooperative_matrix;\n@group(0) @binding(0) var<storage, read> a: array<f16>;\n@group(0) @binding(6) var<storage, read_write> c: array<f32>;\n@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;\nvar<workgroup> at: array<vec4<f16>, {a4}>;\nvar<workgroup> bt: array<vec4<f16>, {b4}>;\n@compute @workgroup_size({threads})\nfn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {{\n    for (var i = li; i < {a4}u; i += {threads}u) {{ at[i] = vec4<f16>(f16(i % 7u) * 0.01h); }}\n    for (var i = li; i < {b4}u; i += {threads}u) {{ bt[i] = vec4<f16>(f16(i % 5u) * 0.01h); }}\n    workgroupBarrier();\n    let sg = li / 32u;\n    let wr0 = (sg % {wr}u) * {}u;\n    let wt0 = (sg / {wr}u) * {}u;\n{}}}\n",
+                fr * 16,
+                ft * 16,
+                body.replace("KSu", &format!("{ks}u")).replace("STRIDE4u", &format!("{stride4}u"))
+            );
+            let groups = 340u32;
+            let out = b.vec((groups * threads / 32 * fr * ft * 256) as usize);
+            let a = b.vec(16);
+            let iters = 4096u32 * 64 / ks;
+            let name: &'static str = Box::leak(format!("bench-coop-tile-{rows}x{tokens}-{wr}x{wt}-{ks}").into_boxed_str());
+            let run = || {
+                let mut rec = Recorder::new(&b);
+                let d = rec.gpu().dummy().clone();
+                let drw = rec.gpu().dummy_rw().clone();
+                rec.dispatch_wide(name, &src, [buffer(&a), &d, &d, &d, &d, &d, buffer(&out), &drw], &[iters], (groups, 1, 1));
+                rec.read_range(&out, 0, 1);
+                Box::new(rec).finish();
+            };
+            run();
+            let t = std::time::Instant::now();
+            for _ in 0..3 {
+                run();
+            }
+            let secs = t.elapsed().as_secs_f64() / 3.0;
+            let flops = groups as f64 * (rows * tokens) as f64 * (iters * ks) as f64 * 2.0;
+            eprintln!("a tile of {rows}x{tokens}, subgroups {wr}x{wt} of {}x{} ({} fragments), k {ks} a step ({:.1} KB): {:.1} TFLOPS", fr * 16, ft * 16, fr * ft, (a4 + b4) as f64 * 8.0 / 1024.0, flops / secs / 1e12);
         }
     }
 
