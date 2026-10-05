@@ -508,6 +508,57 @@ mod tests {
         close(&got[0], &want, "the chain");
     }
 
+    /// What a chained one-row matmul costs on the GPU: 28 of one weight in a chain (a layer's worth of dispatches a
+    /// model's), at a 3B Llama's shapes, against the weight's bytes; and a chain of small ops alone. (The one-row kernel reads its weights at 170-280 GB/s,
+    /// whatever its lanes a row, its loads or its value array: a kernel of wide loads is what would change it.)
+    #[test]
+    #[ignore = "a timing; run with --nocapture"]
+    fn measure_chained_matmuls() {
+        let Ok(b) = WgpuBackend::new(Some(4 << 30)) else { return };
+        for (dtype, n, k, block, bytes) in [(GgmlType::Q4_K, 3072usize, 3072usize, 256usize, 144usize), (GgmlType::Q4_K, 16384, 3072, 256, 144), (GgmlType::Q6_K, 3072, 8192, 256, 210)] {
+            let nbytes = n * (k / block) * bytes;
+            let mut next = rng(n as u32);
+            let mut raw = vec![0u8; nbytes];
+            for v in raw.iter_mut() {
+                *v = ((next() + 1.0) * 100.0) as u8;
+            }
+            let w = ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(raw, vec![n, k], dtype));
+            let (x, y) = (b.vec(k), b.vec(n));
+            DeviceChain::upload(&b, &x, &(0..k).map(|_| next()).collect::<Vec<_>>());
+            let reps = 28;
+            let run = || {
+                let mut rec = b.begin();
+                for _ in 0..reps {
+                    rec.matmul(&w, &x, &y);
+                }
+                rec.read_range(&y, 0, 1);
+                rec.finish();
+            };
+            run();
+            let t = std::time::Instant::now();
+            for _ in 0..5 {
+                run();
+            }
+            let secs = t.elapsed().as_secs_f64() / 5.0 / reps as f64;
+            eprintln!("{dtype:?} [{n}, {k}] ({:.1} MB): {:.1} us a matmul in a chain, {:.0} GB/s", nbytes as f64 / 1e6, secs * 1e6, nbytes as f64 / secs / 1e9);
+        }
+        let (a, c) = (b.vec(3072), b.vec(3072));
+        let run = || {
+            let mut rec = b.begin();
+            for _ in 0..28 * 8 {
+                rec.add(&a, &c);
+            }
+            rec.read_range(&a, 0, 1);
+            rec.finish();
+        };
+        run();
+        let t = std::time::Instant::now();
+        for _ in 0..5 {
+            run();
+        }
+        eprintln!("an add of 3072 in a chain: {:.1} us", t.elapsed().as_secs_f64() / 5.0 / (28.0 * 8.0) * 1e6);
+    }
+
     /// RoPE, a store into a cache and attention over it give the CPU backend's answer (GQA): a few positions in, and
     /// past 512 (three runs of the split attention put together).
     #[test]
