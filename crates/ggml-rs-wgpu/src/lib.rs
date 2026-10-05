@@ -376,6 +376,60 @@ impl std::fmt::Debug for WgpuBackend {
 }
 
 impl WgpuBackend {
+    /// A gated delta net's step on the GPU (the chain's conv and recurrence kernels, one submit), its recurrent state
+    /// and conv window kept there between calls as tensors that are the GPU's own vectors (`DeviceChain::alias`): a
+    /// state on the host (a new one, a restore) is taken up into one. None for a shape the kernels do not take; the
+    /// caller runs the host's. Where a model calls the backend's step itself (Qwen3.8-Flash-Next, a Qwen3.5 prompt
+    /// with an image), this takes the recurrence off the host: 7.8 ms a layer there for Flash-Next.
+    #[allow(clippy::too_many_arguments)]
+    fn delta_net_gpu(
+        &self, mixed_qkv: &Tensor, z_in: &Tensor, beta_alpha: &Tensor, conv_weight: &Tensor, ssm_a: &Tensor, dt_bias: &Tensor, ssm_norm: &Tensor,
+        conv_state: &mut Tensor, state: &mut Tensor, d: ggml_rs::DeltaNet,
+    ) -> Option<Tensor> {
+        use ggml_rs::DeviceChain;
+        let seq = d.rows;
+        let kern = conv_weight.dim(conv_weight.rank() - 1);
+        let ch = 2 * d.k_heads * d.k_dim + d.v_heads * d.v_dim;
+        let supported = d.k_dim == d.v_dim && [16, 32, 64, 128].contains(&d.k_dim) && d.k_heads > 0 && (2..=8).contains(&kern) && seq > 0;
+        if !supported || mixed_qkv.numel() != seq * ch || z_in.numel() != seq * d.v_heads * d.v_dim || beta_alpha.numel() != seq * 2 * d.v_heads
+            || conv_weight.numel() != ch * kern
+        {
+            return None;
+        }
+        // the state and the conv window as this adapter's vectors: the ones they alias, or the host's taken up
+        let adopt = |t: &mut Tensor, shape: Vec<usize>| -> ggml_rs::DeviceVec {
+            let len: usize = shape.iter().product();
+            if let Some(v) = self.aliased(t).filter(|v| v.len == len) {
+                return v;
+            }
+            let host = t.to_host();
+            let v = self.vec(len);
+            if host.numel() == len {
+                DeviceChain::upload(self, &v, host.data());
+            }
+            *t = self.alias(&v, shape);
+            v
+        };
+        let st = adopt(state, vec![d.v_heads, d.v_dim, d.k_dim]);
+        let cv = adopt(conv_state, vec![kern - 1, ch]);
+        let up = |t: &Tensor| {
+            let h = if t.is_device() { t.to_host() } else { t.clone() };
+            let v = self.vec(h.numel());
+            DeviceChain::upload(self, &v, h.data());
+            v
+        };
+        let (qkv, z, ba, cw, a, dt, nm) = (up(mixed_qkv), up(z_in), up(beta_alpha), up(conv_weight), up(ssm_a), up(dt_bias), up(ssm_norm));
+        let (conv_out, out) = (self.vec(seq * ch), self.vec(seq * d.v_heads * d.v_dim));
+        let mut rec = self.begin();
+        // these vectors are this call's: no bind groups kept to hold them
+        rec.keep_groups(false);
+        rec.ssm_conv(&qkv, &cw, &cv, &conv_out, seq, ch, kern);
+        rec.delta_net(&conv_out, &z, &ba, &a, &dt, &nm, &st, &out, d);
+        rec.read(&out);
+        let got = rec.finish().pop().expect("the delta net's output");
+        Some(Tensor::from_vec(got, vec![seq, d.v_heads * d.v_dim]))
+    }
+
     /// Open the best adapter wgpu finds, or the one `OAIY_WEBGPU_ADAPTER` names
     /// (part of its name, any case: "radeon", "arc", "5090"), for a computer with
     /// more than one GPU. `budget_bytes` caps the weights placed on it (WebGPU
@@ -653,6 +707,28 @@ impl Backend for WgpuBackend {
     }
     fn as_any(&self) -> &dyn Any {
         self
+    }
+    fn delta_net_step(
+        &self, mixed_qkv: &Tensor, z_in: &Tensor, beta_alpha: &Tensor, conv_weight: &Tensor, ssm_a: &Tensor, dt_bias: &Tensor, ssm_norm: &Tensor,
+        conv_state: &mut Tensor, state: &mut Tensor, seq: usize, num_v_heads: usize, num_k_heads: usize, head_v_dim: usize, head_k_dim: usize,
+        v_per_k: usize, scale_q: f32, eps: f32,
+    ) -> Tensor {
+        let d = ggml_rs::DeltaNet { rows: seq, v_heads: num_v_heads, k_heads: num_k_heads, k_dim: head_k_dim, v_dim: head_v_dim, scale_q, eps, sigmoid_gate: false };
+        match self.delta_net_gpu(mixed_qkv, z_in, beta_alpha, conv_weight, ssm_a, dt_bias, ssm_norm, conv_state, state, d) {
+            Some(out) => out,
+            None => self.cpu.delta_net_step(mixed_qkv, z_in, beta_alpha, conv_weight, ssm_a, dt_bias, ssm_norm, conv_state, state, seq, num_v_heads, num_k_heads, head_v_dim, head_k_dim, v_per_k, scale_q, eps),
+        }
+    }
+    fn delta_net_step_sigmoid(
+        &self, mixed_qkv: &Tensor, z_in: &Tensor, beta_alpha: &Tensor, conv_weight: &Tensor, ssm_a: &Tensor, dt_bias: &Tensor, ssm_norm: &Tensor,
+        conv_state: &mut Tensor, state: &mut Tensor, seq: usize, num_v_heads: usize, num_k_heads: usize, head_v_dim: usize, head_k_dim: usize,
+        v_per_k: usize, scale_q: f32, eps: f32,
+    ) -> Tensor {
+        let d = ggml_rs::DeltaNet { rows: seq, v_heads: num_v_heads, k_heads: num_k_heads, k_dim: head_k_dim, v_dim: head_v_dim, scale_q, eps, sigmoid_gate: true };
+        match self.delta_net_gpu(mixed_qkv, z_in, beta_alpha, conv_weight, ssm_a, dt_bias, ssm_norm, conv_state, state, d) {
+            Some(out) => out,
+            None => self.cpu.delta_net_step_sigmoid(mixed_qkv, z_in, beta_alpha, conv_weight, ssm_a, dt_bias, ssm_norm, conv_state, state, seq, num_v_heads, num_k_heads, head_v_dim, head_k_dim, v_per_k, scale_q, eps),
+        }
     }
     fn vram_status(&self) -> Option<(usize, usize)> {
         let (used, budget) = self.usage();

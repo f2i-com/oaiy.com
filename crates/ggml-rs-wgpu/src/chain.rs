@@ -1326,10 +1326,9 @@ mod tests {
     /// host made, at a small shape and at Qwen3.8 27B's (48 value heads on 16 key heads of 128).
     #[test]
     fn a_delta_net_matches_the_hosts() {
-        use ggml_rs::Backend;
         let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
         let cpu = ggml_rs::CpuBackend::new();
-        for (nv, nk, dim, kern, rows) in [(8usize, 4usize, 32usize, 4usize, 1usize), (8, 4, 32, 4, 7), (48, 16, 128, 4, 1), (48, 16, 128, 4, 5)] {
+        for (nv, nk, dim, kern, rows, sigmoid) in [(8usize, 4usize, 32usize, 4usize, 1usize, false), (8, 4, 32, 4, 7, true), (48, 16, 128, 4, 1, false), (48, 16, 128, 4, 5, true)] {
             let ch = 2 * nk * dim + nv * dim;
             let mut next = rng((nv * 31 + rows) as u32);
             let mut vals = |n: usize, s: f32| (0..n).map(|_| next() * s).collect::<Vec<f32>>();
@@ -1346,8 +1345,28 @@ mod tests {
             let t = |d: &[f32], shape: Vec<usize>| ggml_rs::Tensor::from_vec(d.to_vec(), shape);
             let mut conv_c = t(&conv0, vec![kern - 1, ch]);
             let mut state_c = t(&state0, vec![nv, dim, dim]);
-            let want = cpu.delta_net_step(&t(&qkv, vec![rows, ch]), &t(&z, vec![rows, nv * dim]), &t(&ba, vec![rows, 2 * nv]), &t(&cw, vec![ch, kern]),
-                &t(&a, vec![nv]), &t(&dt, vec![nv]), &t(&nm, vec![dim]), &mut conv_c, &mut state_c, rows, nv, nk, dim, dim, nv / nk, scale, eps);
+            // the host's step, or the backend's (its state kept on the GPU between calls)
+            let step = |be: &dyn ggml_rs::Backend, conv: &mut ggml_rs::Tensor, state: &mut ggml_rs::Tensor| {
+                let (q, zz, bb, ww) = (t(&qkv, vec![rows, ch]), t(&z, vec![rows, nv * dim]), t(&ba, vec![rows, 2 * nv]), t(&cw, vec![ch, kern]));
+                let (aa, dd, nn) = (t(&a, vec![nv]), t(&dt, vec![nv]), t(&nm, vec![dim]));
+                if sigmoid {
+                    be.delta_net_step_sigmoid(&q, &zz, &bb, &ww, &aa, &dd, &nn, conv, state, rows, nv, nk, dim, dim, nv / nk, scale, eps)
+                } else {
+                    be.delta_net_step(&q, &zz, &bb, &ww, &aa, &dd, &nn, conv, state, rows, nv, nk, dim, dim, nv / nk, scale, eps)
+                }
+            };
+            let want = step(&cpu, &mut conv_c, &mut state_c);
+            // twice each way: the second from the first's state
+            let (mut conv_g, mut state_g) = (t(&conv0, vec![kern - 1, ch]), t(&state0, vec![nv, dim, dim]));
+            let (mut conv_h, mut state_h) = (t(&conv0, vec![kern - 1, ch]), t(&state0, vec![nv, dim, dim]));
+            for _ in 0..2 {
+                let got = step(&b, &mut conv_g, &mut state_g);
+                let host = step(&cpu, &mut conv_h, &mut state_h);
+                close(got.data(), host.data(), &format!("{nv} heads, {rows} rows: the backend's step"));
+                assert!(state_g.is_device() && conv_g.is_device(), "the state stays on the GPU");
+            }
+            close(state_g.to_host().data(), state_h.data(), &format!("{nv} heads, {rows} rows: the backend's state"));
+            close(conv_g.to_host().data(), conv_h.data(), &format!("{nv} heads, {rows} rows: the backend's conv"));
             let up = |d: &[f32]| {
                 let v = b.vec(d.len());
                 DeviceChain::upload(&b, &v, d);
@@ -1358,7 +1377,7 @@ mod tests {
             let (conv_out, out) = (b.vec(rows * ch), b.vec(rows * nv * dim));
             let mut rec = b.begin();
             rec.ssm_conv(&qkv_d, &cw_d, &conv_d, &conv_out, rows, ch, kern);
-            rec.delta_net(&conv_out, &z_d, &ba_d, &a_d, &dt_d, &nm_d, &state_d, &out, DeltaNet { rows, v_heads: nv, k_heads: nk, k_dim: dim, v_dim: dim, scale_q: scale, eps, sigmoid_gate: false });
+            rec.delta_net(&conv_out, &z_d, &ba_d, &a_d, &dt_d, &nm_d, &state_d, &out, DeltaNet { rows, v_heads: nv, k_heads: nk, k_dim: dim, v_dim: dim, scale_q: scale, eps, sigmoid_gate: sigmoid });
             rec.read(&out);
             rec.read(&conv_d);
             let got = rec.finish();
