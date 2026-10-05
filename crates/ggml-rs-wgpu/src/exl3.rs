@@ -1203,23 +1203,41 @@ const ROUTE: &str = r#"
 @group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
 
 var<workgroup> l: array<f32, 1024>;
+// the same, four at a time (the comparisons' reads)
+var<workgroup> l4: array<vec4<f32>, 256>;
 var<workgroup> top: array<u32, 32>;
+
+// How many of l4's first `quads` beat logit `v` at index `i` (a higher logit, or as high at a lower index).
+fn beaten(v: f32, i: u32, quads: u32) -> u32 {
+    var above = 0u;
+    for (var q = 0u; q < quads; q++) {
+        let u = l4[q];
+        let j = 4u * q;
+        above += select(0u, 1u, u.x > v || (u.x == v && j < i));
+        above += select(0u, 1u, u.y > v || (u.y == v && j + 1u < i));
+        above += select(0u, 1u, u.z > v || (u.z == v && j + 2u < i));
+        above += select(0u, 1u, u.w > v || (u.w == v && j + 3u < i));
+    }
+    return above;
+}
 
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_index) t: u32) {
     let n = p[0].x;
     let k = p[0].y;
-    for (var i = t; i < n; i += 256u) {
-        l[i] = logits[i];
+    let quads = (n + 3u) / 4u;
+    // past the last logit, -inf (beats none)
+    for (var i = t; i < 4u * quads; i += 256u) {
+        var v = bitcast<f32>(0xff800000u);
+        if (i < n) {
+            v = logits[i];
+        }
+        l[i] = v;
+        l4[i / 4u][i % 4u] = v;
     }
     workgroupBarrier();
     for (var i = t; i < n; i += 256u) {
-        let v = l[i];
-        var above = 0u;
-        for (var j = 0u; j < n; j++) {
-            let u = l[j];
-            above += select(0u, 1u, u > v || (u == v && j < i));
-        }
+        let above = beaten(l[i], i, quads);
         if (above < k) {
             top[above] = i;
         }
