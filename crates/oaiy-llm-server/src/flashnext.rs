@@ -1249,20 +1249,27 @@ impl FlashNext {
 
     /// [`Self::ple_embed`]'s features on the host (`[tokens, ple_dim]`), for a chain to upload as they are.
     fn ple_embed_host(&self, tokens: &[u32], kv: &mut KvCache) -> Result<Vec<f32>> {
-        let cfg = &self.config;
-        let ctx = cfg.ngram - 1;
-        let slot = ple_slot(cfg);
-        let eos = cfg.ple_eos as i64;
-        // The carried context: the last ngram-1 ids (eos at a sequence start).
-        let mut history: Vec<i64> = match &kv.ssm_state[slot] {
-            Some(t) => t.to_host().data().iter().map(|&v| v as i64).collect(),
-            None => vec![eos; ctx],
-        };
+        let mut history = self.ple_history(kv);
         history.extend(tokens.iter().map(|&t| t as i64));
-        let n = history.len();
         let emb = self.ngram_embedding(&history)?;
-        kv.ssm_state[slot] = Some(Tensor::from_vec(history[n - ctx..].iter().map(|&v| v as f32).collect(), vec![ctx]));
+        self.ple_carry(&history, kv);
         Ok(emb)
+    }
+
+    /// The n-gram layer's carried context: the last ngram-1 ids (eos at a sequence start).
+    fn ple_history(&self, kv: &KvCache) -> Vec<i64> {
+        let cfg = &self.config;
+        match &kv.ssm_state[ple_slot(cfg)] {
+            Some(t) => t.to_host().data().iter().map(|&v| v as i64).collect(),
+            None => vec![cfg.ple_eos as i64; cfg.ngram - 1],
+        }
+    }
+
+    /// The context `history` (the carried one, then a run's tokens) leaves in the cache for the next run.
+    fn ple_carry(&self, history: &[i64], kv: &mut KvCache) {
+        let ctx = self.config.ngram - 1;
+        let n = history.len();
+        kv.ssm_state[ple_slot(&self.config)] = Some(Tensor::from_vec(history[n - ctx..].iter().map(|&v| v as f32).collect(), vec![ctx]));
     }
 
     /// The n-gram layer: the streams plus their gate against the n-gram features `emb`, and
@@ -1844,7 +1851,7 @@ impl FlashNext {
     /// logits; every row's for a check (`check`: undoable, see [`Self::rollback`]). None leaves the run to `forward`'s
     /// own path: past the dense span (QSA's sparse attention), or with images.
     fn run_chained(&self, tokens: &[u32], embeds: &Tensor, kv: &mut KvCache, check: bool) -> Option<Vec<f32>> {
-        let run = self.run_begin(tokens, embeds, kv, check, &mut None)?;
+        let run = self.run_begin(tokens, embeds, kv, check, &mut None, None)?;
         Some(run.finish(self, kv))
     }
 
@@ -1853,26 +1860,51 @@ impl FlashNext {
     /// chunks before it run, `done` of each said; the rest the caller's). `done(i)` once chunk `i` has gone to the
     /// GPUs (its K and V in the host's cache once the next has).
     pub fn forward_chunks(&self, chunks: &[(&[u32], &Tensor)], kv: &mut KvCache, done: &mut dyn FnMut(usize)) -> Option<Tensor> {
-        let mut pending: Option<ChainedRun<'_>> = None;
-        let mut last = None;
-        for (i, (tokens, embeds)) in chunks.iter().enumerate() {
-            let run = if tokens.len() <= 512 && !profile::on() { self.run_begin(tokens, embeds, kv, false, &mut pending) } else { None };
-            let Some(run) = run else {
-                if let Some(p) = pending.take() {
+        // each chunk's n-gram features (random reads of a 32 GB table: some 25 ms a chunk of 512) read on a thread of
+        // their own, a chunk ahead of the GPUs
+        let ctx = self.config.ngram - 1;
+        let mut history = self.ple_history(kv);
+        let histories: Vec<Vec<i64>> = chunks
+            .iter()
+            .map(|(t, _)| {
+                history.extend(t.iter().map(|&v| v as i64));
+                let h = history.clone();
+                history.drain(..history.len() - ctx);
+                h
+            })
+            .collect();
+        std::thread::scope(|sc| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Option<Vec<f32>>>(1);
+            let histories = &histories;
+            sc.spawn(move || {
+                for h in histories {
+                    if tx.send(self.ngram_embedding(h).ok()).is_err() {
+                        break;
+                    }
+                }
+            });
+            let mut pending: Option<ChainedRun<'_>> = None;
+            let mut last = None;
+            for (i, (tokens, embeds)) in chunks.iter().enumerate() {
+                let ple = rx.recv().ok().flatten();
+                let run = if tokens.len() <= 512 && !profile::on() && ple.is_some() { self.run_begin(tokens, embeds, kv, false, &mut pending, ple) } else { None };
+                let Some(run) = run else {
+                    if let Some(p) = pending.take() {
+                        p.finish(self, kv);
+                    }
+                    return None;
+                };
+                // (one the run did not take: a chain on one device)
+                if let Some(p) = pending.replace(run) {
                     p.finish(self, kv);
                 }
-                return None;
-            };
-            // (one the run did not take: a chain on one device)
-            if let Some(p) = pending.replace(run) {
-                p.finish(self, kv);
+                done(i);
             }
-            done(i);
-        }
-        if let Some(p) = pending.take() {
-            last = Some(p.finish(self, kv));
-        }
-        last.map(|l| Tensor::from_vec(l, vec![1, self.config.vocab]))
+            if let Some(p) = pending.take() {
+                last = Some(p.finish(self, kv));
+            }
+            last.map(|l| Tensor::from_vec(l, vec![1, self.config.vocab]))
+        })
     }
 
     /// An attention layer's rows of a chained run (`t` of them from `at`, K then V each, and its indexer keys) into
@@ -1891,7 +1923,7 @@ impl FlashNext {
     /// [`Self::run_chained`] up to its last device's wait: every device's work gone (the last's running), `kv`
     /// committed; `prev` (a chunk's run before this one's, its last device still running) finished as the next
     /// device's layers are recorded, so the device holds one chunk's scratch at a time.
-    fn run_begin<'a>(&'a self, tokens: &[u32], embeds: &Tensor, kv: &mut KvCache, check: bool, prev: &mut Option<ChainedRun<'a>>) -> Option<ChainedRun<'a>> {
+    fn run_begin<'a>(&'a self, tokens: &[u32], embeds: &Tensor, kv: &mut KvCache, check: bool, prev: &mut Option<ChainedRun<'a>>, ple: Option<Vec<f32>>) -> Option<ChainedRun<'a>> {
         use ggml_rs::{ChainRecorder, DeltaNet};
         use std::sync::atomic::Ordering;
         if std::env::var_os("OAIY_NO_CHAIN").is_some() {
@@ -2074,7 +2106,16 @@ impl FlashNext {
         let prompt_qsa: Vec<Option<QsaVecs>> = chains.iter().enumerate().map(|(d, c)| (sparse && t > CHECK_ROWS && !st.attn_of[d].is_empty()).then(|| self.qsa_vecs(*c, t, m.kv[d].cap))).collect();
         let prompt_keys: Vec<Option<ggml_rs::DeviceVec>> = chains.iter().enumerate().map(|(d, c)| (t > CHECK_ROWS && !st.attn_of[d].is_empty()).then(|| c.vec(t * id_dim))).collect();
         // the n-gram features (on the n-gram layer's device, where it is chained), then the embedding in every stream
-        let ple_emb = self.ple_embed_host(tokens, kv).ok()?;
+        // (a prompt's chunk's read already, as the chunk before ran)
+        let ple_emb = match ple {
+            Some(f) => {
+                let mut history = self.ple_history(kv);
+                history.extend(tokens.iter().map(|&t| t as i64));
+                self.ple_carry(&history, kv);
+                f
+            }
+            None => self.ple_embed_host(tokens, kv).ok()?,
+        };
 
         let ple_owned: Option<PleVecs>;
         let ple_vs: Option<(&ChainPle, &PleVecs)> = match &st.ple {
@@ -2127,7 +2168,7 @@ impl FlashNext {
         let to_cache = |i: usize, kvrows: Vec<f32>, raw: Vec<f32>, kv: &mut KvCache| self.cache_rows(kv, i, past, t, kvrows, raw);
         // the recording open on device `d`, and the attention layers whose rows and keys it reads (in order, before
         // whatever else it reads)
-        let mut open: Option<Box<dyn ChainRecorder + '_>> = None;
+                let mut open: Option<Box<dyn ChainRecorder + '_>> = None;
         let mut attn_reads: Vec<usize> = Vec::new();
         // a device's attention layers' rows and keys read at its handoff, into the host's cache once the next device's
         // layers are recorded (as that device runs them)
@@ -2151,10 +2192,10 @@ impl FlashNext {
                 rec.flush();
                 handoffs.push((rec, dev, std::mem::take(&mut attn_reads)));
                 // the chunk before's last device done with (its scratch back) before this chunk's work there
-                if let Some(p) = prev.take() {
+                                if let Some(p) = prev.take() {
                     p.finish(self, kv);
                 }
-                d = dev;
+                                d = dev;
                 let mut r = chains[d].begin();
                 r.keep_groups(keep);
                 r.hold();
@@ -2396,7 +2437,7 @@ impl FlashNext {
             rec.exl3_rows(chain_packed(&self.head)?, &one.mixed, &one.head, 1);
             rec.read(&one.head);
         }
-        // each handoff in turn: its device's streams (once it has run) up to the next, whose held work then goes
+                // each handoff in turn: its device's streams (once it has run) up to the next, whose held work then goes
         for (from, to, reads) in handoffs.drain(..) {
             let mut got = from.finish().into_iter();
             for &a in &reads {
@@ -2405,9 +2446,9 @@ impl FlashNext {
             }
             chains[to].upload(&devs[to].x, &got.next().expect("the streams"));
         }
-        // the last device's work going (held till its streams were up) as the host stores the others' rows
+                // the last device's work going (held till its streams were up) as the host stores the others' rows
         rec.flush();
-        if let Some(p) = prev.take() {
+                if let Some(p) = prev.take() {
             p.finish(self, kv);
         }
         for (a, kvrows, raw) in to_store.drain(..) {
@@ -2422,7 +2463,7 @@ impl FlashNext {
             self.decoded.store(true, Ordering::Relaxed);
         }
         st.runs.fetch_add(1, Ordering::Relaxed);
-        Some(ChainedRun { rec, attn_reads, at: past, t })
+                Some(ChainedRun { rec, attn_reads, at: past, t })
     }
 }
 
