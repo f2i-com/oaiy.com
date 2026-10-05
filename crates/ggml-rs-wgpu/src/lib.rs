@@ -602,10 +602,18 @@ impl WgpuBackend {
         };
         let limits = adapter.limits();
         let timestamps = if profile::chain_on() { adapter.features() & wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() };
+        // the tensor cores' matrices (Vulkan's cooperative matrices) and f16 in shaders, where the adapter has them: a
+        // prompt's matmuls through them
+        let coop = adapter.features() & (wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX | wgpu::Features::SHADER_F16);
+        let coop = if coop == wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX | wgpu::Features::SHADER_F16 && std::env::var_os("OAIY_NO_COOP").is_none() { coop } else { wgpu::Features::empty() };
+        // SAFETY: wgpu's cooperative matrices are an experimental feature (its implementation may misbehave where
+        // misused); only the prompt kernels use them, each checked against the f32 kernels (OAIY_NO_COOP: none).
+        let experimental = if coop.is_empty() { wgpu::ExperimentalFeatures::disabled() } else { unsafe { wgpu::ExperimentalFeatures::enabled() } };
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("oaiy"),
-            required_features: timestamps,
+            required_features: timestamps | coop,
             required_limits: limits.clone(),
+            experimental_features: experimental,
             ..Default::default()
         }))
         .map_err(|e| format!("WebGPU device on {}: {e}", info.name))?;

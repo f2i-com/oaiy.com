@@ -2250,7 +2250,17 @@ mod dense_webgpu_timing {
         }
         for n in [512usize, 512] {
             let past = kv.len;
+            let _ = ggml_rs_wgpu::profile::take_kernels();
             eprintln!("a chunk of {n} at {past}: {:.1} ms", forward(n, &mut kv));
+            let k = ggml_rs_wgpu::profile::take_kernels();
+            if !k.is_empty() {
+                let all: f64 = k.iter().map(|e| e.1).sum();
+                let count: u64 = k.iter().map(|e| e.2).sum();
+                eprintln!("    every kernel: {all:.1} ms ({count} dispatches)");
+                for (name, ms, c) in k.iter().take(16) {
+                    eprintln!("    {name:<28} {ms:>8.2} ms ({c} dispatches)");
+                }
+            }
         }
     }
 
