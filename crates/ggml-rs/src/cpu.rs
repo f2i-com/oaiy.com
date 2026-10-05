@@ -160,20 +160,22 @@ impl Backend for CpuBackend {
     fn rmsnorm(&self, x: &Tensor, weight: &Tensor, eps: f32) -> Tensor {
         let last = x.dim(x.rank() - 1);
         assert_eq!(weight.shape(), [last], "rmsnorm: weight must be [last_dim]");
-        let n_rows = x.numel() / last;
         let mut out = vec![0.0f32; x.numel()];
         let xd = x.data();
         let wd = weight.data();
-
-        for row in 0..n_rows {
-            let s = row * last;
-            let xr = &xd[s..s + last];
+        let norm = |(xr, or): (&[f32], &mut [f32])| {
             let mut sum_sq = 0.0f32;
             for v in xr { sum_sq += v * v; }
             let inv_rms = 1.0 / (sum_sq / last as f32 + eps).sqrt();
             for j in 0..last {
-                out[s + j] = xr[j] * inv_rms * wd[j];
+                or[j] = xr[j] * inv_rms * wd[j];
             }
+        };
+        // VENDORED-LOCAL: a prompt's rows on every thread (each row's sum as before).
+        if x.numel() >= PARALLEL_FROM {
+            xd.par_chunks(last).zip(out.par_chunks_mut(last)).for_each(norm);
+        } else {
+            xd.chunks(last).zip(out.chunks_mut(last)).for_each(norm);
         }
         Tensor::from_vec(out, x.shape().to_vec())
     }
@@ -254,29 +256,84 @@ impl Backend for CpuBackend {
         }
 
         let half = head_dim / 2;
-        let xd = x.data_mut();
-
-        for s in 0..seq {
+        // VENDORED-LOCAL: each pair's frequency once, and each (position, pair)'s sine and cosine once for all heads,
+        // where they were made for every element (the same values); a prompt's rows on every thread.
+        let freqs: Vec<(f32, f32)> = (0..half)
+            .map(|k| (theta.powf(-2.0 * k as f32 / head_dim as f32), freq_factors.map(|f| f[k]).unwrap_or(1.0)))
+            .collect();
+        let rotate = |(s, row): (usize, &mut [f32])| {
             let pos = positions[s] as f32;
+            let sc: Vec<(f32, f32)> = freqs.iter().map(|&(freq, factor)| (pos * freq / factor).sin_cos()).collect();
             for h in 0..n_heads {
-                let off = (s * n_heads + h) * head_dim;
-                for k in 0..half {
-                    let freq = theta.powf(-2.0 * k as f32 / head_dim as f32);
-                    let factor = freq_factors.map(|f| f[k]).unwrap_or(1.0);
-                    let angle = pos * freq / factor;
-                    let (sin_v, cos_v) = angle.sin_cos();
-
+                let off = h * head_dim;
+                for (k, &(sin_v, cos_v)) in sc.iter().enumerate() {
                     let (i_a, i_b) = match rope_type {
                         RopeType::Normal => (off + 2 * k, off + 2 * k + 1),
                         RopeType::NeoX   => (off + k,     off + k + half),
                     };
-                    let a = xd[i_a];
-                    let b = xd[i_b];
-                    xd[i_a] = a * cos_v - b * sin_v;
-                    xd[i_b] = a * sin_v + b * cos_v;
+                    let a = row[i_a];
+                    let b = row[i_b];
+                    row[i_a] = a * cos_v - b * sin_v;
+                    row[i_b] = a * sin_v + b * cos_v;
                 }
             }
+        };
+        let width = n_heads * head_dim;
+        let parallel = seq * width >= PARALLEL_FROM;
+        let xd = x.data_mut();
+        if parallel {
+            xd.par_chunks_mut(width).enumerate().for_each(rotate);
+        } else {
+            xd.chunks_mut(width).enumerate().for_each(rotate);
         }
+    }
+
+    // VENDORED-LOCAL: the fused gate-up's activation, a prompt's rows on every thread (the trait's default, one by one,
+    // was a few seconds of a 2,000-token prompt).
+    fn silu_mul_split(&self, fused: &Tensor, ff: usize) -> Tensor {
+        let seq = fused.dim(0);
+        debug_assert_eq!(fused.dim(fused.rank() - 1), 2 * ff);
+        let host = fused.to_host();
+        let src = host.data();
+        let mut out = vec![0.0f32; seq * ff];
+        let act = |(row, dst): (&[f32], &mut [f32])| {
+            for j in 0..ff {
+                let g = row[j];
+                let u = row[ff + j];
+                dst[j] = (g / (1.0 + (-g).exp())) * u;
+            }
+        };
+        if seq * ff >= PARALLEL_FROM {
+            src.par_chunks(2 * ff).zip(out.par_chunks_mut(ff)).for_each(act);
+        } else {
+            src.chunks(2 * ff).zip(out.chunks_mut(ff)).for_each(act);
+        }
+        Tensor::from_vec(out, vec![seq, ff])
+    }
+
+    fn gelu_approx_mul_split(&self, fused: &Tensor, ff: usize) -> Tensor {
+        let seq = fused.dim(0);
+        debug_assert_eq!(fused.dim(fused.rank() - 1), 2 * ff);
+        let host = fused.to_host();
+        let src = host.data();
+        let mut out = vec![0.0f32; seq * ff];
+        const SQRT_2_OVER_PI: f32 = 0.7978845608028654;
+        const COEFF: f32 = 0.044715;
+        let act = |(row, dst): (&[f32], &mut [f32])| {
+            for j in 0..ff {
+                let g = row[j];
+                let u = row[ff + j];
+                let inner = SQRT_2_OVER_PI * (g + COEFF * g * g * g);
+                let gelu_v = 0.5 * g * (1.0 + inner.tanh());
+                dst[j] = gelu_v * u;
+            }
+        };
+        if seq * ff >= PARALLEL_FROM {
+            src.par_chunks(2 * ff).zip(out.par_chunks_mut(ff)).for_each(act);
+        } else {
+            src.chunks(2 * ff).zip(out.chunks_mut(ff)).for_each(act);
+        }
+        Tensor::from_vec(out, vec![seq, ff])
     }
 
     fn repeat_kv(&self, x: &Tensor, n_rep: usize) -> Tensor {
@@ -439,6 +496,9 @@ impl Backend for CpuBackend {
         out
     }
 }
+
+// VENDORED-LOCAL: elements from which an elementwise op spreads its rows over the threads (a decode step's stay on one).
+const PARALLEL_FROM: usize = 1 << 16;
 
 // VENDORED-LOCAL: `a . b` as 8 running sums added at the end, so the loop vectorizes.
 fn dot8(a: &[f32], b: &[f32]) -> f32 {

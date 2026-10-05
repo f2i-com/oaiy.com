@@ -182,6 +182,16 @@ impl Weight {
         }
     }
 
+    /// VENDORED-LOCAL: [`Weight::linear`] of one input against several weights (a layer's q, k and v): packed ones in
+    /// one backend call ([`Backend::linear_q_many`]), so a backend whose every call is a round trip makes one.
+    pub fn linear_many(backend: &dyn Backend, x: &Tensor, ws: &[&Weight]) -> Vec<Tensor> {
+        let quants: Option<Vec<&QuantizedTensor>> = ws.iter().map(|w| if let Self::Quant(q) = w { Some(q) } else { None }).collect();
+        match quants {
+            Some(quants) => backend.linear_q_many(x, &quants),
+            None => ws.iter().map(|w| w.linear(backend, x)).collect(),
+        }
+    }
+
     pub fn shape(&self) -> &[usize] {
         match self {
             Self::Packed(w) => w.shape(),
@@ -531,6 +541,10 @@ pub struct CommonTensors {
     /// `tok_embd` Arc when the GGUF has no separate `output.weight`.
     pub output:      Weight,
     pub blocks:      Vec<CommonBlockTensors>,
+    /// VENDORED-LOCAL: a tied head's table as the GGUF packs it, for a backend that keeps the dense table on the host
+    /// (WebGPU): there the head is a quantized matmul on the device, not an f32 one on the CPU. A 3B Llama's tied head
+    /// was 1.6 GB of f32 read on the CPU every token, about 40 ms of its 87 ms step. Dropped at upload otherwise.
+    pub tied_packed: Option<Weight>,
 }
 
 impl CommonTensors {
@@ -542,6 +556,13 @@ impl CommonTensors {
         let tok_embd = Arc::new(idx.take("token_embd.weight", &["tok_embeddings.weight"])?);
         let output_norm = idx.take("output_norm.weight", &["norm.weight"])?;
         let output = load_lm_head_or_tied(idx, &tok_embd)?;
+        let tied_packed = match &output {
+            Weight::TiedEmbed(_) => match idx.take_weight("token_embd.weight", &["tok_embeddings.weight"])? {
+                packed @ Weight::Quant(_) => Some(packed),
+                _ => None,
+            },
+            _ => None,
+        };
 
         let mut blocks = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
@@ -562,7 +583,7 @@ impl CommonTensors {
         }
 
         Self::verify_shapes(&tok_embd, &output_norm, &output, &blocks, cfg)?;
-        Ok(Self { tok_embd, output_norm, output, blocks })
+        Ok(Self { tok_embd, output_norm, output, blocks, tied_packed })
     }
 
     fn verify_shapes(
@@ -635,11 +656,17 @@ impl CommonTensors {
         const M: usize = 2 * 1024 * 1024 * 1024;
         // Tied LM head: upload tok_embd once and share the Arc with the head.
         let (tok_embd, output) = upload_tok_embd_and_lm_head(backend, self.tok_embd, self.output);
+        // VENDORED-LOCAL: unless the backend kept the dense table on the host, where the packed one heads instead.
+        let output = match (output, self.tied_packed) {
+            (Weight::TiedEmbed(_), Some(packed)) if !tok_embd.is_device() => packed,
+            (output, _) => output,
+        };
         let output = output.try_to_device(backend, M);
         Self {
             tok_embd,
             output_norm: backend.to_device(self.output_norm),
             output,
+            tied_packed: None,
             blocks: self.blocks.into_iter().map(|b| CommonBlockTensors {
                 attn_norm:   backend.to_device(b.attn_norm),
                 attn_q:      b.attn_q.try_to_device(backend, M),

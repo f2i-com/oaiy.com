@@ -18,6 +18,30 @@ pub mod dense;
 pub mod exl3;
 pub mod shaders;
 
+/// Where a GGUF model's time goes on this backend: counters any thread adds to and a timing test reads and resets.
+pub mod profile {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    /// A quantized projection's call: all of it, and the part spent waiting for the GPU (submit to mapped).
+    pub static LINEAR: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    pub static LINEAR_WAIT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    /// The attention (on the CPU: the cache is on the host).
+    pub static ATTENTION: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+    pub(crate) fn add(counter: &[AtomicU64; 2], start: Instant) {
+        counter[0].fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        counter[1].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The counters since the last call, as one line, and reset.
+    pub fn take_line() -> String {
+        let take = |c: &[AtomicU64; 2]| (c[0].swap(0, Ordering::Relaxed) as f64 / 1e9, c[1].swap(0, Ordering::Relaxed));
+        let (l, w, a) = (take(&LINEAR), take(&LINEAR_WAIT), take(&ATTENTION));
+        format!("projections {:.3} s ({}), of it waiting for the GPU {:.3} s; attention {:.3} s ({})", l.0, l.1, w.0, a.0, a.1)
+    }
+}
+
 use ggml_quants::GgmlType;
 use ggml_rs::{Backend, CpuBackend, QuantizedDeviceStorage, QuantizedTensor, RopeType, Tensor};
 use std::any::Any;
@@ -387,6 +411,13 @@ impl WgpuBackend {
 
     /// `y = x · Wᵀ` with `W` on the GPU.
     fn linear_gpu(&self, x: &Tensor, q: &WgpuQuant, shape: &[usize]) -> Tensor {
+        let start = std::time::Instant::now();
+        let y = self.linear_gpu_inner(x, q, shape);
+        profile::add(&profile::LINEAR, start);
+        y
+    }
+
+    fn linear_gpu_inner(&self, x: &Tensor, q: &WgpuQuant, shape: &[usize]) -> Tensor {
         let (n, k) = (shape[0], shape[1]);
         let host;
         let x = if x.is_device() {
@@ -411,78 +442,113 @@ impl WgpuBackend {
             for start in (0..m).step_by(rows) {
                 let count = rows.min(m - start);
                 let part = Tensor::from_vec(data[start * k..(start + count) * k].to_vec(), vec![count, k]);
-                y.extend_from_slice(self.linear_gpu(&part, q, shape).data());
+                y.extend_from_slice(self.linear_gpu_inner(&part, q, shape).data());
             }
             return Tensor::from_vec(y, out_shape);
         }
+        self.linear_gpu_batch(x, &[(q, shape)]).pop().expect("one weight, one result")
+    }
+
+    /// Several weights of one input, `x` (`[m, k]` on the host, few enough rows for one binding), in one submit and
+    /// one read back: each weight's `[m, n]`, in order. The input goes up once.
+    fn linear_gpu_batch(&self, x: &Tensor, ws: &[(&WgpuQuant, &[usize])]) -> Vec<Tensor> {
+        let k = ws[0].1[1];
+        let m = x.numel() / k;
         let _one = self.serial.lock().unwrap_or_else(|p| p.into_inner());
         let gpu = &self.gpu;
         let many = m >= shaders::MANY_FROM;
-        let pipeline = gpu.pipeline(q.dtype, many).expect("uploaded weights have a pipeline");
-        let bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+        let bytes = |v: &[f32]| -> Vec<u8> {
+            let mut out = Vec::with_capacity(v.len() * 4);
+            for f in v {
+                out.extend_from_slice(&f.to_le_bytes());
+            }
+            out
+        };
         let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
         let xbuf = gpu.device.create_buffer(&wgpu::BufferDescriptor { label: Some("oaiy-x"), size: (x.numel() * 4) as u64, usage, mapped_at_creation: false });
         gpu.queue.write_buffer(&xbuf, 0, &bytes(x.data()));
-        let ysize = (m * n * 4) as u64;
-        let ybuf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("oaiy-y"),
-            size: ysize,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+        let sizes: Vec<u64> = ws.iter().map(|(_, shape)| (m * shape[0] * 4) as u64).collect();
+        let total: u64 = sizes.iter().sum();
         let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("oaiy-y-read"),
-            size: ysize,
+            size: total,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let mut enc = gpu.device.create_command_encoder(&Default::default());
-        let mut groups = Vec::new();
-        for (buffer, row0, rows) in &q.chunks {
-            let params: Vec<u8> = [k as u32, n as u32, m as u32, *row0, *rows, q.row_bytes as u32, 0, 0]
-                .iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect();
-            let pbuf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("oaiy-params"),
-                size: params.len() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        let mut ybufs = Vec::with_capacity(ws.len());
+        for ((q, shape), &ysize) in ws.iter().zip(&sizes) {
+            let n = shape[0];
+            let pipeline = gpu.pipeline(q.dtype, many).expect("uploaded weights have a pipeline");
+            let ybuf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("oaiy-y"),
+                size: ysize,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             });
-            gpu.queue.write_buffer(&pbuf, 0, &params);
-            let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("oaiy-linear-q"),
-                layout: &gpu.layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: xbuf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: ybuf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: pbuf.as_entire_binding() },
-                ],
-            });
-            groups.push((group, *rows));
-        }
-        {
-            let mut pass = enc.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&pipeline);
-            for (group, rows) in &groups {
-                pass.set_bind_group(0, group, &[]);
-                if many {
-                    pass.dispatch_workgroups(rows.div_ceil(shaders::MANY_TILE), (m as u32).div_ceil(shaders::MANY_TILE), 1);
-                    continue;
-                }
-                // Rows beyond 65535 wrap into the second grid axis.
-                let gx = (*rows).min(65535);
-                let gy = rows.div_ceil(65535);
-                let gz = (m as u32).div_ceil(shaders::M_TILE);
-                pass.dispatch_workgroups(gx, gy, gz);
+            let mut groups = Vec::new();
+            for (buffer, row0, rows) in &q.chunks {
+                let params: Vec<u8> = [k as u32, n as u32, m as u32, *row0, *rows, q.row_bytes as u32, 0, 0]
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect();
+                let pbuf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("oaiy-params"),
+                    size: params.len() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                gpu.queue.write_buffer(&pbuf, 0, &params);
+                let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("oaiy-linear-q"),
+                    layout: &gpu.layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: xbuf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: ybuf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: pbuf.as_entire_binding() },
+                    ],
+                });
+                groups.push((group, *rows));
             }
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&pipeline);
+                for (group, rows) in &groups {
+                    pass.set_bind_group(0, group, &[]);
+                    if many {
+                        pass.dispatch_workgroups(rows.div_ceil(shaders::MANY_TILE), (m as u32).div_ceil(shaders::MANY_TILE), 1);
+                        continue;
+                    }
+                    // Rows beyond 65535 wrap into the second grid axis.
+                    let gx = (*rows).min(65535);
+                    let gy = rows.div_ceil(65535);
+                    let gz = (m as u32).div_ceil(shaders::M_TILE);
+                    pass.dispatch_workgroups(gx, gy, gz);
+                }
+            }
+            ybufs.push(ybuf);
         }
-        enc.copy_buffer_to_buffer(&ybuf, 0, &staging, 0, ysize);
+        let mut at = 0;
+        for (ybuf, &ysize) in ybufs.iter().zip(&sizes) {
+            enc.copy_buffer_to_buffer(ybuf, 0, &staging, at, ysize);
+            at += ysize;
+        }
+        let waiting = std::time::Instant::now();
         gpu.queue.submit([enc.finish()]);
-        let raw = gpu.map_read(&staging, ysize);
-        let y: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-        Tensor::from_vec(y, out_shape)
+        let raw = gpu.map_read(&staging, total);
+        profile::add(&profile::LINEAR_WAIT, waiting);
+        let mut at = 0usize;
+        ws.iter()
+            .zip(&sizes)
+            .map(|((_, shape), &ysize)| {
+                let y: Vec<f32> = raw[at..at + ysize as usize].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                at += ysize as usize;
+                let mut out_shape = x.shape().to_vec();
+                *out_shape.last_mut().expect("x has a last axis") = shape[0];
+                Tensor::from_vec(y, out_shape)
+            })
+            .collect()
     }
 }
 
@@ -510,6 +576,35 @@ impl Backend for WgpuBackend {
         }
         self.cpu.linear_q(x, w)
     }
+    /// Weights of one input that are all on this adapter, in one submit: a layer's q, k and v were three round trips
+    /// a decode step.
+    fn linear_q_many(&self, x: &Tensor, ws: &[&QuantizedTensor]) -> Vec<Tensor> {
+        let on_gpu: Option<Vec<(&WgpuQuant, &[usize])>> =
+            ws.iter().map(|w| Some((w.device_storage()?.as_any().downcast_ref::<WgpuQuant>()?, w.shape()))).collect();
+        let host;
+        let x = if x.is_device() {
+            host = x.to_host();
+            &host
+        } else {
+            x
+        };
+        match on_gpu {
+            Some(on_gpu) if on_gpu.len() > 1 && !x.data().is_empty() => {
+                let k = on_gpu[0].1[1];
+                let m = x.numel() / k;
+                let widest = on_gpu.iter().map(|(_, s)| s[0]).max().unwrap_or(0);
+                let fits = m <= (chunk_limit(&self.gpu.limits) as usize / (4 * k.max(widest))).max(1);
+                if on_gpu.iter().all(|(_, s)| s[1] == k && s[0] > 0) && fits {
+                    let start = std::time::Instant::now();
+                    let ys = self.linear_gpu_batch(x, &on_gpu);
+                    profile::add(&profile::LINEAR, start);
+                    return ys;
+                }
+                ws.iter().map(|w| self.linear_q(x, w)).collect()
+            }
+            _ => ws.iter().map(|w| self.linear_q(x, w)).collect(),
+        }
+    }
 
     // Everything else is CpuBackend's, forwarded explicitly so its optimized
     // overrides are kept rather than the trait's defaults.
@@ -521,6 +616,12 @@ impl Backend for WgpuBackend {
     }
     fn rmsnorm(&self, x: &Tensor, weight: &Tensor, eps: f32) -> Tensor {
         self.cpu.rmsnorm(x, weight, eps)
+    }
+    fn silu_mul_split(&self, fused: &Tensor, ff: usize) -> Tensor {
+        self.cpu.silu_mul_split(fused, ff)
+    }
+    fn gelu_approx_mul_split(&self, fused: &Tensor, ff: usize) -> Tensor {
+        self.cpu.gelu_approx_mul_split(fused, ff)
     }
     fn softmax_last(&self, x: &mut Tensor) {
         self.cpu.softmax_last(x)
@@ -552,11 +653,15 @@ impl Backend for WgpuBackend {
     /// The CPU's fused attention (the cache is on the host): the default would copy the cache and take the softmax on
     /// one thread.
     fn attention(&self, q: &Tensor, k_buffer: &Tensor, v_buffer: &Tensor, kv_len: usize, scale: f32, past: usize, sliding_window: Option<usize>) -> Tensor {
+        let start = std::time::Instant::now();
         let host = |t: &Tensor| if t.is_device() { t.to_host() } else { t.clone() };
-        if q.is_device() || k_buffer.is_device() || v_buffer.is_device() {
-            return self.cpu.attention(&host(q), &host(k_buffer), &host(v_buffer), kv_len, scale, past, sliding_window);
-        }
-        self.cpu.attention(q, k_buffer, v_buffer, kv_len, scale, past, sliding_window)
+        let out = if q.is_device() || k_buffer.is_device() || v_buffer.is_device() {
+            self.cpu.attention(&host(q), &host(k_buffer), &host(v_buffer), kv_len, scale, past, sliding_window)
+        } else {
+            self.cpu.attention(q, k_buffer, v_buffer, kv_len, scale, past, sliding_window)
+        };
+        profile::add(&profile::ATTENTION, start);
+        out
     }
     fn argmax_last(&self, x: &Tensor) -> Vec<u32> {
         self.cpu.argmax_last(x)

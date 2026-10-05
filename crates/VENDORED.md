@@ -50,6 +50,14 @@ copied the cache's prefix, repeated it for every query head of a group, and took
 WebGPU backend, whose cache is on the host, uses it too: a 3B Llama's 2,000-token prompt on the portable build went
 from 59 s to 18 s with it.
 
+**Dense models on WebGPU, round trips and host work (2026-10-05).** `Backend::linear_q_many` (`ggml-rs`) takes one
+input against several packed weights, which the WebGPU backend makes one submit and one read back; `Weight::linear_many`
+(`llama-rs`) uses it for a layer's q, k and v (Llama, Qwen3, Gemma 3). A tied LM head keeps the GGUF's packed table
+too (`CommonTensors::tied_packed`), and heads with it when the backend kept the dense f32 table on the host (WebGPU):
+a quantized matmul on the device, not 1.6 GB of f32 on the CPU each token. `CpuBackend` spreads a prompt's
+RMSNorm, RoPE (its sines and cosines made once a position, not once an element) and fused SwiGLU/GeGLU rows over
+the threads. A 3B Llama's decode step on the portable build went from 87 ms to 37.
+
 **The streaming roadmap (2026-08, `docs/ROADMAP.md`).** Each change is marked with
 its roadmap id:
 

@@ -93,9 +93,8 @@ impl Qwen3Model {
             let qx = &self.extras[layer];
 
             let xn = ops::rmsnorm(backend, &x, &b.attn_norm, cfg.rms_eps);
-            let q_flat = b.attn_q.linear(backend, &xn);
-            let k_flat = b.attn_k.linear(backend, &xn);
-            let v_flat = b.attn_v.linear(backend, &xn);
+            let [q_flat, k_flat, v_flat]: [Tensor; 3] =
+                crate::loader::Weight::linear_many(backend, &xn, &[&b.attn_q, &b.attn_k, &b.attn_v]).try_into().expect("q, k and v");
 
             let q_3d = q_flat.reshape(vec![seq, n_h, hd]).expect("q reshape");
             let k_3d = k_flat.reshape(vec![seq, n_kv, hd]).expect("k reshape");

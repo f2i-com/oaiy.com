@@ -197,9 +197,7 @@ fn llama_messages(msgs: &[oaiy_engine::json::Json]) -> std::result::Result<Vec<l
                             other => return Err(format!("message {}: unsupported content part {other:?}", i + 1)),
                         }
                     }
-                    texts.join("
-
-")
+                    texts.join("\n\n")
                 }
                 Some(_) => return Err(format!("message {}: content must be text or a list of parts", i + 1)),
             };
@@ -1230,6 +1228,38 @@ fn gpu_selection_adapts_to_single_device() {
     assert!(available_devices(&[],0).is_err());
 }
 
+/// Where a dense GGUF model's decode step goes on WebGPU: a 3B Llama, a prompt then steps, each with the backend's
+/// counters (`ggml_rs_wgpu::profile`).
+#[cfg(all(test, feature = "webgpu", not(feature = "cuda")))]
+mod dense_webgpu_timing {
+    #[test]
+    #[ignore = "a timing; needs a WebGPU adapter and E:\\models\\llama-3.2-3b-q4_k_m.gguf; run with --nocapture"]
+    fn measure_a_dense_models_decode_on_webgpu() {
+        use std::sync::Arc;
+        use std::time::Instant;
+        let path = std::env::var("DENSE_MODEL").unwrap_or_else(|_| r"E:\models\llama-3.2-3b-q4_k_m.gguf".into());
+        let Ok(b) = ggml_rs_wgpu::WgpuBackend::new(Some(8 << 30)) else { return };
+        let backend: Arc<dyn ggml_rs::Backend> = Arc::new(b);
+        let gguf = gguf::GgufFile::open(&path).unwrap();
+        let model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap();
+        let mut kv = model.new_kv_cache(4096);
+        let prompt: Vec<u32> = (0..512u32).map(|i| 1000 + (i * 7919) % 20000).collect();
+        ggml_rs_wgpu::profile::take_line();
+        let t = Instant::now();
+        let mut logits = model.forward(&prompt, &mut kv);
+        eprintln!("prompt of {} tokens: {:.3} s; {}", prompt.len(), t.elapsed().as_secs_f64(), ggml_rs_wgpu::profile::take_line());
+        let mut next = model.last_logits(&logits).data().iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
+        let t = Instant::now();
+        let steps = 32;
+        for _ in 0..steps {
+            logits = model.forward(&[next], &mut kv);
+            next = model.last_logits(&logits).data().iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
+        }
+        let secs = t.elapsed().as_secs_f64();
+        eprintln!("{steps} decode steps: {:.1} ms a step; {}", secs * 1e3 / steps as f64, ggml_rs_wgpu::profile::take_line());
+    }
+}
+
 #[cfg(test)]
 mod dense_tests {
     use super::*;
@@ -1301,9 +1331,7 @@ mod dense_tests {
     fn a_message_of_parts_keeps_their_text_and_an_image_is_refused_not_dropped() {
         let parse = |s: &[u8]| oaiy_engine::json::Json::parse(s).unwrap();
         let m = llama_messages(&[parse(br#"{"role":"user","content":[{"type":"text","text":"Capital"},{"type":"text","text":"of France?"}]}"#)]).unwrap();
-        assert_eq!(m[0].content, "Capital
-
-of France?");
+        assert_eq!(m[0].content, "Capital\n\nof France?");
         let m = llama_messages(&[parse(br#"{"role":"assistant","content":null}"#)]).unwrap();
         assert!(matches!(m[0].role, llama_rs::Role::Assistant) && m[0].content.is_empty());
         let e = llama_messages(&[

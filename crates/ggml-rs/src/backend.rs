@@ -284,6 +284,12 @@ pub trait Backend: Send + Sync + Debug + 'static {
     /// This is the load-bearing op for fitting big models in memory: with
     /// the override, weights stay packed (4 bits / element for Q4_K) instead
     /// of being inflated 8× to F32.
+    /// VENDORED-LOCAL: `linear_q` of one input against several weights (a layer's q, k and v), each result in order.
+    /// A backend whose every call is a round trip (WebGPU) makes them one.
+    fn linear_q_many(&self, x: &Tensor, ws: &[&QuantizedTensor]) -> Vec<Tensor> {
+        ws.iter().map(|w| self.linear_q(x, w)).collect()
+    }
+
     fn linear_q(&self, x: &Tensor, w: &QuantizedTensor) -> Tensor {
         // Default: materialize as F32 then call linear. Slow, but correct.
         let bytes_host = if w.is_cpu() {
