@@ -2647,30 +2647,46 @@ impl Recorder<'_> {
             return false;
         }
         assert!(x.len >= m * k && y.len >= m * n, "chain: a tensor-core matmul [{n}, {k}] of {m} rows");
-        // the tokens' rows as f16, padded to the tile, once for every matmul that reads them until something writes x
+        let x16 = self.x16_tiled(x, m, k);
+        let tile = crate::shaders::COOP_TILE;
+        let dtype = q.dtype;
+        let pipeline = self.gpu().named_pipeline(name, || crate::shaders::coop_tiled(dtype).expect("a K-quant's tensor-core kernel"));
+        let tiles = q.chunks.iter().map(|(_, _, rows)| rows.div_ceil(tile)).max().unwrap_or(1) * (m as u32).div_ceil(tile);
+        let (splits, out, parts) = self.coop_parts(tiles, k, m, n, y, split);
+        for (chunk, row0, rows) in &q.chunks {
+            let words = [k as u32, n as u32, m as u32, *row0, *rows, q.row_bytes as u32, splits, 0];
+            self.dispatch_kept(&pipeline, chunk, buffer(&x16), &out, &words, (rows.div_ceil(tile), (m as u32).div_ceil(tile), splits));
+        }
+        self.coop_sum(parts, m, n, y, splits);
+        true
+    }
+
+    /// The tokens' rows `x` (`m` of `k`) as [`crate::shaders::X_F16_TILED`] gives them (f16, padded to the tile and to
+    /// a step of 32): once for every tensor-core matmul that reads them until something writes `x`.
+    fn x16_tiled(&mut self, x: &DeviceVec, m: usize, k: usize) -> DeviceVec {
         let tile = crate::shaders::COOP_TILE;
         let padded = (m as u32).div_ceil(tile) as usize * tile as usize;
         let xb = buffer(x).clone();
-        let x16 = match self.x16.iter().find(|(b, rows, width, _)| *b == xb && *rows == m && *width == k) {
-            Some((.., v)) => v.clone(),
-            None => {
-                let v = self.scratch(padded * k / 2);
-                let conv = self.gpu().named_pipeline("chain-x-f16-tiled", || crate::shaders::X_F16_TILED.to_string());
-                let pairs = (padded * k / 2) as u32;
-                let groups = pairs.div_ceil(256);
-                let d = self.gpu().dummy().clone();
-                self.dispatch_kept(&conv, &d, buffer(x), buffer(&v), &[k as u32, m as u32, padded as u32], (groups.min(65535), groups.div_ceil(65535), 1));
-                self.x16.push((xb, m, k, v.clone()));
-                v
-            }
-        };
-        let dtype = q.dtype;
-        let pipeline = self.gpu().named_pipeline(name, || crate::shaders::coop_tiled(dtype).expect("a K-quant's tensor-core kernel"));
+        if let Some((.., v)) = self.x16.iter().find(|(b, rows, width, _)| *b == xb && *rows == m && *width == k) {
+            return v.clone();
+        }
+        let words = crate::shaders::x_f16_tiled_words(m, k);
+        let v = self.scratch(words);
+        let conv = self.gpu().named_pipeline("chain-x-f16-tiled", || crate::shaders::X_F16_TILED.to_string());
+        let groups = (words as u32).div_ceil(256);
+        let d = self.gpu().dummy().clone();
+        self.dispatch_kept(&conv, &d, buffer(x), buffer(&v), &[k as u32, m as u32, padded as u32], (groups.min(65535), groups.div_ceil(65535), 1));
+        self.x16.push((xb, m, k, v.clone()));
+        v
+    }
+
+    /// A tensor-core matmul's splits along k (as given, else as [`crate::shaders::coop_splits`] chooses for `tiles`
+    /// workgroups), where its sums go (`y`, or a part of scratch a split, added into `y` after), and the parts.
+    fn coop_parts(&mut self, tiles: u32, k: usize, m: usize, n: usize, y: &DeviceVec, split: Option<u32>) -> (u32, wgpu::Buffer, Option<DeviceVec>) {
         // a matmul of too few tiles to fill the GPU's last wave split along k: each split's sums into a part of
         // scratch, then the parts added into y
         let units = self.gpu().coop_units();
-        let steps = (k / 32) as u32;
-        let tiles = q.chunks.iter().map(|(_, _, rows)| rows.div_ceil(tile)).max().unwrap_or(1) * (m as u32).div_ceil(tile);
+        let steps = k.div_ceil(32) as u32;
         let splits = split.unwrap_or_else(|| crate::shaders::coop_splits(tiles, units, steps));
         // (one buffer of parts a recording, grown as it needs: its matmuls run in turn)
         let parts = if splits > 1 {
@@ -2685,16 +2701,56 @@ impl Recorder<'_> {
             None
         };
         let out = parts.as_ref().map_or(buffer(y), buffer).clone();
-        for (chunk, row0, rows) in &q.chunks {
-            let words = [k as u32, n as u32, m as u32, *row0, *rows, q.row_bytes as u32, splits, 0];
-            self.dispatch_kept(&pipeline, chunk, buffer(&x16), &out, &words, (rows.div_ceil(tile), (m as u32).div_ceil(tile), splits));
-        }
+        (splits, out, parts)
+    }
+
+    /// A split tensor-core matmul's parts added into `y`.
+    fn coop_sum(&mut self, parts: Option<DeviceVec>, m: usize, n: usize, y: &DeviceVec, splits: u32) {
         if let Some(parts) = parts {
             let sum = self.named("chain-coop-sum", COOP_SUM);
             let groups = ((m * n) as u32).div_ceil(256);
             let d = self.gpu().dummy().clone();
             self.dispatch_kept(&sum, &d, buffer(&parts), buffer(y), &[(m * n) as u32, splits], (groups.min(65535), groups.div_ceil(65535), 1));
         }
+    }
+
+    /// `y[r] = W x[r]` for a prompt's rows of f16 weights (`[n, k]` two to a word) through the f32 tiled kernel (the
+    /// weights read as f32), split along k where its tiles are few.
+    pub(crate) fn matmul_f16_tiled(&mut self, w: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize) {
+        let tiles = n.div_ceil(64) * rows.div_ceil(64);
+        let want = 1024usize.div_ceil(tiles).min(k / 256).max(1);
+        let kc = k.div_ceil(want).div_ceil(16) * 16;
+        let splits = k.div_ceil(kc);
+        let d = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        let grid = (n.div_ceil(64) as u32, rows.div_ceil(64) as u32, splits as u32);
+        let words = [n as u32, k as u32, rows as u32, kc as u32];
+        let tiled = MATMUL_F32_TILED.replace("var<storage, read> w: array<f32>;", "var<storage, read> w: array<u32>;\nfn wv(e: u32) -> f32 {\n    let pr = unpack2x16float(w[e / 2u]);\n    return select(pr.x, pr.y, (e & 1u) == 1u);\n}").replace("u = w[(o0 + rr) * k + gk];", "u = wv((o0 + rr) * k + gk);");
+        if splits == 1 {
+            self.dispatch_wide("chain-matmul-f16-tiled", &tiled, [buffer(w), buffer(x), &d, &d, &d, &d, buffer(y), &drw], &words, grid);
+        } else {
+            let part = self.scratch(splits * rows * n);
+            self.dispatch_wide("chain-matmul-f16-tiled", &tiled, [buffer(w), buffer(x), &d, &d, &d, &d, buffer(&part), &drw], &words, grid);
+            let len = (rows * n) as u32;
+            self.dispatch_wide("chain-sum-splits", SUM_SPLITS, [buffer(&part), &d, &d, &d, &d, &d, buffer(y), &drw], &[len, splits as u32], (len.div_ceil(256).min(65535), len.div_ceil(256 * 65535), 1));
+        }
+    }
+
+    /// `y[r] = W x[r]` for a prompt's rows of f16 weights (`[n, k]` two to a word, `k` of 4) on the tensor cores
+    /// ([`crate::shaders::coop_tiled_f16`]), split along k as given (else as chosen). False where the device has no
+    /// cooperative matrices.
+    pub(crate) fn matmul_f16_coop(&mut self, w: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, m: usize, split: Option<u32>) -> bool {
+        if !self.gpu().device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) || k % 4 != 0 {
+            return false;
+        }
+        let x16 = self.x16_tiled(x, m, k);
+        let tile = crate::shaders::COOP_TILE;
+        let pipeline = self.gpu().named_pipeline("chain-coop-f16", crate::shaders::coop_tiled_f16);
+        let tiles = (n as u32).div_ceil(tile) * (m as u32).div_ceil(tile);
+        let (splits, out, parts) = self.coop_parts(tiles, k, m, n, y, split);
+        let words = [k as u32, n as u32, m as u32, 0, n as u32, 0, splits, 0];
+        self.dispatch_kept(&pipeline, buffer(w), buffer(&x16), &out, &words, ((n as u32).div_ceil(tile), (m as u32).div_ceil(tile), splits));
+        self.coop_sum(parts, m, n, y, splits);
         true
     }
 
@@ -3025,23 +3081,13 @@ impl ChainRecorder for Recorder<'_> {
             self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(y), &[n as u32, k as u32], (groups, 1, 1));
             return;
         }
-        let tiles = n.div_ceil(64) * rows.div_ceil(64);
-        let want = 1024usize.div_ceil(tiles).min(k / 256).max(1);
-        let kc = k.div_ceil(want).div_ceil(16) * 16;
-        let splits = k.div_ceil(kc);
-        let d = self.gpu().dummy().clone();
-        let drw = self.gpu().dummy_rw().clone();
-        let grid = (n.div_ceil(64) as u32, rows.div_ceil(64) as u32, splits as u32);
-        let words = [n as u32, k as u32, rows as u32, kc as u32];
-        let tiled = MATMUL_F32_TILED.replace("var<storage, read> w: array<f32>;", "var<storage, read> w: array<u32>;\nfn wv(e: u32) -> f32 {\n    let pr = unpack2x16float(w[e / 2u]);\n    return select(pr.x, pr.y, (e & 1u) == 1u);\n}").replace("u = w[(o0 + rr) * k + gk];", "u = wv((o0 + rr) * k + gk);");
-        if splits == 1 {
-            self.dispatch_wide("chain-matmul-f16-tiled", &tiled, [buffer(w), buffer(x), &d, &d, &d, &d, buffer(y), &drw], &words, grid);
-        } else {
-            let part = self.scratch(splits * rows * n);
-            self.dispatch_wide("chain-matmul-f16-tiled", &tiled, [buffer(w), buffer(x), &d, &d, &d, &d, buffer(&part), &drw], &words, grid);
-            let len = (rows * n) as u32;
-            self.dispatch_wide("chain-sum-splits", SUM_SPLITS, [buffer(&part), &d, &d, &d, &d, &d, buffer(y), &drw], &[len, splits as u32], (len.div_ceil(256).min(65535), len.div_ceil(256 * 65535), 1));
+        // a prompt's rows on the tensor cores (f16 tokens, f32 sums: Qwen3.8-Flash-Next's hyper-connections' 324 by
+        // 10,240 and back, its routers' and its delta nets' `ba` some 14 ms of a chunk of 512 where 33; OAIY_NO_COOP_F16
+        // the f32 tiled kernel)
+        if std::env::var_os("OAIY_NO_COOP_F16").is_none() && self.matmul_f16_coop(w, n, k, x, y, rows, None) {
+            return;
         }
+        self.matmul_f16_tiled(w, n, k, x, y, rows);
     }
 
     fn matmul_f32_rows(&mut self, w: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize) {
@@ -4027,14 +4073,14 @@ mod tests {
     }
 
     /// A matrix of f16 values held as f16 (two to a word) multiplies as it does held as f32: a long row's step the same
-    /// bits (summed the same way), a short row's and a prompt's within rounding; a matrix not all f16 values is not
-    /// made.
+    /// bits (summed the same way), a short row's and a prompt's within rounding (a prompt's on the tensor cores within
+    /// f16's: its tokens f16, its sums f16 a window); a matrix not all f16 values is not made.
     #[test]
     fn an_f16_matrix_multiplies_as_its_f32_one() {
         let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
         let mut r = rng(57);
         assert!(b.vec_f16(&[0.1, 0.5]).is_none(), "0.1 is no f16");
-        for (n, k, rows) in [(324usize, 10240usize, 1usize), (513, 2560, 1), (1030, 324, 1), (70, 100, 1), (324, 10240, 70), (1030, 324, 65)] {
+        for (n, k, rows) in [(324usize, 10240usize, 1usize), (513, 2560, 1), (1030, 324, 1), (70, 100, 1), (324, 10240, 70), (1030, 324, 65), (513, 2560, 300), (96, 2560, 512), (10240, 324, 130)] {
             let w: Vec<f32> = (0..n * k).map(|_| half::f16::from_f32(r()).to_f32()).collect();
             let x: Vec<f32> = (0..rows * k).map(|_| r()).collect();
             let (w32, xd, y32, y16) = (b.vec(n * k), b.vec(rows * k), b.vec(rows * n), b.vec(rows * n));
@@ -4050,12 +4096,64 @@ mod tests {
             let (h, f) = (got.pop().unwrap(), got.pop().unwrap());
             if rows == 1 && k >= 2048 {
                 assert_eq!(h.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), f.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "[{n}, {k}]: the same sums");
+            } else if rows > 8 && b.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+                // on the tensor cores: the tokens rounded to f16, the sums f16 a window
+                let rms = (f.iter().map(|e| (*e as f64).powi(2)).sum::<f64>() / f.len() as f64).sqrt();
+                let err = (h.iter().zip(&f).map(|(a, e)| ((*a - *e) as f64).powi(2)).sum::<f64>() / f.len() as f64).sqrt();
+                let worst = h.iter().zip(&f).map(|(a, e)| ((*a - *e) as f64).abs()).fold(0.0, f64::max);
+                assert!(err < 2e-3 * rms && worst < 1.5e-2 * rms, "[{n}, {k}] of {rows} rows: RMS error {err:.3e}, the worst {worst:.3e}, of an RMS {rms:.3}");
             } else {
                 let scale = (k as f32).sqrt();
                 for (i, (a, e)) in h.iter().zip(&f).enumerate() {
                     assert!((a - e).abs() <= 1e-4 * scale, "[{n}, {k}] of {rows} rows [{i}]: {a} against {e}");
                 }
             }
+        }
+    }
+
+    /// Qwen3.8-Flash-Next's f16 matmuls of a chunk of 512 tokens (`--ignored --nocapture`): its hyper-connections' down
+    /// and up, its router and its delta nets' `ba`, through the f32 tiled kernel and on the tensor cores (split as
+    /// chosen and in 1 to 8).
+    #[test]
+    #[ignore = "a measurement"]
+    fn measure_f16_matmuls() {
+        let Ok(b) = WgpuBackend::new(Some(4 << 30)) else { return };
+        if !b.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+            return;
+        }
+        let m = 512usize;
+        let mut r = rng(3);
+        for (what, n, k) in [("hyper-connection down", 324usize, 10240usize), ("hyper-connection up", 10240, 324), ("router", 513, 2560), ("delta net ba", 96, 2560)] {
+            let w: Vec<f32> = (0..n * k).map(|_| half::f16::from_f32(r() * 0.05).to_f32()).collect();
+            let w16 = b.vec_f16(&w).expect("f16 values");
+            let (x, y) = (b.vec(m * k), b.vec(m * n));
+            DeviceChain::upload(&b, &x, &(0..m * k).map(|_| r()).collect::<Vec<_>>());
+            let time = |f: &dyn Fn(&mut Recorder)| {
+                let run = || {
+                    let mut rec = Recorder::new(&b);
+                    for _ in 0..8 {
+                        f(&mut rec);
+                    }
+                    rec.read_range(&y, 0, 1);
+                    Box::new(rec).finish();
+                };
+                run();
+                let t = std::time::Instant::now();
+                for _ in 0..3 {
+                    run();
+                }
+                t.elapsed().as_secs_f64() / 24.0 * 1e3
+            };
+            let ms = time(&|rec| rec.matmul_f16_tiled(&w16, n, k, &x, &y, m));
+            let mut line = format!("{what} [{n}, {k}]: f32 tiled {ms:.3} ms ({:.1} TFLOPS); tensor cores", 2.0 * (m * n * k) as f64 / ms / 1e9);
+            for split in [None, Some(1), Some(2), Some(4), Some(8)] {
+                let ms = time(&|rec| {
+                    rec.wrote(buffer(&x));
+                    assert!(rec.matmul_f16_coop(&w16, n, k, &x, &y, m, split));
+                });
+                line += &format!(" {}: {ms:.3} ms ({:.0})", split.map_or("chosen".to_string(), |s| s.to_string()), 2.0 * (m * n * k) as f64 / ms / 1e9);
+            }
+            eprintln!("{line}");
         }
     }
 
@@ -4435,36 +4533,6 @@ fn main() {
             }
             let ms = t.elapsed().as_secs_f64() / 12.0 * 1e3;
             eprintln!("{name}: {ms:.2} ms ({:.1} TFLOPS)", 2.0 * (m * n * k) as f64 / ms / 1e9);
-        }
-    }
-
-    /// What a prompt's f16 matmuls take (`--ignored --nocapture`): Qwen3.8-Flash-Next's for 512 rows (a hyper-connection's
-    /// down and up, the router, a delta net's gates).
-    #[test]
-    #[ignore = "a measurement"]
-    fn measure_f16_matmuls() {
-        let Ok(b) = WgpuBackend::new(Some(2 << 30)) else { return };
-        let rows = 512usize;
-        for (what, n, k) in [("hc down", 324usize, 8192usize), ("hc up", 8192, 324), ("router", 513, 2048), ("ba", 64, 2048)] {
-            let w = b.vec(n * k / 2);
-            DeviceChain::upload(&b, &w, &vec![f32::from_bits(0x3c003c00); n * k / 2]);
-            let (x, y) = (b.vec(rows * k), b.vec(rows * n));
-            let run = || {
-                let mut rec = b.begin();
-                rec.keep_groups(false);
-                for _ in 0..8 {
-                    rec.matmul_f16_rows(&w, n, k, &x, &y, rows);
-                }
-                rec.read_range(&y, 0, 1);
-                rec.finish();
-            };
-            run();
-            let t = std::time::Instant::now();
-            for _ in 0..3 {
-                run();
-            }
-            let ms = t.elapsed().as_secs_f64() / 24.0 * 1e3;
-            eprintln!("{what} [{n}, {k}] of {rows} rows: {ms:.3} ms ({:.1} TFLOPS)", 2.0 * (rows * n * k) as f64 / ms / 1e9);
         }
     }
 

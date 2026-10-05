@@ -757,8 +757,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
 /// [`X_F16`] for [`coop_tiled`]: the tokens' rows as f16 a step's 32 of `k` at a time, each step's for every (padded)
 /// token together (a token's 32 after the one before's), so a step's loads of a tile's tokens are one run (a warp's
-/// 1 KB, where the rows in place made it 16 runs of 64 bytes: the matmul 0.89 ms where 0.96). `p[0]`: k, rows,
-/// padded rows.
+/// 1 KB, where the rows in place made it 16 runs of 64 bytes: the matmul 0.89 ms where 0.96); a last step short of 32
+/// (`k` even, not of 32) padded with zeros. `p[0]`: k, rows, padded rows.
 pub const X_F16_TILED: &str = r#"
 @group(0) @binding(0) var<storage, read> unused: array<u32>;
 @group(0) @binding(1) var<storage, read> x2: array<vec2<f32>>;
@@ -770,16 +770,21 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let k2 = p[0].x / 2u;
     let padded = p[0].z;
     let i = id.x + id.y * 65535u * 256u;
-    if (i >= padded * k2) { return; }
+    if (i >= padded * ((k2 + 15u) / 16u) * 16u) { return; }
     // pair j of step s's 16, of token t
     let j = i % 16u;
     let t = (i / 16u) % padded;
     let s = i / (16u * padded);
     var v = vec2<f32>(0.0);
-    if (t < p[0].y) { v = x2[t * k2 + s * 16u + j]; }
+    if (t < p[0].y && s * 16u + j < k2) { v = x2[t * k2 + s * 16u + j]; }
     q[i] = pack2x16float(v);
 }
 "#;
+
+/// The words [`X_F16_TILED`] makes of `rows` tokens of `k` (padded to [`COOP_TILE`] tokens and to a step of 32).
+pub fn x_f16_tiled_words(rows: usize, k: usize) -> usize {
+    rows.div_ceil(COOP_TILE as usize) * COOP_TILE as usize * k.div_ceil(32) * 16
+}
 
 /// Weight rows (and tokens) a workgroup of [`coop_tiled`] takes.
 pub const COOP_TILE: u32 = 128;
@@ -875,8 +880,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let rr = r0 + lr;
     let rl = min(rr, p.rows - 1u);
     let kx = p.k;
-    // the workgroup's split of the steps (`wg.z` of `p.splits`, none empty), its sums that split's part of `y`
-    let all = p.k / 32u;
+    // the workgroup's split of the steps (`wg.z` of `p.splits`, none empty), its sums that split's part of `y` (a
+    // last step short of 32 where `k` is: f16 weights')
+    let all = (p.k + 31u) / 32u;
     let per = (all + p.splits - 1u) / p.splits;
     let s0 = wg.z * per;
     let s1 = min(all, s0 + per);
@@ -925,6 +931,7 @@ DECODE_REGS
     {
         let b = s0;
         LOAD_BLOCK
+        STEP_LOAD
         let xb = xo + b * xs;
         xr0 = x16[xb];
         xr1 = x16[xb + 1u];
@@ -954,6 +961,7 @@ DECODE_REGS
         if (b % 8u == 0u && b != b0) {
             LOAD_BLOCK
         }
+        STEP_LOAD
         let xb = xo + b * xs;
         xr0 = x16[xb];
         xr1 = x16[xb + 1u];
@@ -1261,6 +1269,28 @@ const COOP_Q8_0_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
             for (var i = 0u; i < 4u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }
         }"#;
 
+/// f16 weights for [`coop_tiled`] (`[n, k]`, `k` of 4): a thread's 16 of its row's step loaded a step ahead as the
+/// tokens' are, and stored as they are (a last step's past `k` zeros).
+const COOP_F16_REGS: &str = r#"    var wr0 = vec4<f16>();
+    var wr1 = vec4<f16>();
+    var wr2 = vec4<f16>();
+    var wr3 = vec4<f16>();"#;
+const COOP_F16_LOAD: &str = r#"let wk = b * 32u + lh * 16u;
+        let wo = rl * (kx / 4u) + wk / 4u;
+        wr0 = select(vec4<f16>(), w4[wo], wk < kx);
+        wr1 = select(vec4<f16>(), w4[wo + 1u], wk + 4u < kx);
+        wr2 = select(vec4<f16>(), w4[wo + 2u], wk + 8u < kx);
+        wr3 = select(vec4<f16>(), w4[wo + 3u], wk + 12u < kx);"#;
+const COOP_F16_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
+        if (rr < p.rows) {
+            wt[at4] = wr0;
+            wt[at4 + 1u] = wr1;
+            wt[at4 + 2u] = wr2;
+            wt[at4 + 3u] = wr3;
+        } else {
+            for (var i = 0u; i < 4u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }
+        }"#;
+
 /// A prompt's matmul on the tensor cores (WGSL's cooperative matrices, f16 into f32): a workgroup a tile of
 /// [`COOP_TILE`] weight rows by as many tokens, `k` 32 at a time; each step the tile's weights decoded to f16 and its
 /// tokens' rows (as [`X_F16_TILED`] gives them, padded to the tile) copied into the workgroup's memory, the next step's
@@ -1279,19 +1309,48 @@ pub fn coop_tiled(dtype: GgmlType) -> Option<String> {
         GgmlType::Q8_0 => ("@group(0) @binding(0) var<storage, read> w: array<u32>;", COOP_Q6K_HELPERS, "", "", COOP_Q8_0_STEP),
         _ => return None,
     };
+    Some(coop_source(binding, helpers, regs, load, "", step))
+}
+
+/// [`coop_tiled`] for f16 weights (`[n, k]` two to a word, `k` of 4: a last step short of 32 padded with zeros), its
+/// sums f32 throughout: its matmuls (Qwen3.8-Flash-Next's hyper-connections', routers') are few multiply-adds for the
+/// bytes they read, and f16 windows of 32 steps took a chained prompt's logits from 0.9986 of the host's (cosine) to
+/// 0.9967 (0.9989 in f32).
+pub fn coop_tiled_f16() -> String {
+    f32_sums(&coop_source("@group(0) @binding(0) var<storage, read> w4: array<vec4<f16>>;", "", COOP_F16_REGS, "", COOP_F16_LOAD, COOP_F16_STEP))
+}
+
+/// A [`COOP_KERNEL`] source with its multiply-adds into the f32 sums themselves (no f16 windows, nothing folded).
+fn f32_sums(src: &str) -> String {
+    let mut out = src.to_string();
+    for f in ["00", "01", "02", "03", "10", "11", "12", "13"] {
+        let (a, b) = (&f[..1], &f[1..]);
+        let from = format!("h{f} = coopMultiplyAdd(a{a}, b{b}f, h{f});");
+        assert_eq!(out.matches(&from).count(), 2, "the kernel's multiply-adds into h{f}");
+        out = out.replace(&from, &format!("c{f} = coopMultiplyAdd(a{a}, b{b}f, c{f});"));
+    }
+    let start = out.find("    {\n        let cur = ((w1 - 1u) % 2u) * BUF4;").expect("the fold");
+    let end_mark = "        h13 = coop_mat16x16<f16, C>();\n\n    }\n";
+    let end = out[start..].find(end_mark).expect("the fold's end") + start + end_mark.len();
+    out.replace_range(start..end, "");
+    out
+}
+
+/// [`COOP_KERNEL`] with a type's weights put in: their binding, helpers, registers, a block's loads (every 8 steps), a
+/// step's (beside its tokens'), and a step's decode into the workgroup's memory.
+fn coop_source(binding: &str, helpers: &str, regs: &str, load: &str, step_load: &str, step: &str) -> String {
     let frags = [("c00", 0u32, 0u32), ("c01", 0, 16), ("c02", 0, 32), ("c03", 0, 48), ("c10", 16, 0), ("c11", 16, 16), ("c12", 16, 32), ("c13", 16, 48)];
     let edges: String = frags.iter().map(|(cf, fr, ft)| COOP_EDGE.replace("CF", cf).replace("FR", &format!("{fr}u")).replace("FT", &format!("{ft}u"))).collect();
     let fold = std::env::var("OAIY_COOP_FOLD").ok().and_then(|v| v.parse::<u32>().ok()).filter(|&f| f > 0).unwrap_or(COOP_FOLD);
-    Some(
-        COOP_KERNEL
-            .replace("FOLDu", &format!("{fold}u"))
-            .replace("WEIGHTS_BINDING", binding)
-            .replace("DECODE_HELPERS", helpers)
-            .replace("DECODE_REGS", regs)
-            .replace("LOAD_BLOCK", load)
-            .replace("DECODE_STEP", step)
-            .replace("EDGE_STORES", &edges),
-    )
+    COOP_KERNEL
+        .replace("FOLDu", &format!("{fold}u"))
+        .replace("WEIGHTS_BINDING", binding)
+        .replace("DECODE_HELPERS", helpers)
+        .replace("DECODE_REGS", regs)
+        .replace("LOAD_BLOCK", load)
+        .replace("STEP_LOAD", step_load)
+        .replace("DECODE_STEP", step)
+        .replace("EDGE_STORES", &edges)
 }
 
 /// [`coop_tiled`] with its in-loop decode between marker comments (a measurement takes it out).
@@ -1310,7 +1369,7 @@ pub(crate) fn coop_tiled_marked(dtype: GgmlType) -> Option<String> {
     // (the first is the prologue's, kept; the second the loop's, marked)
     let marked = marked.replacen("SECOND_STEP", "        DECODE_STEP\n        let xa = buf + lr * S4 + lh * 4u;\n        xt[xa] = xr0;", 1);
     let marked = marked.replacen("SECOND_STEP", "        // DECODE BEGIN\n        DECODE_STEP\n        // DECODE END\n        let xa = buf + lr * S4 + lh * 4u;\n        xt[xa] = xr0;", 1);
-    Some(marked.replace("FOLDu", &format!("{COOP_FOLD}u")).replace("WEIGHTS_BINDING", binding).replace("DECODE_HELPERS", helpers).replace("DECODE_REGS", regs).replace("LOAD_BLOCK", load).replace("DECODE_STEP", step).replace("EDGE_STORES", &edges))
+    Some(marked.replace("FOLDu", &format!("{COOP_FOLD}u")).replace("WEIGHTS_BINDING", binding).replace("DECODE_HELPERS", helpers).replace("DECODE_REGS", regs).replace("LOAD_BLOCK", load).replace("STEP_LOAD", "").replace("DECODE_STEP", step).replace("EDGE_STORES", &edges))
 }
 
 /// [`rb_kernel`] for a measurement of its shapes.

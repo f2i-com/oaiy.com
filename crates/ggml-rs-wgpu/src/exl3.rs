@@ -3110,6 +3110,98 @@ mod tests {
         }
     }
 
+    /// What a prompt's grouped experts' gate and up matmul takes on the tensor cores (`--ignored --nocapture`, with
+    /// OAIY_CHAIN_PROFILE for each kernel's GPU time): 128 of Qwen3.8-Flash-Next's experts (2,560 by 640, 3 bits), 10,
+    /// 20 or 40 jobs each (a chunk of 512, 1,024 or 2,048 rows over its 512), in blocks of 16 to 128; then the same
+    /// blocks over 8 matrices (their words in the L2 throughout). On an RTX 5090 a block's time is its decode's, its
+    /// rows nearly free: 10 jobs in blocks of 32 0.47 ms, 20 0.51; but blocks of 64 or 128 0.83 and 0.94 for the same
+    /// blocks (their registers leave a workgroup an SM where 32's leave two: 32's padded to one an SM is 0.80), and the
+    /// words in the L2 0.42 where 0.50. Neither skipping a block's empty fragments' multiply-adds nor the decode's
+    /// conversion done in bits changed it.
+    #[test]
+    #[ignore = "a measurement"]
+    fn measure_prompt_expert_blocks() {
+        let Some(b) = backend() else { return };
+        if !coop_on(&b.gpu) {
+            return;
+        }
+        let (count, hidden, ff, tw, top_k) = (128usize, 2560usize, 640usize, 48usize, 10usize);
+        let moe = b.exl3_experts(experts(count, hidden, ff, tw)).unwrap();
+        let g = moe.as_any().unwrap().downcast_ref::<Exl3MoeGrouped>().unwrap();
+        for per in [10usize, 20, 40] {
+            let rows = per * count / top_k;
+            let st = g.scratch(&mut |n| b.vec(n), rows, top_k, false);
+            let x = b.vec(rows * hidden);
+            DeviceChain::upload(&b, &x, &(0..rows * hidden).map(|i| ((i * 37 % 101) as f32 - 50.0) / 31.0).collect::<Vec<_>>());
+            // row r's experts r k to r k + k - 1 (of the count, around): `per` rows each
+            let jobs: Vec<u32> = (0..rows)
+                .flat_map(|r| {
+                    (0..top_k).flat_map(move |j| {
+                        let e = ((r * top_k + j) % count) as u32;
+                        [2 * e, r as u32, 2 * e + 1, r as u32]
+                    })
+                })
+                .collect();
+            upload_u32(&b, &st.jobs_gu, &jobs);
+            let n = jobs.len() / 2;
+            for bs in [16usize, 32, 64, 128] {
+                let order = many_order(&jobs, bs);
+                let ob = b.vec(order.len());
+                upload_u32(&b, &ob, &order);
+                let blocks = order.len() / bs;
+                let run = || {
+                    let mut rec = crate::chain::Recorder::new(&b);
+                    for _ in 0..8 {
+                        g.group_pass(&mut rec, &g.gu, &x, false, &st.jobs_gu, n, Order::Many(&ob, blocks, bs), &st.xh_gu, &st.part_gu, &st.out_gu);
+                    }
+                    use ggml_rs::ChainRecorder;
+                    rec.read_range(&st.out_gu, 0, 1);
+                    Box::new(rec).finish();
+                };
+                run();
+                let _ = crate::profile::take_kernels();
+                let t = std::time::Instant::now();
+                for _ in 0..3 {
+                    run();
+                }
+                let ms = t.elapsed().as_secs_f64() / 24.0 * 1e3;
+                let k = crate::profile::take_kernels();
+                let mm: f64 = k.iter().filter(|e| e.0.starts_with("exl3-coop")).map(|e| e.1).sum::<f64>() / 24.0;
+                eprintln!("{per} jobs an expert ({rows} rows), blocks of {bs} ({blocks}): a pass {ms:.3} ms, its matmul {mm:.3} ms on the GPU");
+            }
+        }
+        // the same blocks (256 of 10 jobs in places for 32) over 4 experts' matrices (their words in the L2 throughout)
+        let (rows, bs, blocks, per) = (256usize, 32usize, 256usize, 10usize);
+        let st = g.scratch(&mut |n| b.vec(n), rows, top_k, false);
+        let x = b.vec(rows * hidden);
+        DeviceChain::upload(&b, &x, &(0..rows * hidden).map(|i| ((i * 37 % 101) as f32 - 50.0) / 31.0).collect::<Vec<_>>());
+        for (what, spread) in [("256 matrices", 256u32), ("8 matrices", 8)] {
+            let jobs: Vec<u32> = (0..blocks * per).flat_map(|j| [((j / per) as u32) % spread, (j % rows) as u32]).collect();
+            upload_u32(&b, &st.jobs_gu, &jobs);
+            let order: Vec<u32> = (0..blocks).flat_map(|blk| (0..bs).map(move |i| if i < per { (blk * per + i) as u32 } else { NONE })).collect();
+            let ob = b.vec(order.len());
+            upload_u32(&b, &ob, &order);
+            let n = blocks * per;
+            let run = || {
+                let mut rec = crate::chain::Recorder::new(&b);
+                for _ in 0..8 {
+                    g.group_pass(&mut rec, &g.gu, &x, false, &st.jobs_gu, n, Order::Many(&ob, blocks, bs), &st.xh_gu, &st.part_gu, &st.out_gu);
+                }
+                use ggml_rs::ChainRecorder;
+                rec.read_range(&st.out_gu, 0, 1);
+                Box::new(rec).finish();
+            };
+            run();
+            let _ = crate::profile::take_kernels();
+            for _ in 0..3 {
+                run();
+            }
+            let k = crate::profile::take_kernels();
+            let mm: f64 = k.iter().filter(|e| e.0.starts_with("exl3-coop")).map(|e| e.1).sum::<f64>() / 24.0;
+            eprintln!("{blocks} blocks of {per} jobs over {what}: the matmul {mm:.3} ms on the GPU");
+        }
+    }
+
     /// A prompt's rows through grouped experts, each expert's in blocks of 32 (a tile decoded once a block): an expert
     /// with more rows than a block (two blocks), one with a single row, the rest a few each, as the definition gives.
     #[test]
