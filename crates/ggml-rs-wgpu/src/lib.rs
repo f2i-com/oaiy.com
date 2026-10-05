@@ -53,6 +53,22 @@ pub mod profile {
         *ON.get_or_init(|| std::env::var_os("OAIY_CHAIN_PROFILE").is_some())
     }
 
+    /// A chain's pieces timed on the GPU (`OAIY_PIECE_STAMPS`): each submitted pass between two timestamps, and a
+    /// recording's busy time (its passes' own) against its span (its first's start to its last's end) added up.
+    pub fn pieces_on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("OAIY_PIECE_STAMPS").is_some())
+    }
+
+    /// Recordings' pieces' busy time and span (ns), and the pieces.
+    pub(crate) static PIECES: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+    /// The pieces' busy time and span since the last call (ms), and how many, and reset.
+    pub fn take_pieces() -> (f64, f64, u64) {
+        let take = |i: usize| PIECES[i].swap(0, Ordering::Relaxed);
+        (take(0) as f64 / 1e6, take(1) as f64 / 1e6, take(2))
+    }
+
     /// Each kernel's GPU time (ns) and dispatches.
     pub(crate) static KERNELS: std::sync::Mutex<std::collections::BTreeMap<&'static str, (u64, u64)>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
@@ -76,6 +92,8 @@ const GIB: u64 = 1 << 30;
 /// The scratch a GPU's pool keeps between chains' runs: a prompt's layer's (Qwen3.8-Flash-Next's at 512 rows about
 /// 0.6 GiB), within the 4 GiB a card's budget leaves.
 const POOL_BYTES: u64 = 3 * GIB / 2;
+/// The read-backs' staging a GPU keeps between chains' runs: two of a prompt's chunks' (some 70 MB each).
+const STAGING_BYTES: u64 = GIB / 4;
 
 /// The adapter's own memory where its API says: Vulkan's largest device-local heap (a discrete card's VRAM). None on
 /// Direct3D 12 and Metal.
@@ -148,6 +166,9 @@ struct Gpu {
     /// Chains' scratch buffers between their runs (bytes, buffer): a prompt's layer takes the last one's, where a new
     /// buffer is allocated and cleared before its first use.
     pool: Mutex<Vec<(u64, wgpu::Buffer)>>,
+    /// Read-backs' staging buffers (host memory the GPU copies into) a chain's reads use again: a prompt's chunk read
+    /// 64 MB of its cache's rows into new ones, each a wait of the OS's before the GPU could start the next.
+    staging: Mutex<Vec<(u64, wgpu::Buffer)>>,
     /// A chain's bind groups that are the same step after step (`chain`): by pipeline, buffers and parameters.
     chain_groups: Mutex<HashMap<chain::GroupKey, wgpu::BindGroup>>,
     /// The layout of the chain's kernels of eight buffers (a gated delta net's: six read, two written, then the
@@ -438,6 +459,36 @@ impl Gpu {
         })
     }
 
+    /// A staging buffer of `bytes` (a power of two) for a read-back: one a read before used, or a new one.
+    pub(crate) fn staging(&self, bytes: u64) -> wgpu::Buffer {
+        let taken = {
+            let mut pool = self.staging.lock().unwrap_or_else(|p| p.into_inner());
+            pool.iter().position(|(b, _)| *b == bytes).map(|i| pool.swap_remove(i).1)
+        };
+        taken.unwrap_or_else(|| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("oaiy-chain-read"),
+                size: bytes,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        })
+    }
+
+    /// Staging buffers back (unmapped), to be used again; past [`STAGING_BYTES`] the largest are let go.
+    pub(crate) fn unstage(&self, buffers: Vec<(u64, wgpu::Buffer)>) {
+        let mut pool = self.staging.lock().unwrap_or_else(|p| p.into_inner());
+        pool.extend(buffers);
+        let mut total: u64 = pool.iter().map(|(b, _)| b).sum();
+        if total > STAGING_BYTES {
+            pool.sort_by_key(|(b, _)| *b);
+            while total > STAGING_BYTES {
+                let Some((b, _)) = pool.pop() else { break };
+                total -= b;
+            }
+        }
+    }
+
     /// Scratch buffers back to the pool, once what used them has run; past [`POOL_BYTES`] the largest are let go.
     pub(crate) fn unpool(&self, buffers: Vec<(u64, wgpu::Buffer)>) {
         let mut pool = self.pool.lock().unwrap_or_else(|p| p.into_inner());
@@ -608,8 +659,8 @@ impl WgpuBackend {
     }
 
     /// Open the best adapter wgpu finds, or the one `OAIY_WEBGPU_ADAPTER` names
-    /// (part of its name, any case: "radeon", "arc", "5090"), for a computer with
-    /// more than one GPU. `budget_bytes` caps the weights placed on it (WebGPU
+    /// (part of its name, any case: "radeon", "arc", "5090", or of its PCI bus id:
+    /// "03:00" of two cards alike), for a computer with more than one GPU. `budget_bytes` caps the weights placed on it (WebGPU
     /// cannot report free memory); `None` picks a default: a discrete card's
     /// memory less 4 GiB where Vulkan says how much it has (27.8 GiB of a 32 GB
     /// card), else 8 GiB; 2 GiB integrated, none for software.
@@ -628,8 +679,11 @@ impl WgpuBackend {
                 let names: Vec<String> = adapters.iter().map(|a| { let i = a.get_info(); format!("{} ({:?})", i.name, i.backend) }).collect();
                 adapters
                     .into_iter()
-                    .find(|a| a.get_info().name.to_lowercase().contains(&wanted))
-                    .ok_or_else(|| format!("OAIY_WEBGPU_ADAPTER={wanted}: no WebGPU adapter has that in its name; there are {}", names.join(", ")))?
+                    .find(|a| {
+                        let i = a.get_info();
+                        i.name.to_lowercase().contains(&wanted) || i.device_pci_bus_id.to_lowercase().contains(&wanted)
+                    })
+                    .ok_or_else(|| format!("OAIY_WEBGPU_ADAPTER={wanted}: no WebGPU adapter has that in its name or PCI bus id; there are {}", names.join(", ")))?
             }
             None => pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -672,7 +726,7 @@ impl WgpuBackend {
             pci_bus_id: info.device_pci_bus_id.clone(),
         };
         let limits = adapter.limits();
-        let timestamps = if profile::chain_on() { adapter.features() & wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() };
+        let timestamps = if profile::chain_on() || profile::pieces_on() { adapter.features() & wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() };
         // the tensor cores' matrices (Vulkan's cooperative matrices) and f16 in shaders, where the adapter has them: a
         // prompt's matmuls through them
         let coop = adapter.features() & (wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX | wgpu::Features::SHADER_F16);
@@ -723,7 +777,7 @@ impl WgpuBackend {
         });
         Ok(Self {
             cpu: CpuBackend::new(),
-            gpu: Arc::new(Gpu { device, queue, layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), names: Mutex::new(HashMap::new()), pool: Mutex::new(Vec::new()), chain_groups: Mutex::new(HashMap::new()), wide: std::sync::OnceLock::new(), chain_groups_wide: Mutex::new(HashMap::new()), dummy: std::sync::OnceLock::new(), dummy_rw: std::sync::OnceLock::new(), limits, staged: AtomicU64::new(0), few: std::sync::OnceLock::new(), moe_steps: Mutex::new(Vec::new()), coop_units: std::sync::OnceLock::new() }),
+            gpu: Arc::new(Gpu { device, queue, layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), names: Mutex::new(HashMap::new()), pool: Mutex::new(Vec::new()), staging: Mutex::new(Vec::new()), chain_groups: Mutex::new(HashMap::new()), wide: std::sync::OnceLock::new(), chain_groups_wide: Mutex::new(HashMap::new()), dummy: std::sync::OnceLock::new(), dummy_rw: std::sync::OnceLock::new(), limits, staged: AtomicU64::new(0), few: std::sync::OnceLock::new(), moe_steps: Mutex::new(Vec::new()), coop_units: std::sync::OnceLock::new() }),
             budget,
             used: Arc::new(AtomicU64::new(0)),
             summary,

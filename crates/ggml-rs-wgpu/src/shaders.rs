@@ -755,8 +755,38 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+/// [`X_F16`] for [`coop_tiled`]: the tokens' rows as f16 a step's 32 of `k` at a time, each step's for every (padded)
+/// token together (a token's 32 after the one before's), so a step's loads of a tile's tokens are one run (a warp's
+/// 1 KB, where the rows in place made it 16 runs of 64 bytes: the matmul 0.89 ms where 0.96). `p[0]`: k, rows,
+/// padded rows.
+pub const X_F16_TILED: &str = r#"
+@group(0) @binding(0) var<storage, read> unused: array<u32>;
+@group(0) @binding(1) var<storage, read> x2: array<vec2<f32>>;
+@group(0) @binding(2) var<storage, read_write> q: array<u32>;
+@group(0) @binding(3) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let k2 = p[0].x / 2u;
+    let padded = p[0].z;
+    let i = id.x + id.y * 65535u * 256u;
+    if (i >= padded * k2) { return; }
+    // pair j of step s's 16, of token t
+    let j = i % 16u;
+    let t = (i / 16u) % padded;
+    let s = i / (16u * padded);
+    var v = vec2<f32>(0.0);
+    if (t < p[0].y) { v = x2[t * k2 + s * 16u + j]; }
+    q[i] = pack2x16float(v);
+}
+"#;
+
 /// Weight rows (and tokens) a workgroup of [`coop_tiled`] takes.
 pub const COOP_TILE: u32 = 128;
+
+/// The steps (of 32 of `k`) a tensor-core matmul sums in f16 before it adds them into its f32 sums: f16 sums run the
+/// multiply-adds twice as fast, and over 512 they are within some 0.1% (an int8 activation's own error is near 1%).
+const COOP_FOLD: u32 = 32;
 
 /// How many workgroups of 1024 threads run at once (a GPU's SMs or compute units, where one holds one of them; their
 /// tensor cores are what a matmul's workgroups share): each works a while (`p[0].x` dependent multiply-adds), and
@@ -788,16 +818,16 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 /// The splits of a tensor-core matmul's `steps` (of 32) for `groups` workgroups on a GPU of `units` (its SMs: a
 /// workgroup alone on one runs about twice as fast as two together): the fewest of those that take least time, each
 /// wave of `units` workgroups taking as long however full, and each split's sums written and read again besides (as
-/// much as the matmul's own time `4 s / k` per FLOP of the GPU's per byte, taken as 50: the parts mostly in its L2, as
-/// [`crate::chain`]'s `measure_coop_splits` finds), at most 8 splits of 8 steps or more; and how many that is with
-/// none empty.
+/// much as `420 s / k` of the matmul's own time: the parts mostly in its L2, as [`crate::chain`]'s
+/// `measure_coop_splits` finds of Qwen3.8 27B's shapes), at most 8 splits of 8 steps or more; and how many that is
+/// with none empty.
 pub fn coop_splits(groups: u32, units: u32, steps: u32) -> u32 {
     let slots = units.max(1);
     let k = (steps * 32) as f64;
     let cost = |s: u32| {
         let w = groups * s;
         let waves = w.div_ceil(slots) * slots;
-        waves as f64 / w as f64 + if s > 1 { 200.0 * s as f64 / k } else { 0.0 }
+        waves as f64 / w as f64 + if s > 1 { 420.0 * s as f64 / k } else { 0.0 }
     };
     let most = (steps / 8).clamp(1, 8);
     let s = (1..=most).fold(1, |best, s| if cost(s) < cost(best) - 1e-9 { s } else { best });
@@ -851,7 +881,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let s0 = wg.z * per;
     let s1 = min(all, s0 + per);
     let zo = wg.z * p.m * p.n;
-    let xo = ((t0 + lr) * kx + lh * 16u) / 4u;
+    // (the tokens as [`X_F16_TILED`] gives them: a step's for every padded token together)
+    let padded = ((p.m + 127u) / 128u) * 128u;
+    let xo = (t0 + lr) * 8u + lh * 4u;
+    let xs = padded * 8u;
     var c00 = coop_mat16x16<f32, C>();
     var c01 = coop_mat16x16<f32, C>();
     var c02 = coop_mat16x16<f32, C>();
@@ -860,6 +893,27 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     var c11 = coop_mat16x16<f32, C>();
     var c12 = coop_mat16x16<f32, C>();
     var c13 = coop_mat16x16<f32, C>();
+    // the multiply-adds' sums in f16 (twice as fast), folded into the f32 ones every FOLD steps
+    var h00 = coop_mat16x16<f16, C>();
+    var h01 = coop_mat16x16<f16, C>();
+    var h02 = coop_mat16x16<f16, C>();
+    var h03 = coop_mat16x16<f16, C>();
+    var h10 = coop_mat16x16<f16, C>();
+    var h11 = coop_mat16x16<f16, C>();
+    var h12 = coop_mat16x16<f16, C>();
+    var h13 = coop_mat16x16<f16, C>();
+    // the identity: an f16 sum's way into its f32 one (staged as an A, times it)
+    if (li < 64u) {
+        let col = li / 4u;
+        var v = vec4<f16>(0.0h);
+        if (col / 4u == li % 4u) { v[col % 4u] = 1.0h; }
+        wt[li] = v;
+    }
+    workgroupBarrier();
+    let i0 = 0u;
+    let s4i = 4u;
+    let ident = coopLoad<coop_mat16x16<f16, B>>(&wt[i0], s4i);
+    workgroupBarrier();
     // the words of a step's weights and tokens this thread decodes and copies, loaded a step ahead
 DECODE_REGS
     var xr0 = vec4<f16>();
@@ -871,7 +925,7 @@ DECODE_REGS
     {
         let b = s0;
         LOAD_BLOCK
-        let xb = xo + b * 8u;
+        let xb = xo + b * xs;
         xr0 = x16[xb];
         xr1 = x16[xb + 1u];
         xr2 = x16[xb + 2u];
@@ -888,7 +942,11 @@ DECODE_REGS
         xt[xa + 3u] = xr3;
     }
     workgroupBarrier();
-    for (var b0 = s0; b0 < s1; b0++) {
+    // the steps in windows of FOLD, each window's f16 sums folded into the f32 ones after it (a loop in a loop: naga
+    // wants a cooperative op's control flow uniform, and an `if` on the step is not to it)
+    for (var w0 = s0; w0 < s1; w0 += FOLDu) {
+    let w1 = min(w0 + FOLDu, s1);
+    for (var b0 = w0; b0 < w1; b0++) {
         // the next step (the last's own again, stored where no one reads it after): loaded, multiplied, stored, with
         // no branch between (a branch lets the compiler sink the loads to their stores, past the multiplies)
         let b = min(b0 + 1u, s1 - 1u);
@@ -896,7 +954,7 @@ DECODE_REGS
         if (b % 8u == 0u && b != b0) {
             LOAD_BLOCK
         }
-        let xb = xo + b * 8u;
+        let xb = xo + b * xs;
         xr0 = x16[xb];
         xr1 = x16[xb + 1u];
         xr2 = x16[xb + 2u];
@@ -919,14 +977,14 @@ DECODE_REGS
             let b1f = coopLoad<coop_mat16x16<f16, B>>(&xt[ib1], s10);
             let b2f = coopLoad<coop_mat16x16<f16, B>>(&xt[ib2], s10);
             let b3f = coopLoad<coop_mat16x16<f16, B>>(&xt[ib3], s10);
-            c00 = coopMultiplyAdd(a0, b0f, c00);
-            c01 = coopMultiplyAdd(a0, b1f, c01);
-            c02 = coopMultiplyAdd(a0, b2f, c02);
-            c03 = coopMultiplyAdd(a0, b3f, c03);
-            c10 = coopMultiplyAdd(a1, b0f, c10);
-            c11 = coopMultiplyAdd(a1, b1f, c11);
-            c12 = coopMultiplyAdd(a1, b2f, c12);
-            c13 = coopMultiplyAdd(a1, b3f, c13);
+            h00 = coopMultiplyAdd(a0, b0f, h00);
+            h01 = coopMultiplyAdd(a0, b1f, h01);
+            h02 = coopMultiplyAdd(a0, b2f, h02);
+            h03 = coopMultiplyAdd(a0, b3f, h03);
+            h10 = coopMultiplyAdd(a1, b0f, h10);
+            h11 = coopMultiplyAdd(a1, b1f, h11);
+            h12 = coopMultiplyAdd(a1, b2f, h12);
+            h13 = coopMultiplyAdd(a1, b3f, h13);
         }
         {
             let kk = 16u;
@@ -943,14 +1001,14 @@ DECODE_REGS
             let b1f = coopLoad<coop_mat16x16<f16, B>>(&xt[ib1], s10);
             let b2f = coopLoad<coop_mat16x16<f16, B>>(&xt[ib2], s10);
             let b3f = coopLoad<coop_mat16x16<f16, B>>(&xt[ib3], s10);
-            c00 = coopMultiplyAdd(a0, b0f, c00);
-            c01 = coopMultiplyAdd(a0, b1f, c01);
-            c02 = coopMultiplyAdd(a0, b2f, c02);
-            c03 = coopMultiplyAdd(a0, b3f, c03);
-            c10 = coopMultiplyAdd(a1, b0f, c10);
-            c11 = coopMultiplyAdd(a1, b1f, c11);
-            c12 = coopMultiplyAdd(a1, b2f, c12);
-            c13 = coopMultiplyAdd(a1, b3f, c13);
+            h00 = coopMultiplyAdd(a0, b0f, h00);
+            h01 = coopMultiplyAdd(a0, b1f, h01);
+            h02 = coopMultiplyAdd(a0, b2f, h02);
+            h03 = coopMultiplyAdd(a0, b3f, h03);
+            h10 = coopMultiplyAdd(a1, b0f, h10);
+            h11 = coopMultiplyAdd(a1, b1f, h11);
+            h12 = coopMultiplyAdd(a1, b2f, h12);
+            h13 = coopMultiplyAdd(a1, b3f, h13);
         }
         DECODE_STEP
         let xa = buf + lr * S4 + lh * 4u;
@@ -959,6 +1017,52 @@ DECODE_REGS
         xt[xa + 2u] = xr2;
         xt[xa + 3u] = xr3;
         workgroupBarrier();
+    }
+    {
+        let cur = ((w1 - 1u) % 2u) * BUF4;
+        // the f16 sums into the f32 ones, four fragments at a time through the step's buffer (two in its
+        // weights', two in its tokens'), the f16 ones started over
+        let fw0 = cur + sg * 128u;
+        let fw1 = fw0 + 64u;
+        let s4f = 4u;
+        coopStore(h00, &wt[fw0], s4f);
+        coopStore(h01, &wt[fw1], s4f);
+        coopStore(h02, &xt[fw0], s4f);
+        coopStore(h03, &xt[fw1], s4f);
+        workgroupBarrier();
+        let g00 = coopLoad<coop_mat16x16<f16, A>>(&wt[fw0], s4f);
+        c00 = coopMultiplyAdd(g00, ident, c00);
+        let g01 = coopLoad<coop_mat16x16<f16, A>>(&wt[fw1], s4f);
+        c01 = coopMultiplyAdd(g01, ident, c01);
+        let g02 = coopLoad<coop_mat16x16<f16, A>>(&xt[fw0], s4f);
+        c02 = coopMultiplyAdd(g02, ident, c02);
+        let g03 = coopLoad<coop_mat16x16<f16, A>>(&xt[fw1], s4f);
+        c03 = coopMultiplyAdd(g03, ident, c03);
+        workgroupBarrier();
+        coopStore(h10, &wt[fw0], s4f);
+        coopStore(h11, &wt[fw1], s4f);
+        coopStore(h12, &xt[fw0], s4f);
+        coopStore(h13, &xt[fw1], s4f);
+        workgroupBarrier();
+        let g10 = coopLoad<coop_mat16x16<f16, A>>(&wt[fw0], s4f);
+        c10 = coopMultiplyAdd(g10, ident, c10);
+        let g11 = coopLoad<coop_mat16x16<f16, A>>(&wt[fw1], s4f);
+        c11 = coopMultiplyAdd(g11, ident, c11);
+        let g12 = coopLoad<coop_mat16x16<f16, A>>(&xt[fw0], s4f);
+        c12 = coopMultiplyAdd(g12, ident, c12);
+        let g13 = coopLoad<coop_mat16x16<f16, A>>(&xt[fw1], s4f);
+        c13 = coopMultiplyAdd(g13, ident, c13);
+        workgroupBarrier();
+        h00 = coop_mat16x16<f16, C>();
+        h01 = coop_mat16x16<f16, C>();
+        h02 = coop_mat16x16<f16, C>();
+        h03 = coop_mat16x16<f16, C>();
+        h10 = coop_mat16x16<f16, C>();
+        h11 = coop_mat16x16<f16, C>();
+        h12 = coop_mat16x16<f16, C>();
+        h13 = coop_mat16x16<f16, C>();
+
+    }
     }
     // out: y[token, row] is the tile's (row, token) column-major, a token's rows `n` apart
     let ns = p.n;
@@ -1159,7 +1263,7 @@ const COOP_Q8_0_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
 
 /// A prompt's matmul on the tensor cores (WGSL's cooperative matrices, f16 into f32): a workgroup a tile of
 /// [`COOP_TILE`] weight rows by as many tokens, `k` 32 at a time; each step the tile's weights decoded to f16 and its
-/// tokens' rows (as [`X_F16`] gives them, padded to the tile) copied into the workgroup's memory, the next step's
+/// tokens' rows (as [`X_F16_TILED`] gives them, padded to the tile) copied into the workgroup's memory, the next step's
 /// loaded as this one's are multiplied, each of its 8 subgroups its 32 rows by 64 tokens as 2 by 4 fragments of 16x16
 /// (the tokens' fragments read from their rows in memory where they were the f16 rows in place: 141 TFLOPS without a
 /// decode, the loop 207 with both in the workgroup's); the sums stored straight into `y` (a tile at the edge through a
@@ -1177,8 +1281,10 @@ pub fn coop_tiled(dtype: GgmlType) -> Option<String> {
     };
     let frags = [("c00", 0u32, 0u32), ("c01", 0, 16), ("c02", 0, 32), ("c03", 0, 48), ("c10", 16, 0), ("c11", 16, 16), ("c12", 16, 32), ("c13", 16, 48)];
     let edges: String = frags.iter().map(|(cf, fr, ft)| COOP_EDGE.replace("CF", cf).replace("FR", &format!("{fr}u")).replace("FT", &format!("{ft}u"))).collect();
+    let fold = std::env::var("OAIY_COOP_FOLD").ok().and_then(|v| v.parse::<u32>().ok()).filter(|&f| f > 0).unwrap_or(COOP_FOLD);
     Some(
         COOP_KERNEL
+            .replace("FOLDu", &format!("{fold}u"))
             .replace("WEIGHTS_BINDING", binding)
             .replace("DECODE_HELPERS", helpers)
             .replace("DECODE_REGS", regs)
@@ -1186,6 +1292,25 @@ pub fn coop_tiled(dtype: GgmlType) -> Option<String> {
             .replace("DECODE_STEP", step)
             .replace("EDGE_STORES", &edges),
     )
+}
+
+/// [`coop_tiled`] with its in-loop decode between marker comments (a measurement takes it out).
+#[cfg(test)]
+pub(crate) fn coop_tiled_marked(dtype: GgmlType) -> Option<String> {
+    let src = coop_tiled(dtype)?;
+    // the loop's decode is the second DECODE_STEP's: mark it in the template and fill it in again
+    let _ = src;
+    let (binding, helpers, regs, load, step) = match dtype {
+        GgmlType::Q3_K => ("@group(0) @binding(0) var<storage, read> w4: array<vec4<u32>>;", COOP_Q3K_HELPERS, COOP_Q3K_REGS, COOP_Q3K_LOAD, COOP_Q3K_STEP),
+        _ => return None,
+    };
+    let frags = [("c00", 0u32, 0u32), ("c01", 0, 16), ("c02", 0, 32), ("c03", 0, 48), ("c10", 16, 0), ("c11", 16, 16), ("c12", 16, 32), ("c13", 16, 48)];
+    let edges: String = frags.iter().map(|(cf, fr, ft)| COOP_EDGE.replace("CF", cf).replace("FR", &format!("{fr}u")).replace("FT", &format!("{ft}u"))).collect();
+    let marked = COOP_KERNEL.replacen("        DECODE_STEP\n        let xa = buf + lr * S4 + lh * 4u;\n        xt[xa] = xr0;", "SECOND_STEP", 2);
+    // (the first is the prologue's, kept; the second the loop's, marked)
+    let marked = marked.replacen("SECOND_STEP", "        DECODE_STEP\n        let xa = buf + lr * S4 + lh * 4u;\n        xt[xa] = xr0;", 1);
+    let marked = marked.replacen("SECOND_STEP", "        // DECODE BEGIN\n        DECODE_STEP\n        // DECODE END\n        let xa = buf + lr * S4 + lh * 4u;\n        xt[xa] = xr0;", 1);
+    Some(marked.replace("FOLDu", &format!("{COOP_FOLD}u")).replace("WEIGHTS_BINDING", binding).replace("DECODE_HELPERS", helpers).replace("DECODE_REGS", regs).replace("LOAD_BLOCK", load).replace("DECODE_STEP", step).replace("EDGE_STORES", &edges))
 }
 
 /// [`rb_kernel`] for a measurement of its shapes.

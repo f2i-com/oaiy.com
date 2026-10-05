@@ -191,7 +191,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 const AXPY_AT: &str = r#"
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let i = id.x;
+    let i = id.x + id.y * 16776960u;
     if (i < p[0].x) { y[i] = y[i] + bitcast<f32>(w[p[0].y]) * x[i]; }
 }
 "#;
@@ -200,7 +200,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 const ADD: &str = r#"
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let i = id.x;
+    let i = id.x + id.y * 16776960u;
     if (i < p[0].x) { y[i] = y[i] + x[i]; }
 }
 "#;
@@ -209,7 +209,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 const SILU_MUL_SPLIT: &str = r#"
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let i = id.x;
+    let i = id.x + id.y * 16776960u;
     let ff = p[0].x;
     if (i < ff * p[0].y) {
         let r = i / ff;
@@ -224,7 +224,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 const GELU_MUL_SPLIT: &str = r#"
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let i = id.x;
+    let i = id.x + id.y * 16776960u;
     let ff = p[0].x;
     if (i < ff * p[0].y) {
         let r = i / ff;
@@ -247,7 +247,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     var rot = p[1].x;
     if (rot == 0u) { rot = hd; }
     let half = rot / 2u;
-    let i = id.x;
+    let i = id.x + id.y * 16776960u;
     if (i >= p[0].w * heads * half) { return; }
     let r = i / (heads * half);
     let h = (i / half) % heads;
@@ -650,7 +650,7 @@ const COPY_COLS: &str = r#"
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let width = p[0].x;
-    let i = id.x;
+    let i = id.x + id.y * 16776960u;
     if (i < width * p[0].y) { y[i] = x[(i / width) * p[0].z + p[0].w + i % width]; }
 }
 "#;
@@ -659,7 +659,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 const MUL_SIGMOID: &str = r#"
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let i = id.x;
+    let i = id.x + id.y * 16776960u;
     if (i < p[0].x) { y[i] = bitcast<f32>(w[i]) * (1.0 / (1.0 + exp(-x[i]))); }
 }
 "#;
@@ -668,7 +668,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 const SILU_MUL: &str = r#"
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let i = id.x;
+    let i = id.x + id.y * 16776960u;
     if (i < p[0].x) {
         let g = bitcast<f32>(w[i]);
         y[i] = (g / (1.0 + exp(-g))) * x[i];
@@ -1934,6 +1934,12 @@ impl std::fmt::Debug for Aliased {
 }
 
 /// A buffer for a chain's vector of `len`.
+/// A grid of `groups` workgroups of 256 for a kernel that indexes over two of its dimensions (`id.x + id.y * 65535 *
+/// 256`): a dimension takes 65,535 at most (a chunk of 1,024 rows' FFN is 69,632).
+fn grid(groups: u32) -> (u32, u32, u32) {
+    (groups.min(65535), groups.div_ceil(65535).max(1), 1)
+}
+
 fn vec_buffer(gpu: &Gpu, len: usize) -> wgpu::Buffer {
     gpu.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("oaiy-chain-vec"),
@@ -2091,7 +2097,7 @@ impl DeviceChain for WgpuBackend {
     }
 
     fn begin(&self) -> Box<dyn ChainRecorder + '_> {
-        Box::new(Recorder { backend: self, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None })
+        Box::new(Recorder { backend: self, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None })
     }
 }
 
@@ -2212,7 +2218,7 @@ impl<'a> Recorder<'a> {
     /// A recording on `backend`, its bind groups kept (the crate's own measurements record kernels directly).
     #[cfg(test)]
     pub(crate) fn new(backend: &'a WgpuBackend) -> Self {
-        Recorder { backend, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None }
+        Recorder { backend, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None }
     }
 }
 
@@ -2269,6 +2275,10 @@ pub(crate) struct Recorder<'a> {
     /// waits for its own work, not what went after it (the next chunk's).
     copied: usize,
     flushed: Option<wgpu::SubmissionIndex>,
+    /// `OAIY_PIECE_STAMPS`: the pieces' timestamps, and how many pieces so far; once a flush has copied them out
+    /// (with its reads: a finish waits for its own work, not for what went after), where to
+    stamps: Option<(wgpu::QuerySet, u32)>,
+    stamped: Option<wgpu::Buffer>,
 }
 
 impl Recorder<'_> {
@@ -2290,7 +2300,9 @@ impl Recorder<'_> {
             let start = std::time::Instant::now();
             let mut piece = self.gpu().device.create_command_encoder(&Default::default());
             {
-                let mut pass = piece.begin_compute_pass(&Default::default());
+                let i = self.next_stamp();
+                let timestamp_writes = self.stamp_writes(i);
+                let mut pass = piece.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes });
                 for (pipeline, group, (x, y, z)) in &self.dispatches {
                     pass.set_pipeline(pipeline);
                     pass.set_bind_group(0, group, &[]);
@@ -2305,6 +2317,42 @@ impl Recorder<'_> {
             }
             crate::profile::add(&crate::profile::CHAIN_ENCODE, start);
         }
+    }
+
+    /// `OAIY_PIECE_STAMPS`: the next piece's place among the recording's timestamps (up to 512 pieces).
+    fn next_stamp(&mut self) -> Option<u32> {
+        if !crate::profile::pieces_on() || !self.gpu().device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            return None;
+        }
+        if self.stamps.is_none() {
+            let set = self.gpu().device.create_query_set(&wgpu::QuerySetDescriptor { label: Some("oaiy-chain-pieces"), ty: wgpu::QueryType::Timestamp, count: 1024 });
+            self.stamps = Some((set, 0));
+        }
+        let (_, n) = self.stamps.as_mut().expect("made");
+        if *n >= 512 {
+            return None;
+        }
+        *n += 1;
+        Some(*n - 1)
+    }
+
+    /// The pieces' timestamps resolved and copied out by `enc` (where there are any): the buffer they are read from.
+    fn resolve_pieces(&mut self, enc: &mut wgpu::CommandEncoder) -> Option<wgpu::Buffer> {
+        let (set, n) = self.stamps.take().filter(|(_, n)| *n > 0)?;
+        let device = &self.gpu().device;
+        let bytes = 16 * n as u64;
+        let resolved = device.create_buffer(&wgpu::BufferDescriptor { label: Some("oaiy-chain-pieces"), size: bytes, usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let staging = device.create_buffer(&wgpu::BufferDescriptor { label: Some("oaiy-chain-pieces-read"), size: bytes, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        enc.resolve_query_set(&set, 0..2 * n, &resolved, 0);
+        enc.copy_buffer_to_buffer(&resolved, 0, &staging, 0, bytes);
+        Some(staging)
+    }
+
+    /// Piece `i`'s pass's timestamps.
+    fn stamp_writes(&self, i: Option<u32>) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+        let (set, _) = self.stamps.as_ref()?;
+        let i = i?;
+        Some(wgpu::ComputePassTimestampWrites { query_set: set, beginning_of_pass_write_index: Some(2 * i), end_of_pass_write_index: Some(2 * i + 1) })
     }
 
     /// A vector of `len` for this recording alone (a prompt's scratch): from the GPU's pool, given back when the
@@ -2607,7 +2655,7 @@ impl Recorder<'_> {
             Some((.., v)) => v.clone(),
             None => {
                 let v = self.scratch(padded * k / 2);
-                let conv = self.gpu().named_pipeline("chain-x-f16", || crate::shaders::X_F16.to_string());
+                let conv = self.gpu().named_pipeline("chain-x-f16-tiled", || crate::shaders::X_F16_TILED.to_string());
                 let pairs = (padded * k / 2) as u32;
                 let groups = pairs.div_ceil(256);
                 let d = self.gpu().dummy().clone();
@@ -2810,21 +2858,21 @@ impl ChainRecorder for Recorder<'_> {
 
     fn add(&mut self, acc: &DeviceVec, y: &DeviceVec) {
         let pipeline = self.named("chain-add", ADD);
-        self.dispatch_kept(&pipeline, buffer(y), buffer(y), buffer(acc), &[acc.len as u32], ((acc.len as u32).div_ceil(256), 1, 1));
+        self.dispatch_kept(&pipeline, buffer(y), buffer(y), buffer(acc), &[acc.len as u32], grid((acc.len as u32).div_ceil(256)));
     }
 
     fn silu_mul_split_rows(&mut self, fused: &DeviceVec, out: &DeviceVec, rows: usize) {
         let ff = out.len / rows;
         assert!(rows > 0 && out.len == rows * ff && fused.len >= 2 * out.len, "chain: SwiGLU of {rows} rows");
         let pipeline = self.named("chain-silu-mul-split", SILU_MUL_SPLIT);
-        self.dispatch_kept(&pipeline, buffer(fused), buffer(fused), buffer(out), &[ff as u32, rows as u32], ((out.len as u32).div_ceil(256), 1, 1));
+        self.dispatch_kept(&pipeline, buffer(fused), buffer(fused), buffer(out), &[ff as u32, rows as u32], grid((out.len as u32).div_ceil(256)));
     }
 
     fn gelu_mul_split_rows(&mut self, fused: &DeviceVec, out: &DeviceVec, rows: usize) {
         let ff = out.len / rows;
         assert!(rows > 0 && out.len == rows * ff && fused.len >= 2 * out.len, "chain: GeGLU of {rows} rows");
         let pipeline = self.named("chain-gelu-mul-split", GELU_MUL_SPLIT);
-        self.dispatch_kept(&pipeline, buffer(fused), buffer(fused), buffer(out), &[ff as u32, rows as u32], ((out.len as u32).div_ceil(256), 1, 1));
+        self.dispatch_kept(&pipeline, buffer(fused), buffer(fused), buffer(out), &[ff as u32, rows as u32], grid((out.len as u32).div_ceil(256)));
     }
 
     fn keep_groups(&mut self, keep: bool) {
@@ -2853,6 +2901,9 @@ impl ChainRecorder for Recorder<'_> {
             }
         }
         self.copied = self.reads.len();
+        if let Some(staging) = self.resolve_pieces(&mut enc) {
+            self.stamped = Some(staging);
+        }
         self.flushed = Some(self.gpu().queue.submit([enc.finish()]));
     }
 
@@ -2908,32 +2959,32 @@ impl ChainRecorder for Recorder<'_> {
     fn axpy_at(&mut self, acc: &DeviceVec, y: &DeviceVec, weights: &DeviceVec, at: usize, len: usize) {
         assert!(acc.len >= len && y.len >= len && weights.len > at, "chain: a weighted term of {len}");
         let pipeline = self.named("chain-axpy-at", AXPY_AT);
-        self.dispatch_kept(&pipeline, buffer(weights), buffer(y), buffer(acc), &[len as u32, at as u32], ((len as u32).div_ceil(256), 1, 1));
+        self.dispatch_kept(&pipeline, buffer(weights), buffer(y), buffer(acc), &[len as u32, at as u32], grid((len as u32).div_ceil(256)));
     }
 
     fn copy_cols(&mut self, src: &DeviceVec, dst: &DeviceVec, rows: usize, width: usize, stride: usize, at: usize) {
         assert!(rows > 0 && at + width <= stride && src.len >= rows * stride && dst.len >= rows * width, "chain: {rows} rows' columns {at}..{} of {stride}", at + width);
         let pipeline = self.named("chain-copy-cols", COPY_COLS);
-        self.dispatch_kept(&pipeline, buffer(src), buffer(src), buffer(dst), &[width as u32, rows as u32, stride as u32, at as u32], (((rows * width) as u32).div_ceil(256), 1, 1));
+        self.dispatch_kept(&pipeline, buffer(src), buffer(src), buffer(dst), &[width as u32, rows as u32, stride as u32, at as u32], grid(((rows * width) as u32).div_ceil(256)));
     }
 
     fn rope_partial_rows(&mut self, x: &DeviceVec, rows: usize, heads: usize, head_dim: usize, rot: usize, table: &DeviceVec) {
         assert!(rot > 0 && rot % 2 == 0 && rot <= head_dim && x.len >= rows * heads * head_dim && table.len >= rows * rot, "chain: RoPE of {rot} of {head_dim}");
         let pipeline = self.named("chain-rope", ROPE);
         let pairs = (rows * heads * rot / 2) as u32;
-        self.dispatch_kept(&pipeline, buffer(table), buffer(table), buffer(x), &[heads as u32, head_dim as u32, 1, rows as u32, rot as u32], (pairs.div_ceil(256), 1, 1));
+        self.dispatch_kept(&pipeline, buffer(table), buffer(table), buffer(x), &[heads as u32, head_dim as u32, 1, rows as u32, rot as u32], grid(pairs.div_ceil(256)));
     }
 
     fn mul_sigmoid(&mut self, x: &DeviceVec, gate: &DeviceVec, out: &DeviceVec, len: usize) {
         assert!(x.len >= len && gate.len >= len && out.len >= len && !Arc::ptr_eq(&x.inner, &out.inner), "chain: a gate of {len}");
         let pipeline = self.named("chain-mul-sigmoid", MUL_SIGMOID);
-        self.dispatch_kept(&pipeline, buffer(x), buffer(gate), buffer(out), &[len as u32], ((len as u32).div_ceil(256), 1, 1));
+        self.dispatch_kept(&pipeline, buffer(x), buffer(gate), buffer(out), &[len as u32], grid((len as u32).div_ceil(256)));
     }
 
     fn silu_mul(&mut self, gate: &DeviceVec, up: &DeviceVec, out: &DeviceVec, len: usize) {
         assert!(gate.len >= len && up.len >= len && out.len >= len, "chain: a SwiGLU of {len}");
         let pipeline = self.named("chain-silu-mul", SILU_MUL);
-        self.dispatch_kept(&pipeline, buffer(gate), buffer(up), buffer(out), &[len as u32], ((len as u32).div_ceil(256), 1, 1));
+        self.dispatch_kept(&pipeline, buffer(gate), buffer(up), buffer(out), &[len as u32], grid((len as u32).div_ceil(256)));
     }
 
     fn ple_gate(&mut self, key: &DeviceVec, x: &DeviceVec, value: &DeviceVec, norm_key: &DeviceVec, norm_query: &DeviceVec, norm_conv: &DeviceVec, gated: &DeviceVec, conv_in: &DeviceVec, rows: usize, streams: usize, d: usize, eps: f32) {
@@ -3073,7 +3124,7 @@ impl ChainRecorder for Recorder<'_> {
         assert!(x.len >= rows * heads * head_dim && table.len >= rows * head_dim, "chain: RoPE of {rows} rows");
         let pipeline = self.named("chain-rope", ROPE);
         let pairs = (rows * heads * head_dim / 2) as u32;
-        self.dispatch_kept(&pipeline, buffer(table), buffer(table), buffer(x), &[heads as u32, head_dim as u32, neox as u32, rows as u32], (pairs.div_ceil(256), 1, 1));
+        self.dispatch_kept(&pipeline, buffer(table), buffer(table), buffer(x), &[heads as u32, head_dim as u32, neox as u32, rows as u32], grid(pairs.div_ceil(256)));
     }
 
     fn store_rows(&mut self, src: &DeviceVec, dst: &DeviceVec, rows: usize, len: usize, start: usize, stride: usize, at: usize) {
@@ -3149,12 +3200,7 @@ impl ChainRecorder for Recorder<'_> {
 
     fn read_range(&mut self, v: &DeviceVec, offset: usize, len: usize) {
         assert!(offset + len <= v.len, "chain: reading {len} at {offset} of {}", v.len);
-        let staging = self.gpu().device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("oaiy-chain-read"),
-            size: (len.max(1) * 4) as u64,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let staging = self.gpu().staging(((len.max(1) * 4) as u64).next_power_of_two().max(256));
         self.reads.push((buffer(v).clone(), offset, staging, len));
     }
 
@@ -3186,20 +3232,25 @@ impl ChainRecorder for Recorder<'_> {
             stamps = Some((staging, n));
         } else {
             // what the pieces submitted while recording left (`push`), with the reads
-            let mut pass = enc.begin_compute_pass(&Default::default());
+            let i = if self.dispatches.is_empty() { None } else { self.next_stamp() };
+            let timestamp_writes = self.stamp_writes(i);
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes });
             for (pipeline, group, (x, y, z)) in &self.dispatches {
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, group, &[]);
                 pass.dispatch_workgroups(*x, *y, *z);
             }
         }
+        // (the pieces since a flush, if any, resolved with this; else the flush's)
+        let late = self.resolve_pieces(&mut enc);
+        let pieces = late.clone().or_else(|| self.stamped.take());
         for (from, offset, staging, len) in &self.reads[self.copied..] {
             if *len > 0 {
                 enc.copy_buffer_to_buffer(from, (*offset * 4) as u64, staging, 0, (*len * 4) as u64);
             }
         }
         // nothing recorded since a flush: its submission the one waited for
-        let since = !self.dispatches.is_empty() || !self.held.is_empty() || self.copied < self.reads.len() || stamps.is_some();
+        let since = !self.dispatches.is_empty() || !self.held.is_empty() || self.copied < self.reads.len() || stamps.is_some() || late.is_some();
         let command = enc.finish();
         crate::profile::add(&crate::profile::CHAIN_ENCODE, start);
         let submitted = std::time::Instant::now();
@@ -3216,12 +3267,35 @@ impl ChainRecorder for Recorder<'_> {
         if let Some((staging, _)) = &stamps {
             staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
         }
+        if let Some(staging) = &pieces {
+            staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        }
         // this recording's work waited for, not what was submitted after it (the next chunk's, as this one's rows
         // are read)
         self.gpu().device.poll(wgpu::PollType::Wait { submission_index: Some(index), timeout: None }).expect("webgpu: device lost while waiting for a chain");
         crate::profile::add(&crate::profile::CHAIN_WAIT, submitted);
         let pooled = std::mem::take(&mut self.pooled);
         self.gpu().unpool(pooled);
+        if let Some(staging) = pieces {
+            let period = self.gpu().queue.get_timestamp_period() as f64;
+            let view = staging.slice(..).get_mapped_range().expect("webgpu: mapping the pieces' times");
+            let ticks: Vec<u64> = view.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().expect("8 bytes"))).collect();
+            drop(view);
+            staging.unmap();
+            let busy: u64 = ticks.chunks_exact(2).map(|p| p[1].saturating_sub(p[0])).sum();
+            let span = ticks.last().copied().unwrap_or(0).saturating_sub(ticks.first().copied().unwrap_or(0));
+            use std::sync::atomic::Ordering as O;
+            crate::profile::PIECES[0].fetch_add((busy as f64 * period) as u64, O::Relaxed);
+            crate::profile::PIECES[1].fetch_add((span as f64 * period) as u64, O::Relaxed);
+            crate::profile::PIECES[2].fetch_add(ticks.len() as u64 / 2, O::Relaxed);
+            if std::env::var("OAIY_PIECE_STAMPS").is_ok_and(|v| v == "2") {
+                // each piece: its start after the first's, and how long (ms)
+                static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+                let base = *BASE.get_or_init(|| ticks[0]);
+                let at = |t: u64| t.saturating_sub(base) as f64 * period / 1e6;
+                eprintln!("    a recording's {} pieces, {:.1} ms busy over {:.1}, on the GPU's clock {:.1}..{:.1}", ticks.len() / 2, busy as f64 * period / 1e6, span as f64 * period / 1e6, at(ticks[0]), at(*ticks.last().expect("a piece")));
+            }
+        }
         if let Some((staging, n)) = stamps {
             let period = self.gpu().queue.get_timestamp_period() as f64;
             let view = staging.slice(..).get_mapped_range().expect("webgpu: mapping the profile");
@@ -3249,6 +3323,8 @@ impl ChainRecorder for Recorder<'_> {
                 v
             })
             .collect();
+        let staged: Vec<(u64, wgpu::Buffer)> = std::mem::take(&mut self.reads).into_iter().map(|(_, _, staging, _)| (staging.size(), staging)).collect();
+        self.gpu().unstage(staged);
         crate::profile::add(&crate::profile::LINEAR_WAIT, start);
         out
     }
@@ -4158,6 +4234,52 @@ fn main() {
         }
     }
 
+    /// How far the tensor cores' sums (f16 a window of steps, then f32) are from the f32 kernel's (`--ignored
+    /// --nocapture`; OAIY_COOP_FOLD the window): the relative RMS error and the worst element's, Q3_K and Q6_K at the
+    /// 27B's widths, the tokens' rows as a model's (unit RMS, a few channels a hundred times the rest).
+    #[test]
+    #[ignore = "a measurement"]
+    fn measure_coop_fold_error() {
+        let Ok(b) = WgpuBackend::new(Some(2 << 30)) else { return };
+        if !b.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+            return;
+        }
+        for (dtype, bytes, scales) in [(GgmlType::Q3_K, 110usize, &[108usize][..]), (GgmlType::Q6_K, 210, &[208][..])] {
+            for k in [5120usize, 17408] {
+                let (n, m) = (256usize, 256usize);
+                let mut next = rng(k as u32 + bytes as u32);
+                let mut raw = vec![0u8; n * (k / 256) * bytes];
+                for v in raw.iter_mut() {
+                    *v = ((next() + 1.0) * 100.0) as u8;
+                }
+                for blk in raw.chunks_exact_mut(bytes) {
+                    for &at in scales {
+                        let d = half::f16::from_f32(0.001 + (blk[(at + 4) % bytes] as f32) * 1e-5).to_bits().to_le_bytes();
+                        blk[at] = d[0];
+                        blk[at + 1] = d[1];
+                    }
+                }
+                let w = ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(raw, vec![n, k], dtype));
+                let x: Vec<f32> = (0..m * k).map(|i| next() * 1.7 * if i % k % 997 == 3 { 100.0 } else { 1.0 }).collect();
+                let (xv, y, yc) = (b.vec(m * k), b.vec(m * n), b.vec(m * n));
+                DeviceChain::upload(&b, &xv, &x);
+                let mut rec = Recorder::new(&b);
+                rec.matmul_rows_f32(&w, &xv, &y, m);
+                rec.read(&y);
+                let want = Box::new(rec).finish().pop().unwrap();
+                let mut rec = Recorder::new(&b);
+                assert!(rec.matmul_rows_coop(&w, &xv, &yc, m));
+                rec.read(&yc);
+                let got = Box::new(rec).finish().pop().unwrap();
+                let err: f64 = got.iter().zip(&want).map(|(a, e)| ((*a - *e) as f64).powi(2)).sum::<f64>().sqrt();
+                let norm: f64 = want.iter().map(|e| (*e as f64).powi(2)).sum::<f64>().sqrt();
+                let rms = (norm * norm / want.len() as f64).sqrt();
+                let worst = got.iter().zip(&want).map(|(a, e)| ((*a - *e) as f64).abs() / rms).fold(0.0, f64::max);
+                eprintln!("{dtype:?} k {k}: relative error {:.2e}, the worst element's {:.2e} of the RMS ({rms:.3})", err / norm, worst);
+            }
+        }
+    }
+
     /// What splitting a tensor-core matmul along k gains (`--ignored --nocapture`): Qwen3.8 27B's Q3_K matmuls of 512
     /// tokens, each split as chosen and in 1 to 4.
     #[test]
@@ -4176,7 +4298,7 @@ fn main() {
             let units = b.gpu.coop_units();
             let chosen = crate::shaders::coop_splits((n as u32).div_ceil(128) * (m as u32).div_ceil(128), units, (k / 32) as u32);
             let mut line = format!("{what} [{n}, {k}] (chosen {chosen}):");
-            for split in [None, Some(1), Some(2), Some(3), Some(4)] {
+            for split in [None, Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)] {
                 let run = || {
                     let mut rec = Recorder::new(&b);
                     for _ in 0..8 {
@@ -4207,8 +4329,8 @@ fn main() {
         // attention's q (384), k and v (32 each), output (160, k 6144)
         assert_eq!(coop_splits(1088, 170, 160), 1);
         assert_eq!(coop_splits(160, 170, 544), 1);
-        assert_eq!(coop_splits(192, 170, 160), 5);
-        assert_eq!(coop_splits(384, 170, 160), 3);
+        assert_eq!(coop_splits(192, 170, 160), 3);
+        assert_eq!(coop_splits(384, 170, 160), 2);
         assert_eq!(coop_splits(32, 170, 160), 5);
         assert_eq!(coop_splits(160, 170, 192), 1);
         // splits of 8 steps or more
@@ -4304,6 +4426,78 @@ fn main() {
             }
             let ms = t.elapsed().as_secs_f64() / 24.0 * 1e3;
             eprintln!("{what} [{n}, {k}] of {rows} rows: {ms:.3} ms ({:.1} TFLOPS)", 2.0 * (rows * n * k) as f64 / ms / 1e9);
+        }
+    }
+
+    /// The Q3_K tensor-core matmul and variants of it, each timed on FFN gate and up's shape (`--ignored --nocapture`):
+    /// as it is, and with a part of it taken out (results wrong, what that part costs): the step's barrier, its tokens'
+    /// loads, its decode, the f16 sums' folds.
+    #[test]
+    #[ignore = "a measurement"]
+    fn measure_coop_variants() {
+        let Ok(b) = WgpuBackend::new(Some(4 << 30)) else { return };
+        if !b.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+            return;
+        }
+        let (m, n, k) = (512usize, 34816usize, 5120usize);
+        let mut next = rng(7);
+        let raw: Vec<u8> = (0..n * (k / 256) * 110).map(|_| ((next() + 1.0) * 100.0) as u8).collect();
+        let w = ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(raw, vec![n, k], GgmlType::Q3_K));
+        let q = w.device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).expect("on the GPU");
+        let x16 = b.vec(m * k / 2);
+        let y = b.vec(m * n);
+        let base = crate::shaders::coop_tiled(GgmlType::Q3_K).expect("Q3_K's kernel");
+        let marked = crate::shaders::coop_tiled_marked(GgmlType::Q3_K).expect("Q3_K's kernel");
+        // the loop's barrier (the prologue's kept)
+        let step_end = "        xt[xa + 3u] = xr3;\n        workgroupBarrier();\n";
+        let no_barrier = {
+            let at = base.rfind(step_end).expect("the loop's barrier");
+            format!("{}        xt[xa + 3u] = xr3;\n{}", &base[..at], &base[at + step_end.len()..])
+        };
+        // the loop's token loads (each step's from x16) as the first's
+        let loads = "        let xb = xo + b * xs;\n        xr0 = x16[xb];\n        xr1 = x16[xb + 1u];\n        xr2 = x16[xb + 2u];\n        xr3 = x16[xb + 3u];\n";
+        let no_x = {
+            let at = base.rfind(loads).expect("the loop's loads");
+            format!("{}{}", &base[..at], &base[at + loads.len()..])
+        };
+        let no_decode = {
+            let mut out = String::new();
+            let mut skipping = false;
+            for line in marked.lines() {
+                if line.contains("// DECODE BEGIN") {
+                    skipping = true;
+                }
+                if !skipping {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+                if line.contains("// DECODE END") {
+                    skipping = false;
+                }
+            }
+            out
+        };
+        let no_fold = base.replace("w0 += 32u", "w0 += 100000u").replace("w0 + 32u", "w0 + 100000u");
+        for (name, src) in [("bench-coop-q3k", base.clone()), ("bench-coop-q3k-no-barrier", no_barrier), ("bench-coop-q3k-no-x-loads", no_x), ("bench-coop-q3k-no-decode", no_decode), ("bench-coop-q3k-no-fold", no_fold)] {
+            let pipeline = b.gpu.named_pipeline(Box::leak(name.to_string().into_boxed_str()), || src.clone());
+            let run = || {
+                let mut rec = Recorder::new(&b);
+                for _ in 0..8 {
+                    for (chunk, row0, rows) in &q.chunks {
+                        let words = [k as u32, n as u32, m as u32, *row0, *rows, q.row_bytes as u32, 1, 0];
+                        rec.dispatch_kept(&pipeline, chunk, buffer(&x16), buffer(&y), &words, (rows.div_ceil(128), (m as u32).div_ceil(128), 1));
+                    }
+                }
+                rec.read_range(&y, 0, 1);
+                Box::new(rec).finish();
+            };
+            run();
+            let t = std::time::Instant::now();
+            for _ in 0..3 {
+                run();
+            }
+            let ms = t.elapsed().as_secs_f64() / 24.0 * 1e3;
+            eprintln!("{name}: {ms:.3} ms ({:.0} TFLOPS)", 2.0 * (m * n * k) as f64 / ms / 1e9);
         }
     }
 
@@ -4653,7 +4847,7 @@ fn main() {
         for m in [1usize, 2, 3, 4] {
             let (x, y, y8) = (b.vec(m * k), b.vec(m * n), b.vec(m * n));
             DeviceChain::upload(&b, &x, &(0..m * k).map(|_| next()).collect::<Vec<_>>());
-            let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None };
+            let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None };
             assert!(rq.matmul_rows_q8(w, &x, &y8, m));
             rq.read(&y8);
             let got = Box::new(rq).finish().pop().unwrap();
@@ -4669,7 +4863,7 @@ fn main() {
             let reps = 28;
             let time = |q8: bool| {
                 let run = || {
-                    let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None };
+                    let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None };
                     for i in 0..reps {
                         let w = &ws[i % ws.len()];
                         if q8 {
@@ -4815,7 +5009,7 @@ fn main() {
                 let pipeline = b.gpu.named_pipeline(Box::leak(format!("test-rb-{dtype:?}-{r}-{ks}").into_boxed_str()), || src);
                 let reps = 32;
                 let run = || {
-                    let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None };
+                    let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None };
                     for i in 0..reps {
                         let q = ws[i % ws.len()].device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).unwrap();
                         for (chunk, row0, rows) in &q.chunks {
@@ -4875,7 +5069,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) n
             let pipeline = b.gpu.named_pipeline(name, || body);
             let groups = 170 * 16;
             let run = || {
-                let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None };
+                let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None };
                 for _ in 0..8 {
                     rq.dispatch_kept(&pipeline, buffer(&src), buffer(&src), buffer(&out), &[(len / 4) as u32], (groups, 1, 1));
                 }
