@@ -529,10 +529,16 @@ impl WgpuBackend {
                         pass.dispatch_workgroups(rows.div_ceil(shaders::MANY_TILE), (m as u32).div_ceil(shaders::MANY_TILE), 1);
                         continue;
                     }
-                    // Rows beyond 65535 wrap into the second grid axis; the decode kernel takes one row of x.
+                    // Rows (or the decode kernel's workgroups of rows) beyond 65535 wrap into the second grid axis;
+                    // the decode kernel takes one row of x.
+                    if m == 1 {
+                        let groups = rows.div_ceil(shaders::decode_rows_per_group(q.dtype));
+                        pass.dispatch_workgroups(groups.min(65535), groups.div_ceil(65535), 1);
+                        continue;
+                    }
                     let gx = (*rows).min(65535);
                     let gy = rows.div_ceil(65535);
-                    let gz = if m == 1 { 1 } else { (m as u32).div_ceil(shaders::M_TILE) };
+                    let gz = (m as u32).div_ceil(shaders::M_TILE);
                     pass.dispatch_workgroups(gx, gy, gz);
                 }
             }

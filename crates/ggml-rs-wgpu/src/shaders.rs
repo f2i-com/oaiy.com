@@ -195,10 +195,189 @@ pub fn source(dtype: GgmlType) -> Option<String> {
 }
 
 /// The one-row kernel for a decode step's single row of `x`: the same kernel with one row's sums, where eight were
-/// kept and reduced whatever the rows (a dense model's decode step on WebGPU is its matmuls one row at a time).
+/// kept and reduced whatever the rows (a dense model's decode step on WebGPU is its matmuls one row at a time). Q4_K
+/// has a kernel of its own ([`Q4K_DECODE`]).
 pub fn source_decode(dtype: GgmlType) -> Option<String> {
-    source_rows(dtype, 1)
+    match dtype {
+        GgmlType::Q4_K => Some(Q4K_DECODE.to_string()),
+        GgmlType::Q6_K => Some(Q6K_DECODE.to_string()),
+        _ => source_rows(dtype, 1),
+    }
 }
+
+/// Weight rows a workgroup of `dtype`'s decode kernel takes (its grid is the rows over this).
+pub fn decode_rows_per_group(dtype: GgmlType) -> u32 {
+    if matches!(dtype, GgmlType::Q4_K | GgmlType::Q6_K) { 8 } else { 1 }
+}
+
+/// Q6_K for one row of `x`, read a word at a time: 8 weight rows a workgroup of 256, 32 lanes a row; a lane takes half
+/// a sub-block (16 weights, one scale): their low bits' 16 bytes and high bits' 16 bytes as four words each (a block is
+/// 210 bytes, so every other one starts two bytes into a word and its words are put together from two), and `x` four
+/// at a time, and adds `d * scale * (dot(q, x) - 32 * sum(x))`.
+const Q6K_DECODE: &str = r#"
+struct Params {
+    k: u32,
+    n: u32,
+    m: u32,
+    row0: u32,
+    rows: u32,
+    row_bytes: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+@group(0) @binding(0) var<storage, read> w: array<u32>;
+@group(0) @binding(1) var<storage, read> x4: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> p: Params;
+
+var<workgroup> partial: array<f32, 256>;
+
+fn byte(o: u32) -> u32 { return (w[o >> 2u] >> ((o & 3u) * 8u)) & 0xffu; }
+
+// The four bytes at `o`, an even offset (a word, or the halves of two).
+fn word_at(o: u32) -> u32 {
+    let i = o >> 2u;
+    if ((o & 3u) == 0u) { return w[i]; }
+    return (w[i] >> 16u) | (w[i + 1u] << 16u);
+}
+
+fn bytes4(v: u32) -> vec4<u32> {
+    return vec4<u32>(v & 255u, (v >> 8u) & 255u, (v >> 16u) & 255u, v >> 24u);
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let lane = li & 31u;
+    let r = (wg.x + wg.y * 65535u) * 8u + (li >> 5u);
+    var acc = 0.0;
+    if (r < p.rows) {
+        let blocks = p.k / 256u;
+        let row_base = r * p.row_bytes;
+        for (var c = lane; c < blocks * 16u; c += 32u) {
+            let blk = c / 16u;
+            let sub = (c % 16u) / 2u;
+            let hf = c % 2u;
+            let bb = row_base + blk * 210u;
+            let h = sub / 4u;
+            let qd = sub % 4u;
+            let ql = bb + h * 64u + (qd & 1u) * 32u + hf * 16u;
+            let qh = bb + 128u + h * 32u + hf * 16u;
+            let lshift = select(0u, 4u, qd >= 2u);
+            let hshift = 2u * qd;
+            let d = unpack2x16float(byte(bb + 208u) | (byte(bb + 209u) << 8u)).x;
+            let scb = byte(bb + 192u + h * 8u + 2u * qd + hf);
+            let sc = f32(i32(scb) - select(0, 256, scb >= 128u));
+            let xb = (blk * 256u + sub * 32u + hf * 16u) / 4u;
+            var dq = 0.0;
+            var sx = 0.0;
+            for (var wi = 0u; wi < 4u; wi++) {
+                let lo = bytes4(word_at(ql + wi * 4u));
+                let hi = bytes4(word_at(qh + wi * 4u));
+                let q = ((lo >> vec4<u32>(lshift)) & vec4<u32>(15u)) | (((hi >> vec4<u32>(hshift)) & vec4<u32>(3u)) << vec4<u32>(4u));
+                let a = x4[xb + wi];
+                dq += dot(vec4<f32>(q), a);
+                sx += a.x + a.y + a.z + a.w;
+            }
+            acc += d * sc * (dq - 32.0 * sx);
+        }
+    }
+    partial[li] = acc;
+    workgroupBarrier();
+    for (var st = 16u; st > 0u; st /= 2u) {
+        if (lane < st) { partial[li] += partial[li + st]; }
+        workgroupBarrier();
+    }
+    if (r < p.rows && lane == 0u) { y[p.row0 + r] = partial[li]; }
+}
+"#;
+
+/// Q4_K for one row of `x`, read wide: 8 weight rows a workgroup of 256, 32 lanes a row; a lane takes a 16-byte run of
+/// a block's quants (32 weights: 16 of a sub-block's low nibbles and 16 of the next one's high) with one vec4 load,
+/// the block's header (its scales) with another, and `x` four at a time, and adds `d * dot(q, x) - m * sum(x)` for
+/// each half. The generic kernel read a byte a load, 13 loads a lane for 16 bytes of quants: 165-230 GB/s.
+const Q4K_DECODE: &str = r#"
+struct Params {
+    k: u32,
+    n: u32,
+    m: u32,
+    row0: u32,
+    rows: u32,
+    row_bytes: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+@group(0) @binding(0) var<storage, read> w4: array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read> x4: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> p: Params;
+
+var<workgroup> partial: array<f32, 256>;
+
+// Byte `b` (0..12) of a block's scales, the header's last three words.
+fn sbyte(h: vec4<u32>, b: u32) -> u32 {
+    let wd = select(select(h.w, h.z, b < 8u), h.y, b < 4u);
+    return (wd >> (8u * (b % 4u))) & 255u;
+}
+
+// Sub-block `j`'s 6-bit scale and minimum, as ggml's get_scale_min_k4.
+fn scale_min(h: vec4<u32>, j: u32) -> vec2<f32> {
+    if (j < 4u) {
+        return vec2<f32>(f32(sbyte(h, j) & 63u), f32(sbyte(h, j + 4u) & 63u));
+    }
+    let sc = (sbyte(h, j + 4u) & 15u) | ((sbyte(h, j - 4u) >> 6u) << 4u);
+    let mn = (sbyte(h, j + 4u) >> 4u) | ((sbyte(h, j) >> 6u) << 4u);
+    return vec2<f32>(f32(sc), f32(mn));
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let lane = li & 31u;
+    let r = (wg.x + wg.y * 65535u) * 8u + (li >> 5u);
+    var acc = 0.0;
+    if (r < p.rows) {
+        let blocks = p.k / 256u;
+        let row4 = r * (p.row_bytes / 16u);
+        for (var c = lane; c < blocks * 8u; c += 32u) {
+            let blk = c / 8u;
+            let j = c % 8u;
+            let base4 = row4 + blk * 9u;
+            let h = w4[base4];
+            let q = w4[base4 + 1u + j];
+            let dm = unpack2x16float(h.x);
+            let pair = j / 2u;
+            let half = j % 2u;
+            let slo = scale_min(h, 2u * pair);
+            let shi = scale_min(h, 2u * pair + 1u);
+            // x: sub-block 2*pair's 16 at half * 16, and sub-block 2*pair + 1's
+            let xa = (blk * 256u + 2u * pair * 32u + half * 16u) / 4u;
+            let xb = xa + 8u;
+            var dot_lo = 0.0;
+            var sum_lo = 0.0;
+            var dot_hi = 0.0;
+            var sum_hi = 0.0;
+            for (var wi = 0u; wi < 4u; wi++) {
+                let word = q[wi];
+                let a = x4[xa + wi];
+                let b = x4[xb + wi];
+                let lo = vec4<f32>(f32(word & 15u), f32((word >> 8u) & 15u), f32((word >> 16u) & 15u), f32((word >> 24u) & 15u));
+                let hi = vec4<f32>(f32((word >> 4u) & 15u), f32((word >> 12u) & 15u), f32((word >> 20u) & 15u), f32((word >> 28u) & 15u));
+                dot_lo += dot(lo, a);
+                sum_lo += a.x + a.y + a.z + a.w;
+                dot_hi += dot(hi, b);
+                sum_hi += b.x + b.y + b.z + b.w;
+            }
+            acc += dm.x * slo.x * dot_lo - dm.y * slo.y * sum_lo + dm.x * shi.x * dot_hi - dm.y * shi.y * sum_hi;
+        }
+    }
+    partial[li] = acc;
+    workgroupBarrier();
+    for (var st = 16u; st > 0u; st /= 2u) {
+        if (lane < st) { partial[li] += partial[li + st]; }
+        workgroupBarrier();
+    }
+    if (r < p.rows && lane == 0u) { y[p.row0 + r] = partial[li]; }
+}
+"#;
 
 fn source_rows(dtype: GgmlType, m_tile: u32) -> Option<String> {
     let (elems, bytes, dequant) = layout(dtype)?;

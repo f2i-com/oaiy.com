@@ -517,9 +517,12 @@ impl ChainRecorder for Recorder<'_> {
             let words = [k as u32, n as u32, m as u32, *row0, *rows, q.row_bytes as u32, 0, 0];
             let groups = if m >= crate::shaders::MANY_FROM {
                 (rows.div_ceil(crate::shaders::MANY_TILE), (m as u32).div_ceil(crate::shaders::MANY_TILE), 1)
+            } else if m == 1 {
+                // the decode kernel's workgroups of rows, beyond 65535 wrapping into the second grid axis
+                let groups = rows.div_ceil(crate::shaders::decode_rows_per_group(q.dtype));
+                (groups.min(65535), groups.div_ceil(65535), 1)
             } else {
-                // rows beyond 65535 wrap into the second grid axis
-                ((*rows).min(65535), rows.div_ceil(65535), if m == 1 { 1 } else { (m as u32).div_ceil(crate::shaders::M_TILE) })
+                ((*rows).min(65535), rows.div_ceil(65535), (m as u32).div_ceil(crate::shaders::M_TILE))
             };
             self.dispatch_kept(&pipeline, chunk, buffer(x), buffer(y), &words, groups);
         }
