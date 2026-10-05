@@ -969,7 +969,7 @@ impl ChainRecorder for Recorder<'_> {
         assert!(g.is_on(&self.backend.gpu), "chain: an EXL3 projection of another adapter");
         let (words, splits) = g.single_chunk().expect("an EXL3 projection in one buffer");
         let (k, n) = g.kn();
-        assert!(rows > 0 && x.len >= rows * k && y.len >= rows * n && rows * splits as usize <= 65535, "chain: an EXL3 [{n}, {k}] of {rows} rows");
+        assert!(rows > 0 && x.len >= rows * k && y.len >= rows * n && rows <= 65535, "chain: an EXL3 [{n}, {k}] of {rows} rows");
         let c = g.chain(self.backend);
         // a step's one row: the projection's own scratch (its bind groups kept); else this call's
         let (xh, part, yt, jobs) = if rows == 1 && self.keep {
@@ -984,8 +984,26 @@ impl ChainRecorder for Recorder<'_> {
         let pre = crate::exl3::chain_shader("pre");
         self.dispatch_wide("exl3-pre", &pre, [buffer(x), buffer(&c.suh), &imap, buffer(&jobs), &d, &d, buffer(&xh), &drw], &[k as u32, c.imap.is_none() as u32], ((k / 128) as u32, rows as u32, 1));
         let ntiles = (n / 16) as u32;
+        let grid = |z: usize| (ntiles.min(65535), ntiles.div_ceil(65535), z as u32 * splits);
         let mm = crate::exl3::chain_shader("mm");
-        self.dispatch_wide("exl3-mm", &mm, [words, buffer(&xh), buffer(&jobs), &d, &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, splits, 0], (ntiles.min(65535), ntiles.div_ceil(65535), rows as u32 * splits));
+        if rows == 1 {
+            self.dispatch_wide("exl3-mm", &mm, [words, buffer(&xh), buffer(&jobs), &d, &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, splits, 0], grid(1));
+        } else {
+            // a prompt's rows as the projection's own passes take them: 32 at a time, each tile decoded once a pass, and a
+            // last lone row as one row is
+            let lone = rows % 32 == 1;
+            let many: Vec<u32> = (0..(rows - lone as usize) as u32).collect::<Vec<_>>().chunks(32).flat_map(|b| b.iter().copied().chain(std::iter::repeat(crate::exl3::NONE)).take(32)).collect();
+            let order = crate::exl3::u32_vec(self.backend, &many);
+            let per = 65535 / splits as usize;
+            let blocks = many.len() / 32;
+            let kernel = crate::exl3::chain_shader("many");
+            for first in (0..blocks).step_by(per) {
+                self.dispatch_wide("exl3-many", &kernel, [words, buffer(&xh), buffer(&jobs), buffer(&order), &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, splits, 0, first as u32], grid(per.min(blocks - first)));
+            }
+            if lone {
+                self.dispatch_wide("exl3-mm", &mm, [words, buffer(&xh), buffer(&jobs), &d, &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, splits, 0, rows as u32 - 1], grid(1));
+            }
+        }
         let post = crate::exl3::chain_shader("post");
         let post_out = if c.omap.is_some() { buffer(&yt) } else { buffer(y) };
         self.dispatch_wide("exl3-post", &post, [buffer(&part), buffer(&c.svh), buffer(&jobs), &d, &d, &d, post_out, &drw], &[n as u32, splits], ((n / 128) as u32, rows as u32, 1));
