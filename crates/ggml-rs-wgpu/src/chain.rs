@@ -729,7 +729,9 @@ mod tests {
     #[ignore = "a timing; run with --nocapture"]
     fn measure_chained_matmuls() {
         let Ok(b) = WgpuBackend::new(Some(4 << 30)) else { return };
-        for (dtype, n, k, block, bytes) in [(GgmlType::Q4_K, 3072usize, 3072usize, 256usize, 144usize), (GgmlType::Q4_K, 16384, 3072, 256, 144), (GgmlType::Q6_K, 3072, 8192, 256, 210)] {
+        // a 3B Llama's attention and FFN, and Qwen3.8 27B's types: its FFN gate (Q3_K), qkv (Q5_K) and down (Q4_K)
+        for (dtype, n, k, block, bytes) in [(GgmlType::Q4_K, 3072usize, 3072usize, 256usize, 144usize), (GgmlType::Q4_K, 16384, 3072, 256, 144), (GgmlType::Q6_K, 3072, 8192, 256, 210),
+            (GgmlType::Q3_K, 17408, 5120, 256, 110), (GgmlType::Q5_K, 10240, 5120, 256, 176), (GgmlType::Q4_K, 5120, 17408, 256, 144)] {
             let nbytes = n * (k / block) * bytes;
             let mut next = rng(n as u32);
             let mut raw = vec![0u8; nbytes];

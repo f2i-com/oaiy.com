@@ -195,11 +195,14 @@ pub fn source(dtype: GgmlType) -> Option<String> {
 }
 
 /// The one-row kernel for a decode step's single row of `x`: the same kernel with one row's sums, where eight were
-/// kept and reduced whatever the rows (a dense model's decode step on WebGPU is its matmuls one row at a time). Q4_K
-/// has a kernel of its own ([`Q4K_DECODE`]).
+/// kept and reduced whatever the rows (a dense model's decode step on WebGPU is its matmuls one row at a time). The
+/// K-quants have kernels of their own that read the weights wide ([`Q3K_DECODE`], [`Q4K_DECODE`], [`Q5K_DECODE`],
+/// [`Q6K_DECODE`]).
 pub fn source_decode(dtype: GgmlType) -> Option<String> {
     match dtype {
+        GgmlType::Q3_K => Some(Q3K_DECODE.to_string()),
         GgmlType::Q4_K => Some(Q4K_DECODE.to_string()),
+        GgmlType::Q5_K => Some(Q5K_DECODE.to_string()),
         GgmlType::Q6_K => Some(Q6K_DECODE.to_string()),
         _ => source_rows(dtype, 1),
     }
@@ -207,8 +210,200 @@ pub fn source_decode(dtype: GgmlType) -> Option<String> {
 
 /// Weight rows a workgroup of `dtype`'s decode kernel takes (its grid is the rows over this).
 pub fn decode_rows_per_group(dtype: GgmlType) -> u32 {
-    if matches!(dtype, GgmlType::Q4_K | GgmlType::Q6_K) { 8 } else { 1 }
+    match dtype {
+        GgmlType::Q3_K => 16,
+        GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K => 8,
+        _ => 1,
+    }
 }
+
+/// Q3_K for one row of `x`, read a word at a time: 16 weight rows a workgroup of 256, 16 lanes a row; a lane takes 64
+/// weights of a block (four of its 16-weight runs, which share their low bits' 16 bytes and their high bits' 16 bytes,
+/// read as four words each; a block is 110 bytes, so every other one starts two bytes into a word and its words are
+/// put together from two), and `x` four at a time, and adds `d * (scale - 32) * dot(q, x)` for each run. Lanes of 32
+/// weights read the scales and high bits twice as often: 724 GB/s for Qwen3.8 27B's FFN gate.
+const Q3K_DECODE: &str = r#"
+struct Params {
+    k: u32,
+    n: u32,
+    m: u32,
+    row0: u32,
+    rows: u32,
+    row_bytes: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+@group(0) @binding(0) var<storage, read> w: array<u32>;
+@group(0) @binding(1) var<storage, read> x4: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> p: Params;
+
+var<workgroup> partial: array<f32, 256>;
+
+// The four bytes at `o`, an even offset (a word, or the halves of two).
+fn word_at(o: u32) -> u32 {
+    let i = o >> 2u;
+    if ((o & 3u) == 0u) { return w[i]; }
+    return (w[i] >> 16u) | (w[i + 1u] << 16u);
+}
+
+fn bytes4(v: u32) -> vec4<u32> {
+    return vec4<u32>(v & 255u, (v >> 8u) & 255u, (v >> 16u) & 255u, v >> 24u);
+}
+
+// Scale `k` (0..16) of a block, its 12 bytes in the words a0, a1 and tmp, less 32 (ggml's kmask unpacking).
+fn q3_scale(a0: u32, a1: u32, tmp: u32, k: u32) -> f32 {
+    var word: u32;
+    switch (k / 4u) {
+        case 0u: { word = (a0 & 0x0f0f0f0fu) | (((tmp >> 0u) & 0x03030303u) << 4u); }
+        case 1u: { word = (a1 & 0x0f0f0f0fu) | (((tmp >> 2u) & 0x03030303u) << 4u); }
+        case 2u: { word = ((a0 >> 4u) & 0x0f0f0f0fu) | (((tmp >> 4u) & 0x03030303u) << 4u); }
+        default: { word = ((a1 >> 4u) & 0x0f0f0f0fu) | (((tmp >> 6u) & 0x03030303u) << 4u); }
+    }
+    return f32((word >> ((k % 4u) * 8u)) & 0xffu) - 32.0;
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let lane = li & 15u;
+    let r = (wg.x + wg.y * 65535u) * 16u + (li >> 4u);
+    var acc = 0.0;
+    if (r < p.rows) {
+        let blocks = p.k / 256u;
+        let row_base = r * p.row_bytes;
+        for (var c = lane; c < blocks * 4u; c += 16u) {
+            let blk = c / 4u;
+            // the block's half (128 weights) and the run within each 32 of it (16 weights)
+            let h = (c % 4u) / 2u;
+            let g = c % 2u;
+            let bb = row_base + blk * 110u;
+            let qs = bb + 32u + h * 32u + g * 16u;
+            let hm = bb + g * 16u;
+            let a0 = word_at(bb + 96u);
+            let a1 = word_at(bb + 100u);
+            let tmp = word_at(bb + 104u);
+            let dw = w[(bb + 108u) >> 2u];
+            let d = unpack2x16float(select(dw & 0xffffu, dw >> 16u, ((bb + 108u) & 3u) != 0u)).x;
+            let xa = (blk * 256u + h * 128u + g * 16u) / 4u;
+            var dq = vec4<f32>(0.0);
+            for (var wi = 0u; wi < 4u; wi++) {
+                let qw = bytes4(word_at(qs + wi * 4u));
+                let hw = bytes4(word_at(hm + wi * 4u));
+                for (var j = 0u; j < 4u; j++) {
+                    let q = vec4<f32>((qw >> vec4<u32>(2u * j)) & vec4<u32>(3u)) + 4.0 * vec4<f32>((hw >> vec4<u32>(j + 4u * h)) & vec4<u32>(1u)) - 4.0;
+                    dq[j] += dot(q, x4[xa + j * 8u + wi]);
+                }
+            }
+            let k0 = 8u * h + g;
+            acc += d * (q3_scale(a0, a1, tmp, k0) * dq.x + q3_scale(a0, a1, tmp, k0 + 2u) * dq.y
+                + q3_scale(a0, a1, tmp, k0 + 4u) * dq.z + q3_scale(a0, a1, tmp, k0 + 6u) * dq.w);
+        }
+    }
+    partial[li] = acc;
+    workgroupBarrier();
+    for (var st = 8u; st > 0u; st /= 2u) {
+        if (lane < st) { partial[li] += partial[li + st]; }
+        workgroupBarrier();
+    }
+    if (r < p.rows && lane == 0u) { y[p.row0 + r] = partial[li]; }
+}
+"#;
+
+/// Q5_K for one row of `x`, read wide, as [`Q4K_DECODE`]: 8 weight rows a workgroup of 256, 32 lanes a row; a lane
+/// takes a 16-byte run of a block's low bits (32 weights: 16 of a sub-block's low nibbles and 16 of the next one's
+/// high), the 16 bytes of high bits beside them and the block's header (its scales), a vec4 load each, and `x` four at
+/// a time, and adds `d * dot(q, x) - m * sum(x)` for each half. A block is 176 bytes, 11 vec4s.
+const Q5K_DECODE: &str = r#"
+struct Params {
+    k: u32,
+    n: u32,
+    m: u32,
+    row0: u32,
+    rows: u32,
+    row_bytes: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+@group(0) @binding(0) var<storage, read> w4: array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read> x4: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> p: Params;
+
+var<workgroup> partial: array<f32, 256>;
+
+// Byte `b` (0..12) of a block's scales, the header's last three words.
+fn sbyte(h: vec4<u32>, b: u32) -> u32 {
+    let wd = select(select(h.w, h.z, b < 8u), h.y, b < 4u);
+    return (wd >> (8u * (b % 4u))) & 255u;
+}
+
+// Sub-block `j`'s 6-bit scale and minimum, as ggml's get_scale_min_k4.
+fn scale_min(h: vec4<u32>, j: u32) -> vec2<f32> {
+    if (j < 4u) {
+        return vec2<f32>(f32(sbyte(h, j) & 63u), f32(sbyte(h, j + 4u) & 63u));
+    }
+    let sc = (sbyte(h, j + 4u) & 15u) | ((sbyte(h, j - 4u) >> 6u) << 4u);
+    let mn = (sbyte(h, j + 4u) >> 4u) | ((sbyte(h, j) >> 6u) << 4u);
+    return vec2<f32>(f32(sc), f32(mn));
+}
+
+// The four bytes' bit `s` of `v` (a byte each), as 0 or 16.
+fn high4(v: u32, s: u32) -> vec4<f32> {
+    return 16.0 * vec4<f32>(f32((v >> s) & 1u), f32((v >> (s + 8u)) & 1u), f32((v >> (s + 16u)) & 1u), f32((v >> (s + 24u)) & 1u));
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let lane = li & 31u;
+    let r = (wg.x + wg.y * 65535u) * 8u + (li >> 5u);
+    var acc = 0.0;
+    if (r < p.rows) {
+        let blocks = p.k / 256u;
+        let row4 = r * (p.row_bytes / 16u);
+        for (var c = lane; c < blocks * 8u; c += 32u) {
+            let blk = c / 8u;
+            let j = c % 8u;
+            let base4 = row4 + blk * 11u;
+            let h = w4[base4];
+            let pair = j / 2u;
+            let half = j % 2u;
+            let qh = w4[base4 + 1u + half];
+            let q = w4[base4 + 3u + j];
+            let dm = unpack2x16float(h.x);
+            let slo = scale_min(h, 2u * pair);
+            let shi = scale_min(h, 2u * pair + 1u);
+            // x: sub-block 2*pair's 16 at half * 16, and sub-block 2*pair + 1's
+            let xa = (blk * 256u + 2u * pair * 32u + half * 16u) / 4u;
+            let xb = xa + 8u;
+            let sl = 2u * pair;
+            var dot_lo = 0.0;
+            var sum_lo = 0.0;
+            var dot_hi = 0.0;
+            var sum_hi = 0.0;
+            for (var wi = 0u; wi < 4u; wi++) {
+                let word = q[wi];
+                let hw = qh[wi];
+                let a = x4[xa + wi];
+                let b = x4[xb + wi];
+                let lo = vec4<f32>(f32(word & 15u), f32((word >> 8u) & 15u), f32((word >> 16u) & 15u), f32((word >> 24u) & 15u)) + high4(hw, sl);
+                let hi = vec4<f32>(f32((word >> 4u) & 15u), f32((word >> 12u) & 15u), f32((word >> 20u) & 15u), f32((word >> 28u) & 15u)) + high4(hw, sl + 1u);
+                dot_lo += dot(lo, a);
+                sum_lo += a.x + a.y + a.z + a.w;
+                dot_hi += dot(hi, b);
+                sum_hi += b.x + b.y + b.z + b.w;
+            }
+            acc += dm.x * slo.x * dot_lo - dm.y * slo.y * sum_lo + dm.x * shi.x * dot_hi - dm.y * shi.y * sum_hi;
+        }
+    }
+    partial[li] = acc;
+    workgroupBarrier();
+    for (var st = 16u; st > 0u; st /= 2u) {
+        if (lane < st) { partial[li] += partial[li + st]; }
+        workgroupBarrier();
+    }
+    if (r < p.rows && lane == 0u) { y[p.row0 + r] = partial[li]; }
+}
+"#;
 
 /// Q6_K for one row of `x`, read a word at a time: 8 weight rows a workgroup of 256, 32 lanes a row; a lane takes half
 /// a sub-block (16 weights, one scale): their low bits' 16 bytes and high bits' 16 bytes as four words each (a block is
