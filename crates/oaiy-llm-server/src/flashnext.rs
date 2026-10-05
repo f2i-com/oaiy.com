@@ -1428,6 +1428,8 @@ struct MtpChain {
     router: ChainMat,
     ones: ggml_rs::DeviceVec,
     hid: ggml_rs::DeviceVec,
+    /// A draft's token, its logit and the sum of the exponentials against it (`argmax_softmax`).
+    best: ggml_rs::DeviceVec,
     devs: [std::sync::OnceLock<MtpDev>; CHECK_ROWS],
 }
 
@@ -1638,6 +1640,7 @@ impl FlashNext {
                         router: ChainMat::new(c, &mp.router),
                         ones,
                         hid: c.vec(CHECK_ROWS * s * cfg.hidden),
+                        best: c.vec(3),
                         devs: Default::default(),
                     })
                 });
@@ -2365,7 +2368,6 @@ impl FlashNext {
             })
         };
         let one = dev(1);
-        let argmax = |l: &[f32]| l.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0 as u32;
         fn packed(w: &Weight) -> &dyn PackedLinear {
             chain_packed(w).expect("a chained layer's matrix")
         }
@@ -2432,12 +2434,11 @@ impl FlashNext {
             }
             hc(&mut *rec, &mc.mixer, None, &one.dv.post, &one.dv.mixed, &one.dv, 1);
             rec.exl3_rows(chain_packed(&self.head)?, &one.dv.mixed, &one.dv.head, 1);
-            rec.read(&one.dv.head);
-            let logits = rec.finish().pop().expect("the draft's logits");
-            let best = argmax(&logits);
-            // the draft's probability under the layer: the largest logit's share of their exponentials
-            let top = logits[best as usize];
-            let total: f64 = logits.iter().map(|&l| ((l - top) as f64).exp()).sum();
+            // the draft and its probability under the layer (the largest logit's share of their exponentials)
+            rec.argmax_softmax(&one.dv.head, &mc.best);
+            rec.read(&mc.best);
+            let got = rec.finish().pop().expect("the draft");
+            let (best, total) = (got[0].to_bits(), got[2] as f64);
             if pass == 0 {
                 // the layer's entries are true ones up to the trunk's last position, the draft taken or not
                 g.valid = n;

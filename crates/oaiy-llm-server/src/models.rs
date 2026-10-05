@@ -1731,6 +1731,18 @@ mod dense_webgpu_timing {
                 made.push(d);
                 l = model.forward(&[next], &model.embed_text(&[next]).unwrap(), &mut kv, None).unwrap();
             }
+            // OAIY_CHAIN_PROFILE: where a draft's time goes
+            if ggml_rs_wgpu::profile::chain_on() {
+                let _ = (ggml_rs_wgpu::profile::take_kernels(), ggml_rs_wgpu::profile::take_line());
+                let t = std::time::Instant::now();
+                let d = model.draft_above(&kv, &seq[seq.len() - 8..], 3, 0.0);
+                let k = ggml_rs_wgpu::profile::take_kernels();
+                let gpu: f64 = k.iter().map(|e| e.1).sum();
+                eprintln!("a draft of {:?}: {:.1} ms, of it the GPU's kernels {gpu:.2} ms; {}", d.map(|d| d.len()), t.elapsed().as_secs_f64() * 1e3, ggml_rs_wgpu::profile::take_line());
+                for (name, ms, n) in k.iter().take(12) {
+                    eprintln!("  {name:<28} {ms:>9.3} ms {n:>6}");
+                }
+            }
             // drafts made with token i sampled guess tokens i + 1, i + 2, i + 3
             let out = &seq[pt.len()..];
             for (i, d) in made.iter().enumerate() {
@@ -1782,8 +1794,10 @@ mod dense_webgpu_timing {
         let report = |what: &str, wall: f64| {
             let k = ggml_rs_wgpu::profile::take_kernels();
             let gpu: f64 = k.iter().map(|e| e.1).sum();
-            eprintln!("{what}: {wall:.1} ms, of it the GPU's kernels {gpu:.1} ms; {}", ggml_rs_wgpu::profile::take_line());
-            for (name, ms, n) in k.iter().take(14) {
+            let count: u64 = k.iter().map(|e| e.2 as u64).sum();
+            eprintln!("{what}: {wall:.1} ms, of it the GPU's kernels {gpu:.1} ms in {count} dispatches; {}", ggml_rs_wgpu::profile::take_line());
+            // OAIY_PROFILE_ALL: every kernel, not only the costliest
+            for (name, ms, n) in k.iter().take(if std::env::var_os("OAIY_PROFILE_ALL").is_some() { usize::MAX } else { 14 }) {
                 eprintln!("  {name:<28} {ms:>9.2} ms {n:>6}");
             }
         };

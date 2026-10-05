@@ -390,6 +390,60 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 }
 "#;
 
+/// [`ChainRecorder::argmax_softmax`] of `p[0].x` logits, one workgroup: each thread's largest (the first of equals in
+/// its stride) and the sum of exponentials against it as it goes, then the threads' combined, the lower index of
+/// equals taken.
+const ARGMAX_SOFTMAX: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(6) var<storage, read_write> out: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> mv: array<f32, 256>;
+var<workgroup> mi: array<u32, 256>;
+var<workgroup> ms: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_index) t: u32) {
+    let n = p[0].x;
+    var m = -3.4e38;
+    var idx = 0xffffffffu;
+    var s = 0.0;
+    for (var i = t; i < n; i += 256u) {
+        let v = x[i];
+        if (v > m) {
+            s = s * exp(m - v) + 1.0;
+            m = v;
+            idx = i;
+        } else {
+            s += exp(v - m);
+        }
+    }
+    mv[t] = m;
+    mi[t] = idx;
+    ms[t] = s;
+    workgroupBarrier();
+    for (var st = 128u; st > 0u; st /= 2u) {
+        if (t < st) {
+            let m1 = mv[t];
+            let m2 = mv[t + st];
+            let i1 = mi[t];
+            let i2 = mi[t + st];
+            let take = m2 > m1 || (m2 == m1 && i2 < i1);
+            let mm = select(m1, m2, take);
+            ms[t] = ms[t] * exp(m1 - mm) + ms[t + st] * exp(m2 - mm);
+            mv[t] = mm;
+            mi[t] = select(i1, i2, take);
+        }
+        workgroupBarrier();
+    }
+    if (t == 0u) {
+        out[0] = bitcast<f32>(mi[0]);
+        out[1] = mv[0];
+        out[2] = ms[0];
+    }
+}
+"#;
+
 /// `y[p[0].y + i] = x[p[0].z + i]` for `i < p[0].x`.
 const COPY: &str = r#"
 @compute @workgroup_size(256)
@@ -1356,6 +1410,14 @@ impl DeviceChain for WgpuBackend {
     }
 }
 
+impl<'a> Recorder<'a> {
+    /// A recording on `backend`, its bind groups kept (the crate's own measurements record kernels directly).
+    #[cfg(test)]
+    pub(crate) fn new(backend: &'a WgpuBackend) -> Self {
+        Recorder { backend, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), q8: Vec::new() }
+    }
+}
+
 /// One dispatch: its pipeline, bind group and grid.
 type Dispatch = (Arc<wgpu::ComputePipeline>, wgpu::BindGroup, (u32, u32, u32));
 
@@ -1956,6 +2018,13 @@ impl ChainRecorder for Recorder<'_> {
         self.dispatch(&part, buffer(kv), buffer(q), buffer(out), &params, (n_h as u32, runs as u32, 1));
         let join = self.named("chain-attention-join", ATTENTION_JOIN);
         self.dispatch(&join, buffer(kv), buffer(q), buffer(out), &params, (n_h as u32, 1, 1));
+    }
+
+    fn argmax_softmax(&mut self, x: &DeviceVec, out: &DeviceVec) {
+        assert!(x.len > 0 && out.len >= 3, "chain: a draft's token of {} logits", x.len);
+        let d = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        self.dispatch_wide("chain-argmax-softmax", ARGMAX_SOFTMAX, [buffer(x), &d, &d, &d, &d, &d, buffer(out), &drw], &[x.len as u32], (1, 1, 1));
     }
 
     fn read_range(&mut self, v: &DeviceVec, offset: usize, len: usize) {
@@ -2613,6 +2682,32 @@ mod tests {
                     assert!((a - e).abs() <= 1e-4 * scale, "[{n}, {k}] of {rows} rows [{i}]: {a} against {e}");
                 }
             }
+        }
+    }
+
+    /// A draft's token from logits on the device is the host's: the first of equal largest, and the sum of the
+    /// exponentials against it within rounding, over a vocabulary's 248,320 and a few.
+    #[test]
+    fn a_drafts_token_is_the_first_largest_logit_and_its_share() {
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        let mut r = rng(17);
+        for (n, peak, tie) in [(248_320usize, 151_000usize, Some(200_000usize)), (5, 3, None), (300, 7, Some(6))] {
+            let mut x: Vec<f32> = (0..n).map(|_| r() * 8.0).collect();
+            x[peak] = 30.0;
+            if let Some(t) = tie {
+                x[t] = 30.0;
+            }
+            let (xd, out) = (b.vec(n), b.vec(3));
+            DeviceChain::upload(&b, &xd, &x);
+            let mut rec = b.begin();
+            rec.argmax_softmax(&xd, &out);
+            rec.read(&out);
+            let got = rec.finish().pop().unwrap();
+            let first = tie.map_or(peak, |t| t.min(peak));
+            let total: f64 = x.iter().map(|&v| ((v - 30.0) as f64).exp()).sum();
+            assert_eq!(got[0].to_bits() as usize, first, "{n}: the first largest");
+            assert_eq!(got[1], 30.0);
+            assert!(((got[2] as f64) - total).abs() <= 1e-5 * total, "{n}: {} against {total}", got[2]);
         }
     }
 

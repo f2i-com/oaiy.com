@@ -227,6 +227,10 @@ pub trait ChainRecorder {
     /// `acc[i] += weights[at] * y[i]` for `i < len`: a weighted sum's term, its weight read from the device (an
     /// expert's, written by the host before the chain runs).
     fn axpy_at(&mut self, acc: &DeviceVec, y: &DeviceVec, weights: &DeviceVec, at: usize, len: usize);
+    /// A draft's token and its probability from logits `x`: `out[0]` the index of the largest (the first of equals,
+    /// an f32's bits), `out[1]` the largest, `out[2]` the sum of `exp(x[i] - out[1])` (the token's probability its
+    /// inverse), where reading the logits back cost a draft a millisecond.
+    fn argmax_softmax(&mut self, x: &DeviceVec, out: &DeviceVec);
     /// Read `v` back once the chain has run.
     fn read(&mut self, v: &DeviceVec) {
         self.read_range(v, 0, v.len)

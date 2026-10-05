@@ -251,9 +251,7 @@ impl Exl3Cpu {
 fn one_lanes(x_at: &str, words_at: &str, out: &str) -> String {
     let codes: String = (0..8)
         .map(|jj| {
-            let r = ["rb", "rb + 1u", "rb + 8u", "rb + 9u"][jj % 4];
             let acc = if jj < 4 { "lo" } else { "hi" };
-            let _ = r;
             format!("            {acc} = {acc} + xv[{}] * decode_at(code_in(q0, q1, q2, q3, at[{jj}]));\n", jj % 4)
         })
         .collect();
@@ -980,9 +978,9 @@ pub(crate) const FEW_MAX: usize = 8;
 /// The matmul for a few rows of one matrix (a check of drafted tokens, a short chunk): [`g_mm_source`]'s lanes, each
 /// decoding its eight codes of a tile once and summing them against every row's inputs in the order the one-row
 /// kernel sums them (so each row's sums are that kernel's bit for bit). A workgroup a (tile column, block and split);
-/// a block is `rows` jobs of one matrix from `order` (its unused places [`NONE`]), each job's partial sums to `part[(j
-/// * splits + s) * n..]` as [`g_mm_source`]'s. `p[0]`: n, k, tile words, splits; `p[1]`: words a matrix, the pass's
-/// first block.
+/// a block is `rows` jobs of one matrix from `order` (its unused places [`NONE`]; a block with none ends at once), each
+/// job's partial sums to `part[(j * splits + s) * n..]` as [`g_mm_source`]'s. `p[0]`: n, k, tile words, splits; `p[1]`:
+/// words a matrix, the pass's first block.
 pub(crate) fn g_few(rows: usize) -> &'static str {
     static SOURCES: [std::sync::OnceLock<String>; FEW_MAX - 1] = [const { std::sync::OnceLock::new() }; FEW_MAX - 1];
     assert!((2..=FEW_MAX).contains(&rows), "a block of 2 to {FEW_MAX} rows");
@@ -1025,6 +1023,7 @@ var<workgroup> red: array<vec2<f32>, {red_len}>;
 // every code's place in a tile (`place`), the workgroup's threads one each: the same in every tile
 var<workgroup> places: array<u32, 256>;
 var<workgroup> firsts: array<u32, 32>;
+var<workgroup> lead: u32;
 
 fn round_f16(v: f32) -> f32 {{
     let b = bitcast<u32>(v);
@@ -1074,6 +1073,12 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     }}
     let blk = p[1].y + wg.z / splits;
     let s = wg.z % splits;
+    if (t == 0u) {{
+        lead = order[blk * {rows}u];
+    }}
+    if (workgroupUniformLoad(&lead) == 0xffffffffu) {{
+        return;
+    }}
 {ids}
     let base = jobs[2u * j0] * p[1].x;
     let kts = k / 16u;
@@ -1178,6 +1183,68 @@ impl FewScratch {
     pub(crate) fn fits(k: usize, n: usize, splits: usize) -> bool {
         k <= Self::K && n <= Self::N && n * splits <= Self::PART
     }
+}
+
+/// A check's routed experts in blocks for [`g_few`], from its down jobs ([`DOWN_JOBS`]'s: pair `j`'s expert, `p[0].x`
+/// pairs, at most 256): each expert's pairs (at most `p[0].y`, the block's rows, as a row takes an expert once) a block
+/// of their own in their list's order, the blocks in the order their experts first appear; the down jobs' order
+/// (`order_d`, `p[0].x` blocks of `p[0].y`) and the gate and up jobs' (`order_gu`: expert block `b`'s gate jobs `2j` in
+/// block `2b`, its up jobs `2j + 1` in `2b + 1`), the other places [`NONE`]. One workgroup.
+const GROUP: &str = r#"
+@group(0) @binding(0) var<storage, read> jobs: array<u32>;
+@group(0) @binding(6) var<storage, read_write> order_gu: array<u32>;
+@group(0) @binding(7) var<storage, read_write> order_d: array<u32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> ex: array<u32, 256>;
+// 1 where a pair is its expert's first
+var<workgroup> first: array<u32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_index) t: u32) {
+    let n = p[0].x;
+    let rows = p[0].y;
+    for (var i = t; i < n * rows; i += 256u) {
+        order_d[i] = 0xffffffffu;
+        order_gu[2u * i] = 0xffffffffu;
+        order_gu[2u * i + 1u] = 0xffffffffu;
+    }
+    if (t < n) {
+        ex[t] = jobs[2u * t];
+    }
+    workgroupBarrier();
+    var leader = t;
+    var slot = 0u;
+    if (t < n) {
+        let e = ex[t];
+        for (var r = 0u; r < t; r++) {
+            if (ex[r] == e) {
+                if (leader == t) { leader = r; }
+                slot += 1u;
+            }
+        }
+        first[t] = select(0u, 1u, leader == t);
+    }
+    storageBarrier();
+    workgroupBarrier();
+    if (t < n) {
+        var blk = 0u;
+        for (var r = 0u; r < leader; r++) { blk += first[r]; }
+        order_d[blk * rows + slot] = t;
+        order_gu[2u * blk * rows + slot] = 2u * t;
+        order_gu[(2u * blk + 1u) * rows + slot] = 2u * t + 1u;
+    }
+}
+"#;
+
+/// How a group's jobs are taken: each a workgroup's (a step's, [`g_mm_source`]); a prompt's in blocks of one matrix
+/// ([`g_many`], the order and its blocks); a check's few rows' grouped on the GPU in blocks of `rows` ([`g_few`], the
+/// order and the most blocks it can have), each job's sums the one-job kernel's.
+#[derive(Clone, Copy)]
+enum Order<'a> {
+    Jobs,
+    Many(&'a DeviceVec, usize),
+    Few(&'a DeviceVec, usize, usize),
 }
 
 /// The pipeline name of [`g_few`]'s kernel for blocks of `rows`.
@@ -1524,6 +1591,9 @@ pub(crate) struct Step {
     su: DeviceVec,
     sa: DeviceVec,
     sd: DeviceVec,
+    /// A check's jobs grouped by matrix ([`GROUP`]): gate and up, down.
+    order_gu: DeviceVec,
+    order_d: DeviceVec,
 }
 
 /// A MoE layer's experts on the GPU as groups (Qwen3.8-Flash-Next's 512 routed ones): their gate and up matrices in
@@ -1648,6 +1718,8 @@ impl Exl3MoeGrouped {
             su: vec(rows * f),
             sa: vec(rows * f),
             sd: vec(rows * h),
+            order_gu: vec(if one && rows > 1 { 2 * pairs * rows } else { 1 }),
+            order_d: vec(if one && rows > 1 { pairs * rows } else { 1 }),
         }
     }
 
@@ -1668,7 +1740,7 @@ impl Exl3MoeGrouped {
     /// `order`: a prompt's jobs in blocks of one matrix (and the blocks' count), each tile decoded once a block, in one
     /// split (a prompt has workgroups enough without, and its partial sums are the smaller).
     #[allow(clippy::too_many_arguments)]
-    fn group_pass(&self, rec: &mut crate::chain::Recorder<'_>, g: &Group, x: &DeviceVec, jobs: &DeviceVec, count: usize, order: Option<(&DeviceVec, usize)>, xh: &DeviceVec, part: &DeviceVec, y: &DeviceVec) {
+    fn group_pass(&self, rec: &mut crate::chain::Recorder<'_>, g: &Group, x: &DeviceVec, jobs: &DeviceVec, count: usize, order: Order<'_>, xh: &DeviceVec, part: &DeviceVec, y: &DeviceVec) {
         let d = rec.gpu().dummy().clone();
         let drw = rec.gpu().dummy_rw().clone();
         let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
@@ -1676,11 +1748,11 @@ impl Exl3MoeGrouped {
         let (suh, svh) = (buf(&g.suh), buf(&g.svh));
         rec.dispatch_wide("exl3-pre", &chain_shader("pre"), [&xb, &suh, &d, &jb, &d, &d, &xhb, &drw], &[g.k as u32, 1], ((g.k / 128) as u32, count as u32, 1));
         let ntiles = (g.n / 16) as u32;
-        let splits = if order.is_some() { 1 } else { g.splits };
+        let splits = if matches!(order, Order::Many(..)) { 1 } else { g.splits };
         // as many jobs (or blocks) a pass as the grid's third axis takes
         let per = (65535 / splits) as usize;
         match order {
-            Some((order, blocks)) => {
+            Order::Many(order, blocks) => {
                 let ob = buf(order);
                 let rows = moe_block();
                 for first in (0..blocks).step_by(per) {
@@ -1688,7 +1760,14 @@ impl Exl3MoeGrouped {
                     rec.dispatch_wide(many_name(rows), &g_many(rows), [&g.words, &xhb, &jb, &ob, &d, &d, &pb, &drw], &[g.n as u32, g.k as u32, g.tw as u32, splits, g.mwords as u32, first as u32], (ntiles.min(65535), ntiles.div_ceil(65535), these * splits));
                 }
             }
-            None => {
+            Order::Few(order, blocks, rows) => {
+                let ob = buf(order);
+                for first in (0..blocks).step_by(per) {
+                    let these = per.min(blocks - first) as u32;
+                    rec.dispatch_wide(few_name(rows), g_few(rows), [&g.words, &xhb, &jb, &ob, &d, &d, &pb, &drw], &[g.n as u32, g.k as u32, g.tw as u32, splits, g.mwords as u32, first as u32], (ntiles.min(65535), ntiles.div_ceil(65535), these * splits));
+                }
+            }
+            Order::Jobs => {
                 for first in (0..count).step_by(per) {
                     let jobs = per.min(count - first) as u32;
                     rec.dispatch_wide("exl3-mm", &chain_shader("mm"), [&g.words, &xhb, &jb, &d, &d, &d, &pb, &drw], &[g.n as u32, g.k as u32, g.tw as u32, g.splits, g.mwords as u32, first as u32], (ntiles.min(65535), ntiles.div_ceil(65535), jobs * g.splits));
@@ -1733,7 +1812,11 @@ impl Exl3MoeGrouped {
             (v, o.len() / moe_block())
         };
         let orders = (rows > 1).then(|| (order(&jobs_gu), order(&jobs_d)));
-        self.run(rec, &st, x, out, rows, orders.as_ref().map(|((g, gn), (d, dn))| ((g, *gn), (d, *dn))));
+        let (ogu, od) = match &orders {
+            Some(((g, gn), (d, dn))) => (Order::Many(g, *gn), Order::Many(d, *dn)),
+            None => (Order::Jobs, Order::Jobs),
+        };
+        self.run(rec, &st, x, out, rows, ogu, od);
     }
 
     /// `rows` rows' experts (a step's one, a check's few) routed on the GPU from the router's `logits` (`[rows, routed +
@@ -1751,25 +1834,35 @@ impl Exl3MoeGrouped {
         let drw = rec.gpu().dummy_rw().clone();
         rec.dispatch_wide("moe-route", ROUTE, [&buf(logits), &d, &d, &d, &d, &d, &buf(&st.jobs_gu), &buf(&st.w)], &[self.routed as u32, top_k as u32], (rows as u32, 1, 1));
         rec.dispatch_wide("moe-down-jobs", DOWN_JOBS, [&buf(&st.jobs_gu), &d, &d, &d, &d, &d, &buf(&st.jobs_d), &drw], &[(rows * top_k) as u32], (1, 1, 1));
-        self.run(rec, &st, x, out, rows, None);
+        // a check's few rows: an expert the rows share decoded once for them (its jobs one block; OAIY_MOE_UNGROUPED:
+        // a job each)
+        let pairs = rows * top_k;
+        let grouped = (2..=FEW_MAX).contains(&rows) && pairs <= 256 && std::env::var_os("OAIY_MOE_UNGROUPED").is_none();
+        let (ogu, od) = if grouped {
+            rec.dispatch_wide("moe-group", GROUP, [&buf(&st.jobs_d), &d, &d, &d, &d, &d, &buf(&st.order_gu), &buf(&st.order_d)], &[pairs as u32, rows as u32], (1, 1, 1));
+            (Order::Few(&st.order_gu, 2 * pairs, rows), Order::Few(&st.order_d, pairs, rows))
+        } else {
+            (Order::Jobs, Order::Jobs)
+        };
+        self.run(rec, &st, x, out, rows, ogu, od);
         true
     }
 
     /// The experts' work once `st` holds the jobs and weights: gate and up, SwiGLU, down, the shared expert on every
-    /// row, and each row's weighted sum; `orders`, a prompt's (gate and up, down: each order and its blocks).
-    #[allow(clippy::type_complexity)]
-    fn run(&self, rec: &mut crate::chain::Recorder<'_>, st: &Step, x: &DeviceVec, out: &DeviceVec, rows: usize, orders: Option<((&DeviceVec, usize), (&DeviceVec, usize))>) {
+    /// row, and each row's weighted sum; the gate and up jobs taken as `ogu` has them, the down jobs as `od`.
+    #[allow(clippy::too_many_arguments)]
+    fn run(&self, rec: &mut crate::chain::Recorder<'_>, st: &Step, x: &DeviceVec, out: &DeviceVec, rows: usize, ogu: Order<'_>, od: Order<'_>) {
         use ggml_rs::ChainRecorder;
         let (h, f, top_k) = (self.hidden, self.ff, st.top_k);
         let pairs = rows * top_k;
         let (jgu, jd, wv, xh_gu, part_gu, out_gu, act, xh_d, part_d, out_d, sg, su, sa, sd) =
             (&st.jobs_gu, &st.jobs_d, &st.w, &st.xh_gu, &st.part_gu, &st.out_gu, &st.act, &st.xh_d, &st.part_d, &st.out_d, &st.sg, &st.su, &st.sa, &st.sd);
-        self.group_pass(rec, &self.gu, x, jgu, 2 * pairs, orders.map(|o| o.0), xh_gu, part_gu, out_gu);
+        self.group_pass(rec, &self.gu, x, jgu, 2 * pairs, ogu, xh_gu, part_gu, out_gu);
         let silu = rec.named("moe-silu-pairs", SILU_PAIRS);
         let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
         let d = rec.gpu().dummy().clone();
         rec.dispatch_kept(&silu, &d, &buf(out_gu), &buf(act), &[f as u32, pairs as u32], (((pairs * f) as u32).div_ceil(256), 1, 1));
-        self.group_pass(rec, &self.down, act, jd, pairs, orders.map(|o| o.1), xh_d, part_d, out_d);
+        self.group_pass(rec, &self.down, act, jd, pairs, od, xh_d, part_d, out_d);
         // the shared expert on every row
         rec.exl3_rows(&self.shared[0], x, sg, rows);
         rec.exl3_rows(&self.shared[1], x, su, rows);
@@ -2482,6 +2575,110 @@ mod tests {
                 line += &format!(" {rows} rows {:.1} us ({:.2}x, {:.0} GB/s);", each * 1e6, each / one, bytes / each / 1e9);
             }
             eprintln!("{line}");
+        }
+    }
+
+    /// The few-rows kernel's cost by how many of a block's places hold jobs, against the one-job kernel's
+    /// (`--ignored --nocapture`): an expert's gate (640 x 2560) and a delta net's qkv (10240 x 2560) at 3 bits, matrices
+    /// in turn past the L2; and a dispatch of empty blocks.
+    #[test]
+    #[ignore = "a measurement"]
+    fn measure_few_blocks() {
+        let Some(b) = backend() else { return };
+        for (k, n, count) in [(2560usize, 640usize, 96usize), (2560, 10240, 8)] {
+            let ws: Vec<_> = (0..count as u32).map(|i| b.exl3(random_exl3(k, n, 48, 700 + i)).unwrap()).collect();
+            let g: Vec<&Exl3Gpu> = ws.iter().map(|w| w.as_any().unwrap().downcast_ref::<Exl3Gpu>().unwrap()).collect();
+            let splits = g[0].single_chunk().unwrap().1;
+            let (xh, part) = (b.vec(8 * k), b.vec(8 * splits as usize * n));
+            DeviceChain::upload(&b, &xh, &(0..8 * k).map(|i| ((i * 37 % 101) as f32 - 50.0) / 31.0).collect::<Vec<_>>());
+            let jobs = u32_vec(&b, &(0..8u32).flat_map(|r| [0, r]).collect::<Vec<_>>());
+            let ntiles = (n / 16) as u32;
+            let reps = 4 * count;
+            let time = |name: &'static str, body: &str, order: Option<&DeviceVec>, blocks: u32| {
+                let run = || {
+                    use ggml_rs::ChainRecorder;
+                    let mut rec = crate::chain::Recorder::new(&b);
+                    let d = rec.gpu().dummy().clone();
+                    let drw = rec.gpu().dummy_rw().clone();
+                    let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().unwrap().clone();
+                    for i in 0..reps {
+                        let (words, _) = g[i % count].single_chunk().unwrap();
+                        let ob = order.map(buf).unwrap_or_else(|| d.clone());
+                        rec.dispatch_wide(name, body, [words, &buf(&xh), &buf(&jobs), &ob, &d, &d, &buf(&part), &drw], &[n as u32, k as u32, 48, splits, 0, 0], (ntiles, 1, blocks * splits));
+                    }
+                    rec.read_range(&part, 0, 1);
+                    Box::new(rec).finish();
+                };
+                run();
+                let t = std::time::Instant::now();
+                for _ in 0..5 {
+                    run();
+                }
+                t.elapsed().as_secs_f64() / 5.0 / reps as f64 * 1e6
+            };
+            let one = time("exl3-mm", &chain_shader("mm"), None, 1);
+            let mut line = format!("[{n}, {k}]: a job {one:.1} us;");
+            for (rows, used) in [(4usize, 1usize), (4, 2), (4, 4), (2, 1), (2, 2), (8, 1)] {
+                let order: Vec<u32> = (0..rows as u32).map(|r| if (r as usize) < used { r } else { NONE }).collect();
+                let ov = u32_vec(&b, &order);
+                line += &format!(" few-{rows} with {used} {:.1} us;", time(few_name(rows), g_few(rows), Some(&ov), 1));
+            }
+            let empty = u32_vec(&b, &vec![NONE; 4 * 40]);
+            line += &format!(" 40 empty blocks of 4 {:.1} us", time(few_name(4), g_few(4), Some(&empty), 40));
+            eprintln!("{line}");
+        }
+    }
+
+    /// A check's experts as the GPU takes them in one pass (`--ignored --nocapture`): 4 rows of 10 of 128 experts
+    /// (Qwen3.8-Flash-Next's 2560 x 640 at 3 bits), their gate and up jobs a job a workgroup set, or grouped by matrix
+    /// in blocks of 4 (no empty blocks), as the rows share none, some or all of them.
+    #[test]
+    #[ignore = "a measurement"]
+    fn measure_grouped_check_experts() {
+        let Some(b) = backend() else { return };
+        let (count, hidden, ff, rows, k) = (128usize, 2560usize, 640usize, 4usize, 10usize);
+        let moe = b.exl3_experts(experts(count, hidden, ff, 48)).unwrap();
+        let g = moe.as_any().unwrap().downcast_ref::<Exl3MoeGrouped>().unwrap();
+        let st = g.scratch(&mut |n| b.vec(n), rows, k, true);
+        let x = b.vec(rows * hidden);
+        DeviceChain::upload(&b, &x, &(0..rows * hidden).map(|i| ((i * 37 % 101) as f32 - 50.0) / 31.0).collect::<Vec<_>>());
+        for (what, shared) in [("none shared", 0usize), ("3 of 10 shared", 3), ("all shared", 10)] {
+            // row r's experts: the shared ones, then its own
+            let picks: Vec<Vec<usize>> = (0..rows).map(|r| (0..k).map(|j| if j < shared { j } else { 10 + r * 25 + j }).collect()).collect();
+            let jobs: Vec<u32> = picks.iter().enumerate().flat_map(|(r, p)| p.iter().flat_map(move |&e| [2 * e as u32, r as u32, 2 * e as u32 + 1, r as u32])).collect();
+            upload_u32(&b, &st.jobs_gu, &jobs);
+            let n = jobs.len() / 2;
+            // blocks of a matrix's jobs, as GROUP makes them
+            let mut seen: Vec<(u32, Vec<u32>)> = Vec::new();
+            for q in 0..n {
+                let m = jobs[2 * q];
+                match seen.iter_mut().find(|(mm, _)| *mm == m) {
+                    Some((_, list)) => list.push(q as u32),
+                    None => seen.push((m, vec![q as u32])),
+                }
+            }
+            let order: Vec<u32> = seen.iter().flat_map(|(_, list)| (0..rows).map(|i| list.get(i).copied().unwrap_or(NONE))).collect();
+            upload_u32(&b, &st.order_gu, &order);
+            let blocks = seen.len();
+            let time = |few: bool| {
+                let run = || {
+                    use ggml_rs::ChainRecorder;
+                    let mut rec = crate::chain::Recorder::new(&b);
+                    for _ in 0..48 {
+                        let o = if few { Order::Few(&st.order_gu, blocks, rows) } else { Order::Jobs };
+                        g.group_pass(&mut rec, &g.gu, &x, &st.jobs_gu, n, o, &st.xh_gu, &st.part_gu, &st.out_gu);
+                    }
+                    rec.read_range(&st.out_gu, 0, 1);
+                    Box::new(rec).finish();
+                };
+                run();
+                let t = std::time::Instant::now();
+                for _ in 0..5 {
+                    run();
+                }
+                t.elapsed().as_secs_f64() / 5.0 / 48.0 * 1e6
+            };
+            eprintln!("{what}: {n} jobs, {blocks} matrices: a job each {:.1} us a pass, grouped {:.1} us", time(false), time(true));
         }
     }
 

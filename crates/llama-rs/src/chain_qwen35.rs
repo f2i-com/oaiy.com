@@ -146,6 +146,8 @@ struct MtpWork {
     table: DeviceVec,
     last: DeviceVec,
     logits: DeviceVec,
+    /// A draft's token, its logit and the sum of the exponentials against it (`argmax_softmax`).
+    best: DeviceVec,
 }
 
 /// What drafting and checking drafts need on the device: the multi-token-prediction layer's norms, its cache and
@@ -447,6 +449,7 @@ impl Qwen35Chain {
                         table: v(r * cfg.rope_dim),
                         last: v(d),
                         logits: v(cfg.vocab_size),
+                        best: v(3),
                     };
                     Some(Spec {
                         enorm: upload(&mtp.enorm),
@@ -790,7 +793,6 @@ impl Qwen35Chain {
         }
         g.owner = kv.id;
         let eps = m.config.rms_eps;
-        let argmax = |l: &[f32]| l.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0 as u32;
         let wk = &sp.work;
         let mut drafts = Vec::with_capacity(k);
         // pass 0: the caught-up rows (the hidden states kept); then a row a draft (the layer's own output)
@@ -821,12 +823,11 @@ impl Qwen35Chain {
             let xn1 = first(&wk.xn, s.d);
             rec.rmsnorm_rows(&wk.last, &sp.head_norm, &xn1, 1, eps);
             rec.matmul(quant(&m.output), &xn1, &wk.logits);
-            rec.read(&wk.logits);
-            let logits = rec.finish().pop().expect("the draft's logits");
-            let best = argmax(&logits);
-            // the draft's probability under the layer: the largest logit's share of their exponentials
-            let top = logits[best as usize];
-            let total: f64 = logits.iter().map(|&l| ((l - top) as f64).exp()).sum();
+            // the draft and its probability under the layer (the largest logit's share of their exponentials)
+            rec.argmax_softmax(&wk.logits, &wk.best);
+            rec.read(&wk.best);
+            let got = rec.finish().pop().expect("the draft");
+            let (best, total) = (got[0].to_bits(), got[2] as f64);
             if pass == 0 {
                 // the layer's entries are its own up to the trunk's last position, the draft taken or not
                 g.valid = n;
