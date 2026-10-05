@@ -1058,6 +1058,52 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+/// A prompt's conv ([`SSM_CONV`]'s sums), a thread a (channel, token): its `kernel` inputs those up to it, the run's
+/// or (before its first) the state's; no output another's input. The state is left to [`SSM_CONV_STATE`].
+const SSM_CONV_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> qkv: array<f32>;
+@group(0) @binding(1) var<storage, read> cw: array<f32>;
+@group(0) @binding(2) var<storage, read> cs: array<f32>;
+@group(0) @binding(7) var<storage, read_write> out: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let ch = p[0].x;
+    let kern = p[0].z;
+    let c = wg.x * 256u + li;
+    let t = wg.y;
+    if (c >= ch) { return; }
+    var acc = 0.0;
+    for (var k = 0u; k + 1u < kern; k++) {
+        // input t + k - (kern - 1)
+        let j = t + k;
+        var xv = 0.0;
+        if (j + 1u >= kern) { xv = qkv[(j + 1u - kern) * ch + c]; } else { xv = cs[j * ch + c]; }
+        acc += xv * cw[c * kern + k];
+    }
+    acc += qkv[t * ch + c] * cw[c * kern + kern - 1u];
+    out[t * ch + c] = acc / (1.0 + exp(-acc));
+}
+"#;
+
+/// The state after [`SSM_CONV_ROWS`]: the run's last `kernel - 1` inputs (a run as long at least), a thread a channel.
+const SSM_CONV_STATE: &str = r#"
+@group(0) @binding(0) var<storage, read> qkv: array<f32>;
+@group(0) @binding(6) var<storage, read_write> cs: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let ch = p[0].x;
+    let rows = p[0].y;
+    let kern = p[0].z;
+    let c = id.x;
+    if (c >= ch) { return; }
+    for (var k = 0u; k + 1u < kern; k++) { cs[k * ch + c] = qkv[(rows + 1u + k - kern) * ch + c]; }
+}
+"#;
+
 /// A gated delta net's causal depthwise conv, a thread a channel through the run's tokens (as the host's): its
 /// `kernel - 1` inputs before them from the state, each output through SiLU, the state left with the last inputs.
 /// `p[0]`: the channels, the tokens, the kernel.
@@ -1094,9 +1140,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 /// (as the host's `delta_net_step`), the row held in registers from the run's start to its end: each token's q and k
 /// (its key head's) L2-normed, the state decayed by `exp(softplus(alpha + dt_bias) * a)`, the delta rule's update by
 /// `sigmoid(beta)`, the state read by q, and the result RMS-normed over the head and gated by `silu(z)` (or
-/// `sigmoid(z)`). `DK` (the heads' size, `k_dim` = `v_dim`) is made a constant. `p[0]`: the value heads, the key heads;
-/// `p[1]`: the tokens, the bits of the q scale and of eps, the sigmoid gate. (A row read from memory at each token:
-/// 43 us a layer for a decode step of Qwen3.8 27B, 30 us a token of a prompt.)
+/// `sigmoid(z)`). `DK` (the heads' size, `k_dim` = `v_dim`) is made a constant, and the row `DK / 4` vectors of its
+/// own ([`delta_net_one`] puts their code in: an array indexed in a loop is the thread's memory, not its registers).
+/// `p[0]`: the value heads, the key heads; `p[1]`: the tokens, the bits of the q scale and of eps, the sigmoid gate. (A
+/// row read from memory at each token: 43 us a layer for a decode step of Qwen3.8 27B, 30 us a token of a prompt.)
 const DELTA_NET: &str = r#"
 @group(0) @binding(0) var<storage, read> cv: array<f32>;
 @group(0) @binding(1) var<storage, read> zz: array<f32>;
@@ -1127,8 +1174,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) i
     let hk = h % nk;
     let ch = 2u * nk * DK + nv * DK;
     let base = (h * DK + i) * DK4;
-    var row: array<vec4<f32>, DK4>;
-    for (var c = 0u; c < DK4; c++) { row[c] = st[base + c]; }
+ROW_LOAD
     for (var t = 0u; t < rows; t++) {
         let r0 = t * ch;
         let q = cv[r0 + hk * DK + i];
@@ -1159,25 +1205,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) i
         let g = exp(sp * sa[h]);
         // the decayed row read by k, its sums in the host's order
         var kv = 0.0;
-        for (var c = 0u; c < DK4; c++) {
-            let s = row[c] * g;
-            let kk = kn[c];
-            kv += s.x * kk.x;
-            kv += s.y * kk.y;
-            kv += s.z * kk.z;
-            kv += s.w * kk.w;
-        }
+ONE_KV
         let delta = (cv[r0 + 2u * nk * DK + h * DK + i] - kv) * bt;
         var core = 0.0;
-        for (var c = 0u; c < DK4; c++) {
-            let s = row[c] * g + delta * kn[c];
-            row[c] = s;
-            let qq = qn[c];
-            core += s.x * qq.x;
-            core += s.y * qq.y;
-            core += s.z * qq.z;
-            core += s.w * qq.w;
-        }
+ONE_UPDATE
         red[i] = core * core;
         workgroupBarrier();
         for (var s = DK / 2u; s > 0u; s /= 2u) {
@@ -1191,7 +1222,200 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) i
         out[t * nv * DK + h * DK + i] = core * inv * nm[i] * gate;
         workgroupBarrier();
     }
-    for (var c = 0u; c < DK4; c++) { st[base + c] = row[c]; }
+ROW_STORE
+}
+"#;
+
+/// [`DELTA_NET`] for heads `dk` wide: the row's `dk / 4` vectors and their code, each sum in the host's order.
+fn delta_net_one(dk: usize) -> String {
+    let n = dk / 4;
+    let load: String = (0..n).map(|c| format!("    var sr{c} = st[base + {c}u];\n")).collect();
+    let kv: String = (0..n)
+        .map(|c| format!("        {{\n            let s = sr{c} * g;\n            let kk = kn[{c}u];\n            kv += s.x * kk.x;\n            kv += s.y * kk.y;\n            kv += s.z * kk.z;\n            kv += s.w * kk.w;\n        }}\n"))
+        .collect();
+    let update: String = (0..n)
+        .map(|c| format!("        {{\n            let s = sr{c} * g + delta * kn[{c}u];\n            sr{c} = s;\n            let qq = qn[{c}u];\n            core += s.x * qq.x;\n            core += s.y * qq.y;\n            core += s.z * qq.z;\n            core += s.w * qq.w;\n        }}\n"))
+        .collect();
+    let store: String = (0..n).map(|c| format!("    st[base + {c}u] = sr{c};\n")).collect();
+    DELTA_NET
+        .replace("DK_VALUE", &dk.to_string())
+        .replace("ROW_LOAD\n", &load)
+        .replace("ONE_KV\n", &kv)
+        .replace("ONE_UPDATE\n", &update)
+        .replace("ROW_STORE\n", &store)
+}
+
+/// A prompt's delta net in three passes, the first: each token's q and k (its key heads') L2-normed as
+/// [`DELTA_NET`] norms them, a workgroup a (key head, token), into the scratch `qk` (`[token, key head]`: q then k),
+/// and the token's `sigmoid(beta)` and decay of each value head the key head's (after them, `[token, value head]`).
+const DELTA_NET_PREP: &str = r#"
+@group(0) @binding(0) var<storage, read> cv: array<f32>;
+@group(0) @binding(2) var<storage, read> ba: array<f32>;
+@group(0) @binding(3) var<storage, read> sa: array<f32>;
+@group(0) @binding(4) var<storage, read> dt: array<f32>;
+@group(0) @binding(6) var<storage, read_write> qk: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+const DK: u32 = DK_VALUEu;
+
+var<workgroup> red: array<f32, 2 * DK>;
+
+@compute @workgroup_size(DK)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) i: u32) {
+    let nv = p[0].x;
+    let nk = p[0].y;
+    let rows = p[1].x;
+    let scale_q = bitcast<f32>(p[1].y);
+    let eps = bitcast<f32>(p[1].z);
+    let hk = wg.x;
+    let t = wg.y;
+    let r0 = t * (2u * nk * DK + nv * DK);
+    let q = cv[r0 + hk * DK + i];
+    let k = cv[r0 + nk * DK + hk * DK + i];
+    red[i] = q * q;
+    red[DK + i] = k * k;
+    workgroupBarrier();
+    for (var s = DK / 2u; s > 0u; s /= 2u) {
+        if (i < s) {
+            red[i] += red[i + s];
+            red[DK + i] += red[DK + i + s];
+        }
+        workgroupBarrier();
+    }
+    let inv_q = 1.0 / sqrt(red[0] + eps);
+    let inv_k = 1.0 / sqrt(red[DK] + eps);
+    let o = (t * nk + hk) * 2u * DK;
+    qk[o + i] = q * inv_q * scale_q;
+    qk[o + DK + i] = k * inv_k;
+    // the value heads that read this key head (h % nk)
+    if (i < nv / nk) {
+        let h = hk + i * nk;
+        let bt = 1.0 / (1.0 + exp(-ba[t * 2u * nv + h]));
+        let ab = ba[t * 2u * nv + nv + h] + dt[h];
+        var sp = ab;
+        if (ab <= 20.0) {
+            let e = exp(ab);
+            sp = select(log(1.0 + e), e * (1.0 - 0.5 * e), e < 1e-4);
+        }
+        let bg = rows * nk * 2u * DK + (t * nv + h) * 2u;
+        qk[bg] = bt;
+        qk[bg + 1u] = exp(sp * sa[h]);
+    }
+}
+"#;
+
+/// The second: the recurrence through the tokens, a workgroup `R` rows of a value head's state and a thread a row
+/// held in registers from the first token to the last (as `DK / 4` vectors of its own, the code unrolled: an array
+/// indexed in a loop is the thread's memory, not its registers); each token's q and k (the first pass's) in the
+/// workgroup's memory, the next token's loaded as this one's are used (one barrier a token); each token's state read
+/// by q into `out`, as yet unnormed. ([`delta_net_scan`] puts the rows' code in.)
+const DELTA_NET_SCAN: &str = r#"
+@group(0) @binding(0) var<storage, read> qk4: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> cv: array<f32>;
+@group(0) @binding(2) var<storage, read> qk: array<f32>;
+@group(0) @binding(6) var<storage, read_write> st: array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read_write> out: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+const DK: u32 = DK_VALUEu;
+const DK4: u32 = DK_VALUEu / 4u;
+const R: u32 = R_VALUEu;
+
+// two tokens' q then k
+var<workgroup> qks: array<vec4<f32>, 4 * DK4>;
+
+@compute @workgroup_size(R)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let nv = p[0].x;
+    let nk = p[0].y;
+    let rows = p[1].x;
+    let h = wg.x / (DK / R);
+    let i = (wg.x % (DK / R)) * R + li;
+    let hk = h % nk;
+    let ch = 2u * nk * DK + nv * DK;
+    let base = (h * DK + i) * DK4;
+    let bg0 = rows * nk * 2u * DK;
+ROW_LOAD
+    for (var c = li; c < 2u * DK4; c += R) { qks[c] = qk4[hk * 2u * DK4 + c]; }
+    workgroupBarrier();
+    for (var t = 0u; t < rows; t++) {
+        let cur = (t % 2u) * 2u * DK4;
+        let ks = cur + DK4;
+        // the next token's q and k loaded now, stored once this one's are used
+        let more = t + 1u < rows;
+        let o4 = ((t + 1u) * nk + hk) * 2u * DK4;
+        var pre0 = vec4<f32>(0.0);
+        var pre1 = vec4<f32>(0.0);
+        if (more && li < 2u * DK4) { pre0 = qk4[o4 + li]; }
+        if (more && li + R < 2u * DK4) { pre1 = qk4[o4 + li + R]; }
+        let bt = qk[bg0 + (t * nv + h) * 2u];
+        let g = qk[bg0 + (t * nv + h) * 2u + 1u];
+        var ka = vec4<f32>(0.0);
+        var kb = vec4<f32>(0.0);
+ROW_KV
+        let kd = ka + kb;
+        let kv = (kd.x + kd.y + kd.z + kd.w) * g;
+        let delta = (cv[t * ch + 2u * nk * DK + h * DK + i] - kv) * bt;
+        var qa = vec4<f32>(0.0);
+        var qb = vec4<f32>(0.0);
+ROW_UPDATE
+        let qd = qa + qb;
+        out[t * nv * DK + h * DK + i] = qd.x + qd.y + qd.z + qd.w;
+        let nxt = 2u * DK4 - cur;
+        if (more && li < 2u * DK4) { qks[nxt + li] = pre0; }
+        if (more && li + R < 2u * DK4) { qks[nxt + li + R] = pre1; }
+        workgroupBarrier();
+    }
+ROW_STORE
+}
+"#;
+
+/// [`DELTA_NET_SCAN`] for heads `dk` wide, `r` rows a workgroup: the row's `dk / 4` vectors and their code.
+fn delta_net_scan(dk: usize, r: usize) -> String {
+    let n = dk / 4;
+    let load: String = (0..n).map(|c| format!("    var sr{c} = st[base + {c}u];\n")).collect();
+    let kv: String = (0..n).map(|c| format!("        {} += sr{c} * qks[ks + {c}u];\n", if c % 2 == 0 { "ka" } else { "kb" })).collect();
+    let update: String = (0..n).map(|c| format!("        sr{c} = sr{c} * g + delta * qks[ks + {c}u];\n        {} += sr{c} * qks[cur + {c}u];\n", if c % 2 == 0 { "qa" } else { "qb" })).collect();
+    let store: String = (0..n).map(|c| format!("    st[base + {c}u] = sr{c};\n")).collect();
+    DELTA_NET_SCAN
+        .replace("DK_VALUE", &dk.to_string())
+        .replace("R_VALUE", &r.to_string())
+        .replace("ROW_LOAD\n", &load)
+        .replace("ROW_KV\n", &kv)
+        .replace("ROW_UPDATE\n", &update)
+        .replace("ROW_STORE\n", &store)
+}
+
+/// The third: each token's state read by q RMS-normed over its head and gated as [`DELTA_NET`]'s, a workgroup a
+/// (value head, token), in place.
+const DELTA_NET_NORM: &str = r#"
+@group(0) @binding(1) var<storage, read> zz: array<f32>;
+@group(0) @binding(5) var<storage, read> nm: array<f32>;
+@group(0) @binding(7) var<storage, read_write> out: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+const DK: u32 = DK_VALUEu;
+
+var<workgroup> red: array<f32, DK>;
+
+@compute @workgroup_size(DK)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) i: u32) {
+    let nv = p[0].x;
+    let eps = bitcast<f32>(p[1].z);
+    let sig = p[1].w;
+    let o = (wg.y * nv + wg.x) * DK + i;
+    let core = out[o];
+    red[i] = core * core;
+    workgroupBarrier();
+    for (var s = DK / 2u; s > 0u; s /= 2u) {
+        if (i < s) { red[i] += red[i + s]; }
+        workgroupBarrier();
+    }
+    let inv = 1.0 / sqrt(red[0] / f32(DK) + eps);
+    let zv = zz[o];
+    var gate = zv / (1.0 + exp(-zv));
+    if (sig != 0u) { gate = 1.0 / (1.0 + exp(-zv)); }
+    out[o] = core * inv * nm[i] * gate;
 }
 "#;
 
@@ -2125,6 +2349,31 @@ impl Recorder<'_> {
         true
     }
 
+    /// [`ChainRecorder::delta_net`] for a prompt's rows ([`DELTA_NET_PREP`], [`DELTA_NET_SCAN`], [`DELTA_NET_NORM`]):
+    /// every token's q, k and gates at once, then the recurrence a thread a state's row, then every token's norm.
+    #[allow(clippy::too_many_arguments)]
+    fn delta_net_rows(&mut self, conv: &DeviceVec, z: &DeviceVec, beta_alpha: &DeviceVec, ssm_a: &DeviceVec, dt_bias: &DeviceVec, norm: &DeviceVec, state: &DeviceVec, out: &DeviceVec, d: &DeltaNet, words: &[u32]) {
+        let names: [&'static str; 3] = match d.k_dim {
+            32 => ["chain-delta-net-prep-32", "chain-delta-net-scan-32", "chain-delta-net-norm-32"],
+            64 => ["chain-delta-net-prep-64", "chain-delta-net-scan-64", "chain-delta-net-norm-64"],
+            128 => ["chain-delta-net-prep-128", "chain-delta-net-scan-128", "chain-delta-net-norm-128"],
+            other => panic!("chain: a delta net of heads of {other}"),
+        };
+        let dk = d.k_dim;
+        let qk = self.scratch(d.rows * d.k_heads * 2 * dk + d.rows * d.v_heads * 2);
+        let dd = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        // a workgroup a warp's 32 rows (more of them than of heads: 0.32 ms a layer of Qwen3.8 27B's for 512 tokens,
+        // as a head's 128; 64 0.44)
+        let r = 32;
+        let size = |s: &str| s.replace("DK_VALUE", &dk.to_string());
+        let rows = d.rows as u32;
+        self.dispatch_wide(names[0], &size(DELTA_NET_PREP), [buffer(conv), &dd, buffer(beta_alpha), buffer(ssm_a), buffer(dt_bias), &dd, buffer(&qk), &drw], words, (d.k_heads as u32, rows, 1));
+        let groups = (d.v_heads * dk / r) as u32;
+        self.dispatch_wide(names[1], &delta_net_scan(dk, r), [buffer(&qk), buffer(conv), buffer(&qk), &dd, &dd, &dd, buffer(state), buffer(out)], words, (groups, 1, 1));
+        self.dispatch_wide(names[2], &size(DELTA_NET_NORM), [&dd, buffer(z), &dd, &dd, &dd, buffer(norm), &drw, buffer(out)], words, (d.v_heads as u32, rows, 1));
+    }
+
     /// `y[r] = W x[r]` as [`ChainRecorder::matmul_rows`] through the f32 kernels alone: the decode kernel for one row, the
     /// one-row kernel for a few, the tiled one for a prompt.
     pub(crate) fn matmul_rows_f32(&mut self, w: &QuantizedTensor, x: &DeviceVec, y: &DeviceVec, m: usize) {
@@ -2568,7 +2817,17 @@ impl ChainRecorder for Recorder<'_> {
     fn ssm_conv(&mut self, qkv: &DeviceVec, weight: &DeviceVec, state: &DeviceVec, out: &DeviceVec, rows: usize, channels: usize, kernel: usize) {
         assert!((2..=8).contains(&kernel) && qkv.len >= rows * channels && weight.len >= channels * kernel && state.len >= (kernel - 1) * channels && out.len >= rows * channels, "chain: a conv of {kernel} over {rows} rows of {channels}");
         let q = buffer(qkv);
-        self.dispatch_wide("chain-ssm-conv", SSM_CONV, [q, buffer(weight), q, q, q, q, buffer(state), buffer(out)], &[channels as u32, rows as u32, kernel as u32], ((channels as u32).div_ceil(256), 1, 1));
+        let words = [channels as u32, rows as u32, kernel as u32];
+        let groups = (channels as u32).div_ceil(256);
+        // a prompt's a thread a (channel, token) where the thread a channel walked its tokens (0.26 ms of a 27B's
+        // layer for 512), then the state; a step's and a check's as they were
+        if rows >= 16 && rows <= 65535 {
+            let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
+            self.dispatch_wide("chain-ssm-conv-rows", SSM_CONV_ROWS, [q, buffer(weight), buffer(state), &d, &d, &d, &drw, buffer(out)], &words, (groups, rows as u32, 1));
+            self.dispatch_wide("chain-ssm-conv-state", SSM_CONV_STATE, [q, &d, &d, &d, &d, &d, buffer(state), &drw], &words, (groups, 1, 1));
+            return;
+        }
+        self.dispatch_wide("chain-ssm-conv", SSM_CONV, [q, buffer(weight), q, q, q, q, buffer(state), buffer(out)], &words, (groups, 1, 1));
     }
 
     fn delta_net(&mut self, conv: &DeviceVec, z: &DeviceVec, beta_alpha: &DeviceVec, ssm_a: &DeviceVec, dt_bias: &DeviceVec, norm: &DeviceVec, state: &DeviceVec, out: &DeviceVec, d: DeltaNet) {
@@ -2588,8 +2847,13 @@ impl ChainRecorder for Recorder<'_> {
             "chain: a delta net's buffers"
         );
         let words = [d.v_heads as u32, d.k_heads as u32, d.k_dim as u32, d.v_dim as u32, d.rows as u32, d.scale_q.to_bits(), d.eps.to_bits(), d.sigmoid_gate as u32];
-        let source = DELTA_NET.replace("DK_VALUE", &d.k_dim.to_string());
-        self.dispatch_wide(name, &source, [buffer(conv), buffer(z), buffer(beta_alpha), buffer(ssm_a), buffer(dt_bias), buffer(norm), buffer(state), buffer(out)], &words, (d.v_heads as u32, 1, 1));
+        // a prompt's in three passes (the recurrence's alone in turn); a step's and a check's few rows the one kernel
+        // (a check's rows a step's bit for bit)
+        if d.rows >= 16 && d.k_dim >= 32 && d.v_heads % d.k_heads == 0 {
+            self.delta_net_rows(conv, z, beta_alpha, ssm_a, dt_bias, norm, state, out, &d, &words);
+            return;
+        }
+        self.dispatch_wide(name, &delta_net_one(d.k_dim), [buffer(conv), buffer(z), buffer(beta_alpha), buffer(ssm_a), buffer(dt_bias), buffer(norm), buffer(state), buffer(out)], &words, (d.v_heads as u32, 1, 1));
     }
 
     fn rope_rows(&mut self, x: &DeviceVec, rows: usize, heads: usize, head_dim: usize, table: &DeviceVec, neox: bool) {
@@ -3111,12 +3375,13 @@ mod tests {
 
     /// A gated delta net's conv and recurrence give the host's answer (`Backend::delta_net_step`, the CPU's): the
     /// output, the conv state and the recurrent state after a decode step and after a run of tokens, from states the
-    /// host made, at a small shape and at Qwen3.8 27B's (48 value heads on 16 key heads of 128).
+    /// host made, at a small shape and at Qwen3.8 27B's (48 value heads on 16 key heads of 128); runs of a few tokens
+    /// (one kernel) and of a prompt's (three passes).
     #[test]
     fn a_delta_net_matches_the_hosts() {
         let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
         let cpu = ggml_rs::CpuBackend::new();
-        for (nv, nk, dim, kern, rows, sigmoid) in [(8usize, 4usize, 32usize, 4usize, 1usize, false), (8, 4, 32, 4, 7, true), (48, 16, 128, 4, 1, false), (48, 16, 128, 4, 5, true)] {
+        for (nv, nk, dim, kern, rows, sigmoid) in [(8usize, 4usize, 32usize, 4usize, 1usize, false), (8, 4, 32, 4, 7, true), (48, 16, 128, 4, 1, false), (48, 16, 128, 4, 5, true), (8, 4, 32, 4, 37, false), (48, 16, 128, 4, 100, true), (32, 16, 128, 4, 64, false)] {
             let ch = 2 * nk * dim + nv * dim;
             let mut next = rng((nv * 31 + rows) as u32);
             let mut vals = |n: usize, s: f32| (0..n).map(|_| next() * s).collect::<Vec<f32>>();
@@ -3176,6 +3441,45 @@ mod tests {
             let state = b.alias(&state_d, vec![nv, dim, dim]);
             close(state.to_host().data(), state_c.data(), &format!("{what}: the state"));
             assert!(b.aliased(&state).is_some_and(|v| Arc::ptr_eq(&v.inner, &state_d.inner)));
+        }
+    }
+
+    /// What a prompt's delta net takes (`--ignored --nocapture`): Qwen3.8 27B's (48 value heads on 16 key heads of 128)
+    /// for 512 tokens, as one kernel and in three passes.
+    #[test]
+    #[ignore = "a measurement"]
+    fn measure_delta_net_rows() {
+        let Ok(b) = WgpuBackend::new(Some(2 << 30)) else { return };
+        let (nv, nk, dim, rows) = (48usize, 16usize, 128usize, 512usize);
+        let ch = 2 * nk * dim + nv * dim;
+        let mut next = rng(3);
+        let mut up = |n: usize, s: f32| {
+            let v = b.vec(n);
+            DeviceChain::upload(&b, &v, &(0..n).map(|_| next() * s).collect::<Vec<f32>>());
+            v
+        };
+        let (cv, z, ba, a, dt, nm, state, out) = (up(rows * ch, 1.0), up(rows * nv * dim, 1.0), up(rows * 2 * nv, 2.0), up(nv, 1.0), up(nv, 1.0), up(dim, 1.0), up(nv * dim * dim, 0.1), up(rows * nv * dim, 0.0));
+        let d = DeltaNet { rows, v_heads: nv, k_heads: nk, k_dim: dim, v_dim: dim, scale_q: 1.0 / (dim as f32).sqrt(), eps: 1e-6, sigmoid_gate: false };
+        let words = [nv as u32, nk as u32, dim as u32, dim as u32, rows as u32, d.scale_q.to_bits(), d.eps.to_bits(), 0];
+        for three in [false, true] {
+            let run = || {
+                let mut rec = Recorder::new(&b);
+                for _ in 0..4 {
+                    if three {
+                        rec.delta_net_rows(&cv, &z, &ba, &a, &dt, &nm, &state, &out, &d, &words);
+                    } else {
+                        rec.dispatch_wide("chain-delta-net-128", &delta_net_one(dim), [buffer(&cv), buffer(&z), buffer(&ba), buffer(&a), buffer(&dt), buffer(&nm), buffer(&state), buffer(&out)], &words, (nv as u32, 1, 1));
+                    }
+                }
+                rec.read_range(&out, 0, 1);
+                Box::new(rec).finish();
+            };
+            run();
+            let t = std::time::Instant::now();
+            for _ in 0..3 {
+                run();
+            }
+            eprintln!("{}: {:.3} ms a layer", if three { "three passes" } else { "one kernel" }, t.elapsed().as_secs_f64() / 12.0 * 1e3);
         }
     }
 
