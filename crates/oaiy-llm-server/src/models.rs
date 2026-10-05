@@ -2339,6 +2339,58 @@ mod dense_webgpu_timing {
         }
     }
 
+    /// A Qwen3.5 hybrid's prompt run whole (its chain recording each chunk as the one before runs) answers as its
+    /// chunks run one call at a time: 2,148 tokens (QWEN35_MODEL), the last logits and 8 steps after bit for bit, and
+    /// how long each takes.
+    #[test]
+    #[ignore = "needs a WebGPU adapter and a Qwen3.5 GGUF (QWEN35_MODEL); run with --nocapture"]
+    fn a_qwen35_prompt_run_whole_answers_as_its_chunks_one_at_a_time() {
+        use std::sync::Arc;
+        let path = std::env::var("QWEN35_MODEL").unwrap_or_else(|_| r"E:\models\Qwen3.8-27B-Q3_K_M.gguf".into());
+        let Ok(b) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
+        let backend: Arc<dyn ggml_rs::Backend> = Arc::new(b);
+        let gguf = gguf::GgufFile::open(&path).unwrap();
+        let model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap();
+        let llama_rs::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
+        let tokens: Vec<u32> = (0..2148u32).map(|i| 1000 + (i * 7919) % 20000).collect();
+        let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+        let mut results = Vec::new();
+        for round in 0..2 {
+            for whole in [false, true] {
+                let mut kv = model.new_kv_cache(4096);
+                let t = std::time::Instant::now();
+                let last = if whole {
+                    let e = m.embed_text(&tokens).to_host();
+                    m.forward_embeds_positions(&e, tokens.len(), &mut kv, None).unwrap().to_host()
+                } else {
+                    let mut l = None;
+                    for chunk in tokens.chunks(512) {
+                        let e = m.embed_text(chunk).to_host();
+                        l = Some(m.forward_embeds_positions(&e, chunk.len(), &mut kv, None).unwrap().to_host());
+                    }
+                    l.unwrap()
+                };
+                let secs = t.elapsed().as_secs_f64();
+                let mut next = argmax(last.data());
+                let mut steps = Vec::new();
+                for _ in 0..8 {
+                    let e = m.embed_text(&[next]);
+                    let l = m.forward_embeds_positions(&e, 1, &mut kv, None).unwrap().to_host();
+                    next = argmax(l.data());
+                    steps.push(bits(l.data()));
+                }
+                eprintln!("round {round}, {}: {} tokens in {:.0} ms ({:.0} tokens a second)", if whole { "whole" } else { "a chunk a call" }, tokens.len(), secs * 1e3, tokens.len() as f64 / secs);
+                results.push((bits(last.data()), steps, kv.len));
+            }
+        }
+        for pair in results.chunks(2) {
+            assert_eq!(pair[0].2, pair[1].2, "the same rows in the caches");
+            assert!(pair[0].0 == pair[1].0, "the prompt's logits bit for bit");
+            assert!(pair[0].1 == pair[1].1, "the steps' logits after it bit for bit");
+        }
+    }
+
     /// Qwen3.5's hybrid chained on the GPU (QWEN35_MODEL: the 9B, or Qwen3.8 27B) answers as its host path does: the
     /// same prompt (QWEN35_PROMPT tokens, in chunks of 512 as the server sends them) then 64 greedy steps each way
     /// give the same tokens, every step's logits close; and the chain did run.

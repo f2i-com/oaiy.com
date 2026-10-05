@@ -330,6 +330,34 @@ fn adopt(chain: &dyn DeviceChain, pool: &mut DeviceVec, slot: &mut Option<Tensor
     v
 }
 
+/// A chained run gone to the GPU: its recording (its reads the logits, then each attention layer's rows), and where
+/// those rows go in the host's cache.
+pub(crate) struct Qwen35Run<'a> {
+    rec: Box<dyn ggml_rs::ChainRecorder + 'a>,
+    layers: Vec<usize>,
+    past: usize,
+    t: usize,
+    vocab: usize,
+}
+
+impl Qwen35Run<'_> {
+    /// Waited for: each row's logits (a check's every row's, else the last's), its K and V rows into the host's
+    /// cache, which the device's copy already holds.
+    fn finish(self, backend: &dyn Backend, kv: &mut KvCache) -> Vec<Tensor> {
+        let mut got = self.rec.finish().into_iter();
+        let logits = got.next().expect("the logits");
+        let logits: Vec<Tensor> = logits.chunks_exact(self.vocab).map(|l| Tensor::from_vec(l.to_vec(), vec![1, self.vocab])).collect();
+        let len = kv.len;
+        kv.len = self.past;
+        for (&l, rows) in self.layers.iter().zip(got) {
+            kv.append_rows(backend, l, &rows, self.t);
+        }
+        kv.len = len;
+        kv.dirty_from = usize::MAX;
+        logits
+    }
+}
+
 impl Qwen35Chain {
     fn state(&self, m: &Qwen35Model) -> Option<&State> {
         self.state
@@ -503,17 +531,23 @@ impl Qwen35Chain {
             embeds.data()
         };
         let s = st.dims;
-        let mut logits = None;
+        let backend: &dyn Backend = &*m.backend;
+        // each chunk recorded and gone to the GPU as the chunk before runs, the chunk before's rows read back and
+        // into the host's cache as this one runs
+        let mut pending: Option<Qwen35Run<'_>> = None;
         let mut at = 0;
         while at < rows {
             // a chunk's rows, as many as the attention's scratch has room for over the positions they reach
             let runs = (kv.len + rows).div_ceil(256).max(1);
             let per_row = (s.n_h * runs * (s.hd + 2) + s.n_h * s.hd) * 4;
             let t = (ATTENTION_SCRATCH / per_row).clamp(1, MAX_ROWS).min(rows - at);
-            logits = Some(self.run(m, st, chain, &emb[at * s.d..(at + t) * s.d], t, kv, false).pop().expect("the logits"));
+            let run = self.run_begin(m, st, chain, &emb[at * s.d..(at + t) * s.d], t, kv, false);
+            if let Some(p) = pending.replace(run) {
+                p.finish(backend, kv);
+            }
             at += t;
         }
-        logits
+        pending.map(|p| p.finish(backend, kv).pop().expect("the logits"))
     }
 
     /// Whether the chain drafts and checks tokens (the model's multi-token-prediction layer on the device).
@@ -567,9 +601,15 @@ impl Qwen35Chain {
     /// One submit of `t` rows: the last row's logits, or (a check) every row's.
     #[allow(clippy::too_many_arguments)]
     fn run(&self, m: &Qwen35Model, st: &State, chain: &dyn DeviceChain, emb: &[f32], t: usize, kv: &mut KvCache, checking: bool) -> Vec<Tensor> {
+        self.run_begin(m, st, chain, emb, t, kv, checking).finish(&*m.backend, kv)
+    }
+
+    /// [`Self::run`] up to its wait: its work gone to the GPU, `kv` committed (its rows the device's copy's; into
+    /// the host's cache at the finish).
+    #[allow(clippy::too_many_arguments)]
+    fn run_begin<'a>(&self, m: &Qwen35Model, st: &State, chain: &'a dyn DeviceChain, emb: &[f32], t: usize, kv: &mut KvCache, checking: bool) -> Qwen35Run<'a> {
         let s = st.dims;
         let cfg = &m.config;
-        let backend: &dyn Backend = &*m.backend;
         let (kvd, row) = (s.n_kv * s.hd, 2 * s.n_kv * s.hd);
         let past = kv.len;
         let eps = cfg.rms_eps;
@@ -703,17 +743,11 @@ impl Qwen35Chain {
         for slot in 0..st.attention_layers.len() {
             rec.read_range(&g.layers[slot], past * row, t * row);
         }
-        let mut got = rec.finish().into_iter();
-        let logits = got.next().expect("the logits");
-        let logits: Vec<Tensor> = logits.chunks_exact(s.vocab).map(|l| Tensor::from_vec(l.to_vec(), vec![1, s.vocab])).collect();
-        // the run's K and V rows into the host's cache too, which the copy already holds
-        for (&l, rows) in st.attention_layers.iter().zip(got) {
-            kv.append_rows(backend, l, &rows, t);
-        }
+        rec.flush();
         kv.commit(t);
         kv.dirty_from = usize::MAX;
         self.runs.fetch_add(1, Ordering::Relaxed);
-        logits
+        Qwen35Run { rec, layers: st.attention_layers.clone(), past, t, vocab: s.vocab }
     }
 
     /// The prediction layer's cache at a prompt's chunk (`t` rows at `past`, its embeddings `emb`, its hidden states

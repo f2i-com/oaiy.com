@@ -386,6 +386,22 @@ impl Hybrid {
             }
             return last.ok_or_else(|| "no chunk to run".to_string());
         }
+        // the Qwen3.5 hybrid's as one run (its chain records each chunk as the one before runs)
+        if let (Self::Qwen35(Model::Qwen35(_)), true) = (self, chunks.len() > 1) {
+            let width = self.width();
+            let rows: usize = chunks.iter().map(|(t, _)| t.len()).sum();
+            let mut emb = Vec::with_capacity(rows * width);
+            let mut tokens = Vec::with_capacity(rows);
+            for (t, e) in chunks {
+                emb.extend_from_slice(e.data());
+                tokens.extend_from_slice(t);
+            }
+            let out = self.forward(&tokens, Tensor::from_vec(emb, vec![rows, width]), kv, None)?;
+            for i in 0..chunks.len() {
+                done(i);
+            }
+            return Ok(out);
+        }
         let mut last = None;
         for (i, (t, e)) in chunks.iter().enumerate() {
             last = Some(self.forward(t, e.clone(), kv, None)?);
@@ -393,13 +409,14 @@ impl Hybrid {
         }
         last.ok_or_else(|| "no chunk to run".to_string())
     }
-    /// Whether a prompt's chunks go to [`Self::forward_chunks`] together.
+    /// Whether a prompt's chunks go to [`Self::forward_chunks`] together: Flash-Next over several GPUs, a chained
+    /// Qwen3.5 hybrid.
     fn pipelines(&self) -> bool {
         #[cfg(any(feature = "cuda", feature = "webgpu"))]
         if let Self::Flash(f) = self {
             return f.devices_len() > 1;
         }
-        false
+        matches!(self, Self::Qwen35(Model::Qwen35(m)) if m.backend.chain().is_some())
     }
     /// Run `tokens` (embedded as `embeds`, on the host) after what `kv` holds: the last logits, on the host.
     fn forward(&self, tokens: &[u32], embeds: Tensor, kv: &mut KvCache, positions: Option<&[[u32; 3]]>) -> Result<Tensor, String> {
@@ -574,27 +591,20 @@ impl QwenEngine {
                 logits = Some(hybrid.forward_chunks(&chunks, &mut self.kv, &mut done)?);
                 self.covered.extend_from_slice(&keys[pos..stop]);
                 pos = stop;
-                if stops.contains(&pos) && !self.checkpoints.iter().any(|(saved, _, _)| saved == &keys[..pos]) {
-                    if self.log { eprintln!("  Qwen checkpoint: {pos} tokens; disk={}", self.disk.is_some()); }
-                    let base = stops.first() == Some(&pos);
-                    let snap = RecurrentSnapshot::capture(&self.kv);
-                    self.checkpoints.push((keys[..pos].to_vec(), snap, base));
-                    trim_checkpoints(&mut self.checkpoints);
+            } else {
+                let end = (pos+PREFILL_CHUNK).min(keys.len()).min(stops.iter().copied().find(|&s| s > pos).unwrap_or(keys.len()));
+                let mut embeds = hybrid.embed(&job.prompt[pos..end])?;
+                let width = hybrid.width();
+                for (at,t) in &soft {
+                    let from = pos.max(*at); let to = end.min(*at+t.dim(0));
+                    if from < to { embeds.data_mut()[(from-pos)*width..(to-pos)*width].copy_from_slice(&t.data()[(from-at)*width..(to-at)*width]); }
                 }
-                continue;
+                let out = hybrid.forward(&job.prompt[pos..end], embeds, &mut self.kv, (!job.images.is_empty()).then_some(&positions[pos..end]))?;
+                logits = Some(out);
+                self.covered.extend_from_slice(&keys[pos..end]);
+                let _ = job.events.send(Event::Progress { done: end-start, total });
+                pos = end;
             }
-            let end = (pos+PREFILL_CHUNK).min(keys.len()).min(stops.iter().copied().find(|&s| s > pos).unwrap_or(keys.len()));
-            let mut embeds = hybrid.embed(&job.prompt[pos..end])?;
-            let width = hybrid.width();
-            for (at,t) in &soft {
-                let from = pos.max(*at); let to = end.min(*at+t.dim(0));
-                if from < to { embeds.data_mut()[(from-pos)*width..(to-pos)*width].copy_from_slice(&t.data()[(from-at)*width..(to-at)*width]); }
-            }
-            let out = hybrid.forward(&job.prompt[pos..end], embeds, &mut self.kv, (!job.images.is_empty()).then_some(&positions[pos..end]))?;
-            logits = Some(out);
-            self.covered.extend_from_slice(&keys[pos..end]);
-            let _ = job.events.send(Event::Progress { done: end-start, total });
-            pos = end;
             if stops.contains(&pos) && !self.checkpoints.iter().any(|(saved, _, _)| saved == &keys[..pos]) {
                 if self.log { eprintln!("  Qwen checkpoint: {pos} tokens; disk={}", self.disk.is_some()); }
                 let base = stops.first() == Some(&pos);

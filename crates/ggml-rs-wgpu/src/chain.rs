@@ -2087,7 +2087,7 @@ impl DeviceChain for WgpuBackend {
     }
 
     fn begin(&self) -> Box<dyn ChainRecorder + '_> {
-        Box::new(Recorder { backend: self, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new() })
+        Box::new(Recorder { backend: self, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None })
     }
 }
 
@@ -2208,7 +2208,7 @@ impl<'a> Recorder<'a> {
     /// A recording on `backend`, its bind groups kept (the crate's own measurements record kernels directly).
     #[cfg(test)]
     pub(crate) fn new(backend: &'a WgpuBackend) -> Self {
-        Recorder { backend, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new() }
+        Recorder { backend, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None }
     }
 }
 
@@ -2258,6 +2258,10 @@ pub(crate) struct Recorder<'a> {
     /// as it is (each its command buffer, submitted in turn when it is let go).
     hold: bool,
     held: Vec<wgpu::CommandBuffer>,
+    /// The reads copied out by a flush (the first so many of `reads`), and that flush's submission: a recording
+    /// waits for its own work, not what went after it (the next chunk's).
+    copied: usize,
+    flushed: Option<wgpu::SubmissionIndex>,
 }
 
 impl Recorder<'_> {
@@ -2812,13 +2816,24 @@ impl ChainRecorder for Recorder<'_> {
     }
 
     fn flush(&mut self) {
-        // let go: what is held, then what is left
+        // let go: what is held, then what is left, then the reads so far copied out after them
         self.hold = false;
         let held = std::mem::take(&mut self.held);
         if !held.is_empty() {
             self.gpu().queue.submit(held);
         }
         self.submit_piece();
+        if crate::profile::chain_on() {
+            return;
+        }
+        let mut enc = self.gpu().device.create_command_encoder(&Default::default());
+        for (from, offset, staging, len) in &self.reads[self.copied..] {
+            if *len > 0 {
+                enc.copy_buffer_to_buffer(from, (*offset * 4) as u64, staging, 0, (*len * 4) as u64);
+            }
+        }
+        self.copied = self.reads.len();
+        self.flushed = Some(self.gpu().queue.submit([enc.finish()]));
     }
 
     fn exl3_rows(&mut self, w: &dyn ggml_rs::exl3::PackedLinear, x: &DeviceVec, y: &DeviceVec, rows: usize) {
@@ -3158,25 +3173,32 @@ impl ChainRecorder for Recorder<'_> {
                 pass.dispatch_workgroups(*x, *y, *z);
             }
         }
-        for (from, offset, staging, len) in &self.reads {
+        for (from, offset, staging, len) in &self.reads[self.copied..] {
             if *len > 0 {
                 enc.copy_buffer_to_buffer(from, (*offset * 4) as u64, staging, 0, (*len * 4) as u64);
             }
         }
+        // nothing recorded since a flush: its submission the one waited for
+        let since = !self.dispatches.is_empty() || !self.held.is_empty() || self.copied < self.reads.len() || stamps.is_some();
         let command = enc.finish();
         crate::profile::add(&crate::profile::CHAIN_ENCODE, start);
         let submitted = std::time::Instant::now();
         // (a held recording's pieces first, in turn)
         let mut commands = std::mem::take(&mut self.held);
         commands.push(command);
-        self.gpu().queue.submit(commands);
+        let index = match self.flushed.take() {
+            Some(index) if !since => index,
+            _ => self.gpu().queue.submit(commands),
+        };
         for (_, _, staging, len) in &self.reads {
             staging.slice(..(*len as u64 * 4).max(4)).map_async(wgpu::MapMode::Read, |_| {});
         }
         if let Some((staging, _)) = &stamps {
             staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
         }
-        self.gpu().device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).expect("webgpu: device lost while waiting for a chain");
+        // this recording's work waited for, not what was submitted after it (the next chunk's, as this one's rows
+        // are read)
+        self.gpu().device.poll(wgpu::PollType::Wait { submission_index: Some(index), timeout: None }).expect("webgpu: device lost while waiting for a chain");
         crate::profile::add(&crate::profile::CHAIN_WAIT, submitted);
         let pooled = std::mem::take(&mut self.pooled);
         self.gpu().unpool(pooled);
@@ -4598,7 +4620,7 @@ fn main() {
         for m in [1usize, 2, 3, 4] {
             let (x, y, y8) = (b.vec(m * k), b.vec(m * n), b.vec(m * n));
             DeviceChain::upload(&b, &x, &(0..m * k).map(|_| next()).collect::<Vec<_>>());
-            let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new() };
+            let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None };
             assert!(rq.matmul_rows_q8(w, &x, &y8, m));
             rq.read(&y8);
             let got = Box::new(rq).finish().pop().unwrap();
@@ -4614,7 +4636,7 @@ fn main() {
             let reps = 28;
             let time = |q8: bool| {
                 let run = || {
-                    let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new() };
+                    let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None };
                     for i in 0..reps {
                         let w = &ws[i % ws.len()];
                         if q8 {
@@ -4760,7 +4782,7 @@ fn main() {
                 let pipeline = b.gpu.named_pipeline(Box::leak(format!("test-rb-{dtype:?}-{r}-{ks}").into_boxed_str()), || src);
                 let reps = 32;
                 let run = || {
-                    let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new() };
+                    let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None };
                     for i in 0..reps {
                         let q = ws[i % ws.len()].device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).unwrap();
                         for (chunk, row0, rows) in &q.chunks {
@@ -4820,7 +4842,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) n
             let pipeline = b.gpu.named_pipeline(name, || body);
             let groups = 170 * 16;
             let run = || {
-                let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new() };
+                let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None };
                 for _ in 0..8 {
                     rq.dispatch_kept(&pipeline, buffer(&src), buffer(&src), buffer(&out), &[(len / 4) as u32], (groups, 1, 1));
                 }
