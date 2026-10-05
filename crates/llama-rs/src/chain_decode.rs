@@ -13,12 +13,54 @@ use crate::config::ModelConfig;
 use crate::kv_cache::KvCache;
 use crate::loader::{CommonTensors, FfnPair, Weight};
 
-/// A dense model's tensors as a chained step reads them.
+/// A dense model's tensors as a chained step reads them, and what its layers do that Llama's do not.
 pub(crate) struct Dense<'a> {
     pub cfg: &'a ModelConfig,
     pub common: &'a CommonTensors,
-    /// Per-head norms of each layer's q and k before RoPE (Qwen3's), `[head_dim]` weights each.
+    /// Per-head norms of each layer's q and k before RoPE (Qwen3's, Gemma 3's), `[head_dim]` weights each.
     pub qk_norms: Option<Vec<(&'a Tensor, &'a Tensor)>>,
+    /// Norms of each layer's attention output and FFN output before their residuals (Gemma 3's).
+    pub post_norms: Option<Vec<(&'a Tensor, &'a Tensor)>>,
+    /// The FFN's gate through the tanh GELU (Gemma's GeGLU), else SiLU.
+    pub gelu: bool,
+    /// The embedding times this (Gemma's `sqrt(d)`).
+    pub embed_scale: Option<f32>,
+    /// Each layer's RoPE base, its per-frequency divisors and its sliding window (Gemma 3's local and global layers);
+    /// empty: the config's base for every layer, unscaled, no window.
+    pub layers: Vec<(f32, Option<&'a [f32]>, Option<usize>)>,
+    /// The logits through `tanh(l / c) * c`.
+    pub softcap: Option<f32>,
+}
+
+impl<'a> Dense<'a> {
+    /// A model whose layers are Llama's.
+    pub fn plain(cfg: &'a ModelConfig, common: &'a CommonTensors) -> Dense<'a> {
+        Dense { cfg, common, qk_norms: None, post_norms: None, gelu: false, embed_scale: None, layers: Vec::new(), softcap: None }
+    }
+
+    /// Layer `l`'s RoPE base, divisors and window.
+    fn layer(&self, l: usize) -> (f32, Option<&'a [f32]>, Option<usize>) {
+        self.layers.get(l).copied().unwrap_or((self.cfg.rope_theta, None, None))
+    }
+
+    /// The distinct RoPEs of the layers (base and divisors), and each layer's among them.
+    fn ropes(&self) -> (Vec<(f32, Option<&'a [f32]>)>, Vec<usize>) {
+        let mut distinct: Vec<(f32, Option<&'a [f32]>)> = Vec::new();
+        let which = (0..self.cfg.n_layers)
+            .map(|l| {
+                let (theta, factors, _) = self.layer(l);
+                let same = |(t, f): &(f32, Option<&[f32]>)| t.to_bits() == theta.to_bits() && f.map(|f| f.as_ptr()) == factors.map(|f| f.as_ptr());
+                match distinct.iter().position(same) {
+                    Some(i) => i,
+                    None => {
+                        distinct.push((theta, factors));
+                        distinct.len() - 1
+                    }
+                }
+            })
+            .collect();
+        (distinct, which)
+    }
 }
 
 /// The chained step's state on the device, made at the first step that can use one; None when the backend has no chain
@@ -46,7 +88,10 @@ struct ChainKv {
 
 struct ChainState {
     kv: Mutex<ChainKv>,
-    rope_table: DeviceVec,
+    /// A sine-and-cosine table a distinct RoPE of the layers.
+    rope_tables: Vec<DeviceVec>,
+    /// Gemma 3's norms of a layer's attention and FFN outputs.
+    post_norms: Option<Vec<(DeviceVec, DeviceVec)>>,
     attn_norms: Vec<DeviceVec>,
     ffn_norms: Vec<DeviceVec>,
     /// Qwen3's per-head q and k norms, a layer's each.
@@ -62,6 +107,8 @@ struct ChainState {
     qn: DeviceVec,
     kn: DeviceVec,
     proj: DeviceVec,
+    /// a projection's output normed (Gemma 3's post norms)
+    proj_n: DeviceVec,
     gate_up: DeviceVec,
     act: DeviceVec,
     logits: DeviceVec,
@@ -107,7 +154,8 @@ impl ChainDecoder {
                 let (d, qd, kvd) = (cfg.embedding_dim, cfg.n_heads * cfg.head_dim, cfg.n_kv_heads * cfg.head_dim);
                 Some(ChainState {
                     kv: Mutex::new(ChainKv { layers: Vec::new(), cap: 0, out: chain.vec(1), owner: 0 }),
-                    rope_table: chain.vec(cfg.head_dim),
+                    rope_tables: m.ropes().0.iter().map(|_| chain.vec(cfg.head_dim)).collect(),
+                    post_norms: m.post_norms.as_ref().map(|norms| norms.iter().map(|(a, f)| (upload(a), upload(f))).collect()),
                     attn_norms: m.common.blocks.iter().map(|b| upload(&b.attn_norm)).collect(),
                     ffn_norms: m.common.blocks.iter().map(|b| upload(&b.ffn_norm)).collect(),
                     qk_norms: m.qk_norms.as_ref().map(|norms| norms.iter().map(|(q, k)| (upload(q), upload(k))).collect()),
@@ -120,6 +168,7 @@ impl ChainDecoder {
                     qn: chain.vec(qd),
                     kn: chain.vec(kvd),
                     proj: chain.vec(d),
+                    proj_n: chain.vec(d),
                     gate_up: chain.vec(2 * ff),
                     act: chain.vec(ff),
                     logits: chain.vec(cfg.vocab_size),
@@ -172,17 +221,24 @@ impl ChainDecoder {
             }
         }
         g.owner = kv.id;
-        let theta = cfg.rope_theta;
-        let table: Vec<f32> = (0..hd / 2)
-            .flat_map(|j| {
-                let (s, c) = (past as f32 * theta.powf(-2.0 * j as f32 / hd as f32) / 1.0).sin_cos();
-                [s, c]
-            })
-            .collect();
-        chain.upload(&st.rope_table, &table);
+        // each RoPE's sines and cosines at this position, as the CPU's rope makes them
+        let (ropes, rope_of) = m.ropes();
+        for ((theta, factors), table) in ropes.iter().zip(&st.rope_tables) {
+            let values: Vec<f32> = (0..hd / 2)
+                .flat_map(|j| {
+                    let factor = factors.map(|f| f[j]).unwrap_or(1.0);
+                    let (s, c) = (past as f32 * theta.powf(-2.0 * j as f32 / hd as f32) / factor).sin_cos();
+                    [s, c]
+                })
+                .collect();
+            chain.upload(table, &values);
+        }
         let neox = matches!(cfg.arch.rope_type(), ggml_rs::RopeType::NeoX);
         let emb = backend.embed_lookup(&m.common.tok_embd, &[token], cfg.embedding_dim);
-        let emb = if emb.is_device() { emb.to_host() } else { emb };
+        let mut emb = if emb.is_device() { emb.to_host() } else { emb };
+        if let Some(s) = m.embed_scale {
+            emb.data_mut().iter_mut().for_each(|v| *v *= s);
+        }
         chain.upload(&st.x, emb.data());
         let mut rec = chain.begin();
         for l in 0..cfg.n_layers {
@@ -199,19 +255,38 @@ impl ChainDecoder {
                 }
                 None => (&st.q, &st.k),
             };
-            rec.rope(q, n_h, hd, &st.rope_table, neox);
-            rec.rope(k, n_kv, hd, &st.rope_table, neox);
+            let table = &st.rope_tables[rope_of[l]];
+            rec.rope(q, n_h, hd, table, neox);
+            rec.rope(k, n_kv, hd, table, neox);
             rec.store(k, &g.layers[l], past * row);
             rec.store(&st.v, &g.layers[l], past * row + kvd);
-            rec.attention(q, &g.layers[l], &g.out, n_h, n_kv, hd, 0, past + 1, g.cap, scale);
+            // a sliding window sees the last `w` positions, as the CPU's attention does
+            let lo = m.layer(l).2.map_or(0, |w| (past + 1).saturating_sub(w));
+            rec.attention(q, &g.layers[l], &g.out, n_h, n_kv, hd, lo, past + 1, g.cap, scale);
             rec.matmul(quant(&b.attn_output), &g.out, &st.proj);
-            rec.add(&st.x, &st.proj);
+            match &st.post_norms {
+                Some(norms) => {
+                    rec.rmsnorm(&st.proj, &norms[l].0, &st.proj_n, cfg.rms_eps);
+                    rec.add(&st.x, &st.proj_n);
+                }
+                None => rec.add(&st.x, &st.proj),
+            }
             rec.rmsnorm(&st.x, &st.ffn_norms[l], &st.xn, cfg.rms_eps);
             let FfnPair::Fused(gu) = &b.ffn_pair else { unreachable!("the chain state checked the pair") };
             rec.matmul(quant(gu), &st.xn, &st.gate_up);
-            rec.silu_mul_split(&st.gate_up, &st.act);
+            if m.gelu {
+                rec.gelu_mul_split(&st.gate_up, &st.act);
+            } else {
+                rec.silu_mul_split(&st.gate_up, &st.act);
+            }
             rec.matmul(quant(&b.ffn_down), &st.act, &st.proj);
-            rec.add(&st.x, &st.proj);
+            match &st.post_norms {
+                Some(norms) => {
+                    rec.rmsnorm(&st.proj, &norms[l].1, &st.proj_n, cfg.rms_eps);
+                    rec.add(&st.x, &st.proj_n);
+                }
+                None => rec.add(&st.x, &st.proj),
+            }
         }
         rec.rmsnorm(&st.x, &st.output_norm, &st.xn, cfg.rms_eps);
         rec.matmul(quant(&m.common.output), &st.xn, &st.logits);
@@ -220,7 +295,10 @@ impl ChainDecoder {
             rec.read_range(&g.layers[l], past * row, row);
         }
         let mut got = rec.finish().into_iter();
-        let logits = got.next().expect("the logits");
+        let mut logits = got.next().expect("the logits");
+        if let Some(c) = m.softcap {
+            logits.iter_mut().for_each(|v| *v = (*v * (1.0 / c)).tanh() * c);
+        }
         // the step's K and V rows into the host's cache too, which the copy already holds
         for (l, kvrow) in got.enumerate() {
             let k = Tensor::from_vec(kvrow[..kvd].to_vec(), vec![1, n_kv, hd]);

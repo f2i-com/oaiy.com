@@ -1260,7 +1260,7 @@ mod dense_webgpu_timing {
         eprintln!("{steps} decode steps: {:.1} ms a step; {}", secs * 1e3 / steps as f64, ggml_rs_wgpu::profile::take_line());
     }
 
-    /// A decode step chained on the GPU (a Llama's or a Qwen3's: DENSE_MODEL) answers as the host path does: from the
+    /// A decode step chained on the GPU (a Llama's, a Qwen3's or a Gemma 3's: DENSE_MODEL) answers as the host path does: from the
     /// same prompt, 64 greedy steps each way give the same tokens, every step's logits close (cosine 0.9999 or more).
     #[test]
     #[ignore = "needs a WebGPU adapter and the 3B Llama GGUF (E:/models/llama-3.2-3b-q4_k_m.gguf, or DENSE_MODEL)"]
@@ -1275,7 +1275,8 @@ mod dense_webgpu_timing {
         let host = |t: &[u32], kv: &mut llama_rs::KvCache| match &model {
             llama_rs::Model::Llama(m) => m.forward_host(t, kv),
             llama_rs::Model::Qwen3(m) => m.forward_host(t, kv),
-            _ => panic!("a Llama or a Qwen3"),
+            llama_rs::Model::Gemma3(m) => m.forward_host(t, kv),
+            _ => panic!("a Llama, a Qwen3 or a Gemma 3"),
         };
         let n: u32 = std::env::var("DENSE_PROMPT").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
         let prompt: Vec<u32> = (0..n).map(|i| 1000 + (i * 7919) % 20000).collect();

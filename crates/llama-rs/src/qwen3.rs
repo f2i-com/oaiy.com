@@ -80,7 +80,7 @@ impl Qwen3Model {
         // VENDORED-LOCAL: a decode step chained on the device when the backend has one for this model.
         if tokens.len() == 1 {
             let norms = self.extras.iter().map(|e| (&e.attn_q_norm, &e.attn_k_norm)).collect();
-            let dense = crate::chain_decode::Dense { cfg: &self.config, common: &self.common, qk_norms: Some(norms) };
+            let dense = crate::chain_decode::Dense { qk_norms: Some(norms), ..crate::chain_decode::Dense::plain(&self.config, &self.common) };
             if let Some(logits) = self.chain.step(&*self.backend, &dense, tokens[0], kv) {
                 return logits;
             }

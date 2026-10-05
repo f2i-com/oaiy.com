@@ -57,6 +57,8 @@ pub trait ChainRecorder {
     fn add(&mut self, acc: &DeviceVec, y: &DeviceVec);
     /// `out = silu(fused[..ff]) * fused[ff..]`, `ff = out.len`.
     fn silu_mul_split(&mut self, fused: &DeviceVec, out: &DeviceVec);
+    /// `out = gelu_approx(fused[..ff]) * fused[ff..]` (the tanh approximation), `ff = out.len`.
+    fn gelu_mul_split(&mut self, fused: &DeviceVec, out: &DeviceVec);
     /// Rotate `x` (`[heads, head_dim]`) in place: pair `k` of each head by `table[2k]` (sine) and `table[2k + 1]`
     /// (cosine), the pairs `(2k, 2k + 1)` or with `neox` `(k, k + head_dim / 2)`.
     fn rope(&mut self, x: &DeviceVec, heads: usize, head_dim: usize, table: &DeviceVec, neox: bool);

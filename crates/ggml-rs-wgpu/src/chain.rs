@@ -81,6 +81,20 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+/// `y = gelu_approx(x[..ff]) * x[ff..]` (the tanh approximation, as the CPU's), `ff = p[0].x`.
+const GELU_MUL_SPLIT: &str = r#"
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x;
+    let ff = p[0].x;
+    if (i < ff) {
+        let g = x[i];
+        let inner = 0.7978845608028654 * (g + 0.044715 * g * g * g);
+        y[i] = 0.5 * g * (1.0 + tanh(inner)) * x[ff + i];
+    }
+}
+"#;
+
 /// RoPE in place on `y` (`[p[0].x heads, p[0].y head_dim]`): pair `k` by the sine `w[2k]` and cosine `w[2k + 1]`
 /// (made on the host, as the CPU's rope makes them), the pairs `(2k, 2k + 1)` or with `p[0].z` `(k, k + half)`.
 const ROPE: &str = r#"
@@ -390,6 +404,11 @@ impl ChainRecorder for Recorder<'_> {
 
     fn silu_mul_split(&mut self, fused: &DeviceVec, out: &DeviceVec) {
         let pipeline = self.named("chain-silu-mul-split", SILU_MUL_SPLIT);
+        self.dispatch_kept(&pipeline, buffer(fused), buffer(fused), buffer(out), &[out.len as u32], ((out.len as u32).div_ceil(256), 1, 1));
+    }
+
+    fn gelu_mul_split(&mut self, fused: &DeviceVec, out: &DeviceVec) {
+        let pipeline = self.named("chain-gelu-mul-split", GELU_MUL_SPLIT);
         self.dispatch_kept(&pipeline, buffer(fused), buffer(fused), buffer(out), &[out.len as u32], ((out.len as u32).div_ceil(256), 1, 1));
     }
 

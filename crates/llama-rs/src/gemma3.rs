@@ -38,6 +38,8 @@ pub struct Gemma3Model {
     /// (`rope.scaling.type = linear`, `rope.scaling.factor`: 8 on the 4B, 12B
     /// and 27B; none on the 1B). The local layers are not scaled.
     rope_global_factors: Option<Vec<f32>>,
+    /// VENDORED-LOCAL: a decode step chained on the backend's device ([`crate::chain_decode`]).
+    chain: crate::chain_decode::ChainDecoder,
 }
 
 impl std::fmt::Debug for Gemma3Model {
@@ -91,7 +93,7 @@ impl Gemma3Model {
         let factor = g.get_f32(&format!("{ns}.rope.scaling.factor")).unwrap_or(1.0);
         let rope_global_factors = (linear && factor > 0.0 && factor != 1.0).then(|| vec![factor; config.head_dim / 2]);
 
-        Ok(Self { config, tokenizer, common, extras, backend, embed_scale_const, rope_theta_local, rope_global_factors })
+        Ok(Self { config, tokenizer, common, extras, backend, embed_scale_const, rope_theta_local, rope_global_factors, chain: Default::default() })
     }
 
     /// Look up token embeddings and apply Gemma 3's per-token `sqrt(d)` scaling.
@@ -112,6 +114,37 @@ impl Gemma3Model {
     /// Standard text-only forward: tokens → logits. Composes [`embed_text`]
     /// and [`forward_embeds`].
     pub fn forward(&self, tokens: &[u32], kv: &mut KvCache) -> Tensor {
+        // VENDORED-LOCAL: a decode step chained on the device when the backend has one for this model.
+        if tokens.len() == 1 {
+            let cfg = &self.config;
+            let layers = (0..cfg.n_layers)
+                .map(|l| {
+                    if cfg.layer_uses_sliding_window(l) {
+                        (self.rope_theta_local, None, cfg.sliding_window)
+                    } else {
+                        (cfg.rope_theta, self.rope_global_factors.as_deref(), None)
+                    }
+                })
+                .collect();
+            let dense = crate::chain_decode::Dense {
+                qk_norms: Some(self.extras.iter().map(|e| (&e.attn_q_norm, &e.attn_k_norm)).collect()),
+                post_norms: Some(self.extras.iter().map(|e| (&e.attn_post_norm, &e.ffn_post_norm)).collect()),
+                gelu: true,
+                embed_scale: self.embed_scale_const,
+                layers,
+                softcap: cfg.final_logit_softcap,
+                ..crate::chain_decode::Dense::plain(cfg, &self.common)
+            };
+            if let Some(logits) = self.chain.step(&*self.backend, &dense, tokens[0], kv) {
+                return logits;
+            }
+        }
+        self.forward_host(tokens, kv)
+    }
+
+    /// VENDORED-LOCAL: [`Self::forward`] op by op through the backend, never chained (what a chained step is
+    /// checked against).
+    pub fn forward_host(&self, tokens: &[u32], kv: &mut KvCache) -> Tensor {
         let embeds = self.embed_text(tokens);
         self.forward_embeds(&embeds, kv)
     }
