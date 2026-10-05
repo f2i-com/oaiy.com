@@ -76,6 +76,9 @@ impl ThinkBudget {
 /// How often a long reasoning block reports progress, in tokens.
 pub(crate) const THINKING_EVERY: usize = 32;
 
+/// A dense model's prompt chunk ([`GlmEngine::prefill_step`]).
+const DENSE_PREFILL_CHUNK: usize = 512;
+
 pub struct GlmEngine {
     model: Model,
     tok: Arc<Tokenizer>,
@@ -343,7 +346,7 @@ impl GlmEngine {
         // batched pass and one progress event, which is frequent enough to watch.
         let mut logits;
         let mut pos = start;
-        let step = llama_rs::glm5next::forward::prefill_chunk().max(1);
+        let step = self.prefill_step();
         // All but the last token, then the state is kept, then the last one.
         //
         // The state is kept one token short on purpose. A restore has to leave at
@@ -577,6 +580,17 @@ impl GlmEngine {
 
     /// Several tokens in one call, so `forward` can batch them. Returns the last
     /// one's logits, which is all a prompt needs.
+    /// Tokens a prompt's chunk holds. A model whose experts stream (GLM-5.3-Flash and the other MoE models) reads
+    /// each layer's experts once a chunk and reports progress a chunk; a dense one reads every weight once a chunk, and
+    /// on WebGPU each projection is a submit and a read back, so its chunks are bigger: a 3B Llama's 2,000-token prompt
+    /// took 17.5 s in chunks of 64.
+    fn prefill_step(&self) -> usize {
+        match &self.model {
+            Model::Llama(_) | Model::Qwen3(_) | Model::Gemma3(_) | Model::Gemma3n(_) | Model::Gemma4(_) => DENSE_PREFILL_CHUNK,
+            _ => llama_rs::glm5next::forward::prefill_chunk().max(1),
+        }
+    }
+
     fn forward_many(&mut self, ids: &[u32]) -> Result<Vec<f32>> {
         let t = self.model.forward(ids, &mut self.kv);
         // A dense model on a CUDA card leaves its logits on the card; the streamed MoE models hand them back on the host.

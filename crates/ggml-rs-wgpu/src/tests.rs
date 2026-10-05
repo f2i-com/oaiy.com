@@ -86,7 +86,8 @@ fn every_quant_type_matches_the_cpu_dequantization() {
         let w = random_weights(dtype, rows, k, &mut rng);
         let qt = b.to_device_quant(QuantizedTensor::from_bytes_cpu(w.clone(), vec![rows, k], dtype));
         assert!(qt.is_device(), "{dtype:?} was not uploaded");
-        for m in [1, 5, 9] {
+        // 1 and 5 tokens take the one-row kernel, 9 and 70 the tiled one (70: a second tile of tokens, part empty).
+        for m in [1, 5, 9, 70] {
             let x: Vec<f32> = (0..m * k).map(|_| rng.unit() * 2.0 - 1.0).collect();
             let y = b.linear_q(&Tensor::from_vec(x.clone(), vec![m, k]), &qt);
             assert_eq!(y.shape(), &[m, rows]);
@@ -98,6 +99,38 @@ fn every_quant_type_matches_the_cpu_dequantization() {
         }
         // Read-back returns the uploaded bytes unchanged.
         assert_eq!(qt.to_host().bytes(), &w[..], "{dtype:?} round trip");
+    }
+}
+
+/// What a quantized projection costs: a 4096 x 4096 weight against 1 to 512 tokens, each call a submit and a read
+/// back (its time with the round trip in it), for the common GGUF types.
+#[test]
+#[ignore = "a timing; run with --nocapture"]
+fn measure_quantized_projections() {
+    let Some(b) = backend() else { return };
+    let mut rng = Rng(11);
+    let (rows, k) = (4096, 4096);
+    for dtype in [GgmlType::Q4_K, GgmlType::Q6_K, GgmlType::Q8_0] {
+        let w = random_weights(dtype, rows, k, &mut rng);
+        let bytes = w.len();
+        let qt = b.to_device_quant(QuantizedTensor::from_bytes_cpu(w, vec![rows, k], dtype));
+        for m in [1usize, 8, 64, 512] {
+            let x = Tensor::from_vec((0..m * k).map(|_| rng.unit() * 2.0 - 1.0).collect(), vec![m, k]);
+            b.linear_q(&x, &qt);
+            let calls = if m >= 64 { 5 } else { 20 };
+            let t = std::time::Instant::now();
+            for _ in 0..calls {
+                b.linear_q(&x, &qt);
+            }
+            let secs = t.elapsed().as_secs_f64() / calls as f64;
+            eprintln!(
+                "{dtype:?} [{rows}, {k}] ({:.1} MB) x {m} tokens: {:.3} ms a call, {:.0} GFLOP/s, {:.0} GB/s of weights",
+                bytes as f64 / 1e6,
+                secs * 1e3,
+                2.0 * (m * rows * k) as f64 / secs / 1e9,
+                bytes as f64 / secs / 1e9
+            );
+        }
     }
 }
 

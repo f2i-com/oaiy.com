@@ -15,6 +15,10 @@ use ggml_quants::GgmlType;
 
 /// Output rows of `x` handled per workgroup (the partial sums each thread keeps).
 pub const M_TILE: u32 = 8;
+/// Rows of `x` from which a call takes the tiled kernel ([`source_many`]): 64 tokens by 64 weight rows a workgroup.
+pub const MANY_FROM: usize = 9;
+/// Tokens (and weight rows) a workgroup of the tiled kernel takes.
+pub const MANY_TILE: u32 = 64;
 /// Threads per workgroup: they split one weight row's 32-element sub-blocks.
 pub const THREADS: u32 = 64;
 
@@ -107,6 +111,83 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     }
 }
 "#;
+
+/// The tiled kernel for a prompt (more than [`M_TILE`] rows of `x`): 64 tokens by 64 weight rows a workgroup, a
+/// 32-element sub-block of `k` a step. Each of 64 threads decodes one weight row's sub-block with the type's own
+/// `dequant` (so the weights are the CPU's exactly) into workgroup memory, kept as vec4s of four rows; then every
+/// thread adds 4 tokens by 4 rows, its sums four vec4s. The one-row kernel decodes a row's weights once for every 8
+/// tokens and adds them in arrays the compiler keeps in memory: a 4096 x 4096 Q4_K weight against 512 tokens took
+/// 24 ms (0.7 TFLOP/s).
+const MANY_BODY: &str = r#"
+var<workgroup> xs: array<f32, 2048>;
+// k step kk, rows 4q..4q+3: wt[kk * 16 + q]
+var<workgroup> wt: array<vec4<f32>, 512>;
+
+// Token `tok`'s sums of rows row0..row0+3 of this chunk, those it has and of a token there is.
+fn put(v: vec4<f32>, tok: u32, row0: u32) {
+    if (tok >= p.m) { return; }
+    for (var b = 0u; b < 4u; b++) {
+        if (row0 + b < p.rows) { y[tok * p.n + p.row0 + row0 + b] = v[b]; }
+    }
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let r0 = wg.x * 64u;
+    let t0 = wg.y * 64u;
+    let tx = li & 15u;
+    let ty = li >> 4u;
+    var acc0 = vec4<f32>(0.0);
+    var acc1 = vec4<f32>(0.0);
+    var acc2 = vec4<f32>(0.0);
+    var acc3 = vec4<f32>(0.0);
+    let units = p.k / 32u;
+    for (var u = 0u; u < units; u++) {
+        // The tokens' 64 x 32: element e, token e / 32, k e % 32, kept k-major.
+        for (var e = li; e < 2048u; e += 256u) {
+            let tok = t0 + e / 32u;
+            var val = 0.0;
+            if (tok < p.m) { val = x[tok * p.k + u * 32u + e % 32u]; }
+            xs[(e % 32u) * 64u + e / 32u] = val;
+        }
+        // The rows' sub-block u, a row a thread.
+        if (li < 64u) {
+            let r = r0 + li;
+            if (r < p.rows) {
+                dequant(r * p.row_bytes + (u / SUBS) * BLOCK_BYTES, u % SUBS);
+                for (var j = 0u; j < 32u; j++) { wt[j * 16u + li / 4u][li % 4u] = v[j]; }
+            } else {
+                for (var j = 0u; j < 32u; j++) { wt[j * 16u + li / 4u][li % 4u] = 0.0; }
+            }
+        }
+        workgroupBarrier();
+        for (var kk = 0u; kk < 32u; kk++) {
+            let w4 = wt[kk * 16u + tx];
+            let xb = kk * 64u + ty * 4u;
+            acc0 += xs[xb] * w4;
+            acc1 += xs[xb + 1u] * w4;
+            acc2 += xs[xb + 2u] * w4;
+            acc3 += xs[xb + 3u] * w4;
+        }
+        workgroupBarrier();
+    }
+    let tok = t0 + ty * 4u;
+    let row0 = r0 + tx * 4u;
+    put(acc0, tok, row0);
+    put(acc1, tok + 1u, row0);
+    put(acc2, tok + 2u, row0);
+    put(acc3, tok + 3u, row0);
+}
+"#;
+
+/// The tiled shader for `dtype` (see [`MANY_BODY`]).
+pub fn source_many(dtype: GgmlType) -> Option<String> {
+    let (elems, bytes, dequant) = layout(dtype)?;
+    let head = COMMON.replace("THREADS_X_MTILE", &(THREADS * M_TILE).to_string());
+    let body = MANY_BODY.replace("SUBS", &format!("{}u", elems / 32)).replace("BLOCK_BYTES", &format!("{bytes}u"));
+    let helper = if matches!(dtype, GgmlType::Q4_K | GgmlType::Q5_K) { SCALE_MIN_K4 } else { "" };
+    Some(format!("{head}\n{helper}\n{dequant}\n{body}"))
+}
 
 /// The complete shader for `dtype`.
 pub fn source(dtype: GgmlType) -> Option<String> {

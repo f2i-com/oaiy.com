@@ -44,6 +44,12 @@ Local modifications should be minimal and marked with a comment
   store (`llama-rs/src/xdb_container.rs`, `oaiy-llm convert`). Reading the `.gguf` in
   place replaced it, and the xdb crate was removed.
 
+**Attention on the CPU in one pass (2026-10-05).** `CpuBackend::attention` (`ggml-rs/src/cpu.rs`) reads each query
+head's KV head in place, each (query, head) row on its own thread, its dot products as 8 running sums; the default
+copied the cache's prefix, repeated it for every query head of a group, and took the softmax on one thread. The
+WebGPU backend, whose cache is on the host, uses it too: a 3B Llama's 2,000-token prompt on the portable build went
+from 59 s to 18 s with it.
+
 **The streaming roadmap (2026-08, `docs/ROADMAP.md`).** Each change is marked with
 its roadmap id:
 

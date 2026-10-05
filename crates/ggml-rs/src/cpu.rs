@@ -362,6 +362,65 @@ impl Backend for CpuBackend {
         Tensor::from_vec(out, vec![seq, n_h, hd])
     }
 
+    // VENDORED-LOCAL: attention in one pass, each (query, head) row on its own thread, reading its KV head in place.
+    // The default copies the cache's prefix and repeats it for every query head of a group, then takes the softmax
+    // on one thread over every (query, head, position): a 3B Llama's 2,000-token prompt took 59 s and a decode step
+    // 0.9 s on the portable build. A query's dot with a key is 8 running sums (one sum, an add waiting on the last,
+    // keeps the CPU from using its vector units), so the results differ from the default's in the order of a sum.
+    fn attention(
+        &self,
+        q: &Tensor,
+        k_buffer: &Tensor,
+        v_buffer: &Tensor,
+        kv_len: usize,
+        scale: f32,
+        past: usize,
+        sliding_window: Option<usize>,
+    ) -> Tensor {
+        let (seq, n_h_q, hd) = (q.dim(0), q.dim(1), q.dim(2));
+        let n_h_kv = k_buffer.dim(1);
+        debug_assert_eq!(n_h_q % n_h_kv, 0);
+        let n_rep = n_h_q / n_h_kv;
+        let (qd, kd, vd) = (q.data(), k_buffer.data(), v_buffer.data());
+        let mut out = vec![0.0f32; seq * n_h_q * hd];
+        out.par_chunks_mut(hd).enumerate().for_each_init(Vec::new, |scores: &mut Vec<f32>, (sh, row)| {
+            let (s, h) = (sh / n_h_q, sh % n_h_q);
+            let kh = h / n_rep;
+            let q_pos = past + s;
+            // the positions this query sees: causal, and within the window if there is one
+            let hi = (q_pos + 1).min(kv_len);
+            let lo = sliding_window.map_or(0, |w| q_pos.saturating_sub(w - 1)).min(hi);
+            if lo == hi {
+                return;
+            }
+            let qv = &qd[sh * hd..(sh + 1) * hd];
+            scores.clear();
+            let mut m = f32::NEG_INFINITY;
+            for t in lo..hi {
+                let kv = &kd[(t * n_h_kv + kh) * hd..(t * n_h_kv + kh + 1) * hd];
+                let sc = dot8(qv, kv) * scale;
+                if sc > m {
+                    m = sc;
+                }
+                scores.push(sc);
+            }
+            let mut sum = 0.0f32;
+            for sc in scores.iter_mut() {
+                *sc = (*sc - m).exp();
+                sum += *sc;
+            }
+            let inv = 1.0 / sum;
+            for (t, p) in (lo..hi).zip(scores.iter()) {
+                let p = p * inv;
+                let vv = &vd[(t * n_h_kv + kh) * hd..(t * n_h_kv + kh + 1) * hd];
+                for d in 0..hd {
+                    row[d] += p * vv[d];
+                }
+            }
+        });
+        Tensor::from_vec(out, vec![seq, n_h_q, hd])
+    }
+
     fn argmax_last(&self, x: &Tensor) -> Vec<u32> {
         let last = x.dim(x.rank() - 1);
         let rows = x.numel() / last;
@@ -379,6 +438,19 @@ impl Backend for CpuBackend {
         }
         out
     }
+}
+
+// VENDORED-LOCAL: `a . b` as 8 running sums added at the end, so the loop vectorizes.
+fn dot8(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = [0.0f32; 8];
+    let (ca, cb) = (a.chunks_exact(8), b.chunks_exact(8));
+    let tail: f32 = ca.remainder().iter().zip(cb.remainder()).map(|(x, y)| x * y).sum();
+    for (x, y) in ca.zip(cb) {
+        for l in 0..8 {
+            acc[l] += x[l] * y[l];
+        }
+    }
+    acc.iter().sum::<f32>() + tail
 }
 
 // ----- tests ---------------------------------------------------------------
@@ -412,6 +484,55 @@ mod tests {
         for m in [1, 3, 20] {
             let x = Tensor::from_vec((0..m * k).map(|i| (i as f32 * 0.37).sin()).collect(), vec![m, k]);
             assert_eq!(cpu.linear_q(&x, &w).data(), cpu.linear(&x, &dense).data(), "m={m}");
+        }
+    }
+
+    /// The fused attention gives the default's results but for the order of its dot products' sums: GQA, a KV prefix,
+    /// a causal offset, and a window.
+    #[test]
+    fn fused_attention_matches_the_default() {
+        #[derive(Debug)]
+        struct Default(CpuBackend);
+        impl Backend for Default {
+            fn name(&self) -> &str { "default" }
+            fn as_any(&self) -> &dyn std::any::Any { self }
+            fn linear(&self, x: &Tensor, w: &Tensor) -> Tensor { self.0.linear(x, w) }
+            fn add_inplace(&self, x: &mut Tensor, y: &Tensor) { self.0.add_inplace(x, y) }
+            fn mul_inplace(&self, x: &mut Tensor, y: &Tensor) { self.0.mul_inplace(x, y) }
+            fn rmsnorm(&self, x: &Tensor, w: &Tensor, eps: f32) -> Tensor { self.0.rmsnorm(x, w, eps) }
+            fn softmax_last(&self, x: &mut Tensor) { self.0.softmax_last(x) }
+            fn silu(&self, x: &Tensor) -> Tensor { self.0.silu(x) }
+            fn gelu_approx(&self, x: &Tensor) -> Tensor { self.0.gelu_approx(x) }
+            fn rope(&self, x: &mut Tensor, positions: &[u32], head_dim: usize, rope_type: RopeType, theta: f32, freq_factors: Option<&[f32]>) {
+                self.0.rope(x, positions, head_dim, rope_type, theta, freq_factors)
+            }
+            fn repeat_kv(&self, x: &Tensor, n_rep: usize) -> Tensor { self.0.repeat_kv(x, n_rep) }
+            fn bmm_qkt(&self, q: &Tensor, k: &Tensor, scale: f32, past: usize) -> Tensor { self.0.bmm_qkt(q, k, scale, past) }
+            fn bmm_av(&self, scores: &Tensor, v: &Tensor) -> Tensor { self.0.bmm_av(scores, v) }
+            fn argmax_last(&self, x: &Tensor) -> Vec<u32> { self.0.argmax_last(x) }
+        }
+        let mut s = 0x9E37_79B9u32;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            (s as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        let (n_h_q, n_h_kv, hd, max_kv) = (8, 2, 16, 40);
+        let k = Tensor::from_vec((0..max_kv * n_h_kv * hd).map(|_| next()).collect(), vec![max_kv, n_h_kv, hd]);
+        let v = Tensor::from_vec((0..max_kv * n_h_kv * hd).map(|_| next()).collect(), vec![max_kv, n_h_kv, hd]);
+        let (fused, default) = (CpuBackend::new(), Default(CpuBackend::new()));
+        // a prompt from the start, a chunk continuing one, a decode step; with and without a window
+        for (seq, past) in [(12usize, 0usize), (7, 20), (1, 33)] {
+            let q = Tensor::from_vec((0..seq * n_h_q * hd).map(|_| next()).collect(), vec![seq, n_h_q, hd]);
+            let kv_len = past + seq;
+            for window in [None, Some(5), Some(64)] {
+                let a = fused.attention(&q, &k, &v, kv_len, 0.25, past, window);
+                let b = default.attention(&q, &k, &v, kv_len, 0.25, past, window);
+                assert_eq!(a.shape(), b.shape());
+                let worst = a.data().iter().zip(b.data()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+                assert!(worst < 1e-5, "seq {seq} past {past} window {window:?}: {worst}");
+            }
         }
     }
 

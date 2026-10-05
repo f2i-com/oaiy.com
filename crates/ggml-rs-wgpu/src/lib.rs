@@ -38,7 +38,7 @@ struct Gpu {
     queue: wgpu::Queue,
     layout: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
-    pipelines: Mutex<HashMap<GgmlType, Arc<wgpu::ComputePipeline>>>,
+    pipelines: Mutex<HashMap<(GgmlType, bool), Arc<wgpu::ComputePipeline>>>,
     /// The EXL3 matmul's pipelines (`exl3::shader`): for one row, and for several. Made when first used.
     exl3: Mutex<[Option<Arc<wgpu::ComputePipeline>>; 2]>,
     /// Other kernels' pipelines by name (`dense`), made when first used.
@@ -215,12 +215,13 @@ impl Gpu {
         pipeline
     }
 
-    fn pipeline(&self, dtype: GgmlType) -> Option<Arc<wgpu::ComputePipeline>> {
+    /// `dtype`'s kernel: the one-row kernel, or with `many` the tiled one a prompt takes.
+    fn pipeline(&self, dtype: GgmlType, many: bool) -> Option<Arc<wgpu::ComputePipeline>> {
         let mut cache = self.pipelines.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(p) = cache.get(&dtype) {
+        if let Some(p) = cache.get(&(dtype, many)) {
             return Some(Arc::clone(p));
         }
-        let source = shaders::source(dtype)?;
+        let source = if many { shaders::source_many(dtype)? } else { shaders::source(dtype)? };
         let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("oaiy-linear-q"),
             source: wgpu::ShaderSource::Wgsl(source.into()),
@@ -233,7 +234,7 @@ impl Gpu {
             compilation_options: Default::default(),
             cache: None,
         }));
-        cache.insert(dtype, Arc::clone(&pipeline));
+        cache.insert((dtype, many), Arc::clone(&pipeline));
         Some(pipeline)
     }
 }
@@ -365,7 +366,7 @@ impl WgpuBackend {
 
     fn upload(&self, w: QuantizedTensor) -> QuantizedTensor {
         let Some((elems, block_bytes, _)) = shaders::layout(w.dtype()) else { return w };
-        if w.is_device() || w.rank() != 2 || w.dim(1) % elems as usize != 0 || self.gpu.pipeline(w.dtype()).is_none() {
+        if w.is_device() || w.rank() != 2 || w.dim(1) % elems as usize != 0 || self.gpu.pipeline(w.dtype(), false).is_none() {
             return w;
         }
         let row_bytes = w.dim(1) / elems as usize * block_bytes as usize;
@@ -416,7 +417,8 @@ impl WgpuBackend {
         }
         let _one = self.serial.lock().unwrap_or_else(|p| p.into_inner());
         let gpu = &self.gpu;
-        let pipeline = gpu.pipeline(q.dtype).expect("uploaded weights have a pipeline");
+        let many = m >= shaders::MANY_FROM;
+        let pipeline = gpu.pipeline(q.dtype, many).expect("uploaded weights have a pipeline");
         let bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
         let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
         let xbuf = gpu.device.create_buffer(&wgpu::BufferDescriptor { label: Some("oaiy-x"), size: (x.numel() * 4) as u64, usage, mapped_at_creation: false });
@@ -465,6 +467,10 @@ impl WgpuBackend {
             pass.set_pipeline(&pipeline);
             for (group, rows) in &groups {
                 pass.set_bind_group(0, group, &[]);
+                if many {
+                    pass.dispatch_workgroups(rows.div_ceil(shaders::MANY_TILE), (m as u32).div_ceil(shaders::MANY_TILE), 1);
+                    continue;
+                }
                 // Rows beyond 65535 wrap into the second grid axis.
                 let gx = (*rows).min(65535);
                 let gy = rows.div_ceil(65535);
@@ -542,6 +548,15 @@ impl Backend for WgpuBackend {
     }
     fn bmm_av(&self, scores: &Tensor, v: &Tensor) -> Tensor {
         self.cpu.bmm_av(scores, v)
+    }
+    /// The CPU's fused attention (the cache is on the host): the default would copy the cache and take the softmax on
+    /// one thread.
+    fn attention(&self, q: &Tensor, k_buffer: &Tensor, v_buffer: &Tensor, kv_len: usize, scale: f32, past: usize, sliding_window: Option<usize>) -> Tensor {
+        let host = |t: &Tensor| if t.is_device() { t.to_host() } else { t.clone() };
+        if q.is_device() || k_buffer.is_device() || v_buffer.is_device() {
+            return self.cpu.attention(&host(q), &host(k_buffer), &host(v_buffer), kv_len, scale, past, sliding_window);
+        }
+        self.cpu.attention(q, k_buffer, v_buffer, kv_len, scale, past, sliding_window)
     }
     fn argmax_last(&self, x: &Tensor) -> Vec<u32> {
         self.cpu.argmax_last(x)
