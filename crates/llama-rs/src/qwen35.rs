@@ -220,10 +220,14 @@ impl Qwen35Model {
         // token rows. A 248k-vocabulary table must not become a permanent FP32 copy.
         let packed = g.tensor_by_name("token_embd.weight").filter(|info|
             crate::loader::dtype_supports_packed_matmul(info.dtype) &&
-            config.embedding_dim % info.dtype.block_size() == 0 && g.tensor_by_name("output.weight").is_some());
+            config.embedding_dim % info.dtype.block_size() == 0);
         let (tok_embd, packed_tok_embd, output) = if let Some(info) = packed {
             let Weight::Quant(q) = Weight::load(g, info)? else { unreachable!() };
-            (None, Some(q), idx.take_weight("output.weight", &[])?)
+            // VENDORED-LOCAL: a model without an output weight (Qwen3.5 4B) is headed by the packed table too, a
+            // quantized matmul (on the GPU where the backend holds it), where the table became 2.5 GB of f32 on the
+            // host and its matmul ran there.
+            let output = if g.tensor_by_name("output.weight").is_some() { idx.take_weight("output.weight", &[])? } else { Weight::Quant(q.clone()) };
+            (None, Some(q), output)
         } else {
             let table = Arc::new(idx.take("token_embd.weight", &["tok_embeddings.weight"])?);
             let output = load_lm_head_or_tied(&idx, &table)?;
