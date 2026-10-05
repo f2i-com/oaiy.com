@@ -1260,8 +1260,8 @@ mod dense_webgpu_timing {
         eprintln!("{steps} decode steps: {:.1} ms a step; {}", secs * 1e3 / steps as f64, ggml_rs_wgpu::profile::take_line());
     }
 
-    /// A Llama decode step chained on the GPU answers as the host path does: from the same prompt, 64 greedy steps
-    /// each way give the same tokens, every step's logits close (cosine 0.9999 or more).
+    /// A decode step chained on the GPU (a Llama's or a Qwen3's: DENSE_MODEL) answers as the host path does: from the
+    /// same prompt, 64 greedy steps each way give the same tokens, every step's logits close (cosine 0.9999 or more).
     #[test]
     #[ignore = "needs a WebGPU adapter and the 3B Llama GGUF (E:/models/llama-3.2-3b-q4_k_m.gguf, or DENSE_MODEL)"]
     fn a_chained_decode_step_answers_as_the_host_path() {
@@ -1270,17 +1270,23 @@ mod dense_webgpu_timing {
         let Ok(b) = ggml_rs_wgpu::WgpuBackend::new(Some(8 << 30)) else { return };
         let backend: Arc<dyn ggml_rs::Backend> = Arc::new(b);
         let gguf = gguf::GgufFile::open(&path).unwrap();
-        let llama_rs::Model::Llama(model) = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap() else { panic!("a Llama") };
+        let model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap();
+        // the host path, op by op (a Llama's or a Qwen3's), and the model's own (chained where it can be)
+        let host = |t: &[u32], kv: &mut llama_rs::KvCache| match &model {
+            llama_rs::Model::Llama(m) => m.forward_host(t, kv),
+            llama_rs::Model::Qwen3(m) => m.forward_host(t, kv),
+            _ => panic!("a Llama or a Qwen3"),
+        };
         let n: u32 = std::env::var("DENSE_PROMPT").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
         let prompt: Vec<u32> = (0..n).map(|i| 1000 + (i * 7919) % 20000).collect();
         let argmax = |l: &ggml_rs::Tensor| l.data().iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
         let run = |chained: bool| {
             let mut kv = model.new_kv_cache(prompt.len() + 80);
-            let l = model.forward_host(&prompt, &mut kv);
+            let l = host(&prompt, &mut kv);
             let mut next = argmax(&model.last_logits(&l));
             let (mut tokens, mut all) = (Vec::new(), Vec::new());
             for _ in 0..64 {
-                let l = if chained { model.forward(&[next], &mut kv) } else { model.forward_host(&[next], &mut kv) };
+                let l = if chained { model.forward(&[next], &mut kv) } else { host(&[next], &mut kv) };
                 let l = model.last_logits(&l).data().to_vec();
                 next = l.iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
                 tokens.push(next);

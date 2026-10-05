@@ -51,6 +51,8 @@ pub trait ChainRecorder {
     fn matmul(&mut self, w: &QuantizedTensor, x: &DeviceVec, y: &DeviceVec);
     /// `out = x / rms(x) * w`.
     fn rmsnorm(&mut self, x: &DeviceVec, w: &DeviceVec, out: &DeviceVec, eps: f32);
+    /// [`Self::rmsnorm`] of each of `rows` rows of `x` (a head's q or k), all with the same `w` (`[x.len / rows]`).
+    fn rmsnorm_rows(&mut self, x: &DeviceVec, w: &DeviceVec, out: &DeviceVec, rows: usize, eps: f32);
     /// `acc += y`.
     fn add(&mut self, acc: &DeviceVec, y: &DeviceVec);
     /// `out = silu(fused[..ff]) * fused[ff..]`, `ff = out.len`.

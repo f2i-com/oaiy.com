@@ -16,6 +16,7 @@
 
 #![deny(rust_2018_idioms)]
 
+mod chain_decode;
 pub mod chat;
 pub mod config;
 pub mod gemma3;

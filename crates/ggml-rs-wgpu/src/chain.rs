@@ -38,6 +38,27 @@ fn main(@builtin(local_invocation_index) li: u32) {
 }
 "#;
 
+/// [`RMSNORM`] of row `wg.x` of `x` (rows of `p[0].x`), every row with the same weights `w`.
+const RMSNORM_ROWS: &str = r#"
+var<workgroup> part: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let n = p[0].x;
+    let at = wg.x * n;
+    var s = 0.0;
+    for (var i = li; i < n; i += 256u) { let v = x[at + i]; s += v * v; }
+    part[li] = s;
+    workgroupBarrier();
+    for (var stride = 128u; stride > 0u; stride /= 2u) {
+        if (li < stride) { part[li] += part[li + stride]; }
+        workgroupBarrier();
+    }
+    let inv = 1.0 / sqrt(part[0] / f32(n) + bitcast<f32>(p[0].y));
+    for (var i = li; i < n; i += 256u) { y[at + i] = x[at + i] * inv * bitcast<f32>(w[i]); }
+}
+"#;
+
 /// `y += x` over `p[0].x` elements.
 const ADD: &str = r#"
 @compute @workgroup_size(256)
@@ -354,6 +375,12 @@ impl ChainRecorder for Recorder<'_> {
     fn rmsnorm(&mut self, x: &DeviceVec, w: &DeviceVec, out: &DeviceVec, eps: f32) {
         let pipeline = self.named("chain-rmsnorm", RMSNORM);
         self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(out), &[x.len as u32, eps.to_bits()], (1, 1, 1));
+    }
+
+    fn rmsnorm_rows(&mut self, x: &DeviceVec, w: &DeviceVec, out: &DeviceVec, rows: usize, eps: f32) {
+        assert!(rows > 0 && x.len % rows == 0 && w.len >= x.len / rows && out.len >= x.len, "chain: rmsnorm of {rows} rows of {}", x.len);
+        let pipeline = self.named("chain-rmsnorm-rows", RMSNORM_ROWS);
+        self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(out), &[(x.len / rows) as u32, eps.to_bits()], (rows as u32, 1, 1));
     }
 
     fn add(&mut self, acc: &DeviceVec, y: &DeviceVec) {
