@@ -1428,6 +1428,82 @@ mod dense_webgpu_timing {
         assert!(after_steps > 0.99 && after_host > 0.99, "{after_steps} {after_host}");
     }
 
+    /// Qwen3.8-Flash-Next chained past QSA's dense span (FLASHNEXT_MODEL) answers as its own path does: a prompt of some
+    /// 2,100 tokens in chunks of 512 (the last past 2,051 positions, its rows' blocks chosen on the GPU) against the
+    /// host path's whole prompt, then steps on the host path's greedy tokens; each step's logits close and the same
+    /// greedy token (bar near-ties), and a step's time there.
+    #[test]
+    #[ignore = "needs WebGPU adapters with room for Qwen3.8-Flash-Next (FLASHNEXT_MODEL); run with --nocapture"]
+    fn a_chained_flashnext_attends_past_the_dense_span_as_its_own_path() {
+        use std::sync::Arc;
+        let path = std::env::var("FLASHNEXT_MODEL").unwrap_or_else(|_| r"E:\models\Qwen3.8-Flash-Next\exl3-3.05bpw".into());
+        let Ok(b0) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
+        let others: Vec<Arc<ggml_rs_wgpu::WgpuBackend>> = b0.others(None).into_iter().map(Arc::new).collect();
+        let b0 = Arc::new(b0);
+        let gpus: Vec<&ggml_rs_wgpu::WgpuBackend> = std::iter::once(b0.as_ref()).chain(others.iter().map(|g| g.as_ref())).collect();
+        let backends: Vec<Arc<dyn ggml_rs::Backend>> = std::iter::once(Arc::clone(&b0) as Arc<dyn ggml_rs::Backend>).chain(others.iter().map(|g| Arc::clone(g) as Arc<dyn ggml_rs::Backend>)).collect();
+        type Make<'a> = Box<dyn Fn(ggml_rs::exl3::Exl3Data) -> std::result::Result<Arc<dyn ggml_rs::exl3::PackedLinear>, String> + Send + Sync + 'a>;
+        let packed = |device: usize| -> Make<'_> {
+            let b = gpus[device];
+            Box::new(move |d| b.exl3(d))
+        };
+        let p = std::path::Path::new(&path);
+        let reserve = crate::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
+        let experts = |device: usize, _layer: &str, list: Vec<[ggml_rs::exl3::Exl3Data; 3]>| -> oaiy_engine::Result<Box<dyn ggml_rs::exl3::Experts>> {
+            gpus[device].exl3_experts_leaving(list, reserve).map_err(oaiy_engine::Error::Arg)
+        };
+        let model = crate::flashnext::load_portable(p, backends, &packed, &experts, false).unwrap();
+        let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
+        let cosine = |a: &[f32], b: &[f32]| {
+            let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
+            let n = |v: &[f32]| v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            dot / (n(a) * n(b))
+        };
+        // a long prose of the market town, then a question about its start
+        let para = "The river town kept its market on the north bank, where barges unloaded grain, wool and salt. Every spring the floods rose to the steps of the old customs house, and every summer the merchants rebuilt the stalls a little higher. The ferryman counted the seasons by the colour of the water. ";
+        let mut text = String::from("<|im_start|>user\nThe ferryman's name was Aldous Penrose. ");
+        while model.tokenizer.encode(&text, false).unwrap().len() < 2080 {
+            text += para;
+        }
+        text += "\n\nWhat was the ferryman's name, and what did he count the seasons by?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+        let prompt: Vec<u32> = model.tokenizer.encode(&text, false).unwrap();
+        let steps: usize = std::env::var("FLASHNEXT_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(32);
+        let (mut kh, mut kc) = (model.new_kv_cache(prompt.len() + steps + 8), model.new_kv_cache(prompt.len() + steps + 8));
+        let t = std::time::Instant::now();
+        let lh = model.forward_host(&prompt, &model.embed_text(&prompt).unwrap(), &mut kh, None).unwrap();
+        let host_prompt = t.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        let mut lc = None;
+        for chunk in prompt.chunks(512) {
+            lc = Some(model.forward(chunk, &model.embed_text(chunk).unwrap(), &mut kc, None).unwrap());
+        }
+        let chained_prompt = t.elapsed().as_secs_f64();
+        let lc = lc.unwrap();
+        let runs = model.chain_runs();
+        eprintln!("a prompt of {} tokens: host {host_prompt:.1} s, chained {chained_prompt:.1} s ({runs} chunks chained); logits cosine {:.6}, the same greedy token {}", prompt.len(), cosine(lh.data(), lc.data()), argmax(lh.data()) == argmax(lc.data()));
+        assert_eq!(runs, prompt.len().div_ceil(512), "every chunk chained");
+        let mut next = argmax(lh.data());
+        let (mut worst, mut same, mut th, mut tc) = (1.0f64, 0usize, 0f64, 0f64);
+        let mut out = Vec::new();
+        for _ in 0..steps {
+            let e = model.embed_text(&[next]).unwrap();
+            let t = std::time::Instant::now();
+            let host = model.forward_host(&[next], &e, &mut kh, None).unwrap();
+            th += t.elapsed().as_secs_f64();
+            let t = std::time::Instant::now();
+            let chained = model.forward(&[next], &e, &mut kc, None).unwrap();
+            tc += t.elapsed().as_secs_f64();
+            worst = worst.min(cosine(host.data(), chained.data()));
+            same += (argmax(host.data()) == argmax(chained.data())) as usize;
+            next = argmax(host.data());
+            out.push(next);
+        }
+        eprintln!("{steps} steps past {} positions: host {:.1} ms a step, chained {:.1} ms; worst logits cosine {worst:.6}; the same greedy token {same} of {steps}", prompt.len(), th * 1e3 / steps as f64, tc * 1e3 / steps as f64);
+        eprintln!("  {}", model.tokenizer.decode(&out).replace('\n', " "));
+        assert_eq!(model.chain_runs(), runs + steps, "every step chained");
+        assert!(worst > 0.99, "{worst}");
+    }
+
     /// A chained Qwen3.8-Flash-Next check of a few tokens (FLASHNEXT_MODEL) gives each row's logits as steps on the same
     /// tokens do, bit for bit, and undone past its first rows leaves the state those rows would: a check of four of the
     /// steps' greedy tokens, rolled back to two, a check of the next three, a step, then checks of 2 to 4 rows each kept
@@ -1465,7 +1541,8 @@ mod dense_webgpu_timing {
         };
         let step = |t: u32, kv: &mut llama_rs::KvCache| model.forward(&[t], &model.embed_text(&[t]).unwrap(), kv, None).unwrap();
         // the steps' greedy tokens g and their logits l (l[i] after g[i])
-        let (mut ks, mut kc) = (model.new_kv_cache(prompt.len() + 512), model.new_kv_cache(prompt.len() + 512));
+        let room = prompt.len() + 512 + std::env::var("FLASHNEXT_CHECK_AT").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+        let (mut ks, mut kc) = (model.new_kv_cache(room), model.new_kv_cache(room));
         let e = model.embed_text(&prompt).unwrap();
         let mut g = vec![argmax(model.forward(&prompt, &e, &mut ks, None).unwrap().data())];
         let _ = model.forward(&prompt, &e, &mut kc, None).unwrap();
@@ -1791,8 +1868,8 @@ mod dense_webgpu_timing {
             gpus[device].exl3_experts_leaving(list, reserve).map_err(oaiy_engine::Error::Arg)
         };
         let model = crate::flashnext::load_portable(p, backends, &packed, &experts, false).unwrap();
-        let tokens: Vec<u32> = (0..1100u32).map(|i| 1000 + (i * 7919) % 20000).collect();
-        let mut kv = model.new_kv_cache(2048);
+        let tokens: Vec<u32> = (0..4200u32).map(|i| 1000 + (i * 7919) % 20000).collect();
+        let mut kv = model.new_kv_cache(4096);
         let report = |what: &str, wall: f64| {
             let k = ggml_rs_wgpu::profile::take_kernels();
             let gpu: f64 = k.iter().map(|e| e.1).sum();
@@ -1804,7 +1881,14 @@ mod dense_webgpu_timing {
             }
         };
         let mut at = 0;
-        for (i, n) in [512usize, 512, 64].into_iter().enumerate() {
+        // FLASHNEXT_PAST: chunks of 512 up to that many positions first (past QSA's dense span at 2,052)
+        let past_span: usize = std::env::var("FLASHNEXT_PAST").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let mut chunks: Vec<usize> = vec![512, 512, 64];
+        if past_span > 0 {
+            chunks = std::iter::repeat_n(512, past_span / 512).chain([past_span % 512]).filter(|&n| n > 0).collect();
+        }
+        let chunk_count = chunks.len();
+        for (i, n) in chunks.into_iter().enumerate() {
             let e = model.embed_text(&tokens[at..at + n]).unwrap();
             let _ = (ggml_rs_wgpu::profile::take_kernels(), ggml_rs_wgpu::profile::take_line());
             let t = Instant::now();
@@ -1824,7 +1908,7 @@ mod dense_webgpu_timing {
             next = l.data().iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
         }
         // runs of a few rows (what a check of drafts would be): each a mean of 6 after one to warm
-        let mut runs = 7;
+        let mut runs = chunk_count + 4;
         for rows in [1usize, 2, 3, 4, 8] {
             let mut wall = 0.0;
             for rep in 0..7 {

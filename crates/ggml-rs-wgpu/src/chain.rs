@@ -1236,6 +1236,263 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 }
 "#;
 
+/// QSA's pooled block keys: `pooled[b, i]` the mean of `raw` rows `b ratio ..`, each `/ ratio` added in turn (as
+/// `Backend::qsa_pool`), a workgroup a block. `p[0]`: blocks, ratio, d (at most 256).
+const QSA_POOL: &str = r#"
+@group(0) @binding(0) var<storage, read> raw: array<f32>;
+@group(0) @binding(6) var<storage, read_write> pooled: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) i: u32) {
+    let blocks = p[0].x;
+    let ratio = p[0].y;
+    let d = p[0].z;
+    let b = wg.x + wg.y * 65535u;
+    if (b >= blocks || i >= d) { return; }
+    var acc = 0.0;
+    for (var c = 0u; c < ratio; c++) { acc += raw[(b * ratio + c) * d + i] / f32(ratio); }
+    pooled[b * d + i] = acc;
+}
+"#;
+
+/// QSA's block scores, a thread a (block, query): `scale * sum over the heads of relu(q[r, h] . pooled[j])` for the
+/// blocks the query sees whole, `-inf` past them. `p[0]`: rows, heads, d, nb; `p[1]`: first, ratio, scale.
+const QSA_SCORES: &str = r#"
+@group(0) @binding(0) var<storage, read> q: array<f32>;
+@group(0) @binding(1) var<storage, read> pooled: array<f32>;
+@group(0) @binding(6) var<storage, read_write> scores: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> qs: array<f32, 2048>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let heads = p[0].y;
+    let d = p[0].z;
+    let nb = p[0].w;
+    let first = p[1].x;
+    let ratio = p[1].y;
+    let scale = bitcast<f32>(p[1].z);
+    let r = wg.y;
+    let hd = heads * d;
+    for (var i = li; i < hd; i += 256u) { qs[i] = q[r * hd + i]; }
+    workgroupBarrier();
+    let j = wg.x * 256u + li;
+    if (j >= nb) { return; }
+    var total = bitcast<f32>(0xff800000u);
+    if (j < (first + r + 1u) / ratio) {
+        var sum = 0.0;
+        for (var h = 0u; h < heads; h++) {
+            var dot = 0.0;
+            for (var i = 0u; i < d; i++) { dot += qs[h * d + i] * pooled[j * d + i]; }
+            sum += max(dot, 0.0);
+        }
+        total = sum * scale;
+    }
+    scores[r * nb + j] = total;
+}
+"#;
+
+/// QSA's selection, a workgroup a query: the blocks it sees whole sorted (bitonic, in the workgroup's memory) by score,
+/// the larger first and the lower block of equals, the first `keep` marked and written in ascending order (all of them
+/// where it sees no more). `p[0]`: rows, nb (at most 4096), first, ratio; `p[1]`: keep.
+const QSA_SELECT: &str = r#"
+@group(0) @binding(0) var<storage, read> scores: array<f32>;
+@group(0) @binding(6) var<storage, read_write> list: array<u32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> keys: array<u32, 4096>;
+var<workgroup> ids: array<u32, 4096>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    let nb = p[0].y;
+    let first = p[0].z;
+    let ratio = p[0].w;
+    let keep = p[1].x;
+    let r = wg.x;
+    let visible = min((first + r + 1u) / ratio, nb);
+    let count = min(visible, keep);
+    var n = 1u;
+    while (n < visible) { n *= 2u; }
+    // a larger score a larger key (positive scores' sign bit set, negative ones' bits flipped)
+    for (var i = t; i < n; i += 256u) {
+        if (i < visible) {
+            let u = bitcast<u32>(scores[r * nb + i]);
+            keys[i] = select(u | 0x80000000u, ~u, (u >> 31u) == 1u);
+            ids[i] = i;
+        } else {
+            keys[i] = 0u;
+            ids[i] = 0xffffffffu;
+        }
+    }
+    workgroupBarrier();
+    if (visible > keep) {
+        for (var size = 2u; size <= n; size *= 2u) {
+            for (var stride = size / 2u; stride > 0u; stride /= 2u) {
+                for (var i = t; i < n / 2u; i += 256u) {
+                    let a = 2u * stride * (i / stride) + i % stride;
+                    let b = a + stride;
+                    let ka = keys[a];
+                    let kb = keys[b];
+                    let ia = ids[a];
+                    let ib = ids[b];
+                    let before = ka > kb || (ka == kb && ia < ib);
+                    if (before != ((a & size) == 0u)) {
+                        keys[a] = kb;
+                        keys[b] = ka;
+                        ids[a] = ib;
+                        ids[b] = ia;
+                    }
+                }
+                workgroupBarrier();
+            }
+        }
+    }
+    // the kept blocks flagged (keys reused), then their places in ascending order (each thread's run of blocks
+    // counted, the runs' counts summed in ids, reused)
+    for (var i = t; i < visible; i += 256u) { keys[i] = 0u; }
+    workgroupBarrier();
+    for (var i = t; i < count; i += 256u) {
+        if (visible > keep) { keys[ids[i]] = 1u; } else { keys[i] = 1u; }
+    }
+    workgroupBarrier();
+    let per = (visible + 255u) / 256u;
+    let lo = t * per;
+    let hi = min(lo + per, visible);
+    var mine = 0u;
+    for (var i = lo; i < hi; i++) { mine += keys[i]; }
+    ids[t] = mine;
+    workgroupBarrier();
+    if (t == 0u) {
+        var at = 0u;
+        for (var w = 0u; w < 256u; w++) {
+            let c = ids[w];
+            ids[w] = at;
+            at += c;
+        }
+    }
+    workgroupBarrier();
+    var slot = ids[t];
+    for (var i = lo; i < hi; i++) {
+        if (keys[i] == 1u) {
+            list[r * keep + slot] = i;
+            slot += 1u;
+        }
+    }
+}
+"#;
+
+/// QSA's attention part, [`ATTENTION_PART4`]'s sums over a query's entries in turn: its kept blocks' positions (from
+/// `list`, ascending) then its tail block's, a workgroup a (head, run of 256 entries, query), the runs' parts as
+/// [`ATTENTION_ROWS_PART`] lays them out (for [`ATTENTION_ROWS_JOIN`]), the grid's third axis the queries. `p[0]`: n_h,
+/// n_kv, hd, first; `p[1]`: ratio, runs, scale, keep.
+const QSA_ATTENTION_PART: &str = r#"
+@group(0) @binding(0) var<storage, read> kv4: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> q4: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> list: array<u32>;
+@group(0) @binding(6) var<storage, read_write> y: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+var<workgroup> qs: array<vec4<f32>, 128>;
+var<workgroup> sc: array<f32, 256>;
+var<workgroup> at: array<u32, 256>;
+var<workgroup> red: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let n_h = p[0].x;
+    let n_kv = p[0].y;
+    let hd = p[0].z;
+    let first = p[0].w;
+    let ratio = p[1].x;
+    let runs = p[1].y;
+    let scale = bitcast<f32>(p[1].z);
+    let keep = p[1].w;
+    let rows = nwg.z;
+    let h = wg.x;
+    let run = wg.y;
+    let r = wg.z;
+    let pos = first + r;
+    let visible = (pos + 1u) / ratio;
+    let count = min(visible, keep);
+    let entries = count * ratio + (pos + 1u - visible * ratio);
+    let kh = h / (n_h / n_kv);
+    let hd4 = hd / 4u;
+    let kvd4 = n_kv * hd4;
+    let row4 = 2u * kvd4;
+    if (li < hd4) {
+        qs[li] = q4[(r * n_h + h) * hd4 + li];
+    }
+    let start = run * 256u;
+    let end = min(start + 256u, entries);
+    let e = start + li;
+    // the entry's position: a kept block's, or the tail's
+    var t = 0u;
+    if (e < count * ratio) {
+        t = list[r * keep + e / ratio] * ratio + e % ratio;
+    } else {
+        t = visible * ratio + (e - count * ratio);
+    }
+    at[li] = t;
+    workgroupBarrier();
+    var s = -3.4e38;
+    if (e < end) {
+        let kb = t * row4 + kh * hd4;
+        var a = vec4<f32>(0.0);
+        for (var d = 0u; d < hd4; d++) { a += qs[d] * kv4[kb + d]; }
+        s = (a.x + a.y + a.z + a.w) * scale;
+    }
+    red[li] = s;
+    workgroupBarrier();
+    for (var st = 128u; st > 0u; st /= 2u) {
+        if (li < st) { red[li] = max(red[li], red[li + st]); }
+        workgroupBarrier();
+    }
+    let m = red[0];
+    workgroupBarrier();
+    var ex = 0.0;
+    if (e < end) { ex = exp(s - m); }
+    sc[li] = ex;
+    red[li] = ex;
+    workgroupBarrier();
+    for (var st = 128u; st > 0u; st /= 2u) {
+        if (li < st) { red[li] += red[li + st]; }
+        workgroupBarrier();
+    }
+    let l = red[0];
+    let unit = (r * n_h + h) * runs + run;
+    let part = rows * n_h * hd + unit * hd;
+    var n = 0u;
+    if (end > start) { n = end - start; }
+    for (var d4 = li; d4 < hd4; d4 += 256u) {
+        var a0 = vec4<f32>(0.0);
+        var a1 = vec4<f32>(0.0);
+        var a2 = vec4<f32>(0.0);
+        var a3 = vec4<f32>(0.0);
+        let vb = kvd4 + kh * hd4 + d4;
+        var i = 0u;
+        for (; i + 4u <= n; i += 4u) {
+            a0 += sc[i] * kv4[vb + at[i] * row4];
+            a1 += sc[i + 1u] * kv4[vb + at[i + 1u] * row4];
+            a2 += sc[i + 2u] * kv4[vb + at[i + 2u] * row4];
+            a3 += sc[i + 3u] * kv4[vb + at[i + 3u] * row4];
+        }
+        for (; i < n; i++) { a0 += sc[i] * kv4[vb + at[i] * row4]; }
+        let o = (a0 + a1) + (a2 + a3);
+        y[part + d4 * 4u] = o.x;
+        y[part + d4 * 4u + 1u] = o.y;
+        y[part + d4 * 4u + 2u] = o.z;
+        y[part + d4 * 4u + 3u] = o.w;
+    }
+    if (li == 0u) {
+        let ml = rows * n_h * hd + rows * n_h * runs * hd + unit * 2u;
+        y[ml] = m;
+        y[ml + 1u] = select(0.0, l, n > 0u);
+    }
+}
+"#;
+
 /// A uniform's eight words, the rest of `words` zero.
 fn words8(words: &[u32]) -> [u32; 8] {
     let mut all = [0u32; 8];
@@ -1389,6 +1646,10 @@ impl DeviceChain for WgpuBackend {
 
     fn attention_rows_out_len(&self, rows: usize, n_h: usize, head_dim: usize, kv_len: usize) -> usize {
         rows * n_h * head_dim + rows * n_h * kv_len.div_ceil(SPLIT).max(1) * (head_dim + 2)
+    }
+
+    fn qsa_attention_out_len(&self, rows: usize, n_h: usize, head_dim: usize, keep: usize, ratio: usize) -> usize {
+        rows * n_h * head_dim + rows * n_h * (keep * ratio + ratio).div_ceil(256) * (head_dim + 2)
     }
 
     fn holds_exl3(&self, w: &dyn ggml_rs::exl3::PackedLinear) -> bool {
@@ -2044,6 +2305,44 @@ impl ChainRecorder for Recorder<'_> {
         self.dispatch(&part, buffer(kv), buffer(q), buffer(out), &params, (n_h as u32, runs as u32, 1));
         let join = self.named("chain-attention-join", ATTENTION_JOIN);
         self.dispatch(&join, buffer(kv), buffer(q), buffer(out), &params, (n_h as u32, 1, 1));
+    }
+
+    fn qsa_pool(&mut self, raw: &DeviceVec, pooled: &DeviceVec, blocks: usize, ratio: usize, d: usize) {
+        assert!(d <= 256 && raw.len >= blocks * ratio * d && pooled.len >= blocks * d, "chain: QSA's pool of {blocks} blocks");
+        let dd = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        let b = blocks as u32;
+        self.dispatch_wide("chain-qsa-pool", QSA_POOL, [buffer(raw), &dd, &dd, &dd, &dd, &dd, buffer(pooled), &drw], &[b, ratio as u32, d as u32], (b.min(65535), b.div_ceil(65535), 1));
+    }
+
+    fn qsa_scores(&mut self, q: &DeviceVec, pooled: &DeviceVec, scores: &DeviceVec, rows: usize, heads: usize, d: usize, nb: usize, first: usize, ratio: usize, scale: f32) {
+        assert!(heads * d <= 2048 && q.len >= rows * heads * d && pooled.len >= nb * d && scores.len >= rows * nb, "chain: QSA's scores of {rows} rows over {nb} blocks");
+        let dd = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        self.dispatch_wide("chain-qsa-scores", QSA_SCORES, [buffer(q), buffer(pooled), &dd, &dd, &dd, &dd, buffer(scores), &drw], &[rows as u32, heads as u32, d as u32, nb as u32, first as u32, ratio as u32, scale.to_bits()], ((nb as u32).div_ceil(256), rows as u32, 1));
+    }
+
+    fn qsa_select(&mut self, scores: &DeviceVec, list: &DeviceVec, rows: usize, nb: usize, first: usize, ratio: usize, keep: usize) {
+        assert!(nb <= 4096 && keep > 0 && scores.len >= rows * nb && list.len >= rows * keep, "chain: QSA's selection of {keep} of {nb} blocks");
+        let dd = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        self.dispatch_wide("chain-qsa-select", QSA_SELECT, [buffer(scores), &dd, &dd, &dd, &dd, &dd, buffer(list), &drw], &[rows as u32, nb as u32, first as u32, ratio as u32, keep as u32], (rows as u32, 1, 1));
+    }
+
+    fn qsa_attention(&mut self, q: &DeviceVec, kv: &DeviceVec, list: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, first: usize, ratio: usize, keep: usize, scale: f32) {
+        let runs = (keep * ratio + ratio).div_ceil(256);
+        assert!(
+            head_dim % 4 == 0 && head_dim <= 512 && q.len >= rows * n_h * head_dim && kv.len >= (first + rows) * 2 * n_kv * head_dim && list.len >= rows * keep && out.len >= self.backend.qsa_attention_out_len(rows, n_h, head_dim, keep, ratio),
+            "chain: QSA's attention's buffers"
+        );
+        let dd = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        let words = [n_h as u32, n_kv as u32, head_dim as u32, first as u32, ratio as u32, runs as u32, scale.to_bits(), keep as u32];
+        self.dispatch_wide("chain-qsa-attention-part", QSA_ATTENTION_PART, [buffer(kv), buffer(q), buffer(list), &dd, &dd, &dd, buffer(out), &drw], &words, (n_h as u32, runs as u32, rows as u32));
+        // the runs joined as a prompt's are (an empty run's sum 0 adds nothing)
+        let params = self.uniform(&[n_h as u32, n_kv as u32, head_dim as u32, first as u32, 0, runs as u32, scale.to_bits(), rows as u32]);
+        let join = self.named("chain-attention-rows-join", ATTENTION_ROWS_JOIN);
+        self.dispatch(&join, buffer(kv), buffer(q), buffer(out), &params, (n_h as u32, rows as u32, 1));
     }
 
     fn argmax_softmax(&mut self, x: &DeviceVec, out: &DeviceVec) {
@@ -2709,6 +3008,91 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// QSA chained gives the host's: the pooled block keys bit for bit, the block scores within rounding, each query's
+    /// chosen blocks the same, and its attention over them and its tail within rounding (Qwen3.8-Flash-Next's 4 index
+    /// heads of 128, 24 heads of 256 over 2 kv heads, blocks of 4, 64 kept of 750); and where a query keeps every
+    /// block, the dense decode attention's bits.
+    #[test]
+    fn qsa_chained_is_the_hosts() {
+        use ggml_rs::Backend;
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        let cpu = ggml_rs::CpuBackend::new();
+        let mut r = rng(29);
+        let (ratio, d, heads, keep, first, rows) = (4usize, 128usize, 4usize, 64usize, 2998usize, 3usize);
+        let (nh, nkv, hd) = (24usize, 2usize, 256usize);
+        let total = first + rows;
+        let nb = total / ratio;
+        let raw: Vec<f32> = (0..total * d).map(|_| r()).collect();
+        let t = |v: &[f32], shape: Vec<usize>| ggml_rs::Tensor::from_vec(v.to_vec(), shape);
+        let up = |v: &[f32]| {
+            let x = b.vec(v.len());
+            DeviceChain::upload(&b, &x, v);
+            x
+        };
+        // the pool
+        let (rawd, pooled) = (up(&raw), b.vec(nb * d));
+        let mut rec = b.begin();
+        rec.qsa_pool(&rawd, &pooled, nb, ratio, d);
+        rec.read(&pooled);
+        let got_pool = rec.finish().pop().unwrap();
+        let want_pool = cpu.qsa_pool(&t(&raw, vec![total, d]), nb, ratio);
+        assert_eq!(got_pool.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), want_pool.data().iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "the pooled keys");
+        // the scores, the selection, the attention
+        let q: Vec<f32> = (0..rows * heads * d).map(|_| r()).collect();
+        let qa: Vec<f32> = (0..rows * nh * hd).map(|_| r()).collect();
+        let (k, v): (Vec<f32>, Vec<f32>) = ((0..total * nkv * hd).map(|_| r()).collect(), (0..total * nkv * hd).map(|_| r()).collect());
+        let mut kv = Vec::with_capacity(total * 2 * nkv * hd);
+        for p in 0..total {
+            kv.extend_from_slice(&k[p * nkv * hd..(p + 1) * nkv * hd]);
+            kv.extend_from_slice(&v[p * nkv * hd..(p + 1) * nkv * hd]);
+        }
+        let scale = 1.0 / (d as f32).sqrt();
+        let ascale = 1.0 / (hd as f32).sqrt();
+        let (qd, scores, list, qad, kvd) = (up(&q), b.vec(rows * nb), b.vec(rows * keep), up(&qa), up(&kv));
+        let out = b.vec(DeviceChain::qsa_attention_out_len(&b, rows, nh, hd, keep, ratio));
+        let mut rec = b.begin();
+        rec.qsa_scores(&qd, &pooled, &scores, rows, heads, d, nb, first, ratio, scale);
+        rec.qsa_select(&scores, &list, rows, nb, first, ratio, keep);
+        rec.qsa_attention(&qad, &kvd, &list, &out, rows, nh, nkv, hd, first, ratio, keep, ascale);
+        rec.read(&scores);
+        rec.read(&list);
+        rec.read_range(&out, 0, rows * nh * hd);
+        let mut got = rec.finish();
+        let (got_out, got_list, got_scores) = (got.pop().unwrap(), got.pop().unwrap(), got.pop().unwrap());
+        let want_scores = cpu.qsa_block_scores(&t(&q, vec![rows, heads, d]), &want_pool.reshape(vec![nb, d]).unwrap(), first, ratio, scale);
+        for (i, (g, w)) in got_scores.iter().zip(want_scores.data()).enumerate() {
+            assert!(g == w || (g - w).abs() <= 1e-5 * w.abs().max(1.0), "score {i}: {g} against {w}");
+        }
+        let want_sel = cpu.qsa_select(&want_scores, first, ratio, keep);
+        let width = keep * ratio + ratio;
+        for row in 0..rows {
+            let mut want: Vec<u32> = want_sel.data()[row * width..row * width + keep * ratio].iter().step_by(ratio).map(|&v| v as u32 / ratio as u32).collect();
+            want.sort();
+            let got_row: Vec<u32> = got_list[row * keep..(row + 1) * keep].iter().map(|v| v.to_bits()).collect();
+            assert_eq!(got_row, want, "row {row}'s blocks");
+        }
+        let want_out = cpu.sparse_attention(&t(&qa, vec![rows, nh, hd]), &t(&k, vec![total, nkv, hd]), &t(&v, vec![total, nkv, hd]), &want_sel, ascale);
+        let scale_out = want_out.data().iter().fold(1e-6f32, |m, x| m.max(x.abs()));
+        for (i, (g, w)) in got_out.iter().zip(want_out.data()).enumerate() {
+            assert!((g - w).abs() <= 1e-5 * scale_out, "attention {i}: {g} against {w}");
+        }
+        // every block kept: the dense decode attention, bit for bit
+        let (few, at) = (40usize, 37usize);
+        let mut rec = b.begin();
+        let q1 = up(&qa[..nh * hd]);
+        let (dense, sparse, l2, s2) = (b.vec(DeviceChain::attention_out_len(&b, nh, hd, total)), b.vec(DeviceChain::qsa_attention_out_len(&b, 1, nh, hd, few, ratio)), b.vec(few), b.vec(few));
+        rec.qsa_scores(&q1, &pooled, &s2, 1, 1, d, at / ratio, at, ratio, scale);
+        let _ = (heads, &l2);
+        rec.qsa_select(&s2, &l2, 1, at / ratio, at, ratio, few);
+        rec.qsa_attention(&q1, &kvd, &l2, &sparse, 1, nh, nkv, hd, at, ratio, few, ascale);
+        rec.attention(&q1, &kvd, &dense, nh, nkv, hd, 0, at + 1, total, ascale);
+        rec.read_range(&sparse, 0, nh * hd);
+        rec.read_range(&dense, 0, nh * hd);
+        let mut got = rec.finish();
+        let (dn, sp) = (got.pop().unwrap(), got.pop().unwrap());
+        assert_eq!(sp.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), dn.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "every block kept: the dense attention");
     }
 
     /// A draft's token from logits on the device is the host's: the first of equal largest, and the sum of the

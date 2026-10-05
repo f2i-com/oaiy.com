@@ -1327,8 +1327,9 @@ enum ChainMixer {
     /// The beta-alpha projection, the conv's weights, `A`, `dt_bias`, the output norm, and which of the recurrent
     /// states' pool is this layer's.
     Gdn { ba: ChainMat, conv: ggml_rs::DeviceVec, a: ggml_rs::DeviceVec, dt: ggml_rs::DeviceVec, norm: ggml_rs::DeviceVec, slot: usize },
-    /// The per-head norms, and which of its device's copy of the cache is this layer's.
-    Attn { q_norm: ggml_rs::DeviceVec, k_norm: ggml_rs::DeviceVec, slot: usize },
+    /// The per-head norms, the indexer's (QSA's query and pooled key norms), and which of its device's copy of the
+    /// cache is this layer's.
+    Attn { q_norm: ggml_rs::DeviceVec, k_norm: ggml_rs::DeviceVec, iq_norm: ggml_rs::DeviceVec, ik_norm: ggml_rs::DeviceVec, slot: usize },
 }
 
 /// A device's working vectors for a step (one row).
@@ -1363,13 +1364,39 @@ struct ChainDev {
     head: ggml_rs::DeviceVec,
 }
 
-/// A device's copy of its attention layers' caches (row `t`: K `[kv_heads, head_dim]` then V), `cap` rows.
+/// A device's copy of its attention layers' caches (row `t`: K `[kv_heads, head_dim]` then V), `cap` rows, and of their
+/// raw indexer keys (`[cap, index_dim]`, QSA's pool reads them past the dense span).
 struct ChainKv {
     layers: Vec<ggml_rs::DeviceVec>,
+    raw: Vec<ggml_rs::DeviceVec>,
     cap: usize,
     out: ggml_rs::DeviceVec,
+    /// QSA's vectors for a step's or a check's rows, made at the first past the dense span (for this `cap`).
+    qsa: Option<QsaVecs>,
     /// The `KvCache::id` the rows are a copy of (0: none).
     owner: u64,
+}
+
+/// QSA's vectors on a device for runs of up to `rows` rows over a cache of `cap` positions: the indexer's queries (in,
+/// normed), the pooled block keys (in, normed) and the RoPE table of the blocks' starts, the block scores, each row's
+/// blocks, and the attention's output and parts.
+struct QsaVecs {
+    rows: usize,
+    iq: ggml_rs::DeviceVec,
+    iqn: ggml_rs::DeviceVec,
+    pooled: ggml_rs::DeviceVec,
+    pooledn: ggml_rs::DeviceVec,
+    table: ggml_rs::DeviceVec,
+    scores: ggml_rs::DeviceVec,
+    list: ggml_rs::DeviceVec,
+    out: ggml_rs::DeviceVec,
+}
+
+/// `v`'s first `len` elements as a vector of their own (the same buffer): a chain's ops take their sizes from their
+/// vectors' lengths.
+fn first(v: &ggml_rs::DeviceVec, len: usize) -> ggml_rs::DeviceVec {
+    assert!(len <= v.len, "{len} of a vector of {}", v.len);
+    ggml_rs::DeviceVec { len, inner: Arc::clone(&v.inner) }
 }
 
 /// What a chained step changes: the devices' copies of the cache, and the recurrent states the cache's tensors alias.
@@ -1605,7 +1632,7 @@ impl FlashNext {
                                 return None;
                             }
                             attn_of[d].push(i);
-                            ChainMixer::Attn { q_norm: up(d, &a.q_norm), k_norm: up(d, &a.k_norm), slot: attn_of[d].len() - 1 }
+                            ChainMixer::Attn { q_norm: up(d, &a.q_norm), k_norm: up(d, &a.k_norm), iq_norm: up(d, &a.index_q_norm), ik_norm: up(d, &a.index_k_norm), slot: attn_of[d].len() - 1 }
                         }
                     };
                     if !chains[d].holds_experts(l.moe.experts.as_ref()) {
@@ -1648,7 +1675,7 @@ impl FlashNext {
                 let rank = layers.iter().map(|l| l.attn_hc.rank.max(l.mlp_hc.rank)).max().unwrap_or(0).max(collapse.rank).max(mtp_rank);
                 let devs = chains.iter().map(|c| chain_dev(*c, cfg, rank, 1, 1)).collect();
                 let keys = chains.iter().zip(&attn_of).map(|(c, a)| c.vec(a.len().max(1) * cfg.index_dim)).collect();
-                let kv = chains.iter().map(|c| ChainKv { layers: Vec::new(), cap: 0, out: c.vec(1), owner: 0 }).collect();
+                let kv = chains.iter().map(|c| ChainKv { layers: Vec::new(), raw: Vec::new(), cap: 0, out: c.vec(1), qsa: None, owner: 0 }).collect();
                 let pool = gdn
                     .iter()
                     .map(|&i| {
@@ -1803,9 +1830,11 @@ impl FlashNext {
         let past = kv.len;
         let t = tokens.len();
         let ratio = cfg.index_ratio;
-        if t == 0 || past + t > cfg.index_budget / ratio * ratio + ratio - 1 {
+        // past the dense span the attention layers' queries attend to their QSA blocks (at most 4096 blocks)
+        if t == 0 || (past + t) / ratio > 4096 {
             return None;
         }
+        let sparse = past + t > cfg.index_budget / ratio * ratio + ratio - 1;
         let st = self.chain_state()?;
         let chains: Vec<&dyn ggml_rs::DeviceChain> = self.devices.iter().map(|b| b.chain()).collect::<Option<_>>()?;
         let (h, s) = (cfg.hidden, cfg.streams);
@@ -1815,6 +1844,7 @@ impl FlashNext {
         let eps = cfg.eps;
         let few = (2..=CHECK_ROWS).contains(&t);
         assert!(!check || few, "a check of 2 to {CHECK_ROWS} rows");
+        let id_dim = cfg.index_dim;
         let mut m = st.m.lock().unwrap_or_else(|p| p.into_inner());
         // the devices' copies of the attention caches: room for this run, the rows the host wrote since
         for (d, layers) in st.attn_of.iter().enumerate() {
@@ -1822,7 +1852,9 @@ impl FlashNext {
             if g.cap < past + t {
                 let cap = (past + t).next_power_of_two().max(256);
                 g.layers = (0..layers.len()).map(|i| match g.layers.get(i) { Some(old) => chains[d].resize(old, cap * row), None => chains[d].vec(cap * row) }).collect();
+                g.raw = (0..layers.len()).map(|i| match g.raw.get(i) { Some(old) => chains[d].resize(old, cap * id_dim), None => chains[d].vec(cap * id_dim) }).collect();
                 g.out = chains[d].vec(chains[d].attention_out_len(nh, hd, cap));
+                g.qsa = None;
                 g.cap = cap;
             }
             let from = if g.owner == kv.id { kv.dirty_from.min(past) } else { 0 };
@@ -1835,9 +1867,16 @@ impl FlashNext {
                         rows.extend_from_slice(&vh.data()[t * kvd..(t + 1) * kvd]);
                     }
                     chains[d].upload_at(&g.layers[slot], from * row, &rows);
+                    // and its raw indexer keys
+                    let Mixer::Attn(a) = &self.layers[l].mixer else { unreachable!("layer {l} attends") };
+                    let raw = kv.k_buffer(a.index_slot).to_host();
+                    chains[d].upload_at(&g.raw[slot], from * id_dim, &raw.data()[from * id_dim..past * id_dim]);
                 }
             }
             g.owner = kv.id;
+            if sparse && t <= CHECK_ROWS && !layers.is_empty() && g.qsa.is_none() {
+                g.qsa = Some(self.qsa_vecs(chains[d], CHECK_ROWS, g.cap));
+            }
         }
         // the delta-net layers' recurrent states as the chain's vectors (the cache aliasing them)
         let mut states = Vec::with_capacity(st.gdn.len());
@@ -1955,6 +1994,10 @@ impl FlashNext {
                 Some(m.rows_out[d].clone())
             })
             .collect();
+        // a prompt's chunk's QSA vectors (past the dense span) and its rows' raw indexer keys, on every device with
+        // attention layers
+        let prompt_qsa: Vec<Option<QsaVecs>> = chains.iter().enumerate().map(|(d, c)| (sparse && t > CHECK_ROWS && !st.attn_of[d].is_empty()).then(|| self.qsa_vecs(*c, t, m.kv[d].cap))).collect();
+        let prompt_keys: Vec<Option<ggml_rs::DeviceVec>> = chains.iter().enumerate().map(|(d, c)| (t > CHECK_ROWS && !st.attn_of[d].is_empty()).then(|| c.vec(t * id_dim))).collect();
         // the n-gram features (on the n-gram layer's device, where it is chained), then the embedding in every stream
         let ple_emb = self.ple_embed(self.devices[ple_device].as_ref(), tokens, kv).ok()?;
         let ple_owned: Option<PleVecs>;
@@ -2093,7 +2136,7 @@ impl FlashNext {
                     rec.delta_net(&dv.conv, &dv.z, bav, a, dt, norm, sv, &dv.core, dn);
                     rec.exl3_rows(chain_packed(&g.out)?, &dv.core, &dv.y_out, t);
                 }
-                (Mixer::Attn(a), ChainMixer::Attn { q_norm, k_norm, slot }) => {
+                (Mixer::Attn(a), ChainMixer::Attn { q_norm, k_norm, iq_norm, ik_norm, slot }) => {
                     let g = &m.kv[d];
                     let kvl = &g.layers[*slot];
                     rec.exl3_rows(chain_packed(&a.q)?, &dv.y_in, &dv.qfull, t);
@@ -2107,6 +2150,16 @@ impl FlashNext {
                             None => rec.copy(&dv.index, iq, &st.keys[d], slot * id, id),
                         }
                     }
+                    // and into the device's copy of the raw keys (QSA's pool reads them past the dense span)
+                    match (t, few_set, &prompt_keys[d]) {
+                        (1, _, _) => rec.copy(&dv.index, iq, &g.raw[*slot], past * id, id),
+                        (_, Some(f), _) => rec.store_rows(&f.keys[d][*slot], &g.raw[*slot], t, id, past, id, 0),
+                        (_, None, Some(keys)) => {
+                            rec.copy_cols(&dv.index, keys, t, id, iq + id, iq);
+                            rec.store_rows(keys, &g.raw[*slot], t, id, past, id, 0);
+                        }
+                        _ => unreachable!("a run's raw keys have a place"),
+                    }
                     rec.copy_cols(&dv.qfull, &dv.q, t * nh, hd, 2 * hd, 0);
                     rec.copy_cols(&dv.qfull, &dv.gate, t * nh, hd, 2 * hd, hd);
                     rec.rmsnorm_rows(&dv.q, q_norm, &dv.qn, t * nh, eps);
@@ -2116,8 +2169,25 @@ impl FlashNext {
                     rec.store_rows(&dv.kn, kvl, t, kvd, past, row, 0);
                     rec.store_rows(&dv.v, kvl, t, kvd, past, row, kvd);
                     let scale = 1.0 / (hd as f32).sqrt();
-                    let out = match &attn_rows[d] {
-                        Some(scratch) if few => {
+                    let qsa = g.qsa.as_ref().filter(|q| q.rows >= t).or(prompt_qsa[d].as_ref());
+                    let out = match (&attn_rows[d], qsa) {
+                        (_, Some(q)) if sparse => {
+                            // past the dense span: the indexer's queries, the cache's pooled block keys, each row's top
+                            // blocks, and its attention over them and its tail block
+                            let (ih, nb, keep) = (cfg.index_heads, (past + t) / ratio, cfg.index_budget / ratio);
+                            let (iqv, iqn, pooled, pooledn) = (first(&q.iq, t * ih * id), first(&q.iqn, t * ih * id), first(&q.pooled, nb * id), first(&q.pooledn, nb * id));
+                            rec.copy_cols(&dv.index, &iqv, t, ih * id, iq + id, 0);
+                            rec.rmsnorm_rows(&iqv, iq_norm, &iqn, t * ih, eps);
+                            rec.rope_partial_rows(&iqn, t, ih, id, rot, &dv.table);
+                            rec.qsa_pool(&g.raw[*slot], &pooled, nb, ratio, id);
+                            rec.rmsnorm_rows(&pooled, ik_norm, &pooledn, nb, eps);
+                            rec.rope_partial_rows(&pooledn, nb, 1, id, rot, &q.table);
+                            rec.qsa_scores(&iqn, &pooledn, &q.scores, t, ih, id, nb, past, ratio, 1.0 / (id as f32).sqrt());
+                            rec.qsa_select(&q.scores, &q.list, t, nb, past, ratio, keep);
+                            rec.qsa_attention(&dv.qn, kvl, &q.list, &q.out, t, nh, nkv, hd, past, ratio, keep, scale);
+                            &q.out
+                        }
+                        (Some(scratch), _) if few => {
                             // a row at a time as a step attends (the decode kernel's sums: a check's rows a step's bit
                             // for bit)
                             let (q1, qh) = (&few_set.expect("a few rows' vectors").q1[d], nh * hd);
@@ -2128,11 +2198,11 @@ impl FlashNext {
                             }
                             scratch
                         }
-                        Some(scratch) => {
+                        (Some(scratch), _) => {
                             rec.attention_rows(&dv.qn, kvl, scratch, t, nh, nkv, hd, past, None, scale);
                             scratch
                         }
-                        None => {
+                        (None, _) => {
                             rec.attention(&dv.qn, kvl, &g.out, nh, nkv, hd, 0, past + 1, g.cap, scale);
                             &g.out
                         }
@@ -2242,6 +2312,27 @@ impl FlashNext {
         std::env::var_os("OAIY_NO_CHAIN").is_none() && self.chain_state().is_some_and(|c| c.mtp.is_some())
     }
 
+    /// QSA's vectors on `c` for runs of up to `rows` rows over a cache of `cap` positions.
+    fn qsa_vecs(&self, c: &dyn ggml_rs::DeviceChain, rows: usize, cap: usize) -> QsaVecs {
+        let cfg = &self.config;
+        let (ratio, id, keep) = (cfg.index_ratio, cfg.index_dim, cfg.index_budget / cfg.index_ratio);
+        let blocks = cap / ratio;
+        let v = |n: usize| c.vec(n.max(1));
+        let table = v(blocks * cfg.rope_dim);
+        c.upload(&table, &self.rope_table_of((0..blocks).map(|j| j * ratio)));
+        QsaVecs {
+            rows,
+            iq: v(rows * cfg.index_heads * id),
+            iqn: v(rows * cfg.index_heads * id),
+            pooled: v(blocks * id),
+            pooledn: v(blocks * id),
+            table,
+            scores: v(rows * blocks),
+            list: v(rows * keep),
+            out: v(c.qsa_attention_out_len(rows, cfg.heads, cfg.head_dim, keep, ratio)),
+        }
+    }
+
     /// The prediction layer's cache with room for `len` positions (grown as the trunk's copy is).
     fn mtp_reserve<'a>(c: &dyn ggml_rs::DeviceChain, g: &'a mut Option<MtpKv>, cfg: &Config, len: usize) -> &'a mut MtpKv {
         let row = 2 * cfg.kv_heads * cfg.head_dim;
@@ -2257,8 +2348,13 @@ impl FlashNext {
 
     /// The partial RoPE's sines and cosines at positions `at..at + rows`.
     fn rope_table(&self, at: usize, rows: usize) -> Vec<f32> {
+        self.rope_table_of(at..at + rows)
+    }
+
+    /// The partial RoPE's sines and cosines at `positions`.
+    fn rope_table_of(&self, positions: impl Iterator<Item = usize>) -> Vec<f32> {
         let (cfg, rot) = (&self.config, self.config.rope_dim);
-        (at..at + rows)
+        positions
             .flat_map(|pos| {
                 (0..rot / 2).flat_map(move |k| {
                     let (sn, cs) = (pos as f32 * cfg.rope_theta.powf(-2.0 * k as f32 / rot as f32)).sin_cos();

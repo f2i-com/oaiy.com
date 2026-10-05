@@ -76,6 +76,12 @@ pub trait DeviceChain: Send + Sync {
     fn attention_out_len(&self, n_h: usize, head_dim: usize, cap: usize) -> usize;
     /// The length [`ChainRecorder::attention_rows`]'s `out` needs for `rows` queries over `kv_len` positions.
     fn attention_rows_out_len(&self, rows: usize, n_h: usize, head_dim: usize, kv_len: usize) -> usize;
+    /// The length of [`ChainRecorder::qsa_attention`]'s `out` for `rows` queries of `keep` blocks of `ratio` (its
+    /// results first, `[rows, n_h, head_dim]`), or 0 where the device has no such kernels.
+    fn qsa_attention_out_len(&self, rows: usize, n_h: usize, head_dim: usize, keep: usize, ratio: usize) -> usize {
+        let _ = (rows, n_h, head_dim, keep, ratio);
+        0
+    }
     /// Start recording.
     fn begin(&self) -> Box<dyn ChainRecorder + '_>;
 }
@@ -239,6 +245,36 @@ pub trait ChainRecorder {
     /// an f32's bits), `out[1]` the largest, `out[2]` the sum of `exp(x[i] - out[1])` (the token's probability its
     /// inverse), where reading the logits back cost a draft a millisecond.
     fn argmax_softmax(&mut self, x: &DeviceVec, out: &DeviceVec);
+    /// QSA's pooled block keys (`Backend::qsa_pool`): `pooled[b] = mean of raw rows b ratio .. (b + 1) ratio`, the
+    /// first `blocks` blocks of `raw` (`[.., d]`).
+    fn qsa_pool(&mut self, raw: &DeviceVec, pooled: &DeviceVec, blocks: usize, ratio: usize, d: usize) {
+        let _ = (raw, pooled, blocks, ratio, d);
+        unimplemented!("QSA on this device")
+    }
+    /// QSA's block scores (`Backend::qsa_block_scores`): `scores[r, j] = scale * sum over the heads of relu(q[r, h] .
+    /// pooled[j])` for the `nb` blocks query `r` (at position `first + r`) sees whole, `-inf` for the rest.
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_scores(&mut self, q: &DeviceVec, pooled: &DeviceVec, scores: &DeviceVec, rows: usize, heads: usize, d: usize, nb: usize, first: usize, ratio: usize, scale: f32) {
+        let _ = (q, pooled, scores, rows, heads, d, nb, first, ratio, scale);
+        unimplemented!("QSA on this device")
+    }
+    /// QSA's selection (`Backend::qsa_select`): each query's `keep` best whole blocks (all of them where it sees no
+    /// more), the larger score first and the lower block of equals, into `list[r, ..keep]` in ascending order. At most
+    /// 4096 blocks (16,384 positions of 4).
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_select(&mut self, scores: &DeviceVec, list: &DeviceVec, rows: usize, nb: usize, first: usize, ratio: usize, keep: usize) {
+        let _ = (scores, list, rows, nb, first, ratio, keep);
+        unimplemented!("QSA on this device")
+    }
+    /// QSA's attention (`Backend::sparse_attention`): each query `r` (at position `first + r`) over its blocks in
+    /// `list` (ascending) then its incomplete tail block, as the decode attention sums them; the cache `kv` as
+    /// [`Self::attention_rows`] reads it, `out` [`DeviceChain::qsa_attention_out_len`] long, its first `rows * n_h *
+    /// head_dim` the results.
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_attention(&mut self, q: &DeviceVec, kv: &DeviceVec, list: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, first: usize, ratio: usize, keep: usize, scale: f32) {
+        let _ = (q, kv, list, out, rows, n_h, n_kv, head_dim, first, ratio, keep, scale);
+        unimplemented!("QSA on this device")
+    }
     /// Read `v` back once the chain has run.
     fn read(&mut self, v: &DeviceVec) {
         self.read_range(v, 0, v.len)
