@@ -2463,7 +2463,8 @@ mod dense_webgpu_timing {
         let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
         let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
         let mut results = Vec::new();
-        for round in 0..2 {
+        let rounds: usize = std::env::var("QWEN35_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+        for round in 0..rounds {
             for whole in [false, true] {
                 let mut kv = model.new_kv_cache(4096);
                 let t = std::time::Instant::now();

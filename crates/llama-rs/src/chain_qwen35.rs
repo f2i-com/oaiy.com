@@ -325,6 +325,33 @@ struct Work {
 }
 
 impl Work {
+    /// Its first `t` rows' vectors (the same buffers): a pooled set's for a chunk of fewer rows than it has room for.
+    fn view(&self, s: &Dims, t: usize) -> Work {
+        Work {
+            x: first(&self.x, t * s.d),
+            xn: first(&self.xn, t * s.d),
+            qkv: first(&self.qkv, t * s.ch),
+            z: first(&self.z, t * s.nv * s.dv),
+            ba: first(&self.ba, t * 2 * s.nv),
+            conv: first(&self.conv, t * s.ch),
+            core: first(&self.core, t * s.nv * s.dv),
+            proj: first(&self.proj, t * s.d),
+            qfull: first(&self.qfull, t * s.n_h * 2 * s.hd),
+            q: first(&self.q, t * s.n_h * s.hd),
+            gate: first(&self.gate, t * s.n_h * s.hd),
+            k: first(&self.k, t * s.n_kv * s.hd),
+            v: first(&self.v, t * s.n_kv * s.hd),
+            qn: first(&self.qn, t * s.n_h * s.hd),
+            kn: first(&self.kn, t * s.n_kv * s.hd),
+            gated: first(&self.gated, t * s.n_h * s.hd),
+            ffa: first(&self.ffa, t * 2 * s.ff),
+            ffb: first(&self.ffb, t * s.ff),
+            act: first(&self.act, t * s.ff),
+            table: first(&self.table, t * s.rot),
+            last: self.last.clone(),
+        }
+    }
+
     fn new(chain: &dyn DeviceChain, s: &Dims, t: usize) -> Work {
         let v = |n: usize| chain.vec(n);
         Work {
@@ -368,6 +395,10 @@ struct State {
     logits: DeviceVec,
     /// Drafting and checking, where the model has a multi-token-prediction layer the device holds.
     spec: Option<Spec>,
+    /// A prompt's chunks' vectors, each set room for the most rows a chunk has, and their attention's scratch: taken
+    /// by a chunk and given back once it has run (each chunk's new ones, some 25 buffers and 0.5 GB, were the
+    /// allocator's every 200 ms).
+    prompt_sets: Mutex<Vec<(Work, DeviceVec)>>,
 }
 
 fn quant(w: &Weight) -> &QuantizedTensor {
@@ -808,6 +839,8 @@ pub(crate) struct Qwen35Run<'a> {
     past: usize,
     t: usize,
     vocab: usize,
+    /// A prompt chunk's pooled vectors, back to the pool once the run is done
+    set: Option<(&'a Mutex<Vec<(Work, DeviceVec)>>, (Work, DeviceVec))>,
 }
 
 impl Qwen35Run<'_> {
@@ -815,6 +848,9 @@ impl Qwen35Run<'_> {
     /// cache, which the device's copy already holds.
     fn finish(self, backend: &dyn Backend, kv: &mut KvCache) -> Vec<Tensor> {
         let mut got = self.rec.finish().into_iter();
+        if let Some((pool, set)) = self.set {
+            pool.lock().unwrap_or_else(|p| p.into_inner()).push(set);
+        }
         let logits = got.next().expect("the logits");
         let logits: Vec<Tensor> = logits.chunks_exact(self.vocab).map(|l| Tensor::from_vec(l.to_vec(), vec![1, self.vocab])).collect();
         let len = kv.len;
@@ -965,6 +1001,7 @@ impl Qwen35Chain {
                     step: Work::new(chain, &dims, 1),
                     logits: chain.vec(cfg.vocab_size),
                     spec,
+                    prompt_sets: Mutex::new(Vec::new()),
                 })
             })
             .as_ref()
@@ -1261,7 +1298,7 @@ impl Qwen35Chain {
     /// [`Self::run`] up to its wait: its work gone to the GPU, `kv` committed (its rows the device's copy's; into
     /// the host's cache at the finish).
     #[allow(clippy::too_many_arguments)]
-    fn run_begin<'a>(&self, m: &Qwen35Model, st: &State, chain: &'a dyn DeviceChain, emb: &[f32], t: usize, kv: &mut KvCache, checking: bool) -> Qwen35Run<'a> {
+    fn run_begin<'a>(&self, m: &Qwen35Model, st: &'a State, chain: &'a dyn DeviceChain, emb: &[f32], t: usize, kv: &mut KvCache, checking: bool) -> Qwen35Run<'a> {
         let s = st.dims;
         let cfg = &m.config;
         let row = 2 * s.n_kv * s.hd;
@@ -1280,14 +1317,25 @@ impl Qwen35Chain {
             states.push((state, conv));
         }
         drop(pool);
+        // a prompt's chunk's vectors a pooled set's (room for a chunk of the most rows), its attention's scratch grown
+        // as the positions it reaches do
+        let mut set = None;
         let prompt;
         let w = if t == 1 {
             &st.step
         } else {
-            prompt = Work::new(chain, &s, t);
+            let taken = st.prompt_sets.lock().unwrap_or_else(|p| p.into_inner()).pop();
+            let (full, scratch) = taken.filter(|(f, _)| f.x.len >= t * s.d).unwrap_or_else(|| (Work::new(chain, &s, t.max(2 * MAX_ROWS)), chain.vec(1)));
+            let need = chain.attention_rows_out_len(t, s.n_h, s.hd, past + t);
+            let scratch = if scratch.len >= need { scratch } else { chain.vec(need + need / 2) };
+            prompt = full.view(&s, t);
+            set = Some((full, scratch));
             &prompt
         };
-        let attn = if t == 1 { g.out.clone() } else { chain.vec(chain.attention_rows_out_len(t, s.n_h, s.hd, past + t)) };
+        let attn = match &set {
+            None => g.out.clone(),
+            Some((_, scratch)) => first(scratch, chain.attention_rows_out_len(t, s.n_h, s.hd, past + t)),
+        };
         chain.upload(&w.table, &rope_table(cfg.rope_theta, s.rot, past, t));
         chain.upload(&w.x, emb);
         let mut rec = chain.begin();
@@ -1335,7 +1383,7 @@ impl Qwen35Chain {
         kv.commit(t);
         kv.dirty_from = usize::MAX;
         self.runs.fetch_add(1, Ordering::Relaxed);
-        Qwen35Run { rec, layers: st.attention_layers.clone(), past, t, vocab: s.vocab }
+        Qwen35Run { rec, layers: st.attention_layers.clone(), past, t, vocab: s.vocab, set: set.map(|v| (&st.prompt_sets, v)) }
     }
 
     /// The prediction layer's cache at a prompt's chunk (`t` rows at `past`, its embeddings `emb`, its hidden states
