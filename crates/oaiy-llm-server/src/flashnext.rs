@@ -1844,6 +1844,54 @@ impl FlashNext {
     /// logits; every row's for a check (`check`: undoable, see [`Self::rollback`]). None leaves the run to `forward`'s
     /// own path: past the dense span (QSA's sparse attention), or with images.
     fn run_chained(&self, tokens: &[u32], embeds: &Tensor, kv: &mut KvCache, check: bool) -> Option<Vec<f32>> {
+        let run = self.run_begin(tokens, embeds, kv, check, &mut None)?;
+        Some(run.finish(self, kv))
+    }
+
+    /// A prompt's chunks in turn, chained, each chunk's first devices' layers run as the last device runs the chunk
+    /// before's (`kv` then holds them all): the last chunk's logits, or None where a chunk cannot be chained (the
+    /// chunks before it run, `done` of each said; the rest the caller's). `done(i)` once chunk `i` has gone to the
+    /// GPUs (its K and V in the host's cache once the next has).
+    pub fn forward_chunks(&self, chunks: &[(&[u32], &Tensor)], kv: &mut KvCache, done: &mut dyn FnMut(usize)) -> Option<Tensor> {
+        let mut pending: Option<ChainedRun<'_>> = None;
+        let mut last = None;
+        for (i, (tokens, embeds)) in chunks.iter().enumerate() {
+            let run = if tokens.len() <= 512 && !profile::on() { self.run_begin(tokens, embeds, kv, false, &mut pending) } else { None };
+            let Some(run) = run else {
+                if let Some(p) = pending.take() {
+                    p.finish(self, kv);
+                }
+                return None;
+            };
+            // (one the run did not take: a chain on one device)
+            if let Some(p) = pending.replace(run) {
+                p.finish(self, kv);
+            }
+            done(i);
+        }
+        if let Some(p) = pending.take() {
+            last = Some(p.finish(self, kv));
+        }
+        last.map(|l| Tensor::from_vec(l, vec![1, self.config.vocab]))
+    }
+
+    /// An attention layer's rows of a chained run (`t` of them from `at`, K then V each, and its indexer keys) into
+    /// the host's cache.
+    fn cache_rows(&self, kv: &mut KvCache, i: usize, at: usize, t: usize, kvrows: Vec<f32>, raw: Vec<f32>) {
+        let Mixer::Attn(a) = &self.layers[i].mixer else { unreachable!("layer {i} attends") };
+        let b = self.devices[self.layers[i].device].as_ref();
+        let id = self.config.index_dim;
+        let len = kv.len;
+        kv.len = at;
+        kv.append(b, a.index_slot, &Tensor::from_vec(raw.clone(), vec![t, 1, id]), &Tensor::from_vec(raw, vec![t, 1, id]));
+        kv.append_rows(b, i, &kvrows, t);
+        kv.len = len;
+    }
+
+    /// [`Self::run_chained`] up to its last device's wait: every device's work gone (the last's running), `kv`
+    /// committed; `prev` (a chunk's run before this one's, its last device still running) finished as the next
+    /// device's layers are recorded, so the device holds one chunk's scratch at a time.
+    fn run_begin<'a>(&'a self, tokens: &[u32], embeds: &Tensor, kv: &mut KvCache, check: bool, prev: &mut Option<ChainedRun<'a>>) -> Option<ChainedRun<'a>> {
         use ggml_rs::{ChainRecorder, DeltaNet};
         use std::sync::atomic::Ordering;
         if std::env::var_os("OAIY_NO_CHAIN").is_some() {
@@ -2076,12 +2124,7 @@ impl FlashNext {
         };
         // an attention layer's K and V rows and its indexer keys (`[t, index_dim]`), read back, into the host's cache
         let (iq, id) = (cfg.index_heads * cfg.index_dim, cfg.index_dim);
-        let to_cache = |i: usize, kvrows: Vec<f32>, raw: Vec<f32>, kv: &mut KvCache| {
-            let Mixer::Attn(a) = &self.layers[i].mixer else { unreachable!("layer {i} attends") };
-            let b = self.devices[self.layers[i].device].as_ref();
-            kv.append(b, a.index_slot, &Tensor::from_vec(raw.clone(), vec![t, 1, id]), &Tensor::from_vec(raw, vec![t, 1, id]));
-            kv.append_rows(b, i, &kvrows, t);
-        };
+        let to_cache = |i: usize, kvrows: Vec<f32>, raw: Vec<f32>, kv: &mut KvCache| self.cache_rows(kv, i, past, t, kvrows, raw);
         // the recording open on device `d`, and the attention layers whose rows and keys it reads (in order, before
         // whatever else it reads)
         let mut open: Option<Box<dyn ChainRecorder + '_>> = None;
@@ -2107,12 +2150,19 @@ impl FlashNext {
                 rec.read(&devs[d].x);
                 rec.flush();
                 handoffs.push((rec, dev, std::mem::take(&mut attn_reads)));
+                // the chunk before's last device done with (its scratch back) before this chunk's work there
+                if let Some(p) = prev.take() {
+                    p.finish(self, kv);
+                }
                 d = dev;
                 let mut r = chains[d].begin();
                 r.keep_groups(keep);
                 r.hold();
                 open = Some(r);
             } else if dev != d || ple_here && ple_vs.is_none() {
+                if let Some(p) = prev.take() {
+                    p.finish(self, kv);
+                }
                 // (a handoff before this one's first: its streams up to its next device before that one's held work
                 // is finished below)
                 for (from, to, reads) in handoffs.drain(..) {
@@ -2357,15 +2407,12 @@ impl FlashNext {
         }
         // the last device's work going (held till its streams were up) as the host stores the others' rows
         rec.flush();
+        if let Some(p) = prev.take() {
+            p.finish(self, kv);
+        }
         for (a, kvrows, raw) in to_store.drain(..) {
             to_cache(a, kvrows, raw, kv);
         }
-        let mut got = rec.finish().into_iter();
-        for &a in &attn_reads {
-            let (kvrows, raw) = (got.next().expect("a layer's K and V"), got.next().expect("its indexer keys"));
-            to_cache(a, kvrows, raw, kv);
-        }
-        let logits = got.next().expect("the logits");
         if let Some(at) = hid {
             m.mtp_hid = at;
         }
@@ -2375,11 +2422,38 @@ impl FlashNext {
             self.decoded.store(true, Ordering::Relaxed);
         }
         st.runs.fetch_add(1, Ordering::Relaxed);
-        Some(logits)
+        Some(ChainedRun { rec, attn_reads, at: past, t })
+    }
+}
+
+/// A chained run whose last device is running: its recording (the run's reads its attention layers' rows, then
+/// the logits) and where its rows go in the host's cache.
+struct ChainedRun<'a> {
+    rec: Box<dyn ggml_rs::ChainRecorder + 'a>,
+    attn_reads: Vec<usize>,
+    at: usize,
+    t: usize,
+}
+
+impl ChainedRun<'_> {
+    /// Its last device waited for: its attention layers' rows into the host's cache, the logits.
+    fn finish(self, fnx: &FlashNext, kv: &mut KvCache) -> Vec<f32> {
+        let mut got = self.rec.finish().into_iter();
+        for &a in &self.attn_reads {
+            let (kvrows, raw) = (got.next().expect("a layer's K and V"), got.next().expect("its indexer keys"));
+            fnx.cache_rows(kv, a, self.at, self.t, kvrows, raw);
+        }
+        kv.dirty_from = usize::MAX;
+        got.next().expect("the logits")
     }
 }
 
 impl FlashNext {
+    /// The devices its layers are over.
+    pub fn devices_len(&self) -> usize {
+        self.devices.len()
+    }
+
     /// Whether the chain drafts tokens (its multi-token-prediction layer loaded and chained).
     pub fn drafts(&self) -> bool {
         std::env::var_os("OAIY_NO_CHAIN").is_none() && self.chain_state().is_some_and(|c| c.mtp.is_some())

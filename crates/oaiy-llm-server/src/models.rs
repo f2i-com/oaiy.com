@@ -1428,6 +1428,75 @@ mod dense_webgpu_timing {
         assert!(after_steps > 0.99 && after_host > 0.99, "{after_steps} {after_host}");
     }
 
+    /// Qwen3.8-Flash-Next's prompt chunks run together (each chunk's first device's layers as the last device runs the
+    /// chunk before's) answer as chunks run one at a time: a prompt of 4 chunks of 512 and one of 100, the last logits
+    /// and steps after it bit for bit (the caches the same), and how long each takes. FLASHNEXT_MODEL: the checkpoint.
+    #[test]
+    #[ignore = "needs WebGPU adapters with room for Qwen3.8-Flash-Next (FLASHNEXT_MODEL); run with --nocapture"]
+    fn flashnext_chunks_run_together_answer_as_one_at_a_time() {
+        use std::sync::Arc;
+        let path = std::env::var("FLASHNEXT_MODEL").unwrap_or_else(|_| r"E:\models\Qwen3.8-Flash-Next\exl3-3.05bpw".into());
+        let Ok(b0) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
+        let others: Vec<Arc<ggml_rs_wgpu::WgpuBackend>> = b0.others(None).into_iter().map(Arc::new).collect();
+        let b0 = Arc::new(b0);
+        let gpus: Vec<&ggml_rs_wgpu::WgpuBackend> = std::iter::once(b0.as_ref()).chain(others.iter().map(|g| g.as_ref())).collect();
+        let backends: Vec<Arc<dyn ggml_rs::Backend>> = std::iter::once(Arc::clone(&b0) as Arc<dyn ggml_rs::Backend>).chain(others.iter().map(|g| Arc::clone(g) as Arc<dyn ggml_rs::Backend>)).collect();
+        type Make<'a> = Box<dyn Fn(ggml_rs::exl3::Exl3Data) -> std::result::Result<Arc<dyn ggml_rs::exl3::PackedLinear>, String> + Send + Sync + 'a>;
+        let packed = |device: usize| -> Make<'_> {
+            let b = gpus[device];
+            Box::new(move |d| b.exl3(d))
+        };
+        let p = std::path::Path::new(&path);
+        let reserve = crate::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
+        let experts = |device: usize, _layer: &str, list: Vec<[ggml_rs::exl3::Exl3Data; 3]>| -> oaiy_engine::Result<Box<dyn ggml_rs::exl3::Experts>> {
+            gpus[device].exl3_experts_leaving(list, reserve).map_err(oaiy_engine::Error::Arg)
+        };
+        let model = crate::flashnext::load_portable(p, backends, &packed, &experts, false).unwrap();
+        let tokens: Vec<u32> = (0..2148u32).map(|i| 1000 + (i * 7919) % 20000).collect();
+        let spans = [(0usize, 512usize), (512, 1024), (1024, 1536), (1536, 2048), (2048, 2148)];
+        let embeds: Vec<ggml_rs::Tensor> = spans.iter().map(|&(a, z)| model.embed_text(&tokens[a..z]).unwrap()).collect();
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+        let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
+        // twice each way (the first warms the kernels)
+        let mut results = Vec::new();
+        for round in 0..2 {
+            for together in [false, true] {
+                let mut kv = model.new_kv_cache(4096);
+                let t = std::time::Instant::now();
+                let last = if together {
+                    let chunks: Vec<(&[u32], &ggml_rs::Tensor)> = spans.iter().zip(&embeds).map(|(&(a, z), e)| (&tokens[a..z], e)).collect();
+                    let mut n = 0;
+                    let l = model.forward_chunks(&chunks, &mut kv, &mut |_| n += 1).expect("the chunks chained");
+                    assert_eq!(n, spans.len(), "every chunk said");
+                    l
+                } else {
+                    let mut l = None;
+                    for (&(a, z), e) in spans.iter().zip(&embeds) {
+                        l = Some(model.forward(&tokens[a..z], e, &mut kv, None).unwrap());
+                    }
+                    l.unwrap()
+                };
+                let secs = t.elapsed().as_secs_f64();
+                // steps after it: the caches the same
+                let mut next = argmax(last.data());
+                let mut steps = Vec::new();
+                for _ in 0..8 {
+                    let e = model.embed_text(&[next]).unwrap();
+                    let l = model.forward(&[next], &e, &mut kv, None).unwrap();
+                    next = argmax(l.data());
+                    steps.push(bits(l.data()));
+                }
+                eprintln!("round {round}, {}: {} tokens in {:.0} ms ({:.0} tokens a second)", if together { "together" } else { "one at a time" }, tokens.len(), secs * 1e3, tokens.len() as f64 / secs);
+                results.push((bits(last.data()), steps, kv.len));
+            }
+        }
+        for pair in results.chunks(2) {
+            assert_eq!(pair[0].2, pair[1].2, "the same rows in the caches");
+            assert!(pair[0].0 == pair[1].0, "the prompt's logits bit for bit");
+            assert!(pair[0].1 == pair[1].1, "the steps' logits after it bit for bit");
+        }
+    }
+
     /// Qwen3.8-Flash-Next chained past QSA's dense span (FLASHNEXT_MODEL) answers as its own path does: a prompt of some
     /// 2,100 tokens in chunks of 512 (the last past 2,051 positions, its rows' blocks chosen on the GPU) against the
     /// host path's whole prompt, then steps on the host path's greedy tokens; each step's logits close and the same

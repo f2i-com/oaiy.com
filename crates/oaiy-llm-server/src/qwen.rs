@@ -365,6 +365,42 @@ impl Hybrid {
             _ => {}
         }
     }
+    /// A prompt's text chunks (each embedded, on the host) after what `kv` holds, as many at once as the model runs
+    /// so (Qwen3.8-Flash-Next: each chunk's first devices' layers as its last device runs the chunk before's): the
+    /// last chunk's logits, `done(i)` once each chunk is in. Another model's, or one Flash-Next cannot chain, a chunk
+    /// at a time.
+    fn forward_chunks(&self, chunks: &[(&[u32], Tensor)], kv: &mut KvCache, done: &mut dyn FnMut(usize)) -> Result<Tensor, String> {
+        #[cfg(any(feature = "cuda", feature = "webgpu"))]
+        if let Self::Flash(f) = self {
+            let len = kv.len;
+            let refs: Vec<(&[u32], &Tensor)> = chunks.iter().map(|(t, e)| (*t, e)).collect();
+            if let Some(l) = f.forward_chunks(&refs, kv, done) {
+                return Ok(l);
+            }
+            // (what ran before a chunk it could not chain stands: the rest a chunk at a time)
+            let ran: usize = chunks.iter().scan(len, |at, (t, _)| { *at += t.len(); Some(*at) }).take_while(|&at| at <= kv.len).count();
+            let mut last = None;
+            for (i, (t, e)) in chunks.iter().enumerate().skip(ran) {
+                last = Some(self.forward(t, e.clone(), kv, None)?);
+                done(i);
+            }
+            return last.ok_or_else(|| "no chunk to run".to_string());
+        }
+        let mut last = None;
+        for (i, (t, e)) in chunks.iter().enumerate() {
+            last = Some(self.forward(t, e.clone(), kv, None)?);
+            done(i);
+        }
+        last.ok_or_else(|| "no chunk to run".to_string())
+    }
+    /// Whether a prompt's chunks go to [`Self::forward_chunks`] together.
+    fn pipelines(&self) -> bool {
+        #[cfg(any(feature = "cuda", feature = "webgpu"))]
+        if let Self::Flash(f) = self {
+            return f.devices_len() > 1;
+        }
+        false
+    }
     /// Run `tokens` (embedded as `embeds`, on the host) after what `kv` holds: the last logits, on the host.
     fn forward(&self, tokens: &[u32], embeds: Tensor, kv: &mut KvCache, positions: Option<&[[u32; 3]]>) -> Result<Tensor, String> {
         match self {
@@ -526,6 +562,27 @@ impl QwenEngine {
         let mut pos = start;
         while pos < keys.len() {
             if job.cancel.load(Ordering::Relaxed) { return Ok(()); }
+            // a text prompt's chunks up to the next checkpoint together, where the model runs them so (some at a time,
+            // between cancellations' looks)
+            if hybrid.pipelines() && job.images.is_empty() {
+                let stop = stops.iter().copied().find(|&s| s > pos).unwrap_or(keys.len()).min(keys.len()).min(pos + 8 * PREFILL_CHUNK);
+                let spans: Vec<(usize, usize)> = (pos..stop).step_by(PREFILL_CHUNK).map(|a| (a, (a + PREFILL_CHUNK).min(stop))).collect();
+                let embeds = spans.iter().map(|&(a, b)| hybrid.embed(&job.prompt[a..b])).collect::<Result<Vec<_>, _>>()?;
+                let chunks: Vec<(&[u32], Tensor)> = spans.iter().zip(embeds).map(|(&(a, b), e)| (&job.prompt[a..b], e)).collect();
+                let events = &job.events;
+                let mut done = |i: usize| { let _ = events.send(Event::Progress { done: spans[i].1 - start, total }); };
+                logits = Some(hybrid.forward_chunks(&chunks, &mut self.kv, &mut done)?);
+                self.covered.extend_from_slice(&keys[pos..stop]);
+                pos = stop;
+                if stops.contains(&pos) && !self.checkpoints.iter().any(|(saved, _, _)| saved == &keys[..pos]) {
+                    if self.log { eprintln!("  Qwen checkpoint: {pos} tokens; disk={}", self.disk.is_some()); }
+                    let base = stops.first() == Some(&pos);
+                    let snap = RecurrentSnapshot::capture(&self.kv);
+                    self.checkpoints.push((keys[..pos].to_vec(), snap, base));
+                    trim_checkpoints(&mut self.checkpoints);
+                }
+                continue;
+            }
             let end = (pos+PREFILL_CHUNK).min(keys.len()).min(stops.iter().copied().find(|&s| s > pos).unwrap_or(keys.len()));
             let mut embeds = hybrid.embed(&job.prompt[pos..end])?;
             let width = hybrid.width();
