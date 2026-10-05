@@ -190,6 +190,13 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 }
 "#;
 
+/// A uniform's eight words, the rest of `words` zero.
+fn words8(words: &[u32]) -> [u32; 8] {
+    let mut all = [0u32; 8];
+    all[..words.len()].copy_from_slice(words);
+    all
+}
+
 fn buffer(v: &DeviceVec) -> &wgpu::Buffer {
     v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector")
 }
@@ -247,6 +254,12 @@ impl DeviceChain for WgpuBackend {
 /// One dispatch: its pipeline, bind group and grid.
 type Dispatch = (Arc<wgpu::ComputePipeline>, wgpu::BindGroup, (u32, u32, u32));
 
+/// A bind group a chain makes again step after step: its pipeline, its three buffers and its parameters.
+pub(crate) type GroupKey = (usize, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, [u32; 8]);
+
+/// Bind groups kept before the cache starts over (a cache grown from buffers that were replaced).
+const KEEP_GROUPS: usize = 16384;
+
 struct Recorder<'a> {
     backend: &'a WgpuBackend,
     /// Every op's dispatch, in order, run in one compute pass (a pass an op cost more than the ops).
@@ -261,8 +274,7 @@ impl Recorder<'_> {
     }
 
     fn uniform(&self, words: &[u32]) -> wgpu::Buffer {
-        let mut all = [0u32; 8];
-        all[..words.len()].copy_from_slice(words);
+        let all = words8(words);
         let bytes: Vec<u8> = all.iter().flat_map(|v| v.to_le_bytes()).collect();
         let buf = self.gpu().device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("oaiy-chain-params"),
@@ -272,6 +284,39 @@ impl Recorder<'_> {
         });
         self.gpu().queue.write_buffer(&buf, 0, &bytes);
         buf
+    }
+
+    /// A dispatch whose bind group is the same every step (its buffers and parameters): made once and kept.
+    fn dispatch_kept(&mut self, pipeline: &Arc<wgpu::ComputePipeline>, at0: &wgpu::Buffer, at1: &wgpu::Buffer, at2: &wgpu::Buffer, words: &[u32], groups: (u32, u32, u32)) {
+        let key: GroupKey = (Arc::as_ptr(pipeline) as usize, at0.clone(), at1.clone(), at2.clone(), words8(words));
+        let kept = self.gpu().chain_groups.lock().unwrap_or_else(|p| p.into_inner()).get(&key).cloned();
+        let group = match kept {
+            Some(group) => group,
+            None => {
+                let params = self.uniform(words);
+                let group = self.group(at0, at1, at2, &params);
+                let mut groups = self.gpu().chain_groups.lock().unwrap_or_else(|p| p.into_inner());
+                if groups.len() >= KEEP_GROUPS {
+                    groups.clear();
+                }
+                groups.insert(key, group.clone());
+                group
+            }
+        };
+        self.dispatches.push((Arc::clone(pipeline), group, groups));
+    }
+
+    fn group(&self, at0: &wgpu::Buffer, at1: &wgpu::Buffer, at2: &wgpu::Buffer, params: &wgpu::Buffer) -> wgpu::BindGroup {
+        self.gpu().device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("oaiy-chain"),
+            layout: &self.gpu().layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: at0.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: at1.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: at2.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: params.as_entire_binding() },
+            ],
+        })
     }
 
     fn dispatch(&mut self, pipeline: &Arc<wgpu::ComputePipeline>, at0: &wgpu::Buffer, at1: &wgpu::Buffer, at2: &wgpu::Buffer, params: &wgpu::Buffer, groups: (u32, u32, u32)) {
@@ -300,35 +345,31 @@ impl ChainRecorder for Recorder<'_> {
         assert!(x.len >= k && y.len >= n, "chain: matmul [{n}, {k}] from {} into {}", x.len, y.len);
         let pipeline = self.gpu().pipeline(q.dtype, 1).expect("uploaded weights have a pipeline");
         for (chunk, row0, rows) in &q.chunks {
-            let params = self.uniform(&[k as u32, n as u32, 1, *row0, *rows, q.row_bytes as u32, 0, 0]);
             // Rows beyond 65535 wrap into the second grid axis.
-            self.dispatch(&pipeline, chunk, buffer(x), buffer(y), &params, ((*rows).min(65535), rows.div_ceil(65535), 1));
+            let words = [k as u32, n as u32, 1, *row0, *rows, q.row_bytes as u32, 0, 0];
+            self.dispatch_kept(&pipeline, chunk, buffer(x), buffer(y), &words, ((*rows).min(65535), rows.div_ceil(65535), 1));
         }
     }
 
     fn rmsnorm(&mut self, x: &DeviceVec, w: &DeviceVec, out: &DeviceVec, eps: f32) {
         let pipeline = self.named("chain-rmsnorm", RMSNORM);
-        let params = self.uniform(&[x.len as u32, eps.to_bits()]);
-        self.dispatch(&pipeline, buffer(w), buffer(x), buffer(out), &params, (1, 1, 1));
+        self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(out), &[x.len as u32, eps.to_bits()], (1, 1, 1));
     }
 
     fn add(&mut self, acc: &DeviceVec, y: &DeviceVec) {
         let pipeline = self.named("chain-add", ADD);
-        let params = self.uniform(&[acc.len as u32]);
-        self.dispatch(&pipeline, buffer(y), buffer(y), buffer(acc), &params, ((acc.len as u32).div_ceil(256), 1, 1));
+        self.dispatch_kept(&pipeline, buffer(y), buffer(y), buffer(acc), &[acc.len as u32], ((acc.len as u32).div_ceil(256), 1, 1));
     }
 
     fn silu_mul_split(&mut self, fused: &DeviceVec, out: &DeviceVec) {
         let pipeline = self.named("chain-silu-mul-split", SILU_MUL_SPLIT);
-        let params = self.uniform(&[out.len as u32]);
-        self.dispatch(&pipeline, buffer(fused), buffer(fused), buffer(out), &params, ((out.len as u32).div_ceil(256), 1, 1));
+        self.dispatch_kept(&pipeline, buffer(fused), buffer(fused), buffer(out), &[out.len as u32], ((out.len as u32).div_ceil(256), 1, 1));
     }
 
     fn rope(&mut self, x: &DeviceVec, heads: usize, head_dim: usize, table: &DeviceVec, neox: bool) {
         let pipeline = self.named("chain-rope", ROPE);
-        let params = self.uniform(&[heads as u32, head_dim as u32, neox as u32]);
         let pairs = (heads * head_dim / 2) as u32;
-        self.dispatch(&pipeline, buffer(table), buffer(table), buffer(x), &params, (pairs.div_ceil(256), 1, 1));
+        self.dispatch_kept(&pipeline, buffer(table), buffer(table), buffer(x), &[heads as u32, head_dim as u32, neox as u32], (pairs.div_ceil(256), 1, 1));
     }
 
     fn store(&mut self, src: &DeviceVec, dst: &DeviceVec, offset: usize) {

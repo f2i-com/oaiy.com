@@ -68,6 +68,8 @@ struct Gpu {
     exl3: Mutex<[Option<Arc<wgpu::ComputePipeline>>; 2]>,
     /// Other kernels' pipelines by name (`dense`), made when first used.
     named: Mutex<HashMap<&'static str, Arc<wgpu::ComputePipeline>>>,
+    /// A chain's bind groups that are the same step after step (`chain`): by pipeline, buffers and parameters.
+    chain_groups: Mutex<HashMap<chain::GroupKey, wgpu::BindGroup>>,
     limits: wgpu::Limits,
     /// Upload bytes written since the queue was last flushed.
     staged: AtomicU64,
@@ -373,7 +375,7 @@ impl WgpuBackend {
         });
         Ok(Self {
             cpu: CpuBackend::new(),
-            gpu: Arc::new(Gpu { device, queue, layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), limits, staged: AtomicU64::new(0) }),
+            gpu: Arc::new(Gpu { device, queue, layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), chain_groups: Mutex::new(HashMap::new()), limits, staged: AtomicU64::new(0) }),
             budget,
             used: Arc::new(AtomicU64::new(0)),
             summary,

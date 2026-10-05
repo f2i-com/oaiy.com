@@ -204,12 +204,15 @@ impl LlamaModel {
         let from = if g.owner == kv.id { kv.dirty_from.min(past) } else { 0 };
         if from < past {
             for l in 0..cfg.n_layers {
+                // the host's buffers read in place (a copy of one was its whole capacity: 0.3 s for 512 rows)
                 let (kh, vh) = (kv.k_buffer(l), kv.v_buffer(l));
-                let (kh, vh) = (if kh.is_device() { kh.to_host() } else { kh.clone() }, if vh.is_device() { vh.to_host() } else { vh.clone() });
+                let (kown, vown);
+                let kd = if kh.is_device() { kown = kh.to_host(); kown.data() } else { kh.data() };
+                let vd = if vh.is_device() { vown = vh.to_host(); vown.data() } else { vh.data() };
                 let mut rows = Vec::with_capacity((past - from) * row);
                 for t in from..past {
-                    rows.extend_from_slice(&kh.data()[t * kvd..(t + 1) * kvd]);
-                    rows.extend_from_slice(&vh.data()[t * kvd..(t + 1) * kvd]);
+                    rows.extend_from_slice(&kd[t * kvd..(t + 1) * kvd]);
+                    rows.extend_from_slice(&vd[t * kvd..(t + 1) * kvd]);
                 }
                 chain.upload_at(&g.layers[l], from * row, &rows);
             }
