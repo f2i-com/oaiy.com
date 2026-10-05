@@ -2055,12 +2055,7 @@ impl FlashNext {
             let Mixer::Attn(a) = &self.layers[i].mixer else { unreachable!("layer {i} attends") };
             let b = self.devices[self.layers[i].device].as_ref();
             kv.append(b, a.index_slot, &Tensor::from_vec(raw.clone(), vec![t, 1, id]), &Tensor::from_vec(raw, vec![t, 1, id]));
-            let (mut kh, mut vh) = (Vec::with_capacity(t * kvd), Vec::with_capacity(t * kvd));
-            for r in kvrows.chunks_exact(row) {
-                kh.extend_from_slice(&r[..kvd]);
-                vh.extend_from_slice(&r[kvd..]);
-            }
-            kv.append(b, i, &Tensor::from_vec(kh, vec![t, nkv, hd]), &Tensor::from_vec(vh, vec![t, nkv, hd]));
+            kv.append_rows(b, i, &kvrows, t);
         };
         // the recording open on device `d`, and the attention layers whose rows and keys it reads (in order, before
         // whatever else it reads)

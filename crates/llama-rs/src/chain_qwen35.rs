@@ -708,12 +708,7 @@ impl Qwen35Chain {
         let logits: Vec<Tensor> = logits.chunks_exact(s.vocab).map(|l| Tensor::from_vec(l.to_vec(), vec![1, s.vocab])).collect();
         // the run's K and V rows into the host's cache too, which the copy already holds
         for (&l, rows) in st.attention_layers.iter().zip(got) {
-            let (mut kh, mut vh) = (Vec::with_capacity(t * kvd), Vec::with_capacity(t * kvd));
-            for r in rows.chunks_exact(row) {
-                kh.extend_from_slice(&r[..kvd]);
-                vh.extend_from_slice(&r[kvd..]);
-            }
-            kv.append(backend, l, &Tensor::from_vec(kh, vec![t, s.n_kv, s.hd]), &Tensor::from_vec(vh, vec![t, s.n_kv, s.hd]));
+            kv.append_rows(backend, l, &rows, t);
         }
         kv.commit(t);
         kv.dirty_from = usize::MAX;

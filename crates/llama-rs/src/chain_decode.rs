@@ -341,12 +341,7 @@ impl ChainDecoder {
         let mut out = got.next().expect("the logits");
         // the chunk's K and V rows into the host's cache too, which the copy already holds
         for (l, rows) in got.enumerate() {
-            let (mut kh, mut vh) = (Vec::with_capacity(t * kvd), Vec::with_capacity(t * kvd));
-            for r in rows.chunks_exact(row) {
-                kh.extend_from_slice(&r[..kvd]);
-                vh.extend_from_slice(&r[kvd..]);
-            }
-            kv.append(backend, l, &Tensor::from_vec(kh, vec![t, n_kv, hd]), &Tensor::from_vec(vh, vec![t, n_kv, hd]));
+            kv.append_rows(backend, l, &rows, t);
         }
         kv.commit(t);
         kv.dirty_from = usize::MAX;

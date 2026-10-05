@@ -172,6 +172,34 @@ impl KvCache {
         self.dirty_from = self.dirty_from.min(self.len);
     }
 
+    /// VENDORED-LOCAL: [`Self::append`] of `seq` rows given as a device's cache holds them, each row's K then its V
+    /// (`[seq, 2, n_kv, head_dim]`, a chained run's read back): copied straight into a host cache's K and V (a 512-row
+    /// chunk's 64 MB 18 ms through two vectors of their own, freshly allocated), through [`Self::append`] into a
+    /// device's.
+    pub fn append_rows(&mut self, backend: &dyn Backend, layer: usize, rows: &[f32], seq: usize) {
+        let inner = self.n_kv_heads_per_layer[layer] * self.head_dims[layer];
+        assert_eq!(rows.len(), seq * 2 * inner, "a cache's {seq} rows, K then V");
+        self.reserve_layer(backend, layer, self.len + seq);
+        if self.k[layer].is_device() || self.v[layer].is_device() {
+            let (mut kh, mut vh) = (Vec::with_capacity(seq * inner), Vec::with_capacity(seq * inner));
+            for r in rows.chunks_exact(2 * inner) {
+                kh.extend_from_slice(&r[..inner]);
+                vh.extend_from_slice(&r[inner..]);
+            }
+            let shape = vec![seq, self.n_kv_heads_per_layer[layer], self.head_dims[layer]];
+            self.append(backend, layer, &Tensor::from_vec(kh, shape.clone()), &Tensor::from_vec(vh, shape));
+            return;
+        }
+        let at = self.len * inner;
+        for (half, dst) in [&mut self.k[layer], &mut self.v[layer]].into_iter().enumerate() {
+            let dst = &mut dst.data_mut()[at..at + seq * inner];
+            for (d, r) in dst.chunks_exact_mut(inner).zip(rows.chunks_exact(2 * inner)) {
+                d.copy_from_slice(&r[half * inner..(half + 1) * inner]);
+            }
+        }
+        self.dirty_from = self.dirty_from.min(self.len);
+    }
+
     pub fn n_kv_heads_for(&self, layer: usize) -> usize {
         self.n_kv_heads_per_layer[layer]
     }
@@ -182,4 +210,35 @@ impl KvCache {
 
     pub fn k_buffer(&self, layer: usize) -> &Tensor { &self.k[layer] }
     pub fn v_buffer(&self, layer: usize) -> &Tensor { &self.v[layer] }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A device's rows (each K then V) appended as they are read back give the cache [`KvCache::append`] gives: two
+    /// batches, one after the other.
+    #[test]
+    fn rows_read_back_append_as_k_and_v_do() {
+        let cpu = ggml_rs::CpuBackend::new();
+        let (nkv, hd) = (2usize, 4usize);
+        let inner = nkv * hd;
+        let (mut a, mut b) = (KvCache::new(&cpu, 1, 64, nkv, hd), KvCache::new(&cpu, 1, 64, nkv, hd));
+        for (seq, base) in [(3usize, 0.0f32), (9, 100.0)] {
+            let rows: Vec<f32> = (0..seq * 2 * inner).map(|i| base + i as f32).collect();
+            let (mut k, mut v) = (Vec::new(), Vec::new());
+            for r in rows.chunks_exact(2 * inner) {
+                k.extend_from_slice(&r[..inner]);
+                v.extend_from_slice(&r[inner..]);
+            }
+            a.append(&cpu, 0, &Tensor::from_vec(k, vec![seq, nkv, hd]), &Tensor::from_vec(v, vec![seq, nkv, hd]));
+            b.append_rows(&cpu, 0, &rows, seq);
+            a.commit(seq);
+            b.commit(seq);
+        }
+        let n = a.len * inner;
+        assert_eq!(&a.k_buffer(0).data()[..n], &b.k_buffer(0).data()[..n]);
+        assert_eq!(&a.v_buffer(0).data()[..n], &b.v_buffer(0).data()[..n]);
+        assert_eq!(a.dirty_from, b.dirty_from);
+    }
 }
