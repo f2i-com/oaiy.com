@@ -186,7 +186,7 @@ impl QuantizedDeviceStorage for WgpuQuant {
         let out = self.gpu_bytes();
         // ggml's layout, where the GPU's blocks are padded
         match shaders::padded_block(self.dtype) {
-            Some((host, gpu)) => shaders::pad_blocks(&out, gpu, host),
+            Some((host, gpu, at)) => shaders::pad_blocks(&out, gpu, host, at),
             None => out,
         }
     }
@@ -664,7 +664,7 @@ impl WgpuBackend {
         let row_bytes = w.dim(1) / elems as usize * block_bytes as usize;
         // ggml's bytes, and the GPU's: Q3_K's blocks padded (`shaders::padded_block`)
         let padded = shaders::padded_block(w.dtype());
-        let host_row = padded.map_or(row_bytes, |(host, gpu)| row_bytes / gpu * host);
+        let host_row = padded.map_or(row_bytes, |(host, gpu, _)| row_bytes / gpu * host);
         if w.bytes().len() != host_row * w.dim(0) || row_bytes as u64 > chunk_limit(&self.gpu.limits) {
             return w;
         }
@@ -676,7 +676,7 @@ impl WgpuBackend {
             return w;
         }
         let chunks = match padded {
-            Some((host, gpu)) => self.gpu.upload_rows(&shaders::pad_blocks(w.bytes(), host, gpu), row_bytes, 1),
+            Some((host, gpu, at)) => self.gpu.upload_rows(&shaders::pad_blocks(w.bytes(), host, gpu, at), row_bytes, 1),
             None => self.gpu.upload_rows(w.bytes(), row_bytes, 1),
         };
         let storage = WgpuQuant { gpu: Arc::clone(&self.gpu), dtype: w.dtype(), chunks, row_bytes, nbytes, used: Arc::clone(&self.used) };

@@ -575,7 +575,8 @@ impl QwenEngine {
                 // its drafts, then the token and them in one check; else the token alone
                 let checked = drafter.filter(|_| self.kv.len + 1 + DRAFTS <= self.kv.max_len).and_then(|m| {
                     let recent: Vec<u32> = self.covered[self.covered.len().saturating_sub(llama_rs::SPEC_ROWS)..].iter().map(|&k| k as u32).chain([next]).collect();
-                    let drafts = m.draft(&self.kv, &recent, DRAFTS)?;
+                    // none the layer is sure enough of: a step of the token alone
+                    let drafts = m.draft(&self.kv, &recent, DRAFTS).filter(|d| !d.is_empty())?;
                     let rows: Vec<u32> = std::iter::once(next).chain(drafts.iter().copied()).collect();
                     Some((drafts, m.check(&rows, &mut self.kv)?))
                 });

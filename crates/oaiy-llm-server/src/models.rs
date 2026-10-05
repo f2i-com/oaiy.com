@@ -953,6 +953,13 @@ impl Models {
                     }
                 }
             }
+            // its chained runs' kernels compiled before the first request waits on them
+            if let llama_rs::Model::Qwen35(m) = &model {
+                let warm = std::time::Instant::now();
+                if m.warm_up() {
+                    self.say(format!("{}: its chained runs ready in {:.1} s", spec.name, warm.elapsed().as_secs_f64()));
+                }
+            }
             let tok = Arc::new(model.tokenizer().clone());
             // Dense Qwen fits one card; bound the initial KV allocation.
             let max_seq = self.context(model.config().context_length).min(16384);
@@ -1653,6 +1660,9 @@ mod dense_webgpu_timing {
         let mut kv = model.new_kv_cache(prompt.len() + gen + 16);
         let mut logits = m.forward_embeds_positions(&m.embed_text(&prompt), prompt.len(), &mut kv, None).unwrap().to_host();
         let mut history = prompt.clone();
+        // the rows of logits the checks gave (the token they follow's place in `history`, the logits), to be held
+        // against a step's at the same place afterwards (a check's rows run through the int8 kernels)
+        let mut used: Vec<(usize, ggml_rs::Tensor)> = Vec::new();
         let (mut out, mut checks, mut accepted, clock) = (Vec::new(), 0usize, 0usize, Instant::now());
         let (mut t_draft, mut t_check, mut t_back) = (0f64, 0f64, 0f64);
         let mut check_kernels = std::collections::BTreeMap::<&'static str, (f64, u64)>::new();
@@ -1664,6 +1674,11 @@ mod dense_webgpu_timing {
             let c = Instant::now();
             let drafts = m.draft(&kv, &history, k).expect("drafts");
             t_draft += c.elapsed().as_secs_f64();
+            if drafts.is_empty() {
+                // none the layer is sure enough of: a step of the token alone
+                logits = m.forward_embeds_positions(&m.embed_text(&[next]), 1, &mut kv, None).unwrap().to_host();
+                continue;
+            }
             let mut rows = vec![next];
             rows.extend(&drafts);
             let before = ggml_rs_wgpu::profile::take_kernels();
@@ -1688,8 +1703,30 @@ mod dense_webgpu_timing {
             m.rollback(&mut kv, rows.len(), j + 1);
             t_back += c.elapsed().as_secs_f64();
             logits = checked[j].clone();
+            // row r follows `rows[r]`, at history's place len - 1 - (j - r)
+            let at = history.len() - 1 - j;
+            for (r, row) in checked.into_iter().take(j + 1).enumerate() {
+                used.push((at + r, row));
+            }
         }
         let spec_s = clock.elapsed().as_secs_f64();
+        // a step at a time along the drafted tokens, each check's row against the step's logits there
+        let cosine = |a: &[f32], b: &[f32]| {
+            let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
+            let n = |v: &[f32]| v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            dot / (n(a) * n(b))
+        };
+        let mut kv2 = model.new_kv_cache(prompt.len() + gen + 16);
+        let _ = m.forward_embeds_positions(&m.embed_text(&prompt), prompt.len(), &mut kv2, None).unwrap();
+        let mut worst = 1.0f64;
+        let mut u = used.iter().peekable();
+        for (place, &tok) in history.iter().enumerate().skip(prompt.len()) {
+            let step = m.forward_embeds_positions(&m.embed_text(&[tok]), 1, &mut kv2, None).unwrap().to_host();
+            while let Some((p, row)) = u.next_if(|(p, _)| *p == place) {
+                let _ = p;
+                worst = worst.min(cosine(step.data(), row.data()));
+            }
+        }
         eprintln!("a check's round: drafting {:.1} ms, the check {:.1} ms, rollbacks {:.1} ms", t_draft * 1e3 / checks as f64, t_check * 1e3 / checks as f64, t_back * 1e3 / checks as f64);
         let mut ck: Vec<_> = check_kernels.into_iter().collect();
         ck.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0));
@@ -1698,10 +1735,10 @@ mod dense_webgpu_timing {
         }
         out.truncate(gen);
         let same = plain.iter().zip(&out).take_while(|(a, b)| a == b).count();
-        eprintln!("{gen} tokens: a step at a time {:.1} ms a token; drafting {k} {:.1} ms a token ({checks} checks, {accepted} drafts taken of {}, {:.2} a check); the same tokens for the first {same}", plain_s * 1e3 / gen as f64, spec_s * 1e3 / gen as f64, checks * k, accepted as f64 / checks as f64);
+        eprintln!("{gen} tokens: a step at a time {:.1} ms a token; drafting {k} {:.1} ms a token ({checks} checks, {accepted} drafts taken of {}, {:.2} a check); the same tokens for the first {same}; the checks' logits against the steps' at the same places: worst cosine {worst:.6}", plain_s * 1e3 / gen as f64, (spec_s - 0.0) * 1e3 / gen as f64, checks * k, accepted as f64 / checks as f64);
         eprintln!("plain:   {:?}", m.tokenizer.decode(&plain[..48.min(gen)]));
         eprintln!("drafted: {:?}", m.tokenizer.decode(&out[..48.min(gen)]));
-        assert!(same >= 32, "the first {same} tokens agree");
+        assert!(worst > 0.999, "a check's logits against a step's: cosine {worst}");
     }
 
     /// Where a chained Qwen3.5 run's time goes (QWEN35_MODEL): prompt chunks of a few tokens as the server's

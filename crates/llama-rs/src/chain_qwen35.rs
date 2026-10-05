@@ -105,6 +105,9 @@ struct Pool {
 /// Rows a check of drafted tokens takes at most (the sampled token and its drafts).
 pub const SPEC_ROWS: usize = 8;
 
+/// The least probability (under the prediction layer) a draft is checked at: Strata's `--spec-min-p` default.
+const DRAFT_MIN_P: f64 = 0.5;
+
 /// The multi-token-prediction layer's own copy of its attention cache (row `p`: its K then V), `cap` rows, and a
 /// row's attention output and scratch; its entries for positions `start..valid` are the layer's at those positions
 /// (from the trunk's hidden state and the token after), of the cache `owner`.
@@ -757,11 +760,12 @@ impl Qwen35Chain {
         g.valid = past + rows;
     }
 
-    /// Draft `k` tokens after `next` (the token sampled for position `kv.len`): the prediction layer's entries caught
-    /// up to it first (each position from the trunk's hidden state there, kept from the last run, and the token after,
-    /// `tokens` the tokens at positions `hidden's first + 1..=kv.len`, ending with `next`), its last giving the first
-    /// draft; each further draft from the layer's own output and the draft before. None where the chain does not draft
-    /// or the hidden states it needs are not kept.
+    /// Draft up to `k` tokens after `next` (the token sampled for position `kv.len`): the prediction layer's entries
+    /// caught up to it first (each position from the trunk's hidden state there, kept from the last run, and the token
+    /// after, `tokens` the tokens at positions `hidden's first + 1..=kv.len`, ending with `next`), its last giving the
+    /// first draft; each further draft from the layer's own output and the draft before. A draft the layer gives less
+    /// than [`DRAFT_MIN_P`] ends them (none where the first is such): a check's rows cost, and an unlikely draft is
+    /// seldom taken. None where the chain does not draft or the hidden states it needs are not kept.
     pub(crate) fn draft(&self, m: &Qwen35Model, kv: &KvCache, tokens: &[u32], k: usize) -> Option<Vec<u32>> {
         if !self.drafts(m) || k == 0 {
             return None;
@@ -819,11 +823,18 @@ impl Qwen35Chain {
             rec.matmul(quant(&m.output), &xn1, &wk.logits);
             rec.read(&wk.logits);
             let logits = rec.finish().pop().expect("the draft's logits");
-            drafts.push(argmax(&logits));
+            let best = argmax(&logits);
+            // the draft's probability under the layer: the largest logit's share of their exponentials
+            let top = logits[best as usize];
+            let total: f64 = logits.iter().map(|&l| ((l - top) as f64).exp()).sum();
             if pass == 0 {
-                // the layer's entries are its own up to the trunk's last position
+                // the layer's entries are its own up to the trunk's last position, the draft taken or not
                 g.valid = n;
             }
+            if 1.0 / total < DRAFT_MIN_P {
+                break;
+            }
+            drafts.push(best);
         }
         Some(drafts)
     }

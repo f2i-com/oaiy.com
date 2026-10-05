@@ -215,6 +215,42 @@ impl Qwen35Model {
         self.chain.rollback(self, kv, rows, keep)
     }
 
+    /// VENDORED-LOCAL: its chained runs' kernels compiled before a first request waits on them: a short prompt and a
+    /// step on a cache of their own, and where it drafts a draft, a check of two rows and its rollback. False where it
+    /// runs no chain.
+    pub fn warm_up(&self) -> bool {
+        let Ok(tokens) = self.tokenizer.encode("The river town kept its market on the north bank.", false) else { return false };
+        if tokens.is_empty() {
+            return false;
+        }
+        let mut kv = KvCache::new(&*self.backend, self.config.n_layers, tokens.len() + 16, self.config.n_kv_heads, self.config.head_dim);
+        let embeds = self.embed_text(&tokens);
+        let Ok(logits) = self.forward_embeds_positions(&embeds, tokens.len(), &mut kv, None) else { return false };
+        let logits = logits.to_host();
+        let next = logits.data().iter().enumerate().fold((0usize, f32::NEG_INFINITY), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0 as u32;
+        if self.forward_embeds_positions(&self.embed_text(&[next]), 1, &mut kv, None).is_err() {
+            return false;
+        }
+        if self.drafts() {
+            let mut recent = tokens.clone();
+            recent.push(next);
+            let drafts = self.draft(&kv, &recent, 3).unwrap_or_default();
+            // two rows at least, so the several-row kernels are compiled whatever the layer drafted
+            let mut rows = vec![next];
+            if drafts.is_empty() {
+                rows.push(next);
+            } else {
+                rows.extend(&drafts);
+            }
+            if let Some(checked) = self.check(&rows, &mut kv) {
+                self.rollback(&mut kv, rows.len(), 1);
+                drop(checked);
+            }
+        }
+        self.chain.runs.store(0, std::sync::atomic::Ordering::Relaxed);
+        true
+    }
+
     /// The model's multi-token-prediction layer, if its GGUF has one.
     pub fn load_mtp(&self, g: &GgufFile) -> Result<Option<Qwen35Mtp>> {
         let i = self.config.n_layers;
