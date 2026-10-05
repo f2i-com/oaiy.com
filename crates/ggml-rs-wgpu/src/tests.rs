@@ -26,7 +26,8 @@ impl Rng {
 
 /// Random blocks with finite, modest f16 scales.
 fn random_weights(dtype: GgmlType, rows: usize, k: usize, rng: &mut Rng) -> Vec<u8> {
-    let (elems, bytes, _) = shaders::layout(dtype).unwrap();
+    // ggml's blocks (the GPU's may be padded)
+    let (elems, bytes) = (dtype.block_size() as u32, dtype.type_size() as u32);
     let blocks = rows * k / elems as usize;
     let mut out = vec![0u8; blocks * bytes as usize];
     for b in out.iter_mut() {

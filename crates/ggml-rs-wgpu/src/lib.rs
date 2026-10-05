@@ -127,6 +127,18 @@ impl Drop for WgpuQuant {
     }
 }
 
+impl WgpuQuant {
+    /// The weights as the GPU holds them.
+    fn gpu_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.nbytes);
+        for (buffer, _, rows) in &self.chunks {
+            let len = *rows as usize * self.row_bytes;
+            out.extend_from_slice(&self.gpu.read(buffer, len as u64)[..len]);
+        }
+        out
+    }
+}
+
 impl QuantizedDeviceStorage for WgpuQuant {
     fn nbytes(&self) -> usize {
         self.nbytes
@@ -138,12 +150,12 @@ impl QuantizedDeviceStorage for WgpuQuant {
         "webgpu"
     }
     fn copy_to_host(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.nbytes);
-        for (buffer, _, rows) in &self.chunks {
-            let len = *rows as usize * self.row_bytes;
-            out.extend_from_slice(&self.gpu.read(buffer, len as u64)[..len]);
+        let out = self.gpu_bytes();
+        // ggml's layout, where the GPU's blocks are padded
+        match shaders::padded_block(self.dtype) {
+            Some((host, gpu)) => shaders::pad_blocks(&out, gpu, host),
+            None => out,
         }
-        out
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -152,7 +164,7 @@ impl QuantizedDeviceStorage for WgpuQuant {
         self
     }
     fn clone_to_device(&self) -> Box<dyn QuantizedDeviceStorage> {
-        let bytes = self.copy_to_host();
+        let bytes = self.gpu_bytes();
         self.used.fetch_add(self.nbytes as u64, Ordering::Relaxed);
         Box::new(WgpuQuant {
             gpu: Arc::clone(&self.gpu),
@@ -310,7 +322,7 @@ impl Gpu {
     /// `dtype`'s kernel for `m` rows of `x`: the decode kernel for one, the one-row kernel for a few, the tiled one
     /// a prompt takes.
     fn pipeline(&self, dtype: GgmlType, m: usize) -> Option<Arc<wgpu::ComputePipeline>> {
-        let kind = if m >= shaders::MANY_FROM { 1u8 } else if m == 1 { 2 } else { 0 };
+        let kind = shaders::kind(dtype, m);
         let mut cache = self.pipelines.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(p) = cache.get(&(dtype, kind)) {
             return Some(Arc::clone(p));
@@ -318,6 +330,7 @@ impl Gpu {
         let source = match kind {
             1 => shaders::source_many(dtype)?,
             2 => shaders::source_decode(dtype)?,
+            3 => shaders::source_multi(dtype)?,
             _ => shaders::source(dtype)?,
         };
         let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -469,17 +482,23 @@ impl WgpuBackend {
             return w;
         }
         let row_bytes = w.dim(1) / elems as usize * block_bytes as usize;
-        let nbytes = w.bytes().len();
-        if nbytes != row_bytes * w.dim(0) || row_bytes as u64 > chunk_limit(&self.gpu.limits) {
+        // ggml's bytes, and the GPU's: Q3_K's blocks padded (`shaders::padded_block`)
+        let padded = shaders::padded_block(w.dtype());
+        let host_row = padded.map_or(row_bytes, |(host, gpu)| row_bytes / gpu * host);
+        if w.bytes().len() != host_row * w.dim(0) || row_bytes as u64 > chunk_limit(&self.gpu.limits) {
             return w;
         }
+        let nbytes = row_bytes * w.dim(0);
         // Reserve before uploading so concurrent loads cannot overshoot together.
         let prev = self.used.fetch_add(nbytes as u64, Ordering::Relaxed);
         if prev + nbytes as u64 > self.budget {
             self.used.fetch_sub(nbytes as u64, Ordering::Relaxed);
             return w;
         }
-        let chunks = self.gpu.upload_rows(w.bytes(), row_bytes, 1);
+        let chunks = match padded {
+            Some((host, gpu)) => self.gpu.upload_rows(&shaders::pad_blocks(w.bytes(), host, gpu), row_bytes, 1),
+            None => self.gpu.upload_rows(w.bytes(), row_bytes, 1),
+        };
         let storage = WgpuQuant { gpu: Arc::clone(&self.gpu), dtype: w.dtype(), chunks, row_bytes, nbytes, used: Arc::clone(&self.used) };
         QuantizedTensor::from_device(Box::new(storage), w.shape().to_vec())
     }
@@ -531,7 +550,6 @@ impl WgpuBackend {
         let m = x.numel() / k;
         let _one = self.serial.lock().unwrap_or_else(|p| p.into_inner());
         let gpu = &self.gpu;
-        let many = m >= shaders::MANY_FROM;
         let bytes = |v: &[f32]| -> Vec<u8> {
             let mut out = Vec::with_capacity(v.len() * 4);
             for f in v {
@@ -591,20 +609,7 @@ impl WgpuBackend {
                 pass.set_pipeline(&pipeline);
                 for (group, rows) in &groups {
                     pass.set_bind_group(0, group, &[]);
-                    if many {
-                        pass.dispatch_workgroups(rows.div_ceil(shaders::MANY_TILE), (m as u32).div_ceil(shaders::MANY_TILE), 1);
-                        continue;
-                    }
-                    // Rows (or the decode kernel's workgroups of rows) beyond 65535 wrap into the second grid axis;
-                    // the decode kernel takes one row of x.
-                    if m == 1 {
-                        let groups = rows.div_ceil(shaders::decode_rows_per_group(q.dtype));
-                        pass.dispatch_workgroups(groups.min(65535), groups.div_ceil(65535), 1);
-                        continue;
-                    }
-                    let gx = (*rows).min(65535);
-                    let gy = rows.div_ceil(65535);
-                    let gz = (m as u32).div_ceil(shaders::M_TILE);
+                    let (gx, gy, gz) = shaders::grid(q.dtype, m, *rows);
                     pass.dispatch_workgroups(gx, gy, gz);
                 }
             }
