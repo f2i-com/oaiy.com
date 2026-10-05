@@ -38,7 +38,8 @@ fn main(@builtin(local_invocation_index) li: u32) {
 }
 "#;
 
-/// [`RMSNORM`] of row `wg.x` of `x` (rows of `p[0].x`), every row with the same weights `w`.
+/// [`RMSNORM`] of row `wg.x` of `x` (rows of `p[0].x`), every row with the same weights `w`, or with `p[0].z` rows of
+/// them the row's `wg.x % p[0].z` (a hyper-connection's streams).
 const RMSNORM_ROWS: &str = r#"
 var<workgroup> part: array<f32, 256>;
 
@@ -46,6 +47,9 @@ var<workgroup> part: array<f32, 256>;
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
     let n = p[0].x;
     let at = wg.x * n;
+    var wrows = p[0].z;
+    if (wrows == 0u) { wrows = 1u; }
+    let wat = (wg.x % wrows) * n;
     var s = 0.0;
     for (var i = li; i < n; i += 256u) { let v = x[at + i]; s += v * v; }
     part[li] = s;
@@ -55,7 +59,80 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         workgroupBarrier();
     }
     let inv = 1.0 / sqrt(part[0] / f32(n) + bitcast<f32>(p[0].y));
-    for (var i = li; i < n; i += 256u) { y[at + i] = x[at + i] * inv * bitcast<f32>(w[i]); }
+    for (var i = li; i < n; i += 256u) { y[at + i] = x[at + i] * inv * bitcast<f32>(w[wat + i]); }
+}
+"#;
+
+/// A hyper-connection's gates, `p[0]`: rank, writes, streams, rows. `t` (binding 6) `[rows, rank + writes]`: its first
+/// `rank` become `silu(t / streams)`, the rest 0; `post` (binding 7) `[rows, writes]` gets their `2 sigmoid(t /
+/// streams)`. As the host's `hc_gates`.
+const HC_GATES: &str = r#"
+@group(0) @binding(6) var<storage, read_write> t: array<f32>;
+@group(0) @binding(7) var<storage, read_write> post: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let rank = p[0].x;
+    let writes = p[0].y;
+    let streams = f32(p[0].z);
+    let width = rank + writes;
+    let i = id.x;
+    if (i >= width * p[0].w) { return; }
+    let r = i / width;
+    let c = i % width;
+    let v = t[i] / streams;
+    if (c < rank) {
+        t[i] = v / (1.0 + exp(-v));
+    } else {
+        post[r * writes + c - rank] = 2.0 / (1.0 + exp(-v));
+        t[i] = 0.0;
+    }
+}
+"#;
+
+/// A hyper-connection's branch input: `y[r, j] = sum over s of x[r, s, j] / (1 + exp(-w[r, s, j])) / streams` (`w` the
+/// logits, `x` the normed streams), `p[0]`: d, streams, rows. As the host's `hc_mix`.
+const HC_MIX: &str = r#"
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let d = p[0].x;
+    let streams = p[0].y;
+    let i = id.x;
+    if (i >= d * p[0].z) { return; }
+    let r = i / d;
+    let j = i % d;
+    var acc = 0.0;
+    for (var s = 0u; s < streams; s++) {
+        let at = (r * streams + s) * d + j;
+        acc += x[at] / (1.0 + exp(-bitcast<f32>(w[at]))) / f32(streams);
+    }
+    y[i] = acc;
+}
+"#;
+
+/// A hyper-connection site's write-back: `y[r, s, j] += w[r, s] * x[r, j]` (`w` the write weights, `x` the branch
+/// output, `y` the streams), `p[0]`: d, streams, rows. As the host's `stream_apply`.
+const STREAM_APPLY: &str = r#"
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let d = p[0].x;
+    let streams = p[0].y;
+    let i = id.x;
+    if (i >= d * streams * p[0].z) { return; }
+    let r = i / (d * streams);
+    let s = (i / d) % streams;
+    let j = i % d;
+    y[i] = y[i] + bitcast<f32>(w[r * streams + s]) * x[r * d + j];
+}
+"#;
+
+/// `y[i] += w[p[0].y] * x[i]` for `i < p[0].x`: a weighted sum's term, its weight read from the device.
+const AXPY_AT: &str = r#"
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x;
+    if (i < p[0].x) { y[i] = y[i] + bitcast<f32>(w[p[0].y]) * x[i]; }
 }
 "#;
 
@@ -688,6 +765,12 @@ impl DeviceChain for WgpuBackend {
         rows * n_h * head_dim + rows * n_h * kv_len.div_ceil(SPLIT).max(1) * (head_dim + 2)
     }
 
+    fn holds_exl3(&self, w: &dyn ggml_rs::exl3::PackedLinear) -> bool {
+        w.as_any()
+            .and_then(|a| a.downcast_ref::<crate::exl3::Exl3Gpu>())
+            .is_some_and(|g| g.is_on(&self.gpu) && g.single_chunk().is_some())
+    }
+
     fn holds(&self, w: &QuantizedTensor) -> bool {
         w.device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).is_some_and(|q| Arc::ptr_eq(&q.gpu, &self.gpu))
     }
@@ -865,6 +948,70 @@ impl ChainRecorder for Recorder<'_> {
 
     fn keep_groups(&mut self, keep: bool) {
         self.keep = keep;
+    }
+
+    fn exl3_rows(&mut self, w: &dyn ggml_rs::exl3::PackedLinear, x: &DeviceVec, y: &DeviceVec, rows: usize) {
+        let g = w.as_any().and_then(|a| a.downcast_ref::<crate::exl3::Exl3Gpu>()).expect("an EXL3 projection this adapter holds");
+        assert!(g.is_on(&self.backend.gpu), "chain: an EXL3 projection of another adapter");
+        let (words, splits) = g.single_chunk().expect("an EXL3 projection in one buffer");
+        let (k, n) = g.kn();
+        assert!(rows > 0 && x.len >= rows * k && y.len >= rows * n && rows * splits as usize <= 65535, "chain: an EXL3 [{n}, {k}] of {rows} rows");
+        let c = g.chain(self.backend);
+        // a step's one row: the projection's own scratch (its bind groups kept); else this call's
+        let (xh, part, yt, jobs) = if rows == 1 && self.keep {
+            (c.xh.clone(), c.part.clone(), c.yt.clone(), c.jobs1.clone())
+        } else {
+            let jobs: Vec<u32> = (0..rows as u32).flat_map(|r| [0, r]).collect();
+            (self.backend.vec(rows * k), self.backend.vec(rows * splits as usize * n), self.backend.vec(rows * n), crate::exl3::u32_vec(self.backend, &jobs))
+        };
+        let d = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        let imap = c.imap.as_ref().map_or(&d, buffer).clone();
+        let pre = crate::exl3::chain_shader("pre");
+        self.dispatch_wide("exl3-pre", &pre, [buffer(x), buffer(&c.suh), &imap, buffer(&jobs), &d, &d, buffer(&xh), &drw], &[k as u32, c.imap.is_none() as u32], ((k / 128) as u32, rows as u32, 1));
+        let ntiles = (n / 16) as u32;
+        let mm = crate::exl3::chain_shader("mm");
+        self.dispatch_wide("exl3-mm", &mm, [words, buffer(&xh), buffer(&jobs), &d, &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, splits, 0], (ntiles.min(65535), ntiles.div_ceil(65535), rows as u32 * splits));
+        let post = crate::exl3::chain_shader("post");
+        let post_out = if c.omap.is_some() { buffer(&yt) } else { buffer(y) };
+        self.dispatch_wide("exl3-post", &post, [buffer(&part), buffer(&c.svh), buffer(&jobs), &d, &d, &d, post_out, &drw], &[n as u32, splits], ((n / 128) as u32, rows as u32, 1));
+        if let Some(omap) = &c.omap {
+            let gather = crate::exl3::chain_shader("gather");
+            self.dispatch_wide("exl3-gather", &gather, [buffer(&yt), buffer(omap), buffer(&jobs), &d, &d, &d, buffer(y), &drw], &[n as u32], ((n as u32).div_ceil(256), rows as u32, 1));
+        }
+    }
+
+    fn rmsnorm_streams(&mut self, x: &DeviceVec, w: &DeviceVec, out: &DeviceVec, rows: usize, streams: usize, eps: f32) {
+        let n = x.len / (rows * streams).max(1);
+        assert!(rows > 0 && streams > 0 && n * rows * streams == x.len && w.len >= streams * n && out.len >= x.len, "chain: a norm of {rows} rows of {streams} streams");
+        let pipeline = self.named("chain-rmsnorm-rows", RMSNORM_ROWS);
+        self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(out), &[n as u32, eps.to_bits(), streams as u32], ((rows * streams) as u32, 1, 1));
+    }
+
+    fn hc_gates(&mut self, t: &DeviceVec, post: &DeviceVec, rows: usize, rank: usize, writes: usize, streams: usize) {
+        assert!(t.len >= rows * (rank + writes) && post.len >= rows * writes.max(1), "chain: a hyper-connection's gates");
+        let len = (rows * (rank + writes)) as u32;
+        // nothing read: a dummy at the read bindings (a buffer written may not be bound as read too)
+        let d = self.gpu().dummy().clone();
+        self.dispatch_wide("chain-hc-gates", HC_GATES, [&d, &d, &d, &d, &d, &d, buffer(t), buffer(post)], &[rank as u32, writes as u32, streams as u32, rows as u32], (len.div_ceil(256), 1, 1));
+    }
+
+    fn hc_mix(&mut self, logits: &DeviceVec, normed: &DeviceVec, out: &DeviceVec, rows: usize, streams: usize, d: usize) {
+        assert!(logits.len >= rows * streams * d && normed.len >= rows * streams * d && out.len >= rows * d, "chain: a hyper-connection's mix");
+        let pipeline = self.named("chain-hc-mix", HC_MIX);
+        self.dispatch_kept(&pipeline, buffer(logits), buffer(normed), buffer(out), &[d as u32, streams as u32, rows as u32], (((rows * d) as u32).div_ceil(256), 1, 1));
+    }
+
+    fn stream_apply(&mut self, x: &DeviceVec, y: &DeviceVec, post: &DeviceVec, rows: usize, streams: usize, d: usize) {
+        assert!(x.len >= rows * streams * d && y.len >= rows * d && post.len >= rows * streams, "chain: a hyper-connection's write-back");
+        let pipeline = self.named("chain-stream-apply", STREAM_APPLY);
+        self.dispatch_kept(&pipeline, buffer(post), buffer(y), buffer(x), &[d as u32, streams as u32, rows as u32], (((rows * streams * d) as u32).div_ceil(256), 1, 1));
+    }
+
+    fn axpy_at(&mut self, acc: &DeviceVec, y: &DeviceVec, weights: &DeviceVec, at: usize, len: usize) {
+        assert!(acc.len >= len && y.len >= len && weights.len > at, "chain: a weighted term of {len}");
+        let pipeline = self.named("chain-axpy-at", AXPY_AT);
+        self.dispatch_kept(&pipeline, buffer(weights), buffer(y), buffer(acc), &[len as u32, at as u32], ((len as u32).div_ceil(256), 1, 1));
     }
 
     fn copy_cols(&mut self, src: &DeviceVec, dst: &DeviceVec, rows: usize, width: usize, stride: usize, at: usize) {
@@ -1472,5 +1619,56 @@ mod tests {
             }
         }
         close(&got[4], &want, "the f32 matmul");
+    }
+
+    /// Flash-Next's hyper-connection ops give the host's: the per-stream norm, the gates, the mix, the write-back, and
+    /// a weighted term read from the device.
+    #[test]
+    fn hyper_connection_ops_match_the_hosts() {
+        use ggml_rs::Backend;
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        let cpu = ggml_rs::CpuBackend::new();
+        let (rows, streams, d, rank, writes) = (3usize, 4usize, 64usize, 8usize, 4usize);
+        let mut next = rng(5);
+        let mut vals = |n: usize| (0..n).map(|_| next()).collect::<Vec<f32>>();
+        let x = vals(rows * streams * d);
+        let w = vals(streams * d);
+        let t0 = vals(rows * (rank + writes));
+        let logits = vals(rows * streams * d);
+        let y = vals(rows * d);
+        let post0 = vals(rows * streams);
+        let up = |v: &[f32]| {
+            let dv = b.vec(v.len());
+            DeviceChain::upload(&b, &dv, v);
+            dv
+        };
+        let t = |v: &[f32], shape: Vec<usize>| ggml_rs::Tensor::from_vec(v.to_vec(), shape);
+        let (xd, wd, td, ld, yd, pd) = (up(&x), up(&w), up(&t0), up(&logits), up(&y), up(&post0));
+        let (normed, post, mixed) = (b.vec(rows * streams * d), b.vec(rows * writes), b.vec(rows * d));
+        let acc = up(&y);
+        let weights = up(&[0.5, -1.25, 2.0]);
+        let mut rec = b.begin();
+        rec.rmsnorm_streams(&xd, &wd, &normed, rows, streams, 1e-6);
+        rec.hc_gates(&td, &post, rows, rank, writes, streams);
+        rec.hc_mix(&ld, &normed, &mixed, rows, streams, d);
+        rec.stream_apply(&xd, &yd, &pd, rows, streams, d);
+        rec.axpy_at(&acc, &yd, &weights, 1, rows * d);
+        for v in [&normed, &td, &post, &mixed, &xd, &acc] {
+            rec.read(v);
+        }
+        let got = rec.finish();
+        let want_normed = cpu.hc_norm(&t(&x, vec![rows, streams * d]), &t(&w, vec![streams * d]), streams, 1e-6);
+        close(&got[0], want_normed.data(), "the per-stream norm");
+        let mut tt = t(&t0, vec![rows, rank + writes]);
+        let want_post = cpu.hc_gates(&mut tt, rank, writes, streams);
+        close(&got[1], tt.data(), "the gates' input");
+        close(&got[2], want_post.data(), "the write weights");
+        let want_mix = cpu.hc_mix(&t(&logits, vec![rows, streams * d]), &want_normed, streams);
+        close(&got[3], want_mix.data(), "the mix");
+        let mut xs = t(&x, vec![rows, streams * d]);
+        cpu.stream_apply(&mut xs, &t(&y, vec![rows, d]), &t(&post0, vec![rows, streams]), streams);
+        close(&got[4], xs.data(), "the write-back");
+        let want_acc: Vec<f32> = y.iter().map(|v| v + -1.25 * v).collect();
+        close(&got[5], &want_acc, "the weighted term");
     }
 }

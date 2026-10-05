@@ -11,7 +11,7 @@
 
 use crate::{chunk_limit, Gpu, WgpuBackend};
 use ggml_rs::exl3::{Exl3Data, PackedLinear};
-use ggml_rs::Tensor;
+use ggml_rs::{DeviceVec, Tensor};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -410,6 +410,8 @@ pub struct Exl3Gpu {
     shape: [usize; 2],
     nbytes: usize,
     used: Arc<AtomicU64>,
+    /// What a chain needs of it, made when first chained.
+    chain: std::sync::OnceLock<Exl3Chain>,
 }
 
 impl std::fmt::Debug for Exl3Gpu {
@@ -457,6 +459,7 @@ impl Exl3Gpu {
             shape: [n, k],
             nbytes,
             used: Arc::clone(&backend.used),
+            chain: std::sync::OnceLock::new(),
         }
     }
 
@@ -575,6 +578,9 @@ fn read_back(gpu: &Gpu, mut enc: wgpu::CommandEncoder, passes: &[Recorded]) -> V
 }
 
 impl PackedLinear for Exl3Gpu {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
     fn shape(&self) -> &[usize] {
         &self.shape
     }
@@ -598,6 +604,290 @@ impl PackedLinear for Exl3Gpu {
             }
         }
         Tensor::from_vec(out, shape)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// In a chain
+// ---------------------------------------------------------------------------
+
+/// f32 to f16 and back as the host's `half` (the `half` crate's: to nearest even, subnormals, infinity past 65504),
+/// for the chain's transforms: an activation is not always a normal f16 value, as a decoded weight is.
+const HALF: &str = r#"
+fn half(v: f32) -> f32 {
+    let b = bitcast<u32>(v);
+    let sign = b & 0x80000000u;
+    let a = b & 0x7fffffffu;
+    if (a > 0x7f800000u) { return v; }
+    if (a >= 0x477ff000u) { return bitcast<f32>(sign | 0x7f800000u); }
+    if (a < 0x38800000u) {
+        // below f16's normals: a multiple of 2^-24, to nearest even
+        let q = round(bitcast<f32>(a) * 16777216.0) / 16777216.0;
+        return bitcast<f32>(sign | bitcast<u32>(q));
+    }
+    return bitcast<f32>(sign | ((a + 0xfffu + ((a >> 13u) & 1u)) & 0xffffe000u));
+}
+"#;
+
+/// The chain's EXL3 kernels take a job list: job `j` is matrix `jobs[2j]` of a group on row `jobs[2j + 1]` of its
+/// input, its result row `j`. A projection's input transform for each job, a workgroup a (128-block, job): `x`'s row
+/// gathered through the input map (unless `p[0].y`, the identity), rounded to f16 and scaled by `suh`, the Hadamard
+/// transform of each 128-block, scaled by 1/sqrt(128) and rounded (as `Transform::pre`). `p[0]`: k, identity.
+const G_PRE: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> suh: array<f32>;
+@group(0) @binding(2) var<storage, read> imap: array<u32>;
+@group(0) @binding(3) var<storage, read> jobs: array<u32>;
+@group(0) @binding(6) var<storage, read_write> xh: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> sh: array<f32, 128>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    let k = p[0].x;
+    let j = wg.y;
+    let m = jobs[2u * j];
+    let xr = jobs[2u * j + 1u];
+    let i = wg.x * 128u + t;
+    var src = i;
+    if (p[0].y == 0u) { src = imap[m * k + i]; }
+    sh[t] = half(x[xr * k + src]) * suh[m * k + i];
+    workgroupBarrier();
+    for (var s = 1u; s < 128u; s *= 2u) {
+        if ((t & s) == 0u) {
+            let a = sh[t];
+            let b = sh[t + s];
+            sh[t] = a + b;
+            sh[t + s] = a - b;
+        }
+        workgroupBarrier();
+    }
+    xh[j * k + i] = half(sh[t] * bitcast<f32>(0x3db504f4u));
+}
+"#;
+
+/// The matmul of each job's transformed row ([`ONE`]'s, the matrices a group's: matrix `m`'s words from `m *
+/// p[1].x`): a workgroup a (tile column, job and split), its partial sums to `part[(j * splits + s) * n..]`.
+/// `p[0]`: n, k, tile words, splits; `p[1]`: words a matrix.
+const G_MM: &str = r#"
+@group(0) @binding(0) var<storage, read> words: array<u32>;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read> jobs: array<u32>;
+@group(0) @binding(6) var<storage, read_write> part: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> tile: array<u32, 64>;
+var<workgroup> xs: array<f32, 16>;
+var<workgroup> red: array<f32, 256>;
+
+fn round_f16(v: f32) -> f32 {
+    let b = bitcast<u32>(v);
+    return bitcast<f32>((b + 0xfffu + ((b >> 13u) & 1u)) & 0xffffe000u);
+}
+
+fn weight(r: u32, c: u32, tw: u32) -> f32 {
+    let nw = tw / 2u;
+    let lane = (r % 8u) / 2u + 4u * (c % 8u);
+    let jj = (r % 2u) + 2u * (r / 8u) + 4u * (c / 8u);
+    let i = lane * 8u + jj;
+    var end = (i + 1u) * (tw / 16u);
+    if (tw % 16u == 8u) {
+        end = end + (i + 1u) / 2u;
+    }
+    let start = (end + nw * 32u - 16u) % (nw * 32u);
+    let w0 = start / 32u;
+    let sh = 48u - start % 32u;
+    let a = tile[w0];
+    let b = tile[(w0 + 1u) % nw];
+    var code: u32;
+    if (sh >= 32u) {
+        code = a >> (sh - 32u);
+    } else {
+        code = (a << (32u - sh)) | (b >> sh);
+    }
+    let hx = (code & 0xffffu) * 0x83dcd12du;
+    let sum = (hx & 255u) + ((hx >> 8u) & 255u) + ((hx >> 16u) & 255u) + (hx >> 24u);
+    return round_f16(f32(1024u + sum) * 0.00676727294921875 - 10.3828125);
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    let n = p[0].x;
+    let k = p[0].y;
+    let tw = p[0].z;
+    let splits = p[0].w;
+    let ntiles = n / 16u;
+    let nt = wg.x + wg.y * 65535u;
+    if (nt >= ntiles) {
+        return;
+    }
+    let j = wg.z / splits;
+    let s = wg.z % splits;
+    let base = jobs[2u * j] * p[1].x;
+    let r = t / 16u;
+    let c = t % 16u;
+    let nw = tw / 2u;
+    let kts = k / 16u;
+    let per = (kts + splits - 1u) / splits;
+    let ks = s * per;
+    let ke = min(kts, ks + per);
+    var acc = 0.0;
+    for (var kt = ks; kt < ke; kt = kt + 1u) {
+        if (t < nw) {
+            tile[t] = words[base + (kt * ntiles + nt) * nw + t];
+        }
+        if (t < 16u) {
+            xs[t] = x[j * k + kt * 16u + t];
+        }
+        workgroupBarrier();
+        acc = acc + xs[r] * weight(r, c, tw);
+        workgroupBarrier();
+    }
+    red[t] = acc;
+    workgroupBarrier();
+    if (r == 0u) {
+        var total = 0.0;
+        for (var q = 0u; q < 16u; q = q + 1u) {
+            total = total + red[q * 16u + c];
+        }
+        part[(j * splits + s) * n + nt * 16u + c] = total;
+    }
+}
+"#;
+
+/// Each job's output transform, a workgroup a (128-block, job): its splits' partial sums added up (in order),
+/// rounded to f16, the Hadamard transform of each 128-block, scaled by 1/sqrt(128) and `svh` and rounded (as
+/// `Transform::post` before its output map). `p[0]`: n, splits.
+const G_POST: &str = r#"
+@group(0) @binding(0) var<storage, read> part: array<f32>;
+@group(0) @binding(1) var<storage, read> svh: array<f32>;
+@group(0) @binding(2) var<storage, read> jobs: array<u32>;
+@group(0) @binding(6) var<storage, read_write> y: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> sh: array<f32, 128>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    let n = p[0].x;
+    let splits = p[0].y;
+    let j = wg.y;
+    let m = jobs[2u * j];
+    let c = wg.x * 128u + t;
+    var v = 0.0;
+    for (var s = 0u; s < splits; s++) { v += part[(j * splits + s) * n + c]; }
+    sh[t] = half(v);
+    workgroupBarrier();
+    for (var st = 1u; st < 128u; st *= 2u) {
+        if ((t & st) == 0u) {
+            let a = sh[t];
+            let b = sh[t + st];
+            sh[t] = a + b;
+            sh[t + st] = a - b;
+        }
+        workgroupBarrier();
+    }
+    y[j * n + c] = half(sh[t] * bitcast<f32>(0x3db504f4u) * svh[m * n + c]);
+}
+"#;
+
+/// Each job's output through its matrix's output map: `y[j, i] = yt[j, omap[m, i]]`. `p[0]`: n.
+const G_GATHER: &str = r#"
+@group(0) @binding(0) var<storage, read> yt: array<f32>;
+@group(0) @binding(1) var<storage, read> omap: array<u32>;
+@group(0) @binding(2) var<storage, read> jobs: array<u32>;
+@group(0) @binding(6) var<storage, read_write> y: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let n = p[0].x;
+    let i = id.x;
+    let j = id.y;
+    if (i >= n) { return; }
+    let m = jobs[2u * j];
+    y[j * n + i] = yt[j * n + omap[m * n + i]];
+}
+"#;
+
+/// The chain's kernels as WGSL: the input transform, the matmul, the output transform and its map.
+pub(crate) fn chain_shader(which: &str) -> String {
+    match which {
+        "pre" => format!("{HALF}{G_PRE}"),
+        "mm" => G_MM.to_string(),
+        "post" => format!("{HALF}{G_POST}"),
+        _ => G_GATHER.to_string(),
+    }
+}
+
+/// What a chain needs of a projection on the GPU, made when it is first chained: its transforms' tables (the maps
+/// only where they are not the identity), and a one-row run's scratch and job table (one set, so a decode step's bind
+/// groups are made once).
+pub(crate) struct Exl3Chain {
+    pub suh: DeviceVec,
+    pub svh: DeviceVec,
+    pub imap: Option<DeviceVec>,
+    pub omap: Option<DeviceVec>,
+    pub xh: DeviceVec,
+    pub part: DeviceVec,
+    pub yt: DeviceVec,
+    pub jobs1: DeviceVec,
+}
+
+/// `values` (u32s) as a chain's vector (their bits).
+pub(crate) fn u32_vec(b: &WgpuBackend, values: &[u32]) -> DeviceVec {
+    use ggml_rs::DeviceChain;
+    let v = b.vec(values.len());
+    let as_f32: Vec<f32> = values.iter().map(|&w| f32::from_bits(w)).collect();
+    DeviceChain::upload(b, &v, &as_f32);
+    v
+}
+
+impl Exl3Gpu {
+    /// Its one buffer of words and its splits, if it has one buffer (a chain takes no other).
+    pub(crate) fn single_chunk(&self) -> Option<(&wgpu::Buffer, u32)> {
+        match self.chunks.as_slice() {
+            [(buffer, 0, _, splits)] => Some((buffer, *splits)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn kn(&self) -> (usize, usize) {
+        (self.t.k, self.t.n)
+    }
+
+    pub(crate) fn tile_words(&self) -> usize {
+        self.tile_words
+    }
+
+    pub(crate) fn is_on(&self, gpu: &Arc<Gpu>) -> bool {
+        Arc::ptr_eq(&self.gpu, gpu)
+    }
+
+    /// Its chain's tables and one-row scratch, made when first asked for.
+    pub(crate) fn chain(&self, b: &WgpuBackend) -> &Exl3Chain {
+        use ggml_rs::DeviceChain;
+        self.chain.get_or_init(|| {
+            let (k, n) = (self.t.k, self.t.n);
+            let splits = self.single_chunk().map_or(1, |c| c.1) as usize;
+            let up = |v: &[f32]| {
+                let d = b.vec(v.len());
+                DeviceChain::upload(b, &d, v);
+                d
+            };
+            let identity = |m: &[u32]| m.iter().enumerate().all(|(i, &v)| v as usize == i);
+            Exl3Chain {
+                suh: up(&self.t.suh),
+                svh: up(&self.t.svh),
+                imap: (!identity(&self.t.input_map)).then(|| u32_vec(b, &self.t.input_map)),
+                omap: (!identity(&self.t.output_map)).then(|| u32_vec(b, &self.t.output_map)),
+                xh: b.vec(k),
+                part: b.vec(splits * n),
+                yt: b.vec(n),
+                jobs1: u32_vec(b, &[0, 0]),
+            }
+        })
     }
 }
 
@@ -1190,5 +1480,45 @@ mod tests {
         assert!(b.usage().0 > 0);
         drop(w);
         assert_eq!(b.usage().0, 0, "dropping the weight returns its bytes");
+    }
+
+    /// A projection chained on the GPU, its transforms there too (the maps gathered, the Hadamard transforms and their
+    /// f16 roundings), gives the projection's own answer (its transforms on the host): one row (a step's, its scratch
+    /// kept) bit for bit, and three, with and without maps, at 3 and 5 bits.
+    #[test]
+    fn a_chained_projection_matches_the_projection() {
+        use ggml_rs::{ChainRecorder, DeviceChain};
+        let Some(b) = backend() else { return };
+        let (k, n) = (512usize, 384usize);
+        for (tw, maps) in [(48usize, false), (80, true)] {
+            let mut data = random_exl3(k, n, tw, 77 + tw as u32);
+            if maps {
+                data.input_map = (0..k as u32).map(|i| (i * 7 + 3) % k as u32).collect();
+                data.output_map = (0..n as u32).rev().collect();
+            }
+            let w = b.exl3(data).unwrap();
+            assert!(b.holds_exl3(w.as_ref()), "the adapter holds it");
+            for rows in [1usize, 3] {
+                let xs: Vec<f32> = (0..rows * k).map(|i| ((i * 37 % 101) as f32 - 50.0) / 31.0).collect();
+                let want = w.linear(&Tensor::from_vec(xs.clone(), vec![rows, k]));
+                let (x, y) = (b.vec(rows * k), b.vec(rows * n));
+                DeviceChain::upload(&b, &x, &xs);
+                // twice: the second from the kept scratch
+                for _ in 0..2 {
+                    let mut rec = b.begin();
+                    rec.exl3_rows(w.as_ref(), &x, &y, rows);
+                    rec.read(&y);
+                    let got = rec.finish().pop().unwrap();
+                    // one row as the projection's own kernel sums it, bit for bit; several as its kernel for a
+                    // prompt's rows does, in another order (an f16 step apart at most)
+                    let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+                    if rows == 1 {
+                        assert_eq!(bits(&got), bits(want.data()), "tw={tw} maps={maps} rows={rows}");
+                    } else {
+                        close(&got, want.data(), &format!("tw={tw} maps={maps} rows={rows}"));
+                    }
+                }
+            }
+        }
     }
 }

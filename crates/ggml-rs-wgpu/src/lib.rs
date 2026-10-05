@@ -99,6 +99,9 @@ struct Gpu {
     /// parameters), made when first used, and their bind groups as `chain_groups`.
     wide: std::sync::OnceLock<(wgpu::BindGroupLayout, wgpu::PipelineLayout)>,
     chain_groups_wide: Mutex<HashMap<chain::WideKey, wgpu::BindGroup>>,
+    /// Small buffers for a kernel's bindings it does not use: one read, one written.
+    dummy: std::sync::OnceLock<wgpu::Buffer>,
+    dummy_rw: std::sync::OnceLock<wgpu::Buffer>,
     limits: wgpu::Limits,
     /// Upload bytes written since the queue was last flushed.
     staged: AtomicU64,
@@ -292,6 +295,20 @@ impl Gpu {
                 immediate_size: 0,
             });
             (layout, pipeline_layout)
+        })
+    }
+
+    /// A small buffer for the bindings a kernel does not read.
+    fn dummy(&self) -> &wgpu::Buffer {
+        self.dummy.get_or_init(|| {
+            self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("oaiy-dummy"), size: 16, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false })
+        })
+    }
+
+    /// Another, for a written binding a kernel does not write (one buffer may not be bound written twice).
+    fn dummy_rw(&self) -> &wgpu::Buffer {
+        self.dummy_rw.get_or_init(|| {
+            self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("oaiy-dummy-rw"), size: 16, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false })
         })
     }
 
@@ -538,7 +555,7 @@ impl WgpuBackend {
         });
         Ok(Self {
             cpu: CpuBackend::new(),
-            gpu: Arc::new(Gpu { device, queue, layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), chain_groups: Mutex::new(HashMap::new()), wide: std::sync::OnceLock::new(), chain_groups_wide: Mutex::new(HashMap::new()), limits, staged: AtomicU64::new(0) }),
+            gpu: Arc::new(Gpu { device, queue, layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), chain_groups: Mutex::new(HashMap::new()), wide: std::sync::OnceLock::new(), chain_groups_wide: Mutex::new(HashMap::new()), dummy: std::sync::OnceLock::new(), dummy_rw: std::sync::OnceLock::new(), limits, staged: AtomicU64::new(0) }),
             budget,
             used: Arc::new(AtomicU64::new(0)),
             summary,

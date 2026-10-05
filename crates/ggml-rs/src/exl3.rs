@@ -6,6 +6,10 @@ pub trait PackedLinear: std::fmt::Debug + Send + Sync {
     fn shape(&self) -> &[usize];
     fn linear(&self, x: &Tensor) -> Tensor;
     fn nbytes(&self) -> usize;
+    /// VENDORED-LOCAL: the concrete projection, for a backend that runs it in a chain of its own (none by default).
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
 }
 
 /// A MoE layer's EXL3 experts, the shared one last: `forward(x, logits, top_k)` routes each row of `x` (`[rows,
@@ -15,6 +19,10 @@ pub trait PackedLinear: std::fmt::Debug + Send + Sync {
 /// GPU through WebGPU and the CPU (`ggml_rs_wgpu::exl3`).
 pub trait Experts: std::fmt::Debug + Send + Sync {
     fn forward(&self, x: &Tensor, logits: &Tensor, top_k: usize) -> Tensor;
+    /// VENDORED-LOCAL: the concrete experts, for a backend that runs them in a chain of its own (none by default).
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
 }
 
 #[derive(Debug)]

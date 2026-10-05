@@ -61,6 +61,8 @@ pub trait DeviceChain: Send + Sync {
     fn resize(&self, v: &DeviceVec, len: usize) -> DeviceVec;
     /// Whether this device holds `w` where its matmuls read it.
     fn holds(&self, w: &QuantizedTensor) -> bool;
+    /// Whether this device holds the EXL3 projection `w` where [`ChainRecorder::exl3_rows`] reads it.
+    fn holds_exl3(&self, w: &dyn crate::exl3::PackedLinear) -> bool;
     /// The length [`ChainRecorder::attention`]'s `out` needs for `n_h` heads of `head_dim` over a cache of `cap` rows:
     /// the result and the device's scratch.
     fn attention_out_len(&self, n_h: usize, head_dim: usize, cap: usize) -> usize;
@@ -154,6 +156,29 @@ pub trait ChainRecorder {
     /// (`[rows, v_heads v_dim]`). Head `h` reads key head `h % k_heads`.
     #[allow(clippy::too_many_arguments)]
     fn delta_net(&mut self, conv: &DeviceVec, z: &DeviceVec, beta_alpha: &DeviceVec, ssm_a: &DeviceVec, dt_bias: &DeviceVec, norm: &DeviceVec, state: &DeviceVec, out: &DeviceVec, d: DeltaNet);
+    /// `y[r] = W x[r]` for `rows` rows of `x` through an EXL3 projection this device holds
+    /// ([`DeviceChain::holds_exl3`]): its input and output transforms (the channel maps, the scales, the Hadamard
+    /// transforms and their f16 roundings) on the device as the host makes them.
+    fn exl3_rows(&mut self, w: &dyn crate::exl3::PackedLinear, x: &DeviceVec, y: &DeviceVec, rows: usize);
+    /// [`Self::rmsnorm_rows`] of each of `rows * streams` rows of `x`, row `r`'s stream `s` by `w[s * d..]` (`d` its
+    /// width): a hyper-connection's per-stream norm (`Backend::hc_norm`).
+    #[allow(clippy::too_many_arguments)]
+    fn rmsnorm_streams(&mut self, x: &DeviceVec, w: &DeviceVec, out: &DeviceVec, rows: usize, streams: usize, eps: f32);
+    /// A hyper-connection's gates (`Backend::hc_gates`): of each of `rows` rows of `t` (`[rows, rank + writes]`) the
+    /// first `rank` become `silu(t / streams)`, the rest 0, and `post` (`[rows, writes]`) gets `2 sigmoid(t /
+    /// streams)` of them.
+    #[allow(clippy::too_many_arguments)]
+    fn hc_gates(&mut self, t: &DeviceVec, post: &DeviceVec, rows: usize, rank: usize, writes: usize, streams: usize);
+    /// A hyper-connection's branch input (`Backend::hc_mix`): `out[r] = sum over s of normed[r, s] *
+    /// sigmoid(logits[r, s]) / streams`, rows of `d`.
+    #[allow(clippy::too_many_arguments)]
+    fn hc_mix(&mut self, logits: &DeviceVec, normed: &DeviceVec, out: &DeviceVec, rows: usize, streams: usize, d: usize);
+    /// A hyper-connection site's write-back (`Backend::stream_apply`): `x[r, s] += post[r, s] * y[r]`, rows of `d`.
+    #[allow(clippy::too_many_arguments)]
+    fn stream_apply(&mut self, x: &DeviceVec, y: &DeviceVec, post: &DeviceVec, rows: usize, streams: usize, d: usize);
+    /// `acc[i] += weights[at] * y[i]` for `i < len`: a weighted sum's term, its weight read from the device (an
+    /// expert's, written by the host before the chain runs).
+    fn axpy_at(&mut self, acc: &DeviceVec, y: &DeviceVec, weights: &DeviceVec, at: usize, len: usize);
     /// Read `v` back once the chain has run.
     fn read(&mut self, v: &DeviceVec) {
         self.read_range(v, 0, v.len)
