@@ -177,6 +177,118 @@ impl ChainDecoder {
             .as_ref()
     }
 
+    /// A prompt's chunk of `tokens`, chained a layer a submit, if the backend can: the last token's logits `[1, vocab]`;
+    /// None leaves it to the model's own path. The residual stream stays on the device; a layer's q, k and v come back
+    /// for the host's RoPE, KV cache and attention, whose output goes up for the rest of the layer and the next one's
+    /// q, k and v. Op by op, every projection's input went up and its output came back, the FFN's too: of a 3B Llama's
+    /// 2,000-token prompt (8.4 s), 3 s on the host making and reading those.
+    pub(crate) fn prompt(&self, backend: &dyn Backend, m: &Dense<'_>, tokens: &[u32], kv: &mut KvCache) -> Option<Tensor> {
+        if std::env::var_os("OAIY_NO_CHAIN").is_some() || tokens.len() < 2 {
+            return None;
+        }
+        let st = self.state(backend, m)?;
+        let chain = backend.chain()?;
+        let cfg = m.cfg;
+        let t = tokens.len();
+        let (n_h, n_kv, hd, d) = (cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, cfg.embedding_dim);
+        let (qd, kvd) = (n_h * hd, n_kv * hd);
+        let ff = m.common.blocks[0].ffn_pair.ff();
+        let past = kv.len;
+        let scale = 1.0 / (hd as f32).sqrt();
+        let rope_type = cfg.arch.rope_type();
+        let positions: Vec<u32> = (past..past + t).map(|p| p as u32).collect();
+        let [x, xn, q, k, v, qn, kn, attn, proj, proj_n, gate_up, act] =
+            [t * d, t * d, t * qd, t * kvd, t * kvd, t * qd, t * kvd, t * qd, t * d, t * d, t * 2 * ff, t * ff].map(|len| chain.vec(len));
+        let (last, logits) = (chain.vec(d), chain.vec(cfg.vocab_size));
+        let emb = backend.embed_lookup(&m.common.tok_embd, tokens, cfg.embedding_dim);
+        let mut emb = if emb.is_device() { emb.to_host() } else { emb };
+        if let Some(s) = m.embed_scale {
+            emb.data_mut().iter_mut().for_each(|e| *e *= s);
+        }
+        chain.upload(&x, emb.data());
+        // a layer's norm, q, k and v (and their per-head norms), read back
+        let head = |rec: &mut dyn ggml_rs::ChainRecorder, l: usize| {
+            let b = &m.common.blocks[l];
+            rec.rmsnorm_rows(&x, &st.attn_norms[l], &xn, t, cfg.rms_eps);
+            rec.matmul_rows(quant(&b.attn_q), &xn, &q, t);
+            rec.matmul_rows(quant(&b.attn_k), &xn, &k, t);
+            rec.matmul_rows(quant(&b.attn_v), &xn, &v, t);
+            match &st.qk_norms {
+                Some(norms) => {
+                    rec.rmsnorm_rows(&q, &norms[l].0, &qn, t * n_h, cfg.rms_eps);
+                    rec.rmsnorm_rows(&k, &norms[l].1, &kn, t * n_kv, cfg.rms_eps);
+                    rec.read(&qn);
+                    rec.read(&kn);
+                }
+                None => {
+                    rec.read(&q);
+                    rec.read(&k);
+                }
+            }
+            rec.read(&v);
+        };
+        let mut rec = chain.begin();
+        head(&mut *rec, 0);
+        let mut got = rec.finish();
+        for l in 0..cfg.n_layers {
+            let b = &m.common.blocks[l];
+            let vh = got.pop().expect("v");
+            let kh = got.pop().expect("k");
+            let qh = got.pop().expect("q");
+            let mut qt = Tensor::from_vec(qh, vec![t, n_h, hd]);
+            let mut kt = Tensor::from_vec(kh, vec![t, n_kv, hd]);
+            let vt = Tensor::from_vec(vh, vec![t, n_kv, hd]);
+            let (theta, factors, window) = m.layer(l);
+            ggml_rs::ops::rope_with_factors(backend, &mut qt, &positions, hd, rope_type, theta, factors);
+            ggml_rs::ops::rope_with_factors(backend, &mut kt, &positions, hd, rope_type, theta, factors);
+            kv.append(backend, l, &kt, &vt);
+            let a = ggml_rs::ops::attention_swa(backend, &qt, kv.k_buffer(l), kv.v_buffer(l), kv.len + t, scale, past, window);
+            let a = if a.is_device() { a.to_host() } else { a };
+            chain.upload(&attn, a.data());
+            let mut rec = chain.begin();
+            rec.matmul_rows(quant(&b.attn_output), &attn, &proj, t);
+            match &st.post_norms {
+                Some(norms) => {
+                    rec.rmsnorm_rows(&proj, &norms[l].0, &proj_n, t, cfg.rms_eps);
+                    rec.add(&x, &proj_n);
+                }
+                None => rec.add(&x, &proj),
+            }
+            rec.rmsnorm_rows(&x, &st.ffn_norms[l], &xn, t, cfg.rms_eps);
+            let FfnPair::Fused(gu) = &b.ffn_pair else { unreachable!("the chain state checked the pair") };
+            rec.matmul_rows(quant(gu), &xn, &gate_up, t);
+            if m.gelu {
+                rec.gelu_mul_split_rows(&gate_up, &act, t);
+            } else {
+                rec.silu_mul_split_rows(&gate_up, &act, t);
+            }
+            rec.matmul_rows(quant(&b.ffn_down), &act, &proj, t);
+            match &st.post_norms {
+                Some(norms) => {
+                    rec.rmsnorm_rows(&proj, &norms[l].1, &proj_n, t, cfg.rms_eps);
+                    rec.add(&x, &proj_n);
+                }
+                None => rec.add(&x, &proj),
+            }
+            if l + 1 < cfg.n_layers {
+                head(&mut *rec, l + 1);
+            } else {
+                // the head of the last token's row only
+                rec.rmsnorm_rows(&x, &st.output_norm, &xn, t, cfg.rms_eps);
+                rec.copy(&xn, (t - 1) * d, &last, 0, d);
+                rec.matmul(quant(&m.common.output), &last, &logits);
+                rec.read(&logits);
+            }
+            got = rec.finish();
+        }
+        kv.commit(t);
+        let mut out = got.pop().expect("the logits");
+        if let Some(c) = m.softcap {
+            out.iter_mut().for_each(|v| *v = (*v * (1.0 / c)).tanh() * c);
+        }
+        Some(Tensor::from_vec(out, vec![1, cfg.vocab_size]))
+    }
+
     /// One decode step of `token`, chained, if the backend can: the logits `[1, vocab]`; None leaves the step to the
     /// model's own path.
     pub(crate) fn step(&self, backend: &dyn Backend, m: &Dense<'_>, token: u32, kv: &mut KvCache) -> Option<Tensor> {

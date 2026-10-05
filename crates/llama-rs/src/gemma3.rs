@@ -115,7 +115,7 @@ impl Gemma3Model {
     /// and [`forward_embeds`].
     pub fn forward(&self, tokens: &[u32], kv: &mut KvCache) -> Tensor {
         // VENDORED-LOCAL: a decode step chained on the device when the backend has one for this model.
-        if tokens.len() == 1 {
+        {
             let cfg = &self.config;
             let layers = (0..cfg.n_layers)
                 .map(|l| {
@@ -135,7 +135,12 @@ impl Gemma3Model {
                 softcap: cfg.final_logit_softcap,
                 ..crate::chain_decode::Dense::plain(cfg, &self.common)
             };
-            if let Some(logits) = self.chain.step(&*self.backend, &dense, tokens[0], kv) {
+            let chained = if tokens.len() == 1 {
+                self.chain.step(&*self.backend, &dense, tokens[0], kv)
+            } else {
+                self.chain.prompt(&*self.backend, &dense, tokens, kv)
+            };
+            if let Some(logits) = chained {
                 return logits;
             }
         }

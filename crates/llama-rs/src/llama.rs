@@ -89,11 +89,14 @@ impl LlamaModel {
 
     pub fn forward(&self, tokens: &[u32], kv: &mut KvCache) -> Tensor {
         // VENDORED-LOCAL: a decode step chained on the device when the backend has one for this model.
-        if tokens.len() == 1 {
-            let dense = crate::chain_decode::Dense::plain(&self.config, &self.weights);
-            if let Some(logits) = self.chain.step(&*self.backend, &dense, tokens[0], kv) {
-                return logits;
-            }
+        let dense = crate::chain_decode::Dense::plain(&self.config, &self.weights);
+        let chained = if tokens.len() == 1 {
+            self.chain.step(&*self.backend, &dense, tokens[0], kv)
+        } else {
+            self.chain.prompt(&*self.backend, &dense, tokens, kv)
+        };
+        if let Some(logits) = chained {
+            return logits;
         }
         self.forward_host(tokens, kv)
     }

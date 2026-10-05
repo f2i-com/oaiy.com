@@ -1283,9 +1283,11 @@ mod dense_webgpu_timing {
         let argmax = |l: &ggml_rs::Tensor| l.data().iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
         let run = |chained: bool| {
             let mut kv = model.new_kv_cache(prompt.len() + 80);
-            let l = host(&prompt, &mut kv);
+            // the prompt chained too, in one chunk, its logits compared with the rest
+            let l = if chained { model.forward(&prompt, &mut kv) } else { host(&prompt, &mut kv) };
+            let first = model.last_logits(&l).data().to_vec();
             let mut next = argmax(&model.last_logits(&l));
-            let (mut tokens, mut all) = (Vec::new(), Vec::new());
+            let (mut tokens, mut all) = (vec![next], vec![first]);
             for _ in 0..64 {
                 let l = if chained { model.forward(&[next], &mut kv) } else { host(&[next], &mut kv) };
                 let l = model.last_logits(&l).data().to_vec();

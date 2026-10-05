@@ -68,29 +68,33 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
-/// `y = silu(x[..ff]) * x[ff..]`, `ff = p[0].x`.
+/// `y[r] = silu(x[r][..ff]) * x[r][ff..]` for each of `p[0].y` rows, `ff = p[0].x`.
 const SILU_MUL_SPLIT: &str = r#"
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let i = id.x;
     let ff = p[0].x;
-    if (i < ff) {
-        let g = x[i];
-        y[i] = (g / (1.0 + exp(-g))) * x[ff + i];
+    if (i < ff * p[0].y) {
+        let r = i / ff;
+        let j = i % ff;
+        let g = x[r * 2u * ff + j];
+        y[i] = (g / (1.0 + exp(-g))) * x[r * 2u * ff + ff + j];
     }
 }
 "#;
 
-/// `y = gelu_approx(x[..ff]) * x[ff..]` (the tanh approximation, as the CPU's), `ff = p[0].x`.
+/// `y[r] = gelu_approx(x[r][..ff]) * x[r][ff..]` (the tanh approximation, as the CPU's) for each of `p[0].y` rows.
 const GELU_MUL_SPLIT: &str = r#"
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let i = id.x;
     let ff = p[0].x;
-    if (i < ff) {
-        let g = x[i];
+    if (i < ff * p[0].y) {
+        let r = i / ff;
+        let j = i % ff;
+        let g = x[r * 2u * ff + j];
         let inner = 0.7978845608028654 * (g + 0.044715 * g * g * g);
-        y[i] = 0.5 * g * (1.0 + tanh(inner)) * x[ff + i];
+        y[i] = 0.5 * g * (1.0 + tanh(inner)) * x[r * 2u * ff + ff + j];
     }
 }
 "#;
@@ -122,12 +126,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
-/// `y[p[0].y + i] = x[i]` for `i < p[0].x`.
-const STORE: &str = r#"
+/// `y[p[0].y + i] = x[p[0].z + i]` for `i < p[0].x`.
+const COPY: &str = r#"
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let i = id.x;
-    if (i < p[0].x) { y[p[0].y + i] = x[i]; }
+    if (i < p[0].x) { y[p[0].y + i] = x[p[0].z + i]; }
 }
 "#;
 
@@ -374,15 +378,21 @@ impl Recorder<'_> {
 }
 
 impl ChainRecorder for Recorder<'_> {
-    fn matmul(&mut self, w: &QuantizedTensor, x: &DeviceVec, y: &DeviceVec) {
+    fn matmul_rows(&mut self, w: &QuantizedTensor, x: &DeviceVec, y: &DeviceVec, m: usize) {
         let q = w.device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).expect("a weight this adapter holds");
         let (n, k) = (w.shape()[0], w.shape()[1]);
-        assert!(x.len >= k && y.len >= n, "chain: matmul [{n}, {k}] from {} into {}", x.len, y.len);
-        let pipeline = self.gpu().pipeline(q.dtype, 1).expect("uploaded weights have a pipeline");
+        assert!(m > 0 && x.len >= m * k && y.len >= m * n, "chain: matmul [{n}, {k}] of {m} rows from {} into {}", x.len, y.len);
+        // the kernel for these rows: the decode kernel for one, the one-row kernel for a few, the tiled one for a prompt
+        let pipeline = self.gpu().pipeline(q.dtype, m).expect("uploaded weights have a pipeline");
         for (chunk, row0, rows) in &q.chunks {
-            // Rows beyond 65535 wrap into the second grid axis.
-            let words = [k as u32, n as u32, 1, *row0, *rows, q.row_bytes as u32, 0, 0];
-            self.dispatch_kept(&pipeline, chunk, buffer(x), buffer(y), &words, ((*rows).min(65535), rows.div_ceil(65535), 1));
+            let words = [k as u32, n as u32, m as u32, *row0, *rows, q.row_bytes as u32, 0, 0];
+            let groups = if m >= crate::shaders::MANY_FROM {
+                (rows.div_ceil(crate::shaders::MANY_TILE), (m as u32).div_ceil(crate::shaders::MANY_TILE), 1)
+            } else {
+                // rows beyond 65535 wrap into the second grid axis
+                ((*rows).min(65535), rows.div_ceil(65535), if m == 1 { 1 } else { (m as u32).div_ceil(crate::shaders::M_TILE) })
+            };
+            self.dispatch_kept(&pipeline, chunk, buffer(x), buffer(y), &words, groups);
         }
     }
 
@@ -402,14 +412,18 @@ impl ChainRecorder for Recorder<'_> {
         self.dispatch_kept(&pipeline, buffer(y), buffer(y), buffer(acc), &[acc.len as u32], ((acc.len as u32).div_ceil(256), 1, 1));
     }
 
-    fn silu_mul_split(&mut self, fused: &DeviceVec, out: &DeviceVec) {
+    fn silu_mul_split_rows(&mut self, fused: &DeviceVec, out: &DeviceVec, rows: usize) {
+        let ff = out.len / rows;
+        assert!(rows > 0 && out.len == rows * ff && fused.len >= 2 * out.len, "chain: SwiGLU of {rows} rows");
         let pipeline = self.named("chain-silu-mul-split", SILU_MUL_SPLIT);
-        self.dispatch_kept(&pipeline, buffer(fused), buffer(fused), buffer(out), &[out.len as u32], ((out.len as u32).div_ceil(256), 1, 1));
+        self.dispatch_kept(&pipeline, buffer(fused), buffer(fused), buffer(out), &[ff as u32, rows as u32], ((out.len as u32).div_ceil(256), 1, 1));
     }
 
-    fn gelu_mul_split(&mut self, fused: &DeviceVec, out: &DeviceVec) {
+    fn gelu_mul_split_rows(&mut self, fused: &DeviceVec, out: &DeviceVec, rows: usize) {
+        let ff = out.len / rows;
+        assert!(rows > 0 && out.len == rows * ff && fused.len >= 2 * out.len, "chain: GeGLU of {rows} rows");
         let pipeline = self.named("chain-gelu-mul-split", GELU_MUL_SPLIT);
-        self.dispatch_kept(&pipeline, buffer(fused), buffer(fused), buffer(out), &[out.len as u32], ((out.len as u32).div_ceil(256), 1, 1));
+        self.dispatch_kept(&pipeline, buffer(fused), buffer(fused), buffer(out), &[ff as u32, rows as u32], ((out.len as u32).div_ceil(256), 1, 1));
     }
 
     fn rope(&mut self, x: &DeviceVec, heads: usize, head_dim: usize, table: &DeviceVec, neox: bool) {
@@ -418,11 +432,11 @@ impl ChainRecorder for Recorder<'_> {
         self.dispatch_kept(&pipeline, buffer(table), buffer(table), buffer(x), &[heads as u32, head_dim as u32, neox as u32], (pairs.div_ceil(256), 1, 1));
     }
 
-    fn store(&mut self, src: &DeviceVec, dst: &DeviceVec, offset: usize) {
-        assert!(offset + src.len <= dst.len, "chain: storing {} at {offset} into {}", src.len, dst.len);
-        let pipeline = self.named("chain-store", STORE);
-        let params = self.uniform(&[src.len as u32, offset as u32]);
-        self.dispatch(&pipeline, buffer(src), buffer(src), buffer(dst), &params, ((src.len as u32).div_ceil(256), 1, 1));
+    fn copy(&mut self, src: &DeviceVec, src_at: usize, dst: &DeviceVec, dst_at: usize, len: usize) {
+        assert!(src_at + len <= src.len && dst_at + len <= dst.len, "chain: copying {len} from {src_at} of {} to {dst_at} of {}", src.len, dst.len);
+        let pipeline = self.named("chain-copy", COPY);
+        let params = self.uniform(&[len as u32, dst_at as u32, src_at as u32]);
+        self.dispatch(&pipeline, buffer(src), buffer(src), buffer(dst), &params, ((len as u32).div_ceil(256), 1, 1));
     }
 
     fn attention(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, n_h: usize, n_kv: usize, head_dim: usize, lo: usize, kv_len: usize, cap: usize, scale: f32) {

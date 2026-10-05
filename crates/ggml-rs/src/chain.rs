@@ -48,7 +48,11 @@ pub trait DeviceChain: Send + Sync {
 /// Ops recorded in order, run together by [`ChainRecorder::finish`].
 pub trait ChainRecorder {
     /// `y = W x` for one row `x` (`[k]`, its first `k` elements) of a weight the device holds (`[n, k]`).
-    fn matmul(&mut self, w: &QuantizedTensor, x: &DeviceVec, y: &DeviceVec);
+    fn matmul(&mut self, w: &QuantizedTensor, x: &DeviceVec, y: &DeviceVec) {
+        self.matmul_rows(w, x, y, 1)
+    }
+    /// `y[r] = W x[r]` for `rows` rows of `x` (`[rows, k]`) into `y` (`[rows, n]`): a prompt's.
+    fn matmul_rows(&mut self, w: &QuantizedTensor, x: &DeviceVec, y: &DeviceVec, rows: usize);
     /// `out = x / rms(x) * w`.
     fn rmsnorm(&mut self, x: &DeviceVec, w: &DeviceVec, out: &DeviceVec, eps: f32);
     /// [`Self::rmsnorm`] of each of `rows` rows of `x` (a head's q or k), all with the same `w` (`[x.len / rows]`).
@@ -56,14 +60,26 @@ pub trait ChainRecorder {
     /// `acc += y`.
     fn add(&mut self, acc: &DeviceVec, y: &DeviceVec);
     /// `out = silu(fused[..ff]) * fused[ff..]`, `ff = out.len`.
-    fn silu_mul_split(&mut self, fused: &DeviceVec, out: &DeviceVec);
+    fn silu_mul_split(&mut self, fused: &DeviceVec, out: &DeviceVec) {
+        self.silu_mul_split_rows(fused, out, 1)
+    }
     /// `out = gelu_approx(fused[..ff]) * fused[ff..]` (the tanh approximation), `ff = out.len`.
-    fn gelu_mul_split(&mut self, fused: &DeviceVec, out: &DeviceVec);
+    fn gelu_mul_split(&mut self, fused: &DeviceVec, out: &DeviceVec) {
+        self.gelu_mul_split_rows(fused, out, 1)
+    }
+    /// [`Self::silu_mul_split`] of each of `rows` rows (`fused` `[rows, 2 ff]`, `out` `[rows, ff]`).
+    fn silu_mul_split_rows(&mut self, fused: &DeviceVec, out: &DeviceVec, rows: usize);
+    /// [`Self::gelu_mul_split`] of each of `rows` rows.
+    fn gelu_mul_split_rows(&mut self, fused: &DeviceVec, out: &DeviceVec, rows: usize);
     /// Rotate `x` (`[heads, head_dim]`) in place: pair `k` of each head by `table[2k]` (sine) and `table[2k + 1]`
     /// (cosine), the pairs `(2k, 2k + 1)` or with `neox` `(k, k + head_dim / 2)`.
     fn rope(&mut self, x: &DeviceVec, heads: usize, head_dim: usize, table: &DeviceVec, neox: bool);
     /// `dst[offset..offset + src.len] = src`.
-    fn store(&mut self, src: &DeviceVec, dst: &DeviceVec, offset: usize);
+    fn store(&mut self, src: &DeviceVec, dst: &DeviceVec, offset: usize) {
+        self.copy(src, 0, dst, offset, src.len)
+    }
+    /// `dst[dst_at..dst_at + len] = src[src_at..src_at + len]`.
+    fn copy(&mut self, src: &DeviceVec, src_at: usize, dst: &DeviceVec, dst_at: usize, len: usize);
     /// One query's attention over a layer's cache `kv` (row `t`: its K `[n_kv, head_dim]` then its V), positions
     /// `lo..kv_len`, each query head on its KV head (`h / (n_h / n_kv)`): `out[..n_h * head_dim]` the result, the rest
     /// of `out` scratch ([`DeviceChain::attention_out_len`] long, `cap` the cache's rows).
