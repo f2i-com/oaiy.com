@@ -339,6 +339,9 @@ impl WgpuTransformer {
         self.gpu.upload(&s.table, &rope_table(&image_positions(prefix.position, h, w)));
         self.gpu.upload(&s.t, &timestep(sigma));
         let mut rec = self.gpu.begin();
+        // (bind groups kept would hold each step's own scratch, the tensor cores' f16 copies and partial sums: some
+        // 0.8 GB a step at 1024x1024, never let go)
+        rec.keep_groups(false);
         let r = rec.as_mut();
         self.time(r, &s.t, &s.time, &s.mods, &s.scale);
         Self::mul(r, &self.img, &s.lat, &s.x, ni, false);
