@@ -7,6 +7,10 @@
 //! described voice, then the Base model's speaker encoder and the codec's
 //! encoder turn that clip into a speaker embedding and reference codes. Later
 //! lines prompt the Base talker with them (in-context), so the voice holds.
+//!
+//! `backend` "webgpu" speaks on WebGPU ([`crate::tts_wgpu`]: the talker on any GPU, the codec, F32, on the CPU), as a
+//! worker built with WebGPU and without CUDA does by default (Candle's talker needs CUDA: its weights BF16). Breeze TTS
+//! 2 and voice design are not on WebGPU yet.
 pub mod breeze;
 pub mod clone;
 pub mod codec;
@@ -54,6 +58,8 @@ pub struct Request {
     /// Speak in a saved voice (a file written by `design_voice`); `model_dir`
     /// is then the Base model.
     pub voice: Option<Voice>,
+    /// On WebGPU.
+    pub webgpu: bool,
 }
 
 impl Request {
@@ -98,7 +104,16 @@ impl Request {
                     Some(Voice::from_json(&Json::parse(&bytes).map_err(|e| format!("voice file {p}: {e}"))?)?)
                 }
             },
+            webgpu: match s("backend").as_deref() {
+                Some("webgpu") => true,
+                Some("cuda" | "cpu") => false,
+                Some(other) => return Err(format!("speech: backend must be webgpu, cuda or cpu, not {other}")),
+                None => cfg!(all(feature = "webgpu", not(feature = "cuda"))),
+            },
         };
+        if r.webgpu && !cfg!(feature = "webgpu") {
+            return Err("speech: this build has no WebGPU (the webgpu feature)".into());
+        }
         if r.text.len() > 20_000 || r.instructions.len() > 4_000 {
             return Err("speech: text is limited to 20000 bytes and instructions to 4000".into());
         }
@@ -176,6 +191,7 @@ pub fn design_voice(r: &DesignRequest, mut report: impl FnMut(Json)) -> Result<J
         cfg_scale: None,
         greedy: false,
         voice: None,
+        webgpu: false,
     };
     let tok = tokenizer(&r.design_dir)?;
     let mut tts = Tts::load(&r.design_dir, &dev)?;
@@ -242,6 +258,10 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     }
     let started = Instant::now();
     std::fs::create_dir_all(&r.output)?;
+    #[cfg(feature = "webgpu")]
+    if r.webgpu {
+        return generate_webgpu(r, report);
+    }
     let dev = device(r.device)?;
     report(event("loading_speech_model", 0, 1));
     let tok = tokenizer(&r.model_dir)?;
@@ -300,6 +320,69 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         ("decode_seconds", Json::Num(decode_seconds)),
         ("seconds", Json::Num(started.elapsed().as_secs_f64())),
         ("seed", Json::Int(r.seed as i64)),
+    ]);
+    std::fs::write(path.with_extension("json"), result.to_json())?;
+    Ok(result)
+}
+
+/// [`generate`] on WebGPU: the talker there ([`crate::tts_wgpu::WgpuTalker`]), the codec (F32) on the CPU.
+#[cfg(feature = "webgpu")]
+fn generate_webgpu(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
+    let started = Instant::now();
+    report(event("loading_speech_model", 0, 1));
+    let tok = tokenizer(&r.model_dir)?;
+    let mut tts = crate::tts_wgpu::WgpuTalker::load(&r.model_dir, r.device)?;
+    let language = tts.language_id(&r.language)?;
+    let text_ids = encode(&tok, &r.text)?;
+    let (prefill, trailing) = match &r.voice {
+        Some(voice) => {
+            let ref_ids = encode(&tok, &voice.ref_text)?;
+            let (p, t) = tts.prefill_clone(&text_ids, &ref_ids, voice, language)?;
+            (p, Some(t))
+        }
+        None => {
+            let instruct_ids = if r.instructions.trim().is_empty() { None } else { Some(encode(&tok, &r.instructions)?) };
+            (tts.prefill(&text_ids, instruct_ids.as_deref(), language)?, None)
+        }
+    };
+    let load_seconds = started.elapsed().as_secs_f64();
+    let max_frames = (r.max_seconds * FRAMES_PER_SECOND).ceil() as usize;
+    let speak_started = Instant::now();
+    let frames = tts.frames(&prefill, trailing, r.sampling(), max_frames, |n| report(event("speaking", n, max_frames)))?;
+    let speak_seconds = speak_started.elapsed().as_secs_f64();
+    drop(tts);
+    report(event("decoding_speech", 0, 1));
+    let decode_started = Instant::now();
+    let codec = codec::CodecDecoder::load(&r.model_dir.join("speech_tokenizer").join("model.safetensors"), &Device::Cpu)?;
+    let samples = match (&r.voice, frames.is_empty()) {
+        (_, true) => Vec::new(),
+        (Some(voice), false) => {
+            let mut all = voice.ref_codes.clone();
+            all.extend_from_slice(&frames);
+            let wave = codec.decode(&all)?;
+            wave[(voice.ref_codes.len() * codec::SAMPLES_PER_FRAME).min(wave.len())..].to_vec()
+        }
+        (None, false) => codec.decode(&frames)?,
+    };
+    let samples = trim_leading_silence(samples, codec::SAMPLE_RATE);
+    drop(codec);
+    let decode_seconds = decode_started.elapsed().as_secs_f64();
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_err(candle_core::Error::wrap)?.as_nanos();
+    let path = r.output.join(format!("speech-{stamp}-{}.wav", r.seed));
+    write_wav(&path, &samples, codec::SAMPLE_RATE)?;
+    let audio_seconds = samples.len() as f64 / codec::SAMPLE_RATE as f64;
+    let result = Json::obj([
+        ("path", Json::str(path.to_string_lossy())),
+        ("sample_rate", Json::Int(codec::SAMPLE_RATE as i64)),
+        ("frames", Json::Int(frames.len() as i64)),
+        ("duration", Json::Num(audio_seconds)),
+        ("finish_reason", Json::str(if frames.len() >= max_frames { "length" } else { "stop" })),
+        ("load_seconds", Json::Num(load_seconds)),
+        ("speak_seconds", Json::Num(speak_seconds)),
+        ("decode_seconds", Json::Num(decode_seconds)),
+        ("seconds", Json::Num(started.elapsed().as_secs_f64())),
+        ("seed", Json::Int(r.seed as i64)),
+        ("backend", Json::str("webgpu")),
     ]);
     std::fs::write(path.with_extension("json"), result.to_json())?;
     Ok(result)
@@ -444,6 +527,7 @@ mod tests {
             cfg_scale: None,
             greedy: true,
             voice: None,
+            webgpu: false,
         };
         let frames = tts.frames(&prefill, None, r.sampling(), 4, |_| {})?;
         for (i, f) in frames.iter().enumerate() {

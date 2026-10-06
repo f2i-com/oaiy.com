@@ -2164,9 +2164,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
-/// A 1-D convolution ([`ChainRecorder::conv1d_rows`]): [`CONV_F32_TILED`]'s tiles over steps (64 steps by 64
+/// A 1-D convolution ([`ChainRecorder::conv1d_padded_rows`]): [`CONV_F32_TILED`]'s tiles over steps (64 steps by 64
 /// outputs a workgroup), tap `t` of step `s` from step `s + t dilation - pad`. `p[0]`: `cout`, `cin`, the steps, the
-/// taps; `p[1]`: the dilation, the dispatch's first tile of steps.
+/// taps; `p[1]`: the dilation, the dispatch's first tile of steps, `pad`.
 const CONV1D_F32_TILED: &str = r#"
 @group(0) @binding(0) var<storage, read> w: array<u32>;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
@@ -2186,7 +2186,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     let dil = i32(p[1].x);
     let cp = (cin + 31u) / 32u * 32u;
     let kt = taps * cp;
-    let pad = i32(taps / 2u) * dil;
+    let pad = i32(p[1].z);
     let o0 = wg.x * 64u;
     let r0 = (p[1].y + wg.y) * 64u;
     let tr = t / 16u;
@@ -2292,6 +2292,63 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let v = x[i];
     let s = sin(a * v);
     x[i] = v + s * s / (a + 1e-9);
+}
+"#;
+
+/// A depthwise causal 1-D convolution ([`ChainRecorder::depthwise_causal_conv1d_rows`]): a thread an output value.
+/// `p[0]`: `c`, `k`, the steps.
+const DEPTHWISE_CAUSAL_CONV1D_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> w: array<f32>;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read> bias: array<f32>;
+@group(0) @binding(6) var<storage, read_write> y: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    let c = p[0].x;
+    let k = p[0].y;
+    if (i >= p[0].z * c) { return; }
+    let ch = i % c;
+    let s = i32(i / c);
+    var acc = bias[ch];
+    for (var j = 0u; j < k; j++) {
+        let src = s + i32(j) - i32(k) + 1;
+        if (src >= 0) { acc += w[ch * k + j] * x[u32(src) * c + ch]; }
+    }
+    y[i] = acc;
+}
+"#;
+
+/// SnakeBeta in place ([`ChainRecorder::snake_beta_rows`]): a thread a value. `p[0]`: the rows, `c`.
+const SNAKE_BETA_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> freq: array<f32>;
+@group(0) @binding(1) var<storage, read> scale: array<f32>;
+@group(0) @binding(6) var<storage, read_write> x: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    if (i >= p[0].x * p[0].y) { return; }
+    let ch = i % p[0].y;
+    let v = x[i];
+    let s = sin(freq[ch] * v);
+    x[i] = v + scale[ch] * s * s;
+}
+"#;
+
+/// A clamp in place ([`ChainRecorder::clamp_in_place`]): a thread a value. `p[0]`: the values, the bounds' bits.
+const CLAMP_IN_PLACE: &str = r#"
+@group(0) @binding(6) var<storage, read_write> x: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    if (i >= p[0].x) { return; }
+    x[i] = clamp(x[i], bitcast<f32>(p[0].y), bitcast<f32>(p[0].z));
 }
 "#;
 
@@ -4799,9 +4856,9 @@ impl ChainRecorder for Recorder<'_> {
         self.dispatch_wide("chain-deform-im2col-rows", DEFORM_IM2COL_ROWS, [buffer(x), buffer(offsets), buffer(modulators), &d, &d, &d, buffer(out), &drw], &[h as u32, w as u32, c as u32, k as u32, first as u32, pixels as u32], grid(n.div_ceil(256)));
     }
 
-    fn conv1d_rows(&mut self, w: &DeviceVec, b: &DeviceVec, cout: usize, cin: usize, k: usize, dilation: usize, x: &DeviceVec, len: usize, y: &DeviceVec) {
+    fn conv1d_padded_rows(&mut self, w: &DeviceVec, b: &DeviceVec, cout: usize, cin: usize, k: usize, dilation: usize, pad: usize, x: &DeviceVec, len: usize, y: &DeviceVec) {
         let cp = cin.div_ceil(32) * 32;
-        assert!(k % 2 == 1 && dilation > 0 && len > 0 && w.len * 2 >= cout * k * cp && b.len >= cout && x.len >= len * cin && y.len >= len * cout, "chain: a 1-D convolution of {len} steps, {cin} channels to {cout}");
+        assert!(dilation > 0 && len > 0 && pad <= (k - 1) * dilation && w.len * 2 >= cout * k * cp && b.len >= cout && x.len >= len * cin && y.len >= len * cout, "chain: a 1-D convolution of {len} steps, {cin} channels to {cout}");
         let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
         let tiles = len.div_ceil(64);
         let per_tile = 2.0 * 64.0 * (cout * cin * k) as f64;
@@ -4809,20 +4866,40 @@ impl ChainRecorder for Recorder<'_> {
         let mut first = 0;
         while first < tiles {
             let n = chunk.min(tiles - first);
-            let words = [cout as u32, cin as u32, len as u32, k as u32, dilation as u32, first as u32];
+            let words = [cout as u32, cin as u32, len as u32, k as u32, dilation as u32, first as u32, pad as u32];
             self.dispatch_wide("chain-conv1d-f32-tiled", CONV1D_F32_TILED, [buffer(w), buffer(x), buffer(b), &d, &d, &d, buffer(y), &drw], &words, ((cout as u32).div_ceil(64), n as u32, 1));
             self.weigh(per_tile * n as f64);
             first += n;
         }
     }
 
-    fn conv_transpose1d_rows(&mut self, w: &DeviceVec, b: &DeviceVec, cout: usize, cin: usize, k: usize, stride: usize, pad: usize, out_pad: usize, x: &DeviceVec, len: usize, y: &DeviceVec) {
-        let out = ((len - 1) * stride + k + out_pad).checked_sub(2 * pad).expect("chain: a transposed convolution's padding past its length");
-        assert!(cin % 4 == 0 && stride > 0 && w.len >= cout * k * cin && b.len >= cout && x.len >= len * cin && y.len >= out * cout, "chain: a transposed 1-D convolution of {len} steps, {cin} channels to {cout}");
+    fn conv_transpose1d_rows(&mut self, w: &DeviceVec, b: &DeviceVec, cout: usize, cin: usize, k: usize, stride: usize, pad: usize, x: &DeviceVec, len: usize, out: usize, y: &DeviceVec) {
+        assert!(out + pad <= (len - 1) * stride + k + stride && cin % 4 == 0 && stride > 0 && w.len >= cout * k * cin && b.len >= cout && x.len >= len * cin && y.len >= out * cout, "chain: a transposed 1-D convolution of {len} steps, {cin} channels to {cout}");
         let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
         let n = (out * cout) as u32;
         self.dispatch_wide("chain-conv-transpose1d-rows", CONV_TRANSPOSE1D_ROWS, [buffer(w), buffer(x), buffer(b), &d, &d, &d, buffer(y), &drw], &[cout as u32, cin as u32, len as u32, k as u32, stride as u32, pad as u32, out as u32], grid(n.div_ceil(256)));
         self.weigh(2.0 * (out * cout) as f64 * (cin * k.div_ceil(stride)) as f64);
+    }
+
+    fn depthwise_causal_conv1d_rows(&mut self, w: &DeviceVec, b: &DeviceVec, c: usize, k: usize, x: &DeviceVec, len: usize, y: &DeviceVec) {
+        assert!(w.len >= c * k && b.len >= c && x.len >= len * c && y.len >= len * c, "chain: a depthwise convolution of {len} steps of {c}");
+        let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
+        let n = (len * c) as u32;
+        self.dispatch_wide("chain-depthwise-causal-conv1d-rows", DEPTHWISE_CAUSAL_CONV1D_ROWS, [buffer(w), buffer(x), buffer(b), &d, &d, &d, buffer(y), &drw], &[c as u32, k as u32, len as u32], grid(n.div_ceil(256)));
+    }
+
+    fn snake_beta_rows(&mut self, x: &DeviceVec, freq: &DeviceVec, scale: &DeviceVec, rows: usize, c: usize) {
+        assert!(x.len >= rows * c && freq.len >= c && scale.len >= c, "chain: SnakeBeta of {rows} rows of {c}");
+        let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
+        let n = (rows * c) as u32;
+        self.dispatch_wide("chain-snake-beta-rows", SNAKE_BETA_ROWS, [buffer(freq), buffer(scale), &d, &d, &d, &d, buffer(x), &drw], &[rows as u32, c as u32], grid(n.div_ceil(256)));
+    }
+
+    fn clamp_in_place(&mut self, x: &DeviceVec, len: usize, lo: f32, hi: f32) {
+        assert!(x.len >= len, "chain: a clamp of {len}");
+        let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
+        let n = len as u32;
+        self.dispatch_wide("chain-clamp-in-place", CLAMP_IN_PLACE, [&d, &d, &d, &d, &d, &d, buffer(x), &drw], &[n, lo.to_bits(), hi.to_bits()], grid(n.div_ceil(256)));
     }
 
     fn snake_rows(&mut self, x: &DeviceVec, alpha: &DeviceVec, rows: usize, c: usize) {
@@ -6224,6 +6301,80 @@ mod tests {
         }
     }
 
+    /// The speech codec's ops as the host computes them: a causal 1-D convolution (its padding all before: 7 taps 3
+    /// apart), a depthwise causal one, SnakeBeta, and a clamp.
+    #[test]
+    fn a_speech_codecs_ops_are_the_hosts() {
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        let mut r = rng(137);
+        let (cin, cout, k, dil, len) = (24usize, 20usize, 7usize, 3usize, 40usize);
+        let wt: Vec<f32> = (0..cout * cin * k).map(|_| half::f16::from_f32(r() * 0.2).to_f32()).collect();
+        let x: Vec<f32> = (0..len * cin).map(|_| r()).collect();
+        let bias: Vec<f32> = (0..cout).map(|_| r()).collect();
+        let wd = b.conv1d_weights(&wt, cout, cin, k).expect("the weights");
+        let (xd, yd, bd) = (b.vec(x.len()), b.vec(len * cout), b.vec(cout));
+        DeviceChain::upload(&b, &xd, &x);
+        DeviceChain::upload(&b, &bd, &bias);
+        let mut rec = b.begin();
+        rec.conv1d_padded_rows(&wd, &bd, cout, cin, k, dil, (k - 1) * dil, &xd, len, &yd);
+        rec.read(&yd);
+        let got = rec.finish().pop().unwrap();
+        for t in 0..len {
+            for co in 0..cout {
+                let mut want = bias[co] as f64;
+                for c in 0..cin {
+                    for j in 0..k {
+                        let s = t as isize + (j * dil) as isize - ((k - 1) * dil) as isize;
+                        if s >= 0 {
+                            want += wt[(co * cin + c) * k + j] as f64 * x[s as usize * cin + c] as f64;
+                        }
+                    }
+                }
+                let g = got[t * cout + co] as f64;
+                assert!((g - want).abs() <= 1e-3 * (1.0 + want.abs()), "causal conv at {t}, {co}: {g} against {want}");
+            }
+        }
+        let (c, k, len) = (12usize, 7usize, 30usize);
+        let w: Vec<f32> = (0..c * k).map(|_| r()).collect();
+        let bias: Vec<f32> = (0..c).map(|_| r()).collect();
+        let x: Vec<f32> = (0..len * c).map(|_| r()).collect();
+        let (wd, bd, xd, yd) = (b.vec(w.len()), b.vec(c), b.vec(x.len()), b.vec(x.len()));
+        DeviceChain::upload(&b, &wd, &w);
+        DeviceChain::upload(&b, &bd, &bias);
+        DeviceChain::upload(&b, &xd, &x);
+        let freq: Vec<f32> = (0..c).map(|_| (r() * 0.5).exp()).collect();
+        let scale: Vec<f32> = (0..c).map(|_| 1.0 / ((r() * 0.5).exp() + 1e-9)).collect();
+        let (fd, sd, td) = (b.vec(c), b.vec(c), b.vec(x.len()));
+        DeviceChain::upload(&b, &fd, &freq);
+        DeviceChain::upload(&b, &sd, &scale);
+        DeviceChain::upload(&b, &td, &x.iter().map(|v| v * 3.0).collect::<Vec<_>>());
+        let mut rec = b.begin();
+        rec.depthwise_causal_conv1d_rows(&wd, &bd, c, k, &xd, len, &yd);
+        rec.read(&yd);
+        rec.snake_beta_rows(&xd, &fd, &sd, len, c);
+        rec.read(&xd);
+        rec.clamp_in_place(&td, len * c, -1.0, 1.0);
+        rec.read(&td);
+        let got = rec.finish();
+        for t in 0..len {
+            for ch in 0..c {
+                let mut want = bias[ch];
+                for j in 0..k {
+                    let s = t as isize + j as isize - k as isize + 1;
+                    if s >= 0 {
+                        want += w[ch * k + j] * x[s as usize * c + ch];
+                    }
+                }
+                let i = t * c + ch;
+                assert!((got[0][i] - want).abs() <= 1e-5 * (1.0 + want.abs()), "depthwise conv at {t}, {ch}: {} against {want}", got[0][i]);
+                let v = x[i];
+                let snake = v + scale[ch] * (freq[ch] * v).sin().powi(2);
+                assert!((got[1][i] - snake).abs() <= 1e-5 * (1.0 + snake.abs()), "SnakeBeta at {t}, {ch}: {} against {snake}", got[1][i]);
+                assert_eq!(got[2][i], (v * 3.0).clamp(-1.0, 1.0), "a clamp at {t}, {ch}");
+            }
+        }
+    }
+
     /// A DAC decoder's ops as the host computes them: 1-D convolutions (7 taps 3 apart, 1 tap; channels not of 32),
     /// transposed ones (stride 4, and an odd stride with output padding: DAC's `ceil(s / 2)` padding, `s % 2` extra),
     /// Snake, and tanh.
@@ -6288,7 +6439,7 @@ mod tests {
             DeviceChain::upload(&b, &xd, &x);
             DeviceChain::upload(&b, &bd, &bias);
             let mut rec = b.begin();
-            rec.conv_transpose1d_rows(&wd, &bd, cout, cin, k, stride, pad, out_pad, &xd, len, &yd);
+            rec.conv_transpose1d_rows(&wd, &bd, cout, cin, k, stride, pad, &xd, len, out, &yd);
             rec.read(&yd);
             let got = rec.finish().pop().unwrap();
             for (i, (g, w)) in got.iter().zip(&want).enumerate() {

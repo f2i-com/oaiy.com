@@ -478,6 +478,7 @@ pub fn design(dir: &Path, name: &str, description: &str, sample_text: &str, lang
         cfg_scale: Some(4.0),
         greedy: false,
         voice: None,
+        webgpu: false,
     };
     let (clip, frames, _, _) = speak(&r, &mut |_| {})?;
     if frames < 12 {

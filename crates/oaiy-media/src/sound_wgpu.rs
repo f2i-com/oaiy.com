@@ -362,7 +362,8 @@ impl Dac {
             let s = u.stride;
             let out = len * s;
             let y = gpu.vec(out * u.cout);
-            r.conv_transpose1d_rows(&u.w, &u.b, u.cout, u.cin, u.k, s, s.div_ceil(2), s % 2, &x, len, &y);
+            // (PyTorch's padding ceil(s / 2) and output padding s % 2: `len s` steps)
+            r.conv_transpose1d_rows(&u.w, &u.b, u.cout, u.cin, u.k, s, s.div_ceil(2), &x, len, out, &y);
             x = y;
             len = out;
             for res in &u.residuals {

@@ -98,13 +98,28 @@ impl WgpuQwen3 {
         self.hidden
     }
 
+    /// A key-value cache for `capacity` positions (each layer's keys then values a row), from position 0.
+    pub fn cache(&self, gpu: &WgpuBackend, capacity: usize) -> Cache {
+        let row = 2 * self.kv_heads * self.head_dim;
+        Cache { kv: (0..self.layers.len()).map(|_| gpu.vec(capacity * row)).collect(), len: 0, capacity }
+    }
+
     /// The final, normed hidden states (`[t, hidden]`) of a prompt's embeddings `x` (`[t, hidden]`, from position 0),
     /// recorded on `r` into `out` (exactly `[t, hidden]`: its rows' norms take their width from its length).
     pub fn prompt(&self, gpu: &WgpuBackend, r: &mut dyn ChainRecorder, x: &DeviceVec, t: usize, out: &DeviceVec) {
+        let mut cache = self.cache(gpu, t);
+        self.step(gpu, r, x, t, &mut cache, out);
+    }
+
+    /// `t` rows of embeddings `x` (`[t, hidden]`) at the cache's next positions: their final, normed states into `out`
+    /// (exactly `[t, hidden]`), their keys and values into `cache` (its length grown by `t`).
+    pub fn step(&self, gpu: &WgpuBackend, r: &mut dyn ChainRecorder, x: &DeviceVec, t: usize, cache: &mut Cache, out: &DeviceVec) {
         let (h, hd, nq, nkv) = (self.hidden, self.head_dim, self.heads, self.kv_heads);
-        assert_eq!(out.len, t * h, "Qwen3 on WebGPU: a prompt's states exactly its rows");
-        // rotate-half RoPE's table: each position's (sin, cos) a pair
-        let table: Vec<f32> = (0..t)
+        assert_eq!(out.len, t * h, "Qwen3 on WebGPU: a step's states exactly its rows");
+        let past = cache.len;
+        assert!(past + t <= cache.capacity, "Qwen3 on WebGPU: {} positions past its cache's {}", past + t, cache.capacity);
+        // rotate-half RoPE's table for the rows' positions: each position's (sin, cos) a pair
+        let table: Vec<f32> = (past..past + t)
             .flat_map(|p| (0..hd / 2).flat_map(move |i| {
                 let a = p as f64 / self.theta.powf(2. * i as f64 / hd as f64);
                 [a.sin() as f32, a.cos() as f32]
@@ -113,12 +128,12 @@ impl WgpuQwen3 {
         let td = gpu.vec(table.len());
         gpu.upload(&td, &table);
         let v = |n: usize| gpu.vec(n);
-        let (n, q, k, vv, qn, kn, kv, att, o) = (v(t * h), v(t * nq * hd), v(t * nkv * hd), v(t * nkv * hd), v(t * nq * hd), v(t * nkv * hd), v(t * 2 * nkv * hd), v(gpu.attention_rows_out_len(t, nq, hd, t)), v(t * h));
+        let (n, q, k, vv, qn, kn, att, o) = (v(t * h), v(t * nq * hd), v(t * nkv * hd), v(t * nkv * hd), v(t * nq * hd), v(t * nkv * hd), v(gpu.attention_rows_out_len(t, nq, hd, past + t)), v(t * h));
         let (g, u, act) = (v(t * self.ff), v(t * self.ff), v(t * self.ff));
         let one = gpu.vec(1);
         gpu.upload(&one, &[1.0]);
         r.copy(x, 0, out, 0, t * h);
-        for l in &self.layers {
+        for (l, kv) in self.layers.iter().zip(&cache.kv) {
             r.rmsnorm_rows(out, &l.input_norm, &n, t, self.eps);
             r.matmul_f16_rows(&l.q.w, l.q.n, l.q.k, &n, &q, t);
             r.matmul_f16_rows(&l.k.w, l.k.n, l.k.k, &n, &k, t);
@@ -127,9 +142,9 @@ impl WgpuQwen3 {
             r.rmsnorm_rows(&k, &l.k_norm, &kn, t * nkv, self.eps);
             r.rope_rows(&qn, t, nq, hd, &td, true);
             r.rope_rows(&kn, t, nkv, hd, &td, true);
-            r.store_rows(&kn, &kv, t, nkv * hd, 0, 2 * nkv * hd, 0);
-            r.store_rows(&vv, &kv, t, nkv * hd, 0, 2 * nkv * hd, nkv * hd);
-            r.attention_rows(&qn, &kv, &att, t, nq, nkv, hd, 0, None, 1.0 / (hd as f32).sqrt());
+            r.store_rows(&kn, kv, t, nkv * hd, past, 2 * nkv * hd, 0);
+            r.store_rows(&vv, kv, t, nkv * hd, past, 2 * nkv * hd, nkv * hd);
+            r.attention_rows(&qn, kv, &att, t, nq, nkv, hd, past, None, 1.0 / (hd as f32).sqrt());
             r.matmul_f16_rows(&l.o.w, l.o.n, l.o.k, &att, &o, t);
             r.axpy_at(out, &o, &one, 0, t * h);
             r.rmsnorm_rows(out, &l.post_norm, &n, t, self.eps);
@@ -141,5 +156,13 @@ impl WgpuQwen3 {
         }
         r.rmsnorm_rows(out, &self.norm, &n, t, self.eps);
         r.copy(&n, 0, out, 0, t * h);
+        cache.len += t;
     }
+}
+
+/// A [`WgpuQwen3`]'s keys and values so far: a layer's rows (keys, then values) for `capacity` positions.
+pub struct Cache {
+    kv: Vec<DeviceVec>,
+    pub len: usize,
+    capacity: usize,
 }

@@ -559,15 +559,40 @@ pub trait ChainRecorder {
     /// to keep the length (zeros past the ends), the weights as [`DeviceChain::conv1d_weights`] packs them, plus `b`.
     #[allow(clippy::too_many_arguments)]
     fn conv1d_rows(&mut self, w: &DeviceVec, b: &DeviceVec, cout: usize, cin: usize, k: usize, dilation: usize, x: &DeviceVec, len: usize, y: &DeviceVec) {
-        let _ = (w, b, cout, cin, k, dilation, x, len, y);
+        self.conv1d_padded_rows(w, b, cout, cin, k, dilation, k / 2 * dilation, x, len, y);
+    }
+    /// [`Self::conv1d_rows`] with `pad` zeros before the first step (a causal convolution's `(k - 1) dilation`; tap `t`
+    /// of step `s` from step `s + t dilation - pad`), the length kept.
+    #[allow(clippy::too_many_arguments)]
+    fn conv1d_padded_rows(&mut self, w: &DeviceVec, b: &DeviceVec, cout: usize, cin: usize, k: usize, dilation: usize, pad: usize, x: &DeviceVec, len: usize, y: &DeviceVec) {
+        let _ = (w, b, cout, cin, k, dilation, pad, x, len, y);
         unimplemented!("a 1-D convolution on this device")
     }
-    /// A transposed 1-D convolution (PyTorch's `ConvTranspose1d`) of `x`'s `len` steps (`[len, cin]`) into `y`
-    /// (`[(len - 1) stride - 2 pad + k + out_pad, cout]`): `w` its weight `[cout, k, cin]` (f32, PyTorch's `[cin, cout,
-    /// k]` rearranged), plus `b`.
+    /// A depthwise causal 1-D convolution (each channel its own `k` taps, `w` `[c, k]`, plus `b`) of `x`'s `len` steps
+    /// (`[len, c]`) into `y`: step `s` from steps `s - k + 1 ..= s` (zeros before the first).
     #[allow(clippy::too_many_arguments)]
-    fn conv_transpose1d_rows(&mut self, w: &DeviceVec, b: &DeviceVec, cout: usize, cin: usize, k: usize, stride: usize, pad: usize, out_pad: usize, x: &DeviceVec, len: usize, y: &DeviceVec) {
-        let _ = (w, b, cout, cin, k, stride, pad, out_pad, x, len, y);
+    fn depthwise_causal_conv1d_rows(&mut self, w: &DeviceVec, b: &DeviceVec, c: usize, k: usize, x: &DeviceVec, len: usize, y: &DeviceVec) {
+        let _ = (w, b, c, k, x, len, y);
+        unimplemented!("a depthwise convolution on this device")
+    }
+    /// `x + scale sin²(freq x)` of `rows` of `c`, `freq` and `scale` a channel's, in place (SnakeBeta: `freq` its
+    /// `e^alpha`, `scale` `1 / (e^beta + 1e-9)`).
+    fn snake_beta_rows(&mut self, x: &DeviceVec, freq: &DeviceVec, scale: &DeviceVec, rows: usize, c: usize) {
+        let _ = (x, freq, scale, rows, c);
+        unimplemented!("SnakeBeta on this device")
+    }
+    /// `len` values clamped to `lo..=hi`, in place.
+    fn clamp_in_place(&mut self, x: &DeviceVec, len: usize, lo: f32, hi: f32) {
+        let _ = (x, len, lo, hi);
+        unimplemented!("a clamp on this device")
+    }
+    /// A transposed 1-D convolution (PyTorch's `ConvTranspose1d`, `pad` dropped from the start) of `x`'s `len` steps
+    /// (`[len, cin]`): its first `out` steps into `y` (`[out, cout]`; PyTorch's whole output `(len - 1) stride - 2 pad +
+    /// k + out_pad`, a causal one's `len stride`, its tail trimmed); `w` its weight `[cout, k, cin]` (f32, PyTorch's
+    /// `[cin, cout, k]` rearranged), plus `b`.
+    #[allow(clippy::too_many_arguments)]
+    fn conv_transpose1d_rows(&mut self, w: &DeviceVec, b: &DeviceVec, cout: usize, cin: usize, k: usize, stride: usize, pad: usize, x: &DeviceVec, len: usize, out: usize, y: &DeviceVec) {
+        let _ = (w, b, cout, cin, k, stride, pad, x, len, out, y);
         unimplemented!("a transposed 1-D convolution on this device")
     }
     /// The Snake activation of `rows` of `c` (`x + sin(alpha x)² / (alpha + 1e-9)`, `alpha` a channel's), in place.

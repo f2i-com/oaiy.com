@@ -38,6 +38,8 @@ pub mod sound;
 #[cfg(feature = "webgpu")]
 pub mod sound_wgpu;
 #[cfg(feature = "webgpu")]
+pub mod tts_wgpu;
+#[cfg(feature = "webgpu")]
 pub mod qwen3_wgpu;
 pub mod model3d;
 pub mod birefnet;
