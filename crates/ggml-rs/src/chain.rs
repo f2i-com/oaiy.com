@@ -83,6 +83,13 @@ pub trait DeviceChain: Send + Sync {
         let _ = values;
         None
     }
+    /// A 1-D convolution's weights (`[cout, cin, k]` as PyTorch keeps them) for [`ChainRecorder::conv1d_rows`]: f16,
+    /// each output's `k` taps in turn, a tap's channels padded with zeros to a multiple of 32. None where a value is past
+    /// f16's range, or the device has no such kernel.
+    fn conv1d_weights(&self, w: &[f32], cout: usize, cin: usize, k: usize) -> Option<DeviceVec> {
+        let _ = (w, cout, cin, k);
+        None
+    }
     /// A convolution's weights (`[cout, cin, k, k]` as PyTorch keeps them, `k` 1, 3 or 7) for
     /// [`ChainRecorder::conv_rows`]: f16 (each rounded to the nearest), each output's `k * k` taps in turn, a tap's
     /// channels padded with zeros to a multiple of 32. None where a value is past f16's range, or the device has no such
@@ -547,6 +554,31 @@ pub trait ChainRecorder {
     fn broadcast_rows(&mut self, src: &DeviceVec, dst: &DeviceVec, rows: usize, c: usize, stride: usize, at: usize) {
         let _ = (src, dst, rows, c, stride, at);
         unimplemented!("a broadcast on this device")
+    }
+    /// A 1-D convolution of `x`'s `len` steps (`[len, cin]`) into `y` (`[len, cout]`): `k` taps `dilation` apart, padded
+    /// to keep the length (zeros past the ends), the weights as [`DeviceChain::conv1d_weights`] packs them, plus `b`.
+    #[allow(clippy::too_many_arguments)]
+    fn conv1d_rows(&mut self, w: &DeviceVec, b: &DeviceVec, cout: usize, cin: usize, k: usize, dilation: usize, x: &DeviceVec, len: usize, y: &DeviceVec) {
+        let _ = (w, b, cout, cin, k, dilation, x, len, y);
+        unimplemented!("a 1-D convolution on this device")
+    }
+    /// A transposed 1-D convolution (PyTorch's `ConvTranspose1d`) of `x`'s `len` steps (`[len, cin]`) into `y`
+    /// (`[(len - 1) stride - 2 pad + k + out_pad, cout]`): `w` its weight `[cout, k, cin]` (f32, PyTorch's `[cin, cout,
+    /// k]` rearranged), plus `b`.
+    #[allow(clippy::too_many_arguments)]
+    fn conv_transpose1d_rows(&mut self, w: &DeviceVec, b: &DeviceVec, cout: usize, cin: usize, k: usize, stride: usize, pad: usize, out_pad: usize, x: &DeviceVec, len: usize, y: &DeviceVec) {
+        let _ = (w, b, cout, cin, k, stride, pad, out_pad, x, len, y);
+        unimplemented!("a transposed 1-D convolution on this device")
+    }
+    /// The Snake activation of `rows` of `c` (`x + sin(alpha x)² / (alpha + 1e-9)`, `alpha` a channel's), in place.
+    fn snake_rows(&mut self, x: &DeviceVec, alpha: &DeviceVec, rows: usize, c: usize) {
+        let _ = (x, alpha, rows, c);
+        unimplemented!("Snake on this device")
+    }
+    /// `tanh` of `len` values, in place.
+    fn tanh_in_place(&mut self, x: &DeviceVec, len: usize) {
+        let _ = (x, len);
+        unimplemented!("tanh on this device")
     }
     /// `out = x` where `x` is positive, else `slope x`, for `len` values (a leaky ReLU; `out` may be `x`).
     fn leaky_relu(&mut self, x: &DeviceVec, out: &DeviceVec, len: usize, slope: f32) {

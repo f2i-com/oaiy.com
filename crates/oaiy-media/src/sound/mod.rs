@@ -4,6 +4,9 @@
 //! latents by flow matching with classifier-free guidance, and the DAC decoder
 //! makes the audio. As the reference does, it always denoises the full 30 s and
 //! keeps the length asked for.
+//!
+//! `backend` "webgpu" runs it on WebGPU ([`crate::sound_wgpu`]: any GPU), as a worker built with WebGPU and without CUDA
+//! does by default (Candle's needs CUDA: its models BF16).
 pub mod dac;
 pub mod dit;
 pub mod pth;
@@ -16,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// The text encoder's input is padded to this many tokens (and cut there).
-const TEXT_LEN: usize = 512;
+pub(crate) const TEXT_LEN: usize = 512;
 
 #[derive(Clone, Debug)]
 pub struct Request {
@@ -34,6 +37,8 @@ pub struct Request {
     pub output: PathBuf,
     /// Testing: start from this noise (F32 little-endian, (128, frames)) instead of the seed's.
     pub noise_file: Option<PathBuf>,
+    /// On WebGPU.
+    pub webgpu: bool,
 }
 
 impl Request {
@@ -52,7 +57,16 @@ impl Request {
             device: j.get("device").and_then(Json::as_i64).unwrap_or(0).max(0) as usize,
             output: s("output_dir").ok_or("sound: missing output_dir")?.into(),
             noise_file: s("noise_file").map(PathBuf::from),
+            webgpu: match s("backend").as_deref() {
+                Some("webgpu") => true,
+                Some("cuda" | "cpu") => false,
+                Some(other) => return Err(format!("sound: backend must be webgpu, cuda or cpu, not {other}")),
+                None => cfg!(all(feature = "webgpu", not(feature = "cuda"))),
+            },
         };
+        if r.webgpu && !cfg!(feature = "webgpu") {
+            return Err("sound: this build has no WebGPU (the webgpu feature)".into());
+        }
         if r.prompt.len() > 4000 || r.negative_prompt.len() > 4000 {
             return Err("sound: the prompt is limited to 4000 bytes".into());
         }
@@ -66,7 +80,7 @@ impl Request {
     }
 }
 
-fn event(stage: &str, current: usize, total: usize) -> Json {
+pub(crate) fn event(stage: &str, current: usize, total: usize) -> Json {
     Json::obj([("stage", Json::str(stage)), ("current", Json::Int(current as i64)), ("total", Json::Int(total as i64))])
 }
 
@@ -85,7 +99,7 @@ fn device(index: usize) -> Result<Device> {
 
 /// Seeded standard normal noise (splitmix64, Box-Muller), rounded to BF16 as the
 /// reference's noise is.
-fn noise(seed: u64, n: usize) -> Vec<f32> {
+pub(crate) fn noise(seed: u64, n: usize) -> Vec<f32> {
     let mut state = seed ^ 0x9e37_79b9_7f4a_7c15;
     let mut uniform = || {
         state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -107,13 +121,13 @@ fn noise(seed: u64, n: usize) -> Vec<f32> {
 }
 
 /// The prompter's whitespace clean: runs of whitespace to one space, trimmed.
-fn clean(text: &str) -> String {
+pub(crate) fn clean(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Qwen3-1.7B's final (normed) hidden states for each prompt, zero-padded to
 /// `TEXT_LEN` rows: (1, TEXT_LEN, hidden) BF16. An empty prompt is all zeros.
-fn encode_texts(dir: &Path, prompts: &[&str], dev: &Device) -> Result<Vec<Tensor>> {
+pub(crate) fn encode_texts(dir: &Path, prompts: &[&str], dev: &Device) -> Result<Vec<Tensor>> {
     let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer").join("tokenizer.json")).map_err(|e| candle_core::Error::Msg(format!("tokenizer: {e}")))?;
     let te = dir.join("text_encoder");
     let cfg = Json::parse(&std::fs::read(te.join("config.json"))?).map_err(candle_core::Error::wrap)?;
@@ -151,13 +165,17 @@ fn encode_texts(dir: &Path, prompts: &[&str], dev: &Device) -> Result<Vec<Tensor
 
 /// The flow-matching noise levels: `steps` from 1 toward 0 (the last one short of
 /// it), shifted toward noise, then 0.
-fn sigmas(steps: usize, shift: f64) -> Vec<f64> {
+pub(crate) fn sigmas(steps: usize, shift: f64) -> Vec<f64> {
     let mut s: Vec<f64> = (0..steps).map(|i| 1. - i as f64 / steps as f64).map(|x| shift * x / (1. + (shift - 1.) * x)).collect();
     s.push(0.);
     s
 }
 
 pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
+    #[cfg(feature = "webgpu")]
+    if r.webgpu {
+        return crate::sound_wgpu::generate(r, report);
+    }
     let started = Instant::now();
     std::fs::create_dir_all(&r.output)?;
     let dev = device(r.device)?;

@@ -2164,6 +2164,150 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+/// A 1-D convolution ([`ChainRecorder::conv1d_rows`]): [`CONV_F32_TILED`]'s tiles over steps (64 steps by 64
+/// outputs a workgroup), tap `t` of step `s` from step `s + t dilation - pad`. `p[0]`: `cout`, `cin`, the steps, the
+/// taps; `p[1]`: the dilation, the dispatch's first tile of steps.
+const CONV1D_F32_TILED: &str = r#"
+@group(0) @binding(0) var<storage, read> w: array<u32>;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read> bias: array<f32>;
+@group(0) @binding(6) var<storage, read_write> y: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> xs: array<vec4<f32>, 272>;
+var<workgroup> ws: array<vec4<f32>, 272>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    let n = p[0].x;
+    let cin = p[0].y;
+    let m = p[0].z;
+    let taps = p[0].w;
+    let dil = i32(p[1].x);
+    let cp = (cin + 31u) / 32u * 32u;
+    let kt = taps * cp;
+    let pad = i32(taps / 2u) * dil;
+    let o0 = wg.x * 64u;
+    let r0 = (p[1].y + wg.y) * 64u;
+    let tr = t / 16u;
+    let to = t % 16u;
+    let kk = t % 16u;
+    var a0 = vec4<f32>(0.0);
+    var a1 = vec4<f32>(0.0);
+    var a2 = vec4<f32>(0.0);
+    var a3 = vec4<f32>(0.0);
+    for (var kb = 0u; kb < kt; kb += 16u) {
+        let gk = kb + kk;
+        let tap = i32(gk / cp);
+        let c = gk % cp;
+        let live = gk < kt && c < cin;
+        for (var q = 0u; q < 4u; q++) {
+            let rr = tr + 16u * q;
+            let s = i32(r0 + rr) + tap * dil - pad;
+            var v = 0.0;
+            if (live && r0 + rr < m && s >= 0 && s < i32(m)) { v = x[u32(s) * cin + c]; }
+            xs[kk * 17u + rr / 4u][rr % 4u] = v;
+            var u = 0.0;
+            if (o0 + rr < n && gk < kt) {
+                let e = (o0 + rr) * kt + gk;
+                u = unpack2x16float(w[e / 2u])[e % 2u];
+            }
+            ws[kk * 17u + rr / 4u][rr % 4u] = u;
+        }
+        workgroupBarrier();
+        for (var j = 0u; j < 16u; j++) {
+            let xv = xs[j * 17u + tr];
+            let wv = ws[j * 17u + to];
+            a0 += xv.x * wv;
+            a1 += xv.y * wv;
+            a2 += xv.z * wv;
+            a3 += xv.w * wv;
+        }
+        workgroupBarrier();
+    }
+    let o = o0 + to * 4u;
+    let r = r0 + tr * 4u;
+    let acc = array<vec4<f32>, 4>(a0, a1, a2, a3);
+    for (var i = 0u; i < 4u; i++) {
+        if (r + i < m) {
+            for (var j = 0u; j < 4u; j++) {
+                if (o + j < n) {
+                    y[(r + i) * n + o + j] = acc[i][j] + bias[o + j];
+                }
+            }
+        }
+    }
+}
+"#;
+
+/// A transposed 1-D convolution ([`ChainRecorder::conv_transpose1d_rows`]): a thread an output value, over the taps
+/// that reach it (`(o + pad - j)` a multiple of the stride: `k / stride` of them) and every input channel (vec4s).
+/// `p[0]`: `cout`, `cin`, the input's steps, `k`; `p[1]`: the stride, `pad`, the output's steps.
+const CONV_TRANSPOSE1D_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> w4: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> x4: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> bias: array<f32>;
+@group(0) @binding(6) var<storage, read_write> y: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    let cout = p[0].x;
+    let cin4 = p[0].y / 4u;
+    let len = p[0].z;
+    let k = p[0].w;
+    let stride = p[1].x;
+    let pad = p[1].y;
+    if (i >= p[1].z * cout) { return; }
+    let co = i % cout;
+    let o = i / cout;
+    var acc = 0.0;
+    // the first tap that reaches `o`: `j = (o + pad) mod stride`, then every stride
+    for (var j = (o + pad) % stride; j < k; j += stride) {
+        if (o + pad < j) { break; }
+        let src = (o + pad - j) / stride;
+        if (src >= len) { continue; }
+        let wb = (co * k + j) * cin4;
+        let xb = src * cin4;
+        var s = vec4<f32>(0.0);
+        for (var c = 0u; c < cin4; c++) { s += w4[wb + c] * x4[xb + c]; }
+        acc += s.x + s.y + s.z + s.w;
+    }
+    y[i] = acc + bias[co];
+}
+"#;
+
+/// Snake in place ([`ChainRecorder::snake_rows`]): a thread a value. `p[0]`: the rows, `c`.
+const SNAKE_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> alpha: array<f32>;
+@group(0) @binding(6) var<storage, read_write> x: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    if (i >= p[0].x * p[0].y) { return; }
+    let a = alpha[i % p[0].y];
+    let v = x[i];
+    let s = sin(a * v);
+    x[i] = v + s * s / (a + 1e-9);
+}
+"#;
+
+/// `tanh` in place ([`ChainRecorder::tanh_in_place`]): a thread a value. `p[0]`: the values.
+const TANH_IN_PLACE: &str = r#"
+@group(0) @binding(6) var<storage, read_write> x: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    if (i >= p[0].x) { return; }
+    x[i] = tanh(x[i]);
+}
+"#;
+
 /// Rows times their gates' sigmoids ([`ChainRecorder::mul_sigmoid_rows`]), in place: a thread a value. `p[0]`: the
 /// rows, `c`.
 const MUL_SIGMOID_ROWS: &str = r#"
@@ -3182,6 +3326,22 @@ impl DeviceChain for WgpuBackend {
         self.vec_f16_rounded(&packed)
     }
 
+    fn conv1d_weights(&self, w: &[f32], cout: usize, cin: usize, k: usize) -> Option<DeviceVec> {
+        if w.len() != cout * cin * k {
+            return None;
+        }
+        let cp = cin.div_ceil(32) * 32;
+        let mut packed = vec![0f32; cout * k * cp];
+        for co in 0..cout {
+            for c in 0..cin {
+                for tap in 0..k {
+                    packed[(co * k + tap) * cp + c] = w[(co * cin + c) * k + tap];
+                }
+            }
+        }
+        self.vec_f16_rounded(&packed)
+    }
+
     fn conv_weights(&self, w: &[f32], cout: usize, cin: usize, k: usize) -> Option<DeviceVec> {
         let taps = k * k;
         if !matches!(k, 1 | 3 | 7) || w.len() != cout * cin * taps {
@@ -4144,6 +4304,9 @@ impl Recorder<'_> {
             self.dispatch_wide("chain-matmul-f16-tiled", &tiled, [buffer(w), buffer(x), &d, &d, &d, &d, buffer(&part), &drw], &words, grid);
             let len = (rows * n) as u32;
             self.dispatch_wide("chain-sum-splits", SUM_SPLITS, [buffer(&part), &d, &d, &d, &d, &d, buffer(y), &drw], &[len, splits as u32], (len.div_ceil(256).min(65535), len.div_ceil(256 * 65535), 1));
+            // (its parts read: spare for the next split's, where each had its own to the recording's end, a sound
+            // step's 360 of 18 MB without tensor cores)
+            self.spare.push((buffer(&part).size(), buffer(&part).clone()));
         }
     }
 
@@ -4636,6 +4799,46 @@ impl ChainRecorder for Recorder<'_> {
         self.dispatch_wide("chain-deform-im2col-rows", DEFORM_IM2COL_ROWS, [buffer(x), buffer(offsets), buffer(modulators), &d, &d, &d, buffer(out), &drw], &[h as u32, w as u32, c as u32, k as u32, first as u32, pixels as u32], grid(n.div_ceil(256)));
     }
 
+    fn conv1d_rows(&mut self, w: &DeviceVec, b: &DeviceVec, cout: usize, cin: usize, k: usize, dilation: usize, x: &DeviceVec, len: usize, y: &DeviceVec) {
+        let cp = cin.div_ceil(32) * 32;
+        assert!(k % 2 == 1 && dilation > 0 && len > 0 && w.len * 2 >= cout * k * cp && b.len >= cout && x.len >= len * cin && y.len >= len * cout, "chain: a 1-D convolution of {len} steps, {cin} channels to {cout}");
+        let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
+        let tiles = len.div_ceil(64);
+        let per_tile = 2.0 * 64.0 * (cout * cin * k) as f64;
+        let chunk = ((CONV_DISPATCH_FLOPS / per_tile) as usize).clamp(1, 65535);
+        let mut first = 0;
+        while first < tiles {
+            let n = chunk.min(tiles - first);
+            let words = [cout as u32, cin as u32, len as u32, k as u32, dilation as u32, first as u32];
+            self.dispatch_wide("chain-conv1d-f32-tiled", CONV1D_F32_TILED, [buffer(w), buffer(x), buffer(b), &d, &d, &d, buffer(y), &drw], &words, ((cout as u32).div_ceil(64), n as u32, 1));
+            self.weigh(per_tile * n as f64);
+            first += n;
+        }
+    }
+
+    fn conv_transpose1d_rows(&mut self, w: &DeviceVec, b: &DeviceVec, cout: usize, cin: usize, k: usize, stride: usize, pad: usize, out_pad: usize, x: &DeviceVec, len: usize, y: &DeviceVec) {
+        let out = ((len - 1) * stride + k + out_pad).checked_sub(2 * pad).expect("chain: a transposed convolution's padding past its length");
+        assert!(cin % 4 == 0 && stride > 0 && w.len >= cout * k * cin && b.len >= cout && x.len >= len * cin && y.len >= out * cout, "chain: a transposed 1-D convolution of {len} steps, {cin} channels to {cout}");
+        let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
+        let n = (out * cout) as u32;
+        self.dispatch_wide("chain-conv-transpose1d-rows", CONV_TRANSPOSE1D_ROWS, [buffer(w), buffer(x), buffer(b), &d, &d, &d, buffer(y), &drw], &[cout as u32, cin as u32, len as u32, k as u32, stride as u32, pad as u32, out as u32], grid(n.div_ceil(256)));
+        self.weigh(2.0 * (out * cout) as f64 * (cin * k.div_ceil(stride)) as f64);
+    }
+
+    fn snake_rows(&mut self, x: &DeviceVec, alpha: &DeviceVec, rows: usize, c: usize) {
+        assert!(x.len >= rows * c && alpha.len >= c, "chain: Snake of {rows} rows of {c}");
+        let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
+        let n = (rows * c) as u32;
+        self.dispatch_wide("chain-snake-rows", SNAKE_ROWS, [buffer(alpha), &d, &d, &d, &d, &d, buffer(x), &drw], &[rows as u32, c as u32], grid(n.div_ceil(256)));
+    }
+
+    fn tanh_in_place(&mut self, x: &DeviceVec, len: usize) {
+        assert!(x.len >= len, "chain: tanh of {len}");
+        let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
+        let n = len as u32;
+        self.dispatch_wide("chain-tanh-in-place", TANH_IN_PLACE, [&d, &d, &d, &d, &d, &d, buffer(x), &drw], &[n], grid(n.div_ceil(256)));
+    }
+
     fn mul_sigmoid_rows(&mut self, x: &DeviceVec, gate: &DeviceVec, rows: usize, c: usize) {
         assert!(x.len >= rows * c && gate.len >= rows, "chain: a gate of {rows} rows of {c}");
         let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
@@ -4837,6 +5040,9 @@ impl ChainRecorder for Recorder<'_> {
             self.dispatch_wide("chain-matmul-f32-tiled", MATMUL_F32_TILED, [buffer(w), buffer(x), &d, &d, &d, &d, buffer(&part), &drw], &words, grid);
             let len = (rows * n) as u32;
             self.dispatch_wide("chain-sum-splits", SUM_SPLITS, [buffer(&part), &d, &d, &d, &d, &d, buffer(y), &drw], &[len, splits as u32], (len.div_ceil(256).min(65535), len.div_ceil(256 * 65535), 1));
+            // (its parts read: spare for the next split's, where each had its own to the recording's end, a sound
+            // step's 360 of 18 MB without tensor cores)
+            self.spare.push((buffer(&part).size(), buffer(&part).clone()));
         }
         self.weigh(2.0 * (rows * n) as f64 * k as f64);
     }
@@ -6015,6 +6221,98 @@ mod tests {
             for (i, (g, w)) in got.iter().zip(&want).enumerate() {
                 assert!((g - w).abs() <= 1e-3 * w.abs() + 1e-6, "{rows}x{cols} rotated {rotation}: [{i}] {g} against {w}");
             }
+        }
+    }
+
+    /// A DAC decoder's ops as the host computes them: 1-D convolutions (7 taps 3 apart, 1 tap; channels not of 32),
+    /// transposed ones (stride 4, and an odd stride with output padding: DAC's `ceil(s / 2)` padding, `s % 2` extra),
+    /// Snake, and tanh.
+    #[test]
+    fn a_dacs_ops_are_the_hosts() {
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        let mut r = rng(131);
+        for (cin, cout, k, dil, len) in [(20usize, 36usize, 7usize, 3usize, 50usize), (64, 40, 7, 1, 70), (48, 8, 1, 1, 33)] {
+            let wt: Vec<f32> = (0..cout * cin * k).map(|_| half::f16::from_f32(r() * 0.2).to_f32()).collect();
+            let x: Vec<f32> = (0..len * cin).map(|_| r()).collect();
+            let bias: Vec<f32> = (0..cout).map(|_| r()).collect();
+            let wd = b.conv1d_weights(&wt, cout, cin, k).expect("the weights");
+            let (xd, yd, bd) = (b.vec(x.len()), b.vec(len * cout), b.vec(cout));
+            DeviceChain::upload(&b, &xd, &x);
+            DeviceChain::upload(&b, &bd, &bias);
+            let mut rec = b.begin();
+            rec.conv1d_rows(&wd, &bd, cout, cin, k, dil, &xd, len, &yd);
+            rec.read(&yd);
+            let got = rec.finish().pop().unwrap();
+            let pad = (k / 2 * dil) as isize;
+            for t in 0..len {
+                for co in 0..cout {
+                    let mut want = bias[co] as f64;
+                    for c in 0..cin {
+                        for j in 0..k {
+                            let s = t as isize + (j * dil) as isize - pad;
+                            if s >= 0 && (s as usize) < len {
+                                want += wt[(co * cin + c) * k + j] as f64 * x[s as usize * cin + c] as f64;
+                            }
+                        }
+                    }
+                    let g = got[t * cout + co] as f64;
+                    assert!((g - want).abs() <= 1e-3 * (1.0 + want.abs()), "1-D conv of {k} taps {dil} apart at {t}, {co}: {g} against {want}");
+                }
+            }
+        }
+        for (cin, cout, stride, len) in [(16usize, 12usize, 4usize, 9usize), (8, 4, 3, 7)] {
+            let (k, pad, out_pad) = (2 * stride, stride.div_ceil(2), stride % 2);
+            // PyTorch's [cin, cout, k], and the kernel's [cout, k, cin]
+            let wt: Vec<f32> = (0..cin * cout * k).map(|_| r() * 0.3).collect();
+            let packed: Vec<f32> = (0..cout * k * cin).map(|i| { let (co, j, c) = (i / (k * cin), (i / cin) % k, i % cin); wt[(c * cout + co) * k + j] }).collect();
+            let x: Vec<f32> = (0..len * cin).map(|_| r()).collect();
+            let bias: Vec<f32> = (0..cout).map(|_| r()).collect();
+            let out = (len - 1) * stride - 2 * pad + k + out_pad;
+            let mut want = vec![0f64; out * cout];
+            for (o, row) in want.chunks_mut(cout).enumerate() {
+                for (co, v) in row.iter_mut().enumerate() {
+                    *v = bias[co] as f64;
+                    for i in 0..len {
+                        for j in 0..k {
+                            if i * stride + j == o + pad {
+                                for c in 0..cin {
+                                    *v += wt[(c * cout + co) * k + j] as f64 * x[i * cin + c] as f64;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let (wd, xd, bd, yd) = (b.vec(packed.len()), b.vec(x.len()), b.vec(cout), b.vec(out * cout));
+            DeviceChain::upload(&b, &wd, &packed);
+            DeviceChain::upload(&b, &xd, &x);
+            DeviceChain::upload(&b, &bd, &bias);
+            let mut rec = b.begin();
+            rec.conv_transpose1d_rows(&wd, &bd, cout, cin, k, stride, pad, out_pad, &xd, len, &yd);
+            rec.read(&yd);
+            let got = rec.finish().pop().unwrap();
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!((*g as f64 - w).abs() <= 1e-4 * (1.0 + w.abs()), "transposed 1-D conv, stride {stride}, [{i}]: {g} against {w}");
+            }
+        }
+        let (rows, c) = (11usize, 6usize);
+        let x: Vec<f32> = (0..rows * c).map(|_| r() * 3.0).collect();
+        let alpha: Vec<f32> = (0..c).map(|_| r() + 1.5).collect();
+        let (xd, ad, td) = (b.vec(x.len()), b.vec(c), b.vec(x.len()));
+        DeviceChain::upload(&b, &xd, &x);
+        DeviceChain::upload(&b, &ad, &alpha);
+        DeviceChain::upload(&b, &td, &x);
+        let mut rec = b.begin();
+        rec.snake_rows(&xd, &ad, rows, c);
+        rec.tanh_in_place(&td, rows * c);
+        rec.read(&xd);
+        rec.read(&td);
+        let got = rec.finish();
+        for (i, &v) in x.iter().enumerate() {
+            let a = alpha[i % c];
+            let snake = v + (a * v).sin().powi(2) / (a + 1e-9);
+            assert!((got[0][i] - snake).abs() <= 1e-5 * (1.0 + snake.abs()), "Snake [{i}]: {} against {snake}", got[0][i]);
+            assert!((got[1][i] - v.tanh()).abs() <= 1e-6, "tanh [{i}]: {} against {}", got[1][i], v.tanh());
         }
     }
 

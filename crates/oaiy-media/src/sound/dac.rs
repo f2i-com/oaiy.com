@@ -23,33 +23,33 @@ pub struct DacConfig {
 }
 
 /// A conv's folded weight and bias.
-struct Conv {
-    w: Tensor,
-    b: Option<Tensor>,
+pub(crate) struct Conv {
+    pub(crate) w: Tensor,
+    pub(crate) b: Option<Tensor>,
 }
 
-struct Residual {
-    snake1: Tensor,
-    conv1: Conv,
-    dilation: usize,
-    snake2: Tensor,
-    conv2: Conv,
+pub(crate) struct Residual {
+    pub(crate) snake1: Tensor,
+    pub(crate) conv1: Conv,
+    pub(crate) dilation: usize,
+    pub(crate) snake2: Tensor,
+    pub(crate) conv2: Conv,
 }
 
-struct Up {
-    snake: Tensor,
-    conv: Conv,
-    stride: usize,
-    residuals: Vec<Residual>,
+pub(crate) struct Up {
+    pub(crate) snake: Tensor,
+    pub(crate) conv: Conv,
+    pub(crate) stride: usize,
+    pub(crate) residuals: Vec<Residual>,
 }
 
 pub struct Dac {
     pub cfg: DacConfig,
-    post_quant: Option<Conv>,
-    first: Conv,
-    ups: Vec<Up>,
-    last_snake: Tensor,
-    last: Conv,
+    pub(crate) post_quant: Option<Conv>,
+    pub(crate) first: Conv,
+    pub(crate) ups: Vec<Up>,
+    pub(crate) last_snake: Tensor,
+    pub(crate) last: Conv,
 }
 
 /// `g * v / |v|`, the norm over every axis but the first.
