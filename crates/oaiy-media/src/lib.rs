@@ -10,6 +10,8 @@ pub mod schedule;
 pub mod text;
 pub mod transformer;
 #[cfg(feature = "webgpu")]
+pub mod wgpu_weights;
+#[cfg(feature = "webgpu")]
 pub mod qwen_wgpu;
 #[cfg(feature = "webgpu")]
 pub mod vae_wgpu;

@@ -62,10 +62,9 @@ impl WgpuTextEncoder {
         let mut w = Weights::open(checkpoint.unwrap_or(&root.join("text_encoder")))?;
         let prefix = if w.has("model.language_model.embed_tokens.weight") { "model.language_model" } else { "model" };
         let embedding = w.tensor(&format!("{prefix}.embed_tokens.weight"), &Device::Cpu, DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-        let mat = |w: &mut Weights, name: &str| -> Result<Mat> {
-            let t = w.tensor(&format!("{name}.weight"), &Device::Cpu, DType::F32)?;
-            let (n, k) = t.dims2()?;
-            let v = gpu.vec_f16_rounded(&t.flatten_all()?.to_vec1::<f32>()?).ok_or_else(|| err(format!("{name}: a weight past f16's range")))?;
+        let mut none = crate::lora::Loras::open(&[])?;
+        let mut mat = |w: &mut Weights, name: &str| -> Result<Mat> {
+            let (v, n, k) = crate::wgpu_weights::f16_matrix(w, &gpu, name, &mut none)?;
             Ok(Mat { v, n, k })
         };
         let vector = |w: &mut Weights, name: &str| -> Result<DeviceVec> {

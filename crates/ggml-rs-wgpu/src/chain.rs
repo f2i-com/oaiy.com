@@ -741,6 +741,20 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
 /// `x[i] += y[i] * g` for `i < p[0].x * p[0].y` (rows of `p[0].x`), `g` `mods[p[0].z + i % p[0].x]`, its tanh where
 /// `p[0].w` is 1.
+/// `w` (f16 pairs, `p[0].x` words) plus `d` (two f32 a word), rounded to f16.
+const ADD_F16: &str = r#"
+@group(0) @binding(0) var<storage, read> d: array<f32>;
+@group(0) @binding(6) var<storage, read_write> w: array<u32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    if (i >= p[0].x) { return; }
+    w[i] = pack2x16float(unpack2x16float(w[i]) + vec2<f32>(d[2u * i], d[2u * i + 1u]));
+}
+"#;
+
 const ADD_GATED_ROWS: &str = r#"
 @group(0) @binding(0) var<storage, read> yv: array<f32>;
 @group(0) @binding(1) var<storage, read> mods: array<f32>;
@@ -3523,6 +3537,14 @@ impl ChainRecorder for Recorder<'_> {
         self.dispatch_wide("chain-add-gated-rows", ADD_GATED_ROWS, [buffer(y), buffer(mods), &d, &d, &d, &d, buffer(x), &drw], &words, grid(((rows * n) as u32).div_ceil(256)));
     }
 
+    fn add_f16(&mut self, w: &DeviceVec, d: &DeviceVec, len: usize) {
+        assert!(len % 2 == 0 && w.len * 2 >= len && d.len >= len, "chain: {len} f16 values plus f32");
+        let dm = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        let words = (len / 2) as u32;
+        self.dispatch_wide("chain-add-f16", ADD_F16, [buffer(d), &dm, &dm, &dm, &dm, &dm, buffer(w), &drw], &[words], grid(words.div_ceil(256)));
+    }
+
     fn conv3d_rows(&mut self, w: &DeviceVec, b: &DeviceVec, cout: usize, cin: usize, x: &DeviceVec, frames: usize, h: usize, wd: usize, y: &DeviceVec) {
         self.conv_taps(w, b, cout, cin, 27, x, frames, h, wd, y);
     }
@@ -4846,6 +4868,36 @@ mod tests {
                     let g = got[r * n + o] as f64;
                     assert!((g - want).abs() <= 1e-5 * mag + 1e-5, "[{n}, {k}] of {rows} rows, row {r} output {o}: {g} against {want}");
                 }
+            }
+        }
+    }
+
+    /// A LoRA's merge on the device: `B A` by the f16 matmul (`A` transposed its weight, `B`'s rows its tokens) added
+    /// into an f16 matrix, each sum rounded to f16, as the host's merge rounds it.
+    #[test]
+    fn a_lora_merges_into_an_f16_matrix_as_the_hosts() {
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        let mut r = rng(71);
+        let (n, k, rank) = (40usize, 96usize, 32usize);
+        let w: Vec<f32> = (0..n * k).map(|_| half::f16::from_f32(r() * 0.1).to_f32()).collect();
+        let a: Vec<f32> = (0..rank * k).map(|_| half::f16::from_f32(r() * 0.05).to_f32()).collect();
+        let bm: Vec<f32> = (0..n * rank).map(|_| half::f16::from_f32(r() * 0.05).to_f32()).collect();
+        let at: Vec<f32> = (0..k * rank).map(|i| a[(i % rank) * k + i / rank]).collect();
+        let (Some(wd), Some(ad)) = (b.vec_f16(&w), b.vec_f16(&at)) else { return };
+        let (bd, dd) = (b.vec(bm.len()), b.vec(n * k));
+        DeviceChain::upload(&b, &bd, &bm);
+        let mut rec = b.begin();
+        rec.matmul_f16_rows(&ad, k, rank, &bd, &dd, n);
+        rec.add_f16(&wd, &dd, n * k);
+        rec.read(&wd);
+        let words = rec.finish().pop().unwrap();
+        for i in 0..n {
+            for j in 0..k {
+                let delta: f64 = (0..rank).map(|q| bm[i * rank + q] as f64 * a[q * k + j] as f64).sum();
+                let want = half::f16::from_f64(w[i * k + j] as f64 + delta).to_f64();
+                let word = words[(i * k + j) / 2].to_bits();
+                let got = half::f16::from_bits(if (i * k + j) % 2 == 0 { word as u16 } else { (word >> 16) as u16 }).to_f64();
+                assert!((got - want).abs() <= 2e-3 * want.abs() + 1e-4, "({i}, {j}): {got} against {want}");
             }
         }
     }

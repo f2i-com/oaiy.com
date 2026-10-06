@@ -404,6 +404,12 @@ pub trait ChainRecorder {
         let _ = (x, y, rows, n, mods, gate_at, tanh, clean);
         unimplemented!("a gated residual on this device")
     }
+    /// `w` (an f16 matrix's `len` values, two to a word) plus `d`'s (f32), each sum rounded to f16: a LoRA's `B A`
+    /// merged into its weight on the device.
+    fn add_f16(&mut self, w: &DeviceVec, d: &DeviceVec, len: usize) {
+        let _ = (w, d, len);
+        unimplemented!("an f16 matrix's sum on this device")
+    }
     /// `out[i] = gelu(x[i])` (the tanh approximation) for `i < len`.
     fn gelu(&mut self, x: &DeviceVec, out: &DeviceVec, len: usize) {
         let _ = (x, out, len);

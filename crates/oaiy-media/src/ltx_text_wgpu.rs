@@ -45,8 +45,8 @@ fn mat(store: &mut Store, gpu: &ggml_rs_wgpu::WgpuBackend, names: &[String]) -> 
         k = cols;
         n += rows;
         let part = match store.bf16_bytes(name)? {
-            Some(bytes) => crate::ltx_wgpu::f16_words(&bytes),
-            None => crate::ltx_wgpu::f16_words_f32(&store.tensor_f32(name, &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?),
+            Some(bytes) => crate::wgpu_weights::f16_words(&bytes),
+            None => crate::wgpu_weights::f16_words_f32(&store.tensor_f32(name, &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?),
         }
         .ok_or_else(|| err(format!("{name}: a weight past f16's range")))?;
         if words.is_empty() {
@@ -372,7 +372,7 @@ mod tests {
                 read += t.elapsed().as_secs_f64();
                 bytes += b.len();
                 let t = std::time::Instant::now();
-                let words = crate::ltx_wgpu::f16_words(&b).expect("in f16's range");
+                let words = crate::wgpu_weights::f16_words(&b).expect("in f16's range");
                 convert += t.elapsed().as_secs_f64();
                 let t = std::time::Instant::now();
                 let v = gpu.vec(words.len());

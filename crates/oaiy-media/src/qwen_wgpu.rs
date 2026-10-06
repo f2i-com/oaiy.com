@@ -98,15 +98,7 @@ pub struct WgpuTransformer {
 
 /// `name`'s weight `[n, k]` (each adapter's factors merged in: `W + B A`) as f16 on `gpu`.
 fn matrix(w: &mut Weights, lora: &mut Loras, gpu: &ggml_rs_wgpu::WgpuBackend, name: &str) -> Result<Mat> {
-    let mut t = w.tensor(&format!("{name}.weight"), &Device::Cpu, DType::F32)?;
-    let (n, k) = t.dims2()?;
-    if !lora.is_empty() {
-        for (a, b) in lora.factors(name, n, k, &Device::Cpu, DType::F32)? {
-            t = (t + b.matmul(&a)?)?;
-        }
-    }
-    let values = t.flatten_all()?.to_vec1::<f32>()?;
-    let v = gpu.vec_f16_rounded(&values).ok_or_else(|| err(format!("{name}: a weight past f16's range")))?;
+    let (v, n, k) = crate::wgpu_weights::f16_matrix(w, gpu, name, lora)?;
     Ok(Mat { v, n, k })
 }
 
@@ -385,6 +377,27 @@ impl WgpuTransformer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// How long a block's load takes (`--ignored --nocapture`): its seven matrices from `OAIY_QWEN_IMAGE_TRANSFORMER`,
+    /// with and without the turbo adapter `OAIY_QWEN_IMAGE_ADAPTER` merged (on the GPU; its kernels' first build in the
+    /// second's).
+    #[test]
+    #[ignore = "a timing; needs Qwen Image 2.1's transformer and its turbo adapter, and a WebGPU adapter"]
+    fn measure_a_blocks_load() -> Result<()> {
+        let (Some(path), Some(adapter)) = (std::env::var_os("OAIY_QWEN_IMAGE_TRANSFORMER"), std::env::var_os("OAIY_QWEN_IMAGE_ADAPTER")) else { return Ok(()) };
+        let gpu = ggml_rs_wgpu::WgpuBackend::nth(0, None).map_err(err)?;
+        let mut w = Weights::open(std::path::Path::new(&path))?;
+        for list in [vec![], vec![(PathBuf::from(&adapter), 1.)]] {
+            let mut lora = Loras::open(&list)?;
+            let t = std::time::Instant::now();
+            for name in ["attn.to_q", "attn.to_k", "attn.to_v", "attn.to_out.0", "img_mlp.gate_layer", "img_mlp.proj", "img_mlp.out"] {
+                matrix(&mut w, &mut lora, &gpu, &format!("transformer_blocks.10.{name}"))?;
+            }
+            gpu.settle();
+            eprintln!("block 10 with {} adapters: {:.3} s", list.len(), t.elapsed().as_secs_f64());
+        }
+        Ok(())
+    }
 
     /// The WebGPU transformer gives the Candle one's velocity (CPU, f32) on the published weights
     /// (`OAIY_QWEN_IMAGE_TRANSFORMER`, e.g. `D:\Qwen-Image-2.1\transformer`): 16 text tokens' states (random, as an

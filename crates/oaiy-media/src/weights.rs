@@ -5,6 +5,12 @@ use candle_core::{
 use dsv41::safetensors::{Dtype, StIndex};
 use std::{fs::File, path::Path};
 
+/// A tensor's bytes as stored, where a device converts them itself: BF16 safetensors, or GGUF's blocks (of their type).
+pub enum Raw {
+    Bf16(Vec<u8>),
+    Ggml(GgmlDType, Vec<u8>),
+}
+
 pub enum Weights {
     Safe(StIndex),
     Gguf {
@@ -58,6 +64,32 @@ impl Weights {
 
     pub fn has(&self, name: &str) -> bool {
         self.resolve(name).is_ok()
+    }
+
+    /// `name`'s bytes as stored where [`Raw`] holds them; None where only [`Self::tensor`] reads it (ComfyUI's
+    /// quantized weights, F16, F32, a fused gate and up it splits).
+    pub fn raw(&mut self, name: &str) -> Result<Option<Raw>> {
+        let Ok(key) = self.resolve(name) else { return Ok(None) };
+        match self {
+            Self::Safe(s) => {
+                let info = s.info(&key).map_err(candle_core::Error::wrap)?;
+                let quantized = key.strip_suffix(".weight").is_some_and(|p| s.get(&format!("{p}.comfy_quant")).is_some());
+                if info.dtype != Dtype::BF16 || quantized {
+                    return Ok(None);
+                }
+                Ok(Some(Raw::Bf16(s.read_par(&key).map_err(candle_core::Error::wrap)?)))
+            }
+            Self::Gguf { content, file } => {
+                use std::io::{Read, Seek, SeekFrom};
+                let info = content.tensor_infos.get(&key).ok_or_else(|| candle_core::Error::Msg(format!("missing tensor {key}")))?;
+                let t = info.ggml_dtype;
+                let size = info.shape.elem_count() / t.block_size() * t.type_size();
+                let mut bytes = vec![0u8; size];
+                file.seek(SeekFrom::Start(content.tensor_data_offset + info.offset))?;
+                file.read_exact(&mut bytes)?;
+                Ok(Some(Raw::Ggml(t, bytes)))
+            }
+        }
     }
 
     /// Inspect dimensions without materializing tensor payloads.
