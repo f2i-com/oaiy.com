@@ -4854,6 +4854,41 @@ mod tests {
         }
     }
 
+    /// A prompt chunk's causal attention without tensor cores (`--ignored --nocapture`): the tiled kernel's against the
+    /// runs' for Qwen3.8 27B's chunk of 512 (24 heads of 256, 4 kv) and a 128-wide model's, the cache before it short
+    /// and long.
+    #[test]
+    #[ignore = "a measurement"]
+    fn measure_chunk_attention_f32() {
+        let Ok(b) = WgpuBackend::new(Some(4 << 30)) else { return };
+        for (n_h, n_kv, hd, rows) in [(24usize, 4usize, 256usize, 512usize), (32, 8, 128, 512), (24, 4, 256, 128), (24, 4, 256, 64)] {
+            for past in [0usize, 2048, 8192, 30000] {
+                let (qd, row, kv_len) = (n_h * hd, 2 * n_kv * hd, past + rows);
+                let mut next = rng((past + rows) as u32);
+                let (qv, kv) = (b.vec(rows * qd), b.vec(kv_len * row));
+                DeviceChain::upload(&b, &qv, &(0..rows * qd).map(|_| next()).collect::<Vec<_>>());
+                DeviceChain::upload(&b, &kv, &(0..kv_len * row).map(|_| next()).collect::<Vec<_>>());
+                let scale = 1.0 / (hd as f32).sqrt();
+                let time = |f: &dyn Fn(&mut Recorder)| {
+                    let mut rec = Recorder::new(&b);
+                    f(&mut rec);
+                    Box::new(rec).finish();
+                    let start = std::time::Instant::now();
+                    let mut rec = Recorder::new(&b);
+                    for _ in 0..4 {
+                        f(&mut rec);
+                    }
+                    Box::new(rec).finish();
+                    start.elapsed().as_secs_f64() / 4.0
+                };
+                let out = b.vec(attention_runs_out_len(rows, n_h, hd, kv_len));
+                let tiled = time(&|rec| rec.attention_rows_tiled(&qv, &kv, &out, rows, n_h, n_kv, hd, past, None, scale, false, 1 << 20));
+                let runs = time(&|rec| rec.attention_rows_runs(&qv, &kv, &out, rows, n_h, n_kv, hd, past, None, scale, false));
+                eprintln!("{n_h} heads ({n_kv} kv) {hd} wide, {rows} rows after {past}: tiled {:.2} ms, runs {:.2} ms", tiled * 1e3, runs * 1e3);
+            }
+        }
+    }
+
     /// A prompt's attention without tensor cores (`--ignored --nocapture`): the tiled kernel's against the runs' at Qwen
     /// Image's 1024x1024 (32 heads of 128, 4,096 queries over 4,200 positions), the tiled alone at LTX's 17,408.
     #[test]

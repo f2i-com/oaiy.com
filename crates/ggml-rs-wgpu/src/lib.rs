@@ -523,7 +523,7 @@ impl Gpu {
     }
 
     /// A kernel's module, its workgroup memory checked first where the device has less than 48 KB of it (Apple's 32,
-    /// OAIY_PORTABLE_LIMITS's 16): wgpu does not check it, and a kernel past the limit fails where it runs, if its
+    /// OAIY_PORTABLE_LIMITS's): wgpu 30 does not check it, and a kernel past the limit fails where it runs, if its
     /// driver says at all.
     fn shader(&self, name: &str, source: String) -> wgpu::ShaderModule {
         if self.limits.max_compute_workgroup_storage_size < 48 << 10 {
@@ -906,11 +906,11 @@ impl WgpuBackend {
         };
         let mut limits = adapter.limits();
         if let Some(v) = std::env::var_os("OAIY_PORTABLE_LIMITS") {
-            // a workgroup's memory as given (bytes: Apple's GPUs have 32,768), else WebGPU's default (16 KB), and its
-            // invocations as WebGPU's defaults (256): other GPUs' limits (a kernel past them refused, Gpu::shader), the
-            // rest the adapter's
+            // a workgroup's memory as given (bytes; else Apple's GPUs' 32,768, the least a native adapter has: WebGPU's
+            // default, a browser's, is 16,384), and its invocations as WebGPU's defaults (256): other GPUs' limits (a
+            // kernel past them refused, Gpu::shader), the rest the adapter's
             let d = wgpu::Limits::default();
-            let bytes = v.to_str().and_then(|s| s.parse::<u32>().ok()).filter(|&b| b >= 1024).unwrap_or(d.max_compute_workgroup_storage_size);
+            let bytes = v.to_str().and_then(|s| s.parse::<u32>().ok()).filter(|&b| b >= 1024).unwrap_or(32 << 10);
             limits.max_compute_workgroup_storage_size = limits.max_compute_workgroup_storage_size.min(bytes);
             limits.max_compute_invocations_per_workgroup = limits.max_compute_invocations_per_workgroup.min(d.max_compute_invocations_per_workgroup);
             limits.max_compute_workgroup_size_x = limits.max_compute_workgroup_size_x.min(d.max_compute_workgroup_size_x);
