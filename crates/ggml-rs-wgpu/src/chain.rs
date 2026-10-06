@@ -1700,6 +1700,124 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 }
 "#;
 
+/// A convolution without tensor cores ([`ChainRecorder::conv_rows`], [`ChainRecorder::conv3d_rows`]): the f32 tiled
+/// matmul's 64 voxels by 64 outputs a workgroup ([`MATMUL_F32_TILED`]), its tokens' tile gathered through the taps
+/// as the tensor cores' kernel takes them (a 3x3's pixel `(y + dy - 1, x + dx - 1)`, zeros past the frame's edge; a
+/// 3x3x3's from frame `t + dt - 1` clamped to the clip), the weights the same packed f16 (`[cout][taps][cin padded
+/// to 32]`, two to a word), the bias added. `p[0]`: `cout`, `cin`, the voxels, the padded `cin`; `p[1]`: the taps, a
+/// row's pixels, a frame's rows, the dispatch's first tile of voxels (a grid of tiles past 65,535 its third dimension).
+const CONV_F32_TILED: &str = r#"
+@group(0) @binding(0) var<storage, read> w: array<u32>;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read> bias: array<f32>;
+@group(0) @binding(6) var<storage, read_write> y: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+// [16 of k][64 voxels (or outputs)], a row of 17 vec4s (the 17th padding, against bank conflicts)
+var<workgroup> xs: array<vec4<f32>, 272>;
+var<workgroup> ws: array<vec4<f32>, 272>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    let n = p[0].x;
+    let cin = p[0].y;
+    let m = p[0].z;
+    let cp = p[0].w;
+    let taps = p[1].x;
+    let wd = p[1].y;
+    let h = p[1].z;
+    let plane = h * wd;
+    let frames = m / plane;
+    let kt = taps * cp;
+    let o0 = wg.x * 64u;
+    let r0 = (p[1].w + wg.y + wg.z * 65535u) * 64u;
+    let tr = t / 16u;
+    let to = t % 16u;
+    let kk = t % 16u;
+    // the voxels this thread loads (rows `t / 16 + 16 q` of the tile): their frame, row and column
+    let pa = min(r0 + tr, m - 1u);
+    let pb = min(r0 + tr + 16u, m - 1u);
+    let pc = min(r0 + tr + 32u, m - 1u);
+    let pd = min(r0 + tr + 48u, m - 1u);
+    let fa = i32(pa / plane); let ya = i32((pa % plane) / wd); let xa = i32(pa % wd);
+    let fb = i32(pb / plane); let yb = i32((pb % plane) / wd); let xb = i32(pb % wd);
+    let fc = i32(pc / plane); let yc = i32((pc % plane) / wd); let xc = i32(pc % wd);
+    let fd = i32(pd / plane); let yd = i32((pd % plane) / wd); let xd = i32(pd % wd);
+    var a0 = vec4<f32>(0.0);
+    var a1 = vec4<f32>(0.0);
+    var a2 = vec4<f32>(0.0);
+    var a3 = vec4<f32>(0.0);
+    for (var kb = 0u; kb < kt; kb += 16u) {
+        let gk = kb + kk;
+        let tap = gk / cp;
+        let c = gk % cp;
+        let live = gk < kt && c < cin;
+        // the tap's offsets in time, rows and columns
+        var dt = 0;
+        var dy = 0;
+        var dx = 0;
+        if (taps == 27u) {
+            dt = i32(tap / 9u) - 1;
+            dy = i32((tap / 3u) % 3u) - 1;
+            dx = i32(tap % 3u) - 1;
+        } else if (taps == 9u) {
+            dy = i32(tap / 3u) - 1;
+            dx = i32(tap % 3u) - 1;
+        }
+        for (var q = 0u; q < 4u; q++) {
+            var f = fa;
+            var yy = ya;
+            var xx = xa;
+            var r = r0 + tr;
+            if (q == 1u) { f = fb; yy = yb; xx = xb; r = r0 + tr + 16u; }
+            if (q == 2u) { f = fc; yy = yc; xx = xc; r = r0 + tr + 32u; }
+            if (q == 3u) { f = fd; yy = yd; xx = xd; r = r0 + tr + 48u; }
+            let sy = yy + dy;
+            let sx = xx + dx;
+            let sf = clamp(f + dt, 0, i32(frames) - 1);
+            var v = 0.0;
+            if (live && r < m && sy >= 0 && sy < i32(h) && sx >= 0 && sx < i32(wd)) {
+                v = x[((u32(sf) * h + u32(sy)) * wd + u32(sx)) * cin + c];
+            }
+            let rr = tr + 16u * q;
+            xs[kk * 17u + rr / 4u][rr % 4u] = v;
+            var u = 0.0;
+            if (o0 + rr < n && gk < kt) {
+                let e = (o0 + rr) * kt + gk;
+                u = unpack2x16float(w[e / 2u])[e % 2u];
+            }
+            ws[kk * 17u + rr / 4u][rr % 4u] = u;
+        }
+        workgroupBarrier();
+        for (var j = 0u; j < 16u; j++) {
+            let xv = xs[j * 17u + tr];
+            let wv = ws[j * 17u + to];
+            a0 += xv.x * wv;
+            a1 += xv.y * wv;
+            a2 += xv.z * wv;
+            a3 += xv.w * wv;
+        }
+        workgroupBarrier();
+    }
+    let o = o0 + to * 4u;
+    let r = r0 + tr * 4u;
+    let acc = array<vec4<f32>, 4>(a0, a1, a2, a3);
+    for (var i = 0u; i < 4u; i++) {
+        if (r + i < m) {
+            for (var j = 0u; j < 4u; j++) {
+                if (o + j < n) {
+                    y[(r + i) * n + o + j] = acc[i][j] + bias[o + j];
+                }
+            }
+        }
+    }
+}
+"#;
+
+/// The most work (FLOPs) one dispatch of a convolution without tensor cores takes on: its voxels' tiles in chunks past
+/// it, as a prompt's attention's ([`ATTENTION_DISPATCH_FLOPS`]).
+const CONV_DISPATCH_FLOPS: f64 = (1u64 << 37) as f64;
+
 /// `y[i] = sum over s of part[s * len + i]`, the splits in order. `p[0]`: len, splits.
 const SUM_SPLITS: &str = r#"
 @group(0) @binding(0) var<storage, read> part: array<f32>;
@@ -2635,7 +2753,8 @@ impl DeviceChain for WgpuBackend {
     }
 
     fn conv3d_weights(&self, w: &[f32], cout: usize, cin: usize) -> Option<DeviceVec> {
-        if w.len() != cout * cin * 27 || !self.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+        // (the tensor cores' kernel's layout, the f32 one's too: CONV_F32_TILED)
+        if w.len() != cout * cin * 27 {
             return None;
         }
         let cp = cin.div_ceil(32) * 32;
@@ -2652,7 +2771,7 @@ impl DeviceChain for WgpuBackend {
 
     fn conv_weights(&self, w: &[f32], cout: usize, cin: usize, k: usize) -> Option<DeviceVec> {
         let taps = k * k;
-        if !matches!(k, 1 | 3) || w.len() != cout * cin * taps || !self.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+        if !matches!(k, 1 | 3) || w.len() != cout * cin * taps {
             return None;
         }
         let cp = cin.div_ceil(32) * 32;
@@ -3532,6 +3651,22 @@ impl Recorder<'_> {
         assert!(m > 0 && w.len * 2 >= cout * taps * cp && b.len >= cout && x.len >= m * cin && y.len >= m * cout, "chain: a convolution of {taps} taps of {frames}x{h}x{wd} voxels, {cin} channels to {cout}");
         let d = self.gpu().dummy().clone();
         let drw = self.gpu().dummy_rw().clone();
+        if !self.gpu().device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+            // no tensor cores: the f32 tiled kernel, the voxels' tiles in chunks of bounded work (the inputs as they
+            // are, no f16 copy or range to keep)
+            let tiles = m.div_ceil(64);
+            let per_tile = 2.0 * 64.0 * (cout * cin * taps) as f64;
+            let chunk = ((CONV_DISPATCH_FLOPS / per_tile) as usize).clamp(1, 65535);
+            let mut first = 0;
+            while first < tiles {
+                let n = chunk.min(tiles - first);
+                let words = [cout as u32, cin as u32, m as u32, cp as u32, taps as u32, wd as u32, h as u32, first as u32];
+                self.dispatch_wide("chain-conv-f32-tiled", CONV_F32_TILED, [buffer(w), buffer(x), buffer(b), &d, &d, &d, buffer(y), &drw], &words, ((cout as u32).div_ceil(64), n as u32, 1));
+                self.weigh(per_tile * n as f64);
+                first += n;
+            }
+            return;
+        }
         // the input as f16, each pixel's channels padded to 32's: once for every convolution that reads it until
         // something writes `x` (kept with the matmuls' tiled copies, a width of its own)
         let key = cp | 1 << 31;
