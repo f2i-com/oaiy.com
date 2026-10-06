@@ -7,6 +7,9 @@
 //! - `upscale`: four times larger with Real-ESRGAN (twice: four times, then
 //!   halved, as Real-ESRGAN's own `outscale` does); a transparent picture keeps
 //!   its alpha, resized bicubic. Up to 4 megapixels in (8192 pixels a side out).
+//!
+//! `backend` "webgpu" upscales on WebGPU (any GPU: [`crate::esrgan_wgpu`]), as a worker built with WebGPU and without
+//! CUDA does unless told "cpu"; background removal stays on Candle.
 use candle_core::{Device, Result};
 use image::{imageops::FilterType, Rgba, RgbaImage};
 use oaiy_engine::json::Json;
@@ -31,6 +34,8 @@ pub struct Request {
     /// 2 or 4 (`upscale` only).
     pub scale: u32,
     pub device: usize,
+    /// Upscaling on WebGPU.
+    pub webgpu: bool,
 }
 
 impl Request {
@@ -45,6 +50,16 @@ impl Request {
         if op == Op::Upscale && scale != 2 && scale != 4 {
             return Err("picture: scale must be 2 or 4".into());
         }
+        // (a worker without CUDA but with WebGPU takes the GPU by default: its CPU is the other way)
+        let webgpu = match s("backend").as_deref() {
+            Some("webgpu") => true,
+            Some("cuda" | "cpu") => false,
+            Some(other) => return Err(format!("picture: backend must be webgpu, cuda or cpu, not {other}")),
+            None => cfg!(all(feature = "webgpu", not(feature = "cuda"))),
+        };
+        if webgpu && !cfg!(feature = "webgpu") {
+            return Err("picture: this build has no WebGPU (the webgpu feature)".into());
+        }
         Ok(Self {
             op,
             image: PathBuf::from(s("image").ok_or("picture: image is required")?),
@@ -52,12 +67,24 @@ impl Request {
             output: PathBuf::from(s("output_dir").ok_or("picture: output_dir is required")?),
             scale: scale as u32,
             device: j.get("device").and_then(Json::as_i64).unwrap_or(0).max(0) as usize,
+            webgpu,
         })
     }
 }
 
 fn event(stage: &str, current: usize, total: usize) -> Json {
     Json::obj([("stage", Json::str(stage)), ("current", Json::Int(current as i64)), ("total", Json::Int(total as i64))])
+}
+
+/// `rgb` four times larger with Real-ESRGAN: on WebGPU where `r` asks, else on `dev`.
+fn upscale(r: &Request, dev: &Device, rgb: &[u8], w: usize, h: usize, report: &mut impl FnMut(Json)) -> Result<Vec<u8>> {
+    #[cfg(feature = "webgpu")]
+    if r.webgpu {
+        let net = crate::esrgan_wgpu::WgpuEsrgan::load(&r.model, r.device)?;
+        return net.upscale_with(rgb, w, h, |done, total| report(event("upscaling", done, total)));
+    }
+    let net = crate::esrgan::Esrgan::load(&r.model, dev)?;
+    net.upscale_with(rgb, w, h, |done, total| report(event("upscaling", done, total)))
 }
 
 fn device(index: usize) -> Result<Device> {
@@ -75,7 +102,8 @@ fn device(index: usize) -> Result<Device> {
 pub fn run(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     let started = Instant::now();
     std::fs::create_dir_all(&r.output)?;
-    let dev = device(r.device)?;
+    // (no Candle device for a WebGPU upscale: a CUDA context on the card would keep its memory)
+    let dev = if r.webgpu && r.op == Op::Upscale { Device::Cpu } else { device(r.device)? };
     let img = image::ImageReader::open(&r.image)?.with_guessed_format()?.decode().map_err(candle_core::Error::wrap)?;
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
@@ -97,8 +125,7 @@ pub fn run(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
             if u64::from(w) * u64::from(h) > MAX_UPSCALE_PIXELS {
                 candle_core::bail!("picture: {w}×{h} is more than 4 megapixels to enlarge; make it smaller first");
             }
-            let net = crate::esrgan::Esrgan::load(&r.model, &dev)?;
-            let big = net.upscale_with(&rgb, w as usize, h as usize, |done, total| report(event("upscaling", done, total)))?;
+            let big = upscale(r, &dev, &rgb, w as usize, h as usize, &mut report)?;
             let (bw, bh) = (w as usize * crate::esrgan::SCALE, h as usize * crate::esrgan::SCALE);
             let transparent = rgba.pixels().any(|p| p[3] != 255);
             let alpha: Vec<u8> = if transparent {

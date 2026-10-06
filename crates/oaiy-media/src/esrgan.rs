@@ -17,8 +17,8 @@ use std::path::Path;
 /// How much larger the picture gets.
 pub const SCALE: usize = 4;
 /// Input tile side, and the context around each tile.
-const TILE: usize = 256;
-const TILE_PAD: usize = 10;
+pub(crate) const TILE: usize = 256;
+pub(crate) const TILE_PAD: usize = 10;
 
 struct Conv {
     w: Tensor,
@@ -52,6 +52,27 @@ impl Dense {
     }
 }
 
+/// `RealESRGAN_x4plus.pth`'s reader and its state dict (its `params_ema`, else `params`, else the file's own), checked to
+/// be RRDBNet's of 23 blocks.
+pub(crate) fn state_dict(path: &Path) -> Result<(Pth, HashMap<String, Value>)> {
+    let pth = Pth::open(path)?;
+    let dict = |v: &Value| -> HashMap<String, Value> {
+        match v {
+            Value::Dict(items) => items.iter().filter_map(|(k, v)| if let Value::Str(k) = k { Some((k.clone(), v.clone())) } else { None }).collect(),
+            _ => HashMap::new(),
+        }
+    };
+    let root = dict(&pth.root.clone());
+    let sd = match root.get("params_ema").or_else(|| root.get("params")) {
+        Some(v) => dict(v),
+        None => root,
+    };
+    if !sd.contains_key("body.22.rdb3.conv5.weight") || sd.contains_key("body.23.rdb1.conv1.weight") {
+        candle_core::bail!("{}: not Real-ESRGAN x4plus (RRDBNet, 23 blocks)", path.display());
+    }
+    Ok((pth, sd))
+}
+
 pub struct Esrgan {
     first: Conv,
     body: Vec<[Dense; 3]>,
@@ -72,21 +93,7 @@ impl Esrgan {
     }
 
     pub fn load_as(path: &Path, dev: &Device, dtype: DType) -> Result<Self> {
-        let mut pth = Pth::open(path)?;
-        let dict = |v: &Value| -> HashMap<String, Value> {
-            match v {
-                Value::Dict(items) => items.iter().filter_map(|(k, v)| if let Value::Str(k) = k { Some((k.clone(), v.clone())) } else { None }).collect(),
-                _ => HashMap::new(),
-            }
-        };
-        let root = dict(&pth.root.clone());
-        let sd = match root.get("params_ema").or_else(|| root.get("params")) {
-            Some(v) => dict(v),
-            None => root,
-        };
-        if !sd.contains_key("body.22.rdb3.conv5.weight") || sd.contains_key("body.23.rdb1.conv1.weight") {
-            candle_core::bail!("{}: not Real-ESRGAN x4plus (RRDBNet, 23 blocks)", path.display());
-        }
+        let (mut pth, sd) = state_dict(path)?;
         let mut conv = |p: &str| -> Result<Conv> {
             let t = |pth: &mut Pth, k: String| -> Result<Tensor> {
                 let v = sd.get(&k).ok_or_else(|| candle_core::Error::Msg(format!("Real-ESRGAN: no {k}")))?.clone();

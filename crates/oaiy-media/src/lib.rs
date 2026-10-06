@@ -38,5 +38,7 @@ pub mod sound;
 pub mod model3d;
 pub mod birefnet;
 pub mod esrgan;
+#[cfg(feature = "webgpu")]
+pub mod esrgan_wgpu;
 pub mod picture;
 pub mod klein;

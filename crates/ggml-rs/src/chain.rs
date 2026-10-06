@@ -465,6 +465,21 @@ pub trait ChainRecorder {
         let _ = (w, b, cout, cin, k, x, h, wd, y);
         unimplemented!("a convolution on this device")
     }
+    /// [`Self::conv_rows`] of `x`'s pixels `xs` values apart, each its first `cin` (a concatenation's leading channels:
+    /// Real-ESRGAN's dense blocks).
+    #[allow(clippy::too_many_arguments)]
+    fn conv_rows_strided(&mut self, w: &DeviceVec, b: &DeviceVec, cout: usize, cin: usize, k: usize, x: &DeviceVec, xs: usize, h: usize, wd: usize, y: &DeviceVec) {
+        if xs == cin {
+            return self.conv_rows(w, b, cout, cin, k, x, h, wd, y);
+        }
+        let _ = (w, b, cout, cin, k, x, xs, h, wd, y);
+        unimplemented!("a strided convolution on this device")
+    }
+    /// `out = x` where `x` is positive, else `slope x`, for `len` values (a leaky ReLU; `out` may be `x`).
+    fn leaky_relu(&mut self, x: &DeviceVec, out: &DeviceVec, len: usize, slope: f32) {
+        let _ = (x, out, len, slope);
+        unimplemented!("a leaky ReLU on this device")
+    }
     /// `y[r] = W x[r] + b` for `rows` rows of `x` (`[rows, k]`), `W` an NVFP4 weight `[n, k]` as
     /// [`DeviceChain::nvfp4_weights`] made it (`w` its words, `scale` its scale's vector), `b` its bias (`[n]`).
     #[allow(clippy::too_many_arguments)]

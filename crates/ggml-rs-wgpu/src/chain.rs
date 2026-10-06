@@ -1079,13 +1079,15 @@ const X_F16_PADDED: &str = r#"
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let c = p[0].x;
     let cp2 = p[0].y / 2u;
+    // (a pixel's values `p[0].w` apart: its first `c` taken)
+    let xs = p[0].w;
     let i = id.x + id.y * 16776960u;
     if (i >= p[0].z * cp2) { return; }
     let px = i / cp2;
     let j = 2u * (i % cp2);
     var v = vec2<f32>(0.0);
-    if (j < c) { v.x = x[px * c + j]; }
-    if (j + 1u < c) { v.y = x[px * c + j + 1u]; }
+    if (j < c) { v.x = x[px * xs + j]; }
+    if (j + 1u < c) { v.y = x[px * xs + j + 1u]; }
     q[i] = pack2x16float(v * range[0]);
 }
 "#;
@@ -1704,8 +1706,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 /// matmul's 64 voxels by 64 outputs a workgroup ([`MATMUL_F32_TILED`]), its tokens' tile gathered through the taps
 /// as the tensor cores' kernel takes them (a 3x3's pixel `(y + dy - 1, x + dx - 1)`, zeros past the frame's edge; a
 /// 3x3x3's from frame `t + dt - 1` clamped to the clip), the weights the same packed f16 (`[cout][taps][cin padded
-/// to 32]`, two to a word), the bias added. `p[0]`: `cout`, `cin`, the voxels, the padded `cin`; `p[1]`: the taps, a
-/// row's pixels, a frame's rows, the dispatch's first tile of voxels (a grid of tiles past 65,535 its third dimension).
+/// to 32]`, two to a word), the bias added. `p[0]`: `cout`, `cin`, the voxels, the values a voxel of `x` apart (its
+/// first `cin`); `p[1]`: the taps, a row's pixels, a frame's rows, the dispatch's first tile of voxels.
 const CONV_F32_TILED: &str = r#"
 @group(0) @binding(0) var<storage, read> w: array<u32>;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
@@ -1722,7 +1724,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     let n = p[0].x;
     let cin = p[0].y;
     let m = p[0].z;
-    let cp = p[0].w;
+    let stride = p[0].w;
+    let cp = (cin + 31u) / 32u * 32u;
     let taps = p[1].x;
     let wd = p[1].y;
     let h = p[1].z;
@@ -1777,7 +1780,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
             let sf = clamp(f + dt, 0, i32(frames) - 1);
             var v = 0.0;
             if (live && r < m && sy >= 0 && sy < i32(h) && sx >= 0 && sx < i32(wd)) {
-                v = x[((u32(sf) * h + u32(sy)) * wd + u32(sx)) * cin + c];
+                v = x[((u32(sf) * h + u32(sy)) * wd + u32(sx)) * stride + c];
             }
             let rr = tr + 16u * q;
             xs[kk * 17u + rr / 4u][rr % 4u] = v;
@@ -1811,6 +1814,21 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
             }
         }
     }
+}
+"#;
+
+/// `out = x` where positive, else `slope x`: `p[0]` the values, the slope's bits.
+const LEAKY_RELU: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(6) var<storage, read_write> out: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    if (i >= p[0].x) { return; }
+    let v = x[i];
+    out[i] = select(v * bitcast<f32>(p[0].y), v, v > 0.0);
 }
 "#;
 
@@ -3643,12 +3661,13 @@ impl Recorder<'_> {
     }
 
     /// [`ChainRecorder::conv_rows`] and [`ChainRecorder::conv3d_rows`]: `taps` 1, 9 (3x3) or 27 (3x3x3), `frames` of
-    /// `h` rows of `wd` (one frame for a picture).
+    /// `h` rows of `wd` (one frame for a picture), `x`'s voxels `xs` values apart (its first `cin` each).
     #[allow(clippy::too_many_arguments)]
-    fn conv_taps(&mut self, w: &DeviceVec, b: &DeviceVec, cout: usize, cin: usize, taps: usize, x: &DeviceVec, frames: usize, h: usize, wd: usize, y: &DeviceVec) {
+    fn conv_taps(&mut self, w: &DeviceVec, b: &DeviceVec, cout: usize, cin: usize, taps: usize, x: &DeviceVec, xs: usize, frames: usize, h: usize, wd: usize, y: &DeviceVec) {
         let cp = cin.div_ceil(32) * 32;
         let m = frames * h * wd;
-        assert!(m > 0 && w.len * 2 >= cout * taps * cp && b.len >= cout && x.len >= m * cin && y.len >= m * cout, "chain: a convolution of {taps} taps of {frames}x{h}x{wd} voxels, {cin} channels to {cout}");
+        assert!(m > 0 && xs >= cin && w.len * 2 >= cout * taps * cp && b.len >= cout && x.len >= (m - 1) * xs + cin && y.len >= m * cout, "chain: a convolution of {taps} taps of {frames}x{h}x{wd} voxels, {cin} channels ({xs} apart) to {cout}");
+        assert!(cp < 1 << 16 && xs < 1 << 14, "chain: a convolution's {cin} channels {xs} apart");
         let d = self.gpu().dummy().clone();
         let drw = self.gpu().dummy_rw().clone();
         if !self.gpu().device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
@@ -3660,7 +3679,7 @@ impl Recorder<'_> {
             let mut first = 0;
             while first < tiles {
                 let n = chunk.min(tiles - first);
-                let words = [cout as u32, cin as u32, m as u32, cp as u32, taps as u32, wd as u32, h as u32, first as u32];
+                let words = [cout as u32, cin as u32, m as u32, xs as u32, taps as u32, wd as u32, h as u32, first as u32];
                 self.dispatch_wide("chain-conv-f32-tiled", CONV_F32_TILED, [buffer(w), buffer(x), buffer(b), &d, &d, &d, buffer(y), &drw], &words, ((cout as u32).div_ceil(64), n as u32, 1));
                 self.weigh(per_tile * n as f64);
                 first += n;
@@ -3669,7 +3688,7 @@ impl Recorder<'_> {
         }
         // the input as f16, each pixel's channels padded to 32's: once for every convolution that reads it until
         // something writes `x` (kept with the matmuls' tiled copies, a width of its own)
-        let key = cp | 1 << 31;
+        let key = cp | xs << 16 | 1 << 31;
         let xb = buffer(x).clone();
         let x16 = match self.x16.iter().find(|(b, rows, width, _)| *b == xb && *rows == m && *width == key) {
             Some((.., v)) => v.clone(),
@@ -3677,14 +3696,15 @@ impl Recorder<'_> {
                 // `x`'s scale for f16 (its largest within 16,384) set on the device, then the copy scaled; the scale kept
                 // beside the copy (a width of its own) for the sums' way back
                 let range = self.scratch(4);
-                let len = (m * cin) as u32;
+                // (over every value of the pixels: a strided input's others too, its range no smaller)
+                let len = ((m - 1) * xs + cin) as u32;
                 self.dispatch_wide("chain-f16-range-clear", F16_RANGE_CLEAR, [&d, &d, &d, &d, &d, &d, buffer(&range), &drw], &[0], (1, 1, 1));
                 self.dispatch_wide("chain-f16-range-max", F16_RANGE_MAX, [buffer(x), &d, &d, &d, &d, &d, buffer(&range), &drw], &[len], grid(len.div_ceil(256)));
                 self.dispatch_wide("chain-f16-range-set", F16_RANGE_SET, [&d, &d, &d, &d, &d, &d, buffer(&range), &drw], &[0], (1, 1, 1));
                 let v = self.scratch(m * cp / 2);
                 let conv = self.gpu().named_pipeline("chain-x-f16-padded", || X_F16_PADDED.to_string());
                 let words = (m * cp / 2) as u32;
-                self.dispatch_kept(&conv, buffer(&range), buffer(x), buffer(&v), &[cin as u32, cp as u32, m as u32], grid(words.div_ceil(256)));
+                self.dispatch_kept(&conv, buffer(&range), buffer(x), buffer(&v), &[cin as u32, cp as u32, m as u32, xs as u32], grid(words.div_ceil(256)));
                 self.x16.push((xb.clone(), m, key, v.clone()));
                 self.x16.push((xb, m, key ^ (3 << 30), range));
                 v
@@ -4115,7 +4135,7 @@ impl ChainRecorder for Recorder<'_> {
     }
 
     fn conv3d_rows(&mut self, w: &DeviceVec, b: &DeviceVec, cout: usize, cin: usize, x: &DeviceVec, frames: usize, h: usize, wd: usize, y: &DeviceVec) {
-        self.conv_taps(w, b, cout, cin, 27, x, frames, h, wd, y);
+        self.conv_taps(w, b, cout, cin, 27, x, cin, frames, h, wd, y);
     }
 
     fn depth_to_space_rows(&mut self, x: &DeviceVec, out: &DeviceVec, frames: usize, h: usize, w: usize, c: usize, st: usize, sh: usize, sw: usize, drop: usize) {
@@ -4129,7 +4149,27 @@ impl ChainRecorder for Recorder<'_> {
 
     fn conv_rows(&mut self, w: &DeviceVec, b: &DeviceVec, cout: usize, cin: usize, k: usize, x: &DeviceVec, h: usize, wd: usize, y: &DeviceVec) {
         assert!(matches!(k, 1 | 3), "chain: a {k}x{k} convolution");
-        self.conv_taps(w, b, cout, cin, k * k, x, 1, h, wd, y);
+        self.conv_taps(w, b, cout, cin, k * k, x, cin, 1, h, wd, y);
+    }
+
+    fn conv_rows_strided(&mut self, w: &DeviceVec, b: &DeviceVec, cout: usize, cin: usize, k: usize, x: &DeviceVec, xs: usize, h: usize, wd: usize, y: &DeviceVec) {
+        assert!(matches!(k, 1 | 3), "chain: a {k}x{k} convolution");
+        self.conv_taps(w, b, cout, cin, k * k, x, xs, 1, h, wd, y);
+    }
+
+    fn leaky_relu(&mut self, x: &DeviceVec, out: &DeviceVec, len: usize, slope: f32) {
+        assert!(x.len >= len && out.len >= len, "chain: a leaky ReLU of {len}");
+        let d = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        let n = len as u32;
+        if Arc::ptr_eq(&x.inner, &out.inner) {
+            // (in place: the one buffer bound once, written where it is read)
+            let body = LEAKY_RELU.replace("@group(0) @binding(0) var<storage, read> x: array<f32>;
+", "").replace("let v = x[i];", "let v = out[i];");
+            self.dispatch_wide("chain-leaky-relu-in-place", &body, [&d, &d, &d, &d, &d, &d, buffer(out), &drw], &[n, slope.to_bits()], grid(n.div_ceil(256)));
+        } else {
+            self.dispatch_wide("chain-leaky-relu", LEAKY_RELU, [buffer(x), &d, &d, &d, &d, &d, buffer(out), &drw], &[n, slope.to_bits()], grid(n.div_ceil(256)));
+        }
     }
 
     fn matmul_nvfp4_rows(&mut self, w: &DeviceVec, scale: &DeviceVec, b: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize) {
@@ -5416,6 +5456,60 @@ mod tests {
         assert_eq!(back, w.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect::<Vec<_>>());
         assert!(b.vec_f16_rounded(&[1.0, 70000.0]).is_none(), "past f16's range");
         assert!(b.vec_f16_rounded(&[1.0, f32::NAN]).is_none(), "not a number");
+    }
+
+    /// Real-ESRGAN's ops as the host computes them: a 3x3 convolution of a concatenation's leading channels (its
+    /// pixels' values further apart than it reads), and a leaky ReLU, apart and in place.
+    #[test]
+    fn real_esrgans_ops_are_the_hosts() {
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        let mut r = rng(97);
+        for (cin, xs, cout, h, w) in [(64usize, 192usize, 32usize, 9usize, 13usize), (160, 192, 64, 7, 5), (3, 3, 64, 6, 11)] {
+            let wt: Vec<f32> = (0..cout * cin * 9).map(|_| half::f16::from_f32(r() * 0.2).to_f32()).collect();
+            let x: Vec<f32> = (0..h * w * xs).map(|_| half::f16::from_f32(r()).to_f32()).collect();
+            let bias: Vec<f32> = (0..cout).map(|_| r()).collect();
+            let wd = b.conv_weights(&wt, cout, cin, 3).expect("the weights");
+            let (xd, yd, bd) = (b.vec(x.len()), b.vec(h * w * cout), b.vec(cout));
+            DeviceChain::upload(&b, &xd, &x);
+            DeviceChain::upload(&b, &bd, &bias);
+            let mut rec = b.begin();
+            rec.conv_rows_strided(&wd, &bd, cout, cin, 3, &xd, xs, h, w, &yd);
+            rec.read(&yd);
+            let got = rec.finish().pop().unwrap();
+            for py in 0..h {
+                for px in 0..w {
+                    for co in 0..cout {
+                        let mut want = bias[co] as f64;
+                        for c in 0..cin {
+                            for ky in 0..3 {
+                                for kx in 0..3 {
+                                    let (iy, ix) = (py as isize + ky as isize - 1, px as isize + kx as isize - 1);
+                                    if iy >= 0 && ix >= 0 && (iy as usize) < h && (ix as usize) < w {
+                                        want += wt[((co * cin + c) * 3 + ky) * 3 + kx] as f64 * x[(iy as usize * w + ix as usize) * xs + c] as f64;
+                                    }
+                                }
+                            }
+                        }
+                        let g = got[(py * w + px) * cout + co] as f64;
+                        assert!((g - want).abs() <= 1e-3 * (1.0 + want.abs()), "3x3 conv of {cin} of {xs} channels to {cout} at ({py}, {px}) channel {co}: {g} against {want}");
+                    }
+                }
+            }
+        }
+        let x: Vec<f32> = (0..1000).map(|_| r() * 4.0).collect();
+        let want: Vec<f32> = x.iter().map(|&v| if v > 0.0 { v } else { 0.2 * v }).collect();
+        let (xd, yd) = (b.vec(1000), b.vec(1000));
+        DeviceChain::upload(&b, &xd, &x);
+        let mut rec = b.begin();
+        rec.leaky_relu(&xd, &yd, 1000, 0.2);
+        rec.read(&yd);
+        rec.leaky_relu(&xd, &xd, 1000, 0.2);
+        rec.read(&xd);
+        let got = rec.finish();
+        for (i, w) in want.iter().enumerate() {
+            assert!((got[0][i] - w).abs() <= 1e-6 * (1.0 + w.abs()), "a leaky ReLU [{i}]: {} against {w}", got[0][i]);
+            assert!((got[1][i] - w).abs() <= 1e-6 * (1.0 + w.abs()), "a leaky ReLU in place [{i}]: {} against {w}", got[1][i]);
+        }
     }
 
     /// A VAE's ops as the host computes them: 3x3 and 1x1 convolutions on the tensor cores with their bias (channels
