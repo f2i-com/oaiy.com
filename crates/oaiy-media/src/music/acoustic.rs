@@ -29,10 +29,10 @@ pub const HOP: usize = 512;
 pub const CHUNK_FRAMES: usize = 200;
 pub const CHUNK_HOP: usize = 100;
 /// Latents a window shares with the one before it.
-const OVERLAP: usize = 172;
+pub(crate) const OVERLAP: usize = 172;
 /// Latents each side of a window that its neighbours' audio replaces.
-const CROP_LEFT: usize = 86;
-const CROP_RIGHT: usize = 344 - 86;
+pub(crate) const CROP_LEFT: usize = 86;
+pub(crate) const CROP_RIGHT: usize = 344 - 86;
 pub const LATENT_CHANNELS: usize = 128;
 
 fn msg(s: impl Into<String>) -> candle_core::Error {
@@ -85,8 +85,8 @@ fn weight_norm(g: &Tensor, v: &Tensor) -> Result<Tensor> {
 /// The Flow-VAE decoder: (B, 128, L) latents to (B, 2, L * 512) audio. Each
 /// stereo channel is decoded from its own 64 latent channels.
 pub struct Vocoder {
-    w: HashMap<String, Tensor>,
-    strides: Vec<usize>,
+    pub(crate) w: HashMap<String, Tensor>,
+    pub(crate) strides: Vec<usize>,
 }
 
 impl Vocoder {
@@ -157,7 +157,7 @@ impl Vocoder {
     }
 }
 
-fn read_config(path: &Path) -> Result<oaiy_engine::json::Json> {
+pub(crate) fn read_config(path: &Path) -> Result<oaiy_engine::json::Json> {
     let bytes = std::fs::read(path).map_err(|e| msg(format!("{}: {e}", path.display())))?;
     oaiy_engine::json::Json::parse(&bytes).map_err(candle_core::Error::wrap)
 }

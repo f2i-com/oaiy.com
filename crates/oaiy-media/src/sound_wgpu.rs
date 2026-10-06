@@ -297,7 +297,8 @@ struct Up {
     residuals: Vec<Residual>,
 }
 
-struct Dac {
+/// A DAC decoder on the device (MOSS-SoundEffect's, and MiniMax Music 3's Flow-VAE decoder: the same layers).
+pub(crate) struct Dac {
     post_quant: Option<Conv1>,
     first: Conv1,
     ups: Vec<Up>,
@@ -307,7 +308,7 @@ struct Dac {
 }
 
 impl Dac {
-    fn from(gpu: &WgpuBackend, d: &crate::sound::dac::Dac) -> Result<Self> {
+    pub(crate) fn from(gpu: &WgpuBackend, d: &crate::sound::dac::Dac) -> Result<Self> {
         let f32v = |t: &Tensor| -> Result<DeviceVec> {
             let v = values(t)?;
             let dv = gpu.vec(v.len());
@@ -342,7 +343,7 @@ impl Dac {
     }
 
     /// Latents `z` (`[len, latent_dim]`) to audio (`len * hop` samples).
-    fn decode(&self, gpu: &WgpuBackend, z: &DeviceVec, len: usize) -> Result<Vec<f32>> {
+    pub(crate) fn decode(&self, gpu: &WgpuBackend, z: &DeviceVec, len: usize) -> Result<Vec<f32>> {
         let mut rec = gpu.begin();
         rec.keep_groups(false);
         let r = rec.as_mut();
@@ -366,14 +367,15 @@ impl Dac {
             r.conv_transpose1d_rows(&u.w, &u.b, u.cout, u.cin, u.k, s, s.div_ceil(2), &x, len, out, &y);
             x = y;
             len = out;
+            // (two vectors a stage for its residual units, not three a unit: a music window's 8 s held 5 GB so)
+            let (a, b) = (gpu.vec(len * u.cout), gpu.vec(len * u.cout));
             for res in &u.residuals {
-                let y = gpu.vec(len * u.cout);
-                r.copy(&x, 0, &y, 0, len * u.cout);
-                r.snake_rows(&y, &res.snake1, len, u.cout);
-                let y = conv(r, &res.conv1, &y, len, res.dilation);
-                r.snake_rows(&y, &res.snake2, len, res.conv1.cout);
-                let y = conv(r, &res.conv2, &y, len, 1);
-                r.axpy_at(&x, &y, &self.one, 0, len * u.cout);
+                r.copy(&x, 0, &a, 0, len * u.cout);
+                r.snake_rows(&a, &res.snake1, len, u.cout);
+                r.conv1d_rows(&res.conv1.w, &res.conv1.b, res.conv1.cout, res.conv1.cin, res.conv1.k, res.dilation, &a, len, &b);
+                r.snake_rows(&b, &res.snake2, len, res.conv1.cout);
+                r.conv1d_rows(&res.conv2.w, &res.conv2.b, res.conv2.cout, res.conv2.cin, res.conv2.k, 1, &b, len, &a);
+                r.axpy_at(&x, &a, &self.one, 0, len * u.cout);
             }
         }
         r.snake_rows(&x, &self.last_snake, len, self.last.cin);

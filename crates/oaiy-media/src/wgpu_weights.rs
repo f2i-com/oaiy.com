@@ -94,7 +94,7 @@ pub fn f16_words_f32(values: &[f32]) -> Option<Vec<f32>> {
 }
 
 /// GGUF's type as the block decoders name it.
-fn ggml(t: GgmlDType) -> Option<ggml_quants::GgmlType> {
+pub(crate) fn ggml(t: GgmlDType) -> Option<ggml_quants::GgmlType> {
     use ggml_quants::GgmlType as G;
     Some(match t {
         GgmlDType::F32 => G::F32,

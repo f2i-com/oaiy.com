@@ -43,6 +43,10 @@ pub mod tts_wgpu;
 pub mod qwen3_wgpu;
 #[cfg(feature = "webgpu")]
 pub mod codec_wgpu;
+#[cfg(feature = "webgpu")]
+pub mod music_wgpu;
+#[cfg(feature = "webgpu")]
+pub mod music_lm_wgpu;
 pub mod model3d;
 pub mod birefnet;
 #[cfg(feature = "webgpu")]

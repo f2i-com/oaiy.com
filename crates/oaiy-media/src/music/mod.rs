@@ -5,6 +5,9 @@
 //! the autoregressive stage ([`lm`]: an 8B language model and a depth
 //! decoder write 25 frames a second) and the acoustic stage ([`acoustic`]:
 //! a flow-matching transformer and the Flow-VAE decoder render them).
+//!
+//! `backend` "webgpu" runs both on WebGPU ([`crate::music_lm_wgpu`], [`crate::music_wgpu`]: any GPU), as a worker
+//! built with WebGPU and without CUDA does by default (Candle's language model is BF16, which its CPU cannot multiply).
 pub mod acoustic;
 pub mod lm;
 pub mod quant;
@@ -172,6 +175,8 @@ pub struct Request {
     pub budget: Budget,
     /// A quantized language model (see [`quant`]) instead of the BF16 one.
     pub language_model: Option<PathBuf>,
+    /// On WebGPU (the transformer's weights f16 there, whatever `dtype`).
+    pub webgpu: bool,
 }
 
 impl Request {
@@ -195,7 +200,16 @@ impl Request {
             greedy: j.get("greedy").and_then(Json::as_bool).unwrap_or(false),
             budget: Budget::parse(j)?,
             language_model: s("language_model").filter(|p| !p.trim().is_empty()).map(PathBuf::from),
+            webgpu: match s("backend").as_deref() {
+                Some("webgpu") => true,
+                Some("cuda" | "cpu") => false,
+                Some(other) => return Err(format!("music: backend must be webgpu, cuda or cpu, not {other}")),
+                None => cfg!(all(feature = "webgpu", not(feature = "cuda"))),
+            },
         };
+        if r.webgpu && !cfg!(feature = "webgpu") {
+            return Err("music: this build has no WebGPU (the webgpu feature)".into());
+        }
         if r.prompt.len() > 20_000 || r.lyrics.len() > 20_000 {
             return Err("music: prompt and lyrics are limited to 20000 bytes each".into());
         }
@@ -251,7 +265,7 @@ fn device(index: usize) -> Result<Device> {
 }
 
 /// Window `k`'s starting noise, (1, 128, len), from the seed alone.
-fn noise(seed: u64, k: usize, len: usize) -> Result<Tensor> {
+pub(crate) fn noise(seed: u64, k: usize, len: usize) -> Result<Tensor> {
     let mut rng = lm::Rng::new(seed ^ 0xA5A5_0000_0000_0000 ^ (k as u64).wrapping_mul(0x9E37_79B9));
     Tensor::from_vec(rng.normals(acoustic::LATENT_CHANNELS * len), (1, acoustic::LATENT_CHANNELS, len), &Device::Cpu)
 }
@@ -259,6 +273,10 @@ fn noise(seed: u64, k: usize, len: usize) -> Result<Tensor> {
 pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     let started = Instant::now();
     std::fs::create_dir_all(&r.output)?;
+    #[cfg(feature = "webgpu")]
+    if r.webgpu {
+        return generate_webgpu(r, report);
+    }
     let dev = device(r.device)?;
     let ids = prompt_ids(&r.model_dir, &r.prompt, &r.lyrics)?;
     let max_frames = ((r.max_seconds * FRAMES_PER_SECOND) as usize).clamp(1, MAX_FRAMES);
@@ -326,6 +344,71 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         ("seed", Json::Int(r.seed as i64)),
         // Where each stage's weights lived (the studio shows the renderer's).
         ("residency", Json::obj([("language_model", lm_report), ("transformer", dit_report)])),
+    ]);
+    std::fs::write(path.with_extension("json"), result.to_json())?;
+    Ok(result)
+}
+
+/// [`generate`] on WebGPU: the language model and depth decoder ([`crate::music_lm_wgpu`]), then the renderer
+/// ([`crate::music_wgpu`]), one after the other on the same device.
+#[cfg(feature = "webgpu")]
+fn generate_webgpu(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
+    use crate::music_lm_wgpu::{WgpuDepth, WgpuMusicLm};
+    let started = Instant::now();
+    let gpu = ggml_rs_wgpu::WgpuBackend::nth(r.device, None).map_err(|e| candle_core::Error::Msg(format!("music on WebGPU: {e}")))?;
+    let ids = prompt_ids(&r.model_dir, &r.prompt, &r.lyrics)?;
+    let max_frames = ((r.max_seconds * FRAMES_PER_SECOND) as usize).clamp(1, MAX_FRAMES);
+
+    // Stage 1: the language model writes the song, frame by frame.
+    let layers = 36;
+    report(event("loading_music_model", 0, layers));
+    let depth = WgpuDepth::load(&r.model_dir.join("rvq_depth_decoder"), &gpu)?;
+    let positions = ids[0].len() + max_frames + 2;
+    let f16 = r.language_model.is_none() && crate::music_lm_wgpu::lm_f16(&gpu, positions);
+    let mut model = WgpuMusicLm::load(&r.model_dir.join("language_model"), r.language_model.as_deref(), positions, &gpu, |i| report(event("loading_music_model", i, layers)))?;
+    let load_seconds = started.elapsed().as_secs_f64();
+    let compose_started = Instant::now();
+    let mut rng = lm::Rng::new(r.seed);
+    let frames = crate::music_lm_wgpu::generate(&mut model, &depth, &ids, max_frames, if r.greedy { None } else { Some(&mut rng) }, |n| {
+        report(event("composing", n, max_frames));
+        Ok(())
+    })?;
+    let compose_seconds = compose_started.elapsed().as_secs_f64();
+    drop(depth);
+    drop(model);
+    if frames.is_empty() {
+        candle_core::bail!("the model ended the song before it began; try another seed or description");
+    }
+    let hidden: Vec<f32> = frames.iter().flat_map(|f| f.hidden.iter().copied()).collect();
+
+    // Stage 2: render the frames to audio.
+    let render_started = Instant::now();
+    let blocks = 36;
+    report(event("loading_renderer", 0, blocks));
+    let acoustic = crate::music_wgpu::WgpuAcoustic::load(&r.model_dir, &gpu, r.steps, r.guidance, |i| report(event("loading_renderer", i, blocks)))?;
+    let seed = r.seed;
+    let audio = acoustic.generate(&hidden, frames.len(), |k, len| noise(seed, k, len)?.flatten_all()?.to_vec1::<f32>(), |done, total| report(event("rendering", done, total)))?;
+    drop(acoustic);
+    let render_seconds = render_started.elapsed().as_secs_f64();
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_err(candle_core::Error::wrap)?.as_nanos();
+    let path = r.output.join(format!("music-{stamp}-{}.wav", r.seed));
+    write_stereo_wav(&path, &audio[0], &audio[1], acoustic::SAMPLE_RATE)?;
+    let seconds = audio[0].len() as f64 / acoustic::SAMPLE_RATE as f64;
+    let result = Json::obj([
+        ("path", Json::str(path.to_string_lossy())),
+        ("sample_rate", Json::Int(acoustic::SAMPLE_RATE as i64)),
+        ("channels", Json::Int(2)),
+        ("frames", Json::Int(frames.len() as i64)),
+        ("duration", Json::Num(seconds)),
+        ("finish_reason", Json::str(if frames.len() >= max_frames { "length" } else { "stop" })),
+        ("prompt_tokens", Json::Int(ids[0].len() as i64)),
+        ("load_seconds", Json::Num(load_seconds)),
+        ("compose_seconds", Json::Num(compose_seconds)),
+        ("render_seconds", Json::Num(render_seconds)),
+        ("seconds", Json::Num(started.elapsed().as_secs_f64())),
+        ("seed", Json::Int(r.seed as i64)),
+        ("backend", Json::str("webgpu")),
+        ("language_model_weights", Json::str(if r.language_model.is_some() { "quantized file" } else if f16 { "f16" } else { "q8_0" })),
     ]);
     std::fs::write(path.with_extension("json"), result.to_json())?;
     Ok(result)

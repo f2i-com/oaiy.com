@@ -542,7 +542,7 @@ pub fn sample_top_k(values: &[f32], rng: Option<&mut Rng>) -> usize {
 }
 
 /// Guidance between a conditional and an unconditional row.
-fn guide(c: &[f32], u: &[f32]) -> Vec<f32> {
+pub(crate) fn guide(c: &[f32], u: &[f32]) -> Vec<f32> {
     c.iter().zip(u).map(|(c, u)| u + (c - u) * CFG).collect()
 }
 
@@ -550,11 +550,15 @@ fn guide(c: &[f32], u: &[f32]) -> Vec<f32> {
 /// song, else the code. Guidance is limited to the conditional row's top 50.
 pub fn pick_semantic(logits: &Tensor, rng: Option<&mut Rng>) -> Result<Option<u32>> {
     let rows = logits.to_vec2::<f32>()?;
-    let (c, u) = (&rows[0], &rows[1]);
+    Ok(pick_semantic_rows(&rows[0], &rows[1], rng))
+}
+
+/// [`pick_semantic`] of the conditional and unconditional rows' logits.
+pub fn pick_semantic_rows(c: &[f32], u: &[f32], rng: Option<&mut Rng>) -> Option<u32> {
     let threshold = kth_largest(c, TOP_K);
     let guided: Vec<f32> = guide(c, u).into_iter().zip(c).map(|(g, &c)| if c < threshold { f32::NEG_INFINITY } else { g }).collect();
     let i = sample_top_k(&guided, rng);
-    Ok(if i == 0 { None } else { Some((i - 1) as u32) })
+    if i == 0 { None } else { Some((i - 1) as u32) }
 }
 
 /// Everything the stage keeps of one frame.
