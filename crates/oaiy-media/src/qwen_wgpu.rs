@@ -558,14 +558,16 @@ mod tests {
     }
 
     /// Each step's time over many (`--ignored --nocapture`): the transformer of `OAIY_QWEN_IMAGE_TRANSFORMER` with its
-    /// turbo adapter `OAIY_QWEN_IMAGE_ADAPTER`, a 1024x1024 picture's latent, 15 steps (a two-picture job's slow late
-    /// steps sought).
+    /// turbo adapter `OAIY_QWEN_IMAGE_ADAPTER`, a 1024x1024 picture's latent (QWEN_IMAGE_GRID another side), 15 steps
+    /// (QWEN_IMAGE_STEPS another count); with OAIY_CHAIN_PROFILE each step's costliest kernels.
     #[test]
     #[ignore = "a timing; needs Qwen Image 2.1's transformer and a WebGPU adapter"]
     fn measure_many_steps() -> Result<()> {
         let Some(path) = std::env::var_os("OAIY_QWEN_IMAGE_TRANSFORMER").map(PathBuf::from) else { return Ok(()) };
         let adapter = std::env::var_os("OAIY_QWEN_IMAGE_ADAPTER").map(PathBuf::from);
-        let (nt, side) = (31usize, 64usize);
+        let side: usize = std::env::var("QWEN_IMAGE_GRID").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+        let steps: usize = std::env::var("QWEN_IMAGE_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(15);
+        let nt = 31usize;
         let mut seed = 0x9e3779b97f4a7c15u64;
         let mut next = || {
             seed ^= seed << 13;
@@ -579,12 +581,15 @@ mod tests {
         let mut latent = Tensor::from_vec(latent, (1, side * side, CH), &Device::Cpu)?;
         let mut gpu = WgpuTransformer::load(&path, 0, adapter.as_deref(), &[], |_| {})?;
         let prefix = gpu.prepare(&text, &[])?;
-        for step in 0..15 {
+        for step in 0..steps {
             let t = std::time::Instant::now();
-            let sigma = 1. - step as f64 / 16.;
+            let sigma = 1. - step as f64 / (steps + 1) as f64;
             let v = gpu.conditioned(&latent, &prefix, sigma, side, side)?;
             latent = (latent + (v * -0.0625)?)?;
             eprintln!("step {step}: {:.3} s", t.elapsed().as_secs_f64());
+            if std::env::var_os("OAIY_CHAIN_PROFILE").is_some() {
+                eprintln!("  {:?}", ggml_rs_wgpu::profile::take_kernels().into_iter().take(6).collect::<Vec<_>>());
+            }
         }
         Ok(())
     }

@@ -775,7 +775,12 @@ impl WgpuBackend {
         // the tensor cores' matrices (Vulkan's cooperative matrices) and f16 in shaders, where the adapter has them: a
         // prompt's matmuls through them
         let coop = adapter.features() & (wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX | wgpu::Features::SHADER_F16);
-        let coop = if coop == wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX | wgpu::Features::SHADER_F16 && std::env::var_os("OAIY_NO_COOP").is_none() { coop } else { wgpu::Features::empty() };
+        // (the kernels' fragments are 16 x 16 x 16, f16 into f32 sums and f16 ones: an adapter with only other shapes,
+        // Metal's 8 x 8, has none of them)
+        let shapes = adapter.cooperative_matrix_properties();
+        let shape = |sums: wgpu::CooperativeScalarType| shapes.iter().any(|p| (p.m_size, p.n_size, p.k_size) == (16, 16, 16) && p.ab_type == wgpu::CooperativeScalarType::F16 && p.cr_type == sums);
+        let fits = shape(wgpu::CooperativeScalarType::F32) && shape(wgpu::CooperativeScalarType::F16);
+        let coop = if coop == wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX | wgpu::Features::SHADER_F16 && fits && std::env::var_os("OAIY_NO_COOP").is_none() { coop } else { wgpu::Features::empty() };
         // SAFETY: wgpu's cooperative matrices are an experimental feature (its implementation may misbehave where
         // misused); only the prompt kernels use them, each checked against the f32 kernels (OAIY_NO_COOP: none).
         let experimental = if coop.is_empty() { wgpu::ExperimentalFeatures::disabled() } else { unsafe { wgpu::ExperimentalFeatures::enabled() } };
