@@ -346,11 +346,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the Base model and clone reference dumps; OAIY_TTS_GOLDEN (clone folder), OAIY_TTS_BASE"]
+    #[ignore = "requires the Base model and clone reference dumps; OAIY_TTS_GOLDEN (clone folder), OAIY_TTS_BASE; OAIY_TTS_TEST_DEVICE a CUDA device's index or cpu"]
     fn encoders_match_reference() -> Result<()> {
         let root = std::path::PathBuf::from(std::env::var("OAIY_TTS_GOLDEN").map_err(candle_core::Error::wrap)?);
         let base = std::path::PathBuf::from(std::env::var("OAIY_TTS_BASE").map_err(candle_core::Error::wrap)?);
-        let dev = Device::new_cuda(std::env::var("OAIY_TTS_TEST_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0))?;
+        // (on the CPU as a voice designed on WebGPU has them)
+        let device = std::env::var("OAIY_TTS_TEST_DEVICE").unwrap_or_default();
+        let dev = if device == "cpu" { Device::Cpu } else { Device::new_cuda(device.parse().unwrap_or(0))? };
         let read = |name: &str, shape: &[usize]| -> Result<Tensor> {
             Tensor::from_raw_buffer(&std::fs::read(root.join(name))?, DType::F32, shape, &dev)
         };

@@ -10,7 +10,8 @@
 //!
 //! `backend` "webgpu" speaks on WebGPU, the talker ([`crate::tts_wgpu`]) and the speech codec's decoder
 //! ([`crate::codec_wgpu`]) on any GPU, as a worker built with WebGPU and without CUDA does by default (Candle's talker
-//! needs CUDA: its weights BF16). Breeze TTS 2 and voice design are not on WebGPU yet.
+//! needs CUDA: its weights BF16); a voice is designed there too, its clip's speaker embedding and codes then worked out
+//! on the CPU (both encoders F32). Breeze TTS 2 is not on WebGPU.
 pub mod breeze;
 pub mod clone;
 pub mod codec;
@@ -141,6 +142,8 @@ pub struct DesignRequest {
     pub seed: u64,
     pub device: usize,
     pub output: PathBuf,
+    /// The sample spoken on WebGPU (the encoders then on the CPU).
+    pub webgpu: bool,
 }
 
 impl DesignRequest {
@@ -156,7 +159,16 @@ impl DesignRequest {
             seed: j.get("seed").and_then(Json::as_i64).unwrap_or(0).max(0) as u64,
             device: j.get("device").and_then(Json::as_i64).unwrap_or(0).max(0) as usize,
             output: s("output_dir").ok_or("voice: missing output_dir")?.into(),
+            webgpu: match s("backend").as_deref() {
+                Some("webgpu") => true,
+                Some("cuda" | "cpu") => false,
+                Some(other) => return Err(format!("voice: backend must be webgpu, cuda or cpu, not {other}")),
+                None => cfg!(all(feature = "webgpu", not(feature = "cuda"))),
+            },
         };
+        if r.webgpu && !cfg!(feature = "webgpu") {
+            return Err("voice: this build has no WebGPU (the webgpu feature)".into());
+        }
         if r.description.len() > 4000 || r.sample.len() > 2000 || r.name.len() > 80 {
             return Err("voice: description, sample text or name too long".into());
         }
@@ -172,27 +184,13 @@ pub fn design_voice(r: &DesignRequest, mut report: impl FnMut(Json)) -> Result<J
         let (voice, clip) = breeze::design(&r.design_dir, &r.name, &r.description, &r.sample, &r.language, r.seed, r.device, &r.output)?;
         return save_voice(voice, &clip, &r.output, started, &mut report);
     }
+    #[cfg(feature = "webgpu")]
+    if r.webgpu {
+        return design_voice_webgpu(r, started, report);
+    }
     let dev = device(r.device)?;
     report(event("designing_voice", 0, 3));
-    let speak = Request {
-        model_dir: r.design_dir.clone(),
-        text: r.sample.clone(),
-        instructions: r.description.clone(),
-        language: r.language.clone(),
-        output: r.output.clone(),
-        seed: r.seed,
-        device: r.device,
-        max_seconds: 30.,
-        temperature: 0.9,
-        top_k: 50,
-        top_p: 1.0,
-        repetition_penalty: 1.05,
-        repetition_penalty_set: true,
-        cfg_scale: None,
-        greedy: false,
-        voice: None,
-        webgpu: false,
-    };
+    let speak = design_sample(r);
     let tok = tokenizer(&r.design_dir)?;
     let mut tts = Tts::load(&r.design_dir, &dev)?;
     let language = tts.language_id(&r.language)?;
@@ -210,6 +208,56 @@ pub fn design_voice(r: &DesignRequest, mut report: impl FnMut(Json)) -> Result<J
     report(event("designing_voice", 2, 3));
     let speaker = clone::SpeakerEncoder::load(&r.base_dir.join("model.safetensors"), &dev)?.embed(&clip)?;
     let ref_codes = clone::SpeechEncoder::load(&r.base_dir.join("speech_tokenizer").join("model.safetensors"), &dev)?.encode(&clip)?;
+    let voice = Voice { name: r.name.clone(), description: r.description.clone(), language: r.language.clone(), ref_text: r.sample.clone(), ref_codes, speaker };
+    save_voice(voice, &clip, &r.output, started, &mut report)
+}
+
+/// How a voice's sample is spoken: its text in the described voice, sampled as the reference's demo does.
+fn design_sample(r: &DesignRequest) -> Request {
+    Request {
+        model_dir: r.design_dir.clone(),
+        text: r.sample.clone(),
+        instructions: r.description.clone(),
+        language: r.language.clone(),
+        output: r.output.clone(),
+        seed: r.seed,
+        device: r.device,
+        max_seconds: 30.,
+        temperature: 0.9,
+        top_k: 50,
+        top_p: 1.0,
+        repetition_penalty: 1.05,
+        repetition_penalty_set: true,
+        cfg_scale: None,
+        greedy: false,
+        voice: None,
+        webgpu: r.webgpu,
+    }
+}
+
+/// [`design_voice`] on WebGPU: the sample spoken and decoded there ([`crate::tts_wgpu::WgpuTalker`],
+/// [`crate::codec_wgpu::WgpuCodec`]), then the Base model's speaker and speech encoders (F32) on the CPU.
+#[cfg(feature = "webgpu")]
+fn design_voice_webgpu(r: &DesignRequest, started: Instant, mut report: impl FnMut(Json)) -> Result<Json> {
+    report(event("designing_voice", 0, 3));
+    let speak = design_sample(r);
+    let tok = tokenizer(&r.design_dir)?;
+    let mut tts = crate::tts_wgpu::WgpuTalker::load(&r.design_dir, r.device)?;
+    let language = tts.language_id(&r.language)?;
+    let instruct = encode(&tok, &r.description)?;
+    let prefill = tts.prefill(&encode(&tok, &r.sample)?, Some(&instruct), language)?;
+    let frames = tts.frames(&prefill, None, speak.sampling(), 375, |_| {})?;
+    let gpu = tts.gpu().clone();
+    drop(tts);
+    if frames.len() < 12 {
+        candle_core::bail!("the voice sample came out too short; try a longer sample text or another seed");
+    }
+    report(event("designing_voice", 1, 3));
+    let clip = crate::codec_wgpu::WgpuCodec::load(&r.design_dir.join("speech_tokenizer").join("model.safetensors"), &gpu)?.decode(&frames)?;
+    drop(gpu);
+    report(event("designing_voice", 2, 3));
+    let speaker = clone::SpeakerEncoder::load(&r.base_dir.join("model.safetensors"), &Device::Cpu)?.embed(&clip)?;
+    let ref_codes = clone::SpeechEncoder::load(&r.base_dir.join("speech_tokenizer").join("model.safetensors"), &Device::Cpu)?.encode(&clip)?;
     let voice = Voice { name: r.name.clone(), description: r.description.clone(), language: r.language.clone(), ref_text: r.sample.clone(), ref_codes, speaker };
     save_voice(voice, &clip, &r.output, started, &mut report)
 }
