@@ -22,12 +22,12 @@ use std::path::Path;
 
 /// The side BiRefNet sees the picture at.
 pub const SIZE: usize = 1024;
-const WINDOW: usize = 12;
+pub(crate) const WINDOW: usize = 12;
 const BN_EPS: f64 = 1e-5;
 
-struct Linear {
-    w: Tensor,
-    b: Option<Tensor>,
+pub(crate) struct Linear {
+    pub(crate) w: Tensor,
+    pub(crate) b: Option<Tensor>,
 }
 
 impl Linear {
@@ -41,10 +41,10 @@ impl Linear {
 }
 
 /// A convolution on [C, H, W], stride 1, padding k / 2, its BatchNorm folded in.
-struct Conv {
-    w: Tensor,
-    b: Option<Tensor>,
-    k: usize,
+pub(crate) struct Conv {
+    pub(crate) w: Tensor,
+    pub(crate) b: Option<Tensor>,
+    pub(crate) k: usize,
 }
 
 impl Conv {
@@ -64,60 +64,60 @@ impl Conv {
 }
 
 /// Modulated deformable convolution (torchvision's), with a BatchNorm folded in.
-struct Deform {
-    offset: Conv,
-    modulator: Conv,
+pub(crate) struct Deform {
+    pub(crate) offset: Conv,
+    pub(crate) modulator: Conv,
     /// [Cout, K·Cin]: taps outer, input channels inner.
-    w: Tensor,
-    b: Tensor,
-    k: usize,
+    pub(crate) w: Tensor,
+    pub(crate) b: Tensor,
+    pub(crate) k: usize,
 }
 
-struct AsppDeformable {
-    branches: Vec<Deform>,
-    pool: Conv,
-    out: Conv,
+pub(crate) struct AsppDeformable {
+    pub(crate) branches: Vec<Deform>,
+    pub(crate) pool: Conv,
+    pub(crate) out: Conv,
 }
 
-struct DecBlk {
-    conv_in: Conv,
-    att: AsppDeformable,
-    conv_out: Conv,
+pub(crate) struct DecBlk {
+    pub(crate) conv_in: Conv,
+    pub(crate) att: AsppDeformable,
+    pub(crate) conv_out: Conv,
 }
 
-struct SwinBlock {
-    norm1: (Tensor, Tensor),
-    qkv: Linear,
-    proj: Linear,
+pub(crate) struct SwinBlock {
+    pub(crate) norm1: (Tensor, Tensor),
+    pub(crate) qkv: Linear,
+    pub(crate) proj: Linear,
     /// [heads, 144, 144]: the relative position bias.
-    bias: Tensor,
-    norm2: (Tensor, Tensor),
-    fc1: Linear,
-    fc2: Linear,
-    heads: usize,
-    shift: usize,
+    pub(crate) bias: Tensor,
+    pub(crate) norm2: (Tensor, Tensor),
+    pub(crate) fc1: Linear,
+    pub(crate) fc2: Linear,
+    pub(crate) heads: usize,
+    pub(crate) shift: usize,
 }
 
-struct Stage {
-    blocks: Vec<SwinBlock>,
-    norm: (Tensor, Tensor),
+pub(crate) struct Stage {
+    pub(crate) blocks: Vec<SwinBlock>,
+    pub(crate) norm: (Tensor, Tensor),
     /// PatchMerging: its norm and reduction.
-    merge: Option<((Tensor, Tensor), Linear)>,
+    pub(crate) merge: Option<((Tensor, Tensor), Linear)>,
 }
 
 pub struct BiRefNet {
-    patch: Conv,
-    patch_norm: (Tensor, Tensor),
-    stages: Vec<Stage>,
-    squeeze: DecBlk,
-    blocks: [DecBlk; 4],
-    lateral: [Conv; 3],
+    pub(crate) patch: Conv,
+    pub(crate) patch_norm: (Tensor, Tensor),
+    pub(crate) stages: Vec<Stage>,
+    pub(crate) squeeze: DecBlk,
+    pub(crate) blocks: [DecBlk; 4],
+    pub(crate) lateral: [Conv; 3],
     /// Each block's gate: a 3×3 convolution (with BatchNorm and ReLU), then 1×1 to one channel.
-    gates: [(Conv, Conv); 3],
+    pub(crate) gates: [(Conv, Conv); 3],
     /// The picture as patches at each block's size, 32² to 1024²: two convolutions each.
-    inputs: [(Conv, Conv); 5],
-    out: Conv,
-    dev: Device,
+    pub(crate) inputs: [(Conv, Conv); 5],
+    pub(crate) out: Conv,
+    pub(crate) dev: Device,
 }
 
 /// Bilinear resampling weights along one axis, PyTorch's `align_corners=True`: [out, in].

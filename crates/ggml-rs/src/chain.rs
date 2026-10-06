@@ -83,7 +83,7 @@ pub trait DeviceChain: Send + Sync {
         let _ = values;
         None
     }
-    /// A convolution's weights (`[cout, cin, k, k]` as PyTorch keeps them, `k` 1 or 3) for
+    /// A convolution's weights (`[cout, cin, k, k]` as PyTorch keeps them, `k` 1, 3 or 7) for
     /// [`ChainRecorder::conv_rows`]: f16 (each rounded to the nearest), each output's `k * k` taps in turn, a tap's
     /// channels padded with zeros to a multiple of 32. None where a value is past f16's range, or the device has no such
     /// kernel.
@@ -456,7 +456,7 @@ pub trait ChainRecorder {
         let _ = (q, kv, out, rows, n_h, n_kv, head_dim, kv_len, scale);
         unimplemented!("full attention on this device")
     }
-    /// A `k` x `k` convolution (`k` 1 or 3; stride 1, zeros past the edge) of an image `x` held as its pixels' rows of
+    /// A `k` x `k` convolution (`k` 1, 3 or 7; stride 1, zeros past the edge) of an image `x` held as its pixels' rows of
     /// channels (`[h * w, cin]`, a row of the image after another) into `y` (`[h * w, cout]`), the weights `w` as
     /// [`DeviceChain::conv_weights`] packs them, plus the bias `b`; `x` of any range (a VAE's reach some 230,000, past
     /// f16's: where the device multiplies in f16, scaled by a power of two its largest sets, undone after).
@@ -486,6 +486,67 @@ pub trait ChainRecorder {
     fn w4a8_f16(&mut self, codes: &DeviceVec, rel: &DeviceVec, channel: &DeviceVec, book: &DeviceVec, rows: usize, cols: usize, rotation: usize, out: &DeviceVec) {
         let _ = (codes, rel, channel, book, rows, cols, rotation, out);
         unimplemented!("W4A8's decode on this device")
+    }
+    /// Swin's windows: `x`'s `h` by `w` tokens of `c` (rows) into `out`'s windows of `win` by `win` (`[windows, win²,
+    /// c]`, the windows row by row), the grid padded with zeros to whole windows (`hp` by `wp`) and, with `shift`,
+    /// rolled up and left by it first (torch.roll by -shift).
+    #[allow(clippy::too_many_arguments)]
+    fn window_rows(&mut self, x: &DeviceVec, out: &DeviceVec, h: usize, w: usize, c: usize, win: usize, shift: usize) {
+        let _ = (x, out, h, w, c, win, shift);
+        unimplemented!("Swin's windows on this device")
+    }
+    /// [`Self::window_rows`]' way back: each of the `h` by `w` tokens' place in `windows` added to its row of `acc` (the
+    /// roll undone, the padding dropped).
+    #[allow(clippy::too_many_arguments)]
+    fn unwindow_add_rows(&mut self, windows: &DeviceVec, acc: &DeviceVec, h: usize, w: usize, c: usize, win: usize, shift: usize) {
+        let _ = (windows, acc, h, w, c, win, shift);
+        unimplemented!("Swin's windows on this device")
+    }
+    /// Swin's window attention, heads 32 wide: `qkv` the windows' tokens' queries, keys and values (`[windows win²,
+    /// 3 heads 32]`, from [`Self::window_rows`] of a `h` by `w` grid), `table` the relative positions' bias (`[(2 win -
+    /// 1)², heads]`), into `out` (`[windows win², heads 32]`); the queries scaled by `scale`; with `shift`, a key in
+    /// another region of the rolled grid than its query's -100 (Swin's mask).
+    #[allow(clippy::too_many_arguments)]
+    fn window_attention(&mut self, qkv: &DeviceVec, table: &DeviceVec, out: &DeviceVec, h: usize, w: usize, heads: usize, win: usize, shift: usize, scale: f32) {
+        let _ = (qkv, table, out, h, w, heads, win, shift, scale);
+        unimplemented!("Swin's window attention on this device")
+    }
+    /// An image's rows (`[h * w, c]`) resized to `oh` by `ow` into `out`, bilinear with the corners aligned (PyTorch's
+    /// `align_corners=True`).
+    #[allow(clippy::too_many_arguments)]
+    fn resize_bilinear_rows(&mut self, x: &DeviceVec, out: &DeviceVec, h: usize, w: usize, c: usize, oh: usize, ow: usize) {
+        let _ = (x, out, h, w, c, oh, ow);
+        unimplemented!("a bilinear resize on this device")
+    }
+    /// A square picture's rows (`[s * s, c]`) as patches `size` a side, each channel of the result one whole block of
+    /// it (`[size², c g²]`, `g = s / size`; einops' `c (hg h) (wg w) -> (c hg wg) h w`).
+    fn blocks_to_channels_rows(&mut self, x: &DeviceVec, out: &DeviceVec, s: usize, c: usize, size: usize) {
+        let _ = (x, out, s, c, size);
+        unimplemented!("patches on this device")
+    }
+    /// A modulated deformable convolution's taps (torchvision's `deform_conv2d`) for `pixels` of an `h` by `w` image
+    /// `x` (`[h w, c]`) from pixel `first`: `out` `[pixels, k² c]` (taps outer), tap `t` of pixel `(y, x)` bilinear at
+    /// `(y - k/2 + t / k + dy, x - k/2 + t % k + dx)` (zeros outside), `(dy, dx)` its `offsets` (`[h w, 2 k²]`), times
+    /// its `modulators` (`[h w, k²]`).
+    #[allow(clippy::too_many_arguments)]
+    fn deform_im2col_rows(&mut self, x: &DeviceVec, offsets: &DeviceVec, modulators: &DeviceVec, out: &DeviceVec, h: usize, w: usize, c: usize, k: usize, first: usize, pixels: usize) {
+        let _ = (x, offsets, modulators, out, h, w, c, k, first, pixels);
+        unimplemented!("a deformable convolution on this device")
+    }
+    /// Each of `x`'s `rows` (`[rows, c]`) times the sigmoid of its `gate` (`[rows]`), in place.
+    fn mul_sigmoid_rows(&mut self, x: &DeviceVec, gate: &DeviceVec, rows: usize, c: usize) {
+        let _ = (x, gate, rows, c);
+        unimplemented!("a gate of rows on this device")
+    }
+    /// `out[ch]` the mean of `x`'s `rows` (`[rows, c]`) at `ch`.
+    fn mean_rows(&mut self, x: &DeviceVec, out: &DeviceVec, rows: usize, c: usize) {
+        let _ = (x, out, rows, c);
+        unimplemented!("a mean on this device")
+    }
+    /// `src`'s `c` values into each of `rows` rows of `dst` (`stride` apart) at `at`.
+    fn broadcast_rows(&mut self, src: &DeviceVec, dst: &DeviceVec, rows: usize, c: usize, stride: usize, at: usize) {
+        let _ = (src, dst, rows, c, stride, at);
+        unimplemented!("a broadcast on this device")
     }
     /// `out = x` where `x` is positive, else `slope x`, for `len` values (a leaky ReLU; `out` may be `x`).
     fn leaky_relu(&mut self, x: &DeviceVec, out: &DeviceVec, len: usize, slope: f32) {

@@ -1763,6 +1763,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
             dt = i32(tap / 9u) - 1;
             dy = i32((tap / 3u) % 3u) - 1;
             dx = i32(tap % 3u) - 1;
+        } else if (taps == 49u) {
+            dy = i32(tap / 7u) - 3;
+            dx = i32(tap % 7u) - 3;
         } else if (taps == 9u) {
             dy = i32(tap / 3u) - 1;
             dx = i32(tap % 3u) - 1;
@@ -1906,6 +1909,306 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     for (var cb = t; cb < GS / 2u; cb += 64u) {
         out[row * (cols / 2u) + g0 / 2u + cb] = pack2x16float(vec2<f32>(g[2u * cb], g[2u * cb + 1u]) * scale);
     }
+}
+"#;
+
+/// Swin's windows ([`ChainRecorder::window_rows`]): a thread an output value. `p[0]`: `h`, `w`, `c`, `win`; `p[1]`: the
+/// shift, the padded grid's `hp` and `wp`.
+const WINDOW_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(6) var<storage, read_write> out: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    let w = p[0].y;
+    let c = p[0].z;
+    let win = p[0].w;
+    let shift = p[1].x;
+    let hp = p[1].y;
+    let wp = p[1].z;
+    if (i >= hp * wp * c) { return; }
+    let ch = i % c;
+    let tok = i / c;
+    let n = win * win;
+    let wdx = tok / n;
+    let t = tok % n;
+    let gw = wp / win;
+    let py = ((wdx / gw) * win + t / win + shift) % hp;
+    let px = ((wdx % gw) * win + t % win + shift) % wp;
+    var v = 0.0;
+    if (py < p[0].x && px < w) { v = x[(py * w + px) * c + ch]; }
+    out[i] = v;
+}
+"#;
+
+/// [`WINDOW_ROWS`]' way back, added ([`ChainRecorder::unwindow_add_rows`]): a thread a token's value. `p` as its.
+const UNWINDOW_ADD_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> xw: array<f32>;
+@group(0) @binding(6) var<storage, read_write> out: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    let w = p[0].y;
+    let c = p[0].z;
+    let win = p[0].w;
+    let shift = p[1].x;
+    let hp = p[1].y;
+    let wp = p[1].z;
+    if (i >= p[0].x * w * c) { return; }
+    let ch = i % c;
+    let tok = i / c;
+    let ry = (tok / w + hp - shift) % hp;
+    let rx = (tok % w + wp - shift) % wp;
+    let wdx = (ry / win) * (wp / win) + rx / win;
+    let t = (ry % win) * win + rx % win;
+    out[i] += xw[(wdx * win * win + t) * c + ch];
+}
+"#;
+
+/// Swin's window attention, heads 32 wide ([`ChainRecorder::window_attention`]): a workgroup a (window, head), a thread
+/// a query (its 32 dims and sums in registers), the keys in turn (each a broadcast: every thread reads the same), the
+/// softmax online. `p[0]`: the padded grid's `hp` and `wp`, the heads, `win`; `p[1]`: the shift, the scale's bits.
+const WINDOW_ATTENTION: &str = r#"
+@group(0) @binding(0) var<storage, read> qkv: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> table: array<f32>;
+@group(0) @binding(6) var<storage, read_write> out: array<vec4<f32>>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+// a coordinate's region of the rolled grid `n` long (Swin's slices: up to the last window, to the shift, the rest)
+fn region(i: u32, n: u32, win: u32, shift: u32) -> u32 {
+    if (i < n - win) { return 0u; }
+    if (i < n - shift) { return 1u; }
+    return 2u;
+}
+
+@compute @workgroup_size(N_u)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    let hp = p[0].x;
+    let wp = p[0].y;
+    let heads = p[0].z;
+    let win = p[0].w;
+    let shift = p[1].x;
+    let scale = bitcast<f32>(p[1].y);
+    let wdx = wg.x;
+    let head = wg.y;
+    let n = win * win;
+    let c4 = heads * 8u;
+    let row4 = 3u * c4;
+    let base = wdx * n;
+    let qo = (base + t) * row4 + head * 8u;
+    let q0 = qkv[qo] * scale;
+    let q1 = qkv[qo + 1u] * scale;
+    let q2 = qkv[qo + 2u] * scale;
+    let q3 = qkv[qo + 3u] * scale;
+    let q4 = qkv[qo + 4u] * scale;
+    let q5 = qkv[qo + 5u] * scale;
+    let q6 = qkv[qo + 6u] * scale;
+    let q7 = qkv[qo + 7u] * scale;
+    let gw = wp / win;
+    let qy = t / win;
+    let qx = t % win;
+    let gy = (wdx / gw) * win;
+    let gx = (wdx % gw) * win;
+    var qr = 0u;
+    if (shift > 0u) { qr = region(gy + qy, hp, win, shift) * 3u + region(gx + qx, wp, win, shift); }
+    var m = -3.0e38;
+    var l = 0.0;
+    var a0 = vec4<f32>();
+    var a1 = vec4<f32>();
+    var a2 = vec4<f32>();
+    var a3 = vec4<f32>();
+    var a4 = vec4<f32>();
+    var a5 = vec4<f32>();
+    var a6 = vec4<f32>();
+    var a7 = vec4<f32>();
+    for (var j = 0u; j < n; j++) {
+        let ko = (base + j) * row4 + c4 + head * 8u;
+        var s = dot(q0, qkv[ko]) + dot(q1, qkv[ko + 1u]) + dot(q2, qkv[ko + 2u]) + dot(q3, qkv[ko + 3u]) + dot(q4, qkv[ko + 4u]) + dot(q5, qkv[ko + 5u]) + dot(q6, qkv[ko + 6u]) + dot(q7, qkv[ko + 7u]);
+        let ky = j / win;
+        let kx = j % win;
+        s += table[((qy + win - 1u - ky) * (2u * win - 1u) + qx + win - 1u - kx) * heads + head];
+        if (shift > 0u && region(gy + ky, hp, win, shift) * 3u + region(gx + kx, wp, win, shift) != qr) { s -= 100.0; }
+        let mn = max(m, s);
+        let a = exp(m - mn);
+        let e = exp(s - mn);
+        l = l * a + e;
+        m = mn;
+        let vo = ko + c4;
+        a0 = a0 * a + e * qkv[vo];
+        a1 = a1 * a + e * qkv[vo + 1u];
+        a2 = a2 * a + e * qkv[vo + 2u];
+        a3 = a3 * a + e * qkv[vo + 3u];
+        a4 = a4 * a + e * qkv[vo + 4u];
+        a5 = a5 * a + e * qkv[vo + 5u];
+        a6 = a6 * a + e * qkv[vo + 6u];
+        a7 = a7 * a + e * qkv[vo + 7u];
+    }
+    let inv = 1.0 / l;
+    let oo = (base + t) * c4 + head * 8u;
+    out[oo] = a0 * inv;
+    out[oo + 1u] = a1 * inv;
+    out[oo + 2u] = a2 * inv;
+    out[oo + 3u] = a3 * inv;
+    out[oo + 4u] = a4 * inv;
+    out[oo + 5u] = a5 * inv;
+    out[oo + 6u] = a6 * inv;
+    out[oo + 7u] = a7 * inv;
+}
+"#;
+
+/// A bilinear resize with the corners aligned ([`ChainRecorder::resize_bilinear_rows`]): a thread an output value.
+/// `p[0]`: `h`, `w`, `c`, `oh`; `p[1]`: `ow`.
+const RESIZE_BILINEAR_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(6) var<storage, read_write> out: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    let h = p[0].x;
+    let w = p[0].y;
+    let c = p[0].z;
+    let oh = p[0].w;
+    let ow = p[1].x;
+    if (i >= oh * ow * c) { return; }
+    let ch = i % c;
+    let ox = (i / c) % ow;
+    let oy = i / (c * ow);
+    var sy = 0.0;
+    if (oh > 1u) { sy = f32(h - 1u) / f32(oh - 1u) * f32(oy); }
+    var sx = 0.0;
+    if (ow > 1u) { sx = f32(w - 1u) / f32(ow - 1u) * f32(ox); }
+    let y0 = min(u32(sy), h - 1u);
+    let x0 = min(u32(sx), w - 1u);
+    let y1 = min(y0 + 1u, h - 1u);
+    let x1 = min(x0 + 1u, w - 1u);
+    let fy = sy - f32(y0);
+    let fx = sx - f32(x0);
+    let top = (1.0 - fx) * x[(y0 * w + x0) * c + ch] + fx * x[(y0 * w + x1) * c + ch];
+    let bottom = (1.0 - fx) * x[(y1 * w + x0) * c + ch] + fx * x[(y1 * w + x1) * c + ch];
+    out[i] = (1.0 - fy) * top + fy * bottom;
+}
+"#;
+
+/// A picture as patches ([`ChainRecorder::blocks_to_channels_rows`]): a thread an output value. `p[0]`: the picture's
+/// side, `c`, the patches' side.
+const BLOCKS_TO_CHANNELS_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(6) var<storage, read_write> out: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    let s = p[0].x;
+    let c = p[0].y;
+    let size = p[0].z;
+    let g = s / size;
+    let cc = c * g * g;
+    if (i >= size * size * cc) { return; }
+    let oc = i % cc;
+    let pix = i / cc;
+    let ch = oc / (g * g);
+    let hg = (oc / g) % g;
+    let wg = oc % g;
+    out[i] = x[((hg * size + pix / size) * s + wg * size + pix % size) * c + ch];
+}
+"#;
+
+/// A modulated deformable convolution's taps ([`ChainRecorder::deform_im2col_rows`]): a thread an output value.
+/// `p[0]`: `h`, `w`, `c`, `k`; `p[1]`: the first pixel, the pixels.
+const DEFORM_IM2COL_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> offsets: array<f32>;
+@group(0) @binding(2) var<storage, read> mods: array<f32>;
+@group(0) @binding(6) var<storage, read_write> out: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    let h = p[0].x;
+    let w = p[0].y;
+    let c = p[0].z;
+    let k = p[0].w;
+    let kk = k * k;
+    if (i >= p[1].y * kk * c) { return; }
+    let ch = i % c;
+    let t = (i / c) % kk;
+    let pix = p[1].x + i / (c * kk);
+    let pad = f32(k / 2u);
+    let y = f32(pix / w) - pad + f32(t / k) + offsets[pix * 2u * kk + 2u * t];
+    let xx = f32(pix % w) - pad + f32(t % k) + offsets[pix * 2u * kk + 2u * t + 1u];
+    var v = 0.0;
+    if (y > -1.0 && y < f32(h) && xx > -1.0 && xx < f32(w)) {
+        let y0 = floor(y);
+        let x0 = floor(xx);
+        let ly = y - y0;
+        let lx = xx - x0;
+        let iy = i32(y0);
+        let ix = i32(x0);
+        let hi = i32(h);
+        let wi = i32(w);
+        if (iy >= 0 && ix >= 0) { v += (1.0 - ly) * (1.0 - lx) * x[(u32(iy) * w + u32(ix)) * c + ch]; }
+        if (iy >= 0 && ix + 1 < wi) { v += (1.0 - ly) * lx * x[(u32(iy) * w + u32(ix + 1)) * c + ch]; }
+        if (iy + 1 < hi && ix >= 0) { v += ly * (1.0 - lx) * x[(u32(iy + 1) * w + u32(ix)) * c + ch]; }
+        if (iy + 1 < hi && ix + 1 < wi) { v += ly * lx * x[(u32(iy + 1) * w + u32(ix + 1)) * c + ch]; }
+        v *= mods[pix * kk + t];
+    }
+    out[i] = v;
+}
+"#;
+
+/// Rows times their gates' sigmoids ([`ChainRecorder::mul_sigmoid_rows`]), in place: a thread a value. `p[0]`: the
+/// rows, `c`.
+const MUL_SIGMOID_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> gate: array<f32>;
+@group(0) @binding(6) var<storage, read_write> x: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    if (i >= p[0].x * p[0].y) { return; }
+    x[i] = x[i] / (1.0 + exp(-gate[i / p[0].y]));
+}
+"#;
+
+/// A column's mean ([`ChainRecorder::mean_rows`]): a thread a channel. `p[0]`: the rows, `c`.
+const MEAN_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(6) var<storage, read_write> out: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let ch = id.x;
+    let rows = p[0].x;
+    let c = p[0].y;
+    if (ch >= c) { return; }
+    var s = 0.0;
+    for (var r = 0u; r < rows; r++) { s += x[r * c + ch]; }
+    out[ch] = s / f32(rows);
+}
+"#;
+
+/// One row into many ([`ChainRecorder::broadcast_rows`]): a thread a value. `p[0]`: the rows, `c`, the stride, `at`.
+const BROADCAST_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> src: array<f32>;
+@group(0) @binding(6) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    let c = p[0].y;
+    if (i >= p[0].x * c) { return; }
+    dst[(i / c) * p[0].z + p[0].w + i % c] = src[i % c];
 }
 "#;
 
@@ -2881,7 +3184,7 @@ impl DeviceChain for WgpuBackend {
 
     fn conv_weights(&self, w: &[f32], cout: usize, cin: usize, k: usize) -> Option<DeviceVec> {
         let taps = k * k;
-        if !matches!(k, 1 | 3) || w.len() != cout * cin * taps {
+        if !matches!(k, 1 | 3 | 7) || w.len() != cout * cin * taps {
             return None;
         }
         let cp = cin.div_ceil(32) * 32;
@@ -3807,6 +4110,7 @@ impl Recorder<'_> {
         let tile = crate::shaders::COOP_TILE;
         let pipeline = match taps {
             27 => self.gpu().named_pipeline("chain-coop-conv3d", || crate::shaders::coop_conv(27)),
+            49 => self.gpu().named_pipeline("chain-coop-conv7x7", || crate::shaders::coop_conv(49)),
             9 => self.gpu().named_pipeline("chain-coop-conv3x3", || crate::shaders::coop_conv(9)),
             _ => self.gpu().named_pipeline("chain-coop-conv1x1", || crate::shaders::coop_conv(1)),
         };
@@ -4153,7 +4457,7 @@ impl ChainRecorder for Recorder<'_> {
         if rows <= 8 {
             self.matmul_f16_rows(w, n, k, x, y, rows);
         } else {
-            assert!(k % 2 == 0 && w.len * 2 >= n * k && x.len >= rows * k && y.len >= rows * n && n <= 65535 && rows <= 65535, "chain: an f16 matmul [{n}, {k}] of {rows} rows");
+            assert!(k % 2 == 0 && w.len * 2 >= n * k && x.len >= rows * k && y.len >= rows * n && n <= 65535 && rows.div_ceil(64) <= 65535, "chain: an f16 matmul [{n}, {k}] of {rows} rows");
             self.matmul_f16_tiled(w, n, k, x, y, rows);
             self.weigh(2.0 * (rows * n) as f64 * k as f64);
         }
@@ -4240,12 +4544,12 @@ impl ChainRecorder for Recorder<'_> {
     }
 
     fn conv_rows(&mut self, w: &DeviceVec, b: &DeviceVec, cout: usize, cin: usize, k: usize, x: &DeviceVec, h: usize, wd: usize, y: &DeviceVec) {
-        assert!(matches!(k, 1 | 3), "chain: a {k}x{k} convolution");
+        assert!(matches!(k, 1 | 3 | 7), "chain: a {k}x{k} convolution");
         self.conv_taps(w, b, cout, cin, k * k, x, cin, 1, h, wd, y);
     }
 
     fn conv_rows_strided(&mut self, w: &DeviceVec, b: &DeviceVec, cout: usize, cin: usize, k: usize, x: &DeviceVec, xs: usize, h: usize, wd: usize, y: &DeviceVec) {
-        assert!(matches!(k, 1 | 3), "chain: a {k}x{k} convolution");
+        assert!(matches!(k, 1 | 3 | 7), "chain: a {k}x{k} convolution");
         self.conv_taps(w, b, cout, cin, k * k, x, xs, 1, h, wd, y);
     }
 
@@ -4275,6 +4579,81 @@ impl ChainRecorder for Recorder<'_> {
             let r = rows as u32;
             self.dispatch_wide(name, &body, bufs, &words, ((cols / rotation) as u32, r.min(65535), r.div_ceil(65535)));
         }
+    }
+
+    fn window_rows(&mut self, x: &DeviceVec, out: &DeviceVec, h: usize, w: usize, c: usize, win: usize, shift: usize) {
+        let (hp, wp) = (h.div_ceil(win) * win, w.div_ceil(win) * win);
+        assert!(shift < win && x.len >= h * w * c && out.len >= hp * wp * c, "chain: windows of {h}x{w} tokens of {c}");
+        let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
+        let n = (hp * wp * c) as u32;
+        self.dispatch_wide("chain-window-rows", WINDOW_ROWS, [buffer(x), &d, &d, &d, &d, &d, buffer(out), &drw], &[h as u32, w as u32, c as u32, win as u32, shift as u32, hp as u32, wp as u32], grid(n.div_ceil(256)));
+    }
+
+    fn unwindow_add_rows(&mut self, windows: &DeviceVec, acc: &DeviceVec, h: usize, w: usize, c: usize, win: usize, shift: usize) {
+        let (hp, wp) = (h.div_ceil(win) * win, w.div_ceil(win) * win);
+        assert!(shift < win && windows.len >= hp * wp * c && acc.len >= h * w * c, "chain: windows of {h}x{w} tokens of {c}");
+        let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
+        let n = (h * w * c) as u32;
+        self.dispatch_wide("chain-unwindow-add-rows", UNWINDOW_ADD_ROWS, [buffer(windows), &d, &d, &d, &d, &d, buffer(acc), &drw], &[h as u32, w as u32, c as u32, win as u32, shift as u32, hp as u32, wp as u32], grid(n.div_ceil(256)));
+    }
+
+    fn window_attention(&mut self, qkv: &DeviceVec, table: &DeviceVec, out: &DeviceVec, h: usize, w: usize, heads: usize, win: usize, shift: usize, scale: f32) {
+        let (hp, wp) = (h.div_ceil(win) * win, w.div_ceil(win) * win);
+        let (n, c) = (win * win, heads * 32);
+        assert!(n <= 256 && shift < win && qkv.len >= hp * wp * 3 * c && table.len >= (2 * win - 1) * (2 * win - 1) * heads && out.len >= hp * wp * c, "chain: window attention of {h}x{w} tokens, {heads} heads");
+        let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
+        // (a pipeline a window's size: its threads, a query each)
+        let name: &'static str = match n {
+            144 => "chain-window-attention-144",
+            49 => "chain-window-attention-49",
+            16 => "chain-window-attention-16",
+            _ => panic!("chain: window attention of {win}x{win} windows"),
+        };
+        let body = WINDOW_ATTENTION.replace("N_u", &format!("{n}u"));
+        self.dispatch_wide(name, &body, [buffer(qkv), buffer(table), &d, &d, &d, &d, buffer(out), &drw], &[hp as u32, wp as u32, heads as u32, win as u32, shift as u32, scale.to_bits()], (((hp / win) * (wp / win)) as u32, heads as u32, 1));
+        self.weigh(4.0 * (hp * wp * n) as f64 * c as f64);
+    }
+
+    fn resize_bilinear_rows(&mut self, x: &DeviceVec, out: &DeviceVec, h: usize, w: usize, c: usize, oh: usize, ow: usize) {
+        assert!(h > 0 && w > 0 && x.len >= h * w * c && out.len >= oh * ow * c, "chain: a resize of {h}x{w} to {oh}x{ow}");
+        let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
+        let n = (oh * ow * c) as u32;
+        self.dispatch_wide("chain-resize-bilinear-rows", RESIZE_BILINEAR_ROWS, [buffer(x), &d, &d, &d, &d, &d, buffer(out), &drw], &[h as u32, w as u32, c as u32, oh as u32, ow as u32], grid(n.div_ceil(256)));
+    }
+
+    fn blocks_to_channels_rows(&mut self, x: &DeviceVec, out: &DeviceVec, s: usize, c: usize, size: usize) {
+        assert!(size > 0 && s % size == 0 && x.len >= s * s * c && out.len >= s * s * c, "chain: patches of {size} of a {s}-pixel picture");
+        let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
+        let n = (s * s * c) as u32;
+        self.dispatch_wide("chain-blocks-to-channels-rows", BLOCKS_TO_CHANNELS_ROWS, [buffer(x), &d, &d, &d, &d, &d, buffer(out), &drw], &[s as u32, c as u32, size as u32], grid(n.div_ceil(256)));
+    }
+
+    fn deform_im2col_rows(&mut self, x: &DeviceVec, offsets: &DeviceVec, modulators: &DeviceVec, out: &DeviceVec, h: usize, w: usize, c: usize, k: usize, first: usize, pixels: usize) {
+        let kk = k * k;
+        assert!(k % 2 == 1 && first + pixels <= h * w && x.len >= h * w * c && offsets.len >= h * w * 2 * kk && modulators.len >= h * w * kk && out.len >= pixels * kk * c, "chain: a deformable convolution's taps of {pixels} pixels");
+        let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
+        let n = (pixels * kk * c) as u32;
+        self.dispatch_wide("chain-deform-im2col-rows", DEFORM_IM2COL_ROWS, [buffer(x), buffer(offsets), buffer(modulators), &d, &d, &d, buffer(out), &drw], &[h as u32, w as u32, c as u32, k as u32, first as u32, pixels as u32], grid(n.div_ceil(256)));
+    }
+
+    fn mul_sigmoid_rows(&mut self, x: &DeviceVec, gate: &DeviceVec, rows: usize, c: usize) {
+        assert!(x.len >= rows * c && gate.len >= rows, "chain: a gate of {rows} rows of {c}");
+        let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
+        let n = (rows * c) as u32;
+        self.dispatch_wide("chain-mul-sigmoid-rows", MUL_SIGMOID_ROWS, [buffer(gate), &d, &d, &d, &d, &d, buffer(x), &drw], &[rows as u32, c as u32], grid(n.div_ceil(256)));
+    }
+
+    fn mean_rows(&mut self, x: &DeviceVec, out: &DeviceVec, rows: usize, c: usize) {
+        assert!(rows > 0 && x.len >= rows * c && out.len >= c, "chain: a mean of {rows} rows of {c}");
+        let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
+        self.dispatch_wide("chain-mean-rows", MEAN_ROWS, [buffer(x), &d, &d, &d, &d, &d, buffer(out), &drw], &[rows as u32, c as u32], ((c as u32).div_ceil(64), 1, 1));
+    }
+
+    fn broadcast_rows(&mut self, src: &DeviceVec, dst: &DeviceVec, rows: usize, c: usize, stride: usize, at: usize) {
+        assert!(src.len >= c && at + c <= stride && dst.len >= rows * stride, "chain: a broadcast of {c} into {rows} rows");
+        let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
+        let n = (rows * c) as u32;
+        self.dispatch_wide("chain-broadcast-rows", BROADCAST_ROWS, [buffer(src), &d, &d, &d, &d, &d, buffer(dst), &drw], &[rows as u32, c as u32, stride as u32, at as u32], grid(n.div_ceil(256)));
     }
 
     fn leaky_relu(&mut self, x: &DeviceVec, out: &DeviceVec, len: usize, slope: f32) {
@@ -4393,8 +4772,8 @@ impl ChainRecorder for Recorder<'_> {
 
     fn matmul_f16_rows(&mut self, w: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize) {
         assert!(k % 2 == 0 && w.len * 2 >= n * k && x.len >= rows * k && y.len >= rows * n, "chain: an f16 matmul [{n}, {k}] of {rows} rows");
-        // (the tensor cores take a million rows, a grid's 65,535 tiles; the other kernels a grid's 65,535 rows)
-        assert!(n <= 65535 && (rows <= 65535 || self.gpu().device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)), "chain: an f16 matmul [{n}, {k}] of {rows} rows");
+        // (the tiled kernels take a grid's 65,535 tiles of rows: 64 rows each, the tensor cores' 32)
+        assert!(n <= 65535 && rows.div_ceil(64) <= 65535, "chain: an f16 matmul [{n}, {k}] of {rows} rows");
         if rows == 1 {
             // a long row a workgroup (as the f32 one sums it); short ones eight threads each, 32 a workgroup
             if k >= 2048 && k % 4 == 0 {
@@ -4428,7 +4807,7 @@ impl ChainRecorder for Recorder<'_> {
     }
 
     fn matmul_f32_rows(&mut self, w: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize) {
-        assert!(w.len >= n * k && x.len >= rows * k && y.len >= rows * n && n <= 65535 && rows <= 65535, "chain: an f32 matmul [{n}, {k}] of {rows} rows");
+        assert!(w.len >= n * k && x.len >= rows * k && y.len >= rows * n && n <= 65535 && rows.div_ceil(64) <= 65535, "chain: an f32 matmul [{n}, {k}] of {rows} rows");
         if rows == 1 {
             let pipeline = if k % 4 == 0 { self.gpu().named_pipeline("chain-matvec-f32-4", || MATVEC_F32_4.to_string()) } else { self.named("chain-matmul-f32", MATMUL_F32) };
             self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(y), &[n as u32, k as u32], (n as u32, 1, 1));
@@ -5635,6 +6014,216 @@ mod tests {
             let got: Vec<f32> = rec.finish().pop().unwrap().iter().flat_map(|w| [half::f16::from_bits(w.to_bits() as u16).to_f32(), half::f16::from_bits((w.to_bits() >> 16) as u16).to_f32()]).collect();
             for (i, (g, w)) in got.iter().zip(&want).enumerate() {
                 assert!((g - w).abs() <= 1e-3 * w.abs() + 1e-6, "{rows}x{cols} rotated {rotation}: [{i}] {g} against {w}");
+            }
+        }
+    }
+
+    /// BiRefNet's ops as the host computes them: Swin's windows there and back (shifted and not, padded), its window
+    /// attention (relative bias, the shifted windows' mask), a bilinear resize with the corners aligned, a picture as
+    /// patches, a modulated deformable convolution's taps, a column's mean, a broadcast, and a 7x7 convolution.
+    #[test]
+    fn birefnets_ops_are_the_hosts() {
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        let mut r = rng(127);
+        let close = |got: &[f32], want: &[f32], what: &str| {
+            assert_eq!(got.len(), want.len(), "{what}: lengths");
+            for (i, (g, w)) in got.iter().zip(want).enumerate() {
+                assert!((g - w).abs() <= 1e-4 * (1.0 + w.abs()), "{what} [{i}]: {g} against {w}");
+            }
+        };
+        // windows of 4 over 6x7 tokens of 5 (padded to 8x8), shifted by 2 and not
+        let (h, w, c, win) = (6usize, 7usize, 5usize, 4usize);
+        let (hp, wp) = (8usize, 8usize);
+        let x: Vec<f32> = (0..h * w * c).map(|_| r()).collect();
+        let xd = b.vec(x.len());
+        DeviceChain::upload(&b, &xd, &x);
+        for shift in [0usize, 2] {
+            let mut want = vec![0f32; hp * wp * c];
+            for (i, v) in want.iter_mut().enumerate() {
+                let (ch, tok) = (i % c, i / c);
+                let (wdx, t) = (tok / (win * win), tok % (win * win));
+                let py = ((wdx / (wp / win)) * win + t / win + shift) % hp;
+                let px = ((wdx % (wp / win)) * win + t % win + shift) % wp;
+                if py < h && px < w {
+                    *v = x[(py * w + px) * c + ch];
+                }
+            }
+            let (wd, acc) = (b.vec(hp * wp * c), b.vec(h * w * c));
+            DeviceChain::upload(&b, &acc, &vec![1.0; h * w * c]);
+            let mut rec = b.begin();
+            rec.window_rows(&xd, &wd, h, w, c, win, shift);
+            rec.read(&wd);
+            rec.unwindow_add_rows(&wd, &acc, h, w, c, win, shift);
+            rec.read(&acc);
+            let got = rec.finish();
+            close(&got[0], &want, &format!("windows shifted {shift}"));
+            close(&got[1], &x.iter().map(|v| v + 1.0).collect::<Vec<_>>(), &format!("windows back shifted {shift}"));
+        }
+        // window attention: 2 heads of 32 over those windows' tokens, shifted and not
+        let heads = 2usize;
+        let cc = heads * 32;
+        let n = win * win;
+        let qkv: Vec<f32> = (0..hp * wp * 3 * cc).map(|_| r()).collect();
+        let table: Vec<f32> = (0..(2 * win - 1) * (2 * win - 1) * heads).map(|_| r()).collect();
+        let (qd, td, od) = (b.vec(qkv.len()), b.vec(table.len()), b.vec(hp * wp * cc));
+        DeviceChain::upload(&b, &qd, &qkv);
+        DeviceChain::upload(&b, &td, &table);
+        let scale = 1.0 / 32f32.sqrt();
+        for shift in [0usize, 2] {
+            let region = |i: usize, len: usize| if i < len - win { 0 } else if i < len - shift { 1 } else { 2 };
+            let mut want = vec![0f32; hp * wp * cc];
+            for wdx in 0..(hp / win) * (wp / win) {
+                let (gy, gx) = ((wdx / (wp / win)) * win, (wdx % (wp / win)) * win);
+                for head in 0..heads {
+                    for qi in 0..n {
+                        let q = &qkv[(wdx * n + qi) * 3 * cc + head * 32..][..32];
+                        let scores: Vec<f32> = (0..n)
+                            .map(|kj| {
+                                let k = &qkv[(wdx * n + kj) * 3 * cc + cc + head * 32..][..32];
+                                let mut s: f32 = q.iter().zip(k).map(|(a, b)| a * scale * b).sum();
+                                s += table[((qi / win + win - 1 - kj / win) * (2 * win - 1) + qi % win + win - 1 - kj % win) * heads + head];
+                                if shift > 0 && region(gy + qi / win, hp) * 3 + region(gx + qi % win, wp) != region(gy + kj / win, hp) * 3 + region(gx + kj % win, wp) {
+                                    s -= 100.0;
+                                }
+                                s
+                            })
+                            .collect();
+                        let m = scores.iter().fold(f32::MIN, |a, &b| a.max(b));
+                        let e: Vec<f32> = scores.iter().map(|s| (s - m).exp()).collect();
+                        let l: f32 = e.iter().sum();
+                        for d in 0..32 {
+                            want[(wdx * n + qi) * cc + head * 32 + d] = (0..n).map(|kj| e[kj] * qkv[(wdx * n + kj) * 3 * cc + 2 * cc + head * 32 + d]).sum::<f32>() / l;
+                        }
+                    }
+                }
+            }
+            let mut rec = b.begin();
+            rec.window_attention(&qd, &td, &od, h, w, heads, win, shift, scale);
+            rec.read(&od);
+            close(&rec.finish().pop().unwrap(), &want, &format!("window attention shifted {shift}"));
+        }
+        // a bilinear resize, corners aligned
+        let (h, w, c, oh, ow) = (5usize, 7usize, 3usize, 9usize, 4usize);
+        let x: Vec<f32> = (0..h * w * c).map(|_| r()).collect();
+        let at = |n_in: usize, n_out: usize, o: usize| {
+            let src = if n_out > 1 { (n_in - 1) as f32 / (n_out - 1) as f32 * o as f32 } else { 0.0 };
+            let i0 = (src as usize).min(n_in - 1);
+            (i0, (i0 + 1).min(n_in - 1), src - i0 as f32)
+        };
+        let want: Vec<f32> = (0..oh * ow * c)
+            .map(|i| {
+                let (ch, ox, oy) = (i % c, (i / c) % ow, i / (c * ow));
+                let ((y0, y1, fy), (x0, x1, fx)) = (at(h, oh, oy), at(w, ow, ox));
+                let v = |y: usize, xx: usize| x[(y * w + xx) * c + ch];
+                (1.0 - fy) * ((1.0 - fx) * v(y0, x0) + fx * v(y0, x1)) + fy * ((1.0 - fx) * v(y1, x0) + fx * v(y1, x1))
+            })
+            .collect();
+        let (xd, yd) = (b.vec(x.len()), b.vec(want.len()));
+        DeviceChain::upload(&b, &xd, &x);
+        let mut rec = b.begin();
+        rec.resize_bilinear_rows(&xd, &yd, h, w, c, oh, ow);
+        rec.read(&yd);
+        close(&rec.finish().pop().unwrap(), &want, "a bilinear resize");
+        // a picture of 8 as patches of 4
+        let (s, c, size) = (8usize, 3usize, 4usize);
+        let g = s / size;
+        let x: Vec<f32> = (0..s * s * c).map(|_| r()).collect();
+        let want: Vec<f32> = (0..s * s * c)
+            .map(|i| {
+                let (oc, pix) = (i % (c * g * g), i / (c * g * g));
+                let (ch, hg, wg) = (oc / (g * g), (oc / g) % g, oc % g);
+                x[((hg * size + pix / size) * s + wg * size + pix % size) * c + ch]
+            })
+            .collect();
+        let (xd, yd) = (b.vec(x.len()), b.vec(want.len()));
+        DeviceChain::upload(&b, &xd, &x);
+        let mut rec = b.begin();
+        rec.blocks_to_channels_rows(&xd, &yd, s, c, size);
+        rec.read(&yd);
+        close(&rec.finish().pop().unwrap(), &want, "patches");
+        // a deformable 3x3's taps for pixels 5..30 of a 6x7 image of 4 channels
+        let (h, w, c, k, first, pixels) = (6usize, 7usize, 4usize, 3usize, 5usize, 25usize);
+        let kk = k * k;
+        let x: Vec<f32> = (0..h * w * c).map(|_| r()).collect();
+        let offs: Vec<f32> = (0..h * w * 2 * kk).map(|_| r() * 2.5).collect();
+        let mods: Vec<f32> = (0..h * w * kk).map(|_| r() + 1.0).collect();
+        let mut want = vec![0f32; pixels * kk * c];
+        for pi in 0..pixels {
+            let pix = first + pi;
+            for t in 0..kk {
+                let y = (pix / w) as f32 - 1.0 + (t / k) as f32 + offs[pix * 2 * kk + 2 * t];
+                let xx = (pix % w) as f32 - 1.0 + (t % k) as f32 + offs[pix * 2 * kk + 2 * t + 1];
+                if y <= -1.0 || y >= h as f32 || xx <= -1.0 || xx >= w as f32 {
+                    continue;
+                }
+                let (y0, x0) = (y.floor(), xx.floor());
+                let (ly, lx) = (y - y0, xx - x0);
+                for ch in 0..c {
+                    let mut v = 0.0;
+                    for (dy, dx, wgt) in [(0i64, 0i64, (1.0 - ly) * (1.0 - lx)), (0, 1, (1.0 - ly) * lx), (1, 0, ly * (1.0 - lx)), (1, 1, ly * lx)] {
+                        let (yy, xc) = (y0 as i64 + dy, x0 as i64 + dx);
+                        if yy >= 0 && xc >= 0 && (yy as usize) < h && (xc as usize) < w {
+                            v += wgt * x[(yy as usize * w + xc as usize) * c + ch];
+                        }
+                    }
+                    want[(pi * kk + t) * c + ch] = v * mods[pix * kk + t];
+                }
+            }
+        }
+        let (xd, od, md, yd) = (b.vec(x.len()), b.vec(offs.len()), b.vec(mods.len()), b.vec(want.len()));
+        DeviceChain::upload(&b, &xd, &x);
+        DeviceChain::upload(&b, &od, &offs);
+        DeviceChain::upload(&b, &md, &mods);
+        let mut rec = b.begin();
+        rec.deform_im2col_rows(&xd, &od, &md, &yd, h, w, c, k, first, pixels);
+        rec.read(&yd);
+        close(&rec.finish().pop().unwrap(), &want, "a deformable convolution's taps");
+        // a column's mean, and broadcast into rows 6 apart at 2
+        let (rows, c) = (37usize, 3usize);
+        let x: Vec<f32> = (0..rows * c).map(|_| r()).collect();
+        let mean: Vec<f32> = (0..c).map(|ch| (0..rows).map(|row| x[row * c + ch]).sum::<f32>() / rows as f32).collect();
+        let (xd, md, bd) = (b.vec(x.len()), b.vec(c), b.vec(rows * 6));
+        DeviceChain::upload(&b, &xd, &x);
+        let mut rec = b.begin();
+        rec.mean_rows(&xd, &md, rows, c);
+        rec.broadcast_rows(&md, &bd, rows, c, 6, 2);
+        rec.read(&md);
+        rec.read(&bd);
+        let got = rec.finish();
+        close(&got[0], &mean, "a mean");
+        for row in 0..rows {
+            close(&got[1][row * 6 + 2..row * 6 + 5], &mean, "a broadcast");
+        }
+        // a 7x7 convolution (16 channels to 8, 9x10 pixels)
+        let (cin, cout, h, w) = (16usize, 8usize, 9usize, 10usize);
+        let wt: Vec<f32> = (0..cout * cin * 49).map(|_| half::f16::from_f32(r() * 0.1).to_f32()).collect();
+        let x: Vec<f32> = (0..h * w * cin).map(|_| half::f16::from_f32(r()).to_f32()).collect();
+        let bias: Vec<f32> = (0..cout).map(|_| r()).collect();
+        let wd = b.conv_weights(&wt, cout, cin, 7).expect("the weights");
+        let (xd, yd, bd) = (b.vec(x.len()), b.vec(h * w * cout), b.vec(cout));
+        DeviceChain::upload(&b, &xd, &x);
+        DeviceChain::upload(&b, &bd, &bias);
+        let mut rec = b.begin();
+        rec.conv_rows(&wd, &bd, cout, cin, 7, &xd, h, w, &yd);
+        rec.read(&yd);
+        let got = rec.finish().pop().unwrap();
+        for py in 0..h {
+            for px in 0..w {
+                for co in 0..cout {
+                    let mut want = bias[co] as f64;
+                    for ch in 0..cin {
+                        for ky in 0..7 {
+                            for kx in 0..7 {
+                                let (iy, ix) = (py as isize + ky as isize - 3, px as isize + kx as isize - 3);
+                                if iy >= 0 && ix >= 0 && (iy as usize) < h && (ix as usize) < w {
+                                    want += wt[((co * cin + ch) * 7 + ky) * 7 + kx] as f64 * x[(iy as usize * w + ix as usize) * cin + ch] as f64;
+                                }
+                            }
+                        }
+                    }
+                    let g = got[(py * w + px) * cout + co] as f64;
+                    assert!((g - want).abs() <= 1e-3 * (1.0 + want.abs()), "7x7 conv at ({py}, {px}) channel {co}: {g} against {want}");
+                }
             }
         }
     }

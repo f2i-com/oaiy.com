@@ -1413,8 +1413,16 @@ pub fn coop_tiled_f16() -> String {
 /// padded to `cin_p` (32's). `Params`: k `taps cin_p`, n `cout`, m the pixels, rows `cout`, `row_bytes` the image's
 /// width, `_pad1` its height.
 pub fn coop_conv(taps: usize) -> String {
+    let seven = COOP_X_CONV3X3
+        .replace("ctap / 3u", "ctap / 7u")
+        .replace("ctap % 3u", "ctap % 7u")
+        .replace("cy >= 1u && cy <= p._pad1 && cx >= 1u && cx <= p.row_bytes", "cy >= 3u && cy < p._pad1 + 3u && cx >= 3u && cx < p.row_bytes + 3u")
+        .replace("cy - 1u", "cy - 3u")
+        .replace("cx - 1u", "cx - 3u");
     let (x_load, per) = match taps {
         27 => (COOP_X_CONV3D, 864),
+        // (a 7x7's: the 3x3's with its taps 7 a row and 3 pixels off the edge)
+        49 => (seven.as_str(), 1568),
         9 => (COOP_X_CONV3X3, 288),
         _ => (COOP_X_CONV1X1, 32),
     };

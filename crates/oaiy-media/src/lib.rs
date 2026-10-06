@@ -37,6 +37,8 @@ pub mod tts;
 pub mod sound;
 pub mod model3d;
 pub mod birefnet;
+#[cfg(feature = "webgpu")]
+pub mod birefnet_wgpu;
 pub mod esrgan;
 #[cfg(feature = "webgpu")]
 pub mod esrgan_wgpu;

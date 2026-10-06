@@ -8,8 +8,8 @@
 //!   halved, as Real-ESRGAN's own `outscale` does); a transparent picture keeps
 //!   its alpha, resized bicubic. Up to 4 megapixels in (8192 pixels a side out).
 //!
-//! `backend` "webgpu" upscales on WebGPU (any GPU: [`crate::esrgan_wgpu`]), as a worker built with WebGPU and without
-//! CUDA does unless told "cpu"; background removal stays on Candle.
+//! `backend` "webgpu" runs both on WebGPU (any GPU: [`crate::birefnet_wgpu`], [`crate::esrgan_wgpu`]), as a worker built
+//! with WebGPU and without CUDA does unless told "cpu".
 use candle_core::{Device, Result};
 use image::{imageops::FilterType, Rgba, RgbaImage};
 use oaiy_engine::json::Json;
@@ -34,7 +34,7 @@ pub struct Request {
     /// 2 or 4 (`upscale` only).
     pub scale: u32,
     pub device: usize,
-    /// Upscaling on WebGPU.
+    /// On WebGPU.
     pub webgpu: bool,
 }
 
@@ -76,6 +76,15 @@ fn event(stage: &str, current: usize, total: usize) -> Json {
     Json::obj([("stage", Json::str(stage)), ("current", Json::Int(current as i64)), ("total", Json::Int(total as i64))])
 }
 
+/// The object's matte in `rgb` with BiRefNet: on WebGPU where `r` asks, else on `dev`.
+fn matte(r: &Request, dev: &Device, rgb: &[u8], w: usize, h: usize) -> Result<Vec<u8>> {
+    #[cfg(feature = "webgpu")]
+    if r.webgpu {
+        return crate::birefnet_wgpu::WgpuBiRefNet::load(&r.model, r.device)?.matte(rgb, w, h);
+    }
+    crate::birefnet::BiRefNet::load(&r.model, dev)?.matte(rgb, w, h)
+}
+
 /// `rgb` four times larger with Real-ESRGAN: on WebGPU where `r` asks, else on `dev`.
 fn upscale(r: &Request, dev: &Device, rgb: &[u8], w: usize, h: usize, report: &mut impl FnMut(Json)) -> Result<Vec<u8>> {
     #[cfg(feature = "webgpu")]
@@ -102,8 +111,8 @@ fn device(index: usize) -> Result<Device> {
 pub fn run(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     let started = Instant::now();
     std::fs::create_dir_all(&r.output)?;
-    // (no Candle device for a WebGPU upscale: a CUDA context on the card would keep its memory)
-    let dev = if r.webgpu && r.op == Op::Upscale { Device::Cpu } else { device(r.device)? };
+    // (no Candle device for a WebGPU job: a CUDA context on the card would keep its memory)
+    let dev = if r.webgpu { Device::Cpu } else { device(r.device)? };
     let img = image::ImageReader::open(&r.image)?.with_guessed_format()?.decode().map_err(candle_core::Error::wrap)?;
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
@@ -112,8 +121,7 @@ pub fn run(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     let (out, name) = match r.op {
         Op::RemoveBackground => {
             report(event("removing_background", 0, 1));
-            let net = crate::birefnet::BiRefNet::load(&r.model, &dev)?;
-            let alpha = net.matte(&rgb, w as usize, h as usize)?;
+            let alpha = matte(r, &dev, &rgb, w as usize, h as usize)?;
             let mut out = rgba;
             for (p, a) in out.pixels_mut().zip(alpha) {
                 p[3] = a;
