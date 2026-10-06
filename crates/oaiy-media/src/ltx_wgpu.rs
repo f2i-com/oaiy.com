@@ -255,8 +255,17 @@ impl WgpuLtx {
 
     /// One attention: `xq`'s `tq` rows' queries over `xkv`'s `tk` rows (each rotated by its table where given), the
     /// heads gated, out through the output projection into `y`. `s` the scratch.
+    /// With `passthrough` the attention is its value projection (the reference's perturbation for spatio-temporal
+    /// guidance), its gate and output still applied.
     #[allow(clippy::too_many_arguments)]
-    fn attend(&self, r: &mut dyn ChainRecorder, a: &Attn, xq: &DeviceVec, tq: usize, xkv: &DeviceVec, tk: usize, rope: Option<&DeviceVec>, s: &Scratch, y: &DeviceVec) {
+    fn attend(&self, r: &mut dyn ChainRecorder, a: &Attn, xq: &DeviceVec, tq: usize, xkv: &DeviceVec, tk: usize, rope: Option<&DeviceVec>, passthrough: bool, s: &Scratch, y: &DeviceVec) {
+        if passthrough {
+            a.v.forward(r, xkv, &s.att, tk);
+            a.gate.forward(r, xq, &s.logits, tq);
+            r.head_gate_rows(&s.att, &s.logits, tq, HEADS, HD);
+            a.out.forward(r, &s.att, y, tq);
+            return;
+        }
         // (the norms take a row's width from their vectors' lengths: views of the scratch's first rows)
         let first = |v: &DeviceVec, rows: usize| DeviceVec { len: rows * D, inner: v.inner.clone() };
         a.q.forward(r, xq, &s.q, tq);
@@ -277,8 +286,10 @@ impl WgpuLtx {
     }
 
     /// The video velocity of `latent` (`tokens` rows of 128) at `sigma` over `context` (`lc` rows of `D`, the
-    /// connector's), its tokens rotated by `rope` ([`rope_table`] of [`video_positions`]): `[tokens, 128]`.
-    pub fn forward(&self, latent: &[f32], tokens: usize, context: &[f32], lc: usize, sigma: f64, rope: &[f32]) -> Result<Vec<f32>> {
+    /// connector's), its tokens rotated by `rope` ([`rope_table`] of [`video_positions`]): `[tokens, 128]`. With
+    /// `skip_self` that block's self-attention passed through (spatio-temporal guidance's perturbed pass).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward(&self, latent: &[f32], tokens: usize, context: &[f32], lc: usize, sigma: f64, rope: &[f32], skip_self: Option<usize>) -> Result<Vec<f32>> {
         if latent.len() != tokens * self.patchify.k || context.len() != lc * D || rope.len() != tokens * D {
             candle_core::bail!("an LTX step's inputs: {} latent values for {tokens} tokens, {} context for {lc}, {} rotary", latent.len(), context.len(), rope.len());
         }
@@ -306,7 +317,7 @@ impl WgpuLtx {
             None => r.copy(&self.vec(2 * D), 0, &prompt, 0, 2 * D),
         }
         self.patchify.forward(r, &lat, &x, tokens);
-        for b in &self.blocks {
+        for (i, b) in self.blocks.iter().enumerate() {
             // the block's modulation: the step's and its own table (shift, scale, gate: self-attention 0-2, the
             // feed-forward 3-5, text attention 6-8), the prompt's two rows the same
             r.copy(&modulation, 0, &mm, 0, 9 * D);
@@ -314,11 +325,11 @@ impl WgpuLtx {
             r.copy(&prompt, 0, &pm, 0, 2 * D);
             r.add(&pm, &b.prompt_table);
             r.norm_mod_rows(&x, &h, tokens, D, &mm, D, Some(0), RowNorm::Rms, EPS);
-            self.attend(r, &b.attn1, &h, tokens, &h, tokens, Some(&table), &s, &y);
+            self.attend(r, &b.attn1, &h, tokens, &h, tokens, Some(&table), skip_self == Some(i), &s, &y);
             r.add_gated_rows(&x, &y, tokens, D, &mm, 2 * D, false);
             r.norm_mod_rows(&x, &h, tokens, D, &mm, 7 * D, Some(6 * D), RowNorm::Rms, EPS);
             r.norm_mod_rows(&ctx, &cm, lc, D, &pm, D, Some(0), RowNorm::None, EPS);
-            self.attend(r, &b.attn2, &h, tokens, &cm, lc, None, &s, &y);
+            self.attend(r, &b.attn2, &h, tokens, &cm, lc, None, false, &s, &y);
             r.add_gated_rows(&x, &y, tokens, D, &mm, 8 * D, false);
             r.norm_mod_rows(&x, &h, tokens, D, &mm, 4 * D, Some(3 * D), RowNorm::Rms, EPS);
             b.ff0.forward(r, &h, &f, tokens);
@@ -369,6 +380,27 @@ mod tests {
     use super::*;
     use candle_core::DType;
 
+    /// How long a step of the WebGPU video stream takes (`--ignored --nocapture`, `OAIY_LTX_NVFP4`): a 768x512 clip of
+    /// 121 frames (16 latent frames of 16 by 24: 6,144 tokens) over the connector's 1,024 context rows.
+    #[test]
+    #[ignore = "a timing; needs LTX 2.3's NVFP4 checkpoint (OAIY_LTX_NVFP4) and a WebGPU adapter"]
+    fn measure_a_video_step() -> Result<()> {
+        let Some(path) = std::env::var_os("OAIY_LTX_NVFP4") else { return Ok(()) };
+        let (frames, h, w, fps, lc) = (16usize, 16usize, 24usize, 24usize, 1024usize);
+        let tokens = frames * h * w;
+        let latent: Vec<f32> = (0..tokens * 128).map(|i| ((i * 7919 % 2001) as f32 / 1000.0 - 1.0) * 1.5).collect();
+        let context: Vec<f32> = (0..lc * D).map(|i| (i * 104729 % 2001) as f32 / 1000.0 - 1.0).collect();
+        let mut store = Store::open(std::path::Path::new(&path), 0)?;
+        let gpu = WgpuLtx::load(&mut store, 0, |_| {})?;
+        let table = rope_table(&video_positions(frames, h, w, fps), &[20., 2048., 2048.], D, HEADS);
+        for i in 0..3 {
+            let t = std::time::Instant::now();
+            let v = gpu.forward(&latent, tokens, &context, lc, 0.7 - 0.1 * i as f64, &table, None)?;
+            eprintln!("step {i}: {:.2} s ({} values)", t.elapsed().as_secs_f64(), v.len());
+        }
+        Ok(())
+    }
+
     /// The WebGPU video stream gives the Candle one's velocity (on CUDA, BF16) on Lightricks' release (`OAIY_LTX_NVFP4`): a video
     /// of 2 latent frames by 4 by 6 and a context of 40 rows (random, as the connector's are near unit RMS) at two sigmas.
     #[test]
@@ -392,7 +424,9 @@ mod tests {
         let gpu = WgpuLtx::load(&mut store, 0, |_| {})?;
         eprintln!("WebGPU video stream loaded in {:.1} s", t.elapsed().as_secs_f64());
         let table = rope_table(&video_positions(frames, h, w, fps), &[20., 2048., 2048.], D, HEADS);
-        let got: Vec<Vec<f32>> = [0.8, 0.25].iter().map(|&sigma| gpu.forward(&latent, tokens, &context, lc, sigma, &table)).collect::<Result<_>>()?;
+        let got: Vec<Vec<f32>> = [0.8, 0.25].iter().map(|&sigma| gpu.forward(&latent, tokens, &context, lc, sigma, &table, None)).collect::<Result<_>>()?;
+        // and spatio-temporal guidance's pass, block 28's self-attention passed through
+        let stg = gpu.forward(&latent, tokens, &context, lc, 0.8, &table, Some(28))?;
         drop(gpu);
         // (Candle's LTX is BF16 throughout: its CPU has no BF16 matmul, so CUDA's device OAIY_LTX_CUDA_DEVICE, 0 else)
         #[cfg(feature = "cuda")]
@@ -413,6 +447,14 @@ mod tests {
             eprintln!("sigma {sigma}: cosine {cos:.6} (Candle's step {:.1} s)", t.elapsed().as_secs_f64());
             assert!(cos > 0.99, "sigma {sigma}: cosine {cos}");
         }
+        cpu.skip_video_self_attn = Some(28);
+        let (v, _) = cpu.forward(&lt, &ct, 0.8, &rope, 0, 0, None, |_| {})?;
+        let want = v.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        let dot: f64 = stg.iter().zip(&want).map(|(a, b)| *a as f64 * *b as f64).sum();
+        let norm = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+        let cos = dot / (norm(&stg) * norm(&want));
+        eprintln!("block 28's self-attention passed through: cosine {cos:.6}");
+        assert!(cos > 0.99, "the perturbed pass: cosine {cos}");
         Ok(())
     }
 
