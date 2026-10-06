@@ -802,6 +802,55 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+/// Space to depth, the time slots one frame's: `p[0]` the input's rows, columns and channels, `p[1]` the time slots and
+/// the rows' and columns' factors.
+const SPACE_TO_DEPTH_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(6) var<storage, read_write> y: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    let w = p[0].y;
+    let c = p[0].z;
+    let st = p[1].x;
+    let sh = p[1].y;
+    let sw = p[1].z;
+    let co = c * st * sh * sw;
+    let ow = w / sw;
+    if (i >= (p[0].x / sh) * ow * co) { return; }
+    let e = i % co;
+    let px = i / co;
+    let oy = px / ow;
+    let ox = px % ow;
+    let ch = e / (st * sh * sw);
+    let fy = (e / sw) % sh;
+    let fx = e % sw;
+    y[i] = x[((oy * sh + fy) * w + ox * sw + fx) * c + ch];
+}
+"#;
+
+/// `y[r, co] += mean(x[r, co g .. (co + 1) g])`: `p[0]` the rows, the channels in and out.
+const GROUP_MEAN_ADD_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(6) var<storage, read_write> y: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    let cin = p[0].y;
+    let cout = p[0].z;
+    if (i >= p[0].x * cout) { return; }
+    let g = cin / cout;
+    let at = (i / cout) * cin + (i % cout) * g;
+    var s = 0.0;
+    for (var e = 0u; e < g; e++) { s += x[at + e]; }
+    y[i] += s / f32(g);
+}
+"#;
+
 /// `w` (f16 pairs, `p[0].x` words) plus `d` (two f32 a word), rounded to f16.
 const ADD_F16: &str = r#"
 @group(0) @binding(0) var<storage, read> d: array<f32>;
@@ -3630,6 +3679,23 @@ impl ChainRecorder for Recorder<'_> {
         self.dispatch_wide("chain-shuffle-down-mean-add-rows", SHUFFLE_DOWN_MEAN_ADD_ROWS, [buffer(x), &dm, &dm, &dm, &dm, &dm, buffer(out), &drw], &[h as u32, w as u32, cin as u32, cout as u32, ft as u32, fs as u32], grid(n.div_ceil(256)));
     }
 
+    fn space_to_depth_rows(&mut self, x: &DeviceVec, out: &DeviceVec, h: usize, w: usize, c: usize, st: usize, sh: usize, sw: usize) {
+        let vol = st * sh * sw;
+        assert!(vol > 0 && h % sh == 0 && w % sw == 0 && x.len >= h * w * c && out.len >= h * w / (sh * sw) * c * vol, "chain: space to depth of {h}x{w} pixels of {c} by ({st}, {sh}, {sw})");
+        let dm = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        let n = (h * w / (sh * sw) * c * vol) as u32;
+        self.dispatch_wide("chain-space-to-depth-rows", SPACE_TO_DEPTH_ROWS, [buffer(x), &dm, &dm, &dm, &dm, &dm, buffer(out), &drw], &[h as u32, w as u32, c as u32, 0, st as u32, sh as u32, sw as u32], grid(n.div_ceil(256)));
+    }
+
+    fn group_mean_add_rows(&mut self, x: &DeviceVec, out: &DeviceVec, rows: usize, cin: usize, cout: usize) {
+        assert!(cout > 0 && cin % cout == 0 && x.len >= rows * cin && out.len >= rows * cout, "chain: a group mean of {rows} rows of {cin} into {cout}");
+        let dm = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        let n = (rows * cout) as u32;
+        self.dispatch_wide("chain-group-mean-add-rows", GROUP_MEAN_ADD_ROWS, [buffer(x), &dm, &dm, &dm, &dm, &dm, buffer(out), &drw], &[rows as u32, cin as u32, cout as u32], grid(n.div_ceil(256)));
+    }
+
     fn add_f16(&mut self, w: &DeviceVec, d: &DeviceVec, len: usize) {
         assert!(len % 2 == 0 && w.len * 2 >= len && d.len >= len, "chain: {len} f16 values plus f32");
         let dm = self.gpu().dummy().clone();
@@ -5020,6 +5086,58 @@ mod tests {
                         assert!((g - want).abs() < 1e-5, "shuffled mean {cin}->{cout} ({ft}, {fs}) at ({oy}, {ox}) {co}: {g} against {want}");
                     }
                 }
+            }
+        }
+    }
+
+    /// LTX's encoder's single-image packing as the host computes it: space to depth (time slots one frame's; space,
+    /// time and both) and the shortcut's group means.
+    #[test]
+    fn ltxs_encoder_ops_are_the_hosts() {
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        let mut r = rng(89);
+        let (h, w, c) = (4usize, 6usize, 3usize);
+        let x: Vec<f32> = (0..h * w * c).map(|_| r()).collect();
+        let xd = b.vec(x.len());
+        DeviceChain::upload(&b, &xd, &x);
+        for (st, sh, sw) in [(1usize, 2usize, 2usize), (2, 1, 1), (2, 2, 2)] {
+            let vol = st * sh * sw;
+            let (oh, ow) = (h / sh, w / sw);
+            let yd = b.vec(oh * ow * c * vol);
+            let mut rec = b.begin();
+            rec.space_to_depth_rows(&xd, &yd, h, w, c, st, sh, sw);
+            rec.read(&yd);
+            let got = rec.finish().pop().unwrap();
+            for oy in 0..oh {
+                for ox in 0..ow {
+                    for ch in 0..c {
+                        for t in 0..st {
+                            for fy in 0..sh {
+                                for fx in 0..sw {
+                                    let e = ((ch * st + t) * sh + fy) * sw + fx;
+                                    assert_eq!(got[(oy * ow + ox) * c * vol + e], x[((oy * sh + fy) * w + ox * sw + fx) * c + ch], "space to depth ({st}, {sh}, {sw}) at ({oy}, {ox}) {e}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let (rows, cin, cout) = (7usize, 12usize, 4usize);
+        let x: Vec<f32> = (0..rows * cin).map(|_| r()).collect();
+        let base: Vec<f32> = (0..rows * cout).map(|_| r()).collect();
+        let (xd, yd) = (b.vec(x.len()), b.vec(base.len()));
+        DeviceChain::upload(&b, &xd, &x);
+        DeviceChain::upload(&b, &yd, &base);
+        let mut rec = b.begin();
+        rec.group_mean_add_rows(&xd, &yd, rows, cin, cout);
+        rec.read(&yd);
+        let got = rec.finish().pop().unwrap();
+        for row in 0..rows {
+            for co in 0..cout {
+                let g = cin / cout;
+                let want = base[row * cout + co] as f64 + (0..g).map(|e| x[row * cin + co * g + e] as f64).sum::<f64>() / g as f64;
+                assert!((got[row * cout + co] as f64 - want).abs() < 1e-5, "group mean row {row} {co}");
             }
         }
     }

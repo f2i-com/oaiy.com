@@ -250,6 +250,152 @@ impl WgpuLtxVae {
     }
 }
 
+/// LTX's video VAE's encoder on WebGPU for one image (a clip's start or end), as
+/// [`crate::ltx::vae::LtxVideoEncoder::encode_means`] computes a one-frame video: its causal 3x3x3 convolutions see the
+/// one frame through every time tap (their taps summed into 3x3 ones, the 2D convolutions'), its downsamplings' frames
+/// the one repeated (each convolution's output and its input packed space to depth, the input's groups averaged as
+/// the shortcut).
+pub struct WgpuLtxImageEncoder {
+    gpu: ggml_rs_wgpu::WgpuBackend,
+    /// Each convolution's taps summed over time (`k` by `k`, as [`DeviceChain::conv_weights`] packs them), its bias,
+    /// its channels out and in.
+    convs: HashMap<String, (DeviceVec, DeviceVec, usize, usize)>,
+    ones: HashMap<usize, DeviceVec>,
+    mean: Vec<f32>,
+    std: Vec<f32>,
+}
+
+/// The encoder's blocks in turn: residual blocks of the channels, or a downsampling by (time, rows, columns).
+const DOWN: [(usize, (usize, usize, usize)); 9] = [(4, (0, 0, 0)), (0, (1, 2, 2)), (6, (0, 0, 0)), (0, (2, 1, 1)), (4, (0, 0, 0)), (0, (2, 2, 2)), (2, (0, 0, 0)), (0, (2, 2, 2)), (2, (0, 0, 0))];
+
+impl WgpuLtxImageEncoder {
+    /// The encoder in `store` (`vae.encoder.*`, `vae.per_channel_statistics.*`: a checkpoint's, or a VAE file's own
+    /// without the `vae.`) on GPU `device` (as CUDA counts them; OAIY_WEBGPU_ADAPTER naming one instead).
+    pub fn load(store: &mut Store, device: usize) -> Result<Self> {
+        let gpu = ggml_rs_wgpu::WgpuBackend::nth(device, None).map_err(err)?;
+        let prefix = if store.index.names().any(|n| n.starts_with("vae.encoder.")) { "vae." } else { "" };
+        let names: Vec<String> = store.index.names().filter(|n| n.starts_with(&format!("{prefix}encoder.")) && n.ends_with(".conv.weight")).map(str::to_owned).collect();
+        let mut convs = HashMap::new();
+        for name in names {
+            let base = name.strip_suffix(".weight").unwrap_or(&name).to_owned();
+            let t = store.tensor_f32(&name, &Device::Cpu)?;
+            let &[cout, cin, kt, 3, 3] = t.dims() else { candle_core::bail!("{name}: a convolution of shape {:?}", t.dims()) };
+            let v = t.flatten_all()?.to_vec1::<f32>()?;
+            // the time taps summed: every one of them the one frame
+            let mut w2 = vec![0f32; cout * cin * 9];
+            for (o, taps) in w2.chunks_mut(9).enumerate() {
+                for t in 0..kt {
+                    for (j, x) in taps.iter_mut().enumerate() {
+                        *x += v[(o * kt + t) * 9 + j];
+                    }
+                }
+            }
+            let w = gpu.conv_weights(&w2, cout, cin, 3).ok_or_else(|| err(format!("{name}: no tensor cores, or a weight past f16's range")))?;
+            let bias = store.tensor_f32(&format!("{base}.bias"), &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+            let b = gpu.vec(bias.len());
+            gpu.upload(&b, &bias);
+            convs.insert(base.strip_prefix(prefix).unwrap_or(&base).to_owned(), (w, b, cout, cin));
+        }
+        let stat = |store: &mut Store, key: &str| -> Result<Vec<f32>> { store.tensor_f32(&format!("{prefix}per_channel_statistics.{key}"), &Device::Cpu)?.flatten_all()?.to_vec1::<f32>() };
+        let (std, mean) = (stat(store, "std-of-means")?, stat(store, "mean-of-means")?);
+        let mut ones = HashMap::new();
+        for c in [128usize, 256, 512, 1024] {
+            let v = gpu.vec(c);
+            gpu.upload(&v, &vec![1.0; c]);
+            ones.insert(c, v);
+        }
+        Ok(Self { gpu, convs, ones, mean, std })
+    }
+
+    fn vec(&self, len: usize) -> DeviceVec {
+        self.gpu.vec(len.max(1))
+    }
+
+    fn conv(&self, r: &mut dyn ChainRecorder, name: &str, x: &DeviceVec, h: usize, w: usize) -> Result<(DeviceVec, usize)> {
+        let (cw, b, cout, cin) = self.convs.get(name).ok_or_else(|| err(format!("missing LTX VAE convolution {name}")))?;
+        let y = self.vec(h * w * cout);
+        r.conv_rows(cw, b, *cout, *cin, 3, x, h, w, &y);
+        Ok((y, *cout))
+    }
+
+    fn norm_silu(&self, r: &mut dyn ChainRecorder, x: &DeviceVec, rows: usize, c: usize) -> Result<DeviceVec> {
+        let ones = self.ones.get(&c).ok_or_else(|| err(format!("no norm of {c} channels")))?;
+        let n = self.vec(rows * c);
+        r.rmsnorm_silu_rows(x, ones, &n, rows, EPS);
+        Ok(n)
+    }
+
+    /// The latent of an image (`rgb`: its `height` rows of `width` pixels' red, green and blue in -1..1): `[h w, 128]`
+    /// (`h` its height over 32), each channel's mean over its deviation as the transformer takes it.
+    pub fn encode(&self, rgb: &[f32], height: usize, width: usize) -> Result<Vec<f32>> {
+        if rgb.len() != height * width * 3 || height % 32 != 0 || width % 32 != 0 {
+            candle_core::bail!("an image of {} values for {width}x{height}, not whole 32 by 32 pixels", rgb.len());
+        }
+        // 4 x 4 patches into channels: a patch's (channel, its column, its row)
+        let (mut h, mut w) = (height / 4, width / 4);
+        let mut patched = vec![0f32; h * w * 48];
+        for py in 0..h {
+            for px in 0..w {
+                for c in 0..3 {
+                    for r in 0..4 {
+                        for q in 0..4 {
+                            patched[(py * w + px) * 48 + c * 16 + r * 4 + q] = rgb[((py * 4 + q) * width + px * 4 + r) * 3 + c];
+                        }
+                    }
+                }
+            }
+        }
+        let x0 = self.vec(patched.len());
+        self.gpu.upload(&x0, &patched);
+        let mut rec = self.gpu.begin();
+        rec.keep_groups(false);
+        let (mut x, mut c) = self.conv(rec.as_mut(), "encoder.conv_in.conv", &x0, h, w)?;
+        rec.finish();
+        for (i, &(res, (st, sh, sw))) in DOWN.iter().enumerate() {
+            let mut rec = self.gpu.begin();
+            rec.keep_groups(false);
+            let r = rec.as_mut();
+            if res > 0 {
+                for j in 0..res {
+                    let p = format!("encoder.down_blocks.{i}.res_blocks.{j}");
+                    let t = self.norm_silu(r, &x, h * w, c)?;
+                    let (h1, _) = self.conv(r, &format!("{p}.conv1.conv"), &t, h, w)?;
+                    let t = self.norm_silu(r, &h1, h * w, c)?;
+                    let (h2, _) = self.conv(r, &format!("{p}.conv2.conv"), &t, h, w)?;
+                    r.add(&h2, &x);
+                    x = h2;
+                }
+            } else {
+                // the convolution's output packed space to depth, plus the input's packing's groups' means
+                let vol = st * sh * sw;
+                let (y, cc) = self.conv(r, &format!("encoder.down_blocks.{i}.conv.conv"), &x, h, w)?;
+                let (oh, ow) = (h / sh, w / sw);
+                let out = self.vec(oh * ow * cc * vol);
+                r.space_to_depth_rows(&y, &out, h, w, cc, st, sh, sw);
+                let packed = self.vec(oh * ow * c * vol);
+                r.space_to_depth_rows(&x, &packed, h, w, c, st, sh, sw);
+                r.group_mean_add_rows(&packed, &out, oh * ow, c * vol, cc * vol);
+                (x, c, h, w) = (out, cc * vol, oh, ow);
+            }
+            rec.finish();
+            self.gpu.settle();
+        }
+        let mut rec = self.gpu.begin();
+        rec.keep_groups(false);
+        let r = rec.as_mut();
+        let t = self.norm_silu(r, &x, h * w, c)?;
+        let (out, co) = self.conv(r, "encoder.conv_out.conv", &t, h, w)?;
+        r.read(&out);
+        let out = rec.finish().pop().ok_or_else(|| err("the latent was not read"))?;
+        let lc = self.mean.len();
+        if co <= lc || self.std.len() != lc {
+            candle_core::bail!("the encoder gives {co} channels for a latent of {lc}");
+        }
+        // the means (all but the last channel, the logvar), less their mean over their deviation
+        Ok(out.chunks(co).flat_map(|px| px[..lc].iter().zip(self.mean.iter().zip(&self.std)).map(|(v, (m, s))| (v - m) / s)).collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +422,36 @@ mod tests {
         let t = std::time::Instant::now();
         let clip = gpu.decode_fitted(&latent, f, h, w)?;
         eprintln!("1024x1024, 121 frames: {:.2} s, {:?}", t.elapsed().as_secs_f64(), clip.dims());
+        Ok(())
+    }
+
+    /// The WebGPU image encoder gives Candle's latent (on CUDA, BF16) of an image (a 64 x 96 one, random as pixels
+    /// are not: smooth gradients and a stripe) from LTX 2.3's checkpoint (`OAIY_LTX_NVFP4`).
+    #[test]
+    #[ignore = "needs LTX 2.3's checkpoint (OAIY_LTX_NVFP4), a WebGPU adapter and CUDA (the cuda feature)"]
+    fn the_webgpu_image_encoder_is_the_candle_one() -> Result<()> {
+        let Some(path) = std::env::var_os("OAIY_LTX_NVFP4") else { return Ok(()) };
+        let (h, w) = (64usize, 96usize);
+        let rgb: Vec<f32> = (0..h * w * 3).map(|i| { let (px, c) = (i / 3, i % 3); let (y, x) = (px / w, px % w); ((y as f32 / h as f32) * 1.6 - 0.8 + if (x / 8 + c) % 3 == 0 { 0.3 } else { -0.2 } + (x as f32 * 0.07 + c as f32).sin() * 0.2).clamp(-1., 1.) }).collect();
+        let mut store = Store::open(std::path::Path::new(&path), 0)?;
+        let gpu = WgpuLtxImageEncoder::load(&mut store, 0)?;
+        let t = std::time::Instant::now();
+        let got = gpu.encode(&rgb, h, w)?;
+        eprintln!("WebGPU encode {:.3} s", t.elapsed().as_secs_f64());
+        drop(gpu);
+        #[cfg(feature = "cuda")]
+        let dev = Device::new_cuda(std::env::var("OAIY_LTX_CUDA_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0))?;
+        #[cfg(not(feature = "cuda"))]
+        let dev = Device::Cpu;
+        let encoder = crate::ltx::vae::LtxVideoEncoder::load(std::path::Path::new(&path), crate::ltx::vae::LtxVaeConfig::ltx_2_3_22b(), &dev, DType::BF16)?;
+        let video = Tensor::from_vec(rgb, (1, 1, h, w, 3), &dev)?.permute((0, 4, 1, 2, 3))?.contiguous()?.to_dtype(DType::BF16)?;
+        let want = encoder.encode_means(&video)?.permute((0, 2, 3, 4, 1))?.contiguous()?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        assert_eq!(got.len(), want.len());
+        let dot: f64 = got.iter().zip(&want).map(|(a, b)| *a as f64 * *b as f64).sum();
+        let norm = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+        let cos = dot / (norm(&got) * norm(&want));
+        eprintln!("an image's latent: cosine {cos:.6}");
+        assert!(cos > 0.999, "cosine {cos}");
         Ok(())
     }
 

@@ -418,6 +418,20 @@ pub trait ChainRecorder {
         let _ = (x, out, h, w, cin, cout, ft, fs);
         unimplemented!("a shuffled mean on this device")
     }
+    /// `out` (`[h / sh, w / sw, c st sh sw]`) `x`'s (`[h, w, c]`) space-to-depth, each output pixel's channels in turn
+    /// by channel, time slot, row and column, its `st` time slots all one frame's: LTX's encoder's packing of a single
+    /// image (its first frame repeated where time halves).
+    #[allow(clippy::too_many_arguments)]
+    fn space_to_depth_rows(&mut self, x: &DeviceVec, out: &DeviceVec, h: usize, w: usize, c: usize, st: usize, sh: usize, sw: usize) {
+        let _ = (x, out, h, w, c, st, sh, sw);
+        unimplemented!("a space to depth on this device")
+    }
+    /// `out[r, co] += ` the mean of `x[r, co g .. (co + 1) g]` (`g = cin / cout`) for `rows` rows: LTX's encoder's
+    /// shortcut, its packed input's groups averaged.
+    fn group_mean_add_rows(&mut self, x: &DeviceVec, out: &DeviceVec, rows: usize, cin: usize, cout: usize) {
+        let _ = (x, out, rows, cin, cout);
+        unimplemented!("a group mean on this device")
+    }
     /// `w` (an f16 matrix's `len` values, two to a word) plus `d`'s (f32), each sum rounded to f16: a LoRA's `B A`
     /// merged into its weight on the device.
     fn add_f16(&mut self, w: &DeviceVec, d: &DeviceVec, len: usize) {

@@ -285,9 +285,8 @@ pub struct Request {
     pub ram_bytes: u64,
     pub vram_bytes: u64,
     pub ffmpeg: PathBuf,
-    /// The text encoder, transformer and video decoder on WebGPU (`backend` "webgpu": any GPU wgpu reaches, Vulkan,
-    /// Metal or DX12): LTX 2.3's and 2.5's text- and image-to-video (start and end images encoded on the CPU), the
-    /// picture only, for now.
+    /// The text encoder, transformer, video decoder and image encoder on WebGPU (`backend` "webgpu": any GPU wgpu
+    /// reaches, Vulkan, Metal or DX12): LTX 2.3's and 2.5's text- and image-to-video, the picture only, for now.
     pub webgpu: bool,
 }
 impl Request {
@@ -722,7 +721,9 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         dev.synchronize()?;
         Ok((start, end))
     };
-    let (starting_latent, ending_latent) = if r.image.is_some() || r.end_image.is_some() {
+    let (starting_latent, ending_latent) = if r.webgpu && (r.image.is_some() || r.end_image.is_some()) {
+        webgpu_endpoints(r, stage_size, &dev, &mut report)?
+    } else if r.image.is_some() || r.end_image.is_some() {
         let encoder = vae::LtxVideoEncoder::load(
             &r.vae,
             vae::LtxVaeConfig::ltx_2_3_22b(),
@@ -1629,6 +1630,28 @@ fn recompress(ffmpeg: &std::path::Path, image: image::RgbImage, crf: u32) -> Res
         .ok_or_else(|| candle_core::Error::Msg("FFmpeg returned a short frame".into()))
 }
 
+/// The start and end images' latents (`[1, h w, 128]`) by the VAE's encoder on WebGPU.
+#[cfg(feature = "webgpu")]
+fn webgpu_endpoints(r: &Request, (width, height): (usize, usize), dev: &Device, report: &mut dyn FnMut(Json)) -> Result<(Option<Tensor>, Option<Tensor>)> {
+    let mut store = Store::open(&r.vae, 0)?;
+    let encoder = crate::ltx_vae_wgpu::WgpuLtxImageEncoder::load(&mut store, r.device)?;
+    drop(store);
+    let mut encode = |path: &Option<PathBuf>, stage: &str| -> Result<Option<Tensor>> {
+        path.as_ref()
+            .map(|path| {
+                report(event(stage, 0, 1));
+                let latent = encoder.encode(&image_values(path, (width, height), &r.ffmpeg, image_crf(r))?, height, width)?;
+                Tensor::from_vec(latent, (1, height / 32 * (width / 32), 128), dev)
+            })
+            .transpose()
+    };
+    Ok((encode(&r.image, "encoding_starting_image")?, encode(&r.end_image, "encoding_ending_image")?))
+}
+#[cfg(not(feature = "webgpu"))]
+fn webgpu_endpoints(_: &Request, _: (usize, usize), _: &Device, _: &mut dyn FnMut(Json)) -> Result<(Option<Tensor>, Option<Tensor>)> {
+    candle_core::bail!("this build has no WebGPU (the webgpu feature)")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_image(
     path: &std::path::Path,
@@ -1639,6 +1662,23 @@ fn encode_image(
     ffmpeg: &std::path::Path,
     crf: u32,
 ) -> Result<Tensor> {
+    let values = image_values(path, (width, height), ffmpeg, crf)?;
+    let pixels = Tensor::from_vec(values, (1, 1, height, width, 3), &dev)?
+        .permute((0, 4, 1, 2, 3))?
+        .contiguous()?
+        .to_dtype(dtype)?;
+    let latent = encoder
+        .encode_means(&pixels)?
+        .permute((0, 2, 3, 4, 1))?
+        .contiguous()?
+        .reshape((1, height / 32 * (width / 32), 128))?
+        .to_dtype(DType::F32)?;
+    Ok(latent)
+}
+
+/// An endpoint image's pixels as the encoder takes them: re-compressed as the clip's frames are (`crf`), resized to
+/// fill `width` by `height`, each pixel's red, green and blue in -1..1 in turn.
+fn image_values(path: &std::path::Path, (width, height): (usize, usize), ffmpeg: &std::path::Path, crf: u32) -> Result<Vec<f32>> {
     let mut reader = image::ImageReader::open(path)?
         .with_guessed_format()
         .map_err(candle_core::Error::wrap)?;
@@ -1655,22 +1695,7 @@ fn encode_image(
             image::imageops::FilterType::Lanczos3,
         )
         .to_rgb8();
-    let values: Vec<f32> = pixels
-        .as_raw()
-        .iter()
-        .map(|&v| v as f32 / 127.5 - 1.)
-        .collect();
-    let pixels = Tensor::from_vec(values, (1, 1, height, width, 3), &dev)?
-        .permute((0, 4, 1, 2, 3))?
-        .contiguous()?
-        .to_dtype(dtype)?;
-    let latent = encoder
-        .encode_means(&pixels)?
-        .permute((0, 2, 3, 4, 1))?
-        .contiguous()?
-        .reshape((1, height / 32 * (width / 32), 128))?
-        .to_dtype(DType::F32)?;
-    Ok(latent)
+    Ok(pixels.as_raw().iter().map(|&v| v as f32 / 127.5 - 1.).collect())
 }
 fn condition_endpoints(
     latent: Tensor,
