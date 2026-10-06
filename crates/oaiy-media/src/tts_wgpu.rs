@@ -509,4 +509,50 @@ mod golden {
         assert!(frames[0][0] == golden[0] && same >= 2, "greedy frames diverge at once");
         Ok(())
     }
+
+    /// A saved voice's prompt on WebGPU against the official clone run's (`clone/` under the dumps: its reference codes
+    /// and BF16 speaker embedding; OAIY_TTS_BASE, else the 1.7B Base): the prefill's rows, the trailing text row, and
+    /// the talker's states for the reference's rows.
+    #[test]
+    #[ignore = "needs Qwen3-TTS Base and the reference's dumps"]
+    fn the_webgpu_clone_prefill_is_the_references() -> Result<()> {
+        let root = std::path::PathBuf::from(std::env::var("OAIY_TTS_GOLDEN").unwrap_or_else(|_| "E:/deepseek/nrob/target/qwen-tts-golden".into())).join("clone");
+        let model = std::path::PathBuf::from(std::env::var("OAIY_TTS_BASE").unwrap_or_else(|_| "E:/models/Qwen3-TTS-12Hz-1.7B-Base".into()));
+        let f32s = |name: &str| -> Vec<f32> { std::fs::read(root.join(name)).unwrap().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect() };
+        let ints = |name: &str| -> Vec<u32> { std::fs::read(root.join(name)).unwrap().chunks_exact(4).map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u32).collect() };
+        let meta = Json::parse(&std::fs::read(root.join("meta.json"))?).map_err(candle_core::Error::wrap)?;
+        let ref_text = meta.get("ref_text").and_then(Json::as_str).unwrap_or_default();
+        let new_text = meta.get("new_text").and_then(Json::as_str).unwrap_or_default();
+        let tok = crate::tts::tokenizer(&model)?;
+        let (ref_ids, text_ids) = (oaiy_tts::text::encode(&tok, ref_text)?, oaiy_tts::text::encode(&tok, new_text)?);
+        let voice = Voice {
+            name: "golden".into(),
+            description: String::new(),
+            language: "english".into(),
+            ref_text: ref_text.into(),
+            ref_codes: ints("ref_code.i32").chunks_exact(16).map(|c| c.try_into().unwrap()).collect(),
+            speaker: f32s("spk_embedding_bf16.f32"),
+        };
+        let mut wt = WgpuTalker::load(&model, 1)?;
+        let lang = wt.language_id("english")?;
+        let h = wt.hidden;
+        let (prefill, trailing) = wt.prefill_clone(&text_ids, &ref_ids, &voice, lang)?;
+        let want = f32s("icl_prefill_in.f32");
+        let (p, t) = (cosines(&prefill, &want, h), cosines(&trailing, &f32s("icl_trailing_text.f32"), h));
+        eprintln!("clone prefill: {} rows and {}, the worst's cosine {p:.6}; the trailing row's {t:.6}", prefill.len() / h, want.len() / h);
+        assert!(prefill.len() == want.len() && trailing.len() == h && p > 0.9999 && t > 0.9999);
+        let g = &wt.gpu;
+        let n = want.len() / h;
+        let mut cache = wt.talker.cache(g, n);
+        let (xd, sd) = (g.vec(want.len()), g.vec(want.len()));
+        g.upload(&xd, &want);
+        let mut rec = g.begin();
+        wt.talker.step(g, rec.as_mut(), &xd, n, &mut cache, &sd);
+        rec.read(&sd);
+        let got = rec.finish().pop().unwrap();
+        let s = cosines(&got, &f32s("icl_prefill_out.f32"), h);
+        eprintln!("talker states: the worst row's cosine {s:.6}");
+        assert!(s > 0.99);
+        Ok(())
+    }
 }

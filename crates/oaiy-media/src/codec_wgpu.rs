@@ -482,6 +482,10 @@ impl WgpuCodec {
 mod golden {
     use super::*;
 
+    fn relative(a: &[f32], b: &[f32]) -> f64 {
+        (a.iter().zip(b).map(|(x, y)| (*x as f64 - *y as f64).powi(2)).sum::<f64>() / b.iter().map(|y| (*y as f64).powi(2)).sum::<f64>()).sqrt()
+    }
+
     /// The decoder on WebGPU against the official implementation's F32 stages for `sampled_codes.i32` (90 frames;
     /// `--ignored --nocapture`; OAIY_TTS_GOLDEN, else E:/deepseek/nrob/target/qwen-tts-golden; OAIY_TTS_MODEL, else the
     /// 1.7B VoiceDesign): each stage's relative RMS error, and the decode's time.
@@ -526,7 +530,7 @@ mod golden {
                 let c = ours.len() / steps;
                 *ours = (0..ours.len()).map(|i| ours[(i % steps) * c + i / steps]).collect();
             }
-            let e = (ours.iter().zip(&want).map(|(a, b)| (*a as f64 - *b as f64).powi(2)).sum::<f64>() / want.iter().map(|b| (*b as f64).powi(2)).sum::<f64>()).sqrt();
+            let e = relative(ours, &want);
             eprintln!("{name}: relative RMS error {e:.3e}");
             worst = worst.max(e);
         }
@@ -534,6 +538,42 @@ mod golden {
         let wave = codec.decode(&frames)?;
         eprintln!("{t} frames decoded in {:.3} s ({} samples)", started.elapsed().as_secs_f64(), wave.len());
         assert!(worst < 1e-3, "{worst}");
+        Ok(())
+    }
+
+    /// [`WgpuCodec::decode`] against Candle's decoder on the CPU (F32, the same chunks) for `sampled_codes.i32` four
+    /// times over (360 frames: a second chunk of speech behind 25 frames of context; `--ignored --nocapture`, the
+    /// folders as above): each chunk's error over the whole waveform's RMS.
+    #[test]
+    #[ignore = "needs Qwen3-TTS's speech tokenizer and the reference's dumps"]
+    fn the_webgpu_codecs_chunks_are_candles() -> Result<()> {
+        let root = std::path::PathBuf::from(std::env::var("OAIY_TTS_GOLDEN").unwrap_or_else(|_| "E:/deepseek/nrob/target/qwen-tts-golden".into()));
+        let model = std::path::PathBuf::from(std::env::var("OAIY_TTS_MODEL").unwrap_or_else(|_| "E:/models/Qwen3-TTS-12Hz-1.7B-VoiceDesign".into()));
+        let codes: Vec<u32> = std::fs::read(root.join("sampled_codes.i32"))?.chunks_exact(4).map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u32).collect();
+        let frames: Vec<[u32; 16]> = codes.chunks_exact(16).map(|c| c.try_into().unwrap()).cycle().take(4 * codes.len() / 16).collect();
+        assert!(frames.len() > CHUNK, "{} frames: one chunk", frames.len());
+        let path = model.join("speech_tokenizer").join("model.safetensors");
+        let gpu = WgpuBackend::nth(1, None).map_err(err)?;
+        let started = std::time::Instant::now();
+        let ours = WgpuCodec::load(&path, &gpu)?.decode(&frames)?;
+        eprintln!("WebGPU: loaded and decoded in {:.2} s", started.elapsed().as_secs_f64());
+        let started = std::time::Instant::now();
+        let theirs = oaiy_tts::codec::CodecDecoder::load(&path, &Device::Cpu)?.decode(&frames)?;
+        eprintln!("Candle on the CPU: {:.1} s", started.elapsed().as_secs_f64());
+        assert_eq!(ours.len(), theirs.len());
+        let split = CHUNK * SAMPLES_PER_FRAME;
+        let rms = |v: &[f32]| (v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>() / v.len() as f64).sqrt();
+        let diff: Vec<f32> = ours.iter().zip(&theirs).map(|(a, b)| a - b).collect();
+        let (first, second) = (rms(&diff[..split]) / rms(&theirs), rms(&diff[split..]) / rms(&theirs));
+        eprintln!(
+            "{} frames: relative RMS error {:.3e}; each chunk's error over the whole's RMS {first:.3e} and {second:.3e} (their own RMS {:.4} and {:.4}; the largest difference {:.2e})",
+            frames.len(),
+            relative(&ours, &theirs),
+            rms(&theirs[..split]),
+            rms(&theirs[split..]),
+            diff.iter().fold(0f32, |m, d| m.max(d.abs())),
+        );
+        assert!(first < 1e-3 && second < 1e-3, "{first} {second}");
         Ok(())
     }
 }
