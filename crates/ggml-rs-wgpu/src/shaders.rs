@@ -1306,6 +1306,24 @@ const COOP_X_CONV3X3: &str = r#"        let ctap = b / cs;
         xr2 = select(vec4<f16>(), x16[cb + 2u], cin);
         xr3 = select(vec4<f16>(), x16[cb + 3u], cin);"#;
 
+/// A 3x3x3 convolution's tokens' loads for [`coop_conv`]: as [`COOP_X_CONV3X3`]'s over a video's voxels (frames of
+/// `p._pad1` rows of `p.row_bytes`), tap `ctap` (`9 dt + 3 dy + dx`) from frame `t + dt - 1` clamped to the clip (its
+/// first and last repeated past its ends) and the pixel `(y + dy - 1, x + dx - 1)`, zeros past the frame's edge.
+const COOP_X_CONV3D: &str = r#"        let ctap = b / cs;
+        let cpix = min(t0 + lr, p.m - 1u);
+        let plane = p.row_bytes * p._pad1;
+        let cfr = cpix / plane;
+        let rem = cpix % plane;
+        let it = u32(clamp(i32(cfr) + i32(ctap / 9u) - 1, 0, i32(p.m / plane) - 1));
+        let cy = rem / p.row_bytes + (ctap / 3u) % 3u;
+        let cx = rem % p.row_bytes + ctap % 3u;
+        let cin = cy >= 1u && cy <= p._pad1 && cx >= 1u && cx <= p.row_bytes;
+        let cb = ((it * plane + select(0u, (cy - 1u) * p.row_bytes + cx - 1u, cin)) * cs * 32u + (b % cs) * 32u + lh * 16u) / 4u;
+        xr0 = select(vec4<f16>(), x16[cb], cin);
+        xr1 = select(vec4<f16>(), x16[cb + 1u], cin);
+        xr2 = select(vec4<f16>(), x16[cb + 2u], cin);
+        xr3 = select(vec4<f16>(), x16[cb + 3u], cin);"#;
+
 /// A 1x1 convolution's tokens' loads for [`coop_conv`]: as [`COOP_X_CONV3X3`]'s with one tap, the pixel's own.
 const COOP_X_CONV1X1: &str = r#"        let cpix = min(t0 + lr, p.m - 1u);
         let cb = (cpix * cs * 32u + (b % cs) * 32u + lh * 16u) / 4u;
@@ -1394,7 +1412,11 @@ pub fn coop_tiled_f16() -> String {
 /// padded to `cin_p` (32's). `Params`: k `taps cin_p`, n `cout`, m the pixels, rows `cout`, `row_bytes` the image's
 /// width, `_pad1` its height.
 pub fn coop_conv(taps: usize) -> String {
-    let (x_load, per) = if taps == 9 { (COOP_X_CONV3X3, 288) } else { (COOP_X_CONV1X1, 32) };
+    let (x_load, per) = match taps {
+        27 => (COOP_X_CONV3D, 864),
+        9 => (COOP_X_CONV3X3, 288),
+        _ => (COOP_X_CONV1X1, 32),
+    };
     let regs = format!("{COOP_F16_REGS}\n    // the steps a tap\n    let cs = p.k / {per}u;");
     f32_sums(&coop_source("@group(0) @binding(0) var<storage, read> w4: array<vec4<f16>>;", "", &regs, "", COOP_F16_LOAD, COOP_F16_STEP, x_load))
 }

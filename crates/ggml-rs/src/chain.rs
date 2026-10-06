@@ -75,6 +75,13 @@ pub trait DeviceChain: Send + Sync {
         let _ = (w, cout, cin, k);
         None
     }
+    /// A 3x3x3 convolution's weights (`[cout, cin, 3, 3, 3]`, PyTorch's) for [`ChainRecorder::conv3d_rows`]: f16, each
+    /// output's 27 taps (time, row, column) in turn, a tap's channels padded with zeros to a multiple of 32. None where
+    /// a value is past f16's range, or the device has no such kernel.
+    fn conv3d_weights(&self, w: &[f32], cout: usize, cin: usize) -> Option<DeviceVec> {
+        let _ = (w, cout, cin);
+        None
+    }
     /// An NVFP4 weight (`[rows, cols]`: `packed` two E2M1 values a byte, high nibble first, `rows x cols / 2`; `scales`
     /// one E4M3 a block of 16, row-major `rows x cols / 16`; `global` the tensor's own) for
     /// [`ChainRecorder::matmul_nvfp4_rows`]: its words, and its scale's vector. None where `cols` is not of 64 or the
@@ -399,6 +406,23 @@ pub trait ChainRecorder {
     fn matmul_nvfp4_rows(&mut self, w: &DeviceVec, scale: &DeviceVec, b: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize) {
         let _ = (w, scale, b, n, k, x, y, rows);
         unimplemented!("NVFP4 on this device")
+    }
+    /// A 3x3x3 convolution (stride 1) of a video `x` held as its voxels' rows of channels (`[frames * h * w, cin]`, a
+    /// frame after another) into `y` (`[frames * h * w, cout]`) plus the bias `b`: in time the first and last frames
+    /// repeated past the clip's ends (LTX's decoder, not causal), zeros past each frame's edge; `x` of any range (as
+    /// [`Self::conv_rows`]).
+    #[allow(clippy::too_many_arguments)]
+    fn conv3d_rows(&mut self, w: &DeviceVec, b: &DeviceVec, cout: usize, cin: usize, x: &DeviceVec, frames: usize, h: usize, wd: usize, y: &DeviceVec) {
+        let _ = (w, b, cout, cin, x, frames, h, wd, y);
+        unimplemented!("a 3D convolution on this device")
+    }
+    /// Depth to space: a video `x` (`[frames * h * w, c * st * sh * sw]`) into `out` (`[(frames * st - drop) * (h *
+    /// sh) * (w * sw), c]`), voxel `(d st + i, y sh + j, x sw + k)`'s channel `c'` the input's `(d, y, x)`'s `c' st sh
+    /// sw + i sh sw + j sw + k`; with `drop` its first frame left out (LTX's after doubling time).
+    #[allow(clippy::too_many_arguments)]
+    fn depth_to_space_rows(&mut self, x: &DeviceVec, out: &DeviceVec, frames: usize, h: usize, w: usize, c: usize, st: usize, sh: usize, sw: usize, drop: usize) {
+        let _ = (x, out, frames, h, w, c, st, sh, sw, drop);
+        unimplemented!("depth to space on this device")
     }
     /// `y[r * n + i] += b[i]` for each of `rows` rows.
     fn add_bias_rows(&mut self, y: &DeviceVec, b: &DeviceVec, rows: usize, n: usize) {

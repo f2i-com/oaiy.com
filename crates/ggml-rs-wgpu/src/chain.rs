@@ -835,6 +835,37 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+/// [`ChainRecorder::depth_to_space_rows`]: `y`'s voxel (frames of `p[1].y` rows of `p[1].z`) of `p[0].x` channels
+/// from `x`'s. `p[0]`: c, st, sh, sw; `p[1]`: the output's voxels, its rows a frame, its row's columns, the frames
+/// dropped first.
+const DEPTH_TO_SPACE_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(6) var<storage, read_write> y: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let c = p[0].x;
+    let st = p[0].y;
+    let sh = p[0].z;
+    let sw = p[0].w;
+    let oh = p[1].y;
+    let ow = p[1].z;
+    let i = id.x + id.y * 16776960u;
+    if (i >= p[1].x * c) { return; }
+    let ch = i % c;
+    let v = i / c;
+    let ox = v % ow;
+    let oy = (v / ow) % oh;
+    let ot = v / (ow * oh) + p[1].w;
+    let h = oh / sh;
+    let w = ow / sw;
+    let src = ((ot / st) * h + oy / sh) * w + ox / sw;
+    let sc = ((ch * st + ot % st) * sh + oy % sh) * sw + ox % sw;
+    y[i] = x[src * (c * st * sh * sw) + sc];
+}
+"#;
+
 /// `x[i] += b[i % p[0].x]` for `i < p[0].x * p[0].y`.
 const ADD_BIAS_ROWS: &str = r#"
 @group(0) @binding(0) var<storage, read> b: array<f32>;
@@ -2283,6 +2314,22 @@ impl DeviceChain for WgpuBackend {
         Some(v)
     }
 
+    fn conv3d_weights(&self, w: &[f32], cout: usize, cin: usize) -> Option<DeviceVec> {
+        if w.len() != cout * cin * 27 || !self.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+            return None;
+        }
+        let cp = cin.div_ceil(32) * 32;
+        let mut packed = vec![0f32; cout * 27 * cp];
+        for co in 0..cout {
+            for c in 0..cin {
+                for tap in 0..27 {
+                    packed[(co * 27 + tap) * cp + c] = w[(co * cin + c) * 27 + tap];
+                }
+            }
+        }
+        self.vec_f16_rounded(&packed)
+    }
+
     fn conv_weights(&self, w: &[f32], cout: usize, cin: usize, k: usize) -> Option<DeviceVec> {
         let taps = k * k;
         if !matches!(k, 1 | 3) || w.len() != cout * cin * taps || !self.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
@@ -3059,6 +3106,56 @@ impl Recorder<'_> {
         }
     }
 
+    /// [`ChainRecorder::conv_rows`] and [`ChainRecorder::conv3d_rows`]: `taps` 1, 9 (3x3) or 27 (3x3x3), `frames` of
+    /// `h` rows of `wd` (one frame for a picture).
+    #[allow(clippy::too_many_arguments)]
+    fn conv_taps(&mut self, w: &DeviceVec, b: &DeviceVec, cout: usize, cin: usize, taps: usize, x: &DeviceVec, frames: usize, h: usize, wd: usize, y: &DeviceVec) {
+        let cp = cin.div_ceil(32) * 32;
+        let m = frames * h * wd;
+        assert!(m > 0 && w.len * 2 >= cout * taps * cp && b.len >= cout && x.len >= m * cin && y.len >= m * cout, "chain: a convolution of {taps} taps of {frames}x{h}x{wd} voxels, {cin} channels to {cout}");
+        let d = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        // the input as f16, each pixel's channels padded to 32's: once for every convolution that reads it until
+        // something writes `x` (kept with the matmuls' tiled copies, a width of its own)
+        let key = cp | 1 << 31;
+        let xb = buffer(x).clone();
+        let x16 = match self.x16.iter().find(|(b, rows, width, _)| *b == xb && *rows == m && *width == key) {
+            Some((.., v)) => v.clone(),
+            None => {
+                // `x`'s scale for f16 (its largest within 16,384) set on the device, then the copy scaled; the scale kept
+                // beside the copy (a width of its own) for the sums' way back
+                let range = self.scratch(4);
+                let len = (m * cin) as u32;
+                self.dispatch_wide("chain-f16-range-clear", F16_RANGE_CLEAR, [&d, &d, &d, &d, &d, &d, buffer(&range), &drw], &[0], (1, 1, 1));
+                self.dispatch_wide("chain-f16-range-max", F16_RANGE_MAX, [buffer(x), &d, &d, &d, &d, &d, buffer(&range), &drw], &[len], grid(len.div_ceil(256)));
+                self.dispatch_wide("chain-f16-range-set", F16_RANGE_SET, [&d, &d, &d, &d, &d, &d, buffer(&range), &drw], &[0], (1, 1, 1));
+                let v = self.scratch(m * cp / 2);
+                let conv = self.gpu().named_pipeline("chain-x-f16-padded", || X_F16_PADDED.to_string());
+                let words = (m * cp / 2) as u32;
+                self.dispatch_kept(&conv, buffer(&range), buffer(x), buffer(&v), &[cin as u32, cp as u32, m as u32], grid(words.div_ceil(256)));
+                self.x16.push((xb.clone(), m, key, v.clone()));
+                self.x16.push((xb, m, key ^ (3 << 30), range));
+                v
+            }
+        };
+        let xb = buffer(x).clone();
+        let range = self.x16.iter().find(|(b, rows, width, _)| *b == xb && *rows == m && *width == key ^ (3 << 30)).map(|(.., v)| v.clone()).expect("a convolution's input's scale beside its copy");
+        let tile = crate::shaders::COOP_TILE;
+        let pipeline = match taps {
+            27 => self.gpu().named_pipeline("chain-coop-conv3d", || crate::shaders::coop_conv(27)),
+            9 => self.gpu().named_pipeline("chain-coop-conv3x3", || crate::shaders::coop_conv(9)),
+            _ => self.gpu().named_pipeline("chain-coop-conv1x1", || crate::shaders::coop_conv(1)),
+        };
+        let kk = taps * cp;
+        let tiles = (cout as u32).div_ceil(tile) * (m as u32).div_ceil(tile);
+        let (splits, out, parts) = self.coop_parts(tiles, kk, m, cout, y, None);
+        let words = [kk as u32, cout as u32, m as u32, 0, cout as u32, wd as u32, splits, h as u32];
+        self.dispatch_kept(&pipeline, buffer(w), buffer(&x16), &out, &words, ((cout as u32).div_ceil(tile), (m as u32).div_ceil(tile), splits));
+        self.coop_sum(parts, m, cout, y, splits);
+        // the sums back to x's range, and the bias
+        self.dispatch_wide("chain-unscale-bias-rows", UNSCALE_BIAS_ROWS, [buffer(b), buffer(&range), &d, &d, &d, &d, buffer(y), &drw], &[cout as u32, m as u32], grid(((m * cout) as u32).div_ceil(256)));
+    }
+
     /// `y[r] = W x[r]` for a prompt's rows of f16 weights (`[n, k]` two to a word) through the f32 tiled kernel (the
     /// weights read as f32), split along k where its tiles are few.
     pub(crate) fn matmul_f16_tiled(&mut self, w: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize) {
@@ -3423,48 +3520,22 @@ impl ChainRecorder for Recorder<'_> {
         self.dispatch_wide("chain-add-gated-rows", ADD_GATED_ROWS, [buffer(y), buffer(mods), &d, &d, &d, &d, buffer(x), &drw], &[n as u32, rows as u32, gate_at as u32, tanh as u32], grid(((rows * n) as u32).div_ceil(256)));
     }
 
-    fn conv_rows(&mut self, w: &DeviceVec, b: &DeviceVec, cout: usize, cin: usize, k: usize, x: &DeviceVec, h: usize, wd: usize, y: &DeviceVec) {
-        let cp = cin.div_ceil(32) * 32;
-        let m = h * wd;
-        let taps = k * k;
-        assert!(matches!(k, 1 | 3) && m > 0 && w.len * 2 >= cout * taps * cp && b.len >= cout && x.len >= m * cin && y.len >= m * cout, "chain: a {k}x{k} convolution of {h}x{wd} pixels, {cin} channels to {cout}");
+    fn conv3d_rows(&mut self, w: &DeviceVec, b: &DeviceVec, cout: usize, cin: usize, x: &DeviceVec, frames: usize, h: usize, wd: usize, y: &DeviceVec) {
+        self.conv_taps(w, b, cout, cin, 27, x, frames, h, wd, y);
+    }
+
+    fn depth_to_space_rows(&mut self, x: &DeviceVec, out: &DeviceVec, frames: usize, h: usize, w: usize, c: usize, st: usize, sh: usize, sw: usize, drop: usize) {
+        let ot = frames * st - drop;
+        let voxels = ot * h * sh * w * sw;
+        assert!(drop < frames * st && x.len >= frames * h * w * c * st * sh * sw && out.len >= voxels * c, "chain: depth to space of {frames}x{h}x{w} voxels of {c} channels by ({st}, {sh}, {sw})");
         let d = self.gpu().dummy().clone();
         let drw = self.gpu().dummy_rw().clone();
-        // the input as f16, each pixel's channels padded to 32's: once for every convolution that reads it until
-        // something writes `x` (kept with the matmuls' tiled copies, a width of its own)
-        let key = cp | 1 << 31;
-        let xb = buffer(x).clone();
-        let x16 = match self.x16.iter().find(|(b, rows, width, _)| *b == xb && *rows == m && *width == key) {
-            Some((.., v)) => v.clone(),
-            None => {
-                // `x`'s scale for f16 (its largest within 16,384) set on the device, then the copy scaled; the scale kept
-                // beside the copy (a width of its own) for the sums' way back
-                let range = self.scratch(4);
-                let len = (m * cin) as u32;
-                self.dispatch_wide("chain-f16-range-clear", F16_RANGE_CLEAR, [&d, &d, &d, &d, &d, &d, buffer(&range), &drw], &[0], (1, 1, 1));
-                self.dispatch_wide("chain-f16-range-max", F16_RANGE_MAX, [buffer(x), &d, &d, &d, &d, &d, buffer(&range), &drw], &[len], grid(len.div_ceil(256)));
-                self.dispatch_wide("chain-f16-range-set", F16_RANGE_SET, [&d, &d, &d, &d, &d, &d, buffer(&range), &drw], &[0], (1, 1, 1));
-                let v = self.scratch(m * cp / 2);
-                let conv = self.gpu().named_pipeline("chain-x-f16-padded", || X_F16_PADDED.to_string());
-                let words = (m * cp / 2) as u32;
-                self.dispatch_kept(&conv, buffer(&range), buffer(x), buffer(&v), &[cin as u32, cp as u32, m as u32], grid(words.div_ceil(256)));
-                self.x16.push((xb.clone(), m, key, v.clone()));
-                self.x16.push((xb, m, key ^ (3 << 30), range));
-                v
-            }
-        };
-        let xb = buffer(x).clone();
-        let range = self.x16.iter().find(|(b, rows, width, _)| *b == xb && *rows == m && *width == key ^ (3 << 30)).map(|(.., v)| v.clone()).expect("a convolution's input's scale beside its copy");
-        let tile = crate::shaders::COOP_TILE;
-        let pipeline = if taps == 9 { self.gpu().named_pipeline("chain-coop-conv3x3", || crate::shaders::coop_conv(9)) } else { self.gpu().named_pipeline("chain-coop-conv1x1", || crate::shaders::coop_conv(1)) };
-        let kk = taps * cp;
-        let tiles = (cout as u32).div_ceil(tile) * (m as u32).div_ceil(tile);
-        let (splits, out, parts) = self.coop_parts(tiles, kk, m, cout, y, None);
-        let words = [kk as u32, cout as u32, m as u32, 0, cout as u32, wd as u32, splits, h as u32];
-        self.dispatch_kept(&pipeline, buffer(w), buffer(&x16), &out, &words, ((cout as u32).div_ceil(tile), (m as u32).div_ceil(tile), splits));
-        self.coop_sum(parts, m, cout, y, splits);
-        // the sums back to x's range, and the bias
-        self.dispatch_wide("chain-unscale-bias-rows", UNSCALE_BIAS_ROWS, [buffer(b), buffer(&range), &d, &d, &d, &d, buffer(y), &drw], &[cout as u32, m as u32], grid(((m * cout) as u32).div_ceil(256)));
+        self.dispatch_wide("chain-depth-to-space-rows", DEPTH_TO_SPACE_ROWS, [buffer(x), &d, &d, &d, &d, &d, buffer(out), &drw], &[c as u32, st as u32, sh as u32, sw as u32, voxels as u32, (h * sh) as u32, (w * sw) as u32, drop as u32], grid(((voxels * c) as u32).div_ceil(256)));
+    }
+
+    fn conv_rows(&mut self, w: &DeviceVec, b: &DeviceVec, cout: usize, cin: usize, k: usize, x: &DeviceVec, h: usize, wd: usize, y: &DeviceVec) {
+        assert!(matches!(k, 1 | 3), "chain: a {k}x{k} convolution");
+        self.conv_taps(w, b, cout, cin, k * k, x, 1, h, wd, y);
     }
 
     fn matmul_nvfp4_rows(&mut self, w: &DeviceVec, scale: &DeviceVec, b: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize) {
@@ -4839,6 +4910,77 @@ mod tests {
         for (i, g) in got.iter().enumerate() {
             let want = q[i] * 2.0 / (1.0 + (-logits[i / hd]).exp());
             assert!((g - want).abs() < 1e-5, "gate [{i}]: {g} against {want}");
+        }
+    }
+
+    /// LTX's VAE ops as the host computes them: a 3x3x3 convolution on the tensor cores (the first and last frames
+    /// repeated past the clip's ends, zeros past each frame's edge; one frame and several, channels not of 32, inputs
+    /// past f16's range) with its bias, and depth to space (time, space and both; the first frame dropped).
+    #[test]
+    fn ltxs_vae_ops_are_the_hosts() {
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        let mut r = rng(61);
+        for (cin, cout, frames, h, w, big) in [(20usize, 36usize, 3usize, 5usize, 7usize, 1f32), (64, 40, 1, 4, 6, 1.0), (32, 8, 4, 3, 5, 300_000.0)] {
+            let wt: Vec<f32> = (0..cout * cin * 27).map(|_| half::f16::from_f32(r() * 0.1).to_f32()).collect();
+            let x: Vec<f32> = (0..frames * h * w * cin).map(|_| half::f16::from_f32(r()).to_f32() * big).collect();
+            let bias: Vec<f32> = (0..cout).map(|_| r()).collect();
+            let Some(wd) = b.conv3d_weights(&wt, cout, cin) else { return };
+            let (xd, yd, bd) = (b.vec(x.len()), b.vec(frames * h * w * cout), b.vec(cout));
+            DeviceChain::upload(&b, &xd, &x);
+            DeviceChain::upload(&b, &bd, &bias);
+            let mut rec = b.begin();
+            rec.conv3d_rows(&wd, &bd, cout, cin, &xd, frames, h, w, &yd);
+            rec.read(&yd);
+            let got = rec.finish().pop().unwrap();
+            for t in 0..frames {
+                for py in 0..h {
+                    for px in 0..w {
+                        for co in 0..cout {
+                            let mut want = bias[co] as f64;
+                            for c in 0..cin {
+                                for kt in 0..3 {
+                                    let it = (t as isize + kt as isize - 1).clamp(0, frames as isize - 1) as usize;
+                                    for ky in 0..3 {
+                                        for kx in 0..3 {
+                                            let (iy, ix) = (py as isize + ky as isize - 1, px as isize + kx as isize - 1);
+                                            if iy >= 0 && ix >= 0 && (iy as usize) < h && (ix as usize) < w {
+                                                want += wt[(((co * cin + c) * 3 + kt) * 3 + ky) * 3 + kx] as f64 * x[((it * h + iy as usize) * w + ix as usize) * cin + c] as f64;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            let g = got[((t * h + py) * w + px) * cout + co] as f64;
+                            assert!((g - want).abs() <= 1e-3 * (big as f64 + want.abs()), "3D conv {cin}->{cout} at ({t}, {py}, {px}) channel {co}: {g} against {want}");
+                        }
+                    }
+                }
+            }
+        }
+        for (st, sh, sw, drop) in [(2usize, 2usize, 2usize, 1usize), (2, 1, 1, 1), (1, 2, 2, 0)] {
+            let (frames, h, w, c) = (3usize, 2usize, 3usize, 5usize);
+            let vol = st * sh * sw;
+            let x: Vec<f32> = (0..frames * h * w * c * vol).map(|_| r()).collect();
+            let ot = frames * st - drop;
+            let out_len = ot * h * sh * w * sw * c;
+            let (xd, yd) = (b.vec(x.len()), b.vec(out_len));
+            DeviceChain::upload(&b, &xd, &x);
+            let mut rec = b.begin();
+            rec.depth_to_space_rows(&xd, &yd, frames, h, w, c, st, sh, sw, drop);
+            rec.read(&yd);
+            let got = rec.finish().pop().unwrap();
+            for o in 0..ot {
+                for oy in 0..h * sh {
+                    for ox in 0..w * sw {
+                        for ch in 0..c {
+                            let t = o + drop;
+                            let (d, i, yy, j, xx, k) = (t / st, t % st, oy / sh, oy % sh, ox / sw, ox % sw);
+                            let want = x[((d * h + yy) * w + xx) * c * vol + ch * vol + i * sh * sw + j * sw + k];
+                            assert_eq!(got[((o * h * sh + oy) * w * sw + ox) * c + ch], want, "depth to space ({st}, {sh}, {sw}) at ({o}, {oy}, {ox}) {ch}");
+                        }
+                    }
+                }
+            }
         }
     }
 
