@@ -18,6 +18,8 @@ pub mod vae_wgpu;
 #[cfg(feature = "webgpu")]
 pub mod text_wgpu;
 #[cfg(feature = "webgpu")]
+pub mod vision_wgpu;
+#[cfg(feature = "webgpu")]
 pub mod ltx_wgpu;
 #[cfg(feature = "webgpu")]
 pub mod ltx_vae_wgpu;

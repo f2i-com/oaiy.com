@@ -404,11 +404,30 @@ pub trait ChainRecorder {
         let _ = (x, y, rows, n, mods, gate_at, tanh, clean);
         unimplemented!("a gated residual on this device")
     }
+    /// `out` (`[h / 2, w / 2, c]`) the odd rows' odd columns of `x` (`[h, w, c]`): a 3x3 convolution of stride 1 so
+    /// sampled is Wan's downsampling one of stride 2 (its input padded right and below).
+    fn subsample2x_rows(&mut self, x: &DeviceVec, out: &DeviceVec, h: usize, w: usize, c: usize) {
+        let _ = (x, out, h, w, c);
+        unimplemented!("a subsampling on this device")
+    }
+    /// `out[oy, ox, co] += ` the mean of `x`'s (`[h, w, cin]`) group `co` of its space-to-depth (each output pixel's
+    /// `cin * ft * fs * fs` values in turn by channel, time slot, row and column; the time slots before the last zero):
+    /// Wan's encoder's shortcut, added to its downsampled output (`[h / fs, w / fs, cout]`).
+    #[allow(clippy::too_many_arguments)]
+    fn shuffle_down_mean_add_rows(&mut self, x: &DeviceVec, out: &DeviceVec, h: usize, w: usize, cin: usize, cout: usize, ft: usize, fs: usize) {
+        let _ = (x, out, h, w, cin, cout, ft, fs);
+        unimplemented!("a shuffled mean on this device")
+    }
     /// `w` (an f16 matrix's `len` values, two to a word) plus `d`'s (f32), each sum rounded to f16: a LoRA's `B A`
     /// merged into its weight on the device.
     fn add_f16(&mut self, w: &DeviceVec, d: &DeviceVec, len: usize) {
         let _ = (w, d, len);
         unimplemented!("an f16 matrix's sum on this device")
+    }
+    /// `out[i] = gelu(x[i])` exactly (`x (1 + erf(x / sqrt 2)) / 2`) for `i < len`: a vision tower's mergers'.
+    fn gelu_erf(&mut self, x: &DeviceVec, out: &DeviceVec, len: usize) {
+        let _ = (x, out, len);
+        unimplemented!("an exact GELU on this device")
     }
     /// `out[i] = gelu(x[i])` (the tanh approximation) for `i < len`.
     fn gelu(&mut self, x: &DeviceVec, out: &DeviceVec, len: usize) {

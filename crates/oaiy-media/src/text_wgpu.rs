@@ -331,6 +331,27 @@ mod tests {
         Ok(())
     }
 
+    /// How long a 1024x1024 reference's encoding takes on the CPU (`--ignored --nocapture`): its VAE latent and its
+    /// vision features (Candle's, F32), each.
+    #[test]
+    #[ignore = "a timing; needs Qwen Image 2.1 (OAIY_QWEN_IMAGE_BASE) and a reference image (OAIY_QWEN_IMAGE_REFERENCE)"]
+    fn measure_a_references_encoding_on_the_cpu() -> Result<()> {
+        let (Some(base), Some(image)) = (std::env::var_os("OAIY_QWEN_IMAGE_BASE").map(std::path::PathBuf::from), std::env::var_os("OAIY_QWEN_IMAGE_REFERENCE").map(std::path::PathBuf::from)) else { return Ok(()) };
+        let reference = crate::reference::Reference::load(&image, 1024)?;
+        let t = std::time::Instant::now();
+        let vae = crate::vae::Vae::load_encoder(&base, &Device::Cpu, DType::F32)?;
+        let loaded = t.elapsed().as_secs_f64();
+        let latent = vae.encode(&reference.pixels(&Device::Cpu, DType::F32)?)?;
+        eprintln!("VAE encoder: loaded {loaded:.1} s, encoded {:.1} s ({:?})", t.elapsed().as_secs_f64() - loaded, latent.dims());
+        drop(vae);
+        let t = std::time::Instant::now();
+        let vision = crate::vision::VisionEncoder::load(&base.join("text_encoder"), &Device::Cpu, DType::F32)?;
+        let loaded = t.elapsed().as_secs_f64();
+        let f = vision.encode(&reference)?;
+        eprintln!("vision encoder: loaded {loaded:.1} s, encoded {:.1} s ({} by {})", t.elapsed().as_secs_f64() - loaded, f.h, f.w);
+        Ok(())
+    }
+
     /// With a reference image (`OAIY_QWEN_IMAGE_REFERENCE`, at 512 by 512): its vision features (Candle's, on the CPU)
     /// in place of its placeholder, its tokens' three rotary axes, its deeper features added; the states and the
     /// image's span as Candle's.

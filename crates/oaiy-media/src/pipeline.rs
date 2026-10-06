@@ -384,20 +384,39 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
             .iter()
             .map(|p| Reference::load(p, r.reference_size))
             .collect::<Result<Vec<_>>>()?;
-        let encoder = Vae::load_encoder(&r.base, &dev, dtype)?;
-        for image in &images {
-            references.push((
-                encoder.encode(&image.pixels(&dev, dtype)?)?,
-                image.h / 16,
-                image.w / 16,
-            ));
+        // their latents by the VAE's encoder on WebGPU for a WebGPU job (on the CPU it took 15 s a 1024x1024 one)
+        #[cfg(feature = "webgpu")]
+        if r.webgpu {
+            let encoder = crate::vae_wgpu::WgpuVae::load_encoder(&r.base, r.device)?;
+            for image in &images {
+                references.push((encoder.encode(&image.pixels(&Device::Cpu, DType::F32)?)?, image.h / 16, image.w / 16));
+            }
         }
-        drop(encoder);
-        let vision = VisionEncoder::load(r.text_encoder.as_deref().unwrap_or(&r.base.join("text_encoder")), &dev, dtype)?;
-        for image in &images {
-            features.push(vision.encode(image)?);
+        if references.is_empty() {
+            let encoder = Vae::load_encoder(&r.base, &dev, dtype)?;
+            for image in &images {
+                references.push((
+                    encoder.encode(&image.pixels(&dev, dtype)?)?,
+                    image.h / 16,
+                    image.w / 16,
+                ));
+            }
         }
-        drop(vision);
+        let root = r.text_encoder.clone().unwrap_or_else(|| r.base.join("text_encoder"));
+        // the vision tower on WebGPU for a WebGPU job (on the CPU it took 45 s a 1024x1024 reference)
+        #[cfg(feature = "webgpu")]
+        if r.webgpu {
+            let vision = crate::vision_wgpu::WgpuVisionEncoder::load(&root, r.device)?;
+            for image in &images {
+                features.push(vision.encode(image)?);
+            }
+        }
+        if features.is_empty() {
+            let vision = VisionEncoder::load(&root, &dev, dtype)?;
+            for image in &images {
+                features.push(vision.encode(image)?);
+            }
+        }
     }
     dev.synchronize()?;
     let reference_encoding_seconds = t.elapsed().as_secs_f64();

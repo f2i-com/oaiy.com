@@ -741,6 +741,67 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
 /// `x[i] += y[i] * g` for `i < p[0].x * p[0].y` (rows of `p[0].x`), `g` `mods[p[0].z + i % p[0].x]`, its tanh where
 /// `p[0].w` is 1.
+/// `y[(oy, ox), c] = x[(2 oy + 1, 2 ox + 1), c]`: `p[0]` the input's rows, columns and channels.
+const SUBSAMPLE2X_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(6) var<storage, read_write> y: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    let h = p[0].x;
+    let w = p[0].y;
+    let c = p[0].z;
+    let ow = w / 2u;
+    if (i >= (h / 2u) * ow * c) { return; }
+    let ch = i % c;
+    let px = i / c;
+    let oy = px / ow;
+    let ox = px % ow;
+    y[i] = x[((2u * oy + 1u) * w + 2u * ox + 1u) * c + ch];
+}
+"#;
+
+/// `y[(oy, ox), co] += mean(group co)` of `x`'s space-to-depth: `p[0]` the input's rows, columns, channels in and out,
+/// `p[1]` the time slots and the spatial factor (each output pixel's `cin ft fs fs` values in turn by channel, slot, row
+/// and column, the slots before the last zero).
+const SHUFFLE_DOWN_MEAN_ADD_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(6) var<storage, read_write> y: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    let h = p[0].x;
+    let w = p[0].y;
+    let cin = p[0].z;
+    let cout = p[0].w;
+    let ft = p[1].x;
+    let fs = p[1].y;
+    let ow = w / fs;
+    if (i >= (h / fs) * ow * cout) { return; }
+    let co = i % cout;
+    let px = i / cout;
+    let oy = px / ow;
+    let ox = px % ow;
+    let per = fs * fs;
+    let g = cin * ft * per / cout;
+    var s = 0.0;
+    for (var e = co * g; e < (co + 1u) * g; e++) {
+        let t = (e / per) % ft;
+        if (t == ft - 1u) {
+            let c = e / (ft * per);
+            let fy = (e / fs) % fs;
+            let fx = e % fs;
+            s += x[((oy * fs + fy) * w + ox * fs + fx) * cin + c];
+        }
+    }
+    y[i] += s / f32(g);
+}
+"#;
+
 /// `w` (f16 pairs, `p[0].x` words) plus `d` (two f32 a word), rounded to f16.
 const ADD_F16: &str = r#"
 @group(0) @binding(0) var<storage, read> d: array<f32>;
@@ -949,6 +1010,22 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 "#;
 
 /// `y[i] = gelu(x[i])` for `i < p[0].x`, the tanh approximation (as [`GELU_MUL_SPLIT`]'s).
+/// [`GELU`] exactly: `x (1 + erf(x / sqrt 2)) / 2`, erf as Abramowitz and Stegun's 7.1.26 (within 1.5e-7).
+const GELU_ERF: &str = r#"
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    if (i < p[0].x) {
+        let g = x[i];
+        let z = abs(g) * 0.7071067811865476;
+        let t = 1.0 / (1.0 + 0.3275911 * z);
+        let poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+        let erf = sign(g) * (1.0 - poly * exp(-z * z));
+        y[i] = 0.5 * g * (1.0 + erf);
+    }
+}
+"#;
+
 const GELU: &str = r#"
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -3537,6 +3614,22 @@ impl ChainRecorder for Recorder<'_> {
         self.dispatch_wide("chain-add-gated-rows", ADD_GATED_ROWS, [buffer(y), buffer(mods), &d, &d, &d, &d, buffer(x), &drw], &words, grid(((rows * n) as u32).div_ceil(256)));
     }
 
+    fn subsample2x_rows(&mut self, x: &DeviceVec, out: &DeviceVec, h: usize, w: usize, c: usize) {
+        assert!(h % 2 == 0 && w % 2 == 0 && x.len >= h * w * c && out.len >= h * w * c / 4, "chain: subsampling {h}x{w} pixels of {c}");
+        let dm = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        let n = (h * w * c / 4) as u32;
+        self.dispatch_wide("chain-subsample2x-rows", SUBSAMPLE2X_ROWS, [buffer(x), &dm, &dm, &dm, &dm, &dm, buffer(out), &drw], &[h as u32, w as u32, c as u32], grid(n.div_ceil(256)));
+    }
+
+    fn shuffle_down_mean_add_rows(&mut self, x: &DeviceVec, out: &DeviceVec, h: usize, w: usize, cin: usize, cout: usize, ft: usize, fs: usize) {
+        assert!(fs >= 1 && ft >= 1 && h % fs == 0 && w % fs == 0 && (cin * ft * fs * fs) % cout == 0 && x.len >= h * w * cin && out.len >= h * w / (fs * fs) * cout, "chain: a shuffled mean of {h}x{w} pixels of {cin} into {cout}");
+        let dm = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        let n = (h * w / (fs * fs) * cout) as u32;
+        self.dispatch_wide("chain-shuffle-down-mean-add-rows", SHUFFLE_DOWN_MEAN_ADD_ROWS, [buffer(x), &dm, &dm, &dm, &dm, &dm, buffer(out), &drw], &[h as u32, w as u32, cin as u32, cout as u32, ft as u32, fs as u32], grid(n.div_ceil(256)));
+    }
+
     fn add_f16(&mut self, w: &DeviceVec, d: &DeviceVec, len: usize) {
         assert!(len % 2 == 0 && w.len * 2 >= len && d.len >= len, "chain: {len} f16 values plus f32");
         let dm = self.gpu().dummy().clone();
@@ -3599,6 +3692,12 @@ impl ChainRecorder for Recorder<'_> {
         let d = self.gpu().dummy().clone();
         let drw = self.gpu().dummy_rw().clone();
         self.dispatch_wide("chain-shuffle-up-add-rows", SHUFFLE_UP_ADD_ROWS, [buffer(x), &d, &d, &d, &d, &d, buffer(out), &drw], &[cin as u32, cout as u32, ft as u32, repeats as u32, h as u32, w as u32], grid(((4 * h * w * cout) as u32).div_ceil(256)));
+    }
+
+    fn gelu_erf(&mut self, x: &DeviceVec, out: &DeviceVec, len: usize) {
+        assert!(x.len >= len && out.len >= len, "chain: an exact GELU of {len}");
+        let pipeline = self.named("chain-gelu-erf", GELU_ERF);
+        self.dispatch_kept(&pipeline, buffer(x), buffer(x), buffer(out), &[len as u32], grid((len as u32).div_ceil(256)));
     }
 
     fn gelu(&mut self, x: &DeviceVec, out: &DeviceVec, len: usize) {
@@ -4870,6 +4969,88 @@ mod tests {
                     assert!((g - want).abs() <= 1e-5 * mag + 1e-5, "[{n}, {k}] of {rows} rows, row {r} output {o}: {g} against {want}");
                 }
             }
+        }
+    }
+
+    /// Wan's encoder's downsampling ops as the host computes them: the odd rows' odd columns, and the shortcut's
+    /// shuffled means (time slots before the last zero; a spatial factor of 2 and of 1).
+    #[test]
+    fn a_vae_encoders_ops_are_the_hosts() {
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        let mut r = rng(83);
+        let (h, w, c) = (6usize, 8usize, 5usize);
+        let x: Vec<f32> = (0..h * w * c).map(|_| r()).collect();
+        let (xd, yd) = (b.vec(x.len()), b.vec(x.len() / 4));
+        DeviceChain::upload(&b, &xd, &x);
+        let mut rec = b.begin();
+        rec.subsample2x_rows(&xd, &yd, h, w, c);
+        rec.read(&yd);
+        let got = rec.finish().pop().unwrap();
+        for oy in 0..h / 2 {
+            for ox in 0..w / 2 {
+                for ch in 0..c {
+                    assert_eq!(got[(oy * w / 2 + ox) * c + ch], x[((2 * oy + 1) * w + 2 * ox + 1) * c + ch], "subsampled ({oy}, {ox}) {ch}");
+                }
+            }
+        }
+        for (cin, cout, ft, fs) in [(4usize, 8usize, 2usize, 2usize), (4, 16, 1, 2), (6, 6, 1, 1), (8, 4, 2, 2)] {
+            let x: Vec<f32> = (0..h * w * cin).map(|_| r()).collect();
+            let (oh, ow) = (h / fs, w / fs);
+            let base: Vec<f32> = (0..oh * ow * cout).map(|_| r()).collect();
+            let (xd, yd) = (b.vec(x.len()), b.vec(base.len()));
+            DeviceChain::upload(&b, &xd, &x);
+            DeviceChain::upload(&b, &yd, &base);
+            let mut rec = b.begin();
+            rec.shuffle_down_mean_add_rows(&xd, &yd, h, w, cin, cout, ft, fs);
+            rec.read(&yd);
+            let got = rec.finish().pop().unwrap();
+            let g = cin * ft * fs * fs / cout;
+            for oy in 0..oh {
+                for ox in 0..ow {
+                    for co in 0..cout {
+                        let mut s = 0.0f64;
+                        for e in co * g..(co + 1) * g {
+                            let (c, t, fy, fx) = (e / (ft * fs * fs), (e / (fs * fs)) % ft, (e / fs) % fs, e % fs);
+                            if t == ft - 1 {
+                                s += x[((oy * fs + fy) * w + ox * fs + fx) * cin + c] as f64;
+                            }
+                        }
+                        let want = base[(oy * ow + ox) * cout + co] as f64 + s / g as f64;
+                        let g = got[(oy * ow + ox) * cout + co] as f64;
+                        assert!((g - want).abs() < 1e-5, "shuffled mean {cin}->{cout} ({ft}, {fs}) at ({oy}, {ox}) {co}: {g} against {want}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The exact GELU as the host's (erf by its series in f64), across a range of inputs.
+    #[test]
+    fn an_exact_gelu_is_the_hosts() {
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        // erf by its Maclaurin series (in f64 near enough to |x| 4.25; past it within 2e-9 of 1)
+        let erf = |x: f64| -> f64 {
+            if x.abs() > 4.25 {
+                return x.signum();
+            }
+            let (mut term, mut sum, mut n) = (x, x, 0.0);
+            while term.abs() > 1e-17 * sum.abs().max(1e-300) && n < 400.0 {
+                n += 1.0;
+                term *= -x * x / n;
+                sum += term / (2.0 * n + 1.0);
+            }
+            sum * 2.0 / std::f64::consts::PI.sqrt()
+        };
+        let x: Vec<f32> = (0..2001).map(|i| (i as f32 - 1000.0) / 125.0).collect();
+        let (xd, yd) = (b.vec(x.len()), b.vec(x.len()));
+        DeviceChain::upload(&b, &xd, &x);
+        let mut rec = b.begin();
+        rec.gelu_erf(&xd, &yd, x.len());
+        rec.read(&yd);
+        let got = rec.finish().pop().unwrap();
+        for (v, g) in x.iter().zip(&got) {
+            let want = 0.5 * *v as f64 * (1.0 + erf(*v as f64 / std::f64::consts::SQRT_2));
+            assert!((*g as f64 - want).abs() <= 1e-6 * (1.0 + want.abs()), "gelu({v}): {g} against {want}");
         }
     }
 
