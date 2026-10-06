@@ -2365,6 +2365,79 @@ mod dense_webgpu_timing {
         }
     }
 
+    /// A Qwen3.5 hybrid deep in a long context on one GPU (QWEN35_MODEL; QWEN35_PAST positions, 15,360 unless given):
+    /// each chunk of 512's time on the way there, then a chunk and decode steps there with each kernel's GPU time
+    /// (OAIY_CHAIN_PROFILE). QWEN35_FILLS: the way there that many times, each from an empty cache (a slow chunk the
+    /// context's, or the card's after so many seconds of work?), QWEN35_PAUSE seconds idle before each but the first.
+    #[test]
+    #[ignore = "a timing; needs a WebGPU adapter and a Qwen3.5 GGUF; run with --nocapture"]
+    fn measure_a_long_qwen35() {
+        use std::sync::Arc;
+        use std::time::Instant;
+        let path = std::env::var("QWEN35_MODEL").unwrap_or_else(|_| r"E:\models\Qwen3.8-27B-Q3_K_M.gguf".into());
+        let past: usize = std::env::var("QWEN35_PAST").ok().and_then(|v| v.parse().ok()).unwrap_or(15_360);
+        let Ok(b) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
+        let backend: Arc<dyn ggml_rs::Backend> = Arc::new(b);
+        let gguf = gguf::GgufFile::open(&path).unwrap();
+        let model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap();
+        let llama_rs::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
+        let fills: usize = std::env::var("QWEN35_FILLS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        let pause: f64 = std::env::var("QWEN35_PAUSE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.);
+        let mut kv = model.new_kv_cache(past + 1024);
+        let tokens: Vec<u32> = (0..(past + 1024) as u32).map(|i| 1000 + (i * 7919) % 20000).collect();
+        let at = std::cell::Cell::new(0usize);
+        let forward = |n: usize, kv: &mut llama_rs::KvCache| {
+            let t = Instant::now();
+            let e = m.embed_text(&tokens[at.get()..at.get() + n]);
+            let l = m.forward_embeds_positions(&e, n, kv, None).unwrap();
+            at.set(at.get() + n);
+            let _ = l.to_host();
+            t.elapsed().as_secs_f64() * 1e3
+        };
+        let kernels = |runs: f64| {
+            let k = ggml_rs_wgpu::profile::take_kernels();
+            if !k.is_empty() {
+                let all: f64 = k.iter().map(|e| e.1).sum();
+                let count: u64 = k.iter().map(|e| e.2).sum();
+                eprintln!("    every kernel: {:.2} ms ({} dispatches)", all / runs, count as f64 / runs);
+                for (name, ms, c) in k.iter().take(14) {
+                    eprintln!("    {name:<32} {:>8.2} ms ({} dispatches)", ms / runs, *c as f64 / runs);
+                }
+            }
+        };
+        for fill in 0..fills {
+            if fill > 0 {
+                std::thread::sleep(std::time::Duration::from_secs_f64(pause));
+                kv = model.new_kv_cache(past + 1024);
+                at.set(0);
+            }
+            let started = Instant::now();
+            let mut line = Vec::new();
+            for i in 0..past / 512 {
+                line.push(format!("{:.0}", forward(512, &mut kv)));
+                if i % 6 == 5 {
+                    eprintln!("chunks to {}: {} ms", (i + 1) * 512, line.join(" "));
+                    line.clear();
+                }
+            }
+            eprintln!("{past} tokens in {:.2} s", started.elapsed().as_secs_f64());
+        }
+        let _ = (ggml_rs_wgpu::profile::take_kernels(), ggml_rs_wgpu::profile::take_line());
+        let (here, ms) = (kv.len, forward(512, &mut kv));
+        eprintln!("a chunk of 512 at {here}: {ms:.1} ms; {}", ggml_rs_wgpu::profile::take_line());
+        kernels(1.);
+        let steps = 16;
+        let t = Instant::now();
+        for _ in 0..steps {
+            forward(1, &mut kv);
+        }
+        eprintln!("{steps} decode steps at {}: {:.2} ms a step; {}", kv.len, t.elapsed().as_secs_f64() * 1e3 / steps as f64, ggml_rs_wgpu::profile::take_line());
+        kernels(steps as f64);
+        let best = (0..4).map(|_| forward(4, &mut kv)).fold(f64::MAX, f64::min);
+        eprintln!("a run of 4 rows: {best:.2} ms");
+        kernels(4.);
+    }
+
     /// A Qwen3.5 hybrid's prompt over two GPUs (its later layers and head copied to the second, each chunk's first
     /// layers run as the second runs the chunk before's) answers as on the first alone: 2,148 tokens (QWEN35_MODEL),
     /// the last logits, 8 steps after and drafts with its MTP layer bit for bit, a second prompt after them too (the

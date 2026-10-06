@@ -679,6 +679,326 @@ fn attention_coop(hd: usize) -> String {
         .replace("STORES\n", &stores)
 }
 
+/// [`attention_coop`]'s attention with the keys 128 a block (`attention_coop_wide`'s kernel before its head's width is
+/// put in): a workgroup of 4 subgroups a (head `h`, 32 queries) still. A block's scores a subgroup's 32 queries by 32
+/// keys, four sums at once (a step of the head two loads of queries and two of keys for four multiplies, where the
+/// 32-key kernel's one sum took two loads a multiply and went a multiply after another); its softmax a thread a
+/// query's 32 keys, four at a time; its values a subgroup's 32 queries by a quarter of the head, a step of 16 keys two
+/// loads of weights and the quarter's of values. A fifth of the barriers a key, half the loads. `kv16` padded to 128
+/// positions (zeros: a weight of none times a value).
+const ATTENTION_COOP_WIDE: &str = r#"enable f16;
+enable wgpu_cooperative_matrix;
+struct Params { n_h: u32, n_kv: u32, past: u32, rows: u32, kv_len: u32, scale: u32, _pad0: u32, _pad1: u32, }
+@group(0) @binding(0) var<storage, read> kv16: array<f16>;
+@group(0) @binding(1) var<storage, read> q16: array<f16>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> p: Params;
+
+const HD: u32 = HEAD_DIMu;
+// a block's scores [query][key] (32 by 128) and its weights the same way as f16 (32 vec4s a query); each thread's
+// largest score and sum, for its query's 4 threads to join
+var<workgroup> s_sh: array<f32, 4096>;
+var<workgroup> p_sh: array<vec4<f16>, 1024>;
+var<workgroup> m_sh: array<f32, 128>;
+var<workgroup> l_sh: array<f32, 128>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let h = wg.x;
+    let q0 = wg.y * 32u;
+    let sg = li / 32u;
+    let kh = h / (p.n_h / p.n_kv);
+    let kvd = p.n_kv * HD;
+    let row = 2u * kvd;
+    let qs = p.n_h * HD;
+    let scale = bitcast<f32>(p.scale);
+    // the thread's query of the 32 and its 32 keys of a block
+    let tr = li / 4u;
+    let tc = (li % 4u) * 32u;
+    let sb = tr * 128u + tc;
+LIMIT
+    let blocks = (hi + 127u) / 128u;
+    let none = vec4<f32>(-3.4e38);
+    var m = -3.4e38;
+    var l = 0.0;
+    for (var kb = 0u; kb < blocks; kb++) {
+SCORES
+        // the block's largest of the thread's 32, then its sum against the largest so far
+        var bm = none;
+        for (var j = 0u; j < 32u; j += 4u) {
+            let kp = vec4<u32>(kb * 128u + tc + j) + vec4<u32>(0u, 1u, 2u, 3u);
+            let sv = vec4<f32>(s_sh[sb + j], s_sh[sb + j + 1u], s_sh[sb + j + 2u], s_sh[sb + j + 3u]) * scale;
+            bm = max(bm, select(none, sv, (kp <= vec4<u32>(qpos)) & (kp < vec4<u32>(p.kv_len))));
+        }
+        let top = max(m, max(max(bm.x, bm.y), max(bm.z, bm.w)));
+        var add = vec4<f32>(0.0);
+        for (var j = 0u; j < 32u; j += 4u) {
+            let kp = vec4<u32>(kb * 128u + tc + j) + vec4<u32>(0u, 1u, 2u, 3u);
+            let sv = vec4<f32>(s_sh[sb + j], s_sh[sb + j + 1u], s_sh[sb + j + 2u], s_sh[sb + j + 3u]) * scale;
+            add += select(vec4<f32>(0.0), exp(sv - vec4<f32>(top)), (kp <= vec4<u32>(qpos)) & (kp < vec4<u32>(p.kv_len)));
+        }
+        l = l * exp(m - top) + add.x + add.y + add.z + add.w;
+        m = top;
+        workgroupBarrier();
+    }
+    m_sh[li] = m;
+    l_sh[li] = l;
+    workgroupBarrier();
+    let r4 = tr * 4u;
+    let mq = max(max(m_sh[r4], m_sh[r4 + 1u]), max(m_sh[r4 + 2u], m_sh[r4 + 3u]));
+    var lq = 0.0;
+    for (var i = 0u; i < 4u; i++) {
+        if (l_sh[r4 + i] > 0.0) { lq += l_sh[r4 + i] * exp(m_sh[r4 + i] - mq); }
+    }
+    let inv = 1.0 / lq;
+DECLARE_O
+    for (var kb = 0u; kb < blocks; kb++) {
+SCORES
+        for (var j = 0u; j < 32u; j += 4u) {
+            let kp = vec4<u32>(kb * 128u + tc + j) + vec4<u32>(0u, 1u, 2u, 3u);
+            let sv = vec4<f32>(s_sh[sb + j], s_sh[sb + j + 1u], s_sh[sb + j + 2u], s_sh[sb + j + 3u]) * scale;
+            let e = select(vec4<f32>(0.0), exp(sv - vec4<f32>(mq)) * inv, (kp <= vec4<u32>(qpos)) & (kp < vec4<u32>(p.kv_len)));
+            p_sh[(sb + j) / 4u] = vec4<f16>(e);
+        }
+        workgroupBarrier();
+        for (var kk = 0u; kk < 128u; kk += 16u) {
+            let ia0 = kk / 4u;
+            let ia1 = (2048u + kk) / 4u;
+            let s32 = 32u;
+            let pa = coopLoadT<coop_mat16x16<f16, A>>(&p_sh[ia0], s32);
+            let pb = coopLoadT<coop_mat16x16<f16, A>>(&p_sh[ia1], s32);
+VALUES
+        }
+        workgroupBarrier();
+    }
+STORES
+}
+"#;
+
+/// [`ATTENTION_COOP_WIDE`]'s block of scores: the subgroup's 32 queries by its 32 keys of the block over the head, four
+/// sums (every index and stride a `let` of its own, for naga's SPIR-V), stored for the softmax.
+const ATTENTION_COOP_WIDE_SCORES: &str = r#"        {
+            var a00 = coop_mat16x16<f32, C>();
+            var a01 = coop_mat16x16<f32, C>();
+            var a10 = coop_mat16x16<f32, C>();
+            var a11 = coop_mat16x16<f32, C>();
+            for (var dd = 0u; dd < HD; dd += 16u) {
+                let iq0 = q0 * qs + h * HD + dd;
+                let iq1 = (q0 + 16u) * qs + h * HD + dd;
+                let ik0 = (kb * 128u + sg * 32u) * row + kh * HD + dd;
+                let ik1 = (kb * 128u + sg * 32u + 16u) * row + kh * HD + dd;
+                let qa = coopLoadT<coop_mat16x16<f16, A>>(&q16[iq0], qs);
+                let qb = coopLoadT<coop_mat16x16<f16, A>>(&q16[iq1], qs);
+                let ka = coopLoad<coop_mat16x16<f16, B>>(&kv16[ik0], row);
+                let kc = coopLoad<coop_mat16x16<f16, B>>(&kv16[ik1], row);
+                a00 = coopMultiplyAdd(qa, ka, a00);
+                a01 = coopMultiplyAdd(qa, kc, a01);
+                a10 = coopMultiplyAdd(qb, ka, a10);
+                a11 = coopMultiplyAdd(qb, kc, a11);
+            }
+            let io00 = sg * 32u;
+            let io01 = sg * 32u + 16u;
+            let io10 = 2048u + sg * 32u;
+            let io11 = 2048u + sg * 32u + 16u;
+            let s128 = 128u;
+            coopStoreT(a00, &s_sh[io00], s128);
+            coopStoreT(a01, &s_sh[io01], s128);
+            coopStoreT(a10, &s_sh[io10], s128);
+            coopStoreT(a11, &s_sh[io11], s128);
+        }
+        workgroupBarrier();
+"#;
+
+/// [`ATTENTION_COOP_WIDE`] for a head `hd` wide (64, 128 or 256: a subgroup's quarter of it `hd / 64` fragments), every
+/// query over every position with `full` (no causal mask).
+fn attention_coop_wide(hd: usize, full: bool) -> String {
+    let frags = hd / 64;
+    let declare: String = (0..2).flat_map(|q| (0..frags).map(move |f| format!("    var o{q}_{f} = coop_mat16x16<f32, C>();\n"))).collect();
+    let values: String = (0..frags)
+        .map(|f| {
+            format!(
+                "            {{\n                let ib = (kb * 128u + kk) * row + kvd + kh * HD + sg * (HD / 4u) + {f}u * 16u;\n                let vb = coopLoadT<coop_mat16x16<f16, B>>(&kv16[ib], row);\n                o0_{f} = coopMultiplyAdd(pa, vb, o0_{f});\n                o1_{f} = coopMultiplyAdd(pb, vb, o1_{f});\n            }}\n"
+            )
+        })
+        .collect();
+    let stores: String = (0..2)
+        .flat_map(|q| (0..frags).map(move |f| format!("    {{\n        let io = (q0 + {q}u * 16u) * qs + h * HD + sg * (HD / 4u) + {f}u * 16u;\n        coopStoreT(o{q}_{f}, &y[io], qs);\n    }}\n")))
+        .collect();
+    let limit = if full {
+        "    // every position, the last query's and the first's alike\n    let qpos = p.kv_len;\n    let hi = p.kv_len;"
+    } else {
+        "    let qpos = p.past + q0 + tr;\n    // the blocks the last query sees\n    let hi = min(p.kv_len, p.past + q0 + 32u);"
+    };
+    ATTENTION_COOP_WIDE
+        .replace("HEAD_DIM", &hd.to_string())
+        .replace("LIMIT", limit)
+        .replace("SCORES\n", ATTENTION_COOP_WIDE_SCORES)
+        .replace("DECLARE_O\n", &declare)
+        .replace("VALUES\n", &values)
+        .replace("STORES\n", &stores)
+}
+
+/// A prompt's (or a diffusion's) attention on the tensor cores in one pass over the keys (`attention_coop_one`'s
+/// kernel before its head's width is put in): [`ATTENTION_COOP_WIDE`]'s blocks of 128 keys, each block's scores made
+/// once. A query's weights are `exp(score - c)` against a reference `c` of its own, its first block's largest score:
+/// a later block's largest more than 8 past it makes that the reference, and the query's sums so far (its row of the
+/// values' sums, and its weights' sum) are scaled down to it. The tensor cores' sums cannot be scaled a row each
+/// where they are, so a workgroup with such a query stores its sums to the output, scales the rows there and loads
+/// them back (rare: a block where some query's largest score grew by more than 8); at the end the sums are stored and
+/// each row divided by its weights' sum the same way. The scores twice was 8.1 of a layer's 18.5 ms (2,048 queries
+/// over 15,360 positions), the exponentials none of it.
+const ATTENTION_COOP_ONE: &str = r#"enable f16;
+enable wgpu_cooperative_matrix;
+struct Params { n_h: u32, n_kv: u32, past: u32, rows: u32, kv_len: u32, scale: u32, _pad0: u32, _pad1: u32, }
+@group(0) @binding(0) var<storage, read> kv16: array<f16>;
+@group(0) @binding(1) var<storage, read> q16: array<f16>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> p: Params;
+
+const HD: u32 = HEAD_DIMu;
+// a block's scores [query][key] (32 by 128) and its weights the same way as f16 (32 vec4s a query); each thread's
+// largest score of the block (then, at the end, its sum), whether its query's reference moved, and whether any did
+var<workgroup> s_sh: array<f32, 4096>;
+var<workgroup> p_sh: array<vec4<f16>, 1024>;
+var<workgroup> m_sh: array<f32, 128>;
+var<workgroup> n_sh: array<f32, 128>;
+var<workgroup> moved: u32;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let h = wg.x;
+    let q0 = wg.y * 32u;
+    let sg = li / 32u;
+    let kh = h / (p.n_h / p.n_kv);
+    let kvd = p.n_kv * HD;
+    let row = 2u * kvd;
+    let qs = p.n_h * HD;
+    let scale = bitcast<f32>(p.scale);
+    // the thread's query of the 32, its 32 keys of a block, and its quarter of the query's row of the output
+    let tr = li / 4u;
+    let tc = (li % 4u) * 32u;
+    let sb = tr * 128u + tc;
+    let r4 = tr * 4u;
+    let yb = (q0 + tr) * qs + h * HD + (li % 4u) * (HD / 4u);
+LIMIT
+    let blocks = (hi + 127u) / 128u;
+    let none = vec4<f32>(-3.4e38);
+    // the query's reference (none yet) and the thread's keys' weights' sum against it
+    var c = -3.4e38;
+    var l = 0.0;
+DECLARE_O
+    for (var kb = 0u; kb < blocks; kb++) {
+SCORES
+        // the thread's 32 scores of the block (those the query does not see none), and their largest
+LOAD_S
+        m_sh[li] = max(max(bm.x, bm.y), max(bm.z, bm.w));
+        workgroupBarrier();
+        // the block's largest for the query: its first is the reference, one more than 8 past the reference the new
+        // one, what is summed so far scaled down to it
+        let bq = max(max(m_sh[r4], m_sh[r4 + 1u]), max(m_sh[r4 + 2u], m_sh[r4 + 3u]));
+        var factor = 1.0;
+        if (bq > -1.0e38) {
+            if (c < -1.0e38) {
+                c = bq;
+            } else if (bq > c + 8.0) {
+                factor = exp(c - bq);
+                c = bq;
+            }
+        }
+        l *= factor;
+        n_sh[li] = 1.0 - factor;
+        // (a query that has seen no key yet: no weights)
+        let on = select(0.0, 1.0, c > -1.0e38);
+        var add = vec4<f32>(0.0);
+WEIGHTS
+        l += add.x + add.y + add.z + add.w;
+        workgroupBarrier();
+        if (li == 0u) {
+            var any = 0.0;
+            for (var i = 0u; i < 128u; i += 4u) { any += n_sh[i]; }
+            moved = select(0u, 1u, any > 0.0);
+        }
+        let go = workgroupUniformLoad(&moved);
+        if (go != 0u) {
+STORES
+            storageBarrier();
+            workgroupBarrier();
+            if (factor != 1.0) {
+                for (var d = 0u; d < HD / 4u; d++) { y[yb + d] = y[yb + d] * factor; }
+            }
+            storageBarrier();
+            workgroupBarrier();
+RELOADS
+        }
+        for (var kk = 0u; kk < 128u; kk += 16u) {
+            let ia0 = kk / 4u;
+            let ia1 = (2048u + kk) / 4u;
+            let s32 = 32u;
+            let pa = coopLoadT<coop_mat16x16<f16, A>>(&p_sh[ia0], s32);
+            let pb = coopLoadT<coop_mat16x16<f16, A>>(&p_sh[ia1], s32);
+VALUES
+        }
+        workgroupBarrier();
+    }
+    // the query's weights' sum (its 4 threads': one reference), and its row over it
+    m_sh[li] = l;
+    workgroupBarrier();
+    let lq = m_sh[r4] + m_sh[r4 + 1u] + m_sh[r4 + 2u] + m_sh[r4 + 3u];
+    let inv = 1.0 / max(lq, 1.0e-30);
+STORES
+    storageBarrier();
+    workgroupBarrier();
+    for (var d = 0u; d < HD / 4u; d++) { y[yb + d] = y[yb + d] * inv; }
+}
+"#;
+
+/// [`ATTENTION_COOP_ONE`] for a head `hd` wide (64, 128 or 256), every query over every position with `full`.
+fn attention_coop_one(hd: usize, full: bool) -> String {
+    let frags = hd / 64;
+    let declare: String = (0..2).flat_map(|q| (0..frags).map(move |f| format!("    var o{q}_{f} = coop_mat16x16<f32, C>();\n"))).collect();
+    let values: String = (0..frags)
+        .map(|f| {
+            format!(
+                "            {{\n                let ib = (kb * 128u + kk) * row + kvd + kh * HD + sg * (HD / 4u) + {f}u * 16u;\n                let vb = coopLoadT<coop_mat16x16<f16, B>>(&kv16[ib], row);\n                o0_{f} = coopMultiplyAdd(pa, vb, o0_{f});\n                o1_{f} = coopMultiplyAdd(pb, vb, o1_{f});\n            }}\n"
+            )
+        })
+        .collect();
+    // (a subgroup's sums' places in the output: its 32 queries' rows, its quarter of the head)
+    let place = |q: usize, f: usize| format!("(q0 + {q}u * 16u) * qs + h * HD + sg * (HD / 4u) + {f}u * 16u");
+    let stores: String = (0..2).flat_map(|q| (0..frags).map(move |f| (q, f))).map(|(q, f)| format!("    {{\n        let io = {};\n        coopStoreT(o{q}_{f}, &y[io], qs);\n    }}\n", place(q, f))).collect();
+    let reloads: String = (0..2).flat_map(|q| (0..frags).map(move |f| (q, f))).map(|(q, f)| format!("    {{\n        let io = {};\n        o{q}_{f} = coopLoadT<coop_mat16x16<f32, C>>(&y[io], qs);\n    }}\n", place(q, f))).collect();
+    // the thread's scores four at a time, each its own name (an array of them would be memory, not registers)
+    let load: String = (0..8)
+        .map(|j| {
+            format!(
+                "        let k{j} = vec4<u32>(kb * 128u + tc + {o}u) + vec4<u32>(0u, 1u, 2u, 3u);\n        let v{j} = select(none, vec4<f32>(s_sh[sb + {o}u], s_sh[sb + {a}u], s_sh[sb + {b}u], s_sh[sb + {c}u]) * scale, (k{j} <= vec4<u32>(qpos)) & (k{j} < vec4<u32>(p.kv_len)));\n",
+                o = 4 * j,
+                a = 4 * j + 1,
+                b = 4 * j + 2,
+                c = 4 * j + 3
+            )
+        })
+        .chain(std::iter::once(format!("        let bm = {};\n", (1..8).fold("v0".to_string(), |m, j| format!("max({m}, v{j})")))))
+        .collect();
+    // (a weight as the tensor cores read it, f16, and the sum of those)
+    let weights: String = (0..8).map(|j| format!("        let w{j} = vec4<f16>(exp(v{j} - vec4<f32>(c)) * on);\n        p_sh[(sb + {o}u) / 4u] = w{j};\n        add += vec4<f32>(w{j});\n", o = 4 * j)).collect();
+    let limit = if full {
+        "    // every position, the last query's and the first's alike\n    let qpos = p.kv_len;\n    let hi = p.kv_len;"
+    } else {
+        "    let qpos = p.past + q0 + tr;\n    // the blocks the last query sees\n    let hi = min(p.kv_len, p.past + q0 + 32u);"
+    };
+    ATTENTION_COOP_ONE
+        .replace("HEAD_DIM", &hd.to_string())
+        .replace("LIMIT", limit)
+        .replace("SCORES\n", ATTENTION_COOP_WIDE_SCORES)
+        .replace("LOAD_S\n", &load)
+        .replace("WEIGHTS\n", &weights)
+        .replace("DECLARE_O\n", &declare)
+        .replace("VALUES\n", &values)
+        .replace("RELOADS\n", &reloads)
+        .replace("STORES\n", &stores)
+}
+
 /// [`attention_coop`] with no causal mask: every query over all `kv_len` positions.
 fn attention_coop_full(hd: usize) -> String {
     let causal = "    let qpos = p.past + q0 + tr;\n    // the blocks the last query sees\n    let hi = min(p.kv_len, p.past + q0 + 32u);\n";
@@ -3720,6 +4040,11 @@ fn piece_flops(gpu: &crate::Gpu) -> f64 {
     set.unwrap_or(if gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) { (1u64 << 41) as f64 } else { (1u64 << 38) as f64 })
 }
 
+/// What a dispatch's workgroup counts for in a piece's work ([`piece_flops`]), whatever its kernel: its 256 values'
+/// reads and writes, about what a thousand FLOPs a value take on the tensor cores (an elementwise op over 300 million
+/// values a seventh of a piece: some 3 ms of 20, and under a throttled memory still well short of a second).
+const WORKGROUP_FLOPS: f64 = 262_144.0;
+
 /// Dispatches a piece of a run submits ([`Recorder::finish`]'s): 128, or `OAIY_PIECE`'s.
 fn piece() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -3779,8 +4104,13 @@ impl Recorder<'_> {
     /// a run's first ops while the CPU records the rest. A later upload (`Queue::write_buffer`) lands after the pieces
     /// already submitted and before the ones after, as the recording's order has it.
     fn push(&mut self, d: Dispatch) {
+        // (each workgroup some memory's worth of work whatever its kernel: an op over a large level's values is all
+        // traffic, weighed by none, and a piece of 128 of them over a 3D decoder's 4.5 million voxels ran past the
+        // OS's 2 s once the card's power limiter had its memory throttled: a lost device)
+        let groups = d.2 .0 as f64 * d.2 .1 as f64 * d.2 .2 as f64;
         self.dispatches.push(d);
-        if self.dispatches.len() >= piece() {
+        self.weight += groups * WORKGROUP_FLOPS;
+        if self.dispatches.len() >= piece() || self.weight >= piece_flops(self.gpu()) {
             self.submit_piece();
         }
     }
@@ -4102,7 +4432,16 @@ impl Recorder<'_> {
         );
         let (q16, kv16) = self.attention_f16(q, kv, rows, kv_len, qs, row);
         let words = [n_h as u32, n_kv as u32, past as u32, rows as u32, kv_len as u32, scale.to_bits(), 0, 0];
-        let pipeline = self.gpu().named_pipeline(name, || if full { attention_coop_full(head_dim) } else { attention_coop(head_dim) });
+        // (the keys 128 a block, their scores once; OAIY_ATTENTION_PASSES=2: twice, the first pass each query's largest
+        // score and sum; OAIY_ATTENTION_NARROW: twice, the keys 32 a block)
+        static KERNEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        let kernel = *KERNEL.get_or_init(|| if std::env::var_os("OAIY_ATTENTION_NARROW").is_some() { 0 } else if std::env::var("OAIY_ATTENTION_PASSES").is_ok_and(|v| v == "2") { 2 } else { 1 });
+        let pipeline = self.gpu().named_pipeline(name, || match (kernel, full) {
+            (1, _) => attention_coop_one(head_dim, full),
+            (2, _) => attention_coop_wide(head_dim, full),
+            (_, true) => attention_coop_full(head_dim),
+            (_, false) => attention_coop(head_dim),
+        });
         self.dispatch_kept(&pipeline, buffer(&kv16), buffer(&q16), buffer(out), &words, (n_h as u32, (rows.div_ceil(32)) as u32, 1));
         self.att16 = Some((q16, kv16));
         self.weigh(4.0 * rows as f64 * kv_len as f64 * (n_h * head_dim) as f64);
@@ -4113,7 +4452,8 @@ impl Recorder<'_> {
     /// attention, each padded to 32 (the copies one pair a recording, grown as it needs: each attention's converted
     /// as it runs; put back in `att16` once used).
     fn attention_f16(&mut self, q: &DeviceVec, kv: &DeviceVec, rows: usize, kv_len: usize, qs: usize, row: usize) -> (DeviceVec, DeviceVec) {
-        let (rp, kp) = (rows.div_ceil(32) * 32, kv_len.div_ceil(32) * 32);
+        // (the keys to a block of the wide kernel's: 128)
+        let (rp, kp) = (rows.div_ceil(32) * 32, kv_len.div_ceil(128) * 128);
         let (q16, kv16) = match self.att16.take() {
             Some((a, b)) if a.len >= rp * qs / 2 && b.len >= kp * row / 2 => (a, b),
             _ => (self.scratch(rp * qs / 2), self.scratch(kp * row / 2)),
@@ -5818,11 +6158,23 @@ mod tests {
         if !b.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
             return;
         }
-        for (n_h, n_kv, hd, past, rows, spread) in [(8usize, 2usize, 64usize, 300usize, 37usize, 1.0f32), (16, 2, 128, 0, 100, 2.0), (24, 4, 256, 214, 64, 1.0), (24, 4, 256, 1000, 150, 3.0)] {
+        // (each as it is, then with keys far past the rest planted)
+        let shapes = [(8usize, 2usize, 64usize, 300usize, 37usize, 1.0f32), (16, 2, 128, 0, 100, 2.0), (24, 4, 256, 214, 64, 1.0), (24, 4, 256, 1000, 150, 3.0)];
+        for (planted, (n_h, n_kv, hd, past, rows, spread)) in [false, true].into_iter().flat_map(|p| shapes.into_iter().map(move |s| (p, s))) {
             let (qd, row, kv_len) = (n_h * hd, 2 * n_kv * hd, past + rows);
             let mut next = rng((qd + past) as u32);
             let q: Vec<f32> = (0..rows * qd).map(|_| next() * spread).collect();
-            let cache: Vec<f32> = (0..kv_len * row).map(|_| next() * spread).collect();
+            let mut cache: Vec<f32> = (0..kv_len * row).map(|_| next() * spread).collect();
+            // (three keys late in the cache made long: a score a dozen or more past a query's largest before it, or as far
+            // under: the one-pass kernel's reference moved and its sums scaled down; f16 keeps so large a score to a
+            // hundredth, so the answers agree less closely)
+            if planted {
+                for at in [kv_len / 3, kv_len / 2 + 7, kv_len - 9] {
+                    for v in &mut cache[at * row..at * row + n_kv * hd] {
+                        *v *= 36.0 / (spread * spread);
+                    }
+                }
+            }
             let (qv, kv) = (b.vec(rows * qd), b.vec(kv_len * row));
             DeviceChain::upload(&b, &qv, &q);
             DeviceChain::upload(&b, &kv, &cache);
@@ -5841,8 +6193,9 @@ mod tests {
             let cos = dot / (norm(got) * norm(want));
             let top = want.iter().fold(0f32, |m, v| m.max(v.abs()));
             let worst = got.iter().zip(want).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
-            eprintln!("{n_h} heads ({n_kv} kv) {hd} wide, {rows} rows after {past}: cosine {cos:.7}, worst {worst:.2e} of {top:.2}");
-            assert!(cos > 0.99999 && worst <= 4e-3 * top, "{n_h} heads {hd} wide, {rows} rows after {past}: cosine {cos}, worst {worst} of {top}");
+            eprintln!("{n_h} heads ({n_kv} kv) {hd} wide, {rows} rows after {past}{}: cosine {cos:.7}, worst {worst:.2e} of {top:.2}", if planted { ", keys planted" } else { "" });
+            let (least, most) = if planted { (0.9999, 3e-2) } else { (0.99999, 4e-3) };
+            assert!(cos > least && worst <= most * top, "{n_h} heads {hd} wide, {rows} rows after {past}: cosine {cos}, worst {worst} of {top}");
         }
     }
 
@@ -5855,8 +6208,10 @@ mod tests {
         if !b.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
             return;
         }
-        let (n_h, n_kv, hd, rows) = (24usize, 4usize, 256usize, 512usize);
-        for past in [0usize, 1024, 2048, 4096] {
+        let (n_h, n_kv, hd) = (24usize, 4usize, 256usize);
+        // (OAIY_ATT_ROWS: the chunk that long)
+        let rows: usize = std::env::var("OAIY_ATT_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
+        for past in [0usize, 1024, 4096, 15360] {
             let (qd, row, kv_len) = (n_h * hd, 2 * n_kv * hd, past + rows);
             let mut next = rng(past as u32 + 5);
             let (qv, kv) = (b.vec(rows * qd), b.vec(kv_len * row));
@@ -5881,7 +6236,7 @@ mod tests {
             // each query's keys up to its own: scores (twice) and values, 2 FLOPs a multiply-add
             let pairs: f64 = (0..rows).map(|r| (past + r + 1) as f64).sum();
             let flops = 3.0 * 2.0 * pairs * (n_h * hd) as f64;
-            eprintln!("512 rows after {past}: {ms:.3} ms a layer ({:.0} TFLOPS)", flops / ms / 1e9);
+            eprintln!("{rows} rows after {past}: {ms:.3} ms a layer ({:.0} TFLOPS)", flops / ms / 1e9);
         }
     }
 
