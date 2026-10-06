@@ -118,9 +118,10 @@ pub(crate) fn image(c: &Config, selected: Option<&str>) -> Result<Config, String
     } else if selected.is_some() {
         return Err("image catalog has no named models".into());
     }
-    // Catalog-wide residency, overridable per model like every other field.
+    // Catalog-wide residency and backend (cuda, cpu or webgpu: where the worker runs the model), overridable per model
+    // like every other field.
     snapshot.image_memory = Json::Obj(
-        ["memory", "ram_gb", "vram_gb"]
+        ["memory", "ram_gb", "vram_gb", "backend"]
             .into_iter()
             .filter_map(|k| j.get(k).map(|v| (k.to_string(), v.clone())))
             .collect(),

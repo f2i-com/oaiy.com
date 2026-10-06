@@ -668,6 +668,12 @@ fn image_memory(c: &Config, body: &Json) -> Result<Vec<(String, Json)>, String> 
             fields.push((key.into(), Json::Int(n.min(cap))));
         }
     }
+    // the catalog's backend (a request's own is not taken: where a model runs is the operator's): webgpu runs the
+    // worker's model on WebGPU (a worker built with its webgpu feature: any GPU, no CUDA)
+    if let Some(backend) = settings.get("backend") {
+        let b = backend.as_str().filter(|b| ["cuda", "cpu", "webgpu"].contains(b)).ok_or("image backend must be cuda, cpu or webgpu")?;
+        fields.push(("backend".into(), Json::str(b)));
+    }
     Ok(fields)
 }
 
@@ -1276,6 +1282,20 @@ mod tests {
         assert_eq!(gguf.get("transformer").and_then(Json::as_str), Some("model.gguf"));
         std::fs::remove_dir_all(&cfg.output_root).unwrap();
     }
+    #[test]
+    fn a_catalogs_backend_reaches_the_worker_and_a_requests_does_not() {
+        let mut cfg = config();
+        cfg.output_root = std::env::temp_dir().join(format!("oaiy-image-backend-{}", std::process::id()));
+        let body = |s: &str| Json::parse(s.as_bytes()).unwrap();
+        let r = prepare(&cfg, &body(r#"{"prompt":"x","backend":"webgpu"}"#)).unwrap();
+        assert!(r.get("backend").is_none(), "a request's own backend is not taken");
+        cfg.image_memory = Json::obj([("backend", Json::str("webgpu"))]);
+        let r = prepare(&cfg, &body(r#"{"prompt":"x"}"#)).unwrap();
+        assert_eq!(r.get("backend").and_then(Json::as_str), Some("webgpu"));
+        cfg.image_memory = Json::obj([("backend", Json::str("vulkan"))]);
+        assert!(prepare(&cfg, &body(r#"{"prompt":"x"}"#)).is_err(), "an unknown backend");
+    }
+
     #[test]
     fn image_memory_defaults_to_auto_and_respects_catalog_caps() {
         let mut cfg = config();
