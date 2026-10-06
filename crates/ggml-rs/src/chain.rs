@@ -172,6 +172,12 @@ pub trait ChainRecorder {
     fn rmsnorm(&mut self, x: &DeviceVec, w: &DeviceVec, out: &DeviceVec, eps: f32);
     /// [`Self::rmsnorm`] of each of `rows` rows of `x` (a head's q or k), all with the same `w` (`[x.len / rows]`).
     fn rmsnorm_rows(&mut self, x: &DeviceVec, w: &DeviceVec, out: &DeviceVec, rows: usize, eps: f32);
+    /// [`Self::rmsnorm_rows`] of each head of `rows` rows (`x` `[rows, heads, d]`, `d` from its length), head `h` by row
+    /// `h` of `w` (`[heads, d]`): a multi-head RMS norm whose heads have weights of their own (TRELLIS's).
+    fn rmsnorm_heads_rows(&mut self, x: &DeviceVec, w: &DeviceVec, out: &DeviceVec, rows: usize, heads: usize, eps: f32) {
+        let _ = (x, w, out, rows, heads, eps);
+        unimplemented!("a multi-head RMS norm on this device")
+    }
     /// `acc += y`.
     fn add(&mut self, acc: &DeviceVec, y: &DeviceVec);
     /// [`Self::rmsnorm_rows`] then SiLU, in one pass (a VAE's norms before its convolutions: no normed copy).
@@ -544,6 +550,20 @@ pub trait ChainRecorder {
     fn mul_sigmoid_rows(&mut self, x: &DeviceVec, gate: &DeviceVec, rows: usize, c: usize) {
         let _ = (x, gate, rows, c);
         unimplemented!("a gate of rows on this device")
+    }
+    /// `out`'s `rows` rows of `c` (from row `first` of `index`): row `r` is `x`'s row `index[first + r]` (`index` u32s
+    /// in a vector's words), zeros where that is `src_rows` or past it: a sparse convolution's neighbours gathered (a
+    /// missing one zeros), or rows picked out.
+    #[allow(clippy::too_many_arguments)]
+    fn gather_rows(&mut self, x: &DeviceVec, index: &DeviceVec, out: &DeviceVec, rows: usize, c: usize, first: usize, src_rows: usize) {
+        let _ = (x, index, out, rows, c, first, src_rows);
+        unimplemented!("a gather of rows on this device")
+    }
+    /// `out[r, k] += x[r, k / repeat]` for each of `rows` rows (`x` `[rows, c]`, `out` `[rows, c repeat]`): each channel
+    /// repeated `repeat` times, added (a sparse decoder's skip as it goes up a level).
+    fn repeat_cols_add_rows(&mut self, x: &DeviceVec, out: &DeviceVec, rows: usize, c: usize, repeat: usize) {
+        let _ = (x, out, rows, c, repeat);
+        unimplemented!("a repeat of columns on this device")
     }
     /// `out[ch]` the mean of `x`'s `rows` (`[rows, c]`) at `ch`.
     fn mean_rows(&mut self, x: &DeviceVec, out: &DeviceVec, rows: usize, c: usize) {

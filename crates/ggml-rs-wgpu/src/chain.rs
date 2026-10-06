@@ -2295,6 +2295,43 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+/// Rows gathered ([`ChainRecorder::gather_rows`]): a thread a value, zeros for a missing row. `p[0]`: the rows, `c`,
+/// the source's rows, the index's first.
+const GATHER_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> index: array<u32>;
+@group(0) @binding(6) var<storage, read_write> out: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    let c = p[0].y;
+    if (i >= p[0].x * c) { return; }
+    let src = index[p[0].w + i / c];
+    var v = 0.0;
+    if (src < p[0].z) { v = x[src * c + i % c]; }
+    out[i] = v;
+}
+"#;
+
+/// Each channel repeated, added ([`ChainRecorder::repeat_cols_add_rows`]): a thread an output value. `p[0]`: the rows,
+/// `c`, the repeats.
+const REPEAT_COLS_ADD_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(6) var<storage, read_write> out: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    let width = p[0].y * p[0].z;
+    if (i >= p[0].x * width) { return; }
+    let r = i / width;
+    out[i] += x[r * p[0].y + (i % width) / p[0].z];
+}
+"#;
+
 /// A depthwise causal 1-D convolution ([`ChainRecorder::depthwise_causal_conv1d_rows`]): a thread an output value.
 /// `p[0]`: `c`, `k`, the steps.
 const DEPTHWISE_CAUSAL_CONV1D_ROWS: &str = r#"
@@ -4530,6 +4567,16 @@ impl ChainRecorder for Recorder<'_> {
         self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(out), &[n as u32, eps.to_bits(), 0, r], (r.min(65535), r.div_ceil(65535), 1));
     }
 
+    fn rmsnorm_heads_rows(&mut self, x: &DeviceVec, w: &DeviceVec, out: &DeviceVec, rows: usize, heads: usize, eps: f32) {
+        let r = rows * heads;
+        assert!(r > 0 && x.len % r == 0 && w.len >= x.len / rows && out.len >= x.len, "chain: a multi-head rmsnorm of {rows} rows of {heads} heads ({})", x.len);
+        let n = x.len / r;
+        // (the norms' kernels take the weight's rows in turn: row r of x by w's row r % heads)
+        let pipeline = if n % 4 == 0 { self.gpu().named_pipeline("chain-rmsnorm-rows4", || RMSNORM_ROWS4.to_string()) } else { self.named("chain-rmsnorm-rows", RMSNORM_ROWS) };
+        let rr = r as u32;
+        self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(out), &[n as u32, eps.to_bits(), heads as u32, rr], (rr.min(65535), rr.div_ceil(65535), 1));
+    }
+
     fn rmsnorm_silu_rows(&mut self, x: &DeviceVec, w: &DeviceVec, out: &DeviceVec, rows: usize, eps: f32) {
         assert!(rows > 0 && x.len % rows == 0 && w.len >= x.len / rows && out.len >= x.len, "chain: rmsnorm and SiLU of {rows} rows of {}", x.len);
         let n = x.len / rows;
@@ -4879,6 +4926,20 @@ impl ChainRecorder for Recorder<'_> {
         let n = (out * cout) as u32;
         self.dispatch_wide("chain-conv-transpose1d-rows", CONV_TRANSPOSE1D_ROWS, [buffer(w), buffer(x), buffer(b), &d, &d, &d, buffer(y), &drw], &[cout as u32, cin as u32, len as u32, k as u32, stride as u32, pad as u32, out as u32], grid(n.div_ceil(256)));
         self.weigh(2.0 * (out * cout) as f64 * (cin * k.div_ceil(stride)) as f64);
+    }
+
+    fn gather_rows(&mut self, x: &DeviceVec, index: &DeviceVec, out: &DeviceVec, rows: usize, c: usize, first: usize, src_rows: usize) {
+        assert!(index.len >= first + rows && out.len >= rows * c && x.len >= src_rows * c && rows * c < 1 << 32, "chain: a gather of {rows} rows of {c}");
+        let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
+        let n = (rows * c) as u32;
+        self.dispatch_wide("chain-gather-rows", GATHER_ROWS, [buffer(x), buffer(index), &d, &d, &d, &d, buffer(out), &drw], &[rows as u32, c as u32, src_rows as u32, first as u32], grid(n.div_ceil(256)));
+    }
+
+    fn repeat_cols_add_rows(&mut self, x: &DeviceVec, out: &DeviceVec, rows: usize, c: usize, repeat: usize) {
+        assert!(x.len >= rows * c && out.len >= rows * c * repeat && repeat > 0, "chain: {rows} rows of {c} repeated {repeat} times");
+        let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
+        let n = (rows * c * repeat) as u32;
+        self.dispatch_wide("chain-repeat-cols-add-rows", REPEAT_COLS_ADD_ROWS, [buffer(x), &d, &d, &d, &d, &d, buffer(out), &drw], &[rows as u32, c as u32, repeat as u32], grid(n.div_ceil(256)));
     }
 
     fn depthwise_causal_conv1d_rows(&mut self, w: &DeviceVec, b: &DeviceVec, c: usize, k: usize, x: &DeviceVec, len: usize, y: &DeviceVec) {
@@ -6298,6 +6359,40 @@ mod tests {
             for (i, (g, w)) in got.iter().zip(&want).enumerate() {
                 assert!((g - w).abs() <= 1e-3 * w.abs() + 1e-6, "{rows}x{cols} rotated {rotation}: [{i}] {g} against {w}");
             }
+        }
+    }
+
+    /// A sparse decoder's gathers as the host makes them: rows picked by an index (from an offset into it, a missing one
+    /// zeros), and each channel repeated and added.
+    #[test]
+    fn gathered_and_repeated_rows_are_the_hosts() {
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        let mut r = rng(149);
+        let (src, c, rows, first, repeat) = (37usize, 12usize, 50usize, 7usize, 3usize);
+        let x: Vec<f32> = (0..src * c).map(|_| r()).collect();
+        // (every source row, and the missing one, some twice)
+        let index: Vec<u32> = (0..first + rows).map(|i| ((i * 13) % (src + 1)) as u32).collect();
+        let (xd, id, out) = (b.vec(x.len()), b.vec(index.len()), b.vec(rows * c));
+        DeviceChain::upload(&b, &xd, &x);
+        DeviceChain::upload(&b, &id, &index.iter().map(|&v| f32::from_bits(v)).collect::<Vec<_>>());
+        let acc: Vec<f32> = (0..rows * c * repeat).map(|_| r()).collect();
+        let ad = b.vec(acc.len());
+        DeviceChain::upload(&b, &ad, &acc);
+        let mut rec = b.begin();
+        rec.gather_rows(&xd, &id, &out, rows, c, first, src);
+        rec.repeat_cols_add_rows(&out, &ad, rows, c, repeat);
+        rec.read(&out);
+        rec.read(&ad);
+        let got = rec.finish();
+        for i in 0..rows * c {
+            let s = index[first + i / c] as usize;
+            let want = if s < src { x[s * c + i % c] } else { 0. };
+            assert_eq!(got[0][i], want, "gathered [{i}]");
+        }
+        for i in 0..rows * c * repeat {
+            let w = c * repeat;
+            let want = acc[i] + got[0][(i / w) * c + (i % w) / repeat];
+            assert_eq!(got[1][i], want, "repeated [{i}]");
         }
     }
 

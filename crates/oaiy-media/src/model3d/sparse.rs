@@ -174,11 +174,16 @@ impl Subdivision {
 
     /// The children's coordinates at the next (twice as fine) level.
     pub fn coords(&self, level: &Level) -> Vec<[i32; 3]> {
+        self.coords_of(&level.coords)
+    }
+
+    /// [`Self::coords`] of a level's voxels at `coords`.
+    pub fn coords_of(&self, coords: &[[i32; 3]]) -> Vec<[i32; 3]> {
         self.parent
             .iter()
             .zip(&self.child)
             .map(|(&p, &s)| {
-                let c = level.coords[p as usize];
+                let c = coords[p as usize];
                 [c[0] * 2 + (s & 1) as i32, c[1] * 2 + ((s >> 1) & 1) as i32, c[2] * 2 + ((s >> 2) & 1) as i32]
             })
             .collect()
