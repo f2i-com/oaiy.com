@@ -689,7 +689,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let r = wg.x + wg.y * 65535u;
     if (r >= p[1].x) { return; }
     let at = r * n;
-    let mode = p[1].y;
+    let mode = p[1].y & 3u;
+    // a clean row (before p[1].z, or from p[1].w on) modulated by the second set
+    let second = select(0u, p[1].y >> 2u, r < p[1].z || r >= p[1].w);
     var mean = 0.0;
     if (mode == 2u) {
         var s = 0.0;
@@ -717,8 +719,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     }
     let shifted = p[0].w != 0xffffffffu;
     for (var i = li; i < n; i += 256u) {
-        var v = (x[at + i] - mean) * inv * (1.0 + mods[p[0].z + i]);
-        if (shifted) { v += mods[p[0].w + i]; }
+        var v = (x[at + i] - mean) * inv * (1.0 + mods[second + p[0].z + i]);
+        if (shifted) { v += mods[second + p[0].w + i]; }
         y[at + i] = v;
     }
 }
@@ -749,7 +751,10 @@ const ADD_GATED_ROWS: &str = r#"
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let i = id.x + id.y * 16776960u;
     if (i >= p[0].x * p[0].y) { return; }
-    var g = mods[p[0].z + i % p[0].x];
+    // a clean row (before p[1].x, or from p[1].y on) gated by the second set (p[1].z on)
+    let row = i / p[0].x;
+    let second = select(0u, p[1].z, row < p[1].x || row >= p[1].y);
+    var g = mods[second + p[0].z + i % p[0].x];
     if (p[0].w == 1u) { g = tanh(g); }
     x[i] += yv[i] * g;
 }
@@ -3492,8 +3497,9 @@ impl ChainRecorder for Recorder<'_> {
         }
     }
 
-    fn norm_mod_rows(&mut self, x: &DeviceVec, out: &DeviceVec, rows: usize, n: usize, mods: &DeviceVec, scale_at: usize, shift_at: Option<usize>, norm: ggml_rs::RowNorm, eps: f32) {
-        assert!(rows > 0 && x.len >= rows * n && out.len >= rows * n && mods.len >= scale_at + n && shift_at.is_none_or(|s| mods.len >= s + n), "chain: a modulated norm of {rows} rows of {n}");
+    fn norm_mod_rows_clean(&mut self, x: &DeviceVec, out: &DeviceVec, rows: usize, n: usize, mods: &DeviceVec, scale_at: usize, shift_at: Option<usize>, norm: ggml_rs::RowNorm, eps: f32, clean: ggml_rs::CleanRows) {
+        let set = if clean == ggml_rs::CleanRows::NONE { 0 } else { clean.offset };
+        assert!(rows > 0 && x.len >= rows * n && out.len >= rows * n && mods.len >= set + scale_at + n && shift_at.is_none_or(|s| mods.len >= set + s + n) && set < 1 << 30, "chain: a modulated norm of {rows} rows of {n}");
         let d = self.gpu().dummy().clone();
         let drw = self.gpu().dummy_rw().clone();
         let mode = match norm {
@@ -3501,16 +3507,20 @@ impl ChainRecorder for Recorder<'_> {
             ggml_rs::RowNorm::Rms => 1,
             ggml_rs::RowNorm::Layer => 2,
         };
-        let words = [n as u32, eps.to_bits(), scale_at as u32, shift_at.map_or(u32::MAX, |s| s as u32), rows as u32, mode];
+        let bound = |v: usize| v.min(u32::MAX as usize) as u32;
+        let words = [n as u32, eps.to_bits(), scale_at as u32, shift_at.map_or(u32::MAX, |s| s as u32), rows as u32, mode | (set as u32) << 2, bound(clean.before), bound(clean.from)];
         let r = rows as u32;
         self.dispatch_wide("chain-layernorm-mod-rows", LAYERNORM_MOD_ROWS, [buffer(x), buffer(mods), &d, &d, &d, &d, buffer(out), &drw], &words, (r.min(65535), r.div_ceil(65535), 1));
     }
 
-    fn add_gated_rows(&mut self, x: &DeviceVec, y: &DeviceVec, rows: usize, n: usize, mods: &DeviceVec, gate_at: usize, tanh: bool) {
-        assert!(x.len >= rows * n && y.len >= rows * n && mods.len >= gate_at + n, "chain: a gated residual of {rows} rows of {n}");
+    fn add_gated_rows_clean(&mut self, x: &DeviceVec, y: &DeviceVec, rows: usize, n: usize, mods: &DeviceVec, gate_at: usize, tanh: bool, clean: ggml_rs::CleanRows) {
+        let set = if clean == ggml_rs::CleanRows::NONE { 0 } else { clean.offset };
+        assert!(x.len >= rows * n && y.len >= rows * n && mods.len >= set + gate_at + n, "chain: a gated residual of {rows} rows of {n}");
         let d = self.gpu().dummy().clone();
         let drw = self.gpu().dummy_rw().clone();
-        self.dispatch_wide("chain-add-gated-rows", ADD_GATED_ROWS, [buffer(y), buffer(mods), &d, &d, &d, &d, buffer(x), &drw], &[n as u32, rows as u32, gate_at as u32, tanh as u32], grid(((rows * n) as u32).div_ceil(256)));
+        let bound = |v: usize| v.min(u32::MAX as usize) as u32;
+        let words = [n as u32, rows as u32, gate_at as u32, tanh as u32, bound(clean.before), bound(clean.from), set as u32, 0];
+        self.dispatch_wide("chain-add-gated-rows", ADD_GATED_ROWS, [buffer(y), buffer(mods), &d, &d, &d, &d, buffer(x), &drw], &words, grid(((rows * n) as u32).div_ceil(256)));
     }
 
     fn conv3d_rows(&mut self, w: &DeviceVec, b: &DeviceVec, cout: usize, cin: usize, x: &DeviceVec, frames: usize, h: usize, wd: usize, y: &DeviceVec) {
@@ -4868,6 +4878,31 @@ mod tests {
                     let g = got[row * n + i] as f64;
                     assert!((g - want).abs() <= 1e-5 * (1.0 + want.abs()), "{norm:?} row {row} [{i}]: {g} against {want}");
                 }
+            }
+        }
+        // clean rows (the first two and the last) by a second modulation, three sets on
+        let clean = ggml_rs::CleanRows { before: 2, from: rows - 1, offset: 3 * n };
+        let both: Vec<f32> = (0..6 * n).map(|_| r()).collect();
+        let bd = b.vec(both.len());
+        DeviceChain::upload(&b, &bd, &both);
+        let acc = b.vec(x.len());
+        DeviceChain::upload(&b, &acc, &x);
+        let mut rec = b.begin();
+        rec.norm_mod_rows_clean(&xd, &out, rows, n, &bd, n, Some(2 * n), ggml_rs::RowNorm::Rms, 1e-6, clean);
+        rec.add_gated_rows_clean(&acc, &xd, rows, n, &bd, 0, false, clean);
+        rec.read(&out);
+        rec.read(&acc);
+        let mut reads = rec.finish();
+        let (gated, normed) = (reads.pop().unwrap(), reads.pop().unwrap());
+        for row in 0..rows {
+            let set = if row < 2 || row >= rows - 1 { 3 * n } else { 0 };
+            let v = &x[row * n..(row + 1) * n];
+            let inv = 1.0 / (v.iter().map(|&a| (a as f64).powi(2)).sum::<f64>() / n as f64 + 1e-6).sqrt();
+            for i in 0..n {
+                let want = v[i] as f64 * inv * (1.0 + both[set + n + i] as f64) + both[set + 2 * n + i] as f64;
+                assert!((normed[row * n + i] as f64 - want).abs() <= 1e-5 * (1.0 + want.abs()), "clean rows' norm, row {row} [{i}]");
+                let want = v[i] as f64 * (1.0 + both[set + i] as f64);
+                assert!((gated[row * n + i] as f64 - want).abs() <= 1e-5 * (1.0 + want.abs()), "clean rows' gate, row {row} [{i}]");
             }
         }
         // the split rotary: (row, head) its own table, each head's halves paired

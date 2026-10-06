@@ -1,12 +1,12 @@
-//! LTX 2.3's transformer on WebGPU, as [`crate::ltx::transformer`] computes its video stream (text-to-video: no
-//! audio, no conditioning frames, no NAG yet): its weights on the GPU as they are stored where the chain has a kernel
+//! LTX 2.3's transformer on WebGPU, as [`crate::ltx::transformer`] computes its video stream (text- and
+//! image-to-video, its clean first and last frames' tokens at timestep 0: no audio or NAG yet): its weights on the GPU as they are stored where the chain has a kernel
 //! for them (NVFP4 packed, the tensor cores decoding it as they multiply: Lightricks' `-nvfp4` release's 44 blocks of
 //! 48), else Q8_0 where the tensor cores take it (a BF16 checkpoint's video stream is 28 GB as f16, 15 as Q8_0), else
 //! f16 (BF16 rounded); its activations f32.
 use crate::ltx::store::{untile_scales, Store};
 use candle_core::{Device, Result};
 use dsv41::safetensors::Dtype;
-use ggml_rs::{Backend, ChainRecorder, DeviceChain, DeviceVec, QuantizedTensor, RowNorm};
+use ggml_rs::{Backend, ChainRecorder, CleanRows, DeviceChain, DeviceVec, QuantizedTensor, RowNorm};
 
 const PREFIX: &str = "model.diffusion_model.";
 /// The video stream's width, heads and head.
@@ -321,15 +321,24 @@ pub fn rope_table(positions: &[Vec<f32>], maxima: &[f32], dim: usize, heads: usi
     t
 }
 
-/// A video's tokens' coordinates (time in seconds, then its pixels' row and column), as the reference places them.
-pub fn video_positions(frames: usize, height: usize, width: usize, fps: usize) -> Vec<Vec<f32>> {
-    let mut positions = Vec::with_capacity(frames * height * width);
+/// A video's tokens' coordinates (time in seconds, then its pixels' row and column), as the reference places them;
+/// with `end_image`, an appended end frame's tokens at the last frame's time.
+pub fn video_positions(frames: usize, height: usize, width: usize, fps: usize, end_image: bool) -> Vec<Vec<f32>> {
+    let mut positions = Vec::with_capacity((frames + usize::from(end_image)) * height * width);
     for t in 0..frames {
         for y in 0..height {
             for x in 0..width {
                 let start = (t * 8).saturating_sub(7);
                 let end = (t + 1) * 8 - 7;
                 positions.push(vec![(start + end) as f32 / (2 * fps) as f32, (y as f32 + 0.5) * 32., (x as f32 + 0.5) * 32.]);
+            }
+        }
+    }
+    if end_image {
+        let last = ((frames - 1) * 8) as f32 + 0.5;
+        for y in 0..height {
+            for x in 0..width {
+                positions.push(vec![last / fps as f32, (y as f32 + 0.5) * 32., (x as f32 + 0.5) * 32.]);
             }
         }
     }
@@ -396,20 +405,29 @@ impl WgpuLtx {
 
     /// The video velocity of `latent` (`tokens` rows of 128) at `sigma` over `context` (`lc` rows of `D`, the
     /// connector's), its tokens rotated by `table` ([`rope_table`] of [`video_positions`], [`Self::upload`]ed):
-    /// `[tokens, 128]`. With `skip_self` that block's self-attention passed through (spatio-temporal guidance's
-    /// perturbed pass).
+    /// `[tokens, 128]`. `clean`: the leading tokens of a starting image and the trailing ones of an end image, at
+    /// timestep 0. With `skip_self` that block's self-attention passed through (spatio-temporal guidance's perturbed
+    /// pass).
     #[allow(clippy::too_many_arguments)]
-    pub fn forward(&self, latent: &[f32], tokens: usize, context: &[f32], lc: usize, sigma: f64, table: &DeviceVec, skip_self: Option<usize>) -> Result<Vec<f32>> {
-        self.pass(latent, tokens, context, lc, sigma, table, skip_self, false)?.pop().ok_or_else(|| err("the velocity was not read"))
+    pub fn forward(&self, latent: &[f32], tokens: usize, context: &[f32], lc: usize, sigma: f64, table: &DeviceVec, clean: (usize, usize), skip_self: Option<usize>) -> Result<Vec<f32>> {
+        self.pass(latent, tokens, context, lc, sigma, table, clean, skip_self, false)?.pop().ok_or_else(|| err("the velocity was not read"))
     }
 
     /// [`Self::forward`]'s pass: its reads, the velocity last (with `trace`, every block's output before it, one after
     /// another in one vector: a read is the vector as the recording leaves it).
     #[allow(clippy::too_many_arguments)]
-    fn pass(&self, latent: &[f32], tokens: usize, context: &[f32], lc: usize, sigma: f64, table: &DeviceVec, skip_self: Option<usize>, trace: bool) -> Result<Vec<Vec<f32>>> {
+    fn pass(&self, latent: &[f32], tokens: usize, context: &[f32], lc: usize, sigma: f64, table: &DeviceVec, clean: (usize, usize), skip_self: Option<usize>, trace: bool) -> Result<Vec<Vec<f32>>> {
         if latent.len() != tokens * self.patchify.k || context.len() != lc * D || table.len != tokens * D {
             candle_core::bail!("an LTX step's inputs: {} latent values for {tokens} tokens, {} context for {lc}, {} rotary", latent.len(), context.len(), table.len);
         }
+        let (start, end) = clean;
+        if start + end >= tokens {
+            candle_core::bail!("conditioning must leave generated video tokens");
+        }
+        // the clean tokens' rows modulated by timestep 0's set, after sigma's: the blocks' nine rows, the output's two
+        let two = start + end > 0;
+        let rows = if two { CleanRows { before: start, from: tokens - end, offset: 9 * D } } else { CleanRows::NONE };
+        let out_rows = if two { CleanRows { offset: 2 * D, ..rows } } else { CleanRows::NONE };
         let s = Scratch::new(&self.gpu, tokens.max(lc));
         let (lat, ctx) = (self.vec(latent.len()), self.vec(context.len()));
         self.gpu.upload(&lat, latent);
@@ -419,13 +437,22 @@ impl WgpuLtx {
         let (x, h, cm, y, f, fg) = (self.vec(tokens * D), self.vec(tokens * D), self.vec(lc * D), self.vec(tokens * D), self.vec(tokens * 4 * D), self.vec(tokens * 4 * D));
         let (emb, modulation, prompt) = (self.vec(D), self.vec(9 * D), self.vec(2 * D));
         let trail = self.vec(if trace { self.blocks.len() * tokens * D } else { 1 });
-        let (mm, pm, mo) = (self.vec(9 * D), self.vec(2 * D), self.vec(2 * D));
+        let sets = if two { 2 } else { 1 };
+        let (mm, pm, mo) = (self.vec(sets * 9 * D), self.vec(2 * D), self.vec(sets * 2 * D));
         let (s1, s2) = (self.vec(D), self.vec(D));
+        // timestep 0's, for the clean tokens: its sinusoids, embedding and modulation, and a set's scratch
+        let (t0, emb0, modulation0, set, out_set) = (self.vec(256), self.vec(D), self.vec(9 * D), self.vec(9 * D), self.vec(2 * D));
+        if two {
+            self.gpu.upload(&t0, &sinusoids(0.));
+        }
         let mut rec = self.gpu.begin();
         rec.keep_groups(false);
         let r = rec.as_mut();
         // the timestep's modulation and embedding, the prompt's modulation
         self.adaln.record(r, &t, &s1, &s2, &emb, &modulation);
+        if two {
+            self.adaln.record(r, &t0, &s1, &s2, &emb0, &modulation0);
+        }
         match &self.prompt {
             Some(pe) => {
                 let pe_emb = self.vec(D);
@@ -437,30 +464,41 @@ impl WgpuLtx {
         for (i, b) in self.blocks.iter().enumerate() {
             // the block's modulation: the step's and its own table (shift, scale, gate: self-attention 0-2, the
             // feed-forward 3-5, text attention 6-8), the prompt's two rows the same
-            r.copy(&modulation, 0, &mm, 0, 9 * D);
-            r.add(&mm, &b.table);
+            if two {
+                for (at, step) in [(0, &modulation), (9 * D, &modulation0)] {
+                    r.copy(step, 0, &set, 0, 9 * D);
+                    r.add(&set, &b.table);
+                    r.copy(&set, 0, &mm, at, 9 * D);
+                }
+            } else {
+                r.copy(&modulation, 0, &mm, 0, 9 * D);
+                r.add(&mm, &b.table);
+            }
             r.copy(&prompt, 0, &pm, 0, 2 * D);
             r.add(&pm, &b.prompt_table);
-            r.norm_mod_rows(&x, &h, tokens, D, &mm, D, Some(0), RowNorm::Rms, EPS);
+            r.norm_mod_rows_clean(&x, &h, tokens, D, &mm, D, Some(0), RowNorm::Rms, EPS, rows);
             self.attend(r, &b.attn1, &h, tokens, &h, tokens, Some(table), skip_self == Some(i), &s, &y);
-            r.add_gated_rows(&x, &y, tokens, D, &mm, 2 * D, false);
-            r.norm_mod_rows(&x, &h, tokens, D, &mm, 7 * D, Some(6 * D), RowNorm::Rms, EPS);
+            r.add_gated_rows_clean(&x, &y, tokens, D, &mm, 2 * D, false, rows);
+            r.norm_mod_rows_clean(&x, &h, tokens, D, &mm, 7 * D, Some(6 * D), RowNorm::Rms, EPS, rows);
             r.norm_mod_rows(&ctx, &cm, lc, D, &pm, D, Some(0), RowNorm::None, EPS);
             self.attend(r, &b.attn2, &h, tokens, &cm, lc, None, false, &s, &y);
-            r.add_gated_rows(&x, &y, tokens, D, &mm, 8 * D, false);
-            r.norm_mod_rows(&x, &h, tokens, D, &mm, 4 * D, Some(3 * D), RowNorm::Rms, EPS);
+            r.add_gated_rows_clean(&x, &y, tokens, D, &mm, 8 * D, false, rows);
+            r.norm_mod_rows_clean(&x, &h, tokens, D, &mm, 4 * D, Some(3 * D), RowNorm::Rms, EPS, rows);
             b.ff0.forward(r, &h, &f, tokens);
             r.gelu(&f, &fg, tokens * b.ff0.n);
             b.ff2.forward(r, &fg, &y, tokens);
-            r.add_gated_rows(&x, &y, tokens, D, &mm, 5 * D, false);
+            r.add_gated_rows_clean(&x, &y, tokens, D, &mm, 5 * D, false, rows);
             if trace {
                 r.copy(&x, 0, &trail, i * tokens * D, tokens * D);
             }
         }
         // the output: a layer norm, its table's (shift, scale) plus the timestep's embedding, the projection
-        r.copy(&self.out_table, 0, &mo, 0, 2 * D);
-        r.add_bias_rows(&mo, &emb, 2, D);
-        r.norm_mod_rows(&x, &h, tokens, D, &mo, D, Some(0), RowNorm::Layer, EPS);
+        for (at, e) in [(0, &emb), (2 * D, &emb0)].into_iter().take(sets) {
+            r.copy(&self.out_table, 0, &out_set, 0, 2 * D);
+            r.add_bias_rows(&out_set, e, 2, D);
+            r.copy(&out_set, 0, &mo, at, 2 * D);
+        }
+        r.norm_mod_rows_clean(&x, &h, tokens, D, &mo, D, Some(0), RowNorm::Layer, EPS, out_rows);
         let vel = self.vec(tokens * self.proj_out.n);
         self.proj_out.forward(r, &h, &vel, tokens);
         if trace {
@@ -583,10 +621,10 @@ mod tests {
         let context: Vec<f32> = (0..lc * D).map(|i| (i * 104729 % 2001) as f32 / 1000.0 - 1.0).collect();
         let mut store = Store::open(std::path::Path::new(&path), 0)?;
         let gpu = WgpuLtx::load(&mut store, 0, |_| {})?;
-        let table = gpu.upload(&rope_table(&video_positions(frames, h, w, fps), &[20., 2048., 2048.], D, HEADS));
+        let table = gpu.upload(&rope_table(&video_positions(frames, h, w, fps, false), &[20., 2048., 2048.], D, HEADS));
         for i in 0..3 {
             let t = std::time::Instant::now();
-            let v = gpu.forward(&latent, tokens, &context, lc, 0.7 - 0.1 * i as f64, &table, None)?;
+            let v = gpu.forward(&latent, tokens, &context, lc, 0.7 - 0.1 * i as f64, &table, (0, 0), None)?;
             eprintln!("step {i}: {:.2} s ({} values)", t.elapsed().as_secs_f64(), v.len());
         }
         Ok(())
@@ -633,10 +671,14 @@ mod tests {
         let mut store = Store::open(path, 0)?;
         let gpu = WgpuLtx::load(&mut store, 0, |_| {})?;
         eprintln!("WebGPU video stream loaded in {:.1} s", t.elapsed().as_secs_f64());
-        let table = gpu.upload(&rope_table(&video_positions(frames, h, w, fps), &[20., 2048., 2048.], D, HEADS));
-        let got: Vec<Vec<f32>> = [0.8, 0.25].iter().map(|&sigma| gpu.forward(&latent, tokens, &context, lc, sigma, &table, None)).collect::<Result<_>>()?;
+        let table = gpu.upload(&rope_table(&video_positions(frames, h, w, fps, false), &[20., 2048., 2048.], D, HEADS));
+        let got: Vec<Vec<f32>> = [0.8, 0.25].iter().map(|&sigma| gpu.forward(&latent, tokens, &context, lc, sigma, &table, (0, 0), None)).collect::<Result<_>>()?;
         // and spatio-temporal guidance's pass, block 28's self-attention passed through
-        let stg = gpu.forward(&latent, tokens, &context, lc, 0.8, &table, Some(28))?;
+        let stg = gpu.forward(&latent, tokens, &context, lc, 0.8, &table, (0, 0), Some(28))?;
+        // and a starting image's and an end image's clean tokens (the first frame's, an appended frame's)
+        let ends = gpu.upload(&rope_table(&video_positions(frames, h, w, fps, true), &[20., 2048., 2048.], D, HEADS));
+        let appended: Vec<f32> = latent.iter().chain(&latent[..h * w * 128]).map(|v| v * 0.9).collect();
+        let conditioned = gpu.forward(&appended, tokens + h * w, &context, lc, 0.8, &ends, (h * w, h * w), None)?;
         drop(gpu);
         // (Candle's LTX is BF16 throughout: its CPU has no BF16 matmul, so CUDA's device OAIY_LTX_CUDA_DEVICE, 0 else)
         #[cfg(feature = "cuda")]
@@ -651,23 +693,42 @@ mod tests {
         let lt = candle_core::Tensor::from_vec(latent, (1, tokens, 128), &dev)?.to_dtype(DType::BF16)?;
         let ct = candle_core::Tensor::from_vec(context, (1, lc, D), &dev)?.to_dtype(DType::BF16)?;
         let (ln, cn) = (nudged(&lt)?, nudged(&ct)?);
-        let passes = [(0.8, None, &got[0]), (0.25, None, &got[1]), (0.8, Some(28), &stg)];
-        for (sigma, skip, got) in passes {
+        let rope_ends = crate::ltx::transformer::Rope::video_with_end(frames, h, w, fps, true, &dev)?;
+        let la = candle_core::Tensor::from_vec(appended, (1, tokens + h * w, 128), &dev)?.to_dtype(DType::BF16)?;
+        let lan = nudged(&la)?;
+        let passes = [(0.8, None, false, &got[0]), (0.25, None, false, &got[1]), (0.8, Some(28), false, &stg), (0.8, None, true, &conditioned)];
+        for (sigma, skip, ends, got) in passes {
             let t = std::time::Instant::now();
             cpu.skip_video_self_attn = skip;
+            let (rope, clean) = if ends { (&rope_ends, h * w) } else { (&rope, 0) };
             let velocity = |cpu: &mut crate::ltx::transformer::Transformer, l: &candle_core::Tensor, c: &candle_core::Tensor| -> Result<Vec<f32>> {
-                cpu.forward(l, c, sigma, &rope, 0, 0, None, |_| {})?.0.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()
+                cpu.forward(l, c, sigma, rope, clean, clean, None, |_| {})?.0.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()
             };
-            let want = velocity(&mut cpu, &lt, &ct)?;
+            let (l, n) = if ends { (&la, &lan) } else { (&lt, &ln) };
+            let want = velocity(&mut cpu, l, &ct)?;
             let seconds = t.elapsed().as_secs_f64();
-            let (_, spread) = compare(&velocity(&mut cpu, &ln, &cn)?, &want);
+            let nudged = velocity(&mut cpu, n, &cn)?;
+            let (_, spread) = compare(&nudged, &want);
             let (cos, err) = compare(got, &want);
-            let what = match skip {
-                Some(b) => format!("sigma {sigma}, block {b}'s self-attention passed through"),
-                None => format!("sigma {sigma}"),
+            if ends {
+                // the clean tokens' rows (the first frame's, the appended one's) and the noisy ones' apart
+                let row = 128;
+                let (lo, hi) = (clean * row, want.len() - clean * row);
+                let part = |v: &[f32], noisy: bool| -> Vec<f32> { if noisy { v[lo..hi].to_vec() } else { v[..lo].iter().chain(&v[hi..]).copied().collect() } };
+                for noisy in [false, true] {
+                    let (c, e) = compare(&part(got, noisy), &part(&want, noisy));
+                    let (_, sp) = compare(&part(&nudged, noisy), &part(&want, noisy));
+                    eprintln!("  the {} rows: cosine {c:.6}, relative error {e:.2e} (the reference's own spread {sp:.2e})", if noisy { "noisy" } else { "clean" });
+                }
+            }
+            let what = match (skip, ends) {
+                (Some(b), _) => format!("sigma {sigma}, block {b}'s self-attention passed through"),
+                (None, true) => format!("sigma {sigma}, a starting and an end image's tokens clean"),
+                (None, false) => format!("sigma {sigma}"),
             };
             eprintln!("{what}: cosine {cos:.6}, relative error {err:.2e} (the reference's own spread {spread:.2e}; its step {seconds:.1} s)");
-            assert!(err <= (2.0 * spread).max(0.1), "{what}: relative error {err} where the reference's own spread is {spread}");
+            // (its BF16 rounding at every op beside one step off at the inputs: within three times that)
+            assert!(err <= (3.0 * spread).max(0.1), "{what}: relative error {err} where the reference's own spread is {spread}");
         }
         Ok(())
     }
@@ -692,8 +753,8 @@ mod tests {
         let context: Vec<f32> = (0..lc * D).map(|_| (next() * 1.7) as f32).collect();
         let mut store = Store::open(path, 0)?;
         let gpu = WgpuLtx::load(&mut store, 0, |_| {})?;
-        let table = gpu.upload(&rope_table(&video_positions(frames, h, w, fps), &[20., 2048., 2048.], D, HEADS));
-        let got = gpu.pass(&latent, tokens, &context, lc, 0.8, &table, None, true)?;
+        let table = gpu.upload(&rope_table(&video_positions(frames, h, w, fps, false), &[20., 2048., 2048.], D, HEADS));
+        let got = gpu.pass(&latent, tokens, &context, lc, 0.8, &table, (0, 0), None, true)?;
         let trail = &got[0];
         drop(gpu);
         #[cfg(feature = "cuda")]

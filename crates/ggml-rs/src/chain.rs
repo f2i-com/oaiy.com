@@ -51,6 +51,22 @@ pub enum RowNorm {
     Layer,
 }
 
+/// Which rows of a modulated op take its modulation's second set: a video's clean conditioning tokens (its first
+/// frame's, its appended last frame's), their timestep 0 beside the noisy tokens' sigma.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CleanRows {
+    /// The rows before this one, and those from `from` on, take the second set.
+    pub before: usize,
+    pub from: usize,
+    /// The second set's offset from the first in the modulation's vector.
+    pub offset: usize,
+}
+
+impl CleanRows {
+    /// Every row the first set's.
+    pub const NONE: Self = Self { before: 0, from: usize::MAX, offset: 0 };
+}
+
 /// A device that runs a chain of ops on vectors it holds.
 pub trait DeviceChain: Send + Sync {
     /// A zeroed vector of `len`.
@@ -355,7 +371,12 @@ pub trait ChainRecorder {
     /// modulation the same.
     #[allow(clippy::too_many_arguments)]
     fn norm_mod_rows(&mut self, x: &DeviceVec, out: &DeviceVec, rows: usize, n: usize, mods: &DeviceVec, scale_at: usize, shift_at: Option<usize>, norm: RowNorm, eps: f32) {
-        let _ = (x, out, rows, n, mods, scale_at, shift_at, norm, eps);
+        self.norm_mod_rows_clean(x, out, rows, n, mods, scale_at, shift_at, norm, eps, CleanRows::NONE)
+    }
+    /// [`Self::norm_mod_rows`] with `clean`'s rows modulated by the second set (`clean.offset` on in `mods`).
+    #[allow(clippy::too_many_arguments)]
+    fn norm_mod_rows_clean(&mut self, x: &DeviceVec, out: &DeviceVec, rows: usize, n: usize, mods: &DeviceVec, scale_at: usize, shift_at: Option<usize>, norm: RowNorm, eps: f32, clean: CleanRows) {
+        let _ = (x, out, rows, n, mods, scale_at, shift_at, norm, eps, clean);
         unimplemented!("a modulated norm on this device")
     }
     /// RoPE of `x` (`[rows, heads, head_dim]`) in place over each head's halves (NeoX pairs `(k, k + head_dim / 2)`),
@@ -375,7 +396,12 @@ pub trait ChainRecorder {
     /// a diffusion transformer's gated residual.
     #[allow(clippy::too_many_arguments)]
     fn add_gated_rows(&mut self, x: &DeviceVec, y: &DeviceVec, rows: usize, n: usize, mods: &DeviceVec, gate_at: usize, tanh: bool) {
-        let _ = (x, y, rows, n, mods, gate_at, tanh);
+        self.add_gated_rows_clean(x, y, rows, n, mods, gate_at, tanh, CleanRows::NONE)
+    }
+    /// [`Self::add_gated_rows`] with `clean`'s rows gated by the second set (`clean.offset` on in `mods`).
+    #[allow(clippy::too_many_arguments)]
+    fn add_gated_rows_clean(&mut self, x: &DeviceVec, y: &DeviceVec, rows: usize, n: usize, mods: &DeviceVec, gate_at: usize, tanh: bool, clean: CleanRows) {
+        let _ = (x, y, rows, n, mods, gate_at, tanh, clean);
         unimplemented!("a gated residual on this device")
     }
     /// `out[i] = gelu(x[i])` (the tanh approximation) for `i < len`.

@@ -286,7 +286,8 @@ pub struct Request {
     pub vram_bytes: u64,
     pub ffmpeg: PathBuf,
     /// The text encoder, transformer and video decoder on WebGPU (`backend` "webgpu": any GPU wgpu reaches, Vulkan,
-    /// Metal or DX12): LTX 2.3's text-to-video, the picture only, for now.
+    /// Metal or DX12): LTX 2.3's text- and image-to-video (its start and end images encoded on the CPU), the picture
+    /// only, for now.
     pub webgpu: bool,
 }
 impl Request {
@@ -512,7 +513,6 @@ impl Request {
             let unsupported = [
                 (self.model == "ltx-2.5", "LTX 2.5 (its Gemma 4 text encoder)"),
                 (self.audio || self.audio_file.is_some() || self.speech.is_some() || self.reference_voice.is_some() || self.identity, "sound (set audio to false)"),
-                (self.image.is_some() || self.end_image.is_some(), "starting and ending images"),
                 (self.lora.is_some(), "LoRAs"),
                 (self.refine.is_some(), "two-stage refinement"),
                 (nag, "a negative prompt without CFG (NAG)"),
@@ -701,6 +701,8 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         }
     }
     let image_started = Instant::now();
+    // (a WebGPU clip's images encoded on the CPU, whose matmuls take F32, not BF16)
+    let vae_dtype = if r.webgpu { DType::F32 } else { DType::BF16 };
     // Two stages: the first renders at half the size.
     let two_stage = r.guidance.is_some() && r.refine.is_some();
     let stage_size = if two_stage { (r.width / 2, r.height / 2) } else { (r.width, r.height) };
@@ -708,12 +710,12 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         if r.image.is_none() && r.end_image.is_none() {
             return Ok((None, None));
         }
-        let encoder = vae::LtxVideoEncoder::load(&r.vae, vae::LtxVaeConfig::ltx_2_3_22b(), &dev, DType::BF16)?;
+        let encoder = vae::LtxVideoEncoder::load(&r.vae, vae::LtxVaeConfig::ltx_2_3_22b(), &dev, vae_dtype)?;
         let mut encode = |path: &Option<PathBuf>, stage: &str| -> Result<Option<Tensor>> {
             path.as_ref()
                 .map(|path| {
                     report(event(stage, 0, 1));
-                    encode_image(path, size, &encoder, &dev, &r.ffmpeg, image_crf(r))
+                    encode_image(path, size, &encoder, &dev, vae_dtype, &r.ffmpeg, image_crf(r))
                 })
                 .transpose()
         };
@@ -728,13 +730,13 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
             &r.vae,
             vae::LtxVaeConfig::ltx_2_3_22b(),
             &dev,
-            DType::BF16,
+            vae_dtype,
         )?;
         let mut encode = |path: &Option<PathBuf>, stage: &str| -> Result<Option<Tensor>> {
             path.as_ref()
                 .map(|path| {
                     report(event(stage, 0, 1));
-                    encode_image(path, stage_size, &encoder, &dev, &r.ffmpeg, image_crf(r))
+                    encode_image(path, stage_size, &encoder, &dev, vae_dtype, &r.ffmpeg, image_crf(r))
                 })
                 .transpose()
         };
@@ -1026,7 +1028,8 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
                     let latent = video_f32.as_deref().ok_or_else(|| candle_core::Error::Msg("the latent's values".into()))?;
                     let values = context.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
                     let tokens = latent.len() / 128;
-                    let v = m.forward(latent, tokens, &values, values.len() / 4096, sigma, table, perturb)?;
+                    let clean = (if starting_latent.is_some() { h * w } else { 0 }, if ending_latent.is_some() { h * w } else { 0 });
+                    let v = m.forward(latent, tokens, &values, values.len() / 4096, sigma, table, clean, perturb)?;
                     report(event("video_denoising", (step * passes + at + 1) * 48, steps * passes * 48));
                     Ok((Tensor::from_vec(v, (1, tokens, 128), &dev)?, None))
                 }
@@ -1463,7 +1466,7 @@ enum Model {
 fn webgpu_model(r: &Request, store: &mut Store, f: usize, h: usize, w: usize, report: &mut dyn FnMut(Json)) -> Result<Model> {
     report(event("loading_video_model", 0, 48));
     let m = crate::ltx_wgpu::WgpuLtx::load(store, r.device, |n| report(event("loading_video_model", n, 48)))?;
-    let table = m.upload(&crate::ltx_wgpu::rope_table(&crate::ltx_wgpu::video_positions(f, h, w, r.fps), &[20., 2048., 2048.], 4096, 32));
+    let table = m.upload(&crate::ltx_wgpu::rope_table(&crate::ltx_wgpu::video_positions(f, h, w, r.fps, r.end_image.is_some()), &[20., 2048., 2048.], 4096, 32));
     Ok(Model::Wgpu(m, table))
 }
 #[cfg(not(feature = "webgpu"))]
@@ -1630,11 +1633,13 @@ fn recompress(ffmpeg: &std::path::Path, image: image::RgbImage, crf: u32) -> Res
         .ok_or_else(|| candle_core::Error::Msg("FFmpeg returned a short frame".into()))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_image(
     path: &std::path::Path,
     (width, height): (usize, usize),
     encoder: &vae::LtxVideoEncoder,
     dev: &Device,
+    dtype: DType,
     ffmpeg: &std::path::Path,
     crf: u32,
 ) -> Result<Tensor> {
@@ -1662,7 +1667,7 @@ fn encode_image(
     let pixels = Tensor::from_vec(values, (1, 1, height, width, 3), &dev)?
         .permute((0, 4, 1, 2, 3))?
         .contiguous()?
-        .to_dtype(DType::BF16)?;
+        .to_dtype(dtype)?;
     let latent = encoder
         .encode_means(&pixels)?
         .permute((0, 2, 3, 4, 1))?
