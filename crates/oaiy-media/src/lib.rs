@@ -19,6 +19,8 @@ pub mod text_wgpu;
 pub mod ltx_wgpu;
 #[cfg(feature = "webgpu")]
 pub mod ltx_vae_wgpu;
+#[cfg(feature = "webgpu")]
+pub mod ltx_text_wgpu;
 pub mod vae;
 pub mod vision;
 pub mod weights;

@@ -177,6 +177,24 @@ mod tests {
     use super::*;
     use candle_core::DType;
 
+    /// How long the WebGPU decoder takes (`--ignored --nocapture`, `OAIY_LTX_NVFP4`): a 768x512 clip of 121 frames
+    /// (a latent of 16 frames of 16 by 24), and the card's memory at its most.
+    #[test]
+    #[ignore = "a timing; needs LTX 2.3's checkpoint (OAIY_LTX_NVFP4) and a WebGPU adapter"]
+    fn measure_a_clips_decode() -> Result<()> {
+        let Some(path) = std::env::var_os("OAIY_LTX_NVFP4") else { return Ok(()) };
+        let (f, h, w) = (16usize, 16usize, 24usize);
+        let latent: Vec<f32> = (0..f * h * w * 128).map(|i| (i * 7919 % 2001) as f32 / 1000.0 - 1.0).collect();
+        let mut store = Store::open(std::path::Path::new(&path), 0)?;
+        let gpu = WgpuLtxVae::load(&mut store, 0)?;
+        for i in 0..2 {
+            let t = std::time::Instant::now();
+            let clip = gpu.decode(&latent, f, h, w)?;
+            eprintln!("decode {i}: {:.2} s, {:?}; the card's memory {:?}", t.elapsed().as_secs_f64(), clip.dims(), gpu.gpu.memory_budget().map(|(b, u)| (u as f64 / 1e9, b as f64 / 1e9)));
+        }
+        Ok(())
+    }
+
     /// The WebGPU decoder gives Candle's clip (on CUDA, BF16) from Lightricks' release (`OAIY_LTX_NVFP4`): a latent of
     /// 2 frames of 2 by 3 (9 frames of 64 by 96), random as a sampled one is.
     #[test]

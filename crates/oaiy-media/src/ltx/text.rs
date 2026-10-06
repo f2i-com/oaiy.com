@@ -150,19 +150,22 @@ fn hidden_features(
     dev: &Device,
     mut progress: impl FnMut(usize),
 ) -> Result<Tensor> {
+    // The text model's weights under `model.`, or the multimodal release's
+    // `language_model.model.` (Google's own Gemma 3 12B).
+    let p = if store.index.get("language_model.model.embed_tokens.weight").is_some() { "language_model.model." } else { "model." };
     // Masked left-padding need not traverse 48 layers. Preserve its position
     // offset so the BF16 rotary angles match the padded reference encoder.
-    let embedding = store.rows("model.embed_tokens.weight", ids, dev)?;
+    let embedding = store.rows(&format!("{p}embed_tokens.weight"), ids, dev)?;
     let mut x = embedding
         .unsqueeze(0)?
         .broadcast_mul(&Tensor::new(3840f32.sqrt(), dev)?.to_dtype(DType::BF16)?)?;
     drop(embedding);
     let mut states = vec![feature_norm(&x)?];
     for i in 0..48 {
-        let w = store.group(&format!("model.layers.{i}."), dev, false, |_| true)?;
+        let w = store.group(&format!("{p}layers.{i}."), dev, false, |_| true)?;
         x = block(&w, &x, i, gemma4, 1024 - ids.len())?;
         if i == 47 {
-            x = gemma_norm(&x, &store.tensor("model.norm.weight", dev, false)?, gemma4)?;
+            x = gemma_norm(&x, &store.tensor(&format!("{p}norm.weight"), dev, false)?, gemma4)?;
         }
         states.push(feature_norm(&x)?);
         progress(i + 1);

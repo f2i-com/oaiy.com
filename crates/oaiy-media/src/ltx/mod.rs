@@ -9,7 +9,7 @@
 mod audio;
 mod cache;
 pub(crate) mod store;
-mod text;
+pub(crate) mod text;
 pub(crate) mod transformer;
 mod upsampler;
 pub mod vae;

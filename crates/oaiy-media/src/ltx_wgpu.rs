@@ -255,34 +255,9 @@ impl WgpuLtx {
 
     /// One attention: `xq`'s `tq` rows' queries over `xkv`'s `tk` rows (each rotated by its table where given), the
     /// heads gated, out through the output projection into `y`. `s` the scratch.
-    /// With `passthrough` the attention is its value projection (the reference's perturbation for spatio-temporal
-    /// guidance), its gate and output still applied.
     #[allow(clippy::too_many_arguments)]
     fn attend(&self, r: &mut dyn ChainRecorder, a: &Attn, xq: &DeviceVec, tq: usize, xkv: &DeviceVec, tk: usize, rope: Option<&DeviceVec>, passthrough: bool, s: &Scratch, y: &DeviceVec) {
-        if passthrough {
-            a.v.forward(r, xkv, &s.att, tk);
-            a.gate.forward(r, xq, &s.logits, tq);
-            r.head_gate_rows(&s.att, &s.logits, tq, HEADS, HD);
-            a.out.forward(r, &s.att, y, tq);
-            return;
-        }
-        // (the norms take a row's width from their vectors' lengths: views of the scratch's first rows)
-        let first = |v: &DeviceVec, rows: usize| DeviceVec { len: rows * D, inner: v.inner.clone() };
-        a.q.forward(r, xq, &s.q, tq);
-        r.rmsnorm_rows(&first(&s.q, tq), &a.qn, &first(&s.qn, tq), tq, EPS);
-        a.k.forward(r, xkv, &s.k, tk);
-        r.rmsnorm_rows(&first(&s.k, tk), &a.kn, &first(&s.kn, tk), tk, EPS);
-        a.v.forward(r, xkv, &s.v, tk);
-        if let Some(t) = rope {
-            r.rope_split_rows(&s.qn, tq, HEADS, HD, t);
-            r.rope_split_rows(&s.kn, tk, HEADS, HD, t);
-        }
-        r.store_rows(&s.kn, &s.kv, tk, D, 0, 2 * D, 0);
-        r.store_rows(&s.v, &s.kv, tk, D, 0, 2 * D, D);
-        r.attention_rows_full(&s.qn, &s.kv, &s.att, tq, HEADS, HEADS, HD, tk, 1.0 / (HD as f32).sqrt());
-        a.gate.forward(r, xq, &s.logits, tq);
-        r.head_gate_rows(&s.att, &s.logits, tq, HEADS, HD);
-        a.out.forward(r, &s.att, y, tq);
+        attend(r, a, xq, tq, xkv, tk, rope, passthrough, s, y)
     }
 
     /// The video velocity of `latent` (`tokens` rows of 128) at `sigma` over `context` (`lc` rows of `D`, the
@@ -293,7 +268,7 @@ impl WgpuLtx {
         if latent.len() != tokens * self.patchify.k || context.len() != lc * D || rope.len() != tokens * D {
             candle_core::bail!("an LTX step's inputs: {} latent values for {tokens} tokens, {} context for {lc}, {} rotary", latent.len(), context.len(), rope.len());
         }
-        let s = Scratch::new(self, tokens.max(lc));
+        let s = Scratch::new(&self.gpu, tokens.max(lc));
         let (lat, ctx, table) = (self.vec(latent.len()), self.vec(context.len()), self.vec(rope.len()));
         self.gpu.upload(&lat, latent);
         self.gpu.upload(&ctx, context);
@@ -348,6 +323,37 @@ impl WgpuLtx {
     }
 }
 
+/// One attention: `xq`'s `tq` rows' queries over `xkv`'s `tk` rows (each rotated by its table where given), the heads
+/// gated, out through the output projection into `y`. With `passthrough` the attention is its value projection (the
+/// reference's perturbation for spatio-temporal guidance), its gate and output still applied. `s` the scratch.
+#[allow(clippy::too_many_arguments)]
+fn attend(r: &mut dyn ChainRecorder, a: &Attn, xq: &DeviceVec, tq: usize, xkv: &DeviceVec, tk: usize, rope: Option<&DeviceVec>, passthrough: bool, s: &Scratch, y: &DeviceVec) {
+    if passthrough {
+        a.v.forward(r, xkv, &s.att, tk);
+        a.gate.forward(r, xq, &s.logits, tq);
+        r.head_gate_rows(&s.att, &s.logits, tq, HEADS, HD);
+        a.out.forward(r, &s.att, y, tq);
+        return;
+    }
+    // (the norms take a row's width from their vectors' lengths: views of the scratch's first rows)
+    let first = |v: &DeviceVec, rows: usize| DeviceVec { len: rows * D, inner: v.inner.clone() };
+    a.q.forward(r, xq, &s.q, tq);
+    r.rmsnorm_rows(&first(&s.q, tq), &a.qn, &first(&s.qn, tq), tq, EPS);
+    a.k.forward(r, xkv, &s.k, tk);
+    r.rmsnorm_rows(&first(&s.k, tk), &a.kn, &first(&s.kn, tk), tk, EPS);
+    a.v.forward(r, xkv, &s.v, tk);
+    if let Some(t) = rope {
+        r.rope_split_rows(&s.qn, tq, HEADS, HD, t);
+        r.rope_split_rows(&s.kn, tk, HEADS, HD, t);
+    }
+    r.store_rows(&s.kn, &s.kv, tk, D, 0, 2 * D, 0);
+    r.store_rows(&s.v, &s.kv, tk, D, 0, 2 * D, D);
+    r.attention_rows_full(&s.qn, &s.kv, &s.att, tq, HEADS, HEADS, HD, tk, 1.0 / (HD as f32).sqrt());
+    a.gate.forward(r, xq, &s.logits, tq);
+    r.head_gate_rows(&s.att, &s.logits, tq, HEADS, HD);
+    a.out.forward(r, &s.att, y, tq);
+}
+
 /// An attention's vectors, for `rows` rows at the most.
 struct Scratch {
     q: DeviceVec,
@@ -361,18 +367,55 @@ struct Scratch {
 }
 
 impl Scratch {
-    fn new(m: &WgpuLtx, rows: usize) -> Self {
+    fn new(gpu: &ggml_rs_wgpu::WgpuBackend, rows: usize) -> Self {
+        let v = |len: usize| gpu.vec(len.max(1));
         Self {
-            q: m.vec(rows * D),
-            qn: m.vec(rows * D),
-            k: m.vec(rows * D),
-            kn: m.vec(rows * D),
-            v: m.vec(rows * D),
-            kv: m.vec(rows * 2 * D),
-            att: m.vec(m.gpu.attention_rows_full_out_len(rows, HEADS, HD, rows)),
-            logits: m.vec(rows * HEADS),
+            q: v(rows * D),
+            qn: v(rows * D),
+            k: v(rows * D),
+            kn: v(rows * D),
+            v: v(rows * D),
+            kv: v(rows * 2 * D),
+            att: v(gpu.attention_rows_full_out_len(rows, HEADS, HD, rows)),
+            logits: v(rows * HEADS),
         }
     }
+}
+
+/// One of a text connector's blocks: its gated self-attention and its feed-forward.
+pub struct ConnectorBlock {
+    attn1: Attn,
+    ff0: Linear,
+    ff2: Linear,
+}
+
+impl ConnectorBlock {
+    pub fn load(store: &mut Store, gpu: &ggml_rs_wgpu::WgpuBackend, p: &str) -> Result<Self> {
+        Ok(Self { attn1: Attn::load(store, gpu, &format!("{p}.attn1"))?, ff0: Linear::load(store, gpu, &format!("{p}.ff.net.0.proj"))?, ff2: Linear::load(store, gpu, &format!("{p}.ff.net.2"))? })
+    }
+}
+
+/// The text connector over `x` (`rows` of `D`, changed in place) as [`crate::ltx::transformer::connector`] runs it:
+/// each block RMS-normed (no weights) into its self-attention (rotated by `table`) and its feed-forward, each added
+/// back; the result over its RMS (a new vector).
+pub fn connector(gpu: &ggml_rs_wgpu::WgpuBackend, r: &mut dyn ChainRecorder, blocks: &[ConnectorBlock], x: &DeviceVec, rows: usize, table: &DeviceVec) -> DeviceVec {
+    let s = Scratch::new(gpu, rows);
+    let ones = gpu.vec(D);
+    gpu.upload(&ones, &vec![1.0; D]);
+    let v = |len: usize| gpu.vec(len.max(1));
+    let (h, y, f, fg, out) = (v(rows * D), v(rows * D), v(rows * 4 * D), v(rows * 4 * D), v(rows * D));
+    for b in blocks {
+        r.rmsnorm_rows(x, &ones, &h, rows, EPS);
+        attend(r, &b.attn1, &h, rows, &h, rows, Some(table), false, &s, &y);
+        r.add(x, &y);
+        r.rmsnorm_rows(x, &ones, &h, rows, EPS);
+        b.ff0.forward(r, &h, &f, rows);
+        r.gelu(&f, &fg, rows * b.ff0.n);
+        b.ff2.forward(r, &fg, &y, rows);
+        r.add(x, &y);
+    }
+    r.rmsnorm_rows(x, &ones, &out, rows, EPS);
+    out
 }
 
 #[cfg(test)]
