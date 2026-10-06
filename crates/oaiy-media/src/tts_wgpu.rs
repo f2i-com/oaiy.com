@@ -125,6 +125,11 @@ impl WgpuTalker {
         self.hidden
     }
 
+    /// The device it runs on (the codec's after it).
+    pub fn gpu(&self) -> &WgpuBackend {
+        &self.gpu
+    }
+
     /// T(ids): text embedding rows through the text projection (`[n, hidden]`, on the host).
     fn text(&mut self, ids: &[u32]) -> Result<Vec<f32>> {
         let g = &self.gpu;

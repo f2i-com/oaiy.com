@@ -23,7 +23,7 @@ pub const SAMPLES_PER_FRAME: usize = 1920;
 pub const SAMPLE_RATE: usize = 24_000;
 /// The official decoder works on 300-frame chunks with 25 frames of left
 /// context; longer inputs are decoded the same way.
-const CHUNK: usize = 300;
+pub const CHUNK: usize = 300;
 pub const LEFT_CONTEXT: usize = 25;
 
 /// The decoder's shape, from `decoder_config` in the speech tokenizer's

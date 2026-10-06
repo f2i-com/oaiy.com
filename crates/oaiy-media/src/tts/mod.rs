@@ -8,9 +8,9 @@
 //! encoder turn that clip into a speaker embedding and reference codes. Later
 //! lines prompt the Base talker with them (in-context), so the voice holds.
 //!
-//! `backend` "webgpu" speaks on WebGPU ([`crate::tts_wgpu`]: the talker on any GPU, the codec, F32, on the CPU), as a
-//! worker built with WebGPU and without CUDA does by default (Candle's talker needs CUDA: its weights BF16). Breeze TTS
-//! 2 and voice design are not on WebGPU yet.
+//! `backend` "webgpu" speaks on WebGPU, the talker ([`crate::tts_wgpu`]) and the speech codec's decoder
+//! ([`crate::codec_wgpu`]) on any GPU, as a worker built with WebGPU and without CUDA does by default (Candle's talker
+//! needs CUDA: its weights BF16). Breeze TTS 2 and voice design are not on WebGPU yet.
 pub mod breeze;
 pub mod clone;
 pub mod codec;
@@ -325,7 +325,8 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     Ok(result)
 }
 
-/// [`generate`] on WebGPU: the talker there ([`crate::tts_wgpu::WgpuTalker`]), the codec (F32) on the CPU.
+/// [`generate`] on WebGPU: the talker ([`crate::tts_wgpu::WgpuTalker`]), then the codec's decoder
+/// ([`crate::codec_wgpu::WgpuCodec`]) on its device.
 #[cfg(feature = "webgpu")]
 fn generate_webgpu(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     let started = Instant::now();
@@ -350,10 +351,11 @@ fn generate_webgpu(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     let speak_started = Instant::now();
     let frames = tts.frames(&prefill, trailing, r.sampling(), max_frames, |n| report(event("speaking", n, max_frames)))?;
     let speak_seconds = speak_started.elapsed().as_secs_f64();
+    let gpu = tts.gpu().clone();
     drop(tts);
     report(event("decoding_speech", 0, 1));
     let decode_started = Instant::now();
-    let codec = codec::CodecDecoder::load(&r.model_dir.join("speech_tokenizer").join("model.safetensors"), &Device::Cpu)?;
+    let codec = crate::codec_wgpu::WgpuCodec::load(&r.model_dir.join("speech_tokenizer").join("model.safetensors"), &gpu)?;
     let samples = match (&r.voice, frames.is_empty()) {
         (_, true) => Vec::new(),
         (Some(voice), false) => {
