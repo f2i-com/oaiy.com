@@ -310,6 +310,16 @@ impl Model {
 }
 
 /// `loras`: LoRA adapters as `[{"path": …, "strength": 0.8}]` (strength 1 when left out), or plain paths.
+/// A request's `backend` for a model with no WebGPU path yet (`what`): cuda or cpu as before, webgpu refused rather than
+/// run on Candle unasked (a computer with no CUDA would crawl through it on the CPU).
+pub(crate) fn not_on_webgpu(j: &Json, what: &str) -> std::result::Result<(), String> {
+    match j.get("backend").and_then(Json::as_str) {
+        None | Some("cuda" | "cpu") => Ok(()),
+        Some("webgpu") => Err(format!("{what} does not run on WebGPU yet: give this model the cuda or cpu backend")),
+        Some(other) => Err(format!("backend must be cuda, cpu or webgpu, not {other}")),
+    }
+}
+
 pub(crate) fn parse_loras(j: &Json) -> std::result::Result<Vec<(PathBuf, f64)>, String> {
     let Some(list) = j.get("loras") else { return Ok(Vec::new()) };
     if matches!(list, Json::Null) {
@@ -624,6 +634,15 @@ pub(crate) fn noise(seed: u64, n: usize) -> Vec<f32> {
     }
     out
 }
+#[test]
+fn models_with_no_webgpu_path_refuse_it() {
+    let j = |b: &str| Json::parse(format!(r#"{{"backend":"{b}"}}"#).as_bytes()).unwrap();
+    assert!(not_on_webgpu(&j("cuda"), "SDXL").is_ok() && not_on_webgpu(&j("cpu"), "SDXL").is_ok());
+    assert!(not_on_webgpu(&Json::parse(b"{}").unwrap(), "SDXL").is_ok());
+    assert!(not_on_webgpu(&j("webgpu"), "SDXL").unwrap_err().contains("SDXL does not run on WebGPU yet"));
+    assert!(not_on_webgpu(&j("vulkan"), "SDXL").is_err());
+}
+
 #[test]
 fn seeds_are_repeatable_and_distinct() {
     assert_eq!(noise(7, 13), noise(7, 13));

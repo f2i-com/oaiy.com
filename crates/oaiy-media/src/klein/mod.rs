@@ -31,6 +31,7 @@ pub struct Request {
 }
 impl Request {
     pub fn parse(j: &Json) -> std::result::Result<Self, String> {
+        crate::pipeline::not_on_webgpu(j, "FLUX.2 Klein")?;
         let path = |key: &str| -> std::result::Result<PathBuf, String> {
             let p = PathBuf::from(
                 j.get(key)

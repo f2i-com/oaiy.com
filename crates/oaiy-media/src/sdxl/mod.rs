@@ -35,6 +35,7 @@ pub struct Request {
 }
 impl Request {
     pub fn parse(j: &Json) -> std::result::Result<Self, String> {
+        crate::pipeline::not_on_webgpu(j, "SDXL")?;
         let text = |k| {
             j.get(k)
                 .and_then(Json::as_str)
