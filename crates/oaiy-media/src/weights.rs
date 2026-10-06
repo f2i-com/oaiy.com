@@ -101,11 +101,21 @@ impl Weights {
         }
     }
 
+    /// `name` as ComfyUI's W4A8 keeps it ([`crate::comfy_quant::W4a8`]: a GPU's to decode), None for anything else.
+    pub fn w4a8(&self, name: &str) -> Result<Option<crate::comfy_quant::W4a8>> {
+        let Ok(key) = self.resolve(name) else { return Ok(None) };
+        match self {
+            Self::Safe(s) => crate::comfy_quant::w4a8(s, &key),
+            Self::Gguf { .. } => Ok(None),
+        }
+    }
+
     /// Inspect dimensions without materializing tensor payloads.
     pub fn shape(&self, name: &str) -> Result<Vec<usize>> {
         let key = self.resolve(name)?;
         match self {
-            Self::Safe(s) => Ok(s.info(&key).map_err(candle_core::Error::wrap)?.shape.clone()),
+            // (ComfyUI's W4A8: its codes two to a byte, the matrix [rows, 2 x the bytes'], as Self::tensor reads it)
+            Self::Safe(s) => Ok(crate::comfy_quant::logical_shape(s, &key).unwrap_or(s.info(&key).map_err(candle_core::Error::wrap)?.shape.clone())),
             Self::Gguf { content, .. } => Ok(content.tensor_infos.get(&key)
                 .ok_or_else(|| candle_core::Error::Msg(format!("missing tensor {key}")))?.shape.dims().to_vec()),
         }

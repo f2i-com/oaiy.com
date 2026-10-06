@@ -1817,6 +1817,98 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 }
 "#;
 
+/// ComfyUI's W4A8 decoded to f16 ([`ChainRecorder::w4a8_f16`]), a thread a code byte (two values, an f16 pair's
+/// word). `p[0]`: the rows, the columns.
+const W4A8_F16: &str = r#"
+@group(0) @binding(0) var<storage, read> codes: array<u32>;
+@group(0) @binding(1) var<storage, read> rel: array<u32>;
+@group(0) @binding(2) var<storage, read> channel: array<f32>;
+@group(0) @binding(3) var<storage, read> book: array<f32>;
+@group(0) @binding(6) var<storage, read_write> out: array<u32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+fn e4m3(b: u32) -> f32 {
+    let e = (b >> 3u) & 15u;
+    let m = b & 7u;
+    let v = select(bitcast<f32>(((e + 120u) << 23u) | (m << 20u)), f32(m) * 0.001953125, e == 0u);
+    return select(v, -v, (b & 128u) != 0u);
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    let cols = p[0].y;
+    let bytes = cols / 2u;
+    if (i >= p[0].x * bytes) { return; }
+    let row = i / bytes;
+    let col = 2u * (i % bytes);
+    let b = (codes[i / 4u] >> (8u * (i % 4u))) & 255u;
+    let gi = row * (cols / 16u) + col / 16u;
+    let s = e4m3((rel[gi / 4u] >> (8u * (gi % 4u))) & 255u);
+    let ch = channel[row];
+    let lo = clamp(round(book[b & 15u] * s), -127.0, 127.0) * ch;
+    let hi = clamp(round(book[b >> 4u] * s), -127.0, 127.0) * ch;
+    out[i] = pack2x16float(vec2<f32>(lo, hi));
+}
+"#;
+
+/// [`W4A8_F16`] with ConvRot's rotation undone (`GS`, a power of four, put in): a workgroup a row's group, decoded
+/// into its memory, then the Hadamard matrix's passes of four (a digit of the group's base-4 index each), scaled by
+/// the group's square root. `p[0]`: the rows, the columns; a row `wg.y + 65,535 wg.z`, its group `wg.x`.
+const W4A8_F16_ROTATED: &str = r#"
+@group(0) @binding(0) var<storage, read> codes: array<u32>;
+@group(0) @binding(1) var<storage, read> rel: array<u32>;
+@group(0) @binding(2) var<storage, read> channel: array<f32>;
+@group(0) @binding(3) var<storage, read> book: array<f32>;
+@group(0) @binding(6) var<storage, read_write> out: array<u32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+const GS: u32 = GS_u;
+var<workgroup> g: array<f32, GS_u>;
+
+fn e4m3(b: u32) -> f32 {
+    let e = (b >> 3u) & 15u;
+    let m = b & 7u;
+    let v = select(bitcast<f32>(((e + 120u) << 23u) | (m << 20u)), f32(m) * 0.001953125, e == 0u);
+    return select(v, -v, (b & 128u) != 0u);
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    let cols = p[0].y;
+    let row = min(wg.y + wg.z * 65535u, p[0].x - 1u);
+    let g0 = wg.x * GS;
+    let ch = channel[row];
+    for (var cb = t; cb < GS / 2u; cb += 64u) {
+        let i = row * (cols / 2u) + g0 / 2u + cb;
+        let b = (codes[i / 4u] >> (8u * (i % 4u))) & 255u;
+        let gi = row * (cols / 16u) + (g0 + 2u * cb) / 16u;
+        let s = e4m3((rel[gi / 4u] >> (8u * (gi % 4u))) & 255u);
+        g[2u * cb] = clamp(round(book[b & 15u] * s), -127.0, 127.0) * ch;
+        g[2u * cb + 1u] = clamp(round(book[b >> 4u] * s), -127.0, 127.0) * ch;
+    }
+    workgroupBarrier();
+    for (var h = 1u; h < GS; h *= 4u) {
+        for (var u = t; u < GS / 4u; u += 64u) {
+            let j = (u / h) * 4u * h + u % h;
+            let a = g[j];
+            let b = g[j + h];
+            let c = g[j + 2u * h];
+            let d = g[j + 3u * h];
+            g[j] = a + b + c - d;
+            g[j + h] = a + b - c + d;
+            g[j + 2u * h] = a - b + c + d;
+            g[j + 3u * h] = -a + b + c + d;
+        }
+        workgroupBarrier();
+    }
+    let scale = 1.0 / sqrt(f32(GS));
+    for (var cb = t; cb < GS / 2u; cb += 64u) {
+        out[row * (cols / 2u) + g0 / 2u + cb] = pack2x16float(vec2<f32>(g[2u * cb], g[2u * cb + 1u]) * scale);
+    }
+}
+"#;
+
 /// `out = x` where positive, else `slope x`: `p[0]` the values, the slope's bits.
 const LEAKY_RELU: &str = r#"
 @group(0) @binding(0) var<storage, read> x: array<f32>;
@@ -4157,6 +4249,34 @@ impl ChainRecorder for Recorder<'_> {
         self.conv_taps(w, b, cout, cin, k * k, x, xs, 1, h, wd, y);
     }
 
+    fn w4a8_f16(&mut self, codes: &DeviceVec, rel: &DeviceVec, channel: &DeviceVec, book: &DeviceVec, rows: usize, cols: usize, rotation: usize, out: &DeviceVec) {
+        assert!(
+            rows > 0 && cols % 16 == 0 && codes.len * 8 >= rows * cols && rel.len * 4 >= rows * cols / 16 && channel.len >= rows && book.len >= 16 && out.len * 2 >= rows * cols,
+            "chain: a W4A8 matrix of {rows} by {cols}"
+        );
+        assert!(rotation == 0 || (rotation.is_power_of_two() && rotation.trailing_zeros() % 2 == 0 && (4..=4096).contains(&rotation) && cols % rotation == 0), "chain: W4A8's rotation of {rotation} over {cols} columns");
+        let drw = self.gpu().dummy_rw().clone();
+        let d = self.gpu().dummy().clone();
+        let bufs = [buffer(codes), buffer(rel), buffer(channel), buffer(book), &d, &d, buffer(out), &drw];
+        let words = [rows as u32, cols as u32];
+        if rotation == 0 {
+            let n = (rows * cols / 2) as u32;
+            self.dispatch_wide("chain-w4a8-f16", W4A8_F16, bufs, &words, grid(n.div_ceil(256)));
+        } else {
+            let name: &'static str = match rotation {
+                4 => "chain-w4a8-f16-rotated-4",
+                16 => "chain-w4a8-f16-rotated-16",
+                64 => "chain-w4a8-f16-rotated-64",
+                256 => "chain-w4a8-f16-rotated-256",
+                1024 => "chain-w4a8-f16-rotated-1024",
+                _ => "chain-w4a8-f16-rotated-4096",
+            };
+            let body = W4A8_F16_ROTATED.replace("GS_u", &format!("{rotation}u"));
+            let r = rows as u32;
+            self.dispatch_wide(name, &body, bufs, &words, ((cols / rotation) as u32, r.min(65535), r.div_ceil(65535)));
+        }
+    }
+
     fn leaky_relu(&mut self, x: &DeviceVec, out: &DeviceVec, len: usize, slope: f32) {
         assert!(x.len >= len && out.len >= len, "chain: a leaky ReLU of {len}");
         let d = self.gpu().dummy().clone();
@@ -5456,6 +5576,67 @@ mod tests {
         assert_eq!(back, w.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect::<Vec<_>>());
         assert!(b.vec_f16_rounded(&[1.0, 70000.0]).is_none(), "past f16's range");
         assert!(b.vec_f16_rounded(&[1.0, f32::NAN]).is_none(), "not a number");
+    }
+
+    /// ComfyUI's W4A8 decoded on the device as the host decodes it: codes of a random codebook, FP8 group scales (a
+    /// subnormal among them), rows' scales; not rotated, and rotated in groups of 16 and 256.
+    #[test]
+    fn w4a8s_decode_is_the_hosts() {
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        let mut r = rng(113);
+        let e4m3 = |v: u8| -> f32 {
+            let (e, m) = (((v >> 3) & 15) as i32, (v & 7) as f32);
+            let x = if e == 0 { m / 8.0 * 2f32.powi(-6) } else { (1.0 + m / 8.0) * 2f32.powi(e - 7) };
+            if v & 128 != 0 { -x } else { x }
+        };
+        for (rows, cols, rotation) in [(5usize, 48usize, 0usize), (3, 64, 16), (70, 512, 256)] {
+            let codes: Vec<u8> = (0..rows * cols / 2).map(|_| ((r() + 1.0) * 127.9) as u8).collect();
+            // (scales up to e4m3's 2^3 or so, a subnormal at the first)
+            let rel: Vec<u8> = (0..rows * cols / 16).map(|i| if i == 0 { 3 } else { 0x30 + ((r() + 1.0) * 15.9) as u8 }).collect();
+            let channel: Vec<f32> = (0..rows).map(|_| r() * 0.01).collect();
+            let book: Vec<f32> = (0..16).map(|i| (i as f32 - 8.0) * (1.0 + 0.1 * r())).collect();
+            // the host's: the values, then each group rotated
+            let mut want: Vec<f32> = (0..rows * cols)
+                .map(|i| {
+                    let (row, col) = (i / cols, i % cols);
+                    let byte = codes[row * cols / 2 + col / 2];
+                    let code = if col % 2 == 0 { byte & 15 } else { byte >> 4 };
+                    (book[code as usize] * e4m3(rel[row * cols / 16 + col / 16])).round_ties_even().clamp(-127.0, 127.0) * channel[row]
+                })
+                .collect();
+            if rotation > 0 {
+                const H: [[f32; 4]; 4] = [[1., 1., 1., -1.], [1., 1., -1., 1.], [1., -1., 1., 1.], [-1., 1., 1., 1.]];
+                let entry = |mut a: usize, mut c: usize| {
+                    let mut v = 1.0 / (rotation as f32).sqrt();
+                    while a != 0 || c != 0 {
+                        v *= H[a % 4][c % 4];
+                        a /= 4;
+                        c /= 4;
+                    }
+                    v
+                };
+                for group in want.chunks_mut(rotation) {
+                    let x = group.to_vec();
+                    for (c, y) in group.iter_mut().enumerate() {
+                        *y = (0..rotation).map(|a| x[a] * entry(a, c)).sum();
+                    }
+                }
+            }
+            let words = |bytes: &[u8]| -> Vec<f32> { bytes.chunks(4).map(|c| { let mut w = [0u8; 4]; w[..c.len()].copy_from_slice(c); f32::from_bits(u32::from_le_bytes(w)) }).collect() };
+            let (cw, rw) = (words(&codes), words(&rel));
+            let (cd, rd, chd, bd, out) = (b.vec(cw.len()), b.vec(rw.len()), b.vec(rows), b.vec(16), b.vec(rows * cols / 2));
+            DeviceChain::upload(&b, &cd, &cw);
+            DeviceChain::upload(&b, &rd, &rw);
+            DeviceChain::upload(&b, &chd, &channel);
+            DeviceChain::upload(&b, &bd, &book);
+            let mut rec = b.begin();
+            rec.w4a8_f16(&cd, &rd, &chd, &bd, rows, cols, rotation, &out);
+            rec.read(&out);
+            let got: Vec<f32> = rec.finish().pop().unwrap().iter().flat_map(|w| [half::f16::from_bits(w.to_bits() as u16).to_f32(), half::f16::from_bits((w.to_bits() >> 16) as u16).to_f32()]).collect();
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!((g - w).abs() <= 1e-3 * w.abs() + 1e-6, "{rows}x{cols} rotated {rotation}: [{i}] {g} against {w}");
+            }
+        }
     }
 
     /// Real-ESRGAN's ops as the host computes them: a 3x3 convolution of a concatenation's leading channels (its

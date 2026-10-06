@@ -475,6 +475,18 @@ pub trait ChainRecorder {
         let _ = (w, b, cout, cin, k, x, xs, h, wd, y);
         unimplemented!("a strided convolution on this device")
     }
+    /// ComfyUI's W4A8 matrix (`rows` by `cols`) decoded into `out` as f16 pairs (`rows * cols / 2` words, the even
+    /// column the low half): `codes` its codes two to a byte (the even column the low nibble) and `rel` its FP8 E4M3
+    /// group scales (16 columns a scale), both as bytes four to a word; `channel` its rows' scales, `book` its codes'
+    /// 16 values. A value is `round(book[code] rel)` (ties to even, within -127..127) times its row's scale; with
+    /// `rotation` (a power of four; 0 none) each group that long of a row then times the Hadamard matrix ConvRot
+    /// rotated by (the 4x4 `[[1, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]]`'s Kronecker power over the
+    /// group's square root).
+    #[allow(clippy::too_many_arguments)]
+    fn w4a8_f16(&mut self, codes: &DeviceVec, rel: &DeviceVec, channel: &DeviceVec, book: &DeviceVec, rows: usize, cols: usize, rotation: usize, out: &DeviceVec) {
+        let _ = (codes, rel, channel, book, rows, cols, rotation, out);
+        unimplemented!("W4A8's decode on this device")
+    }
     /// `out = x` where `x` is positive, else `slope x`, for `len` values (a leaky ReLU; `out` may be `x`).
     fn leaky_relu(&mut self, x: &DeviceVec, out: &DeviceVec, len: usize, slope: f32) {
         let _ = (x, out, len, slope);

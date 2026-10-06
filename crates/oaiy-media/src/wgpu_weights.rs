@@ -146,14 +146,34 @@ pub fn f16_matrix(w: &mut Weights, gpu: &ggml_rs_wgpu::WgpuBackend, name: &str, 
     let key = format!("{name}.weight");
     let shape = w.shape(&key)?;
     let &[n, k] = shape.as_slice() else { candle_core::bail!("{key}: a matrix of shape {shape:?}") };
-    let words = match w.raw(&key)? {
-        Some(Raw::Bf16(b)) => f16_words(&b),
-        Some(Raw::Ggml(t, b)) => f16_words_ggml(t, &b, n, k),
-        None => f16_words_f32(&w.tensor(&key, &Device::Cpu, DType::F32)?.flatten_all()?.to_vec1::<f32>()?),
-    }
-    .ok_or_else(|| err(format!("{name}: a weight past f16's range")))?;
-    let v = gpu.vec(words.len());
-    gpu.upload(&v, &words);
+    let v = match w.w4a8(&key)? {
+        // ComfyUI's W4A8 decoded on the device (on the CPU some 8 s of a Qwen3-VL 8B's load)
+        Some(q) => {
+            let words = |bytes: &[u8]| -> Vec<f32> { bytes.chunks(4).map(|c| { let mut b = [0u8; 4]; b[..c.len()].copy_from_slice(c); f32::from_bits(u32::from_le_bytes(b)) }).collect() };
+            let (codes, rel) = (words(&q.codes), words(&q.rel));
+            let (cd, rd, ch, bk, v) = (gpu.vec(codes.len()), gpu.vec(rel.len()), gpu.vec(q.rows), gpu.vec(16), gpu.vec(q.rows * q.cols / 2));
+            gpu.upload(&cd, &codes);
+            gpu.upload(&rd, &rel);
+            gpu.upload(&ch, &q.channel);
+            gpu.upload(&bk, &q.book);
+            let mut rec = gpu.begin();
+            rec.keep_groups(false);
+            rec.w4a8_f16(&cd, &rd, &ch, &bk, q.rows, q.cols, q.rotation, &v);
+            rec.finish();
+            v
+        }
+        None => {
+            let words = match w.raw(&key)? {
+                Some(Raw::Bf16(b)) => f16_words(&b),
+                Some(Raw::Ggml(t, b)) => f16_words_ggml(t, &b, n, k),
+                None => f16_words_f32(&w.tensor(&key, &Device::Cpu, DType::F32)?.flatten_all()?.to_vec1::<f32>()?),
+            }
+            .ok_or_else(|| err(format!("{name}: a weight past f16's range")))?;
+            let v = gpu.vec(words.len());
+            gpu.upload(&v, &words);
+            v
+        }
+    };
     if !lora.is_empty() {
         for (a, b) in lora.factors(name, n, k, &Device::Cpu, DType::F32)? {
             let rank = a.dim(0)?;
