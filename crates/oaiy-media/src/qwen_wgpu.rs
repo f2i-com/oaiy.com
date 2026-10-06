@@ -388,12 +388,14 @@ mod tests {
 
     /// The WebGPU transformer gives the Candle one's velocity (CPU, f32) on the published weights
     /// (`OAIY_QWEN_IMAGE_TRANSFORMER`, e.g. `D:\Qwen-Image-2.1\transformer`): 16 text tokens' states (random, as an
-    /// encoder's are: a few channels large) and an 8 x 8 image's latent at two sigmas.
+    /// encoder's are: a few channels large) and an 8 x 8 image's latent (QWEN_IMAGE_GRID another side) at two sigmas.
     #[test]
     #[ignore = "needs the Qwen Image 2.1 transformer (OAIY_QWEN_IMAGE_TRANSFORMER) and a WebGPU adapter"]
     fn the_webgpu_transformer_is_the_candle_one() -> Result<()> {
         let Some(path) = std::env::var_os("OAIY_QWEN_IMAGE_TRANSFORMER").map(PathBuf::from) else { return Ok(()) };
-        let (nt, h, w) = (16usize, 8usize, 8usize);
+        // QWEN_IMAGE_GRID: the latent's side (8 by default; 32 is a 512x512 picture's)
+        let side: usize = std::env::var("QWEN_IMAGE_GRID").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+        let (nt, h, w) = (16usize, side, side);
         let mut seed = 0x9e3779b97f4a7c15u64;
         let mut next = || {
             seed ^= seed << 13;

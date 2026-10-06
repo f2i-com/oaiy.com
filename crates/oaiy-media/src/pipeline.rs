@@ -32,8 +32,8 @@ pub struct Request {
     pub reference_size: usize,
     /// Where the transformer and text-encoder blocks live: GPU, RAM or SSD.
     pub budget: Budget,
-    /// The transformer on WebGPU (`backend` "webgpu": any GPU wgpu reaches, OAIY_WEBGPU_ADAPTER picking one), the text
-    /// encoder and VAE on the build's own device.
+    /// The text encoder, transformer and VAE's decoder on WebGPU (`backend` "webgpu": any GPU wgpu reaches, Vulkan,
+    /// Metal or Direct3D 12; OAIY_WEBGPU_ADAPTER picking one), no reference images yet.
     pub webgpu: bool,
 }
 impl Request {
@@ -208,6 +208,36 @@ enum Model {
     Wgpu(crate::qwen_wgpu::WgpuTransformer),
 }
 
+/// The text encoder on its device: Candle's or the WebGPU chain's (prompts without reference images).
+enum Encoder {
+    Candle(TextEncoder),
+    #[cfg(feature = "webgpu")]
+    Wgpu(crate::text_wgpu::WgpuTextEncoder),
+}
+
+impl Encoder {
+    fn encode(&mut self, prompt: &str, images: &[crate::vision::Features]) -> Result<crate::text::Conditioning> {
+        match self {
+            Encoder::Candle(e) => e.encode(prompt, images),
+            #[cfg(feature = "webgpu")]
+            Encoder::Wgpu(e) => {
+                if !images.is_empty() {
+                    candle_core::bail!("reference images are not supported on WebGPU yet");
+                }
+                e.encode(prompt)
+            }
+        }
+    }
+
+    fn residency(&self) -> Json {
+        match self {
+            Encoder::Candle(e) => e.residency(),
+            #[cfg(feature = "webgpu")]
+            Encoder::Wgpu(_) => Json::obj([("device", Json::str("webgpu"))]),
+        }
+    }
+}
+
 /// The VAE's decoder on its device: Candle's or the WebGPU chain's.
 enum Decoder {
     Candle(Vae),
@@ -360,7 +390,14 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
     let reference_encoding_seconds = t.elapsed().as_secs_f64();
     event(Json::obj([("stage", Json::str("loading_text_encoder"))]));
     let text_load_start = Instant::now();
-    let mut encoder = TextEncoder::load(&r.base, r.text_encoder.as_deref(), &dev, dtype, &r.budget)?;
+    #[cfg(feature = "webgpu")]
+    let mut encoder = if r.webgpu {
+        Encoder::Wgpu(crate::text_wgpu::WgpuTextEncoder::load(&r.base, r.text_encoder.as_deref())?)
+    } else {
+        Encoder::Candle(TextEncoder::load(&r.base, r.text_encoder.as_deref(), &dev, dtype, &r.budget)?)
+    };
+    #[cfg(not(feature = "webgpu"))]
+    let mut encoder = Encoder::Candle(TextEncoder::load(&r.base, r.text_encoder.as_deref(), &dev, dtype, &r.budget)?);
     dev.synchronize()?;
     let text_load_seconds = text_load_start.elapsed().as_secs_f64();
     let encoding_start = Instant::now();
