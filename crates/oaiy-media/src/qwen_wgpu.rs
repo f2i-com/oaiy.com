@@ -1,12 +1,14 @@
 //! Qwen Image 2.1's transformer on WebGPU ([`ggml_rs_wgpu`]'s chain of ops), as [`crate::transformer`] computes it: the
 //! text prefix conditioned at time zero, its keys and values made once a prompt; each step's image tokens over them
 //! and their own. The weights are f16 on the GPU (the BF16 checkpoint's rounded to the nearest: none past f16's range,
-//! and the 0.01% it holds only nearly all below 2^-17), LoRA factors merged in as they load. A step's matmuls run on
-//! the tensor cores where the adapter has them (their inputs f16: a step's largest some 130, its MLP's); the prefix's
-//! read their inputs as f32 (its MLP's reach some 5,000, f16's range 65,504).
-use crate::{lora::Loras, text::Conditioning, weights::Weights};
-use candle_core::{DType, Device, Result, Tensor};
-use ggml_rs::{ChainRecorder, DeviceChain, DeviceVec};
+//! and the 0.01% it holds only nearly all below 2^-17), LoRA factors merged in as they load; a GGUF's K-quant blocks
+//! stay as they are where the adapter has tensor cores (Q4_K_M's 4.5 GB, not 14 as f16), each LoRA's factors beside
+//! them, added as it runs. A step's matmuls run on the tensor cores where the adapter has them (their inputs f16: a
+//! step's largest some 130, its MLP's); the prefix's f16 ones read their inputs as f32 (its MLP's reach some 5,000,
+//! f16's range 65,504).
+use crate::{lora::Loras, text::Conditioning, weights::{Raw, Weights}};
+use candle_core::{quantized::GgmlDType, DType, Device, Result, Tensor};
+use ggml_rs::{Backend, ChainRecorder, DeviceChain, DeviceVec, QuantizedTensor};
 use std::path::{Path, PathBuf};
 
 const D: usize = 4096;
@@ -23,11 +25,51 @@ fn err(e: impl std::fmt::Display) -> candle_core::Error {
     candle_core::Error::Msg(e.to_string())
 }
 
-/// A matrix on the GPU as f16 (`[n, k]`).
+/// A matrix on the GPU (`[n, k]`): f16 (a checkpoint's float weights, LoRA factors merged in as they load), or a GGUF's
+/// K-quant blocks as they are, each adapter's factors then kept beside them and added as it runs (`B A x`: `A`
+/// `[rank, k]` and `B` `[n, rank]` as f16, its scale in `B`).
 struct Mat {
-    v: DeviceVec,
+    w: W,
     n: usize,
     k: usize,
+    lora: Vec<(DeviceVec, DeviceVec, usize)>,
+}
+
+enum W {
+    F16(DeviceVec),
+    Quant(QuantizedTensor),
+}
+
+/// A LoRA's running vectors: its `A x` (rows of the largest rank) and its `B A x` (rows of the widest output).
+struct Low {
+    t: DeviceVec,
+    y: DeviceVec,
+}
+
+/// `v`'s first `len` values.
+fn first(v: &DeviceVec, len: usize) -> DeviceVec {
+    DeviceVec { len, inner: v.inner.clone() }
+}
+
+/// The K-quants with tensor-core kernels.
+fn coop_type(t: GgmlDType) -> Option<ggml_quants::GgmlType> {
+    use ggml_quants::GgmlType as G;
+    Some(match t {
+        GgmlDType::Q3K => G::Q3_K,
+        GgmlDType::Q4K => G::Q4_K,
+        GgmlDType::Q5K => G::Q5_K,
+        GgmlDType::Q6K => G::Q6_K,
+        GgmlDType::Q8_0 => G::Q8_0,
+        _ => return None,
+    })
+}
+
+/// A tensor's values as an f16 matrix on `gpu`.
+fn f16_vec(gpu: &ggml_rs_wgpu::WgpuBackend, t: &Tensor, what: &str) -> Result<DeviceVec> {
+    let words = crate::wgpu_weights::f16_words_f32(&t.flatten_all()?.to_vec1::<f32>()?).ok_or_else(|| err(format!("{what}: past f16's range")))?;
+    let v = gpu.vec(words.len());
+    gpu.upload(&v, &words);
+    Ok(v)
 }
 
 struct Block {
@@ -77,10 +119,13 @@ struct Scratch {
     time: [DeviceVec; 4],
     mods: DeviceVec,
     scale: DeviceVec,
+    low: Low,
 }
 
 pub struct WgpuTransformer {
     gpu: ggml_rs_wgpu::WgpuBackend,
+    /// The largest rank of the LoRA factors kept beside quantized weights (0: none).
+    rank: usize,
     img: Mat,
     text1: Mat,
     text2: Mat,
@@ -96,10 +141,32 @@ pub struct WgpuTransformer {
     scratch: Option<Scratch>,
 }
 
-/// `name`'s weight `[n, k]` (each adapter's factors merged in: `W + B A`) as f16 on `gpu`.
+/// `name`'s weight `[n, k]` on `gpu`: a GGUF's K-quant blocks as they are where the tensor cores take them (rows a
+/// multiple of 256 long; OAIY_WEBGPU_DEQUANTIZE f16 throughout), each adapter's factors beside them; else f16, each
+/// adapter's factors merged in (`W + B A`).
 fn matrix(w: &mut Weights, lora: &mut Loras, gpu: &ggml_rs_wgpu::WgpuBackend, name: &str) -> Result<Mat> {
+    let key = format!("{name}.weight");
+    let shape = w.shape(&key)?;
+    let quant = w.ggml_dtype(&key).and_then(coop_type).filter(|_| gpu.tensor_cores() && std::env::var_os("OAIY_WEBGPU_DEQUANTIZE").is_none());
+    if let (Some(g), &[n, k]) = (quant, shape.as_slice()) {
+        if let (0, Some(Raw::Ggml(_, bytes))) = (k % 256, w.raw(&key)?) {
+            let size = bytes.len();
+            let q = gpu.to_device_quant(QuantizedTensor::from_bytes_cpu(bytes, vec![n, k], g));
+            if !q.is_device() {
+                candle_core::bail!("{key}: no room on the GPU for its {} MB", size >> 20);
+            }
+            let mut low = Vec::new();
+            if !lora.is_empty() {
+                for (a, b) in lora.factors(name, n, k, &Device::Cpu, DType::F32)? {
+                    let rank = a.dim(0)?;
+                    low.push((f16_vec(gpu, &a, name)?, f16_vec(gpu, &b, name)?, rank));
+                }
+            }
+            return Ok(Mat { w: W::Quant(q), n, k, lora: low });
+        }
+    }
     let (v, n, k) = crate::wgpu_weights::f16_matrix(w, gpu, name, lora)?;
-    Ok(Mat { v, n, k })
+    Ok(Mat { w: W::F16(v), n, k, lora: Vec::new() })
 }
 
 /// `name` (a norm's weight) as f32 on `gpu`, plus `add`.
@@ -190,7 +257,9 @@ impl WgpuTransformer {
         let text_norm = vector(&mut w, &gpu, "txt_in.text_norm.weight", 1.)?;
         // every block has been read once: an adapter that fit nothing is for another model
         let lora_notes = lora.check()?;
-        Ok(Self { gpu, img, text1, text2, time1, time2, modulation, norm_out, out, text_norm, blocks, lora_notes, scratch: None })
+        let mats = [&img, &text1, &text2, &time1, &time2, &modulation, &norm_out, &out].into_iter().chain(blocks.iter().flat_map(|b| [&b.q, &b.k, &b.v, &b.o, &b.gate, &b.up, &b.down]));
+        let rank = mats.flat_map(|m| m.lora.iter().map(|l| l.2)).max().unwrap_or(0);
+        Ok(Self { gpu, rank, img, text1, text2, time1, time2, modulation, norm_out, out, text_norm, blocks, lora_notes, scratch: None })
     }
 
     /// LoRA adapters that fit only in part, and what of them was left out.
@@ -209,25 +278,37 @@ impl WgpuTransformer {
         self.gpu.vec(len.max(1))
     }
 
-    /// `y = W x` for `rows` rows: the tensor cores' f16 inputs, or (`exact`) the inputs as f32.
-    fn mul(rec: &mut dyn ChainRecorder, m: &Mat, x: &DeviceVec, y: &DeviceVec, rows: usize, exact: bool) {
-        if exact {
-            rec.matmul_f16_rows_f32(&m.v, m.n, m.k, x, y, rows);
-        } else {
-            rec.matmul_f16_rows(&m.v, m.n, m.k, x, y, rows);
+    /// A LoRA's running vectors for `rows` rows (nothing to speak of where no factors are kept).
+    fn low(&self, rows: usize) -> Low {
+        let rows = if self.rank == 0 { 0 } else { rows };
+        Low { t: self.vec(rows * self.rank), y: self.vec(rows * FF) }
+    }
+
+    /// `y = W x` for `rows` rows, each kept LoRA's `B A x` added: the tensor cores' f16 inputs, or (`exact`) an f16
+    /// weight's inputs as f32 (a K-quant's matmul takes them as f16).
+    fn mul(rec: &mut dyn ChainRecorder, m: &Mat, x: &DeviceVec, y: &DeviceVec, rows: usize, exact: bool, low: &Low) {
+        match &m.w {
+            W::F16(v) if exact => rec.matmul_f16_rows_f32(v, m.n, m.k, x, y, rows),
+            W::F16(v) => rec.matmul_f16_rows(v, m.n, m.k, x, y, rows),
+            W::Quant(q) => rec.matmul_rows(q, x, y, rows),
+        }
+        for (a, b, rank) in &m.lora {
+            rec.matmul_f16_rows(a, *rank, m.k, x, &low.t, rows);
+            rec.matmul_f16_rows(b, m.n, *rank, &low.t, &low.y, rows);
+            rec.add(&first(y, rows * m.n), &first(&low.y, rows * m.n));
         }
     }
 
     /// The modulation of a timestep: `mods` the blocks' (`[scale, gate, scale, gate]`, each `D`) and `scale` the
     /// output norm's, from `t` (its sinusoids) through the time embedder; `time` its four vectors.
-    fn time(&self, rec: &mut dyn ChainRecorder, t: &DeviceVec, time: &[DeviceVec; 4], mods: &DeviceVec, scale: &DeviceVec) {
+    fn time(&self, rec: &mut dyn ChainRecorder, t: &DeviceVec, time: &[DeviceVec; 4], mods: &DeviceVec, scale: &DeviceVec, low: &Low) {
         let [t1, t1s, emb, embs] = time;
-        Self::mul(rec, &self.time1, t, t1, 1, true);
+        Self::mul(rec, &self.time1, t, t1, 1, true, low);
         rec.mul_sigmoid(t1, t1, t1s, D);
-        Self::mul(rec, &self.time2, t1s, emb, 1, true);
+        Self::mul(rec, &self.time2, t1s, emb, 1, true, low);
         rec.mul_sigmoid(emb, emb, embs, D);
-        Self::mul(rec, &self.modulation, embs, mods, 1, true);
-        Self::mul(rec, &self.norm_out, embs, scale, 1, true);
+        Self::mul(rec, &self.modulation, embs, mods, 1, true, low);
+        Self::mul(rec, &self.norm_out, embs, scale, 1, true, low);
     }
 
     /// The vectors of a step of `ni` image tokens after `nt` of the prefix's (kept for the next of the same size, the
@@ -266,6 +347,7 @@ impl WgpuTransformer {
             time: [self.vec(D), self.vec(D), self.vec(D), self.vec(D)],
             mods: self.vec(4 * D),
             scale: self.vec(D),
+            low: self.low(ni),
         }
     }
 
@@ -293,20 +375,21 @@ impl WgpuTransformer {
         let (g, u, act) = (self.vec(nt * FF), self.vec(nt * FF), self.vec(nt * FF));
         let att = self.vec(self.gpu.attention_rows_out_len(nt.div_ceil(32) * 32, HEADS, HD, nt));
         let kv: Vec<DeviceVec> = (0..BLOCKS).map(|_| self.vec(nt * ROW)).collect();
+        let low = self.low(nt);
         let mut rec = self.gpu.begin();
         rec.keep_groups(false);
         let r = rec.as_mut();
         r.rmsnorm_rows(&sv, &self.text_norm, &sn, nt, EPS);
-        Self::mul(r, &self.text1, &sn, &t1, nt, true);
+        Self::mul(r, &self.text1, &sn, &t1, nt, true, &low);
         r.gelu(&t1, &t1g, nt * D);
-        Self::mul(r, &self.text2, &t1g, &x, nt, true);
-        self.time(r, &t, &time, &mods, &scale);
+        Self::mul(r, &self.text2, &t1g, &x, nt, true, &low);
+        self.time(r, &t, &time, &mods, &scale, &low);
         let s = 1.0 / (HD as f32).sqrt();
         for (b, kvl) in self.blocks.iter().zip(&kv) {
             r.layernorm_mod_rows(&x, &norm, nt, D, &mods, 0, None, EPS);
-            Self::mul(r, &b.q, &norm, &q, nt, true);
-            Self::mul(r, &b.k, &norm, &k, nt, true);
-            Self::mul(r, &b.v, &norm, &v, nt, true);
+            Self::mul(r, &b.q, &norm, &q, nt, true, &low);
+            Self::mul(r, &b.k, &norm, &k, nt, true, &low);
+            Self::mul(r, &b.v, &norm, &v, nt, true, &low);
             r.rmsnorm_rows(&q, &b.qn, &qq, nt * HEADS, EPS);
             r.rmsnorm_rows(&k, &b.kn, &kk, nt * HEADS, EPS);
             r.rope_rows(&qq, nt, HEADS, HD, &table, false);
@@ -314,13 +397,13 @@ impl WgpuTransformer {
             r.store_rows(&kk, kvl, nt, D, 0, ROW, 0);
             r.store_rows(&v, kvl, nt, D, 0, ROW, D);
             r.attention_rows(&qq, kvl, &att, nt, HEADS, HEADS, HD, 0, None, s);
-            Self::mul(r, &b.o, &att, &o, nt, true);
+            Self::mul(r, &b.o, &att, &o, nt, true, &low);
             r.add_gated_rows(&x, &o, nt, D, &mods, D, true);
             r.layernorm_mod_rows(&x, &norm, nt, D, &mods, 2 * D, None, EPS);
-            Self::mul(r, &b.gate, &norm, &g, nt, true);
-            Self::mul(r, &b.up, &norm, &u, nt, true);
+            Self::mul(r, &b.gate, &norm, &g, nt, true, &low);
+            Self::mul(r, &b.up, &norm, &u, nt, true, &low);
             r.silu_mul(&g, &u, &act, nt * FF);
-            Self::mul(r, &b.down, &act, &o, nt, true);
+            Self::mul(r, &b.down, &act, &o, nt, true, &low);
             r.add_gated_rows(&x, &o, nt, D, &mods, 3 * D, true);
         }
         rec.finish();
@@ -343,15 +426,15 @@ impl WgpuTransformer {
         // 0.8 GB a step at 1024x1024, never let go)
         rec.keep_groups(false);
         let r = rec.as_mut();
-        self.time(r, &s.t, &s.time, &s.mods, &s.scale);
-        Self::mul(r, &self.img, &s.lat, &s.x, ni, false);
+        self.time(r, &s.t, &s.time, &s.mods, &s.scale, &s.low);
+        Self::mul(r, &self.img, &s.lat, &s.x, ni, false, &s.low);
         let scale = 1.0 / (HD as f32).sqrt();
         for (b, pkv) in self.blocks.iter().zip(&prefix.kv) {
             r.copy(pkv, 0, &s.kv, 0, nt * ROW);
             r.layernorm_mod_rows(&s.x, &s.norm, ni, D, &s.mods, 0, None, EPS);
-            Self::mul(r, &b.q, &s.norm, &s.q, ni, false);
-            Self::mul(r, &b.k, &s.norm, &s.k, ni, false);
-            Self::mul(r, &b.v, &s.norm, &s.v, ni, false);
+            Self::mul(r, &b.q, &s.norm, &s.q, ni, false, &s.low);
+            Self::mul(r, &b.k, &s.norm, &s.k, ni, false, &s.low);
+            Self::mul(r, &b.v, &s.norm, &s.v, ni, false, &s.low);
             r.rmsnorm_rows(&s.q, &b.qn, &s.qq, ni * HEADS, EPS);
             r.rmsnorm_rows(&s.k, &b.kn, &s.kk, ni * HEADS, EPS);
             r.rope_rows(&s.qq, ni, HEADS, HD, &s.table, false);
@@ -359,17 +442,17 @@ impl WgpuTransformer {
             r.store_rows(&s.kk, &s.kv, ni, D, nt, ROW, 0);
             r.store_rows(&s.v, &s.kv, ni, D, nt, ROW, D);
             r.attention_rows_full(&s.qq, &s.kv, &s.att, ni, HEADS, HEADS, HD, nt + ni, scale);
-            Self::mul(r, &b.o, &s.att, &s.o, ni, false);
+            Self::mul(r, &b.o, &s.att, &s.o, ni, false, &s.low);
             r.add_gated_rows(&s.x, &s.o, ni, D, &s.mods, D, true);
             r.layernorm_mod_rows(&s.x, &s.norm, ni, D, &s.mods, 2 * D, None, EPS);
-            Self::mul(r, &b.gate, &s.norm, &s.g, ni, false);
-            Self::mul(r, &b.up, &s.norm, &s.u, ni, false);
+            Self::mul(r, &b.gate, &s.norm, &s.g, ni, false, &s.low);
+            Self::mul(r, &b.up, &s.norm, &s.u, ni, false, &s.low);
             r.silu_mul(&s.g, &s.u, &s.act, ni * FF);
-            Self::mul(r, &b.down, &s.act, &s.o, ni, false);
+            Self::mul(r, &b.down, &s.act, &s.o, ni, false, &s.low);
             r.add_gated_rows(&s.x, &s.o, ni, D, &s.mods, 3 * D, true);
         }
         r.layernorm_mod_rows(&s.x, &s.norm, ni, D, &s.scale, 0, None, EPS);
-        Self::mul(r, &self.out, &s.norm, &s.vel, ni, false);
+        Self::mul(r, &self.out, &s.norm, &s.vel, ni, false, &s.low);
         r.read(&s.vel);
         let vel = rec.finish().pop().ok_or_else(|| err("the step's velocity was not read"))?;
         self.scratch = Some(s);

@@ -66,6 +66,15 @@ impl Weights {
         self.resolve(name).is_ok()
     }
 
+    /// `name`'s GGUF block type (a GGUF file's tensor; None for safetensors), without reading it.
+    pub fn ggml_dtype(&self, name: &str) -> Option<GgmlDType> {
+        let key = self.resolve(name).ok()?;
+        match self {
+            Self::Gguf { content, .. } => content.tensor_infos.get(&key).map(|i| i.ggml_dtype),
+            Self::Safe(_) => None,
+        }
+    }
+
     /// `name`'s bytes as stored where [`Raw`] holds them; None where only [`Self::tensor`] reads it (ComfyUI's
     /// quantized weights, F16, F32, a fused gate and up it splits).
     pub fn raw(&mut self, name: &str) -> Result<Option<Raw>> {
