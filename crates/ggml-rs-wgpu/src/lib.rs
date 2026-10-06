@@ -338,6 +338,29 @@ impl Gpu {
     }
 
     /// Upload whole rows into buffers below the binding limit.
+    /// `data` (a multiple of 4 bytes) into `buffer` at `offset` through a write's staging memory, copied there from every
+    /// core: one core's copy into the card's memory (Resizable BAR) took 1.4 GB/s, most of a weight's load. Small
+    /// writes as `write_buffer`'s.
+    pub(crate) fn write(&self, buffer: &wgpu::Buffer, offset: u64, data: &[u8]) {
+        let size = match wgpu::BufferSize::new(data.len() as u64) {
+            Some(size) if data.len() >= 8 << 20 => size,
+            _ => return self.queue.write_buffer(buffer, offset, data),
+        };
+        let Some(mut view) = self.queue.write_buffer_with(buffer, offset, size) else { return self.queue.write_buffer(buffer, offset, data) };
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
+        let each = data.len().div_ceil(threads).div_ceil(4096) * 4096;
+        let mut whole = view.slice(..);
+        let base = whole.as_raw_ptr().cast::<u8>().as_ptr() as usize;
+        std::thread::scope(|s| {
+            for (i, part) in data.chunks(each).enumerate() {
+                let at = base + i * each;
+                // SAFETY: each thread writes its own bytes of the staging memory, mapped for writing until the view
+                // (which outlives this scope) is dropped; nothing reads them
+                s.spawn(move || unsafe { std::ptr::copy_nonoverlapping(part.as_ptr(), at as *mut u8, part.len()) });
+            }
+        });
+    }
+
     fn upload_rows(&self, bytes: &[u8], row_bytes: usize, _hint: usize) -> Vec<(wgpu::Buffer, u32, u32)> {
         let rows = bytes.len() / row_bytes;
         let per = ((chunk_limit(&self.limits) as usize) / row_bytes).max(1);
@@ -354,11 +377,11 @@ impl Gpu {
                 mapped_at_creation: false,
             });
             if data.len() % 4 == 0 {
-                self.queue.write_buffer(&buffer, 0, data);
+                self.write(&buffer, 0, data);
             } else {
                 let mut padded = data.to_vec();
                 padded.resize(size as usize, 0);
-                self.queue.write_buffer(&buffer, 0, &padded);
+                self.write(&buffer, 0, &padded);
             }
             chunks.push((buffer, r as u32, n as u32));
             r += n;

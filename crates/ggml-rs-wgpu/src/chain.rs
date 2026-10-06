@@ -2288,14 +2288,6 @@ impl ggml_rs::DeviceStorage for Aliased {
     }
 }
 
-fn le_bytes(data: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(data.len() * 4);
-    for f in data {
-        bytes.extend_from_slice(&f.to_le_bytes());
-    }
-    bytes
-}
-
 impl DeviceChain for WgpuBackend {
     fn vec(&self, len: usize) -> DeviceVec {
         DeviceVec { len, inner: Arc::new(vec_buffer(&self.gpu, len)) }
@@ -2406,7 +2398,8 @@ impl DeviceChain for WgpuBackend {
     fn upload_at(&self, v: &DeviceVec, offset: usize, data: &[f32]) {
         assert!(offset + data.len() <= v.len, "chain: {} values at {offset} into a vector of {}", data.len(), v.len);
         if !data.is_empty() {
-            self.gpu.queue.write_buffer(buffer(v), (offset * 4) as u64, &le_bytes(data));
+            // (the values' own bytes: every target wgpu runs on is little-endian)
+            self.gpu.write(buffer(v), (offset * 4) as u64, bytemuck::cast_slice(data));
             // a large write's staging (device memory, with Resizable BAR) let go now: a model's weights uploaded in
             // turn held it all until the next submit (Qwen Image's 14 GB took 31 of a 32 GB card)
             if data.len() >= 16 << 20 {

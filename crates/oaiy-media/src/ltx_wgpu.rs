@@ -27,27 +27,113 @@ pub enum Weight {
     F16(DeviceVec),
 }
 
-/// `values` (rows of 32's multiples) as Q8_0's blocks, the rows shared among the CPU's threads.
-fn q8_0(values: &[f32]) -> Vec<u8> {
-    const CHUNK: usize = 32 * 4096;
-    let mut out = vec![0u8; values.len() / 32 * 34];
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
-    let per = (values.len().div_ceil(CHUNK).div_ceil(threads) * CHUNK).max(CHUNK);
+/// `f` over `src` and `dst` in matching runs on every core: `per` of `src`'s items to `per_out` of `dst`'s.
+fn on_cores<S: Sync, T: Send>(src: &[S], per: usize, dst: &mut [T], per_out: usize, f: impl Fn(&[S], &mut [T]) + Sync) {
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(32);
+    let each = src.len().div_ceil(per).div_ceil(threads).max(1);
     std::thread::scope(|s| {
-        for (src, dst) in values.chunks(per).zip(out.chunks_mut(per / 32 * 34)) {
-            s.spawn(move || ggml_quants::q8_0::quantize(src, dst));
+        for (a, b) in src.chunks(each * per).zip(dst.chunks_mut(each * per_out)) {
+            let f = &f;
+            s.spawn(move || f(a, b));
+        }
+    });
+}
+
+fn bf16(b: &[u8]) -> f32 {
+    f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16)
+}
+
+/// A weight's values as Q8_0's blocks (32 values a block).
+fn q8_0(values: &[f32]) -> Vec<u8> {
+    let mut out = vec![0u8; values.len() / 32 * 34];
+    on_cores(values, 32, &mut out, 34, ggml_quants::q8_0::quantize);
+    out
+}
+
+/// A BF16 weight's bytes as Q8_0's blocks.
+fn q8_0_bf16(bytes: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; bytes.len() / 64 * 34];
+    on_cores(bytes, 64, &mut out, 34, |src, dst| {
+        let mut x = [0f32; 32];
+        for (b, q) in src.chunks_exact(64).zip(dst.chunks_exact_mut(34)) {
+            for (v, two) in x.iter_mut().zip(b.chunks_exact(2)) {
+                *v = bf16(two);
+            }
+            ggml_quants::q8_0::quantize(&x, q);
         }
     });
     out
 }
 
+/// A pair's f16 word (the first value low), as the chain's f16 matrices hold them; false where a value is past f16's
+/// range.
+fn f16_word(lo: f32, hi: f32, ok: &mut bool) -> f32 {
+    *ok &= lo.abs() <= 65504.0 && hi.abs() <= 65504.0;
+    f32::from_bits(half::f16::from_f32(lo).to_bits() as u32 | (half::f16::from_f32(hi).to_bits() as u32) << 16)
+}
+
+/// A BF16 weight's bytes as f16 words, each value rounded to the nearest f16; None where one is past its range.
+pub fn f16_words(bytes: &[u8]) -> Option<Vec<f32>> {
+    if bytes.len() % 4 != 0 {
+        return None;
+    }
+    let mut out = vec![0f32; bytes.len() / 4];
+    let ok = std::sync::atomic::AtomicBool::new(true);
+    on_cores(bytes, 4, &mut out, 1, |src, dst| {
+        let mut fine = true;
+        for (b, w) in src.chunks_exact(4).zip(dst.iter_mut()) {
+            *w = f16_word(bf16(&b[..2]), bf16(&b[2..]), &mut fine);
+        }
+        if !fine {
+            ok.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    ok.into_inner().then_some(out)
+}
+
+/// [`f16_words`] of values already f32.
+pub fn f16_words_f32(values: &[f32]) -> Option<Vec<f32>> {
+    if values.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = vec![0f32; values.len() / 2];
+    let ok = std::sync::atomic::AtomicBool::new(true);
+    on_cores(values, 2, &mut out, 1, |src, dst| {
+        let mut fine = true;
+        for (p, w) in src.chunks_exact(2).zip(dst.iter_mut()) {
+            *w = f16_word(p[0], p[1], &mut fine);
+        }
+        if !fine {
+            ok.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    ok.into_inner().then_some(out)
+}
+
+/// A dense weight's values as stored: a BF16 checkpoint's bytes (converted on every core), else f32.
+enum Values {
+    Bf16(Vec<u8>),
+    F32(Vec<f32>),
+}
+
+impl Values {
+    fn of(store: &mut Store, key: &str) -> Result<Self> {
+        Ok(match store.bf16_bytes(key)? {
+            Some(bytes) => Self::Bf16(bytes),
+            None => Self::F32(store.tensor_f32(key, &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?),
+        })
+    }
+}
+
 /// A dense weight (`[n, k]`) on `gpu`: Q8_0 where the tensor cores take its rows (a multiple of 256 long), else f16
 /// (f16 throughout with OAIY_LTX_WEBGPU_WEIGHTS=f16: a card with room for it).
-fn dense(gpu: &ggml_rs_wgpu::WgpuBackend, key: &str, values: Vec<f32>, n: usize, k: usize) -> Result<Weight> {
+fn dense(gpu: &ggml_rs_wgpu::WgpuBackend, key: &str, values: Values, n: usize, k: usize) -> Result<Weight> {
     let f16 = std::env::var("OAIY_LTX_WEBGPU_WEIGHTS").is_ok_and(|v| v.eq_ignore_ascii_case("f16"));
     if gpu.tensor_cores() && k % 256 == 0 && !f16 {
-        let bytes = q8_0(&values);
-        drop(values);
+        let bytes = match values {
+            Values::Bf16(b) => q8_0_bf16(&b),
+            Values::F32(v) => q8_0(&v),
+        };
         let size = bytes.len();
         let w = gpu.to_device_quant(QuantizedTensor::from_bytes_cpu(bytes, vec![n, k], ggml_quants::GgmlType::Q8_0));
         if !w.is_device() {
@@ -55,7 +141,14 @@ fn dense(gpu: &ggml_rs_wgpu::WgpuBackend, key: &str, values: Vec<f32>, n: usize,
         }
         return Ok(Weight::Q8(w));
     }
-    Ok(Weight::F16(gpu.vec_f16_rounded(&values).ok_or_else(|| err(format!("{key}: past f16's range")))?))
+    let words = match values {
+        Values::Bf16(b) => f16_words(&b),
+        Values::F32(v) => f16_words_f32(&v),
+    }
+    .ok_or_else(|| err(format!("{key}: past f16's range")))?;
+    let v = gpu.vec(words.len());
+    gpu.upload(&v, &words);
+    Ok(Weight::F16(v))
 }
 
 pub struct Linear {
@@ -95,15 +188,14 @@ impl Linear {
             let global = f32::from_le_bytes(g.get(..4).and_then(|b| b.try_into().ok()).ok_or_else(|| err(format!("{global_name} is not one F32")))?);
             match gpu.nvfp4_weights(&packed, scales, global, n, k) {
                 Some((w, scale)) => (Weight::Nvfp4 { w, scale }, n, k),
-                None => {
-                    let t = store.tensor_f32(&key, &Device::Cpu)?;
-                    (dense(gpu, &key, t.flatten_all()?.to_vec1::<f32>()?, n, k)?, n, k)
-                }
+                None => (dense(gpu, &key, Values::of(store, &key)?, n, k)?, n, k),
             }
         } else {
-            let t = store.tensor_f32(&key, &Device::Cpu)?;
-            let (n, k) = t.dims2()?;
-            (dense(gpu, &key, t.flatten_all()?.to_vec1::<f32>()?, n, k)?, n, k)
+            let (n, k) = match info.shape.as_slice() {
+                [n, k] => (*n, *k),
+                _ => candle_core::bail!("{key}: a weight of shape {:?}", info.shape),
+            };
+            (dense(gpu, &key, Values::of(store, &key)?, n, k)?, n, k)
         };
         let bias_name = format!("{name}.bias");
         let bias: Vec<f32> = if store.index.get(&bias_name).is_some() { store.tensor_f32(&bias_name, &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()? } else { vec![0.0; n] };

@@ -176,6 +176,31 @@ impl StIndex {
         Ok(buf)
     }
 
+    /// [`Self::read`] by several threads at once, each its own part: a large tensor from the page cache (one thread's
+    /// copy took most of the time a model's weights took to reach a GPU).
+    pub fn read_par(&self, name: &str) -> Result<Vec<u8>> {
+        const PART: usize = 32 << 20;
+        let t = self.info(name)?;
+        let len = usize::try_from(t.nbytes)
+            .map_err(|_| Error::Format(format!("{name}: {} bytes do not fit in memory", t.nbytes)))?;
+        if len < 2 * PART {
+            return self.read(name);
+        }
+        let mut buf = vec![0u8; len];
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
+        let each = len.div_ceil(threads).max(PART).div_ceil(4096) * 4096;
+        let (path, start) = (&self.shards[t.shard], t.start);
+        std::thread::scope(|s| {
+            let parts: Vec<_> = buf
+                .chunks_mut(each)
+                .enumerate()
+                .map(|(i, part)| s.spawn(move || -> std::io::Result<()> { read_exact_at(&File::open(path)?, part, start + (i * each) as u64) }))
+                .collect();
+            parts.into_iter().try_for_each(|p| p.join().unwrap_or_else(|_| Err(std::io::Error::other("a read's thread panicked"))))
+        })?;
+        Ok(buf)
+    }
+
     /// F32 / BF16 / F16 tensor decoded to `f32`.
     pub fn read_f32(&self, name: &str) -> Result<Vec<f32>> {
         let dtype = self.info(name)?.dtype;
@@ -272,4 +297,28 @@ fn index_shard(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tensor past the size read in parts comes back from the parts as from one read (its bytes, not a part's
+    /// shifted or a part left zero).
+    #[test]
+    fn a_tensor_read_in_parts_is_the_one_read() {
+        let len = 70 << 20;
+        let data: Vec<u8> = (0..len).map(|i: usize| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        let header = format!(r#"{{"t":{{"dtype":"U8","shape":[{len}],"data_offsets":[0,{len}]}}}}"#);
+        let path = std::env::temp_dir().join(format!("dsv41-read-par-{}.safetensors", std::process::id()));
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header.as_bytes());
+        bytes.extend(&data);
+        std::fs::write(&path, bytes).unwrap();
+        let index = StIndex::open_file(&path).unwrap();
+        let (one, parts) = (index.read("t").unwrap(), index.read_par("t").unwrap());
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(one, data);
+        assert!(parts == data, "the parts' bytes differ");
+    }
 }

@@ -382,6 +382,17 @@ impl Store {
         self.rotations.insert(key.to_owned(), r);
         Ok(r)
     }
+    /// `key`'s bytes where it is stored as BF16 and read as it is (no LoRA, scale or rotation on it): for a device that
+    /// converts them itself, on every core.
+    pub fn bf16_bytes(&mut self, key: &str) -> Result<Option<Vec<u8>>> {
+        let info = self.index.info(key).map_err(candle_core::Error::wrap)?.clone();
+        if info.dtype != Dtype::BF16 || self.lora.contains_key(key) || self.scale(key)?.is_some() || self.rotation(key)?.is_some() {
+            return Ok(None);
+        }
+        let bytes = self.index.read_par(key).map_err(candle_core::Error::wrap)?;
+        self.disk_bytes += bytes.len() as u64;
+        Ok(Some(bytes))
+    }
     /// A tensor at full precision (the audio decoder and vocoder run in F32).
     pub fn tensor_f32(&mut self, key: &str, dev: &Device) -> Result<Tensor> {
         let info = self.index.info(key).map_err(candle_core::Error::wrap)?.clone();
