@@ -1,19 +1,23 @@
-//! LTX 2.3's prompt context on WebGPU, as [`crate::ltx::text::encode`] and [`crate::ltx::transformer::connector`]
-//! make it: Gemma 3 12B's hidden states (the embedding's and every layer's, each over its RMS, stacked), the video
-//! stream's aggregate projection, then its connector's eight blocks over 1,024 rows (the prompt's, then learned
-//! registers). One device throughout (its vectors stay there): Gemma's weights (24 GB as f16) a layer at a time,
-//! every prompt through it, before the projection's and the connector's are loaded.
+//! LTX's prompt context on WebGPU, as [`crate::ltx::text::encode`] and [`crate::ltx::transformer::connector`] make
+//! it: the text model's hidden states (the embedding's and every layer's, each over its RMS, stacked: Gemma 3 12B's
+//! for LTX 2.3, LTX 2.5's Gemma 4 12B's), the video stream's aggregate projection, then its connector's eight blocks
+//! over 1,024 rows (the prompt's, then learned registers). One device throughout (its vectors stay there): the text
+//! model's weights (24 GB as f16) a layer at a time, every prompt through it, before the projection's and the
+//! connector's are loaded.
 use crate::ltx::store::Store;
 use crate::ltx_wgpu::{rope_table, Linear};
 use candle_core::{Device, Result};
-use ggml_rs::{ChainRecorder, DeviceChain, DeviceVec};
+use ggml_rs::{ChainRecorder, DeviceChain, DeviceVec, RowNorm};
 use std::path::Path;
 
 const LAYERS: usize = 48;
 const G: usize = 3840;
 const HEADS: usize = 16;
-const KV_HEADS: usize = 8;
-const GHD: usize = 256;
+/// A local layer's head, and a global one's (Gemma 4's: Gemma 3's are the local width).
+const HD: usize = 256;
+const GLOBAL_HD: usize = 512;
+/// The widest a layer's keys are (local: 8 heads of 256; Gemma 4's global: one of 512).
+const KV_WIDTH: usize = 8 * HD;
 const FF: usize = 15360;
 const EPS: f32 = 1e-6;
 /// The connector's rows (the prompt's, then registers), width and heads.
@@ -68,7 +72,7 @@ fn vector(store: &mut Store, gpu: &ggml_rs_wgpu::WgpuBackend, name: &str, add: f
 }
 
 struct Layer {
-    /// The norms' `1 + w`.
+    /// The norms' scales (Gemma 3's `1 + w`, Gemma 4's `w`).
     input: DeviceVec,
     post_attn: DeviceVec,
     pre_ff: DeviceVec,
@@ -77,11 +81,17 @@ struct Layer {
     kn: DeviceVec,
     q: Mat,
     k: Mat,
-    v: Mat,
+    /// None where the keys serve as values too (Gemma 4's global layers).
+    v: Option<Mat>,
     o: Mat,
     /// The gate's rows, then the up projection's (one matmul).
     gate_up: Mat,
     down: Mat,
+    /// Its head's width and its key heads.
+    hd: usize,
+    kv: usize,
+    /// Gemma 4's layer scalar, less one, for every channel (the layer's output times it: an affine's scale).
+    scalar: Option<DeviceVec>,
 }
 
 fn mul(r: &mut dyn ChainRecorder, m: &Mat, x: &DeviceVec, y: &DeviceVec, rows: usize) {
@@ -89,31 +99,51 @@ fn mul(r: &mut dyn ChainRecorder, m: &Mat, x: &DeviceVec, y: &DeviceVec, rows: u
     r.matmul_f16_rows_f32(&m.v, m.n, m.k, x, y, rows);
 }
 
-/// Gemma's layer `i` (its weights under `prefix`) on `gpu`.
-fn layer(store: &mut Store, gpu: &ggml_rs_wgpu::WgpuBackend, prefix: &str, i: usize) -> Result<Layer> {
+/// The text model's layer `i` (its weights under `prefix`; `gemma4` LTX 2.5's Gemma 4) on `gpu`.
+fn layer(store: &mut Store, gpu: &ggml_rs_wgpu::WgpuBackend, prefix: &str, i: usize, gemma4: bool) -> Result<Layer> {
     let p = format!("{prefix}layers.{i}.");
     let n = |s: &str| format!("{p}{s}");
+    // Gemma 3's norms scale by 1 + w, Gemma 4's by w
+    let add = if gemma4 { 0. } else { 1. };
+    let v_name = n("self_attn.v_proj.weight");
+    let qn = vector(store, gpu, &n("self_attn.q_norm.weight"), add)?;
+    let (q, k) = (mat(store, gpu, &[n("self_attn.q_proj.weight")])?, mat(store, gpu, &[n("self_attn.k_proj.weight")])?);
+    let hd = qn.len;
+    let scalar = if gemma4 {
+        let s = store.tensor_f32(&n("layer_scalar"), &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+        let values = vec![s.first().copied().ok_or_else(|| err(format!("{p}layer_scalar is empty")))? - 1.; G];
+        let v = gpu.vec(G);
+        gpu.upload(&v, &values);
+        Some(v)
+    } else {
+        None
+    };
     let l = Layer {
-        input: vector(store, gpu, &n("input_layernorm.weight"), 1.)?,
-        post_attn: vector(store, gpu, &n("post_attention_layernorm.weight"), 1.)?,
-        pre_ff: vector(store, gpu, &n("pre_feedforward_layernorm.weight"), 1.)?,
-        post_ff: vector(store, gpu, &n("post_feedforward_layernorm.weight"), 1.)?,
-        qn: vector(store, gpu, &n("self_attn.q_norm.weight"), 1.)?,
-        kn: vector(store, gpu, &n("self_attn.k_norm.weight"), 1.)?,
-        q: mat(store, gpu, &[n("self_attn.q_proj.weight")])?,
-        k: mat(store, gpu, &[n("self_attn.k_proj.weight")])?,
-        v: mat(store, gpu, &[n("self_attn.v_proj.weight")])?,
+        input: vector(store, gpu, &n("input_layernorm.weight"), add)?,
+        post_attn: vector(store, gpu, &n("post_attention_layernorm.weight"), add)?,
+        pre_ff: vector(store, gpu, &n("pre_feedforward_layernorm.weight"), add)?,
+        post_ff: vector(store, gpu, &n("post_feedforward_layernorm.weight"), add)?,
+        kn: vector(store, gpu, &n("self_attn.k_norm.weight"), add)?,
+        qn,
+        v: if store.index.get(&v_name).is_some() { Some(mat(store, gpu, &[v_name])?) } else { None },
         o: mat(store, gpu, &[n("self_attn.o_proj.weight")])?,
         gate_up: mat(store, gpu, &[n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])?,
         down: mat(store, gpu, &[n("mlp.down_proj.weight")])?,
+        kv: k.n / hd.max(1),
+        hd,
+        q,
+        k,
+        scalar,
     };
-    if l.q.n != HEADS * GHD || l.k.n != KV_HEADS * GHD || l.gate_up.n != 2 * FF {
-        candle_core::bail!("not Gemma 3 12B (q {}, k {}, gate and up {})", l.q.n, l.k.n, l.gate_up.n);
+    let fits = matches!(l.hd, HD | GLOBAL_HD) && l.q.n == HEADS * l.hd && l.k.n == l.kv * l.hd && l.kv >= 1 && l.kv * l.hd <= KV_WIDTH && l.o.k == l.q.n && l.gate_up.n == 2 * FF && (l.v.is_some() || gemma4);
+    if !fits {
+        candle_core::bail!("not Gemma 3 or Gemma 4 12B at layer {i} (q {}, k {}, head {}, gate and up {})", l.q.n, l.k.n, l.hd, l.gate_up.n);
     }
     Ok(l)
 }
 
-/// A prompt's vectors through Gemma: its rows `x`, its rotary tables, its scratch, and its stacked states.
+/// A prompt's vectors through the text model: its rows `x`, its rotary tables, its scratch (each its widest layer's
+/// size), and its stacked states.
 struct Prompt {
     s: usize,
     x: DeviceVec,
@@ -123,6 +153,7 @@ struct Prompt {
     q: DeviceVec,
     k: DeviceVec,
     vv: DeviceVec,
+    vn: DeviceVec,
     qq: DeviceVec,
     kk: DeviceVec,
     kv: DeviceVec,
@@ -135,13 +166,26 @@ struct Prompt {
     feats: DeviceVec,
 }
 
-/// Each prompt's video context (`[1024, 4096]`, the connector's), from Gemma 3 12B at `gemma` (its text weights
-/// under `model.` or the multimodal release's `language_model.model.`; `tokenizer` its tokenizer.json) and the
-/// projection and connector in `transformer` (LTX 2.3's checkpoint), on GPU `device` (as CUDA counts them;
+/// `v`'s first `len` values (a norm takes a row's width from its vector's length).
+fn first(v: &DeviceVec, len: usize) -> DeviceVec {
+    DeviceVec { len, inner: v.inner.clone() }
+}
+
+/// Each prompt's video context (`[1024, 4096]`, the connector's), from the text model at `gemma` (Gemma 3 12B, its
+/// weights under `model.` or the multimodal release's `language_model.model.`, `tokenizer` its tokenizer.json; or LTX
+/// 2.5's Gemma 4 12B, its tokenizer and aggregate projection in its own file) and the projection (where Gemma's file
+/// has none) and connector in `transformer` (LTX's checkpoint), on GPU `device` (as CUDA counts them;
 /// OAIY_WEBGPU_ADAPTER naming one instead). `progress(step, of)` as it goes.
-pub fn contexts(gemma: &Path, tokenizer: &Path, transformer: &mut Store, prompts: &[String], device: usize, mut progress: impl FnMut(usize, usize)) -> Result<Vec<Vec<f32>>> {
+pub fn contexts(gemma: &Path, tokenizer: Option<&Path>, transformer: &mut Store, prompts: &[String], device: usize, mut progress: impl FnMut(usize, usize)) -> Result<Vec<Vec<f32>>> {
     let gpu = ggml_rs_wgpu::WgpuBackend::nth(device, None).map_err(err)?;
-    let mut tok = tokenizers::Tokenizer::from_file(tokenizer).map_err(err)?;
+    let mut store = Store::open(gemma, 0)?;
+    let prefix = if store.index.get("language_model.model.embed_tokens.weight").is_some() { "language_model.model." } else { "model." };
+    let gemma4 = store.index.get(&format!("{prefix}layers.0.layer_scalar")).is_some();
+    let mut tok = match tokenizer {
+        Some(path) => tokenizers::Tokenizer::from_file(path).map_err(err)?,
+        None if gemma4 => tokenizers::Tokenizer::from_bytes(store.index.read("tokenizer_json").map_err(err)?).map_err(err)?,
+        None => candle_core::bail!("LTX 2.3 requires a Gemma 3 tokenizer path"),
+    };
     tok.with_padding(None);
     tok.with_truncation(None).map_err(err)?;
     let mut ids_all = Vec::new();
@@ -154,55 +198,59 @@ pub fn contexts(gemma: &Path, tokenizer: &Path, transformer: &mut Store, prompts
         ids_all.push(ids);
     }
     let steps = LAYERS + 10;
-    // Gemma's hidden states, each prompt's stacked on the GPU: a layer's weights at a time, every prompt through it
+    // the global layers' heads: Gemma 3's the local width (positions over 8), Gemma 4's twice it (a quarter of its
+    // pairs turned, positions as they are); attention unscaled in Gemma 4
+    let (global_hd, global_factor, global_turned) = if gemma4 { (GLOBAL_HD, 1., GLOBAL_HD / 8) } else { (HD, 8., HD / 2) };
+    let scale = if gemma4 { 1. } else { 1. / (HD as f32).sqrt() };
+    // its hidden states, each prompt's stacked on the GPU: a layer's weights at a time, every prompt through it
     let stacked: Vec<(DeviceVec, usize)> = {
-        let mut store = Store::open(gemma, 0)?;
-        let prefix = if store.index.get("language_model.model.embed_tokens.weight").is_some() { "language_model.model." } else { "model." };
         let ones = gpu.vec(G);
         gpu.upload(&ones, &vec![1.0; G]);
         let mut prompts = Vec::with_capacity(ids_all.len());
         for ids in &ids_all {
             let s = ids.len();
             let emb = store.rows(&format!("{prefix}embed_tokens.weight"), ids, &Device::Cpu)?.to_dtype(candle_core::DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-            let scale = (G as f32).sqrt();
-            let x0: Vec<f32> = emb.iter().map(|v| v * scale).collect();
-            // RoPE over each head's halves: the local layers' (base 10,000) and the global ones' (1e6, positions over 8);
-            // positions after the reference's left padding to 1,024
+            let x0: Vec<f32> = emb.iter().map(|v| v * (G as f32).sqrt()).collect();
+            // RoPE over each head's halves, its first `turned` pairs (the rest at angle 0), positions after the
+            // reference's left padding to 1,024
             let offset = ROWS - s;
-            let table = |base: f64, factor: f64| -> Vec<f32> {
-                let mut t = Vec::with_capacity(s * GHD);
+            let table = |hd: usize, base: f64, factor: f64, turned: usize| -> Vec<f32> {
+                let mut t = Vec::with_capacity(s * hd);
                 for p in 0..s {
-                    for j in 0..GHD / 2 {
-                        let a = (p + offset) as f64 / (base.powf(2. * j as f64 / GHD as f64) * factor);
+                    for j in 0..hd / 2 {
+                        let a = if j < turned { (p + offset) as f64 / (base.powf(2. * j as f64 / hd as f64) * factor) } else { 0. };
                         t.extend([a.sin() as f32, a.cos() as f32]);
                     }
                 }
                 t
             };
-            let (local, global) = (gpu.vec(s * GHD), gpu.vec(s * GHD));
-            gpu.upload(&local, &table(10000., 1.));
-            gpu.upload(&global, &table(1e6, 8.));
+            let (local, global) = (gpu.vec(s * HD), gpu.vec(s * global_hd));
+            gpu.upload(&local, &table(HD, 10000., 1., HD / 2));
+            gpu.upload(&global, &table(global_hd, 1e6, global_factor, global_turned));
             let x = gpu.vec(s * G);
             gpu.upload(&x, &x0);
             let v = |len: usize| gpu.vec(len.max(1));
+            let qw = HEADS * global_hd.max(HD);
+            let att = gpu.attention_rows_out_len(s.div_ceil(32) * 32, HEADS, HD, s).max(gpu.attention_rows_out_len(s.div_ceil(32) * 32, HEADS, global_hd, s));
             prompts.push(Prompt {
                 s,
                 x,
                 local,
                 global,
                 h: v(s * G),
-                q: v(s * HEADS * GHD),
-                k: v(s * KV_HEADS * GHD),
-                vv: v(s * KV_HEADS * GHD),
-                qq: v(s * HEADS * GHD),
-                kk: v(s * KV_HEADS * GHD),
-                kv: v(s * 2 * KV_HEADS * GHD),
+                q: v(s * qw),
+                k: v(s * KV_WIDTH),
+                vv: v(s * KV_WIDTH),
+                vn: v(s * KV_WIDTH),
+                qq: v(s * qw),
+                kk: v(s * KV_WIDTH),
+                kv: v(s * 2 * KV_WIDTH),
                 o: v(s * G),
                 gu: v(s * 2 * FF),
                 act: v(s * FF),
                 an: v(s * G),
                 fs: v(s * G),
-                att: v(gpu.attention_rows_out_len(s.div_ceil(32) * 32, HEADS, GHD, s)),
+                att: v(att),
                 feats: v(s * (LAYERS + 1) * G),
             });
         }
@@ -217,10 +265,11 @@ pub fn contexts(gemma: &Path, tokenizer: &Path, transformer: &mut Store, prompts
             stack(rec.as_mut(), p, &p.x, 0);
         }
         rec.finish();
-        let row = 2 * KV_HEADS * GHD;
         for i in 0..LAYERS {
-            let l = layer(&mut store, &gpu, prefix, i)?;
-            let final_norm = if i == LAYERS - 1 { Some(vector(&mut store, &gpu, &format!("{prefix}norm.weight"), 1.)?) } else { None };
+            let l = layer(&mut store, &gpu, prefix, i, gemma4)?;
+            let final_norm = if i == LAYERS - 1 { Some(vector(&mut store, &gpu, &format!("{prefix}norm.weight"), if gemma4 { 0. } else { 1. })?) } else { None };
+            let (hd, kv) = (l.hd, l.kv);
+            let (qd, kd) = (HEADS * hd, kv * hd);
             let mut rec = gpu.begin();
             rec.keep_groups(false);
             let r = rec.as_mut();
@@ -230,14 +279,25 @@ pub fn contexts(gemma: &Path, tokenizer: &Path, transformer: &mut Store, prompts
                 r.rmsnorm_rows(x, &l.input, h, s, EPS);
                 mul(r, &l.q, h, &p.q, s);
                 mul(r, &l.k, h, &p.k, s);
-                mul(r, &l.v, h, &p.vv, s);
-                r.rmsnorm_rows(&p.q, &l.qn, &p.qq, s * HEADS, EPS);
-                r.rmsnorm_rows(&p.k, &l.kn, &p.kk, s * KV_HEADS, EPS);
-                r.rope_rows(&p.qq, s, HEADS, GHD, tv, true);
-                r.rope_rows(&p.kk, s, KV_HEADS, GHD, tv, true);
-                r.store_rows(&p.kk, &p.kv, s, KV_HEADS * GHD, 0, row, 0);
-                r.store_rows(&p.vv, &p.kv, s, KV_HEADS * GHD, 0, row, KV_HEADS * GHD);
-                r.attention_rows(&p.qq, &p.kv, &p.att, s, HEADS, KV_HEADS, GHD, 0, None, 1.0 / (GHD as f32).sqrt());
+                match &l.v {
+                    Some(v) => mul(r, v, h, &p.vv, s),
+                    // (the keys as they come, before their norm and rotary, as values)
+                    None => r.copy(&p.k, 0, &p.vv, 0, s * kd),
+                }
+                r.rmsnorm_rows(&first(&p.q, s * qd), &l.qn, &first(&p.qq, s * qd), s * HEADS, EPS);
+                r.rmsnorm_rows(&first(&p.k, s * kd), &l.kn, &first(&p.kk, s * kd), s * kv, EPS);
+                r.rope_rows(&p.qq, s, HEADS, hd, tv, true);
+                r.rope_rows(&p.kk, s, kv, hd, tv, true);
+                let row = 2 * kd;
+                r.store_rows(&p.kk, &p.kv, s, kd, 0, row, 0);
+                if gemma4 {
+                    // Gemma 4's values over their RMS (no weights)
+                    r.rmsnorm_rows(&first(&p.vv, s * kd), &ones, &first(&p.vn, s * kd), s * kv, EPS);
+                    r.store_rows(&p.vn, &p.kv, s, kd, 0, row, kd);
+                } else {
+                    r.store_rows(&p.vv, &p.kv, s, kd, 0, row, kd);
+                }
+                r.attention_rows(&p.qq, &p.kv, &p.att, s, HEADS, kv, hd, 0, None, scale);
                 mul(r, &l.o, &p.att, &p.o, s);
                 r.rmsnorm_rows(&p.o, &l.post_attn, &p.an, s, EPS);
                 r.add(x, &p.an);
@@ -247,6 +307,11 @@ pub fn contexts(gemma: &Path, tokenizer: &Path, transformer: &mut Store, prompts
                 mul(r, &l.down, &p.act, &p.o, s);
                 r.rmsnorm_rows(&p.o, &l.post_ff, &p.an, s, EPS);
                 r.add(x, &p.an);
+                if let Some(sc) = &l.scalar {
+                    // the layer's output times its scalar (an affine: x (1 + (scalar - 1)))
+                    r.norm_mod_rows(x, &p.an, s, G, sc, 0, None, RowNorm::None, EPS);
+                    r.copy(&p.an, 0, x, 0, s * G);
+                }
                 match &final_norm {
                     Some(norm) => {
                         r.rmsnorm_rows(x, norm, h, s, EPS);
@@ -262,9 +327,13 @@ pub fn contexts(gemma: &Path, tokenizer: &Path, transformer: &mut Store, prompts
         prompts.into_iter().map(|p| (p.feats, p.s)).collect()
     };
     gpu.release_cached();
-    // the projection (its input over sqrt(3840 / 4096), folded into its weights) and the connector
+    // the projection (its input over sqrt(3840 / 4096), folded into its weights; Gemma 4's in its own file) and the
+    // connector
     let g = |n: &str| format!("model.diffusion_model.{n}");
-    let proj = projection(transformer, &gpu, "text_embedding_projection.video_aggregate_embed", (D as f32 / G as f32).sqrt())?;
+    let name = "text_embedding_projection.video_aggregate_embed";
+    let own = store.index.get(&format!("{name}.weight")).is_some();
+    let proj = projection(if own { &mut store } else { &mut *transformer }, &gpu, name, (D as f32 / G as f32).sqrt())?;
+    drop(store);
     progress(LAYERS + 1, steps);
     let registers = transformer.tensor_f32(&g("video_embeddings_connector.learnable_registers"), &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
     let mut blocks = Vec::with_capacity(8);
@@ -393,12 +462,14 @@ mod tests {
     fn the_webgpu_prompt_context_is_the_candle_one() -> Result<()> {
         let (Some(gemma), Some(ltx)) = (std::env::var_os("OAIY_LTX_GEMMA"), std::env::var_os("OAIY_LTX_NVFP4")) else { return Ok(()) };
         let (gemma, ltx) = (std::path::PathBuf::from(gemma), std::path::PathBuf::from(ltx));
-        let tokenizer = std::env::var_os("OAIY_LTX_TOKENIZER").map_or_else(|| gemma.join("tokenizer.json"), std::path::PathBuf::from);
+        // (Gemma 4's in its own file; Gemma 3's OAIY_LTX_TOKENIZER or the folder's)
+        let gemma4 = Store::open(&gemma, 0)?.index.get("model.layers.0.layer_scalar").is_some();
+        let tokenizer = (!gemma4).then(|| std::env::var_os("OAIY_LTX_TOKENIZER").map_or_else(|| gemma.join("tokenizer.json"), std::path::PathBuf::from));
         let prompt = "A red fox trots through fresh snow at sunrise, its breath steaming, the camera tracking beside it".to_string();
         let t = std::time::Instant::now();
         let mut store = Store::open(&ltx, 0)?;
         let started = std::time::Instant::now();
-        let got = contexts(&gemma, &tokenizer, &mut store, std::slice::from_ref(&prompt), 0, |n, of| {
+        let got = contexts(&gemma, tokenizer.as_deref(), &mut store, std::slice::from_ref(&prompt), 0, |n, of| {
             if [1, 24, LAYERS, LAYERS + 1, LAYERS + 9, of].contains(&n) {
                 eprintln!("step {n} of {of}: {:.1} s", started.elapsed().as_secs_f64());
             }
@@ -410,7 +481,7 @@ mod tests {
         #[cfg(not(feature = "cuda"))]
         let dev = Device::Cpu;
         let t = std::time::Instant::now();
-        let (features, _) = crate::ltx::text::encode(&gemma, Some(&tokenizer), &mut store, &prompt, false, false, &dev, |_| {})?;
+        let (features, _) = crate::ltx::text::encode(&gemma, tokenizer.as_deref(), &mut store, &prompt, gemma4, false, &dev, |_| {})?;
         let want = crate::ltx::transformer::connector(&mut store, &features, "video_embeddings_connector", &dev, |_| {})?;
         eprintln!("Candle context {:.1} s", t.elapsed().as_secs_f64());
         let want = want.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;

@@ -286,8 +286,8 @@ pub struct Request {
     pub vram_bytes: u64,
     pub ffmpeg: PathBuf,
     /// The text encoder, transformer and video decoder on WebGPU (`backend` "webgpu": any GPU wgpu reaches, Vulkan,
-    /// Metal or DX12): LTX 2.3's text- and image-to-video (its start and end images encoded on the CPU), the picture
-    /// only, for now.
+    /// Metal or DX12): LTX 2.3's and 2.5's text- and image-to-video (start and end images encoded on the CPU), the
+    /// picture only, for now.
     pub webgpu: bool,
 }
 impl Request {
@@ -510,7 +510,6 @@ impl Request {
         if self.webgpu {
             let nag = self.guidance.as_ref().is_none_or(|g| g.cfg == 1.) && self.negative_prompt.is_some();
             let unsupported = [
-                (self.model == "ltx-2.5", "LTX 2.5 (its Gemma 4 text encoder)"),
                 (self.audio || self.audio_file.is_some() || self.speech.is_some() || self.reference_voice.is_some() || self.identity, "sound (set audio to false)"),
                 (self.lora.is_some(), "LoRAs"),
                 (self.refine.is_some(), "two-stage refinement"),
@@ -1027,7 +1026,7 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
                     let values = context.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
                     let tokens = latent.len() / 128;
                     let clean = (if starting_latent.is_some() { h * w } else { 0 }, if ending_latent.is_some() { h * w } else { 0 });
-                    let v = m.forward(latent, tokens, &values, values.len() / 4096, sigma, table, clean, perturb)?;
+                    let v = m.forward(latent, tokens, &values, values.len() / 4096, sigma, table, clean, h * w, perturb)?;
                     report(event("video_denoising", (step * passes + at + 1) * 48, steps * passes * 48));
                     Ok((Tensor::from_vec(v, (1, tokens, 128), &dev)?, None))
                 }
@@ -1490,9 +1489,8 @@ fn webgpu_contexts(r: &Request, store: &mut Store, cached: Option<Tensor>, negat
         report(event("cached_video_prompt", 1, 1));
         Vec::new()
     } else {
-        let tokenizer = r.tokenizer.as_deref().ok_or_else(|| candle_core::Error::Msg("LTX 2.3 requires a Gemma 3 tokenizer path".into()))?;
         report(event("encoding_video_prompt", 0, 1));
-        crate::ltx_text_wgpu::contexts(&r.text_encoder, tokenizer, store, &prompts, r.device, |n, of| report(event("encoding_video_prompt", n, of)))?
+        crate::ltx_text_wgpu::contexts(&r.text_encoder, r.tokenizer.as_deref(), store, &prompts, r.device, |n, of| report(event("encoding_video_prompt", n, of)))?
     }
     .into_iter();
     let mut next = || -> Result<Tensor> {

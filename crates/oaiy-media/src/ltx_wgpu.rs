@@ -266,6 +266,8 @@ pub fn video_positions(frames: usize, height: usize, width: usize, fps: usize, e
 pub struct WgpuLtx {
     gpu: ggml_rs_wgpu::WgpuBackend,
     patchify: Linear,
+    /// LTX 2.5's learned marker of the first latent frame's tokens (added after the patchify).
+    keyframe: Option<DeviceVec>,
     adaln: TimeEmbed,
     prompt: Option<TimeEmbed>,
     out_table: DeviceVec,
@@ -283,6 +285,7 @@ impl WgpuLtx {
         let adaln = TimeEmbed::load(store, &gpu, &g("adaln_single"))?;
         let prompt = if store.index.get(&g("prompt_adaln_single.linear.weight")).is_some() { Some(TimeEmbed::load(store, &gpu, &g("prompt_adaln_single"))?) } else { None };
         let out_table = vector(store, &gpu, &g("scale_shift_table"))?;
+        let keyframe = if store.index.get(&g("keyframes_abs_pos_embedding")).is_some() { Some(vector(store, &gpu, &g("keyframes_abs_pos_embedding"))?) } else { None };
         let proj_out = Linear::load(store, &gpu, &g("proj_out"))?;
         if patchify.n != D || adaln.linear.n != 9 * D || out_table.len != 2 * D {
             candle_core::bail!("not LTX 2.3's video stream (patchify {}, modulation {}, output table {})", patchify.n, adaln.linear.n, out_table.len);
@@ -300,7 +303,7 @@ impl WgpuLtx {
             });
             progress(i + 1);
         }
-        Ok(Self { gpu, patchify, adaln, prompt, out_table, proj_out, blocks })
+        Ok(Self { gpu, patchify, keyframe, adaln, prompt, out_table, proj_out, blocks })
     }
 
     fn vec(&self, len: usize) -> DeviceVec {
@@ -324,17 +327,17 @@ impl WgpuLtx {
     /// The video velocity of `latent` (`tokens` rows of 128) at `sigma` over `context` (`lc` rows of `D`, the
     /// connector's), its tokens rotated by `table` ([`rope_table`] of [`video_positions`], [`Self::upload`]ed):
     /// `[tokens, 128]`. `clean`: the leading tokens of a starting image and the trailing ones of an end image, at
-    /// timestep 0. With `skip_self` that block's self-attention passed through (spatio-temporal guidance's perturbed
-    /// pass).
+    /// timestep 0; `first_frame` the first latent frame's tokens (LTX 2.5 marks them). With `skip_self` that block's
+    /// self-attention passed through (spatio-temporal guidance's perturbed pass).
     #[allow(clippy::too_many_arguments)]
-    pub fn forward(&self, latent: &[f32], tokens: usize, context: &[f32], lc: usize, sigma: f64, table: &DeviceVec, clean: (usize, usize), skip_self: Option<usize>) -> Result<Vec<f32>> {
-        self.pass(latent, tokens, context, lc, sigma, table, clean, skip_self, false)?.pop().ok_or_else(|| err("the velocity was not read"))
+    pub fn forward(&self, latent: &[f32], tokens: usize, context: &[f32], lc: usize, sigma: f64, table: &DeviceVec, clean: (usize, usize), first_frame: usize, skip_self: Option<usize>) -> Result<Vec<f32>> {
+        self.pass(latent, tokens, context, lc, sigma, table, clean, first_frame, skip_self, false)?.pop().ok_or_else(|| err("the velocity was not read"))
     }
 
     /// [`Self::forward`]'s pass: its reads, the velocity last (with `trace`, every block's output before it, one after
     /// another in one vector: a read is the vector as the recording leaves it).
     #[allow(clippy::too_many_arguments)]
-    fn pass(&self, latent: &[f32], tokens: usize, context: &[f32], lc: usize, sigma: f64, table: &DeviceVec, clean: (usize, usize), skip_self: Option<usize>, trace: bool) -> Result<Vec<Vec<f32>>> {
+    fn pass(&self, latent: &[f32], tokens: usize, context: &[f32], lc: usize, sigma: f64, table: &DeviceVec, clean: (usize, usize), first_frame: usize, skip_self: Option<usize>, trace: bool) -> Result<Vec<Vec<f32>>> {
         if latent.len() != tokens * self.patchify.k || context.len() != lc * D || table.len != tokens * D {
             candle_core::bail!("an LTX step's inputs: {} latent values for {tokens} tokens, {} context for {lc}, {} rotary", latent.len(), context.len(), table.len);
         }
@@ -379,6 +382,9 @@ impl WgpuLtx {
             None => r.copy(&self.vec(2 * D), 0, &prompt, 0, 2 * D),
         }
         self.patchify.forward(r, &lat, &x, tokens);
+        if let Some(marker) = self.keyframe.as_ref().filter(|_| first_frame > 0) {
+            r.add_bias_rows(&x, marker, first_frame.min(tokens), D);
+        }
         for (i, b) in self.blocks.iter().enumerate() {
             // the block's modulation: the step's and its own table (shift, scale, gate: self-attention 0-2, the
             // feed-forward 3-5, text attention 6-8), the prompt's two rows the same
@@ -542,7 +548,7 @@ mod tests {
         let table = gpu.upload(&rope_table(&video_positions(frames, h, w, fps, false), &[20., 2048., 2048.], D, HEADS));
         for i in 0..3 {
             let t = std::time::Instant::now();
-            let v = gpu.forward(&latent, tokens, &context, lc, 0.7 - 0.1 * i as f64, &table, (0, 0), None)?;
+            let v = gpu.forward(&latent, tokens, &context, lc, 0.7 - 0.1 * i as f64, &table, (0, 0), h * w, None)?;
             eprintln!("step {i}: {:.2} s ({} values)", t.elapsed().as_secs_f64(), v.len());
         }
         Ok(())
@@ -590,13 +596,13 @@ mod tests {
         let gpu = WgpuLtx::load(&mut store, 0, |_| {})?;
         eprintln!("WebGPU video stream loaded in {:.1} s", t.elapsed().as_secs_f64());
         let table = gpu.upload(&rope_table(&video_positions(frames, h, w, fps, false), &[20., 2048., 2048.], D, HEADS));
-        let got: Vec<Vec<f32>> = [0.8, 0.25].iter().map(|&sigma| gpu.forward(&latent, tokens, &context, lc, sigma, &table, (0, 0), None)).collect::<Result<_>>()?;
+        let got: Vec<Vec<f32>> = [0.8, 0.25].iter().map(|&sigma| gpu.forward(&latent, tokens, &context, lc, sigma, &table, (0, 0), h * w, None)).collect::<Result<_>>()?;
         // and spatio-temporal guidance's pass, block 28's self-attention passed through
-        let stg = gpu.forward(&latent, tokens, &context, lc, 0.8, &table, (0, 0), Some(28))?;
+        let stg = gpu.forward(&latent, tokens, &context, lc, 0.8, &table, (0, 0), h * w, Some(28))?;
         // and a starting image's and an end image's clean tokens (the first frame's, an appended frame's)
         let ends = gpu.upload(&rope_table(&video_positions(frames, h, w, fps, true), &[20., 2048., 2048.], D, HEADS));
         let appended: Vec<f32> = latent.iter().chain(&latent[..h * w * 128]).map(|v| v * 0.9).collect();
-        let conditioned = gpu.forward(&appended, tokens + h * w, &context, lc, 0.8, &ends, (h * w, h * w), None)?;
+        let conditioned = gpu.forward(&appended, tokens + h * w, &context, lc, 0.8, &ends, (h * w, h * w), h * w, None)?;
         drop(gpu);
         // (Candle's LTX is BF16 throughout: its CPU has no BF16 matmul, so CUDA's device OAIY_LTX_CUDA_DEVICE, 0 else)
         #[cfg(feature = "cuda")]
@@ -672,7 +678,7 @@ mod tests {
         let mut store = Store::open(path, 0)?;
         let gpu = WgpuLtx::load(&mut store, 0, |_| {})?;
         let table = gpu.upload(&rope_table(&video_positions(frames, h, w, fps, false), &[20., 2048., 2048.], D, HEADS));
-        let got = gpu.pass(&latent, tokens, &context, lc, 0.8, &table, (0, 0), None, true)?;
+        let got = gpu.pass(&latent, tokens, &context, lc, 0.8, &table, (0, 0), h * w, None, true)?;
         let trail = &got[0];
         drop(gpu);
         #[cfg(feature = "cuda")]
