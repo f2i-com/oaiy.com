@@ -96,7 +96,9 @@ pub struct WgpuBiRefNet {
     lateral: Vec<Conv>,
     gates: Vec<(Conv, Conv)>,
     inputs: Vec<(Conv, Conv)>,
-    out: Conv,
+    /// The output's 1x1 convolution in two: of the decoder's features and of the picture's input block's (their
+    /// 1024x1024 concatenation, 1 GB, never made).
+    out: (Conv, Conv),
     /// `[1.0]` (a plain sum's weight), and 2.0s (the modulators' scale) enough for the largest.
     one: DeviceVec,
     twos: DeviceVec,
@@ -182,7 +184,13 @@ impl WgpuBiRefNet {
             lateral: net.lateral.iter().map(|c| conv(c, "a lateral")).collect::<Result<_>>()?,
             gates: net.gates.iter().map(|p| pair(p, "a gate")).collect::<Result<_>>()?,
             inputs: net.inputs.iter().map(|p| pair(p, "an input block")).collect::<Result<_>>()?,
-            out: conv(&net.out, "the output")?,
+            out: {
+                let split = net.inputs[4].1.w.dim(0)?;
+                let cin = net.out.w.dim(1)?;
+                let a = crate::birefnet::Conv { w: net.out.w.narrow(1, 0, cin - split)?.contiguous()?, b: net.out.b.clone(), k: 1 };
+                let b = crate::birefnet::Conv { w: net.out.w.narrow(1, cin - split, split)?.contiguous()?, b: None, k: 1 };
+                (conv(&a, "the output")?, conv(&b, "the output")?)
+            },
             one: f32v(&[1.0]),
             twos: f32v(&vec![2.0; (SIZE / 4) * (SIZE / 4) * 49]),
             gpu,
@@ -260,13 +268,28 @@ impl WgpuBiRefNet {
         levels
     }
 
+    /// `f`'s ops one recording (its scratch, the tensor cores' f16 copies of the convolutions' inputs, back to the
+    /// pool when it has run: the whole forward one recording held 7.4 GB at once).
+    fn phase<T>(&self, f: impl FnOnce(&mut dyn ChainRecorder) -> T) -> T {
+        let mut rec = self.gpu.begin();
+        rec.keep_groups(false);
+        let out = f(rec.as_mut());
+        rec.finish();
+        out
+    }
+
     /// The four encoder levels: the backbone at full and half size, joined, the top one with its context.
-    fn encode(&self, r: &mut dyn ChainRecorder, x: &DeviceVec) -> Vec<Level> {
+    fn encode(&self, x: &DeviceVec) -> Vec<Level> {
         let g = &self.gpu;
-        let full = self.backbone(r, x, SIZE);
-        let xh = g.vec(SIZE * SIZE / 4 * 3);
-        r.resize_bilinear_rows(x, &xh, SIZE, SIZE, 3, SIZE / 2, SIZE / 2);
-        let half = self.backbone(r, &xh, SIZE / 2);
+        let full = self.phase(|r| self.backbone(r, x, SIZE));
+        let half = self.phase(|r| {
+            let xh = g.vec(SIZE * SIZE / 4 * 3);
+            r.resize_bilinear_rows(x, &xh, SIZE, SIZE, 3, SIZE / 2, SIZE / 2);
+            self.backbone(r, &xh, SIZE / 2)
+        });
+        let mut rec = g.begin();
+        rec.keep_groups(false);
+        let r = rec.as_mut();
         let mut levels: Vec<Level> = Vec::new();
         for ((f, h, w, c), (hf, hh, hw, _)) in full.iter().zip(&half) {
             let (cat, up) = (g.vec(h * w * 2 * c), g.vec(h * w * c));
@@ -290,6 +313,7 @@ impl WgpuBiRefNet {
             at += c;
         }
         levels[3] = (ctx, h4, w4, width);
+        rec.finish();
         levels
     }
 
@@ -371,40 +395,46 @@ impl WgpuBiRefNet {
         let g = &self.gpu;
         let xd = g.vec(x.len());
         g.upload(&xd, x);
+        let levels = self.encode(&xd);
+        let (l3, h3, w3, _) = &levels[3];
+        let mut p = self.phase(|r| {
+            let top = self.dec(r, &self.squeeze, l3, *h3, *w3);
+            let i0 = self.input(r, 0, &xd, *h3);
+            self.join(r, &top, self.squeeze.conv_out.cout, &i0, self.inputs[0].1.cout, h3 * w3)
+        });
+        let (mut ph, mut pw) = (*h3, *w3);
+        for i in 0..3 {
+            let (skip, sh, sw, _) = &levels[2 - i];
+            p = self.phase(|r| {
+                let q = self.dec(r, &self.blocks[i], &p, ph, pw);
+                let cq = self.blocks[i].conv_out.cout;
+                let (gate, attn) = &self.gates[i];
+                let gt = self.conv(r, gate, &q, ph, pw);
+                Self::relu(r, &gt, ph * pw * gate.cout);
+                let at = self.conv(r, attn, &gt, ph, pw);
+                r.mul_sigmoid_rows(&q, &at, ph * pw, cq);
+                let up = g.vec(sh * sw * cq);
+                r.resize_bilinear_rows(&q, &up, ph, pw, cq, *sh, *sw);
+                let lat = self.conv(r, &self.lateral[i], skip, *sh, *sw);
+                r.axpy_at(&up, &lat, &self.one, 0, sh * sw * cq);
+                let inp = self.input(r, i + 1, &xd, *sh);
+                self.join(r, &up, cq, &inp, self.inputs[i + 1].1.cout, sh * sw)
+            });
+            (ph, pw) = (*sh, *sw);
+        }
+        let q = self.phase(|r| self.dec(r, &self.blocks[3], &p, ph, pw));
+        drop(p);
         let mut rec = g.begin();
         rec.keep_groups(false);
         let r = rec.as_mut();
-        let levels = self.encode(r, &xd);
-        let (l3, h3, w3, _) = &levels[3];
-        let top = self.dec(r, &self.squeeze, l3, *h3, *w3);
-        let ct = self.squeeze.conv_out.cout;
-        let i0 = self.input(r, 0, &xd, *h3);
-        let mut p = self.join(r, &top, ct, &i0, self.inputs[0].1.cout, h3 * w3);
-        let (mut ph, mut pw) = (*h3, *w3);
-        for i in 0..3 {
-            let q = self.dec(r, &self.blocks[i], &p, ph, pw);
-            let cq = self.blocks[i].conv_out.cout;
-            let (gate, attn) = &self.gates[i];
-            let gt = self.conv(r, gate, &q, ph, pw);
-            Self::relu(r, &gt, ph * pw * gate.cout);
-            let at = self.conv(r, attn, &gt, ph, pw);
-            r.mul_sigmoid_rows(&q, &at, ph * pw, cq);
-            let (skip, sh, sw, _) = &levels[2 - i];
-            let up = g.vec(sh * sw * cq);
-            r.resize_bilinear_rows(&q, &up, ph, pw, cq, *sh, *sw);
-            let lat = self.conv(r, &self.lateral[i], skip, *sh, *sw);
-            r.axpy_at(&up, &lat, &self.one, 0, sh * sw * cq);
-            let inp = self.input(r, i + 1, &xd, *sh);
-            p = self.join(r, &up, cq, &inp, self.inputs[i + 1].1.cout, sh * sw);
-            (ph, pw) = (*sh, *sw);
-        }
-        let q = self.dec(r, &self.blocks[3], &p, ph, pw);
         let cq = self.blocks[3].conv_out.cout;
         let up = g.vec(SIZE * SIZE * cq);
         r.resize_bilinear_rows(&q, &up, ph, pw, cq, SIZE, SIZE);
         let inp = self.input(r, 4, &xd, SIZE);
-        let last = self.join(r, &up, cq, &inp, self.inputs[4].1.cout, SIZE * SIZE);
-        let logits = self.conv(r, &self.out, &last, SIZE, SIZE);
+        // the output's convolution of the two apart, summed
+        let logits = self.conv(r, &self.out.0, &up, SIZE, SIZE);
+        let more = self.conv(r, &self.out.1, &inp, SIZE, SIZE);
+        r.axpy_at(&logits, &more, &self.one, 0, SIZE * SIZE);
         r.read(&logits);
         rec.finish().pop().ok_or_else(|| err("the logits were not read"))
     }

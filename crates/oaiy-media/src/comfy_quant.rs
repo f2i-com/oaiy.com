@@ -275,8 +275,7 @@ fn parallel_rows(data: &mut [f32], cols: usize, decode: impl Fn(usize, &mut [f32
     if cols == 0 || data.is_empty() {
         return;
     }
-    // (every core: a W4A8 Qwen3-VL 8B's 7.6 billion values decoded for WebGPU on the CPU)
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(8));
     let rows_per_chunk = (data.len() / cols).div_ceil(threads).max(1);
     std::thread::scope(|scope| {
         for (i, chunk) in data.chunks_mut(rows_per_chunk * cols).enumerate() {
