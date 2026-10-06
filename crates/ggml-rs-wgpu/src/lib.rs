@@ -154,7 +154,7 @@ fn chunk_limit(limits: &wgpu::Limits) -> u64 {
 /// The driver's calls a [`Gpu`]'s watchdog watches ([`Gpu::wait`]'s polls, a second's timeout each): how many are in
 /// progress, and when one last began or returned (ms since the first watched). None returned in [`HUNG`] has hung in
 /// the driver: NVIDIA's Vulkan, its device lost to a reset (Windows' TDR: a submission past 2 s), spins in its fence
-/// wait whatever the timeout, and the process is ended, saying why, rather than left waiting for good.
+/// wait whatever the timeout; said, and the process ended where it is one job's ([`end_process_on_hang`]).
 #[derive(Default)]
 struct Watch {
     calls: AtomicU64,
@@ -188,24 +188,41 @@ impl Drop for Watched<'_> {
     }
 }
 
-/// `watch`'s calls checked every second while its GPU lives: one hung ([`HUNG`]) ends the process, saying why on
-/// stderr (a media worker's last line, the job's error).
+/// Whether a hung driver call ends the process ([`end_process_on_hang`]); else it is only said, once.
+static END_ON_HANG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A driver call hung on a lost device ([`HUNG`] without one returning) ends this process, saying why on stderr: for a
+/// process of one job (the media worker: its last line the job's error, rather than a job that never ends). Elsewhere
+/// (a server's other models on other devices) it is only said.
+pub fn end_process_on_hang() {
+    END_ON_HANG.store(true, Ordering::Relaxed);
+}
+
+/// `watch`'s calls checked every second while its GPU lives: one hung ([`HUNG`]) said on stderr, and the process ended
+/// where [`end_process_on_hang`] has asked.
 fn watchdog(watch: std::sync::Weak<Watch>, lost: std::sync::Weak<Mutex<Option<String>>>, name: String) {
+    let mut said = false;
     loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
         let Some(w) = watch.upgrade() else { return };
         if w.calls.load(Ordering::Relaxed) == 0 {
+            said = false;
             continue;
         }
         let quiet = watch_clock().saturating_sub(w.stamp.load(Ordering::Relaxed));
-        if quiet > HUNG.as_millis() as u64 {
+        if quiet > HUNG.as_millis() as u64 && !said {
             let why = lost.upgrade().and_then(|l| l.lock().unwrap_or_else(|p| p.into_inner()).clone());
+            let end = END_ON_HANG.load(Ordering::Relaxed);
             eprintln!(
-                "webgpu: {name}'s driver has not returned from a wait in {} s: its device is lost{} (a reset: a submission past the OS's GPU time limit, Windows' 2 s TDR); ending the process",
+                "webgpu: {name}'s driver has not returned from a wait in {} s: its device is lost{} (a reset: a submission past the OS's GPU time limit, Windows' 2 s TDR){}",
                 quiet / 1000,
-                why.map_or(String::new(), |w| format!(" ({w})"))
+                why.map_or(String::new(), |w| format!(" ({w})")),
+                if end { "; ending the process" } else { "" }
             );
-            end_process();
+            if end {
+                end_process();
+            }
+            said = true;
         }
     }
 }
@@ -868,7 +885,17 @@ impl WgpuBackend {
             device_type: format!("{:?}", info.device_type),
             pci_bus_id: info.device_pci_bus_id.clone(),
         };
-        let limits = adapter.limits();
+        let mut limits = adapter.limits();
+        if std::env::var_os("OAIY_PORTABLE_LIMITS").is_some() {
+            // a workgroup's memory and invocations as WebGPU's defaults (16 KB, 256): other GPUs' limits (a kernel past
+            // them fails to build), the rest the adapter's
+            let d = wgpu::Limits::default();
+            limits.max_compute_workgroup_storage_size = limits.max_compute_workgroup_storage_size.min(d.max_compute_workgroup_storage_size);
+            limits.max_compute_invocations_per_workgroup = limits.max_compute_invocations_per_workgroup.min(d.max_compute_invocations_per_workgroup);
+            limits.max_compute_workgroup_size_x = limits.max_compute_workgroup_size_x.min(d.max_compute_workgroup_size_x);
+            limits.max_compute_workgroup_size_y = limits.max_compute_workgroup_size_y.min(d.max_compute_workgroup_size_y);
+            limits.max_compute_workgroup_size_z = limits.max_compute_workgroup_size_z.min(d.max_compute_workgroup_size_z);
+        }
         let timestamps = if profile::chain_on() || profile::pieces_on() { adapter.features() & wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() };
         // the tensor cores' matrices (Vulkan's cooperative matrices) and f16 in shaders, where the adapter has them: a
         // prompt's matmuls through them

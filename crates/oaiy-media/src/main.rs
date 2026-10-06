@@ -1,6 +1,22 @@
 use oaiy_engine::json::Json;
 use std::io::{Read, Write};
 fn main() {
+    // a panic's message the last line too, as an error's (the server keeps the last: else the backtrace's note)
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        report(info);
+        let message = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| info.payload().downcast_ref::<&str>().copied())
+            .unwrap_or("a panic");
+        let at = info.location().map_or(String::new(), |l| format!(" at {}:{}", l.file(), l.line()));
+        eprintln!("{}", Json::obj([("error", Json::str(format!("{message}{at}")))]).to_json());
+    }));
+    // (one job a process: a GPU driver hung on a lost device ends it, the job failed rather than never done)
+    #[cfg(feature = "webgpu")]
+    ggml_rs_wgpu::end_process_on_hang();
     if let Err(e) = run() {
         eprintln!(
             "{}",
