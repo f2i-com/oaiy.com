@@ -824,7 +824,7 @@ mod tests {
             }
             let queued = t.elapsed().as_secs_f64();
             gpu.queue.submit([]);
-            let _ = gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+            gpu.wait(None);
             let secs = t.elapsed().as_secs_f64();
             eprintln!("round {round}: {:.0} MB in {secs:.3} s ({:.2} GB/s; the writes queued in {queued:.3} s)", 32.0 * size as f64 / 1e6, 32.0 * size as f64 / secs / 1e9);
         }

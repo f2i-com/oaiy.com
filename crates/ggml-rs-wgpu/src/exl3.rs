@@ -2866,7 +2866,7 @@ mod tests {
             let t = std::time::Instant::now();
             for _ in 0..50 {
                 b.gpu.queue.submit([]);
-                let _ = b.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+                b.gpu.wait(None);
             }
             let idle = t.elapsed().as_secs_f64() * 1000.0 / 50.0;
             // As in a model: the host computes between calls (here 3 ms of spinning), so the GPU waits idle between them.

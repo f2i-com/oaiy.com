@@ -151,9 +151,89 @@ fn chunk_limit(limits: &wgpu::Limits) -> u64 {
     (limits.max_storage_buffer_binding_size as u64).min(limits.max_buffer_size).min(1 << 30) & !3
 }
 
+/// The driver's calls a [`Gpu`]'s watchdog watches ([`Gpu::wait`]'s polls, a second's timeout each): how many are in
+/// progress, and when one last began or returned (ms since the first watched). None returned in [`HUNG`] has hung in
+/// the driver: NVIDIA's Vulkan, its device lost to a reset (Windows' TDR: a submission past 2 s), spins in its fence
+/// wait whatever the timeout, and the process is ended, saying why, rather than left waiting for good.
+#[derive(Default)]
+struct Watch {
+    calls: AtomicU64,
+    stamp: AtomicU64,
+}
+
+/// How long a watched call may go without one returning.
+const HUNG: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Milliseconds since the first call (never 0).
+fn watch_clock() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+impl Watch {
+    /// A watched call begun, ended when the guard is dropped.
+    fn enter(&self) -> Watched<'_> {
+        self.stamp.store(watch_clock(), Ordering::Relaxed);
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Watched(self)
+    }
+}
+
+struct Watched<'a>(&'a Watch);
+
+impl Drop for Watched<'_> {
+    fn drop(&mut self) {
+        self.0.stamp.store(watch_clock(), Ordering::Relaxed);
+        self.0.calls.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// `watch`'s calls checked every second while its GPU lives: one hung ([`HUNG`]) ends the process, saying why on
+/// stderr (a media worker's last line, the job's error).
+fn watchdog(watch: std::sync::Weak<Watch>, lost: std::sync::Weak<Mutex<Option<String>>>, name: String) {
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let Some(w) = watch.upgrade() else { return };
+        if w.calls.load(Ordering::Relaxed) == 0 {
+            continue;
+        }
+        let quiet = watch_clock().saturating_sub(w.stamp.load(Ordering::Relaxed));
+        if quiet > HUNG.as_millis() as u64 {
+            let why = lost.upgrade().and_then(|l| l.lock().unwrap_or_else(|p| p.into_inner()).clone());
+            eprintln!(
+                "webgpu: {name}'s driver has not returned from a wait in {} s: its device is lost{} (a reset: a submission past the OS's GPU time limit, Windows' 2 s TDR); ending the process",
+                quiet / 1000,
+                why.map_or(String::new(), |w| format!(" ({w})"))
+            );
+            end_process();
+        }
+    }
+}
+
+/// This process ended at once, its exit code 3: no DLL's detach run (a GPU driver's would wait for its hung threads).
+fn end_process() -> ! {
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentProcess() -> isize;
+            fn TerminateProcess(process: isize, code: u32) -> i32;
+        }
+        // SAFETY: the current process's pseudo-handle, ended
+        unsafe {
+            TerminateProcess(GetCurrentProcess(), 3);
+        }
+    }
+    std::process::abort()
+}
+
 struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
+    /// Why the device was lost, once its callback has said (a wait then fails rather than waiting on).
+    lost: Arc<Mutex<Option<String>>>,
+    /// The driver's calls a watchdog thread watches (a hung one ends the process).
+    watch: Arc<Watch>,
     layout: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
     pipelines: Mutex<HashMap<(GgmlType, u8), Arc<wgpu::ComputePipeline>>>,
@@ -326,12 +406,30 @@ impl Gpu {
         self.map_read(&staging, len)
     }
 
+    /// Waits for submission `index` (else everything submitted), a second at a time: a lost device (its callback has
+    /// said so, or nothing has finished in ten minutes: a driver that lost it without saying) fails the job rather than
+    /// leaving it waiting for good.
+    pub(crate) fn wait(&self, index: Option<wgpu::SubmissionIndex>) {
+        loop {
+            let polled = {
+                let _watched = self.watch.enter();
+                self.device.poll(wgpu::PollType::Wait { submission_index: index.clone(), timeout: Some(std::time::Duration::from_secs(1)) })
+            };
+            match polled {
+                Ok(_) => return,
+                Err(wgpu::PollError::Timeout) => {}
+                Err(e) => panic!("webgpu: waiting for the GPU: {e}"),
+            }
+            if let Some(why) = self.lost.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+                panic!("webgpu: the device was lost ({why})");
+            }
+        }
+    }
+
     fn map_read(&self, staging: &wgpu::Buffer, len: u64) -> Vec<u8> {
         let slice = staging.slice(..len);
         slice.map_async(wgpu::MapMode::Read, |_| {});
-        self.device
-            .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
-            .expect("webgpu: device lost while waiting for a result");
+        self.wait(None);
         let out = slice.get_mapped_range().expect("webgpu: mapping a finished buffer").to_vec();
         staging.unmap();
         out
@@ -392,7 +490,7 @@ impl Gpu {
             if pending >= 256 << 20 {
                 self.staged.store(0, Ordering::Relaxed);
                 self.queue.submit([]);
-                let _ = self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+                self.wait(None);
             }
         }
         chunks
@@ -792,6 +890,32 @@ impl WgpuBackend {
             ..Default::default()
         }))
         .map_err(|e| format!("WebGPU device on {}: {e}", info.name))?;
+        // its loss noted (a TDR, a driver's reset): a wait for it fails then
+        let lost = Arc::new(Mutex::new(None));
+        {
+            let lost = Arc::clone(&lost);
+            device.set_device_lost_callback(move |reason, message| {
+                *lost.lock().unwrap_or_else(|p| p.into_inner()) = Some(format!("{reason:?}: {message}"));
+            });
+        }
+        {
+            // (an error once it is lost said to be that: its new buffers are invalid, the first use of one the error)
+            let lost = Arc::clone(&lost);
+            device.on_uncaptured_error(Arc::new(move |e: wgpu::Error| {
+                if let Some(why) = lost.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+                    panic!("webgpu: the device was lost ({why}): {e}");
+                }
+                panic!("wgpu error: {e}");
+            }));
+        }
+        let watch = Arc::new(Watch::default());
+        {
+            let (w, l, name) = (Arc::downgrade(&watch), Arc::downgrade(&lost), info.name.clone());
+            std::thread::Builder::new()
+                .name("oaiy-webgpu-watchdog".into())
+                .spawn(move || watchdog(w, l, name))
+                .map_err(|e| format!("WebGPU device on {}: its watchdog: {e}", info.name))?;
+        }
         let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -827,7 +951,7 @@ impl WgpuBackend {
         });
         Ok(Self {
             cpu: CpuBackend::new(),
-            gpu: Arc::new(Gpu { device, queue, layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), names: Mutex::new(HashMap::new()), pool: Mutex::new(Vec::new()), staging: Mutex::new(Vec::new()), chain_groups: Mutex::new(HashMap::new()), wide: std::sync::OnceLock::new(), chain_groups_wide: Mutex::new(HashMap::new()), dummy: std::sync::OnceLock::new(), dummy_rw: std::sync::OnceLock::new(), limits, staged: AtomicU64::new(0), few: std::sync::OnceLock::new(), moe_steps: Mutex::new(Vec::new()), coop_units: std::sync::OnceLock::new() }),
+            gpu: Arc::new(Gpu { device, queue, lost, watch, layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), names: Mutex::new(HashMap::new()), pool: Mutex::new(Vec::new()), staging: Mutex::new(Vec::new()), chain_groups: Mutex::new(HashMap::new()), wide: std::sync::OnceLock::new(), chain_groups_wide: Mutex::new(HashMap::new()), dummy: std::sync::OnceLock::new(), dummy_rw: std::sync::OnceLock::new(), limits, staged: AtomicU64::new(0), few: std::sync::OnceLock::new(), moe_steps: Mutex::new(Vec::new()), coop_units: std::sync::OnceLock::new() }),
             budget,
             used: Arc::new(AtomicU64::new(0)),
             summary,
@@ -854,7 +978,7 @@ impl WgpuBackend {
         let up = || {
             self.gpu.queue.write_buffer(&buf, 0, &data);
             let i = self.gpu.queue.submit([]);
-            let _ = self.gpu.device.poll(wgpu::PollType::Wait { submission_index: Some(i), timeout: None });
+            self.gpu.wait(Some(i));
         };
         up();
         let _ = self.gpu.read(&buf, len as u64);
@@ -875,7 +999,7 @@ impl WgpuBackend {
     /// Wait for the GPU's work and let go of the buffers dropped since (wgpu frees them at a poll or submit: a stage's
     /// vectors dropped before the next stage makes its own would otherwise share the card with them).
     pub fn settle(&self) {
-        let _ = self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        self.gpu.wait(None);
     }
 
     /// Let go of what the device keeps between chains' runs (the kept bind groups and the vectors they hold, the
@@ -1079,7 +1203,7 @@ impl WgpuBackend {
         gpu.queue.submit([enc.finish()]);
         let slice = staging.slice(..total);
         slice.map_async(wgpu::MapMode::Read, |_| {});
-        gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).expect("webgpu: device lost while waiting for a result");
+        gpu.wait(None);
         profile::add(&profile::LINEAR_WAIT, waiting);
         // each output made straight from the mapped bytes (a copy of them first was a second pass over a prompt's
         // outputs, up to 131 MB a call)

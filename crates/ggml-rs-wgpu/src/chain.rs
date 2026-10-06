@@ -2405,7 +2405,7 @@ impl ggml_rs::DeviceStorage for Aliased {
         }
         self.gpu.queue.submit([enc.finish()]);
         staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).expect("webgpu: device lost while reading a chain's vector");
+        self.gpu.wait(None);
         let view = staging.slice(..).get_mapped_range().expect("webgpu: mapping a finished buffer");
         let host: Vec<f32> = view.chunks_exact(4).take(len).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
         drop(view);
@@ -2549,7 +2549,7 @@ impl DeviceChain for WgpuBackend {
             // turn held it all until the next submit (Qwen Image's 14 GB took 31 of a 32 GB card)
             if data.len() >= 16 << 20 {
                 self.gpu.queue.submit([]);
-                let _ = self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+                self.gpu.wait(None);
             }
         }
     }
@@ -2600,7 +2600,7 @@ impl DeviceChain for WgpuBackend {
     }
 
     fn begin(&self) -> Box<dyn ChainRecorder + '_> {
-        Box::new(Recorder { backend: self, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None })
+        Box::new(Recorder { backend: self, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new() })
     }
 }
 
@@ -2721,7 +2721,7 @@ impl<'a> Recorder<'a> {
     /// A recording on `backend`, its bind groups kept (the crate's own measurements record kernels directly).
     #[cfg(test)]
     pub(crate) fn new(backend: &'a WgpuBackend) -> Self {
-        Recorder { backend, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None }
+        Recorder { backend, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new() }
     }
 }
 
@@ -2737,8 +2737,11 @@ pub(crate) type WideKey = (usize, [wgpu::Buffer; 8], [u32; 8]);
 /// Bind groups kept before the cache starts over (a cache grown from buffers that were replaced).
 const KEEP_GROUPS: usize = 16384;
 
-/// Dispatches a piece of a run submits ([`Recorder::finish`]'s).
-const PIECE: usize = 128;
+/// Dispatches a piece of a run submits ([`Recorder::finish`]'s): 128, or `OAIY_PIECE`'s.
+fn piece() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("OAIY_PIECE").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(128))
+}
 
 /// The most splits along k of a prompt's EXL3 projection on the tensor cores.
 const COOP_SPLITS_MAX: usize = 8;
@@ -2782,27 +2785,47 @@ pub(crate) struct Recorder<'a> {
     /// (with its reads: a finish waits for its own work, not for what went after), where to
     stamps: Option<(wgpu::QuerySet, u32)>,
     stamped: Option<wgpu::Buffer>,
+    /// `OAIY_CHAIN_PROFILE`: each piece's kernels and where their timestamps are copied (read at the finish).
+    timed: Vec<(Vec<Arc<wgpu::ComputePipeline>>, wgpu::Buffer)>,
 }
 
 impl Recorder<'_> {
-    /// A dispatch recorded; a piece of [`PIECE`] submitted as soon as it is recorded (unless profiled), so the GPU runs
+    /// A dispatch recorded; a piece of [`piece`]'s submitted as soon as it is recorded, so the GPU runs
     /// a run's first ops while the CPU records the rest. A later upload (`Queue::write_buffer`) lands after the pieces
     /// already submitted and before the ones after, as the recording's order has it.
     fn push(&mut self, d: Dispatch) {
         self.dispatches.push(d);
-        if self.dispatches.len() >= PIECE {
+        if self.dispatches.len() >= piece() {
             self.submit_piece();
         }
     }
 
     /// The dispatches recorded so far encoded as a piece (one compute pass) and submitted (held: kept to be, see
-    /// [`ChainRecorder::hold`]); none where profiled (each its own pass at the finish).
+    /// [`ChainRecorder::hold`]); profiled (`OAIY_CHAIN_PROFILE`), each its own pass between two timestamps (a piece
+    /// at a time: the whole recording one submission would run past the OS's limit on one, Windows' 2 s).
     fn submit_piece(&mut self) {
-        if !self.dispatches.is_empty() && !crate::profile::chain_on() {
+        if !self.dispatches.is_empty() {
             let _one = self.backend.serial.lock().unwrap_or_else(|p| p.into_inner());
             let start = std::time::Instant::now();
             let mut piece = self.gpu().device.create_command_encoder(&Default::default());
-            {
+            if crate::profile::chain_on() && self.gpu().device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+                let n = self.dispatches.len();
+                let device = &self.gpu().device;
+                let set = device.create_query_set(&wgpu::QuerySetDescriptor { label: Some("oaiy-chain-profile"), ty: wgpu::QueryType::Timestamp, count: 2 * n as u32 });
+                for (i, (pipeline, group, (x, y, z))) in self.dispatches.iter().enumerate() {
+                    let timestamp_writes = Some(wgpu::ComputePassTimestampWrites { query_set: &set, beginning_of_pass_write_index: Some(2 * i as u32), end_of_pass_write_index: Some(2 * i as u32 + 1) });
+                    let mut pass = piece.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes });
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, group, &[]);
+                    pass.dispatch_workgroups(*x, *y, *z);
+                }
+                let bytes = 16 * n as u64;
+                let resolved = device.create_buffer(&wgpu::BufferDescriptor { label: Some("oaiy-chain-profile"), size: bytes, usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+                let staging = device.create_buffer(&wgpu::BufferDescriptor { label: Some("oaiy-chain-profile-read"), size: bytes, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+                piece.resolve_query_set(&set, 0..2 * n as u32, &resolved, 0);
+                piece.copy_buffer_to_buffer(&resolved, 0, &staging, 0, bytes);
+                self.timed.push((self.dispatches.iter().map(|(p, _, _)| Arc::clone(p)).collect(), staging));
+            } else {
                 let i = self.next_stamp();
                 let timestamp_writes = self.stamp_writes(i);
                 let mut pass = piece.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes });
@@ -3543,9 +3566,6 @@ impl ChainRecorder for Recorder<'_> {
             self.gpu().queue.submit(held);
         }
         self.submit_piece();
-        if crate::profile::chain_on() {
-            return;
-        }
         let mut enc = self.gpu().device.create_command_encoder(&Default::default());
         for (from, offset, staging, len) in &self.reads[self.copied..] {
             if *len > 0 {
@@ -4018,34 +4038,17 @@ impl ChainRecorder for Recorder<'_> {
     }
 
     fn finish(mut self: Box<Self>) -> Vec<Vec<f32>> {
+        // (profiled: what is left a piece of its own, timed as the others)
+        let profiled = crate::profile::chain_on();
+        if profiled {
+            self.submit_piece();
+        }
         let _one = self.backend.serial.lock().unwrap_or_else(|p| p.into_inner());
         let start = std::time::Instant::now();
         let mut enc = self.gpu().device.create_command_encoder(&Default::default());
-        // profiled: each dispatch a pass between two timestamps (up to the query set's 4096)
-        let timed = crate::profile::chain_on() && self.gpu().device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
-        let mut stamps = None;
-        if timed {
-            let n = self.dispatches.len().min(wgpu::QUERY_SET_MAX_QUERIES as usize / 2);
-            let device = &self.gpu().device;
-            let set = device.create_query_set(&wgpu::QuerySetDescriptor { label: Some("oaiy-chain-profile"), ty: wgpu::QueryType::Timestamp, count: (2 * n).max(2) as u32 });
-            for (i, (pipeline, group, (x, y, z))) in self.dispatches.iter().enumerate() {
-                let timestamp_writes = (i < n).then(|| wgpu::ComputePassTimestampWrites { query_set: &set, beginning_of_pass_write_index: Some(2 * i as u32), end_of_pass_write_index: Some(2 * i as u32 + 1) });
-                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes });
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, group, &[]);
-                pass.dispatch_workgroups(*x, *y, *z);
-            }
-            let bytes = (16 * n).max(16) as u64;
-            let resolved = device.create_buffer(&wgpu::BufferDescriptor { label: Some("oaiy-chain-profile"), size: bytes, usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
-            let staging = device.create_buffer(&wgpu::BufferDescriptor { label: Some("oaiy-chain-profile-read"), size: bytes, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-            if n > 0 {
-                enc.resolve_query_set(&set, 0..2 * n as u32, &resolved, 0);
-                enc.copy_buffer_to_buffer(&resolved, 0, &staging, 0, bytes);
-            }
-            stamps = Some((staging, n));
-        } else {
+        if !self.dispatches.is_empty() {
             // what the pieces submitted while recording left (`push`), with the reads
-            let i = if self.dispatches.is_empty() { None } else { self.next_stamp() };
+            let i = self.next_stamp();
             let timestamp_writes = self.stamp_writes(i);
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes });
             for (pipeline, group, (x, y, z)) in &self.dispatches {
@@ -4062,8 +4065,8 @@ impl ChainRecorder for Recorder<'_> {
                 enc.copy_buffer_to_buffer(from, (*offset * 4) as u64, staging, 0, (*len * 4) as u64);
             }
         }
-        // nothing recorded since a flush: its submission the one waited for
-        let since = !self.dispatches.is_empty() || !self.held.is_empty() || self.copied < self.reads.len() || stamps.is_some() || late.is_some();
+        // nothing recorded since a flush: its submission the one waited for (profiled: this one, after every timed piece)
+        let since = !self.dispatches.is_empty() || !self.held.is_empty() || self.copied < self.reads.len() || profiled || late.is_some();
         let command = enc.finish();
         crate::profile::add(&crate::profile::CHAIN_ENCODE, start);
         let submitted = std::time::Instant::now();
@@ -4077,7 +4080,7 @@ impl ChainRecorder for Recorder<'_> {
         for (_, _, staging, len) in &self.reads {
             staging.slice(..(*len as u64 * 4).max(4)).map_async(wgpu::MapMode::Read, |_| {});
         }
-        if let Some((staging, _)) = &stamps {
+        for (_, staging) in &self.timed {
             staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
         }
         if let Some(staging) = &pieces {
@@ -4085,7 +4088,7 @@ impl ChainRecorder for Recorder<'_> {
         }
         // this recording's work waited for, not what was submitted after it (the next chunk's, as this one's rows
         // are read)
-        self.gpu().device.poll(wgpu::PollType::Wait { submission_index: Some(index), timeout: None }).expect("webgpu: device lost while waiting for a chain");
+        self.gpu().wait(Some(index));
         crate::profile::add(&crate::profile::CHAIN_WAIT, submitted);
         let pooled = std::mem::take(&mut self.pooled);
         self.gpu().unpool(pooled);
@@ -4109,14 +4112,14 @@ impl ChainRecorder for Recorder<'_> {
                 eprintln!("    a recording's {} pieces, {:.1} ms busy over {:.1}, on the GPU's clock {:.1}..{:.1}", ticks.len() / 2, busy as f64 * period / 1e6, span as f64 * period / 1e6, at(ticks[0]), at(*ticks.last().expect("a piece")));
             }
         }
-        if let Some((staging, n)) = stamps {
+        for (pipelines, staging) in std::mem::take(&mut self.timed) {
             let period = self.gpu().queue.get_timestamp_period() as f64;
             let view = staging.slice(..).get_mapped_range().expect("webgpu: mapping the profile");
             let ticks: Vec<u64> = view.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().expect("8 bytes"))).collect();
             drop(view);
             staging.unmap();
             let mut k = crate::profile::KERNELS.lock().unwrap_or_else(|p| p.into_inner());
-            for (i, (pipeline, _, _)) in self.dispatches.iter().take(n).enumerate() {
+            for (i, pipeline) in pipelines.iter().enumerate() {
                 let ns = (ticks[2 * i + 1].saturating_sub(ticks[2 * i]) as f64 * period) as u64;
                 let e = k.entry(self.gpu().name_of(pipeline)).or_default();
                 e.0 += ns;
@@ -6403,7 +6406,7 @@ fn main() {
         for m in [1usize, 2, 3, 4] {
             let (x, y, y8) = (b.vec(m * k), b.vec(m * n), b.vec(m * n));
             DeviceChain::upload(&b, &x, &(0..m * k).map(|_| next()).collect::<Vec<_>>());
-            let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None };
+            let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new() };
             assert!(rq.matmul_rows_q8(w, &x, &y8, m));
             rq.read(&y8);
             let got = Box::new(rq).finish().pop().unwrap();
@@ -6419,7 +6422,7 @@ fn main() {
             let reps = 28;
             let time = |q8: bool| {
                 let run = || {
-                    let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None };
+                    let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new() };
                     for i in 0..reps {
                         let w = &ws[i % ws.len()];
                         if q8 {
@@ -6565,7 +6568,7 @@ fn main() {
                 let pipeline = b.gpu.named_pipeline(Box::leak(format!("test-rb-{dtype:?}-{r}-{ks}").into_boxed_str()), || src);
                 let reps = 32;
                 let run = || {
-                    let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None };
+                    let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new() };
                     for i in 0..reps {
                         let q = ws[i % ws.len()].device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).unwrap();
                         for (chunk, row0, rows) in &q.chunks {
@@ -6625,7 +6628,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) n
             let pipeline = b.gpu.named_pipeline(name, || body);
             let groups = 170 * 16;
             let run = || {
-                let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None };
+                let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new() };
                 for _ in 0..8 {
                     rq.dispatch_kept(&pipeline, buffer(&src), buffer(&src), buffer(&out), &[(len / 4) as u32], (groups, 1, 1));
                 }
