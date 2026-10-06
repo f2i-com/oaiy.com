@@ -475,6 +475,9 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     let (vpos, vneg) = (gpu.vec(frames * channels), gpu.vec(frames * channels));
     let s = sigmas(r.steps, r.shift);
     let denoise_started = Instant::now();
+    // (short steps for seconds on end, a dozen pieces each: two in flight, or a card under a power limit throttles
+    // itself for most of them: 100 steps in 13 s where 36)
+    gpu.pieces_in_flight_at_most(2);
     for i in 0..r.steps {
         report(event("generating_sound", i, r.steps));
         let (t, t_mod) = dit.timestep(s[i] * 1000.);
@@ -500,6 +503,7 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         }
         rec.finish();
     }
+    gpu.pieces_in_flight_at_most(0);
     let denoise_seconds = denoise_started.elapsed().as_secs_f64();
     drop((positive, negative, dit));
     report(event("decoding_sound", 0, 1));

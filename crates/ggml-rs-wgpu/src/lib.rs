@@ -236,6 +236,13 @@ fn watchdog(watch: std::sync::Weak<Watch>, lost: std::sync::Weak<Mutex<Option<St
     }
 }
 
+/// OAIY_PIECES_IN_FLIGHT's, where it is set: every device's pieces in flight at most that many, whatever was asked
+/// of it ([`WgpuBackend::pieces_in_flight_at_most`]; 0: as many as are recorded).
+fn pieces_in_flight_asked() -> Option<usize> {
+    static ASKED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *ASKED.get_or_init(|| std::env::var("OAIY_PIECES_IN_FLIGHT").ok().and_then(|v| v.parse().ok()))
+}
+
 /// This process ended at once, its exit code 3: no DLL's detach run (a GPU driver's would wait for its hung threads).
 fn end_process() -> ! {
     #[cfg(windows)]
@@ -260,6 +267,10 @@ struct Gpu {
     lost: Arc<Mutex<Option<String>>>,
     /// The driver's calls a watchdog thread watches (a hung one ends the process).
     watch: Arc<Watch>,
+    /// The chains' pieces submitted and not yet waited for, the oldest first ([`Gpu::submit_piece`]), and how many may
+    /// be so at once (0: as many as are recorded).
+    in_flight: Mutex<std::collections::VecDeque<wgpu::SubmissionIndex>>,
+    in_flight_limit: std::sync::atomic::AtomicUsize,
     layout: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
     pipelines: Mutex<HashMap<(GgmlType, u8), Arc<wgpu::ComputePipeline>>>,
@@ -430,6 +441,22 @@ impl Gpu {
         enc.copy_buffer_to_buffer(src, 0, &staging, 0, len);
         self.queue.submit([enc.finish()]);
         self.map_read(&staging, len)
+    }
+
+    /// A chain's piece submitted: where the device's pieces in flight are limited
+    /// ([`WgpuBackend::pieces_in_flight_at_most`]), once all but the limit less one of those before it have run.
+    pub(crate) fn submit_piece(&self, commands: Vec<wgpu::CommandBuffer>) -> wgpu::SubmissionIndex {
+        let limit = pieces_in_flight_asked().unwrap_or_else(|| self.in_flight_limit.load(Ordering::Relaxed));
+        let mut flying = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
+        while limit > 0 && flying.len() >= limit {
+            let oldest = flying.pop_front().expect("a piece in flight");
+            self.wait(Some(oldest));
+        }
+        let index = self.queue.submit(commands);
+        if limit > 0 {
+            flying.push_back(index.clone());
+        }
+        index
     }
 
     /// Waits for submission `index` (else everything submitted), a second at a time: a lost device (its callback has
@@ -999,7 +1026,7 @@ impl WgpuBackend {
         });
         Ok(Self {
             cpu: CpuBackend::new(),
-            gpu: Arc::new(Gpu { device, queue, lost, watch, layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), names: Mutex::new(HashMap::new()), pool: Mutex::new(Vec::new()), staging: Mutex::new(Vec::new()), chain_groups: Mutex::new(HashMap::new()), wide: std::sync::OnceLock::new(), chain_groups_wide: Mutex::new(HashMap::new()), dummy: std::sync::OnceLock::new(), dummy_rw: std::sync::OnceLock::new(), limits, staged: AtomicU64::new(0), few: std::sync::OnceLock::new(), moe_steps: Mutex::new(Vec::new()), coop_units: std::sync::OnceLock::new() }),
+            gpu: Arc::new(Gpu { device, queue, lost, watch, in_flight: Mutex::new(std::collections::VecDeque::new()), in_flight_limit: std::sync::atomic::AtomicUsize::new(0), layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), names: Mutex::new(HashMap::new()), pool: Mutex::new(Vec::new()), staging: Mutex::new(Vec::new()), chain_groups: Mutex::new(HashMap::new()), wide: std::sync::OnceLock::new(), chain_groups_wide: Mutex::new(HashMap::new()), dummy: std::sync::OnceLock::new(), dummy_rw: std::sync::OnceLock::new(), limits, staged: AtomicU64::new(0), few: std::sync::OnceLock::new(), moe_steps: Mutex::new(Vec::new()), coop_units: std::sync::OnceLock::new() }),
             budget,
             used: Arc::new(AtomicU64::new(0)),
             summary,
@@ -1074,6 +1101,22 @@ impl WgpuBackend {
 
     pub fn memory_budget(&self) -> Option<(u64, u64)> {
         heap_budget(&self.raw_adapter)
+    }
+
+    /// At most `pieces` of the chains' pieces on this device's queue at once from here on (0: as many as are recorded,
+    /// as it is until asked): for a loop of short steps that runs the GPU for seconds on end. A recording's pieces go
+    /// to the GPU as they are recorded, a step's dozen queued within its first milliseconds; twelve such steps a
+    /// second (MiniMax Music 3's transformer: 800 dispatches a step, 82 ms) and an RTX 5090 under a power limit (402 W
+    /// of its 575) fell, after some 5 s and then every 2, into 9 s of its limiter's harshest throttle (its clock 1,550
+    /// MHz of 2,700, its memory slower still: a matmul over large weights 17 times as long), where with two or three
+    /// in flight, or a step one submission, it throttles so once, for a second, and settles (Candle's CUDA, a kernel
+    /// at a time, never does). Two cost such a step nothing (one, a millisecond: the GPU idle while the next piece is
+    /// handed over). Not for long dispatches (Pixal3D's flows over 15,000 voxels, 1.8 s a pass: steady as they are,
+    /// and with a limit the throttle found them now and then), nor a language model's prompts (their chunks recorded
+    /// ahead for one card while another runs: Qwen3.8 27B's 3,166 tokens over two in 1.03 s, in 1.55 with two in
+    /// flight).
+    pub fn pieces_in_flight_at_most(&self, pieces: usize) {
+        self.gpu.in_flight_limit.store(pieces, Ordering::Relaxed);
     }
 
     /// Bytes of weights placed on the GPU, and the budget.

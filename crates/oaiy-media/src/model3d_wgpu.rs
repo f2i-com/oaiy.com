@@ -917,6 +917,46 @@ mod golden {
         Ok(())
     }
 
+    /// The 1024 shape model's pass over the reference's 15,229 voxels, over and over (`--ignored --nocapture`;
+    /// OAIY_STEPS, else 30, each a conditioned pass then an unconditioned one): each pass's time and, profiled
+    /// (OAIY_CHAIN_PROFILE), the third pass's kernels.
+    #[test]
+    #[ignore = "needs Pixal3D and the reference's dumps"]
+    fn measure_repeated_flow_passes() -> Result<()> {
+        let gpu = WgpuBackend::nth(1, None).map_err(err)?;
+        let dit = WgpuDit3::load(&models().join("Pixal3D/ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16"), &gpu)?;
+        let c = coords("coords_hr.i32");
+        let n = c.len();
+        let table = upload(&gpu, &super::table(&c, 128));
+        let pos = dit.context(&gpu, Some(&load("global512.bin")), Some(&load("proj_shape_hr.bin")), 5);
+        let neg = dit.context(&gpu, None, None, 5);
+        let (xd, mods, out, w) = (upload(&gpu, &load("shape_hr.bin")), upload(&gpu, &dit.modulation(600.)), gpu.vec(n * dit.cfg.out_channels), dit.scratch(&gpu, n));
+        let steps: usize = std::env::var("OAIY_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
+        let profiled = std::env::var_os("OAIY_CHAIN_PROFILE").is_some();
+        let clock = std::time::Instant::now();
+        let mut line = Vec::new();
+        for i in 0..2 * steps {
+            let started = std::time::Instant::now();
+            let mut rec = gpu.begin();
+            rec.keep_groups(false);
+            dit.forward(&w, rec.as_mut(), &xd, &mods, &table, if i % 2 == 0 { &pos } else { &neg }, &out);
+            rec.finish();
+            line.push(format!("{:.0}", started.elapsed().as_secs_f64() * 1000.));
+            if profiled {
+                let kernels = ggml_rs_wgpu::profile::take_kernels();
+                if i == 2 {
+                    let top: Vec<String> = kernels.into_iter().take(10).map(|(name, ms, count)| format!("{name} {ms:.0} ms ({count})")).collect();
+                    eprintln!("pass 3: {}", top.join(", "));
+                }
+            }
+            if i % 10 == 9 {
+                eprintln!("{:.1} s: steps {}..{}: {} ms", clock.elapsed().as_secs_f64(), i - 8, i + 1, line.join(" "));
+                line.clear();
+            }
+        }
+        Ok(())
+    }
+
     /// The structure flow model's step and the 512 shape model's on the official pipeline's dumped inputs, against its
     /// outputs (`--ignored --nocapture`; P3D_DIR, else E:/p3dref/cmp4/ref; MODELS, else E:/models; the reference ran its
     /// blocks in BF16).

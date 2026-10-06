@@ -444,6 +444,9 @@ impl WgpuAcoustic {
     /// channels first); `progress(done, total)` counts Euler steps.
     pub fn generate(&self, hidden: &[f32], frames: usize, mut noise: impl FnMut(usize, usize) -> Result<Vec<f32>>, mut progress: impl FnMut(usize, usize)) -> Result<[Vec<f32>; 2]> {
         let g = &self.gpu;
+        // (the steps' pieces two in flight: with a step's dozen queued, a card under a power limit throttled 17 times
+        // over for 9 s of every 11)
+        g.pieces_in_flight_at_most(2);
         let (c, cd) = (LATENT_CHANNELS, self.transformer.cond_dim);
         let width = hidden.len() / frames.max(1);
         let starts = chunk_starts(frames);
@@ -502,6 +505,7 @@ impl WgpuAcoustic {
             prev = Some((xs[os * c..oe * c].to_vec(), cond[os * cd..oe * cd].to_vec(), oe - os));
             chunks.push((xs, len));
         }
+        g.pieces_in_flight_at_most(0);
         let n = chunks.len();
         let mut out = [Vec::new(), Vec::new()];
         for (i, (latents, len)) in chunks.iter().enumerate() {
@@ -643,7 +647,10 @@ mod golden {
     }
 
     /// A window's steps on fixed inputs, over and over (`--ignored --nocapture`; OAIY_STEPS, else 400): each step's two
-    /// sequences' pass and the latents' update from the reference's first step's, ten steps' times to a line.
+    /// sequences' pass and the latents' update from the reference's first step's, ten steps' times to a line. The
+    /// recordings' pieces as many in flight as are recorded (OAIY_PIECES_IN_FLIGHT=2 as a song's steps have them): a
+    /// card under a power limit takes some 82 ms a step for 5 s, then 1.4 s for six of every 28
+    /// (`nvidia-smi dmon -s puvc` shows its limiter: violations 100%, the clock 1,550 MHz).
     #[test]
     #[ignore = "needs MiniMax-Music3 and the reference's dumps"]
     fn measure_repeated_steps() -> Result<()> {
@@ -658,6 +665,7 @@ mod golden {
         let weights = upload(&gpu, &[-0.01, 0.007]);
         let steps = std::env::var("OAIY_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(400);
         let mut line = Vec::new();
+        let clock = std::time::Instant::now();
         for i in 0..steps {
             let started = std::time::Instant::now();
             let mut rec = gpu.begin();
@@ -670,7 +678,7 @@ mod golden {
             rec.finish();
             line.push(format!("{:.0}", started.elapsed().as_secs_f64() * 1000.));
             if i % 10 == 9 {
-                eprintln!("steps {}..{}: {} ms", i - 8, i + 1, line.join(" "));
+                eprintln!("{:.1} s: steps {}..{}: {} ms", clock.elapsed().as_secs_f64(), i - 8, i + 1, line.join(" "));
                 line.clear();
             }
         }

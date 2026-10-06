@@ -3825,7 +3825,7 @@ impl Recorder<'_> {
             self.weight = 0.0;
             if !self.hold {
                 let held = std::mem::take(&mut self.held);
-                self.gpu().queue.submit(held);
+                self.gpu().submit_piece(held);
             }
             crate::profile::add(&crate::profile::CHAIN_ENCODE, start);
         }
@@ -4635,7 +4635,7 @@ impl ChainRecorder for Recorder<'_> {
         self.hold = false;
         let held = std::mem::take(&mut self.held);
         if !held.is_empty() {
-            self.gpu().queue.submit(held);
+            self.gpu().submit_piece(held);
         }
         self.submit_piece();
         let mut enc = self.gpu().device.create_command_encoder(&Default::default());
@@ -4648,7 +4648,7 @@ impl ChainRecorder for Recorder<'_> {
         if let Some(staging) = self.resolve_pieces(&mut enc) {
             self.stamped = Some(staging);
         }
-        self.flushed = Some(self.gpu().queue.submit([enc.finish()]));
+        self.flushed = Some(self.gpu().submit_piece(vec![enc.finish()]));
     }
 
     fn exl3_rows(&mut self, w: &dyn ggml_rs::exl3::PackedLinear, x: &DeviceVec, y: &DeviceVec, rows: usize) {
@@ -5350,7 +5350,7 @@ impl ChainRecorder for Recorder<'_> {
         commands.push(command);
         let index = match self.flushed.take() {
             Some(index) if !since => index,
-            _ => self.gpu().queue.submit(commands),
+            _ => self.gpu().submit_piece(commands),
         };
         for (_, _, staging, len) in &self.reads {
             staging.slice(..(*len as u64 * 4).max(4)).map_async(wgpu::MapMode::Read, |_| {});
