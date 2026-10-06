@@ -482,137 +482,84 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
         .as_ref()
         .map(|n| model.prepare(n, &references))
         .transpose()?;
-    // every image sampled first, then the transformer let go before the decodes (its weights and a step's scratch:
-    // some 20 GB at 1024x1024 on WebGPU, beside the decoder's own)
+    // Candle's: the decoder loaded first and each picture decoded once sampled (completed pictures survive a later
+    // failure). WebGPU's: every picture sampled first, the transformer let go, only then the decoder loaded (one device
+    // on the card through the heavy work: a second's had slowed steps) and the pictures decoded, those sampled before a
+    // failure too.
+    let mut vae = None;
+    let mut vae_load_seconds = 0.;
+    if !r.webgpu {
+        event(Json::obj([("stage", Json::str("loading_vae"))]));
+        let load_start = Instant::now();
+        vae = Some(Decoder::Candle(Vae::load(&r.base, &dev, dtype)?));
+        dev.synchronize()?;
+        vae_load_seconds = load_start.elapsed().as_secs_f64();
+    }
     let mut sampled = Vec::with_capacity(r.count);
+    let mut failure = None;
     for i in 0..r.count {
-        if prefix.is_none() || embeddings.len() > 1 {
-            drop(prefix.take());
-            event(Json::obj([("stage", Json::str("preparing_conditioning"))]));
-            prefix = Some(model.prepare(
-                &embeddings[if embeddings.len() == 1 { 0 } else { i }],
-                &references,
-            )?);
-        }
-        let image_start = Instant::now();
-        let pi = if embeddings.len() == 1 { 0 } else { i };
-        let seed = r.seed + i as u64;
-        let mut latent =
-            Tensor::from_vec(noise(seed, h * w * 64), (1, h * w, 64), &dev)?.to_dtype(dtype)?;
-        for (step, pair) in sigmas.windows(2).enumerate() {
-            let step_start = Instant::now();
-            let mut velocity =
-                model.conditioned(&latent, prefix.as_ref().unwrap(), pair[0], h, w)?;
-            if let Some(neg) = &negative_prefix {
-                let uncond = model.conditioned(&latent, neg, pair[0], h, w)?;
-                velocity = (&uncond + ((velocity - &uncond)? * r.cfg)?)?;
+        let picture = (|| -> Result<Sampled> {
+            if prefix.is_none() || embeddings.len() > 1 {
+                drop(prefix.take());
+                event(Json::obj([("stage", Json::str("preparing_conditioning"))]));
+                prefix = Some(model.prepare(&embeddings[if embeddings.len() == 1 { 0 } else { i }], &references)?);
             }
-            latent = (latent.to_dtype(DType::F32)?
-                + (velocity.to_dtype(DType::F32)? * (pair[1] - pair[0]))?)?
-                .to_dtype(dtype)?;
-            dev.synchronize()?;
-            event(Json::obj([
-                ("stage", Json::str("sampling")),
-                ("image", Json::Int((i + 1) as i64)),
-                ("step", Json::Int((step + 1) as i64)),
-                ("steps", Json::Int(r.steps as i64)),
-                ("seconds", Json::Num(step_start.elapsed().as_secs_f64())),
-            ]));
+            let image_start = Instant::now();
+            let pi = if embeddings.len() == 1 { 0 } else { i };
+            let seed = r.seed + i as u64;
+            let mut latent = Tensor::from_vec(noise(seed, h * w * 64), (1, h * w, 64), &dev)?.to_dtype(dtype)?;
+            for (step, pair) in sigmas.windows(2).enumerate() {
+                let step_start = Instant::now();
+                let mut velocity = model.conditioned(&latent, prefix.as_ref().unwrap(), pair[0], h, w)?;
+                if let Some(neg) = &negative_prefix {
+                    let uncond = model.conditioned(&latent, neg, pair[0], h, w)?;
+                    velocity = (&uncond + ((velocity - &uncond)? * r.cfg)?)?;
+                }
+                latent = (latent.to_dtype(DType::F32)? + (velocity.to_dtype(DType::F32)? * (pair[1] - pair[0]))?)?.to_dtype(dtype)?;
+                dev.synchronize()?;
+                event(Json::obj([
+                    ("stage", Json::str("sampling")),
+                    ("image", Json::Int((i + 1) as i64)),
+                    ("step", Json::Int((step + 1) as i64)),
+                    ("steps", Json::Int(r.steps as i64)),
+                    ("seconds", Json::Num(step_start.elapsed().as_secs_f64())),
+                ]));
+            }
+            Ok(Sampled { i, pi, seed, latent, sampling_seconds: image_start.elapsed().as_secs_f64(), image_start })
+        })();
+        match (picture, &vae) {
+            (Ok(p), Some(v)) => {
+                model.release_scratch();
+                save_picture(r, &out, &mut manifest, &mut files, &mut event, v, p, h, w)?;
+            }
+            (Ok(p), None) => sampled.push(p),
+            (Err(e), _) if !sampled.is_empty() => {
+                failure = Some(e);
+                break;
+            }
+            (Err(e), _) => return Err(e),
         }
-        sampled.push((i, pi, seed, latent, image_start.elapsed().as_secs_f64(), image_start));
     }
     let transformer_residency = model.residency();
     drop(prefix);
     drop(negative_prefix);
     model.release_scratch();
     drop(model);
-    // the decoder loaded only now: on WebGPU a second device on the card through the steps slowed some of them some
-    // ten seconds each (a two-picture job's last three, every time)
-    event(Json::obj([("stage", Json::str("loading_vae"))]));
-    let load_start = Instant::now();
-    #[cfg(feature = "webgpu")]
-    let vae = if r.webgpu { Decoder::Wgpu(crate::vae_wgpu::WgpuVae::load(&r.base, r.device)?) } else { Decoder::Candle(Vae::load(&r.base, &dev, dtype)?) };
-    #[cfg(not(feature = "webgpu"))]
-    let vae = Decoder::Candle(Vae::load(&r.base, &dev, dtype)?);
-    dev.synchronize()?;
-    let vae_load_seconds = load_start.elapsed().as_secs_f64();
-    for (i, pi, seed, latent, sampling_seconds, image_start) in sampled {
-        let decode_start = Instant::now();
-        let rgba = vae
-            .decode(&latent, h, w)?
-            .to_dtype(DType::F32)?
-            .squeeze(0)?
-            .permute((1, 2, 0))?
-            .contiguous()?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-        let decode_seconds = decode_start.elapsed().as_secs_f64();
-        let save_start = Instant::now();
-        if rgba.iter().any(|x| !x.is_finite()) {
-            candle_core::bail!("non-finite VAE output for image {}", i + 1);
+    if !sampled.is_empty() {
+        event(Json::obj([("stage", Json::str("loading_vae"))]));
+        let load_start = Instant::now();
+        #[cfg(feature = "webgpu")]
+        let decoder = if r.webgpu { Decoder::Wgpu(crate::vae_wgpu::WgpuVae::load(&r.base, r.device)?) } else { Decoder::Candle(Vae::load(&r.base, &dev, dtype)?) };
+        #[cfg(not(feature = "webgpu"))]
+        let decoder = Decoder::Candle(Vae::load(&r.base, &dev, dtype)?);
+        dev.synchronize()?;
+        vae_load_seconds = load_start.elapsed().as_secs_f64();
+        for p in sampled {
+            save_picture(r, &out, &mut manifest, &mut files, &mut event, &decoder, p, h, w)?;
         }
-        let bytes: Vec<u8> = rgba
-            .into_iter()
-            .map(|x| ((x.clamp(-1., 1.) + 1.) * 127.5).round() as u8)
-            .collect();
-        let path = out.join(format!("image-{:04}.png", i + 1));
-        save_png(&path, &bytes, r.width as u32, r.height as u32)?;
-        let record = Json::obj([
-            ("path", Json::str(path.to_string_lossy())),
-            ("seed", Json::Int(seed as i64)),
-            ("prompt", Json::str(&r.prompts[pi])),
-            (
-                "images",
-                Json::Arr(
-                    r.images
-                        .iter()
-                        .map(|p| Json::str(p.to_string_lossy()))
-                        .collect(),
-                ),
-            ),
-            ("steps", Json::Int(r.steps as i64)),
-            ("sampling_seconds", Json::Num(sampling_seconds)),
-            ("decode_seconds", Json::Num(decode_seconds)),
-            (
-                "save_seconds",
-                Json::Num(save_start.elapsed().as_secs_f64()),
-            ),
-            (
-                "image_seconds",
-                Json::Num(image_start.elapsed().as_secs_f64()),
-            ),
-            ("transformer", Json::str(r.transformer.to_string_lossy())),
-            ("text_encoder", Json::str(r.text_encoder.clone().unwrap_or_else(||r.base.join("text_encoder")).to_string_lossy())),
-            ("model", r.model.as_ref().map(Json::str).unwrap_or(Json::Null)),
-            (
-                "adapter",
-                r.adapter
-                    .as_ref()
-                    .map_or(Json::Null, |p| Json::str(p.to_string_lossy())),
-            ),
-            (
-                "loras",
-                Json::Arr(r.loras.iter().map(|(p, s)| Json::obj([("path", Json::str(p.to_string_lossy())), ("strength", Json::Num(*s))])).collect()),
-            ),
-        ]);
-        writeln!(manifest, "{}", record.to_json())?;
-        manifest.flush()?;
-        event(Json::obj([
-            ("stage", Json::str("image_saved")),
-            ("image", Json::Int((i + 1) as i64)),
-            ("path", Json::str(path.to_string_lossy())),
-            ("sampling_seconds", Json::Num(sampling_seconds)),
-            ("decode_seconds", Json::Num(decode_seconds)),
-            (
-                "image_seconds",
-                Json::Num(image_start.elapsed().as_secs_f64()),
-            ),
-        ]));
-        files.push(Json::obj([
-            ("path", Json::str(path.to_string_lossy())),
-            ("seed", Json::Int(seed as i64)),
-            ("steps", Json::Int(r.steps as i64)),
-        ]));
+    }
+    if let Some(e) = failure {
+        return Err(e);
     }
     Ok(Json::obj([
         ("data", Json::Arr(files)),
@@ -639,6 +586,61 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
         ),
     ]))
 }
+/// A sampled picture's latent, before its decode.
+struct Sampled {
+    i: usize,
+    /// Its prompt's index.
+    pi: usize,
+    seed: u64,
+    latent: Tensor,
+    sampling_seconds: f64,
+    image_start: Instant,
+}
+
+/// `p`'s picture: decoded by `vae`, saved as a PNG, its record in the batch's manifest, announced and listed.
+#[allow(clippy::too_many_arguments)]
+fn save_picture(r: &Request, out: &Path, manifest: &mut File, files: &mut Vec<Json>, event: &mut impl FnMut(Json), vae: &Decoder, p: Sampled, h: usize, w: usize) -> Result<()> {
+    let Sampled { i, pi, seed, latent, sampling_seconds, image_start } = p;
+    let decode_start = Instant::now();
+    let rgba = vae.decode(&latent, h, w)?.to_dtype(DType::F32)?.squeeze(0)?.permute((1, 2, 0))?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+    let decode_seconds = decode_start.elapsed().as_secs_f64();
+    let save_start = Instant::now();
+    if rgba.iter().any(|x| !x.is_finite()) {
+        candle_core::bail!("non-finite VAE output for image {}", i + 1);
+    }
+    let bytes: Vec<u8> = rgba.into_iter().map(|x| ((x.clamp(-1., 1.) + 1.) * 127.5).round() as u8).collect();
+    let path = out.join(format!("image-{:04}.png", i + 1));
+    save_png(&path, &bytes, r.width as u32, r.height as u32)?;
+    let record = Json::obj([
+        ("path", Json::str(path.to_string_lossy())),
+        ("seed", Json::Int(seed as i64)),
+        ("prompt", Json::str(&r.prompts[pi])),
+        ("images", Json::Arr(r.images.iter().map(|p| Json::str(p.to_string_lossy())).collect())),
+        ("steps", Json::Int(r.steps as i64)),
+        ("sampling_seconds", Json::Num(sampling_seconds)),
+        ("decode_seconds", Json::Num(decode_seconds)),
+        ("save_seconds", Json::Num(save_start.elapsed().as_secs_f64())),
+        ("image_seconds", Json::Num(image_start.elapsed().as_secs_f64())),
+        ("transformer", Json::str(r.transformer.to_string_lossy())),
+        ("text_encoder", Json::str(r.text_encoder.clone().unwrap_or_else(|| r.base.join("text_encoder")).to_string_lossy())),
+        ("model", r.model.as_ref().map(Json::str).unwrap_or(Json::Null)),
+        ("adapter", r.adapter.as_ref().map_or(Json::Null, |p| Json::str(p.to_string_lossy()))),
+        ("loras", Json::Arr(r.loras.iter().map(|(p, s)| Json::obj([("path", Json::str(p.to_string_lossy())), ("strength", Json::Num(*s))])).collect())),
+    ]);
+    writeln!(manifest, "{}", record.to_json())?;
+    manifest.flush()?;
+    event(Json::obj([
+        ("stage", Json::str("image_saved")),
+        ("image", Json::Int((i + 1) as i64)),
+        ("path", Json::str(path.to_string_lossy())),
+        ("sampling_seconds", Json::Num(sampling_seconds)),
+        ("decode_seconds", Json::Num(decode_seconds)),
+        ("image_seconds", Json::Num(image_start.elapsed().as_secs_f64())),
+    ]));
+    files.push(Json::obj([("path", Json::str(path.to_string_lossy())), ("seed", Json::Int(seed as i64)), ("steps", Json::Int(r.steps as i64))]));
+    Ok(())
+}
+
 fn save_png(path: &Path, bytes: &[u8], width: u32, height: u32) -> Result<()> {
     use image::ImageEncoder;
     let file = File::options().create_new(true).write(true).open(path)?;
