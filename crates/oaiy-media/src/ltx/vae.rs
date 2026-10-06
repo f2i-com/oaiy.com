@@ -968,7 +968,7 @@ impl LtxVideoDecoder {
 /// `left_ramp = 0` (no leftward neighbour), and the last tile's
 /// `right_ramp = 0` — those edges keep full weight (= 1) so the boundary
 /// stays at unit blend instead of fading.
-fn build_intervals(
+pub(crate) fn build_intervals(
     axis_len: usize,
     tile_size: usize,
     overlap: usize,
@@ -997,7 +997,7 @@ fn build_intervals(
 /// Trapezoidal 1D mask: linear ramp from 0→1 over the leftmost
 /// `left_ramp` cells, flat 1 in the middle, linear ramp 1→0 over the
 /// rightmost `right_ramp` cells. F32. When ramps are 0, returns all-1s.
-fn trapezoidal_mask_1d(length: usize, left_ramp: usize, right_ramp: usize) -> Result<Tensor> {
+pub(crate) fn trapezoidal_mask_1d(length: usize, left_ramp: usize, right_ramp: usize) -> Result<Tensor> {
     let mut v: Vec<f32> = vec![1.0; length];
     if left_ramp > 0 {
         for i in 0..left_ramp.min(length) {

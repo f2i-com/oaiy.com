@@ -90,6 +90,82 @@ impl WgpuLtxVae {
         Ok(n)
     }
 
+    /// [`Self::decode`] whole where the card has room for it (its activations some 260 bytes a pixel of every frame:
+    /// 12 GB at 768x512 and 121 frames) and its largest vector fits a binding (the last blocks' 128 channels at a
+    /// quarter of the pixels' rows and columns: 2.3 GB at 1024x576), else in overlapping tiles of the size that has, a
+    /// quarter of a tile shared.
+    pub fn decode_fitted(&self, latent: &[f32], f: usize, h: usize, w: usize) -> Result<Tensor> {
+        // (where the API reports no budget: a card's 8 GB free)
+        let free = self.gpu.memory_budget().map_or(8 << 30, |(budget, used)| budget.saturating_sub(used)) as f64 * 0.85;
+        let frames = if f == 1 { 1 } else { 8 * (f - 1) + 1 };
+        let binding = self.gpu.max_binding();
+        let fits = |th: usize, tw: usize| (frames * th * 32 * tw * 32) as f64 * 260. <= free && (frames * th * 8 * tw * 8 * 128 * 4) as u64 <= binding;
+        if fits(h, w) {
+            return self.decode(latent, f, h, w);
+        }
+        let mut tile = 16;
+        while tile > 4 && !fits(tile.min(h), tile.min(w)) {
+            tile /= 2;
+        }
+        if !fits(tile.min(h), tile.min(w)) {
+            candle_core::bail!("the card has no room for the video decoder's tiles; reduce frames or free GPU memory");
+        }
+        self.decode_tiled(latent, f, h, w, tile, tile / 4)
+    }
+
+    /// [`Self::decode`] in overlapping tiles of `tile` latent rows and columns (`overlap` shared, blended linearly) as
+    /// [`crate::ltx::vae::LtxVideoDecoder::decode_tiled`] makes them: each tile's every frame on the GPU, the blend on
+    /// the host.
+    pub fn decode_tiled(&self, latent: &[f32], f: usize, h: usize, w: usize, tile: usize, overlap: usize) -> Result<Tensor> {
+        use crate::ltx::vae::{build_intervals, trapezoidal_mask_1d};
+        if latent.len() != f * h * w * 128 || overlap >= tile {
+            candle_core::bail!("an LTX latent of {} values for {f}x{h}x{w} tokens, tiles of {tile} sharing {overlap}", latent.len());
+        }
+        let frames = if f == 1 { 1 } else { 8 * (f - 1) + 1 };
+        let (hp, wp) = (h * 32, w * 32);
+        let mut acc = vec![0f32; 3 * frames * hp * wp];
+        let mut weight = vec![0f32; hp * wp];
+        for &(h_lo, h_hi, top, bottom) in &build_intervals(h, tile, overlap) {
+            for &(w_lo, w_hi, left, right) in &build_intervals(w, tile, overlap) {
+                let (th, tw) = (h_hi - h_lo, w_hi - w_lo);
+                let mut part = Vec::with_capacity(f * th * tw * 128);
+                for t in 0..f {
+                    for y in h_lo..h_hi {
+                        let row = (t * h + y) * w;
+                        part.extend_from_slice(&latent[(row + w_lo) * 128..(row + w_hi) * 128]);
+                    }
+                }
+                let values = self.decode(&part, f, th, tw)?.flatten_all()?.to_vec1::<f32>()?;
+                let (ph, pw) = (th * 32, tw * 32);
+                let hm = trapezoidal_mask_1d(ph, top * 32, bottom * 32)?.to_vec1::<f32>()?;
+                let wm = trapezoidal_mask_1d(pw, left * 32, right * 32)?.to_vec1::<f32>()?;
+                let (y0, x0) = (h_lo * 32, w_lo * 32);
+                for y in 0..ph {
+                    for x in 0..pw {
+                        weight[(y0 + y) * wp + x0 + x] += hm[y] * wm[x];
+                    }
+                }
+                for plane in 0..3 * frames {
+                    for y in 0..ph {
+                        let (from, to) = ((plane * ph + y) * pw, (plane * hp + y0 + y) * wp + x0);
+                        for x in 0..pw {
+                            acc[to + x] += values[from + x] * hm[y] * wm[x];
+                        }
+                    }
+                }
+            }
+        }
+        for plane in acc.chunks_mut(hp * wp) {
+            for (v, wt) in plane.iter_mut().zip(&weight) {
+                if *wt <= 0. {
+                    candle_core::bail!("a pixel no tile covered");
+                }
+                *v /= wt;
+            }
+        }
+        Tensor::from_vec(acc, (1, 3, frames, hp, wp), &Device::Cpu)
+    }
+
     /// The clip of `latent` (`[f h w, 128]`, the transformer's tokens: `f` frames of `h` by `w`): `[1, 3, 8 (f - 1) +
     /// 1, 32 h, 32 w]` (RGB in -1..1) on the CPU.
     pub fn decode(&self, latent: &[f32], f: usize, h: usize, w: usize) -> Result<Tensor> {
@@ -194,6 +270,41 @@ mod tests {
             let clip = gpu.decode(&latent, f, h, w)?;
             eprintln!("decode {i}: {:.2} s, {:?}; the card's memory {:?}", t.elapsed().as_secs_f64(), clip.dims(), gpu.gpu.memory_budget().map(|(b, u)| (u as f64 / 1e9, b as f64 / 1e9)));
         }
+        // and a 1024x1024 clip of 121 frames (past the card at once) in tiles
+        let (h, w) = (32usize, 32usize);
+        let latent: Vec<f32> = (0..f * h * w * 128).map(|i| (i * 7919 % 2001) as f32 / 1000.0 - 1.0).collect();
+        let t = std::time::Instant::now();
+        let clip = gpu.decode_fitted(&latent, f, h, w)?;
+        eprintln!("1024x1024, 121 frames: {:.2} s, {:?}", t.elapsed().as_secs_f64(), clip.dims());
+        Ok(())
+    }
+
+    /// The tiled decode blends its tiles into the clip a whole decode gives: a latent of 2 frames of 5 by 6 in tiles of
+    /// 3 sharing 1 (the seams' blend aside, the tiles see less of their neighbours: near, not equal).
+    #[test]
+    #[ignore = "needs LTX 2.3's checkpoint (OAIY_LTX_NVFP4) and a WebGPU adapter"]
+    fn tiles_blend_into_the_whole_clip() -> Result<()> {
+        let Some(path) = std::env::var_os("OAIY_LTX_NVFP4") else { return Ok(()) };
+        let (f, h, w) = (2usize, 5usize, 6usize);
+        let mut seed = 0x2545_f491u64;
+        let latent: Vec<f32> = (0..f * h * w * 128)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                ((seed >> 11) as f64 / (1u64 << 53) as f64 * 2. - 1.) as f32
+            })
+            .collect();
+        let mut store = Store::open(std::path::Path::new(&path), 0)?;
+        let gpu = WgpuLtxVae::load(&mut store, 0)?;
+        let whole = gpu.decode(&latent, f, h, w)?.flatten_all()?.to_vec1::<f32>()?;
+        let tiled = gpu.decode_tiled(&latent, f, h, w, 3, 1)?.flatten_all()?.to_vec1::<f32>()?;
+        assert_eq!(whole.len(), tiled.len());
+        let dot: f64 = whole.iter().zip(&tiled).map(|(a, b)| *a as f64 * *b as f64).sum();
+        let norm = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+        let cos = dot / (norm(&whole) * norm(&tiled));
+        eprintln!("tiles of 3 sharing 1 against the whole clip: cosine {cos:.6}");
+        assert!(cos > 0.95, "cosine {cos}");
         Ok(())
     }
 

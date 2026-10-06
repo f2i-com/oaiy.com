@@ -509,14 +509,12 @@ impl Request {
         }
         if self.webgpu {
             let nag = self.guidance.as_ref().is_none_or(|g| g.cfg == 1.) && self.negative_prompt.is_some();
-            // (the decoder's activations at 768x512 and 121 frames peak at 12 GB: larger clips want a tiled decode)
             let unsupported = [
                 (self.model == "ltx-2.5", "LTX 2.5 (its Gemma 4 text encoder)"),
                 (self.audio || self.audio_file.is_some() || self.speech.is_some() || self.reference_voice.is_some() || self.identity, "sound (set audio to false)"),
                 (self.lora.is_some(), "LoRAs"),
                 (self.refine.is_some(), "two-stage refinement"),
                 (nag, "a negative prompt without CFG (NAG)"),
-                (self.width * self.height * self.frames > 768 * 512 * 121, "clips past 768x512 at 121 frames"),
             ];
             if let Some((_, what)) = unsupported.iter().find(|(on, _)| *on) {
                 return Err(format!("WebGPU video does not support {what} yet"));
@@ -1535,7 +1533,7 @@ fn webgpu_decode(r: &Request, latent: &Tensor, f: usize, h: usize, w: usize) -> 
     let mut store = Store::open(&r.vae, 0)?;
     let decoder = crate::ltx_vae_wgpu::WgpuLtxVae::load(&mut store, r.device)?;
     drop(store);
-    decoder.decode(&latent.flatten_all()?.to_vec1::<f32>()?, f, h, w)
+    decoder.decode_fitted(&latent.flatten_all()?.to_vec1::<f32>()?, f, h, w)
 }
 #[cfg(not(feature = "webgpu"))]
 fn webgpu_decode(_: &Request, _: &Tensor, _: usize, _: usize, _: usize) -> Result<Tensor> {
@@ -1799,7 +1797,6 @@ mod tests {
             (r#","audio":true"#, "sound"),
             (r#","lora":"l""#, "LoRAs"),
             (r#","negative_prompt":"n""#, "NAG"),
-            (r#","width":1024,"height":1024,"frames":121"#, "past 768x512"),
             (r#","refine":{"transformer":"t","upsampler":"u"}"#, "refinement"),
         ] {
             let e = request(extra).unwrap_err();

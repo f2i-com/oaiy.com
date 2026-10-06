@@ -890,6 +890,11 @@ impl WgpuBackend {
         self.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
     }
 
+    /// The most bytes one vector an op reads or writes may hold (the adapter's storage binding limit: 2 GB here).
+    pub fn max_binding(&self) -> u64 {
+        (self.gpu.limits.max_storage_buffer_binding_size as u64).min(self.gpu.limits.max_buffer_size)
+    }
+
     pub fn memory_budget(&self) -> Option<(u64, u64)> {
         heap_budget(&self.raw_adapter)
     }
