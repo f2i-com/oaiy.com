@@ -85,7 +85,7 @@ struct Block {
     ff_out: Lin,
 }
 
-/// A pass's work vectors for up to `len` latents, kept for a song's every pass.
+/// A step's work vectors (its two sequences' pass) for up to `len` latents a sequence, kept for a song's every step.
 pub struct Scratch {
     len: usize,
     h0: DeviceVec,
@@ -96,9 +96,16 @@ pub struct Scratch {
     q: DeviceVec,
     k: DeviceVec,
     vv: DeviceVec,
+    /// The first sequence's keys and values, and the second's (its queries, keys and values copied out first).
     kv: DeviceVec,
-    o: DeviceVec,
+    kv1: DeviceVec,
+    q1: DeviceVec,
+    k1: DeviceVec,
+    v1: DeviceVec,
+    att0: DeviceVec,
+    att1: DeviceVec,
     att: DeviceVec,
+    o: DeviceVec,
     fv: DeviceVec,
     fg: DeviceVec,
     act: DeviceVec,
@@ -208,78 +215,103 @@ impl WgpuDit {
         (0..s).flat_map(|p| inv.iter().flat_map(move |f| { let a = p as f32 * f; [a.sin(), a.cos()] })).collect()
     }
 
-    /// The work vectors of a pass over up to `len` latents.
+    /// The work vectors of a step over up to `len` latents a sequence.
     pub fn scratch(&self, gpu: &WgpuBackend, len: usize) -> Scratch {
         let (c, dim, ff, nh, hd) = (LATENT_CHANNELS, self.dim, self.ff, self.heads, self.head_dim);
         let (width, s) = (2 * c + self.cond_dim, len + 1);
         let v = |n: usize| gpu.vec(n);
+        let att = gpu.attention_rows_full_out_len(s, nh, hd, s);
         Scratch {
             len,
-            h0: v(len * width),
-            h1: v(len * width),
-            hs: v(s * dim),
-            hp: v(len * dim),
-            n: v(s * dim),
-            q: v(s * dim),
-            k: v(s * dim),
-            vv: v(s * dim),
+            h0: v(2 * len * width),
+            h1: v(2 * len * width),
+            hs: v(2 * s * dim),
+            hp: v(2 * len * dim),
+            n: v(2 * s * dim),
+            q: v(2 * s * dim),
+            k: v(2 * s * dim),
+            vv: v(2 * s * dim),
             kv: v(s * 2 * dim),
-            o: v(s * dim),
-            att: v(gpu.attention_rows_full_out_len(s, nh, hd, s)),
-            fv: v(s * ff),
-            fg: v(s * ff),
-            act: v(s * ff),
-            hl: v(len * dim),
-            h2: v(len * c),
+            kv1: v(s * 2 * dim),
+            q1: v(s * dim),
+            k1: v(s * dim),
+            v1: v(s * dim),
+            att0: v(att),
+            att1: v(att),
+            att: v(2 * s * dim),
+            o: v(2 * s * dim),
+            fv: v(2 * s * ff),
+            fg: v(2 * s * ff),
+            act: v(2 * s * ff),
+            hl: v(2 * len * dim),
+            h2: v(2 * len * c),
         }
     }
 
-    /// The velocity for latents `x` (`[len, 128]`) at the time whose embedding is `temb`, conditioned on `cond` (`[len,
-    /// cond_dim]`), recorded on `r` into `out` (`[len, 128]`), its work in `w` (for at least `len`; a song's passes one
-    /// after another in it); `zeros` at least `len * 128` zeros, `table` [`Self::table`]'s for at least `len + 1`.
+    /// A step's two velocities for latents `x` (`[len, 128]`) at the time whose embedding is `temb`: conditioned on
+    /// `conds[0]` and on `conds[1]` (each `[len, cond_dim]`), as one pass over both sequences (the matrices read once
+    /// for both, each sequence attending over its own tokens), recorded on `r` into `out` (`[2 len, 128]`: the first's,
+    /// then the second's), its work in `w` (for at least `len`); `zeros` at least `len * 128` zeros, `table`
+    /// [`Self::table`]'s for `len + 1` positions twice over.
     #[allow(clippy::too_many_arguments)]
-    fn forward(&self, w: &Scratch, len: usize, r: &mut dyn ChainRecorder, x: &DeviceVec, temb: &DeviceVec, cond: &DeviceVec, zeros: &DeviceVec, table: &DeviceVec, out: &DeviceVec) {
+    fn forward(&self, w: &Scratch, len: usize, r: &mut dyn ChainRecorder, x: &DeviceVec, temb: &DeviceVec, conds: [&DeviceVec; 2], zeros: &DeviceVec, table: &DeviceVec, out: &DeviceVec) {
         let (c, dim, ff, nh, hd) = (LATENT_CHANNELS, self.dim, self.ff, self.heads, self.head_dim);
         let width = 2 * c + self.cond_dim;
         assert!(len <= w.len, "music on WebGPU: a pass of {len} latents in work vectors for {}", w.len);
         let s = len + 1;
+        let rows = 2 * s;
         let one = &self.one;
-        let Scratch { h0, h1, hs, hp, n, q, k, vv, kv, o, att, fv, fg, act, hl, h2, .. } = w;
-        // [latents, zeros, condition] along the channels, plus its 1x1 convolution
-        r.store_rows(x, h0, len, c, 0, width, 0);
-        r.store_rows(zeros, h0, len, c, 0, width, c);
-        r.store_rows(cond, h0, len, self.cond_dim, 0, width, 2 * c);
-        self.preprocess.run(r, h0, h1, len);
-        r.axpy_at(h1, h0, one, 0, len * width);
-        // the time's token first, then the latents'
-        r.copy(temb, 0, hs, 0, dim);
-        self.proj_in.run(r, h1, hp, len);
-        r.copy(hp, 0, hs, dim, len * dim);
+        let Scratch { h0, h1, hs, hp, n, q, k, vv, kv, kv1, q1, k1, v1, att0, att1, att, o, fv, fg, act, hl, h2, .. } = w;
+        // each sequence's [latents, zeros, condition] along the channels, plus its 1x1 convolution
+        for (si, cond) in conds.iter().enumerate() {
+            r.store_rows(x, h0, len, c, si * len, width, 0);
+            r.store_rows(zeros, h0, len, c, si * len, width, c);
+            r.store_rows(cond, h0, len, self.cond_dim, si * len, width, 2 * c);
+        }
+        self.preprocess.run(r, h0, h1, 2 * len);
+        r.axpy_at(h1, h0, one, 0, 2 * len * width);
+        // each sequence: the time's token first, then the latents'
+        self.proj_in.run(r, h1, hp, 2 * len);
+        for si in 0..2 {
+            r.copy(temb, 0, hs, si * s * dim, dim);
+            r.copy(hp, si * len * dim, hs, (si * s + 1) * dim, len * dim);
+        }
         let scale = 1. / (hd as f32).sqrt();
         for b in &self.blocks {
-            r.norm_mod_rows(hs, n, s, dim, &b.norm1, 0, Some(dim), RowNorm::Layer, 1e-5);
-            b.q.run(r, n, q, s);
-            b.k.run(r, n, k, s);
-            b.v.run(r, n, vv, s);
-            r.rope_partial_rows(q, s, nh, hd, self.rotary, table);
-            r.rope_partial_rows(k, s, nh, hd, self.rotary, table);
+            r.norm_mod_rows(hs, n, rows, dim, &b.norm1, 0, Some(dim), RowNorm::Layer, 1e-5);
+            b.q.run(r, n, q, rows);
+            b.k.run(r, n, k, rows);
+            b.v.run(r, n, vv, rows);
+            r.rope_partial_rows(q, rows, nh, hd, self.rotary, table);
+            r.rope_partial_rows(k, rows, nh, hd, self.rotary, table);
+            // the first sequence over its own; the second's queries, keys and values copied out for it
             r.store_rows(k, kv, s, dim, 0, 2 * dim, 0);
             r.store_rows(vv, kv, s, dim, 0, 2 * dim, dim);
-            r.attention_rows_full(q, kv, att, s, nh, nh, hd, s, scale);
-            b.out.run(r, att, o, s);
-            r.axpy_at(hs, o, one, 0, s * dim);
-            r.norm_mod_rows(hs, n, s, dim, &b.norm2, 0, Some(dim), RowNorm::Layer, 1e-5);
-            b.value.run(r, n, fv, s);
-            b.gate.run(r, n, fg, s);
-            r.silu_mul(fg, fv, act, s * ff);
-            b.ff_out.run(r, act, o, s);
-            r.axpy_at(hs, o, one, 0, s * dim);
+            r.attention_rows_full(q, kv, att0, s, nh, nh, hd, s, scale);
+            r.copy(q, s * dim, q1, 0, s * dim);
+            r.copy(k, s * dim, k1, 0, s * dim);
+            r.copy(vv, s * dim, v1, 0, s * dim);
+            r.store_rows(k1, kv1, s, dim, 0, 2 * dim, 0);
+            r.store_rows(v1, kv1, s, dim, 0, 2 * dim, dim);
+            r.attention_rows_full(q1, kv1, att1, s, nh, nh, hd, s, scale);
+            r.copy(att0, 0, att, 0, s * dim);
+            r.copy(att1, 0, att, s * dim, s * dim);
+            b.out.run(r, att, o, rows);
+            r.axpy_at(hs, o, one, 0, rows * dim);
+            r.norm_mod_rows(hs, n, rows, dim, &b.norm2, 0, Some(dim), RowNorm::Layer, 1e-5);
+            b.value.run(r, n, fv, rows);
+            b.gate.run(r, n, fg, rows);
+            r.silu_mul(fg, fv, act, rows * ff);
+            b.ff_out.run(r, act, o, rows);
+            r.axpy_at(hs, o, one, 0, rows * dim);
         }
-        // the latents' tokens out, plus the last 1x1 convolution
-        r.copy(hs, dim, hl, 0, len * dim);
-        self.proj_out.run(r, hl, h2, len);
-        self.postprocess.run(r, h2, out, len);
-        r.axpy_at(out, h2, &self.one, 0, len * c);
+        // each sequence's latents' tokens out, plus the last 1x1 convolution
+        for si in 0..2 {
+            r.copy(hs, (si * s + 1) * dim, hl, si * len * dim, len * dim);
+        }
+        self.proj_out.run(r, hl, h2, 2 * len);
+        self.postprocess.run(r, h2, out, 2 * len);
+        r.axpy_at(out, h2, one, 0, 2 * len * c);
     }
 }
 
@@ -421,9 +453,8 @@ impl WgpuAcoustic {
         let tembs: Vec<DeviceVec> = ts[..self.steps].iter().map(|&t| upload(g, &self.transformer.temb(t))).collect();
         let longest = latent_len(CHUNK_FRAMES.min(frames));
         let zeros = upload(g, &vec![0f32; longest * cd.max(c)]);
-        let table = upload(g, &self.transformer.table(longest + 1));
         let scratch = self.transformer.scratch(g, longest);
-        let (x, cd_dev, vc, vu, weights) = (g.vec(longest * c), g.vec(longest * cd), g.vec(longest * c), g.vec(longest * c), g.vec(2));
+        let (x, cd_dev, v2, vu, weights) = (g.vec(longest * c), g.vec(longest * cd), g.vec(2 * longest * c), g.vec(longest * c), g.vec(2));
         // the previous window's shared latents and condition (rows), and how many
         let mut prev: Option<(Vec<f32>, Vec<f32>, usize)> = None;
         let mut chunks = Vec::with_capacity(starts.len());
@@ -439,6 +470,7 @@ impl WgpuAcoustic {
             let init = rows_of(&noise(k, len)?, c, len);
             g.upload(&x, &init);
             g.upload(&cd_dev, &cond);
+            let table = upload(g, &self.transformer.table(len + 1).repeat(2));
             for i in 0..self.steps {
                 let t = ts[i];
                 if let (true, Some((pl, _, _))) = (overlap > 0, &prev) {
@@ -452,9 +484,9 @@ impl WgpuAcoustic {
                 let mut rec = g.begin();
                 rec.keep_groups(false);
                 let r = rec.as_mut();
-                self.transformer.forward(&scratch, len, r, &x, &tembs[i], &cd_dev, &zeros, &table, &vc);
-                self.transformer.forward(&scratch, len, r, &x, &tembs[i], &zeros, &zeros, &table, &vu);
-                r.axpy_at(&x, &vc, &weights, 0, len * c);
+                self.transformer.forward(&scratch, len, r, &x, &tembs[i], [&cd_dev, &zeros], &zeros, &table, &v2);
+                r.axpy_at(&x, &v2, &weights, 0, len * c);
+                r.copy(&v2, len * c, &vu, 0, len * c);
                 r.axpy_at(&x, &vu, &weights, 1, len * c);
                 rec.finish();
                 progress(k * self.steps + i + 1, total);
@@ -530,22 +562,24 @@ mod golden {
             let both: Vec<f32> = wave[0].iter().chain(&wave[1]).copied().collect();
             eprintln!("vocoder window {i}: {:.2e}", relative(&both, &load(&g, &format!("wave{i}.f32"))));
         }
+        // the reference's first step's two passes (its conditioned and unconditioned, the same latents) as one
         let dit = &acoustic.transformer;
+        let x = load(&g, "dit_x0.f32");
+        let len = x.len() / c;
+        let t = load(&g, "dit_t0.f32")[0];
+        let conds = [upload(&gpu, &load(&g, "dit_c0.f32")), upload(&gpu, &load(&g, "dit_c1.f32"))];
+        let (xd, temb, table, zeros, out) = (upload(&gpu, &rows_of(&x, c, len)), upload(&gpu, &dit.temb(t)), upload(&gpu, &dit.table(len + 1).repeat(2)), upload(&gpu, &vec![0f32; len * c]), gpu.vec(2 * len * c));
+        let started = std::time::Instant::now();
+        let mut rec = gpu.begin();
+        rec.keep_groups(false);
+        dit.forward(&dit.scratch(&gpu, len), len, rec.as_mut(), &xd, &temb, [&conds[0], &conds[1]], &zeros, &table, &out);
+        rec.as_mut().read(&out);
+        let v = rec.finish().pop().unwrap();
         for i in 0..2 {
-            let x = load(&g, &format!("dit_x{i}.f32"));
-            let len = x.len() / c;
-            let t = load(&g, &format!("dit_t{i}.f32"))[0];
-            let cond = load(&g, &format!("dit_c{i}.f32"));
-            let (xd, cdd, temb, table, zeros, out) = (upload(&gpu, &rows_of(&x, c, len)), upload(&gpu, &cond), upload(&gpu, &dit.temb(t)), upload(&gpu, &dit.table(len + 1)), upload(&gpu, &vec![0f32; len * c]), gpu.vec(len * c));
-            let started = std::time::Instant::now();
-            let mut rec = gpu.begin();
-            rec.keep_groups(false);
-            dit.forward(&dit.scratch(&gpu, len), len, rec.as_mut(), &xd, &temb, &cdd, &zeros, &table, &out);
-            rec.as_mut().read(&out);
-            let v = rec.finish().pop().unwrap();
             let want = rows_of(&load(&g, &format!("dit_v{i}.f32")), c, len);
-            eprintln!("transformer pass {i} (t {t}): {:.2e} in {:.3} s", relative(&v, &want), started.elapsed().as_secs_f64());
+            eprintln!("transformer pass {i} (t {t}): {:.2e}", relative(&v[i * len * c..(i + 1) * len * c], &want));
         }
+        eprintln!("(both in {:.3} s)", started.elapsed().as_secs_f64());
         // the whole stage: both windows' inputs less the overlap, and the run's noise
         let (a, b) = (load(&g, "cond_in0.f32"), load(&g, "cond_in1.f32"));
         let hidden: Vec<f32> = a.iter().chain(&b[100 * 32768..]).copied().collect();
@@ -559,68 +593,84 @@ mod golden {
         Ok(())
     }
 
-    /// One transformer pass on fixed inputs, over and over (`--ignored --nocapture`; OAIY_PASSES, else 400): each
-    /// pass's time, ten to a line.
+    /// Candle's acoustic stage on CUDA (BF16, as the official pipeline loads it) against WebGPU's for one 30 s song (750
+    /// frames of the run's hiddens repeated, the seed's noise; `--ignored --nocapture`, built `webgpu cuda`;
+    /// OAIY_MUSIC_CUDA_DEVICE, else 1, with CUDA_DEVICE_ORDER=PCI_BUS_ID the card WebGPU takes): each window's time on
+    /// both, and how far apart their audio is.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs MiniMax-Music3, the reference's dumps and CUDA"]
+    fn a_songs_rendering_is_candles() -> Result<()> {
+        use crate::music::acoustic::{Acoustic, ConditionEncoder, Transformer};
+        let (g, m) = dirs();
+        let run = load(&g, "frame_hiddens.f32");
+        let frames = 750;
+        let hidden: Vec<f32> = run.chunks_exact(32768).cycle().take(frames).flatten().copied().collect();
+        let windows = |label: &'static str| {
+            let (started, mut last, mut line) = (std::time::Instant::now(), 0f64, Vec::new());
+            move |done: usize, _total: usize| {
+                if done % 30 == 0 {
+                    let t = started.elapsed().as_secs_f64();
+                    line.push(format!("{:.1}", t - last));
+                    last = t;
+                    eprintln!("{label}: windows {} s", line.join(" "));
+                }
+            }
+        };
+        let dev = Device::new_cuda(std::env::var("OAIY_MUSIC_CUDA_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(1))?;
+        let mut candle = Acoustic {
+            condition: ConditionEncoder::load(&m.join("condition_encoder"), &dev)?,
+            transformer: Transformer::load(&m.join("transformer"), candle_core::DType::BF16, &crate::residency::Budget::default(), &dev, |_| {})?,
+            vocoder: Vocoder::load(&m.join("vocoder"), &dev)?,
+            steps: 30,
+            guidance: 1.7,
+        };
+        let started = std::time::Instant::now();
+        let theirs = candle.generate(&Tensor::from_vec(hidden.clone(), (1, frames, 32768), &dev)?, |k, len| crate::music::noise(7, k, len), windows("CUDA"))?.to_dtype(candle_core::DType::F32)?.to_vec2::<f32>()?;
+        eprintln!("CUDA: rendered in {:.1} s", started.elapsed().as_secs_f64());
+        drop(candle);
+        let gpu = WgpuBackend::nth(1, None).map_err(err)?;
+        let acoustic = WgpuAcoustic::load(&m, &gpu, 30, 1.7, |_| {})?;
+        let started = std::time::Instant::now();
+        let ours = acoustic.generate(&hidden, frames, |k, len| Ok(crate::music::noise(7, k, len)?.flatten_all()?.to_vec1::<f32>()?), windows("WebGPU"))?;
+        eprintln!("WebGPU: rendered in {:.1} s", started.elapsed().as_secs_f64());
+        // (the first window's own samples: its latents less those the second's audio replaces)
+        let first = (latent_len(CHUNK_FRAMES) - CROP_RIGHT) * HOP;
+        for (side, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+            eprintln!("side {side}: {:.2e} relative RMS apart; the first window's {:.2e}, the rest's {:.2e}", relative(a, b), relative(&a[..first], &b[..first]), relative(&a[first..], &b[first..]));
+        }
+        Ok(())
+    }
+
+    /// A window's steps on fixed inputs, over and over (`--ignored --nocapture`; OAIY_STEPS, else 400): each step's two
+    /// sequences' pass and the latents' update from the reference's first step's, ten steps' times to a line.
     #[test]
     #[ignore = "needs MiniMax-Music3 and the reference's dumps"]
-    fn measure_repeated_transformer_passes() -> Result<()> {
+    fn measure_repeated_steps() -> Result<()> {
         let (g, m) = dirs();
         let gpu = WgpuBackend::nth(1, None).map_err(err)?;
         let dit = WgpuDit::load(&m.join("transformer"), &gpu, |_| {})?;
         let c = LATENT_CHANNELS;
-        // (OAIY_MUSIC_DUMP: a folder's x.f32 and cond.f32, rows as a window's pass has them, else the reference's first)
-        let (x, cond) = match std::env::var("OAIY_MUSIC_DUMP") {
-            Ok(d) => (load(Path::new(&d), "x.f32"), load(Path::new(&d), "cond.f32")),
-            Err(_) => {
-                let x = load(&g, "dit_x0.f32");
-                (rows_of(&x, c, x.len() / c), load(&g, "dit_c0.f32"))
-            }
-        };
+        let x = load(&g, "dit_x0.f32");
         let len = x.len() / c;
-        let (xd, cdd, temb, table, zeros, out) = (upload(&gpu, &x), upload(&gpu, &cond), upload(&gpu, &dit.temb(0.)), upload(&gpu, &dit.table(len + 1)), upload(&gpu, &vec![0f32; len * c]), gpu.vec(len * c));
+        let (xd, cd, temb, table, zeros, v2, vu) = (upload(&gpu, &rows_of(&x, c, len)), upload(&gpu, &load(&g, "dit_c0.f32")), upload(&gpu, &dit.temb(0.)), upload(&gpu, &dit.table(len + 1).repeat(2)), upload(&gpu, &vec![0f32; len * dit.cond_dim]), gpu.vec(2 * len * c), gpu.vec(len * c));
         let scratch = dit.scratch(&gpu, len);
-        let passes = std::env::var("OAIY_PASSES").ok().and_then(|v| v.parse().ok()).unwrap_or(400);
-        // (OAIY_STEPS: each a step's two passes and the latents' update, as a window's)
-        let steps = std::env::var_os("OAIY_STEPS").is_some();
-        let (vu, zc) = (gpu.vec(len * c), upload(&gpu, &vec![0f32; len * dit.cond_dim]));
         let weights = upload(&gpu, &[-0.01, 0.007]);
+        let steps = std::env::var("OAIY_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(400);
         let mut line = Vec::new();
-        let mut first: Option<Vec<f32>> = None;
-        for i in 0..passes {
-            // (OAIY_SAME: every pass from the same latents, its output against the first's)
-            if std::env::var_os("OAIY_SAME").is_some() {
-                gpu.upload(&xd, &x);
-            }
+        for i in 0..steps {
             let started = std::time::Instant::now();
             let mut rec = gpu.begin();
             rec.keep_groups(false);
-            dit.forward(&scratch, len, rec.as_mut(), &xd, &temb, &cdd, &zeros, &table, &out);
-            if steps {
-                dit.forward(&scratch, len, rec.as_mut(), &xd, &temb, &zc, &zeros, &table, &vu);
-                rec.as_mut().axpy_at(&xd, &out, &weights, 0, len * c);
-                rec.as_mut().axpy_at(&xd, &vu, &weights, 1, len * c);
-            }
-            if std::env::var_os("OAIY_SAME").is_some() {
-                rec.as_mut().read(&out);
-                let got = rec.finish().pop().unwrap();
-                match &first {
-                    None => first = Some(got),
-                    Some(f) => {
-                        let differ = f.iter().zip(&got).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
-                        if differ > 0 {
-                            eprintln!("pass {}: {differ} values differ from the first pass's", i + 1);
-                        }
-                    }
-                }
-            } else {
-                rec.finish();
-            }
+            let r = rec.as_mut();
+            dit.forward(&scratch, len, r, &xd, &temb, [&cd, &zeros], &zeros, &table, &v2);
+            r.axpy_at(&xd, &v2, &weights, 0, len * c);
+            r.copy(&v2, len * c, &vu, 0, len * c);
+            r.axpy_at(&xd, &vu, &weights, 1, len * c);
+            rec.finish();
             line.push(format!("{:.0}", started.elapsed().as_secs_f64() * 1000.));
-            if let Some(ms) = std::env::var("OAIY_STEP_SLEEP_MS").ok().and_then(|v| v.parse().ok()) {
-                std::thread::sleep(std::time::Duration::from_millis(ms));
-            }
             if i % 10 == 9 {
-                eprintln!("passes {}..{}: {} ms", i - 8, i + 1, line.join(" "));
+                eprintln!("steps {}..{}: {} ms", i - 8, i + 1, line.join(" "));
                 line.clear();
             }
         }
