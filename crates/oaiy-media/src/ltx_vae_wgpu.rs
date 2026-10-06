@@ -42,12 +42,13 @@ pub struct WgpuLtxVae {
 }
 
 impl WgpuLtxVae {
-    /// The decoder in `store` (`vae.decoder.*`, `vae.per_channel_statistics.*`) on GPU `device` (as CUDA counts them;
-    /// OAIY_WEBGPU_ADAPTER naming one instead).
+    /// The decoder in `store` (`vae.decoder.*`, `vae.per_channel_statistics.*`: a checkpoint's, or a VAE file's own
+    /// without the `vae.`) on GPU `device` (as CUDA counts them; OAIY_WEBGPU_ADAPTER naming one instead).
     pub fn load(store: &mut Store, device: usize) -> Result<Self> {
         let gpu = ggml_rs_wgpu::WgpuBackend::nth(device, None).map_err(err)?;
         let mut convs = HashMap::new();
-        let names: Vec<String> = store.index.names().filter(|n| n.starts_with("vae.decoder.") && n.ends_with(".conv.weight")).map(str::to_owned).collect();
+        let prefix = if store.index.names().any(|n| n.starts_with("vae.decoder.")) { "vae." } else { "" };
+        let names: Vec<String> = store.index.names().filter(|n| n.starts_with(&format!("{prefix}decoder.")) && n.ends_with(".conv.weight")).map(str::to_owned).collect();
         for name in names {
             let base = name.strip_suffix(".weight").unwrap_or(&name).to_owned();
             let t = store.tensor_f32(&name, &Device::Cpu)?;
@@ -56,9 +57,10 @@ impl WgpuLtxVae {
             let bias = store.tensor_f32(&format!("{base}.bias"), &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
             let b = gpu.vec(bias.len());
             gpu.upload(&b, &bias);
-            convs.insert(base, Conv { w, b, cout, cin });
+            // (kept under the checkpoint's names, as the decode asks for them)
+            convs.insert(format!("vae.{}", base.strip_prefix(prefix).unwrap_or(&base)), Conv { w, b, cout, cin });
         }
-        let stat = |store: &mut Store, key: &str| -> Result<Vec<f32>> { store.tensor_f32(&format!("vae.per_channel_statistics.{key}"), &Device::Cpu)?.flatten_all()?.to_vec1::<f32>() };
+        let stat = |store: &mut Store, key: &str| -> Result<Vec<f32>> { store.tensor_f32(&format!("{prefix}per_channel_statistics.{key}"), &Device::Cpu)?.flatten_all()?.to_vec1::<f32>() };
         let (std, mean) = (stat(store, "std-of-means")?, stat(store, "mean-of-means")?);
         let mut ones = HashMap::new();
         for c in [1024usize, 512, 256, 128] {

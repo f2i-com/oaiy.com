@@ -631,6 +631,11 @@ fn prepare_video(c: &Config, body: &Json) -> Result<Json, String> {
     if let Some(ffmpeg) = config.get("ffmpeg").and_then(Json::as_str) {
         fields.push(("ffmpeg".into(), Json::str(ffmpeg)));
     }
+    // the model's backend, else the catalog's (a request's own is not taken: where a model runs is the operator's)
+    if let Some(backend) = selected.get("backend").or_else(|| config.get("backend")) {
+        let b = backend.as_str().filter(|b| ["cuda", "cpu", "webgpu"].contains(b)).ok_or("video backend must be cuda, cpu or webgpu")?;
+        fields.push(("backend".into(), Json::str(b)));
+    }
     fields.push((
         "output_dir".into(),
         Json::str(output_directory(c, body, "videos")?.to_string_lossy()),
@@ -1077,6 +1082,40 @@ mod tests {
         assert!(Config::read(&root).is_ok()); // a broken optional manifest does not prevent chat startup
         std::fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn a_video_catalogs_backend_reaches_the_worker_and_a_requests_does_not() {
+        let root = std::env::temp_dir().join(format!("oaiy-video-backend-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let weight = root.join("fixture.safetensors");
+        std::fs::write(&weight, b"fixture").unwrap();
+        let manifest = root.join("video.json");
+        let write = |catalog: Option<&str>, model: Option<&str>| {
+            let mut fields: Vec<(&str, Json)> = ["transformer", "text_encoder", "vae", "tokenizer"].iter().map(|k| (*k, Json::str(weight.to_string_lossy()))).collect();
+            if let Some(b) = model {
+                fields.push(("backend", Json::str(b)));
+            }
+            let mut top = vec![("models", Json::obj([("ltx-2.3", Json::obj(fields))]))];
+            if let Some(b) = catalog {
+                top.push(("backend", Json::str(b)));
+            }
+            std::fs::write(&manifest, Json::obj(top).to_json()).unwrap();
+        };
+        let mut cfg = config();
+        cfg.output_root = root.join("output");
+        cfg.video_config = Some(manifest.clone());
+        let body = |s: &str| Json::parse(s.as_bytes()).unwrap();
+        let backend = |cfg: &Config, request: &str| prepare_video(cfg, &body(request)).map(|r| r.get("backend").and_then(Json::as_str).map(str::to_owned));
+        write(None, None);
+        assert_eq!(backend(&cfg, r#"{"model":"ltx-2.3","prompt":"x","backend":"webgpu"}"#).unwrap(), None, "a request's own is not taken");
+        write(Some("webgpu"), None);
+        assert_eq!(backend(&cfg, r#"{"model":"ltx-2.3","prompt":"x"}"#).unwrap().as_deref(), Some("webgpu"));
+        write(Some("webgpu"), Some("cuda"));
+        assert_eq!(backend(&cfg, r#"{"model":"ltx-2.3","prompt":"x"}"#).unwrap().as_deref(), Some("cuda"), "the model's over the catalog's");
+        write(Some("vulkan"), None);
+        assert!(backend(&cfg, r#"{"model":"ltx-2.3","prompt":"x"}"#).is_err(), "an unknown backend");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn video_requests_use_trusted_paths_and_bounded_memory() {
         let root = std::env::temp_dir().join(format!("oaiy-video-config-{}", std::process::id()));

@@ -1,11 +1,12 @@
 //! LTX 2.3's transformer on WebGPU, as [`crate::ltx::transformer`] computes its video stream (text-to-video: no
 //! audio, no conditioning frames, no NAG yet): its weights on the GPU as they are stored where the chain has a kernel
 //! for them (NVFP4 packed, the tensor cores decoding it as they multiply: Lightricks' `-nvfp4` release's 44 blocks of
-//! 48), else f16 (BF16 rounded); its activations f32.
+//! 48), else Q8_0 where the tensor cores take it (a BF16 checkpoint's video stream is 28 GB as f16, 15 as Q8_0), else
+//! f16 (BF16 rounded); its activations f32.
 use crate::ltx::store::{untile_scales, Store};
 use candle_core::{Device, Result};
 use dsv41::safetensors::Dtype;
-use ggml_rs::{ChainRecorder, DeviceChain, DeviceVec, RowNorm};
+use ggml_rs::{Backend, ChainRecorder, DeviceChain, DeviceVec, QuantizedTensor, RowNorm};
 
 const PREFIX: &str = "model.diffusion_model.";
 /// The video stream's width, heads and head.
@@ -19,10 +20,42 @@ fn err(e: impl std::fmt::Display) -> candle_core::Error {
     candle_core::Error::Msg(e.to_string())
 }
 
-/// A linear layer on the GPU: its weight NVFP4 (its words and its scale's vector) or f16, and its bias.
+/// A linear layer on the GPU: its weight NVFP4 (its words and its scale's vector), Q8_0 or f16, and its bias.
 pub enum Weight {
     Nvfp4 { w: DeviceVec, scale: DeviceVec },
+    Q8(QuantizedTensor),
     F16(DeviceVec),
+}
+
+/// `values` (rows of 32's multiples) as Q8_0's blocks, the rows shared among the CPU's threads.
+fn q8_0(values: &[f32]) -> Vec<u8> {
+    const CHUNK: usize = 32 * 4096;
+    let mut out = vec![0u8; values.len() / 32 * 34];
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
+    let per = (values.len().div_ceil(CHUNK).div_ceil(threads) * CHUNK).max(CHUNK);
+    std::thread::scope(|s| {
+        for (src, dst) in values.chunks(per).zip(out.chunks_mut(per / 32 * 34)) {
+            s.spawn(move || ggml_quants::q8_0::quantize(src, dst));
+        }
+    });
+    out
+}
+
+/// A dense weight (`[n, k]`) on `gpu`: Q8_0 where the tensor cores take its rows (a multiple of 256 long), else f16
+/// (f16 throughout with OAIY_LTX_WEBGPU_WEIGHTS=f16: a card with room for it).
+fn dense(gpu: &ggml_rs_wgpu::WgpuBackend, key: &str, values: Vec<f32>, n: usize, k: usize) -> Result<Weight> {
+    let f16 = std::env::var("OAIY_LTX_WEBGPU_WEIGHTS").is_ok_and(|v| v.eq_ignore_ascii_case("f16"));
+    if gpu.tensor_cores() && k % 256 == 0 && !f16 {
+        let bytes = q8_0(&values);
+        drop(values);
+        let size = bytes.len();
+        let w = gpu.to_device_quant(QuantizedTensor::from_bytes_cpu(bytes, vec![n, k], ggml_quants::GgmlType::Q8_0));
+        if !w.is_device() {
+            candle_core::bail!("{key}: no room on the GPU for its {} MB (as Q8_0)", size >> 20);
+        }
+        return Ok(Weight::Q8(w));
+    }
+    Ok(Weight::F16(gpu.vec_f16_rounded(&values).ok_or_else(|| err(format!("{key}: past f16's range")))?))
 }
 
 pub struct Linear {
@@ -64,15 +97,13 @@ impl Linear {
                 Some((w, scale)) => (Weight::Nvfp4 { w, scale }, n, k),
                 None => {
                     let t = store.tensor_f32(&key, &Device::Cpu)?;
-                    let v = gpu.vec_f16_rounded(&t.flatten_all()?.to_vec1::<f32>()?).ok_or_else(|| err(format!("{key}: past f16's range")))?;
-                    (Weight::F16(v), n, k)
+                    (dense(gpu, &key, t.flatten_all()?.to_vec1::<f32>()?, n, k)?, n, k)
                 }
             }
         } else {
             let t = store.tensor_f32(&key, &Device::Cpu)?;
             let (n, k) = t.dims2()?;
-            let v = gpu.vec_f16_rounded(&t.flatten_all()?.to_vec1::<f32>()?).ok_or_else(|| err(format!("{key}: past f16's range")))?;
-            (Weight::F16(v), n, k)
+            (dense(gpu, &key, t.flatten_all()?.to_vec1::<f32>()?, n, k)?, n, k)
         };
         let bias_name = format!("{name}.bias");
         let bias: Vec<f32> = if store.index.get(&bias_name).is_some() { store.tensor_f32(&bias_name, &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()? } else { vec![0.0; n] };
@@ -85,6 +116,10 @@ impl Linear {
     pub fn forward(&self, rec: &mut dyn ChainRecorder, x: &DeviceVec, y: &DeviceVec, rows: usize) {
         match &self.weight {
             Weight::Nvfp4 { w, scale } => rec.matmul_nvfp4_rows(w, scale, &self.bias, self.n, self.k, x, y, rows),
+            Weight::Q8(w) => {
+                rec.matmul_rows(w, x, y, rows);
+                rec.add_bias_rows(y, &self.bias, rows, self.n);
+            }
             Weight::F16(w) => {
                 rec.matmul_f16_rows(w, self.n, self.k, x, y, rows);
                 rec.add_bias_rows(y, &self.bias, rows, self.n);
@@ -253,6 +288,13 @@ impl WgpuLtx {
         self.gpu.vec(len.max(1))
     }
 
+    /// `values` on this transformer's GPU (a rotary table, kept for every step).
+    pub fn upload(&self, values: &[f32]) -> DeviceVec {
+        let v = self.vec(values.len());
+        self.gpu.upload(&v, values);
+        v
+    }
+
     /// One attention: `xq`'s `tq` rows' queries over `xkv`'s `tk` rows (each rotated by its table where given), the
     /// heads gated, out through the output projection into `y`. `s` the scratch.
     #[allow(clippy::too_many_arguments)]
@@ -261,22 +303,30 @@ impl WgpuLtx {
     }
 
     /// The video velocity of `latent` (`tokens` rows of 128) at `sigma` over `context` (`lc` rows of `D`, the
-    /// connector's), its tokens rotated by `rope` ([`rope_table`] of [`video_positions`]): `[tokens, 128]`. With
-    /// `skip_self` that block's self-attention passed through (spatio-temporal guidance's perturbed pass).
+    /// connector's), its tokens rotated by `table` ([`rope_table`] of [`video_positions`], [`Self::upload`]ed):
+    /// `[tokens, 128]`. With `skip_self` that block's self-attention passed through (spatio-temporal guidance's
+    /// perturbed pass).
     #[allow(clippy::too_many_arguments)]
-    pub fn forward(&self, latent: &[f32], tokens: usize, context: &[f32], lc: usize, sigma: f64, rope: &[f32], skip_self: Option<usize>) -> Result<Vec<f32>> {
-        if latent.len() != tokens * self.patchify.k || context.len() != lc * D || rope.len() != tokens * D {
-            candle_core::bail!("an LTX step's inputs: {} latent values for {tokens} tokens, {} context for {lc}, {} rotary", latent.len(), context.len(), rope.len());
+    pub fn forward(&self, latent: &[f32], tokens: usize, context: &[f32], lc: usize, sigma: f64, table: &DeviceVec, skip_self: Option<usize>) -> Result<Vec<f32>> {
+        self.pass(latent, tokens, context, lc, sigma, table, skip_self, false)?.pop().ok_or_else(|| err("the velocity was not read"))
+    }
+
+    /// [`Self::forward`]'s pass: its reads, the velocity last (with `trace`, every block's output before it, one after
+    /// another in one vector: a read is the vector as the recording leaves it).
+    #[allow(clippy::too_many_arguments)]
+    fn pass(&self, latent: &[f32], tokens: usize, context: &[f32], lc: usize, sigma: f64, table: &DeviceVec, skip_self: Option<usize>, trace: bool) -> Result<Vec<Vec<f32>>> {
+        if latent.len() != tokens * self.patchify.k || context.len() != lc * D || table.len != tokens * D {
+            candle_core::bail!("an LTX step's inputs: {} latent values for {tokens} tokens, {} context for {lc}, {} rotary", latent.len(), context.len(), table.len);
         }
         let s = Scratch::new(&self.gpu, tokens.max(lc));
-        let (lat, ctx, table) = (self.vec(latent.len()), self.vec(context.len()), self.vec(rope.len()));
+        let (lat, ctx) = (self.vec(latent.len()), self.vec(context.len()));
         self.gpu.upload(&lat, latent);
         self.gpu.upload(&ctx, context);
-        self.gpu.upload(&table, rope);
         let t = self.vec(256);
         self.gpu.upload(&t, &sinusoids(sigma));
         let (x, h, cm, y, f, fg) = (self.vec(tokens * D), self.vec(tokens * D), self.vec(lc * D), self.vec(tokens * D), self.vec(tokens * 4 * D), self.vec(tokens * 4 * D));
         let (emb, modulation, prompt) = (self.vec(D), self.vec(9 * D), self.vec(2 * D));
+        let trail = self.vec(if trace { self.blocks.len() * tokens * D } else { 1 });
         let (mm, pm, mo) = (self.vec(9 * D), self.vec(2 * D), self.vec(2 * D));
         let (s1, s2) = (self.vec(D), self.vec(D));
         let mut rec = self.gpu.begin();
@@ -300,7 +350,7 @@ impl WgpuLtx {
             r.copy(&prompt, 0, &pm, 0, 2 * D);
             r.add(&pm, &b.prompt_table);
             r.norm_mod_rows(&x, &h, tokens, D, &mm, D, Some(0), RowNorm::Rms, EPS);
-            self.attend(r, &b.attn1, &h, tokens, &h, tokens, Some(&table), skip_self == Some(i), &s, &y);
+            self.attend(r, &b.attn1, &h, tokens, &h, tokens, Some(table), skip_self == Some(i), &s, &y);
             r.add_gated_rows(&x, &y, tokens, D, &mm, 2 * D, false);
             r.norm_mod_rows(&x, &h, tokens, D, &mm, 7 * D, Some(6 * D), RowNorm::Rms, EPS);
             r.norm_mod_rows(&ctx, &cm, lc, D, &pm, D, Some(0), RowNorm::None, EPS);
@@ -311,6 +361,9 @@ impl WgpuLtx {
             r.gelu(&f, &fg, tokens * b.ff0.n);
             b.ff2.forward(r, &fg, &y, tokens);
             r.add_gated_rows(&x, &y, tokens, D, &mm, 5 * D, false);
+            if trace {
+                r.copy(&x, 0, &trail, i * tokens * D, tokens * D);
+            }
         }
         // the output: a layer norm, its table's (shift, scale) plus the timestep's embedding, the projection
         r.copy(&self.out_table, 0, &mo, 0, 2 * D);
@@ -318,8 +371,11 @@ impl WgpuLtx {
         r.norm_mod_rows(&x, &h, tokens, D, &mo, D, Some(0), RowNorm::Layer, EPS);
         let vel = self.vec(tokens * self.proj_out.n);
         self.proj_out.forward(r, &h, &vel, tokens);
+        if trace {
+            r.read(&trail);
+        }
         r.read(&vel);
-        rec.finish().pop().ok_or_else(|| err("the velocity was not read"))
+        Ok(rec.finish())
     }
 }
 
@@ -435,7 +491,7 @@ mod tests {
         let context: Vec<f32> = (0..lc * D).map(|i| (i * 104729 % 2001) as f32 / 1000.0 - 1.0).collect();
         let mut store = Store::open(std::path::Path::new(&path), 0)?;
         let gpu = WgpuLtx::load(&mut store, 0, |_| {})?;
-        let table = rope_table(&video_positions(frames, h, w, fps), &[20., 2048., 2048.], D, HEADS);
+        let table = gpu.upload(&rope_table(&video_positions(frames, h, w, fps), &[20., 2048., 2048.], D, HEADS));
         for i in 0..3 {
             let t = std::time::Instant::now();
             let v = gpu.forward(&latent, tokens, &context, lc, 0.7 - 0.1 * i as f64, &table, None)?;
@@ -444,10 +500,29 @@ mod tests {
         Ok(())
     }
 
-    /// The WebGPU video stream gives the Candle one's velocity (on CUDA, BF16) on Lightricks' release (`OAIY_LTX_NVFP4`): a video
-    /// of 2 latent frames by 4 by 6 and a context of 40 rows (random, as the connector's are near unit RMS) at two sigmas.
+    /// `a`'s cosine with `b`, and its distance from `b` over `b`'s size.
+    fn compare(a: &[f32], b: &[f32]) -> (f64, f64) {
+        let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
+        let na = a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+        let nb = b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+        let diff = a.iter().zip(b).map(|(x, y)| (*x as f64 - *y as f64).powi(2)).sum::<f64>().sqrt();
+        (dot / (na * nb), diff / nb)
+    }
+
+    /// `t` (BF16) with every value one BF16 step off, alternately up and down: inputs as near as BF16 holds them.
+    fn nudged(t: &candle_core::Tensor) -> Result<candle_core::Tensor> {
+        let v: Vec<half::bf16> = t.flatten_all()?.to_vec1::<half::bf16>()?.iter().enumerate().map(|(i, x)| half::bf16::from_bits(if i % 2 == 0 { x.to_bits().wrapping_add(1) } else { x.to_bits().wrapping_sub(1) })).collect();
+        candle_core::Tensor::from_vec(v, t.dims(), t.device())
+    }
+
+    /// The WebGPU video stream gives the Candle one's velocity (on CUDA, BF16) for the checkpoint `OAIY_LTX_NVFP4` names
+    /// (Lightricks' NVFP4 release, or a BF16 one's Q8_0): a video of 2 latent frames by 4 by 6 and a context of 40 rows
+    /// (random, as the connector's are near unit RMS) at two sigmas and spatio-temporal guidance's pass. As near as the
+    /// reference is to itself, its inputs one BF16 step off, or to a tenth: the distilled release's last blocks take
+    /// random inputs' BF16 noise to a fifth of the velocity ([`trace_the_video_blocks_against_candles`]: its blocks
+    /// agree to 0.9999 through block 36).
     #[test]
-    #[ignore = "needs LTX 2.3's NVFP4 checkpoint (OAIY_LTX_NVFP4), a WebGPU adapter and some 60 GB of RAM"]
+    #[ignore = "needs an LTX 2.3 checkpoint (OAIY_LTX_NVFP4), a WebGPU adapter, CUDA (the cuda feature) and some 60 GB of RAM"]
     fn the_webgpu_video_stream_is_the_candle_one() -> Result<()> {
         let Some(path) = std::env::var_os("OAIY_LTX_NVFP4") else { return Ok(()) };
         let path = std::path::Path::new(&path);
@@ -466,7 +541,7 @@ mod tests {
         let mut store = Store::open(path, 0)?;
         let gpu = WgpuLtx::load(&mut store, 0, |_| {})?;
         eprintln!("WebGPU video stream loaded in {:.1} s", t.elapsed().as_secs_f64());
-        let table = rope_table(&video_positions(frames, h, w, fps), &[20., 2048., 2048.], D, HEADS);
+        let table = gpu.upload(&rope_table(&video_positions(frames, h, w, fps), &[20., 2048., 2048.], D, HEADS));
         let got: Vec<Vec<f32>> = [0.8, 0.25].iter().map(|&sigma| gpu.forward(&latent, tokens, &context, lc, sigma, &table, None)).collect::<Result<_>>()?;
         // and spatio-temporal guidance's pass, block 28's self-attention passed through
         let stg = gpu.forward(&latent, tokens, &context, lc, 0.8, &table, Some(28))?;
@@ -476,28 +551,136 @@ mod tests {
         let dev = Device::new_cuda(std::env::var("OAIY_LTX_CUDA_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0))?;
         #[cfg(not(feature = "cuda"))]
         let dev = Device::Cpu;
-        let mut cpu = crate::ltx::transformer::Transformer::new(Store::open(path, 0)?, &dev, 20 << 30, false, false)?;
+        // (a budget under the blocks' INT8 size: they stream as they are stored; a BF16 checkpoint's 28 GB over a
+        // budget its INT8 rows fit would be those rows, not the reference)
+        let mut cpu = crate::ltx::transformer::Transformer::new(Store::open(path, 0)?, &dev, 8 << 30, false, false)?;
+        assert!(!cpu.int8, "the reference's blocks as INT8");
         let rope = crate::ltx::transformer::Rope::video_with_end(frames, h, w, fps, false, &dev)?;
         let lt = candle_core::Tensor::from_vec(latent, (1, tokens, 128), &dev)?.to_dtype(DType::BF16)?;
         let ct = candle_core::Tensor::from_vec(context, (1, lc, D), &dev)?.to_dtype(DType::BF16)?;
-        for (i, &sigma) in [0.8, 0.25].iter().enumerate() {
+        let (ln, cn) = (nudged(&lt)?, nudged(&ct)?);
+        let passes = [(0.8, None, &got[0]), (0.25, None, &got[1]), (0.8, Some(28), &stg)];
+        for (sigma, skip, got) in passes {
             let t = std::time::Instant::now();
-            let (v, _) = cpu.forward(&lt, &ct, sigma, &rope, 0, 0, None, |_| {})?;
-            let want = v.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-            let dot: f64 = got[i].iter().zip(&want).map(|(a, b)| *a as f64 * *b as f64).sum();
-            let norm = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
-            let cos = dot / (norm(&got[i]) * norm(&want));
-            eprintln!("sigma {sigma}: cosine {cos:.6} (Candle's step {:.1} s)", t.elapsed().as_secs_f64());
-            assert!(cos > 0.99, "sigma {sigma}: cosine {cos}");
+            cpu.skip_video_self_attn = skip;
+            let velocity = |cpu: &mut crate::ltx::transformer::Transformer, l: &candle_core::Tensor, c: &candle_core::Tensor| -> Result<Vec<f32>> {
+                cpu.forward(l, c, sigma, &rope, 0, 0, None, |_| {})?.0.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()
+            };
+            let want = velocity(&mut cpu, &lt, &ct)?;
+            let seconds = t.elapsed().as_secs_f64();
+            let (_, spread) = compare(&velocity(&mut cpu, &ln, &cn)?, &want);
+            let (cos, err) = compare(got, &want);
+            let what = match skip {
+                Some(b) => format!("sigma {sigma}, block {b}'s self-attention passed through"),
+                None => format!("sigma {sigma}"),
+            };
+            eprintln!("{what}: cosine {cos:.6}, relative error {err:.2e} (the reference's own spread {spread:.2e}; its step {seconds:.1} s)");
+            assert!(err <= (2.0 * spread).max(0.1), "{what}: relative error {err} where the reference's own spread is {spread}");
         }
-        cpu.skip_video_self_attn = Some(28);
+        Ok(())
+    }
+
+    /// Each block's output of the WebGPU video stream against Candle's (on CUDA, BF16; `OAIY_LTX_NVFP4`), the inputs
+    /// as [`the_webgpu_video_stream_is_the_candle_one`]'s at sigma 0.8: where the two part.
+    #[test]
+    #[ignore = "a trace; needs an LTX 2.3 checkpoint (OAIY_LTX_NVFP4), a WebGPU adapter and CUDA (the cuda feature)"]
+    fn trace_the_video_blocks_against_candles() -> Result<()> {
+        let Some(path) = std::env::var_os("OAIY_LTX_NVFP4") else { return Ok(()) };
+        let path = std::path::Path::new(&path);
+        let (frames, h, w, fps, lc) = (2usize, 4usize, 6usize, 24usize, 40usize);
+        let tokens = frames * h * w;
+        let mut seed = 0x51ed_270bu64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64 * 2. - 1.
+        };
+        let latent: Vec<f32> = (0..tokens * 128).map(|_| (next() * 1.7) as f32).collect();
+        let context: Vec<f32> = (0..lc * D).map(|_| (next() * 1.7) as f32).collect();
+        let mut store = Store::open(path, 0)?;
+        let gpu = WgpuLtx::load(&mut store, 0, |_| {})?;
+        let table = gpu.upload(&rope_table(&video_positions(frames, h, w, fps), &[20., 2048., 2048.], D, HEADS));
+        let got = gpu.pass(&latent, tokens, &context, lc, 0.8, &table, None, true)?;
+        let trail = &got[0];
+        drop(gpu);
+        #[cfg(feature = "cuda")]
+        let dev = Device::new_cuda(std::env::var("OAIY_LTX_CUDA_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0))?;
+        #[cfg(not(feature = "cuda"))]
+        let dev = Device::Cpu;
+        let mut cpu = crate::ltx::transformer::Transformer::new(Store::open(path, 0)?, &dev, 8 << 30, false, false)?;
+        cpu.hiddens = Some(Vec::new());
+        let rope = crate::ltx::transformer::Rope::video_with_end(frames, h, w, fps, false, &dev)?;
+        let lt = candle_core::Tensor::from_vec(latent, (1, tokens, 128), &dev)?.to_dtype(DType::BF16)?;
+        let ct = candle_core::Tensor::from_vec(context, (1, lc, D), &dev)?.to_dtype(DType::BF16)?;
         let (v, _) = cpu.forward(&lt, &ct, 0.8, &rope, 0, 0, None, |_| {})?;
+        let hiddens = cpu.hiddens.take().unwrap_or_default();
+        for (i, hidden) in hiddens.iter().enumerate() {
+            let want = hidden.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+            let (cos, rel) = compare(&trail[i * tokens * D..(i + 1) * tokens * D], &want);
+            let rms = (want.iter().map(|x| (*x as f64).powi(2)).sum::<f64>() / want.len() as f64).sqrt();
+            let peak = want.iter().fold(0f32, |m, x| m.max(x.abs()));
+            eprintln!("block {i:2}: cosine {cos:.6}, relative error {rel:.2e} (the reference's RMS {rms:.3e}, its largest {peak:.3e})");
+        }
         let want = v.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-        let dot: f64 = stg.iter().zip(&want).map(|(a, b)| *a as f64 * *b as f64).sum();
-        let norm = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
-        let cos = dot / (norm(&stg) * norm(&want));
-        eprintln!("block 28's self-attention passed through: cosine {cos:.6}");
-        assert!(cos > 0.99, "the perturbed pass: cosine {cos}");
+        let (cos, rel) = compare(got.last().unwrap(), &want);
+        eprintln!("velocity: cosine {cos:.6}, relative error {rel:.2e}");
+        Ok(())
+    }
+
+    /// A BF16 checkpoint's layers (`OAIY_LTX_NVFP4` naming a BF16 one: LTX 2.3's distilled release) as Q8_0 on the
+    /// tensor cores give their quantization's product (in f64, the kernel's own error), 300 rows; and how far that is
+    /// from the BF16 weights' (the quantization's).
+    #[test]
+    #[ignore = "needs a BF16 LTX 2.3 checkpoint (OAIY_LTX_NVFP4) and a WebGPU adapter with tensor cores"]
+    fn a_q8_layer_on_the_gpu_is_its_quantizations() -> Result<()> {
+        let Some(path) = std::env::var_os("OAIY_LTX_NVFP4") else { return Ok(()) };
+        let mut store = Store::open(std::path::Path::new(&path), 0)?;
+        let gpu = ggml_rs_wgpu::WgpuBackend::new(None).map_err(err)?;
+        for name in ["model.diffusion_model.transformer_blocks.10.attn1.to_q", "model.diffusion_model.transformer_blocks.10.attn1.to_gate_logits", "model.diffusion_model.transformer_blocks.10.ff.net.0.proj", "model.diffusion_model.transformer_blocks.10.ff.net.2"] {
+            let l = Linear::load(&mut store, &gpu, name)?;
+            if !matches!(l.weight, Weight::Q8(_)) {
+                eprintln!("{name}: not Q8_0 (an NVFP4 checkpoint's, or no tensor cores)");
+                return Ok(());
+            }
+            let rows = 300;
+            let mut seed = 0x9e37_79b9u64;
+            let x: Vec<f32> = (0..rows * l.k)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    (seed % 2001) as f32 / 1000.0 - 1.0
+                })
+                .collect();
+            let (xd, yd) = (gpu.vec(x.len()), gpu.vec(rows * l.n));
+            gpu.upload(&xd, &x);
+            let mut rec = gpu.begin();
+            l.forward(rec.as_mut(), &xd, &yd, rows);
+            rec.read(&yd);
+            let got = rec.finish().pop().unwrap();
+            let w = store.tensor_f32(&format!("{name}.weight"), &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+            let b = store.tensor_f32(&format!("{name}.bias"), &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+            let mut wq = vec![0f32; w.len()];
+            ggml_quants::q8_0::dequantize(&q8_0(&w), &mut wq);
+            let product = |w: &[f32]| -> Vec<f64> {
+                let mut y = vec![0f64; rows * l.n];
+                for r in 0..rows {
+                    let xr = &x[r * l.k..(r + 1) * l.k];
+                    for o in 0..l.n {
+                        let wr = &w[o * l.k..(o + 1) * l.k];
+                        y[r * l.n + o] = b[o] as f64 + xr.iter().zip(wr).map(|(a, c)| *a as f64 * *c as f64).sum::<f64>();
+                    }
+                }
+                y
+            };
+            let (exact, bf16) = (product(&wq), product(&w));
+            let rms = (bf16.iter().map(|v| v * v).sum::<f64>() / bf16.len() as f64).sqrt();
+            let rel = |a: &[f64]| (got.iter().zip(a).map(|(g, e)| (*g as f64 - e).powi(2)).sum::<f64>() / a.len() as f64).sqrt() / rms;
+            let quant = (exact.iter().zip(&bf16).map(|(e, f)| (e - f).powi(2)).sum::<f64>() / bf16.len() as f64).sqrt() / rms;
+            eprintln!("{name} [{}, {}]: the kernel's error {:.2e} of the RMS, the GPU's from BF16's {:.2e} (Q8_0's own {quant:.2e})", l.n, l.k, rel(&exact), rel(&bf16));
+            assert!(rel(&exact) < 2e-3, "{name}: the kernel's error {} of the RMS", rel(&exact));
+        }
         Ok(())
     }
 

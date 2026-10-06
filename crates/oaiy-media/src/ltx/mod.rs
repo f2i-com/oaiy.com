@@ -285,6 +285,9 @@ pub struct Request {
     pub ram_bytes: u64,
     pub vram_bytes: u64,
     pub ffmpeg: PathBuf,
+    /// The text encoder, transformer and video decoder on WebGPU (`backend` "webgpu": any GPU wgpu reaches, Vulkan,
+    /// Metal or DX12): LTX 2.3's text-to-video, the picture only, for now.
+    pub webgpu: bool,
 }
 impl Request {
     pub fn parse(j: &Json) -> std::result::Result<Self, String> {
@@ -304,6 +307,12 @@ impl Request {
             };
             usize::try_from(v).map_err(|_| format!("{k} must be nonnegative"))
         };
+        let webgpu = match j.get("backend").and_then(Json::as_str) {
+            None | Some("cuda" | "cpu") => false,
+            Some("webgpu") if cfg!(feature = "webgpu") => true,
+            Some("webgpu") => return Err("this build has no WebGPU (the webgpu feature)".into()),
+            Some(other) => return Err(format!("backend must be cuda, cpu or webgpu, not {other}")),
+        };
         let r = Self {
             model: s("model")?,
             transformer: s("transformer")?.into(),
@@ -316,10 +325,11 @@ impl Request {
                 .filter(|s| !s.trim().is_empty())
                 .map(PathBuf::from),
             // Audio comes with every clip whose model has an audio VAE, unless
-            // the request says `"audio": false`. A given soundtrack needs it.
+            // the request says `"audio": false` (or runs on WebGPU, which has
+            // no audio stream yet). A given soundtrack needs it.
             audio: match j.get("audio") {
                 None | Some(Json::Null) => {
-                    j.get("audio_vae").and_then(Json::as_str).is_some_and(|s| !s.trim().is_empty())
+                    !webgpu && j.get("audio_vae").and_then(Json::as_str).is_some_and(|s| !s.trim().is_empty())
                         || j.get("audio_file").is_some_and(|v| !matches!(v, Json::Null))
                         || j.get("speech").is_some_and(|v| !matches!(v, Json::Null))
                 }
@@ -427,6 +437,7 @@ impl Request {
                 .and_then(Json::as_str)
                 .unwrap_or("ffmpeg")
                 .into(),
+            webgpu,
         };
         r.validate()?;
         if let Some(v) = j.get("steps") {
@@ -494,6 +505,22 @@ impl Request {
         }
         if self.prompt.trim().is_empty() {
             return Err("prompt must not be empty".into());
+        }
+        if self.webgpu {
+            let nag = self.guidance.as_ref().is_none_or(|g| g.cfg == 1.) && self.negative_prompt.is_some();
+            // (the decoder's activations at 768x512 and 121 frames peak at 12 GB: larger clips want a tiled decode)
+            let unsupported = [
+                (self.model == "ltx-2.5", "LTX 2.5 (its Gemma 4 text encoder)"),
+                (self.audio || self.audio_file.is_some() || self.speech.is_some() || self.reference_voice.is_some() || self.identity, "sound (set audio to false)"),
+                (self.image.is_some() || self.end_image.is_some(), "starting and ending images"),
+                (self.lora.is_some(), "LoRAs"),
+                (self.refine.is_some(), "two-stage refinement"),
+                (nag, "a negative prompt without CFG (NAG)"),
+                (self.width * self.height * self.frames > 768 * 512 * 121, "clips past 768x512 at 121 frames"),
+            ];
+            if let Some((_, what)) = unsupported.iter().find(|(on, _)| *on) {
+                return Err(format!("WebGPU video does not support {what} yet"));
+            }
         }
         for path in self.image.iter().chain(self.end_image.iter()) {
             let meta = std::fs::metadata(path).map_err(|e| format!("video endpoint image: {e}"))?;
@@ -572,7 +599,8 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     let soundtrack_in = if owned.identity { None } else { soundtrack_in };
     owned.validate().map_err(candle_core::Error::Msg)?;
     let r = &owned;
-    let dev = inference_device(r.device)?;
+    // (a WebGPU clip's latent and guidance stay on the host: small beside its GPU's work)
+    let dev = if r.webgpu { Device::Cpu } else { inference_device(r.device)? };
     let ram = if r.memory == "ssd" || r.memory == "gpu" {
         0
     } else {
@@ -757,6 +785,20 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     let prompt_cache_hit = cached.is_some() && (!r.audio || cached_audio.is_some());
     let mut text_encoder_seconds = 0.;
     let mut connector_seconds = 0.;
+    // The negative prompt for guided sampling: video only (the audio stream
+    // keeps the prompt's context in that pass, as the reference does).
+    let negative_text = match (&r.guidance, &r.negative_prompt) {
+        // Guided: the request's negative prompt, else the guidance's (or the reference's).
+        (Some(g), n) if g.cfg != 1. => Some(n.clone().unwrap_or_else(|| g.negative_prompt.clone())),
+        // Unguided: NAG, when there is one.
+        (_, Some(n)) => Some(n.clone()),
+        _ => None,
+    };
+    let (context, audio_context, negative) = if r.webgpu {
+        let (context, negative) = webgpu_contexts(r, &mut store, cached, negative_text, &mut report)?;
+        text_encoder_seconds = encode_started.elapsed().as_secs_f64();
+        (context, None, negative)
+    } else {
     let (context, audio_context) = if prompt_cache_hit {
         report(event("cached_video_prompt", 1, 1));
         (cached.unwrap_or_else(|| unreachable!()), cached_audio)
@@ -797,15 +839,6 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         }
         (context, audio_context)
     };
-    // The negative prompt for guided sampling: video only (the audio stream
-    // keeps the prompt's context in that pass, as the reference does).
-    let negative_text = match (&r.guidance, &r.negative_prompt) {
-        // Guided: the request's negative prompt, else the guidance's (or the reference's).
-        (Some(g), n) if g.cfg != 1. => Some(n.clone().unwrap_or_else(|| g.negative_prompt.clone())),
-        // Unguided: NAG, when there is one.
-        (_, Some(n)) => Some(n.clone()),
-        _ => None,
-    };
     let negative = match negative_text {
         Some(text) => {
             let neg = Request { prompt: text, audio: false, ..r.clone() };
@@ -834,6 +867,8 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         }
         _ => None,
     };
+    (context, audio_context, negative)
+    };
     let text_seconds = encode_started.elapsed().as_secs_f64();
     let gpu_budget = if r.memory == "ram" || r.memory == "ssd" {
         0
@@ -841,7 +876,9 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         r.vram_bytes
     };
     #[cfg(feature = "cuda")]
-    let gpu_budget = {
+    let gpu_budget = if r.webgpu {
+        gpu_budget
+    } else {
         let free = dev
             .as_cuda_device()?
             .cuda_stream()
@@ -854,19 +891,21 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         // memory to system RAM, where kernels crawl into the driver's watchdog.
         gpu_budget.min(free.saturating_sub(8 * GIB))
     };
-    let mut model = transformer::Transformer::new(store, &dev, gpu_budget, r.memory == "gpu", r.audio)?;
+    let (f, mut h, mut w) = ((r.frames - 1) / 8 + 1, stage_size.1 / 32, stage_size.0 / 32);
+    let mut model = if r.webgpu {
+        webgpu_model(r, &mut store, f, h, w, &mut report)?
+    } else {
+        Model::Candle(transformer::Transformer::new(store, &dev, gpu_budget, r.memory == "gpu", r.audio)?)
+    };
     // A negative prompt without CFG steers every step by NAG.
-    if r.guidance.as_ref().is_none_or(|g| g.cfg == 1.) {
-        if let Some(context) = &negative {
-            model.nag = Some(transformer::Nag { context: context.clone(), scale: r.nag.0, tau: r.nag.1, alpha: r.nag.2 });
-            report(event("negative_prompt_nag", 1, 1));
-        }
+    if let (true, Some(context), Model::Candle(model)) = (r.guidance.as_ref().is_none_or(|g| g.cfg == 1.), &negative, &mut model) {
+        model.nag = Some(transformer::Nag { context: context.clone(), scale: r.nag.0, tau: r.nag.1, alpha: r.nag.2 });
+        report(event("negative_prompt_nag", 1, 1));
     }
-    let int8_weights = model.int8;
+    let int8_weights = matches!(&model, Model::Candle(m) if m.int8);
     if int8_weights {
         report(event("int8_weights", 1, 1));
     }
-    let (f, mut h, mut w) = ((r.frames - 1) / 8 + 1, stage_size.1 / 32, stage_size.0 / 32);
     let rope = transformer::Rope::video_with_end(f, h, w, r.fps, ending_latent.is_some(), &dev)?;
     let noise = crate::pipeline::noise(r.seed, f * h * w * 128);
     let mut latent = Tensor::from_vec(noise, (1, f * h * w, 128), &dev)?;
@@ -936,6 +975,9 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
             _ => audio_latent.as_ref().map(|a| a.to_dtype(DType::BF16)).transpose()?,
         };
         let video_bf16 = latent.to_dtype(DType::BF16)?;
+        // (the WebGPU stream takes the latent's f32 values)
+        #[cfg(feature = "webgpu")]
+        let video_f32 = if r.webgpu { Some(latent.flatten_all()?.to_vec1::<f32>()?) } else { None };
         let mut pass = 0;
         // Without the reference voice: only the clip's own audio tokens.
         let target_bf16 = match (&audio_bf16, &identity) {
@@ -963,19 +1005,32 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
             };
             let at = pass;
             pass += 1;
-            model.skip_video_self_attn = perturb;
-            let out = model.forward(
-                &video_bf16,
-                context,
-                sigma,
-                &rope,
-                if starting_latent.is_some() { h * w } else { 0 },
-                if ending_latent.is_some() { h * w } else { 0 },
-                audio_input,
-                |n| report(event("video_denoising", (step * passes + at) * 48 + n, steps * passes * 48)),
-            );
-            model.skip_video_self_attn = None;
-            out
+            match &mut model {
+                Model::Candle(model) => {
+                    model.skip_video_self_attn = perturb;
+                    let out = model.forward(
+                        &video_bf16,
+                        context,
+                        sigma,
+                        &rope,
+                        if starting_latent.is_some() { h * w } else { 0 },
+                        if ending_latent.is_some() { h * w } else { 0 },
+                        audio_input,
+                        |n| report(event("video_denoising", (step * passes + at) * 48 + n, steps * passes * 48)),
+                    );
+                    model.skip_video_self_attn = None;
+                    out
+                }
+                #[cfg(feature = "webgpu")]
+                Model::Wgpu(m, table) => {
+                    let latent = video_f32.as_deref().ok_or_else(|| candle_core::Error::Msg("the latent's values".into()))?;
+                    let values = context.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+                    let tokens = latent.len() / 128;
+                    let v = m.forward(latent, tokens, &values, values.len() / 4096, sigma, table, perturb)?;
+                    report(event("video_denoising", (step * passes + at + 1) * 48, steps * passes * 48));
+                    Ok((Tensor::from_vec(v, (1, tokens, 128), &dev)?, None))
+                }
+            }
         };
         let (mut velocity, mut audio_velocity) = run(&context, false, None, false)?;
         // Identity guidance: the clip's audio away from what it would be
@@ -1042,7 +1097,11 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     }
     // Appended end-keyframe tokens guide attention but are not part of the decoded clip.
     latent = latent.narrow(1, 0, f * h * w)?.contiguous()?;
-    let (mut gpu, mut host, mut disk) = model.stats();
+    let (mut gpu, mut host, mut disk) = match &model {
+        Model::Candle(m) => m.stats(),
+        #[cfg(feature = "webgpu")]
+        Model::Wgpu(..) => (0, 0, 0),
+    };
     dev.synchronize()?;
     drop(model);
     if let (true, Some(refine)) = (two_stage, &r.refine) {
@@ -1126,6 +1185,9 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     dev.synchronize()?;
     report(event("decoding_video", 0, 1));
     let decode_started = Instant::now();
+    let pixels = if r.webgpu {
+        webgpu_decode(r, &latent, f, h, w)?
+    } else {
     let decoder =
         vae::LtxVideoDecoder::load(&r.vae, vae::LtxVaeConfig::ltx_2_3_22b(), &dev, DType::BF16)?;
     let latent = latent
@@ -1161,6 +1223,8 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         decoder.decode_tiled(&latent, tile, tile, tile / 4, tile / 4)?
     };
     drop(decoder);
+    pixels
+    };
     drop(latent);
     let decode_seconds = decode_started.elapsed().as_secs_f64();
     // The soundtrack: audio VAE decoder and vocoder, then trimmed (or padded)
@@ -1378,6 +1442,7 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         ("seed", Json::Int(r.seed as i64)),
         ("seconds", Json::Num(started.elapsed().as_secs_f64())),
         ("memory", Json::str(&r.memory)),
+        ("backend", Json::str(if r.webgpu { "webgpu" } else { "cuda" })),
         ("gpu_weight_bytes", Json::Int(gpu as i64)),
         ("ram_weight_bytes", Json::Int(host as i64)),
         ("weight_bytes_read", Json::Int(disk as i64)),
@@ -1385,6 +1450,95 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     std::fs::write(path.with_extension("json"), result.to_json())?;
     Ok(result)
 }
+/// The transformer a clip is denoised by: Candle's, or (`backend` "webgpu") the video stream on WebGPU with its
+/// tokens' rotary table.
+enum Model {
+    Candle(transformer::Transformer),
+    #[cfg(feature = "webgpu")]
+    Wgpu(crate::ltx_wgpu::WgpuLtx, ggml_rs::DeviceVec),
+}
+
+/// The video stream of `store`'s transformer on WebGPU, for a latent of `f` frames of `h` by `w`.
+#[cfg(feature = "webgpu")]
+fn webgpu_model(r: &Request, store: &mut Store, f: usize, h: usize, w: usize, report: &mut dyn FnMut(Json)) -> Result<Model> {
+    report(event("loading_video_model", 0, 48));
+    let m = crate::ltx_wgpu::WgpuLtx::load(store, r.device, |n| report(event("loading_video_model", n, 48)))?;
+    let table = m.upload(&crate::ltx_wgpu::rope_table(&crate::ltx_wgpu::video_positions(f, h, w, r.fps), &[20., 2048., 2048.], 4096, 32));
+    Ok(Model::Wgpu(m, table))
+}
+#[cfg(not(feature = "webgpu"))]
+fn webgpu_model(_: &Request, _: &mut Store, _: usize, _: usize, _: usize, _: &mut dyn FnMut(Json)) -> Result<Model> {
+    candle_core::bail!("this build has no WebGPU (the webgpu feature)")
+}
+
+/// The prompt's video context and the negative prompt's (where there is one) on WebGPU: from the prompt cache where
+/// it holds them (`cached` the prompt's), else Gemma, the projection and the connector on the GPU, both prompts in
+/// one pass over Gemma's layers. On the host (F32 where new).
+#[cfg(feature = "webgpu")]
+fn webgpu_contexts(r: &Request, store: &mut Store, cached: Option<Tensor>, negative_text: Option<String>, report: &mut dyn FnMut(Json)) -> Result<(Tensor, Option<Tensor>)> {
+    let negative_cache = negative_text.as_ref().and_then(|text| cache::PromptCache::new(&Request { prompt: text.clone(), audio: false, ..r.clone() }));
+    let cached_negative = negative_cache.as_ref().and_then(|c| c.load(&Device::Cpu));
+    let mut prompts = Vec::new();
+    if cached.is_none() {
+        prompts.push(r.prompt.clone());
+    }
+    if let (Some(text), None) = (&negative_text, &cached_negative) {
+        prompts.push(text.clone());
+    }
+    let mut fresh = if prompts.is_empty() {
+        report(event("cached_video_prompt", 1, 1));
+        Vec::new()
+    } else {
+        let tokenizer = r.tokenizer.as_deref().ok_or_else(|| candle_core::Error::Msg("LTX 2.3 requires a Gemma 3 tokenizer path".into()))?;
+        report(event("encoding_video_prompt", 0, 1));
+        crate::ltx_text_wgpu::contexts(&r.text_encoder, tokenizer, store, &prompts, r.device, |n, of| report(event("encoding_video_prompt", n, of)))?
+    }
+    .into_iter();
+    let mut next = || -> Result<Tensor> {
+        let values = fresh.next().ok_or_else(|| candle_core::Error::Msg("a prompt's context is missing".into()))?;
+        Tensor::from_vec(values, (1, 1024, 4096), &Device::Cpu)
+    };
+    let context = match cached {
+        Some(c) => c,
+        None => {
+            let c = next()?;
+            if let Some(cache) = cache::PromptCache::new(r) {
+                let _ = cache.save(&c);
+            }
+            c
+        }
+    };
+    let negative = match (negative_text, cached_negative) {
+        (Some(_), Some(c)) => Some(c),
+        (Some(_), None) => {
+            let c = next()?;
+            if let Some(cache) = &negative_cache {
+                let _ = cache.save(&c);
+            }
+            Some(c)
+        }
+        _ => None,
+    };
+    Ok((context, negative))
+}
+#[cfg(not(feature = "webgpu"))]
+fn webgpu_contexts(_: &Request, _: &mut Store, _: Option<Tensor>, _: Option<String>, _: &mut dyn FnMut(Json)) -> Result<(Tensor, Option<Tensor>)> {
+    candle_core::bail!("this build has no WebGPU (the webgpu feature)")
+}
+
+/// The clip of `latent` (`[1, f h w, 128]`) by the video decoder on WebGPU: `[1, 3, frames, height, width]`.
+#[cfg(feature = "webgpu")]
+fn webgpu_decode(r: &Request, latent: &Tensor, f: usize, h: usize, w: usize) -> Result<Tensor> {
+    let mut store = Store::open(&r.vae, 0)?;
+    let decoder = crate::ltx_vae_wgpu::WgpuLtxVae::load(&mut store, r.device)?;
+    drop(store);
+    decoder.decode(&latent.flatten_all()?.to_vec1::<f32>()?, f, h, w)
+}
+#[cfg(not(feature = "webgpu"))]
+fn webgpu_decode(_: &Request, _: &Tensor, _: usize, _: usize, _: usize) -> Result<Tensor> {
+    candle_core::bail!("this build has no WebGPU (the webgpu feature)")
+}
+
 /// The clip length for a soundtrack of `seconds`: enough frames at `fps` to
 /// hold all of it, snapped up to 8k+1 (the reference snaps down, which cuts
 /// the last words off), within 9..=121. The soundtrack is padded with silence
@@ -1625,6 +1779,31 @@ mod tests {
         assert!(!Request::parse(&base("")).unwrap().audio);
         assert!(!Request::parse(&base(r#","audio_vae":"a","audio":false"#)).unwrap().audio);
         assert!(Request::parse(&base(r#","audio":true"#)).is_err(), "audio without its VAE");
+    }
+    #[test]
+    #[cfg(feature = "webgpu")]
+    fn a_webgpu_clip_is_text_to_video_without_sound_for_now() {
+        let request = |extra: &str| {
+            let j = Json::parse(format!(r#"{{"model":"ltx-2.3","transformer":"t","text_encoder":"e","tokenizer":"k","vae":"t","audio_vae":"t","output_dir":"o","prompt":"p","backend":"webgpu"{extra}}}"#).as_bytes()).unwrap();
+            Request::parse(&j)
+        };
+        let r = request("").unwrap();
+        assert!(r.webgpu && !r.audio, "sound off by default on WebGPU, though the checkpoint has its VAE");
+        assert!(request(r#","guidance":{"steps":30}"#).unwrap().guidance.is_some(), "guided sampling, its negative prompt by CFG");
+        for (extra, what) in [
+            (r#","audio":true"#, "sound"),
+            (r#","lora":"l""#, "LoRAs"),
+            (r#","negative_prompt":"n""#, "NAG"),
+            (r#","width":1024,"height":1024,"frames":121"#, "past 768x512"),
+            (r#","refine":{"transformer":"t","upsampler":"u"}"#, "refinement"),
+        ] {
+            let e = request(extra).unwrap_err();
+            assert!(e.starts_with("WebGPU video does not support") && e.contains(what), "{extra}: {e}");
+        }
+        let cuda = Json::parse(br#"{"model":"ltx-2.3","transformer":"t","text_encoder":"e","tokenizer":"k","vae":"t","output_dir":"o","prompt":"p","backend":"cuda"}"#).unwrap();
+        assert!(!Request::parse(&cuda).unwrap().webgpu);
+        let other = Json::parse(br#"{"model":"ltx-2.3","transformer":"t","text_encoder":"e","tokenizer":"k","vae":"t","output_dir":"o","prompt":"p","backend":"metal"}"#).unwrap();
+        assert!(Request::parse(&other).is_err());
     }
     #[test]
     fn starting_frame_is_exact_after_each_euler_update() -> Result<()> {

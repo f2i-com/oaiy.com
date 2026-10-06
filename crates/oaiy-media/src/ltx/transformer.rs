@@ -549,6 +549,9 @@ pub struct Transformer {
     first_hidden: Option<Tensor>,
     #[cfg(test)]
     first_audio_hidden: Option<Tensor>,
+    /// Every video block's output, where given a list (another implementation's tests).
+    #[cfg(test)]
+    pub(crate) hiddens: Option<Vec<Tensor>>,
 }
 
 #[cfg(test)]
@@ -900,6 +903,8 @@ impl Transformer {
             #[cfg(test)]
             first_hidden: None,
             #[cfg(test)]
+            hiddens: None,
+            #[cfg(test)]
             first_audio_hidden: None,
         })
     }
@@ -1076,6 +1081,10 @@ impl Transformer {
                     *ax = a;
                 }
                 None => x = block(w, x, context, &modulation, prompt.as_ref(), rope, skip_self, nag.as_ref())?,
+            }
+            #[cfg(test)]
+            if let Some(h) = self.hiddens.as_mut() {
+                h.push(x.clone());
             }
             #[cfg(test)]
             if i == 0 {

@@ -268,14 +268,15 @@ mod tests {
     use super::*;
     use candle_core::DType;
 
-    /// The WebGPU prompt context is Candle's (on CUDA, BF16): Gemma 3 12B (`OAIY_LTX_GEMMA`, its folder; its
-    /// tokenizer.json there), then the projection and connector of Lightricks' release (`OAIY_LTX_NVFP4`), a prompt.
+    /// The WebGPU prompt context is Candle's (on CUDA, BF16): Gemma 3 12B (`OAIY_LTX_GEMMA`, its folder or one file;
+    /// its tokenizer `OAIY_LTX_TOKENIZER`, else the folder's tokenizer.json), then the projection and connector of an
+    /// LTX 2.3 checkpoint (`OAIY_LTX_NVFP4`), a prompt.
     #[test]
     #[ignore = "needs Gemma 3 12B (OAIY_LTX_GEMMA), LTX 2.3 (OAIY_LTX_NVFP4), a WebGPU adapter and CUDA (the cuda feature)"]
     fn the_webgpu_prompt_context_is_the_candle_one() -> Result<()> {
         let (Some(gemma), Some(ltx)) = (std::env::var_os("OAIY_LTX_GEMMA"), std::env::var_os("OAIY_LTX_NVFP4")) else { return Ok(()) };
         let (gemma, ltx) = (std::path::PathBuf::from(gemma), std::path::PathBuf::from(ltx));
-        let tokenizer = gemma.join("tokenizer.json");
+        let tokenizer = std::env::var_os("OAIY_LTX_TOKENIZER").map_or_else(|| gemma.join("tokenizer.json"), std::path::PathBuf::from);
         let prompt = "A red fox trots through fresh snow at sunrise, its breath steaming, the camera tracking beside it".to_string();
         let t = std::time::Instant::now();
         let mut store = Store::open(&ltx, 0)?;

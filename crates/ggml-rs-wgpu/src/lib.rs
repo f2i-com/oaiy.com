@@ -861,6 +861,12 @@ impl WgpuBackend {
         self.settle();
     }
 
+    /// Whether the adapter has cooperative matrices (the tensor cores' kernels: f16, NVFP4 and the K-quants' and Q8_0's
+    /// for a prompt's rows).
+    pub fn tensor_cores(&self) -> bool {
+        self.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+    }
+
     pub fn memory_budget(&self) -> Option<(u64, u64)> {
         heap_budget(&self.raw_adapter)
     }
