@@ -56,6 +56,14 @@ pub trait DeviceChain: Send + Sync {
         let _ = values;
         None
     }
+    /// A convolution's weights (`[cout, cin, k, k]` as PyTorch keeps them, `k` 1 or 3) for
+    /// [`ChainRecorder::conv_rows`]: f16 (each rounded to the nearest), each output's `k * k` taps in turn, a tap's
+    /// channels padded with zeros to a multiple of 32. None where a value is past f16's range, or the device has no such
+    /// kernel.
+    fn conv_weights(&self, w: &[f32], cout: usize, cin: usize, k: usize) -> Option<DeviceVec> {
+        let _ = (w, cout, cin, k);
+        None
+    }
     /// The length [`ChainRecorder::attention_rows_full`]'s `out` takes (the result, then any scratch its kernels
     /// keep there).
     fn attention_rows_full_out_len(&self, rows: usize, n_h: usize, head_dim: usize, kv_len: usize) -> usize {
@@ -117,6 +125,11 @@ pub trait ChainRecorder {
     fn rmsnorm_rows(&mut self, x: &DeviceVec, w: &DeviceVec, out: &DeviceVec, rows: usize, eps: f32);
     /// `acc += y`.
     fn add(&mut self, acc: &DeviceVec, y: &DeviceVec);
+    /// [`Self::rmsnorm_rows`] then SiLU, in one pass (a VAE's norms before its convolutions: no normed copy).
+    fn rmsnorm_silu_rows(&mut self, x: &DeviceVec, w: &DeviceVec, out: &DeviceVec, rows: usize, eps: f32) {
+        let _ = (x, w, out, rows, eps);
+        unimplemented!("a norm and SiLU on this device")
+    }
     /// `x += y`, then `out` its rows' [`Self::rmsnorm_rows`] with `w`: a residual's add and the next norm in one.
     fn add_rmsnorm_rows(&mut self, x: &DeviceVec, y: &DeviceVec, w: &DeviceVec, out: &DeviceVec, rows: usize, eps: f32) {
         self.add(x, y);
@@ -331,6 +344,34 @@ pub trait ChainRecorder {
     fn attention_rows_full(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, kv_len: usize, scale: f32) {
         let _ = (q, kv, out, rows, n_h, n_kv, head_dim, kv_len, scale);
         unimplemented!("full attention on this device")
+    }
+    /// A `k` x `k` convolution (`k` 1 or 3; stride 1, zeros past the edge) of an image `x` held as its pixels' rows of
+    /// channels (`[h * w, cin]`, a row of the image after another) into `y` (`[h * w, cout]`), the weights `w` as
+    /// [`DeviceChain::conv_weights`] packs them, plus the bias `b`; `x` of any range (a VAE's reach some 230,000, past
+    /// f16's: where the device multiplies in f16, scaled by a power of two its largest sets, undone after).
+    #[allow(clippy::too_many_arguments)]
+    fn conv_rows(&mut self, w: &DeviceVec, b: &DeviceVec, cout: usize, cin: usize, k: usize, x: &DeviceVec, h: usize, wd: usize, y: &DeviceVec) {
+        let _ = (w, b, cout, cin, k, x, h, wd, y);
+        unimplemented!("a convolution on this device")
+    }
+    /// `y[r * n + i] += b[i]` for each of `rows` rows.
+    fn add_bias_rows(&mut self, y: &DeviceVec, b: &DeviceVec, rows: usize, n: usize) {
+        let _ = (y, b, rows, n);
+        unimplemented!("a bias on this device")
+    }
+    /// An image held as its pixels' rows of channels (`[h * w, c]`) twice as wide and high into `out` (`[2h * 2w,
+    /// c]`), each pixel four (nearest).
+    fn upsample2x_rows(&mut self, x: &DeviceVec, out: &DeviceVec, h: usize, w: usize, c: usize) {
+        let _ = (x, out, h, w, c);
+        unimplemented!("an upsampling on this device")
+    }
+    /// Wan's upsampling shortcut added: `out` (`[2h * 2w, cout]`) gets `x` (`[h * w, cin]`) each channel repeated
+    /// `cout ft 4 / cin` times then shuffled into pixels (`(cout, ft, 2, 2)`), the last of `ft` frames kept:
+    /// `out[(2y + a, 2x + b), co] += x[(y, x), ci]`, `ci = (4 co ft + 4 (ft - 1) + 2 a + b) / repeats`.
+    #[allow(clippy::too_many_arguments)]
+    fn shuffle_up_add_rows(&mut self, x: &DeviceVec, out: &DeviceVec, h: usize, w: usize, cin: usize, cout: usize, ft: usize) {
+        let _ = (x, out, h, w, cin, cout, ft);
+        unimplemented!("an upsampling shortcut on this device")
     }
     /// Read `v` back once the chain has run.
     fn read(&mut self, v: &DeviceVec) {

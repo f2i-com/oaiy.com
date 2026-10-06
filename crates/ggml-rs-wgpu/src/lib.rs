@@ -822,6 +822,23 @@ impl WgpuBackend {
 
     /// The OS's budget for this process on the card's memory, and its use of it now (Vulkan's): None where the API
     /// does not say.
+    /// Wait for the GPU's work and let go of the buffers dropped since (wgpu frees them at a poll or submit: a stage's
+    /// vectors dropped before the next stage makes its own would otherwise share the card with them).
+    pub fn settle(&self) {
+        let _ = self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+    }
+
+    /// Let go of what the device keeps between chains' runs (the kept bind groups and the vectors they hold, the
+    /// scratch and staging pools), then [`Self::settle`]: the room for another model's work on the same card (a
+    /// diffusion step's kept some 10 GB past its weights).
+    pub fn release_cached(&self) {
+        self.gpu.chain_groups.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        self.gpu.chain_groups_wide.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        self.gpu.pool.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        self.gpu.staging.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        self.settle();
+    }
+
     pub fn memory_budget(&self) -> Option<(u64, u64)> {
         heap_budget(&self.raw_adapter)
     }

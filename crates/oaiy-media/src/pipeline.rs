@@ -208,6 +208,24 @@ enum Model {
     Wgpu(crate::qwen_wgpu::WgpuTransformer),
 }
 
+/// The VAE's decoder on its device: Candle's or the WebGPU chain's.
+enum Decoder {
+    Candle(Vae),
+    #[cfg(feature = "webgpu")]
+    Wgpu(crate::vae_wgpu::WgpuVae),
+}
+
+impl Decoder {
+    /// The picture of `latent` (`[1, h w, 64]`): `[1, 4, 16 h, 16 w]`.
+    fn decode(&self, latent: &Tensor, h: usize, w: usize) -> Result<Tensor> {
+        match self {
+            Decoder::Candle(v) => v.decode(latent, h, w),
+            #[cfg(feature = "webgpu")]
+            Decoder::Wgpu(v) => v.decode(latent, h, w),
+        }
+    }
+}
+
 /// A prompt's conditioning, as its model made it.
 enum Prefix {
     Candle(crate::transformer::Prefix),
@@ -232,6 +250,15 @@ impl Model {
             (Model::Wgpu(m), Prefix::Wgpu(p)) => m.conditioned(latent, p, sigma, h, w)?.to_device(latent.device())?.to_dtype(latent.dtype()),
             #[cfg(feature = "webgpu")]
             _ => candle_core::bail!("a prompt's conditioning from another model"),
+        }
+    }
+
+    /// Let go of what a step keeps for the next (the VAE's decode wants the room).
+    fn release_scratch(&mut self) {
+        match self {
+            Model::Candle(_) => {}
+            #[cfg(feature = "webgpu")]
+            Model::Wgpu(m) => m.release_scratch(),
         }
     }
 
@@ -379,7 +406,10 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
     }
     event(Json::obj([("stage", Json::str("loading_vae"))]));
     let load_start = Instant::now();
-    let vae = Vae::load(&r.base, &dev, dtype)?;
+    #[cfg(feature = "webgpu")]
+    let vae = if r.webgpu { Decoder::Wgpu(crate::vae_wgpu::WgpuVae::load(&r.base)?) } else { Decoder::Candle(Vae::load(&r.base, &dev, dtype)?) };
+    #[cfg(not(feature = "webgpu"))]
+    let vae = Decoder::Candle(Vae::load(&r.base, &dev, dtype)?);
     dev.synchronize()?;
     let vae_load_seconds = load_start.elapsed().as_secs_f64();
     let (h, w) = (r.height / 16, r.width / 16);
@@ -427,6 +457,7 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
         }
         let sampling_seconds = image_start.elapsed().as_secs_f64();
         let decode_start = Instant::now();
+        model.release_scratch();
         let rgba = vae
             .decode(&latent, h, w)?
             .to_dtype(DType::F32)?

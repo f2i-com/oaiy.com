@@ -731,6 +731,149 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+/// An image's pixels' rows of `p[0].x` channels f32 (`x`) as f16 padded to `p[0].y` (`q`, two to a word), `p[0].z`
+/// pixels, each times `range[0]` ([`F16_RANGE_SET`]'s scale).
+const X_F16_PADDED: &str = r#"
+@group(0) @binding(0) var<storage, read> range: array<f32>;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> q: array<u32>;
+@group(0) @binding(3) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let c = p[0].x;
+    let cp2 = p[0].y / 2u;
+    let i = id.x + id.y * 16776960u;
+    if (i >= p[0].z * cp2) { return; }
+    let px = i / cp2;
+    let j = 2u * (i % cp2);
+    var v = vec2<f32>(0.0);
+    if (j < c) { v.x = x[px * c + j]; }
+    if (j + 1u < c) { v.y = x[px * c + j + 1u]; }
+    q[i] = pack2x16float(v * range[0]);
+}
+"#;
+
+/// The largest magnitude of `x` (`p[0].x` values) into `range[2]` (its bits: a non-negative f32's order is its bits'),
+/// zeroed first ([`F16_RANGE_CLEAR`]).
+const F16_RANGE_MAX: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(6) var<storage, read_write> range: array<atomic<u32>>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    if (i < p[0].x) { atomicMax(&range[2], bitcast<u32>(abs(x[i]))); }
+}
+"#;
+
+/// `range[2]` zeroed for [`F16_RANGE_MAX`].
+const F16_RANGE_CLEAR: &str = r#"
+@group(0) @binding(6) var<storage, read_write> range: array<u32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(1)
+fn main() {
+    range[2] = 0u;
+}
+"#;
+
+/// A power of two that keeps `x`'s largest (`range[2]`, [`F16_RANGE_MAX`]'s) within 16,384 as f16: `range[0]` it,
+/// `range[1]` its inverse (exact both).
+const F16_RANGE_SET: &str = r#"
+@group(0) @binding(6) var<storage, read_write> range: array<u32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(1)
+fn main() {
+    let m = bitcast<f32>(range[2]);
+    var k = 0.0;
+    if (m > 16384.0) { k = ceil(log2(m / 16384.0)); }
+    k = min(k, 100.0);
+    range[0] = bitcast<u32>(exp2(-k));
+    range[1] = bitcast<u32>(exp2(k));
+}
+"#;
+
+/// `x[i] = x[i] * range[1] + b[i % p[0].x]` for `i < p[0].x * p[0].y`: a scaled convolution's sums back to their
+/// range, and its bias.
+const UNSCALE_BIAS_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> b: array<f32>;
+@group(0) @binding(1) var<storage, read> range: array<f32>;
+@group(0) @binding(6) var<storage, read_write> x: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    if (i < p[0].x * p[0].y) { x[i] = x[i] * range[1] + b[i % p[0].x]; }
+}
+"#;
+
+/// `x[i] += b[i % p[0].x]` for `i < p[0].x * p[0].y`.
+const ADD_BIAS_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> b: array<f32>;
+@group(0) @binding(6) var<storage, read_write> x: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    if (i < p[0].x * p[0].y) { x[i] += b[i % p[0].x]; }
+}
+"#;
+
+/// Nearest 2x of an image of `p[0].y` by `p[0].z` pixels of `p[0].x` channels: `y`'s pixel `(oy, ox)` is `x`'s
+/// `(oy / 2, ox / 2)`.
+const UPSAMPLE2X_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(6) var<storage, read_write> y: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let c = p[0].x;
+    let h = p[0].y;
+    let w = p[0].z;
+    let i = id.x + id.y * 16776960u;
+    if (i >= 4u * h * w * c) { return; }
+    let ch = i % c;
+    let px = i / c;
+    let ox = px % (2u * w);
+    let oy = px / (2u * w);
+    y[i] = x[((oy / 2u) * w + ox / 2u) * c + ch];
+}
+"#;
+
+/// [`ChainRecorder::shuffle_up_add_rows`]: `y` (`[2h * 2w, cout]`) gets `x` (`[h * w, cin]`) shuffled up. `p[0]`:
+/// cin, cout, ft, repeats; `p[1]`: h, w.
+const SHUFFLE_UP_ADD_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(6) var<storage, read_write> y: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let cin = p[0].x;
+    let cout = p[0].y;
+    let ft = p[0].z;
+    let repeats = p[0].w;
+    let h = p[1].x;
+    let w = p[1].y;
+    let i = id.x + id.y * 16776960u;
+    if (i >= 4u * h * w * cout) { return; }
+    let co = i % cout;
+    let px = i / cout;
+    let ox = px % (2u * w);
+    let oy = px / (2u * w);
+    let a = oy % 2u;
+    let b = ox % 2u;
+    let ci = (4u * co * ft + 4u * (ft - 1u) + 2u * a + b) / repeats;
+    y[i] += x[((oy / 2u) * w + ox / 2u) * cin + ci];
+}
+"#;
+
 /// `y[i] = gelu(x[i])` for `i < p[0].x`, the tanh approximation (as [`GELU_MUL_SPLIT`]'s).
 const GELU: &str = r#"
 @compute @workgroup_size(256)
@@ -2116,6 +2259,23 @@ impl DeviceChain for WgpuBackend {
         Some(v)
     }
 
+    fn conv_weights(&self, w: &[f32], cout: usize, cin: usize, k: usize) -> Option<DeviceVec> {
+        let taps = k * k;
+        if !matches!(k, 1 | 3) || w.len() != cout * cin * taps || !self.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+            return None;
+        }
+        let cp = cin.div_ceil(32) * 32;
+        let mut packed = vec![0f32; cout * taps * cp];
+        for co in 0..cout {
+            for c in 0..cin {
+                for tap in 0..taps {
+                    packed[(co * taps + tap) * cp + c] = w[(co * cin + c) * taps + tap];
+                }
+            }
+        }
+        self.vec_f16_rounded(&packed)
+    }
+
     fn attention_rows_full_out_len(&self, rows: usize, n_h: usize, head_dim: usize, kv_len: usize) -> usize {
         // the tensor cores' kernel writes its rows padded to 32 and keeps nothing else there
         if rows >= 16 && matches!(head_dim, 64 | 128 | 256) && self.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
@@ -2880,7 +3040,7 @@ impl Recorder<'_> {
     /// ([`crate::shaders::coop_tiled_f16`]), split along k as given (else as chosen). False where the device has no
     /// cooperative matrices.
     pub(crate) fn matmul_f16_coop(&mut self, w: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, m: usize, split: Option<u32>) -> bool {
-        if !self.gpu().device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) || k % 4 != 0 {
+        if !self.gpu().device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) || k % 4 != 0 || m.div_ceil(crate::shaders::COOP_TILE as usize) > 65535 {
             return false;
         }
         let x16 = self.x16_tiled(x, m, k);
@@ -3042,6 +3202,20 @@ impl ChainRecorder for Recorder<'_> {
         self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(out), &[n as u32, eps.to_bits(), 0, r], (r.min(65535), r.div_ceil(65535), 1));
     }
 
+    fn rmsnorm_silu_rows(&mut self, x: &DeviceVec, w: &DeviceVec, out: &DeviceVec, rows: usize, eps: f32) {
+        assert!(rows > 0 && x.len % rows == 0 && w.len >= x.len / rows && out.len >= x.len, "chain: rmsnorm and SiLU of {rows} rows of {}", x.len);
+        let n = x.len / rows;
+        let silu = |body: &str| {
+            let at = "y4[at + i] = x4[at + i] * inv * w4[wat + i];";
+            assert_eq!(body.matches(at).count(), 1, "the norm's store");
+            body.replace(at, "let v = x4[at + i] * inv * w4[wat + i];\n        y4[at + i] = v / (vec4<f32>(1.0) + exp(-v));")
+        };
+        assert!(n % 4 == 0, "chain: rmsnorm and SiLU of rows {n} long (a multiple of 4)");
+        let pipeline = self.gpu().named_pipeline("chain-rmsnorm-silu-rows4", || silu(RMSNORM_ROWS4));
+        let r = rows as u32;
+        self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(out), &[n as u32, eps.to_bits(), 0, r], (r.min(65535), r.div_ceil(65535), 1));
+    }
+
     fn add_rmsnorm_rows(&mut self, x: &DeviceVec, y: &DeviceVec, w: &DeviceVec, out: &DeviceVec, rows: usize, eps: f32) {
         let n = x.len / rows.max(1);
         if rows == 0 || n % 4 != 0 || n * rows != x.len || y.len < x.len || w.len < n || out.len < x.len || Arc::ptr_eq(&x.inner, &out.inner) {
@@ -3199,6 +3373,72 @@ impl ChainRecorder for Recorder<'_> {
         self.dispatch_wide("chain-add-gated-rows", ADD_GATED_ROWS, [buffer(y), buffer(mods), &d, &d, &d, &d, buffer(x), &drw], &[n as u32, rows as u32, gate_at as u32, tanh as u32], grid(((rows * n) as u32).div_ceil(256)));
     }
 
+    fn conv_rows(&mut self, w: &DeviceVec, b: &DeviceVec, cout: usize, cin: usize, k: usize, x: &DeviceVec, h: usize, wd: usize, y: &DeviceVec) {
+        let cp = cin.div_ceil(32) * 32;
+        let m = h * wd;
+        let taps = k * k;
+        assert!(matches!(k, 1 | 3) && m > 0 && w.len * 2 >= cout * taps * cp && b.len >= cout && x.len >= m * cin && y.len >= m * cout, "chain: a {k}x{k} convolution of {h}x{wd} pixels, {cin} channels to {cout}");
+        let d = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        // the input as f16, each pixel's channels padded to 32's: once for every convolution that reads it until
+        // something writes `x` (kept with the matmuls' tiled copies, a width of its own)
+        let key = cp | 1 << 31;
+        let xb = buffer(x).clone();
+        let x16 = match self.x16.iter().find(|(b, rows, width, _)| *b == xb && *rows == m && *width == key) {
+            Some((.., v)) => v.clone(),
+            None => {
+                // `x`'s scale for f16 (its largest within 16,384) set on the device, then the copy scaled; the scale kept
+                // beside the copy (a width of its own) for the sums' way back
+                let range = self.scratch(4);
+                let len = (m * cin) as u32;
+                self.dispatch_wide("chain-f16-range-clear", F16_RANGE_CLEAR, [&d, &d, &d, &d, &d, &d, buffer(&range), &drw], &[0], (1, 1, 1));
+                self.dispatch_wide("chain-f16-range-max", F16_RANGE_MAX, [buffer(x), &d, &d, &d, &d, &d, buffer(&range), &drw], &[len], grid(len.div_ceil(256)));
+                self.dispatch_wide("chain-f16-range-set", F16_RANGE_SET, [&d, &d, &d, &d, &d, &d, buffer(&range), &drw], &[0], (1, 1, 1));
+                let v = self.scratch(m * cp / 2);
+                let conv = self.gpu().named_pipeline("chain-x-f16-padded", || X_F16_PADDED.to_string());
+                let words = (m * cp / 2) as u32;
+                self.dispatch_kept(&conv, buffer(&range), buffer(x), buffer(&v), &[cin as u32, cp as u32, m as u32], grid(words.div_ceil(256)));
+                self.x16.push((xb.clone(), m, key, v.clone()));
+                self.x16.push((xb, m, key ^ (3 << 30), range));
+                v
+            }
+        };
+        let xb = buffer(x).clone();
+        let range = self.x16.iter().find(|(b, rows, width, _)| *b == xb && *rows == m && *width == key ^ (3 << 30)).map(|(.., v)| v.clone()).expect("a convolution's input's scale beside its copy");
+        let tile = crate::shaders::COOP_TILE;
+        let pipeline = if taps == 9 { self.gpu().named_pipeline("chain-coop-conv3x3", || crate::shaders::coop_conv(9)) } else { self.gpu().named_pipeline("chain-coop-conv1x1", || crate::shaders::coop_conv(1)) };
+        let kk = taps * cp;
+        let tiles = (cout as u32).div_ceil(tile) * (m as u32).div_ceil(tile);
+        let (splits, out, parts) = self.coop_parts(tiles, kk, m, cout, y, None);
+        let words = [kk as u32, cout as u32, m as u32, 0, cout as u32, wd as u32, splits, h as u32];
+        self.dispatch_kept(&pipeline, buffer(w), buffer(&x16), &out, &words, ((cout as u32).div_ceil(tile), (m as u32).div_ceil(tile), splits));
+        self.coop_sum(parts, m, cout, y, splits);
+        // the sums back to x's range, and the bias
+        self.dispatch_wide("chain-unscale-bias-rows", UNSCALE_BIAS_ROWS, [buffer(b), buffer(&range), &d, &d, &d, &d, buffer(y), &drw], &[cout as u32, m as u32], grid(((m * cout) as u32).div_ceil(256)));
+    }
+
+    fn add_bias_rows(&mut self, y: &DeviceVec, b: &DeviceVec, rows: usize, n: usize) {
+        assert!(y.len >= rows * n && b.len >= n, "chain: a bias on {rows} rows of {n}");
+        let d = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        self.dispatch_wide("chain-add-bias-rows", ADD_BIAS_ROWS, [buffer(b), &d, &d, &d, &d, &d, buffer(y), &drw], &[n as u32, rows as u32], grid(((rows * n) as u32).div_ceil(256)));
+    }
+
+    fn upsample2x_rows(&mut self, x: &DeviceVec, out: &DeviceVec, h: usize, w: usize, c: usize) {
+        assert!(x.len >= h * w * c && out.len >= 4 * h * w * c, "chain: upsampling {h}x{w} pixels of {c}");
+        let d = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        self.dispatch_wide("chain-upsample2x-rows", UPSAMPLE2X_ROWS, [buffer(x), &d, &d, &d, &d, &d, buffer(out), &drw], &[c as u32, h as u32, w as u32], grid(((4 * h * w * c) as u32).div_ceil(256)));
+    }
+
+    fn shuffle_up_add_rows(&mut self, x: &DeviceVec, out: &DeviceVec, h: usize, w: usize, cin: usize, cout: usize, ft: usize) {
+        let repeats = cout * ft * 4 / cin.max(1);
+        assert!(ft > 0 && repeats > 0 && repeats * cin == cout * ft * 4 && x.len >= h * w * cin && out.len >= 4 * h * w * cout, "chain: an upsampling shortcut of {cin} channels to {cout}");
+        let d = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        self.dispatch_wide("chain-shuffle-up-add-rows", SHUFFLE_UP_ADD_ROWS, [buffer(x), &d, &d, &d, &d, &d, buffer(out), &drw], &[cin as u32, cout as u32, ft as u32, repeats as u32, h as u32, w as u32], grid(((4 * h * w * cout) as u32).div_ceil(256)));
+    }
+
     fn gelu(&mut self, x: &DeviceVec, out: &DeviceVec, len: usize) {
         assert!(x.len >= len && out.len >= len, "chain: a GELU of {len}");
         let pipeline = self.named("chain-gelu", GELU);
@@ -3239,7 +3479,9 @@ impl ChainRecorder for Recorder<'_> {
     }
 
     fn matmul_f16_rows(&mut self, w: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize) {
-        assert!(k % 2 == 0 && w.len * 2 >= n * k && x.len >= rows * k && y.len >= rows * n && n <= 65535 && rows <= 65535, "chain: an f16 matmul [{n}, {k}] of {rows} rows");
+        assert!(k % 2 == 0 && w.len * 2 >= n * k && x.len >= rows * k && y.len >= rows * n, "chain: an f16 matmul [{n}, {k}] of {rows} rows");
+        // (the tensor cores take a million rows, a grid's 65,535 tiles; the other kernels a grid's 65,535 rows)
+        assert!(n <= 65535 && (rows <= 65535 || self.gpu().device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)), "chain: an f16 matmul [{n}, {k}] of {rows} rows");
         if rows == 1 {
             // a long row a workgroup (as the f32 one sums it); short ones eight threads each, 32 a workgroup
             if k >= 2048 && k % 4 == 0 {
@@ -4320,6 +4562,91 @@ mod tests {
         assert_eq!(back, w.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect::<Vec<_>>());
         assert!(b.vec_f16_rounded(&[1.0, 70000.0]).is_none(), "past f16's range");
         assert!(b.vec_f16_rounded(&[1.0, f32::NAN]).is_none(), "not a number");
+    }
+
+    /// A VAE's ops as the host computes them: 3x3 and 1x1 convolutions on the tensor cores with their bias (channels
+    /// not of 32 and of 32, an image not of the tile, inputs past f16's range: a VAE's reach 230,000), the nearest
+    /// upsampling, and Wan's shuffled shortcut (one frame and two).
+    #[test]
+    fn a_vaes_ops_are_the_hosts() {
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        let mut r = rng(31);
+        for (cin, cout, h, w, k, big) in [(20usize, 36usize, 9usize, 13usize, 3usize, 1f32), (64, 160, 16, 16, 3, 1.0), (144, 4, 5, 7, 3, 1.0), (48, 40, 11, 6, 1, 1.0), (32, 24, 7, 9, 3, 300_000.0), (40, 8, 6, 5, 1, 300_000.0)] {
+            let taps = k * k;
+            let wt: Vec<f32> = (0..cout * cin * taps).map(|_| half::f16::from_f32(r() * 0.2).to_f32()).collect();
+            let x: Vec<f32> = (0..h * w * cin).map(|_| half::f16::from_f32(r()).to_f32() * big).collect();
+            let bias: Vec<f32> = (0..cout).map(|_| r()).collect();
+            let Some(wd) = b.conv_weights(&wt, cout, cin, k) else { return };
+            let (xd, yd, bd) = (b.vec(x.len()), b.vec(h * w * cout), b.vec(cout));
+            DeviceChain::upload(&b, &xd, &x);
+            DeviceChain::upload(&b, &bd, &bias);
+            let mut rec = b.begin();
+            rec.conv_rows(&wd, &bd, cout, cin, k, &xd, h, w, &yd);
+            rec.read(&yd);
+            let got = rec.finish().pop().unwrap();
+            let off = (k / 2) as isize;
+            for py in 0..h {
+                for px in 0..w {
+                    for co in 0..cout {
+                        let mut want = bias[co] as f64;
+                        for c in 0..cin {
+                            for ky in 0..k {
+                                for kx in 0..k {
+                                    let (iy, ix) = (py as isize + ky as isize - off, px as isize + kx as isize - off);
+                                    if iy >= 0 && ix >= 0 && (iy as usize) < h && (ix as usize) < w {
+                                        want += wt[((co * cin + c) * k + ky) * k + kx] as f64 * x[(iy as usize * w + ix as usize) * cin + c] as f64;
+                                    }
+                                }
+                            }
+                        }
+                        let g = got[(py * w + px) * cout + co] as f64;
+                        assert!((g - want).abs() <= 1e-3 * (big as f64 + want.abs()), "{k}x{k} conv {cin}->{cout} (inputs to {big}) at ({py}, {px}) channel {co}: {g} against {want}");
+                    }
+                }
+            }
+        }
+        let (h, w, c) = (3usize, 5usize, 6usize);
+        let x: Vec<f32> = (0..h * w * c).map(|_| r()).collect();
+        let (xd, yd) = (b.vec(x.len()), b.vec(4 * x.len()));
+        DeviceChain::upload(&b, &xd, &x);
+        let mut rec = b.begin();
+        rec.upsample2x_rows(&xd, &yd, h, w, c);
+        rec.read(&yd);
+        let got = rec.finish().pop().unwrap();
+        for oy in 0..2 * h {
+            for ox in 0..2 * w {
+                for ch in 0..c {
+                    assert_eq!(got[(oy * 2 * w + ox) * c + ch], x[((oy / 2) * w + ox / 2) * c + ch], "upsampled ({oy}, {ox}) {ch}");
+                }
+            }
+        }
+        for (cin, cout, ft) in [(8usize, 8usize, 2usize), (8, 4, 1), (12, 6, 2)] {
+            let repeats = cout * ft * 4 / cin;
+            let x: Vec<f32> = (0..h * w * cin).map(|_| r()).collect();
+            let base: Vec<f32> = (0..4 * h * w * cout).map(|_| r()).collect();
+            let (xd, yd) = (b.vec(x.len()), b.vec(base.len()));
+            DeviceChain::upload(&b, &xd, &x);
+            DeviceChain::upload(&b, &yd, &base);
+            let mut rec = b.begin();
+            rec.shuffle_up_add_rows(&xd, &yd, h, w, cin, cout, ft);
+            rec.read(&yd);
+            let got = rec.finish().pop().unwrap();
+            // as the host's: repeat each channel, view as (cout, ft, 2, 2), keep the last frame, shuffle into pixels
+            for co in 0..cout {
+                for a in 0..2 {
+                    for bb in 0..2 {
+                        for y in 0..h {
+                            for xx in 0..w {
+                                let e = ((co * ft + ft - 1) * 2 + a) * 2 + bb;
+                                let ci = e / repeats;
+                                let o = ((2 * y + a) * 2 * w + 2 * xx + bb) * cout + co;
+                                assert_eq!(got[o], base[o] + x[(y * w + xx) * cin + ci], "shuffled {cin}->{cout} ft {ft} at {o}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Full (unmasked) attention as the host computes it: every query over all of a text prefix's positions and the

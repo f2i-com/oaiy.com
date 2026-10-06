@@ -11,6 +11,8 @@ pub mod text;
 pub mod transformer;
 #[cfg(feature = "webgpu")]
 pub mod qwen_wgpu;
+#[cfg(feature = "webgpu")]
+pub mod vae_wgpu;
 pub mod vae;
 pub mod vision;
 pub mod weights;

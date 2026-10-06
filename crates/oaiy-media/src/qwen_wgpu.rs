@@ -206,6 +206,13 @@ impl WgpuTransformer {
         &self.lora_notes
     }
 
+    /// Let go of a step's vectors and what the device keeps for the next (some 10 GB at 1024x1024 past the weights; the
+    /// VAE's decode wants the room), made again by the next step.
+    pub fn release_scratch(&mut self) {
+        self.scratch = None;
+        self.gpu.release_cached();
+    }
+
     fn vec(&self, len: usize) -> DeviceVec {
         self.gpu.vec(len.max(1))
     }

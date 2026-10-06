@@ -932,11 +932,7 @@ DECODE_REGS
         let b = s0;
         LOAD_BLOCK
         STEP_LOAD
-        let xb = xo + b * xs;
-        xr0 = x16[xb];
-        xr1 = x16[xb + 1u];
-        xr2 = x16[xb + 2u];
-        xr3 = x16[xb + 3u];
+X_LOAD
     }
     {
         let b = s0;
@@ -962,11 +958,7 @@ DECODE_REGS
             LOAD_BLOCK
         }
         STEP_LOAD
-        let xb = xo + b * xs;
-        xr0 = x16[xb];
-        xr1 = x16[xb + 1u];
-        xr2 = x16[xb + 2u];
-        xr3 = x16[xb + 3u];
+X_LOAD
         let cur = (b0 % 2u) * BUF4;
         // (every index and stride a `let` of its own: naga's SPIR-V wants a cooperative load's and store's operands
         // emitted before them); k's two halves of 16 written out
@@ -1291,6 +1283,37 @@ const COOP_F16_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
             for (var i = 0u; i < 4u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }
         }"#;
 
+/// [`COOP_KERNEL`]'s tokens' loads of a step `b`: a thread's 16 of its token's 32 from the tiled copy
+/// ([`X_F16_TILED`]).
+const COOP_X_TILED: &str = r#"        let xb = xo + b * xs;
+        xr0 = x16[xb];
+        xr1 = x16[xb + 1u];
+        xr2 = x16[xb + 2u];
+        xr3 = x16[xb + 3u];"#;
+
+/// A 3x3 convolution's tokens' loads for [`coop_conv3x3`]: the tokens an image's pixels (`p.m` of them, rows of
+/// `p.row_bytes`, `p._pad1` rows), its input `x16` f16 channels-last with each pixel's channels padded to 32 (`p.k / 9`
+/// of them); step `b` tap `b / cs` (`3 dy + dx`) and channels `32 (b % cs)..` of it, a thread's 16 of them from the
+/// pixel `(y + dy - 1, x + dx - 1)`, zeros past the image's edge.
+const COOP_X_CONV3X3: &str = r#"        let ctap = b / cs;
+        let cpix = min(t0 + lr, p.m - 1u);
+        let cy = cpix / p.row_bytes + ctap / 3u;
+        let cx = cpix % p.row_bytes + ctap % 3u;
+        let cin = cy >= 1u && cy <= p._pad1 && cx >= 1u && cx <= p.row_bytes;
+        let cb = ((select(0u, cy - 1u, cin) * p.row_bytes + select(0u, cx - 1u, cin)) * cs * 32u + (b % cs) * 32u + lh * 16u) / 4u;
+        xr0 = select(vec4<f16>(), x16[cb], cin);
+        xr1 = select(vec4<f16>(), x16[cb + 1u], cin);
+        xr2 = select(vec4<f16>(), x16[cb + 2u], cin);
+        xr3 = select(vec4<f16>(), x16[cb + 3u], cin);"#;
+
+/// A 1x1 convolution's tokens' loads for [`coop_conv`]: as [`COOP_X_CONV3X3`]'s with one tap, the pixel's own.
+const COOP_X_CONV1X1: &str = r#"        let cpix = min(t0 + lr, p.m - 1u);
+        let cb = (cpix * cs * 32u + (b % cs) * 32u + lh * 16u) / 4u;
+        xr0 = x16[cb];
+        xr1 = x16[cb + 1u];
+        xr2 = x16[cb + 2u];
+        xr3 = x16[cb + 3u];"#;
+
 /// A prompt's matmul on the tensor cores (WGSL's cooperative matrices, f16 into f32): a workgroup a tile of
 /// [`COOP_TILE`] weight rows by as many tokens, `k` 32 at a time; each step the tile's weights decoded to f16 and its
 /// tokens' rows (as [`X_F16_TILED`] gives them, padded to the tile) copied into the workgroup's memory, the next step's
@@ -1309,7 +1332,7 @@ pub fn coop_tiled(dtype: GgmlType) -> Option<String> {
         GgmlType::Q8_0 => ("@group(0) @binding(0) var<storage, read> w: array<u32>;", COOP_Q6K_HELPERS, "", "", COOP_Q8_0_STEP),
         _ => return None,
     };
-    Some(coop_source(binding, helpers, regs, load, "", step))
+    Some(coop_source(binding, helpers, regs, load, "", step, COOP_X_TILED))
 }
 
 /// [`coop_tiled`] for f16 weights (`[n, k]` two to a word, `k` of 4: a last step short of 32 padded with zeros), its
@@ -1317,7 +1340,18 @@ pub fn coop_tiled(dtype: GgmlType) -> Option<String> {
 /// bytes they read, and f16 windows of 32 steps took a chained prompt's logits from 0.9986 of the host's (cosine) to
 /// 0.9967 (0.9989 in f32).
 pub fn coop_tiled_f16() -> String {
-    f32_sums(&coop_source("@group(0) @binding(0) var<storage, read> w4: array<vec4<f16>>;", "", COOP_F16_REGS, "", COOP_F16_LOAD, COOP_F16_STEP))
+    f32_sums(&coop_source("@group(0) @binding(0) var<storage, read> w4: array<vec4<f16>>;", "", COOP_F16_REGS, "", COOP_F16_LOAD, COOP_F16_STEP, COOP_X_TILED))
+}
+
+/// A `taps` (1 or 9) convolution (stride 1, padding 1 for 3x3) on the tensor cores: [`coop_tiled_f16`]'s kernel with
+/// its tokens an image's pixels, their rows gathered as [`COOP_X_CONV3X3`] (an implicit im2col) or
+/// [`COOP_X_CONV1X1`] reads them; the weights `[cout, taps cin_p]` f16, each output's taps in turn, a tap's channels
+/// padded to `cin_p` (32's). `Params`: k `taps cin_p`, n `cout`, m the pixels, rows `cout`, `row_bytes` the image's
+/// width, `_pad1` its height.
+pub fn coop_conv(taps: usize) -> String {
+    let (x_load, per) = if taps == 9 { (COOP_X_CONV3X3, 288) } else { (COOP_X_CONV1X1, 32) };
+    let regs = format!("{COOP_F16_REGS}\n    // the steps a tap\n    let cs = p.k / {per}u;");
+    f32_sums(&coop_source("@group(0) @binding(0) var<storage, read> w4: array<vec4<f16>>;", "", &regs, "", COOP_F16_LOAD, COOP_F16_STEP, x_load))
 }
 
 /// A [`COOP_KERNEL`] source with its multiply-adds into the f32 sums themselves (no f16 windows, nothing folded).
@@ -1338,7 +1372,7 @@ fn f32_sums(src: &str) -> String {
 
 /// [`COOP_KERNEL`] with a type's weights put in: their binding, helpers, registers, a block's loads (every 8 steps), a
 /// step's (beside its tokens'), and a step's decode into the workgroup's memory.
-fn coop_source(binding: &str, helpers: &str, regs: &str, load: &str, step_load: &str, step: &str) -> String {
+fn coop_source(binding: &str, helpers: &str, regs: &str, load: &str, step_load: &str, step: &str, x_load: &str) -> String {
     let frags = [("c00", 0u32, 0u32), ("c01", 0, 16), ("c02", 0, 32), ("c03", 0, 48), ("c10", 16, 0), ("c11", 16, 16), ("c12", 16, 32), ("c13", 16, 48)];
     let edges: String = frags.iter().map(|(cf, fr, ft)| COOP_EDGE.replace("CF", cf).replace("FR", &format!("{fr}u")).replace("FT", &format!("{ft}u"))).collect();
     let fold = std::env::var("OAIY_COOP_FOLD").ok().and_then(|v| v.parse::<u32>().ok()).filter(|&f| f > 0).unwrap_or(COOP_FOLD);
@@ -1349,6 +1383,7 @@ fn coop_source(binding: &str, helpers: &str, regs: &str, load: &str, step_load: 
         .replace("DECODE_REGS", regs)
         .replace("LOAD_BLOCK", load)
         .replace("STEP_LOAD", step_load)
+        .replace("X_LOAD", x_load)
         .replace("DECODE_STEP", step)
         .replace("EDGE_STORES", &edges)
 }
@@ -1369,7 +1404,7 @@ pub(crate) fn coop_tiled_marked(dtype: GgmlType) -> Option<String> {
     // (the first is the prologue's, kept; the second the loop's, marked)
     let marked = marked.replacen("SECOND_STEP", "        DECODE_STEP\n        let xa = buf + lr * S4 + lh * 4u;\n        xt[xa] = xr0;", 1);
     let marked = marked.replacen("SECOND_STEP", "        // DECODE BEGIN\n        DECODE_STEP\n        // DECODE END\n        let xa = buf + lr * S4 + lh * 4u;\n        xt[xa] = xr0;", 1);
-    Some(marked.replace("FOLDu", &format!("{COOP_FOLD}u")).replace("WEIGHTS_BINDING", binding).replace("DECODE_HELPERS", helpers).replace("DECODE_REGS", regs).replace("LOAD_BLOCK", load).replace("STEP_LOAD", "").replace("DECODE_STEP", step).replace("EDGE_STORES", &edges))
+    Some(marked.replace("FOLDu", &format!("{COOP_FOLD}u")).replace("WEIGHTS_BINDING", binding).replace("DECODE_HELPERS", helpers).replace("DECODE_REGS", regs).replace("LOAD_BLOCK", load).replace("STEP_LOAD", "").replace("X_LOAD", COOP_X_TILED).replace("DECODE_STEP", step).replace("EDGE_STORES", &edges))
 }
 
 /// [`rb_kernel`] for a measurement of its shapes.
