@@ -141,13 +141,14 @@ pub struct WgpuTransformer {
     scratch: Option<Scratch>,
 }
 
-/// `name`'s weight `[n, k]` on `gpu`: a GGUF's K-quant blocks as they are where the tensor cores take them (rows a
-/// multiple of 256 long; OAIY_WEBGPU_DEQUANTIZE f16 throughout), each adapter's factors beside them; else f16, each
-/// adapter's factors merged in (`W + B A`).
+/// `name`'s weight `[n, k]` on `gpu`: a GGUF's K-quant blocks as they are (rows a multiple of 256 long; the tensor
+/// cores' kernels, else the f32 ones: without tensor cores 1024x1024's steps 2.98 s where f16's 2.80, 10.8 GB where
+/// some 14; OAIY_WEBGPU_DEQUANTIZE f16 throughout), each adapter's factors beside them; else f16, each adapter's
+/// factors merged in (`W + B A`).
 fn matrix(w: &mut Weights, lora: &mut Loras, gpu: &ggml_rs_wgpu::WgpuBackend, name: &str) -> Result<Mat> {
     let key = format!("{name}.weight");
     let shape = w.shape(&key)?;
-    let quant = w.ggml_dtype(&key).and_then(coop_type).filter(|_| gpu.tensor_cores() && std::env::var_os("OAIY_WEBGPU_DEQUANTIZE").is_none());
+    let quant = w.ggml_dtype(&key).and_then(coop_type).filter(|_| std::env::var_os("OAIY_WEBGPU_DEQUANTIZE").is_none());
     if let (Some(g), &[n, k]) = (quant, shape.as_slice()) {
         if let (0, Some(Raw::Ggml(_, bytes))) = (k % 256, w.raw(&key)?) {
             let size = bytes.len();

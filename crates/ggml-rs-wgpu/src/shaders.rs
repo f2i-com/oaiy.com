@@ -214,6 +214,7 @@ pub fn source_many(dtype: GgmlType) -> Option<String> {
         GgmlType::Q4_K => return Some(Q4K_TILED.to_string()),
         GgmlType::Q5_K => return Some(Q5K_TILED.to_string()),
         GgmlType::Q6_K => return Some(Q6K_TILED.to_string()),
+        GgmlType::Q8_0 => return Some(Q80_TILED.to_string()),
         _ => {}
     }
     let (elems, bytes, dequant) = layout(dtype)?;
@@ -1900,6 +1901,119 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         }
         workgroupBarrier();
         for (var kk = 0u; kk < 64u; kk++) {
+            let wv = ws[kk * 16u + tx];
+            let xv = xs[kk * 16u + ty];
+            acc0 += xv.x * wv;
+            acc1 += xv.y * wv;
+            acc2 += xv.z * wv;
+            acc3 += xv.w * wv;
+        }
+        workgroupBarrier();
+    }
+    let row0 = r0 + tx * 4u;
+    let accs = array<vec4<f32>, 4>(acc0, acc1, acc2, acc3);
+    for (var i = 0u; i < 4u; i++) {
+        let tok = t0 + ty * 4u + i;
+        if (tok < p.m) {
+            for (var b = 0u; b < 4u; b++) {
+                if (row0 + b < p.rows) { y[tok * p.n + p.row0 + row0 + b] = accs[i][b]; }
+            }
+        }
+    }
+}
+"#;
+
+/// Q8_0's tiled kernel for a prompt without tensor cores: as [`Q4K_TILED`] (64 tokens by 64 weight rows a workgroup,
+/// every thread decoding its part of a step: a row's quarter of a block, 8 values) with a block of 32 a step, so its
+/// tiles take 16 KB of a workgroup's memory (WebGPU's portable limit; [`MANY_BODY`]'s 18, its decode a thread a row
+/// into an array in memory while the rest waited: LTX's steps without tensor cores 55% slower than f16's). A block's
+/// 34 bytes (an f16 scale, then 32 int8) start two bytes off a word in every other one.
+const Q80_TILED: &str = r#"
+struct Params {
+    k: u32,
+    n: u32,
+    m: u32,
+    row0: u32,
+    rows: u32,
+    row_bytes: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+@group(0) @binding(0) var<storage, read> w: array<u32>;
+@group(0) @binding(1) var<storage, read> x4: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> p: Params;
+
+// k-major: the step's k index kk, then tokens (xs) or rows (ws) four to a vec4
+var<workgroup> xs: array<vec4<f32>, 512>;
+var<workgroup> ws: array<vec4<f32>, 512>;
+
+// A word's four int8, low byte first.
+fn i8x4(v: u32) -> vec4<f32> {
+    return vec4<f32>(f32(bitcast<i32>(v << 24u) >> 24u), f32(bitcast<i32>(v << 16u) >> 24u), f32(bitcast<i32>(v << 8u) >> 24u), f32(bitcast<i32>(v) >> 24u));
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let r0 = wg.x * 64u;
+    let t0 = wg.y * 64u;
+    let tx = li & 15u;
+    let ty = li >> 4u;
+    // what this thread loads: x's token li / 4, its 8 of the step's k at (li % 4) * 8; and decodes: row li / 4's
+    // quarter li % 4 of the step's block
+    let xt = li / 4u;
+    let xq = li % 4u;
+    let wr = li / 4u;
+    let wq = li % 4u;
+    var acc0 = vec4<f32>(0.0);
+    var acc1 = vec4<f32>(0.0);
+    var acc2 = vec4<f32>(0.0);
+    var acc3 = vec4<f32>(0.0);
+    let k4 = p.k / 4u;
+    let steps = p.k / 32u;
+    let r = r0 + wr;
+    for (var s = 0u; s < steps; s++) {
+        let tok = t0 + xt;
+        for (var i = 0u; i < 2u; i++) {
+            var v = vec4<f32>(0.0);
+            if (tok < p.m) { v = x4[tok * k4 + s * 8u + xq * 2u + i]; }
+            let kk = xq * 8u + i * 4u;
+            xs[kk * 16u + xt / 4u][xt % 4u] = v.x;
+            xs[(kk + 1u) * 16u + xt / 4u][xt % 4u] = v.y;
+            xs[(kk + 2u) * 16u + xt / 4u][xt % 4u] = v.z;
+            xs[(kk + 3u) * 16u + xt / 4u][xt % 4u] = v.w;
+        }
+        var lo = vec4<f32>(0.0);
+        var hi = vec4<f32>(0.0);
+        if (r < p.rows) {
+            // the block's scale, then this quarter's 8 int8 (two bytes off a word where the block starts two off)
+            let at = r * p.row_bytes + s * 34u;
+            let dw = w[at / 4u];
+            let d = select(unpack2x16float(dw).x, unpack2x16float(dw).y, at % 4u == 2u);
+            let q = at + 2u + wq * 8u;
+            let a = w[q / 4u];
+            let b = w[q / 4u + 1u];
+            var w0 = a;
+            var w1 = b;
+            if (q % 4u == 2u) {
+                let c = w[q / 4u + 2u];
+                w0 = (a >> 16u) | (b << 16u);
+                w1 = (b >> 16u) | (c << 16u);
+            }
+            lo = d * i8x4(w0);
+            hi = d * i8x4(w1);
+        }
+        let kw = wq * 8u;
+        ws[kw * 16u + wr / 4u][wr % 4u] = lo.x;
+        ws[(kw + 1u) * 16u + wr / 4u][wr % 4u] = lo.y;
+        ws[(kw + 2u) * 16u + wr / 4u][wr % 4u] = lo.z;
+        ws[(kw + 3u) * 16u + wr / 4u][wr % 4u] = lo.w;
+        ws[(kw + 4u) * 16u + wr / 4u][wr % 4u] = hi.x;
+        ws[(kw + 5u) * 16u + wr / 4u][wr % 4u] = hi.y;
+        ws[(kw + 6u) * 16u + wr / 4u][wr % 4u] = hi.z;
+        ws[(kw + 7u) * 16u + wr / 4u][wr % 4u] = hi.w;
+        workgroupBarrier();
+        for (var kk = 0u; kk < 32u; kk++) {
             let wv = ws[kk * 16u + tx];
             let xv = xs[kk * 16u + ty];
             acc0 += xv.x * wv;

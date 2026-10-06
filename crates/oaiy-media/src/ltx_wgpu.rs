@@ -43,11 +43,12 @@ impl Values {
     }
 }
 
-/// A dense weight (`[n, k]`) on `gpu`: Q8_0 where the tensor cores take its rows (a multiple of 256 long), else f16
-/// (f16 throughout with OAIY_LTX_WEBGPU_WEIGHTS=f16: a card with room for it).
+/// A dense weight (`[n, k]`) on `gpu`: Q8_0 where its rows are a multiple of 256 long (the tensor cores' kernels, else
+/// the f32 tiled one: without tensor cores a 512x320 clip's steps 10.3 s where f16's 11.5, 14.4 GB where 29.5), else
+/// f16 (f16 throughout with OAIY_LTX_WEBGPU_WEIGHTS=f16).
 fn dense(gpu: &ggml_rs_wgpu::WgpuBackend, key: &str, values: Values, n: usize, k: usize) -> Result<Weight> {
     let f16 = std::env::var("OAIY_LTX_WEBGPU_WEIGHTS").is_ok_and(|v| v.eq_ignore_ascii_case("f16"));
-    if gpu.tensor_cores() && k % 256 == 0 && !f16 {
+    if k % 256 == 0 && !f16 {
         let bytes = match values {
             Values::Bf16(b) => q8_0_bf16(&b),
             Values::F32(v) => q8_0(&v),

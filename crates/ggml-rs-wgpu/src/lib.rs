@@ -161,6 +161,15 @@ struct Watch {
     stamp: AtomicU64,
 }
 
+/// The bytes of a WGSL module's workgroup variables, as its layout has them (None: it does not parse here).
+fn workgroup_bytes(source: &str) -> Option<u64> {
+    use wgpu::naga;
+    let module = naga::front::wgsl::parse_str(source).ok()?;
+    let mut layouter = naga::proc::Layouter::default();
+    layouter.update(module.to_ctx()).ok()?;
+    Some(module.global_variables.iter().filter(|(_, g)| g.space == naga::AddressSpace::WorkGroup).map(|(_, g)| layouter[g.ty].size as u64).sum())
+}
+
 /// How long a watched call may go without one returning.
 const HUNG: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -513,16 +522,29 @@ impl Gpu {
         chunks
     }
 
+    /// A kernel's module, its workgroup memory checked first where the device has less than 48 KB of it (Apple's 32,
+    /// OAIY_PORTABLE_LIMITS's 16): wgpu does not check it, and a kernel past the limit fails where it runs, if its
+    /// driver says at all.
+    fn shader(&self, name: &str, source: String) -> wgpu::ShaderModule {
+        if self.limits.max_compute_workgroup_storage_size < 48 << 10 {
+            if let Some(bytes) = workgroup_bytes(&source) {
+                assert!(
+                    bytes <= self.limits.max_compute_workgroup_storage_size as u64,
+                    "webgpu: kernel {name} takes {bytes} bytes of a workgroup's memory, past this device's {}",
+                    self.limits.max_compute_workgroup_storage_size
+                );
+            }
+        }
+        self.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(name), source: wgpu::ShaderSource::Wgsl(source.into()) })
+    }
+
     fn exl3_pipeline(&self, many: bool) -> Arc<wgpu::ComputePipeline> {
         let mut slots = self.exl3.lock().unwrap_or_else(|p| p.into_inner());
         let slot = &mut slots[many as usize];
         if let Some(p) = slot.as_ref() {
             return Arc::clone(p);
         }
-        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("oaiy-exl3"),
-            source: wgpu::ShaderSource::Wgsl(exl3::shader(many).into()),
-        });
+        let module = self.shader("oaiy-exl3", exl3::shader(many));
         let pipeline = Arc::new(self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("oaiy-exl3"),
             layout: Some(&self.pipeline_layout),
@@ -656,7 +678,7 @@ impl Gpu {
         if let Some(p) = cache.get(name) {
             return Arc::clone(p);
         }
-        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(name), source: wgpu::ShaderSource::Wgsl(source().into()) });
+        let module = self.shader(name, source());
         let pipeline = Arc::new(self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(name),
             layout: Some(layout),
@@ -684,10 +706,7 @@ impl Gpu {
             3 => shaders::source_multi(dtype)?,
             _ => shaders::source(dtype)?,
         };
-        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("oaiy-linear-q"),
-            source: wgpu::ShaderSource::Wgsl(source.into()),
-        });
+        let module = self.shader(&format!("oaiy-linear-q ({dtype:?}, kind {kind})"), source);
         let pipeline = Arc::new(self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("oaiy-linear-q"),
             layout: Some(&self.pipeline_layout),
@@ -886,11 +905,13 @@ impl WgpuBackend {
             pci_bus_id: info.device_pci_bus_id.clone(),
         };
         let mut limits = adapter.limits();
-        if std::env::var_os("OAIY_PORTABLE_LIMITS").is_some() {
-            // a workgroup's memory and invocations as WebGPU's defaults (16 KB, 256): other GPUs' limits (a kernel past
-            // them fails to build), the rest the adapter's
+        if let Some(v) = std::env::var_os("OAIY_PORTABLE_LIMITS") {
+            // a workgroup's memory as given (bytes: Apple's GPUs have 32,768), else WebGPU's default (16 KB), and its
+            // invocations as WebGPU's defaults (256): other GPUs' limits (a kernel past them refused, Gpu::shader), the
+            // rest the adapter's
             let d = wgpu::Limits::default();
-            limits.max_compute_workgroup_storage_size = limits.max_compute_workgroup_storage_size.min(d.max_compute_workgroup_storage_size);
+            let bytes = v.to_str().and_then(|s| s.parse::<u32>().ok()).filter(|&b| b >= 1024).unwrap_or(d.max_compute_workgroup_storage_size);
+            limits.max_compute_workgroup_storage_size = limits.max_compute_workgroup_storage_size.min(bytes);
             limits.max_compute_invocations_per_workgroup = limits.max_compute_invocations_per_workgroup.min(d.max_compute_invocations_per_workgroup);
             limits.max_compute_workgroup_size_x = limits.max_compute_workgroup_size_x.min(d.max_compute_workgroup_size_x);
             limits.max_compute_workgroup_size_y = limits.max_compute_workgroup_size_y.min(d.max_compute_workgroup_size_y);

@@ -8,7 +8,8 @@ description = "WebGPU backend for ggml-rs: quantized matmuls in WGSL on any wgpu
 [dependencies]
 ggml-rs     = { path = "../ggml-rs", version = "0.0.1" }
 ggml-quants = { path = "../ggml-quants", version = "0.0.1" }
-wgpu        = "30"
+# (naga-ir: its WGSL parser, to measure a kernel's workgroup memory, which wgpu does not check against the limit)
+wgpu        = { version = "30", features = ["naga-ir"] }
 pollster    = "0.4"
 # f16 rounding of EXL3 projections' activations, as exllamav3 rounds them.
 half        = { version = "2.4" }
