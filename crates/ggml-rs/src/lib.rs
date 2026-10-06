@@ -20,7 +20,7 @@ pub mod quantized;
 pub mod tensor;
 
 pub use backend::{Backend, RopeType};
-pub use chain::{ChainRecorder, DeltaNet, DeviceChain, DeviceVec};
+pub use chain::{ChainRecorder, DeltaNet, DeviceChain, DeviceVec, RowNorm};
 pub use cpu::CpuBackend;
 pub use quantized::{QuantizedDeviceStorage, QuantizedStorage, QuantizedTensor};
 pub use tensor::{DeviceStorage, Shape, Tensor, TensorError, TensorStorage};

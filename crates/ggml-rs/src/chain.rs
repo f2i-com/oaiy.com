@@ -40,6 +40,17 @@ pub struct DeltaNet {
     pub sigmoid_gate: bool,
 }
 
+/// How [`ChainRecorder::norm_mod_rows`] normalizes each row before its modulation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowNorm {
+    /// None: the modulation alone (an affine of the row).
+    None,
+    /// Over the row's RMS (no centring).
+    Rms,
+    /// A layer norm: centred, over its deviation.
+    Layer,
+}
+
 /// A device that runs a chain of ops on vectors it holds.
 pub trait DeviceChain: Send + Sync {
     /// A zeroed vector of `len`.
@@ -331,8 +342,27 @@ pub trait ChainRecorder {
     /// diffusion transformer's modulated norm, every row by the same modulation.
     #[allow(clippy::too_many_arguments)]
     fn layernorm_mod_rows(&mut self, x: &DeviceVec, out: &DeviceVec, rows: usize, n: usize, mods: &DeviceVec, scale_at: usize, shift_at: Option<usize>, eps: f32) {
-        let _ = (x, out, rows, n, mods, scale_at, shift_at, eps);
-        unimplemented!("a modulated layer norm on this device")
+        self.norm_mod_rows(x, out, rows, n, mods, scale_at, shift_at, RowNorm::Layer, eps)
+    }
+    /// [`Self::layernorm_mod_rows`] with the row's norm as `norm` says (none, an RMS norm, or a layer norm), each row's
+    /// modulation the same.
+    #[allow(clippy::too_many_arguments)]
+    fn norm_mod_rows(&mut self, x: &DeviceVec, out: &DeviceVec, rows: usize, n: usize, mods: &DeviceVec, scale_at: usize, shift_at: Option<usize>, norm: RowNorm, eps: f32) {
+        let _ = (x, out, rows, n, mods, scale_at, shift_at, norm, eps);
+        unimplemented!("a modulated norm on this device")
+    }
+    /// RoPE of `x` (`[rows, heads, head_dim]`) in place over each head's halves (NeoX pairs `(k, k + head_dim / 2)`),
+    /// each (row, head) by its own `table[(r * heads + h) * head_dim..]` (each pair's sine then cosine): LTX's split
+    /// rotary, its frequencies spread over the heads.
+    fn rope_split_rows(&mut self, x: &DeviceVec, rows: usize, heads: usize, head_dim: usize, table: &DeviceVec) {
+        let _ = (x, rows, heads, head_dim, table);
+        unimplemented!("a split rotary on this device")
+    }
+    /// `y[r, h, ..] *= 2 sigmoid(logits[r, h])` for `rows` rows of `heads` heads of `head_dim`: a gated attention's
+    /// per-head gate.
+    fn head_gate_rows(&mut self, y: &DeviceVec, logits: &DeviceVec, rows: usize, heads: usize, head_dim: usize) {
+        let _ = (y, logits, rows, heads, head_dim);
+        unimplemented!("a head gate on this device")
     }
     /// `x[r] += y[r] * g` for each of `rows` rows of `n`, `g` `mods[gate_at..gate_at + n]` or (with `tanh`) its tanh:
     /// a diffusion transformer's gated residual.
@@ -347,7 +377,8 @@ pub trait ChainRecorder {
         unimplemented!("GELU on this device")
     }
     /// [`Self::attention_rows`] with no causal mask: each of `rows` queries over all `kv_len` positions of `kv` (a
-    /// diffusion transformer's image tokens over a text prefix's and their own); `out` as there.
+    /// diffusion transformer's image tokens over a text prefix's and their own, or a video's over a text's: fewer
+    /// positions than queries); `out` [`DeviceChain::attention_rows_full_out_len`] long.
     #[allow(clippy::too_many_arguments)]
     fn attention_rows_full(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, kv_len: usize, scale: f32) {
         let _ = (q, kv, out, rows, n_h, n_kv, head_dim, kv_len, scale);
