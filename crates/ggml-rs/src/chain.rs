@@ -64,6 +64,14 @@ pub trait DeviceChain: Send + Sync {
         let _ = (w, cout, cin, k);
         None
     }
+    /// An NVFP4 weight (`[rows, cols]`: `packed` two E2M1 values a byte, high nibble first, `rows x cols / 2`; `scales`
+    /// one E4M3 a block of 16, row-major `rows x cols / 16`; `global` the tensor's own) for
+    /// [`ChainRecorder::matmul_nvfp4_rows`]: its words, and its scale's vector. None where `cols` is not of 64 or the
+    /// device has no such kernel.
+    fn nvfp4_weights(&self, packed: &[u8], scales: &[u8], global: f32, rows: usize, cols: usize) -> Option<(DeviceVec, DeviceVec)> {
+        let _ = (packed, scales, global, rows, cols);
+        None
+    }
     /// The length [`ChainRecorder::attention_rows_full`]'s `out` takes (the result, then any scratch its kernels
     /// keep there).
     fn attention_rows_full_out_len(&self, rows: usize, n_h: usize, head_dim: usize, kv_len: usize) -> usize {
@@ -353,6 +361,13 @@ pub trait ChainRecorder {
     fn conv_rows(&mut self, w: &DeviceVec, b: &DeviceVec, cout: usize, cin: usize, k: usize, x: &DeviceVec, h: usize, wd: usize, y: &DeviceVec) {
         let _ = (w, b, cout, cin, k, x, h, wd, y);
         unimplemented!("a convolution on this device")
+    }
+    /// `y[r] = W x[r] + b` for `rows` rows of `x` (`[rows, k]`), `W` an NVFP4 weight `[n, k]` as
+    /// [`DeviceChain::nvfp4_weights`] made it (`w` its words, `scale` its scale's vector), `b` its bias (`[n]`).
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_nvfp4_rows(&mut self, w: &DeviceVec, scale: &DeviceVec, b: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize) {
+        let _ = (w, scale, b, n, k, x, y, rows);
+        unimplemented!("NVFP4 on this device")
     }
     /// `y[r * n + i] += b[i]` for each of `rows` rows.
     fn add_bias_rows(&mut self, y: &DeviceVec, b: &DeviceVec, rows: usize, n: usize) {

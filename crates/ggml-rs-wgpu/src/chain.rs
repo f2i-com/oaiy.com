@@ -2285,6 +2285,25 @@ impl DeviceChain for WgpuBackend {
         }
     }
 
+    fn nvfp4_weights(&self, packed: &[u8], scales: &[u8], global: f32, rows: usize, cols: usize) -> Option<(DeviceVec, DeviceVec)> {
+        if cols % 64 != 0 || packed.len() != rows * cols / 2 || scales.len() != rows * cols / 16 || !self.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+            return None;
+        }
+        // a row's nibbles' words, then its scales' (four a word)
+        let (nb, sb) = (cols / 2, cols / 16);
+        let mut words: Vec<f32> = Vec::with_capacity(rows * (nb + sb) / 4);
+        for r in 0..rows {
+            let row = packed[r * nb..(r + 1) * nb].iter().chain(&scales[r * sb..(r + 1) * sb]);
+            let bytes: Vec<u8> = row.copied().collect();
+            words.extend(bytes.chunks_exact(4).map(|c| f32::from_bits(u32::from_le_bytes([c[0], c[1], c[2], c[3]]))));
+        }
+        let w = self.vec(words.len());
+        DeviceChain::upload(self, &w, &words);
+        let s = self.vec(4);
+        DeviceChain::upload(self, &s, &[1.0, global, 0.0, 0.0]);
+        Some((w, s))
+    }
+
     fn vec_f16_rounded(&self, values: &[f32]) -> Option<DeviceVec> {
         use rayon::prelude::*;
         if values.len() % 2 != 0 || values.par_chunks(1 << 16).any(|c| c.iter().any(|v| !v.is_finite() || v.abs() > 65504.0)) {
@@ -3415,6 +3434,22 @@ impl ChainRecorder for Recorder<'_> {
         self.coop_sum(parts, m, cout, y, splits);
         // the sums back to x's range, and the bias
         self.dispatch_wide("chain-unscale-bias-rows", UNSCALE_BIAS_ROWS, [buffer(b), buffer(&range), &d, &d, &d, &d, buffer(y), &drw], &[cout as u32, m as u32], grid(((m * cout) as u32).div_ceil(256)));
+    }
+
+    fn matmul_nvfp4_rows(&mut self, w: &DeviceVec, scale: &DeviceVec, b: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize) {
+        assert!(k % 64 == 0 && w.len >= n * (k / 8 + k / 64) && scale.len >= 2 && b.len >= n && x.len >= rows * k && y.len >= rows * n && rows.div_ceil(crate::shaders::COOP_TILE as usize) <= 65535, "chain: an NVFP4 matmul [{n}, {k}] of {rows} rows");
+        let x16 = self.x16_tiled(x, rows, k);
+        let tile = crate::shaders::COOP_TILE;
+        let pipeline = self.gpu().named_pipeline("chain-coop-nvfp4", crate::shaders::coop_tiled_nvfp4);
+        let tiles = (n as u32).div_ceil(tile) * (rows as u32).div_ceil(tile);
+        let (splits, out, parts) = self.coop_parts(tiles, k, rows, n, y, None);
+        let words = [k as u32, n as u32, rows as u32, 0, n as u32, (k / 8 + k / 64) as u32, splits, 0];
+        self.dispatch_kept(&pipeline, buffer(w), buffer(&x16), &out, &words, ((n as u32).div_ceil(tile), (rows as u32).div_ceil(tile), splits));
+        self.coop_sum(parts, rows, n, y, splits);
+        // the tensor's own scale, and the bias
+        let d = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        self.dispatch_wide("chain-unscale-bias-rows", UNSCALE_BIAS_ROWS, [buffer(b), buffer(scale), &d, &d, &d, &d, buffer(y), &drw], &[n as u32, rows as u32], grid(((rows * n) as u32).div_ceil(256)));
     }
 
     fn add_bias_rows(&mut self, y: &DeviceVec, b: &DeviceVec, rows: usize, n: usize) {
@@ -4644,6 +4679,52 @@ mod tests {
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// An NVFP4 matmul on the tensor cores as the host computes it: E2M1 pairs high nibble first, an E4M3 scale a block
+    /// of 16 (every byte but the NaNs), the tensor's own scale and a bias after the sums; rows of a tile and not.
+    #[test]
+    fn an_nvfp4_matmul_is_the_hosts() {
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        let e2m1 = [0f64, 0.5, 1., 1.5, 2., 3., 4., 6., -0., -0.5, -1., -1.5, -2., -3., -4., -6.];
+        let e4m3 = |v: u8| -> f64 {
+            let (s, e, m) = (if v & 0x80 != 0 { -1.0 } else { 1.0 }, ((v >> 3) & 15) as i32, (v & 7) as f64);
+            s * if e == 0 { m / 8.0 * 2f64.powi(-6) } else { (1.0 + m / 8.0) * 2f64.powi(e - 7) }
+        };
+        let mut seed = 0x1234_5678u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for (n, k, rows, global) in [(160usize, 256usize, 130usize, 0.0123f32), (64, 2048, 9, 3.5), (300, 128, 128, 1.0)] {
+            let packed: Vec<u8> = (0..n * k / 2).map(|_| next() as u8).collect();
+            let scales: Vec<u8> = (0..n * k / 16).map(|_| loop { let v = (next() % 0x78) as u8 | ((next() & 1) as u8) << 7; if v & 0x7f != 0x7f { break v; } }).collect();
+            let x: Vec<f32> = (0..rows * k).map(|_| half::f16::from_f32((next() % 2001) as f32 / 1000.0 - 1.0).to_f32()).collect();
+            let bias: Vec<f32> = (0..n).map(|_| (next() % 2001) as f32 / 1000.0 - 1.0).collect();
+            let Some((wd, sd)) = b.nvfp4_weights(&packed, &scales, global, n, k) else { return };
+            let (xd, yd, bd) = (b.vec(x.len()), b.vec(rows * n), b.vec(n));
+            DeviceChain::upload(&b, &xd, &x);
+            DeviceChain::upload(&b, &bd, &bias);
+            let mut rec = b.begin();
+            rec.matmul_nvfp4_rows(&wd, &sd, &bd, n, k, &xd, &yd, rows);
+            rec.read(&yd);
+            let got = rec.finish().pop().unwrap();
+            let weight = |o: usize, j: usize| -> f64 {
+                let byte = packed[o * k / 2 + j / 2];
+                let code = if j % 2 == 0 { byte >> 4 } else { byte & 15 };
+                e2m1[code as usize] * e4m3(scales[o * k / 16 + j / 16]) * global as f64
+            };
+            for r in 0..rows {
+                for o in 0..n {
+                    let want = bias[o] as f64 + (0..k).map(|j| weight(o, j) * x[r * k + j] as f64).sum::<f64>();
+                    let mag: f64 = (0..k).map(|j| (weight(o, j) * x[r * k + j] as f64).abs()).sum();
+                    let g = got[r * n + o] as f64;
+                    assert!((g - want).abs() <= 1e-5 * mag + 1e-5, "[{n}, {k}] of {rows} rows, row {r} output {o}: {g} against {want}");
                 }
             }
         }

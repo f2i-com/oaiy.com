@@ -641,7 +641,7 @@ fn is_scale(name: &str) -> bool {
 
 /// NVFP4 block scales from the cuBLAS tiled layout (128 x 4 tiles, stored as
 /// 32 x 4 x 4) to row-major `rows x cols`.
-fn untile_scales(tiled: &[u8], rows: usize, cols: usize) -> Result<Vec<u8>> {
+pub(crate) fn untile_scales(tiled: &[u8], rows: usize, cols: usize) -> Result<Vec<u8>> {
     if rows % 128 != 0 || cols % 4 != 0 || tiled.len() != rows * cols {
         candle_core::bail!("NVFP4 scales of {rows} x {cols} are not whole 128 x 4 tiles");
     }

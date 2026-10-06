@@ -1314,6 +1314,51 @@ const COOP_X_CONV1X1: &str = r#"        let cpix = min(t0 + lr, p.m - 1u);
         xr2 = x16[cb + 2u];
         xr3 = x16[cb + 3u];"#;
 
+/// NVFP4 for [`coop_tiled_nvfp4`]: a row's words its nibbles (`k / 8`) then its block scales (`k / 64`, four E4M3 a
+/// word), `p.row_bytes` words a row; E2M1 and E4M3 made from their bits (no table), each value times its block's
+/// scale exact in f16 (6 bits, within 2^-10..2688), the tensor's own scale after the sums.
+const COOP_NVFP4_HELPERS: &str = r#"fn e2m1(c: u32) -> f32 {
+    let e = (c >> 1u) & 3u;
+    let normal = ((e + 126u) << 23u) | ((c & 1u) << 22u);
+    let sub = select(0u, 0x3f000000u, (c & 1u) != 0u);
+    return bitcast<f32>(((c & 8u) << 28u) | select(normal, sub, e == 0u));
+}
+
+fn e4m3(b: u32) -> f32 {
+    let e = (b >> 3u) & 15u;
+    let m = b & 7u;
+    let v = select(bitcast<f32>(((e + 120u) << 23u) | (m << 20u)), f32(m) * 0.001953125, e == 0u);
+    return select(v, -v, (b & 128u) != 0u);
+}
+
+// a word's eight values, high nibble of each byte first
+fn nib4(w: u32, sh: u32, s: f32) -> vec4<f16> {
+    let q = w >> sh;
+    return vec4<f16>(s * vec4<f32>(e2m1((q >> 4u) & 15u), e2m1(q & 15u), e2m1((q >> 12u) & 15u), e2m1((q >> 8u) & 15u)));
+}"#;
+const COOP_NVFP4_REGS: &str = r#"    var nw0 = 0u;
+    var nw1 = 0u;
+    var sw = 0u;"#;
+const COOP_NVFP4_LOAD: &str = r#"let nb = rl * p.row_bytes + b * 4u + lh * 2u;
+        nw0 = w[nb];
+        nw1 = w[nb + 1u];
+        sw = w[rl * p.row_bytes + kx / 8u + (2u * b + lh) / 4u];"#;
+const COOP_NVFP4_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
+        if (rr < p.rows) {
+            let sc = e4m3((sw >> (8u * ((2u * b + lh) % 4u))) & 0xffu);
+            wt[at4] = nib4(nw0, 0u, sc);
+            wt[at4 + 1u] = nib4(nw0, 16u, sc);
+            wt[at4 + 2u] = nib4(nw1, 0u, sc);
+            wt[at4 + 3u] = nib4(nw1, 16u, sc);
+        } else {
+            for (var i = 0u; i < 4u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }
+        }"#;
+
+/// [`coop_tiled`] for NVFP4 weights ([`COOP_NVFP4_HELPERS`]'s layout; `k` of 64), its sums f32 throughout.
+pub fn coop_tiled_nvfp4() -> String {
+    f32_sums(&coop_source("@group(0) @binding(0) var<storage, read> w: array<u32>;", COOP_NVFP4_HELPERS, COOP_NVFP4_REGS, "", COOP_NVFP4_LOAD, COOP_NVFP4_STEP, COOP_X_TILED))
+}
+
 /// A prompt's matmul on the tensor cores (WGSL's cooperative matrices, f16 into f32): a workgroup a tile of
 /// [`COOP_TILE`] weight rows by as many tokens, `k` 32 at a time; each step the tile's weights decoded to f16 and its
 /// tokens' rows (as [`X_F16_TILED`] gives them, padded to the tile) copied into the workgroup's memory, the next step's
