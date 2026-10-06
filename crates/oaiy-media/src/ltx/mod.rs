@@ -10,7 +10,7 @@ mod audio;
 mod cache;
 pub(crate) mod store;
 mod text;
-mod transformer;
+pub(crate) mod transformer;
 mod upsampler;
 pub mod vae;
 use candle_core::{DType, Device, Result, Tensor};

@@ -699,7 +699,10 @@ fn decode_as(key: &str, dtype: Dtype, shape: &[usize], bytes: &[u8], scale: Opti
     // NVFP4: `rows x cols/2` bytes and one scale per 16 values.
     if let (Dtype::U8, Some(scales), [rows, packed]) = (dtype, scale, shape) {
         let (rows, cols) = (*rows, *packed * 2);
-        if cols % 16 == 0 && scales.len() == rows * cols / 16 {
+        // (a layer of fewer rows than a tile's 128, a gate's 32, keeps its scales' whole tile: its first rows its own)
+        let whole = rows * cols / 16;
+        if cols % 16 == 0 && (scales.len() == whole || scales.len() == rows.div_ceil(128) * 128 * cols / 16) {
+            let scales = &scales[..whole];
             // Each byte to its two values, high nibble first.
             let pairs: Vec<f32> = (0..256usize).flat_map(|b| [E2M1[b >> 4], E2M1[b & 15]]).collect();
             let table = Tensor::from_vec(pairs, (256, 2), dev)?;
