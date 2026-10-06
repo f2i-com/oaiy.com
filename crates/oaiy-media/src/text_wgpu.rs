@@ -51,14 +51,14 @@ pub struct WgpuTextEncoder {
 }
 
 impl WgpuTextEncoder {
-    /// The text encoder under `root` (`text_encoder/`, or the `checkpoint` given; `processor/tokenizer.json`) on the
-    /// WebGPU adapter (OAIY_WEBGPU_ADAPTER picks one).
-    pub fn load(root: &Path, checkpoint: Option<&Path>) -> Result<Self> {
+    /// The text encoder under `root` (`text_encoder/`, or the `checkpoint` given; `processor/tokenizer.json`) on GPU
+    /// `device` (as CUDA counts them; OAIY_WEBGPU_ADAPTER naming one instead).
+    pub fn load(root: &Path, checkpoint: Option<&Path>, device: usize) -> Result<Self> {
         let config = oaiy_engine::json::Json::parse(&std::fs::read(root.join("text_encoder/config.json"))?).map_err(candle_core::Error::wrap)?;
         if config.get("model_type").and_then(|x| x.as_str()) != Some("qwen3_vl") {
             candle_core::bail!("expected Qwen3-VL text encoder");
         }
-        let gpu = ggml_rs_wgpu::WgpuBackend::new(None).map_err(err)?;
+        let gpu = ggml_rs_wgpu::WgpuBackend::nth(device, None).map_err(err)?;
         let mut w = Weights::open(checkpoint.unwrap_or(&root.join("text_encoder")))?;
         let prefix = if w.has("model.language_model.embed_tokens.weight") { "model.language_model" } else { "model" };
         let embedding = w.tensor(&format!("{prefix}.embed_tokens.weight"), &Device::Cpu, DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
@@ -183,7 +183,7 @@ mod tests {
         let Some(base) = std::env::var_os("OAIY_QWEN_IMAGE_BASE").map(std::path::PathBuf::from) else { return Ok(()) };
         let prompt = "A cosy mountain cabin at dusk beside a frozen lake, a sign above the door that reads \"WebGPU Lodge\"";
         let t = std::time::Instant::now();
-        let mut gpu = WgpuTextEncoder::load(&base, None)?;
+        let mut gpu = WgpuTextEncoder::load(&base, None, 0)?;
         eprintln!("WebGPU text encoder loaded in {:.1} s", t.elapsed().as_secs_f64());
         let t = std::time::Instant::now();
         let got = gpu.encode(prompt)?;

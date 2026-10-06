@@ -694,6 +694,28 @@ impl WgpuBackend {
         Self::open(adapter, budget_bytes)
     }
 
+    /// The computer's `index`-th GPU (0 the first) as a CUDA device index counts them: the discrete ones on the API
+    /// `new` picks, in their order on the PCI bus (nvidia-smi's, and CUDA's of cards alike), else every adapter on it;
+    /// `OAIY_WEBGPU_ADAPTER`, where set, naming one instead (as for `new`). A worker told which GPU to use (an image
+    /// model kept off a chat model's).
+    pub fn nth(index: usize, budget_bytes: Option<u64>) -> Result<Self, String> {
+        if std::env::var("OAIY_WEBGPU_ADAPTER").is_ok_and(|s| !s.trim().is_empty()) {
+            return Self::new(budget_bytes);
+        }
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        desc.backends = wgpu::Backends::PRIMARY;
+        let instance = wgpu::Instance::new(desc.with_env());
+        let best = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() })).map_err(|e| format!("no WebGPU adapter: {e}"))?;
+        let api = best.get_info().backend;
+        let all: Vec<wgpu::Adapter> = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::PRIMARY)).into_iter().filter(|a| a.get_info().backend == api).collect();
+        let discrete = all.iter().any(|a| a.get_info().device_type == wgpu::DeviceType::DiscreteGpu);
+        let mut list: Vec<wgpu::Adapter> = all.into_iter().filter(|a| !discrete || a.get_info().device_type == wgpu::DeviceType::DiscreteGpu).collect();
+        list.sort_by_key(|a| a.get_info().device_pci_bus_id);
+        let count = list.len();
+        let adapter = list.into_iter().nth(index).ok_or_else(|| format!("GPU {index}: the computer has {count} on {api:?}"))?;
+        Self::open(adapter, budget_bytes)
+    }
+
     /// The computer's other discrete GPUs on this one's API, each opened as a backend of its own (a budget each, as
     /// `new` picks one): two cards of one model differ only in where they sit on the PCI bus. For a model whose
     /// weights do not fit one card (Qwen3.8-Flash-Next's 46 GB of experts).

@@ -392,7 +392,7 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
     let text_load_start = Instant::now();
     #[cfg(feature = "webgpu")]
     let mut encoder = if r.webgpu {
-        Encoder::Wgpu(crate::text_wgpu::WgpuTextEncoder::load(&r.base, r.text_encoder.as_deref())?)
+        Encoder::Wgpu(crate::text_wgpu::WgpuTextEncoder::load(&r.base, r.text_encoder.as_deref(), r.device)?)
     } else {
         Encoder::Candle(TextEncoder::load(&r.base, r.text_encoder.as_deref(), &dev, dtype, &r.budget)?)
     };
@@ -430,7 +430,7 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
     };
     #[cfg(feature = "webgpu")]
     let mut model = if r.webgpu {
-        Model::Wgpu(crate::qwen_wgpu::WgpuTransformer::load(&r.transformer, r.adapter.as_deref(), &r.loras, progress)?)
+        Model::Wgpu(crate::qwen_wgpu::WgpuTransformer::load(&r.transformer, r.device, r.adapter.as_deref(), &r.loras, progress)?)
     } else {
         Model::Candle(Transformer::load(&r.transformer, r.adapter.as_deref(), &r.loras, &dev, dtype, &r.budget, progress)?)
     };
@@ -444,7 +444,7 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
     event(Json::obj([("stage", Json::str("loading_vae"))]));
     let load_start = Instant::now();
     #[cfg(feature = "webgpu")]
-    let vae = if r.webgpu { Decoder::Wgpu(crate::vae_wgpu::WgpuVae::load(&r.base)?) } else { Decoder::Candle(Vae::load(&r.base, &dev, dtype)?) };
+    let vae = if r.webgpu { Decoder::Wgpu(crate::vae_wgpu::WgpuVae::load(&r.base, r.device)?) } else { Decoder::Candle(Vae::load(&r.base, &dev, dtype)?) };
     #[cfg(not(feature = "webgpu"))]
     let vae = Decoder::Candle(Vae::load(&r.base, &dev, dtype)?);
     dev.synchronize()?;

@@ -34,9 +34,10 @@ pub struct WgpuVae {
 }
 
 impl WgpuVae {
-    /// The decoder of the VAE under `root` (`vae/`, its config's latents' mean and deviation) on the WebGPU adapter.
-    pub fn load(root: &Path) -> Result<Self> {
-        let gpu = ggml_rs_wgpu::WgpuBackend::new(None).map_err(err)?;
+    /// The decoder of the VAE under `root` (`vae/`, its config's latents' mean and deviation) on GPU `device` (as
+    /// CUDA counts them; OAIY_WEBGPU_ADAPTER naming one instead).
+    pub fn load(root: &Path, device: usize) -> Result<Self> {
+        let gpu = ggml_rs_wgpu::WgpuBackend::nth(device, None).map_err(err)?;
         let mut w = Weights::open(&root.join("vae"))?;
         let mut convs = HashMap::new();
         let mut gammas = HashMap::new();
@@ -214,7 +215,7 @@ mod tests {
         };
         let latent: Vec<f32> = (0..h * w * 64).map(|_| (next() * 1.7) as f32).collect();
         let latent = Tensor::from_vec(latent, (1, h * w, 64), &Device::Cpu)?;
-        let gpu = WgpuVae::load(&base)?;
+        let gpu = WgpuVae::load(&base, 0)?;
         let t = std::time::Instant::now();
         let got = gpu.decode(&latent, h, w)?;
         eprintln!("WebGPU decode {:.3} s", t.elapsed().as_secs_f64());

@@ -161,10 +161,10 @@ fn host(t: &Tensor) -> Result<Vec<f32>> {
 }
 
 impl WgpuTransformer {
-    /// The transformer at `path` on the WebGPU adapter (OAIY_WEBGPU_ADAPTER picks one by name or PCI bus id), with the
-    /// turbo `adapter` and `loras` merged into its weights. `progress(block)` as each block loads.
-    pub fn load(path: &Path, adapter: Option<&Path>, loras: &[(PathBuf, f64)], mut progress: impl FnMut(usize)) -> Result<Self> {
-        let gpu = ggml_rs_wgpu::WgpuBackend::new(None).map_err(err)?;
+    /// The transformer at `path` on GPU `device` (as CUDA counts them; OAIY_WEBGPU_ADAPTER naming one instead), with
+    /// the turbo `adapter` and `loras` merged into its weights. `progress(block)` as each block loads.
+    pub fn load(path: &Path, device: usize, adapter: Option<&Path>, loras: &[(PathBuf, f64)], mut progress: impl FnMut(usize)) -> Result<Self> {
+        let gpu = ggml_rs_wgpu::WgpuBackend::nth(device, None).map_err(err)?;
         let mut w = Weights::open(path)?;
         let list: Vec<(PathBuf, f64)> = adapter.map(|a| (a.to_owned(), 1.)).into_iter().chain(loras.iter().cloned()).collect();
         let mut lora = Loras::open(&list)?;
@@ -388,7 +388,8 @@ mod tests {
 
     /// The WebGPU transformer gives the Candle one's velocity (CPU, f32) on the published weights
     /// (`OAIY_QWEN_IMAGE_TRANSFORMER`, e.g. `D:\Qwen-Image-2.1\transformer`): 16 text tokens' states (random, as an
-    /// encoder's are: a few channels large) and an 8 x 8 image's latent (QWEN_IMAGE_GRID another side) at two sigmas.
+    /// encoder's are: a few channels large) and an 8 x 8 image's latent (QWEN_IMAGE_GRID another side) at two sigmas;
+    /// with OAIY_QWEN_IMAGE_ADAPTER a turbo adapter on both.
     #[test]
     #[ignore = "needs the Qwen Image 2.1 transformer (OAIY_QWEN_IMAGE_TRANSFORMER) and a WebGPU adapter"]
     fn the_webgpu_transformer_is_the_candle_one() -> Result<()> {
@@ -408,14 +409,16 @@ mod tests {
         let text = Conditioning { states: Tensor::from_vec(states, (1, nt, D), &Device::Cpu)?, spans: Vec::new() };
         let latent = Tensor::from_vec(latent, (1, h * w, CH), &Device::Cpu)?;
         let t = std::time::Instant::now();
-        let mut gpu = WgpuTransformer::load(&path, None, &[], |_| {})?;
+        // OAIY_QWEN_IMAGE_ADAPTER: a turbo adapter on both (merged into the weights here, added as it runs there)
+        let adapter = std::env::var_os("OAIY_QWEN_IMAGE_ADAPTER").map(PathBuf::from);
+        let mut gpu = WgpuTransformer::load(&path, 0, adapter.as_deref(), &[], |_| {})?;
         eprintln!("WebGPU transformer loaded in {:.1} s", t.elapsed().as_secs_f64());
         let prefix = gpu.prepare(&text, &[])?;
         let got: Vec<Vec<f32>> = [0.9, 0.3].iter().map(|&s| gpu.conditioned(&latent, &prefix, s, h, w)?.flatten_all()?.to_vec1::<f32>()).collect::<Result<_>>()?;
         drop(gpu);
         let t = std::time::Instant::now();
         let budget = crate::residency::Budget::default();
-        let mut cpu = crate::transformer::Transformer::load(&path, None, &[], &Device::Cpu, DType::F32, &budget, |_| {})?;
+        let mut cpu = crate::transformer::Transformer::load(&path, adapter.as_deref(), &[], &Device::Cpu, DType::F32, &budget, |_| {})?;
         eprintln!("Candle transformer loaded in {:.1} s", t.elapsed().as_secs_f64());
         let prefix = cpu.prepare(&text, &[])?;
         for (i, &sigma) in [0.9, 0.3].iter().enumerate() {
