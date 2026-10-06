@@ -1,5 +1,7 @@
 //! Qwen Image 2.1's text encoder (Qwen3-VL 8B's language model) on WebGPU, as [`crate::text::TextEncoder`] encodes a
-//! prompt without reference images: the last decoder layer's states before the final norm, the system prefix dropped.
+//! prompt, its reference images' vision features in place of their placeholders (each token's three rotary axes, the
+//! features' deeper layers added after the first three): the last decoder layer's states before the final norm, the
+//! system prefix dropped.
 //! The weights f16 on the GPU (the BF16 checkpoint's rounded) a layer at a time, every prompt through it (its 16 GB
 //! never all on the card), the embedding's rows looked up on the host; the matmuls read their inputs as f32 (an LLM's
 //! hidden states reach some 500).
@@ -57,6 +59,10 @@ pub struct WgpuTextEncoder {
 struct Prompt {
     s: usize,
     drop: usize,
+    /// Its images' token runs (`(start, len)`, among all its tokens) and the vectors their deeper features are added
+    /// from (a layer's at a time: zeros past the runs).
+    spans: Vec<(usize, usize)>,
+    deep: DeviceVec,
     x: DeviceVec,
     norm: DeviceVec,
     q: DeviceVec,
@@ -132,20 +138,48 @@ impl WgpuTextEncoder {
     /// `prompt`'s conditioning (as [`crate::text::TextEncoder::encode`] gives it with no reference images): its states
     /// on the CPU.
     pub fn encode(&mut self, prompt: &str) -> Result<Conditioning> {
-        self.encode_all(&[prompt])?.pop().ok_or_else(|| err("no conditioning"))
+        self.encode_all(&[prompt], &[])?.pop().ok_or_else(|| err("no conditioning"))
     }
 
-    /// Each prompt's conditioning (as [`Self::encode`]), every prompt through a layer while its weights are on the
-    /// card.
-    pub fn encode_all(&mut self, prompts: &[&str]) -> Result<Vec<Conditioning>> {
+    /// Each prompt's conditioning (as [`crate::text::TextEncoder::encode`] gives it, `images` the reference images'
+    /// vision features for every prompt), every prompt through a layer while its weights are on the card.
+    pub fn encode_all(&mut self, prompts: &[&str], images: &[crate::vision::Features]) -> Result<Vec<Conditioning>> {
+        const IMAGE_PAD: u32 = 151655;
         let system = self.tokenizer.encode(SYSTEM, false).map_err(err)?.len();
         let vocab = self.embedding.len() / D;
+        let host = |t: &Tensor| -> Result<Vec<f32>> { t.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>() };
+        let embeddings: Vec<Vec<f32>> = images.iter().map(|f| host(&f.embedding)).collect::<Result<_>>()?;
+        let deeps: Vec<Vec<Vec<f32>>> = images.iter().map(|f| f.deep.iter().map(host).collect::<Result<Vec<_>>>()).collect::<Result<_>>()?;
+        let image_prefix = (1..=images.len()).map(|i| format!("<image{i}><|vision_start|><|image_pad|><|vision_end|>")).collect::<Vec<_>>().join(" ");
         let mut all = Vec::with_capacity(prompts.len());
         for prompt in prompts {
-            let text = format!("{SYSTEM}<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n");
-            let ids = self.tokenizer.encode(text.as_str(), false).map_err(err)?.get_ids().to_vec();
-            if ids.len() > 1024 {
+            let text = format!("{SYSTEM}<|im_start|>user\n{image_prefix}{prompt}<|im_end|>\n<|im_start|>assistant\n");
+            let tokens = self.tokenizer.encode(text.as_str(), false).map_err(err)?.get_ids().to_vec();
+            if tokens.len() > 1024 {
                 candle_core::bail!("image prompt exceeds 1024 text tokens");
+            }
+            // each image's placeholder as its features' grid (their positions its rows and columns from where it
+            // starts), the text's a position a token on all three axes
+            let (mut ids, mut spans, mut positions, mut position) = (Vec::new(), Vec::new(), Vec::new(), 0usize);
+            for id in tokens {
+                if id == IMAGE_PAD {
+                    let image = images.get(spans.len()).ok_or_else(|| err("unexpected image placeholder in prompt"))?;
+                    spans.push((ids.len(), image.h * image.w));
+                    for y in 0..image.h {
+                        for x in 0..image.w {
+                            ids.push(id);
+                            positions.push([position, position + y, position + x]);
+                        }
+                    }
+                    position += image.h.max(image.w);
+                } else {
+                    ids.push(id);
+                    positions.push([position; 3]);
+                    position += 1;
+                }
+            }
+            if spans.len() != images.len() {
+                candle_core::bail!("reference image placeholder mismatch");
             }
             let s = ids.len();
             let mut x0 = Vec::with_capacity(s * D);
@@ -156,11 +190,19 @@ impl WgpuTextEncoder {
                 }
                 x0.extend_from_slice(&self.embedding[id * D..(id + 1) * D]);
             }
-            // RoPE over each head's halves (NeoX), a token's position its index (a text-only prompt's three axes alike)
+            for (&(start, len), e) in spans.iter().zip(&embeddings) {
+                if e.len() != len * D {
+                    candle_core::bail!("an image's features: {} values for {len} tokens", e.len());
+                }
+                x0[start * D..(start + len) * D].copy_from_slice(e);
+            }
+            // RoPE over each head's halves (NeoX): Qwen3-VL's interleaved axes, a pair's from its index (every third
+            // past the first of the 60 the rows' or the columns', the rest time's)
             let mut table = Vec::with_capacity(s * HD);
-            for p in 0..s {
+            for pos in &positions {
                 for j in 0..HD / 2 {
-                    let a = p as f64 / THETA.powf(j as f64 / (HD / 2) as f64);
+                    let axis = if j < 60 && j % 3 != 0 { j % 3 } else { 0 };
+                    let a = pos[axis] as f64 / THETA.powf(j as f64 / (HD / 2) as f64);
                     table.push(a.sin() as f32);
                     table.push(a.cos() as f32);
                 }
@@ -168,6 +210,8 @@ impl WgpuTextEncoder {
             let p = Prompt {
                 s,
                 drop: system,
+                deep: self.vec(if spans.is_empty() { 1 } else { s * D }),
+                spans,
                 x: self.vec(s * D),
                 norm: self.vec(s * D),
                 q: self.vec(s * D),
@@ -190,6 +234,21 @@ impl WgpuTextEncoder {
         let row = 2 * KV_HEADS * HD;
         for i in 0..LAYERS {
             let l = self.layer(i)?;
+            // the images' deeper features for this layer's output (the first three's), zeros past their runs
+            let deep_at = (i < 3 && !images.is_empty()).then_some(i);
+            if let Some(layer) = deep_at {
+                for p in &all {
+                    let mut v = vec![0f32; p.s * D];
+                    for (&(start, len), d) in p.spans.iter().zip(&deeps) {
+                        let f = d.get(layer).ok_or_else(|| err("an image's deeper features"))?;
+                        if f.len() != len * D {
+                            candle_core::bail!("an image's deeper features: {} values for {len} tokens", f.len());
+                        }
+                        v[start * D..(start + len) * D].copy_from_slice(f);
+                    }
+                    self.gpu.upload(&p.deep, &v);
+                }
+            }
             let mut rec = self.gpu.begin();
             rec.keep_groups(false);
             let r = rec.as_mut();
@@ -215,6 +274,9 @@ impl WgpuTextEncoder {
                 r.silu_mul(&p.g, &p.u, &p.act, s * FF);
                 mul(r, &l.down, &p.act, &p.o);
                 r.add(&p.x, &p.o);
+                if deep_at.is_some() {
+                    r.add(&p.x, &p.deep);
+                }
             }
             rec.finish();
             drop(l);
@@ -225,7 +287,10 @@ impl WgpuTextEncoder {
             rec.read_range(&p.x, p.drop * D, (p.s - p.drop) * D);
         }
         let reads = rec.finish();
-        all.iter().zip(reads).map(|(p, states)| Ok(Conditioning { states: Tensor::from_vec(states, (1, p.s - p.drop, D), &Device::Cpu)?, spans: Vec::new() })).collect()
+        all.iter()
+            .zip(reads)
+            .map(|(p, states)| Ok(Conditioning { states: Tensor::from_vec(states, (1, p.s - p.drop, D), &Device::Cpu)?, spans: p.spans.iter().map(|&(s, n)| (s - p.drop, n)).collect() }))
+            .collect()
     }
 }
 
@@ -262,6 +327,41 @@ mod tests {
             worst = worst.min(dot / (na * nb));
         }
         eprintln!("{n} tokens: the worst token's cosine {worst:.6}");
+        assert!(worst > 0.999, "the worst token's cosine {worst}");
+        Ok(())
+    }
+
+    /// With a reference image (`OAIY_QWEN_IMAGE_REFERENCE`, at 512 by 512): its vision features (Candle's, on the CPU)
+    /// in place of its placeholder, its tokens' three rotary axes, its deeper features added; the states and the
+    /// image's span as Candle's.
+    #[test]
+    #[ignore = "needs Qwen Image 2.1's text encoder (OAIY_QWEN_IMAGE_BASE), a reference image (OAIY_QWEN_IMAGE_REFERENCE) and a WebGPU adapter"]
+    fn a_reference_images_conditioning_is_the_candle_ones() -> Result<()> {
+        let (Some(base), Some(image)) = (std::env::var_os("OAIY_QWEN_IMAGE_BASE").map(std::path::PathBuf::from), std::env::var_os("OAIY_QWEN_IMAGE_REFERENCE").map(std::path::PathBuf::from)) else { return Ok(()) };
+        let prompt = "Make it night time, the cafe lit by warm lamps";
+        let reference = crate::reference::Reference::load(&image, 512)?;
+        let vision = crate::vision::VisionEncoder::load(&base.join("text_encoder"), &Device::Cpu, DType::F32)?;
+        let features = vec![vision.encode(&reference)?];
+        drop(vision);
+        let mut gpu = WgpuTextEncoder::load(&base, None, 0)?;
+        let got = gpu.encode_all(&[prompt], &features)?.remove(0);
+        drop(gpu);
+        let budget = crate::residency::Budget::default();
+        let mut cpu = crate::text::TextEncoder::load(&base, None, &Device::Cpu, DType::F32, &budget)?;
+        let want = cpu.encode(prompt, &features)?;
+        assert_eq!(got.spans, want.spans);
+        assert_eq!(got.states.dims(), want.states.dims());
+        let (g, e) = (got.states.flatten_all()?.to_vec1::<f32>()?, want.states.flatten_all()?.to_vec1::<f32>()?);
+        let n = e.len() / D;
+        let mut worst = 1f64;
+        for t in 0..n {
+            let (a, b) = (&g[t * D..(t + 1) * D], &e[t * D..(t + 1) * D]);
+            let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
+            let na = a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            let nb = b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            worst = worst.min(dot / (na * nb));
+        }
+        eprintln!("{n} tokens ({:?} the image's): the worst token's cosine {worst:.6}", want.spans);
         assert!(worst > 0.999, "the worst token's cosine {worst}");
         Ok(())
     }

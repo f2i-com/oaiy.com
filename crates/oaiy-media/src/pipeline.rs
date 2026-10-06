@@ -33,7 +33,8 @@ pub struct Request {
     /// Where the transformer and text-encoder blocks live: GPU, RAM or SSD.
     pub budget: Budget,
     /// The text encoder, transformer and VAE's decoder on WebGPU (`backend` "webgpu": any GPU wgpu reaches, Vulkan,
-    /// Metal or Direct3D 12; OAIY_WEBGPU_ADAPTER picking one), no reference images yet.
+    /// Metal or Direct3D 12; OAIY_WEBGPU_ADAPTER picking one); reference images' VAE latents and vision features made
+    /// by Candle on its device first.
     pub webgpu: bool,
 }
 impl Request {
@@ -186,9 +187,6 @@ impl Request {
                 return Err(format!("LoRA strength must be between -4 and 4 ({})", path.display()));
             }
         }
-        if self.webgpu && !self.images.is_empty() {
-            return Err("reference images are not supported on WebGPU yet".into());
-        }
         for path in [&self.base, &self.transformer]
             .into_iter()
             .chain(self.adapter.iter()).chain(self.text_encoder.iter()).chain(self.loras.iter().map(|(p, _)| p))
@@ -220,12 +218,7 @@ impl Encoder {
         match self {
             Encoder::Candle(e) => e.encode(prompt, images),
             #[cfg(feature = "webgpu")]
-            Encoder::Wgpu(e) => {
-                if !images.is_empty() {
-                    candle_core::bail!("reference images are not supported on WebGPU yet");
-                }
-                e.encode(prompt)
-            }
+            Encoder::Wgpu(e) => e.encode_all(&[prompt], images)?.pop().ok_or_else(|| candle_core::Error::Msg("no conditioning".into())),
         }
     }
 
@@ -233,7 +226,7 @@ impl Encoder {
     fn encode_all(&mut self, prompts: &[&str], images: &[crate::vision::Features]) -> Result<Vec<crate::text::Conditioning>> {
         match self {
             #[cfg(feature = "webgpu")]
-            Encoder::Wgpu(e) if images.is_empty() => e.encode_all(prompts),
+            Encoder::Wgpu(e) => e.encode_all(prompts, images),
             _ => prompts.iter().map(|p| self.encode(p, images)).collect(),
         }
     }
@@ -356,8 +349,9 @@ pub(crate) fn parse_loras(j: &Json) -> std::result::Result<Vec<(PathBuf, f64)>, 
 /// in a batch reuse one transformer and VAE; completed images survive failure.
 pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
     r.validate().map_err(candle_core::Error::Msg)?;
+    // (a WebGPU job's reference images encoded on the CPU: a CUDA context on its card keeps its memory)
     #[cfg(feature = "cuda")]
-    let dev = Device::new_cuda(r.device)?;
+    let dev = if r.webgpu { Device::Cpu } else { Device::new_cuda(r.device)? };
     #[cfg(not(feature = "cuda"))]
     let dev = Device::Cpu;
     let dtype = if dev.is_cuda() {

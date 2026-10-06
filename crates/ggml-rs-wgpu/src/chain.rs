@@ -657,7 +657,7 @@ fn main(@builtin(local_invocation_index) t: u32) {
 const COPY: &str = r#"
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let i = id.x;
+    let i = id.x + id.y * 16776960u;
     if (i < p[0].x) { y[p[0].y + i] = x[p[0].z + i]; }
 }
 "#;
@@ -3791,7 +3791,8 @@ impl ChainRecorder for Recorder<'_> {
         assert!(src_at + len <= src.len && dst_at + len <= dst.len, "chain: copying {len} from {src_at} of {} to {dst_at} of {}", src.len, dst.len);
         let pipeline = self.named("chain-copy", COPY);
         let params = self.uniform(&[len as u32, dst_at as u32, src_at as u32]);
-        self.dispatch(&pipeline, buffer(src), buffer(src), buffer(dst), &params, ((len as u32).div_ceil(256), 1, 1));
+        // (past 16.8 million values the grid's second dimension: a 1024x1024 reference image's tokens in a prefix)
+        self.dispatch(&pipeline, buffer(src), buffer(src), buffer(dst), &params, grid((len as u32).div_ceil(256)));
     }
 
     fn attention(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, n_h: usize, n_kv: usize, head_dim: usize, lo: usize, kv_len: usize, cap: usize, scale: f32) {
@@ -4870,6 +4871,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A copy past a grid dimension's 65,535 workgroups (17 million values, from one offset to another), every value
+    /// where it belongs.
+    #[test]
+    fn a_long_copy_lands_every_value() {
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        let len = 17_000_000usize;
+        let src: Vec<f32> = (0..len + 3).map(|i| i as f32).collect();
+        let (sd, dd) = (b.vec(src.len()), b.vec(len + 5));
+        DeviceChain::upload(&b, &sd, &src);
+        let mut rec = b.begin();
+        rec.copy(&sd, 3, &dd, 5, len);
+        rec.read(&dd);
+        let got = rec.finish().pop().unwrap();
+        for i in [0usize, 1, 16_776_959, 16_776_960, 16_776_961, len - 1] {
+            assert_eq!(got[5 + i], (3 + i) as f32, "value {i}");
+        }
+        assert_eq!(&got[..5], &[0.; 5]);
     }
 
     /// A LoRA's merge on the device: `B A` by the f16 matmul (`A` transposed its weight, `B`'s rows its tokens) added

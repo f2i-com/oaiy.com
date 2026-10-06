@@ -351,63 +351,135 @@ impl WgpuTransformer {
         }
     }
 
-    /// The text prefix's keys and values in every layer (the text tokens conditioned at time zero, causal among
-    /// themselves). Reference images are not taken here yet.
+    /// The prefix's keys and values in every layer, conditioned at time zero as [`crate::transformer::Transformer::
+    /// prepare`] makes them: the text's tokens (causal among themselves) and each reference image's latent in place of
+    /// its vision tokens (its tokens over each other and everything before them), `refs` the latents (`[1, h w, 64]`)
+    /// and their grids.
     pub fn prepare(&mut self, text: &Conditioning, refs: &[(Tensor, usize, usize)]) -> Result<WgpuPrefix> {
-        if !refs.is_empty() {
-            candle_core::bail!("reference images are not supported on WebGPU yet");
-        }
         let nt = text.states.dim(1)?;
         if text.states.dims() != [1, nt, D] || nt == 0 {
             candle_core::bail!("text states must be [1, n, {D}], not {:?}", text.states.dims());
         }
+        if text.spans.len() != refs.len() {
+            candle_core::bail!("conditioning/reference count mismatch");
+        }
+        // its parts in turn: (where the text's projected states start, or which reference; its tokens; causal), each
+        // part's positions (an image's its rows and columns about its centre, a position its larger side)
+        enum Part {
+            /// The text's projected states from this one.
+            Text(usize),
+            /// This reference's latent.
+            Image(usize),
+        }
+        let mut parts: Vec<(Part, usize, bool)> = Vec::new();
+        let (mut cursor, mut position, mut positions) = (0, 0, Vec::new());
+        for (i, (&(start, len), (latent, h, w))) in text.spans.iter().zip(refs).enumerate() {
+            if latent.dims() != [1, h * w, CH] || len * 4 != h * w || start < cursor {
+                candle_core::bail!("reference latent/vision grid mismatch");
+            }
+            if start > cursor {
+                parts.push((Part::Text(cursor), start - cursor, true));
+                positions.extend((position..position + start - cursor).map(|p| [p as f64; 3]));
+                position += start - cursor;
+            }
+            parts.push((Part::Image(i), h * w, false));
+            positions.extend(image_positions(position, *h, *w));
+            position += (*h).max(*w);
+            cursor = start + len;
+        }
+        if nt > cursor {
+            parts.push((Part::Text(cursor), nt - cursor, true));
+            positions.extend((position..position + nt - cursor).map(|p| [p as f64; 3]));
+            position += nt - cursor;
+        }
+        let np = positions.len();
         let states = host(&text.states)?;
-        let positions: Vec<[f64; 3]> = (0..nt).map(|p| [p as f64; 3]).collect();
-        let (sv, sn, t1, t1g) = (self.vec(nt * D), self.vec(nt * D), self.vec(nt * D), self.vec(nt * D));
+        let (sv, sn, t1, t1g, xt) = (self.vec(nt * D), self.vec(nt * D), self.vec(nt * D), self.vec(nt * D), self.vec(nt * D));
         self.gpu.upload(&sv, &states);
-        let table = self.vec(nt * HD);
+        // each reference's latent and its tokens through the image projection
+        let mut images = Vec::with_capacity(refs.len());
+        for (latent, h, w) in refs {
+            let lv = self.vec(h * w * CH);
+            self.gpu.upload(&lv, &host(latent)?);
+            images.push((lv, self.vec(h * w * D), h * w));
+        }
+        let table = self.vec(np * HD);
         self.gpu.upload(&table, &rope_table(&positions));
         let t = self.vec(256);
         self.gpu.upload(&t, &timestep(0.));
         let time = [self.vec(D), self.vec(D), self.vec(D), self.vec(D)];
         let (mods, scale) = (self.vec(4 * D), self.vec(D));
-        let (x, norm, q, k, v, qq, kk, o) = (self.vec(nt * D), self.vec(nt * D), self.vec(nt * D), self.vec(nt * D), self.vec(nt * D), self.vec(nt * D), self.vec(nt * D), self.vec(nt * D));
-        let (g, u, act) = (self.vec(nt * FF), self.vec(nt * FF), self.vec(nt * FF));
-        let att = self.vec(self.gpu.attention_rows_out_len(nt.div_ceil(32) * 32, HEADS, HD, nt));
-        let kv: Vec<DeviceVec> = (0..BLOCKS).map(|_| self.vec(nt * ROW)).collect();
-        let low = self.low(nt);
+        let (x, norm, q, k, v, qq, kk, o) = (self.vec(np * D), self.vec(np * D), self.vec(np * D), self.vec(np * D), self.vec(np * D), self.vec(np * D), self.vec(np * D), self.vec(np * D));
+        let (g, u, act) = (self.vec(np * FF), self.vec(np * FF), self.vec(np * FF));
+        // a part's queries, and its attention's output (with its partials' room), at the start of their own vectors
+        let (mut at, mut longest, mut room) = (0, 0, 0);
+        let mut spans = Vec::with_capacity(parts.len());
+        for (_, n, causal) in &parts {
+            let need = if *causal { self.gpu.attention_rows_out_len(n.div_ceil(32) * 32, HEADS, HD, at + n) } else { self.gpu.attention_rows_full_out_len(*n, HEADS, HD, at + n) };
+            (longest, room) = (longest.max(*n), room.max(need));
+            spans.push(at);
+            at += n;
+        }
+        let (qs, atts, att) = (self.vec(longest * D), self.vec(room), self.vec(np * D));
+        let kv: Vec<DeviceVec> = (0..BLOCKS).map(|_| self.vec(np * ROW)).collect();
+        let low = self.low(np);
         let mut rec = self.gpu.begin();
         rec.keep_groups(false);
         let r = rec.as_mut();
         r.rmsnorm_rows(&sv, &self.text_norm, &sn, nt, EPS);
         Self::mul(r, &self.text1, &sn, &t1, nt, true, &low);
         r.gelu(&t1, &t1g, nt * D);
-        Self::mul(r, &self.text2, &t1g, &x, nt, true, &low);
-        self.time(r, &t, &time, &mods, &scale, &low);
-        let s = 1.0 / (HD as f32).sqrt();
-        for (b, kvl) in self.blocks.iter().zip(&kv) {
-            r.layernorm_mod_rows(&x, &norm, nt, D, &mods, 0, None, EPS);
-            Self::mul(r, &b.q, &norm, &q, nt, true, &low);
-            Self::mul(r, &b.k, &norm, &k, nt, true, &low);
-            Self::mul(r, &b.v, &norm, &v, nt, true, &low);
-            r.rmsnorm_rows(&q, &b.qn, &qq, nt * HEADS, EPS);
-            r.rmsnorm_rows(&k, &b.kn, &kk, nt * HEADS, EPS);
-            r.rope_rows(&qq, nt, HEADS, HD, &table, false);
-            r.rope_rows(&kk, nt, HEADS, HD, &table, false);
-            r.store_rows(&kk, kvl, nt, D, 0, ROW, 0);
-            r.store_rows(&v, kvl, nt, D, 0, ROW, D);
-            r.attention_rows(&qq, kvl, &att, nt, HEADS, HEADS, HD, 0, None, s);
-            Self::mul(r, &b.o, &att, &o, nt, true, &low);
-            r.add_gated_rows(&x, &o, nt, D, &mods, D, true);
-            r.layernorm_mod_rows(&x, &norm, nt, D, &mods, 2 * D, None, EPS);
-            Self::mul(r, &b.gate, &norm, &g, nt, true, &low);
-            Self::mul(r, &b.up, &norm, &u, nt, true, &low);
-            r.silu_mul(&g, &u, &act, nt * FF);
-            Self::mul(r, &b.down, &act, &o, nt, true, &low);
-            r.add_gated_rows(&x, &o, nt, D, &mods, 3 * D, true);
+        Self::mul(r, &self.text2, &t1g, &xt, nt, true, &low);
+        for (lv, xi, n) in &images {
+            Self::mul(r, &self.img, lv, xi, *n, true, &low);
         }
+        // the parts into the prefix's rows: the text's projected states but its images' vision tokens, the images'
+        for ((from, n, _), &at) in parts.iter().zip(&spans) {
+            match from {
+                Part::Text(start) => r.copy(&xt, start * D, &x, at * D, n * D),
+                Part::Image(i) => r.copy(&images[*i].1, 0, &x, at * D, n * D),
+            }
+        }
+        self.time(r, &t, &time, &mods, &scale, &low);
         rec.finish();
-        Ok(WgpuPrefix { kv, nt, position: nt })
+        let s = 1.0 / (HD as f32).sqrt();
+        // a recording a block: what its ops keep for themselves (their inputs' f16 copies, partial sums) let go before
+        // the next's (a 1024x1024 reference's 4,096 tokens filled the card otherwise)
+        for (b, kvl) in self.blocks.iter().zip(&kv) {
+            let mut rec = self.gpu.begin();
+            rec.keep_groups(false);
+            let r = rec.as_mut();
+            r.layernorm_mod_rows(&x, &norm, np, D, &mods, 0, None, EPS);
+            Self::mul(r, &b.q, &norm, &q, np, true, &low);
+            Self::mul(r, &b.k, &norm, &k, np, true, &low);
+            Self::mul(r, &b.v, &norm, &v, np, true, &low);
+            r.rmsnorm_rows(&q, &b.qn, &qq, np * HEADS, EPS);
+            r.rmsnorm_rows(&k, &b.kn, &kk, np * HEADS, EPS);
+            r.rope_rows(&qq, np, HEADS, HD, &table, false);
+            r.rope_rows(&kk, np, HEADS, HD, &table, false);
+            r.store_rows(&kk, kvl, np, D, 0, ROW, 0);
+            r.store_rows(&v, kvl, np, D, 0, ROW, D);
+            // each part's queries over the rows to its end: a text's causal, an image's all of them
+            for ((_, n, causal), &at) in parts.iter().zip(&spans) {
+                r.copy(&qq, at * D, &qs, 0, n * D);
+                if *causal {
+                    r.attention_rows(&qs, kvl, &atts, *n, HEADS, HEADS, HD, at, None, s);
+                } else {
+                    r.attention_rows_full(&qs, kvl, &atts, *n, HEADS, HEADS, HD, at + n, s);
+                }
+                r.copy(&atts, 0, &att, at * D, n * D);
+            }
+            Self::mul(r, &b.o, &att, &o, np, true, &low);
+            r.add_gated_rows(&x, &o, np, D, &mods, D, true);
+            r.layernorm_mod_rows(&x, &norm, np, D, &mods, 2 * D, None, EPS);
+            Self::mul(r, &b.gate, &norm, &g, np, true, &low);
+            Self::mul(r, &b.up, &norm, &u, np, true, &low);
+            r.silu_mul(&g, &u, &act, np * FF);
+            Self::mul(r, &b.down, &act, &o, np, true, &low);
+            r.add_gated_rows(&x, &o, np, D, &mods, 3 * D, true);
+            rec.finish();
+        }
+        Ok(WgpuPrefix { kv, nt: np, position })
     }
 
     /// The velocity of `latent` (`[1, h w, 64]`) at `sigma`, conditioned on `prefix`: `[1, h w, 64]` on the CPU.
@@ -513,6 +585,45 @@ mod tests {
             let v = gpu.conditioned(&latent, &prefix, sigma, side, side)?;
             latent = (latent + (v * -0.0625)?)?;
             eprintln!("step {step}: {:.3} s", t.elapsed().as_secs_f64());
+        }
+        Ok(())
+    }
+
+    /// With a reference image: 40 text states, 16 of them an image's vision tokens (at 8), its 8 x 8 latent in their
+    /// place in the prefix (its tokens over each other and all before them); an 8 x 8 picture's velocity as Candle's
+    /// (CPU, f32) on the published weights (`OAIY_QWEN_IMAGE_TRANSFORMER`), at two sigmas.
+    #[test]
+    #[ignore = "needs the Qwen Image 2.1 transformer (OAIY_QWEN_IMAGE_TRANSFORMER) and a WebGPU adapter"]
+    fn a_reference_images_prefix_is_the_candle_ones() -> Result<()> {
+        let Some(path) = std::env::var_os("OAIY_QWEN_IMAGE_TRANSFORMER").map(PathBuf::from) else { return Ok(()) };
+        let (nt, side) = (40usize, 8usize);
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64 * 2. - 1.
+        };
+        let states: Vec<f32> = (0..nt * D).map(|i| (next() * if i % D % 997 == 5 { 300. } else { 3. }) as f32).collect();
+        let reference: Vec<f32> = (0..side * side * CH).map(|_| next() as f32).collect();
+        let latent: Vec<f32> = (0..side * side * CH).map(|_| (next() * 1.7) as f32).collect();
+        let text = Conditioning { states: Tensor::from_vec(states, (1, nt, D), &Device::Cpu)?, spans: vec![(8, side * side / 4)] };
+        let refs = vec![(Tensor::from_vec(reference, (1, side * side, CH), &Device::Cpu)?, side, side)];
+        let latent = Tensor::from_vec(latent, (1, side * side, CH), &Device::Cpu)?;
+        let mut gpu = WgpuTransformer::load(&path, 0, None, &[], |_| {})?;
+        let prefix = gpu.prepare(&text, &refs)?;
+        let got: Vec<Vec<f32>> = [0.9, 0.3].iter().map(|&s| gpu.conditioned(&latent, &prefix, s, side, side)?.flatten_all()?.to_vec1::<f32>()).collect::<Result<_>>()?;
+        drop(gpu);
+        let budget = crate::residency::Budget::default();
+        let mut cpu = crate::transformer::Transformer::load(&path, None, &[], &Device::Cpu, DType::F32, &budget, |_| {})?;
+        let prefix = cpu.prepare(&text, &refs)?;
+        for (i, &sigma) in [0.9, 0.3].iter().enumerate() {
+            let want = cpu.conditioned(&latent, &prefix, sigma, side, side)?.flatten_all()?.to_vec1::<f32>()?;
+            let dot: f64 = got[i].iter().zip(&want).map(|(a, b)| *a as f64 * *b as f64).sum();
+            let norm = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+            let cos = dot / (norm(&got[i]) * norm(&want));
+            eprintln!("sigma {sigma}, a reference's prefix: cosine {cos:.6}");
+            assert!(cos > 0.999, "sigma {sigma}: cosine {cos}");
         }
         Ok(())
     }
