@@ -229,6 +229,15 @@ impl Encoder {
         }
     }
 
+    /// Each prompt's conditioning (WebGPU's: every prompt through a layer while its weights are on the card).
+    fn encode_all(&mut self, prompts: &[&str], images: &[crate::vision::Features]) -> Result<Vec<crate::text::Conditioning>> {
+        match self {
+            #[cfg(feature = "webgpu")]
+            Encoder::Wgpu(e) if images.is_empty() => e.encode_all(prompts),
+            _ => prompts.iter().map(|p| self.encode(p, images)).collect(),
+        }
+    }
+
     fn residency(&self) -> Json {
         match self {
             Encoder::Candle(e) => e.residency(),
@@ -411,19 +420,19 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
     dev.synchronize()?;
     let text_load_seconds = text_load_start.elapsed().as_secs_f64();
     let encoding_start = Instant::now();
-    let mut embeddings = Vec::new();
-    for (i, prompt) in r.prompts.iter().enumerate() {
-        embeddings.push(encoder.encode(prompt, &features)?);
+    // every prompt (and CFG's blank negative last) at once: WebGPU's encoder reads its weights once for them all
+    let mut texts: Vec<&str> = r.prompts.iter().map(String::as_str).collect();
+    if r.cfg > 1. {
+        texts.push(" ");
+    }
+    let mut embeddings = encoder.encode_all(&texts, &features)?;
+    let negative = if r.cfg > 1. { embeddings.pop() } else { None };
+    for i in 0..embeddings.len() {
         event(Json::obj([
             ("stage", Json::str("encoding")),
             ("completed", Json::Int((i + 1) as i64)),
         ]));
     }
-    let negative = if r.cfg > 1. {
-        Some(encoder.encode(" ", &features)?)
-    } else {
-        None
-    };
     let text_residency = encoder.residency();
     drop(encoder);
     drop(features);
@@ -451,14 +460,6 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
     for note in model.lora_notes() {
         event(Json::obj([("stage", Json::str("lora_note")), ("note", Json::str(note))]));
     }
-    event(Json::obj([("stage", Json::str("loading_vae"))]));
-    let load_start = Instant::now();
-    #[cfg(feature = "webgpu")]
-    let vae = if r.webgpu { Decoder::Wgpu(crate::vae_wgpu::WgpuVae::load(&r.base, r.device)?) } else { Decoder::Candle(Vae::load(&r.base, &dev, dtype)?) };
-    #[cfg(not(feature = "webgpu"))]
-    let vae = Decoder::Candle(Vae::load(&r.base, &dev, dtype)?);
-    dev.synchronize()?;
-    let vae_load_seconds = load_start.elapsed().as_secs_f64();
     let (h, w) = (r.height / 16, r.width / 16);
     let sigmas =
         schedule::sigmas(r.steps, h * w, r.adapter.is_some()).map_err(candle_core::Error::Msg)?;
@@ -468,6 +469,9 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
         .as_ref()
         .map(|n| model.prepare(n, &references))
         .transpose()?;
+    // every image sampled first, then the transformer let go before the decodes (its weights and a step's scratch:
+    // some 20 GB at 1024x1024 on WebGPU, beside the decoder's own)
+    let mut sampled = Vec::with_capacity(r.count);
     for i in 0..r.count {
         if prefix.is_none() || embeddings.len() > 1 {
             drop(prefix.take());
@@ -502,9 +506,25 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
                 ("seconds", Json::Num(step_start.elapsed().as_secs_f64())),
             ]));
         }
-        let sampling_seconds = image_start.elapsed().as_secs_f64();
+        sampled.push((i, pi, seed, latent, image_start.elapsed().as_secs_f64(), image_start));
+    }
+    let transformer_residency = model.residency();
+    drop(prefix);
+    drop(negative_prefix);
+    model.release_scratch();
+    drop(model);
+    // the decoder loaded only now: on WebGPU a second device on the card through the steps slowed some of them some
+    // ten seconds each (a two-picture job's last three, every time)
+    event(Json::obj([("stage", Json::str("loading_vae"))]));
+    let load_start = Instant::now();
+    #[cfg(feature = "webgpu")]
+    let vae = if r.webgpu { Decoder::Wgpu(crate::vae_wgpu::WgpuVae::load(&r.base, r.device)?) } else { Decoder::Candle(Vae::load(&r.base, &dev, dtype)?) };
+    #[cfg(not(feature = "webgpu"))]
+    let vae = Decoder::Candle(Vae::load(&r.base, &dev, dtype)?);
+    dev.synchronize()?;
+    let vae_load_seconds = load_start.elapsed().as_secs_f64();
+    for (i, pi, seed, latent, sampling_seconds, image_start) in sampled {
         let decode_start = Instant::now();
-        model.release_scratch();
         let rgba = vae
             .decode(&latent, h, w)?
             .to_dtype(DType::F32)?
@@ -600,7 +620,7 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
             "residency",
             Json::obj([
                 ("budget", r.budget.to_json()),
-                ("transformer", model.residency()),
+                ("transformer", transformer_residency),
                 ("text_encoder", text_residency),
             ]),
         ),

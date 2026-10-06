@@ -384,6 +384,7 @@ impl Store {
     }
     /// `key`'s bytes where it is stored as BF16 and read as it is (no LoRA, scale or rotation on it): for a device that
     /// converts them itself, on every core.
+    #[cfg(feature = "webgpu")]
     pub fn bf16_bytes(&mut self, key: &str) -> Result<Option<Vec<u8>>> {
         let info = self.index.info(key).map_err(candle_core::Error::wrap)?.clone();
         if info.dtype != Dtype::BF16 || self.lora.contains_key(key) || self.scale(key)?.is_some() || self.rotation(key)?.is_some() {
