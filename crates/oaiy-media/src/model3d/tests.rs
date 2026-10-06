@@ -269,7 +269,7 @@ fn pictures_are_cut_out_and_enlarged() -> Result<()> {
     let mut scene = image::imageops::resize(&image::open(std::env::var("SCENE").unwrap_or_else(|_| "C:/Users/User/AppData/Local/Temp/claude/E--repos-bot-computer/fc80cba4-4bf0-4581-8aca-668cb05bf606/scratchpad/pixal3d/repo/assets/app/hdri_city.png".into())).unwrap().to_rgba8(), 1200, 1000, image::imageops::FilterType::Lanczos3);
     image::imageops::overlay(&mut scene, &turtle, 150, 60);
     image::DynamicImage::ImageRgba8(scene).to_rgb8().save(out.join("busy.png")).unwrap();
-    let helpers = super::prepare::Helpers { matte: Some(std::path::Path::new("E:/models/BiRefNet")), upscaler: Some(std::path::Path::new("E:/models/Real-ESRGAN/RealESRGAN_x4plus.pth")), dev: &dev };
+    let helpers = super::prepare::Helpers { matte: Some(std::path::Path::new("E:/models/BiRefNet")), upscaler: Some(std::path::Path::new("E:/models/Real-ESRGAN/RealESRGAN_x4plus.pth")), dev: &dev, webgpu: None };
     for (name, picture) in [("bust", std::path::PathBuf::from("E:/p3dref/case4/input.png")), ("small", out.join("small.png")), ("busy", out.join("busy.png"))] {
         let t = std::time::Instant::now();
         let p = super::prepare::prepare(&picture, &helpers)?;
@@ -294,7 +294,7 @@ fn only_a_picture_whose_alpha_cuts_something_out_is_taken_as_cut_out() {
     }
     assert!(!super::prepare::cuts_out(&img));
     img.save(dir.join("translucent.png")).unwrap();
-    let helpers = super::prepare::Helpers { matte: None, upscaler: None, dev: &Device::Cpu };
+    let helpers = super::prepare::Helpers { matte: None, upscaler: None, dev: &Device::Cpu, webgpu: None };
     let p = super::prepare::prepare(&dir.join("translucent.png"), &helpers).unwrap();
     assert_eq!(p.matte, "background");
     assert!(p.image.width() < 60, "cropped to the square, not the whole picture: {}", p.image.width());

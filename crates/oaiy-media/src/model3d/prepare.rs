@@ -39,6 +39,8 @@ pub struct Helpers<'a> {
     /// Real-ESRGAN x4plus weights: the square is made 2048 a side, enlarged where it has fewer pixels.
     pub upscaler: Option<&'a Path>,
     pub dev: &'a Device,
+    /// Both on WebGPU device `webgpu` instead ([`crate::birefnet_wgpu`], [`crate::esrgan_wgpu`]).
+    pub webgpu: Option<usize>,
 }
 
 /// A plain background's colour, when the border is (nearly) one colour.
@@ -149,9 +151,12 @@ pub fn prepare(path: &Path, helpers: &Helpers) -> Result<Prepared> {
     let matte = if has_alpha {
         "alpha"
     } else if let Some(dir) = helpers.matte {
-        let net = crate::birefnet::BiRefNet::load(dir, helpers.dev)?;
         let rgb: Vec<u8> = rgba.pixels().flat_map(|p| [p[0], p[1], p[2]]).collect();
-        let alpha = net.matte(&rgb, w as usize, h as usize)?;
+        let alpha = match helpers.webgpu {
+            #[cfg(feature = "webgpu")]
+            Some(device) => crate::birefnet_wgpu::WgpuBiRefNet::load(dir, device)?.matte(&rgb, w as usize, h as usize)?,
+            _ => crate::birefnet::BiRefNet::load(dir, helpers.dev)?.matte(&rgb, w as usize, h as usize)?,
+        };
         for (p, a) in rgba.pixels_mut().zip(alpha) {
             p[3] = a;
         }
@@ -212,11 +217,14 @@ pub fn prepare(path: &Path, helpers: &Helpers) -> Result<Prepared> {
             drop(full);
             // Fewer than half the pixels wanted: four times larger with Real-ESRGAN (its alpha bicubic, as Pillow).
             let square = if side < UPSCALED / 2 {
-                let net = crate::esrgan::Esrgan::load(weights, helpers.dev)?;
                 let s = side as usize;
                 let rgb: Vec<u8> = square.pixels().flat_map(|p| [p[0], p[1], p[2]]).collect();
                 let alpha: Vec<u8> = square.pixels().map(|p| p[3]).collect();
-                let big = net.upscale(&rgb, s, s)?;
+                let big = match helpers.webgpu {
+                    #[cfg(feature = "webgpu")]
+                    Some(device) => crate::esrgan_wgpu::WgpuEsrgan::load(weights, device)?.upscale_with(&rgb, s, s, |_, _| {})?,
+                    _ => crate::esrgan::Esrgan::load(weights, helpers.dev)?.upscale(&rgb, s, s)?,
+                };
                 let b = s * crate::esrgan::SCALE;
                 let big_alpha = oaiy_image::resize::resample(&alpha, 1, s, s, b, b, oaiy_image::resize::Filter::Bicubic);
                 let mut bigger = RgbaImage::new(b as u32, b as u32);

@@ -17,6 +17,11 @@
 //!
 //! One model is on the GPU at a time. The reference's own steps, guidance and
 //! normalization come from its pipeline.json.
+//!
+//! `backend` "webgpu" runs it on WebGPU, as a worker built with WebGPU and
+//! without CUDA does by default: the picture's preparation, the flow
+//! transformers and the decoders there ([`crate::model3d_wgpu`]); DINOv3, NAF
+//! and the voxels' projections on the CPU (F32, as the reference runs them).
 pub mod bake;
 pub mod decoder;
 pub mod dinov3;
@@ -77,6 +82,8 @@ pub struct Request {
     pub matte: Option<PathBuf>,
     /// Real-ESRGAN x4plus's weights: enlarges a small picture before it is seen.
     pub upscaler: Option<PathBuf>,
+    /// On WebGPU.
+    pub webgpu: bool,
 }
 
 impl Request {
@@ -104,8 +111,17 @@ impl Request {
             texture_size: j.get("texture_size").and_then(Json::as_i64).unwrap_or(2048).max(0) as u32,
             matte: s("matte").filter(|v| !v.is_empty()).map(PathBuf::from),
             upscaler: s("upscaler").filter(|v| !v.is_empty()).map(PathBuf::from),
+            webgpu: match s("backend").as_deref() {
+                Some("webgpu") => true,
+                Some("cuda" | "cpu") => false,
+                Some(other) => return Err(format!("3d: backend must be webgpu, cuda or cpu, not {other}")),
+                None => cfg!(all(feature = "webgpu", not(feature = "cuda"))),
+            },
             model_dir,
         };
+        if r.webgpu && !cfg!(feature = "webgpu") {
+            return Err("3d: this build has no WebGPU (the webgpu feature)".into());
+        }
         if r.resolution != 1024 && r.resolution != 1536 {
             return Err("3d: resolution must be 1024 or 1536".into());
         }
@@ -329,6 +345,10 @@ fn project(seen: &Seen, naf: Option<(&naf::Naf, usize)>, coords: &[[i32; 3]], gr
 pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     let started = Instant::now();
     std::fs::create_dir_all(&r.output)?;
+    #[cfg(feature = "webgpu")]
+    if r.webgpu {
+        return generate_webgpu(r, report);
+    }
     let dev = device(r.device)?;
     let pipeline = Json::parse(&std::fs::read(r.model_dir.join("pipeline.json"))?).map_err(candle_core::Error::wrap)?;
     let model = |key: &str| -> Result<PathBuf> {
@@ -347,7 +367,7 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         let img = image::ImageReader::open(&r.image)?.with_guessed_format()?.decode().map_err(candle_core::Error::wrap)?;
         prepare::Prepared { image: img.to_rgb8(), cutout: img.to_rgba8(), matte: "prepared", upscaled: None }
     } else {
-        prepare::prepare(&r.image, &prepare::Helpers { matte: r.matte.as_deref(), upscaler: r.upscaler.as_deref(), dev: &dev })?
+        prepare::prepare(&r.image, &prepare::Helpers { matte: r.matte.as_deref(), upscaler: r.upscaler.as_deref(), dev: &dev, webgpu: None })?
     };
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_err(candle_core::Error::wrap)?.as_nanos();
     let cutout = r.output.join(format!("model-{stamp}-input.png"));
@@ -531,6 +551,264 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         ("texture_size", Json::Int(if textures.is_some() { r.texture_size as i64 } else { 0 })),
         ("seconds", Json::Num(started.elapsed().as_secs_f64())),
         ("seed", Json::Int(r.seed as i64)),
+    ]))
+}
+
+/// [`sample`] on the host's values: `model(x, t·1000, conditional)` the velocity (the device's).
+#[cfg(feature = "webgpu")]
+fn sample_values(mut x: Vec<f32>, s: &Sampling, unbiased: bool, mut model: impl FnMut(&[f32], f64, bool) -> Result<Vec<f32>>, mut report: impl FnMut(usize, usize)) -> Result<Vec<f32>> {
+    let spread = |v: &[f32]| -> f64 {
+        let n = v.len() as f64;
+        let mean = v.iter().map(|&a| a as f64).sum::<f64>() / n;
+        (v.iter().map(|&a| (a as f64 - mean).powi(2)).sum::<f64>() / if unbiased { n - 1. } else { n }).sqrt()
+    };
+    let ts: Vec<f64> = (0..=s.steps).map(|i| 1. - i as f64 / s.steps as f64).map(|t| s.rescale_t * t / (1. + (s.rescale_t - 1.) * t)).collect();
+    for i in 0..s.steps {
+        report(i, s.steps);
+        let (t, t_prev) = (ts[i], ts[i + 1]);
+        let guided = s.guidance != 1. && s.interval.0 <= t && t <= s.interval.1;
+        let pred = if !guided {
+            model(&x, 1000. * t, true)?
+        } else {
+            let pos = model(&x, 1000. * t, true)?;
+            let neg = model(&x, 1000. * t, false)?;
+            let (g, h) = (s.guidance as f32, (1. - s.guidance) as f32);
+            let mut pred: Vec<f32> = pos.iter().zip(&neg).map(|(p, n)| p * g + n * h).collect();
+            if s.rescale > 0. {
+                let k = (SIGMA_MIN + (1. - SIGMA_MIN) * t) as f32;
+                let keep = (1. - SIGMA_MIN) as f32;
+                let x0_pos: Vec<f32> = x.iter().zip(&pos).map(|(a, p)| a * keep - p * k).collect();
+                let x0_cfg: Vec<f32> = x.iter().zip(&pred).map(|(a, p)| a * keep - p * k).collect();
+                let ratio = spread(&x0_pos) / spread(&x0_cfg);
+                let (a, b) = ((s.rescale * ratio) as f32, (1. - s.rescale) as f32);
+                pred = x.iter().zip(&x0_cfg).map(|(v, c)| (v * keep - (c * a + c * b)) / k).collect();
+            }
+            pred
+        };
+        let dt = (t - t_prev) as f32;
+        for (a, p) in x.iter_mut().zip(&pred) {
+            *a -= p * dt;
+        }
+    }
+    report(s.steps, s.steps);
+    Ok(x)
+}
+
+/// A tensor's values (F32).
+#[cfg(feature = "webgpu")]
+fn values(t: &Tensor) -> Result<Vec<f32>> {
+    t.to_dtype(DType::F32)?.flatten_all()?.to_vec1()
+}
+
+/// The host's values as a tensor on the CPU (for the dumps).
+#[cfg(feature = "webgpu")]
+fn host(v: &[f32], rows: usize) -> Result<Tensor> {
+    Tensor::from_vec(v.to_vec(), (rows, v.len() / rows.max(1)), &Device::Cpu)
+}
+
+/// [`generate`] on WebGPU: the picture's preparation, the four flows and the decoders on the device; DINOv3, NAF and
+/// the voxels' projections on the CPU (F32).
+#[cfg(feature = "webgpu")]
+fn generate_webgpu(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
+    use crate::model3d_wgpu::{table, WgpuDit3, WgpuLevel, WgpuSparseDecoder, WgpuStructureDecoder};
+    let started = Instant::now();
+    let cpu = Device::Cpu;
+    let pipeline = Json::parse(&std::fs::read(r.model_dir.join("pipeline.json"))?).map_err(candle_core::Error::wrap)?;
+    let model = |key: &str| -> Result<PathBuf> {
+        let rel = pipeline.get("args").and_then(|a| a.get("models")).and_then(|m| m.get(key)).and_then(Json::as_str).ok_or_else(|| candle_core::Error::Msg(format!("pipeline.json: no {key}")))?;
+        Ok(r.model_dir.join(rel))
+    };
+    let ss_sampling = Sampling::read(&pipeline, "sparse_structure_sampler", r.steps);
+    let shape_sampling = Sampling::read(&pipeline, "shape_slat_sampler", r.steps);
+    let tex_sampling = Sampling::read(&pipeline, "tex_slat_sampler", r.steps);
+    let shape_norm = normalization(&pipeline, "shape_slat_normalization")?;
+    let tex_norm = normalization(&pipeline, "tex_slat_normalization")?;
+    let denorm = |v: &[f32], (mean, std): &(Vec<f32>, Vec<f32>)| -> Vec<f32> { v.iter().enumerate().map(|(i, x)| x * std[i % std.len()] + mean[i % mean.len()]).collect() };
+    let renorm = |v: &[f32], (mean, std): &(Vec<f32>, Vec<f32>)| -> Vec<f32> { v.iter().enumerate().map(|(i, x)| (x - mean[i % mean.len()]) / std[i % std.len()]).collect() };
+
+    // 1. The picture (its helpers on their own devices, gone before the flows').
+    report(event("preparing_image", 0, 1));
+    let prepared = if r.prepared {
+        let img = image::ImageReader::open(&r.image)?.with_guessed_format()?.decode().map_err(candle_core::Error::wrap)?;
+        prepare::Prepared { image: img.to_rgb8(), cutout: img.to_rgba8(), matte: "prepared", upscaled: None }
+    } else {
+        prepare::prepare(&r.image, &prepare::Helpers { matte: r.matte.as_deref(), upscaler: r.upscaler.as_deref(), dev: &cpu, webgpu: Some(r.device) })?
+    };
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_err(candle_core::Error::wrap)?.as_nanos();
+    let cutout = r.output.join(format!("model-{stamp}-input.png"));
+    prepared.cutout.save(&cutout).map_err(candle_core::Error::wrap)?;
+    let fov = r.fov_degrees.to_radians();
+    let cam = proj::Camera::framing(fov, 1., 512., 0.);
+    report(event("encoding_image", 0, 2));
+    let dino = dinov3::Dinov3::load(&r.dino_dir, &cpu)?;
+    let seen512 = see(&dino, &prepared.image, 512, &cpu)?;
+    report(event("encoding_image", 1, 2));
+    let seen1024 = see(&dino, &prepared.image, 1024, &cpu)?;
+    drop(dino);
+    let naf = naf::Naf::load(&r.naf, &cpu)?;
+    let (global512, global1024) = (values(&seen512.global)?, values(&seen1024.global)?);
+    let tokens = seen512.global.dim(0)?;
+    let gpu = ggml_rs_wgpu::WgpuBackend::nth(r.device, None).map_err(|e| candle_core::Error::Msg(format!("3D on WebGPU: {e}")))?;
+    // one flow model's run: its conditioning, its starting noise, the sampler; the velocity on the device
+    let run = |path: &Path, coords: &[[i32; 3]], proj: &[f32], global: &[f32], x: Vec<f32>, extra: Option<&[f32]>, s: &Sampling, unbiased: bool, report: &mut dyn FnMut(usize, usize)| -> Result<Vec<f32>> {
+        let flow = WgpuDit3::load(path, &gpu)?;
+        let n = coords.len();
+        let pos = flow.context(&gpu, Some(global), Some(proj), tokens);
+        let neg = flow.context(&gpu, None, None, tokens);
+        let rope = crate::model3d_wgpu::upload_values(&gpu, &table(coords, 128));
+        let w = flow.scratch(&gpu, n);
+        let cin = flow.config().in_channels;
+        let (xd, out) = (ggml_rs::DeviceChain::vec(&gpu, n * cin), ggml_rs::DeviceChain::vec(&gpu, n * flow.config().out_channels));
+        sample_values(x, s, unbiased, |x, t, conditional| {
+            // (the texture's flow takes the shape as input channels after its noise)
+            let input: Vec<f32> = match extra {
+                Some(e) => {
+                    let (a, b) = (x.len() / n, e.len() / n);
+                    (0..n).flat_map(|i| x[i * a..(i + 1) * a].iter().chain(&e[i * b..(i + 1) * b]).copied()).collect()
+                }
+                None => x.to_vec(),
+            };
+            ggml_rs::DeviceChain::upload(&gpu, &xd, &input);
+            let mods = crate::model3d_wgpu::upload_values(&gpu, &flow.modulation(t));
+            let mut rec = ggml_rs::DeviceChain::begin(&gpu);
+            rec.keep_groups(false);
+            flow.forward(&w, rec.as_mut(), &xd, &mods, &rope, if conditional { &pos } else { &neg }, &out);
+            rec.as_mut().read(&out);
+            rec.finish().pop().ok_or_else(|| candle_core::Error::Msg("3D on WebGPU: the velocity was not read".into()))
+        }, report)
+    };
+
+    // 2. The coarse structure.
+    let ss_res = 16usize;
+    let dense = Level::dense(ss_res, &cpu)?;
+    let proj_ss = values(&project(&seen512, None, &dense.coords, ss_res, &cam, &cpu)?)?;
+    let coords32 = {
+        let n = ss_res * ss_res * ss_res;
+        let c_in = dit::Config::read(&model("sparse_structure_flow_model")?.with_extension("json"))?.in_channels;
+        // the noise as the reference draws it, [C, 16³], as tokens [16³, C]
+        let planes = start_noise(r, "ss", 1, c_in * n)?;
+        let x: Vec<f32> = (0..n * c_in).map(|i| planes[(i % c_in) * n + i / c_in]).collect();
+        let z = run(&model("sparse_structure_flow_model")?, &dense.coords, &proj_ss, &global512, x, None, &ss_sampling, true, &mut |i, n| report(event("making_structure", i, n)))?;
+        dump(r, "ss_latent", &host(&z, n)?)?;
+        let decoder = WgpuStructureDecoder::load(&model("sparse_structure_decoder")?, &gpu)?;
+        let (logits, res) = decoder.forward(&gpu, &z)?;
+        // occupied at 64³, max-pooled to 32³ (any occupied child)
+        let f = res / 32;
+        let mut cells = std::collections::BTreeSet::new();
+        for (i, v) in logits.iter().enumerate() {
+            if *v > 0. {
+                let (x, y, z) = (i / (res * res), (i / res) % res, i % res);
+                cells.insert([(x / f) as i32, (y / f) as i32, (z / f) as i32]);
+            }
+        }
+        cells.into_iter().collect::<Vec<_>>()
+    };
+    let coords32 = given_coords(r, "coords32")?.unwrap_or(coords32);
+    if coords32.is_empty() {
+        candle_core::bail!("3d: no structure came out of the picture (is the object in view, on a plain background?)");
+    }
+    dump_coords(r, "coords32", &coords32)?;
+
+    // 3. The shape at 512, the finer voxels it proposes, and the shape there.
+    let proj_lr = values(&project(&seen512, Some((&naf, 512)), &coords32, 32, &cam, &cpu)?)?;
+    let shape_flow = model("shape_slat_flow_model_512")?;
+    let c = dit::Config::read(&shape_flow.with_extension("json"))?.in_channels;
+    let x = start_noise(r, "shape_lr", 2, coords32.len() * c)?;
+    let lr = run(&shape_flow, &coords32, &proj_lr, &global512, x, None, &shape_sampling, false, &mut |i, n| report(event("making_shape", i, n * 2)))?;
+    let lr_slat = denorm(&lr, &shape_norm);
+    dump(r, "shape512", &host(&lr_slat, coords32.len())?)?;
+    drop(proj_lr);
+    let shape_decoder = WgpuSparseDecoder::load(&model("shape_slat_decoder")?, &gpu)?;
+    let fine = shape_decoder.upsample(&gpu, WgpuLevel::new(&gpu, coords32.clone(), 32), &lr_slat, 4)?;
+    // quantized to the high-resolution latent grid, fewer tokens if there are too many
+    let mut hr_res = r.resolution;
+    let hr_coords = loop {
+        let grid = hr_res / 16;
+        let mut q: Vec<[i32; 3]> = fine.coords.iter().map(|c| c.map(|v| ((((v as f32) + 0.5) / 512.) * (grid as f32 - 1.)).round_ties_even() as i32)).collect();
+        q.sort_unstable();
+        q.dedup();
+        if q.len() < r.max_tokens || hr_res == 1024 {
+            break q;
+        }
+        hr_res -= 128;
+    };
+    drop(fine);
+    let hr_coords = given_coords(r, "coords_hr")?.unwrap_or(hr_coords);
+    let grid = hr_res / 16;
+    dump_coords(r, "coords_hr", &hr_coords)?;
+    let proj_hr = values(&project(&seen1024, Some((&naf, 512)), &hr_coords, grid, &cam, &cpu)?)?;
+    let shape_flow = model("shape_slat_flow_model_1024")?;
+    let x = start_noise(r, "shape_hr", 3, hr_coords.len() * c)?;
+    let z = run(&shape_flow, &hr_coords, &proj_hr, &global1024, x, None, &shape_sampling, false, &mut |i, n| report(event("making_shape", n + i, n * 2)))?;
+    let shape = denorm(&z, &shape_norm);
+    dump(r, "shape_hr", &host(&shape, hr_coords.len())?)?;
+    drop(proj_hr);
+
+    // 4. The texture on the same voxels.
+    let proj_tex = values(&project(&seen1024, Some((&naf, 1024)), &hr_coords, grid, &cam, &cpu)?)?;
+    let tex_flow = model("tex_slat_flow_model_1024")?;
+    let shape_n = renorm(&shape, &shape_norm);
+    let c_tex = dit::Config::read(&tex_flow.with_extension("json"))?.in_channels - shape_n.len() / hr_coords.len();
+    let x = start_noise(r, "tex", 4, hr_coords.len() * c_tex)?;
+    let z = run(&tex_flow, &hr_coords, &proj_tex, &global1024, x, Some(&shape_n), &tex_sampling, false, &mut |i, n| report(event("making_texture", i, n)))?;
+    let tex = denorm(&z, &tex_norm);
+    dump(r, "tex_hr", &host(&tex, hr_coords.len())?)?;
+    drop((proj_tex, naf, seen512, seen1024));
+
+    // 5. Decoding, the mesh and its colours.
+    report(event("decoding", 0, 2));
+    let decoded = shape_decoder.forward(&gpu, WgpuLevel::new(&gpu, hr_coords.clone(), grid), &shape, None)?;
+    drop(shape_decoder);
+    let res = decoded.level.res;
+    report(event("decoding", 1, 2));
+    let tex_decoder = WgpuSparseDecoder::load(&model("tex_slat_decoder")?, &gpu)?;
+    let attrs = tex_decoder.forward(&gpu, WgpuLevel::new(&gpu, hr_coords.clone(), grid), &tex, Some(&decoded.subdivisions))?;
+    drop(tex_decoder);
+    drop(gpu);
+    let colors: Vec<f32> = attrs.feats.iter().map(|v| v * 0.5 + 0.5).collect();
+    report(event("meshing", 0, 3));
+    let voxels = decoded.level.coords.len();
+    let raw = mesh::dual_grid(&decoded.level.coords, &decoded.feats, res);
+    let raw_faces = raw.triangles.len();
+    let surface = remesh::Surface::new(&raw, r.remesh.unwrap_or(res));
+    drop(raw);
+    let mut mesh = remesh::remesh(&surface);
+    report(event("meshing", 1, 3));
+    simplify(&mut mesh, r.faces);
+    report(event("meshing", 2, 3));
+    let sampler = mesh::Voxels::new(&decoded.level.coords, &colors, res);
+    let (mesh, textures) = if r.texture_size == 0 {
+        mesh.color_from_voxels(&sampler);
+        (mesh, None)
+    } else {
+        let baked = bake::bake(&mesh, &surface, &sampler, r.texture_size)?;
+        (baked.mesh, Some(baked.textures))
+    };
+    drop((surface, sampler));
+    let glb = glb::write(&mesh, textures.as_ref());
+    let path = r.output.join(format!("model-{stamp}-{}.glb", r.seed));
+    std::fs::write(&path, &glb)?;
+    report(event("meshing", 3, 3));
+    Ok(Json::obj([
+        ("path", Json::str(path.to_string_lossy())),
+        ("input", Json::str(cutout.to_string_lossy())),
+        ("matte", Json::str(prepared.matte)),
+        ("upscaled", match prepared.upscaled {
+            Some((from, to)) => Json::Arr(vec![Json::Int(from as i64), Json::Int(to as i64)]),
+            None => Json::Null,
+        }),
+        ("resolution", Json::Int(res as i64)),
+        ("voxels", Json::Int(voxels as i64)),
+        ("tokens", Json::Int(hr_coords.len() as i64)),
+        ("raw_faces", Json::Int(raw_faces as i64)),
+        ("faces", Json::Int(mesh.triangles.len() as i64)),
+        ("vertices", Json::Int(mesh.positions.len() as i64)),
+        ("bytes", Json::Int(glb.len() as i64)),
+        ("fov_degrees", Json::Num(r.fov_degrees)),
+        ("texture_size", Json::Int(if textures.is_some() { r.texture_size as i64 } else { 0 })),
+        ("seconds", Json::Num(started.elapsed().as_secs_f64())),
+        ("seed", Json::Int(r.seed as i64)),
+        ("backend", Json::str("webgpu")),
     ]))
 }
 

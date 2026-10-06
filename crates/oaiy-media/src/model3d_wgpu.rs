@@ -22,6 +22,11 @@ fn upload(gpu: &WgpuBackend, v: &[f32]) -> DeviceVec {
     d
 }
 
+/// `v` on the device.
+pub fn upload_values(gpu: &WgpuBackend, v: &[f32]) -> DeviceVec {
+    upload(gpu, v)
+}
+
 /// A tensor's F32 values.
 fn f32s(s: &mut Store, key: &str) -> Result<Vec<f32>> {
     s.tensor_f32(key, &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()
