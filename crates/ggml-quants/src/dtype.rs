@@ -41,6 +41,8 @@ pub enum GgmlType {
     Q4_0_8_8 = 33,
     TQ1_0   = 34,
     TQ2_0   = 35,
+    /// 2 bits a weight, a scale a block of 64 (the GSQ-RCO GGUFs' routed experts).
+    Q2_0    = 42,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -84,6 +86,7 @@ impl GgmlType {
             33 => Self::Q4_0_8_8,
             34 => Self::TQ1_0,
             35 => Self::TQ2_0,
+            42 => Self::Q2_0,
             other => return Err(UnknownDtype(other)),
         })
     }
@@ -100,6 +103,7 @@ impl GgmlType {
             IQ4_XS => 256,
             Q4_0_4_4 | Q4_0_4_8 | Q4_0_8_8 => 32,
             TQ1_0 | TQ2_0 => 256,
+            Q2_0 => 64,
         }
     }
 
@@ -139,6 +143,7 @@ impl GgmlType {
             Q4_0_4_4 | Q4_0_4_8 | Q4_0_8_8 => 18,
             TQ1_0   => 2 + 53,
             TQ2_0   => 2 + 64,
+            Q2_0    => 2 + 16,
         }
     }
 
@@ -163,6 +168,7 @@ impl GgmlType {
             IQ4_NL => "IQ4_NL", IQ4_XS => "IQ4_XS",
             Q4_0_4_4 => "Q4_0_4_4", Q4_0_4_8 => "Q4_0_4_8", Q4_0_8_8 => "Q4_0_8_8",
             TQ1_0 => "TQ1_0", TQ2_0 => "TQ2_0",
+            Q2_0 => "Q2_0",
         }
     }
 }

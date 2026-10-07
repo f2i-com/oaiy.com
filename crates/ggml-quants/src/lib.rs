@@ -15,6 +15,7 @@ pub mod error;
 
 pub mod iq4_nl;
 pub mod iq4_xs;
+pub mod q2_0;
 pub mod q2_k;
 pub mod q3_k;
 pub mod q4_0;
@@ -57,6 +58,7 @@ pub fn dequantize(dtype: GgmlType, src: &[u8], dst: &mut [f32]) -> Result<()> {
         GgmlType::F32 => copy_f32(src, dst),
         GgmlType::F16 => dequant_f16(src, dst),
         GgmlType::BF16 => dequant_bf16(src, dst),
+        GgmlType::Q2_0 => q2_0::dequantize(src, dst),
         GgmlType::Q4_0 => q4_0::dequantize(src, dst),
         GgmlType::Q4_1 => q4_1::dequantize(src, dst),
         GgmlType::Q5_0 => q5_0::dequantize(src, dst),
@@ -78,6 +80,7 @@ pub fn is_supported(dtype: GgmlType) -> bool {
     matches!(
         dtype,
         GgmlType::F32 | GgmlType::F16 | GgmlType::BF16
+            | GgmlType::Q2_0
             | GgmlType::Q4_0 | GgmlType::Q4_1
             | GgmlType::Q5_0 | GgmlType::Q5_1
             | GgmlType::Q8_0
