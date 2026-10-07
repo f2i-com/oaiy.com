@@ -8,7 +8,7 @@
 use crate::codec_wgpu::WgpuCodec;
 use crate::tts_wgpu::{FramesEnd, WgpuTalker};
 use candle_core::{Device, Result};
-use oaiy_tts::codec::{LEFT_CONTEXT, SAMPLE_RATE};
+use oaiy_tts::codec::SAMPLE_RATE;
 use oaiy_tts::talker::FRAMES_PER_SECOND;
 use oaiy_tts::voice::Voice;
 use oaiy_tts::{clone, Finish, LeadIn, SpeakOptions, SpeakReport};
@@ -19,6 +19,19 @@ use std::time::Instant;
 fn err(e: impl std::fmt::Display) -> candle_core::Error {
     candle_core::Error::Msg(format!("speech on WebGPU: {e}"))
 }
+
+/// Frames a stream's chunk is decoded after. The codec's attention reaches 72 frames back in each of its eight
+/// layers, and the reach compounds, so a chunk decoded after a fixed number of frames is the whole decode's only
+/// while the line (and its voice's clip before it) is no longer than that. Measured on a line of 249 frames against
+/// its whole decode (`a_streams_chunks_against_the_whole_decode`): after the official chunked decode's 25 frames a
+/// chunk is 17 dB from it (a fiftieth of its power in error, at every chunk's edge), after 80 frames 33 dB, after 120
+/// 48 dB, after 160 62 dB, a chunk of four frames costing 29, 55, 74 and 87 ms. 120: an error 48 dB under the
+/// speech, for a quarter of real time. Only a stream that keeps each stage's state (Candle's does: the
+/// transformer's keys and values, each causal convolution's last inputs) is the whole decode's at any length, at
+/// the cost of the new frames alone; this one is to become that.
+const STREAM_CONTEXT: usize = 120;
+/// Frames a chunk after the first: four (0.32 s of sound), which halves what the decodes cost against two.
+const CHUNK_FRAMES: usize = 4;
 
 /// The engine: a Qwen3-TTS Base model resident on one WebGPU adapter.
 pub struct WgpuTts {
@@ -58,7 +71,7 @@ impl WgpuTts {
             model_dir: model_dir.to_path_buf(),
             ffmpeg: PathBuf::from("ffmpeg"),
             voice_cache: Some(std::env::temp_dir().join("oaiy-tts-voices")),
-            options: SpeakOptions::default(),
+            options: SpeakOptions { chunk_frames: CHUNK_FRAMES, ..SpeakOptions::default() },
         };
         tts.warm_up()?;
         Ok(tts)
@@ -162,7 +175,7 @@ impl WgpuTts {
         report.prefill_seconds = started.elapsed().as_secs_f64();
         let Self { talker, codec, .. } = self;
         // the frames a chunk is decoded after: the voice's clip's last ones, then the line's own
-        let mut before: Vec<[u32; 16]> = voice.ref_codes[voice.ref_codes.len().saturating_sub(LEFT_CONTEXT)..].to_vec();
+        let mut before: Vec<[u32; 16]> = voice.ref_codes[voice.ref_codes.len().saturating_sub(STREAM_CONTEXT)..].to_vec();
         let mut gate = LeadIn::new(o.trim_leading_silence);
         let mut pending: Vec<[u32; 16]> = Vec::new();
         let mut emit = |samples: Vec<f32>, report: &mut SpeakReport| {
@@ -179,9 +192,9 @@ impl WgpuTts {
             if pending.is_empty() {
                 return Ok(Vec::new());
             }
-            let samples = codec.decode_after(before, pending)?;
+            let samples = codec.decode_after_with(before, pending, STREAM_CONTEXT)?;
             before.append(pending);
-            let extra = before.len().saturating_sub(LEFT_CONTEXT);
+            let extra = before.len().saturating_sub(STREAM_CONTEXT);
             before.drain(..extra);
             Ok(samples)
         };
@@ -220,12 +233,63 @@ impl WgpuTts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oaiy_tts::codec::LEFT_CONTEXT;
 
     /// A server loads the engine on one thread and speaks on another.
     #[test]
     fn the_engine_can_move_between_threads() {
         fn send<T: Send>() {}
         send::<WgpuTts>();
+    }
+
+    /// A stream's chunks against the whole decode of the same frames (`--ignored --nocapture`; `OAIY_TTS` the model's
+    /// folder, `OAIY_TTS_VOICE` a saved voice, whose clip's codes are the frames): the signal-to-noise ratio of each
+    /// chunk size and context, where the whole decode has every frame before.
+    #[test]
+    #[ignore = "needs a Qwen3-TTS Base model, a saved voice and a WebGPU adapter"]
+    fn a_streams_chunks_against_the_whole_decode() -> Result<()> {
+        let dir = PathBuf::from(std::env::var("OAIY_TTS").unwrap_or_else(|_| "E:/models/Qwen3-TTS-12Hz-0.6B-Base".into()));
+        let device = std::env::var("OAIY_TTS_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let voice = Voice::open(Path::new(&std::env::var("OAIY_TTS_VOICE").map_err(err)?)).map_err(err)?;
+        // (the clip three times over: a line longer than any context tried, so none is the whole of it)
+        let frames = &voice.ref_codes.repeat(3);
+        assert!(frames.len() > 2 * STREAM_CONTEXT, "the voice's clip is too short to tell");
+        let gpu = ggml_rs_wgpu::WgpuBackend::nth(device, None).map_err(err)?;
+        let codec = WgpuCodec::load(&dir.join("speech_tokenizer").join("model.safetensors"), &gpu)?;
+        let whole = codec.decode(frames)?;
+        let snr = |got: &[f32], from: usize| {
+            let (mut signal, mut noise) = (0f64, 0f64);
+            for (a, b) in whole[from..].iter().zip(&got[from..]) {
+                signal += (*a as f64).powi(2);
+                noise += (*a as f64 - *b as f64).powi(2);
+            }
+            10. * (signal / noise.max(1e-30)).log10()
+        };
+        eprintln!("{} frames ({:.1} s)", frames.len(), frames.len() as f64 / FRAMES_PER_SECOND);
+        let after = 80 * oaiy_tts::codec::SAMPLES_PER_FRAME;
+        let mut ours = 0.;
+        for (chunk, context) in [(2usize, LEFT_CONTEXT), (4, LEFT_CONTEXT), (4, 80), (4, STREAM_CONTEXT), (4, 160)] {
+            let mut stream = Vec::with_capacity(whole.len());
+            let started = Instant::now();
+            for at in (0..frames.len()).step_by(chunk) {
+                let end = (at + chunk).min(frames.len());
+                stream.extend(codec.decode_after_with(&frames[..at], &frames[at..end], context)?);
+            }
+            let seconds = started.elapsed().as_secs_f64();
+            assert_eq!(stream.len(), whole.len());
+            eprintln!(
+                "chunks of {chunk} after {context} frames: SNR {:.1} dB over the line, {:.1} dB past its first 80 frames; {:.1} ms a chunk ({:.2} of real time)",
+                snr(&stream, 0),
+                snr(&stream, after),
+                seconds * 1e3 / frames.len().div_ceil(chunk) as f64,
+                seconds / (frames.len() as f64 / FRAMES_PER_SECOND)
+            );
+            if (chunk, context) == (4, STREAM_CONTEXT) {
+                ours = snr(&stream, after);
+            }
+        }
+        assert!(ours > 40., "the stream's chunks are {ours:.1} dB from the whole decode");
+        Ok(())
     }
 
     /// The Base model speaking two lines in a voice on WebGPU, streamed (`--ignored --nocapture`; `OAIY_TTS` the

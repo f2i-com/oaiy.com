@@ -164,15 +164,17 @@ let report = tts.speak(text, &voice, &cancel, |pcm: &[i16]| { /* play it */ })?;
 
 `oaiy_tts::Tts` is the same engine on Candle (`Tts::load(model_dir, &Device::Cpu)`): the
 reference the WebGPU one is written against, whose GPU was CUDA's. On WebGPU the talker
-hands each frame over as it draws it and the codec decodes each chunk after the 25 frames
-before it (the official chunked decode's left context), where Candle's stream carries each
-stage's state from chunk to chunk; a voice's speaker embedding and codes are made on the
-CPU, once a clip. Measured through `oaiy-voice` on an RTX 5090 (2026-10-08, the 0.6B Base,
-a voice from a 6-second clip): a line of 5.4 s spoken in 3.5 s (real-time factor 0.66),
-its first audio 0.64 s after the call; the 1.7B Base, real-time factor 0.55, first audio
-0.41 s. The CUDA engine's figures below (factor 0.15, first audio under 0.1 s) are what is
-still to be made up: a frame is 17 round trips to the GPU where CUDA replayed one graph,
-and a chunk's decode reads 25 frames again.
+hands each frame over as it draws it and the codec decodes each chunk of four frames after
+the 120 frames before it, where Candle's stream carries each stage's state from chunk to
+chunk; a voice's speaker embedding and codes are made on the CPU, once a clip. A chunk
+decoded so is 48 dB from the whole decode of the same frames on a long line (after the
+official chunked decode's 25 frames it is 17 dB: audible at every chunk's edge); only a
+stream that keeps its state is the whole decode's at any length, and this one is to become
+that. Measured through `oaiy-voice` on an RTX 5090 (2026-10-08, the 0.6B Base, a voice from
+a 6-second clip): a line of 5.4 s spoken in 4.5 s (real-time factor 0.83), its first audio
+0.94 s after the call. The CUDA engine's figures below (factor 0.15, first audio under
+0.1 s) are what is still to be made up: a frame is 17 round trips to the GPU where CUDA
+replayed one graph, and a chunk's decode reads its 120 frames of context again.
 
 - **Model folder.** The 0.6B release: `config.json`, `model.safetensors`,
   `vocab.json`, `merges.txt` and `speech_tokenizer/`. The speech tokenizer is

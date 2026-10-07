@@ -348,10 +348,15 @@ impl WgpuCodec {
     /// `before` ahead of them, as [`Self::decode`] reads each of its chunks. A stream's chunk: every stage is causal,
     /// so what a frame sounds like is settled once it is drawn, and the context is what the stages reach back for.
     pub fn decode_after(&self, before: &[[u32; 16]], new: &[[u32; 16]]) -> Result<Vec<f32>> {
+        self.decode_after_with(before, new, LEFT_CONTEXT)
+    }
+
+    /// [`Self::decode_after`] with `context` frames of `before` read ahead of `new`.
+    pub fn decode_after_with(&self, before: &[[u32; 16]], new: &[[u32; 16]], context: usize) -> Result<Vec<f32>> {
         if new.is_empty() {
             return Ok(Vec::new());
         }
-        let context = before.len().min(LEFT_CONTEXT);
+        let context = before.len().min(context);
         let mut frames = before[before.len() - context..].to_vec();
         frames.extend_from_slice(new);
         let wave = self.forward(&frames)?;
