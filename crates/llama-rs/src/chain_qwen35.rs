@@ -28,6 +28,35 @@ use crate::qwen35::{Qwen35Block, Qwen35Model};
 /// Rows a submit takes at most over two cards (the server's prompt chunks are 512), twice that on one.
 const MAX_ROWS: usize = 512;
 
+/// A prompt's pieces on a device's queue at once ([`DeviceChain::pieces_in_flight_at_most`]), for a run of
+/// [`FEW_ROWS`] or more: a card under a power limit (an RTX 5090 at 402 W of its 575) otherwise runs a tenth as fast
+/// for seconds at a time through a long prompt's chunks (the 27B's 15,360 tokens on one card: some 7 s in, a chunk
+/// 2.7 s where 0.26, for 3 to 15 s at a time; over two cards the second's half of a chunk 1.05 s where 0.05: 15,646
+/// tokens in 8.7 to 14.9 s, where now 4.3 to 5.7). So fed it does so once, for a second or two, and settles.
+const PIECES_IN_FLIGHT: usize = 2;
+const FEW_ROWS: usize = 64;
+
+/// Devices' queues holding a few pieces at once ([`PIECES_IN_FLIGHT`]) until this is dropped.
+struct FewInFlight<'a>(Vec<&'a dyn DeviceChain>);
+
+impl<'a> FewInFlight<'a> {
+    fn on(chains: impl IntoIterator<Item = &'a dyn DeviceChain>) -> Self {
+        let chains: Vec<_> = chains.into_iter().collect();
+        for c in &chains {
+            c.pieces_in_flight_at_most(PIECES_IN_FLIGHT);
+        }
+        Self(chains)
+    }
+}
+
+impl Drop for FewInFlight<'_> {
+    fn drop(&mut self) {
+        for c in &self.0 {
+            c.pieces_in_flight_at_most(0);
+        }
+    }
+}
+
 /// The most a prompt's attention scratch may take: a chunk's rows are cut to fit it (at 16K positions, 24 heads of
 /// 256 take 1.6 MB a row where the backend's attention leaves each run of positions' part there; a kernel that
 /// leaves none, 25 KB).
@@ -1017,6 +1046,8 @@ impl Qwen35Chain {
         }
         let st = self.state(m)?;
         let chain = m.backend.chain()?;
+        // a prompt's pieces a few at once on each device's queue; a step's, and a check's few rows', as recorded
+        let _few = (rows >= FEW_ROWS).then(|| FewInFlight::on(std::iter::once(chain).chain(self.second.get().and_then(|b| b.chain()))));
         let emb_own;
         let emb = if embeds.is_device() {
             emb_own = embeds.to_host();

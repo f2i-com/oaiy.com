@@ -2383,6 +2383,8 @@ mod dense_webgpu_timing {
         let llama_rs::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
         let fills: usize = std::env::var("QWEN35_FILLS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
         let pause: f64 = std::env::var("QWEN35_PAUSE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.);
+        // (QWEN35_CALL: the tokens a call on the way there, 512 unless given; the server's are 4,096)
+        let call: usize = std::env::var("QWEN35_CALL").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
         let mut kv = model.new_kv_cache(past + 1024);
         let tokens: Vec<u32> = (0..(past + 1024) as u32).map(|i| 1000 + (i * 7919) % 20000).collect();
         let at = std::cell::Cell::new(0usize);
@@ -2413,10 +2415,10 @@ mod dense_webgpu_timing {
             }
             let started = Instant::now();
             let mut line = Vec::new();
-            for i in 0..past / 512 {
-                line.push(format!("{:.0}", forward(512, &mut kv)));
-                if i % 6 == 5 {
-                    eprintln!("chunks to {}: {} ms", (i + 1) * 512, line.join(" "));
+            for i in 0..past / call {
+                line.push(format!("{:.0}", forward(call, &mut kv)));
+                if i % 6 == 5 || i + 1 == past / call {
+                    eprintln!("chunks to {}: {} ms", (i + 1) * call, line.join(" "));
                     line.clear();
                 }
             }

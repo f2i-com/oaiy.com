@@ -327,7 +327,7 @@ impl DenseGpu {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            gpu.queue.write_buffer(&ubuf, 0, &params);
+            gpu.queue().write_buffer(&ubuf, 0, &params);
             let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("oaiy-dense"),
                 layout: &gpu.layout,
@@ -387,7 +387,7 @@ pub fn forward_batch(items: &[(&DenseGpu, &[f32], usize, Range<usize>)]) -> Vec<
         enc.copy_buffer_to_buffer(&p.y, 0, &staging, at, p.size);
         at += p.size;
     }
-    gpu.queue.submit([enc.finish()]);
+    gpu.queue().submit([enc.finish()]);
     let raw = gpu.map_read(&staging, total);
     let mut at = 0usize;
     items
@@ -415,7 +415,7 @@ fn upload_f32(gpu: &Gpu, x: &[f32]) -> wgpu::Buffer {
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    gpu.queue.write_buffer(&buf, 0, &bytes);
+    gpu.queue().write_buffer(&buf, 0, &bytes);
     buf
 }
 
@@ -451,8 +451,8 @@ impl RecordSlots {
     /// once (an empty submit), so one record goes up while the next is written.
     pub fn write(&self, i: usize, record: &[u8]) {
         assert_eq!(record.len(), self.record_bytes, "dense: a record of another size");
-        self.gpu.queue.write_buffer(&self.slots[i], 0, record);
-        self.gpu.queue.submit([]);
+        self.gpu.queue().write_buffer(&self.slots[i], 0, record);
+        self.gpu.queue().submit([]);
     }
 
     /// Slot `i`'s MXFP4 matrix `[n, k]`: its nibbles from byte `w` (`[n, k]`, two to a byte, low first), its e8m0 scales
@@ -820,10 +820,10 @@ mod tests {
         for round in 0..4 {
             let t = std::time::Instant::now();
             for buf in &bufs {
-                gpu.queue.write_buffer(buf, 0, &host);
+                gpu.queue().write_buffer(buf, 0, &host);
             }
             let queued = t.elapsed().as_secs_f64();
-            gpu.queue.submit([]);
+            gpu.queue().submit([]);
             gpu.wait(None);
             let secs = t.elapsed().as_secs_f64();
             eprintln!("round {round}: {:.0} MB in {secs:.3} s ({:.2} GB/s; the writes queued in {queued:.3} s)", 32.0 * size as f64 / 1e6, 32.0 * size as f64 / secs / 1e9);

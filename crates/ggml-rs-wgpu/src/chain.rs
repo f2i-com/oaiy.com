@@ -3675,7 +3675,7 @@ impl ggml_rs::DeviceStorage for Aliased {
         if len > 0 {
             enc.copy_buffer_to_buffer(buffer(&self.v), 0, &staging, 0, (len * 4) as u64);
         }
-        self.gpu.queue.submit([enc.finish()]);
+        self.gpu.queue().submit([enc.finish()]);
         staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
         self.gpu.wait(None);
         let view = staging.slice(..).get_mapped_range().expect("webgpu: mapping a finished buffer");
@@ -3700,12 +3700,16 @@ impl ggml_rs::DeviceStorage for Aliased {
         if self.v.len > 0 {
             enc.copy_buffer_to_buffer(buffer(&self.v), 0, &copy, 0, (self.v.len * 4) as u64);
         }
-        self.gpu.queue.submit([enc.finish()]);
+        self.gpu.queue().submit([enc.finish()]);
         Box::new(Aliased { v: DeviceVec { len: self.v.len, inner: Arc::new(copy) }, gpu: Arc::clone(&self.gpu), serial: Arc::clone(&self.serial) })
     }
 }
 
 impl DeviceChain for WgpuBackend {
+    fn pieces_in_flight_at_most(&self, pieces: usize) {
+        WgpuBackend::pieces_in_flight_at_most(self, pieces);
+    }
+
     fn vec(&self, len: usize) -> DeviceVec {
         DeviceVec { len, inner: Arc::new(vec_buffer(&self.gpu, len)) }
     }
@@ -3815,7 +3819,7 @@ impl DeviceChain for WgpuBackend {
     fn zero(&self, v: &DeviceVec) {
         let mut enc = self.gpu.device.create_command_encoder(&Default::default());
         enc.clear_buffer(buffer(v), 0, None);
-        self.gpu.queue.submit([enc.finish()]);
+        self.gpu.queue().submit([enc.finish()]);
     }
 
     fn alias(&self, v: &DeviceVec, shape: Vec<usize>) -> Tensor {
@@ -3837,7 +3841,7 @@ impl DeviceChain for WgpuBackend {
             // a large write's staging (device memory, with Resizable BAR) let go now: a model's weights uploaded in
             // turn held it all until the next submit (Qwen Image's 14 GB took 31 of a 32 GB card)
             if data.len() >= 16 << 20 {
-                self.gpu.queue.submit([]);
+                self.gpu.queue().submit([]);
                 self.gpu.wait(None);
             }
         }
@@ -3849,7 +3853,7 @@ impl DeviceChain for WgpuBackend {
         if keep > 0 {
             let mut enc = self.gpu.device.create_command_encoder(&Default::default());
             enc.copy_buffer_to_buffer(buffer(v), 0, buffer(&grown), 0, (keep * 4) as u64);
-            self.gpu.queue.submit([enc.finish()]);
+            self.gpu.queue().submit([enc.finish()]);
         }
         grown
     }
@@ -3895,7 +3899,7 @@ impl DeviceChain for WgpuBackend {
     }
 
     fn begin(&self) -> Box<dyn ChainRecorder + '_> {
-        Box::new(Recorder { backend: self, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0 })
+        Box::new(Recorder { backend: self, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0 })
     }
 }
 
@@ -4016,12 +4020,12 @@ impl<'a> Recorder<'a> {
     /// A recording on `backend`, its bind groups kept (the crate's own measurements record kernels directly).
     #[cfg(test)]
     pub(crate) fn new(backend: &'a WgpuBackend) -> Self {
-        Recorder { backend, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0 }
+        Recorder { backend, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0 }
     }
 }
 
 /// One dispatch: its pipeline, bind group and grid.
-type Dispatch = (Arc<wgpu::ComputePipeline>, wgpu::BindGroup, (u32, u32, u32));
+use crate::Dispatch;
 
 /// A bind group a chain makes again step after step: its pipeline, its three buffers and its parameters.
 pub(crate) type GroupKey = (usize, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, [u32; 8]);
@@ -4085,10 +4089,12 @@ pub(crate) struct Recorder<'a> {
     /// as it is (each its command buffer, submitted in turn when it is let go).
     hold: bool,
     held: Vec<wgpu::CommandBuffer>,
+    /// The held pieces that go by the device's feed ([`Recorder::fed`]): each its dispatches, encoded at its turn.
+    lists: Vec<Vec<Dispatch>>,
     /// The reads copied out by a flush (the first so many of `reads`), and that flush's submission: a recording
     /// waits for its own work, not what went after it (the next chunk's).
     copied: usize,
-    flushed: Option<wgpu::SubmissionIndex>,
+    flushed: Option<crate::Piece>,
     /// `OAIY_PIECE_STAMPS`: the pieces' timestamps, and how many pieces so far; once a flush has copied them out
     /// (with its reads: a finish waits for its own work, not for what went after), where to
     stamps: Option<(wgpu::QuerySet, u32)>,
@@ -4118,7 +4124,24 @@ impl Recorder<'_> {
     /// The dispatches recorded so far encoded as a piece (one compute pass) and submitted (held: kept to be, see
     /// [`ChainRecorder::hold`]); profiled (`OAIY_CHAIN_PROFILE`), each its own pass between two timestamps (a piece
     /// at a time: the whole recording one submission would run past the OS's limit on one, Windows' 2 s).
+    /// Whether this recording's pieces go by the device's feed as their dispatches (its pieces in flight are limited):
+    /// not one that times its pieces or its kernels (their passes are its own to encode), nor one that has held
+    /// command buffers already.
+    fn fed(&self) -> bool {
+        self.gpu().feeds() && self.held.is_empty() && !crate::profile::chain_on() && !crate::profile::pieces_on()
+    }
+
     fn submit_piece(&mut self) {
+        if !self.dispatches.is_empty() && self.fed() {
+            let list = std::mem::take(&mut self.dispatches);
+            self.weight = 0.0;
+            if self.hold {
+                self.lists.push(list);
+            } else {
+                self.gpu().feed(list);
+            }
+            return;
+        }
         if !self.dispatches.is_empty() {
             let _one = self.backend.serial.lock().unwrap_or_else(|p| p.into_inner());
             let start = std::time::Instant::now();
@@ -4243,7 +4266,8 @@ impl Recorder<'_> {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        self.gpu().queue.write_buffer(&buf, 0, &bytes);
+        // (a new buffer: its write is in no waiting piece's way, so not after them as `queue`'s are)
+        self.gpu().queue_raw.write_buffer(&buf, 0, &bytes);
         buf
     }
 
@@ -4977,6 +5001,9 @@ impl ChainRecorder for Recorder<'_> {
         if !held.is_empty() {
             self.gpu().submit_piece(held);
         }
+        for list in std::mem::take(&mut self.lists) {
+            self.gpu().feed(list);
+        }
         self.submit_piece();
         let mut enc = self.gpu().device.create_command_encoder(&Default::default());
         for (from, offset, staging, len) in &self.reads[self.copied..] {
@@ -4988,7 +5015,7 @@ impl ChainRecorder for Recorder<'_> {
         if let Some(staging) = self.resolve_pieces(&mut enc) {
             self.stamped = Some(staging);
         }
-        self.flushed = Some(self.gpu().submit_piece(vec![enc.finish()]));
+        self.flushed = Some(self.gpu().submit_after(vec![enc.finish()]));
     }
 
     fn exl3_rows(&mut self, w: &dyn ggml_rs::exl3::PackedLinear, x: &DeviceVec, y: &DeviceVec, rows: usize) {
@@ -5655,7 +5682,8 @@ impl ChainRecorder for Recorder<'_> {
     fn finish(mut self: Box<Self>) -> Vec<Vec<f32>> {
         // (profiled: what is left a piece of its own, timed as the others)
         let profiled = crate::profile::chain_on();
-        if profiled {
+        // (by the feed: what is left a piece of its own too, encoded at its turn as the others)
+        if profiled || self.fed() {
             self.submit_piece();
         }
         let _one = self.backend.serial.lock().unwrap_or_else(|p| p.into_inner());
@@ -5681,17 +5709,26 @@ impl ChainRecorder for Recorder<'_> {
             }
         }
         // nothing recorded since a flush: its submission the one waited for (profiled: this one, after every timed piece)
-        let since = !self.dispatches.is_empty() || !self.held.is_empty() || self.copied < self.reads.len() || profiled || late.is_some();
+        let since = !self.dispatches.is_empty() || !self.held.is_empty() || !self.lists.is_empty() || self.copied < self.reads.len() || profiled || late.is_some();
         let command = enc.finish();
         crate::profile::add(&crate::profile::CHAIN_ENCODE, start);
         let submitted = std::time::Instant::now();
-        // (a held recording's pieces first, in turn)
-        let mut commands = std::mem::take(&mut self.held);
-        commands.push(command);
-        let index = match self.flushed.take() {
-            Some(index) if !since => index,
-            _ => self.gpu().submit_piece(commands),
+        let last = match self.flushed.take() {
+            Some(piece) if !since => piece,
+            _ => {
+                // (a held recording's pieces first, in turn)
+                let held = std::mem::take(&mut self.held);
+                if !held.is_empty() {
+                    self.gpu().submit_piece(held);
+                }
+                for list in std::mem::take(&mut self.lists) {
+                    self.gpu().feed(list);
+                }
+                self.gpu().submit_after(vec![command])
+            }
         };
+        // (gone to the queue before its staging buffers are mapped: a submission may not copy into a mapped one)
+        let index = self.gpu().gone(last);
         for (_, _, staging, len) in &self.reads {
             staging.slice(..(*len as u64 * 4).max(4)).map_async(wgpu::MapMode::Read, |_| {});
         }
@@ -5708,7 +5745,7 @@ impl ChainRecorder for Recorder<'_> {
         let pooled = std::mem::take(&mut self.pooled);
         self.gpu().unpool(pooled);
         if let Some(staging) = pieces {
-            let period = self.gpu().queue.get_timestamp_period() as f64;
+            let period = self.gpu().queue().get_timestamp_period() as f64;
             let view = staging.slice(..).get_mapped_range().expect("webgpu: mapping the pieces' times");
             let ticks: Vec<u64> = view.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().expect("8 bytes"))).collect();
             drop(view);
@@ -5728,7 +5765,7 @@ impl ChainRecorder for Recorder<'_> {
             }
         }
         for (pipelines, staging) in std::mem::take(&mut self.timed) {
-            let period = self.gpu().queue.get_timestamp_period() as f64;
+            let period = self.gpu().queue().get_timestamp_period() as f64;
             let view = staging.slice(..).get_mapped_range().expect("webgpu: mapping the profile");
             let ticks: Vec<u64> = view.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().expect("8 bytes"))).collect();
             drop(view);
@@ -8681,7 +8718,7 @@ fn main() {
         for m in [1usize, 2, 3, 4] {
             let (x, y, y8) = (b.vec(m * k), b.vec(m * n), b.vec(m * n));
             DeviceChain::upload(&b, &x, &(0..m * k).map(|_| next()).collect::<Vec<_>>());
-            let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0 };
+            let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0 };
             assert!(rq.matmul_rows_q8(w, &x, &y8, m));
             rq.read(&y8);
             let got = Box::new(rq).finish().pop().unwrap();
@@ -8697,7 +8734,7 @@ fn main() {
             let reps = 28;
             let time = |q8: bool| {
                 let run = || {
-                    let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0 };
+                    let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0 };
                     for i in 0..reps {
                         let w = &ws[i % ws.len()];
                         if q8 {
@@ -8843,7 +8880,7 @@ fn main() {
                 let pipeline = b.gpu.named_pipeline(Box::leak(format!("test-rb-{dtype:?}-{r}-{ks}").into_boxed_str()), || src);
                 let reps = 32;
                 let run = || {
-                    let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0 };
+                    let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0 };
                     for i in 0..reps {
                         let q = ws[i % ws.len()].device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).unwrap();
                         for (chunk, row0, rows) in &q.chunks {
@@ -8903,7 +8940,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) n
             let pipeline = b.gpu.named_pipeline(name, || body);
             let groups = 170 * 16;
             let run = || {
-                let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0 };
+                let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0 };
                 for _ in 0..8 {
                     rq.dispatch_kept(&pipeline, buffer(&src), buffer(&src), buffer(&out), &[(len / 4) as u32], (groups, 1, 1));
                 }

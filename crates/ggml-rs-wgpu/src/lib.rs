@@ -243,6 +243,13 @@ fn pieces_in_flight_asked() -> Option<usize> {
     *ASKED.get_or_init(|| std::env::var("OAIY_PIECES_IN_FLIGHT").ok().and_then(|v| v.parse().ok()))
 }
 
+impl Drop for Gpu {
+    fn drop(&mut self) {
+        self.feed.state.lock().unwrap_or_else(|p| p.into_inner()).closed = true;
+        self.feed.changed.notify_all();
+    }
+}
+
 /// This process ended at once, its exit code 3: no DLL's detach run (a GPU driver's would wait for its hung threads).
 fn end_process() -> ! {
     #[cfg(windows)]
@@ -260,17 +267,150 @@ fn end_process() -> ! {
     std::process::abort()
 }
 
+/// A dispatch of a chain's: its pipeline, its bind group and its grid of workgroups.
+pub(crate) type Dispatch = (Arc<wgpu::ComputePipeline>, wgpu::BindGroup, (u32, u32, u32));
+
+/// A chain's piece on its way to a device's queue ([`Gpu::submit_piece`], [`Gpu::feed`]): gone (its submission), or
+/// to go once the device's pieces in flight allow, its submission put here then.
+pub(crate) enum Piece {
+    Gone(wgpu::SubmissionIndex),
+    Fed(Arc<Mutex<Option<wgpu::SubmissionIndex>>>),
+}
+
+/// What a device's feed is handed: a piece's dispatches, encoded when its turn comes, or command buffers as they are.
+enum Fare {
+    Dispatches(Vec<Dispatch>),
+    Commands(Vec<wgpu::CommandBuffer>),
+}
+
+/// A device's pieces waiting for its queue, where its pieces in flight are limited
+/// ([`WgpuBackend::pieces_in_flight_at_most`]): a thread of the device's ([`feed_pieces`]) encodes and submits each in
+/// turn once all but the limit less one of those before it have run, so whoever recorded them goes on meanwhile (a
+/// prompt over two cards records one's chunk as the other runs). A piece's command buffer is made there, just before
+/// it is submitted: an RTX 5090 under a power limit runs a prompt's chunks steadily so, and throttles itself for
+/// seconds at a time through the same pieces encoded as they were recorded and submitted in the same turn, however
+/// few of them were on its queue at once (15,360 tokens of the 27B, four times over: 6.8 s each after the first's
+/// once-only second, where 9.2, 13.9, 13.1 and 6.8). Anything else of the queue's waits for the pieces handed over
+/// first ([`Gpu::queue`]): a write is before the submissions after it.
+#[derive(Default)]
+struct Feed {
+    state: Mutex<Fed>,
+    changed: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct Fed {
+    /// What was handed over and is not yet submitted, in turn, each with where its submission is wanted.
+    waiting: std::collections::VecDeque<(Fare, Arc<Mutex<Option<wgpu::SubmissionIndex>>>)>,
+    /// How many were handed over, and how many of them are submitted.
+    handed: u64,
+    gone: u64,
+    /// The device's thread runs (from the first piece handed over), and is to end (the device dropped).
+    fed: bool,
+    closed: bool,
+    /// Why the thread stopped, if it did: a lost device, or an error of the queue's.
+    failed: Option<String>,
+}
+
+/// Waits for `device`'s submission `index` (else everything submitted), a second at a time: Err once its loss has been
+/// said, or the wait itself fails.
+fn wait_for(device: &wgpu::Device, watch: &Watch, lost: &Mutex<Option<String>>, index: Option<wgpu::SubmissionIndex>) -> Result<(), String> {
+    loop {
+        let polled = {
+            let _watched = watch.enter();
+            device.poll(wgpu::PollType::Wait { submission_index: index.clone(), timeout: Some(std::time::Duration::from_secs(1)) })
+        };
+        match polled {
+            Ok(_) => return Ok(()),
+            Err(wgpu::PollError::Timeout) => {}
+            Err(e) => return Err(format!("waiting for the GPU: {e}")),
+        }
+        if let Some(why) = lost.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            return Err(format!("the device was lost ({why})"));
+        }
+    }
+}
+
+/// `dispatches` as one pass's command buffer.
+fn encode(device: &wgpu::Device, dispatches: &[Dispatch]) -> wgpu::CommandBuffer {
+    let mut piece = device.create_command_encoder(&Default::default());
+    {
+        let mut pass = piece.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+        for (pipeline, group, (x, y, z)) in dispatches {
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, group, &[]);
+            pass.dispatch_workgroups(*x, *y, *z);
+        }
+    }
+    piece.finish()
+}
+
+/// A device's [`Feed`]'s thread: what was handed over submitted in turn (a piece's dispatches encoded then), each
+/// once the device's pieces in flight are fewer than `limit` (as it is then; 0: at once). It ends with the device, or
+/// at a failure (said to whoever waits on the feed next).
+fn feed_pieces(feed: Arc<Feed>, device: wgpu::Device, queue: wgpu::Queue, watch: Arc<Watch>, lost: Arc<Mutex<Option<String>>>, limit: Arc<std::sync::atomic::AtomicUsize>) {
+    let mut flying: std::collections::VecDeque<wgpu::SubmissionIndex> = std::collections::VecDeque::new();
+    loop {
+        let (fare, slot) = {
+            let mut s = feed.state.lock().unwrap_or_else(|p| p.into_inner());
+            loop {
+                if let Some(next) = s.waiting.pop_front() {
+                    break next;
+                }
+                if s.closed {
+                    return;
+                }
+                s = feed.changed.wait(s).unwrap_or_else(|p| p.into_inner());
+            }
+        };
+        // (an error of the queue's is a panic of its handler's: this thread's, so said to the feed's users)
+        let gone = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let most = pieces_in_flight_asked().unwrap_or_else(|| limit.load(Ordering::Relaxed));
+            while most > 0 && flying.len() >= most {
+                let oldest = flying.pop_front().expect("a piece in flight");
+                wait_for(&device, &watch, &lost, Some(oldest))?;
+            }
+            if most == 0 {
+                flying.clear();
+            }
+            let commands = match fare {
+                Fare::Dispatches(dispatches) => vec![encode(&device, &dispatches)],
+                Fare::Commands(commands) => commands,
+            };
+            let index = queue.submit(commands);
+            flying.push_back(index.clone());
+            Ok::<_, String>(index)
+        }));
+        let mut s = feed.state.lock().unwrap_or_else(|p| p.into_inner());
+        match gone {
+            Ok(Ok(index)) => {
+                *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(index);
+                s.gone += 1;
+            }
+            Ok(Err(why)) => s.failed = Some(why),
+            Err(panic) => s.failed = Some(panic.downcast_ref::<String>().cloned().or_else(|| panic.downcast_ref::<&str>().map(|m| m.to_string())).unwrap_or_else(|| "its queue's thread panicked".into())),
+        }
+        let failed = s.failed.is_some();
+        drop(s);
+        feed.changed.notify_all();
+        if failed {
+            return;
+        }
+    }
+}
+
 struct Gpu {
     device: wgpu::Device,
-    queue: wgpu::Queue,
+    /// The device's queue as it is; [`Gpu::queue`] for anyone's use of it but the feed's.
+    queue_raw: wgpu::Queue,
     /// Why the device was lost, once its callback has said (a wait then fails rather than waiting on).
     lost: Arc<Mutex<Option<String>>>,
     /// The driver's calls a watchdog thread watches (a hung one ends the process).
     watch: Arc<Watch>,
-    /// The chains' pieces submitted and not yet waited for, the oldest first ([`Gpu::submit_piece`]), and how many may
-    /// be so at once (0: as many as are recorded).
-    in_flight: Mutex<std::collections::VecDeque<wgpu::SubmissionIndex>>,
-    in_flight_limit: std::sync::atomic::AtomicUsize,
+    /// The chains' pieces on their way to the queue where the device's pieces in flight are limited ([`Gpu::feed`]),
+    /// and how many may be in flight at once (0: as many as are recorded).
+    feed: Arc<Feed>,
+    in_flight_limit: Arc<std::sync::atomic::AtomicUsize>,
     layout: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
     pipelines: Mutex<HashMap<(GgmlType, u8), Arc<wgpu::ComputePipeline>>>,
@@ -404,7 +544,7 @@ impl Gpu {
             let params = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("oaiy-coop-units-params"), size: 32, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
             let mut words = [0u8; 32];
             words[..4].copy_from_slice(&65536u32.to_le_bytes());
-            self.queue.write_buffer(&params, 0, &words);
+            self.queue().write_buffer(&params, 0, &words);
             let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("oaiy-coop-units"),
                 layout: &self.layout,
@@ -422,7 +562,7 @@ impl Gpu {
                 pass.set_bind_group(0, &group, &[]);
                 pass.dispatch_workgroups(4096, 1, 1);
             }
-            self.queue.submit([enc.finish()]);
+            self.queue().submit([enc.finish()]);
             let got = self.read(&counts, 8);
             u32::from_le_bytes([got[0], got[1], got[2], got[3]]).max(1)
         })
@@ -439,43 +579,116 @@ impl Gpu {
         });
         let mut enc = self.device.create_command_encoder(&Default::default());
         enc.copy_buffer_to_buffer(src, 0, &staging, 0, len);
-        self.queue.submit([enc.finish()]);
+        self.queue().submit([enc.finish()]);
         self.map_read(&staging, len)
     }
 
-    /// A chain's piece submitted: where the device's pieces in flight are limited
-    /// ([`WgpuBackend::pieces_in_flight_at_most`]), once all but the limit less one of those before it have run.
-    pub(crate) fn submit_piece(&self, commands: Vec<wgpu::CommandBuffer>) -> wgpu::SubmissionIndex {
-        let limit = pieces_in_flight_asked().unwrap_or_else(|| self.in_flight_limit.load(Ordering::Relaxed));
-        let mut flying = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
-        while limit > 0 && flying.len() >= limit {
-            let oldest = flying.pop_front().expect("a piece in flight");
-            self.wait(Some(oldest));
-        }
-        let index = self.queue.submit(commands);
-        if limit > 0 {
-            flying.push_back(index.clone());
-        }
-        index
+    /// The device's queue, for a write or a submission of the caller's own: after everything handed to the feed has
+    /// gone to it (a write is before the submissions after it; a piece still waiting would run after a write made
+    /// since it was recorded).
+    fn queue(&self) -> &wgpu::Queue {
+        self.settle();
+        &self.queue_raw
     }
 
-    /// Waits for submission `index` (else everything submitted), a second at a time: a lost device (its callback has
-    /// said so, or nothing has finished in ten minutes: a driver that lost it without saying) fails the job rather than
-    /// leaving it waiting for good.
-    pub(crate) fn wait(&self, index: Option<wgpu::SubmissionIndex>) {
+    /// Whether the device's pieces in flight are limited: its chains' pieces go by its feed.
+    pub(crate) fn feeds(&self) -> bool {
+        pieces_in_flight_asked().unwrap_or_else(|| self.in_flight_limit.load(Ordering::Relaxed)) > 0
+    }
+
+    /// Waits until everything handed to the feed is submitted (at once where nothing is waiting).
+    fn settle(&self) {
+        let mut s = self.feed.state.lock().unwrap_or_else(|p| p.into_inner());
+        while s.gone < s.handed {
+            if let Some(why) = &s.failed {
+                panic!("webgpu: {why}");
+            }
+            s = self.feed.changed.wait(s).unwrap_or_else(|p| p.into_inner());
+        }
+    }
+
+    /// `fare` handed to the feed (its thread begun at the first), where its submission will be said.
+    fn hand(&self, fare: Fare) -> Piece {
+        let slot = Arc::new(Mutex::new(None));
+        let mut s = self.feed.state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(why) = &s.failed {
+            panic!("webgpu: {why}");
+        }
+        s.waiting.push_back((fare, Arc::clone(&slot)));
+        s.handed += 1;
+        if !s.fed {
+            s.fed = true;
+            let (feed, device, queue, watch, lost, limit) = (Arc::clone(&self.feed), self.device.clone(), self.queue_raw.clone(), Arc::clone(&self.watch), Arc::clone(&self.lost), Arc::clone(&self.in_flight_limit));
+            std::thread::Builder::new().name("oaiy-webgpu-feed".into()).spawn(move || feed_pieces(feed, device, queue, watch, lost, limit)).expect("webgpu: a thread for the device's queue");
+        }
+        drop(s);
+        self.feed.changed.notify_all();
+        Piece::Fed(slot)
+    }
+
+    /// A chain's piece as its dispatches: where the device's pieces in flight are limited
+    /// ([`WgpuBackend::pieces_in_flight_at_most`]), to its feed, which encodes and submits it once all but the limit
+    /// less one of those before it have run (the caller goes on at once); else encoded and submitted here.
+    pub(crate) fn feed(&self, dispatches: Vec<Dispatch>) {
+        if self.feeds() {
+            self.hand(Fare::Dispatches(dispatches));
+        } else {
+            self.queue().submit([encode(&self.device, &dispatches)]);
+        }
+    }
+
+    /// A chain's piece its recorder encoded (its command buffers, in turn) submitted: where the device's pieces in
+    /// flight are limited, by its feed a command buffer a piece, and waited for until the last of them has gone to the
+    /// queue (all but the limit less one of those before it have run: such a piece keeps its recorder to the queue's
+    /// pace). The piece returned is the last of them.
+    pub(crate) fn submit_piece(&self, commands: Vec<wgpu::CommandBuffer>) -> Piece {
+        if !self.feeds() || commands.is_empty() {
+            return Piece::Gone(self.queue().submit(commands));
+        }
+        let mut last = None;
+        for command in commands {
+            last = Some(self.hand(Fare::Commands(vec![command])));
+        }
+        Piece::Gone(self.gone(last.expect("a command buffer")))
+    }
+
+    /// A recording's copies out (its reads, its timestamps) submitted after its pieces: by the feed where the device's
+    /// pieces in flight are limited (the caller goes on at once), else here.
+    pub(crate) fn submit_after(&self, commands: Vec<wgpu::CommandBuffer>) -> Piece {
+        if self.feeds() {
+            self.hand(Fare::Commands(commands))
+        } else {
+            Piece::Gone(self.queue().submit(commands))
+        }
+    }
+
+    /// `piece`'s submission, once it has gone to the queue (a buffer it copies into can be mapped from then, not
+    /// before).
+    pub(crate) fn gone(&self, piece: Piece) -> wgpu::SubmissionIndex {
+        let slot = match piece {
+            Piece::Gone(index) => return index,
+            Piece::Fed(slot) => slot,
+        };
+        let mut s = self.feed.state.lock().unwrap_or_else(|p| p.into_inner());
         loop {
-            let polled = {
-                let _watched = self.watch.enter();
-                self.device.poll(wgpu::PollType::Wait { submission_index: index.clone(), timeout: Some(std::time::Duration::from_secs(1)) })
-            };
-            match polled {
-                Ok(_) => return,
-                Err(wgpu::PollError::Timeout) => {}
-                Err(e) => panic!("webgpu: waiting for the GPU: {e}"),
+            if let Some(index) = slot.lock().unwrap_or_else(|p| p.into_inner()).clone() {
+                return index;
             }
-            if let Some(why) = self.lost.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
-                panic!("webgpu: the device was lost ({why})");
+            if let Some(why) = &s.failed {
+                panic!("webgpu: {why}");
             }
+            s = self.feed.changed.wait(s).unwrap_or_else(|p| p.into_inner());
+        }
+    }
+
+    /// Waits for submission `index` (else everything submitted, the feed's pieces too), a second at a time: a lost
+    /// device (its callback has said so) fails the job rather than leaving it waiting for good.
+    pub(crate) fn wait(&self, index: Option<wgpu::SubmissionIndex>) {
+        if index.is_none() {
+            self.settle();
+        }
+        if let Err(why) = wait_for(&self.device, &self.watch, &self.lost, index) {
+            panic!("webgpu: {why}");
         }
     }
 
@@ -495,9 +708,9 @@ impl Gpu {
     pub(crate) fn write(&self, buffer: &wgpu::Buffer, offset: u64, data: &[u8]) {
         let size = match wgpu::BufferSize::new(data.len() as u64) {
             Some(size) if data.len() >= 8 << 20 => size,
-            _ => return self.queue.write_buffer(buffer, offset, data),
+            _ => return self.queue().write_buffer(buffer, offset, data),
         };
-        let Some(mut view) = self.queue.write_buffer_with(buffer, offset, size) else { return self.queue.write_buffer(buffer, offset, data) };
+        let Some(mut view) = self.queue().write_buffer_with(buffer, offset, size) else { return self.queue().write_buffer(buffer, offset, data) };
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
         let each = data.len().div_ceil(threads).div_ceil(4096) * 4096;
         let mut whole = view.slice(..);
@@ -542,7 +755,7 @@ impl Gpu {
             let pending = self.staged.fetch_add(size, Ordering::Relaxed) + size;
             if pending >= 256 << 20 {
                 self.staged.store(0, Ordering::Relaxed);
-                self.queue.submit([]);
+                self.queue().submit([]);
                 self.wait(None);
             }
         }
@@ -1026,7 +1239,7 @@ impl WgpuBackend {
         });
         Ok(Self {
             cpu: CpuBackend::new(),
-            gpu: Arc::new(Gpu { device, queue, lost, watch, in_flight: Mutex::new(std::collections::VecDeque::new()), in_flight_limit: std::sync::atomic::AtomicUsize::new(0), layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), names: Mutex::new(HashMap::new()), pool: Mutex::new(Vec::new()), staging: Mutex::new(Vec::new()), chain_groups: Mutex::new(HashMap::new()), wide: std::sync::OnceLock::new(), chain_groups_wide: Mutex::new(HashMap::new()), dummy: std::sync::OnceLock::new(), dummy_rw: std::sync::OnceLock::new(), limits, staged: AtomicU64::new(0), few: std::sync::OnceLock::new(), moe_steps: Mutex::new(Vec::new()), coop_units: std::sync::OnceLock::new() }),
+            gpu: Arc::new(Gpu { device, queue_raw: queue, lost, watch, feed: Arc::new(Feed::default()), in_flight_limit: Arc::new(std::sync::atomic::AtomicUsize::new(0)), layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), names: Mutex::new(HashMap::new()), pool: Mutex::new(Vec::new()), staging: Mutex::new(Vec::new()), chain_groups: Mutex::new(HashMap::new()), wide: std::sync::OnceLock::new(), chain_groups_wide: Mutex::new(HashMap::new()), dummy: std::sync::OnceLock::new(), dummy_rw: std::sync::OnceLock::new(), limits, staged: AtomicU64::new(0), few: std::sync::OnceLock::new(), moe_steps: Mutex::new(Vec::new()), coop_units: std::sync::OnceLock::new() }),
             budget,
             used: Arc::new(AtomicU64::new(0)),
             summary,
@@ -1051,8 +1264,8 @@ impl WgpuBackend {
             mapped_at_creation: false,
         });
         let up = || {
-            self.gpu.queue.write_buffer(&buf, 0, &data);
-            let i = self.gpu.queue.submit([]);
+            self.gpu.queue().write_buffer(&buf, 0, &data);
+            let i = self.gpu.queue().submit([]);
             self.gpu.wait(Some(i));
         };
         up();
@@ -1104,17 +1317,18 @@ impl WgpuBackend {
     }
 
     /// At most `pieces` of the chains' pieces on this device's queue at once from here on (0: as many as are recorded,
-    /// as it is until asked): for a loop of short steps that runs the GPU for seconds on end. A recording's pieces go
-    /// to the GPU as they are recorded, a step's dozen queued within its first milliseconds; twelve such steps a
-    /// second (MiniMax Music 3's transformer: 800 dispatches a step, 82 ms) and an RTX 5090 under a power limit (402 W
-    /// of its 575) fell, after some 5 s and then every 2, into 9 s of its limiter's harshest throttle (its clock 1,550
-    /// MHz of 2,700, its memory slower still: a matmul over large weights 17 times as long), where with two or three
-    /// in flight, or a step one submission, it throttles so once, for a second, and settles (Candle's CUDA, a kernel
-    /// at a time, never does). Two cost such a step nothing (one, a millisecond: the GPU idle while the next piece is
-    /// handed over). Not for long dispatches (Pixal3D's flows over 15,000 voxels, 1.8 s a pass: steady as they are,
-    /// and with a limit the throttle found them now and then), nor a language model's prompts (their chunks recorded
-    /// ahead for one card while another runs: Qwen3.8 27B's 3,166 tokens over two in 1.03 s, in 1.55 with two in
-    /// flight).
+    /// as it is until asked), each encoded just before it is submitted ([`Feed`]): for a loop of short steps, or a
+    /// prompt's chunks, that runs the GPU for seconds on end. A recording's pieces otherwise go to the GPU as they are
+    /// recorded, a step's dozen queued within its first milliseconds; twelve such steps a second (MiniMax Music 3's
+    /// transformer: 800 dispatches a step, 82 ms), or a prompt's chunks one after another (the 27B's 512 tokens in
+    /// 0.2 s), and an RTX 5090 under a power limit (402 W of its 575) fell, after some 5 to 7 s and then every few, into
+    /// seconds of running a tenth as fast (a matmul over large weights 12 to 17 times as long, an attention 2 to 3: its
+    /// memory busy three times as much of the time, its clock no lower and its limiter less at work than before),
+    /// where so fed it does so once, for a second or two, and settles (Candle's CUDA, a kernel at a time, never
+    /// does). The pieces' number on the queue is the lesser part of it: with one, two or three on the queue but each
+    /// encoded when it was recorded, the card fell so as before; two encoded at their turn cost a step or a chunk
+    /// nothing, three some 6% of a long prompt's chunk. Not for long dispatches (Pixal3D's flows over 15,000 voxels,
+    /// 1.2 s a pass: steady as they are, and with a limit the throttle found them now and then).
     pub fn pieces_in_flight_at_most(&self, pieces: usize) {
         self.gpu.in_flight_limit.store(pieces, Ordering::Relaxed);
     }
@@ -1229,7 +1443,7 @@ impl WgpuBackend {
         };
         let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
         let xbuf = gpu.device.create_buffer(&wgpu::BufferDescriptor { label: Some("oaiy-x"), size: (x.numel() * 4) as u64, usage, mapped_at_creation: false });
-        gpu.queue.write_buffer(&xbuf, 0, &bytes(x.data()));
+        gpu.queue().write_buffer(&xbuf, 0, &bytes(x.data()));
         let sizes: Vec<u64> = ws.iter().map(|(_, shape)| (m * shape[0] * 4) as u64).collect();
         let total: u64 = sizes.iter().sum();
         let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1261,7 +1475,7 @@ impl WgpuBackend {
                     usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
-                gpu.queue.write_buffer(&pbuf, 0, &params);
+                gpu.queue().write_buffer(&pbuf, 0, &params);
                 let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("oaiy-linear-q"),
                     layout: &gpu.layout,
@@ -1291,7 +1505,7 @@ impl WgpuBackend {
             at += ysize;
         }
         let waiting = std::time::Instant::now();
-        gpu.queue.submit([enc.finish()]);
+        gpu.queue().submit([enc.finish()]);
         let slice = staging.slice(..total);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         gpu.wait(None);

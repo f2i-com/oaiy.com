@@ -145,6 +145,12 @@ pub trait DeviceChain: Send + Sync {
         let _ = w;
         None
     }
+    /// From here on the device's queue holds at most `pieces` of its recordings' pieces at once (0: as many as are
+    /// recorded, as a device starts), where it has such a queue: for a run of many pieces one after another (a
+    /// prompt's chunks, a sampler's steps), which a card under a power limit otherwise throttles itself through.
+    fn pieces_in_flight_at_most(&self, pieces: usize) {
+        let _ = pieces;
+    }
     /// The length [`ChainRecorder::attention`]'s `out` needs for `n_h` heads of `head_dim` over a cache of `cap` rows:
     /// the result and the device's scratch.
     fn attention_out_len(&self, n_h: usize, head_dim: usize, cap: usize) -> usize;

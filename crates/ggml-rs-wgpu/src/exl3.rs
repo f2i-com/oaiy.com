@@ -612,7 +612,7 @@ impl Exl3Gpu {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        gpu.queue.write_buffer(&xbuf, 0, &bytes(xh));
+        gpu.queue().write_buffer(&xbuf, 0, &bytes(xh));
         let psize = (slots * rows * n * 4) as u64;
         let pbuf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("oaiy-exl3-partial"),
@@ -635,7 +635,7 @@ impl Exl3Gpu {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            gpu.queue.write_buffer(&ubuf, 0, &params);
+            gpu.queue().write_buffer(&ubuf, 0, &params);
             let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("oaiy-exl3"),
                 layout: &gpu.layout,
@@ -692,7 +692,7 @@ fn read_back(gpu: &Gpu, mut enc: wgpu::CommandEncoder, passes: &[Recorded]) -> V
         enc.copy_buffer_to_buffer(&r.part, 0, &staging, at, r.size);
         at += r.size;
     }
-    gpu.queue.submit([enc.finish()]);
+    gpu.queue().submit([enc.finish()]);
     let raw = gpu.map_read(&staging, total.max(4));
     let all: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
     let mut at = 0;
@@ -2865,7 +2865,7 @@ mod tests {
             // The same with nothing to compute: an empty submit and wait.
             let t = std::time::Instant::now();
             for _ in 0..50 {
-                b.gpu.queue.submit([]);
+                b.gpu.queue().submit([]);
                 b.gpu.wait(None);
             }
             let idle = t.elapsed().as_secs_f64() * 1000.0 / 50.0;
