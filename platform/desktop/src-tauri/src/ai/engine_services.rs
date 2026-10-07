@@ -612,7 +612,7 @@ mod tests {
     }
 
     /// An explicitly started isolated Studio can verify the scoped guard, the
-    /// actual forwarding function, native CUDA worker and configured style LoRA
+    /// actual forwarding function, native worker and configured style LoRA
     /// together. Credentials live in memory and are never written to evidence.
     #[tokio::test]
     #[ignore = "requires OAIY_KLEIN_LOCAL_TEST_GATEWAY and idle GPU 1; creates real native PNGs"]

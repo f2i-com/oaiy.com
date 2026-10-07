@@ -299,7 +299,6 @@
 .setup-model-option { flex-direction: row; align-items: flex-start; gap: 10px; max-width: none; cursor: pointer; }
 .setup-model-option > input[type='radio'] { flex: none; width: 15px; height: 15px; margin: 2px 0 0; cursor: pointer; }
 .setup-model-option.is-selected { border-style: solid; border-color: color-mix(in srgb, var(--primary) 55%, var(--strong-border)); }
-.setup-model-option.is-unavailable { cursor: default; opacity: 0.72; }
 .setup-model-text { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 3px; }
 .setup-model-text strong .badge { margin-left: 0; }
 .setup-model-text strong .badge-pending::before { animation: none; }

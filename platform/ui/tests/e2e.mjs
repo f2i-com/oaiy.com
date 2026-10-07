@@ -154,7 +154,7 @@ for (const theme of ['dark', 'light']) {
     ok('the page compares the browser and the desktop, in a table a screen reader can read',
       (await page.locator('table.lp-compare th[scope="col"]').count()) === 3 && (await page.locator('table.lp-compare tbody th[scope="row"]').count()) >= 6);
     ok('it says what needs the desktop, plainly',
-      /NVIDIA GPU/.test((await page.locator('#why').textContent()) ?? '') && /not published for download yet/.test((await page.locator('#why').textContent()) ?? ''));
+      /graphics card of any make/.test((await page.locator('#why').textContent()) ?? '') && /not published for download yet/.test((await page.locator('#why').textContent()) ?? ''));
 
     ok('every design token it references resolves', await page.evaluate(() => {
       const cs = getComputedStyle(document.documentElement);

@@ -928,8 +928,7 @@ fn engine_model(m: &serde_json::Value) -> serde_json::Value {
         "recommended": m.get("recommended").and_then(|r| r.as_bool()).unwrap_or(false),
         // A language model the Agent can use its tools with (the catalog's `agent_tools`); the others chat.
         "agentTools": m.get("agent_tools").and_then(|r| r.as_bool()).unwrap_or(false),
-        // The engines that run it (both when the catalog does not say), the RAM it needs and the GPUs it takes.
-        "engines": m.get("engines").cloned().unwrap_or_else(|| serde_json::json!(["cuda", "webgpu"])),
+        // The RAM it needs and the GPUs it takes.
         "ramGb": m.get("ram_gb"),
         "gpuCount": m.get("gpu_count"),
         "needs": m.get("needs").cloned().unwrap_or_else(|| serde_json::json!([])),
@@ -974,8 +973,6 @@ pub(crate) async fn engines_catalog_at(ui: Option<String>) -> serde_json::Value 
         "dir": state.get("dir"),
         "free": state.get("free"),
         "groups": state.get("groups").cloned().unwrap_or_else(|| serde_json::json!([])),
-        // The engines this OAIY can start: a model none of them runs is not one to download here.
-        "engines": state.get("engines").cloned().unwrap_or(serde_json::Value::Null),
         "models": state.get("models").and_then(|m| m.as_array()).map(|m| m.iter().map(engine_model).collect::<Vec<_>>()).unwrap_or_default(),
         "defaults": defaults,
     })

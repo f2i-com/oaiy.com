@@ -232,19 +232,9 @@ export function groupModels(catalog: EngineCatalog | null, group: string): Engin
   return [...models.filter((m) => m.recommended), ...models.filter((m) => !m.recommended)];
 }
 
-/**
- * Can an engine this OAIY has run `m`? A model for the CUDA engine alone (`engines: ["cuda"]`) cannot on an install
- * with only the portable one, until the NVIDIA engine is fetched. An older desktop does not say: every model can.
- */
-export function canRun(catalog: EngineCatalog | null, m: EngineCatalogModel): boolean {
-  const here = catalog?.engines;
-  if (!here) return true;
-  return (m.engines ?? ['cuda', 'webgpu']).some((e) => here[e]);
-}
-
-/** The catalog's recommended model for `group` (else its first) that an engine here runs, to offer when nothing is chosen. */
+/** The catalog's recommended model for `group` (else its first), to offer when nothing is chosen. */
 export function recommendedModel(catalog: EngineCatalog | null, group: string): EngineCatalogModel | null {
-  const models = (catalog?.models ?? []).filter((m) => m.group === group && canRun(catalog, m));
+  const models = (catalog?.models ?? []).filter((m) => m.group === group);
   return models.find((m) => m.recommended) ?? models[0] ?? null;
 }
 

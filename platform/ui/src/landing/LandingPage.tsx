@@ -390,7 +390,7 @@ function Why() {
     {
       tone: 'var(--signal-amber)',
       title: 'Models on your own machine',
-      body: "OAIY's own engines run language, image, video and speech models on your computer. Most need an NVIDIA GPU; language models also run on WebGPU or the CPU. The engines are not in the installer yet.",
+      body: "OAIY's own engines run language, image, video and speech models on your computer. They run on a graphics card of any make, through WebGPU; language models also run on the CPU. The engines are not in the installer yet.",
     },
   ];
   return (
@@ -544,7 +544,7 @@ function HowItWorks() {
 const COMPARISON: { what: string; browser: string; desktop: string; muted?: boolean }[] = [
   { what: 'The flow editor', browser: 'Yes', desktop: 'Yes' },
   { what: 'Your own AI: Ollama, LM Studio, OpenAI, Anthropic, any endpoint', browser: 'Yes, called straight from the page', desktop: 'Yes' },
-  { what: "OAIY's own models: language, image, video and speech", browser: 'No', desktop: 'Yes, on your computer (an NVIDIA GPU for most)', muted: true },
+  { what: "OAIY's own models: language, image, video and speech", browser: 'No', desktop: 'Yes, on your computer (a graphics card for most)', muted: true },
   { what: 'The Agent: projects, code and a live preview', browser: 'Runs inside OAIY Desktop', desktop: 'Yes', muted: true },
   { what: 'The AI Receptionist', browser: 'No', desktop: 'Yes, with the Aokie plugin and your phone', muted: true },
   { what: 'Browser automation and Python services', browser: 'No', desktop: 'Yes', muted: true },

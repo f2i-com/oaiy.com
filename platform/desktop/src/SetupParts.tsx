@@ -10,10 +10,9 @@ import {
   type EngineCatalog,
   type EngineCatalogModel,
   type EngineDownload,
-  type NvidiaEngine,
   type ServiceSnapshot,
 } from './api';
-import { canRun, chosenModel, groupModels, recommendedModel, type StepState } from './setupFlow';
+import { chosenModel, groupModels, recommendedModel, type StepState } from './setupFlow';
 
 /**
  * The setup wizard's shared parts: its frame (the step list, the pane, Back /
@@ -353,9 +352,6 @@ function modelFacts(m: EngineCatalogModel, gpuGb?: number): string {
     .join(' · ');
 }
 
-/** Only NVIDIA cards run it (OAIY's CUDA engine), rather than any GPU. */
-const cudaOnly = (m: EngineCatalogModel) => !!m.engines && !m.engines.includes('webgpu');
-
 /** A download as it goes: a bar, and how far. */
 function DownloadProgress({ name, dl }: { name: string; dl: EngineDownload }) {
   return (
@@ -369,65 +365,6 @@ function DownloadProgress({ name, dl }: { name: string; dl: EngineDownload }) {
         {dl.filesTotal && dl.filesTotal > 1 ? ` · file ${Math.min((dl.filesDone ?? 0) + 1, dl.filesTotal)} of ${dl.filesTotal}` : ''}
       </small>
     </span>
-  );
-}
-
-/**
- * The NVIDIA engine on a computer with an NVIDIA card: OAIY's CUDA language-model server, which the installer does
- * not carry. Faster there, and the one engine that runs the models marked NVIDIA only. The desktop fetches this
- * version's from the release, checks its signature with the key updates are checked with, and has the engines run it.
- * Nothing shows on a computer without one, or once it is there.
- */
-export function NvidiaEngineOffer({ onInstalled }: { onInstalled: () => void }) {
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [status, refresh] = usePoll<NvidiaEngine>(() => engines.nvidia(), busy ? 700 : 30000, isTauri());
-  if (!status || !status.offered || !status.nvidia) return null;
-  const f = status.fetch;
-  const running = busy || f.state === 'downloading' || f.state === 'checking';
-  if (status.installed && f.state !== 'done') return null;
-  const get = async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      await engines.fetchNvidia();
-      onInstalled();
-    } catch (e) {
-      setError(errorText(e));
-    } finally {
-      setBusy(false);
-      void refresh();
-    }
-  };
-  const problem = error ?? (f.state === 'failed' ? f.error : null);
-  return (
-    <div className="setup-offer-card setup-nvidia-engine">
-      <span className="setup-model-text">
-        <strong>
-          NVIDIA engine {status.installed && <span className="badge badge-ok">Installed</span>}
-        </strong>
-        <small>
-          {status.installed
-            ? 'The engines run language models on OAIY’s NVIDIA engine now, including the ones marked NVIDIA only.'
-            : 'This computer has an NVIDIA card. OAIY’s NVIDIA engine runs language models faster on it, and runs the ones marked NVIDIA only. A small download, checked before it is used.'}
-        </small>
-        {running && (
-          <span className="setup-req-progress">
-            <span className="setup-progress" role="progressbar" aria-label="Fetching the NVIDIA engine" aria-valuenow={f.total ? Math.round((f.got / f.total) * 100) : undefined}>
-              <i className={f.total ? undefined : 'is-indeterminate'} style={f.total ? { width: `${Math.min(100, (f.got / f.total) * 100)}%` } : undefined} />
-            </span>
-            <small className="setup-mono">{f.state === 'checking' ? 'Checking its signature…' : f.total ? `${formatBytes(f.got)} of ${formatBytes(f.total)}` : 'Starting…'}</small>
-          </span>
-        )}
-        {problem && <small className="card-warn" role="alert">{problem}</small>}
-      </span>
-      {!status.installed && !running && (
-        <button type="button" className="btn" onClick={() => void get()}>
-          <Download size={14} /> {problem ? 'Try again' : 'Get the NVIDIA engine'}
-        </button>
-      )}
-      {running && <Loader2 size={14} className="spin" aria-hidden />}
-    </div>
   );
 }
 
@@ -522,7 +459,7 @@ export function EngineModelCard({
   const options = chosen ? [] : groupModels(catalog, group);
   // A download under way holds the choice: it is the one shown, and the others wait.
   const active = options.find((m) => m.download && ACTIVE.has(m.download.status)) ?? null;
-  const offer = active ?? options.find((m) => m.id === picked && canRun(catalog, m)) ?? recommendedModel(catalog, group);
+  const offer = active ?? options.find((m) => m.id === picked) ?? recommendedModel(catalog, group);
   const dl = offer?.download ?? null;
   const llm = group === 'llm';
   const ownFile = llm && isTauri();
@@ -579,22 +516,19 @@ export function EngineModelCard({
         <div className="setup-model-list" role="radiogroup" aria-label={`${groupLabel(catalog, group)} to download`}>
           {options.map((m) => {
             const selected = m.id === offer.id;
-            const runs = canRun(catalog, m);
             return (
-              <label key={m.id} className={`setup-offer-card setup-model-option${selected ? ' is-selected' : ''}${runs ? '' : ' is-unavailable'}`}>
+              <label key={m.id} className={`setup-offer-card setup-model-option${selected ? ' is-selected' : ''}`}>
                 {options.length > 1 && (
-                  <input type="radio" name={`engine-model-${group}`} value={m.id} checked={selected} disabled={!!active || busy || !runs} onChange={() => setPicked(m.id)} />
+                  <input type="radio" name={`engine-model-${group}`} value={m.id} checked={selected} disabled={!!active || busy} onChange={() => setPicked(m.id)} />
                 )}
                 <span className="setup-model-text">
                   <strong>
                     {m.name} {m.recommended && <span className="badge badge-pending">Recommended</span>}
                     {llm && (m.agentTools ? <span className="badge badge-ok">Agent tools</span> : <span className="badge badge-neutral">Chat only</span>)}
-                    {cudaOnly(m) && <span className="badge badge-neutral">NVIDIA only</span>}
                     {m.installed && <span className="badge badge-ok">Downloaded</span>}
                   </strong>
                   {m.about && <small>{m.about}</small>}
                   <small className="setup-mono">{modelFacts(m, gpuGb)}</small>
-                  {!runs && <small className="card-warn">It runs on OAIY’s NVIDIA engine, which this OAIY does not have yet{ownFile ? ': get it below, on a computer with an NVIDIA card' : ''}.</small>}
                 </span>
               </label>
             );
@@ -604,7 +538,6 @@ export function EngineModelCard({
         {dl && ACTIVE.has(dl.status) && <DownloadProgress name={offer.name} dl={dl} />}
         {dl?.status === 'failed' && dl.error && <p className="card-warn">{dl.error}</p>}
         {offer.installed && <p className="form-hint">Downloaded. Choose it in Engines to use it.</p>}
-        {ownFile && <NvidiaEngineOffer onInstalled={onChanged} />}
         {ownFile && <OwnModelFile onAdded={addedFile} />}
       </div>
     );

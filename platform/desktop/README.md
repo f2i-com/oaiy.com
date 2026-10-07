@@ -251,7 +251,7 @@ where `src/embed.rs` looks (`OAIY_APP_DIST` and `OAIY_FLOWS_DIST` override it). 
 `npm run stage-engines` copies the portable language-model engine
 (`target/release/oaiy-llm-server-webgpu`) into `src-tauri/resources/engines`, and stops when
 it is not built: an installed OAIY runs the model its setup downloads on it, from
-`<install>/resources/engines`, unless a CUDA build of `oaiy-llm-server` is beside the program
+`<install>/resources/engines`, unless a build of `oaiy-llm-server` is beside the program
 (`src/engines.rs`). `tauri dev`, `cargo test` and CI need none of them staged: `build.rs`
 makes the three folders, empty, and in a debug build the pages come from their build
 folders.

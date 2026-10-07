@@ -1,7 +1,7 @@
 {
   "id": "oaiy-voice",
   "name": "OAIY Voice",
-  "description": "OAIY's own voice for calls, in Rust on the GPU with the most free memory: Parakeet speech-to-text and Qwen3-TTS speech that streams as it is made, in a voice cloned from a short clip (an MP3 or WAV, chosen on the Calendar page). Served locally over the OpenAI /v1/audio/transcriptions and /v1/audio/speech APIs. Uses the models already in your model folders, or downloads them (~4.3 GB, checksum-verified).",
+  "description": "OAIY's own voice for calls, in Rust (on the CPU for now): Parakeet speech-to-text and Qwen3-TTS speech that streams as it is made, in a voice cloned from a short clip (an MP3 or WAV, chosen on the Calendar page). Served locally over the OpenAI /v1/audio/transcriptions and /v1/audio/speech APIs. Uses the models already in your model folders, or downloads them (~4.3 GB, checksum-verified).",
   "category": "Speech",
   "defaultPort": 8783,
   "install": {

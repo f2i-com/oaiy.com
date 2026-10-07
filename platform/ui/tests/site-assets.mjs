@@ -231,7 +231,9 @@ await check('the pages no longer say what is not true of the product', () => {
   const both = `${landing}\n${desktop}`;
   for (const stale of [/tray companion/i, /Windows, optional/, /Windows desktop app/, /no window to keep open/i, /lives in the system tray/i, /CUDA, Metal, ROCm/, /Windows-only/i, /nothing phones home/i, /Ollama, llama\.cpp/,
     // Nothing is published for download for the engines, and nothing binds a key to one provider.
-    /separate download/i, /sent only to the provider/i]) {
+    /separate download/i, /sent only to the provider/i,
+    // The engines run on any graphics card (WebGPU): none of them needs one maker's.
+    /NVIDIA GPU/i, /CUDA/]) {
     assert.doesNotMatch(both, stale, String(stale));
   }
   assert.doesNotMatch(landing, /No account, no install/, 'the desktop is an install');
@@ -272,7 +274,7 @@ await check('what the pages must say plainly is there', () => {
   // landing: what it is, what needs the desktop, what is not ready
   assert.match(landing, /AI agent and flow builder/);
   assert.match(landing, /Windows and Linux/);
-  assert.match(landing, /NVIDIA GPU/);
+  assert.match(landing, /graphics card of any make/);
   assert.match(landing, /phone connected over Bluetooth/);
   assert.match(landing, /not published for download yet/);
   assert.match(landing, /engines are not in the installer yet/);

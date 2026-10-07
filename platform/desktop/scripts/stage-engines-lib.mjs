@@ -2,11 +2,10 @@
  * Stage the portable language-model engine into src-tauri/resources/engines, so the installer carries it.
  *
  * OAIY's engines run a language model with `oaiy-llm-server`, whose programs used to be a separate, hand-built
- * channel: an installed OAIY could download a model and had nothing to run it with. The portable build,
- * `oaiy-llm-server-webgpu` (no CUDA: GGUF models on any graphics card through WebGPU, else the CPU), is about 12 MB and
+ * channel: an installed OAIY could download a model and had nothing to run it with. The server, staged under the name
+ * `oaiy-llm-server-webgpu` (every model on any graphics card through WebGPU, else the CPU), is about 15 MB and
  * needs nothing a system lacks, so every installer carries it. The desktop finds it in `<install>/resources/engines`
- * (src-tauri/src/engines.rs), after a faster CUDA build put beside the program, which stays a separate download: the
- * NVIDIA libraries it needs come to about 850 MB.
+ * (src-tauri/src/engines.rs), after a build of one's own put beside the program.
  *
  * This does not build the engine: `cargo build` of it takes minutes, and the release workflow runs it before
  * `tauri build`. It checks that the build is there, copies it, and verifies the copy against the build; a missing or

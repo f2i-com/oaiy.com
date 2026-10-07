@@ -2045,8 +2045,6 @@ export interface EngineCatalogModel {
   recommended: boolean;
   /** A language model the Agent can use its tools with (the engine reads its tool calls); the others chat only. */
   agentTools?: boolean;
-  /** The engines that run it: `cuda` (NVIDIA), `webgpu` (any GPU, else the CPU). Both when absent. */
-  engines?: Array<'cuda' | 'webgpu'>;
   /** The computer's memory it needs, in GB, when that is more than a usual computer's. */
   ramGb?: number | null;
   /** The GPUs it takes, when more than one. */
@@ -2076,23 +2074,6 @@ export interface EngineCatalog {
   groups?: Array<{ id: string; name: string; about?: string }>;
   models?: EngineCatalogModel[];
   defaults?: Record<string, string | null>;
-  /** The engines this OAIY can start; absent from an older desktop (every model is then offered). */
-  engines?: { cuda: boolean; webgpu: boolean } | null;
-}
-
-/**
- * The NVIDIA engine: the CUDA language-model server, which the installer does not carry and the desktop fetches on
- * request (its window's commands, not routes).
- */
-export interface NvidiaEngine {
-  /** A CUDA build is made for this kind of computer (Windows and Linux on x86-64). */
-  offered: boolean;
-  /** This computer has an NVIDIA GPU with its driver. */
-  nvidia: boolean;
-  /** This version's engine has been fetched. */
-  installed: boolean;
-  version: string;
-  fetch: { state: 'idle' | 'downloading' | 'checking' | 'done' | 'failed'; got: number; total: number | null; error: string | null };
 }
 
 export const engines = {
@@ -2110,10 +2091,6 @@ export const engines = {
    * command of the desktop's window, not a route: the desktop refuses a file the engine cannot run.
    */
   addModelFile: (path: string) => tauriInvoke<AddedModelFile>('add_engine_model', { path }),
-  /** The NVIDIA engine's state. The desktop's window only. */
-  nvidia: () => tauriInvoke<NvidiaEngine>('nvidia_engine_status'),
-  /** Fetch the NVIDIA engine, check its signature and have the engines run it; resolves when it is done. */
-  fetchNvidia: () => tauriInvoke<NvidiaEngine>('fetch_nvidia_engine'),
 };
 
 // ----- setup (the wizard's record, on the desktop) -----

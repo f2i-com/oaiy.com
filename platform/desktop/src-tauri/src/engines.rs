@@ -66,8 +66,8 @@ pub fn programs_dir() -> Option<PathBuf> {
         candidates.push(dir.join("engines"));
         candidates.push(dir);
     }
-    // The portable engine the installer carries: after a CUDA build put beside the program, which is faster on an
-    // NVIDIA card and is still the one used when it is there.
+    // The engine the installer carries: after one put beside the program (a build of one's own), which is still the
+    // one used when it is there.
     if let Some(dir) = BUNDLED.get() {
         candidates.push(dir.clone());
     }
@@ -76,11 +76,35 @@ pub fn programs_dir() -> Option<PathBuf> {
     first_with_programs(candidates)
 }
 
-/// The first of `candidates` that holds an engine program: the CUDA or the portable language-model server, or the
-/// media worker.
+/// The first of `candidates` that holds an engine program: the language-model server, under either of its names, or
+/// the media worker.
 fn first_with_programs(candidates: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
     let has = |d: &Path| ["oaiy-llm-server", "oaiy-llm-server-webgpu", "oaiy-media"].iter().any(|p| d.join(exe(p)).is_file());
     candidates.into_iter().find(|d| has(d)).map(|d| std::path::absolute(&d).unwrap_or(d))
+}
+
+/// Where an older OAIY Desktop kept the NVIDIA engine it downloaded: the CUDA build of the language-model server,
+/// one folder a version.
+fn old_cuda_engines(data_dir: &Path) -> PathBuf {
+    data_dir.join("engines").join("cuda")
+}
+
+/// There is one engine now, and it runs on any GPU. A studio that an older OAIY Desktop pointed at its NVIDIA engine
+/// (`llm.server` under `<data>/engines/cuda/`) is taken off it, back to the default, which this install's engine
+/// answers to; and that folder is removed. Left alone, an upgraded install would go on running an older release's
+/// program with this release's command line.
+fn retire_cuda_engine(config: &Path, data_dir: &Path) -> Result<(), String> {
+    let root = old_cuda_engines(data_dir);
+    let server = oaiy_studio::llm_server(config)?;
+    if Path::new(&server).starts_with(&root) {
+        oaiy_studio::set_llm_server(config, "oaiy-llm-server")?;
+        log::info!("engines: the language-model server was an older version's NVIDIA engine ({server}); it is this install's engine again");
+    }
+    if root.is_dir() {
+        std::fs::remove_dir_all(&root).map_err(|e| format!("could not remove the older NVIDIA engine in {}: {e}", root.display()))?;
+        log::info!("engines: removed the older NVIDIA engine, {}", root.display());
+    }
+    Ok(())
 }
 
 /// Start the engines, or find them running. Returns their control pages' address.
@@ -98,8 +122,8 @@ fn start_with(data_dir: &Path, m: Mode) -> Result<String, String> {
         // this makes the folder it is owner-only (unix), and the studio saves the file the same.
         crate::secret_file::create_private_dir(dir).map_err(|e| format!("could not make {}: {e}", dir.display()))?;
     }
-    // The NVIDIA engine this version fetched (an optional download), or none: another version's is set aside.
-    if let Err(e) = crate::nvidia_engine::reconcile(&config, data_dir, env!("CARGO_PKG_VERSION")) {
+    // The NVIDIA engine an older version fetched (the CUDA build, which is no more): set aside before the studio starts.
+    if let Err(e) = retire_cuda_engine(&config, data_dir) {
         log::warn!("engines: {e}");
     }
     if let Some(programs) = programs_dir() {
@@ -425,22 +449,51 @@ mod tests {
     }
 
     #[test]
-    fn the_portable_engine_an_installer_carries_is_found_and_a_cuda_build_before_it_is_preferred() {
+    fn the_engine_an_installer_carries_is_found_and_a_build_beside_the_program_before_it_is_preferred() {
         let base = std::env::temp_dir().join(format!("oaiy-engine-dirs-{}", std::process::id()));
-        let (empty, cuda, bundled) = (base.join("empty"), base.join("cuda"), base.join("bundled"));
-        for d in [&empty, &cuda, &bundled] {
+        let (empty, beside, bundled) = (base.join("empty"), base.join("beside"), base.join("bundled"));
+        for d in [&empty, &beside, &bundled] {
             std::fs::create_dir_all(d).unwrap();
         }
         std::fs::write(bundled.join(exe("oaiy-llm-server-webgpu")), b"x").unwrap();
-        // The bundled portable server alone is enough: it was not a program here before, so an installer's was never found.
+        // The bundled server alone is enough, under the name the installer stages it by.
         let found = first_with_programs([empty.clone(), bundled.clone()]).unwrap();
         assert!(found.ends_with("bundled"), "{}", found.display());
-        // A CUDA build earlier in the list wins.
-        std::fs::write(cuda.join(exe("oaiy-llm-server")), b"x").unwrap();
-        assert!(first_with_programs([empty.clone(), cuda.clone(), bundled.clone()]).unwrap().ends_with("cuda"));
+        // A build earlier in the list wins.
+        std::fs::write(beside.join(exe("oaiy-llm-server")), b"x").unwrap();
+        assert!(first_with_programs([empty.clone(), beside.clone(), bundled.clone()]).unwrap().ends_with("beside"));
         // Nothing anywhere: none.
         assert_eq!(first_with_programs([empty.clone()]), None);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn an_older_versions_nvidia_engine_is_set_aside_and_its_folder_removed() {
+        let data = std::env::temp_dir().join(format!("oaiy-retire-cuda-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data);
+        let config = config_path(&data);
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        // An install that fetched the NVIDIA engine of two versions, and ran the later.
+        let old = old_cuda_engines(&data);
+        for v in ["0.1.0", "0.2.0"] {
+            std::fs::create_dir_all(old.join(v)).unwrap();
+            std::fs::write(old.join(v).join(exe("oaiy-llm-server")), b"x").unwrap();
+        }
+        oaiy_studio::set_llm_server(&config, &old.join("0.2.0").join(exe("oaiy-llm-server")).to_string_lossy()).unwrap();
+        retire_cuda_engine(&config, &data).unwrap();
+        assert_eq!(oaiy_studio::llm_server(&config).unwrap(), "oaiy-llm-server", "back to the default, which this install's engine answers to");
+        assert!(!old.exists(), "the downloaded engines are removed");
+        assert!(config.is_file(), "the configuration beside them is kept");
+        // A server of the person's own choosing is theirs; and a start with nothing to set aside changes nothing.
+        let own = data.join("mine").join(exe("oaiy-llm-server"));
+        oaiy_studio::set_llm_server(&config, &own.to_string_lossy()).unwrap();
+        retire_cuda_engine(&config, &data).unwrap();
+        assert_eq!(oaiy_studio::llm_server(&config).unwrap(), own.to_string_lossy());
+        // The folder gone but the setting still under it (removed by hand): the default again.
+        oaiy_studio::set_llm_server(&config, &old.join("0.2.0").join(exe("oaiy-llm-server")).to_string_lossy()).unwrap();
+        retire_cuda_engine(&config, &data).unwrap();
+        assert_eq!(oaiy_studio::llm_server(&config).unwrap(), "oaiy-llm-server");
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     #[test]
