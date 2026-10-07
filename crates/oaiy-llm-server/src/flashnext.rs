@@ -282,6 +282,7 @@ struct NgramTable {
     start: u64,
     rows: u64,
     row_words: usize,
+    /// A trellis row's bits a value; 0 for a GGUF's table (IQ4_NL rows, no head bias and no codebook).
     bits: usize,
     head_offsets: Vec<i64>,
     head_sizes: Vec<i64>,
@@ -305,6 +306,9 @@ fn mul1_codebook() -> Vec<f32> {
         round_f16((1024 + sum) as f32 * k_inv + k_bias)
     }).collect()
 }
+
+/// The bytes of a GGUF n-gram table's row: `ROW_DIM` values as IQ4_NL blocks of 32 (18 bytes each).
+const IQ4_NL_ROW: usize = ROW_DIM / 32 * 18;
 
 /// The most u16 words an n-gram table's row takes (its scale, then `ROW_DIM` codes of up to 8 bits).
 const ROW_WORDS_MAX: usize = 1 + ROW_DIM * 8 / 16;
@@ -383,6 +387,14 @@ impl NgramTable {
         if row >= self.rows {
             return Err(bad("n-gram row out of range"));
         }
+        // (a GGUF's table: each row five IQ4_NL blocks, its values as they are)
+        if self.bits == 0 {
+            let mut buf = [0u8; IQ4_NL_ROW];
+            let file = &self.files[rayon::current_thread_index().unwrap_or(0) % self.files.len()];
+            read_at(file, &mut buf, self.start + row * IQ4_NL_ROW as u64)?;
+            ggml_quants::iq4_nl::dequantize(&buf, &mut out[..ROW_DIM]);
+            return Ok(());
+        }
         // (a row's 62 bytes or so: on the stack)
         let mut buf = [0u8; 2 * ROW_WORDS_MAX];
         let bytes = &mut buf[..self.row_words * 2];
@@ -412,6 +424,14 @@ fn read_at(f: &File, buf: &mut [u8], at: u64) -> Result<()> {
     Ok(())
 }
 
+/// The token embeddings, a token's row read from the file as it is needed.
+enum Embed {
+    /// A checkpoint's own floats: the file, the table's first byte and its type.
+    Plain(File, u64, Dtype),
+    /// A GGUF's quantized rows: the file, the table's first byte, its type and a row's bytes.
+    Quant(File, u64, ggml_quants::GgmlType, usize),
+}
+
 /// The n-gram layer. Small, once per forward: it runs on the host, but its projections.
 struct Ple {
     table: NgramTable,
@@ -434,7 +454,7 @@ fn ple_slot(cfg: &Config) -> usize {
 pub struct FlashNext {
     pub config: Config,
     pub tokenizer: tokenizer::Tokenizer,
-    embed: (File, u64, Dtype),
+    embed: Embed,
     layers: Vec<Layer>,
     ple: Ple,
     collapse: HyperMix,
@@ -914,7 +934,7 @@ fn build(path: &Path, backends: Vec<Arc<dyn Backend>>, cudas: Vec<Arc<Card>>, lo
     let file = File::open(idx.shard_path(embed.shard))?;
     Ok(FlashNext {
         tokenizer: tok,
-        embed: (file, embed.start, embed.dtype),
+        embed: Embed::Plain(file, embed.start, embed.dtype),
         layers,
         ple,
         collapse,
@@ -950,14 +970,25 @@ impl FlashNext {
     /// Token embeddings, `[tokens, hidden]` on the host.
     pub fn embed_text(&self, tokens: &[u32]) -> Result<Tensor> {
         let h = self.config.hidden;
-        let (file, start, dtype) = &self.embed;
+        if tokens.iter().any(|&t| t as usize >= self.config.vocab) {
+            return Err(bad("token outside the vocabulary"));
+        }
+        let (file, start, dtype) = match &self.embed {
+            Embed::Plain(file, start, dtype) => (file, start, dtype),
+            Embed::Quant(file, start, dtype, row) => {
+                let mut out = vec![0f32; tokens.len() * h];
+                let mut buf = vec![0u8; *row];
+                for (&t, o) in tokens.iter().zip(out.chunks_exact_mut(h)) {
+                    read_at(file, &mut buf, start + t as u64 * *row as u64)?;
+                    ggml_quants::dequantize(*dtype, &buf, o).map_err(|e| bad(e.to_string()))?;
+                }
+                return Ok(Tensor::from_vec(out, vec![tokens.len(), h]));
+            }
+        };
         let size = dtype.size();
         let mut out = Vec::with_capacity(tokens.len() * h);
         let mut buf = vec![0u8; h * size];
         for &t in tokens {
-            if t as usize >= self.config.vocab {
-                return Err(bad("token outside the vocabulary"));
-            }
             read_at(file, &mut buf, start + (t as u64) * (h * size) as u64)?;
             match dtype {
                 Dtype::F32 => out.extend(buf.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))),

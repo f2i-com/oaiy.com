@@ -4450,6 +4450,9 @@ impl DeviceChain for WgpuBackend {
         if let Some(q) = w.as_any().and_then(|a| a.downcast_ref::<crate::quant_linear::QuantLinear>()) {
             return self.holds(&q.w);
         }
+        if let Some(f) = w.as_any().and_then(|a| a.downcast_ref::<crate::quant_linear::HalfLinear>()) {
+            return f.is_on(&self.gpu);
+        }
         w.as_any()
             .and_then(|a| a.downcast_ref::<crate::exl3::Exl3Gpu>())
             .is_some_and(|g| g.is_on(&self.gpu) && g.single_chunk().is_some())
@@ -4488,6 +4491,20 @@ impl Recorder<'_> {
                     self.matmul_rows(&q.w, &t, y, rows);
                 }
                 None => self.matmul_rows(&q.w, x, y, rows),
+            }
+            return;
+        }
+        // (and its matrices of floats, as f16)
+        if let Some(f) = w.as_any().and_then(|a| a.downcast_ref::<crate::quant_linear::HalfLinear>()) {
+            let (k, n) = f.kn();
+            assert!(rows > 0 && x.len >= rows * k && y.len >= rows * n, "chain: an f16 projection [{n}, {k}] of {rows} rows");
+            match up {
+                Some(u) => {
+                    let t = self.scratch(rows * k);
+                    self.silu_mul(x, u, &t, rows * k);
+                    self.matmul_f16_rows(&f.w, n, k, &t, y, rows);
+                }
+                None => self.matmul_f16_rows(&f.w, n, k, x, y, rows),
             }
             return;
         }

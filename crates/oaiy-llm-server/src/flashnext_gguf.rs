@@ -3,11 +3,14 @@
 //! Q5_0, IQ4_NL, IQ4_XS, BF16), the hashed n-gram table a second shard of IQ4_NL rows. The tensors are GGML's layout
 //! already (the delta nets' value heads tiled, the indexer's projection in its two parts, `ssm_a` its `-exp(A_log)`),
 //! which is the layout this engine runs: no channel maps, where the EXL3 loader maps a Hugging Face checkpoint's.
-use super::{bad, Config};
+use super::{bad, Attn, Config, Embed, FlashNext, Gdn, HyperMix, Layer, Mixer, Moe, NgramTable, Ple, ROW_DIM};
+use dsv41::safetensors::Dtype;
 use ggml_quants::GgmlType;
+use ggml_rs::{exl3::{Experts, PackedLinear}, Backend, QuantizedTensor, Tensor};
 use gguf::{GgufFile, Value};
+use llama_rs::loader::Weight;
 use oaiy_engine::Result;
-use std::path::Path;
+use std::{fs::File, path::Path, sync::Arc};
 
 pub(crate) const ARCH: &str = "qwen4exp";
 
@@ -127,6 +130,234 @@ impl Source<'_> {
         ggml_quants::dequantize(dtype, &bytes, &mut out).map_err(|e| bad(format!("{name}: {e}")))?;
         Ok(out)
     }
+}
+
+/// One MoE layer's experts as a GGUF holds them: the routed ones' gate and up (`[experts][ff][hidden]`) and down
+/// (`[experts][hidden][ff]`) each its type and its blocks' bytes, row after row; the shared expert's three matrices
+/// dequantized (gate and up `[ff, hidden]`, down `[hidden, ff]`).
+pub struct ExpertBlocks {
+    pub hidden: usize,
+    pub ff: usize,
+    pub experts: usize,
+    pub gate: (GgmlType, Vec<u8>),
+    pub up: (GgmlType, Vec<u8>),
+    pub down: (GgmlType, Vec<u8>),
+    pub shared: [Vec<f32>; 3],
+}
+
+/// Makes a GGUF's quantized matrix (`[n, k]`) a projection on a device (by its index).
+pub type QuantMaker<'a> = &'a (dyn Fn(usize, QuantizedTensor) -> std::result::Result<Arc<dyn PackedLinear>, String> + Sync);
+/// Makes a matrix of floats (`[n, k]`, row-major) a projection on a device: a GGUF's BF16 ones a chain reads packed.
+pub type FloatMaker<'a> = &'a (dyn Fn(usize, Vec<f32>, usize, usize) -> std::result::Result<Arc<dyn PackedLinear>, String> + Sync);
+/// Makes a layer's experts on a device.
+pub type ExpertsMaker<'a> = &'a (dyn Fn(usize, ExpertBlocks) -> Result<Box<dyn Experts>> + Sync);
+
+/// Qwen3.8-Flash-Next from the GGUF at `path` (its first shard), its layers shared over `backends` in order as the
+/// EXL3 loader shares them: every matrix in its file's type, what `quant`, `float` and `experts` make of them on a
+/// device. No multi-token-prediction layer (the GGUFs carry none) and no adapters.
+pub(crate) fn load(path: &Path, backends: Vec<Arc<dyn Backend>>, quant: QuantMaker<'_>, float: FloatMaker<'_>, experts: ExpertsMaker<'_>) -> Result<FlashNext> {
+    let g = GgufFile::open(path).map_err(|e| bad(e.to_string()))?;
+    if g.architecture().ok() != Some(ARCH) {
+        return Err(bad("not a Qwen3.8-Flash-Next GGUF"));
+    }
+    let cfg = Config::from_gguf(&g)?;
+    let tok = tokenizer::Tokenizer::from_gguf(&g).map_err(|e| bad(format!("its tokenizer: {e}")))?;
+    let src = Source { g: &g };
+    let shards = gguf::reader::split_shard_paths(path, g.n_shards()).filter(|_| g.n_shards() > 1).unwrap_or_else(|| vec![path.to_path_buf()]);
+    let h = cfg.hidden;
+    let width = cfg.streams * h;
+    let (nk, nv, kd, vd, conv) = (cfg.nk, cfg.nv, cfg.kd, cfg.vd, cfg.conv);
+    let qkv = 2 * nk * kd + nv * vd;
+    if cfg.shared_ff != cfg.moe_ff {
+        return Err(bad("the shared expert must be as wide as the routed ones"));
+    }
+    // a matrix a chain reads packed (`k -> n`): its blocks as they are, or its floats
+    let packed = |device: usize, name: &str, k: usize, n: usize| -> Result<Weight> {
+        let dtype = src.dtype(name, &[n, k])?;
+        Ok(Weight::Packed(if dtype.is_quantized() {
+            let bytes = g.tensor_bytes(src.info(name)?).map_err(|e| bad(format!("{name}: {e}")))?.into_owned();
+            quant(device, QuantizedTensor::from_bytes_cpu(bytes, vec![n, k], dtype)).map_err(|e| bad(format!("{name}: {e}")))?
+        } else {
+            float(device, src.values(name, &[n, k])?, n, k).map_err(|e| bad(format!("{name}: {e}")))?
+        }))
+    };
+    let tensor = |device: usize, name: &str, shape: &[usize]| -> Result<Tensor> { Ok(backends[device].to_device(Tensor::from_vec(src.values(name, shape)?, shape.to_vec()))) };
+    let dense = |device: usize, values: Vec<f32>, rows: usize, cols: usize| Weight::Dense(backends[device].to_device(Tensor::from_vec(values, vec![rows, cols])));
+    // a gated-residual site (`{p}_down`, `_up`, `_norm` and, where it writes back, `_inject`), as the EXL3 loader
+    // lays one out: the write logits ride along the down projection, the up projection ignores them
+    let hyper = |device: usize, p: &str, site: bool| -> Result<HyperMix> {
+        let rank = src.info(&format!("{p}_down.weight"))?.shape.get(1).copied().unwrap_or(0) as usize;
+        let writes = if site { cfg.streams } else { 0 };
+        let mut down = src.values(&format!("{p}_down.weight"), &[rank, width])?;
+        if site {
+            down.extend(src.values(&format!("{p}_inject.weight"), &[cfg.streams, width])?);
+        }
+        let up = src.values(&format!("{p}_up.weight"), &[width, rank])?;
+        let mut padded = Vec::with_capacity(width * (rank + writes));
+        for row in up.chunks_exact(rank) {
+            padded.extend_from_slice(row);
+            padded.extend(std::iter::repeat_n(0.0, writes));
+        }
+        Ok(HyperMix {
+            norm: tensor(device, &format!("{p}_norm.weight"), &[width])?,
+            down: backends[device].to_device(Tensor::from_vec(down, vec![rank + writes, width])),
+            up: backends[device].to_device(Tensor::from_vec(padded, vec![width, rank + writes])),
+            rank,
+            site,
+            packed: false,
+        })
+    };
+    let load_layer = |i: usize| -> Result<Layer> {
+        let device = i * backends.len() / cfg.layers;
+        let b = format!("blk.{i}");
+        let mixer = if cfg.attention[i] {
+            let (iq, ik) = (cfg.index_heads * cfg.index_dim, cfg.index_dim);
+            // the indexer's query heads, then its key: one projection
+            let mut index = src.values(&format!("{b}.indexer.q_proj.weight"), &[iq, h])?;
+            index.extend(src.values(&format!("{b}.indexer.k_proj.weight"), &[ik, h])?);
+            Mixer::Attn(Attn {
+                q: packed(device, &format!("{b}.attn_q.weight"), h, 2 * cfg.heads * cfg.head_dim)?,
+                k: packed(device, &format!("{b}.attn_k.weight"), h, cfg.kv_heads * cfg.head_dim)?,
+                v: packed(device, &format!("{b}.attn_v.weight"), h, cfg.kv_heads * cfg.head_dim)?,
+                o: packed(device, &format!("{b}.attn_output.weight"), cfg.heads * cfg.head_dim, h)?,
+                q_norm: tensor(device, &format!("{b}.attn_q_norm.weight"), &[cfg.head_dim])?,
+                k_norm: tensor(device, &format!("{b}.attn_k_norm.weight"), &[cfg.head_dim])?,
+                index_qk: Weight::Packed(float(device, index, iq + ik, h).map_err(|e| bad(format!("{b}'s indexer: {e}")))?),
+                index_q_norm: tensor(device, &format!("{b}.indexer.q_norm.weight"), &[ik])?,
+                index_k_norm: tensor(device, &format!("{b}.indexer.k_norm.weight"), &[ik])?,
+                index_slot: cfg.layers + 1 + cfg.attention[..i].iter().filter(|&&a| a).count(),
+            })
+        } else {
+            let mut ba = src.values(&format!("{b}.ssm_beta.weight"), &[nv, h])?;
+            ba.extend(src.values(&format!("{b}.ssm_alpha.weight"), &[nv, h])?);
+            Mixer::Gdn(Gdn {
+                qkv: packed(device, &format!("{b}.attn_qkv.weight"), h, qkv)?,
+                z: packed(device, &format!("{b}.attn_gate.weight"), h, nv * vd)?,
+                ba: dense(device, ba, 2 * nv, h),
+                a: tensor(device, &format!("{b}.ssm_a"), &[nv])?,
+                dt_bias: tensor(device, &format!("{b}.ssm_dt.bias"), &[nv])?,
+                conv: tensor(device, &format!("{b}.ssm_conv1d.weight"), &[qkv, conv])?,
+                norm: tensor(device, &format!("{b}.ssm_norm.weight"), &[vd])?,
+                out: packed(device, &format!("{b}.ssm_out.weight"), nv * vd, h)?,
+            })
+        };
+        // the routed experts' three tensors, each every expert's rows one after another
+        let blocks = |name: &str, n: usize, k: usize| -> Result<(GgmlType, Vec<u8>)> {
+            let name = format!("{b}.{name}.weight");
+            let dtype = src.dtype(&name, &[cfg.experts, n, k])?;
+            if !dtype.is_quantized() || k % dtype.block_size() != 0 {
+                return Err(bad(format!("{name}: experts of {dtype:?}, rows of {k}")));
+            }
+            Ok((dtype, g.tensor_bytes(src.info(&name)?).map_err(|e| bad(format!("{name}: {e}")))?.into_owned()))
+        };
+        let made = experts(device, ExpertBlocks {
+            hidden: h,
+            ff: cfg.moe_ff,
+            experts: cfg.experts,
+            gate: blocks("ffn_gate_exps", cfg.moe_ff, h)?,
+            up: blocks("ffn_up_exps", cfg.moe_ff, h)?,
+            down: blocks("ffn_down_exps", h, cfg.moe_ff)?,
+            shared: [
+                src.values(&format!("{b}.ffn_gate_shexp.weight"), &[cfg.shared_ff, h])?,
+                src.values(&format!("{b}.ffn_up_shexp.weight"), &[cfg.shared_ff, h])?,
+                src.values(&format!("{b}.ffn_down_shexp.weight"), &[h, cfg.shared_ff])?,
+            ],
+        })?;
+        // the router, then the shared expert's gate
+        let mut router = src.values(&format!("{b}.ffn_gate_inp.weight"), &[cfg.experts, h])?;
+        router.extend(src.values(&format!("{b}.ffn_gate_inp_shexp.weight"), &[h])?);
+        Ok(Layer {
+            device,
+            attn_hc: hyper(device, &format!("{b}.hc_attn"), true)?,
+            mlp_hc: hyper(device, &format!("{b}.hc_ffn"), true)?,
+            mixer,
+            moe: Moe { router: dense(device, router, cfg.experts + 1, h), experts: made },
+        })
+    };
+    // (a layer is independent of the others: four load at once, as the EXL3 loader's)
+    const WORKERS: usize = 4;
+    let mut loaded: Vec<Option<Layer>> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..WORKERS)
+            .map(|w| {
+                let load_layer = &load_layer;
+                scope.spawn(move || (w..cfg.layers).step_by(WORKERS).map(|i| load_layer(i).map(|l| (i, l))).collect::<Result<Vec<_>>>())
+            })
+            .collect();
+        let mut out: Vec<Option<Layer>> = (0..cfg.layers).map(|_| None).collect();
+        for w in workers {
+            for (i, layer) in w.join().expect("layer loader")? {
+                out[i] = Some(layer);
+            }
+        }
+        Ok::<_, oaiy_engine::Error>(out)
+    })?;
+    let layers: Vec<Layer> = loaded.iter_mut().map(|l| l.take().expect("every layer")).collect();
+
+    // the n-gram layer, with the block it runs before; its table the second shard's one tensor
+    let pd = layers[cfg.ple_layer].device;
+    let b = format!("blk.{}", cfg.ple_layer);
+    let heads = (cfg.ngram - 1) * cfg.heads_per_ngram;
+    let table = src.info("per_layer_token_embd.weight")?;
+    if table.dtype != GgmlType::IQ4_NL || table.shape.len() != 2 || table.shape[0] as usize != ROW_DIM {
+        return Err(bad(format!("n-gram table: {:?} of shape {:?}, not IQ4_NL rows of {ROW_DIM}", table.dtype, table.shape)));
+    }
+    let (head_offsets, head_sizes) = (integers(&g, "ple.head_offsets")?, integers(&g, "ple.head_vocab_sizes")?);
+    if head_offsets.len() != heads || head_sizes.len() != heads || head_offsets.iter().zip(&head_sizes).any(|(o, s)| *o < 0 || *s <= 0 || (o + s) as u64 > table.shape[1]) {
+        return Err(bad("n-gram table: head parameters do not match the heads"));
+    }
+    let table_file = &shards[g.shard_of(table)];
+    let ple = Ple {
+        table: NgramTable {
+            files: (0..rayon::current_num_threads().max(1)).map(|_| File::open(table_file)).collect::<std::io::Result<_>>()?,
+            start: g.tensor_data_offset(table) as u64,
+            rows: table.shape[1],
+            row_words: 0,
+            bits: 0,
+            head_offsets,
+            head_sizes,
+            multipliers: integers(&g, "ple.layer_multipliers")?,
+            bias: Vec::new(),
+            codebook: Vec::new(),
+        },
+        key: dense(pd, src.values(&format!("{b}.ple_key.weight"), &[width, cfg.ple_dim])?, width, cfg.ple_dim),
+        value: dense(pd, src.values(&format!("{b}.ple_value.weight"), &[h, cfg.ple_dim])?, h, cfg.ple_dim),
+        norm_key: tensor(pd, &format!("{b}.ple_norm_key.weight"), &[width])?,
+        norm_query: tensor(pd, &format!("{b}.ple_norm_query.weight"), &[width])?,
+        norm_conv: tensor(pd, &format!("{b}.ple_norm_conv.weight"), &[width])?,
+        conv: tensor(pd, &format!("{b}.ple_conv1d.weight"), &[width, cfg.ple_kernel])?,
+    };
+    if ple.table.multipliers.len() < cfg.ngram {
+        return Err(bad("n-gram table: a multiplier is missing"));
+    }
+
+    let last = backends.len() - 1;
+    let collapse = hyper(last, "output_hc", false)?;
+    let head = packed(last, "output.weight", h, cfg.vocab)?;
+    // the embeddings: a token's row read from the file as it is needed
+    let et = src.info("token_embd.weight")?;
+    let dtype = src.dtype("token_embd.weight", &[cfg.vocab, h])?;
+    let (file, start) = (File::open(&shards[g.shard_of(et)])?, g.tensor_data_offset(et) as u64);
+    let embed = match dtype {
+        GgmlType::F32 => Embed::Plain(file, start, Dtype::F32),
+        GgmlType::F16 => Embed::Plain(file, start, Dtype::F16),
+        GgmlType::BF16 => Embed::Plain(file, start, Dtype::BF16),
+        _ if h % dtype.block_size() == 0 => Embed::Quant(file, start, dtype, h / dtype.block_size() * dtype.type_size()),
+        _ => return Err(bad(format!("embeddings of {dtype:?}"))),
+    };
+    Ok(FlashNext {
+        tokenizer: tok,
+        embed,
+        layers,
+        ple,
+        collapse,
+        head,
+        devices: backends,
+        cudas: Vec::new(),
+        decoded: Default::default(),
+        chain: Default::default(),
+        mtp: None,
+        config: cfg,
+    })
 }
 
 #[cfg(all(test, feature = "webgpu"))]

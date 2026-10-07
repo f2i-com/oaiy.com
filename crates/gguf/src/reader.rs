@@ -648,7 +648,7 @@ impl GgufInner {
 /// recovered by stripping that suffix. Returns the full set in shard order
 /// (index 0 is `-00001-of-`), or `None` if the name does not match, which the
 /// caller reports rather than guessing.
-fn split_shard_paths(path: &Path, count: usize) -> Option<Vec<PathBuf>> {
+pub fn split_shard_paths(path: &Path, count: usize) -> Option<Vec<PathBuf>> {
     if count == 0 {
         return None;
     }
