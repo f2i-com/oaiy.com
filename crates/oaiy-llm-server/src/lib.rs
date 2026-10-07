@@ -82,8 +82,8 @@ pub struct Options {
     pub host: String,
     /// Port; 0 lets the OS pick one ([`Running::addr`] tells which).
     pub port: u16,
-    /// CUDA devices; the layers are split across them. Empty: the visible
-    /// ones in order, at most two (the layers split only at layer 20).
+    /// The GPUs the models may use, by their number as nvidia-smi counts them: the first carries a model, the rest
+    /// what one spreads over more than one. Empty: the first adapter, and every other discrete GPU for those.
     pub devices: Vec<usize>,
     /// Context length in tokens, prompt and reply together. 0 (`--ctx auto`):
     /// the most each model allows.

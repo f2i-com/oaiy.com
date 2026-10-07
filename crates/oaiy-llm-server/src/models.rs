@@ -553,12 +553,14 @@ impl Models {
         if o.lora_adapters.contains_key(&spec.name) {
             return Err(Error::Arg(format!("{}: LoRA adapters need the CUDA build", spec.name)));
         }
-        let picked = crate::backend::open(o, &o.devices)?;
+        let devices = self.devices_of(spec);
+        let picked = crate::backend::open(o, &devices)?;
         self.say(format!("{} runs on {} (EXL3 experts decoded in the matmul, a layer's in two batches)", spec.name, picked.label));
         let wgpu = picked.backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>();
-        // The computer's other discrete GPUs take a share of the layers, a whole layer each (its experts too): two
-        // 32 GB cards hold all of its 46 GB of experts, where the CPU decoded what one could not (most of a step).
-        let others: Vec<Arc<ggml_rs_wgpu::WgpuBackend>> = wgpu.map(|b| b.others(o.webgpu_gb.map(|g| g << 30))).unwrap_or_default().into_iter().map(Arc::new).collect();
+        // The other GPUs it may use (the rest of its devices; every other discrete one where none is named) take a
+        // share of the layers, a whole layer each (its experts too): two 32 GB cards hold all of its 46 GB of
+        // experts, where the CPU decoded what one could not (most of a step).
+        let others: Vec<Arc<ggml_rs_wgpu::WgpuBackend>> = wgpu.map(|b| crate::backend::others(o, &devices, b)).unwrap_or_default().into_iter().map(Arc::new).collect();
         let gpus: Vec<&ggml_rs_wgpu::WgpuBackend> = wgpu.into_iter().chain(others.iter().map(|g| g.as_ref())).collect();
         let backends: Vec<Arc<dyn ggml_rs::Backend>> =
             std::iter::once(Arc::clone(&picked.backend)).chain(others.iter().map(|g| Arc::clone(g) as Arc<dyn ggml_rs::Backend>)).collect();
@@ -619,7 +621,8 @@ impl Models {
         // The routed experts on the CPU through this CPU's fastest kernel (the same bits as the portable one).
         model.set_expert_row_kernel(dsv41_simd::row_kernel());
         self.say(format!("experts on the CPU: the {} kernel", dsv41_simd::row_kernel_name()));
-        let picked = crate::backend::open(o, &o.devices)?;
+        let devices = self.devices_of(spec);
+        let picked = crate::backend::open(o, &devices)?;
         let mut kernel = None;
         match picked.backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>() {
             Some(b) => {
@@ -630,9 +633,9 @@ impl Models {
                 let experts = match crate::dsv41_portable::WgpuExperts::new(b) {
                     Some(mut k) => {
                         let (n, kept) = (k.slots(), k.tier().0);
-                        // The computer's other cards hold a share of the experts for good (OAIY_NO_SPLIT: the one GPU).
-                        let others: Vec<Arc<ggml_rs_wgpu::WgpuBackend>> =
-                            if std::env::var_os("OAIY_NO_SPLIT").is_some() { Vec::new() } else { b.others(o.webgpu_gb.map(|g| g << 30)).into_iter().map(Arc::new).collect() };
+                        // The other GPUs it may use (the rest of its devices; every other discrete one where none is
+                        // named; OAIY_NO_SPLIT: none) hold a share of the experts for good.
+                        let others: Vec<Arc<ggml_rs_wgpu::WgpuBackend>> = crate::backend::others(o, &devices, b).into_iter().map(Arc::new).collect();
                         let pinned = k.pin_on(&others, model.cfg.n_layers, model.cfg.n_routed_experts);
                         let k = Arc::new(k);
                         model.set_experts_kernel(Some(Arc::clone(&k) as Arc<dyn dsv41::expert::ExpertsKernel>));
@@ -655,6 +658,12 @@ impl Models {
         Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Deepseek(tok)) })
     }
 
+    /// The GPUs `spec` may use, by number: its own list (`--devices-for`), else the server's (`--devices`); empty
+    /// where neither names any (the first adapter, and every other discrete GPU for a model that spreads).
+    fn devices_of(&self, spec: &Spec) -> Vec<usize> {
+        self.opts.model_devices.get(&spec.name).cloned().unwrap_or_else(|| self.opts.devices.clone())
+    }
+
     /// OrcaSAQ without CUDA: its packed EXL3 projections on the WebGPU adapter while the weight budget holds them,
     /// the rest decoded on the CPU, everything else on the host as in any portable model. No PEFT adapters and no
     /// vision tower (both CUDA's); its prompt states are kept as on CUDA, under a fingerprint of their own.
@@ -664,7 +673,7 @@ impl Models {
         if o.lora_adapters.contains_key(&spec.name) {
             return Err(Error::Arg(format!("{}: LoRA adapters need the CUDA build", spec.name)));
         }
-        let picked = crate::backend::open(o, &o.devices)?;
+        let picked = crate::backend::open(o, &self.devices_of(spec))?;
         self.say(format!("{} runs on {} (EXL3, decoded in the matmul)", spec.name, picked.label));
         let wgpu = picked.backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>();
         let packed = |data: ggml_rs::exl3::Exl3Data| match wgpu {
@@ -713,11 +722,13 @@ impl Models {
         if o.lora_adapters.contains_key(&spec.name) {
             return Err(Error::Arg(format!("{}: LoRA adapters are not applied to a GGUF", spec.name)));
         }
-        let picked = crate::backend::open(o, &o.devices)?;
+        let devices = self.devices_of(spec);
+        let picked = crate::backend::open(o, &devices)?;
         self.say(format!("{} runs on {} (a GGUF: each matrix in its file's type)", spec.name, picked.label));
         let wgpu = picked.backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>();
-        // (OAIY_NO_SPLIT: the one GPU, as for the dense models: what does not fit there runs on the host)
-        let others: Vec<Arc<ggml_rs_wgpu::WgpuBackend>> = wgpu.filter(|_| std::env::var_os("OAIY_NO_SPLIT").is_none()).map(|b| b.others(o.webgpu_gb.map(|g| g << 30))).unwrap_or_default().into_iter().map(Arc::new).collect();
+        // (its other GPUs: the rest of its devices, or every other discrete one where none is named; OAIY_NO_SPLIT:
+        // the one GPU, as for the dense models: what does not fit there runs on the host)
+        let others: Vec<Arc<ggml_rs_wgpu::WgpuBackend>> = wgpu.map(|b| crate::backend::others(o, &devices, b)).unwrap_or_default().into_iter().map(Arc::new).collect();
         let gpus: Vec<&ggml_rs_wgpu::WgpuBackend> = wgpu.into_iter().chain(others.iter().map(|g| g.as_ref())).collect();
         let backends: Vec<Arc<dyn ggml_rs::Backend>> =
             std::iter::once(Arc::clone(&picked.backend)).chain(others.iter().map(|g| Arc::clone(g) as Arc<dyn ggml_rs::Backend>)).collect();
@@ -758,12 +769,9 @@ impl Models {
         if crate::flashnext::gguf_file::detect(&path) {
             return self.load_flashnext_gguf(spec, &path);
         }
-        // Every card `--devices` names, in that order: the first carries the trunk
-        // and the rest take a share of the MoE layers. `open_cards` hands back the
-        // same instances the expert tier will use, so the trunk and card 0's expert
-        // shard share one CUDA context rather than opening a second on that device.
-        let devices = self.image_config.as_ref().filter(|c|c.controller_name==spec.name).map(|c|vec![c.controller_device]).unwrap_or_else(||o.devices.clone());
-        // CUDA cards in a CUDA build; WebGPU or the CPU without one.
+        // The GPUs it may use: an image model's controller the one its configuration names, else the model's own
+        // list or the server's; the first carries it.
+        let devices = self.image_config.as_ref().filter(|c| c.controller_name == spec.name).map(|c| vec![c.controller_device]).unwrap_or_else(|| self.devices_of(spec));
         let picked = crate::backend::open(o, &devices)?;
         self.say(format!("{} runs on {}", spec.name, picked.label));
         let backend: Arc<dyn ggml_rs::Backend> = Arc::clone(&picked.backend);
@@ -775,8 +783,8 @@ impl Models {
             #[allow(unused_mut)]
             let (mut backend, mut helper): (Arc<dyn ggml_rs::Backend>, Option<Arc<dyn ggml_rs::Backend>>) = (backend, None);
             #[cfg(feature = "webgpu")]
-            if let Some(b) = backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>().filter(|_| std::env::var_os("OAIY_NO_SPLIT").is_none()) {
-                if let Some(other) = b.others(o.webgpu_gb.map(|g| g << 30)).into_iter().next() {
+            if let Some(b) = backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>() {
+                if let Some(other) = crate::backend::others(o, &devices, b).into_iter().next() {
                     let (mine, theirs) = (b.transfer_rates().0, other.transfer_rates().0);
                     let (bus, other_bus) = (b.adapter().pci_bus_id.clone(), other.adapter().pci_bus_id.clone());
                     let other: Arc<dyn ggml_rs::Backend> = Arc::new(other);

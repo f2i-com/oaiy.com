@@ -15,8 +15,10 @@ const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|
 
   --host ADDR          listen address (default 127.0.0.1; 0.0.0.0 for the network)
   --port N             port (default 8000)
-  --devices 1,0        GPUs, as nvidia-smi counts them; layers split across them
-                       (default: the visible ones in order, at most two)
+  --devices 1,0        the GPUs the models may use, as nvidia-smi counts them: the
+                       first carries a model, the rest what one spreads over
+                       more than one (default: the first GPU, and every other
+                       discrete one for a model that spreads)
   --ctx N|auto         context length in tokens, prompt + reply (default 65536);
                        auto: the most the model allows
   --ram-gb N           host RAM for the expert cache (default: 80% of what is
