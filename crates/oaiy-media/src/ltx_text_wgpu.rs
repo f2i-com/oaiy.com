@@ -231,7 +231,7 @@ pub fn contexts(gemma: &Path, tokenizer: Option<&Path>, transformer: &mut Store,
             gpu.upload(&x, &x0);
             let v = |len: usize| gpu.vec(len.max(1));
             let qw = HEADS * global_hd.max(HD);
-            let att = gpu.attention_rows_out_len(s.div_ceil(32) * 32, HEADS, HD, s).max(gpu.attention_rows_out_len(s.div_ceil(32) * 32, HEADS, global_hd, s));
+            let att = gpu.attention_rows_out_len(s, HEADS, HD, s).max(gpu.attention_rows_out_len(s, HEADS, global_hd, s));
             prompts.push(Prompt {
                 s,
                 x,

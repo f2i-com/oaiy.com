@@ -416,7 +416,7 @@ impl WgpuTransformer {
         let (mut at, mut longest, mut room) = (0, 0, 0);
         let mut spans = Vec::with_capacity(parts.len());
         for (_, n, causal) in &parts {
-            let need = if *causal { self.gpu.attention_rows_out_len(n.div_ceil(32) * 32, HEADS, HD, at + n) } else { self.gpu.attention_rows_full_out_len(*n, HEADS, HD, at + n) };
+            let need = if *causal { self.gpu.attention_rows_out_len(*n, HEADS, HD, at + n) } else { self.gpu.attention_rows_full_out_len(*n, HEADS, HD, at + n) };
             (longest, room) = (longest.max(*n), room.max(need));
             spans.push(at);
             at += n;

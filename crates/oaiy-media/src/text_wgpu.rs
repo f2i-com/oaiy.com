@@ -224,7 +224,7 @@ impl WgpuTextEncoder {
                 u: self.vec(s * FF),
                 act: self.vec(s * FF),
                 kv: self.vec(s * 2 * KV_HEADS * HD),
-                att: self.vec(self.gpu.attention_rows_out_len(s.div_ceil(32) * 32, HEADS, HD, s)),
+                att: self.vec(self.gpu.attention_rows_out_len(s, HEADS, HD, s)),
                 table: self.vec(s * HD),
             };
             self.gpu.upload(&p.x, &x0);
