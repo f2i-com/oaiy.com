@@ -388,12 +388,21 @@ impl Hybrid {
         }
         // the Qwen3.5 hybrid's as one run (its chain records each chunk as the one before runs)
         if let (Self::Qwen35(Model::Qwen35(_)), true) = (self, chunks.len() > 1) {
+            use rayon::prelude::*;
             let width = self.width();
             let rows: usize = chunks.iter().map(|(t, _)| t.len()).sum();
-            let mut emb = Vec::with_capacity(rows * width);
+            // (the chunks' embeddings side by side, copied on every core: 64 MB a run of 3,150 tokens, 10 ms on one)
+            let mut emb = vec![0f32; rows * width];
+            let mut parts: Vec<&mut [f32]> = Vec::with_capacity(chunks.len());
+            let mut rest = &mut emb[..];
+            for (t, _) in chunks {
+                let (part, after) = rest.split_at_mut(t.len() * width);
+                parts.push(part);
+                rest = after;
+            }
+            parts.into_par_iter().zip(chunks.par_iter()).for_each(|(part, (_, e))| part.copy_from_slice(e.data()));
             let mut tokens = Vec::with_capacity(rows);
-            for (t, e) in chunks {
-                emb.extend_from_slice(e.data());
+            for (t, _) in chunks {
                 tokens.extend_from_slice(t);
             }
             let out = self.forward(&tokens, Tensor::from_vec(emb, vec![rows, width]), kv, None)?;
@@ -587,7 +596,13 @@ impl QwenEngine {
             if hybrid.pipelines() && job.images.is_empty() {
                 let stop = stops.iter().copied().find(|&s| s > pos).unwrap_or(keys.len()).min(keys.len()).min(pos + 8 * PREFILL_CHUNK);
                 let spans: Vec<(usize, usize)> = (pos..stop).step_by(PREFILL_CHUNK).map(|a| (a, (a + PREFILL_CHUNK).min(stop))).collect();
-                let embeds = spans.iter().map(|&(a, b)| hybrid.embed(&job.prompt[a..b])).collect::<Result<Vec<_>, _>>()?;
+                // (a dense hybrid's chunks' embeddings on every core: its table's rows, 16 ms a run of 3,150 on one)
+                let embeds = if hybrid.qwen35().is_some() {
+                    use rayon::prelude::*;
+                    spans.par_iter().map(|&(a, b)| hybrid.embed(&job.prompt[a..b])).collect::<Result<Vec<_>, _>>()?
+                } else {
+                    spans.iter().map(|&(a, b)| hybrid.embed(&job.prompt[a..b])).collect::<Result<Vec<_>, _>>()?
+                };
                 if said { eprintln!("  prefill: {} rows embedded in {:.1} ms", stop - pos, began.elapsed().as_secs_f64() * 1e3); }
                 let chunks: Vec<(&[u32], Tensor)> = spans.iter().zip(embeds).map(|(&(a, b), e)| (&job.prompt[a..b], e)).collect();
                 let events = &job.events;
