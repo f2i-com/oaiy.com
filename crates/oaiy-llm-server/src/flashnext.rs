@@ -1885,9 +1885,17 @@ impl FlashNext {
             });
             let mut pending: Option<ChainedRun<'_>> = None;
             let mut last = None;
+            let said = std::env::var_os("OAIY_FN_LOG").is_some();
+            let began = std::time::Instant::now();
             for (i, (tokens, embeds)) in chunks.iter().enumerate() {
+                let t0 = began.elapsed().as_secs_f64() * 1e3;
                 let ple = rx.recv().ok().flatten();
+                let t1 = began.elapsed().as_secs_f64() * 1e3;
+                let had = pending.is_some();
                 let run = if tokens.len() <= 512 && !profile::on() && ple.is_some() { self.run_begin(tokens, embeds, kv, false, &mut pending, ple) } else { None };
+                if said {
+                    eprintln!("  fn chunk {i}: at {t0:.0} ms, features waited {:.0}, begun in {:.0} (the one before {})", t1 - t0, began.elapsed().as_secs_f64() * 1e3 - t1, if had && pending.is_none() { "finished inside" } else { "left" });
+                }
                 let Some(run) = run else {
                     if let Some(p) = pending.take() {
                         p.finish(self, kv);
@@ -1933,6 +1941,14 @@ impl FlashNext {
         let past = kv.len;
         let t = tokens.len();
         let ratio = cfg.index_ratio;
+        let phases = std::env::var_os("OAIY_FN_LOG").is_some() && t > 64;
+        let clock = std::time::Instant::now();
+        let mut marks: Vec<(&str, f64)> = Vec::new();
+        let mut mark = |what: &'static str| {
+            if phases {
+                marks.push((what, clock.elapsed().as_secs_f64() * 1e3));
+            }
+        };
         // past the dense span the attention layers' queries attend to their QSA blocks (at most 4096 blocks)
         if t == 0 || (past + t) / ratio > 4096 {
             return None;
@@ -2177,6 +2193,7 @@ impl FlashNext {
         // to the next device (its work held until they do), and its attention layers read
         let mut handoffs: Vec<(Box<dyn ChainRecorder + '_>, usize, Vec<usize>)> = Vec::new();
         let mut pending: Option<Routed> = None;
+        mark("ready");
         for (i, (layer, cl)) in self.layers.iter().zip(&st.layers).enumerate() {
             let dev = layer.device;
             let ple_here = i == cfg.ple_layer;
@@ -2190,11 +2207,13 @@ impl FlashNext {
                 });
                 rec.read(&devs[d].x);
                 rec.flush();
+                mark("first device recorded and gone");
                 handoffs.push((rec, dev, std::mem::take(&mut attn_reads)));
                 // the chunk before's last device done with (its scratch back) before this chunk's work there
                                 if let Some(p) = prev.take() {
                     p.finish(self, kv);
                 }
+                mark("the chunk before finished");
                                 d = dev;
                 let mut r = chains[d].begin();
                 r.keep_groups(keep);
@@ -2443,17 +2462,21 @@ impl FlashNext {
             rec.exl3_rows(chain_packed(&self.head)?, &one.mixed, &one.head, 1);
             rec.read(&one.head);
         }
+        mark("last device recorded");
                 // each handoff in turn: its device's streams (once it has run) up to the next, whose held work then goes
         for (from, to, reads) in handoffs.drain(..) {
             let mut got = from.finish().into_iter();
+            mark("first device waited for and read");
             for &a in &reads {
                 let (kvrows, raw) = (got.next().expect("a layer's K and V"), got.next().expect("its indexer keys"));
                 to_store.push((a, kvrows, raw));
             }
             chains[to].upload(&devs[to].x, &got.next().expect("the streams"));
         }
+        mark("streams up");
                 // the last device's work going (held till its streams were up) as the host stores the others' rows
         rec.flush();
+        mark("last device gone");
                 if let Some(p) = prev.take() {
             p.finish(self, kv);
         }
@@ -2469,6 +2492,10 @@ impl FlashNext {
             self.decoded.store(true, Ordering::Relaxed);
         }
         st.runs.fetch_add(1, Ordering::Relaxed);
+        mark("rows stored");
+        if phases {
+            eprintln!("    fn run of {t} at {past}: {}", marks.iter().map(|(w, ms)| format!("{w} {ms:.0}")).collect::<Vec<_>>().join(", "));
+        }
                 Some(ChainedRun { rec, attn_reads, at: past, t })
     }
 }
