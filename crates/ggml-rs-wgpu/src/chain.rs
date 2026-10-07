@@ -3602,6 +3602,160 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 }
 "#;
 
+/// [`ATTENTION_PART4`] for a KV head's whole group of query heads at once (`attention_part_group`'s kernel before the
+/// group's size is put in), a workgroup a (KV head, run): each key and each value read once for the group's heads,
+/// where a workgroup a query head read them a head each (the 27B's six heads a KV head: at 15,888 positions a step's
+/// sixteen layers' parts read the cache's 2 GB six times over, 4.3 ms of its 16.8). The scores a thread a key, a sum a
+/// head; the softmaxes together, a head a vec4's component; the values a thread a column of four over a share of the
+/// run's keys (256 threads: as many shares as the head's quarter goes into them), the shares' sums put together
+/// through the workgroup's memory. The same parts, largest and sum a head for the join.
+const ATTENTION_PART_GROUP: &str = r#"
+@group(0) @binding(0) var<storage, read> kv4: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> q4: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> p: array<vec4<u32>, 2>;
+// the group's queries [head][hd / 4]; then each key's scores, then weights, as they are reduced (two vec4s a key);
+// then the shares' sums but the first's [(share - 1) * hd / 4 + column][head]
+var<workgroup> buf: array<vec4<f32>, 1152>;
+// each key's weights, a head a component (two vec4s a key)
+var<workgroup> sc: array<vec4<f32>, 512>;
+const G: u32 = GROUPu;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let n_h = p[0].x;
+    let n_kv = p[0].y;
+    let hd = p[0].z;
+    let hi = p[0].w;
+    let lo = p[1].x;
+    let runs = p[1].y;
+    let scale = bitcast<f32>(p[1].z);
+    let kh = wg.x;
+    let run = wg.y;
+    let hd4 = hd / 4u;
+    let kvd4 = n_kv * hd4;
+    let row4 = 2u * kvd4;
+    for (var i = li; i < G * hd4; i += 256u) { buf[i] = q4[kh * G * hd4 + i]; }
+    workgroupBarrier();
+    let start = lo + run * 256u;
+    let end = min(start + 256u, hi);
+    let t = start + li;
+    let live = t < end;
+    var s0 = vec4<f32>(-3.4e38);
+    var s1 = vec4<f32>(-3.4e38);
+    if (live) {
+        let kb = t * row4 + kh * hd4;
+SCORE_SUMS
+        for (var d = 0u; d < hd4; d++) {
+            let k = kv4[kb + d];
+SCORE_STEPS
+        }
+SCORES
+    }
+    workgroupBarrier();
+    buf[2u * li] = s0;
+    buf[2u * li + 1u] = s1;
+    workgroupBarrier();
+    for (var st = 128u; st > 0u; st /= 2u) {
+        if (li < st) {
+            buf[2u * li] = max(buf[2u * li], buf[2u * (li + st)]);
+            buf[2u * li + 1u] = max(buf[2u * li + 1u], buf[2u * (li + st) + 1u]);
+        }
+        workgroupBarrier();
+    }
+    let m0 = buf[0];
+    let m1 = buf[1];
+    workgroupBarrier();
+    var e0 = vec4<f32>(0.0);
+    var e1 = vec4<f32>(0.0);
+    if (live) {
+        e0 = exp(s0 - m0);
+        e1 = exp(s1 - m1);
+    }
+    sc[2u * li] = e0;
+    sc[2u * li + 1u] = e1;
+    buf[2u * li] = e0;
+    buf[2u * li + 1u] = e1;
+    workgroupBarrier();
+    for (var st = 128u; st > 0u; st /= 2u) {
+        if (li < st) {
+            buf[2u * li] += buf[2u * (li + st)];
+            buf[2u * li + 1u] += buf[2u * (li + st) + 1u];
+        }
+        workgroupBarrier();
+    }
+    let l0 = buf[0];
+    let l1 = buf[1];
+    workgroupBarrier();
+    // the thread's column of four and its share of the run's keys
+    let d4 = li % hd4;
+    let share = li / hd4;
+    var n = 0u;
+    if (end > start) { n = end - start; }
+    let first = share * hd4;
+    let last = min(first + hd4, n);
+    let vb = start * row4 + kvd4 + kh * hd4 + d4;
+VALUE_SUMS
+    for (var i = first; i < last; i++) {
+        let v = kv4[vb + i * row4];
+        let w0 = sc[2u * i];
+        let w1 = sc[2u * i + 1u];
+VALUE_STEPS
+    }
+    if (share > 0u) {
+        let at = ((share - 1u) * hd4 + d4) * G;
+SHARE_STORES
+    }
+    workgroupBarrier();
+    if (share == 0u) {
+        for (var o = 1u; o < 256u / hd4; o++) {
+            let at = ((o - 1u) * hd4 + d4) * G;
+SHARE_ADDS
+        }
+STORES
+    }
+    if (li == 0u) {
+LARGEST_AND_SUMS
+    }
+}
+"#;
+
+/// [`ATTENTION_PART_GROUP`] for groups of `g` query heads a KV head (2 to 8).
+fn attention_part_group(g: usize) -> String {
+    let c = |i: usize| ["x", "y", "z", "w"][i % 4];
+    let each = |f: &dyn Fn(usize) -> String| (0..g).map(f).collect::<String>();
+    let scores = (0..2)
+        .map(|v| {
+            let parts: Vec<String> = (0..4).map(|i| if 4 * v + i < g { format!("(a{0}.x + a{0}.y + a{0}.z + a{0}.w) * scale", 4 * v + i) } else { "-3.4e38".into() }).collect();
+            format!("        s{v} = vec4<f32>({});\n", parts.join(", "))
+        })
+        .collect::<String>();
+    ATTENTION_PART_GROUP
+        .replace("GROUP", &g.to_string())
+        .replace("SCORE_SUMS\n", &each(&|i| format!("        var a{i} = vec4<f32>(0.0);\n")))
+        .replace("SCORE_STEPS\n", &each(&|i| format!("            a{i} += buf[{i}u * hd4 + d] * k;\n")))
+        .replace("SCORES\n", &scores)
+        .replace("VALUE_SUMS\n", &each(&|i| format!("    var v{i} = vec4<f32>(0.0);\n")))
+        .replace("VALUE_STEPS\n", &each(&|i| format!("        v{i} += w{}.{} * v;\n", i / 4, c(i))))
+        .replace("SHARE_STORES\n", &each(&|i| format!("        buf[at + {i}u] = v{i};\n")))
+        .replace("SHARE_ADDS\n", &each(&|i| format!("            v{i} += buf[at + {i}u];\n")))
+        .replace(
+            "STORES\n",
+            &each(&|i| format!("        {{\n            let at = n_h * hd + ((kh * G + {i}u) * runs + run) * hd + d4 * 4u;\n            y[at] = v{i}.x;\n            y[at + 1u] = v{i}.y;\n            y[at + 2u] = v{i}.z;\n            y[at + 3u] = v{i}.w;\n        }}\n")),
+        )
+        .replace(
+            "LARGEST_AND_SUMS\n",
+            &each(&|i| format!("        {{\n            let ml = n_h * hd + n_h * runs * hd + ((kh * G + {i}u) * runs + run) * 2u;\n            y[ml] = m{}.{};\n            y[ml + 1u] = l{}.{};\n        }}\n", i / 4, c(i), i / 4, c(i))),
+        )
+}
+
+/// Whether a step's attention parts take a KV head's group of `g` query heads of `head_dim` at once
+/// ([`ATTENTION_PART_GROUP`]): 2 to 8 of them, the head 64, 128 or 256 wide, the shares' sums within the kernel's
+/// memory (26.6 KB of the workgroup's, where a device allows it).
+fn attention_group_for(g: usize, head_dim: usize, workgroup_bytes: u32) -> bool {
+    matches!(head_dim, 64 | 128 | 256) && (2..=8).contains(&g) && g * (256 - head_dim / 4) <= 1152 && workgroup_bytes >= 26_624
+}
+
 /// QSA's attention part, [`ATTENTION_PART4`]'s sums over a query's entries in turn: its kept blocks' positions (from
 /// `list`, ascending) then its tail block's, a workgroup a (head, run of 256 entries, query), the runs' parts as
 /// [`ATTENTION_ROWS_PART`] lays them out (for [`ATTENTION_ROWS_JOIN`]), the grid's third axis the queries. `p[0]`: n_h,
@@ -4497,6 +4651,31 @@ impl Recorder<'_> {
     /// [`Self::attention_rows_f32_masked`] in runs of 256 positions a workgroup a (head, run, query), the runs then
     /// joined: any head's width, its out [`attention_runs_out_len`] long.
     #[allow(clippy::too_many_arguments)]
+    /// [`ChainRecorder::attention`], its parts a KV head's query heads together with `group` where they can be
+    /// ([`attention_group_for`]), else a workgroup a query head.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn attention_by(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, n_h: usize, n_kv: usize, head_dim: usize, lo: usize, kv_len: usize, cap: usize, scale: f32, group: bool) {
+        let runs = kv_len.saturating_sub(lo).div_ceil(SPLIT).max(1);
+        assert!(
+            kv.len >= cap * 2 * n_kv * head_dim && kv_len <= cap && out.len >= n_h * head_dim + n_h * runs * (head_dim + 2),
+            "chain: attention's buffers"
+        );
+        let params = self.uniform(&[n_h as u32, n_kv as u32, head_dim as u32, kv_len as u32, lo as u32, runs as u32, scale.to_bits()]);
+        let g = if n_kv > 0 && n_h % n_kv == 0 { n_h / n_kv } else { 0 };
+        if group && attention_group_for(g, head_dim, self.gpu().limits.max_compute_workgroup_storage_size) {
+            // a KV head's query heads together: its keys and values read once
+            const NAMES: [&str; 9] = ["", "", "chain-attention-group-2", "chain-attention-group-3", "chain-attention-group-4", "chain-attention-group-5", "chain-attention-group-6", "chain-attention-group-7", "chain-attention-group-8"];
+            let part = self.gpu().named_pipeline(NAMES[g], || attention_part_group(g));
+            self.dispatch(&part, buffer(kv), buffer(q), buffer(out), &params, (n_kv as u32, runs as u32, 1));
+        } else {
+            // a head a multiple of 4 wide (at most 512): the vec4 kernel
+            let part = if head_dim % 4 == 0 && head_dim <= 512 { self.gpu().named_pipeline("chain-attention-part4", || ATTENTION_PART4.to_string()) } else { self.named("chain-attention-part", ATTENTION_PART) };
+            self.dispatch(&part, buffer(kv), buffer(q), buffer(out), &params, (n_h as u32, runs as u32, 1));
+        }
+        let join = self.named("chain-attention-join", ATTENTION_JOIN);
+        self.dispatch(&join, buffer(kv), buffer(q), buffer(out), &params, (n_h as u32, 1, 1));
+    }
+
     pub(crate) fn attention_rows_runs(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, past: usize, window: Option<usize>, scale: f32, full: bool) {
         self.attention_rows_runs_by(q, kv, out, rows, n_h, n_kv, head_dim, past, window, scale, full, head_dim % 4 == 0 && head_dim <= 512);
     }
@@ -5733,17 +5912,10 @@ impl ChainRecorder for Recorder<'_> {
     }
 
     fn attention(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, n_h: usize, n_kv: usize, head_dim: usize, lo: usize, kv_len: usize, cap: usize, scale: f32) {
-        let runs = kv_len.saturating_sub(lo).div_ceil(SPLIT).max(1);
-        assert!(
-            kv.len >= cap * 2 * n_kv * head_dim && kv_len <= cap && out.len >= n_h * head_dim + n_h * runs * (head_dim + 2),
-            "chain: attention's buffers"
-        );
-        let params = self.uniform(&[n_h as u32, n_kv as u32, head_dim as u32, kv_len as u32, lo as u32, runs as u32, scale.to_bits()]);
-        // a head a multiple of 4 wide (at most 512): the vec4 kernel
-        let part = if head_dim % 4 == 0 && head_dim <= 512 { self.gpu().named_pipeline("chain-attention-part4", || ATTENTION_PART4.to_string()) } else { self.named("chain-attention-part", ATTENTION_PART) };
-        self.dispatch(&part, buffer(kv), buffer(q), buffer(out), &params, (n_h as u32, runs as u32, 1));
-        let join = self.named("chain-attention-join", ATTENTION_JOIN);
-        self.dispatch(&join, buffer(kv), buffer(q), buffer(out), &params, (n_h as u32, 1, 1));
+        // (OAIY_ATTENTION_PART4: a workgroup a query head, as before the groups' kernel)
+        static HEADS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let group = !*HEADS.get_or_init(|| std::env::var_os("OAIY_ATTENTION_PART4").is_some());
+        self.attention_by(q, kv, out, n_h, n_kv, head_dim, lo, kv_len, cap, scale, group);
     }
 
     fn qsa_pool(&mut self, raw: &DeviceVec, pooled: &DeviceVec, blocks: usize, ratio: usize, d: usize) {
@@ -6178,6 +6350,36 @@ mod tests {
             let worst = got.iter().zip(want).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
             eprintln!("{n_h} heads ({n_kv} kv) {hd} wide, {rows} rows after {first}, keeping {keep}: cosine {cos:.7}, worst {worst:.2e} of {top:.2}");
             assert!(cos > 0.99999 && worst <= 4e-3 * top, "{rows} rows after {first} keeping {keep}: cosine {cos}, worst {worst} of {top}");
+        }
+    }
+
+    /// A step's attention with a KV head's query heads together gives what a workgroup a head gives: groups of 2, 3, 4
+    /// and 6, heads 64, 128 and 256 wide, a window's start, a run short of its 256, a single position.
+    #[test]
+    fn a_steps_attention_by_groups_is_the_heads() {
+        let Ok(b) = WgpuBackend::new(Some(2 << 30)) else { return };
+        for (n_h, n_kv, hd, lo, kv_len) in [(24usize, 4usize, 256usize, 0usize, 3000usize), (8, 4, 64, 0, 700), (24, 8, 128, 100, 1111), (4, 1, 256, 0, 513), (16, 4, 128, 40, 41), (12, 2, 256, 0, 1)] {
+            let (qd, row, cap) = (n_h * hd, 2 * n_kv * hd, kv_len + 3);
+            let mut next = rng((qd + kv_len) as u32);
+            let q: Vec<f32> = (0..qd).map(|_| next() * 2.0).collect();
+            let cache: Vec<f32> = (0..cap * row).map(|_| next() * 2.0).collect();
+            let (qv, kv) = (b.vec(qd), b.vec(cap * row));
+            DeviceChain::upload(&b, &qv, &q);
+            DeviceChain::upload(&b, &kv, &cache);
+            let scale = 1.0 / (hd as f32).sqrt();
+            let len = b.attention_out_len(n_h, hd, cap);
+            let (want, got) = (b.vec(len), b.vec(len));
+            assert!(attention_group_for(n_h / n_kv, hd, b.gpu.limits.max_compute_workgroup_storage_size), "{n_h} heads of {hd} over {n_kv}: by groups");
+            let mut rec = Recorder::new(&b);
+            rec.attention_by(&qv, &kv, &want, n_h, n_kv, hd, lo, kv_len, cap, scale, false);
+            rec.attention_by(&qv, &kv, &got, n_h, n_kv, hd, lo, kv_len, cap, scale, true);
+            rec.read_range(&want, 0, qd);
+            rec.read_range(&got, 0, qd);
+            let r = Box::new(rec).finish();
+            let (want, got) = (&r[0], &r[1]);
+            let top = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let worst = got.iter().zip(want).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
+            assert!(top > 0.0 && worst <= 2e-5 * top, "{n_h} heads ({n_kv} kv) {hd} wide over {lo}..{kv_len}: worst {worst} of {top}");
         }
     }
 
