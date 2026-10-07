@@ -1,9 +1,8 @@
 [workspace]
 resolver = "2"
-# Vendored cudarc (patched in [patch.crates-io] below) is not a workspace member.
 # The two desktop apps (bot.computer's in app/, the previous OAIY Desktop in
 # platform/) keep their own lockfiles and build on their own for now.
-exclude = ["crates/cudarc", "app/src-tauri", "platform/desktop/src-tauri"]
+exclude = ["app/src-tauri", "platform/desktop/src-tauri"]
 members = [
     "crates/oaiy-media",
     # Realtime text to speech (Qwen3-TTS on Candle, streaming, voice cloning);
@@ -16,12 +15,8 @@ members = [
     # Image decoding for the vision models (PNG, JPEG, Pillow-exact resize);
     # std-only like the core.
     "crates/oaiy-image",
-    # Its CUDA path (and the hybrid CPU/GPU decode). Like ggml-rs-cuda: a
-    # member, not a default member (needs a CUDA toolchain); holds the
-    # reviewed unsafe (kernel launches, pinned mappings, AVX-512 dispatch).
-    "crates/dsv41-cuda",
-    # The OpenAI-compatible server for it (needs CUDA too, so not a default
-    # member either).
+    # The OpenAI-compatible server: every model on WebGPU (wgpu is a long build, so
+    # not a default member).
     "crates/oaiy-llm-server",
     # The portable host: supervises oaiy-llm-server and oaiy-media, serves the
     # control UI and the configurable API gateway. std-only, so a default member.
@@ -37,21 +32,12 @@ members = [
     "crates/ggml-rs",
     "crates/tokenizer",
     "crates/llama-rs",
-    # Vendored CUDA backend (see crates/VENDORED.md). A member so its tests
-    # run under `--workspace`, but kept out of `default-members`: building it
-    # needs a CUDA toolchain (cudarc dynamic-linking), so the default build
-    # stays CPU-only. Opt in with `cargo build -p oaiy-llm-cli --features cuda`.
-    "crates/ggml-rs-cuda",
-    # Their kernels' build-time compiler (NVRTC to a cubin per GPU architecture), a
-    # build-dependency of ggml-rs-cuda and dsv41-cuda: like them, not a default member.
-    "crates/oaiy-cuda-build",
-    # WebGPU backend (VENDORED-LOCAL addition beside ggml-rs-cuda): quantized
-    # matmuls on any wgpu adapter for machines without CUDA. A member, not a
-    # default member: wgpu adds minutes to every default build.
+    # The GPU backend (VENDORED-LOCAL): every model's kernels on any wgpu adapter
+    # (Vulkan, Metal, Direct3D 12). A member, not a default member: wgpu adds
+    # minutes to every default build.
     "crates/ggml-rs-wgpu",
     # The resident speech server (Parakeet speech-to-text on Candle). Like
-    # oaiy-media a member, not a default member: Candle is a long build, and
-    # its GPU build needs a CUDA toolchain (`--features cuda`).
+    # oaiy-media a member, not a default member: Candle is a long build.
     "crates/oaiy-voice",
     # The vault's key material (docs: design/vault.final.md, work packages
     # V-01 and V-02): the cryptographic primitives and the named-secret
@@ -86,7 +72,7 @@ license = "Apache-2.0"
 # Hard rule for oaiy-engine, oaiy-image, oaiy-studio and dsv41: std-only, no external crates.
 # Do not add a [workspace.dependencies] table.
 # Exception: the vendored GGUF subsystem members (crates/gguf,
-# ggml-quants, ggml-rs, tokenizer, llama-rs, ggml-rs-cuda — see
+# ggml-quants, ggml-rs, tokenizer, llama-rs, ggml-rs-wgpu — see
 # crates/VENDORED.md) carry their own explicit external dependencies and
 # do not inherit from this workspace.
 
@@ -108,12 +94,7 @@ codegen-units = 16
 opt-level = 3
 
 [profile.release]
-# rustc 1.92.0 (stable MSVC) crashes with STATUS_ACCESS_VIOLATION compiling
-# ggml-rs-cuda's tests/cpu_vs_cuda.rs at the default codegen-units=16;
-# a single codegen unit avoids it (and matches the vendored llm workspace).
+# A single codegen unit, as the vendored llm workspace builds (first set here for a rustc
+# 1.92.0 crash on a test of the CUDA backend this workspace no longer has). Every speed the
+# docs give was measured with it: leave it.
 codegen-units = 1
-
-# VENDORED-LOCAL: cudarc 0.19.8 with one fix (crates/cudarc, see crates/VENDORED.md): a
-# device buffer freed on a thread without its context current was never released.
-[patch.crates-io]
-cudarc = { path = "crates/cudarc" }

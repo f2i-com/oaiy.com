@@ -266,8 +266,6 @@ fn check_gguf(path: &str) -> Result<(), String> {
 /// cache to the same device.
 pub(crate) struct LlamaBackend {
     pub backend: Arc<dyn ggml_rs::Backend>,
-    #[cfg(feature = "cuda")]
-    pub cuda: Option<Arc<ggml_rs_cuda::CudaBackend>>,
 }
 
 fn llama_backend(o: &Opts) -> Result<LlamaBackend, String> {
@@ -284,8 +282,6 @@ fn llama_backend(o: &Opts) -> Result<LlamaBackend, String> {
             }
             return Ok(LlamaBackend {
                 backend: Arc::new(b),
-                #[cfg(feature = "cuda")]
-                cuda: None,
             });
         }
         #[cfg(not(feature = "webgpu"))]
@@ -294,19 +290,8 @@ fn llama_backend(o: &Opts) -> Result<LlamaBackend, String> {
     if !o.cuda {
         return Ok(LlamaBackend {
             backend: ggml_rs::default_backend(),
-            #[cfg(feature = "cuda")]
-            cuda: None,
         });
     }
-    #[cfg(feature = "cuda")]
-    {
-        let b = Arc::new(ggml_rs_cuda::CudaBackend::new(0).map_err(|e| format!("cuda init: {e}"))?);
-        Ok(LlamaBackend {
-            backend: b.clone(),
-            cuda: Some(b),
-        })
-    }
-    #[cfg(not(feature = "cuda"))]
     {
         Err("--cuda needs a CUDA build: cargo build --release -p oaiy-llm-cli --features cuda"
             .to_string())
@@ -324,72 +309,6 @@ fn llama_backend(o: &Opts) -> Result<LlamaBackend, String> {
 /// mutually exclusive: both put a cache on card 0, which would charge its VRAM
 /// twice and split the hits between them.
 pub(crate) fn maybe_enable_vram_cache(o: &Opts, lb: &LlamaBackend, model: &mut Model) {
-    #[cfg(feature = "cuda")]
-    {
-        if let Model::Glm5Next(g) = model {
-            // `--vram-cache 0` still means "no VRAM tier at all".
-            if o.vram_cache == Some(0) {
-                return;
-            }
-            let Some(cuda) = &lb.cuda else {
-                if !o.quiet {
-                    eprintln!("oaiy-llm: the GLM expert tier needs --cuda");
-                }
-                return;
-            };
-            // Card 0 is the trunk's own backend; the rest are opened here.
-            let mut cards = vec![Arc::clone(cuda)];
-            cards.extend(llama_rs::glm5next::device::extra_cards(0));
-            let cap = o.vram_cache.unwrap_or(0) as usize;
-            match g.enable_tiering(cards, cap) {
-                Ok(()) => {
-                    if !o.quiet {
-                        let (budgets, layers) = g.tier_layout();
-                        let gb: Vec<String> =
-                            budgets.iter().map(|b| format!("{:.1}", *b as f64 / 1e9)).collect();
-                        eprintln!(
-                            "oaiy-llm: expert tier {} card(s), VRAM {} GB, MoE layers {:?}",
-                            budgets.len(),
-                            gb.join("+"),
-                            layers
-                        );
-                    }
-                }
-                Err(e) => eprintln!("oaiy-llm: GLM expert tier unavailable: {e}"),
-            }
-            return;
-        }
-        let Some(shared) = model.stream_shared() else {
-            if o.vram_cache.is_some() && !o.quiet {
-                eprintln!("oaiy-llm: --vram-cache applies to streamed MoE models (--budget)");
-            }
-            return;
-        };
-        let budget = match o.vram_cache {
-            Some(0) => return, // explicitly disabled
-            Some(n) => Some(n),
-            None => lb.cuda.as_ref().and_then(|c| {
-                ggml_rs::Backend::vram_status(c.as_ref())
-                    .map(|(free, _)| (2u64 << 30).min(free as u64 / 4))
-            }),
-        };
-        let Some(budget) = budget else { return };
-        let Some(cuda) = &lb.cuda else {
-            if o.vram_cache.is_some() {
-                eprintln!("oaiy-llm: --vram-cache needs --cuda");
-            }
-            return;
-        };
-        match shared.enable_device_cache(Arc::clone(cuda), budget as usize) {
-            Ok(()) => {
-                if !o.quiet {
-                    eprintln!("oaiy-llm: VRAM expert cache {}", human(budget));
-                }
-            }
-            Err(e) => eprintln!("oaiy-llm: VRAM expert cache unavailable: {e}"),
-        }
-    }
-    #[cfg(not(feature = "cuda"))]
     {
         let _ = (lb, model);
         if o.vram_cache.is_some() {
@@ -502,22 +421,6 @@ fn print_stats(model: &Model, n: usize, sec: f64) {
             100.0 * st.hits as f64 / acc.max(1) as f64,
             st.bytes_read as f64 / (1u64 << 30) as f64,
             st.evictions,
-        );
-    }
-    #[cfg(feature = "cuda")]
-    if let Some(ds) = model.device_cache_stats() {
-        let tot = ds.bytes_hit + ds.h2d_bytes;
-        eprintln!(
-            "vram cache: {} hit / {} miss = {:.1}% byte hit, {:.2} GiB H2D, \
-             {} evictions, {} entries ({} / {})",
-            ds.hits,
-            ds.misses,
-            100.0 * ds.bytes_hit as f64 / tot.max(1) as f64,
-            ds.h2d_bytes as f64 / (1u64 << 30) as f64,
-            ds.evictions,
-            ds.entries,
-            human(ds.bytes_used),
-            human(ds.budget_bytes),
         );
     }
 }
@@ -913,7 +816,7 @@ fn run(args: &[String]) -> i32 {
                 "oaiy-llm {} ({}{})\n",
                 VERSION,
                 bench::REVISION.get(..12).unwrap_or(bench::REVISION),
-                if cfg!(feature = "cuda") { ", cuda" } else { "" }
+                if false { ", cuda" } else { "" }
             );
             0
         }

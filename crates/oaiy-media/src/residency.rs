@@ -106,16 +106,6 @@ impl Budget {
     /// the device has free now less the headroom.
     pub fn vram_limit(&self, dev: &Device) -> Result<u64> {
         let configured = self.vram_bytes.unwrap_or(u64::MAX);
-        #[cfg(feature = "cuda")]
-        if let Ok(cuda) = dev.as_cuda_device() {
-            let free = cuda
-                .cuda_stream()
-                .context()
-                .mem_get_info()
-                .map_err(candle_core::Error::wrap)?
-                .0 as u64;
-            return Ok(configured.min(free.saturating_sub(self.headroom)));
-        }
         let _ = dev;
         Ok(configured)
     }

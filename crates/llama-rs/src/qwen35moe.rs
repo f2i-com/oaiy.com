@@ -153,8 +153,6 @@ impl Qwen35MoeModel {
                 router, gate_up_experts, down_experts,
                 top_k: expert_used,
                 stream: None, // VENDORED-LOCAL: resident experts
-                #[cfg(feature = "cuda")]
-                gpu_plan: std::sync::OnceLock::new(),
             }.move_to_device(&*backend, SAFETY_BYTES);
 
             // Auto-fuse shexp gate+up at load time (silu_mul_split halves the

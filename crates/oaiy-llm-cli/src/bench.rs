@@ -503,8 +503,6 @@ fn bench_gguf(o: &Opts) -> i32 {
     // Attach the VRAM expert cache (no-op unless streaming on CUDA; see
     // maybe_enable_vram_cache for the budget default).
     maybe_enable_vram_cache(o, &lb, &mut model);
-    #[cfg(feature = "cuda")]
-    let dstats0 = model.device_cache_stats();
 
     let ids = match model.tokenizer().encode(PROMPT, true) {
         Ok(v) => v,
@@ -603,20 +601,6 @@ fn bench_gguf(o: &Opts) -> i32 {
             "not MoE-streaming: no expert cache, so cache/ssd/active-expert fields are null"
                 .into(),
         );
-    }
-
-    // Device-cache counters over the same span (prefill passes +
-    // decode, like the host counters above). byte_hit_rate = bytes served
-    // from VRAM / (VRAM-served + H2D-uploaded); h2d_bytes_per_token is the
-    // residual PCIe traffic the cache did NOT absorb.
-    #[cfg(feature = "cuda")]
-    if let (Some(before), Some(after)) = (dstats0, model.device_cache_stats()) {
-        let tokens = (r.prompt_tokens + r.decode_tokens).max(1);
-        let bytes_hit = after.bytes_hit - before.bytes_hit;
-        let h2d = after.h2d_bytes - before.h2d_bytes;
-        r.device_cache_byte_hit_rate =
-            vec![bytes_hit as f64 / (bytes_hit + h2d).max(1) as f64];
-        r.h2d_bytes_per_token = vec![h2d / tokens];
     }
 
     r.peak_rss_bytes = peak_rss_bytes();

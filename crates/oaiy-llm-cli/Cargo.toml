@@ -17,16 +17,12 @@ llama-rs = { path = "../llama-rs" }
 ggml-rs = { path = "../ggml-rs" }
 gguf = { path = "../gguf" }
 tokenizer = { path = "../tokenizer" }
-# CUDA backend for `oaiy-llm run --cuda`, behind the `cuda` feature. cudarc
-# links CUDA dynamically; the default build needs no CUDA toolchain.
-ggml-rs-cuda = { path = "../ggml-rs-cuda", optional = true }
 # WebGPU backend for `oaiy-llm run --webgpu`, behind the `webgpu` feature: any
-# D3D12/Vulkan/Metal GPU, no CUDA toolkit.
+# D3D12/Vulkan/Metal GPU.
 ggml-rs-wgpu = { path = "../ggml-rs-wgpu", optional = true }
 
 [features]
-default = []
-# GPU inference: `oaiy-llm run model.gguf --cuda`. Needs the CUDA toolkit at
-# build time.
-cuda = ["llama-rs/cuda", "dep:ggml-rs-cuda"]
+default = ["webgpu"]
+# GPU inference: `oaiy-llm run model.gguf --webgpu` (`--no-default-features` builds
+# the CPU-only tool).
 webgpu = ["dep:ggml-rs-wgpu"]

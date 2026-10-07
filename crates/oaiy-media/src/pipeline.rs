@@ -349,10 +349,6 @@ pub(crate) fn parse_loras(j: &Json) -> std::result::Result<Vec<(PathBuf, f64)>, 
 /// in a batch reuse one transformer and VAE; completed images survive failure.
 pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
     r.validate().map_err(candle_core::Error::Msg)?;
-    // (a WebGPU job's reference images encoded on the CPU: a CUDA context on its card keeps its memory)
-    #[cfg(feature = "cuda")]
-    let dev = if r.webgpu { Device::Cpu } else { Device::new_cuda(r.device)? };
-    #[cfg(not(feature = "cuda"))]
     let dev = Device::Cpu;
     let dtype = if dev.is_cuda() {
         DType::BF16

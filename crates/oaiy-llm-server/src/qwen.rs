@@ -252,7 +252,7 @@ pub fn prepare_images(records: &[Json], prompt: Vec<u32>, image_id: u32, cfg: &M
 /// What the engine runs: a Qwen3.5 hybrid (llama-rs), or Qwen3.8-Flash-Next.
 pub enum Hybrid {
     Qwen35(Model),
-    #[cfg(any(feature = "cuda", feature = "webgpu"))]
+    #[cfg(feature = "webgpu")]
     Flash(Box<crate::flashnext::FlashNext>),
     #[cfg(test)]
     Fake(Box<crate::qwen_real::FakeModel>),
@@ -271,7 +271,7 @@ impl Hybrid {
         match self {
             Self::Qwen35(Model::Qwen35(m)) => Ok(&m.tokenizer),
             Self::Qwen35(_) => Err("not a dense Qwen hybrid".into()),
-            #[cfg(any(feature = "cuda", feature = "webgpu"))]
+            #[cfg(feature = "webgpu")]
             Self::Flash(f) => Ok(&f.tokenizer),
             #[cfg(test)]
             Self::Fake(f) => Ok(&f.tok),
@@ -280,7 +280,7 @@ impl Hybrid {
     fn width(&self) -> usize {
         match self {
             Self::Qwen35(m) => m.config().embedding_dim,
-            #[cfg(any(feature = "cuda", feature = "webgpu"))]
+            #[cfg(feature = "webgpu")]
             Self::Flash(f) => f.config.hidden,
             #[cfg(test)]
             Self::Fake(f) => f.width,
@@ -292,7 +292,7 @@ impl Hybrid {
     fn parks(&self) -> bool {
         match self {
             Self::Qwen35(_) => false,
-            #[cfg(any(feature = "cuda", feature = "webgpu"))]
+            #[cfg(feature = "webgpu")]
             Self::Flash(_) => true,
             #[cfg(test)]
             Self::Fake(_) => true,
@@ -301,7 +301,7 @@ impl Hybrid {
     fn new_kv_cache(&self, max_seq: usize) -> KvCache {
         match self {
             Self::Qwen35(m) => m.new_kv_cache(max_seq),
-            #[cfg(any(feature = "cuda", feature = "webgpu"))]
+            #[cfg(feature = "webgpu")]
             Self::Flash(f) => f.new_kv_cache(max_seq),
             #[cfg(test)]
             Self::Fake(_) => crate::qwen_real::new_kv(max_seq),
@@ -312,7 +312,7 @@ impl Hybrid {
         match self {
             Self::Qwen35(Model::Qwen35(m)) => Ok(m.embed_text(tokens).to_host()),
             Self::Qwen35(_) => Err("not a dense Qwen hybrid".into()),
-            #[cfg(any(feature = "cuda", feature = "webgpu"))]
+            #[cfg(feature = "webgpu")]
             Self::Flash(f) => f.embed_text(tokens).map_err(|e| e.to_string()),
             #[cfg(test)]
             Self::Fake(f) => Ok(Tensor::zeros(vec![tokens.len(), f.width])),
@@ -322,7 +322,7 @@ impl Hybrid {
     fn drafts(&self) -> bool {
         match self {
             Self::Qwen35(Model::Qwen35(m)) => m.drafts(),
-            #[cfg(any(feature = "cuda", feature = "webgpu"))]
+            #[cfg(feature = "webgpu")]
             Self::Flash(f) => f.drafts(),
             _ => false,
         }
@@ -330,7 +330,7 @@ impl Hybrid {
     /// The tokens before a draft's `next` it may need (its layer catches up on the last run's rows): at most this many.
     fn draft_window(&self) -> usize {
         match self {
-            #[cfg(any(feature = "cuda", feature = "webgpu"))]
+            #[cfg(feature = "webgpu")]
             Self::Flash(_) => crate::flashnext::CHECK_ROWS,
             _ => llama_rs::SPEC_ROWS,
         }
@@ -339,7 +339,7 @@ impl Hybrid {
     fn draft(&self, kv: &KvCache, recent: &[u32], k: usize) -> Option<Vec<u32>> {
         match self {
             Self::Qwen35(Model::Qwen35(m)) => m.draft(kv, recent, k),
-            #[cfg(any(feature = "cuda", feature = "webgpu"))]
+            #[cfg(feature = "webgpu")]
             Self::Flash(f) => f.draft(kv, recent, k),
             _ => None,
         }
@@ -348,7 +348,7 @@ impl Hybrid {
     fn check(&self, rows: &[u32], kv: &mut KvCache) -> Option<Vec<Tensor>> {
         match self {
             Self::Qwen35(Model::Qwen35(m)) => m.check(rows, kv),
-            #[cfg(any(feature = "cuda", feature = "webgpu"))]
+            #[cfg(feature = "webgpu")]
             Self::Flash(f) => f.check(rows, kv),
             _ => None,
         }
@@ -357,7 +357,7 @@ impl Hybrid {
     fn rollback(&self, kv: &mut KvCache, rows: usize, keep: usize) {
         match self {
             Self::Qwen35(Model::Qwen35(m)) => m.rollback(kv, rows, keep),
-            #[cfg(any(feature = "cuda", feature = "webgpu"))]
+            #[cfg(feature = "webgpu")]
             Self::Flash(f) => {
                 let _ = rows;
                 f.rollback(kv, keep)
@@ -370,7 +370,7 @@ impl Hybrid {
     /// last chunk's logits, `done(i)` once each chunk is in. Another model's, or one Flash-Next cannot chain, a chunk
     /// at a time.
     fn forward_chunks(&self, chunks: &[(&[u32], Tensor)], kv: &mut KvCache, done: &mut dyn FnMut(usize)) -> Result<Tensor, String> {
-        #[cfg(any(feature = "cuda", feature = "webgpu"))]
+        #[cfg(feature = "webgpu")]
         if let Self::Flash(f) = self {
             let len = kv.len;
             let refs: Vec<(&[u32], &Tensor)> = chunks.iter().map(|(t, e)| (*t, e)).collect();
@@ -404,7 +404,7 @@ impl Hybrid {
     }
     /// The tokens a prompt's chunk has at most ([`PREFILL_CHUNK`]; Flash-Next's own where its devices take more).
     fn prompt_rows(&self) -> usize {
-        #[cfg(any(feature = "cuda", feature = "webgpu"))]
+        #[cfg(feature = "webgpu")]
         if let Self::Flash(f) = self {
             return f.prompt_rows();
         }
@@ -413,7 +413,7 @@ impl Hybrid {
     /// Whether a prompt's chunks go to [`Self::forward_chunks`] together: Flash-Next over several GPUs, a chained
     /// Qwen3.5 hybrid.
     fn pipelines(&self) -> bool {
-        #[cfg(any(feature = "cuda", feature = "webgpu"))]
+        #[cfg(feature = "webgpu")]
         if let Self::Flash(f) = self {
             return f.devices_len() > 1;
         }
@@ -444,7 +444,7 @@ impl Hybrid {
     /// Whether a run of `rows` after what `kv` holds can keep its recurrent states from inside it once each of `taps`
     /// rows is in ([`Self::forward_chunks_tapped`]): a chained Qwen3.5 hybrid's, where its chain says so.
     fn can_tap(&self, rows: usize, kv: &KvCache, taps: &[usize]) -> bool {
-        #[cfg(any(feature = "cuda", feature = "webgpu"))]
+        #[cfg(feature = "webgpu")]
         if let Self::Flash(f) = self {
             return f.can_tap(rows, kv, taps);
         }
@@ -453,7 +453,7 @@ impl Hybrid {
     /// [`Self::forward_chunks`] with the recurrent states as they are once each of `taps` rows of the chunks is in
     /// (what a checkpoint there holds, the run not stopping for it), where [`Self::can_tap`] said it can.
     fn forward_chunks_tapped(&self, chunks: &[(&[u32], Tensor)], kv: &mut KvCache, done: &mut dyn FnMut(usize), taps: &[usize]) -> Result<(Tensor, Vec<llama_rs::Tapped>), String> {
-        #[cfg(any(feature = "cuda", feature = "webgpu"))]
+        #[cfg(feature = "webgpu")]
         if let Self::Flash(f) = self {
             let len = kv.len;
             let refs: Vec<(&[u32], &Tensor)> = chunks.iter().map(|(t, e)| (*t, e)).collect();
@@ -487,7 +487,7 @@ impl Hybrid {
                 Ok(m.forward_embeds_positions(&embeds, tokens.len(), kv, positions).map_err(|e| e.to_string())?.to_host())
             }
             Self::Qwen35(_) => Err("not a dense Qwen hybrid".into()),
-            #[cfg(any(feature = "cuda", feature = "webgpu"))]
+            #[cfg(feature = "webgpu")]
             Self::Flash(f) => f.forward(tokens, &embeds, kv, positions).map_err(|e| e.to_string()),
             #[cfg(test)]
             Self::Fake(f) => f.forward(tokens, kv),

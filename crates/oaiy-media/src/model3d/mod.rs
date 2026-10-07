@@ -115,7 +115,7 @@ impl Request {
                 Some("webgpu") => true,
                 Some("cuda" | "cpu") => false,
                 Some(other) => return Err(format!("3d: backend must be webgpu, cuda or cpu, not {other}")),
-                None => cfg!(all(feature = "webgpu", not(feature = "cuda"))),
+                None => cfg!(feature = "webgpu"),
             },
             model_dir,
         };
@@ -149,11 +149,6 @@ fn event(stage: &str, current: usize, total: usize) -> Json {
 }
 
 fn device(index: usize) -> Result<Device> {
-    #[cfg(feature = "cuda")]
-    {
-        Device::new_cuda(index)
-    }
-    #[cfg(not(feature = "cuda"))]
     {
         let _ = index;
         candle_core::bail!("3D models need a GPU: this oaiy-media was built without CUDA (build it with --features cuda or flash-attn)")

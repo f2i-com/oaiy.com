@@ -33,8 +33,6 @@ use oaiy_engine::{Error, Result};
 
 use crate::engine::Job;
 use crate::{api, disk, glm, Options, STATE_FORMAT};
-#[cfg(feature = "cuda")]
-use crate::engine;
 
 pub(crate) fn needs_tool_precision(body: &oaiy_engine::json::Json) -> bool {
     use oaiy_engine::json::Json;
@@ -469,34 +467,24 @@ impl Models {
             self.say(format!("unloading {}", l.name));
             drop(l.jobs);
             let _ = l.thread.join();
-            // What it freed goes back to the driver, not the allocator's pool: the next
-            // model may need the whole GPU.
-            #[cfg(feature = "cuda")]
-            ggml_rs_cuda::release_unused_memory();
             self.say(format!("{} unloaded", l.name));
         }
 
         let t = std::time::Instant::now();
         self.say(format!("loading {} from {}", spec.name, spec.path.display()));
         let next = match spec.kind {
-            #[cfg(feature = "cuda")]
-            Kind::Deepseek => self.load_deepseek(&spec),
-            #[cfg(feature = "cuda")]
-            Kind::OrcaSaq => self.load_orcasaq(&spec),
-            #[cfg(feature = "cuda")]
-            Kind::FlashNext => self.load_flashnext(&spec),
             // OrcaSAQ's EXL3 projections on any GPU through WebGPU (else the CPU).
-            #[cfg(all(not(feature = "cuda"), feature = "webgpu"))]
+            #[cfg(feature = "webgpu")]
             Kind::OrcaSaq => self.load_orcasaq_portable(&spec),
             // Flash-Next's EXL3 matrices and experts too.
-            #[cfg(all(not(feature = "cuda"), feature = "webgpu"))]
+            #[cfg(feature = "webgpu")]
             Kind::FlashNext => self.load_flashnext_portable(&spec),
-            #[cfg(all(not(feature = "cuda"), not(feature = "webgpu")))]
+            #[cfg(not(feature = "webgpu"))]
             Kind::OrcaSaq | Kind::FlashNext => Err(Error::Arg(format!("{} is an EXL3 checkpoint, which needs the CUDA or the WebGPU build", spec.name))),
             // DeepSeek-V4.1's CPU model with its dense trunk on any GPU through WebGPU (else the CPU).
-            #[cfg(all(not(feature = "cuda"), feature = "webgpu"))]
+            #[cfg(feature = "webgpu")]
             Kind::Deepseek => self.load_deepseek_portable(&spec),
-            #[cfg(all(not(feature = "cuda"), not(feature = "webgpu")))]
+            #[cfg(not(feature = "webgpu"))]
             Kind::Deepseek => Err(Error::Arg(format!(
                 "{} is a DeepSeek checkpoint, which needs the CUDA or the WebGPU build; this build serves GGUF models",
                 spec.name
@@ -556,232 +544,10 @@ impl Models {
         }
     }
 
-    // ---------------------------------------------------------------- DeepSeek
-    #[cfg(feature = "cuda")]
-    fn load_deepseek(&self, spec: &Spec) -> Result<Live> {
-        use dsv41_cuda::{GpuModel, GpuOptions};
-
-        let o = &self.opts;
-        let count = dsv41_cuda::gpu::device_count()?;
-        let devices = available_devices(&o.devices, count)?;
-        if !o.devices.is_empty() && devices != o.devices {
-            self.say(format!("available GPU selection: {:?} (requested {:?})", devices, o.devices));
-        }
-        let observer_device = if o.observer_device < count { o.observer_device }
-            else { *devices.last().ok_or_else(||oaiy_engine::Error::Arg("no CUDA device available".into()))? };
-        // Load the reviewer FIRST, so DeepSeek sizes its caches from the VRAM
-        // genuinely remaining. Both stay resident; model routing is unchanged.
-        let observer = o.observer_model.as_deref().map(|path| {
-            self.say(format!("loading resident observer {} on GPU {}", path.display(), observer_device));
-            crate::observer::Observer::load_shared(path, observer_device, o.observer_vram_gb, devices.contains(&observer_device))
-        }).transpose()?;
-        let tok = Arc::new(dsv41::tokenizer::Tokenizer::load(&spec.path)?);
-        // DeepSeek sizes its caches up front and names no maximum of its own,
-        // so `--ctx auto` keeps it at the server's default.
-        let max_seq = if o.ctx == 0 { crate::DEFAULT_CTX } else { o.ctx };
-        let gopts = GpuOptions {
-            devices,
-            max_seq,
-            expert_cache_bytes: o.expert_cache_bytes() as usize,
-            direct_io: true,
-            vram_expert_bytes: None,
-            vram_headroom_bytes: (o.headroom_gb * (1u64 << 30) as f64) as usize,
-            cpu_expert_threads: o.cpu_threads,
-            vision: o.vision,
-            residual_on_device: None,
-        };
-        self.say(format!("expert host cache: {:.2} GiB effective (configured ceiling {} GiB; capped by available RAM)",gopts.expert_cache_bytes as f64 / (1u64<<30) as f64,o.ram_gb));
-        let engram_meta = o
-            .engram_meta
-            .clone()
-            .unwrap_or_else(|| spec.path.join("engram_meta.safetensors"));
-        let (ternary_source, tool_source) = self.expert_sources(&spec.name);
-        let mut model = GpuModel::load_with_expert_source(&spec.path, &engram_meta, &gopts, ternary_source)?;
-        let tool_experts = tool_source.is_some();
-        if let Some(source) = tool_source { model.enable_tool_experts(source)?; }
-        if let Some(path) = &o.expert_trace { model.enable_route_log(path)?; }
-        if let Some((path, bank)) = startup_warm_profile(o.usage.as_deref(), tool_experts) {
-            let (vram, queued) = model.warm(path, 4)?;
-            self.say(format!(
-                "warmed {vram} {bank} experts into VRAM; {queued} more loading into RAM in the background"
-            ));
-        }
-
-        let mut cfg = self.base_cfg(spec, max_seq);
-        if model.has_vision() {
-            cfg.vision = model.cfg.vision.clone();
-            self.say("vision tower loaded; chat requests may carry images".into());
-        }
-        cfg.image_token_id = model.cfg.image_token_id;
-
-        let (jobs, rx) = std::sync::mpsc::channel();
-        let request_log = !o.quiet && !o.silent;
-        let mut e = engine::Engine::new(
-            model,
-            Arc::clone(&tok),
-            o.chunk,
-            o.step_below,
-            o.layered_max,
-            o.checkpoints,
-            o.usage.clone(),
-            request_log,
-        );
-        e.warn = !o.silent;
-        e.tool_experts = tool_experts;
-        e.observer = observer;
-        e.repetition_guard = o.repetition_guard;
-        if e.observer.is_some() {
-            self.say("Observer available: review off by default; opt in to a single approval gate with oaiy_observer_review=blocking".into());
-        } else if tool_experts {
-            self.say("DSML boundary precision: ternary prompt/prose; MXFP4 tool payload; 80/20 expert cache budgets; trunk retained".into());
-        }
-        if let Some(dir) = &o.prompt_cache {
-            // Different expert banks must never share prompt states, including
-            // two variants built from the same retained tensor index.
-            let identity = format!("{:?}|{:?}|{:?}|ctx={}|dsml-v1", spec.path, ternary_source, tool_source, max_seq);
-            let precision = disk::fnv(identity.as_bytes(), 0);
-            let isolated = dir.join(format!("model-{precision:016x}"));
-            let dir = &isolated;
-            // States belong to this model (its config and weight map) and to this
-            // state format.
-            let mut fingerprint = disk::fnv(&[STATE_FORMAT], precision);
-            for name in ["config.json", "model.safetensors.index.json"] {
-                fingerprint =
-                    disk::fnv(&std::fs::read(spec.path.join(name)).unwrap_or_default(), fingerprint);
-            }
-            if tool_experts { fingerprint = disk::fnv(b"dsml-boundary-v1-ternary-prompts", fingerprint); }
-            match disk::DiskCache::open(dir, fingerprint, (o.prompt_cache_gb * 1e9) as u64) {
-                Ok(cache) => {
-                    self.say(format!("{} prompt states on disk in {}", cache.len(), dir.display()));
-                    e.disk = Some(cache);
-                }
-                Err(err) => {
-                    self.say(format!("prompt states are not kept ({}: {err})", dir.display()))
-                }
-            }
-        }
-        let thread = std::thread::Builder::new()
-            .name("model".into())
-            .spawn(move || e.run(rx))
-            .map_err(Error::Io)?;
-
-        Ok(Live {
-            name: spec.name.clone(),
-            jobs,
-            thread,
-            cfg: Arc::new(cfg),
-            flavour: Arc::new(Flavour::Deepseek(tok)),
-        })
-    }
-
-    /// Qwen3.8-Flash-Next: its layers split over the configured GPUs (it needs about 50 GB).
-    #[cfg(feature = "cuda")]
-    fn load_flashnext(&self, spec: &Spec) -> Result<Live> {
-        let o = &self.opts;
-        let configured = o.model_devices.get(&spec.name).unwrap_or(&o.devices);
-        // None configured (a model added from the catalog): the first two GPUs, as DeepSeek takes them. It needs about
-        // 50 GB, more than one card holds, and on GPU 0 alone it could not load.
-        let devices = if configured.is_empty() { available_devices(&[], dsv41_cuda::gpu::device_count()?)? } else { configured.clone() };
-        self.say(format!("loading {}: Qwen3.8-Flash-Next, native EXL3 over {} GPU(s)", spec.name, devices.len()));
-        let devices = &devices;
-        // Every adapter for the alias, applied together, each at its strength (else the alias's).
-        let default_strength = o.lora_strengths.get(&spec.name).copied().unwrap_or(1.0);
-        let base = crate::flashnext::lora_base(&spec.path)?;
-        let adapters = o.lora_adapters.get(&spec.name).map(|list| list.iter()
-            .map(|(path, strength)| crate::lora::Adapter::open_for(path, &base).map(|a| a.with_strength(strength.unwrap_or(default_strength))))
-            .collect::<Result<Vec<_>>>()).transpose()?.unwrap_or_default();
-        let model = crate::flashnext::load_with_adapters(&spec.path, devices, &adapters)?;
-        for (adapter, (path, strength)) in adapters.iter().zip(o.lora_adapters.get(&spec.name).into_iter().flatten()) {
-            self.say(format!("Flash-Next: loaded LoRA {} for {} projections (strength {})", path.display(), adapter.len(), strength.unwrap_or(default_strength)));
-        }
-        let tok = Arc::new(model.tokenizer.clone());
-        let max_seq = self.context(model.config.context_length);
-        let mut cfg = self.base_cfg(spec, max_seq);
-        cfg.image_token_id = tok.token_id("<|image_pad|>").ok_or_else(|| Error::Arg("Flash-Next tokenizer lacks image_pad".into()))?;
-        // Its vision tower: Qwen3.5's, stored as EXL3, on the last GPU.
-        let vision_path = o.vision.then(|| o.vision_projectors.get(&spec.name)).flatten();
-        let projector = if let Some(path) = vision_path {
-            let cuda = model.cudas.last().expect("a GPU").clone();
-            let mm = crate::qwen_vision::load(path, cuda.clone(), model.config.hidden, Some(cuda))?;
-            cfg.qwen_vision = Some(mm.config().clone());
-            self.say("Flash-Next: Qwen vision tower loaded (576 tokens/image)".into());
-            Some(mm)
-        } else { None };
-        let (jobs, rx) = std::sync::mpsc::channel();
-        // Flash-Next keeps one conversation on the GPUs and nothing on disk: the conversations it
-        // sets aside (a runner and its call's sub-agent taking turns) wait in host RAM, within
-        // --park-gb and never more than half of what is free.
-        let park = crate::qwen_park::budget(o.park_gb, ggml_rs_cuda::host_memory().map(|(free, _)| free as u64));
-        if park > 0 {
-            self.say(format!("Flash-Next: conversations it sets aside wait in host RAM, up to {:.1} GB (--park-gb)", park as f64 / 1e9));
-        }
-        let e = crate::qwen::QwenEngine::new(crate::qwen::Hybrid::Flash(Box::new(model)), projector, max_seq, !o.quiet && !o.silent).park_up_to(park);
-        let thread = std::thread::Builder::new().name("flashnext-model".into()).spawn(move || e.run(rx))?;
-        Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Qwen(tok)) })
-    }
-
-    #[cfg(feature = "cuda")]
-    fn load_orcasaq(&self, spec: &Spec) -> Result<Live> {
-        let o=&self.opts;
-        self.say(format!("loading {}: native EXL3 mixed precision",spec.name));
-        // Every adapter for the alias, applied together, each at its strength (else the alias's).
-        let default_strength=o.lora_strengths.get(&spec.name).copied().unwrap_or(1.0);
-        let adapters=o.lora_adapters.get(&spec.name).map(|list| list.iter().map(|(path,strength)| crate::lora::Adapter::open(path).map(|a|a.with_strength(strength.unwrap_or(default_strength)))).collect::<Result<Vec<_>>>()).transpose()?.unwrap_or_default();
-        let model=if adapters.is_empty() {crate::orcasaq::load(&spec.path,&o.devices)?} else {crate::orcasaq::load_with_adapter(&spec.path,&o.devices,&adapters)?};
-        for (adapter,(path,strength)) in adapters.iter().zip(o.lora_adapters.get(&spec.name).into_iter().flatten()) {
-            self.say(format!("OrcaSAQ: loaded LoRA {} for {} text projections (strength {})",path.display(),adapter.len(),strength.unwrap_or(default_strength)));
-        }
-        let tok=Arc::new(model.tokenizer().clone());
-        let max_seq=self.context(model.config().context_length);
-        let mut cfg=self.base_cfg(spec,max_seq);
-        cfg.image_token_id=tok.token_id("<|image_pad|>").ok_or_else(||Error::Arg("Orca tokenizer lacks image_pad".into()))?;
-        let vision_path=o.vision.then(||o.vision_projectors.get(&spec.name)).flatten();
-        let projector=if let Some(path)=vision_path {
-            let llama_rs::Model::Qwen35(m)=&model else { return Err(Error::Arg("Orca requires Qwen hybrid runtime".into())); };
-            // Use the last configured cache device: the first already holds
-            // the text weights. Image embeddings cross back through host RAM.
-            let backend=m.cache_backends.last().unwrap_or(&m.backend).clone();
-            let mm=crate::qwen_vision::load(path,backend,model.config().embedding_dim,None)?;
-            cfg.qwen_vision=Some(mm.config().clone());
-            self.say("OrcaSAQ: original Qwen vision tower loaded (576 tokens/image)".into());
-            Some(mm)
-        } else { None };
-        let (jobs,rx)=std::sync::mpsc::channel();
-        let mut e=crate::qwen::QwenEngine::new(model,projector,max_seq,!o.quiet && !o.silent);
-        e.image_disk_cache=vision_path.is_some();
-        if let Some(dir)=&o.prompt_cache {
-            let mut fp=disk::fnv(b"orcasaq2-exl3-qwen-state-v1",0);
-            fp=disk::fnv(spec.path.as_os_str().as_encoded_bytes(),fp);
-            for adapter in &adapters {fp=disk::fnv(&adapter.fingerprint.to_le_bytes(),fp);}
-            let mut files:Vec<_>=std::fs::read_dir(&spec.path)?.filter_map(|e|e.ok().map(|e|e.path())).filter(|p|
-                p.extension().is_some_and(|x|x=="safetensors" || x=="json")).collect();
-            if let Some(path)=vision_path {
-                // Include tower weights/config and preprocessing semantics:
-                // a state from a different vision pipeline is never reusable.
-                fp=disk::fnv(b"qwen38-vision-letterbox768-erfgelu-v1",fp);
-                files.extend(std::fs::read_dir(path)?.filter_map(|e|e.ok().map(|e|e.path())).filter(|p|
-                    p.extension().is_some_and(|x|x=="safetensors" || x=="json")));
-            }
-            files.sort();
-            for p in files {
-                let meta=std::fs::metadata(&p)?;
-                fp=disk::fnv(p.as_os_str().as_encoded_bytes(),fp);
-                fp=disk::fnv(&meta.len().to_le_bytes(),fp);
-                if let Ok(t)=meta.modified().and_then(|t|t.duration_since(std::time::UNIX_EPOCH).map_err(std::io::Error::other)) {fp=disk::fnv(&t.as_nanos().to_le_bytes(),fp);}
-            }
-            match disk::DiskCache::open(dir,fp,(o.prompt_cache_gb*1e9)as u64){
-                Ok(cache)=>{self.say(format!("OrcaSAQ prompt cache: {} entries in {}",cache.len(),dir.display())); e.disk=Some(cache);},
-                Err(err)=>self.say(format!("OrcaSAQ prompt cache unavailable: {err}")),
-            }
-        }
-        let thread=std::thread::Builder::new().name("orcasaq-model".into()).spawn(move||e.run(rx))?;
-        Ok(Live{name:spec.name.clone(),jobs,thread,cfg:Arc::new(cfg),flavour:Arc::new(Flavour::Qwen(tok))})
-    }
-
     /// Qwen3.8-Flash-Next without CUDA: its EXL3 matrices and experts on the WebGPU adapter while the weight budget
     /// holds them (the first layers' experts), the rest decoded on the CPU, everything else on the host. No PEFT
     /// adapters and no vision tower (both CUDA's); conversations set aside in host RAM as on CUDA.
-    #[cfg(all(not(feature = "cuda"), feature = "webgpu"))]
+    #[cfg(feature = "webgpu")]
     fn load_flashnext_portable(&self, spec: &Spec) -> Result<Live> {
         let o = &self.opts;
         if o.lora_adapters.contains_key(&spec.name) {
@@ -840,7 +606,7 @@ impl Models {
     /// experts streamed through the host cache from RAM and the drive, and its dense trunk (attention projections,
     /// shared experts, router, head: about 9.7 GB) on the WebGPU adapter while the budget holds it. No images and no
     /// observer (both CUDA's); a conversation's next turn continues the state rather than reading it all again.
-    #[cfg(all(not(feature = "cuda"), feature = "webgpu"))]
+    #[cfg(feature = "webgpu")]
     fn load_deepseek_portable(&self, spec: &Spec) -> Result<Live> {
         let o = &self.opts;
         let tok = Arc::new(dsv41::tokenizer::Tokenizer::load(&spec.path)?);
@@ -881,7 +647,7 @@ impl Models {
     /// OrcaSAQ without CUDA: its packed EXL3 projections on the WebGPU adapter while the weight budget holds them,
     /// the rest decoded on the CPU, everything else on the host as in any portable model. No PEFT adapters and no
     /// vision tower (both CUDA's); its prompt states are kept as on CUDA, under a fingerprint of their own.
-    #[cfg(all(not(feature = "cuda"), feature = "webgpu"))]
+    #[cfg(feature = "webgpu")]
     fn load_orcasaq_portable(&self, spec: &Spec) -> Result<Live> {
         let o = &self.opts;
         if o.lora_adapters.contains_key(&spec.name) {
@@ -930,7 +696,7 @@ impl Models {
     /// Qwen3.8-Flash-Next from a GGUF (`qwen4exp`: the GSQ-RCO files) on WebGPU: its layers over every discrete GPU, a
     /// layer's experts on its device in the file's type while the budget holds them (the rest on the host), the dense
     /// matrices in theirs. No adapters, no vision tower and no multi-token-prediction layer (the GGUFs carry none).
-    #[cfg(all(not(feature = "cuda"), feature = "webgpu"))]
+    #[cfg(feature = "webgpu")]
     fn load_flashnext_gguf(&self, spec: &Spec, path: &Path) -> Result<Live> {
         let o = &self.opts;
         if o.lora_adapters.contains_key(&spec.name) {
@@ -977,7 +743,7 @@ impl Models {
     fn load_gguf(&self, spec: &Spec) -> Result<Live> {
         let o = &self.opts;
         let path = Kind::gguf_path(&spec.path)?;
-        #[cfg(all(not(feature = "cuda"), feature = "webgpu"))]
+        #[cfg(feature = "webgpu")]
         if crate::flashnext::gguf_file::detect(&path) {
             return self.load_flashnext_gguf(spec, &path);
         }
@@ -1098,30 +864,10 @@ impl Models {
                 budget as f64 / 1e9
             ));
         }
-        #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+        #[allow(unused_mut)]
         let mut model = llama_rs::Model::open_streaming(&path, backend, budget)
             .map_err(|e| Error::Arg(e.to_string()))?;
 
-        // The expert hierarchy. `open_streaming` leaves a streamed model with its
-        // RAM cache only -- no VRAM expert cache, one card, no CPU tier -- which for
-        // GLM-5.3-Flash is 0.686 s a token against 0.139 tiered, because then every
-        // routed expert of every token crosses PCIe. Nothing else served here needs
-        // asking, so the arch decides.
-        #[cfg(feature = "cuda")]
-        if let (llama_rs::Model::Glm5Next(g), Some(cards)) = (&mut model, picked.cards) {
-            g.enable_tiering(cards, 0).map_err(|e| Error::Arg(e.to_string()))?;
-            if !o.quiet && !o.silent {
-                let (budgets, layers) = g.tier_layout();
-                let gb: Vec<String> =
-                    budgets.iter().map(|b| format!("{:.1}", *b as f64 / 1e9)).collect();
-                eprintln!(
-                    "  expert tier: {} card(s), VRAM {} GB, MoE layers {:?}",
-                    budgets.len(),
-                    gb.join("+"),
-                    layers
-                );
-            }
-        }
         let model = model;
         let tok = Arc::new(model.tokenizer().clone());
 
@@ -1376,7 +1122,7 @@ pub(crate) fn flashnext_gguf_on(path: &Path, gpus: &[&ggml_rs_wgpu::WgpuBackend]
     Ok(model)
 }
 
-#[cfg(all(test, feature = "webgpu", not(feature = "cuda")))]
+#[cfg(all(test, feature = "webgpu"))]
 mod dense_webgpu_timing {
     #[test]
     #[ignore = "a timing; needs a WebGPU adapter and E:\\models\\llama-3.2-3b-q4_k_m.gguf; run with --nocapture"]

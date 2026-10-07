@@ -242,8 +242,6 @@ impl Gemma4MoeModel {
                 router, gate_up_experts, down_experts: down_per_expert,
                 top_k: expert_used,
                 stream: None, // VENDORED-LOCAL: resident experts
-                #[cfg(feature = "cuda")]
-                gpu_plan: std::sync::OnceLock::new(),
             }.move_to_device(&*backend, SAFETY_BYTES);
 
             let down_exps_s_t = idx.take(&format!("blk.{i}.ffn_down_exps.scale"), &[])?;

@@ -35,21 +35,7 @@ const GEMMA4_IMAGE_TOKEN_ID: u32 = 258880;
 fn pick_backend(name: &str) -> Result<Arc<dyn Backend>, Box<dyn std::error::Error>> {
     match name {
         "cpu" => Ok(default_backend()),
-        #[cfg(feature = "cuda")]
-        "cuda" => {
-            // Allow `cuda:N` to pick a specific GPU; default to 0.
-            // Useful when GPU 0 is still pinned by a zombie process from a
-            // prior crash and you need to retry on a different device.
-            Ok(Arc::new(ggml_rs_cuda::CudaBackend::new(0)?))
-        }
-        #[cfg(feature = "cuda")]
-        s if s.starts_with("cuda:") => {
-            let idx: usize = s[5..].parse().map_err(|e| format!("bad cuda device: {e}"))?;
-            Ok(Arc::new(ggml_rs_cuda::CudaBackend::new(idx)?))
-        }
-        #[cfg(not(feature = "cuda"))]
         s if s.starts_with("cuda:") => Err(format!("CUDA not enabled; got `{s}`. Build with --features cuda").into()),
-        #[cfg(not(feature = "cuda"))]
         "cuda" => Err("CUDA backend not enabled. Build with `--features cuda`".into()),
         other => Err(format!("unknown backend `{other}`").into()),
     }

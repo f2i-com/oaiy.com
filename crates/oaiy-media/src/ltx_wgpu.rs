@@ -678,10 +678,6 @@ mod tests {
         gpu.nag = Some(Nag { context: negative.clone(), rows: negative_rows, scale: 11.0, tau: 2.5, alpha: 0.25 });
         let guided = gpu.forward(&latent, tokens, &context, lc, 0.8, &table, (0, 0), h * w, None)?;
         drop(gpu);
-        // (Candle's LTX is BF16 throughout: its CPU has no BF16 matmul, so CUDA's device OAIY_LTX_CUDA_DEVICE, 0 else)
-        #[cfg(feature = "cuda")]
-        let dev = Device::new_cuda(std::env::var("OAIY_LTX_CUDA_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0))?;
-        #[cfg(not(feature = "cuda"))]
         let dev = Device::Cpu;
         // (a budget under the blocks' INT8 size: they stream as they are stored; a BF16 checkpoint's 28 GB over a
         // budget its INT8 rows fit would be those rows, not the reference)
@@ -861,9 +857,6 @@ mod tests {
         let got = gpu.pass(&latent, tokens, &context, lc, 0.8, &table, (0, 0), h * w, None, true)?;
         let trail = &got[0];
         drop(gpu);
-        #[cfg(feature = "cuda")]
-        let dev = Device::new_cuda(std::env::var("OAIY_LTX_CUDA_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0))?;
-        #[cfg(not(feature = "cuda"))]
         let dev = Device::Cpu;
         let mut cpu = crate::ltx::transformer::Transformer::new(Store::open(path, 0)?, &dev, 8 << 30, false, false)?;
         cpu.hiddens = Some(Vec::new());

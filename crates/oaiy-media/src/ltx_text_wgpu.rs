@@ -476,9 +476,6 @@ mod tests {
         })?
         .remove(0);
         eprintln!("WebGPU context {:.1} s", t.elapsed().as_secs_f64());
-        #[cfg(feature = "cuda")]
-        let dev = Device::new_cuda(std::env::var("OAIY_LTX_CUDA_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0))?;
-        #[cfg(not(feature = "cuda"))]
         let dev = Device::Cpu;
         let t = std::time::Instant::now();
         let (features, _) = crate::ltx::text::encode(&gemma, tokenizer.as_deref(), &mut store, &prompt, gemma4, false, &dev, |_| {})?;

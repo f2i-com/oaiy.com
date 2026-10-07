@@ -47,13 +47,6 @@ fn msg(s: impl Into<String>) -> candle_core::Error {
 
 /// A CUDA device, or a clear error when this build has no CUDA.
 pub fn cuda(ordinal: usize) -> Result<Device> {
-    #[cfg(feature = "cuda")]
-    {
-        let dev = Device::new_cuda(ordinal)?;
-        weights::untracked(&dev);
-        Ok(dev)
-    }
-    #[cfg(not(feature = "cuda"))]
     {
         let _ = ordinal;
         Err(msg("oaiy-tts was built without CUDA: build it with --features cuda (or flash-attn)"))
@@ -63,8 +56,6 @@ pub fn cuda(ordinal: usize) -> Result<Device> {
 /// Free and total memory on the device, when it is a GPU.
 pub fn device_memory(dev: &Device) -> Option<(u64, u64)> {
     match dev {
-        #[cfg(feature = "cuda")]
-        Device::Cuda(d) => d.cuda_stream().context().mem_get_info().ok().map(|(free, total)| (free as u64, total as u64)),
         _ => None,
     }
 }

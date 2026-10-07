@@ -54,17 +54,6 @@ fn repeat_kv(x: &Tensor) -> Result<Tensor> {
 // Gemma 4 uses scale=1. Passing it directly avoids rounding a rescaled Q.
 fn gemma4_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
     let (_, _, n, d) = q.dims4()?;
-    #[cfg(feature = "flash-attn")]
-    if q.device().is_cuda() && d <= 256 {
-        return candle_flash_attn::flash_attn(
-            &q.transpose(1, 2)?,
-            &k.transpose(1, 2)?,
-            &v.transpose(1, 2)?,
-            1.,
-            true,
-        )?
-        .transpose(1, 2);
-    }
     let _ = d;
     let kt = k.transpose(2, 3)?.contiguous()?;
     let v = v.contiguous()?;

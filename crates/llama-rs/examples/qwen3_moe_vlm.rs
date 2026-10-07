@@ -35,16 +35,7 @@ fn image_pad_token_id(tok: &tokenizer::Tokenizer) -> Result<u32, Box<dyn std::er
 fn pick_backend(name: &str) -> Result<Arc<dyn Backend>, Box<dyn std::error::Error>> {
     match name {
         "cpu" => Ok(default_backend()),
-        #[cfg(feature = "cuda")]
-        "cuda" => Ok(Arc::new(ggml_rs_cuda::CudaBackend::new(0)?)),
-        #[cfg(feature = "cuda")]
-        s if s.starts_with("cuda:") => {
-            let idx: usize = s[5..].parse().map_err(|e| format!("bad cuda device: {e}"))?;
-            Ok(Arc::new(ggml_rs_cuda::CudaBackend::new(idx)?))
-        }
-        #[cfg(not(feature = "cuda"))]
         "cuda" => Err("CUDA backend not enabled. Build with `--features cuda`".into()),
-        #[cfg(not(feature = "cuda"))]
         s if s.starts_with("cuda:") => Err(format!("CUDA not enabled; got `{s}`").into()),
         other => Err(format!("unknown backend `{other}`").into()),
     }

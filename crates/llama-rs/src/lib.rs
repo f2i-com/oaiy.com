@@ -32,9 +32,6 @@ pub mod loader;
 pub mod mixtral;
 pub mod mmproj;
 pub mod moe;
-// VENDORED-LOCAL: MOE-01/MOE-02 — grouped CUDA MoE decode (see moe_cuda.rs).
-#[cfg(feature = "cuda")]
-mod moe_cuda;
 pub mod qwen3;
 pub mod glm5next; // VENDORED-LOCAL: GLM-5.3-Flash
 pub mod qwen3moe;
@@ -331,14 +328,6 @@ impl Model {
     /// model; `None` for resident loads.
     pub fn expert_cache_stats(&self) -> Option<oaiy_engine::ecache::CacheStats> {
         self.stream_shared().map(|s| s.cache_stats())
-    }
-
-    /// VENDORED-LOCAL (CACHE-02): VRAM expert-cache counters for a streaming
-    /// model with `--vram-cache` enabled; `None` otherwise (and in non-CUDA
-    /// builds, where the whole device cache is compiled out).
-    #[cfg(feature = "cuda")]
-    pub fn device_cache_stats(&self) -> Option<expert_stream::device_cache::DeviceCacheStats> {
-        self.stream_shared().and_then(|s| s.device_cache_stats())
     }
 
     /// The first streaming fetch/reconstruction failure, if any. The forward

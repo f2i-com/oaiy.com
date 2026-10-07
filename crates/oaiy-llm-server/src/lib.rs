@@ -8,23 +8,20 @@
 //! OS, and `silent` keeps the server's log off the host's terminal.
 
 #![forbid(unsafe_code)]
-// Without CUDA the DeepSeek engine is compiled out, and with it the only callers
-// of its helpers (repetition and tool-phase guards, observer internals). The
-// default CUDA build still checks all of them for dead code.
-#![cfg_attr(not(feature = "cuda"), allow(dead_code))]
+// The DeepSeek engine that called these helpers (the repetition and tool-phase guards, the
+// observer's internals) was the CUDA build's: they stand for the WebGPU engine to take up
+// (`dsv41_portable`), and until it does nothing calls them.
+#![allow(dead_code)]
 
 mod api;
 mod disk;
-// The request/reply types every engine shares; `engine` is the DeepSeek-V4.1
-// worker, which needs CUDA. Without it the name still carries the shared types.
+// The request/reply types every engine shares, under the name the DeepSeek-V4.1 worker
+// had them by (`engine`).
 mod job;
-#[cfg(feature = "cuda")]
-mod engine;
-#[cfg(not(feature = "cuda"))]
 mod engine {
     pub use crate::job::*;
 }
-// Which backend runs GGUF models: CUDA, WebGPU or the CPU.
+// Which backend runs GGUF models: WebGPU or the CPU.
 mod backend;
 pub mod observer;
 mod tool_phase;
@@ -38,10 +35,10 @@ mod qwen;
 // OrcaSAQ (EXL3: packed on CUDA, or on any GPU through WebGPU), its PEFT adapters (CUDA) and its Qwen vision tower (CUDA).
 mod orcasaq;
 // Qwen3.8-Flash-Next (qwen4_exp, EXL3: on CUDA, or on any GPU through WebGPU).
-#[cfg(any(feature = "cuda", feature = "webgpu"))]
+#[cfg(feature = "webgpu")]
 mod flashnext;
 // DeepSeek-V4.1 without CUDA: the CPU model with its dense trunk on the WebGPU adapter.
-#[cfg(all(not(feature = "cuda"), feature = "webgpu"))]
+#[cfg(feature = "webgpu")]
 mod dsv41_portable;
 mod lora;
 mod qwen_cache;
@@ -49,8 +46,6 @@ mod qwen_cache;
 mod qwen_park;
 #[cfg(test)]
 mod qwen_real;
-#[cfg(feature = "cuda")]
-mod qwen_vision;
 pub mod images;
 mod media_catalog;
 
@@ -60,7 +55,6 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-
 
 /// Bump when what a prompt state holds changes: older files are then left
 /// alone.
@@ -224,11 +218,9 @@ impl Options {
     /// `--ram-gb` is there for a caller who knows better. The portable build asks
     /// the same way (`ggml_rs_wgpu::host_memory`): it used to assume 32 GB always.
     pub fn expert_cache_bytes(&self) -> u64 {
-        #[cfg(feature = "cuda")]
-        let free = ggml_rs_cuda::host_memory().map(|(free, _)| free as u64);
-        #[cfg(all(not(feature = "cuda"), feature = "webgpu"))]
+        #[cfg(feature = "webgpu")]
         let free = ggml_rs_wgpu::host_memory().map(|(free, _)| free as u64);
-        #[cfg(not(any(feature = "cuda", feature = "webgpu")))]
+        #[cfg(not(feature = "webgpu"))]
         let free = None;
         host_cache_budget(self.ram_gb, free)
     }

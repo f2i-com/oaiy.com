@@ -391,33 +391,6 @@ impl Talker {
     /// The frame's work: replayed from its graph when there is one for this
     /// thread, else captured (on CUDA) or run as it is.
     fn run_frame(&self, w: &mut FrameWork) -> Result<()> {
-        #[cfg(feature = "cuda")]
-        if let candle_core::Device::Cuda(cuda) = &self.dev {
-            let here = std::thread::current().id();
-            if let Some(graph) = w.graph.as_ref().filter(|g| g.thread == here) {
-                return graph.graph.launch().map_err(candle_core::Error::wrap);
-            }
-            w.graph = None;
-            // Warm up with the parameter cache on (Candle then keeps the small
-            // shape uploads strided kernels make on the device, where the
-            // capture can reuse them), then capture the same work.
-            let _cache = cuda.enable_cuda_graph_htod_cache();
-            self.frame_ops(w)?;
-            self.dev.synchronize()?;
-            let stream = cuda.cuda_stream();
-            use candle_core::cuda_backend::cudarc::driver::sys;
-            stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED).map_err(candle_core::Error::wrap)?;
-            let captured = self.frame_ops(w);
-            let graph = stream.end_capture(sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH);
-            captured?;
-            if let Some(graph) = graph.map_err(candle_core::Error::wrap)? {
-                graph.upload().map_err(candle_core::Error::wrap)?;
-                w.graph = Some(FrameGraph { graph, thread: here });
-            }
-            // The warm-up already made this frame's outputs; the capture only
-            // recorded the work.
-            return Ok(());
-        }
         self.frame_ops(w)
     }
 
@@ -526,8 +499,6 @@ struct FrameWork {
     cache: Cache,
     /// What the work was made for: the draws' settings are baked into a graph.
     sampling: Sampling,
-    #[cfg(feature = "cuda")]
-    graph: Option<FrameGraph>,
 }
 
 impl FrameWork {
@@ -542,8 +513,6 @@ impl FrameWork {
             summed: Tensor::zeros((1, 1, h), dtype, dev)?,
             cache: Cache::new(t.predictor.layers()),
             sampling: s.clone(),
-            #[cfg(feature = "cuda")]
-            graph: None,
         })
     }
 
@@ -552,23 +521,6 @@ impl FrameWork {
         (a.temperature, a.top_k, a.repetition_penalty, a.sub_temperature, a.sub_top_k, a.greedy) == (s.temperature, s.top_k, s.repetition_penalty, s.sub_temperature, s.sub_top_k, s.greedy)
     }
 }
-
-/// A captured frame, and the thread it was captured on: it replays on that
-/// thread's stream, with Candle's (thread-local) cached kernel parameters.
-#[cfg(feature = "cuda")]
-struct FrameGraph {
-    graph: candle_core::cuda_backend::cudarc::driver::CudaGraph,
-    thread: std::thread::ThreadId,
-}
-
-// SAFETY: CUDA graph objects must not be used from two threads at the same
-// time. A `FrameGraph` lives inside the talker's `frame_work` mutex, so only
-// one thread touches it at once, and it is launched only on the thread that
-// captured it (`run_frame` checks `thread` and captures anew elsewhere);
-// moving it to another thread otherwise only drops it there, which destroys
-// the graph through the driver API with no other user.
-#[cfg(feature = "cuda")]
-unsafe impl Send for FrameGraph {}
 
 /// One line being spoken: the talker's cache and where it is in the text.
 pub struct Generation {

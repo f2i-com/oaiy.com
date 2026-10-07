@@ -12,9 +12,6 @@ use std::sync::Arc;
 
 pub(crate) struct Picked {
     pub backend: Arc<dyn ggml_rs::Backend>,
-    /// Every CUDA card, for GLM's expert tier (CUDA builds on CUDA only).
-    #[cfg(feature = "cuda")]
-    pub cards: Option<Vec<Arc<ggml_rs_cuda::CudaBackend>>>,
     /// For the log: what runs the model.
     pub label: String,
 }
@@ -22,8 +19,6 @@ pub(crate) struct Picked {
 fn cpu() -> Picked {
     Picked {
         backend: Arc::new(ggml_rs::CpuBackend::new()),
-        #[cfg(feature = "cuda")]
-        cards: None,
         label: "the CPU".into(),
     }
 }
@@ -35,8 +30,6 @@ fn webgpu(o: &Options) -> std::result::Result<Picked, String> {
     let (_, budget) = b.usage();
     Ok(Picked {
         backend: Arc::new(b),
-        #[cfg(feature = "cuda")]
-        cards: None,
         label: format!("WebGPU on {} ({}), up to {} GiB of weights, the rest on the CPU", a.name, a.backend, budget >> 30),
     })
 }
@@ -51,14 +44,7 @@ pub(crate) fn open(o: &Options, devices: &[usize]) -> Result<Picked> {
             #[cfg(not(feature = "webgpu"))]
             return Err(Error::Arg("--backend webgpu needs a WebGPU build (oaiy-llm-server-webgpu)".into()));
         }
-        "cuda" | "auto" if cfg!(feature = "cuda") => {
-            #[cfg(feature = "cuda")]
-            {
-                let cards = llama_rs::glm5next::device::open_cards(devices).map_err(|e| Error::Arg(e.to_string()))?;
-                let backend: Arc<dyn ggml_rs::Backend> = Arc::clone(&cards[0]) as Arc<dyn ggml_rs::Backend>;
-                return Ok(Picked { backend, label: format!("CUDA ({} card(s))", cards.len()), cards: Some(cards) });
-            }
-            #[cfg(not(feature = "cuda"))]
+        "cuda" | "auto" if false => {
             unreachable!("guarded by cfg!(feature = \"cuda\")")
         }
         "cuda" => Err(Error::Arg("--backend cuda needs the CUDA build (oaiy-llm-server)".into())),

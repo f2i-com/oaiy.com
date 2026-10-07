@@ -540,14 +540,12 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
 mod tests {
     use super::*;
 
-    #[cfg(feature = "cuda")]
     fn cosine(a: &[f32], b: &[f32]) -> f64 {
         let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
         let n = |v: &[f32]| v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
         dot / (n(a) * n(b)).max(1e-30)
     }
 
-    #[cfg(feature = "cuda")]
     fn read(gpu: &WgpuBackend, v: &DeviceVec) -> Vec<f32> {
         let mut rec = gpu.begin();
         rec.read(v);
@@ -557,9 +555,8 @@ mod tests {
     /// Each stage on WebGPU against Candle's on CUDA (`--ignored --nocapture`, built with `webgpu cuda`; Candle on
     /// OAIY_SOUND_CUDA_DEVICE, 0 by default): the prompt's text states, a step's flow from the same noise and text, and
     /// the DAC's audio from the same latents.
-    #[cfg(feature = "cuda")]
     #[test]
-    #[ignore = "needs MOSS-SoundEffect v2.0 and CUDA"]
+    #[ignore = "its reference is Candle on CUDA, which this workspace no longer builds: the CUDA station (the backup branch's worktree) runs it until it reads fixtures"]
     fn the_webgpu_sound_is_candles() -> Result<()> {
         let dir = std::path::PathBuf::from(std::env::var("OAIY_SOUND").unwrap_or_else(|_| "E:/models/MOSS-SoundEffect-v2.0".into()));
         let cuda: usize = std::env::var("OAIY_SOUND_CUDA_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);

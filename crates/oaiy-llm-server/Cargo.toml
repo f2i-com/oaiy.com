@@ -9,36 +9,30 @@ description = "OpenAI-compatible HTTP server for DeepSeek-V4.1-Flash on OAIY"
 name = "oaiy-llm-server"
 path = "src/main.rs"
 
-# The same server without CUDA, for machines that lack it: GGUF models on any
-# WebGPU adapter (D3D12, Vulkan, Metal), else the CPU. Build it with
-#   cargo build --release -p oaiy-llm-server --no-default-features --features webgpu --bin oaiy-llm-server-webgpu
-# A CUDA build imports nvcuda.dll and would not start on such a machine, hence
-# a second executable rather than a runtime switch.
+# The same server under the name its WebGPU build had while a CUDA build stood
+# beside it: the studio's configuration, the desktop's staging and the release
+# workflow still ask for it by this name.
 [[bin]]
 name = "oaiy-llm-server-webgpu"
 path = "src/webgpu_main.rs"
 required-features = ["webgpu"]
 
 [features]
-default = ["cuda"]
-# DeepSeek-V4.1, OrcaSAQ (EXL3), the observer, and GGUF on NVIDIA GPUs.
-cuda = ["dep:dsv41-cuda", "dep:ggml-rs-cuda", "llama-rs/cuda"]
-# GGUF models with their quantized matmuls on WebGPU (see crates/ggml-rs-wgpu).
+default = ["webgpu"]
+# Every model's kernels on any GPU wgpu reaches (see crates/ggml-rs-wgpu); without it
+# (`--no-default-features`) the server runs GGUF models on the CPU.
 webgpu = ["dep:ggml-rs-wgpu"]
 
-# std-only apart from the workspace crates (dsv41-cuda brings CUDA).
+# std-only apart from the workspace crates.
 [dependencies]
 oaiy-engine = { path = "../oaiy-engine" }
 dsv41 = { path = "../dsv41" }
-dsv41-cuda = { path = "../dsv41-cuda", optional = true }
-# VENDORED-LOCAL: GLM-5.3-Flash is served through llama-rs rather than dsv41-cuda,
-# so a second engine sits beside the DeepSeek one (see src/glm.rs). Its CUDA
-# backend comes with this crate's `cuda` feature (on by default).
+# VENDORED-LOCAL: GLM-5.3-Flash is served through llama-rs, so a second engine sits
+# beside the DeepSeek one (see src/glm.rs).
 llama-rs = { path = "../llama-rs" }
 tokenizer = { path = "../tokenizer" }
 gguf = { path = "../gguf" }
 ggml-quants = { path = "../ggml-quants" }
 ggml-rs = { path = "../ggml-rs" }
 rayon = "1.10"
-ggml-rs-cuda = { path = "../ggml-rs-cuda", optional = true }
 ggml-rs-wgpu = { path = "../ggml-rs-wgpu", optional = true }

@@ -496,11 +496,6 @@ fn av_block(
 /// Measured, not estimated: decoding and the allocator hold more than the
 /// weights' own bytes, and other programs may share the GPU.
 fn fits_on_device(dev: &Device, size: u64) -> Result<bool> {
-    #[cfg(feature = "cuda")]
-    if let Ok(cuda) = dev.as_cuda_device() {
-        let free = cuda.cuda_stream().context().mem_get_info().map_err(candle_core::Error::wrap)?.0 as u64;
-        return Ok(free >= 3 * size + (2 << 30));
-    }
     let _ = (dev, size);
     Ok(true)
 }

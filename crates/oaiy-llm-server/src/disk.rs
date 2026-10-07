@@ -55,22 +55,6 @@ pub trait PromptState: Send + 'static {
     }
 }
 
-#[cfg(feature = "cuda")]
-impl PromptState for dsv41_cuda::Snapshot {
-    fn pos(&self) -> usize {
-        self.pos()
-    }
-    fn encoded_len(&self) -> usize {
-        self.encoded_len()
-    }
-    fn encode(&self, out: &mut Vec<u8>) {
-        self.encode(out)
-    }
-    fn decode(bytes: &[u8]) -> oaiy_engine::Result<Self> {
-        dsv41_cuda::Snapshot::decode(bytes)
-    }
-}
-
 impl PromptState for llama_rs::glm5next::forward::StateSnapshot {
     fn pos(&self) -> usize {
         self.len
@@ -282,73 +266,6 @@ impl<S: PromptState> DiskCache<S> {
         }
     }
 }
-
-#[cfg(all(test, feature = "cuda"))]
-mod tests {
-    use super::*;
-
-    /// A snapshot of `pos` tokens with no layers (what the cache stores
-    /// does not matter here).
-    fn snap(pos: usize) -> dsv41_cuda::Snapshot {
-        let mut bytes = (pos as u64).to_le_bytes().to_vec();
-        bytes.extend(0u32.to_le_bytes());
-        dsv41_cuda::Snapshot::decode(&bytes).unwrap()
-    }
-
-    fn written(dir: &Path, n: usize) -> bool {
-        for _ in 0..200 {
-            let files = fs::read_dir(dir).unwrap().flatten().filter(|f| f.path().extension().and_then(|e| e.to_str()) == Some(EXT)).count();
-            if files == n {
-                return true;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        false
-    }
-
-    #[test]
-    fn states_outlive_the_process_and_keep_reusable_prefixes() {
-        let dir = std::env::temp_dir().join(format!("oaiy-prompt-cache-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        let mut cache: DiskCache<dsv41_cuda::Snapshot> = DiskCache::open(&dir, 7, 1 << 30).unwrap();
-        cache.save(vec![1, 2, 3], snap(3), true);
-        cache.save(vec![1, 2, 3, 4, 5], snap(5), false);
-        cache.save(vec![1, 2, 3, 4, 5, 6, 7], snap(7), false);
-        assert!(written(&dir, 3));
-        // Publication status follows the rename; wait for the worker marker too.
-        for _ in 0..200 {
-            if cache.entries.iter().all(|e| e.ready.load(Ordering::Acquire) == 1) { break; }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        // Keep both shorter and longer conversation prefixes within the budget.
-        assert_eq!(cache.len(), 3);
-        assert!(cache.has(&[1, 2, 3]) && cache.has(&[1, 2, 3, 4, 5]));
-        assert_eq!(cache.best(&[1, 2, 3, 4, 5, 6, 7, 8], 7).map(|b| b.1), Some(7));
-        assert_eq!(cache.best(&[1, 2, 3, 9], 3).map(|b| b.1), Some(3));
-        assert_eq!(cache.best(&[1, 2, 3, 4, 5, 6, 7], 6).map(|b| b.1), Some(5));
-        assert_eq!(cache.best(&[2, 3], 1), None);
-        assert!(written(&dir, 3));
-
-        // another process of the same model finds them; another model does not
-        let mut again: DiskCache<dsv41_cuda::Snapshot> = DiskCache::open(&dir, 7, 1 << 30).unwrap();
-        assert_eq!(again.len(), 3);
-        let (i, len) = again.best(&[1, 2, 3, 4, 5, 6, 7, 8], 7).unwrap();
-        let (keys, state) = again.load(i).unwrap();
-        assert_eq!((keys, state.pos(), len), (vec![1, 2, 3, 4, 5, 6, 7], 7, 7));
-        assert_eq!(
-            DiskCache::<dsv41_cuda::Snapshot>::open(&dir, 8, 1 << 30).unwrap().len(),
-            0
-        );
-
-        // over the budget the least recently used go
-        let mut small: DiskCache<dsv41_cuda::Snapshot> = DiskCache::open(&dir, 7, 150).unwrap();
-        small.save(vec![9; 8], snap(8), true);
-        assert_eq!(small.len(), 1);
-        assert!(small.has(&[9; 8]));
-        let _ = fs::remove_dir_all(&dir);
-    }
-}
-
 
 #[cfg(test)]
 mod publication_tests {

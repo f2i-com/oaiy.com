@@ -61,7 +61,7 @@ impl Request {
                 Some("webgpu") => true,
                 Some("cuda" | "cpu") => false,
                 Some(other) => return Err(format!("sound: backend must be webgpu, cuda or cpu, not {other}")),
-                None => cfg!(all(feature = "webgpu", not(feature = "cuda"))),
+                None => cfg!(feature = "webgpu"),
             },
         };
         if r.webgpu && !cfg!(feature = "webgpu") {
@@ -85,12 +85,7 @@ pub(crate) fn event(stage: &str, current: usize, total: usize) -> Json {
 }
 
 fn device(index: usize) -> Result<Device> {
-    #[cfg(feature = "cuda")]
-    {
-        Device::new_cuda(index)
-    }
     // The models run in BF16, which the CPU backend cannot multiply.
-    #[cfg(not(feature = "cuda"))]
     {
         let _ = index;
         candle_core::bail!("sound effects need a GPU: this oaiy-media was built without CUDA (build it with --features cuda or flash-attn)")

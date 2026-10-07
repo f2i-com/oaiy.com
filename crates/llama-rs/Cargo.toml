@@ -9,7 +9,6 @@ description = "Top-level pure-Rust LLM inference crate. Loads GGUF, runs Llama-f
 gguf         = { path = "../gguf", version = "0.0.1" }
 ggml-quants  = { path = "../ggml-quants", version = "0.0.1" }
 ggml-rs      = { path = "../ggml-rs", version = "0.0.1" }
-ggml-rs-cuda = { path = "../ggml-rs-cuda", version = "0.0.1", optional = true }
 tokenizer    = { path = "../tokenizer", version = "0.0.1" }
 # VENDORED-LOCAL: streaming expert backend (src/expert_stream.rs) reuses
 # OAIY's bounded expert cache (`Ecache`) and `WeightStore` seam. Workspace-
@@ -22,7 +21,6 @@ thiserror    = "1.0"
 
 [features]
 default = []
-cuda    = ["dep:ggml-rs-cuda"]
 
 [[example]]
 name = "inspect_gguf"

@@ -131,11 +131,6 @@ fn rotate(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
 /// Attention for one sequence: q [Nq, H, d], k/v [Nk, H, d].
 fn attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
     let d = q.dim(D::Minus1)?;
-    #[cfg(feature = "flash-attn")]
-    if q.device().is_cuda() {
-        let o = candle_flash_attn::flash_attn(&q.unsqueeze(0)?.contiguous()?, &k.unsqueeze(0)?.contiguous()?, &v.unsqueeze(0)?.contiguous()?, 1. / (d as f32).sqrt(), false)?;
-        return o.squeeze(0);
-    }
     let q = q.transpose(0, 1)?.contiguous()?.to_dtype(DType::F32)?;
     let k = k.transpose(0, 1)?.contiguous()?.to_dtype(DType::F32)?;
     let v = v.transpose(0, 1)?.contiguous()?.to_dtype(DType::F32)?;

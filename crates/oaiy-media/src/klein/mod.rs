@@ -170,9 +170,6 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
     crate::lora::Loras::open(&r.loras)?
         .validate_modules(&transformer::Config::default().projections())?;
     drop(index);
-    #[cfg(feature = "cuda")]
-    let dev = Device::new_cuda(r.device)?;
-    #[cfg(not(feature = "cuda"))]
     let dev = Device::Cpu;
     let dtype = if dev.is_cuda() {
         DType::BF16

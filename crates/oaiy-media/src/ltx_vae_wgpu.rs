@@ -439,9 +439,6 @@ mod tests {
         let got = gpu.encode(&rgb, h, w)?;
         eprintln!("WebGPU encode {:.3} s", t.elapsed().as_secs_f64());
         drop(gpu);
-        #[cfg(feature = "cuda")]
-        let dev = Device::new_cuda(std::env::var("OAIY_LTX_CUDA_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0))?;
-        #[cfg(not(feature = "cuda"))]
         let dev = Device::Cpu;
         let encoder = crate::ltx::vae::LtxVideoEncoder::load(std::path::Path::new(&path), crate::ltx::vae::LtxVaeConfig::ltx_2_3_22b(), &dev, DType::BF16)?;
         let video = Tensor::from_vec(rgb, (1, 1, h, w, 3), &dev)?.permute((0, 4, 1, 2, 3))?.contiguous()?.to_dtype(DType::BF16)?;
@@ -505,9 +502,6 @@ mod tests {
         let t = std::time::Instant::now();
         let got = gpu.decode(&latent, f, h, w)?;
         eprintln!("WebGPU decode {:.3} s: {:?}", t.elapsed().as_secs_f64(), got.dims());
-        #[cfg(feature = "cuda")]
-        let dev = Device::new_cuda(std::env::var("OAIY_LTX_CUDA_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0))?;
-        #[cfg(not(feature = "cuda"))]
         let dev = Device::Cpu;
         let decoder = crate::ltx::vae::LtxVideoDecoder::load(path, crate::ltx::vae::LtxVaeConfig::ltx_2_3_22b(), &dev, DType::BF16)?;
         let lt = Tensor::from_vec(latent, (1, f, h, w, 128), &dev)?.permute((0, 4, 1, 2, 3))?.contiguous()?.to_dtype(DType::BF16)?;

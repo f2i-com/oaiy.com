@@ -59,7 +59,7 @@ impl Request {
             Some("webgpu") => true,
             Some("cuda" | "cpu") => false,
             Some(other) => return Err(format!("picture: backend must be webgpu, cuda or cpu, not {other}")),
-            None => cfg!(all(feature = "webgpu", not(feature = "cuda"))),
+            None => cfg!(feature = "webgpu"),
         };
         if webgpu && !cfg!(feature = "webgpu") {
             return Err("picture: this build has no WebGPU (the webgpu feature)".into());
@@ -120,11 +120,6 @@ fn upscale(r: &Request, dev: &Device, rgb: &[u8], w: usize, h: usize, report: &m
 }
 
 fn device(index: usize) -> Result<Device> {
-    #[cfg(feature = "cuda")]
-    {
-        Device::new_cuda(index)
-    }
-    #[cfg(not(feature = "cuda"))]
     {
         let _ = index;
         Ok(Device::Cpu)

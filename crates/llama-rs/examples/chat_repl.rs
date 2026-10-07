@@ -26,17 +26,8 @@ use llama_rs::{apply_chat_template, ChatMessage, Model, SampleParams};
 fn pick_backend(name: &str) -> Result<std::sync::Arc<dyn Backend>, Box<dyn std::error::Error>> {
     match name {
         "cpu" => Ok(default_backend()),
-        #[cfg(feature = "cuda")]
-        "cuda" => Ok(std::sync::Arc::new(ggml_rs_cuda::CudaBackend::new(0)?)),
-        #[cfg(not(feature = "cuda"))]
         "cuda" => Err("CUDA backend not enabled. Build with `--features cuda`".into()),
         "auto" => {
-            #[cfg(feature = "cuda")]
-            { match ggml_rs_cuda::CudaBackend::new(0) {
-                Ok(b)  => { eprintln!("auto: CUDA available, using cuda:0"); Ok(std::sync::Arc::new(b)) }
-                Err(e) => { eprintln!("auto: CUDA unavailable ({e:?}), falling back to CPU"); Ok(default_backend()) }
-            } }
-            #[cfg(not(feature = "cuda"))]
             { eprintln!("auto: built without --features cuda, using CPU"); Ok(default_backend()) }
         }
         other => Err(format!("unknown backend `{other}` (try `cpu`, `cuda`, or `auto`)").into()),

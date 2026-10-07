@@ -204,7 +204,7 @@ impl Request {
                 Some("webgpu") => true,
                 Some("cuda" | "cpu") => false,
                 Some(other) => return Err(format!("music: backend must be webgpu, cuda or cpu, not {other}")),
-                None => cfg!(all(feature = "webgpu", not(feature = "cuda"))),
+                None => cfg!(feature = "webgpu"),
             },
         };
         if r.webgpu && !cfg!(feature = "webgpu") {
@@ -253,11 +253,6 @@ pub fn write_stereo_wav(path: &Path, left: &[f32], right: &[f32], rate: usize) -
 }
 
 fn device(index: usize) -> Result<Device> {
-    #[cfg(feature = "cuda")]
-    {
-        Device::new_cuda(index)
-    }
-    #[cfg(not(feature = "cuda"))]
     {
         let _ = index;
         Ok(Device::Cpu)

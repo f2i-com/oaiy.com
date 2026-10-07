@@ -129,24 +129,6 @@ fn run() -> candle_core::Result<()> {
 }
 
 fn configure_cache(output: &std::path::Path) -> candle_core::Result<()> {
-    #[cfg(feature = "cuda")]
-    {
-        // Configure the driver before CUDA or tokenizer threads are started.
-        // A writable cache avoids recompiling PTX on every worker invocation.
-        if std::env::var_os("CUDA_CACHE_PATH").is_none() {
-            let cache = output.join(".cuda-cache");
-            std::fs::create_dir_all(&cache)?;
-            // A plain absolute path: the driver ignores `\?\`-prefixed
-            // (canonical Windows) paths and would JIT every kernel again.
-            std::env::set_var("CUDA_CACHE_PATH", std::path::absolute(&cache)?);
-        }
-        if std::env::var_os("CUDA_CACHE_MAXSIZE").is_none() {
-            // The driver's maximum (4 GiB): one GPU's worth of kernels for
-            // every model the worker runs.
-            std::env::set_var("CUDA_CACHE_MAXSIZE", "4294967296");
-        }
-    }
-    #[cfg(not(feature = "cuda"))]
     let _ = output;
     Ok(())
 }

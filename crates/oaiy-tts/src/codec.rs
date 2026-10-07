@@ -71,40 +71,13 @@ pub struct CodecDecoder {
     /// Stream states after a voice's reference clip, by its codes (a clip is
     /// worked through once, not every line).
     primed: std::sync::Mutex<HashMap<u64, StreamState>>,
-    /// Captured stream steps, by chunk length (CUDA).
-    #[cfg(feature = "cuda")]
-    graphs: std::sync::Mutex<HashMap<usize, StepGraph>>,
     dev: Device,
 }
 
 /// Lengths at most this long keep their positional tables.
 const SHORT: usize = 128;
-/// Chunks at most this long are captured as graphs.
-#[cfg(feature = "cuda")]
-const GRAPHED_CHUNK: usize = 16;
 /// Reference clips whose primed states are kept.
 const PRIMED_VOICES: usize = 16;
-
-/// A captured stream step for one chunk length: its codes, mask and state in
-/// (the state updated in place), its audio out, and the thread it was
-/// captured on (it replays only there).
-#[cfg(feature = "cuda")]
-struct StepGraph {
-    ids: Tensor,
-    mask: Tensor,
-    state: Vec<Tensor>,
-    wave: Tensor,
-    graph: candle_core::cuda_backend::cudarc::driver::CudaGraph,
-    thread: std::thread::ThreadId,
-}
-
-// SAFETY: CUDA graph objects must not be used from two threads at the same
-// time. A `StepGraph` lives inside the decoder's `graphs` mutex, so one
-// thread touches it at once, and it is launched only on the thread that
-// captured it (`CodecStream::push` checks `thread`); elsewhere it is only
-// dropped, which destroys the graph with no other user.
-#[cfg(feature = "cuda")]
-unsafe impl Send for StepGraph {}
 
 fn msg(s: impl Into<String>) -> candle_core::Error {
     candle_core::Error::Msg(s.into())
@@ -166,8 +139,6 @@ impl CodecDecoder {
             cfg,
             tables: Default::default(),
             primed: Default::default(),
-            #[cfg(feature = "cuda")]
-            graphs: Default::default(),
             dev: dev.clone(),
         })
     }
@@ -493,51 +464,6 @@ impl CodecDecoder {
         let ids = self.ids(frames)?;
         let mask = self.stream_mask(n, state.history)?;
         let past = self.cfg.window - 1;
-        #[cfg(feature = "cuda")]
-        if let (Device::Cuda(cuda), true) = (&self.dev, n <= GRAPHED_CHUNK && !state.tensors.is_empty()) {
-            let here = std::thread::current().id();
-            let mut graphs = self.graphs.lock().map_err(|_| msg("codec graphs poisoned by a panic"))?;
-            if let Some(g) = graphs.get(&n).filter(|g| g.thread == here && g.state.len() == state.tensors.len()) {
-                g.ids.slice_set(&ids, 1, 0)?;
-                g.mask.slice_set(&mask, 1, 0)?;
-                for (work, s) in g.state.iter().zip(&state.tensors) {
-                    work.slice_set(s, 0, 0)?;
-                }
-                g.graph.launch().map_err(candle_core::Error::wrap)?;
-                for (work, s) in g.state.iter().zip(&state.tensors) {
-                    s.slice_set(work, 0, 0)?;
-                }
-                state.history = (state.history + n).min(past);
-                return g.wave.copy();
-            }
-            // Warm up with Candle's parameter cache on (the strided kernels'
-            // shape uploads stay on the device for the capture to reuse),
-            // then capture the same step between fixed buffers. The warm-up
-            // is this call's decode; the capture only records.
-            let _cache = cuda.enable_cuda_graph_htod_cache();
-            let (ids, mask) = (ids.copy()?, mask.copy()?);
-            let mut work = state.tensors.iter().map(Tensor::copy).collect::<Result<Vec<_>>>()?;
-            let out = self.run(&ids, Some((&mut work, &mask)))?;
-            let wave = out.copy()?;
-            for (w, s) in work.iter().zip(&state.tensors) {
-                s.slice_set(w, 0, 0)?;
-            }
-            self.dev.synchronize()?;
-            // The capture replays from the state the warm-up left; each
-            // launch then starts from what is copied in.
-            use candle_core::cuda_backend::cudarc::driver::sys;
-            let stream = cuda.cuda_stream();
-            stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED).map_err(candle_core::Error::wrap)?;
-            let captured = self.run(&ids, Some((&mut work, &mask))).and_then(|w| wave.slice_set(&w, 2, 0));
-            let graph = stream.end_capture(sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH);
-            captured?;
-            if let Some(graph) = graph.map_err(candle_core::Error::wrap)? {
-                graph.upload().map_err(candle_core::Error::wrap)?;
-                graphs.insert(n, StepGraph { ids, mask, state: work, wave, graph, thread: here });
-            }
-            state.history = (state.history + n).min(past);
-            return Ok(out);
-        }
         let out = self.run(&ids, Some((&mut state.tensors, &mask)))?;
         state.history = (state.history + n).min(past);
         Ok(out)

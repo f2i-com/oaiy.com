@@ -25,19 +25,11 @@ use crate::orcasaq::{inverse, tokenizer, value_map};
 use dsv41::safetensors::{Dtype, StIndex};
 use ggml_rs::{exl3::{Exl3Data, Experts, PackedLinear}, Backend, Tensor};
 use ggml_rs::tensor::round_f16;
-#[cfg(feature = "cuda")]
-use ggml_rs_cuda::{exl3::{Exl3Experts, Exl3Matrix, HalfMatrix}, CudaBackend};
 
-/// The CUDA cards a decode step is captured on, as graphs.
-#[cfg(feature = "cuda")]
-pub type Card = CudaBackend;
 /// A build without CUDA has no cards to capture on: nothing asks it to (`graphs_enabled` is false).
-#[cfg(not(feature = "cuda"))]
 pub type Card = NoCard;
 
-#[cfg(not(feature = "cuda"))]
 pub struct NoCard;
-#[cfg(not(feature = "cuda"))]
 impl NoCard {
     fn graph_begin(&self) -> bool {
         false
@@ -69,7 +61,6 @@ fn bad(s: impl Into<String>) -> Error {
 
 #[path = "flashnext_gguf.rs"]
 pub(crate) mod gguf_file;
-
 
 /// A Qwen3.8-Flash-Next checkpoint: `qwen4_exp`, EXL3.
 pub fn detect(path: &Path) -> bool {
@@ -295,7 +286,6 @@ struct NgramTable {
 const ROW_DIM: usize = 160;
 const MUL1: u64 = 0x83DC_D12D;
 
-
 /// The 65536 decoded `mul1` values, as fp16 (bit-exact with EXL3's codebook).
 fn mul1_codebook() -> Vec<f32> {
     let k_inv = dsv41::formats::f16_to_f32(0x1eee);
@@ -500,20 +490,8 @@ struct FnMtp {
 /// one, as the checkpoint's f16 weights are; f32 otherwise.
 /// Without a card, f32 on `backend`.
 fn half_or_dense(card: Option<&Arc<Card>>, backend: &Arc<dyn Backend>, values: Vec<f32>, rows: usize, cols: usize) -> Weight {
-    #[cfg(feature = "cuda")]
-    if let Some(card) = card {
-        if cols % 2 == 0 && values.iter().all(|&v| round_f16(v) == v) {
-            return Weight::Packed(Arc::new(HalfMatrix::upload(card.clone(), &values, rows, cols)));
-        }
-    }
     let _ = card;
     Weight::Dense(backend.to_device(Tensor::from_vec(values, vec![rows, cols])))
-}
-
-#[cfg(feature = "cuda")]
-pub(crate) fn exl3_weight(idx: &StIndex, backend: &Arc<CudaBackend>, name: &str, k: usize, n: usize, input: Option<Vec<u32>>, output: Option<Vec<u32>>) -> Result<Weight> {
-    let data = exl3_data(idx, name, k, n, input, output)?;
-    Ok(Weight::Packed(Arc::new(Exl3Matrix::upload(backend.clone(), data).map_err(bad)?)))
 }
 
 /// The EXL3 matrix `name` (`k -> n`), read and checked, on the host.
@@ -712,42 +690,9 @@ fn mtp_layer(idx: &StIndex, cfg: &Config, last: &Loader<'_>, device: usize, make
     }))
 }
 
-/// Load the model, its layers split evenly over `devices` (in order).
-#[cfg(all(test, feature = "cuda"))]
-pub fn load(path: &Path, devices: &[usize]) -> Result<FlashNext> {
-    load_with_adapters(path, devices, &[])
-}
-
-/// As `load`, with LoRA adapters (from `Adapter::open_for` with `lora_base`) applied together.
-#[cfg(feature = "cuda")]
-pub(crate) fn load_with_adapters(path: &Path, devices: &[usize], lora: &[Adapter]) -> Result<FlashNext> {
-    let cfg = Config::read(path)?;
-    let ids: Vec<usize> = if devices.is_empty() { vec![0] } else { devices.to_vec() };
-    // Streams of their own, so that decode steps can run as graphs.
-    let cudas: Vec<Arc<CudaBackend>> = ids.iter().map(|&d| CudaBackend::new_graphable(d).map(Arc::new).map_err(|e| bad(e.to_string()))).collect::<Result<_>>()?;
-    let backends: Vec<Arc<dyn Backend>> = cudas.iter().map(|c| c.clone() as Arc<dyn Backend>).collect();
-    let packed = |d: usize| -> Box<dyn Fn(Exl3Data) -> std::result::Result<Arc<dyn PackedLinear>, String> + Send + Sync> {
-        let card = cudas[d].clone();
-        Box::new(move |data| Exl3Matrix::upload(card.clone(), data).map(|m| Arc::new(m) as Arc<dyn PackedLinear>))
-    };
-    let experts = |d: usize, m: &str, list: Vec<[Exl3Data; 3]>| -> Result<Box<dyn Experts>> {
-        let mut experts = Exl3Experts::upload(cudas[d].clone(), list).map_err(bad)?;
-        if !lora.is_empty() {
-            for which in 0..3 {
-                if let Some((slot_of, a, b, rank)) = expert_lora(lora, m, &cfg, which)? {
-                    experts.set_lora(which, &slot_of, &a, &b, rank).map_err(bad)?;
-                }
-            }
-        }
-        Ok(Box::new(experts))
-    };
-    build(path, backends, cudas.clone(), lora, &packed, &experts, false)
-}
-
 /// The bytes of Flash-Next's EXL3 matrices outside its experts (attention, delta-net, the head): a portable build keeps
 /// that much of the GPU budget for them, where the experts, loaded first, took it all and left the 248k-row head to the
 /// CPU.
-#[cfg_attr(feature = "cuda", allow(dead_code))]
 pub(crate) fn dense_exl3_bytes(path: &Path) -> Result<u64> {
     let idx = StIndex::open(path)?;
     Ok(idx.names().filter(|n| reserved(n)).filter_map(|n| idx.get(n).map(|i| i.nbytes)).sum())
@@ -756,7 +701,6 @@ pub(crate) fn dense_exl3_bytes(path: &Path) -> Result<u64> {
 /// Whether a tensor is one of the matrices `dense_exl3_bytes` keeps GPU budget for. Not the experts, and not the n-gram
 /// table: its rows are trellis-quantized too, but it is read from the disk as needed and never placed on the GPU, and
 /// counted (32.6 GB) it left the experts none of a 27 GiB budget.
-#[cfg_attr(feature = "cuda", allow(dead_code))]
 fn reserved(name: &str) -> bool {
     (name.ends_with(".trellis") && name.starts_with("model.language_model.") || name == "lm_head.trellis")
         && !name.contains(".experts.")
@@ -787,7 +731,6 @@ mod reserve_tests {
 /// the last), each EXL3 matrix as `packed` makes it on its device and each layer's experts as `experts` does (on any
 /// GPU through WebGPU, else on the CPU), no PEFT adapters, a decode step uncaptured. (A CUDA build loads it on the
 /// cards.)
-#[cfg_attr(feature = "cuda", allow(dead_code))]
 /// `mtp`: its multi-token-prediction layer too (on the last device), for drafting.
 pub(crate) fn load_portable(path: &Path, backends: Vec<Arc<dyn Backend>>, packed: Packer<'_>, experts: ExpertMaker<'_>, mtp: bool) -> Result<FlashNext> {
     build(path, backends, Vec::new(), &[], packed, experts, mtp)
@@ -3198,7 +3141,7 @@ impl FlashNext {
 fn graphs_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // Graphs are CUDA's: a build without it runs every step uncaptured.
-    *ON.get_or_init(|| cfg!(feature = "cuda") && std::env::var("FLASHNEXT_GRAPHS").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| false && std::env::var("FLASHNEXT_GRAPHS").map_or(true, |v| v != "0"))
 }
 
 /// Where a forward's time goes, when `FLASHNEXT_PROFILE` is set: each part synchronizes the
@@ -3243,139 +3186,6 @@ mod profile {
             }
             self.t = now;
         }
-    }
-}
-
-#[cfg(all(test, feature = "cuda"))]
-mod tests {
-    use super::*;
-
-    /// Against exllamav3 on the same checkpoint (see exl3-ref/reference.py): FLASHNEXT_MODEL,
-    /// FLASHNEXT_REFERENCE (its reference.json), FLASHNEXT_DEVICES (e.g. "0,1").
-    #[test]
-    #[ignore = "needs the checkpoint, two GPUs and a reference.json"]
-    fn matches_the_reference() {
-        let path = std::env::var("FLASHNEXT_MODEL").expect("FLASHNEXT_MODEL");
-        let reference = Json::parse(&std::fs::read(std::env::var("FLASHNEXT_REFERENCE").expect("FLASHNEXT_REFERENCE")).unwrap()).unwrap();
-        let devices: Vec<usize> = std::env::var("FLASHNEXT_DEVICES").unwrap_or_else(|_| "0,1".into()).split(',').map(|d| d.trim().parse().unwrap()).collect();
-        let list = |key: &str| reference.get(key).and_then(Json::as_array).unwrap().to_vec();
-        let ids: Vec<u32> = list("ids").iter().map(|v| v.as_f64().unwrap() as u32).collect();
-        let top: Vec<Vec<u32>> = list("top_ids").iter().map(|r| r.as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as u32).collect()).collect();
-        let top_logits: Vec<Vec<f32>> = list("top_logits").iter().map(|r| r.as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect()).collect();
-        let t = std::time::Instant::now();
-        let model = load(Path::new(&path), &devices).unwrap();
-        eprintln!("loaded in {:.1}s; {} tokens", t.elapsed().as_secs_f64(), ids.len());
-
-        // The n-gram features of the first positions.
-        let eos = model.config.ple_eos as i64;
-        let mut history = vec![eos; model.config.ngram - 1];
-        history.extend(ids.iter().map(|&t| t as i64));
-        let emb = model.ngram_embedding(&history).unwrap();
-        let want: Vec<Vec<f32>> = list("ngram_embedding_first").iter().map(|r| r.as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect()).collect();
-        let dim = model.config.ple_dim;
-        let worst = want.iter().enumerate().flat_map(|(r, row)| row.iter().enumerate().map(move |(i, w)| (r, i, *w)))
-            .map(|(r, i, w)| (emb[r * dim + i] - w).abs()).fold(0f32, f32::max);
-        eprintln!("n-gram features: largest difference {worst:.5}");
-
-        let compare = |pos: usize, logits: &Tensor| -> (bool, f32) {
-            let l = logits.data();
-            let mine = (0..l.len()).max_by(|&a, &b| l[a].total_cmp(&l[b])).unwrap() as u32;
-            let diff = top[pos].iter().zip(&top_logits[pos]).map(|(&i, &v)| (l[i as usize] - v).abs()).fold(0f32, f32::max);
-            (mine == top[pos][0], diff)
-        };
-        // Token by token: every position's prediction (a long prompt: prefill all but its last
-        // few, then those one at a time).
-        let mut kv = model.new_kv_cache(ids.len() + 8);
-        let (mut agree, mut worst) = (0, 0f32);
-        let first = if ids.len() > 256 { ids.len() - 8 } else { 0 };
-        let t = std::time::Instant::now();
-        for chunk in ids[..first].chunks(512) {
-            let e = model.embed_text(chunk).unwrap();
-            model.forward(chunk, &e, &mut kv, None).unwrap();
-        }
-        eprintln!("prefilled {first} tokens in {:.1}s", t.elapsed().as_secs_f64());
-        let t = std::time::Instant::now();
-        for (pos, &id) in ids.iter().enumerate().skip(first) {
-            let e = model.embed_text(&[id]).unwrap();
-            let logits = model.forward(&[id], &e, &mut kv, None).unwrap();
-            let (same, diff) = compare(pos, &logits);
-            agree += same as usize;
-            worst = worst.max(diff);
-            if !same || pos < 3 { eprintln!("  position {pos}: top-1 {} (reference {}), top-5 logit difference {diff:.3}", if same { "same" } else { "DIFFERENT" }, top[pos][0]); }
-        }
-        let n = ids.len() - first;
-        eprintln!("token by token: top-1 agrees at {agree}/{n} positions; largest top-5 logit difference {worst:.3}; {:.1} tokens/s", n as f64 / t.elapsed().as_secs_f64());
-        // All at once (prefill chunks): the last prediction.
-        if std::env::var("FLASHNEXT_SKIP_PREFILL").is_ok() { assert!(agree * 10 >= n * 9, "differs from the reference"); return; }
-        let mut kv = model.new_kv_cache(ids.len() + 8);
-        let t = std::time::Instant::now();
-        let mut logits = None;
-        for chunk in ids.chunks(512) {
-            let e = model.embed_text(chunk).unwrap();
-            logits = Some(model.forward(chunk, &e, &mut kv, None).unwrap());
-        }
-        let (same, diff) = compare(ids.len() - 1, &logits.unwrap());
-        eprintln!("prefill: last top-1 {}, top-5 logit difference {diff:.3}; {:.0} tokens/s", if same { "same" } else { "DIFFERENT" }, ids.len() as f64 / t.elapsed().as_secs_f64());
-        assert!(agree * 10 >= n * 9 && same, "differs from the reference");
-    }
-}
-
-#[cfg(all(test, feature = "cuda"))]
-mod bench {
-    use super::*;
-    /// Prefill and decode speed (FLASHNEXT_MODEL, FLASHNEXT_REFERENCE for its prompt ids,
-    /// FLASHNEXT_DEVICES; FLASHNEXT_PROFILE for where the time goes).
-    #[test]
-    #[ignore = "needs the checkpoint and two GPUs"]
-    fn speed() {
-        let path = std::env::var("FLASHNEXT_MODEL").expect("FLASHNEXT_MODEL");
-        let reference = Json::parse(&std::fs::read(std::env::var("FLASHNEXT_REFERENCE").expect("FLASHNEXT_REFERENCE")).unwrap()).unwrap();
-        let devices: Vec<usize> = std::env::var("FLASHNEXT_DEVICES").unwrap_or_else(|_| "0,1".into()).split(',').map(|d| d.trim().parse().unwrap()).collect();
-        let ids: Vec<u32> = reference.get("ids").and_then(Json::as_array).unwrap().iter().map(|v| v.as_f64().unwrap() as u32).collect();
-        let model = load(Path::new(&path), &devices).unwrap();
-        let n: usize = std::env::var("FLASHNEXT_DECODE").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
-        let mut kv = model.new_kv_cache(ids.len() + n + 8);
-        let t = std::time::Instant::now();
-        let mut logits = None;
-        for chunk in ids.chunks(512) {
-            let e = model.embed_text(chunk).unwrap();
-            logits = Some(model.forward(chunk, &e, &mut kv, None).unwrap());
-        }
-        eprintln!("prefill: {} tokens in {:.2}s ({:.0} tokens/s)", ids.len(), t.elapsed().as_secs_f64(), ids.len() as f64 / t.elapsed().as_secs_f64());
-        profile::print("prefill");
-        let mut logits = logits.unwrap();
-        profile::reset();
-        let t = std::time::Instant::now();
-        let mut out = Vec::new();
-        for _ in 0..n {
-            let l = logits.data();
-            let next = (0..l.len()).max_by(|&a, &b| l[a].total_cmp(&l[b])).unwrap() as u32;
-            out.push(next);
-            let e = model.embed_text(&[next]).unwrap();
-            logits = model.forward(&[next], &e, &mut kv, None).unwrap();
-        }
-        eprintln!("decode: {n} tokens in {:.2}s ({:.1} tokens/s): {:?}", t.elapsed().as_secs_f64(), n as f64 / t.elapsed().as_secs_f64(), model.tokenizer.decode(&out));
-    }
-}
-
-#[cfg(all(test, feature = "cuda"))]
-mod unload_tests {
-    fn used() -> String {
-        let out = std::process::Command::new("nvidia-smi").args(["--query-gpu=memory.used", "--format=csv,noheader"]).output().unwrap();
-        String::from_utf8_lossy(&out.stdout).replace('\n', " ")
-    }
-    /// A dropped model's GPU memory is free for the next (FLASHNEXT_UNLOAD_MODEL: an OrcaSAQ checkpoint).
-    #[test]
-    #[ignore = "needs a checkpoint and a GPU"]
-    fn unloading_frees_the_gpu() {
-        let path = std::env::var("FLASHNEXT_UNLOAD_MODEL").expect("FLASHNEXT_UNLOAD_MODEL");
-        let model = crate::orcasaq::load(std::path::Path::new(&path), &[0]).unwrap();
-        eprintln!("loaded: {}", used());
-        // Dropped where engines drop their models: another thread, with no context bound.
-        std::thread::spawn(move || drop(model)).join().unwrap();
-        eprintln!("dropped on another thread: {}", used());
-        let first = |s: String| s.split_whitespace().next().unwrap().parse::<u64>().unwrap();
-        assert!(first(used()) < 2048, "the model's GPU memory was not released");
     }
 }
 

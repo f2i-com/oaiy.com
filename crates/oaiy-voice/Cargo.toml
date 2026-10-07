@@ -17,6 +17,3 @@ oaiy-tts = { path = "../oaiy-tts" }
 
 [features]
 default = []
-cuda = ["candle-core/cuda", "candle-nn/cuda", "oaiy-tts/cuda"]
-# Faster attention for the speech model (as oaiy-media builds it).
-flash-attn = ["cuda", "oaiy-tts/flash-attn"]

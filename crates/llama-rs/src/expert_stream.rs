@@ -579,23 +579,6 @@ pub struct StreamShared {
     /// First fetch/reconstruction failure, for the infallible-forward
     /// error channel (see module docs).
     error: Mutex<Option<String>>,
-    /// VENDORED-LOCAL (CACHE-02): the VRAM expert cache, when the model
-    /// streams on a CUDA backend and `--vram-cache` enabled it. Set once
-    /// after open, before generation; read per layer-forward.
-    #[cfg(feature = "cuda")]
-    device: Mutex<Option<Arc<device_cache::DeviceCache>>>,
-    /// VENDORED-LOCAL: GLM-5.3-Flash. One VRAM expert cache per GPU, and which
-    /// one each layer uses.
-    ///
-    /// A cache lives on exactly one card, and a kernel can only read the card it
-    /// was launched on, so spanning two GPUs means partitioning by layer: a
-    /// layer's experts are cached on the card that runs that layer's expert FFN.
-    /// `shard_of[layer]` indexes `shards`. Empty means the single-cache path
-    /// above, which is what every other architecture here uses.
-    #[cfg(feature = "cuda")]
-    shards: Mutex<Vec<Arc<device_cache::DeviceCache>>>,
-    #[cfg(feature = "cuda")]
-    shard_of: Mutex<Vec<usize>>,
     /// VENDORED-LOCAL: GLM-5.3-Flash. Whether the RAM tier drops what VRAM takes.
     ///
     /// Off, a record admitted to VRAM stays in RAM too, so the two tiers hold
@@ -639,139 +622,8 @@ impl StreamShared {
             cache: Ecache::new(cache_budget_bytes, rec, oaiy_engine::types::CachePolicy::Lfru),
             resident_est_bytes,
             error: Mutex::new(None),
-            #[cfg(feature = "cuda")]
-            device: Mutex::new(None),
-            #[cfg(feature = "cuda")]
-            shards: Mutex::new(Vec::new()),
-            #[cfg(feature = "cuda")]
-            shard_of: Mutex::new(Vec::new()),
             exclusive_tiers: std::env::var("GLM5_EXCLUSIVE_TIERS").ok().as_deref() == Some("1"),
         }))
-    }
-
-    /// VENDORED-LOCAL (CACHE-02): attach a VRAM expert cache over `backend`.
-    /// The model's forward backend must be this same `CudaBackend` — the
-    /// entries' device tensors are only zero-copy for the backend that
-    /// created them. Call once after open, before generation; without this
-    /// the streaming path behaves exactly as before (per-dispatch uploads).
-    #[cfg(feature = "cuda")]
-    pub fn enable_device_cache(
-        &self,
-        backend: Arc<ggml_rs_cuda::CudaBackend>,
-        budget_bytes: usize,
-    ) -> Result<(), String> {
-        let dc = device_cache::DeviceCache::new(backend, budget_bytes, self.store.record_bytes())?;
-        *self.device.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(dc));
-        Ok(())
-    }
-
-    // VENDORED-LOCAL: GLM-5.3-Flash. Span the expert tier over several GPUs.
-    /// One VRAM expert cache per backend in `backends`, each with
-    /// `budget_bytes_each`, and `shard_of[layer]` naming which card runs that
-    /// layer -- so a layer's experts are cached on the card that computes them.
-    ///
-    /// Two RTX 5090s hold 32 GB each. The trunk measures 5.97 GB and sits on card
-    /// 0, so card 0 can spare ~24 GB and card 1 nearly all of its 32: roughly
-    /// 3 400 records of the 12 096 at 16.32 MB a slot, against ~1 500 on one
-    /// card. Partitioning contiguously also means each card sees the same layers
-    /// on every token, so its LFRU set converges instead of thrashing.
-    #[cfg(feature = "cuda")]
-    pub fn enable_device_shards(
-        &self,
-        backends: &[Arc<ggml_rs_cuda::CudaBackend>],
-        budgets: &[usize],
-        shard_of: Vec<usize>,
-    ) -> Result<(), String> {
-        if backends.is_empty() {
-            return Err("expert stream: no backends for the VRAM tier".into());
-        }
-        if budgets.len() != backends.len() {
-            return Err(format!(
-                "expert stream: {} budgets for {} cards",
-                budgets.len(),
-                backends.len()
-            ));
-        }
-        if let Some(&bad) = shard_of.iter().find(|&&s| s >= backends.len()) {
-            return Err(format!(
-                "expert stream: layer assigned to card {bad}, only {} given",
-                backends.len()
-            ));
-        }
-        let rec = self.store.record_bytes();
-        let mut built = Vec::with_capacity(backends.len());
-        for (b, &budget) in backends.iter().zip(budgets) {
-            built.push(Arc::new(device_cache::DeviceCache::new(
-                Arc::clone(b),
-                budget,
-                rec,
-            )?));
-        }
-        // The first shard also answers `device_cache()`, so anything that has not
-        // learned about sharding keeps working.
-        *self.device.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&built[0]));
-        *self.shards.lock().unwrap_or_else(|e| e.into_inner()) = built;
-        *self.shard_of.lock().unwrap_or_else(|e| e.into_inner()) = shard_of;
-        Ok(())
-    }
-
-    /// The VRAM expert cache that serves `layer`.
-    #[cfg(feature = "cuda")]
-    pub fn device_cache_for(&self, layer: u32) -> Option<Arc<device_cache::DeviceCache>> {
-        let map = self.shard_of.lock().unwrap_or_else(|e| e.into_inner());
-        match map.get(layer as usize).copied() {
-            Some(i) => self
-                .shards
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(i)
-                .map(Arc::clone),
-            None => self.device_cache(),
-        }
-    }
-
-    /// Every VRAM shard, for the per-token frequency aging.
-    #[cfg(feature = "cuda")]
-    pub fn shards_for_aging(&self) -> Vec<Arc<device_cache::DeviceCache>> {
-        let shards = self.shards.lock().unwrap_or_else(|e| e.into_inner());
-        if !shards.is_empty() {
-            return shards.iter().map(Arc::clone).collect();
-        }
-        drop(shards);
-        self.device_cache().into_iter().collect()
-    }
-
-    /// Per-card VRAM tier statistics, in card order. Empty when not sharded.
-    #[cfg(feature = "cuda")]
-    pub fn shard_stats(&self) -> Vec<device_cache::DeviceCacheStats> {
-        self.shards
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .map(|d| d.stats())
-            .collect()
-    }
-
-    /// Test hook: attach an already-built cache (lets tests force the
-    /// staging order via `DeviceCache::set_eager`).
-    #[cfg(all(test, feature = "cuda"))]
-    pub(crate) fn enable_device_cache_with(&self, dc: Arc<device_cache::DeviceCache>) {
-        *self.device.lock().unwrap_or_else(|e| e.into_inner()) = Some(dc);
-    }
-
-    /// The VRAM expert cache, if enabled (CACHE-02).
-    #[cfg(feature = "cuda")]
-    pub fn device_cache(&self) -> Option<Arc<device_cache::DeviceCache>> {
-        self.device
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-    }
-
-    /// Device-cache counters; `None` when no VRAM cache is attached.
-    #[cfg(feature = "cuda")]
-    pub fn device_cache_stats(&self) -> Option<device_cache::DeviceCacheStats> {
-        self.device_cache().map(|dc| dc.stats())
     }
 
     /// Per-layer handle for a block's `MoeFfn`.
@@ -925,43 +777,8 @@ impl LayerStream {
         experts: &[u32],
         // Only the VRAM tier promotes, so without `cuda` there is nothing to
         // promote into.
-        #[cfg_attr(not(feature = "cuda"), allow(unused_variables))] promote: usize,
+        #[allow(unused_variables)] promote: usize,
     ) -> Result<Vec<ResolvedExpert>, String> {
-        #[cfg(feature = "cuda")]
-        if let Some(dc) = self.shared.device_cache_for(self.layer) {
-            let mut distinct = experts.to_vec();
-            distinct.sort_unstable();
-            distinct.dedup();
-
-            let mut d = DeviceDispatch::new(dc.clone());
-            // Counts the accesses and tells us which are resident.
-            let misses = d.lookup_all(self.layer, &distinct);
-            self.prewarm_host(&misses);
-
-            // Rank the misses by how often they have been wanted, and admit the top
-            // `promote`. `freq` survives eviction, so a returning hot expert is
-            // ranked on what it earned.
-            let mut ranked = misses.clone();
-            ranked.sort_by_key(|&e| std::cmp::Reverse(dc.freq(self.layer, e)));
-            let admit: Vec<u32> = ranked.into_iter().take(promote).collect();
-            if !admit.is_empty() {
-                d.stage_misses(self, &admit)?;
-            }
-
-            let mut out = Vec::with_capacity(experts.len());
-            for &e in experts {
-                if misses.contains(&e) && !admit.contains(&e) {
-                    out.push(ResolvedExpert::Cpu(self.host_record(e)?));
-                    continue;
-                }
-                match d.resolve(self, e)? {
-                    Some(en) => out.push(ResolvedExpert::Device(en)),
-                    // Staging declined: the CPU can still have it.
-                    None => out.push(ResolvedExpert::Cpu(self.host_record(e)?)),
-                }
-            }
-            return Ok(out);
-        }
 
         // No VRAM tier: everything the CPU can take, it takes.
         self.prewarm_host(experts);
@@ -980,43 +797,6 @@ impl LayerStream {
     }
 
     pub(crate) fn resolve_experts(&self, experts: &[u32]) -> Result<Vec<ResolvedExpert>, String> {
-        // No `set_scan_layer` here, deliberately -- see [`StreamShared::set_scan_layer`].
-        #[cfg(feature = "cuda")]
-        if let Some(dc) = self.shared.device_cache_for(self.layer) {
-            // MoE ordinal 0 is reached exactly once per token, which is the token
-            // boundary the frequency aging needs. Every shard ages on it, not just
-            // the one that owns layer 0, or the other cards would never age.
-            if self.layer == 0 {
-                for d in self.shared.shards_for_aging() {
-                    d.tick_token();
-                }
-            }
-            let mut distinct = experts.to_vec();
-            distinct.sort_unstable();
-            distinct.dedup();
-
-            let mut d = DeviceDispatch::new(dc);
-            if d.eager() {
-                let misses = d.lookup_all(self.layer, &distinct);
-                self.prewarm_host(&misses);
-                d.stage_misses(self, &misses)?;
-            } else {
-                self.prewarm_host(&distinct);
-            }
-
-            let mut out = Vec::with_capacity(experts.len());
-            for &e in experts {
-                match d.resolve(self, e)? {
-                    Some(en) => out.push(ResolvedExpert::Device(en)),
-                    // Staging declined or failed: the host record still works.
-                    None => {
-                        let (pair, down) = self.expert_weights(e)?;
-                        out.push(ResolvedExpert::Host { pair, down });
-                    }
-                }
-            }
-            return Ok(out);
-        }
         self.prewarm_host(experts);
         experts
             .iter()
@@ -1166,25 +946,6 @@ impl LayerStream {
 
         let mut output = backend.alloc_zeros(vec![seq, hidden]);
 
-        // Route. CUDA: ids+weights computed on device (`dev_routing`); the
-        // ids mailbox is the staging miss list. Host weights are pulled
-        // lazily — only the reference dispatch loop needs them.
-        #[cfg(feature = "cuda")]
-        let cuda = backend
-            .as_any()
-            .downcast_ref::<ggml_rs_cuda::CudaBackend>();
-        #[cfg(feature = "cuda")]
-        let dev_routing =
-            cuda.and_then(|c| c.moe_route_device(router_logits, top_k));
-        #[cfg(feature = "cuda")]
-        let (ids_flat, mut w_flat): (Vec<u32>, Option<Vec<f32>>) = match &dev_routing {
-            Some(r) => (r.ids_to_host(), None),
-            None => {
-                let (i, w) = backend.moe_route_topk(router_logits, top_k);
-                (i, Some(w))
-            }
-        };
-        #[cfg(not(feature = "cuda"))]
         let (ids_flat, w_flat): (Vec<u32>, Option<Vec<f32>>) = {
             let (i, w) = backend.moe_route_topk(router_logits, top_k);
             (i, Some(w))
@@ -1196,79 +957,8 @@ impl LayerStream {
         distinct.sort_unstable();
         distinct.dedup();
 
-        // VENDORED-LOCAL (CACHE-02 / STREAM-01): VRAM expert cache. With a
-        // device cache attached, routed experts resolve to device-resident
-        // tensors: a HIT launches the matvec against VRAM with zero H2D
-        // bytes; a MISS is staged through the pinned ring onto the transfer
-        // stream and admitted, then its ticket is waited once before the
-        // first matvec that reads it. Without one (CPU backend, or no
-        // --vram-cache) the flow is exactly the pre-CACHE-02 one.
-        #[cfg(feature = "cuda")]
-        let mut dev: Option<DeviceDispatch> = match self.shared.device_cache() {
-            Some(dc) => {
-                let mut d = DeviceDispatch::new(dc);
-                if d.eager() {
-                    // Whole-layer prefetch: look every routed expert up
-                    // (counting the hits/misses), host-prewarm ONLY the
-                    // device misses in one batched read, then stage every
-                    // miss's upload on the transfer stream BEFORE the
-                    // layer's first matvec. Compute below walks the routed
-                    // order waiting one upload ticket per expert — never a
-                    // device-wide sync.
-                    let misses = d.lookup_all(self.layer, &distinct);
-                    self.prewarm_host(&misses);
-                    if let Err(msg) = d.stage_misses(self, &misses) {
-                        self.shared.record_error(msg);
-                        return output;
-                    }
-                } else {
-                    // Lazy order: each miss uploads right before its first
-                    // compute (the classic i / i+1 pipeline). Host records
-                    // are still batch-prewarmed; only the H2D timing differs.
-                    self.prewarm_host(&distinct);
-                }
-                Some(d)
-            }
-            None => {
-                self.prewarm_host(&distinct);
-                None
-            }
-        };
-        #[cfg(not(feature = "cuda"))]
         self.prewarm_host(&distinct);
 
-        // MOE-02 grouped fast path: single-token decode, SwiGLU without
-        // per-expert output scales, every routed expert device-resident and
-        // kernel-eligible → one grouped call for the whole layer.
-        #[cfg(feature = "cuda")]
-        if seq == 1
-            && !opts.use_gelu
-            && opts.down_exps_scale_host.is_none()
-            && crate::moe_cuda::grouped_enabled()
-        {
-            if let (Some(c), Some(r), Some(d)) = (cuda, &dev_routing, dev.as_mut()) {
-                match self.try_grouped_cuda(c, r, d, x, &ids_flat, hidden) {
-                    Ok(Some(out)) => return out,
-                    Ok(None) => {} // not eligible — reference loop below
-                    Err(msg) => {
-                        self.shared.record_error(msg);
-                        return output;
-                    }
-                }
-            }
-        }
-
-        // Reference per-(token, expert) dispatch. Host routing weights are
-        // needed here; pull the weights mailbox when routing ran on device.
-        #[cfg(feature = "cuda")]
-        if w_flat.is_none() {
-            w_flat = Some(
-                dev_routing
-                    .as_ref()
-                    .expect("device routing present when weights not yet pulled")
-                    .weights_to_host(),
-            );
-        }
         let w_flat = w_flat.expect("routing weights available");
 
         for t in 0..seq {
@@ -1280,20 +970,6 @@ impl LayerStream {
                 let idx = *idx as usize;
                 let e = idx as u32;
                 let host_w;
-                #[cfg(feature = "cuda")]
-                let dev_w = match dev.as_mut() {
-                    Some(d) => match d.resolve(self, e) {
-                        Ok(v) => v,
-                        Err(msg) => {
-                            self.shared.record_error(msg);
-                            return output; // zeros from this token on; caller checks error()
-                        }
-                    },
-                    None => None,
-                };
-                #[cfg(feature = "cuda")]
-                let dev_pd = dev_w.as_ref().map(|en| (&en.pair, &en.down));
-                #[cfg(not(feature = "cuda"))]
                 let dev_pd: Option<(&FfnPair, &Weight)> = None;
                 let (pair, down) = match dev_pd {
                     Some((p, d)) => (p, d),
@@ -1324,96 +1000,6 @@ impl LayerStream {
         output
     }
 
-    /// MOE-02 grouped streaming dispatch. Resolves every routed expert to a
-    /// device-cache entry (staging lazy misses on the way), builds the
-    /// layer's pointer table over them — one small H2D covering all k
-    /// experts — and runs the grouped kernels against the device-resident
-    /// routing. `Ok(None)` = some expert can't participate (host fallback
-    /// or kernel-ineligible dtype/geometry); the caller runs the reference
-    /// loop, which reuses the memoized leases.
-    ///
-    /// The pointer table is sized `2 * n_experts` (gate_up | down, indexed
-    /// by expert id) with only the k routed entries filled — the kernels
-    /// only ever read routed entries, and one flat upload beats k small
-    /// ones on WDDM.
-    #[cfg(feature = "cuda")]
-    fn try_grouped_cuda(
-        &self,
-        cuda: &ggml_rs_cuda::CudaBackend,
-        routing: &ggml_rs_cuda::MoeRoutingDevice,
-        d: &mut DeviceDispatch,
-        x: &Tensor,
-        ids: &[u32],
-        hidden: usize,
-    ) -> Result<Option<Tensor>, String> {
-        let n_experts = self.shared.n_experts();
-        let mut gu_tab = vec![0u64; n_experts];
-        let mut dn_tab = vec![0u64; n_experts];
-        let mut gu_dt: Option<GgmlType> = None;
-        let mut dn_dt: Option<GgmlType> = None;
-        let mut ff = 0usize;
-        // Keep the entry Arcs alive until after the launches are enqueued:
-        // DeviceEntry::drop orders its frees behind the compute stream's
-        // queued work (the PERF-02 discipline), so dropping the leases only
-        // after `moe_grouped_ffn` returns keeps the read→free edge correct.
-        let mut entries = Vec::with_capacity(ids.len());
-        for &e in ids {
-            let en = match d.resolve(self, e)? {
-                Some(en) => en,
-                None => return Ok(None), // host-path expert — not groupable
-            };
-            let crate::loader::FfnPair::Fused(Weight::Quant(gu)) = &en.pair else {
-                return Ok(None);
-            };
-            let Weight::Quant(dn) = &en.down else { return Ok(None) };
-            if gu.shape().len() != 2 || dn.shape().len() != 2 || gu.dim(0) % 2 != 0 {
-                return Ok(None);
-            }
-            let f = gu.dim(0) / 2;
-            let h = gu.dim(1);
-            if h != hidden || dn.dim(0) != h || dn.dim(1) != f {
-                return Ok(None);
-            }
-            if ff == 0 {
-                ff = f;
-            } else if ff != f {
-                return Ok(None);
-            }
-            match gu_dt {
-                Some(dt) if dt != gu.dtype() => return Ok(None),
-                None => gu_dt = Some(gu.dtype()),
-                _ => {}
-            }
-            match dn_dt {
-                Some(dt) if dt != dn.dtype() => return Ok(None),
-                None => dn_dt = Some(dn.dtype()),
-                _ => {}
-            }
-            let (Some(gup), Some(dnp)) = (
-                ggml_rs_cuda::quant_device_ptr(gu),
-                ggml_rs_cuda::quant_device_ptr(dn),
-            ) else {
-                return Ok(None);
-            };
-            gu_tab[e as usize] = gup;
-            dn_tab[e as usize] = dnp;
-            entries.push(en);
-        }
-        let (Some(gu_dt), Some(dn_dt)) = (gu_dt, dn_dt) else {
-            return Ok(None);
-        };
-        if !ggml_rs_cuda::grouped_kernel_covers(gu_dt, hidden)
-            || !ggml_rs_cuda::grouped_kernel_covers(dn_dt, ff)
-        {
-            return Ok(None);
-        }
-        let plan = ggml_rs_cuda::MoeDevicePlan::new(
-            cuda, &gu_tab, &dn_tab, None, gu_dt, dn_dt, ff, hidden, false,
-        );
-        let out = cuda.moe_grouped_ffn(x, &plan, routing);
-        drop(entries);
-        Ok(Some(out))
-    }
 }
 
 /// VENDORED-LOCAL: GLM-5.3-Flash. One expert of one layer, resolved.
@@ -1422,8 +1008,6 @@ impl LayerStream {
 /// matvec launches with zero host-to-device bytes. `Host` is a reconstruction
 /// over the leased RAM record, which is what every dispatch used to be.
 pub(crate) enum ResolvedExpert {
-    #[cfg(feature = "cuda")]
-    Device(Arc<device_cache::DeviceEntry>),
     Host { pair: FfnPair, down: Weight },
     /// VENDORED-LOCAL: GLM-5.3-Flash. A VRAM miss whose record is in RAM, left
     /// there on purpose: computing it on the CPU costs less than the PCIe copy
@@ -1435,25 +1019,8 @@ impl ResolvedExpert {
     /// The GPU-side weights, or `None` for an expert bound for the CPU.
     pub(crate) fn gpu(&self) -> Option<(&FfnPair, &Weight)> {
         match self {
-            #[cfg(feature = "cuda")]
-            Self::Device(en) => Some((&en.pair, &en.down)),
             Self::Host { pair, down } => Some((pair, down)),
             Self::Cpu(_) => None,
-        }
-    }
-
-    /// The leased record, for an expert bound for the CPU.
-    /// The VRAM-cache entry, when this expert has one.
-    ///
-    /// Narrower than [`Self::gpu`], which also answers for `Host`: a `Host`
-    /// expert's matvec runs on the card but its weights are in RAM and upload as
-    /// they are read, so it has no device address and cannot join a grouped
-    /// dispatch. Only `Device` can.
-    #[cfg(feature = "cuda")]
-    pub(crate) fn device_entry(&self) -> Option<&Arc<device_cache::DeviceEntry>> {
-        match self {
-            Self::Device(en) => Some(en),
-            _ => None,
         }
     }
 
@@ -1461,117 +1028,6 @@ impl ResolvedExpert {
         match self {
             Self::Cpu(l) => Some(l),
             _ => None,
-        }
-    }
-}
-
-/// VENDORED-LOCAL (CACHE-02 / STREAM-01): per-layer-forward device dispatch
-/// state. Holds the VRAM cache plus this forward's leases: an entry looked
-/// up or staged once is reused for every token routed to the same expert in
-/// this forward, so the cache sees each distinct expert at most once per
-/// layer-forward.
-#[cfg(feature = "cuda")]
-struct DeviceDispatch {
-    dc: Arc<device_cache::DeviceCache>,
-    leases: std::collections::HashMap<u32, Arc<device_cache::DeviceEntry>>,
-}
-
-#[cfg(feature = "cuda")]
-impl DeviceDispatch {
-    fn new(dc: Arc<device_cache::DeviceCache>) -> Self {
-        Self {
-            dc,
-            leases: std::collections::HashMap::new(),
-        }
-    }
-
-    fn eager(&self) -> bool {
-        self.dc.is_eager()
-    }
-
-    /// Look every routed expert up, memoizing hits; return the misses.
-    fn lookup_all(&mut self, layer: u32, experts: &[u32]) -> Vec<u32> {
-        let mut misses = Vec::new();
-        for &e in experts {
-            match self.dc.acquire(layer, e) {
-                Some(en) => {
-                    self.leases.insert(e, en);
-                }
-                None => misses.push(e),
-            }
-        }
-        misses
-    }
-
-    /// Host-acquire expert `e`'s record (a host-cache hit after prewarm,
-    /// else a fetch) and stage its upload into the device cache. Staging
-    /// failures (pinned-alloc errors) are not fatal: the expert is left out
-    /// of the lease map and the dispatch loop falls back to the host path
-    /// for it. Experts whose dtype needs the dequantize fallback stay on
-    /// the host path by design.
-    fn stage_one(&mut self, ls: &LayerStream, e: u32) -> Result<(), String> {
-        let lease = ls
-            .shared
-            .cache
-            .acquire(ls.layer, e, &ls.shared.store)
-            .map_err(|err| format!("expert {e} of layer {}: {err}", ls.layer))?;
-        let plan = record_plan(ls.shared.store.layout(), ls.layer as usize);
-        if !plan.packed {
-            return Ok(());
-        }
-        match self.dc.stage_and_admit(ls.layer, e, &lease, &plan) {
-            Ok(en) => {
-                self.leases.insert(e, en);
-                // VENDORED-LOCAL: GLM-5.3-Flash. Exclusive tiers.
-                //
-                // VRAM owns this record now, so RAM need not. `stage_and_admit`
-                // copied the bytes into the pinned slot before returning, so the
-                // lease has done its job -- and it has to be dropped first, because
-                // `Ecache::remove` refuses an entry something still holds.
-                if ls.shared.exclusive_tiers {
-                    drop(lease);
-                    ls.shared.cache.remove(ls.layer, e);
-                }
-            }
-            Err(_) => self.dc.note_stage_failure(),
-        }
-        Ok(())
-    }
-
-    /// Eager half of STREAM-01: stage every miss's upload before the
-    /// layer's first matvec.
-    fn stage_misses(&mut self, ls: &LayerStream, misses: &[u32]) -> Result<(), String> {
-        for &e in misses {
-            self.stage_one(ls, e)?;
-        }
-        Ok(())
-    }
-
-    /// Resolve expert `e` for compute: memoized lease, cache hit, or (lazy
-    /// mode / an expert eager staging skipped) a stage on first use. The
-    /// entry's upload tickets are waited once here, before its first
-    /// matvec. `Ok(None)` = use the host path for this expert.
-    fn resolve(
-        &mut self,
-        ls: &LayerStream,
-        e: u32,
-    ) -> Result<Option<Arc<device_cache::DeviceEntry>>, String> {
-        if let Some(en) = self.leases.get(&e) {
-            self.dc.ensure_ready(en);
-            return Ok(Some(Arc::clone(en)));
-        }
-        if let Some(en) = self.dc.acquire(ls.layer, e) {
-            self.dc.ensure_ready(&en);
-            self.leases.insert(e, Arc::clone(&en));
-            return Ok(Some(en));
-        }
-        self.stage_one(ls, e)?;
-        match self.leases.get(&e) {
-            Some(en) => {
-                self.dc.ensure_ready(en);
-                Ok(Some(Arc::clone(en)))
-            }
-            None => Ok(None),
         }
     }
 }
@@ -1603,58 +1059,6 @@ fn make_weight(
         .map_err(|e| format!("dequantize {dtype:?} expert slice: {e}"))?;
     Ok(Weight::Dense(Tensor::from_vec(out, shape.to_vec())))
 }
-
-/// Per-layer plan for rebuilding an expert's `(FfnPair, down Weight)` from
-/// its record — the lengths/dtypes/shapes both the host reconstruction
-/// ([`LayerStream::expert_weights`]) and the device staging path
-/// ([`device_cache::DeviceCache::stage_and_admit`]) must agree on.
-///
-/// `fused` mirrors the host path's fused-view decision exactly: the bytes at
-/// `record[0 .. glen+ulen]` ARE the fused gate‖up tensor when the gate
-/// region is unpadded, the halves share dtype and shape, and the dtype has a
-/// packed matvec. `packed` is false when any part needs the dequantize
-/// fallback — such experts stay on the host path (never staged to VRAM).
-///
-// VENDORED-LOCAL (CACHE-02).
-#[cfg(feature = "cuda")]
-#[derive(Debug, Clone)]
-pub(crate) struct RecordPlan {
-    pub fused: bool,
-    pub packed: bool,
-    /// (record offset, byte len, dtype, shape) per part.
-    pub gate: (usize, usize, GgmlType, [usize; 2]),
-    pub up: (usize, usize, GgmlType, [usize; 2]),
-    pub down: (usize, usize, GgmlType, [usize; 2]),
-}
-
-#[cfg(feature = "cuda")]
-pub(crate) fn record_plan(layout: &ExpertLayout, l: usize) -> RecordPlan {
-    let g = layout.gate.max_per_expert_bytes;
-    let u = layout.up.max_per_expert_bytes;
-    let (glen, ulen, dlen) = (
-        layout.gate.per_expert_bytes[l],
-        layout.up.per_expert_bytes[l],
-        layout.down.per_expert_bytes[l],
-    );
-    let (gd, ud, dd) = (layout.gate.dtypes[l], layout.up.dtypes[l], layout.down.dtypes[l]);
-    let fused = glen == g
-        && gd == ud
-        && layout.gate.shape == layout.up.shape
-        && dtype_supports_packed_matmul(gd);
-    let packed = dtype_supports_packed_matmul(gd)
-        && dtype_supports_packed_matmul(ud)
-        && dtype_supports_packed_matmul(dd);
-    RecordPlan {
-        fused,
-        packed,
-        gate: (0, glen, gd, layout.gate.shape),
-        up: (g, ulen, ud, layout.up.shape),
-        down: (g + u, dlen, dd, layout.down.shape),
-    }
-}
-
-#[cfg(feature = "cuda")]
-pub mod device_cache;
 
 #[cfg(test)]
 mod tests;

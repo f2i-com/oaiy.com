@@ -14,9 +14,6 @@
 //! A future fused-MoE CUDA kernel (one launch handles routing + dispatch +
 //! reduction) is the speedup path.
 
-#[cfg(feature = "cuda")]
-use std::sync::Arc;
-
 use ggml_rs::{Backend, Tensor};
 
 use crate::loader::Weight;
@@ -93,13 +90,6 @@ pub struct MoeFfn {
     /// experts are read per dispatch from the .gguf file through a bounded
     /// cache. Resident models leave this `None`.
     pub stream: Option<crate::expert_stream::LayerStream>,
-    /// VENDORED-LOCAL: MOE-02 — lazily-built CUDA grouped-decode plan
-    /// (static per-layer pointer tables; see `moe_cuda.rs`). `OnceLock`
-    /// because eligibility is decided on the first decode forward, when the
-    /// backend and the weights' final placement are known; `None` inside
-    /// means "checked, not eligible" (fall back to the reference loop).
-    #[cfg(feature = "cuda")]
-    pub(crate) gpu_plan: std::sync::OnceLock<Option<Arc<crate::moe_cuda::GpuLayerPlan>>>,
 }
 
 impl MoeFfn {
@@ -120,10 +110,6 @@ impl MoeFfn {
                                   .map(|w| w.try_to_device(backend, safety_margin_bytes)).collect(),
             top_k:            self.top_k,
             stream:           self.stream,
-            // Weights may have changed placement — rebuild the grouped plan
-            // against their new storage on first use.
-            #[cfg(feature = "cuda")]
-            gpu_plan:         std::sync::OnceLock::new(),
         }
     }
 }
@@ -196,15 +182,6 @@ pub fn moe_forward_with_logits(
     // same backend ops, only the weight storage differs.
     if let Some(stream) = &moe.stream {
         return stream.forward_with_logits(backend, x, router_logits, moe.top_k, opts);
-    }
-    // VENDORED-LOCAL: MOE-02 — grouped CUDA decode: routing stays on device
-    // and the layer's k expert FFNs run as 3 kernel launches (see
-    // moe_cuda.rs). `None` → reference loop below (non-CUDA backend,
-    // prefill, or an ineligible layer).
-    #[cfg(feature = "cuda")]
-    if let Some(out) = crate::moe_cuda::try_grouped_forward(backend, x, moe, router_logits, opts)
-    {
-        return out;
     }
     let seq = x.dim(0);
     let hidden = x.dim(1);
@@ -337,8 +314,6 @@ mod tests {
         }
 
         let moe = MoeFfn { router, gate_up_experts, down_experts, top_k, stream: None,
-            #[cfg(feature = "cuda")]
-            gpu_plan: std::sync::OnceLock::new(),
         };
 
         // Reference: run expert 2's FFN by hand using the pre-fusion gate/up
@@ -363,136 +338,4 @@ mod tests {
         }
     }
 
-    // VENDORED-LOCAL: MOE-01/MOE-02 — end-to-end check that the grouped CUDA
-    // path through `moe_forward` (plan build, on-device routing, grouped
-    // kernels) matches the CPU reference loop on the same weights.
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn moe_forward_cuda_grouped_matches_cpu() {
-        use ggml_quants::GgmlType;
-        use ggml_rs::{Backend, CpuBackend, QuantizedTensor};
-
-        let cuda = match ggml_rs_cuda::CudaBackend::new(0) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("[skipping] CUDA init failed: {e}");
-                return;
-            }
-        };
-        let cpu = CpuBackend::new();
-
-        let hidden = 256usize;
-        let ff = 768usize;
-        let n_experts = 6usize;
-        let top_k = 3usize;
-
-        // Deterministic pseudo-random bytes / floats (no external crates).
-        struct Sm(u64);
-        impl Sm {
-            fn next(&mut self) -> u64 {
-                self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
-                let mut z = self.0;
-                z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-                z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-                z ^ (z >> 31)
-            }
-            fn f32(&mut self, scale: f32) -> f32 {
-                (((self.next() >> 40) & 0xFF) as f32 / 255.0 - 0.5) * scale
-            }
-        }
-        let mut rng = Sm(0x1234_5678_9abc_def0);
-
-        // Q8_0 experts: [2ff, hidden] fused gate‖up + [hidden, ff] down per
-        // expert, random packed bytes with small scales (dequant is
-        // deterministic from the bytes — that's all the kernels read).
-        let small_d = half::f16::from_f32(0.01).to_bits().to_le_bytes();
-        let quant_bytes = |rows: usize, k: usize, rng: &mut Sm| {
-            let bpr = k / 32;
-            let mut bytes: Vec<u8> =
-                (0..rows * bpr * 34).map(|_| rng.next() as u8).collect();
-            for row in 0..rows {
-                for blk in 0..bpr {
-                    let off = (row * bpr + blk) * 34;
-                    bytes[off..off + 2].copy_from_slice(&small_d);
-                }
-            }
-            bytes
-        };
-
-        // Generate the weights ONCE so both backends see identical tensors.
-        let router_data: Vec<f32> = (0..n_experts * hidden).map(|_| rng.f32(0.5)).collect();
-        let gu_bytes: Vec<Vec<u8>> = (0..n_experts)
-            .map(|_| quant_bytes(2 * ff, hidden, &mut rng))
-            .collect();
-        let dn_bytes: Vec<Vec<u8>> = (0..n_experts)
-            .map(|_| quant_bytes(hidden, ff, &mut rng))
-            .collect();
-        let x_data: Vec<f32> = (0..hidden).map(|_| rng.f32(1.0)).collect();
-
-        let build_moe = |backend: &dyn Backend| {
-            let router = Weight::Dense(backend.to_device(Tensor::from_vec(
-                router_data.clone(),
-                vec![n_experts, hidden],
-            )));
-            let mut gate_up_experts = Vec::with_capacity(n_experts);
-            let mut down_experts = Vec::with_capacity(n_experts);
-            for e in 0..n_experts {
-                let gu = QuantizedTensor::from_bytes_cpu(
-                    gu_bytes[e].clone(),
-                    vec![2 * ff, hidden],
-                    GgmlType::Q8_0,
-                );
-                let dn = QuantizedTensor::from_bytes_cpu(
-                    dn_bytes[e].clone(),
-                    vec![hidden, ff],
-                    GgmlType::Q8_0,
-                );
-                gate_up_experts.push(crate::loader::FfnPair::Fused(Weight::Quant(
-                    backend.to_device_quant(gu),
-                )));
-                down_experts.push(Weight::Quant(backend.to_device_quant(dn)));
-            }
-            MoeFfn {
-                router,
-                gate_up_experts,
-                down_experts,
-                top_k,
-                stream: None,
-                gpu_plan: std::sync::OnceLock::new(),
-            }
-        };
-
-        let moe_gpu = build_moe(&cuda);
-        let moe_cpu = build_moe(&cpu);
-        let x = Tensor::from_vec(x_data, vec![1, hidden]);
-
-        let out_gpu = moe_forward(&cuda, &x, &moe_gpu).to_host();
-        let out_cpu = moe_forward(&cpu, &x, &moe_cpu).to_host();
-
-        // The grouped plan must actually have engaged (else this test is
-        // vacuous — it would just be the reference loop on both sides).
-        assert!(
-            moe_gpu.gpu_plan.get().and_then(|p| p.as_ref()).is_some(),
-            "grouped CUDA plan was not built — grouped path did not engage"
-        );
-        // Second call reuses the cached plan.
-        let out_gpu2 = moe_forward(&cuda, &x, &moe_gpu).to_host();
-        assert_eq!(out_gpu.data(), out_gpu2.data(), "grouped path not deterministic");
-
-        let max_diff = out_gpu
-            .data()
-            .iter()
-            .zip(out_cpu.data().iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        let any_bad = out_gpu
-            .data()
-            .iter()
-            .zip(out_cpu.data().iter())
-            .any(|(a, b)| {
-                let d = (a - b).abs();
-                d >= 1e-2 && d >= 1e-2 * (a.abs() + b.abs())
-            });
-        assert!(!any_bad, "grouped CUDA vs CPU MoE output differs; max_diff={max_diff}");
-    }
 }

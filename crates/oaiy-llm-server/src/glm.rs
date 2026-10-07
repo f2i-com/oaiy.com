@@ -472,22 +472,6 @@ impl GlmEngine {
             }
             eprintln!("    {:<30} {:7.2}", "counted total", prof::total_ms() / passes);
             prof::reset();
-            // Host<->device round trips. A D2H of something the GPU just wrote is a
-            // synchronisation, and the cards measured 2-18% busy with their memory
-            // controllers at 0-6% -- starved, not slow. This says by how much.
-            #[cfg(feature = "cuda")]
-            {
-                let (dh, dhb, hd, hdb) = ggml_rs_cuda::xfer::get();
-                eprintln!(
-                    "    {:<30} {:7.1} D2H ({:.2} MB), {:.1} H2D ({:.2} MB)",
-                    "round trips a pass",
-                    dh as f64 / passes,
-                    dhb as f64 / passes / 1e6,
-                    hd as f64 / passes,
-                    hdb as f64 / passes / 1e6,
-                );
-                ggml_rs_cuda::xfer::reset();
-            }
             self.tier_report(passes);
         }
         let _ = job.events.send(Event::Done {
@@ -509,70 +493,7 @@ impl GlmEngine {
     /// **delta** over the request. Dividing the running totals instead reads as a
     /// per-token figure and is not one: it says 166 grouped layer-calls a pass for
     /// a model with 42 MoE layers.
-    #[cfg(not(feature = "cuda"))]
     fn tier_report(&mut self, _passes: f64) {}
-    #[cfg(feature = "cuda")]
-    fn tier_report(&mut self, passes: f64) {
-        let llama_rs::Model::Glm5Next(g) = &self.model else { return };
-        let Some((cache, shards, cpu, grouped)) = g.tier_stats() else { return };
-        let now = TierCounters {
-            drive_bytes: cache.bytes_read,
-            ram_hits: cache.hits,
-            ram_misses: cache.misses,
-            vram_hits: shards.iter().map(|s| s.hits).sum(),
-            vram_misses: shards.iter().map(|s| s.misses).sum(),
-            h2d_bytes: shards.iter().map(|s| s.h2d_bytes).sum(),
-            waits_free: shards.iter().map(|s| s.waits_free).sum(),
-            waits_pending: shards.iter().map(|s| s.waits_pending).sum(),
-            cpu_records: cpu.0,
-            cpu_secs: cpu.2,
-            grouped_calls: grouped.0,
-            grouped_slots: grouped.1,
-            grouped_fell: grouped.2,
-        };
-        let d = now.since(&self.tiers);
-        self.tiers = now;
-
-        let look = (d.vram_hits + d.vram_misses).max(1);
-        eprintln!(
-            "  VRAM tier: {:.1}% of {:.1} lookups a pass hit, {:.1} MB uploaded a pass",
-            100.0 * d.vram_hits as f64 / look as f64,
-            (d.vram_hits + d.vram_misses) as f64 / passes,
-            d.h2d_bytes as f64 / passes / 1e6,
-        );
-        // Whether the async H2D actually hid: a `waits_free` is a transfer that
-        // had finished before its expert was needed, a `waits_pending` one the
-        // compute stream had to be ordered behind. The second kind is the only
-        // way the upload bytes reach the clock.
-        let waits = (d.waits_free + d.waits_pending).max(1);
-        eprintln!(
-            "  uploads: {:.1}% had landed before they were needed ({:.1} of {:.1} a pass stalled)",
-            100.0 * d.waits_free as f64 / waits as f64,
-            d.waits_pending as f64 / passes,
-            (d.waits_free + d.waits_pending) as f64 / passes,
-        );
-        eprintln!(
-            "  CPU tier: {:.1} records a pass, {:.1} ms a pass",
-            d.cpu_records as f64 / passes,
-            d.cpu_secs * 1e3 / passes,
-        );
-        eprintln!(
-            "  grouped: {:.1} of {:.1} layer-calls a pass, {:.1} slots each",
-            d.grouped_calls as f64 / passes,
-            (d.grouped_calls + d.grouped_fell) as f64 / passes,
-            d.grouped_slots as f64 / d.grouped_calls.max(1) as f64,
-        );
-        // The drive. `bytes_read` is what the RAM cache had to go and get; on a warm
-        // request it does not move at all, which is the point of a 140 GB cache.
-        let ram_look = (d.ram_hits + d.ram_misses).max(1);
-        eprintln!(
-            "  drive: {:.1} MB over the request ({:.1} MB a pass, {:.1}% of {} RAM lookups missed)",
-            d.drive_bytes as f64 / 1e6,
-            d.drive_bytes as f64 / passes / 1e6,
-            100.0 * d.ram_misses as f64 / ram_look as f64,
-            d.ram_hits + d.ram_misses,
-        );
-    }
 
     fn forward_one(&mut self, id: u32) -> Result<Vec<f32>> {
         self.forward_many(&[id])

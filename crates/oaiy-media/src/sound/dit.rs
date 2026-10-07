@@ -123,10 +123,6 @@ fn layer_norm(x: &Tensor, eps: f64, affine: Option<(&Tensor, &Tensor)>) -> Resul
 /// Full attention over (B, S, H, D) in BF16.
 fn attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
     let hd = q.dim(3)?;
-    #[cfg(feature = "flash-attn")]
-    if q.device().is_cuda() {
-        return candle_flash_attn::flash_attn(&q.contiguous()?, &k.contiguous()?, &v.contiguous()?, 1. / (hd as f32).sqrt(), false);
-    }
     let t = |x: &Tensor| -> Result<Tensor> { x.transpose(1, 2)?.to_dtype(DType::F32)?.contiguous() };
     let (qt, kt, vt) = (t(q)?, t(k)?, t(v)?);
     let scores = (qt.matmul(&kt.t()?)? / (hd as f64).sqrt())?;

@@ -367,10 +367,6 @@ impl Lm {
 /// (its causal mask is aligned to the last key: the KV-cache case).
 fn causal_attention(q: &Tensor, k: &Tensor, v: &Tensor, start: usize) -> Result<Tensor> {
     let hd = q.dim(3)?;
-    #[cfg(feature = "flash-attn")]
-    if q.device().is_cuda() {
-        return candle_flash_attn::flash_attn(q, k, v, 1. / (hd as f32).sqrt(), true);
-    }
     let (b, nk, kv_heads, _) = k.dims4()?;
     let (_, nq, heads, _) = q.dims4()?;
     let groups = heads / kv_heads;

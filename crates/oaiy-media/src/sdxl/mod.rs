@@ -476,9 +476,6 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
         ("stage", Json::str("initializing_device")),
         ("device", Json::Int(r.device as i64)),
     ]));
-    #[cfg(feature = "cuda")]
-    let dev = Device::new_cuda(r.device)?;
-    #[cfg(not(feature = "cuda"))]
     let dev = Device::Cpu;
     let dtype = if dev.is_cuda() {
         DType::BF16

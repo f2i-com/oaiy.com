@@ -358,15 +358,14 @@ impl WgpuTalker {
     }
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
     /// The talker's decoder's states for a prefill on WebGPU against Candle's (`--ignored --nocapture`, `webgpu cuda`),
     /// and the first logits' best codes.
-    #[cfg(feature = "cuda")]
     #[test]
-    #[ignore = "needs Qwen3-TTS and CUDA"]
+    #[ignore = "its reference is Candle on CUDA, which this workspace no longer builds: the CUDA station (the backup branch's worktree) runs it until it reads fixtures"]
     fn the_webgpu_talkers_states_are_candles() -> Result<()> {
         let dir = std::path::PathBuf::from(std::env::var("OAIY_TTS").unwrap_or_else(|_| "E:/models/Qwen3-TTS-12Hz-0.6B-Base".into()));
         let tok = crate::tts::tokenizer(&dir)?;
@@ -401,9 +400,8 @@ mod tests {
 
     /// The talker on WebGPU against Candle's on CUDA, both greedy (`--ignored --nocapture`, built with `webgpu cuda`;
     /// OAIY_TTS the model folder, the 0.6B Base by default): the prefill's rows, and how many frames agree.
-    #[cfg(feature = "cuda")]
     #[test]
-    #[ignore = "needs Qwen3-TTS and CUDA"]
+    #[ignore = "its reference is Candle on CUDA, which this workspace no longer builds: the CUDA station (the backup branch's worktree) runs it until it reads fixtures"]
     fn the_webgpu_talker_is_candles() -> Result<()> {
         let dir = std::path::PathBuf::from(std::env::var("OAIY_TTS").unwrap_or_else(|_| "E:/models/Qwen3-TTS-12Hz-0.6B-Base".into()));
         let tok = crate::tts::tokenizer(&dir)?;

@@ -13,15 +13,6 @@ use std::path::Path;
 /// buffer then leaves an error for the next call to report). Call it before
 /// making the tensors a graph will use; the weights' loaders do.
 pub fn untracked(dev: &Device) {
-    #[cfg(feature = "cuda")]
-    if let Device::Cuda(cuda) = dev {
-        // SAFETY: the events only order work across streams. Candle queues a
-        // thread's work on that thread's one stream, and this crate hands
-        // tensors between threads only after synchronizing the device (at
-        // the end of loading and of every line), so no use depends on them.
-        unsafe { cuda.disable_event_tracking() }
-    }
-    #[cfg(not(feature = "cuda"))]
     let _ = dev;
 }
 

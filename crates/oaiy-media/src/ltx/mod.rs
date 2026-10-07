@@ -872,22 +872,6 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     } else {
         r.vram_bytes
     };
-    #[cfg(feature = "cuda")]
-    let gpu_budget = if r.webgpu {
-        gpu_budget
-    } else {
-        let free = dev
-            .as_cuda_device()?
-            .cuda_stream()
-            .context()
-            .mem_get_info()
-            .map_err(candle_core::Error::wrap)?
-            .0 as u64;
-        // Leave room for global projections, activations and a streamed block,
-        // with a margin: on Windows a card filled to the brim pages device
-        // memory to system RAM, where kernels crawl into the driver's watchdog.
-        gpu_budget.min(free.saturating_sub(8 * GIB))
-    };
     let (f, mut h, mut w) = ((r.frames - 1) / 8 + 1, stage_size.1 / 32, stage_size.0 / 32);
     let mut model = if r.webgpu {
         webgpu_model(r, &mut store, f, h, w, &mut report)?
@@ -1140,11 +1124,6 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         // a fine-tune (Sulphur, or one of LTX 2.5) may have its own.
         let (context, audio_context) = refine_contexts(r, &refine.transformer, &mut store, &dev, &mut report)?;
         let budget = if r.memory == "ram" || r.memory == "ssd" { 0 } else { r.vram_bytes };
-        #[cfg(feature = "cuda")]
-        let budget = {
-            let free = dev.as_cuda_device()?.cuda_stream().context().mem_get_info().map_err(candle_core::Error::wrap)?.0 as u64;
-            budget.min(free.saturating_sub(8 * GIB))
-        };
         let mut model = transformer::Transformer::new(store, &dev, budget, r.memory == "gpu", r.audio)?;
         let audio_bf16 = audio_latent.as_ref().map(|a| a.to_dtype(DType::BF16)).transpose()?;
         let refine_steps = REFINE_SIGMAS.len() - 1;
@@ -1203,17 +1182,6 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     // Large clips use overlapping tiles sized for the convolution workspace.
     let pixel_budget = 32 * 1024 * 1024usize;
     dev.synchronize()?;
-    #[cfg(feature = "cuda")]
-    let pixel_budget = {
-        let free = dev
-            .as_cuda_device()?
-            .cuda_stream()
-            .context()
-            .mem_get_info()
-            .map_err(candle_core::Error::wrap)?
-            .0;
-        pixel_budget.min(free.saturating_sub(4usize << 30) / 512)
-    };
     let pixels = if r.frames * r.height * r.width <= pixel_budget {
         decoder.decode(&latent)?.to_device(&Device::Cpu)?
     } else {
@@ -1852,11 +1820,6 @@ mod tests {
     }
 }
 fn inference_device(index: usize) -> Result<Device> {
-    #[cfg(feature = "cuda")]
-    {
-        Device::new_cuda(index)
-    }
-    #[cfg(not(feature = "cuda"))]
     {
         let _ = index;
         candle_core::bail!("LTX video requires the CUDA worker; rebuild with --features flash-attn")

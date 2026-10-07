@@ -594,8 +594,6 @@ fn forward_with_logits_matches_resident_moe() {
             down_experts: downs,
             top_k: 2,
             stream: None,
-            #[cfg(feature = "cuda")]
-            gpu_plan: std::sync::OnceLock::new(),
         };
 
         let resident =

@@ -601,9 +601,8 @@ mod golden {
     /// frames of the run's hiddens repeated, the seed's noise; `--ignored --nocapture`, built `webgpu cuda`;
     /// OAIY_MUSIC_CUDA_DEVICE, else 1, with CUDA_DEVICE_ORDER=PCI_BUS_ID the card WebGPU takes): each window's time on
     /// both, and how far apart their audio is.
-    #[cfg(feature = "cuda")]
     #[test]
-    #[ignore = "needs MiniMax-Music3, the reference's dumps and CUDA"]
+    #[ignore = "its reference is Candle on CUDA, which this workspace no longer builds: the CUDA station (the backup branch's worktree) runs it until it reads fixtures"]
     fn a_songs_rendering_is_candles() -> Result<()> {
         use crate::music::acoustic::{Acoustic, ConditionEncoder, Transformer};
         let (g, m) = dirs();

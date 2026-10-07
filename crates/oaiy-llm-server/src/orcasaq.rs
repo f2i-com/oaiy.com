@@ -5,8 +5,6 @@
 //! through WebGPU, or decoded on the CPU (`ggml_rs_wgpu::exl3`).
 use dsv41::safetensors::{Dtype, StIndex};
 use ggml_rs::{exl3::{Exl3Data, PackedLinear}, Backend, Tensor};
-#[cfg(feature = "cuda")]
-use ggml_rs_cuda::{exl3::Exl3Matrix, CudaBackend};
 use llama_rs::{
     loader::{FfnPair, Weight},
     qwen35::{Qwen35Block, Qwen35Model, SsmConfig},
@@ -19,147 +17,6 @@ fn bad(s: impl Into<String>) -> Error {
     Error::Format(s.into())
 }
 
-#[cfg(all(test, feature = "cuda"))]
-mod runtime_tests {
-    use super::*;
-    fn model_path() -> std::path::PathBuf {
-        std::env::var_os("OAIY_TEST_ORCA").map(std::path::PathBuf::from)
-            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/OrcaSAQ-2-27B"))
-    }
-    #[test]
-    #[ignore = "manual real-model prefill timing/profiling, requires downloaded weights"]
-    fn benchmark_real_model_prefill() {
-        let path = model_path();
-        let adapter=std::env::var_os("OAIY_TEST_LORA").map(|p|crate::lora::Adapter::open(Path::new(&p)).unwrap());
-        let model = load_with_adapter(&path, &[0, 1], adapter.as_slice()).unwrap();
-        let token = model.tokenizer().encode("Hello", false).unwrap()[0];
-        let sizes = std::env::var("OAIY_BENCH_PREFILL_SIZES").ok().map(|s|s.split(',').map(|n|n.parse::<usize>().unwrap()).collect::<Vec<_>>())
-            .unwrap_or_else(||vec![crate::qwen::PREFILL_CHUNK]);
-        for size in sizes {
-          let tokens = vec![token; size];
-          for run in 0..2 {
-            let mut kv = model.new_kv_cache(260000);
-            let start = std::time::Instant::now();
-            let logits = model.forward(&tokens, &mut kv).to_host();
-            assert!(logits.data().iter().all(|v| v.is_finite()));
-            eprintln!("prefill run {run}: {} tokens in {:.3}s", tokens.len(), start.elapsed().as_secs_f64());
-          }
-        }
-    }
-    #[test]
-    #[ignore = "manual real-model decode timing/profiling, requires downloaded weights"]
-    fn benchmark_real_model_decode() {
-        let path = model_path();
-        let devices: &[usize] = if std::env::var_os("OAIY_BENCH_LOCAL_KV").is_some() { &[0] } else { &[0, 1] };
-        let adapter=std::env::var_os("OAIY_TEST_LORA").map(|p|crate::lora::Adapter::open(Path::new(&p)).unwrap());
-        let model = load_with_adapter(&path, devices, adapter.as_slice()).unwrap();
-        let mut kv = model.new_kv_cache(260000);
-        let token = model.tokenizer().encode("Hello", false).unwrap()[0];
-        for _ in 0..16 { let _ = model.forward(&[token], &mut kv).to_host(); }
-        let start = std::time::Instant::now();
-        const STEPS: usize = 128;
-        for _ in 0..STEPS { let _ = model.forward(&[token], &mut kv).to_host(); }
-        let seconds=start.elapsed().as_secs_f64();
-        eprintln!("{STEPS} decode steps: {seconds:.3}s, {:.2} tokens/s", STEPS as f64/seconds);
-    }
-    #[test]
-    #[ignore = "requires downloaded OrcaSAQ and two 32GB CUDA devices"]
-    fn real_model_distributed_cache_restores_and_reserves_260000() {
-        let path = model_path();
-        let adapter=std::env::var_os("OAIY_TEST_LORA").map(|p|crate::lora::Adapter::open(Path::new(&p)).unwrap());
-        let baseline=adapter.as_ref().map(|_| {
-            let base=load(&path,&[0,1]).unwrap();
-            let tokens=base.tokenizer().encode("The capital of France is",false).unwrap();
-            base.forward(&tokens,&mut base.new_kv_cache(260000)).to_host().data().to_vec()
-        });
-        let mut model = load_with_adapter(&path, &[0, 1],adapter.as_slice()).unwrap();
-        let vision = if std::env::var_os("OAIY_TEST_VISION").is_some() {
-            let Model::Qwen35(m)=&model else { unreachable!() };
-            Some(crate::qwen_vision::load(&path.join("vision"),m.cache_backends.last().unwrap().clone(),5120,None).unwrap())
-        } else { None };
-        let tokens = model
-            .tokenizer()
-            .encode("The capital of France is", false)
-            .unwrap();
-        let mut kv = model.new_kv_cache(260000);
-        let distributed = model.forward(&tokens, &mut kv).to_host();
-        if let Some(baseline)=baseline {
-            let difference=baseline.iter().zip(distributed.data()).map(|(a,b)|(a-b).abs()).fold(0.0f32,f32::max);
-            assert!(difference>1e-3,"nonzero adapter must affect real-model logits");
-            eprintln!("LoRA changes real-model logits: max delta {difference}");
-        }
-        let Model::Qwen35(m) = &mut model else {
-            unreachable!()
-        };
-        let placement = m.cache_backends.clone();
-        m.cache_backends.fill(m.backend.clone());
-        let mut local = model.new_kv_cache(260000);
-        let expected = model.forward(&tokens, &mut local).to_host();
-        let error = expected
-            .data()
-            .iter()
-            .zip(distributed.data())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        assert!(error < 1e-4, "distributed attention logits error {error}");
-        drop(local);
-        let Model::Qwen35(m) = &mut model else {
-            unreachable!()
-        };
-        m.cache_backends = placement;
-        let snap =
-            crate::qwen_cache::Snapshot::capture(&kv, &m.attention_layers, m.backend.as_ref());
-        let recurrent = crate::qwen_cache::RecurrentSnapshot::capture(&kv);
-        let next = model.forward(&tokens[..1], &mut kv).to_host();
-        let Model::Qwen35(m) = &model else {
-            unreachable!()
-        };
-        snap.restore(&mut kv, &m.attention_layers, m.ssm_cfg, m.backend.as_ref())
-            .unwrap();
-        let restored = model.forward(&tokens[..1], &mut kv).to_host();
-        assert_eq!(
-            next.data(),
-            restored.data(),
-            "restored recurrence and both GPUs must match"
-        );
-        let Model::Qwen35(m) = &model else { unreachable!() };
-        recurrent.restore(&mut kv, snap.pos, &m.attention_layers, m.ssm_cfg, m.backend.as_ref()).unwrap();
-        let rewound = model.forward(&tokens[..1], &mut kv).to_host();
-        assert_eq!(next.data(), rewound.data(), "recurrent-only rewind must preserve exact real-model logits");
-        let Model::Qwen35(m) = &model else {
-            unreachable!()
-        };
-        for (i, &attn) in m.attention_layers.iter().enumerate() {
-            if attn {
-                let backend = kv.layer_backends[i].clone();
-                kv.reserve_layer(backend.as_ref(), i, 260000);
-                assert_eq!(kv.k[i].dim(0), 260000);
-            }
-        }
-        assert!(kv.size_bytes() >= 34_078_720_000);
-        // Preserved prefix remains usable after growth to the full capacity.
-        let logits = model.forward(&tokens[..1], &mut kv).to_host();
-        assert!(logits.data().iter().all(|x| x.is_finite()));
-        if let Some(vision)=vision {
-            let pixels=Tensor::from_vec(vec![0.0;3*768*768],vec![3,768,768]);
-            let out=vision.forward(&pixels).unwrap().to_host();
-            assert_eq!(out.shape(),[576,5120]);
-            assert!(out.data().iter().all(|x|x.is_finite()));
-            let Model::Qwen35(m)=&model else { unreachable!() };
-            let rows=crate::qwen::PREFILL_CHUNK.min(576);
-            let embeds=m.backend.to_device(Tensor::from_vec(out.data()[..rows*5120].to_vec(),vec![rows,5120]));
-            let positions:Vec<_>=(0..rows).map(|i|[4,4+(i/24) as u32,4+(i%24) as u32]).collect();
-            let logits=m.forward_embeds_positions(&embeds,rows,&mut kv,Some(&positions)).unwrap().to_host();
-            assert!(logits.data().iter().all(|x|x.is_finite()));
-            eprintln!("{rows}-token image prefill also fits alongside the full KV allocation");
-            eprintln!("vision encoding also verified with all 260000 KV slots resident");
-        }
-        eprintln!(
-            "260000-token capacity: {} bytes; distributed/restored logits verified",
-            kv.size_bytes()
-        );
-    }
-}
 fn json(path: &Path) -> Result<Json> {
     Json::parse(&std::fs::read(path)?)
 }
@@ -188,37 +45,20 @@ type Packer<'a> = &'a dyn Fn(Exl3Data) -> std::result::Result<Arc<dyn PackedLine
 
 /// The PEFT adapters applied as the weights load, together and in order: the CUDA build's; a portable build has none.
 struct Adapters<'a> {
-    #[cfg(feature = "cuda")]
-    list: &'a [crate::lora::Adapter],
-    #[cfg(not(feature = "cuda"))]
     list: std::marker::PhantomData<&'a ()>,
 }
 impl<'a> Adapters<'a> {
-    #[cfg(feature = "cuda")]
-    fn of(list: &'a [crate::lora::Adapter]) -> Self {
-        Self { list }
-    }
-    #[cfg_attr(feature = "cuda", allow(dead_code))]
     fn none() -> Self {
-        #[cfg(feature = "cuda")]
-        return Self { list: &[] };
-        #[cfg(not(feature = "cuda"))]
         Self { list: std::marker::PhantomData }
     }
     /// Each adapter wraps what the one before made (an adapter without this weight leaves it).
     fn wrap(&self, name: &str, w: Weight, backend: &Arc<dyn Backend>, input: Option<&[u32]>, output: Option<&[u32]>) -> Result<Weight> {
-        #[cfg(feature = "cuda")]
-        return self.list.iter().try_fold(w, |w, adapter| adapter.wrap(name, w, backend.clone(), input, output));
-        #[cfg(not(feature = "cuda"))]
         {
             let _ = (name, backend, input, output);
             Ok(w)
         }
     }
     fn merge_dense(&self, name: &str, w: Tensor, backend: &dyn Backend, map: Option<&[u32]>) -> Result<Tensor> {
-        #[cfg(feature = "cuda")]
-        return self.list.iter().try_fold(w, |w, adapter| adapter.merge_dense(name, w, backend, map));
-        #[cfg(not(feature = "cuda"))]
         {
             let _ = (name, backend, map);
             Ok(w)
@@ -226,10 +66,6 @@ impl<'a> Adapters<'a> {
     }
     /// Every adapter's targets were found.
     fn finish(&self) -> Result<()> {
-        #[cfg(feature = "cuda")]
-        for adapter in self.list {
-            adapter.finish()?;
-        }
         Ok(())
     }
 }
@@ -464,30 +300,8 @@ mod tests {
     }
 }
 
-#[cfg(feature = "cuda")]
-pub fn load(path: &Path, devices: &[usize]) -> Result<Model> {
-    load_with_adapter(path,devices,&[])
-}
-#[cfg(feature = "cuda")]
-pub(crate) fn load_with_adapter(path: &Path, devices: &[usize], lora:&[crate::lora::Adapter]) -> Result<Model> {
-    let device = devices.first().copied().unwrap_or(0);
-    let cuda = Arc::new(CudaBackend::new(device).map_err(|e| bad(e.to_string()))?);
-    let backend: Arc<dyn Backend> = cuda.clone();
-    let mut cache_devices: Vec<Arc<dyn Backend>> = vec![backend.clone()];
-    for &other in devices.iter().skip(1) {
-        if other != device {
-            cache_devices.push(Arc::new(
-                CudaBackend::new(other).map_err(|e| bad(e.to_string()))?,
-            ));
-        }
-    }
-    let packed = |data: Exl3Data| Exl3Matrix::upload(cuda.clone(), data).map(|m| Arc::new(m) as Arc<dyn PackedLinear>);
-    build(path, backend, cache_devices, &packed, &Adapters::of(lora))
-}
-
 /// OrcaSAQ without CUDA: its tensors on `backend`, each packed projection as `packed` makes it (on any GPU through
 /// WebGPU, else on the CPU), no PEFT adapters, its attention cache beside it. (A CUDA build loads it on the card.)
-#[cfg_attr(feature = "cuda", allow(dead_code))]
 pub(crate) fn load_portable(path: &Path, backend: Arc<dyn Backend>, packed: Packer<'_>) -> Result<Model> {
     build(path, backend.clone(), vec![backend], packed, &Adapters::none())
 }

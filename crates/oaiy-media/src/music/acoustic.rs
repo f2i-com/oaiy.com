@@ -383,10 +383,6 @@ fn block(b: &Block, h: &Tensor, cos: &Tensor, sin: &Tensor, heads: usize, hd: us
 /// Full (bidirectional) attention over (B, S, H, D).
 fn attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
     let hd = q.dim(3)?;
-    #[cfg(feature = "flash-attn")]
-    if q.device().is_cuda() && q.dtype() == DType::BF16 {
-        return candle_flash_attn::flash_attn(&q.contiguous()?, &k.contiguous()?, &v.contiguous()?, 1. / (hd as f32).sqrt(), false);
-    }
     let dtype = q.dtype();
     let t = |x: &Tensor| -> Result<Tensor> { x.transpose(1, 2)?.to_dtype(DType::F32)?.contiguous() };
     let (q, k, v) = (t(q)?, t(k)?, t(v)?);

@@ -244,17 +244,6 @@ mod tests {
         check_published_forward(&Device::Cpu)
     }
 
-    #[cfg(feature = "cuda")]
-    #[test]
-    #[ignore = "requires an explicitly selected idle OAIY_KLEIN_TEST_CUDA_DEVICE"]
-    fn cuda_tiny_transformer_matches_published_bfl_forward_on_every_residency_tier() -> Result<()> {
-        let device = std::env::var("OAIY_KLEIN_TEST_CUDA_DEVICE")
-            .map_err(candle_core::Error::wrap)?
-            .parse::<usize>()
-            .map_err(candle_core::Error::wrap)?;
-        check_published_forward(&Device::new_cuda(device)?)
-    }
-
     fn check_published_forward(device: &Device) -> Result<()> {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/klein");
         let j = Json::parse(&std::fs::read(root.join("expected.json"))?)

@@ -108,16 +108,12 @@ impl MixtralModel {
                     down_experts: Vec::new(),
                     top_k: n_experts_used,
                     stream: Some(shared.layer(i as u32)),
-                    #[cfg(feature = "cuda")]
-                    gpu_plan: std::sync::OnceLock::new(),
                 }
                 .move_to_device(&*backend, M),
                 None => {
                     let (gate_up_experts, down_experts) =
                         crate::qwen3moe::load_per_layer_experts_compat(&idx, i, n_experts)?;
                     MoeFfn { router, gate_up_experts, down_experts, top_k: n_experts_used, stream: None,
-                        #[cfg(feature = "cuda")]
-                        gpu_plan: std::sync::OnceLock::new(),
                     }
                         .move_to_device(&*backend, M)
                 }
