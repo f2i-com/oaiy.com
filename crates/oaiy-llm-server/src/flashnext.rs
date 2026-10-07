@@ -67,6 +67,9 @@ fn bad(s: impl Into<String>) -> Error {
     Error::Format(format!("Qwen3.8-Flash-Next: {}", s.into()))
 }
 
+#[path = "flashnext_gguf.rs"]
+pub(crate) mod gguf_file;
+
 
 /// A Qwen3.8-Flash-Next checkpoint: `qwen4_exp`, EXL3.
 pub fn detect(path: &Path) -> bool {
@@ -167,8 +170,14 @@ impl Config {
             index_budget: number(c, "indexer_budget")?,
             index_ratio: number(c, "indexer_compress_ratio")?,
         };
+        cfg.checked()
+    }
+
+    /// The dimensions, where this implementation runs them.
+    fn checked(self) -> Result<Self> {
+        let cfg = self;
         if cfg.attention.len() != cfg.layers || cfg.ple_layer >= cfg.layers || cfg.heads % cfg.kv_heads != 0
-            || cfg.nv % cfg.nk != 0 || cfg.kd != cfg.vd || cfg.streams != 4 || cfg.ngram < 2 || cfg.rope_dim > head_dim
+            || cfg.nv % cfg.nk != 0 || cfg.kd != cfg.vd || cfg.streams != 4 || cfg.ngram < 2 || cfg.rope_dim > cfg.head_dim
             || cfg.rope_dim > cfg.index_dim || cfg.index_budget % cfg.index_ratio != 0 {
             return Err(bad("unsupported dimensions"));
         }

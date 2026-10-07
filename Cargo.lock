@@ -1828,6 +1828,7 @@ version = "0.7.0"
 dependencies = [
  "dsv41",
  "dsv41-cuda",
+ "ggml-quants",
  "ggml-rs",
  "ggml-rs-cuda",
  "ggml-rs-wgpu",

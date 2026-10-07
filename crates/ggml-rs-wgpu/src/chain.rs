@@ -4446,6 +4446,10 @@ impl DeviceChain for WgpuBackend {
     }
 
     fn holds_exl3(&self, w: &dyn ggml_rs::exl3::PackedLinear) -> bool {
+        // (a GGUF's matrix where a packed projection is asked for: held as a quantized weight is)
+        if let Some(q) = w.as_any().and_then(|a| a.downcast_ref::<crate::quant_linear::QuantLinear>()) {
+            return self.holds(&q.w);
+        }
         w.as_any()
             .and_then(|a| a.downcast_ref::<crate::exl3::Exl3Gpu>())
             .is_some_and(|g| g.is_on(&self.gpu) && g.single_chunk().is_some())
@@ -4472,6 +4476,21 @@ impl Recorder<'_> {
     /// [`ChainRecorder::exl3_rows`], the input `x`, or (`up` given) the SwiGLU `silu(x) * up` computed as the input
     /// transform reads it (a shared expert's down projection: a dispatch fewer).
     pub(crate) fn exl3_rows_of(&mut self, w: &dyn ggml_rs::exl3::PackedLinear, x: &DeviceVec, up: Option<&DeviceVec>, y: &DeviceVec, rows: usize) {
+        // a GGUF's matrix: the quantized matmul of its rows as they are (no transform either side, no channel map),
+        // a SwiGLU's product made first where one is asked for
+        if let Some(q) = w.as_any().and_then(|a| a.downcast_ref::<crate::quant_linear::QuantLinear>()) {
+            let (k, n) = q.kn();
+            assert!(rows > 0 && x.len >= rows * k && y.len >= rows * n, "chain: a quantized projection [{n}, {k}] of {rows} rows");
+            match up {
+                Some(u) => {
+                    let t = self.scratch(rows * k);
+                    self.silu_mul(x, u, &t, rows * k);
+                    self.matmul_rows(&q.w, &t, y, rows);
+                }
+                None => self.matmul_rows(&q.w, x, y, rows),
+            }
+            return;
+        }
         let g = w.as_any().and_then(|a| a.downcast_ref::<crate::exl3::Exl3Gpu>()).expect("an EXL3 projection this adapter holds");
         assert!(g.is_on(&self.backend.gpu), "chain: an EXL3 projection of another adapter");
         let (words, splits) = g.single_chunk().expect("an EXL3 projection in one buffer");

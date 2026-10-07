@@ -58,6 +58,7 @@ pub fn layout(dtype: GgmlType) -> Option<(u32, u32, &'static str)> {
         GgmlType::Q5_1 => (32, 24, Q5_1),
         GgmlType::Q8_0 => (32, 34, Q8_0),
         GgmlType::IQ4_NL => (32, 18, IQ4_NL),
+        GgmlType::Q2_0 => (64, 18, Q2_0),
         GgmlType::Q2_K => (256, 84, Q2_K),
         GgmlType::Q3_K => (256, 112, Q3_K),
         GgmlType::Q4_K => (256, 144, Q4_K),
@@ -2488,6 +2489,20 @@ fn dequant(bb: u32, sub: u32) {
         let q = byte(bb + 4u + i);
         v[i] = (f32(q & 15u) - 8.0) * d;
         v[i + 16u] = (f32(q >> 4u) - 8.0) * d;
+    }
+}
+"#;
+
+// Q2_0: a scale, then 64 2-bit codes four a byte (a code of 0..3 the scale's -1, 0, +1 and +2).
+const Q2_0: &str = r#"
+fn dequant(bb: u32, sub: u32) {
+    let d = f16at(bb);
+    for (var i = 0u; i < 8u; i++) {
+        let q = byte(bb + 2u + sub * 8u + i);
+        v[i * 4u] = (f32(q & 3u) - 1.0) * d;
+        v[i * 4u + 1u] = (f32((q >> 2u) & 3u) - 1.0) * d;
+        v[i * 4u + 2u] = (f32((q >> 4u) & 3u) - 1.0) * d;
+        v[i * 4u + 3u] = (f32(q >> 6u) - 1.0) * d;
     }
 }
 "#;

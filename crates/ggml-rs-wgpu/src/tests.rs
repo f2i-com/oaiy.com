@@ -73,8 +73,8 @@ fn backend() -> Option<WgpuBackend> {
     }
 }
 
-const TYPES: [GgmlType; 12] = [
-    GgmlType::Q4_0, GgmlType::Q4_1, GgmlType::Q5_0, GgmlType::Q5_1, GgmlType::Q8_0, GgmlType::IQ4_NL,
+const TYPES: [GgmlType; 13] = [
+    GgmlType::Q2_0, GgmlType::Q4_0, GgmlType::Q4_1, GgmlType::Q5_0, GgmlType::Q5_1, GgmlType::Q8_0, GgmlType::IQ4_NL,
     GgmlType::Q2_K, GgmlType::Q3_K, GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K, GgmlType::IQ4_XS,
 ];
 
