@@ -617,6 +617,7 @@ impl Models {
         self.say(format!("expert host cache: {:.2} GiB", opts.expert_cache_bytes as f64 / (1u64 << 30) as f64));
         let mut model = dsv41::model::Model::load(&spec.path, &engram_meta, &opts)?;
         let picked = crate::backend::open(o, &o.devices)?;
+        let mut kernel = None;
         match picked.backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>() {
             Some(b) => {
                 let (count, bytes) = crate::dsv41_portable::offload(&mut model, b);
@@ -624,10 +625,17 @@ impl Models {
                 // and the experts used most kept there in what is left after those (a decode step's computed there while
                 // the CPU reads and computes the rest).
                 let experts = match crate::dsv41_portable::WgpuExperts::new(b) {
-                    Some(k) => {
+                    Some(mut k) => {
                         let (n, kept) = (k.slots(), k.tier().0);
-                        model.set_experts_kernel(Some(Arc::new(k)));
-                        format!("a prompt's busy experts ({n} at a time) and {kept} experts kept there between requests; the rest on the CPU")
+                        // The computer's other cards hold a share of the experts for good (OAIY_NO_SPLIT: the one GPU).
+                        let others: Vec<Arc<ggml_rs_wgpu::WgpuBackend>> =
+                            if std::env::var_os("OAIY_NO_SPLIT").is_some() { Vec::new() } else { b.others(o.webgpu_gb.map(|g| g << 30)).into_iter().map(Arc::new).collect() };
+                        let pinned = k.pin_on(&others, model.cfg.n_layers, model.cfg.n_routed_experts);
+                        let k = Arc::new(k);
+                        model.set_experts_kernel(Some(Arc::clone(&k) as Arc<dyn dsv41::expert::ExpertsKernel>));
+                        kernel = Some(k);
+                        let share = if pinned > 0 { format!(", {pinned} more on the other GPU{} for good (read while idle)", if others.len() > 1 { "s" } else { "" }) } else { String::new() };
+                        format!("a prompt's busy experts ({n} at a time) and {kept} experts kept there between requests{share}; the rest on the CPU")
                     }
                     None => "no room left there for experts; they run on the CPU".into(),
                 };
@@ -639,7 +647,7 @@ impl Models {
         // Its own placeholder (as the CUDA build): the default, token 0, is DeepSeek's start of sequence.
         cfg.image_token_id = model.cfg.image_token_id;
         let (jobs, rx) = std::sync::mpsc::channel();
-        let e = crate::dsv41_portable::Engine::new(model, Arc::clone(&tok), !o.quiet && !o.silent);
+        let e = crate::dsv41_portable::Engine::new(model, Arc::clone(&tok), !o.quiet && !o.silent).with_kernel(kernel);
         let thread = std::thread::Builder::new().name("deepseek-model".into()).spawn(move || e.run(rx)).map_err(Error::Io)?;
         Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Deepseek(tok)) })
     }

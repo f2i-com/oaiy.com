@@ -388,7 +388,7 @@ pub struct CpuExperts {
 impl CpuExperts {
     /// `threads` workers (0: one per available hardware thread).
     pub fn new(threads: usize) -> CpuExperts {
-        Self::with_kernel(threads, fp4_rows)
+        Self::with_kernel(threads, crate::cpu::row_kernel())
     }
 
     /// [`new`](Self::new) with a faster row kernel (same results).
@@ -583,5 +583,32 @@ mod tests {
                 assert!(got[e].iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()), "expert {e}, {threads} threads");
             }
         }
+    }
+
+    /// A prompt's expert of a few rows, a row at a time through a row kernel (the portable one, and this CPU's): the
+    /// bits of `expert_forward_batch`, which decodes each weight row once for all of them.
+    #[test]
+    fn a_few_rows_through_a_row_kernel_are_the_batchs_bit_for_bit() {
+        use crate::expert::{expert_forward_batch, expert_forward_rows};
+        let rec = record(91);
+        let mut s = 11u64;
+        let x: Vec<f32> = (0..3 * DIM)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                to_bf16(((s >> 11) as f32 / (1u64 << 53) as f32 - 0.5) * 8.0)
+            })
+            .collect();
+        let weights = [0.4f32, 1.1, 0.25];
+        let want = expert_forward_batch(&rec, &x, Some(&weights), 10.0);
+        for (name, kernel) in [("portable", fp4_rows as RowKernel), (crate::cpu::row_kernel_name(), crate::cpu::row_kernel())] {
+            let got = expert_forward_rows(kernel, &rec, &x, Some(&weights), 10.0);
+            assert_eq!(got.len(), want.len());
+            assert!(got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()), "the {name} kernel");
+        }
+        // (and with no routing weight, as the shared path gives none)
+        let got = expert_forward_rows(crate::cpu::row_kernel(), &rec, &x[..DIM], None, 0.0);
+        assert!(got.iter().zip(&expert_forward_batch(&rec, &x[..DIM], None, 0.0)).all(|(a, b)| a.to_bits() == b.to_bits()));
     }
 }

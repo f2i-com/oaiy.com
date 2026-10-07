@@ -14,7 +14,6 @@ use oaiy_engine::store::WeightStore;
 use oaiy_engine::Result;
 
 use crate::config::Config;
-use crate::expert::expert_forward_batch;
 use crate::formats::to_bf16;
 use crate::linear::{load_vec, Out, Weight};
 use crate::ops::{silu, softplus};
@@ -336,12 +335,14 @@ impl Moe {
                 });
             }
             drop(got_tx);
+            let kernel = crate::cpu::row_kernel();
             for _ in 0..threads.min(light) {
                 let (work_rx, out_tx) = (&work_rx, out_tx.clone());
                 scope.spawn(move || loop {
                     let job = work_rx.lock().unwrap_or_else(|p| p.into_inner()).recv();
                     let Ok((j, record)) = job else { break };
-                    let out = expert_forward_batch(&record, &gathered[j].1, Some(&gathered[j].2), cfg.swiglu_limit);
+                    // (each worker its own thread's: the row kernel, not the matmul that starts threads of its own)
+                    let out = crate::expert::expert_forward_rows(kernel, &record, &gathered[j].1, Some(&gathered[j].2), cfg.swiglu_limit);
                     if out_tx.send((j, out)).is_err() {
                         break;
                     }

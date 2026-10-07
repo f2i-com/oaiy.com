@@ -20,11 +20,13 @@
 //! - [`vision`] — image preprocessing (bit-exact to the reference's Pillow
 //!   pipeline) and the ViT + aligner on the CPU
 
-#![forbid(unsafe_code)]
+// (denied, not forbidden: `cpu` alone allows it, for the calls that pick a SIMD kernel after checking the CPU has it)
+#![deny(unsafe_code)]
 
 pub mod attention;
 pub mod chat;
 pub mod config;
+pub mod cpu;
 pub mod cpu_experts;
 pub mod detok;
 pub mod engram;

@@ -151,6 +151,11 @@ impl Model {
         &self.experts.cache
     }
 
+    /// Where the routed experts' records are read from.
+    pub fn expert_store(&self) -> &Arc<dyn oaiy_engine::store::WeightStore> {
+        &self.experts.store
+    }
+
     /// Run `ids` at positions `start_pos..` (a prefill at 0, then one token at
     /// a time) and return the last position's logits (f32, `[vocab]`).
     pub fn forward(&mut self, ids: &[u32], start_pos: usize, trace: Trace<'_>) -> Result<Vec<f32>> {
@@ -317,7 +322,8 @@ impl Model {
     /// waits for the drive for every expert it has not met (some 13 ms each from a 1.4 GB/s drive, and a step routes
     /// to 240), so what is read while nothing is asked is a wait a later step does not have. False once every expert
     /// has been looked at or the cache is full (reading past that would only swap one unused record for another).
-    pub fn warm_experts(&self, cursor: &mut usize, count: usize) -> bool {
+    /// `elsewhere(layer, expert)`: an expert another tier holds for good (a GPU's), which RAM need not.
+    pub fn warm_experts(&self, cursor: &mut usize, count: usize, elsewhere: &dyn Fn(u32, u32) -> bool) -> bool {
         let (layers, per_layer) = (self.cfg.n_layers, self.cfg.n_routed_experts);
         let cache = &self.experts.cache;
         let total = layers * per_layer;
@@ -329,7 +335,7 @@ impl Model {
         while *cursor < total && picks.len() < count.min(room) {
             let (l, e) = ((*cursor % layers) as u32, (*cursor / layers) as u32);
             *cursor += 1;
-            if !cache.probe(l, e) {
+            if !cache.probe(l, e) && !elsewhere(l, e) {
                 picks.push((l, e));
             }
         }

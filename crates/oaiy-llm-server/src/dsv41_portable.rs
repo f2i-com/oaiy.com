@@ -56,6 +56,8 @@ pub(crate) struct Engine {
     log: bool,
     /// Reading the experts into RAM while no request waits ([`Warm`]); None once done, or switched off.
     warm: Option<Warm>,
+    /// The experts' kernel on the GPUs, for what the other cards hold for good ([`Pinned`]): filled while idle too.
+    kernel: Option<Arc<WgpuExperts>>,
 }
 
 /// The idle reading of the routed experts into the RAM tier: where it is, and what it has read so far.
@@ -88,7 +90,14 @@ impl Engine {
         let warm = std::env::var_os("OAIY_DSV41_NO_WARM")
             .is_none()
             .then(|| Warm { cursor: 0, started: None, reading: std::time::Duration::ZERO, bytes_before: model.expert_cache().stats().bytes_read });
-        Engine { model, tok, covered: Vec::new(), checkpoint: None, eos, log, warm }
+        Engine { model, tok, covered: Vec::new(), checkpoint: None, eos, log, warm, kernel: None }
+    }
+
+    /// The experts' kernel the model was given, when other cards hold a share of them: the idle reading fills those
+    /// first, and leaves them out of RAM.
+    pub(crate) fn with_kernel(mut self, kernel: Option<Arc<WgpuExperts>>) -> Engine {
+        self.kernel = kernel;
+        self
     }
 
     /// An idle slice of the experts' reading into RAM; says when it starts and when there is no more to read.
@@ -102,16 +111,24 @@ impl Engine {
             }
         }
         let slice = std::time::Instant::now();
-        let more = self.model.warm_experts(&mut w.cursor, WARM_SLICE);
+        // the other cards' share first (it is never read again), then RAM's, which leaves that share out
+        let kernel = self.kernel.as_deref();
+        if kernel.is_some_and(|k| k.pin_some(self.model.expert_store().as_ref(), self.model.expert_cache(), WARM_SLICE)) {
+            w.reading += slice.elapsed();
+            return;
+        }
+        let more = self.model.warm_experts(&mut w.cursor, WARM_SLICE, &|l, e| kernel.is_some_and(|k| k.pins(l, e)));
         w.reading += slice.elapsed();
         if !more {
             if self.log {
                 let c = self.model.expert_cache();
                 let read = c.stats().bytes_read.saturating_sub(w.bytes_before);
+                let pinned = kernel.map_or(0, |k| k.pinned());
                 eprintln!(
-                    "  the experts' RAM tier holds {} of its {}: {:.1} s of idle reading ({:.1} GB read since the model loaded)",
+                    "  the experts' RAM tier holds {} of its {}{}: {:.1} s of idle reading ({:.1} GB read into RAM since the model loaded)",
                     c.len(),
                     c.n_slots(),
+                    if pinned > 0 { format!(", the other GPUs {pinned} more for good") } else { String::new() },
                     w.reading.as_secs_f64(),
                     read as f64 / 1e9
                 );
@@ -172,6 +189,25 @@ impl Engine {
             return Err(oaiy_engine::Error::Arg(format!("a prompt of {} tokens does not fit a context of {max_seq}", prompt.len())));
         }
         let started = std::time::Instant::now();
+        // OAIY_DSV41_PROFILE: where the prompt's and the reply's time went (`dsv41::profile`), and what each read
+        let profiling = self.log && std::env::var_os("OAIY_DSV41_PROFILE").is_some();
+        let read_so_far = |m: &dsv41::model::Model| {
+            let st = m.expert_cache().stats();
+            (st.bytes_read, st.hits, st.misses)
+        };
+        let part = |label: &str, before: (u64, u64, u64), after: (u64, u64, u64)| {
+            eprintln!(
+                "    {label}: read {:.2} GB, {} hits / {} misses in RAM; {}",
+                (after.0 - before.0) as f64 / 1e9,
+                after.1 - before.1,
+                after.2 - before.2,
+                dsv41::profile::take_line()
+            );
+        };
+        if profiling {
+            dsv41::profile::take();
+        }
+        let at_start = read_so_far(&self.model);
         let common = self.covered.iter().zip(prompt).take_while(|(a, b)| a == b).count();
         // The live state, or the last prompt's checkpoint: whichever serves more of this prompt.
         let live = reusable(&self.covered, prompt);
@@ -213,6 +249,10 @@ impl Engine {
         let _ = job.events.send(Event::Progress { done: total, total });
         let prefill_s = started.elapsed().as_secs_f64();
         let _ = job.events.send(Event::Prefilled { cached: start });
+        let at_reply = read_so_far(&self.model);
+        if profiling {
+            part("the prompt", at_start, at_reply);
+        }
 
         let think_start = self.tok.special(dsv41::chat::THINK_START);
         let mut budget = crate::glm::ThinkBudget::new(think_start.is_some() && prompt.last().copied() == think_start, self.tok.special(dsv41::chat::THINK_END), job.think_budget);
@@ -265,6 +305,9 @@ impl Engine {
             let decode_s = decode.elapsed().as_secs_f64();
             eprintln!("  {} prompt tokens ({start} reused) in {prefill_s:.1}s; {n} generated in {decode_s:.1}s ({:.2} tok/s)", prompt.len(), n as f64 / decode_s.max(1e-9));
         }
+        if profiling {
+            part("the reply", at_reply, read_so_far(&self.model));
+        }
         let _ = job.events.send(Event::Done { finish, completion_tokens: n });
         Ok(())
     }
@@ -285,7 +328,47 @@ pub(crate) struct WgpuExperts {
     /// 32 decode steps of the same prompt (the same tokens): exclusive read 35.8 GB, inclusive 34.2. A decode step
     /// takes experts in and lets others go, and one let go was then in neither tier.
     exclusive: std::sync::atomic::AtomicBool,
+    /// The share of the experts the computer's other GPUs hold for good ([`WgpuExperts::pin_on`]).
+    pinned: Option<Pinned>,
 }
+
+/// Experts the other GPUs hold for good: a fixed share of every layer's (its last ones: the RAM tier's idle reading
+/// starts from the first), each read from the drive once into a slot of its own while the server idles and never
+/// replaced. The first card's tier follows what is used (LFRU) and RAM holds what it can of the rest; this share needs
+/// neither, so between them the tiers hold more of the 10,612 than RAM alone, and a prompt, which routes to most of
+/// them, reads that much less from the drive each time.
+struct Pinned {
+    /// each card's slots, and the plan's first slot that is its own
+    cards: Vec<(RecordSlots, usize)>,
+    layers: usize,
+    per_layer: usize,
+    /// slots over the cards: plan slot `g` is layer `g % layers`'s expert `per_layer - 1 - g / layers`
+    total: usize,
+    /// the experts whose records are in their slots so far: `(card, slot)`
+    index: std::sync::RwLock<std::collections::HashMap<(u32, u32), (usize, usize)>>,
+    /// the plan's next slot to fill
+    next: std::sync::atomic::AtomicUsize,
+}
+
+impl Pinned {
+    fn expert(&self, g: usize) -> (u32, u32) {
+        ((g % self.layers) as u32, (self.per_layer - 1 - g / self.layers) as u32)
+    }
+
+    /// The plan's slot for `(layer, expert)`, if it is one of the share.
+    fn slot(&self, layer: u32, expert: u32) -> Option<usize> {
+        let g = (self.per_layer - 1).checked_sub(expert as usize)? * self.layers + layer as usize;
+        (g < self.total).then_some(g)
+    }
+
+    fn card(&self, g: usize) -> (usize, usize) {
+        let c = self.cards.iter().rposition(|&(_, first)| first <= g).expect("a plan slot is a card's");
+        (c, g - self.cards[c].1)
+    }
+}
+
+/// Threads reading the pinned share's records from the drive at once (as dsv41's readers).
+const PIN_READERS: usize = 8;
 
 /// Decode steps after which every count halves (as the CUDA engine's tier): without aging, an old topic's experts would
 /// keep the slots for good.
@@ -308,7 +391,93 @@ impl WgpuExperts {
             resident,
             admit_on_decode: std::sync::atomic::AtomicBool::new(true),
             exclusive: std::sync::atomic::AtomicBool::new(false),
+            pinned: None,
         })
+    }
+
+    /// Have `gpus` (the computer's other cards) hold a share of the `layers * per_layer` routed experts for good, as
+    /// many as each one's weight budget has room for but [`MARGIN`]: the slots are made now and filled while the server
+    /// idles ([`Self::pin_some`]). How many they will hold.
+    pub(crate) fn pin_on(&mut self, gpus: &[Arc<WgpuBackend>], layers: usize, per_layer: usize) -> usize {
+        let record = dsv41::expert::RECORD_BYTES;
+        let (mut cards, mut total) = (Vec::new(), 0usize);
+        for gpu in gpus {
+            let (used, budget) = gpu.usage();
+            let room = ((budget.saturating_sub(used).saturating_sub(MARGIN) / record as u64) as usize).min(layers * per_layer - total);
+            if let Some(slots) = (room > 0).then(|| gpu.record_slots(room, record)).flatten() {
+                let n = slots.len();
+                cards.push((slots, total));
+                total += n;
+            }
+        }
+        if total > 0 {
+            self.pinned = Some(Pinned { cards, layers, per_layer, total, index: Default::default(), next: Default::default() });
+        }
+        total
+    }
+
+    /// For each of `layer`'s `experts`, the other card and slot that hold it now, if one does.
+    fn pinned_now(&self, layer: u32, experts: &[u32]) -> Vec<Option<(usize, usize)>> {
+        match &self.pinned {
+            Some(p) => {
+                let index = p.index.read().unwrap_or_else(|e| e.into_inner());
+                experts.iter().map(|&e| index.get(&(layer, e)).copied()).collect()
+            }
+            None => vec![None; experts.len()],
+        }
+    }
+
+    /// Whether `(layer, expert)` is one of the share the other GPUs hold for good (filled yet or not).
+    pub(crate) fn pins(&self, layer: u32, expert: u32) -> bool {
+        self.pinned.as_ref().is_some_and(|p| p.slot(layer, expert).is_some())
+    }
+
+    /// The experts the other GPUs hold so far.
+    pub(crate) fn pinned(&self) -> usize {
+        self.pinned.as_ref().map_or(0, |p| p.index.read().unwrap_or_else(|e| e.into_inner()).len())
+    }
+
+    /// Fill the share's next `count` slots: their records read from `store` on several threads, written to their slots,
+    /// and let go from the RAM tier if a request had read them there. Whether more are left to fill.
+    pub(crate) fn pin_some(&self, store: &dyn oaiy_engine::store::WeightStore, cache: &oaiy_engine::ecache::Ecache, count: usize) -> bool {
+        use std::sync::atomic::Ordering;
+        let Some(p) = &self.pinned else { return false };
+        let first = p.next.load(Ordering::Relaxed);
+        if first >= p.total {
+            return false;
+        }
+        let last = (first + count).min(p.total);
+        let turn = std::sync::atomic::AtomicUsize::new(first);
+        let read: Mutex<Vec<(usize, Vec<u8>)>> = Mutex::new(Vec::with_capacity(last - first));
+        std::thread::scope(|scope| {
+            for _ in 0..PIN_READERS.min(last - first) {
+                scope.spawn(|| loop {
+                    let g = turn.fetch_add(1, Ordering::Relaxed);
+                    if g >= last {
+                        break;
+                    }
+                    let (layer, expert) = p.expert(g);
+                    let mut record = vec![0u8; dsv41::expert::RECORD_BYTES];
+                    // (a record that cannot be read is left out: its expert goes through RAM as before)
+                    if store.fetch(layer, expert, &mut record).is_ok() {
+                        read.lock().unwrap_or_else(|e| e.into_inner()).push((g, record));
+                    }
+                });
+            }
+        });
+        let read = read.into_inner().unwrap_or_else(|e| e.into_inner());
+        for (g, record) in &read {
+            let (card, slot) = p.card(*g);
+            p.cards[card].0.write(slot, record);
+        }
+        let mut index = p.index.write().unwrap_or_else(|e| e.into_inner());
+        for (g, _) in &read {
+            let (layer, expert) = p.expert(*g);
+            index.insert((layer, expert), p.card(*g));
+            cache.remove(layer, expert);
+        }
+        p.next.store(last, Ordering::Relaxed);
+        last < p.total
     }
 
     /// Keep what comes in out of the RAM tier, or in both (the default).
@@ -370,22 +539,65 @@ impl dsv41::expert::ExpertsKernel for WgpuExperts {
     }
 
     fn holds(&self, layer: u32, experts: &[u32], tokens: &[usize]) -> Vec<bool> {
-        match &self.resident {
-            Some(r) => r.lock().unwrap_or_else(|p| p.into_inner()).holds(layer, experts, tokens),
-            None => vec![false; experts.len()],
+        // the other cards' share is held without being counted; the first card's tier counts and holds of the rest
+        let there = self.pinned_now(layer, experts);
+        let (rest, rest_tokens): (Vec<u32>, Vec<usize>) = experts.iter().zip(tokens).zip(&there).filter(|(_, at)| at.is_none()).map(|((&e, &n), _)| (e, n)).unzip();
+        let mut of_rest = match &self.resident {
+            Some(r) => r.lock().unwrap_or_else(|p| p.into_inner()).holds(layer, &rest, &rest_tokens),
+            None => vec![false; rest.len()],
         }
+        .into_iter();
+        there.iter().map(|at| at.is_some() || of_rest.next().expect("one of the rest")).collect()
     }
 
     fn forward_held(&self, layer: u32, jobs: &[(u32, &[f32], &[f32])], swiglu_limit: f32) -> Vec<Vec<f32>> {
-        let r = self.resident.as_ref().expect("a kernel that holds experts").lock().unwrap_or_else(|p| p.into_inner());
-        let picks: Vec<(usize, &[f32], &[f32])> = jobs.iter().map(|&(e, x, w)| (r.index[&(layer, e)], x, w)).collect();
-        picks.chunks(dsv41::moe::GPU_GROUP).flat_map(|part| run(&r.slots, part, swiglu_limit)).collect()
+        let experts: Vec<u32> = jobs.iter().map(|j| j.0).collect();
+        let there = self.pinned_now(layer, &experts);
+        // each card's experts in a thread of its own: the first card's tier, and each other card's share
+        let cards = self.pinned.as_ref().map_or(0, |p| p.cards.len());
+        let mut outs: Vec<Option<Vec<f32>>> = (0..jobs.len()).map(|_| None).collect();
+        std::thread::scope(|scope| {
+            let shares: Vec<_> = (0..cards)
+                .filter_map(|c| {
+                    let mine: Vec<usize> = (0..jobs.len()).filter(|&j| there[j].is_some_and(|(card, _)| card == c)).collect();
+                    (!mine.is_empty()).then(|| {
+                        let there = &there;
+                        let slots = &self.pinned.as_ref().expect("a share's card").cards[c].0;
+                        let handle = scope.spawn(move || {
+                            let picks: Vec<(usize, &[f32], &[f32])> = mine.iter().map(|&j| (there[j].expect("its slot").1, jobs[j].1, jobs[j].2)).collect();
+                            let got: Vec<Vec<f32>> = picks.chunks(dsv41::moe::GPU_GROUP).flat_map(|part| run(slots, part, swiglu_limit)).collect();
+                            (mine, got)
+                        });
+                        handle
+                    })
+                })
+                .collect();
+            let first: Vec<usize> = (0..jobs.len()).filter(|&j| there[j].is_none()).collect();
+            if !first.is_empty() {
+                let r = self.resident.as_ref().expect("a kernel that holds experts").lock().unwrap_or_else(|p| p.into_inner());
+                let picks: Vec<(usize, &[f32], &[f32])> = first.iter().map(|&j| (r.index[&(layer, jobs[j].0)], jobs[j].1, jobs[j].2)).collect();
+                let got: Vec<Vec<f32>> = picks.chunks(dsv41::moe::GPU_GROUP).flat_map(|part| run(&r.slots, part, swiglu_limit)).collect();
+                for (j, out) in first.into_iter().zip(got) {
+                    outs[j] = Some(out);
+                }
+            }
+            for share in shares {
+                let (mine, got) = share.join().expect("a card's experts panicked");
+                for (j, out) in mine.into_iter().zip(got) {
+                    outs[j] = Some(out);
+                }
+            }
+        });
+        outs.into_iter().map(|o| o.expect("every held expert computed")).collect()
     }
 
     fn prefetch_order(&self, layer: u32, experts: u32) -> Vec<u32> {
-        let Some(r) = &self.resident else { return (0..experts).collect() };
+        let all: Vec<u32> = (0..experts).collect();
+        let there = self.pinned_now(layer, &all);
+        let rest = all.into_iter().filter(|&e| there[e as usize].is_none());
+        let Some(r) = &self.resident else { return rest.collect() };
         let r = r.lock().unwrap_or_else(|p| p.into_inner());
-        let mut order: Vec<u32> = (0..experts).filter(|&e| !r.index.contains_key(&(layer, e))).collect();
+        let mut order: Vec<u32> = rest.filter(|&e| !r.index.contains_key(&(layer, e))).collect();
         order.sort_by_key(|&e| std::cmp::Reverse(r.freq((layer, e))));
         order
     }

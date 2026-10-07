@@ -261,6 +261,32 @@ pub fn expert_forward_batch(record: &[u8], x: &[f32], route_weights: Option<&[f3
     fp4_matmul(&hq, nt, &record[W2], &record[S2], DIM, INTER).into_iter().map(to_bf16).collect()
 }
 
+/// [`expert_forward_batch`] on the caller's thread through a row kernel ([`crate::cpu::row_kernel`]: the SIMD one
+/// where the CPU has it), a row of `x` at a time: each output row is summed in [`expert_forward`]'s order, so the same
+/// bits. For a prompt's experts of a few rows, many of them computed at once on a pool's threads:
+/// `expert_forward_batch` starts a thread a core for each of its three matrices, under workers that already fill
+/// the cores, and decodes each weight through a table one at a time (a 91-token prompt's 7,200 experts on the CPU
+/// took 22 s that way).
+pub fn expert_forward_rows(kernel: crate::cpu_experts::RowKernel, record: &[u8], x: &[f32], route_weights: Option<&[f32]>, swiglu_limit: f32) -> Vec<f32> {
+    assert_eq!(record.len(), RECORD_BYTES);
+    assert_eq!(x.len() % DIM, 0);
+    let nt = x.len() / DIM;
+    if let Some(w) = route_weights {
+        assert_eq!(w.len(), nt);
+    }
+    let (mut gate, mut up, mut y) = (vec![0.0f32; INTER], vec![0.0f32; INTER], vec![0.0f32; DIM]);
+    let mut out = Vec::with_capacity(nt * DIM);
+    for t in 0..nt {
+        let xq = fake_quant_fp8(&x[t * DIM..(t + 1) * DIM], BLOCK);
+        kernel(&xq, &record[W1], &record[S1], DIM, 0, &mut gate);
+        kernel(&xq, &record[W3], &record[S3], DIM, 0, &mut up);
+        let hq = fake_quant_fp8(&swiglu(&gate, &up, route_weights.map(|w| &w[t..t + 1]), swiglu_limit), BLOCK);
+        kernel(&hq, &record[W2], &record[S2], INTER, 0, &mut y);
+        out.extend(y.iter().map(|&v| to_bf16(v)));
+    }
+    out
+}
+
 /// The middle of [`expert_forward_batch`]: from the gate and up sums (`[rows, INTER]`, f32) to the activation the down
 /// projection takes (before its fp8 quantization): each rounded to bf16, clamped, `silu(gate) * up`, times the row's
 /// routing weight, rounded again.
