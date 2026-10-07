@@ -1471,10 +1471,10 @@ impl Qwen35Chain {
         };
         rec.rmsnorm_rows(&e, &sp.enorm, &en, rows, eps);
         rec.rmsnorm_rows(&hid, &sp.hnorm, &hn, rows, eps);
-        for r in 0..rows {
-            rec.copy(&en, r * s.d, &cat, r * 2 * s.d, s.d);
-            rec.copy(&hn, r * s.d, &cat, r * 2 * s.d + s.d, s.d);
-        }
+        // (each row's two halves side by side: two dispatches, where a copy a half a row was 2,046 a chunk of 1,024,
+        // each with its parameters to make)
+        rec.store_rows(&en, &cat, rows, s.d, 0, 2 * s.d, 0);
+        rec.store_rows(&hn, &cat, rows, s.d, 0, 2 * s.d, s.d);
         rec.matmul_rows(quant(&mtp.eh_proj), &cat, &x, rows);
         // its K and V into its cache (as its block makes them: the rest of the block, whose output nothing reads
         // here, not run)
@@ -1540,10 +1540,8 @@ impl Qwen35Chain {
             }
             rec.rmsnorm_rows(&ev, &sp.enorm, &env, rows, eps);
             rec.rmsnorm_rows(&hv, &sp.hnorm, &hnv, rows, eps);
-            for r in 0..rows {
-                rec.copy(&env, r * s.d, &cat, r * 2 * s.d, s.d);
-                rec.copy(&hnv, r * s.d, &cat, r * 2 * s.d + s.d, s.d);
-            }
+            rec.store_rows(&env, &cat, rows, s.d, 0, 2 * s.d, 0);
+            rec.store_rows(&hnv, &cat, rows, s.d, 0, 2 * s.d, s.d);
             let w = MtpRows::of(wk, &s, rows);
             rec.matmul_rows(quant(&mtp.eh_proj), &cat, &w.x, rows);
             mtp_block(m, mtp, sp, &s, &mut *rec, &g, &w, rows, at, Some((&wk.q1, g.start)));

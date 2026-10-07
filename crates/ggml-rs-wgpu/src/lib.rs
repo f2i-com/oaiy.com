@@ -277,10 +277,35 @@ pub(crate) enum Piece {
     Fed(Arc<Mutex<Option<wgpu::SubmissionIndex>>>),
 }
 
-/// What a device's feed is handed: a piece's dispatches, encoded when its turn comes, or command buffers as they are.
+/// What a device's feed is handed: a piece's dispatches, encoded when its turn comes, command buffers as they are,
+/// or a write of the host's into a buffer (its bytes, at an offset) made in its turn.
 enum Fare {
     Dispatches(Vec<Dispatch>),
     Commands(Vec<wgpu::CommandBuffer>),
+    Write(wgpu::Buffer, u64, Vec<u8>),
+}
+
+/// `data` (a multiple of 4 bytes) into `buffer` at `offset` through a write's staging memory, copied there from every
+/// core: one core's copy into the card's memory (Resizable BAR) took 1.4 GB/s, most of a weight's load. Small
+/// writes as `write_buffer`'s.
+fn write_bytes(queue: &wgpu::Queue, buffer: &wgpu::Buffer, offset: u64, data: &[u8]) {
+    let size = match wgpu::BufferSize::new(data.len() as u64) {
+        Some(size) if data.len() >= 8 << 20 => size,
+        _ => return queue.write_buffer(buffer, offset, data),
+    };
+    let Some(mut view) = queue.write_buffer_with(buffer, offset, size) else { return queue.write_buffer(buffer, offset, data) };
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
+    let each = data.len().div_ceil(threads).div_ceil(4096) * 4096;
+    let mut whole = view.slice(..);
+    let base = whole.as_raw_ptr().cast::<u8>().as_ptr() as usize;
+    std::thread::scope(|s| {
+        for (i, part) in data.chunks(each).enumerate() {
+            let at = base + i * each;
+            // SAFETY: each thread writes its own bytes of the staging memory, mapped for writing until the view
+            // (which outlives this scope) is dropped; nothing reads them
+            s.spawn(move || unsafe { std::ptr::copy_nonoverlapping(part.as_ptr(), at as *mut u8, part.len()) });
+        }
+    });
 }
 
 /// A device's pieces waiting for its queue, where its pieces in flight are limited
@@ -365,6 +390,14 @@ fn feed_pieces(feed: Arc<Feed>, device: wgpu::Device, queue: wgpu::Queue, watch:
         };
         // (an error of the queue's is a panic of its handler's: this thread's, so said to the feed's users)
         let gone = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // (a write: made now, after the pieces before it and before those after; nothing of the GPU's to wait for)
+            let fare = match fare {
+                Fare::Write(buffer, offset, data) => {
+                    write_bytes(&queue, &buffer, offset, &data);
+                    return Ok::<_, String>(None);
+                }
+                fare => fare,
+            };
             let most = pieces_in_flight_asked().unwrap_or_else(|| limit.load(Ordering::Relaxed));
             while most > 0 && flying.len() >= most {
                 let oldest = flying.pop_front().expect("a piece in flight");
@@ -376,15 +409,16 @@ fn feed_pieces(feed: Arc<Feed>, device: wgpu::Device, queue: wgpu::Queue, watch:
             let commands = match fare {
                 Fare::Dispatches(dispatches) => vec![encode(&device, &dispatches)],
                 Fare::Commands(commands) => commands,
+                Fare::Write(..) => unreachable!("a write is made above"),
             };
             let index = queue.submit(commands);
             flying.push_back(index.clone());
-            Ok::<_, String>(index)
+            Ok(Some(index))
         }));
         let mut s = feed.state.lock().unwrap_or_else(|p| p.into_inner());
         match gone {
             Ok(Ok(index)) => {
-                *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(index);
+                *slot.lock().unwrap_or_else(|p| p.into_inner()) = index;
                 s.gone += 1;
             }
             Ok(Err(why)) => s.failed = Some(why),
@@ -701,30 +735,23 @@ impl Gpu {
         out
     }
 
-    /// Upload whole rows into buffers below the binding limit.
-    /// `data` (a multiple of 4 bytes) into `buffer` at `offset` through a write's staging memory, copied there from every
-    /// core: one core's copy into the card's memory (Resizable BAR) took 1.4 GB/s, most of a weight's load. Small
-    /// writes as `write_buffer`'s.
+    /// `data` (a multiple of 4 bytes) into `buffer` at `offset` ([`write_bytes`]): at once, or, behind pieces still
+    /// waiting for the queue, in its turn after them by the feed (a copy of the bytes), the caller going on (a
+    /// prompt's next chunk is recorded as the one before runs: its embeddings' upload waiting for the queue kept the
+    /// recording to the GPU's last pieces).
     pub(crate) fn write(&self, buffer: &wgpu::Buffer, offset: u64, data: &[u8]) {
-        let size = match wgpu::BufferSize::new(data.len() as u64) {
-            Some(size) if data.len() >= 8 << 20 => size,
-            _ => return self.queue().write_buffer(buffer, offset, data),
+        let holds = {
+            let s = self.feed.state.lock().unwrap_or_else(|p| p.into_inner());
+            s.gone < s.handed && s.failed.is_none()
         };
-        let Some(mut view) = self.queue().write_buffer_with(buffer, offset, size) else { return self.queue().write_buffer(buffer, offset, data) };
-        let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
-        let each = data.len().div_ceil(threads).div_ceil(4096) * 4096;
-        let mut whole = view.slice(..);
-        let base = whole.as_raw_ptr().cast::<u8>().as_ptr() as usize;
-        std::thread::scope(|s| {
-            for (i, part) in data.chunks(each).enumerate() {
-                let at = base + i * each;
-                // SAFETY: each thread writes its own bytes of the staging memory, mapped for writing until the view
-                // (which outlives this scope) is dropped; nothing reads them
-                s.spawn(move || unsafe { std::ptr::copy_nonoverlapping(part.as_ptr(), at as *mut u8, part.len()) });
-            }
-        });
+        if holds {
+            self.hand(Fare::Write(buffer.clone(), offset, data.to_vec()));
+        } else {
+            write_bytes(self.queue(), buffer, offset, data);
+        }
     }
 
+    /// Upload whole rows into buffers below the binding limit.
     fn upload_rows(&self, bytes: &[u8], row_bytes: usize, _hint: usize) -> Vec<(wgpu::Buffer, u32, u32)> {
         let rows = bytes.len() / row_bytes;
         let per = ((chunk_limit(&self.limits) as usize) / row_bytes).max(1);

@@ -3931,7 +3931,9 @@ impl ggml_rs::DeviceStorage for Aliased {
         staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
         self.gpu.wait(None);
         let view = staging.slice(..).get_mapped_range().expect("webgpu: mapping a finished buffer");
-        let host: Vec<f32> = view.chunks_exact(4).take(len).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        // (as bytes: every target wgpu runs on is little-endian)
+        let mut host = vec![0f32; len];
+        bytemuck::cast_slice_mut::<f32, u8>(&mut host).copy_from_slice(&view[..len * 4]);
         drop(view);
         staging.unmap();
         host
@@ -6060,19 +6062,28 @@ impl ChainRecorder for Recorder<'_> {
                 e.1 += 1;
             }
         }
-        let out = self
-            .reads
-            .iter()
-            .map(|(_, _, staging, len)| {
-                let view = staging.slice(..(*len as u64 * 4).max(4)).get_mapped_range().expect("webgpu: mapping a finished buffer");
-                // copied as bytes (a 512-row chunk's cache rows, 64 MB: a value at a time some 15 ms)
-                let mut v = vec![0f32; *len];
-                bytemuck::cast_slice_mut::<f32, u8>(&mut v).copy_from_slice(&view[..*len * 4]);
-                drop(view);
-                staging.unmap();
-                v
-            })
-            .collect();
+        // copied as bytes (a 512-row chunk's cache rows, 64 MB: a value at a time some 15 ms), 8 MB or more of them on
+        // every core, the host's pages first touched there (a checkpoint's 96 recurrent states, 149 MB: 34 ms on one)
+        let copied = |staging: &wgpu::Buffer, len: usize| {
+            use rayon::prelude::*;
+            let view = staging.slice(..(len as u64 * 4).max(4)).get_mapped_range().expect("webgpu: mapping a finished buffer");
+            let mut v = vec![0f32; len];
+            let (to, from) = (bytemuck::cast_slice_mut::<f32, u8>(&mut v), &view[..len * 4]);
+            if from.len() >= 8 << 20 {
+                to.par_chunks_mut(1 << 20).zip(from.par_chunks(1 << 20)).for_each(|(t, f)| t.copy_from_slice(f));
+            } else {
+                to.copy_from_slice(from);
+            }
+            drop(view);
+            staging.unmap();
+            v
+        };
+        let out = if self.reads.iter().map(|r| r.3 * 4).sum::<usize>() >= 8 << 20 && self.reads.len() > 1 {
+            use rayon::prelude::*;
+            self.reads.par_iter().map(|(_, _, staging, len)| copied(staging, *len)).collect()
+        } else {
+            self.reads.iter().map(|(_, _, staging, len)| copied(staging, *len)).collect()
+        };
         let staged: Vec<(u64, wgpu::Buffer)> = std::mem::take(&mut self.reads).into_iter().map(|(_, _, staging, _)| (staging.size(), staging)).collect();
         self.gpu().unstage(staged);
         crate::profile::add(&crate::profile::LINEAR_WAIT, start);

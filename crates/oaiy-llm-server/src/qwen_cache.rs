@@ -5,6 +5,41 @@ use ggml_rs::{Backend, Tensor};
 use llama_rs::{KvCache, qwen35::SsmConfig};
 use std::sync::Arc;
 
+/// `slots`' tensors on the host: those a layer's device holds as its chain's vectors read back together, one wait a
+/// device for them all and their bytes copied on every core (a tensor at a time was a wait each: the 27B's 96
+/// recurrent tensors, 149 MB, 34 ms a checkpoint where 29 now, the transfer's own), the rest each its own.
+fn hosted(kv: &KvCache, slots: &[Option<Tensor>]) -> Vec<Option<Tensor>> {
+    let mut out: Vec<Option<Tensor>> = slots.iter().map(|_| None).collect();
+    // (the layers by their devices, in turn)
+    let mut left: Vec<usize> = (0..slots.len()).filter(|&i| slots[i].is_some()).collect();
+    while let Some(&first) = left.first() {
+        let backend = kv.layer_backends.get(first);
+        let same = |i: usize| match (backend, kv.layer_backends.get(i)) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        let (these, rest): (Vec<usize>, Vec<usize>) = left.iter().partition(|&&i| i == first || same(i));
+        left = rest;
+        let chain = backend.and_then(|b| b.chain());
+        let vectors: Vec<(usize, ggml_rs::DeviceVec)> = these.iter().filter_map(|&i| Some((i, chain?.aliased(slots[i].as_ref()?)?))).collect();
+        if let (Some(chain), true) = (chain, vectors.len() > 1) {
+            let mut rec = chain.begin();
+            for (_, v) in &vectors {
+                rec.read(v);
+            }
+            for ((i, _), values) in vectors.iter().zip(rec.finish()) {
+                out[*i] = Some(Tensor::from_vec(values, slots[*i].as_ref().expect("a tensor").shape().to_vec()));
+            }
+        }
+        for i in these {
+            if out[i].is_none() {
+                out[i] = slots[i].as_ref().map(Tensor::to_host);
+            }
+        }
+    }
+    out
+}
+
 #[derive(Clone)]
 pub struct Snapshot {
     pub pos: usize,
@@ -24,9 +59,9 @@ impl RecurrentSnapshot {
             .map(|layer| [None, None, layer[2].clone(), layer[3].clone()]).collect() })
     }
     pub fn capture(kv: &KvCache) -> Self {
-        Self(Snapshot { pos: kv.len, layers: kv.ssm_state.iter().zip(&kv.ssm_conv)
-            .map(|(s,c)| [None, None, s.as_ref().map(Tensor::to_host), c.as_ref().map(Tensor::to_host)])
-            .collect() })
+        let mut states = hosted(kv, &kv.ssm_state);
+        let mut convs = hosted(kv, &kv.ssm_conv);
+        Self(Snapshot { pos: kv.len, layers: (0..kv.ssm_state.len()).map(|i| [None, None, states[i].take(), convs[i].take()]).collect() })
     }
     pub fn bytes(&self) -> usize {
         self.0.layers.iter().flatten().flatten().map(|t| t.numel()*4).sum()

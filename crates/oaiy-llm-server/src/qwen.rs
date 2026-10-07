@@ -577,14 +577,18 @@ impl QwenEngine {
         }
         let mut logits = None;
         let mut pos = start;
+        // (OAIY_PREFILL_LOG: each run's rows and time, its embedding's and its checkpoint's)
+        let said = std::env::var_os("OAIY_PREFILL_LOG").is_some();
         while pos < keys.len() {
             if job.cancel.load(Ordering::Relaxed) { return Ok(()); }
+            let (from, began) = (pos, std::time::Instant::now());
             // a text prompt's chunks up to the next checkpoint together, where the model runs them so (some at a time,
             // between cancellations' looks)
             if hybrid.pipelines() && job.images.is_empty() {
                 let stop = stops.iter().copied().find(|&s| s > pos).unwrap_or(keys.len()).min(keys.len()).min(pos + 8 * PREFILL_CHUNK);
                 let spans: Vec<(usize, usize)> = (pos..stop).step_by(PREFILL_CHUNK).map(|a| (a, (a + PREFILL_CHUNK).min(stop))).collect();
                 let embeds = spans.iter().map(|&(a, b)| hybrid.embed(&job.prompt[a..b])).collect::<Result<Vec<_>, _>>()?;
+                if said { eprintln!("  prefill: {} rows embedded in {:.1} ms", stop - pos, began.elapsed().as_secs_f64() * 1e3); }
                 let chunks: Vec<(&[u32], Tensor)> = spans.iter().zip(embeds).map(|(&(a, b), e)| (&job.prompt[a..b], e)).collect();
                 let events = &job.events;
                 let mut done = |i: usize| { let _ = events.send(Event::Progress { done: spans[i].1 - start, total }); };
@@ -605,6 +609,8 @@ impl QwenEngine {
                 let _ = job.events.send(Event::Progress { done: end-start, total });
                 pos = end;
             }
+            if said { eprintln!("  prefill: rows {from}..{pos} in {:.1} ms", began.elapsed().as_secs_f64() * 1e3); }
+            let began = std::time::Instant::now();
             if stops.contains(&pos) && !self.checkpoints.iter().any(|(saved, _, _)| saved == &keys[..pos]) {
                 if self.log { eprintln!("  Qwen checkpoint: {pos} tokens; disk={}", self.disk.is_some()); }
                 let base = stops.first() == Some(&pos);
@@ -622,6 +628,7 @@ impl QwenEngine {
                 // Keep the system prefix plus recent conversation boundaries.
                 // Host storage avoids competing with media for VRAM.
                 trim_checkpoints(&mut self.checkpoints);
+                if said { eprintln!("  prefill: the checkpoint at {pos} in {:.1} ms", began.elapsed().as_secs_f64() * 1e3); }
             }
         }
         let prefill_secs = clock.elapsed().as_secs_f64();
@@ -742,10 +749,19 @@ fn trim_checkpoints(checkpoints: &mut Vec<(Vec<u64>, RecurrentSnapshot, bool)>) 
 /// Save before the first user message, before the current assistant header
 /// (thinking/tool rendering changes its suffix), and one token short of the
 /// entire prompt so an identical retry still runs a token to recover logits.
+/// A checkpoint this close before the prompt's last token serves the same prompt asked again as one at that token
+/// would: the tokens between are run from it.
+const NEAR_THE_END: usize = 16;
+
 fn checkpoint_positions(prompt: &[u32], im_start: Option<u32>) -> Vec<usize> {
     let boundaries: Vec<_> = prompt.iter().enumerate().filter_map(|(i, &t)|
         (i > 0 && Some(t) == im_start).then_some(i)).collect();
-    let mut stops = vec![prompt.len().saturating_sub(1)];
+    // The position before the last (the same prompt asked again runs one token), unless the last boundary is a few
+    // tokens back (a chat's: the assistant's header): a checkpoint is the recurrent states to the host (the 27B's
+    // 149 MB, 30 ms) and a run cut in two there, each prompt, for the header's few tokens' 30 ms when one is asked again.
+    let last = prompt.len().saturating_sub(1);
+    let mut stops = Vec::new();
+    if boundaries.last().map_or(true, |&b| last.saturating_sub(b) > NEAR_THE_END) { stops.push(last); }
     stops.extend(boundaries.first().copied());
     stops.extend(boundaries.last().copied());
     stops.retain(|&p| p > 0 && p < prompt.len());
@@ -827,7 +843,12 @@ mod tests {
         let first = [1, 10, 11, 1, 20, 21, 1, 30, 31, 32];
         let next = [1, 10, 11, 1, 20, 21, 1, 30, 40, 41, 1, 50];
         let stops = checkpoint_positions(&first, Some(1));
-        assert_eq!(stops, [3, 6, 9]);
+        // (the last boundary three tokens from the end: none at the token before the last)
+        assert_eq!(stops, [3, 6]);
+        // a boundary far from the end leaves the one before the last token
+        let mut long = vec![7u32; 40];
+        long[3] = 1;
+        assert_eq!(checkpoint_positions(&long, Some(1)), [3, 39]);
         assert_eq!(stops.iter().copied().filter(|&p| next.starts_with(&first[..p])).max(), Some(6));
         assert_eq!(checkpoint_positions(&[1], Some(1)), []);
         assert_eq!(checkpoint_positions(&[7, 8, 9], None), [2]);
