@@ -507,12 +507,10 @@ impl Request {
             return Err("prompt must not be empty".into());
         }
         if self.webgpu {
-            let nag = self.guidance.as_ref().is_none_or(|g| g.cfg == 1.) && self.negative_prompt.is_some();
             let unsupported = [
                 (self.audio || self.audio_file.is_some() || self.speech.is_some() || self.reference_voice.is_some() || self.identity, "sound (set audio to false)"),
                 (self.lora.is_some(), "LoRAs"),
                 (self.refine.is_some(), "two-stage refinement"),
-                (nag, "a negative prompt without CFG (NAG)"),
             ];
             if let Some((_, what)) = unsupported.iter().find(|(on, _)| *on) {
                 return Err(format!("WebGPU video does not support {what} yet"));
@@ -900,6 +898,12 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     // A negative prompt without CFG steers every step by NAG.
     if let (true, Some(context), Model::Candle(model)) = (r.guidance.as_ref().is_none_or(|g| g.cfg == 1.), &negative, &mut model) {
         model.nag = Some(transformer::Nag { context: context.clone(), scale: r.nag.0, tau: r.nag.1, alpha: r.nag.2 });
+        report(event("negative_prompt_nag", 1, 1));
+    }
+    #[cfg(feature = "webgpu")]
+    if let (true, Some(context), Model::Wgpu(model, _)) = (r.guidance.as_ref().is_none_or(|g| g.cfg == 1.), &negative, &mut model) {
+        let values = context.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        model.nag = Some(crate::ltx_wgpu::Nag { rows: values.len() / 4096, context: values, scale: r.nag.0 as f32, tau: r.nag.1 as f32, alpha: r.nag.2 as f32 });
         report(event("negative_prompt_nag", 1, 1));
     }
     let int8_weights = matches!(&model, Model::Candle(m) if m.int8);
@@ -1816,10 +1820,10 @@ mod tests {
         let r = request("").unwrap();
         assert!(r.webgpu && !r.audio, "sound off by default on WebGPU, though the checkpoint has its VAE");
         assert!(request(r#","guidance":{"steps":30}"#).unwrap().guidance.is_some(), "guided sampling, its negative prompt by CFG");
+        assert!(request(r#","negative_prompt":"n""#).unwrap().negative_prompt.is_some(), "a negative prompt without CFG: by NAG");
         for (extra, what) in [
             (r#","audio":true"#, "sound"),
             (r#","lora":"l""#, "LoRAs"),
-            (r#","negative_prompt":"n""#, "NAG"),
             (r#","refine":{"transformer":"t","upsampler":"u"}"#, "refinement"),
         ] {
             let e = request(extra).unwrap_err();

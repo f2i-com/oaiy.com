@@ -431,6 +431,15 @@ pub trait ChainRecorder {
         let _ = (x, rows, heads, head_dim, table);
         unimplemented!("a split rotary on this device")
     }
+    /// Normalised attention guidance's mix of an attention's output `pos` and the same queries' over a negative
+    /// context, `neg` (`rows` rows of `width` each), into `pos`: `guided = pos * scale - neg * (scale - 1)`, each row
+    /// of it scaled back to `tau` times `pos`'s row where its L1 norm is more than that (`min(1, tau * (|pos| + 1e-6)
+    /// / |guided|)`), then `guided * alpha + pos * (1 - alpha)`.
+    #[allow(clippy::too_many_arguments)]
+    fn nag_mix(&mut self, pos: &DeviceVec, neg: &DeviceVec, rows: usize, width: usize, scale: f32, tau: f32, alpha: f32) {
+        let _ = (pos, neg, rows, width, scale, tau, alpha);
+        unimplemented!("normalised attention guidance on this device")
+    }
     /// `y[r, h, ..] *= 2 sigmoid(logits[r, h])` for `rows` rows of `heads` heads of `head_dim`: a gated attention's
     /// per-head gate.
     fn head_gate_rows(&mut self, y: &DeviceVec, logits: &DeviceVec, rows: usize, heads: usize, head_dim: usize) {

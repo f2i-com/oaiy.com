@@ -1403,6 +1403,53 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 "#;
 
 /// `y[i] *= 2 sigmoid(logits[i / p[0].x])` for `i < p[0].y` (`p[0].x` a head's width): a gated attention's heads.
+/// [`ChainRecorder::nag_mix`]: a workgroup a row, each thread its share of the row's values four at a time; the row's
+/// L1 norms (the guided output's and the plain one's) summed by sixteens through the workgroup's memory. `p[0]`: the
+/// row's width (a multiple of 4), rows, and the bits of scale and tau; `p[1].x`: alpha's.
+const NAG_MIX: &str = r#"
+@group(0) @binding(0) var<storage, read> neg: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read_write> pos: array<vec4<f32>>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> part: array<vec2<f32>, 256>;
+var<workgroup> some: array<vec2<f32>, 16>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let w4 = p[0].x / 4u;
+    let row = wg.x + wg.y * 65535u;
+    if (row >= p[0].y) { return; }
+    let scale = bitcast<f32>(p[0].z);
+    let tau = bitcast<f32>(p[0].w);
+    let alpha = bitcast<f32>(p[1].x);
+    let at = row * w4;
+    var sums = vec2<f32>(0.0);
+    for (var c = li; c < w4; c += 256u) {
+        let a = pos[at + c];
+        let g = abs(a * scale - neg[at + c] * (scale - 1.0));
+        let q = abs(a);
+        sums += vec2<f32>(g.x + g.y + g.z + g.w, q.x + q.y + q.z + q.w);
+    }
+    part[li] = sums;
+    workgroupBarrier();
+    if (li < 16u) {
+        var s = vec2<f32>(0.0);
+        for (var i = 0u; i < 16u; i++) { s += part[li * 16u + i]; }
+        some[li] = s;
+    }
+    workgroupBarrier();
+    var total = vec2<f32>(0.0);
+    for (var i = 0u; i < 16u; i++) { total += some[i]; }
+    // the guided row within tau times the plain one's size
+    let factor = clamp(tau * (total.y + 1.0e-6) / max(total.x, 1.0e-30), 0.0, 1.0);
+    for (var c = li; c < w4; c += 256u) {
+        let a = pos[at + c];
+        let g = a * scale - neg[at + c] * (scale - 1.0);
+        pos[at + c] = g * (factor * alpha) + a * (1.0 - alpha);
+    }
+}
+"#;
+
 const HEAD_GATE_ROWS: &str = r#"
 @group(0) @binding(0) var<storage, read> logits: array<f32>;
 @group(0) @binding(6) var<storage, read_write> y: array<f32>;
@@ -5866,6 +5913,14 @@ impl ChainRecorder for Recorder<'_> {
         self.dispatch_kept(&pipeline, buffer(table), buffer(table), buffer(x), &[heads as u32, head_dim as u32, 1, rows as u32, 0, 1], grid(pairs.div_ceil(256)));
     }
 
+    fn nag_mix(&mut self, pos: &DeviceVec, neg: &DeviceVec, rows: usize, width: usize, scale: f32, tau: f32, alpha: f32) {
+        assert!(width % 4 == 0 && pos.len >= rows * width && neg.len >= rows * width, "chain: a guidance mix of {rows} rows of {width}");
+        let d = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        let rows32 = rows as u32;
+        self.dispatch_wide("chain-nag-mix", NAG_MIX, [buffer(neg), &d, &d, &d, &d, &d, buffer(pos), &drw], &[width as u32, rows32, scale.to_bits(), tau.to_bits(), alpha.to_bits()], (rows32.min(65535), rows32.div_ceil(65535), 1));
+    }
+
     fn head_gate_rows(&mut self, y: &DeviceVec, logits: &DeviceVec, rows: usize, heads: usize, head_dim: usize) {
         assert!(y.len >= rows * heads * head_dim && logits.len >= rows * heads, "chain: a head gate of {rows} rows");
         let d = self.gpu().dummy().clone();
@@ -9082,6 +9137,42 @@ fn main() {
             let secs = t.elapsed().as_secs_f64() / 3.0;
             let flops = groups as f64 * (rows * tokens) as f64 * (iters * ks) as f64 * 2.0;
             eprintln!("a tile of {rows}x{tokens}, subgroups {wr}x{wt} of {}x{} ({} fragments), k {ks} a step ({:.1} KB): {:.1} TFLOPS", fr * 16, ft * 16, fr * ft, (a4 + b4) as f64 * 8.0 / 1024.0, flops / secs / 1e12);
+        }
+    }
+
+    /// Normalised attention guidance's mix is the reference's formula (`ltx::transformer::nag_mix`): rows whose
+    /// guided output is within tau of the plain one, rows scaled back to it, and alpha's blend.
+    #[test]
+    fn nag_mix_is_the_formula() {
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        let (rows, width) = (37usize, 1028usize);
+        let mut next = rng(41);
+        let pos: Vec<f32> = (0..rows * width).map(|_| next()).collect();
+        // (every third row's negative far from it: its guided output past tau, scaled back)
+        let neg: Vec<f32> = (0..rows * width).map(|i| if (i / width) % 3 == 0 { -3.0 * next() } else { pos[i] + 0.05 * next() }).collect();
+        for (scale, tau, alpha) in [(11.0f32, 2.5f32, 0.25f32), (3.0, 2.5, 1.0), (1.0, 2.5, 1.0)] {
+            let (pv, nv) = (b.vec(rows * width), b.vec(rows * width));
+            DeviceChain::upload(&b, &pv, &pos);
+            DeviceChain::upload(&b, &nv, &neg);
+            let mut rec = Recorder::new(&b);
+            rec.nag_mix(&pv, &nv, rows, width, scale, tau, alpha);
+            rec.read(&pv);
+            let got = Box::new(rec).finish().pop().unwrap();
+            let (mut worst, mut scaled) = (0f32, 0);
+            for r in 0..rows {
+                let (p, n) = (&pos[r * width..(r + 1) * width], &neg[r * width..(r + 1) * width]);
+                let guided: Vec<f32> = p.iter().zip(n).map(|(a, b)| a * scale - b * (scale - 1.0)).collect();
+                let l1 = |v: &[f32]| v.iter().map(|x| x.abs() as f64).sum::<f64>();
+                let factor = (tau as f64 * (l1(p) + 1e-6) / l1(&guided)).clamp(0.0, 1.0) as f32;
+                scaled += (factor < 1.0) as usize;
+                for c in 0..width {
+                    let want = guided[c] * factor * alpha + p[c] * (1.0 - alpha);
+                    worst = worst.max((got[r * width + c] - want).abs() / want.abs().max(1.0));
+                }
+            }
+            eprintln!("scale {scale}, tau {tau}, alpha {alpha}: {scaled} of {rows} rows scaled back, the worst error {worst:.2e}");
+            assert!(worst < 2e-5, "scale {scale}: {worst}");
+            assert!(scale == 1.0 || scaled > 0, "some rows are scaled back");
         }
     }
 

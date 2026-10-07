@@ -1,5 +1,5 @@
 //! LTX 2.3's transformer on WebGPU, as [`crate::ltx::transformer`] computes its video stream (text- and
-//! image-to-video, its clean first and last frames' tokens at timestep 0: no audio or NAG yet): its weights on the GPU as they are stored where the chain has a kernel
+//! image-to-video, its clean first and last frames' tokens at timestep 0, a negative prompt by NAG: no audio yet): its weights on the GPU as they are stored where the chain has a kernel
 //! for them (NVFP4 packed, the tensor cores decoding it as they multiply: Lightricks' `-nvfp4` release's 44 blocks of
 //! 48), else Q8_0 where the tensor cores take it (a BF16 checkpoint's video stream is 28 GB as f16, 15 as Q8_0), else
 //! f16 (BF16 rounded); its activations f32.
@@ -274,6 +274,21 @@ pub struct WgpuLtx {
     out_table: DeviceVec,
     proj_out: Linear,
     blocks: Vec<Block>,
+    /// A negative prompt by normalised attention guidance, for every forward until cleared (as the reference's
+    /// `ltx::transformer::Transformer::nag`).
+    pub nag: Option<Nag>,
+}
+
+/// A negative prompt's video context (`rows` rows of `D`, the connector's, as the prompt's) and normalised attention
+/// guidance's scale, tau and alpha: each block's text cross-attention is run over it too, and the two outputs mixed
+/// ([`ChainRecorder::nag_mix`]) before the heads' gate and the output projection. One more cross-attention a block,
+/// not a second pass of the model.
+pub struct Nag {
+    pub context: Vec<f32>,
+    pub rows: usize,
+    pub scale: f32,
+    pub tau: f32,
+    pub alpha: f32,
 }
 
 impl WgpuLtx {
@@ -304,7 +319,7 @@ impl WgpuLtx {
             });
             progress(i + 1);
         }
-        Ok(Self { gpu, patchify, keyframe, adaln, prompt, out_table, proj_out, blocks })
+        Ok(Self { gpu, patchify, keyframe, adaln, prompt, out_table, proj_out, blocks, nag: None })
     }
 
     fn vec(&self, len: usize) -> DeviceVec {
@@ -350,10 +365,22 @@ impl WgpuLtx {
         let two = start + end > 0;
         let rows = if two { CleanRows { before: start, from: tokens - end, offset: 9 * D } } else { CleanRows::NONE };
         let out_rows = if two { CleanRows { offset: 2 * D, ..rows } } else { CleanRows::NONE };
-        let s = Scratch::new(&self.gpu, tokens.max(lc));
+        let nag = self.nag.as_ref();
+        if let Some(n) = nag {
+            if n.context.len() != n.rows * D || n.rows == 0 {
+                candle_core::bail!("a negative context of {} values for {} rows", n.context.len(), n.rows);
+            }
+        }
+        let ln = nag.map_or(0, |n| n.rows);
+        let s = Scratch::new(&self.gpu, tokens.max(lc).max(ln));
         let (lat, ctx) = (self.vec(latent.len()), self.vec(context.len()));
         self.gpu.upload(&lat, latent);
         self.gpu.upload(&ctx, context);
+        // the negative context, its modulated rows and the plain attention's output kept beside the negative's
+        let (nctx, ncm, plain) = (self.vec(ln * D), self.vec(ln * D), self.vec(if nag.is_some() { tokens * D } else { 1 }));
+        if let Some(n) = nag {
+            self.gpu.upload(&nctx, &n.context);
+        }
         let t = self.vec(256);
         self.gpu.upload(&t, &sinusoids(sigma));
         let (x, h, cm, y, f, fg) = (self.vec(tokens * D), self.vec(tokens * D), self.vec(lc * D), self.vec(tokens * D), self.vec(tokens * 4 * D), self.vec(tokens * 4 * D));
@@ -406,7 +433,14 @@ impl WgpuLtx {
             r.add_gated_rows_clean(&x, &y, tokens, D, &mm, 2 * D, false, rows);
             r.norm_mod_rows_clean(&x, &h, tokens, D, &mm, 7 * D, Some(6 * D), RowNorm::Rms, EPS, rows);
             r.norm_mod_rows(&ctx, &cm, lc, D, &pm, D, Some(0), RowNorm::None, EPS);
-            self.attend(r, &b.attn2, &h, tokens, &cm, lc, None, false, &s, &y);
+            match nag {
+                Some(n) => {
+                    // the negative context modulated as the prompt's, the two attentions' outputs mixed
+                    r.norm_mod_rows(&nctx, &ncm, ln, D, &pm, D, Some(0), RowNorm::None, EPS);
+                    attend_guided(r, &b.attn2, &h, tokens, (&cm, lc), (&ncm, ln), n, &s, &plain, &y);
+                }
+                None => self.attend(r, &b.attn2, &h, tokens, &cm, lc, None, false, &s, &y),
+            }
             r.add_gated_rows_clean(&x, &y, tokens, D, &mm, 8 * D, false, rows);
             r.norm_mod_rows_clean(&x, &h, tokens, D, &mm, 4 * D, Some(3 * D), RowNorm::Rms, EPS, rows);
             b.ff0.forward(r, &h, &f, tokens);
@@ -463,6 +497,31 @@ fn attend(r: &mut dyn ChainRecorder, a: &Attn, xq: &DeviceVec, tq: usize, xkv: &
     a.gate.forward(r, xq, &s.logits, tq);
     r.head_gate_rows(&s.att, &s.logits, tq, HEADS, HD);
     a.out.forward(r, &s.att, y, tq);
+}
+
+/// A text cross-attention guided away from a negative context ([`Nag`]; the reference's `nag_attn`): `xq`'s `tq`
+/// rows' queries over the prompt's context and over the negative one (`(rows, count)` each), the two outputs mixed in
+/// `plain`, then the heads' gate and the output projection into `y`.
+#[allow(clippy::too_many_arguments)]
+fn attend_guided(r: &mut dyn ChainRecorder, a: &Attn, xq: &DeviceVec, tq: usize, positive: (&DeviceVec, usize), negative: (&DeviceVec, usize), nag: &Nag, s: &Scratch, plain: &DeviceVec, y: &DeviceVec) {
+    let first = |v: &DeviceVec, rows: usize| DeviceVec { len: rows * D, inner: v.inner.clone() };
+    a.q.forward(r, xq, &s.q, tq);
+    r.rmsnorm_rows(&first(&s.q, tq), &a.qn, &first(&s.qn, tq), tq, EPS);
+    for (which, (xkv, tk)) in [positive, negative].into_iter().enumerate() {
+        a.k.forward(r, xkv, &s.k, tk);
+        r.rmsnorm_rows(&first(&s.k, tk), &a.kn, &first(&s.kn, tk), tk, EPS);
+        a.v.forward(r, xkv, &s.v, tk);
+        r.store_rows(&s.kn, &s.kv, tk, D, 0, 2 * D, 0);
+        r.store_rows(&s.v, &s.kv, tk, D, 0, 2 * D, D);
+        r.attention_rows_full(&s.qn, &s.kv, &s.att, tq, HEADS, HEADS, HD, tk, 1.0 / (HD as f32).sqrt());
+        if which == 0 {
+            r.copy(&s.att, 0, plain, 0, tq * D);
+        }
+    }
+    r.nag_mix(plain, &s.att, tq, D, nag.scale, nag.tau, nag.alpha);
+    a.gate.forward(r, xq, &s.logits, tq);
+    r.head_gate_rows(plain, &s.logits, tq, HEADS, HD);
+    a.out.forward(r, plain, y, tq);
 }
 
 /// An attention's vectors, for `rows` rows at the most.
@@ -592,9 +651,12 @@ mod tests {
         };
         let latent: Vec<f32> = (0..tokens * 128).map(|_| (next() * 1.7) as f32).collect();
         let context: Vec<f32> = (0..lc * D).map(|_| (next() * 1.7) as f32).collect();
+        // (a negative prompt's context, of another length)
+        let negative_rows = 24usize;
+        let negative: Vec<f32> = (0..negative_rows * D).map(|_| (next() * 1.7) as f32).collect();
         let t = std::time::Instant::now();
         let mut store = Store::open(path, 0)?;
-        let gpu = WgpuLtx::load(&mut store, 0, |_| {})?;
+        let mut gpu = WgpuLtx::load(&mut store, 0, |_| {})?;
         eprintln!("WebGPU video stream loaded in {:.1} s", t.elapsed().as_secs_f64());
         let table = gpu.upload(&rope_table(&video_positions(frames, h, w, fps, false), &[20., 2048., 2048.], D, HEADS));
         let got: Vec<Vec<f32>> = [0.8, 0.25].iter().map(|&sigma| gpu.forward(&latent, tokens, &context, lc, sigma, &table, (0, 0), h * w, None)).collect::<Result<_>>()?;
@@ -604,6 +666,10 @@ mod tests {
         let ends = gpu.upload(&rope_table(&video_positions(frames, h, w, fps, true), &[20., 2048., 2048.], D, HEADS));
         let appended: Vec<f32> = latent.iter().chain(&latent[..h * w * 128]).map(|v| v * 0.9).collect();
         let conditioned = gpu.forward(&appended, tokens + h * w, &context, lc, 0.8, &ends, (h * w, h * w), h * w, None)?;
+        // and a negative prompt without CFG: every block's text attention guided away from it (the reference's
+        // defaults for video: scale 11, tau 2.5, alpha 0.25)
+        gpu.nag = Some(Nag { context: negative.clone(), rows: negative_rows, scale: 11.0, tau: 2.5, alpha: 0.25 });
+        let guided = gpu.forward(&latent, tokens, &context, lc, 0.8, &table, (0, 0), h * w, None)?;
         drop(gpu);
         // (Candle's LTX is BF16 throughout: its CPU has no BF16 matmul, so CUDA's device OAIY_LTX_CUDA_DEVICE, 0 else)
         #[cfg(feature = "cuda")]
@@ -621,10 +687,14 @@ mod tests {
         let rope_ends = crate::ltx::transformer::Rope::video_with_end(frames, h, w, fps, true, &dev)?;
         let la = candle_core::Tensor::from_vec(appended, (1, tokens + h * w, 128), &dev)?.to_dtype(DType::BF16)?;
         let lan = nudged(&la)?;
-        let passes = [(0.8, None, false, &got[0]), (0.25, None, false, &got[1]), (0.8, Some(28), false, &stg), (0.8, None, true, &conditioned)];
-        for (sigma, skip, ends, got) in passes {
+        let nt = candle_core::Tensor::from_vec(negative, (1, negative_rows, D), &dev)?.to_dtype(DType::BF16)?;
+        let passes_plain = got[0].clone();
+        let mut want_plain: Option<Vec<f32>> = None;
+        let passes = [(0.8, None, false, false, &got[0]), (0.25, None, false, false, &got[1]), (0.8, Some(28), false, false, &stg), (0.8, None, true, false, &conditioned), (0.8, None, false, true, &guided)];
+        for (sigma, skip, ends, nag, got) in passes {
             let t = std::time::Instant::now();
             cpu.skip_video_self_attn = skip;
+            cpu.nag = nag.then(|| crate::ltx::transformer::Nag { context: nt.clone(), scale: 11., tau: 2.5, alpha: 0.25 });
             let (rope, clean) = if ends { (&rope_ends, h * w) } else { (&rope, 0) };
             let velocity = |cpu: &mut crate::ltx::transformer::Transformer, l: &candle_core::Tensor, c: &candle_core::Tensor| -> Result<Vec<f32>> {
                 cpu.forward(l, c, sigma, rope, clean, clean, None, |_| {})?.0.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()
@@ -646,11 +716,30 @@ mod tests {
                     eprintln!("  the {} rows: cosine {c:.6}, relative error {e:.2e} (the reference's own spread {sp:.2e})", if noisy { "noisy" } else { "clean" });
                 }
             }
-            let what = match (skip, ends) {
-                (Some(b), _) => format!("sigma {sigma}, block {b}'s self-attention passed through"),
-                (None, true) => format!("sigma {sigma}, a starting and an end image's tokens clean"),
-                (None, false) => format!("sigma {sigma}"),
+            let what = match (skip, ends, nag) {
+                (Some(b), _, _) => format!("sigma {sigma}, block {b}'s self-attention passed through"),
+                (None, true, _) => format!("sigma {sigma}, a starting and an end image's tokens clean"),
+                (None, false, true) => format!("sigma {sigma}, a negative prompt by NAG"),
+                (None, false, false) => format!("sigma {sigma}"),
             };
+            if !nag && !ends && skip.is_none() && want_plain.is_none() {
+                want_plain = Some(want.clone());
+            }
+            if nag {
+                // What the guidance changes, here and in the reference: the velocity's difference from the pass with no
+                // negative prompt (a pair's passes through the same arithmetic, so its difference is the guidance's).
+                let (cos, moved) = compare(got, &passes_plain);
+                eprintln!("  NAG against no negative prompt: cosine {cos:.6}, relative difference {moved:.2e}");
+                assert!(moved > 1e-3, "the negative prompt changes the velocity");
+                let plain = want_plain.as_ref().expect("the pass with no negative prompt first");
+                let ours: Vec<f32> = got.iter().zip(&passes_plain).map(|(a, b)| a - b).collect();
+                let theirs: Vec<f32> = want.iter().zip(plain).map(|(a, b)| a - b).collect();
+                let (dc, de) = compare(&ours, &theirs);
+                // (the change is some 4% of the velocity, as the reference's own spread is: the two changes agree as
+                // far as that lets them; the blocks' trace with OAIY_LTX_TRACE_NAG holds each block to four places)
+                eprintln!("  the guidance's change against the reference's: cosine {dc:.6}, relative error {de:.2e}");
+                assert!(dc > 0.6, "the guidance's change is the reference's: cosine {dc}");
+            }
             eprintln!("{what}: cosine {cos:.6}, relative error {err:.2e} (the reference's own spread {spread:.2e}; its step {seconds:.1} s)");
             // (its BF16 rounding at every op beside one step off at the inputs: within three times that)
             assert!(err <= (3.0 * spread).max(0.1), "{what}: relative error {err} where the reference's own spread is {spread}");
@@ -676,8 +765,12 @@ mod tests {
         };
         let latent: Vec<f32> = (0..tokens * 128).map(|_| (next() * 1.7) as f32).collect();
         let context: Vec<f32> = (0..lc * D).map(|_| (next() * 1.7) as f32).collect();
+        // (OAIY_LTX_TRACE_NAG: a negative prompt by NAG in both, its context another 24 rows: every block's text
+        // attention guided, and the first blocks, which agree to four places, held to the reference's)
+        let negative: Option<Vec<f32>> = std::env::var_os("OAIY_LTX_TRACE_NAG").map(|_| (0..24 * D).map(|_| (next() * 1.7) as f32).collect());
         let mut store = Store::open(path, 0)?;
-        let gpu = WgpuLtx::load(&mut store, 0, |_| {})?;
+        let mut gpu = WgpuLtx::load(&mut store, 0, |_| {})?;
+        gpu.nag = negative.as_ref().map(|n| Nag { context: n.clone(), rows: 24, scale: 11.0, tau: 2.5, alpha: 0.25 });
         let table = gpu.upload(&rope_table(&video_positions(frames, h, w, fps, false), &[20., 2048., 2048.], D, HEADS));
         let got = gpu.pass(&latent, tokens, &context, lc, 0.8, &table, (0, 0), h * w, None, true)?;
         let trail = &got[0];
@@ -688,6 +781,10 @@ mod tests {
         let dev = Device::Cpu;
         let mut cpu = crate::ltx::transformer::Transformer::new(Store::open(path, 0)?, &dev, 8 << 30, false, false)?;
         cpu.hiddens = Some(Vec::new());
+        if let Some(n) = &negative {
+            let context = candle_core::Tensor::from_vec(n.clone(), (1, 24, D), &dev)?.to_dtype(DType::BF16)?;
+            cpu.nag = Some(crate::ltx::transformer::Nag { context, scale: 11., tau: 2.5, alpha: 0.25 });
+        }
         let rope = crate::ltx::transformer::Rope::video_with_end(frames, h, w, fps, false, &dev)?;
         let lt = candle_core::Tensor::from_vec(latent, (1, tokens, 128), &dev)?.to_dtype(DType::BF16)?;
         let ct = candle_core::Tensor::from_vec(context, (1, lc, D), &dev)?.to_dtype(DType::BF16)?;
@@ -699,6 +796,9 @@ mod tests {
             let rms = (want.iter().map(|x| (*x as f64).powi(2)).sum::<f64>() / want.len() as f64).sqrt();
             let peak = want.iter().fold(0f32, |m, x| m.max(x.abs()));
             eprintln!("block {i:2}: cosine {cos:.6}, relative error {rel:.2e} (the reference's RMS {rms:.3e}, its largest {peak:.3e})");
+            if negative.is_some() && i < 8 {
+                assert!(cos > 0.999, "block {i} with a negative prompt by NAG: cosine {cos}");
+            }
         }
         let want = v.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
         let (cos, rel) = compare(got.last().unwrap(), &want);
