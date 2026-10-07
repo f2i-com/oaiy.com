@@ -1549,8 +1549,13 @@ fn many_rows(gpu: &Gpu) -> usize {
 /// The jobs a block of a prompt's experts grouped on the GPU takes: about three times the jobs an expert has on
 /// average (16 to 128), so a busy expert's tiles are decoded for as few blocks as a quiet one's empty places cost
 /// columns (Qwen3.8-Flash-Next's chunk of 512, some 10 jobs an expert: blocks of 32 308 ms, of 16 337, of 64 339).
+/// Blocks of 32 up to some 24 jobs an expert: a chunk of 1,024, 20 an expert, its experts' matmuls 118 ms with them
+/// and 149 with blocks of 64 (a workgroup of 64 an SM, where two of 32).
 fn moe_rows_for(pairs: usize, experts: usize) -> usize {
     let target = 3 * pairs / experts.max(1);
+    if (16..=72).contains(&target) {
+        return 32;
+    }
     [16, 32, 64, 128].into_iter().find(|&b| b >= target).unwrap_or(128)
 }
 

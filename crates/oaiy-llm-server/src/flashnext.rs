@@ -964,7 +964,7 @@ impl FlashNext {
     /// rope positions, when the prompt has images.
     pub fn forward(&self, tokens: &[u32], embeds: &Tensor, kv: &mut KvCache, positions: Option<&[[u32; 3]]>) -> Result<Tensor> {
         // VENDORED-LOCAL: a decode step or a prompt's chunk chained on the GPUs where they can (WebGPU)
-        if positions.is_none() && !profile::on() && tokens.len() <= 512 {
+        if positions.is_none() && !profile::on() && tokens.len() <= self.prompt_rows() {
             if let Some(logits) = self.forward_chained(tokens, embeds, kv) {
                 return Ok(logits);
             }
@@ -1921,7 +1921,7 @@ impl FlashNext {
                 let ple = rx.recv().ok().flatten();
                 let t1 = began.elapsed().as_secs_f64() * 1e3;
                 let had = pending.is_some();
-                let fits = tokens.len() <= 512 && !profile::on() && ple.is_some();
+                let fits = tokens.len() <= self.prompt_rows() && !profile::on() && ple.is_some();
                 // (the chunk before's rest goes after this chunk's first part, or before a chunk that goes whole)
                 if ahead && fits && tokens.len() > CHECK_ROWS {
                     match self.run_part(tokens, embeds, kv, false, &mut pending, ple, Stage::First) {
@@ -2685,6 +2685,18 @@ impl FlashNext {
     /// The devices its layers are over.
     pub fn devices_len(&self) -> usize {
         self.devices.len()
+    }
+
+    /// The rows a prompt's chunk has at most: 512 (OAIY_FN_ROWS: as given, 64 to 1,024). A chunk's experts' weights
+    /// are decoded once a block of their rows, and a chunk of 512 gives each of the 512 experts some 10 rows of a
+    /// block's 32, so a chunk of 1,024 takes less of the GPUs a token (its kernels 298 ms where two of 512 take 342).
+    /// It is not the faster for that over two cards (2,148 tokens run together 679 to 691 ms in chunks of 1,024 where
+    /// 602 to 612 in 512s: fewer chunks one behind the other), and with 24 GB of weights a card its vectors do not
+    /// fit two RTX 5090s' 32 GB (out of memory at the server's second prompt); past 1,638 rows a kernel's grid is
+    /// wider than a dispatch may be.
+    pub fn prompt_rows(&self) -> usize {
+        static ASKED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        ASKED.get_or_init(|| std::env::var("OAIY_FN_ROWS").ok().and_then(|v| v.parse().ok()).filter(|n| (64..=1024).contains(n))).unwrap_or(512)
     }
 
     /// Whether the chain drafts tokens (its multi-token-prediction layer loaded and chained).

@@ -418,6 +418,14 @@ impl Hybrid {
         }
         last.ok_or_else(|| "no chunk to run".to_string())
     }
+    /// The tokens a prompt's chunk has at most ([`PREFILL_CHUNK`]; Flash-Next's own where its devices take more).
+    fn prompt_rows(&self) -> usize {
+        #[cfg(any(feature = "cuda", feature = "webgpu"))]
+        if let Self::Flash(f) = self {
+            return f.prompt_rows();
+        }
+        PREFILL_CHUNK
+    }
     /// Whether a prompt's chunks go to [`Self::forward_chunks`] together: Flash-Next over several GPUs, a chained
     /// Qwen3.5 hybrid.
     fn pipelines(&self) -> bool {
@@ -600,7 +608,8 @@ impl QwenEngine {
             // between cancellations' looks)
             if hybrid.pipelines() && job.images.is_empty() {
                 let stop = stops.iter().copied().find(|&s| s > pos).unwrap_or(keys.len()).min(keys.len()).min(pos + 8 * PREFILL_CHUNK);
-                let spans: Vec<(usize, usize)> = (pos..stop).step_by(PREFILL_CHUNK).map(|a| (a, (a + PREFILL_CHUNK).min(stop))).collect();
+                let rows = hybrid.prompt_rows();
+                let spans: Vec<(usize, usize)> = (pos..stop).step_by(rows).map(|a| (a, (a + rows).min(stop))).collect();
                 // (a dense hybrid's chunks' embeddings on every core: its table's rows, 16 ms a run of 3,150 on one)
                 let embeds = if hybrid.qwen35().is_some() {
                     use rayon::prelude::*;
