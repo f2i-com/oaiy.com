@@ -157,42 +157,86 @@ struct Pool {
     convs: Vec<DeviceVec>,
 }
 
-/// A layer's quantized weights a run reads: the model's own (on the first device), or their copies on the second.
+/// A projection a chain multiplies by: a GGUF's quantized matrix, or a packed one its device holds (EXL3: OrcaSAQ's
+/// checkpoint, whose every projection is one, its channel maps the matrix's own).
+#[derive(Clone, Copy)]
+enum W<'a> {
+    Quant(&'a QuantizedTensor),
+    Packed(&'a dyn ggml_rs::exl3::PackedLinear),
+}
+
+impl<'a> W<'a> {
+    /// `w`, which the chain's state checked the device holds.
+    fn of(w: &'a Weight) -> Self {
+        match w {
+            Weight::Quant(q) => W::Quant(q),
+            Weight::Packed(p) => W::Packed(p.as_ref()),
+            _ => unreachable!("the chain state checked every weight"),
+        }
+    }
+
+    /// Whether `chain`'s device holds `w`, so a chain can multiply by it.
+    fn held(chain: &dyn DeviceChain, w: &Weight) -> bool {
+        match w {
+            Weight::Quant(q) => chain.holds(q),
+            Weight::Packed(p) => chain.holds_exl3(p.as_ref()),
+            _ => false,
+        }
+    }
+
+    /// `y`'s `rows` rows = `x`'s times this.
+    fn rows(self, rec: &mut dyn ggml_rs::ChainRecorder, x: &DeviceVec, y: &DeviceVec, rows: usize) {
+        match self {
+            W::Quant(q) => rec.matmul_rows(q, x, y, rows),
+            W::Packed(p) => rec.exl3_rows(p, x, y, rows),
+        }
+    }
+
+    /// `y` = one row `x` times this.
+    fn one(self, rec: &mut dyn ggml_rs::ChainRecorder, x: &DeviceVec, y: &DeviceVec) {
+        match self {
+            W::Quant(q) => rec.matmul(q, x, y),
+            W::Packed(p) => rec.exl3_rows(p, x, y, 1),
+        }
+    }
+}
+
+/// A layer's projections a run reads: the model's own (on the first device), or their copies on the second.
 #[derive(Clone, Copy)]
 enum LayerW<'a> {
-    Attention { q: &'a QuantizedTensor, k: &'a QuantizedTensor, v: &'a QuantizedTensor, o: &'a QuantizedTensor, ffn: FfnW<'a>, down: &'a QuantizedTensor },
+    Attention { q: W<'a>, k: W<'a>, v: W<'a>, o: W<'a>, ffn: FfnW<'a>, down: W<'a> },
     /// `ba` none where the fused beta-alpha projection's weights are f32 (the layer's vectors hold them)
-    Ssm { qkv: &'a QuantizedTensor, gate: &'a QuantizedTensor, ba: Option<&'a QuantizedTensor>, out: &'a QuantizedTensor, ffn: FfnW<'a>, down: &'a QuantizedTensor },
+    Ssm { qkv: W<'a>, gate: W<'a>, ba: Option<W<'a>>, out: W<'a>, ffn: FfnW<'a>, down: W<'a> },
 }
 
 /// An FFN's gate and up projections: fused, or a pair.
 #[derive(Clone, Copy)]
 enum FfnW<'a> {
-    Fused(&'a QuantizedTensor),
-    Split(&'a QuantizedTensor, &'a QuantizedTensor),
+    Fused(W<'a>),
+    Split(W<'a>, W<'a>),
 }
 
 impl<'a> LayerW<'a> {
     /// The model's own block's.
     fn of(b: &'a Qwen35Block) -> Self {
         let ffn = |p: &'a FfnPair| match p {
-            FfnPair::Fused(w) => FfnW::Fused(quant(w)),
-            FfnPair::Split { gate, up } => FfnW::Split(quant(gate), quant(up)),
+            FfnPair::Fused(w) => FfnW::Fused(W::of(w)),
+            FfnPair::Split { gate, up } => FfnW::Split(W::of(gate), W::of(up)),
         };
         match b {
             Qwen35Block::Attention { attn_q, attn_k, attn_v, attn_output, ffn_pair, ffn_down, .. } => {
-                LayerW::Attention { q: quant(attn_q), k: quant(attn_k), v: quant(attn_v), o: quant(attn_output), ffn: ffn(ffn_pair), down: quant(ffn_down) }
+                LayerW::Attention { q: W::of(attn_q), k: W::of(attn_k), v: W::of(attn_v), o: W::of(attn_output), ffn: ffn(ffn_pair), down: W::of(ffn_down) }
             }
             Qwen35Block::Ssm { attn_qkv, attn_gate, ssm_ba, ssm_out, ffn_pair, ffn_down, .. } => LayerW::Ssm {
-                qkv: quant(attn_qkv),
-                gate: quant(attn_gate),
+                qkv: W::of(attn_qkv),
+                gate: W::of(attn_gate),
                 ba: match ssm_ba {
-                    Weight::Quant(q) => Some(q),
+                    Weight::Quant(q) => Some(W::Quant(q)),
                     _ => None,
                 },
-                out: quant(ssm_out),
+                out: W::of(ssm_out),
                 ffn: ffn(ffn_pair),
-                down: quant(ffn_down),
+                down: W::of(ffn_down),
             },
         }
     }
@@ -212,7 +256,10 @@ enum SplitFfn {
 impl SplitW {
     /// `w`'s copies on `chain`'s device: None where one cannot be made there.
     fn copy(chain: &dyn DeviceChain, w: LayerW<'_>) -> Option<SplitW> {
-        let c = |q: &QuantizedTensor| chain.copy_weight(q);
+        let c = |w: W<'_>| match w {
+            W::Quant(q) => chain.copy_weight(q),
+            W::Packed(_) => None,
+        };
         let ffn = |f: FfnW<'_>| -> Option<SplitFfn> {
             Some(match f {
                 FfnW::Fused(gu) => SplitFfn::Fused(c(gu)?),
@@ -238,13 +285,17 @@ impl SplitW {
     fn view(&self) -> LayerW<'_> {
         fn ffn(f: &SplitFfn) -> FfnW<'_> {
             match f {
-                SplitFfn::Fused(gu) => FfnW::Fused(gu),
-                SplitFfn::Split(g, u) => FfnW::Split(g, u),
+                SplitFfn::Fused(gu) => FfnW::Fused(W::Quant(gu)),
+                SplitFfn::Split(g, u) => FfnW::Split(W::Quant(g), W::Quant(u)),
             }
         }
         match self {
-            SplitW::Attention { q, k, v, o, ffn: f, down } => LayerW::Attention { q, k, v, o, ffn: ffn(f), down },
-            SplitW::Ssm { qkv, gate, ba, out, ffn: f, down } => LayerW::Ssm { qkv, gate, ba: ba.as_ref(), out, ffn: ffn(f), down },
+            SplitW::Attention { q, k, v, o, ffn: f, down } => {
+                LayerW::Attention { q: W::Quant(q), k: W::Quant(k), v: W::Quant(v), o: W::Quant(o), ffn: ffn(f), down: W::Quant(down) }
+            }
+            SplitW::Ssm { qkv, gate, ba, out, ffn: f, down } => {
+                LayerW::Ssm { qkv: W::Quant(qkv), gate: W::Quant(gate), ba: ba.as_ref().map(W::Quant), out: W::Quant(out), ffn: ffn(f), down: W::Quant(down) }
+            }
         }
     }
 }
@@ -647,9 +698,9 @@ fn record_layers<'w>(rec: &mut dyn ggml_rs::ChainRecorder, s: &Dims, eps: f32, l
         let (ffn, down) = match (lw, &lv.mixer) {
             (LayerW::Attention { q, k, v, o, ffn, down }, Mixer::Attention { q_norm, k_norm, slot }) => {
                 let kvl = &b.kvl[*slot];
-                rec.matmul_rows(q, &w.xn, &w.qfull, t);
-                rec.matmul_rows(k, &w.xn, &w.k, t);
-                rec.matmul_rows(v, &w.xn, &w.v, t);
+                q.rows(rec, &w.xn, &w.qfull, t);
+                k.rows(rec, &w.xn, &w.k, t);
+                v.rows(rec, &w.xn, &w.v, t);
                 // each head's q is its query then its gate
                 rec.copy_cols(&w.qfull, &w.q, t * s.n_h, s.hd, 2 * s.hd, 0);
                 rec.copy_cols(&w.qfull, &w.gate, t * s.n_h, s.hd, 2 * s.hd, s.hd);
@@ -680,16 +731,16 @@ fn record_layers<'w>(rec: &mut dyn ggml_rs::ChainRecorder, s: &Dims, eps: f32, l
                     rec.attention_rows(&w.qn, kvl, b.attn, t, s.n_h, s.n_kv, s.hd, past, None, scale);
                 }
                 rec.mul_sigmoid(b.attn, &w.gate, &w.gated, t * s.n_h * s.hd);
-                rec.matmul_rows(o, &w.gated, &w.proj, t);
+                o.rows(rec, &w.gated, &w.proj, t);
                 (ffn, down)
             }
             (LayerW::Ssm { qkv, gate, ba, out, ffn, down }, Mixer::Ssm { conv_w, a, dt, norm, ba_f32, slot }) => {
                 let (state, conv) = &b.states[*slot];
-                rec.matmul_rows(qkv, &w.xn, &w.qkv, t);
-                rec.matmul_rows(gate, &w.xn, &w.z, t);
+                qkv.rows(rec, &w.xn, &w.qkv, t);
+                gate.rows(rec, &w.xn, &w.z, t);
                 match (ba_f32, ba) {
                     (Some(wf), _) => rec.matmul_f32_rows(wf, 2 * s.nv, s.d, &w.xn, &w.ba, t),
-                    (None, Some(q)) => rec.matmul_rows(q, &w.xn, &w.ba, t),
+                    (None, Some(q)) => q.rows(rec, &w.xn, &w.ba, t),
                     (None, None) => unreachable!("a delta net's beta-alpha projection is f32 or quantized"),
                 }
                 if let Some(sp) = check {
@@ -730,7 +781,7 @@ fn record_layers<'w>(rec: &mut dyn ggml_rs::ChainRecorder, s: &Dims, eps: f32, l
                         done = end;
                     }
                 }
-                rec.matmul_rows(out, &w.core, &w.proj, t);
+                out.rows(rec, &w.core, &w.proj, t);
                 (ffn, down)
             }
             _ => unreachable!("a layer's vectors are its block's"),
@@ -738,16 +789,16 @@ fn record_layers<'w>(rec: &mut dyn ggml_rs::ChainRecorder, s: &Dims, eps: f32, l
         rec.add_rmsnorm_rows(&w.x, &w.proj, &lv.post_norm, &w.xn, t, eps);
         match ffn {
             FfnW::Fused(gu) => {
-                rec.matmul_rows(gu, &w.xn, &w.ffa, t);
+                gu.rows(rec, &w.xn, &w.ffa, t);
                 rec.silu_mul_split_rows(&w.ffa, &w.act, t);
             }
             FfnW::Split(gate, up) => {
-                rec.matmul_rows(gate, &w.xn, &w.ffa, t);
-                rec.matmul_rows(up, &w.xn, &w.ffb, t);
+                gate.rows(rec, &w.xn, &w.ffa, t);
+                up.rows(rec, &w.xn, &w.ffb, t);
                 rec.silu_mul(&w.ffa, &w.ffb, &w.act, t * s.ff);
             }
         }
-        rec.matmul_rows(down, &w.act, &w.proj, t);
+        down.rows(rec, &w.act, &w.proj, t);
         *added = true;
     }
 }
@@ -1063,7 +1114,7 @@ impl Qwen35Chain {
                 let chain = m.backend.chain()?;
                 let cfg = &m.config;
                 let sc = &m.ssm_cfg;
-                let held = |w: &Weight| matches!(w, Weight::Quant(q) if chain.holds(q));
+                let held = |w: &Weight| W::held(chain, w);
                 let (nv, nk, dk) = (sc.time_step_rank, sc.group_count, sc.state_size);
                 let dv = if nv == 0 { 0 } else { sc.inner_size / nv };
                 let (n_h, n_kv, hd, d) = (cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, cfg.embedding_dim);
@@ -1337,7 +1388,9 @@ impl Qwen35Chain {
                 if from == 0 || from >= n {
                     return None;
                 }
-                let output = chain.copy_weight(quant(&m.output))?;
+                // (a GGUF's alone: a packed model's prompts stay on the device its projections were made on)
+                let Weight::Quant(head) = &m.output else { return None };
+                let output = chain.copy_weight(head)?;
                 let weights = m.blocks[from..].iter().map(|b| SplitW::copy(chain, LayerW::of(b))).collect::<Option<Vec<_>>>()?;
                 let (mut attention_slots, mut ssm_slots) = (Vec::new(), Vec::new());
                 let layers = (from..n)
@@ -1663,7 +1716,7 @@ impl Qwen35Chain {
         }
         if checking {
             let sp = st.spec.as_ref().expect("a check is a drafting chain's");
-            rec.matmul_rows(quant(&m.output), &w.xn, &sp.logits, t);
+            W::of(&m.output).rows(&mut *rec, &w.xn, &sp.logits, t);
             rec.read_range(&sp.logits, 0, t * s.vocab);
         } else {
             let last = if t == 1 {
@@ -1672,7 +1725,7 @@ impl Qwen35Chain {
                 rec.copy(&w.xn, (t - 1) * s.d, &w.last, 0, s.d);
                 &w.last
             };
-            rec.matmul(quant(&m.output), last, &st.logits);
+            W::of(&m.output).one(&mut *rec, last, &st.logits);
             rec.read(&st.logits);
         }
         for slot in 0..st.attention_layers.len() {
