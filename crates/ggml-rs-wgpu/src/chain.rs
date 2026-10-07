@@ -4139,7 +4139,10 @@ const KEEP_GROUPS: usize = 16384;
 fn piece_flops(gpu: &crate::Gpu) -> f64 {
     static FLOPS: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
     let set = *FLOPS.get_or_init(|| std::env::var("OAIY_PIECE_FLOPS").ok().and_then(|v| v.parse().ok()).filter(|&f: &f64| f > 0.0));
-    set.unwrap_or(if gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) { (1u64 << 41) as f64 } else { (1u64 << 38) as f64 })
+    // (a device that feeds its pieces a few at a time: the smaller ones, the one slow spell a card under a power limit
+    // has through a long run of them 0.45 s shorter so, the 27B's 15,360 tokens 7.9 s the first time where 8.35, and
+    // the run no slower after it)
+    set.unwrap_or(if gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) && !gpu.feeds() { (1u64 << 41) as f64 } else { (1u64 << 38) as f64 })
 }
 
 /// What a dispatch's workgroup counts for in a piece's work ([`piece_flops`]), whatever its kernel: its 256 values'
