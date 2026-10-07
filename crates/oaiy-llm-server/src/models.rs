@@ -2481,8 +2481,14 @@ mod dense_webgpu_timing {
         let path = std::env::var("QWEN35_MODEL").unwrap_or_else(|_| r"E:\models\Qwen3.8-27B-Q3_K_M.gguf".into());
         let Ok(b) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
         let backend: Arc<dyn ggml_rs::Backend> = Arc::new(b);
-        let gguf = gguf::GgufFile::open(&path).unwrap();
-        let model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap();
+        // (a GGUF, or an EXL3 checkpoint's folder: OrcaSAQ's, its projections packed on the device)
+        let model = if std::path::Path::new(&path).is_dir() {
+            let gpu = backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>().expect("the WebGPU backend");
+            crate::orcasaq::load_portable(std::path::Path::new(&path), Arc::clone(&backend), &|d| gpu.exl3(d)).unwrap()
+        } else {
+            let gguf = gguf::GgufFile::open(&path).unwrap();
+            llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap()
+        };
         let llama_rs::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
         let mut kv = model.new_kv_cache(4096);
         let tokens: Vec<u32> = (0..2048u32).map(|i| 1000 + (i * 7919) % 20000).collect();

@@ -262,6 +262,9 @@ var<workgroup> red: array<vec2<f32>, 256>;
 // every code's place in a tile (`place`), the workgroup's threads one each: the same in every tile
 var<workgroup> places: array<u32, 256>;
 var<workgroup> firsts: array<u32, 32>;
+// a code's value by its bytes' sum (0 to 1,020), the workgroup's threads four each: a weight is then a read where it
+// was a conversion, a product and a rounding to f16
+var<workgroup> values: array<f32, 1024>;
 
 fn round_f16(v: f32) -> f32 {{
     let b = bitcast<u32>(v);
@@ -297,8 +300,7 @@ fn code_in(q0: u32, q1: u32, q2: u32, q3: u32, at: u32) -> u32 {{
 
 fn decode_at(code: u32) -> f32 {{
     let hx = (code & 0xffffu) * 0x83dcd12du;
-    let sum = dot4U8Packed(hx, 0x01010101u);
-    return round_f16(f32(1024u + sum) * 0.00676727294921875 - 10.3828125);
+    return values[dot4U8Packed(hx, 0x01010101u)];
 }}
 
 fn lanes(t: u32, nt: u32, ntiles: u32, ks: u32, ke: u32, tw: u32, base: u32) -> vec2<f32> {{
@@ -310,6 +312,10 @@ fn lanes(t: u32, nt: u32, ntiles: u32, ks: u32, ke: u32, tw: u32, base: u32) -> 
     places[t] = place(t, tw, first);
     if (t % 8u == 0u) {{
         firsts[t / 8u] = first;
+    }}
+    for (var i = 0u; i < 4u; i = i + 1u) {{
+        let sum = 4u * t + i;
+        values[sum] = round_f16(f32(1024u + sum) * 0.00676727294921875 - 10.3828125);
     }}
     workgroupBarrier();
     let w0 = firsts[l];
@@ -1060,6 +1066,8 @@ var<workgroup> xt: array<vec2<f16>, {xt_len}>;
 var<workgroup> stage: array<f32, 2048>;
 // every code's place in a tile, and each lane's first word (the same in every tile)
 var<workgroup> places: array<u32, 256>;
+// a code's value by its bytes' sum (0 to 1,020), the workgroup's threads four each (as the one-row kernel's)
+var<workgroup> values: array<f32, 1024>;
 var<workgroup> firsts: array<u32, 32>;
 var<workgroup> ids: array<u32, {rows}>;
 
@@ -1097,8 +1105,7 @@ fn code_in(q0: u32, q1: u32, q2: u32, q3: u32, at: u32) -> u32 {{
 
 fn decode_at(code: u32) -> f32 {{
     let hx = (code & 0xffffu) * 0x83dcd12du;
-    let sum = dot4U8Packed(hx, 0x01010101u);
-    return round_f16(f32(1024u + sum) * 0.00676727294921875 - 10.3828125);
+    return values[dot4U8Packed(hx, 0x01010101u)];
 }}
 
 @compute @workgroup_size(256)
@@ -1114,6 +1121,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     let sp = wg.z % splits;
     let first = window(8u * (t / 8u), tw).x;
     places[t] = place(t, tw, first);
+    for (var i = 0u; i < 4u; i = i + 1u) {{
+        let sum = 4u * t + i;
+        values[sum] = round_f16(f32(1024u + sum) * 0.00676727294921875 - 10.3828125);
+    }}
     if (t % 8u == 0u) {{
         firsts[t / 8u] = first;
     }}
@@ -1266,6 +1277,8 @@ fn g_few_source(rows: usize) -> String {
 var<workgroup> red: array<vec2<f32>, {red_len}>;
 // every code's place in a tile (`place`), the workgroup's threads one each: the same in every tile
 var<workgroup> places: array<u32, 256>;
+// a code's value by its bytes' sum (0 to 1,020), the workgroup's threads four each (as the one-row kernel's)
+var<workgroup> values: array<f32, 1024>;
 var<workgroup> firsts: array<u32, 32>;
 var<workgroup> lead: u32;
 
@@ -1300,8 +1313,7 @@ fn code_in(q0: u32, q1: u32, q2: u32, q3: u32, at: u32) -> u32 {{
 
 fn decode_at(code: u32) -> f32 {{
     let hx = (code & 0xffffu) * 0x83dcd12du;
-    let sum = dot4U8Packed(hx, 0x01010101u);
-    return round_f16(f32(1024u + sum) * 0.00676727294921875 - 10.3828125);
+    return values[dot4U8Packed(hx, 0x01010101u)];
 }}
 
 @compute @workgroup_size(256)
@@ -1335,6 +1347,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     let rb = 2u * (l % 4u);
     let first = window(8u * (t / 8u), tw).x;
     places[t] = place(t, tw, first);
+    for (var i = 0u; i < 4u; i = i + 1u) {{
+        let sum = 4u * t + i;
+        values[sum] = round_f16(f32(1024u + sum) * 0.00676727294921875 - 10.3828125);
+    }}
     if (t % 8u == 0u) {{
         firsts[t / 8u] = first;
     }}
