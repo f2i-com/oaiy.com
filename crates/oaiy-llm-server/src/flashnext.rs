@@ -458,6 +458,9 @@ pub struct FlashNext {
     chain: std::sync::OnceLock<Option<FnChain>>,
     /// Its multi-token-prediction layer, where asked for ([`load_portable`]'s `mtp`): drafts a chained check takes.
     mtp: Option<FnMtp>,
+    /// The positions of the run a chain is recording, where its rows are not the next ones in order (a picture's
+    /// tokens, and the text after one): one a row, in three axes ([`Self::forward`] sets and clears it).
+    pub(crate) placed: std::sync::Mutex<Option<Vec<[u32; 3]>>>,
 }
 
 /// Qwen3.8-Flash-Next's multi-token-prediction layer (the checkpoint's `mtp.*`, on the last device with the head): the
@@ -900,6 +903,7 @@ fn build(path: &Path, backends: Vec<Arc<dyn Backend>>, cudas: Vec<Arc<Card>>, lo
         decoded: Default::default(),
         chain: Default::default(),
         mtp,
+        placed: Default::default(),
         config: cfg,
     })
 }
@@ -981,9 +985,15 @@ impl FlashNext {
     /// what `kv` holds: the last position's logits, on the host. `positions`: the multimodal
     /// rope positions, when the prompt has images.
     pub fn forward(&self, tokens: &[u32], embeds: &Tensor, kv: &mut KvCache, positions: Option<&[[u32; 3]]>) -> Result<Tensor> {
-        // VENDORED-LOCAL: a decode step or a prompt's chunk chained on the GPUs where they can (WebGPU)
-        if positions.is_none() && !profile::on() && tokens.len() <= self.prompt_rows() {
-            if let Some(logits) = self.forward_chained(tokens, embeds, kv) {
+        // VENDORED-LOCAL: a decode step or a prompt's chunk chained on the GPUs where they can (WebGPU); a run with a
+        // picture in it (or after one) at the positions it is given, where Qwen's rotation of 64 lays its axes out
+        // (op by op, a prompt with a picture was read at 12 tokens/s and answered at 4)
+        let placed = positions.filter(|p| self.config.rope_dim == 64 && p.len() == tokens.len());
+        if (positions.is_none() || placed.is_some()) && !profile::on() && tokens.len() <= self.prompt_rows() {
+            *self.placed.lock().unwrap_or_else(|p| p.into_inner()) = placed.map(<[[u32; 3]]>::to_vec);
+            let logits = self.forward_chained(tokens, embeds, kv);
+            *self.placed.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            if let Some(logits) = logits {
                 return Ok(logits);
             }
         }
@@ -2297,10 +2307,16 @@ impl FlashNext {
             u.tokens = tokens.to_vec();
             u.history = kv.ssm_state[ple_slot(cfg)].clone();
         }
-        // the partial RoPE's sines and cosines at these positions, on every device
-        let table: Vec<f32> = (past..past + t)
-            .flat_map(|pos| {
+        // the partial RoPE's sines and cosines at these positions, on every device: the next ones in order, or the
+        // ones the run was given, a pair's angle then its axis's position (time, height, width, interleaved over the
+        // pairs by Qwen's sections of 11, 11 and 10, as the host's `multimodal_rope::text` rotates them)
+        let axis = |k: usize| if k % 3 == 1 && k < 33 { 1 } else if k % 3 == 2 && k < 30 { 2 } else { 0 };
+        let given = self.placed.lock().unwrap_or_else(|p| p.into_inner()).clone().filter(|p| p.len() == t);
+        let table: Vec<f32> = (0..t)
+            .flat_map(|row| {
+                let at = given.as_ref().map(|p| p[row]);
                 (0..rot / 2).flat_map(move |k| {
+                    let pos = at.map_or(past + row, |p| p[axis(k)] as usize);
                     let (sn, cs) = (pos as f32 * cfg.rope_theta.powf(-2.0 * k as f32 / rot as f32)).sin_cos();
                     [sn, cs]
                 })

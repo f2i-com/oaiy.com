@@ -75,6 +75,9 @@ pub struct Qwen35Chain {
     split: OnceLock<Option<Split>>,
     /// Prompts on the first device alone all the same (a test's comparison).
     pub split_off: AtomicBool,
+    /// The positions of a run whose rows are not the next ones in order ([`Self::forward_positions`]: a picture's
+    /// tokens, and the text after one): the cache's length the run began at, and each of its rows' three axes.
+    positions: Mutex<Option<(usize, Vec<[u32; 3]>)>>,
 }
 
 impl std::fmt::Debug for Qwen35Chain {
@@ -522,6 +525,68 @@ fn rope_table(theta: f32, rot: usize, past: usize, rows: usize) -> Vec<f32> {
             })
         })
         .collect()
+}
+
+/// [`rope_table`] for rows whose positions are given, each in three axes (time, height, width), as the CPU's
+/// `multimodal_rope::text` rotates them: a pair's angle is its axis's position times the pair's frequency, the axes
+/// interleaved over the pairs by Qwen's sections of 11, 11 and 10 (`rot` 64, the one layout there is); a row whose
+/// three are equal (text) is [`rope_table`]'s at that position.
+fn rope_table_at(theta: f32, rot: usize, positions: &[[u32; 3]]) -> Vec<f32> {
+    let axis = |k: usize| {
+        if k % 3 == 1 && k < 33 {
+            1
+        } else if k % 3 == 2 && k < 30 {
+            2
+        } else {
+            0
+        }
+    };
+    positions
+        .iter()
+        .flat_map(|pos| {
+            (0..rot / 2).flat_map(move |k| {
+                let (s, c) = (pos[axis(k)] as f32 * theta.powf(-2.0 * k as f32 / rot as f32)).sin_cos();
+                [s, c]
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod position_tests {
+    use super::{rope_table, rope_table_at};
+    use ggml_rs::Tensor;
+
+    /// The table for rows at given positions rotates as the CPU's `multimodal_rope::text` does (a picture's tokens,
+    /// placed by row and column), and for text (three equal axes) is the plain table at that position.
+    #[test]
+    fn a_table_at_given_positions_is_the_multimodal_rotation() {
+        let (theta, rot, width, heads) = (10_000_000.0f32, 64usize, 80usize, 2usize);
+        let text = [[7u32; 3], [8; 3], [1234; 3]];
+        assert_eq!(rope_table_at(theta, rot, &text[..2]), rope_table(theta, rot, 7, 2));
+        assert_eq!(rope_table_at(theta, rot, &text[2..]), rope_table(theta, rot, 1234, 1));
+        // a picture's tokens: one time, rows and columns their own
+        let positions = [[5u32, 5, 5], [5, 5, 6], [5, 6, 5], [5, 9, 14], [6, 6, 6]];
+        let x: Vec<f32> = (0..positions.len() * heads * width).map(|i| (i as f32 * 0.37).sin()).collect();
+        let mut want = Tensor::from_vec(x.clone(), vec![positions.len(), heads, width]);
+        crate::multimodal_rope::text(&*ggml_rs::default_backend(), &mut want, &positions, rot, theta);
+        let table = rope_table_at(theta, rot, &positions);
+        let mut got = x;
+        for row in 0..positions.len() {
+            for k in 0..rot / 2 {
+                let (sin, cos) = (table[(row * rot / 2 + k) * 2], table[(row * rot / 2 + k) * 2 + 1]);
+                for head in 0..heads {
+                    let a = (row * heads + head) * width + k;
+                    let c = a + rot / 2;
+                    (got[a], got[c]) = (got[a] * cos - got[c] * sin, got[a] * sin + got[c] * cos);
+                }
+            }
+        }
+        let worst = got.iter().zip(want.to_host().data()).map(|(g, w)| (g - w).abs()).fold(0f32, f32::max);
+        assert!(worst < 1e-5, "{worst}");
+        // (and the axes matter: the same rows at their time alone rotate otherwise)
+        assert_ne!(rope_table_at(theta, rot, &positions[3..4]), rope_table(theta, rot, 5, 1));
+    }
 }
 
 /// Room in the chain's copy of the attention cache for `needed` rows (grown to a power of two, its rows kept).
@@ -1258,6 +1323,29 @@ impl Qwen35Chain {
         self.forward_with(m, embeds, rows, kv, &[]).map(|(logits, _)| logits)
     }
 
+    /// [`Self::forward`] for rows at `positions` (one a row, in three axes: a picture's tokens are placed by their row
+    /// and column, and the text after a picture counts on from fewer positions than the picture has tokens), on the
+    /// model's own device: op by op, a prompt with a picture was read at 7 tokens/s and answered at 6. None where
+    /// the model's rotation is not Qwen's 64 (the axes' layout is its own).
+    pub(crate) fn forward_positions(&self, m: &Qwen35Model, embeds: &Tensor, rows: usize, kv: &mut KvCache, positions: &[[u32; 3]]) -> Option<Tensor> {
+        if m.config.rope_dim != 64 || positions.len() != rows {
+            return None;
+        }
+        *self.positions.lock().unwrap_or_else(|p| p.into_inner()) = Some((kv.len, positions.to_vec()));
+        let out = self.forward_with(m, embeds, rows, kv, &[]).map(|(logits, _)| logits);
+        *self.positions.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        out
+    }
+
+    /// The RoPE table of `rows` rows after `past`: at the positions a run was given ([`Self::forward_positions`]),
+    /// else at `past..past + rows`.
+    fn table(&self, theta: f32, rot: usize, past: usize, rows: usize) -> Vec<f32> {
+        match &*self.positions.lock().unwrap_or_else(|p| p.into_inner()) {
+            Some((base, at)) if past >= *base && past - base + rows <= at.len() => rope_table_at(theta, rot, &at[past - base..past - base + rows]),
+            _ => rope_table(theta, rot, past, rows),
+        }
+    }
+
     /// [`Self::forward`] with the delta nets' states and conv windows as they are once each of `taps` rows of the run
     /// is in (ascending, 1 to `rows`), on the device: what a checkpoint at those positions holds, without the run
     /// stopping there (a prompt's last two, before the assistant's header and before its last token, were a run of 6
@@ -1329,7 +1417,9 @@ impl Qwen35Chain {
         };
         let s = st.dims;
         let chunks = self.chunks(chain, &s, kv.len, rows);
-        if chunks.len() > 1 {
+        // (a run at given positions stays on the model's own device: the second's chunks build their own tables)
+        let placed = self.positions.lock().unwrap_or_else(|p| p.into_inner()).is_some();
+        if chunks.len() > 1 && !placed {
             if let (Some(sp), Some(chain1)) = (self.split(m, st), self.second.get().and_then(|b| b.chain())) {
                 return Some(self.forward_split(m, st, sp, chain, chain1, emb, &chunks, kv, taps));
             }
@@ -1688,7 +1778,7 @@ impl Qwen35Chain {
             None => g.out.clone(),
             Some((_, scratch)) => first(scratch, chain.attention_rows_out_len(t, s.n_h, s.hd, past + t)),
         };
-        chain.upload(&w.table, &rope_table(cfg.rope_theta, s.rot, past, t));
+        chain.upload(&w.table, &self.table(cfg.rope_theta, s.rot, past, t));
         chain.upload(&w.x, emb);
         let mut rec = chain.begin();
         // a prompt's vectors are its own: no bind groups kept to hold them

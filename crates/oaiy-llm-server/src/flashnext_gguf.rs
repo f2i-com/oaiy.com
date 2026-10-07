@@ -372,6 +372,7 @@ pub(crate) fn load(path: &Path, backends: Vec<Arc<dyn Backend>>, quant: QuantMak
         chain: Default::default(),
         mtp: None,
         config: cfg,
+        placed: Default::default(),
     })
 }
 

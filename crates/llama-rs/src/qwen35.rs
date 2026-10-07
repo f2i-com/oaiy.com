@@ -530,12 +530,14 @@ impl Qwen35Model {
 
     /// Explicit MRoPE coordinates for image patches and subsequent text.
     pub fn forward_embeds_positions(&self, embeds: &Tensor, seq: usize, kv: &mut KvCache, multimodal: Option<&[[u32; 3]]>) -> Result<Tensor> {
-        // VENDORED-LOCAL: text chained on the device when the backend has a chain for this model (a prompt with an
-        // image, its positions in three axes, takes the path below).
-        if multimodal.is_none() {
-            if let Some(logits) = self.chain.forward(self, embeds, seq, kv) {
-                return Ok(logits);
-            }
+        // VENDORED-LOCAL: chained on the device when the backend has a chain for this model: text at the positions
+        // that follow, a run with a picture in it (or after one) at the positions it is given, in three axes.
+        let chained = match multimodal {
+            None => self.chain.forward(self, embeds, seq, kv),
+            Some(positions) => self.chain.forward_positions(self, embeds, seq, kv, positions),
+        };
+        if let Some(logits) = chained {
+            return Ok(logits);
         }
         self.forward_embeds_host(embeds, seq, kv, multimodal)
     }
