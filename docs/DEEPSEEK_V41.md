@@ -7,6 +7,14 @@
 **Date:** 2026-09-18. Every number below is measured on this machine or read from the
 checkpoint headers unless marked *estimate*.
 
+> **Where it runs now (2026-10-08).** This page is the plan and the record of the CUDA
+> engine (`dsv41-cuda`), and its figures are that engine's. The engines' one GPU backend
+> is WebGPU now, and the CUDA engine stands on the branch
+> `backup/cuda-support-2026-10-08`. On main the server runs this model through `dsv41`'s
+> CPU model with its dense trunk and busy experts on a WebGPU adapter
+> ([WEBGPU.md](WEBGPU.md#deepseek-v41)): about a token a second, a long first prompt
+> taking minutes, and no images yet.
+
 ## Verdict
 
 Feasible, and a good fit for OAIY's design: this is a 552B sparse MoE whose active set per
@@ -754,7 +762,7 @@ trunk on the GPU first, then the MXFP4 experts (a VRAM tier, and the prompt's ba
 matmuls). A portable serving engine on the CPU model alone would make an Agent wait
 21 minutes for its first answer.
 
-What the portable build does about it (docs/WEBGPU.md, "DeepSeek-V4.1 without CUDA"):
+What the WebGPU build does about it (docs/WEBGPU.md, "DeepSeek-V4.1"):
 the trunk on the WebGPU adapter took the prompt to 1,081 s and showed the attention's
 remaining 600 s to be its serial sparse attention and index scores, which spread over
 the threads took it to 558 s; a prompt's busy experts on the GPU and the records read

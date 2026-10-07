@@ -36,7 +36,7 @@ for what OAIY is and how to build it.
 | [ENGINES.md](ENGINES.md) | OAIY's engines: streaming mixture-of-experts models from NVMe through RAM to the GPU, the crates, building, testing, benchmarks. |
 | [STUDIO.md](STUDIO.md) | `oaiy-studio`, the host that runs the engines: a portable install, getting and adding models, memory, the API gateway, the control port. |
 | [MEDIA_CATALOG.md](MEDIA_CATALOG.md) | The media model manifests the engines read (`config/media.example`). |
-| [WEBGPU.md](WEBGPU.md) | Language models on machines without CUDA: WebGPU, else the CPU. |
+| [WEBGPU.md](WEBGPU.md) | The engines' GPU backend: WebGPU on any GPU, else the CPU. |
 | [QWEN_IMAGE.md](QWEN_IMAGE.md) | Pictures and picture edits with Qwen Image 2.1, in Rust. |
 | [SDXL.md](SDXL.md) | SDXL 1.0 checkpoints (and derivatives) in the media worker. |
 | [LTX_VIDEO.md](LTX_VIDEO.md) | Video from text or a picture with LTX, with its soundtrack. |

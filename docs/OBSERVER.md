@@ -2,6 +2,8 @@
 
 Current default is **observer off**. The final section below supersedes the historical automatic-review/repair behavior.
 
+> **No WebGPU path yet (2026-10-08).** The observer was a CUDA engine. The engines' one GPU backend is WebGPU now, and on main the server says the observer is not available rather than start one. This page describes the CUDA build, which stands on the branch `backup/cuda-support-2026-10-08`.
+
 The optional observer reviews DeepSeek tool drafts before clients receive executable calls. When the ternary model is selected, the first draft uses ternary routed experts. With the original model selected, original MXFP4 experts are used throughout. An observer may request one suffix regeneration with a bounded window of original MXFP4 expert forwards, then review it again. This is experimental mixed-precision inference, not trained BitNet or original-model equivalence.
 
 ## Configuration

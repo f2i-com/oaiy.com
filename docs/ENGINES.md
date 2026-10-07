@@ -9,7 +9,7 @@
 ![Rust](https://img.shields.io/badge/rust-stable-orange?logo=rust)
 ![Core dependencies](https://img.shields.io/badge/core_dependencies-0-brightgreen)
 ![Unsafe](https://img.shields.io/badge/unsafe-forbidden_in_core-blue)
-![CUDA](https://img.shields.io/badge/CUDA-optional-76B900?logo=nvidia)
+![GPU](https://img.shields.io/badge/GPU-WebGPU-005A9C)
 ![Weights](https://img.shields.io/badge/weights-GGUF%20%7C%20safetensors-purple)
 ![License](https://img.shields.io/badge/license-Apache--2.0%20%7C%20MIT-lightgrey)
 
@@ -25,6 +25,12 @@ between the three tiers so the next token finds its loot close at hand.
 > experts, decoding at **~29 tokens/s on one desktop** (Ryzen 9 9950X3D, 192 GB RAM,
 > 2× RTX 5090), read straight from its safetensors.
 > [How it was pulled off →](DEEPSEEK_V41.md)
+>
+> That figure is the CUDA engine's. Since 2026-10-08 the engines' one GPU backend is
+> **WebGPU** (any GPU, through Direct3D 12, Vulkan or Metal), where this model runs at
+> about a token a second for now ([WEBGPU.md](WEBGPU.md)); the CUDA engine stands on the
+> branch `backup/cuda-support-2026-10-08`. The speeds this page gives for GPUs were
+> measured with the CUDA engines unless they say WebGPU.
 
 An opt-in [ternary-expert research backend](TERNARY_EXPERTS.md) also supports
 original MXFP4 experts during generated tool calls and local routing logs. It is
@@ -61,7 +67,7 @@ Every token is a small, well-planned job:
   job API). Image and video weights sit on the GPU, in RAM or on the SSD per your
   memory settings, and media jobs pause the LLM only when they need its GPU. See
   [the studio guide](STUDIO.md).
-- **OrcaSAQ2 27B from original EXL3 safetensors.** Native Rust/CUDA loading of
+- **OrcaSAQ2 27B from original EXL3 safetensors.** Native Rust loading of
   mixed 3/3.5/4-bit decoder projections, a 6-bit head and int8 embeddings,
   with Qwen reasoning, XML tool calls and prompt caching. See
   [download, setup and current limits](ORCASAQ.md).
@@ -119,15 +125,12 @@ Every token is a small, well-planned job:
   trunk and reads routed experts on demand, with parallel positioned reads, into a
   bounded RAM cache. The same quantized kernels run on the streamed bytes, so the output
   is token-identical to loading everything.
-- **WebGPU and CPU for machines without CUDA.** `--webgpu` (and the
-  `oaiy-llm-server-webgpu` build) runs GGUF models' quantized matmuls on any Direct3D
-  12, Vulkan or Metal GPU, straight from the GGML blocks, with the rest on the
-  CPU. Weights past the GPU budget run on the CPU. In testing, greedy tokens
-  matched the CPU on 1B, 9B and 27B models. See [WEBGPU.md](WEBGPU.md).
-- **CUDA.** `--cuda` runs GGUF models on the GPU, with GPU-side routing, grouped MoE
-  kernels and a VRAM expert cache (`--vram-cache`) for streamed models. Token ids are
-  bit-identical to the CPU path on every tested model. The default build is CPU-only
-  and needs nothing beyond Rust.
+- **WebGPU on any GPU, else the CPU.** The server (and `oaiy-llm --webgpu`) runs
+  on any Direct3D 12, Vulkan or Metal GPU: GGUF models straight from their GGML
+  blocks, the EXL3 checkpoints, GLM-5.3-Flash and DeepSeek-V4.1. Weights past the GPU
+  budget run on the CPU, and a machine with no GPU runs on the CPU. In testing, greedy
+  tokens matched the CPU on 1B, 9B and 27B models. The build needs nothing beyond
+  Rust. See [WEBGPU.md](WEBGPU.md).
 - **Std-only core.** `oaiy-engine` and `dsv41` have zero external dependencies and
   `#![forbid(unsafe_code)]`. The JSON parser, the expert cache and the thread pool are
   all hand-rolled.
@@ -138,13 +141,13 @@ The easiest way in is the studio:
 
 ```sh
 cargo build --release -p oaiy-studio   # std-only; builds anywhere
-powershell tools/qwen-image/build.ps1  # CUDA engines: oaiy-media and oaiy-llm-server
+powershell tools/qwen-image/build.ps1  # the engines: oaiy-media and oaiy-llm-server
 target/release/oaiy-studio             # opens the control UI; add models from the Models page
 ```
 
 To drive the engines directly instead:
 
-Requires a recent stable Rust. The default build is CPU-only:
+Requires a recent stable Rust, and nothing of a GPU's to build:
 
 ```sh
 cargo build --release
@@ -168,12 +171,11 @@ oaiy-llm run Qwen3-30B-A3B-Q4_K_M.gguf "Explain rainbows." --budget 8G --stats
 and the cache's hit rate. Other subcommands: `bench` (timings plus a JSON result
 schema), `tokenize`, `detokenize` (see `oaiy-llm --help`).
 
-GPU build (needs the CUDA toolkit at build time, a driver at run time):
+On a GPU (any, through WebGPU; a driver at run time is all it needs):
 
 ```sh
-cargo build --release -p oaiy-llm-cli --features cuda
-oaiy-llm run model.gguf "prompt" --cuda
-oaiy-llm run big-moe.gguf "prompt" --cuda --budget 16G --vram-cache 20G
+oaiy-llm run model.gguf "prompt" --webgpu
+oaiy-llm run model.gguf "prompt" --webgpu --webgpu-gb 20   # cap the weights it holds
 ```
 
 ## DeepSeek-V4.1-Flash
@@ -184,22 +186,15 @@ token), plus hyper-connections, compressed sparse attention and Engram n-gram me
 The checkpoint is used as-is: `dsv41` reads the safetensors headers and serves each
 expert with two positioned reads.
 
-```sh
-echo Explain how rainbows form. > prompt.txt
-
-# decode on both GPUs: layers 0-19 on cuda:1, 20-39 on cuda:0
-cargo run -p dsv41-cuda --release --example dsv41_generate -- prompt.txt 256 1,0
-```
+On main it is served by `oaiy-llm-server` (below), through `dsv41`'s CPU model with
+its dense trunk and busy experts on a WebGPU adapter. The CUDA engine's own runner
+(`cargo run -p dsv41-cuda --release --example dsv41_generate`) and the figures in this
+table are on the branch `backup/cuda-support-2026-10-08`.
 
 The prompt goes through OAIY's own Rust tokenizer and chat format, both matched
 exactly against the reference (3,638 tokenizer cases, 420 chat-format cases).
-`generate` streams the text and prints per-token timing and cache hit rates. Useful
-environment variables: `DSV41_MODEL` (checkpoint directory), `DSV41_RAM_GB` (RAM tier,
-default 140), `DSV41_USAGE` (the saved expert-usage profile that warms the tiers at
-start), `DSV41_RUNS` (answer the prompt several times in one process, as a server
-would), and `DSV41_PROFILE` (per-phase timing).
 
-| On a 9950X3D, 192 GB DDR5, 2× RTX 5090 | Decode |
+| The CUDA engine, on a 9950X3D, 192 GB DDR5, 2× RTX 5090 | Decode |
 |---|---:|
 | Warm (RAM and VRAM tiers filled; any long-lived process) | **~29 tok/s** |
 | First answer of a fresh process, warm-started from the usage profile | 2–6 tok/s (bound by the SSD) |
@@ -346,8 +341,6 @@ crates/
   oaiy-llm-cli/      `oaiy-llm` binary: run / chat / bench / info / tokenize for GGUF models
   dsv41/         DeepSeek-V4.1 from safetensors: in-place expert store, CPU reference
                  model, CPU experts (std-only, forbid(unsafe_code))
-  dsv41-cuda/    DeepSeek-V4.1 on CUDA: kernels, VRAM expert cache, hybrid decode,
-                 chunk continuation, checkpoints, layer-by-layer prefill, vision tower
   oaiy-image/    image decoding (std-only): PNG with its own inflate, JPEG, Pillow's
                  resize — pixel-exact to Pillow
   oaiy-llm-server/   OpenAI-compatible HTTP server for DeepSeek-V4.1 (std-only)
@@ -361,10 +354,10 @@ crates/
   oaiy-tts/      streaming Qwen3-TTS (Candle), shared with oaiy-media's speech
   oaiy-voice/    the resident speech server for calls: Parakeet speech-to-text and
                  Qwen3-TTS, served as OAIY Voice
-  ggml-rs-wgpu/  WebGPU backend: quantized GGUF matmuls in WGSL, the rest on the CPU
-  gguf, ggml-quants, ggml-rs, ggml-rs-cuda, tokenizer, llama-rs
-                 our pure-Rust GGUF stack: reader, quant kernels, CPU and CUDA
-                 backends, tokenizers, model architectures, expert streaming
+  ggml-rs-wgpu/  WebGPU backend: the models' kernels in WGSL, what does not fit on the CPU
+  gguf, ggml-quants, ggml-rs, tokenizer, llama-rs
+                 our pure-Rust GGUF stack: reader, quant kernels, the CPU
+                 backend, tokenizers, model architectures, expert streaming
 tools/dsv41/     Python oracle (the reference model, streamed) and helpers
 docs/            DEEPSEEK_V41.md (the port), ROADMAP.md (streaming roadmap), and the
                  rest (see docs/README.md)
@@ -384,36 +377,31 @@ cargo test --workspace
 240+ tests. Correctness rests on synthetic GGUF models built in Rust (no downloads
 needed), golden fixtures, and known-answer tests: the CLI tests write tiny llama and
 Qwen3-MoE GGUFs and check that streamed experts give the same tokens as resident ones.
-CUDA tests skip when no GPU is reachable.
+The tests that need a GPU or a model on disk are `#[ignore]`d.
 
 The DeepSeek-V4.1 golden gates need the checkpoint and the oracle's golden files, so
-they are `#[ignore]`d by default:
-
-```sh
-DSV41_CUDA_DEVICES=1,0 cargo test -p dsv41-cuda --release --test gpu_model -- --ignored --nocapture --test-threads=1
-```
-
-Vision has its own golden files (`tools/dsv41/vision_golden.py` for decoding,
-preprocessing and the tower; `oracle.py --image` for a whole image prompt):
+they are `#[ignore]`d by default. Vision has its own golden files
+(`tools/dsv41/vision_golden.py` for decoding, preprocessing and the tower;
+`oracle.py --image` for a whole image prompt):
 
 ```sh
 cargo test -p oaiy-image --release            # decoders and resize against Pillow
 cargo test -p dsv41 --release --test vision_golden -- --include-ignored
-cargo test -p dsv41-cuda --release --test gpu_vision -- --ignored --nocapture
-cargo test -p dsv41-cuda --release --test gpu_vision_model -- --ignored --nocapture --test-threads=1
 ```
+
+The CUDA engine's gates (`dsv41-cuda`'s `gpu_model`, `gpu_vision` and
+`gpu_vision_model`) are on the branch `backup/cuda-support-2026-10-08`.
 
 ## Status and caveats
 
-- The GGUF CPU path is slow on big models (Qwen3-30B-A3B: ~0.2 tok/s on CPU against
-  16.9 on one GPU); use `--cuda`. The DeepSeek-V4.1 path has its own AVX-512 expert
+- The GGUF CPU path is slow on big models (Qwen3-30B-A3B: ~0.2 tok/s on the CPU);
+  use `--webgpu`, or the server. The DeepSeek-V4.1 path has its own AVX-512 expert
   kernel.
 - GGUF expert streaming covers the Qwen3-MoE and Mixtral families; other MoE
   architectures load resident.
 - **Direct I/O** (page-cache bypass) is used by `dsv41`; GGUF streaming reads through
   the OS page cache.
-- DeepSeek-V4.1 runs through `oaiy-llm-server` or the `dsv41-cuda` example; `oaiy-llm-cli`
-  takes GGUF files.
+- DeepSeek-V4.1 runs through `oaiy-llm-server`; `oaiy-llm-cli` takes GGUF files.
 - **DeepSeek-V4.1 context:** the model is trained for 1,048,576 tokens (YaRN ×16 over
   65,536). OAIY's caches cost ~7 KB a token, so `--ctx` can go far (65,536 by default).
   `--ctx auto` serves every other model at the most it allows (its
@@ -421,7 +409,8 @@ cargo test -p dsv41-cuda --release --test gpu_vision_model -- --ignored --nocapt
   the context setting is 0, its default.
   Verified against the reference oracle up to 247 tokens; longer contexts run the same
   code, but candidate filtering only engages past ~32K tokens and is unverified there.
-- **DeepSeek-V4.1 vision:** PNG and JPEG only (GIF, WebP and BMP are refused with a
+- **DeepSeek-V4.1 vision** (the CUDA engine's: on WebGPU the model takes no images
+  yet)**:** PNG and JPEG only (GIF, WebP and BMP are refused with a
   clear error), and no `http(s)` image URLs (a std-only build has no TLS; send
   `data:` URLs). An image prompt is numerically touchy: one bf16 rounding step on 1%
   of an image's inputs moves the model's final logits by ~25%. So replies match the
@@ -435,7 +424,7 @@ cargo test -p dsv41-cuda --release --test gpu_vision_model -- --ignored --nocapt
 ## Provenance
 
 OAIY is written from scratch in Rust. The GGUF stack (`gguf`, `ggml-quants`, `ggml-rs`,
-`ggml-rs-cuda`, `tokenizer`, `llama-rs`) is the repo author's own Rust code, vendored
+`tokenizer`, `llama-rs`) is the repo author's own Rust code, vendored
 from their `llm` workspace (see `crates/VENDORED.md`). The DeepSeek-V4.1 engine
 follows DeepSeek's reference implementation and chat encoding, published under the MIT
 License (see `NOTICE`). `oaiy-image` is our own code; to decode to the same pixels as
@@ -444,7 +433,7 @@ libjpeg-turbo's IDCT, upsampling and colour conversion (see `NOTICE`).
 
 ## License
 
-`oaiy-engine`, `oaiy-llm-cli`, `oaiy-image`, `oaiy-llm-server`, `dsv41` and `dsv41-cuda` are licensed under **Apache-2.0**
+`oaiy-engine`, `oaiy-llm-cli`, `oaiy-image`, `oaiy-llm-server` and `dsv41` are licensed under **Apache-2.0**
 (`LICENSE-APACHE`; see `NOTICE`).
 
 The GGUF stack crates are dual-licensed **MIT OR Apache-2.0** (`LICENSE-MIT`,

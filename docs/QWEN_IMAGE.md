@@ -36,29 +36,28 @@ safetensors option, and the saved manifest records the exact checkpoint path.
 
 ## Build and configuration
 
-On Windows with CUDA 12.8 and Visual Studio 2022 C++ build tools:
+On Windows:
 
 ```powershell
 ./tools/qwen-image/build.ps1
 ```
 
-On a configured CUDA development shell, the equivalent commands are:
+Anywhere, the equivalent commands are:
 
 ```sh
-cargo build --release -p oaiy-media --features flash-attn
+cargo build --release -p oaiy-media
 cargo build --release -p oaiy-llm-server
 ```
 
-The first FlashAttention build compiles CUDA kernels and downloads the pinned
-NVIDIA CUTLASS headers; it can take several minutes. `--features cuda` remains
-available for GPUs/build environments without FlashAttention. The optimized
-path targets Ampere or newer NVIDIA GPUs and preserves the causal text prefix
-by evaluating it separately from bidirectional image queries. The VAE's wider
-attention head uses the bounded reference implementation.
+WebGPU is the default feature of both, and nothing of a GPU's is needed to build
+them. A job runs on WebGPU, on a GPU of any make, when it names no backend;
+`backend: "cpu"` runs it with Candle on the CPU (the reference, and slow), and
+`backend: "cuda"` is refused by name. The CUDA and FlashAttention path this page's
+timings were measured with stands on the branch `backup/cuda-support-2026-10-08`.
 
 Copy `config/qwen-image.example.json` to a local configuration and set the paths
 and device ordinals. The integrated controller configuration currently requires
-two different CUDA devices. On this machine GPU 0 holds the Qwen 27B controller;
+two different GPUs. On this machine GPU 0 holds the Qwen 27B controller;
 GPU 1 encodes prompts, drops the text encoder, then holds the diffusion model
 and VAE. The standalone worker can use one GPU without a language controller.
 
@@ -166,8 +165,8 @@ JSON on stdin with `--stdin`:
 ```
 
 Progress is JSONL on stderr; stdout contains one final JSON result. Dropping the
-process releases all image allocations. CPU builds support reference tests, but
-full model inference is intended for a CUDA build.
+process releases all image allocations. The CPU backend supports reference tests;
+full model inference is for a GPU.
 
 ## Performance measurement
 
@@ -186,12 +185,10 @@ events, results and PNGs below `target/qwen-image-bench`. It reports the first
 image separately and the median of subsequent images. It does not load the
 language controller. Avoid concurrent GPU workloads or compilation when timing.
 
-OAIY shares a `.cuda-cache` directory under the configured output root between
-jobs. The standalone worker defaults to `.cuda-cache` under its output directory.
-An explicit `CUDA_CACHE_PATH` or `CUDA_CACHE_MAXSIZE` takes precedence; otherwise
-the worker allows a 1 GiB compiled-kernel cache. The initial run still compiles
-kernels and every worker invocation loads model weights. Use one batch for many
-images to amortize setup; warm per-image timing is not first-request latency.
+Every worker invocation loads model weights, and its first job prepares its
+kernels. Use one batch for many images to amortize setup; warm per-image timing is
+not first-request latency. (The CUDA build kept a compiled-kernel cache,
+`.cuda-cache`, between jobs.)
 
 ## LoRA adapters
 
@@ -284,7 +281,7 @@ The GPU regression compares FlashAttention with the F32 reference for causal,
 mixed-prefix and bidirectional attention, including multiple batches and
 non-aligned sequence lengths. All six diffusion tests passed with the GPU test
 explicitly enabled. Generated Q4 and BF16 images were also visually inspected.
-The full workspace suite with `--features oaiy-media/flash-attn` passed:
+With the CUDA build, the full workspace suite with `--features oaiy-media/flash-attn` passed:
 501 tests passed, zero failed, 77 explicitly ignored (the GPU attention test
 was then run separately with `--include-ignored`).
 

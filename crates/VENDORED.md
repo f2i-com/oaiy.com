@@ -1,6 +1,6 @@
 # The GGUF stack
 
-The crates `gguf`, `ggml-quants`, `ggml-rs`, `ggml-rs-cuda`, `tokenizer`, and
+The crates `gguf`, `ggml-quants`, `ggml-rs`, `tokenizer`, and
 `llama-rs` in this directory are **vendored** from the author's own pure-Rust
 llama.cpp-equivalent project:
 
@@ -8,17 +8,16 @@ llama.cpp-equivalent project:
 - Date: 2026-08-02
 - Provenance: the author's own code; upstream license `MIT OR Apache-2.0`.
 
-They are OAIY's GGUF engine: the reader, the quant kernels, the CPU and CUDA
-backends, the tokenizers, and the per-architecture models. They keep their original
+They are OAIY's GGUF engine: the reader, the quant kernels, the CPU
+backend, the tokenizers, and the per-architecture models. They keep their original
 external dependencies and upstream style; the std-only rule for `oaiy-engine` / `dsv41`
 does **not** apply to them (see `CONVENTIONS.md`).
 
-`ggml-rs-cuda` is a workspace member but is kept out of `default-members`: building it
-needs a CUDA toolchain (cudarc dynamic-linking), so the default build/test stays
-CPU-only. It is pulled in by the `cuda` feature of `llama-rs` (and `oaiy-llm-cli`, which
-forwards to it: `cargo build -p oaiy-llm-cli --features cuda`, then `OAIY run MODEL.gguf
-"prompt" --cuda`). Its tests run under `cargo test --workspace` on a CUDA machine and
-skip when no GPU is reachable.
+`ggml-rs-cuda`, the stack's CUDA backend, was vendored with them and removed on
+2026-10-08, when WebGPU (`ggml-rs-wgpu`) became the engines' one GPU backend. It stands
+on the branch `backup/cuda-support-2026-10-08`, with the copy of cudarc it used
+(`crates/cudarc`, 0.19.8 with local changes for freeing across contexts and for
+capturing a decode step as a graph).
 
 Local modifications should be minimal and marked with a comment
 (`// VENDORED-LOCAL: ...`) so future re-vendoring diffs stay readable.
@@ -63,29 +62,12 @@ its roadmap id:
 
 - Host-cache leases (CACHE-01).
 - A per-device VRAM expert cache (CACHE-02 / STREAM-01,
-  `llama-rs/src/expert_stream/device_cache.rs`).
-- Pinned staging and async uploads (GPU-02, `ggml-rs-cuda/src/transfer.rs`).
+  `llama-rs/src/expert_stream/device_cache.rs`): removed with the CUDA backend.
+- Pinned staging and async uploads (GPU-02, `ggml-rs-cuda/src/transfer.rs`): removed with
+  it.
 - GPU top-k routing and grouped MoE kernels (MOE-01 / MOE-02,
-  `ggml-rs-cuda/src/moe.rs`, `llama-rs/src/moe_cuda.rs`).
+  `ggml-rs-cuda/src/moe.rs`, `llama-rs/src/moe_cuda.rs`): removed with it.
 - Backend synchronization points for `oaiy-llm bench` (PERF-01).
 
-DeepSeek-V4.1 (`dsv41`, `dsv41-cuda`) does not go through this stack: it has its own
-safetensors reader and CUDA kernels (cudarc directly), and shares only `oaiy-engine`'s cache
-and store seam.
-
-## cudarc
-
-`crates/cudarc` is cudarc 0.19.8 from crates.io, used in place of it through
-`[patch.crates-io]` in the workspace manifest (and excluded from the workspace). Its
-changes are marked `VENDORED-LOCAL`:
-
-- `CudaSlice::drop` makes its context current before it frees, as the stream and event
-  drops already do. Without it, a buffer freed on a thread where another device's context
-  (or none) was current was never released: a model unloaded from its engine thread kept
-  all of its VRAM, and the next model found the GPU full.
-- Graph capture for whole decode steps (`CudaStream::begin_graph` and `end_graph`):
-  - While a stream is being captured, its allocations come from an arena, a bump allocator
-    reset each capture, so the same launches get the same addresses every step. Those
-    slices are not `owned` and free nothing.
-  - Frees anywhere in the context wait until the capture ends (`free_after`), because a
-    free recorded into the graph would happen again at every replay.
+DeepSeek-V4.1 (`dsv41`) does not go through this stack: it has its own safetensors
+reader, and shares only `oaiy-engine`'s cache and store seam.

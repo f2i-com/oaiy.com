@@ -43,12 +43,15 @@ is reused; changing project/settings automatically restarts it after its
 current request completes. `coder-cli --workspace PATH oaiy start` also starts
 it explicitly. No separate Python/vLLM server is needed.
 
-## Without CUDA
+## Where it runs
 
-`oaiy-llm-server-webgpu` loads the same folder on any GPU through WebGPU, its packed
-weights decoded inside a WGSL matmul, else on the CPU: see
-[WEBGPU.md](WEBGPU.md#exl3-orcasaq-without-cuda). On the RTX 5090 it decodes at 3.9
-tokens a second. PEFT adapters and the vision tower need the CUDA build.
+The server loads the folder on any GPU through WebGPU, its packed weights decoded
+inside a WGSL matmul, else on the CPU: see [WEBGPU.md](WEBGPU.md#exl3-orcasaq) (3.9
+tokens a second on the RTX 5090 when that page measured it, on 2026-10-05). PEFT
+adapters and the vision tower have no WebGPU path yet.
+
+The sections below describe the CUDA implementation and its measurements. That build
+stands on the branch `backup/cuda-support-2026-10-08`.
 
 ## Implementation and limits
 
@@ -336,13 +339,14 @@ The model card recommends temperature 1.0, top_p 0.95 and top_k 20.
 
 ```powershell
 cargo test --workspace
-cargo test --release -p ggml-rs-cuda --test exl3 --test long_attention
-cargo test --release -p oaiy-llm-server benchmark_real_model_decode -- --ignored --nocapture
-cargo test --release -p oaiy-llm-server benchmark_real_model_prefill -- --ignored --nocapture
-cargo test --release -p oaiy-llm-server real_model_distributed_cache -- --ignored --nocapture
+cargo test --release -p ggml-rs-wgpu exl3::
 cargo test --release -p oaiy-llm-server tokenizer_matches_huggingface_oracle -- --ignored
 python tools/orcasaq/download.py --verify-only
 ```
+
+The CUDA build's kernel tests (`ggml-rs-cuda`'s `exl3` and `long_attention`) and its
+real-model benchmarks (`benchmark_real_model_decode`, `benchmark_real_model_prefill`,
+`real_model_distributed_cache`) are on that branch.
 
 The CUDA test uses independently packed synthetic trellises and checks every
 decoded weight plus GEMV, prefill and channel permutations for every supported

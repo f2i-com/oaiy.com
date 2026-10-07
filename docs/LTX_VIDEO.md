@@ -2,11 +2,19 @@
 
 The `oaiy-media` worker implements text-to-video and image-to-video with optional start/end images for distilled
 LTX 2.3, LTX 2.5 and Sulphur-2 checkpoints in Rust. Clips also get a
-soundtrack generated with the picture (see [Audio](#audio)). Candle supplies tensor
-operations and CUDA kernels. Gemma text encoding, the video transformer,
-eight-step Euler sampling and the convolutional VAE run inside the worker.
+soundtrack generated with the picture (see [Audio](#audio)). Gemma text encoding, the
+video transformer, eight-step Euler sampling and the convolutional VAE run inside the worker.
 FFmpeg only encodes the decoded pixels into an H.264 MP4; it does not run models.
 The server and inference core remain std-only and forbid unsafe Rust.
+
+> **WebGPU, since 2026-10-08.** The worker's one GPU backend is WebGPU, which a job
+> gets when it names no backend: text-to-video and image-to-video, guided sampling, a
+> negative prompt and LoRAs run there, without sound. Sound (a soundtrack made with the
+> picture, one to follow, speech) and two-stage refinement have no WebGPU path yet and
+> are refused there; `backend: "cuda"` is refused by name, and Candle's CPU backend
+> cannot multiply the model's BF16 weights. What this page says of sound, of
+> refinement, of CUDA and of its timings describes the CUDA build, which stands on the
+> branch `backup/cuda-support-2026-10-08`.
 
 Sulphur-2 and LTX 2.5 have been validated end to end locally in both text-to-video
 and image-to-video modes. The original LTX 2.3 checkpoint is still downloading;
@@ -69,10 +77,10 @@ available in the linked repositories.
 
 ## Configure and build
 
-Use the same CUDA worker and server build as [Qwen Image](QWEN_IMAGE.md):
+Use the same worker and server build as [Qwen Image](QWEN_IMAGE.md):
 
 ```sh
-cargo build --release -p oaiy-media --features flash-attn
+cargo build --release -p oaiy-media
 cargo build --release -p oaiy-llm-server
 ```
 
@@ -102,7 +110,7 @@ Coder-cli exposes `video_generate`:
 Use `action: "status"` for progress and completed file paths. Status includes
 configured video models and whether their weight files are present. Do not
 resubmit a queued/running job. `cancel` terminates the worker and releases its
-CUDA context; `release` permits the original language model again once all
+GPU memory; `release` permits the original language model again once all
 media work has finished. The next chat request then selects its requested model.
 
 Equivalent authenticated endpoints are:
@@ -185,7 +193,7 @@ than 35 s. The result reports `int8_weights`.
 **Headroom.** The weight budget leaves 8 GiB of the card free and the video
 decoder's workspace 4 GiB: on Windows, a card filled to the brim pages device
 memory to system RAM, where kernels can stall into the driver's 2-second
-watchdog (TDR). After a worker fails with a GPU fault (a CUDA error or
+watchdog (TDR). After a worker fails with a GPU fault (a driver error or
 non-finite output), Studio waits 30 s before the next media job, so a job never
 starts on a card whose driver is still recovering.
 
@@ -485,6 +493,9 @@ Set `OAIY_LTX_GOLDEN`, `OAIY_LTX_GEMMA`, `OAIY_LTX_GEMMA4`, `OAIY_LTX_CHECKPOINT
 and optionally `OAIY_LTX_TEST_DEVICE` before running the ignored tests:
 
 ```sh
-cargo test --release -p oaiy-media --features flash-attn --lib ltx:: -- --include-ignored --test-threads=1
-cargo test --release -p oaiy-media --features flash-attn --test ltx -- --include-ignored --test-threads=1
+cargo test --release -p oaiy-media --lib ltx:: -- --include-ignored --test-threads=1
+cargo test --release -p oaiy-media --test ltx -- --include-ignored --test-threads=1
 ```
+
+(Those of them that open a CUDA device were the CUDA build's and fail on main: run them
+on that branch.)

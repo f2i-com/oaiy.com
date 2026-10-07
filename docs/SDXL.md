@@ -6,9 +6,12 @@ the original checkpoint in place: UNet, CLIP-L, OpenCLIP-G and VAE must all be
 present. The architecture code was ported from the author's `plugin-diffusion`
 Rust implementation. Inference is native Rust/Candle; no Python service is used.
 
-Build with `tools/qwen-image/build.ps1` on Windows (CUDA/Flash Attention), or
-`cargo build --release -p oaiy-media --features flash-attn` with the CUDA
-toolchain configured. The existing [media controller setup](QWEN_IMAGE.md) and
+Build with `tools/qwen-image/build.ps1` on Windows, or
+`cargo build --release -p oaiy-media` anywhere (WebGPU is its default feature, and
+nothing of a GPU's is needed to build it). A job runs on WebGPU, on a GPU of any
+make: the UNet and the VAE there, the two CLIP encoders on the CPU. `backend: "cpu"`
+runs it with Candle on the CPU instead, which is the reference and slow; `backend:
+"cuda"` is refused by name. The existing [media controller setup](QWEN_IMAGE.md) and
 image API supervise SDXL jobs too. Restart the server/coder-cli after rebuilding.
 
 ## Catalog
@@ -59,7 +62,7 @@ CLIP-L pads with EOT, OpenCLIP-G with token zero.
 Call `image_generate` with this request, then poll `action: status` for progress
 and saved paths. `n` reuses a prompt with consecutive seeds; `prompts` can contain
 one prompt or exactly `n` prompts. Models load once per batch. Cancellation keeps
-completed images. Coder-cli stores outputs and the worker's CUDA cache under the
+completed images. Coder-cli stores outputs under the
 selected project's `.coder-cli` media output directory. Direct worker tests use
 the explicitly supplied `output_dir`.
 
@@ -71,12 +74,14 @@ quality tradeoff mentioned in the author's instructions.
 
 ## Current limits
 
-Local RTX 5090 validation with this checkpoint generated and visually checked a
+With the CUDA build (which stands on the branch `backup/cuda-support-2026-10-08`;
+these are its figures, not WebGPU's), local RTX 5090 validation with this checkpoint
+generated and visually checked a
 1024×1024 fox/shrine image at 16 steps, CFG 2.5: 6.1 seconds sampling, 3.0 seconds
 decoding/PNG saving, 44.0 seconds for the full first worker run. A separate
 two-prompt 1024×768 batch produced an anime wizard and lighthouse; its second
 image took 4.3 seconds total (3.3 seconds sampling). Startup, weight loading and
-first-use CUDA kernel preparation are paid once per batch. These are measured
+first-use kernel preparation are paid once per batch. These are measured
 examples, not latency guarantees.
 
 - Text-to-image only; reference editing, inpainting, LoRA and SDXL Refiner are
@@ -87,7 +92,8 @@ examples, not latency guarantees.
   Prompt weighting syntax and long-prompt chunking are not implemented.
 - `clip_skip: 1` means the standard SDXL penultimate layer; `2` selects one layer
   earlier. UI conventions differ, so these are explicit worker semantics.
-- UNet/text encoders use BF16 on CUDA; VAE decoding uses FP32 for stability.
+- On the Candle path the UNet and text encoders used BF16 on CUDA and use FP32 on
+  the CPU; VAE decoding uses FP32 for stability. The residency below is that path's.
   Peak memory increases with resolution. With `memory: "gpu"` (or `auto` when
   the checkpoint fits the VRAM cap) every component stays resident. With `ram` or
   `ssd` (or `auto` when it does not fit) the worker stages by component: the CLIP

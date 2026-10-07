@@ -148,7 +148,8 @@ safetensors read in place, experts streamed from the NVMe through a RAM cache to
 GPU) and `oaiy-media` (Qwen Image, SDXL, LTX video, Qwen3-TTS and Breeze TTS 2, MiniMax
 Music 3, MOSS-SoundEffect, Pixal3D, BiRefNet, Real-ESRGAN, on Candle). It serves an
 OpenAI-style gateway (`8080`) and its control pages (`7860`), downloads ready-to-run
-models from its catalog, and falls back to WebGPU or the CPU without CUDA. See
+models from its catalog, and runs them on a GPU of any make through WebGPU, else on
+the CPU. See
 [docs/ENGINES.md](docs/ENGINES.md) and [docs/STUDIO.md](docs/STUDIO.md).
 
 ### Plugins, setup and connections
@@ -213,9 +214,9 @@ desktop's own process (`oaiy_studio::launch`); a debug build attaches to an
 - **Rust** (stable) and **Node.js 24** with npm.
 - **Windows:** the Visual Studio 2022 C++ build tools and WebView2, as
   [Tauri](https://tauri.app/start/prerequisites/) needs.
-- **For the GPU engines:** an NVIDIA GPU, CUDA 12.8 and the Visual Studio **2022** C++
-  tools (CUDA 12.8 does not support a newer Visual Studio). Without CUDA, the language
-  models run on WebGPU or the CPU.
+- **For the engines' GPU:** a graphics card of any make with a current driver (Direct3D
+  12, Vulkan or Metal). The engines run on it through WebGPU, and on the CPU without
+  one; nothing of a GPU's is needed to build them.
 - **For ChatGPT:** the Codex CLI, signed in from OAIY.
 - **For the phone:** the Aokie plugin, and Bluetooth to reach the phone (see
   [Aokie's contract](docs/ecosystem/AOKIE_CONTRACT.md)).
@@ -227,11 +228,10 @@ and the CLI install theirs from a checksummed ZIPP release before they build or 
 ### The engines
 
 ```sh
-# The host, with no CUDA needed:
+# The host:
 cargo build --release -p oaiy-studio -p oaiy-studio-tray
 
-# Windows with CUDA: oaiy-media, oaiy-llm-server (and its WebGPU build) and the host,
-# with the Visual Studio 2022 tools loaded for you:
+# The engines too: oaiy-media, oaiy-llm-server and the host
 pwsh tools/qwen-image/build.ps1
 
 target/release/oaiy-studio          # its control pages open in a browser window
@@ -312,7 +312,7 @@ cd platform/ui && npm run dev        # the flow editor: http://localhost:5173/ap
 
 | Where | Command | What |
 |---|---|---|
-| root | `cargo test` | the engines' default crates (without CUDA, `llama-rs`'s tests do not compile yet: see the plan's known issues); `--workspace` adds the CUDA and Candle crates, which need CUDA to build |
+| root | `cargo test` | the engines' default crates; `--workspace` adds the Candle crates (media and speech). The tests that need a GPU or a model on disk are ignored |
 | `app/` | `npm test`, `npm run test:e2e` | unit tests; the app in headless Chrome with a scripted model |
 | `platform/desktop/` | `npm test` | the dashboard (Vitest) |
 | `platform/desktop/src-tauri/` | `cargo test --no-default-features`, `cargo test --features gui` | the desktop's Rust, headless and with the GUI |
@@ -328,7 +328,7 @@ release is made by tagging a version: see [docs/RELEASING.md](docs/RELEASING.md)
 
 | Folder | What |
 |---|---|
-| [`crates/`](crates/) | The engines, in Rust: `oaiy-engine` (the core), `oaiy-llm-server` and `oaiy-llm-cli`, `dsv41` and `dsv41-cuda` (DeepSeek-V4.1), `oaiy-media`, `oaiy-tts`, `oaiy-voice`, `oaiy-image`, `oaiy-studio` and `oaiy-studio-tray`, and the vendored GGUF stack |
+| [`crates/`](crates/) | The engines, in Rust: `oaiy-engine` (the core), `oaiy-llm-server` and `oaiy-llm-cli`, `dsv41` (DeepSeek-V4.1), `oaiy-media`, `oaiy-tts`, `oaiy-voice`, `oaiy-image`, `oaiy-studio` and `oaiy-studio-tray`, and the vendored GGUF stack |
 | [`app/`](app/) | The Agent app (TypeScript, Vite) |
 | [`platform/desktop/`](platform/desktop/) | OAIY Desktop: the dashboard (React), the Tauri 2 and axum host, and `oaiy-server` |
 | [`platform/ui/`](platform/ui/) | The flow editor and its bundled nodes |

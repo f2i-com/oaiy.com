@@ -1,5 +1,7 @@
 # Local validation after the Klein merge
 
+> **Note (2026-10-08).** The CUDA code and the CUDA figures on this page are the CUDA build's, which stands on the branch `backup/cuda-support-2026-10-08`: the engines' one GPU backend is WebGPU now ([WEBGPU.md](WEBGPU.md)).
+
 Public main `5921d886a2d147bc699c56ad007a42c61e99952a` contains the tested
 Klein commit `eb744c8eadabf400dbc37e4abc3879d33c28c706` as its direct parent.
 Its own commit changes no files. Validation moved to a fresh isolated C: checkout,

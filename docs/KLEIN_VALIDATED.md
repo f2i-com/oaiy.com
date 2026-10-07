@@ -1,5 +1,7 @@
 # Native Klein 4B validation
 
+> **Note (2026-10-08).** The CUDA code and the CUDA figures on this page are the CUDA build's, which stands on the branch `backup/cuda-support-2026-10-08`: the engines' one GPU backend is WebGPU now ([WEBGPU.md](WEBGPU.md)).
+
 This is the preserved original checkpoint. See [KLEIN_INTEGRATED.md](KLEIN_INTEGRATED.md)
 for the latest pinned upstream integration, scoped native HTTP runs, auth checks,
 and the independent desktop/Studio service credential contract.

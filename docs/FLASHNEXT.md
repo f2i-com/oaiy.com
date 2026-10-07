@@ -9,6 +9,12 @@ The model has 125B parameters with 6B active per token, plus a 51B-parameter n-g
 table. At 3.05 bpw the weights are about 48 GB, so it runs over two GPUs; the n-gram
 table (32.6 GB) stays on disk and is read as it is needed.
 
+> **WebGPU, since 2026-10-08.** The engines' one GPU backend is WebGPU: this model's
+> layers split over the cards `--devices` names. What this page says of CUDA graphs and
+> of `CudaBackend`, and its speed figures (two RTX 5090s), describe the CUDA build,
+> which stands on the branch `backup/cuda-support-2026-10-08`. LoRA adapters and the vision
+> tower have no WebGPU path yet. See [WEBGPU.md](WEBGPU.md#qwen38-flash-next).
+
 ## Download and launch
 
 ```powershell
@@ -16,10 +22,11 @@ hf download turboderp/Qwen3.8-Flash-Next-exl3 --revision 3.05bpw_h5_ng5 --local-
 target/release/oaiy-llm-server.exe --model E:\models\Qwen3.8-Flash-Next\exl3-3.05bpw --name Qwen3.8-Flash-Next --devices 0,1
 ```
 
-Without CUDA, `oaiy-llm-server-webgpu` runs it on one GPU of any kind through WebGPU, the
-experts that do not fit decoded on the CPU, at about a token a second (see
-[WEBGPU.md](WEBGPU.md#qwen38-flash-next-without-cuda)); added with no GPUs of its own, the
-CUDA build takes the first two.
+It runs through WebGPU on GPUs of any kind: split over the cards `--devices` names
+(with none named, the visible ones in order, at most two), or on one card with the
+experts that do not fit decoded on the CPU, far more slowly (see
+[WEBGPU.md](WEBGPU.md#qwen38-flash-next)). The server also reads a GGUF of the same
+architecture.
 
 In Studio, add it as a model with GPUs of its own, so the others keep theirs:
 
@@ -117,12 +124,12 @@ The Qwen3.5 hybrid and the other engines are not changed.
 
 ### Checking it
 
-The logic runs on the CPU, with no model: `cargo test -p oaiy-llm-server --lib qwen` (set
-`CUDA_VISIBLE_DEVICES=-1` if the GPUs are in use). That includes `qwen_real.rs`, which drives the real
+The logic runs on the CPU, with no model: `cargo test -p oaiy-llm-server --lib qwen`.
+That includes `qwen_real.rs`, which drives the real
 `QwenEngine::run` with a fake model whose answers depend on every row and recurrent tensor of the
 cache, and compares an engine that sets conversations aside with one that does not over randomized
-scripts (`PARK_FUZZ_SEEDS` sets how many). `cuda_round_trip_is_bit_exact_on_the_real_devices` is
-ignored: it opens a CUDA context on devices 0 and 1, so run it only with the model stopped.
+scripts (`PARK_FUZZ_SEEDS` sets how many). (The CUDA build had one more, on the real cards:
+`cuda_round_trip_is_bit_exact_on_the_real_devices`.)
 
 On the real model, `crates/oaiy-llm-server/tools/verify_parking.py` (loopback only, synthetic
 text; its own logic is tested against `tools/mock_server.py` with `python -m unittest
@@ -168,6 +175,10 @@ The multi-token prediction head is not used.
 
 ## Checking it
 
+On main, the ignored tests of `models.rs` hold the WebGPU chain against the engine's own host
+path on the checkpoint (`FLASHNEXT_MODEL`). The comparison with exllamav3 below was the CUDA
+build's and is on that branch:
+
 `matches_the_reference` (in `flashnext.rs`, ignored by default) compares OAIY with
 exllamav3 on the same checkpoint. Generate a reference with exllamav3 1.4.9 (the 1.5 Windows
 wheels' extension is over 2 GB and does not load), then:
@@ -184,13 +195,14 @@ attention is in use, it agrees at every position checked.
 
 ## Speed
 
-On two RTX 5090s, decoding runs at about 113 tokens/s on a short prompt, 105 tokens/s at
-4,000 tokens of context and 92 tokens/s at 64,000. Prefill runs at about 640 tokens/s. Through Studio, with
-sampling and streaming, decoding runs at about 108 tokens/s. A later request that
+With the CUDA build, on two RTX 5090s, decoding ran at about 113 tokens/s on a short prompt, 105 tokens/s at
+4,000 tokens of context and 92 tokens/s at 64,000. Prefill ran at about 640 tokens/s. Through Studio, with
+sampling and streaming, decoding ran at about 108 tokens/s. (These are that build's figures, not WebGPU's:
+see [WEBGPU.md](WEBGPU.md).) A later request that
 continues an earlier one (an agent's next step) reads only what is new, from memory or from
 a checkpoint at a message boundary.
 
-What makes it that fast:
+What made it that fast, in the CUDA build:
 
 - **Graphs.** A decode step is about 1,400 small kernels. Launched one at a time, each costs
   the host 7 to 8 µs on Windows, which is longer than most of them take to run. So after the

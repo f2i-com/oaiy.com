@@ -1,5 +1,7 @@
 # Native Klein integration checkpoint
 
+> **Note (2026-10-08).** The CUDA code and the CUDA figures on this page are the CUDA build's, which stands on the branch `backup/cuda-support-2026-10-08`: the engines' one GPU backend is WebGPU now ([WEBGPU.md](WEBGPU.md)).
+
 This is the original integration evidence. [KLEIN_LOCAL_GATES.md](KLEIN_LOCAL_GATES.md)
 records the verified merge into main and completed local build/browser follow-up.
 

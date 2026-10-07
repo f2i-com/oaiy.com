@@ -23,17 +23,8 @@ $request = @{
     device = $cfg.image_device
 }
 [IO.File]::WriteAllText($requestPath, ($request | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
-$oldCache = $env:CUDA_CACHE_PATH
-try {
-    if (-not $oldCache) {
-        $env:CUDA_CACHE_PATH = Join-Path $cfg.output_root '.cuda-cache'
-        New-Item -ItemType Directory -Path $env:CUDA_CACHE_PATH -Force | Out-Null
-    }
-    $process = Start-Process -FilePath $cfg.worker -ArgumentList '--request', ('"' + $requestPath + '"') -WindowStyle Hidden -PassThru -Wait -RedirectStandardOutput (Join-Path $run 'result.json') -RedirectStandardError (Join-Path $run 'events.jsonl')
-    if ($process.ExitCode) { throw (Get-Content (Join-Path $run 'events.jsonl') -Tail 8 | Out-String) }
-} finally {
-    $env:CUDA_CACHE_PATH = $oldCache
-}
+$process = Start-Process -FilePath $cfg.worker -ArgumentList '--request', ('"' + $requestPath + '"') -WindowStyle Hidden -PassThru -Wait -RedirectStandardOutput (Join-Path $run 'result.json') -RedirectStandardError (Join-Path $run 'events.jsonl')
+if ($process.ExitCode) { throw (Get-Content (Join-Path $run 'events.jsonl') -Tail 8 | Out-String) }
 $result = Get-Content (Join-Path $run 'result.json') -Raw | ConvertFrom-Json
 $records = @(Get-Content (Join-Path $result.output_dir 'manifest.jsonl') | ForEach-Object { $_ | ConvertFrom-Json })
 $warm = @($records | Select-Object -Skip 1 | ForEach-Object { $_.image_seconds } | Sort-Object)

@@ -5,10 +5,10 @@ OAIY — Orchestrate AI Yourself
 Copyright 2026 F2i
 
 The crates under crates/oaiy-engine, crates/oaiy-llm-cli, crates/oaiy-image,
-crates/oaiy-llm-server, crates/dsv41 and crates/dsv41-cuda are licensed under
+crates/oaiy-llm-server and crates/dsv41 are licensed under
 the Apache License, Version 2.0 (see LICENSE-APACHE).
 
-crates/dsv41 and crates/dsv41-cuda implement DeepSeek-V4.1 following
+crates/dsv41 implements DeepSeek-V4.1 following
 DeepSeek's reference inference code (inference/model.py) and chat
 encoding (encoding/encoding.py); crates/dsv41/src/chat.rs ports the
 encoding rule for rule, including its prompt templates. That reference
@@ -25,7 +25,7 @@ and libjpeg-turbo's integer IDCT, chroma upsampling and colour conversion
 Independent JPEG Group.
 
 The crates under crates/gguf, crates/ggml-quants, crates/ggml-rs,
-crates/ggml-rs-cuda, crates/tokenizer, and crates/llama-rs are vendored
+crates/tokenizer, and crates/llama-rs are vendored
 from the author's own pure-Rust GGUF compute subsystem (see
 crates/VENDORED.md), licensed MIT OR Apache-2.0 (see LICENSE-MIT and
 LICENSE-APACHE).

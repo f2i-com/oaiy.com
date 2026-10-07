@@ -1,5 +1,7 @@
 # OAIY: the plan
 
+> **Note (2026-10-08).** The CUDA code and the CUDA figures on this page are the CUDA build's, which stands on the branch `backup/cuda-support-2026-10-08`: the engines' one GPU backend is WebGPU now ([WEBGPU.md](WEBGPU.md)).
+
 OAIY is one app: a local AI host, an agent that works in your projects and answers your
 calls and messages, a flow editor and runtime, and the plugins and connections around them
 (Aokie, FormLogic, ChatGPT through Codex). It runs as a desktop app on Windows, and as a web

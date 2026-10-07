@@ -7,8 +7,8 @@ serves a control UI and exposes one API whose routes you configure: paths,
 methods, and the dialect each speaks.
 
 It is std-only like the core (`#![forbid(unsafe_code)]`, no external crates), so
-it builds and runs its UI on any machine. The engines need CUDA; see
-[Current limits](#current-limits).
+it builds and runs its UI on any machine. The engines run on a GPU of any make
+through WebGPU, else on the CPU; see [Current limits](#current-limits).
 
 ## A portable install
 
@@ -18,7 +18,7 @@ Put these in one folder:
 oaiy-studio.exe        the host, as a console program (cargo build --release -p oaiy-studio)
 oaiy-studio-tray.exe   the same host as a notification-area app (Windows)
 oaiy-llm-server.exe        language models (tools/qwen-image/build.ps1 builds both)
-oaiy-media.exe     images and video (built with --features flash-attn)
+oaiy-media.exe     images and video
 oaiy-studio.json       created with defaults on first start
 ```
 
@@ -103,7 +103,7 @@ The catalog lists mainstream releases only, with their licences:
 
 | Group | Models |
 |---|---|
-| Chat | On any GPU (GGUF): Qwen3.5 9B, 4B and 27B, Qwen3.8 27B at 4, 8 and 3 bits (the Agent can use its tools with these), Qwen3 8B and 4B, Gemma 4 E2B, Gemma 3 4B, Llama 3.2 3B (chat only). On NVIDIA with the CUDA engine: Qwen3.8 27B as 3.21-bit OrcaSAQ, Qwen3.8-Flash-Next (two GPUs) and DeepSeek V4.1 Flash (192 GB of RAM), all with tool use. The setup shows a CUDA-only model as NVIDIA only, and not to download where there is no CUDA engine. |
+| Chat | On any GPU (GGUF): Qwen3.5 9B, 4B and 27B, Qwen3.8 27B at 4, 8 and 3 bits (the Agent can use its tools with these), Qwen3 8B and 4B, Gemma 4 E2B, Gemma 3 4B, Llama 3.2 3B (chat only). Also on any GPU, each from its own checkpoint: Qwen3.8 27B as 3.21-bit OrcaSAQ, Qwen3.8-Flash-Next (two GPUs, or one with experts on the CPU) and DeepSeek V4.1 Flash (192 GB of RAM; slow), all with tool use. |
 | Images | Qwen Image 2.1 with Viggle's turbo adapter; Stable Diffusion XL 1.0 with its CLIP tokenizer |
 | Video | LTX 2.5 (its BF16 transformer, Gemma 4 text encoder, and video and audio VAEs) |
 | Speech | Qwen3-TTS 1.7B (VoiceDesign and Base); Breeze TTS 2 |
@@ -484,21 +484,25 @@ sections are:
     `family` (`ltx-2.3` | `ltx-2.5` | `sulphur-2`), `transformer`, `vae`,
     `text_encoder` and `tokenizer` (not for 2.5).
 
-## Machines without CUDA
+## What the language model runs on
 
-`llm.backend` picks what the language model runs on: `auto` (default), `cuda`,
-`webgpu` or `cpu`. With `auto` the studio starts `llm.server` (the CUDA build)
-when an NVIDIA GPU answers. If that dies while loading, or there is no NVIDIA GPU,
-it starts `llm.server_webgpu` (`oaiy-llm-server-webgpu`, built without CUDA), which
-runs GGUF models on any WebGPU adapter and falls back to the CPU.
-`llm.webgpu_gb` caps the weights WebGPU holds; the rest run on the CPU. The
-Overview shows what the model runs on. See [WEBGPU.md](WEBGPU.md).
+`llm.backend` picks it: `auto` (default: a GPU through WebGPU when there is one,
+else the CPU), `webgpu` or `cpu`. There is one server, `llm.server`
+(`oaiy-llm-server`); `llm.server_webgpu` (`oaiy-llm-server-webgpu`) is the same
+program under the name it had while a CUDA build stood beside it, and is started
+when `llm.server` is not there (an install that staged only that name). A
+configuration that says `cuda` (one the CUDA build wrote) is read as `auto`, and
+saved so. `llm.webgpu_gb` caps the weights WebGPU holds; the rest run on the CPU.
+The Overview shows what the model runs on. See [WEBGPU.md](WEBGPU.md).
 
 ## Current limits
 
-- Without CUDA, only GGUF language models serve (DeepSeek and EXL3 checkpoints
-  are CUDA engines), and image and video jobs are CPU-only (LTX video needs the
-  CUDA worker). `media.llm_policy: auto` reasons about CUDA device indices.
+- Not on WebGPU yet: FLUX.2 Klein (it runs with `backend: "cpu"` only), LTX's
+  sound and two-stage refinement, the observer, LoRA adapters and the vision tower
+  for Qwen3.8-Flash-Next and OrcaSAQ, GLM-5.3-Flash's expert tier in VRAM, images for
+  DeepSeek-V4.1, and the realtime speech server `oaiy-voice` (the CPU). The CUDA
+  code that ran them stands on the branch `backup/cuda-support-2026-10-08`.
+- `media.llm_policy: auto` reasons about GPU indices as `nvidia-smi` counts them.
 - One media job runs at a time; jobs queue. Only one language model is resident
   (oaiy-llm-server swaps on request).
 - The job list lives in memory: a restart forgets jobs, not their files.

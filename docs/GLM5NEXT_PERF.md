@@ -1,5 +1,7 @@
 # GLM-5.3-Flash: where a token goes, and the expert hierarchy
 
+> **Note (2026-10-08).** The CUDA code and the CUDA figures on this page are the CUDA build's, which stands on the branch `backup/cuda-support-2026-10-08`: the engines' one GPU backend is WebGPU now ([WEBGPU.md](WEBGPU.md)).
+
 Modelled on `dsv41`/`dsv41-cuda`, which reaches **~29 tok/s warm** on this same
 machine (`docs/DEEPSEEK_V41.md`). This document says what that design is, which
 parts glm5next now has, what each measures at here, and what is left.

@@ -2,6 +2,11 @@
 
 **Updated:** native CUDA baseline, strength-1 LoRA image and byte-identical
 strength-zero control have now succeeded. See [current validation and reproduction](KLEIN_VALIDATED.md).
+
+> **No WebGPU path yet (2026-10-08).** The engines' one GPU backend is WebGPU now, and
+> FLUX.2 Klein is the one image model not on it: on main a Klein job runs only with
+> `backend: "cpu"` (Candle on the CPU, slowly) and says so otherwise. The CUDA worker
+> these pages record stands on the branch `backup/cuda-support-2026-10-08`.
 The text below preserves the initial checkpoint and its inspection evidence.
 
 This is a recoverable development checkpoint, **not a validated full-model image release**.

@@ -5,8 +5,9 @@ natively in Rust (`oaiy-media`, `kind: "speech"`). The studio serves both as
 OpenAI's `audio.speech`. It adds **saved voices**: describe a voice once, keep
 it, and every later line uses the same voice.
 
-For calls, [`oaiy-tts`](#realtime-speech-oaiy-tts) speaks as it goes, in real
-time on the GPU, in a voice cloned from a clip of anyone speaking.
+For calls, [`oaiy-tts`](#realtime-speech-oaiy-tts) speaks as it goes, in a voice
+cloned from a clip of anyone speaking (in real time on the GPU with the CUDA build
+that was; on the CPU for now).
 
 ## Models
 
@@ -129,6 +130,13 @@ sounding the same from clip to clip. In the Playground's Video tab, pick
 
 ## Realtime speech: `oaiy-tts`
 
+> **Where it runs now.** `oaiy-media`'s speech (above) runs on WebGPU. The realtime
+> engine below (`oaiy-tts`, and `oaiy-voice` which serves it) has no WebGPU path yet:
+> since CUDA left the build it runs on the CPU (`oaiy-voice --device auto` or `cpu`;
+> a GPU by number is refused). The GPU path this section describes, its CUDA graphs
+> and its figures are the CUDA build's, which stands on the branch
+> `backup/cuda-support-2026-10-08`.
+
 Calls hear it through `crates/oaiy-voice`, OAIY's voice server (the desktop's
 `oaiy-voice` service), which also runs Parakeet speech-to-text. There a voice
 is a clip in the voices folder, and a clip with nothing written beside it is
@@ -147,7 +155,7 @@ while it speaks. A voice is cloned from a short clip and its transcript.
 the encoders that make a voice.
 
 ```rust
-let dev = oaiy_tts::cuda(1)?;                       // the GPU to use
+let dev = candle_core::Device::Cpu;                 // the CPU for now (the GPU path was CUDA's)
 let mut tts = oaiy_tts::Tts::load(model_dir, &dev)?; // loads and warms up
 let voice = tts.voice_from_audio(clip, Some(transcript))?; // mp3, wav, ...
 let cancel = AtomicBool::new(false);                // set it to stop (barge-in)
@@ -183,8 +191,8 @@ let report = tts.speak(text, &voice, &cancel, |pcm: &[i16]| { /* play it */ })?;
 - **Threads.** `Tts` is `Send`. It speaks one line at a time (`&mut self`).
   For concurrent calls, use one engine per call; each takes about 2 GB.
 
-Measured on an RTX 5090 (`cuda:1`), with a two-sentence reply (4.8 s of audio)
-in a voice cloned from a 6-second clip:
+Measured with the CUDA build on an RTX 5090 (`cuda:1`), with a two-sentence reply
+(4.8 s of audio) in a voice cloned from a 6-second clip:
 
 | | |
 |---|---|
@@ -194,14 +202,16 @@ in a voice cloned from a 6-second clip:
 | Real-time factor | 0.15-0.16 |
 | Device memory | 1.7 GB of weights; about 2.0-2.2 GB in all |
 
-`cargo run --release -p oaiy-tts --features flash-attn --example speak --
+With that build, `cargo run --release -p oaiy-tts --features flash-attn --example speak --
 --voice clip.mp3 --transcript "..." --text "..." --out out.wav --device 1`
-speaks a line and prints these numbers; `--example tts_bench` times frames and codec
-chunks apart. `cargo test -p oaiy-tts` runs on the CPU with no weights.
+spoke a line and printed these numbers, and `--example tts_bench` timed frames and codec
+chunks apart; both examples ask for a CUDA device, so on main they wait for the WebGPU
+port. `cargo test -p oaiy-tts` runs on the CPU with no weights.
 
 ## Speed and memory
 
-On an RTX 5090:
+On an RTX 5090, with the CUDA build (not measured again on WebGPU, where
+`oaiy-media`'s speech runs now):
 
 - The talker writes about 80 frames a second, against 12.5 for real time (the
   official PyTorch implementation writes 8.2): the code predictor's steps

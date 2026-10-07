@@ -1,12 +1,15 @@
 # WebGPU and CPU inference
 
-OAIY's GGUF models run on NVIDIA GPUs through CUDA. On a machine without CUDA
-(an AMD or Intel GPU, a laptop's integrated graphics, Apple silicon) they run
-through **WebGPU**, and on a machine with no usable GPU, on the **CPU**.
+OAIY's models run on a GPU through **WebGPU** (an NVIDIA, AMD or Intel GPU, a
+laptop's integrated graphics, Apple silicon), and on a machine with no usable GPU,
+on the **CPU**. There is no CUDA backend any more: the one that was stands on the
+branch `backup/cuda-support-2026-10-08`. Where this page sets a figure beside CUDA's,
+that figure is that build's; the sections below are dated, and each says what it
+measured then.
 
 ## How it works
 
-`crates/ggml-rs-wgpu` is a backend for the GGUF stack beside `ggml-rs-cuda`. A
+`crates/ggml-rs-wgpu` is the GGUF stack's GPU backend. A
 GGUF model spends nearly all of its time in one operation: multiplying
 activations by quantized weight matrices (`linear_q`). The WebGPU backend
 uploads those matrices to the GPU **in their GGML block layout**, so they take
@@ -64,39 +67,38 @@ before.
 ## Using it
 
 ```sh
-# the CLI
-cargo build --release -p oaiy-llm-cli --features webgpu
+# the CLI (WebGPU is a default feature)
+cargo build --release -p oaiy-llm-cli
 oaiy-llm run model.gguf "prompt" --webgpu            # or --webgpu-gb 20
 
-# the OpenAI-compatible server, built without CUDA so it starts anywhere
-cargo build --release -p oaiy-llm-server --no-default-features --features webgpu --bin oaiy-llm-server-webgpu
-oaiy-llm-server-webgpu --model model.gguf --backend auto   # WebGPU, else the CPU
+# the OpenAI-compatible server: it starts anywhere
+cargo build --release -p oaiy-llm-server
+oaiy-llm-server --model model.gguf --backend auto   # WebGPU, else the CPU
 ```
 
-`tools/qwen-image/build.ps1` builds `oaiy-llm-server-webgpu` beside the CUDA
-`oaiy-llm-server`. It is a separate executable because a CUDA build imports the
-NVIDIA driver's DLLs and will not start without them. `oaiy-llm-server-webgpu`
-imports only system DLLs.
+`tools/qwen-image/build.ps1` builds it with the media worker and the studio. The
+build also makes `oaiy-llm-server-webgpu`: the same program under the name it had
+while a CUDA build stood beside it, which the desktop's installer still stages it
+by. Either imports only system DLLs. `--backend` is `auto`, `webgpu` or `cpu`;
+`cuda` is refused by name.
 
 In **OAIY**, Settings → Language model → *Runs on*:
 
-- `auto` (the default) starts the CUDA build when an NVIDIA GPU answers. If that
-  build dies while loading (a missing driver, say), the studio starts
-  `oaiy-llm-server-webgpu` instead. Without an NVIDIA GPU it starts
-  `oaiy-llm-server-webgpu` directly.
-- `cuda`, `webgpu` and `cpu` pin one.
+- `auto` (the default): a GPU through WebGPU when there is one, else the CPU.
+- `webgpu` and `cpu` pin one. A configuration that still says `cuda` is read as
+  `auto`.
 
 The Overview page shows what the model actually runs on.
 
-`oaiy-llm-server-webgpu` serves GGUF models of the types above, and OrcaSAQ (EXL3,
+The server serves GGUF models of the types above, and OrcaSAQ (EXL3,
 below). A GGUF with IQ1, IQ2 or IQ3 tensors (unsloth's smaller "UD" quants mix them
 in, even UD-Q4_K_M) does not load, and OAIY's setup refuses one before it is added.
-The observer is a CUDA engine, and it says so rather than trying. Qwen3.8-Flash-Next
+The observer has no WebGPU path yet, and says so rather than trying. Qwen3.8-Flash-Next
 and DeepSeek-V4.1 run on it too (below).
 
-## DeepSeek-V4.1 without CUDA
+## DeepSeek-V4.1
 
-The CPU model (`dsv41::model`, the reference the CUDA path is tested against) serves it,
+The CPU model (`dsv41::model`, the reference the CUDA engine was tested against) serves it,
 with what measured slowest on the CPU moved (docs/DEEPSEEK_V41.md, "The CPU model,
 measured"; `dsv41::profile` says where a pass's time goes):
 
@@ -145,7 +147,7 @@ An Agent's tool call end to end (before the overlapped MoE): a 285-token prompt 
 tokens and took 52 s. On an internal NVMe the reads, most of what is left, would be
 several times faster.
 
-## EXL3 (OrcaSAQ) without CUDA
+## EXL3 (OrcaSAQ)
 
 `ggml_rs_wgpu::exl3` keeps an EXL3 projection's packed trellis words on the GPU (VRAM
 use equals the checkpoint's) and decodes them inside the matmul, in WGSL: one kernel
@@ -159,24 +161,24 @@ beyond the budget, or a computer without a GPU, decodes on the CPU (`Exl3Cpu`), 
 The tests check both against an independent bit-by-bit packing oracle at all eleven
 supported bitrates, on the RTX 5090 and the Radeon iGPU.
 
-OrcaSAQ-2-27B through `oaiy-llm-server-webgpu` on the RTX 5090 (2026-10-05): loaded in
+OrcaSAQ-2-27B through the server on the RTX 5090 (2026-10-05): loaded in
 19 s with 10.7 GB of EXL3 weights on the GPU; a 162-token prompt in 21.7 s and 3.9
 tokens a second, against 17 s and 4.5 for Qwen3.8 27B Q4_K_M on the same path (the
-rest is the host's share of every portable model); tool calls made and answered. No
-PEFT adapters and no vision tower without CUDA.
+rest is the host's share of every model then); tool calls made and answered. No
+PEFT adapters and no vision tower yet.
 
-## Qwen3.8-Flash-Next without CUDA
+## Qwen3.8-Flash-Next
 
 Its 512 experts a layer (and the shared one) are `ggml_rs_wgpu::exl3::Exl3MoeHost`:
 each projection on the GPU while the budget holds it, the rest decoded on the CPU
 (through a 65,536-entry table of mul1's values, where decoding was most of their
-time), the routing on the host exactly as the CUDA kernel routes. A layer's experts
+time), the routing on the host exactly as the CUDA kernel routed. A layer's experts
 run as two batches (every gate and up, then every down), the GPU's recorded in one
 encoder and read back with one submit, the CPU's an expert a thread meanwhile. The
 attention, delta-net and head matrices keep their share of the budget
 (`flashnext::dense_exl3_bytes`, which leaves out the n-gram table: its rows are
 trellis-quantized too, but it is read from the disk); the sigmoid-gated delta-net
-step runs on the host, a head a thread, checked against the CUDA kernel; the
+step runs on the host, a head a thread, checked against the CUDA kernel while there was one; the
 hyper-connection matrices are f32 on the host (unpacked once, where the host op
 unpacked f16 every call).
 
@@ -189,14 +191,17 @@ against 0.4 ms alone) and the hyper-connections (0.12 s). With every expert on t
 CPU instead it was a little faster here (1.2 tokens a second, the prompt in 28 s:
 sixteen fast cores beat a layer's two GPU round trips) but took 48 GB of RAM; that
 is how it ran until the reserve stopped counting the 32.6 GB n-gram table, which
-left the experts none of the budget. On two GPUs with CUDA it is far faster.
-No PEFT adapters and no vision tower without CUDA.
-Image and video generation (`oaiy-media`) still need CUDA for useful speed.
+left the experts none of the budget. (That was one card on that date: its layers
+split over two cards since, and it reads a GGUF of the same architecture too.)
+No PEFT adapters and no vision tower yet.
+Image and video generation (`oaiy-media`) run on WebGPU too: each model's own page
+says what of it does.
 
-## GLM-5.3-Flash without CUDA
+## GLM-5.3-Flash
 
-Its GGUF (`glm5next`) streams its experts on the CPU, from RAM and the drive, as the
-CUDA build streams them to the cards, and puts its dense layers on the WebGPU adapter.
+Its GGUF (`glm5next`) streams its experts on the CPU, from RAM and the drive (the
+CUDA build streamed them to the cards: that tier is not on WebGPU yet), and puts its
+dense layers on the WebGPU adapter.
 The catalog's is unsloth's 4-bit dynamic GGUF of Z.ai's weights (UD-Q4_K_XL, 199.7 GB:
 Q4_K, Q5_K, Q6_K and Q8_0 tensors, read from its headers). On the RTX 5090 (2026-10-05,
 a GGUF of the same architecture and tensor types, 192 GB of RAM): loaded in 11 s with
@@ -215,7 +220,7 @@ as the high-performance adapter), greedy decoding:
 | Qwen3.5 9B Q4_K_M | 2.7 tok/s | 9.2 tok/s | 40 of 40 |
 | Qwen3.8 27B Q4_K_M | 0.79 tok/s | 4.0 tok/s (14.7 GB on the GPU); 1.16 tok/s with a 6 GB budget | 40 of 40, all three |
 
-Through `oaiy-llm-server-webgpu` the 9B loads in 4.1 s and answers chat requests.
+Through the server the 9B loads in 4.1 s and answers chat requests.
 Forcing Direct3D 12 (`WGPU_BACKEND=dx12`) passes the same parity test and gives
 the same 1B tokens at 16.8 tok/s.
 

@@ -1,5 +1,7 @@
 # Experimental ternary experts and tool-call precision
 
+> **Note (2026-10-08).** The CUDA code and the CUDA figures on this page are the CUDA build's, which stands on the branch `backup/cuda-support-2026-10-08`: the engines' one GPU backend is WebGPU now ([WEBGPU.md](WEBGPU.md)).
+
 This opt-in research backend reads custom W2/G128 routed-expert records produced
 by [nca_research](https://github.com/f2i-com/nca_research). It is an explicit
 experimental exception to the normal read-original-weights format policy in

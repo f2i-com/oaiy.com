@@ -2,19 +2,19 @@
 
 This workspace is a Rust (edition 2021) inference engine, `oaiy-engine`, that reads GGUF and
 safetensors weights in place. This file is the contract every change to the engine
-crates (`oaiy-engine`, `oaiy-llm-cli`, `oaiy-llm-server`, `oaiy-image`, `dsv41`, `dsv41-cuda`) is held to.
+crates (`oaiy-engine`, `oaiy-llm-cli`, `oaiy-llm-server`, `oaiy-image`, `dsv41`) is held to.
 
 ## Hard rules
 
 - **std-only.** No external crates in `oaiy-engine`, `oaiy-image`, `dsv41`, `oaiy-llm-server` or `oaiy-studio`: no serde, no
   tokio, nothing.
   The core is zero-dependency by design. Do not add a dependency "just for this one
-  thing"; write the 30 lines instead. (`dsv41-cuda` depends on cudarc for the GPU; the
-  GGUF stack is covered below.)
+  thing"; write the 30 lines instead. (The GGUF stack, and the GPU backend it brings
+  to the server, are covered below.)
 - **No `unsafe`** in `oaiy-engine`, `oaiy-llm-cli`, `oaiy-llm-server`, `oaiy-studio`, `oaiy-image` or `dsv41`: their crate roots say
-  `#![forbid(unsafe_code)]`. `dsv41-cuda` may use it for kernel launches, pinned
-  memory and SIMD dispatch, with a `SAFETY:` comment on every block explaining why safe
-  Rust cannot express it and what makes it sound.
+  `#![forbid(unsafe_code)]`. Where a crate outside that list needs it, every block has
+  a `SAFETY:` comment explaining why safe Rust cannot express it and what makes it
+  sound.
 - **Weights are read in place.** GGUF and safetensors, as published. No converters and
   no weight format of our own.
 - **Cross-platform.** MSVC/gnu Windows and Unix, from one source. Put platform
@@ -58,12 +58,13 @@ crates (`oaiy-engine`, `oaiy-llm-cli`, `oaiy-llm-server`, `oaiy-image`, `dsv41`,
 `oaiy-studio-tray` puts the std-only `oaiy-studio` library behind a Windows
 notification-area icon. Win32 UI is outside std, so this crate depends on
 `windows-sys` (bindings only). Its `unsafe` is confined to `src/tray.rs`, and
-every block there carries a `SAFETY:` comment, as in `dsv41-cuda`.
+every block there carries a `SAFETY:` comment.
 
 ## Diffusion compute boundary
 
 `oaiy-media` is a separate, opt-in Rust compute worker. It uses Candle core/nn
-tensor primitives (and CUDA kernels), the Rust tokenizer and PNG encoder. Its
+tensor primitives on the CPU and the workspace's WebGPU backend on a GPU, the Rust
+tokenizer and PNG encoder. Its
 architecture, weight loading, scheduler and batch loop live in this workspace;
 it does not invoke Python or a C++ diffusion engine. It forbids unsafe Rust.
 The server supervises it through a std-only subprocess protocol, so these
@@ -71,7 +72,7 @@ dependencies do not enter `oaiy-llm-server`, `oaiy-engine`, `oaiy-image` or `dsv
 
 ## GGUF stack dependencies
 
-The crates `gguf`, `ggml-quants`, `ggml-rs`, `ggml-rs-cuda`, `tokenizer` and
+The crates `gguf`, `ggml-quants`, `ggml-rs`, `tokenizer` and
 `llama-rs` are the author's own Rust GGUF stack, vendored from their `llm` workspace
 (see `crates/VENDORED.md`). They keep their own external dependencies and upstream
 style, and the std-only and no-`unsafe` rules above do not apply to them. Local
