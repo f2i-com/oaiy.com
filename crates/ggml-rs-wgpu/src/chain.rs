@@ -968,10 +968,12 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let q0 = wg.y * 32u;
     let sg = li / 32u;
     let kh = h / (p.n_h / p.n_kv);
-    let kvd = p.n_kv * HD;
-    let row = 2u * kvd;
     let qs = p.n_h * HD;
     let scale = bitcast<f32>(p.scale);
+    // the cache's f16 copy a fragment at a time ([`crate::shaders::KV_F16_TILED`]): the 16-position blocks a KV head
+    // has, and where the values' fragments begin
+    let nb = ((p.kv_len + 127u) / 128u) * 8u;
+    let voff = p.n_kv * nb * HD * 16u;
     // the thread's query of the 32, its 32 keys of a block, and its quarter of the query's row of the output
     let tr = li / 4u;
     let tc = (li % 4u) * 32u;
@@ -1054,7 +1056,7 @@ fn attention_coop_one(hd: usize, full: bool) -> String {
     let values: String = (0..frags)
         .map(|f| {
             format!(
-                "            {{\n                let ib = (kb * 128u + kk) * row + kvd + kh * HD + sg * (HD / 4u) + {f}u * 16u;\n                let vb = coopLoadT<coop_mat16x16<f16, B>>(&kv16[ib], row);\n                o0_{f} = coopMultiplyAdd(pa, vb, o0_{f});\n                o1_{f} = coopMultiplyAdd(pb, vb, o1_{f});\n            }}\n"
+                "            {{\n                let ib = voff + ((kh * nb + kb * 8u + kk / 16u) * (HD / 16u) + sg * (HD / 64u) + {f}u) * 256u;\n                let sv = 16u;\n                let vb = coopLoadT<coop_mat16x16<f16, B>>(&kv16[ib], sv);\n                o0_{f} = coopMultiplyAdd(pa, vb, o0_{f});\n                o1_{f} = coopMultiplyAdd(pb, vb, o1_{f});\n            }}\n"
             )
         })
         .collect();
@@ -1079,8 +1081,17 @@ fn attention_coop_one(hd: usize, full: bool) -> String {
     } else {
         "    let qpos = p.past + q0 + tr;\n    // the blocks the last query sees\n    let hi = min(p.kv_len, p.past + q0 + 32u);"
     };
-    // (the scores' fragments stored into vec4s: their places and stride in those)
+    // (the scores' fragments stored into vec4s: their places and stride in those; the keys' fragments each a run)
     let mut scores = ATTENTION_COOP_WIDE_SCORES.to_string();
+    for (scalars, fours) in [
+        ("let ik0 = (kb * 128u + sg * 32u) * row + kh * HD + dd;", "let ik0 = ((kh * nb + kb * 8u + sg * 2u) * (HD / 16u) + dd / 16u) * 256u;"),
+        ("let ik1 = (kb * 128u + sg * 32u + 16u) * row + kh * HD + dd;", "let ik1 = ((kh * nb + kb * 8u + sg * 2u + 1u) * (HD / 16u) + dd / 16u) * 256u;"),
+        ("let ka = coopLoad<coop_mat16x16<f16, B>>(&kv16[ik0], row);", "let sk = 16u;\n                let ka = coopLoad<coop_mat16x16<f16, B>>(&kv16[ik0], sk);"),
+        ("let kc = coopLoad<coop_mat16x16<f16, B>>(&kv16[ik1], row);", "let kc = coopLoad<coop_mat16x16<f16, B>>(&kv16[ik1], sk);"),
+    ] {
+        assert_eq!(scores.matches(scalars).count(), 1, "the scores' keys");
+        scores = scores.replace(scalars, fours);
+    }
     for (scalars, fours) in [("let io00 = sg * 32u;", "let io00 = sg * 8u;"), ("let io01 = sg * 32u + 16u;", "let io01 = sg * 8u + 4u;"), ("let io10 = 2048u + sg * 32u;", "let io10 = 512u + sg * 8u;"), ("let io11 = 2048u + sg * 32u + 16u;", "let io11 = 512u + sg * 8u + 4u;"), ("let s128 = 128u;", "let s128 = 32u;")] {
         assert_eq!(scores.matches(scalars).count(), 1, "the scores' places");
         scores = scores.replace(scalars, fours);
@@ -4853,12 +4864,13 @@ impl Recorder<'_> {
             kv.len >= kv_len * row && q.len >= rows * qs && out.len >= rp * qs && (full || out.len >= self.backend.attention_rows_out_len(rows, n_h, head_dim, kv_len)),
             "chain: a prompt's attention's buffers"
         );
-        let (q16, kv16) = self.attention_f16(q, kv, rows, kv_len, qs, row);
-        let words = [n_h as u32, n_kv as u32, past as u32, rows as u32, kv_len as u32, scale.to_bits(), 0, 0];
         // (the keys 128 a block, their scores once; OAIY_ATTENTION_PASSES=2: twice, the first pass each query's largest
         // score and sum; OAIY_ATTENTION_NARROW: twice, the keys 32 a block)
         static KERNEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
         let kernel = *KERNEL.get_or_init(|| if std::env::var_os("OAIY_ATTENTION_NARROW").is_some() { 0 } else if std::env::var("OAIY_ATTENTION_PASSES").is_ok_and(|v| v == "2") { 2 } else { 1 });
+        // (the one pass reads the cache's copy a fragment at a time)
+        let (q16, kv16) = self.attention_f16(q, kv, rows, kv_len, qs, row, (kernel == 1).then_some((n_kv, head_dim)));
+        let words = [n_h as u32, n_kv as u32, past as u32, rows as u32, kv_len as u32, scale.to_bits(), 0, 0];
         let pipeline = self.gpu().named_pipeline(name, || match (kernel, full) {
             (1, _) => attention_coop_one(head_dim, full),
             (2, _) => attention_coop_wide(head_dim, full),
@@ -4874,7 +4886,7 @@ impl Recorder<'_> {
     /// A prompt's queries (`rows` of `qs`) and its cache's rows (`kv_len` of `row`) as f16 for the tensor cores'
     /// attention, each padded to 32 (the copies one pair a recording, grown as it needs: each attention's converted
     /// as it runs; put back in `att16` once used).
-    fn attention_f16(&mut self, q: &DeviceVec, kv: &DeviceVec, rows: usize, kv_len: usize, qs: usize, row: usize) -> (DeviceVec, DeviceVec) {
+    fn attention_f16(&mut self, q: &DeviceVec, kv: &DeviceVec, rows: usize, kv_len: usize, qs: usize, row: usize, tiled: Option<(usize, usize)>) -> (DeviceVec, DeviceVec) {
         // (the keys to a block of the wide kernel's: 128)
         let (rp, kp) = (rows.div_ceil(32) * 32, kv_len.div_ceil(128) * 128);
         let (q16, kv16) = match self.att16.take() {
@@ -4885,7 +4897,14 @@ impl Recorder<'_> {
         let d = self.gpu().dummy().clone();
         for (src, dst, width, n, padded) in [(q, &q16, qs, rows, rp), (kv, &kv16, row, kv_len, kp)] {
             let groups = ((padded * width / 2) as u32).div_ceil(256);
-            self.dispatch_kept(&conv, &d, buffer(src), buffer(dst), &[width as u32, n as u32, padded as u32], (groups.min(65535), groups.div_ceil(65535), 1));
+            match tiled.filter(|_| std::ptr::eq(dst, &kv16)) {
+                // the cache's a fragment at a time (`tiled`: its KV heads and their width), the one-pass kernels'
+                Some((n_kv, head_dim)) => {
+                    let tile = self.gpu().named_pipeline("chain-kv-f16-tiled", || crate::shaders::KV_F16_TILED.to_string());
+                    self.dispatch_kept(&tile, &d, buffer(src), buffer(dst), &[n_kv as u32, head_dim as u32, n as u32, padded as u32], (groups.min(65535), groups.div_ceil(65535), 1));
+                }
+                None => self.dispatch_kept(&conv, &d, buffer(src), buffer(dst), &[width as u32, n as u32, padded as u32], (groups.min(65535), groups.div_ceil(65535), 1)),
+            }
         }
         (q16, kv16)
     }
@@ -4934,10 +4953,10 @@ impl Recorder<'_> {
         let words = (rows * mw) as u32;
         let groups = words.div_ceil(256);
         self.dispatch_wide("chain-qsa-mask", QSA_MASK, [buffer(list), &d, &d, &d, &d, &d, buffer(&mask), &drw], &[rows as u32, keep as u32, mw as u32, first as u32, ratio as u32], (groups.min(65535), groups.div_ceil(65535), 1));
-        let (q16, kv16) = self.attention_f16(q, kv, rows, kv_len, qs, row);
         // (the keys 128 a block, their scores once; OAIY_ATTENTION_PASSES=2 or OAIY_ATTENTION_NARROW: twice, 32 a block)
         static OLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let old = *OLD.get_or_init(|| std::env::var_os("OAIY_ATTENTION_NARROW").is_some() || std::env::var("OAIY_ATTENTION_PASSES").is_ok_and(|v| v == "2"));
+        let (q16, kv16) = self.attention_f16(q, kv, rows, kv_len, qs, row, (!old).then_some((n_kv, head_dim)));
         let src = if old { attention_coop_masked(head_dim) } else { attention_coop_one_masked(head_dim) };
         let words = [n_h as u32, n_kv as u32, first as u32, rows as u32, kv_len as u32, scale.to_bits(), ratio as u32, mw as u32];
         self.dispatch_wide(name, &src, [buffer(&kv16), buffer(&q16), buffer(&mask), &d, &d, &d, buffer(out), &drw], &words, (n_h as u32, rows.div_ceil(32) as u32, 1));

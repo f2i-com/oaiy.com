@@ -756,6 +756,40 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+/// An attention cache's rows (`[position][K of every KV head, then V]`, f32) as f16 for the tensor cores' one-pass
+/// attention, a fragment at a time: its keys, then its values, each `[KV head][16 positions][16 of the head's
+/// width]` a run of 256 halves `[position][dim]`, so a fragment's load is one run of 512 bytes (in place its 16
+/// positions' pieces were 32 bytes each a row apart, 4 KB: the keys' and values' loads 4.3 of the kernel's 10 ms a
+/// layer for 2,048 queries over 15,360 positions, and with these runs the kernel 7.3). Positions from `p[0].z` to the
+/// padded `p[0].w` (a multiple of 128) zero. `p[0]`: KV heads, the head's width, positions, padded positions.
+pub const KV_F16_TILED: &str = r#"
+@group(0) @binding(0) var<storage, read> unused: array<u32>;
+@group(0) @binding(1) var<storage, read> x2: array<vec2<f32>>;
+@group(0) @binding(2) var<storage, read_write> q: array<u32>;
+@group(0) @binding(3) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let n_kv = p[0].x;
+    let hd = p[0].y;
+    // the fragments a KV head has, and a region (the keys, the values); a fragment 128 words of two halves
+    let per_head = (p[0].w / 16u) * (hd / 16u);
+    let per_region = n_kv * per_head;
+    let i = id.x + id.y * 65535u * 256u;
+    if (i >= 2u * per_region * 128u) { return; }
+    let frag = i / 128u;
+    let within = i % 128u;
+    let region = frag / per_region;
+    let kh = (frag % per_region) / per_head;
+    let rem = frag % per_head;
+    let key = (rem / (hd / 16u)) * 16u + within / 8u;
+    let dim = (rem % (hd / 16u)) * 16u + (within % 8u) * 2u;
+    var v = vec2<f32>(0.0);
+    if (key < p[0].z) { v = x2[(key * 2u * n_kv * hd + region * n_kv * hd + kh * hd + dim) / 2u]; }
+    q[i] = pack2x16float(v);
+}
+"#;
+
 /// [`X_F16`] for [`coop_tiled`]: the tokens' rows as f16 a step's 32 of `k` at a time, each step's for every (padded)
 /// token together (a token's 32 after the one before's), so a step's loads of a tile's tokens are one run (a warp's
 /// 1 KB, where the rows in place made it 16 runs of 64 bytes: the matmul 0.89 ms where 0.96); a last step short of 32
