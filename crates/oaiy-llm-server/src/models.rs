@@ -586,6 +586,7 @@ impl Models {
             }
             .map_err(Error::Arg)
         };
+        let tower_backend = backends.last().map(Arc::clone);
         let model = crate::flashnext::load_portable_with(&spec.path, backends, &adapters, &packed, &experts, o.mtp.contains(&spec.name)).map_err(|e| match adapters.is_empty() {
             true => e,
             // (an adapter's target nothing took: the routed experts' are not applied on WebGPU yet)
@@ -610,9 +611,26 @@ impl Models {
         let max_seq = self.context(model.config.context_length).min(16384);
         let mut cfg = self.base_cfg(spec, max_seq);
         cfg.image_token_id = tok.token_id("<|image_pad|>").ok_or_else(|| Error::Arg("Flash-Next tokenizer lacks image_pad".into()))?;
+        // Its vision tower, where the alias is given one: on the last GPU (the first carries the head's side of the
+        // text model), the matrices the checkpoint stores as EXL3 packed there.
+        let vision_path = o.vision.then(|| o.vision_projectors.get(&spec.name)).flatten();
+        let projector = match (vision_path, tower_backend) {
+            (Some(path), Some(backend)) => {
+                let last = gpus.last().copied();
+                let make = |d: ggml_rs::exl3::Exl3Data| match last {
+                    Some(g) => g.exl3(d),
+                    None => ggml_rs_wgpu::exl3::exl3_cpu(d),
+                };
+                let mm = crate::qwen_vision::load(path, backend, model.config.hidden, Some(&make))?;
+                cfg.qwen_vision = Some(mm.config().clone());
+                self.say(format!("{}: Qwen vision tower loaded (576 tokens an image)", spec.name));
+                Some(mm)
+            }
+            _ => None,
+        };
         let (jobs, rx) = std::sync::mpsc::channel();
         let park = crate::qwen_park::budget(o.park_gb, ggml_rs_wgpu::host_memory().map(|(free, _)| free as u64));
-        let e = crate::qwen::QwenEngine::new(crate::qwen::Hybrid::Flash(Box::new(model)), None, max_seq, !o.quiet && !o.silent).park_up_to(park);
+        let e = crate::qwen::QwenEngine::new(crate::qwen::Hybrid::Flash(Box::new(model)), projector, max_seq, !o.quiet && !o.silent).park_up_to(park);
         let thread = std::thread::Builder::new().name("flashnext-model".into()).spawn(move || e.run(rx))?;
         Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Qwen(tok)) })
     }
@@ -679,8 +697,8 @@ impl Models {
 
     /// OrcaSAQ: its packed EXL3 projections on the WebGPU adapter while the weight budget holds them, the rest
     /// decoded on the CPU, everything else on the host as in any portable model; its PEFT adapters beside the
-    /// projections they adapt. No vision tower yet; its prompt states are kept under a fingerprint of their own,
-    /// which its adapters are part of.
+    /// projections they adapt, and its vision tower where it is given one. Its prompt states are kept under a
+    /// fingerprint of their own, which its adapters are part of.
     #[cfg(feature = "webgpu")]
     fn load_orcasaq_portable(&self, spec: &Spec) -> Result<Live> {
         let o = &self.opts;
@@ -711,8 +729,20 @@ impl Models {
         let max_seq = self.context(model.config().context_length).min(16384);
         let mut cfg = self.base_cfg(spec, max_seq);
         cfg.image_token_id = tok.token_id("<|image_pad|>").ok_or_else(|| Error::Arg("Orca tokenizer lacks image_pad".into()))?;
+        // Its vision tower, where the alias is given one (the checkpoint's `vision` folder): on the model's backend.
+        let vision_path = o.vision.then(|| o.vision_projectors.get(&spec.name)).flatten();
+        let projector = match vision_path {
+            Some(path) => {
+                let mm = crate::qwen_vision::load(path, Arc::clone(&picked.backend), model.config().embedding_dim, None)?;
+                cfg.qwen_vision = Some(mm.config().clone());
+                self.say(format!("{}: original Qwen vision tower loaded (576 tokens an image)", spec.name));
+                Some(mm)
+            }
+            None => None,
+        };
         let (jobs, rx) = std::sync::mpsc::channel();
-        let mut e = crate::qwen::QwenEngine::new(model, None, max_seq, !o.quiet && !o.silent);
+        let mut e = crate::qwen::QwenEngine::new(model, projector, max_seq, !o.quiet && !o.silent);
+        e.image_disk_cache = vision_path.is_some();
         if let Some(dir) = &o.prompt_cache {
             let mut fp = disk::fnv(b"orcasaq2-exl3-qwen-state-portable-v1", 0);
             fp = disk::fnv(spec.path.as_os_str().as_encoded_bytes(), fp);

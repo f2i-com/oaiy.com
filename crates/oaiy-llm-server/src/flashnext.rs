@@ -495,7 +495,7 @@ fn half_or_dense(card: Option<&Arc<Card>>, backend: &Arc<dyn Backend>, values: V
 }
 
 /// The EXL3 matrix `name` (`k -> n`), read and checked, on the host.
-fn exl3_data(idx: &StIndex, name: &str, k: usize, n: usize, input: Option<Vec<u32>>, output: Option<Vec<u32>>) -> Result<Exl3Data> {
+pub(crate) fn exl3_data(idx: &StIndex, name: &str, k: usize, n: usize, input: Option<Vec<u32>>, output: Option<Vec<u32>>) -> Result<Exl3Data> {
     let key = format!("{name}.trellis");
     let info = idx.info(&key)?;
     if info.dtype != Dtype::I16 || info.shape.len() != 3 || info.shape[..2] != [k / 16, n / 16] {

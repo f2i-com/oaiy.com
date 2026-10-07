@@ -32,11 +32,15 @@ pub mod glm;
 pub mod models;
 mod http;
 mod qwen;
-// OrcaSAQ (EXL3: packed on CUDA, or on any GPU through WebGPU), its PEFT adapters (CUDA) and its Qwen vision tower (CUDA).
+// OrcaSAQ (EXL3: packed on any GPU through WebGPU, else decoded on the CPU), its PEFT adapters and its Qwen vision
+// tower.
 mod orcasaq;
-// Qwen3.8-Flash-Next (qwen4_exp, EXL3: on CUDA, or on any GPU through WebGPU).
+// Qwen3.8-Flash-Next (qwen4_exp, EXL3, on any GPU through WebGPU).
 #[cfg(feature = "webgpu")]
 mod flashnext;
+// The vision tower an EXL3 checkpoint comes with (OrcaSAQ's, Flash-Next's), on the model's backend.
+#[cfg(feature = "webgpu")]
+mod qwen_vision;
 // DeepSeek-V4.1 without CUDA: the CPU model with its dense trunk on the WebGPU adapter.
 #[cfg(feature = "webgpu")]
 mod dsv41_portable;
