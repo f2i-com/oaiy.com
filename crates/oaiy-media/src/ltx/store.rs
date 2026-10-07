@@ -341,6 +341,7 @@ impl Store {
 
     /// Whether a LoRA adapts `key`'s weight ([`Self::add_lora`]): [`Self::tensor`] then gives it with the LoRA's part
     /// added, where the bytes as stored ([`Self::bf16_bytes`], the index's own reads) are the weight without it.
+    #[cfg(feature = "webgpu")]
     pub fn adapted(&self, key: &str) -> bool {
         self.lora.contains_key(key)
     }
