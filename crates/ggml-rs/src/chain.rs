@@ -151,6 +151,12 @@ pub trait DeviceChain: Send + Sync {
     fn pieces_in_flight_at_most(&self, pieces: usize) {
         let _ = pieces;
     }
+    /// Whether the device is known to have room for `bytes` more of vectors, and some to spare: false where it does
+    /// not say what it has (a vector it has no room for fails the run that asked for it).
+    fn has_room(&self, bytes: u64) -> bool {
+        let _ = bytes;
+        false
+    }
     /// Whether a step's attention of `n_h` heads of `head_dim` over `n_kv` KV heads can read its cache as f16 halves
     /// ([`ChainRecorder::halve`], [`ChainRecorder::attention_halved`]).
     fn attention_halves(&self, n_h: usize, n_kv: usize, head_dim: usize) -> bool {

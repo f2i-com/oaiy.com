@@ -135,6 +135,8 @@ struct Kv {
     /// first `halved` rows are the layers': whatever writes a layer's rows from a position on lowers it to there.
     half: Vec<DeviceVec>,
     halved: usize,
+    /// The `cap` at which the device had no room for the halves (not asked again until the cache grows).
+    refused: usize,
 }
 
 /// A step's attention reads the cache's f16 halves from this many positions on: its parts are then bound by the
@@ -1052,7 +1054,7 @@ impl Qwen35Chain {
                     attention_layers,
                     ssm_layers,
                     output_norm: upload(&m.output_norm),
-                    kv: Mutex::new(Kv { layers: Vec::new(), cap: 0, out: chain.vec(1), owner: 0, half: Vec::new(), halved: 0 }),
+                    kv: Mutex::new(Kv { layers: Vec::new(), cap: 0, out: chain.vec(1), owner: 0, half: Vec::new(), halved: 0, refused: 0 }),
                     pool: Mutex::new(pool),
                     step: Work::new(chain, &dims, 1),
                     logits: chain.vec(cfg.vocab_size),
@@ -1170,7 +1172,7 @@ impl Qwen35Chain {
                     output_norm: upload_tensor(chain, &m.output_norm),
                     output,
                     logits: chain.vec(s.vocab),
-                    kv: Mutex::new(SplitKv { kv: Kv { layers: Vec::new(), cap: 0, out: chain.vec(1), owner: 0, half: Vec::new(), halved: 0 }, upto: 0 }),
+                    kv: Mutex::new(SplitKv { kv: Kv { layers: Vec::new(), cap: 0, out: chain.vec(1), owner: 0, half: Vec::new(), halved: 0, refused: 0 }, upto: 0 }),
                     pool,
                 })
             })
@@ -1378,11 +1380,18 @@ impl Qwen35Chain {
         // the layers' rows from `past` on are written here: their halves' rows end there; a step deep in a long cache
         // reads the halves, brought up to its own row as it goes
         g.halved = g.halved.min(past);
-        let halves = t == 1 && past + 1 >= halves_from() && chain.attention_halves(s.n_h, s.n_kv, s.hd);
+        let mut halves = t == 1 && past + 1 >= halves_from() && chain.attention_halves(s.n_h, s.n_kv, s.hd);
         if halves && g.half.len() != g.layers.len() {
+            // half the cache's size again (1.07 GB at 16,384 positions, 2.1 at 32,768): only where the device says it
+            // has that and more to spare, else the step reads the cache as it is
             let words = g.cap * row / 2;
-            g.half = (0..g.layers.len()).map(|_| chain.vec(words)).collect();
-            g.halved = 0;
+            if g.refused != g.cap && chain.has_room((g.layers.len() * words * 4) as u64) {
+                g.half = (0..g.layers.len()).map(|_| chain.vec(words)).collect();
+                g.halved = 0;
+            } else {
+                g.refused = g.cap;
+                halves = false;
+            }
         }
         let halved = g.halved;
         if halves {

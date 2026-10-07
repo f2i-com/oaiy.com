@@ -515,6 +515,11 @@ impl QwenEngine {
         let (positions, mut next_position) = positions(job)?;
         let mut keys: Vec<_> = job.prompt.iter().map(|&t| t as u64).collect();
         for image in &job.images { for (offset,k) in keys[image.start..image.start+image.prep.n_tokens()].iter_mut().enumerate() { *k = image.hash.rotate_left(17) ^ (offset as u64) ^ (1<<63); } }
+        // (checkpoints a cancelled or failed request left on their device: to the host before anything is set aside)
+        let device = self.model.qwen35().map(|m| &m.backend);
+        for (_, snap, _) in &mut self.checkpoints {
+            snap.settle(&self.kv, device);
+        }
         let cache_clock = std::time::Instant::now();
         // Flash-Next: a conversation set aside in RAM that this prompt continues comes back
         // first (the live one is set aside in its place), and the cache logic below goes on from

@@ -3994,6 +3994,11 @@ impl DeviceChain for WgpuBackend {
         WgpuBackend::pieces_in_flight_at_most(self, pieces);
     }
 
+    fn has_room(&self, bytes: u64) -> bool {
+        // (the adapter's own count of its memory in use against its budget; a gigabyte left after)
+        self.memory_budget().is_some_and(|(budget, used)| used.saturating_add(bytes).saturating_add(1 << 30) <= budget)
+    }
+
     fn attention_halves(&self, n_h: usize, n_kv: usize, head_dim: usize) -> bool {
         // (OAIY_ATTENTION_F32: a step's attention over the cache as it is)
         static F32: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
