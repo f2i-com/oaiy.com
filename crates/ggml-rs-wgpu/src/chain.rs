@@ -3749,6 +3749,36 @@ fn attention_part_group(g: usize) -> String {
         )
 }
 
+/// [`attention_part_group`] over a cache held as f16 halves ([`HALVE`]'s): each key and value a vec4 of f16, half the
+/// bytes (a step's parts over 15,888 positions read 130 MB a layer at half the card's bandwidth).
+fn attention_part_group_halved(g: usize) -> String {
+    let f32s = attention_part_group(g);
+    let halved = f32s
+        .replace("var<storage, read> kv4: array<vec4<f32>>;", "var<storage, read> kv4: array<vec4<f16>>;")
+        .replace("let k = kv4[kb + d];", "let k = vec4<f32>(kv4[kb + d]);")
+        .replace("let v = kv4[vb + i * row4];", "let v = vec4<f32>(kv4[vb + i * row4]);");
+    assert_eq!(halved.matches("f16").count(), 1, "the halves' kernel's reads");
+    assert_eq!(halved.matches("vec4<f32>(kv4[").count(), 2, "the halves' kernel's reads");
+    format!("enable f16;\n{halved}")
+}
+
+/// `p[0].y` pairs of `x2`'s values from pair `p[0].x` as f16, a pair a word of `q` at the same place: a cache's rows
+/// as the halves [`attention_part_group_halved`] reads.
+const HALVE: &str = r#"
+@group(0) @binding(0) var<storage, read> unused: array<u32>;
+@group(0) @binding(1) var<storage, read> x2: array<vec2<f32>>;
+@group(0) @binding(2) var<storage, read_write> q: array<u32>;
+@group(0) @binding(3) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 65535u * 256u;
+    if (i >= p[0].y) { return; }
+    let j = p[0].x + i;
+    q[j] = pack2x16float(x2[j]);
+}
+"#;
+
 /// Whether a step's attention parts take a KV head's group of `g` query heads of `head_dim` at once
 /// ([`ATTENTION_PART_GROUP`]): 2 to 8 of them, the head 64, 128 or 256 wide, the shares' sums within the kernel's
 /// memory (26.6 KB of the workgroup's, where a device allows it).
@@ -3962,6 +3992,15 @@ impl ggml_rs::DeviceStorage for Aliased {
 impl DeviceChain for WgpuBackend {
     fn pieces_in_flight_at_most(&self, pieces: usize) {
         WgpuBackend::pieces_in_flight_at_most(self, pieces);
+    }
+
+    fn attention_halves(&self, n_h: usize, n_kv: usize, head_dim: usize) -> bool {
+        // (OAIY_ATTENTION_F32: a step's attention over the cache as it is)
+        static F32: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let g = if n_kv > 0 && n_h % n_kv == 0 { n_h / n_kv } else { 0 };
+        !*F32.get_or_init(|| std::env::var_os("OAIY_ATTENTION_F32").is_some() || std::env::var_os("OAIY_ATTENTION_PART4").is_some())
+            && self.gpu.device.features().contains(wgpu::Features::SHADER_F16)
+            && attention_group_for(g, head_dim, self.gpu.limits.max_compute_workgroup_storage_size)
     }
 
     fn vec(&self, len: usize) -> DeviceVec {
@@ -5920,6 +5959,33 @@ impl ChainRecorder for Recorder<'_> {
         self.attention_by(q, kv, out, n_h, n_kv, head_dim, lo, kv_len, cap, scale, group);
     }
 
+    fn halve(&mut self, src: &DeviceVec, dst: &DeviceVec, at: usize, len: usize) {
+        assert!(at % 2 == 0 && len % 2 == 0 && at + len <= src.len && (at + len) / 2 <= dst.len, "chain: halves of {len} values at {at} of {} into {}", src.len, dst.len);
+        if len == 0 {
+            return;
+        }
+        let pipeline = self.gpu().named_pipeline("chain-halve", || HALVE.to_string());
+        let params = self.uniform(&[(at / 2) as u32, (len / 2) as u32]);
+        let d = self.gpu().dummy().clone();
+        let groups = ((len / 2) as u32).div_ceil(256);
+        self.dispatch(&pipeline, &d, buffer(src), buffer(dst), &params, (groups.min(65535), groups.div_ceil(65535), 1));
+    }
+
+    fn attention_halved(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, n_h: usize, n_kv: usize, head_dim: usize, lo: usize, kv_len: usize, cap: usize, scale: f32) {
+        let runs = kv_len.saturating_sub(lo).div_ceil(SPLIT).max(1);
+        assert!(
+            self.backend.attention_halves(n_h, n_kv, head_dim) && kv.len >= cap * n_kv * head_dim && kv_len <= cap && out.len >= n_h * head_dim + n_h * runs * (head_dim + 2),
+            "chain: attention's buffers"
+        );
+        let params = self.uniform(&[n_h as u32, n_kv as u32, head_dim as u32, kv_len as u32, lo as u32, runs as u32, scale.to_bits()]);
+        const NAMES: [&str; 9] = ["", "", "chain-attention-halves-2", "chain-attention-halves-3", "chain-attention-halves-4", "chain-attention-halves-5", "chain-attention-halves-6", "chain-attention-halves-7", "chain-attention-halves-8"];
+        let g = n_h / n_kv;
+        let part = self.gpu().named_pipeline(NAMES[g], || attention_part_group_halved(g));
+        self.dispatch(&part, buffer(kv), buffer(q), buffer(out), &params, (n_kv as u32, runs as u32, 1));
+        let join = self.named("chain-attention-join", ATTENTION_JOIN);
+        self.dispatch(&join, buffer(kv), buffer(q), buffer(out), &params, (n_h as u32, 1, 1));
+    }
+
     fn qsa_pool(&mut self, raw: &DeviceVec, pooled: &DeviceVec, blocks: usize, ratio: usize, d: usize) {
         assert!(d <= 256 && raw.len >= blocks * ratio * d && pooled.len >= blocks * d, "chain: QSA's pool of {blocks} blocks");
         let dd = self.gpu().dummy().clone();
@@ -6391,6 +6457,45 @@ mod tests {
             let top = want.iter().fold(0f32, |m, v| m.max(v.abs()));
             let worst = got.iter().zip(want).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
             assert!(top > 0.0 && worst <= 2e-5 * top, "{n_h} heads ({n_kv} kv) {hd} wide over {lo}..{kv_len}: worst {worst} of {top}");
+        }
+    }
+
+    /// A step's attention over its cache's f16 halves gives what the f32 cache gives, to f16's rounding: the halves
+    /// made in two goes (rows added since the first), groups of 2, 3 and 6, heads 64, 128 and 256 wide.
+    #[test]
+    fn a_steps_attention_over_halves_is_the_f32_caches() {
+        let Ok(b) = WgpuBackend::new(Some(2 << 30)) else { return };
+        for (n_h, n_kv, hd, lo, kv_len) in [(24usize, 4usize, 256usize, 0usize, 3000usize), (8, 4, 64, 0, 700), (24, 8, 128, 100, 1111)] {
+            if !b.attention_halves(n_h, n_kv, hd) {
+                return;
+            }
+            let (qd, row, cap) = (n_h * hd, 2 * n_kv * hd, kv_len + 3);
+            let mut next = rng((qd + kv_len) as u32);
+            let q: Vec<f32> = (0..qd).map(|_| next() * 2.0).collect();
+            let cache: Vec<f32> = (0..cap * row).map(|_| next() * 2.0).collect();
+            let (qv, kv, half) = (b.vec(qd), b.vec(cap * row), b.vec(cap * row / 2));
+            DeviceChain::upload(&b, &qv, &q);
+            DeviceChain::upload(&b, &kv, &cache);
+            let scale = 1.0 / (hd as f32).sqrt();
+            let len = b.attention_out_len(n_h, hd, cap);
+            let (want, got) = (b.vec(len), b.vec(len));
+            let mut rec = Recorder::new(&b);
+            rec.attention_by(&qv, &kv, &want, n_h, n_kv, hd, lo, kv_len, cap, scale, false);
+            let first = kv_len / 3;
+            rec.halve(&kv, &half, 0, first * row);
+            rec.halve(&kv, &half, first * row, (kv_len - first) * row);
+            rec.attention_halved(&qv, &half, &got, n_h, n_kv, hd, lo, kv_len, cap, scale);
+            rec.read_range(&want, 0, qd);
+            rec.read_range(&got, 0, qd);
+            let r = Box::new(rec).finish();
+            let (want, got) = (&r[0], &r[1]);
+            let dot: f64 = got.iter().zip(want).map(|(a, e)| *a as f64 * *e as f64).sum();
+            let norm = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+            let cos = dot / (norm(got) * norm(want));
+            let top = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let worst = got.iter().zip(want).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
+            eprintln!("{n_h} heads ({n_kv} kv) {hd} wide over {lo}..{kv_len}: cosine {cos:.7}, worst {worst:.2e} of {top:.2}");
+            assert!(cos > 0.99999 && worst <= 4e-3 * top, "{n_h} heads ({n_kv} kv) {hd} wide over {lo}..{kv_len}: cosine {cos}, worst {worst} of {top}");
         }
     }
 

@@ -2429,6 +2429,10 @@ mod dense_webgpu_timing {
         eprintln!("a chunk of 512 at {here}: {ms:.1} ms; {}", ggml_rs_wgpu::profile::take_line());
         kernels(1.);
         let steps = 16;
+        // (a first step apart: deep in a long cache it makes the cache's f16 halves, once)
+        let first = forward(1, &mut kv);
+        let _ = (ggml_rs_wgpu::profile::take_kernels(), ggml_rs_wgpu::profile::take_line());
+        eprintln!("the first step at {}: {first:.1} ms", kv.len - 1);
         let t = Instant::now();
         for _ in 0..steps {
             forward(1, &mut kv);

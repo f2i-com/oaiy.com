@@ -151,6 +151,12 @@ pub trait DeviceChain: Send + Sync {
     fn pieces_in_flight_at_most(&self, pieces: usize) {
         let _ = pieces;
     }
+    /// Whether a step's attention of `n_h` heads of `head_dim` over `n_kv` KV heads can read its cache as f16 halves
+    /// ([`ChainRecorder::halve`], [`ChainRecorder::attention_halved`]).
+    fn attention_halves(&self, n_h: usize, n_kv: usize, head_dim: usize) -> bool {
+        let _ = (n_h, n_kv, head_dim);
+        false
+    }
     /// The length [`ChainRecorder::attention`]'s `out` needs for `n_h` heads of `head_dim` over a cache of `cap` rows:
     /// the result and the device's scratch.
     fn attention_out_len(&self, n_h: usize, head_dim: usize, cap: usize) -> usize;
@@ -246,6 +252,20 @@ pub trait ChainRecorder {
     /// of `out` scratch ([`DeviceChain::attention_out_len`] long, `cap` the cache's rows).
     #[allow(clippy::too_many_arguments)]
     fn attention(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, n_h: usize, n_kv: usize, head_dim: usize, lo: usize, kv_len: usize, cap: usize, scale: f32);
+    /// `len` of `src`'s values from `at` (both even) as f16 in `dst`, two a word, its words `at / 2..`: a cache's rows as
+    /// the halves [`Self::attention_halved`] reads. Only where [`DeviceChain::attention_halves`].
+    fn halve(&mut self, src: &DeviceVec, dst: &DeviceVec, at: usize, len: usize) {
+        let _ = (src, dst, at, len);
+        unreachable!("chain: no f16 halves on this device")
+    }
+    /// [`Self::attention`] over the cache as f16 halves (`kv` what [`Self::halve`] made of the cache's rows: `cap` rows
+    /// of `n_kv * head_dim` words): half the bytes a step reads of a long cache, which bound it. Only where
+    /// [`DeviceChain::attention_halves`].
+    #[allow(clippy::too_many_arguments)]
+    fn attention_halved(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, n_h: usize, n_kv: usize, head_dim: usize, lo: usize, kv_len: usize, cap: usize, scale: f32) {
+        let _ = (q, kv, out, n_h, n_kv, head_dim, lo, kv_len, cap, scale);
+        unreachable!("chain: no f16 halves on this device")
+    }
     /// `dst[r * width + i] = src[r * stride + at + i]` for each of `rows` rows: a run of columns of each row of `src`
     /// (the query or the gate half of each head of Qwen3.5's q).
     #[allow(clippy::too_many_arguments)]

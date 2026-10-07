@@ -130,6 +130,22 @@ struct Kv {
     out: DeviceVec,
     /// The [`KvCache::id`] the rows are a copy of (0: none).
     owner: u64,
+    /// The layers' rows as f16, two values a word ([`ggml_rs::ChainRecorder::halve`]), for a step's attention deep in
+    /// a long cache ([`HALVES_FROM`]); none until such a step, or where the device has no such attention. Their
+    /// first `halved` rows are the layers': whatever writes a layer's rows from a position on lowers it to there.
+    half: Vec<DeviceVec>,
+    halved: usize,
+}
+
+/// A step's attention reads the cache's f16 halves from this many positions on: its parts are then bound by the
+/// bytes they read (the 27B at 15,888 positions: 130 MB a layer at half the card's bandwidth, 2.3 ms of a step's
+/// 15.7), where under some 4,000 a workgroup's own time is what they take.
+const HALVES_FROM: usize = 4096;
+
+/// [`HALVES_FROM`], or OAIY_HALVES_FROM's (a test's: 1 has every step read the halves).
+fn halves_from() -> usize {
+    static FROM: OnceLock<usize> = OnceLock::new();
+    *FROM.get_or_init(|| std::env::var("OAIY_HALVES_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(HALVES_FROM))
 }
 
 /// The vectors the cache's recurrent state tensors alias, a delta net layer's each: its state and its conv's last
@@ -466,6 +482,9 @@ fn reserve(chain: &dyn DeviceChain, g: &mut Kv, s: &Dims, slots: usize, needed: 
         .collect();
     g.out = chain.vec(chain.attention_out_len(s.n_h, s.hd, cap));
     g.cap = cap;
+    // (the halves' vectors are the old layers': made again, and filled, at the next step that reads them)
+    g.half.clear();
+    g.halved = 0;
 }
 
 /// Bring the chain's copy of the attention cache up to `past` rows: the rows the host wrote since (all of them for a
@@ -473,6 +492,7 @@ fn reserve(chain: &dyn DeviceChain, g: &mut Kv, s: &Dims, slots: usize, needed: 
 fn sync(chain: &dyn DeviceChain, g: &mut Kv, s: &Dims, layers: &[usize], kv: &KvCache, past: usize) {
     let from = if g.owner == kv.id { kv.dirty_from.min(past) } else { 0 };
     upload_rows(chain, g, s, layers, kv, from, past);
+    g.halved = g.halved.min(from);
     g.owner = kv.id;
 }
 
@@ -554,6 +574,8 @@ fn layer_vecs(chain: &dyn DeviceChain, b: &Qwen35Block, slot: usize) -> LayerVec
 /// scratch.
 struct Bound<'a> {
     kvl: &'a [DeviceVec],
+    /// The layers' f16 halves and how many of their rows are the layers' so far, where a step reads them.
+    half: Option<(&'a [DeviceVec], usize)>,
     cap: usize,
     states: &'a [(DeviceVec, DeviceVec)],
     w: &'a Work,
@@ -590,7 +612,11 @@ fn record_layers<'w>(rec: &mut dyn ggml_rs::ChainRecorder, s: &Dims, eps: f32, l
                 rec.rope_partial_rows(&w.kn, t, s.n_kv, s.hd, s.rot, &w.table);
                 rec.store_rows(&w.kn, kvl, t, kvd, past, row, 0);
                 rec.store_rows(&w.v, kvl, t, kvd, past, row, kvd);
-                if t == 1 {
+                if let (1, Some((half, done))) = (t, b.half) {
+                    // the rows since the halves were last brought up (this step's, and a prompt's before it)
+                    rec.halve(kvl, &half[*slot], done * row, (past + 1 - done) * row);
+                    rec.attention_halved(&w.qn, &half[*slot], b.attn, s.n_h, s.n_kv, s.hd, 0, past + 1, b.cap, scale);
+                } else if t == 1 {
                     rec.attention(&w.qn, kvl, b.attn, s.n_h, s.n_kv, s.hd, 0, past + 1, b.cap, scale);
                 } else {
                     rec.attention_rows(&w.qn, kvl, b.attn, t, s.n_h, s.n_kv, s.hd, past, None, scale);
@@ -722,7 +748,7 @@ impl<'a> SplitRun<'a> {
             self.mtp(&mut *rec, j, &hidden);
         }
         let mut added = false;
-        let bound = Bound { kvl: self.kv0.0, cap: self.kv0.1, states: self.states, w: &w, attn: &attn };
+        let bound = Bound { kvl: self.kv0.0, half: None, cap: self.kv0.1, states: self.states, w: &w, attn: &attn };
         let from = self.sp.from;
         record_layers(&mut *rec, &s, cfg.rms_eps, self.m.blocks[..from].iter().map(LayerW::of).zip(&self.st.layers[..from]), &bound, t, pos, None, &mut added);
         // to the second: the residual stream and the last layer's output (their add fused with its first layer's norm)
@@ -760,7 +786,7 @@ impl<'a> SplitRun<'a> {
         rec.keep_groups(false);
         rec.hold();
         let mut added = true;
-        let bound = Bound { kvl: self.kv1.0, cap: self.kv1.1, states: self.states1, w: &w, attn: &attn };
+        let bound = Bound { kvl: self.kv1.0, half: None, cap: self.kv1.1, states: self.states1, w: &w, attn: &attn };
         record_layers(&mut *rec, &s, cfg.rms_eps, self.sp.weights.iter().map(SplitW::view).zip(&self.sp.layers), &bound, t, pos, None, &mut added);
         rec.add_rmsnorm_rows(&w.x, &w.proj, &self.sp.output_norm, &w.xn, t, cfg.rms_eps);
         if last {
@@ -1026,7 +1052,7 @@ impl Qwen35Chain {
                     attention_layers,
                     ssm_layers,
                     output_norm: upload(&m.output_norm),
-                    kv: Mutex::new(Kv { layers: Vec::new(), cap: 0, out: chain.vec(1), owner: 0 }),
+                    kv: Mutex::new(Kv { layers: Vec::new(), cap: 0, out: chain.vec(1), owner: 0, half: Vec::new(), halved: 0 }),
                     pool: Mutex::new(pool),
                     step: Work::new(chain, &dims, 1),
                     logits: chain.vec(cfg.vocab_size),
@@ -1144,7 +1170,7 @@ impl Qwen35Chain {
                     output_norm: upload_tensor(chain, &m.output_norm),
                     output,
                     logits: chain.vec(s.vocab),
-                    kv: Mutex::new(SplitKv { kv: Kv { layers: Vec::new(), cap: 0, out: chain.vec(1), owner: 0 }, upto: 0 }),
+                    kv: Mutex::new(SplitKv { kv: Kv { layers: Vec::new(), cap: 0, out: chain.vec(1), owner: 0, half: Vec::new(), halved: 0 }, upto: 0 }),
                     pool,
                 })
             })
@@ -1192,6 +1218,8 @@ impl Qwen35Chain {
         let end = past0 + chunks.iter().map(|c| c.1).sum::<usize>();
         // the first's copy of the cache (every layer's) up to the prompt, and room for all of it
         let mut g = st.kv.lock().unwrap_or_else(|p| p.into_inner());
+        // (the prompt's rows are written from here on: the halves' end there)
+        g.halved = g.halved.min(past0);
         reserve(chain, &mut g, &s, st.attention_layers.len(), end);
         sync(chain, &mut g, &s, &st.attention_layers, kv, past0);
         // the second's, of its layers: the rows it lacks (the host's since, and those the first wrote)
@@ -1347,6 +1375,19 @@ impl Qwen35Chain {
         let mut g = st.kv.lock().unwrap_or_else(|p| p.into_inner());
         reserve(chain, &mut g, &s, st.attention_layers.len(), past + t);
         sync(chain, &mut g, &s, &st.attention_layers, kv, past);
+        // the layers' rows from `past` on are written here: their halves' rows end there; a step deep in a long cache
+        // reads the halves, brought up to its own row as it goes
+        g.halved = g.halved.min(past);
+        let halves = t == 1 && past + 1 >= halves_from() && chain.attention_halves(s.n_h, s.n_kv, s.hd);
+        if halves && g.half.len() != g.layers.len() {
+            let words = g.cap * row / 2;
+            g.half = (0..g.layers.len()).map(|_| chain.vec(words)).collect();
+            g.halved = 0;
+        }
+        let halved = g.halved;
+        if halves {
+            g.halved = past + 1;
+        }
         // the recurrent states the cache holds, as the chain's vectors
         let mut pool = st.pool.lock().unwrap_or_else(|p| p.into_inner());
         let mut states = Vec::with_capacity(st.ssm_layers.len());
@@ -1382,7 +1423,7 @@ impl Qwen35Chain {
         rec.keep_groups(t == 1);
         // each residual's add waits for the norm after it (the next layer's, or the output's): one dispatch for both
         let mut added = false;
-        let bound = Bound { kvl: &g.layers, cap: g.cap, states: &states, w, attn: &attn };
+        let bound = Bound { kvl: &g.layers, half: halves.then(|| (&g.half[..], halved)), cap: g.cap, states: &states, w, attn: &attn };
         let check = if checking { st.spec.as_ref() } else { None };
         record_layers(&mut *rec, &s, eps, m.blocks.iter().map(LayerW::of).zip(&st.layers), &bound, t, past, check, &mut added);
         // the head of the last row only, or of a check's every row; with a prediction layer, the hidden states after the
