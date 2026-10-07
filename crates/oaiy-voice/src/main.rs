@@ -106,7 +106,9 @@ fn pick_gpu(choice: DeviceChoice) -> Option<usize> {
 fn device_for(gpu: Option<usize>) -> Result<Device, String> {
     match gpu {
         None => Ok(Device::Cpu),
-        Some(n) => Device::new_cuda(n).map_err(|e| format!("cuda:{n}: {e}")),
+        // (the GPU path was Candle's on CUDA, which this workspace no longer builds: speech is the CPU's until its
+        // WebGPU port, and a GPU asked for by number says so rather than fall back unasked)
+        Some(n) => Device::new_cuda(n).map_err(|e| format!("cuda:{n}: there is no CUDA backend any more, speech runs on the CPU (--device cpu, or leave it out): {e}")),
     }
 }
 

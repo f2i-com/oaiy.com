@@ -2,9 +2,9 @@
 //!
 //! Every command opens a `.gguf` file through the workspace's own llama-rs
 //! engine. `--budget` streams a MoE model's experts from the `.gguf` file
-//! through a bounded RAM cache instead of loading them all; `--cuda` runs
-//! on the GPU (a `--features cuda` build). DeepSeek-V4.1 safetensors have
-//! their own engine and runner (`dsv41-cuda`, docs/DEEPSEEK_V41.md).
+//! through a bounded RAM cache instead of loading them all; `--webgpu` runs
+//! the quantized matmuls on a GPU. DeepSeek-V4.1 safetensors have their own
+//! engine, in the server (docs/DEEPSEEK_V41.md).
 //!
 //!   oaiy-llm run        MODEL.gguf "prompt"   generate once
 //!   oaiy-llm chat       MODEL.gguf            interactive conversation
@@ -103,16 +103,10 @@ struct Opts {
     stats: bool,
     /// --raw: plain continuation, no chat template.
     raw: bool,
-    /// --cuda: run on CUDA device 0 (build with `--features cuda`).
-    cuda: bool,
     /// --webgpu: quantized matmuls on a WebGPU adapter, the rest on the CPU
-    /// (build with `--features webgpu`). `--webgpu-gb N` caps its weights.
+    /// (the `webgpu` feature, a default). `--webgpu-gb N` caps its weights.
     webgpu: bool,
     webgpu_gb: Option<u64>,
-    /// --vram-cache N: VRAM expert cache budget for a streamed MoE model on
-    /// CUDA. Absent = min(2 GiB, 25% free VRAM) when streaming on CUDA;
-    /// `0` disables. Ignored on CPU and for resident loads.
-    vram_cache: Option<u64>,
     file: Option<String>,
     system: Option<String>,
     /// The model, then the command's argument (prompt, text or ids).
@@ -130,7 +124,7 @@ fn opts_init() -> Opts {
 
 /// Options that take a value.
 const VALUE_FLAGS: &[&str] = &[
-    "--budget", "--vram-cache", "--ctx", "-n", "--top-k", "--seed", "--temp", "--top-p",
+    "--budget", "--ctx", "-n", "--top-k", "--seed", "--temp", "--top-p",
     "--file", "--system", "--trace-out", "--json-out", "--webgpu-gb",
 ];
 
@@ -150,7 +144,6 @@ fn parse_opts(args: &[String], o: &mut Opts) -> Result<(), String> {
             let bad = || format!("{a}: {v:?} is not a valid value");
             match a {
                 "--budget" => o.budget = parse_size(v).ok_or_else(bad)?,
-                "--vram-cache" => o.vram_cache = Some(parse_size(v).ok_or_else(bad)?),
                 "--webgpu-gb" => {
                     o.webgpu_gb = Some(v.trim().parse().map_err(|_| bad())?);
                     o.webgpu = true;
@@ -176,7 +169,9 @@ fn parse_opts(args: &[String], o: &mut Opts) -> Result<(), String> {
             "--json" => o.json = true,
             "--raw" => o.raw = true,
             "--stats" => o.stats = true,
-            "--cuda" => o.cuda = true,
+            // (the two the CUDA backend had: named, so a script written for it says why it stopped)
+            "--cuda" => return Err("--cuda: there is no CUDA backend any more; --webgpu is the GPU".into()),
+            "--vram-cache" => return Err("--vram-cache: the VRAM expert cache was the CUDA backend's, which is gone".into()),
             "--webgpu" => o.webgpu = true,
             _ if is_flag(a) => return Err(format!("unknown option {a}")),
             _ if o.pos.len() < 2 => o.pos.push(a.to_string()),
@@ -260,19 +255,13 @@ fn check_gguf(path: &str) -> Result<(), String> {
     }
 }
 
-/// Backend for a model: CPU by default, CUDA device 0 with `--cuda`
-/// (requires `cargo build -p oaiy-llm-cli --features cuda`). The concrete CUDA
-/// handle rides along so a streaming model can attach its VRAM expert
-/// cache to the same device.
+/// Backend for a model: the CPU by default, a WebGPU adapter with `--webgpu`.
 pub(crate) struct LlamaBackend {
     pub backend: Arc<dyn ggml_rs::Backend>,
 }
 
 fn llama_backend(o: &Opts) -> Result<LlamaBackend, String> {
     if o.webgpu {
-        if o.cuda {
-            return Err("--webgpu and --cuda are alternatives; pick one".into());
-        }
         #[cfg(feature = "webgpu")]
         {
             let b = ggml_rs_wgpu::WgpuBackend::new(o.webgpu_gb.map(|g| g << 30)).map_err(|e| format!("webgpu init: {e}"))?;
@@ -287,36 +276,9 @@ fn llama_backend(o: &Opts) -> Result<LlamaBackend, String> {
         #[cfg(not(feature = "webgpu"))]
         return Err("--webgpu needs a WebGPU build: cargo build --release -p oaiy-llm-cli --features webgpu".into());
     }
-    if !o.cuda {
-        return Ok(LlamaBackend {
-            backend: ggml_rs::default_backend(),
-        });
-    }
-    {
-        Err("--cuda needs a CUDA build: cargo build --release -p oaiy-llm-cli --features cuda"
-            .to_string())
-    }
-}
-
-/// Attach the VRAM expert cache to a streaming model. Budget: `--vram-cache
-/// N` (`0` disables); without the flag the default is min(2 GiB, 25% of
-/// free VRAM) when the model streams on CUDA, disabled otherwise. No-op for
-/// resident loads and CPU runs.
-///
-/// VENDORED-LOCAL: GLM-5.3-Flash takes the tiered form of this instead — every
-/// card, sized on the card, plus the CPU tier — because its experts are 182 GB
-/// and a 2 GiB slice of one card holds 140 of 12,096 records. The two are
-/// mutually exclusive: both put a cache on card 0, which would charge its VRAM
-/// twice and split the hits between them.
-pub(crate) fn maybe_enable_vram_cache(o: &Opts, lb: &LlamaBackend, model: &mut Model) {
-    {
-        let _ = (lb, model);
-        if o.vram_cache.is_some() {
-            eprintln!(
-                "oaiy-llm: --vram-cache needs a CUDA build: cargo build --release -p oaiy-llm-cli --features cuda"
-            );
-        }
-    }
+    Ok(LlamaBackend {
+        backend: ggml_rs::default_backend(),
+    })
 }
 
 /// Load the model at `o.pos[0]` on `backend`: resident, or with streamed
@@ -338,11 +300,11 @@ fn open_model(o: &Opts) -> Result<Model, i32> {
         eprintln!("{m}");
         2
     })?;
-    let mut model = load_model(o, lb.backend.clone()).map_err(|m| {
+    let model = load_model(o, lb.backend.clone()).map_err(|m| {
         eprintln!("{m}");
         1
     })?;
-    if (o.cuda || o.webgpu) && !o.quiet {
+    if o.webgpu && !o.quiet {
         eprintln!("oaiy-llm: backend {}", model.backend().name());
         #[cfg(feature = "webgpu")]
         if let Some(w) = model.backend().as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>() {
@@ -361,7 +323,6 @@ fn open_model(o: &Opts) -> Result<Model, i32> {
             );
         }
     }
-    maybe_enable_vram_cache(o, &lb, &mut model);
     Ok(model)
 }
 
@@ -779,16 +740,13 @@ fn help() {
          \n\
          options: -n N  --temp F  --top-p F  --top-k N  --seed N  --ctx N\n\
          \x20        --system TEXT  --raw  --stats  -q  --json\n\
-         \x20        --budget N  --cuda  --webgpu  --vram-cache N  --trace-out F\n\
+         \x20        --budget N  --webgpu  --webgpu-gb N  --trace-out F\n\
          \x20 --budget 24G   stream a MoE model's experts from the .gguf through\n\
          \x20                a RAM cache, keeping resident weights + cache under\n\
          \x20                24 GB (default: load everything)\n\
-         \x20 --cuda         run on CUDA device 0 (build with --features cuda)\n\
          \x20 --webgpu       quantized matmuls on any WebGPU adapter (D3D12, Vulkan,\n\
-         \x20                Metal), the rest on the CPU (build with --features\n\
-         \x20                webgpu); --webgpu-gb N caps the weights it holds\n\
-         \x20 --vram-cache N VRAM expert cache for a streamed model on CUDA\n\
-         \x20                (0 disables; default min(2 GiB, 25% free VRAM))\n\
+         \x20                Metal), the rest on the CPU; --webgpu-gb N caps the\n\
+         \x20                weights it holds\n\
          \x20 --raw          plain continuation, no chat template (the default\n\
          \x20                for a GGUF without one)\n\
          \x20 --json         machine-readable output for info, tokenize and\n\
@@ -816,7 +774,7 @@ fn run(args: &[String]) -> i32 {
                 "oaiy-llm {} ({}{})\n",
                 VERSION,
                 bench::REVISION.get(..12).unwrap_or(bench::REVISION),
-                if false { ", cuda" } else { "" }
+                if cfg!(feature = "webgpu") { ", webgpu" } else { "" }
             );
             0
         }

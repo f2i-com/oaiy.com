@@ -2,7 +2,7 @@
 //!
 //! Usage:
 //!   cargo run --release -p llama-rs --example generate -- path/to/model.gguf "Hello, world"
-//!   cargo run --release -p llama-rs --features cuda --example generate -- path/to/model.gguf "Hi" cuda
+//!   cargo run --release -p llama-rs --example generate -- path/to/model.gguf "Hi" cpu
 
 use std::env;
 use std::io::Write;
@@ -99,10 +99,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn pick_backend(name: &str) -> Result<std::sync::Arc<dyn Backend>, Box<dyn std::error::Error>> {
     match name {
         "cpu" => Ok(default_backend()),
-        "cuda" => Err("CUDA backend not enabled. Build with `--features cuda`".into()),
-        "auto" => {
-            { eprintln!("auto: built without --features cuda, using CPU"); Ok(default_backend()) }
-        }
-        other => Err(format!("unknown backend `{other}` (try `cpu`, `cuda`, or `auto`)").into()),
+        "cuda" => Err("there is no CUDA backend any more: the GPU is WebGPU (oaiy-llm --webgpu, or the server)".into()),
+        "auto" => Ok(default_backend()),
+        other => Err(format!("unknown backend `{other}` (try `cpu` or `auto`)").into()),
     }
 }

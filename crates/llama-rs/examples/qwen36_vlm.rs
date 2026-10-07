@@ -8,12 +8,12 @@
 //! → 576 after 2x2 spatial merge).
 //!
 //! Usage:
-//!   cargo run --release --features cuda -p llama-rs --example qwen36_vlm -- \
+//!   cargo run --release -p llama-rs --example qwen36_vlm -- \
 //!       models/Qwen3.6-27B-Q4_K_M.gguf \
 //!       models/qwen3.6-mmproj-f16.gguf \
 //!       models/test_image.jpg \
 //!       "What's in this image?" \
-//!       cuda
+//!       cpu
 
 use std::env;
 use std::io::Write;
@@ -32,8 +32,8 @@ const QWEN36_IMAGE_PAD_TOKEN_ID: u32 = 248056;
 fn pick_backend(name: &str) -> Result<Arc<dyn Backend>, Box<dyn std::error::Error>> {
     match name {
         "cpu" => Ok(default_backend()),
-        s if s.starts_with("cuda:") => Err(format!("CUDA not enabled; got `{s}`. Build with --features cuda").into()),
-        "cuda" => Err("CUDA backend not enabled. Build with `--features cuda`".into()),
+        s if s.starts_with("cuda:") => Err(format!("there is no CUDA backend any more: the GPU is WebGPU (oaiy-llm --webgpu, or the server); got `{s}`").into()),
+        "cuda" => Err("there is no CUDA backend any more: the GPU is WebGPU (oaiy-llm --webgpu, or the server)".into()),
         other => Err(format!("unknown backend `{other}`").into()),
     }
 }

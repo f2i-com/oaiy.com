@@ -334,6 +334,8 @@ mod request_tests {
             ("tokenizer", Json::str(fixture.to_string_lossy())),
             ("vae", Json::str(fixture.to_string_lossy())),
             ("output_dir", Json::str(output.to_string_lossy())),
+            // (no WebGPU path yet: the CPU, by name)
+            ("backend", Json::str("cpu")),
             ("prompt", Json::str("fox")), ("negative_prompt", negative),
         ]);
         for value in [Json::Null, Json::str(""), Json::str(" \t")] {

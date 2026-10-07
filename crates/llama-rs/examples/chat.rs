@@ -3,7 +3,7 @@
 //!
 //! Usage:
 //!   cargo run --release -p llama-rs --example chat -- model.gguf "your question"
-//!   cargo run --release -p llama-rs --features cuda --example chat -- model.gguf "your question" cuda
+//!   cargo run --release -p llama-rs --example chat -- model.gguf "your question" cpu
 
 use std::env;
 use std::io::Write;
@@ -16,8 +16,8 @@ use llama_rs::{ChatMessage, Model, SampleParams};
 fn pick_backend(name: &str) -> Result<std::sync::Arc<dyn Backend>, Box<dyn std::error::Error>> {
     match name {
         "cpu" => Ok(default_backend()),
-        "cuda" => Err("CUDA backend not enabled. Build with `--features cuda`".into()),
-        other => Err(format!("unknown backend `{other}` (try `cpu` or `cuda`)").into()),
+        "cuda" => Err("there is no CUDA backend any more: the GPU is WebGPU (oaiy-llm --webgpu, or the server)".into()),
+        other => Err(format!("unknown backend `{other}` (try `cpu`)").into()),
     }
 }
 

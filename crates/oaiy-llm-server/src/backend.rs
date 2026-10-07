@@ -1,10 +1,8 @@
 //! Which backend GGUF models run on.
 //!
-//! A CUDA build uses the cards `--devices` names (and GLM's expert tier across
-//! them). Without CUDA -- `oaiy-llm-server-webgpu`, for machines that lack it -- the
-//! quantized matmuls run on the first WebGPU adapter (D3D12, Vulkan or Metal)
-//! with everything else on the CPU, and a machine with no adapter at all runs
-//! on the CPU. `--backend` pins one.
+//! A model's kernels run on a WebGPU adapter (D3D12, Vulkan or Metal: the first,
+//! or the one `--devices` names) with what does not fit there on the CPU, and a
+//! machine with no adapter at all runs on the CPU. `--backend` pins one.
 
 use crate::Options;
 use oaiy_engine::{Error, Result};
@@ -42,14 +40,11 @@ pub(crate) fn open(o: &Options, devices: &[usize]) -> Result<Picked> {
             #[cfg(feature = "webgpu")]
             return webgpu(o).map_err(Error::Arg);
             #[cfg(not(feature = "webgpu"))]
-            return Err(Error::Arg("--backend webgpu needs a WebGPU build (oaiy-llm-server-webgpu)".into()));
+            return Err(Error::Arg("--backend webgpu needs a build with the webgpu feature (the default)".into()));
         }
-        "cuda" | "auto" if false => {
-            unreachable!("guarded by cfg!(feature = \"cuda\")")
-        }
-        "cuda" => Err(Error::Arg("--backend cuda needs the CUDA build (oaiy-llm-server)".into())),
+        "cuda" => Err(Error::Arg("--backend cuda: there is no CUDA backend any more; auto or webgpu is the GPU".into())),
         _ => {
-            // auto without CUDA: an adapter if there is one, else the CPU.
+            // auto: an adapter if there is one, else the CPU.
             #[cfg(feature = "webgpu")]
             match webgpu(o) {
                 Ok(p) => return Ok(p),

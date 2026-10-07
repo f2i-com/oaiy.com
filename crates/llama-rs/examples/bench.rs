@@ -1,9 +1,9 @@
 //! Throughput micro-bench: prefill + decode tokens-per-second, median over runs.
 //!
 //! Usage:
-//!   cargo run --release -p llama-rs --features cuda --example bench -- model.gguf cuda
-//!   cargo run --release -p llama-rs --features cuda --example bench -- model.gguf cuda 256 128 5
-//!   cargo run --release -p llama-rs --features cuda --example bench -- model.gguf cuda 128 64 3 --csv
+//!   cargo run --release -p llama-rs --example bench -- model.gguf cpu
+//!   cargo run --release -p llama-rs --example bench -- model.gguf cpu 256 128 5
+//!   cargo run --release -p llama-rs --example bench -- model.gguf cpu 128 64 3 --csv
 //!
 //! Positional args: `<model.gguf> [backend] [prefill_len] [decode_len] [runs] [--csv]`
 //!   prefill_len  number of tokens fed to the prefill forward pass (default 128)
@@ -31,17 +31,10 @@ use llama_rs::Model;
 fn pick_backend(name: &str) -> Result<std::sync::Arc<dyn Backend>, Box<dyn std::error::Error>> {
     match name {
         "cpu" => Ok(default_backend()),
-        "cuda" => Err("CUDA backend not enabled. Build with `--features cuda`".into()),
-        // "auto": try CUDA, fall back to CPU on failure (no driver, no GPU,
-        // or build without --features cuda). Lets the user run on any machine
-        // without changing the command line.
-        "auto" => {
-            {
-                eprintln!("auto: built without --features cuda, using CPU");
-                Ok(default_backend())
-            }
-        }
-        other => Err(format!("unknown backend `{other}` (try `cpu`, `cuda`, or `auto`)").into()),
+        "cuda" => Err("there is no CUDA backend any more: the GPU is WebGPU (oaiy-llm --webgpu, or the server)".into()),
+        // "auto": the CPU (it tried CUDA first while there was a CUDA backend).
+        "auto" => Ok(default_backend()),
+        other => Err(format!("unknown backend `{other}` (try `cpu` or `auto`)").into()),
     }
 }
 

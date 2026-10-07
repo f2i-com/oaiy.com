@@ -633,7 +633,7 @@ fn prepare_video(c: &Config, body: &Json) -> Result<Json, String> {
     }
     // the model's backend, else the catalog's (a request's own is not taken: where a model runs is the operator's)
     if let Some(backend) = selected.get("backend").or_else(|| config.get("backend")) {
-        let b = backend.as_str().filter(|b| ["cuda", "cpu", "webgpu"].contains(b)).ok_or("video backend must be cuda, cpu or webgpu")?;
+        let b = backend.as_str().filter(|b| ["cpu", "webgpu"].contains(b)).ok_or("video backend must be webgpu or cpu (there is no CUDA backend any more)")?;
         fields.push(("backend".into(), Json::str(b)));
     }
     fields.push((
@@ -673,10 +673,10 @@ fn image_memory(c: &Config, body: &Json) -> Result<Vec<(String, Json)>, String> 
             fields.push((key.into(), Json::Int(n.min(cap))));
         }
     }
-    // the catalog's backend (a request's own is not taken: where a model runs is the operator's): webgpu runs the
-    // worker's model on WebGPU (a worker built with its webgpu feature: any GPU, no CUDA)
+    // the catalog's backend (a request's own is not taken: where a model runs is the operator's): webgpu, which is
+    // also what a catalog naming none gets, or cpu
     if let Some(backend) = settings.get("backend") {
-        let b = backend.as_str().filter(|b| ["cuda", "cpu", "webgpu"].contains(b)).ok_or("image backend must be cuda, cpu or webgpu")?;
+        let b = backend.as_str().filter(|b| ["cpu", "webgpu"].contains(b)).ok_or("image backend must be webgpu or cpu (there is no CUDA backend any more)")?;
         fields.push(("backend".into(), Json::str(b)));
     }
     Ok(fields)
@@ -1109,8 +1109,10 @@ mod tests {
         assert_eq!(backend(&cfg, r#"{"model":"ltx-2.3","prompt":"x","backend":"webgpu"}"#).unwrap(), None, "a request's own is not taken");
         write(Some("webgpu"), None);
         assert_eq!(backend(&cfg, r#"{"model":"ltx-2.3","prompt":"x"}"#).unwrap().as_deref(), Some("webgpu"));
-        write(Some("webgpu"), Some("cuda"));
-        assert_eq!(backend(&cfg, r#"{"model":"ltx-2.3","prompt":"x"}"#).unwrap().as_deref(), Some("cuda"), "the model's over the catalog's");
+        write(Some("webgpu"), Some("cpu"));
+        assert_eq!(backend(&cfg, r#"{"model":"ltx-2.3","prompt":"x"}"#).unwrap().as_deref(), Some("cpu"), "the model's over the catalog's");
+        write(Some("cuda"), None);
+        assert!(backend(&cfg, r#"{"model":"ltx-2.3","prompt":"x"}"#).unwrap_err().contains("no CUDA backend"), "a catalog written for the CUDA build says so");
         write(Some("vulkan"), None);
         assert!(backend(&cfg, r#"{"model":"ltx-2.3","prompt":"x"}"#).is_err(), "an unknown backend");
         std::fs::remove_dir_all(&root).unwrap();

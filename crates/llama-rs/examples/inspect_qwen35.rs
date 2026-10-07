@@ -15,14 +15,14 @@ use llama_rs::{Model, Qwen35Block};
 fn pick_backend(name: &str) -> Result<std::sync::Arc<dyn Backend>, Box<dyn std::error::Error>> {
     match name {
         "cpu" => Ok(default_backend()),
-        "cuda" => Err("CUDA backend not enabled. Build with `--features cuda`".into()),
-        other => Err(format!("unknown backend `{other}` (try `cpu` or `cuda`)").into()),
+        "cuda" => Err("there is no CUDA backend any more: the GPU is WebGPU (oaiy-llm --webgpu, or the server)".into()),
+        other => Err(format!("unknown backend `{other}` (try `cpu`)").into()),
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
-    let path = args.next().ok_or("usage: inspect_qwen35 <model.gguf> [backend=cpu|cuda]")?;
+    let path = args.next().ok_or("usage: inspect_qwen35 <model.gguf> [backend=cpu]")?;
     let backend_name = args.next().unwrap_or_else(|| "cpu".into());
 
     let g = GgufFile::open(&path)?;
@@ -181,10 +181,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("    GGUF stores V heads in TILED order (per `_LinearAttentionVReorderBase`");
     println!("    in convert_hf_to_gguf.py), which the code correctly handles via");
     println!("    `h_k = h_v % num_k_heads`.");
-    println!("  * Decode: ~21 tok/s on CUDA (per-token CUDA delta-net + conv1d kernel");
-    println!("    pair keeps everything on device, eliminating the per-layer d2h on the");
-    println!("    decode fast path), ~0.1 tok/s on CPU. Prefill still uses the chunked-");
-    println!("    rayon host loop — task #66 will replace it with a chunked CUDA kernel.");
+    println!("  * Decode: ~0.1 tok/s on this CPU backend. Prefill uses the chunked-rayon");
+    println!("    host loop. The GPU path for this family is the server's, on WebGPU.");
 
     Ok(())
 }

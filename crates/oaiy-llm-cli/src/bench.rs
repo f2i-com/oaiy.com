@@ -3,8 +3,8 @@
 //! "Required result fields").
 //!
 //! One invocation covers one cell of the benchmark matrix: a GGUF model,
-//! resident or with streamed experts (`--budget`), on CPU or CUDA (`--cuda`
-//! in a `--features cuda` build). Model load, TTFT, prefill and
+//! resident or with streamed experts (`--budget`), on the CPU or a WebGPU
+//! adapter (`--webgpu`). Model load, TTFT, prefill and
 //! steady-state decode are timed separately, with the backend synchronized
 //! at every timing boundary (`Backend::synchronize`, VENDORED-LOCAL in
 //! ggml-rs).
@@ -16,7 +16,7 @@
 use std::io::Write;
 use std::time::Instant;
 
-use crate::{human, llama_backend, load_model, maybe_enable_vram_cache, sample_params, Opts};
+use crate::{human, llama_backend, load_model, sample_params, Opts};
 
 /// Fixed bench prompt, identified in JSON so numbers across runs compare
 /// like with like.
@@ -200,8 +200,8 @@ impl BenchResult {
             n.push("kv_bytes: no KV cache was allocated".into());
         }
         if self.device_cache_byte_hit_rate.is_empty() {
-            n.push("device_cache_byte_hit_rate: no VRAM expert cache active (needs a streamed \
-                    MoE model on CUDA: --budget with --cuda)"
+            n.push("device_cache_byte_hit_rate: no VRAM expert cache (it was the CUDA backend's, \
+                    which is gone)"
                 .into());
         }
         if self.host_copy_bytes_per_token.is_none() {
@@ -209,8 +209,8 @@ impl BenchResult {
                     instrumented in expert_stream".into());
         }
         if self.h2d_bytes_per_token.is_empty() {
-            n.push("h2d_bytes_per_token: no VRAM expert cache active (H2D upload bytes are \
-                    counted on the device-cache miss path; needs a streamed MoE model on CUDA)"
+            n.push("h2d_bytes_per_token: no VRAM expert cache (H2D upload bytes were counted on \
+                    the CUDA backend's device-cache miss path, which is gone)"
                 .into());
         }
         if self.kernel_launches_per_token.is_none() {
@@ -443,10 +443,10 @@ fn emit(o: &Opts, r: &BenchResult) -> i32 {
 
 /* ---- the bench ------------------------------------------------------------ */
 
-/// Resident or streamed (--budget), CPU or CUDA. Timed separately: load, a
+/// Resident or streamed (--budget), CPU or WebGPU. Timed separately: load, a
 /// standalone prefill forward, then generation with per-token inter-arrival
 /// times. The backend is synchronized at every timing boundary so async
-/// CUDA work is attributed to the right phase.
+/// GPU work is attributed to the right phase.
 fn bench_gguf(o: &Opts) -> i32 {
     let phase = if o.budget > 0 { "streamed-gguf" } else { "resident-gguf" };
     let mut r = BenchResult::new(o, phase);
@@ -459,12 +459,12 @@ fn bench_gguf(o: &Opts) -> i32 {
         }
     };
     let backend = lb.backend.clone();
-    // Post-load free-VRAM delta is the only device-memory figure the CUDA
-    // backend exposes; it is a lower bound on what the model holds.
+    // Post-load free-VRAM delta, where a backend reports its memory; it is a
+    // lower bound on what the model holds.
     let vram0 = backend.vram_status();
 
     let t_load = Instant::now();
-    let mut model = match load_model(o, backend) {
+    let model = match load_model(o, backend) {
         Ok(m) => m,
         Err(m) => {
             eprintln!("{m}");
@@ -474,13 +474,7 @@ fn bench_gguf(o: &Opts) -> i32 {
     model.backend().synchronize();
     r.load_ms = Some(t_load.elapsed().as_secs_f64() * 1000.0);
     r.backend = model.backend().name().to_string();
-    r.hw_device = if o.cuda {
-        // ggml-rs-cuda names the backend "cuda:<ordinal>"; it exposes no
-        // device-name query, so the ordinal is all there is to report.
-        format!("cuda ({}; device-name query not exposed)", model.backend().name())
-    } else {
-        "cpu".to_string()
-    };
+    r.hw_device = if o.webgpu { format!("webgpu ({})", model.backend().name()) } else { "cpu".to_string() };
     if let (Some((free0, _)), Some((free1, _))) = (vram0, model.backend().vram_status()) {
         r.resident_device_bytes = vec![free0.saturating_sub(free1) as u64];
     }
@@ -499,10 +493,6 @@ fn bench_gguf(o: &Opts) -> i32 {
              resident set is demand-paged (see peak_rss_bytes)".into(),
         );
     }
-
-    // Attach the VRAM expert cache (no-op unless streaming on CUDA; see
-    // maybe_enable_vram_cache for the budget default).
-    maybe_enable_vram_cache(o, &lb, &mut model);
 
     let ids = match model.tokenizer().encode(PROMPT, true) {
         Ok(v) => v,

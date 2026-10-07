@@ -105,12 +105,7 @@ impl Request {
                     Some(Voice::from_json(&Json::parse(&bytes).map_err(|e| format!("voice file {p}: {e}"))?)?)
                 }
             },
-            webgpu: match s("backend").as_deref() {
-                Some("webgpu") => true,
-                Some("cuda" | "cpu") => false,
-                Some(other) => return Err(format!("speech: backend must be webgpu, cuda or cpu, not {other}")),
-                None => cfg!(feature = "webgpu"),
-            },
+            webgpu: crate::pipeline::backend_is_webgpu(j, "speech")?,
         };
         if r.webgpu && !cfg!(feature = "webgpu") {
             return Err("speech: this build has no WebGPU (the webgpu feature)".into());
@@ -159,12 +154,7 @@ impl DesignRequest {
             seed: j.get("seed").and_then(Json::as_i64).unwrap_or(0).max(0) as u64,
             device: j.get("device").and_then(Json::as_i64).unwrap_or(0).max(0) as usize,
             output: s("output_dir").ok_or("voice: missing output_dir")?.into(),
-            webgpu: match s("backend").as_deref() {
-                Some("webgpu") => true,
-                Some("cuda" | "cpu") => false,
-                Some(other) => return Err(format!("voice: backend must be webgpu, cuda or cpu, not {other}")),
-                None => cfg!(feature = "webgpu"),
-            },
+            webgpu: crate::pipeline::backend_is_webgpu(j, "voice")?,
         };
         if r.webgpu && !cfg!(feature = "webgpu") {
             return Err("voice: this build has no WebGPU (the webgpu feature)".into());
@@ -285,11 +275,9 @@ fn event(stage: &str, current: usize, total: usize) -> Json {
 }
 
 fn device(index: usize) -> Result<Device> {
-    // The models run in BF16, which the CPU backend cannot multiply.
-    {
-        let _ = index;
-        candle_core::bail!("speech need a GPU: this oaiy-media was built without CUDA (build it with --features cuda or flash-attn)")
-    }
+    // (the models run in BF16, which Candle's CPU backend cannot multiply)
+    let _ = index;
+    candle_core::bail!("speech runs on WebGPU: the cpu backend cannot multiply its BF16 weights")
 }
 
 pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {

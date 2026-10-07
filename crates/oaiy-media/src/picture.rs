@@ -55,12 +55,7 @@ impl Request {
         }
         // (a worker without CUDA but with WebGPU takes the GPU by default: its CPU is the other way)
         let webgpu_asked = s("backend").as_deref() == Some("webgpu");
-        let webgpu = match s("backend").as_deref() {
-            Some("webgpu") => true,
-            Some("cuda" | "cpu") => false,
-            Some(other) => return Err(format!("picture: backend must be webgpu, cuda or cpu, not {other}")),
-            None => cfg!(feature = "webgpu"),
-        };
+        let webgpu = crate::pipeline::backend_is_webgpu(j, "picture")?;
         if webgpu && !cfg!(feature = "webgpu") {
             return Err("picture: this build has no WebGPU (the webgpu feature)".into());
         }
@@ -120,10 +115,8 @@ fn upscale(r: &Request, dev: &Device, rgb: &[u8], w: usize, h: usize, report: &m
 }
 
 fn device(index: usize) -> Result<Device> {
-    {
-        let _ = index;
-        Ok(Device::Cpu)
-    }
+    let _ = index;
+    Ok(Device::Cpu)
 }
 
 pub fn run(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {

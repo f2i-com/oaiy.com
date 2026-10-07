@@ -100,7 +100,7 @@ impl Engine {
         use crate::engine::{sample, Event, Finish};
         use std::sync::atomic::Ordering;
         if !job.images.is_empty() {
-            return Err(oaiy_engine::Error::Arg("DeepSeek-V4.1 takes images in the CUDA build only".into()));
+            return Err(oaiy_engine::Error::Arg("DeepSeek-V4.1 does not take images on WebGPU yet".into()));
         }
         let prompt = &job.prompt;
         let max_seq = self.model.max_seq();

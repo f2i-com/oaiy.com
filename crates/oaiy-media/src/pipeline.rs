@@ -122,12 +122,7 @@ impl Request {
             device: number("device", 0)?,
             cfg,
             budget: Budget::parse(j)?,
-            webgpu: match j.get("backend").and_then(Json::as_str) {
-                None | Some("cuda" | "cpu") => false,
-                Some("webgpu") if cfg!(feature = "webgpu") => true,
-                Some("webgpu") => return Err("this build has no WebGPU (the webgpu feature)".into()),
-                Some(other) => return Err(format!("backend must be cuda, cpu or webgpu, not {other}")),
-            },
+            webgpu: backend_is_webgpu(j, "image")?,
         };
         r.validate()?;
         Ok(r)
@@ -312,13 +307,28 @@ impl Model {
 }
 
 /// `loras`: LoRA adapters as `[{"path": …, "strength": 0.8}]` (strength 1 when left out), or plain paths.
-/// A request's `backend` for a model with no WebGPU path yet (`what`): cuda or cpu as before, webgpu refused rather than
-/// run on Candle unasked (a computer with no CUDA would crawl through it on the CPU).
+/// A job's `backend`, true for WebGPU: `webgpu` (any GPU wgpu reaches), which is also what a job naming none gets
+/// in a build that has it, or `cpu` (Candle on the CPU: the reference, and slow). `cuda` is refused by name: a job
+/// written for the CUDA build that was says so, rather than crawl through the CPU unasked.
+pub(crate) fn backend_is_webgpu(j: &Json, what: &str) -> std::result::Result<bool, String> {
+    match j.get("backend").and_then(Json::as_str) {
+        None => Ok(cfg!(feature = "webgpu")),
+        Some("webgpu") if cfg!(feature = "webgpu") => Ok(true),
+        Some("webgpu") => Err(format!("{what}: this build has no WebGPU (the webgpu feature)")),
+        Some("cpu") => Ok(false),
+        Some("cuda") => Err(format!("{what}: there is no CUDA backend any more: leave backend out for WebGPU, or give cpu")),
+        Some(other) => Err(format!("{what}: backend must be webgpu or cpu, not {other}")),
+    }
+}
+
+/// A job's `backend` for a model with no WebGPU path yet (`what`): Candle on the CPU, and only where the job asks for
+/// that by name (`cpu`), rather than crawl through the CPU unasked.
 pub(crate) fn not_on_webgpu(j: &Json, what: &str) -> std::result::Result<(), String> {
     match j.get("backend").and_then(Json::as_str) {
-        None | Some("cuda" | "cpu") => Ok(()),
-        Some("webgpu") => Err(format!("{what} does not run on WebGPU yet: give this model the cuda or cpu backend")),
-        Some(other) => Err(format!("backend must be cuda, cpu or webgpu, not {other}")),
+        Some("cpu") => Ok(()),
+        None | Some("webgpu") => Err(format!("{what} does not run on WebGPU yet: backend cpu runs it on the CPU, slowly")),
+        Some("cuda") => Err(format!("{what}: there is no CUDA backend any more, and it does not run on WebGPU yet: backend cpu runs it on the CPU, slowly")),
+        Some(other) => Err(format!("{what}: backend must be webgpu or cpu, not {other}")),
     }
 }
 
@@ -668,10 +678,24 @@ pub(crate) fn noise(seed: u64, n: usize) -> Vec<f32> {
 #[test]
 fn models_with_no_webgpu_path_refuse_it() {
     let j = |b: &str| Json::parse(format!(r#"{{"backend":"{b}"}}"#).as_bytes()).unwrap();
-    assert!(not_on_webgpu(&j("cuda"), "SDXL").is_ok() && not_on_webgpu(&j("cpu"), "SDXL").is_ok());
-    assert!(not_on_webgpu(&Json::parse(b"{}").unwrap(), "SDXL").is_ok());
-    assert!(not_on_webgpu(&j("webgpu"), "SDXL").unwrap_err().contains("SDXL does not run on WebGPU yet"));
-    assert!(not_on_webgpu(&j("vulkan"), "SDXL").is_err());
+    assert!(not_on_webgpu(&j("cpu"), "Klein").is_ok(), "the CPU, asked for by name");
+    for asked in [Json::parse(b"{}").unwrap(), j("webgpu")] {
+        assert!(not_on_webgpu(&asked, "Klein").unwrap_err().contains("Klein does not run on WebGPU yet"));
+    }
+    assert!(not_on_webgpu(&j("cuda"), "Klein").unwrap_err().contains("no CUDA backend"));
+    assert!(not_on_webgpu(&j("vulkan"), "Klein").is_err());
+}
+
+#[test]
+fn a_jobs_backend_is_webgpu_unless_it_names_the_cpu() {
+    let j = |b: &str| Json::parse(format!(r#"{{"backend":"{b}"}}"#).as_bytes()).unwrap();
+    assert_eq!(backend_is_webgpu(&Json::parse(b"{}").unwrap(), "image"), Ok(cfg!(feature = "webgpu")), "none named: the GPU where the build has it");
+    assert_eq!(backend_is_webgpu(&j("cpu"), "image"), Ok(false));
+    if cfg!(feature = "webgpu") {
+        assert_eq!(backend_is_webgpu(&j("webgpu"), "image"), Ok(true));
+    }
+    assert!(backend_is_webgpu(&j("cuda"), "image").unwrap_err().contains("no CUDA backend"));
+    assert!(backend_is_webgpu(&j("vulkan"), "image").unwrap_err().contains("webgpu or cpu"));
 }
 
 #[test]

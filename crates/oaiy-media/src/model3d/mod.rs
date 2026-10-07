@@ -111,12 +111,7 @@ impl Request {
             texture_size: j.get("texture_size").and_then(Json::as_i64).unwrap_or(2048).max(0) as u32,
             matte: s("matte").filter(|v| !v.is_empty()).map(PathBuf::from),
             upscaler: s("upscaler").filter(|v| !v.is_empty()).map(PathBuf::from),
-            webgpu: match s("backend").as_deref() {
-                Some("webgpu") => true,
-                Some("cuda" | "cpu") => false,
-                Some(other) => return Err(format!("3d: backend must be webgpu, cuda or cpu, not {other}")),
-                None => cfg!(feature = "webgpu"),
-            },
+            webgpu: crate::pipeline::backend_is_webgpu(j, "3d")?,
             model_dir,
         };
         if r.webgpu && !cfg!(feature = "webgpu") {
@@ -149,10 +144,8 @@ fn event(stage: &str, current: usize, total: usize) -> Json {
 }
 
 fn device(index: usize) -> Result<Device> {
-    {
-        let _ = index;
-        candle_core::bail!("3D models need a GPU: this oaiy-media was built without CUDA (build it with --features cuda or flash-attn)")
-    }
+    let _ = index;
+    candle_core::bail!("3D models run on WebGPU: the cpu backend has no path for them")
 }
 
 /// Seeded standard normal noise (splitmix64, Box-Muller).

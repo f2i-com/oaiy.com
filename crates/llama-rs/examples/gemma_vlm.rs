@@ -16,8 +16,8 @@
 //!   6. Sample + decode loop   (manual; mirrors generate.rs without prefill)
 //!
 //! Cost note: vision tower runs once (~90s on host CPU for 896×896 SigLIP-400M).
-//! Text decode is the same as text-only Gemma 3 4B. CUDA backend is supported
-//! for the LM path; vision tower currently runs on the LM's backend regardless
+//! Text decode is the same as text-only Gemma 3 4B. The vision tower runs on
+//! the LM's backend
 //! (one-shot per image, host fallback paths inside MmProj::forward).
 
 use std::env;
@@ -35,8 +35,8 @@ use llama_rs::{
 fn pick_backend(name: &str) -> Result<Arc<dyn Backend>, Box<dyn std::error::Error>> {
     match name {
         "cpu" => Ok(default_backend()),
-        "cuda" => Err("CUDA backend not enabled. Build with `--features cuda`".into()),
-        other => Err(format!("unknown backend `{other}` (try `cpu` or `cuda`)").into()),
+        "cuda" => Err("there is no CUDA backend any more: the GPU is WebGPU (oaiy-llm --webgpu, or the server)".into()),
+        other => Err(format!("unknown backend `{other}` (try `cpu`)").into()),
     }
 }
 

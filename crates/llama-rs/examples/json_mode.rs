@@ -7,9 +7,9 @@
 //!     values. Auto-stops on the closing `}`.
 //!
 //! Usage:
-//!   cargo run --release --features cuda -p llama-rs --example json_mode -- model.gguf cuda
-//!   cargo run --release --features cuda -p llama-rs --example json_mode -- model.gguf cuda --strict
-//!   cargo run --release --features cuda -p llama-rs --example json_mode -- model.gguf cuda --strict "List 3 primes"
+//!   cargo run --release -p llama-rs --example json_mode -- model.gguf cpu
+//!   cargo run --release -p llama-rs --example json_mode -- model.gguf cpu --strict
+//!   cargo run --release -p llama-rs --example json_mode -- model.gguf cpu --strict "List 3 primes"
 
 use std::env;
 use std::io::Write;
@@ -21,8 +21,8 @@ use llama_rs::{apply_chat_template, ChatMessage, Model, SampleParams};
 fn pick_backend(name: &str) -> Result<std::sync::Arc<dyn Backend>, Box<dyn std::error::Error>> {
     match name {
         "cpu" => Ok(default_backend()),
-        "cuda" => Err("CUDA backend not enabled. Build with `--features cuda`".into()),
-        other => Err(format!("unknown backend `{other}` (try `cpu` or `cuda`)").into()),
+        "cuda" => Err("there is no CUDA backend any more: the GPU is WebGPU (oaiy-llm --webgpu, or the server)".into()),
+        other => Err(format!("unknown backend `{other}` (try `cpu`)").into()),
     }
 }
 

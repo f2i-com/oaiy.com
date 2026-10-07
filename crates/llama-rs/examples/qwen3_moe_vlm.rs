@@ -4,12 +4,12 @@
 //! `mmproj.rs`, so the vision side is identical.
 //!
 //! Usage:
-//!   cargo run --release --features cuda -p llama-rs --example qwen3_moe_vlm -- \
+//!   cargo run --release -p llama-rs --example qwen3_moe_vlm -- \
 //!       models/Qwen3-VL-30B-A3B-Instruct-Q4_K_M.gguf \
 //!       models/Qwen3-VL-30B-A3B-mmproj-F16.gguf \
 //!       test_image.png \
 //!       "What's in this image?" \
-//!       cuda
+//!       cpu
 
 use std::env;
 use std::io::Write;
@@ -35,8 +35,8 @@ fn image_pad_token_id(tok: &tokenizer::Tokenizer) -> Result<u32, Box<dyn std::er
 fn pick_backend(name: &str) -> Result<Arc<dyn Backend>, Box<dyn std::error::Error>> {
     match name {
         "cpu" => Ok(default_backend()),
-        "cuda" => Err("CUDA backend not enabled. Build with `--features cuda`".into()),
-        s if s.starts_with("cuda:") => Err(format!("CUDA not enabled; got `{s}`").into()),
+        "cuda" => Err("there is no CUDA backend any more: the GPU is WebGPU (oaiy-llm --webgpu, or the server)".into()),
+        s if s.starts_with("cuda:") => Err(format!("there is no CUDA backend any more: the GPU is WebGPU (oaiy-llm --webgpu, or the server); got `{s}`").into()),
         other => Err(format!("unknown backend `{other}`").into()),
     }
 }

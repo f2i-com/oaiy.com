@@ -3,9 +3,9 @@
 //! (e.g. Qwen3-30B-A3B starts `[12095, 13, 15920, ...]` on the bench prompt).
 //!
 //! Usage:
-//!   cargo run --release -p llama-rs --features cuda --example greedy_ids -- \
-//!     path/to/model.gguf "prompt" [max_new] [cuda|cpu]
-//!   ... -- path/to/model.gguf stream [max_new]    (streamed experts: 4G RAM + 8G VRAM cache on CUDA)
+//!   cargo run --release -p llama-rs --example greedy_ids -- \
+//!     path/to/model.gguf "prompt" [max_new] [cpu|cpu]
+//!   ... -- path/to/model.gguf stream [max_new]    (streamed experts: 4G RAM)
 
 use std::env;
 
@@ -21,7 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .to_string()
     });
     let max_new: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(16);
-    let backend_name = args.next().unwrap_or_else(|| "cuda".to_string());
+    let backend_name = args.next().unwrap_or_else(|| "cpu".to_string());
 
     let model = if prompt == "stream" {
         {

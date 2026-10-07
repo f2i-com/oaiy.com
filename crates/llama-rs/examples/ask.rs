@@ -8,8 +8,8 @@
 //!   * `json` — `Model::ask_json(messages, max_new)`: JSON-constrained via the FSM
 //!
 //! Usage:
-//!   cargo run --release --features cuda -p llama-rs --example ask -- model.gguf cuda chat "Capital of Japan?"
-//!   cargo run --release --features cuda -p llama-rs --example ask -- model.gguf cuda json "Describe a fictional cat as JSON: name, age, indoor (bool)"
+//!   cargo run --release -p llama-rs --example ask -- model.gguf cpu chat "Capital of Japan?"
+//!   cargo run --release -p llama-rs --example ask -- model.gguf cpu json "Describe a fictional cat as JSON: name, age, indoor (bool)"
 
 use std::env;
 
@@ -20,11 +20,9 @@ use llama_rs::{ChatMessage, Model};
 fn pick_backend(name: &str) -> Result<std::sync::Arc<dyn Backend>, Box<dyn std::error::Error>> {
     match name {
         "cpu" => Ok(default_backend()),
-        "cuda" => Err("CUDA backend not enabled. Build with `--features cuda`".into()),
-        "auto" => {
-            { eprintln!("auto: built without --features cuda, using CPU"); Ok(default_backend()) }
-        }
-        other => Err(format!("unknown backend `{other}` (try `cpu`, `cuda`, or `auto`)").into()),
+        "cuda" => Err("there is no CUDA backend any more: the GPU is WebGPU (oaiy-llm --webgpu, or the server)".into()),
+        "auto" => Ok(default_backend()),
+        other => Err(format!("unknown backend `{other}` (try `cpu` or `auto`)").into()),
     }
 }
 

@@ -1,7 +1,7 @@
 //! Vision-language demo for Gemma 4 (E2B / E4B). **WORK IN PROGRESS** — the
 //! vision tower runs cleanly and produces correct-shape soft tokens; the
-//! splice + LM-side prefill currently hits a CUDA `ILLEGAL_ADDRESS` error
-//! that's still being investigated. Mirrors `gemma_vlm.rs`
+//! splice + LM-side prefill hit an `ILLEGAL_ADDRESS` error on the CUDA backend
+//! that was (never resolved; the CPU backend is what runs it now). Mirrors `gemma_vlm.rs`
 //! (Gemma 3) but uses:
 //!   * Gemma 4's bespoke vision tower (RMSNorm + SwiGLU + sandwich norms)
 //!   * Gemma 4's chat template (`<|turn>user\n{prompt}<turn|>\n<|turn>model\n`)
@@ -11,12 +11,12 @@
 //!     (PLE-aware — placeholder positions get `<|image|>`'s PLE)
 //!
 //! Usage:
-//!   cargo run --release --features cuda -p llama-rs --example gemma4_vlm -- \
+//!   cargo run --release -p llama-rs --example gemma4_vlm -- \
 //!       models/gemma-4-e2b-q4_k_m.gguf \
 //!       models/mmproj-gemma-4-e2b-f16.gguf \
 //!       models/test_image.jpg \
 //!       "What's in this image?" \
-//!       cuda
+//!       cpu
 
 use std::env;
 use std::io::Write;
@@ -35,8 +35,8 @@ const GEMMA4_IMAGE_TOKEN_ID: u32 = 258880;
 fn pick_backend(name: &str) -> Result<Arc<dyn Backend>, Box<dyn std::error::Error>> {
     match name {
         "cpu" => Ok(default_backend()),
-        s if s.starts_with("cuda:") => Err(format!("CUDA not enabled; got `{s}`. Build with --features cuda").into()),
-        "cuda" => Err("CUDA backend not enabled. Build with `--features cuda`".into()),
+        s if s.starts_with("cuda:") => Err(format!("there is no CUDA backend any more: the GPU is WebGPU (oaiy-llm --webgpu, or the server); got `{s}`").into()),
+        "cuda" => Err("there is no CUDA backend any more: the GPU is WebGPU (oaiy-llm --webgpu, or the server)".into()),
         other => Err(format!("unknown backend `{other}`").into()),
     }
 }

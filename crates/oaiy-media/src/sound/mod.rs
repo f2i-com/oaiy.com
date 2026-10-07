@@ -57,12 +57,7 @@ impl Request {
             device: j.get("device").and_then(Json::as_i64).unwrap_or(0).max(0) as usize,
             output: s("output_dir").ok_or("sound: missing output_dir")?.into(),
             noise_file: s("noise_file").map(PathBuf::from),
-            webgpu: match s("backend").as_deref() {
-                Some("webgpu") => true,
-                Some("cuda" | "cpu") => false,
-                Some(other) => return Err(format!("sound: backend must be webgpu, cuda or cpu, not {other}")),
-                None => cfg!(feature = "webgpu"),
-            },
+            webgpu: crate::pipeline::backend_is_webgpu(j, "sound")?,
         };
         if r.webgpu && !cfg!(feature = "webgpu") {
             return Err("sound: this build has no WebGPU (the webgpu feature)".into());
@@ -85,11 +80,9 @@ pub(crate) fn event(stage: &str, current: usize, total: usize) -> Json {
 }
 
 fn device(index: usize) -> Result<Device> {
-    // The models run in BF16, which the CPU backend cannot multiply.
-    {
-        let _ = index;
-        candle_core::bail!("sound effects need a GPU: this oaiy-media was built without CUDA (build it with --features cuda or flash-attn)")
-    }
+    // (the models run in BF16, which Candle's CPU backend cannot multiply)
+    let _ = index;
+    candle_core::bail!("sound effects run on WebGPU: the cpu backend cannot multiply their BF16 weights")
 }
 
 /// Seeded standard normal noise (splitmix64, Box-Muller), rounded to BF16 as the

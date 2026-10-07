@@ -200,12 +200,7 @@ impl Request {
             greedy: j.get("greedy").and_then(Json::as_bool).unwrap_or(false),
             budget: Budget::parse(j)?,
             language_model: s("language_model").filter(|p| !p.trim().is_empty()).map(PathBuf::from),
-            webgpu: match s("backend").as_deref() {
-                Some("webgpu") => true,
-                Some("cuda" | "cpu") => false,
-                Some(other) => return Err(format!("music: backend must be webgpu, cuda or cpu, not {other}")),
-                None => cfg!(feature = "webgpu"),
-            },
+            webgpu: crate::pipeline::backend_is_webgpu(j, "music")?,
         };
         if r.webgpu && !cfg!(feature = "webgpu") {
             return Err("music: this build has no WebGPU (the webgpu feature)".into());
@@ -253,10 +248,8 @@ pub fn write_stereo_wav(path: &Path, left: &[f32], right: &[f32], rate: usize) -
 }
 
 fn device(index: usize) -> Result<Device> {
-    {
-        let _ = index;
-        Ok(Device::Cpu)
-    }
+    let _ = index;
+    Ok(Device::Cpu)
 }
 
 /// Window `k`'s starting noise, (1, 128, len), from the seed alone.

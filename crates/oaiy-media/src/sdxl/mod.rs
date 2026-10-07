@@ -38,12 +38,7 @@ pub struct Request {
 }
 impl Request {
     pub fn parse(j: &Json) -> std::result::Result<Self, String> {
-        let webgpu = match j.get("backend").and_then(Json::as_str) {
-            None | Some("cuda" | "cpu") => false,
-            Some("webgpu") if cfg!(feature = "webgpu") => true,
-            Some("webgpu") => return Err("this build has no WebGPU (the webgpu feature)".into()),
-            Some(other) => return Err(format!("backend must be cuda, cpu or webgpu, not {other}")),
-        };
+        let webgpu = crate::pipeline::backend_is_webgpu(j, "SDXL")?;
         let text = |k| {
             j.get(k)
                 .and_then(Json::as_str)

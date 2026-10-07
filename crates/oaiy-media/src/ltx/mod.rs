@@ -307,12 +307,7 @@ impl Request {
             };
             usize::try_from(v).map_err(|_| format!("{k} must be nonnegative"))
         };
-        let webgpu = match j.get("backend").and_then(Json::as_str) {
-            None | Some("cuda" | "cpu") => false,
-            Some("webgpu") if cfg!(feature = "webgpu") => true,
-            Some("webgpu") => return Err("this build has no WebGPU (the webgpu feature)".into()),
-            Some(other) => return Err(format!("backend must be cuda, cpu or webgpu, not {other}")),
-        };
+        let webgpu = crate::pipeline::backend_is_webgpu(j, "video")?;
         let r = Self {
             model: s("model")?,
             transformer: s("transformer")?.into(),
@@ -1414,7 +1409,7 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         ("seed", Json::Int(r.seed as i64)),
         ("seconds", Json::Num(started.elapsed().as_secs_f64())),
         ("memory", Json::str(&r.memory)),
-        ("backend", Json::str(if r.webgpu { "webgpu" } else { "cuda" })),
+        ("backend", Json::str(if r.webgpu { "webgpu" } else { "cpu" })),
         ("gpu_weight_bytes", Json::Int(gpu as i64)),
         ("ram_weight_bytes", Json::Int(host as i64)),
         ("weight_bytes_read", Json::Int(disk as i64)),
@@ -1750,7 +1745,8 @@ mod tests {
         assert_eq!(frames_for_audio(0.2, 24), 9);
         assert_eq!(frames_for_audio(30., 24), 121);
         let base = |extra: &str| {
-            Json::parse(format!(r#"{{"model":"ltx-2.5","transformer":"t","text_encoder":"e","vae":"v","audio_vae":"a","output_dir":"o","prompt":"p"{extra}}}"#).as_bytes()).unwrap()
+            // (the sound's request logic: WebGPU video refuses sound yet, so the backend these name is the CPU)
+            Json::parse(format!(r#"{{"model":"ltx-2.5","transformer":"t","text_encoder":"e","vae":"v","audio_vae":"a","output_dir":"o","prompt":"p","backend":"cpu"{extra}}}"#).as_bytes()).unwrap()
         };
         let r = Request::parse(&base(r#","speech":{"kind":"speech"}"#)).unwrap();
         assert!(r.frames_from_audio && r.audio && r.speech.is_some());
@@ -1768,10 +1764,10 @@ mod tests {
     #[test]
     fn audio_defaults_on_for_ltx_2_5_with_an_audio_vae() {
         let base = |extra: &str| {
-            Json::parse(format!(r#"{{"model":"ltx-2.5","transformer":"t","text_encoder":"e","vae":"v","output_dir":"o","prompt":"p"{extra}}}"#).as_bytes()).unwrap()
+            Json::parse(format!(r#"{{"model":"ltx-2.5","transformer":"t","text_encoder":"e","vae":"v","output_dir":"o","prompt":"p","backend":"cpu"{extra}}}"#).as_bytes()).unwrap()
         };
         assert!(Request::parse(&base(r#","audio_vae":"a""#)).unwrap().audio);
-        let sulphur = Json::parse(br#"{"model":"sulphur-2","transformer":"t","text_encoder":"e","tokenizer":"k","vae":"t","audio_vae":"t","output_dir":"o","prompt":"p"}"#).unwrap();
+        let sulphur = Json::parse(br#"{"model":"sulphur-2","transformer":"t","text_encoder":"e","tokenizer":"k","vae":"t","audio_vae":"t","output_dir":"o","prompt":"p","backend":"cpu"}"#).unwrap();
         assert!(Request::parse(&sulphur).unwrap().audio, "LTX 2.3 checkpoints carry their own audio VAE");
         assert!(!Request::parse(&base("")).unwrap().audio);
         assert!(!Request::parse(&base(r#","audio_vae":"a","audio":false"#)).unwrap().audio);
@@ -1796,8 +1792,10 @@ mod tests {
             let e = request(extra).unwrap_err();
             assert!(e.starts_with("WebGPU video does not support") && e.contains(what), "{extra}: {e}");
         }
+        let cpu = Json::parse(br#"{"model":"ltx-2.3","transformer":"t","text_encoder":"e","tokenizer":"k","vae":"t","output_dir":"o","prompt":"p","backend":"cpu"}"#).unwrap();
+        assert!(!Request::parse(&cpu).unwrap().webgpu);
         let cuda = Json::parse(br#"{"model":"ltx-2.3","transformer":"t","text_encoder":"e","tokenizer":"k","vae":"t","output_dir":"o","prompt":"p","backend":"cuda"}"#).unwrap();
-        assert!(!Request::parse(&cuda).unwrap().webgpu);
+        assert!(Request::parse(&cuda).unwrap_err().contains("no CUDA backend"));
         let other = Json::parse(br#"{"model":"ltx-2.3","transformer":"t","text_encoder":"e","tokenizer":"k","vae":"t","output_dir":"o","prompt":"p","backend":"metal"}"#).unwrap();
         assert!(Request::parse(&other).is_err());
     }
@@ -1820,10 +1818,9 @@ mod tests {
     }
 }
 fn inference_device(index: usize) -> Result<Device> {
-    {
-        let _ = index;
-        candle_core::bail!("LTX video requires the CUDA worker; rebuild with --features flash-attn")
-    }
+    // (Candle's CPU backend cannot multiply the model's BF16 weights: video is WebGPU's)
+    let _ = index;
+    candle_core::bail!("LTX video runs on WebGPU: the cpu backend cannot multiply its BF16 weights")
 }
 fn command(path: &std::path::Path) -> Command {
     let mut c = Command::new(path);

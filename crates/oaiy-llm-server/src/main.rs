@@ -15,8 +15,8 @@ const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|
 
   --host ADDR          listen address (default 127.0.0.1; 0.0.0.0 for the network)
   --port N             port (default 8000)
-  --devices 1,0        CUDA devices; layers split across them (default: the
-                       visible ones in order, at most two)
+  --devices 1,0        GPUs, as nvidia-smi counts them; layers split across them
+                       (default: the visible ones in order, at most two)
   --ctx N|auto         context length in tokens, prompt + reply (default 65536);
                        auto: the most the model allows
   --ram-gb N           host RAM for the expert cache (default: 80% of what is
@@ -93,9 +93,8 @@ const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|
                        request log, and each request's state is dropped when it
                        ends (requests may also send incognito: true, or the
                        header X-OAIY-Incognito: 1, one at a time)
-  --backend B          GGUF backend: auto (default), cuda, webgpu or cpu. auto is
-                       CUDA in a CUDA build; in oaiy-llm-server-webgpu it is the
-                       first WebGPU adapter, else the CPU
+  --backend B          auto (default), webgpu or cpu. auto is the first WebGPU
+                       adapter, else the CPU
   --webgpu-gb N        weights WebGPU may hold (default: a discrete card's memory
                        less 4 GiB where Vulkan reports it, else 8; 2 integrated);
                        the rest run on the CPU
@@ -245,8 +244,11 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Options, Stri
             "--incognito" => a.incognito = true,
             "--backend" => {
                 a.backend = val()?;
-                if !["auto", "cuda", "webgpu", "cpu"].contains(&a.backend.as_str()) {
-                    return Err("--backend wants auto, cuda, webgpu or cpu".into());
+                if a.backend == "cuda" {
+                    return Err("--backend cuda: there is no CUDA backend any more; auto or webgpu is the GPU".into());
+                }
+                if !["auto", "webgpu", "cpu"].contains(&a.backend.as_str()) {
+                    return Err("--backend wants auto, webgpu or cpu".into());
                 }
             }
             "--webgpu-gb" => a.webgpu_gb = Some(num(val()?)? as u64),
