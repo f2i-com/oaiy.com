@@ -1,0 +1,239 @@
+//! The recorder's matmuls of a prompt's rows: a quantized weight's (f32, on the tensor cores, from int8 activations) and an f16 matrix's.
+use super::*;
+
+impl Recorder<'_> {
+    /// `y[r] = W x[r]` as [`ChainRecorder::matmul_rows`] through the f32 kernels alone: the decode kernel for one row, the
+    /// one-row kernel for a few, the tiled one for a prompt.
+    pub(crate) fn matmul_rows_f32(&mut self, w: &QuantizedTensor, x: &DeviceVec, y: &DeviceVec, m: usize) {
+        let q = w.device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).expect("a weight this adapter holds");
+        let (n, k) = (w.shape()[0], w.shape()[1]);
+        assert!(m > 0 && x.len >= m * k && y.len >= m * n, "chain: matmul [{n}, {k}] of {m} rows from {} into {}", x.len, y.len);
+        let pipeline = self.gpu().pipeline(q.dtype, m).expect("uploaded weights have a pipeline");
+        for (chunk, row0, rows) in &q.chunks {
+            let words = [k as u32, n as u32, m as u32, *row0, *rows, q.row_bytes as u32, 0, 0];
+            let groups = crate::shaders::grid(q.dtype, m, *rows);
+            self.dispatch_kept(&pipeline, chunk, buffer(x), buffer(y), &words, groups);
+        }
+    }
+
+    /// `y[r] = W x[r]` as [`ChainRecorder::matmul_rows`] for a prompt's rows on the tensor cores
+    /// ([`crate::shaders::coop_tiled`]: f16 weights and tokens into f32 sums). False where the device has no cooperative
+    /// matrices or the type no such kernel.
+    pub(crate) fn matmul_rows_coop(&mut self, w: &QuantizedTensor, x: &DeviceVec, y: &DeviceVec, m: usize) -> bool {
+        self.matmul_rows_coop_split(w, x, y, m, None)
+    }
+
+    /// [`Self::matmul_rows_coop`], split along k as given (else as [`crate::shaders::coop_splits`] chooses).
+    pub(crate) fn matmul_rows_coop_split(&mut self, w: &QuantizedTensor, x: &DeviceVec, y: &DeviceVec, m: usize, split: Option<u32>) -> bool {
+        let q = w.device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).expect("a weight this adapter holds");
+        let (n, k) = (w.shape()[0], w.shape()[1]);
+        use ggml_quants::GgmlType as T;
+        let name = match q.dtype {
+            T::Q3_K => "chain-coop-Q3_K",
+            T::Q4_K => "chain-coop-Q4_K",
+            T::Q5_K => "chain-coop-Q5_K",
+            T::Q6_K => "chain-coop-Q6_K",
+            T::Q8_0 => "chain-coop-Q8_0",
+            T::Q2_0 => "chain-coop-Q2_0",
+            T::Q4_0 => "chain-coop-Q4_0",
+            T::Q5_0 => "chain-coop-Q5_0",
+            T::IQ4_NL => "chain-coop-IQ4_NL",
+            T::IQ4_XS => "chain-coop-IQ4_XS",
+            _ => return false,
+        };
+        if !self.gpu().device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) || k % 256 != 0 {
+            return false;
+        }
+        assert!(x.len >= m * k && y.len >= m * n, "chain: a tensor-core matmul [{n}, {k}] of {m} rows");
+        let x16 = self.x16_tiled(x, m, k);
+        let tile = crate::shaders::COOP_TILE;
+        let dtype = q.dtype;
+        let pipeline = self.gpu().named_pipeline(name, || crate::shaders::coop_tiled(dtype).expect("a K-quant's tensor-core kernel"));
+        let tiles = q.chunks.iter().map(|(_, _, rows)| rows.div_ceil(tile)).max().unwrap_or(1) * (m as u32).div_ceil(tile);
+        let (splits, out, parts) = self.coop_parts(tiles, k, m, n, y, split);
+        for (chunk, row0, rows) in &q.chunks {
+            let words = [k as u32, n as u32, m as u32, *row0, *rows, q.row_bytes as u32, splits, 0];
+            self.dispatch_kept(&pipeline, chunk, buffer(&x16), &out, &words, (rows.div_ceil(tile), (m as u32).div_ceil(tile), splits));
+        }
+        self.coop_sum(parts, m, n, y, splits);
+        true
+    }
+
+    /// The tokens' rows `x` (`m` of `k`) as [`crate::shaders::X_F16_TILED`] gives them (f16, padded to the tile and to
+    /// a step of 32): once for every tensor-core matmul that reads them until something writes `x`.
+    pub(super) fn x16_tiled(&mut self, x: &DeviceVec, m: usize, k: usize) -> DeviceVec {
+        let tile = crate::shaders::COOP_TILE;
+        let padded = (m as u32).div_ceil(tile) as usize * tile as usize;
+        let xb = buffer(x).clone();
+        if let Some((.., v)) = self.x16.iter().find(|(b, rows, width, _)| *b == xb && *rows == m && *width == k) {
+            return v.clone();
+        }
+        let words = crate::shaders::x_f16_tiled_words(m, k);
+        let v = self.scratch(words);
+        let conv = self.gpu().named_pipeline("chain-x-f16-tiled", || crate::shaders::X_F16_TILED.to_string());
+        let groups = (words as u32).div_ceil(256);
+        let d = self.gpu().dummy().clone();
+        self.dispatch_kept(&conv, &d, buffer(x), buffer(&v), &[k as u32, m as u32, padded as u32], (groups.min(65535), groups.div_ceil(65535), 1));
+        self.x16.push((xb, m, k, v.clone()));
+        v
+    }
+
+    /// A tensor-core matmul's splits along k (as given, else as [`crate::shaders::coop_splits`] chooses for `tiles`
+    /// workgroups), where its sums go (`y`, or a part of scratch a split, added into `y` after), and the parts.
+    pub(super) fn coop_parts(&mut self, tiles: u32, k: usize, m: usize, n: usize, y: &DeviceVec, split: Option<u32>) -> (u32, wgpu::Buffer, Option<DeviceVec>) {
+        // a matmul of too few tiles to fill the GPU's last wave split along k: each split's sums into a part of
+        // scratch, then the parts added into y
+        let units = self.gpu().coop_units();
+        let steps = k.div_ceil(32) as u32;
+        let splits = split.unwrap_or_else(|| crate::shaders::coop_splits(tiles, units, steps));
+        // (one buffer of parts a recording, grown as it needs: its matmuls run in turn)
+        let parts = if splits > 1 {
+            let len = splits as usize * m * n;
+            let v = match self.parts.take() {
+                Some(v) if v.len >= len => v,
+                _ => self.scratch(len),
+            };
+            self.parts = Some(v.clone());
+            Some(v)
+        } else {
+            None
+        };
+        let out = parts.as_ref().map_or(buffer(y), buffer).clone();
+        (splits, out, parts)
+    }
+
+    /// A split tensor-core matmul's parts added into `y`.
+    pub(super) fn coop_sum(&mut self, parts: Option<DeviceVec>, m: usize, n: usize, y: &DeviceVec, splits: u32) {
+        if let Some(parts) = parts {
+            let sum = self.named("chain-coop-sum", COOP_SUM);
+            let groups = ((m * n) as u32).div_ceil(256);
+            let d = self.gpu().dummy().clone();
+            self.dispatch_kept(&sum, &d, buffer(&parts), buffer(y), &[(m * n) as u32, splits], (groups.min(65535), groups.div_ceil(65535), 1));
+        }
+    }
+
+    /// `y[r] = W x[r]` for a prompt's rows of f16 weights (`[n, k]` two to a word) through the f32 tiled kernel (the
+    /// weights read as f32), split along k where its tiles are few.
+    pub(crate) fn matmul_f16_tiled(&mut self, w: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize) {
+        let tiles = n.div_ceil(64) * rows.div_ceil(64);
+        let want = 1024usize.div_ceil(tiles).min(k / 256).max(1);
+        let kc = k.div_ceil(want).div_ceil(16) * 16;
+        let splits = k.div_ceil(kc);
+        let d = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        let grid = (n.div_ceil(64) as u32, rows.div_ceil(64) as u32, splits as u32);
+        let words = [n as u32, k as u32, rows as u32, kc as u32];
+        let tiled = MATMUL_F32_TILED.replace("var<storage, read> w: array<f32>;", "var<storage, read> w: array<u32>;\nfn wv(e: u32) -> f32 {\n    let pr = unpack2x16float(w[e / 2u]);\n    return select(pr.x, pr.y, (e & 1u) == 1u);\n}").replace("u = w[(o0 + rr) * k + gk];", "u = wv((o0 + rr) * k + gk);");
+        if splits == 1 {
+            self.dispatch_wide("chain-matmul-f16-tiled", &tiled, [buffer(w), buffer(x), &d, &d, &d, &d, buffer(y), &drw], &words, grid);
+        } else {
+            let part = self.scratch(splits * rows * n);
+            self.dispatch_wide("chain-matmul-f16-tiled", &tiled, [buffer(w), buffer(x), &d, &d, &d, &d, buffer(&part), &drw], &words, grid);
+            let len = (rows * n) as u32;
+            self.dispatch_wide("chain-sum-splits", SUM_SPLITS, [buffer(&part), &d, &d, &d, &d, &d, buffer(y), &drw], &[len, splits as u32], (len.div_ceil(256).min(65535), len.div_ceil(256 * 65535), 1));
+            // (its parts read: spare for the next split's, where each had its own to the recording's end, a sound
+            // step's 360 of 18 MB without tensor cores)
+            self.spare.push((buffer(&part).size(), buffer(&part).clone()));
+        }
+    }
+
+    /// `y[r] = W x[r]` for a prompt's rows of f16 weights (`[n, k]` two to a word, `k` of 4) on the tensor cores
+    /// ([`crate::shaders::coop_tiled_f16`]), split along k as given (else as chosen). False where the device has no
+    /// cooperative matrices.
+    pub(crate) fn matmul_f16_coop(&mut self, w: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, m: usize, split: Option<u32>) -> bool {
+        if !self.gpu().device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) || k % 4 != 0 || m.div_ceil(crate::shaders::COOP_TILE as usize) > 65535 {
+            return false;
+        }
+        let x16 = self.x16_tiled(x, m, k);
+        let tile = crate::shaders::COOP_TILE;
+        let pipeline = self.gpu().named_pipeline("chain-coop-f16", crate::shaders::coop_tiled_f16);
+        let tiles = (n as u32).div_ceil(tile) * (m as u32).div_ceil(tile);
+        let (splits, out, parts) = self.coop_parts(tiles, k, m, n, y, split);
+        let words = [k as u32, n as u32, m as u32, 0, n as u32, 0, splits, 0];
+        self.dispatch_kept(&pipeline, buffer(w), buffer(&x16), &out, &words, ((n as u32).div_ceil(tile), (m as u32).div_ceil(tile), splits));
+        self.coop_sum(parts, m, n, y, splits);
+        true
+    }
+
+    /// `y[r] = W x[r]` as [`ChainRecorder::matmul_rows`] for a prompt's rows, from `x`'s rows as int8 (quantized once,
+    /// as for [`Self::matmul_rows_q8`]) through [`crate::shaders::tiled_q8`]. False for a type without that kernel.
+    pub(crate) fn matmul_rows_tq8(&mut self, w: &QuantizedTensor, x: &DeviceVec, y: &DeviceVec, m: usize) -> bool {
+        let q = w.device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).expect("a weight this adapter holds");
+        let (n, k) = (w.shape()[0], w.shape()[1]);
+        if q.dtype != ggml_quants::GgmlType::Q3_K || k % 256 != 0 {
+            return false;
+        }
+        let (len, xs_at) = crate::shaders::q8_len(m, k);
+        assert!(x.len >= m * k && y.len >= m * n, "chain: an int8 tiled matmul [{n}, {k}] of {m} rows");
+        let xb = buffer(x).clone();
+        let xq = match self.q8.iter().find(|(b, rows, width, _)| *b == xb && *rows == m && *width == k) {
+            Some((.., xq)) => xq.clone(),
+            None => {
+                let xq = self.scratch(len);
+                let quant = self.gpu().named_pipeline("chain-q8-quantize", || crate::shaders::QUANT_Q8.to_string());
+                let blocks = (m * k / 32) as u32;
+                let groups = blocks.div_ceil(256);
+                let d = self.gpu().dummy().clone();
+                self.dispatch_kept(&quant, &d, buffer(x), buffer(&xq), &[k as u32, m as u32, xs_at as u32], (groups.min(65535), groups.div_ceil(65535), 1));
+                self.q8.push((xb, m, k, xq.clone()));
+                xq
+            }
+        };
+        let pipeline = self.gpu().named_pipeline("chain-tq8-Q3_K", || crate::shaders::tiled_q8(ggml_quants::GgmlType::Q3_K).expect("Q3_K's int8 tiled kernel"));
+        for (chunk, row0, rows) in &q.chunks {
+            let words = [k as u32, n as u32, m as u32, *row0, *rows, q.row_bytes as u32, xs_at as u32, 0];
+            let groups = (rows.div_ceil(crate::shaders::TQ8_ROWS), (m as u32).div_ceil(crate::shaders::TQ8_TOKENS), 1);
+            self.dispatch_kept(&pipeline, chunk, buffer(&xq), buffer(y), &words, groups);
+        }
+        true
+    }
+
+    /// `y[r] = W x[r]` as [`ChainRecorder::matmul_rows`] for several rows, from `x`'s rows as int8 (quantized once,
+    /// [`crate::shaders::QUANT_Q8`], for every matmul that reads them until something writes `x`): the K-quants' int8
+    /// kernels, a check of drafts' rows in about 1.3 of a step's time where the f32 kernels take 1.7. False for a type
+    /// without one (nothing recorded).
+    pub(super) fn matmul_rows_q8(&mut self, w: &QuantizedTensor, x: &DeviceVec, y: &DeviceVec, m: usize) -> bool {
+        let q = w.device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).expect("a weight this adapter holds");
+        let (n, k) = (w.shape()[0], w.shape()[1]);
+        let block = if q.dtype == ggml_quants::GgmlType::Q4_0 { 32 } else { 256 };
+        if !matches!(q.dtype, ggml_quants::GgmlType::Q3_K | ggml_quants::GgmlType::Q4_K | ggml_quants::GgmlType::Q5_K | ggml_quants::GgmlType::Q6_K | ggml_quants::GgmlType::Q4_0) || k % block != 0 {
+            return false;
+        }
+        let (len, xs_at) = crate::shaders::q8_len(m, k);
+        assert!(x.len >= m * k && y.len >= m * n, "chain: an int8 matmul [{n}, {k}] of {m} rows");
+        let xb = buffer(x).clone();
+        let xq = match self.q8.iter().find(|(b, rows, width, _)| *b == xb && *rows == m && *width == k) {
+            Some((.., xq)) => xq.clone(),
+            None => {
+                let xq = self.scratch(len);
+                let quant = self.gpu().named_pipeline("chain-q8-quantize", || crate::shaders::QUANT_Q8.to_string());
+                let blocks = (m * k / 32) as u32;
+                let groups = blocks.div_ceil(256);
+                let d = self.gpu().dummy().clone();
+                self.dispatch_kept(&quant, &d, buffer(x), buffer(&xq), &[k as u32, m as u32, xs_at as u32], (groups.min(65535), groups.div_ceil(65535), 1));
+                self.q8.push((xb, m, k, xq.clone()));
+                xq
+            }
+        };
+        let mr = if m == 1 { 1 } else { crate::shaders::MULTI_ROWS };
+        let name = match (q.dtype, mr == 1) {
+            (ggml_quants::GgmlType::Q3_K, true) => "chain-q8-Q3_K-decode",
+            (ggml_quants::GgmlType::Q3_K, false) => "chain-q8-Q3_K-multi",
+            (ggml_quants::GgmlType::Q4_K, true) => "chain-q8-Q4_K-decode",
+            (ggml_quants::GgmlType::Q4_K, false) => "chain-q8-Q4_K-multi",
+            (ggml_quants::GgmlType::Q5_K, true) => "chain-q8-Q5_K-decode",
+            (ggml_quants::GgmlType::Q5_K, false) => "chain-q8-Q5_K-multi",
+            (ggml_quants::GgmlType::Q4_0, true) => "chain-q8-Q4_0-decode",
+            (ggml_quants::GgmlType::Q4_0, false) => "chain-q8-Q4_0-multi",
+            (_, true) => "chain-q8-Q6_K-decode",
+            (_, false) => "chain-q8-Q6_K-multi",
+        };
+        let pipeline = self.gpu().named_pipeline(name, || crate::shaders::rb_kernel_q8(q.dtype, crate::shaders::rb_rows(q.dtype, mr), mr).expect("a K-quant's int8 kernel"));
+        for (chunk, row0, rows) in &q.chunks {
+            let words = [k as u32, n as u32, m as u32, *row0, *rows, q.row_bytes as u32, xs_at as u32, 0];
+            let groups = crate::shaders::grid(q.dtype, m, *rows);
+            self.dispatch_kept(&pipeline, chunk, buffer(&xq), buffer(y), &words, groups);
+        }
+        true
+    }
+}
