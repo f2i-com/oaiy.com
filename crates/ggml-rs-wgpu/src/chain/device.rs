@@ -191,6 +191,10 @@ impl DeviceChain for WgpuBackend {
     }
 
     fn holds_exl3(&self, w: &dyn ggml_rs::exl3::PackedLinear) -> bool {
+        // (a projection with a low-rank update beside it, a LoRA adapter's: held when its three matrices are)
+        if let Some(l) = w.as_any().and_then(|a| a.downcast_ref::<crate::quant_linear::LowRank>()) {
+            return self.holds_exl3(&*l.base) && self.holds_exl3(&*l.a) && self.holds_exl3(&*l.b);
+        }
         // (a GGUF's matrix where a packed projection is asked for: held as a quantized weight is)
         if let Some(q) = w.as_any().and_then(|a| a.downcast_ref::<crate::quant_linear::QuantLinear>()) {
             return self.holds(&q.w);

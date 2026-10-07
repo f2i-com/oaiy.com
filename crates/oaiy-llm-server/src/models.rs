@@ -550,9 +550,15 @@ impl Models {
     #[cfg(feature = "webgpu")]
     fn load_flashnext_portable(&self, spec: &Spec) -> Result<Live> {
         let o = &self.opts;
-        if o.lora_adapters.contains_key(&spec.name) {
-            return Err(Error::Arg(format!("{}: LoRA adapters need the CUDA build", spec.name)));
-        }
+        // Every adapter for the alias, applied together, each at its strength (else the alias's).
+        let default_strength = o.lora_strengths.get(&spec.name).copied().unwrap_or(1.0);
+        let base = crate::flashnext::lora_base(&spec.path)?;
+        let adapters = o
+            .lora_adapters
+            .get(&spec.name)
+            .map(|list| list.iter().map(|(path, strength)| crate::lora::Adapter::open_for(path, &base).map(|a| a.with_strength(strength.unwrap_or(default_strength)))).collect::<Result<Vec<_>>>())
+            .transpose()?
+            .unwrap_or_default();
         let devices = self.devices_of(spec);
         let picked = crate::backend::open(o, &devices)?;
         self.say(format!("{} runs on {} (EXL3 experts decoded in the matmul, a layer's in two batches)", spec.name, picked.label));
@@ -580,7 +586,14 @@ impl Models {
             }
             .map_err(Error::Arg)
         };
-        let model = crate::flashnext::load_portable(&spec.path, backends, &packed, &experts, o.mtp.contains(&spec.name))?;
+        let model = crate::flashnext::load_portable_with(&spec.path, backends, &adapters, &packed, &experts, o.mtp.contains(&spec.name)).map_err(|e| match adapters.is_empty() {
+            true => e,
+            // (an adapter's target nothing took: the routed experts' are not applied on WebGPU yet)
+            false => Error::Arg(format!("{}: {e} (a LoRA that adapts the routed experts is not applied on WebGPU yet; one for the attention and dense projections is)", spec.name)),
+        })?;
+        for (adapter, (path, strength)) in adapters.iter().zip(o.lora_adapters.get(&spec.name).into_iter().flatten()) {
+            self.say(format!("Flash-Next: loaded LoRA {} for {} projections (strength {})", path.display(), adapter.len(), strength.unwrap_or(default_strength)));
+        }
         let warm = std::time::Instant::now();
         if model.warm_up() {
             self.say(format!("{}: its chained steps ready in {:.1} s{}", spec.name, warm.elapsed().as_secs_f64(), if model.drafts() { ", drafting with its MTP layer" } else { "" }));
@@ -664,15 +677,21 @@ impl Models {
         self.opts.model_devices.get(&spec.name).cloned().unwrap_or_else(|| self.opts.devices.clone())
     }
 
-    /// OrcaSAQ without CUDA: its packed EXL3 projections on the WebGPU adapter while the weight budget holds them,
-    /// the rest decoded on the CPU, everything else on the host as in any portable model. No PEFT adapters and no
-    /// vision tower (both CUDA's); its prompt states are kept as on CUDA, under a fingerprint of their own.
+    /// OrcaSAQ: its packed EXL3 projections on the WebGPU adapter while the weight budget holds them, the rest
+    /// decoded on the CPU, everything else on the host as in any portable model; its PEFT adapters beside the
+    /// projections they adapt. No vision tower yet; its prompt states are kept under a fingerprint of their own,
+    /// which its adapters are part of.
     #[cfg(feature = "webgpu")]
     fn load_orcasaq_portable(&self, spec: &Spec) -> Result<Live> {
         let o = &self.opts;
-        if o.lora_adapters.contains_key(&spec.name) {
-            return Err(Error::Arg(format!("{}: LoRA adapters need the CUDA build", spec.name)));
-        }
+        // Every adapter for the alias, applied together, each at its strength (else the alias's).
+        let default_strength = o.lora_strengths.get(&spec.name).copied().unwrap_or(1.0);
+        let adapters = o
+            .lora_adapters
+            .get(&spec.name)
+            .map(|list| list.iter().map(|(path, strength)| crate::lora::Adapter::open(path).map(|a| a.with_strength(strength.unwrap_or(default_strength)))).collect::<Result<Vec<_>>>())
+            .transpose()?
+            .unwrap_or_default();
         let picked = crate::backend::open(o, &self.devices_of(spec))?;
         self.say(format!("{} runs on {} (EXL3, decoded in the matmul)", spec.name, picked.label));
         let wgpu = picked.backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>();
@@ -680,7 +699,10 @@ impl Models {
             Some(b) => b.exl3(data),
             None => ggml_rs_wgpu::exl3::exl3_cpu(data),
         };
-        let model = crate::orcasaq::load_portable(&spec.path, Arc::clone(&picked.backend), &packed)?;
+        let model = crate::orcasaq::load_portable_with(&spec.path, Arc::clone(&picked.backend), &packed, &adapters)?;
+        for (adapter, (path, strength)) in adapters.iter().zip(o.lora_adapters.get(&spec.name).into_iter().flatten()) {
+            self.say(format!("OrcaSAQ: loaded LoRA {} for {} text projections (strength {})", path.display(), adapter.len(), strength.unwrap_or(default_strength)));
+        }
         if let Some((used, budget)) = wgpu.map(|b| b.usage()) {
             self.say(format!("{}: {:.1} GB of EXL3 weights on the GPU (budget {:.0} GB)", spec.name, used as f64 / 1e9, budget as f64 / 1e9));
         }
@@ -703,6 +725,10 @@ impl Models {
                 let meta = std::fs::metadata(&p)?;
                 fp = disk::fnv(p.as_os_str().as_encoded_bytes(), fp);
                 fp = disk::fnv(&meta.len().to_le_bytes(), fp);
+            }
+            // (a state made under one set of adapters belongs to another model under another)
+            for adapter in &adapters {
+                fp = disk::fnv(&adapter.fingerprint.to_le_bytes(), fp);
             }
             match disk::DiskCache::open(dir, fp, (o.prompt_cache_gb * 1e9) as u64) {
                 Ok(cache) => e.disk = Some(cache),
@@ -1308,7 +1334,16 @@ mod dense_webgpu_timing {
         let experts = |device: usize, _layer: &str, list: Vec<[ggml_rs::exl3::Exl3Data; 3]>| -> oaiy_engine::Result<Box<dyn ggml_rs::exl3::Experts>> {
             gpus[device].exl3_experts_leaving(list, reserve).map_err(oaiy_engine::Error::Arg)
         };
-        let model = crate::flashnext::load_portable(p, backends, &packed, &experts, false).unwrap();
+        // (FLASHNEXT_LORA: a PEFT adapter's folder, applied as the weights load: the chain runs each adapted
+        // projection with its update beside it, and must answer as the host's path does with the same adapter)
+        let adapters: Vec<crate::lora::Adapter> = std::env::var("FLASHNEXT_LORA")
+            .ok()
+            .map(|dir| vec![crate::lora::Adapter::open_for(std::path::Path::new(&dir), &crate::flashnext::lora_base(p).unwrap()).unwrap()])
+            .unwrap_or_default();
+        let model = crate::flashnext::load_portable_with(p, backends, &adapters, &packed, &experts, false).unwrap();
+        if let Some(a) = adapters.first() {
+            eprintln!("with a LoRA for {} projections", a.len());
+        }
         let steps: usize = std::env::var("FLASHNEXT_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(48);
         let prompt: Vec<u32> = model.tokenizer.encode("Write a short story about a cat called Moss who lives on a boat.", false).unwrap();
         let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;

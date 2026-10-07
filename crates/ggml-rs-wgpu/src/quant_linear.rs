@@ -82,7 +82,73 @@ impl PackedLinear for HalfLinear {
     }
 }
 
+/// A packed projection with a low-rank update beside it, where a chain takes a packed projection: a LoRA adapter's
+/// `y = W x + B (A x)`, the base as it is (EXL3, a GGUF's blocks, another of these) and `A` (`[r, k]`) and `B` (`[n,
+/// r]`, the adapter's scale in it) as f16 matrices on its device. A recorder's `exl3_rows` of one is the base's rows,
+/// then the two small products, added to them; the host's path makes the same sums. The base is never rewritten.
+pub struct LowRank {
+    pub(crate) base: Arc<dyn PackedLinear>,
+    pub(crate) a: Arc<dyn PackedLinear>,
+    pub(crate) b: Arc<dyn PackedLinear>,
+    shape: [usize; 2],
+    rank: usize,
+}
+
+impl std::fmt::Debug for LowRank {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LowRank({:?} rank {} on {:?})", self.shape, self.rank, self.base)
+    }
+}
+
+impl LowRank {
+    /// Its columns and rows (`k` inputs to `n` outputs).
+    pub(crate) fn kn(&self) -> (usize, usize) {
+        (self.shape[1], self.shape[0])
+    }
+
+    /// The update's rank as held (an odd one is one more: f16 values go two to a word).
+    pub(crate) fn rank(&self) -> usize {
+        self.rank
+    }
+}
+
+impl PackedLinear for LowRank {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+    fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+    fn nbytes(&self) -> usize {
+        self.base.nbytes() + self.a.nbytes() + self.b.nbytes()
+    }
+    fn linear(&self, x: &Tensor) -> Tensor {
+        let y = self.base.linear(x).to_host();
+        let update = self.b.linear(&self.a.linear(x)).to_host();
+        Tensor::from_vec(y.data().iter().zip(update.data()).map(|(y, u)| y + u).collect(), y.shape().to_vec())
+    }
+}
+
 impl WgpuBackend {
+    /// `base` (`[n, k]`) with the low-rank update `b @ a` beside it (`a`: `[rank, k]`, `b`: `[n, rank]`, row-major, a
+    /// LoRA's scale already in one of them), on this device: a packed projection a chain runs. An error where the
+    /// shapes do not agree or a value is past f16's range.
+    pub fn low_rank(&self, base: Arc<dyn PackedLinear>, mut a: Vec<f32>, mut b: Vec<f32>, mut rank: usize) -> Result<Arc<dyn PackedLinear>, String> {
+        let &[n, k] = base.shape() else { return Err(format!("a low-rank update of a projection of shape {:?}", base.shape())) };
+        if rank == 0 || a.len() != rank * k || b.len() != n * rank {
+            return Err(format!("a rank {rank} update of {} and {} floats beside a projection [{n}, {k}]", a.len(), b.len()));
+        }
+        // an odd rank gains a row of zeros in A and a column of zeros in B: nothing is added to the product
+        if rank % 2 != 0 {
+            a.extend(std::iter::repeat_n(0.0, k));
+            b = b.chunks_exact(rank).flat_map(|row| row.iter().copied().chain(std::iter::once(0.0))).collect();
+            rank += 1;
+        }
+        let a = self.half_linear(a, rank, k)?;
+        let b = self.half_linear(b, n, rank)?;
+        Ok(Arc::new(LowRank { base, a, b, shape: [n, k], rank }))
+    }
+
     /// `values` (`[n, k]`, row-major; `k` even) on this device as f16, a packed projection a chain runs. An error
     /// where a value is past f16's range.
     pub fn half_linear(&self, values: Vec<f32>, n: usize, k: usize) -> Result<Arc<dyn PackedLinear>, String> {
@@ -178,5 +244,77 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A projection with a low-rank update beside it (a LoRA adapter's) is `(W + B A) x`, by the host's path and in
+    /// a chain: over a matrix of floats and over a quantized one, an even rank and an odd one (which gains a zero),
+    /// one over another (two adapters), and under a SwiGLU's product.
+    #[test]
+    fn a_low_rank_update_beside_a_projection_is_the_sum_of_both() {
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        let mut seed = 0x0bad_5eed_1234_5677u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let (n, k) = (96usize, 512usize);
+        let mut floats = |len: usize, scale: f32| -> Vec<f32> { (0..len).map(|_| ((next() >> 40) as f32 / (1u64 << 23) as f32 - 1.0) * scale).collect() };
+        // `dense + b @ a`, as f64 sums rounded once
+        let with = |dense: &[f32], a: &[f32], bm: &[f32], rank: usize| -> Vec<f32> {
+            (0..n * k).map(|i| (dense[i] as f64 + (0..rank).map(|r| bm[(i / k) * rank + r] as f64 * a[r * k + i % k] as f64).sum::<f64>()) as f32).collect()
+        };
+        let mut cases: Vec<(String, Arc<dyn PackedLinear>, Vec<f32>)> = Vec::new();
+        let dense = floats(n * k, 0.05);
+        for rank in [4usize, 3] {
+            let (a, bm) = (floats(rank * k, 0.05), floats(n * rank, 0.5));
+            let w = b.low_rank(b.half_linear(dense.clone(), n, k).unwrap(), a.clone(), bm.clone(), rank).unwrap();
+            cases.push((format!("floats, rank {rank}"), w, with(&dense, &a, &bm, rank)));
+        }
+        // two adapters, one over the other
+        let (a1, b1, a2, b2) = (floats(2 * k, 0.05), floats(n * 2, 0.5), floats(6 * k, 0.05), floats(n * 6, 0.5));
+        let first = b.low_rank(b.half_linear(dense.clone(), n, k).unwrap(), a1.clone(), b1.clone(), 2).unwrap();
+        cases.push(("floats, two updates".into(), b.low_rank(first, a2.clone(), b2.clone(), 6).unwrap(), with(&with(&dense, &a1, &b1, 2), &a2, &b2, 6)));
+        // a quantized base
+        let dtype = GgmlType::Q4_0;
+        let (elems, bytes) = (dtype.block_size(), dtype.type_size());
+        let mut raw: Vec<u8> = floats(n * k / elems * bytes, 1.0).iter().map(|v| (v * 127.0) as i8 as u8).collect();
+        for block in raw.chunks_exact_mut(bytes) {
+            block[..2].copy_from_slice(&half::f16::from_f32(0.01).to_bits().to_le_bytes());
+        }
+        let mut quant = vec![0f32; n * k];
+        ggml_quants::dequantize(dtype, &raw, &mut quant).unwrap();
+        let (a, bm) = (floats(8 * k, 0.05), floats(n * 8, 0.5));
+        let w = b.low_rank(b.quant_linear(QuantizedTensor::from_bytes_cpu(raw, vec![n, k], dtype)).unwrap(), a.clone(), bm.clone(), 8).unwrap();
+        cases.push(("Q4_0, rank 8".into(), w, with(&quant, &a, &bm, 8)));
+
+        for (what, w, dense) in &cases {
+            assert!(DeviceChain::holds_exl3(&b, w.as_ref()), "{what}: held where a chain reads it");
+            for rows in [1usize, 3, 70] {
+                let x = floats(rows * k, 1.0);
+                let want: Vec<f64> = (0..rows * n).map(|i| (0..k).map(|j| dense[(i % n) * k + j] as f64 * x[(i / n) * k + j] as f64).sum()).collect();
+                let size = want.iter().fold(0f64, |m, v| m.max(v.abs()));
+                let host = w.linear(&Tensor::from_vec(x.clone(), vec![rows, k]));
+                // (the output a work vector longer than these rows, as a model's are: what is past them is left)
+                let (xv, yv) = (DeviceChain::vec(&b, rows * k), DeviceChain::vec(&b, rows * n + 5));
+                DeviceChain::upload(&b, &xv, &x);
+                DeviceChain::upload(&b, &yv, &vec![7.0; rows * n + 5]);
+                let mut rec = DeviceChain::begin(&b);
+                rec.exl3_rows(w.as_ref(), &xv, &yv, rows);
+                rec.read(&yv);
+                let chained = rec.finish().pop().unwrap();
+                assert!(chained[rows * n..].iter().all(|&v| v == 7.0), "{what}, {rows} rows: the sum went past its rows");
+                for (path, got) in [("the host's path", host.data()), ("a chain", &chained[..rows * n])] {
+                    let worst = got.iter().zip(&want).map(|(g, w)| (*g as f64 - w).abs()).fold(0f64, f64::max);
+                    let allowed = if (2..=8).contains(&rows) { 1.5e-2 } else { 3e-3 };
+                    eprintln!("{what}, {rows} rows by {path}: the worst error {:.1e} of the largest", worst / size);
+                    assert!(worst <= size * allowed, "{what}, {rows} rows by {path}: {worst} of {size}");
+                }
+            }
+        }
+        // the shapes must agree
+        assert!(b.low_rank(b.half_linear(dense.clone(), n, k).unwrap(), vec![0.0; 4 * k], vec![0.0; n * 3], 4).is_err());
+        assert!(b.low_rank(b.half_linear(dense, n, k).unwrap(), Vec::new(), Vec::new(), 0).is_err());
     }
 }

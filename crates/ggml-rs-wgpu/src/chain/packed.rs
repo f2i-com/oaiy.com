@@ -5,6 +5,27 @@ impl Recorder<'_> {
     /// [`ChainRecorder::exl3_rows`], the input `x`, or (`up` given) the SwiGLU `silu(x) * up` computed as the input
     /// transform reads it (a shared expert's down projection: a dispatch fewer).
     pub(crate) fn exl3_rows_of(&mut self, w: &dyn ggml_rs::exl3::PackedLinear, x: &DeviceVec, up: Option<&DeviceVec>, y: &DeviceVec, rows: usize) {
+        // a projection with a low-rank update beside it (a LoRA adapter's): the base's rows, then `B (A x)` added to
+        // them; a SwiGLU's product, where one is asked for, made once for both
+        if let Some(l) = w.as_any().and_then(|a| a.downcast_ref::<crate::quant_linear::LowRank>()) {
+            let ((k, n), r) = (l.kn(), l.rank());
+            assert!(rows > 0 && x.len >= rows * k && y.len >= rows * n, "chain: a projection [{n}, {k}] with a rank {r} update, of {rows} rows");
+            let input = match up {
+                Some(u) => {
+                    let t = self.scratch(rows * k);
+                    self.silu_mul(x, u, &t, rows * k);
+                    t
+                }
+                None => x.clone(),
+            };
+            self.exl3_rows_of(&*l.base, &input, None, y, rows);
+            let (low, update) = (self.scratch(rows * r), self.scratch(rows * n));
+            self.exl3_rows_of(&*l.a, &input, None, &low, rows);
+            self.exl3_rows_of(&*l.b, &low, None, &update, rows);
+            // (`y` may be longer than these rows: the sum is theirs alone)
+            self.add(&DeviceVec { len: rows * n, inner: y.inner.clone() }, &update);
+            return;
+        }
         // a GGUF's matrix: the quantized matmul of its rows as they are (no transform either side, no channel map),
         // a SwiGLU's product made first where one is asked for
         if let Some(q) = w.as_any().and_then(|a| a.downcast_ref::<crate::quant_linear::QuantLinear>()) {

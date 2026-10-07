@@ -194,8 +194,17 @@ pub(crate) fn stacked(adapters: &[Adapter], parts: &[Part<'_>], k: usize, n: usi
     Ok(Some((a_all, b_all, total)))
 }
 
-/// `base` plus the low-rank `b @ a` (from `stacked`), on `backend`.
+/// `base` plus the low-rank `b @ a` (from `stacked`), on `backend`: beside a packed projection on WebGPU, an update
+/// a chain runs with it (`ggml_rs_wgpu`'s `LowRank`: the model's steps and prompts stay one submit each); else the
+/// generic one, whose update the backend adds op by op.
 pub(crate) fn adapted(base: Weight, a: Vec<f32>, b: Vec<f32>, rank: usize, backend: Arc<dyn Backend>) -> Weight {
+    #[cfg(feature = "webgpu")]
+    if let (Weight::Packed(packed), Some(gpu)) = (&base, backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>()) {
+        // (an update whose values f16 cannot hold stays the generic one: f32 on the host's path)
+        if let Ok(w) = gpu.low_rank(Arc::clone(packed), a.clone(), b.clone(), rank) {
+            return Weight::Packed(w);
+        }
+    }
     let k = a.len() / rank;
     let n = b.len() / rank;
     let a = backend.to_device(Tensor::from_vec(a, vec![rank, k]));
@@ -415,18 +424,11 @@ impl Adapter {
         input: Option<&[u32]>,
         output: Option<&[u32]>,
     ) -> Result<Weight> {
-        let shape = base.shape();
-        let Some((a, b)) = self.tensors(name, shape[1], shape[0], input, output)? else {
+        let (n, k) = (base.shape()[0], base.shape()[1]);
+        let Some((a, b, rank)) = self.part(name, k, n, input, output)? else {
             return Ok(base);
         };
-        let a = backend.to_device(a);
-        let b = backend.to_device(b);
-        Ok(Weight::Packed(Arc::new(LoraLinear {
-            base,
-            a,
-            b,
-            backend,
-        })))
+        Ok(adapted(base, a, b, rank, backend))
     }
     pub fn merge_dense(
         &self,

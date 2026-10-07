@@ -733,7 +733,14 @@ mod reserve_tests {
 /// cards.)
 /// `mtp`: its multi-token-prediction layer too (on the last device), for drafting.
 pub(crate) fn load_portable(path: &Path, backends: Vec<Arc<dyn Backend>>, packed: Packer<'_>, experts: ExpertMaker<'_>, mtp: bool) -> Result<FlashNext> {
-    build(path, backends, Vec::new(), &[], packed, experts, mtp)
+    load_portable_with(path, backends, &[], packed, experts, mtp)
+}
+
+/// [`load_portable`] with `lora`'s adapters applied, together, as the weights load: beside each dense projection
+/// they adapt, on its device. An adapter that also adapts the routed experts is refused (its targets there are
+/// left over when the model is built: `experts` makes them as the checkpoint has them).
+pub(crate) fn load_portable_with(path: &Path, backends: Vec<Arc<dyn Backend>>, lora: &[Adapter], packed: Packer<'_>, experts: ExpertMaker<'_>, mtp: bool) -> Result<FlashNext> {
+    build(path, backends, Vec::new(), lora, packed, experts, mtp)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -1,8 +1,8 @@
 //! Read OrcaSAQ2's original sharded EXL3 checkpoint. No Python runtime/conversion.
 //!
-//! On CUDA (`load`, `load_with_adapter`) its projections stay packed on the card (`Exl3Matrix`), PEFT adapters
-//! applied; elsewhere (`load_portable`) they are whatever the caller makes of each `Exl3Data`: packed on any GPU
-//! through WebGPU, or decoded on the CPU (`ggml_rs_wgpu::exl3`).
+//! Its projections are whatever the caller makes of each `Exl3Data` (`load_portable`): packed on any GPU through
+//! WebGPU, or decoded on the CPU (`ggml_rs_wgpu::exl3`); PEFT adapters are applied beside them as they load
+//! (`load_portable_with`).
 use dsv41::safetensors::{Dtype, StIndex};
 use ggml_rs::{exl3::{Exl3Data, PackedLinear}, Backend, Tensor};
 use llama_rs::{
@@ -43,29 +43,26 @@ pub fn detect(path: &Path) -> bool {
 /// Makes a projection of its packed EXL3 weights: on the card the model runs on.
 type Packer<'a> = &'a dyn Fn(Exl3Data) -> std::result::Result<Arc<dyn PackedLinear>, String>;
 
-/// The PEFT adapters applied as the weights load, together and in order: the CUDA build's; a portable build has none.
+/// The PEFT adapters applied as the weights load, together and in order.
 struct Adapters<'a> {
-    list: std::marker::PhantomData<&'a ()>,
+    list: &'a [crate::lora::Adapter],
 }
 impl<'a> Adapters<'a> {
-    fn none() -> Self {
-        Self { list: std::marker::PhantomData }
+    fn of(list: &'a [crate::lora::Adapter]) -> Self {
+        Self { list }
     }
     /// Each adapter wraps what the one before made (an adapter without this weight leaves it).
     fn wrap(&self, name: &str, w: Weight, backend: &Arc<dyn Backend>, input: Option<&[u32]>, output: Option<&[u32]>) -> Result<Weight> {
-        {
-            let _ = (name, backend, input, output);
-            Ok(w)
-        }
+        self.list.iter().try_fold(w, |w, adapter| adapter.wrap(name, w, backend.clone(), input, output))
     }
     fn merge_dense(&self, name: &str, w: Tensor, backend: &dyn Backend, map: Option<&[u32]>) -> Result<Tensor> {
-        {
-            let _ = (name, backend, map);
-            Ok(w)
-        }
+        self.list.iter().try_fold(w, |w, adapter| adapter.merge_dense(name, w, backend, map))
     }
     /// Every adapter's targets were found.
     fn finish(&self) -> Result<()> {
+        for adapter in self.list {
+            adapter.finish()?;
+        }
         Ok(())
     }
 }
@@ -300,10 +297,16 @@ mod tests {
     }
 }
 
-/// OrcaSAQ without CUDA: its tensors on `backend`, each packed projection as `packed` makes it (on any GPU through
-/// WebGPU, else on the CPU), no PEFT adapters, its attention cache beside it. (A CUDA build loads it on the card.)
+/// OrcaSAQ: its tensors on `backend`, each packed projection as `packed` makes it (on any GPU through WebGPU, else
+/// on the CPU), its attention cache beside it; no PEFT adapters.
 pub(crate) fn load_portable(path: &Path, backend: Arc<dyn Backend>, packed: Packer<'_>) -> Result<Model> {
-    build(path, backend.clone(), vec![backend], packed, &Adapters::none())
+    load_portable_with(path, backend, packed, &[])
+}
+
+/// [`load_portable`] with `lora`'s PEFT adapters applied, together and in order, as the weights load: beside each
+/// packed projection they adapt (never into it), on its device.
+pub(crate) fn load_portable_with(path: &Path, backend: Arc<dyn Backend>, packed: Packer<'_>, lora: &[crate::lora::Adapter]) -> Result<Model> {
+    build(path, backend.clone(), vec![backend], packed, &Adapters::of(lora))
 }
 
 fn build(path: &Path, backend: Arc<dyn Backend>, cache_devices: Vec<Arc<dyn Backend>>, packed: Packer<'_>, adapters: &Adapters<'_>) -> Result<Model> {
