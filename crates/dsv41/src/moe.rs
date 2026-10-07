@@ -60,6 +60,24 @@ impl Experts {
             }
         });
     }
+
+    /// Read `picks` (`(layer, expert)` each) into the RAM cache on [`READERS`] threads: the drive read ahead of the
+    /// steps that will ask for them. One already there is left as it is.
+    pub fn warm(&self, picks: &[(u32, u32)]) {
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..READERS.min(picks.len()) {
+                scope.spawn(|| {
+                    while let Some(&(layer, e)) = picks.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        if !self.cache.probe(layer, e) {
+                            // the lease dropped at once: a leased record is never evicted
+                            let _ = self.cache.acquire(layer, e, self.store.as_ref());
+                        }
+                    }
+                });
+            }
+        });
+    }
 }
 
 /// Tokens of a prompt an expert needs before a GPU is worth its record's upload (18.8 MB): with fewer, the CPU's

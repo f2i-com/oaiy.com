@@ -312,6 +312,31 @@ impl Model {
         self.hasher.set_cache(&c.history);
     }
 
+    /// Read up to `count` routed experts the RAM cache does not hold into it, from `*cursor` on (every layer's expert
+    /// `e` before any layer's `e + 1`: a step uses each layer's alike), while the cache has room: a cold decode step
+    /// waits for the drive for every expert it has not met (some 13 ms each from a 1.4 GB/s drive, and a step routes
+    /// to 240), so what is read while nothing is asked is a wait a later step does not have. False once every expert
+    /// has been looked at or the cache is full (reading past that would only swap one unused record for another).
+    pub fn warm_experts(&self, cursor: &mut usize, count: usize) -> bool {
+        let (layers, per_layer) = (self.cfg.n_layers, self.cfg.n_routed_experts);
+        let cache = &self.experts.cache;
+        let total = layers * per_layer;
+        let room = cache.n_slots().saturating_sub(cache.len());
+        if room == 0 {
+            return false;
+        }
+        let mut picks = Vec::with_capacity(count.min(room));
+        while *cursor < total && picks.len() < count.min(room) {
+            let (l, e) = ((*cursor % layers) as u32, (*cursor / layers) as u32);
+            *cursor += 1;
+            if !cache.probe(l, e) {
+                picks.push((l, e));
+            }
+        }
+        self.experts.warm(&picks);
+        *cursor < total
+    }
+
     /// Have a prompt's busy routed experts' matmuls made by `kernel` (a GPU's: see [`crate::moe::Experts::gpu`]).
     pub fn set_experts_kernel(&mut self, kernel: Option<Arc<dyn crate::expert::ExpertsKernel>>) {
         self.experts.gpu = kernel;

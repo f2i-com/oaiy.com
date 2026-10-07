@@ -54,7 +54,21 @@ pub(crate) struct Engine {
     checkpoint: Option<(Vec<u32>, dsv41::model::Checkpoint)>,
     eos: u32,
     log: bool,
+    /// Reading the experts into RAM while no request waits ([`Warm`]); None once done, or switched off.
+    warm: Option<Warm>,
 }
+
+/// The idle reading of the routed experts into the RAM tier: where it is, and what it has read so far.
+struct Warm {
+    cursor: usize,
+    started: Option<std::time::Instant>,
+    reading: std::time::Duration,
+    bytes_before: u64,
+}
+
+/// Records an idle slice reads (some 300 MB: a fifth of a second from a 1.4 GB/s drive), so a request that arrives
+/// meanwhile waits no longer than that.
+const WARM_SLICE: usize = 16;
 
 /// How much of `prompt` a state covering `tokens` can serve: all of `tokens`, when the prompt starts with them and goes
 /// on past them (a state cannot be rewound, and the next token's logits need a forward pass); else none.
@@ -70,12 +84,62 @@ fn reusable(tokens: &[u32], prompt: &[u32]) -> usize {
 impl Engine {
     pub(crate) fn new(model: dsv41::model::Model, tok: Arc<dsv41::tokenizer::Tokenizer>, log: bool) -> Engine {
         let eos = model.cfg.eos_token_id;
-        Engine { model, tok, covered: Vec::new(), checkpoint: None, eos, log }
+        // (OAIY_DSV41_NO_WARM: leave the drive alone between requests)
+        let warm = std::env::var_os("OAIY_DSV41_NO_WARM")
+            .is_none()
+            .then(|| Warm { cursor: 0, started: None, reading: std::time::Duration::ZERO, bytes_before: model.expert_cache().stats().bytes_read });
+        Engine { model, tok, covered: Vec::new(), checkpoint: None, eos, log, warm }
+    }
+
+    /// An idle slice of the experts' reading into RAM; says when it starts and when there is no more to read.
+    fn warm_some(&mut self) {
+        let Some(w) = &mut self.warm else { return };
+        if w.started.is_none() {
+            w.started = Some(std::time::Instant::now());
+            if self.log {
+                let c = self.model.expert_cache();
+                eprintln!("  reading the experts into RAM while idle ({} of the {} the cache holds are there)", c.len(), c.n_slots());
+            }
+        }
+        let slice = std::time::Instant::now();
+        let more = self.model.warm_experts(&mut w.cursor, WARM_SLICE);
+        w.reading += slice.elapsed();
+        if !more {
+            if self.log {
+                let c = self.model.expert_cache();
+                let read = c.stats().bytes_read.saturating_sub(w.bytes_before);
+                eprintln!(
+                    "  the experts' RAM tier holds {} of its {}: {:.1} s of idle reading ({:.1} GB read since the model loaded)",
+                    c.len(),
+                    c.n_slots(),
+                    w.reading.as_secs_f64(),
+                    read as f64 / 1e9
+                );
+            }
+            self.warm = None;
+        }
     }
 
     pub(crate) fn run(mut self, jobs: std::sync::mpsc::Receiver<crate::engine::Job>) {
         use crate::engine::{Event, Finish};
-        for job in jobs {
+        use std::sync::mpsc::TryRecvError;
+        loop {
+            // with nothing asked, the experts' next records are read; a request is taken between slices
+            let job = if self.warm.is_some() {
+                match jobs.try_recv() {
+                    Ok(job) => job,
+                    Err(TryRecvError::Empty) => {
+                        self.warm_some();
+                        continue;
+                    }
+                    Err(TryRecvError::Disconnected) => break,
+                }
+            } else {
+                match jobs.recv() {
+                    Ok(job) => job,
+                    Err(_) => break,
+                }
+            };
             if job.wipe {
                 self.covered.clear();
                 self.checkpoint = None;
