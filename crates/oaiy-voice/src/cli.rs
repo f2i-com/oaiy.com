@@ -50,10 +50,10 @@ impl Mode {
 /// Where the model runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeviceChoice {
-    /// The CUDA GPU with the most free memory when this build has CUDA and
-    /// one is there, else the CPU.
+    /// The CPU: the GPU path was Candle's on CUDA, which this workspace no longer builds.
     Auto,
     Cpu,
+    /// A GPU by number, as a configuration from the CUDA build may still ask: refused with the reason at start.
     Cuda(usize),
 }
 
@@ -128,7 +128,7 @@ impl Args {
 
 pub const USAGE: &str = "usage: oaiy-voice [--mode stt|tts|both] [--port N] [--host ADDR]
                   [--stt-model-dir PATH | --model PATH] [--tts-model-dir PATH]
-                  [--device auto|cpu|cuda|cuda:N] [--dtype auto|f32|tf32|f16|bf16]
+                  [--device auto|cpu] [--dtype auto|f32|tf32|f16|bf16]
                   [--voices-dir DIR] [--voice NAME|CLIP] [--ffmpeg PATH] [--model-dirs DIRS]
        oaiy-voice transcribe --model PATH [--device ...] [--dtype ...] [--repeat N] FILE.wav...
 

@@ -45,12 +45,11 @@ fn msg(s: impl Into<String>) -> candle_core::Error {
     candle_core::Error::Msg(s.into())
 }
 
-/// A CUDA device, or a clear error when this build has no CUDA.
+/// The GPU this engine ran on was Candle's on CUDA, which this workspace no longer builds: an error that says so,
+/// until the engine's WebGPU port (speech on WebGPU today is the media worker's, `oaiy-media`'s `speech` jobs).
 pub fn cuda(ordinal: usize) -> Result<Device> {
-    {
-        let _ = ordinal;
-        Err(msg("oaiy-tts was built without CUDA: build it with --features cuda (or flash-attn)"))
-    }
+    let _ = ordinal;
+    Err(msg("realtime speech has no GPU path in this build: its CUDA backend is gone and its WebGPU port is not made yet (the media worker's speech jobs run on WebGPU)"))
 }
 
 /// Free and total memory on the device, when it is a GPU.

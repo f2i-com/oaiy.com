@@ -350,12 +350,6 @@ impl Images {
             return Err("cancelled after controller handoff".into());
         }
         let mut command = Command::new(&cfg.worker);
-        if std::env::var_os("CUDA_CACHE_PATH").is_none() {
-            // Share compiled CUDA kernels across all output folders and jobs.
-            let cache = cfg.output_root.join(".cuda-cache");
-            std::fs::create_dir_all(&cache).map_err(|e| format!("CUDA cache: {e}"))?;
-            command.env("CUDA_CACHE_PATH", cache);
-        }
         command
             .arg("--stdin")
             .stdin(Stdio::piped())

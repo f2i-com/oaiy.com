@@ -640,11 +640,14 @@ fn reference_audio(value: &Json, output_root: &Path, allow_local: bool) -> Resul
 /// How long media jobs wait after a worker hit a GPU fault.
 const GPU_FAULT_PAUSE: Duration = Duration::from_secs(30);
 
-/// A worker error that means the GPU or its driver faulted (not a bad request).
+/// A worker error that means the GPU or its driver faulted (not a bad request): WebGPU's loss of its device (a
+/// driver reset: the next job must not follow at once), a result that is not a number, and what the CUDA worker that
+/// was said of the same.
 fn gpu_fault(error: &str) -> bool {
-    ["CUDA_ERROR", "DriverError", "nonfinite", "illegal memory access", "launch failure", "device-side assert"]
+    let lower = error.to_ascii_lowercase();
+    ["device lost", "device is lost", "devicelost", "device was lost", "nonfinite", "cuda_error", "drivererror", "illegal memory access", "launch failure", "device-side assert"]
         .iter()
-        .any(|m| error.contains(m))
+        .any(|m| lower.contains(m))
 }
 
 pub fn video_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, allow_local: bool) -> Result<(Json, String, String, f64), String> {
@@ -1527,6 +1530,8 @@ mod tests {
     fn gpu_faults_are_told_from_bad_requests() {
         assert!(gpu_fault("DriverError(CUDA_ERROR_LAUNCH_FAILED, \"unspecified launch failure\")"));
         assert!(gpu_fault("nonfinite decoded video pixels"));
+        assert!(gpu_fault("wgpu error: Validation Error: Parent device is lost"));
+        assert!(gpu_fault("Device lost (DeviceLostReason::Unknown): the GPU driver was reset"));
         assert!(!gpu_fault("size must look like 1024x1024"));
     }
 
