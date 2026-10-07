@@ -189,8 +189,11 @@ impl Tokenizer {
         // win when a longer special is also a prefix.
         special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
+        // (a Qwen GGUF's own pre-tokenizer, `tokenizer.ggml.pre` qwen2 or qwen35: its letters with their marks, its
+        // digits one by one and NFC first, as its Hugging Face tokenizer has them; Llama's splitter otherwise)
+        let qwen3_pre = model == TokenizerModel::Gpt2 && matches!(gguf.get_str("tokenizer.ggml.pre"), Ok("qwen2" | "qwen35"));
         Ok(Self {
-            qwen3_pre: false,
+            qwen3_pre,
             model,
             tokens,
             token_to_id,

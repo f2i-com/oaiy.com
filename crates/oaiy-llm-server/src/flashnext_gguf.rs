@@ -563,6 +563,38 @@ mod tests {
             eprintln!("token {t}'s embedding ({all:?}): cosine {c:.4}");
             least = least.min(c);
         }
+        // the n-gram table: a few rows of each hash head, the GGUF's IQ4_NL rows against the checkpoint's trellis rows
+        // (theirs with the head's bias added, which the GGUF's rows hold already)
+        let heads = (cfg.ngram - 1) * cfg.heads_per_ngram;
+        let theirs = NgramTable::open(&idx, &format!("{p}.layers.{}.ple.ple_embedding.ngram_embedding", cfg.ple_layer), heads)?;
+        let table = src.info("per_layer_token_embd.weight")?;
+        assert_eq!((table.dtype, table.shape[0] as usize, table.shape[1]), (ggml_quants::GgmlType::IQ4_NL, ROW_DIM, theirs.rows), "the table's rows");
+        let bytes = g.tensor_bytes(table).map_err(|e| bad(e.to_string()))?;
+        assert_eq!(super::integers(&g, "ple.head_offsets")?, theirs.head_offsets, "the heads' offsets");
+        assert_eq!(super::integers(&g, "ple.head_vocab_sizes")?, theirs.head_sizes, "the heads' sizes");
+        assert_eq!(super::integers(&g, "ple.layer_multipliers")?, theirs.multipliers, "the hash's multipliers");
+        let mut rows_least = 1f64;
+        for head in 0..heads {
+            for at in [0i64, 12_345, theirs.head_sizes[head] / 2, theirs.head_sizes[head] - 1] {
+                let row = (theirs.head_offsets[head] + at) as usize;
+                let (mut got, mut want) = (vec![0f32; ROW_DIM], vec![0f32; ROW_DIM]);
+                ggml_quants::iq4_nl::dequantize(&bytes[row * IQ4_NL_ROW..(row + 1) * IQ4_NL_ROW], &mut got);
+                theirs.row(row as u64, head, &mut want)?;
+                rows_least = rows_least.min(cosine(&got, &want));
+            }
+        }
+        eprintln!("the n-gram table's rows ({} of them compared): the least cosine {rows_least:.4}", heads * 4);
+        least = least.min(rows_least);
+        // the GGUF's tokenizer gives the checkpoint's ids (no start token added: the chat template's text is the prompt)
+        let (ours, reference) = (tokenizer::Tokenizer::from_gguf(&g).map_err(|e| bad(e.to_string()))?, tokenizer(exl3, cfg.vocab)?);
+        for text in [
+            "<|im_start|>user\nWrite a short story about a cat called Moss who lives on a boat.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+            "fn main() {\n    let v: Vec<u32> = (0..10).map(|i| i * i).collect();\n    println!(\"{v:?}\");\n}\n",
+            "Größe, naïve café — 東京は日本の首都です。 Привет, мир! 🙂",
+            "  leading spaces,\ttabs and a trailing newline\n",
+        ] {
+            assert_eq!(ours.encode(text, false).map_err(|e| bad(e.to_string()))?, reference.encode(text, false).map_err(|e| bad(e.to_string()))?, "the ids of {text:?}");
+        }
         eprintln!("unquantized tensors: the least cosine {worst_same:.6}; quantized ones against EXL3's: the least {least:.4}");
         assert!(least > 0.8, "a quantized matrix is not its EXL3 one: cosine {least}");
         Ok(())

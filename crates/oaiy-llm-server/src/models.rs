@@ -939,7 +939,8 @@ impl Models {
         let picked = crate::backend::open(o, &o.devices)?;
         self.say(format!("{} runs on {} (a GGUF: each matrix in its file's type)", spec.name, picked.label));
         let wgpu = picked.backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>();
-        let others: Vec<Arc<ggml_rs_wgpu::WgpuBackend>> = wgpu.map(|b| b.others(o.webgpu_gb.map(|g| g << 30))).unwrap_or_default().into_iter().map(Arc::new).collect();
+        // (OAIY_NO_SPLIT: the one GPU, as for the dense models: what does not fit there runs on the host)
+        let others: Vec<Arc<ggml_rs_wgpu::WgpuBackend>> = wgpu.filter(|_| std::env::var_os("OAIY_NO_SPLIT").is_none()).map(|b| b.others(o.webgpu_gb.map(|g| g << 30))).unwrap_or_default().into_iter().map(Arc::new).collect();
         let gpus: Vec<&ggml_rs_wgpu::WgpuBackend> = wgpu.into_iter().chain(others.iter().map(|g| g.as_ref())).collect();
         let backends: Vec<Arc<dyn ggml_rs::Backend>> =
             std::iter::once(Arc::clone(&picked.backend)).chain(others.iter().map(|g| Arc::clone(g) as Arc<dyn ggml_rs::Backend>)).collect();
@@ -1478,7 +1479,7 @@ mod dense_webgpu_timing {
         eprintln!("loaded in {:.1} s over {} GPUs: {}", clock.elapsed().as_secs_f64(), gpus.len(), gpus.iter().map(|g| format!("{:.1} GB", g.usage().0 as f64 / 1e9)).collect::<Vec<_>>().join(", "));
         let steps: usize = std::env::var("FLASHNEXT_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(48);
         let text = "<|im_start|>user\nWrite a short story about a cat called Moss who lives on a boat.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
-        let prompt: Vec<u32> = model.tokenizer.encode(text, true).unwrap();
+        let prompt: Vec<u32> = model.tokenizer.encode(text, false).unwrap();
         let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
         let cosine = |a: &[f32], b: &[f32]| {
             let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();

@@ -27,7 +27,7 @@ fn llama3_regex() -> &'static Regex {
         // `+` produce the same matches here because every alternative is
         // anchored — there's no backtracking that could change the result.
         Regex::new(
-            r#"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?:$|\S)|\s+"#
+            r#"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+"#
         ).expect("pretokenizer regex compiles")
     })
 }
@@ -36,23 +36,34 @@ fn llama3_regex() -> &'static Regex {
 /// For inputs with no special structure (pure letters, no punctuation), this
 /// yields one piece per word + leading-space-prefixed continuation.
 pub fn split_llama3(text: &str) -> Vec<&str> {
-    let re = llama3_regex();
-    let mut out = Vec::new();
-    let mut last_end = 0;
-    for m in re.find_iter(text) {
-        // The pattern is comprehensive enough that we shouldn't see gaps in
-        // practice, but if we do, push the gap as its own piece (better to
-        // round-trip than silently drop bytes).
-        if m.start() > last_end {
-            out.push(&text[last_end..m.start()]);
+    split_with_lookahead(llama3_regex(), text)
+}
+
+/// `text` split by `re`, whose last alternative is a run of whitespace (`\s+`) standing for the reference regex's
+/// `\s+(?!\S)|\s+` (Rust's regex has no lookaround): a run of two or more whitespace before a non-space gives up its
+/// last character, which the next piece then starts with (`"    let"` is three spaces and `" let"`, as llama.cpp and
+/// the Hugging Face tokenizers split it; a run consumed whole, or with the character after it, splits every indented
+/// line of code otherwise).
+fn split_with_lookahead<'a>(re: &Regex, text: &'a str) -> Vec<&'a str> {
+    let mut pieces = Vec::new();
+    let mut pos = 0;
+    while pos < text.len() {
+        // (nothing matched: the rest as it is, better to round-trip than to drop bytes)
+        let Some(m) = re.find_at(text, pos) else {
+            pieces.push(&text[pos..]);
+            break;
+        };
+        if m.start() > pos {
+            pieces.push(&text[pos..m.start()]);
         }
-        out.push(m.as_str());
-        last_end = m.end();
+        let (mut end, span) = (m.end(), m.as_str());
+        if end < text.len() && span.chars().all(char::is_whitespace) && !span.ends_with(['\r', '\n']) && span.chars().count() > 1 {
+            end -= span.chars().last().unwrap().len_utf8();
+        }
+        pieces.push(&text[m.start()..end]);
+        pos = end;
     }
-    if last_end < text.len() {
-        out.push(&text[last_end..]);
-    }
-    out
+    pieces
 }
 
 /// VENDORED-LOCAL: Qwen3.8's regex, with its whitespace lookahead expressed
@@ -60,18 +71,28 @@ pub fn split_llama3(text: &str) -> Vec<&str> {
 pub fn split_qwen3(text:&str)->Vec<&str>{
     static R:OnceLock<Regex>=OnceLock::new();
     let re=R.get_or_init(||Regex::new(r#"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+"#).expect("Qwen regex"));
-    let mut pieces=vec![];let mut pos=0;
-    while pos<text.len(){
-        let Some(m)=re.find_at(text,pos) else {pieces.push(&text[pos..]);break;};
-        if m.start()>pos{pieces.push(&text[pos..m.start()]);}
-        let mut end=m.end();let span=m.as_str();
-        if end<text.len() && span.chars().all(char::is_whitespace) && !span.ends_with(['\r','\n']) && span.chars().count()>1 {
-            // \s+(?!\S) keeps all but the last whitespace before a non-space.
-            end-=span.chars().last().unwrap().len_utf8();
+    split_with_lookahead(re, text)
+}
+
+#[cfg(test)]
+mod lookahead_tests {
+    use super::*;
+
+    /// A run of whitespace before a word leaves its last character to the word, in both splitters; Llama's digits
+    /// come three at a time and Qwen's one by one.
+    #[test]
+    fn whitespace_before_a_word_leaves_it_one_space() {
+        for split in [split_llama3 as fn(&str) -> Vec<&str>, split_qwen3] {
+            assert_eq!(split("fn f() {\n    let v = 1;\n}"), ["fn", " f", "()", " {\n", "   ", " let", " v", " =", " ", "1", ";\n", "}"]);
+            assert_eq!(split("a  b"), ["a", " ", " b"]);
+            assert_eq!(split("a b"), ["a", " b"]);
+            assert_eq!(split("end   "), ["end", "   "], "a run at the end whole");
+            assert_eq!(split("x \n  y"), ["x", " \n", " ", " y"]);
+            assert_eq!(split("\t\tif"), ["\t", "\tif"]);
         }
-        pieces.push(&text[m.start()..end]);pos=end;
+        assert_eq!(split_llama3("in 2026 and 12345"), ["in", " ", "202", "6", " and", " ", "123", "45"]);
+        assert_eq!(split_qwen3("in 2026"), ["in", " ", "2", "0", "2", "6"]);
     }
-    pieces
 }
 
 #[cfg(test)]
