@@ -13,6 +13,8 @@
 pub mod dtype;
 pub mod error;
 
+pub mod iq;
+pub mod iq_tables;
 pub mod iq4_nl;
 pub mod iq4_xs;
 pub mod q2_0;
@@ -65,6 +67,13 @@ pub fn dequantize(dtype: GgmlType, src: &[u8], dst: &mut [f32]) -> Result<()> {
         GgmlType::Q5_1 => q5_1::dequantize(src, dst),
         GgmlType::Q8_0 => q8_0::dequantize(src, dst),
         GgmlType::IQ4_NL => iq4_nl::dequantize(src, dst),
+        GgmlType::IQ2_XXS => iq::iq2_xxs::dequantize(src, dst),
+        GgmlType::IQ2_XS => iq::iq2_xs::dequantize(src, dst),
+        GgmlType::IQ2_S => iq::iq2_s::dequantize(src, dst),
+        GgmlType::IQ3_XXS => iq::iq3_xxs::dequantize(src, dst),
+        GgmlType::IQ3_S => iq::iq3_s::dequantize(src, dst),
+        GgmlType::IQ1_S => iq::iq1_s::dequantize(src, dst),
+        GgmlType::IQ1_M => iq::iq1_m::dequantize(src, dst),
         GgmlType::IQ4_XS => iq4_xs::dequantize(src, dst),
         GgmlType::Q2_K => q2_k::dequantize(src, dst),
         GgmlType::Q3_K => q3_k::dequantize(src, dst),
@@ -85,6 +94,8 @@ pub fn is_supported(dtype: GgmlType) -> bool {
             | GgmlType::Q5_0 | GgmlType::Q5_1
             | GgmlType::Q8_0
             | GgmlType::IQ4_NL | GgmlType::IQ4_XS
+            | GgmlType::IQ2_XXS | GgmlType::IQ2_XS | GgmlType::IQ2_S | GgmlType::IQ3_XXS | GgmlType::IQ3_S
+            | GgmlType::IQ1_S | GgmlType::IQ1_M
             | GgmlType::Q2_K | GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K
     )
 }

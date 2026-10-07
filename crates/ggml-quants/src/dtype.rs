@@ -132,11 +132,11 @@ impl GgmlType {
             Q6_K => 128 + 64 + 16 + 2,
             Q8_K => 4 + 256 + 16 * 2,
             IQ2_XXS => 2 + 64,
-            IQ2_XS  => 2 + 64 + 16,
-            IQ2_S   => 2 + 64 + 16 + 8,
+            IQ2_XS  => 2 + 64 + 8,        // d + qs[32] as u16 + scales[8]
+            IQ2_S   => 2 + 64 + 8 + 8,    // d + qs[32] + signs[32] + qh[8] + scales[8]
             IQ3_XXS => 2 + 64 + 32,
             IQ3_S   => 2 + 64 + 32 + 4 + 8,
-            IQ1_S   => 2 + 32 + 8,
+            IQ1_S   => 2 + 32 + 16,       // d + qs[32] + qh[8] as u16
             IQ1_M   => 32 + 8 + 16,
             IQ4_NL  => 2 + 16,
             IQ4_XS  => 2 + 2 + 4 + 128,   // d + scales_h + scales_l[QK_K/64] + qs[QK_K/2]

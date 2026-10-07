@@ -34,6 +34,15 @@ fn random_weights(dtype: GgmlType, rows: usize, k: usize, rng: &mut Rng) -> Vec<
         *b = rng.next() as u8;
     }
     for blk in 0..blocks {
+        // (IQ1_M has no scale field: its f16 is the top nibbles of its last four u16s)
+        if dtype == GgmlType::IQ1_M {
+            let bits = half::f16::from_f32(0.002 + 0.02 * rng.unit()).to_bits();
+            for i in 0..4 {
+                let at = blk * bytes as usize + 48 + 2 * i + 1;
+                out[at] = (out[at] & 0x0f) | ((((bits >> (4 * i)) & 15) as u8) << 4);
+            }
+            continue;
+        }
         for &off in scale_offsets(dtype) {
             let scale = half::f16::from_f32(0.002 + 0.02 * rng.unit()).to_bits().to_le_bytes();
             let at = blk * bytes as usize + off;
@@ -73,7 +82,8 @@ fn backend() -> Option<WgpuBackend> {
     }
 }
 
-const TYPES: [GgmlType; 13] = [
+const TYPES: [GgmlType; 20] = [
+    GgmlType::IQ2_XXS, GgmlType::IQ2_XS, GgmlType::IQ2_S, GgmlType::IQ3_XXS, GgmlType::IQ3_S, GgmlType::IQ1_S, GgmlType::IQ1_M,
     GgmlType::Q2_0, GgmlType::Q4_0, GgmlType::Q4_1, GgmlType::Q5_0, GgmlType::Q5_1, GgmlType::Q8_0, GgmlType::IQ4_NL,
     GgmlType::Q2_K, GgmlType::Q3_K, GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K, GgmlType::IQ4_XS,
 ];

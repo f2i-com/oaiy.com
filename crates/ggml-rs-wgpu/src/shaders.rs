@@ -65,9 +65,145 @@ pub fn layout(dtype: GgmlType) -> Option<(u32, u32, &'static str)> {
         GgmlType::Q5_K => (256, 176, Q5_K),
         GgmlType::Q6_K => (256, 210, Q6_K),
         GgmlType::IQ4_XS => (256, 136, IQ4_XS),
+        // (the grid types: each its decode with ggml's tables beside it)
+        GgmlType::IQ2_XXS | GgmlType::IQ2_XS | GgmlType::IQ2_S | GgmlType::IQ3_XXS | GgmlType::IQ3_S | GgmlType::IQ1_S | GgmlType::IQ1_M => (256, dtype.type_size() as u32, iq_grid_dequant(dtype)?),
         _ => return None,
     })
 }
+
+/// A grid type's `dequant` (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M: [`ggml_quants::iq`]'s decodes, a 32 of
+/// a block at a time) with the tables it reads as constants beside it: ggml's grids ([`ggml_quants::iq_tables`]; a
+/// u64 entry its low word then its high) and the sign patterns. Made once a type.
+fn iq_grid_dequant(dtype: GgmlType) -> Option<&'static str> {
+    use ggml_quants::iq_tables as t;
+    use std::sync::OnceLock;
+    static SOURCES: [OnceLock<String>; 7] = [const { OnceLock::new() }; 7];
+    let words64 = |g: &[u64]| g.iter().flat_map(|v| [*v as u32, (*v >> 32) as u32]).collect::<Vec<u32>>();
+    let table = |name: &str, values: &[u32]| format!("const {name} = array<u32, {}>({});\n", values.len(), values.iter().map(|v| format!("{v}u")).collect::<Vec<_>>().join(","));
+    let signs = || table("KSIGNS", &t::KSIGNS_IQ2XS.iter().map(|v| *v as u32).collect::<Vec<_>>());
+    let (slot, tables, body): (usize, Box<dyn Fn() -> String>, &str) = match dtype {
+        GgmlType::IQ2_XXS => (0, Box::new(move || signs() + &table("GRID", &words64(&t::IQ2XXS_GRID))), IQ2_XXS),
+        GgmlType::IQ2_XS => (1, Box::new(move || signs() + &table("GRID", &words64(&t::IQ2XS_GRID))), IQ2_XS),
+        GgmlType::IQ2_S => (2, Box::new(move || table("GRID", &words64(&t::IQ2S_GRID))), IQ2_S),
+        GgmlType::IQ3_XXS => (3, Box::new(move || signs() + &table("GRID", &t::IQ3XXS_GRID)), IQ3_XXS),
+        GgmlType::IQ3_S => (4, Box::new(move || table("GRID", &t::IQ3S_GRID)), IQ3_S),
+        GgmlType::IQ1_S => (5, Box::new(move || table("GRID", &words64(&t::IQ1S_GRID))), IQ1_S),
+        GgmlType::IQ1_M => (6, Box::new(move || table("GRID", &words64(&t::IQ1S_GRID))), IQ1_M),
+        _ => return None,
+    };
+    Some(SOURCES[slot].get_or_init(|| format!("{}{IQ_GROUPS}{body}", tables())).as_str())
+}
+
+/// A group of 8 weights into `v[at..]`: magnitudes a byte each from two words (a u64 grid entry's halves, or two u32
+/// entries), times `s` and their signs (a bit each of `signs`); and IQ1's, signed bytes plus an offset.
+const IQ_GROUPS: &str = r#"
+fn put8(at: u32, lo: u32, hi: u32, signs: u32, s: f32) {
+    for (var j = 0u; j < 4u; j++) {
+        v[at + j] = s * f32((lo >> (8u * j)) & 255u) * select(1.0, -1.0, ((signs >> j) & 1u) == 1u);
+        v[at + 4u + j] = s * f32((hi >> (8u * j)) & 255u) * select(1.0, -1.0, ((signs >> (j + 4u)) & 1u) == 1u);
+    }
+}
+fn put1(at: u32, lo: u32, hi: u32, delta: f32, s: f32) {
+    for (var j = 0u; j < 4u; j++) {
+        v[at + j] = s * (i8of((lo >> (8u * j)) & 255u) + delta);
+        v[at + 4u + j] = s * (i8of((hi >> (8u * j)) & 255u) + delta);
+    }
+}
+"#;
+
+const IQ2_XXS: &str = r#"
+fn dequant(bb: u32, sub: u32) {
+    let at = bb + 2u + 8u * sub;
+    let aux = u32at(at + 4u);
+    let db = f16at(bb) * (0.5 + f32(aux >> 28u)) * 0.25;
+    for (var l = 0u; l < 4u; l++) {
+        let i = byte(at + l);
+        put8(8u * l, GRID[2u * i], GRID[2u * i + 1u], KSIGNS[(aux >> (7u * l)) & 127u], db);
+    }
+}
+"#;
+
+const IQ2_XS: &str = r#"
+fn dequant(bb: u32, sub: u32) {
+    let d = f16at(bb);
+    let sc = byte(bb + 66u + sub);
+    let db0 = d * (0.5 + f32(sc & 15u)) * 0.25;
+    let db1 = d * (0.5 + f32(sc >> 4u)) * 0.25;
+    for (var l = 0u; l < 4u; l++) {
+        let q = u16at(bb + 2u + 2u * (4u * sub + l));
+        let i = q & 511u;
+        put8(8u * l, GRID[2u * i], GRID[2u * i + 1u], KSIGNS[q >> 9u], select(db0, db1, l >= 2u));
+    }
+}
+"#;
+
+const IQ2_S: &str = r#"
+fn dequant(bb: u32, sub: u32) {
+    let d = f16at(bb);
+    let qh = byte(bb + 66u + sub);
+    let sc = byte(bb + 74u + sub);
+    let db0 = d * (0.5 + f32(sc & 15u)) * 0.25;
+    let db1 = d * (0.5 + f32(sc >> 4u)) * 0.25;
+    for (var l = 0u; l < 4u; l++) {
+        let i = byte(bb + 2u + 4u * sub + l) | ((qh << (8u - 2u * l)) & 0x300u);
+        put8(8u * l, GRID[2u * i], GRID[2u * i + 1u], byte(bb + 34u + 4u * sub + l), select(db0, db1, l >= 2u));
+    }
+}
+"#;
+
+const IQ3_XXS: &str = r#"
+fn dequant(bb: u32, sub: u32) {
+    let aux = u32at(bb + 66u + 4u * sub);
+    let db = f16at(bb) * (0.5 + f32(aux >> 28u)) * 0.5;
+    for (var l = 0u; l < 4u; l++) {
+        let q = bb + 2u + 8u * sub + 2u * l;
+        put8(8u * l, GRID[byte(q)], GRID[byte(q + 1u)], KSIGNS[(aux >> (7u * l)) & 127u], db);
+    }
+}
+"#;
+
+const IQ3_S: &str = r#"
+fn dequant(bb: u32, sub: u32) {
+    let sc = byte(bb + 106u + sub / 2u);
+    let db = f16at(bb) * f32(1u + 2u * ((sc >> (4u * (sub % 2u))) & 15u));
+    let qh = byte(bb + 66u + sub);
+    for (var l = 0u; l < 4u; l++) {
+        let q = bb + 2u + 8u * sub + 2u * l;
+        put8(8u * l, GRID[byte(q) | ((qh << (8u - 2u * l)) & 256u)], GRID[byte(q + 1u) | ((qh << (7u - 2u * l)) & 256u)], byte(bb + 74u + 4u * sub + l), db);
+    }
+}
+"#;
+
+const IQ1_S: &str = r#"
+fn dequant(bb: u32, sub: u32) {
+    let qh = u16at(bb + 34u + 2u * sub);
+    let dl = f16at(bb) * f32(2u * ((qh >> 12u) & 7u) + 1u);
+    let delta = select(0.125, -0.125, (qh & 0x8000u) != 0u);
+    for (var l = 0u; l < 4u; l++) {
+        let i = byte(bb + 2u + 4u * sub + l) | (((qh >> (3u * l)) & 7u) << 8u);
+        put1(8u * l, GRID[2u * i], GRID[2u * i + 1u], delta, dl);
+    }
+}
+"#;
+
+const IQ1_M: &str = r#"
+fn dequant(bb: u32, sub: u32) {
+    let s0 = u16at(bb + 48u);
+    let s1 = u16at(bb + 50u);
+    let s2 = u16at(bb + 52u);
+    let s3 = u16at(bb + 54u);
+    let d = unpack2x16float((s0 >> 12u) | ((s1 >> 8u) & 0x00f0u) | ((s2 >> 4u) & 0x0f00u) | (s3 & 0xf000u)).x;
+    let pair = sub / 2u;
+    let sc = select(select(s0, s1, pair == 1u), select(s2, s3, pair == 3u), pair >= 2u) >> (6u * (sub % 2u));
+    let dl0 = d * f32(2u * (sc & 7u) + 1u);
+    let dl1 = d * f32(2u * ((sc >> 3u) & 7u) + 1u);
+    for (var l = 0u; l < 4u; l++) {
+        let h = byte(bb + 32u + 2u * sub + l / 2u) >> (4u * (l % 2u));
+        let i = byte(bb + 4u * sub + l) | ((h & 7u) << 8u);
+        put1(8u * l, GRID[2u * i], GRID[2u * i + 1u], select(0.125, -0.125, (h & 8u) != 0u), select(dl0, dl1, l >= 2u));
+    }
+}
+"#;
 
 const COMMON: &str = r#"
 struct Params {
