@@ -1434,7 +1434,7 @@ impl FewScratch {
 /// of their own in their list's order, the blocks in the order their experts first appear; the down jobs' order
 /// (`order_d`, `p[0].x` blocks of `p[0].y`) and the gate and up jobs' (`order_gu`: expert block `b`'s gate jobs `2j` in
 /// block `2b`, its up jobs `2j + 1` in `2b + 1`), the other places [`NONE`]. One workgroup.
-const GROUP: &str = r#"
+pub(crate) const GROUP: &str = r#"
 @group(0) @binding(0) var<storage, read> jobs: array<u32>;
 @group(0) @binding(6) var<storage, read_write> order_gu: array<u32>;
 @group(0) @binding(7) var<storage, read_write> order_d: array<u32>;
@@ -1551,7 +1551,7 @@ fn many_rows(gpu: &Gpu) -> usize {
 /// columns (Qwen3.8-Flash-Next's chunk of 512, some 10 jobs an expert: blocks of 32 308 ms, of 16 337, of 64 339).
 /// Blocks of 32 up to some 24 jobs an expert: a chunk of 1,024, 20 an expert, its experts' matmuls 118 ms with them
 /// and 149 with blocks of 64 (a workgroup of 64 an SM, where two of 32).
-fn moe_rows_for(pairs: usize, experts: usize) -> usize {
+pub(crate) fn moe_rows_for(pairs: usize, experts: usize) -> usize {
     let target = 3 * pairs / experts.max(1);
     if (16..=72).contains(&target) {
         return 32;
@@ -1704,7 +1704,7 @@ impl Exl3Gpu {
 
 /// Each row's experts summed in its own order, each weighted (as `Exl3MoeHost::forward`): `out[r, i] = sum over j < K
 /// of w[r, j] * d[r K + j, i]`, then `+ w[r, K] * sh[r, i]` (the shared expert). `p[0]`: hidden, K, rows.
-const WSUM_ROWS: &str = r#"
+pub(crate) const WSUM_ROWS: &str = r#"
 @group(0) @binding(0) var<storage, read> d: array<f32>;
 @group(0) @binding(1) var<storage, read> sh: array<f32>;
 @group(0) @binding(2) var<storage, read> w: array<f32>;
@@ -1728,7 +1728,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
 /// [`WSUM_ROWS`] with each row's sum added to its streams (`xs[r, s] += post[r, s] * sum`, `p[0].w` streams), as
 /// `ChainRecorder::stream_apply` writes it back. `p[0]`: hidden, K, rows, streams.
-const WSUM_APPLY: &str = r#"
+pub(crate) const WSUM_APPLY: &str = r#"
 @group(0) @binding(0) var<storage, read> d: array<f32>;
 @group(0) @binding(1) var<storage, read> sh: array<f32>;
 @group(0) @binding(2) var<storage, read> w: array<f32>;
@@ -1761,7 +1761,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 /// by its gate's sigmoid; then the row's jobs as the grouped experts take them: gate and up `[2e, r, 2e + 1, r]` an
 /// expert (`jobs`, from pair `r k`), the weights `w` (from `r (k + 1)`: the top k's, the shared one's last). `p[0]`:
 /// routed (at most 1024), k (at most 32).
-const ROUTE: &str = r#"
+pub(crate) const ROUTE: &str = r#"
 @group(0) @binding(0) var<storage, read> logits: array<f32>;
 @group(0) @binding(6) var<storage, read_write> jobs: array<u32>;
 @group(0) @binding(7) var<storage, read_write> w: array<f32>;
@@ -1835,7 +1835,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 /// job's place among its expert's as the atomics fall), and their gate and up jobs in blocks `2 b` and `2 b + 1`.
 /// `od`: the down order (`p[0].y` blocks), then each expert's count, first block and filled places (`p[0].z`
 /// experts); `og` the gate and up order. First every place unused and every count 0.
-const MANY_CLEAR: &str = r#"
+pub(crate) const MANY_CLEAR: &str = r#"
 @group(0) @binding(6) var<storage, read_write> og: array<u32>;
 @group(0) @binding(7) var<storage, read_write> od: array<u32>;
 @group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
@@ -1851,7 +1851,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 "#;
 
 /// [`MANY_CLEAR`]'s second pass: each expert's jobs counted, a thread a pair. `p[0]`: the pairs, the blocks.
-const MANY_COUNT: &str = r#"
+pub(crate) const MANY_COUNT: &str = r#"
 @group(0) @binding(0) var<storage, read> jd: array<u32>;
 @group(0) @binding(7) var<storage, read_write> od: array<atomic<u32>>;
 @group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
@@ -1866,7 +1866,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
 /// [`MANY_CLEAR`]'s third: each expert's first block, the blocks of the experts before it, one workgroup a thread an
 /// expert (1024 at most). `p[0]`: the pairs, the blocks, the experts, the jobs a block.
-const MANY_SCAN: &str = r#"
+pub(crate) const MANY_SCAN: &str = r#"
 @group(0) @binding(7) var<storage, read_write> od: array<u32>;
 @group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
 
@@ -1894,7 +1894,7 @@ fn main(@builtin(local_invocation_index) e: u32) {
 
 /// [`MANY_CLEAR`]'s last: each pair's down job into its expert's blocks, and its gate and up jobs (`2 j`, `2 j + 1`)
 /// into theirs, a thread a pair. `p[0]`: the pairs, the blocks, the experts.
-const MANY_SCATTER: &str = r#"
+pub(crate) const MANY_SCATTER: &str = r#"
 @group(0) @binding(0) var<storage, read> jd: array<u32>;
 @group(0) @binding(6) var<storage, read_write> og: array<u32>;
 @group(0) @binding(7) var<storage, read_write> od: array<atomic<u32>>;
@@ -1919,7 +1919,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
 /// The down projections' jobs of routed rows from their gate and up jobs ([`ROUTE`]'s): pair `j`'s expert `e` on
 /// hidden row `j`, `[e, j]`. `p[0]`: the pairs (rows times k).
-const DOWN_JOBS: &str = r#"
+pub(crate) const DOWN_JOBS: &str = r#"
 @group(0) @binding(0) var<storage, read> gu: array<u32>;
 @group(0) @binding(6) var<storage, read_write> jobs: array<u32>;
 @group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
@@ -1949,22 +1949,22 @@ struct Group {
 
 /// A decode step's scratch: one row, `top_k` experts (the bind groups of a step made once).
 pub(crate) struct Step {
-    top_k: usize,
-    jobs_gu: DeviceVec,
-    jobs_d: DeviceVec,
-    w: DeviceVec,
-    xh_gu: DeviceVec,
-    part_gu: DeviceVec,
-    out_gu: DeviceVec,
-    xh_d: DeviceVec,
-    part_d: DeviceVec,
-    out_d: DeviceVec,
-    sg: DeviceVec,
-    su: DeviceVec,
-    sd: DeviceVec,
+    pub(crate) top_k: usize,
+    pub(crate) jobs_gu: DeviceVec,
+    pub(crate) jobs_d: DeviceVec,
+    pub(crate) w: DeviceVec,
+    pub(crate) xh_gu: DeviceVec,
+    pub(crate) part_gu: DeviceVec,
+    pub(crate) out_gu: DeviceVec,
+    pub(crate) xh_d: DeviceVec,
+    pub(crate) part_d: DeviceVec,
+    pub(crate) out_d: DeviceVec,
+    pub(crate) sg: DeviceVec,
+    pub(crate) su: DeviceVec,
+    pub(crate) sd: DeviceVec,
     /// A check's jobs grouped by matrix ([`GROUP`]): gate and up, down.
-    order_gu: DeviceVec,
-    order_d: DeviceVec,
+    pub(crate) order_gu: DeviceVec,
+    pub(crate) order_d: DeviceVec,
 }
 
 /// A MoE layer's experts on the GPU as groups (Qwen3.8-Flash-Next's 512 routed ones): their gate and up matrices in

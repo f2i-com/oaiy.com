@@ -1,0 +1,1120 @@
+//! A MoE layer's experts as a GGUF holds them (Qwen3.8-Flash-Next's GSQ-RCO files: 512 routed experts a layer, their
+//! gate, up and down matrices each one tensor of quant blocks), beside [`crate::exl3`]'s EXL3 ones and run as those
+//! are: a row's experts a job list (job `j` matrix `jobs[2j]` on input row `jobs[2j + 1]`, its result row `j`), routed
+//! on the host or on the GPU ([`crate::exl3::ROUTE`]), grouped by expert for a prompt's rows, each row's weighted sum
+//! made on the GPU. What differs is the matmul: a GGUF's weights are the weights (no Hadamard transforms, no channel
+//! maps), decoded by one function a type ([`Kind::wgsl`]'s `w8`: eight weights of a row) that every kernel here calls,
+//! so another type is its decode function, its rows' layout on the GPU and, for a lookup-table type, its grid.
+//!
+//! Q2_0 (ggml type 42: 64 weights a block of 18 bytes, an f16 scale then 2 bits a weight, a weight `(code - 1) *
+//! scale`) is held a row at a time: its codes' words (16 weights a word, weight `i` its bits `2 i`), then its blocks'
+//! scales, f16, two a word: the GGUF's bytes, no more, each word aligned.
+use crate::exl3::{coop_on, many_order, moe_rows_for, Step, DOWN_JOBS, FEW_MAX, GROUP, MANY_CLEAR, MANY_COUNT, MANY_SCAN, MANY_SCATTER, ROUTE, WSUM_APPLY, WSUM_ROWS};
+use crate::{chunk_limit, Gpu, WgpuBackend};
+use ggml_quants::GgmlType;
+use ggml_rs::exl3::{route, Experts};
+use ggml_rs::{ChainRecorder, DeviceChain, DeviceVec, Tensor};
+use rayon::prelude::*;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
+
+/// One MoE layer's experts as a GGUF holds them.
+pub struct QuantExpertsData {
+    pub hidden: usize,
+    pub ff: usize,
+    /// The routed experts.
+    pub experts: usize,
+    /// Routed gate and up: `[experts][ff rows][hidden cols]`; down: `[experts][hidden rows][ff cols]`. Raw block
+    /// bytes, row-major, each row a whole number of blocks (a GGUF's `ffn_gate_exps` of 2560 x 640 x 512 and so on).
+    pub gate: (GgmlType, Vec<u8>),
+    pub up: (GgmlType, Vec<u8>),
+    pub down: (GgmlType, Vec<u8>),
+    /// The shared expert, dequantised by the loader: gate and up `[ff, hidden]`, down `[hidden, ff]`, f32 row-major.
+    pub shared: [Vec<f32>; 3],
+}
+
+/// The bytes of a row of `cols` weights of type `t`.
+fn row_bytes(t: GgmlType, cols: usize) -> usize {
+    cols / t.block_size() * t.type_size()
+}
+
+impl QuantExpertsData {
+    /// Each tensor's bytes are its shape's (a row a whole number of its type's blocks), of a type `ggml_quants` decodes.
+    pub fn validate(&self) -> Result<(), String> {
+        let (h, f, e) = (self.hidden, self.ff, self.experts);
+        if h == 0 || f == 0 || e == 0 {
+            return Err("experts of no size".into());
+        }
+        for (what, (t, bytes), rows, cols) in [("gate", &self.gate, f, h), ("up", &self.up, f, h), ("down", &self.down, h, f)] {
+            if !ggml_quants::is_supported(*t) {
+                return Err(format!("the experts' {what}: no decoder for {}", t.name()));
+            }
+            if cols % t.block_size() != 0 {
+                return Err(format!("the experts' {what}: rows of {cols} are not whole {} blocks", t.name()));
+            }
+            let want = e * rows * row_bytes(*t, cols);
+            if bytes.len() != want {
+                return Err(format!("the experts' {what}: {} bytes, {want} for {e} of {rows} x {cols} in {}", bytes.len(), t.name()));
+            }
+        }
+        for (what, m) in ["gate", "up", "down"].iter().zip(&self.shared) {
+            if m.len() != h * f {
+                return Err(format!("the shared expert's {what}: {} values, not {}", m.len(), h * f));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `y = W x`, `W` `[n, k]` row-major, summed in f64 (the reference's).
+fn matvec(w: &[f32], k: usize, x: &[f32], y: &mut [f32]) {
+    for (row, out) in w.chunks_exact(k).zip(y.iter_mut()) {
+        *out = row.iter().zip(x).map(|(a, b)| *a as f64 * *b as f64).sum::<f64>() as f32;
+    }
+}
+
+fn silu(v: f32) -> f32 {
+    v / (1.0 + (-v).exp())
+}
+
+/// The experts on the host: the reference the GPU's are held against, and where they run without a GPU (or past its
+/// budget). Each expert a call's rows share is dequantised once for them.
+pub struct QuantMoeCpu {
+    data: QuantExpertsData,
+}
+
+impl std::fmt::Debug for QuantMoeCpu {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "QuantMoeCpu({} routed experts of {}x{} in {}, and the shared one, on the host)", self.data.experts, self.data.hidden, self.data.ff, self.data.gate.0.name())
+    }
+}
+
+impl QuantMoeCpu {
+    /// Matrix `e` of a tensor of `rows` by `cols` matrices, dequantised.
+    fn matrix((t, bytes): &(GgmlType, Vec<u8>), e: usize, rows: usize, cols: usize) -> Vec<f32> {
+        let each = rows * row_bytes(*t, cols);
+        let mut out = vec![0f32; rows * cols];
+        ggml_quants::dequantize(*t, &bytes[e * each..(e + 1) * each], &mut out).expect("a validated tensor");
+        out
+    }
+}
+
+impl Experts for QuantMoeCpu {
+    fn forward(&self, x: &Tensor, logits: &Tensor, top_k: usize) -> Tensor {
+        let d = &self.data;
+        let (h, f, n) = (d.hidden, d.ff, d.experts);
+        let x = x.to_host();
+        let logits = logits.to_host();
+        let (xs, ls) = (x.data(), logits.data());
+        let rows = xs.len() / h;
+        let assign: Vec<Vec<(usize, f32)>> = (0..rows).map(|r| route(&ls[r * (n + 1)..(r + 1) * (n + 1)], top_k)).collect();
+        // each routed expert's rows (and their weights)
+        let mut by: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
+        for (r, a) in assign.iter().enumerate() {
+            for &(e, w) in &a[..a.len() - 1] {
+                by[e].push((r, w));
+            }
+        }
+        let expert = |g: &[f32], u: &[f32], dn: &[f32], xr: &[f32], w: f32| -> Vec<f32> {
+            let (mut a, mut b, mut y) = (vec![0f32; f], vec![0f32; f], vec![0f32; h]);
+            matvec(g, h, xr, &mut a);
+            matvec(u, h, xr, &mut b);
+            for (a, b) in a.iter_mut().zip(&b) {
+                *a = silu(*a) * b;
+            }
+            matvec(dn, f, &a, &mut y);
+            y.iter_mut().for_each(|v| *v *= w);
+            y
+        };
+        let routed: Vec<(usize, Vec<f32>)> = by
+            .par_iter()
+            .enumerate()
+            .filter(|(_, rs)| !rs.is_empty())
+            .flat_map_iter(|(e, rs)| {
+                let (g, u, dn) = (Self::matrix(&d.gate, e, f, h), Self::matrix(&d.up, e, f, h), Self::matrix(&d.down, e, h, f));
+                rs.iter().map(|&(r, w)| (r, expert(&g, &u, &dn, &xs[r * h..(r + 1) * h], w))).collect::<Vec<_>>()
+            })
+            .collect();
+        let mut out = vec![0f32; rows * h];
+        for (r, y) in routed {
+            out[r * h..(r + 1) * h].iter_mut().zip(&y).for_each(|(o, v)| *o += v);
+        }
+        // the shared expert on every row, weighted by its gate's sigmoid
+        out.par_chunks_mut(h).enumerate().for_each(|(r, o)| {
+            let y = expert(&d.shared[0], &d.shared[1], &d.shared[2], &xs[r * h..(r + 1) * h], assign[r].last().expect("the shared expert").1);
+            o.iter_mut().zip(&y).for_each(|(o, v)| *o += v);
+        });
+        Tensor::from_vec(out, vec![rows, h])
+    }
+}
+
+/// The experts of `data` on the host.
+pub fn quant_experts_cpu(data: QuantExpertsData) -> Result<Box<dyn Experts>, String> {
+    data.validate()?;
+    Ok(Box::new(QuantMoeCpu { data }))
+}
+
+/// A weight type the GPU's kernels decode: its rows' layout there and its `w8`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    Q2_0,
+}
+
+impl Kind {
+    fn of(t: GgmlType) -> Option<Kind> {
+        match t {
+            GgmlType::Q2_0 => Some(Kind::Q2_0),
+            _ => None,
+        }
+    }
+
+    fn tag(self) -> &'static str {
+        match self {
+            Kind::Q2_0 => "q2_0",
+        }
+    }
+
+    /// The words a row of `k` weights takes on the GPU.
+    fn row_words(self, k: usize) -> usize {
+        match self {
+            // a word 16 weights' codes, then a word two blocks' scales
+            Kind::Q2_0 => k / 16 + (k / 64).div_ceil(2),
+        }
+    }
+
+    /// A row's blocks (`src`, `k` weights as the GGUF has them) as the GPU holds it (`dst`, [`Self::row_words`] long).
+    fn pack_row(self, src: &[u8], k: usize, dst: &mut [u32]) {
+        match self {
+            Kind::Q2_0 => {
+                let kw = k / 16;
+                dst[kw..].fill(0);
+                for (b, block) in src.chunks_exact(18).enumerate() {
+                    for (i, c) in block[2..].chunks_exact(4).enumerate() {
+                        dst[4 * b + i] = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                    }
+                    dst[kw + b / 2] |= (u16::from_le_bytes([block[0], block[1]]) as u32) << (16 * (b % 2));
+                }
+            }
+        }
+    }
+
+    /// `fn w8(rb: u32, kt: u32, hf: u32, kw: u32) -> array<f32, 8>`: weights `16 kt + 8 hf ..` (eight of them) of the
+    /// row whose words start at `rb` of `words`, a row of `16 kw` weights.
+    fn wgsl(self) -> &'static str {
+        match self {
+            Kind::Q2_0 => W8_Q2_0,
+        }
+    }
+}
+
+const W8_Q2_0: &str = r#"
+// Q2_0: a row's codes (16 weights a word, weight i its bits 2 i: -1, 0, 1 or 2 times its block's scale), then its
+// blocks' scales (64 weights a block), f16, two a word.
+fn w8(rb: u32, kt: u32, hf: u32, kw: u32) -> array<f32, 8> {
+    let bits = words[rb + kt] >> (16u * hf);
+    let d2 = unpack2x16float(words[rb + kw + kt / 8u]);
+    let d = select(d2.x, d2.y, ((kt >> 2u) & 1u) == 1u);
+    return array<f32, 8>(
+        (f32(bits & 3u) - 1.0) * d,
+        (f32((bits >> 2u) & 3u) - 1.0) * d,
+        (f32((bits >> 4u) & 3u) - 1.0) * d,
+        (f32((bits >> 6u) & 3u) - 1.0) * d,
+        (f32((bits >> 8u) & 3u) - 1.0) * d,
+        (f32((bits >> 10u) & 3u) - 1.0) * d,
+        (f32((bits >> 12u) & 3u) - 1.0) * d,
+        (f32((bits >> 14u) & 3u) - 1.0) * d
+    );
+}
+"#;
+
+/// The matmul of blocks of `rows` (1 to [`FEW_MAX`]) jobs of one matrix, in f32: a workgroup a (16 outputs, block), a
+/// thread an output's sixteenth of `k`, each weight decoded once for the block's rows; a block's jobs from `order`
+/// (its unused places `0xffffffff`, a block with none ends at once), or with `p[0].w` block `b` job `b` alone (a
+/// step's jobs, no order). Job `j`'s sums to `y[j * n..]`. `p[0]`: n, k, words a row, whether the order is the
+/// identity; `p[1]`: words a matrix, the pass's first block.
+fn few_source(kind: Kind, rows: usize) -> String {
+    assert!((1..=FEW_MAX).contains(&rows), "a block of 1 to {FEW_MAX} rows");
+    let each = |f: &dyn Fn(usize) -> String| (0..rows).map(f).collect::<String>();
+    let ids = each(&|i| {
+        format!(
+            "    var j{i} = blk;\n    if (!identity) {{ j{i} = order[blk * {rows}u + {i}u]; }}\n    let on{i} = j{i} != 0xffffffffu;\n    let xb{i} = jobs[2u * select(j{i}, 0u, !on{i}) + 1u] * k;\n    var a{i} = 0.0;\n"
+        )
+    });
+    let sums = each(&|i| format!("            if (on{i}) {{\n                var s = 0.0;\n                for (var e = 0u; e < 8u; e++) {{ s += lo[e] * x[xb{i} + at + e] + hi[e] * x[xb{i} + at + 8u + e]; }}\n                a{i} += s;\n            }}\n"));
+    let store = each(&|i| format!("    red[t * {rows}u + {i}u] = a{i};\n"));
+    let out = each(&|i| format!("        if (on{i}) {{\n            var s = 0.0;\n            for (var q = 0u; q < 16u; q++) {{ s += red[(t + q) * {rows}u + {i}u]; }}\n            y[j{i} * n + row] = s;\n        }}\n"));
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read> words: array<u32>;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read> jobs: array<u32>;
+@group(0) @binding(3) var<storage, read> order: array<u32>;
+@group(0) @binding(6) var<storage, read_write> y: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+// each thread's sums, [output][sixteenth of k][row]
+var<workgroup> red: array<f32, {red_len}>;
+{w8}
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {{
+    let n = p[0].x;
+    let k = p[0].y;
+    let rw = p[0].z;
+    let identity = p[0].w == 1u;
+    let blk = p[1].y + wg.z;
+    let o = t / 16u;
+    let c = t % 16u;
+{ids}    let row = (wg.x + wg.y * 65535u) * 16u + o;
+    let live = on0 && row < n;
+    let rb = jobs[2u * select(j0, 0u, !on0)] * p[1].x + min(row, n - 1u) * rw;
+    let kw = k / 16u;
+    let per = (kw + 15u) / 16u;
+    let ks = c * per;
+    let ke = min(kw, ks + per);
+    if (live) {{
+        for (var kt = ks; kt < ke; kt++) {{
+            var lo = w8(rb, kt, 0u, kw);
+            var hi = w8(rb, kt, 1u, kw);
+            let at = kt * 16u;
+{sums}        }}
+    }}
+{store}    workgroupBarrier();
+    if (live && c == 0u) {{
+{out}    }}
+}}
+"#,
+        red_len = 256 * rows,
+        w8 = kind.wgsl(),
+    )
+}
+
+/// [`few_source`]'s matmul on the tensor cores (WGSL's cooperative matrices, f16 into f32), for blocks of `rows` (16,
+/// 32, 64 or 128) jobs of one matrix, as [`crate::exl3::g_coop`] is laid out: a workgroup 8 tile columns (128
+/// outputs) of a block, `k` 16 at a time; each step a lane decodes eight weights of its warp's 16 outputs into the
+/// workgroup's memory as f16 (a Q2_0 weight is one exactly) and the block's inputs beside them (rounded to f16), the
+/// next step's loaded as this one's are multiplied; each warp its 16 outputs by the block's rows. `p` as
+/// [`few_source`]'s (no identity order).
+fn coop_source(kind: Kind, rows: usize) -> String {
+    assert!(matches!(rows, 16 | 32 | 64 | 128), "a block of 16, 32, 64 or 128 rows");
+    let f = rows / 16;
+    let pairs = rows * 8;
+    let each = |g: &dyn Fn(usize) -> String| (0..f).map(g).collect::<String>();
+    let decl = each(&|i| format!("    var c{i} = coop_mat16x16<f32, C>();\n"));
+    let mma = each(&|i| format!("        {{\n            let bf = coopLoad<coop_mat16x16<f16, B>>(&xt[curx + {}u * S2], s2);\n            c{i} = coopMultiplyAdd(af, bf, c{i});\n        }}\n", i * 16));
+    let out = each(&|i| {
+        format!(
+            "    {{\n        let so = warp * 256u;\n        coopStore(c{i}, &stage[so], 16u);\n        workgroupBarrier();\n        for (var e = l; e < 256u; e += 32u) {{\n            let id = ids[{}u + e / 16u];\n            if (id != 0xffffffffu && live) {{ y[id * n + tc * 16u + e % 16u] = stage[so + e]; }}\n        }}\n        workgroupBarrier();\n    }}\n",
+            i * 16
+        )
+    });
+    // the inputs a thread loads a step: pairs `t + 256 i` of the block's rows by 16 of k
+    let per = pairs.div_ceil(256);
+    let xdecl: String = (0..per).map(|i| format!("    var xp{i} = vec2<f32>(0.0);\n")).collect();
+    let xload: String = (0..per)
+        .map(|i| format!("        {{\n            let q = t + {}u;\n            if (q < {pairs}u) {{\n                xp{i} = vec2<f32>(0.0);\n                if (ids[q / 8u] != 0xffffffffu) {{ xp{i} = x2[(xb[q / 8u] + kn * 16u) / 2u + q % 8u]; }}\n            }}\n        }}\n", 256 * i))
+        .collect();
+    let xstore: String = (0..per).map(|i| format!("        {{\n            let q = t + {}u;\n            if (q < {pairs}u) {{ xt[nbx + (q / 8u) * S2 + q % 8u] = vec2<f16>(xp{i}); }}\n        }}\n", 256 * i)).collect();
+    let wstore = "        wt[nbw + wo] = vec2<f16>(f16(v[0]), f16(v[1]));\n        wt[nbw + wo + 1u] = vec2<f16>(f16(v[2]), f16(v[3]));\n        wt[nbw + wo + 2u] = vec2<f16>(f16(v[4]), f16(v[5]));\n        wt[nbw + wo + 3u] = vec2<f16>(f16(v[6]), f16(v[7]));\n";
+    format!(
+        r#"enable f16;
+enable wgpu_cooperative_matrix;
+@group(0) @binding(0) var<storage, read> words: array<u32>;
+@group(0) @binding(1) var<storage, read> x2: array<vec2<f32>>;
+@group(0) @binding(2) var<storage, read> jobs: array<u32>;
+@group(0) @binding(3) var<storage, read> order: array<u32>;
+@group(0) @binding(6) var<storage, read_write> y: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+// a row's stride in the tiles, as f16 pairs: 16 of k and 8 against bank conflicts
+const S2: u32 = 12u;
+// two steps' weights [output][k] and inputs [row][k]
+var<workgroup> wt: array<vec2<f16>, {wt_len}>;
+var<workgroup> xt: array<vec2<f16>, {xt_len}>;
+var<workgroup> stage: array<f32, 2048>;
+// the block's jobs, and where each one's input row starts
+var<workgroup> ids: array<u32, {rows}>;
+var<workgroup> xb: array<u32, {rows}>;
+{w8}
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {{
+    let n = p[0].x;
+    let k = p[0].y;
+    let rw = p[0].z;
+    let ntiles = n / 16u;
+    let blk = p[1].y + wg.z;
+    if (t < {rows}u) {{
+        let id = order[blk * {rows}u + t];
+        var at = 0u;
+        if (id != 0xffffffffu) {{ at = jobs[2u * id + 1u] * k; }}
+        ids[t] = id;
+        xb[t] = at;
+    }}
+    workgroupBarrier();
+    // a block the order left unused (a GPU's grouping sizes the grid for the most blocks it could fill)
+    let head = workgroupUniformLoad(&ids[0]);
+    if (head == 0xffffffffu) {{
+        return;
+    }}
+    let warp = t / 32u;
+    let l = t % 32u;
+    // the warp's tile column (past the matrix: the last, its sums not stored); the lane's output of its 16 and half
+    // of the step's 16 weights
+    let tc = wg.x * 8u + warp;
+    let live = tc < ntiles;
+    let o = l / 2u;
+    let hf = l % 2u;
+    let rb = jobs[2u * head] * p[1].x + (min(tc, ntiles - 1u) * 16u + o) * rw;
+    let kw = k / 16u;
+    let wo = (warp * 16u + o) * S2 + hf * 4u;
+    let s2 = S2;
+{decl}{xdecl}    // the first step's
+    {{
+        let kn = 0u;
+        var v = w8(rb, kn, hf, kw);
+{xload}        let nbw = 0u;
+        let nbx = 0u;
+{wstore}{xstore}    }}
+    workgroupBarrier();
+    for (var kt = 0u; kt < kw; kt++) {{
+        // the next step (the last's own again, into the buffer no one reads after): loaded before this one's are
+        // multiplied, stored after
+        let kn = min(kt + 1u, kw - 1u);
+        var v = w8(rb, kn, hf, kw);
+{xload}        let curx = (kt % 2u) * {half_xt}u;
+        let af = coopLoadT<coop_mat16x16<f16, A>>(&wt[(kt % 2u) * {half_wt}u + warp * 16u * S2], s2);
+{mma}        let nbw = ((kt + 1u) % 2u) * {half_wt}u;
+        let nbx = ((kt + 1u) % 2u) * {half_xt}u;
+{wstore}{xstore}        workgroupBarrier();
+    }}
+{out}}}
+"#,
+        wt_len = 2 * 128 * 12,
+        xt_len = 2 * rows * 12,
+        half_wt = 128 * 12,
+        half_xt = rows * 12,
+        w8 = kind.wgsl(),
+    )
+}
+
+/// Each pair's SwiGLU, as its down projection reads it: `act[j] = silu(y[2 j]) * y[2 j + 1]`, rows of `p[0].x`,
+/// `p[0].y` pairs.
+const SWIGLU_PAIRS: &str = r#"
+@group(0) @binding(0) var<storage, read> y: array<f32>;
+@group(0) @binding(6) var<storage, read_write> act: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    let ff = p[0].x;
+    if (i >= p[0].y * ff) { return; }
+    let pair = i / ff;
+    let c = i % ff;
+    let g = y[2u * pair * ff + c];
+    act[i] = (g / (1.0 + exp(-g))) * y[(2u * pair + 1u) * ff + c];
+}
+"#;
+
+/// A kernel's pipeline name and source, made once (a pipeline is named for good).
+fn kernel(kind: Kind, coop: bool, rows: usize) -> (&'static str, &'static str) {
+    type Made = ((Kind, bool, usize), (&'static str, &'static str));
+    static MADE: Mutex<Vec<Made>> = Mutex::new(Vec::new());
+    let mut made = MADE.lock().unwrap_or_else(|p| p.into_inner());
+    let key = (kind, coop, rows);
+    if let Some((_, k)) = made.iter().find(|(k, _)| *k == key) {
+        return *k;
+    }
+    let name: &'static str = Box::leak(format!("quant-moe-{}-{}-{rows}", kind.tag(), if coop { "coop" } else { "few" }).into_boxed_str());
+    let source: &'static str = Box::leak(if coop { coop_source(kind, rows) } else { few_source(kind, rows) }.into_boxed_str());
+    made.push((key, (name, source)));
+    (name, source)
+}
+
+/// One kind of a layer's routed experts' projection as a group (their gate and up matrices, or their down ones): their
+/// rows in one buffer, a matrix's after another.
+struct Group {
+    words: wgpu::Buffer,
+    kind: Kind,
+    k: usize,
+    n: usize,
+    /// Words a row, and a matrix.
+    rw: usize,
+    mwords: usize,
+}
+
+/// How a group's jobs are taken: each a block of its own (a step's, no order), or in blocks of one matrix (the order,
+/// its blocks, the jobs a block): up to [`FEW_MAX`] a block in f32, 16 and more on the tensor cores.
+#[derive(Clone, Copy)]
+enum Order<'a> {
+    Jobs,
+    Blocks(&'a DeviceVec, usize, usize),
+}
+
+/// The shared expert's matrix: f16 where every value is one exactly (a Q2_0 matrix's are), else f32.
+struct Dense {
+    w: DeviceVec,
+    half: bool,
+    n: usize,
+    k: usize,
+}
+
+impl Dense {
+    fn new(b: &WgpuBackend, values: &[f32], n: usize, k: usize) -> Self {
+        match DeviceChain::vec_f16(b, values) {
+            Some(w) => Dense { w, half: true, n, k },
+            None => {
+                let w = b.vec(values.len());
+                DeviceChain::upload(b, &w, values);
+                Dense { w, half: false, n, k }
+            }
+        }
+    }
+
+    fn rows(&self, rec: &mut crate::chain::Recorder<'_>, x: &DeviceVec, y: &DeviceVec, rows: usize) {
+        if self.half {
+            rec.matmul_f16_rows(&self.w, self.n, self.k, x, y, rows);
+        } else {
+            rec.matmul_f32_rows(&self.w, self.n, self.k, x, y, rows);
+        }
+    }
+}
+
+/// A MoE layer's GGUF experts on the GPU as groups, as [`crate::exl3::Exl3MoeGrouped`] holds EXL3's: the routed ones'
+/// gate and up matrices in one buffer (matrix `2e` expert `e`'s gate, `2e + 1` its up), their down matrices in
+/// another, the shared expert dense.
+pub struct QuantMoe {
+    b: WgpuBackend,
+    routed: usize,
+    hidden: usize,
+    ff: usize,
+    gu: Group,
+    down: Group,
+    shared: [Dense; 3],
+    /// Whether a prompt's blocks go to the tensor cores (where the device has them; OAIY_QUANT_MOE_NO_COOP: no).
+    coop: bool,
+    /// The bytes counted against the backend's budget, given back when the layer goes.
+    bytes: u64,
+}
+
+impl std::fmt::Debug for QuantMoe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "QuantMoe({} routed experts of {}x{} in {} as two groups, and the shared one)", self.routed, self.hidden, self.ff, self.gu.kind.tag())
+    }
+}
+
+impl Drop for QuantMoe {
+    fn drop(&mut self) {
+        self.b.used.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+/// What tells this module's scratch from EXL3's of the same shape, in the caches the two share.
+const QUANT: usize = 1 << 40;
+
+impl QuantMoe {
+    /// The layer's experts as groups on `b`, if they can be: their types ones the kernels decode, each group within a
+    /// binding, and all of them within the budget less `reserve`. Else `data` back, for the host.
+    fn try_new(b: &WgpuBackend, data: QuantExpertsData, reserve: u64) -> Result<Self, QuantExpertsData> {
+        let (h, f, e) = (data.hidden, data.ff, data.experts);
+        let (Some(kg), Some(ku), Some(kd)) = (Kind::of(data.gate.0), Kind::of(data.up.0), Kind::of(data.down.0)) else { return Err(data) };
+        // (the tensor cores' tiles are 16 by 16, a scale's block 64)
+        if kg != ku || h % 64 != 0 || f % 64 != 0 {
+            return Err(data);
+        }
+        let (gw, dw) = (kg.row_words(h), kd.row_words(f));
+        let gu_bytes = (2 * e * f * gw * 4) as u64;
+        let d_bytes = (e * h * dw * 4) as u64;
+        let limit = chunk_limit(&b.gpu.limits);
+        // (a job's matrix and row index its words in 32 bits)
+        if gu_bytes > limit || d_bytes > limit || gu_bytes / 4 > u32::MAX as u64 || d_bytes / 4 > u32::MAX as u64 {
+            return Err(data);
+        }
+        let shared_bytes = (3 * h * f * 4) as u64;
+        let total = gu_bytes + d_bytes + shared_bytes;
+        let prev = b.used.fetch_add(total, Ordering::Relaxed);
+        if prev + total > b.budget.saturating_sub(reserve) {
+            b.used.fetch_sub(total, Ordering::Relaxed);
+            return Err(data);
+        }
+        // a group's rows packed on every core, a matrix's after another (`which`: the tensors a matrix comes from in turn)
+        let group = |which: &[&(GgmlType, Vec<u8>)], kind: Kind, n: usize, k: usize| -> Group {
+            let (rw, rb) = (kind.row_words(k), row_bytes(which[0].0, k));
+            let mwords = n * rw;
+            let mut words = vec![0u32; e * which.len() * mwords];
+            words.par_chunks_mut(mwords).enumerate().for_each(|(m, out)| {
+                let src = &which[m % which.len()].1[(m / which.len()) * n * rb..];
+                for (r, row) in out.chunks_exact_mut(rw).enumerate() {
+                    kind.pack_row(&src[r * rb..(r + 1) * rb], k, row);
+                }
+            });
+            // (the words' bytes as they lie: little-endian, as the kernels read them)
+            let bytes: &[u8] = bytemuck::cast_slice(&words);
+            Group { words: b.gpu.upload_rows(bytes, bytes.len(), 1).remove(0).0, kind, k, n, rw, mwords }
+        };
+        let gu = group(&[&data.gate, &data.up], kg, f, h);
+        let down = group(&[&data.down], kd, h, f);
+        let shared = [Dense::new(b, &data.shared[0], f, h), Dense::new(b, &data.shared[1], f, h), Dense::new(b, &data.shared[2], h, f)];
+        let coop = coop_on(&b.gpu) && std::env::var_os("OAIY_QUANT_MOE_NO_COOP").is_none();
+        Ok(QuantMoe { b: b.clone(), routed: e, hidden: h, ff: f, gu, down, shared, coop, bytes: total })
+    }
+
+    pub(crate) fn is_on(&self, gpu: &Arc<Gpu>) -> bool {
+        Arc::ptr_eq(&self.b.gpu, gpu)
+    }
+
+    /// Scratch for `rows` rows of `top_k` experts, from `vec` (EXL3's [`Step`], what its caches keep: the vectors its
+    /// transforms take here the SwiGLUs', the shared expert's in `part_gu` and each pair's in `xh_d`). `few`: a check's
+    /// rows, whose jobs [`GROUP`] orders.
+    fn scratch(&self, vec: &mut dyn FnMut(usize) -> DeviceVec, rows: usize, top_k: usize, few: bool) -> Step {
+        let (h, f) = (self.hidden, self.ff);
+        let pairs = rows * top_k;
+        Step {
+            top_k,
+            jobs_gu: vec(4 * pairs),
+            jobs_d: vec(2 * pairs),
+            w: vec(rows * (top_k + 1)),
+            xh_gu: vec(1),
+            part_gu: vec(rows * f),
+            out_gu: vec(2 * pairs * f),
+            xh_d: vec(pairs * f),
+            part_d: vec(1),
+            out_d: vec(pairs * h),
+            sg: vec(rows * f),
+            su: vec(rows * f),
+            sd: vec(rows * h),
+            order_gu: vec(if few { 2 * pairs * rows } else { 1 }),
+            order_d: vec(if few { pairs * rows } else { 1 }),
+        }
+    }
+
+    /// The kept scratch of `rows` routed rows (a step's one, a check's few): one for every layer of this shape on the
+    /// device (a layer's experts are done before the next layer's start), its bind groups kept.
+    fn step(&self, rows: usize, top_k: usize) -> Arc<Step> {
+        let key = [rows, top_k, self.hidden, self.ff, QUANT, QUANT];
+        let mut s = self.b.gpu.moe_steps.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((_, st)) = s.iter().find(|(k, _)| *k == key) {
+            return Arc::clone(st);
+        }
+        let st = Arc::new(self.scratch(&mut |n| self.b.vec(n), rows, top_k, rows > 1));
+        s.push((key, Arc::clone(&st)));
+        st
+    }
+
+    /// One group's jobs (`jobs`, `count` of them) on `x`'s rows into `y`'s (job `j`'s row `j`).
+    #[allow(clippy::too_many_arguments)]
+    fn group_pass(&self, rec: &mut crate::chain::Recorder<'_>, g: &Group, x: &DeviceVec, jobs: &DeviceVec, count: usize, order: Order<'_>, y: &DeviceVec) {
+        let d = rec.gpu().dummy().clone();
+        let drw = rec.gpu().dummy_rw().clone();
+        let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
+        let (xb, jb, yb) = (buf(x), buf(jobs), buf(y));
+        let ntiles = (g.n / 16) as u32;
+        let (ob, blocks, rows, identity) = match order {
+            Order::Jobs => (d.clone(), count, 1, 1),
+            Order::Blocks(o, blocks, rows) => (buf(o), blocks, rows, 0),
+        };
+        let coop = rows > FEW_MAX;
+        let (name, source) = kernel(g.kind, coop, rows);
+        // as many blocks a pass as the grid's third axis takes
+        for first in (0..blocks).step_by(65535) {
+            let these = 65535.min(blocks - first) as u32;
+            let words = [g.n as u32, g.k as u32, g.rw as u32, identity, g.mwords as u32, first as u32];
+            let grid = if coop { (ntiles.div_ceil(8), 1, these) } else { (ntiles.min(65535), ntiles.div_ceil(65535), these) };
+            rec.dispatch_wide(name, source, [&g.words, &xb, &jb, &ob, &d, &d, &yb, &drw], &words, grid);
+        }
+        rec.weigh(2.0 * count as f64 * (g.n * g.k) as f64);
+    }
+
+    /// Record `assign`'s experts for each row of `x` into `out` (see `ChainRecorder::moe_rows`).
+    pub(crate) fn record(&self, rec: &mut crate::chain::Recorder<'_>, x: &DeviceVec, out: &DeviceVec, assign: &[Vec<(usize, f32)>]) {
+        let rows = assign.len();
+        let h = self.hidden;
+        let top_k = assign.first().map_or(0, |a| a.len().saturating_sub(1));
+        assert!(rows > 0 && top_k > 0 && assign.iter().all(|a| a.len() == top_k + 1 && a[top_k].0 == self.routed), "moe: each row's routed experts, then the shared one");
+        assert!(x.len >= rows * h && out.len >= rows * h, "moe: {rows} rows of {h}");
+        // the jobs: gate and up of each (row, expert) on its row of x, then down of each on its hidden row
+        let mut jobs_gu = Vec::with_capacity(4 * rows * top_k);
+        let mut jobs_d = Vec::with_capacity(2 * rows * top_k);
+        let mut w = Vec::with_capacity(rows * (top_k + 1));
+        for (r, a) in assign.iter().enumerate() {
+            for (j, &(e, wt)) in a[..top_k].iter().enumerate() {
+                assert!(e < self.routed, "moe: expert {e} of {}", self.routed);
+                jobs_gu.extend([2 * e as u32, r as u32, 2 * e as u32 + 1, r as u32]);
+                jobs_d.extend([e as u32, (r * top_k + j) as u32]);
+                w.push(wt);
+            }
+            w.push(a[top_k].1);
+        }
+        let b = rec.backend().clone();
+        // a step's one row: the kept scratch (its bind groups kept); else this call's (from the pool, given back when
+        // the recording has run)
+        let st = if rows == 1 && rec.keeps() { self.step(1, top_k) } else { Arc::new(self.scratch(&mut |n| rec.scratch(n), rows, top_k, false)) };
+        let up = |v: &DeviceVec, data: &[u32]| DeviceChain::upload(&b, v, &data.iter().map(|&u| f32::from_bits(u)).collect::<Vec<_>>());
+        up(&st.jobs_gu, &jobs_gu);
+        up(&st.jobs_d, &jobs_d);
+        DeviceChain::upload(&b, &st.w, &w);
+        // a prompt's rows: each expert's in blocks, its weights decoded once a block (16 on the tensor cores)
+        let block = if self.coop { 16 } else { FEW_MAX };
+        let mut order = |jobs: &[u32]| {
+            let o = many_order(jobs, block);
+            let v = rec.scratch(o.len());
+            up(&v, &o);
+            (v, o.len() / block)
+        };
+        let orders = (rows > 1).then(|| (order(&jobs_gu), order(&jobs_d)));
+        let (ogu, od) = match &orders {
+            Some(((g, gn), (d, dn))) => (Order::Blocks(g, *gn, block), Order::Blocks(d, *dn, block)),
+            None => (Order::Jobs, Order::Jobs),
+        };
+        self.run(rec, &st, x, out, rows, ogu, od, None);
+    }
+
+    /// `rows` rows' experts routed on the GPU from the router's `logits` (`[rows, routed + 1]`) and recorded into
+    /// `out` (see `ChainRecorder::moe_routed`), as [`crate::exl3::Exl3MoeGrouped::record_routed`] records EXL3's:
+    /// [`ROUTE`] writes the jobs and weights where [`Self::record`] uploads them. `into`: each row's sum added to its
+    /// streams (the streams, their write weights, how many) where it would be `out`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_routed(&self, rec: &mut crate::chain::Recorder<'_>, x: &DeviceVec, out: &DeviceVec, logits: &DeviceVec, top_k: usize, rows: usize, into: Option<(&DeviceVec, &DeviceVec, usize)>) -> bool {
+        // a prompt's rows (more than a check's) grouped by expert on the GPU, where the tensor cores take its blocks
+        let many = rows > FEW_MAX && self.coop;
+        if self.routed > 1024 || top_k == 0 || top_k > 32.min(self.routed) || rows == 0 || (rows > 64 && !many) || rows > 65535 || logits.len < rows * (self.routed + 1) {
+            return false;
+        }
+        assert!(x.len >= rows * self.hidden && (into.is_some() || out.len >= rows * self.hidden), "moe: {rows} rows of {}", self.hidden);
+        let pairs = rows * top_k;
+        // a check's few rows: an expert the rows share decoded once for them (its jobs one block)
+        let grouped = (2..=FEW_MAX).contains(&rows) && pairs <= 256;
+        // (a prompt's scratch the recording's, each layer's in turn)
+        let st = if rec.keeps() && !many && (rows == 1 || grouped) {
+            self.step(rows, top_k)
+        } else if many {
+            let key = [rows, top_k, self.hidden, self.ff + QUANT];
+            match rec.moe_tmp.take() {
+                Some((k, st)) if k == key => {
+                    rec.moe_tmp = Some((k, Arc::clone(&st)));
+                    st
+                }
+                _ => {
+                    let st = Arc::new(self.scratch(&mut |n| rec.scratch(n), rows, top_k, false));
+                    rec.moe_tmp = Some((key, Arc::clone(&st)));
+                    st
+                }
+            }
+        } else {
+            Arc::new(self.scratch(&mut |n| rec.scratch(n), rows, top_k, grouped))
+        };
+        let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
+        let d = rec.gpu().dummy().clone();
+        let drw = rec.gpu().dummy_rw().clone();
+        rec.dispatch_wide("moe-route", ROUTE, [&buf(logits), &d, &d, &d, &d, &d, &buf(&st.jobs_gu), &buf(&st.w)], &[self.routed as u32, top_k as u32], (rows as u32, 1, 1));
+        rec.dispatch_wide("moe-down-jobs", DOWN_JOBS, [&buf(&st.jobs_gu), &d, &d, &d, &d, &d, &buf(&st.jobs_d), &drw], &[pairs as u32], (1, 1, 1));
+        if many {
+            // blocks of some three times the jobs an expert has on average; the most blocks the experts could fill (a
+            // part-filled one each at most), the grid that wide
+            let bs = moe_rows_for(pairs, self.routed);
+            let blocks = pairs.div_ceil(bs) + self.routed;
+            let (og, od) = (rec.scratch(2 * bs * blocks), rec.scratch(bs * blocks + 3 * self.routed));
+            let words = [pairs as u32, blocks as u32, self.routed as u32, bs as u32];
+            let groups = ((2 * bs * blocks) as u32).div_ceil(256);
+            let jd = buf(&st.jobs_d);
+            rec.dispatch_wide("moe-many-clear", MANY_CLEAR, [&d, &d, &d, &d, &d, &d, &buf(&og), &buf(&od)], &words, (groups.min(65535), groups.div_ceil(65535), 1));
+            rec.dispatch_wide("moe-many-count", MANY_COUNT, [&jd, &d, &d, &d, &d, &d, &drw, &buf(&od)], &words, ((pairs as u32).div_ceil(256), 1, 1));
+            rec.dispatch_wide("moe-many-scan", MANY_SCAN, [&d, &d, &d, &d, &d, &d, &drw, &buf(&od)], &words, (1, 1, 1));
+            rec.dispatch_wide("moe-many-scatter", MANY_SCATTER, [&jd, &d, &d, &d, &d, &d, &buf(&og), &buf(&od)], &words, ((pairs as u32).div_ceil(256), 1, 1));
+            self.run(rec, &st, x, out, rows, Order::Blocks(&og, 2 * blocks, bs), Order::Blocks(&od, blocks, bs), into);
+            return true;
+        }
+        let (ogu, od) = if grouped {
+            rec.dispatch_wide("moe-group", GROUP, [&buf(&st.jobs_d), &d, &d, &d, &d, &d, &buf(&st.order_gu), &buf(&st.order_d)], &[pairs as u32, rows as u32], (1, 1, 1));
+            (Order::Blocks(&st.order_gu, 2 * pairs, rows), Order::Blocks(&st.order_d, pairs, rows))
+        } else {
+            (Order::Jobs, Order::Jobs)
+        };
+        self.run(rec, &st, x, out, rows, ogu, od, into);
+        true
+    }
+
+    /// The experts' work once `st` holds the jobs and weights: gate and up, each pair's SwiGLU, down, the shared
+    /// expert on every row, and each row's weighted sum (into `out`, or added to the streams `into` names).
+    #[allow(clippy::too_many_arguments)]
+    fn run(&self, rec: &mut crate::chain::Recorder<'_>, st: &Step, x: &DeviceVec, out: &DeviceVec, rows: usize, ogu: Order<'_>, od: Order<'_>, into: Option<(&DeviceVec, &DeviceVec, usize)>) {
+        let (h, f, top_k) = (self.hidden, self.ff, st.top_k);
+        let pairs = rows * top_k;
+        let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
+        let d = rec.gpu().dummy().clone();
+        let drw = rec.gpu().dummy_rw().clone();
+        self.group_pass(rec, &self.gu, x, &st.jobs_gu, 2 * pairs, ogu, &st.out_gu);
+        let groups = ((pairs * f) as u32).div_ceil(256);
+        rec.dispatch_wide("quant-moe-swiglu", SWIGLU_PAIRS, [&buf(&st.out_gu), &d, &d, &d, &d, &d, &buf(&st.xh_d), &drw], &[f as u32, pairs as u32], (groups.min(65535), groups.div_ceil(65535).max(1), 1));
+        self.group_pass(rec, &self.down, &st.xh_d, &st.jobs_d, pairs, od, &st.out_d);
+        // the shared expert on every row
+        self.shared[0].rows(rec, x, &st.sg, rows);
+        self.shared[1].rows(rec, x, &st.su, rows);
+        rec.silu_mul(&st.sg, &st.su, &st.part_gu, rows * f);
+        self.shared[2].rows(rec, &st.part_gu, &st.sd, rows);
+        let groups = (((rows * h) as u32).div_ceil(256), 1, 1);
+        match into {
+            Some((xs, post, streams)) => {
+                assert!(xs.len >= rows * streams * h && post.len >= rows * streams, "moe: {rows} rows' {streams} streams");
+                rec.dispatch_wide("moe-wsum-apply", WSUM_APPLY, [&buf(&st.out_d), &buf(&st.sd), &buf(&st.w), &buf(post), &d, &d, &buf(xs), &drw], &[h as u32, top_k as u32, rows as u32, streams as u32], groups);
+            }
+            None => rec.dispatch_wide("moe-wsum-rows", WSUM_ROWS, [&buf(&st.out_d), &buf(&st.sd), &buf(&st.w), &d, &d, &d, &buf(out), &drw], &[h as u32, top_k as u32, rows as u32], groups),
+        }
+    }
+}
+
+impl Experts for QuantMoe {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
+    fn forward(&self, x: &Tensor, logits: &Tensor, top_k: usize) -> Tensor {
+        let h = self.hidden;
+        let x = x.to_host();
+        let logits = logits.to_host();
+        let rows = x.numel() / h;
+        let width = self.routed + 1;
+        let assign: Vec<Vec<(usize, f32)>> = (0..rows).map(|r| route(&logits.data()[r * width..(r + 1) * width], top_k)).collect();
+        let b = &self.b;
+        let (xd, out) = (b.vec(rows * h), b.vec(rows * h));
+        DeviceChain::upload(b, &xd, x.data());
+        let mut rec = b.begin();
+        rec.keep_groups(false);
+        rec.moe_rows(self, &xd, &out, &assign);
+        rec.read(&out);
+        let y = rec.finish().pop().expect("the experts' sum");
+        Tensor::from_vec(y, vec![rows, h])
+    }
+}
+
+impl WgpuBackend {
+    /// A MoE layer's experts as a GGUF holds them: on the GPU as groups ([`QuantMoe`]) where the kernels decode their
+    /// types and the weight budget holds them, else on the host ([`QuantMoeCpu`]).
+    pub fn quant_experts(&self, data: QuantExpertsData) -> Result<Box<dyn Experts>, String> {
+        self.quant_experts_leaving(data, 0)
+    }
+
+    /// As [`Self::quant_experts`], leaving `reserve` bytes of the budget for the model's other matrices (loaded after).
+    pub fn quant_experts_leaving(&self, data: QuantExpertsData, reserve: u64) -> Result<Box<dyn Experts>, String> {
+        data.validate()?;
+        match QuantMoe::try_new(self, data, reserve) {
+            Ok(g) => Ok(Box::new(g)),
+            Err(data) => Ok(Box::new(QuantMoeCpu { data })),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rng(mut seed: u64) -> impl FnMut() -> f32 {
+        move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            ((seed >> 11) as f64 / (1u64 << 53) as f64 * 2. - 1.) as f32
+        }
+    }
+
+    /// `matrices` of `rows` by `cols` in Q2_0: every code at random, each block a scale of its own (some negative).
+    fn random_q2_0(next: &mut impl FnMut() -> f32, matrices: usize, rows: usize, cols: usize) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(matrices * rows * cols / 64 * 18);
+        for _ in 0..matrices * rows * cols / 64 {
+            let d = (0.015 + 0.01 * next()) * if next() > 0.8 { -1.0 } else { 1.0 };
+            bytes.extend(half::f16::from_f32(d).to_bits().to_le_bytes());
+            bytes.extend((0..16).map(|_| ((next() + 1.0) * 127.99) as u8));
+        }
+        bytes
+    }
+
+    /// Experts at random: the routed ones Q2_0; the shared one's values f16's where `half` (as a Q2_0 matrix's are).
+    fn experts(seed: u64, hidden: usize, ff: usize, count: usize, half: bool) -> QuantExpertsData {
+        let mut next = rng(seed);
+        let gate = random_q2_0(&mut next, count, ff, hidden);
+        let up = random_q2_0(&mut next, count, ff, hidden);
+        let down = random_q2_0(&mut next, count, hidden, ff);
+        let mut dense = |n: usize| -> Vec<f32> { (0..n).map(|_| if half { half::f16::from_f32(0.03 * next()).to_f32() } else { 0.03 * next() }).collect() };
+        let shared = [dense(ff * hidden), dense(ff * hidden), dense(hidden * ff)];
+        QuantExpertsData { hidden, ff, experts: count, gate: (GgmlType::Q2_0, gate), up: (GgmlType::Q2_0, up), down: (GgmlType::Q2_0, down), shared }
+    }
+
+    fn copy(d: &QuantExpertsData) -> QuantExpertsData {
+        QuantExpertsData { hidden: d.hidden, ff: d.ff, experts: d.experts, gate: d.gate.clone(), up: d.up.clone(), down: d.down.clone(), shared: d.shared.clone() }
+    }
+
+    /// `rows` rows of inputs and of router logits (no two alike).
+    fn inputs(seed: u64, rows: usize, hidden: usize, count: usize) -> (Vec<f32>, Vec<f32>) {
+        let mut next = rng(seed);
+        ((0..rows * hidden).map(|_| next()).collect(), (0..rows * (count + 1)).map(|_| 3.0 * next()).collect())
+    }
+
+    /// The worst difference between `got` and `want`, over `want`'s RMS.
+    fn worst(got: &[f32], want: &[f32]) -> f64 {
+        assert_eq!(got.len(), want.len());
+        let rms = (want.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / want.len() as f64).sqrt();
+        got.iter().zip(want).map(|(g, w)| (*g as f64 - *w as f64).abs()).fold(0f64, f64::max) / rms.max(1e-30)
+    }
+
+    /// The host's experts are the definition's: each row's top `k` routed experts by logit, softmax-weighted among
+    /// themselves, and the shared one by its gate's sigmoid, each `down(silu(gate x) * up x)`, from every tensor
+    /// dequantised whole and summed in three loops.
+    #[test]
+    fn the_hosts_experts_are_three_plain_loops() {
+        let (hidden, ff, count, top_k, rows) = (256usize, 128usize, 12usize, 3usize, 5usize);
+        let data = experts(11, hidden, ff, count, false);
+        let (x, logits) = inputs(12, rows, hidden, count);
+        let whole = |(t, bytes): &(GgmlType, Vec<u8>), n: usize| {
+            let mut out = vec![0f32; n];
+            ggml_quants::dequantize(*t, bytes, &mut out).unwrap();
+            out
+        };
+        let (g, u, d) = (whole(&data.gate, count * ff * hidden), whole(&data.up, count * ff * hidden), whole(&data.down, count * hidden * ff));
+        let mut want = vec![0f64; rows * hidden];
+        for r in 0..rows {
+            let l = &logits[r * (count + 1)..(r + 1) * (count + 1)];
+            let mut order: Vec<usize> = (0..count).collect();
+            order.sort_by(|&a, &b| l[b].partial_cmp(&l[a]).unwrap().then(a.cmp(&b)));
+            let top = &order[..top_k];
+            let sum: f64 = top.iter().map(|&e| (l[e] as f64).exp()).sum();
+            let mut parts: Vec<(f64, &[f32], &[f32], &[f32])> = top.iter().map(|&e| ((l[e] as f64).exp() / sum, &g[e * ff * hidden..(e + 1) * ff * hidden], &u[e * ff * hidden..(e + 1) * ff * hidden], &d[e * hidden * ff..(e + 1) * hidden * ff])).collect();
+            parts.push((1.0 / (1.0 + (-l[count] as f64).exp()), &data.shared[0], &data.shared[1], &data.shared[2]));
+            for (w, g, u, d) in parts {
+                let act: Vec<f64> = (0..ff)
+                    .map(|j| {
+                        let dot = |m: &[f32]| (0..hidden).map(|c| m[j * hidden + c] as f64 * x[r * hidden + c] as f64).sum::<f64>();
+                        let (a, b) = (dot(g), dot(u));
+                        a / (1.0 + (-a).exp()) * b
+                    })
+                    .collect();
+                for i in 0..hidden {
+                    want[r * hidden + i] += w * (0..ff).map(|j| d[i * ff + j] as f64 * act[j]).sum::<f64>();
+                }
+            }
+        }
+        let want: Vec<f32> = want.iter().map(|v| *v as f32).collect();
+        let host = quant_experts_cpu(data).unwrap();
+        let got = host.forward(&Tensor::from_vec(x, vec![rows, hidden]), &Tensor::from_vec(logits, vec![rows, count + 1]), top_k).to_host();
+        let e = worst(got.data(), &want);
+        eprintln!("the host's experts against three loops: the worst error {e:.2e} of the RMS");
+        assert!(e < 1e-4, "the host's experts: {e}");
+    }
+
+    /// The GPU's experts' sums by each of its ways in: routed on the host (`Experts::forward`, `moe_rows`), routed on
+    /// the GPU (`moe_routed`), and those added to the streams (`moe_routed_into`; four streams, their sums the row's
+    /// weights' times it). None where the device routes no such rows.
+    #[allow(clippy::type_complexity)]
+    fn gpu_sums(b: &WgpuBackend, moe: &dyn Experts, x: &[f32], logits: &[f32], rows: usize, hidden: usize, count: usize, top_k: usize) -> (Vec<f32>, Option<Vec<f32>>, Option<(Vec<f32>, Vec<f32>)>) {
+        let hosted = moe.forward(&Tensor::from_vec(x.to_vec(), vec![rows, hidden]), &Tensor::from_vec(logits.to_vec(), vec![rows, count + 1]), top_k).to_host().data().to_vec();
+        let streams = 4;
+        let (xd, ld, out, xs, post) = (b.vec(rows * hidden), b.vec(rows * (count + 1)), b.vec(rows * hidden), b.vec(rows * streams * hidden), b.vec(rows * streams));
+        DeviceChain::upload(b, &xd, x);
+        DeviceChain::upload(b, &ld, logits);
+        let posts: Vec<f32> = (0..rows * streams).map(|i| 0.25 + (i % 7) as f32 * 0.125).collect();
+        let before: Vec<f32> = (0..rows * streams * hidden).map(|i| (i % 13) as f32 * 0.5 - 3.0).collect();
+        DeviceChain::upload(b, &post, &posts);
+        DeviceChain::upload(b, &xs, &before);
+        let mut rec = b.begin();
+        rec.keep_groups(false);
+        if !rec.moe_routed(moe, &xd, &out, &ld, top_k, rows) {
+            return (hosted, None, None);
+        }
+        rec.read(&out);
+        assert!(rec.moe_routed_into(moe, &xd, &xs, &post, &ld, top_k, rows, streams));
+        rec.read(&xs);
+        let mut read = rec.finish();
+        let after = read.pop().unwrap();
+        let routed = read.pop().unwrap();
+        // what the streams should hold, from the routed sums
+        let want: Vec<f32> = (0..rows * streams * hidden).map(|i| before[i] + posts[i / hidden] * routed[(i / (streams * hidden)) * hidden + i % hidden]).collect();
+        (hosted, Some(routed), Some((after, want)))
+    }
+
+    /// The GPU's Q2_0 experts are the host's: a small layer (hidden 256, 12 experts, 3 a row) and Flash-Next's shape
+    /// (2560 by 640, 24 experts, 10 a row), for a step's one row, a check's three, and a prompt's 40, 70 and 512, routed on
+    /// the host and on the GPU, in f32 and (where the adapter has them) on the tensor cores, whose inputs are f16's.
+    #[test]
+    fn the_gpus_q2_0_experts_are_the_hosts() {
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        for (hidden, ff, count, top_k) in [(256usize, 128usize, 12usize, 3usize), (2560, 640, 24, 10)] {
+            for half in [true, false] {
+                let data = experts(31 + hidden as u64, hidden, ff, count, half);
+                let host = quant_experts_cpu(copy(&data)).unwrap();
+                let mut f32s = QuantMoe::try_new(&b, copy(&data), 0).ok().expect("room for the experts");
+                f32s.coop = false;
+                let cores = QuantMoe::try_new(&b, data, 0).ok().expect("room for the experts");
+                for rows in [1usize, 3, 40, 70, 512] {
+                    let (x, logits) = inputs(7 + rows as u64, rows, hidden, count);
+                    let want = host.forward(&Tensor::from_vec(x.clone(), vec![rows, hidden]), &Tensor::from_vec(logits.clone(), vec![rows, count + 1]), top_k).to_host().data().to_vec();
+                    for (what, moe) in [("f32", &f32s), ("the tensor cores", &cores)] {
+                        if !moe.coop && what != "f32" {
+                            continue;
+                        }
+                        let (hosted, routed, into) = gpu_sums(&b, moe, &x, &logits, rows, hidden, count, top_k);
+                        let e = worst(&hosted, &want);
+                        let mut line = format!("{hidden} by {ff}, {count} experts ({} shared), {rows} rows, {what}: routed on the host {e:.2e}", if half { "an f16" } else { "an f32" });
+                        // f32's sums to their rounding; the tensor cores' inputs are rounded to f16 (a block of 16
+                        // jobs: the host's routing of any rows but a step's one, the GPU's of a prompt's), as the
+                        // shared expert's f16 matmul rounds a prompt's
+                        let shared = half && rows > 8 && coop_on(&b.gpu);
+                        let bound = |cores: bool| if cores || shared { 6e-3 } else { 2e-5 };
+                        assert!(e < bound(moe.coop && rows > 1), "{line}");
+                        if let Some(routed) = routed {
+                            let e = worst(&routed, &want);
+                            line += &format!(", on the GPU {e:.2e}");
+                            assert!(e < bound(moe.coop && rows > FEW_MAX), "{line}");
+                            let (after, expect) = into.unwrap();
+                            let e = worst(&after, &expect);
+                            line += &format!(", into the streams {e:.2e}");
+                            assert!(e < 1e-4, "{line}");
+                        }
+                        eprintln!("{line}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The tensor cores' matmul is the f32 kernel's where the inputs are f16's (a Q2_0 weight is one exactly, so the
+    /// tiles lose nothing): a group's jobs in blocks of 16, 32, 64 and 128 (some places unused, some blocks none)
+    /// against a job each, for the gate and up group and the down one.
+    #[test]
+    fn the_tensor_cores_matmul_is_f32s_on_f16_inputs() {
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        if !coop_on(&b.gpu) {
+            return;
+        }
+        let (hidden, ff, count) = (2560usize, 640usize, 6usize);
+        let moe = QuantMoe::try_new(&b, experts(41, hidden, ff, count, true), 0).ok().expect("room for the experts");
+        let mut next = rng(42);
+        for (g, matrices) in [(&moe.gu, 2 * count), (&moe.down, count)] {
+            // 150 jobs over the group's matrices (unevenly), each on one of 40 input rows
+            let inputs = 40usize;
+            let x: Vec<f32> = (0..inputs * g.k).map(|_| half::f16::from_f32(2.0 * next()).to_f32()).collect();
+            let jobs: Vec<u32> = (0..150u32).flat_map(|j| [(j * j % 7 + j % 3) % matrices as u32, (j * 11) % inputs as u32]).collect();
+            let count = jobs.len() / 2;
+            let (xd, jd) = (b.vec(x.len()), crate::exl3::u32_vec(&b, &jobs));
+            DeviceChain::upload(&b, &xd, &x);
+            let run = |order: Option<(Vec<u32>, usize)>| -> Vec<f32> {
+                let y = b.vec(count * g.n);
+                let mut rec = crate::chain::Recorder::new(&b);
+                rec.keep_groups(false);
+                match &order {
+                    Some((o, rows)) => {
+                        let ov = crate::exl3::u32_vec(&b, o);
+                        moe.group_pass(&mut rec, g, &xd, &jd, count, Order::Blocks(&ov, o.len() / rows, *rows), &y);
+                    }
+                    None => moe.group_pass(&mut rec, g, &xd, &jd, count, Order::Jobs, &y),
+                }
+                rec.read(&y);
+                Box::new(rec).finish().pop().unwrap()
+            };
+            let want = run(None);
+            for rows in [16usize, 32, 64, 128] {
+                let mut order = many_order(&jobs, rows);
+                // (a block of none between the others, as a GPU's grouping leaves them)
+                order.splice(rows..rows, vec![crate::exl3::NONE; rows]);
+                let got = run(Some((order, rows)));
+                let e = worst(&got, &want);
+                eprintln!("[{}, {}], blocks of {rows} on the tensor cores against a job each in f32: the worst error {e:.2e} of the RMS", g.n, g.k);
+                // (the sums of 2,560 products in another order)
+                assert!(e < 1e-4, "blocks of {rows}: {e}");
+            }
+            // and the f32 kernel's blocks of 2 to 8
+            for rows in 2..=FEW_MAX {
+                let got = run(Some((many_order(&jobs, rows), rows)));
+                let e = worst(&got, &want);
+                assert!(e < 2e-6, "[{}, {}], blocks of {rows} in f32: {e}", g.n, g.k);
+            }
+        }
+    }
+
+    /// A step's experts with their bind groups kept are the same sums a second time, and a layer that goes gives its
+    /// bytes back to the budget.
+    #[test]
+    fn a_kept_step_repeats_and_a_layer_gives_its_bytes_back() {
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        let (hidden, ff, count, top_k) = (256usize, 128usize, 12usize, 3usize);
+        let used = b.used.load(Ordering::Relaxed);
+        let data = experts(5, hidden, ff, count, true);
+        let host = quant_experts_cpu(copy(&data)).unwrap();
+        let moe = b.quant_experts(data).unwrap();
+        assert!(DeviceChain::holds_experts(&b, moe.as_ref()) && b.used.load(Ordering::Relaxed) > used, "the experts on the GPU, counted");
+        let (xd, ld, out) = (b.vec(hidden), b.vec(count + 1), b.vec(hidden));
+        for step in 0..3u64 {
+            let (x, logits) = inputs(90 + step, 1, hidden, count);
+            DeviceChain::upload(&b, &xd, &x);
+            DeviceChain::upload(&b, &ld, &logits);
+            let mut rec = b.begin();
+            assert!(rec.moe_routed(moe.as_ref(), &xd, &out, &ld, top_k, 1));
+            rec.read(&out);
+            let got = rec.finish().pop().unwrap();
+            let want = host.forward(&Tensor::from_vec(x, vec![1, hidden]), &Tensor::from_vec(logits, vec![1, count + 1]), top_k).to_host();
+            let e = worst(&got, want.data());
+            assert!(e < 2e-5, "step {step}: {e}");
+        }
+        drop(moe);
+        assert_eq!(b.used.load(Ordering::Relaxed), used, "the layer's bytes given back");
+        // experts of a type the kernels do not decode run on the host
+        let mut other = experts(6, hidden, ff, count, true);
+        let q4 = |n: usize| (ggml_quants::GgmlType::Q4_0, vec![0u8; n / 32 * 18]);
+        (other.gate, other.up, other.down) = (q4(count * ff * hidden), q4(count * ff * hidden), q4(count * hidden * ff));
+        let hosted = b.quant_experts(other).unwrap();
+        assert!(!DeviceChain::holds_experts(&b, hosted.as_ref()), "Q4_0 experts are the host's");
+    }
+
+    /// The experts' kernels' time (`--ignored --nocapture`): Flash-Next's layer (512 experts of 2560 by 640 in Q2_0,
+    /// 10 a row), a prompt's 512 rows in f32 and on the tensor cores, routed on the host and on the GPU, and a step's
+    /// one row.
+    #[test]
+    #[ignore = "a measurement"]
+    fn measure_q2_0_experts() {
+        let Ok(b) = WgpuBackend::new(Some(3 << 30)) else { return };
+        let (hidden, ff, count, top_k) = (2560usize, 640usize, 512usize, 10usize);
+        let data = experts(77, hidden, ff, count, true);
+        let mut f32s = QuantMoe::try_new(&b, copy(&data), 0).ok().expect("room for the experts");
+        f32s.coop = false;
+        let cores = QuantMoe::try_new(&b, data, 0).ok().expect("room for the experts");
+        for rows in [512usize, 1] {
+            let (x, logits) = inputs(3, rows, hidden, count);
+            let assign: Vec<Vec<(usize, f32)>> = (0..rows).map(|r| route(&logits[r * (count + 1)..(r + 1) * (count + 1)], top_k)).collect();
+            let (xd, ld, out) = (b.vec(rows * hidden), b.vec(rows * (count + 1)), b.vec(rows * hidden));
+            DeviceChain::upload(&b, &xd, &x);
+            DeviceChain::upload(&b, &ld, &logits);
+            for (what, moe) in [("f32", &f32s), ("the tensor cores", &cores)] {
+                if what != "f32" && (!moe.coop || rows == 1) {
+                    continue;
+                }
+                for device in [false, true] {
+                    let reps = if rows == 1 { 200 } else { 8 };
+                    let run = || {
+                        let mut rec = b.begin();
+                        rec.keep_groups(rows == 1);
+                        for _ in 0..reps {
+                            if device {
+                                if !rec.moe_routed(moe, &xd, &out, &ld, top_k, rows) {
+                                    return false;
+                                }
+                            } else {
+                                rec.moe_rows(moe, &xd, &out, &assign);
+                            }
+                        }
+                        rec.read_range(&out, 0, 1);
+                        rec.finish();
+                        true
+                    };
+                    if !run() {
+                        eprintln!("{rows} rows, {what}, routed on the GPU: not this device's");
+                        continue;
+                    }
+                    let t = std::time::Instant::now();
+                    for _ in 0..3 {
+                        run();
+                    }
+                    let each = t.elapsed().as_secs_f64() / 3.0 / reps as f64;
+                    let flops = 2.0 * (rows * top_k) as f64 * (3 * hidden * ff) as f64;
+                    eprintln!("{rows} rows of {top_k} of {count} experts, {what}, routed on the {}: {:.3} ms a layer ({:.1} TFLOPS)", if device { "GPU" } else { "host" }, each * 1e3, flops / each / 1e12);
+                }
+            }
+        }
+    }
+}

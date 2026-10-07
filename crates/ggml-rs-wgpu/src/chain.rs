@@ -4459,7 +4459,8 @@ impl DeviceChain for WgpuBackend {
     }
 
     fn holds_experts(&self, e: &dyn ggml_rs::exl3::Experts) -> bool {
-        e.as_any().and_then(|a| a.downcast_ref::<crate::exl3::Exl3MoeGrouped>()).is_some_and(|g| g.is_on(&self.gpu))
+        // (EXL3's groups, or a GGUF's quant blocks)
+        e.as_any().is_some_and(|a| a.downcast_ref::<crate::exl3::Exl3MoeGrouped>().is_some_and(|g| g.is_on(&self.gpu)) || a.downcast_ref::<crate::quant_moe::QuantMoe>().is_some_and(|g| g.is_on(&self.gpu)))
     }
 
     fn holds(&self, w: &QuantizedTensor) -> bool {
@@ -5700,20 +5701,29 @@ impl ChainRecorder for Recorder<'_> {
     }
 
     fn moe_rows(&mut self, experts: &dyn ggml_rs::exl3::Experts, x: &DeviceVec, out: &DeviceVec, assign: &[Vec<(usize, f32)>]) {
+        if let Some(q) = experts.as_any().and_then(|a| a.downcast_ref::<crate::quant_moe::QuantMoe>()) {
+            return q.record(self, x, out, assign);
+        }
         let g = experts.as_any().and_then(|a| a.downcast_ref::<crate::exl3::Exl3MoeGrouped>()).expect("experts this adapter holds as groups");
         g.record(self, x, out, assign);
     }
 
     fn moe_routed(&mut self, experts: &dyn ggml_rs::exl3::Experts, x: &DeviceVec, out: &DeviceVec, logits: &DeviceVec, top_k: usize, rows: usize) -> bool {
+        if let Some(q) = experts.as_any().and_then(|a| a.downcast_ref::<crate::quant_moe::QuantMoe>()) {
+            return q.record_routed(self, x, out, logits, top_k, rows, None);
+        }
         let Some(g) = experts.as_any().and_then(|a| a.downcast_ref::<crate::exl3::Exl3MoeGrouped>()) else { return false };
         g.record_routed(self, x, out, logits, top_k, rows, None)
     }
 
     fn moe_routed_into(&mut self, experts: &dyn ggml_rs::exl3::Experts, x: &DeviceVec, streams_x: &DeviceVec, post: &DeviceVec, logits: &DeviceVec, top_k: usize, rows: usize, streams: usize) -> bool {
-        let Some(g) = experts.as_any().and_then(|a| a.downcast_ref::<crate::exl3::Exl3MoeGrouped>()) else { return false };
         // no vector for the sums: they go into the streams
         let none = self.gpu().dummy_rw().clone();
         let out = DeviceVec { len: 0, inner: Arc::new(none) };
+        if let Some(q) = experts.as_any().and_then(|a| a.downcast_ref::<crate::quant_moe::QuantMoe>()) {
+            return q.record_routed(self, x, &out, logits, top_k, rows, Some((streams_x, post, streams)));
+        }
+        let Some(g) = experts.as_any().and_then(|a| a.downcast_ref::<crate::exl3::Exl3MoeGrouped>()) else { return false };
         g.record_routed(self, x, &out, logits, top_k, rows, Some((streams_x, post, streams)))
     }
 

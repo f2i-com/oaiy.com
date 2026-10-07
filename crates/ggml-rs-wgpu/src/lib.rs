@@ -18,6 +18,7 @@ pub mod chain;
 pub mod dense;
 pub mod exl3;
 pub mod quant_linear;
+pub mod quant_moe;
 pub mod shaders;
 
 /// Where a GGUF model's time goes on this backend: counters any thread adds to and a timing test reads and resets.
