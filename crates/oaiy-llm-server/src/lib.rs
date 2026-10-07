@@ -364,6 +364,9 @@ pub fn start_listening(mut o: Options, listening: impl FnOnce(SocketAddr)) -> oa
     };
     let listener = TcpListener::bind((o.host.as_str(), o.port))?;
     let addr = listener.local_addr()?;
+    // A loopback address's other family too, where it is free: a client that asks for "localhost" and is given ::1
+    // first waits some 2 s on Windows for that to fail before every connection to 127.0.0.1 (and the other way).
+    let other = other_loopback(addr).and_then(|a| TcpListener::bind(a).ok());
     listening(addr);
 
     // VENDORED-LOCAL: the configured models, loaded one at a time.
@@ -423,9 +426,9 @@ pub fn start_listening(mut o: Options, listening: impl FnOnce(SocketAddr)) -> oa
     log(format!("serving {default_name} at http://{addr}/v1"));
     let activity = Arc::new(Activity { active: AtomicUsize::new(0), last: AtomicU64::new(0), epoch: Instant::now() });
     let requests = Arc::clone(&activity);
-    let accept = std::thread::Builder::new()
-        .name("accept".into())
-        .spawn(move || {
+    let accepting = move |listener: TcpListener| {
+        let (server, requests) = (Arc::clone(&server), Arc::clone(&requests));
+        move || {
             for conn in listener.incoming() {
                 let Ok(stream) = conn else { continue };
                 let server = Arc::clone(&server);
@@ -449,9 +452,33 @@ pub fn start_listening(mut o: Options, listening: impl FnOnce(SocketAddr)) -> oa
                     });
                 });
             }
-        })
-        .map_err(oaiy_engine::Error::Io)?;
+        }
+    };
+    if let Some(other) = other {
+        // (its thread the process's: nothing waits for it)
+        let _ = std::thread::Builder::new().name("accept-other-loopback".into()).spawn(accepting(other));
+    }
+    let accept = std::thread::Builder::new().name("accept".into()).spawn(accepting(listener)).map_err(oaiy_engine::Error::Io)?;
     Ok(Running { addr, accept, activity, images })
+}
+
+/// The other family's loopback address for one of them, at the same port (::1 for 127.0.0.1 and the other way); none
+/// for an address that is not the loopback's own.
+fn other_loopback(addr: SocketAddr) -> Option<SocketAddr> {
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) if ip == std::net::Ipv4Addr::LOCALHOST => Some(SocketAddr::new(std::net::Ipv6Addr::LOCALHOST.into(), addr.port())),
+        std::net::IpAddr::V6(ip) if ip == std::net::Ipv6Addr::LOCALHOST => Some(SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), addr.port())),
+        _ => None,
+    }
+}
+#[test]
+fn a_loopback_address_has_the_other_familys() {
+    let at = |s: &str| s.parse::<SocketAddr>().unwrap();
+    assert_eq!(other_loopback(at("127.0.0.1:8080")), Some(at("[::1]:8080")));
+    assert_eq!(other_loopback(at("[::1]:9")), Some(at("127.0.0.1:9")));
+    assert_eq!(other_loopback(at("0.0.0.0:8080")), None);
+    assert_eq!(other_loopback(at("192.168.1.4:8080")), None);
+    assert_eq!(other_loopback(at("127.0.0.2:8080")), None);
 }
 
 fn host_cache_budget(requested_gib: usize, available: Option<u64>) -> u64 {

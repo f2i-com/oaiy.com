@@ -1220,6 +1220,8 @@ mod tests {
         for file in ["transformer.safetensors","text.safetensors","vae.safetensors","tokenizer.json","style.safetensors"] { std::fs::write(root.join(file),b"fixture").unwrap(); }
         std::fs::write(root.join("image.json"),br#"{"default_model":"klein","models":{"klein":{"architecture":"flux2-klein-4b","transformer":"transformer.safetensors","text_encoder":"text.safetensors","vae":"vae.safetensors","tokenizer":"tokenizer.json","loras":[{"path":"style.safetensors","strength":0.75}]}}}"#).unwrap();
         cfg.media_dir=Some(root.clone());
+        // (its batches' directories its own: the default root is another test's to remove)
+        cfg.output_root=root.join("output");
         let request=prepare(&cfg,&Json::parse(br#"{"model":"klein","prompt":"fox","transformer":"untrusted","device":99}"#).unwrap()).unwrap();
         assert_eq!(request.get("architecture").and_then(Json::as_str),Some("flux2-klein-4b"));
         assert_eq!(request.get("transformer").and_then(Json::as_str),root.join("transformer.safetensors").to_str());
