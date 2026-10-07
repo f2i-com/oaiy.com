@@ -943,10 +943,19 @@ impl Models {
         let gpus: Vec<&ggml_rs_wgpu::WgpuBackend> = wgpu.into_iter().chain(others.iter().map(|g| g.as_ref())).collect();
         let backends: Vec<Arc<dyn ggml_rs::Backend>> =
             std::iter::once(Arc::clone(&picked.backend)).chain(others.iter().map(|g| Arc::clone(g) as Arc<dyn ggml_rs::Backend>)).collect();
-        let model = flashnext_gguf_on(path, &gpus, backends)?;
+        // (its draft layer: the GGUFs carry none, so from the same model's EXL3 checkpoint where one is named)
+        let drafting = o.mtp.contains(&spec.name);
+        let mtp_from = o.mtp_from.get(&spec.name).filter(|_| drafting);
+        if drafting && mtp_from.is_none() {
+            self.say(format!("{}: its GGUF has no MTP layer; name the model's EXL3 checkpoint with --mtp-from {}=DIR for it to draft", spec.name, spec.name));
+        }
+        let model = flashnext_gguf_on(path, &gpus, backends, mtp_from.map(|p| p.as_path()))?;
         let warm = std::time::Instant::now();
         if model.warm_up() {
-            self.say(format!("{}: its chained steps ready in {:.1} s", spec.name, warm.elapsed().as_secs_f64()));
+            self.say(format!("{}: its chained steps ready in {:.1} s{}", spec.name, warm.elapsed().as_secs_f64(), if model.drafts() { ", drafting with its MTP layer" } else { "" }));
+        }
+        if mtp_from.is_some() && !model.drafts() {
+            self.say(format!("{}: its MTP layer is not all on a GPU, so it does not draft", spec.name));
         }
         for (d, g) in gpus.iter().enumerate() {
             let (used, budget) = g.usage();
@@ -1328,7 +1337,7 @@ fn gpu_selection_adapts_to_single_device() {
 /// and each matrix of floats a chain reads packed on its layer's device, a layer's experts there while the device's
 /// budget holds them beside its share of the dense matrices, else on the host.
 #[cfg(feature = "webgpu")]
-pub(crate) fn flashnext_gguf_on(path: &Path, gpus: &[&ggml_rs_wgpu::WgpuBackend], backends: Vec<Arc<dyn ggml_rs::Backend>>) -> Result<crate::flashnext::FlashNext> {
+pub(crate) fn flashnext_gguf_on(path: &Path, gpus: &[&ggml_rs_wgpu::WgpuBackend], backends: Vec<Arc<dyn ggml_rs::Backend>>, mtp_from: Option<&Path>) -> Result<crate::flashnext::FlashNext> {
     use crate::flashnext::gguf_file::{dense_bytes, load, ExpertBlocks};
     let on = |device: usize| gpus.get(device).copied().ok_or_else(|| "no GPU to hold it".to_string());
     let quant = |device: usize, w: ggml_rs::QuantizedTensor| on(device)?.quant_linear(w);
@@ -1342,7 +1351,28 @@ pub(crate) fn flashnext_gguf_on(path: &Path, gpus: &[&ggml_rs_wgpu::WgpuBackend]
         }
         .map_err(Error::Arg)
     };
-    load(path, backends, &quant, &float, &experts)
+    let mut model = load(path, backends, &quant, &float, &experts)?;
+    // its multi-token-prediction layer, an EXL3 checkpoint's (`mtp_from`): on the last device, as that loader puts it
+    if let Some(exl3) = mtp_from {
+        type Make<'a> = Box<dyn Fn(ggml_rs::exl3::Exl3Data) -> std::result::Result<Arc<dyn ggml_rs::exl3::PackedLinear>, String> + Send + Sync + 'a>;
+        let packed = |device: usize| -> Make<'_> {
+            match gpus.get(device).copied() {
+                Some(b) => Box::new(move |d| b.exl3(d)),
+                None => Box::new(ggml_rs_wgpu::exl3::exl3_cpu),
+            }
+        };
+        let layer = |device: usize, _layer: &str, list: Vec<[ggml_rs::exl3::Exl3Data; 3]>| -> Result<Box<dyn ggml_rs::exl3::Experts>> {
+            match gpus.get(device) {
+                Some(b) => b.exl3_experts(list),
+                None => ggml_rs_wgpu::exl3::exl3_experts_cpu(list),
+            }
+            .map_err(Error::Arg)
+        };
+        if !model.attach_mtp(exl3, &packed, &layer)? {
+            return Err(Error::Arg(format!("{} has no MTP layer", exl3.display())));
+        }
+    }
+    Ok(model)
 }
 
 #[cfg(all(test, feature = "webgpu", not(feature = "cuda")))]
@@ -1444,7 +1474,7 @@ mod dense_webgpu_timing {
         let gpus: Vec<&ggml_rs_wgpu::WgpuBackend> = std::iter::once(b0.as_ref()).chain(others.iter().map(|g| g.as_ref())).collect();
         let backends: Vec<Arc<dyn ggml_rs::Backend>> = std::iter::once(Arc::clone(&b0) as Arc<dyn ggml_rs::Backend>).chain(others.iter().map(|g| Arc::clone(g) as Arc<dyn ggml_rs::Backend>)).collect();
         let clock = std::time::Instant::now();
-        let model = super::flashnext_gguf_on(std::path::Path::new(&path), &gpus, backends).unwrap();
+        let model = super::flashnext_gguf_on(std::path::Path::new(&path), &gpus, backends, None).unwrap();
         eprintln!("loaded in {:.1} s over {} GPUs: {}", clock.elapsed().as_secs_f64(), gpus.len(), gpus.iter().map(|g| format!("{:.1} GB", g.usage().0 as f64 / 1e9)).collect::<Vec<_>>().join(", "));
         let steps: usize = std::env::var("FLASHNEXT_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(48);
         let text = "<|im_start|>user\nWrite a short story about a cat called Moss who lives on a boat.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
@@ -2272,7 +2302,7 @@ mod dense_webgpu_timing {
         let p = std::path::Path::new(&path);
         // (FLASHNEXT_GGUF: the model from that GGUF's first shard, where the EXL3 checkpoint's)
         let model = match std::env::var("FLASHNEXT_GGUF") {
-            Ok(g) => super::flashnext_gguf_on(std::path::Path::new(&g), &gpus, backends).unwrap(),
+            Ok(g) => super::flashnext_gguf_on(std::path::Path::new(&g), &gpus, backends, None).unwrap(),
             Err(_) => {
                 let reserve = crate::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
                 let experts = |device: usize, _layer: &str, list: Vec<[ggml_rs::exl3::Exl3Data; 3]>| -> oaiy_engine::Result<Box<dyn ggml_rs::exl3::Experts>> {

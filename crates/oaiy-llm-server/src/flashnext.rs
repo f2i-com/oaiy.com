@@ -669,6 +669,49 @@ fn expert_lora(lora: &[Adapter], m: &str, cfg: &Config, which: usize) -> Result<
     Ok(Some((slot_of, a_all, b_all, rank)))
 }
 
+/// The multi-token-prediction layer of the EXL3 checkpoint `idx` indexes (its `mtp.*`: an attention block and a MoE
+/// block behind their hyper-connections, the projections either side), on `device` as `last` makes its matrices and
+/// `make_experts` its experts: None where the checkpoint has none.
+fn mtp_layer(idx: &StIndex, cfg: &Config, last: &Loader<'_>, device: usize, make_experts: ExpertMaker<'_>) -> Result<Option<FnMtp>> {
+    if idx.get("mtp.fc_embedding.trellis").is_none() {
+        return Ok(None);
+    }
+    let (h, width) = (cfg.hidden, cfg.streams * cfg.hidden);
+    let (a, m) = ("mtp.layers.0.self_attn", "mtp.layers.0.mlp");
+    let names: Vec<String> = (0..cfg.experts).map(|e| format!("{m}.experts.{e}")).chain([format!("{m}.shared_expert")]).collect();
+    let read = |p: &String| -> Result<[Exl3Data; 3]> {
+        Ok([
+            exl3_data(idx, &format!("{p}.gate_proj"), h, cfg.moe_ff, None, None)?,
+            exl3_data(idx, &format!("{p}.up_proj"), h, cfg.moe_ff, None, None)?,
+            exl3_data(idx, &format!("{p}.down_proj"), cfg.moe_ff, h, None, None)?,
+        ])
+    };
+    let per = names.len().div_ceil(16);
+    let experts: Vec<[Exl3Data; 3]> = std::thread::scope(|scope| {
+        let parts: Vec<_> = names.chunks(per).map(|part| scope.spawn(|| part.iter().map(read).collect::<Result<Vec<_>>>())).collect();
+        parts.into_iter().map(|t| t.join().expect("expert reader")).collect::<Result<Vec<Vec<_>>>>()
+    })?.into_iter().flatten().collect();
+    let mut router = last.host(&format!("{m}.gate.weight"), cfg.experts * h, false, None)?;
+    router.extend(last.host(&format!("{m}.shared_expert_gate.weight"), h, false, None)?);
+    Ok(Some(FnMtp {
+        enorm: last.tensor("mtp.pre_fc_norm_embedding.weight", &[h], true, None)?,
+        hnorm: last.tensor("mtp.pre_fc_norm_hidden.weight", &[width], true, None)?,
+        fc_e: last.weight("mtp.fc_embedding", h, h, None, None)?,
+        fc_h: last.weight("mtp.fc_hidden", h, h, None, None)?,
+        attn_hc: last.hyper("mtp.layers.0.attn_hyper_connection", cfg, true)?,
+        mlp_hc: last.hyper("mtp.layers.0.mlp_hyper_connection", cfg, true)?,
+        mixer: last.hyper("mtp.hyper_connection_mixer", cfg, false)?,
+        q: last.weight(&format!("{a}.q_proj"), h, 2 * cfg.heads * cfg.head_dim, None, None)?,
+        k: last.weight(&format!("{a}.k_proj"), h, cfg.kv_heads * cfg.head_dim, None, None)?,
+        v: last.weight(&format!("{a}.v_proj"), h, cfg.kv_heads * cfg.head_dim, None, None)?,
+        o: last.weight(&format!("{a}.o_proj"), cfg.heads * cfg.head_dim, h, None, None)?,
+        q_norm: last.tensor(&format!("{a}.q_norm.weight"), &[cfg.head_dim], true, None)?,
+        k_norm: last.tensor(&format!("{a}.k_norm.weight"), &[cfg.head_dim], true, None)?,
+        router: Tensor::from_vec(router, vec![cfg.experts + 1, h]),
+        experts: make_experts(device, m, experts)?,
+    }))
+}
+
 /// Load the model, its layers split evenly over `devices` (in order).
 #[cfg(all(test, feature = "cuda"))]
 pub fn load(path: &Path, devices: &[usize]) -> Result<FlashNext> {
@@ -891,44 +934,7 @@ fn build(path: &Path, backends: Vec<Arc<dyn Backend>>, cudas: Vec<Arc<Card>>, lo
     let collapse = last.hyper(&format!("{p}.hyper_connection_mixer"), &cfg, false)?;
     let head = last.weight("lm_head", h, cfg.vocab, None, None)?;
     // The multi-token-prediction layer, where asked for and the checkpoint has one: on the last device, with the head.
-    let mtp = match (mtp, idx.get("mtp.fc_embedding.trellis")) {
-        (true, Some(_)) => {
-            let (a, m) = ("mtp.layers.0.self_attn", "mtp.layers.0.mlp");
-            let names: Vec<String> = (0..cfg.experts).map(|e| format!("{m}.experts.{e}")).chain([format!("{m}.shared_expert")]).collect();
-            let read = |p: &String| -> Result<[Exl3Data; 3]> {
-                Ok([
-                    exl3_data(&idx, &format!("{p}.gate_proj"), h, cfg.moe_ff, None, None)?,
-                    exl3_data(&idx, &format!("{p}.up_proj"), h, cfg.moe_ff, None, None)?,
-                    exl3_data(&idx, &format!("{p}.down_proj"), cfg.moe_ff, h, None, None)?,
-                ])
-            };
-            let per = names.len().div_ceil(16);
-            let experts: Vec<[Exl3Data; 3]> = std::thread::scope(|scope| {
-                let parts: Vec<_> = names.chunks(per).map(|part| scope.spawn(|| part.iter().map(read).collect::<Result<Vec<_>>>())).collect();
-                parts.into_iter().map(|t| t.join().expect("expert reader")).collect::<Result<Vec<Vec<_>>>>()
-            })?.into_iter().flatten().collect();
-            let mut router = last.host(&format!("{m}.gate.weight"), cfg.experts * h, false, None)?;
-            router.extend(last.host(&format!("{m}.shared_expert_gate.weight"), h, false, None)?);
-            Some(FnMtp {
-                enorm: last.tensor("mtp.pre_fc_norm_embedding.weight", &[h], true, None)?,
-                hnorm: last.tensor("mtp.pre_fc_norm_hidden.weight", &[width], true, None)?,
-                fc_e: last.weight("mtp.fc_embedding", h, h, None, None)?,
-                fc_h: last.weight("mtp.fc_hidden", h, h, None, None)?,
-                attn_hc: last.hyper("mtp.layers.0.attn_hyper_connection", &cfg, true)?,
-                mlp_hc: last.hyper("mtp.layers.0.mlp_hyper_connection", &cfg, true)?,
-                mixer: last.hyper("mtp.hyper_connection_mixer", &cfg, false)?,
-                q: last.weight(&format!("{a}.q_proj"), h, 2 * cfg.heads * cfg.head_dim, None, None)?,
-                k: last.weight(&format!("{a}.k_proj"), h, cfg.kv_heads * cfg.head_dim, None, None)?,
-                v: last.weight(&format!("{a}.v_proj"), h, cfg.kv_heads * cfg.head_dim, None, None)?,
-                o: last.weight(&format!("{a}.o_proj"), cfg.heads * cfg.head_dim, h, None, None)?,
-                q_norm: last.tensor(&format!("{a}.q_norm.weight"), &[cfg.head_dim], true, None)?,
-                k_norm: last.tensor(&format!("{a}.k_norm.weight"), &[cfg.head_dim], true, None)?,
-                router: Tensor::from_vec(router, vec![cfg.experts + 1, h]),
-                experts: make_experts(backends.len() - 1, m, experts)?,
-            })
-        }
-        _ => None,
-    };
+    let mtp = if mtp { mtp_layer(&idx, &cfg, &last, backends.len() - 1, make_experts)? } else { None };
     // Every target of every adapter found its matrix.
     for adapter in lora { adapter.finish()?; }
     let file = File::open(idx.shard_path(embed.shard))?;
@@ -949,6 +955,28 @@ fn build(path: &Path, backends: Vec<Arc<dyn Backend>>, cudas: Vec<Arc<Card>>, lo
 }
 
 impl FlashNext {
+    /// Give the model the multi-token-prediction layer of the EXL3 checkpoint at `exl3` (the same model's: a GGUF
+    /// carries none, and Strata takes it from the original checkpoint likewise), on the last device with the head, its
+    /// matrices what `packed` makes and its experts what `make_experts` does. Before its first chained step. False
+    /// where the checkpoint has no such layer.
+    pub(crate) fn attach_mtp(&mut self, exl3: &Path, packed: Packer<'_>, make_experts: ExpertMaker<'_>) -> Result<bool> {
+        if !detect(exl3) {
+            return Err(bad(format!("{} is not a Qwen3.8-Flash-Next EXL3 checkpoint", exl3.display())));
+        }
+        let theirs = Config::read(exl3)?;
+        if format!("{theirs:?}") != format!("{:?}", self.config) {
+            return Err(bad(format!("{} is another model's checkpoint: its MTP layer is not this one's", exl3.display())));
+        }
+        if self.chain.get().is_some() {
+            return Err(bad("an MTP layer is attached before the model's first step"));
+        }
+        let idx = StIndex::open(exl3)?;
+        let device = self.devices.len() - 1;
+        let last = Loader { idx: &idx, backend: self.devices[device].clone(), card: self.cudas.get(device).cloned(), lora: &[], packed: packed(device) };
+        self.mtp = mtp_layer(&idx, &self.config, &last, device, make_experts)?;
+        Ok(self.mtp.is_some())
+    }
+
     /// A cache for one sequence: attention K/V on each layer's device, the n-gram slot, then
     /// each attention layer's raw indexer keys.
     pub fn new_kv_cache(&self, max_len: usize) -> KvCache {

@@ -83,6 +83,8 @@ const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|
   --mtp NAME           NAME (a Qwen3.5 GGUF with a multi-token-prediction layer, or
                        Qwen3.8-Flash-Next, on WebGPU) drafts tokens with that layer
                        and checks them in one run; repeat for more models
+  --mtp-from NAME=DIR  where NAME takes that layer from when its own file has none: a
+                       Qwen3.8-Flash-Next GGUF's from the same model's EXL3 checkpoint
   --no-vision          skip the vision tower (images are refused)
   --local-images on|off  let requests name image files on this machine (paths,
                        file:// URLs); default on when listening on loopback only
@@ -184,6 +186,11 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Options, Stri
             }
             "--mtp" => {
                 a.mtp.insert(val()?);
+            }
+            "--mtp-from" => {
+                let value = val()?;
+                let (name, path) = value.split_once('=').filter(|(n, p)| !n.is_empty() && !p.is_empty()).ok_or("--mtp-from wants NAME=DIR")?;
+                a.mtp_from.insert(name.into(), path.into());
             }
             "--vision-projector" => {
                 let value=val()?;

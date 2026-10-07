@@ -124,6 +124,9 @@ pub struct Options {
     /// Models (by name) that draft tokens with their multi-token-prediction layer, checking them in one run (a
     /// Qwen3.5 GGUF with one, chained on WebGPU).
     pub mtp: std::collections::BTreeSet<String>,
+    /// Where a drafting model (by name) takes its multi-token-prediction layer from when its own file has none: a
+    /// Qwen3.8-Flash-Next GGUF's from the same model's EXL3 checkpoint (a directory).
+    pub mtp_from: std::collections::BTreeMap<String, PathBuf>,
     /// LoRA adapters per Orca or Flash-Next model alias (PEFT folders; for Flash-Next also
     /// llama.cpp GGUF LoRAs), applied together in order, each with its own strength when it
     /// was given one.
@@ -251,6 +254,7 @@ impl Default for Options {
             vision_projectors: std::collections::BTreeMap::new(),
             model_devices: std::collections::BTreeMap::new(),
             mtp: std::collections::BTreeSet::new(),
+            mtp_from: std::collections::BTreeMap::new(),
             lora_adapters: std::collections::BTreeMap::new(),
             lora_strengths: std::collections::BTreeMap::new(),
             start_model: None,
