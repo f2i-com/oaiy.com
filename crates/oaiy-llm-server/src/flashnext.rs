@@ -1885,6 +1885,35 @@ impl FlashNext {
             });
             let mut pending: Option<ChainedRun<'_>> = None;
             let mut last = None;
+            // Over two devices each chunk in two parts, its first device's as that device still runs the chunk
+            // before's (OAIY_FN_IN_TURN: a chunk whole at a time): where the n-gram layer is chained, the experts
+            // routed on their GPU, the layers one device's then the other's, and each device has room for another
+            // chunk's vectors.
+            let ahead = std::env::var_os("OAIY_FN_IN_TURN").is_none()
+                && self.devices.len() == 2
+                && self.chain_state().is_some_and(|st| st.ple.is_some())
+                && self.config.experts <= 1024
+                && self.config.top_k <= 32
+                && std::env::var_os("OAIY_HOST_ROUTE").is_none()
+                && self.layers.windows(2).filter(|w| w[0].device != w[1].device).count() == 1
+                && self.devices.iter().all(|b| b.chain().is_some_and(|c| c.has_room(1 << 30)));
+            let mut parked: Option<(usize, Box<Parked<'_>>)> = None;
+            // Each device then has a chunk's work behind the one it runs, with no gap: its pieces two at a time on its
+            // queue, each encoded at its turn, until the chunks are in. Without that a card under a power limit ran a
+            // tenth as fast for seconds at a time (15,037 tokens in 6.6 to 13.3 s where 5.3; the chunks whole, with
+            // their gaps, 5.9 to 7.7).
+            struct Fed<'a>(Vec<&'a dyn ggml_rs::DeviceChain>);
+            impl Drop for Fed<'_> {
+                fn drop(&mut self) {
+                    for c in &self.0 {
+                        c.pieces_in_flight_at_most(0);
+                    }
+                }
+            }
+            let fed = Fed(if ahead { self.devices.iter().filter_map(|b| b.chain()).collect() } else { Vec::new() });
+            for c in &fed.0 {
+                c.pieces_in_flight_at_most(2);
+            }
             let said = std::env::var_os("OAIY_FN_LOG").is_some();
             let began = std::time::Instant::now();
             for (i, (tokens, embeds)) in chunks.iter().enumerate() {
@@ -1892,7 +1921,38 @@ impl FlashNext {
                 let ple = rx.recv().ok().flatten();
                 let t1 = began.elapsed().as_secs_f64() * 1e3;
                 let had = pending.is_some();
-                let run = if tokens.len() <= 512 && !profile::on() && ple.is_some() { self.run_begin(tokens, embeds, kv, false, &mut pending, ple) } else { None };
+                let fits = tokens.len() <= 512 && !profile::on() && ple.is_some();
+                // (the chunk before's rest goes after this chunk's first part, or before a chunk that goes whole)
+                if ahead && fits && tokens.len() > CHECK_ROWS {
+                    match self.run_part(tokens, embeds, kv, false, &mut pending, ple, Stage::First) {
+                        Some(Went::Parked(p)) => {
+                            let mut before = parked.replace((i, p));
+                            self.run_rest(&mut before, &mut pending, embeds, kv, done);
+                            if said {
+                                eprintln!("  fn chunk {i}: at {t0:.0} ms, features waited {:.0}, its first part and the chunk before's rest in {:.0}", t1 - t0, began.elapsed().as_secs_f64() * 1e3 - t1);
+                            }
+                            continue;
+                        }
+                        Some(Went::Run(run)) => {
+                            // (no second device's part after all: as a chunk whole)
+                            self.run_rest(&mut parked, &mut pending, embeds, kv, done);
+                            if let Some(p) = pending.replace(run) {
+                                p.finish(self, kv);
+                            }
+                            done(i);
+                            continue;
+                        }
+                        None => {
+                            self.run_rest(&mut parked, &mut pending, embeds, kv, done);
+                            if let Some(p) = pending.take() {
+                                p.finish(self, kv);
+                            }
+                            return None;
+                        }
+                    }
+                }
+                self.run_rest(&mut parked, &mut pending, embeds, kv, done);
+                let run = if fits { self.run_begin(tokens, embeds, kv, false, &mut pending, ple) } else { None };
                 if said {
                     eprintln!("  fn chunk {i}: at {t0:.0} ms, features waited {:.0}, begun in {:.0} (the one before {})", t1 - t0, began.elapsed().as_secs_f64() * 1e3 - t1, if had && pending.is_none() { "finished inside" } else { "left" });
                 }
@@ -1908,11 +1968,26 @@ impl FlashNext {
                 }
                 done(i);
             }
+            if let Some(&(_, embeds)) = chunks.last() {
+                self.run_rest(&mut parked, &mut pending, embeds, kv, done);
+            }
             if let Some(p) = pending.take() {
                 last = Some(p.finish(self, kv));
             }
             last.map(|l| Tensor::from_vec(l, vec![1, self.config.vocab]))
         })
+    }
+
+    /// A parked chunk's rest ([`Stage::Rest`]; `embeds` any chunk's, not read): its second device's layers recorded
+    /// and gone behind the run before's, which is then finished, this chunk's run `pending` in its place.
+    fn run_rest<'a>(&'a self, parked: &mut Option<(usize, Box<Parked<'a>>)>, pending: &mut Option<ChainedRun<'a>>, embeds: &Tensor, kv: &mut KvCache, done: &mut dyn FnMut(usize)) {
+        if let Some((j, q)) = parked.take() {
+            let Some(Went::Run(run)) = self.run_part(&[], embeds, kv, false, pending, None, Stage::Rest(q)) else { panic!("a chunk's second device's part") };
+            if let Some(p) = pending.replace(run) {
+                p.finish(self, kv);
+            }
+            done(j);
+        }
     }
 
     /// An attention layer's rows of a chained run (`t` of them from `at`, K then V each, and its indexer keys) into
@@ -1932,14 +2007,34 @@ impl FlashNext {
     /// committed; `prev` (a chunk's run before this one's, its last device still running) finished as the next
     /// device's layers are recorded, so the device holds one chunk's scratch at a time.
     fn run_begin<'a>(&'a self, tokens: &[u32], embeds: &Tensor, kv: &mut KvCache, check: bool, prev: &mut Option<ChainedRun<'a>>, ple: Option<Vec<f32>>) -> Option<ChainedRun<'a>> {
+        match self.run_part(tokens, embeds, kv, check, prev, ple, Stage::Whole)? {
+            Went::Run(run) => Some(run),
+            Went::Parked(_) => unreachable!("a whole run stops at no device"),
+        }
+    }
+
+    /// [`Self::run_begin`] whole, or a prompt's chunk over two devices in two parts ([`Self::forward_chunks`]): its
+    /// first device's layers recorded and gone ([`Stage::First`]: `kv` committed, the chunk parked where its next
+    /// device's layers begin), then, once the chunk after's first part is gone too, the rest from there
+    /// ([`Stage::Rest`]: `tokens` and `embeds` not read, the chunk's own kept with it). So each device has its next
+    /// chunk's work behind the one it runs, where a chunk whole left the first device idle while the host recorded
+    /// the second's layers and stored rows, and the second while the host recorded the next chunk's first.
+    #[allow(clippy::too_many_arguments)]
+    fn run_part<'a>(&'a self, tokens: &[u32], embeds: &Tensor, kv: &mut KvCache, check: bool, prev: &mut Option<ChainedRun<'a>>, ple: Option<Vec<f32>>, stage: Stage<'a>) -> Option<Went<'a>> {
         use ggml_rs::{ChainRecorder, DeltaNet};
         use std::sync::atomic::Ordering;
         if std::env::var_os("OAIY_NO_CHAIN").is_some() {
             return None;
         }
         let cfg = &self.config;
-        let past = kv.len;
-        let t = tokens.len();
+        let first_only = matches!(stage, Stage::First);
+        let mut parked = match stage {
+            Stage::Rest(p) => Some(p),
+            _ => None,
+        };
+        let resumed = parked.is_some();
+        let past = parked.as_ref().map_or(kv.len, |p| p.past);
+        let t = parked.as_ref().map_or(tokens.len(), |p| p.t);
         let ratio = cfg.index_ratio;
         let phases = std::env::var_os("OAIY_FN_LOG").is_some() && t > 64;
         let clock = std::time::Instant::now();
@@ -1969,8 +2064,9 @@ impl FlashNext {
         assert!(!check || few, "a check of 2 to {CHECK_ROWS} rows");
         let id_dim = cfg.index_dim;
         let mut m = st.m.lock().unwrap_or_else(|p| p.into_inner());
-        // the devices' copies of the attention caches: room for this run, the rows the host wrote since
-        for (d, layers) in st.attn_of.iter().enumerate() {
+        // the devices' copies of the attention caches: room for this run, the rows the host wrote since (a resumed
+        // chunk's when it began)
+        for (d, layers) in st.attn_of.iter().enumerate().filter(|_| !resumed) {
             let g = &mut m.kv[d];
             if g.cap < past + t {
                 let cap = (past + t).next_power_of_two().max(256);
@@ -2060,14 +2156,14 @@ impl FlashNext {
                 }
             })
         });
-        let owned: Vec<ChainDev>;
-        let devs: &[ChainDev] = match few_set {
-            _ if t == 1 => &st.devs,
-            Some(f) => &f.devs,
-            None => {
-                owned = chains.iter().map(|c| chain_dev(*c, cfg, st.rank, t, 1)).collect();
-                &owned
-            }
+        let owned: Option<Arc<Vec<ChainDev>>> = (t != 1 && few_set.is_none()).then(|| match &parked {
+            Some(p) => Arc::clone(&p.devs),
+            None => Arc::new(chains.iter().map(|c| chain_dev(*c, cfg, st.rank, t, 1)).collect()),
+        });
+        let devs: &[ChainDev] = match (&owned, few_set) {
+            (Some(o), _) => o,
+            (None, Some(f)) => &f.devs,
+            (None, None) => &st.devs,
         };
         // a check: what undoing it needs (the delta nets' and the n-gram window's backups are taken as it runs)
         if check {
@@ -2096,34 +2192,44 @@ impl FlashNext {
                 })
             })
             .collect();
-        for (c, dv) in chains.iter().zip(devs) {
+        for (c, dv) in chains.iter().zip(devs).filter(|_| !resumed) {
             c.upload(&dv.table, &table);
         }
         // a prompt's attention scratch, on every device with attention layers (a few rows' kept, grown as positions are)
-        let attn_rows: Vec<Option<ggml_rs::DeviceVec>> = chains
-            .iter()
-            .enumerate()
-            .map(|(d, c)| {
-                if t == 1 || st.attn_of[d].is_empty() {
-                    return None;
-                }
-                let len = c.attention_rows_out_len(t, nh, hd, past + t);
-                if !few {
-                    return Some(c.vec(len));
-                }
-                if m.rows_out[d].len < len {
-                    m.rows_out[d] = c.vec(len.next_power_of_two());
-                }
-                Some(m.rows_out[d].clone())
-            })
-            .collect();
+        let attn_rows: Vec<Option<ggml_rs::DeviceVec>> = match &parked {
+            Some(p) => p.attn_rows.clone(),
+            None => chains
+                .iter()
+                .enumerate()
+                .map(|(d, c)| {
+                    if t == 1 || st.attn_of[d].is_empty() {
+                        return None;
+                    }
+                    let len = c.attention_rows_out_len(t, nh, hd, past + t);
+                    if !few {
+                        return Some(c.vec(len));
+                    }
+                    if m.rows_out[d].len < len {
+                        m.rows_out[d] = c.vec(len.next_power_of_two());
+                    }
+                    Some(m.rows_out[d].clone())
+                })
+                .collect(),
+        };
         // a prompt's chunk's QSA vectors (past the dense span) and its rows' raw indexer keys, on every device with
         // attention layers
-        let prompt_qsa: Vec<Option<QsaVecs>> = chains.iter().enumerate().map(|(d, c)| (sparse && t > CHECK_ROWS && !st.attn_of[d].is_empty()).then(|| self.qsa_vecs(*c, t, m.kv[d].cap))).collect();
-        let prompt_keys: Vec<Option<ggml_rs::DeviceVec>> = chains.iter().enumerate().map(|(d, c)| (t > CHECK_ROWS && !st.attn_of[d].is_empty()).then(|| c.vec(t * id_dim))).collect();
+        let prompt_qsa: Arc<Vec<Option<QsaVecs>>> = match &parked {
+            Some(p) => Arc::clone(&p.qsa),
+            None => Arc::new(chains.iter().enumerate().map(|(d, c)| (sparse && t > CHECK_ROWS && !st.attn_of[d].is_empty()).then(|| self.qsa_vecs(*c, t, m.kv[d].cap))).collect()),
+        };
+        let prompt_keys: Vec<Option<ggml_rs::DeviceVec>> = match &parked {
+            Some(p) => p.keys.clone(),
+            None => chains.iter().enumerate().map(|(d, c)| (t > CHECK_ROWS && !st.attn_of[d].is_empty()).then(|| c.vec(t * id_dim))).collect(),
+        };
         // the n-gram features (on the n-gram layer's device, where it is chained), then the embedding in every stream
         // (a prompt's chunk's read already, as the chunk before ran)
         let ple_emb = match ple {
+            _ if resumed => Vec::new(),
             Some(f) => {
                 let mut history = self.ple_history(kv);
                 history.extend(tokens.iter().map(|&t| t as i64));
@@ -2133,28 +2239,35 @@ impl FlashNext {
             None => self.ple_embed_host(tokens, kv).ok()?,
         };
 
-        let ple_owned: Option<PleVecs>;
+        let ple_owned: Option<Arc<PleVecs>> = (st.ple.is_some() && t != 1 && !few).then(|| match &parked {
+            Some(p) => Arc::clone(p.ple.as_ref().expect("the chunk's n-gram vectors")),
+            None => Arc::new(ple_vecs(chains[ple_device], cfg, t)),
+        });
         let ple_vs: Option<(&ChainPle, &PleVecs)> = match &st.ple {
             Some((p, step)) if t == 1 => Some((p, step)),
             Some((p, _)) if few => few_set.and_then(|f| f.ple.as_ref()).map(|v| (p, v)),
-            Some((p, _)) => {
-                ple_owned = Some(ple_vecs(chains[ple_device], cfg, t));
-                ple_owned.as_ref().map(|v| (p, v))
-            }
+            Some((p, _)) => ple_owned.as_deref().map(|v| (p, v)),
             None => None,
         };
-        if let Some((_, v)) = ple_vs {
-            chains[ple_device].upload(&v.emb, &ple_emb);
-        }
-        let e = embeds.to_host();
-        let mut x0 = Vec::with_capacity(t * s * h);
-        for row in e.data().chunks_exact(h).take(t) {
-            for _ in 0..s {
-                x0.extend_from_slice(row);
+        // where the layers go on from: the first, or a resumed chunk's next device's first
+        let start = parked.as_ref().map_or(0, |p| p.at);
+        let mut d = self.layers[start].device;
+        let e = match &parked {
+            Some(p) => p.e.clone(),
+            None => embeds.to_host(),
+        };
+        if !resumed {
+            if let Some((_, v)) = ple_vs {
+                chains[ple_device].upload(&v.emb, &ple_emb);
             }
+            let mut x0 = Vec::with_capacity(t * s * h);
+            for row in e.data().chunks_exact(h).take(t) {
+                for _ in 0..s {
+                    x0.extend_from_slice(row);
+                }
+            }
+            chains[d].upload(&devs[d].x, &x0);
         }
-        let mut d = self.layers[0].device;
-        chains[d].upload(&devs[d].x, &x0);
         let hc = |rec: &mut dyn ChainRecorder, dv: &ChainDev, rows: usize, hcv: &HcVecs, pending: Option<(&ggml_rs::DeviceVec, &ggml_rs::DeviceVec)>, post: &ggml_rs::DeviceVec, out: &ggml_rs::DeviceVec| {
             if let Some((y, p)) = pending {
                 rec.stream_apply(&dv.x, y, p, rows, s, h);
@@ -2191,10 +2304,17 @@ impl FlashNext {
         let mut to_store: Vec<(usize, Vec<f32>, Vec<f32>)> = Vec::new();
         // a device's recording (its work submitted, its reads its streams and its layers' rows) whose streams go up
         // to the next device (its work held until they do), and its attention layers read
-        let mut handoffs: Vec<(Box<dyn ChainRecorder + '_>, usize, Vec<usize>)> = Vec::new();
+        let mut handoffs: Vec<(Box<dyn ChainRecorder + '_>, usize, Vec<usize>)> = parked.as_mut().map(|p| std::mem::take(&mut p.handoffs)).unwrap_or_default();
         let mut pending: Option<Routed> = None;
+        if resumed {
+            // (as after a handoff: this device's work held till the streams are up)
+            let mut r = chains[d].begin();
+            r.keep_groups(keep);
+            r.hold();
+            open = Some(r);
+        }
         mark("ready");
-        for (i, (layer, cl)) in self.layers.iter().zip(&st.layers).enumerate() {
+        for (i, (layer, cl)) in self.layers.iter().zip(&st.layers).enumerate().skip(start) {
             let dev = layer.device;
             let ple_here = i == cfg.ple_layer;
             if dev != d && pending.is_none() && !(ple_here && ple_vs.is_none()) {
@@ -2209,6 +2329,12 @@ impl FlashNext {
                 rec.flush();
                 mark("first device recorded and gone");
                 handoffs.push((rec, dev, std::mem::take(&mut attn_reads)));
+                if first_only {
+                    // the chunk parked here: its next device's layers after the next chunk's first part
+                    kv.commit(t);
+                    kv.dirty_from = usize::MAX;
+                    return Some(Went::Parked(Box::new(Parked { past, t, e, devs: owned.clone()?, ple: ple_owned.clone(), attn_rows, qsa: prompt_qsa, keys: prompt_keys, handoffs, at: i })));
+                }
                 // the chunk before's last device done with (its scratch back) before this chunk's work there
                                 if let Some(p) = prev.take() {
                     p.finish(self, kv);
@@ -2486,7 +2612,9 @@ impl FlashNext {
         if let Some(at) = hid {
             m.mtp_hid = at;
         }
-        kv.commit(t);
+        if !resumed {
+            kv.commit(t);
+        }
         kv.dirty_from = usize::MAX;
         if t == 1 {
             self.decoded.store(true, Ordering::Relaxed);
@@ -2496,8 +2624,39 @@ impl FlashNext {
         if phases {
             eprintln!("    fn run of {t} at {past}: {}", marks.iter().map(|(w, ms)| format!("{w} {ms:.0}")).collect::<Vec<_>>().join(", "));
         }
-                Some(ChainedRun { rec, attn_reads, at: past, t })
+                Some(Went::Run(ChainedRun { rec, attn_reads, at: past, t }))
     }
+}
+
+/// How much of a chained run [`FlashNext::run_part`] makes: all of it, a prompt chunk's first device's part, or the
+/// rest of a chunk parked after that.
+enum Stage<'a> {
+    Whole,
+    First,
+    Rest(Box<Parked<'a>>),
+}
+
+/// What [`FlashNext::run_part`] left: a run whose last device is running, or a chunk parked after its first device's
+/// part.
+enum Went<'a> {
+    Run(ChainedRun<'a>),
+    Parked(Box<Parked<'a>>),
+}
+
+/// A prompt's chunk whose first device's layers are recorded and gone: its positions, its embeddings (the prediction
+/// layer's), its own vectors on every device, its first device's recording (its streams and rows read at the
+/// handoff), and the layer its next device's begin at.
+struct Parked<'a> {
+    past: usize,
+    t: usize,
+    e: Tensor,
+    devs: Arc<Vec<ChainDev>>,
+    ple: Option<Arc<PleVecs>>,
+    attn_rows: Vec<Option<ggml_rs::DeviceVec>>,
+    qsa: Arc<Vec<Option<QsaVecs>>>,
+    keys: Vec<Option<ggml_rs::DeviceVec>>,
+    handoffs: Vec<(Box<dyn ggml_rs::ChainRecorder + 'a>, usize, Vec<usize>)>,
+    at: usize,
 }
 
 /// A chained run whose last device is running: its recording (the run's reads its attention layers' rows, then
