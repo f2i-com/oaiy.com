@@ -954,12 +954,12 @@ struct Params { n_h: u32, n_kv: u32, past: u32, rows: u32, kv_len: u32, scale: u
 @group(0) @binding(3) var<uniform> p: Params;
 
 const HD: u32 = HEAD_DIMu;
-// a block's scores [query][key] (32 by 128) and its weights the same way as f16 (32 vec4s a query); each thread's
-// largest score of the block (then, at the end, its sum), whether its query's reference moved, and whether any did
-var<workgroup> s_sh: array<f32, 4096>;
+// a block's scores [query][key] (32 by 128, 32 vec4s a query: a thread's 32 of them 8 loads) and its weights the same
+// way as f16; each thread's largest score of the block (then, at the end, its sum), and whether some query's
+// reference moves at this block (set by a thread that sees it, cleared by the first once the sums are scaled)
+var<workgroup> s_sh: array<vec4<f32>, 1024>;
 var<workgroup> p_sh: array<vec4<f16>, 1024>;
 var<workgroup> m_sh: array<f32, 128>;
-var<workgroup> n_sh: array<f32, 128>;
 var<workgroup> moved: u32;
 
 @compute @workgroup_size(128)
@@ -989,8 +989,11 @@ DECLARE_O
 SCORES
         // the thread's 32 scores of the block (those the query does not see none), and their largest
 LOAD_S
-        m_sh[li] = max(max(bm.x, bm.y), max(bm.z, bm.w));
-        workgroupBarrier();
+        let tm = max(max(bm.x, bm.y), max(bm.z, bm.w));
+        m_sh[li] = tm;
+        // (a thread whose largest is more than 8 past its query's reference: that reference moves, as below)
+        if (c > -1.0e38 && tm > c + 8.0) { moved = 1u; }
+        let go = workgroupUniformLoad(&moved);
         // the block's largest for the query: its first is the reference, one more than 8 past the reference the new
         // one, what is summed so far scaled down to it
         let bq = max(max(m_sh[r4], m_sh[r4 + 1u]), max(m_sh[r4 + 2u], m_sh[r4 + 3u]));
@@ -1004,19 +1007,6 @@ LOAD_S
             }
         }
         l *= factor;
-        n_sh[li] = 1.0 - factor;
-        // (a query that has seen no key yet: no weights)
-        let on = select(0.0, 1.0, c > -1.0e38);
-        var add = vec4<f32>(0.0);
-WEIGHTS
-        l += add.x + add.y + add.z + add.w;
-        workgroupBarrier();
-        if (li == 0u) {
-            var any = 0.0;
-            for (var i = 0u; i < 128u; i += 4u) { any += n_sh[i]; }
-            moved = select(0u, 1u, any > 0.0);
-        }
-        let go = workgroupUniformLoad(&moved);
         if (go != 0u) {
 STORES
             storageBarrier();
@@ -1024,10 +1014,17 @@ STORES
             if (factor != 1.0) {
                 for (var d = 0u; d < HD / 4u; d++) { y[yb + d] = y[yb + d] * factor; }
             }
+            if (li == 0u) { moved = 0u; }
             storageBarrier();
             workgroupBarrier();
 RELOADS
         }
+        // (a query that has seen no key yet: no weights)
+        let on = select(0.0, 1.0, c > -1.0e38);
+        var add = vec4<f32>(0.0);
+WEIGHTS
+        l += add.x + add.y + add.z + add.w;
+        workgroupBarrier();
         for (var kk = 0u; kk < 128u; kk += 16u) {
             let ia0 = kk / 4u;
             let ia1 = (2048u + kk) / 4u;
@@ -1069,11 +1066,8 @@ fn attention_coop_one(hd: usize, full: bool) -> String {
     let load: String = (0..8)
         .map(|j| {
             format!(
-                "        let k{j} = vec4<u32>(kb * 128u + tc + {o}u) + vec4<u32>(0u, 1u, 2u, 3u);\n        let v{j} = select(none, vec4<f32>(s_sh[sb + {o}u], s_sh[sb + {a}u], s_sh[sb + {b}u], s_sh[sb + {c}u]) * scale, (k{j} <= vec4<u32>(qpos)) & (k{j} < vec4<u32>(p.kv_len)));\n",
-                o = 4 * j,
-                a = 4 * j + 1,
-                b = 4 * j + 2,
-                c = 4 * j + 3
+                "        let k{j} = vec4<u32>(kb * 128u + tc + {o}u) + vec4<u32>(0u, 1u, 2u, 3u);\n        let v{j} = select(none, s_sh[(sb + {o}u) / 4u] * scale, (k{j} <= vec4<u32>(qpos)) & (k{j} < vec4<u32>(p.kv_len)));\n",
+                o = 4 * j
             )
         })
         .chain(std::iter::once(format!("        let bm = {};\n", (1..8).fold("v0".to_string(), |m, j| format!("max({m}, v{j})")))))
@@ -1085,10 +1079,16 @@ fn attention_coop_one(hd: usize, full: bool) -> String {
     } else {
         "    let qpos = p.past + q0 + tr;\n    // the blocks the last query sees\n    let hi = min(p.kv_len, p.past + q0 + 32u);"
     };
+    // (the scores' fragments stored into vec4s: their places and stride in those)
+    let mut scores = ATTENTION_COOP_WIDE_SCORES.to_string();
+    for (scalars, fours) in [("let io00 = sg * 32u;", "let io00 = sg * 8u;"), ("let io01 = sg * 32u + 16u;", "let io01 = sg * 8u + 4u;"), ("let io10 = 2048u + sg * 32u;", "let io10 = 512u + sg * 8u;"), ("let io11 = 2048u + sg * 32u + 16u;", "let io11 = 512u + sg * 8u + 4u;"), ("let s128 = 128u;", "let s128 = 32u;")] {
+        assert_eq!(scores.matches(scalars).count(), 1, "the scores' places");
+        scores = scores.replace(scalars, fours);
+    }
     ATTENTION_COOP_ONE
         .replace("HEAD_DIM", &hd.to_string())
         .replace("LIMIT", limit)
-        .replace("SCORES\n", ATTENTION_COOP_WIDE_SCORES)
+        .replace("SCORES\n", &scores)
         .replace("LOAD_S\n", &load)
         .replace("WEIGHTS\n", &weights)
         .replace("DECLARE_O\n", &declare)
@@ -6789,7 +6789,9 @@ mod tests {
         if !b.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
             return;
         }
-        let (n_h, n_kv, hd) = (24usize, 4usize, 256usize);
+        // (OAIY_ATT_HD: heads that wide, as many more of them)
+        let hd: usize = std::env::var("OAIY_ATT_HD").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+        let (n_h, n_kv) = (24 * 256 / hd, 4 * 256 / hd);
         // (OAIY_ATT_ROWS: the chunk that long)
         let rows: usize = std::env::var("OAIY_ATT_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
         for past in [0usize, 1024, 4096, 15360] {

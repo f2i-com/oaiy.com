@@ -2456,8 +2456,10 @@ mod dense_webgpu_timing {
         let pause: f64 = std::env::var("QWEN35_PAUSE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.);
         // (QWEN35_CALL: the tokens a call on the way there, 512 unless given; the server's are 4,096)
         let call: usize = std::env::var("QWEN35_CALL").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
-        let mut kv = model.new_kv_cache(past + 1024);
-        let tokens: Vec<u32> = (0..(past + 1024) as u32).map(|i| 1000 + (i * 7919) % 20000).collect();
+        // (QWEN35_CHUNK: the rows of the chunk measured there, 512 unless given; one card's prompt chunks are 1,024)
+        let chunk: usize = std::env::var("QWEN35_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
+        let mut kv = model.new_kv_cache(past + chunk + 512);
+        let tokens: Vec<u32> = (0..(past + chunk + 512) as u32).map(|i| 1000 + (i * 7919) % 20000).collect();
         let at = std::cell::Cell::new(0usize);
         let forward = |n: usize, kv: &mut llama_rs::KvCache| {
             let t = Instant::now();
@@ -2481,7 +2483,7 @@ mod dense_webgpu_timing {
         for fill in 0..fills {
             if fill > 0 {
                 std::thread::sleep(std::time::Duration::from_secs_f64(pause));
-                kv = model.new_kv_cache(past + 1024);
+                kv = model.new_kv_cache(past + chunk + 512);
                 at.set(0);
             }
             let started = Instant::now();
@@ -2496,8 +2498,8 @@ mod dense_webgpu_timing {
             eprintln!("{past} tokens in {:.2} s", started.elapsed().as_secs_f64());
         }
         let _ = (ggml_rs_wgpu::profile::take_kernels(), ggml_rs_wgpu::profile::take_line());
-        let (here, ms) = (kv.len, forward(512, &mut kv));
-        eprintln!("a chunk of 512 at {here}: {ms:.1} ms; {}", ggml_rs_wgpu::profile::take_line());
+        let (here, ms) = (kv.len, forward(chunk, &mut kv));
+        eprintln!("a chunk of {chunk} at {here}: {ms:.1} ms; {}", ggml_rs_wgpu::profile::take_line());
         kernels(1.);
         let steps = 16;
         // (a first step apart: deep in a long cache it makes the cache's f16 halves, once)

@@ -1112,14 +1112,29 @@ impl Qwen35Chain {
         let backend: &dyn Backend = &*m.backend;
         // each chunk recorded and gone to the GPU as the chunk before runs, the chunk before's rows read back and
         // into the host's cache as this one runs
+        // (OAIY_CHUNKS_LOG: when each chunk's recording began and ended and when the chunk before it was done, ms)
+        let mut log = std::env::var_os("OAIY_CHUNKS_LOG").map(|_| (std::time::Instant::now(), Vec::new()));
+        let said = |what: String, log: &mut Option<(std::time::Instant, Vec<String>)>| {
+            if let Some((t0, lines)) = log {
+                lines.push(format!("{:.1} {what}", t0.elapsed().as_secs_f64() * 1e3));
+            }
+        };
         let mut pending: Option<Qwen35Run<'_>> = None;
         for &(at, t) in &chunks {
+            said(format!("rows {at}..{} at {}: recording", at + t, kv.len), &mut log);
             let run = self.run_begin(m, st, chain, &emb[at * s.d..(at + t) * s.d], t, kv, false);
+            said("recorded".to_string(), &mut log);
             if let Some(p) = pending.replace(run) {
                 p.finish(backend, kv);
+                said("the chunk before done".to_string(), &mut log);
             }
         }
-        pending.map(|p| p.finish(backend, kv).pop().expect("the logits"))
+        let out = pending.map(|p| p.finish(backend, kv).pop().expect("the logits"));
+        said("the last done".to_string(), &mut log);
+        if let Some((_, lines)) = &log {
+            eprintln!("a prompt's {} chunks: {}", chunks.len(), lines.join("; "));
+        }
+        out
     }
 
     /// A second device for prompts: a prompt's chunks run over both ([`Self::forward`]), the layers from the middle
