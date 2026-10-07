@@ -9085,6 +9085,25 @@ fn main() {
         }
     }
 
+    /// The cooperative matrices each adapter offers through wgpu (`--ignored --nocapture`): their shapes and their
+    /// inputs' and sums' types. wgpu 30 names f32, f16, i32 and u32 only: a driver's 8-bit integer matrices (what
+    /// llama.cpp's CUDA backend multiplies K-quants with on these cards) are not among what it passes on.
+    #[test]
+    #[ignore = "a listing"]
+    fn list_cooperative_matrices() {
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        desc.backends = wgpu::Backends::PRIMARY;
+        let instance = wgpu::Instance::new(desc.with_env());
+        for adapter in pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all())) {
+            let info = adapter.get_info();
+            let shapes = adapter.cooperative_matrix_properties();
+            eprintln!("{} ({:?}): {} shapes", info.name, info.backend, shapes.len());
+            for p in shapes.iter() {
+                eprintln!("    {} x {} x {}: {:?} inputs, {:?} sums{}", p.m_size, p.n_size, p.k_size, p.ab_type, p.cr_type, if p.saturating_accumulation { ", saturating" } else { "" });
+            }
+        }
+    }
+
     /// What the tensor cores reach through cooperative matrices (`--ignored --nocapture`): each subgroup multiplying
     /// 16x16 f16 fragments it holds into 8 accumulators, over and over (the arithmetic alone), its sums f32 and f16
     /// (an RTX 5090: 244 and 485 TFLOPS).
