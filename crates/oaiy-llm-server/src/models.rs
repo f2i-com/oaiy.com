@@ -2270,11 +2270,17 @@ mod dense_webgpu_timing {
             Box::new(move |d| b.exl3(d))
         };
         let p = std::path::Path::new(&path);
-        let reserve = crate::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
-        let experts = |device: usize, _layer: &str, list: Vec<[ggml_rs::exl3::Exl3Data; 3]>| -> oaiy_engine::Result<Box<dyn ggml_rs::exl3::Experts>> {
-            gpus[device].exl3_experts_leaving(list, reserve).map_err(oaiy_engine::Error::Arg)
+        // (FLASHNEXT_GGUF: the model from that GGUF's first shard, where the EXL3 checkpoint's)
+        let model = match std::env::var("FLASHNEXT_GGUF") {
+            Ok(g) => super::flashnext_gguf_on(std::path::Path::new(&g), &gpus, backends).unwrap(),
+            Err(_) => {
+                let reserve = crate::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
+                let experts = |device: usize, _layer: &str, list: Vec<[ggml_rs::exl3::Exl3Data; 3]>| -> oaiy_engine::Result<Box<dyn ggml_rs::exl3::Experts>> {
+                    gpus[device].exl3_experts_leaving(list, reserve).map_err(oaiy_engine::Error::Arg)
+                };
+                crate::flashnext::load_portable(p, backends, &packed, &experts, false).unwrap()
+            }
         };
-        let model = crate::flashnext::load_portable(p, backends, &packed, &experts, false).unwrap();
         let tokens: Vec<u32> = (0..16_400u32).map(|i| 1000 + (i * 7919) % 20000).collect();
         let mut kv = model.new_kv_cache(16_384);
         let report = |what: &str, wall: f64| {

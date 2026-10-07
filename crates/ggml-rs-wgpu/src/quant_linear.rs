@@ -173,6 +173,7 @@ mod tests {
                     // (a prompt's rows on the tensor cores read the inputs as f16; a check's few rows as int8 where
                     // the type has that kernel, as llama.cpp's MMQ does: some 0.4% of the largest)
                     let allowed = if (2..=8).contains(&rows) { 1.5e-2 } else { 2e-3 };
+                    eprintln!("{dtype}, {rows} rows by {what}: the worst error {:.1e} of the largest", worst / size);
                     assert!(worst <= size * allowed, "{dtype}, {rows} rows by {what}: {worst} of {size}");
                 }
             }

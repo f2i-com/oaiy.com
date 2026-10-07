@@ -189,7 +189,14 @@ pub(crate) fn load(path: &Path, backends: Vec<Arc<dyn Backend>>, quant: QuantMak
         }))
     };
     let tensor = |device: usize, name: &str, shape: &[usize]| -> Result<Tensor> { Ok(backends[device].to_device(Tensor::from_vec(src.values(name, shape)?, shape.to_vec()))) };
-    let dense = |device: usize, values: Vec<f32>, rows: usize, cols: usize| Weight::Dense(backends[device].to_device(Tensor::from_vec(values, vec![rows, cols])));
+    // a matrix of floats a chain multiplies by: each value rounded to f16's nearest, as the EXL3 checkpoint keeps
+    // them (a chain holds a matrix as f16 where every value is one: the tensor cores' kernel, and half the bytes a
+    // step reads; a GGUF's BF16 has values too small for f16's exponent, a few in a matrix)
+    let halves = |mut values: Vec<f32>| -> Vec<f32> {
+        values.iter_mut().for_each(|v| *v = ggml_rs::tensor::round_f16(*v));
+        values
+    };
+    let dense = |device: usize, values: Vec<f32>, rows: usize, cols: usize| Weight::Dense(backends[device].to_device(Tensor::from_vec(halves(values), vec![rows, cols])));
     // a gated-residual site (`{p}_down`, `_up`, `_norm` and, where it writes back, `_inject`), as the EXL3 loader
     // lays one out: the write logits ride along the down projection, the up projection ignores them
     let hyper = |device: usize, p: &str, site: bool| -> Result<HyperMix> {
@@ -207,8 +214,8 @@ pub(crate) fn load(path: &Path, backends: Vec<Arc<dyn Backend>>, quant: QuantMak
         }
         Ok(HyperMix {
             norm: tensor(device, &format!("{p}_norm.weight"), &[width])?,
-            down: backends[device].to_device(Tensor::from_vec(down, vec![rank + writes, width])),
-            up: backends[device].to_device(Tensor::from_vec(padded, vec![width, rank + writes])),
+            down: backends[device].to_device(Tensor::from_vec(halves(down), vec![rank + writes, width])),
+            up: backends[device].to_device(Tensor::from_vec(halves(padded), vec![width, rank + writes])),
             rank,
             site,
             packed: false,
@@ -264,10 +271,11 @@ pub(crate) fn load(path: &Path, backends: Vec<Arc<dyn Backend>>, quant: QuantMak
             gate: blocks("ffn_gate_exps", cfg.moe_ff, h)?,
             up: blocks("ffn_up_exps", cfg.moe_ff, h)?,
             down: blocks("ffn_down_exps", h, cfg.moe_ff)?,
+            // (the shared expert dense, as f16: its dequantized values rounded as the float matrices are)
             shared: [
-                src.values(&format!("{b}.ffn_gate_shexp.weight"), &[cfg.shared_ff, h])?,
-                src.values(&format!("{b}.ffn_up_shexp.weight"), &[cfg.shared_ff, h])?,
-                src.values(&format!("{b}.ffn_down_shexp.weight"), &[h, cfg.shared_ff])?,
+                halves(src.values(&format!("{b}.ffn_gate_shexp.weight"), &[cfg.shared_ff, h])?),
+                halves(src.values(&format!("{b}.ffn_up_shexp.weight"), &[cfg.shared_ff, h])?),
+                halves(src.values(&format!("{b}.ffn_down_shexp.weight"), &[h, cfg.shared_ff])?),
             ],
         })?;
         // the router, then the shared expert's gate

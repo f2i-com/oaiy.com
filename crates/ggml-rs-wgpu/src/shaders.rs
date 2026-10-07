@@ -1297,6 +1297,95 @@ const COOP_Q8_0_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
             for (var i = 0u; i < 4u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }
         }"#;
 
+/// Q2_0's decode for [`coop_tiled`] (18-byte blocks of 64 weights, two steps a block): a thread's half of a step its
+/// scale times its 16 codes less one (four codes a byte; each product an f16 exactly).
+const COOP_Q2_0_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
+        if (rr < p.rows) {
+            let base = rr * p.row_bytes + (b / 2u) * 18u;
+            let d = unpack2x16float(byte(base) | (byte(base + 1u) << 8u)).x;
+            let codes = word_at(base + 2u + (b % 2u) * 8u + lh * 4u);
+            for (var wi = 0u; wi < 4u; wi++) {
+                let q = (codes >> (wi * 8u)) & 0xffu;
+                wt[at4 + wi] = vec4<f16>(d * (vec4<f32>(f32(q & 3u), f32((q >> 2u) & 3u), f32((q >> 4u) & 3u), f32(q >> 6u)) - 1.0));
+            }
+        } else {
+            for (var i = 0u; i < 4u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }
+        }"#;
+
+/// Q4_0's decode for [`coop_tiled`] (on the GPU 20-byte blocks, [`padded_block`]: the scale, a gap, 16 bytes of
+/// nibbles): a step a block, a thread's half its low nibbles or its high ones, each less 8.
+const COOP_Q4_0_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
+        if (rr < p.rows) {
+            let base = rr * p.row_bytes + b * 20u;
+            let d = unpack2x16float(byte(base) | (byte(base + 1u) << 8u)).x;
+            for (var wi = 0u; wi < 4u; wi++) {
+                wt[at4 + wi] = vec4<f16>(d * byte_less((word_at(base + 4u + 4u * wi) >> (lh * 4u)) & 0x0f0f0f0fu, 8.0));
+            }
+        } else {
+            for (var i = 0u; i < 4u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }
+        }"#;
+
+/// Q5_0's decode for [`coop_tiled`] (22-byte blocks: the scale, 32 high bits, 16 bytes of nibbles): a step a block,
+/// a thread's half its low nibbles or its high ones, each with its fifth bit, less 16.
+const COOP_Q5_0_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
+        if (rr < p.rows) {
+            let base = rr * p.row_bytes + b * 22u;
+            let d = unpack2x16float(byte(base) | (byte(base + 1u) << 8u)).x;
+            let qh = word_at(base + 2u) >> (lh * 16u);
+            for (var wi = 0u; wi < 4u; wi++) {
+                let hb = (qh >> (wi * 4u)) & 15u;
+                let fifth = ((hb & 1u) | ((hb & 2u) << 7u) | ((hb & 4u) << 14u) | ((hb & 8u) << 21u)) << 4u;
+                wt[at4 + wi] = vec4<f16>(d * byte_less(((word_at(base + 6u + 4u * wi) >> (lh * 4u)) & 0x0f0f0f0fu) | fifth, 16.0));
+            }
+        } else {
+            for (var i = 0u; i < 4u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }
+        }"#;
+
+/// [`COOP_Q6K_HELPERS`] and IQ4's values (a nibble's, ggml's `kvalues_iq4nl`), a word's four nibbles' at once.
+const COOP_IQ4_HELPERS: &str = r#"fn byte(o: u32) -> u32 { return (w[o >> 2u] >> ((o & 3u) * 8u)) & 0xffu; }
+fn word_at(o: u32) -> u32 {
+    let i = o >> 2u;
+    if ((o & 3u) == 0u) { return w[i]; }
+    return (w[i] >> 16u) | (w[i + 1u] << 16u);
+}
+const KV4 = array<f32, 16>(-127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0, 53.0, 69.0, 89.0, 113.0);
+// the values of a word's four nibbles (each byte's low four bits)
+fn iq4(q: u32) -> vec4<f32> {
+    return vec4<f32>(KV4[q & 15u], KV4[(q >> 8u) & 15u], KV4[(q >> 16u) & 15u], KV4[(q >> 24u) & 15u]);
+}
+"#;
+
+/// IQ4_NL's decode for [`coop_tiled`] (18-byte blocks: the scale, 16 bytes of nibbles): a step a block, a thread's
+/// half its low nibbles' values or its high ones'.
+const COOP_IQ4_NL_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
+        if (rr < p.rows) {
+            let base = rr * p.row_bytes + b * 18u;
+            let d = unpack2x16float(byte(base) | (byte(base + 1u) << 8u)).x;
+            for (var wi = 0u; wi < 4u; wi++) {
+                wt[at4 + wi] = vec4<f16>(d * iq4(word_at(base + 2u + 4u * wi) >> (lh * 4u)));
+            }
+        } else {
+            for (var i = 0u; i < 4u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }
+        }"#;
+
+/// IQ4_XS's decode for [`coop_tiled`] (136-byte blocks of 256: the scale, each 32's six-bit scale in two fields, 128
+/// bytes of nibbles): a step a 32 of its block, its scale the block's times its own less 32.
+const COOP_IQ4_XS_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
+        if (rr < p.rows) {
+            let ib = b % 8u;
+            let base = rr * p.row_bytes + (b / 8u) * 136u;
+            let head = w[base >> 2u];
+            let low = (w[(base >> 2u) + 1u] >> (4u * ib)) & 15u;
+            let ls = low | ((((head >> 16u) >> (2u * ib)) & 3u) << 4u);
+            let dl = unpack2x16float(head & 0xffffu).x * (f32(ls) - 32.0);
+            let qo = (base >> 2u) + 2u + ib * 4u;
+            for (var wi = 0u; wi < 4u; wi++) {
+                wt[at4 + wi] = vec4<f16>(dl * iq4(w[qo + wi] >> (lh * 4u)));
+            }
+        } else {
+            for (var i = 0u; i < 4u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }
+        }"#;
+
 /// f16 weights for [`coop_tiled`] (`[n, k]`, `k` of 4): a thread's 16 of its row's step loaded a step ahead as the
 /// tokens' are, and stored as they are (a last step's past `k` zeros).
 const COOP_F16_REGS: &str = r#"    var wr0 = vec4<f16>();
@@ -1429,6 +1518,13 @@ pub fn coop_tiled(dtype: GgmlType) -> Option<String> {
         GgmlType::Q5_K => (vec4s, COOP_K_HELPERS, COOP_Q5K_REGS, COOP_Q5K_LOAD, COOP_Q5K_STEP),
         GgmlType::Q6_K => ("@group(0) @binding(0) var<storage, read> w: array<u32>;", COOP_Q6K_HELPERS, "", "", COOP_Q6K_STEP),
         GgmlType::Q8_0 => ("@group(0) @binding(0) var<storage, read> w: array<u32>;", COOP_Q6K_HELPERS, "", "", COOP_Q8_0_STEP),
+        // (the plain blocks a Qwen3.8-Flash-Next GGUF's dense matrices come in beside the K-quants: their bytes read
+        // as Q6_K's and Q8_0's are, a step a 32 of a block)
+        GgmlType::Q2_0 => ("@group(0) @binding(0) var<storage, read> w: array<u32>;", COOP_Q6K_HELPERS, "", "", COOP_Q2_0_STEP),
+        GgmlType::Q4_0 => ("@group(0) @binding(0) var<storage, read> w: array<u32>;", COOP_Q6K_HELPERS, "", "", COOP_Q4_0_STEP),
+        GgmlType::Q5_0 => ("@group(0) @binding(0) var<storage, read> w: array<u32>;", COOP_Q6K_HELPERS, "", "", COOP_Q5_0_STEP),
+        GgmlType::IQ4_NL => ("@group(0) @binding(0) var<storage, read> w: array<u32>;", COOP_IQ4_HELPERS, "", "", COOP_IQ4_NL_STEP),
+        GgmlType::IQ4_XS => ("@group(0) @binding(0) var<storage, read> w: array<u32>;", COOP_IQ4_HELPERS, "", "", COOP_IQ4_XS_STEP),
         _ => return None,
     };
     Some(coop_source(binding, helpers, regs, load, "", step, COOP_X_TILED))

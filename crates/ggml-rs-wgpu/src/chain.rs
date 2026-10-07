@@ -5250,6 +5250,11 @@ impl Recorder<'_> {
             T::Q5_K => "chain-coop-Q5_K",
             T::Q6_K => "chain-coop-Q6_K",
             T::Q8_0 => "chain-coop-Q8_0",
+            T::Q2_0 => "chain-coop-Q2_0",
+            T::Q4_0 => "chain-coop-Q4_0",
+            T::Q5_0 => "chain-coop-Q5_0",
+            T::IQ4_NL => "chain-coop-IQ4_NL",
+            T::IQ4_XS => "chain-coop-IQ4_XS",
             _ => return false,
         };
         if !self.gpu().device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) || k % 256 != 0 {
