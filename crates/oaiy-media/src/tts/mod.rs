@@ -16,6 +16,8 @@ pub mod breeze;
 pub mod clone;
 pub mod codec;
 pub mod model;
+#[cfg(feature = "webgpu")]
+pub mod realtime;
 
 use candle_core::{Device, Result};
 use oaiy_engine::json::Json;

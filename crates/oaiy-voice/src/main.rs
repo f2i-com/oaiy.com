@@ -35,36 +35,14 @@ impl SpeechToText for Parakeet {
     }
 }
 
-/// The CUDA GPU with the most free memory, and how much: speech takes what
-/// is spare there first, and the engines that load later size themselves
-/// around it.
+/// The GPU with the most free memory, and how much, as nvidia-smi counts them (which is how the WebGPU backend
+/// numbers them too): speech takes what is spare there first, and the engines that load later size themselves
+/// around it. None where nvidia-smi does not answer (a card of another make: the first GPU then).
 fn roomiest_gpu() -> Option<(usize, u64)> {
-    if !candle_core::utils::cuda_is_available() {
-        return None;
-    }
-    // Asked of nvidia-smi when every GPU is visible: measuring through CUDA
-    // opens a context on each GPU, and one left on another GPU holds memory
-    // there for as long as this server runs.
-    let pinned = std::env::var("CUDA_VISIBLE_DEVICES").is_ok_and(|v| !v.trim().is_empty());
-    if !pinned {
-        if let Some(best) = free_by_smi().and_then(|rows| rows.into_iter().max_by_key(|&(_, free)| free)) {
-            return Some(best);
-        }
-    }
-    let mut best: Option<(usize, u64)> = None;
-    for n in 0..16 {
-        let Ok(dev) = Device::new_cuda(n) else { break };
-        if let Some((free, _)) = oaiy_tts::device_memory(&dev) {
-            if best.is_none_or(|(_, most)| free > most) {
-                best = Some((n, free));
-            }
-        }
-    }
-    best
+    free_by_smi().and_then(|rows| rows.into_iter().max_by_key(|&(_, free)| free))
 }
 
-/// Free memory per GPU, from nvidia-smi (numbered as CUDA numbers them here:
-/// `main` sets `CUDA_DEVICE_ORDER=PCI_BUS_ID`, nvidia-smi's order).
+/// Free memory per GPU, from nvidia-smi (in its order, the PCI bus's).
 fn free_by_smi() -> Option<Vec<(usize, u64)>> {
     let mut command = std::process::Command::new("nvidia-smi");
     #[cfg(windows)]
@@ -91,76 +69,63 @@ fn parse_free(text: &str) -> Vec<(usize, u64)> {
         .collect()
 }
 
-/// The GPU speech runs on (`None`: the CPU).
+/// The one GPU `CUDA_VISIBLE_DEVICES` names, if it names one by number: how OAIY Desktop's GPU picker assigns a
+/// service its card (in nvidia-smi's order, the WebGPU backend's too).
+fn pinned_gpu() -> Option<usize> {
+    std::env::var("CUDA_VISIBLE_DEVICES").ok().and_then(|v| v.trim().parse().ok())
+}
+
+/// The GPU text to speech runs on, through WebGPU (`None`: `--device cpu`, which leaves it none).
 fn pick_gpu(choice: DeviceChoice) -> Option<usize> {
     match choice {
         DeviceChoice::Cpu => None,
-        DeviceChoice::Cuda(n) => Some(n),
-        DeviceChoice::Auto => roomiest_gpu().map(|(n, free)| {
-            eprintln!("[oaiy-voice] cuda:{n} has the most free memory ({:.1} GB): speech runs there", free as f64 / 1e9);
-            n
+        DeviceChoice::Gpu(n) => Some(n),
+        DeviceChoice::Auto => Some(match (pinned_gpu(), roomiest_gpu()) {
+            // (the desktop's GPU picker pins a service by CUDA_VISIBLE_DEVICES, which WebGPU does not read: read here)
+            (Some(n), _) => {
+                eprintln!("[oaiy-voice] pinned to GPU {n} (CUDA_VISIBLE_DEVICES): speech is made there");
+                n
+            }
+            (None, Some((n, free))) => {
+                eprintln!("[oaiy-voice] GPU {n} has the most free memory ({:.1} GB): speech is made there", free as f64 / 1e9);
+                n
+            }
+            (None, None) => 0,
         }),
     }
 }
 
-fn device_for(gpu: Option<usize>) -> Result<Device, String> {
-    match gpu {
-        None => Ok(Device::Cpu),
-        // (the GPU path was Candle's on CUDA, which this workspace no longer builds: speech is the CPU's until its
-        // WebGPU port, and a GPU asked for by number says so rather than fall back unasked)
-        Some(n) => Device::new_cuda(n).map_err(|e| format!("cuda:{n}: there is no CUDA backend any more, speech runs on the CPU (--device cpu, or leave it out): {e}")),
+/// Speech to text runs on the CPU (Candle's; its GPU path was CUDA's), in f32: Candle's CPU kernels are fastest so,
+/// and half precision there only loses.
+fn pick_dtype(p: Precision) -> DType {
+    if matches!(p, Precision::F16 | Precision::Bf16 | Precision::Tf32) {
+        eprintln!("[oaiy-voice] speech to text runs on the CPU in f32 (the other precisions were the CUDA build's)");
     }
+    DType::F32
 }
 
-fn pick_dtype(p: Precision, dev: &Device) -> DType {
-    // TF32 products are a process-wide cuBLAS setting; this process runs one model.
-    candle_core::cuda::set_gemm_reduced_precision_f32(p == Precision::Tf32 && dev.is_cuda());
-    if !dev.is_cuda() {
-        // Candle's CPU kernels are fastest in f32; half precision there only loses.
-        if matches!(p, Precision::F16 | Precision::Bf16) {
-            eprintln!("[oaiy-voice] the CPU runs in f32 (half precision is for the GPU)");
-        }
-        return DType::F32;
-    }
-    match p {
-        Precision::Auto | Precision::F16 => DType::F16,
-        Precision::F32 | Precision::Tf32 => DType::F32,
-        Precision::Bf16 => DType::BF16,
-    }
+fn describe(dtype: DType) -> String {
+    format!("cpu {}", dtype.as_str())
 }
 
-fn describe(dev: &Device, dtype: DType) -> String {
-    let d = match dev {
-        Device::Cpu => "cpu".to_string(),
-        Device::Cuda(_) => match dev.location() {
-            candle_core::DeviceLocation::Cuda { gpu_id } => format!("cuda:{gpu_id}"),
-            _ => "cuda".to_string(),
-        },
-        _ => format!("{:?}", dev.location()),
-    };
-    let tf32 = dtype == DType::F32 && dev.is_cuda() && candle_core::cuda::gemm_reduced_precision_f32();
-    format!("{d} {}", if tf32 { "tf32" } else { dtype.as_str() })
-}
-
-fn load(path: &Path, gpu: Option<usize>, precision: Precision) -> Result<Transcriber, String> {
-    let dev = device_for(gpu)?;
-    let dtype = pick_dtype(precision, &dev);
+/// The speech-to-text model, on the CPU.
+fn load(path: &Path, precision: Precision) -> Result<Transcriber, String> {
+    let dev = Device::Cpu;
+    let dtype = pick_dtype(precision);
     let started = Instant::now();
     let t = Transcriber::load(path, &dev, dtype).map_err(|e| format!("{}: {e}", path.display()))?;
-    // One pass over a second of quiet, so the first caller does not wait
-    // for the GPU's libraries and kernels to load.
+    // One pass over a second of quiet, so the first caller does not wait for the first use's set-up.
     let quiet: Vec<f32> = (0..t.sample_rate()).map(|i| 1e-3 * ((i as f32) * 0.37).sin()).collect();
     t.transcribe(&quiet).map_err(|e| format!("{}: warm-up: {e}", path.display()))?;
-    eprintln!("[oaiy-voice] loaded {} on {} in {:.1} s", t.name, describe(&dev, dtype), started.elapsed().as_secs_f64());
+    eprintln!("[oaiy-voice] loaded {} on {} in {:.1} s", t.name, describe(dtype), started.elapsed().as_secs_f64());
     Ok(t)
 }
 
 fn serve(args: Args) -> Result<(), String> {
-    let gpu = pick_gpu(args.device);
     let (stt, id, device) = if args.mode.stt() {
         let path = args.stt_model.clone().ok_or("no speech-to-text model: pass --stt-model-dir (a Parakeet .nemo, a model.safetensors or a folder holding one)")?;
-        let t = load(&args.find_model(&path), gpu, args.dtype)?;
-        let (id, device) = (t.name.clone(), describe(t.device(), t.dtype()));
+        let t = load(&args.find_model(&path), args.dtype)?;
+        let (id, device) = (t.name.clone(), describe(t.dtype()));
         let shared: SharedStt = Arc::new(Mutex::new(Box::new(Parakeet(t)) as Box<dyn SpeechToText>));
         (Some(shared), id, device)
     } else {
@@ -168,7 +133,7 @@ fn serve(args: Args) -> Result<(), String> {
     };
     let tts = if args.mode.tts() {
         let path = args.tts_model.clone().ok_or("no text-to-speech model: pass --tts-model-dir (a Qwen3-TTS Base folder)")?;
-        let gpu = gpu.ok_or("text-to-speech runs on a CUDA GPU: there is none here, or this build has no CUDA (build with --features cuda)")?;
+        let gpu = pick_gpu(args.device).ok_or("text-to-speech runs on a GPU, through WebGPU: --device cpu leaves it none (--mode stt is speech-to-text alone)")?;
         // A voice clip with nothing written beside it is heard by this server's own ears.
         let transcribe = stt.clone().map(|stt| {
             Arc::new(move |samples: &[f32], rate: usize| {
@@ -204,7 +169,10 @@ fn transcribe(argv: Vec<String>) -> Result<(), String> {
         }
     }
     let model = model.ok_or("transcribe needs --model")?;
-    let t = load(&model, pick_gpu(device), dtype)?;
+    if matches!(device, DeviceChoice::Gpu(_)) {
+        eprintln!("[oaiy-voice] speech to text runs on the CPU: --device names the GPU text to speech is made on");
+    }
+    let t = load(&model, dtype)?;
     for f in files {
         let bytes = std::fs::read(&f).map_err(|e| format!("{}: {e}", f.display()))?;
         let wav = audio::parse_wav(&bytes).map_err(|e| format!("{}: {e}", f.display()))?;

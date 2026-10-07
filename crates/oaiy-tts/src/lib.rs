@@ -337,9 +337,10 @@ impl Tts {
 
 /// Holds back the silence a line opens with, keeping its last tenth of a
 /// second as a lead-in; after a second of it, speech or not, it lets go.
-struct LeadIn {
-    open: bool,
-    held: Vec<f32>,
+/// (Public: the engine on WebGPU, `oaiy-media`'s, passes its chunks through it too.)
+pub struct LeadIn {
+    pub open: bool,
+    pub held: Vec<f32>,
     silent: usize,
 }
 
@@ -350,11 +351,11 @@ impl LeadIn {
     /// -46 dBFS: quieter than any speech, louder than the model's silence.
     const LEVEL: f32 = 0.005;
 
-    fn new(enabled: bool) -> Self {
+    pub fn new(enabled: bool) -> Self {
         Self { open: !enabled, held: Vec::new(), silent: 0 }
     }
 
-    fn pass(&mut self, samples: Vec<f32>) -> Vec<f32> {
+    pub fn pass(&mut self, samples: Vec<f32>) -> Vec<f32> {
         if self.open {
             return samples;
         }

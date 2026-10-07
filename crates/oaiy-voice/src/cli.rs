@@ -50,11 +50,14 @@ impl Mode {
 /// Where the model runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeviceChoice {
-    /// The CPU: the GPU path was Candle's on CUDA, which this workspace no longer builds.
+    /// Text to speech on the GPU with the most free memory (the first where that cannot be asked); speech to text
+    /// on the CPU.
     Auto,
+    /// No GPU: speech to text alone can run so.
     Cpu,
-    /// A GPU by number, as a configuration from the CUDA build may still ask: refused with the reason at start.
-    Cuda(usize),
+    /// Text to speech on this GPU, as nvidia-smi counts them (`gpu:N`; `cuda:N` from an older configuration is the
+    /// same card).
+    Gpu(usize),
 }
 
 impl DeviceChoice {
@@ -63,10 +66,10 @@ impl DeviceChoice {
         match v.as_str() {
             "auto" => Ok(Self::Auto),
             "cpu" => Ok(Self::Cpu),
-            "cuda" | "gpu" => Ok(Self::Cuda(0)),
+            "gpu" | "cuda" => Ok(Self::Gpu(0)),
             _ => {
-                let n = v.strip_prefix("cuda:").or_else(|| v.strip_prefix("gpu:")).ok_or_else(|| format!("--device {v:?}: expected auto, cpu, cuda or cuda:N"))?;
-                n.parse().map(Self::Cuda).map_err(|_| format!("--device {v:?}: bad GPU index"))
+                let n = v.strip_prefix("gpu:").or_else(|| v.strip_prefix("cuda:")).ok_or_else(|| format!("--device {v:?}: expected auto, cpu, gpu or gpu:N"))?;
+                n.parse().map(Self::Gpu).map_err(|_| format!("--device {v:?}: bad GPU index"))
             }
         }
     }
@@ -128,7 +131,7 @@ impl Args {
 
 pub const USAGE: &str = "usage: oaiy-voice [--mode stt|tts|both] [--port N] [--host ADDR]
                   [--stt-model-dir PATH | --model PATH] [--tts-model-dir PATH]
-                  [--device auto|cpu] [--dtype auto|f32|tf32|f16|bf16]
+                  [--device auto|cpu|gpu:N] [--dtype auto|f32|tf32|f16|bf16]
                   [--voices-dir DIR] [--voice NAME|CLIP] [--ffmpeg PATH] [--model-dirs DIRS]
        oaiy-voice transcribe --model PATH [--device ...] [--dtype ...] [--repeat N] FILE.wav...
 
@@ -231,8 +234,8 @@ mod tests {
     #[test]
     fn device_and_dtype() {
         let a = p(&["--device", "cuda:1", "--dtype", "bf16", "--model", "m.nemo"]).unwrap();
-        assert_eq!((a.device, a.dtype), (DeviceChoice::Cuda(1), Precision::Bf16));
-        assert_eq!(DeviceChoice::parse("cuda").unwrap(), DeviceChoice::Cuda(0));
+        assert_eq!((a.device, a.dtype), (DeviceChoice::Gpu(1), Precision::Bf16));
+        assert_eq!(DeviceChoice::parse("cuda").unwrap(), DeviceChoice::Gpu(0));
         assert_eq!(DeviceChoice::parse("CPU").unwrap(), DeviceChoice::Cpu);
         assert!(DeviceChoice::parse("cuda:x").is_err());
         assert!(Precision::parse("int8").is_err());
@@ -246,7 +249,7 @@ mod tests {
             _ => None,
         };
         let a = parse_with_env(["--mode", "stt"].map(String::from), env).unwrap();
-        assert_eq!((a.device, a.dtype), (DeviceChoice::Cuda(1), Precision::F32));
+        assert_eq!((a.device, a.dtype), (DeviceChoice::Gpu(1), Precision::F32));
         let a = parse_with_env(["--device", "cpu"].map(String::from), env).unwrap();
         assert_eq!(a.device, DeviceChoice::Cpu);
         assert!(parse_with_env(Vec::<String>::new(), |k| (k == "OAIY_VOICE_DEVICE").then(|| "tpu".to_string())).is_err());

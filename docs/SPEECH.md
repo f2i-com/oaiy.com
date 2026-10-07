@@ -5,9 +5,9 @@ natively in Rust (`oaiy-media`, `kind: "speech"`). The studio serves both as
 OpenAI's `audio.speech`. It adds **saved voices**: describe a voice once, keep
 it, and every later line uses the same voice.
 
-For calls, [`oaiy-tts`](#realtime-speech-oaiy-tts) speaks as it goes, in a voice
-cloned from a clip of anyone speaking (in real time on the GPU with the CUDA build
-that was; on the CPU for now).
+For calls, the [realtime engine](#realtime-speech-oaiy-tts) speaks as it goes, in a voice
+cloned from a clip of anyone speaking: on any GPU through WebGPU (`oaiy-media`'s
+`tts::realtime`, which `oaiy-voice` serves), faster than it is heard.
 
 ## Models
 
@@ -155,12 +155,24 @@ while it speaks. A voice is cloned from a short clip and its transcript.
 the encoders that make a voice.
 
 ```rust
-let dev = candle_core::Device::Cpu;                 // the CPU for now (the GPU path was CUDA's)
-let mut tts = oaiy_tts::Tts::load(model_dir, &dev)?; // loads and warms up
+// On a GPU, through WebGPU (GPU 0 as nvidia-smi counts them): what `oaiy-voice` runs.
+let mut tts = oaiy_media::tts::realtime::WgpuTts::load(model_dir, 0)?; // loads and warms up
 let voice = tts.voice_from_audio(clip, Some(transcript))?; // mp3, wav, ...
 let cancel = AtomicBool::new(false);                // set it to stop (barge-in)
 let report = tts.speak(text, &voice, &cancel, |pcm: &[i16]| { /* play it */ })?;
 ```
+
+`oaiy_tts::Tts` is the same engine on Candle (`Tts::load(model_dir, &Device::Cpu)`): the
+reference the WebGPU one is written against, whose GPU was CUDA's. On WebGPU the talker
+hands each frame over as it draws it and the codec decodes each chunk after the 25 frames
+before it (the official chunked decode's left context), where Candle's stream carries each
+stage's state from chunk to chunk; a voice's speaker embedding and codes are made on the
+CPU, once a clip. Measured through `oaiy-voice` on an RTX 5090 (2026-10-08, the 0.6B Base,
+a voice from a 6-second clip): a line of 5.4 s spoken in 3.5 s (real-time factor 0.66),
+its first audio 0.64 s after the call; the 1.7B Base, real-time factor 0.55, first audio
+0.41 s. The CUDA engine's figures below (factor 0.15, first audio under 0.1 s) are what is
+still to be made up: a frame is 17 round trips to the GPU where CUDA replayed one graph,
+and a chunk's decode reads 25 frames again.
 
 - **Model folder.** The 0.6B release: `config.json`, `model.safetensors`,
   `vocab.json`, `merges.txt` and `speech_tokenizer/`. The speech tokenizer is

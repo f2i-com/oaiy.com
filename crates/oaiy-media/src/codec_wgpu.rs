@@ -344,6 +344,20 @@ impl WgpuCodec {
         Ok(out)
     }
 
+    /// The samples of `new` (1920 a frame), which follow `before`: decoded with the last [`LEFT_CONTEXT`] frames of
+    /// `before` ahead of them, as [`Self::decode`] reads each of its chunks. A stream's chunk: every stage is causal,
+    /// so what a frame sounds like is settled once it is drawn, and the context is what the stages reach back for.
+    pub fn decode_after(&self, before: &[[u32; 16]], new: &[[u32; 16]]) -> Result<Vec<f32>> {
+        if new.is_empty() {
+            return Ok(Vec::new());
+        }
+        let context = before.len().min(LEFT_CONTEXT);
+        let mut frames = before[before.len() - context..].to_vec();
+        frames.extend_from_slice(new);
+        let wave = self.forward(&frames)?;
+        Ok(wave[context * SAMPLES_PER_FRAME..].to_vec())
+    }
+
     /// One whole decode of `frames` (`frames.len() * 1920` samples).
     fn forward(&self, frames: &[[u32; 16]]) -> Result<Vec<f32>> {
         let x = upload(&self.gpu, &self.rows(frames)?);

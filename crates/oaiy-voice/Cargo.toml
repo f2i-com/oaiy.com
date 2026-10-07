@@ -12,8 +12,10 @@ dsv41 = { path = "../dsv41" }
 candle-core = "0.11.0"
 candle-nn = "0.11.0"
 half = "2"
-# Text to speech: Qwen3-TTS, streaming, in a voice from a clip.
+# Text to speech: Qwen3-TTS, streaming, in a voice from a clip. Its engine on a GPU is oaiy-media's, on WebGPU
+# (tts::realtime: the talker and the codec's decoder there); oaiy-tts has the voices, the audio and the CPU's encoders.
 oaiy-tts = { path = "../oaiy-tts" }
+oaiy-media = { path = "../oaiy-media" }
 
 [features]
 default = []

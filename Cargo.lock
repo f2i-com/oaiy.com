@@ -1598,6 +1598,7 @@ dependencies = [
  "dsv41",
  "half",
  "oaiy-engine",
+ "oaiy-media",
  "oaiy-tts",
 ]
 

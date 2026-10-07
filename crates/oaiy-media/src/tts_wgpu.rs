@@ -57,6 +57,17 @@ impl Table {
     }
 }
 
+/// Why [`WgpuTalker::frames_with`] stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FramesEnd {
+    /// The talker drew the codec's end.
+    Ended,
+    /// `max_frames` were made.
+    Full,
+    /// The caller's `on_frame` said to stop.
+    Stopped,
+}
+
 pub struct WgpuTalker {
     gpu: WgpuBackend,
     talker: WgpuQwen3,
@@ -257,6 +268,18 @@ impl WgpuTalker {
 
     /// Every frame until the codec's end (or `max_frames`), as [`oaiy_tts::talker::Talker::frames`] on the host's draws.
     pub fn frames(&mut self, prefill: &[f32], trailing: Option<Vec<f32>>, sampling: Sampling, max_frames: usize, mut progress: impl FnMut(usize)) -> Result<Vec<[u32; 16]>> {
+        let mut frames = Vec::new();
+        self.frames_with(prefill, trailing, sampling, max_frames, |frame| {
+            frames.push(*frame);
+            progress(frames.len());
+            Ok(true)
+        })?;
+        Ok(frames)
+    }
+
+    /// [`Self::frames`], each frame shown to `on_frame` as it is drawn (a stream decodes and plays it while the next
+    /// is made); `on_frame` answering false stops the line there. Why it stopped.
+    pub fn frames_with(&mut self, prefill: &[f32], trailing: Option<Vec<f32>>, sampling: Sampling, max_frames: usize, mut on_frame: impl FnMut(&[u32; 16]) -> Result<bool>) -> Result<FramesEnd> {
         let (h, ph) = (self.hidden, self.predictor_hidden);
         let pad = self.text(&[TTS_PAD])?;
         let g = &self.gpu;
@@ -305,8 +328,8 @@ impl WgpuTalker {
             rec.finish().pop().ok_or_else(|| err("the logits were not read"))
         };
         let (mut hidden, mut logits) = talker_step(self, &mut cache, prefill)?;
-        let mut frames = Vec::new();
-        while frames.len() < max_frames {
+        let mut made = 0usize;
+        while made < max_frames {
             let s = &sampling;
             let penalty = s.repetition_penalty as f32;
             if penalty != 1.0 {
@@ -314,7 +337,7 @@ impl WgpuTalker {
                     *l = if *l < 0. { *l * penalty } else { *l / penalty };
                 }
             }
-            if frames.len() < 2 {
+            if made < 2 {
                 logits[CODEC_EOS as usize] = f32::NEG_INFINITY;
             }
             for (id, l) in logits.iter_mut().enumerate().skip(AUDIO_CODES as usize) {
@@ -324,7 +347,7 @@ impl WgpuTalker {
             }
             let c0 = sample(&logits, s.temperature, s.top_k, s.top_p, s.greedy, &mut rng);
             if c0 == CODEC_EOS {
-                break;
+                return Ok(FramesEnd::Ended);
             }
             seen[c0 as usize] = true;
             // the other 15 codes, the predictor's from this frame's start
@@ -339,10 +362,12 @@ impl WgpuTalker {
                 frame[i + 1] = code;
                 x = self.predictor_embeddings[i].row(code).to_vec();
             }
-            let step = frames.len();
-            frames.push(frame);
-            progress(frames.len());
-            if frames.len() >= max_frames {
+            let step = made;
+            made += 1;
+            if !on_frame(&frame)? {
+                return Ok(FramesEnd::Stopped);
+            }
+            if made >= max_frames {
                 break;
             }
             // the next input: the frame's embeddings summed, plus the text's
@@ -354,7 +379,7 @@ impl WgpuTalker {
             e.iter_mut().zip(text).for_each(|(a, b)| *a += b);
             (hidden, logits) = talker_step(self, &mut cache, &e)?;
         }
-        Ok(frames)
+        Ok(FramesEnd::Full)
     }
 }
 

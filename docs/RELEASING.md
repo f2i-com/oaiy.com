@@ -342,7 +342,7 @@ a release matter here:
 
 - **The other engines.** `oaiy-media` (pictures, video, sound, speech, music and 3D, on
   WebGPU), the `oaiy-studio` host and its tray, and `oaiy-voice`, the speech server for
-  calls (on the CPU for now). `tools/qwen-image/build.ps1` builds all of them on Windows but
+  calls (speech on WebGPU, speech-to-text on the CPU). `tools/qwen-image/build.ps1` builds all of them on Windows but
   `oaiy-voice`, which is a crate of its own. They are built by hand: they are a separate
   channel, and no workflow here builds them. The desktop finds them beside itself, in an
   `engines` folder there, or where `OAIY_ENGINES_DIR` points, and prefers a language-model

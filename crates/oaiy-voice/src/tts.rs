@@ -1,5 +1,5 @@
-//! Text to speech: Qwen3-TTS (`oaiy-tts`) on a thread of its own, in voices
-//! made from clips.
+//! Text to speech: Qwen3-TTS on a GPU through WebGPU (`oaiy-media`'s
+//! `tts::realtime`), on a thread of its own, in voices made from clips.
 //!
 //! A voice is a clip of someone speaking (WAV, MP3, anything FFmpeg reads) in
 //! the voices folder, named by its file name: `phone.mp3` is the voice
@@ -9,9 +9,9 @@
 //! clip alone is enough. Voices are made once and kept (the engine's cache,
 //! keyed by the clip's bytes and words), and a changed clip makes a new one.
 //!
-//! The engine keeps the thread that loaded it: its CUDA graphs belong to that
-//! thread. Lines are spoken one at a time, in turn; each streams 16-bit PCM
-//! at 24 kHz as it is made, and stops when its listener goes.
+//! The engine keeps the thread that loaded it. Lines are spoken one at a
+//! time, in turn; each streams 16-bit PCM at 24 kHz as it is made, and stops
+//! when its listener goes.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -20,7 +20,8 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
-use oaiy_tts::{Tts, Voice};
+use oaiy_media::tts::realtime::WgpuTts as Tts;
+use oaiy_tts::Voice;
 
 /// What speech-to-text gives the voices: the text of mono audio at a rate.
 pub type Transcribe = Arc<dyn Fn(&[f32], usize) -> Result<String, String> + Send + Sync>;
@@ -138,7 +139,7 @@ pub struct Speaker {
 /// How the engine is started.
 pub struct Setup {
     pub model_dir: PathBuf,
-    /// The CUDA GPU it runs on.
+    /// The GPU it runs on, as nvidia-smi counts them (the WebGPU backend's number too).
     pub gpu: usize,
     pub voices: Voices,
     /// FFmpeg, for clips that are not plain WAV.
@@ -163,7 +164,7 @@ impl Speaker {
             .map_err(|e| format!("the speech thread: {e}"))?;
         let loaded = ready.recv().map_err(|_| "the speech engine stopped while loading".to_string())??;
         eprintln!("[oaiy-voice] {loaded}");
-        Ok(Self { jobs, model, device: format!("cuda:{gpu}"), voices })
+        Ok(Self { jobs, model, device: format!("webgpu:{gpu}"), voices })
     }
 
     /// Speak `text` in `voice` (the default when `None`), handing each piece of
@@ -216,7 +217,7 @@ impl crate::server::TextToSpeech for Speaker {
 /// The engine's thread: load, then speak each job in turn.
 fn engine(setup: Setup, inbox: mpsc::Receiver<Job>, ready: mpsc::Sender<Result<String, String>>) {
     let started = Instant::now();
-    let loaded = oaiy_tts::cuda(setup.gpu).and_then(|dev| Tts::load(&setup.model_dir, &dev)).map_err(|e| format!("{}: {e}", setup.model_dir.display()));
+    let loaded = Tts::load(&setup.model_dir, setup.gpu).map_err(|e| format!("{}: {e}", setup.model_dir.display()));
     let mut tts = match loaded {
         Ok(t) => t,
         Err(e) => {
@@ -237,8 +238,7 @@ fn engine(setup: Setup, inbox: mpsc::Receiver<Job>, ready: mpsc::Sender<Result<S
             String::new()
         }
     };
-    let gb = tts.weight_bytes() as f64 / 1e9;
-    let _ = ready.send(Ok(format!("loaded {} on cuda:{} ({gb:.1} GB) in {:.1} s{default}", setup.model_dir.display(), setup.gpu, started.elapsed().as_secs_f64())));
+    let _ = ready.send(Ok(format!("loaded {} on GPU {}, {} through WebGPU, in {:.1} s{default}", setup.model_dir.display(), setup.gpu, tts.adapter(), started.elapsed().as_secs_f64())));
     for job in inbox {
         let result = setup.voices.clip(job.voice.as_deref()).and_then(|clip| voices.voice(&mut tts, &clip)).and_then(|voice| {
             let chunks = job.chunks.clone();
