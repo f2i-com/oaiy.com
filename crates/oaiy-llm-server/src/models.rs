@@ -616,6 +616,9 @@ impl Models {
         let opts = dsv41::model::ModelOptions { max_seq, expert_cache_bytes: o.expert_cache_bytes() as usize, direct_io: true };
         self.say(format!("expert host cache: {:.2} GiB", opts.expert_cache_bytes as f64 / (1u64 << 30) as f64));
         let mut model = dsv41::model::Model::load(&spec.path, &engram_meta, &opts)?;
+        // The routed experts on the CPU through this CPU's fastest kernel (the same bits as the portable one).
+        model.set_expert_row_kernel(dsv41_simd::row_kernel());
+        self.say(format!("experts on the CPU: the {} kernel", dsv41_simd::row_kernel_name()));
         let picked = crate::backend::open(o, &o.devices)?;
         let mut kernel = None;
         match picked.backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>() {

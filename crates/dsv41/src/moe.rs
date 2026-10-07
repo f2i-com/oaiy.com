@@ -29,6 +29,9 @@ pub struct Experts {
     /// Where a prompt's busy experts (those [`GPU_MIN_ROWS`] or more of its tokens chose) have their matmuls made, a
     /// group of [`GPU_GROUP`] a call: a GPU's (`crate::expert::ExpertsKernel`). None: all on the CPU.
     pub gpu: Option<Arc<dyn crate::expert::ExpertsKernel>>,
+    /// The row kernel a prompt's experts on the CPU run through (`pool`'s is its own): the portable one unless a
+    /// caller chose this CPU's ([`crate::model::Model::set_expert_row_kernel`]).
+    pub kernel: crate::cpu_experts::RowKernel,
 }
 
 /// Tokens a pass needs before its layers' experts are read while their attention runs: a prompt this long uses most of
@@ -335,7 +338,7 @@ impl Moe {
                 });
             }
             drop(got_tx);
-            let kernel = crate::cpu::row_kernel();
+            let kernel = experts.kernel;
             for _ in 0..threads.min(light) {
                 let (work_rx, out_tx) = (&work_rx, out_tx.clone());
                 scope.spawn(move || loop {

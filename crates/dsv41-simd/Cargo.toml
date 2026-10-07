@@ -1,0 +1,11 @@
+[package]
+name = "dsv41-simd"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Which SIMD row kernel dsv41's routed experts run on this CPU: the one place that may call them"
+
+# `dsv41` forbids `unsafe` (CONVENTIONS.md) and writes its AVX-512 kernels as safe `#[target_feature]` functions,
+# which only code that checked the CPU may call. That call is all this crate is. std-only.
+[dependencies]
+dsv41 = { path = "../dsv41" }

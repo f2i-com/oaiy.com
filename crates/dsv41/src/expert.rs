@@ -261,8 +261,8 @@ pub fn expert_forward_batch(record: &[u8], x: &[f32], route_weights: Option<&[f3
     fp4_matmul(&hq, nt, &record[W2], &record[S2], DIM, INTER).into_iter().map(to_bf16).collect()
 }
 
-/// [`expert_forward_batch`] on the caller's thread through a row kernel ([`crate::cpu::row_kernel`]: the SIMD one
-/// where the CPU has it), a row of `x` at a time: each output row is summed in [`expert_forward`]'s order, so the same
+/// [`expert_forward_batch`] on the caller's thread through a row kernel (the model's: `dsv41-simd`'s SIMD one where
+/// a caller chose it for this CPU), a row of `x` at a time: each output row is summed in [`expert_forward`]'s order, so the same
 /// bits. For a prompt's experts of a few rows, many of them computed at once on a pool's threads:
 /// `expert_forward_batch` starts a thread a core for each of its three matrices, under workers that already fill
 /// the cores, and decodes each weight through a table one at a time (a 91-token prompt's 7,200 experts on the CPU

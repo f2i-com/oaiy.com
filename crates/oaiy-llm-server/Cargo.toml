@@ -27,6 +27,8 @@ webgpu = ["dep:ggml-rs-wgpu"]
 [dependencies]
 oaiy-engine = { path = "../oaiy-engine" }
 dsv41 = { path = "../dsv41" }
+# This CPU's row kernel for DeepSeek's routed experts (the call dsv41, which forbids `unsafe`, cannot make).
+dsv41-simd = { path = "../dsv41-simd" }
 # VENDORED-LOCAL: GLM-5.3-Flash is served through llama-rs, so a second engine sits
 # beside the DeepSeek one (see src/glm.rs).
 llama-rs = { path = "../llama-rs" }

@@ -581,6 +581,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsv41-simd"
+version = "0.1.0"
+dependencies = [
+ "dsv41",
+]
+
+[[package]]
 name = "dyn-stack"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1512,6 +1519,7 @@ name = "oaiy-llm-server"
 version = "0.7.0"
 dependencies = [
  "dsv41",
+ "dsv41-simd",
  "ggml-quants",
  "ggml-rs",
  "ggml-rs-wgpu",

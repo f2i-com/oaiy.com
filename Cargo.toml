@@ -12,6 +12,9 @@ members = [
     "crates/oaiy-llm-cli",
     # DeepSeek-V4.1 support (docs/DEEPSEEK_V41.md); std-only like the core.
     "crates/dsv41",
+    # Which SIMD row kernel dsv41's routed experts run on this CPU: the one `unsafe` call dsv41 itself may not make
+    # (it forbids `unsafe`), behind a runtime feature check. std-only.
+    "crates/dsv41-simd",
     # Image decoding for the vision models (PNG, JPEG, Pillow-exact resize);
     # std-only like the core.
     "crates/oaiy-image",

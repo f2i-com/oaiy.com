@@ -134,6 +134,7 @@ impl Model {
             experts: Experts {
                 // Every hardware thread for the routed experts (a decode step's at once, a prompt's spread out).
                 pool: Some(crate::cpu_experts::CpuExperts::new(0)),
+                kernel: crate::cpu_experts::fp4_rows,
                 gpu: None,
                 store: Arc::new(store),
                 cache: Ecache::new(opts.expert_cache_bytes, RECORD_BYTES, CachePolicy::Lfru),
@@ -341,6 +342,14 @@ impl Model {
         }
         self.experts.warm(&picks);
         *cursor < total
+    }
+
+    /// Run the routed experts on the CPU through `kernel` (a decode step's pool and a prompt's workers both): the
+    /// crate `dsv41-simd` picks this CPU's fastest, which this crate may define but not call (it forbids `unsafe`).
+    /// Every kernel gives the same bits.
+    pub fn set_expert_row_kernel(&mut self, kernel: crate::cpu_experts::RowKernel) {
+        self.experts.pool = Some(crate::cpu_experts::CpuExperts::with_kernel(0, kernel));
+        self.experts.kernel = kernel;
     }
 
     /// Have a prompt's busy routed experts' matmuls made by `kernel` (a GPU's: see [`crate::moe::Experts::gpu`]).
