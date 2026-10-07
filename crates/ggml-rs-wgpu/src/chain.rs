@@ -1128,6 +1128,70 @@ fn attention_coop_masked(hd: usize) -> String {
         .replace("if (kp <= qpos && kp < p.kv_len) {", "if (kp <= qpos && kp < p.kv_len && kept(q0 + tr, qpos, kp)) {")
 }
 
+/// [`attention_coop_masked`] in one pass over the keys, 128 of them a block ([`attention_coop_one`] with the mask: a
+/// query's keys of a block it did not keep count for nothing, as those past it; its reference is its first block
+/// with a key it attends to). A prompt's chunk of 512 at 14,336 positions (24 heads of 256 over 2 KV heads): its
+/// twelve layers' 81 ms with the scores twice and the keys 32 a block.
+fn attention_coop_one_masked(hd: usize) -> String {
+    let mut src = attention_coop_one(hd, false)
+        .replace("@group(0) @binding(2) var<storage, read_write> y: array<f32>;", "@group(0) @binding(2) var<storage, read> mask: array<u32>;\n@group(0) @binding(6) var<storage, read_write> y: array<f32>;")
+        .replace("@group(0) @binding(3) var<uniform> p: Params;", "@group(0) @binding(8) var<uniform> p: Params;\n\n// whether query `row` (at `qpos`) attends to position `kp`: its tail block's, or a block it kept\nfn kept(row: u32, qpos: u32, kp: u32) -> bool {\n    let b = kp / p._pad0;\n    if (b >= (qpos + 1u) / p._pad0) { return true; }\n    return ((mask[row * p._pad1 + b / 32u] >> (b % 32u)) & 1u) == 1u;\n}");
+    assert!(src.contains("fn kept(") && src.contains("binding(6) var<storage, read_write> y"), "the mask's bindings");
+    for j in 0..8 {
+        let seen = format!("(k{j} <= vec4<u32>(qpos)) & (k{j} < vec4<u32>(p.kv_len))");
+        assert_eq!(src.matches(&seen).count(), 1, "the keys a query sees");
+        src = src.replace(&seen, &format!("{seen} & vec4<bool>(kept(q0 + tr, qpos, k{j}.x), kept(q0 + tr, qpos, k{j}.y), kept(q0 + tr, qpos, k{j}.z), kept(q0 + tr, qpos, k{j}.w))"));
+    }
+    src
+}
+
+/// [`QSA_SCORES`] for `heads` index heads (1 to 8) of a width a multiple of 4: each block's pooled key read once, a
+/// vec4 at a time, for every head's sum (a sum a load a head: a prompt's chunk of 512 over 3,584 blocks, 4 heads of
+/// 128, 8 ms a layer).
+fn qsa_scores4(heads: usize) -> String {
+    let each = |f: &dyn Fn(usize) -> String| (0..heads).map(f).collect::<String>();
+    let total = (0..heads).map(|h| format!("max(a{h}.x + a{h}.y + a{h}.z + a{h}.w, 0.0)")).collect::<Vec<_>>().join(" + ");
+    QSA_SCORES4
+        .replace("HEADS", &heads.to_string())
+        .replace("SUMS\n", &each(&|h| format!("        var a{h} = vec4<f32>(0.0);\n")))
+        .replace("STEPS\n", &each(&|h| format!("            a{h} += qs[{h}u * d4 + i] * v;\n")))
+        .replace("TOTAL", &total)
+}
+
+const QSA_SCORES4: &str = r#"
+@group(0) @binding(0) var<storage, read> q: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> pooled: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read_write> scores: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> qs: array<vec4<f32>, 512>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let d4 = p[0].z / 4u;
+    let nb = p[0].w;
+    let first = p[1].x;
+    let ratio = p[1].y;
+    let scale = bitcast<f32>(p[1].z);
+    let r = wg.y;
+    let hd4 = HEADSu * d4;
+    for (var i = li; i < hd4; i += 256u) { qs[i] = q[r * hd4 + i]; }
+    workgroupBarrier();
+    let j = wg.x * 256u + li;
+    if (j >= nb) { return; }
+    var total = bitcast<f32>(0xff800000u);
+    if (j < (first + r + 1u) / ratio) {
+SUMS
+        for (var i = 0u; i < d4; i++) {
+            let v = pooled[j * d4 + i];
+STEPS
+        }
+        total = (TOTAL) * scale;
+    }
+    scores[r * nb + j] = total;
+}
+"#;
+
 /// QSA's kept blocks of each query (`list`: `keep` a query, ascending, its first `min(visible, keep)` its own) as a
 /// bitmask (`mask`: `p[0].z` words a query), a thread a word: its blocks found in the list by bisection. `p[0]`: the
 /// queries, keep, words a query, the first query's position; `p[1].x`: the positions a block.
@@ -4871,7 +4935,10 @@ impl Recorder<'_> {
         let groups = words.div_ceil(256);
         self.dispatch_wide("chain-qsa-mask", QSA_MASK, [buffer(list), &d, &d, &d, &d, &d, buffer(&mask), &drw], &[rows as u32, keep as u32, mw as u32, first as u32, ratio as u32], (groups.min(65535), groups.div_ceil(65535), 1));
         let (q16, kv16) = self.attention_f16(q, kv, rows, kv_len, qs, row);
-        let src = attention_coop_masked(head_dim);
+        // (the keys 128 a block, their scores once; OAIY_ATTENTION_PASSES=2 or OAIY_ATTENTION_NARROW: twice, 32 a block)
+        static OLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let old = *OLD.get_or_init(|| std::env::var_os("OAIY_ATTENTION_NARROW").is_some() || std::env::var("OAIY_ATTENTION_PASSES").is_ok_and(|v| v == "2"));
+        let src = if old { attention_coop_masked(head_dim) } else { attention_coop_one_masked(head_dim) };
         let words = [n_h as u32, n_kv as u32, first as u32, rows as u32, kv_len as u32, scale.to_bits(), ratio as u32, mw as u32];
         self.dispatch_wide(name, &src, [buffer(&kv16), buffer(&q16), buffer(&mask), &d, &d, &d, buffer(out), &drw], &words, (n_h as u32, rows.div_ceil(32) as u32, 1));
         self.att16 = Some((q16, kv16));
@@ -6003,6 +6070,13 @@ impl ChainRecorder for Recorder<'_> {
         assert!(heads * d <= 2048 && q.len >= rows * heads * d && pooled.len >= nb * d && scores.len >= rows * nb, "chain: QSA's scores of {rows} rows over {nb} blocks");
         let dd = self.gpu().dummy().clone();
         let drw = self.gpu().dummy_rw().clone();
+        // a head a multiple of 4 wide, 8 heads at most: each pooled key read once for them all, a vec4 at a time
+        if d % 4 == 0 && (1..=8).contains(&heads) && std::env::var_os("OAIY_QSA_SCORES_F1").is_none() {
+            const NAMES: [&str; 9] = ["", "chain-qsa-scores4-1", "chain-qsa-scores4-2", "chain-qsa-scores4-3", "chain-qsa-scores4-4", "chain-qsa-scores4-5", "chain-qsa-scores4-6", "chain-qsa-scores4-7", "chain-qsa-scores4-8"];
+            let src = qsa_scores4(heads);
+            self.dispatch_wide(NAMES[heads], &src, [buffer(q), buffer(pooled), &dd, &dd, &dd, &dd, buffer(scores), &drw], &[rows as u32, heads as u32, d as u32, nb as u32, first as u32, ratio as u32, scale.to_bits()], ((nb as u32).div_ceil(256), rows as u32, 1));
+            return;
+        }
         self.dispatch_wide("chain-qsa-scores", QSA_SCORES, [buffer(q), buffer(pooled), &dd, &dd, &dd, &dd, buffer(scores), &drw], &[rows as u32, heads as u32, d as u32, nb as u32, first as u32, ratio as u32, scale.to_bits()], ((nb as u32).div_ceil(256), rows as u32, 1));
     }
 
