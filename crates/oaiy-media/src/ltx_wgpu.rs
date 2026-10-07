@@ -36,6 +36,11 @@ enum Values {
 
 impl Values {
     fn of(store: &mut Store, key: &str) -> Result<Self> {
+        // (a weight a LoRA adapts: the store's sum of the two, rounded as the reference rounds it, where the bytes as
+        // stored are the weight alone)
+        if store.adapted(key) {
+            return Ok(Self::F32(store.tensor(key, &Device::Cpu, false)?.to_dtype(candle_core::DType::F32)?.flatten_all()?.to_vec1::<f32>()?));
+        }
         Ok(match store.bf16_bytes(key)? {
             Some(bytes) => Self::Bf16(bytes),
             None => Self::F32(store.tensor_f32(key, &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?),
@@ -105,7 +110,9 @@ impl Linear {
             let scales = &all[..n * sc];
             let g = store.index.read(&global_name).map_err(err)?;
             let global = f32::from_le_bytes(g.get(..4).and_then(|b| b.try_into().ok()).ok_or_else(|| err(format!("{global_name} is not one F32")))?);
-            match gpu.nvfp4_weights(&packed, scales, global, n, k) {
+            // (a weight a LoRA adapts is no longer the NVFP4 stored: dense, with the LoRA's part)
+            let stored = if store.adapted(&key) { None } else { gpu.nvfp4_weights(&packed, scales, global, n, k) };
+            match stored {
                 Some((w, scale)) => (Weight::Nvfp4 { w, scale }, n, k),
                 None => (dense(gpu, &key, Values::of(store, &key)?, n, k)?, n, k),
             }
@@ -744,6 +751,85 @@ mod tests {
             // (its BF16 rounding at every op beside one step off at the inputs: within three times that)
             assert!(err <= (3.0 * spread).max(0.1), "{what}: relative error {err} where the reference's own spread is {spread}");
         }
+        Ok(())
+    }
+
+    /// A layer a LoRA adapts is loaded with it (`Store::add_lora`): its product the weight's plus the LoRA's scaled
+    /// `B A`, as f16 (a layer 8 wide) and as Q8_0 (256 wide, to its quantization), where a layer the LoRA does not
+    /// name is its weight alone.
+    #[test]
+    fn a_layer_a_lora_adapts_is_loaded_with_it() -> Result<()> {
+        let Ok(gpu) = ggml_rs_wgpu::WgpuBackend::new(Some(1 << 30)) else { return Ok(()) };
+        let dir = std::env::temp_dir().join(format!("oaiy-wgpu-lora-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let f32s = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let write = |path: &std::path::Path, tensors: &[(String, Vec<usize>, Vec<u8>)]| -> Result<()> {
+            let mut header = String::from("{");
+            let mut data = Vec::new();
+            for (i, (name, shape, bytes)) in tensors.iter().enumerate() {
+                if i > 0 {
+                    header.push(',');
+                }
+                header.push_str(&format!("\"{name}\":{{\"dtype\":\"F32\",\"shape\":{shape:?},\"data_offsets\":[{},{}]}}", data.len(), data.len() + bytes.len()));
+                data.extend_from_slice(bytes);
+            }
+            header.push('}');
+            let mut out = (header.len() as u64).to_le_bytes().to_vec();
+            out.extend_from_slice(header.as_bytes());
+            out.extend(data);
+            std::fs::write(path, out)?;
+            Ok(())
+        };
+        let mut seed = 0x9e37_79b9u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            ((seed >> 11) as f64 / (1u64 << 53) as f64 * 2. - 1.) as f32
+        };
+        let (n, rank, rows, scale) = (6usize, 2usize, 5usize, 0.7f32);
+        for k in [8usize, 256] {
+            let w: Vec<f32> = (0..n * k).map(|_| next()).collect();
+            let (a, b): (Vec<f32>, Vec<f32>) = ((0..rank * k).map(|_| next()).collect(), (0..n * rank).map(|_| next()).collect());
+            let bias: Vec<f32> = (0..n).map(|_| next()).collect();
+            let (model, lora) = (dir.join(format!("m{k}.safetensors")), dir.join(format!("l{k}.safetensors")));
+            write(&model, &[
+                ("model.diffusion_model.blk.to_q.weight".into(), vec![n, k], f32s(&w)),
+                ("model.diffusion_model.blk.to_q.bias".into(), vec![n], f32s(&bias)),
+                ("model.diffusion_model.blk.to_k.weight".into(), vec![n, k], f32s(&w)),
+            ])?;
+            write(&lora, &[("diffusion_model.blk.to_q.lora_A.weight".into(), vec![rank, k], f32s(&a)), ("diffusion_model.blk.to_q.lora_B.weight".into(), vec![n, rank], f32s(&b))])?;
+            let mut store = Store::open(&model, 0)?;
+            assert_eq!(store.add_lora(&lora, scale as f64)?, 1);
+            assert!(store.adapted("model.diffusion_model.blk.to_q.weight") && !store.adapted("model.diffusion_model.blk.to_k.weight"));
+            let x: Vec<f32> = (0..rows * k).map(|_| next()).collect();
+            for (name, adapted) in [("model.diffusion_model.blk.to_q", true), ("model.diffusion_model.blk.to_k", false)] {
+                let layer = Linear::load(&mut store, &gpu, name)?;
+                let (xv, yv) = (gpu.vec(rows * k), gpu.vec(rows * n));
+                gpu.upload(&xv, &x);
+                let mut rec = gpu.begin();
+                layer.forward(rec.as_mut(), &xv, &yv, rows);
+                rec.read(&yv);
+                let got = rec.finish().pop().unwrap();
+                // (against the weight with the LoRA's part, and against the weight alone: how far the LoRA moves it)
+                let (mut worst, mut size, mut alone) = (0f64, 0f64, 0f64);
+                for r in 0..rows {
+                    for i in 0..n {
+                        let part = |j: usize| scale as f64 * (0..rank).map(|q| b[i * rank + q] as f64 * a[q * k + j] as f64).sum::<f64>();
+                        let plain = (0..k).map(|j| w[i * k + j] as f64 * x[r * k + j] as f64).sum::<f64>() + if adapted { bias[i] as f64 } else { 0. };
+                        let want = plain + if adapted { (0..k).map(|j| part(j) * x[r * k + j] as f64).sum::<f64>() } else { 0. };
+                        worst = worst.max((got[r * n + i] as f64 - want).abs());
+                        alone = alone.max((got[r * n + i] as f64 - plain).abs());
+                        size = size.max(want.abs());
+                    }
+                }
+                eprintln!("{k} wide, {}: the worst error {worst:.2e} of {size:.2} (from the weight alone {alone:.2e})", if adapted { "with the LoRA" } else { "no LoRA on it" });
+                // (f16's rounding of the weights, or Q8_0's quantization of them)
+                assert!(worst <= size * if k % 256 == 0 { 0.03 } else { 5e-3 }, "{name}, {k} wide: {worst} of {size}");
+                assert!(!adapted || alone > 20. * worst, "{name}, {k} wide: the LoRA's part is in the product");
+            }
+        }
+        std::fs::remove_dir_all(dir)?;
         Ok(())
     }
 

@@ -339,6 +339,12 @@ impl Store {
         Ok(self.lora.len())
     }
 
+    /// Whether a LoRA adapts `key`'s weight ([`Self::add_lora`]): [`Self::tensor`] then gives it with the LoRA's part
+    /// added, where the bytes as stored ([`Self::bf16_bytes`], the index's own reads) are the weight without it.
+    pub fn adapted(&self, key: &str) -> bool {
+        self.lora.contains_key(key)
+    }
+
     pub fn tensor(&mut self, key: &str, dev: &Device, cache: bool) -> Result<Tensor> {
         let t = self.tensor_plain(key, dev, cache)?;
         match self.lora.get(key) {

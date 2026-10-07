@@ -509,7 +509,6 @@ impl Request {
         if self.webgpu {
             let unsupported = [
                 (self.audio || self.audio_file.is_some() || self.speech.is_some() || self.reference_voice.is_some() || self.identity, "sound (set audio to false)"),
-                (self.lora.is_some(), "LoRAs"),
                 (self.refine.is_some(), "two-stage refinement"),
             ];
             if let Some((_, what)) = unsupported.iter().find(|(on, _)| *on) {
@@ -1821,9 +1820,9 @@ mod tests {
         assert!(r.webgpu && !r.audio, "sound off by default on WebGPU, though the checkpoint has its VAE");
         assert!(request(r#","guidance":{"steps":30}"#).unwrap().guidance.is_some(), "guided sampling, its negative prompt by CFG");
         assert!(request(r#","negative_prompt":"n""#).unwrap().negative_prompt.is_some(), "a negative prompt without CFG: by NAG");
+        assert!(request(r#","lora":"l""#).unwrap().lora.is_some(), "a LoRA: the weights it adapts loaded with it");
         for (extra, what) in [
             (r#","audio":true"#, "sound"),
-            (r#","lora":"l""#, "LoRAs"),
             (r#","refine":{"transformer":"t","upsampler":"u"}"#, "refinement"),
         ] {
             let e = request(extra).unwrap_err();
