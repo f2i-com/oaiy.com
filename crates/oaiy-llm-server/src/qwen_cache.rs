@@ -5,20 +5,63 @@ use ggml_rs::{Backend, Tensor};
 use llama_rs::{KvCache, qwen35::SsmConfig};
 use std::sync::Arc;
 
-/// `slots`' tensors on the host: those a layer's device holds as its chain's vectors read back together, one wait a
-/// device for them all and their bytes copied on every core (a tensor at a time was a wait each: the 27B's 96
-/// recurrent tensors, 149 MB, 34 ms a checkpoint where 29 now, the transfer's own), the rest each its own.
-fn hosted(kv: &KvCache, slots: &[Option<Tensor>]) -> Vec<Option<Tensor>> {
+/// `t` for a cache to take as its own: a checkpoint's tensor still on a device is the checkpoint's vector there, which
+/// a run would write over, so its values from the host.
+fn its_own(t: &Tensor) -> Tensor {
+    if t.is_device() { t.to_host() } else { t.clone() }
+}
+
+/// The layers of `left` on the first of them's device (a layer's the cache's own for it, else `fallback`), that
+/// device, and the rest.
+fn by_device<'a>(kv: &'a KvCache, left: &[usize], fallback: Option<&'a Arc<dyn Backend>>) -> (Vec<usize>, Option<&'a Arc<dyn Backend>>, Vec<usize>) {
+    let of = |i: usize| kv.layer_backends.get(i).or(fallback);
+    let backend = of(left[0]);
+    let same = |i: usize| match (backend, of(i)) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    };
+    let (these, rest): (Vec<usize>, Vec<usize>) = left.iter().partition(|&&i| same(i));
+    (these, backend, rest)
+}
+
+/// `slots`' tensors as they are now, apart from the cache's: those a layer's device holds as its chain's vectors
+/// copied there into new vectors (submitted, not waited for), the rest read to the host.
+fn copied(kv: &KvCache, slots: &[Option<Tensor>], fallback: Option<&Arc<dyn Backend>>) -> Vec<Option<Tensor>> {
     let mut out: Vec<Option<Tensor>> = slots.iter().map(|_| None).collect();
-    // (the layers by their devices, in turn)
     let mut left: Vec<usize> = (0..slots.len()).filter(|&i| slots[i].is_some()).collect();
-    while let Some(&first) = left.first() {
-        let backend = kv.layer_backends.get(first);
-        let same = |i: usize| match (backend, kv.layer_backends.get(i)) {
-            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-            _ => false,
-        };
-        let (these, rest): (Vec<usize>, Vec<usize>) = left.iter().partition(|&&i| i == first || same(i));
+    while !left.is_empty() {
+        let (these, backend, rest) = by_device(kv, &left, fallback);
+        left = rest;
+        if let Some(chain) = backend.and_then(|b| b.chain()) {
+            let vectors: Vec<(usize, ggml_rs::DeviceVec)> = these.iter().filter_map(|&i| Some((i, chain.aliased(slots[i].as_ref()?)?))).collect();
+            if !vectors.is_empty() {
+                let mut rec = chain.begin();
+                for (i, v) in &vectors {
+                    let copy = chain.vec(v.len);
+                    rec.copy(v, 0, &copy, 0, v.len);
+                    out[*i] = Some(chain.alias(&copy, slots[*i].as_ref().expect("a tensor").shape().to_vec()));
+                }
+                // (gone to the GPU after what is there already; nothing of it read here)
+                rec.flush();
+            }
+        }
+        for i in these {
+            if out[i].is_none() {
+                out[i] = slots[i].as_ref().map(Tensor::to_host);
+            }
+        }
+    }
+    out
+}
+
+/// `slots`' tensors on the host: those a layer's device holds as its chain's vectors read back together, one wait a
+/// device for them all and their bytes copied on every core, the rest each its own.
+fn hosted(kv: &KvCache, slots: &[Option<Tensor>], fallback: Option<&Arc<dyn Backend>>) -> Vec<Option<Tensor>> {
+    let mut out: Vec<Option<Tensor>> = slots.iter().map(|_| None).collect();
+    let mut left: Vec<usize> = (0..slots.len()).filter(|&i| slots[i].is_some()).collect();
+    while !left.is_empty() {
+        let (these, backend, rest) = by_device(kv, &left, fallback);
         left = rest;
         let chain = backend.and_then(|b| b.chain());
         let vectors: Vec<(usize, ggml_rs::DeviceVec)> = these.iter().filter_map(|&i| Some((i, chain?.aliased(slots[i].as_ref()?)?))).collect();
@@ -58,10 +101,33 @@ impl RecurrentSnapshot {
         Self(Snapshot { pos: snapshot.pos, layers: snapshot.layers.iter()
             .map(|layer| [None, None, layer[2].clone(), layer[3].clone()]).collect() })
     }
+    /// The cache's recurrent tensors, on the host.
     pub fn capture(kv: &KvCache) -> Self {
-        let mut states = hosted(kv, &kv.ssm_state);
-        let mut convs = hosted(kv, &kv.ssm_conv);
+        let mut states = hosted(kv, &kv.ssm_state, None);
+        let mut convs = hosted(kv, &kv.ssm_conv, None);
         Self(Snapshot { pos: kv.len, layers: (0..kv.ssm_state.len()).map(|i| [None, None, states[i].take(), convs[i].take()]).collect() })
+    }
+    /// [`Self::capture`] with no wait for the GPU: the tensors a device's chain holds (a layer's device the cache's
+    /// own for it, else `backend`) are copied there into vectors of their own, and [`Self::settle`] brings them to
+    /// the host once the reply is out (the 27B's 149 MB read to the host was 30 ms of a prompt, a checkpoint or two a
+    /// prompt); the rest are read to the host here.
+    pub fn capture_later(kv: &KvCache, backend: Option<&Arc<dyn Backend>>) -> Self {
+        let mut states = copied(kv, &kv.ssm_state, backend);
+        let mut convs = copied(kv, &kv.ssm_conv, backend);
+        Self(Snapshot { pos: kv.len, layers: (0..kv.ssm_state.len()).map(|i| [None, None, states[i].take(), convs[i].take()]).collect() })
+    }
+    /// The tensors still on a device brought to the host (the cards' memory is the models'): for when the GPU has
+    /// nothing else to do.
+    pub fn settle(&mut self, kv: &KvCache, backend: Option<&Arc<dyn Backend>>) {
+        if !self.0.layers.iter().flatten().flatten().any(Tensor::is_device) || self.0.layers.len() != kv.ssm_state.len() {
+            return;
+        }
+        for slot in 2..4 {
+            let tensors: Vec<Option<Tensor>> = self.0.layers.iter().map(|l| l[slot].clone()).collect();
+            for (layer, t) in self.0.layers.iter_mut().zip(hosted(kv, &tensors, backend)) {
+                layer[slot] = t;
+            }
+        }
     }
     pub fn bytes(&self) -> usize {
         self.0.layers.iter().flatten().flatten().map(|t| t.numel()*4).sum()
@@ -75,8 +141,8 @@ impl RecurrentSnapshot {
         }
         for (i, layer) in self.0.layers.iter().enumerate() {
             let backend = kv.layer_backends[i].clone();
-            kv.ssm_state[i] = layer[2].as_ref().map(|t| backend.to_device(t.clone()));
-            kv.ssm_conv[i] = layer[3].as_ref().map(|t| backend.to_device(t.clone()));
+            kv.ssm_state[i] = layer[2].as_ref().map(|t| backend.to_device(its_own(t)));
+            kv.ssm_conv[i] = layer[3].as_ref().map(|t| backend.to_device(its_own(t)));
         }
         kv.len = self.0.pos;
         Ok(())
@@ -137,8 +203,8 @@ impl Snapshot {
                 backend.copy_axis0_into(&mut kv.k[i], 0, &backend.to_device(k.clone()));
                 backend.copy_axis0_into(&mut kv.v[i], 0, &backend.to_device(v.clone()));
             }
-            kv.ssm_state[i] = layer[2].as_ref().map(|t| backend.to_device(t.clone()));
-            kv.ssm_conv[i] = layer[3].as_ref().map(|t| backend.to_device(t.clone()));
+            kv.ssm_state[i] = layer[2].as_ref().map(|t| backend.to_device(its_own(t)));
+            kv.ssm_conv[i] = layer[3].as_ref().map(|t| backend.to_device(its_own(t)));
         }
         kv.len = self.pos;
         Ok(())

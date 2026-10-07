@@ -623,7 +623,7 @@ impl QwenEngine {
                         }
                     }
                 }
-                let snap = RecurrentSnapshot::capture(&self.kv);
+                let snap = RecurrentSnapshot::capture_later(&self.kv, model.map(|m| &m.backend));
                 self.checkpoints.push((keys[..pos].to_vec(), snap, base));
                 // Keep the system prefix plus recent conversation boundaries.
                 // Host storage avoids competing with media for VRAM.
@@ -730,6 +730,11 @@ impl QwenEngine {
         if self.log { eprintln!("  Qwen: {} prompt tokens ({} cached) in {:.2}s; {} generated in {:.2}s (sampling {t_sample:.2}s, text {t_text:.2}s, model {t_model:.2}s){}", job.prompt.len(),start,prefill_secs,generated.len(),decode_clock.elapsed().as_secs_f64(), if drafts_checked > 0 { format!("; {drafts_taken} of {drafts_checked} drafts taken") } else { String::new() }); }
         if !text.is_empty() { let _ = job.events.send(Event::Text(text)); }
         let _ = job.events.send(Event::Done { finish, completion_tokens: generated.len() });
+        // the reply is out: this prompt's checkpoints' states, copied on their devices as it ran, to the host now
+        let device = self.model.qwen35().map(|m| &m.backend);
+        for (_, snap, _) in &mut self.checkpoints {
+            snap.settle(&self.kv, device);
+        }
         Ok(())
     }
 }
@@ -757,19 +762,10 @@ fn trim_checkpoints(checkpoints: &mut Vec<(Vec<u64>, RecurrentSnapshot, bool)>) 
 /// Save before the first user message, before the current assistant header
 /// (thinking/tool rendering changes its suffix), and one token short of the
 /// entire prompt so an identical retry still runs a token to recover logits.
-/// A checkpoint this close before the prompt's last token serves the same prompt asked again as one at that token
-/// would: the tokens between are run from it.
-const NEAR_THE_END: usize = 16;
-
 fn checkpoint_positions(prompt: &[u32], im_start: Option<u32>) -> Vec<usize> {
     let boundaries: Vec<_> = prompt.iter().enumerate().filter_map(|(i, &t)|
         (i > 0 && Some(t) == im_start).then_some(i)).collect();
-    // The position before the last (the same prompt asked again runs one token), unless the last boundary is a few
-    // tokens back (a chat's: the assistant's header): a checkpoint is the recurrent states to the host (the 27B's
-    // 149 MB, 30 ms) and a run cut in two there, each prompt, for the header's few tokens' 30 ms when one is asked again.
-    let last = prompt.len().saturating_sub(1);
-    let mut stops = Vec::new();
-    if boundaries.last().map_or(true, |&b| last.saturating_sub(b) > NEAR_THE_END) { stops.push(last); }
+    let mut stops = vec![prompt.len().saturating_sub(1)];
     stops.extend(boundaries.first().copied());
     stops.extend(boundaries.last().copied());
     stops.retain(|&p| p > 0 && p < prompt.len());
@@ -851,12 +847,7 @@ mod tests {
         let first = [1, 10, 11, 1, 20, 21, 1, 30, 31, 32];
         let next = [1, 10, 11, 1, 20, 21, 1, 30, 40, 41, 1, 50];
         let stops = checkpoint_positions(&first, Some(1));
-        // (the last boundary three tokens from the end: none at the token before the last)
-        assert_eq!(stops, [3, 6]);
-        // a boundary far from the end leaves the one before the last token
-        let mut long = vec![7u32; 40];
-        long[3] = 1;
-        assert_eq!(checkpoint_positions(&long, Some(1)), [3, 39]);
+        assert_eq!(stops, [3, 6, 9]);
         assert_eq!(stops.iter().copied().filter(|&p| next.starts_with(&first[..p])).max(), Some(6));
         assert_eq!(checkpoint_positions(&[1], Some(1)), []);
         assert_eq!(checkpoint_positions(&[7, 8, 9], None), [2]);
