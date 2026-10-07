@@ -65,8 +65,17 @@ pub fn layout(dtype: GgmlType) -> Option<(u32, u32, &'static str)> {
         GgmlType::Q5_K => (256, 176, Q5_K),
         GgmlType::Q6_K => (256, 210, Q6_K),
         GgmlType::IQ4_XS => (256, 136, IQ4_XS),
-        // (the grid types: each its decode with ggml's tables beside it)
-        GgmlType::IQ2_XXS | GgmlType::IQ2_XS | GgmlType::IQ2_S | GgmlType::IQ3_XXS | GgmlType::IQ3_S | GgmlType::IQ1_S | GgmlType::IQ1_M => (256, dtype.type_size() as u32, iq_grid_dequant(dtype)?),
+        // The grid types (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M) are NOT on the GPU: `iq_grid_dequant`
+        // decodes them rightly (the CPU's values at 1 to 70 rows), but with its tables WGSL constants indexed at run
+        // time, which a compiler copies into the function at each call: the cross-type test took 11 s where 0.7, and
+        // the same tables in the routed experts' kernel ran one dispatch past Windows' two seconds and reset the
+        // driver (2026-10-07). Until the tables are a storage buffer's, a matrix of these types stays on the host
+        // (`WgpuBackend::supports` says no; OAIY_GRID_ON_GPU=1 the constants' kernel, for small shapes only).
+        GgmlType::IQ2_XXS | GgmlType::IQ2_XS | GgmlType::IQ2_S | GgmlType::IQ3_XXS | GgmlType::IQ3_S | GgmlType::IQ1_S | GgmlType::IQ1_M
+            if std::env::var_os("OAIY_GRID_ON_GPU").is_some() =>
+        {
+            (256, dtype.type_size() as u32, iq_grid_dequant(dtype)?)
+        }
         _ => return None,
     })
 }

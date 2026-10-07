@@ -82,8 +82,8 @@ fn backend() -> Option<WgpuBackend> {
     }
 }
 
-const TYPES: [GgmlType; 20] = [
-    GgmlType::IQ2_XXS, GgmlType::IQ2_XS, GgmlType::IQ2_S, GgmlType::IQ3_XXS, GgmlType::IQ3_S, GgmlType::IQ1_S, GgmlType::IQ1_M,
+// (the grid types, IQ2_XXS to IQ1_M, are off the GPU until their tables are a buffer's: `shaders::layout`)
+const TYPES: [GgmlType; 13] = [
     GgmlType::Q2_0, GgmlType::Q4_0, GgmlType::Q4_1, GgmlType::Q5_0, GgmlType::Q5_1, GgmlType::Q8_0, GgmlType::IQ4_NL,
     GgmlType::Q2_K, GgmlType::Q3_K, GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K, GgmlType::IQ4_XS,
 ];
