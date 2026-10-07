@@ -132,6 +132,13 @@ impl Source<'_> {
     }
 }
 
+/// The bytes of a GGUF's matrices a device holds beside its experts (every tensor but the routed experts', the
+/// embeddings and the n-gram table, which stay in the file): what a device's experts leave room for.
+pub(crate) fn dense_bytes(path: &Path) -> Result<u64> {
+    let g = GgufFile::open_streaming(path).map_err(|e| bad(e.to_string()))?;
+    Ok(g.tensors().iter().filter(|t| !(t.name.contains("_exps.") || t.name == "token_embd.weight" || t.name == "per_layer_token_embd.weight")).map(|t| t.nbytes()).sum())
+}
+
 /// One MoE layer's experts as a GGUF holds them: the routed ones' gate and up (`[experts][ff][hidden]`) and down
 /// (`[experts][hidden][ff]`) each its type and its blocks' bytes, row after row; the shared expert's three matrices
 /// dequantized (gate and up `[ff, hidden]`, down `[hidden, ff]`).

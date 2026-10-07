@@ -927,10 +927,50 @@ impl Models {
         Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Qwen(tok)) })
     }
 
+    /// Qwen3.8-Flash-Next from a GGUF (`qwen4exp`: the GSQ-RCO files) on WebGPU: its layers over every discrete GPU, a
+    /// layer's experts on its device in the file's type while the budget holds them (the rest on the host), the dense
+    /// matrices in theirs. No adapters, no vision tower and no multi-token-prediction layer (the GGUFs carry none).
+    #[cfg(all(not(feature = "cuda"), feature = "webgpu"))]
+    fn load_flashnext_gguf(&self, spec: &Spec, path: &Path) -> Result<Live> {
+        let o = &self.opts;
+        if o.lora_adapters.contains_key(&spec.name) {
+            return Err(Error::Arg(format!("{}: LoRA adapters are not applied to a GGUF", spec.name)));
+        }
+        let picked = crate::backend::open(o, &o.devices)?;
+        self.say(format!("{} runs on {} (a GGUF: each matrix in its file's type)", spec.name, picked.label));
+        let wgpu = picked.backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>();
+        let others: Vec<Arc<ggml_rs_wgpu::WgpuBackend>> = wgpu.map(|b| b.others(o.webgpu_gb.map(|g| g << 30))).unwrap_or_default().into_iter().map(Arc::new).collect();
+        let gpus: Vec<&ggml_rs_wgpu::WgpuBackend> = wgpu.into_iter().chain(others.iter().map(|g| g.as_ref())).collect();
+        let backends: Vec<Arc<dyn ggml_rs::Backend>> =
+            std::iter::once(Arc::clone(&picked.backend)).chain(others.iter().map(|g| Arc::clone(g) as Arc<dyn ggml_rs::Backend>)).collect();
+        let model = flashnext_gguf_on(path, &gpus, backends)?;
+        let warm = std::time::Instant::now();
+        if model.warm_up() {
+            self.say(format!("{}: its chained steps ready in {:.1} s", spec.name, warm.elapsed().as_secs_f64()));
+        }
+        for (d, g) in gpus.iter().enumerate() {
+            let (used, budget) = g.usage();
+            self.say(format!("{}: {:.1} GB of its weights on GPU {d} ({} at {}, budget {:.0} GB), the rest on the CPU", spec.name, used as f64 / 1e9, g.adapter().name, g.adapter().pci_bus_id, budget as f64 / 1e9));
+        }
+        let tok = Arc::new(model.tokenizer.clone());
+        let max_seq = self.context(model.config.context_length).min(16384);
+        let mut cfg = self.base_cfg(spec, max_seq);
+        cfg.image_token_id = tok.token_id("<|image_pad|>").ok_or_else(|| Error::Arg("Flash-Next tokenizer lacks image_pad".into()))?;
+        let (jobs, rx) = std::sync::mpsc::channel();
+        let park = crate::qwen_park::budget(o.park_gb, ggml_rs_wgpu::host_memory().map(|(free, _)| free as u64));
+        let e = crate::qwen::QwenEngine::new(crate::qwen::Hybrid::Flash(Box::new(model)), None, max_seq, !o.quiet && !o.silent).park_up_to(park);
+        let thread = std::thread::Builder::new().name("flashnext-model".into()).spawn(move || e.run(rx))?;
+        Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Qwen(tok)) })
+    }
+
     // ---------------------------------------------------------------- GGUF
     fn load_gguf(&self, spec: &Spec) -> Result<Live> {
         let o = &self.opts;
         let path = Kind::gguf_path(&spec.path)?;
+        #[cfg(all(not(feature = "cuda"), feature = "webgpu"))]
+        if crate::flashnext::gguf_file::detect(&path) {
+            return self.load_flashnext_gguf(spec, &path);
+        }
         // Every card `--devices` names, in that order: the first carries the trunk
         // and the rest take a share of the MoE layers. `open_cards` hands back the
         // same instances the expert tier will use, so the trunk and card 0's expert
@@ -1284,6 +1324,27 @@ fn gpu_selection_adapts_to_single_device() {
 
 /// Where a dense GGUF model's decode step goes on WebGPU: a 3B Llama, a prompt then steps, each with the backend's
 /// counters (`ggml_rs_wgpu::profile`).
+/// Qwen3.8-Flash-Next from the GGUF at `path` over `gpus` (the devices `backends` are, in order): each quantized matrix
+/// and each matrix of floats a chain reads packed on its layer's device, a layer's experts there while the device's
+/// budget holds them beside its share of the dense matrices, else on the host.
+#[cfg(feature = "webgpu")]
+pub(crate) fn flashnext_gguf_on(path: &Path, gpus: &[&ggml_rs_wgpu::WgpuBackend], backends: Vec<Arc<dyn ggml_rs::Backend>>) -> Result<crate::flashnext::FlashNext> {
+    use crate::flashnext::gguf_file::{dense_bytes, load, ExpertBlocks};
+    let on = |device: usize| gpus.get(device).copied().ok_or_else(|| "no GPU to hold it".to_string());
+    let quant = |device: usize, w: ggml_rs::QuantizedTensor| on(device)?.quant_linear(w);
+    let float = |device: usize, values: Vec<f32>, n: usize, k: usize| on(device)?.half_linear(values, n, k);
+    let reserve = dense_bytes(path)? / backends.len().max(1) as u64 + (1 << 30);
+    let experts = |device: usize, e: ExpertBlocks| -> Result<Box<dyn ggml_rs::exl3::Experts>> {
+        let data = ggml_rs_wgpu::quant_moe::QuantExpertsData { hidden: e.hidden, ff: e.ff, experts: e.experts, gate: e.gate, up: e.up, down: e.down, shared: e.shared };
+        match gpus.get(device) {
+            Some(b) => b.quant_experts_leaving(data, reserve),
+            None => ggml_rs_wgpu::quant_moe::quant_experts_cpu(data),
+        }
+        .map_err(Error::Arg)
+    };
+    load(path, backends, &quant, &float, &experts)
+}
+
 #[cfg(all(test, feature = "webgpu", not(feature = "cuda")))]
 mod dense_webgpu_timing {
     #[test]
@@ -1366,6 +1427,66 @@ mod dense_webgpu_timing {
         eprintln!("prompt {n}: host {host_s:.2} s, chained {chain_s:.2} s for 64 steps; worst logits cosine {worst:.6}");
         assert_eq!(host_tokens, chain_tokens);
         assert!(worst >= 0.9999, "{worst}");
+    }
+
+    /// Qwen3.8-Flash-Next from a GGUF (FLASHNEXT_GGUF, its first shard) chained on the GPUs answers as its own host
+    /// path does (the same weights through the host's matmuls and its experts' reference): the prompt as one chunk,
+    /// then step by step on the host path's greedy tokens, each step's logits close; and what it writes reads as an
+    /// answer (printed: a wrong tensor or layout writes noise). FLASHNEXT_STEPS: the steps (48).
+    #[test]
+    #[ignore = "needs WebGPU adapters with room for Qwen3.8-Flash-Next and its GGUF (FLASHNEXT_GGUF)"]
+    fn a_flashnext_gguf_chained_answers_as_its_own_path() {
+        use std::sync::Arc;
+        let Ok(path) = std::env::var("FLASHNEXT_GGUF") else { return };
+        let Ok(b0) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
+        let others: Vec<Arc<ggml_rs_wgpu::WgpuBackend>> = if std::env::var_os("OAIY_NO_SPLIT").is_some() { Vec::new() } else { b0.others(None).into_iter().map(Arc::new).collect() };
+        let b0 = Arc::new(b0);
+        let gpus: Vec<&ggml_rs_wgpu::WgpuBackend> = std::iter::once(b0.as_ref()).chain(others.iter().map(|g| g.as_ref())).collect();
+        let backends: Vec<Arc<dyn ggml_rs::Backend>> = std::iter::once(Arc::clone(&b0) as Arc<dyn ggml_rs::Backend>).chain(others.iter().map(|g| Arc::clone(g) as Arc<dyn ggml_rs::Backend>)).collect();
+        let clock = std::time::Instant::now();
+        let model = super::flashnext_gguf_on(std::path::Path::new(&path), &gpus, backends).unwrap();
+        eprintln!("loaded in {:.1} s over {} GPUs: {}", clock.elapsed().as_secs_f64(), gpus.len(), gpus.iter().map(|g| format!("{:.1} GB", g.usage().0 as f64 / 1e9)).collect::<Vec<_>>().join(", "));
+        let steps: usize = std::env::var("FLASHNEXT_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(48);
+        let text = "<|im_start|>user\nWrite a short story about a cat called Moss who lives on a boat.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+        let prompt: Vec<u32> = model.tokenizer.encode(text, true).unwrap();
+        let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
+        let cosine = |a: &[f32], b: &[f32]| {
+            let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
+            let n = |v: &[f32]| v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            dot / (n(a) * n(b))
+        };
+        let (mut kh, mut kc) = (model.new_kv_cache(prompt.len() + steps + 64), model.new_kv_cache(prompt.len() + steps + 64));
+        let e = model.embed_text(&prompt).unwrap();
+        let t = std::time::Instant::now();
+        let lh = model.forward_host(&prompt, &e, &mut kh, None).unwrap();
+        let ph = t.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        let lc = model.forward(&prompt, &e, &mut kc, None).unwrap();
+        let pc = t.elapsed().as_secs_f64();
+        let prompt_cos = cosine(lh.data(), lc.data());
+        eprintln!("the prompt's {} tokens: host {:.0} ms, chained {:.0} ms; logits cosine {prompt_cos:.6}, the same greedy token {}", prompt.len(), ph * 1e3, pc * 1e3, argmax(lh.data()) == argmax(lc.data()));
+        let mut next = argmax(lh.data());
+        let (mut worst, mut same, mut th, mut tc) = (1.0f64, 0usize, 0f64, 0f64);
+        let mut written = vec![next];
+        for _ in 0..steps {
+            let e = model.embed_text(&[next]).unwrap();
+            let t = std::time::Instant::now();
+            let host = model.forward_host(&[next], &e, &mut kh, None).unwrap();
+            th += t.elapsed().as_secs_f64();
+            let t = std::time::Instant::now();
+            let chained = model.forward(&[next], &e, &mut kc, None).unwrap();
+            tc += t.elapsed().as_secs_f64();
+            worst = worst.min(cosine(host.data(), chained.data()));
+            same += (argmax(host.data()) == argmax(chained.data())) as usize;
+            next = argmax(host.data());
+            written.push(next);
+        }
+        let runs = model.chain_runs();
+        eprintln!("{steps} steps: host {:.1} ms a step, chained {:.1} ms ({runs} chained); worst logits cosine {worst:.6}; the same greedy token {same} of {steps}", th * 1e3 / steps as f64, tc * 1e3 / steps as f64);
+        eprintln!("it writes: {:?}", model.tokenizer.decode(&written));
+        assert!(prompt_cos > 0.99, "{prompt_cos}");
+        assert!(worst > 0.99, "{worst}");
+        assert_eq!(runs, steps + 1, "the prompt and every step chained");
     }
 
     /// Qwen3.8-Flash-Next chained on the GPUs (its layers over every discrete one) answers as its own path does: the
