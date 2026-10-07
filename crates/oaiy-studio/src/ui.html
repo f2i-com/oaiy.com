@@ -907,13 +907,12 @@ dialog::backdrop { background: var(--backdrop); }
           <label class="f"><span>Prompt cache on disk (GB)</span><input type="number" step="0.5" data-bind="llm.prompt_cache_gb" data-type="num"></label>
           <label class="f"><span>Flash-Next: conversations set aside in RAM (GB, 0 = off, empty = the server's default)</span><input type="number" step="0.5" min="0" data-bind="llm.park_gb" data-type="numnull" placeholder="8"></label>
           <label class="f"><span>Runs on</span><select data-bind="llm.backend">
-            <option value="auto">Auto: CUDA, else WebGPU, else CPU</option>
-            <option value="cuda">CUDA (NVIDIA)</option>
+            <option value="auto">Auto: a GPU (WebGPU), else the CPU</option>
             <option value="webgpu">WebGPU (any GPU)</option>
             <option value="cpu">CPU only</option></select></label>
           <label class="f"><span>WebGPU weights (GB, empty = by GPU type)</span><input type="number" min="0" data-bind="llm.webgpu_gb" data-type="intnull" placeholder="8 discrete, 2 integrated"></label>
         </div>
-        <p class="muted small">WebGPU runs GGUF models on any Direct3D 12, Vulkan or Metal GPU: the quantized matmuls go to the GPU, everything else runs on the CPU, and weights past the limit stay in RAM. DeepSeek and EXL3 checkpoints need CUDA.</p>
+        <p class="muted small">WebGPU runs every model on any Direct3D 12, Vulkan or Metal GPU: weights past the limit stay in RAM and run on the CPU.</p>
         <div class="row" style="margin-top:14px; gap:22px">
           <label class="check"><input type="checkbox" data-bind="llm.enabled"> Enabled</label>
           <label class="check"><input type="checkbox" data-bind="llm.autostart"> Load at startup</label>
@@ -925,8 +924,8 @@ dialog::backdrop { background: var(--backdrop); }
       <div class="block">
         <h2>Programs and folders</h2>
         <div class="grid-f" style="grid-template-columns:1fr">
-          <label class="f"><span>oaiy-llm-server (CUDA build)</span><div class="pathfield"><input type="text" data-bind="llm.server"><button class="btn" type="button" data-pick="llm.server">Browse</button></div></label>
-          <label class="f"><span>oaiy-llm-server-webgpu (for machines without CUDA)</span><div class="pathfield"><input type="text" data-bind="llm.server_webgpu"><button class="btn" type="button" data-pick="llm.server_webgpu">Browse</button></div></label>
+          <label class="f"><span>oaiy-llm-server</span><div class="pathfield"><input type="text" data-bind="llm.server"><button class="btn" type="button" data-pick="llm.server">Browse</button></div></label>
+          <label class="f"><span>oaiy-llm-server-webgpu (the same server's other name: used when the one above is not there)</span><div class="pathfield"><input type="text" data-bind="llm.server_webgpu"><button class="btn" type="button" data-pick="llm.server_webgpu">Browse</button></div></label>
           <label class="f"><span>oaiy-media</span><div class="pathfield"><input type="text" data-bind="media.worker"><button class="btn" type="button" data-pick="media.worker">Browse</button></div></label>
           <label class="f"><span>FFmpeg</span><div class="pathfield"><input type="text" data-bind="media.video.ffmpeg"><button class="btn" type="button" data-pick="media.video.ffmpeg">Browse</button></div></label>
           <label class="f"><span>Output folder</span><div class="pathfield"><input type="text" data-bind="media.output_dir"><button class="btn" type="button" data-pick="media.output_dir" data-dir="1">Browse</button></div></label>
@@ -1557,7 +1556,7 @@ function renderHardware() {
       <div class="meter"><div style="width:${used / ram.total_mb * 100}%;background:var(--ram)"></div></div>
       <div class="num small">${gb(used)} / ${gb(ram.total_mb)} GB</div></div>`);
   }
-  hw.innerHTML = rows.join("") || '<div class="empty">No NVIDIA GPU reported (nvidia-smi not found). CPU-only builds still run image and video jobs, slowly.</div>';
+  hw.innerHTML = rows.join("") || '<div class="empty">No GPU or memory reported. Without a GPU the engines run on the CPU, slowly, and video, sound, speech and 3D do not run.</div>';
   $("#hw-note").textContent = sys?.gpus?.length ? "" : "";
 }
 function renderState() {

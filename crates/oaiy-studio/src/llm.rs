@@ -2,10 +2,10 @@
 //! private loopback port with a random key. The gateway proxies to it; nothing
 //! else can reach it.
 //!
-//! A separate process rather than a linked library: oaiy-llm-server needs CUDA at
-//! build time and holds GPU memory that only process exit reliably returns, so
-//! stopping it (for a media job that needs its GPU, or after idling) is a kill,
-//! and a crash takes down the model, not the studio.
+//! A separate process rather than a linked library: oaiy-llm-server holds GPU
+//! memory that only process exit reliably returns, so stopping it (for a media
+//! job that needs its GPU, or after idling) is a kill, and a crash takes down
+//! the model, not the studio.
 
 use crate::config;
 use crate::util::{bool_or, int_or, num_or, random_id, str_or, LogRing};
@@ -58,10 +58,6 @@ struct Inner {
     /// The context the loaded model was opened with, as oaiy-llm-server reported it.
     context: Option<i64>,
     command: String,
-    /// Launches still to try if this one dies while loading (auto: CUDA, then WebGPU).
-    fallbacks: Vec<Launch>,
-    /// Arguments, key and folder of the current launch, for a fallback.
-    relaunch: Option<(Vec<String>, String, PathBuf)>,
 }
 
 /// One way to start the server: the program and its `--backend`.
@@ -71,54 +67,40 @@ pub struct Launch {
     pub backend: &'static str,
 }
 
-/// Whether an NVIDIA driver answers (`nvidia-smi -L` lists a GPU).
-pub(crate) fn nvidia_present() -> bool {
-    let mut c = Command::new("nvidia-smi");
-    c.arg("-L").stdin(Stdio::null()).stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        c.creation_flags(0x0800_0000);
+/// What `llm.backend` asks of the server: `webgpu`, `cpu`, else `auto` (a GPU through WebGPU when there is one,
+/// else the CPU). `cuda`, which a configuration from the CUDA build may still say, is `auto`: the GPU it meant.
+pub fn backend(llm: &Json) -> &'static str {
+    match str_or(llm, "backend", "auto") {
+        "webgpu" => "webgpu",
+        "cpu" => "cpu",
+        _ => "auto",
     }
-    c.output().is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("GPU"))
 }
 
-/// Which server programs to try, in order, for `llm.backend`:
-/// - `cuda`: `llm.server` (the CUDA build);
-/// - `webgpu` / `cpu`: `llm.server_webgpu` (built without CUDA, so it starts on
-///   any machine);
-/// - `auto`: the CUDA build when an NVIDIA GPU answers and the program exists,
-///   falling back to the WebGPU build if it dies while loading; the WebGPU build
-///   (WebGPU, else CPU) otherwise.
-pub fn launches(llm: &Json, root: &Path, nvidia: bool) -> Vec<Launch> {
-    let cuda = config::program(root, str_or(llm, "server", "oaiy-llm-server"));
-    let portable = config::program(root, str_or(llm, "server_webgpu", "oaiy-llm-server-webgpu"));
-    match str_or(llm, "backend", "auto") {
-        "cuda" => vec![Launch { program: cuda, backend: "cuda" }],
-        "webgpu" => vec![Launch { program: portable, backend: "webgpu" }],
-        "cpu" => vec![Launch { program: portable, backend: "cpu" }],
-        _ => {
-            let mut plan = Vec::new();
-            if nvidia && cuda.is_file() {
-                plan.push(Launch { program: cuda.clone(), backend: "auto" });
-            }
-            if portable.is_file() || plan.is_empty() {
-                plan.push(Launch { program: portable, backend: "auto" });
-            }
-            // Neither built beside the studio: let the OS path find the CUDA build.
-            if !plan.iter().any(|l| l.program.is_file()) && !cuda.is_file() {
-                plan.insert(0, Launch { program: cuda, backend: "auto" });
-            }
-            plan
+/// The server programs to try, in order: `llm.server` (`oaiy-llm-server`), then `llm.server_webgpu`
+/// (`oaiy-llm-server-webgpu`: the same server, under the name it had while a CUDA build stood beside it, which older
+/// configurations and installs still name). The one that is a file comes first; the other is tried only when the
+/// first cannot be started.
+pub fn launches(llm: &Json, root: &Path) -> Vec<Launch> {
+    let backend = backend(llm);
+    let server = config::program(root, str_or(llm, "server", "oaiy-llm-server"));
+    let other = config::program(root, str_or(llm, "server_webgpu", "oaiy-llm-server-webgpu"));
+    let mut programs = vec![server];
+    if other != programs[0] {
+        if other.is_file() && !programs[0].is_file() {
+            programs.insert(0, other);
+        } else {
+            programs.push(other);
         }
     }
+    programs.into_iter().map(|program| Launch { program, backend }).collect()
 }
 
-/// The weights the portable engine may put on the GPU when the configuration does not say (`llm.webgpu_gb`): the
+/// The weights the engine may put on the GPU when the configuration does not say (`llm.webgpu_gb`): the
 /// largest GPU's memory, less `llm.vram_headroom_gb` and 2 GB for the cache and the work buffers. WebGPU cannot report
 /// free memory, so the engine otherwise assumes 8 GiB of any discrete card, and a 27B model ran mostly on the CPU of a
 /// 32 GB card. None (the engine's own default) when no GPU says, or the result would be under 4 GB (an integrated GPU,
-/// whose memory is the computer's). A CUDA build takes the flag and does not use it.
+/// whose memory is the computer's).
 pub fn auto_webgpu_gb(gpus: &Json, llm: &Json) -> Option<i64> {
     let largest_mb = gpus.as_array()?.iter().filter_map(|g| g.get("memory_total_mb").and_then(Json::as_i64)).max()?;
     let headroom = int_or(llm, "vram_headroom_gb", 2).max(0);
@@ -282,8 +264,6 @@ impl Llm {
                 resident: None,
                 context: None,
                 command: String::new(),
-                fallbacks: Vec::new(),
-                relaunch: None,
             }),
             changed: Condvar::new(),
             log: Arc::new(LogRing::new(2000)),
@@ -336,9 +316,7 @@ impl Llm {
         if self.is_running() {
             return Ok(());
         }
-        // Probed before taking the lock: nvidia-smi can take a second, and the
-        // UI's status reads wait on this lock.
-        let mut plan = launches(llm, root, nvidia_present());
+        let mut plan = launches(llm, root);
         let mut g = self.lock();
         if matches!(g.state, State::Starting | State::Ready) {
             return Ok(());
@@ -375,8 +353,6 @@ impl Llm {
                 Err(e) => errors.push(e),
             }
         };
-        g.fallbacks = plan;
-        g.relaunch = Some((args.clone(), key.clone(), root.to_path_buf()));
         g.generation += 1;
         let generation = g.generation;
         g.lifeline = child.stdin.take();
@@ -441,25 +417,6 @@ impl Llm {
                 if let Some(status) = exited {
                     g.child = None;
                     g.lifeline = None;
-                    // Died while loading with another launch to try: e.g. the CUDA
-                    // build on a machine whose driver it cannot load.
-                    let mut relaunched = false;
-                    while g.state == State::Starting && !g.fallbacks.is_empty() && !relaunched {
-                        let next = g.fallbacks.remove(0);
-                        self.log.push(format!("studio: oaiy-llm-server exited ({status}) while loading; trying {}", next.program.display()));
-                        if let Some((args, key, root)) = g.relaunch.clone() {
-                            if let Ok((mut child, shown)) = self.spawn(&next, &args, &key, &root) {
-                                g.lifeline = child.stdin.take();
-                                g.child = Some(child);
-                                g.command = shown;
-                                g.started = Some(Instant::now());
-                                relaunched = true;
-                            }
-                        }
-                    }
-                    if relaunched {
-                        continue;
-                    }
                     g.state = State::Failed;
                     let tail = self.log.tail(12);
                     g.error = Some(format!("oaiy-llm-server exited ({status}):\n{tail}"));
@@ -541,7 +498,7 @@ impl Llm {
         tail.lines().rev().find_map(|l| l.strip_suffix(" token context)")?.rsplit_once('(')?.1.parse().ok())
     }
 
-    /// "WebGPU on …", "CUDA (2 card(s))" or "the CPU", as oaiy-llm-server reported it.
+    /// "WebGPU on …" or "the CPU", as oaiy-llm-server reported it.
     fn runs_on(&self) -> Option<String> {
         let tail = self.log.tail(400);
         tail.lines().rev().find_map(|l| l.split_once(" runs on ").map(|(_, on)| on.trim().to_string()))
@@ -662,25 +619,35 @@ mod tests {
     }
 
     #[test]
-    fn auto_prefers_cuda_with_an_nvidia_gpu_and_falls_back_to_webgpu() {
+    fn the_server_is_the_one_program_that_is_there_under_either_name() {
         let dir = std::env::temp_dir().join(format!("oaiy-studio-launch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let exe = |n: &str| dir.join(if cfg!(windows) { format!("{n}.exe") } else { n.to_string() });
-        std::fs::write(exe("cuda-srv"), b"x").unwrap();
-        std::fs::write(exe("gpu-srv"), b"x").unwrap();
-        let llm = |backend: &str| Json::parse(format!(r#"{{"backend":"{backend}","server":"cuda-srv","server_webgpu":"gpu-srv"}}"#).as_bytes()).unwrap();
+        let llm = |backend: &str| Json::parse(format!(r#"{{"backend":"{backend}","server":"srv","server_webgpu":"srv-webgpu"}}"#).as_bytes()).unwrap();
         let names = |plan: Vec<Launch>| plan.into_iter().map(|l| (l.program.file_stem().unwrap().to_string_lossy().into_owned(), l.backend)).collect::<Vec<_>>();
-        assert_eq!(names(launches(&llm("auto"), &dir, true)), [("cuda-srv".into(), "auto"), ("gpu-srv".into(), "auto")]);
-        assert_eq!(names(launches(&llm("auto"), &dir, false)), [("gpu-srv".into(), "auto")]);
-        assert_eq!(names(launches(&llm("cpu"), &dir, true)), [("gpu-srv".into(), "cpu")]);
-        assert_eq!(names(launches(&llm("cuda"), &dir, false)), [("cuda-srv".into(), "cuda")]);
+        // Neither is a file: both by name, llm.server first (the OS search path may find one).
+        assert_eq!(names(launches(&llm("auto"), &dir)), [("srv".into(), "auto"), ("srv-webgpu".into(), "auto")]);
+        // Only the name the WebGPU build had is there (an install that staged that one): it is the server.
+        std::fs::write(exe("srv-webgpu"), b"x").unwrap();
+        assert_eq!(names(launches(&llm("auto"), &dir)), [("srv-webgpu".into(), "auto"), ("srv".into(), "auto")]);
+        // Both there: llm.server, whatever the backend, and no NVIDIA card is asked about.
+        std::fs::write(exe("srv"), b"x").unwrap();
+        assert_eq!(names(launches(&llm("auto"), &dir)), [("srv".into(), "auto"), ("srv-webgpu".into(), "auto")]);
+        assert_eq!(names(launches(&llm("webgpu"), &dir))[0], ("srv".into(), "webgpu"));
+        assert_eq!(names(launches(&llm("cpu"), &dir))[0], ("srv".into(), "cpu"));
+        // A configuration from the CUDA build: the GPU it meant, which is WebGPU's now.
+        assert_eq!(names(launches(&llm("cuda"), &dir))[0], ("srv".into(), "auto"));
+        // One program named twice is tried once.
+        let same = Json::parse(br#"{"server":"srv","server_webgpu":"srv"}"#).unwrap();
+        assert_eq!(names(launches(&same, &dir)), [("srv".into(), "auto")]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn a_missing_server_fails_clearly_instead_of_hanging() {
         let llm = Arc::new(Llm::new());
-        let cfg = Json::parse(br#"{"gateway":{"host":"127.0.0.1"},"llm":{"backend":"cuda","server":"definitely-missing/oaiy-llm-server-x","models":[{"name":"m","path":"m.gguf"}]}}"#).unwrap();
+        let cfg = Json::parse(br#"{"gateway":{"host":"127.0.0.1"},"llm":{"backend":"auto","server":"definitely-missing/oaiy-llm-server-x","server_webgpu":"definitely-missing/oaiy-llm-server-y","models":[{"name":"m","path":"m.gguf"}]}}"#).unwrap();
         let err = llm.ensure_ready(&cfg, &std::env::temp_dir(), Duration::from_secs(5)).unwrap_err();
         assert!(err.contains("could not start the LLM server"), "{err}");
         assert_eq!(llm.state(), State::Failed);

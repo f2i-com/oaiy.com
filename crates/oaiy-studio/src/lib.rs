@@ -358,27 +358,22 @@ pub fn running_instance(args: &Args) -> Option<String> {
     running_at(args)
 }
 
-/// The CUDA language-model server the configuration at `config_path` names (`llm.server`): a bare program name
+/// The language-model server the configuration at `config_path` names (`llm.server`): a bare program name
 /// (found beside the studio, else on the PATH) or a path. Made with defaults when there is none.
 pub fn llm_server(config_path: &std::path::Path) -> Result<String, String> {
     let cfg = config::load(config_path)?;
     Ok(cfg.get("llm").map_or("oaiy-llm-server", |l| str_or(l, "server", "oaiy-llm-server")).to_string())
 }
 
-/// Set `llm.server` in the configuration file: the NVIDIA engine OAIY Desktop downloads (an absolute path), or the
-/// bare default again. For a studio that is not running; a running one is told through `PUT /api/config`, which
-/// restarts its language model on the new server.
+/// Set `llm.server` in the configuration file: a path, or the bare default again (OAIY Desktop takes a studio off
+/// the CUDA engine an older version of it downloaded). For a studio that is not running; a running one is told
+/// through `PUT /api/config`, which restarts its language model on the new server.
 pub fn set_llm_server(config_path: &std::path::Path, value: &str) -> Result<(), String> {
     let mut cfg = config::load(config_path)?;
     let mut llm = cfg.get("llm").cloned().unwrap_or(Json::Obj(Vec::new()));
     util::set(&mut llm, "server", Json::str(value));
     util::set(&mut cfg, "llm", llm);
     config::save(config_path, &cfg)
-}
-
-/// Whether this computer has an NVIDIA GPU with its driver (`nvidia-smi` lists one): where the CUDA engine runs.
-pub fn nvidia_gpu() -> bool {
-    llm::nvidia_present()
 }
 
 /// For a host that runs the studio but is not its executable (OAIY Desktop):
@@ -554,7 +549,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_host_reads_and_sets_the_cuda_server_and_keeps_the_rest_of_the_configuration() {
+    fn a_host_reads_and_sets_the_server_and_keeps_the_rest_of_the_configuration() {
         let dir = std::env::temp_dir().join(format!("oaiy-llm-server-setting-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -566,7 +561,7 @@ mod tests {
         assert_eq!(llm_server(&path).unwrap(), downloaded.to_string_lossy());
         let cfg = config::load(&path).unwrap();
         let llm = cfg.get("llm").unwrap();
-        assert_eq!(str_or(llm, "server_webgpu", ""), "oaiy-llm-server-webgpu", "the portable engine's setting is kept");
+        assert_eq!(str_or(llm, "server_webgpu", ""), "oaiy-llm-server-webgpu", "the server's other name is kept");
         assert!(cfg.get("gateway").is_some(), "the other sections are kept");
         set_llm_server(&path, "oaiy-llm-server").unwrap();
         assert_eq!(llm_server(&path).unwrap(), "oaiy-llm-server");

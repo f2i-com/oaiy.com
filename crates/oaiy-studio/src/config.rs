@@ -266,6 +266,20 @@ pub fn exe_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// `llm.backend` of a file the CUDA build wrote: `cuda` is `auto` now (the GPU, through WebGPU), so a studio that
+/// was set to it still starts, and its settings page shows what it runs on. Returns whether anything changed.
+pub fn upgrade_backend(v: &mut Json) -> bool {
+    let Json::Obj(top) = v else { return false };
+    let Some((_, Json::Obj(llm))) = top.iter_mut().find(|(k, _)| k == "llm") else { return false };
+    match llm.iter_mut().find(|(k, _)| k == "backend") {
+        Some((_, backend)) if backend.as_str() == Some("cuda") => {
+            *backend = Json::str("auto");
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Read the file (creating it with defaults when it does not exist yet).
 pub fn load(path: &Path) -> Result<Json, String> {
     if !path.exists() {
@@ -278,6 +292,11 @@ pub fn load(path: &Path) -> Result<Json, String> {
     // Before the defaults fill in, so a file without `routes_version` is seen as old.
     let upgraded = upgrade_routes(&mut v);
     let upgraded = upgrade_origins(&mut v) || upgraded;
+    let was_cuda = upgrade_backend(&mut v);
+    if was_cuda {
+        eprintln!("oaiy-studio: {}: llm.backend was cuda; there is no CUDA build any more, so it is auto now (the GPU, through WebGPU)", path.display());
+    }
+    let upgraded = upgraded || was_cuda;
     merge_defaults(&mut v, &default_json());
     if upgraded {
         save(path, &v)?;
@@ -454,8 +473,8 @@ pub fn validate(v: &Json) -> Result<(), String> {
             return Err(format!("llm model {name} needs a path (a .gguf, a folder holding one, or a checkpoint folder)"));
         }
     }
-    if !["auto", "cuda", "webgpu", "cpu"].contains(&str_or(llm, "backend", "auto")) {
-        return Err("llm.backend must be auto, cuda, webgpu or cpu".into());
+    if !["auto", "webgpu", "cpu"].contains(&str_or(llm, "backend", "auto")) {
+        return Err("llm.backend must be auto, webgpu or cpu (there is no CUDA build any more: auto is the GPU, through WebGPU)".into());
     }
     gib(llm, "webgpu_gb", "llm", 1024)?;
     // Host RAM for the conversations Flash-Next sets aside; null (or absent) leaves the server's own default.
@@ -752,6 +771,8 @@ mod tests {
             (Box::new(|v: &mut Json| *field(v, &["llm", "default_model"]) = Json::str("ghost")), "default_model"),
             (Box::new(|v: &mut Json| *field(v, &["llm", "park_gb"]) = Json::Int(-1)), "llm.park_gb"),
             (Box::new(|v: &mut Json| *field(v, &["llm", "park_gb"]) = Json::str("8")), "llm.park_gb"),
+            (Box::new(|v: &mut Json| *field(v, &["llm", "backend"]) = Json::str("cuda")), "no CUDA build"),
+            (Box::new(|v: &mut Json| *field(v, &["llm", "backend"]) = Json::str("vulkan")), "llm.backend"),
             (Box::new(move |v: &mut Json| {
                 let mut r = routes(v);
                 if let Json::Arr(items) = &mut r { let first = items[0].clone(); items.push(first); }
@@ -770,6 +791,30 @@ mod tests {
             let err = with(edit).unwrap_err();
             assert!(err.contains(needle), "{err} lacks {needle}");
         }
+    }
+
+    #[test]
+    fn a_file_the_cuda_build_wrote_is_read_as_auto_and_saved_so() {
+        let dir = std::env::temp_dir().join(format!("oaiy-config-backend-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE_NAME);
+        let mut v = default_json();
+        *field(&mut v, &["llm", "backend"]) = Json::str("cuda");
+        std::fs::write(&path, pretty(&v, 0)).unwrap();
+        // The studio starts on it (validation alone refuses cuda), and the file says auto from then on.
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.get("llm").and_then(|l| l.get("backend")).and_then(Json::as_str), Some("auto"));
+        let on_disk = Json::parse(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(on_disk.get("llm").and_then(|l| l.get("backend")).and_then(Json::as_str), Some("auto"));
+        // Any other value is the person's and is left alone.
+        for kept in ["auto", "webgpu", "cpu"] {
+            let mut v = default_json();
+            *field(&mut v, &["llm", "backend"]) = Json::str(kept);
+            assert!(!upgrade_backend(&mut v), "{kept}");
+            assert_eq!(v.get("llm").and_then(|l| l.get("backend")).and_then(Json::as_str), Some(kept));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

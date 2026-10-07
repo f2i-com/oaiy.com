@@ -2,8 +2,8 @@
 //!
 //! OAIY runs models whose weights do not fit in VRAM (or RAM) by moving
 //! them through three tiers: NVMe -> RAM -> GPU. The engines live in their
-//! own crates (`llama-rs` for GGUF models, `dsv41` / `dsv41-cuda` for
-//! DeepSeek-V4.1 safetensors); this crate holds what they have in common:
+//! own crates (`llama-rs` for GGUF models, `dsv41` for DeepSeek-V4.1
+//! safetensors); this crate holds what they have in common:
 //!
 //! - [`store`]: the [`store::WeightStore`] seam, one record per
 //!   (layer, expert), read from wherever the weights live

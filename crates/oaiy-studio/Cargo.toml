@@ -13,6 +13,6 @@ name = "oaiy-studio"
 path = "src/main.rs"
 
 # std-only like the core: it supervises oaiy-llm-server and oaiy-media as
-# subprocesses, so it builds (and runs its UI) on machines without CUDA.
+# subprocesses, so it builds (and runs its UI) on machines with no GPU at all.
 [dependencies]
 oaiy-engine = { path = "../oaiy-engine" }

@@ -479,22 +479,11 @@ impl Downloads {
             ("dir", Json::str(dir.to_string_lossy())),
             ("free", self.free_cached(&dir).map_or(Json::Null, |v| Json::Int(v as i64))),
             ("token", Json::Bool(token(&cfg).is_some())),
-            ("engines", engines_here(&cfg, &studio.root)),
             ("groups", catalog().get("groups").cloned().unwrap_or(Json::Arr(Vec::new()))),
             ("models", Json::Arr(models)),
         ])
     }
 
-}
-
-/// Which language-model engines this studio can start: the CUDA build (`llm.server`) and the portable one
-/// (`llm.server_webgpu`), each where the configuration names it or beside the studio or its configuration. A catalog
-/// model says which it runs on (`engines`; both when it does not say), so one needing the CUDA build is not offered
-/// for download where there is none: DeepSeek-V4.1, the EXL3 models and GLM-5.3-Flash are hundreds of gigabytes.
-pub(crate) fn engines_here(cfg: &Json, root: &Path) -> Json {
-    let llm = cfg.get("llm").cloned().unwrap_or(Json::Null);
-    let found = |key: &str, default: &str| crate::config::program(root, str_or(&llm, key, default)).is_file();
-    Json::obj([("cuda", Json::Bool(found("server", "oaiy-llm-server"))), ("webgpu", Json::Bool(found("server_webgpu", "oaiy-llm-server-webgpu")))])
 }
 
 impl Downloads {
@@ -780,11 +769,8 @@ mod tests {
             // Whether the Agent can use its tools with a language model: the engine reads tool calls in the
             // Qwen3.5 and GLM formats only, and the setup wizard labels each model by it.
             assert!(e.get("agent_tools").is_none_or(|t| matches!(t, Json::Bool(_))), "{id}: agent_tools is not a boolean");
-            // The engines that run it, when not both: some of "cuda" and "webgpu", never none.
-            if let Some(engines) = e.get("engines") {
-                let engines = strings(Some(engines));
-                assert!(!engines.is_empty() && engines.iter().all(|x| x == "cuda" || x == "webgpu"), "{id}: engines {engines:?}");
-            }
+            // One engine runs every model: an entry no longer says which of two.
+            assert!(e.get("engines").is_none(), "{id}: engines (there is one engine)");
             for key in ["ram_gb", "gpu_count"] {
                 assert!(e.get(key).is_none_or(|v| v.as_f64().is_some_and(|n| n > 0.)), "{id}: {key} is not a positive number");
             }
@@ -815,20 +801,6 @@ mod tests {
             assert!(!include.iter().any(|g| glob(g, other)), "{other} is not downloaded");
         }
         assert_eq!(strings(glm.get("add")), ["GLM-5.3-Flash-GGUF/UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf"]);
-    }
-
-    #[test]
-    fn the_engines_here_are_the_programs_the_configuration_can_start() {
-        let d = std::env::temp_dir().join(format!("oaiy-engines-here-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        let exe = |n: &str| if cfg!(windows) { format!("{n}.exe") } else { n.to_string() };
-        let portable = d.join(exe("oaiy-llm-server-webgpu"));
-        std::fs::write(&portable, b"x").unwrap();
-        let cfg = Json::obj([("llm", Json::obj([("server", Json::str("no-such-cuda-build")), ("server_webgpu", Json::str(portable.to_string_lossy()))]))]);
-        let here = engines_here(&cfg, &d);
-        assert_eq!(here.get("webgpu"), Some(&Json::Bool(true)), "the portable build, where the configuration names it");
-        assert_eq!(here.get("cuda"), Some(&Json::Bool(false)), "no CUDA build anywhere");
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

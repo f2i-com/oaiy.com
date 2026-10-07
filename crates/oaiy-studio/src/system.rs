@@ -47,9 +47,9 @@ impl System {
 
     /// `[{index, name, memory_used_mb, memory_total_mb, utilization, temperature}]`
     /// from `nvidia-smi`. Without an NVIDIA driver, the display adapters the OS
-    /// knows (an AMD or Intel GPU, which the portable engine runs on through
-    /// WebGPU), with their `vendor` and total memory only: `index` is then their
-    /// place in that list, not a CUDA device. Empty when neither says.
+    /// knows (an AMD or Intel GPU, which the engine runs on through WebGPU), with
+    /// their `vendor` and total memory only: `index` is then their place in that
+    /// list, not nvidia-smi's. Empty when neither says.
     pub fn gpus(&self) -> Json {
         Self::cached(&self.gpus, GPU_TTL, || {
             let out = quiet("nvidia-smi")

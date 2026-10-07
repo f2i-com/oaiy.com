@@ -1345,12 +1345,6 @@ impl Media {
         let output_root = studio.output_root();
         std::fs::create_dir_all(&output_root).map_err(|e| e.to_string())?;
         let mut command = Command::new(&program);
-        if std::env::var_os("CUDA_CACHE_PATH").is_none() {
-            // Share compiled CUDA kernels across jobs.
-            let cache = output_root.join(".cuda-cache");
-            let _ = std::fs::create_dir_all(&cache);
-            command.env("CUDA_CACHE_PATH", cache);
-        }
         command.arg("--stdin").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         #[cfg(windows)]
         {
