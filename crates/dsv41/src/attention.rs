@@ -345,7 +345,14 @@ impl Attention {
         let scale = (hd as f32).powf(-0.5);
         let attending = std::time::Instant::now();
         let o = Mutex::new(vec![0.0f32; t * nh * hd]);
-        parallel_rows(t * nh, 1, &|b, e| {
+        // As many threads as the work pays for: `parallel_rows` starts its threads at each call (some 60 us each
+        // here), and a decode step's 64 heads over a few dozen positions are a quarter of a millisecond on one. A
+        // thread a pair of heads cost a step 0.076 s over its 40 layers where one thread takes 0.011 (measured, a
+        // 40-token context); a prompt's work is thousands of times that and takes every thread. The time is least
+        // near the square root of the work over a thread's start, so that many.
+        let work: usize = idxs.iter().map(Vec::len).sum::<usize>() * nh * hd * 2;
+        let threads = ((work as f64 / 6e5).sqrt() as usize).max(1);
+        parallel_rows(t * nh, (t * nh).div_ceil(threads), &|b, e| {
             let mut buf = vec![0.0f32; (e - b) * hd];
             for r in b..e {
                 let (i, h) = (r / nh, r % nh);
@@ -644,14 +651,35 @@ pub fn compressed_pos(start_pos: usize, j: usize, ratio: usize) -> usize {
     (start_pos / ratio + j) * ratio
 }
 
+/// `a . b` in sixteen running sums (one vector's lanes to the compiler), added up at the end: a head's score against
+/// a position is 512 products, and summed one after another (which a compiler may not reorder) the scores were a
+/// decode step's 0.08 s of sparse attention, a fifth of the step. The reference sums on a GPU in an order of its own;
+/// this one is fixed, whatever the machine.
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    const LANES: usize = 16;
+    let (ca, cb) = (a.chunks_exact(LANES), b.chunks_exact(LANES));
+    let tail: f32 = ca.remainder().iter().zip(cb.remainder()).map(|(x, y)| x * y).sum();
+    let mut acc = [0.0f32; LANES];
+    for (x, y) in ca.zip(cb) {
+        for i in 0..LANES {
+            acc[i] += x[i] * y[i];
+        }
+    }
+    let mut width = LANES;
+    while width > 1 {
+        width /= 2;
+        for i in 0..width {
+            acc[i] += acc[i + width];
+        }
+    }
+    acc[0] + tail
+}
+
 /// One query head over its gathered positions (-1 skipped), with the sink
 /// logit in the denominator: `sum_j bf16(p_j) * kv_j / (sum_j p_j + e^(sink - max))`.
 pub fn sparse_attend(q: &[f32], kv: &[f32], hd: usize, idxs: &[i32], sink: f32, scale: f32, out: &mut [f32]) {
     let valid: Vec<usize> = idxs.iter().filter(|&&j| j >= 0).map(|&j| j as usize).collect();
-    let scores: Vec<f32> = valid
-        .iter()
-        .map(|&j| q.iter().zip(&kv[j * hd..(j + 1) * hd]).map(|(a, b)| a * b).sum::<f32>() * scale)
-        .collect();
+    let scores: Vec<f32> = valid.iter().map(|&j| dot(q, &kv[j * hd..(j + 1) * hd]) * scale).collect();
     let mx = scores.iter().fold(-1e30f32, |a, &b| a.max(b));
     let p: Vec<f32> = scores.iter().map(|s| (s - mx).exp()).collect();
     let denom = p.iter().sum::<f32>() + (sink - mx).exp();
