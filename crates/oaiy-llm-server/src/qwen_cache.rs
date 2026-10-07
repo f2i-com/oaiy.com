@@ -116,6 +116,11 @@ impl RecurrentSnapshot {
         let mut convs = copied(kv, &kv.ssm_conv, backend);
         Self(Snapshot { pos: kv.len, layers: (0..kv.ssm_state.len()).map(|i| [None, None, states[i].take(), convs[i].take()]).collect() })
     }
+    /// A checkpoint at `pos` of the recurrent tensors a run kept from inside it (`llama_rs::Tapped`'s, a layer each:
+    /// on their device as [`Self::capture_later`]'s copies are, and settled as they are).
+    pub fn tapped(pos: usize, states: Vec<Option<Tensor>>, convs: Vec<Option<Tensor>>) -> Self {
+        Self(Snapshot { pos, layers: states.into_iter().zip(convs).map(|(state, conv)| [None, None, state, conv]).collect() })
+    }
     /// The tensors still on a device brought to the host (the cards' memory is the models'): for when the GPU has
     /// nothing else to do.
     pub fn settle(&mut self, kv: &KvCache, backend: Option<&Arc<dyn Backend>>) {

@@ -2495,7 +2495,12 @@ mod dense_webgpu_timing {
                     line.clear();
                 }
             }
-            eprintln!("{past} tokens in {:.2} s", started.elapsed().as_secs_f64());
+            // (the rows short of a whole call too: the fill is `past` tokens whatever a call's are; it printed `past`
+            // for the whole calls' tokens, 12,288 of 15,360 with calls of 4,096)
+            if past % call > 0 {
+                eprintln!("the last {}: {:.0} ms", past % call, forward(past % call, &mut kv));
+            }
+            eprintln!("{} tokens in {:.2} s", kv.len, started.elapsed().as_secs_f64());
         }
         let _ = (ggml_rs_wgpu::profile::take_kernels(), ggml_rs_wgpu::profile::take_line());
         let (here, ms) = (kv.len, forward(chunk, &mut kv));
@@ -2593,6 +2598,97 @@ mod dense_webgpu_timing {
             for (i, (a, b)) in pair[0].0.iter().zip(&pair[1].0).enumerate() {
                 assert!(a == b, "result {i} (logits or drafts) bit for bit");
             }
+        }
+    }
+
+    /// A Qwen3.5 hybrid's run that keeps its recurrent states from inside it (QWEN35_MODEL; QWEN35_LEN tokens, 1,300
+    /// unless asked: a chunk of 1,024 and one that keeps both) against the runs that stop where it keeps them, before
+    /// the prompt's last 7 tokens and before its last: the states before the last 7 are those runs' (the same rows
+    /// through the same kernels in a prompt of 135 tokens or more: to their rounding), those before the last and the
+    /// logits as close as a run of few
+    /// rows is to a chunk's (other kernels for its matmuls and attention); and a cache put back to either kept state
+    /// and run on from there gives the run's own logits again, the same token.
+    #[test]
+    #[ignore = "needs a WebGPU adapter and a Qwen3.5 GGUF (QWEN35_MODEL); run with --nocapture"]
+    fn a_qwen35_run_keeps_the_states_its_stops_would() {
+        use std::sync::Arc;
+        let path = std::env::var("QWEN35_MODEL").unwrap_or_else(|_| r"E:\models\Qwen3.8-27B-Q3_K_M.gguf".into());
+        let Ok(b) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
+        let backend: Arc<dyn ggml_rs::Backend> = Arc::new(b);
+        let gguf = gguf::GgufFile::open(&path).unwrap();
+        let model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap();
+        let llama_rs::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
+        let n: usize = std::env::var("QWEN35_LEN").ok().and_then(|v| v.parse().ok()).unwrap_or(1300);
+        let tokens: Vec<u32> = (0..n as u32).map(|i| 1000 + (i * 7919) % 20000).collect();
+        let taps = [n - 7, n - 1];
+        let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
+        let cosine = |a: &[f32], b: &[f32]| {
+            let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
+            let norm = |v: &[f32]| v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            dot / (norm(a) * norm(b)).max(1e-30)
+        };
+        let host = |ts: &[Option<ggml_rs::Tensor>]| -> Vec<Option<Vec<f32>>> { ts.iter().map(|t| t.as_ref().map(|t| t.to_host().data().to_vec())).collect() };
+        let run = |from: usize, to: usize, kv: &mut llama_rs::KvCache| {
+            let e = m.embed_text(&tokens[from..to]).to_host();
+            m.forward_embeds_positions(&e, to - from, kv, None).unwrap().to_host()
+        };
+        // (the kernels warmed: a prompt and a few rows)
+        {
+            let mut kv = model.new_kv_cache(4096);
+            run(0, n - 7, &mut kv);
+            run(n - 7, n, &mut kv);
+        }
+        // the runs that stop
+        let mut kv = model.new_kv_cache(4096);
+        let t = std::time::Instant::now();
+        run(0, n - 7, &mut kv);
+        let first = (host(&kv.ssm_state), host(&kv.ssm_conv));
+        run(n - 7, n - 1, &mut kv);
+        let second = (host(&kv.ssm_state), host(&kv.ssm_conv));
+        let stopped = run(n - 1, n, &mut kv);
+        let ms_stopped = t.elapsed().as_secs_f64() * 1e3;
+        // the run that keeps them
+        let mut kv = model.new_kv_cache(4096);
+        let e = m.embed_text(&tokens).to_host();
+        assert!(m.can_tap(n, &kv, &taps), "a run of {n} rows keeps its states after {taps:?}");
+        let t = std::time::Instant::now();
+        let (logits, kept) = m.forward_embeds_tapped(&e, n, &mut kv, &taps).expect("the run keeps its states");
+        let logits = logits.to_host();
+        let ms_kept = t.elapsed().as_secs_f64() * 1e3;
+        assert_eq!(kept.iter().map(|k| k.at).collect::<Vec<_>>(), taps, "the states' places");
+        assert_eq!(kv.len, n, "the cache's rows");
+        let mut worst = Vec::new();
+        for (tap, (states, convs)) in kept.iter().zip([&first, &second]) {
+            let (mut cs, mut cc, mut layers) = (1f64, 1f64, 0);
+            for (got, want) in host(&tap.states).iter().zip(states).chain(host(&tap.convs).iter().zip(convs)).map(|(g, w)| (g.as_ref(), w.as_ref())) {
+                assert_eq!(got.is_some(), want.is_some(), "a layer's state where the cache has one");
+                if let (Some(g), Some(w)) = (got, want) {
+                    assert_eq!(g.len(), w.len(), "a state's size");
+                    let c = cosine(g, w);
+                    if g.len() == first.0.iter().flatten().next().map_or(0, |v| v.len()) { cs = cs.min(c) } else { cc = cc.min(c) }
+                    layers += 1;
+                }
+            }
+            eprintln!("the states kept after {} rows against the run's that stops there: the worst cosine {cs:.7} (the conv windows' {cc:.7}), {layers} of them", tap.at);
+            worst.push(cs.min(cc));
+        }
+        let c = cosine(logits.data(), stopped.data());
+        eprintln!("{n} tokens: the runs that stop {ms_stopped:.0} ms (this test reading their states to the host between them), the run that keeps its states {ms_kept:.0} ms; the logits' cosine {c:.6}, the same token {}", argmax(logits.data()) == argmax(stopped.data()));
+        // (a run of few rows is other kernels: a short prompt's rows before its last 7 are not the same ones either)
+        assert!(worst[0] > if n >= 135 { 0.99999 } else { 0.995 }, "the states before the last 7 rows: {}", worst[0]);
+        assert!(worst[1] > 0.995, "the states before the last row: {}", worst[1]);
+        assert!(c > 0.995 && argmax(logits.data()) == argmax(stopped.data()), "the logits: {c}");
+        // a cache put back to a kept state runs on to the same logits
+        for tap in kept.iter().rev() {
+            for l in 0..kv.ssm_state.len() {
+                kv.ssm_state[l] = tap.states[l].as_ref().map(|t| backend.to_device(t.to_host()));
+                kv.ssm_conv[l] = tap.convs[l].as_ref().map(|t| backend.to_device(t.to_host()));
+            }
+            kv.len = tap.at;
+            let again = run(tap.at, n, &mut kv);
+            let c = cosine(again.data(), logits.data());
+            eprintln!("put back to the state after {} rows and run on: the logits' cosine {c:.6}, the same token {}", tap.at, argmax(again.data()) == argmax(logits.data()));
+            assert!(c > 0.995 && argmax(again.data()) == argmax(logits.data()), "run on from the state after {} rows: {c}", tap.at);
         }
     }
 

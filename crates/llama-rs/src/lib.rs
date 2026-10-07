@@ -18,7 +18,7 @@
 
 mod chain_decode;
 mod chain_qwen35;
-pub use chain_qwen35::{Qwen35Chain, SPEC_ROWS};
+pub use chain_qwen35::{Qwen35Chain, Tapped, SPEC_ROWS};
 pub mod chat;
 pub mod config;
 pub mod gemma3;

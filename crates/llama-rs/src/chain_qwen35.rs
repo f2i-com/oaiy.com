@@ -447,6 +447,8 @@ struct State {
     /// by a chunk and given back once it has run (each chunk's new ones, some 25 buffers and 0.5 GB, were the
     /// allocator's every 200 ms).
     prompt_sets: Mutex<Vec<(Work, DeviceVec)>>,
+    /// A tapped run's later rows' vectors, made at the first run that keeps a state from inside.
+    seg: std::sync::OnceLock<Seg>,
 }
 
 fn quant(w: &Weight) -> &QuantizedTensor {
@@ -582,6 +584,39 @@ struct Bound<'a> {
     states: &'a [(DeviceVec, DeviceVec)],
     w: &'a Work,
     attn: &'a DeviceVec,
+    /// The states kept from inside the run (by row, each once), and the vectors its rows after the first of them go
+    /// through.
+    taps: &'a [Tap],
+    seg: Option<&'a Seg>,
+}
+
+/// The most rows of a run after the first state it keeps from inside ([`Tap`]): those rows' recurrence goes through
+/// vectors of its own this long (a prompt's tail: the assistant's header and its last token).
+const TAP_ROWS: usize = 64;
+
+/// A state kept from inside a run: each delta net's state and conv window as they are once the run's first `row` rows
+/// are through it (a pair a slot), copied there as the run goes.
+struct Tap {
+    row: usize,
+    vecs: Vec<(DeviceVec, DeviceVec)>,
+}
+
+/// The vectors a tapped run's later rows' recurrence goes through ([`TAP_ROWS`] of them, a set a chain: each layer's
+/// in turn): the conv's input and output, the gate, the beta-alpha and the delta net's output.
+struct Seg {
+    qkv: DeviceVec,
+    z: DeviceVec,
+    ba: DeviceVec,
+    conv: DeviceVec,
+    core: DeviceVec,
+}
+
+/// A run's recurrent states as they were with `at` rows in the cache ([`Qwen35Chain::forward_tapped`]): each layer's
+/// delta-net state and conv window (none for an attention layer), on the device, as [`KvCache`] holds its own.
+pub struct Tapped {
+    pub at: usize,
+    pub states: Vec<Option<Tensor>>,
+    pub convs: Vec<Option<Tensor>>,
 }
 
 /// `layers` of a run of `t` rows at `past`, each its weights and vectors; `added` whether a residual's add is pending
@@ -645,8 +680,35 @@ fn record_layers<'w>(rec: &mut dyn ggml_rs::ChainRecorder, s: &Dims, eps: f32, l
                     rec.copy(&w.qkv, 0, qkv, 0, t * s.ch);
                     rec.copy(&w.ba, 0, ba, 0, t * 2 * s.nv);
                 }
-                rec.ssm_conv(&w.qkv, conv_w, conv, &w.conv, t, s.ch, s.kern);
-                rec.delta_net(&w.conv, &w.z, &w.ba, a, dt, norm, state, &w.core, delta);
+                if b.taps.is_empty() {
+                    rec.ssm_conv(&w.qkv, conv_w, conv, &w.conv, t, s.ch, s.kern);
+                    rec.delta_net(&w.conv, &w.z, &w.ba, a, dt, norm, state, &w.core, delta);
+                } else {
+                    // the recurrence in parts, each kept state's rows and then its copies: the first part where the
+                    // rows are, the later ones (a prompt's tail: few) through the parts' own vectors and back
+                    let vw = s.nv * s.dv;
+                    let mut done = 0;
+                    for (end, keep) in b.taps.iter().map(|tap| (tap.row, Some(&tap.vecs[*slot]))).chain(std::iter::once((t, None))) {
+                        let n = end - done;
+                        if n > 0 && done == 0 {
+                            rec.ssm_conv(&w.qkv, conv_w, conv, &w.conv, n, s.ch, s.kern);
+                            rec.delta_net(&w.conv, &w.z, &w.ba, a, dt, norm, state, &w.core, DeltaNet { rows: n, ..delta });
+                        } else if n > 0 {
+                            let seg = b.seg.expect("a tapped run's later rows' vectors");
+                            rec.copy(&w.qkv, done * s.ch, &seg.qkv, 0, n * s.ch);
+                            rec.copy(&w.z, done * vw, &seg.z, 0, n * vw);
+                            rec.copy(&w.ba, done * 2 * s.nv, &seg.ba, 0, n * 2 * s.nv);
+                            rec.ssm_conv(&seg.qkv, conv_w, conv, &seg.conv, n, s.ch, s.kern);
+                            rec.delta_net(&seg.conv, &seg.z, &seg.ba, a, dt, norm, state, &seg.core, DeltaNet { rows: n, ..delta });
+                            rec.copy(&seg.core, 0, &w.core, done * vw, n * vw);
+                        }
+                        if let Some((sv, cv)) = keep {
+                            rec.copy(state, 0, sv, 0, state.len);
+                            rec.copy(conv, 0, cv, 0, conv.len);
+                        }
+                        done = end;
+                    }
+                }
                 rec.matmul_rows(out, &w.core, &w.proj, t);
                 (ffn, down)
             }
@@ -750,7 +812,7 @@ impl<'a> SplitRun<'a> {
             self.mtp(&mut *rec, j, &hidden);
         }
         let mut added = false;
-        let bound = Bound { kvl: self.kv0.0, half: None, cap: self.kv0.1, states: self.states, w: &w, attn: &attn };
+        let bound = Bound { kvl: self.kv0.0, half: None, cap: self.kv0.1, states: self.states, w: &w, attn: &attn, taps: &[], seg: None };
         let from = self.sp.from;
         record_layers(&mut *rec, &s, cfg.rms_eps, self.m.blocks[..from].iter().map(LayerW::of).zip(&self.st.layers[..from]), &bound, t, pos, None, &mut added);
         // to the second: the residual stream and the last layer's output (their add fused with its first layer's norm)
@@ -788,7 +850,7 @@ impl<'a> SplitRun<'a> {
         rec.keep_groups(false);
         rec.hold();
         let mut added = true;
-        let bound = Bound { kvl: self.kv1.0, half: None, cap: self.kv1.1, states: self.states1, w: &w, attn: &attn };
+        let bound = Bound { kvl: self.kv1.0, half: None, cap: self.kv1.1, states: self.states1, w: &w, attn: &attn, taps: &[], seg: None };
         record_layers(&mut *rec, &s, cfg.rms_eps, self.sp.weights.iter().map(SplitW::view).zip(&self.sp.layers), &bound, t, pos, None, &mut added);
         rec.add_rmsnorm_rows(&w.x, &w.proj, &self.sp.output_norm, &w.xn, t, cfg.rms_eps);
         if last {
@@ -899,6 +961,8 @@ pub(crate) struct Qwen35Run<'a> {
     vocab: usize,
     /// A prompt chunk's pooled vectors, back to the pool once the run is done
     set: Option<(&'a Mutex<Vec<(Work, DeviceVec)>>, (Work, DeviceVec))>,
+    /// The states it keeps from inside (theirs once the run has run: read after it, as anything of the device's)
+    taps: Vec<Tapped>,
 }
 
 impl Qwen35Run<'_> {
@@ -1060,6 +1124,7 @@ impl Qwen35Chain {
                     logits: chain.vec(cfg.vocab_size),
                     spec,
                     prompt_sets: Mutex::new(Vec::new()),
+                    seg: Default::default(),
                 })
             })
             .as_ref()
@@ -1069,6 +1134,67 @@ impl Qwen35Chain {
     /// last token's logits `[1, vocab]`; None leaves them to the model's own path. A run of more rows than a submit
     /// takes goes in chunks.
     pub(crate) fn forward(&self, m: &Qwen35Model, embeds: &Tensor, rows: usize, kv: &mut KvCache) -> Option<Tensor> {
+        self.forward_with(m, embeds, rows, kv, &[]).map(|(logits, _)| logits)
+    }
+
+    /// [`Self::forward`] with the delta nets' states and conv windows as they are once each of `taps` rows of the run
+    /// is in (ascending, 1 to `rows`), on the device: what a checkpoint at those positions holds, without the run
+    /// stopping there (a prompt's last two, before the assistant's header and before its last token, were a run of 6
+    /// rows and a run of 1 after the prompt's: 44 ms of a 3,158-token prompt's 1.32 s, 48 of a follow-up turn's 105).
+    /// None, and nothing run, where [`Self::can_tap`] is false.
+    pub(crate) fn forward_tapped(&self, m: &Qwen35Model, embeds: &Tensor, rows: usize, kv: &mut KvCache, taps: &[usize]) -> Option<(Tensor, Vec<Tapped>)> {
+        if embeds.numel() != rows * m.config.embedding_dim || !self.can_tap(m, rows, kv, taps) {
+            return None;
+        }
+        self.forward_with(m, embeds, rows, kv, taps)
+    }
+
+    /// Whether a run of `rows` after what `kv` holds can keep its recurrent states from inside it once each of `taps`
+    /// rows is in ([`Self::forward_tapped`]): chained, its chunks on one device (a prompt's over two keep none), and
+    /// each chunk's rows after the first state it keeps few ([`TAP_ROWS`]: their recurrence goes through vectors of
+    /// its own; a state early in a long chunk is a run's end still). OAIY_NO_TAPS: never.
+    pub fn can_tap(&self, m: &Qwen35Model, rows: usize, kv: &KvCache, taps: &[usize]) -> bool {
+        if std::env::var_os("OAIY_NO_CHAIN").is_some() || std::env::var_os("OAIY_NO_TAPS").is_some() || rows == 0 || taps.is_empty() {
+            return false;
+        }
+        let (Some(st), Some(chain)) = (self.state(m), m.backend.chain()) else { return false };
+        let chunks = self.chunks(chain, &st.dims, kv.len, rows);
+        if chunks.len() > 1 && self.second.get().and_then(|b| b.chain()).is_some() && self.split(m, st).is_some() {
+            return false;
+        }
+        taps.windows(2).all(|w| w[0] < w[1])
+            && taps[0] > 0
+            && taps[taps.len() - 1] <= rows
+            && chunks.iter().all(|&(at, t)| taps.iter().find(|&&p| p > at && p <= at + t).map_or(true, |&p| at + t - p <= TAP_ROWS))
+    }
+
+    /// The chunks of a run of `rows` after `past` positions (each its first row and its rows): as many rows as the
+    /// attention's scratch has room for over the positions they reach (the backend's own length of it for the rows
+    /// asked; past the room, as many as fit a part a run of positions), up to a chunk of 1,024 on one card (some 1%
+    /// the faster), 512 where a second one takes their later layers (the more chunks the more of them run together).
+    /// (A chunk cut in two past 10,580 positions whatever the kernel was a fifth of its time: the matmuls' rows by
+    /// halves.)
+    fn chunks(&self, chain: &dyn DeviceChain, s: &Dims, past: usize, rows: usize) -> Vec<(usize, usize)> {
+        let most = if self.second.get().is_some() { MAX_ROWS } else { 2 * MAX_ROWS };
+        let mut chunks = Vec::new();
+        let mut at = 0;
+        while at < rows {
+            let want = most.min(rows - at);
+            let t = if chain.attention_rows_out_len(want, s.n_h, s.hd, past + at + want) * 4 <= ATTENTION_SCRATCH {
+                want
+            } else {
+                let runs = (past + at + rows).div_ceil(256).max(1);
+                let per_row = (s.n_h * runs * (s.hd + 2) + s.n_h * s.hd) * 4;
+                (ATTENTION_SCRATCH / per_row).clamp(1, want)
+            };
+            chunks.push((at, t));
+            at += t;
+        }
+        chunks
+    }
+
+    /// [`Self::forward`], keeping the states `taps` name (none: as it is; some: [`Self::can_tap`] said so).
+    fn forward_with(&self, m: &Qwen35Model, embeds: &Tensor, rows: usize, kv: &mut KvCache, taps: &[usize]) -> Option<(Tensor, Vec<Tapped>)> {
         if std::env::var_os("OAIY_NO_CHAIN").is_some() || rows == 0 || embeds.numel() != rows * m.config.embedding_dim {
             return None;
         }
@@ -1084,29 +1210,11 @@ impl Qwen35Chain {
             embeds.data()
         };
         let s = st.dims;
-        // the chunks: each as many rows as the attention's scratch has room for over the positions they reach (the
-        // backend's own length of it for the rows asked; past the room, as many as fit a part a run of positions), up
-        // to a chunk of 1,024 on one card (some 1% the faster), 512 where a second one takes their later layers (the
-        // more chunks the more of them run together). (A chunk cut in two past 10,580 positions whatever the kernel
-        // was a fifth of its time: the matmuls' rows by halves.)
-        let most = if self.second.get().is_some() { MAX_ROWS } else { 2 * MAX_ROWS };
-        let mut chunks = Vec::new();
-        let mut at = 0;
-        while at < rows {
-            let want = most.min(rows - at);
-            let t = if chain.attention_rows_out_len(want, s.n_h, s.hd, kv.len + at + want) * 4 <= ATTENTION_SCRATCH {
-                want
-            } else {
-                let runs = (kv.len + at + rows).div_ceil(256).max(1);
-                let per_row = (s.n_h * runs * (s.hd + 2) + s.n_h * s.hd) * 4;
-                (ATTENTION_SCRATCH / per_row).clamp(1, want)
-            };
-            chunks.push((at, t));
-            at += t;
-        }
+        let chunks = self.chunks(chain, &s, kv.len, rows);
         if chunks.len() > 1 {
             if let (Some(sp), Some(chain1)) = (self.split(m, st), self.second.get().and_then(|b| b.chain())) {
-                return Some(self.forward_split(m, st, sp, chain, chain1, emb, &chunks, kv));
+                assert!(taps.is_empty(), "a prompt over two devices keeps no state from inside it");
+                return Some((self.forward_split(m, st, sp, chain, chain1, emb, &chunks, kv), Vec::new()));
             }
         }
         let backend: &dyn Backend = &*m.backend;
@@ -1120,9 +1228,13 @@ impl Qwen35Chain {
             }
         };
         let mut pending: Option<Qwen35Run<'_>> = None;
+        let mut tapped = Vec::new();
         for &(at, t) in &chunks {
             said(format!("rows {at}..{} at {}: recording", at + t, kv.len), &mut log);
-            let run = self.run_begin(m, st, chain, &emb[at * s.d..(at + t) * s.d], t, kv, false);
+            // (the states this chunk keeps: by its own rows)
+            let local: Vec<usize> = taps.iter().filter(|&&p| p > at && p <= at + t).map(|&p| p - at).collect();
+            let mut run = self.run_begin(m, st, chain, &emb[at * s.d..(at + t) * s.d], t, kv, false, &local);
+            tapped.append(&mut run.taps);
             said("recorded".to_string(), &mut log);
             if let Some(p) = pending.replace(run) {
                 p.finish(backend, kv);
@@ -1134,7 +1246,7 @@ impl Qwen35Chain {
         if let Some((_, lines)) = &log {
             eprintln!("a prompt's {} chunks: {}", chunks.len(), lines.join("; "));
         }
-        out
+        out.map(|logits| (logits, tapped))
     }
 
     /// A second device for prompts: a prompt's chunks run over both ([`Self::forward`]), the layers from the middle
@@ -1376,13 +1488,13 @@ impl Qwen35Chain {
     /// One submit of `t` rows: the last row's logits, or (a check) every row's.
     #[allow(clippy::too_many_arguments)]
     fn run(&self, m: &Qwen35Model, st: &State, chain: &dyn DeviceChain, emb: &[f32], t: usize, kv: &mut KvCache, checking: bool) -> Vec<Tensor> {
-        self.run_begin(m, st, chain, emb, t, kv, checking).finish(&*m.backend, kv)
+        self.run_begin(m, st, chain, emb, t, kv, checking, &[]).finish(&*m.backend, kv)
     }
 
     /// [`Self::run`] up to its wait: its work gone to the GPU, `kv` committed (its rows the device's copy's; into
     /// the host's cache at the finish).
     #[allow(clippy::too_many_arguments)]
-    fn run_begin<'a>(&self, m: &Qwen35Model, st: &'a State, chain: &'a dyn DeviceChain, emb: &[f32], t: usize, kv: &mut KvCache, checking: bool) -> Qwen35Run<'a> {
+    fn run_begin<'a>(&self, m: &Qwen35Model, st: &'a State, chain: &'a dyn DeviceChain, emb: &[f32], t: usize, kv: &mut KvCache, checking: bool, taps: &[usize]) -> Qwen35Run<'a> {
         let s = st.dims;
         let cfg = &m.config;
         let row = 2 * s.n_kv * s.hd;
@@ -1421,6 +1533,22 @@ impl Qwen35Chain {
             states.push((state, conv));
         }
         drop(pool);
+        // the states kept from inside the run (`taps`: after that many of its rows, ascending): a pair of vectors a
+        // slot for each, and the vectors the rows after the first of them go through
+        assert!(
+            !(checking && !taps.is_empty()) && taps.windows(2).all(|w| w[0] < w[1]) && taps.first().map_or(true, |&r| r > 0 && t - r.min(t) <= TAP_ROWS) && taps.last().map_or(true, |&r| r <= t),
+            "chain: a run of {t} rows keeps states after {taps:?}"
+        );
+        let kept: Vec<Tap> = taps.iter().map(|&row| Tap { row, vecs: states.iter().map(|(state, conv)| (chain.vec(state.len), chain.vec(conv.len))).collect() }).collect();
+        let seg = kept.first().filter(|tap| tap.row < t).map(|_| {
+            st.seg.get_or_init(|| Seg {
+                qkv: chain.vec(TAP_ROWS * s.ch),
+                z: chain.vec(TAP_ROWS * s.nv * s.dv),
+                ba: chain.vec(TAP_ROWS * 2 * s.nv),
+                conv: chain.vec(TAP_ROWS * s.ch),
+                core: chain.vec(TAP_ROWS * s.nv * s.dv),
+            })
+        });
         // a prompt's chunk's vectors a pooled set's (room for a chunk of the most rows), its attention's scratch grown
         // as the positions it reaches do
         let mut set = None;
@@ -1447,7 +1575,7 @@ impl Qwen35Chain {
         rec.keep_groups(t == 1);
         // each residual's add waits for the norm after it (the next layer's, or the output's): one dispatch for both
         let mut added = false;
-        let bound = Bound { kvl: &g.layers, half: halves.then(|| (&g.half[..], halved)), cap: g.cap, states: &states, w, attn: &attn };
+        let bound = Bound { kvl: &g.layers, half: halves.then(|| (&g.half[..], halved)), cap: g.cap, states: &states, w, attn: &attn, taps: &kept, seg };
         let check = if checking { st.spec.as_ref() } else { None };
         record_layers(&mut *rec, &s, eps, m.blocks.iter().map(LayerW::of).zip(&st.layers), &bound, t, past, check, &mut added);
         // the head of the last row only, or of a check's every row; with a prediction layer, the hidden states after the
@@ -1487,7 +1615,20 @@ impl Qwen35Chain {
         kv.commit(t);
         kv.dirty_from = usize::MAX;
         self.runs.fetch_add(1, Ordering::Relaxed);
-        Qwen35Run { rec, layers: st.attention_layers.clone(), past, t, vocab: s.vocab, set: set.map(|v| (&st.prompt_sets, v)) }
+        // the kept states as the cache holds a layer's (theirs once the run has run)
+        let taps = kept
+            .iter()
+            .map(|tap| {
+                let none = || (0..kv.ssm_state.len()).map(|_| None).collect::<Vec<Option<Tensor>>>();
+                let (mut states, mut convs) = (none(), none());
+                for (i, &l) in st.ssm_layers.iter().enumerate() {
+                    states[l] = Some(chain.alias(&tap.vecs[i].0, vec![s.nv, s.dv, s.dk]));
+                    convs[l] = Some(chain.alias(&tap.vecs[i].1, vec![s.kern - 1, s.ch]));
+                }
+                Tapped { at: past + tap.row, states, convs }
+            })
+            .collect();
+        Qwen35Run { rec, layers: st.attention_layers.clone(), past, t, vocab: s.vocab, set: set.map(|v| (&st.prompt_sets, v)), taps }
     }
 
     /// The prediction layer's cache at a prompt's chunk (`t` rows at `past`, its embeddings `emb`, its hidden states

@@ -540,6 +540,19 @@ impl Qwen35Model {
         self.forward_embeds_host(embeds, seq, kv, multimodal)
     }
 
+    /// VENDORED-LOCAL: whether [`Self::forward_embeds_tapped`] can keep the states `taps` name from inside a run of
+    /// `seq` rows after what `kv` holds ([`crate::Qwen35Chain::can_tap`]).
+    pub fn can_tap(&self, seq: usize, kv: &KvCache, taps: &[usize]) -> bool {
+        self.chain.can_tap(self, seq, kv, taps)
+    }
+
+    /// VENDORED-LOCAL: [`Self::forward_embeds`] chained, with the recurrent states as they are once each of `taps`
+    /// rows of the run is in (what a checkpoint there holds, the run not stopping for it); None, and nothing run,
+    /// where it cannot ([`Self::can_tap`]).
+    pub fn forward_embeds_tapped(&self, embeds: &Tensor, seq: usize, kv: &mut KvCache, taps: &[usize]) -> Option<(Tensor, Vec<crate::Tapped>)> {
+        self.chain.forward_tapped(self, embeds, seq, kv, taps)
+    }
+
     /// VENDORED-LOCAL: [`Self::forward_embeds_positions`] op by op through the backend, never chained (what a chained
     /// run is checked against).
     pub fn forward_embeds_host(&self, embeds: &Tensor, seq: usize, kv: &mut KvCache, multimodal: Option<&[[u32; 3]]>) -> Result<Tensor> {

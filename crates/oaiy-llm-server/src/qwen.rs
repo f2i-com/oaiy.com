@@ -388,24 +388,8 @@ impl Hybrid {
         }
         // the Qwen3.5 hybrid's as one run (its chain records each chunk as the one before runs)
         if let (Self::Qwen35(Model::Qwen35(_)), true) = (self, chunks.len() > 1) {
-            use rayon::prelude::*;
-            let width = self.width();
-            let rows: usize = chunks.iter().map(|(t, _)| t.len()).sum();
-            // (the chunks' embeddings side by side, copied on every core: 64 MB a run of 3,150 tokens, 10 ms on one)
-            let mut emb = vec![0f32; rows * width];
-            let mut parts: Vec<&mut [f32]> = Vec::with_capacity(chunks.len());
-            let mut rest = &mut emb[..];
-            for (t, _) in chunks {
-                let (part, after) = rest.split_at_mut(t.len() * width);
-                parts.push(part);
-                rest = after;
-            }
-            parts.into_par_iter().zip(chunks.par_iter()).for_each(|(part, (_, e))| part.copy_from_slice(e.data()));
-            let mut tokens = Vec::with_capacity(rows);
-            for (t, _) in chunks {
-                tokens.extend_from_slice(t);
-            }
-            let out = self.forward(&tokens, Tensor::from_vec(emb, vec![rows, width]), kv, None)?;
+            let (tokens, emb) = self.joined(chunks);
+            let out = self.forward(&tokens, emb, kv, None)?;
             for i in 0..chunks.len() {
                 done(i);
             }
@@ -436,6 +420,44 @@ impl Hybrid {
         matches!(self, Self::Qwen35(Model::Qwen35(m)) if m.backend.chain().is_some())
     }
     /// Run `tokens` (embedded as `embeds`, on the host) after what `kv` holds: the last logits, on the host.
+    /// `chunks`' tokens one after another and their embeddings side by side (copied on every core: 64 MB a run of
+    /// 3,150 tokens, 10 ms on one).
+    fn joined(&self, chunks: &[(&[u32], Tensor)]) -> (Vec<u32>, Tensor) {
+        use rayon::prelude::*;
+        let width = self.width();
+        let rows: usize = chunks.iter().map(|(t, _)| t.len()).sum();
+        let mut emb = vec![0f32; rows * width];
+        let mut parts: Vec<&mut [f32]> = Vec::with_capacity(chunks.len());
+        let mut rest = &mut emb[..];
+        for (t, _) in chunks {
+            let (part, after) = rest.split_at_mut(t.len() * width);
+            parts.push(part);
+            rest = after;
+        }
+        parts.into_par_iter().zip(chunks.par_iter()).for_each(|(part, (_, e))| part.copy_from_slice(e.data()));
+        let mut tokens = Vec::with_capacity(rows);
+        for (t, _) in chunks {
+            tokens.extend_from_slice(t);
+        }
+        (tokens, Tensor::from_vec(emb, vec![rows, width]))
+    }
+    /// Whether a run of `rows` after what `kv` holds can keep its recurrent states from inside it once each of `taps`
+    /// rows is in ([`Self::forward_chunks_tapped`]): a chained Qwen3.5 hybrid's, where its chain says so.
+    fn can_tap(&self, rows: usize, kv: &KvCache, taps: &[usize]) -> bool {
+        matches!(self, Self::Qwen35(Model::Qwen35(m)) if m.can_tap(rows, kv, taps))
+    }
+    /// [`Self::forward_chunks`] with the recurrent states as they are once each of `taps` rows of the chunks is in
+    /// (what a checkpoint there holds, the run not stopping for it), where [`Self::can_tap`] said it can.
+    fn forward_chunks_tapped(&self, chunks: &[(&[u32], Tensor)], kv: &mut KvCache, done: &mut dyn FnMut(usize), taps: &[usize]) -> Result<(Tensor, Vec<llama_rs::Tapped>), String> {
+        let Self::Qwen35(Model::Qwen35(m)) = self else { return Err("not a dense Qwen hybrid".into()) };
+        let (tokens, emb) = self.joined(chunks);
+        let embeds = m.backend.to_device(emb);
+        let (logits, kept) = m.forward_embeds_tapped(&embeds, tokens.len(), kv, taps).ok_or("the run could not keep its states from inside")?;
+        for i in 0..chunks.len() {
+            done(i);
+        }
+        Ok((logits.to_host(), kept))
+    }
     fn forward(&self, tokens: &[u32], embeds: Tensor, kv: &mut KvCache, positions: Option<&[[u32; 3]]>) -> Result<Tensor, String> {
         match self {
             Self::Qwen35(Model::Qwen35(m)) => {
@@ -607,7 +629,14 @@ impl QwenEngine {
             // a text prompt's chunks up to the next checkpoint together, where the model runs them so (some at a time,
             // between cancellations' looks)
             if hybrid.pipelines() && job.images.is_empty() {
-                let stop = stops.iter().copied().find(|&s| s > pos).unwrap_or(keys.len()).min(keys.len()).min(pos + 8 * PREFILL_CHUNK);
+                // the checkpoints this run would reach that are not kept yet: kept from inside it where the model can
+                // (its states copied as the run goes: a prompt's last two, before the assistant's header and before
+                // its last token, were a run of 6 rows and a run of 1 of their own), else a run's end each as before
+                // (a disk's checkpoints are whole states: a run's end too)
+                let far = (pos + 8 * PREFILL_CHUNK).min(keys.len());
+                let due: Vec<usize> = stops.iter().copied().filter(|&s| s > pos && s <= far && !self.checkpoints.iter().any(|(saved, _, _)| saved == &keys[..s])).collect();
+                let inside = !due.is_empty() && (self.disk.is_none() || job.forget) && self.kv.len == pos && hybrid.can_tap(far - pos, &self.kv, &due.iter().map(|s| s - pos).collect::<Vec<_>>());
+                let stop = if inside { far } else { stops.iter().copied().find(|&s| s > pos).unwrap_or(keys.len()).min(keys.len()).min(pos + 8 * PREFILL_CHUNK) };
                 let rows = hybrid.prompt_rows();
                 let spans: Vec<(usize, usize)> = (pos..stop).step_by(rows).map(|a| (a, (a + rows).min(stop))).collect();
                 // (a dense hybrid's chunks' embeddings on every core: its table's rows, 16 ms a run of 3,150 on one)
@@ -621,7 +650,18 @@ impl QwenEngine {
                 let chunks: Vec<(&[u32], Tensor)> = spans.iter().zip(embeds).map(|(&(a, b), e)| (&job.prompt[a..b], e)).collect();
                 let events = &job.events;
                 let mut done = |i: usize| { let _ = events.send(Event::Progress { done: spans[i].1 - start, total }); };
-                logits = Some(hybrid.forward_chunks(&chunks, &mut self.kv, &mut done)?);
+                if inside {
+                    let (out, kept) = hybrid.forward_chunks_tapped(&chunks, &mut self.kv, &mut done, &due.iter().map(|s| s - pos).collect::<Vec<_>>())?;
+                    logits = Some(out);
+                    for tap in kept {
+                        if self.log { eprintln!("  Qwen checkpoint: {} tokens; from inside the run", tap.at); }
+                        let base = stops.first() == Some(&tap.at);
+                        self.checkpoints.push((keys[..tap.at].to_vec(), RecurrentSnapshot::tapped(tap.at, tap.states, tap.convs), base));
+                        trim_checkpoints(&mut self.checkpoints);
+                    }
+                } else {
+                    logits = Some(hybrid.forward_chunks(&chunks, &mut self.kv, &mut done)?);
+                }
                 self.covered.extend_from_slice(&keys[pos..stop]);
                 pos = stop;
             } else {
