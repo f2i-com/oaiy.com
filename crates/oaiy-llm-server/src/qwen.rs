@@ -694,10 +694,10 @@ impl QwenEngine {
                 drafts_taken += 1;
             } else {
                 // its drafts, then the token and them in one check; else the token alone
-                let checked = drafter.filter(|_| self.kv.len + 1 + DRAFTS <= self.kv.max_len).and_then(|m| {
+                let checked = drafter.filter(|_| self.kv.len + 1 + drafts_most() <= self.kv.max_len).and_then(|m| {
                     let recent: Vec<u32> = self.covered[self.covered.len().saturating_sub(m.draft_window())..].iter().map(|&k| k as u32).chain([next]).collect();
                     // none the layer is sure enough of: a step of the token alone
-                    let drafts = m.draft(&self.kv, &recent, DRAFTS).filter(|d| !d.is_empty())?;
+                    let drafts = m.draft(&self.kv, &recent, drafts_most()).filter(|d| !d.is_empty())?;
                     let rows: Vec<u32> = std::iter::once(next).chain(drafts.iter().copied()).collect();
                     Some((drafts, m.check(&rows, &mut self.kv)?))
                 });
@@ -737,6 +737,14 @@ impl QwenEngine {
 /// Tokens drafted a check, where a model drafts (its multi-token-prediction layer): Qwen3.8 27B's take 0.86, 0.73
 /// and 0.65 in turn (each where the ones before it were).
 const DRAFTS: usize = 3;
+
+/// [`DRAFTS`], or OAIY_DRAFTS's (1 to 7: a check is 8 rows at most). More than three loses on Flash-Next, whose check
+/// is some 1.9 steps (its 66 tokens after 3,780: 0.84 s with three, 42 of 51 drafts taken; 0.96 with four, 45 of 59;
+/// 0.94 with five; 0.99 with six).
+fn drafts_most() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| std::env::var("OAIY_DRAFTS").ok().and_then(|v| v.parse().ok()).filter(|n| (1..=7).contains(n)).unwrap_or(DRAFTS))
+}
 
 fn trim_checkpoints(checkpoints: &mut Vec<(Vec<u64>, RecurrentSnapshot, bool)>) {
     while checkpoints.len() > 1 && (checkpoints.len() > 3 ||
