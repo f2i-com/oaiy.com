@@ -1518,6 +1518,132 @@ mod dense_webgpu_timing {
     }
 
     /// Qwen3.8-Flash-Next chained past QSA's dense span (FLASHNEXT_MODEL) answers as its own path does: a prompt of some
+    /// Qwen3.8-Flash-Next's prompt whose chunks keep its checkpoints' states from inside them (FLASHNEXT_MODEL;
+    /// FLASHNEXT_LEN tokens, 1,300 unless asked) against the runs that stop where it keeps them, before the prompt's
+    /// last 7 tokens and before its last: the delta nets' states and conv windows and the n-gram layer's window as
+    /// close as those runs' (the same rows through the same kernels where the stopped run's last chunk is long; a
+    /// run of few rows' kernels apart else), the n-gram layer's history the same ids, the logits as close; and a cache
+    /// put back to either kept state and run on from there gives the run's own logits again.
+    #[test]
+    #[ignore = "needs WebGPU adapters with room for Qwen3.8-Flash-Next (FLASHNEXT_MODEL); run with --nocapture"]
+    fn flashnext_chunks_keep_the_states_their_stops_would() {
+        use std::sync::Arc;
+        let path = std::env::var("FLASHNEXT_MODEL").unwrap_or_else(|_| r"E:\models\Qwen3.8-Flash-Next\exl3-3.05bpw".into());
+        let Ok(b0) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
+        let others: Vec<Arc<ggml_rs_wgpu::WgpuBackend>> = b0.others(None).into_iter().map(Arc::new).collect();
+        let b0 = Arc::new(b0);
+        let gpus: Vec<&ggml_rs_wgpu::WgpuBackend> = std::iter::once(b0.as_ref()).chain(others.iter().map(|g| g.as_ref())).collect();
+        let backends: Vec<Arc<dyn ggml_rs::Backend>> = std::iter::once(Arc::clone(&b0) as Arc<dyn ggml_rs::Backend>).chain(others.iter().map(|g| Arc::clone(g) as Arc<dyn ggml_rs::Backend>)).collect();
+        type Make<'a> = Box<dyn Fn(ggml_rs::exl3::Exl3Data) -> std::result::Result<Arc<dyn ggml_rs::exl3::PackedLinear>, String> + Send + Sync + 'a>;
+        let packed = |device: usize| -> Make<'_> {
+            let b = gpus[device];
+            Box::new(move |d| b.exl3(d))
+        };
+        let p = std::path::Path::new(&path);
+        let reserve = crate::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
+        let experts = |device: usize, _layer: &str, list: Vec<[ggml_rs::exl3::Exl3Data; 3]>| -> oaiy_engine::Result<Box<dyn ggml_rs::exl3::Experts>> {
+            gpus[device].exl3_experts_leaving(list, reserve).map_err(oaiy_engine::Error::Arg)
+        };
+        let model = crate::flashnext::load_portable(p, backends, &packed, &experts, false).unwrap();
+        let n: usize = std::env::var("FLASHNEXT_LEN").ok().and_then(|v| v.parse().ok()).unwrap_or(1300);
+        let tokens: Vec<u32> = (0..n as u32).map(|i| 1000 + (i * 7919) % 20000).collect();
+        let taps = [n - 7, n - 1];
+        let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0;
+        let cosine = |a: &[f32], b: &[f32]| {
+            let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
+            let norm = |v: &[f32]| v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            dot / (norm(a) * norm(b)).max(1e-30)
+        };
+        // (the same token, or one as good to a tenth of a logit: these prompts' tokens are no text)
+        let agree = |a: &[f32], b: &[f32]| argmax(a) == argmax(b) || (b[argmax(b)] - b[argmax(a)]).abs() < 0.1;
+        let host = |ts: &[Option<ggml_rs::Tensor>]| -> Vec<Option<Vec<f32>>> { ts.iter().map(|t| t.as_ref().map(|t| t.to_host().data().to_vec())).collect() };
+        // a prompt's rows as the server runs them: chunks of the model's own, together
+        let most = model.prompt_rows();
+        let run = |from: usize, to: usize, kv: &mut llama_rs::KvCache, taps: &[usize]| {
+            let spans: Vec<(usize, usize)> = (from..to).step_by(most).map(|a| (a, (a + most).min(to))).collect();
+            let embeds: Vec<ggml_rs::Tensor> = spans.iter().map(|&(a, z)| model.embed_text(&tokens[a..z]).unwrap()).collect();
+            let chunks: Vec<(&[u32], &ggml_rs::Tensor)> = spans.iter().zip(&embeds).map(|(&(a, z), e)| (&tokens[a..z], e)).collect();
+            let (logits, kept) = model.forward_chunks_tapped(&chunks, kv, &mut |_| {}, taps);
+            (logits.expect("the chunks chained").to_host(), kept)
+        };
+        // (the kernels warmed)
+        {
+            let mut kv = model.new_kv_cache(4096);
+            run(0, n - 7, &mut kv, &[]);
+            run(n - 7, n, &mut kv, &[]);
+        }
+        // the runs that stop
+        let mut kv = model.new_kv_cache(4096);
+        let t = std::time::Instant::now();
+        run(0, n - 7, &mut kv, &[]);
+        let first = (host(&kv.ssm_state), host(&kv.ssm_conv));
+        run(n - 7, n - 1, &mut kv, &[]);
+        let second = (host(&kv.ssm_state), host(&kv.ssm_conv));
+        let (stopped, _) = run(n - 1, n, &mut kv, &[]);
+        let ms_stopped = t.elapsed().as_secs_f64() * 1e3;
+        // the chunks that keep them
+        let mut kv = model.new_kv_cache(4096);
+        assert!(model.can_tap(n, &kv, &taps), "chunks of {n} rows keep their states after {taps:?}");
+        let t = std::time::Instant::now();
+        let (logits, kept) = run(0, n, &mut kv, &taps);
+        let ms_kept = t.elapsed().as_secs_f64() * 1e3;
+        assert_eq!(kept.iter().map(|k| k.at).collect::<Vec<_>>(), taps, "the states' places");
+        assert_eq!(kv.len, n, "the cache's rows");
+        // (a short stopped chunk's rows are through other kernels than a long one's)
+        let before = (n - 7) % most;
+        for (i, (tap, (states, convs))) in kept.iter().zip([&first, &second]).enumerate() {
+            let (mut worst, mut count) = (1f64, 0);
+            for (got, want) in host(&tap.states).iter().zip(states).chain(host(&tap.convs).iter().zip(convs)).map(|(g, w)| (g.as_ref(), w.as_ref())) {
+                assert_eq!(got.is_some(), want.is_some(), "a slot's state where the cache has one");
+                if let (Some(g), Some(w)) = (got, want) {
+                    assert_eq!(g.len(), w.len(), "a state's size");
+                    // (the n-gram layer's history: token ids, the same ones)
+                    if g.len() < 16 {
+                        assert_eq!(g, w, "the n-gram layer's history");
+                    } else {
+                        worst = worst.min(cosine(g, w));
+                    }
+                    count += 1;
+                }
+            }
+            eprintln!("the states kept after {} rows against the run's that stops there: the worst cosine {worst:.7}, {count} of them", tap.at);
+            assert!(worst > if i == 0 && (before == 0 || before >= 128) { 0.9999 } else { 0.98 }, "the states after {} rows: {worst}", tap.at);
+        }
+        // The same chunks keeping nothing: the same kernels over the same rows but the recurrences of the rows after a
+        // kept state, which go a few rows at a time (their own kernels, where a chunk's rows go through the scan's):
+        // the same logits to those kernels' rounding, which a prompt of a few tokens that are no text makes the most
+        // of (28 of them: the delta nets' states the same to five places through 17 layers, 0.997 by the last).
+        let mut whole_kv = model.new_kv_cache(4096);
+        let (whole, _) = run(0, n, &mut whole_kv, &[]);
+        let cw = cosine(logits.data(), whole.data());
+        // (where the two differ, slot by slot: the states at the end)
+        if std::env::var_os("FLASHNEXT_TAPS_DEBUG").is_some() {
+            let (a, b) = ((host(&kv.ssm_state), host(&kv.ssm_conv)), (host(&whole_kv.ssm_state), host(&whole_kv.ssm_conv)));
+            for (what, x, y) in [("state", &a.0, &b.0), ("conv", &a.1, &b.1)] {
+                let line: Vec<String> = x.iter().zip(y).enumerate().filter_map(|(i, (g, w))| Some((i, g.as_ref()?, w.as_ref()?))).map(|(i, g, w)| format!("{i}:{:.5}", cosine(g, w))).collect();
+                eprintln!("the end's {what}s, kept against not: {}", line.join(" "));
+            }
+        }
+        let c = cosine(logits.data(), stopped.data());
+        eprintln!("{n} tokens: the runs that stop {ms_stopped:.0} ms (this test reading their states to the host between them), the chunks that keep their states {ms_kept:.0} ms; the logits' cosine with the chunks that keep none {cw:.7}, with the runs that stop {c:.6} (the same token {})", argmax(logits.data()) == argmax(stopped.data()));
+        assert!(cw > if before == 0 || before >= 128 { 0.9999 } else { 0.98 }, "the logits against the chunks that keep nothing: {cw}");
+        // (the runs that stop are runs of few rows at the end, other kernels: a prompt of a few tokens is all such)
+        assert!(c > 0.98 && (c < 0.999 || agree(logits.data(), stopped.data())), "the logits against the stopped runs': {c}");
+        // a cache put back to a kept state runs on to the same logits
+        for tap in kept.iter().rev() {
+            for i in 0..kv.ssm_state.len() {
+                let backend = kv.layer_backends[i].clone();
+                kv.ssm_state[i] = tap.states[i].as_ref().map(|t| backend.to_device(t.to_host()));
+                kv.ssm_conv[i] = tap.convs[i].as_ref().map(|t| backend.to_device(t.to_host()));
+            }
+            kv.len = tap.at;
+            let (again, _) = run(tap.at, n, &mut kv, &[]);
+            let c = cosine(again.data(), logits.data());
+            eprintln!("put back to the state after {} rows and run on: the logits' cosine {c:.6}, the same token {}", tap.at, argmax(again.data()) == argmax(logits.data()));
+            assert!(c > 0.98 && (c < 0.999 || agree(again.data(), logits.data())), "run on from the state after {} rows: {c}", tap.at);
+        }
+    }
+
     /// Qwen3.8-Flash-Next's prompt in chunks of 1,024 run together (FLASHNEXT_MODEL, with OAIY_FN_ROWS=1024: 512 is
     /// the most otherwise, and there is nothing to compare) answers as in chunks of 512 one at a time: the last logits to the kernels' rounding (the experts' blocks hold other rows, their sums in another
     /// order), the same token, and the steps after it the same tokens.

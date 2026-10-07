@@ -1562,6 +1562,8 @@ pub(crate) struct FnChain {
     ple: Option<(ChainPle, PleVecs)>,
     /// The vectors of runs of 2 to [`CHECK_ROWS`] rows, made at the first of each.
     few: [std::sync::OnceLock<FewSet>; CHECK_ROWS - 1],
+    /// A tapped run's later rows' vectors, a set a device, made at the first run that keeps a state from inside.
+    seg: std::sync::OnceLock<Vec<TapSeg>>,
     /// The multi-token-prediction layer, where it is loaded and chainable.
     mtp: Option<MtpChain>,
     m: std::sync::Mutex<ChainMut>,
@@ -1724,7 +1726,7 @@ impl FlashNext {
                 };
                 let ple_window = chains[pd].vec((cfg.ple_kernel.max(1) - 1) * cfg.ngram * s * cfg.hidden);
                 let rows_out = chains.iter().map(|c| c.vec(1)).collect();
-                Some(FnChain { layers, devs, attn_of, gdn, collapse, rank, keys, ple, few: Default::default(), mtp, m: std::sync::Mutex::new(ChainMut { kv, pool, ple_window, rows_out, undo: None, mtp_kv: None, mtp_hid: (0, 0) }), runs: Default::default() })
+                Some(FnChain { layers, devs, attn_of, gdn, collapse, rank, keys, ple, few: Default::default(), seg: Default::default(), mtp, m: std::sync::Mutex::new(ChainMut { kv, pool, ple_window, rows_out, undo: None, mtp_kv: None, mtp_hid: (0, 0) }), runs: Default::default() })
             })
             .as_ref()
     }
@@ -1851,7 +1853,7 @@ impl FlashNext {
     /// logits; every row's for a check (`check`: undoable, see [`Self::rollback`]). None leaves the run to `forward`'s
     /// own path: past the dense span (QSA's sparse attention), or with images.
     fn run_chained(&self, tokens: &[u32], embeds: &Tensor, kv: &mut KvCache, check: bool) -> Option<Vec<f32>> {
-        let run = self.run_begin(tokens, embeds, kv, check, &mut None, None)?;
+        let run = self.run_begin(tokens, embeds, kv, check, &mut None, None, &[])?;
         Some(run.finish(self, kv))
     }
 
@@ -1860,6 +1862,45 @@ impl FlashNext {
     /// chunks before it run, `done` of each said; the rest the caller's). `done(i)` once chunk `i` has gone to the
     /// GPUs (its K and V in the host's cache once the next has).
     pub fn forward_chunks(&self, chunks: &[(&[u32], &Tensor)], kv: &mut KvCache, done: &mut dyn FnMut(usize)) -> Option<Tensor> {
+        self.forward_chunks_tapped(chunks, kv, done, &[]).0
+    }
+
+    /// Whether a prompt's chunks of [`Self::prompt_rows`] (`rows` in all, after what `kv` holds) can keep their
+    /// recurrent states from inside them once each of `taps` rows is in ([`Self::forward_chunks_tapped`]): chained,
+    /// the n-gram layer too (its window a device's vector), and each chunk's rows after the first state it keeps few
+    /// ([`TAP_ROWS`]: their recurrences go through vectors of their own). OAIY_NO_TAPS: never.
+    pub fn can_tap(&self, rows: usize, kv: &KvCache, taps: &[usize]) -> bool {
+        if std::env::var_os("OAIY_NO_CHAIN").is_some() || std::env::var_os("OAIY_NO_TAPS").is_some() || profile::on() || rows == 0 || taps.is_empty() {
+            return false;
+        }
+        let most = self.prompt_rows();
+        self.chain_state().is_some_and(|st| st.ple.is_some())
+            && self.devices.iter().all(|b| b.chain().is_some())
+            && (kv.len + rows) / self.config.index_ratio <= 4096
+            && taps.windows(2).all(|w| w[0] < w[1])
+            && taps[0] > 0
+            && taps[taps.len() - 1] <= rows
+            && (0..rows).step_by(most).all(|at| {
+                let end = (at + most).min(rows);
+                taps.iter().find(|&&p| p > at && p <= end).map_or(true, |&p| end - p <= TAP_ROWS)
+            })
+    }
+
+    /// [`Self::forward_chunks`] with the delta nets' states and conv windows and the n-gram layer's window and history
+    /// as they are once each of `taps` rows of the chunks is in (ascending, counted through the chunks): what a
+    /// checkpoint there holds, the run not stopping for it. A prompt's last two, before the assistant's header and
+    /// before its last token, each ended a run, and a run of few rows costs what a chunk of 64 does (its weights are
+    /// decoded once whatever its rows): a follow-up turn's 21 new tokens 102 ms, then 42 and 18 for those two. The
+    /// states of the chunks that ran (all of them where the logits are given).
+    pub fn forward_chunks_tapped(&self, chunks: &[(&[u32], &Tensor)], kv: &mut KvCache, done: &mut dyn FnMut(usize), taps: &[usize]) -> (Option<Tensor>, Vec<llama_rs::Tapped>) {
+        let mut tapped: Vec<llama_rs::Tapped> = Vec::new();
+        // each chunk's first row among the chunks'
+        let starts: Vec<usize> = chunks.iter().scan(0, |at, (t, _)| { let a = *at; *at += t.len(); Some(a) }).collect();
+        let logits = self.chunks_run(chunks, kv, done, taps, &starts, &mut tapped);
+        (logits, tapped)
+    }
+
+    fn chunks_run(&self, chunks: &[(&[u32], &Tensor)], kv: &mut KvCache, done: &mut dyn FnMut(usize), taps: &[usize], starts: &[usize], tapped: &mut Vec<llama_rs::Tapped>) -> Option<Tensor> {
         // each chunk's n-gram features (random reads of a 32 GB table: some 25 ms a chunk of 512) read on a thread of
         // their own, a chunk ahead of the GPUs
         let ctx = self.config.ngram - 1;
@@ -1922,20 +1963,23 @@ impl FlashNext {
                 let t1 = began.elapsed().as_secs_f64() * 1e3;
                 let had = pending.is_some();
                 let fits = tokens.len() <= self.prompt_rows() && !profile::on() && ple.is_some();
+                // (the states this chunk keeps: by its own rows)
+                let local: Vec<usize> = taps.iter().filter(|&&p| p > starts[i] && p <= starts[i] + tokens.len()).map(|&p| p - starts[i]).collect();
                 // (the chunk before's rest goes after this chunk's first part, or before a chunk that goes whole)
                 if ahead && fits && tokens.len() > CHECK_ROWS {
-                    match self.run_part(tokens, embeds, kv, false, &mut pending, ple, Stage::First) {
+                    match self.run_part(tokens, embeds, kv, false, &mut pending, ple, Stage::First, &local) {
                         Some(Went::Parked(p)) => {
                             let mut before = parked.replace((i, p));
-                            self.run_rest(&mut before, &mut pending, embeds, kv, done);
+                            self.run_rest(&mut before, &mut pending, embeds, kv, done, tapped);
                             if said {
                                 eprintln!("  fn chunk {i}: at {t0:.0} ms, features waited {:.0}, its first part and the chunk before's rest in {:.0}", t1 - t0, began.elapsed().as_secs_f64() * 1e3 - t1);
                             }
                             continue;
                         }
-                        Some(Went::Run(run)) => {
+                        Some(Went::Run(mut run)) => {
                             // (no second device's part after all: as a chunk whole)
-                            self.run_rest(&mut parked, &mut pending, embeds, kv, done);
+                            self.run_rest(&mut parked, &mut pending, embeds, kv, done, tapped);
+                            tapped.append(&mut run.tapped);
                             if let Some(p) = pending.replace(run) {
                                 p.finish(self, kv);
                             }
@@ -1943,7 +1987,7 @@ impl FlashNext {
                             continue;
                         }
                         None => {
-                            self.run_rest(&mut parked, &mut pending, embeds, kv, done);
+                            self.run_rest(&mut parked, &mut pending, embeds, kv, done, tapped);
                             if let Some(p) = pending.take() {
                                 p.finish(self, kv);
                             }
@@ -1951,17 +1995,18 @@ impl FlashNext {
                         }
                     }
                 }
-                self.run_rest(&mut parked, &mut pending, embeds, kv, done);
-                let run = if fits { self.run_begin(tokens, embeds, kv, false, &mut pending, ple) } else { None };
+                self.run_rest(&mut parked, &mut pending, embeds, kv, done, tapped);
+                let run = if fits { self.run_begin(tokens, embeds, kv, false, &mut pending, ple, &local) } else { None };
                 if said {
                     eprintln!("  fn chunk {i}: at {t0:.0} ms, features waited {:.0}, begun in {:.0} (the one before {})", t1 - t0, began.elapsed().as_secs_f64() * 1e3 - t1, if had && pending.is_none() { "finished inside" } else { "left" });
                 }
-                let Some(run) = run else {
+                let Some(mut run) = run else {
                     if let Some(p) = pending.take() {
                         p.finish(self, kv);
                     }
                     return None;
                 };
+                tapped.append(&mut run.tapped);
                 // (one the run did not take: a chain on one device)
                 if let Some(p) = pending.replace(run) {
                     p.finish(self, kv);
@@ -1969,7 +2014,7 @@ impl FlashNext {
                 done(i);
             }
             if let Some(&(_, embeds)) = chunks.last() {
-                self.run_rest(&mut parked, &mut pending, embeds, kv, done);
+                self.run_rest(&mut parked, &mut pending, embeds, kv, done, tapped);
             }
             if let Some(p) = pending.take() {
                 last = Some(p.finish(self, kv));
@@ -1980,9 +2025,10 @@ impl FlashNext {
 
     /// A parked chunk's rest ([`Stage::Rest`]; `embeds` any chunk's, not read): its second device's layers recorded
     /// and gone behind the run before's, which is then finished, this chunk's run `pending` in its place.
-    fn run_rest<'a>(&'a self, parked: &mut Option<(usize, Box<Parked<'a>>)>, pending: &mut Option<ChainedRun<'a>>, embeds: &Tensor, kv: &mut KvCache, done: &mut dyn FnMut(usize)) {
+    fn run_rest<'a>(&'a self, parked: &mut Option<(usize, Box<Parked<'a>>)>, pending: &mut Option<ChainedRun<'a>>, embeds: &Tensor, kv: &mut KvCache, done: &mut dyn FnMut(usize), tapped: &mut Vec<llama_rs::Tapped>) {
         if let Some((j, q)) = parked.take() {
-            let Some(Went::Run(run)) = self.run_part(&[], embeds, kv, false, pending, None, Stage::Rest(q)) else { panic!("a chunk's second device's part") };
+            let Some(Went::Run(mut run)) = self.run_part(&[], embeds, kv, false, pending, None, Stage::Rest(q), &[]) else { panic!("a chunk's second device's part") };
+            tapped.append(&mut run.tapped);
             if let Some(p) = pending.replace(run) {
                 p.finish(self, kv);
             }
@@ -2006,8 +2052,8 @@ impl FlashNext {
     /// [`Self::run_chained`] up to its last device's wait: every device's work gone (the last's running), `kv`
     /// committed; `prev` (a chunk's run before this one's, its last device still running) finished as the next
     /// device's layers are recorded, so the device holds one chunk's scratch at a time.
-    fn run_begin<'a>(&'a self, tokens: &[u32], embeds: &Tensor, kv: &mut KvCache, check: bool, prev: &mut Option<ChainedRun<'a>>, ple: Option<Vec<f32>>) -> Option<ChainedRun<'a>> {
-        match self.run_part(tokens, embeds, kv, check, prev, ple, Stage::Whole)? {
+    fn run_begin<'a>(&'a self, tokens: &[u32], embeds: &Tensor, kv: &mut KvCache, check: bool, prev: &mut Option<ChainedRun<'a>>, ple: Option<Vec<f32>>, taps: &[usize]) -> Option<ChainedRun<'a>> {
+        match self.run_part(tokens, embeds, kv, check, prev, ple, Stage::Whole, taps)? {
             Went::Run(run) => Some(run),
             Went::Parked(_) => unreachable!("a whole run stops at no device"),
         }
@@ -2020,7 +2066,7 @@ impl FlashNext {
     /// chunk's work behind the one it runs, where a chunk whole left the first device idle while the host recorded
     /// the second's layers and stored rows, and the second while the host recorded the next chunk's first.
     #[allow(clippy::too_many_arguments)]
-    fn run_part<'a>(&'a self, tokens: &[u32], embeds: &Tensor, kv: &mut KvCache, check: bool, prev: &mut Option<ChainedRun<'a>>, ple: Option<Vec<f32>>, stage: Stage<'a>) -> Option<Went<'a>> {
+    fn run_part<'a>(&'a self, tokens: &[u32], embeds: &Tensor, kv: &mut KvCache, check: bool, prev: &mut Option<ChainedRun<'a>>, ple: Option<Vec<f32>>, stage: Stage<'a>, taps: &[usize]) -> Option<Went<'a>> {
         use ggml_rs::{ChainRecorder, DeltaNet};
         use std::sync::atomic::Ordering;
         if std::env::var_os("OAIY_NO_CHAIN").is_some() {
@@ -2142,6 +2188,56 @@ impl FlashNext {
             }
             kv.ssm_conv[slot] = Some(c.alias(&m.ple_window, shape));
             m.ple_window.clone()
+        });
+        // The states the run keeps from inside it (`taps`: after that many of its rows, ascending; a resumed chunk's
+        // its own): a pair of vectors a delta net and one for the n-gram layer's window, and what the caller is given
+        // of them: a checkpoint's tensors, as the cache holds its own (the n-gram layer's history its tokens').
+        let (kept, mut tapped): (Vec<Tap>, Vec<llama_rs::Tapped>) = match parked.as_mut() {
+            Some(p) => (std::mem::take(&mut p.kept), std::mem::take(&mut p.tapped)),
+            None if taps.is_empty() => (Vec::new(), Vec::new()),
+            None => {
+                assert!(!check && taps.windows(2).all(|w| w[0] < w[1]) && taps[0] > 0 && taps[taps.len() - 1] <= t && t - taps[0] <= TAP_ROWS, "a run of {t} rows keeps states after {taps:?}");
+                let before = self.ple_history(kv);
+                let ctx = cfg.ngram - 1;
+                let kept: Vec<Tap> = taps
+                    .iter()
+                    .map(|&row| Tap {
+                        row,
+                        gdn: st.gdn.iter().zip(&states).map(|(&l, (sv, cv))| (chains[self.layers[l].device].vec(sv.len), chains[self.layers[l].device].vec(cv.len))).collect(),
+                        window: ple_window.as_ref().map(|w| chains[ple_device].vec(w.len)),
+                    })
+                    .collect();
+                let tapped = kept
+                    .iter()
+                    .map(|tap| {
+                        let none = || (0..kv.ssm_state.len()).map(|_| None).collect::<Vec<Option<Tensor>>>();
+                        let (mut ss, mut cs) = (none(), none());
+                        for (slot, &l) in st.gdn.iter().enumerate() {
+                            let c = chains[self.layers[l].device];
+                            ss[l] = Some(c.alias(&tap.gdn[slot].0, vec![cfg.nv, cfg.vd, cfg.kd]));
+                            cs[l] = Some(c.alias(&tap.gdn[slot].1, vec![cfg.conv - 1, conv_dim]));
+                        }
+                        if let Some(w) = &tap.window {
+                            cs[ple_slot(cfg)] = Some(chains[ple_device].alias(w, vec![(cfg.ple_kernel - 1) * cfg.ngram, s * h]));
+                        }
+                        let ids: Vec<i64> = before.iter().copied().chain(tokens[..tap.row].iter().map(|&v| v as i64)).collect();
+                        ss[ple_slot(cfg)] = Some(Tensor::from_vec(ids[ids.len() - ctx..].iter().map(|&v| v as f32).collect(), vec![ctx]));
+                        llama_rs::Tapped { at: past + tap.row, states: ss, convs: cs }
+                    })
+                    .collect();
+                (kept, tapped)
+            }
+        };
+        let segs: Option<&Vec<TapSeg>> = kept.first().filter(|tap| tap.row < t).map(|_| {
+            st.seg.get_or_init(|| {
+                chains
+                    .iter()
+                    .map(|c| {
+                        let v = |n: usize| c.vec(TAP_ROWS * n);
+                        TapSeg { qkv: v(conv_dim), conv: v(conv_dim), z: v(cfg.nv * cfg.vd), ba: v(2 * cfg.nv), core: v(cfg.nv * cfg.vd), x: v(s * h), gated: v(s * h), conv_in: v(s * h) }
+                    })
+                    .collect()
+            })
         });
         // a step's vectors and a few rows' (their bind groups kept); a prompt's chunk's its own
         let keep = t == 1 || few;
@@ -2333,7 +2429,7 @@ impl FlashNext {
                     // the chunk parked here: its next device's layers after the next chunk's first part
                     kv.commit(t);
                     kv.dirty_from = usize::MAX;
-                    return Some(Went::Parked(Box::new(Parked { past, t, e, devs: owned.clone()?, ple: ple_owned.clone(), attn_rows, qsa: prompt_qsa, keys: prompt_keys, handoffs, at: i })));
+                    return Some(Went::Parked(Box::new(Parked { past, t, e, devs: owned.clone()?, ple: ple_owned.clone(), attn_rows, qsa: prompt_qsa, keys: prompt_keys, handoffs, at: i, kept, tapped })));
                 }
                 // the chunk before's last device done with (its scratch back) before this chunk's work there
                                 if let Some(p) = prev.take() {
@@ -2411,7 +2507,32 @@ impl FlashNext {
                 p.key.mul(&mut *rec, s * h, cfg.ple_dim, &v.emb, &v.key, t);
                 p.value.mul(&mut *rec, h, cfg.ple_dim, &v.emb, &v.value, t);
                 rec.ple_gate(&v.key, &dv.x, &v.value, &p.norm_key, &p.norm_query, &p.norm_conv, &v.gated, &v.conv_in, t, s, h, eps);
-                rec.ple_conv(&dv.x, &v.gated, &v.conv_in, window, &p.conv, t, s * h, cfg.ple_kernel, cfg.ngram);
+                if kept.is_empty() {
+                    rec.ple_conv(&dv.x, &v.gated, &v.conv_in, window, &p.conv, t, s * h, cfg.ple_kernel, cfg.ngram);
+                } else {
+                    // the conv in parts, each kept state's rows then the window's copy: the first part where the rows
+                    // are, the later ones (few) through the parts' own vectors and back
+                    let w = s * h;
+                    let mut done = 0;
+                    for (end, to) in kept.iter().map(|tap| (tap.row, tap.window.as_ref())).chain(std::iter::once((t, None))) {
+                        let n = end - done;
+                        if n > 0 && done == 0 {
+                            rec.ple_conv(&dv.x, &v.gated, &v.conv_in, window, &p.conv, n, w, cfg.ple_kernel, cfg.ngram);
+                        } else if n > 0 {
+                            let seg = &segs.expect("a tapped run's later rows' vectors")[d];
+                            let (sx, sg, sc) = (first_of(&seg.x, n * w), first_of(&seg.gated, n * w), first_of(&seg.conv_in, n * w));
+                            rec.copy(&dv.x, done * w, &sx, 0, n * w);
+                            rec.copy(&v.gated, done * w, &sg, 0, n * w);
+                            rec.copy(&v.conv_in, done * w, &sc, 0, n * w);
+                            rec.ple_conv(&sx, &sg, &sc, window, &p.conv, n, w, cfg.ple_kernel, cfg.ngram);
+                            rec.copy(&sx, 0, &dv.x, done * w, n * w);
+                        }
+                        if let Some(to) = to {
+                            rec.copy(window, 0, to, 0, window.len);
+                        }
+                        done = end;
+                    }
+                }
             }
             let applied = pending.take().map(|routed| experts(&mut *rec, dv, i - 1, routed)).is_some();
             hc(&mut *rec, dv, t, &cl.attn_hc, applied.then_some((&dv.moe_out, &dv.post2)), &dv.post, &dv.y_in);
@@ -2430,9 +2551,36 @@ impl FlashNext {
                         rec.copy(sv, 0, &u.backups[*slot].0, 0, sv.len);
                         rec.copy(cv, 0, &u.backups[*slot].1, 0, cv.len);
                     }
-                    rec.ssm_conv(qkv, conv, cv, &dv.conv, t, conv_dim, cfg.conv);
                     let dn = DeltaNet { rows: t, v_heads: cfg.nv, k_heads: cfg.nk, k_dim: cfg.kd, v_dim: cfg.vd, scale_q: 1.0 / (cfg.vd as f32).sqrt(), eps, sigmoid_gate: true };
-                    rec.delta_net(&dv.conv, &dv.z, bav, a, dt, norm, sv, &dv.core, dn);
+                    if kept.is_empty() {
+                        rec.ssm_conv(qkv, conv, cv, &dv.conv, t, conv_dim, cfg.conv);
+                        rec.delta_net(&dv.conv, &dv.z, bav, a, dt, norm, sv, &dv.core, dn);
+                    } else {
+                        // the recurrence in parts, each kept state's rows then its copies (as the n-gram layer's)
+                        let vw = cfg.nv * cfg.vd;
+                        let mut done = 0;
+                        for (end, to) in kept.iter().map(|tap| (tap.row, Some(&tap.gdn[*slot]))).chain(std::iter::once((t, None))) {
+                            let n = end - done;
+                            if n > 0 && done == 0 {
+                                rec.ssm_conv(qkv, conv, cv, &dv.conv, n, conv_dim, cfg.conv);
+                                rec.delta_net(&dv.conv, &dv.z, bav, a, dt, norm, sv, &dv.core, DeltaNet { rows: n, ..dn });
+                            } else if n > 0 {
+                                let seg = &segs.expect("a tapped run's later rows' vectors")[d];
+                                let (sq, sc, sz, sb, so) = (first_of(&seg.qkv, n * conv_dim), first_of(&seg.conv, n * conv_dim), first_of(&seg.z, n * vw), first_of(&seg.ba, n * 2 * cfg.nv), first_of(&seg.core, n * vw));
+                                rec.copy(qkv, done * conv_dim, &sq, 0, n * conv_dim);
+                                rec.copy(&dv.z, done * vw, &sz, 0, n * vw);
+                                rec.copy(bav, done * 2 * cfg.nv, &sb, 0, n * 2 * cfg.nv);
+                                rec.ssm_conv(&sq, conv, cv, &sc, n, conv_dim, cfg.conv);
+                                rec.delta_net(&sc, &sz, &sb, a, dt, norm, sv, &so, DeltaNet { rows: n, ..dn });
+                                rec.copy(&so, 0, &dv.core, done * vw, n * vw);
+                            }
+                            if let Some((ts, tc)) = to {
+                                rec.copy(sv, 0, ts, 0, sv.len);
+                                rec.copy(cv, 0, tc, 0, cv.len);
+                            }
+                            done = end;
+                        }
+                    }
                     rec.exl3_rows(chain_packed(&g.out)?, &dv.core, &dv.y_out, t);
                 }
                 (Mixer::Attn(a), ChainMixer::Attn { q_norm, k_norm, iq_norm, ik_norm, slot }) => {
@@ -2624,8 +2772,42 @@ impl FlashNext {
         if phases {
             eprintln!("    fn run of {t} at {past}: {}", marks.iter().map(|(w, ms)| format!("{w} {ms:.0}")).collect::<Vec<_>>().join(", "));
         }
-                Some(Went::Run(ChainedRun { rec, attn_reads, at: past, t }))
+        drop(kept);
+        Some(Went::Run(ChainedRun { rec, attn_reads, at: past, t, tapped: std::mem::take(&mut tapped) }))
     }
+}
+
+/// The most rows of a chunk after the first state it keeps from inside ([`FlashNext::forward_chunks_tapped`]): those
+/// rows' recurrences go through vectors of their own this long (a prompt's tail: the assistant's header and its last
+/// token).
+pub(crate) const TAP_ROWS: usize = 64;
+
+/// A state a run keeps from inside it: each delta net's state and conv window (a pair a slot, on the layer's device)
+/// and the n-gram layer's window as they are once the run's first `row` rows are through them, copied there as the
+/// run goes.
+struct Tap {
+    row: usize,
+    gdn: Vec<(ggml_rs::DeviceVec, ggml_rs::DeviceVec)>,
+    window: Option<ggml_rs::DeviceVec>,
+}
+
+/// The vectors a tapped run's later rows' recurrences go through on a device ([`TAP_ROWS`] of them): a delta net's
+/// conv input and output, gate, beta-alpha and output; the n-gram layer's streams, gate and conv input.
+struct TapSeg {
+    qkv: ggml_rs::DeviceVec,
+    conv: ggml_rs::DeviceVec,
+    z: ggml_rs::DeviceVec,
+    ba: ggml_rs::DeviceVec,
+    core: ggml_rs::DeviceVec,
+    x: ggml_rs::DeviceVec,
+    gated: ggml_rs::DeviceVec,
+    conv_in: ggml_rs::DeviceVec,
+}
+
+/// `v`'s first `len` elements as a vector of their own (the same buffer).
+fn first_of(v: &ggml_rs::DeviceVec, len: usize) -> ggml_rs::DeviceVec {
+    assert!(len <= v.len, "{len} of a vector of {}", v.len);
+    ggml_rs::DeviceVec { len, inner: Arc::clone(&v.inner) }
 }
 
 /// How much of a chained run [`FlashNext::run_part`] makes: all of it, a prompt chunk's first device's part, or the
@@ -2657,6 +2839,9 @@ struct Parked<'a> {
     keys: Vec<Option<ggml_rs::DeviceVec>>,
     handoffs: Vec<(Box<dyn ggml_rs::ChainRecorder + 'a>, usize, Vec<usize>)>,
     at: usize,
+    /// The states the chunk keeps from inside it (their vectors, and what the caller is given of them).
+    kept: Vec<Tap>,
+    tapped: Vec<llama_rs::Tapped>,
 }
 
 /// A chained run whose last device is running: its recording (the run's reads its attention layers' rows, then
@@ -2666,6 +2851,8 @@ struct ChainedRun<'a> {
     attn_reads: Vec<usize>,
     at: usize,
     t: usize,
+    /// The states it keeps from inside (theirs once the run has run)
+    tapped: Vec<llama_rs::Tapped>,
 }
 
 impl ChainedRun<'_> {

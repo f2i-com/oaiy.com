@@ -444,11 +444,33 @@ impl Hybrid {
     /// Whether a run of `rows` after what `kv` holds can keep its recurrent states from inside it once each of `taps`
     /// rows is in ([`Self::forward_chunks_tapped`]): a chained Qwen3.5 hybrid's, where its chain says so.
     fn can_tap(&self, rows: usize, kv: &KvCache, taps: &[usize]) -> bool {
+        #[cfg(any(feature = "cuda", feature = "webgpu"))]
+        if let Self::Flash(f) = self {
+            return f.can_tap(rows, kv, taps);
+        }
         matches!(self, Self::Qwen35(Model::Qwen35(m)) if m.can_tap(rows, kv, taps))
     }
     /// [`Self::forward_chunks`] with the recurrent states as they are once each of `taps` rows of the chunks is in
     /// (what a checkpoint there holds, the run not stopping for it), where [`Self::can_tap`] said it can.
     fn forward_chunks_tapped(&self, chunks: &[(&[u32], Tensor)], kv: &mut KvCache, done: &mut dyn FnMut(usize), taps: &[usize]) -> Result<(Tensor, Vec<llama_rs::Tapped>), String> {
+        #[cfg(any(feature = "cuda", feature = "webgpu"))]
+        if let Self::Flash(f) = self {
+            let len = kv.len;
+            let refs: Vec<(&[u32], &Tensor)> = chunks.iter().map(|(t, e)| (*t, e)).collect();
+            let (logits, kept) = f.forward_chunks_tapped(&refs, kv, done, taps);
+            if let Some(l) = logits {
+                return Ok((l, kept));
+            }
+            // (as [`Self::forward_chunks`]: what ran before a chunk it could not chain stands, with the states it
+            // kept; the rest a chunk at a time, their checkpoints not kept)
+            let ran: usize = chunks.iter().scan(len, |at, (t, _)| { *at += t.len(); Some(*at) }).take_while(|&at| at <= kv.len).count();
+            let mut last = None;
+            for (i, (t, e)) in chunks.iter().enumerate().skip(ran) {
+                last = Some(self.forward(t, e.clone(), kv, None)?);
+                done(i);
+            }
+            return last.map(|l| (l, kept)).ok_or_else(|| "no chunk to run".to_string());
+        }
         let Self::Qwen35(Model::Qwen35(m)) = self else { return Err("not a dense Qwen hybrid".into()) };
         let (tokens, emb) = self.joined(chunks);
         let embeds = m.backend.to_device(emb);
