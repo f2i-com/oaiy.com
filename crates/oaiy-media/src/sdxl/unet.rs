@@ -612,6 +612,24 @@ impl UNet2DConditionModel {
         context: &Tensor,
         y_label: &Tensor,
     ) -> Result<Tensor> {
+        self.forward_traced(x, timesteps, context, y_label, None)
+    }
+
+    /// [`Self::forward`], with each block's output pushed to `trace`: the input blocks', the middle's, then the
+    /// output blocks' (what another backend's blocks are held against).
+    pub fn forward_traced(
+        &self,
+        x: &Tensor,
+        timesteps: &Tensor,
+        context: &Tensor,
+        y_label: &Tensor,
+        mut trace: Option<&mut Vec<Tensor>>,
+    ) -> Result<Tensor> {
+        let mut keep = |h: &Tensor| {
+            if let Some(t) = trace.as_deref_mut() {
+                t.push(h.clone());
+            }
+        };
         // ---- timestep + label embeddings ----
         let t_in_dim = self.cfg.block_out_channels[0];
         let t =
@@ -632,11 +650,13 @@ impl UNet2DConditionModel {
         let mut skips: Vec<Tensor> = Vec::with_capacity(self.input_blocks.len());
         for block in &self.input_blocks {
             h = block.forward(&h, &emb, context)?;
+            keep(&h);
             skips.push(h.clone());
         }
 
         // ---- middle ----
         h = self.middle_block.forward(&h, &emb, context)?;
+        keep(&h);
 
         // ---- up path ----
         for block in &self.output_blocks {
@@ -647,6 +667,7 @@ impl UNet2DConditionModel {
             })?;
             h = Tensor::cat(&[&h, &skip], 1)?;
             h = block.forward(&h, &emb, context)?;
+            keep(&h);
         }
         if !skips.is_empty() {
             candle_core::bail!(

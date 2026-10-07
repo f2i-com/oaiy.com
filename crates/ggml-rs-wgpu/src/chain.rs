@@ -1403,6 +1403,151 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 "#;
 
 /// `y[i] *= 2 sigmoid(logits[i / p[0].x])` for `i < p[0].y` (`p[0].x` a head's width): a gated attention's heads.
+/// [`ChainRecorder::group_norm_rows`]'s sums: a workgroup a (group, 256 pixels), each thread a pixel's values of the
+/// group (their sum and their squares' less the group's first value: sums of what is near zero keep their digits),
+/// the workgroup's sums into `stats[(g * chunks + j) * 2..]`. `p[0]`: pixels, channels, groups, chunks.
+const GROUP_NORM_SUMS: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(6) var<storage, read_write> stats: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> part: array<vec2<f32>, 256>;
+var<workgroup> some: array<vec2<f32>, 16>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let pixels = p[0].x;
+    let c = p[0].y;
+    let cpg = c / p[0].z;
+    let chunks = p[0].w;
+    let g = wg.x;
+    let j = wg.y;
+    let px = j * 256u + li;
+    // (the group's first value: what every value is taken from, for the sums' digits)
+    let pilot = x[g * cpg];
+    var sums = vec2<f32>(0.0);
+    if (px < pixels) {
+        let at = px * c + g * cpg;
+        for (var i = 0u; i < cpg; i++) {
+            let v = x[at + i] - pilot;
+            sums += vec2<f32>(v, v * v);
+        }
+    }
+    part[li] = sums;
+    workgroupBarrier();
+    if (li < 16u) {
+        var t = vec2<f32>(0.0);
+        for (var i = 0u; i < 16u; i++) { t += part[li * 16u + i]; }
+        some[li] = t;
+    }
+    workgroupBarrier();
+    if (li == 0u) {
+        var t = vec2<f32>(0.0);
+        for (var i = 0u; i < 16u; i++) { t += some[i]; }
+        let o = (g * chunks + j) * 2u;
+        stats[o] = t.x;
+        stats[o + 1u] = t.y;
+    }
+}
+"#;
+
+/// [`ChainRecorder::group_norm_rows`]'s mean and scale: a workgroup a group, its chunks' sums added up, the group's
+/// mean and `1 / sqrt(variance + eps)` after the chunks' sums (`stats[(groups * chunks + g) * 2..]`). `p[0]`: pixels,
+/// channels, groups, chunks; `p[1].x`: eps's bits.
+const GROUP_NORM_STATS: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(6) var<storage, read_write> stats: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> part: array<vec2<f32>, 64>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let cpg = p[0].y / p[0].z;
+    let chunks = p[0].w;
+    let g = wg.x;
+    var t = vec2<f32>(0.0);
+    for (var j = li; j < chunks; j += 64u) {
+        let o = (g * chunks + j) * 2u;
+        t += vec2<f32>(stats[o], stats[o + 1u]);
+    }
+    part[li] = t;
+    workgroupBarrier();
+    if (li == 0u) {
+        var all = vec2<f32>(0.0);
+        for (var i = 0u; i < 64u; i++) { all += part[i]; }
+        let n = f32(p[0].x) * f32(cpg);
+        let m = all.x / n;
+        let variance = max(all.y / n - m * m, 0.0);
+        let o = (p[0].z * chunks + g) * 2u;
+        stats[o] = x[g * cpg] + m;
+        stats[o + 1u] = inverseSqrt(variance + bitcast<f32>(p[1].x));
+    }
+}
+"#;
+
+/// [`ChainRecorder::group_norm_rows`]'s rows: each value less its group's mean, times its scale and its channel's
+/// weight, plus the channel's bias, through SiLU where `p[1].y` is 1. `p[0]`: pixels, channels, groups, chunks.
+const GROUP_NORM_APPLY: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> weight: array<f32>;
+@group(0) @binding(2) var<storage, read> bias: array<f32>;
+@group(0) @binding(3) var<storage, read> stats: array<f32>;
+@group(0) @binding(6) var<storage, read_write> y: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    let c = p[0].y;
+    if (i >= p[0].x * c) { return; }
+    let ch = i % c;
+    let o = (p[0].z * p[0].w + ch / (c / p[0].z)) * 2u;
+    let v = (x[i] - stats[o]) * stats[o + 1u] * weight[ch] + bias[ch];
+    y[i] = select(v, v / (1.0 + exp(-v)), p[1].y == 1u);
+}
+"#;
+
+/// [`ChainRecorder::geglu_rows`]: `p[0]` rows and `ff`.
+const GEGLU_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(6) var<storage, read_write> y: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    let ff = p[0].y;
+    if (i >= p[0].x * ff) { return; }
+    let at = (i / ff) * 2u * ff + i % ff;
+    let g = x[at + ff];
+    let z = abs(g) * 0.7071067811865476;
+    let t = 1.0 / (1.0 + 0.3275911 * z);
+    let poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+    let erf = sign(g) * (1.0 - poly * exp(-z * z));
+    y[i] = x[at] * 0.5 * g * (1.0 + erf);
+}
+"#;
+
+/// `y[(oy, ox), c] = x[(2 oy, 2 ox), c]`: `p[0]` the input's rows, columns and channels.
+const SUBSAMPLE2X_EVEN_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(6) var<storage, read_write> y: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    let h = p[0].x;
+    let w = p[0].y;
+    let c = p[0].z;
+    let ow = w / 2u;
+    if (i >= (h / 2u) * ow * c) { return; }
+    let px = i / c;
+    y[i] = x[(2u * (px / ow) * w + 2u * (px % ow)) * c + i % c];
+}
+"#;
+
 /// [`ChainRecorder::nag_mix`]: a workgroup a row, each thread its share of the row's values four at a time; the row's
 /// L1 norms (the guided output's and the plain one's) summed by sixteens through the workgroup's memory. `p[0]`: the
 /// row's width (a multiple of 4), rows, and the bits of scale and tau; `p[1].x`: alpha's.
@@ -5913,6 +6058,35 @@ impl ChainRecorder for Recorder<'_> {
         self.dispatch_kept(&pipeline, buffer(table), buffer(table), buffer(x), &[heads as u32, head_dim as u32, 1, rows as u32, 0, 1], grid(pairs.div_ceil(256)));
     }
 
+    fn group_norm_rows(&mut self, x: &DeviceVec, weight: &DeviceVec, bias: &DeviceVec, out: &DeviceVec, stats: &DeviceVec, pixels: usize, c: usize, groups: usize, eps: f32, silu: bool) {
+        let chunks = pixels.div_ceil(256);
+        assert!(
+            groups > 0 && c % groups == 0 && pixels > 0 && chunks <= 65535 && x.len >= pixels * c && out.len >= pixels * c && weight.len >= c && bias.len >= c && stats.len >= groups * (chunks + 1) * 2,
+            "chain: a group norm of {pixels} pixels of {c} in {groups} groups"
+        );
+        let d = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        let words = [pixels as u32, c as u32, groups as u32, chunks as u32, eps.to_bits(), silu as u32];
+        self.dispatch_wide("chain-group-norm-sums", GROUP_NORM_SUMS, [buffer(x), &d, &d, &d, &d, &d, buffer(stats), &drw], &words, (groups as u32, chunks as u32, 1));
+        self.dispatch_wide("chain-group-norm-stats", GROUP_NORM_STATS, [buffer(x), &d, &d, &d, &d, &d, buffer(stats), &drw], &words, (groups as u32, 1, 1));
+        self.dispatch_wide("chain-group-norm-apply", GROUP_NORM_APPLY, [buffer(x), buffer(weight), buffer(bias), buffer(stats), &d, &d, buffer(out), &drw], &words, grid(((pixels * c) as u32).div_ceil(256)));
+    }
+
+    fn geglu_rows(&mut self, fused: &DeviceVec, out: &DeviceVec, rows: usize, ff: usize) {
+        assert!(fused.len >= rows * 2 * ff && out.len >= rows * ff, "chain: GEGLU of {rows} rows of {ff}");
+        let d = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        self.dispatch_wide("chain-geglu-rows", GEGLU_ROWS, [buffer(fused), &d, &d, &d, &d, &d, buffer(out), &drw], &[rows as u32, ff as u32], grid(((rows * ff) as u32).div_ceil(256)));
+    }
+
+    fn subsample2x_even_rows(&mut self, x: &DeviceVec, out: &DeviceVec, h: usize, w: usize, c: usize) {
+        assert!(h % 2 == 0 && w % 2 == 0 && x.len >= h * w * c && out.len >= h * w * c / 4, "chain: subsampling {h}x{w} pixels of {c}");
+        let dm = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        let n = (h * w * c / 4) as u32;
+        self.dispatch_wide("chain-subsample2x-even-rows", SUBSAMPLE2X_EVEN_ROWS, [buffer(x), &dm, &dm, &dm, &dm, &dm, buffer(out), &drw], &[h as u32, w as u32, c as u32], grid(n.div_ceil(256)));
+    }
+
     fn nag_mix(&mut self, pos: &DeviceVec, neg: &DeviceVec, rows: usize, width: usize, scale: f32, tau: f32, alpha: f32) {
         assert!(width % 4 == 0 && pos.len >= rows * width && neg.len >= rows * width, "chain: a guidance mix of {rows} rows of {width}");
         let d = self.gpu().dummy().clone();
@@ -9137,6 +9311,90 @@ fn main() {
             let secs = t.elapsed().as_secs_f64() / 3.0;
             let flops = groups as f64 * (rows * tokens) as f64 * (iters * ks) as f64 * 2.0;
             eprintln!("a tile of {rows}x{tokens}, subgroups {wr}x{wt} of {}x{} ({} fragments), k {ks} a step ({:.1} KB): {:.1} TFLOPS", fr * 16, ft * 16, fr * ft, (a4 + b4) as f64 * 8.0 / 1024.0, flops / secs / 1e12);
+        }
+    }
+
+    /// A UNet's ops are their formulas: a group norm of an image's rows (its groups' means and variances over every
+    /// pixel, a large offset on a group kept), with and without its SiLU; GEGLU's gate times the exact GELU; and the
+    /// even pixels of an image.
+    #[test]
+    fn a_unets_ops_are_their_formulas() {
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        let mut next = rng(77);
+        // the group norm: 300 pixels (two chunks of 256, the second short) of 64 channels in 32 groups
+        for (pixels, c, groups) in [(300usize, 64usize, 32usize), (16usize, 320, 32), (1024, 96, 8)] {
+            let cpg = c / groups;
+            // (a group's values about an offset of its own, one of them large)
+            let x: Vec<f32> = (0..pixels * c).map(|i| next() * (1.0 + (i % c / cpg) as f32 * 0.1) + if (i % c) / cpg == 3 { 250.0 } else { (i % c / cpg) as f32 * 0.5 }).collect();
+            let (weight, bias): (Vec<f32>, Vec<f32>) = ((0..c).map(|_| 1.0 + 0.3 * next()).collect(), (0..c).map(|_| 0.2 * next()).collect());
+            for silu in [false, true] {
+                let eps = 1e-5f32;
+                let (xv, wv, bv, ov, sv) = (b.vec(pixels * c), b.vec(c), b.vec(c), b.vec(pixels * c), b.vec(groups * (pixels.div_ceil(256) + 1) * 2));
+                DeviceChain::upload(&b, &xv, &x);
+                DeviceChain::upload(&b, &wv, &weight);
+                DeviceChain::upload(&b, &bv, &bias);
+                let mut rec = Recorder::new(&b);
+                rec.group_norm_rows(&xv, &wv, &bv, &ov, &sv, pixels, c, groups, eps, silu);
+                rec.read(&ov);
+                let got = Box::new(rec).finish().pop().unwrap();
+                let mut worst = 0f64;
+                for g in 0..groups {
+                    let values: Vec<f64> = (0..pixels).flat_map(|px| (0..cpg).map(move |i| (px, i))).map(|(px, i)| x[px * c + g * cpg + i] as f64).collect();
+                    let mean = values.iter().sum::<f64>() / values.len() as f64;
+                    let var = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
+                    for px in 0..pixels {
+                        for i in 0..cpg {
+                            let ch = g * cpg + i;
+                            let v = (x[px * c + ch] as f64 - mean) / (var + eps as f64).sqrt() * weight[ch] as f64 + bias[ch] as f64;
+                            let want = if silu { v / (1.0 + (-v).exp()) } else { v };
+                            worst = worst.max((got[px * c + ch] as f64 - want).abs());
+                        }
+                    }
+                }
+                eprintln!("a group norm of {pixels} pixels of {c} in {groups} groups{}: the worst error {worst:.2e}", if silu { ", through SiLU" } else { "" });
+                assert!(worst < 2e-4, "{pixels} pixels of {c}: {worst}");
+            }
+        }
+        // GEGLU
+        let (rows, ff) = (7usize, 300usize);
+        let fused: Vec<f32> = (0..rows * 2 * ff).map(|_| 3.0 * next()).collect();
+        let (fv, ov) = (b.vec(rows * 2 * ff), b.vec(rows * ff));
+        DeviceChain::upload(&b, &fv, &fused);
+        let mut rec = Recorder::new(&b);
+        rec.geglu_rows(&fv, &ov, rows, ff);
+        rec.read(&ov);
+        let got = Box::new(rec).finish().pop().unwrap();
+        let erf = |v: f64| {
+            // (Abramowitz and Stegun 7.1.26 is the kernel's; the series here to 1e-12)
+            let (mut sum, mut term) = (v, v);
+            for n in 1..60 {
+                term *= -v * v / n as f64;
+                sum += term / (2 * n + 1) as f64;
+            }
+            sum * 2.0 / std::f64::consts::PI.sqrt()
+        };
+        let worst = (0..rows * ff).map(|i| {
+            let (r, j) = (i / ff, i % ff);
+            let (gate, value) = (fused[r * 2 * ff + j] as f64, fused[r * 2 * ff + ff + j] as f64);
+            (got[i] as f64 - gate * 0.5 * value * (1.0 + erf(value / std::f64::consts::SQRT_2))).abs()
+        }).fold(0f64, f64::max);
+        eprintln!("GEGLU of {rows} rows of {ff}: the worst error {worst:.2e}");
+        assert!(worst < 1e-5, "GEGLU: {worst}");
+        // the even pixels
+        let (h, w, c) = (6usize, 10usize, 5usize);
+        let x: Vec<f32> = (0..h * w * c).map(|i| i as f32).collect();
+        let (xv, ov) = (b.vec(h * w * c), b.vec(h * w * c / 4));
+        DeviceChain::upload(&b, &xv, &x);
+        let mut rec = Recorder::new(&b);
+        rec.subsample2x_even_rows(&xv, &ov, h, w, c);
+        rec.read(&ov);
+        let got = Box::new(rec).finish().pop().unwrap();
+        for oy in 0..h / 2 {
+            for ox in 0..w / 2 {
+                for ch in 0..c {
+                    assert_eq!(got[(oy * (w / 2) + ox) * c + ch], x[(2 * oy * w + 2 * ox) * c + ch], "pixel ({oy}, {ox}), channel {ch}");
+                }
+            }
         }
     }
 

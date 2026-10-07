@@ -431,6 +431,27 @@ pub trait ChainRecorder {
         let _ = (x, rows, heads, head_dim, table);
         unimplemented!("a split rotary on this device")
     }
+    /// A group norm of an image held as its pixels' rows of channels (`x`, `[pixels, c]`) into `out`: its channels in
+    /// `groups` runs, each run normalised over all the pixels (the mean and the variance of its `pixels * c / groups`
+    /// values, `eps` added to the variance), then times `weight[ch]` plus `bias[ch]`, and with `silu` through SiLU
+    /// (a UNet's norm before each convolution). `stats` scratch of `groups * (pixels / 256 + 2) * 2` values.
+    #[allow(clippy::too_many_arguments)]
+    fn group_norm_rows(&mut self, x: &DeviceVec, weight: &DeviceVec, bias: &DeviceVec, out: &DeviceVec, stats: &DeviceVec, pixels: usize, c: usize, groups: usize, eps: f32, silu: bool) {
+        let _ = (x, weight, bias, out, stats, pixels, c, groups, eps, silu);
+        unimplemented!("a group norm on this device")
+    }
+    /// GEGLU of each of `rows` rows: `out = fused[..ff] * gelu(fused[ff..])`, the GELU exact (`fused` `[rows, 2 ff]`,
+    /// `out` `[rows, ff]`): a UNet's transformer blocks' feed-forward gate.
+    fn geglu_rows(&mut self, fused: &DeviceVec, out: &DeviceVec, rows: usize, ff: usize) {
+        let _ = (fused, out, rows, ff);
+        unimplemented!("GEGLU on this device")
+    }
+    /// `out` (`[h / 2, w / 2, c]`) the even rows' even columns of `x` (`[h, w, c]`): a 3x3 convolution of stride 1
+    /// so sampled is one of stride 2 padded by 1 all round (PyTorch's, a UNet's downsampling).
+    fn subsample2x_even_rows(&mut self, x: &DeviceVec, out: &DeviceVec, h: usize, w: usize, c: usize) {
+        let _ = (x, out, h, w, c);
+        unimplemented!("subsampling on this device")
+    }
     /// Normalised attention guidance's mix of an attention's output `pos` and the same queries' over a negative
     /// context, `neg` (`rows` rows of `width` each), into `pos`: `guided = pos * scale - neg * (scale - 1)`, each row
     /// of it scaled back to `tau` times `pos`'s row where its L1 norm is more than that (`min(1, tau * (|pos| + 1e-6)

@@ -32,6 +32,8 @@ pub mod lora;
 mod comfy_quant;
 pub mod ltx;
 pub mod sdxl;
+#[cfg(feature = "webgpu")]
+pub mod sdxl_wgpu;
 pub mod music;
 pub mod tts;
 pub mod sound;
