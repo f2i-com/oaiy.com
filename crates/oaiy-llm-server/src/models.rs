@@ -2602,10 +2602,11 @@ mod dense_webgpu_timing {
     }
 
     /// A Qwen3.5 hybrid's run that keeps its recurrent states from inside it (QWEN35_MODEL; QWEN35_LEN tokens, 1,300
-    /// unless asked: a chunk of 1,024 and one that keeps both) against the runs that stop where it keeps them, before
+    /// unless asked: a chunk of 1,024 and one that keeps both; QWEN35_TWO: its chunks over two devices, of 512, each
+    /// device keeping its layers') against the runs that stop where it keeps them, before
     /// the prompt's last 7 tokens and before its last: the states before the last 7 are those runs' (the same rows
-    /// through the same kernels in a prompt of 135 tokens or more: to their rounding), those before the last and the
-    /// logits as close as a run of few
+    /// through the same kernels where the stopped run's last chunk is 128 rows or more: to their rounding), those
+    /// before the last and the logits as close as a run of few
     /// rows is to a chunk's (other kernels for its matmuls and attention); and a cache put back to either kept state
     /// and run on from there gives the run's own logits again, the same token.
     #[test]
@@ -2614,10 +2615,18 @@ mod dense_webgpu_timing {
         use std::sync::Arc;
         let path = std::env::var("QWEN35_MODEL").unwrap_or_else(|_| r"E:\models\Qwen3.8-27B-Q3_K_M.gguf".into());
         let Ok(b) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
+        // (QWEN35_TWO: the prompts' chunks over a second device too, each keeping its own layers' states)
+        let second = std::env::var_os("QWEN35_TWO").and_then(|_| b.others(None).into_iter().next());
         let backend: Arc<dyn ggml_rs::Backend> = Arc::new(b);
         let gguf = gguf::GgufFile::open(&path).unwrap();
         let model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap();
         let llama_rs::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
+        let two = second.is_some();
+        if let Some(b1) = second {
+            m.chain.split_onto(Arc::new(b1));
+            assert!(m.warm_up(), "the second device's layers");
+            eprintln!("over two devices");
+        }
         let n: usize = std::env::var("QWEN35_LEN").ok().and_then(|v| v.parse().ok()).unwrap_or(1300);
         let tokens: Vec<u32> = (0..n as u32).map(|i| 1000 + (i * 7919) % 20000).collect();
         let taps = [n - 7, n - 1];
@@ -2628,6 +2637,9 @@ mod dense_webgpu_timing {
             dot / (norm(a) * norm(b)).max(1e-30)
         };
         let host = |ts: &[Option<ggml_rs::Tensor>]| -> Vec<Option<Vec<f32>>> { ts.iter().map(|t| t.as_ref().map(|t| t.to_host().data().to_vec())).collect() };
+        // (the same token, or one as good to a tenth of a logit: these prompts' tokens are no text, and two of their
+        // next ones can be that close, a run of few rows' kernels apart)
+        let agree = |a: &[f32], b: &[f32]| argmax(a) == argmax(b) || (b[argmax(b) as usize] - b[argmax(a) as usize]).abs() < 0.1;
         let run = |from: usize, to: usize, kv: &mut llama_rs::KvCache| {
             let e = m.embed_text(&tokens[from..to]).to_host();
             m.forward_embeds_positions(&e, to - from, kv, None).unwrap().to_host()
@@ -2674,10 +2686,12 @@ mod dense_webgpu_timing {
         }
         let c = cosine(logits.data(), stopped.data());
         eprintln!("{n} tokens: the runs that stop {ms_stopped:.0} ms (this test reading their states to the host between them), the run that keeps its states {ms_kept:.0} ms; the logits' cosine {c:.6}, the same token {}", argmax(logits.data()) == argmax(stopped.data()));
-        // (a run of few rows is other kernels: a short prompt's rows before its last 7 are not the same ones either)
-        assert!(worst[0] > if n >= 135 { 0.99999 } else { 0.995 }, "the states before the last 7 rows: {}", worst[0]);
+        // (a chunk of few rows is other kernels than a longer one's: where the stopped run's last chunk is short, its
+        // rows before the last 7 are not through the same ones either)
+        let before = (n - 7) % if two { 512 } else { 1024 };
+        assert!(worst[0] > if before == 0 || before >= 128 { 0.99999 } else { 0.995 }, "the states before the last 7 rows: {}", worst[0]);
         assert!(worst[1] > 0.995, "the states before the last row: {}", worst[1]);
-        assert!(c > 0.995 && argmax(logits.data()) == argmax(stopped.data()), "the logits: {c}");
+        assert!(c > 0.995 && agree(logits.data(), stopped.data()), "the logits: {c}");
         // a cache put back to a kept state runs on to the same logits
         for tap in kept.iter().rev() {
             for l in 0..kv.ssm_state.len() {
@@ -2688,7 +2702,7 @@ mod dense_webgpu_timing {
             let again = run(tap.at, n, &mut kv);
             let c = cosine(again.data(), logits.data());
             eprintln!("put back to the state after {} rows and run on: the logits' cosine {c:.6}, the same token {}", tap.at, argmax(again.data()) == argmax(logits.data()));
-            assert!(c > 0.995 && argmax(again.data()) == argmax(logits.data()), "run on from the state after {} rows: {c}", tap.at);
+            assert!(c > 0.995 && agree(again.data(), logits.data()), "run on from the state after {} rows: {c}", tap.at);
         }
     }
 

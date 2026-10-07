@@ -265,6 +265,8 @@ struct Split {
     logits: DeviceVec,
     kv: Mutex<SplitKv>,
     pool: Pool,
+    /// A tapped run's later rows' vectors on the second device, made at the first run that keeps a state there.
+    seg: std::sync::OnceLock<Seg>,
 }
 
 /// The second device's copy of its layers' attention cache: its rows up to `upto` are the cache's (`kv.owner`'s).
@@ -611,6 +613,12 @@ struct Seg {
     core: DeviceVec,
 }
 
+impl Seg {
+    fn new(chain: &dyn DeviceChain, s: &Dims) -> Self {
+        Seg { qkv: chain.vec(TAP_ROWS * s.ch), z: chain.vec(TAP_ROWS * s.nv * s.dv), ba: chain.vec(TAP_ROWS * 2 * s.nv), conv: chain.vec(TAP_ROWS * s.ch), core: chain.vec(TAP_ROWS * s.nv * s.dv) }
+    }
+}
+
 /// A run's recurrent states as they were with `at` rows in the cache ([`Qwen35Chain::forward_tapped`]): each layer's
 /// delta-net state and conv window (none for an attention layer), on the device, as [`KvCache`] holds its own.
 pub struct Tapped {
@@ -760,6 +768,11 @@ struct SplitRun<'a> {
     slots0: Vec<usize>,
     layers1: &'a [usize],
     owner: u64,
+    /// The rows of the run after which the recurrent states are kept (ascending), those states as its chunks record
+    /// them (a device's layers' at its part of a chunk), and the cache's layers.
+    taps: &'a [usize],
+    kept: std::cell::RefCell<Vec<Tapped>>,
+    layers_n: usize,
     /// Whether the second's recurrent states go up from the first's (else they are zero: a new conversation's)
     states_up: bool,
     /// OAIY_SPLIT_LOG: when each step began and ended (ms from the run's start), for the log
@@ -793,6 +806,46 @@ impl<'a> SplitRun<'a> {
         }
     }
 
+    /// The states chunk `i` keeps on one device (`c`, whose recurrent slots are `states`): for each of the run's kept
+    /// rows in the chunk a pair of vectors for each slot whose layer the device runs (`layer_of`: that layer, in the
+    /// cache's order), the run's kept states given them (theirs once that part of the chunk has run).
+    fn tap(&self, i: usize, c: &dyn DeviceChain, states: &[(DeviceVec, DeviceVec)], layer_of: &dyn Fn(usize) -> Option<usize>) -> Vec<Tap> {
+        let s = self.st.dims;
+        let (at, t) = self.chunks[i];
+        let mut kept = self.kept.borrow_mut();
+        let mut spare: Option<DeviceVec> = None;
+        self.taps
+            .iter()
+            .filter(|&&p| p > at && p <= at + t)
+            .map(|&p| {
+                let abs = self.past0 + p;
+                if !kept.iter().any(|k| k.at == abs) {
+                    let none = || (0..self.layers_n).map(|_| None).collect::<Vec<Option<Tensor>>>();
+                    kept.push(Tapped { at: abs, states: none(), convs: none() });
+                }
+                let entry = kept.iter_mut().find(|k| k.at == abs).expect("the kept state");
+                let vecs = states
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, (state, conv))| match layer_of(slot) {
+                        Some(l) => {
+                            let (sv, cv) = (c.vec(state.len), c.vec(conv.len));
+                            entry.states[l] = Some(c.alias(&sv, vec![s.nv, s.dv, s.dk]));
+                            entry.convs[l] = Some(c.alias(&cv, vec![s.kern - 1, s.ch]));
+                            (sv, cv)
+                        }
+                        // (a slot whose layer the other device runs: never copied to)
+                        None => {
+                            let v = spare.get_or_insert_with(|| c.vec(1)).clone();
+                            (v.clone(), v)
+                        }
+                    })
+                    .collect();
+                Tap { row: p - at, vecs }
+            })
+            .collect()
+    }
+
     /// Chunk `i`'s layers before the split's, gone to the first device after the prediction layer's work for the
     /// chunks whose hidden states are back (`due`).
     fn first(&self, i: usize, due: &mut Vec<(usize, Vec<f32>)>) -> FirstRun<'a> {
@@ -812,7 +865,9 @@ impl<'a> SplitRun<'a> {
             self.mtp(&mut *rec, j, &hidden);
         }
         let mut added = false;
-        let bound = Bound { kvl: self.kv0.0, half: None, cap: self.kv0.1, states: self.states, w: &w, attn: &attn, taps: &[], seg: None };
+        let kept = self.tap(i, c, self.states, &|j| Some(self.st.ssm_layers[j]).filter(|&l| l < self.sp.from));
+        let seg = kept.first().filter(|tap| tap.row < t).map(|_| self.st.seg.get_or_init(|| Seg::new(c, &s)));
+        let bound = Bound { kvl: self.kv0.0, half: None, cap: self.kv0.1, states: self.states, w: &w, attn: &attn, taps: &kept, seg };
         let from = self.sp.from;
         record_layers(&mut *rec, &s, cfg.rms_eps, self.m.blocks[..from].iter().map(LayerW::of).zip(&self.st.layers[..from]), &bound, t, pos, None, &mut added);
         // to the second: the residual stream and the last layer's output (their add fused with its first layer's norm)
@@ -850,7 +905,9 @@ impl<'a> SplitRun<'a> {
         rec.keep_groups(false);
         rec.hold();
         let mut added = true;
-        let bound = Bound { kvl: self.kv1.0, half: None, cap: self.kv1.1, states: self.states1, w: &w, attn: &attn, taps: &[], seg: None };
+        let kept = self.tap(i, c, self.states1, &|k| Some(self.st.ssm_layers[self.sp.ssm_slots[k]]));
+        let seg = kept.first().filter(|tap| tap.row < t).map(|_| self.sp.seg.get_or_init(|| Seg::new(c, &s)));
+        let bound = Bound { kvl: self.kv1.0, half: None, cap: self.kv1.1, states: self.states1, w: &w, attn: &attn, taps: &kept, seg };
         record_layers(&mut *rec, &s, cfg.rms_eps, self.sp.weights.iter().map(SplitW::view).zip(&self.sp.layers), &bound, t, pos, None, &mut added);
         rec.add_rmsnorm_rows(&w.x, &w.proj, &self.sp.output_norm, &w.xn, t, cfg.rms_eps);
         if last {
@@ -1150,18 +1207,15 @@ impl Qwen35Chain {
     }
 
     /// Whether a run of `rows` after what `kv` holds can keep its recurrent states from inside it once each of `taps`
-    /// rows is in ([`Self::forward_tapped`]): chained, its chunks on one device (a prompt's over two keep none), and
-    /// each chunk's rows after the first state it keeps few ([`TAP_ROWS`]: their recurrence goes through vectors of
-    /// its own; a state early in a long chunk is a run's end still). OAIY_NO_TAPS: never.
+    /// rows is in ([`Self::forward_tapped`]): chained (on one device or a prompt's chunks over two, each keeping its
+    /// own layers'), and each chunk's rows after the first state it keeps few ([`TAP_ROWS`]: their recurrence goes
+    /// through vectors of its own; a state early in a long chunk is a run's end still). OAIY_NO_TAPS: never.
     pub fn can_tap(&self, m: &Qwen35Model, rows: usize, kv: &KvCache, taps: &[usize]) -> bool {
         if std::env::var_os("OAIY_NO_CHAIN").is_some() || std::env::var_os("OAIY_NO_TAPS").is_some() || rows == 0 || taps.is_empty() {
             return false;
         }
         let (Some(st), Some(chain)) = (self.state(m), m.backend.chain()) else { return false };
         let chunks = self.chunks(chain, &st.dims, kv.len, rows);
-        if chunks.len() > 1 && self.second.get().and_then(|b| b.chain()).is_some() && self.split(m, st).is_some() {
-            return false;
-        }
         taps.windows(2).all(|w| w[0] < w[1])
             && taps[0] > 0
             && taps[taps.len() - 1] <= rows
@@ -1213,8 +1267,7 @@ impl Qwen35Chain {
         let chunks = self.chunks(chain, &s, kv.len, rows);
         if chunks.len() > 1 {
             if let (Some(sp), Some(chain1)) = (self.split(m, st), self.second.get().and_then(|b| b.chain())) {
-                assert!(taps.is_empty(), "a prompt over two devices keeps no state from inside it");
-                return Some((self.forward_split(m, st, sp, chain, chain1, emb, &chunks, kv), Vec::new()));
+                return Some(self.forward_split(m, st, sp, chain, chain1, emb, &chunks, kv, taps));
             }
         }
         let backend: &dyn Backend = &*m.backend;
@@ -1301,6 +1354,7 @@ impl Qwen35Chain {
                     logits: chain.vec(s.vocab),
                     kv: Mutex::new(SplitKv { kv: Kv { layers: Vec::new(), cap: 0, out: chain.vec(1), owner: 0, half: Vec::new(), halved: 0, refused: 0 }, upto: 0 }),
                     pool,
+                    seg: Default::default(),
                 })
             })
             .as_ref()
@@ -1319,7 +1373,7 @@ impl Qwen35Chain {
         }
         let e = m.embed_text(&tokens).to_host();
         let mut kv = KvCache::new(&*m.backend, m.config.n_layers, rows + 16, m.config.n_kv_heads, m.config.head_dim);
-        self.forward_split(m, st, sp, chain, chain1, e.data(), &[(0, 64), (64, 64)], &mut kv);
+        self.forward_split(m, st, sp, chain, chain1, e.data(), &[(0, 64), (64, 64)], &mut kv, &[]);
         true
     }
 
@@ -1341,7 +1395,7 @@ impl Qwen35Chain {
     /// K and V rows go into the host's cache and the first's copy. With a prediction layer each chunk's hidden states
     /// come back to the first for the layer's cache. The last chunk's logits.
     #[allow(clippy::too_many_arguments)]
-    fn forward_split(&self, m: &Qwen35Model, st: &State, sp: &Split, chain: &dyn DeviceChain, chain1: &dyn DeviceChain, emb: &[f32], chunks: &[(usize, usize)], kv: &mut KvCache) -> Tensor {
+    fn forward_split(&self, m: &Qwen35Model, st: &State, sp: &Split, chain: &dyn DeviceChain, chain1: &dyn DeviceChain, emb: &[f32], chunks: &[(usize, usize)], kv: &mut KvCache, taps: &[usize]) -> (Tensor, Vec<Tapped>) {
         let s = st.dims;
         let past0 = kv.len;
         let end = past0 + chunks.iter().map(|c| c.1).sum::<usize>();
@@ -1379,6 +1433,7 @@ impl Qwen35Chain {
         }
         let n = chunks.len();
         let mut logits = None;
+        let tapped;
         {
             let run = SplitRun {
                 chained: self,
@@ -1397,6 +1452,9 @@ impl Qwen35Chain {
                 slots0: (0..st.attention_layers.len()).filter(|&a| st.attention_layers[a] < sp.from).collect(),
                 layers1: &layers1,
                 owner: kv.id,
+                taps,
+                kept: Default::default(),
+                layers_n: kv.ssm_state.len(),
                 states_up: !fresh,
                 log: std::env::var_os("OAIY_SPLIT_LOG").map(|_| (std::time::Instant::now(), Default::default())),
             };
@@ -1429,12 +1487,13 @@ impl Qwen35Chain {
             if let Some((t, l)) = &run.log {
                 eprintln!("split run of {n} chunks, {:.1} ms:\n  {}", t.elapsed().as_secs_f64() * 1e3, l.borrow().join("\n  "));
             }
+            tapped = run.kept.take();
         }
         g1.upto = end;
         kv.len = end;
         kv.dirty_from = usize::MAX;
         self.runs.fetch_add(n, Ordering::Relaxed);
-        Tensor::from_vec(logits.expect("the last chunk's logits"), vec![1, s.vocab])
+        (Tensor::from_vec(logits.expect("the last chunk's logits"), vec![1, s.vocab]), tapped)
     }
 
     /// Whether the chain drafts and checks tokens (the model's multi-token-prediction layer on the device).
@@ -1540,15 +1599,7 @@ impl Qwen35Chain {
             "chain: a run of {t} rows keeps states after {taps:?}"
         );
         let kept: Vec<Tap> = taps.iter().map(|&row| Tap { row, vecs: states.iter().map(|(state, conv)| (chain.vec(state.len), chain.vec(conv.len))).collect() }).collect();
-        let seg = kept.first().filter(|tap| tap.row < t).map(|_| {
-            st.seg.get_or_init(|| Seg {
-                qkv: chain.vec(TAP_ROWS * s.ch),
-                z: chain.vec(TAP_ROWS * s.nv * s.dv),
-                ba: chain.vec(TAP_ROWS * 2 * s.nv),
-                conv: chain.vec(TAP_ROWS * s.ch),
-                core: chain.vec(TAP_ROWS * s.nv * s.dv),
-            })
-        });
+        let seg = kept.first().filter(|tap| tap.row < t).map(|_| st.seg.get_or_init(|| Seg::new(chain, &s)));
         // a prompt's chunk's vectors a pooled set's (room for a chunk of the most rows), its attention's scratch grown
         // as the positions it reaches do
         let mut set = None;
