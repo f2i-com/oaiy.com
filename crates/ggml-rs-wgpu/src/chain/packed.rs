@@ -4,26 +4,42 @@ use super::*;
 impl Recorder<'_> {
     /// [`ChainRecorder::exl3_rows`], the input `x`, or (`up` given) the SwiGLU `silu(x) * up` computed as the input
     /// transform reads it (a shared expert's down projection: a dispatch fewer).
+    /// One of the three vectors a projection with a low-rank update computes through (its `A x`, its `B (A x)`, a
+    /// SwiGLU's product), `len` long or more: the recording's own, grown as a projection needs.
+    fn low_rank_scratch(&mut self, slot: usize, len: usize) -> DeviceVec {
+        match &self.low_rank[slot] {
+            Some(v) if v.len >= len => v.clone(),
+            _ => {
+                let v = self.scratch(len);
+                self.low_rank[slot] = Some(v.clone());
+                v
+            }
+        }
+    }
+
     pub(crate) fn exl3_rows_of(&mut self, w: &dyn ggml_rs::exl3::PackedLinear, x: &DeviceVec, up: Option<&DeviceVec>, y: &DeviceVec, rows: usize) {
         // a projection with a low-rank update beside it (a LoRA adapter's): the base's rows, then `B (A x)` added to
         // them; a SwiGLU's product, where one is asked for, made once for both
         if let Some(l) = w.as_any().and_then(|a| a.downcast_ref::<crate::quant_linear::LowRank>()) {
             let ((k, n), r) = (l.kn(), l.rank());
             assert!(rows > 0 && x.len >= rows * k && y.len >= rows * n, "chain: a projection [{n}, {k}] with a rank {r} update, of {rows} rows");
-            let input = match up {
-                Some(u) => {
-                    let t = self.scratch(rows * k);
-                    self.silu_mul(x, u, &t, rows * k);
-                    t
-                }
-                None => x.clone(),
-            };
-            self.exl3_rows_of(&*l.base, &input, None, y, rows);
-            let (low, update) = (self.scratch(rows * r), self.scratch(rows * n));
-            self.exl3_rows_of(&*l.a, &input, None, &low, rows);
+            // The three vectors between its products are the recording's own, every adapted projection's in turn
+            // (each is read by what is recorded before the next writes it): a vector each to the recording's end was
+            // more than a card holds (a 609-row prompt's 64 layers under two adapters), and the recorder's spare
+            // scratch is not theirs to share: a small vector there is also what the host writes a table into as it
+            // records (an EXL3 run's jobs), which lands before any dispatch runs.
+            let product = up.map(|u| {
+                let t = self.low_rank_scratch(2, rows * k);
+                self.silu_mul(x, u, &t, rows * k);
+                t
+            });
+            let input = product.as_ref().unwrap_or(x);
+            self.exl3_rows_of(&*l.base, input, None, y, rows);
+            let (low, update) = (self.low_rank_scratch(0, rows * r), self.low_rank_scratch(1, rows * n));
+            self.exl3_rows_of(&*l.a, input, None, &low, rows);
             self.exl3_rows_of(&*l.b, &low, None, &update, rows);
             // (`y` may be longer than these rows: the sum is theirs alone)
-            self.add(&DeviceVec { len: rows * n, inner: y.inner.clone() }, &update);
+            self.add(&DeviceVec { len: rows * n, inner: y.inner.clone() }, &DeviceVec { len: rows * n, inner: update.inner.clone() });
             return;
         }
         // a GGUF's matrix: the quantized matmul of its rows as they are (no transform either side, no channel map),

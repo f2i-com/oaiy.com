@@ -313,6 +313,40 @@ mod tests {
                 }
             }
         }
+        // several projections in one recording, each's output the next one's input and their scratch shared (a
+        // model's layers: a step's one row with its bind groups kept, a check's few rows, a prompt's many)
+        let square: Vec<(Arc<dyn PackedLinear>, Vec<f32>)> = (0..3)
+            .map(|_| {
+                let (w, a, bm) = (floats(k * k, 0.04), floats(4 * k, 0.05), floats(k * 4, 0.5));
+                let sum: Vec<f32> = (0..k * k).map(|i| (w[i] as f64 + (0..4).map(|r| bm[(i / k) * 4 + r] as f64 * a[r * k + i % k] as f64).sum::<f64>()) as f32).collect();
+                (b.low_rank(b.half_linear(w, k, k).unwrap(), a, bm, 4).unwrap(), sum)
+            })
+            .collect();
+        for rows in [1usize, 3, 70] {
+            for keep in [true, false] {
+                let x = floats(rows * k, 1.0);
+                let mut want: Vec<f64> = x.iter().map(|&v| v as f64).collect();
+                for (_, dense) in &square {
+                    want = (0..rows * k).map(|i| (0..k).map(|j| dense[(i % k) * k + j] as f64 * want[(i / k) * k + j]).sum()).collect();
+                }
+                let size = want.iter().fold(0f64, |m, v| m.max(v.abs()));
+                let vs: Vec<DeviceVec> = (0..=square.len()).map(|_| DeviceChain::vec(&b, rows * k)).collect();
+                DeviceChain::upload(&b, &vs[0], &x);
+                // (twice over, as a model's steps follow one another: the second recording meets what the first kept)
+                for turn in 0..2 {
+                    let mut rec = DeviceChain::begin(&b);
+                    rec.keep_groups(keep);
+                    for (i, (w, _)) in square.iter().enumerate() {
+                        rec.exl3_rows(w.as_ref(), &vs[i], &vs[i + 1], rows);
+                    }
+                    rec.read(&vs[square.len()]);
+                    let got = rec.finish().pop().unwrap();
+                    let worst = got.iter().zip(&want).map(|(g, w)| (*g as f64 - w).abs()).fold(0f64, f64::max);
+                    eprintln!("three in a row, {rows} rows, groups kept {keep}, turn {turn}: the worst error {:.1e} of the largest", worst / size);
+                    assert!(worst <= size * 3e-2, "three in a row, {rows} rows, groups kept {keep}, turn {turn}: {worst} of {size}");
+                }
+            }
+        }
         // the shapes must agree
         assert!(b.low_rank(b.half_linear(dense.clone(), n, k).unwrap(), vec![0.0; 4 * k], vec![0.0; n * 3], 4).is_err());
         assert!(b.low_rank(b.half_linear(dense, n, k).unwrap(), Vec::new(), Vec::new(), 0).is_err());

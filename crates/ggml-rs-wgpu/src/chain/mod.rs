@@ -122,7 +122,7 @@ impl<'a> Recorder<'a> {
     /// A recording on `backend`, its bind groups kept (the crate's own measurements record kernels directly).
     #[cfg(test)]
     pub(crate) fn new(backend: &'a WgpuBackend) -> Self {
-        Recorder { backend, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0 }
+        Recorder { backend, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), low_rank: [None, None, None], q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0 }
     }
 }
 
@@ -176,6 +176,9 @@ pub(crate) struct Recorder<'a> {
     /// Of that, what nothing recorded after reads (an input's f16 or int8 rows once the input is written): taken
     /// again before the pool's (a prompt's 27B chunk made 256 f16 copies, 3.6 GB held to its end).
     spare: Vec<(u64, wgpu::Buffer)>,
+    /// The vectors a projection with a low-rank update computes through (`packed`'s `low_rank_scratch`): every
+    /// such projection's in turn.
+    low_rank: [Option<DeviceVec>; 3],
     /// Inputs of several rows quantized to int8 for the int8 kernels so far (the vector, its rows and width, the int8
     /// rows): each quantized once for the matmuls that read it, until something writes it.
     q8: Vec<(wgpu::Buffer, usize, usize, DeviceVec)>,
