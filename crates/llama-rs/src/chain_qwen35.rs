@@ -580,8 +580,10 @@ fn layer_vecs(chain: &dyn DeviceChain, b: &Qwen35Block, slot: usize) -> LayerVec
 /// scratch.
 struct Bound<'a> {
     kvl: &'a [DeviceVec],
-    /// The layers' f16 halves and how many of their rows are the layers' so far, where a step reads them.
+    /// The layers' f16 halves and how many of their rows are the layers' so far, where a step reads them (or a run
+    /// of few rows, a row at a time: `one`, a step's query vector and its attention's output).
     half: Option<(&'a [DeviceVec], usize)>,
+    one: Option<(&'a DeviceVec, &'a DeviceVec)>,
     cap: usize,
     states: &'a [(DeviceVec, DeviceVec)],
     w: &'a Work,
@@ -661,6 +663,17 @@ fn record_layers<'w>(rec: &mut dyn ggml_rs::ChainRecorder, s: &Dims, eps: f32, l
                     // the rows since the halves were last brought up (this step's, and a prompt's before it)
                     rec.halve(kvl, &half[*slot], done * row, (past + 1 - done) * row);
                     rec.attention_halved(&w.qn, &half[*slot], b.attn, s.n_h, s.n_kv, s.hd, 0, past + 1, b.cap, scale);
+                } else if let (Some((half, done)), Some((q1, o1))) = (b.half, b.one) {
+                    // a few rows deep in a long cache (a check of drafted tokens): each row's attention a step's, the
+                    // halves brought up to the run's last row and each row's keys those up to its own position (the
+                    // rows' own kernel took 2.6 ms a row of the sixteen layers at 12,800 positions where a step's 1.3)
+                    rec.halve(kvl, &half[*slot], done * row, (past + t - done) * row);
+                    let qd = s.n_h * s.hd;
+                    for r in 0..t {
+                        rec.copy(&w.qn, r * qd, q1, 0, qd);
+                        rec.attention_halved(q1, &half[*slot], o1, s.n_h, s.n_kv, s.hd, 0, past + r + 1, b.cap, scale);
+                        rec.copy(o1, 0, b.attn, r * qd, qd);
+                    }
                 } else if t == 1 {
                     rec.attention(&w.qn, kvl, b.attn, s.n_h, s.n_kv, s.hd, 0, past + 1, b.cap, scale);
                 } else {
@@ -867,7 +880,7 @@ impl<'a> SplitRun<'a> {
         let mut added = false;
         let kept = self.tap(i, c, self.states, &|j| Some(self.st.ssm_layers[j]).filter(|&l| l < self.sp.from));
         let seg = kept.first().filter(|tap| tap.row < t).map(|_| self.st.seg.get_or_init(|| Seg::new(c, &s)));
-        let bound = Bound { kvl: self.kv0.0, half: None, cap: self.kv0.1, states: self.states, w: &w, attn: &attn, taps: &kept, seg };
+        let bound = Bound { kvl: self.kv0.0, half: None, one: None, cap: self.kv0.1, states: self.states, w: &w, attn: &attn, taps: &kept, seg };
         let from = self.sp.from;
         record_layers(&mut *rec, &s, cfg.rms_eps, self.m.blocks[..from].iter().map(LayerW::of).zip(&self.st.layers[..from]), &bound, t, pos, None, &mut added);
         // to the second: the residual stream and the last layer's output (their add fused with its first layer's norm)
@@ -907,7 +920,7 @@ impl<'a> SplitRun<'a> {
         let mut added = true;
         let kept = self.tap(i, c, self.states1, &|k| Some(self.st.ssm_layers[self.sp.ssm_slots[k]]));
         let seg = kept.first().filter(|tap| tap.row < t).map(|_| self.sp.seg.get_or_init(|| Seg::new(c, &s)));
-        let bound = Bound { kvl: self.kv1.0, half: None, cap: self.kv1.1, states: self.states1, w: &w, attn: &attn, taps: &kept, seg };
+        let bound = Bound { kvl: self.kv1.0, half: None, one: None, cap: self.kv1.1, states: self.states1, w: &w, attn: &attn, taps: &kept, seg };
         record_layers(&mut *rec, &s, cfg.rms_eps, self.sp.weights.iter().map(SplitW::view).zip(&self.sp.layers), &bound, t, pos, None, &mut added);
         rec.add_rmsnorm_rows(&w.x, &w.proj, &self.sp.output_norm, &w.xn, t, cfg.rms_eps);
         if last {
@@ -1566,7 +1579,10 @@ impl Qwen35Chain {
         // the layers' rows from `past` on are written here: their halves' rows end there; a step deep in a long cache
         // reads the halves, brought up to its own row as it goes
         g.halved = g.halved.min(past);
-        let mut halves = t == 1 && past + 1 >= halves_from() && chain.attention_halves(s.n_h, s.n_kv, s.hd);
+        // (a step's, or a few rows': a check of drafted tokens, each row's attention then a step's; OAIY_FEW_ROWS_F32:
+        // a few rows' by their own kernel over the cache as it is)
+        let few = t > 1 && t <= SPEC_ROWS && std::env::var_os("OAIY_FEW_ROWS_F32").is_none();
+        let mut halves = (t == 1 || few) && past + t >= halves_from() && chain.attention_halves(s.n_h, s.n_kv, s.hd);
         if halves && g.half.len() != g.layers.len() {
             // half the cache's size again (1.07 GB at 16,384 positions, 2.1 at 32,768): only where the device says it
             // has that and more to spare, else the step reads the cache as it is
@@ -1581,7 +1597,7 @@ impl Qwen35Chain {
         }
         let halved = g.halved;
         if halves {
-            g.halved = past + 1;
+            g.halved = past + t;
         }
         // the recurrent states the cache holds, as the chain's vectors
         let mut pool = st.pool.lock().unwrap_or_else(|p| p.into_inner());
@@ -1626,7 +1642,7 @@ impl Qwen35Chain {
         rec.keep_groups(t == 1);
         // each residual's add waits for the norm after it (the next layer's, or the output's): one dispatch for both
         let mut added = false;
-        let bound = Bound { kvl: &g.layers, half: halves.then(|| (&g.half[..], halved)), cap: g.cap, states: &states, w, attn: &attn, taps: &kept, seg };
+        let bound = Bound { kvl: &g.layers, half: halves.then(|| (&g.half[..], halved)), one: (halves && few).then(|| (&st.step.qn, &g.out)), cap: g.cap, states: &states, w, attn: &attn, taps: &kept, seg };
         let check = if checking { st.spec.as_ref() } else { None };
         record_layers(&mut *rec, &s, eps, m.blocks.iter().map(LayerW::of).zip(&st.layers), &bound, t, past, check, &mut added);
         // the head of the last row only, or of a check's every row; with a prediction layer, the hidden states after the

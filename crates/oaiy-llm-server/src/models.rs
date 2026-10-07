@@ -2254,7 +2254,12 @@ mod dense_webgpu_timing {
         }
         let llama_rs::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
         let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0 as u32;
-        let prompt: Vec<u32> = m.tokenizer.encode("<|im_start|>user\nExplain how a refrigerator keeps food cold, in a few short paragraphs.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", false).unwrap();
+        // (QWEN35_PARAS: that many paragraphs of text before the question, some 60 tokens each: the steps and checks
+        // deep in a context, their attention over the cache's f16 halves past 4,096 positions)
+        let paras: usize = std::env::var("QWEN35_PARAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let filler = "The river town kept its market on the north bank, where barges unloaded grain, wool and salt. Every spring the floods rose to the steps of the old customs house, and every summer the merchants rebuilt the stalls a little higher. The ferryman counted the seasons by the colour of the water. ".repeat(paras);
+        let prompt: Vec<u32> = m.tokenizer.encode(&format!("<|im_start|>user\n{filler}Explain how a refrigerator keeps food cold, in a few short paragraphs.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"), false).unwrap();
+        eprintln!("a prompt of {} tokens", prompt.len());
         let gen = 160usize;
         // a step at a time
         let mut kv = model.new_kv_cache(prompt.len() + gen + 16);

@@ -8670,11 +8670,43 @@ fn main() {
         let m = 512usize;
         for (what, n, k) in [("FFN gate and up", 34816usize, 5120usize), ("FFN gate", 17408, 5120), ("FFN down", 5120, 17408), ("delta net qkv", 10240, 5120), ("delta net gate", 6144, 5120), ("attention q", 12288, 5120)] {
             let mut next = rng(7);
-            let raw: Vec<u8> = (0..n * (k / 256) * 110).map(|_| ((next() + 1.0) * 100.0) as u8).collect();
-            let w = ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(raw, vec![n, k], GgmlType::Q3_K));
+            // (OAIY_BENCH_DTYPE: the weights that type, Q3_K unless asked)
+            let (dtype, block) = match std::env::var("OAIY_BENCH_DTYPE").as_deref() {
+                Ok("Q4_K") => (GgmlType::Q4_K, 144),
+                Ok("Q5_K") => (GgmlType::Q5_K, 176),
+                Ok("Q6_K") => (GgmlType::Q6_K, 210),
+                Ok("Q8_0") => (GgmlType::Q8_0, 272),
+                _ => (GgmlType::Q3_K, 110),
+            };
+            let raw: Vec<u8> = (0..n * (k / 256) * block).map(|_| ((next() + 1.0) * 100.0) as u8).collect();
+            let w = ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(raw, vec![n, k], dtype));
             let (x, y) = (b.vec(m * k), b.vec(m * n));
             let units = b.gpu.coop_units();
             let chosen = crate::shaders::coop_splits((n as u32).div_ceil(128) * (m as u32).div_ceil(128), units, (k / 32) as u32);
+            // (OAIY_BENCH_SECONDS: the chosen split's matmul run that long, what it does each second of it: a card
+            // under a power limit's rate at the limit, where the rest is a burst's)
+            if let Some(secs) = std::env::var("OAIY_BENCH_SECONDS").ok().and_then(|v| v.parse::<f64>().ok()) {
+                let run = || {
+                    let mut rec = Recorder::new(&b);
+                    for _ in 0..8 {
+                        rec.matmul_rows_coop_split(&w, &x, &y, m, None);
+                    }
+                    rec.read_range(&y, 0, 1);
+                    Box::new(rec).finish();
+                };
+                run();
+                let (t, mut done, mut said) = (std::time::Instant::now(), Vec::new(), String::new());
+                while t.elapsed().as_secs_f64() < secs {
+                    run();
+                    done.push(t.elapsed().as_secs_f64());
+                }
+                for sec in 0..secs as usize {
+                    let runs = done.iter().filter(|&&at| at >= sec as f64 && at < sec as f64 + 1.0).count();
+                    said += &format!(" {:.0}", runs as f64 * 8.0 * 2.0 * (m * n * k) as f64 / 1e12);
+                }
+                eprintln!("{what} [{n}, {k}] for {secs} s, TFLOPS each second:{said}");
+                continue;
+            }
             let mut line = format!("{what} [{n}, {k}] (chosen {chosen}):");
             for split in [None, Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)] {
                 let run = || {
