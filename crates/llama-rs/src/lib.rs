@@ -17,6 +17,7 @@
 #![deny(rust_2018_idioms)]
 
 mod chain_decode;
+mod chain_mmproj;
 mod chain_qwen35;
 pub use chain_qwen35::{Qwen35Chain, Tapped, SPEC_ROWS};
 pub mod chat;

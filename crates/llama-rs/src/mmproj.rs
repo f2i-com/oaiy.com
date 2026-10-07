@@ -1219,6 +1219,30 @@ pub struct Qwen3VlMmProj {
     pub post_ln_b:     Tensor,                 // [D]
     pub projector:     Qwen3VlProjector,
     pub backend:       Arc<dyn Backend>,
+    /// VENDORED-LOCAL: the tower chained on the backend's device (`chain_mmproj`), made at the first picture; a
+    /// loader gives `Default::default()`.
+    pub chain:         TowerChain,
+}
+
+/// VENDORED-LOCAL: [`Qwen3VlMmProj::chain`]: the tower's weights on the device once a picture has asked for them
+/// (None inside where they cannot go there).
+#[derive(Default)]
+pub struct TowerChain(std::sync::OnceLock<Option<crate::chain_mmproj::Tower>>);
+
+impl TowerChain {
+    pub(crate) fn get_or_init(&self, make: impl FnOnce() -> Option<crate::chain_mmproj::Tower>) -> &Option<crate::chain_mmproj::Tower> {
+        self.0.get_or_init(make)
+    }
+}
+
+impl std::fmt::Debug for TowerChain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self.0.get() {
+            None => "TowerChain(not yet)",
+            Some(None) => "TowerChain(none)",
+            Some(Some(_)) => "TowerChain(on the device)",
+        })
+    }
 }
 
 impl Qwen3VlMmProj {
@@ -1306,6 +1330,7 @@ impl Qwen3VlMmProj {
         Ok(Self {
             config, patch_embd, patch_embd_b: upload(patch_embd_b),
             position_embd, blocks, post_ln_w, post_ln_b, projector, backend,
+            chain: Default::default(),
         })
     }
 
@@ -1324,6 +1349,11 @@ impl Qwen3VlMmProj {
 
         // ----- 1. Patch conv as flattened matmul + bias ------------------
         let patches = unfold_patches_to_host(image, cfg.patch_size)?;
+        // VENDORED-LOCAL: the whole tower chained on the backend's device where it can be (the plain matrices are
+        // otherwise multiplied on the host by a backend that keeps dense weights there: 20 s a picture).
+        if let Some(out) = crate::chain_mmproj::forward(self, &patches) {
+            return Ok(out);
+        }
         let patches = backend.to_device(patches);
         let in_dim = 3 * cfg.patch_size * cfg.patch_size;
         let patch_w_host = self.patch_embd.to_host();

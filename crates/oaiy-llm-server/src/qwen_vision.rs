@@ -190,6 +190,7 @@ pub fn load(root: &Path, backend: Arc<dyn Backend>, width: usize, exl3: Option<E
         projector,
         config: cfg,
         backend,
+        chain: Default::default(),
     }))
 }
 
