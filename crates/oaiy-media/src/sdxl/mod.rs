@@ -32,10 +32,18 @@ pub struct Request {
     pub clip_skip: usize,
     /// Resident on the GPU, or staged component by component (see `Stages`).
     pub budget: Budget,
+    /// The UNet and the VAE's decoder on WebGPU (`backend` "webgpu": any GPU wgpu reaches), the text encoders on
+    /// the host.
+    pub webgpu: bool,
 }
 impl Request {
     pub fn parse(j: &Json) -> std::result::Result<Self, String> {
-        crate::pipeline::not_on_webgpu(j, "SDXL")?;
+        let webgpu = match j.get("backend").and_then(Json::as_str) {
+            None | Some("cuda" | "cpu") => false,
+            Some("webgpu") if cfg!(feature = "webgpu") => true,
+            Some("webgpu") => return Err("this build has no WebGPU (the webgpu feature)".into()),
+            Some(other) => return Err(format!("backend must be cuda, cpu or webgpu, not {other}")),
+        };
         let text = |k| {
             j.get(k)
                 .and_then(Json::as_str)
@@ -125,6 +133,7 @@ impl Request {
             device: number("device", 0, 0, 255)?,
             clip_skip: number("clip_skip", 1, 1, 11)?,
             budget: Budget::parse(j)?,
+            webgpu,
         };
         for p in [&r.checkpoint, &r.tokenizer] {
             if !p.is_file() {
@@ -281,7 +290,187 @@ fn encode_prompt(
     Ok((context, y, truncated))
 }
 
+/// The official CLIP tokenizer the request names, neither padding nor truncating.
+fn open_tokenizer(r: &Request) -> Result<tokenizers::Tokenizer> {
+    let mut tokenizer =
+        tokenizers::Tokenizer::from_file(&r.tokenizer).map_err(candle_core::Error::wrap)?;
+    tokenizer.with_padding(None);
+    tokenizer
+        .with_truncation(None)
+        .map_err(candle_core::Error::wrap)?;
+    if tokenizer.token_to_id("<|startoftext|>") != Some(49406)
+        || tokenizer.token_to_id("<|endoftext|>") != Some(49407)
+    {
+        candle_core::bail!("SDXL requires the official CLIP tokenizer");
+    }
+    Ok(tokenizer)
+}
+
+/// A new directory for this batch's images under the request's, and its manifest.
+fn batch_dir(r: &Request) -> Result<(PathBuf, std::fs::File)> {
+    std::fs::create_dir_all(&r.output)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(candle_core::Error::wrap)?
+        .as_nanos();
+    let out = r
+        .output
+        .join(format!("batch-{}-{stamp}", std::process::id()));
+    std::fs::create_dir(&out)?;
+    let manifest = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(out.join("manifest.jsonl"))?;
+    Ok((out, manifest))
+}
+
+/// Image `i`'s picture (`decoded`: `[1, 3, height, width]` in -1..1) saved in `out`, its record written to the
+/// manifest and returned.
+#[allow(clippy::too_many_arguments)]
+fn save_image(r: &Request, out: &std::path::Path, manifest: &mut std::fs::File, i: usize, prompt: &str, seed: u64, truncated: bool, decoded: &Tensor, sampling_seconds: f64, decode_seconds: f64, image_clock: Instant, event: &mut impl FnMut(Json)) -> Result<Json> {
+    let rgb = decoded
+        .squeeze(0)?
+        .permute((1, 2, 0))?
+        .contiguous()?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    if rgb.iter().any(|v| !v.is_finite()) {
+        candle_core::bail!("non-finite SDXL VAE output");
+    }
+    let bytes: Vec<u8> = rgb
+        .iter()
+        .map(|v| ((v.clamp(-1., 1.) + 1.) * 127.5).round() as u8)
+        .collect();
+    let image = image::RgbImage::from_raw(r.width as u32, r.height as u32, bytes)
+        .ok_or_else(|| candle_core::Error::Msg("bad RGB dimensions".into()))?;
+    let path = out.join(format!("image-{:04}.png", i + 1));
+    image.save(&path).map_err(candle_core::Error::wrap)?;
+    let record = Json::obj([
+        ("path", Json::str(path.to_string_lossy())),
+        ("prompt", Json::str(prompt)),
+        ("negative_prompt", Json::str(&r.negative)),
+        ("seed", Json::Int(seed as i64)),
+        ("steps", Json::Int(r.steps as i64)),
+        ("cfg", Json::Num(r.cfg)),
+        ("sampler", Json::str("dpmpp_2m")),
+        ("scheduler", Json::str("karras")),
+        ("width", Json::Int(r.width as i64)),
+        ("height", Json::Int(r.height as i64)),
+        ("clip_skip", Json::Int(r.clip_skip as i64)),
+        ("prompt_truncated", Json::Bool(truncated)),
+        ("checkpoint", Json::str(r.checkpoint.to_string_lossy())),
+        ("sampling_seconds", Json::Num(sampling_seconds)),
+        ("decode_seconds", Json::Num(decode_seconds)),
+        (
+            "image_seconds",
+            Json::Num(image_clock.elapsed().as_secs_f64()),
+        ),
+    ]);
+    writeln!(manifest, "{}", record.to_json())?;
+    manifest.flush()?;
+    event(Json::obj([
+        ("stage", Json::str("image_saved")),
+        ("image", Json::Int(i as i64 + 1)),
+        ("path", Json::str(path.to_string_lossy())),
+        ("prompt_truncated", Json::Bool(truncated)),
+    ]));
+    Ok(record)
+}
+
+/// [`generate`] with the UNet and the VAE's decoder on WebGPU ([`crate::sdxl_wgpu::WgpuUnet`],
+/// [`crate::sdxl_vae_wgpu::WgpuSdxlVae`]): the two CLIP encoders on the host through Candle in f32 (a prompt's two
+/// encodings, against a step's two passes of the UNet), the noise the host's from the seed (Candle seeds no generator on the CPU), a guided step's prompt and
+/// negative prompt two passes of one recording, a guidance of 1 the prompt's pass alone.
+#[cfg(feature = "webgpu")]
+fn generate_webgpu(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
+    let clock = Instant::now();
+    event(Json::obj([
+        ("stage", Json::str("initializing_device")),
+        ("device", Json::Int(r.device as i64)),
+        ("backend", Json::str("webgpu")),
+    ]));
+    let dev = Device::Cpu;
+    let tokenizer = open_tokenizer(r)?;
+    let (out, mut manifest) = batch_dir(r)?;
+    event(Json::obj([("stage", Json::str("loading_sdxl"))]));
+    let mut stages = Stages {
+        weights: Weights::open(&r.checkpoint)?,
+        host: HashMap::new(),
+        ram_left: 0,
+        host_bytes: 0,
+        streamed_bytes: 0,
+    };
+    let unet = crate::sdxl_wgpu::WgpuUnet::load(&mut stages.weights, UNET, &config::UNetConfig::sdxl_1_0(), r.device)?;
+    let vae = crate::sdxl_vae_wgpu::WgpuSdxlVae::load_on(&mut stages.weights, VAE, &config::VaeConfig::sdxl_default(), unet.backend().clone())?;
+    let (cl, cg) = stages.clips(&dev, DType::F32)?;
+    let load_seconds = clock.elapsed().as_secs_f64();
+    let sigmas = scheduler::sdxl_default_sigmas(r.steps);
+    let (lh, lw) = (r.height / 8, r.width / 8);
+    let row = |t: &Tensor, i: usize| -> Result<Vec<f32>> { t.narrow(0, i, 1)?.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>() };
+    let mut files = Vec::new();
+    for i in 0..r.count {
+        let image_clock = Instant::now();
+        let prompt = &r.prompts[if r.prompts.len() == 1 { 0 } else { i }];
+        event(Json::obj([
+            ("stage", Json::str("encoding_prompt")),
+            ("image", Json::Int(i as i64 + 1)),
+        ]));
+        let (context, y, truncated) = encode_prompt(r, &tokenizer, &cl, &cg, prompt, &dev)?;
+        // the prompt's keys and values for every cross-attention, and the negative prompt's where it guides
+        let mut conds = vec![unet.prepare(&row(&context, 0)?, &row(&y, 0)?)?];
+        if r.cfg != 1.0 {
+            conds.push(unet.prepare(&row(&context, 1)?, &row(&y, 1)?)?);
+        }
+        let conds: Vec<&crate::sdxl_wgpu::Cond> = conds.iter().collect();
+        let seed = r.seed + i as u64;
+        let mut x = Tensor::from_vec(crate::pipeline::noise(seed, 4 * lh * lw), (1, 4, lh, lw), &dev)?.affine(sigmas[0], 0.)?;
+        let mut state = scheduler::SamplerState::default();
+        let sampling = Instant::now();
+        for step in 0..r.steps {
+            let scaled = scheduler::scale_input_for_euler(&x, sigmas[step])?;
+            let t = scheduler::sigma_to_timestep(sigmas[step], 1000) as f32;
+            // (the latent as its pixels' rows of channels, the UNet's tokens)
+            let rows = scaled.squeeze(0)?.permute((1, 2, 0))?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+            let eps = unet.eps(&rows, lh, lw, t, &conds)?;
+            let guided: Vec<f32> = match eps.get(1) {
+                Some(neg) => eps[0].iter().zip(neg).map(|(c, n)| n + (c - n) * r.cfg as f32).collect(),
+                None => eps[0].clone(),
+            };
+            let guided = Tensor::from_vec(guided, (lh, lw, 4), &dev)?.permute((2, 0, 1))?.unsqueeze(0)?.contiguous()?;
+            x = scheduler::dpmpp_2m_step(&x, &guided, sigmas[step], sigmas[step + 1], &mut state)?;
+            event(Json::obj([
+                ("stage", Json::str("sampling")),
+                ("image", Json::Int(i as i64 + 1)),
+                ("step", Json::Int(step as i64 + 1)),
+                ("steps", Json::Int(r.steps as i64)),
+            ]));
+        }
+        let sampling_seconds = sampling.elapsed().as_secs_f64();
+        event(Json::obj([
+            ("stage", Json::str("decoding")),
+            ("image", Json::Int(i as i64 + 1)),
+        ]));
+        let decode = Instant::now();
+        // (the UNet's vectors let go first: the decoder's last blocks are the largest a picture makes)
+        unet.forget();
+        let (rgb, oh, ow) = vae.decode(&x.squeeze(0)?.permute((1, 2, 0))?.contiguous()?.flatten_all()?.to_vec1::<f32>()?, lh, lw)?;
+        let decoded = Tensor::from_vec(rgb, (oh, ow, 3), &dev)?.permute((2, 0, 1))?.unsqueeze(0)?;
+        files.push(save_image(r, &out, &mut manifest, i, prompt, seed, truncated, &decoded, sampling_seconds, decode.elapsed().as_secs_f64(), image_clock, &mut event)?);
+    }
+    Ok(Json::obj([
+        ("data", Json::Arr(files)),
+        ("output_dir", Json::str(out.to_string_lossy())),
+        ("load_seconds", Json::Num(load_seconds)),
+        ("seconds", Json::Num(clock.elapsed().as_secs_f64())),
+        ("backend", Json::str("webgpu")),
+    ]))
+}
+
 pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
+    #[cfg(feature = "webgpu")]
+    if r.webgpu {
+        return generate_webgpu(r, event);
+    }
     let clock = Instant::now();
     event(Json::obj([
         ("stage", Json::str("initializing_device")),
@@ -296,30 +485,8 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
     } else {
         DType::F32
     };
-    let mut tokenizer =
-        tokenizers::Tokenizer::from_file(&r.tokenizer).map_err(candle_core::Error::wrap)?;
-    tokenizer.with_padding(None);
-    tokenizer
-        .with_truncation(None)
-        .map_err(candle_core::Error::wrap)?;
-    if tokenizer.token_to_id("<|startoftext|>") != Some(49406)
-        || tokenizer.token_to_id("<|endoftext|>") != Some(49407)
-    {
-        candle_core::bail!("SDXL requires the official CLIP tokenizer");
-    }
-    std::fs::create_dir_all(&r.output)?;
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(candle_core::Error::wrap)?
-        .as_nanos();
-    let out = r
-        .output
-        .join(format!("batch-{}-{stamp}", std::process::id()));
-    std::fs::create_dir(&out)?;
-    let mut manifest = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(out.join("manifest.jsonl"))?;
+    let tokenizer = open_tokenizer(r)?;
+    let (out, mut manifest) = batch_dir(r)?;
     event(Json::obj([("stage", Json::str("loading_sdxl"))]));
     // The checkpoint's FP16 size is what its components take on the device.
     let checkpoint_bytes = std::fs::metadata(&r.checkpoint)?.len();
@@ -412,53 +579,7 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
             }
             None => stages.vae(&dev)?.decode(&x)?,
         };
-        let rgb = decoded
-            .squeeze(0)?
-            .permute((1, 2, 0))?
-            .contiguous()?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-        if rgb.iter().any(|v| !v.is_finite()) {
-            candle_core::bail!("non-finite SDXL VAE output");
-        }
-        let bytes: Vec<u8> = rgb
-            .iter()
-            .map(|v| ((v.clamp(-1., 1.) + 1.) * 127.5).round() as u8)
-            .collect();
-        let image = image::RgbImage::from_raw(r.width as u32, r.height as u32, bytes)
-            .ok_or_else(|| candle_core::Error::Msg("bad RGB dimensions".into()))?;
-        let path = out.join(format!("image-{:04}.png", i + 1));
-        image.save(&path).map_err(candle_core::Error::wrap)?;
-        let record = Json::obj([
-            ("path", Json::str(path.to_string_lossy())),
-            ("prompt", Json::str(prompt)),
-            ("negative_prompt", Json::str(&r.negative)),
-            ("seed", Json::Int(seed as i64)),
-            ("steps", Json::Int(r.steps as i64)),
-            ("cfg", Json::Num(r.cfg)),
-            ("sampler", Json::str("dpmpp_2m")),
-            ("scheduler", Json::str("karras")),
-            ("width", Json::Int(r.width as i64)),
-            ("height", Json::Int(r.height as i64)),
-            ("clip_skip", Json::Int(r.clip_skip as i64)),
-            ("prompt_truncated", Json::Bool(truncated)),
-            ("checkpoint", Json::str(r.checkpoint.to_string_lossy())),
-            ("sampling_seconds", Json::Num(sampling_seconds)),
-            ("decode_seconds", Json::Num(decode.elapsed().as_secs_f64())),
-            (
-                "image_seconds",
-                Json::Num(image_clock.elapsed().as_secs_f64()),
-            ),
-        ]);
-        writeln!(manifest, "{}", record.to_json())?;
-        manifest.flush()?;
-        event(Json::obj([
-            ("stage", Json::str("image_saved")),
-            ("image", Json::Int(i as i64 + 1)),
-            ("path", Json::str(path.to_string_lossy())),
-            ("prompt_truncated", Json::Bool(truncated)),
-        ]));
-        files.push(record);
+        files.push(save_image(r, &out, &mut manifest, i, prompt, seed, truncated, &decoded, sampling_seconds, decode.elapsed().as_secs_f64(), image_clock, &mut event)?);
     }
     Ok(Json::obj([
         ("data", Json::Arr(files)),

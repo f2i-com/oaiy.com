@@ -297,6 +297,11 @@ impl WgpuUnet {
         Ok(Self { gpu, cfg: cfg.clone(), time, label, input, middle, output, out_norm, out_conv, pool: RefCell::new(HashMap::new()) })
     }
 
+    /// The device it is on (the VAE's decoder shares it).
+    pub fn backend(&self) -> &ggml_rs_wgpu::WgpuBackend {
+        &self.gpu
+    }
+
     /// A vector of `len` from the pool, or a new one.
     fn take(&self, len: usize) -> DeviceVec {
         let len = len.max(1);
