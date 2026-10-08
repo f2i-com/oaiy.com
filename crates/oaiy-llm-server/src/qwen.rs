@@ -829,6 +829,13 @@ impl QwenEngine {
         let mut generated = Vec::new(); let mut think_used = 0usize;
         let mut stream = NativeStream::default();
         let mut rng = job.sampling.seed ^ 0x9E3779B97F4A7C15;
+        // (OAIY_CHAIN_PROFILE: the reply's kernels alone, the prompt's let go here)
+        #[cfg(feature = "webgpu")]
+        let profiled = self.log && std::env::var_os("OAIY_CHAIN_PROFILE").is_some();
+        #[cfg(feature = "webgpu")]
+        if profiled {
+            let _ = ggml_rs_wgpu::profile::take_kernels();
+        }
         let mut logits = Row::Logits(logits.unwrap());
         // (a greedy request's rows: the token alone where the model picks it on its GPU, megabytes of logits a check
         // not read back)
@@ -938,6 +945,14 @@ impl QwenEngine {
         // a check's rows no token reached
         if let (Some(m), false) = (drafter, pending.is_empty()) {
             m.rollback(&mut self.kv, check_rows, check_rows - pending.len());
+        }
+        #[cfg(feature = "webgpu")]
+        if profiled {
+            let kernels = ggml_rs_wgpu::profile::take_kernels();
+            eprintln!("  Qwen kernels: the reply's {:.1} ms of the GPU's in {} dispatches (each timed in a pass of its own)", kernels.iter().map(|k| k.1).sum::<f64>(), kernels.iter().map(|k| k.2 as u64).sum::<u64>());
+            for (name, ms, count) in kernels.iter().take(48) {
+                eprintln!("    {name:<34} {ms:>9.2} ms {count:>7}");
+            }
         }
         if self.log && std::env::var_os("OAIY_DECODE_LOG").is_some() {
             let each: Vec<String> = by_fifty.iter().scan(0f64, |before, &t| { let d = t - *before; *before = t; Some(format!("{d:.3}")) }).collect();

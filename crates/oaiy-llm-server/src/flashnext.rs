@@ -3230,6 +3230,9 @@ impl FlashNext {
             c.upload(&dv.table, &self.rope_table(at, rows));
             let mut rec = c.begin();
             rec.keep_groups(true);
+            // (a GGUF's head from int8 activations, as the trunk's rows take it: half a draft's GPU time in f32, and
+            // a draft is only what a check then takes or refuses)
+            rec.rows_alike(true);
             if pass == 0 {
                 rec.copy(&mc.hid, 0, &md.hin, 0, rows * s * h);
             } else {

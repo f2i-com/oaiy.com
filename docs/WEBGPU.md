@@ -392,6 +392,15 @@ not waited for (`ChainRecorder::send`; each card's next work is behind it on its
 queue): 0.04 s of the request where 0.07, 256 tokens in 1.71 to 1.84 s (139 to 150
 tokens a second).
 
+A draft's head takes the int8 kernel too (a GGUF's head was half a draft's GPU time in
+f32): a round of three drafts 2.4 ms where 3.0, drafting 0.25 to 0.27 s of the request,
+256 tokens in 1.67 to 1.82 s (141 to 153 tokens a second; Strata 179). What the reply's
+time is then, by kernel (`OAIY_CHAIN_PROFILE` in the server prints it at a request's
+end; 1,613 ms of the GPU's, which is the whole reply): the IQ4_XS matrices 242 ms and
+their int8 rows 53, the experts 281, the f16 matrices 2,560 wide 172, the
+hyper-connections 214, QSA's attention 70 and its selection 28, the stream norms 67,
+the delta nets 61, and 39 of copies (a check's backups of the delta nets' states).
+
 On one card, which is what Strata's figure is for, this file is far from it: its
 experts are 35.5 GB, so 15 of the 48 layers' run on the host (`quant_host` reads the
 grid types as they lie too: 0.27 to 0.42 ms an expert a row on one AVX-512 core, where
