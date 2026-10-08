@@ -289,8 +289,14 @@ an int8 kernel (`shaders::iq4_xs_few_q8`: each 32 of a row rounded to int8 by it
 scale, which is llama.cpp's CPU arithmetic and what the K-quants' check kernels here
 do): 2.1 ms of a check of four where the f32 kernel took 7.8, more than a step's whole
 2.5. A check's rows then differ from a step's by that rounding: over 36 rows the logits'
-cosine is 0.99967 on average and 0.9987 at worst, the greedy token the same each time
-(with f32 rows they are the step's exactly; `OAIY_NO_Q8` gives those).
+cosine is 0.99967 on average and 0.9987 at worst. So a drafted reply is not always the
+plain one, token for token, even at temperature 0: where two tokens are nearly tied the
+rounding can pick the other. Of two greedy replies to Strata's request one was the
+plain reply and one left it at its eighth token (both read as answers). `OAIY_NO_Q8`
+gives a check's rows in f32, a step's exactly, and then both were the plain replies to
+the byte, at 93 to 95 tokens a second where 108 to 119. (The K-quants' check kernels
+are int8 the same way, so this holds for every GGUF model that drafts; an EXL3
+checkpoint's checks are a step's bit for bit.)
 
 Against the request Strata's benchmark makes (a synthetic Python module up to 4,096
 prompt tokens, greedy, 256 tokens), the same two cards: the prompt at 3,600 tokens a
