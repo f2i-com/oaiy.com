@@ -15,7 +15,12 @@ The server and inference core remain std-only and forbid unsafe Rust.
 > and the vocoder are still Candle's on the CPU. On one RTX 5090 at its 400 W cap, LTX
 > 2.3's distilled checkpoint (its one file given as `audio_vae` too), 512x320, 49
 > frames: 62 s with sound where 36 s without (the eight steps 4.0 s where 3.1; the
-> sound's decode on the CPU 16 s; the rest reading the checkpoint and Gemma). Against
+> sound's decode on the CPU 16 s; the rest reading the checkpoint and Gemma), the
+> card's memory 20.0 GiB at most where 14.3. The largest clip (1024x1024, 121 frames,
+> a starting and an end image): 162 s where 107 (the steps 65.7 s where 58.5, the
+> sound's decode 38 s), 27.1 GiB where 20.9. A card with no room for a clip's steps
+> beside both streams runs it without its sound and says so
+> (`sound_dropped_no_gpu_memory`), as it ran before the audio stream was there. Against
 > the reference's golden tensors (`tools/ltx/audio_reference.py`) the two streams' first
 > two blocks give its velocities to 0.7% (video 0.0066, audio 0.0073 to 0.0077, with
 > the audio denoised and with it frozen) and the audio connector its context to 0.7%,

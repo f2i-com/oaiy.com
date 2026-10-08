@@ -874,6 +874,21 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     } else {
         Model::Candle(transformer::Transformer::new(store, &dev, gpu_budget, r.memory == "gpu", r.audio)?)
     };
+    // A clip with sound on a card with no room left for its steps once both streams are on it (LTX 2.3's are 20 GiB,
+    // the largest clip's steps 7 more): without its sound, and said, as such a clip ran before the audio stream was
+    // on WebGPU, where it would fail partway.
+    #[cfg(feature = "webgpu")]
+    let silenced = match &mut model {
+        Model::Wgpu(m, _, sound) if r.audio && !m.room_for_step(f * h * w + if r.end_image.is_some() { h * w } else { 0 }) => {
+            m.drop_audio();
+            *sound = None;
+            report(event("sound_dropped_no_gpu_memory", 1, 1));
+            Some(Request { audio: false, ..r.clone() })
+        }
+        _ => None,
+    };
+    #[cfg(feature = "webgpu")]
+    let r = silenced.as_ref().unwrap_or(r);
     // A negative prompt without CFG steers every step by NAG.
     if let (true, Some(context), Model::Candle(model)) = (r.guidance.as_ref().is_none_or(|g| g.cfg == 1.), &negative, &mut model) {
         model.nag = Some(transformer::Nag { context: context.clone(), scale: r.nag.0, tau: r.nag.1, alpha: r.nag.2 });

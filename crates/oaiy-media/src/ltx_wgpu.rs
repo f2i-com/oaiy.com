@@ -445,6 +445,23 @@ impl WgpuLtx {
         self.audio.is_some()
     }
 
+    /// Let go of the audio stream (its layers' memory the card's again): the video's alone from here on.
+    pub fn drop_audio(&mut self) {
+        self.audio = None;
+        for b in &mut self.blocks {
+            b.audio = None;
+        }
+        self.gpu.settle();
+    }
+
+    /// Whether the card has room for a step of `tokens` video tokens beside what is loaded, where it says what it has
+    /// (true where it does not): a step's vectors are some 0.41 MiB a token (measured: 17,408 tokens 6.9 GiB), asked
+    /// for here as 450 KiB a token (OAIY_LTX_TOKEN_KIB another figure) with a GiB to spare.
+    pub fn room_for_step(&self, tokens: usize) -> bool {
+        let token_bytes = std::env::var("OAIY_LTX_TOKEN_KIB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(450) << 10;
+        self.gpu.memory_budget().is_none_or(|(budget, used)| budget.saturating_sub(used) >= tokens as u64 * token_bytes + (1 << 30))
+    }
+
     fn vec(&self, len: usize) -> DeviceVec {
         self.gpu.vec(len.max(1))
     }

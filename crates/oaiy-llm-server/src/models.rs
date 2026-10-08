@@ -1188,11 +1188,12 @@ pub(crate) fn flashnext_gguf_on(path: &Path, gpus: &[&ggml_rs_wgpu::WgpuBackend]
     // The prediction layer (an EXL3 checkpoint's, its experts some 1 GB at 3 bits a weight, on the last device) only
     // where the GPUs have room for every layer's experts beside it: where some run on the host a check's rows each
     // cost those experts a row, and drafting saved nothing (one RTX 5090, 300 tokens: 6.0 to 6.5 s drafting one to
-    // three deep where 5.75 to 6.07 without), so its room is the experts'. OAIY_DRAFTS asks for it all the same.
+    // three deep where 5.75 to 6.07 without), so its room is the experts'. OAIY_DRAFT_OVER_HOST_LAYERS asks for it all
+    // the same (OAIY_DRAFTS is the drafts' depth, whatever loads).
     let mtp_bytes: u64 = 5 << 28;
     let room: u64 = gpus.iter().map(|g| g.usage().1.saturating_sub(g.usage().0)).sum();
     let whole = std::fs::metadata(path).map_or(0, |m| m.len());
-    let mtp_from = mtp_from.filter(|_| whole + mtp_bytes + ((gpus.len() as u64) << 30) <= room || std::env::var_os("OAIY_DRAFTS").is_some());
+    let mtp_from = mtp_from.filter(|_| whole + mtp_bytes + ((gpus.len() as u64) << 30) <= room || std::env::var_os("OAIY_DRAFT_OVER_HOST_LAYERS").is_some());
     let reserve = dense_bytes(path)? / backends.len().max(1) as u64 + (1 << 30) + if mtp_from.is_some() { mtp_bytes } else { 0 };
     // Each device's experts by an allowance of their own: its budget less that reserve, counted as they are placed
     // (the layers load four at a time, each with its dense matrices: the device's own count of its weights already
@@ -1206,7 +1207,13 @@ pub(crate) fn flashnext_gguf_on(path: &Path, gpus: &[&ggml_rs_wgpu::WgpuBackend]
             Some(b) => {
                 let bytes = (data.gate.1.len() + data.up.1.len() + data.down.1.len() + 3 * data.hidden * data.ff * 4) as u64;
                 if placed[device].fetch_add(bytes, Relaxed) + bytes <= allowance[device] {
-                    b.quant_experts(data)
+                    // (experts the GPU's kernels do not decode, or the card had no room for after all, are the
+                    // host's: their bytes are not the card's)
+                    let made = b.quant_experts(data);
+                    if made.as_ref().is_ok_and(|e| e.on_host()) {
+                        placed[device].fetch_sub(bytes, Relaxed);
+                    }
+                    made
                 } else {
                     placed[device].fetch_sub(bytes, Relaxed);
                     ggml_rs_wgpu::quant_host::quant_experts_host_beside(b, data)
