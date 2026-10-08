@@ -344,25 +344,53 @@ impl Attention {
         // time on the CPU and most of a decode step's attention.
         let scale = (hd as f32).powf(-0.5);
         let attending = std::time::Instant::now();
-        let o = Mutex::new(vec![0.0f32; t * nh * hd]);
-        // As many threads as the work pays for: `parallel_rows` starts its threads at each call (some 60 us each
-        // here), and a decode step's 64 heads over a few dozen positions are a quarter of a millisecond on one. A
-        // thread a pair of heads cost a step 0.076 s over its 40 layers where one thread takes 0.011 (measured, a
-        // 40-token context); a prompt's work is thousands of times that and takes every thread. The time is least
-        // near the square root of the work over a thread's start, so that many.
         let work: usize = idxs.iter().map(Vec::len).sum::<usize>() * nh * hd * 2;
-        let threads = ((work as f64 / 6e5).sqrt() as usize).max(1);
-        parallel_rows(t * nh, (t * nh).div_ceil(threads), &|b, e| {
-            let mut buf = vec![0.0f32; (e - b) * hd];
-            for r in b..e {
-                let (i, h) = (r / nh, r % nh);
-                let out = &mut buf[(r - b) * hd..(r - b + 1) * hd];
-                sparse_attend(&q[r * hd..(r + 1) * hd], &kv_all, hd, &idxs[i], self.attn_sink[h], scale, out);
-                self.rope.apply(&mut out[hd - rd..], start_pos + i, true);
-            }
-            o.lock().unwrap_or_else(|p| p.into_inner())[b * hd..e * hd].copy_from_slice(&buf);
-        });
-        let o = o.into_inner().unwrap_or_else(|p| p.into_inner());
+        let o: Vec<f32> = if work <= POOLED_WORK {
+            // A decode step's (64 heads over a few hundred positions: a millisecond or two of one thread's work), on
+            // workers that are already there ([`crate::pool`]): a share of the heads each, some 150,000 products or
+            // more a share. Starting threads for it at each call (some 60 us each here) left the time least at the
+            // square root of the work over a thread's start, four threads and half a millisecond a layer for a
+            // 300-token context, 20 to 26 ms a token; the same sums, whichever worker makes them.
+            let rows = t * nh;
+            let pool = crate::pool::shared().lock().unwrap_or_else(|p| p.into_inner());
+            let per = rows.div_ceil(pool.threads().min(rows).min((work / 150_000).max(1)));
+            let (q, kv_all, idxs) = (Arc::new(q), Arc::new(kv_all), Arc::new(idxs));
+            let (sink, rope) = (Arc::new(self.attn_sink.clone()), Arc::clone(&self.rope));
+            let jobs: Vec<crate::pool::Job> = (0..rows)
+                .step_by(per)
+                .enumerate()
+                .map(|(id, b)| {
+                    let e = (b + per).min(rows);
+                    let (q, kv_all, idxs, sink, rope) = (Arc::clone(&q), Arc::clone(&kv_all), Arc::clone(&idxs), Arc::clone(&sink), Arc::clone(&rope));
+                    Box::new(move || {
+                        let mut buf = vec![0.0f32; (e - b) * hd];
+                        for r in b..e {
+                            let (i, h) = (r / nh, r % nh);
+                            let out = &mut buf[(r - b) * hd..(r - b + 1) * hd];
+                            sparse_attend(&q[r * hd..(r + 1) * hd], &kv_all, hd, &idxs[i], sink[h], scale, out);
+                            rope.apply(&mut out[hd - rd..], start_pos + i, true);
+                        }
+                        (id, buf)
+                    }) as crate::pool::Job
+                })
+                .collect();
+            pool.run(jobs).concat()
+        } else {
+            // A prompt's: thousands of times a step's work, on every thread (`parallel_rows` starts its own).
+            let o = Mutex::new(vec![0.0f32; t * nh * hd]);
+            let threads = ((work as f64 / 6e5).sqrt() as usize).max(1);
+            parallel_rows(t * nh, (t * nh).div_ceil(threads), &|b, e| {
+                let mut buf = vec![0.0f32; (e - b) * hd];
+                for r in b..e {
+                    let (i, h) = (r / nh, r % nh);
+                    let out = &mut buf[(r - b) * hd..(r - b + 1) * hd];
+                    sparse_attend(&q[r * hd..(r + 1) * hd], &kv_all, hd, &idxs[i], self.attn_sink[h], scale, out);
+                    self.rope.apply(&mut out[hd - rd..], start_pos + i, true);
+                }
+                o.lock().unwrap_or_else(|p| p.into_inner())[b * hd..e * hd].copy_from_slice(&buf);
+            });
+            o.into_inner().unwrap_or_else(|p| p.into_inner())
+        };
         crate::profile::add(crate::profile::Part::SparseAttention, attending);
 
         // grouped low-rank output: wo_a is block-diagonal over o_groups
@@ -650,6 +678,11 @@ pub fn pool(kv: &[f32], score: &[f32], r: usize, hd: usize) -> Vec<f32> {
 pub fn compressed_pos(start_pos: usize, j: usize, ratio: usize) -> usize {
     (start_pos / ratio + j) * ratio
 }
+
+/// The most products of a call's sparse attention that go to the workers that stay ([`crate::pool::shared`]): a
+/// decode step's at the longest context it attends over (the window and every selected position, 64 heads) is some 42
+/// million; a prompt's chunk is past it and starts its own threads.
+const POOLED_WORK: usize = 64_000_000;
 
 /// `a . b` in sixteen running sums (one vector's lanes to the compiler), added up at the end: a head's score against
 /// a position is 512 products, and summed one after another (which a compiler may not reorder) the scores were a

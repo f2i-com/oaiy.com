@@ -21,96 +21,21 @@
 //! `#[target_feature]` function, so this crate stays free of `unsafe`; the
 //! caller that verified the CPU features (the crate `dsv41-simd`) makes the call.
 //!
-//! Threads are persistent: decode needs two parallel phases per layer
-//! (gate/up, then down), and spawning 16+ threads 80 times per token would
-//! cost more than the work. Jobs own their inputs through `Arc`s, so the
+//! Threads are persistent ([`crate::pool`]): decode needs two parallel phases
+//! per layer (gate/up, then down), and spawning 16+ threads 80 times per token
+//! would cost more than the work. Jobs own their inputs through `Arc`s, so the
 //! pool needs no lifetime tricks.
 
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use crate::expert::{BLOCK, DIM, INTER, RECORD_BYTES, S1, S2, S3, W1, W2, W3};
 use crate::formats::{e8m0_to_f32, fake_quant_fp8, to_bf16, FP4_VALUES};
+use crate::pool::{Job, Pool};
 
 /// Rows computed together, one per SIMD lane.
 const LANES: usize = 16;
-
-type Job = Box<dyn FnOnce() -> (usize, Vec<f32>) + Send>;
-
-/// A fixed set of worker threads fed round-robin, results tagged by job index.
-struct Pool {
-    senders: Vec<Sender<Job>>,
-    results: Receiver<(usize, Vec<f32>)>,
-    handles: Vec<JoinHandle<()>>,
-}
-
-impl Pool {
-    fn new(threads: usize) -> Pool {
-        let (res_tx, results) = channel::<(usize, Vec<f32>)>();
-        let mut senders = Vec::with_capacity(threads);
-        let mut handles = Vec::with_capacity(threads);
-        for i in 0..threads {
-            let (tx, rx) = channel::<Job>();
-            let res_tx = res_tx.clone();
-            let h = std::thread::Builder::new()
-                .name(format!("dsv41-expert-{i}"))
-                .spawn(move || {
-                    while let Some(job) = recv_spinning(&rx) {
-                        if res_tx.send(job()).is_err() {
-                            break;
-                        }
-                    }
-                })
-                .expect("spawn expert worker");
-            senders.push(tx);
-            handles.push(h);
-        }
-        Pool { senders, results, handles }
-    }
-
-    /// Run every job, returning their outputs in job order.
-    fn run(&self, jobs: Vec<Job>) -> Vec<Vec<f32>> {
-        let n = jobs.len();
-        for (i, job) in jobs.into_iter().enumerate() {
-            self.senders[i % self.senders.len()].send(job).expect("expert worker alive");
-        }
-        let mut out = vec![Vec::new(); n];
-        for _ in 0..n {
-            let (i, v) = recv_spinning(&self.results).expect("expert worker alive");
-            out[i] = v;
-        }
-        out
-    }
-}
-
-/// How long a thread polls for its next message before parking. A job's two
-/// phases follow each other within microseconds and layers within about a
-/// millisecond; waking a parked thread costs tens of microseconds on Windows,
-/// twice per job, which is a fifth of a one-expert job.
-const SPIN: std::time::Duration = std::time::Duration::from_micros(100);
-
-/// `rx.recv()`, polling for [`SPIN`] first. `None` when the channel is closed.
-fn recv_spinning<T>(rx: &Receiver<T>) -> Option<T> {
-    let t0 = std::time::Instant::now();
-    loop {
-        match rx.try_recv() {
-            Ok(v) => return Some(v),
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => return None,
-            Err(std::sync::mpsc::TryRecvError::Empty) if t0.elapsed() < SPIN => std::hint::spin_loop(),
-            Err(std::sync::mpsc::TryRecvError::Empty) => return rx.recv().ok(),
-        }
-    }
-}
-
-impl Drop for Pool {
-    fn drop(&mut self) {
-        self.senders.clear(); // closes every job channel; workers leave their loops
-        for h in self.handles.drain(..) {
-            let _ = h.join();
-        }
-    }
-}
 
 /// Both e2m1 values of a byte, low nibble first: one load decodes two weights.
 const PAIRS: [[f32; 2]; 256] = {
@@ -403,7 +328,7 @@ impl CpuExperts {
         let coordinator = std::thread::Builder::new()
             .name("dsv41-experts".into())
             .spawn(move || {
-                let engine = Engine { pool: Pool::new(threads), threads, kernel, record_bytes };
+                let engine = Engine { pool: Pool::new(threads, "dsv41-expert"), threads, kernel, record_bytes };
                 while let Ok(req) = rx.recv() {
                     let Request { records, weights, x, swiglu_limit, done } = req;
                     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.forward(&records, &weights, &x, swiglu_limit)))

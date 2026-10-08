@@ -38,6 +38,7 @@ pub mod linear;
 pub mod model;
 pub mod moe;
 pub mod ops;
+mod pool;
 pub mod profile;
 pub mod safetensors;
 pub mod tokenizer;
