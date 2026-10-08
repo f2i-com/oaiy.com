@@ -56,8 +56,10 @@ pub(crate) struct Engine {
     log: bool,
     /// Reading the experts into RAM while no request waits ([`Warm`]); None once done, or switched off.
     warm: Option<Warm>,
-    /// The experts' kernel on the GPUs, for what the other cards hold for good ([`Pinned`]): filled while idle too.
+    /// The experts' kernel on the GPUs, for what the other cards hold ([`Pinned`]): filled while idle too.
     kernel: Option<Arc<WgpuExperts>>,
+    /// Experts the idle rebalance has moved since it last said so.
+    rebalanced: usize,
 }
 
 /// The idle reading of the routed experts into the RAM tier: where it is, and what it has read so far.
@@ -71,6 +73,8 @@ struct Warm {
 /// Records an idle slice reads (some 300 MB: a fifth of a second from a 1.4 GB/s drive), so a request that arrives
 /// meanwhile waits no longer than that.
 const WARM_SLICE: usize = 16;
+/// Experts an idle slice of the rebalance moves (each a record read from the drive and one uploaded: as long a wait).
+const REBALANCE_SLICE: usize = 4;
 
 /// How much of `prompt` a state covering `tokens` can serve: all of `tokens`, when the prompt starts with them and goes
 /// on past them (a state cannot be rewound, and the next token's logits need a forward pass); else none.
@@ -90,7 +94,7 @@ impl Engine {
         let warm = std::env::var_os("OAIY_DSV41_NO_WARM")
             .is_none()
             .then(|| Warm { cursor: 0, started: None, reading: std::time::Duration::ZERO, bytes_before: model.expert_cache().stats().bytes_read });
-        Engine { model, tok, covered: Vec::new(), checkpoint: None, eos, log, warm, kernel: None }
+        Engine { model, tok, covered: Vec::new(), checkpoint: None, eos, log, warm, kernel: None, rebalanced: 0 }
     }
 
     /// The experts' kernel the model was given, when other cards hold a share of them: the idle reading fills those
@@ -137,6 +141,21 @@ impl Engine {
         }
     }
 
+    /// An idle slice of the cards' rebalance ([`WgpuExperts::rebalance`]): whether it moved any (false: there is
+    /// nothing more to move, said once with what was moved since the last request).
+    fn rebalance_some(&mut self) -> bool {
+        let Some(k) = self.kernel.as_deref() else { return false };
+        let moved = k.rebalance(self.model.expert_store().as_ref(), self.model.expert_cache(), REBALANCE_SLICE);
+        self.rebalanced += moved;
+        if moved == 0 && self.rebalanced > 0 {
+            if self.log {
+                eprintln!("  {} experts moved onto the GPUs while idle, in place of their least used ({} so far)", self.rebalanced, k.moved());
+            }
+            self.rebalanced = 0;
+        }
+        moved > 0
+    }
+
     pub(crate) fn run(mut self, jobs: std::sync::mpsc::Receiver<crate::engine::Job>) {
         use crate::engine::{Event, Finish};
         use std::sync::mpsc::TryRecvError;
@@ -152,9 +171,19 @@ impl Engine {
                     Err(TryRecvError::Disconnected) => break,
                 }
             } else {
-                match jobs.recv() {
+                // then, with nothing asked, the cards take RAM's most used experts in place of their least used
+                match jobs.try_recv() {
                     Ok(job) => job,
-                    Err(_) => break,
+                    Err(TryRecvError::Empty) => {
+                        if self.rebalance_some() {
+                            continue;
+                        }
+                        match jobs.recv() {
+                            Ok(job) => job,
+                            Err(_) => break,
+                        }
+                    }
+                    Err(TryRecvError::Disconnected) => break,
                 }
             };
             if job.wipe {
@@ -191,16 +220,26 @@ impl Engine {
         let started = std::time::Instant::now();
         // OAIY_DSV41_PROFILE: where the prompt's and the reply's time went (`dsv41::profile`), and what each read
         let profiling = self.log && std::env::var_os("OAIY_DSV41_PROFILE").is_some();
-        let read_so_far = |m: &dsv41::model::Model| {
+        let kernel = self.kernel.clone();
+        let read_so_far = move |m: &dsv41::model::Model| {
             let st = m.expert_cache().stats();
-            (st.bytes_read, st.hits, st.misses)
+            let tier = kernel.as_ref().map_or((0, 0, 0, 0), |k| {
+                let (_, hits, misses, admitted) = k.tier();
+                (hits, misses, admitted, k.share_hits())
+            });
+            (st.bytes_read, st.hits, st.misses, tier)
         };
-        let part = |label: &str, before: (u64, u64, u64), after: (u64, u64, u64)| {
+        type Read = (u64, u64, u64, (u64, u64, u64, u64));
+        let part = |label: &str, before: Read, after: Read| {
             eprintln!(
-                "    {label}: read {:.2} GB, {} hits / {} misses in RAM; {}; {}",
+                "    {label}: read {:.2} GB, {} hits / {} misses in RAM; the first card's tier {} hits / {} misses, {} taken in, the other cards' share {} hits; {}; {}",
                 (after.0 - before.0) as f64 / 1e9,
                 after.1 - before.1,
                 after.2 - before.2,
+                after.3 .0 - before.3 .0,
+                after.3 .1 - before.3 .1,
+                after.3 .2 - before.3 .2,
+                after.3 .3 - before.3 .3,
                 dsv41::profile::take_line(),
                 ggml_rs_wgpu::profile::take_dense_line()
             );
@@ -329,9 +368,27 @@ pub(crate) struct WgpuExperts {
     /// 32 decode steps of the same prompt (the same tokens): exclusive read 35.8 GB, inclusive 34.2. A decode step
     /// takes experts in and lets others go, and one let go was then in neither tier.
     exclusive: std::sync::atomic::AtomicBool,
-    /// The share of the experts the computer's other GPUs hold for good ([`WgpuExperts::pin_on`]).
+    /// The share of the experts the computer's other GPUs hold ([`WgpuExperts::pin_on`]).
     pinned: Option<Pinned>,
+    /// Every expert's uses since the model loaded, a call that routed to it one (a decode step, or a prompt's pass):
+    /// what [`WgpuExperts::rebalance`] ranks by. The first card's own counts are in tokens and halve as it decodes,
+    /// to choose among a prompt's; these say what a card is worth holding over a session.
+    uses: Mutex<std::collections::HashMap<(u32, u32), u32>>,
+    /// Experts the idle rebalance has moved onto the cards so far.
+    moved: std::sync::atomic::AtomicU64,
 }
+
+/// Where a card holds an expert: the first card's tier's slot, or another card's and its slot.
+#[derive(Clone, Copy)]
+enum Place {
+    First(usize),
+    Share(usize, usize),
+}
+
+/// How much more an expert in RAM must have been used than the one a card would give up for it: twice as much and
+/// [`REBALANCE_MARGIN`] more. Each move is an upload and a record read back from the drive, so two experts used about
+/// as much do not change places back and forth.
+const REBALANCE_MARGIN: u32 = 4;
 
 /// Experts the other GPUs hold for good: a fixed share of every layer's (its last ones: the RAM tier's idle reading
 /// starts from the first), each read from the drive once into a slot of its own while the server idles and never
@@ -349,6 +406,8 @@ struct Pinned {
     index: std::sync::RwLock<std::collections::HashMap<(u32, u32), (usize, usize)>>,
     /// the plan's next slot to fill
     next: std::sync::atomic::AtomicUsize,
+    /// uses of the share's experts so far (for the profile)
+    hits: std::sync::atomic::AtomicU64,
 }
 
 impl Pinned {
@@ -393,7 +452,95 @@ impl WgpuExperts {
             admit_on_decode: std::sync::atomic::AtomicBool::new(true),
             exclusive: std::sync::atomic::AtomicBool::new(false),
             pinned: None,
+            uses: Mutex::new(std::collections::HashMap::new()),
+            moved: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// While the server idles: up to `count` of the most used experts RAM holds go onto the cards, each in place of a
+    /// card's least used (or into a slot the first card has free), where it has been used twice as much and
+    /// [`REBALANCE_MARGIN`] more; the displaced expert's record is read from the drive into the place RAM has free
+    /// again. How many moved (0: the cards hold what is used most, as far as the counts say).
+    ///
+    /// Only where the tiers are exclusive (an expert in one place): the cards then hold the experts a session uses
+    /// most, whichever they turn out to be, and RAM the next most. The other cards' share starts as a fixed one (each
+    /// layer's last experts, read at start-up before anything is known of their use), and the first card's as what
+    /// the first prompts routed to; neither changes on a request's own path, where a swap is an upload of 18.9 MB and
+    /// an expert left in no tier.
+    pub(crate) fn rebalance(&self, store: &dyn oaiy_engine::store::WeightStore, cache: &oaiy_engine::ecache::Ecache, count: usize) -> usize {
+        use std::sync::atomic::Ordering;
+        if !self.exclusive.load(Ordering::Relaxed) || count == 0 {
+            return 0;
+        }
+        // what the cards hold, least used first (a free slot of the first card before any), and RAM's most used
+        let (mut held, mut wanted) = {
+            let uses = self.uses.lock().unwrap_or_else(|p| p.into_inner());
+            let of = |key: &(u32, u32)| uses.get(key).copied().unwrap_or(0);
+            let mut held: Vec<(u32, Option<(u32, u32)>, Place)> = Vec::new();
+            if let Some(r) = &self.resident {
+                let r = r.lock().unwrap_or_else(|p| p.into_inner());
+                held.extend(r.keys.iter().enumerate().map(|(i, key)| (key.as_ref().map_or(0, of), *key, Place::First(i))));
+            }
+            if let Some(p) = &self.pinned {
+                let index = p.index.read().unwrap_or_else(|e| e.into_inner());
+                held.extend(index.iter().map(|(key, &(card, slot))| (of(key), Some(*key), Place::Share(card, slot))));
+            }
+            let on_a_card: std::collections::HashSet<(u32, u32)> = held.iter().filter_map(|h| h.1).collect();
+            let mut wanted: Vec<(u32, (u32, u32))> =
+                uses.iter().filter(|(key, &n)| n > REBALANCE_MARGIN && !on_a_card.contains(key)).map(|(key, &n)| (n, *key)).collect();
+            (held, {
+                wanted.sort_unstable_by(|a, b| b.cmp(a));
+                wanted
+            })
+        };
+        held.sort_unstable_by_key(|h| (h.1.is_some(), h.0, h.1));
+        wanted.retain(|&(_, (layer, expert))| cache.probe(layer, expert));
+        let mut moved = 0;
+        for (&(n, key), &(least, old, place)) in wanted.iter().zip(&held) {
+            if moved == count || (old.is_some() && n < 2 * least + REBALANCE_MARGIN) {
+                break;
+            }
+            // the displaced one's record first: if the drive will not give it, nothing changes
+            let back = match old {
+                Some((layer, expert)) => {
+                    let mut record = vec![0u8; dsv41::expert::RECORD_BYTES];
+                    if store.fetch(layer, expert, &mut record).is_err() {
+                        continue;
+                    }
+                    Some(record)
+                }
+                None => None,
+            };
+            let Ok(record) = cache.acquire(key.0, key.1, store) else { continue };
+            match place {
+                Place::First(i) => {
+                    let mut r = self.resident.as_ref().expect("the first card's slot").lock().unwrap_or_else(|p| p.into_inner());
+                    r.put(i, key, &record);
+                }
+                Place::Share(card, slot) => {
+                    let p = self.pinned.as_ref().expect("another card's slot");
+                    p.cards[card].0.write(slot, &record);
+                    let mut index = p.index.write().unwrap_or_else(|e| e.into_inner());
+                    if let Some(old) = old {
+                        index.remove(&old);
+                    }
+                    index.insert(key, (card, slot));
+                }
+            }
+            drop(record);
+            cache.remove(key.0, key.1);
+            if let (Some((layer, expert)), Some(record)) = (old, back) {
+                let _ = cache.admit_owned(layer, expert, record);
+            }
+            moved += 1;
+        }
+        self.moved.fetch_add(moved as u64, Ordering::Relaxed);
+        moved
+    }
+
+    /// Experts the idle rebalance has moved onto the cards so far.
+    pub(crate) fn moved(&self) -> u64 {
+        self.moved.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Have `gpus` (the computer's other cards) hold a share of the `layers * per_layer` routed experts for good, as
@@ -412,7 +559,7 @@ impl WgpuExperts {
             }
         }
         if total > 0 {
-            self.pinned = Some(Pinned { cards, layers, per_layer, total, index: Default::default(), next: Default::default() });
+            self.pinned = Some(Pinned { cards, layers, per_layer, total, index: Default::default(), next: Default::default(), hits: Default::default() });
         }
         total
     }
@@ -431,6 +578,11 @@ impl WgpuExperts {
     /// Whether `(layer, expert)` is one of the share the other GPUs hold for good (filled yet or not).
     pub(crate) fn pins(&self, layer: u32, expert: u32) -> bool {
         self.pinned.as_ref().is_some_and(|p| p.slot(layer, expert).is_some())
+    }
+
+    /// Uses of the other GPUs' share so far.
+    pub(crate) fn share_hits(&self) -> u64 {
+        self.pinned.as_ref().map_or(0, |p| p.hits.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// The experts the other GPUs hold so far.
@@ -481,9 +633,14 @@ impl WgpuExperts {
         last < p.total
     }
 
-    /// Keep what comes in out of the RAM tier, or in both (the default).
+    /// Keep what comes in out of the RAM tier (an expert in one place: the first card's tier then takes in only what
+    /// a free slot holds as requests go, and changes by [`Self::rebalance`] while the server idles), or in both (as
+    /// made: the tier replaces its least used as it goes).
     pub(crate) fn set_exclusive(&self, on: bool) {
         self.exclusive.store(on, std::sync::atomic::Ordering::Relaxed);
+        if let Some(r) = &self.resident {
+            r.lock().unwrap_or_else(|p| p.into_inner()).replaces = !on;
+        }
     }
 
     /// Let a decode step's misses come in, or not (to measure what their uploads cost).
@@ -540,8 +697,18 @@ impl dsv41::expert::ExpertsKernel for WgpuExperts {
     }
 
     fn holds(&self, layer: u32, experts: &[u32], tokens: &[usize]) -> Vec<bool> {
-        // the other cards' share is held without being counted; the first card's tier counts and holds of the rest
+        {
+            let mut uses = self.uses.lock().unwrap_or_else(|p| p.into_inner());
+            for &e in experts {
+                let n = uses.entry((layer, e)).or_insert(0);
+                *n = n.saturating_add(1);
+            }
+        }
+        // the other cards' share is held without being counted there; the first card's tier counts and holds of the rest
         let there = self.pinned_now(layer, experts);
+        if let Some(p) = &self.pinned {
+            p.hits.fetch_add(there.iter().flatten().count() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         let (rest, rest_tokens): (Vec<u32>, Vec<usize>) = experts.iter().zip(tokens).zip(&there).filter(|(_, at)| at.is_none()).map(|((&e, &n), _)| (e, n)).unzip();
         let mut of_rest = match &self.resident {
             Some(r) => r.lock().unwrap_or_else(|p| p.into_inner()).holds(layer, &rest, &rest_tokens),
@@ -639,6 +806,10 @@ struct Resident {
     hits: u64,
     misses: u64,
     admitted: u64,
+    /// Whether a full tier replaces its least used with what is used more as requests go (the tiers inclusive: what
+    /// it lets go is still in RAM), or changes only by [`WgpuExperts::rebalance`] (exclusive: what it let go on a
+    /// request's path would be in no tier).
+    replaces: bool,
 }
 
 impl Resident {
@@ -656,6 +827,7 @@ impl Resident {
             hits: 0,
             misses: 0,
             admitted: 0,
+            replaces: true,
         }
     }
 
@@ -687,25 +859,37 @@ impl Resident {
             .collect()
     }
 
-    /// The slot to fill next: an empty one, else the least used (of equals, the longest unused).
-    fn victim(&self) -> usize {
+    /// The slot to fill next: an empty one, else (where the tier replaces as it goes) the least used, of equals the
+    /// longest unused.
+    fn victim(&self) -> Option<usize> {
         if let Some(i) = self.keys.iter().position(Option::is_none) {
-            return i;
+            return Some(i);
         }
-        (0..self.keys.len()).min_by_key(|&i| (self.keys[i].map_or(0, |k| self.freq(k)), self.last[i])).expect("a slot")
+        if !self.replaces {
+            return None;
+        }
+        (0..self.keys.len()).min_by_key(|&i| (self.keys[i].map_or(0, |k| self.freq(k)), self.last[i]))
     }
 
-    /// Take in `key`'s record if it is not held and is used more than what it would replace (a tie keeps the resident
-    /// one: each swap is an upload).
+    /// Take in `key`'s record if it is not held and a slot is free, or (where the tier replaces as it goes) it is used
+    /// more than what it would replace (a tie keeps the resident one: each swap is an upload).
     fn admit(&mut self, key: (u32, u32), record: &[u8]) -> bool {
         if self.index.contains_key(&key) {
             return false;
         }
-        let i = self.victim();
+        let Some(i) = self.victim() else { return false };
         if let Some(old) = self.keys[i] {
             if self.freq(old) >= self.freq(key) {
                 return false;
             }
+        }
+        self.put(i, key, record);
+        true
+    }
+
+    /// `key`'s record into slot `i`, in place of what it held.
+    fn put(&mut self, i: usize, key: (u32, u32), record: &[u8]) {
+        if let Some(old) = self.keys[i] {
             self.index.remove(&old);
         }
         self.slots.write(i, record);
@@ -713,7 +897,6 @@ impl Resident {
         self.index.insert(key, i);
         self.last[i] = self.clock;
         self.admitted += 1;
-        true
     }
 
     fn pass_done(&mut self, tokens: usize, cache: &oaiy_engine::ecache::Ecache, store: &dyn oaiy_engine::store::WeightStore, exclusive: bool) {
@@ -896,6 +1079,95 @@ mod tests {
     fn gpu() -> WgpuBackend {
         let gb: u64 = std::env::var("DSV41_WEBGPU_GB").ok().and_then(|v| v.parse().ok()).unwrap_or(27);
         WgpuBackend::new(Some(gb << 30)).expect("a WebGPU adapter")
+    }
+
+    /// A store whose record for `(layer, expert)` is made from the two numbers: nibbles from a generator they seed,
+    /// scales of a real record's size.
+    struct Made;
+
+    impl oaiy_engine::store::WeightStore for Made {
+        fn record_bytes(&self) -> usize {
+            dsv41::expert::RECORD_BYTES
+        }
+        fn shape(&self) -> (u32, u32) {
+            (2, 64)
+        }
+        fn fetch(&self, layer: u32, expert: u32, dst: &mut [u8]) -> oaiy_engine::Result<()> {
+            let mut s = (0x9E37_79B9_7F4A_7C15u64 ^ ((layer as u64) << 32 | expert as u64)).wrapping_mul(0x2545_F491_4F6C_DD1D) | 1;
+            let scales = dsv41::expert::S1.start;
+            for (i, chunk) in dst.chunks_mut(8).enumerate() {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                for (j, b) in chunk.iter_mut().enumerate() {
+                    let byte = (s >> (8 * j)) as u8;
+                    *b = if i * 8 + j < scales { byte } else { 118 + byte % 4 };
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// While the server idles the card takes RAM's most used experts in place of its least used, each in one place
+    /// before and after: on a tier of four slots, filled as a decode step's misses fill it, two experts used ten
+    /// times as much as two of the card's change places with them, the displaced two are in RAM again with their own
+    /// records, one used a little stays where it is, and what the card then computes for one it took in is what that
+    /// expert's record gives. Nothing comes in on a request's path once the tier is full.
+    #[test]
+    #[ignore = "needs a WebGPU adapter (some 700 MB of it)"]
+    fn an_idle_rebalance_gives_the_card_the_most_used_experts_and_ram_the_displaced() {
+        use dsv41::expert::{ExpertJob, ExpertsKernel, DIM, RECORD_BYTES};
+        use oaiy_engine::store::WeightStore;
+        let record = RECORD_BYTES as u64;
+        let b = WgpuBackend::new(Some(dsv41::moe::GPU_GROUP as u64 * record + MARGIN + 4 * record + record / 2)).expect("a WebGPU adapter");
+        let k = WgpuExperts::new(&b).unwrap();
+        assert_eq!(k.tier().0, 4, "a tier of four slots");
+        k.set_exclusive(true);
+        let (store, cache) = (Made, oaiy_engine::ecache::Ecache::new(8 * RECORD_BYTES, RECORD_BYTES, oaiy_engine::CachePolicy::Lfru));
+        // experts 0 to 3 come in as a decode step's misses do, and leave RAM
+        for e in 0..4u32 {
+            let lease = cache.acquire(0, e, &store).unwrap();
+            assert_eq!(k.holds(0, &[e], &[1]), [false]);
+            assert_eq!(k.offer(0, &[(e, &lease[..])]), [e]);
+            drop(lease);
+            assert!(cache.remove(0, e));
+        }
+        assert_eq!(k.holds(0, &[0, 1, 2, 3], &[1; 4]), [true; 4]);
+        // a fifth does not, the tier full: a swap on a request's path would leave what it let go in no tier
+        let lease = cache.acquire(0, 4, &store).unwrap();
+        assert_eq!(k.holds(0, &[4], &[1]), [false]);
+        assert!(k.offer(0, &[(4, &lease[..])]).is_empty());
+        drop(lease);
+        // 4 and 5 are then used twenty times (and 1, which the card holds), 6 three times; 5 and 6 are in RAM too
+        for _ in 0..20 {
+            k.holds(0, &[1, 4, 5], &[1; 3]);
+        }
+        for _ in 0..3 {
+            k.holds(0, &[6], &[1]);
+        }
+        drop(cache.acquire(0, 5, &store).unwrap());
+        drop(cache.acquire(0, 6, &store).unwrap());
+        assert_eq!(k.rebalance(&store, &cache, 8), 2, "4 and 5 in place of two of the card's least used");
+        assert_eq!(k.holds(0, &[1, 4, 5, 6], &[1; 4]), [true, true, true, false]);
+        assert!(!cache.probe(0, 4) && !cache.probe(0, 5) && cache.probe(0, 6), "what the card took in is not in RAM too");
+        let out: Vec<u32> = [0u32, 2, 3].into_iter().filter(|&e| !k.holds(0, &[e], &[1])[0]).collect();
+        assert_eq!(out.len(), 2, "two of the three used least gave way: {out:?}");
+        for &e in &out {
+            assert!(cache.probe(0, e), "a displaced expert is in RAM again");
+            let mut own = vec![0u8; RECORD_BYTES];
+            store.fetch(0, e, &mut own).unwrap();
+            assert!(cache.acquire(0, e, &store).unwrap()[..] == own[..], "with its own record");
+        }
+        // what the card computes for one it took in is what its record gives
+        let x: Vec<f32> = (0..DIM).map(|i| ((i * 37 % 101) as f32 - 50.0) / 80.0).collect();
+        let weights = [0.3f32];
+        let held = k.forward_held(0, &[(4, &x[..], &weights[..])], 10.0).pop().unwrap();
+        let mut own = vec![0u8; RECORD_BYTES];
+        store.fetch(0, 4, &mut own).unwrap();
+        let fresh = k.forward(&[ExpertJob { record: &own, x: &x, weights: &weights }], 10.0).pop().unwrap();
+        assert!(held == fresh && held.iter().any(|v| *v != 0.0), "the slot holds expert 4's record");
+        assert_eq!(k.rebalance(&store, &cache, 8), 0, "and then there is nothing to move");
+        assert_eq!(k.moved(), 2);
     }
 
     /// The trunk and a prompt's busy experts on the GPU give the CPU model's answer: on a prompt long enough for experts

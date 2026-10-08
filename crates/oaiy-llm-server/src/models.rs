@@ -668,10 +668,14 @@ impl Models {
                         // named; OAIY_NO_SPLIT: none) hold a share of the experts for good.
                         let others: Vec<Arc<ggml_rs_wgpu::WgpuBackend>> = crate::backend::others(o, &devices, b).into_iter().map(Arc::new).collect();
                         let pinned = k.pin_on(&others, model.cfg.n_layers, model.cfg.n_routed_experts);
+                        // An expert in one place: the 15,360 are 290 GB, and what a card holds RAM need not. The cards
+                        // then change what they hold only while the server idles (OAIY_DSV41_INCLUSIVE: as before, the
+                        // first card's tier replacing as it goes and RAM holding its experts too).
+                        k.set_exclusive(std::env::var_os("OAIY_DSV41_INCLUSIVE").is_none());
                         let k = Arc::new(k);
                         model.set_experts_kernel(Some(Arc::clone(&k) as Arc<dyn dsv41::expert::ExpertsKernel>));
                         kernel = Some(k);
-                        let share = if pinned > 0 { format!(", {pinned} more on the other GPU{} for good (read while idle)", if others.len() > 1 { "s" } else { "" }) } else { String::new() };
+                        let share = if pinned > 0 { format!(", {pinned} more on the other GPU{} (read while idle)", if others.len() > 1 { "s" } else { "" }) } else { String::new() };
                         format!("a prompt's busy experts ({n} at a time) and {kept} experts kept there between requests{share}; the rest on the CPU")
                     }
                     None => "no room left there for experts; they run on the CPU".into(),
