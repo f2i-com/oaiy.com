@@ -186,15 +186,24 @@ impl Moe {
     /// `x`: `[t, dim]` (bf16 values); returns `[t, dim]` bf16 and the routes taken.
     pub fn forward(&self, cfg: &Config, x: &[f32], t: usize, experts: &Experts) -> Result<(Vec<f32>, Vec<Route>)> {
         let d = cfg.dim;
-        // The router's and the shared expert's projections of x, together.
-        let [w1, _, w3] = &self.shared;
-        let [logits, gate, up]: [Vec<f32>; 3] = crate::linear::forward_together(&[
-            (&self.gate, x, t, 0..self.gate.n(), Out::F32),
-            (w1, x, t, 0..w1.n(), Out::Bf16),
-            (w3, x, t, 0..w3.n(), Out::Bf16),
-        ])
-        .try_into()
-        .expect("three projections");
+        let [w1, w2, w3] = &self.shared;
+        // A decode step's shared expert whole and the router's logits in one call, where a device holds them (its
+        // down projection was a round trip of its own, a layer); else the router's and the shared expert's
+        // projections of x together, and its down projection after the routed experts.
+        let whole = (t == 1).then(|| crate::linear::gated_together(w1, w3, w2, x, cfg.swiglu_limit, &[(&self.gate, x, 0..self.gate.n(), Out::F32)])).flatten();
+        let (logits, shared_parts, shared_whole) = match whole {
+            Some((shared, mut logits)) => (logits.pop().expect("the router's logits"), None, Some(shared)),
+            None => {
+                let [logits, gate, up]: [Vec<f32>; 3] = crate::linear::forward_together(&[
+                    (&self.gate, x, t, 0..self.gate.n(), Out::F32),
+                    (w1, x, t, 0..w1.n(), Out::Bf16),
+                    (w3, x, t, 0..w3.n(), Out::Bf16),
+                ])
+                .try_into()
+                .expect("three projections");
+                (logits, Some((gate, up)), None)
+            }
+        };
         let routes = route(cfg, &logits, &self.bias, t);
         let mut y = vec![0.0f32; t * d];
         let mut used: Vec<u32> = routes.iter().flat_map(|r| r.experts.iter().copied()).collect();
@@ -290,7 +299,11 @@ impl Moe {
                 }
             }
         }
-        let shared = self.shared_forward(cfg, &gate, &up, t);
+        let shared = match (shared_whole, shared_parts) {
+            (Some(shared), _) => shared,
+            (None, Some((gate, up))) => self.shared_forward(cfg, &gate, &up, t),
+            (None, None) => unreachable!("the shared expert is made one way or the other"),
+        };
         for (acc, v) in y.iter_mut().zip(shared) {
             *acc = to_bf16(*acc + v);
         }

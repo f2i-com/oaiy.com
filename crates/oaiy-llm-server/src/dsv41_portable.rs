@@ -32,6 +32,28 @@ impl DenseKernel for WgpuDense {
             .collect();
         Some(ggml_rs_wgpu::dense::forward_batch(&batch?))
     }
+
+    /// The unit and the others on this adapter in one submit, the SwiGLU on the device
+    /// ([`ggml_rs_wgpu::dense::forward_units`]).
+    fn forward_gated(
+        &self,
+        up: &dyn DenseKernel,
+        down: &dyn DenseKernel,
+        x: &[f32],
+        limit: f32,
+        others: &[(&dyn DenseKernel, &[f32], std::ops::Range<usize>)],
+    ) -> Option<(Vec<f32>, Vec<Vec<f32>>)> {
+        let here = |k: &dyn DenseKernel| -> Option<Arc<DenseGpu>> {
+            let w = &(k as &dyn std::any::Any).downcast_ref::<WgpuDense>()?.0;
+            w.same_device(&self.0).then(|| Arc::clone(w))
+        };
+        let (up, down) = (here(up)?, here(down)?);
+        let held: Vec<Arc<DenseGpu>> = others.iter().map(|(k, ..)| here(*k)).collect::<Option<_>>()?;
+        let with: Vec<(&DenseGpu, &[f32], std::ops::Range<usize>)> = held.iter().zip(others).map(|(w, (_, x, rows))| (&**w, *x, rows.clone())).collect();
+        let unit = ggml_rs_wgpu::dense::Unit { gate: &self.0, up: &up, down: &down, x, weight: 1.0 };
+        let (mut downs, sums) = ggml_rs_wgpu::dense::forward_units(&[unit], &with, limit)?;
+        Some((downs.pop()?, sums))
+    }
 }
 
 /// The tokens one forward pass reads of a prompt. A pass reads each layer's experts once for all its tokens, so a
@@ -662,8 +684,11 @@ impl WgpuExperts {
     }
 }
 
-/// Experts whose records are in `slots`, `(slot, x, weights)` each: every one's gate and up in one submit, the SwiGLU on
-/// the host as dsv41 takes it, then every down in another.
+/// Experts whose records are in `slots`, `(slot, x, weights)` each. A decode step's (one row each): all of it in one
+/// submit, the SwiGLU between an expert's projections made on the device ([`ggml_rs_wgpu::dense::forward_units`]). A
+/// prompt's rows: every one's gate and up in one submit, the SwiGLU on the host as dsv41 takes it, then every down in
+/// another; a step's went that way too, two round trips a card a layer, and once the cards held most of a step's
+/// experts that was what the step waited for.
 fn run(slots: &RecordSlots, picks: &[(usize, &[f32], &[f32])], swiglu_limit: f32) -> Vec<Vec<f32>> {
     use dsv41::expert::{BLOCK, DIM, INTER, S1, S2, S3, W1, W2, W3};
     use dsv41::formats::{fake_quant_fp8, to_bf16};
@@ -672,9 +697,25 @@ fn run(slots: &RecordSlots, picks: &[(usize, &[f32], &[f32])], swiglu_limit: f32
         .iter()
         .map(|&(i, ..)| [slots.mxfp4(i, W1.start, S1.start, INTER, DIM), slots.mxfp4(i, W3.start, S3.start, INTER, DIM), slots.mxfp4(i, W2.start, S2.start, DIM, INTER)])
         .collect();
-    let xq: Vec<Vec<f32>> = picks.iter().map(|(_, x, _)| fake_quant_fp8(x, BLOCK)).collect();
+    // Each input quantized once, however many experts take it (a decode step's all take the token's one row: quantized
+    // for each, it was most of the host's part of the call, and each copy an upload of its own).
+    let mut quantized: Vec<(*const f32, usize, Vec<f32>)> = Vec::new();
+    for (_, x, _) in picks {
+        if !quantized.iter().any(|(at, len, _)| (*at, *len) == (x.as_ptr(), x.len())) {
+            quantized.push((x.as_ptr(), x.len(), fake_quant_fp8(x, BLOCK)));
+        }
+    }
+    let xq: Vec<&[f32]> = picks.iter().map(|(_, x, _)| &quantized.iter().find(|(at, len, _)| (*at, *len) == (x.as_ptr(), x.len())).expect("quantized above").2[..]).collect();
+    if rows.iter().all(|&r| r == 1) {
+        let units: Vec<ggml_rs_wgpu::dense::Unit<'_>> = (0..picks.len())
+            .map(|i| ggml_rs_wgpu::dense::Unit { gate: &mats[i][0], up: &mats[i][1], down: &mats[i][2], x: xq[i], weight: picks[i].2[0] })
+            .collect();
+        if let Some((downs, _)) = ggml_rs_wgpu::dense::forward_units(&units, &[], swiglu_limit) {
+            return downs.into_iter().map(|y| y.into_iter().map(to_bf16).collect()).collect();
+        }
+    }
     let items: Vec<(&DenseGpu, &[f32], usize, std::ops::Range<usize>)> =
-        (0..picks.len()).flat_map(|i| [(&mats[i][0], xq[i].as_slice(), rows[i], 0..INTER), (&mats[i][1], xq[i].as_slice(), rows[i], 0..INTER)]).collect();
+        (0..picks.len()).flat_map(|i| [(&mats[i][0], xq[i], rows[i], 0..INTER), (&mats[i][1], xq[i], rows[i], 0..INTER)]).collect();
     let sums = ggml_rs_wgpu::dense::forward_batch(&items);
     let hq: Vec<Vec<f32>> =
         sums.chunks(2).zip(picks).map(|(p, (_, _, w))| fake_quant_fp8(&dsv41::expert::swiglu(&p[0], &p[1], Some(w), swiglu_limit), BLOCK)).collect();
@@ -1105,6 +1146,57 @@ mod tests {
                 }
             }
             Ok(())
+        }
+    }
+
+    /// A decode step's experts in one submit, the SwiGLU between an expert's projections on the device, give what the
+    /// two calls with the SwiGLU on the host give: on six records and a row each, nearly every one of the 30,720
+    /// outputs the same bf16 value, and the rest a few bf16 steps away (the device's exponential is not the host's to
+    /// the bit, and a rounding of the activation can then go the other way), none far off.
+    #[test]
+    #[ignore = "needs a WebGPU adapter (some 700 MB of it)"]
+    fn a_steps_experts_in_one_submit_give_the_two_calls_outputs_but_for_a_rounding() {
+        use dsv41::expert::{BLOCK, DIM, INTER, RECORD_BYTES, S1, S2, S3, W1, W2, W3};
+        use dsv41::formats::{fake_quant_fp8, to_bf16};
+        use ggml_rs_wgpu::dense::{forward_batch, forward_units, Unit};
+        use oaiy_engine::store::WeightStore;
+        let b = WgpuBackend::new(Some(1 << 30)).expect("a WebGPU adapter");
+        let slots = b.record_slots(6, RECORD_BYTES).unwrap();
+        let mut record = vec![0u8; RECORD_BYTES];
+        for e in 0..6 {
+            Made.fetch(1, e as u32, &mut record).unwrap();
+            slots.write(e, &record);
+        }
+        let mats: Vec<[DenseGpu; 3]> =
+            (0..6).map(|i| [slots.mxfp4(i, W1.start, S1.start, INTER, DIM), slots.mxfp4(i, W3.start, S3.start, INTER, DIM), slots.mxfp4(i, W2.start, S2.start, DIM, INTER)]).collect();
+        let xs: Vec<Vec<f32>> = (0..6).map(|e| fake_quant_fp8(&(0..DIM).map(|i| (((i * 37 + e * 11) % 101) as f32 - 50.0) / 60.0).collect::<Vec<f32>>(), BLOCK)).collect();
+        let weights: Vec<f32> = (0..6).map(|e| 0.05 + 0.07 * e as f32).collect();
+        for limit in [10.0f32, 0.0] {
+            // the two calls, the SwiGLU on the host between them
+            let items: Vec<(&DenseGpu, &[f32], usize, std::ops::Range<usize>)> = (0..6).flat_map(|i| [(&mats[i][0], &xs[i][..], 1, 0..INTER), (&mats[i][1], &xs[i][..], 1, 0..INTER)]).collect();
+            let sums = forward_batch(&items);
+            let hq: Vec<Vec<f32>> = sums.chunks(2).zip(&weights).map(|(p, w)| fake_quant_fp8(&dsv41::expert::swiglu(&p[0], &p[1], Some(&[*w]), limit), BLOCK)).collect();
+            let items: Vec<(&DenseGpu, &[f32], usize, std::ops::Range<usize>)> = (0..6).map(|i| (&mats[i][2], &hq[i][..], 1, 0..DIM)).collect();
+            let want: Vec<Vec<f32>> = forward_batch(&items).into_iter().map(|y| y.into_iter().map(to_bf16).collect()).collect();
+            // one submit
+            let units: Vec<Unit<'_>> = (0..6).map(|i| Unit { gate: &mats[i][0], up: &mats[i][1], down: &mats[i][2], x: &xs[i], weight: weights[i] }).collect();
+            let (got, none) = forward_units(&units, &[], limit).expect("six experts fit the arena");
+            assert!(none.is_empty());
+            let got: Vec<Vec<f32>> = got.into_iter().map(|y| y.into_iter().map(to_bf16).collect()).collect();
+            let steps = |v: f32| (v.to_bits() >> 16) as i64 * if v < 0.0 { -1 } else { 1 };
+            let (mut same, mut worst, mut far) = (0usize, 0i64, 0.0f32);
+            let scale = want.iter().flatten().fold(0.0f32, |m, v| m.max(v.abs()));
+            for (g, w) in got.iter().flatten().zip(want.iter().flatten()) {
+                if g.to_bits() == w.to_bits() {
+                    same += 1;
+                } else {
+                    worst = worst.max((steps(*g) - steps(*w)).abs());
+                    far = far.max((g - w).abs());
+                }
+            }
+            eprintln!("limit {limit}: {same} of {} outputs the same; the rest at most {worst} bf16 steps away ({far:.3e} of a largest {scale:.3e})", 6 * DIM);
+            assert!(scale > 0.0 && same * 100 >= 6 * DIM * 97, "{same} the same");
+            assert!(far <= scale * 0.01, "an output {far} away of a largest {scale}");
         }
     }
 

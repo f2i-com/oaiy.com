@@ -51,6 +51,68 @@ pub trait DenseKernel: Send + Sync + std::any::Any {
         let _ = items;
         None
     }
+
+    /// A gated unit in one call of this kernel's kind (a GPU's: one submit, one round trip), this kernel its gate:
+    /// the sums of `x` (one row, quantized already) against it and against `up`, their SwiGLU (each sum rounded to
+    /// bf16 and clamped at `limit`, `silu(gate) * up` rounded to bf16) quantized to fp8 as `down` takes its input, and
+    /// the sums of that against `down`; and with them `others`' sums of one row each. `(down's sums, the others')`,
+    /// or None when it cannot (another kind among them), and the caller makes each projection on its own.
+    #[allow(clippy::type_complexity)]
+    fn forward_gated(
+        &self,
+        up: &dyn DenseKernel,
+        down: &dyn DenseKernel,
+        x: &[f32],
+        limit: f32,
+        others: &[(&dyn DenseKernel, &[f32], std::ops::Range<usize>)],
+    ) -> Option<(Vec<f32>, Vec<Vec<f32>>)> {
+        let _ = (up, down, x, limit, others);
+        None
+    }
+}
+
+/// A token's fp8 gated unit (the shared expert: `gate` and `up` of `x`, the SwiGLU of the two clamped at `limit`,
+/// `down` of it, rounded to bf16) and `others`' [`Weight::forward_rows`] of one row each (`(weight, x, rows, out)`),
+/// in one call where a device holds them all and takes them together ([`DenseKernel::forward_gated`]); None where it
+/// does not, and the caller makes them as before. The unit's roundings are the reference's at the same points; where
+/// a device makes the SwiGLU its exponential is its own, so an element now and then is a bf16 step from the host's.
+#[allow(clippy::type_complexity)]
+pub fn gated_together(gate: &Weight, up: &Weight, down: &Weight, x: &[f32], limit: f32, others: &[(&Weight, &[f32], std::ops::Range<usize>, Out)]) -> Option<(Vec<f32>, Vec<Vec<f32>>)> {
+    fn fp8(w: &Weight) -> Option<&dyn DenseKernel> {
+        if let Weight::Device { kernel, fp8: true, .. } = w {
+            Some(&**kernel)
+        } else {
+            None
+        }
+    }
+    let (g, u, d) = (fp8(gate)?, fp8(up)?, fp8(down)?);
+    let kernels: Vec<&dyn DenseKernel> = others.iter().map(|(w, ..)| if let Weight::Device { kernel, .. } = w { Some(&**kernel) } else { None }).collect::<Option<_>>()?;
+    assert_eq!(x.len(), gate.k(), "linear: input is not [1, k]");
+    assert!(gate.k() == up.k() && gate.n() == up.n() && gate.n() == down.k(), "linear: a gated unit's projections do not fit each other");
+    let (xq, _) = gate.prepare(x, Out::Bf16);
+    let prepared: Vec<(Vec<f32>, Out)> = others
+        .iter()
+        .map(|(w, x, rows, out)| {
+            assert_eq!(x.len(), w.k(), "linear: input is not [1, k]");
+            assert!(rows.end <= w.n(), "linear: row range past the weight");
+            w.prepare(x, *out)
+        })
+        .collect();
+    let with: Vec<(&dyn DenseKernel, &[f32], std::ops::Range<usize>)> = kernels.iter().zip(others).zip(&prepared).map(|((k, (_, _, rows, _)), (x, _))| (*k, x.as_slice(), rows.clone())).collect();
+    let start = std::time::Instant::now();
+    let (mut y, mut ys) = g.forward_gated(u, d, &xq, limit, &with)?;
+    crate::profile::add(crate::profile::Part::DeviceDense, start);
+    for v in y.iter_mut() {
+        *v = to_bf16(*v);
+    }
+    for (y, (_, out)) in ys.iter_mut().zip(&prepared) {
+        if *out == Out::Bf16 {
+            for v in y.iter_mut() {
+                *v = to_bf16(*v);
+            }
+        }
+    }
+    Some((y, ys))
 }
 
 /// Several weights' [`Weight::forward_rows`] at once, each `(weight, x, t, rows, out)`'s result in order and the same
@@ -60,16 +122,25 @@ pub fn forward_together(items: &[(&Weight, &[f32], usize, std::ops::Range<usize>
     let kernels: Option<Vec<&dyn DenseKernel>> =
         items.iter().map(|(w, ..)| if let Weight::Device { kernel, .. } = w { Some(&**kernel) } else { None }).collect();
     if let Some(kernels) = kernels.filter(|k| k.len() > 1) {
-        let prepared: Vec<(Vec<f32>, Out)> = items
+        // Each input as its weights take it, made once for the weights that take it the same way (the queries' and the
+        // window's projections both quantize a layer's x, the shared expert's gate and up likewise: quantized for each,
+        // it was a tenth of a millisecond a layer, and each copy an upload of its own).
+        let mut made: Vec<((*const f32, usize, bool), Vec<f32>)> = Vec::new();
+        let prepared: Vec<(usize, Out)> = items
             .iter()
             .map(|(w, x, t, rows, out)| {
                 assert_eq!(x.len(), t * w.k(), "linear: input is not [t, k]");
                 assert!(rows.end <= w.n(), "linear: row range past the weight");
-                w.prepare(x, *out)
+                let key = (x.as_ptr(), x.len(), w.quantizes());
+                let at = made.iter().position(|(k, _)| *k == key).unwrap_or_else(|| {
+                    made.push((key, w.prepare(x, *out).0));
+                    made.len() - 1
+                });
+                (at, if w.quantizes() { Out::Bf16 } else { *out })
             })
             .collect();
         let many: Vec<(&dyn DenseKernel, &[f32], usize, std::ops::Range<usize>)> =
-            kernels.iter().zip(items).zip(&prepared).map(|((k, (_, _, t, rows, _)), (x, _))| (*k, x.as_slice(), *t, rows.clone())).collect();
+            kernels.iter().zip(items).zip(&prepared).map(|((k, (_, _, t, rows, _)), (at, _))| (*k, made[*at].1.as_slice(), *t, rows.clone())).collect();
         let start = std::time::Instant::now();
         if let Some(mut ys) = kernels[0].forward_many(&many) {
             crate::profile::add(crate::profile::Part::DeviceDense, start);
@@ -178,12 +249,18 @@ impl Weight {
         self.forward_rows(x, t, 0..self.n(), out)
     }
 
+    /// Whether this weight takes its activation quantized to fp8 (and gives its result in bf16): an fp8 weight.
+    fn quantizes(&self) -> bool {
+        matches!(self, Weight::Fp8 { .. } | Weight::Device { fp8: true, .. })
+    }
+
     /// The activation as this weight takes it, and the rounding of its result: an fp8 weight's quantized and its
     /// result bf16, as the reference does.
     fn prepare(&self, x: &[f32], out: Out) -> (Vec<f32>, Out) {
-        match self {
-            Weight::Fp8 { .. } | Weight::Device { fp8: true, .. } => (fake_quant_fp8(x, FP8_BLOCK), Out::Bf16),
-            _ => (x.to_vec(), out),
+        if self.quantizes() {
+            (fake_quant_fp8(x, FP8_BLOCK), Out::Bf16)
+        } else {
+            (x.to_vec(), out)
         }
     }
 

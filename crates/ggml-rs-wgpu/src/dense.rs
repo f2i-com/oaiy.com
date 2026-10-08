@@ -384,6 +384,8 @@ pub(crate) struct Arena {
     /// bytes from one dispatch's parameters to the next's (the device's alignment of a uniform's offset)
     step: u32,
     groups: std::collections::HashMap<wgpu::Buffer, wgpu::BindGroup>,
+    /// [`SWIGLU`]'s bind group: the results read, the inputs written.
+    stage: Option<wgpu::BindGroup>,
 }
 
 /// The most a call's inputs, and its results, may hold to go through the [`Arena`] (bytes), and its most dispatches.
@@ -418,7 +420,25 @@ impl Arena {
             params: buffer("oaiy-dense-arena-params", ARENA_DISPATCHES as u64 * step as u64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST),
             step,
             groups: std::collections::HashMap::new(),
+            stage: None,
         }
+    }
+
+    /// [`SWIGLU`]'s bind group, made the first time it is asked for.
+    fn stage(&mut self, gpu: &Gpu) -> &wgpu::BindGroup {
+        let Arena { layout, x, y, params, stage, .. } = self;
+        stage.get_or_insert_with(|| {
+            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("oaiy-dense-arena-stage"),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: y.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: gpu.dummy().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: x.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: params, offset: 0, size: std::num::NonZeroU64::new(PARAM_BYTES) }) },
+                ],
+            })
+        })
     }
 
     /// `weights`' bind group, made the first time it is asked for.
@@ -448,73 +468,221 @@ fn forget(gpu: &Gpu, buffers: &mut dyn Iterator<Item = &wgpu::Buffer>) {
     }
 }
 
+/// An expert of a decode step for [`forward_units`]: its gate and up projections of `x` (one row, as they take it),
+/// and the down projection of their SwiGLU times `weight` (1 where it has none).
+pub struct Unit<'a> {
+    pub gate: &'a DenseGpu,
+    pub up: &'a DenseGpu,
+    pub down: &'a DenseGpu,
+    pub x: &'a [f32],
+    pub weight: f32,
+}
+
+/// The stage between a unit's projections ([`forward_units`]), a workgroup 32 of its width (the reach of one fp8
+/// scale): the gate's and the up's sums rounded to bf16 and clamped at the limit, `silu(gate) * up * weight` rounded
+/// to bf16, and that quantized to fp8 as the reference quantizes an activation (a power-of-two scale from the 32's
+/// largest, each value rounded to nearest even on the e4m3 grid), which is what the down projection multiplies. The
+/// roundings are the host's to the bit (integer steps on the values' bits, products by powers of two); the
+/// exponential and the division are the device's own, so a result now and then is a bf16 step from the host's.
+/// `p[0]`: where the gate's sums start in the results, the up's, where the activation goes in the inputs; `p[1]`: the
+/// weight's bits, the limit's (0: none).
+const SWIGLU: &str = r#"
+@group(0) @binding(0) var<storage, read> src: array<f32>;
+@group(0) @binding(2) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(3) var<uniform> p: array<vec4<u32>, 3>;
+var<workgroup> h: array<f32, 32>;
+
+// to bf16 and back: round to nearest even at bit 16
+fn bf16(v: f32) -> f32 {
+    let b = bitcast<u32>(v);
+    return bitcast<f32>((b + 0x7fffu + ((b >> 16u) & 1u)) & 0xffff0000u);
+}
+
+// to the e4m3 grid, |v| <= 448: its step 2^-9 below 2^-6 and 2^(e - 3) in the binade of 2^e
+fn e4m3(v: f32) -> f32 {
+    let a = abs(v);
+    var q = 448.0;
+    if (a < 0.015625) {
+        q = round(a * 512.0) * 0.001953125;
+    } else if (a < 448.0) {
+        let e = (bitcast<u32>(a) >> 23u) & 0xffu;
+        q = round(a * bitcast<f32>((257u - e) << 23u)) * bitcast<f32>((e - 3u) << 23u);
+    }
+    return select(q, -q, (bitcast<u32>(v) >> 31u) == 1u);
+}
+
+@compute @workgroup_size(32)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let i = wg.x * 32u + li;
+    let weight = bitcast<f32>(p[1].x);
+    let limit = bitcast<f32>(p[1].y);
+    var g = bf16(src[p[0].x + i]);
+    var u = bf16(src[p[0].y + i]);
+    if (limit > 0.0) {
+        u = clamp(u, -limit, limit);
+        g = min(g, limit);
+    }
+    let v = bf16(g / (1.0 + exp(-g)) * u * weight);
+    h[li] = v;
+    workgroupBarrier();
+    var most = 0.0;
+    for (var l = 0u; l < 32u; l++) { most = max(most, abs(h[l])); }
+    // the scale: 2^ceil(log2(most / 448)), most at least 1e-4; its exponent, one more unless its mantissa is zero
+    let b = bitcast<u32>(max(most, 0.0001) * 0.002232142857142857);
+    let e = ((b >> 23u) & 0xffu) + select(0u, 1u, (b & 0x7fffffu) != 0u);
+    dst[p[0].z + i] = e4m3(clamp(v * bitcast<f32>((254u - e) << 23u), -448.0, 448.0)) * bitcast<f32>(e << 23u);
+}
+"#;
+
+/// A decode step's experts on one device in one submit and one read back: each unit's gate and up projections of its
+/// row, their SwiGLU quantized on the device ([`SWIGLU`]) and its down projection (its sums, f32), and with them the
+/// sums of `others` (plain weights against one row each, `(weight, x, rows)`). None when it does not go through the
+/// device's [`Arena`] (past its sizes, or OAIY_DENSE_FEW): the caller then makes the projections in calls of their own
+/// with the SwiGLU on the host between them, which was two round trips an expert's step and is what a prompt's rows
+/// still take.
+pub fn forward_units(units: &[Unit<'_>], others: &[(&DenseGpu, &[f32], Range<usize>)], limit: f32) -> Option<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+    let first = units.first().map(|u| u.gate).or(others.first().map(|o| o.0))?;
+    let gpu = &first.gpu;
+    assert!(units.iter().flat_map(|u| [u.gate, u.up, u.down]).chain(others.iter().map(|o| o.0)).all(|w| Arc::ptr_eq(&w.gpu, gpu)), "dense: a call on more than one GPU");
+    let _one = first.serial.lock().unwrap_or_else(|p| p.into_inner());
+    arena_call(gpu, others, units, limit)
+}
+
 /// [`forward_batch`] for a call whose every item is one row of x, through the device's [`Arena`]: None when it is not
 /// such a call or is past the arena's sizes (the caller then makes its own buffers).
 fn forward_in_arena(gpu: &Arc<Gpu>, items: &[(&DenseGpu, &[f32], usize, Range<usize>)]) -> Option<Vec<Vec<f32>>> {
-    if few_only() || items.iter().any(|(_, _, t, rows)| *t != 1 || rows.is_empty()) {
+    if items.iter().any(|(_, _, t, rows)| *t != 1 || rows.is_empty()) {
+        return None;
+    }
+    let plain: Vec<(&DenseGpu, &[f32], Range<usize>)> = items.iter().map(|(w, x, _, rows)| (*w, *x, rows.clone())).collect();
+    arena_call(gpu, &plain, &[], 0.0).map(|(_, sums)| sums)
+}
+
+/// A dispatch of an [`arena_call`]: the weight's buffer it reads, its kernel's kind and grid, and its parameters.
+struct Step<'a> {
+    buffer: &'a wgpu::Buffer,
+    kind: Kind,
+    grid: u32,
+    params: [u32; 12],
+}
+
+/// `w`'s dispatches for rows `rows` of it against the row at `xo` of the inputs, its sums to `yo` of the results.
+fn steps_of<'a>(w: &'a DenseGpu, rows: &Range<usize>, xo: u32, yo: u32, steps: &mut Vec<Step<'a>>) {
+    assert!(rows.end <= w.n, "dense: rows past the weight");
+    for (buffer, first, n_rows, soff, woff) in &w.chunks {
+        let (a, b) = ((*first as usize).max(rows.start), (*first as usize + *n_rows as usize).min(rows.end));
+        if a < b {
+            steps.push(Step {
+                buffer,
+                kind: w.kind,
+                grid: (b - a).div_ceil(8) as u32,
+                params: [w.k as u32, 1, *first, *n_rows, rows.start as u32, rows.len() as u32, *soff, w.kind as u32, *woff, xo, yo, 0],
+            });
+        }
+    }
+}
+
+/// One submit through the device's [`Arena`]: `plain` weights against one row each, and `units` ([`forward_units`]).
+/// The inputs go one after another (each once, however many weights take it), then each unit's activation, which
+/// [`SWIGLU`] writes; the results are each unit's gate and up sums, then what is read back: the units' down sums and
+/// `plain`'s. Three passes: the gate, up and plain projections; the units' stage; their down projections.
+fn arena_call(gpu: &Arc<Gpu>, plain: &[(&DenseGpu, &[f32], Range<usize>)], units: &[Unit<'_>], limit: f32) -> Option<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+    if few_only() || plain.iter().any(|(_, _, rows)| rows.is_empty()) {
         return None;
     }
     let making = std::time::Instant::now();
-    // each input once, however many weights take it, and where it starts (f32)
     let mut inputs: Vec<((*const f32, usize), u32)> = Vec::new();
     let mut xs: Vec<u8> = Vec::new();
-    for (w, x, ..) in items {
-        assert_eq!(x.len(), w.k, "dense: the input is not [t, k]");
-        if !inputs.iter().any(|(key, _)| *key == (x.as_ptr(), x.len())) {
-            inputs.push(((x.as_ptr(), x.len()), (xs.len() / 4) as u32));
-            xs.extend(x.iter().flat_map(|v| v.to_le_bytes()));
+    let mut place = |x: &[f32], k: usize| -> u32 {
+        assert_eq!(x.len(), k, "dense: the input is not [1, k]");
+        if let Some((_, at)) = inputs.iter().find(|(key, _)| *key == (x.as_ptr(), x.len())) {
+            return *at;
         }
+        let at = (xs.len() / 4) as u32;
+        inputs.push(((x.as_ptr(), x.len()), at));
+        xs.extend(x.iter().flat_map(|v| v.to_le_bytes()));
+        at
+    };
+    let unit_inputs: Vec<u32> = units
+        .iter()
+        .map(|u| {
+            assert!(u.gate.k == u.up.k && u.gate.n == u.up.n && u.gate.n == u.down.k && u.gate.n % 32 == 0, "dense: a unit's projections do not fit each other");
+            place(u.x, u.gate.k)
+        })
+        .collect();
+    let plain_inputs: Vec<u32> = plain.iter().map(|(w, x, _)| place(x, w.k)).collect();
+    let given = (xs.len() / 4) as u32;
+    // the inputs' buffer after what is given: each unit's activation; the results: each unit's gate and up sums, then
+    // (read back) each unit's down sums and the plain weights' sums
+    let width: u32 = units.iter().map(|u| u.gate.n as u32).sum();
+    let kept = 2 * width;
+    let (mut first, mut stage, mut last): (Vec<Step<'_>>, Vec<[u32; 12]>, Vec<Step<'_>>) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut act, mut sums, mut out) = (given, 0u32, kept);
+    for (u, &xo) in units.iter().zip(&unit_inputs) {
+        let inter = u.gate.n as u32;
+        steps_of(u.gate, &(0..u.gate.n), xo, sums, &mut first);
+        steps_of(u.up, &(0..u.up.n), xo, sums + inter, &mut first);
+        stage.push([sums, sums + inter, act, inter, u.weight.to_bits(), limit.to_bits(), 0, 0, 0, 0, 0, 0]);
+        steps_of(u.down, &(0..u.down.n), act, out, &mut last);
+        act += inter;
+        sums += 2 * inter;
+        out += u.down.n as u32;
     }
-    // each item's dispatches (a buffer of its weight that holds some of its rows): the buffer, the kind, the grid
-    let mut dispatches: Vec<(&wgpu::Buffer, Kind, u32)> = Vec::new();
-    let mut params: Vec<[u32; 12]> = Vec::new();
-    let mut results = 0u32;
-    for (w, x, _, rows) in items {
-        assert!(rows.end <= w.n, "dense: rows past the weight");
-        let xo = inputs.iter().find(|(key, _)| *key == (x.as_ptr(), x.len())).expect("every input placed").1;
-        for (buffer, first, n_rows, soff, woff) in &w.chunks {
-            let (a, b) = ((*first as usize).max(rows.start), (*first as usize + *n_rows as usize).min(rows.end));
-            if a < b {
-                dispatches.push((buffer, w.kind, (b - a).div_ceil(8) as u32));
-                params.push([w.k as u32, 1, *first, *n_rows, rows.start as u32, rows.len() as u32, *soff, w.kind as u32, *woff, xo, results, 0]);
-            }
-        }
-        results += rows.len() as u32;
+    for ((w, _, rows), &xo) in plain.iter().zip(&plain_inputs) {
+        steps_of(w, rows, xo, out, &mut first);
+        out += rows.len() as u32;
     }
-    let bytes = results as u64 * 4;
-    if xs.len() as u64 > ARENA_BYTES || bytes > ARENA_BYTES || dispatches.len() > ARENA_DISPATCHES || dispatches.is_empty() {
+    let dispatches = first.len() + stage.len() + last.len();
+    if act as u64 * 4 > ARENA_BYTES || out as u64 * 4 > ARENA_BYTES || dispatches > ARENA_DISPATCHES || first.is_empty() {
         return None;
     }
     let mut slot = gpu.dense_arena.lock().unwrap_or_else(|p| p.into_inner());
     let arena = slot.get_or_insert_with(|| Arena::new(gpu));
     let step = arena.step as usize;
-    let mut table = vec![0u8; dispatches.len() * step];
-    for (i, p) in params.iter().enumerate() {
+    let mut table = vec![0u8; dispatches * step];
+    for (i, p) in first.iter().map(|s| &s.params).chain(&stage).chain(last.iter().map(|s| &s.params)).enumerate() {
         for (j, v) in p.iter().enumerate() {
             table[i * step + 4 * j..i * step + 4 * j + 4].copy_from_slice(&v.to_le_bytes());
         }
     }
     gpu.queue().write_buffer(&arena.x, 0, &xs);
     gpu.queue().write_buffer(&arena.params, 0, &table);
+    // (the pipelines and the groups first: a pass borrows them)
     let pipelines: Vec<Arc<wgpu::ComputePipeline>> =
-        dispatches.iter().map(|&(_, kind, _)| gpu.named_pipeline_in(one_name(kind), &arena.pipeline_layout, || one_shader(kind))).collect();
-    let mut enc = gpu.device.create_command_encoder(&Default::default());
-    {
-        // (the groups first: a pass borrows them)
-        for (buffer, ..) in &dispatches {
-            arena.group(gpu, buffer);
-        }
-        let mut pass = enc.begin_compute_pass(&Default::default());
-        for (i, ((buffer, _, grid), pipeline)) in dispatches.iter().zip(&pipelines).enumerate() {
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &arena.groups[*buffer], &[(i * step) as u32]);
-            pass.dispatch_workgroups(*grid, 1, 1);
-        }
+        first.iter().chain(&last).map(|s| gpu.named_pipeline_in(one_name(s.kind), &arena.pipeline_layout, || one_shader(s.kind))).collect();
+    let swiglu = (!stage.is_empty()).then(|| gpu.named_pipeline_in("dense-swiglu", &arena.pipeline_layout, || SWIGLU.to_string()));
+    for s in first.iter().chain(&last) {
+        arena.group(gpu, s.buffer);
     }
-    enc.copy_buffer_to_buffer(&arena.y, 0, &arena.staging, 0, bytes);
+    if swiglu.is_some() {
+        arena.stage(gpu);
+    }
+    let mut enc = gpu.device.create_command_encoder(&Default::default());
+    let project = |enc: &mut wgpu::CommandEncoder, steps: &[Step<'_>], pipelines: &[Arc<wgpu::ComputePipeline>], at: usize| {
+        let mut pass = enc.begin_compute_pass(&Default::default());
+        for (i, (s, pipeline)) in steps.iter().zip(pipelines).enumerate() {
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &arena.groups[s.buffer], &[((at + i) * step) as u32]);
+            pass.dispatch_workgroups(s.grid, 1, 1);
+        }
+    };
+    project(&mut enc, &first, &pipelines[..first.len()], 0);
+    if let Some(swiglu) = &swiglu {
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(swiglu);
+            for (i, p) in stage.iter().enumerate() {
+                pass.set_bind_group(0, arena.stage.as_ref().expect("made above"), &[((first.len() + i) * step) as u32]);
+                pass.dispatch_workgroups(p[3] / 32, 1, 1);
+            }
+        }
+        project(&mut enc, &last, &pipelines[first.len()..], first.len() + stage.len());
+    }
+    let bytes = (out - kept) as u64 * 4;
+    enc.copy_buffer_to_buffer(&arena.y, kept as u64 * 4, &arena.staging, 0, bytes);
     crate::profile::add(&crate::profile::DENSE_MAKE, making);
-    for (w, _, _, rows) in items {
-        crate::profile::DENSE_BYTES[0].fetch_add(w.nbytes_of(rows.len()), Ordering::Relaxed);
+    for (w, rows) in units.iter().flat_map(|u| [(u.gate, u.gate.n), (u.up, u.up.n), (u.down, u.down.n)]).chain(plain.iter().map(|(w, _, rows)| (*w, rows.len()))) {
+        crate::profile::DENSE_BYTES[0].fetch_add(w.nbytes_of(rows), Ordering::Relaxed);
         crate::profile::DENSE_BYTES[1].fetch_add(1, Ordering::Relaxed);
     }
     let submitting = std::time::Instant::now();
@@ -524,16 +692,14 @@ fn forward_in_arena(gpu: &Arc<Gpu>, items: &[(&DenseGpu, &[f32], usize, Range<us
     let raw = gpu.map_read_soon(&arena.staging, bytes);
     crate::profile::add(&crate::profile::DENSE_WAIT, waiting);
     let mut at = 0usize;
-    Some(
-        items
-            .iter()
-            .map(|(_, _, _, rows)| {
-                let out = raw[at..at + rows.len() * 4].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-                at += rows.len() * 4;
-                out
-            })
-            .collect(),
-    )
+    let mut take = |n: usize| -> Vec<f32> {
+        let v = raw[at..at + n * 4].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        at += n * 4;
+        v
+    };
+    let downs: Vec<Vec<f32>> = units.iter().map(|u| take(u.down.n)).collect();
+    let sums: Vec<Vec<f32>> = plain.iter().map(|(_, _, rows)| take(rows.len())).collect();
+    Some((downs, sums))
 }
 
 /// A dense weight on the GPU.
