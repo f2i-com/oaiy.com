@@ -113,11 +113,18 @@ measured"; `dsv41::profile` says where a pass's time goes):
   matrices read in place with their e8m0 scales (`RecordSlots`); a prompt's MoE hands
   each record over as it is read, the busy ones to the GPU a group of 32 at a time and
   the rest to the CPU's workers meanwhile, so the reads and the matmuls overlap. What
-  the budget has left after the trunk and the slots keeps the experts used most between
-  passes, by the CUDA engine's VRAM policy (LFRU counted in tokens, aged every 128
-  steps; a prompt's most used taken in from RAM once it is read): 935 of them on a
-  32 GB card with a 27 GiB budget. A decode step's held experts (about 110 of its 240)
-  are computed there while the CPU reads and computes the rest.
+  the budget has left after the trunk and the slots keeps experts between passes: 935
+  of them on a 32 GB card with a 27 GiB budget, and a second card 1,509 more. The
+  15,360 routed experts are 290 GB and fit nowhere whole, so each is in one place (a
+  card or RAM, never both), and while the server idles the cards take RAM's most used
+  experts in place of their least used (`WgpuExperts::rebalance`: used twice as much
+  and four times more, the displaced one read back into RAM from the drive). On a
+  request's own path a card takes in only what a free slot holds: a swap there is an
+  upload of 18.9 MB and an expert left in no tier. A decode step's experts on the
+  cards (about 190 of its 240 once a session's are there) are computed there, an
+  expert's whole step one submit a card (its gate and up projections, their SwiGLU
+  quantized on the device, its down projection), while the CPU reads and computes the
+  rest.
 - The sparse attention, the indexer's scores and the hyper-connections' mixing spread
   over the CPU's threads (serial, the attention was most of a prompt's time and the
   mixing's dot products 29 s of it); a layer's expert records read eight at a time.
@@ -147,6 +154,24 @@ An Agent's tool call end to end (before the overlapped MoE): a 285-token prompt 
 tokens and took 52 s. On an internal NVMe the reads, most of what is left, would be
 several times faster.
 
+Since then (2026-10-09), through the server on two RTX 5090s with 152 GB of RAM for
+experts and the same drive: the experts are read into RAM and onto the second card
+while the server idles (130 s after it loads), and a 48-token reply then runs at 5.6
+tokens a second on a first-time prompt and 6.9 to 7.7 on one read before; a 93-token
+prompt takes 7.5 to 7.9 s and a 276-token one 19.6 to 19.8. The CUDA build on this
+drive gave 6.4 to 7.3 and 7.9 to 10.5 tokens a second, and 5.1 to 6.1 s and 18.2 to
+18.9 s. What did it, in the order of what each was worth: the experts each in one
+tier and the cards rebalanced while idle (above); a decode step's dense calls through
+buffers the device keeps (`dense::Arena`: one write of the inputs, one of the
+parameters, kept bind groups, one read-back polled for, where each call made and freed
+some ten buffers and groups); the CPU's AVX-512 expert kernel and a prompt's experts a
+worker each; the sparse attention's heads on workers that stay (`dsv41::pool`); the
+hyper-connections' 24 projections summed side by side; an expert's step and the shared
+expert each one submit. A step on a prompt read before is 130 to 146 ms: the trunk's
+228 dense calls 40, the experts 50 to 57 (the drive 22 to 29 for the one or two of its
+240 that are in no tier, the CPU's 26 to 28, the cards' beside them), sparse attention
+11, mixing 6. `OAIY_DSV41_PROFILE` prints each prompt's and reply's.
+
 ## EXL3 (OrcaSAQ)
 
 `ggml_rs_wgpu::exl3` keeps an EXL3 projection's packed trellis words on the GPU (VRAM
@@ -164,8 +189,19 @@ supported bitrates, on the RTX 5090 and the Radeon iGPU.
 OrcaSAQ-2-27B through the server on the RTX 5090 (2026-10-05): loaded in
 19 s with 10.7 GB of EXL3 weights on the GPU; a 162-token prompt in 21.7 s and 3.9
 tokens a second, against 17 s and 4.5 for Qwen3.8 27B Q4_K_M on the same path (the
-rest is the host's share of every model then); tool calls made and answered. No
-PEFT adapters and no vision tower yet.
+rest is the host's share of every model then); tool calls made and answered.
+
+Since then (2026-10-09) it runs chained on the device as the GGUF models do (a decode
+step or a prompt's chunk recorded once and submitted whole, the transforms and the
+roundings in kernels of their own): on one RTX 5090 a reply at 54 to 55 tokens a
+second, a 1,960-token prompt in 1.4 s and a 7,720-token one in 5.5 to 6.9 s. The CUDA
+build gave 54 to 59 tokens a second, 5.1 s and 24.4 s. The one-row and few-row
+kernels are written for a tile's rate (`exl3-mm-48` and so on: a lane shifts its words
+to its first code once a tile and each code is a shift by a constant, its value a read
+of a table the workgroup makes), which took a decode step's 400 matrices from 21.9 ms
+to 10.2. Its PEFT adapters run beside the projections they adapt
+(`quant_linear::LowRank`), and its vision tower is chained too (a new picture answered
+in 2.4 s; a picture prompt takes positions in three axes).
 
 ## Qwen3.8-Flash-Next
 
@@ -193,7 +229,12 @@ sixteen fast cores beat a layer's two GPU round trips) but took 48 GB of RAM; th
 is how it ran until the reserve stopped counting the 32.6 GB n-gram table, which
 left the experts none of the budget. (That was one card on that date: its layers
 split over two cards since, and it reads a GGUF of the same architecture too.)
-No PEFT adapters and no vision tower yet.
+
+Since then (2026-10-09), its EXL3 checkpoint chained over two RTX 5090s: a reply at 68
+to 69 tokens a second, 66 to 83 with its drafting head; a 1,960-token prompt in 0.54
+to 0.72 s. Its PEFT adapters run on its dense projections (an adapter of its routed
+experts is refused), and its vision tower is chained (a new picture answered in
+1.2 s).
 Image and video generation (`oaiy-media`) run on WebGPU too: each model's own page
 says what of it does.
 
