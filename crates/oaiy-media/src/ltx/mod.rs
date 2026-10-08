@@ -320,11 +320,10 @@ impl Request {
                 .filter(|s| !s.trim().is_empty())
                 .map(PathBuf::from),
             // Audio comes with every clip whose model has an audio VAE, unless
-            // the request says `"audio": false` (or runs on WebGPU, which has
-            // no audio stream yet). A given soundtrack needs it.
+            // the request says `"audio": false`. A given soundtrack needs it.
             audio: match j.get("audio") {
                 None | Some(Json::Null) => {
-                    !webgpu && j.get("audio_vae").and_then(Json::as_str).is_some_and(|s| !s.trim().is_empty())
+                    j.get("audio_vae").and_then(Json::as_str).is_some_and(|s| !s.trim().is_empty())
                         || j.get("audio_file").is_some_and(|v| !matches!(v, Json::Null))
                         || j.get("speech").is_some_and(|v| !matches!(v, Json::Null))
                 }
@@ -502,8 +501,10 @@ impl Request {
             return Err("prompt must not be empty".into());
         }
         if self.webgpu {
+            // (a clip's own sound runs there: the two streams denoised together)
             let unsupported = [
-                (self.audio || self.audio_file.is_some() || self.speech.is_some() || self.reference_voice.is_some() || self.identity, "sound (set audio to false)"),
+                (self.audio_file.is_some() || self.speech.is_some(), "a given soundtrack or speech to follow"),
+                (self.reference_voice.is_some() || self.identity, "a reference voice"),
                 (self.refine.is_some(), "two-stage refinement"),
             ];
             if let Some((_, what)) = unsupported.iter().find(|(on, _)| *on) {
@@ -787,9 +788,9 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         _ => None,
     };
     let (context, audio_context, negative) = if r.webgpu {
-        let (context, negative) = webgpu_contexts(r, &mut store, cached, negative_text, &mut report)?;
+        let contexts = webgpu_contexts(r, &mut store, cached, cached_audio, negative_text, &mut report)?;
         text_encoder_seconds = encode_started.elapsed().as_secs_f64();
-        (context, None, negative)
+        contexts
     } else {
     let (context, audio_context) = if prompt_cache_hit {
         report(event("cached_video_prompt", 1, 1));
@@ -869,7 +870,7 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     };
     let (f, mut h, mut w) = ((r.frames - 1) / 8 + 1, stage_size.1 / 32, stage_size.0 / 32);
     let mut model = if r.webgpu {
-        webgpu_model(r, &mut store, f, h, w, &mut report)?
+        webgpu_model(r, &mut store, f, h, w, audio_frames, &mut report)?
     } else {
         Model::Candle(transformer::Transformer::new(store, &dev, gpu_budget, r.memory == "gpu", r.audio)?)
     };
@@ -879,7 +880,7 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         report(event("negative_prompt_nag", 1, 1));
     }
     #[cfg(feature = "webgpu")]
-    if let (true, Some(context), Model::Wgpu(model, _)) = (r.guidance.as_ref().is_none_or(|g| g.cfg == 1.), &negative, &mut model) {
+    if let (true, Some(context), Model::Wgpu(model, ..)) = (r.guidance.as_ref().is_none_or(|g| g.cfg == 1.), &negative, &mut model) {
         let values = context.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
         model.nag = Some(crate::ltx_wgpu::Nag { rows: values.len() / 4096, context: values, scale: r.nag.0 as f32, tau: r.nag.1 as f32, alpha: r.nag.2 as f32 });
         report(event("negative_prompt_nag", 1, 1));
@@ -1004,14 +1005,27 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
                     out
                 }
                 #[cfg(feature = "webgpu")]
-                Model::Wgpu(m, table) => {
+                Model::Wgpu(m, table, sound) => {
                     let latent = video_f32.as_deref().ok_or_else(|| candle_core::Error::Msg("the latent's values".into()))?;
                     let values = context.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
                     let tokens = latent.len() / 128;
                     let clean = (if starting_latent.is_some() { h * w } else { 0 }, if ending_latent.is_some() { h * w } else { 0 });
-                    let v = m.forward(latent, tokens, &values, values.len() / 4096, sigma, table, clean, h * w, perturb)?;
-                    report(event("video_denoising", (step * passes + at + 1) * 48, steps * passes * 48));
-                    Ok((Tensor::from_vec(v, (1, tokens, 128), &dev)?, None))
+                    let host = |t: &Tensor| t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>();
+                    match (&audio_bf16, &audio_context, sound.as_ref()) {
+                        // a clip with sound: the two streams together, the audio at the video's sigma
+                        (Some(audio), Some(audio_context), Some((sound_table, video_cross))) => {
+                            let (a, c) = (host(audio)?, host(audio_context)?);
+                            let pass = crate::ltx_wgpu::AudioPass { latent: &a, tokens: a.len() / 128, context: &c, rows: c.len() / 2048, sigma, table: sound_table, video_cross, skip_self: None };
+                            let (v, s) = m.forward_av(latent, tokens, &values, values.len() / 4096, sigma, table, clean, h * w, perturb, &pass)?;
+                            report(event("video_denoising", (step * passes + at + 1) * 48, steps * passes * 48));
+                            Ok((Tensor::from_vec(v, (1, tokens, 128), &dev)?, Some(Tensor::from_vec(s, (1, pass.tokens, 128), &dev)?)))
+                        }
+                        _ => {
+                            let v = m.forward(latent, tokens, &values, values.len() / 4096, sigma, table, clean, h * w, perturb)?;
+                            report(event("video_denoising", (step * passes + at + 1) * 48, steps * passes * 48));
+                            Ok((Tensor::from_vec(v, (1, tokens, 128), &dev)?, None))
+                        }
+                    }
                 }
             }
         };
@@ -1418,33 +1432,46 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     Ok(result)
 }
 /// The transformer a clip is denoised by: Candle's, or (`backend` "webgpu") the video stream on WebGPU with its
-/// tokens' rotary table.
+/// tokens' rotary table and, for a clip with sound, the audio stream beside it: the audio tokens' table and the
+/// video tokens' for the attention between the streams.
 enum Model {
     Candle(transformer::Transformer),
     #[cfg(feature = "webgpu")]
-    Wgpu(crate::ltx_wgpu::WgpuLtx, ggml_rs::DeviceVec),
+    Wgpu(crate::ltx_wgpu::WgpuLtx, ggml_rs::DeviceVec, Option<(ggml_rs::DeviceVec, ggml_rs::DeviceVec)>),
 }
 
-/// The video stream of `store`'s transformer on WebGPU, for a latent of `f` frames of `h` by `w`.
+/// The video stream of `store`'s transformer on WebGPU (and the audio stream where the clip has sound), for a latent
+/// of `f` frames of `h` by `w` and `audio_frames` of audio.
 #[cfg(feature = "webgpu")]
-fn webgpu_model(r: &Request, store: &mut Store, f: usize, h: usize, w: usize, report: &mut dyn FnMut(Json)) -> Result<Model> {
+fn webgpu_model(r: &Request, store: &mut Store, f: usize, h: usize, w: usize, audio_frames: usize, report: &mut dyn FnMut(Json)) -> Result<Model> {
+    use crate::ltx_wgpu::{rope_table, video_positions};
     report(event("loading_video_model", 0, 48));
-    let m = crate::ltx_wgpu::WgpuLtx::load(store, r.device, |n| report(event("loading_video_model", n, 48)))?;
-    let table = m.upload(&crate::ltx_wgpu::rope_table(&crate::ltx_wgpu::video_positions(f, h, w, r.fps, r.end_image.is_some()), &[20., 2048., 2048.], 4096, 32));
-    Ok(Model::Wgpu(m, table))
+    let m = crate::ltx_wgpu::WgpuLtx::load_streams(store, r.device, r.audio, |n| report(event("loading_video_model", n, 48)))?;
+    let positions = video_positions(f, h, w, r.fps, r.end_image.is_some());
+    let table = m.upload(&rope_table(&positions, &[20., 2048., 2048.], 4096, 32));
+    // (each audio frame at its span's middle and each video token at its time, in seconds: 2,048 channels' tables)
+    let sound = r.audio.then(|| {
+        let middles: Vec<Vec<f32>> = transformer::audio_spans(audio_frames).iter().map(|&(s, e)| vec![((s + e) / 2.) as f32]).collect();
+        let times: Vec<Vec<f32>> = positions.iter().map(|p| vec![p[0]]).collect();
+        (m.upload(&rope_table(&middles, &[20.], 2048, 32)), m.upload(&rope_table(&times, &[20.], 2048, 32)))
+    });
+    Ok(Model::Wgpu(m, table, sound))
 }
 #[cfg(not(feature = "webgpu"))]
-fn webgpu_model(_: &Request, _: &mut Store, _: usize, _: usize, _: usize, _: &mut dyn FnMut(Json)) -> Result<Model> {
+fn webgpu_model(_: &Request, _: &mut Store, _: usize, _: usize, _: usize, _: usize, _: &mut dyn FnMut(Json)) -> Result<Model> {
     candle_core::bail!("this build has no WebGPU (the webgpu feature)")
 }
 
-/// The prompt's video context and the negative prompt's (where there is one) on WebGPU: from the prompt cache where
-/// it holds them (`cached` the prompt's), else Gemma, the projection and the connector on the GPU, both prompts in
-/// one pass over Gemma's layers. On the host (F32 where new).
+/// The prompt's video context, its audio context (a clip with sound) and the negative prompt's video context (where
+/// there is one) on WebGPU: from the prompt cache where it holds them (`cached` the prompt's video context,
+/// `cached_audio` its audio one), else Gemma, the projections and the connectors on the GPU, both prompts in one pass
+/// over Gemma's layers. On the host (F32 where new).
 #[cfg(feature = "webgpu")]
-fn webgpu_contexts(r: &Request, store: &mut Store, cached: Option<Tensor>, negative_text: Option<String>, report: &mut dyn FnMut(Json)) -> Result<(Tensor, Option<Tensor>)> {
+fn webgpu_contexts(r: &Request, store: &mut Store, cached: Option<Tensor>, cached_audio: Option<Tensor>, negative_text: Option<String>, report: &mut dyn FnMut(Json)) -> Result<(Tensor, Option<Tensor>, Option<Tensor>)> {
     let negative_cache = negative_text.as_ref().and_then(|text| cache::PromptCache::new(&Request { prompt: text.clone(), audio: false, ..r.clone() }));
     let cached_negative = negative_cache.as_ref().and_then(|c| c.load(&Device::Cpu));
+    // (the prompt anew where either of its contexts is not cached)
+    let cached = cached.filter(|_| !r.audio || cached_audio.is_some());
     let mut prompts = Vec::new();
     if cached.is_none() {
         prompts.push(r.prompt.clone());
@@ -1457,27 +1484,30 @@ fn webgpu_contexts(r: &Request, store: &mut Store, cached: Option<Tensor>, negat
         Vec::new()
     } else {
         report(event("encoding_video_prompt", 0, 1));
-        crate::ltx_text_wgpu::contexts(&r.text_encoder, r.tokenizer.as_deref(), store, &prompts, r.device, |n, of| report(event("encoding_video_prompt", n, of)))?
+        crate::ltx_text_wgpu::contexts_streams(&r.text_encoder, r.tokenizer.as_deref(), store, &prompts, r.device, r.audio, |n, of| report(event("encoding_video_prompt", n, of)))?
     }
     .into_iter();
-    let mut next = || -> Result<Tensor> {
-        let values = fresh.next().ok_or_else(|| candle_core::Error::Msg("a prompt's context is missing".into()))?;
-        Tensor::from_vec(values, (1, 1024, 4096), &Device::Cpu)
+    let mut next = || -> Result<(Tensor, Option<Tensor>)> {
+        let (video, sound) = fresh.next().ok_or_else(|| candle_core::Error::Msg("a prompt's context is missing".into()))?;
+        Ok((Tensor::from_vec(video, (1, 1024, 4096), &Device::Cpu)?, sound.map(|s| Tensor::from_vec(s, (1, 1024, 2048), &Device::Cpu)).transpose()?))
     };
-    let context = match cached {
-        Some(c) => c,
+    let (context, audio_context) = match cached {
+        Some(c) => (c, cached_audio.filter(|_| r.audio)),
         None => {
-            let c = next()?;
+            let (c, a) = next()?;
             if let Some(cache) = cache::PromptCache::new(r) {
                 let _ = cache.save(&c);
             }
-            c
+            if let (Some(cache), Some(a)) = (cache::PromptCache::audio(r).filter(|_| r.audio), &a) {
+                let _ = cache.save(a);
+            }
+            (c, a)
         }
     };
     let negative = match (negative_text, cached_negative) {
         (Some(_), Some(c)) => Some(c),
         (Some(_), None) => {
-            let c = next()?;
+            let (c, _) = next()?;
             if let Some(cache) = &negative_cache {
                 let _ = cache.save(&c);
             }
@@ -1485,10 +1515,10 @@ fn webgpu_contexts(r: &Request, store: &mut Store, cached: Option<Tensor>, negat
         }
         _ => None,
     };
-    Ok((context, negative))
+    Ok((context, audio_context, negative))
 }
 #[cfg(not(feature = "webgpu"))]
-fn webgpu_contexts(_: &Request, _: &mut Store, _: Option<Tensor>, _: Option<String>, _: &mut dyn FnMut(Json)) -> Result<(Tensor, Option<Tensor>)> {
+fn webgpu_contexts(_: &Request, _: &mut Store, _: Option<Tensor>, _: Option<Tensor>, _: Option<String>, _: &mut dyn FnMut(Json)) -> Result<(Tensor, Option<Tensor>, Option<Tensor>)> {
     candle_core::bail!("this build has no WebGPU (the webgpu feature)")
 }
 
@@ -1775,18 +1805,20 @@ mod tests {
     }
     #[test]
     #[cfg(feature = "webgpu")]
-    fn a_webgpu_clip_is_text_to_video_without_sound_for_now() {
+    fn a_webgpu_clip_has_its_own_sound_and_refuses_a_given_one() {
         let request = |extra: &str| {
             let j = Json::parse(format!(r#"{{"model":"ltx-2.3","transformer":"t","text_encoder":"e","tokenizer":"k","vae":"t","audio_vae":"t","output_dir":"o","prompt":"p","backend":"webgpu"{extra}}}"#).as_bytes()).unwrap();
             Request::parse(&j)
         };
         let r = request("").unwrap();
-        assert!(r.webgpu && !r.audio, "sound off by default on WebGPU, though the checkpoint has its VAE");
+        assert!(r.webgpu && r.audio, "a clip's own sound where the checkpoint has its audio VAE, on WebGPU as elsewhere");
+        assert!(!request(r#","audio":false"#).unwrap().audio, "a silent clip where the job says so");
         assert!(request(r#","guidance":{"steps":30}"#).unwrap().guidance.is_some(), "guided sampling, its negative prompt by CFG");
         assert!(request(r#","negative_prompt":"n""#).unwrap().negative_prompt.is_some(), "a negative prompt without CFG: by NAG");
         assert!(request(r#","lora":"l""#).unwrap().lora.is_some(), "a LoRA: the weights it adapts loaded with it");
         for (extra, what) in [
-            (r#","audio":true"#, "sound"),
+            (r#","speech":{"text":"hello"}"#, "soundtrack or speech"),
+            (r#","identity":true"#, "reference voice"),
             (r#","refine":{"transformer":"t","upsampler":"u"}"#, "refinement"),
         ] {
             let e = request(extra).unwrap_err();

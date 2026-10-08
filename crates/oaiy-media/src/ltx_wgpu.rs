@@ -1,5 +1,7 @@
 //! LTX 2.3's transformer on WebGPU, as [`crate::ltx::transformer`] computes its video stream (text- and
-//! image-to-video, its clean first and last frames' tokens at timestep 0, a negative prompt by NAG: no audio yet): its weights on the GPU as they are stored where the chain has a kernel
+//! image-to-video, its clean first and last frames' tokens at timestep 0, a negative prompt by NAG) and, where it is
+//! loaded with it, its audio stream beside (a clip's sound denoised with its picture: each block's audio attentions
+//! and feed-forward, and the two attentions between the streams): its weights on the GPU as they are stored where the chain has a kernel
 //! for them (NVFP4 packed, the tensor cores decoding it as they multiply: Lightricks' `-nvfp4` release's 44 blocks of
 //! 48), else Q8_0 where the tensor cores take it (a BF16 checkpoint's video stream is 28 GB as f16, 15 as Q8_0), else
 //! f16 (BF16 rounded); its activations f32.
@@ -16,6 +18,8 @@ const HEADS: usize = 32;
 const HD: usize = 128;
 const BLOCKS: usize = 48;
 const EPS: f32 = 1e-6;
+/// The audio stream's width (its heads 64 wide), which the attentions between the streams work at too.
+const A: usize = 2048;
 
 fn err(e: impl std::fmt::Display) -> candle_core::Error {
     candle_core::Error::Msg(e.to_string())
@@ -146,12 +150,14 @@ impl Linear {
     }
 }
 
-/// One attention's layers: q, k, v, its gate's logits and its output, and q's and k's RMS norms (over the width).
+/// One attention's layers: q, k, v, its gate's logits (where it has a gate) and its output, and q's and k's RMS norms
+/// (over the width). Its width is q's output's (the video's 4,096, or 2,048 for the audio's own and for those between
+/// the streams), its heads [`HEADS`].
 struct Attn {
     q: Linear,
     k: Linear,
     v: Linear,
-    gate: Linear,
+    gate: Option<Linear>,
     out: Linear,
     qn: DeviceVec,
     kn: DeviceVec,
@@ -159,11 +165,12 @@ struct Attn {
 
 impl Attn {
     fn load(store: &mut Store, gpu: &ggml_rs_wgpu::WgpuBackend, p: &str) -> Result<Self> {
+        let gate = format!("{p}.to_gate_logits");
         Ok(Self {
             q: Linear::load(store, gpu, &format!("{p}.to_q"))?,
             k: Linear::load(store, gpu, &format!("{p}.to_k"))?,
             v: Linear::load(store, gpu, &format!("{p}.to_v"))?,
-            gate: Linear::load(store, gpu, &format!("{p}.to_gate_logits"))?,
+            gate: if store.index.get(&format!("{gate}.weight")).is_some() { Some(Linear::load(store, gpu, &gate)?) } else { None },
             out: Linear::load(store, gpu, &format!("{p}.to_out.0"))?,
             qn: vector(store, gpu, &format!("{p}.q_norm.weight"))?,
             kn: vector(store, gpu, &format!("{p}.k_norm.weight"))?,
@@ -179,6 +186,81 @@ struct Block {
     /// The block's nine modulation rows' own part (`[9, D]`), and the prompt's two (`[2, D]`).
     table: DeviceVec,
     prompt_table: DeviceVec,
+    audio: Option<AudioBlock>,
+}
+
+/// A block's audio stream: its self-attention, text attention and feed-forward as the video's ([`A`] wide), the
+/// attention of the video's tokens over the audio's and of the audio's over the video's, and each side's part of
+/// those two's modulation (four rows: a scale and a shift for each direction; then its direction's gate).
+struct AudioBlock {
+    attn1: Attn,
+    attn2: Attn,
+    ff0: Linear,
+    ff2: Linear,
+    table: DeviceVec,
+    prompt_table: DeviceVec,
+    a2v: Attn,
+    v2a: Attn,
+    cross_video: (DeviceVec, DeviceVec),
+    cross_audio: (DeviceVec, DeviceVec),
+}
+
+impl AudioBlock {
+    fn load(store: &mut Store, gpu: &ggml_rs_wgpu::WgpuBackend, p: &str) -> Result<Self> {
+        // a table of five rows as its first four and its last
+        let split = |store: &mut Store, name: &str, width: usize| -> Result<(DeviceVec, DeviceVec)> {
+            let values = store.tensor_f32(name, &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+            if values.len() != 5 * width {
+                candle_core::bail!("{name}: {} values, not five rows of {width}", values.len());
+            }
+            let (rows, gate) = (gpu.vec(4 * width), gpu.vec(width));
+            gpu.upload(&rows, &values[..4 * width]);
+            gpu.upload(&gate, &values[4 * width..]);
+            Ok((rows, gate))
+        };
+        Ok(Self {
+            attn1: Attn::load(store, gpu, &format!("{p}.audio_attn1"))?,
+            attn2: Attn::load(store, gpu, &format!("{p}.audio_attn2"))?,
+            ff0: Linear::load(store, gpu, &format!("{p}.audio_ff.net.0.proj"))?,
+            ff2: Linear::load(store, gpu, &format!("{p}.audio_ff.net.2"))?,
+            table: vector(store, gpu, &format!("{p}.audio_scale_shift_table"))?,
+            prompt_table: vector(store, gpu, &format!("{p}.audio_prompt_scale_shift_table"))?,
+            a2v: Attn::load(store, gpu, &format!("{p}.audio_to_video_attn"))?,
+            v2a: Attn::load(store, gpu, &format!("{p}.video_to_audio_attn"))?,
+            cross_video: split(store, &format!("{p}.scale_shift_table_a2v_ca_video"), D)?,
+            cross_audio: split(store, &format!("{p}.scale_shift_table_a2v_ca_audio"), A)?,
+        })
+    }
+}
+
+/// The audio stream's own layers outside the blocks: its patchify, its timestep's and its prompt's embedders, its
+/// output's table and projection, and the embedders of the attention between the streams (each side's four rows of
+/// scale and shift, each direction's gate).
+struct AudioStreams {
+    patchify: Linear,
+    adaln: TimeEmbed,
+    prompt: Option<TimeEmbed>,
+    out_table: DeviceVec,
+    proj_out: Linear,
+    video_rows: TimeEmbed,
+    audio_rows: TimeEmbed,
+    video_gate: TimeEmbed,
+    audio_gate: TimeEmbed,
+}
+
+/// A step's audio beside its video ([`WgpuLtx::forward_av`]): the audio latent (`tokens` rows of the audio patchify's
+/// width) at `sigma` over its own context (`rows` rows of 2,048, the audio connector's); its tokens rotated by `table`
+/// and, in the attention between the streams, the video's by `video_cross` (each a [`rope_table`] of times over 2,048
+/// channels, [`WgpuLtx::upload`]ed). With `skip_self` that block's audio self-attention passed through.
+pub struct AudioPass<'a> {
+    pub latent: &'a [f32],
+    pub tokens: usize,
+    pub context: &'a [f32],
+    pub rows: usize,
+    pub sigma: f64,
+    pub table: &'a DeviceVec,
+    pub video_cross: &'a DeviceVec,
+    pub skip_self: Option<usize>,
 }
 
 /// A timestep's embedder (`{p}.emb.timestep_embedder.linear_1/2`) and its modulation's linear (`{p}.linear`).
@@ -281,6 +363,8 @@ pub struct WgpuLtx {
     out_table: DeviceVec,
     proj_out: Linear,
     blocks: Vec<Block>,
+    /// The audio stream's layers outside the blocks, where it was loaded with it ([`Self::load_streams`]).
+    audio: Option<AudioStreams>,
     /// A negative prompt by normalised attention guidance, for every forward until cleared (as the reference's
     /// `ltx::transformer::Transformer::nag`).
     pub nag: Option<Nag>,
@@ -301,7 +385,13 @@ pub struct Nag {
 impl WgpuLtx {
     /// The video stream of the transformer in `store` on GPU `device` (as CUDA counts them; OAIY_WEBGPU_ADAPTER naming
     /// one instead). `progress(block)` as each loads.
-    pub fn load(store: &mut Store, device: usize, mut progress: impl FnMut(usize)) -> Result<Self> {
+    pub fn load(store: &mut Store, device: usize, progress: impl FnMut(usize)) -> Result<Self> {
+        Self::load_streams(store, device, false, progress)
+    }
+
+    /// [`Self::load`], with the audio stream beside the video's where `audio` (a clip with sound: each block's audio
+    /// layers and those between the streams, some half as much again).
+    pub fn load_streams(store: &mut Store, device: usize, audio: bool, mut progress: impl FnMut(usize)) -> Result<Self> {
         let gpu = ggml_rs_wgpu::WgpuBackend::nth(device, None).map_err(err)?;
         let g = |n: &str| format!("{PREFIX}{n}");
         let patchify = Linear::load(store, &gpu, &g("patchify_proj"))?;
@@ -323,10 +413,36 @@ impl WgpuLtx {
                 ff2: Linear::load(store, &gpu, &format!("{p}.ff.net.2"))?,
                 table: vector(store, &gpu, &format!("{p}.scale_shift_table"))?,
                 prompt_table: vector(store, &gpu, &format!("{p}.prompt_scale_shift_table"))?,
+                audio: if audio { Some(AudioBlock::load(store, &gpu, &p)?) } else { None },
             });
             progress(i + 1);
         }
-        Ok(Self { gpu, patchify, keyframe, adaln, prompt, out_table, proj_out, blocks, nag: None })
+        let audio = if audio {
+            let streams = AudioStreams {
+                patchify: Linear::load(store, &gpu, &g("audio_patchify_proj"))?,
+                adaln: TimeEmbed::load(store, &gpu, &g("audio_adaln_single"))?,
+                prompt: if store.index.get(&g("audio_prompt_adaln_single.linear.weight")).is_some() { Some(TimeEmbed::load(store, &gpu, &g("audio_prompt_adaln_single"))?) } else { None },
+                out_table: vector(store, &gpu, &g("audio_scale_shift_table"))?,
+                proj_out: Linear::load(store, &gpu, &g("audio_proj_out"))?,
+                video_rows: TimeEmbed::load(store, &gpu, &g("av_ca_video_scale_shift_adaln_single"))?,
+                audio_rows: TimeEmbed::load(store, &gpu, &g("av_ca_audio_scale_shift_adaln_single"))?,
+                video_gate: TimeEmbed::load(store, &gpu, &g("av_ca_a2v_gate_adaln_single"))?,
+                audio_gate: TimeEmbed::load(store, &gpu, &g("av_ca_v2a_gate_adaln_single"))?,
+            };
+            let (s, widths) = (&streams, [D, A]);
+            if s.patchify.n != A || s.adaln.linear.n != 9 * A || s.out_table.len != 2 * A || s.video_rows.linear.n != 4 * D || s.audio_rows.linear.n != 4 * A || s.video_gate.linear.n != D || s.audio_gate.linear.n != A || [&s.adaln, &s.video_rows, &s.audio_rows, &s.video_gate, &s.audio_gate].iter().any(|e| !widths.contains(&e.t1.n) || !widths.contains(&e.t2.n)) {
+                candle_core::bail!("not LTX 2.3's audio stream (patchify {}, modulation {}, output table {})", s.patchify.n, s.adaln.linear.n, s.out_table.len);
+            }
+            Some(streams)
+        } else {
+            None
+        };
+        Ok(Self { gpu, patchify, keyframe, adaln, prompt, out_table, proj_out, blocks, audio, nag: None })
+    }
+
+    /// Whether it was loaded with its audio stream.
+    pub fn has_audio(&self) -> bool {
+        self.audio.is_some()
     }
 
     fn vec(&self, len: usize) -> DeviceVec {
@@ -344,7 +460,7 @@ impl WgpuLtx {
     /// heads gated, out through the output projection into `y`. `s` the scratch.
     #[allow(clippy::too_many_arguments)]
     fn attend(&self, r: &mut dyn ChainRecorder, a: &Attn, xq: &DeviceVec, tq: usize, xkv: &DeviceVec, tk: usize, rope: Option<&DeviceVec>, passthrough: bool, s: &Scratch, y: &DeviceVec) {
-        attend(r, a, xq, tq, xkv, tk, rope, passthrough, s, y)
+        attend(r, a, xq, tq, xkv, tk, rope, rope, passthrough, s, y)
     }
 
     /// The video velocity of `latent` (`tokens` rows of 128) at `sigma` over `context` (`lc` rows of `D`, the
@@ -354,13 +470,23 @@ impl WgpuLtx {
     /// self-attention passed through (spatio-temporal guidance's perturbed pass).
     #[allow(clippy::too_many_arguments)]
     pub fn forward(&self, latent: &[f32], tokens: usize, context: &[f32], lc: usize, sigma: f64, table: &DeviceVec, clean: (usize, usize), first_frame: usize, skip_self: Option<usize>) -> Result<Vec<f32>> {
-        self.pass(latent, tokens, context, lc, sigma, table, clean, first_frame, skip_self, false)?.pop().ok_or_else(|| err("the velocity was not read"))
+        self.pass(latent, tokens, context, lc, sigma, table, clean, first_frame, skip_self, false, None)?.pop().ok_or_else(|| err("the velocity was not read"))
+    }
+
+    /// [`Self::forward`] with the clip's sound beside its picture: the video's velocity and the audio's (`[audio
+    /// tokens, the audio latent's width]`), each block's two streams attending to each other, as the reference's
+    /// `av_block` (the model loaded with its audio stream: [`Self::load_streams`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_av(&self, latent: &[f32], tokens: usize, context: &[f32], lc: usize, sigma: f64, table: &DeviceVec, clean: (usize, usize), first_frame: usize, skip_self: Option<usize>, audio: &AudioPass<'_>) -> Result<(Vec<f32>, Vec<f32>)> {
+        let mut reads = self.pass(latent, tokens, context, lc, sigma, table, clean, first_frame, skip_self, false, Some(audio))?;
+        let sound = reads.pop().ok_or_else(|| err("the audio's velocity was not read"))?;
+        Ok((reads.pop().ok_or_else(|| err("the velocity was not read"))?, sound))
     }
 
     /// [`Self::forward`]'s pass: its reads, the velocity last (with `trace`, every block's output before it, one after
     /// another in one vector: a read is the vector as the recording leaves it).
     #[allow(clippy::too_many_arguments)]
-    fn pass(&self, latent: &[f32], tokens: usize, context: &[f32], lc: usize, sigma: f64, table: &DeviceVec, clean: (usize, usize), first_frame: usize, skip_self: Option<usize>, trace: bool) -> Result<Vec<Vec<f32>>> {
+    fn pass(&self, latent: &[f32], tokens: usize, context: &[f32], lc: usize, sigma: f64, table: &DeviceVec, clean: (usize, usize), first_frame: usize, skip_self: Option<usize>, trace: bool, audio: Option<&AudioPass<'_>>) -> Result<Vec<Vec<f32>>> {
         if latent.len() != tokens * self.patchify.k || context.len() != lc * D || table.len != tokens * D {
             candle_core::bail!("an LTX step's inputs: {} latent values for {tokens} tokens, {} context for {lc}, {} rotary", latent.len(), context.len(), table.len);
         }
@@ -379,7 +505,19 @@ impl WgpuLtx {
             }
         }
         let ln = nag.map_or(0, |n| n.rows);
-        let s = Scratch::new(&self.gpu, tokens.max(lc).max(ln));
+        // the audio stream's step, where there is sound: its layers, its inputs and its vectors
+        let sound = match audio {
+            Some(a) => {
+                let g = self.audio.as_ref().ok_or_else(|| err("this transformer was loaded without its audio stream"))?;
+                if a.latent.len() != a.tokens * g.patchify.k || a.context.len() != a.rows * A || a.table.len != a.tokens * A || a.video_cross.len != tokens * A || a.tokens == 0 || a.rows == 0 {
+                    candle_core::bail!("an LTX step's sound: {} latent values for {} tokens, {} context for {}, {} and {} rotary", a.latent.len(), a.tokens, a.context.len(), a.rows, a.table.len, a.video_cross.len);
+                }
+                Some((g, a, Sound::new(self, g, a, tokens, if two { 2 } else { 1 })))
+            }
+            None => None,
+        };
+        let (ta, la) = audio.map_or((0, 0), |a| (a.tokens, a.rows));
+        let s = Scratch::new(&self.gpu, tokens.max(lc).max(ln).max(ta).max(la));
         let (lat, ctx) = (self.vec(latent.len()), self.vec(context.len()));
         self.gpu.upload(&lat, latent);
         self.gpu.upload(&ctx, context);
@@ -420,6 +558,25 @@ impl WgpuLtx {
         if let Some(marker) = self.keyframe.as_ref().filter(|_| first_frame > 0) {
             r.add_bias_rows(&x, marker, first_frame.min(tokens), D);
         }
+        // the audio's step: every timestep the audio's own sigma, but the video's rows of the attention between the
+        // streams (its tokens' own timesteps: sigma's, and 0's for the clean ones) and the audio's gate (the video's)
+        if let Some((g, a, v)) = &sound {
+            g.adaln.record(r, &v.t, &s1, &s2, &v.emb, &v.modulation);
+            match &g.prompt {
+                Some(pe) => pe.record(r, &v.t, &s1, &s2, &v.spare, &v.prompt),
+                None => r.copy(&self.vec(2 * A), 0, &v.prompt, 0, 2 * A),
+            }
+            g.audio_rows.record(r, &v.t, &s1, &s2, &v.spare, &v.audio_rows);
+            g.video_gate.record(r, &v.t, &s1, &s2, &v.spare, &v.video_gate);
+            g.audio_gate.record(r, &t, &s1, &s2, &v.spare, &v.audio_gate);
+            for (at, step) in [(0, &t), (4 * D, &t0)].into_iter().take(sets) {
+                g.video_rows.record(r, step, &s1, &s2, &v.spare, &v.rows_set);
+                r.copy(&v.rows_set, 0, &v.video_rows, at, 4 * D);
+            }
+            g.patchify.forward(r, &v.lat, &v.x, a.tokens);
+        }
+        // (the clean video tokens' rows of the attention between the streams: timestep 0's set)
+        let cross_rows = if two { CleanRows { offset: 4 * D, ..rows } } else { CleanRows::NONE };
         for (i, b) in self.blocks.iter().enumerate() {
             // the block's modulation: the step's and its own table (shift, scale, gate: self-attention 0-2, the
             // feed-forward 3-5, text attention 6-8), the prompt's two rows the same
@@ -449,6 +606,48 @@ impl WgpuLtx {
                 None => self.attend(r, &b.attn2, &h, tokens, &cm, lc, None, false, &s, &y),
             }
             r.add_gated_rows_clean(&x, &y, tokens, D, &mm, 8 * D, false, rows);
+            if let (Some((_, a, v)), Some(ab)) = (&sound, &b.audio) {
+                let (ta, la) = (a.tokens, a.rows);
+                // the audio's own attentions, as the video's: its nine rows (shift, scale, gate each), its prompt's two
+                r.copy(&v.modulation, 0, &v.mm, 0, 9 * A);
+                r.add(&v.mm, &ab.table);
+                r.copy(&v.prompt, 0, &v.pm, 0, 2 * A);
+                r.add(&v.pm, &ab.prompt_table);
+                r.norm_mod_rows(&v.x, &v.h, ta, A, &v.mm, A, Some(0), RowNorm::Rms, EPS);
+                attend(r, &ab.attn1, &v.h, ta, &v.h, ta, Some(a.table), Some(a.table), a.skip_self == Some(i), &s, &v.y);
+                r.add_gated_rows(&v.x, &v.y, ta, A, &v.mm, 2 * A, false);
+                r.norm_mod_rows(&v.x, &v.h, ta, A, &v.mm, 7 * A, Some(6 * A), RowNorm::Rms, EPS);
+                r.norm_mod_rows(&v.ctx, &v.cm, la, A, &v.pm, A, Some(0), RowNorm::None, EPS);
+                attend(r, &ab.attn2, &v.h, ta, &v.cm, la, None, None, false, &s, &v.y);
+                r.add_gated_rows(&v.x, &v.y, ta, A, &v.mm, 8 * A, false);
+                // the two streams over each other: each side's rows (a scale then a shift for each direction) and each
+                // direction's gate, the step's plus the block's; both directions from the streams as they are now
+                for at in (0..sets).map(|set| set * 4 * D) {
+                    r.copy(&v.video_rows, at, &v.rows_set, 0, 4 * D);
+                    r.add(&v.rows_set, &ab.cross_video.0);
+                    r.copy(&v.rows_set, 0, &v.video_mod, at, 4 * D);
+                }
+                r.copy(&v.audio_rows, 0, &v.audio_mod, 0, 4 * A);
+                r.add(&v.audio_mod, &ab.cross_audio.0);
+                r.copy(&v.video_gate, 0, &v.video_by, 0, D);
+                r.add(&v.video_by, &ab.cross_video.1);
+                r.copy(&v.audio_gate, 0, &v.audio_by, 0, A);
+                r.add(&v.audio_by, &ab.cross_audio.1);
+                r.norm_mod_rows_clean(&x, &h, tokens, D, &v.video_mod, 0, Some(D), RowNorm::Rms, EPS, cross_rows);
+                r.norm_mod_rows(&v.x, &v.h, ta, A, &v.audio_mod, 0, Some(A), RowNorm::Rms, EPS);
+                attend(r, &ab.a2v, &h, tokens, &v.h, ta, Some(a.video_cross), Some(a.table), false, &s, &y);
+                r.norm_mod_rows(&v.x, &v.h, ta, A, &v.audio_mod, 2 * A, Some(3 * A), RowNorm::Rms, EPS);
+                r.norm_mod_rows_clean(&x, &h, tokens, D, &v.video_mod, 2 * D, Some(3 * D), RowNorm::Rms, EPS, cross_rows);
+                attend(r, &ab.v2a, &v.h, ta, &h, tokens, Some(a.table), Some(a.video_cross), false, &s, &v.y);
+                r.add_gated_rows(&x, &y, tokens, D, &v.video_by, 0, false);
+                r.add_gated_rows(&v.x, &v.y, ta, A, &v.audio_by, 0, false);
+                // the audio's feed-forward
+                r.norm_mod_rows(&v.x, &v.h, ta, A, &v.mm, 4 * A, Some(3 * A), RowNorm::Rms, EPS);
+                ab.ff0.forward(r, &v.h, &v.f, ta);
+                r.gelu(&v.f, &v.fg, ta * ab.ff0.n);
+                ab.ff2.forward(r, &v.fg, &v.y, ta);
+                r.add_gated_rows(&v.x, &v.y, ta, A, &v.mm, 5 * A, false);
+            }
             r.norm_mod_rows_clean(&x, &h, tokens, D, &mm, 4 * D, Some(3 * D), RowNorm::Rms, EPS, rows);
             b.ff0.forward(r, &h, &f, tokens);
             r.gelu(&f, &fg, tokens * b.ff0.n);
@@ -471,39 +670,128 @@ impl WgpuLtx {
             r.read(&trail);
         }
         r.read(&vel);
+        // the audio's output, as the video's: a layer norm, its table plus its timestep's embedding, its projection
+        if let Some((g, a, v)) = &sound {
+            r.copy(&g.out_table, 0, &v.pm, 0, 2 * A);
+            r.add_bias_rows(&v.pm, &v.emb, 2, A);
+            r.norm_mod_rows(&v.x, &v.h, a.tokens, A, &v.pm, A, Some(0), RowNorm::Layer, EPS);
+            g.proj_out.forward(r, &v.h, &v.vel, a.tokens);
+            r.read(&v.vel);
+        }
         Ok(rec.finish())
     }
 }
 
-/// One attention: `xq`'s `tq` rows' queries over `xkv`'s `tk` rows (each rotated by its table where given), the heads
-/// gated, out through the output projection into `y`. With `passthrough` the attention is its value projection (the
-/// reference's perturbation for spatio-temporal guidance), its gate and output still applied. `s` the scratch.
+/// A step's audio vectors ([`WgpuLtx::pass`] with sound).
+struct Sound {
+    lat: DeviceVec,
+    ctx: DeviceVec,
+    /// The audio's sigma's sinusoids.
+    t: DeviceVec,
+    x: DeviceVec,
+    h: DeviceVec,
+    cm: DeviceVec,
+    y: DeviceVec,
+    f: DeviceVec,
+    fg: DeviceVec,
+    emb: DeviceVec,
+    /// An embedder's embedding nobody reads.
+    spare: DeviceVec,
+    modulation: DeviceVec,
+    prompt: DeviceVec,
+    mm: DeviceVec,
+    pm: DeviceVec,
+    /// The attention between the streams: the step's rows (the video's a set a timestep) and gates, a set's scratch,
+    /// then each with the block's part.
+    video_rows: DeviceVec,
+    audio_rows: DeviceVec,
+    video_gate: DeviceVec,
+    audio_gate: DeviceVec,
+    rows_set: DeviceVec,
+    video_mod: DeviceVec,
+    audio_mod: DeviceVec,
+    video_by: DeviceVec,
+    audio_by: DeviceVec,
+    vel: DeviceVec,
+}
+
+impl Sound {
+    fn new(m: &WgpuLtx, g: &AudioStreams, a: &AudioPass<'_>, _tokens: usize, sets: usize) -> Self {
+        let v = |len: usize| m.vec(len);
+        let (ta, la) = (a.tokens, a.rows);
+        let ff = m.blocks.first().and_then(|b| b.audio.as_ref()).map_or(4 * A, |b| b.ff0.n);
+        let (lat, ctx, t) = (v(a.latent.len()), v(a.context.len()), v(256));
+        m.gpu.upload(&lat, a.latent);
+        m.gpu.upload(&ctx, a.context);
+        m.gpu.upload(&t, &sinusoids(a.sigma));
+        Sound {
+            lat,
+            ctx,
+            t,
+            x: v(ta * A),
+            h: v(ta * A),
+            cm: v(la * A),
+            y: v(ta * A),
+            f: v(ta * ff),
+            fg: v(ta * ff),
+            emb: v(A),
+            spare: v(D),
+            modulation: v(9 * A),
+            prompt: v(2 * A),
+            mm: v(9 * A),
+            pm: v(2 * A),
+            video_rows: v(sets * 4 * D),
+            audio_rows: v(4 * A),
+            video_gate: v(D),
+            audio_gate: v(A),
+            rows_set: v(4 * D),
+            video_mod: v(sets * 4 * D),
+            audio_mod: v(4 * A),
+            video_by: v(D),
+            audio_by: v(A),
+            vel: v(ta * g.proj_out.n),
+        }
+    }
+}
+
+/// One attention: `xq`'s `tq` rows' queries over `xkv`'s `tk` rows (the queries rotated by `rope_q` and the keys by
+/// `rope_k` where given: the same table for a stream over itself, each stream's own between the two), the heads gated
+/// where the attention has a gate, out through the output projection into `y`. Its width is its q's (the video's
+/// 4,096, the audio's and the streams' between them 2,048), its inputs' and its output's their layers'. With
+/// `passthrough` the attention is its value projection (the reference's perturbation for spatio-temporal guidance),
+/// its gate and output still applied. `s` the scratch.
 #[allow(clippy::too_many_arguments)]
-fn attend(r: &mut dyn ChainRecorder, a: &Attn, xq: &DeviceVec, tq: usize, xkv: &DeviceVec, tk: usize, rope: Option<&DeviceVec>, passthrough: bool, s: &Scratch, y: &DeviceVec) {
+fn attend(r: &mut dyn ChainRecorder, a: &Attn, xq: &DeviceVec, tq: usize, xkv: &DeviceVec, tk: usize, rope_q: Option<&DeviceVec>, rope_k: Option<&DeviceVec>, passthrough: bool, s: &Scratch, y: &DeviceVec) {
+    let width = a.q.n;
+    let hd = width / HEADS;
+    let gate_out = |r: &mut dyn ChainRecorder| {
+        if let Some(gate) = &a.gate {
+            gate.forward(r, xq, &s.logits, tq);
+            r.head_gate_rows(&s.att, &s.logits, tq, HEADS, hd);
+        }
+        a.out.forward(r, &s.att, y, tq);
+    };
     if passthrough {
         a.v.forward(r, xkv, &s.att, tk);
-        a.gate.forward(r, xq, &s.logits, tq);
-        r.head_gate_rows(&s.att, &s.logits, tq, HEADS, HD);
-        a.out.forward(r, &s.att, y, tq);
-        return;
+        return gate_out(r);
     }
     // (the norms take a row's width from their vectors' lengths: views of the scratch's first rows)
-    let first = |v: &DeviceVec, rows: usize| DeviceVec { len: rows * D, inner: v.inner.clone() };
+    let first = |v: &DeviceVec, rows: usize| DeviceVec { len: rows * width, inner: v.inner.clone() };
     a.q.forward(r, xq, &s.q, tq);
     r.rmsnorm_rows(&first(&s.q, tq), &a.qn, &first(&s.qn, tq), tq, EPS);
     a.k.forward(r, xkv, &s.k, tk);
     r.rmsnorm_rows(&first(&s.k, tk), &a.kn, &first(&s.kn, tk), tk, EPS);
     a.v.forward(r, xkv, &s.v, tk);
-    if let Some(t) = rope {
-        r.rope_split_rows(&s.qn, tq, HEADS, HD, t);
-        r.rope_split_rows(&s.kn, tk, HEADS, HD, t);
+    if let Some(t) = rope_q {
+        r.rope_split_rows(&s.qn, tq, HEADS, hd, t);
     }
-    r.store_rows(&s.kn, &s.kv, tk, D, 0, 2 * D, 0);
-    r.store_rows(&s.v, &s.kv, tk, D, 0, 2 * D, D);
-    r.attention_rows_full(&s.qn, &s.kv, &s.att, tq, HEADS, HEADS, HD, tk, 1.0 / (HD as f32).sqrt());
-    a.gate.forward(r, xq, &s.logits, tq);
-    r.head_gate_rows(&s.att, &s.logits, tq, HEADS, HD);
-    a.out.forward(r, &s.att, y, tq);
+    if let Some(t) = rope_k {
+        r.rope_split_rows(&s.kn, tk, HEADS, hd, t);
+    }
+    r.store_rows(&s.kn, &s.kv, tk, width, 0, 2 * width, 0);
+    r.store_rows(&s.v, &s.kv, tk, width, 0, 2 * width, width);
+    r.attention_rows_full(&s.qn, &s.kv, &s.att, tq, HEADS, HEADS, hd, tk, 1.0 / (hd as f32).sqrt());
+    gate_out(r);
 }
 
 /// A text cross-attention guided away from a negative context ([`Nag`]; the reference's `nag_attn`): `xq`'s `tq`
@@ -526,8 +814,10 @@ fn attend_guided(r: &mut dyn ChainRecorder, a: &Attn, xq: &DeviceVec, tq: usize,
         }
     }
     r.nag_mix(plain, &s.att, tq, D, nag.scale, nag.tau, nag.alpha);
-    a.gate.forward(r, xq, &s.logits, tq);
-    r.head_gate_rows(plain, &s.logits, tq, HEADS, HD);
+    if let Some(gate) = &a.gate {
+        gate.forward(r, xq, &s.logits, tq);
+        r.head_gate_rows(plain, &s.logits, tq, HEADS, HD);
+    }
     a.out.forward(r, plain, y, tq);
 }
 
@@ -553,7 +843,8 @@ impl Scratch {
             kn: v(rows * D),
             v: v(rows * D),
             kv: v(rows * 2 * D),
-            att: v(gpu.attention_rows_full_out_len(rows, HEADS, HD, rows)),
+            // (the video's heads, or the audio's of half the width: whichever's scratch is the longer)
+            att: v(gpu.attention_rows_full_out_len(rows, HEADS, HD, rows).max(gpu.attention_rows_full_out_len(rows, HEADS, A / HEADS, rows))),
             logits: v(rows * HEADS),
         }
     }
@@ -572,18 +863,19 @@ impl ConnectorBlock {
     }
 }
 
-/// The text connector over `x` (`rows` of `D`, changed in place) as [`crate::ltx::transformer::connector`] runs it:
-/// each block RMS-normed (no weights) into its self-attention (rotated by `table`) and its feed-forward, each added
-/// back; the result over its RMS (a new vector).
+/// The text connector over `x` (`rows` of its blocks' width: the video's 4,096 or the audio's 2,048; changed in place)
+/// as [`crate::ltx::transformer::connector`] runs it: each block RMS-normed (no weights) into its self-attention
+/// (rotated by `table`) and its feed-forward, each added back; the result over its RMS (a new vector).
 pub fn connector(gpu: &ggml_rs_wgpu::WgpuBackend, r: &mut dyn ChainRecorder, blocks: &[ConnectorBlock], x: &DeviceVec, rows: usize, table: &DeviceVec) -> DeviceVec {
     let s = Scratch::new(gpu, rows);
-    let ones = gpu.vec(D);
-    gpu.upload(&ones, &vec![1.0; D]);
+    let (d, ff) = blocks.first().map_or((D, 4 * D), |b| (b.attn1.q.k, b.ff0.n));
+    let ones = gpu.vec(d);
+    gpu.upload(&ones, &vec![1.0; d]);
     let v = |len: usize| gpu.vec(len.max(1));
-    let (h, y, f, fg, out) = (v(rows * D), v(rows * D), v(rows * 4 * D), v(rows * 4 * D), v(rows * D));
+    let (h, y, f, fg, out) = (v(rows * d), v(rows * d), v(rows * ff), v(rows * ff), v(rows * d));
     for b in blocks {
         r.rmsnorm_rows(x, &ones, &h, rows, EPS);
-        attend(r, &b.attn1, &h, rows, &h, rows, Some(table), false, &s, &y);
+        attend(r, &b.attn1, &h, rows, &h, rows, Some(table), Some(table), false, &s, &y);
         r.add(x, &y);
         r.rmsnorm_rows(x, &ones, &h, rows, EPS);
         b.ff0.forward(r, &h, &f, rows);
@@ -750,6 +1042,180 @@ mod tests {
         Ok(())
     }
 
+    /// The two streams' first two blocks on WebGPU give the reference's own velocities: its golden tensors
+    /// (`tools/ltx/audio_reference.py --part transformer`, in `OAIY_LTX_GOLDEN`; the checkpoint `OAIY_LTX_CHECKPOINT`),
+    /// as [`crate::ltx::transformer`]'s `audio_video_blocks_match_reference` holds Candle to them: a video of one
+    /// latent frame of 4 by 4, its first four tokens a starting image's (clean: their velocities are the sampler's
+    /// to discard), six audio frames, each stream over eight context rows, at sigma 0.725; then the audio frozen
+    /// (its sigma 0, the video's as it was). The reference is BF16 throughout and this is Q8_0 weights (f16 with
+    /// OAIY_LTX_WEBGPU_WEIGHTS=f16) under f32 activations: held to a twentieth, where Candle's BF16 is to 0.03.
+    #[test]
+    #[ignore = "needs the reference's golden tensors (OAIY_LTX_GOLDEN), their checkpoint (OAIY_LTX_CHECKPOINT) and a WebGPU adapter"]
+    fn the_two_streams_blocks_are_the_references() -> Result<()> {
+        let (Some(root), Some(weights)) = (std::env::var_os("OAIY_LTX_GOLDEN").map(std::path::PathBuf::from), std::env::var_os("OAIY_LTX_CHECKPOINT")) else { return Ok(()) };
+        let read = |name: &str, len: usize| -> Result<Vec<f32>> {
+            let bytes = std::fs::read(root.join(name))?;
+            if bytes.len() != 4 * len {
+                candle_core::bail!("{name}: {} bytes, not {len} floats", bytes.len());
+            }
+            Ok(bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect())
+        };
+        let (frames, h, w, fps, lc) = (1usize, 4usize, 4usize, 24usize, 8usize);
+        let (tokens, audio_frames, la, clean) = (frames * h * w, 6usize, 8usize, 4usize);
+        let (x, context) = (read("av-video-input.f32", tokens * 128)?, read("av-video-context.f32", lc * D)?);
+        let (ax, actx) = (read("av-audio-input.f32", audio_frames * 128)?, read("av-audio-context.f32", la * A)?);
+        let mut store = Store::open(std::path::Path::new(&weights), 0)?;
+        let mut gpu = WgpuLtx::load_streams(&mut store, 0, true, |_| {})?;
+        // (the reference ran the first two blocks)
+        gpu.blocks.truncate(2);
+        let positions = video_positions(frames, h, w, fps, false);
+        let table = gpu.upload(&rope_table(&positions, &[20., 2048., 2048.], D, HEADS));
+        let times: Vec<Vec<f32>> = positions.iter().map(|p| vec![p[0]]).collect();
+        let video_cross = gpu.upload(&rope_table(&times, &[20.], A, HEADS));
+        let middles: Vec<Vec<f32>> = crate::ltx::transformer::audio_spans(audio_frames).iter().map(|&(s, e)| vec![((s + e) / 2.) as f32]).collect();
+        let sound_table = gpu.upload(&rope_table(&middles, &[20.], A, HEADS));
+        let relative = |got: &[f32], want: &[f32]| -> f64 {
+            let e: f64 = got.iter().zip(want).map(|(a, b)| (*a as f64 - *b as f64).powi(2)).sum();
+            (e / want.iter().map(|b| (*b as f64).powi(2)).sum::<f64>()).sqrt()
+        };
+        let mut worst = 0f64;
+        for (sound_sigma, video_name, audio_name, what) in [(0.725, "av-video-output.f32", "av-audio-output.f32", "both denoised"), (0., "av-frozen-video-output.f32", "av-frozen-audio-output.f32", "the audio frozen")] {
+            // (a set of goldens made without the frozen pass has no such pair)
+            if sound_sigma == 0. && !root.join(video_name).is_file() {
+                continue;
+            }
+            let pass = AudioPass { latent: &ax, tokens: audio_frames, context: &actx, rows: la, sigma: sound_sigma, table: &sound_table, video_cross: &video_cross, skip_self: None };
+            let (video, audio) = gpu.forward_av(&x, tokens, &context, lc, 0.725, &table, (clean, 0), h * w, None, &pass)?;
+            let (want_video, want_audio) = (read(video_name, tokens * 128)?, read(audio_name, audio_frames * 128)?);
+            let (ev, ea) = (relative(&video[clean * 128..], &want_video[clean * 128..]), relative(&audio, &want_audio));
+            eprintln!("{what}: the video's velocity {ev:.4} from the reference's (relative RMS), the audio's {ea:.4}");
+            worst = worst.max(ev).max(ea);
+        }
+        assert!(worst < 0.05, "the two streams' blocks: {worst} from the reference's");
+        Ok(())
+    }
+
+    /// The audio stream's text connector on WebGPU (2,048 wide: [`connector`] at its blocks' width) gives the
+    /// reference's own context: its golden tensors (`OAIY_LTX_GOLDEN`'s `audio-connector-input.f32`, twelve prompt
+    /// rows, and `-output.f32`, the 1,024 rows; the checkpoint `OAIY_LTX_CHECKPOINT`), as
+    /// [`crate::ltx::transformer`]'s `audio_connector_matches_reference` holds Candle to them.
+    #[test]
+    #[ignore = "needs the reference's golden tensors (OAIY_LTX_GOLDEN), their checkpoint (OAIY_LTX_CHECKPOINT) and a WebGPU adapter"]
+    fn the_audio_connector_is_the_references() -> Result<()> {
+        let (Some(root), Some(weights)) = (std::env::var_os("OAIY_LTX_GOLDEN").map(std::path::PathBuf::from), std::env::var_os("OAIY_LTX_CHECKPOINT")) else { return Ok(()) };
+        let read = |name: &str, len: usize| -> Result<Vec<f32>> {
+            let bytes = std::fs::read(root.join(name))?;
+            if bytes.len() != 4 * len {
+                candle_core::bail!("{name}: {} bytes, not {len} floats", bytes.len());
+            }
+            Ok(bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect())
+        };
+        let (rows, s) = (1024usize, 12usize);
+        let (features, want) = (read("audio-connector-input.f32", s * A)?, read("audio-connector-output.f32", rows * A)?);
+        let gpu = ggml_rs_wgpu::WgpuBackend::nth(0, None).map_err(err)?;
+        let mut store = Store::open(std::path::Path::new(&weights), 0)?;
+        let p = format!("{PREFIX}audio_embeddings_connector");
+        let registers = store.tensor_f32(&format!("{p}.learnable_registers"), &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+        let blocks: Vec<ConnectorBlock> = (0..8).map(|i| ConnectorBlock::load(&mut store, &gpu, &format!("{p}.transformer_1d_blocks.{i}"))).collect::<Result<_>>()?;
+        // the prompt's rows, then the learned registers (register i % 128 at row i)
+        let x0: Vec<f32> = features.iter().copied().chain((s..rows).flat_map(|i| registers[(i % 128) * A..(i % 128 + 1) * A].iter().copied())).collect();
+        let x = gpu.vec(rows * A);
+        gpu.upload(&x, &x0);
+        let rope = rope_table(&(0..rows).map(|i| vec![i as f32]).collect::<Vec<_>>(), &[4096.], A, HEADS);
+        let table = gpu.vec(rope.len());
+        gpu.upload(&table, &rope);
+        let mut rec = gpu.begin();
+        rec.keep_groups(false);
+        let out = connector(&gpu, rec.as_mut(), &blocks, &x, rows, &table);
+        rec.read(&out);
+        let got = rec.finish().pop().ok_or_else(|| err("the context was not read"))?;
+        let (cos, e) = compare(&got, &want);
+        eprintln!("the audio connector's context: cosine {cos:.6}, {e:.4} from the reference's (relative)");
+        assert!(e < 0.03, "the audio connector: {e} from the reference's");
+        Ok(())
+    }
+
+    /// The two streams on WebGPU give the Candle ones' velocities (CPU, BF16) for the checkpoint `OAIY_LTX_NVFP4`
+    /// names (one with its audio stream: LTX 2.3's single file): a video of 2 latent frames by 4 by 6 and 9 audio
+    /// frames, each over its own context (random, near unit RMS), at two sigmas, the audio's its own. Each stream as
+    /// near as the reference is to itself with its inputs one BF16 step off, or to a tenth (see
+    /// [`the_webgpu_video_stream_is_the_candle_one`]).
+    #[test]
+    #[ignore = "needs an LTX 2.3 checkpoint with its audio stream (OAIY_LTX_NVFP4), a WebGPU adapter, some 60 GB of RAM and a Candle that multiplies BF16 (CUDA's: the CPU's does not)"]
+    fn the_webgpu_audio_and_video_streams_are_the_candle_ones() -> Result<()> {
+        use crate::ltx::transformer::{AudioInput, Rope, Transformer};
+        let Some(path) = std::env::var_os("OAIY_LTX_NVFP4") else { return Ok(()) };
+        let path = std::path::Path::new(&path);
+        let (frames, h, w, fps, lc) = (2usize, 4usize, 6usize, 24usize, 40usize);
+        let (audio_frames, la) = (9usize, 24usize);
+        let tokens = frames * h * w;
+        let mut seed = 0x51ed_270bu64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64 * 2. - 1.
+        };
+        let latent: Vec<f32> = (0..tokens * 128).map(|_| (next() * 1.7) as f32).collect();
+        let context: Vec<f32> = (0..lc * D).map(|_| (next() * 1.7) as f32).collect();
+        let sound: Vec<f32> = (0..audio_frames * 128).map(|_| (next() * 1.7) as f32).collect();
+        let sound_context: Vec<f32> = (0..la * A).map(|_| (next() * 1.7) as f32).collect();
+        let t = std::time::Instant::now();
+        let mut store = Store::open(path, 0)?;
+        let gpu = WgpuLtx::load_streams(&mut store, 0, true, |_| {})?;
+        eprintln!("WebGPU video and audio streams loaded in {:.1} s", t.elapsed().as_secs_f64());
+        let positions = video_positions(frames, h, w, fps, false);
+        let table = gpu.upload(&rope_table(&positions, &[20., 2048., 2048.], D, HEADS));
+        let times: Vec<Vec<f32>> = positions.iter().map(|p| vec![p[0]]).collect();
+        let video_cross = gpu.upload(&rope_table(&times, &[20.], A, HEADS));
+        let middles: Vec<Vec<f32>> = crate::ltx::transformer::audio_spans(audio_frames).iter().map(|&(s, e)| vec![((s + e) / 2.) as f32]).collect();
+        let sound_table = gpu.upload(&rope_table(&middles, &[20.], A, HEADS));
+        // (the audio's sigma its own: the gates and the rows between the streams go by the right one each)
+        let sigmas = [(0.8, 0.725), (0.25, 0.25)];
+        let mut got = Vec::new();
+        for &(sigma, sound_sigma) in &sigmas {
+            let t = std::time::Instant::now();
+            let pass = AudioPass { latent: &sound, tokens: audio_frames, context: &sound_context, rows: la, sigma: sound_sigma, table: &sound_table, video_cross: &video_cross, skip_self: None };
+            got.push(gpu.forward_av(&latent, tokens, &context, lc, sigma, &table, (0, 0), h * w, None, &pass)?);
+            eprintln!("a step of both streams: {:.2} s", t.elapsed().as_secs_f64());
+        }
+        // and the video alone from the model loaded with both: its stream as it is without sound
+        let alone = gpu.forward(&latent, tokens, &context, lc, 0.8, &table, (0, 0), h * w, None)?;
+        drop(gpu);
+        let dev = Device::Cpu;
+        let mut cpu = Transformer::new(Store::open(path, 0)?, &dev, 8 << 30, false, true)?;
+        assert!(!cpu.int8, "the reference's blocks as INT8");
+        let rope = Rope::video_with_end(frames, h, w, fps, false, &dev)?;
+        let (sound_rope, cross_rope) = (Rope::audio(audio_frames, &dev)?, Rope::video_cross(frames, h, w, fps, false, &dev)?);
+        let bf16 = |v: &[f32], rows: usize, width: usize| candle_core::Tensor::from_vec(v.to_vec(), (1, rows, width), &dev)?.to_dtype(DType::BF16);
+        let (lt, ct, st, sct) = (bf16(&latent, tokens, 128)?, bf16(&context, lc, D)?, bf16(&sound, audio_frames, 128)?, bf16(&sound_context, la, A)?);
+        let (ln, cn, sn, scn) = (nudged(&lt)?, nudged(&ct)?, nudged(&st)?, nudged(&sct)?);
+        let host = |t: candle_core::Tensor| t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>();
+        for (i, &(sigma, sound_sigma)) in sigmas.iter().enumerate() {
+            let t = std::time::Instant::now();
+            let mut both = |l: &candle_core::Tensor, c: &candle_core::Tensor, s: &candle_core::Tensor, sc: &candle_core::Tensor| -> Result<(Vec<f32>, Vec<f32>)> {
+                let audio = AudioInput { latent: s, context: sc, rope: &sound_rope, video_cross: &cross_rope, sigma: sound_sigma, isolated: false, clean_tokens: 0 };
+                let (video, sound) = cpu.forward(l, c, sigma, &rope, 0, 0, Some(audio), |_| {})?;
+                Ok((host(video)?, host(sound.ok_or_else(|| err("the reference gave no audio velocity"))?)?))
+            };
+            let want = both(&lt, &ct, &st, &sct)?;
+            let seconds = t.elapsed().as_secs_f64();
+            let near = both(&ln, &cn, &sn, &scn)?;
+            for (what, got, want, near) in [("video", &got[i].0, &want.0, &near.0), ("audio", &got[i].1, &want.1, &near.1)] {
+                let (_, spread) = compare(near, want);
+                let (cos, e) = compare(got, want);
+                eprintln!("sigma {sigma} (the audio's {sound_sigma}), the {what}'s velocity: cosine {cos:.6}, relative error {e:.2e} (the reference's own spread {spread:.2e}; its step {seconds:.1} s)");
+                assert!(e <= (3.0 * spread).max(0.1), "the {what}'s velocity at sigma {sigma}: relative error {e} where the reference's own spread is {spread}");
+            }
+        }
+        // (the video alone: against the reference with no audio, through the same blocks)
+        let (video, _) = cpu.forward(&lt, &ct, 0.8, &rope, 0, 0, None, |_| {})?;
+        let (cos, e) = compare(&alone, &host(video)?);
+        eprintln!("the video alone from the model with both: cosine {cos:.6}, relative error {e:.2e}");
+        assert!(e <= 0.3, "the video alone: relative error {e}");
+        Ok(())
+    }
+
     /// A layer a LoRA adapts is loaded with it (`Store::add_lora`): its product the weight's plus the LoRA's scaled
     /// `B A`, as f16 (a layer 8 wide) and as Q8_0 (256 wide, to its quantization), where a layer the LoRA does not
     /// name is its weight alone.
@@ -854,7 +1320,7 @@ mod tests {
         let mut gpu = WgpuLtx::load(&mut store, 0, |_| {})?;
         gpu.nag = negative.as_ref().map(|n| Nag { context: n.clone(), rows: 24, scale: 11.0, tau: 2.5, alpha: 0.25 });
         let table = gpu.upload(&rope_table(&video_positions(frames, h, w, fps, false), &[20., 2048., 2048.], D, HEADS));
-        let got = gpu.pass(&latent, tokens, &context, lc, 0.8, &table, (0, 0), h * w, None, true)?;
+        let got = gpu.pass(&latent, tokens, &context, lc, 0.8, &table, (0, 0), h * w, None, true, None)?;
         let trail = &got[0];
         drop(gpu);
         let dev = Device::Cpu;

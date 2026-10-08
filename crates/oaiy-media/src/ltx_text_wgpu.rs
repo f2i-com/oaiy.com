@@ -24,6 +24,8 @@ const EPS: f32 = 1e-6;
 const ROWS: usize = 1024;
 const D: usize = 4096;
 const CHEADS: usize = 32;
+/// The audio stream's connector's width.
+const AUDIO: usize = 2048;
 
 fn err(e: impl std::fmt::Display) -> candle_core::Error {
     candle_core::Error::Msg(e.to_string())
@@ -176,7 +178,14 @@ fn first(v: &DeviceVec, len: usize) -> DeviceVec {
 /// 2.5's Gemma 4 12B, its tokenizer and aggregate projection in its own file) and the projection (where Gemma's file
 /// has none) and connector in `transformer` (LTX's checkpoint), on GPU `device` (as CUDA counts them;
 /// OAIY_WEBGPU_ADAPTER naming one instead). `progress(step, of)` as it goes.
-pub fn contexts(gemma: &Path, tokenizer: Option<&Path>, transformer: &mut Store, prompts: &[String], device: usize, mut progress: impl FnMut(usize, usize)) -> Result<Vec<Vec<f32>>> {
+pub fn contexts(gemma: &Path, tokenizer: Option<&Path>, transformer: &mut Store, prompts: &[String], device: usize, progress: impl FnMut(usize, usize)) -> Result<Vec<Vec<f32>>> {
+    Ok(contexts_streams(gemma, tokenizer, transformer, prompts, device, false, progress)?.into_iter().map(|(video, _)| video).collect())
+}
+
+/// [`contexts`], and with `audio` each prompt's audio context beside its video one (`[1024, 2048]`: the same stacked
+/// states through the audio stream's aggregate projection and its own connector, as
+/// [`crate::ltx::text::encode`] and the reference's `audio_embeddings_connector`).
+pub fn contexts_streams(gemma: &Path, tokenizer: Option<&Path>, transformer: &mut Store, prompts: &[String], device: usize, audio: bool, mut progress: impl FnMut(usize, usize)) -> Result<Vec<(Vec<f32>, Option<Vec<f32>>)>> {
     let gpu = ggml_rs_wgpu::WgpuBackend::nth(device, None).map_err(err)?;
     let mut store = Store::open(gemma, 0)?;
     let prefix = if store.index.get("language_model.model.embed_tokens.weight").is_some() { "language_model.model." } else { "model." };
@@ -197,7 +206,7 @@ pub fn contexts(gemma: &Path, tokenizer: Option<&Path>, transformer: &mut Store,
         ids.truncate(ROWS);
         ids_all.push(ids);
     }
-    let steps = LAYERS + 10;
+    let steps = LAYERS + 10 + if audio { 9 } else { 0 };
     // the global layers' heads: Gemma 3's the local width (positions over 8), Gemma 4's twice it (a quarter of its
     // pairs turned, positions as they are); attention unscaled in Gemma 4
     let (global_hd, global_factor, global_turned) = if gemma4 { (GLOBAL_HD, 1., GLOBAL_HD / 8) } else { (HD, 8., HD / 2) };
@@ -327,43 +336,56 @@ pub fn contexts(gemma: &Path, tokenizer: Option<&Path>, transformer: &mut Store,
         prompts.into_iter().map(|p| (p.feats, p.s)).collect()
     };
     gpu.release_cached();
-    // the projection (its input over sqrt(3840 / 4096), folded into its weights; Gemma 4's in its own file) and the
-    // connector
+    // a stream's projection (its input over sqrt(3840 / its width), folded into its weights; Gemma 4's in its own file)
+    // and its connector: the video's 4,096 wide, the audio's 2,048
     let g = |n: &str| format!("model.diffusion_model.{n}");
-    let name = "text_embedding_projection.video_aggregate_embed";
-    let own = store.index.get(&format!("{name}.weight")).is_some();
-    let proj = projection(if own { &mut store } else { &mut *transformer }, &gpu, name, (D as f32 / G as f32).sqrt())?;
-    drop(store);
-    progress(LAYERS + 1, steps);
-    let registers = transformer.tensor_f32(&g("video_embeddings_connector.learnable_registers"), &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
-    let mut blocks = Vec::with_capacity(8);
-    for i in 0..8 {
-        let p = g(&format!("video_embeddings_connector.transformer_1d_blocks.{i}"));
-        blocks.push(crate::ltx_wgpu::ConnectorBlock::load(transformer, &gpu, &p)?);
-        progress(LAYERS + 2 + i, steps);
-    }
-    let rope = rope_table(&(0..ROWS).map(|i| vec![i as f32]).collect::<Vec<_>>(), &[4096.], D, CHEADS);
-    let table = gpu.vec(rope.len());
-    gpu.upload(&table, &rope);
-    let mut contexts = Vec::new();
-    for (feats, s) in stacked {
-        let x = gpu.vec(ROWS * D);
-        // the learned registers past the prompt's rows (register i % 128 at row i)
-        let pad: Vec<f32> = (s..ROWS).flat_map(|i| registers[(i % 128) * D..(i % 128 + 1) * D].iter().copied()).collect();
-        if !pad.is_empty() {
-            gpu.upload_at(&x, s * D, &pad);
+    let mut done = LAYERS;
+    let mut stream = |store: &mut Store, transformer: &mut Store, which: &str, width: usize| -> Result<Vec<Vec<f32>>> {
+        let name = format!("text_embedding_projection.{which}_aggregate_embed");
+        let own = store.index.get(&format!("{name}.weight")).is_some();
+        let proj = projection(if own { store } else { &mut *transformer }, &gpu, &name, (width as f32 / G as f32).sqrt())?;
+        done += 1;
+        progress(done, steps);
+        let registers = transformer.tensor_f32(&g(&format!("{which}_embeddings_connector.learnable_registers")), &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+        if proj.n != width || registers.len() != 128 * width {
+            candle_core::bail!("the {which} stream's context: a projection to {} and {} register values, for a width of {width}", proj.n, registers.len());
         }
-        let mut rec = gpu.begin();
-        rec.keep_groups(false);
-        let r = rec.as_mut();
-        proj.forward(r, &feats, &x, s);
-        let out = crate::ltx_wgpu::connector(&gpu, r, &blocks, &x, ROWS, &table);
-        r.read(&out);
-        let c = rec.finish().pop().ok_or_else(|| err("the context was not read"))?;
-        contexts.push(c);
-    }
+        let mut blocks = Vec::with_capacity(8);
+        for i in 0..8 {
+            let p = g(&format!("{which}_embeddings_connector.transformer_1d_blocks.{i}"));
+            blocks.push(crate::ltx_wgpu::ConnectorBlock::load(transformer, &gpu, &p)?);
+            done += 1;
+            progress(done, steps);
+        }
+        let rope = rope_table(&(0..ROWS).map(|i| vec![i as f32]).collect::<Vec<_>>(), &[4096.], width, CHEADS);
+        let table = gpu.vec(rope.len());
+        gpu.upload(&table, &rope);
+        let mut contexts = Vec::new();
+        for (feats, s) in &stacked {
+            let s = *s;
+            let x = gpu.vec(ROWS * width);
+            // the learned registers past the prompt's rows (register i % 128 at row i)
+            let pad: Vec<f32> = (s..ROWS).flat_map(|i| registers[(i % 128) * width..(i % 128 + 1) * width].iter().copied()).collect();
+            if !pad.is_empty() {
+                gpu.upload_at(&x, s * width, &pad);
+            }
+            let mut rec = gpu.begin();
+            rec.keep_groups(false);
+            let r = rec.as_mut();
+            proj.forward(r, feats, &x, s);
+            let out = crate::ltx_wgpu::connector(&gpu, r, &blocks, &x, ROWS, &table);
+            r.read(&out);
+            contexts.push(rec.finish().pop().ok_or_else(|| err("the context was not read"))?);
+        }
+        Ok(contexts)
+    };
+    let video = stream(&mut store, transformer, "video", D)?;
+    let sound = if audio { Some(stream(&mut store, transformer, "audio", AUDIO)?) } else { None };
+    drop(stream);
+    drop(store);
     progress(steps, steps);
-    Ok(contexts)
+    let mut sound = sound.map(|s| s.into_iter());
+    Ok(video.into_iter().map(|v| (v, sound.as_mut().and_then(|s| s.next()))).collect())
 }
 
 /// The aggregate projection `name` (`[n, 3840 x 49]`) for the features as stacked here (each state's 3,840 channels

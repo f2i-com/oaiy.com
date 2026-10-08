@@ -15,7 +15,8 @@ strength-zero control have now succeeded. See [current validation and reproducti
 > at an 8x8 latent and 0.99995 at 32x32 (Candle's own quantized matmul, which rounds
 > the activations to 8 bits a block as ggml's does, is 0.9987 from that itself), the
 > text encoder's worst token 0.9992. `backend: "cpu"` runs Candle on the CPU (the
-> reference, and slow). The CUDA worker these pages record stands on the branch
+> reference, and slow: the same 512x512 picture in 289 s on a Ryzen 9 9950X3D, its
+> steps 265 s and its decode 11.7 s). The CUDA worker these pages record stands on the branch
 > `backup/cuda-support-2026-10-08`.
 The text below preserves the initial checkpoint and its inspection evidence.
 

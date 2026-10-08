@@ -9,12 +9,21 @@ The server and inference core remain std-only and forbid unsafe Rust.
 
 > **WebGPU, since 2026-10-08.** The worker's one GPU backend is WebGPU, which a job
 > gets when it names no backend: text-to-video and image-to-video, guided sampling, a
-> negative prompt and LoRAs run there, without sound. Sound (a soundtrack made with the
-> picture, one to follow, speech) and two-stage refinement have no WebGPU path yet and
-> are refused there; `backend: "cuda"` is refused by name, and Candle's CPU backend
-> cannot multiply the model's BF16 weights. What this page says of sound, of
-> refinement, of CUDA and of its timings describes the CUDA build, which stands on the
-> branch `backup/cuda-support-2026-10-08`.
+> negative prompt and LoRAs run there, and (2026-10-11) a clip's own sound, made with
+> its picture: the transformer's audio stream beside its video stream, each block's two
+> attending to each other, and the audio's text context, all on the GPU; the audio VAE
+> and the vocoder are still Candle's on the CPU. On one RTX 5090 at its 400 W cap, LTX
+> 2.3's distilled checkpoint (its one file given as `audio_vae` too), 512x320, 49
+> frames: 62 s with sound where 36 s without (the eight steps 4.0 s where 3.1; the
+> sound's decode on the CPU 16 s; the rest reading the checkpoint and Gemma). Against
+> the reference's golden tensors (`tools/ltx/audio_reference.py`) the two streams' first
+> two blocks give its velocities to 0.7% (video 0.0066, audio 0.0073 to 0.0077, with
+> the audio denoised and with it frozen) and the audio connector its context to 0.7%,
+> from Q8_0 weights where the reference is BF16. A soundtrack or speech to follow, a
+> reference voice and two-stage refinement have no WebGPU path yet and are refused
+> there; `backend: "cuda"` is refused by name, and Candle's CPU backend cannot multiply
+> the model's BF16 weights. What this page says of those, of CUDA and of its timings
+> describes the CUDA build, which stands on the branch `backup/cuda-support-2026-10-08`.
 
 Sulphur-2 and LTX 2.5 have been validated end to end locally in both text-to-video
 and image-to-video modes. The original LTX 2.3 checkpoint is still downloading;
