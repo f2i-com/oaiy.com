@@ -362,6 +362,13 @@ pub trait ChainRecorder {
         let _ = (experts, x, streams_x, post, logits, top_k, rows, streams);
         false
     }
+    /// The shared expert of a layer whose routed experts are on the host (`Experts::on_host`), where this device
+    /// holds it: its output on each of `rows` rows of `x` into `out` (`[rows, hidden]`, not weighted), for
+    /// `Experts::forward_given`. False where it does not (nothing recorded: the host runs the shared expert too).
+    fn moe_shared(&mut self, experts: &dyn crate::exl3::Experts, x: &DeviceVec, out: &DeviceVec, rows: usize) -> bool {
+        let _ = (experts, x, out, rows);
+        false
+    }
     /// `acc[i] += weights[at] * y[i]` for `i < len`: a weighted sum's term, its weight read from the device (an
     /// expert's, written by the host before the chain runs).
     fn axpy_at(&mut self, acc: &DeviceVec, y: &DeviceVec, weights: &DeviceVec, at: usize, len: usize);

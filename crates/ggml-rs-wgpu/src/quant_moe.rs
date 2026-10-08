@@ -147,9 +147,13 @@ impl Experts for QuantMoeCpu {
         });
         Tensor::from_vec(out, vec![rows, h])
     }
+
+    fn on_host(&self) -> bool {
+        true
+    }
 }
 
-/// The experts of `data` on the host.
+/// The experts of `data` on the host, the reference: [`crate::quant_host::quant_experts_host`] is what a model runs.
 pub fn quant_experts_cpu(data: QuantExpertsData) -> Result<Box<dyn Experts>, String> {
     data.validate()?;
     Ok(Box::new(QuantMoeCpu { data }))
@@ -476,7 +480,7 @@ enum Order<'a> {
 }
 
 /// The shared expert's matrix: f16 where every value is one exactly (a Q2_0 matrix's are), else f32.
-struct Dense {
+pub(crate) struct Dense {
     w: DeviceVec,
     half: bool,
     n: usize,
@@ -484,7 +488,7 @@ struct Dense {
 }
 
 impl Dense {
-    fn new(b: &WgpuBackend, values: &[f32], n: usize, k: usize) -> Self {
+    pub(crate) fn new(b: &WgpuBackend, values: &[f32], n: usize, k: usize) -> Self {
         match DeviceChain::vec_f16(b, values) {
             Some(w) => Dense { w, half: true, n, k },
             None => {
@@ -495,7 +499,7 @@ impl Dense {
         }
     }
 
-    fn rows(&self, rec: &mut crate::chain::Recorder<'_>, x: &DeviceVec, y: &DeviceVec, rows: usize) {
+    pub(crate) fn rows(&self, rec: &mut crate::chain::Recorder<'_>, x: &DeviceVec, y: &DeviceVec, rows: usize) {
         if self.half {
             rec.matmul_f16_rows(&self.w, self.n, self.k, x, y, rows);
         } else {
@@ -814,7 +818,8 @@ impl Experts for QuantMoe {
 
 impl WgpuBackend {
     /// A MoE layer's experts as a GGUF holds them: on the GPU as groups ([`QuantMoe`]) where the kernels decode their
-    /// types and the weight budget holds them, else on the host ([`QuantMoeCpu`]).
+    /// types and the weight budget holds them, else on the host, their shared expert here
+    /// ([`crate::quant_host::quant_experts_host_beside`]).
     pub fn quant_experts(&self, data: QuantExpertsData) -> Result<Box<dyn Experts>, String> {
         self.quant_experts_leaving(data, 0)
     }
@@ -824,13 +829,13 @@ impl WgpuBackend {
         data.validate()?;
         match QuantMoe::try_new(self, data, reserve) {
             Ok(g) => Ok(Box::new(g)),
-            Err(data) => Ok(Box::new(QuantMoeCpu { data })),
+            Err(data) => crate::quant_host::quant_experts_host_beside(self, data),
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn rng(mut seed: u64) -> impl FnMut() -> f32 {
@@ -854,7 +859,7 @@ mod tests {
     }
 
     /// Experts at random: the routed ones Q2_0; the shared one's values f16's where `half` (as a Q2_0 matrix's are).
-    fn experts(seed: u64, hidden: usize, ff: usize, count: usize, half: bool) -> QuantExpertsData {
+    pub(crate) fn experts(seed: u64, hidden: usize, ff: usize, count: usize, half: bool) -> QuantExpertsData {
         let mut next = rng(seed);
         let gate = random_q2_0(&mut next, count, ff, hidden);
         let up = random_q2_0(&mut next, count, ff, hidden);
@@ -864,18 +869,18 @@ mod tests {
         QuantExpertsData { hidden, ff, experts: count, gate: (GgmlType::Q2_0, gate), up: (GgmlType::Q2_0, up), down: (GgmlType::Q2_0, down), shared }
     }
 
-    fn copy(d: &QuantExpertsData) -> QuantExpertsData {
+    pub(crate) fn copy(d: &QuantExpertsData) -> QuantExpertsData {
         QuantExpertsData { hidden: d.hidden, ff: d.ff, experts: d.experts, gate: d.gate.clone(), up: d.up.clone(), down: d.down.clone(), shared: d.shared.clone() }
     }
 
     /// `rows` rows of inputs and of router logits (no two alike).
-    fn inputs(seed: u64, rows: usize, hidden: usize, count: usize) -> (Vec<f32>, Vec<f32>) {
+    pub(crate) fn inputs(seed: u64, rows: usize, hidden: usize, count: usize) -> (Vec<f32>, Vec<f32>) {
         let mut next = rng(seed);
         ((0..rows * hidden).map(|_| next()).collect(), (0..rows * (count + 1)).map(|_| 3.0 * next()).collect())
     }
 
     /// The worst difference between `got` and `want`, over `want`'s RMS.
-    fn worst(got: &[f32], want: &[f32]) -> f64 {
+    pub(crate) fn worst(got: &[f32], want: &[f32]) -> f64 {
         assert_eq!(got.len(), want.len());
         let rms = (want.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / want.len() as f64).sqrt();
         got.iter().zip(want).map(|(g, w)| (*g as f64 - *w as f64).abs()).fold(0f64, f64::max) / rms.max(1e-30)

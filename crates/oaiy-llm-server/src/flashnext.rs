@@ -1379,6 +1379,9 @@ struct ChainLayer {
     mixer: ChainMixer,
     /// The router, then the shared expert's gate, `[experts + 1, hidden]`.
     router: ChainMat,
+    /// Its experts are on the host (no GPU had room for them): the chain reads its router and its experts' input
+    /// back, they run there, and their sum goes up for the layer's write-back.
+    host: bool,
 }
 
 enum ChainMixer {
@@ -1645,7 +1648,8 @@ fn chain_packed(w: &Weight) -> Option<&dyn PackedLinear> {
 
 impl FlashNext {
     /// The chained step's state, made at the first step that can use one: None when a device has no chain, or a
-    /// matrix or a layer's experts are not where a chain reads them.
+    /// matrix is not where a chain reads it, or a layer's experts are neither there nor on the host (a layer no GPU
+    /// had room for: [`ChainLayer::host`]).
     fn chain_state(&self) -> Option<&FnChain> {
         self.chain
             .get_or_init(|| {
@@ -1695,10 +1699,11 @@ impl FlashNext {
                             ChainMixer::Attn { q_norm: up(d, &a.q_norm), k_norm: up(d, &a.k_norm), iq_norm: up(d, &a.index_q_norm), ik_norm: up(d, &a.index_k_norm), slot: attn_of[d].len() - 1 }
                         }
                     };
-                    if !chains[d].holds_experts(l.moe.experts.as_ref()) {
+                    let host = !chains[d].holds_experts(l.moe.experts.as_ref());
+                    if host && (!l.moe.experts.on_host() || std::env::var_os("OAIY_NO_HOST_LAYERS").is_some()) {
                         return None;
                     }
-                    layers.push(ChainLayer { attn_hc: hc(d, &l.attn_hc)?, mlp_hc: hc(d, &l.mlp_hc)?, mixer, router: dense(&l.moe.router)? });
+                    layers.push(ChainLayer { attn_hc: hc(d, &l.attn_hc)?, mlp_hc: hc(d, &l.mlp_hc)?, mixer, router: dense(&l.moe.router)?, host });
                 }
                 // the last layer, the collapse and the head on the last device: a run's layers have written to the cache
                 // before it gets there, so nothing may leave it then
@@ -1960,7 +1965,7 @@ impl FlashNext {
             // chunk's vectors.
             let ahead = std::env::var_os("OAIY_FN_IN_TURN").is_none()
                 && self.devices.len() == 2
-                && self.chain_state().is_some_and(|st| st.ple.is_some())
+                && self.chain_state().is_some_and(|st| st.ple.is_some() && st.layers.iter().all(|l| !l.host))
                 && self.config.experts <= 1024
                 && self.config.top_k <= 32
                 && std::env::var_os("OAIY_HOST_ROUTE").is_none()
@@ -2418,9 +2423,12 @@ impl FlashNext {
         // after its router, their sums added to the streams there
         enum Routed {
             Host(Vec<Vec<(usize, f32)>>),
+            /// A layer's experts run on the host (none of its GPU's): their sums, for the device they go up to.
+            Summed(usize, Vec<f32>),
         }
         let experts = |rec: &mut dyn ChainRecorder, dv: &ChainDev, layer: usize, routed: Routed| match routed {
             Routed::Host(assign) => rec.moe_rows(self.layers[layer].moe.experts.as_ref(), &dv.y2_in, &dv.moe_out, &assign),
+            Routed::Summed(device, sums) => chains[device].upload(&dv.moe_out, &sums),
         };
         // an attention layer's K and V rows and its indexer keys (`[t, index_dim]`), read back, into the host's cache
         let (iq, id) = (cfg.index_heads * cfg.index_dim, cfg.index_dim);
@@ -2436,6 +2444,10 @@ impl FlashNext {
         // to the next device (its work held until they do), and its attention layers read
         let mut handoffs: Vec<(Box<dyn ChainRecorder + '_>, usize, Vec<usize>)> = parked.as_mut().map(|p| std::mem::take(&mut p.handoffs)).unwrap_or_default();
         let mut pending: Option<Routed> = None;
+        // (OAIY_FN_HOST_LOG: what the run's host layers cost, the waits for their read-backs and their experts)
+        static HOST_LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let host_log = *HOST_LOG.get_or_init(|| std::env::var_os("OAIY_FN_HOST_LOG").is_some());
+        let (mut host_layers, mut host_waited, mut host_ran) = (0usize, 0f64, 0f64);
         if resumed {
             // (as after a handoff: this device's work held till the streams are up)
             let mut r = chains[d].begin();
@@ -2697,7 +2709,7 @@ impl FlashNext {
             }
             hc(&mut *rec, dv, t, &cl.mlp_hc, Some((&dv.y_out, &dv.post)), &dv.post2, &dv.y2_in);
             cl.router.mul(&mut *rec, cfg.experts + 1, h, &dv.y2_in, &dv.router, t);
-            if on_gpu && rec.moe_routed_into(layer.moe.experts.as_ref(), &dv.y2_in, &dv.x, &dv.post2, &dv.router, cfg.top_k, t, s) {
+            if on_gpu && !cl.host && rec.moe_routed_into(layer.moe.experts.as_ref(), &dv.y2_in, &dv.x, &dv.post2, &dv.router, cfg.top_k, t, s) {
                 // the experts after it, on the device, their sums into the streams; the recording goes on
                 if let ChainMixer::Attn { slot, .. } = &cl.mixer {
                     rec.read_range(&m.kv[d].layers[*slot], past * row, t * row);
@@ -2710,7 +2722,18 @@ impl FlashNext {
                 }
                 continue;
             }
+            // The host between this layer's submits: to route its rows, or (a layer no GPU had room for) to run its
+            // experts on their input.
+            let width = cfg.experts + 1;
+            // (a host layer's shared expert on the device where it is there: its outputs read back with the rest)
+            let shared = cl.host && rec.moe_shared(layer.moe.experts.as_ref(), &dv.y2_in, &dv.moe_out, t);
             rec.read(&dv.router);
+            if cl.host {
+                rec.read_range(&dv.y2_in, 0, t * h);
+            }
+            if shared {
+                rec.read_range(&dv.moe_out, 0, t * h);
+            }
             let attn_slot = match &cl.mixer {
                 ChainMixer::Attn { slot, .. } => {
                     rec.read_range(&m.kv[d].layers[*slot], past * row, t * row);
@@ -2719,15 +2742,49 @@ impl FlashNext {
                 }
                 _ => false,
             };
+            // (what this device's recording waits on first: the chunk before's run, and the streams of the device
+            // before, whose handoff holds this one's work)
+            if let Some(p) = prev.take() {
+                p.finish(self, kv);
+            }
+            for (from, to, reads) in handoffs.drain(..) {
+                let mut got = from.finish().into_iter();
+                for &a in &reads {
+                    let (kvrows, raw) = (got.next().expect("a layer's K and V"), got.next().expect("its indexer keys"));
+                    to_store.push((a, kvrows, raw));
+                }
+                chains[to].upload(&devs[to].x, &got.next().expect("the streams"));
+            }
+            let waiting = std::time::Instant::now();
             let mut got = open.take().expect("the layer's recording").finish().into_iter();
+            host_waited += waiting.elapsed().as_secs_f64() * 1e3;
+            // (the device's attention layers before this one, routed on it: their rows and keys are this recording's)
+            for a in attn_reads.drain(..) {
+                let (kvrows, raw) = (got.next().expect("a layer's K and V"), got.next().expect("its indexer keys"));
+                to_store.push((a, kvrows, raw));
+            }
             let logits = got.next().expect("the router's logits");
+            let input = cl.host.then(|| got.next().expect("the experts' input"));
+            let shared = shared.then(|| got.next().expect("the shared expert's outputs"));
             if attn_slot {
                 let (kvrows, index) = (got.next().expect("the run's K and V"), got.next().expect("the run's indexer keys"));
                 let raw: Vec<f32> = index.chunks_exact(iq + id).take(t).flat_map(|r| r[iq..].iter().copied()).collect();
                 to_cache(i, kvrows, raw, kv);
             }
-            let width = cfg.experts + 1;
-            pending = Some(Routed::Host((0..t).map(|r| ggml_rs::exl3::route(&logits[r * width..(r + 1) * width], cfg.top_k)).collect()));
+            pending = Some(match input {
+                Some(x) => {
+                    let running = std::time::Instant::now();
+                    let (x, logits) = (Tensor::from_vec(x, vec![t, h]), Tensor::from_vec(logits[..t * width].to_vec(), vec![t, width]));
+                    let sums = match &shared {
+                        Some(shared) => layer.moe.experts.forward_given(&x, &logits, cfg.top_k, shared),
+                        None => layer.moe.experts.forward(&x, &logits, cfg.top_k),
+                    };
+                    host_layers += 1;
+                    host_ran += running.elapsed().as_secs_f64() * 1e3;
+                    Routed::Summed(d, sums.to_host().data().to_vec())
+                }
+                None => Routed::Host((0..t).map(|r| ggml_rs::exl3::route(&logits[r * width..(r + 1) * width], cfg.top_k)).collect()),
+            });
         }
         // the last layer's experts, its write-back, the streams' collapse and the head, on the last device (the
         // chain's state saw to it)
@@ -2771,6 +2828,9 @@ impl FlashNext {
             rec.read(&one.head);
         }
         mark("last device recorded");
+        if host_log && host_layers > 0 {
+            eprintln!("    fn run of {t} at {past}: {host_layers} layers' experts on the host {host_ran:.2} ms, the waits for their inputs {host_waited:.2} ms, {:.2} ms in all so far", clock.elapsed().as_secs_f64() * 1e3);
+        }
                 // each handoff in turn: its device's streams (once it has run) up to the next, whose held work then goes
         for (from, to, reads) in handoffs.drain(..) {
             let mut got = from.finish().into_iter();
@@ -2918,6 +2978,11 @@ impl FlashNext {
     pub fn prompt_rows(&self) -> usize {
         static ASKED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
         ASKED.get_or_init(|| std::env::var("OAIY_FN_ROWS").ok().and_then(|v| v.parse().ok()).filter(|n| (64..=1024).contains(n))).unwrap_or(512)
+    }
+
+    /// The layers whose experts run on the host (no GPU had room for them).
+    pub fn host_layers(&self) -> usize {
+        self.layers.iter().filter(|l| l.moe.experts.on_host()).count()
     }
 
     /// Whether the chain drafts tokens (its multi-token-prediction layer loaded and chained).

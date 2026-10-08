@@ -182,6 +182,11 @@ impl ChainRecorder for Recorder<'_> {
         g.record_routed(self, x, &out, logits, top_k, rows, Some((streams_x, post, streams)))
     }
 
+    fn moe_shared(&mut self, experts: &dyn ggml_rs::exl3::Experts, x: &DeviceVec, out: &DeviceVec, rows: usize) -> bool {
+        let Some(host) = experts.as_any().and_then(|a| a.downcast_ref::<crate::quant_host::QuantMoeHost>()) else { return false };
+        host.record_shared(self, x, out, rows)
+    }
+
     fn axpy_at(&mut self, acc: &DeviceVec, y: &DeviceVec, weights: &DeviceVec, at: usize, len: usize) {
         assert!(acc.len >= len && y.len >= len && weights.len > at, "chain: a weighted term of {len}");
         let pipeline = self.named("chain-axpy-at", AXPY_AT);

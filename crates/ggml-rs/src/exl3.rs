@@ -23,6 +23,19 @@ pub trait Experts: std::fmt::Debug + Send + Sync {
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         None
     }
+    /// VENDORED-LOCAL: whether these run on the host (a layer no GPU had room for): `forward` then takes host tensors,
+    /// touches no device, and gives a row the same sum whatever rows are beside it, so a chain may call it between a
+    /// layer's submits (the layer's router and input read back, the sum uploaded). Not by default.
+    fn on_host(&self) -> bool {
+        false
+    }
+    /// VENDORED-LOCAL: [`Self::forward`] of experts on the host whose shared expert a device ran
+    /// (`ChainRecorder::moe_shared`): `shared` its outputs (`[rows, hidden]`, not yet weighted), added by its gate to
+    /// the routed experts' sums. By default the shared expert is run again here.
+    fn forward_given(&self, x: &Tensor, logits: &Tensor, top_k: usize, shared: &[f32]) -> Tensor {
+        let _ = shared;
+        self.forward(x, logits, top_k)
+    }
 }
 
 /// VENDORED-LOCAL: one row's experts and their weights, as the CUDA routing gives them: the `top_k` of the routed
