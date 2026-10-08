@@ -794,6 +794,17 @@ impl Dense {
         }
     }
 
+    /// [`Self::rows`] of a SwiGLU's gate rows then its up rows (`[2 ff, k]`), and the SwiGLU, into `out` (`[rows,
+    /// ff]`): one dispatch where the recorder has the two as one kernel (`fused` then unwritten), else the matmul into
+    /// `fused` and the SwiGLU of it.
+    pub(crate) fn rows_swiglu(&self, rec: &mut crate::chain::Recorder<'_>, x: &DeviceVec, fused: &DeviceVec, out: &DeviceVec, rows: usize) {
+        if self.half && rec.matmul_f16_swiglu_rows(&self.w, self.n / 2, self.k, x, out, rows) {
+            return;
+        }
+        self.rows(rec, x, fused, rows);
+        rec.silu_mul_split_rows(fused, out, rows);
+    }
+
     /// `first`'s rows then `second`'s as one matrix (`[n, k]`).
     pub(crate) fn stacked(b: &WgpuBackend, first: &[f32], second: &[f32], n: usize, k: usize) -> Self {
         let both: Vec<f32> = first.iter().chain(second).copied().collect();
@@ -1083,14 +1094,20 @@ impl QuantMoe {
         let groups = ((pairs * f) as u32).div_ceil(256);
         rec.dispatch_wide("quant-moe-swiglu", SWIGLU_PAIRS, [&buf(&st.out_gu), &d, &d, &d, &d, &d, &buf(&st.xh_d), &drw], &[f as u32, pairs as u32], (groups.min(65535), groups.div_ceil(65535).max(1), 1));
         self.group_pass(rec, &self.down, &st.xh_d, &st.jobs_d, pairs, od, &st.out_d);
-        // the shared expert on every row
-        self.shared[0].rows(rec, x, &st.sg, rows);
-        rec.silu_mul_split_rows(&st.sg, &st.part_gu, rows);
+        // the shared expert on every row: its gate and up with their SwiGLU, then its down projection with the
+        // experts' sum into the streams, each one dispatch for a step's row or a check's few
+        self.shared[0].rows_swiglu(rec, x, &st.sg, &st.part_gu, rows);
+        if let Some((xs, post, streams)) = into {
+            assert!(xs.len >= rows * streams * h && post.len >= rows * streams, "moe: {rows} rows' {streams} streams");
+            let down = &self.shared[1];
+            if down.half && rec.shared_down_wsum(&down.w, h, f, &st.part_gu, &st.out_d, &st.w, post, xs, rows, top_k, streams) {
+                return;
+            }
+        }
         self.shared[1].rows(rec, &st.part_gu, &st.sd, rows);
         let groups = (((rows * h) as u32).div_ceil(256), 1, 1);
         match into {
             Some((xs, post, streams)) => {
-                assert!(xs.len >= rows * streams * h && post.len >= rows * streams, "moe: {rows} rows' {streams} streams");
                 rec.dispatch_wide("moe-wsum-apply", WSUM_APPLY, [&buf(&st.out_d), &buf(&st.sd), &buf(&st.w), &buf(post), &d, &d, &buf(xs), &drw], &[h as u32, top_k as u32, rows as u32, streams as u32], groups);
             }
             None => rec.dispatch_wide("moe-wsum-rows", WSUM_ROWS, [&buf(&st.out_d), &buf(&st.sd), &buf(&st.w), &d, &d, &d, &buf(out), &drw], &[h as u32, top_k as u32, rows as u32], groups),

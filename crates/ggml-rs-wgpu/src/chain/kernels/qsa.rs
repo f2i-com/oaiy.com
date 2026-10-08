@@ -233,6 +233,78 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 }
 "#;
 
+/// [`QSA_SELECT`] for few blocks (`p[0].y` at most [`QSA_RANKED`]): each block placed by how many come before it (a
+/// larger score, or as large at a lower block) and kept where fewer than `keep` do, where the sort took a round and a
+/// barrier for every stride of every size (36 for 256 blocks, 23 us a query's selection at 4,096 positions). The same
+/// blocks, written the same way. `p` as [`QSA_SELECT`]'s.
+pub(in crate::chain) const QSA_SELECT_RANKED: &str = r#"
+@group(0) @binding(0) var<storage, read> scores: array<f32>;
+@group(0) @binding(6) var<storage, read_write> list: array<u32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> keys: array<u32, 1024>;
+var<workgroup> kept: array<u32, 1024>;
+var<workgroup> runs: array<u32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    let nb = p[0].y;
+    let first = p[0].z;
+    let ratio = p[0].w;
+    let keep = p[1].x;
+    let r = wg.x;
+    let visible = min((first + r + 1u) / ratio, nb);
+    // a larger score a larger key (positive scores' sign bit set, negative ones' bits flipped)
+    for (var i = t; i < visible; i += 256u) {
+        let u = bitcast<u32>(scores[r * nb + i]);
+        keys[i] = select(u | 0x80000000u, ~u, (u >> 31u) == 1u);
+    }
+    workgroupBarrier();
+    for (var i = t; i < visible; i += 256u) {
+        var take = 1u;
+        if (visible > keep) {
+            let k = keys[i];
+            var before = 0u;
+            for (var j = 0u; j < visible; j++) {
+                let o = keys[j];
+                before += select(0u, 1u, o > k || (o == k && j < i));
+            }
+            take = select(0u, 1u, before < keep);
+        }
+        kept[i] = take;
+    }
+    workgroupBarrier();
+    // their places in ascending order (each thread's run of blocks counted, the runs' counts summed)
+    let per = (visible + 255u) / 256u;
+    let lo = t * per;
+    let hi = min(lo + per, visible);
+    var mine = 0u;
+    for (var i = lo; i < hi; i++) { mine += kept[i]; }
+    runs[t] = mine;
+    workgroupBarrier();
+    if (t == 0u) {
+        var at = 0u;
+        for (var w = 0u; w < 256u; w++) {
+            let c = runs[w];
+            runs[w] = at;
+            at += c;
+        }
+    }
+    workgroupBarrier();
+    var slot = runs[t];
+    for (var i = lo; i < hi; i++) {
+        if (kept[i] == 1u) {
+            list[r * keep + slot] = i;
+            slot += 1u;
+        }
+    }
+}
+"#;
+
+/// The most blocks [`QSA_SELECT_RANKED`] takes (16,384 positions of 16): past them a thread's comparisons are more
+/// than the sort's rounds.
+pub(in crate::chain) const QSA_RANKED: usize = 1024;
+
 /// QSA's attention part, [`ATTENTION_PART4`]'s sums over a query's entries in turn: its kept blocks' positions (from
 /// `list`, ascending) then its tail block's, a workgroup a (head, run of 256 entries, query), the runs' parts as
 /// [`ATTENTION_ROWS_PART`] lays them out (for [`ATTENTION_ROWS_JOIN`]), the grid's third axis the queries. `p[0]`: n_h,

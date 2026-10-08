@@ -23,7 +23,7 @@ use crate::quant_moe::{Dense, QuantExpertsData};
 use crate::WgpuBackend;
 use ggml_quants::GgmlType;
 use ggml_rs::exl3::{route, Experts};
-use ggml_rs::{ChainRecorder, DeviceChain, DeviceVec, Tensor};
+use ggml_rs::{DeviceChain, DeviceVec, Tensor};
 use rayon::prelude::*;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -533,8 +533,7 @@ impl QuantMoeHost {
         } else {
             Arc::new([rec.scratch(rows * 2 * f), rec.scratch(rows * f)])
         };
-        g.mats[0].rows(rec, x, &st[0], rows);
-        rec.silu_mul_split_rows(&st[0], &st[1], rows);
+        g.mats[0].rows_swiglu(rec, x, &st[0], &st[1], rows);
         g.mats[1].rows(rec, &st[1], out, rows);
         true
     }

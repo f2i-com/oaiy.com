@@ -401,6 +401,13 @@ their int8 rows 53, the experts 281, the f16 matrices 2,560 wide 172, the
 hyper-connections 214, QSA's attention 70 and its selection 28, the stream norms 67,
 the delta nets 61, and 39 of copies (a check's backups of the delta nets' states).
 
+Of those, three small ones since: a row's norm adds its threads' sums in sixteens and
+then the sixteens (two barriers where a tree took eight); QSA's selection places up to
+1,024 blocks each by how many come before it (the sort took 36 rounds for 256); and
+the shared expert's gate and up matmul makes its SwiGLU and its down matmul the
+experts' sum into the streams, each one dispatch where two. Strata's request drafting:
+256 tokens in 1.65 to 1.72 s, 149 to 155 tokens a second (Strata 179).
+
 On one card, which is what Strata's figure is for, this file is far from it: its
 experts are 35.5 GB, so 15 of the 48 layers' run on the host (`quant_host` reads the
 grid types as they lie too: 0.27 to 0.42 ms an expert a row on one AVX-512 core, where

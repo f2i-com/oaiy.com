@@ -927,7 +927,9 @@ impl ChainRecorder for Recorder<'_> {
         assert!(nb <= 4096 && keep > 0 && scores.len >= rows * nb && list.len >= rows * keep, "chain: QSA's selection of {keep} of {nb} blocks");
         let dd = self.gpu().dummy().clone();
         let drw = self.gpu().dummy_rw().clone();
-        self.dispatch_wide("chain-qsa-select", QSA_SELECT, [buffer(scores), &dd, &dd, &dd, &dd, &dd, buffer(list), &drw], &[rows as u32, nb as u32, first as u32, ratio as u32, keep as u32], (rows as u32, 1, 1));
+        // (few blocks: each placed by how many come before it; many: sorted)
+        let (name, body) = if nb <= QSA_RANKED { ("chain-qsa-select-ranked", QSA_SELECT_RANKED) } else { ("chain-qsa-select", QSA_SELECT) };
+        self.dispatch_wide(name, body, [buffer(scores), &dd, &dd, &dd, &dd, &dd, buffer(list), &drw], &[rows as u32, nb as u32, first as u32, ratio as u32, keep as u32], (rows as u32, 1, 1));
     }
 
     fn qsa_attention(&mut self, q: &DeviceVec, kv: &DeviceVec, list: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, first: usize, ratio: usize, keep: usize, scale: f32) {
@@ -1114,7 +1116,7 @@ fn hc_fused() -> bool {
 }
 
 /// A generated kernel's name and source, made once for its rows, lanes and streams (a pipeline is named for good).
-fn fused_kernel(what: &'static str, rows: usize, lanes: usize, streams: usize, make: impl FnOnce() -> String) -> (&'static str, &'static str) {
+pub(super) fn fused_kernel(what: &'static str, rows: usize, lanes: usize, streams: usize, make: impl FnOnce() -> String) -> (&'static str, &'static str) {
     type Made = ((&'static str, usize, usize, usize), (&'static str, &'static str));
     static MADE: Mutex<Vec<Made>> = Mutex::new(Vec::new());
     let mut made = MADE.lock().unwrap_or_else(|p| p.into_inner());

@@ -275,6 +275,127 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     )
 }
 
+/// [`matvec_f16_lanes`] of a SwiGLU's gate rows and up rows as one matrix (`[2 ff, k]`, the gate's first) with the
+/// SwiGLU ([`super::SILU_MUL_SPLIT`]) where it would store the sums: a workgroup's output rows are pairs, gate `j` then
+/// up `j` of some `j`, a row of x's sums by a lane of its own, and the gate's lane writes `silu(gate) * up` to `y[r,
+/// j]`. The sums and the SwiGLU as the two kernels make them, bit for bit. `p[0]`: ff, k.
+pub(in crate::chain) fn matvec_f16_swiglu_lanes(rows: usize, lanes: usize) -> String {
+    assert!((1..=8).contains(&rows) && lanes.is_power_of_two() && (8..=128).contains(&lanes), "1 to 8 rows, 8 to 128 lanes");
+    let each = |f: &dyn Fn(usize) -> String| (0..rows).map(f).collect::<Vec<_>>().join("\n");
+    let regs = each(&|r| format!("    var s{r} = vec4<f32>(0.0);"));
+    let sums = each(&|r| format!("            s{r} += wv * x4[{r}u * k4 + i];"));
+    let parts = each(&|r| format!("    part[{r}u * 256u + li] = s{r}.x + s{r}.y + s{r}.z + s{r}.w;"));
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read> w2: array<vec2<u32>>;
+@group(0) @binding(1) var<storage, read> x4: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> p: array<vec4<u32>, 2>;
+var<workgroup> part: array<f32, {len}>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {{
+    let ff = p[0].x;
+    let k4 = p[0].y / 4u;
+    // the workgroup's slots: a pair's gate row, then its up row
+    let slot = li / {lanes}u;
+    let lane = li % {lanes}u;
+    let j = (wg.x + wg.y * 65535u) * {pairs}u + slot / 2u;
+    let up = slot % 2u;
+    let o = up * ff + j;
+{regs}
+    if (j < ff) {{
+        for (var i = lane; i < k4; i += {lanes}u) {{
+            let pr = w2[o * k4 + i];
+            let a = unpack2x16float(pr.x);
+            let b = unpack2x16float(pr.y);
+            let wv = vec4<f32>(a.x, a.y, b.x, b.y);
+{sums}
+        }}
+    }}
+{parts}
+    workgroupBarrier();
+    // row `lane`'s sum of this slot's (its lanes' parts in order), left where they began; then the gate's lane
+    let own = lane * 256u + li - lane;
+    if (lane < {rows}u && j < ff) {{
+        var t = 0.0;
+        for (var q = 0u; q < {lanes}u; q++) {{ t += part[own + q]; }}
+        part[own] = t;
+    }}
+    workgroupBarrier();
+    if (lane < {rows}u && up == 0u && j < ff) {{
+        let g = part[own];
+        y[lane * ff + j] = (g / (1.0 + exp(-g))) * part[own + {lanes}u];
+    }}
+}}
+"#,
+        len = rows * 256,
+        pairs = 256 / lanes / 2,
+    )
+}
+
+/// [`matvec_f16_lanes`] of a MoE layer's shared expert's down matrix (`[h, ff]`) with the experts' weighted sum into
+/// the streams ([`crate::exl3::WSUM_APPLY`]) where it would store a sum: output `c` of row `r` is the shared expert's
+/// term, and its lane adds the routed experts' `kk` (`d`, pair `r kk + j`'s outputs, by `wts[r (kk + 1) + j]`), then
+/// the shared one's by `wts[r (kk + 1) + kk]`, and adds the sum to row `r`'s streams by `post`. The sums as the two
+/// kernels make them, bit for bit. `p[0]`: h, ff, kk, the streams.
+pub(in crate::chain) fn shared_down_wsum_lanes(rows: usize, lanes: usize) -> String {
+    assert!((1..=8).contains(&rows) && lanes.is_power_of_two() && (8..=256).contains(&lanes), "1 to 8 rows, 8 to 256 lanes");
+    let each = |f: &dyn Fn(usize) -> String| (0..rows).map(f).collect::<Vec<_>>().join("\n");
+    let regs = each(&|r| format!("    var s{r} = vec4<f32>(0.0);"));
+    let sums = each(&|r| format!("            s{r} += wv * x4[{r}u * k4 + i];"));
+    let parts = each(&|r| format!("    part[{r}u * 256u + li] = s{r}.x + s{r}.y + s{r}.z + s{r}.w;"));
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read> w2: array<vec2<u32>>;
+@group(0) @binding(1) var<storage, read> x4: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> d: array<f32>;
+@group(0) @binding(3) var<storage, read> wts: array<f32>;
+@group(0) @binding(4) var<storage, read> post: array<f32>;
+@group(0) @binding(6) var<storage, read_write> xs: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+var<workgroup> part: array<f32, {len}>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {{
+    let n = p[0].x;
+    let k4 = p[0].y / 4u;
+    let kk = p[0].z;
+    let streams = p[0].w;
+    let o = (wg.x + wg.y * 65535u) * {per}u + li / {lanes}u;
+    let lane = li % {lanes}u;
+{regs}
+    if (o < n) {{
+        for (var i = lane; i < k4; i += {lanes}u) {{
+            let pr = w2[o * k4 + i];
+            let a = unpack2x16float(pr.x);
+            let b = unpack2x16float(pr.y);
+            let wv = vec4<f32>(a.x, a.y, b.x, b.y);
+{sums}
+        }}
+    }}
+{parts}
+    workgroupBarrier();
+    // row `lane`'s: the shared expert's output (its lanes' parts in order), then the experts' sum and its streams
+    if (lane < {rows}u && o < n) {{
+        let at = lane * 256u + li - lane;
+        var t = 0.0;
+        for (var q = 0u; q < {lanes}u; q++) {{ t += part[at + q]; }}
+        var acc = 0.0;
+        for (var j = 0u; j < kk; j++) {{ acc += wts[lane * (kk + 1u) + j] * d[(lane * kk + j) * n + o]; }}
+        acc += wts[lane * (kk + 1u) + kk] * t;
+        for (var s = 0u; s < streams; s++) {{
+            let to = (lane * streams + s) * n + o;
+            xs[to] = xs[to] + post[lane * streams + s] * acc;
+        }}
+    }}
+}}
+"#,
+        len = rows * 256,
+        per = 256 / lanes,
+    )
+}
+
 /// [`MATVEC_F16`] (`narrow`: [`MATVEC_F16_NARROW`]) for `rows` rows (2 to 8, a check of drafts): each weight read once
 /// for all of them, each row's products summed in the one-row kernel's order (so a row's outputs are its bit for bit).
 /// `p[0]`: n, k.

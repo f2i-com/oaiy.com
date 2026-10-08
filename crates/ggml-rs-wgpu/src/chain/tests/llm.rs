@@ -463,3 +463,55 @@ fn a_hyper_connections_fused_projections_are_their_two_ops() {
         }
     }
 }
+
+/// The shared expert's fused kernels are the ops they replace, bit for bit: its gate and up matmul with its SwiGLU
+/// against the f16 matmul then the SwiGLU, and its down matmul with the experts' weighted sum into the streams against
+/// the matmul then that sum's kernel; a step's row and a check's few, a small shape and Flash-Next's (640 of 2,560, the
+/// top 10, four streams).
+#[test]
+fn a_shared_experts_fused_kernels_are_their_two_ops() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    let mut next = rng(53);
+    for (h, ff, top_k, streams) in [(64usize, 16usize, 3usize, 2usize), (2560, 640, 10, 4)] {
+        let f16s = |len: usize, next: &mut dyn FnMut() -> f32| -> Vec<f32> { (0..len).map(|_| half::f16::from_f32(0.05 * next()).to_f32()).collect() };
+        let (gu, down) = (f16s(2 * ff * h, &mut next), f16s(h * ff, &mut next));
+        let (guw, dw) = (DeviceChain::vec_f16(&b, &gu).unwrap(), DeviceChain::vec_f16(&b, &down).unwrap());
+        for rows in [1usize, 3, 8] {
+            let up = |v: &[f32]| {
+                let d = b.vec(v.len());
+                DeviceChain::upload(&b, &d, v);
+                d
+            };
+            let vals = |len: usize, next: &mut dyn FnMut() -> f32| -> Vec<f32> { (0..len).map(|_| next()).collect() };
+            let x = up(&vals(rows * h, &mut next));
+            let (d, wts, post) = (up(&vals(rows * top_k * h, &mut next)), up(&vals(rows * (top_k + 1), &mut next)), up(&vals(rows * streams, &mut next)));
+            let streams0 = vals(rows * streams * h, &mut next);
+            let (xs0, xs1) = (up(&streams0), up(&streams0));
+            let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+            // the ops each
+            let (fused0, act0, sd0) = (b.vec(rows * 2 * ff), b.vec(rows * ff), b.vec(rows * h));
+            let mut rec = Recorder::new(&b);
+            rec.matmul_f16_rows(&guw, 2 * ff, h, &x, &fused0, rows);
+            rec.silu_mul_split_rows(&fused0, &act0, rows);
+            rec.matmul_f16_rows(&dw, h, ff, &act0, &sd0, rows);
+            let dd = b.gpu.dummy().clone();
+            let drw = b.gpu.dummy_rw().clone();
+            rec.dispatch_wide("moe-wsum-apply", crate::exl3::WSUM_APPLY, [buffer(&d), buffer(&sd0), buffer(&wts), buffer(&post), &dd, &dd, buffer(&xs0), &drw], &[h as u32, top_k as u32, rows as u32, streams as u32], (((rows * h) as u32).div_ceil(256), 1, 1));
+            rec.read(&act0);
+            rec.read(&xs0);
+            let want = Box::new(rec).finish();
+            // the fused ones
+            let act1 = b.vec(rows * ff);
+            let mut rec = Recorder::new(&b);
+            assert!(rec.matmul_f16_swiglu_rows(&guw, ff, h, &x, &act1, rows), "the SwiGLU's kernel");
+            assert!(rec.shared_down_wsum(&dw, h, ff, &act1, &d, &wts, &post, &xs1, rows, top_k, streams), "the sum's kernel");
+            rec.read(&act1);
+            rec.read(&xs1);
+            let got = Box::new(rec).finish();
+            for (what, (g, w), len) in [("the SwiGLU", (&got[0], &want[0]), rows * ff), ("the streams", (&got[1], &want[1]), rows * streams * h)] {
+                assert!(w[..len].iter().any(|v| *v != 0.0) && bits(&w[..len]) != bits(&streams0[..len.min(streams0.len())]), "{what}: values to compare");
+                assert_eq!(bits(&g[..len]), bits(&w[..len]), "{h} of {ff}, {rows} rows: {what}");
+            }
+        }
+    }
+}

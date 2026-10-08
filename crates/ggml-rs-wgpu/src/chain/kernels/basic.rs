@@ -62,6 +62,7 @@ pub(in crate::chain) const RMSNORM_ROWS4: &str = r#"
 @group(0) @binding(2) var<storage, read_write> y4: array<vec4<f32>>;
 @group(0) @binding(3) var<uniform> p: array<vec4<u32>, 2>;
 var<workgroup> part: array<f32, 256>;
+var<workgroup> lead: array<f32, 16>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
@@ -76,11 +77,17 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     for (var i = li; i < n4; i += 256u) { let v = x4[at + i]; s += v * v; }
     part[li] = s.x + s.y + s.z + s.w;
     workgroupBarrier();
-    for (var stride = 128u; stride > 0u; stride /= 2u) {
-        if (li < stride) { part[li] += part[li + stride]; }
-        workgroupBarrier();
+    // the threads' sums in sixteens, then the sixteens by every thread alike: two barriers, where a tree of halvings
+    // took eight (a Flash-Next reply has 16,000 of these norms, 4 us each with the tree)
+    if (li < 16u) {
+        var t = 0.0;
+        for (var j = 0u; j < 16u; j++) { t += part[li * 16u + j]; }
+        lead[li] = t;
     }
-    let inv = 1.0 / sqrt(part[0] / f32(p[0].x) + bitcast<f32>(p[0].y));
+    workgroupBarrier();
+    var total = 0.0;
+    for (var j = 0u; j < 16u; j++) { total += lead[j]; }
+    let inv = 1.0 / sqrt(total / f32(p[0].x) + bitcast<f32>(p[0].y));
     for (var i = li; i < n4; i += 256u) { y4[at + i] = x4[at + i] * inv * w4[wat + i]; }
 }
 "#;
@@ -94,6 +101,7 @@ pub(in crate::chain) const ADD_RMSNORM_ROWS4: &str = r#"
 @group(0) @binding(7) var<storage, read_write> out: array<vec4<f32>>;
 @group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
 var<workgroup> part: array<f32, 256>;
+var<workgroup> lead: array<f32, 16>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
@@ -109,11 +117,17 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     }
     part[li] = s.x + s.y + s.z + s.w;
     workgroupBarrier();
-    for (var stride = 128u; stride > 0u; stride /= 2u) {
-        if (li < stride) { part[li] += part[li + stride]; }
-        workgroupBarrier();
+    // the threads' sums in sixteens, then the sixteens by every thread alike: two barriers, where a tree of halvings
+    // took eight (a Flash-Next reply has 16,000 of these norms, 4 us each with the tree)
+    if (li < 16u) {
+        var t = 0.0;
+        for (var j = 0u; j < 16u; j++) { t += part[li * 16u + j]; }
+        lead[li] = t;
     }
-    let inv = 1.0 / sqrt(part[0] / f32(p[0].x) + bitcast<f32>(p[0].y));
+    workgroupBarrier();
+    var total = 0.0;
+    for (var j = 0u; j < 16u; j++) { total += lead[j]; }
+    let inv = 1.0 / sqrt(total / f32(p[0].x) + bitcast<f32>(p[0].y));
     for (var i = li; i < n4; i += 256u) { out[at + i] = x4[at + i] * inv * w4[i]; }
 }
 "#;

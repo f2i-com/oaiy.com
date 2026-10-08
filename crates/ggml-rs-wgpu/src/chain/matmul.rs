@@ -57,6 +57,47 @@ impl Recorder<'_> {
         true
     }
 
+    /// A SwiGLU's gate and up matmul with its SwiGLU, one dispatch ([`matvec_f16_swiglu_lanes`]): `w` the f16 matrix
+    /// `[2 ff, k]` (the gate's rows, then the up's), `out[r, j] = silu(gate) * up` for `rows` rows of `x`. False
+    /// (nothing recorded) where the rows are more than a check's, or the width is not the lanes' kernel's, or
+    /// OAIY_MOE_UNFUSED is set: the caller's matmul and SwiGLU then.
+    pub(crate) fn matmul_f16_swiglu_rows(&mut self, w: &DeviceVec, ff: usize, k: usize, x: &DeviceVec, out: &DeviceVec, rows: usize) -> bool {
+        let lanes = f16_lanes(k);
+        if !(1..=8).contains(&rows) || k % 4 != 0 || lanes > 128 || !moe_fused() {
+            return false;
+        }
+        assert!(w.len * 2 >= 2 * ff * k && x.len >= rows * k && out.len >= rows * ff && 2 * ff <= 65535, "chain: a SwiGLU's matmul [{}, {k}] of {rows} rows", 2 * ff);
+        let (name, source) = super::ops::fused_kernel("chain-matvec-f16-swiglu", rows, lanes, 0, || matvec_f16_swiglu_lanes(rows, lanes));
+        let pipeline = self.gpu().named_pipeline(name, || source.to_string());
+        let groups = (ff as u32).div_ceil((256 / lanes / 2) as u32);
+        self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(out), &[ff as u32, k as u32], (groups.min(65535), groups.div_ceil(65535), 1));
+        self.weigh(2.0 * (rows * 2 * ff) as f64 * k as f64);
+        true
+    }
+
+    /// A MoE layer's shared expert's down matmul with the experts' weighted sum into the streams, one dispatch
+    /// ([`shared_down_wsum_lanes`]): `w` the f16 matrix `[h, ff]`, `x` the shared expert's SwiGLU (`[rows, ff]`), `d`
+    /// the routed experts' outputs, `wts` their weights and the shared one's, `xs` and `post` the streams and their
+    /// write weights. False (nothing recorded) as [`Self::matmul_f16_swiglu_rows`]: the caller's matmul and sum then.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn shared_down_wsum(&mut self, w: &DeviceVec, h: usize, ff: usize, x: &DeviceVec, d: &DeviceVec, wts: &DeviceVec, post: &DeviceVec, xs: &DeviceVec, rows: usize, top_k: usize, streams: usize) -> bool {
+        if !(1..=8).contains(&rows) || ff % 4 != 0 || !moe_fused() {
+            return false;
+        }
+        assert!(
+            w.len * 2 >= h * ff && x.len >= rows * ff && d.len >= rows * top_k * h && wts.len >= rows * (top_k + 1) && post.len >= rows * streams && xs.len >= rows * streams * h && h <= 65535,
+            "chain: a shared expert's down matmul [{h}, {ff}] and {rows} rows' sums"
+        );
+        let lanes = f16_lanes(ff);
+        let (name, source) = super::ops::fused_kernel("chain-shared-down-wsum", rows, lanes, 0, || shared_down_wsum_lanes(rows, lanes));
+        let dd = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        let groups = (h as u32).div_ceil((256 / lanes) as u32);
+        self.dispatch_wide(name, source, [buffer(w), buffer(x), buffer(d), buffer(wts), buffer(post), &dd, buffer(xs), &drw], &[h as u32, ff as u32, top_k as u32, streams as u32], (groups.min(65535), groups.div_ceil(65535), 1));
+        self.weigh(2.0 * (rows * h) as f64 * ff as f64);
+        true
+    }
+
     /// `x`'s `m` rows of `k` as int8 ([`crate::shaders::QUANT_Q8`]), and where their scales start: made once for every
     /// int8 matmul that reads them until something writes `x`.
     pub(super) fn x_q8(&mut self, x: &DeviceVec, m: usize, k: usize) -> (DeviceVec, usize) {
@@ -269,4 +310,10 @@ impl Recorder<'_> {
         }
         true
     }
+}
+
+/// Whether the shared expert's fused kernels are taken (OAIY_MOE_UNFUSED: its matmuls, SwiGLU and sum each their own).
+fn moe_fused() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("OAIY_MOE_UNFUSED").is_none())
 }
