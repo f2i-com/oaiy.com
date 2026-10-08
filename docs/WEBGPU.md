@@ -294,13 +294,15 @@ cosine is 0.99967 on average and 0.9987 at worst, the greedy token the same each
 
 Against the request Strata's benchmark makes (a synthetic Python module up to 4,096
 prompt tokens, greedy, 256 tokens), the same two cards: the prompt at 3,600 tokens a
-second (Strata 4,270), the reply at 75 to 78 tokens a second plain and 106 to 111
-drafting (Strata 179). Strata's run is one card at 575 W; ours two at 400 W. The two
-logs count the same work for it: Strata's 256 tokens are 96 passes with 160 of 226
-drafts taken, ours 97 passes with 159 of 214. What differs is a pass's time: 24 ms here
-(a check of 3.5 rows 19.3 ms, its drafts 4.7 ms: the server's decode line says these)
-where Strata's is 14.9 all told. A step is 1,498 dispatches and its smallest kernels
-take some 7 us each, so the count of dispatches is most of what is left. On one card
+second (Strata 4,270), the reply at 78 to 81 tokens a second plain and 108 to 120
+drafting (Strata 179; ours 118 but for the first reply after loading). Strata's run is
+one card at 575 W; ours two at 400 W. The two logs count the same work for it: Strata's
+256 tokens are 96 passes with 160 of 226 drafts taken, ours 102 with 153 of 210. What
+differs is a pass's time: 21 ms here (a check of 3.4 rows 17.5 ms, its drafts 3.6 ms:
+the server's decode line says these) where Strata's is 14.9 all told. A check's time is
+its kernels': of a check of four rows' 18 ms the f16 matrices are 4.5 (the
+hyper-connections' are f16 in the file; the IQ3_S ones are held so), the experts 4.7
+with their routing, the IQ4_XS matrices 2.6, attention 2.3. On one card
 the layers it has no room for still run their experts on the reference path (the
 host's fast kernel reads Q2_0 only), so it is not usable there yet.
 

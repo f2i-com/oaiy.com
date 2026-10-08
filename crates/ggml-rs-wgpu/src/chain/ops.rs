@@ -132,7 +132,8 @@ impl ChainRecorder for Recorder<'_> {
     fn rmsnorm_streams(&mut self, x: &DeviceVec, w: &DeviceVec, out: &DeviceVec, rows: usize, streams: usize, eps: f32) {
         let n = x.len / (rows * streams).max(1);
         assert!(rows > 0 && streams > 0 && n * rows * streams == x.len && w.len >= streams * n && out.len >= x.len, "chain: a norm of {rows} rows of {streams} streams");
-        let pipeline = self.named("chain-rmsnorm-rows", RMSNORM_ROWS);
+        // (streams a multiple of 4 long: vec4 loads, as a row's norm)
+        let pipeline = if n % 4 == 0 { self.gpu().named_pipeline("chain-rmsnorm-rows4", || RMSNORM_ROWS4.to_string()) } else { self.named("chain-rmsnorm-rows", RMSNORM_ROWS) };
         let r = (rows * streams) as u32;
         self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(out), &[n as u32, eps.to_bits(), streams as u32, r], (r.min(65535), r.div_ceil(65535), 1));
     }
@@ -879,7 +880,12 @@ impl ChainRecorder for Recorder<'_> {
         assert!(x.len > 0 && out.len >= 3, "chain: a draft's token of {} logits", x.len);
         let d = self.gpu().dummy().clone();
         let drw = self.gpu().dummy_rw().clone();
-        self.dispatch_wide("chain-argmax-softmax", ARGMAX_SOFTMAX, [buffer(x), &d, &d, &d, &d, &d, buffer(out), &drw], &[x.len as u32], (1, 1, 1));
+        // a workgroup of the first pass its 4,096 logits' largest and share, then those
+        let groups = x.len.div_ceil(4096);
+        assert!(groups <= 65535, "chain: a draft's token of {} logits", x.len);
+        let parts = self.scratch(4 * groups);
+        self.dispatch_wide("chain-argmax-softmax-parts", ARGMAX_SOFTMAX_PARTS, [buffer(x), &d, &d, &d, &d, &d, buffer(&parts), &drw], &[x.len as u32], (groups as u32, 1, 1));
+        self.dispatch_wide("chain-argmax-softmax", ARGMAX_SOFTMAX, [buffer(&parts), &d, &d, &d, &d, &d, buffer(out), &drw], &[groups as u32], (1, 1, 1));
     }
 
     fn read_range(&mut self, v: &DeviceVec, offset: usize, len: usize) {

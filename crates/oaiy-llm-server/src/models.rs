@@ -2191,7 +2191,8 @@ mod dense_webgpu_timing {
     }
 
     /// Where a chained Qwen3.8-Flash-Next run's time goes (FLASHNEXT_MODEL): a prompt's chunk of 512 and decode steps,
-    /// each kernel's GPU time with OAIY_CHAIN_PROFILE set (`ggml_rs_wgpu::profile::take_kernels`).
+    /// each kernel's GPU time with OAIY_CHAIN_PROFILE set (`ggml_rs_wgpu::profile::take_kernels`). FLASHNEXT_MTP: an
+    /// EXL3 checkpoint whose prediction layer a GGUF model (FLASHNEXT_GGUF) drafts with: a round of three drafts too.
     #[test]
     #[ignore = "a timing; needs WebGPU adapters with room for Qwen3.8-Flash-Next (FLASHNEXT_MODEL); run with --nocapture"]
     fn measure_a_chained_flashnext() {
@@ -2212,7 +2213,10 @@ mod dense_webgpu_timing {
         let p = std::path::Path::new(&path);
         // (FLASHNEXT_GGUF: the model from that GGUF's first shard, where the EXL3 checkpoint's)
         let model = match std::env::var("FLASHNEXT_GGUF") {
-            Ok(g) => super::flashnext_gguf_on(std::path::Path::new(&g), &gpus, backends, None).unwrap(),
+            Ok(g) => {
+                let mtp = std::env::var("FLASHNEXT_MTP").ok();
+                super::flashnext_gguf_on(std::path::Path::new(&g), &gpus, backends, mtp.as_deref().map(std::path::Path::new)).unwrap()
+            }
             Err(_) => {
                 let reserve = crate::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
                 let experts = |device: usize, _layer: &str, list: Vec<[ggml_rs::exl3::Exl3Data; 3]>| -> oaiy_engine::Result<Box<dyn ggml_rs::exl3::Experts>> {
@@ -2303,6 +2307,28 @@ mod dense_webgpu_timing {
                 runs += 1;
             }
             eprintln!("a check of {rows} rows: {:.1} ms", wall / 6.0);
+        }
+        // a round of three drafts after a step (every draft the layer makes, however unlikely): a mean of 6
+        if model.drafts() {
+            let mut wall = 0.0;
+            for rep in 0..7 {
+                let e = model.embed_text(&[next]).unwrap();
+                let l = model.forward(&[next], &e, &mut kv, None).unwrap();
+                runs += 1;
+                next = l.data().iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
+                let _ = (ggml_rs_wgpu::profile::take_kernels(), ggml_rs_wgpu::profile::take_line());
+                let t = Instant::now();
+                let d = model.draft_above(&kv, &[next], 3, 0.0).expect("drafts after a step");
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                assert_eq!(d.len(), 3, "three drafts");
+                if rep > 0 {
+                    wall += ms;
+                }
+                if rep == 6 {
+                    report("a round of 3 drafts", ms);
+                }
+            }
+            eprintln!("a round of 3 drafts: {:.2} ms", wall / 6.0);
         }
         assert_eq!(model.chain_runs(), runs, "every run chained");
     }
