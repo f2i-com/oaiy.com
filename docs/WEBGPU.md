@@ -320,7 +320,29 @@ layers' experts a row each (146 ms a host layer for a chunk of 512). Strata keep
 layer's most used experts on the card (71% of them fit, 98 to 99.7% of its lookups hit)
 and computes the few others on the host; a whole layer on or off the card, as here,
 puts a third of the model's experts on the host for every token. Experts held one by
-one, most used first, are what one card needs next.
+one are what one card needs next, and what that would give was measured first, from
+the model's own routing (`OAIY_HOST_ROUTE_LOG`, with `OAIY_EXPERTS_ON_HOST` to put
+every layer's on the host; a prose request and Strata's):
+
+- Within a request the routing is narrow: the most used half of the experts take 96 to
+  99.8% of its lookups, and a reply never touches 42 to 48% of them. But which half
+  depends on the text: a card holding the 69% another request used most hits 70 to 76%
+  of this one's lookups, hardly more than any 69% would.
+- So the card must take in what it misses. Doing that (the least recently used put out)
+  a card of 69% hits 97.1% of the reply's lookups to Strata's request and 98.2 to 98.6%
+  of the prose one's: Strata's own log says 97.8 to 99.7%, so that is how it works too.
+- A miss still costs its layer a round trip to the host here, and they are spread: a
+  check of 3.4 rows has 48 misses in 23 of its 48 layers, a step 15 in 12 (14 and 6 on
+  prose); at 85% of the experts held, 12 layers a check. So for a reply it would be
+  some 12 to 23 round trips a pass where a whole layer on the host is 15, each with a
+  tenth of the host's work: a gain, not Strata's speed, which rests on CUDA's cheap
+  waits. For a prompt it is the whole difference: 96 to 98% of a chunk's lookups
+  would stay on the card where a third of them are the host's now.
+
+A recording's reads are polled for 20 ms before the thread waits for them
+(`OAIY_CHAIN_SPIN_MS`), as a CUDA program's are by default: a step, a check and a host
+layer's round trip end within that, and each was some 0.1 ms the longer for parking
+the thread (2 to 3% of a reply).
 
 On one card (`--devices 0`) the file does not fit: its experts are 34 GB, and a 32 GB
 card's budget holds 34 of the 48 layers' beside the dense matrices. The other 14

@@ -1198,7 +1198,10 @@ pub(crate) fn flashnext_gguf_on(path: &Path, gpus: &[&ggml_rs_wgpu::WgpuBackend]
     // Each device's experts by an allowance of their own: its budget less that reserve, counted as they are placed
     // (the layers load four at a time, each with its dense matrices: the device's own count of its weights already
     // holds the dense ones loaded so far, and the reserve taken off that left a card 3.8 GB short of its budget).
-    let allowance: Vec<u64> = gpus.iter().map(|g| g.usage().1.saturating_sub(g.usage().0).saturating_sub(reserve)).collect();
+    // (OAIY_EXPERTS_ON_HOST: no allowance, every layer's routed experts on the host: for studying what a model routes
+    // to, with OAIY_HOST_ROUTE_LOG)
+    let none = std::env::var_os("OAIY_EXPERTS_ON_HOST").is_some();
+    let allowance: Vec<u64> = gpus.iter().map(|g| if none { 0 } else { g.usage().1.saturating_sub(g.usage().0).saturating_sub(reserve) }).collect();
     let placed: Vec<std::sync::atomic::AtomicU64> = gpus.iter().map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
     let experts = |device: usize, e: ExpertBlocks| -> Result<Box<dyn ggml_rs::exl3::Experts>> {
         use std::sync::atomic::Ordering::Relaxed;

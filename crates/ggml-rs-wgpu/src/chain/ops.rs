@@ -944,8 +944,17 @@ impl ChainRecorder for Recorder<'_> {
         };
         // (gone to the queue before its staging buffers are mapped: a submission may not copy into a mapped one)
         let index = self.gpu().gone(last);
-        for (_, _, staging, len) in &self.reads {
-            staging.slice(..(*len as u64 * 4).max(4)).map_async(wgpu::MapMode::Read, |_| {});
+        // (the last read's mapping says when the reads are there)
+        let mapped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let count = self.reads.len();
+        for (i, (_, _, staging, len)) in self.reads.iter().enumerate() {
+            let flag = std::sync::Arc::clone(&mapped);
+            let last = i + 1 == count;
+            staging.slice(..(*len as u64 * 4).max(4)).map_async(wgpu::MapMode::Read, move |_| {
+                if last {
+                    flag.store(true, std::sync::atomic::Ordering::Release);
+                }
+            });
         }
         for (_, staging) in &self.timed {
             staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
@@ -954,8 +963,18 @@ impl ChainRecorder for Recorder<'_> {
             staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
         }
         // this recording's work waited for, not what was submitted after it (the next chunk's, as this one's rows
-        // are read)
-        self.gpu().wait(Some(index));
+        // are read). Its reads are polled for 20 ms first (OAIY_CHAIN_SPIN_MS another time, 0 none): a step, a check
+        // of drafts, a draft and a host layer's round trip end within that, and parking the thread to be woken cost
+        // each some 0.1 ms (Flash-Next on one card with 15 host layers 300 tokens in 6.38 to 6.50 s where 6.54 to
+        // 6.78; on two, drafting, 256 in 2.09 to 2.31 s where 2.14 to 2.36). A core is busy for it, as a CUDA
+        // program's is by that runtime's default; a prompt's chunk or a picture's step is waited for after the 20 ms.
+        static SPIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let spin = *SPIN.get_or_init(|| std::env::var("OAIY_CHAIN_SPIN_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(20));
+        if spin > 0 && count > 0 && self.timed.is_empty() && pieces.is_none() {
+            self.gpu().wait_soon(index, &mapped, std::time::Duration::from_millis(spin));
+        } else {
+            self.gpu().wait(Some(index));
+        }
         crate::profile::add(&crate::profile::CHAIN_WAIT, submitted);
         let pooled = std::mem::take(&mut self.pooled);
         self.gpu().unpool(pooled);

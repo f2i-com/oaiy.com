@@ -746,6 +746,23 @@ impl Gpu {
         }
     }
 
+    /// [`Self::wait`] for submission `index` whose read-back sets `mapped` when it is there: the device polled for up
+    /// to `spin` first, so a round trip a fraction of a millisecond away does not park the thread and wake it (the
+    /// OS's wake was most of such a wait).
+    pub(crate) fn wait_soon(&self, index: wgpu::SubmissionIndex, mapped: &std::sync::atomic::AtomicBool, spin: std::time::Duration) {
+        let began = std::time::Instant::now();
+        while !mapped.load(Ordering::Acquire) {
+            if began.elapsed() >= spin {
+                return self.wait(Some(index));
+            }
+            let _ = self.device.poll(wgpu::PollType::Poll);
+            std::hint::spin_loop();
+        }
+        if let Some(why) = self.lost.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            panic!("webgpu: the device was lost ({why})");
+        }
+    }
+
     fn map_read(&self, staging: &wgpu::Buffer, len: u64) -> Vec<u8> {
         let slice = staging.slice(..len);
         slice.map_async(wgpu::MapMode::Read, |_| {});

@@ -463,6 +463,16 @@ pub struct QuantMoeHost {
     grid: Option<Grid>,
     level: Level,
     gpu: Option<SharedOnGpu>,
+    /// Which of the process's host layers this is, in the order they were made ([`route_log`]'s name for it).
+    id: usize,
+}
+
+/// OAIY_HOST_ROUTE_LOG: a file each call of a host layer's experts adds a line to, the layer's number, its rows and
+/// each row's routed experts in turn (`id rows e e e ...`): which experts a model uses, for choosing what a card
+/// should hold. None where unset or the file cannot be made.
+fn route_log() -> Option<&'static Mutex<std::io::BufWriter<std::fs::File>>> {
+    static LOG: OnceLock<Option<Mutex<std::io::BufWriter<std::fs::File>>>> = OnceLock::new();
+    LOG.get_or_init(|| std::env::var_os("OAIY_HOST_ROUTE_LOG").and_then(|p| std::fs::File::create(p).ok()).map(|f| Mutex::new(std::io::BufWriter::new(f)))).as_ref()
 }
 
 impl std::fmt::Debug for QuantMoeHost {
@@ -482,7 +492,8 @@ impl QuantMoeHost {
         if !(q2(data.down.0) && (grid.is_some() || (q2(data.gate.0) && q2(data.up.0)))) || data.hidden % wide != 0 || data.ff % BLOCK != 0 {
             return Err(data);
         }
-        Ok(QuantMoeHost { data, grid, level, gpu: None })
+        static MADE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        Ok(QuantMoeHost { data, grid, level, gpu: None, id: MADE.fetch_add(1, Ordering::Relaxed) })
     }
 
     /// With the shared expert on `b` as well, where its budget has the room (f16 where its values are f16's: 10 MB of
@@ -598,6 +609,18 @@ impl QuantMoeHost {
         let rows = xs.len() / h;
         assert!(given.is_none_or(|g| g.len() >= rows * h), "the shared expert's outputs for {rows} rows");
         let assign: Vec<Vec<(usize, f32)>> = (0..rows).map(|r| route(&ls[r * (n + 1)..(r + 1) * (n + 1)], top_k)).collect();
+        if let Some(log) = route_log() {
+            use std::io::Write;
+            let mut line = format!("{} {rows}", self.id);
+            for a in &assign {
+                for (e, _) in &a[..a.len() - 1] {
+                    line += &format!(" {e}");
+                }
+            }
+            let mut log = log.lock().unwrap_or_else(|p| p.into_inner());
+            let _ = writeln!(log, "{line}");
+            let _ = log.flush();
+        }
         let sums: Vec<Vec<f32>> = xs.chunks_exact(h).map(|x| self.sums(x)).collect();
         // each routed expert's rows, and where in a row's list it is: an expert's rows one task (its matrices read on
         // one core for them all)
