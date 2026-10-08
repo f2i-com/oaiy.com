@@ -1199,7 +1199,8 @@ pub(crate) fn flashnext_gguf_on(path: &Path, gpus: &[&ggml_rs_wgpu::WgpuBackend]
     // on the host's cores, so no trip to the host between a layer's router and its experts, and it drafts. Where
     // the cards' kernels read the host's memory and that has room for every routed expert within 80% of what is
     // free (they are all there, whichever the card holds); OAIY_EXPERT_CACHE=0: as before, whole layers' experts on
-    // the host's cores.
+    // the host's cores. OAIY_EXPERT_SLOTS=N: N of each layer's on every card whatever its room (a check's: cards
+    // that hold them all answer the same with a part held).
     let (routed_bytes, layers) = experts_layout(path)?;
     let ram = ggml_rs_wgpu::host_memory().map_or(0, |(free, _)| free as u64);
     let part = !gpus.is_empty() && gpus.iter().all(|g| g.host_weights()) && routed_bytes <= ram / 10 * 8 && std::env::var("OAIY_EXPERT_CACHE").map_or(true, |v| v != "0");
@@ -1228,10 +1229,11 @@ pub(crate) fn flashnext_gguf_on(path: &Path, gpus: &[&ggml_rs_wgpu::WgpuBackend]
                 let (here, routed) = (layers.div_ceil(gpus.len()) as u64, routed_bytes / gpus.len() as u64);
                 // (a card short of room for them all: half a gigabyte of it left for a prompt's scratch of the experts
                 // it reads from the host's memory)
-                let fits = allowance[device] >= here * shared + routed;
+                let asked: Option<usize> = std::env::var("OAIY_EXPERT_SLOTS").ok().and_then(|v| v.parse().ok());
+                let fits = asked.is_none() && allowance[device] >= here * shared + routed;
                 let share = allowance[device].saturating_sub(here * shared + (1 << 29)) as f64 / routed.max(1) as f64;
                 if part && !fits {
-                    let slots = (data.experts as f64 * share * 0.98) as usize;
+                    let slots = asked.unwrap_or((data.experts as f64 * share * 0.98) as usize);
                     if slots >= 64 {
                         shares[device].store(slots.min(data.experts) * 1024 + data.experts.min(1023), Relaxed);
                         b.quant_experts_cached(data, slots)

@@ -456,8 +456,7 @@ the prediction layer), every expert's matrices are in the host's memory, and the
 experts' kernels read an expert that has no slot from there, its 1.5 MB in 57 us,
 with no word from the host between a layer's router and its experts. The kernels
 write the pass each expert was last used in; a recording reads that as it finishes,
-and the experts it read from the host are copied into the slots of the least recently
-used, behind it in the queue.
+and the host lists the least recently used for the next pass.
 
 A load from the host's memory is the bus's fetch of its 64-byte line, kept for no
 later load, so the threads that load at once must share lines. The kernels for a
@@ -478,10 +477,29 @@ and 179. `OAIY_EXPERT_CACHE=0` is the placement before (whole layers' experts on
 host's cores). The checks: a layer held in part against the same held whole, bit for
 bit, every type, in f32 and on the tensor cores
 (`a_cards_share_of_a_layers_experts_is_all_of_them`), and the model's own with
-`OAIY_NO_SPLIT` (its checks its steps bit for bit, 22 of 22). What is left there: an
-expert read from the host and then copied in crosses the bus twice (the card could
-take it in as it reads it); a prompt puts out the experts a reply uses; and the first
-slots are the first experts, where a file of the model's use would say which.
+`OAIY_NO_SPLIT` (its checks its steps bit for bit, 22 of 22).
+
+In that first form an expert was read where it lay and copied into a slot after the
+pass: twice over the bus. The pass takes it in itself now. After a layer's routing
+one workgroup marks the pass's experts and gives each that has no slot the slot of
+one the host listed (`ADMIT`: up to 32 a layer, none that the pass uses), and a
+kernel copies those from the host's memory into their slots (`EXPERTS_IN`, the same
+one that fills a prompt's scratch) before the experts' kernels run, which then read
+the card. Where the list runs out a few rows' kernels still read the host's memory
+and a prompt's rows the scratch. And use is two counts, a step's or a check's and a
+prompt's rows', each written by its own kernels: the victims are the experts the last
+pass of either kind did not use, the ones steps and checks used longest ago first. By
+one count a prompt's chunks (which use most of a layer's experts) made what replies
+had just used the oldest, and put it out before anything else.
+
+One RTX 5090 at 400 W, Strata's request: the prompt in 3.2 to 3.6 s (1,140 to 1,270
+tokens a second) and a reply at 116 to 118 tokens a second (256 tokens in 2.17 to
+2.20 s) where the first form gave 3.8 to 4.0 s and 102 to 104. The reply takes in
+6,400 experts after the first prompt and 4,300 after the same kind of request again
+(the first form: 6,100 each time); the prompt reads 20,000 to 26,000 and takes in
+5,000 to 6,700 of them. What is left: the taking in is 0.25 to 0.37 s of a reply's
+2.2 (two cards, which hold every expert: 1.62 to 1.74 s), and the first slots are the
+first experts, where a file of the model's use would say which.
 
 A recording's reads are polled for 20 ms before the thread waits for them
 (`OAIY_CHAIN_SPIN_MS`), as a CUDA program's are by default: a step, a check and a host
