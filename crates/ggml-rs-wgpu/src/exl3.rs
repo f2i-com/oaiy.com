@@ -331,20 +331,26 @@ fn window(i: u32, tw: u32) -> vec2<u32> {{
     return vec2<u32>(start / 32u, 48u - start % 32u);
 }}
 
-// Code `i`'s word after `w0` (0, 1 or 2) and its shift, packed.
+// Code `i`'s view and its shift, packed, for a lane whose first word is `w0`: which 32 bits of the lane's four
+// words its window lies in (view 2 d: word d; view 2 d + 1: word d's low half and the next's high half), and how
+// far the code is above the view's low end. A lane's eight codes start within 96 bits of its first word (8 bits
+// a weight at most), so views 0 to 5.
 fn place(i: u32, tw: u32, w0: u32) -> u32 {{
     let nw = tw / 2u;
     let wd = window(i, tw);
-    return ((wd.x + nw - w0) % nw) | (wd.y << 8u);
+    let o = 32u * ((wd.x + nw - w0) % nw) + (48u - wd.y);
+    return (o >> 4u) | ((16u - (o & 15u)) << 8u);
 }}
 
-// A code from the four words `q0..q3` (from a lane's first) at its packed place.
+// A code from the four words `q0..q3` (from a lane's first) at its packed place: its view, shifted (its low 16
+// bits: `decode_at` takes no more). The straddling views are the same for a lane's eight codes.
 fn code_in(q0: u32, q1: u32, q2: u32, q3: u32, at: u32) -> u32 {{
-    let d = at & 3u;
-    let sh = at >> 8u;
-    let a = select(select(q0, q1, d == 1u), q2, d >= 2u);
-    let b = select(select(q1, q2, d == 1u), q3, d >= 2u);
-    return select((a << (32u - sh)) | (b >> sh), a >> (sh - 32u), sh >= 32u);
+    let odd = (at & 1u) == 1u;
+    let p0 = select(q0, (q0 << 16u) | (q1 >> 16u), odd);
+    let p1 = select(q1, (q1 << 16u) | (q2 >> 16u), odd);
+    let p2 = select(q2, (q2 << 16u) | (q3 >> 16u), odd);
+    let hi = (at >> 1u) & 3u;
+    return select(select(p0, p1, hi == 1u), p2, hi == 2u) >> (at >> 8u);
 }}
 
 fn decode_at(code: u32) -> f32 {{
@@ -1145,20 +1151,26 @@ fn window(i: u32, tw: u32) -> vec2<u32> {{
     return vec2<u32>(start / 32u, 48u - start % 32u);
 }}
 
-// Code `i`'s word after `w0` (0, 1 or 2) and its shift, packed.
+// Code `i`'s view and its shift, packed, for a lane whose first word is `w0`: which 32 bits of the lane's four
+// words its window lies in (view 2 d: word d; view 2 d + 1: word d's low half and the next's high half), and how
+// far the code is above the view's low end. A lane's eight codes start within 96 bits of its first word (8 bits
+// a weight at most), so views 0 to 5.
 fn place(i: u32, tw: u32, w0: u32) -> u32 {{
     let nw = tw / 2u;
     let wd = window(i, tw);
-    return ((wd.x + nw - w0) % nw) | (wd.y << 8u);
+    let o = 32u * ((wd.x + nw - w0) % nw) + (48u - wd.y);
+    return (o >> 4u) | ((16u - (o & 15u)) << 8u);
 }}
 
-// A code from the four words `q0..q3` (from a lane's first) at its packed place.
+// A code from the four words `q0..q3` (from a lane's first) at its packed place: its view, shifted (its low 16
+// bits: `decode_at` takes no more). The straddling views are the same for a lane's eight codes.
 fn code_in(q0: u32, q1: u32, q2: u32, q3: u32, at: u32) -> u32 {{
-    let d = at & 3u;
-    let sh = at >> 8u;
-    let a = select(select(q0, q1, d == 1u), q2, d >= 2u);
-    let b = select(select(q1, q2, d == 1u), q3, d >= 2u);
-    return select((a << (32u - sh)) | (b >> sh), a >> (sh - 32u), sh >= 32u);
+    let odd = (at & 1u) == 1u;
+    let p0 = select(q0, (q0 << 16u) | (q1 >> 16u), odd);
+    let p1 = select(q1, (q1 << 16u) | (q2 >> 16u), odd);
+    let p2 = select(q2, (q2 << 16u) | (q3 >> 16u), odd);
+    let hi = (at >> 1u) & 3u;
+    return select(select(p0, p1, hi == 1u), p2, hi == 2u) >> (at >> 8u);
 }}
 
 fn decode_at(code: u32) -> f32 {{
@@ -1358,15 +1370,17 @@ fn window(i: u32, tw: u32) -> vec2<u32> {{
 fn place(i: u32, tw: u32, w0: u32) -> u32 {{
     let nw = tw / 2u;
     let wd = window(i, tw);
-    return ((wd.x + nw - w0) % nw) | (wd.y << 8u);
+    let o = 32u * ((wd.x + nw - w0) % nw) + (48u - wd.y);
+    return (o >> 4u) | ((16u - (o & 15u)) << 8u);
 }}
 
 fn code_in(q0: u32, q1: u32, q2: u32, q3: u32, at: u32) -> u32 {{
-    let d = at & 3u;
-    let sh = at >> 8u;
-    let a = select(select(q0, q1, d == 1u), q2, d >= 2u);
-    let b = select(select(q1, q2, d == 1u), q3, d >= 2u);
-    return select((a << (32u - sh)) | (b >> sh), a >> (sh - 32u), sh >= 32u);
+    let odd = (at & 1u) == 1u;
+    let p0 = select(q0, (q0 << 16u) | (q1 >> 16u), odd);
+    let p1 = select(q1, (q1 << 16u) | (q2 >> 16u), odd);
+    let p2 = select(q2, (q2 << 16u) | (q3 >> 16u), odd);
+    let hi = (at >> 1u) & 3u;
+    return select(select(p0, p1, hi == 1u), p2, hi == 2u) >> (at >> 8u);
 }}
 
 fn decode_at(code: u32) -> f32 {{
@@ -3026,8 +3040,9 @@ mod tests {
     fn a_chained_projection_matches_the_projection() {
         let Some(b) = backend() else { return };
         let (k, n) = (512usize, 384usize);
-        // (3, 3.5 and 4 bits a weight through a step's near kernel, 5 through the general one)
-        for (tw, maps) in [(48usize, false), (56, false), (64, true), (80, true)] {
+        // (3, 3.5 and 4 bits a weight through a step's near kernel, 5 and 8 through the general one: at 7 bits and
+        // more a lane's last codes lie in its third and fourth words)
+        for (tw, maps) in [(48usize, false), (56, false), (64, true), (80, true), (128, false)] {
             let mut data = random_exl3(k, n, tw, 77 + tw as u32);
             if maps {
                 data.input_map = (0..k as u32).map(|i| (i * 7 + 3) % k as u32).collect();
