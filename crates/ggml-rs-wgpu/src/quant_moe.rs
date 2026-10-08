@@ -739,12 +739,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 /// `mats`: 0 where the card holds every expert of the layer, else the group's matrices an expert, for the kernel that
 /// reads an expert the card does not hold from the host's memory, or (`staged`) from where a prompt's were copied
 /// ([`cached_source`]).
-fn kernel(kind: Kind, coop: bool, rows: usize, k: usize, mats: usize, staged: bool) -> (&'static str, &'static str) {
+///
+/// `lanes`: the few rows' kernel's lanes a row where not [`few_lanes`]'s (0: those).
+fn kernel(kind: Kind, coop: bool, rows: usize, k: usize, mats: usize, staged: bool, lanes: usize) -> (&'static str, &'static str) {
     type Made = ((Kind, bool, usize, usize, usize, bool), (&'static str, &'static str));
     static MADE: Mutex<Vec<Made>> = Mutex::new(Vec::new());
     let mut made = MADE.lock().unwrap_or_else(|p| p.into_inner());
     // (the tensor cores' kernel is one for every width; the few-row one is written for its lanes a row)
-    let lanes = if coop { 0 } else { few_lanes(kind, k) };
+    let lanes = if coop { 0 } else if lanes > 0 { lanes } else { few_lanes(kind, k) };
     let key = (kind, coop, rows, lanes, mats, staged);
     if let Some((_, k)) = made.iter().find(|(k, _)| *k == key) {
         return *k;
@@ -1155,6 +1157,9 @@ struct Group {
 enum Order<'a> {
     Jobs,
     Blocks(&'a DeviceVec, usize, usize),
+    /// As `Blocks`, the order's first block not its vector's first (the vector, that block, the blocks, the jobs a
+    /// block): a prompt's experts of few rows, kept after its others' blocks.
+    At(&'a DeviceVec, usize, usize, usize),
 }
 
 /// The shared expert's matrix: f16 where every value is one exactly (a Q2_0 matrix's are), else f32.
@@ -1395,12 +1400,16 @@ impl QuantMoe {
         let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
         let (xb, jb, yb) = (buf(x), buf(jobs), buf(y));
         let ntiles = (g.n / 16) as u32;
-        let (ob, blocks, rows, identity) = match order {
-            Order::Jobs => (d.clone(), count, 1, 1),
-            Order::Blocks(o, blocks, rows) => (buf(o), blocks, rows, 0),
+        let (ob, base, blocks, rows, identity) = match order {
+            Order::Jobs => (d.clone(), 0, count, 1, 1),
+            Order::Blocks(o, blocks, rows) => (buf(o), 0, blocks, rows, 0),
+            Order::At(o, base, blocks, rows) => (buf(o), base, blocks, rows, 0),
         };
         let coop = rows > FEW_MAX;
-        let (name, source) = kernel(g.kind, coop, rows, g.k, if self.cache.is_some() { g.mats } else { 0 }, stage.is_some());
+        // (a prompt's experts of few rows: eight lanes a row, 32 output rows a workgroup. Most of that pass's blocks
+        // are empty, an expert of more rows or of none, and a workgroup of an empty block still starts)
+        let lanes = if matches!(order, Order::At(..)) { 8 } else { few_lanes(g.kind, g.k) };
+        let (name, source) = kernel(g.kind, coop, rows, g.k, if self.cache.is_some() { g.mats } else { 0 }, stage.is_some(), lanes);
         // (a card holding some of the experts: the rest's rows in the host's memory or where this run's were copied,
         // and the layer's state)
         let staged = stage.map(|s| buf(s));
@@ -1412,8 +1421,8 @@ impl QuantMoe {
         // as many blocks a pass as the grid's third axis takes
         for first in (0..blocks).step_by(65535) {
             let these = 65535.min(blocks - first) as u32;
-            let words = [g.n as u32, g.k as u32, g.rw as u32, identity, g.mwords as u32, first as u32, 0, self.routed as u32];
-            let groups = (g.n as u32).div_ceil((256 / few_lanes(g.kind, g.k)) as u32);
+            let words = [g.n as u32, g.k as u32, g.rw as u32, identity, g.mwords as u32, (base + first) as u32, 0, self.routed as u32];
+            let groups = (g.n as u32).div_ceil((256 / lanes) as u32);
             let grid = if coop { (ntiles.div_ceil(8), 1, these) } else { (groups.min(65535), groups.div_ceil(65535), these) };
             rec.dispatch_wide(name, source, [&g.words, &xb, &jb, &ob, g.table.as_ref().unwrap_or(&d), cold, &yb, state], &words, grid);
         }
@@ -1461,7 +1470,7 @@ impl QuantMoe {
             Some(((g, gn), (d, dn))) => (Order::Blocks(g, *gn, block), Order::Blocks(d, *dn, block)),
             None => (Order::Jobs, Order::Jobs),
         };
-        self.run(rec, &st, x, out, rows, ogu, od, None);
+        self.run(rec, &st, x, out, rows, ogu, od, None, None);
     }
 
     /// `rows` rows' experts routed on the GPU from the router's `logits` (`[rows, routed + 1]`) and recorded into
@@ -1507,15 +1516,22 @@ impl QuantMoe {
             // part-filled one each at most), the grid that wide
             let bs = moe_rows_for(pairs, self.routed);
             let blocks = pairs.div_ceil(bs) + self.routed;
-            let (og, od) = (rec.scratch(2 * bs * blocks), rec.scratch(bs * blocks + 3 * self.routed));
-            let words = [pairs as u32, blocks as u32, self.routed as u32, bs as u32];
+            // An expert with FEW_MAX of the chunk's rows or fewer takes no such block: its jobs go to a block of its
+            // own of that many, after the others' in the same vectors, for the few rows' kernel. Of a chunk of 512's
+            // 371 blocks of 32 rows a Flash-Next layer, 43% held 8 rows or fewer (158 of the 299 experts it used, a
+            // tenth of its pairs), each a whole block's decode on the tensor cores.
+            let few = if std::env::var_os("OAIY_MOE_NO_TAIL").is_some() { 0 } else { FEW_MAX };
+            let (tail_g, tail_d) = (2 * bs * blocks, (bs * blocks + 3 * self.routed).next_multiple_of(FEW_MAX));
+            let (og, od) = (rec.scratch(tail_g + 2 * self.routed * few), rec.scratch(tail_d + self.routed * few));
+            let words = [pairs as u32, blocks as u32, self.routed as u32, bs as u32, few as u32, tail_d as u32, tail_g as u32];
             let groups = ((2 * bs * blocks) as u32).div_ceil(256);
             let jd = buf(&st.jobs_d);
             rec.dispatch_wide("moe-many-clear", MANY_CLEAR, [&d, &d, &d, &d, &d, &d, &buf(&og), &buf(&od)], &words, (groups.min(65535), groups.div_ceil(65535), 1));
             rec.dispatch_wide("moe-many-count", MANY_COUNT, [&jd, &d, &d, &d, &d, &d, &drw, &buf(&od)], &words, ((pairs as u32).div_ceil(256), 1, 1));
             rec.dispatch_wide("moe-many-scan", MANY_SCAN, [&d, &d, &d, &d, &d, &d, &drw, &buf(&od)], &words, (1, 1, 1));
             rec.dispatch_wide("moe-many-scatter", MANY_SCATTER, [&jd, &d, &d, &d, &d, &d, &buf(&og), &buf(&od)], &words, ((pairs as u32).div_ceil(256), 1, 1));
-            self.run(rec, &st, x, out, rows, Order::Blocks(&og, 2 * blocks, bs), Order::Blocks(&od, blocks, bs), into);
+            let tail = (few > 0).then(|| [Order::At(&og, tail_g / few, 2 * self.routed, few), Order::At(&od, tail_d / few, self.routed, few)]);
+            self.run(rec, &st, x, out, rows, Order::Blocks(&og, 2 * blocks, bs), Order::Blocks(&od, blocks, bs), tail, into);
             return true;
         }
         let (ogu, od) = if grouped {
@@ -1524,14 +1540,15 @@ impl QuantMoe {
         } else {
             (Order::Jobs, Order::Jobs)
         };
-        self.run(rec, &st, x, out, rows, ogu, od, into);
+        self.run(rec, &st, x, out, rows, ogu, od, None, into);
         true
     }
 
     /// The experts' work once `st` holds the jobs and weights: gate and up, each pair's SwiGLU, down, the shared
-    /// expert on every row, and each row's weighted sum (into `out`, or added to the streams `into` names).
+    /// expert on every row, and each row's weighted sum (into `out`, or added to the streams `into` names). `tail`: a
+    /// prompt's experts of few rows, their gate and up order and their down one, run after the others' of each.
     #[allow(clippy::too_many_arguments)]
-    fn run(&self, rec: &mut crate::chain::Recorder<'_>, st: &Step, x: &DeviceVec, out: &DeviceVec, rows: usize, ogu: Order<'_>, od: Order<'_>, into: Option<(&DeviceVec, &DeviceVec, usize)>) {
+    fn run(&self, rec: &mut crate::chain::Recorder<'_>, st: &Step, x: &DeviceVec, out: &DeviceVec, rows: usize, ogu: Order<'_>, od: Order<'_>, tail: Option<[Order<'_>; 2]>, into: Option<(&DeviceVec, &DeviceVec, usize)>) {
         let (h, f, top_k) = (self.hidden, self.ff, st.top_k);
         let pairs = rows * top_k;
         let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
@@ -1544,9 +1561,15 @@ impl QuantMoe {
             c.admit(rec, &st.jobs_d, pairs, matches!(ogu, Order::Blocks(_, _, rows) if rows > FEW_MAX))
         });
         self.group_pass_from(rec, &self.gu, x, &st.jobs_gu, 2 * pairs, ogu, &st.out_gu, stage.as_ref().map(|s| &s[0]));
+        if let Some([gu, _]) = tail {
+            self.group_pass_from(rec, &self.gu, x, &st.jobs_gu, 2 * pairs / 10, gu, &st.out_gu, stage.as_ref().map(|s| &s[0]));
+        }
         let groups = ((pairs * f) as u32).div_ceil(256);
         rec.dispatch_wide("quant-moe-swiglu", SWIGLU_PAIRS, [&buf(&st.out_gu), &d, &d, &d, &d, &d, &buf(&st.xh_d), &drw], &[f as u32, pairs as u32], (groups.min(65535), groups.div_ceil(65535).max(1), 1));
         self.group_pass_from(rec, &self.down, &st.xh_d, &st.jobs_d, pairs, od, &st.out_d, stage.as_ref().map(|s| &s[1]));
+        if let Some([_, down]) = tail {
+            self.group_pass_from(rec, &self.down, &st.xh_d, &st.jobs_d, pairs / 10, down, &st.out_d, stage.as_ref().map(|s| &s[1]));
+        }
         // the shared expert on every row: its gate and up with their SwiGLU, then its down projection with the
         // experts' sum into the streams, each one dispatch for a step's row or a check's few
         self.shared[0].rows_swiglu(rec, x, &st.sg, &st.part_gu, rows);
@@ -1868,6 +1891,34 @@ pub(crate) mod tests {
                 held.sort_unstable();
                 eprintln!("{gu:?}, {}: {read} experts read from the host's memory, {brought} of them taken into the card's {} slots", if cores { "the tensor cores" } else { "f32" }, held.len());
                 assert!(read > 0 && brought > 0 && held == [0, 1, 2, 3, 4], "{gu:?}: the card's slots took in what the passes used: {held:?}");
+            }
+        }
+    }
+
+    /// A prompt's experts that take few of its rows go through the few rows' kernel, whose sums are f32's: a layer
+    /// of 192 experts (3 a row) gives each a row or two of a prompt's 40 or 70, and routed on the GPU where it has
+    /// the tensor cores the layer is the host's to f32's rounding (the shared expert f32 too), where a block of the
+    /// tensor cores' rounds its inputs to f16 (some 1e-3 of the RMS).
+    #[test]
+    fn a_prompts_experts_of_few_rows_are_f32s() {
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        if !coop_on(&b.gpu) {
+            return;
+        }
+        let (hidden, ff, count, top_k) = (256usize, 128usize, 192usize, 3usize);
+        for gu in [GgmlType::Q2_0, GgmlType::IQ2_S] {
+            let data = experts_of(91, hidden, ff, count, false, gu);
+            let host = quant_experts_cpu(copy(&data)).unwrap();
+            let moe = QuantMoe::try_new(&b, data, 0).ok().expect("room for the experts");
+            assert!(moe.coop, "the tensor cores take this device's prompts");
+            for rows in [40usize, 70] {
+                let (x, logits) = inputs(17 + rows as u64, rows, hidden, count);
+                let want = host.forward(&Tensor::from_vec(x.clone(), vec![rows, hidden]), &Tensor::from_vec(logits.clone(), vec![rows, count + 1]), top_k).to_host().data().to_vec();
+                let (_, routed, into) = gpu_sums(&b, &moe, &x, &logits, rows, hidden, count, top_k);
+                let e = worst(&routed.expect("a prompt's rows routed on the GPU"), &want);
+                let (after, expect) = into.expect("and into the streams");
+                eprintln!("{gu:?} gate and up, {count} experts, {rows} rows: routed on the GPU {e:.2e}, into the streams {:.2e}", worst(&after, &expect));
+                assert!(e < 5e-5, "{gu:?}, {rows} rows: {e:.2e}");
             }
         }
     }

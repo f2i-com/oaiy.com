@@ -995,7 +995,24 @@ impl FlashNext {
         let placed = positions.filter(|p| self.config.rope_dim == 64 && p.len() == tokens.len());
         if (positions.is_none() || placed.is_some()) && !profile::on() && tokens.len() <= self.prompt_rows() {
             *self.placed.lock().unwrap_or_else(|p| p.into_inner()) = placed.map(<[[u32; 3]]>::to_vec);
+            // A prompt's chunk on one card: its pieces two at a time on the queue, each encoded at its turn, as two
+            // cards' chunks are paced ([`Self::chunks_run`]). Recorded and submitted as fast as the host goes, a card
+            // under a power limit ran such chunks a third as fast for whole prompts (4,086 tokens in 8.6 s where 3.5).
+            struct Paced<'a>(Vec<&'a dyn ggml_rs::DeviceChain>);
+            impl Drop for Paced<'_> {
+                fn drop(&mut self) {
+                    for c in &self.0 {
+                        c.pieces_in_flight_at_most(0);
+                    }
+                }
+            }
+            let alone = tokens.len() > CHECK_ROWS && self.devices.len() == 1 && std::env::var_os("OAIY_FN_UNPACED").is_none();
+            let paced = Paced(if alone { self.devices.iter().filter_map(|b| b.chain()).collect() } else { Vec::new() });
+            for c in &paced.0 {
+                c.pieces_in_flight_at_most(2);
+            }
             let logits = self.forward_chained(tokens, embeds, kv);
+            drop(paced);
             *self.placed.lock().unwrap_or_else(|p| p.into_inner()) = None;
             if let Some(logits) = logits {
                 return Ok(logits);

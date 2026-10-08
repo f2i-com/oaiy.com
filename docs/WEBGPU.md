@@ -516,6 +516,22 @@ vectors and scratch are 1.3 GiB more, past the budget beside 313 slots a layer, 
 512 stays what a chunk is. One card's chunks run together, as two cards' are, were
 the same 3.1 to 3.5 s for 1.5 GiB more.
 
+A prompt's experts by rows (the model's routing again: `OAIY_ROUTE_DUMP`): a chunk
+of 512 uses 299 of a layer's 512 experts, and 158 of those take eight of its rows or
+fewer, a tenth of its pairs in 43% of the tensor cores' blocks of 32, each a matrix
+decoded for a block of mostly empty rows. Those go through the few rows' kernel now
+(the grouping gives such an expert no block and puts its jobs in a block of eight of
+its own, after the others' in the same vectors: `MANY_SCAN`, `MANY_SCATTER`,
+`Order::At`; `OAIY_MOE_NO_TAIL` the grouping before). By the GPU's clock a prompt's
+experts are 1.02 s where 1.11: the tensor cores' kernels 0.70 s where 1.11, the few
+rows' 0.32 (eight lanes a row there: most of that pass's blocks are empty, and a
+workgroup of an empty block still starts). Their sums are f32's, where a block's
+inputs are rounded to f16 (`a_prompts_experts_of_few_rows_are_f32s`). Strata's
+prompt on both cards: 1.02 to 1.03 s where 1.10 to 1.12 (4,000 tokens a second;
+Strata 4,270 on one card at 575 W); on one card 3.0 to 3.4 s where 3.1 to 3.5. One
+card's chunks are paced as two cards' are, two pieces on the queue at a time (a run
+of prompts at 8.6 s where 3.5 was seen once without, and not again either way).
+
 A recording's reads are polled for 20 ms before the thread waits for them
 (`OAIY_CHAIN_SPIN_MS`), as a CUDA program's are by default: a step, a check and a host
 layer's round trip end within that, and each was some 0.1 ms the longer for parking

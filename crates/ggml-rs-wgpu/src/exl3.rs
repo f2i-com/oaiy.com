@@ -1996,6 +1996,11 @@ pub(crate) fn record_route(rec: &mut crate::chain::Recorder<'_>, logits: &wgpu::
 /// job's place among its expert's as the atomics fall), and their gate and up jobs in blocks `2 b` and `2 b + 1`.
 /// `od`: the down order (`p[0].y` blocks), then each expert's count, first block and filled places (`p[0].z`
 /// experts); `og` the gate and up order. First every place unused and every count 0.
+///
+/// `p[1].x` not 0: an expert with that many jobs or fewer takes no block of those; its jobs go to a block of its own
+/// of `p[1].x` places in a second order, the down one from `od[p[1].y]` (block `e` expert `e`'s) and the gate and up
+/// one from `og[p[1].z]` (blocks `2 e` and `2 e + 1`): the few rows' kernel's, where the tensor cores' would decode
+/// a matrix for a block of mostly empty rows.
 pub(crate) const MANY_CLEAR: &str = r#"
 @group(0) @binding(6) var<storage, read_write> og: array<u32>;
 @group(0) @binding(7) var<storage, read_write> od: array<u32>;
@@ -2008,6 +2013,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if (i < 2u * places) { og[i] = 0xffffffffu; }
     if (i < places) { od[i] = 0xffffffffu; }
     if (i < 3u * p[0].z) { od[places + i] = 0u; }
+    let few = p[1].x;
+    if (few > 0u) {
+        if (i < 2u * p[0].z * few) { og[p[1].z + i] = 0xffffffffu; }
+        if (i < p[0].z * few) { od[p[1].y + i] = 0xffffffffu; }
+    }
 }
 "#;
 
@@ -2040,6 +2050,8 @@ fn main(@builtin(local_invocation_index) e: u32) {
     let ne = p[0].z;
     var nb = 0u;
     if (e < ne) { nb = (od[at + e] + bs - 1u) / bs; }
+    // (an expert of few jobs: none of these blocks, its own in the second order)
+    if (p[1].x > 0u && e < ne && od[at + e] <= p[1].x) { nb = 0u; }
     sums[e] = nb;
     workgroupBarrier();
     for (var st = 1u; st < 1024u; st *= 2u) {
@@ -2070,6 +2082,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let ne = p[0].z;
     let e = jd[2u * j];
     let pos = atomicAdd(&od[at + 2u * ne + e], 1u);
+    let few = p[1].x;
+    if (few > 0u && atomicLoad(&od[at + e]) <= few) {
+        atomicStore(&od[p[1].y + e * few + pos], j);
+        og[p[1].z + 2u * e * few + pos] = 2u * j;
+        og[p[1].z + (2u * e + 1u) * few + pos] = 2u * j + 1u;
+        return;
+    }
     let b = atomicLoad(&od[at + ne + e]) + pos / bs;
     let slot = pos % bs;
     atomicStore(&od[b * bs + slot], j);
