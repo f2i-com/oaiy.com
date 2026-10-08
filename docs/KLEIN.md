@@ -3,7 +3,7 @@
 **Updated:** native CUDA baseline, strength-1 LoRA image and byte-identical
 strength-zero control have now succeeded. See [current validation and reproduction](KLEIN_VALIDATED.md).
 
-> **On WebGPU (2026-10-10).** A Klein job runs on WebGPU, on a GPU of any make, when it
+> **On WebGPU (2026-10-08).** A Klein job runs on WebGPU, on a GPU of any make, when it
 > names no backend: the Qwen3-4B text encoder (`klein_text_wgpu`), the transformer
 > (`klein_wgpu`: a GGUF's K-quant blocks as they are, or a checkpoint's floats as f16,
 > LoRA factors beside or merged) and the VAE's decoder (SDXL's on WebGPU, the same

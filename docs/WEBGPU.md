@@ -170,7 +170,7 @@ An Agent's tool call end to end (before the overlapped MoE): a 285-token prompt 
 tokens and took 52 s. On an internal NVMe the reads, most of what is left, would be
 several times faster.
 
-Since then (2026-10-09), through the server on two RTX 5090s with 152 GB of RAM for
+Since then (2026-10-08), through the server on two RTX 5090s with 152 GB of RAM for
 experts and the same drive: the experts are read into RAM and onto the second card
 while the server idles (130 s after it loads), and a 48-token reply then runs at 5.6
 tokens a second on a first-time prompt and 6.9 to 7.7 on one read before; a 93-token
@@ -218,7 +218,7 @@ OrcaSAQ-2-27B through the server on the RTX 5090 (2026-10-05): loaded in
 tokens a second, against 17 s and 4.5 for Qwen3.8 27B Q4_K_M on the same path (the
 rest is the host's share of every model then); tool calls made and answered.
 
-Since then (2026-10-09) it runs chained on the device as the GGUF models do (a decode
+Since then (2026-10-08) it runs chained on the device as the GGUF models do (a decode
 step or a prompt's chunk recorded once and submitted whole, the transforms and the
 roundings in kernels of their own): on one RTX 5090 a reply at 54 to 55 tokens a
 second, a 1,960-token prompt in 1.4 s and a 7,720-token one in 5.5 to 6.9 s. The CUDA
@@ -257,7 +257,7 @@ is how it ran until the reserve stopped counting the 32.6 GB n-gram table, which
 left the experts none of the budget. (That was one card on that date: its layers
 split over two cards since, and it reads a GGUF of the same architecture too.)
 
-Since then (2026-10-09), its EXL3 checkpoint chained over two RTX 5090s: a reply at 68
+Since then (2026-10-08), its EXL3 checkpoint chained over two RTX 5090s: a reply at 68
 to 69 tokens a second, 66 to 83 with its drafting head; a 1,960-token prompt in 0.54
 to 0.72 s. Its PEFT adapters run on its dense projections (an adapter of its routed
 experts is refused), and its vision tower is chained (a new picture answered in
@@ -265,7 +265,7 @@ experts is refused), and its vision tower is chained (a new picture answered in
 
 It also reads the GGUFs Strata runs (ISTA-DASLab's GSQ-RCO files: Q2_0 experts with
 K-quant, IQ4 and f16 matrices beside them; `quant_moe`, `quant_linear`). From the Q2_0
-file over two RTX 5090s (2026-10-10): a reply at 84 to 88 tokens a second, 88 to 96
+file over two RTX 5090s (2026-10-08): a reply at 84 to 88 tokens a second, 88 to 96
 drafting with the EXL3 checkpoint's prediction layer (`--mtp-from`), a 1,960-token
 prompt in 0.50 to 0.56 s. Strata's published figure for the model on one RTX 5090
 (its IQ2_XS file, drafting four deep with suffix drafts, the card at its full 575 W;
@@ -273,6 +273,22 @@ ours are capped at 400 W) is 179 tokens a second and 4,270 tokens a second of pr
 at 4K: the prompt is matched on two cards, the reply is half. A decode step there
 takes 10.9 ms (10.6 of them the GPU's kernels), a check of four drafted rows 19.7,
 and a round of drafting adds some 5 ms for the drafts themselves.
+
+The IQ2_XS file is the one Strata's figure is for. Its routed experts' gate and up
+matrices are grid types (IQ2_S in 34 layers, IQ2_XXS in 11, IQ1_M in 3; their down
+matrices Q2_0): a group of eight weights is one entry of ggml's grid, with its signs and
+a scale. `quant_moe` decodes them on the card as it does Q2_0, the grid in a storage
+buffer of the layer's (as WGSL constants such tables are copied at each call, which
+once reset the driver). From that file over two RTX 5090s (2026-10-08): a reply at 78
+to 81 tokens a second, 80 to 88 drafting, a 1,960-token prompt in about 1 s; a decode
+step 11.6 ms, a check of four rows 21.8 (before these kernels every layer's experts ran
+on the host's reference path: 0.9 tokens a second). So Strata's own figure is still
+twice ours on its own file. Its log says where: 256 tokens in 96 passes of 3.4 rows,
+14.9 ms a pass; ours, on prose, 300 tokens in 145 passes of 2.7 rows, 23.7 ms a pass.
+A step's row costs much the same in both; each further row of a check costs 3.3 ms here
+(the IQ4_XS matrices 1.25 of it, the experts 0.7). On one card the layers it has no
+room for still run their experts on the reference path (the host's fast kernel reads
+Q2_0 only).
 
 On one card (`--devices 0`) the file does not fit: its experts are 34 GB, and a 32 GB
 card's budget holds 34 of the 48 layers' beside the dense matrices. The other 14

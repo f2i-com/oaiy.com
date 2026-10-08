@@ -9,7 +9,7 @@ The server and inference core remain std-only and forbid unsafe Rust.
 
 > **WebGPU, since 2026-10-08.** The worker's one GPU backend is WebGPU, which a job
 > gets when it names no backend: text-to-video and image-to-video, guided sampling, a
-> negative prompt and LoRAs run there, and (2026-10-11) a clip's own sound, made with
+> negative prompt and LoRAs run there, and (2026-10-08) a clip's own sound, made with
 > its picture: the transformer's audio stream beside its video stream, each block's two
 > attending to each other, and the audio's text context, all on the GPU; the audio VAE
 > and the vocoder are still Candle's on the CPU. On one RTX 5090 at its 400 W cap, LTX
