@@ -447,7 +447,8 @@ impl Hybrid {
         matches!(self, Self::Qwen35(Model::Qwen35(m)) if m.backend.chain().is_some())
     }
     /// Whether a prompt's chunks go to [`Self::forward_chunks`] together: Flash-Next over several GPUs, a chained
-    /// Qwen3.5 hybrid.
+    /// Qwen3.5 hybrid. (One card that runs every layer's experts gains nothing by it: 3.1 to 3.5 s for 4,086 tokens
+    /// either way, and two chunks' vectors and scratch at once are 1.5 GiB more of a card that has none to spare.)
     fn pipelines(&self) -> bool {
         #[cfg(feature = "webgpu")]
         if let Self::Flash(f) = self {
@@ -786,7 +787,8 @@ impl QwenEngine {
                 self.covered.extend_from_slice(&keys[pos..stop]);
                 pos = stop;
             } else {
-                let end = (pos+PREFILL_CHUNK).min(keys.len()).min(stops.iter().copied().find(|&s| s > pos).unwrap_or(keys.len()));
+                // (the model's own chunk where it has one: Flash-Next's on one card, which runs no pipeline)
+                let end = (pos + hybrid.prompt_rows()).min(keys.len()).min(stops.iter().copied().find(|&s| s > pos).unwrap_or(keys.len()));
                 let mut embeds = hybrid.embed(&job.prompt[pos..end])?;
                 let width = hybrid.width();
                 for (at,t) in &soft {

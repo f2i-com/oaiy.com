@@ -3049,7 +3049,11 @@ impl FlashNext {
         self.devices.len()
     }
 
-    /// The rows a prompt's chunk has at most: 512 (OAIY_FN_ROWS: as given, 64 to 1,024). A chunk's experts' weights
+    /// The rows a prompt's chunk has at most: 512 (OAIY_FN_ROWS: as given, 64 to 1,024; on one card too). One card
+    /// that holds a part of its experts reads fewer of the others from the host's memory in chunks of 1,024 (a
+    /// chunk copies each it uses once: 4,086 tokens in 2.5 to 2.8 s where 3.1 to 3.5), but a chunk's vectors and
+    /// scratch are then 1.3 GiB more, past what the system lets a process keep on a 32 GB card beside 313 slots a
+    /// layer (a prompt in 6 to 7 s some runs, out of memory in others). A chunk's experts' weights
     /// are decoded once a block of their rows, and a chunk of 512 gives each of the 512 experts some 10 rows of a
     /// block's 32, so a chunk of 1,024 takes less of the GPUs a token (its kernels 298 ms where two of 512 take 342).
     /// It is not the faster for that over two cards (2,148 tokens run together 679 to 691 ms in chunks of 1,024 where

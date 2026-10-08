@@ -1066,6 +1066,23 @@ impl ChainRecorder for Recorder<'_> {
         }
         crate::profile::add(&crate::profile::CHAIN_WAIT, submitted);
         let pooled = std::mem::take(&mut self.pooled);
+        // (OAIY_SCRATCH_LOG: what the recording held of the pool's scratch, by size, where it is 64 MB or more)
+        static SCRATCH_LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *SCRATCH_LOG.get_or_init(|| std::env::var_os("OAIY_SCRATCH_LOG").is_some()) {
+            let total: u64 = pooled.iter().map(|(b, _)| b).sum();
+            if total >= 64 << 20 {
+                let mut sizes: Vec<(u64, usize)> = Vec::new();
+                for (b, _) in &pooled {
+                    match sizes.iter_mut().find(|(s, _)| s == b) {
+                        Some((_, n)) => *n += 1,
+                        None => sizes.push((*b, 1)),
+                    }
+                }
+                sizes.sort_by_key(|(s, n)| std::cmp::Reverse(s * *n as u64));
+                let most: Vec<String> = sizes.iter().take(8).map(|(s, n)| format!("{n} of {} MB", s >> 20)).collect();
+                eprintln!("    a recording's scratch: {} buffers, {:.2} GiB ({}); spare {:.2} GiB", pooled.len(), total as f64 / (1u64 << 30) as f64, most.join(", "), self.spare.iter().map(|(b, _)| b).sum::<u64>() as f64 / (1u64 << 30) as f64);
+            }
+        }
         self.gpu().unpool(pooled);
         if let Some(staging) = pieces {
             let period = self.gpu().queue().get_timestamp_period() as f64;

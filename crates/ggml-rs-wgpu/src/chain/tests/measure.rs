@@ -1168,6 +1168,18 @@ fn measure_the_dispatch_floor() {
     }
 }
 
+/// What the system lets this process keep on the card (Vulkan's budget for its device-local heap), the card's size
+/// and the weights' budget made of it (`--ignored --nocapture`): a model's weights, its caches and a prompt's scratch
+/// past the first are moved off the card by the system, with no error and a prompt some three times as long.
+#[test]
+#[ignore = "a measurement"]
+fn measure_the_cards_room() {
+    let Ok(b) = WgpuBackend::new(None) else { return };
+    let gib = |v: u64| v as f64 / (1u64 << 30) as f64;
+    let (used, weights) = b.usage();
+    eprintln!("{}: the system's budget for this process {:?} GiB (and its use of it), the weights' budget {:.2} GiB ({:.2} used)", b.adapter().name, b.memory_budget().map(|(budget, used)| (gib(budget), gib(used))), gib(weights), gib(used));
+}
+
 /// What a kernel pays for a matrix it reads from the HOST's memory over the bus ([`WgpuBackend::host_vec_of_bytes`])
 /// against one in the card's own (`--ignored --nocapture`): BF16 matrices of an expert's size (1.6 MB), a shared
 /// expert's (6.5 MB) and a delta net's gate's (31 MB), one row, each dispatch another copy (256 MB of them in turn),

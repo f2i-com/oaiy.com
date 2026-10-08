@@ -25,5 +25,8 @@ impl Recorder<'_> {
         let groups = (d.v_heads * dk / r) as u32;
         self.dispatch_wide(names[1], &delta_net_scan(dk, r), [buffer(&qk), buffer(conv), buffer(&qk), &dd, &dd, &dd, buffer(state), buffer(out)], words, (groups, 1, 1));
         self.dispatch_wide(names[2], &size(DELTA_NET_NORM), [&dd, buffer(z), &dd, &dd, &dd, buffer(norm), &drw, buffer(out)], words, (d.v_heads as u32, rows, 1));
+        // (the scan was the scratch's last reader: the next layer's delta net takes it again. Each of Flash-Next's
+        // 36 such layers held its own to the recording's end, 16 MB at 512 rows: half of what a chunk took)
+        self.done_with(&qk);
     }
 }

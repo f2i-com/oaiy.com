@@ -364,7 +364,14 @@ impl Recorder<'_> {
         self.backend
     }
 
-    /// Whether this recording keeps its bind groups.
+    /// `v`, of [`Self::scratch`], has had its last reader recorded: the next scratch of its size is it again (what
+    /// is recorded after writes it after that reader, in the queue's order), where it would be held to the
+    /// recording's end beside a new one.
+    pub(crate) fn done_with(&mut self, v: &DeviceVec) {
+        let b = buffer(v);
+        self.spare.push((b.size(), b.clone()));
+    }
+
     /// A read of `len` elements of `buffer` from `offset`, as [`ChainRecorder::read_range`] records a vector's: its
     /// place among the recording's reads.
     pub(crate) fn read_of(&mut self, buffer: &wgpu::Buffer, offset: usize, len: usize) -> usize {
@@ -373,6 +380,7 @@ impl Recorder<'_> {
         self.reads.len() - 1
     }
 
+    /// Whether this recording keeps its bind groups.
     pub(crate) fn keeps(&self) -> bool {
         self.keep
     }

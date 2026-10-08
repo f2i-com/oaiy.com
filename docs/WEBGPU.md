@@ -501,6 +501,21 @@ tokens a second) and a reply at 116 to 118 tokens a second (256 tokens in 2.17 t
 2.2 (two cards, which hold every expert: 1.62 to 1.74 s), and the first slots are the
 first experts, where a file of the model's use would say which.
 
+What a card has beside its weights decides the rest. Windows lets a process keep
+30.68 GiB on this 32 GB card (`measure_the_cards_room`: Vulkan's budget for the
+heap); past it a prompt ran two or three times as long in some runs and out of memory
+in others. A prompt's chunk held 1.17 GiB of scratch to its recording's end, half of
+it the delta nets' (each of the 36 layers its own 16 MB at 512 rows:
+`OAIY_SCRATCH_LOG` says a recording's scratch by size); a delta net's is the next
+layer's now once its scan is recorded (`Recorder::done_with`), a chunk's scratch is
+0.63 GiB, and the card's most memory in use over the request 29.2 GiB where 29.9.
+Chunks of 1,024 rows (`OAIY_FN_ROWS`, which one card's chunks follow now) copy fewer
+experts from the host, each chunk the ones it uses once: 14,000 to 16,000 a prompt
+where 20,000 to 26,000, the prompt in 2.5 to 2.8 s where 3.1 to 3.5. But their
+vectors and scratch are 1.3 GiB more, past the budget beside 313 slots a layer, so
+512 stays what a chunk is. One card's chunks run together, as two cards' are, were
+the same 3.1 to 3.5 s for 1.5 GiB more.
+
 A recording's reads are polled for 20 ms before the thread waits for them
 (`OAIY_CHAIN_SPIN_MS`), as a CUDA program's are by default: a step, a check and a host
 layer's round trip end within that, and each was some 0.1 ms the longer for parking
