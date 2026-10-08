@@ -11,6 +11,11 @@
 //! Each row's experts are summed in the order it was routed, each expert's output made by itself, so a row's sum is
 //! the same bits whatever rows are beside it (a check of drafted tokens rests on that).
 //!
+//! The grid types the GSQ-RCO IQ2_XS file keeps its experts' gate and up matrices in (IQ2_S, IQ2_XXS, IQ1_M; their
+//! down ones are Q2_0) are read as they lie too ([`Grid`]): a group of eight weights is an entry of ggml's grid, held
+//! here as eight floats, its signs flipped by a table of the bits to flip, times eight of `x`; a 32's (or a 16's)
+//! groups are summed in eight lanes and added to the row's by their scale.
+//!
 //! The shared expert is dense (20 MB of f32 a layer, cold at each step: more to read than a row's ten routed experts
 //! together), so where the layer has a GPU it stays there ([`SharedOnGpu`], 10 MB as f16): the chain records it before
 //! it reads the layer's router and input back, and the host adds its output by its gate (`Experts::forward_given`).
@@ -21,7 +26,7 @@ use ggml_rs::exl3::{route, Experts};
 use ggml_rs::{ChainRecorder, DeviceChain, DeviceVec, Tensor};
 use rayon::prelude::*;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// A Q2_0 block's weights, and its bytes (an f16 scale, then 2 bits a weight).
 const BLOCK: usize = 64;
@@ -98,6 +103,181 @@ fn q2_rows_portable(w: &[u8], k: usize, x: &[f32], sums: &[f32], out: &mut [f32]
             }
         }
         *o = total.iter().sum::<f32>() - less;
+    }
+}
+
+/// A grid type a host layer's gate and up matrices are read as they lie in: a block 256 weights, a group of eight of
+/// them an entry of ggml's grid.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Grid {
+    IQ2_S,
+    IQ2_XXS,
+    IQ1_M,
+}
+
+impl Grid {
+    fn of(t: GgmlType) -> Option<Grid> {
+        match t {
+            GgmlType::IQ2_S => Some(Grid::IQ2_S),
+            GgmlType::IQ2_XXS => Some(Grid::IQ2_XXS),
+            GgmlType::IQ1_M => Some(Grid::IQ1_M),
+            _ => None,
+        }
+    }
+
+    /// A block's bytes in the GGUF.
+    fn block_bytes(self) -> usize {
+        match self {
+            Grid::IQ2_S => 82,
+            Grid::IQ2_XXS => 66,
+            Grid::IQ1_M => 56,
+        }
+    }
+
+    /// The type's grid, an entry its eight weights as floats (IQ2's bytes magnitudes, IQ1's int8: -1, 0 or 1).
+    fn values(self) -> &'static [[f32; 8]] {
+        use ggml_quants::iq_tables as t;
+        static S: OnceLock<Vec<[f32; 8]>> = OnceLock::new();
+        static XXS: OnceLock<Vec<[f32; 8]>> = OnceLock::new();
+        static M: OnceLock<Vec<[f32; 8]>> = OnceLock::new();
+        let floats = |grid: &[u64], signed: bool| -> Vec<[f32; 8]> { grid.iter().map(|e| e.to_le_bytes().map(|b| if signed { b as i8 as f32 } else { b as f32 })).collect() };
+        match self {
+            Grid::IQ2_S => S.get_or_init(|| floats(&t::IQ2S_GRID, false)),
+            Grid::IQ2_XXS => XXS.get_or_init(|| floats(&t::IQ2XXS_GRID, false)),
+            Grid::IQ1_M => M.get_or_init(|| floats(&t::IQ1S_GRID, true)),
+        }
+    }
+}
+
+/// A sign byte's eight signs as the bits to flip in eight floats (weight `j` negative where its bit `j` is set).
+fn sign_bits() -> &'static [[u32; 8]; 256] {
+    static BITS: OnceLock<Box<[[u32; 8]; 256]>> = OnceLock::new();
+    BITS.get_or_init(|| {
+        let mut all = Box::new([[0u32; 8]; 256]);
+        for (s, flips) in all.iter_mut().enumerate() {
+            for (j, f) in flips.iter_mut().enumerate() {
+                *f = ((s >> j) as u32 & 1) << 31;
+            }
+        }
+        all
+    })
+}
+
+/// `x[at..at + 8]`.
+#[inline(always)]
+fn eight(x: &[f32], at: usize) -> &[f32; 8] {
+    x[at..at + 8].try_into().expect("eight of x")
+}
+
+/// A group's eight weights (`m`, their signs flipped by `flips`) times eight of `x`, added to `acc`'s lanes.
+#[inline(always)]
+fn add_group(acc: &mut [f32; 8], m: &[f32; 8], flips: &[u32; 8], x: &[f32; 8]) {
+    for j in 0..8 {
+        acc[j] += f32::from_bits(m[j].to_bits() ^ flips[j]) * x[j];
+    }
+}
+
+/// `out[r]`: IQ2_S row `r` of `w` (rows of `k` weights as a GGUF has them) times `x`. A block is its f16 scale, 32
+/// groups' grid indices' low bytes, their sign bytes, eight bytes of the indices' high bits (two a group) and eight
+/// of scales (a nibble for each 16 weights).
+#[inline(always)]
+fn iq2_s_rows_portable(w: &[u8], k: usize, x: &[f32], out: &mut [f32]) {
+    let (grid, signs) = (Grid::IQ2_S.values(), sign_bits());
+    for (row, o) in w.chunks_exact(k / 256 * 82).zip(out.iter_mut()) {
+        let mut total = [0f32; 8];
+        for (block, xb) in row.chunks_exact(82).zip(x.chunks_exact(256)) {
+            let d = scale(block);
+            for sub in 0..8 {
+                let (high, scales) = (block[66 + sub] as usize, block[74 + sub]);
+                for half in 0..2 {
+                    let mut acc = [0f32; 8];
+                    for l in 2 * half..2 * half + 2 {
+                        let g = 4 * sub + l;
+                        let i = block[2 + g] as usize | ((high << (8 - 2 * l)) & 0x300);
+                        add_group(&mut acc, &grid[i], &signs[block[34 + g] as usize], eight(xb, 8 * g));
+                    }
+                    let s = d * (0.5 + ((scales >> (4 * half)) & 15) as f32) * 0.25;
+                    for j in 0..8 {
+                        total[j] += s * acc[j];
+                    }
+                }
+            }
+        }
+        *o = total.iter().sum();
+    }
+}
+
+/// [`iq2_s_rows_portable`] for IQ2_XXS: a block its f16 scale, then for each 32 weights four groups' grid indices
+/// and a word of their sign patterns' numbers (seven bits each, ggml's table of them) under the 32's scale.
+#[inline(always)]
+fn iq2_xxs_rows_portable(w: &[u8], k: usize, x: &[f32], out: &mut [f32]) {
+    let (grid, signs, patterns) = (Grid::IQ2_XXS.values(), sign_bits(), &ggml_quants::iq_tables::KSIGNS_IQ2XS);
+    for (row, o) in w.chunks_exact(k / 256 * 66).zip(out.iter_mut()) {
+        let mut total = [0f32; 8];
+        for (block, xb) in row.chunks_exact(66).zip(x.chunks_exact(256)) {
+            let d = scale(block);
+            for sub in 0..8 {
+                let at = 2 + 8 * sub;
+                let aux = u32::from_le_bytes([block[at + 4], block[at + 5], block[at + 6], block[at + 7]]);
+                let mut acc = [0f32; 8];
+                for l in 0..4 {
+                    let pattern = patterns[((aux >> (7 * l)) & 127) as usize] as usize;
+                    add_group(&mut acc, &grid[block[at + l] as usize], &signs[pattern], eight(xb, 32 * sub + 8 * l));
+                }
+                let s = d * (0.5 + (aux >> 28) as f32) * 0.25;
+                for j in 0..8 {
+                    total[j] += s * acc[j];
+                }
+            }
+        }
+        *o = total.iter().sum();
+    }
+}
+
+/// [`iq2_s_rows_portable`] for IQ1_M: a block 32 groups' grid indices' low bytes, 16 bytes of their high bits and
+/// offsets' signs (a nibble a group), and four 16-bit words: twelve bits of scales each (three for each 16 weights)
+/// under a nibble of the block's f16 scale. A weight is its grid value (-1, 0 or 1) plus or minus an eighth, times
+/// its scale: `eights[g]` the sum of `x` over group `g`, for the eighths.
+#[inline(always)]
+fn iq1_m_rows_portable(w: &[u8], k: usize, x: &[f32], eights: &[f32], out: &mut [f32]) {
+    let grid = Grid::IQ1_M.values();
+    let none = [0u32; 8];
+    for (row, o) in w.chunks_exact(k / 256 * 56).zip(out.iter_mut()) {
+        let (mut total, mut offsets) = ([0f32; 8], 0f32);
+        for ((b, block), xb) in row.chunks_exact(56).enumerate().zip(x.chunks_exact(256)) {
+            let word = |i: usize| u16::from_le_bytes([block[48 + 2 * i], block[49 + 2 * i]]);
+            let d = scale(&((word(0) >> 12) | ((word(1) >> 8) & 0x00f0) | ((word(2) >> 4) & 0x0f00) | (word(3) & 0xf000)).to_le_bytes());
+            for sub in 0..8 {
+                let scales = word(sub / 2) >> (6 * (sub % 2));
+                for half in 0..2 {
+                    let (mut acc, mut off) = ([0f32; 8], 0f32);
+                    for l in 2 * half..2 * half + 2 {
+                        let g = 4 * sub + l;
+                        let h = (block[32 + 2 * sub + l / 2] >> (4 * (l % 2))) as usize;
+                        add_group(&mut acc, &grid[block[g] as usize | ((h & 7) << 8)], &none, eight(xb, 8 * g));
+                        off += if h & 8 != 0 { -0.125 } else { 0.125 } * eights[32 * b + g];
+                    }
+                    let s = d * (2 * ((scales >> (3 * half)) & 7) + 1) as f32;
+                    offsets += s * off;
+                    for j in 0..8 {
+                        total[j] += s * acc[j];
+                    }
+                }
+            }
+        }
+        *o = total.iter().sum::<f32>() + offsets;
+    }
+}
+
+/// `out[r]`: row `r` of the grid type's `w` times `x` (`eights`: `x`'s sums over groups of eight, IQ1_M's).
+#[inline(always)]
+fn grid_rows_portable(kind: Grid, w: &[u8], k: usize, x: &[f32], eights: &[f32], out: &mut [f32]) {
+    assert!(k % 256 == 0 && x.len() >= k && w.len() >= out.len() * (k / 256 * kind.block_bytes()), "{kind:?} rows of {k}");
+    match kind {
+        Grid::IQ2_S => iq2_s_rows_portable(w, k, x, out),
+        Grid::IQ2_XXS => iq2_xxs_rows_portable(w, k, x, out),
+        Grid::IQ1_M => iq1_m_rows_portable(w, k, x, eights, out),
     }
 }
 
@@ -197,6 +377,23 @@ mod x86 {
     pub unsafe fn dense_rows_avx2(w: &[f32], k: usize, x: &[f32], out: &mut [f32]) {
         super::dense_rows_portable(w, k, x, out)
     }
+
+    /// The grid types' portable loops compiled for AVX-512 (a group's eight lanes are half a register: the loops are
+    /// AVX2's there too, with more registers).
+    ///
+    /// # Safety
+    /// The CPU must have AVX-512F.
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn grid_rows_512(kind: super::Grid, w: &[u8], k: usize, x: &[f32], eights: &[f32], out: &mut [f32]) {
+        super::grid_rows_portable(kind, w, k, x, eights, out)
+    }
+
+    /// # Safety
+    /// The CPU must have AVX2 and FMA.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn grid_rows_avx2(kind: super::Grid, w: &[u8], k: usize, x: &[f32], eights: &[f32], out: &mut [f32]) {
+        super::grid_rows_portable(kind, w, k, x, eights, out)
+    }
 }
 
 fn q2_rows(level: Level, w: &[u8], k: usize, x: &[f32], sums: &[f32], out: &mut [f32]) {
@@ -207,6 +404,17 @@ fn q2_rows(level: Level, w: &[u8], k: usize, x: &[f32], sums: &[f32], out: &mut 
         #[cfg(target_arch = "x86_64")]
         Level::Avx2 => unsafe { x86::q2_rows_avx2(w, k, x, sums, out) },
         Level::Portable => q2_rows_portable(w, k, x, sums, out),
+    }
+}
+
+fn grid_rows(level: Level, kind: Grid, w: &[u8], k: usize, x: &[f32], eights: &[f32], out: &mut [f32]) {
+    match level {
+        // SAFETY: Level::detect found the features these are compiled for.
+        #[cfg(target_arch = "x86_64")]
+        Level::Avx512 => unsafe { x86::grid_rows_512(kind, w, k, x, eights, out) },
+        #[cfg(target_arch = "x86_64")]
+        Level::Avx2 => unsafe { x86::grid_rows_avx2(kind, w, k, x, eights, out) },
+        Level::Portable => grid_rows_portable(kind, w, k, x, eights, out),
     }
 }
 
@@ -247,9 +455,12 @@ impl Drop for SharedOnGpu {
     }
 }
 
-/// A layer's Q2_0 experts on the host, read as the GGUF holds them. See the module's notes.
+/// A layer's experts on the host, read as the GGUF holds them: Q2_0 ones, or ones whose gate and up matrices are a
+/// grid type's. See the module's notes.
 pub struct QuantMoeHost {
     data: QuantExpertsData,
+    /// The gate and up matrices' grid type (Q2_0 where none).
+    grid: Option<Grid>,
     level: Level,
     gpu: Option<SharedOnGpu>,
 }
@@ -257,18 +468,21 @@ pub struct QuantMoeHost {
 impl std::fmt::Debug for QuantMoeHost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let shared = if self.gpu.is_some() { "on the host, the shared one on its GPU" } else { "and the shared one, on the host" };
-        write!(f, "QuantMoeHost({} routed experts of {}x{} in Q2_0 {shared}: {:?})", self.data.experts, self.data.hidden, self.data.ff, self.level)
+        write!(f, "QuantMoeHost({} routed experts of {}x{} in {:?} and {:?} {shared}: {:?})", self.data.experts, self.data.hidden, self.data.ff, self.data.gate.0, self.data.down.0, self.level)
     }
 }
 
 impl QuantMoeHost {
-    /// The experts of `data`, where its routed ones are Q2_0 and their widths whole blocks: else `data` back.
+    /// The experts of `data`, where its routed ones' down matrices are Q2_0, their gate and up ones Q2_0 or one grid
+    /// type, and their widths whole blocks: else `data` back.
     fn try_new(data: QuantExpertsData, level: Level) -> Result<Self, QuantExpertsData> {
         let q2 = |t: GgmlType| t == GgmlType::Q2_0;
-        if !(q2(data.gate.0) && q2(data.up.0) && q2(data.down.0)) || data.hidden % BLOCK != 0 || data.ff % BLOCK != 0 {
+        let grid = Grid::of(data.gate.0).filter(|_| data.up.0 == data.gate.0);
+        let wide = if grid.is_some() { 256 } else { BLOCK };
+        if !(q2(data.down.0) && (grid.is_some() || (q2(data.gate.0) && q2(data.up.0)))) || data.hidden % wide != 0 || data.ff % BLOCK != 0 {
             return Err(data);
         }
-        Ok(QuantMoeHost { data, level, gpu: None })
+        Ok(QuantMoeHost { data, grid, level, gpu: None })
     }
 
     /// With the shared expert on `b` as well, where its budget has the room (f16 where its values are f16's: 10 MB of
@@ -320,15 +534,35 @@ impl QuantMoeHost {
     fn routed(&self, e: usize, x: &[f32], sums: &[f32]) -> Vec<f32> {
         let d = &self.data;
         let (h, f) = (d.hidden, d.ff);
-        let (wide, narrow) = (f * (h / BLOCK * BLOCK_BYTES), h * (f / BLOCK * BLOCK_BYTES));
+        let narrow = h * (f / BLOCK * BLOCK_BYTES);
         let (mut a, mut b, mut y) = (vec![0f32; f], vec![0f32; f], vec![0f32; h]);
-        q2_rows(self.level, &d.gate.1[e * wide..(e + 1) * wide], h, x, sums, &mut a);
-        q2_rows(self.level, &d.up.1[e * wide..(e + 1) * wide], h, x, sums, &mut b);
+        match self.grid {
+            None => {
+                let wide = f * (h / BLOCK * BLOCK_BYTES);
+                q2_rows(self.level, &d.gate.1[e * wide..(e + 1) * wide], h, x, sums, &mut a);
+                q2_rows(self.level, &d.up.1[e * wide..(e + 1) * wide], h, x, sums, &mut b);
+            }
+            // (`sums` then x's sums over groups of eight: [`Self::sums`])
+            Some(kind) => {
+                let wide = f * (h / 256 * kind.block_bytes());
+                grid_rows(self.level, kind, &d.gate.1[e * wide..(e + 1) * wide], h, x, sums, &mut a);
+                grid_rows(self.level, kind, &d.up.1[e * wide..(e + 1) * wide], h, x, sums, &mut b);
+            }
+        }
         for (a, b) in a.iter_mut().zip(&b) {
             *a = silu(*a) * b;
         }
         q2_rows(self.level, &d.down.1[e * narrow..(e + 1) * narrow], f, &a, &block_sums(&a), &mut y);
         y
+    }
+
+    /// What [`Self::routed`] takes of a row `x` beside it: its sums over blocks of 64 (Q2_0's gate and up), or over
+    /// groups of eight (a grid type's: IQ1_M's offsets).
+    fn sums(&self, x: &[f32]) -> Vec<f32> {
+        match self.grid {
+            None => block_sums(x),
+            Some(_) => x.chunks_exact(8).map(|g| g.iter().sum()).collect(),
+        }
     }
 
     /// The shared expert on `x`.
@@ -364,7 +598,7 @@ impl QuantMoeHost {
         let rows = xs.len() / h;
         assert!(given.is_none_or(|g| g.len() >= rows * h), "the shared expert's outputs for {rows} rows");
         let assign: Vec<Vec<(usize, f32)>> = (0..rows).map(|r| route(&ls[r * (n + 1)..(r + 1) * (n + 1)], top_k)).collect();
-        let sums: Vec<Vec<f32>> = xs.chunks_exact(h).map(block_sums).collect();
+        let sums: Vec<Vec<f32>> = xs.chunks_exact(h).map(|x| self.sums(x)).collect();
         // each routed expert's rows, and where in a row's list it is: an expert's rows one task (its matrices read on
         // one core for them all)
         let mut by: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
@@ -446,8 +680,9 @@ impl Experts for QuantMoeHost {
     }
 }
 
-/// The experts of `data` on the host for a model's use: read as they lie where they are Q2_0 ([`QuantMoeHost`]), else
-/// the reference ([`crate::quant_moe::QuantMoeCpu`], each expert dequantised for its call).
+/// The experts of `data` on the host for a model's use: read as they lie where they are Q2_0, or their gate and up
+/// matrices a grid type's ([`QuantMoeHost`]), else the reference ([`crate::quant_moe::QuantMoeCpu`], each expert
+/// dequantised for its call).
 pub fn quant_experts_host(data: QuantExpertsData) -> Result<Box<dyn Experts>, String> {
     data.validate()?;
     match QuantMoeHost::try_new(data, Level::detect()) {
@@ -469,7 +704,7 @@ pub fn quant_experts_host_beside(b: &WgpuBackend, data: QuantExpertsData) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quant_moe::tests::{copy, experts, inputs, worst};
+    use crate::quant_moe::tests::{copy, experts, experts_of, inputs, worst};
 
     /// Every level this CPU has.
     fn levels() -> Vec<Level> {
@@ -501,6 +736,32 @@ mod tests {
                 let got = fast.forward(&xt, &lt, top_k);
                 let err = worst(got.data(), want.data());
                 assert!(err < 2e-4, "{hidden}x{ff}, {rows} rows, {level:?}: the worst {err:.3e} of the reference's RMS");
+            }
+        }
+    }
+
+    /// Experts whose gate and up matrices are a grid type's (IQ2_S, IQ2_XXS, IQ1_M; their down ones Q2_0: the GSQ-RCO
+    /// IQ2_XS file's layers) read as they lie give the reference's sums within f32's rounding: a small shape and
+    /// Flash-Next's width, a step's row, a check's few and a prompt's many, on every level the CPU has; and a row's
+    /// sum is the same bits alone and among other rows.
+    #[test]
+    fn the_hosts_grid_experts_read_as_they_lie_are_the_reference() {
+        for gu in [GgmlType::IQ2_S, GgmlType::IQ2_XXS, GgmlType::IQ1_M] {
+            for (hidden, ff, count, top_k, rows) in [(256usize, 64usize, 24usize, 4usize, 1usize), (256, 64, 24, 4, 37), (512, 192, 12, 3, 5), (2560, 640, 14, 10, 4)] {
+                let data = experts_of(31 + rows as u64, hidden, ff, count, true, gu);
+                let (x, logits) = inputs(7 + hidden as u64, rows, hidden, count);
+                let (xt, lt) = (Tensor::from_vec(x.clone(), vec![rows, hidden]), Tensor::from_vec(logits.clone(), vec![rows, count + 1]));
+                let want = crate::quant_moe::quant_experts_cpu(copy(&data)).unwrap().forward(&xt, &lt, top_k);
+                for level in levels() {
+                    let fast = QuantMoeHost::try_new(copy(&data), level).ok().expect("a grid type's experts");
+                    assert_eq!(fast.grid, Grid::of(gu));
+                    let got = fast.forward(&xt, &lt, top_k);
+                    let err = worst(got.data(), want.data());
+                    assert!(err < 2e-4, "{gu:?} {hidden}x{ff}, {rows} rows, {level:?}: the worst {err:.3e} of the reference's RMS");
+                    let r = rows - 1;
+                    let one = fast.forward(&Tensor::from_vec(x[r * hidden..].to_vec(), vec![1, hidden]), &Tensor::from_vec(logits[r * (count + 1)..].to_vec(), vec![1, count + 1]), top_k);
+                    assert_eq!(one.data().iter().map(|v| v.to_bits()).collect::<Vec<_>>(), got.data()[r * hidden..].iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "{gu:?} row {r} alone, {level:?}");
+                }
             }
         }
     }
@@ -557,16 +818,24 @@ mod tests {
     }
 
     /// What a layer of Flash-Next's experts costs on the host: a step's row, a check's four, a prompt's 512.
+    /// HOST_EXPERTS_TYPE: their gate and up matrices' type (iq2_s, iq2_xxs, iq1_m; Q2_0 where unset).
     #[test]
     #[ignore = "a timing: 0.7 GB of experts made at random; run with --nocapture"]
     fn measure_a_layers_experts_on_the_host() {
         let (hidden, ff, count, top_k) = (2560usize, 640usize, 512usize, 10usize);
-        let data = experts(11, hidden, ff, count, true);
+        let gu = match std::env::var("HOST_EXPERTS_TYPE").as_deref() {
+            Ok("iq2_s") => GgmlType::IQ2_S,
+            Ok("iq2_xxs") => GgmlType::IQ2_XXS,
+            Ok("iq1_m") => GgmlType::IQ1_M,
+            _ => GgmlType::Q2_0,
+        };
+        eprintln!("gate and up {gu:?}");
+        let data = experts_of(11, hidden, ff, count, true, gu);
         for level in levels() {
-            let fast = QuantMoeHost::try_new(copy(&data), level).ok().expect("Q2_0 experts");
+            let fast = QuantMoeHost::try_new(copy(&data), level).ok().expect("experts the host reads as they lie");
             // one routed expert and the shared one, each on this core
             let (x, _) = inputs(3, 1, hidden, count);
-            let sums = block_sums(&x);
+            let sums = fast.sums(&x);
             let t = std::time::Instant::now();
             for e in 0..200 {
                 std::hint::black_box(fast.routed(e, &x, &sums));

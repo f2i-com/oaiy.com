@@ -302,9 +302,19 @@ differs is a pass's time: 21 ms here (a check of 3.4 rows 17.5 ms, its drafts 3.
 the server's decode line says these) where Strata's is 14.9 all told. A check's time is
 its kernels': of a check of four rows' 18 ms the f16 matrices are 4.5 (the
 hyper-connections' are f16 in the file; the IQ3_S ones are held so), the experts 4.7
-with their routing, the IQ4_XS matrices 2.6, attention 2.3. On one card
-the layers it has no room for still run their experts on the reference path (the
-host's fast kernel reads Q2_0 only), so it is not usable there yet.
+with their routing, the IQ4_XS matrices 2.6, attention 2.3.
+
+On one card, which is what Strata's figure is for, this file is far from it: its
+experts are 35.5 GB, so 15 of the 48 layers' run on the host (`quant_host` reads the
+grid types as they lie too: 0.27 to 0.42 ms an expert a row on one AVX-512 core, where
+the reference's dequantising took 18 ms a layer). One RTX 5090 at 400 W: a reply at 43
+to 45 tokens a second, Strata's request at 43 (no drafting there), and its 4,086-token
+prompt in 24 s, 170 tokens a second, because a prompt's every row costs the host
+layers' experts a row each (146 ms a host layer for a chunk of 512). Strata keeps each
+layer's most used experts on the card (71% of them fit, 98 to 99.7% of its lookups hit)
+and computes the few others on the host; a whole layer on or off the card, as here,
+puts a third of the model's experts on the host for every token. Experts held one by
+one, most used first, are what one card needs next.
 
 On one card (`--devices 0`) the file does not fit: its experts are 34 GB, and a 32 GB
 card's budget holds 34 of the 48 layers' beside the dense matrices. The other 14

@@ -1183,7 +1183,7 @@ pub(crate) mod tests {
 
     /// [`experts`] with the routed ones' gate and up matrices of type `gu` (their down ones Q2_0, as the GSQ-RCO
     /// IQ2_XS file has them).
-    fn experts_of(seed: u64, hidden: usize, ff: usize, count: usize, half: bool, gu: GgmlType) -> QuantExpertsData {
+    pub(crate) fn experts_of(seed: u64, hidden: usize, ff: usize, count: usize, half: bool, gu: GgmlType) -> QuantExpertsData {
         let mut next = rng(seed);
         if gu != GgmlType::Q2_0 {
             let gate = random_grid(&mut next, gu, count, ff, hidden);
