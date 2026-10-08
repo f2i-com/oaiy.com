@@ -3,8 +3,9 @@
 //! are: a row's experts a job list (job `j` matrix `jobs[2j]` on input row `jobs[2j + 1]`, its result row `j`), routed
 //! on the host or on the GPU ([`crate::exl3::ROUTE`]), grouped by expert for a prompt's rows, each row's weighted sum
 //! made on the GPU. What differs is the matmul: a GGUF's weights are the weights (no Hadamard transforms, no channel
-//! maps), decoded by one function a type ([`Kind::wgsl`]'s `w8`: eight weights of a row) that every kernel here calls,
-//! so another type is its decode function, its rows' layout on the GPU and, for a lookup-table type, its grid.
+//! maps). The tensor cores' kernel decodes them by one function a type ([`Kind::wgsl`]'s `w8`: eight weights of a
+//! row); the kernel for a step's row and a check's few ([`few_source`]) is written for its type, a word's weights as
+//! vectors. Another type is its decode function, its rows' layout on the GPU and, for a lookup-table type, its grid.
 //!
 //! Q2_0 (ggml type 42: 64 weights a block of 18 bytes, an f16 scale then 2 bits a weight, a weight `(code - 1) *
 //! scale`) is held a row at a time: its codes' words (16 weights a word, weight `i` its bits `2 i`), then its blocks'
@@ -227,34 +228,52 @@ fn w8(rb: u32, kt: u32, hf: u32, kw: u32) -> array<f32, 8> {
 }
 "#;
 
-/// The matmul of blocks of `rows` (1 to [`FEW_MAX`]) jobs of one matrix, in f32: a workgroup a (16 outputs, block), a
-/// thread an output's sixteenth of `k`, each weight decoded once for the block's rows; a block's jobs from `order`
-/// (its unused places `0xffffffff`, a block with none ends at once), or with `p[0].w` block `b` job `b` alone (a
-/// step's jobs, no order). Job `j`'s sums to `y[j * n..]`. `p[0]`: n, k, words a row, whether the order is the
-/// identity; `p[1]`: words a matrix, the pass's first block.
-fn few_source(kind: Kind, rows: usize) -> String {
+/// Lanes an output row is shared out to in [`few_source`]'s kernel, for rows of `k` weights: 8, 16 or 32, some five
+/// words (80 weights) a lane or more. A lane's work must outweigh what every thread does whatever its share (its
+/// jobs' numbers, the barrier, its part in the sum): the experts' down projection is 640 wide, 40 words, and 32 lanes
+/// of it had a word or two each.
+fn few_lanes(k: usize) -> usize {
+    (k / 16 / 5).next_power_of_two().clamp(8, 32)
+}
+
+/// The matmul of blocks of `rows` (1 to [`FEW_MAX`]) jobs of one matrix, in f32: a workgroup a block's `256 / lanes`
+/// output rows, `lanes` threads a row ([`few_lanes`]), each taking a word (16 weights) in every `lanes` of the row, so
+/// the threads of a row read side by side; a word's weights decoded once for the block's rows as four vectors, x four
+/// at a load, the row's sum the lanes' behind a barrier. A block's jobs come from `order` (its unused places
+/// `0xffffffff`, a block with none ends at once), or with `p[0].w` block `b` is job `b` alone (a step's jobs, no
+/// order). Job `j`'s sums to `y[j * n..]`. `p[0]`: n, k, words a row, whether the order is the identity; `p[1]`: words
+/// a matrix, the pass's first block.
+///
+/// The first kernel gave an output row to 16 threads by sixteenths of its width, each decoding eight weights at a
+/// call into an array and reading x one at a time: a Flash-Next layer's ten experts for a step's one row took 77 us
+/// (1.3 TFLOPS), and this one 0.049 with 32 lanes for every width.
+fn few_source(kind: Kind, rows: usize, lanes: usize) -> String {
     assert!((1..=FEW_MAX).contains(&rows), "a block of 1 to {FEW_MAX} rows");
+    assert!(matches!(lanes, 8 | 16 | 32), "8, 16 or 32 lanes a row");
+    let Kind::Q2_0 = kind;
     let each = |f: &dyn Fn(usize) -> String| (0..rows).map(f).collect::<String>();
     let ids = each(&|i| {
         format!(
-            "    var j{i} = blk;\n    if (!identity) {{ j{i} = order[blk * {rows}u + {i}u]; }}\n    let on{i} = j{i} != 0xffffffffu;\n    let xb{i} = jobs[2u * select(j{i}, 0u, !on{i}) + 1u] * k;\n    var a{i} = 0.0;\n"
+            "    var j{i} = blk;\n    if (!identity) {{ j{i} = order[blk * {rows}u + {i}u]; }}\n    let on{i} = j{i} != 0xffffffffu;\n    let xb{i} = jobs[2u * select(j{i}, 0u, !on{i}) + 1u] * (k / 4u);\n    var a{i} = 0.0;\n"
         )
     });
-    let sums = each(&|i| format!("            if (on{i}) {{\n                var s = 0.0;\n                for (var e = 0u; e < 8u; e++) {{ s += lo[e] * x[xb{i} + at + e] + hi[e] * x[xb{i} + at + 8u + e]; }}\n                a{i} += s;\n            }}\n"));
+    let sums = each(&|i| {
+        format!("            if (on{i}) {{ a{i} += d * (dot(c0, x[xb{i} + at]) + dot(c1, x[xb{i} + at + 1u]) + dot(c2, x[xb{i} + at + 2u]) + dot(c3, x[xb{i} + at + 3u])); }}\n")
+    });
     let store = each(&|i| format!("    red[t * {rows}u + {i}u] = a{i};\n"));
-    let out = each(&|i| format!("        if (on{i}) {{\n            var s = 0.0;\n            for (var q = 0u; q < 16u; q++) {{ s += red[(t + q) * {rows}u + {i}u]; }}\n            y[j{i} * n + row] = s;\n        }}\n"));
+    let out = each(&|i| format!("        if (on{i}) {{\n            var s = 0.0;\n            for (var q = 0u; q < {lanes}u; q++) {{ s += red[(t + q) * {rows}u + {i}u]; }}\n            y[j{i} * n + row] = s;\n        }}\n"));
     format!(
         r#"
 @group(0) @binding(0) var<storage, read> words: array<u32>;
-@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> x: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read> jobs: array<u32>;
 @group(0) @binding(3) var<storage, read> order: array<u32>;
 @group(0) @binding(6) var<storage, read_write> y: array<f32>;
 @group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
 
-// each thread's sums, [output][sixteenth of k][row]
+// each thread's sums, [output row][lane][row of x]
 var<workgroup> red: array<f32, {red_len}>;
-{w8}
+
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {{
     let n = p[0].x;
@@ -262,29 +281,33 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     let rw = p[0].z;
     let identity = p[0].w == 1u;
     let blk = p[1].y + wg.z;
-    let o = t / 16u;
-    let c = t % 16u;
-{ids}    let row = (wg.x + wg.y * 65535u) * 16u + o;
+    let slot = t / {lanes}u;
+    let lane = t % {lanes}u;
+{ids}    let row = (wg.x + wg.y * 65535u) * {per}u + slot;
     let live = on0 && row < n;
     let rb = jobs[2u * select(j0, 0u, !on0)] * p[1].x + min(row, n - 1u) * rw;
     let kw = k / 16u;
-    let per = (kw + 15u) / 16u;
-    let ks = c * per;
-    let ke = min(kw, ks + per);
     if (live) {{
-        for (var kt = ks; kt < ke; kt++) {{
-            var lo = w8(rb, kt, 0u, kw);
-            var hi = w8(rb, kt, 1u, kw);
-            let at = kt * 16u;
+        for (var wi = lane; wi < kw; wi += {lanes}u) {{
+            // Q2_0: a word 16 weights' codes (weight i its bits 2 i: -1, 0, 1 or 2 times its block's scale), a block
+            // 64 weights, the blocks' scales f16 after the codes, two a word
+            let w = vec4<u32>(words[rb + wi]);
+            let d2 = unpack2x16float(words[rb + kw + wi / 8u]);
+            let d = select(d2.x, d2.y, ((wi >> 2u) & 1u) == 1u);
+            let c0 = vec4<f32>((w >> vec4<u32>(0u, 2u, 4u, 6u)) & vec4<u32>(3u)) - 1.0;
+            let c1 = vec4<f32>((w >> vec4<u32>(8u, 10u, 12u, 14u)) & vec4<u32>(3u)) - 1.0;
+            let c2 = vec4<f32>((w >> vec4<u32>(16u, 18u, 20u, 22u)) & vec4<u32>(3u)) - 1.0;
+            let c3 = vec4<f32>((w >> vec4<u32>(24u, 26u, 28u, 30u)) & vec4<u32>(3u)) - 1.0;
+            let at = wi * 4u;
 {sums}        }}
     }}
 {store}    workgroupBarrier();
-    if (live && c == 0u) {{
+    if (live && lane == 0u) {{
 {out}    }}
 }}
 "#,
         red_len = 256 * rows,
-        w8 = kind.wgsl(),
+        per = 256 / lanes,
     )
 }
 
@@ -416,16 +439,18 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 "#;
 
 /// A kernel's pipeline name and source, made once (a pipeline is named for good).
-fn kernel(kind: Kind, coop: bool, rows: usize) -> (&'static str, &'static str) {
-    type Made = ((Kind, bool, usize), (&'static str, &'static str));
+fn kernel(kind: Kind, coop: bool, rows: usize, k: usize) -> (&'static str, &'static str) {
+    type Made = ((Kind, bool, usize, usize), (&'static str, &'static str));
     static MADE: Mutex<Vec<Made>> = Mutex::new(Vec::new());
     let mut made = MADE.lock().unwrap_or_else(|p| p.into_inner());
-    let key = (kind, coop, rows);
+    // (the tensor cores' kernel is one for every width; the few-row one is written for its lanes a row)
+    let lanes = if coop { 0 } else { few_lanes(k) };
+    let key = (kind, coop, rows, lanes);
     if let Some((_, k)) = made.iter().find(|(k, _)| *k == key) {
         return *k;
     }
-    let name: &'static str = Box::leak(format!("quant-moe-{}-{}-{rows}", kind.tag(), if coop { "coop" } else { "few" }).into_boxed_str());
-    let source: &'static str = Box::leak(if coop { coop_source(kind, rows) } else { few_source(kind, rows) }.into_boxed_str());
+    let name: &'static str = Box::leak(if coop { format!("quant-moe-{}-coop-{rows}", kind.tag()) } else { format!("quant-moe-{}-few-{rows}-{lanes}", kind.tag()) }.into_boxed_str());
+    let source: &'static str = Box::leak(if coop { coop_source(kind, rows) } else { few_source(kind, rows, lanes) }.into_boxed_str());
     made.push((key, (name, source)));
     (name, source)
 }
@@ -613,12 +638,13 @@ impl QuantMoe {
             Order::Blocks(o, blocks, rows) => (buf(o), blocks, rows, 0),
         };
         let coop = rows > FEW_MAX;
-        let (name, source) = kernel(g.kind, coop, rows);
+        let (name, source) = kernel(g.kind, coop, rows, g.k);
         // as many blocks a pass as the grid's third axis takes
         for first in (0..blocks).step_by(65535) {
             let these = 65535.min(blocks - first) as u32;
             let words = [g.n as u32, g.k as u32, g.rw as u32, identity, g.mwords as u32, first as u32];
-            let grid = if coop { (ntiles.div_ceil(8), 1, these) } else { (ntiles.min(65535), ntiles.div_ceil(65535), these) };
+            let groups = (g.n as u32).div_ceil((256 / few_lanes(g.k)) as u32);
+            let grid = if coop { (ntiles.div_ceil(8), 1, these) } else { (groups.min(65535), groups.div_ceil(65535), these) };
             rec.dispatch_wide(name, source, [&g.words, &xb, &jb, &ob, &d, &d, &yb, &drw], &words, grid);
         }
         rec.weigh(2.0 * count as f64 * (g.n * g.k) as f64);

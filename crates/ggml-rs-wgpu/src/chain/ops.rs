@@ -9,7 +9,11 @@ impl ChainRecorder for Recorder<'_> {
         let q8 = *Q8.get_or_init(|| std::env::var_os("OAIY_NO_Q8").is_none());
         // (a prompt's rows: the tensor cores where the device has them (f16 into f32), else the int8 tiled kernel,
         // llama.cpp's MMQ's arithmetic, where the type has one)
-        let done = ((2..=crate::shaders::MULTI_MAX).contains(&m) && q8 && self.matmul_rows_q8(w, x, y, m))
+        // (IQ4_XS against a step's row or a check's few: a kernel of its own; OAIY_NO_IQ4_FEW: the generic one)
+        static IQ4: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let iq4 = *IQ4.get_or_init(|| std::env::var_os("OAIY_NO_IQ4_FEW").is_none());
+        let done = (iq4 && self.matmul_rows_iq4_xs(w, x, y, m))
+            || ((2..=crate::shaders::MULTI_MAX).contains(&m) && q8 && self.matmul_rows_q8(w, x, y, m))
             || (m > crate::shaders::MULTI_MAX && self.matmul_rows_coop(w, x, y, m))
             || (m > crate::shaders::MULTI_MAX && q8 && self.matmul_rows_tq8(w, x, y, m));
         if !done {

@@ -262,6 +262,41 @@ fn main() {
     }
 }
 
+/// IQ4_XS's kernel for a step's row and a check's few gives the generic f32 kernel's sums (the same weights and the
+/// same f32 products, added in another order): every count of rows it takes, weight rows off a workgroup's eight, a
+/// width of one lane's turn and of three, every six-bit scale and every nibble among the blocks.
+#[test]
+fn iq4_xs_against_a_few_rows_is_the_generic_kernels() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    for (n, k) in [(37usize, 512usize), (64, 2560)] {
+        let mut next = rng(n as u32 + k as u32);
+        let mut raw = vec![0u8; n * (k / 256) * 136];
+        for v in raw.iter_mut() {
+            *v = ((next() + 1.0) * 127.9) as u8;
+        }
+        for blk in raw.chunks_exact_mut(136) {
+            let d = half::f16::from_f32(0.001 + (blk[9] as f32) * 1e-5).to_bits().to_le_bytes();
+            (blk[0], blk[1]) = (d[0], d[1]);
+        }
+        let w = ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(raw, vec![n, k], GgmlType::IQ4_XS));
+        for m in 1..=crate::shaders::IQ4_FEW_MAX {
+            let (x, y, yf) = (b.vec(m * k), b.vec(m * n), b.vec(m * n));
+            DeviceChain::upload(&b, &x, &(0..m * k).map(|_| next()).collect::<Vec<_>>());
+            let mut rec = Recorder::new(&b);
+            rec.matmul_rows_f32(&w, &x, &y, m);
+            rec.read(&y);
+            let want = Box::new(rec).finish().pop().unwrap();
+            let mut rec = Recorder::new(&b);
+            assert!(rec.matmul_rows_iq4_xs(&w, &x, &yf, m), "IQ4_XS [{n}, {k}] of {m} rows");
+            rec.read(&yf);
+            let got = Box::new(rec).finish().pop().unwrap();
+            let scale = want.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+            let worst = got.iter().zip(&want).map(|(a, e)| (a - e).abs()).fold(0.0f32, f32::max);
+            assert!(scale > 0.0 && worst <= scale * 2e-5, "IQ4_XS [{n}, {k}] of {m} rows: {worst} off of a largest {scale}");
+        }
+    }
+}
+
 /// The tensor-core matmuls (where the device has them) give their f32 tiled kernels' sums within f16's rounding:
 /// Q3_K, Q4_K, Q5_K, Q6_K and Q8_0, a tile's worth of tokens and a tile and a bit (the edge), rows off the tile.
 #[test]

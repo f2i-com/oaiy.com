@@ -16,6 +16,26 @@ impl Recorder<'_> {
         }
     }
 
+    /// `y[r] = W x[r]` as [`ChainRecorder::matmul_rows`] for one to eight rows against IQ4_XS weights
+    /// ([`crate::shaders::iq4_xs_few`]). False for another type, more rows, or a width that is not whole blocks.
+    pub(crate) fn matmul_rows_iq4_xs(&mut self, w: &QuantizedTensor, x: &DeviceVec, y: &DeviceVec, m: usize) -> bool {
+        let q = w.device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).expect("a weight this adapter holds");
+        let (n, k) = (w.shape()[0], w.shape()[1]);
+        if q.dtype != ggml_quants::GgmlType::IQ4_XS || m == 0 || m > crate::shaders::IQ4_FEW_MAX || k % 256 != 0 || q.row_bytes != k / 256 * 136 {
+            return false;
+        }
+        assert!(x.len >= m * k && y.len >= m * n, "chain: an IQ4_XS matmul [{n}, {k}] of {m} rows");
+        const NAMES: [&str; crate::shaders::IQ4_FEW_MAX] =
+            ["chain-iq4xs-few-1", "chain-iq4xs-few-2", "chain-iq4xs-few-3", "chain-iq4xs-few-4", "chain-iq4xs-few-5", "chain-iq4xs-few-6", "chain-iq4xs-few-7", "chain-iq4xs-few-8"];
+        let pipeline = self.gpu().named_pipeline(NAMES[m - 1], || crate::shaders::iq4_xs_few(m));
+        for (chunk, row0, rows) in &q.chunks {
+            let words = [k as u32, n as u32, m as u32, *row0, *rows, q.row_bytes as u32, 0, 0];
+            let groups = rows.div_ceil(8);
+            self.dispatch_kept(&pipeline, chunk, buffer(x), buffer(y), &words, (groups.min(65535), groups.div_ceil(65535), 1));
+        }
+        true
+    }
+
     /// `y[r] = W x[r]` as [`ChainRecorder::matmul_rows`] for a prompt's rows on the tensor cores
     /// ([`crate::shaders::coop_tiled`]: f16 weights and tokens into f32 sums). False where the device has no cooperative
     /// matrices or the type no such kernel.
