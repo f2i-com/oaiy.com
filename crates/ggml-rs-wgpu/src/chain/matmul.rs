@@ -246,7 +246,9 @@ impl Recorder<'_> {
         }
         assert!(x.len >= m * k && y.len >= m * n, "chain: an int8 matmul [{n}, {k}] of {m} rows");
         let (xq, xs_at) = self.x_q8(x, m, k);
-        let mr = if m == 1 { 1 } else { crate::shaders::MULTI_ROWS };
+        // (one row by the several rows' kernel where the recording's rows are alike: the one-row int8 kernel sums a
+        // row in another order)
+        let mr = if m == 1 && !self.alike { 1 } else { crate::shaders::MULTI_ROWS };
         let name = match (q.dtype, mr == 1) {
             (ggml_quants::GgmlType::Q3_K, true) => "chain-q8-Q3_K-decode",
             (ggml_quants::GgmlType::Q3_K, false) => "chain-q8-Q3_K-multi",

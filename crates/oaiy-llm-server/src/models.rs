@@ -1400,7 +1400,7 @@ mod dense_webgpu_timing {
         // the same tokens as checks: row r of a check at token `at` against the step on token `at + r`
         let mut kk = model.new_kv_cache(prompt.len() + steps + 64);
         let _ = model.forward(&prompt, &e, &mut kk, None).unwrap();
-        let (mut at, mut rows_seen, mut same, mut worst, mut sum) = (0usize, 0usize, 0usize, 1.0f64, 0f64);
+        let (mut at, mut rows_seen, mut same, mut worst, mut sum, mut exact) = (0usize, 0usize, 0usize, 1.0f64, 0f64, 0usize);
         for rows in [4usize, 3, 2].into_iter().cycle() {
             if at + rows > steps {
                 break;
@@ -1412,14 +1412,18 @@ mod dense_webgpu_timing {
                 worst = worst.min(c);
                 sum += c;
                 same += (argmax(row.data()) == argmax(want)) as usize;
+                exact += row.data().iter().zip(want).all(|(a, b)| a.to_bits() == b.to_bits()) as usize;
                 rows_seen += 1;
             }
             at += rows;
         }
         // (a rounding that changes a row's tenth expert in some layer moves its logits more than the rounding does:
         // the steps against the host path are as far apart at worst)
-        eprintln!("{rows_seen} rows in checks of 4, 3 and 2 against their steps: logits cosine {:.6} on average, {worst:.6} at worst; the same greedy token {same} of {rows_seen}", sum / rows_seen.max(1) as f64);
+        eprintln!("{rows_seen} rows in checks of 4, 3 and 2 against their steps: {exact} bit for bit; logits cosine {:.6} on average, {worst:.6} at worst; the same greedy token {same} of {rows_seen}", sum / rows_seen.max(1) as f64);
         assert!(rows_seen == 0 || worst > 0.99, "a check's rows against its steps': {worst}");
+        // (a step's row takes a check's kernels: `ChainRecorder::rows_alike`; OAIY_NO_Q8 takes the int8 ones from
+        // both alike)
+        assert_eq!(exact, rows_seen, "a check's rows are its steps' bit for bit");
     }
 
     /// Qwen3.8-Flash-Next chained on the GPUs (its layers over every discrete one) answers as its own path does: the

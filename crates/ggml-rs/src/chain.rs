@@ -225,6 +225,15 @@ pub trait ChainRecorder {
     fn keep_groups(&mut self, keep: bool) {
         let _ = keep;
     }
+    /// A step's row by the kernels a check's few rows take (int8 activations, where a weight's type has kernels for
+    /// them), so that a check's rows are a step's bit for bit and a reply is the same drafted or not. For a model
+    /// whose step is not the slower for it: Flash-Next's IQ4_XS matrices are the faster from int8 (as llama.cpp's and
+    /// Strata's steps take them); the K-quants' several-rows kernel with one row is slower than their one-row f32
+    /// one for matrices as large as the 27B's (62 tokens a second where 67.5), whose chain leaves this off. Off at
+    /// first.
+    fn rows_alike(&mut self, on: bool) {
+        let _ = on;
+    }
     /// Hold what is recorded until [`Self::finish`] submits it all (none of it submitted as it is recorded): a
     /// recording whose inputs are uploaded after it, as the next device's of a chain over several is while the last
     /// device runs.

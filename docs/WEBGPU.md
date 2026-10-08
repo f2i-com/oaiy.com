@@ -298,6 +298,20 @@ the byte, at 93 to 95 tokens a second where 108 to 119. (The K-quants' check ker
 are int8 the same way, so this holds for every GGUF model that drafts; an EXL3
 checkpoint's checks are a step's bit for bit.)
 
+That was so until a Flash-Next step took its checks' kernels (`ChainRecorder::
+rows_alike`, which its chain sets): a step's row of an IQ4_XS matrix from int8
+activations as a check's rows are (llama.cpp's and Strata's steps take them so), and of
+a K-quant's by the several-rows kernel. A check's rows are now its steps' bit for bit
+from a GGUF too (22 of 22 rows from the IQ2_XS file and from the Q2_0 one, which the
+model's test holds them to), so a reply is the same drafted or not; and the step is the
+faster for it, its IQ4_XS matrices 1.4 ms where 2.5 (a step 10.3 ms where 10.8 at
+Strata's context). The steps moved by that rounding instead: against the host's path
+their logits' cosine is 0.9984 at worst where 0.9989. The 27B's chain does not ask for
+it: its matrices are K-quants', and their several-rows kernel with one row is slower
+than their one-row f32 one (62 tokens a second where 67.5), and the one-row int8 kernel
+sums in another order than a check's; so a drafted 27B reply can still leave the plain
+one at a near-tie.
+
 Against the request Strata's benchmark makes (a synthetic Python module up to 4,096
 prompt tokens, greedy, 256 tokens), the same two cards: the prompt at 3,600 tokens a
 second (Strata 4,270), the reply at 78 to 81 tokens a second plain and 108 to 120

@@ -875,7 +875,7 @@ fn measure_q8_matmuls() {
     for m in [1usize, 2, 3, 4] {
         let (x, y, y8) = (b.vec(m * k), b.vec(m * n), b.vec(m * n));
         DeviceChain::upload(&b, &x, &(0..m * k).map(|_| next()).collect::<Vec<_>>());
-        let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), low_rank: [None, None, None], q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0 };
+        let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), low_rank: [None, None, None], q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0, alike: false };
         assert!(rq.matmul_rows_q8(w, &x, &y8, m));
         rq.read(&y8);
         let got = Box::new(rq).finish().pop().unwrap();
@@ -891,7 +891,7 @@ fn measure_q8_matmuls() {
         let reps = 28;
         let time = |q8: bool| {
             let run = || {
-                let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), low_rank: [None, None, None], q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0 };
+                let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), low_rank: [None, None, None], q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0, alike: false };
                 for i in 0..reps {
                     let w = &ws[i % ws.len()];
                     if q8 {
@@ -1037,7 +1037,7 @@ fn measure_decode_rows_a_lane() {
             let pipeline = b.gpu.named_pipeline(Box::leak(format!("test-rb-{dtype:?}-{r}-{ks}").into_boxed_str()), || src);
             let reps = 32;
             let run = || {
-                let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), low_rank: [None, None, None], q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0 };
+                let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), low_rank: [None, None, None], q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0, alike: false };
                 for i in 0..reps {
                     let q = ws[i % ws.len()].device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).unwrap();
                     for (chunk, row0, rows) in &q.chunks {
@@ -1097,7 +1097,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) n
         let pipeline = b.gpu.named_pipeline(name, || body);
         let groups = 170 * 16;
         let run = || {
-            let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), low_rank: [None, None, None], q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0 };
+            let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), low_rank: [None, None, None], q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0, alike: false };
             for _ in 0..8 {
                 rq.dispatch_kept(&pipeline, buffer(&src), buffer(&src), buffer(&out), &[(len / 4) as u32], (groups, 1, 1));
             }

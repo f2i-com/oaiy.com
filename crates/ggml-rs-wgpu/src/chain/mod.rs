@@ -122,7 +122,7 @@ impl<'a> Recorder<'a> {
     /// A recording on `backend`, its bind groups kept (the crate's own measurements record kernels directly).
     #[cfg(test)]
     pub(crate) fn new(backend: &'a WgpuBackend) -> Self {
-        Recorder { backend, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), low_rank: [None, None, None], q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0 }
+        Recorder { backend, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), low_rank: [None, None, None], q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0, alike: false }
     }
 }
 
@@ -211,6 +211,8 @@ pub(crate) struct Recorder<'a> {
     timed: Vec<(Vec<Arc<wgpu::ComputePipeline>>, wgpu::Buffer)>,
     /// The work (FLOPs) the heavy ops have said of the piece so far ([`Recorder::weigh`]).
     weight: f64,
+    /// Whether a step's row takes the kernels a check's few rows take ([`ChainRecorder::rows_alike`]).
+    alike: bool,
 }
 
 impl Recorder<'_> {

@@ -13,9 +13,11 @@ impl ChainRecorder for Recorder<'_> {
         // the K-quants' are; OAIY_NO_IQ4_FEW: the generic one)
         static IQ4: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let iq4 = *IQ4.get_or_init(|| std::env::var_os("OAIY_NO_IQ4_FEW").is_none());
-        let done = (iq4 && q8 && m >= 2 && self.matmul_rows_iq4_xs_q8(w, x, y, m))
+        // (a step's row too where the recording's rows are alike: [`ChainRecorder::rows_alike`])
+        let one = self.alike;
+        let done = (iq4 && q8 && (m >= 2 || one) && self.matmul_rows_iq4_xs_q8(w, x, y, m))
             || (iq4 && self.matmul_rows_iq4_xs(w, x, y, m))
-            || ((2..=crate::shaders::MULTI_MAX).contains(&m) && q8 && self.matmul_rows_q8(w, x, y, m))
+            || (((2..=crate::shaders::MULTI_MAX).contains(&m) || (one && m == 1)) && q8 && self.matmul_rows_q8(w, x, y, m))
             || (m > crate::shaders::MULTI_MAX && self.matmul_rows_coop(w, x, y, m))
             || (m > crate::shaders::MULTI_MAX && q8 && self.matmul_rows_tq8(w, x, y, m));
         if !done {
@@ -95,6 +97,10 @@ impl ChainRecorder for Recorder<'_> {
 
     fn keep_groups(&mut self, keep: bool) {
         self.keep = keep;
+    }
+
+    fn rows_alike(&mut self, on: bool) {
+        self.alike = on;
     }
 
     fn hold(&mut self) {

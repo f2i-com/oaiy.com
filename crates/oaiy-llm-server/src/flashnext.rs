@@ -2469,6 +2469,8 @@ impl FlashNext {
             // (as after a handoff: this device's work held till the streams are up)
             let mut r = chains[d].begin();
             r.keep_groups(keep);
+            // (a step's row by a check's kernels: a check's rows its steps' bit for bit, and its IQ4_XS matrices the faster)
+            r.rows_alike(keep);
             r.hold();
             open = Some(r);
         }
@@ -2482,6 +2484,8 @@ impl FlashNext {
                 let mut rec = open.take().unwrap_or_else(|| {
                     let mut r = chains[d].begin();
                     r.keep_groups(keep);
+                    // (a step's row by a check's kernels: a check's rows its steps' bit for bit, and its IQ4_XS matrices the faster)
+                    r.rows_alike(keep);
                     r
                 });
                 rec.read(&devs[d].x);
@@ -2502,6 +2506,8 @@ impl FlashNext {
                                 d = dev;
                 let mut r = chains[d].begin();
                 r.keep_groups(keep);
+                // (a step's row by a check's kernels: a check's rows its steps' bit for bit, and its IQ4_XS matrices the faster)
+                r.rows_alike(keep);
                 r.hold();
                 open = Some(r);
             } else if dev != d || ple_here && ple_vs.is_none() {
@@ -2524,6 +2530,8 @@ impl FlashNext {
                 let mut rec = open.take().unwrap_or_else(|| {
                     let mut r = chains[d].begin();
                     r.keep_groups(keep);
+                    // (a step's row by a check's kernels: a check's rows its steps' bit for bit, and its IQ4_XS matrices the faster)
+                    r.rows_alike(keep);
                     r
                 });
                 if let Some(routed) = pending.take() {
@@ -2550,6 +2558,8 @@ impl FlashNext {
             let rec: &mut dyn ChainRecorder = &mut **open.get_or_insert_with(|| {
                 let mut r = chains[d].begin();
                 r.keep_groups(keep);
+                // (a step's row by a check's kernels: a check's rows its steps' bit for bit, and its IQ4_XS matrices the faster)
+                r.rows_alike(keep);
                 // a prompt's chunk's work on its first device held till its handoff too, then let go at once: its
                 // pieces submitted one by one as they were recorded ran the GPU's kernels some three times as long
                 // (a chunk of 512 some 340 ms of them where held 100; a step's own few go as they are)
@@ -2810,6 +2820,8 @@ impl FlashNext {
         let mut rec = open.take().unwrap_or_else(|| {
             let mut r = chains[d].begin();
             r.keep_groups(keep);
+            // (a step's row by a check's kernels: a check's rows its steps' bit for bit, and its IQ4_XS matrices the faster)
+            r.rows_alike(keep);
             r
         });
         if let Some(routed) = pending.take() {
