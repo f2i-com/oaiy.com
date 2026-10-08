@@ -113,7 +113,7 @@ impl Recorder<'_> {
         }
         let ntiles = (n / 16) as u32;
         let grid = |z: usize| (ntiles.min(65535), ntiles.div_ceil(65535), z as u32 * splits);
-        let mm = crate::exl3::chain_shader("mm");
+        let (mm_name, mm) = crate::exl3::one_row_kernel(g.tile_words());
         // a prompt's rows on the tensor cores, in blocks of 128, split along k where its workgroups are too few to fill
         // the GPU twice over (a block of 128 rows of a projection 2,048 wide is 16 of them)
         let coop = rows > crate::exl3::FEW_MAX && crate::exl3::coop_on(self.gpu());
@@ -135,7 +135,7 @@ impl Recorder<'_> {
                 self.dispatch_wide(crate::exl3::coop_name(BLOCK), &src, [words, buffer(&xh), buffer(&jobs), buffer(&order), &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, coop_splits as u32, 0, first as u32], (ntiles.div_ceil(8), 1, these));
             }
         } else if rows == 1 {
-            self.dispatch_wide("exl3-mm", mm, [words, buffer(&xh), buffer(&jobs), &d, &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, splits, 0], grid(1));
+            self.dispatch_wide(mm_name, mm, [words, buffer(&xh), buffer(&jobs), &d, &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, splits, 0], grid(1));
         } else if rows <= crate::exl3::FEW_MAX {
             // a few rows (a check of drafts): each tile decoded once for all of them, each row summed as one row is
             let order = if few {
@@ -161,7 +161,7 @@ impl Recorder<'_> {
                 self.dispatch_wide(crate::exl3::many_name(BLOCK), &kernel, [words, buffer(&xh), buffer(&jobs), buffer(&order), &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, splits, 0, first as u32], grid(per.min(blocks - first)));
             }
             if lone {
-                self.dispatch_wide("exl3-mm", mm, [words, buffer(&xh), buffer(&jobs), &d, &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, splits, 0, rows as u32 - 1], grid(1));
+                self.dispatch_wide(mm_name, mm, [words, buffer(&xh), buffer(&jobs), &d, &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, splits, 0, rows as u32 - 1], grid(1));
             }
         }
         let post = crate::exl3::chain_shader("post");
