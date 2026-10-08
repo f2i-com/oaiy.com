@@ -815,7 +815,7 @@ impl Models {
         }
         let on_host = model.host_layers();
         if on_host > 0 {
-            self.say(format!("{}: {on_host} of its {} layers' experts run on the host (the GPU has no room for them)", spec.name, model.config.layers));
+            self.say(format!("{}: {on_host} of its {} layers' experts run on the host (no room on the GPU for them, or no kernel there for their type)", spec.name, model.config.layers));
         }
         if mtp_from.is_some() && !model.drafts() {
             let why = if on_host > 0 { "a check of drafts costs the host's experts more than the steps it saves" } else { "its MTP layer is not all on a GPU" };

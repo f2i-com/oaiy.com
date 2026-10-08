@@ -165,7 +165,15 @@ impl WgpuBackend {
         let &[n, k] = w.shape() else { return Err(format!("a quantized projection of shape {:?}", w.shape())) };
         let dtype = w.dtype();
         if !Self::supports(dtype) {
-            return Err(format!("{dtype:?} has no WebGPU kernel"));
+            // A type with no kernel on the GPU (the grid types, IQ3_S and its like: `shaders::layout` says why):
+            // its values as f16, each rounded to the nearest (2 bytes a weight where it was some 3.4 bits: the
+            // GSQ-RCO IQ2_XS file's twenty such matrices are 0.65 GB so), where it would not load at all.
+            if !ggml_quants::is_supported(dtype) || w.is_device() {
+                return Err(format!("{dtype:?} has no WebGPU kernel"));
+            }
+            let mut values = vec![0f32; n * k];
+            ggml_quants::dequantize(dtype, w.bytes(), &mut values).map_err(|e| format!("a {dtype:?} projection [{n}, {k}]: {e}"))?;
+            return self.half_linear(values, n, k);
         }
         let w = self.to_device_quant(w);
         if !w.is_device() {
