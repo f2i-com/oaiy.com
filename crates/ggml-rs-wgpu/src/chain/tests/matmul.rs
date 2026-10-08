@@ -457,3 +457,34 @@ fn a_few_rows_of_an_f16_matrix_are_each_row_alone() {
         }
     }
 }
+
+/// A BF16 matrix from its bytes gives what the same values as f16 give, bit for bit (the same kernels, the weights
+/// widened by a shift where two f16 were unpacked): a step's row and a check's few (the lanes' kernel) and a prompt's
+/// rows (the tiled one, split along k and not). A few rows of a width that is not the lanes' kernel's take the tiled
+/// kernel as BF16 and the narrow one as f16, another order of sums: close there.
+#[test]
+fn bf16_matmuls_are_the_f16_ones() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    let mut next = rng(61);
+    for (n, k, rows) in [(24usize, 64usize, 1usize), (24, 64, 5), (40, 2560, 8), (300, 1024, 40), (70, 38, 3), (70, 38, 100)] {
+        // values BF16 holds (an f32's upper sixteen bits), which f16 holds too at this size
+        let values: Vec<f32> = (0..n * k).map(|_| f32::from_bits((0.05 * next()).to_bits() & 0xffff_0000)).collect();
+        let bytes: Vec<u8> = values.iter().flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes()).collect();
+        let (w16, wb) = (DeviceChain::vec_f16(&b, &values).expect("f16 values"), b.vec_of_bytes(&bytes));
+        let x: Vec<f32> = (0..rows * k).map(|_| next()).collect();
+        let (xd, y16, yb) = (b.vec(rows * k), b.vec(rows * n), b.vec(rows * n));
+        DeviceChain::upload(&b, &xd, &x);
+        let mut rec = b.begin();
+        rec.matmul_f16_rows_f32(&w16, n, k, &xd, &y16, rows);
+        rec.matmul_bf16_rows_f32(&wb, n, k, &xd, &yb, rows);
+        rec.read(&y16);
+        rec.read(&yb);
+        let got = rec.finish();
+        assert!(got[0].iter().any(|v| *v != 0.0), "values to compare");
+        if rows > 8 || k % 4 == 0 {
+            assert_eq!(got[1].iter().map(|v| v.to_bits()).collect::<Vec<_>>(), got[0].iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "[{n}, {k}] of {rows} rows");
+        } else {
+            close(&got[1], &got[0], "a few rows of a narrow BF16 matrix");
+        }
+    }
+}

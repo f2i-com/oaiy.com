@@ -52,6 +52,12 @@ The server and inference core remain std-only and forbid unsafe Rust.
 > went). What is left is nearly all copying: a layer is 460 MB read, converted and
 > written to the card (0.18 s), its run for a short prompt 12 ms; the projection and
 > the connector are 3.1 s and the tokenizer and embeddings 1.4 s.
+>
+> The conversion is gone since (2026-10-10): a BF16 value is an f32's upper sixteen
+> bits, so the layers' matrices go to the card as the file's bytes and the kernels
+> widen them by a shift (`matmul_bf16_rows_f32`). A prompt's context in 10.7 s, the
+> layers 6.0 s: 0.12 s a layer, which is its 460 MB written to the card at 3.8 GB a
+> second beside the next layer's read.
 
 Sulphur-2 and LTX 2.5 have been validated end to end locally in both text-to-video
 and image-to-video modes. The original LTX 2.3 checkpoint is still downloading;

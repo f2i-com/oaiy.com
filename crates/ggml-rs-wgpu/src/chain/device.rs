@@ -2,6 +2,27 @@
 use super::*;
 
 impl WgpuBackend {
+    /// A vector holding `bytes` as they are (a multiple of 4 of them): a checkpoint's weights in a form a kernel
+    /// reads as stored (BF16 for [`ChainRecorder::matmul_bf16_rows_f32`]).
+    pub fn vec_of_bytes(&self, bytes: &[u8]) -> DeviceVec {
+        assert!(bytes.len() % 4 == 0 && !bytes.is_empty(), "chain: a vector of {} bytes", bytes.len());
+        let v = DeviceChain::vec(self, bytes.len() / 4);
+        self.fill_bytes(&v, bytes);
+        v
+    }
+
+    /// `bytes` written into `v` from its start, as they are (a multiple of 4 of them, no more than `v` holds): a
+    /// vector's weights replaced by the next of the same shape, once what read them has run.
+    pub fn fill_bytes(&self, v: &DeviceVec, bytes: &[u8]) {
+        assert!(bytes.len() % 4 == 0 && bytes.len() <= v.len * 4, "chain: {} bytes into a vector of {}", bytes.len(), v.len);
+        self.gpu.write(buffer(v), 0, bytes);
+        // (a large write's staging let go now, as `upload_at`'s)
+        if bytes.len() >= 64 << 20 {
+            self.gpu.queue().submit([]);
+            self.gpu.wait(None);
+        }
+    }
+
     /// [`DeviceChain::conv_weights`] from the weights' own F16 bytes (`[cout, cin, k, k]` little-endian halves, as a
     /// safetensors file keeps them): each half moved to its place on every core, none converted (through f32 a UNet's
     /// convolutions were decoded on one core and rounded back: half of its load). None where a half is an infinity

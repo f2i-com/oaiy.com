@@ -273,6 +273,26 @@ impl ChainRecorder for Recorder<'_> {
         }
     }
 
+    fn matmul_bf16_rows_f32(&mut self, w: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize) {
+        assert!(k % 2 == 0 && w.len * 2 >= n * k && x.len >= rows * k && y.len >= rows * n && n <= 65535 && rows.div_ceil(64) <= 65535, "chain: a BF16 matmul [{n}, {k}] of {rows} rows");
+        if rows <= 8 && k % 4 == 0 {
+            // the f16 lanes' kernel, a word's two BF16 values widened by a shift where it unpacked two f16
+            let lanes = f16_lanes(k);
+            let (name, source) = fused_kernel("chain-matvec-bf16", rows, lanes, 0, || {
+                let f16 = matvec_f16_lanes(rows, lanes);
+                let unpack = "            let a = unpack2x16float(pr.x);\n            let b = unpack2x16float(pr.y);\n            let wv = vec4<f32>(a.x, a.y, b.x, b.y);";
+                assert_eq!(f16.matches(unpack).count(), 1, "the f16 lanes' kernel's read of its weights");
+                f16.replace(unpack, "            let wv = bitcast<vec4<f32>>(vec4<u32>(pr.x << 16u, pr.x & 0xffff0000u, pr.y << 16u, pr.y & 0xffff0000u));")
+            });
+            let pipeline = self.gpu().named_pipeline(name, || source.to_string());
+            let groups = (n as u32).div_ceil((256 / lanes) as u32);
+            self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(y), &[n as u32, k as u32], (groups.min(65535), groups.div_ceil(65535), 1));
+        } else {
+            self.matmul_half_tiled(w, n, k, x, y, rows, true);
+        }
+        self.weigh(2.0 * (rows * n) as f64 * k as f64);
+    }
+
     fn norm_mod_rows_clean(&mut self, x: &DeviceVec, out: &DeviceVec, rows: usize, n: usize, mods: &DeviceVec, scale_at: usize, shift_at: Option<usize>, norm: ggml_rs::RowNorm, eps: f32, clean: ggml_rs::CleanRows) {
         let set = if clean == ggml_rs::CleanRows::NONE { 0 } else { clean.offset };
         assert!(rows > 0 && x.len >= rows * n && out.len >= rows * n && mods.len >= set + scale_at + n && shift_at.is_none_or(|s| mods.len >= set + s + n) && set < 1 << 30, "chain: a modulated norm of {rows} rows of {n}");

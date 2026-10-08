@@ -449,6 +449,13 @@ pub trait ChainRecorder {
     fn matmul_f16_rows_f32(&mut self, w: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize) {
         self.matmul_f16_rows(w, n, k, x, y, rows)
     }
+    /// [`Self::matmul_f16_rows_f32`] of a matrix held as BF16, two values a word as a checkpoint's bytes lie (a
+    /// device's vector of the file's bytes): a BF16 value is an f32's upper sixteen bits, so the kernel widens it by
+    /// a shift, and the weights need no pass over them on the host.
+    fn matmul_bf16_rows_f32(&mut self, w: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize) {
+        let _ = (w, n, k, x, y, rows);
+        unimplemented!("BF16 matrices on this device")
+    }
     /// Each of `rows` rows of `x` (`[rows, n]`) layer-normed (no weights; `eps` added to the variance) into `out`, then
     /// times `1 + mods[scale_at..scale_at + n]` and, where `shift_at` is given, plus `mods[shift_at..shift_at + n]`: a
     /// diffusion transformer's modulated norm, every row by the same modulation.

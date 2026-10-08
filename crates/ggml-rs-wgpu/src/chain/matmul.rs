@@ -215,6 +215,12 @@ impl Recorder<'_> {
     /// `y[r] = W x[r]` for a prompt's rows of f16 weights (`[n, k]` two to a word) through the f32 tiled kernel (the
     /// weights read as f32), split along k where its tiles are few.
     pub(crate) fn matmul_f16_tiled(&mut self, w: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize) {
+        self.matmul_half_tiled(w, n, k, x, y, rows, false)
+    }
+
+    /// [`Self::matmul_f16_tiled`], the weights f16 or (`bf16`) BF16 as a checkpoint's bytes lie, widened by a shift.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn matmul_half_tiled(&mut self, w: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize, bf16: bool) {
         let tiles = n.div_ceil(64) * rows.div_ceil(64);
         let want = 1024usize.div_ceil(tiles).min(k / 256).max(1);
         let kc = k.div_ceil(want).div_ceil(16) * 16;
@@ -223,12 +229,17 @@ impl Recorder<'_> {
         let drw = self.gpu().dummy_rw().clone();
         let grid = (n.div_ceil(64) as u32, rows.div_ceil(64) as u32, splits as u32);
         let words = [n as u32, k as u32, rows as u32, kc as u32];
-        let tiled = MATMUL_F32_TILED.replace("var<storage, read> w: array<f32>;", "var<storage, read> w: array<u32>;\nfn wv(e: u32) -> f32 {\n    let pr = unpack2x16float(w[e / 2u]);\n    return select(pr.x, pr.y, (e & 1u) == 1u);\n}").replace("u = w[(o0 + rr) * k + gk];", "u = wv((o0 + rr) * k + gk);");
+        let (name, value) = if bf16 {
+            ("chain-matmul-bf16-tiled", "fn wv(e: u32) -> f32 {\n    let u = w[e / 2u];\n    return bitcast<f32>(select(u << 16u, u & 0xffff0000u, (e & 1u) == 1u));\n}")
+        } else {
+            ("chain-matmul-f16-tiled", "fn wv(e: u32) -> f32 {\n    let pr = unpack2x16float(w[e / 2u]);\n    return select(pr.x, pr.y, (e & 1u) == 1u);\n}")
+        };
+        let tiled = MATMUL_F32_TILED.replace("var<storage, read> w: array<f32>;", &format!("var<storage, read> w: array<u32>;\n{value}")).replace("u = w[(o0 + rr) * k + gk];", "u = wv((o0 + rr) * k + gk);");
         if splits == 1 {
-            self.dispatch_wide("chain-matmul-f16-tiled", &tiled, [buffer(w), buffer(x), &d, &d, &d, &d, buffer(y), &drw], &words, grid);
+            self.dispatch_wide(name, &tiled, [buffer(w), buffer(x), &d, &d, &d, &d, buffer(y), &drw], &words, grid);
         } else {
             let part = self.scratch(splits * rows * n);
-            self.dispatch_wide("chain-matmul-f16-tiled", &tiled, [buffer(w), buffer(x), &d, &d, &d, &d, buffer(&part), &drw], &words, grid);
+            self.dispatch_wide(name, &tiled, [buffer(w), buffer(x), &d, &d, &d, &d, buffer(&part), &drw], &words, grid);
             let len = (rows * n) as u32;
             self.dispatch_wide("chain-sum-splits", SUM_SPLITS, [buffer(&part), &d, &d, &d, &d, &d, buffer(y), &drw], &[len, splits as u32], (len.div_ceil(256).min(65535), len.div_ceil(256 * 65535), 1));
             // (its parts read: spare for the next split's, where each had its own to the recording's end, a sound

@@ -31,32 +31,43 @@ fn err(e: impl std::fmt::Display) -> candle_core::Error {
     candle_core::Error::Msg(e.to_string())
 }
 
-/// A bias-free matrix as f16 (`[n, k]`).
+/// A bias-free matrix (`[n, k]`) as f16, or (`bf16`) as BF16 the way its file holds it.
 struct Mat {
     v: DeviceVec,
     n: usize,
     k: usize,
+    bf16: bool,
 }
 
-/// [`Mat`] on the host: its f16 words, read and converted, not yet on the GPU.
+/// [`Mat`] on the host, read and not yet on the GPU: a BF16 checkpoint's bytes as they are (the kernels widen BF16
+/// by a shift: no pass over 460 MB a layer to make f16 of them), else f16 words converted from what the file holds.
 struct MatHost {
-    words: Vec<f32>,
+    weights: HostWeights,
     n: usize,
     k: usize,
 }
 
+enum HostWeights {
+    Bf16(Vec<u8>),
+    F16(Vec<f32>),
+}
+
 impl MatHost {
     fn up(self, gpu: &ggml_rs_wgpu::WgpuBackend) -> Mat {
-        let v = gpu.vec(self.words.len());
-        gpu.upload(&v, &self.words);
-        Mat { v, n: self.n, k: self.k }
+        match self.weights {
+            HostWeights::Bf16(bytes) => Mat { v: gpu.vec_of_bytes(&bytes), n: self.n, k: self.k, bf16: true },
+            HostWeights::F16(words) => {
+                let v = gpu.vec(words.len());
+                gpu.upload(&v, &words);
+                Mat { v, n: self.n, k: self.k, bf16: false }
+            }
+        }
     }
 }
 
 /// `names`' matrices one after another (their rows) as f16 words on the host, a BF16 checkpoint's converted from its
 /// bytes on every core.
 fn mat_host(store: &mut Store, names: &[String]) -> Result<MatHost> {
-    let mut words: Vec<f32> = Vec::new();
     let (mut n, mut k) = (0, 0);
     for name in names {
         let shape = store.index.info(name).map_err(err)?.shape.clone();
@@ -66,6 +77,25 @@ fn mat_host(store: &mut Store, names: &[String]) -> Result<MatHost> {
         }
         k = cols;
         n += rows;
+    }
+    // BF16 (an even width, so a row is whole words): the file's bytes, one matrix's after another
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut all = k % 2 == 0 && std::env::var_os("OAIY_LTX_TEXT_F16").is_none();
+    for name in names {
+        if !all {
+            break;
+        }
+        match store.bf16_bytes(name)? {
+            Some(part) if bytes.is_empty() => bytes = part,
+            Some(part) => bytes.extend(part),
+            None => all = false,
+        }
+    }
+    if all {
+        return Ok(MatHost { weights: HostWeights::Bf16(bytes), n, k });
+    }
+    let mut words: Vec<f32> = Vec::new();
+    for name in names {
         let part = match store.bf16_bytes(name)? {
             Some(bytes) => crate::wgpu_weights::f16_words(&bytes),
             None => crate::wgpu_weights::f16_words_f32(&store.tensor_f32(name, &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?),
@@ -77,7 +107,7 @@ fn mat_host(store: &mut Store, names: &[String]) -> Result<MatHost> {
             words.extend(part);
         }
     }
-    Ok(MatHost { words, n, k })
+    Ok(MatHost { weights: HostWeights::F16(words), n, k })
 }
 
 fn vector(store: &mut Store, gpu: &ggml_rs_wgpu::WgpuBackend, name: &str, add: f32) -> Result<DeviceVec> {
@@ -120,7 +150,11 @@ struct Layer {
 
 fn mul(r: &mut dyn ChainRecorder, m: &Mat, x: &DeviceVec, y: &DeviceVec, rows: usize) {
     // (an LLM's hidden states reach hundreds: their f32 into the matmul as they are)
-    r.matmul_f16_rows_f32(&m.v, m.n, m.k, x, y, rows);
+    if m.bf16 {
+        r.matmul_bf16_rows_f32(&m.v, m.n, m.k, x, y, rows);
+    } else {
+        r.matmul_f16_rows_f32(&m.v, m.n, m.k, x, y, rows);
+    }
 }
 
 /// [`Layer`] on the host: its weights read and converted to f16 words, not yet on the GPU (a thread of their own
