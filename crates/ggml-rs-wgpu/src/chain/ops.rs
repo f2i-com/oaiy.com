@@ -138,6 +138,42 @@ impl ChainRecorder for Recorder<'_> {
         self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(out), &[n as u32, eps.to_bits(), streams as u32, r], (r.min(65535), r.div_ceil(65535), 1));
     }
 
+    fn hc_down_gates(&mut self, w: &DeviceVec, k: usize, x: &DeviceVec, t: &DeviceVec, post: &DeviceVec, rows: usize, rank: usize, writes: usize, streams: usize) {
+        let n = rank + writes;
+        // a step's row or a check's few, where the matmul would take its lanes' kernel: that kernel with the gates
+        // (OAIY_HC_UNFUSED: the two kernels)
+        if !(1..=8).contains(&rows) || k % 4 != 0 || writes == 0 || !hc_fused() {
+            self.matmul_f16_rows(w, n, k, x, t, rows);
+            self.hc_gates(t, post, rows, rank, writes, streams);
+            return;
+        }
+        assert!(w.len * 2 >= n * k && x.len >= rows * k && t.len >= rows * n && post.len >= rows * writes && n <= 65535, "chain: a hyper-connection's down projection of {rows} rows");
+        let lanes = f16_lanes(k);
+        let (name, source) = fused_kernel("chain-hc-down-gates", rows, lanes, 0, || hc_down_gates_lanes(rows, lanes));
+        let d = self.gpu().dummy().clone();
+        let groups = (n as u32).div_ceil((256 / lanes) as u32);
+        self.dispatch_wide(name, source, [buffer(w), buffer(x), &d, &d, &d, &d, buffer(t), buffer(post)], &[n as u32, k as u32, rank as u32, streams as u32], (groups.min(65535), groups.div_ceil(65535), 1));
+        self.weigh(2.0 * (rows * n) as f64 * k as f64);
+    }
+
+    fn hc_up_mix(&mut self, w: &DeviceVec, k: usize, t: &DeviceVec, logits: &DeviceVec, normed: &DeviceVec, out: &DeviceVec, rows: usize, streams: usize, d: usize) {
+        let n = streams * d;
+        let lanes = f16_lanes(k);
+        // (as the down projection's; the streams must divide a workgroup's rows)
+        if !(1..=8).contains(&rows) || k % 4 != 0 || streams == 0 || (256 / lanes) % streams != 0 || !hc_fused() {
+            self.matmul_f16_rows(w, n, k, t, logits, rows);
+            self.hc_mix(logits, normed, out, rows, streams, d);
+            return;
+        }
+        assert!(w.len * 2 >= n * k && t.len >= rows * k && normed.len >= rows * n && out.len >= rows * d, "chain: a hyper-connection's up projection of {rows} rows");
+        let (name, source) = fused_kernel("chain-hc-up-mix", rows, lanes, streams, || hc_up_mix_lanes(rows, lanes, streams));
+        let dm = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        let groups = (d as u32).div_ceil((256 / lanes / streams) as u32);
+        self.dispatch_wide(name, source, [buffer(w), buffer(t), buffer(normed), &dm, &dm, &dm, buffer(out), &drw], &[n as u32, k as u32, d as u32, streams as u32], (groups.min(65535), groups.div_ceil(65535), 1));
+        self.weigh(2.0 * (rows * n) as f64 * k as f64);
+    }
+
     fn hc_gates(&mut self, t: &DeviceVec, post: &DeviceVec, rows: usize, rank: usize, writes: usize, streams: usize) {
         assert!(t.len >= rows * (rank + writes) && post.len >= rows * writes.max(1), "chain: a hyper-connection's gates");
         let len = (rows * (rank + writes)) as u32;
@@ -1047,4 +1083,25 @@ impl ChainRecorder for Recorder<'_> {
         crate::profile::add(&crate::profile::LINEAR_WAIT, start);
         out
     }
+}
+
+/// Whether a hyper-connection's projections take their fused kernels (OAIY_HC_UNFUSED: each its two kernels).
+fn hc_fused() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("OAIY_HC_UNFUSED").is_none())
+}
+
+/// A generated kernel's name and source, made once for its rows, lanes and streams (a pipeline is named for good).
+fn fused_kernel(what: &'static str, rows: usize, lanes: usize, streams: usize, make: impl FnOnce() -> String) -> (&'static str, &'static str) {
+    type Made = ((&'static str, usize, usize, usize), (&'static str, &'static str));
+    static MADE: Mutex<Vec<Made>> = Mutex::new(Vec::new());
+    let mut made = MADE.lock().unwrap_or_else(|p| p.into_inner());
+    let key = (what, rows, lanes, streams);
+    if let Some((_, k)) = made.iter().find(|(k, _)| *k == key) {
+        return *k;
+    }
+    let name: &'static str = Box::leak(format!("{what}-{rows}-{lanes}-{streams}").into_boxed_str());
+    let source: &'static str = Box::leak(make().into_boxed_str());
+    made.push((key, (name, source)));
+    (name, source)
 }

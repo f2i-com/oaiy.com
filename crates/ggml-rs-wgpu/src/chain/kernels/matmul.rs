@@ -142,6 +142,117 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     )
 }
 
+/// [`matvec_f16_lanes`] of a hyper-connection's down matrix with its gates ([`super::HC_GATES`]) where it stores a
+/// sum: output `o` of a row its `silu(sum / streams)` below the rank, else 0 with `post` its `2 sigmoid(sum /
+/// streams)`. The sums and the gates as the two kernels make them, bit for bit. `p[0]`: n (the rank and the writes),
+/// k, the rank, the streams.
+pub(in crate::chain) fn hc_down_gates_lanes(rows: usize, lanes: usize) -> String {
+    assert!((1..=8).contains(&rows) && lanes.is_power_of_two() && (8..=256).contains(&lanes), "1 to 8 rows, 8 to 256 lanes");
+    let each = |f: &dyn Fn(usize) -> String| (0..rows).map(f).collect::<Vec<_>>().join("\n");
+    let regs = each(&|r| format!("    var s{r} = vec4<f32>(0.0);"));
+    let sums = each(&|r| format!("            s{r} += wv * x4[{r}u * k4 + i];"));
+    let parts = each(&|r| format!("    part[{r}u * 256u + li] = s{r}.x + s{r}.y + s{r}.z + s{r}.w;"));
+    let outs = each(&|r| {
+        format!(
+            "        var t{r} = 0.0;\n        for (var j = 0u; j < {lanes}u; j++) {{ t{r} += part[{r}u * 256u + li + j]; }}\n        {{\n            let v = t{r} / streams;\n            if (o < rank) {{\n                gt[{r}u * n + o] = v / (1.0 + exp(-v));\n            }} else {{\n                post[{r}u * (n - rank) + o - rank] = 2.0 / (1.0 + exp(-v));\n                gt[{r}u * n + o] = 0.0;\n            }}\n        }}"
+        )
+    });
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read> w2: array<vec2<u32>>;
+@group(0) @binding(1) var<storage, read> x4: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read_write> gt: array<f32>;
+@group(0) @binding(7) var<storage, read_write> post: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+var<workgroup> part: array<f32, {len}>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {{
+    let n = p[0].x;
+    let k4 = p[0].y / 4u;
+    let rank = p[0].z;
+    let streams = f32(p[0].w);
+    let o = (wg.x + wg.y * 65535u) * {per}u + li / {lanes}u;
+    let lane = li % {lanes}u;
+{regs}
+    if (o < n) {{
+        for (var i = lane; i < k4; i += {lanes}u) {{
+            let pr = w2[o * k4 + i];
+            let a = unpack2x16float(pr.x);
+            let b = unpack2x16float(pr.y);
+            let wv = vec4<f32>(a.x, a.y, b.x, b.y);
+{sums}
+        }}
+    }}
+{parts}
+    workgroupBarrier();
+    if (lane == 0u && o < n) {{
+{outs}
+    }}
+}}
+"#,
+        len = rows * 256,
+        per = 256 / lanes,
+    )
+}
+
+/// [`matvec_f16_lanes`] of a hyper-connection's up matrix with its mix ([`super::HC_MIX`]): a workgroup's `256 /
+/// lanes` output rows are `streams` logits each of some outputs `j` (row `s d + j` stream `s`'s), and where the
+/// matmul would store them the first stream's thread adds the streams' `normed / (1 + exp(-logit)) / streams` in
+/// their order into `out[j]`. The logits' sums and the mix as the two kernels make them, bit for bit. `p[0]`: n (the
+/// streams' rows), k, d, the streams (which divide the workgroup's rows).
+pub(in crate::chain) fn hc_up_mix_lanes(rows: usize, lanes: usize, streams: usize) -> String {
+    assert!((1..=8).contains(&rows) && lanes.is_power_of_two() && (8..=256).contains(&lanes) && streams > 0 && (256 / lanes) % streams == 0, "1 to 8 rows, 8 to 256 lanes, streams that divide a workgroup's rows");
+    let each = |f: &dyn Fn(usize) -> String| (0..rows).map(f).collect::<Vec<_>>().join("\n");
+    let regs = each(&|r| format!("    var s{r} = vec4<f32>(0.0);"));
+    let sums = each(&|r| format!("            s{r} += wv * x4[{r}u * k4 + i];"));
+    let parts = each(&|r| format!("    part[{r}u * 256u + li] = s{r}.x + s{r}.y + s{r}.z + s{r}.w;"));
+    let outs = each(&|r| {
+        format!(
+            "        var acc{r} = 0.0;\n        for (var s = 0u; s < {streams}u; s++) {{\n            var t = 0.0;\n            for (var q = 0u; q < {lanes}u; q++) {{ t += part[{r}u * 256u + li + s * {lanes}u + q]; }}\n            acc{r} += normed[({r}u * {streams}u + s) * d + j] / (1.0 + exp(-t)) / f32({streams}u);\n        }}\n        y[{r}u * d + j] = acc{r};"
+        )
+    });
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read> w2: array<vec2<u32>>;
+@group(0) @binding(1) var<storage, read> x4: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> normed: array<f32>;
+@group(0) @binding(6) var<storage, read_write> y: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+var<workgroup> part: array<f32, {len}>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {{
+    let k4 = p[0].y / 4u;
+    let d = p[0].z;
+    // the workgroup's slots: `streams` in turn for each of its outputs
+    let slot = li / {lanes}u;
+    let lane = li % {lanes}u;
+    let j = (wg.x + wg.y * 65535u) * {each_j}u + slot / {streams}u;
+    let s_of = slot % {streams}u;
+    let o = s_of * d + j;
+{regs}
+    if (j < d) {{
+        for (var i = lane; i < k4; i += {lanes}u) {{
+            let pr = w2[o * k4 + i];
+            let a = unpack2x16float(pr.x);
+            let b = unpack2x16float(pr.y);
+            let wv = vec4<f32>(a.x, a.y, b.x, b.y);
+{sums}
+        }}
+    }}
+{parts}
+    workgroupBarrier();
+    if (lane == 0u && s_of == 0u && j < d) {{
+{outs}
+    }}
+}}
+"#,
+        len = rows * 256,
+        each_j = 256 / lanes / streams,
+    )
+}
+
 /// [`MATVEC_F16`] (`narrow`: [`MATVEC_F16_NARROW`]) for `rows` rows (2 to 8, a check of drafts): each weight read once
 /// for all of them, each row's products summed in the one-row kernel's order (so a row's outputs are its bit for bit).
 /// `p[0]`: n, k.

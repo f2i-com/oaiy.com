@@ -1364,6 +1364,26 @@ impl ChainMat {
 
 /// A hyper-connection's matrices on its layer's device (`down` `[rank + writes, streams * hidden]`, `up` `[streams *
 /// hidden, rank + writes]`), and its norm (`1 + w`).
+impl HcVecs {
+    /// The site's projections of `rows` rows of normed streams (`s` of `h`): the down matrix and the gates into `t`
+    /// and `post`, the up matrix and the mix into `out`. f16 matrices take each projection with what follows it (one
+    /// dispatch for a step's row or a check's few, where two: a decode step 10.5 ms where 11.2), `logits` then scratch
+    /// that may stay unwritten.
+    #[allow(clippy::too_many_arguments)]
+    fn project(&self, rec: &mut dyn ggml_rs::ChainRecorder, normed: &ggml_rs::DeviceVec, t: &ggml_rs::DeviceVec, post: &ggml_rs::DeviceVec, logits: &ggml_rs::DeviceVec, out: &ggml_rs::DeviceVec, rows: usize, s: usize, h: usize) {
+        let n = self.rank + self.writes;
+        if self.down.half && self.up.half {
+            rec.hc_down_gates(&self.down.v, s * h, normed, t, post, rows, self.rank, self.writes, s);
+            rec.hc_up_mix(&self.up.v, n, t, logits, normed, out, rows, s, h);
+        } else {
+            self.down.mul(rec, n, s * h, normed, t, rows);
+            rec.hc_gates(t, post, rows, self.rank, self.writes, s);
+            self.up.mul(rec, s * h, n, t, logits, rows);
+            rec.hc_mix(logits, normed, out, rows, s, h);
+        }
+    }
+}
+
 struct HcVecs {
     norm: ggml_rs::DeviceVec,
     down: ChainMat,
@@ -2408,10 +2428,7 @@ impl FlashNext {
                 rec.stream_apply(&dv.x, y, p, rows, s, h);
             }
             rec.rmsnorm_streams(&dv.x, &hcv.norm, &dv.normed, rows, s, eps);
-            hcv.down.mul(&mut *rec, hcv.rank + hcv.writes, s * h, &dv.normed, &dv.t, rows);
-            rec.hc_gates(&dv.t, post, rows, hcv.rank, hcv.writes, s);
-            hcv.up.mul(&mut *rec, s * h, hcv.rank + hcv.writes, &dv.t, &dv.logits, rows);
-            rec.hc_mix(&dv.logits, &dv.normed, out, rows, s, h);
+            hcv.project(&mut *rec, &dv.normed, &dv.t, post, &dv.logits, out, rows, s, h);
         };
         // The experts are routed on their GPU (each layer's router then its experts, a device's layers one submit; a
         // prompt's rows grouped by expert there too, where the tensor cores take them), else by the host between a
@@ -3083,10 +3100,7 @@ impl FlashNext {
         rec.stream_apply(&xs, &e2, &ones, rows, s, h);
         let hcv = &mc.attn_hc;
         rec.rmsnorm_streams(&xs, &hcv.norm, &normed, rows, s, eps);
-        hcv.down.mul(&mut *rec, hcv.rank + hcv.writes, s * h, &normed, &tt, rows);
-        rec.hc_gates(&tt, &post, rows, hcv.rank, hcv.writes, s);
-        hcv.up.mul(&mut *rec, s * h, hcv.rank + hcv.writes, &tt, &logits, rows);
-        rec.hc_mix(&logits, &normed, &mixed, rows, s, h);
+        hcv.project(&mut *rec, &normed, &tt, &post, &logits, &mixed, rows, s, h);
         rec.exl3_rows(kw, &mixed, &kk, rows);
         rec.exl3_rows(vw, &mixed, &vv, rows);
         rec.rmsnorm_rows(&kk, &mc.k_norm, &kn, rows * nkv, eps);
@@ -3172,10 +3186,7 @@ impl FlashNext {
                     rec.stream_apply(&dv.x, y, p, rows, s, h);
                 }
                 rec.rmsnorm_streams(&dv.x, &hcv.norm, &dv.normed, rows, s, eps);
-                hcv.down.mul(&mut *rec, hcv.rank + hcv.writes, s * h, &dv.normed, &dv.t, rows);
-                rec.hc_gates(&dv.t, post, rows, hcv.rank, hcv.writes, s);
-                hcv.up.mul(&mut *rec, s * h, hcv.rank + hcv.writes, &dv.t, &dv.logits, rows);
-                rec.hc_mix(&dv.logits, &dv.normed, out, rows, s, h);
+                hcv.project(&mut *rec, &dv.normed, &dv.t, post, &dv.logits, out, rows, s, h);
             };
             // attention over its own cache, a row at a time from its entries' start
             hc(&mut *rec, &mc.attn_hc, None, &dv.post, &dv.y_in, dv, rows);

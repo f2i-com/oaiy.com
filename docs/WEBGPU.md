@@ -310,6 +310,26 @@ its kernels': of a check of four rows' 18 ms the f16 matrices are 4.5 (the
 hyper-connections' are f16 in the file; the IQ3_S ones are held so), the experts 4.7
 with their routing, the IQ4_XS matrices 2.6, attention 2.3.
 
+Since then two of a layer's kernels are one where they can be: the shared expert's gate
+and up matrices are one matrix (a matmul and a split SwiGLU where two matmuls and a
+SwiGLU), and a hyper-connection's down projection makes its gates and its up projection
+its mix where each would store its sums (bit for bit the two kernels' values, which a
+test holds them to; `OAIY_HC_UNFUSED` for the two kernels). A step is 1,257 dispatches
+where 1,498 and takes 10.5 ms where 11.2 in the same build; a check of four rows, 1,636
+where 1,877, is no faster that can be measured (17.0 ms), and Strata's request drafting
+is 116 to 125 tokens a second. What a dispatch costs was measured for this
+(`measure_the_dispatch_floor`): recording and encoding one is some 4 us of the CPU,
+which a step does not wait for (the GPU is the slower of the two, and runs a piece
+while the next is recorded: pieces of 32 to 128 dispatches give the same times); on
+the GPU one that does next to nothing is 1 to 3 us. So a kernel's time is mostly its
+own: its weights' bytes at some 1.4 TB a second (the widest f16 matrices reach that),
+and the longest run of work any one of its threads has, which is what the small
+kernels' 4 to 15 us are (the router's ranking is 129 comparisons a thread, a few rows'
+sums are added up by one thread for all the rows in turn). Strata's source says the
+same of itself: a window of rows there is one captured CUDA graph of more kernels than
+this engine has dispatches, the dense quantised matrices against int8 activations for
+a step as for a check, and only token ids read back.
+
 On one card, which is what Strata's figure is for, this file is far from it: its
 experts are 35.5 GB, so 15 of the 48 layers' run on the host (`quant_host` reads the
 grid types as they lie too: 0.27 to 0.42 ms an expert a row on one AVX-512 core, where
@@ -335,9 +355,12 @@ every layer's on the host; a prose request and Strata's):
   check of 3.4 rows has 48 misses in 23 of its 48 layers, a step 15 in 12 (14 and 6 on
   prose); at 85% of the experts held, 12 layers a check. So for a reply it would be
   some 12 to 23 round trips a pass where a whole layer on the host is 15, each with a
-  tenth of the host's work: a gain, not Strata's speed, which rests on CUDA's cheap
-  waits. For a prompt it is the whole difference: 96 to 98% of a chunk's lookups
-  would stay on the card where a third of them are the host's now.
+  tenth of the host's work: a gain for one card, and no more than that. With no miss
+  at all one card would run as two do now, and two are at 21 ms a pass where Strata's
+  is 14.9: what separates this engine from Strata's figure is a pass's time on the
+  card, not where the experts are. For a prompt it is the whole difference: 96 to 98%
+  of a chunk's lookups would stay on the card where a third of them are the host's
+  now.
 
 A recording's reads are polled for 20 ms before the thread waits for them
 (`OAIY_CHAIN_SPIN_MS`), as a CUDA program's are by default: a step, a check and a host

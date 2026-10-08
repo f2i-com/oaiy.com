@@ -442,11 +442,12 @@ fn silu(v: f32) -> f32 {
 /// row and a check's few keep (their bind groups kept with them).
 struct SharedOnGpu {
     b: WgpuBackend,
-    mats: [Dense; 3],
+    /// Its gate and up matrices one below the other, and its down one.
+    mats: [Dense; 2],
     /// The bytes counted against the backend's budget, given back when the layer goes.
     bytes: u64,
-    /// By rows: gate's output, up's, and their SwiGLU.
-    kept: Mutex<Vec<(usize, Arc<[DeviceVec; 3]>)>>,
+    /// By rows: the gate's and the up's outputs side by side, and their SwiGLU.
+    kept: Mutex<Vec<(usize, Arc<[DeviceVec; 2]>)>>,
 }
 
 impl Drop for SharedOnGpu {
@@ -507,7 +508,7 @@ impl QuantMoeHost {
             return self;
         }
         let s = &self.data.shared;
-        let mats = [Dense::new(b, &s[0], f, h), Dense::new(b, &s[1], f, h), Dense::new(b, &s[2], h, f)];
+        let mats = [Dense::stacked(b, &s[0], &s[1], 2 * f, h), Dense::new(b, &s[2], h, f)];
         self.gpu = Some(SharedOnGpu { b: b.clone(), mats, bytes, kept: Mutex::new(Vec::new()) });
         self
     }
@@ -524,18 +525,17 @@ impl QuantMoeHost {
             match kept.iter().find(|(r, _)| *r == rows) {
                 Some((_, st)) => Arc::clone(st),
                 None => {
-                    let st = Arc::new([g.b.vec(rows * f), g.b.vec(rows * f), g.b.vec(rows * f)]);
+                    let st = Arc::new([g.b.vec(rows * 2 * f), g.b.vec(rows * f)]);
                     kept.push((rows, Arc::clone(&st)));
                     st
                 }
             }
         } else {
-            Arc::new([rec.scratch(rows * f), rec.scratch(rows * f), rec.scratch(rows * f)])
+            Arc::new([rec.scratch(rows * 2 * f), rec.scratch(rows * f)])
         };
         g.mats[0].rows(rec, x, &st[0], rows);
-        g.mats[1].rows(rec, x, &st[1], rows);
-        rec.silu_mul(&st[0], &st[1], &st[2], rows * f);
-        g.mats[2].rows(rec, &st[2], out, rows);
+        rec.silu_mul_split_rows(&st[0], &st[1], rows);
+        g.mats[1].rows(rec, &st[1], out, rows);
         true
     }
 

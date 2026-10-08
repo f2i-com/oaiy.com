@@ -338,6 +338,22 @@ pub trait ChainRecorder {
     /// sigmoid(logits[r, s]) / streams`, rows of `d`.
     #[allow(clippy::too_many_arguments)]
     fn hc_mix(&mut self, logits: &DeviceVec, normed: &DeviceVec, out: &DeviceVec, rows: usize, streams: usize, d: usize);
+    /// A hyper-connection's down projection and its gates: [`Self::matmul_f16_rows`] of `w` (`[rank + writes, k]`, as
+    /// [`DeviceChain::vec_f16`] made it) on `rows` rows of `x` into `t`, then [`Self::hc_gates`] of `t`. One dispatch
+    /// where the device has the two as one kernel (the same sums and the same gates, bit for bit).
+    #[allow(clippy::too_many_arguments)]
+    fn hc_down_gates(&mut self, w: &DeviceVec, k: usize, x: &DeviceVec, t: &DeviceVec, post: &DeviceVec, rows: usize, rank: usize, writes: usize, streams: usize) {
+        self.matmul_f16_rows(w, rank + writes, k, x, t, rows);
+        self.hc_gates(t, post, rows, rank, writes, streams);
+    }
+    /// A hyper-connection's up projection and its mix: [`Self::matmul_f16_rows`] of `w` (`[streams d, k]`) on `rows`
+    /// rows of `t` into `logits`, then [`Self::hc_mix`] of them with `normed` into `out`. One dispatch where the
+    /// device has the two as one kernel (bit for bit the same `out`; `logits` is then not written).
+    #[allow(clippy::too_many_arguments)]
+    fn hc_up_mix(&mut self, w: &DeviceVec, k: usize, t: &DeviceVec, logits: &DeviceVec, normed: &DeviceVec, out: &DeviceVec, rows: usize, streams: usize, d: usize) {
+        self.matmul_f16_rows(w, streams * d, k, t, logits, rows);
+        self.hc_mix(logits, normed, out, rows, streams, d);
+    }
     /// A hyper-connection site's write-back (`Backend::stream_apply`): `x[r, s] += post[r, s] * y[r]`, rows of `d`.
     #[allow(clippy::too_many_arguments)]
     fn stream_apply(&mut self, x: &DeviceVec, y: &DeviceVec, post: &DeviceVec, rows: usize, streams: usize, d: usize);

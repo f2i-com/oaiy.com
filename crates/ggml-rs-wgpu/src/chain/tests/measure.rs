@@ -1113,3 +1113,57 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) n
         eprintln!("reading 400 MB, {unroll} loads in flight a thread, {wg} threads a workgroup: {:.0} GB/s", (len * 4) as f64 / secs / 1e9);
     }
 }
+
+/// What a recording's dispatches cost at the least, 1 to 3,800 of them in one recording (a Flash-Next step is some
+/// 1,250 dispatches and a check of four rows 1,650): copies of 256 values back and forth between two vectors (each
+/// reads what the one before wrote, so none runs beside another), with the bind groups kept (a decode step's) and
+/// made anew; then, kept, the same copy again and again (one pipeline and one bind group), copies from one vector
+/// into 64 others in turn (none reads what another wrote), and a copy and an add in turn (two pipelines). Each
+/// again held ([`ChainRecorder::hold`]: all of it encoded before any is submitted), its finish alone timed: the
+/// submissions and the GPU's run of them, none of the recording (`--ignored --nocapture`). On an RTX 5090: some 4 us
+/// a dispatch recorded as it runs (the CPU's recording and encoding: the wait at the end is next to nothing), and
+/// held 1.9 to 2.8 us (a copy 2.8, an add 1).
+#[test]
+#[ignore = "a measurement"]
+fn measure_the_dispatch_floor() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    let (x, y) = (b.vec(4096), b.vec(4096));
+    let many: Vec<DeviceVec> = (0..64).map(|_| b.vec(4096)).collect();
+    DeviceChain::upload(&b, &x, &vec![1.0; 4096]);
+    for (what, keep) in [("back and forth", true), ("back and forth, groups made", false), ("the same copy", true), ("into 64 others", true), ("a copy and an add", true)] {
+        for n in [1usize, 500, 1900, 3800] {
+            let run = |held: bool| {
+                let mut rec = Recorder::new(&b);
+                ChainRecorder::keep_groups(&mut rec, keep);
+                if held {
+                    ChainRecorder::hold(&mut rec);
+                }
+                for i in 0..n {
+                    match what {
+                        "the same copy" => rec.copy(&x, 0, &y, 0, 256),
+                        "into 64 others" => rec.copy(&x, 0, &many[i % 64], 0, 256),
+                        "a copy and an add" if i % 2 == 1 => rec.add(&y, &x),
+                        "a copy and an add" => rec.copy(&x, 0, &y, 0, 256),
+                        _ if i % 2 == 0 => rec.copy(&x, 0, &y, 0, 256),
+                        _ => rec.copy(&y, 0, &x, 0, 256),
+                    }
+                }
+                rec.read_range(&x, 0, 1);
+                let t = std::time::Instant::now();
+                Box::new(rec).finish();
+                t.elapsed().as_secs_f64() * 1e3
+            };
+            run(false);
+            let _ = crate::profile::take_line();
+            let t = std::time::Instant::now();
+            for _ in 0..5 {
+                run(false);
+            }
+            let ms = t.elapsed().as_secs_f64() * 1e3 / 5.0;
+            let line = crate::profile::take_line();
+            run(true);
+            let finish = (0..5).map(|_| run(true)).sum::<f64>() / 5.0;
+            eprintln!("{n} dispatches, {what}: {ms:.2} ms a recording ({:.2} us a dispatch); held, its finish {finish:.2} ms ({:.2} us a dispatch); of 5: {line}", ms * 1e3 / n as f64, finish * 1e3 / n as f64);
+        }
+    }
+}

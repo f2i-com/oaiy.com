@@ -792,6 +792,12 @@ impl Dense {
         }
     }
 
+    /// `first`'s rows then `second`'s as one matrix (`[n, k]`).
+    pub(crate) fn stacked(b: &WgpuBackend, first: &[f32], second: &[f32], n: usize, k: usize) -> Self {
+        let both: Vec<f32> = first.iter().chain(second).copied().collect();
+        Dense::new(b, &both, n, k)
+    }
+
     pub(crate) fn rows(&self, rec: &mut crate::chain::Recorder<'_>, x: &DeviceVec, y: &DeviceVec, rows: usize) {
         if self.half {
             rec.matmul_f16_rows(&self.w, self.n, self.k, x, y, rows);
@@ -811,7 +817,9 @@ pub struct QuantMoe {
     ff: usize,
     gu: Group,
     down: Group,
-    shared: [Dense; 3],
+    /// The shared expert: its gate and up matrices one below the other (one matmul gives both, a dispatch fewer a
+    /// layer), and its down one.
+    shared: [Dense; 2],
     /// Whether a prompt's blocks go to the tensor cores (where the device has them; OAIY_QUANT_MOE_NO_COOP: no).
     coop: bool,
     /// The bytes counted against the backend's budget, given back when the layer goes.
@@ -879,7 +887,7 @@ impl QuantMoe {
         };
         let gu = group(&[&data.gate, &data.up], kg, f, h);
         let down = group(&[&data.down], kd, h, f);
-        let shared = [Dense::new(b, &data.shared[0], f, h), Dense::new(b, &data.shared[1], f, h), Dense::new(b, &data.shared[2], h, f)];
+        let shared = [Dense::stacked(b, &data.shared[0], &data.shared[1], 2 * f, h), Dense::new(b, &data.shared[2], h, f)];
         let coop = coop_on(&b.gpu) && std::env::var_os("OAIY_QUANT_MOE_NO_COOP").is_none();
         Ok(QuantMoe { b: b.clone(), routed: e, hidden: h, ff: f, gu, down, shared, coop, bytes: total })
     }
@@ -905,8 +913,9 @@ impl QuantMoe {
             xh_d: vec(pairs * f),
             part_d: vec(1),
             out_d: vec(pairs * h),
-            sg: vec(rows * f),
-            su: vec(rows * f),
+            // (the shared expert's gate and up outputs side by side)
+            sg: vec(rows * 2 * f),
+            su: vec(1),
             sd: vec(rows * h),
             order_gu: vec(if few { 2 * pairs * rows } else { 1 }),
             order_d: vec(if few { pairs * rows } else { 1 }),
@@ -1075,9 +1084,8 @@ impl QuantMoe {
         self.group_pass(rec, &self.down, &st.xh_d, &st.jobs_d, pairs, od, &st.out_d);
         // the shared expert on every row
         self.shared[0].rows(rec, x, &st.sg, rows);
-        self.shared[1].rows(rec, x, &st.su, rows);
-        rec.silu_mul(&st.sg, &st.su, &st.part_gu, rows * f);
-        self.shared[2].rows(rec, &st.part_gu, &st.sd, rows);
+        rec.silu_mul_split_rows(&st.sg, &st.part_gu, rows);
+        self.shared[1].rows(rec, &st.part_gu, &st.sd, rows);
         let groups = (((rows * h) as u32).div_ceil(256), 1, 1);
         match into {
             Some((xs, post, streams)) => {

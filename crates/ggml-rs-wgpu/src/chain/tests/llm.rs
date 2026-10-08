@@ -379,3 +379,54 @@ fn an_add_and_norm_in_one_are_the_two() {
         close(&got[3], &want, "in one");
     }
 }
+
+/// A hyper-connection's fused projections are the ops they replace, bit for bit: the down matrix with its gates
+/// against the f16 matmul then the gates, the up matrix with its mix against the matmul then the mix, for a step's
+/// row and a check's few, at a small shape and at Flash-Next's (four streams of 2,560, a rank of 320 and four
+/// writes).
+#[test]
+fn a_hyper_connections_fused_projections_are_their_two_ops() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    let mut next = rng(41);
+    for (streams, d, rank, writes) in [(4usize, 64usize, 12usize, 4usize), (2, 96, 20, 4), (4, 2560, 320, 4)] {
+        let (width, n) = (streams * d, rank + writes);
+        let f16s = |len: usize, next: &mut dyn FnMut() -> f32| -> Vec<f32> { (0..len).map(|_| half::f16::from_f32(0.05 * next()).to_f32()).collect() };
+        let (down, up) = (f16s(n * width, &mut next), f16s(width * n, &mut next));
+        let (dw, uw) = (DeviceChain::vec_f16(&b, &down).unwrap(), DeviceChain::vec_f16(&b, &up).unwrap());
+        for rows in [1usize, 3, 8] {
+            let normed: Vec<f32> = (0..rows * width).map(|_| next()).collect();
+            let nd = b.vec(rows * width);
+            DeviceChain::upload(&b, &nd, &normed);
+            let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+            // the two ops each
+            let (t0, post0, logits0, out0) = (b.vec(rows * n), b.vec(rows * writes), b.vec(rows * width), b.vec(rows * d));
+            let mut rec = b.begin();
+            rec.matmul_f16_rows(&dw, n, width, &nd, &t0, rows);
+            rec.hc_gates(&t0, &post0, rows, rank, writes, streams);
+            rec.matmul_f16_rows(&uw, width, n, &t0, &logits0, rows);
+            rec.hc_mix(&logits0, &nd, &out0, rows, streams, d);
+            rec.read(&t0);
+            rec.read(&post0);
+            rec.read(&out0);
+            let want = rec.finish();
+            // the fused ones
+            let (t1, post1, logits1, out1) = (b.vec(rows * n), b.vec(rows * writes), b.vec(rows * width), b.vec(rows * d));
+            let at = std::time::Instant::now();
+            let mut rec = b.begin();
+            rec.hc_down_gates(&dw, width, &nd, &t1, &post1, rows, rank, writes, streams);
+            rec.hc_up_mix(&uw, n, &t1, &logits1, &nd, &out1, rows, streams, d);
+            rec.read(&t1);
+            rec.read(&post1);
+            rec.read(&out1);
+            let got = rec.finish();
+            // (the small shapes come first: a kernel that is slow there stops the test before the model's shape)
+            let took = at.elapsed().as_secs_f64();
+            println!("{streams} streams of {d}, {rows} rows: the fused projections in {:.1} ms (with their pipelines the first time)", took * 1e3);
+            assert!(took < 5.0, "a hyper-connection's fused projections took {took:.1} s: stop and look");
+            for (what, (g, w), len) in [("the gated projection", (&got[0], &want[0]), rows * n), ("the write weights", (&got[1], &want[1]), rows * writes), ("the mix", (&got[2], &want[2]), rows * d)] {
+                assert!(w[..len].iter().any(|v| *v != 0.0), "{what}: values to compare");
+                assert_eq!(bits(&g[..len]), bits(&w[..len]), "{streams} streams of {d}, {rows} rows: {what}");
+            }
+        }
+    }
+}
