@@ -35,6 +35,21 @@ pub mod profile {
     pub static CHAIN_ENCODE: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
     pub static CHAIN_WAIT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
+    /// A dense call ([`crate::dense::forward_batch`]): what it makes before its submit (the inputs' uploads, its
+    /// buffers and bind groups, the passes), the submit, and the wait for its read-back; and the bytes of the weights
+    /// it read (its second number the weights).
+    pub static DENSE_MAKE: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    pub static DENSE_SUBMIT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    pub static DENSE_WAIT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    pub static DENSE_BYTES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+    /// The dense calls' counters since the last call, as one line, and reset.
+    pub fn take_dense_line() -> String {
+        let take = |c: &[AtomicU64; 2]| (c[0].swap(0, Ordering::Relaxed) as f64, c[1].swap(0, Ordering::Relaxed));
+        let (m, s, w, b) = (take(&DENSE_MAKE), take(&DENSE_SUBMIT), take(&DENSE_WAIT), take(&DENSE_BYTES));
+        format!("dense calls {}: made in {:.3} s, submitted in {:.3} s, waited for {:.3} s; {} weights of {:.2} GB", m.1, m.0 / 1e9, s.0 / 1e9, w.0 / 1e9, b.1, b.0 / 1e9)
+    }
+
     pub(crate) fn add(counter: &[AtomicU64; 2], start: Instant) {
         counter[0].fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         counter[1].fetch_add(1, Ordering::Relaxed);
@@ -481,6 +496,8 @@ struct Gpu {
     moe_steps: Mutex<Vec<([usize; 6], Arc<exl3::Step>)>>,
     /// How many units (SMs) the tensor cores' matmuls share out ([`Gpu::coop_units`]), counted when first asked.
     coop_units: std::sync::OnceLock<u32>,
+    /// What a decode step's dense calls share ([`dense::Arena`]), made at the first.
+    dense_arena: Mutex<Option<dense::Arena>>,
 }
 
 /// A weight matrix on the GPU: its rows in one or more buffers.
@@ -732,6 +749,37 @@ impl Gpu {
         let slice = staging.slice(..len);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         self.wait(None);
+        let out = slice.get_mapped_range().expect("webgpu: mapping a finished buffer").to_vec();
+        staging.unmap();
+        out
+    }
+
+    /// [`Self::map_read`] for a read-back that is a fraction of a millisecond away (a decode step's dense call): the
+    /// device polled for [`SPIN`] before it is waited for, so the thread is not parked and woken for each (the OS's
+    /// wake of a parked thread was most of such a call's wait). OAIY_DENSE_NO_SPIN: waited for from the start.
+    fn map_read_soon(&self, staging: &wgpu::Buffer, len: u64) -> Vec<u8> {
+        /// How long the device is polled before the thread waits.
+        const SPIN: std::time::Duration = std::time::Duration::from_millis(2);
+        static NO_SPIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *NO_SPIN.get_or_init(|| std::env::var_os("OAIY_DENSE_NO_SPIN").is_some()) {
+            return self.map_read(staging, len);
+        }
+        let slice = staging.slice(..len);
+        let mapped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&mapped);
+        slice.map_async(wgpu::MapMode::Read, move |_| flag.store(true, Ordering::Release));
+        self.settle();
+        let began = std::time::Instant::now();
+        while !mapped.load(Ordering::Acquire) {
+            if began.elapsed() > SPIN {
+                if let Err(why) = wait_for(&self.device, &self.watch, &self.lost, None) {
+                    panic!("webgpu: {why}");
+                }
+                break;
+            }
+            let _ = self.device.poll(wgpu::PollType::Poll);
+            std::hint::spin_loop();
+        }
         let out = slice.get_mapped_range().expect("webgpu: mapping a finished buffer").to_vec();
         staging.unmap();
         out
@@ -1268,7 +1316,7 @@ impl WgpuBackend {
         });
         Ok(Self {
             cpu: CpuBackend::new(),
-            gpu: Arc::new(Gpu { device, queue_raw: queue, lost, watch, feed: Arc::new(Feed::default()), in_flight_limit: Arc::new(std::sync::atomic::AtomicUsize::new(0)), layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), names: Mutex::new(HashMap::new()), pool: Mutex::new(Vec::new()), staging: Mutex::new(Vec::new()), chain_groups: Mutex::new(HashMap::new()), wide: std::sync::OnceLock::new(), chain_groups_wide: Mutex::new(HashMap::new()), dummy: std::sync::OnceLock::new(), dummy_rw: std::sync::OnceLock::new(), limits, staged: AtomicU64::new(0), few: std::sync::OnceLock::new(), moe_steps: Mutex::new(Vec::new()), coop_units: std::sync::OnceLock::new() }),
+            gpu: Arc::new(Gpu { device, queue_raw: queue, lost, watch, feed: Arc::new(Feed::default()), in_flight_limit: Arc::new(std::sync::atomic::AtomicUsize::new(0)), layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), names: Mutex::new(HashMap::new()), pool: Mutex::new(Vec::new()), staging: Mutex::new(Vec::new()), chain_groups: Mutex::new(HashMap::new()), wide: std::sync::OnceLock::new(), chain_groups_wide: Mutex::new(HashMap::new()), dummy: std::sync::OnceLock::new(), dummy_rw: std::sync::OnceLock::new(), limits, staged: AtomicU64::new(0), few: std::sync::OnceLock::new(), moe_steps: Mutex::new(Vec::new()), coop_units: std::sync::OnceLock::new(), dense_arena: Mutex::new(None) }),
             budget,
             used: Arc::new(AtomicU64::new(0)),
             summary,

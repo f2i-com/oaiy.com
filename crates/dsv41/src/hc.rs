@@ -17,8 +17,9 @@ pub const MIX: usize = (2 + HC) * HC; // 24
 
 /// One sublayer's mix parameters (`hc_{attn,ffn}_{fn,base,scale}`).
 pub struct HcParams {
-    /// `[24, 4 * dim]` f32.
-    fn_: Vec<f32>,
+    /// The `[24, 4 * dim]` projection kept the other way about, `[4 * dim, 24]`: element `k`'s 24 weights side by
+    /// side, as [`mixes`] takes them.
+    by_k: Vec<f32>,
     base: Vec<f32>,
     scale: Vec<f32>,
 }
@@ -34,17 +35,14 @@ impl HcParams {
 
     /// From raw parts: `fn_` `[24, 4 * dim]`, `base` `[24]`, `scale` `[3]`.
     pub fn new(fn_: Vec<f32>, base: Vec<f32>, scale: Vec<f32>) -> HcParams {
-        HcParams { fn_, base, scale }
-    }
-
-    /// The `[24, 4 * dim]` projection, for uploading to a device.
-    pub fn projection(&self) -> &[f32] {
-        &self.fn_
-    }
-
-    /// `[24]` biases and `[3]` scales, for uploading to a device.
-    pub fn base_and_scale(&self) -> (&[f32], &[f32]) {
-        (&self.base, &self.scale)
+        let n = fn_.len() / MIX;
+        let mut by_k = vec![0.0f32; fn_.len()];
+        for (j, row) in fn_.chunks_exact(n.max(1)).enumerate() {
+            for (k, &w) in row.iter().enumerate() {
+                by_k[k * MIX + j] = w;
+            }
+        }
+        HcParams { by_k, base, scale }
     }
 }
 
@@ -60,9 +58,15 @@ pub struct Mix {
 /// `hc_mixes` for one token: `x` is its `[HC * dim]` stream (bf16 values).
 pub fn mixes(x: &[f32], p: &HcParams, norm_eps: f32, iters: usize, hc_eps: f32) -> Mix {
     let n = x.len();
+    assert_eq!(p.by_k.len(), n * MIX, "hc: the stream is not the projection's width");
+    // The 24 projections' sums side by side, each in its own order (k ascending, as one projection at a time sums
+    // it): the same sums to the bit, and 24 lanes of one loop where each was a chain of 20,480 additions, each waiting
+    // for the one before (a decode step's 80 of these were 16 ms of it).
     let mut proj = [0.0f32; MIX];
-    for (j, mj) in proj.iter_mut().enumerate() {
-        *mj = p.fn_[j * n..(j + 1) * n].iter().zip(x).map(|(w, v)| w * v).sum::<f32>();
+    for (weights, &v) in p.by_k.chunks_exact(MIX).zip(x) {
+        for (acc, w) in proj.iter_mut().zip(weights) {
+            *acc += w * v;
+        }
     }
     let sumsq = x.iter().map(|v| v * v).sum::<f32>();
     mixes_from_projection(&proj, sumsq, n, p, norm_eps, iters, hc_eps)
@@ -143,11 +147,7 @@ mod tests {
     #[test]
     fn sinkhorn_comb_is_doubly_stochastic() {
         let n = HC * 8;
-        let p = HcParams {
-            fn_: (0..MIX * n).map(|i| ((i * 7919 % 101) as f32 - 50.0) / 50.0).collect(),
-            base: (0..MIX).map(|i| i as f32 * 0.1 - 1.0).collect(),
-            scale: vec![0.5, 0.7, 1.3],
-        };
+        let p = HcParams::new((0..MIX * n).map(|i| ((i * 7919 % 101) as f32 - 50.0) / 50.0).collect(), (0..MIX).map(|i| i as f32 * 0.1 - 1.0).collect(), vec![0.5, 0.7, 1.3]);
         let x: Vec<f32> = (0..n).map(|i| (i as f32 - 16.0) / 10.0).collect();
         let m = mixes(&x, &p, 1e-20, 20, 1e-6);
         for j in 0..HC {
@@ -158,17 +158,45 @@ mod tests {
         }
     }
 
+    /// The mixes are the ones the 24 projections summed one at a time give, to the bit: at the model's width, on
+    /// values of mixed signs and sizes (sums that would differ in another order).
+    #[test]
+    fn the_projections_side_by_side_are_the_ones_summed_one_at_a_time() {
+        let n = HC * 5120;
+        let mut s = 0x2545_f491u32;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            (s % 20_001) as f32 / 10_000.0 - 1.0
+        };
+        let fn_: Vec<f32> = (0..MIX * n).map(|_| next() * 0.05).collect();
+        let x: Vec<f32> = (0..n).map(|i| next() * if i % 97 == 0 { 300.0 } else { 3.0 }).collect();
+        let (base, scale): (Vec<f32>, Vec<f32>) = ((0..MIX).map(|i| i as f32 * 0.1 - 1.0).collect(), vec![0.5, 0.7, 1.3]);
+        let mut proj = [0.0f32; MIX];
+        for (j, mj) in proj.iter_mut().enumerate() {
+            for (w, v) in fn_[j * n..(j + 1) * n].iter().zip(&x) {
+                *mj += w * v;
+            }
+        }
+        let p = HcParams::new(fn_, base, scale);
+        let mut sumsq = 0.0f32;
+        for v in &x {
+            sumsq += v * v;
+        }
+        let want = mixes_from_projection(&proj, sumsq, n, &p, 1e-6, 20, 1e-6);
+        let got = mixes(&x, &p, 1e-6, 20, 1e-6);
+        let bits = |m: &Mix| -> Vec<u32> { m.pre.iter().chain(&m.post).chain(m.comb.iter().flatten()).map(|v| v.to_bits()).collect() };
+        assert_eq!(bits(&got), bits(&want));
+    }
+
     /// What one token's mixing costs on one thread, at DeepSeek-V4.1's width (HC streams of 5,120): a prompt's tokens
     /// take it twice a layer, 40 layers.
     #[test]
     #[ignore = "a timing; run with --nocapture"]
     fn measure_a_tokens_mixing() {
         let n = HC * 5120;
-        let p = HcParams {
-            fn_: (0..MIX * n).map(|i| ((i * 7919 % 101) as f32 - 50.0) / 5000.0).collect(),
-            base: (0..MIX).map(|i| i as f32 * 0.1 - 1.0).collect(),
-            scale: vec![0.5, 0.7, 1.3],
-        };
+        let p = HcParams::new((0..MIX * n).map(|i| ((i * 7919 % 101) as f32 - 50.0) / 5000.0).collect(), (0..MIX).map(|i| i as f32 * 0.1 - 1.0).collect(), vec![0.5, 0.7, 1.3]);
         let x: Vec<f32> = (0..n).map(|i| ((i % 33) as f32 - 16.0) / 10.0).collect();
         let tokens = 2000;
         let t = std::time::Instant::now();

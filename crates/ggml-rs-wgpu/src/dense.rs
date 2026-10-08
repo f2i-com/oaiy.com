@@ -245,6 +245,297 @@ fn shader(many: bool) -> String {
     format!("{COMMON}{}", if many { MANY_KERNEL } else { FEW_KERNEL })
 }
 
+/// A decode step's kernel ([`Arena`]'s): one row of x against a weight of `kind`, written for that kind. 8 rows a
+/// workgroup and 32 lanes a row as [`FEW_KERNEL`], but a lane takes 32 of k at a time (the reach of one scale, so a
+/// scale is read once for 32 weights where once a word), x four at a load, and an fp8 byte or an e2m1 nibble is a read
+/// of the workgroup's table of its values (made by its threads, one each) where it was decoded by its bits with a
+/// branch a weight; its one sum is a register. The row of x is at `p[2].y` of the call's inputs and the sums go to
+/// `p[2].z` of its results (both in f32).
+fn one_shader(kind: Kind) -> String {
+    const X: &str = "@group(0) @binding(1) var<storage, read> x: array<f32>;";
+    assert_eq!(COMMON.matches(X).count(), 1, "the kernels' input binding");
+    let common = COMMON.replace(X, "@group(0) @binding(1) var<storage, read> x4: array<vec4<f32>>;");
+    let lanes = ["x", "y", "z", "w"];
+    // (the workgroup's table's entries, a thread's part in making it, words a 32 of k, a block's sum, its scale)
+    let (entries, fill, words, sum, scale): (usize, &str, usize, String, &str) = match kind {
+        Kind::Fp8 => (
+            256,
+            "    lut[li] = fp8(li);\n",
+            8,
+            (0..8)
+                .map(|q| {
+                    let bytes: String = (0..4)
+                        .map(|j| {
+                            let byte = if j == 3 { "w >> 24u".to_string() } else { format!("(w >> {}u) & 255u", 8 * j) };
+                            format!(" d += lut[{byte}] * v.{};", lanes[j])
+                        })
+                        .collect();
+                    format!("            {{ let w = wbuf[at + {q}u]; let v = x4[xb + {q}u];{bytes} }}\n")
+                })
+                .collect(),
+            "bitcast<f32>(wbuf[soff + (local / 32u) * kb + b])",
+        ),
+        Kind::Bf16 => (
+            1,
+            "",
+            16,
+            (0..8)
+                .map(|q| {
+                    format!(
+                        "            {{ let w0 = wbuf[at + {}u]; let w1 = wbuf[at + {}u]; let v = x4[xb + {q}u]; d += bitcast<f32>(w0 << 16u) * v.x; d += bitcast<f32>(w0 & 0xffff0000u) * v.y; d += bitcast<f32>(w1 << 16u) * v.z; d += bitcast<f32>(w1 & 0xffff0000u) * v.w; }}\n",
+                        2 * q,
+                        2 * q + 1
+                    )
+                })
+                .collect(),
+            "1.0",
+        ),
+        Kind::Mxfp4 | Kind::Record => (
+            16,
+            "    if (li < 16u) { lut[li] = fp4(li); }\n",
+            4,
+            (0..4)
+                .map(|q| {
+                    let nibbles: String = (0..8)
+                        .map(|j| {
+                            let nibble = if j == 7 { "w >> 28u".to_string() } else { format!("(w >> {}u) & 15u", 4 * j) };
+                            format!(" d += lut[{nibble}] * {}.{};", if j < 4 { "va" } else { "vb" }, lanes[j % 4])
+                        })
+                        .collect();
+                    format!("            {{ let w = wbuf[at + {q}u]; let va = x4[xb + {}u]; let vb = x4[xb + {}u];{nibbles} }}\n", 2 * q, 2 * q + 1)
+                })
+                .collect(),
+            if kind == Kind::Mxfp4 { "bitcast<f32>(wbuf[soff + local * kb + b])" } else { "e8m0((wbuf[(soff + local * kb + b) / 4u] >> (8u * ((soff + local * kb + b) % 4u))) & 255u)" },
+        ),
+    };
+    format!(
+        r#"{common}
+var<workgroup> lut: array<f32, {entries}>;
+var<workgroup> part: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {{
+    let k = p[0].x; let first = p[0].z; let rows = p[0].w;
+    let lo = p[1].x; let count = p[1].y; let soff = p[1].z;
+    let woff = p[2].x;
+    let xo = p[2].y / 4u;
+    let yo = p[2].z;
+    let lane = li & 31u;
+    let slot = li >> 5u;
+{fill}    workgroupBarrier();
+    // The rows this buffer and the call share: [max(first, lo), min(first + rows, lo + count)).
+    let start = max(first, lo);
+    let row = start + wg.x * 8u + slot;
+    let live = row < min(first + rows, lo + count);
+    var acc = 0.0;
+    if (live) {{
+        let local = row - first;
+        let kb = k / 32u;
+        let wrow = woff + local * kb * {words}u;
+        for (var b = lane; b < kb; b += 32u) {{
+            let at = wrow + b * {words}u;
+            let xb = xo + b * 8u;
+            var d = 0.0;
+{sum}            acc += d * {scale};
+        }}
+    }}
+    part[li] = acc;
+    workgroupBarrier();
+    if (live && lane == 0u) {{
+        var total = 0.0;
+        for (var l = 0u; l < 32u; l++) {{ total += part[slot * 32u + l]; }}
+        y[yo + row - lo] = total;
+    }}
+}}
+"#
+    )
+}
+
+/// The pipeline name of [`one_shader`]'s kernel for `kind`.
+fn one_name(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Fp8 => "dense-one-fp8",
+        Kind::Bf16 => "dense-one-bf16",
+        Kind::Mxfp4 => "dense-one-mxfp4",
+        Kind::Record => "dense-one-record",
+    }
+}
+
+/// OAIY_DENSE_FEW: one row of x through [`FEW_KERNEL`] and a call's own buffers, as two to eight rows are (to compare
+/// [`Arena`]'s way with).
+fn few_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("OAIY_DENSE_FEW").is_some())
+}
+
+/// What a decode step's dense calls share on a device, made at the first and kept: the call's inputs one after another
+/// in one buffer (one write), its dispatches' parameters in another (one write, each dispatch's at an offset its bind
+/// group takes), its results in a third and their read-back, and each weight buffer's bind group with those. A call
+/// made its inputs' buffers, a result and a parameter buffer and a bind group for every weight, and a read-back, wrote
+/// each on its own, and let them all go after: in a reply that was 300 us a call beyond the GPU's 50 (a quarter of a
+/// decode step's time over its 380 calls), where the same call alone in a test took 80.
+pub(crate) struct Arena {
+    pipeline_layout: wgpu::PipelineLayout,
+    layout: wgpu::BindGroupLayout,
+    x: wgpu::Buffer,
+    y: wgpu::Buffer,
+    staging: wgpu::Buffer,
+    params: wgpu::Buffer,
+    /// bytes from one dispatch's parameters to the next's (the device's alignment of a uniform's offset)
+    step: u32,
+    groups: std::collections::HashMap<wgpu::Buffer, wgpu::BindGroup>,
+}
+
+/// The most a call's inputs, and its results, may hold to go through the [`Arena`] (bytes), and its most dispatches.
+const ARENA_BYTES: u64 = 4 << 20;
+const ARENA_DISPATCHES: usize = 256;
+/// A dispatch's parameters (the kernels' `p`).
+const PARAM_BYTES: u64 = 48;
+
+impl Arena {
+    fn new(gpu: &Gpu) -> Arena {
+        let entry = |binding, ty| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::COMPUTE, ty, count: None };
+        let storage = |read_only| wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only }, has_dynamic_offset: false, min_binding_size: None };
+        let layout = gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("oaiy-dense-arena"),
+            entries: &[
+                entry(0, storage(true)),
+                entry(1, storage(true)),
+                entry(2, storage(false)),
+                entry(3, wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: true, min_binding_size: std::num::NonZeroU64::new(PARAM_BYTES) }),
+            ],
+        });
+        let pipeline_layout =
+            gpu.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("oaiy-dense-arena"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
+        let step = gpu.limits.min_uniform_buffer_offset_alignment.max(PARAM_BYTES as u32).next_multiple_of(16);
+        let buffer = |label, size, usage| gpu.device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: false });
+        Arena {
+            pipeline_layout,
+            layout,
+            x: buffer("oaiy-dense-arena-x", ARENA_BYTES, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST),
+            y: buffer("oaiy-dense-arena-y", ARENA_BYTES, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC),
+            staging: buffer("oaiy-dense-arena-read", ARENA_BYTES, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST),
+            params: buffer("oaiy-dense-arena-params", ARENA_DISPATCHES as u64 * step as u64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST),
+            step,
+            groups: std::collections::HashMap::new(),
+        }
+    }
+
+    /// `weights`' bind group, made the first time it is asked for.
+    fn group(&mut self, gpu: &Gpu, weights: &wgpu::Buffer) -> &wgpu::BindGroup {
+        let Arena { layout, x, y, params, groups, .. } = self;
+        groups.entry(weights.clone()).or_insert_with(|| {
+            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("oaiy-dense-arena"),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: weights.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: x.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: y.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: params, offset: 0, size: std::num::NonZeroU64::new(PARAM_BYTES) }) },
+                ],
+            })
+        })
+    }
+}
+
+/// The arena's bind groups of `buffers` let go (with the weights they are of: a kept group keeps its buffers).
+fn forget(gpu: &Gpu, buffers: &mut dyn Iterator<Item = &wgpu::Buffer>) {
+    if let Some(arena) = gpu.dense_arena.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+        for buffer in buffers {
+            arena.groups.remove(buffer);
+        }
+    }
+}
+
+/// [`forward_batch`] for a call whose every item is one row of x, through the device's [`Arena`]: None when it is not
+/// such a call or is past the arena's sizes (the caller then makes its own buffers).
+fn forward_in_arena(gpu: &Arc<Gpu>, items: &[(&DenseGpu, &[f32], usize, Range<usize>)]) -> Option<Vec<Vec<f32>>> {
+    if few_only() || items.iter().any(|(_, _, t, rows)| *t != 1 || rows.is_empty()) {
+        return None;
+    }
+    let making = std::time::Instant::now();
+    // each input once, however many weights take it, and where it starts (f32)
+    let mut inputs: Vec<((*const f32, usize), u32)> = Vec::new();
+    let mut xs: Vec<u8> = Vec::new();
+    for (w, x, ..) in items {
+        assert_eq!(x.len(), w.k, "dense: the input is not [t, k]");
+        if !inputs.iter().any(|(key, _)| *key == (x.as_ptr(), x.len())) {
+            inputs.push(((x.as_ptr(), x.len()), (xs.len() / 4) as u32));
+            xs.extend(x.iter().flat_map(|v| v.to_le_bytes()));
+        }
+    }
+    // each item's dispatches (a buffer of its weight that holds some of its rows): the buffer, the kind, the grid
+    let mut dispatches: Vec<(&wgpu::Buffer, Kind, u32)> = Vec::new();
+    let mut params: Vec<[u32; 12]> = Vec::new();
+    let mut results = 0u32;
+    for (w, x, _, rows) in items {
+        assert!(rows.end <= w.n, "dense: rows past the weight");
+        let xo = inputs.iter().find(|(key, _)| *key == (x.as_ptr(), x.len())).expect("every input placed").1;
+        for (buffer, first, n_rows, soff, woff) in &w.chunks {
+            let (a, b) = ((*first as usize).max(rows.start), (*first as usize + *n_rows as usize).min(rows.end));
+            if a < b {
+                dispatches.push((buffer, w.kind, (b - a).div_ceil(8) as u32));
+                params.push([w.k as u32, 1, *first, *n_rows, rows.start as u32, rows.len() as u32, *soff, w.kind as u32, *woff, xo, results, 0]);
+            }
+        }
+        results += rows.len() as u32;
+    }
+    let bytes = results as u64 * 4;
+    if xs.len() as u64 > ARENA_BYTES || bytes > ARENA_BYTES || dispatches.len() > ARENA_DISPATCHES || dispatches.is_empty() {
+        return None;
+    }
+    let mut slot = gpu.dense_arena.lock().unwrap_or_else(|p| p.into_inner());
+    let arena = slot.get_or_insert_with(|| Arena::new(gpu));
+    let step = arena.step as usize;
+    let mut table = vec![0u8; dispatches.len() * step];
+    for (i, p) in params.iter().enumerate() {
+        for (j, v) in p.iter().enumerate() {
+            table[i * step + 4 * j..i * step + 4 * j + 4].copy_from_slice(&v.to_le_bytes());
+        }
+    }
+    gpu.queue().write_buffer(&arena.x, 0, &xs);
+    gpu.queue().write_buffer(&arena.params, 0, &table);
+    let pipelines: Vec<Arc<wgpu::ComputePipeline>> =
+        dispatches.iter().map(|&(_, kind, _)| gpu.named_pipeline_in(one_name(kind), &arena.pipeline_layout, || one_shader(kind))).collect();
+    let mut enc = gpu.device.create_command_encoder(&Default::default());
+    {
+        // (the groups first: a pass borrows them)
+        for (buffer, ..) in &dispatches {
+            arena.group(gpu, buffer);
+        }
+        let mut pass = enc.begin_compute_pass(&Default::default());
+        for (i, ((buffer, _, grid), pipeline)) in dispatches.iter().zip(&pipelines).enumerate() {
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &arena.groups[*buffer], &[(i * step) as u32]);
+            pass.dispatch_workgroups(*grid, 1, 1);
+        }
+    }
+    enc.copy_buffer_to_buffer(&arena.y, 0, &arena.staging, 0, bytes);
+    crate::profile::add(&crate::profile::DENSE_MAKE, making);
+    for (w, _, _, rows) in items {
+        crate::profile::DENSE_BYTES[0].fetch_add(w.nbytes_of(rows.len()), Ordering::Relaxed);
+        crate::profile::DENSE_BYTES[1].fetch_add(1, Ordering::Relaxed);
+    }
+    let submitting = std::time::Instant::now();
+    gpu.queue().submit([enc.finish()]);
+    crate::profile::add(&crate::profile::DENSE_SUBMIT, submitting);
+    let waiting = std::time::Instant::now();
+    let raw = gpu.map_read_soon(&arena.staging, bytes);
+    crate::profile::add(&crate::profile::DENSE_WAIT, waiting);
+    let mut at = 0usize;
+    Some(
+        items
+            .iter()
+            .map(|(_, _, _, rows)| {
+                let out = raw[at..at + rows.len() * 4].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                at += rows.len() * 4;
+                out
+            })
+            .collect(),
+    )
+}
+
 /// A dense weight on the GPU.
 pub struct DenseGpu {
     gpu: Arc<Gpu>,
@@ -268,6 +559,10 @@ impl std::fmt::Debug for DenseGpu {
 impl Drop for DenseGpu {
     fn drop(&mut self) {
         self.used.fetch_sub(self.nbytes, Ordering::Relaxed);
+        // (a record's matrix is its slots' buffer, which the slots let go)
+        if self.kind != Kind::Record {
+            forget(&self.gpu, &mut self.chunks.iter().map(|c| &c.0));
+        }
     }
 }
 
@@ -280,6 +575,16 @@ struct Pass {
 impl DenseGpu {
     pub fn n(&self) -> usize {
         self.n
+    }
+
+    /// The bytes `rows` of its rows hold (for the profile's count of what a call read).
+    fn nbytes_of(&self, rows: usize) -> u64 {
+        let per = match self.kind {
+            Kind::Fp8 => 2,
+            Kind::Bf16 => 4,
+            Kind::Mxfp4 | Kind::Record => 1,
+        };
+        (rows * self.k * per / 2) as u64
     }
 
     pub fn k(&self) -> usize {
@@ -360,6 +665,10 @@ pub fn forward_batch(items: &[(&DenseGpu, &[f32], usize, Range<usize>)]) -> Vec<
     let gpu = &first.0.gpu;
     assert!(items.iter().all(|(w, ..)| Arc::ptr_eq(&w.gpu, gpu)), "dense: a batch on more than one GPU");
     let _one = first.0.serial.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(out) = forward_in_arena(gpu, items) {
+        return out;
+    }
+    let making = std::time::Instant::now();
     // Each input once, however many weights take it (an expert's gate and up take the same).
     let mut inputs: Vec<((*const f32, usize), wgpu::Buffer)> = Vec::new();
     for (w, x, t, rows) in items {
@@ -387,8 +696,19 @@ pub fn forward_batch(items: &[(&DenseGpu, &[f32], usize, Range<usize>)]) -> Vec<
         enc.copy_buffer_to_buffer(&p.y, 0, &staging, at, p.size);
         at += p.size;
     }
+    crate::profile::add(&crate::profile::DENSE_MAKE, making);
+    for (w, _, t, rows) in items {
+        if *t > 0 && !rows.is_empty() {
+            crate::profile::DENSE_BYTES[0].fetch_add(w.nbytes_of(rows.len()), Ordering::Relaxed);
+            crate::profile::DENSE_BYTES[1].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let submitting = std::time::Instant::now();
     gpu.queue().submit([enc.finish()]);
+    crate::profile::add(&crate::profile::DENSE_SUBMIT, submitting);
+    let waiting = std::time::Instant::now();
     let raw = gpu.map_read(&staging, total);
+    crate::profile::add(&crate::profile::DENSE_WAIT, waiting);
     let mut at = 0usize;
     items
         .iter()
@@ -435,6 +755,7 @@ pub struct RecordSlots {
 impl Drop for RecordSlots {
     fn drop(&mut self) {
         self.used.fetch_sub(self.nbytes, Ordering::Relaxed);
+        forget(&self.gpu, &mut self.slots.iter());
     }
 }
 
@@ -804,6 +1125,153 @@ mod tests {
         let held = b.usage().0;
         drop(slots);
         assert_eq!(b.usage().0, held - 2 * record.len() as u64, "the slots' bytes come back to the budget");
+    }
+
+    /// What one dense call costs a decode step, and what of it is the trip itself: a weight the size of an attention
+    /// projection against one row, then the same trip with nothing to compute (a copy of 4 KB read back), with the
+    /// read-back's buffer kept, and waited for by polling.
+    #[test]
+    #[ignore = "a timing; run with --nocapture"]
+    fn measure_a_round_trip() {
+        let Some(b) = backend() else { return };
+        let gpu = &b.gpu;
+        let (n, k, calls) = (1024usize, 4096usize, 400u32);
+        let w = b.dense(fp8_data(n, k, 5)).unwrap().expect("within the budget");
+        let x = input(1, k, 6);
+        let us = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1e6 / calls as f64;
+        for _ in 0..20 {
+            w.forward(&x, 1, 0..n);
+        }
+        let t = std::time::Instant::now();
+        for _ in 0..calls {
+            std::hint::black_box(w.forward(&x, 1, 0..n));
+        }
+        eprintln!("a dense call of [{n}, {k}] against one row: {:.0} us", us(t));
+        let two = [(&*w, &x[..], 1usize, 0..n), (&*w, &x[..], 1usize, 0..n)];
+        let t = std::time::Instant::now();
+        for _ in 0..calls {
+            std::hint::black_box(forward_batch(&two));
+        }
+        eprintln!("two of them in one call: {:.0} us", us(t));
+        // what a kernel reads a second: eight of a weight in one call against one, the seven more over their bytes
+        for (name, data, bytes) in [
+            ("fp8", fp8_data(4096, 5120, 7), 4096.0 * 5120.0),
+            ("bf16", bf16_data(4096, 5120, 8), 4096.0 * 5120.0 * 2.0),
+            ("mxfp4", mxfp4_data(4096, 5120, 9), 4096.0 * 5120.0 / 2.0),
+        ] {
+            let big = b.dense(data).unwrap().expect("within the budget");
+            let xb = input(1, 5120, 10);
+            let one = [(&*big, &xb[..], 1usize, 0..4096usize)];
+            let eight: Vec<(&DenseGpu, &[f32], usize, Range<usize>)> = (0..8).map(|_| one[0].clone()).collect();
+            let time = |items: &[(&DenseGpu, &[f32], usize, Range<usize>)]| {
+                for _ in 0..10 {
+                    forward_batch(items);
+                }
+                let t = std::time::Instant::now();
+                for _ in 0..100 {
+                    std::hint::black_box(forward_batch(items));
+                }
+                t.elapsed().as_secs_f64() / 100.0
+            };
+            let (a, e) = (time(&one), time(&eight));
+            eprintln!("{name} [4096, 5120]: one {:.0} us, eight in a call {:.0} us: {:.0} GB/s", a * 1e6, e * 1e6, 7.0 * bytes / (e - a) / 1e9);
+            // as a decode step spaces its calls: the GPU idle between them (the host's work of a layer), by a busy
+            // wait (the thread kept) or a sleep (the thread parked)
+            for (how, pause_us, sleeps) in [("after 300 us of the host's work", 300u64, false), ("after 2 ms of it", 2000, false), ("after a 2 ms sleep", 2000, true)] {
+                let mut spent = 0.0;
+                for _ in 0..100 {
+                    let pause = std::time::Instant::now();
+                    if sleeps {
+                        std::thread::sleep(std::time::Duration::from_micros(pause_us));
+                    } else {
+                        while pause.elapsed() < std::time::Duration::from_micros(pause_us) {
+                            std::hint::spin_loop();
+                        }
+                    }
+                    let t = std::time::Instant::now();
+                    std::hint::black_box(forward_batch(&eight));
+                    spent += t.elapsed().as_secs_f64();
+                }
+                eprintln!("    eight in a call {how}: {:.0} us", spent / 100.0 * 1e6);
+            }
+        }
+        let t = std::time::Instant::now();
+        for _ in 0..calls {
+            std::hint::black_box(upload_f32(gpu, &x));
+        }
+        eprintln!("the input's buffer made and written: {:.0} us", us(t));
+        gpu.queue().submit([]);
+        gpu.wait(None);
+        let size = 4096u64;
+        let src = gpu.device.create_buffer(&wgpu::BufferDescriptor { label: None, size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let staging = || gpu.device.create_buffer(&wgpu::BufferDescriptor { label: None, size, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let t = std::time::Instant::now();
+        for _ in 0..calls {
+            let st = staging();
+            let mut enc = gpu.device.create_command_encoder(&Default::default());
+            enc.copy_buffer_to_buffer(&src, 0, &st, 0, size);
+            gpu.queue().submit([enc.finish()]);
+            std::hint::black_box(gpu.map_read(&st, size));
+        }
+        eprintln!("a trip with nothing to compute (4 KB copied and read back, its buffer made each time): {:.0} us", us(t));
+        let kept = staging();
+        let t = std::time::Instant::now();
+        for _ in 0..calls {
+            let mut enc = gpu.device.create_command_encoder(&Default::default());
+            enc.copy_buffer_to_buffer(&src, 0, &kept, 0, size);
+            gpu.queue().submit([enc.finish()]);
+            std::hint::black_box(gpu.map_read(&kept, size));
+        }
+        eprintln!("the same with the read-back's buffer kept: {:.0} us", us(t));
+        let t = std::time::Instant::now();
+        for _ in 0..calls {
+            let mut enc = gpu.device.create_command_encoder(&Default::default());
+            enc.copy_buffer_to_buffer(&src, 0, &kept, 0, size);
+            gpu.queue().submit([enc.finish()]);
+            let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = done.clone();
+            kept.slice(..size).map_async(wgpu::MapMode::Read, move |_| flag.store(true, std::sync::atomic::Ordering::Release));
+            while !done.load(std::sync::atomic::Ordering::Acquire) {
+                let _ = gpu.device.poll(wgpu::PollType::Poll);
+                std::hint::spin_loop();
+            }
+            std::hint::black_box(kept.slice(..size).get_mapped_range().expect("mapped").to_vec());
+            kept.unmap();
+        }
+        eprintln!("the same, waited for by polling: {:.0} us", us(t));
+        let t = std::time::Instant::now();
+        for _ in 0..calls {
+            gpu.queue().write_buffer(&src, 0, &[0u8; 4096]);
+            let mut enc = gpu.device.create_command_encoder(&Default::default());
+            enc.copy_buffer_to_buffer(&src, 0, &kept, 0, size);
+            gpu.queue().submit([enc.finish()]);
+            std::hint::black_box(gpu.map_read(&kept, size));
+        }
+        eprintln!("the kept trip with 4 KB written first: {:.0} us", us(t));
+        // with the device holding what DeepSeek's does (a thousand records' buffers, written once): the same calls
+        let record = 18_874_368u64;
+        let held: Vec<wgpu::Buffer> = (0..1000)
+            .map(|_| gpu.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: record, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }))
+            .collect();
+        gpu.queue().submit([]);
+        gpu.wait(None);
+        for _ in 0..20 {
+            w.forward(&x, 1, 0..n);
+        }
+        let t = std::time::Instant::now();
+        for _ in 0..calls {
+            std::hint::black_box(w.forward(&x, 1, 0..n));
+        }
+        eprintln!("a dense call of [{n}, {k}] with a thousand records' buffers on the device: {:.0} us", us(t));
+        let t = std::time::Instant::now();
+        for _ in 0..calls {
+            let mut enc = gpu.device.create_command_encoder(&Default::default());
+            enc.copy_buffer_to_buffer(&src, 0, &kept, 0, size);
+            gpu.queue().submit([enc.finish()]);
+            std::hint::black_box(gpu.map_read(&kept, size));
+        }
+        eprintln!("the kept trip then: {:.0} us", us(t));
+        drop(held);
     }
 
     /// What the link to the adapter carries: 32 expert-sized writes (600 MB) into buffers made once, then waited for.
