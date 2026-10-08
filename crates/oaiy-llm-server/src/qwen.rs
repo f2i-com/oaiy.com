@@ -353,6 +353,33 @@ impl Hybrid {
             _ => None,
         }
     }
+    /// [`Self::check`] for a request that samples greedily, where the model picks each row's token on its GPU
+    /// (Flash-Next chained): the tokens alone. None: nothing run, [`Self::check`] the caller's.
+    fn check_picks(&self, rows: &[u32], kv: &mut KvCache) -> Option<Vec<u32>> {
+        match self {
+            #[cfg(feature = "webgpu")]
+            Self::Flash(f) => f.check_picks(rows, kv),
+            _ => {
+                let _ = (rows, kv);
+                None
+            }
+        }
+    }
+    /// A decode step's next token for a request that samples greedily, as [`Self::check_picks`]. None: nothing run,
+    /// [`Self::forward`] the caller's.
+    fn step_pick(&self, token: u32, kv: &mut KvCache) -> Option<u32> {
+        match self {
+            #[cfg(feature = "webgpu")]
+            Self::Flash(f) => {
+                let embeds = f.embed_text(&[token]).ok()?;
+                f.step_pick(token, &embeds, kv)
+            }
+            _ => {
+                let _ = (token, kv);
+                None
+            }
+        }
+    }
     /// Undo the last check's `rows` past its first `keep`.
     fn rollback(&self, kv: &mut KvCache, rows: usize, keep: usize) {
         match self {
@@ -732,7 +759,10 @@ impl QwenEngine {
         let mut generated = Vec::new(); let mut think_used = 0usize;
         let mut stream = NativeStream::default();
         let mut rng = job.sampling.seed ^ 0x9E3779B97F4A7C15;
-        let mut logits = logits.unwrap();
+        let mut logits = Row::Logits(logits.unwrap());
+        // (a greedy request's rows: the token alone where the model picks it on its GPU, megabytes of logits a check
+        // not read back)
+        let greedy = job.sampling.temperature <= 0.0 && job.images.is_empty();
         let mut finish = Finish::Length;
         // Where decoding's time goes, for the log: sampling, the text (decode and stream), the model.
         let (mut t_sample, mut t_text, mut t_model) = (0f64, 0f64, 0f64);
@@ -741,7 +771,7 @@ impl QwenEngine {
         // its logits are the check's (sampling the model's distribution and taking a draft only where it is the token
         // sampled is that distribution's sampling still); where it picks another, the check's rows from there are undone.
         let drafter = (job.images.is_empty() && hybrid.drafts()).then_some(hybrid);
-        let mut pending: std::collections::VecDeque<(u32, Tensor)> = Default::default();
+        let mut pending: std::collections::VecDeque<(u32, Row)> = Default::default();
         let (mut check_rows, mut drafts_checked, mut drafts_taken) = (0usize, 0usize, 0usize);
         // (for the log: the checks made and their rows, the time making drafts, in checks, and undoing rows)
         let (mut checks, mut rows_checked, mut t_draft, mut t_check, mut t_undo) = (0usize, 0usize, 0f64, 0f64, 0f64);
@@ -751,7 +781,7 @@ impl QwenEngine {
                 return Ok(());
             }
             let clock = std::time::Instant::now();
-            let mut next = sample(logits.data(), &job.sampling, &mut rng);
+            let mut next = logits.sample(&job.sampling, &mut rng);
             t_sample += clock.elapsed().as_secs_f64();
             if thinking && job.think_budget.is_some_and(|n|think_used >= n) { if let Some(end) = think_end { next = end; } }
             let stop = next == eos || Some(next) == tok.eos();
@@ -798,7 +828,11 @@ impl QwenEngine {
                     let drafts = drafts?;
                     let rows: Vec<u32> = std::iter::once(next).chain(drafts.iter().copied()).collect();
                     let began = std::time::Instant::now();
-                    let checked = m.check(&rows, &mut self.kv);
+                    let picked = if greedy { m.check_picks(&rows, &mut self.kv) } else { None };
+                    let checked: Option<Vec<Row>> = match picked {
+                        Some(tokens) => Some(tokens.into_iter().map(Row::Pick).collect()),
+                        None => m.check(&rows, &mut self.kv).map(|l| l.into_iter().map(Row::Logits).collect()),
+                    };
                     t_check += began.elapsed().as_secs_f64();
                     Some((drafts, checked?))
                 });
@@ -812,8 +846,13 @@ impl QwenEngine {
                         pending = drafts.into_iter().zip(rows).collect();
                     }
                     None => {
-                        let embeds = hybrid.embed(&[next])?;
-                        logits = hybrid.forward(&[next], embeds, &mut self.kv, (!job.images.is_empty()).then_some(&[[next_position;3]]))?;
+                        logits = match if greedy { hybrid.step_pick(next, &mut self.kv) } else { None } {
+                            Some(token) => Row::Pick(token),
+                            None => {
+                                let embeds = hybrid.embed(&[next])?;
+                                Row::Logits(hybrid.forward(&[next], embeds, &mut self.kv, (!job.images.is_empty()).then_some(&[[next_position;3]]))?)
+                            }
+                        };
                     }
                 }
             }
@@ -844,6 +883,23 @@ impl QwenEngine {
 
 /// Tokens drafted a check, where a model drafts (its multi-token-prediction layer): Qwen3.8 27B's take 0.86, 0.73
 /// and 0.65 in turn (each where the ones before it were).
+/// What a row of the model gave the decode loop: its logits, or (a greedy request's, where the model picks on its
+/// GPU) its largest logit's token alone.
+enum Row {
+    Logits(Tensor),
+    Pick(u32),
+}
+
+impl Row {
+    /// The token sampled from the row.
+    fn sample(&self, s: &crate::job::Sampling, rng: &mut u64) -> u32 {
+        match self {
+            Row::Logits(l) => sample(l.data(), s, rng),
+            Row::Pick(token) => *token,
+        }
+    }
+}
+
 const DRAFTS: usize = 3;
 
 /// [`DRAFTS`], or OAIY_DRAFTS's (1 to 7: a check is 8 rows at most). More than three loses on Flash-Next, whose check

@@ -1424,6 +1424,28 @@ mod dense_webgpu_timing {
         // (a step's row takes a check's kernels: `ChainRecorder::rows_alike`; OAIY_NO_Q8 takes the int8 ones from
         // both alike)
         assert_eq!(exact, rows_seen, "a check's rows are its steps' bit for bit");
+        // a greedy request's tokens picked on the GPU: a step's and a check's rows' are their logits' first largest
+        let mut kp = model.new_kv_cache(prompt.len() + steps + 64);
+        let _ = model.forward(&prompt, &e, &mut kp, None).unwrap();
+        let (mut at, mut picked) = (0usize, 0usize);
+        for rows in [1usize, 4, 3, 2].into_iter().cycle() {
+            if at + rows > steps {
+                break;
+            }
+            let got = if rows == 1 {
+                let e1 = model.embed_text(&written[at..at + 1]).unwrap();
+                vec![model.step_pick(written[at], &e1, &mut kp).expect("a step chained")]
+            } else {
+                model.check_picks(&written[at..at + rows], &mut kp).expect("a check chained")
+            };
+            assert_eq!(got.len(), rows);
+            for (r, token) in got.iter().enumerate() {
+                assert_eq!(*token, argmax(&stepped[at + r]), "the token picked for position {} of a run of {rows}", at + r);
+                picked += 1;
+            }
+            at += rows;
+        }
+        eprintln!("{picked} tokens picked on the GPU, in steps and checks of 4, 3 and 2: each its logits' first largest");
     }
 
     /// Qwen3.8-Flash-Next chained on the GPUs (its layers over every discrete one) answers as its own path does: the
@@ -2314,6 +2336,35 @@ mod dense_webgpu_timing {
                 runs += 1;
             }
             eprintln!("a check of {rows} rows: {:.1} ms", wall / 6.0);
+        }
+        // the same with the rows' tokens picked on the GPU (a greedy request's), a picked run and one that reads its
+        // logits in turn on the same tokens: each a mean of 6 after one of each to warm
+        for rows in 1..=4usize.min(crate::flashnext::CHECK_ROWS) {
+            let (mut picked, mut read) = (0.0, 0.0);
+            for rep in 0..7 {
+                let toks: Vec<u32> = (0..rows as u32).map(|i| 4000 + i * 31 + rep * 7).collect();
+                let e1 = model.embed_text(&toks[..1]).unwrap();
+                let t = Instant::now();
+                if rows == 1 {
+                    let _ = model.step_pick(toks[0], &e1, &mut kv).expect("a step chained");
+                } else {
+                    let _ = model.check_picks(&toks, &mut kv).expect("a check chained");
+                }
+                let a = t.elapsed().as_secs_f64() * 1e3;
+                let t = Instant::now();
+                if rows == 1 {
+                    let _ = model.forward(&toks, &e1, &mut kv, None).unwrap();
+                } else {
+                    let _ = model.check(&toks, &mut kv).expect("a check chained");
+                }
+                let b = t.elapsed().as_secs_f64() * 1e3;
+                if rep > 0 {
+                    picked += a;
+                    read += b;
+                }
+                runs += 2;
+            }
+            eprintln!("{} of {rows} rows, their tokens picked on the GPU: {:.1} ms; their logits read: {:.1} ms", if rows == 1 { "a step" } else { "a check" }, picked / 6.0, read / 6.0);
         }
         // a round of three drafts after a step (every draft the layer makes, however unlikely): a mean of 6
         if model.drafts() {

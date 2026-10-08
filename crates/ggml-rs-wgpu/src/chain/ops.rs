@@ -927,15 +927,19 @@ impl ChainRecorder for Recorder<'_> {
     }
 
     fn argmax_softmax(&mut self, x: &DeviceVec, out: &DeviceVec) {
-        assert!(x.len > 0 && out.len >= 3, "chain: a draft's token of {} logits", x.len);
+        self.argmax_rows(x, 1, x.len, out)
+    }
+
+    fn argmax_rows(&mut self, x: &DeviceVec, rows: usize, n: usize, out: &DeviceVec) {
+        assert!(rows > 0 && n > 0 && x.len >= rows * n && out.len + 1 >= 4 * rows, "chain: {rows} rows' tokens of {n} logits each");
         let d = self.gpu().dummy().clone();
         let drw = self.gpu().dummy_rw().clone();
-        // a workgroup of the first pass its 4,096 logits' largest and share, then those
-        let groups = x.len.div_ceil(4096);
-        assert!(groups <= 65535, "chain: a draft's token of {} logits", x.len);
-        let parts = self.scratch(4 * groups);
-        self.dispatch_wide("chain-argmax-softmax-parts", ARGMAX_SOFTMAX_PARTS, [buffer(x), &d, &d, &d, &d, &d, buffer(&parts), &drw], &[x.len as u32], (groups as u32, 1, 1));
-        self.dispatch_wide("chain-argmax-softmax", ARGMAX_SOFTMAX, [buffer(&parts), &d, &d, &d, &d, &d, buffer(out), &drw], &[groups as u32], (1, 1, 1));
+        // a workgroup of the first pass a row's 4,096 logits' largest and share, then a row's of those
+        let groups = n.div_ceil(4096);
+        assert!(groups <= 65535 && rows <= 65535, "chain: {rows} rows' tokens of {n} logits each");
+        let parts = self.scratch(4 * groups * rows);
+        self.dispatch_wide("chain-argmax-softmax-parts", ARGMAX_SOFTMAX_PARTS, [buffer(x), &d, &d, &d, &d, &d, buffer(&parts), &drw], &[n as u32, groups as u32], (groups as u32, rows as u32, 1));
+        self.dispatch_wide("chain-argmax-softmax", ARGMAX_SOFTMAX, [buffer(&parts), &d, &d, &d, &d, &d, buffer(out), &drw], &[groups as u32], (rows as u32, 1, 1));
     }
 
     fn read_range(&mut self, v: &DeviceVec, offset: usize, len: usize) {

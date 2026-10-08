@@ -377,6 +377,16 @@ kernel makes the weights a thread an expert: 6.7 us a layer for the two, the sam
 experts and weights. A step is 10.8 ms where 11.4 and a check of four rows 15.0 where
 15.5.
 
+A request that samples greedily (temperature 0) has its tokens picked on the GPU
+(`argmax_rows`: each row's first largest logit, as the host's greedy sampling takes it;
+`FlashNext::check_picks` and `step_pick`). A check read every row's logits back, a
+megabyte a row, to pick a token from each: a check of two, three and four rows is 1.0
+to 1.3 ms the shorter for picking them there (the same tokens, which the model's test
+holds them to). Strata's request drafting: 256 tokens in 1.75 to 1.86 s, 138 to 146
+tokens a second (Strata 179), where 1.93 to 2.05 s; of it the checks 1.23 to 1.32 s
+(13.9 ms each of 3.4 rows), drafting 0.31 s, undoing 0.07 s. A request with a
+temperature reads the logits as before.
+
 On one card, which is what Strata's figure is for, this file is far from it: its
 experts are 35.5 GB, so 15 of the 48 layers' run on the host (`quant_host` reads the
 grid types as they lie too: 0.27 to 0.42 ms an expert a row on one AVX-512 core, where

@@ -294,6 +294,39 @@ fn a_drafts_token_is_the_first_largest_logit_and_its_share() {
     }
 }
 
+/// Several rows' tokens are each row's first largest logit and its share: rows of a vocabulary's 248,320 and of a
+/// few, a row's peak in its first and its last workgroup of 4,096, equals within a row.
+#[test]
+fn rows_tokens_are_each_rows_first_largest_logit() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    let mut r = rng(23);
+    for (n, rows) in [(248_320usize, 4usize), (248_320, 8), (300, 3), (5, 2), (4096, 5)] {
+        let mut x: Vec<f32> = (0..rows * n).map(|_| r() * 8.0).collect();
+        let mut firsts = Vec::new();
+        for row in 0..rows {
+            // (a peak somewhere else in every row, and its equal after it in every other)
+            let peak = (row * 7919 + 3) % n;
+            x[row * n + peak] = 30.0;
+            if row % 2 == 1 && peak + 1 < n {
+                x[row * n + n - 1] = 30.0;
+            }
+            firsts.push(peak);
+        }
+        let (xd, out) = (b.vec(rows * n), b.vec(4 * rows));
+        DeviceChain::upload(&b, &xd, &x);
+        let mut rec = b.begin();
+        rec.argmax_rows(&xd, rows, n, &out);
+        rec.read(&out);
+        let got = rec.finish().pop().unwrap();
+        for row in 0..rows {
+            let total: f64 = x[row * n..(row + 1) * n].iter().map(|&v| ((v - 30.0) as f64).exp()).sum();
+            assert_eq!(got[4 * row].to_bits() as usize, firsts[row], "{rows} rows of {n}: row {row}'s first largest");
+            assert_eq!(got[4 * row + 1], 30.0);
+            assert!(((got[4 * row + 2] as f64) - total).abs() <= 1e-5 * total, "{rows} rows of {n}: row {row}'s {} against {total}", got[4 * row + 2]);
+        }
+    }
+}
+
 /// An n-gram layer's gate and conv chained give the CPU's: two rows (a prompt's) then one (a step's), its window
 /// carried from the first to the second.
 #[test]

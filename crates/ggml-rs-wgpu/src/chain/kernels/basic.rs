@@ -167,9 +167,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
-/// [`ChainRecorder::argmax_softmax`]'s first pass over `p[0].x` logits: a workgroup 4,096 of them, a thread 16 (its
-/// largest, the first of equals, and the sum of exponentials against it as it goes), then the threads' combined, the
-/// lower index of equals taken; workgroup `g`'s largest, its index (as bits) and its sum to `parts[4 g..]`.
+/// [`ChainRecorder::argmax_rows`]'s first pass over rows of `p[0].x` logits (a row a line of the grid's second axis):
+/// a workgroup 4,096 of a row's, a thread 16 (its largest, the first of equals, and the sum of exponentials against it
+/// as it goes), then the threads' combined, the lower index of equals taken; row `r`'s workgroup `g`'s largest, its
+/// index in the row (as bits) and its sum to `parts[4 (r p[0].y + g)..]` (`p[0].y` the workgroups a row).
 ///
 /// One workgroup took them all at first, 970 of a vocabulary's 248,320 a thread one after another with an
 /// exponential each: 160 us a draft, a sixth of what a draft costs.
@@ -185,13 +186,14 @@ var<workgroup> ms: array<f32, 256>;
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
     let n = p[0].x;
+    let row = wg.y;
     var m = -3.4e38;
     var idx = 0xffffffffu;
     var s = 0.0;
     for (var j = 0u; j < 16u; j++) {
         let i = wg.x * 4096u + j * 256u + t;
         if (i < n) {
-            let v = x[i];
+            let v = x[row * n + i];
             if (v > m) {
                 s = s * exp(m - v) + 1.0;
                 m = v;
@@ -220,15 +222,16 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
         workgroupBarrier();
     }
     if (t == 0u) {
-        parts[4u * wg.x] = mv[0];
-        parts[4u * wg.x + 1u] = bitcast<f32>(mi[0]);
-        parts[4u * wg.x + 2u] = ms[0];
+        let at = 4u * (row * p[0].y + wg.x);
+        parts[at] = mv[0];
+        parts[at + 1u] = bitcast<f32>(mi[0]);
+        parts[at + 2u] = ms[0];
     }
 }
 "#;
 
-/// [`ChainRecorder::argmax_softmax`]'s second pass: [`ARGMAX_SOFTMAX_PARTS`]'s `p[0].x` parts combined the same way,
-/// one workgroup: the largest's index (as bits), the largest and the sum to `out[0..3]`.
+/// [`ChainRecorder::argmax_rows`]'s second pass: a row's `p[0].x` parts ([`ARGMAX_SOFTMAX_PARTS`]'s) combined the same
+/// way, a workgroup a row `r`: the largest's index (as bits), the largest and the sum to `out[4 r..]`.
 pub(in crate::chain) const ARGMAX_SOFTMAX: &str = r#"
 @group(0) @binding(0) var<storage, read> parts: array<f32>;
 @group(0) @binding(6) var<storage, read_write> out: array<f32>;
@@ -239,17 +242,19 @@ var<workgroup> mi: array<u32, 256>;
 var<workgroup> ms: array<f32, 256>;
 
 @compute @workgroup_size(256)
-fn main(@builtin(local_invocation_index) t: u32) {
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
     let count = p[0].x;
+    let row = wg.x;
     var m = -3.4e38;
     var idx = 0xffffffffu;
     var s = 0.0;
     for (var g = t; g < count; g += 256u) {
-        let m2 = parts[4u * g];
-        let i2 = bitcast<u32>(parts[4u * g + 1u]);
+        let at = 4u * (row * count + g);
+        let m2 = parts[at];
+        let i2 = bitcast<u32>(parts[at + 1u]);
         let take = m2 > m || (m2 == m && i2 < idx);
         let mm = select(m, m2, take);
-        s = s * exp(m - mm) + parts[4u * g + 2u] * exp(m2 - mm);
+        s = s * exp(m - mm) + parts[at + 2u] * exp(m2 - mm);
         m = mm;
         idx = select(idx, i2, take);
     }
@@ -272,9 +277,9 @@ fn main(@builtin(local_invocation_index) t: u32) {
         workgroupBarrier();
     }
     if (t == 0u) {
-        out[0] = bitcast<f32>(mi[0]);
-        out[1] = mv[0];
-        out[2] = ms[0];
+        out[4u * row] = bitcast<f32>(mi[0]);
+        out[4u * row + 1u] = mv[0];
+        out[4u * row + 2u] = ms[0];
     }
 }
 "#;

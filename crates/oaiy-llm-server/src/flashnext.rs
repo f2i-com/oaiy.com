@@ -461,6 +461,9 @@ pub struct FlashNext {
     /// The positions of the run a chain is recording, where its rows are not the next ones in order (a picture's
     /// tokens, and the text after one): one a row, in three axes ([`Self::forward`] sets and clears it).
     pub(crate) placed: std::sync::Mutex<Option<Vec<[u32; 3]>>>,
+    /// Whether the chained run a caller is starting reads its rows' picks (each row's largest logit's token, picked
+    /// on the GPU) where it would read their logits: set and cleared around that run ([`Self::check_picks`]).
+    pick: std::sync::atomic::AtomicBool,
 }
 
 /// Qwen3.8-Flash-Next's multi-token-prediction layer (the checkpoint's `mtp.*`, on the last device with the head): the
@@ -904,6 +907,7 @@ fn build(path: &Path, backends: Vec<Arc<dyn Backend>>, cudas: Vec<Arc<Card>>, lo
         chain: Default::default(),
         mtp,
         placed: Default::default(),
+        pick: Default::default(),
         config: cfg,
     })
 }
@@ -1443,6 +1447,8 @@ struct ChainDev {
     table: ggml_rs::DeviceVec,
     mixed: ggml_rs::DeviceVec,
     head: ggml_rs::DeviceVec,
+    /// The head's rows' picks (`ChainRecorder::argmax_rows`: four values a row).
+    picks: ggml_rs::DeviceVec,
 }
 
 /// A device's copy of its attention layers' caches (row `t`: K `[kv_heads, head_dim]` then V), `cap` rows, and of their
@@ -1656,6 +1662,7 @@ fn chain_dev(c: &dyn ggml_rs::DeviceChain, cfg: &Config, rank: usize, rows: usiz
         table: v(cfg.rope_dim),
         mixed: c.vec(heads * h),
         head: c.vec(heads * cfg.vocab),
+        picks: c.vec(4 * heads.max(1)),
     }
 }
 
@@ -1834,6 +1841,33 @@ impl FlashNext {
         let embeds = self.embed_text(tokens).ok()?;
         let logits = self.run_chained(tokens, &embeds, kv, true)?;
         Some(logits.chunks_exact(self.config.vocab).map(|r| Tensor::from_vec(r.to_vec(), vec![1, self.config.vocab])).collect())
+    }
+
+    /// [`Self::check`] for a request that samples greedily: each row's token alone, its largest logit's (the first of
+    /// equals, as greedy sampling takes it), picked on the GPU. A check's rows of logits are a megabyte each to read
+    /// back, for a token each. None as [`Self::check`] (nothing run).
+    pub fn check_picks(&self, tokens: &[u32], kv: &mut KvCache) -> Option<Vec<u32>> {
+        if !(2..=CHECK_ROWS).contains(&tokens.len()) || kv.len + tokens.len() > kv.max_len {
+            return None;
+        }
+        let embeds = self.embed_text(tokens).ok()?;
+        self.pick.store(true, std::sync::atomic::Ordering::Relaxed);
+        let got = self.run_chained(tokens, &embeds, kv, true);
+        self.pick.store(false, std::sync::atomic::Ordering::Relaxed);
+        Some(got?.chunks_exact(4).take(tokens.len()).map(|row| row[0].to_bits()).collect())
+    }
+
+    /// A decode step's token for a request that samples greedily, as [`Self::check_picks`]: `token` (its embedding
+    /// `embeds`) run after what `kv` holds, the next token picked on the GPU. None where the step cannot be chained
+    /// (nothing run: [`Self::forward`] is the caller's).
+    pub fn step_pick(&self, token: u32, embeds: &Tensor, kv: &mut KvCache) -> Option<u32> {
+        if profile::on() || self.prompt_rows() == 0 {
+            return None;
+        }
+        self.pick.store(true, std::sync::atomic::Ordering::Relaxed);
+        let got = self.run_chained(&[token], embeds, kv, false);
+        self.pick.store(false, std::sync::atomic::Ordering::Relaxed);
+        got.map(|row| row[0].to_bits())
     }
 
     /// Undo the last check's rows past its first `keep` (the token sampled and the drafts accepted): each delta net's
@@ -2841,11 +2875,18 @@ impl FlashNext {
                 hid = Some((past + t - 1, 1));
             }
         }
+        // (a greedy request's run: its rows' tokens picked here, those read where megabytes of logits were)
+        let pick = self.pick.load(Ordering::Relaxed);
         if check {
             // every row's streams collapsed, then the head
             hc(&mut *rec, dv, t, &st.collapse, None, &dv.post, &dv.mixed);
             rec.exl3_rows(chain_packed(&self.head)?, &dv.mixed, &dv.head, t);
-            rec.read(&dv.head);
+            if pick {
+                rec.argmax_rows(&dv.head, t, cfg.vocab, &dv.picks);
+                rec.read(&dv.picks);
+            } else {
+                rec.read(&dv.head);
+            }
         } else {
             // the last row's streams collapsed (in a step's own vectors), then the head
             let one = &st.devs[d];
@@ -2854,7 +2895,12 @@ impl FlashNext {
             }
             hc(&mut *rec, one, 1, &st.collapse, None, &one.post, &one.mixed);
             rec.exl3_rows(chain_packed(&self.head)?, &one.mixed, &one.head, 1);
-            rec.read(&one.head);
+            if pick {
+                rec.argmax_rows(&one.head, 1, cfg.vocab, &one.picks);
+                rec.read(&one.picks);
+            } else {
+                rec.read(&one.head);
+            }
         }
         mark("last device recorded");
         if host_log && host_layers > 0 {

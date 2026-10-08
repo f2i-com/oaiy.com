@@ -401,6 +401,13 @@ pub trait ChainRecorder {
     /// an f32's bits), `out[1]` the largest, `out[2]` the sum of `exp(x[i] - out[1])` (the token's probability its
     /// inverse), where reading the logits back cost a draft a millisecond.
     fn argmax_softmax(&mut self, x: &DeviceVec, out: &DeviceVec);
+    /// [`Self::argmax_softmax`] of each of `rows` rows of `x` (`[rows, n]`), row `r`'s three at `out[4 r..]`: a greedy
+    /// request's tokens picked on the device, where a check's rows of logits were megabytes to read back for a token
+    /// each.
+    fn argmax_rows(&mut self, x: &DeviceVec, rows: usize, n: usize, out: &DeviceVec) {
+        let _ = (x, rows, n, out);
+        unimplemented!("a row's largest logit on this device")
+    }
     /// QSA's pooled block keys (`Backend::qsa_pool`): `pooled[b] = mean of raw rows b ratio .. (b + 1) ratio`, the
     /// first `blocks` blocks of `raw` (`[.., d]`).
     fn qsa_pool(&mut self, raw: &DeviceVec, pooled: &DeviceVec, blocks: usize, ratio: usize, d: usize) {
