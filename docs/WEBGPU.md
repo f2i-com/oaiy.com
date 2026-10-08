@@ -278,9 +278,9 @@ The IQ2_XS file is the one Strata's figure is for. Its routed experts' gate and 
 matrices are grid types (IQ2_S in 34 layers, IQ2_XXS in 11, IQ1_M in 3; their down
 matrices Q2_0): a group of eight weights is one entry of ggml's grid, with its signs and
 a scale. `quant_moe` decodes them on the card as it does Q2_0, the grid in a storage
-buffer of the layer's (as WGSL constants such tables are copied at each call, which
-once reset the driver). Before these kernels every layer's experts ran on the host's
-reference path: 0.9 tokens a second.
+buffer of the layer's, two bits a weight (as WGSL constants such tables are copied at
+each call, which once reset the driver). Before these kernels every layer's experts ran
+on the host's reference path: 0.9 tokens a second.
 
 From that file over two RTX 5090s (2026-10-08): a reply at 79 to 84 tokens a second,
 93 to 103 drafting. A decode step takes 11.5 ms; a check of drafts (every row's logits)
@@ -290,20 +290,19 @@ scale, which is llama.cpp's CPU arithmetic and what the K-quants' check kernels 
 do): 2.1 ms of a check of four where the f32 kernel took 7.8, more than a step's whole
 2.5. A check's rows then differ from a step's by that rounding: over 36 rows the logits'
 cosine is 0.99967 on average and 0.9987 at worst, the greedy token the same each time
-(with f32 rows they are the step's exactly; `OAIY_NO_Q8` gives those). The prompt is
-slower than the Q2_0 file's: 1,960 tokens in about 1 s where 0.5, a chunk of 512 rows
-362 ms where 217, of which the grid types' tensor-core kernel is 195 ms (it decodes a
-group of eight weights with seven loads where Q2_0 takes two: still to be reworked).
+(with f32 rows they are the step's exactly; `OAIY_NO_Q8` gives those).
 
-Strata's 179 tokens a second is not matched: on its own file, drafting, ours is 93 to
-103 on two cards. The two runs are not yet like for like either way: Strata's is one
-card at 575 W, a 4K prompt of synthetic code, drafting four deep with suffix drafts;
-ours two cards at 400 W, prose, three deep. Its log gives 256 tokens in 96 passes of
-3.4 rows, 14.9 ms a pass all told. Ours gives 300 tokens in 144 passes: 117 checks of
-3.2 rows at 16.9 ms each, 27 plain steps, and 3.8 ms a pass making the drafts (the
-server's decode line now says these). On one card the layers it has no room for still
-run their experts on the reference path (the host's fast kernel reads Q2_0 only), so
-it is not usable there yet.
+Against the request Strata's benchmark makes (a synthetic Python module up to 4,096
+prompt tokens, greedy, 256 tokens), the same two cards: the prompt at 3,600 tokens a
+second (Strata 4,270), the reply at 75 to 78 tokens a second plain and 106 to 111
+drafting (Strata 179). Strata's run is one card at 575 W; ours two at 400 W. The two
+logs count the same work for it: Strata's 256 tokens are 96 passes with 160 of 226
+drafts taken, ours 97 passes with 159 of 214. What differs is a pass's time: 24 ms here
+(a check of 3.5 rows 19.3 ms, its drafts 4.7 ms: the server's decode line says these)
+where Strata's is 14.9 all told. A step is 1,498 dispatches and its smallest kernels
+take some 7 us each, so the count of dispatches is most of what is left. On one card
+the layers it has no room for still run their experts on the reference path (the
+host's fast kernel reads Q2_0 only), so it is not usable there yet.
 
 On one card (`--devices 0`) the file does not fit: its experts are 34 GB, and a 32 GB
 card's budget holds 34 of the 48 layers' beside the dense matrices. The other 14

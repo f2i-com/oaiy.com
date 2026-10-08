@@ -12,10 +12,12 @@
 //! scales, f16, two a word: the GGUF's bytes, no more, each word aligned.
 //!
 //! The grid types the GSQ-RCO IQ2_XS file keeps its experts' gate and up matrices in (IQ2_S, IQ2_XXS, IQ1_M: 256
-//! weights a block, a group of eight an entry of ggml's grid, with its signs and a scale of its own) are held as the
-//! GGUF's blocks, each padded to whole words; `w8`'s eight weights are one group. The grid is a storage buffer of the
-//! layer's (binding 4): as WGSL constants such tables are copied at each call, which once ran a dispatch past
-//! Windows' two seconds and reset the driver (`crate::shaders::layout`'s note).
+//! weights a block, a group of eight an entry of ggml's grid, with its signs and a scale of its own) are held a block
+//! in whole words, its fields each on a word's edge (a 32's four index bytes one word, its signs another: the GGUF's
+//! bytes in another order, and a pad). The grid is a storage buffer of the layer's (binding 4), two bits a weight (a
+//! grid's bytes take four values at most), so a group is one load of it: as WGSL constants such tables are copied at
+//! each call, which once ran a dispatch past Windows' two seconds and reset the driver (`crate::shaders::layout`'s
+//! note).
 use crate::exl3::{coop_on, many_order, moe_rows_for, Step, DOWN_JOBS, FEW_MAX, GROUP, MANY_CLEAR, MANY_COUNT, MANY_SCAN, MANY_SCATTER, ROUTE, WSUM_APPLY, WSUM_ROWS};
 use crate::{chunk_limit, Gpu, WgpuBackend};
 use ggml_quants::GgmlType;
@@ -232,108 +234,180 @@ impl Kind {
                     dst[kw + b / 2] |= (u16::from_le_bytes([block[0], block[1]]) as u32) << (16 * (b % 2));
                 }
             }
-            // (a block's bytes as they lie, little-endian, its last word's spare bytes zero)
             Some((bytes, words)) => {
-                dst.fill(0);
+                let le = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
                 for (block, out) in src.chunks_exact(bytes).zip(dst.chunks_exact_mut(words)) {
-                    for (i, byte) in block.iter().enumerate() {
-                        out[i / 4] |= (*byte as u32) << (8 * (i % 4));
+                    match self {
+                        // the GGUF's: the scale (f16), 32 index bytes, 32 sign bytes, 8 bytes of the indices' high
+                        // bits, 8 of scales; here the eight 32s' index words, their sign words, the high bits', the
+                        // scales', the scale
+                        Kind::IQ2_S => {
+                            for s in 0..8 {
+                                out[s] = le(&block[2 + 4 * s..]);
+                                out[8 + s] = le(&block[34 + 4 * s..]);
+                            }
+                            (out[16], out[17], out[18], out[19]) = (le(&block[66..]), le(&block[70..]), le(&block[74..]), le(&block[78..]));
+                            out[20] = u16::from_le_bytes([block[0], block[1]]) as u32;
+                        }
+                        // the GGUF's: the scale, then each 32's four index bytes and its word of signs and scale;
+                        // here the index words, those words, the scale
+                        Kind::IQ2_XXS => {
+                            for s in 0..8 {
+                                out[s] = le(&block[2 + 8 * s..]);
+                                out[8 + s] = le(&block[6 + 8 * s..]);
+                            }
+                            out[16] = u16::from_le_bytes([block[0], block[1]]) as u32;
+                        }
+                        // (IQ1_M's fields lie on words' edges as they are: its bytes, little-endian)
+                        _ => {
+                            for (o, c) in out.iter_mut().zip(block.chunks_exact(4)) {
+                                *o = le(c);
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
-    /// The table a grid type's `w8` reads (its storage buffer's words): ggml's grid, an entry its low word then its
-    /// high (eight weights a byte each); after IQ2_XXS's 256 entries, the 128 sign patterns its groups index.
-    fn table(self) -> Option<Vec<u32>> {
+    /// A grid type's grid: ggml's, and whether its bytes are int8 (IQ1's -1, 0 and 1; the others' are magnitudes).
+    fn grid(self) -> Option<(&'static [u64], bool)> {
         use ggml_quants::iq_tables as t;
-        let words = |g: &[u64]| g.iter().flat_map(|v| [*v as u32, (*v >> 32) as u32]).collect::<Vec<u32>>();
         match self {
             Kind::Q2_0 => None,
-            Kind::IQ2_S => Some(words(&t::IQ2S_GRID)),
-            Kind::IQ2_XXS => Some(words(&t::IQ2XXS_GRID).into_iter().chain(t::KSIGNS_IQ2XS.iter().map(|s| *s as u32)).collect()),
-            Kind::IQ1_M => Some(words(&t::IQ1S_GRID)),
+            Kind::IQ2_S => Some((&t::IQ2S_GRID, false)),
+            Kind::IQ2_XXS => Some((&t::IQ2XXS_GRID, false)),
+            Kind::IQ1_M => Some((&t::IQ1S_GRID, true)),
         }
     }
 
-    /// `fn w8(rb: u32, kt: u32, hf: u32, kw: u32) -> array<f32, 8>`: weights `16 kt + 8 hf ..` (eight of them) of the
-    /// row whose words start at `rb` of `words`, a row of `16 kw` weights. A grid type's with its grid's binding.
+    /// The table a grid type's kernels read (its storage buffer's words): the grid's entries, a word each
+    /// ([`grid_codes`]).
+    fn table(self) -> Option<Vec<u32>> {
+        self.grid().map(|(g, signed)| grid_codes(g, signed).0)
+    }
+
+    /// The type's decoder. Q2_0: `fn w8(rb: u32, kt: u32, hf: u32, kw: u32) -> array<f32, 8>`, weights `16 kt + 8 hf
+    /// ..` (eight of them) of the row whose words start at `rb` of `words`, a row of `16 kw` weights. A grid type:
+    /// `fn sub_of(bw: u32, sub: u32) -> Sub`, what the 32 weights `32 sub ..` of the block at `bw` share, and `fn
+    /// grp(h: Sub, l: u32) -> array<f32, 8>`, its group `l` of four; `BLOCK_WORDS`; and the grid's binding.
     fn wgsl(self) -> String {
+        let Some((grid, signed)) = self.grid() else { return W8_Q2_0.to_string() };
+        let helpers = GRID_HELPERS.replace("LEVELS", &levels_wgsl(grid_codes(grid, signed).1));
         match self {
-            Kind::Q2_0 => W8_Q2_0.to_string(),
-            Kind::IQ2_S => format!("{GRID_HELPERS}{W8_IQ2_S}"),
-            Kind::IQ2_XXS => format!("{GRID_HELPERS}{W8_IQ2_XXS}"),
-            Kind::IQ1_M => format!("{GRID_HELPERS}{W8_IQ1_M}"),
+            Kind::IQ2_S => format!("{helpers}{GRID_MAGS}{SUB_IQ2_S}"),
+            Kind::IQ2_XXS => format!("{helpers}{GRID_MAGS}{SUB_IQ2_XXS}"),
+            _ => format!("{helpers}{SUB_IQ1_M}"),
         }
     }
 }
 
-/// What the grid types' `w8`s share: the grid's buffer, a block's byte, and a group's eight weights from its grid
-/// entry's bytes.
+/// A grid's entries as the kernels read them: two bits a weight, eight weights a word (weight `j` its bits `2 j`),
+/// each one of the grid's values, which are four at most (returned in order: a code is its value's place among them;
+/// the last repeated where they are fewer). `signed`: the grid's bytes are int8.
+fn grid_codes(grid: &[u64], signed: bool) -> (Vec<u32>, [f32; 4]) {
+    let value = |b: u8| if signed { b as i8 as f32 } else { b as f32 };
+    let mut seen: Vec<u8> = grid.iter().flat_map(|e| e.to_le_bytes()).collect();
+    seen.sort_unstable_by(|a, b| value(*a).total_cmp(&value(*b)));
+    seen.dedup();
+    assert!(seen.len() <= 4, "a grid of {} values: two bits a weight hold four", seen.len());
+    let code = |b: &u8| seen.iter().position(|s| s == b).expect("a value of the grid's") as u32;
+    let codes = grid.iter().map(|e| e.to_le_bytes().iter().enumerate().fold(0u32, |w, (j, b)| w | code(b) << (2 * j))).collect();
+    let mut levels = [value(*seen.last().expect("a grid has values")); 4];
+    for (l, b) in levels.iter_mut().zip(&seen) {
+        *l = value(*b);
+    }
+    (codes, levels)
+}
+
+/// A grid's values from their codes `c` (a `vec4<f32>` of them), as WGSL: `l0 + c (a + b c)` where that gives each
+/// value exactly in f32 (ggml's grids: 8, 25, 43 and 62 are `8 + c (16.5 + c / 2)`, IQ1's -1, 0 and 1 `c - 1`), two
+/// multiply-adds a weight; else by comparing (five steps a weight, which was a third of the few-row kernel's time).
+fn levels_wgsl(l: [f32; 4]) -> String {
+    let b = (l[2] - 2.0 * l[1] + l[0]) / 2.0;
+    let a = l[1] - l[0] - b;
+    if (0..4).all(|c| l[0] + c as f32 * (a + b * c as f32) == l[c]) {
+        format!("vec4<f32>({:?}) + c * (vec4<f32>({a:?}) + {b:?} * c)", l[0])
+    } else {
+        format!("select(select(vec4<f32>({:?}), vec4<f32>({:?}), c == vec4<f32>(1.0)), select(vec4<f32>({:?}), vec4<f32>({:?}), c == vec4<f32>(3.0)), c >= vec4<f32>(2.0))", l[0], l[1], l[2], l[3])
+    }
+}
+
+/// What the grid types' decoders share: the grid's buffer, what a 32 of a block's weights share, and a grid entry's
+/// values (`LEVELS` the grid's four from a code, written in by [`Kind::wgsl`]: [`levels_wgsl`]).
 const GRID_HELPERS: &str = r#"
 @group(0) @binding(4) var<storage, read> grid: array<u32>;
 
-// byte `at` of the block whose words start at `bw` (the GGUF's bytes, little-endian)
-fn bat(bw: u32, at: u32) -> u32 {
-    return (words[bw + at / 4u] >> (8u * (at % 4u))) & 255u;
+// what a block's 32 weights share: their four groups' grid indices' low bytes, their signs, the scale of each half
+// (groups 0 and 1, 2 and 3), and the type's own bits
+struct Sub {
+    idx: u32,
+    sg: u32,
+    s0: f32,
+    s1: f32,
+    x: u32,
 }
 
-// a group's eight weights: its grid entry's bytes (`lo`'s four, then `hi`'s), each times `s`, negative where its bit
-// of `signs` is set
-fn mags(lo: u32, hi: u32, signs: u32, s: f32) -> array<f32, 8> {
-    var v: array<f32, 8>;
-    for (var j = 0u; j < 4u; j++) {
-        v[j] = s * f32((lo >> (8u * j)) & 255u) * select(1.0, -1.0, ((signs >> j) & 1u) == 1u);
-        v[4u + j] = s * f32((hi >> (8u * j)) & 255u) * select(1.0, -1.0, ((signs >> (j + 4u)) & 1u) == 1u);
-    }
-    return v;
-}
-"#;
-
-const W8_IQ2_S: &str = r#"
-// IQ2_S: a block its f16 scale, 32 groups' grid indices' low bytes, their signs' bytes, eight bytes of the indices'
-// high bits (two a group) and eight of scales (a nibble for each half of a 32): 82 bytes, 21 words here.
-fn w8(rb: u32, kt: u32, hf: u32, kw: u32) -> array<f32, 8> {
-    let gi = 2u * kt + hf;
-    let bw = rb + (gi / 32u) * 21u;
-    let g = gi % 32u;
-    let sub = g / 4u;
-    let l = g % 4u;
-    let sc = bat(bw, 74u + sub);
-    let s = unpack2x16float(words[bw]).x * (0.5 + f32(select(sc & 15u, sc >> 4u, l >= 2u))) * 0.25;
-    let i = bat(bw, 2u + g) | ((bat(bw, 66u + sub) << (8u - 2u * l)) & 0x300u);
-    return mags(grid[2u * i], grid[2u * i + 1u], bat(bw, 34u + g), s);
+// four of a grid entry's weights: two bits each (`e` shifted by `sh`), a weight one of the grid's four values
+fn levels(e: u32, sh: vec4<u32>) -> vec4<f32> {
+    let c = vec4<f32>((vec4<u32>(e) >> sh) & vec4<u32>(3u));
+    return LEVELS;
 }
 "#;
 
-const W8_IQ2_XXS: &str = r#"
-// IQ2_XXS: a block its f16 scale, then eight bytes for each 32 weights: four groups' grid indices, and a word of
-// their sign patterns' numbers (7 bits each) with the 32's scale in its top four bits: 66 bytes, 17 words here. The
-// sign patterns follow the grid's 256 entries in its buffer.
-fn w8(rb: u32, kt: u32, hf: u32, kw: u32) -> array<f32, 8> {
-    let gi = 2u * kt + hf;
-    let bw = rb + (gi / 32u) * 17u;
-    let g = gi % 32u;
-    let at = 2u + 8u * (g / 4u);
-    let l = g % 4u;
-    let aux = bat(bw, at + 4u) | (bat(bw, at + 5u) << 8u) | (bat(bw, at + 6u) << 16u) | (bat(bw, at + 7u) << 24u);
-    let s = unpack2x16float(words[bw]).x * (0.5 + f32(aux >> 28u)) * 0.25;
-    let i = bat(bw, at + l);
-    return mags(grid[2u * i], grid[2u * i + 1u], grid[512u + ((aux >> (7u * l)) & 127u)], s);
+/// A group's eight weights of the types whose grids are magnitudes (IQ2_S, IQ2_XXS).
+const GRID_MAGS: &str = r#"
+// a group's eight weights: its grid entry's values, each times `s`, negative where its bit of `signs` is set
+// (a sign is its bit moved into the float's own: the product negated, exactly)
+fn mags(e: u32, signs: u32, s: f32) -> array<f32, 8> {
+    let m0 = bitcast<vec4<u32>>(s * levels(e, vec4<u32>(0u, 2u, 4u, 6u)));
+    let m1 = bitcast<vec4<u32>>(s * levels(e, vec4<u32>(8u, 10u, 12u, 14u)));
+    let v0 = bitcast<vec4<f32>>(m0 ^ ((vec4<u32>(signs) << vec4<u32>(31u, 30u, 29u, 28u)) & vec4<u32>(0x80000000u)));
+    let v1 = bitcast<vec4<f32>>(m1 ^ ((vec4<u32>(signs) << vec4<u32>(27u, 26u, 25u, 24u)) & vec4<u32>(0x80000000u)));
+    return array<f32, 8>(v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w);
 }
 "#;
 
-const W8_IQ1_M: &str = r#"
-// IQ1_M: a block 32 groups' grid indices' low bytes, 16 bytes of their high bits and offsets' signs (a nibble a
-// group), and four 16-bit words: twelve bits of scales each (three for each 16 weights) under a nibble of the block's
-// f16 scale: 56 bytes, 14 words. A weight is its grid byte (signed) plus or minus an eighth, times its scale.
-fn w8(rb: u32, kt: u32, hf: u32, kw: u32) -> array<f32, 8> {
-    let gi = 2u * kt + hf;
-    let bw = rb + (gi / 32u) * 14u;
-    let g = gi % 32u;
-    let sub = g / 4u;
-    let l = g % 4u;
+const SUB_IQ2_S: &str = r#"
+// IQ2_S, a block 21 words here: the eight 32s' index words (a group's grid index's low byte each), their sign words
+// (a byte a group), two words of the indices' high bits (a byte a 32: two bits a group), two of scales (a byte a 32:
+// a nibble for each half), and the block's f16 scale.
+const BLOCK_WORDS: u32 = 21u;
+fn sub_of(bw: u32, sub: u32) -> Sub {
+    let sh = 8u * (sub % 4u);
+    let sc = (words[bw + 18u + sub / 4u] >> sh) & 255u;
+    let d = unpack2x16float(words[bw + 20u]).x;
+    return Sub(words[bw + sub], words[bw + 8u + sub], d * (0.5 + f32(sc & 15u)) * 0.25, d * (0.5 + f32(sc >> 4u)) * 0.25, (words[bw + 16u + sub / 4u] >> sh) & 255u);
+}
+fn grp(h: Sub, l: u32) -> array<f32, 8> {
+    let i = ((h.idx >> (8u * l)) & 255u) | ((h.x << (8u - 2u * l)) & 0x300u);
+    return mags(grid[i], (h.sg >> (8u * l)) & 255u, select(h.s0, h.s1, l >= 2u));
+}
+"#;
+
+const SUB_IQ2_XXS: &str = r#"
+// IQ2_XXS, a block 17 words here: the eight 32s' index words (a group's grid index each), then for each 32 a word of
+// its groups' sign patterns (seven bits each: a group's eighth sign makes its negatives even) under the 32's scale in
+// its top four bits, and the block's f16 scale.
+const BLOCK_WORDS: u32 = 17u;
+fn sub_of(bw: u32, sub: u32) -> Sub {
+    let aux = words[bw + 8u + sub];
+    let s = unpack2x16float(words[bw + 16u]).x * (0.5 + f32(aux >> 28u)) * 0.25;
+    return Sub(words[bw + sub], aux, s, s, 0u);
+}
+fn grp(h: Sub, l: u32) -> array<f32, 8> {
+    let s7 = (h.sg >> (7u * l)) & 127u;
+    return mags(grid[(h.idx >> (8u * l)) & 255u], s7 | ((countOneBits(s7) & 1u) << 7u), h.s0);
+}
+"#;
+
+const SUB_IQ1_M: &str = r#"
+// IQ1_M, a block 14 words (the GGUF's 56 bytes as they lie): the eight 32s' index words (a group's grid index's low
+// byte each), four words of the indices' high bits and the offsets' signs (a nibble a group), and four 16-bit words:
+// twelve bits of scales each (three for each 16 weights) under a nibble of the block's f16 scale. A weight is its grid
+// value (-1, 0 or 1) plus or minus an eighth, times its scale.
+const BLOCK_WORDS: u32 = 14u;
+fn sub_of(bw: u32, sub: u32) -> Sub {
     let s0 = words[bw + 12u] & 0xffffu;
     let s1 = words[bw + 12u] >> 16u;
     let s2 = words[bw + 13u] & 0xffffu;
@@ -341,18 +415,16 @@ fn w8(rb: u32, kt: u32, hf: u32, kw: u32) -> array<f32, 8> {
     let d = unpack2x16float((s0 >> 12u) | ((s1 >> 8u) & 0x00f0u) | ((s2 >> 4u) & 0x0f00u) | (s3 & 0xf000u)).x;
     let pair = sub / 2u;
     let sc = select(select(s0, s1, pair == 1u), select(s2, s3, pair == 3u), pair >= 2u) >> (6u * (sub % 2u));
-    let dl = d * f32(2u * (select(sc, sc >> 3u, l >= 2u) & 7u) + 1u);
-    let h = bat(bw, 32u + 2u * sub + l / 2u) >> (4u * (l % 2u));
-    let i = bat(bw, 4u * sub + l) | ((h & 7u) << 8u);
-    let delta = select(0.125, -0.125, (h & 8u) != 0u);
-    let lo = grid[2u * i];
-    let hi = grid[2u * i + 1u];
-    var v: array<f32, 8>;
-    for (var j = 0u; j < 4u; j++) {
-        v[j] = dl * (f32(i32(lo << (24u - 8u * j)) >> 24u) + delta);
-        v[4u + j] = dl * (f32(i32(hi << (24u - 8u * j)) >> 24u) + delta);
-    }
-    return v;
+    return Sub(words[bw + sub], 0u, d * f32(2u * (sc & 7u) + 1u), d * f32(2u * ((sc >> 3u) & 7u) + 1u), (words[bw + 8u + sub / 2u] >> (16u * (sub % 2u))) & 0xffffu);
+}
+fn grp(h: Sub, l: u32) -> array<f32, 8> {
+    let hn = (h.x >> (4u * l)) & 15u;
+    let e = grid[((h.idx >> (8u * l)) & 255u) | ((hn & 7u) << 8u)];
+    let delta = select(0.125, -0.125, (hn & 8u) != 0u);
+    let dl = select(h.s0, h.s1, l >= 2u);
+    let v0 = dl * (levels(e, vec4<u32>(0u, 2u, 4u, 6u)) + delta);
+    let v1 = dl * (levels(e, vec4<u32>(8u, 10u, 12u, 14u)) + delta);
+    return array<f32, 8>(v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w);
 }
 "#;
 
@@ -380,8 +452,12 @@ fn w8(rb: u32, kt: u32, hf: u32, kw: u32) -> array<f32, 8> {
 /// words (80 weights) a lane or more. A lane's work must outweigh what every thread does whatever its share (its
 /// jobs' numbers, the barrier, its part in the sum): the experts' down projection is 640 wide, 40 words, and 32 lanes
 /// of it had a word or two each.
-fn few_lanes(k: usize) -> usize {
-    (k / 16 / 5).next_power_of_two().clamp(8, 32)
+///
+/// A grid type's lanes take a group of eight weights at a turn, ten such a lane or more (the same 80 weights; 64 and
+/// 128 lanes of Flash-Next's 2,560 were slower: a check's four rows 1.78 ms a step's layers with 64 where 1.53).
+fn few_lanes(kind: Kind, k: usize) -> usize {
+    let turn = if kind.block().is_some() { 8 } else { 16 };
+    (k / turn / (80 / turn)).next_power_of_two().clamp(8, 32)
 }
 
 /// The matmul of blocks of `rows` (1 to [`FEW_MAX`]) jobs of one matrix, in f32: a workgroup a block's `256 / lanes`
@@ -399,7 +475,7 @@ fn few_source(kind: Kind, rows: usize, lanes: usize) -> String {
     assert!((1..=FEW_MAX).contains(&rows), "a block of 1 to {FEW_MAX} rows");
     assert!(matches!(lanes, 8 | 16 | 32), "8, 16 or 32 lanes a row");
     if kind != Kind::Q2_0 {
-        return few_source_w8(kind, rows, lanes);
+        return few_source_grid(kind, rows, lanes);
     }
     let each = |f: &dyn Fn(usize) -> String| (0..rows).map(f).collect::<String>();
     let ids = each(&|i| {
@@ -461,9 +537,13 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     )
 }
 
-/// [`few_source`] for a kind decoded by its `w8` (the grid types): laid out the same, a lane taking a group of eight
-/// weights in every `lanes` of the row (one grid entry, decoded once for the block's rows), x two fours at a load.
-fn few_source_w8(kind: Kind, rows: usize, lanes: usize) -> String {
+/// [`few_source`] for a grid type: laid out the same, a lane taking a group of eight weights in every `lanes` of the
+/// row (one grid entry, decoded once for the block's rows), x two fours at a load. What a group's decoding costs does
+/// not show in this kernel's time: a Flash-Next layer's twenty IQ2_S matrices for a step's row take 18 us whether a
+/// group is seven loads (bytes off words' edges, a grid entry two words) or six with less arithmetic, as now. A lane
+/// taking 32 weights at a turn (their fields read once, their four groups written out one after another) was slower
+/// for every count of lanes tried, 25 us and a check's four rows 86 where 45: the loop's body four times as long.
+fn few_source_grid(kind: Kind, rows: usize, lanes: usize) -> String {
     let each = |f: &dyn Fn(usize) -> String| (0..rows).map(f).collect::<String>();
     let ids = each(&|i| {
         format!(
@@ -484,7 +564,7 @@ fn few_source_w8(kind: Kind, rows: usize, lanes: usize) -> String {
 
 // each thread's sums, [output row][lane][row of x]
 var<workgroup> red: array<f32, {red_len}>;
-{w8}
+{decoder}
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {{
     let n = p[0].x;
@@ -497,10 +577,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 {ids}    let row = (wg.x + wg.y * 65535u) * {per}u + slot;
     let live = on0 && row < n;
     let rb = jobs[2u * select(j0, 0u, !on0)] * p[1].x + min(row, n - 1u) * rw;
-    let kw = k / 16u;
     if (live) {{
         for (var gi = lane; gi < k / 8u; gi += {lanes}u) {{
-            let v = w8(rb, gi / 2u, gi % 2u, kw);
+            let g = gi % 32u;
+            let v = grp(sub_of(rb + (gi / 32u) * BLOCK_WORDS, g / 4u), g % 4u);
             let c0 = vec4<f32>(v[0], v[1], v[2], v[3]);
             let c1 = vec4<f32>(v[4], v[5], v[6], v[7]);
             let at = gi * 2u;
@@ -513,7 +593,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 "#,
         red_len = 256 * rows,
         per = 256 / lanes,
-        w8 = kind.wgsl(),
+        decoder = kind.wgsl(),
     )
 }
 
@@ -522,9 +602,18 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 /// outputs) of a block, `k` 16 at a time; each step a lane decodes eight weights of its warp's 16 outputs into the
 /// workgroup's memory as f16 (a Q2_0 weight is one exactly) and the block's inputs beside them (rounded to f16), the
 /// next step's loaded as this one's are multiplied; each warp its 16 outputs by the block's rows. `p` as
-/// [`few_source`]'s (no identity order).
+/// [`few_source`]'s (no identity order). A grid type's lane reads its 32's fields once for the two steps its groups
+/// are in, and a group is one load of the grid (it read the fields a group, bytes off words' edges, and a grid entry
+/// of two words: seven loads where Q2_0 takes two, and a Flash-Next layer's IQ2_S experts were 4.9 ms of a prompt's
+/// 512 rows; they are 1.8).
 fn coop_source(kind: Kind, rows: usize) -> String {
     assert!(matches!(rows, 16 | 32 | 64 | 128), "a block of 16, 32, 64 or 128 rows");
+    // the decoder's state, the first step's eight weights and a later step `kn`'s
+    let (state, first, next) = if kind.block().is_some() {
+        ("    var h = sub_of(rb, 0u);\n", "var v = grp(h, hf);", "if (kn % 2u == 0u) { h = sub_of(rb + (kn / 16u) * BLOCK_WORDS, (kn / 2u) % 8u); }\n        var v = grp(h, 2u * (kn % 2u) + hf);")
+    } else {
+        ("", "var v = w8(rb, kn, hf, kw);", "var v = w8(rb, kn, hf, kw);")
+    };
     let f = rows / 16;
     let pairs = rows * 8;
     let each = |g: &dyn Fn(usize) -> String| (0..f).map(g).collect::<String>();
@@ -596,10 +685,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     let kw = k / 16u;
     let wo = (warp * 16u + o) * S2 + hf * 4u;
     let s2 = S2;
-{decl}{xdecl}    // the first step's
+{decl}{xdecl}{state}    // the first step's
     {{
         let kn = 0u;
-        var v = w8(rb, kn, hf, kw);
+        {first}
 {xload}        let nbw = 0u;
         let nbx = 0u;
 {wstore}{xstore}    }}
@@ -608,7 +697,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
         // the next step (the last's own again, into the buffer no one reads after): loaded before this one's are
         // multiplied, stored after
         let kn = min(kt + 1u, kw - 1u);
-        var v = w8(rb, kn, hf, kw);
+        {next}
 {xload}        let curx = (kt % 2u) * {half_xt}u;
         let af = coopLoadT<coop_mat16x16<f16, A>>(&wt[(kt % 2u) * {half_wt}u + warp * 16u * S2], s2);
 {mma}        let nbw = ((kt + 1u) % 2u) * {half_wt}u;
@@ -650,7 +739,7 @@ fn kernel(kind: Kind, coop: bool, rows: usize, k: usize) -> (&'static str, &'sta
     static MADE: Mutex<Vec<Made>> = Mutex::new(Vec::new());
     let mut made = MADE.lock().unwrap_or_else(|p| p.into_inner());
     // (the tensor cores' kernel is one for every width; the few-row one is written for its lanes a row)
-    let lanes = if coop { 0 } else { few_lanes(k) };
+    let lanes = if coop { 0 } else { few_lanes(kind, k) };
     let key = (kind, coop, rows, lanes);
     if let Some((_, k)) = made.iter().find(|(k, _)| *k == key) {
         return *k;
@@ -855,7 +944,7 @@ impl QuantMoe {
         for first in (0..blocks).step_by(65535) {
             let these = 65535.min(blocks - first) as u32;
             let words = [g.n as u32, g.k as u32, g.rw as u32, identity, g.mwords as u32, first as u32];
-            let groups = (g.n as u32).div_ceil((256 / few_lanes(g.k)) as u32);
+            let groups = (g.n as u32).div_ceil((256 / few_lanes(g.kind, g.k)) as u32);
             let grid = if coop { (ntiles.div_ceil(8), 1, these) } else { (groups.min(65535), groups.div_ceil(65535), these) };
             rec.dispatch_wide(name, source, [&g.words, &xb, &jb, &ob, g.table.as_ref().unwrap_or(&d), &d, &yb, &drw], &words, grid);
         }
@@ -1245,6 +1334,27 @@ pub(crate) mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// What the grid types' kernels take for granted of ggml's tables: a grid's bytes are one of four values at most,
+    /// so an entry is two bits a weight (each grid given back from its codes and values), and IQ2_XXS's sign pattern
+    /// `i` is `i` with an eighth sign that makes its set bits even (the kernel computes it).
+    #[test]
+    fn the_grids_are_two_bits_a_weight() {
+        for kind in [Kind::IQ2_S, Kind::IQ2_XXS, Kind::IQ1_M] {
+            let (grid, signed) = kind.grid().unwrap();
+            let (codes, levels) = grid_codes(grid, signed);
+            assert_eq!(codes.len(), grid.len());
+            for (e, c) in grid.iter().zip(&codes) {
+                for (j, b) in e.to_le_bytes().iter().enumerate() {
+                    let want = if signed { *b as i8 as f32 } else { *b as f32 };
+                    assert_eq!(levels[((c >> (2 * j)) & 3) as usize], want, "{kind:?}: weight {j} of entry {e:#x}");
+                }
+            }
+        }
+        for (i, s) in ggml_quants::iq_tables::KSIGNS_IQ2XS.iter().enumerate() {
+            assert_eq!(*s as u32, i as u32 | ((i as u32).count_ones() & 1) << 7, "sign pattern {i}");
         }
     }
 
