@@ -1324,7 +1324,8 @@ impl WgpuBackend {
         let experimental = if coop.is_empty() { wgpu::ExperimentalFeatures::disabled() } else { unsafe { wgpu::ExperimentalFeatures::enabled() } };
         // storage buffers in the host's memory (mappable ones), where the adapter has them: weights a card has no
         // room for, read over the bus by the kernels themselves
-        let mappable = adapter.features() & wgpu::Features::MAPPABLE_PRIMARY_BUFFERS;
+        // (OAIY_NO_HOST_BUFFERS: not asked for)
+        let mappable = if std::env::var_os("OAIY_NO_HOST_BUFFERS").is_some() { wgpu::Features::empty() } else { adapter.features() & wgpu::Features::MAPPABLE_PRIMARY_BUFFERS };
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("oaiy"),
             required_features: timestamps | coop | mappable,

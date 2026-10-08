@@ -275,8 +275,19 @@ pub fn contexts(gemma: &Path, tokenizer: Option<&Path>, transformer: &mut Store,
 /// states through the audio stream's aggregate projection and its own connector, as
 /// [`crate::ltx::text::encode`] and the reference's `audio_embeddings_connector`).
 pub fn contexts_streams(gemma: &Path, tokenizer: Option<&Path>, transformer: &mut Store, prompts: &[String], device: usize, audio: bool, mut progress: impl FnMut(usize, usize)) -> Result<Vec<(Vec<f32>, Option<Vec<f32>>)>> {
+    // (OAIY_LOAD_PROFILE: where a prompt's context's time goes, part by part)
+    let profile = std::env::var_os("OAIY_LOAD_PROFILE").is_some();
+    let mut lap = std::time::Instant::now();
+    let mut said = |what: &str| {
+        if profile {
+            eprintln!("the text context: {what} {:.2} s", lap.elapsed().as_secs_f64());
+        }
+        lap = std::time::Instant::now();
+    };
     let gpu = ggml_rs_wgpu::WgpuBackend::nth(device, None).map_err(err)?;
+    said("the device");
     let mut store = Store::open(gemma, 0)?;
+    said("the text model's file opened");
     let prefix = if store.index.get("language_model.model.embed_tokens.weight").is_some() { "language_model.model." } else { "model." };
     let gemma4 = store.index.get(&format!("{prefix}layers.0.layer_scalar")).is_some();
     let mut tok = match tokenizer {
@@ -295,6 +306,7 @@ pub fn contexts_streams(gemma: &Path, tokenizer: Option<&Path>, transformer: &mu
         ids.truncate(ROWS);
         ids_all.push(ids);
     }
+    said("the tokenizer and the prompts' tokens");
     let steps = LAYERS + 10 + if audio { 9 } else { 0 };
     // the global layers' heads: Gemma 3's the local width (positions over 8), Gemma 4's twice it (a quarter of its
     // pairs turned, positions as they are); attention unscaled in Gemma 4
@@ -363,6 +375,7 @@ pub fn contexts_streams(gemma: &Path, tokenizer: Option<&Path>, transformer: &mu
             stack(rec.as_mut(), p, &p.x, 0);
         }
         rec.finish();
+        said("the prompts' embeddings and vectors");
         // a layer's weights are read and converted to f16 by a thread of their own (its own handle on the file), a
         // layer ahead of the one the GPU is given: one thread reading, converting, uploading and running each layer in
         // turn took 0.27 s a layer with the file in the system's cache, of it 0.06 the read and 0.06 the conversion
@@ -461,6 +474,7 @@ pub fn contexts_streams(gemma: &Path, tokenizer: Option<&Path>, transformer: &mu
         })?;
         prompts.into_iter().map(|p| (p.feats, p.s)).collect()
     };
+    said("the layers");
     gpu.release_cached();
     // a stream's projection (its input over sqrt(3840 / its width), folded into its weights; Gemma 4's in its own file)
     // and its connector: the video's 4,096 wide, the audio's 2,048
@@ -470,6 +484,7 @@ pub fn contexts_streams(gemma: &Path, tokenizer: Option<&Path>, transformer: &mu
         let name = format!("text_embedding_projection.{which}_aggregate_embed");
         let own = store.index.get(&format!("{name}.weight")).is_some();
         let proj = projection(if own { store } else { &mut *transformer }, &gpu, &name, (width as f32 / G as f32).sqrt())?;
+        said("a stream's projection");
         done += 1;
         progress(done, steps);
         let registers = transformer.tensor_f32(&g(&format!("{which}_embeddings_connector.learnable_registers")), &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
@@ -483,6 +498,7 @@ pub fn contexts_streams(gemma: &Path, tokenizer: Option<&Path>, transformer: &mu
             done += 1;
             progress(done, steps);
         }
+        said("its registers and its connector's eight blocks");
         let rope = rope_table(&(0..ROWS).map(|i| vec![i as f32]).collect::<Vec<_>>(), &[4096.], width, CHEADS);
         let table = gpu.vec(rope.len());
         gpu.upload(&table, &rope);
@@ -503,6 +519,7 @@ pub fn contexts_streams(gemma: &Path, tokenizer: Option<&Path>, transformer: &mu
             r.read(&out);
             contexts.push(rec.finish().pop().ok_or_else(|| err("the context was not read"))?);
         }
+        said("its runs");
         Ok(contexts)
     };
     let video = stream(&mut store, transformer, "video", D)?;
