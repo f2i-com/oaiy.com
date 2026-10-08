@@ -24,10 +24,18 @@ The server and inference core remain std-only and forbid unsafe Rust.
 > the reference's golden tensors (`tools/ltx/audio_reference.py`) the two streams' first
 > two blocks give its velocities to 0.7% (video 0.0066, audio 0.0073 to 0.0077, with
 > the audio denoised and with it frozen) and the audio connector its context to 0.7%,
-> from Q8_0 weights where the reference is BF16. A soundtrack or speech to follow, a
-> reference voice and two-stage refinement have no WebGPU path yet and are refused
-> there; `backend: "cuda"` is refused by name, and Candle's CPU backend cannot multiply
-> the model's BF16 weights. What this page says of those, of CUDA and of its timings
+> from Q8_0 weights where the reference is BF16. A given soundtrack is followed there
+> too (`audio_file`, or `speech` made first): the audio stream is held as it was given
+> (mixed with one noise at each step's sigma, or at sigma 0 with `soundtrack_mode:
+> "frozen"`: the frozen pass is the second of those golden figures) while the picture
+> is denoised beside it, and guidance by the soundtrack (`a2v_guidance` above 1) sets
+> each step against the pass without the streams' attention to each other, which is the
+> picture's stream alone. The soundtrack's encoding is Candle's on the CPU. A 2 s
+> soundtrack, 512x320, 57 frames: the eight steps 4.5 s, 7.2 s with that guidance (two
+> passes a step). A card with no room for both streams refuses such a clip, where it
+> would run one with its own sound silent. A reference voice and two-stage refinement
+> have no WebGPU path yet and are refused there; `backend: "cuda"` is refused by name,
+> and Candle's CPU backend cannot multiply the model's BF16 weights. What this page says of those, of CUDA and of its timings
 > describes the CUDA build, which stands on the branch `backup/cuda-support-2026-10-08`.
 
 Sulphur-2 and LTX 2.5 have been validated end to end locally in both text-to-video

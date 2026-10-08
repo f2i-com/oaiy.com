@@ -501,9 +501,9 @@ impl Request {
             return Err("prompt must not be empty".into());
         }
         if self.webgpu {
-            // (a clip's own sound runs there: the two streams denoised together)
+            // (a clip's own sound runs there, the two streams denoised together, and a given soundtrack is followed:
+            // the audio stream held as it was given while the picture's is denoised beside it)
             let unsupported = [
-                (self.audio_file.is_some() || self.speech.is_some(), "a given soundtrack or speech to follow"),
                 (self.reference_voice.is_some() || self.identity, "a reference voice"),
                 (self.refine.is_some(), "two-stage refinement"),
             ];
@@ -879,6 +879,11 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     // on WebGPU, where it would fail partway.
     #[cfg(feature = "webgpu")]
     let silenced = match &mut model {
+        // (a soundtrack to follow is the audio stream's to carry: without room for that stream the clip cannot follow
+        // it, and a clip that ignored its soundtrack would be the wrong clip)
+        Model::Wgpu(m, _, _) if r.audio && conditioning_audio.is_some() && !m.room_for_step(f * h * w + if r.end_image.is_some() { h * w } else { 0 }) => {
+            candle_core::bail!("the GPU has no room for this clip's steps beside the audio stream that following a soundtrack needs: a smaller or shorter clip, or a card with more memory")
+        }
         Model::Wgpu(m, _, sound) if r.audio && !m.room_for_step(f * h * w + if r.end_image.is_some() { h * w } else { 0 }) => {
             m.drop_audio();
             *sound = None;
@@ -1027,10 +1032,14 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
                     let clean = (if starting_latent.is_some() { h * w } else { 0 }, if ending_latent.is_some() { h * w } else { 0 });
                     let host = |t: &Tensor| t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>();
                     match (&audio_bf16, &audio_context, sound.as_ref()) {
-                        // a clip with sound: the two streams together, the audio at the video's sigma
-                        (Some(audio), Some(audio_context), Some((sound_table, video_cross))) => {
+                        // a clip with sound: the two streams together, the audio at the video's sigma; a soundtrack
+                        // held as it was given at sigma 0 (one mixed with noise each step at the step's). The pass
+                        // without the streams' attention to each other (what guidance by a soundtrack is set against:
+                        // only its picture is used) is the arm below: the picture's stream alone is that pass.
+                        (Some(audio), Some(audio_context), Some((sound_table, video_cross))) if !isolated => {
                             let (a, c) = (host(audio)?, host(audio_context)?);
-                            let pass = crate::ltx_wgpu::AudioPass { latent: &a, tokens: a.len() / 128, context: &c, rows: c.len() / 2048, sigma, table: sound_table, video_cross, skip_self: None };
+                            let sound_sigma = if frozen_audio && inpaint_noise.is_none() { 0. } else { sigma };
+                            let pass = crate::ltx_wgpu::AudioPass { latent: &a, tokens: a.len() / 128, context: &c, rows: c.len() / 2048, sigma: sound_sigma, table: sound_table, video_cross, skip_self: None };
                             let (v, s) = m.forward_av(latent, tokens, &values, values.len() / 4096, sigma, table, clean, h * w, perturb, &pass)?;
                             report(event("video_denoising", (step * passes + at + 1) * 48, steps * passes * 48));
                             Ok((Tensor::from_vec(v, (1, tokens, 128), &dev)?, Some(Tensor::from_vec(s, (1, pass.tokens, 128), &dev)?)))
@@ -1820,7 +1829,7 @@ mod tests {
     }
     #[test]
     #[cfg(feature = "webgpu")]
-    fn a_webgpu_clip_has_its_own_sound_and_refuses_a_given_one() {
+    fn a_webgpu_clip_has_its_own_sound_or_follows_a_given_one() {
         let request = |extra: &str| {
             let j = Json::parse(format!(r#"{{"model":"ltx-2.3","transformer":"t","text_encoder":"e","tokenizer":"k","vae":"t","audio_vae":"t","output_dir":"o","prompt":"p","backend":"webgpu"{extra}}}"#).as_bytes()).unwrap();
             Request::parse(&j)
@@ -1831,8 +1840,9 @@ mod tests {
         assert!(request(r#","guidance":{"steps":30}"#).unwrap().guidance.is_some(), "guided sampling, its negative prompt by CFG");
         assert!(request(r#","negative_prompt":"n""#).unwrap().negative_prompt.is_some(), "a negative prompt without CFG: by NAG");
         assert!(request(r#","lora":"l""#).unwrap().lora.is_some(), "a LoRA: the weights it adapts loaded with it");
+        let spoken = request(r#","speech":{"text":"hello"}"#).unwrap();
+        assert!(spoken.speech.is_some() && spoken.audio && spoken.frames_from_audio, "speech made first and followed, the clip as long as it");
         for (extra, what) in [
-            (r#","speech":{"text":"hello"}"#, "soundtrack or speech"),
             (r#","identity":true"#, "reference voice"),
             (r#","refine":{"transformer":"t","upsampler":"u"}"#, "refinement"),
         ] {
