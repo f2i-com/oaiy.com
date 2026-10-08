@@ -515,3 +515,29 @@ fn a_shared_experts_fused_kernels_are_their_two_ops() {
         }
     }
 }
+
+/// A large write, which goes a piece at a time ([`Gpu::write`]), leaves the bytes it was given, and so does one made
+/// in place ([`Gpu::write_with`]): 72 MB (two pieces and a part of one) at an offset, read back whole, each way.
+#[test]
+fn a_large_write_is_its_bytes() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    let (len, offset) = (72usize << 20, 4096usize);
+    for way in 0..2u32 {
+        let words: Vec<u32> = (0..len as u32 / 4).map(|i| (i ^ way).wrapping_mul(2654435761).rotate_left(11)).collect();
+        let data: Vec<u8> = words.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let v = DeviceChain::vec(&b, (len + 2 * offset) / 4);
+        DeviceChain::upload(&b, &v, &vec![0f32; (len + 2 * offset) / 4]);
+        if way == 0 {
+            b.gpu.write(buffer(&v), offset as u64, &data);
+        } else if !b.gpu.write_with(buffer(&v), offset as u64, len, &|at, part| part.copy_from_slice(&data[at..at + part.len()])) {
+            eprintln!("no staging memory to make a write in on this adapter");
+            return;
+        }
+        let mut rec = Recorder::new(&b);
+        rec.read_range(&v, 0, (len + 2 * offset) / 4);
+        let got = Box::new(rec).finish().pop().expect("the words");
+        let (edge, held) = (offset / 4, len / 4);
+        assert!(got[..edge].iter().chain(&got[edge + held..]).all(|g| g.to_bits() == 0), "way {way}: nothing written past the bytes");
+        assert!(got[edge..edge + held].iter().zip(&words).all(|(g, w)| g.to_bits() == *w), "way {way}: the vector holds the bytes");
+    }
+}

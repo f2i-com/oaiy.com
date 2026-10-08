@@ -392,6 +392,17 @@ impl Store {
     /// `key`'s bytes where it is stored as BF16 and read as it is (no LoRA, scale or rotation on it): for a device that
     /// converts them itself, on every core.
     #[cfg(feature = "webgpu")]
+    /// Where a BF16 tensor's bytes lie (its file, their start in it, how many), where [`Self::bf16_bytes`] would
+    /// give them as they are: for a reader that puts them where they are wanted itself.
+    pub fn bf16_span(&mut self, key: &str) -> Result<Option<(std::path::PathBuf, u64, usize)>> {
+        let info = self.index.info(key).map_err(candle_core::Error::wrap)?.clone();
+        if info.dtype != Dtype::BF16 || self.lora.contains_key(key) || self.scale(key)?.is_some() || self.rotation(key)?.is_some() {
+            return Ok(None);
+        }
+        self.disk_bytes += info.nbytes;
+        Ok(Some((self.index.shard_path(info.shard).to_path_buf(), info.start, info.nbytes as usize)))
+    }
+
     pub fn bf16_bytes(&mut self, key: &str) -> Result<Option<Vec<u8>>> {
         let info = self.index.info(key).map_err(candle_core::Error::wrap)?.clone();
         if info.dtype != Dtype::BF16 || self.lora.contains_key(key) || self.scale(key)?.is_some() || self.rotation(key)?.is_some() {

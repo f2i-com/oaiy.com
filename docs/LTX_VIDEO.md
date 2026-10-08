@@ -58,6 +58,20 @@ The server and inference core remain std-only and forbid unsafe Rust.
 > widen them by a shift (`matmul_bf16_rows_f32`). A prompt's context in 10.7 s, the
 > layers 6.0 s: 0.12 s a layer, which is its 460 MB written to the card at 3.8 GB a
 > second beside the next layer's read.
+>
+> That 3.8 GB a second was not the card's: a write passes through staging memory,
+> a layer's 460 MB written whole took new staging every time, and new memory comes
+> zeroed from the system at about that rate. A large write now goes 32 MB at a
+> time, each piece waited for, so every piece's staging is the same block again
+> (19 GB a second; `measure_an_uploads_ways` in `ggml-rs-wgpu`), and the layers'
+> matrices are read from the file straight into that staging, with no copy of them
+> in the host's memory between. The projection's 770 million weights are widened
+> on the cores that permute them, where one core made them f32 first. A prompt's
+> context in 5.6 s where the same sitting's 12.6 before (a busier machine than the
+> 10.7 above was measured on): the layers 2.5 s, the connector 1.2, the tokenizer
+> 0.8, the projection 0.5; the same context to the bit. `OAIY_LTX_TEXT_COPY` reads
+> the matrices into the host's memory first and `OAIY_WHOLE_WRITES` writes them
+> whole, as before.
 
 Sulphur-2 and LTX 2.5 have been validated end to end locally in both text-to-video
 and image-to-video modes. The original LTX 2.3 checkpoint is still downloading;

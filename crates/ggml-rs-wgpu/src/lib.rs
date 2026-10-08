@@ -110,6 +110,16 @@ const GIB: u64 = 1 << 30;
 /// The scratch a GPU's pool keeps between chains' runs: a prompt's layer's (Qwen3.8-Flash-Next's at 512 rows about
 /// 0.6 GiB), within the 4 GiB a card's budget leaves.
 const POOL_BYTES: u64 = 3 * GIB / 2;
+/// The scratch made new for chains' recordings (none of its size in its device's pool), in bytes, since the process
+/// began: memory the system hands over zeroed, at some 3 GB a second on a card of its own, so a prompt whose scratch
+/// is new is the slower by that.
+static SCRATCH_MADE: AtomicU64 = AtomicU64::new(0);
+
+/// The bytes of scratch made new since the process began, all devices' (a request's line says its own).
+pub fn scratch_made() -> u64 {
+    SCRATCH_MADE.load(Ordering::Relaxed)
+}
+
 /// The read-backs' staging a GPU keeps between chains' runs: two of a prompt's chunks' (some 70 MB each).
 const STAGING_BYTES: u64 = GIB / 4;
 
@@ -324,6 +334,39 @@ fn write_bytes(queue: &wgpu::Queue, buffer: &wgpu::Buffer, offset: u64, data: &[
             s.spawn(move || unsafe { std::ptr::copy_nonoverlapping(part.as_ptr(), at as *mut u8, part.len()) });
         }
     });
+}
+
+/// `len` bytes (a multiple of 4) of `buffer` from `offset`, made in place by `fill` on every core: `fill(at, part)` puts
+/// the bytes from `at` on into `part`, a part of the write's staging memory, a thread a part. A file read there
+/// straight is copied once, where bytes read into the host's memory first are copied again by [`write_bytes`]. False
+/// (nothing written) where the queue gives no such memory.
+fn write_with(queue: &wgpu::Queue, buffer: &wgpu::Buffer, offset: u64, len: usize, fill: &(dyn Fn(usize, &mut [u8]) + Sync)) -> bool {
+    let Some(size) = wgpu::BufferSize::new(len as u64) else { return false };
+    let Some(mut view) = queue.write_buffer_with(buffer, offset, size) else { return false };
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
+    let each = len.div_ceil(threads).div_ceil(4096) * 4096;
+    let mut whole = view.slice(..);
+    let base = whole.as_raw_ptr().cast::<u8>().as_ptr() as usize;
+    std::thread::scope(|s| {
+        for at in (0..len).step_by(each) {
+            let n = each.min(len - at);
+            // SAFETY: each thread is given its own bytes of the staging memory, mapped for writing until the view
+            // (which outlives this scope) is dropped; nothing else reads or writes them
+            s.spawn(move || fill(at, unsafe { std::slice::from_raw_parts_mut((base + at) as *mut u8, n) }));
+        }
+    });
+    true
+}
+
+/// The bytes from which a write goes a piece at a time ([`Gpu::write`]), and a piece's.
+const WRITE_BY_PIECES: usize = 64 << 20;
+const WRITE_PIECE: usize = 32 << 20;
+
+/// OAIY_WHOLE_WRITES: a large write whole and weights in turn flushed every 256 MB, as they were before a write went
+/// by pieces (a measurement's other side).
+fn whole_writes() -> bool {
+    static ASKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ASKED.get_or_init(|| std::env::var_os("OAIY_WHOLE_WRITES").is_some())
 }
 
 /// A device's pieces waiting for its queue, where its pieces in flight are limited
@@ -815,7 +858,11 @@ impl Gpu {
     /// `data` (a multiple of 4 bytes) into `buffer` at `offset` ([`write_bytes`]): at once, or, behind pieces still
     /// waiting for the queue, in its turn after them by the feed (a copy of the bytes), the caller going on (a
     /// prompt's next chunk is recorded as the one before runs: its embeddings' upload waiting for the queue kept the
-    /// recording to the GPU's last pieces).
+    /// recording to the GPU's last pieces). A large write ([`WRITE_BY_PIECES`]) goes a piece at a time, each waited
+    /// for: a write's staging memory is let go when its submission has run, so each piece's is the allocator's same
+    /// block again, where a whole write's (or pieces' not waited for) was new memory, first touched as it was
+    /// written: 1 GiB in 53 ms where 280 to 360 (`measure_an_uploads_ways`), and no more of the card held than a
+    /// piece (a model's weights whole held 31 GB of a 32 GB card for Qwen Image's 14).
     pub(crate) fn write(&self, buffer: &wgpu::Buffer, offset: u64, data: &[u8]) {
         let holds = {
             let s = self.feed.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -823,8 +870,56 @@ impl Gpu {
         };
         if holds {
             self.hand(Fare::Write(buffer.clone(), offset, data.to_vec()));
-        } else {
+        } else if data.len() < WRITE_BY_PIECES || whole_writes() {
             write_bytes(self.queue(), buffer, offset, data);
+        } else {
+            for (i, piece) in data.chunks(WRITE_PIECE).enumerate() {
+                write_bytes(self.queue(), buffer, offset + (i * WRITE_PIECE) as u64, piece);
+                self.queue().submit([]);
+                self.wait(None);
+            }
+        }
+    }
+
+    /// [`write_with`]: `len` bytes of `buffer` from `offset` made in place by `fill`, a large one a piece at a time as
+    /// [`Self::write`]'s. False where a piece still waits for the queue (nothing written: such a write goes in its
+    /// turn, by its bytes), or the queue gives no staging memory (the caller writes the bytes, all of them).
+    pub(crate) fn write_with(&self, buffer: &wgpu::Buffer, offset: u64, len: usize, fill: &(dyn Fn(usize, &mut [u8]) + Sync)) -> bool {
+        let holds = {
+            let s = self.feed.state.lock().unwrap_or_else(|p| p.into_inner());
+            s.gone < s.handed && s.failed.is_none()
+        };
+        if holds {
+            return false;
+        }
+        let pieces = len >= WRITE_BY_PIECES && !whole_writes();
+        let piece = if pieces { WRITE_PIECE } else { len };
+        for at in (0..len).step_by(piece.max(1)) {
+            let n = piece.min(len - at);
+            if !write_with(self.queue(), buffer, offset + at as u64, n, &|from, part| fill(at + from, part)) {
+                return false;
+            }
+            if pieces {
+                self.queue().submit([]);
+                self.wait(None);
+            }
+        }
+        true
+    }
+
+    /// `bytes` more written since the queue was last flushed: flushed and waited for at a piece's worth
+    /// ([`WRITE_PIECE`]), as a large write is by itself ([`Self::write`]): weights uploaded in turn and never waited
+    /// for each took new staging memory, and all of it was held until the next submission (loading a 16 GB model
+    /// exhausted it).
+    fn staged_more(&self, bytes: u64) {
+        if bytes >= WRITE_BY_PIECES as u64 && !whole_writes() {
+            return self.staged.store(0, Ordering::Relaxed);
+        }
+        let pending = self.staged.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        if pending >= if whole_writes() { 256 << 20 } else { WRITE_PIECE as u64 } {
+            self.staged.store(0, Ordering::Relaxed);
+            self.queue().submit([]);
+            self.wait(None);
         }
     }
 
@@ -845,17 +940,8 @@ impl Gpu {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        // (a piece at a time, the writes' staging let go as `upload_rows` lets its own)
-        const PIECE: usize = 64 << 20;
-        for (i, piece) in bytes.chunks(PIECE).enumerate() {
-            self.write(&buffer, (i * PIECE) as u64, piece);
-            let pending = self.staged.fetch_add(piece.len() as u64, Ordering::Relaxed) + piece.len() as u64;
-            if pending >= 256 << 20 {
-                self.staged.store(0, Ordering::Relaxed);
-                self.queue().submit([]);
-                self.wait(None);
-            }
-        }
+        self.write(&buffer, 0, bytes);
+        self.staged_more(bytes.len() as u64);
         Some(buffer)
     }
 
@@ -884,15 +970,7 @@ impl Gpu {
             }
             chunks.push((buffer, r as u32, n as u32));
             r += n;
-            // `write_buffer` stages through host-visible memory that is only
-            // recycled after a submission completes: flush as uploads pile up,
-            // or loading a 16 GB model exhausts the staging pool.
-            let pending = self.staged.fetch_add(size, Ordering::Relaxed) + size;
-            if pending >= 256 << 20 {
-                self.staged.store(0, Ordering::Relaxed);
-                self.queue().submit([]);
-                self.wait(None);
-            }
+            self.staged_more(size);
         }
         chunks
     }
@@ -985,6 +1063,7 @@ impl Gpu {
             pool.iter().position(|(b, _)| *b == bytes).map(|i| pool.swap_remove(i).1)
         };
         taken.unwrap_or_else(|| {
+            SCRATCH_MADE.fetch_add(bytes, Ordering::Relaxed);
             self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("oaiy-chain-scratch"),
                 size: bytes,

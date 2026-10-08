@@ -727,6 +727,8 @@ impl QwenEngine {
         let _ = job.events.send(Event::Progress { done: 0, total });
         #[cfg(feature = "webgpu")]
         let cold_at_start = ggml_rs_wgpu::quant_moe::cached_experts();
+        #[cfg(feature = "webgpu")]
+        let scratch_at_start = ggml_rs_wgpu::scratch_made();
         let clock = std::time::Instant::now();
         let mut soft = Vec::new();
         for image in &job.images {
@@ -848,6 +850,8 @@ impl QwenEngine {
         // the request's line)
         #[cfg(feature = "webgpu")]
         let (cold_before, cold_prompt) = (cold_at_start, ggml_rs_wgpu::quant_moe::cached_experts());
+        #[cfg(feature = "webgpu")]
+        let scratch_prompt = ggml_rs_wgpu::scratch_made();
         let mut logits = Row::Logits(logits.unwrap());
         // (a greedy request's rows: the token alone where the model picks it on its GPU, megabytes of logits a check
         // not read back)
@@ -981,6 +985,11 @@ impl QwenEngine {
             let now = ggml_rs_wgpu::quant_moe::cached_experts();
             if now.0 > cold_before.0 {
                 eprintln!("  Qwen experts: the prompt read {} from the host's memory and brought {} to the card, the reply {} and {}", cold_prompt.0 - cold_before.0, cold_prompt.1 - cold_before.1, now.0 - cold_prompt.0, now.1 - cold_prompt.1);
+            }
+            // (scratch its recordings found none of in the pool: new memory, which the system zeroes as it gives it)
+            let made = ggml_rs_wgpu::scratch_made();
+            if made > scratch_at_start {
+                eprintln!("  Qwen scratch: {} MiB made new for the prompt, {} for the reply", (scratch_prompt - scratch_at_start) >> 20, (made - scratch_prompt) >> 20);
             }
         }
         if !text.is_empty() { let _ = job.events.send(Event::Text(text)); }

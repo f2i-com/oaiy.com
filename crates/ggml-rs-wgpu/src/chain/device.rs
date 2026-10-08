@@ -19,6 +19,16 @@ impl WgpuBackend {
         Some(DeviceVec { len: bytes.len() / 4, inner: Arc::new(b) })
     }
 
+    /// A vector of `bytes` bytes (a multiple of 4) filled in place by `fill`, which is given each part of them (where
+    /// it starts, and the part) on a thread of its own: a file's bytes read straight into the write's staging memory,
+    /// with no copy of them in a vector of the host's between ([`Gpu::write_with`]). None where the device cannot
+    /// just now (the caller reads them and takes [`Self::vec_of_bytes`]).
+    pub fn vec_filled(&self, bytes: usize, fill: &(dyn Fn(usize, &mut [u8]) + Sync)) -> Option<DeviceVec> {
+        assert!(bytes % 4 == 0 && bytes > 0, "chain: a vector of {bytes} bytes");
+        let v = DeviceChain::vec(self, bytes / 4);
+        self.gpu.write_with(buffer(&v), 0, bytes, fill).then_some(v)
+    }
+
     /// `bytes` written into `v` from its start, as they are (a multiple of 4 of them, no more than `v` holds): a
     /// vector's weights replaced by the next of the same shape, once what read them has run.
     pub fn fill_bytes(&self, v: &DeviceVec, bytes: &[u8]) {

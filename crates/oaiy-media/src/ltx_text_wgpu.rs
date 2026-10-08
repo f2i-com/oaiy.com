@@ -50,18 +50,57 @@ struct MatHost {
 enum HostWeights {
     Bf16(Vec<u8>),
     F16(Vec<f32>),
+    /// BF16 matrices still in their file: each one's file, its bytes' start there and how many, one after another.
+    Spans(Vec<(std::path::PathBuf, u64, usize)>),
+}
+
+/// The bytes from `at` on of `spans`' (one after another), `part.len()` of them, read into `part`.
+fn read_spans(spans: &[(std::path::PathBuf, u64, usize)], at: usize, part: &mut [u8]) -> std::io::Result<()> {
+    let (mut begin, end) = (0usize, at + part.len());
+    for (path, start, len) in spans {
+        let (a, b) = (at.max(begin), end.min(begin + len));
+        if a < b {
+            dsv41::io::read_exact_at(&std::fs::File::open(path)?, &mut part[a - at..b - at], start + (a - begin) as u64)?;
+        }
+        begin += len;
+    }
+    Ok(())
 }
 
 impl MatHost {
-    fn up(self, gpu: &ggml_rs_wgpu::WgpuBackend) -> Mat {
-        match self.weights {
+    fn up(self, gpu: &ggml_rs_wgpu::WgpuBackend) -> Result<Mat> {
+        Ok(match self.weights {
             HostWeights::Bf16(bytes) => Mat { v: gpu.vec_of_bytes(&bytes), n: self.n, k: self.k, bf16: true },
             HostWeights::F16(words) => {
                 let v = gpu.vec(words.len());
                 gpu.upload(&v, &words);
                 Mat { v, n: self.n, k: self.k, bf16: false }
             }
-        }
+            // the file's bytes read straight into the write's staging memory, each thread its own part of them: read
+            // into the host's memory first they were copied twice, the second copy beside the next layer's first
+            HostWeights::Spans(spans) => {
+                let total: usize = spans.iter().map(|s| s.2).sum();
+                let failed = std::sync::Mutex::new(None::<String>);
+                let fill = |at: usize, part: &mut [u8]| {
+                    if let Err(e) = read_spans(&spans, at, part) {
+                        *failed.lock().unwrap_or_else(|p| p.into_inner()) = Some(e.to_string());
+                    }
+                };
+                let filled = gpu.vec_filled(total, &fill);
+                if let Some(e) = failed.into_inner().unwrap_or_else(|p| p.into_inner()) {
+                    return Err(err(e));
+                }
+                let v = match filled {
+                    Some(v) => v,
+                    None => {
+                        let mut bytes = vec![0u8; total];
+                        read_spans(&spans, 0, &mut bytes).map_err(err)?;
+                        gpu.vec_of_bytes(&bytes)
+                    }
+                };
+                Mat { v, n: self.n, k: self.k, bf16: true }
+            }
+        })
     }
 }
 
@@ -78,12 +117,22 @@ fn mat_host(store: &mut Store, names: &[String]) -> Result<MatHost> {
         k = cols;
         n += rows;
     }
-    // BF16 (an even width, so a row is whole words): the file's bytes, one matrix's after another
+    // BF16 (an even width, so a row is whole words): the file's bytes, one matrix's after another; where they lie
+    // in it, for the upload to read them there (OAIY_LTX_TEXT_COPY: read here, into the host's memory, as before)
+    let direct = std::env::var_os("OAIY_LTX_TEXT_COPY").is_none();
     let mut bytes: Vec<u8> = Vec::new();
+    let mut spans = Vec::new();
     let mut all = k % 2 == 0 && std::env::var_os("OAIY_LTX_TEXT_F16").is_none();
     for name in names {
         if !all {
             break;
+        }
+        if direct {
+            match store.bf16_span(name)? {
+                Some(span) => spans.push(span),
+                None => all = false,
+            }
+            continue;
         }
         match store.bf16_bytes(name)? {
             Some(part) if bytes.is_empty() => bytes = part,
@@ -92,7 +141,7 @@ fn mat_host(store: &mut Store, names: &[String]) -> Result<MatHost> {
         }
     }
     if all {
-        return Ok(MatHost { weights: HostWeights::Bf16(bytes), n, k });
+        return Ok(MatHost { weights: if direct { HostWeights::Spans(spans) } else { HostWeights::Bf16(bytes) }, n, k });
     }
     let mut words: Vec<f32> = Vec::new();
     for name in names {
@@ -208,7 +257,7 @@ fn layer_host(store: &mut Store, prefix: &str, i: usize, gemma4: bool) -> Result
 /// Layer `i`'s weights put on `gpu` (`gemma4` LTX 2.5's Gemma 4).
 fn layer_up(gpu: &ggml_rs_wgpu::WgpuBackend, h: LayerHost, i: usize, gemma4: bool) -> Result<Layer> {
     let hd = h.qn.len();
-    let (q, k) = (h.q.up(gpu), h.k.up(gpu));
+    let (q, k) = (h.q.up(gpu)?, h.k.up(gpu)?);
     let l = Layer {
         input: vector_up(gpu, &h.input),
         post_attn: vector_up(gpu, &h.post_attn),
@@ -216,10 +265,10 @@ fn layer_up(gpu: &ggml_rs_wgpu::WgpuBackend, h: LayerHost, i: usize, gemma4: boo
         post_ff: vector_up(gpu, &h.post_ff),
         kn: vector_up(gpu, &h.kn),
         qn: vector_up(gpu, &h.qn),
-        v: h.v.map(|v| v.up(gpu)),
-        o: h.o.up(gpu),
-        gate_up: h.gate_up.up(gpu),
-        down: h.down.up(gpu),
+        v: h.v.map(|v| v.up(gpu)).transpose()?,
+        o: h.o.up(gpu)?,
+        gate_up: h.gate_up.up(gpu)?,
+        down: h.down.up(gpu)?,
         kv: k.n / hd.max(1),
         hd,
         q,
@@ -542,10 +591,13 @@ fn projection(store: &mut Store, gpu: &ggml_rs_wgpu::WgpuBackend, name: &str, sc
     if k != G * states {
         candle_core::bail!("{name}: {k} inputs, not {}", G * states);
     }
-    let w = match store.bf16_bytes(&key)? {
-        Some(bytes) => bytes.chunks_exact(2).map(|b| f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16)).collect(),
-        None => store.tensor_f32(&key, &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?,
+    // (BF16 as its file holds it, widened where it is permuted: 770 million values made f32 on one core first took
+    // half of the projection's time)
+    let (halves, wide) = match store.bf16_bytes(&key)? {
+        Some(bytes) => (bytes, Vec::new()),
+        None => (Vec::new(), store.tensor_f32(&key, &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?),
     };
+    let at = |i: usize| if wide.is_empty() { f32::from_bits((u16::from_le_bytes([halves[2 * i], halves[2 * i + 1]]) as u32) << 16) } else { wide[i] };
     // each row's (state, channel) word pairs, rounded to f16 on every core
     let mut words = vec![0f32; n * k / 2];
     let ok = std::sync::atomic::AtomicBool::new(true);
@@ -555,14 +607,14 @@ fn projection(store: &mut Store, gpu: &ggml_rs_wgpu::WgpuBackend, name: &str, sc
         let mut rows = rows.into_iter();
         for _ in 0..threads {
             let mine: Vec<(usize, &mut [f32])> = rows.by_ref().take(n.div_ceil(threads)).collect();
-            let (w, ok) = (&w, &ok);
+            let (at, ok) = (&at, &ok);
             s.spawn(move || {
                 for (o, dst) in mine {
-                    let src = &w[o * k..(o + 1) * k];
+                    let row = o * k;
                     let mut fine = true;
                     for (j, word) in dst.iter_mut().enumerate() {
                         let (i, c) = ((2 * j) / G, (2 * j) % G);
-                        let (lo, hi) = (src[c * states + i] * scale, src[(c + 1) * states + i] * scale);
+                        let (lo, hi) = (at(row + c * states + i) * scale, at(row + (c + 1) * states + i) * scale);
                         fine &= lo.abs() <= 65504.0 && hi.abs() <= 65504.0;
                         *word = f32::from_bits(half::f16::from_f32(lo).to_bits() as u32 | (half::f16::from_f32(hi).to_bits() as u32) << 16);
                     }

@@ -57,6 +57,16 @@ GPU").
   fails with the list of adapters wgpu found.
 - **Large tensors** are split by rows below the adapter's binding limit (a
   152k-vocabulary Q6_K output head is about 640 MB).
+- **Uploads** go 32 MB at a time, each piece waited for. A write passes through
+  staging memory that is let go only when its submission has run; a large write's
+  staging, or several pieces' not waited for, is memory the allocator has not had
+  before, and the system hands that over zeroed: 1 GiB written whole took 410 ms
+  and by pieces of 64 MB flushed every fourth (as weights were) 250, where pieces
+  each waited for take 57 (19 GB a second on an RTX 5090; `measure_an_uploads_ways`).
+  Qwen3.8 27B's 13.4 GB load in 6.0 s where 10. `OAIY_WHOLE_WRITES` is the way
+  before. A loader may also make a write's bytes in its staging in place
+  (`WgpuBackend::vec_filled`: a file read there, with no copy in the host's memory
+  between).
 
 The CPU path got faster in the same change. `CpuBackend::linear_q` used to
 inflate each whole weight matrix to F32 on every call; it now dequantizes one

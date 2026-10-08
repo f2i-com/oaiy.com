@@ -1180,6 +1180,64 @@ fn measure_the_cards_room() {
     eprintln!("{}: the system's budget for this process {:?} GiB (and its use of it), the weights' budget {:.2} GiB ({:.2} used)", b.adapter().name, b.memory_budget().map(|(budget, used)| (gib(budget), gib(used))), gib(weights), gib(used));
 }
 
+/// What an upload costs by its way (`--ignored --nocapture`): bytes of the host's written through a write's staging
+/// memory on every core ([`crate::write_bytes`]) whole, by pieces of 64 MB waited for every fourth (as weights were
+/// uploaded), and by pieces of 64, 32 and 16 MB each waited for; then as [`Gpu::write`] writes them and as
+/// [`Gpu::write_with`] makes them in that staging in place. 64 MB to 1 GiB, each way three times (the best), the
+/// upload waited for; and what each left there read back at its start, its end and its middle.
+#[test]
+#[ignore = "a measurement"]
+fn measure_an_uploads_ways() {
+    let Ok(b) = WgpuBackend::new(Some(4 << 30)) else { return };
+    for bytes in [64usize << 20, 128 << 20, 256 << 20, 512 << 20, 1 << 30] {
+        let words: Vec<u32> = (0..bytes as u32 / 4).map(|i| i.wrapping_mul(2654435761).rotate_left(13) ^ 0x5bd1e995).collect();
+        let data: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let fill = |at: usize, part: &mut [u8]| part.copy_from_slice(&data[at..at + part.len()]);
+        eprintln!("{} MB:", bytes >> 20);
+        // (a write's pieces: their size, and how many between waits)
+        let ways: [(&str, usize, usize); 7] = [
+            ("one write", bytes, 1),
+            ("pieces of 64 MB, a wait every fourth", 64 << 20, 4),
+            ("pieces of 64 MB, each waited for", 64 << 20, 1),
+            ("pieces of 32 MB, each waited for", 32 << 20, 1),
+            ("pieces of 16 MB, each waited for", 16 << 20, 1),
+            ("as the backend writes", 0, 0),
+            ("as the backend makes them in place", 0, 0),
+        ];
+        for (way, &(what, piece, every)) in ways.iter().enumerate() {
+            let v = DeviceChain::vec(&b, bytes / 4);
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let t = std::time::Instant::now();
+                match way {
+                    0..=4 => {
+                        for (i, part) in data.chunks(piece).enumerate() {
+                            crate::write_bytes(b.gpu.queue(), buffer(&v), (i * piece) as u64, part);
+                            if (i + 1) % every == 0 {
+                                b.gpu.queue().submit([]);
+                                b.gpu.wait(None);
+                            }
+                        }
+                    }
+                    5 => b.gpu.write(buffer(&v), 0, &data),
+                    _ => assert!(b.gpu.write_with(buffer(&v), 0, bytes, &fill), "a write's staging memory"),
+                }
+                b.gpu.queue().submit([]);
+                b.gpu.wait(None);
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            let n = bytes / 4;
+            for (from, len) in [(0usize, 1usize << 18), (n - (1 << 18), 1 << 18), ((n / 2).saturating_sub(1 << 17), 1 << 18)] {
+                let mut rec = Recorder::new(&b);
+                rec.read_range(&v, from, len);
+                let got = Box::new(rec).finish().pop().expect("the words");
+                assert!(got.iter().zip(&words[from..from + len]).all(|(g, w)| g.to_bits() == *w), "{what}: the words from {from}");
+            }
+            eprintln!("  {} MB {what}: {:.0} ms ({:.1} GB/s)", bytes >> 20, best * 1e3, bytes as f64 / best / 1e9);
+        }
+    }
+}
+
 /// What a kernel pays for a matrix it reads from the HOST's memory over the bus ([`WgpuBackend::host_vec_of_bytes`])
 /// against one in the card's own (`--ignored --nocapture`): BF16 matrices of an expert's size (1.6 MB), a shared
 /// expert's (6.5 MB) and a delta net's gate's (31 MB), one row, each dispatch another copy (256 MB of them in turn),
