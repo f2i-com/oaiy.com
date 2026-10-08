@@ -133,7 +133,7 @@ impl ChainRecorder for Recorder<'_> {
 
     fn send(mut self: Box<Self>) {
         // (reads, or a profile's or the pieces' times to resolve: finished as any recording is)
-        if !self.reads.is_empty() || crate::profile::chain_on() || crate::profile::pieces_on() {
+        if !self.reads.is_empty() || !self.settles.is_empty() || crate::profile::chain_on() || crate::profile::pieces_on() {
             let _ = self.finish();
             return;
         }
@@ -1117,7 +1117,7 @@ impl ChainRecorder for Recorder<'_> {
             staging.unmap();
             v
         };
-        let out = if self.reads.iter().map(|r| r.3 * 4).sum::<usize>() >= 8 << 20 && self.reads.len() > 1 {
+        let mut out: Vec<Vec<f32>> = if self.reads.iter().map(|r| r.3 * 4).sum::<usize>() >= 8 << 20 && self.reads.len() > 1 {
             use rayon::prelude::*;
             self.reads.par_iter().map(|(_, _, staging, len)| copied(staging, *len)).collect()
         } else {
@@ -1125,6 +1125,13 @@ impl ChainRecorder for Recorder<'_> {
         };
         let staged: Vec<(u64, wgpu::Buffer)> = std::mem::take(&mut self.reads).into_iter().map(|(_, _, staging, _)| (staging.size(), staging)).collect();
         self.gpu().unstage(staged);
+        // (the layers' experts' use, read for what a card holds of them: not the caller's reads; the last first, each
+        // from its place)
+        let mut settles = std::mem::take(&mut self.settles);
+        settles.sort_by_key(|(_, at)| std::cmp::Reverse(*at));
+        for (cache, at) in settles {
+            cache.settle(&out.remove(at));
+        }
         crate::profile::add(&crate::profile::LINEAR_WAIT, start);
         out
     }

@@ -139,6 +139,13 @@ pub(crate) fn dense_bytes(path: &Path) -> Result<u64> {
     Ok(g.tensors().iter().filter(|t| !(t.name.contains("_exps.") || t.name == "token_embd.weight" || t.name == "per_layer_token_embd.weight")).map(|t| t.nbytes()).sum())
 }
 
+/// The bytes of a GGUF's routed experts (every layer's gate, up and down tensors), and how many layers have them.
+pub(crate) fn experts_layout(path: &Path) -> Result<(u64, usize)> {
+    let g = GgufFile::open_streaming(path).map_err(|e| bad(e.to_string()))?;
+    let bytes = g.tensors().iter().filter(|t| t.name.contains("_exps.")).map(|t| t.nbytes()).sum();
+    Ok((bytes, g.tensors().iter().filter(|t| t.name.ends_with(".ffn_gate_exps.weight")).count()))
+}
+
 /// One MoE layer's experts as a GGUF holds them: the routed ones' gate and up (`[experts][ff][hidden]`) and down
 /// (`[experts][hidden][ff]`) each its type and its blocks' bytes, row after row; the shared expert's three matrices
 /// dequantized (gate and up `[ff, hidden]`, down `[hidden, ff]`).

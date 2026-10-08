@@ -875,7 +875,7 @@ fn measure_q8_matmuls() {
     for m in [1usize, 2, 3, 4] {
         let (x, y, y8) = (b.vec(m * k), b.vec(m * n), b.vec(m * n));
         DeviceChain::upload(&b, &x, &(0..m * k).map(|_| next()).collect::<Vec<_>>());
-        let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), low_rank: [None, None, None], q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0, alike: false };
+        let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), low_rank: [None, None, None], q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0, alike: false, settles: Vec::new(), moe_stage: None };
         assert!(rq.matmul_rows_q8(w, &x, &y8, m));
         rq.read(&y8);
         let got = Box::new(rq).finish().pop().unwrap();
@@ -891,7 +891,7 @@ fn measure_q8_matmuls() {
         let reps = 28;
         let time = |q8: bool| {
             let run = || {
-                let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), low_rank: [None, None, None], q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0, alike: false };
+                let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), low_rank: [None, None, None], q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0, alike: false, settles: Vec::new(), moe_stage: None };
                 for i in 0..reps {
                     let w = &ws[i % ws.len()];
                     if q8 {
@@ -1037,7 +1037,7 @@ fn measure_decode_rows_a_lane() {
             let pipeline = b.gpu.named_pipeline(Box::leak(format!("test-rb-{dtype:?}-{r}-{ks}").into_boxed_str()), || src);
             let reps = 32;
             let run = || {
-                let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), low_rank: [None, None, None], q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0, alike: false };
+                let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), low_rank: [None, None, None], q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0, alike: false, settles: Vec::new(), moe_stage: None };
                 for i in 0..reps {
                     let q = ws[i % ws.len()].device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).unwrap();
                     for (chunk, row0, rows) in &q.chunks {
@@ -1097,7 +1097,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) n
         let pipeline = b.gpu.named_pipeline(name, || body);
         let groups = 170 * 16;
         let run = || {
-            let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), low_rank: [None, None, None], q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0, alike: false };
+            let mut rq = Recorder { backend: &b, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), low_rank: [None, None, None], q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0, alike: false, settles: Vec::new(), moe_stage: None };
             for _ in 0..8 {
                 rq.dispatch_kept(&pipeline, buffer(&src), buffer(&src), buffer(&out), &[(len / 4) as u32], (groups, 1, 1));
             }
@@ -1165,6 +1165,54 @@ fn measure_the_dispatch_floor() {
             let finish = (0..5).map(|_| run(true)).sum::<f64>() / 5.0;
             eprintln!("{n} dispatches, {what}: {ms:.2} ms a recording ({:.2} us a dispatch); held, its finish {finish:.2} ms ({:.2} us a dispatch); of 5: {line}", ms * 1e3 / n as f64, finish * 1e3 / n as f64);
         }
+    }
+}
+
+/// What a kernel pays for a matrix it reads from the HOST's memory over the bus ([`WgpuBackend::host_vec_of_bytes`])
+/// against one in the card's own (`--ignored --nocapture`): BF16 matrices of an expert's size (1.6 MB), a shared
+/// expert's (6.5 MB) and a delta net's gate's (31 MB), one row, each dispatch another copy (256 MB of them in turn),
+/// 100 dispatches in a held recording whose finish is timed. A card that has no room for all a model's experts could
+/// read the ones it lacks so, with no word from the host between a layer's kernels.
+#[test]
+#[ignore = "a measurement"]
+fn measure_a_matrix_in_the_hosts_memory() {
+    let Ok(b) = WgpuBackend::new(Some(4 << 30)) else { return };
+    let mut r = rng(9);
+    let times = 100usize;
+    for (what, n, k) in [("an expert's size", 320usize, 2560usize), ("a shared expert's", 1280, 2560), ("a delta net's gate", 6144, 2560)] {
+        let bytes: Vec<u8> = (0..n * k).flat_map(|_| (((r() * 0.05).to_bits() >> 16) as u16).to_le_bytes()).collect();
+        let count = ((256usize << 20) / bytes.len()).clamp(8, 200);
+        let Some(first) = b.host_vec_of_bytes(&bytes) else {
+            eprintln!("no mappable storage buffers on this adapter");
+            return;
+        };
+        let host: Vec<DeviceVec> = std::iter::once(first).chain((1..count).map(|_| b.host_vec_of_bytes(&bytes).expect("a host vector"))).collect();
+        let card: Vec<DeviceVec> = (0..count).map(|_| b.vec_of_bytes(&bytes)).collect();
+        let (x, y) = (b.vec(k), b.vec(n));
+        DeviceChain::upload(&b, &x, &(0..k).map(|_| r()).collect::<Vec<_>>());
+        let mut line = format!("{what} [{n}, {k}], {:.1} MB:", bytes.len() as f64 / 1e6);
+        let mut sums = Vec::new();
+        for (place, copies) in [("the card's", &card), ("the host's", &host), ("the card's again", &card), ("the host's again", &host)] {
+            let at = std::cell::Cell::new(0usize);
+            let run = || {
+                let mut rec = Recorder::new(&b);
+                ChainRecorder::hold(&mut rec);
+                for _ in 0..times {
+                    at.set(at.get() + 1);
+                    rec.matmul_bf16_rows_f32(&copies[at.get() % copies.len()], n, k, &x, &y, 1);
+                }
+                rec.read_range(&y, 0, n);
+                let t = std::time::Instant::now();
+                let got = Box::new(rec).finish().pop().expect("the sums");
+                (t.elapsed().as_secs_f64() * 1e6 / times as f64, got)
+            };
+            run();
+            let (us, got) = (0..4).map(|_| run()).fold((f64::MAX, Vec::new()), |a, b| if b.0 < a.0 { b } else { a });
+            line += &format!(" {place} {us:.1} us ({:.1} GB/s)", bytes.len() as f64 / us / 1e3);
+            sums.push(got);
+        }
+        assert_eq!(sums[0], sums[1], "{what}: the host's memory's sums are the card's");
+        eprintln!("{line}");
     }
 }
 

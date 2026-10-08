@@ -1176,12 +1176,13 @@ fn gpu_selection_adapts_to_single_device() {
 /// counters (`ggml_rs_wgpu::profile`).
 /// Qwen3.8-Flash-Next from the GGUF at `path` over `gpus` (the devices `backends` are, in order): each quantized matrix
 /// and each matrix of floats a chain reads packed on its layer's device, a layer's experts there while the device's
-/// budget holds them beside its share of the dense matrices (and the prediction layer, where one is asked for), else
-/// on the host (a chain runs those between the layer's submits: one RTX 5090 holds some 35 of the Q2_0 file's 48
-/// layers' experts).
+/// budget holds them beside its share of the dense matrices (and the prediction layer, where one is asked for). A
+/// device with no room for all its layers' experts holds the same share of each layer's where its kernels read the
+/// host's memory (`quant_experts_cached`: one RTX 5090 holds 313 of each of the IQ2_XS file's layers' 512), else
+/// whole layers' experts are on the host (a chain runs those between the layer's submits).
 #[cfg(feature = "webgpu")]
 pub(crate) fn flashnext_gguf_on(path: &Path, gpus: &[&ggml_rs_wgpu::WgpuBackend], backends: Vec<Arc<dyn ggml_rs::Backend>>, mtp_from: Option<&Path>) -> Result<crate::flashnext::FlashNext> {
-    use crate::flashnext::gguf_file::{dense_bytes, load, ExpertBlocks};
+    use crate::flashnext::gguf_file::{dense_bytes, experts_layout, load, ExpertBlocks};
     let on = |device: usize| gpus.get(device).copied().ok_or_else(|| "no GPU to hold it".to_string());
     let quant = |device: usize, w: ggml_rs::QuantizedTensor| on(device)?.quant_linear(w);
     let float = |device: usize, values: Vec<f32>, n: usize, k: usize| on(device)?.half_linear(values, n, k);
@@ -1193,7 +1194,16 @@ pub(crate) fn flashnext_gguf_on(path: &Path, gpus: &[&ggml_rs_wgpu::WgpuBackend]
     let mtp_bytes: u64 = 5 << 28;
     let room: u64 = gpus.iter().map(|g| g.usage().1.saturating_sub(g.usage().0)).sum();
     let whole = std::fs::metadata(path).map_or(0, |m| m.len());
-    let mtp_from = mtp_from.filter(|_| whole + mtp_bytes + ((gpus.len() as u64) << 30) <= room || std::env::var_os("OAIY_DRAFT_OVER_HOST_LAYERS").is_some());
+    // A card with no room for all its layers' experts holds the same share of each layer's, the ones last used, and
+    // its kernels read the others from the host's memory over the bus (`quant_experts_cached`): no layer's experts
+    // on the host's cores, so no trip to the host between a layer's router and its experts, and it drafts. Where
+    // the cards' kernels read the host's memory and that has room for every routed expert within 80% of what is
+    // free (they are all there, whichever the card holds); OAIY_EXPERT_CACHE=0: as before, whole layers' experts on
+    // the host's cores.
+    let (routed_bytes, layers) = experts_layout(path)?;
+    let ram = ggml_rs_wgpu::host_memory().map_or(0, |(free, _)| free as u64);
+    let part = !gpus.is_empty() && gpus.iter().all(|g| g.host_weights()) && routed_bytes <= ram / 10 * 8 && std::env::var("OAIY_EXPERT_CACHE").map_or(true, |v| v != "0");
+    let mtp_from = mtp_from.filter(|_| part || whole + mtp_bytes + ((gpus.len() as u64) << 30) <= room || std::env::var_os("OAIY_DRAFT_OVER_HOST_LAYERS").is_some());
     let reserve = dense_bytes(path)? / backends.len().max(1) as u64 + (1 << 30) + if mtp_from.is_some() { mtp_bytes } else { 0 };
     // Each device's experts by an allowance of their own: its budget less that reserve, counted as they are placed
     // (the layers load four at a time, each with its dense matrices: the device's own count of its weights already
@@ -1203,13 +1213,32 @@ pub(crate) fn flashnext_gguf_on(path: &Path, gpus: &[&ggml_rs_wgpu::WgpuBackend]
     let none = std::env::var_os("OAIY_EXPERTS_ON_HOST").is_some();
     let allowance: Vec<u64> = gpus.iter().map(|g| if none { 0 } else { g.usage().1.saturating_sub(g.usage().0).saturating_sub(reserve) }).collect();
     let placed: Vec<std::sync::atomic::AtomicU64> = gpus.iter().map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+    // (a device's share of each of its layers' experts, where it holds only some: the slots and the experts, for
+    // the load's line)
+    let shares: Vec<std::sync::atomic::AtomicUsize> = gpus.iter().map(|_| std::sync::atomic::AtomicUsize::new(0)).collect();
     let experts = |device: usize, e: ExpertBlocks| -> Result<Box<dyn ggml_rs::exl3::Experts>> {
         use std::sync::atomic::Ordering::Relaxed;
         let data = ggml_rs_wgpu::quant_moe::QuantExpertsData { hidden: e.hidden, ff: e.ff, experts: e.experts, gate: e.gate, up: e.up, down: e.down, shared: e.shared };
         match gpus.get(device) {
             Some(b) => {
-                let bytes = (data.gate.1.len() + data.up.1.len() + data.down.1.len() + 3 * data.hidden * data.ff * 4) as u64;
-                if placed[device].fetch_add(bytes, Relaxed) + bytes <= allowance[device] {
+                let shared = (3 * data.hidden * data.ff * 4) as u64;
+                let bytes = (data.gate.1.len() + data.up.1.len() + data.down.1.len()) as u64 + shared;
+                // (the device's layers' routed experts, and its allowance less their shared ones: the share of each
+                // layer's it has room for)
+                let (here, routed) = (layers.div_ceil(gpus.len()) as u64, routed_bytes / gpus.len() as u64);
+                // (a card short of room for them all: half a gigabyte of it left for a prompt's scratch of the experts
+                // it reads from the host's memory)
+                let fits = allowance[device] >= here * shared + routed;
+                let share = allowance[device].saturating_sub(here * shared + (1 << 29)) as f64 / routed.max(1) as f64;
+                if part && !fits {
+                    let slots = (data.experts as f64 * share * 0.98) as usize;
+                    if slots >= 64 {
+                        shares[device].store(slots.min(data.experts) * 1024 + data.experts.min(1023), Relaxed);
+                        b.quant_experts_cached(data, slots)
+                    } else {
+                        ggml_rs_wgpu::quant_host::quant_experts_host_beside(b, data)
+                    }
+                } else if placed[device].fetch_add(bytes, Relaxed) + bytes <= allowance[device] {
                     // (experts the GPU's kernels do not decode, or the card had no room for after all, are the
                     // host's: their bytes are not the card's)
                     let made = b.quant_experts(data);
@@ -1227,6 +1256,12 @@ pub(crate) fn flashnext_gguf_on(path: &Path, gpus: &[&ggml_rs_wgpu::WgpuBackend]
         .map_err(Error::Arg)
     };
     let mut model = load(path, backends, &quant, &float, &experts)?;
+    for (device, share) in shares.iter().enumerate() {
+        let share = share.load(std::sync::atomic::Ordering::Relaxed);
+        if share > 0 {
+            eprintln!("GPU {device} holds {} of each layer's {} experts (the ones last used); its kernels read the others from the host's memory", share / 1024, share % 1024);
+        }
+    }
     // its multi-token-prediction layer, an EXL3 checkpoint's (`mtp_from`): on the last device, as that loader puts it
     if let Some(exl3) = mtp_from {
         type Make<'a> = Box<dyn Fn(ggml_rs::exl3::Exl3Data) -> std::result::Result<Arc<dyn ggml_rs::exl3::PackedLinear>, String> + Send + Sync + 'a>;

@@ -11,6 +11,14 @@ impl WgpuBackend {
         v
     }
 
+    /// A vector holding `bytes` as they are (a multiple of 4 of them) in the HOST's memory, which a kernel reads over
+    /// the bus ([`Gpu::host_buffer`]). None where the device has no such buffers.
+    pub fn host_vec_of_bytes(&self, bytes: &[u8]) -> Option<DeviceVec> {
+        assert!(bytes.len() % 4 == 0 && !bytes.is_empty(), "chain: a vector of {} bytes", bytes.len());
+        let b = self.gpu.host_buffer(bytes)?;
+        Some(DeviceVec { len: bytes.len() / 4, inner: Arc::new(b) })
+    }
+
     /// `bytes` written into `v` from its start, as they are (a multiple of 4 of them, no more than `v` holds): a
     /// vector's weights replaced by the next of the same shape, once what read them has run.
     pub fn fill_bytes(&self, v: &DeviceVec, bytes: &[u8]) {
@@ -284,6 +292,6 @@ impl DeviceChain for WgpuBackend {
     }
 
     fn begin(&self) -> Box<dyn ChainRecorder + '_> {
-        Box::new(Recorder { backend: self, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), low_rank: [None, None, None], q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0, alike: false })
+        Box::new(Recorder { backend: self, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), low_rank: [None, None, None], q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0, alike: false, settles: Vec::new(), moe_stage: None })
     }
 }

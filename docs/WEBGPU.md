@@ -444,6 +444,45 @@ every layer's on the host; a prose request and Strata's):
   of a chunk's lookups would stay on the card where a third of them are the host's
   now.
 
+That round trip is not needed (2026-10-10): a card's kernels read the host's memory
+themselves. wgpu's Vulkan backend puts a read-mappable storage buffer
+(`MAPPABLE_PRIMARY_BUFFERS`) in the system's memory, and a kernel reads it over the
+bus: 26.6 GB a second on an RTX 5090 with eight lanes of PCIe 5, 13.3 with four, where
+the card's own memory gives 1,400 (`measure_a_matrix_in_the_hosts_memory`; the same
+sums bit for bit. A write-mappable one goes to the card's own host-visible memory,
+which is the card's room). So a card with no room for all its layers' experts holds
+the same share of each layer's (`quant_moe::Cache`: 313 of 512 on a 32 GB card, beside
+the prediction layer), every expert's matrices are in the host's memory, and the
+experts' kernels read an expert that has no slot from there, its 1.5 MB in 57 us,
+with no word from the host between a layer's router and its experts. The kernels
+write the pass each expert was last used in; a recording reads that as it finishes,
+and the experts it read from the host are copied into the slots of the least recently
+used, behind it in the queue.
+
+A load from the host's memory is the bus's fetch of its 64-byte line, kept for no
+later load, so the threads that load at once must share lines. The kernels for a
+step's row and a check's few do (a row's lanes read side by side). The tensor cores'
+kernel, a prompt's, reads a word a thread between barriers: an expert was 0.95 ms
+through it. A prompt's experts that have no slot are therefore copied into the
+card's scratch first, by a kernel whose 256 threads take 256 consecutive words a turn
+(58 us an expert; a thread taking its own 64 words in turn was 0.71 ms), and read
+there.
+
+One RTX 5090 at 400 W, Strata's request: the 4,086-token prompt in 3.8 to 4.0 s where
+24.5 (1,050 tokens a second; 5.0 s the first), and a reply at 102 to 104 tokens a
+second where 46 (256 tokens in 2.47 to 2.52 s, drafting: no layer's experts are the
+host's cores' any more, so a check's rows cost them nothing). The prompt reads 18,000
+experts from the host's memory and 11,000 are brought to the card after its chunks;
+the reply 6,100, 24 a token, each brought in after its pass. Strata on one card: 4,270
+and 179. `OAIY_EXPERT_CACHE=0` is the placement before (whole layers' experts on the
+host's cores). The checks: a layer held in part against the same held whole, bit for
+bit, every type, in f32 and on the tensor cores
+(`a_cards_share_of_a_layers_experts_is_all_of_them`), and the model's own with
+`OAIY_NO_SPLIT` (its checks its steps bit for bit, 22 of 22). What is left there: an
+expert read from the host and then copied in crosses the bus twice (the card could
+take it in as it reads it); a prompt puts out the experts a reply uses; and the first
+slots are the first experts, where a file of the model's use would say which.
+
 A recording's reads are polled for 20 ms before the thread waits for them
 (`OAIY_CHAIN_SPIN_MS`), as a CUDA program's are by default: a step, a check and a host
 layer's round trip end within that, and each was some 0.1 ms the longer for parking

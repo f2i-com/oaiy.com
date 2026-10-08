@@ -736,20 +736,297 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 "#;
 
 /// A kernel's pipeline name and source, made once (a pipeline is named for good).
-fn kernel(kind: Kind, coop: bool, rows: usize, k: usize) -> (&'static str, &'static str) {
-    type Made = ((Kind, bool, usize, usize), (&'static str, &'static str));
+/// `mats`: 0 where the card holds every expert of the layer, else the group's matrices an expert, for the kernel that
+/// reads an expert the card does not hold from the host's memory, or (`staged`) from where a prompt's were copied
+/// ([`cached_source`]).
+fn kernel(kind: Kind, coop: bool, rows: usize, k: usize, mats: usize, staged: bool) -> (&'static str, &'static str) {
+    type Made = ((Kind, bool, usize, usize, usize, bool), (&'static str, &'static str));
     static MADE: Mutex<Vec<Made>> = Mutex::new(Vec::new());
     let mut made = MADE.lock().unwrap_or_else(|p| p.into_inner());
     // (the tensor cores' kernel is one for every width; the few-row one is written for its lanes a row)
     let lanes = if coop { 0 } else { few_lanes(kind, k) };
-    let key = (kind, coop, rows, lanes);
+    let key = (kind, coop, rows, lanes, mats, staged);
     if let Some((_, k)) = made.iter().find(|(k, _)| *k == key) {
         return *k;
     }
-    let name: &'static str = Box::leak(if coop { format!("quant-moe-{}-coop-{rows}", kind.tag()) } else { format!("quant-moe-{}-few-{rows}-{lanes}", kind.tag()) }.into_boxed_str());
-    let source: &'static str = Box::leak(if coop { coop_source(kind, rows) } else { few_source(kind, rows, lanes) }.into_boxed_str());
+    let part = if mats > 0 { format!("-{}{mats}", if staged { "staged" } else { "part" }) } else { String::new() };
+    let name: &'static str = Box::leak(if coop { format!("quant-moe-{}-coop-{rows}{part}", kind.tag()) } else { format!("quant-moe-{}-few-{rows}-{lanes}{part}", kind.tag()) }.into_boxed_str());
+    let source = if coop { coop_source(kind, rows) } else { few_source(kind, rows, lanes) };
+    let source: &'static str = Box::leak(if mats > 0 { cached_source(source, mats, staged) } else { source }.into_boxed_str());
     made.push((key, (name, source)));
     (name, source)
+}
+
+/// [`few_source`]'s or [`coop_source`]'s kernel for a layer a card holds only some of whose experts ([`Cache`]): a
+/// job's matrix read from its expert's slot on the card or, where it has none, from the host's memory, which holds
+/// every expert's (binding 5: a thread's block is one matrix, so the one or the other for all it reads). `mats`: the
+/// group's matrices an expert (2: gate and up; 1: down). The layer's state (binding 7) is each expert's slot, then
+/// the pass each was last used in, then the passes so far: the gate and up kernel counts a pass, and the down one,
+/// run after it, writes that count for its block's expert.
+///
+/// `staged`: binding 5 is the card's scratch, where [`STAGE_COPY`] put the experts the run uses and the card has no
+/// slot for, each at the place the state's last part gives it ([`STAGE_PLAN`]). A prompt's kernel (the tensor
+/// cores') takes that: it reads a word a thread between barriers, and from the host's memory each such read waits
+/// for the bus (Flash-Next's prompt of 4,086 tokens read 16,600 experts so in 15.9 s, 0.95 ms each; a stream
+/// brings one in 57 us).
+fn cached_source(source: String, mats: usize, staged: bool) -> String {
+    let once = |s: String, old: &str, new: String| -> String {
+        assert_eq!(s.matches(old).count(), 1, "a kernel's `{old}`");
+        s.replace(old, &new)
+    };
+    let coop = source.contains("jobs[2u * head] * p[1].x");
+    let (job, first, expert) = if coop { ("jobs[2u * head]", "t == 0u && wg.x == 0u", "jobs[2u * head]") } else { ("jobs[2u * select(j0, 0u, !on0)]", "t == 0u && wg.x == 0u && wg.y == 0u && on0", "jobs[2u * j0]") };
+    let mut s = once(source, &format!("{job} * p[1].x"), format!("mat_at({job}) * p[1].x"));
+    // every read of the weights by where they are
+    let mut out = String::with_capacity(s.len() + 2048);
+    while let Some(at) = s.find("words[") {
+        let end = at + s[at..].find(']').expect("an index's end");
+        assert!(!s[at + 6..end].contains('['), "a kernel's read of its weights by another read");
+        out.push_str(&s[..at]);
+        out.push_str("wd(");
+        out.push_str(&s[at + 6..end]);
+        out.push(')');
+        s = s[end + 1..].to_string();
+    }
+    out.push_str(&s);
+    let helpers = format!(
+        r#"@group(0) @binding(5) var<storage, read> coldw: array<u32>;
+@group(0) @binding(7) var<storage, read_write> state: array<u32>;
+// whether this thread's matrix is read from the host's memory (its expert has no slot on the card)
+var<private> cold_src: bool;
+fn wd(i: u32) -> u32 {{
+    if (cold_src) {{
+        return coldw[i];
+    }}
+    return words[i];
+}}
+// where a job's matrix `m` is: its expert's slot's on the card, or its own in the host's memory (or where the
+// run's were copied from there)
+fn mat_at(m: u32) -> u32 {{
+    let e = m / {mats}u;
+    let slot = state[e];
+    cold_src = slot == 0xffffffffu;
+    return select(slot, {other}, cold_src) * {mats}u + m % {mats}u;
+}}
+@compute"#,
+        other = if staged { "state[2u * p[1].w + 4u + e]" } else { "e" },
+    );
+    let out = once(out, "@compute", helpers);
+    let main = "fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {\n";
+    if mats == 2 {
+        // a pass counted (the pass's first dispatch's first thread)
+        once(out, main, format!("{main}    if (t == 0u && wg.x == 0u && wg.y == 0u && wg.z == 0u && p[1].y == 0u) {{ state[2u * p[1].w] = state[2u * p[1].w] + 1u; }}\n"))
+    } else {
+        // the block's expert used in this pass (one thread a block says so)
+        once(out, "    let rb = mat_at(", format!("    if ({first}) {{ state[p[1].w + {expert}] = state[2u * p[1].w]; }}\n    let rb = mat_at("))
+    }
+}
+
+/// An expert the card has no slot for, in a layer's state.
+const MISS: u32 = u32::MAX;
+
+/// Which of a run's experts the card has no slot for, each given a place in the card's scratch for [`STAGE_COPY`]
+/// (the state's last part, from `2 experts + 4`: an expert's place, [`MISS`] where it has a slot or the run does not
+/// use it): one workgroup, its threads marking the experts the run's pairs name (`jobs`: a pair's expert its even
+/// word), one of them then numbering the marked in turn. `p[0]`: the pairs, the experts (1,024 at most).
+const STAGE_PLAN: &str = r#"
+@group(0) @binding(0) var<storage, read> jobs: array<u32>;
+@group(0) @binding(6) var<storage, read_write> state: array<u32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> mark: array<atomic<u32>, 1024>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_index) t: u32) {
+    let pairs = p[0].x;
+    let experts = p[0].y;
+    for (var e = t; e < experts; e += 256u) {
+        atomicStore(&mark[e], 0u);
+    }
+    workgroupBarrier();
+    for (var q = t; q < pairs; q += 256u) {
+        let e = jobs[2u * q];
+        if (state[e] == 0xffffffffu) {
+            atomicStore(&mark[e], 1u);
+        }
+    }
+    workgroupBarrier();
+    if (t == 0u) {
+        var n = 0u;
+        for (var e = 0u; e < experts; e++) {
+            var at = 0xffffffffu;
+            if (atomicLoad(&mark[e]) == 1u) {
+                at = n;
+                n++;
+            }
+            state[2u * experts + 4u + e] = at;
+        }
+    }
+}
+"#;
+
+/// The experts [`STAGE_PLAN`] gave a place, copied there from the host's memory: their gate and up matrices (`cg` to
+/// `sg`) and their down ones (`cd` to `sd`), a workgroup 16,384 words, its 256 threads 256 consecutive words at
+/// each of 64 turns. A load from the host's memory is the bus's fetch of its 64-byte line, kept for no later load: the
+/// threads that load at once must share lines (each thread its own 64 words in turn had a warp's 32 loads in 32
+/// lines, a line fetched for 4 bytes of it: 2.1 GB a second where the bus gives 26.6). A workgroup's third index
+/// is its expert; one with no place ends at once. `p[0]`: an expert's words in the first group and in the second,
+/// the experts, the workgroups an expert's first group takes.
+const STAGE_COPY: &str = r#"
+@group(0) @binding(0) var<storage, read> cg: array<u32>;
+@group(0) @binding(1) var<storage, read> cd: array<u32>;
+@group(0) @binding(2) var<storage, read> state: array<u32>;
+@group(0) @binding(6) var<storage, read_write> sg: array<u32>;
+@group(0) @binding(7) var<storage, read_write> sd: array<u32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    let e = wg.z;
+    let at = state[2u * p[0].z + 4u + e];
+    if (at == 0xffffffffu) {
+        return;
+    }
+    let gw = p[0].x;
+    let dw = p[0].y;
+    if (wg.x < p[0].w) {
+        let first = wg.x * 16384u + t;
+        for (var i = first; i < min(first + 16384u, gw); i += 256u) {
+            sg[at * gw + i] = cg[e * gw + i];
+        }
+    } else {
+        let first = (wg.x - p[0].w) * 16384u + t;
+        for (var i = first; i < min(first + 16384u, dw); i += 256u) {
+            sd[at * dw + i] = cd[e * dw + i];
+        }
+    }
+}
+"#;
+
+/// A layer's routed experts where the card holds only some of them ([`QuantMoe::make`]'s `slots`): every expert's
+/// matrices are in the host's memory ([`Gpu::host_buffer`]), which the kernels read over the bus for an expert the
+/// card has no slot for ([`cached_source`]), with no word from the host between a layer's router and its experts.
+/// A recording that ran the layer reads which experts it used as it finishes ([`Self::watch`]), and the ones read
+/// from the host are then copied into the slots of the card's least recently used ([`Self::settle`]): the next pass
+/// finds them there.
+///
+/// Flash-Next's GSQ-RCO IQ2_XS file is 37 GB of experts, 1.5 MB each, and one RTX 5090 holds 313 of a layer's 512.
+/// Strata's request (4,086 tokens of code, then 256 of prose) there: the reply reads 24 experts a token from the
+/// host's memory (57 us each on eight lanes of PCIe 5) and brings each in, 102 to 104 tokens a second where whole
+/// layers' experts on the host's cores gave 46; the prompt reads 18,000 and brings 11,000 in, 3.8 to 4.0 s where
+/// 24.5. A fixed set of experts would read some 140 a token (the model's routing replayed: what a reply uses is
+/// not what its prompt did).
+pub(crate) struct Cache {
+    gpu: Arc<Gpu>,
+    experts: usize,
+    /// The experts the card holds.
+    slots: usize,
+    /// Each expert's slot on the card ([`MISS`]: none), the pass each was last used in, the passes so far (and three
+    /// words unused), then each expert's place in a prompt's scratch ([`STAGE_PLAN`]).
+    state: wgpu::Buffer,
+    /// The gate and up group's, and the down group's: every expert's in the host's memory, the card's slots, and an
+    /// expert's bytes there.
+    groups: [(wgpu::Buffer, wgpu::Buffer, u64); 2],
+    /// The host's copy of the experts' slots, and the passes when it last looked.
+    host: Mutex<(Vec<u32>, u32)>,
+    /// The experts read from the host's memory, and those brought to the card, so far.
+    counts: [std::sync::atomic::AtomicU64; 2],
+}
+
+/// The most words a prompt's scratch of experts takes on a device (by its address): the largest of its part-held
+/// layers' two groups', so a recording takes one pair of vectors for all of them ([`Cache::stage`]).
+static STAGE_MOST: Mutex<Vec<(usize, [usize; 2])>> = Mutex::new(Vec::new());
+
+/// Every such layer's experts read from the host's memory and brought to a card since the process began.
+static CACHED: [std::sync::atomic::AtomicU64; 2] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
+/// The experts cards have read from the host's memory, and those brought to a card, since the process began (every
+/// layer's that a card holds only some of): what a request's cost of them was is the difference over it.
+pub fn cached_experts() -> (u64, u64) {
+    (CACHED[0].load(Ordering::Relaxed), CACHED[1].load(Ordering::Relaxed))
+}
+
+impl Cache {
+    /// The experts a prompt's rows use (`jobs`: `pairs` of them, a pair's expert its even word) that the card has no
+    /// slot for, copied from the host's memory into the recording's scratch, where the tensor cores' kernels read
+    /// them: the gate and up group's vector and the down group's (each layer's in turn the same two).
+    fn stage(&self, rec: &mut crate::chain::Recorder<'_>, jobs: &DeviceVec, pairs: usize) -> [DeviceVec; 2] {
+        let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
+        let (d, drw) = (rec.gpu().dummy().clone(), rec.gpu().dummy_rw().clone());
+        // an expert's words in each group, and room for every expert the card has no slot for: the recording's one
+        // pair of vectors, as long as the device's largest such layer needs (a layer of another type a pair of its
+        // own would hold them all to the recording's end)
+        let words = [self.groups[0].2 as usize / 4, self.groups[1].2 as usize / 4];
+        let lens = words.map(|w| (self.experts - self.slots) * w);
+        let (held, stage) = match rec.moe_stage.take() {
+            Some((l, s)) if l[0] >= lens[0] && l[1] >= lens[1] => (l, s),
+            _ => {
+                let device = Arc::as_ptr(&self.gpu) as usize;
+                let most = STAGE_MOST.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|(d, _)| *d == device).map_or(lens, |(_, m)| [m[0].max(lens[0]), m[1].max(lens[1])]);
+                (most, most.map(|l| rec.scratch(l)))
+            }
+        };
+        rec.moe_stage = Some((held, stage.clone()));
+        rec.dispatch_wide("moe-stage-plan", STAGE_PLAN, [&buf(jobs), &d, &d, &d, &d, &d, &self.state, &drw], &[pairs as u32, self.experts as u32], (1, 1, 1));
+        // (a workgroup 256 threads of 64 words)
+        let per = |w: usize| w.div_ceil(256 * 64) as u32;
+        rec.dispatch_wide(
+            "moe-stage-copy",
+            STAGE_COPY,
+            [&self.groups[0].0, &self.groups[1].0, &self.state, &d, &d, &d, &buf(&stage[0]), &buf(&stage[1])],
+            &[words[0] as u32, words[1] as u32, self.experts as u32, per(words[0])],
+            (per(words[0]) + per(words[1]), 1, self.experts as u32),
+        );
+        stage
+    }
+
+    /// `rec` reads the layer's use as it finishes (once a recording, however often it runs the layer).
+    fn watch(self: &Arc<Self>, rec: &mut crate::chain::Recorder<'_>) {
+        if rec.settles.iter().any(|(c, _)| Arc::ptr_eq(c, self)) {
+            return;
+        }
+        let at = rec.read_of(&self.state, self.experts, self.experts + 1);
+        rec.settles.push((Arc::clone(self), at));
+    }
+
+    /// What a recording read of the layer's state once it had run (`read`: the pass each expert was last used in,
+    /// then the passes so far): each expert used since the last look that the card has no slot for is copied from
+    /// the host's memory into the slot of an expert not used since then, the least recently used first, and the
+    /// slots' map with them, behind whatever is in the queue.
+    pub(crate) fn settle(&self, read: &[f32]) {
+        let e = self.experts;
+        let (stamps, passes) = (&read[..e], read[e].to_bits());
+        let mut host = self.host.lock().unwrap_or_else(|p| p.into_inner());
+        let seen = host.1;
+        host.1 = passes;
+        let used = |x: usize| stamps[x].to_bits() > seen;
+        let want: Vec<usize> = (0..e).filter(|&x| host.0[x] == MISS && used(x)).collect();
+        if want.is_empty() {
+            return;
+        }
+        self.counts[0].fetch_add(want.len() as u64, Ordering::Relaxed);
+        CACHED[0].fetch_add(want.len() as u64, Ordering::Relaxed);
+        let mut free: Vec<usize> = (0..e).filter(|&x| host.0[x] != MISS && !used(x)).collect();
+        free.sort_by_key(|&x| stamps[x].to_bits());
+        let n = want.len().min(free.len());
+        if n == 0 {
+            return;
+        }
+        let mut enc = self.gpu.device.create_command_encoder(&Default::default());
+        for (&x, &v) in want.iter().zip(&free) {
+            let slot = host.0[v];
+            host.0[v] = MISS;
+            host.0[x] = slot;
+            for (cold, hot, each) in &self.groups {
+                enc.copy_buffer_to_buffer(cold, x as u64 * each, hot, slot as u64 * each, *each);
+            }
+        }
+        self.counts[1].fetch_add(n as u64, Ordering::Relaxed);
+        CACHED[1].fetch_add(n as u64, Ordering::Relaxed);
+        // (the map, then the copies, in the queue's order: no kernel runs between them)
+        self.gpu.write(&self.state, 0, bytemuck::cast_slice(&host.0[..]));
+        let _ = self.gpu.submit_after(vec![enc.finish()]);
+    }
 }
 
 /// One kind of a layer's routed experts' projection as a group (their gate and up matrices, or their down ones): their
@@ -764,6 +1041,11 @@ struct Group {
     mwords: usize,
     /// A grid type's table ([`Kind::table`]), which its kernels read at binding 4.
     table: Option<wgpu::Buffer>,
+    /// Where the card holds only some of the layer's experts ([`Cache`]): every expert's rows in the host's memory
+    /// (`words` then the card's slots').
+    cold: Option<wgpu::Buffer>,
+    /// The group's matrices an expert (2: gate and up; 1: down).
+    mats: usize,
 }
 
 /// How a group's jobs are taken: each a block of its own (a step's, no order), or in blocks of one matrix (the order,
@@ -837,6 +1119,8 @@ pub struct QuantMoe {
     coop: bool,
     /// The bytes counted against the backend's budget, given back when the layer goes.
     bytes: u64,
+    /// Where the card holds only some of the routed experts: which, and the rest's place in the host's memory.
+    cache: Option<Arc<Cache>>,
 }
 
 impl std::fmt::Debug for QuantMoe {
@@ -858,6 +1142,13 @@ impl QuantMoe {
     /// The layer's experts as groups on `b`, if they can be: their types ones the kernels decode, each group within a
     /// binding, and all of them within the budget less `reserve`. Else `data` back, for the host.
     fn try_new(b: &WgpuBackend, data: QuantExpertsData, reserve: u64) -> Result<Self, QuantExpertsData> {
+        Self::make(b, data, reserve, None)
+    }
+
+    /// [`Self::try_new`], the card holding `slots` of the routed experts where that is fewer than all of them (the
+    /// first so many to begin with), every expert's matrices in the host's memory for the kernels to read the others
+    /// from ([`Cache`]); `data` back too where the device's kernels cannot read the host's memory.
+    fn make(b: &WgpuBackend, data: QuantExpertsData, reserve: u64, slots: Option<usize>) -> Result<Self, QuantExpertsData> {
         let (h, f, e) = (data.hidden, data.ff, data.experts);
         let (Some(kg), Some(ku), Some(kd)) = (Kind::of(data.gate.0), Kind::of(data.up.0), Kind::of(data.down.0)) else { return Err(data) };
         // (the tensor cores' tiles are 16 by 16, a scale's block 64; a grid type's block 256)
@@ -872,8 +1163,13 @@ impl QuantMoe {
         if gu_bytes > limit || d_bytes > limit || gu_bytes / 4 > u32::MAX as u64 || d_bytes / 4 > u32::MAX as u64 {
             return Err(data);
         }
+        let held = slots.map_or(e, |s| s.clamp(1, e));
+        let part = held < e;
+        if part && !b.host_weights() {
+            return Err(data);
+        }
         let shared_bytes = (3 * h * f * 4) as u64;
-        let total = gu_bytes + d_bytes + shared_bytes;
+        let total = (gu_bytes + d_bytes) / e as u64 * held as u64 + shared_bytes + if part { ((3 * e + 4) * 4) as u64 } else { 0 };
         let prev = b.used.fetch_add(total, Ordering::Relaxed);
         if prev + total > b.budget.saturating_sub(reserve) {
             b.used.fetch_sub(total, Ordering::Relaxed);
@@ -896,13 +1192,44 @@ impl QuantMoe {
                 let bytes: &[u8] = bytemuck::cast_slice(&t);
                 b.gpu.upload_rows(bytes, bytes.len(), 1).remove(0).0
             });
-            Group { words: b.gpu.upload_rows(bytes, bytes.len(), 1).remove(0).0, kind, k, n, rw, mwords, table }
+            // (the card's slots: the first experts' to begin with; all of them in the host's memory beside)
+            let hot = &bytes[..held * which.len() * mwords * 4];
+            let cold = part.then(|| b.gpu.host_buffer(bytes).expect("a storage buffer in the host's memory"));
+            Group { words: b.gpu.upload_rows(hot, hot.len(), 1).remove(0).0, kind, k, n, rw, mwords, table, cold, mats: which.len() }
         };
         let gu = group(&[&data.gate, &data.up], kg, f, h);
         let down = group(&[&data.down], kd, h, f);
         let shared = [Dense::stacked(b, &data.shared[0], &data.shared[1], 2 * f, h), Dense::new(b, &data.shared[2], h, f)];
         let coop = coop_on(&b.gpu) && std::env::var_os("OAIY_QUANT_MOE_NO_COOP").is_none();
-        Ok(QuantMoe { b: b.clone(), routed: e, hidden: h, ff: f, gu, down, shared, coop, bytes: total })
+        let cache = part.then(|| {
+            // each expert's slot (the first `held` their own), no pass yet, no place in a prompt's scratch
+            let mut state = vec![0u32; 3 * e + 4];
+            for (x, s) in state[..e].iter_mut().enumerate() {
+                *s = if x < held { x as u32 } else { MISS };
+            }
+            state[2 * e + 4..].fill(MISS);
+            let bytes: &[u8] = bytemuck::cast_slice(&state);
+            let of = |g: &Group| (g.cold.clone().expect("a part-held group's rows in the host's memory"), g.words.clone(), (g.mats * g.mwords * 4) as u64);
+            // (what a prompt's scratch of this layer's experts takes, for the device's largest)
+            let lens = [(e - held) * gu.mats * gu.mwords, (e - held) * down.mats * down.mwords];
+            let device = Arc::as_ptr(&b.gpu) as usize;
+            let mut most = STAGE_MOST.lock().unwrap_or_else(|p| p.into_inner());
+            match most.iter_mut().find(|(d, _)| *d == device) {
+                Some((_, m)) => *m = [m[0].max(lens[0]), m[1].max(lens[1])],
+                None => most.push((device, lens)),
+            }
+            drop(most);
+            Arc::new(Cache {
+                gpu: Arc::clone(&b.gpu),
+                experts: e,
+                slots: held,
+                state: b.gpu.upload_rows(bytes, bytes.len(), 1).remove(0).0,
+                groups: [of(&gu), of(&down)],
+                host: Mutex::new((state[..e].to_vec(), 0)),
+                counts: [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)],
+            })
+        });
+        Ok(QuantMoe { b: b.clone(), routed: e, hidden: h, ff: f, gu, down, shared, coop, bytes: total, cache })
     }
 
     pub(crate) fn is_on(&self, gpu: &Arc<Gpu>) -> bool {
@@ -950,7 +1277,15 @@ impl QuantMoe {
 
     /// One group's jobs (`jobs`, `count` of them) on `x`'s rows into `y`'s (job `j`'s row `j`).
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     fn group_pass(&self, rec: &mut crate::chain::Recorder<'_>, g: &Group, x: &DeviceVec, jobs: &DeviceVec, count: usize, order: Order<'_>, y: &DeviceVec) {
+        self.group_pass_from(rec, g, x, jobs, count, order, y, None)
+    }
+
+    /// [`Self::group_pass`]; `stage`: where a part-held layer's experts with no slot on the card were copied for this
+    /// run ([`Cache::stage`]: a prompt's), else its kernels read them from the host's memory.
+    #[allow(clippy::too_many_arguments)]
+    fn group_pass_from(&self, rec: &mut crate::chain::Recorder<'_>, g: &Group, x: &DeviceVec, jobs: &DeviceVec, count: usize, order: Order<'_>, y: &DeviceVec, stage: Option<&DeviceVec>) {
         let d = rec.gpu().dummy().clone();
         let drw = rec.gpu().dummy_rw().clone();
         let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
@@ -961,14 +1296,22 @@ impl QuantMoe {
             Order::Blocks(o, blocks, rows) => (buf(o), blocks, rows, 0),
         };
         let coop = rows > FEW_MAX;
-        let (name, source) = kernel(g.kind, coop, rows, g.k);
+        let (name, source) = kernel(g.kind, coop, rows, g.k, if self.cache.is_some() { g.mats } else { 0 }, stage.is_some());
+        // (a card holding some of the experts: the rest's rows in the host's memory or where this run's were copied,
+        // and the layer's state)
+        let staged = stage.map(|s| buf(s));
+        let (cold, state) = match (&self.cache, &staged) {
+            (Some(c), Some(s)) => (s, &c.state),
+            (Some(c), None) => (g.cold.as_ref().expect("a part-held group's rows in the host's memory"), &c.state),
+            (None, _) => (&d, &drw),
+        };
         // as many blocks a pass as the grid's third axis takes
         for first in (0..blocks).step_by(65535) {
             let these = 65535.min(blocks - first) as u32;
-            let words = [g.n as u32, g.k as u32, g.rw as u32, identity, g.mwords as u32, first as u32];
+            let words = [g.n as u32, g.k as u32, g.rw as u32, identity, g.mwords as u32, first as u32, 0, self.routed as u32];
             let groups = (g.n as u32).div_ceil((256 / few_lanes(g.kind, g.k)) as u32);
             let grid = if coop { (ntiles.div_ceil(8), 1, these) } else { (groups.min(65535), groups.div_ceil(65535), these) };
-            rec.dispatch_wide(name, source, [&g.words, &xb, &jb, &ob, g.table.as_ref().unwrap_or(&d), &d, &yb, &drw], &words, grid);
+            rec.dispatch_wide(name, source, [&g.words, &xb, &jb, &ob, g.table.as_ref().unwrap_or(&d), cold, &yb, state], &words, grid);
         }
         rec.weigh(2.0 * count as f64 * (g.n * g.k) as f64);
     }
@@ -1090,10 +1433,16 @@ impl QuantMoe {
         let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
         let d = rec.gpu().dummy().clone();
         let drw = rec.gpu().dummy_rw().clone();
-        self.group_pass(rec, &self.gu, x, &st.jobs_gu, 2 * pairs, ogu, &st.out_gu);
+        // (a part-held layer: its use read as the recording finishes; a prompt's rows' experts with no slot on the
+        // card copied there first, for the tensor cores' kernels)
+        let stage = self.cache.as_ref().and_then(|c| {
+            c.watch(rec);
+            matches!(ogu, Order::Blocks(_, _, rows) if rows > FEW_MAX).then(|| c.stage(rec, &st.jobs_d, pairs))
+        });
+        self.group_pass_from(rec, &self.gu, x, &st.jobs_gu, 2 * pairs, ogu, &st.out_gu, stage.as_ref().map(|s| &s[0]));
         let groups = ((pairs * f) as u32).div_ceil(256);
         rec.dispatch_wide("quant-moe-swiglu", SWIGLU_PAIRS, [&buf(&st.out_gu), &d, &d, &d, &d, &d, &buf(&st.xh_d), &drw], &[f as u32, pairs as u32], (groups.min(65535), groups.div_ceil(65535).max(1), 1));
-        self.group_pass(rec, &self.down, &st.xh_d, &st.jobs_d, pairs, od, &st.out_d);
+        self.group_pass_from(rec, &self.down, &st.xh_d, &st.jobs_d, pairs, od, &st.out_d, stage.as_ref().map(|s| &s[1]));
         // the shared expert on every row: its gate and up with their SwiGLU, then its down projection with the
         // experts' sum into the streams, each one dispatch for a step's row or a check's few
         self.shared[0].rows_swiglu(rec, x, &st.sg, &st.part_gu, rows);
@@ -1145,6 +1494,17 @@ impl WgpuBackend {
     /// ([`crate::quant_host::quant_experts_host_beside`]).
     pub fn quant_experts(&self, data: QuantExpertsData) -> Result<Box<dyn Experts>, String> {
         self.quant_experts_leaving(data, 0)
+    }
+
+    /// As [`Self::quant_experts`] where the card has room for `slots` of the layer's routed experts only: it holds
+    /// those (the ones last used, in time) and its kernels read the rest from the host's memory, which holds them
+    /// all ([`Cache`]). On the host as [`Self::quant_experts`]'s where the device cannot ([`Self::host_weights`]).
+    pub fn quant_experts_cached(&self, data: QuantExpertsData, slots: usize) -> Result<Box<dyn Experts>, String> {
+        data.validate()?;
+        match QuantMoe::make(self, data, 0, Some(slots)) {
+            Ok(g) => Ok(Box::new(g)),
+            Err(data) => crate::quant_host::quant_experts_host_beside(self, data),
+        }
     }
 
     /// As [`Self::quant_experts`], leaving `reserve` bytes of the budget for the model's other matrices (loaded after).
@@ -1359,6 +1719,49 @@ pub(crate) mod tests {
                         eprintln!("{line}");
                     }
                 }
+            }
+        }
+    }
+
+    /// A layer a card holds some of whose experts is the layer it holds all of, bit for bit: a small layer (hidden
+    /// 256, 12 experts, 3 a row) with 5 slots against the same all on the card, Q2_0 and IQ2_S, over passes of a
+    /// step's row, a check's three and a prompt's 40 and 70, in f32 and on the tensor cores, by every way in; and
+    /// its slots took in experts the passes used. Each pass's time is printed (new kernels: a slow one a stop sign).
+    #[test]
+    fn a_cards_share_of_a_layers_experts_is_all_of_them() {
+        let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+        if !b.host_weights() {
+            eprintln!("this device's kernels do not read the host's memory");
+            return;
+        }
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+        let (hidden, ff, count, top_k) = (256usize, 128usize, 12usize, 3usize);
+        for gu in [GgmlType::Q2_0, GgmlType::IQ2_S, GgmlType::IQ2_XXS, GgmlType::IQ1_M] {
+            for cores in [false, true] {
+                if cores && !coop_on(&b.gpu) {
+                    continue;
+                }
+                let data = experts_of(77, hidden, ff, count, true, gu);
+                let mut whole = QuantMoe::try_new(&b, copy(&data), 0).ok().expect("room for the experts");
+                let mut part = QuantMoe::make(&b, data, 0, Some(5)).ok().expect("room for five of the experts");
+                (whole.coop, part.coop) = (cores, cores);
+                let cache = Arc::clone(part.cache.as_ref().expect("a layer of 12 experts in 5 slots is part-held"));
+                assert!(whole.cache.is_none());
+                for (pass, rows) in [1usize, 3, 1, 40, 70, 1, 3, 40, 1].into_iter().enumerate() {
+                    let (x, logits) = inputs(100 + pass as u64, rows, hidden, count);
+                    let want = gpu_sums(&b, &whole, &x, &logits, rows, hidden, count, top_k);
+                    let clock = std::time::Instant::now();
+                    let got = gpu_sums(&b, &part, &x, &logits, rows, hidden, count, top_k);
+                    let ms = clock.elapsed().as_secs_f64() * 1e3;
+                    let what = format!("{gu:?}, {} pass {pass} of {rows} rows ({ms:.0} ms)", if cores { "the tensor cores," } else { "f32," });
+                    assert_eq!(bits(&got.0), bits(&want.0), "{what}: routed on the host");
+                    assert_eq!(got.1.as_deref().map(bits), want.1.as_deref().map(bits), "{what}: routed on the GPU");
+                    assert_eq!(got.2.as_ref().map(|(a, _)| bits(a)), want.2.as_ref().map(|(a, _)| bits(a)), "{what}: into the streams");
+                }
+                let (read, brought) = (cache.counts[0].load(Ordering::Relaxed), cache.counts[1].load(Ordering::Relaxed));
+                let held = cache.host.lock().unwrap().0.iter().filter(|s| **s != MISS).count();
+                eprintln!("{gu:?}, {}: {read} experts read from the host's memory, {brought} brought to the card, {held} slots held", if cores { "the tensor cores" } else { "f32" });
+                assert!(read > 0 && brought > 0 && held == 5, "{gu:?}: the card's slots took in what the passes used");
             }
         }
     }

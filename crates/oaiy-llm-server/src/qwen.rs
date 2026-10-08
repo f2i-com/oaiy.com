@@ -724,6 +724,8 @@ impl QwenEngine {
         if self.log { eprintln!("  Qwen cache: {start}/{} tokens from {source} (common {common}) in {:.3}s", keys.len(), cache_clock.elapsed().as_secs_f64()); }
         let total = keys.len()-start;
         let _ = job.events.send(Event::Progress { done: 0, total });
+        #[cfg(feature = "webgpu")]
+        let cold_at_start = ggml_rs_wgpu::quant_moe::cached_experts();
         let clock = std::time::Instant::now();
         let mut soft = Vec::new();
         for image in &job.images {
@@ -829,13 +831,21 @@ impl QwenEngine {
         let mut generated = Vec::new(); let mut think_used = 0usize;
         let mut stream = NativeStream::default();
         let mut rng = job.sampling.seed ^ 0x9E3779B97F4A7C15;
-        // (OAIY_CHAIN_PROFILE: the reply's kernels alone, the prompt's let go here)
+        // (OAIY_CHAIN_PROFILE: the prompt's kernels said here, the reply's alone after)
         #[cfg(feature = "webgpu")]
         let profiled = self.log && std::env::var_os("OAIY_CHAIN_PROFILE").is_some();
         #[cfg(feature = "webgpu")]
         if profiled {
-            let _ = ggml_rs_wgpu::profile::take_kernels();
+            let kernels = ggml_rs_wgpu::profile::take_kernels();
+            eprintln!("  Qwen kernels: the prompt's {:.1} ms of the GPU's in {} dispatches (each timed in a pass of its own)", kernels.iter().map(|k| k.1).sum::<f64>(), kernels.iter().map(|k| k.2 as u64).sum::<u64>());
+            for (name, ms, count) in kernels.iter().take(24) {
+                eprintln!("    {name:<34} {ms:>9.2} ms {count:>7}");
+            }
         }
+        // (a card holding only some of a layer's experts: what it read from the host's memory and brought in, for
+        // the request's line)
+        #[cfg(feature = "webgpu")]
+        let (cold_before, cold_prompt) = (cold_at_start, ggml_rs_wgpu::quant_moe::cached_experts());
         let mut logits = Row::Logits(logits.unwrap());
         // (a greedy request's rows: the token alone where the model picks it on its GPU, megabytes of logits a check
         // not read back)
@@ -964,6 +974,13 @@ impl QwenEngine {
         let text = stream.push(&raw, &job.tools, true)
             .map_err(|e| format!("tool_contract_error: {e}; no tool from this batch was executed. The model wrote: {}", call_excerpt(&raw)))?;
         if self.log { eprintln!("  Qwen: {} prompt tokens ({} cached) in {:.2}s; {} generated in {:.2}s (sampling {t_sample:.2}s, text {t_text:.2}s, model {t_model:.2}s){}", job.prompt.len(),start,prefill_secs,generated.len(),decode_clock.elapsed().as_secs_f64(), if drafts_checked > 0 { format!("; {drafts_taken} of {drafts_checked} drafts taken ({checks} checks of {rows_checked} rows {t_check:.2}s, drafting {t_draft:.2}s, undoing {t_undo:.2}s)") } else { String::new() }); }
+        #[cfg(feature = "webgpu")]
+        if self.log {
+            let now = ggml_rs_wgpu::quant_moe::cached_experts();
+            if now.0 > cold_before.0 {
+                eprintln!("  Qwen experts: the prompt read {} from the host's memory and brought {} to the card, the reply {} and {}", cold_prompt.0 - cold_before.0, cold_prompt.1 - cold_before.1, now.0 - cold_prompt.0, now.1 - cold_prompt.1);
+            }
+        }
         if !text.is_empty() { let _ = job.events.send(Event::Text(text)); }
         let _ = job.events.send(Event::Done { finish, completion_tokens: generated.len() });
         // the reply is out: this prompt's checkpoints' states, copied on their devices as it ran, to the host now

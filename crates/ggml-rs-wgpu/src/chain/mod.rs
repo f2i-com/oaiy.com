@@ -122,7 +122,7 @@ impl<'a> Recorder<'a> {
     /// A recording on `backend`, its bind groups kept (the crate's own measurements record kernels directly).
     #[cfg(test)]
     pub(crate) fn new(backend: &'a WgpuBackend) -> Self {
-        Recorder { backend, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), low_rank: [None, None, None], q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0, alike: false }
+        Recorder { backend, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), low_rank: [None, None, None], q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0, alike: false, settles: Vec::new(), moe_stage: None }
     }
 }
 
@@ -213,6 +213,12 @@ pub(crate) struct Recorder<'a> {
     weight: f64,
     /// Whether a step's row takes the kernels a check's few rows take ([`ChainRecorder::rows_alike`]).
     alike: bool,
+    /// The layers whose experts' use this recording reads as it finishes ([`crate::quant_moe::Cache`]: a card holding
+    /// some of a layer's experts), each with its read's place among `reads`: the cache's, not the caller's.
+    pub(crate) settles: Vec<(Arc<crate::quant_moe::Cache>, usize)>,
+    /// A prompt's rows' experts copied from the host's memory for the tensor cores' kernels ([`crate::quant_moe::Cache`]):
+    /// the gate and up group's and the down group's, each layer's in turn (their lengths).
+    pub(crate) moe_stage: Option<([usize; 2], [DeviceVec; 2])>,
 }
 
 impl Recorder<'_> {
@@ -359,6 +365,14 @@ impl Recorder<'_> {
     }
 
     /// Whether this recording keeps its bind groups.
+    /// A read of `len` elements of `buffer` from `offset`, as [`ChainRecorder::read_range`] records a vector's: its
+    /// place among the recording's reads.
+    pub(crate) fn read_of(&mut self, buffer: &wgpu::Buffer, offset: usize, len: usize) -> usize {
+        let staging = self.gpu().staging(((len.max(1) * 4) as u64).next_power_of_two().max(256));
+        self.reads.push((buffer.clone(), offset, staging, len));
+        self.reads.len() - 1
+    }
+
     pub(crate) fn keeps(&self) -> bool {
         self.keep
     }

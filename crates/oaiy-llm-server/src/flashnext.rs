@@ -2846,7 +2846,11 @@ impl FlashNext {
                     host_ran += running.elapsed().as_secs_f64() * 1e3;
                     Routed::Summed(d, sums.to_host().data().to_vec())
                 }
-                None => Routed::Host((0..t).map(|r| ggml_rs::exl3::route(&logits[r * width..(r + 1) * width], cfg.top_k)).collect()),
+                None => {
+                    let assign: Vec<Vec<(usize, f32)>> = (0..t).map(|r| ggml_rs::exl3::route(&logits[r * width..(r + 1) * width], cfg.top_k)).collect();
+                    route_dump(i, past, &assign);
+                    Routed::Host(assign)
+                }
             });
         }
         // the last layer's experts, its write-back, the streams' collapse and the head, on the last device (the
@@ -3296,6 +3300,30 @@ impl FlashNext {
             drafts.push(best);
         }
         Some(drafts)
+    }
+}
+
+/// OAIY_ROUTE_DUMP names a file: each row's routed experts of each layer the host routes (OAIY_HOST_ROUTE: all of
+/// them) appended to it, a line a row (the layer, the row's position, its experts), for a look at a model's experts'
+/// use (which a card that does not hold them all would keep).
+fn route_dump(layer: usize, past: usize, assign: &[Vec<(usize, f32)>]) {
+    use std::io::Write;
+    static FILE: std::sync::OnceLock<Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>> = std::sync::OnceLock::new();
+    let Some(file) = FILE.get_or_init(|| {
+        let path = std::env::var_os("OAIY_ROUTE_DUMP")?;
+        let f = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
+        Some(std::sync::Mutex::new(std::io::BufWriter::new(f)))
+    }) else {
+        return;
+    };
+    let mut f = file.lock().unwrap_or_else(|p| p.into_inner());
+    for (r, a) in assign.iter().enumerate() {
+        let experts: Vec<String> = a.iter().map(|(e, _)| e.to_string()).collect();
+        let _ = writeln!(f, "{layer} {} {}", past + r, experts.join(" "));
+    }
+    // (a step's line is on disk when the run is looked at)
+    if assign.len() <= 8 && layer % 16 == 15 {
+        let _ = f.flush();
     }
 }
 

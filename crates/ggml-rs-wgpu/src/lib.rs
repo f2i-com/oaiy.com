@@ -828,6 +828,37 @@ impl Gpu {
         }
     }
 
+    /// `bytes` (a multiple of 4 of them) in a storage buffer in the HOST's memory, which a kernel reads over the bus:
+    /// a read-mappable storage buffer, for which wgpu's Vulkan backend asks for the host's cached memory (the system's,
+    /// on a card of its own; a write-mappable one it puts in the card's own host-visible memory where there is such,
+    /// which is the card's speed and the card's room). None where the device has no mappable storage buffers. It
+    /// costs the card none of its memory and a kernel its bytes at the bus's speed: an RTX 5090 on eight lanes of
+    /// PCIe 5 reads it at 26.6 GB a second, on four at 13.3 (`measure_a_matrix_in_the_hosts_memory`), where its own
+    /// memory gives 1,400.
+    pub(crate) fn host_buffer(&self, bytes: &[u8]) -> Option<wgpu::Buffer> {
+        if bytes.is_empty() || bytes.len() % 4 != 0 || !self.device.features().contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS) {
+            return None;
+        }
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("oaiy-host-weights"),
+            size: bytes.len() as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        // (a piece at a time, the writes' staging let go as `upload_rows` lets its own)
+        const PIECE: usize = 64 << 20;
+        for (i, piece) in bytes.chunks(PIECE).enumerate() {
+            self.write(&buffer, (i * PIECE) as u64, piece);
+            let pending = self.staged.fetch_add(piece.len() as u64, Ordering::Relaxed) + piece.len() as u64;
+            if pending >= 256 << 20 {
+                self.staged.store(0, Ordering::Relaxed);
+                self.queue().submit([]);
+                self.wait(None);
+            }
+        }
+        Some(buffer)
+    }
+
     /// Upload whole rows into buffers below the binding limit.
     fn upload_rows(&self, bytes: &[u8], row_bytes: usize, _hint: usize) -> Vec<(wgpu::Buffer, u32, u32)> {
         let rows = bytes.len() / row_bytes;
@@ -1291,9 +1322,12 @@ impl WgpuBackend {
         // SAFETY: wgpu's cooperative matrices are an experimental feature (its implementation may misbehave where
         // misused); only the prompt kernels use them, each checked against the f32 kernels (OAIY_NO_COOP: none).
         let experimental = if coop.is_empty() { wgpu::ExperimentalFeatures::disabled() } else { unsafe { wgpu::ExperimentalFeatures::enabled() } };
+        // storage buffers in the host's memory (mappable ones), where the adapter has them: weights a card has no
+        // room for, read over the bus by the kernels themselves
+        let mappable = adapter.features() & wgpu::Features::MAPPABLE_PRIMARY_BUFFERS;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("oaiy"),
-            required_features: timestamps | coop,
+            required_features: timestamps | coop | mappable,
             required_limits: limits.clone(),
             experimental_features: experimental,
             ..Default::default()
@@ -1457,6 +1491,13 @@ impl WgpuBackend {
     /// Bytes of weights placed on the GPU, and the budget.
     pub fn usage(&self) -> (u64, u64) {
         (self.used.load(Ordering::Relaxed), self.budget)
+    }
+
+    /// Whether this device's kernels can read weights from the host's memory ([`Gpu::host_buffer`]): a card of its own
+    /// on Vulkan, whose backend puts such a buffer in the system's memory (an integrated GPU's memory is the
+    /// system's already, and the other backends say nothing of where a mappable buffer goes).
+    pub fn host_weights(&self) -> bool {
+        self.gpu.device.features().contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS) && self.summary.backend == "Vulkan" && self.summary.device_type == "DiscreteGpu"
     }
 
     /// [`ggml_rs::DeviceChain::copy_weight`]: `w`'s buffers as another adapter holds them (blocks padded alike) read
