@@ -395,10 +395,18 @@ fn generate_webgpu(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
         host_bytes: 0,
         streamed_bytes: 0,
     };
+    let opened = clock.elapsed().as_secs_f64();
     let unet = crate::sdxl_wgpu::WgpuUnet::load(&mut stages.weights, UNET, &config::UNetConfig::sdxl_1_0(), r.device)?;
+    let unet_at = clock.elapsed().as_secs_f64();
     let vae = crate::sdxl_vae_wgpu::WgpuSdxlVae::load_on(&mut stages.weights, VAE, &config::VaeConfig::sdxl_default(), unet.backend().clone())?;
+    let vae_at = clock.elapsed().as_secs_f64();
     let (cl, cg) = stages.clips(&dev, DType::F32)?;
     let load_seconds = clock.elapsed().as_secs_f64();
+    // (OAIY_LOAD_PROFILE: where the loading went)
+    if std::env::var_os("OAIY_LOAD_PROFILE").is_some() {
+        let ns = |i: usize| crate::sdxl_wgpu::LOAD_NS[i].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;
+        eprintln!("load: the device and the checkpoint's index {opened:.2} s, the UNet {:.2} s (reading as f32 {:.2}, packing {:.2}, uploading {:.2}), the VAE {:.2} s, the text encoders {:.2} s", unet_at - opened, ns(0), ns(1), ns(2), vae_at - unet_at, load_seconds - vae_at);
+    }
     let sigmas = scheduler::sdxl_default_sigmas(r.steps);
     let (lh, lw) = (r.height / 8, r.width / 8);
     let row = |t: &Tensor, i: usize| -> Result<Vec<f32>> { t.narrow(0, i, 1)?.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>() };

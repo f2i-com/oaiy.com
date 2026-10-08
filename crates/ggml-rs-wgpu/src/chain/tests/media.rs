@@ -1081,3 +1081,27 @@ fn snake_beta_without_aliasing_is_the_steps_written_out() {
         assert!(big > 0.0 && worst <= 2e-5 * big.max(1.0), "{len} steps of {c}, {ku} and {kd} taps: {worst} off of a largest {big}");
     }
 }
+
+/// A convolution's weights packed from their F16 bytes are the words the same values give as f32: 1x1 and 3x3,
+/// channels a multiple of 32 and not; and an infinity among them is refused.
+#[test]
+fn a_convolutions_f16_bytes_pack_as_its_f32_values() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    let mut next = rng(57);
+    for (cout, cin, k) in [(5usize, 3usize, 3usize), (8, 32, 1), (4, 40, 3), (2, 64, 7)] {
+        let halves: Vec<u16> = (0..cout * cin * k * k).map(|_| half::f16::from_f32(next() * 3.0).to_bits()).collect();
+        let bytes: Vec<u8> = halves.iter().flat_map(|h| h.to_le_bytes()).collect();
+        let values: Vec<f32> = halves.iter().map(|h| half::f16::from_bits(*h).to_f32()).collect();
+        let (got, want) = (b.conv_weights_halves(&bytes, cout, cin, k).expect("finite halves"), DeviceChain::conv_weights(&b, &values, cout, cin, k).expect("values in f16's range"));
+        assert_eq!(got.len, want.len, "{cout}x{cin}x{k}");
+        let read = |v: &DeviceVec| {
+            let mut rec = b.begin();
+            rec.read(v);
+            rec.finish().pop().unwrap().iter().map(|w| w.to_bits()).collect::<Vec<u32>>()
+        };
+        assert_eq!(read(&got), read(&want), "{cout}x{cin}x{k}");
+        let mut bad = bytes.clone();
+        (bad[2], bad[3]) = (0x00, 0x7c);
+        assert!(b.conv_weights_halves(&bad, cout, cin, k).is_none(), "an infinity");
+    }
+}

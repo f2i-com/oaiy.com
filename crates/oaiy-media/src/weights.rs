@@ -101,6 +101,21 @@ impl Weights {
         }
     }
 
+    /// `name`'s bytes and shape where a safetensors file keeps it as F16 (little-endian halves, read on several
+    /// cores): what a device that holds f16 takes as they are. None for anything else (ComfyUI's quantized weights
+    /// too).
+    pub fn raw_f16(&self, name: &str) -> Result<Option<(Vec<u8>, Vec<usize>)>> {
+        let Ok(key) = self.resolve(name) else { return Ok(None) };
+        let Self::Safe(s) = self else { return Ok(None) };
+        let info = s.info(&key).map_err(candle_core::Error::wrap)?;
+        let quantized = key.strip_suffix(".weight").is_some_and(|p| s.get(&format!("{p}.comfy_quant")).is_some());
+        if info.dtype != Dtype::F16 || quantized {
+            return Ok(None);
+        }
+        let shape = info.shape.clone();
+        Ok(Some((s.read_par(&key).map_err(candle_core::Error::wrap)?, shape)))
+    }
+
     /// `name` as ComfyUI's W4A8 keeps it ([`crate::comfy_quant::W4a8`]: a GPU's to decode), None for anything else.
     pub fn w4a8(&self, name: &str) -> Result<Option<crate::comfy_quant::W4a8>> {
         let Ok(key) = self.resolve(name) else { return Ok(None) };

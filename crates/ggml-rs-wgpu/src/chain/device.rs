@@ -1,6 +1,48 @@
 //! The backend as a chain's device: its vectors, what it holds, and a recording's start.
 use super::*;
 
+impl WgpuBackend {
+    /// [`DeviceChain::conv_weights`] from the weights' own F16 bytes (`[cout, cin, k, k]` little-endian halves, as a
+    /// safetensors file keeps them): each half moved to its place on every core, none converted (through f32 a UNet's
+    /// convolutions were decoded on one core and rounded back: half of its load). None where a half is an infinity
+    /// or not a number, or the shape is not the bytes'.
+    pub fn conv_weights_halves(&self, w: &[u8], cout: usize, cin: usize, k: usize) -> Option<DeviceVec> {
+        use rayon::prelude::*;
+        let taps = k * k;
+        if !matches!(k, 1 | 3 | 7) || w.len() != cout * cin * taps * 2 {
+            return None;
+        }
+        let cp = cin.div_ceil(32) * 32;
+        // an output's taps in turn, a tap's channels padded to 32: two halves a word
+        let mut words = vec![0f32; cout * taps * cp / 2];
+        let fine = std::sync::atomic::AtomicBool::new(true);
+        words.par_chunks_mut(taps * cp / 2).zip(w.par_chunks(cin * taps * 2)).for_each(|(out, src)| {
+            let mut ok = true;
+            let mut row = vec![0u16; taps * cp];
+            for c in 0..cin {
+                for tap in 0..taps {
+                    let at = (c * taps + tap) * 2;
+                    let h = u16::from_le_bytes([src[at], src[at + 1]]);
+                    ok &= h & 0x7c00 != 0x7c00;
+                    row[tap * cp + c] = h;
+                }
+            }
+            for (o, p) in out.iter_mut().zip(row.chunks_exact(2)) {
+                *o = f32::from_bits(p[0] as u32 | (p[1] as u32) << 16);
+            }
+            if !ok {
+                fine.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        if !fine.into_inner() {
+            return None;
+        }
+        let v = self.vec(words.len());
+        DeviceChain::upload(self, &v, &words);
+        Some(v)
+    }
+}
+
 impl DeviceChain for WgpuBackend {
     fn pieces_in_flight_at_most(&self, pieces: usize) {
         WgpuBackend::pieces_in_flight_at_most(self, pieces);

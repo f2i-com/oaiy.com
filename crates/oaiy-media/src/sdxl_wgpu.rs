@@ -107,26 +107,50 @@ struct Loader<'a> {
     prefix: &'a str,
 }
 
+/// Where a load's time went, in nanoseconds (OAIY_LOAD_PROFILE prints them): reading tensors as f32, packing them
+/// for the device, and uploading.
+pub(crate) static LOAD_NS: [std::sync::atomic::AtomicU64; 3] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
+fn timed<T>(at: usize, f: impl FnOnce() -> T) -> T {
+    let t = std::time::Instant::now();
+    let out = f();
+    LOAD_NS[at].fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    out
+}
+
 impl Loader<'_> {
     fn values(&mut self, key: &str) -> Result<(Vec<f32>, Vec<usize>)> {
-        let t = self.w.tensor(&format!("{}{key}", self.prefix), &Device::Cpu, DType::F32)?;
-        Ok((t.flatten_all()?.to_vec1::<f32>()?, t.dims().to_vec()))
+        timed(0, || {
+            let t = self.w.tensor(&format!("{}{key}", self.prefix), &Device::Cpu, DType::F32)?;
+            Ok((t.flatten_all()?.to_vec1::<f32>()?, t.dims().to_vec()))
+        })
     }
 
     fn vec(&mut self, key: &str) -> Result<DeviceVec> {
         let (values, _) = self.values(key)?;
         let v = self.gpu.vec(values.len());
-        self.gpu.upload(&v, &values);
+        timed(2, || self.gpu.upload(&v, &values));
         Ok(v)
     }
 
     fn conv(&mut self, name: &str) -> Result<Conv> {
+        // an F16 checkpoint's: its halves moved to their places as they are (through f32, on one core, the UNet's
+        // convolutions and matrices were 9 of a job's 14 s of loading)
+        let key = format!("{}{name}.weight", self.prefix);
+        if let Some((bytes, dims)) = timed(0, || self.w.raw_f16(&key))? {
+            let &[cout, cin, k, kw] = dims.as_slice() else { candle_core::bail!("{name}: a convolution of shape {dims:?}") };
+            if k != kw || !matches!(k, 1 | 3) {
+                candle_core::bail!("{name}: a {k}x{kw} convolution");
+            }
+            let w = timed(1, || self.gpu.conv_weights_halves(&bytes, cout, cin, k)).ok_or_else(|| err(format!("{name}: a convolution's weight past f16's range")))?;
+            return Ok(Conv { w, b: self.vec(&format!("{name}.bias"))?, cout, cin, k });
+        }
         let (values, dims) = self.values(&format!("{name}.weight"))?;
         let &[cout, cin, k, kw] = dims.as_slice() else { candle_core::bail!("{name}: a convolution of shape {dims:?}") };
         if k != kw || !matches!(k, 1 | 3) {
             candle_core::bail!("{name}: a {k}x{kw} convolution");
         }
-        let w = self.gpu.conv_weights(&values, cout, cin, k).ok_or_else(|| err(format!("{name}: a convolution's weight past f16's range")))?;
+        let w = timed(1, || self.gpu.conv_weights(&values, cout, cin, k)).ok_or_else(|| err(format!("{name}: a convolution's weight past f16's range")))?;
         Ok(Conv { w, b: self.vec(&format!("{name}.bias"))?, cout, cin, k })
     }
 
@@ -136,6 +160,23 @@ impl Loader<'_> {
 
     /// `names`' matrices one below another as f16 (each `[_, k]`), with the first's bias where `bias`.
     fn lin(&mut self, names: &[&str], bias: bool) -> Result<Lin> {
+        // (an F16 checkpoint's matrices: their bytes one after another are the words)
+        let raw: Vec<Option<(Vec<u8>, Vec<usize>)>> = timed(0, || names.iter().map(|name| self.w.raw_f16(&format!("{}{name}.weight", self.prefix))).collect::<Result<_>>())?;
+        if raw.iter().all(|r| r.is_some()) {
+            let (mut bytes, mut n, mut k) = (Vec::new(), 0, 0);
+            for (name, (b, dims)) in names.iter().zip(raw.into_iter().flatten()) {
+                let &[rows, cols] = dims.as_slice() else { candle_core::bail!("{name}: a matrix of shape {dims:?}") };
+                if k != 0 && cols != k {
+                    candle_core::bail!("{name}: {cols} wide beside {k}");
+                }
+                (n, k) = (n + rows, cols);
+                bytes.extend(b);
+            }
+            let words = timed(1, || crate::wgpu_weights::f16_words_halves(&bytes)).ok_or_else(|| err(format!("{}: a weight past f16's range", names[0])))?;
+            let w = self.gpu.vec(words.len());
+            timed(2, || self.gpu.upload(&w, &words));
+            return Ok(Lin { w, b: if bias { Some(self.vec(&format!("{}.bias", names[0]))?) } else { None }, n, k });
+        }
         let (mut all, mut n, mut k) = (Vec::new(), 0, 0);
         for name in names {
             let (values, dims) = self.values(&format!("{name}.weight"))?;
@@ -146,9 +187,9 @@ impl Loader<'_> {
             (n, k) = (n + rows, cols);
             all.extend(values);
         }
-        let words = crate::wgpu_weights::f16_words_f32(&all).ok_or_else(|| err(format!("{}: a weight past f16's range", names[0])))?;
+        let words = timed(1, || crate::wgpu_weights::f16_words_f32(&all)).ok_or_else(|| err(format!("{}: a weight past f16's range", names[0])))?;
         let w = self.gpu.vec(words.len());
-        self.gpu.upload(&w, &words);
+        timed(2, || self.gpu.upload(&w, &words));
         Ok(Lin { w, b: if bias { Some(self.vec(&format!("{}.bias", names[0]))?) } else { None }, n, k })
     }
 

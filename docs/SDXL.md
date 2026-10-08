@@ -11,7 +11,13 @@ Build with `tools/qwen-image/build.ps1` on Windows, or
 nothing of a GPU's is needed to build it). A job runs on WebGPU, on a GPU of any
 make: the UNet and the VAE there, the two CLIP encoders on the CPU. `backend: "cpu"`
 runs it with Candle on the CPU instead, which is the reference and slow; `backend:
-"cuda"` is refused by name. The existing [media controller setup](QWEN_IMAGE.md) and
+"cuda"` is refused by name. On one RTX 5090 at a 400 W cap (2026-10-08), a 1024x1024
+picture of 16 steps at CFG 5 is a job of 13.3 s: 7.2 s loading (the UNet 4.9 s, the
+CLIP encoders 1.9 s), then the prompt's encoding on the CPU 2.5 s, the steps 2.7 s
+and the decode 0.8 s. An F16 checkpoint's matrices and convolutions go to the card
+straight from their bytes; decoded to f32 on one core and rounded back, as they were,
+the same job took 20.5 s (14.4 s loading) for the same picture, pixel for pixel.
+`OAIY_LOAD_PROFILE` prints the loading's parts. The existing [media controller setup](QWEN_IMAGE.md) and
 image API supervise SDXL jobs too. Restart the server/coder-cli after rebuilding.
 
 ## Catalog

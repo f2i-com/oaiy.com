@@ -81,6 +81,21 @@ pub fn f16_words(bytes: &[u8]) -> Option<Vec<f32>> {
     })
 }
 
+/// F16 bytes (little-endian halves) as f16 words: the bytes as they are, two halves a word; None where a half is an
+/// infinity or not a number (past f16's range, as the other ways in say it) or the halves are odd in number.
+pub fn f16_words_halves(bytes: &[u8]) -> Option<Vec<f32>> {
+    if bytes.len() % 4 != 0 {
+        return None;
+    }
+    checked(bytes, 4, bytes.len() / 4, 1, |src, dst, fine| {
+        for (b, w) in src.chunks_exact(4).zip(dst.iter_mut()) {
+            let word = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            *fine &= word & 0x7c00 != 0x7c00 && word & 0x7c00_0000 != 0x7c00_0000;
+            *w = f32::from_bits(word);
+        }
+    })
+}
+
 /// [`f16_words`] of values already f32.
 pub fn f16_words_f32(values: &[f32]) -> Option<Vec<f32>> {
     if values.len() % 2 != 0 {
@@ -166,7 +181,11 @@ pub fn f16_matrix(w: &mut Weights, gpu: &ggml_rs_wgpu::WgpuBackend, name: &str, 
             let words = match w.raw(&key)? {
                 Some(Raw::Bf16(b)) => f16_words(&b),
                 Some(Raw::Ggml(t, b)) => f16_words_ggml(t, &b, n, k),
-                None => f16_words_f32(&w.tensor(&key, &Device::Cpu, DType::F32)?.flatten_all()?.to_vec1::<f32>()?),
+                None => match w.raw_f16(&key)? {
+                    // (an F16 file's: its bytes as they are)
+                    Some((b, _)) => f16_words_halves(&b),
+                    None => f16_words_f32(&w.tensor(&key, &Device::Cpu, DType::F32)?.flatten_all()?.to_vec1::<f32>()?),
+                },
             }
             .ok_or_else(|| err(format!("{name}: a weight past f16's range")))?;
             let v = gpu.vec(words.len());
@@ -190,4 +209,25 @@ pub fn f16_matrix(w: &mut Weights, gpu: &ggml_rs_wgpu::WgpuBackend, name: &str, 
         }
     }
     Ok((v, n, k))
+}
+
+#[cfg(test)]
+mod f16_tests {
+    use super::*;
+
+    /// F16 bytes as words are what the same values give as f32 (every half's bits kept, the subnormals and both
+    /// zeros among them), and an infinity or a NaN is refused as a value past f16's range is.
+    #[test]
+    fn f16_bytes_are_their_values_words() {
+        let halves: Vec<u16> = (0..4096u32).map(|i| (i.wrapping_mul(2654435761) >> 16) as u16).filter(|h| h & 0x7c00 != 0x7c00).chain([0, 0x8000, 1, 0x8001, 0x03ff, 0x7bff, 0xfbff]).collect();
+        let halves = &halves[..halves.len() / 2 * 2];
+        let bytes: Vec<u8> = halves.iter().flat_map(|h| h.to_le_bytes()).collect();
+        let values: Vec<f32> = halves.iter().map(|h| half::f16::from_bits(*h).to_f32()).collect();
+        let (got, want) = (f16_words_halves(&bytes).unwrap(), f16_words_f32(&values).unwrap());
+        assert_eq!(got.iter().map(|w| w.to_bits()).collect::<Vec<_>>(), want.iter().map(|w| w.to_bits()).collect::<Vec<_>>());
+        for bad in [0x7c00u16, 0xfc00, 0x7e00] {
+            let bytes: Vec<u8> = [1u16, bad].iter().flat_map(|h| h.to_le_bytes()).collect();
+            assert!(f16_words_halves(&bytes).is_none(), "{bad:#x}");
+        }
+    }
 }
