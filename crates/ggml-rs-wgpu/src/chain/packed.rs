@@ -145,7 +145,8 @@ impl Recorder<'_> {
                 crate::exl3::upload_u32(self.backend, &order, &(0..rows as u32).collect::<Vec<_>>());
                 order
             };
-            self.dispatch_wide(crate::exl3::few_name(rows), crate::exl3::g_few(rows), [words, buffer(&xh), buffer(&jobs), buffer(&order), &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, splits, 0, 0], grid(1));
+            let (few_name, few) = crate::exl3::few_kernel(rows, g.tile_words());
+            self.dispatch_wide(few_name, few, [words, buffer(&xh), buffer(&jobs), buffer(&order), &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, splits, 0, 0], grid(1));
         } else {
             // a prompt's rows summed as the projection's own passes sum them (each tile decoded once for 64 of them here),
             // and a last lone row of a pass as one row is

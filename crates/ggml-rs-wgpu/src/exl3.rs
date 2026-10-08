@@ -309,8 +309,8 @@ fn lanes_fixed(tw: usize) -> Lanes {
     assert!((aligned..=4).contains(&words), "a lane's views lie in the words it loads");
     let mut loads: String = (0..words).map(|i| format!("        let q{i} = words[tile + {}];\n", ["w0", "o1", "o2", "o3"][i])).collect();
     for i in 0..aligned {
-        // (a shift of 32 is no shift at all, so the next word's part goes down by one and then by `31 - s`)
-        loads += &if i + 1 < words { format!("        let a{i} = (q{i} << s) | ((q{} >> 1u) >> r);\n", i + 1) } else { format!("        let a{i} = q{i} << s;\n") };
+        // (a shift of 32 is no shift at all, so the next word's part goes down by one and then by `31 - into`)
+        loads += &if i + 1 < words { format!("        let a{i} = (q{i} << into) | ((q{} >> 1u) >> rest);\n", i + 1) } else { format!("        let a{i} = q{i} << into;\n") };
     }
     for i in 0..2 {
         if at.iter().any(|&(view, _)| view == 2 * i + 1) {
@@ -319,7 +319,7 @@ fn lanes_fixed(tw: usize) -> Lanes {
     }
     Lanes {
         place: "    places[t] = 48u - window(t, tw).y;\n".into(),
-        held: "    let s = places[8u * l];\n    let r = 31u - s;\n".into(),
+        held: "    let into = places[8u * l];\n    let rest = 31u - into;\n".into(),
         loads,
         codes: at.iter().map(|&(view, shift)| format!("{} >> {shift}u", ["a0", "m0", "a1", "m1", "a2"][view])).collect(),
     }
@@ -1322,7 +1322,7 @@ pub(crate) fn coop_name(rows: usize) -> &'static str {
     }
 }
 
-/// The most rows [`g_few`] takes a block.
+/// The most rows [`few_kernel`] takes a block.
 pub(crate) const FEW_MAX: usize = 8;
 
 /// The matmul for a few rows of one matrix (a check of drafted tokens, a short chunk): [`g_mm_source`]'s lanes, each
@@ -1331,13 +1331,26 @@ pub(crate) const FEW_MAX: usize = 8;
 /// a block is `rows` jobs of one matrix from `order` (its unused places [`NONE`]; a block with none ends at once), each
 /// job's partial sums to `part[(j * splits + s) * n..]` as [`g_mm_source`]'s. `p[0]`: n, k, tile words, splits; `p[1]`:
 /// words a matrix, the pass's first block.
-pub(crate) fn g_few(rows: usize) -> &'static str {
-    static SOURCES: [std::sync::OnceLock<String>; FEW_MAX - 1] = [const { std::sync::OnceLock::new() }; FEW_MAX - 1];
+///
+/// Its kernel and the kernel's name for tiles of `tile_words`: written for that rate as the one-row kernel is
+/// ([`lanes_fixed`]; the general form under OAIY_EXL3_GENERAL), each made when first met.
+pub(crate) fn few_kernel(rows: usize, tile_words: usize) -> (&'static str, &'static str) {
+    type Made = [[std::sync::OnceLock<String>; RATES.len() + 1]; FEW_MAX - 1];
+    static NAMES: Made = [const { [const { std::sync::OnceLock::new() }; RATES.len() + 1] }; FEW_MAX - 1];
+    static SOURCES: Made = [const { [const { std::sync::OnceLock::new() }; RATES.len() + 1] }; FEW_MAX - 1];
     assert!((2..=FEW_MAX).contains(&rows), "a block of 2 to {FEW_MAX} rows");
-    SOURCES[rows - 2].get_or_init(|| g_few_source(rows))
+    let rate = RATES.iter().position(|&rate| rate == tile_words).filter(|_| !general_only());
+    let at = rate.unwrap_or(RATES.len());
+    let name = NAMES[rows - 2][at].get_or_init(|| match rate {
+        Some(_) => format!("exl3-few-{rows}-{tile_words}"),
+        None => format!("exl3-few-{rows}"),
+    });
+    (name, SOURCES[rows - 2][at].get_or_init(|| g_few_source(rows, rate.map(|_| tile_words))))
 }
 
-fn g_few_source(rows: usize) -> String {
+fn g_few_source(rows: usize, fixed: Option<usize>) -> String {
+    let Lanes { place, held, loads, codes } = fixed.map_or_else(lanes_general, lanes_fixed);
+    let codes: String = codes.iter().enumerate().map(|(jj, code)| format!("        let c{jj} = decode_at({code});\n")).collect();
     let each = |f: &dyn Fn(usize) -> String| (0..rows).map(f).collect::<Vec<_>>().join("\n");
     let ids = each(&|i| format!("    let j{i} = order[blk * {rows}u + {i}u];"));
     let regs = each(&|i| format!("    var lo{i} = 0.0;\n    var hi{i} = 0.0;"));
@@ -1370,7 +1383,8 @@ fn g_few_source(rows: usize) -> String {
 @group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
 
 var<workgroup> red: array<vec2<f32>, {red_len}>;
-// every code's place in a tile (`place`), the workgroup's threads one each: the same in every tile
+// every code's place in a tile (`place`; in a kernel written for one rate, how far into its word it starts, read of
+// a lane's first code alone), the workgroup's threads one each: the same in every tile
 var<workgroup> places: array<u32, 256>;
 // a code's value by its bytes' sum (0 to 1,020), the workgroup's threads four each (as the one-row kernel's)
 var<workgroup> values: array<f32, 1024>;
@@ -1443,8 +1457,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     let nw = tw / 2u;
     let rb = 2u * (l % 4u);
     let first = window(8u * (t / 8u), tw).x;
-    places[t] = place(t, tw, first);
-    for (var i = 0u; i < 4u; i = i + 1u) {{
+{place}    for (var i = 0u; i < 4u; i = i + 1u) {{
         let sum = 4u * t + i;
         values[sum] = round_f16(f32(1024u + sum) * 0.00676727294921875 - 10.3828125);
     }}
@@ -1456,30 +1469,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     let o1 = (w0 + 1u) % nw;
     let o2 = (w0 + 2u) % nw;
     let o3 = (w0 + 3u) % nw;
-    let a0 = places[8u * l];
-    let a1 = places[8u * l + 1u];
-    let a2 = places[8u * l + 2u];
-    let a3 = places[8u * l + 3u];
-    let a4 = places[8u * l + 4u];
-    let a5 = places[8u * l + 5u];
-    let a6 = places[8u * l + 6u];
-    let a7 = places[8u * l + 7u];
-{regs}
+{held}{regs}
     for (var kt = ks + warp; kt < ke; kt = kt + 8u) {{
         let tile = base + (kt * ntiles + nt) * nw;
-        let q0 = words[tile + w0];
-        let q1 = words[tile + o1];
-        let q2 = words[tile + o2];
-        let q3 = words[tile + o3];
-        let c0 = decode_at(code_in(q0, q1, q2, q3, a0));
-        let c1 = decode_at(code_in(q0, q1, q2, q3, a1));
-        let c2 = decode_at(code_in(q0, q1, q2, q3, a2));
-        let c3 = decode_at(code_in(q0, q1, q2, q3, a3));
-        let c4 = decode_at(code_in(q0, q1, q2, q3, a4));
-        let c5 = decode_at(code_in(q0, q1, q2, q3, a5));
-        let c6 = decode_at(code_in(q0, q1, q2, q3, a6));
-        let c7 = decode_at(code_in(q0, q1, q2, q3, a7));
-{sums}
+{loads}{codes}{sums}
     }}
 {reds}
     workgroupBarrier();
@@ -1542,7 +1535,7 @@ impl FewScratch {
     }
 }
 
-/// A check's routed experts in blocks for [`g_few`], from its down jobs ([`DOWN_JOBS`]'s: pair `j`'s expert, `p[0].x`
+/// A check's routed experts in blocks for [`few_kernel`], from its down jobs ([`DOWN_JOBS`]'s: pair `j`'s expert, `p[0].x`
 /// pairs, at most 256): each expert's pairs (at most `p[0].y`, the block's rows, as a row takes an expert once) a block
 /// of their own in their list's order, the blocks in the order their experts first appear; the down jobs' order
 /// (`order_d`, `p[0].x` blocks of `p[0].y`) and the gate and up jobs' (`order_gu`: expert block `b`'s gate jobs `2j` in
@@ -1595,7 +1588,7 @@ fn main(@builtin(local_invocation_index) t: u32) {
 "#;
 
 /// How a group's jobs are taken: each a workgroup's (a step's, [`g_mm_source`]); a prompt's in blocks of one matrix
-/// ([`g_many`], the order and its blocks); a check's few rows' grouped on the GPU in blocks of `rows` ([`g_few`], the
+/// ([`g_many`], the order and its blocks); a check's few rows' grouped on the GPU in blocks of `rows` ([`few_kernel`], the
 /// order and the most blocks it can have), each job's sums the one-job kernel's.
 #[derive(Clone, Copy)]
 enum Order<'a> {
@@ -1603,11 +1596,6 @@ enum Order<'a> {
     /// The order, its blocks, and the jobs a block.
     Many(&'a DeviceVec, usize, usize),
     Few(&'a DeviceVec, usize, usize),
-}
-
-/// The pipeline name of [`g_few`]'s kernel for blocks of `rows`.
-pub(crate) fn few_name(rows: usize) -> &'static str {
-    ["exl3-few-2", "exl3-few-3", "exl3-few-4", "exl3-few-5", "exl3-few-6", "exl3-few-7", "exl3-few-8"][rows - 2]
 }
 
 /// An unused place in a block of [`g_many`]'s job order.
@@ -2274,7 +2262,8 @@ impl Exl3MoeGrouped {
                 let ob = buf(order);
                 for first in (0..blocks).step_by(per) {
                     let these = per.min(blocks - first) as u32;
-                    rec.dispatch_wide(few_name(rows), g_few(rows), [&g.words, &xhb, &jb, &ob, &d, &d, &pb, &drw], &[g.n as u32, g.k as u32, g.tw as u32, splits, g.mwords as u32, first as u32], (ntiles.min(65535), ntiles.div_ceil(65535), these * splits));
+                    let (name, source) = few_kernel(rows, g.tw);
+                    rec.dispatch_wide(name, source, [&g.words, &xhb, &jb, &ob, &d, &d, &pb, &drw], &[g.n as u32, g.k as u32, g.tw as u32, splits, g.mwords as u32, first as u32], (ntiles.min(65535), ntiles.div_ceil(65535), these * splits));
                 }
             }
             Order::Jobs => {
@@ -3190,10 +3179,10 @@ mod tests {
             for (rows, used) in [(4usize, 1usize), (4, 2), (4, 4), (2, 1), (2, 2), (8, 1)] {
                 let order: Vec<u32> = (0..rows as u32).map(|r| if (r as usize) < used { r } else { NONE }).collect();
                 let ov = u32_vec(&b, &order);
-                line += &format!(" few-{rows} with {used} {:.1} us;", time(few_name(rows), g_few(rows), Some(&ov), 1));
+                line += &format!(" few-{rows} with {used} {:.1} us;", time(few_kernel(rows, 48).0, few_kernel(rows, 48).1, Some(&ov), 1));
             }
             let empty = u32_vec(&b, &vec![NONE; 4 * 40]);
-            line += &format!(" 40 empty blocks of 4 {:.1} us", time(few_name(4), g_few(4), Some(&empty), 40));
+            line += &format!(" 40 empty blocks of 4 {:.1} us", time(few_kernel(4, 48).0, few_kernel(4, 48).1, Some(&empty), 40));
             eprintln!("{line}");
         }
     }
