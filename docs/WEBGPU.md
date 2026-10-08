@@ -158,9 +158,14 @@ Since then (2026-10-09), through the server on two RTX 5090s with 152 GB of RAM 
 experts and the same drive: the experts are read into RAM and onto the second card
 while the server idles (130 s after it loads), and a 48-token reply then runs at 5.6
 tokens a second on a first-time prompt and 6.9 to 7.7 on one read before; a 93-token
-prompt takes 7.5 to 7.9 s and a 276-token one 19.6 to 19.8. The CUDA build on this
-drive gave 6.4 to 7.3 and 7.9 to 10.5 tokens a second, and 5.1 to 6.1 s and 18.2 to
-18.9 s. What did it, in the order of what each was worth: the experts each in one
+prompt takes 7.5 to 7.9 s and a 276-token one 19.6 to 19.8. The first-time figure is
+after a pause of 30 s in which the cards took the experts the first requests had used
+(798 of them); with requests back to back from the start it was 4.4 to 4.9. The CUDA
+build on this drive, both cards too, gave 6.4 to 7.3 and 7.9 to 10.5 tokens a second,
+and 5.1 to 6.1 s and 18.2 to 18.9 s. On one RTX 5090 (`--devices 0`: the trunk and
+960 experts on it, no second card's share) the same replies run at 4.8 to 5.2 tokens a
+second first-time and 5.4 to 6.1 read before, the prompts in 8.3 to 8.8 s and 21.5 to
+22.0 s: the same code, with more of a step's experts on the CPU. What did it, in the order of what each was worth: the experts each in one
 tier and the cards rebalanced while idle (above); a decode step's dense calls through
 buffers the device keeps (`dense::Arena`: one write of the inputs, one of the
 parameters, kept bind groups, one read-back polled for, where each call made and freed

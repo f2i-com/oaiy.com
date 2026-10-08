@@ -82,6 +82,8 @@ pub(crate) struct Engine {
     kernel: Option<Arc<WgpuExperts>>,
     /// Experts the idle rebalance has moved since it last said so.
     rebalanced: usize,
+    /// Whether the drive may be read while no request waits (the idle reading, the rebalance).
+    idle: bool,
 }
 
 /// The idle reading of the routed experts into the RAM tier: where it is, and what it has read so far.
@@ -112,11 +114,11 @@ fn reusable(tokens: &[u32], prompt: &[u32]) -> usize {
 impl Engine {
     pub(crate) fn new(model: dsv41::model::Model, tok: Arc<dsv41::tokenizer::Tokenizer>, log: bool) -> Engine {
         let eos = model.cfg.eos_token_id;
-        // (OAIY_DSV41_NO_WARM: leave the drive alone between requests)
-        let warm = std::env::var_os("OAIY_DSV41_NO_WARM")
-            .is_none()
-            .then(|| Warm { cursor: 0, started: None, reading: std::time::Duration::ZERO, bytes_before: model.expert_cache().stats().bytes_read });
-        Engine { model, tok, covered: Vec::new(), checkpoint: None, eos, log, warm, kernel: None, rebalanced: 0 }
+        // (OAIY_DSV41_NO_WARM: leave the drive alone between requests: neither the idle reading nor the rebalance,
+        // which reads a record for each expert a card gives up)
+        let idle = std::env::var_os("OAIY_DSV41_NO_WARM").is_none();
+        let warm = idle.then(|| Warm { cursor: 0, started: None, reading: std::time::Duration::ZERO, bytes_before: model.expert_cache().stats().bytes_read });
+        Engine { model, tok, covered: Vec::new(), checkpoint: None, eos, log, warm, kernel: None, rebalanced: 0, idle }
     }
 
     /// The experts' kernel the model was given, when other cards hold a share of them: the idle reading fills those
@@ -166,6 +168,9 @@ impl Engine {
     /// An idle slice of the cards' rebalance ([`WgpuExperts::rebalance`]): whether it moved any (false: there is
     /// nothing more to move, said once with what was moved since the last request).
     fn rebalance_some(&mut self) -> bool {
+        if !self.idle {
+            return false;
+        }
         let Some(k) = self.kernel.as_deref() else { return false };
         let moved = k.rebalance(self.model.expert_store().as_ref(), self.model.expert_cache(), REBALANCE_SLICE);
         self.rebalanced += moved;
@@ -392,10 +397,13 @@ pub(crate) struct WgpuExperts {
     exclusive: std::sync::atomic::AtomicBool,
     /// The share of the experts the computer's other GPUs hold ([`WgpuExperts::pin_on`]).
     pinned: Option<Pinned>,
-    /// Every expert's uses since the model loaded, a call that routed to it one (a decode step, or a prompt's pass):
-    /// what [`WgpuExperts::rebalance`] ranks by. The first card's own counts are in tokens and halve as it decodes,
-    /// to choose among a prompt's; these say what a card is worth holding over a session.
+    /// Every expert's uses, a call that routed to it one (a decode step, or a prompt's pass), halved every
+    /// [`USES_AGE_TOKENS`] decode steps: what [`WgpuExperts::rebalance`] ranks by. The first card's own counts are in
+    /// tokens and halve four times as often, to choose among a prompt's; these say what a card is worth holding over
+    /// the last few replies, and forget a topic the session has left.
     uses: Mutex<std::collections::HashMap<(u32, u32), u32>>,
+    /// Decode steps so far (for the counts' aging).
+    decoded: std::sync::atomic::AtomicU64,
     /// Experts the idle rebalance has moved onto the cards so far.
     moved: std::sync::atomic::AtomicU64,
 }
@@ -411,6 +419,10 @@ enum Place {
 /// [`REBALANCE_MARGIN`] more. Each move is an upload and a record read back from the drive, so two experts used about
 /// as much do not change places back and forth.
 const REBALANCE_MARGIN: u32 = 4;
+/// Decode steps after which every expert's count of uses halves ([`WgpuExperts::uses`]): some two or three replies.
+/// Unaged, an expert a long conversation used ten thousand times would keep its slot against one a new topic uses
+/// at every step for as long again.
+const USES_AGE_TOKENS: u64 = 512;
 
 /// Experts the other GPUs hold for good: a fixed share of every layer's (its last ones: the RAM tier's idle reading
 /// starts from the first), each read from the drive once into a slot of its own while the server idles and never
@@ -475,6 +487,7 @@ impl WgpuExperts {
             exclusive: std::sync::atomic::AtomicBool::new(false),
             pinned: None,
             uses: Mutex::new(std::collections::HashMap::new()),
+            decoded: std::sync::atomic::AtomicU64::new(0),
             moved: std::sync::atomic::AtomicU64::new(0),
         })
     }
@@ -597,7 +610,9 @@ impl WgpuExperts {
         }
     }
 
-    /// Whether `(layer, expert)` is one of the share the other GPUs hold for good (filled yet or not).
+    /// Whether `(layer, expert)` is one of the share the other GPUs are filled with at start-up (filled yet or not):
+    /// the idle reading's question, which leaves those out of RAM. It answers from the plan, not from what the cards
+    /// hold after a [`Self::rebalance`] ([`Self::pinned_now`] says that).
     pub(crate) fn pins(&self, layer: u32, expert: u32) -> bool {
         self.pinned.as_ref().is_some_and(|p| p.slot(layer, expert).is_some())
     }
@@ -822,6 +837,13 @@ impl dsv41::expert::ExpertsKernel for WgpuExperts {
     }
 
     fn pass_done(&self, tokens: usize, cache: &oaiy_engine::ecache::Ecache, store: &dyn oaiy_engine::store::WeightStore) {
+        if tokens == 1 && (self.decoded.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1) % USES_AGE_TOKENS == 0 {
+            let mut uses = self.uses.lock().unwrap_or_else(|p| p.into_inner());
+            uses.retain(|_, n| {
+                *n /= 2;
+                *n > 0
+            });
+        }
         if let Some(r) = &self.resident {
             let exclusive = self.exclusive.load(std::sync::atomic::Ordering::Relaxed);
             r.lock().unwrap_or_else(|p| p.into_inner()).pass_done(tokens, cache, store, exclusive);
@@ -1260,6 +1282,18 @@ mod tests {
         assert!(held == fresh && held.iter().any(|v| *v != 0.0), "the slot holds expert 4's record");
         assert_eq!(k.rebalance(&store, &cache, 8), 0, "and then there is nothing to move");
         assert_eq!(k.moved(), 2);
+        // The counts age. Experts 6 and 7 are then used thirty times: 5, which the card took in after twenty-one uses,
+        // would keep its slot against thirty (twice as much and four more is forty-six) but for the halving.
+        for _ in 0..USES_AGE_TOKENS {
+            k.pass_done(1, &cache, &store);
+        }
+        drop(cache.acquire(0, 7, &store).unwrap());
+        for _ in 0..30 {
+            k.holds(0, &[6, 7], &[1; 2]);
+        }
+        assert_eq!(k.rebalance(&store, &cache, 8), 2, "6 and 7 in place of the card's two least used, one of them 5");
+        assert_eq!(k.holds(0, &[1, 4, 5, 6, 7], &[1; 5]), [true, true, false, true, true]);
+        assert!(cache.probe(0, 5) && !cache.probe(0, 6) && !cache.probe(0, 7));
     }
 
     /// The trunk and a prompt's busy experts on the GPU give the CPU model's answer: on a prompt long enough for experts
