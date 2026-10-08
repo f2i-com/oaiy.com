@@ -350,7 +350,7 @@ impl Transformer {
     ) -> Result<Self> {
         Self::load_config(path, adapters, dev, dtype, budget, Config::default())
     }
-    fn load_config(
+    pub(crate) fn load_config(
         path: &Path,
         adapters: &[(PathBuf, f64)],
         dev: &Device,

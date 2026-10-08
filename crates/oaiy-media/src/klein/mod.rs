@@ -1,5 +1,8 @@
 //! Native FLUX.2 Klein 4B text-to-image, using published BFL-layout weights
 //! and runtime LoRA factors. No Python, engine sidecar, or weight conversion.
+//! On WebGPU (a job's `backend`, the default where the build has it) the text
+//! encoder, the transformer and the VAE's decoder run on the GPU
+//! ([`crate::klein_text_wgpu`], [`crate::klein_wgpu`], [`crate::sdxl_vae_wgpu`]).
 pub mod math;
 pub mod schedule;
 pub mod text;
@@ -28,10 +31,107 @@ pub struct Request {
     pub device: usize,
     pub distilled: bool,
     pub budget: Budget,
+    /// The text encoder and the transformer on WebGPU (`backend` "webgpu", or none named in a build that has it);
+    /// else Candle on the CPU (`backend` "cpu").
+    pub webgpu: bool,
 }
+
+/// The transformer a picture is sampled by: Candle's, or the chain's on WebGPU.
+enum Model {
+    Candle(transformer::Transformer),
+    #[cfg(feature = "webgpu")]
+    Wgpu(crate::klein_wgpu::WgpuKlein),
+}
+
+impl Model {
+    fn predict(&mut self, x: &Tensor, context: &Tensor, t: f64, h: usize, w: usize) -> Result<Tensor> {
+        match self {
+            Model::Candle(m) => m.predict(x, context, t, h, w),
+            #[cfg(feature = "webgpu")]
+            Model::Wgpu(m) => m.predict(x, context, t, h, w),
+        }
+    }
+
+    fn residency(&self) -> Json {
+        match self {
+            Model::Candle(m) => m.residency(),
+            #[cfg(feature = "webgpu")]
+            Model::Wgpu(_) => Json::obj([("device", Json::str("webgpu"))]),
+        }
+    }
+
+    /// Let go of a step's vectors where they are a GPU's (the decoder wants the room).
+    fn release_scratch(&mut self) {
+        match self {
+            Model::Candle(_) => {}
+            #[cfg(feature = "webgpu")]
+            Model::Wgpu(m) => m.release_scratch(),
+        }
+    }
+}
+
+/// The VAE's decoder: Candle's, or SDXL's on WebGPU (the same AutoencoderKL) with the statistics its tokens are
+/// unpacked by on the host.
+enum Decoder {
+    Candle(vae::Vae),
+    #[cfg(feature = "webgpu")]
+    Wgpu(crate::sdxl_vae_wgpu::WgpuSdxlVae, Vec<f32>, Vec<f32>),
+}
+
+impl Decoder {
+    /// The picture of `tokens` (`[1, h w, 128]`): its pixels' rows of red, green and blue, in -1..1 or about.
+    fn pixels(&self, tokens: &Tensor, h: usize, w: usize) -> Result<Vec<f32>> {
+        match self {
+            Decoder::Candle(vae) => vae.decode(tokens, h, w)?.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.squeeze(0)?.permute((1, 2, 0))?.contiguous()?.flatten_all()?.to_vec1::<f32>(),
+            #[cfg(feature = "webgpu")]
+            Decoder::Wgpu(vae, mean, std) => {
+                let tokens = tokens.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+                Ok(vae.decode(&vae::unpack_rows(&tokens, h, w, mean, std), 2 * h, 2 * w)?.0)
+            }
+        }
+    }
+}
+
+/// The decoder beside `model` where that is on WebGPU, else Candle's on `dev`.
+fn decoder(r: &Request, model: &Model, dev: &Device) -> Result<Decoder> {
+    match model {
+        Model::Candle(_) => Ok(Decoder::Candle(vae::Vae::load(&r.vae, dev, false)?)),
+        #[cfg(feature = "webgpu")]
+        Model::Wgpu(m) => {
+            let (vae, mean, std) = vae::decoder_on_webgpu(&r.vae, m.backend().clone())?;
+            Ok(Decoder::Wgpu(vae, mean, std))
+        }
+    }
+}
+
+/// Each prompt's conditioning and, where asked, the empty prompt's, by the text encoder on WebGPU.
+#[cfg(feature = "webgpu")]
+fn webgpu_contexts(r: &Request, negative: bool) -> Result<(Vec<Tensor>, Option<Tensor>)> {
+    let mut encoder = crate::klein_text_wgpu::WgpuKleinText::load(&r.text_encoder, &r.tokenizer, r.device)?;
+    let prompts: Vec<&str> = r.prompts.iter().map(String::as_str).chain(negative.then_some("")).collect();
+    let mut contexts = encoder.encode_all(&prompts)?;
+    let negative = if negative { contexts.pop() } else { None };
+    Ok((contexts, negative))
+}
+
+#[cfg(not(feature = "webgpu"))]
+fn webgpu_contexts(_: &Request, _: bool) -> Result<(Vec<Tensor>, Option<Tensor>)> {
+    candle_core::bail!("this build has no WebGPU (the webgpu feature)")
+}
+
+#[cfg(feature = "webgpu")]
+fn webgpu_model(r: &Request) -> Result<Model> {
+    Ok(Model::Wgpu(crate::klein_wgpu::WgpuKlein::load(&r.transformer, r.device, &r.loras, |_| {})?))
+}
+
+#[cfg(not(feature = "webgpu"))]
+fn webgpu_model(_: &Request) -> Result<Model> {
+    candle_core::bail!("this build has no WebGPU (the webgpu feature)")
+}
+
 impl Request {
     pub fn parse(j: &Json) -> std::result::Result<Self, String> {
-        crate::pipeline::not_on_webgpu(j, "FLUX.2 Klein")?;
+        let webgpu = crate::pipeline::backend_is_webgpu(j, "FLUX.2 Klein")?;
         let path = |key: &str| -> std::result::Result<PathBuf, String> {
             let p = PathBuf::from(
                 j.get(key)
@@ -160,6 +260,7 @@ impl Request {
             device: number("device", 0, 0, 31)?,
             distilled,
             budget: Budget::parse(j)?,
+            webgpu,
         })
     }
 }
@@ -181,24 +282,32 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
         ("stage", Json::str("encoding_text")),
         ("architecture", Json::str("flux2-klein-4b")),
     ]));
-    let mut encoder =
-        text::TextEncoder::load(&r.text_encoder, &r.tokenizer, &dev, dtype, &r.budget)?;
-    let mut contexts = Vec::new();
-    for p in &r.prompts {
-        contexts.push(encoder.encode(p)?.to_device(&Device::Cpu)?);
-    }
-    let negative = if !r.distilled && r.cfg > 1. {
-        Some(encoder.encode("")?.to_device(&Device::Cpu)?)
+    let guided = !r.distilled && r.cfg > 1.;
+    let (contexts, negative) = if r.webgpu {
+        webgpu_contexts(r, guided)?
     } else {
-        None
+        let mut encoder =
+            text::TextEncoder::load(&r.text_encoder, &r.tokenizer, &dev, dtype, &r.budget)?;
+        let mut contexts = Vec::new();
+        for p in &r.prompts {
+            contexts.push(encoder.encode(p)?.to_device(&Device::Cpu)?);
+        }
+        let negative = if guided {
+            Some(encoder.encode("")?.to_device(&Device::Cpu)?)
+        } else {
+            None
+        };
+        (contexts, negative)
     };
-    drop(encoder);
     dev.synchronize()?;
     event(Json::obj([("stage", Json::str("loading_transformer"))]));
-    let mut model =
-        transformer::Transformer::load(&r.transformer, &r.loras, &dev, dtype, &r.budget)?;
+    let mut model = if r.webgpu {
+        webgpu_model(r)?
+    } else {
+        Model::Candle(transformer::Transformer::load(&r.transformer, &r.loras, &dev, dtype, &r.budget)?)
+    };
     event(Json::obj([("stage", Json::str("loading_vae"))]));
-    let decoder = vae::Vae::load(&r.vae, &dev, false)?;
+    let decoder = decoder(r, &model, &dev)?;
     std::fs::create_dir_all(&r.output)?;
     let batch = r.output.join(format!(
         "klein-{}-{}",
@@ -245,16 +354,13 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
         }
         dev.synchronize()?;
         let sampling_seconds = sample.elapsed().as_secs_f64();
-        let rgb = decoder
-            .decode(&x, h, w)?
-            .to_device(&Device::Cpu)?
-            .to_dtype(DType::F32)?;
-        let pixels = rgb
-            .squeeze(0)?
-            .permute((1, 2, 0))?
-            .contiguous()?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
+        model.release_scratch();
+        let decode = Instant::now();
+        let pixels = decoder.pixels(&x, h, w)?;
+        let decode_seconds = decode.elapsed().as_secs_f64();
+        if pixels.len() != r.width * r.height * 3 {
+            candle_core::bail!("Klein's decoder made {} values for a {}x{} picture", pixels.len(), r.width, r.height);
+        }
         if pixels.iter().any(|x| !x.is_finite()) {
             candle_core::bail!("Klein produced non-finite pixels; no image saved");
         }
@@ -285,6 +391,7 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
             ("width", Json::Int(r.width as i64)),
             ("height", Json::Int(r.height as i64)),
             ("transformer", Json::str(r.transformer.to_string_lossy())),
+            ("backend", Json::str(if r.webgpu { "webgpu" } else { "cpu" })),
             ("noise_generator", Json::str("oaiy-splitmix64-box-muller")),
             (
                 "loras",
@@ -301,6 +408,7 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
                 ),
             ),
             ("sampling_seconds", Json::Num(sampling_seconds)),
+            ("decode_seconds", Json::Num(decode_seconds)),
         ]);
         writeln!(manifest, "{}", record.to_json())?;
         manifest.flush()?;
@@ -334,8 +442,6 @@ mod request_tests {
             ("tokenizer", Json::str(fixture.to_string_lossy())),
             ("vae", Json::str(fixture.to_string_lossy())),
             ("output_dir", Json::str(output.to_string_lossy())),
-            // (no WebGPU path yet: the CPU, by name)
-            ("backend", Json::str("cpu")),
             ("prompt", Json::str("fox")), ("negative_prompt", negative),
         ]);
         for value in [Json::Null, Json::str(""), Json::str(" \t")] {

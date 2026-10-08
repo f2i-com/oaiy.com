@@ -179,8 +179,11 @@ impl Weights {
     ) -> Result<Linear> {
         let key = format!("{name}.weight");
         let key = if matches!(self, Self::Gguf { .. }) { self.resolve(&key)? } else { key };
+        // ([`gguf_dense`], or OAIY_GGUF_DENSE: a GGUF's matrices dequantized whole, their products exact)
+        static ASKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let dense = GGUF_DENSE.load(std::sync::atomic::Ordering::Relaxed) || *ASKED.get_or_init(|| std::env::var_os("OAIY_GGUF_DENSE").is_some());
         let weight = match self {
-            Self::Gguf { content, file } => {
+            Self::Gguf { content, file } if !dense => {
                 Weight::Quant(QMatMul::from_qtensor(content.tensor(file, &key, dev)?)?)
             }
             _ => Weight::Dense(self.tensor(&key, dev, dtype)?),
@@ -209,6 +212,17 @@ impl Weights {
             adapters,
         })
     }
+}
+
+static GGUF_DENSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether [`Weights::linear`] dequantizes a GGUF's matrices whole from here on (four bytes a weight, their products
+/// exact), where it otherwise keeps their blocks for Candle's quantized matmul. That matmul rounds each row of
+/// activations to 8 bits a block before a K-quant's product, as ggml's does (some 1% of a product's worst element,
+/// FLUX.2 Klein's velocity then 0.9987 by cosine from the exact one): a port that multiplies by the dequantized
+/// weights is held to the exact products, so its tests ask for them.
+pub fn gguf_dense(on: bool) {
+    GGUF_DENSE.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 enum Weight {

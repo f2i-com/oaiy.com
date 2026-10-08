@@ -3,10 +3,20 @@
 **Updated:** native CUDA baseline, strength-1 LoRA image and byte-identical
 strength-zero control have now succeeded. See [current validation and reproduction](KLEIN_VALIDATED.md).
 
-> **No WebGPU path yet (2026-10-08).** The engines' one GPU backend is WebGPU now, and
-> FLUX.2 Klein is the one image model not on it: on main a Klein job runs only with
-> `backend: "cpu"` (Candle on the CPU, slowly) and says so otherwise. The CUDA worker
-> these pages record stands on the branch `backup/cuda-support-2026-10-08`.
+> **On WebGPU (2026-10-10).** A Klein job runs on WebGPU, on a GPU of any make, when it
+> names no backend: the Qwen3-4B text encoder (`klein_text_wgpu`), the transformer
+> (`klein_wgpu`: a GGUF's K-quant blocks as they are, or a checkpoint's floats as f16,
+> LoRA factors beside or merged) and the VAE's decoder (SDXL's on WebGPU, the same
+> AutoencoderKL). From the distilled Q4_K_M GGUF on one RTX 5090 at its 400 W cap, four
+> steps: a 1024x1024 picture in 8.3 s (its steps 1.3 s, 0.31 s each; its decode 0.74 s;
+> the rest is reading the text encoder's 5.4 GB a layer at a time and the transformer's
+> 2.6 GB), a 512x512 one in 6.8 s (steps 0.41 s, decode 0.13 s). Against Candle on the
+> CPU in f32 on the dequantized weights the transformer's velocity is 0.9998 by cosine
+> at an 8x8 latent and 0.99995 at 32x32 (Candle's own quantized matmul, which rounds
+> the activations to 8 bits a block as ggml's does, is 0.9987 from that itself), the
+> text encoder's worst token 0.9992. `backend: "cpu"` runs Candle on the CPU (the
+> reference, and slow). The CUDA worker these pages record stands on the branch
+> `backup/cuda-support-2026-10-08`.
 The text below preserves the initial checkpoint and its inspection evidence.
 
 This is a recoverable development checkpoint, **not a validated full-model image release**.

@@ -21,33 +21,48 @@ const CH: usize = 64;
 const ROW: usize = 2 * D;
 const EPS: f32 = 1e-6;
 
-fn err(e: impl std::fmt::Display) -> candle_core::Error {
+pub(crate) fn err(e: impl std::fmt::Display) -> candle_core::Error {
     candle_core::Error::Msg(e.to_string())
 }
 
 /// A matrix on the GPU (`[n, k]`): f16 (a checkpoint's float weights, LoRA factors merged in as they load), or a GGUF's
 /// K-quant blocks as they are, each adapter's factors then kept beside them and added as it runs (`B A x`: `A`
 /// `[rank, k]` and `B` `[n, rank]` as f16, its scale in `B`).
-struct Mat {
-    w: W,
-    n: usize,
-    k: usize,
-    lora: Vec<(DeviceVec, DeviceVec, usize)>,
+pub(crate) struct Mat {
+    pub(crate) w: W,
+    pub(crate) n: usize,
+    pub(crate) k: usize,
+    pub(crate) lora: Vec<(DeviceVec, DeviceVec, usize)>,
 }
 
-enum W {
+pub(crate) enum W {
     F16(DeviceVec),
     Quant(QuantizedTensor),
 }
 
 /// A LoRA's running vectors: its `A x` (rows of the largest rank) and its `B A x` (rows of the widest output).
-struct Low {
-    t: DeviceVec,
-    y: DeviceVec,
+pub(crate) struct Low {
+    pub(crate) t: DeviceVec,
+    pub(crate) y: DeviceVec,
+}
+
+/// `y = W x` for `rows` rows, each kept LoRA's `B A x` added: the tensor cores' f16 inputs, or (`exact`) an f16
+/// weight's inputs as f32 (a K-quant's matmul takes them as f16).
+pub(crate) fn mul(rec: &mut dyn ChainRecorder, m: &Mat, x: &DeviceVec, y: &DeviceVec, rows: usize, exact: bool, low: &Low) {
+    match &m.w {
+        W::F16(v) if exact => rec.matmul_f16_rows_f32(v, m.n, m.k, x, y, rows),
+        W::F16(v) => rec.matmul_f16_rows(v, m.n, m.k, x, y, rows),
+        W::Quant(q) => rec.matmul_rows(q, x, y, rows),
+    }
+    for (a, b, rank) in &m.lora {
+        rec.matmul_f16_rows(a, *rank, m.k, x, &low.t, rows);
+        rec.matmul_f16_rows(b, m.n, *rank, &low.t, &low.y, rows);
+        rec.add(&first(y, rows * m.n), &first(&low.y, rows * m.n));
+    }
 }
 
 /// `v`'s first `len` values.
-fn first(v: &DeviceVec, len: usize) -> DeviceVec {
+pub(crate) fn first(v: &DeviceVec, len: usize) -> DeviceVec {
     DeviceVec { len, inner: v.inner.clone() }
 }
 
@@ -145,7 +160,7 @@ pub struct WgpuTransformer {
 /// cores' kernels, else the f32 ones: without tensor cores 1024x1024's steps 2.98 s where f16's 2.80, 10.8 GB where
 /// some 14; OAIY_WEBGPU_DEQUANTIZE f16 throughout), each adapter's factors beside them; else f16, each adapter's
 /// factors merged in (`W + B A`).
-fn matrix(w: &mut Weights, lora: &mut Loras, gpu: &ggml_rs_wgpu::WgpuBackend, name: &str) -> Result<Mat> {
+pub(crate) fn matrix(w: &mut Weights, lora: &mut Loras, gpu: &ggml_rs_wgpu::WgpuBackend, name: &str) -> Result<Mat> {
     let key = format!("{name}.weight");
     let shape = w.shape(&key)?;
     let quant = w.ggml_dtype(&key).and_then(coop_type).filter(|_| std::env::var_os("OAIY_WEBGPU_DEQUANTIZE").is_none());
@@ -171,7 +186,7 @@ fn matrix(w: &mut Weights, lora: &mut Loras, gpu: &ggml_rs_wgpu::WgpuBackend, na
 }
 
 /// `name` (a norm's weight) as f32 on `gpu`, plus `add`.
-fn vector(w: &mut Weights, gpu: &ggml_rs_wgpu::WgpuBackend, name: &str, add: f32) -> Result<DeviceVec> {
+pub(crate) fn vector(w: &mut Weights, gpu: &ggml_rs_wgpu::WgpuBackend, name: &str, add: f32) -> Result<DeviceVec> {
     let values: Vec<f32> = w.tensor(name, &Device::Cpu, DType::F32)?.flatten_all()?.to_vec1::<f32>()?.into_iter().map(|v| v + add).collect();
     let v = gpu.vec(values.len());
     gpu.upload(&v, &values);
@@ -205,7 +220,7 @@ fn image_positions(position: usize, h: usize, w: usize) -> Vec<[f64; 3]> {
 }
 
 /// The timestep's 256 sinusoids (cosines, then sines).
-fn timestep(sigma: f64) -> Vec<f32> {
+pub(crate) fn timestep(sigma: f64) -> Vec<f32> {
     let mut v = Vec::with_capacity(256);
     for kind in 0..2 {
         for j in 0..128 {
@@ -216,7 +231,7 @@ fn timestep(sigma: f64) -> Vec<f32> {
     v
 }
 
-fn host(t: &Tensor) -> Result<Vec<f32>> {
+pub(crate) fn host(t: &Tensor) -> Result<Vec<f32>> {
     t.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()
 }
 
@@ -285,19 +300,9 @@ impl WgpuTransformer {
         Low { t: self.vec(rows * self.rank), y: self.vec(rows * FF) }
     }
 
-    /// `y = W x` for `rows` rows, each kept LoRA's `B A x` added: the tensor cores' f16 inputs, or (`exact`) an f16
-    /// weight's inputs as f32 (a K-quant's matmul takes them as f16).
+    /// [`mul`].
     fn mul(rec: &mut dyn ChainRecorder, m: &Mat, x: &DeviceVec, y: &DeviceVec, rows: usize, exact: bool, low: &Low) {
-        match &m.w {
-            W::F16(v) if exact => rec.matmul_f16_rows_f32(v, m.n, m.k, x, y, rows),
-            W::F16(v) => rec.matmul_f16_rows(v, m.n, m.k, x, y, rows),
-            W::Quant(q) => rec.matmul_rows(q, x, y, rows),
-        }
-        for (a, b, rank) in &m.lora {
-            rec.matmul_f16_rows(a, *rank, m.k, x, &low.t, rows);
-            rec.matmul_f16_rows(b, m.n, *rank, &low.t, &low.y, rows);
-            rec.add(&first(y, rows * m.n), &first(&low.y, rows * m.n));
-        }
+        mul(rec, m, x, y, rows, exact, low)
     }
 
     /// The modulation of a timestep: `mods` the blocks' (`[scale, gate, scale, gate]`, each `D`) and `scale` the

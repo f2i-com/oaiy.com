@@ -38,17 +38,25 @@ impl WgpuSdxlVae {
     /// The decoder of the VAE `cfg` describes from `w`'s tensors under `prefix` (a checkpoint's
     /// `first_stage_model.`), on `gpu`.
     pub fn load_on(w: &mut Weights, prefix: &str, cfg: &VaeConfig, gpu: ggml_rs_wgpu::WgpuBackend) -> Result<Self> {
+        Self::load_mapped(w, prefix, cfg, gpu, &|key| key.to_owned(), true)
+    }
+
+    /// [`Self::load_on`] of a VAE whose tensors' names `map` turns into that layout's (a diffusers-layout file's
+    /// `decoder.up_blocks.0.resnets.1` its `decoder.up.3.block.1`), with a `post_quant_conv` or (`post` false: FLUX.2's
+    /// published VAE) perhaps none.
+    pub fn load_mapped(w: &mut Weights, prefix: &str, cfg: &VaeConfig, gpu: ggml_rs_wgpu::WgpuBackend, map: &dyn Fn(&str) -> String, post: bool) -> Result<Self> {
         let (mut convs, mut norms) = (HashMap::new(), HashMap::new());
         for name in w.names() {
             let Some(key) = name.strip_prefix(prefix) else { continue };
+            let key = map(key);
             if !(key.starts_with("decoder.") || key.starts_with("post_quant_conv.")) {
                 continue;
             }
-            let Some(base) = key.strip_suffix(".weight") else { continue };
+            let (Some(base), Some(stored)) = (key.strip_suffix(".weight"), name.strip_suffix(".weight")) else { continue };
             let t = w.tensor(&name, &Device::Cpu, DType::F32)?;
             let dims = t.dims().to_vec();
             let values = t.flatten_all()?.to_vec1::<f32>()?;
-            let bias = w.tensor(&format!("{prefix}{base}.bias"), &Device::Cpu, DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+            let bias = w.tensor(&format!("{stored}.bias"), &Device::Cpu, DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
             let upload = |v: &[f32]| {
                 let d = gpu.vec(v.len());
                 gpu.upload(&d, v);
@@ -70,7 +78,7 @@ impl WgpuSdxlVae {
                 other => candle_core::bail!("{name}: a VAE tensor of shape {other:?}"),
             }
         }
-        if !convs.contains_key("decoder.conv_in") || !convs.contains_key("post_quant_conv") {
+        if !convs.contains_key("decoder.conv_in") || (post && !convs.contains_key("post_quant_conv")) {
             candle_core::bail!("the checkpoint has no VAE decoder under {prefix}");
         }
         Ok(Self { gpu, cfg: cfg.clone(), convs, norms })
@@ -166,7 +174,7 @@ impl WgpuSdxlVae {
             let mut rec = self.gpu.begin();
             rec.keep_groups(false);
             let r = rec.as_mut();
-            let (x, _) = self.conv(r, "post_quant_conv", &x0, h, w)?;
+            let x = if self.convs.contains_key("post_quant_conv") { self.conv(r, "post_quant_conv", &x0, h, w)?.0 } else { x0.clone() };
             let out = self.conv(r, "decoder.conv_in", &x, h, w)?;
             rec.finish();
             out

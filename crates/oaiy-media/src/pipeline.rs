@@ -321,17 +321,6 @@ pub(crate) fn backend_is_webgpu(j: &Json, what: &str) -> std::result::Result<boo
     }
 }
 
-/// A job's `backend` for a model with no WebGPU path yet (`what`): Candle on the CPU, and only where the job asks for
-/// that by name (`cpu`), rather than crawl through the CPU unasked.
-pub(crate) fn not_on_webgpu(j: &Json, what: &str) -> std::result::Result<(), String> {
-    match j.get("backend").and_then(Json::as_str) {
-        Some("cpu") => Ok(()),
-        None | Some("webgpu") => Err(format!("{what} does not run on WebGPU yet: backend cpu runs it on the CPU, slowly")),
-        Some("cuda") => Err(format!("{what}: there is no CUDA backend any more, and it does not run on WebGPU yet: backend cpu runs it on the CPU, slowly")),
-        Some(other) => Err(format!("{what}: backend must be webgpu or cpu, not {other}")),
-    }
-}
-
 pub(crate) fn parse_loras(j: &Json) -> std::result::Result<Vec<(PathBuf, f64)>, String> {
     let Some(list) = j.get("loras") else { return Ok(Vec::new()) };
     if matches!(list, Json::Null) {
@@ -675,17 +664,6 @@ pub(crate) fn noise(seed: u64, n: usize) -> Vec<f32> {
     }
     out
 }
-#[test]
-fn models_with_no_webgpu_path_refuse_it() {
-    let j = |b: &str| Json::parse(format!(r#"{{"backend":"{b}"}}"#).as_bytes()).unwrap();
-    assert!(not_on_webgpu(&j("cpu"), "Klein").is_ok(), "the CPU, asked for by name");
-    for asked in [Json::parse(b"{}").unwrap(), j("webgpu")] {
-        assert!(not_on_webgpu(&asked, "Klein").unwrap_err().contains("Klein does not run on WebGPU yet"));
-    }
-    assert!(not_on_webgpu(&j("cuda"), "Klein").unwrap_err().contains("no CUDA backend"));
-    assert!(not_on_webgpu(&j("vulkan"), "Klein").is_err());
-}
-
 #[test]
 fn a_jobs_backend_is_webgpu_unless_it_names_the_cpu() {
     let j = |b: &str| Json::parse(format!(r#"{{"backend":"{b}"}}"#).as_bytes()).unwrap();

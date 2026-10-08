@@ -14,6 +14,10 @@ pub mod wgpu_weights;
 #[cfg(feature = "webgpu")]
 pub mod qwen_wgpu;
 #[cfg(feature = "webgpu")]
+pub mod klein_wgpu;
+#[cfg(feature = "webgpu")]
+pub mod klein_text_wgpu;
+#[cfg(feature = "webgpu")]
 pub mod vae_wgpu;
 #[cfg(feature = "webgpu")]
 pub mod text_wgpu;
