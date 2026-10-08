@@ -10,6 +10,9 @@ use oaiy_engine::json::Json;
 use std::collections::HashMap;
 use std::path::Path;
 
+#[cfg(feature = "webgpu")]
+mod on_gpu;
+
 /// Audio latent frames per second: 16 kHz mel at hop 160, downsampled 4x in time.
 pub const LATENT_RATE: f64 = 25.;
 

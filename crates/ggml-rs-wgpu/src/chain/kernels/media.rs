@@ -464,6 +464,66 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+/// [`ChainRecorder::snake_beta_alias_rows`]'s first half: a thread a value of the `2 len` upsampled steps, its six
+/// (of `ku` twelve) taps of the steps before it, then SnakeBeta. `p[0]`: len, c, ku.
+pub(in crate::chain) const SNAKE_BETA_UP_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> filters: array<f32>;
+@group(0) @binding(2) var<storage, read> freq: array<f32>;
+@group(0) @binding(3) var<storage, read> scale: array<f32>;
+@group(0) @binding(6) var<storage, read_write> mid: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    let len = p[0].x;
+    let c = p[0].y;
+    let ku = p[0].z;
+    if (i >= 2u * len * c) { return; }
+    let u = i / c;
+    let ch = i % c;
+    // the transposed convolution's output `n` is the sum over the padded steps `s` of step `s` by tap `n - 2 s`
+    let pad = ku / 2u - 1u;
+    let n = u + 2u * pad + (ku - 2u) / 2u;
+    var acc = 0.0;
+    for (var j = n % 2u; j < ku; j += 2u) {
+        let s = clamp(i32((n - j) / 2u) - i32(pad), 0, i32(len) - 1);
+        acc += x[u32(s) * c + ch] * filters[j];
+    }
+    let v = 2.0 * acc;
+    let w = sin(freq[ch] * v);
+    mid[i] = v + scale[ch] * w * w;
+}
+"#;
+
+/// [`ChainRecorder::snake_beta_alias_rows`]'s second half: a thread a value of the `len` steps kept, its `kd` taps
+/// of the upsampled ones. `p[0]`: len, c, where the taps start among the filters, kd.
+pub(in crate::chain) const SNAKE_BETA_DOWN_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> mid: array<f32>;
+@group(0) @binding(1) var<storage, read> filters: array<f32>;
+@group(0) @binding(6) var<storage, read_write> y: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    let len = p[0].x;
+    let c = p[0].y;
+    let kd = p[0].w;
+    if (i >= len * c) { return; }
+    let n = i / c;
+    let ch = i % c;
+    let left = i32(kd / 2u) - i32(1u - kd % 2u);
+    var acc = 0.0;
+    for (var j = 0u; j < kd; j++) {
+        let s = clamp(i32(2u * n + j) - left, 0, i32(2u * len) - 1);
+        acc += mid[u32(s) * c + ch] * filters[p[0].z + j];
+    }
+    y[i] = acc;
+}
+"#;
+
 /// A clamp in place ([`ChainRecorder::clamp_in_place`]): a thread a value. `p[0]`: the values, the bounds' bits.
 pub(in crate::chain) const CLAMP_IN_PLACE: &str = r#"
 @group(0) @binding(6) var<storage, read_write> x: array<f32>;

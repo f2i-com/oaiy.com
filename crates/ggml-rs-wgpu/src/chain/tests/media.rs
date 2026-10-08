@@ -1033,3 +1033,51 @@ fn nag_mix_is_the_formula() {
         assert!(scale == 1.0 || scaled > 0, "some rows are scaled back");
     }
 }
+
+/// SnakeBeta without aliasing is PyTorch's steps written out on the host: the steps padded by their ends, a transposed
+/// convolution of stride 2 (times 2, cropped to twice the steps), SnakeBeta, the ends padded again, the low-pass at
+/// stride 2; twelve taps each as BigVGAN's, and an odd low-pass; one step, a few, and more than a workgroup's.
+#[test]
+fn snake_beta_without_aliasing_is_the_steps_written_out() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    let mut next = rng(91);
+    for (len, c, ku, kd) in [(1usize, 4usize, 12usize, 12usize), (7, 3, 12, 12), (300, 8, 12, 12), (40, 5, 8, 7)] {
+        let x: Vec<f32> = (0..len * c).map(|_| next()).collect();
+        let filters: Vec<f32> = (0..ku + kd).map(|_| 0.2 * next()).collect();
+        let freq: Vec<f32> = (0..c).map(|_| 1.0 + next().abs() * 3.0).collect();
+        let scale: Vec<f32> = (0..c).map(|_| 0.2 + next().abs()).collect();
+        // the host's
+        let mut want = vec![0f32; len * c];
+        for ch in 0..c {
+            let pad = ku / 2 - 1;
+            let xp: Vec<f64> = (0..len + 2 * pad).map(|i| x[(i as isize - pad as isize).clamp(0, len as isize - 1) as usize * c + ch] as f64).collect();
+            let mut full = vec![0f64; (xp.len() - 1) * 2 + ku];
+            for (i, v) in xp.iter().enumerate() {
+                for j in 0..ku {
+                    full[2 * i + j] += v * filters[j] as f64;
+                }
+            }
+            let (left, right) = (pad * 2 + (ku - 2) / 2, pad * 2 + (ku - 1) / 2);
+            let up: Vec<f64> = full[left..full.len() - right].iter().map(|v| 2.0 * v).collect();
+            assert_eq!(up.len(), 2 * len);
+            let z: Vec<f64> = up.iter().map(|v| v + scale[ch] as f64 * (freq[ch] as f64 * v).sin().powi(2)).collect();
+            let (l, r) = (kd / 2 - usize::from(kd % 2 == 0), kd / 2);
+            let zp: Vec<f64> = (0..z.len() + l + r).map(|i| z[(i as isize - l as isize).clamp(0, z.len() as isize - 1) as usize]).collect();
+            for n in 0..len {
+                want[n * c + ch] = (0..kd).map(|j| zp[2 * n + j] * filters[ku + j] as f64).sum::<f64>() as f32;
+            }
+        }
+        let (xd, fd, qd, sd, mid, y) = (b.vec(len * c), b.vec(ku + kd), b.vec(c), b.vec(c), b.vec(2 * len * c), b.vec(len * c));
+        DeviceChain::upload(&b, &xd, &x);
+        DeviceChain::upload(&b, &fd, &filters);
+        DeviceChain::upload(&b, &qd, &freq);
+        DeviceChain::upload(&b, &sd, &scale);
+        let mut rec = b.begin();
+        rec.snake_beta_alias_rows(&xd, &fd, ku, kd, &qd, &sd, len, c, &mid, &y);
+        rec.read(&y);
+        let got = rec.finish().pop().unwrap();
+        let big = want.iter().fold(0f32, |a, v| a.max(v.abs()));
+        let worst = got.iter().zip(&want).map(|(a, e)| (a - e).abs()).fold(0f32, f32::max);
+        assert!(big > 0.0 && worst <= 2e-5 * big.max(1.0), "{len} steps of {c}, {ku} and {kd} taps: {worst} off of a largest {big}");
+    }
+}

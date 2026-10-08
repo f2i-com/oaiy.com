@@ -670,6 +670,17 @@ pub trait ChainRecorder {
         let _ = (x, freq, scale, rows, c);
         unimplemented!("SnakeBeta on this device")
     }
+    /// SnakeBeta without aliasing (BigVGAN's `Activation1d`) of `x`'s `len` steps (`[len, c]`) into `y`: each channel
+    /// upsampled twice over by `filters`' first `ku` taps (PyTorch's transposed convolution of stride 2 over the steps
+    /// padded by their ends with `ku / 2 - 1` each side, times 2, its edges cropped to `2 len` steps), SnakeBeta of
+    /// those (`freq` and `scale` as [`Self::snake_beta_rows`]) into `mid` (`[2 len, c]`), then low-passed by the `kd`
+    /// taps after them over the steps padded by their ends (`kd / 2` after, that or one fewer before where `kd` is
+    /// even), every second step kept. The filters are every channel's.
+    #[allow(clippy::too_many_arguments)]
+    fn snake_beta_alias_rows(&mut self, x: &DeviceVec, filters: &DeviceVec, ku: usize, kd: usize, freq: &DeviceVec, scale: &DeviceVec, len: usize, c: usize, mid: &DeviceVec, y: &DeviceVec) {
+        let _ = (x, filters, ku, kd, freq, scale, len, c, mid, y);
+        unimplemented!("SnakeBeta without aliasing on this device")
+    }
     /// `len` values clamped to `lo..=hi`, in place.
     fn clamp_in_place(&mut self, x: &DeviceVec, len: usize, lo: f32, hi: f32) {
         let _ = (x, len, lo, hi);

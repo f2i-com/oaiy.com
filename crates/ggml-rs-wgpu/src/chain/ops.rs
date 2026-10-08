@@ -445,6 +445,14 @@ impl ChainRecorder for Recorder<'_> {
         self.dispatch_wide("chain-snake-beta-rows", SNAKE_BETA_ROWS, [buffer(freq), buffer(scale), &d, &d, &d, &d, buffer(x), &drw], &[rows as u32, c as u32], grid(n.div_ceil(256)));
     }
 
+    fn snake_beta_alias_rows(&mut self, x: &DeviceVec, filters: &DeviceVec, ku: usize, kd: usize, freq: &DeviceVec, scale: &DeviceVec, len: usize, c: usize, mid: &DeviceVec, y: &DeviceVec) {
+        assert!(ku >= 2 && ku % 2 == 0 && kd >= 1 && len > 0 && filters.len >= ku + kd && freq.len >= c && scale.len >= c && x.len >= len * c && mid.len >= 2 * len * c && y.len >= len * c, "chain: SnakeBeta without aliasing of {len} steps of {c}");
+        let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
+        let n = (2 * len * c) as u32;
+        self.dispatch_wide("chain-snake-beta-up-rows", SNAKE_BETA_UP_ROWS, [buffer(x), buffer(filters), buffer(freq), buffer(scale), &d, &d, buffer(mid), &drw], &[len as u32, c as u32, ku as u32], grid(n.div_ceil(256)));
+        self.dispatch_wide("chain-snake-beta-down-rows", SNAKE_BETA_DOWN_ROWS, [buffer(mid), buffer(filters), &d, &d, &d, &d, buffer(y), &drw], &[len as u32, c as u32, ku as u32, kd as u32], grid((n / 2).div_ceil(256)));
+    }
+
     fn clamp_in_place(&mut self, x: &DeviceVec, len: usize, lo: f32, hi: f32) {
         assert!(x.len >= len, "chain: a clamp of {len}");
         let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());

@@ -1248,6 +1248,10 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         (Some(latent), Some(path)) => {
             report(event("decoding_audio", 0, 1));
             let decoder = audio::AudioDecoder::load(path, &dev)?;
+            // (a WebGPU job's: the vocoder and the bandwidth extension on its GPU, nearly all of the decoding)
+            #[cfg(feature = "webgpu")]
+            let wave = if r.webgpu { decoder.decode_webgpu(r.device, latent)? } else { decoder.decode(latent)? };
+            #[cfg(not(feature = "webgpu"))]
             let wave = decoder.decode(latent)?;
             let rate = decoder.sample_rate;
             drop(decoder);
