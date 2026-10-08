@@ -166,9 +166,10 @@ fn a_lora_merges_into_an_f16_matrix_as_the_hosts() {
     }
 }
 
-/// A matrix of f16 values held as f16 (two to a word) multiplies as it does held as f32: a long row's step the same
-/// bits (summed the same way), a short row's and a prompt's within rounding (a prompt's on the tensor cores within
-/// f16's: its tokens f16, its sums f16 a window); a matrix not all f16 values is not made.
+/// A matrix of f16 values held as f16 (two to a word) multiplies as it does held as f32: a step's row and a prompt's
+/// within rounding (the f16 kernel sums an output's products by its lanes; a prompt's on the tensor cores within
+/// f16's: its tokens f16, its sums f16 a window); a check's few rows are each a step's bit for bit (summed the same
+/// way whatever the rows); a matrix not all f16 values is not made.
 #[test]
 fn an_f16_matrix_multiplies_as_its_f32_one() {
     let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
@@ -188,9 +189,18 @@ fn an_f16_matrix_multiplies_as_its_f32_one() {
         rec.read(&y16);
         let mut got = rec.finish();
         let (h, f) = (got.pop().unwrap(), got.pop().unwrap());
-        if rows == 1 && k >= 2048 {
-            assert_eq!(h.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), f.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "[{n}, {k}]: the same sums");
-        } else if rows > 8 && b.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+        if rows == 1 {
+            // a check of three rows, the step's row its last: that row's sums the step's own
+            let x3: Vec<f32> = (0..2 * k).map(|_| r()).chain(x.iter().copied()).collect();
+            let (x3d, y3) = (b.vec(3 * k), b.vec(3 * n));
+            DeviceChain::upload(&b, &x3d, &x3);
+            let mut rec = b.begin();
+            rec.matmul_f16_rows(&w16, n, k, &x3d, &y3, 3);
+            rec.read(&y3);
+            let three = rec.finish().pop().unwrap();
+            assert_eq!(three[2 * n..].iter().map(|v| v.to_bits()).collect::<Vec<_>>(), h.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "[{n}, {k}]: a check's row is a step's");
+        }
+        if rows > 8 && b.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
             // on the tensor cores: the tokens rounded to f16, the sums f16 a window
             let rms = (f.iter().map(|e| (*e as f64).powi(2)).sum::<f64>() / f.len() as f64).sqrt();
             let err = (h.iter().zip(&f).map(|(a, e)| ((*a - *e) as f64).powi(2)).sum::<f64>() / f.len() as f64).sqrt();

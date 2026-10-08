@@ -633,6 +633,30 @@ impl ChainRecorder for Recorder<'_> {
         assert!(k % 2 == 0 && w.len * 2 >= n * k && x.len >= rows * k && y.len >= rows * n, "chain: an f16 matmul [{n}, {k}] of {rows} rows");
         // (the tiled kernels take a grid's 65,535 tiles of rows: 64 rows each, the tensor cores' 32)
         assert!(n <= 65535 && rows.div_ceil(64) <= 65535, "chain: an f16 matmul [{n}, {k}] of {rows} rows");
+        // a step's row or a check's few against a width of whole fours: an output row's lanes side by side
+        // (OAIY_F16_FIRST: the first kernels, a workgroup an output row or eight threads an output)
+        static LANES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if rows <= 8 && k % 4 == 0 && *LANES.get_or_init(|| std::env::var_os("OAIY_F16_FIRST").is_none()) {
+            type Made = ((usize, usize), &'static str);
+            static NAMES: Mutex<Vec<Made>> = Mutex::new(Vec::new());
+            let lanes = f16_lanes(k);
+            let name = {
+                let mut names = NAMES.lock().unwrap_or_else(|p| p.into_inner());
+                match names.iter().find(|(key, _)| *key == (rows, lanes)) {
+                    Some((_, name)) => *name,
+                    None => {
+                        let name: &'static str = Box::leak(format!("chain-matvec-f16-{rows}-{lanes}").into_boxed_str());
+                        names.push(((rows, lanes), name));
+                        name
+                    }
+                }
+            };
+            let pipeline = self.gpu().named_pipeline(name, || matvec_f16_lanes(rows, lanes));
+            let groups = (n as u32).div_ceil((256 / lanes) as u32);
+            self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(y), &[n as u32, k as u32], (groups.min(65535), groups.div_ceil(65535), 1));
+            self.weigh(2.0 * (rows * n) as f64 * k as f64);
+            return;
+        }
         if rows == 1 {
             // a long row a workgroup (as the f32 one sums it); short ones eight threads each, 32 a workgroup
             if k >= 2048 && k % 4 == 0 {

@@ -79,6 +79,69 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 }
 "#;
 
+/// Lanes an output row of an f16 matrix `k` wide is shared out to in [`matvec_f16_lanes`]: a power of two from 8 to
+/// 256, some ten loads (40 weights) a lane or more. A wide matrix has few rows (a hyper-connection's 324 of 10,240),
+/// and it is the lanes that give the GPU its threads: 32 lanes a row left that one 10,000 threads and took three
+/// times as long as a workgroup a row.
+pub(in crate::chain) fn f16_lanes(k: usize) -> usize {
+    let lanes = (k / 4 / 10).max(1);
+    // (the power of two at or under it)
+    (1usize << (usize::BITS - 1 - lanes.leading_zeros())).clamp(8, 256)
+}
+
+/// An f16 matrix (two weights a word, `k` a multiple of 4) against `rows` rows of x (1 to 8: a decode step's, a check
+/// of drafts'): a workgroup `256 / lanes` output rows, `lanes` threads a row ([`f16_lanes`]), each taking four weights
+/// in every `4 lanes` of the row with four of x at a load, so a row's threads read side by side; each weight is read
+/// once for every row of x, a row's products summed the same way whatever the rows (a lane's in four running sums,
+/// then the lanes in order), so a check's rows are a step's bit for bit. One barrier. `p[0]`: n, k.
+///
+/// It replaces, for such widths, [`MATVEC_F16`] (a workgroup an output row and eight barriers: Flash-Next's routers'
+/// 513 rows of 2,560 gave a thread ten weights) and [`MATVEC_F16_NARROW`] (eight threads an output, a word and two
+/// scalar reads of x at a time): a decode step's f16 matrices (its hyper-connections' and, from a GGUF, its shared
+/// experts': 1.9 GB) were 3.6 ms of its 11.2.
+pub(in crate::chain) fn matvec_f16_lanes(rows: usize, lanes: usize) -> String {
+    assert!((1..=8).contains(&rows) && lanes.is_power_of_two() && (8..=256).contains(&lanes), "1 to 8 rows, 8 to 256 lanes");
+    let each = |f: &dyn Fn(usize) -> String| (0..rows).map(f).collect::<Vec<_>>().join("\n");
+    let regs = each(&|r| format!("    var s{r} = vec4<f32>(0.0);"));
+    let sums = each(&|r| format!("            s{r} += wv * x4[{r}u * k4 + i];"));
+    let parts = each(&|r| format!("    part[{r}u * 256u + li] = s{r}.x + s{r}.y + s{r}.z + s{r}.w;"));
+    let outs = each(&|r| format!("        var t{r} = 0.0;\n        for (var j = 0u; j < {lanes}u; j++) {{ t{r} += part[{r}u * 256u + li + j]; }}\n        y[{r}u * n + o] = t{r};"));
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read> w2: array<vec2<u32>>;
+@group(0) @binding(1) var<storage, read> x4: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> p: array<vec4<u32>, 2>;
+var<workgroup> part: array<f32, {len}>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {{
+    let n = p[0].x;
+    let k4 = p[0].y / 4u;
+    let o = (wg.x + wg.y * 65535u) * {per}u + li / {lanes}u;
+    let lane = li % {lanes}u;
+{regs}
+    if (o < n) {{
+        for (var i = lane; i < k4; i += {lanes}u) {{
+            let pr = w2[o * k4 + i];
+            let a = unpack2x16float(pr.x);
+            let b = unpack2x16float(pr.y);
+            let wv = vec4<f32>(a.x, a.y, b.x, b.y);
+{sums}
+        }}
+    }}
+{parts}
+    workgroupBarrier();
+    if (lane == 0u && o < n) {{
+{outs}
+    }}
+}}
+"#,
+        len = rows * 256,
+        per = 256 / lanes,
+    )
+}
+
 /// [`MATVEC_F16`] (`narrow`: [`MATVEC_F16_NARROW`]) for `rows` rows (2 to 8, a check of drafts): each weight read once
 /// for all of them, each row's products summed in the one-row kernel's order (so a row's outputs are its bit for bit).
 /// `p[0]`: n, k.
