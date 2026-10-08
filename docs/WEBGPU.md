@@ -356,6 +356,13 @@ up in another order than the one a head had (2e-5 of the largest value at most, 
 its test holds it to), so a long greedy reply can part from the earlier one's at a
 near-tie; with every block kept QSA's is the dense attention's bits, as before.
 
+A layer's routing ranked the router's 513 logits in one workgroup, a thread some 260 to
+390 turns of four comparisons: 14.6 us whatever the rows. Nine workgroups rank them now
+(four threads a logit, 33 turns each) and write the down jobs by rank, and a second
+kernel makes the weights a thread an expert: 6.7 us a layer for the two, the same
+experts and weights. A step is 10.8 ms where 11.4 and a check of four rows 15.0 where
+15.5.
+
 On one card, which is what Strata's figure is for, this file is far from it: its
 experts are 35.5 GB, so 15 of the 48 layers' run on the host (`quant_host` reads the
 grid types as they lie too: 0.27 to 0.42 ms an expert a row on one AVX-512 core, where

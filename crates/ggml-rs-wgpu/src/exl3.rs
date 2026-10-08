@@ -1535,7 +1535,7 @@ impl FewScratch {
     }
 }
 
-/// A check's routed experts in blocks for [`few_kernel`], from its down jobs ([`DOWN_JOBS`]'s: pair `j`'s expert, `p[0].x`
+/// A check's routed experts in blocks for [`few_kernel`], from its down jobs ([`ROUTE_RANK`]'s: pair `j`'s expert, `p[0].x`
 /// pairs, at most 256): each expert's pairs (at most `p[0].y`, the block's rows, as a row takes an expert once) a block
 /// of their own in their list's order, the blocks in the order their experts first appear; the down jobs' order
 /// (`order_d`, `p[0].x` blocks of `p[0].y`) and the gate and up jobs' (`order_gu`: expert block `b`'s gate jobs `2j` in
@@ -1873,36 +1873,21 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
-/// A decode step's routing on the GPU, as `ggml_rs::exl3::route` routes (a workgroup a row `r`): the top `p[0].y` of
-/// the router's `p[0].x` routed logits by logit, a tie to the lower index (each logit placed by how many beat it),
-/// their weights a softmax among themselves summed in their order, the shared expert (the logit after them) weighted
-/// by its gate's sigmoid; then the row's jobs as the grouped experts take them: gate and up `[2e, r, 2e + 1, r]` an
-/// expert (`jobs`, from pair `r k`), the weights `w` (from `r (k + 1)`: the top k's, the shared one's last). `p[0]`:
+/// The routing on the GPU, as `ggml_rs::exl3::route` routes, in two kernels ([`record_route`]). This one ranks: the
+/// top `p[0].y` of a row's `p[0].x` routed logits by logit, a tie to the lower index (each logit placed by how many
+/// beat it), and writes their down jobs by rank, `[e, j]` for pair `j = r k + rank` (the experts' down projections
+/// take hidden row `j`). A workgroup 64 of a row's logits (the grid's second axis), four threads a logit, each every
+/// fourth of the comparisons' quads: one workgroup a row gave a thread two or three logits' every comparison, some 390
+/// turns of four, and a layer's routing was 14.6 us whatever its rows (0.7 ms of a Flash-Next step's 11). `p[0]`:
 /// routed (at most 1024), k (at most 32).
-pub(crate) const ROUTE: &str = r#"
+pub(crate) const ROUTE_RANK: &str = r#"
 @group(0) @binding(0) var<storage, read> logits: array<f32>;
-@group(0) @binding(6) var<storage, read_write> jobs: array<u32>;
-@group(0) @binding(7) var<storage, read_write> w: array<f32>;
+@group(0) @binding(6) var<storage, read_write> jd: array<u32>;
 @group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
 
-var<workgroup> l: array<f32, 1024>;
-// the same, four at a time (the comparisons' reads)
+// the row's logits four at a time (the comparisons' reads)
 var<workgroup> l4: array<vec4<f32>, 256>;
-var<workgroup> top: array<u32, 32>;
-
-// How many of l4's first `quads` beat logit `v` at index `i` (a higher logit, or as high at a lower index).
-fn beaten(v: f32, i: u32, quads: u32) -> u32 {
-    var above = 0u;
-    for (var q = 0u; q < quads; q++) {
-        let u = l4[q];
-        let j = 4u * q;
-        above += select(0u, 1u, u.x > v || (u.x == v && j < i));
-        above += select(0u, 1u, u.y > v || (u.y == v && j + 1u < i));
-        above += select(0u, 1u, u.z > v || (u.z == v && j + 2u < i));
-        above += select(0u, 1u, u.w > v || (u.w == v && j + 3u < i));
-    }
-    return above;
-}
+var<workgroup> beat: array<u32, 256>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
@@ -1912,41 +1897,99 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     let lr = r * (n + 1u);
     let quads = (n + 3u) / 4u;
     // past the last logit, -inf (beats none)
-    for (var i = t; i < 4u * quads; i += 256u) {
-        var v = bitcast<f32>(0xff800000u);
-        if (i < n) {
-            v = logits[lr + i];
+    if (t < quads) {
+        var v = vec4<f32>(bitcast<f32>(0xff800000u));
+        for (var c = 0u; c < 4u; c++) {
+            if (4u * t + c < n) { v[c] = logits[lr + 4u * t + c]; }
         }
-        l[i] = v;
-        l4[i / 4u][i % 4u] = v;
+        l4[t] = v;
     }
     workgroupBarrier();
-    for (var i = t; i < n; i += 256u) {
-        let above = beaten(l[i], i, quads);
-        if (above < k) {
-            top[above] = i;
+    let i = wg.y * 64u + t / 4u;
+    let live = i < n;
+    var above = 0u;
+    if (live) {
+        // how many beat logit `i` (a higher logit, or as high at a lower index), among this thread's quads
+        let v = logits[lr + i];
+        for (var q = t % 4u; q < quads; q += 4u) {
+            let u = l4[q];
+            let j = 4u * q;
+            above += select(0u, 1u, u.x > v || (u.x == v && j < i));
+            above += select(0u, 1u, u.y > v || (u.y == v && j + 1u < i));
+            above += select(0u, 1u, u.z > v || (u.z == v && j + 2u < i));
+            above += select(0u, 1u, u.w > v || (u.w == v && j + 3u < i));
         }
     }
+    beat[t] = above;
     workgroupBarrier();
-    if (t == 0u) {
-        let mx = l[top[0]];
+    if (live && t % 4u == 0u) {
+        let rank = beat[t] + beat[t + 1u] + beat[t + 2u] + beat[t + 3u];
+        if (rank < k) {
+            let pair = r * k + rank;
+            jd[2u * pair] = i;
+            jd[2u * pair + 1u] = pair;
+        }
+    }
+}
+"#;
+
+/// [`ROUTE_RANK`]'s second kernel, a workgroup a row `r`, a thread an expert of its top k: their weights (a softmax
+/// among themselves, their exponentials summed in rank order) and the shared expert's (the logit after the routed
+/// ones, by its gate's sigmoid), `w` from `r (k + 1)`: the top k's, the shared one's last; and the row's jobs as the
+/// grouped experts take them, gate and up `[2e, r, 2e + 1, r]` an expert (`jobs`, from pair `r k`). `p[0]`: routed, k
+/// (at most 32).
+pub(crate) const ROUTE_WEIGHTS: &str = r#"
+@group(0) @binding(0) var<storage, read> logits: array<f32>;
+@group(0) @binding(1) var<storage, read> jd: array<u32>;
+@group(0) @binding(6) var<storage, read_write> jobs: array<u32>;
+@group(0) @binding(7) var<storage, read_write> w: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> ex: array<f32, 32>;
+
+@compute @workgroup_size(32)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) j: u32) {
+    let n = p[0].x;
+    let k = p[0].y;
+    let r = wg.x;
+    let lr = r * (n + 1u);
+    let mx = logits[lr + jd[2u * r * k]];
+    var e = 0u;
+    var v = 0.0;
+    if (j < k) {
+        e = jd[2u * (r * k + j)];
+        v = exp(logits[lr + e] - mx);
+    }
+    ex[j] = v;
+    workgroupBarrier();
+    if (j < k) {
         var sum = 0.0;
-        for (var j = 0u; j < k; j++) {
-            sum += exp(l[top[j]] - mx);
-        }
-        for (var j = 0u; j < k; j++) {
-            let e = top[j];
-            w[r * (k + 1u) + j] = exp(l[e] - mx) / sum;
-            let at = 4u * (r * k + j);
-            jobs[at] = 2u * e;
-            jobs[at + 1u] = r;
-            jobs[at + 2u] = 2u * e + 1u;
-            jobs[at + 3u] = r;
-        }
+        for (var i = 0u; i < k; i++) { sum += ex[i]; }
+        w[r * (k + 1u) + j] = v / sum;
+        let at = 4u * (r * k + j);
+        jobs[at] = 2u * e;
+        jobs[at + 1u] = r;
+        jobs[at + 2u] = 2u * e + 1u;
+        jobs[at + 3u] = r;
+    }
+    if (j == 0u) {
         w[r * (k + 1u) + k] = 1.0 / (1.0 + exp(-logits[lr + n]));
     }
 }
 "#;
+
+/// `rows` rows' routing recorded from their router's `logits` (`[rows, routed + 1]`): each row's top `top_k` experts'
+/// down jobs by rank into `st` ([`ROUTE_RANK`]), then their weights and gate and up jobs ([`ROUTE_WEIGHTS`]).
+pub(crate) fn record_route(rec: &mut crate::chain::Recorder<'_>, logits: &wgpu::Buffer, st: &Step, routed: usize, top_k: usize, rows: usize) {
+    let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
+    assert!(routed <= 1024 && top_k <= 32 && top_k <= routed, "moe: the top {top_k} of {routed} experts");
+    let d = rec.gpu().dummy().clone();
+    let drw = rec.gpu().dummy_rw().clone();
+    let words = [routed as u32, top_k as u32];
+    let jd = buf(&st.jobs_d);
+    rec.dispatch_wide("moe-route-rank", ROUTE_RANK, [logits, &d, &d, &d, &d, &d, &jd, &drw], &words, (rows as u32, (routed as u32).div_ceil(64), 1));
+    rec.dispatch_wide("moe-route-weights", ROUTE_WEIGHTS, [logits, &jd, &d, &d, &d, &d, &buf(&st.jobs_gu), &buf(&st.w)], &words, (rows as u32, 1, 1));
+}
 
 /// A prompt's routed jobs grouped by expert on the GPU, as [`many_order`] groups them on the host: each expert's down
 /// jobs in blocks of `p[0].w` (a block one expert's, its unused places [`NONE`]; the blocks in the experts' order, a
@@ -2032,22 +2075,6 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     atomicStore(&od[b * bs + slot], j);
     og[2u * b * bs + slot] = 2u * j;
     og[(2u * b + 1u) * bs + slot] = 2u * j + 1u;
-}
-"#;
-
-/// The down projections' jobs of routed rows from their gate and up jobs ([`ROUTE`]'s): pair `j`'s expert `e` on
-/// hidden row `j`, `[e, j]`. `p[0]`: the pairs (rows times k).
-pub(crate) const DOWN_JOBS: &str = r#"
-@group(0) @binding(0) var<storage, read> gu: array<u32>;
-@group(0) @binding(6) var<storage, read_write> jobs: array<u32>;
-@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
-
-@compute @workgroup_size(64)
-fn main(@builtin(local_invocation_index) t: u32) {
-    for (var j = t; j < p[0].x; j += 64u) {
-        jobs[2u * j] = gu[4u * j] / 2u;
-        jobs[2u * j + 1u] = j;
-    }
 }
 "#;
 
@@ -2323,7 +2350,7 @@ impl Exl3MoeGrouped {
     }
 
     /// `rows` rows' experts (a step's one, a check's few) routed on the GPU from the router's `logits` (`[rows, routed +
-    /// 1]`) and recorded into `out` (see `ChainRecorder::moe_routed`): [`ROUTE`] writes the jobs and weights where
+    /// 1]`) and recorded into `out` (see `ChainRecorder::moe_routed`): [`record_route`] writes the jobs and weights where
     /// [`Self::record`] uploads them, each job one row (so each row's sums are a step's). `into`: each row's sum added to
     /// its streams (the streams, their write weights, how many) where it would be `out`.
     #[allow(clippy::too_many_arguments)]
@@ -2356,8 +2383,7 @@ impl Exl3MoeGrouped {
         let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
         let d = rec.gpu().dummy().clone();
         let drw = rec.gpu().dummy_rw().clone();
-        rec.dispatch_wide("moe-route", ROUTE, [&buf(logits), &d, &d, &d, &d, &d, &buf(&st.jobs_gu), &buf(&st.w)], &[self.routed as u32, top_k as u32], (rows as u32, 1, 1));
-        rec.dispatch_wide("moe-down-jobs", DOWN_JOBS, [&buf(&st.jobs_gu), &d, &d, &d, &d, &d, &buf(&st.jobs_d), &drw], &[(rows * top_k) as u32], (1, 1, 1));
+        record_route(rec, &buf(logits), &st, self.routed, top_k, rows);
         let pairs = rows * top_k;
         if many {
             // blocks of as many jobs as an expert has on average (16 to 64: an expert's tiles decoded once a block,

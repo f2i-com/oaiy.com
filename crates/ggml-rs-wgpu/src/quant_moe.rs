@@ -1,7 +1,7 @@
 //! A MoE layer's experts as a GGUF holds them (Qwen3.8-Flash-Next's GSQ-RCO files: 512 routed experts a layer, their
 //! gate, up and down matrices each one tensor of quant blocks), beside [`crate::exl3`]'s EXL3 ones and run as those
 //! are: a row's experts a job list (job `j` matrix `jobs[2j]` on input row `jobs[2j + 1]`, its result row `j`), routed
-//! on the host or on the GPU ([`crate::exl3::ROUTE`]), grouped by expert for a prompt's rows, each row's weighted sum
+//! on the host or on the GPU ([`crate::exl3::record_route`]), grouped by expert for a prompt's rows, each row's weighted sum
 //! made on the GPU. What differs is the matmul: a GGUF's weights are the weights (no Hadamard transforms, no channel
 //! maps). The tensor cores' kernel decodes them by one function a type ([`Kind::wgsl`]'s `w8`: eight weights of a
 //! row); the kernel for a step's row and a check's few ([`few_source`]) is written for its type, a word's weights as
@@ -18,7 +18,7 @@
 //! grid's bytes take four values at most), so a group is one load of it: as WGSL constants such tables are copied at
 //! each call, which once ran a dispatch past Windows' two seconds and reset the driver (`crate::shaders::layout`'s
 //! note).
-use crate::exl3::{coop_on, many_order, moe_rows_for, Step, DOWN_JOBS, FEW_MAX, GROUP, MANY_CLEAR, MANY_COUNT, MANY_SCAN, MANY_SCATTER, ROUTE, WSUM_APPLY, WSUM_ROWS};
+use crate::exl3::{coop_on, many_order, moe_rows_for, record_route, Step, FEW_MAX, GROUP, MANY_CLEAR, MANY_COUNT, MANY_SCAN, MANY_SCATTER, WSUM_APPLY, WSUM_ROWS};
 use crate::{chunk_limit, Gpu, WgpuBackend};
 use ggml_quants::GgmlType;
 use ggml_rs::exl3::{route, Experts};
@@ -1008,7 +1008,7 @@ impl QuantMoe {
 
     /// `rows` rows' experts routed on the GPU from the router's `logits` (`[rows, routed + 1]`) and recorded into
     /// `out` (see `ChainRecorder::moe_routed`), as [`crate::exl3::Exl3MoeGrouped::record_routed`] records EXL3's:
-    /// [`ROUTE`] writes the jobs and weights where [`Self::record`] uploads them. `into`: each row's sum added to its
+    /// [`record_route`] writes the jobs and weights where [`Self::record`] uploads them. `into`: each row's sum added to its
     /// streams (the streams, their write weights, how many) where it would be `out`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_routed(&self, rec: &mut crate::chain::Recorder<'_>, x: &DeviceVec, out: &DeviceVec, logits: &DeviceVec, top_k: usize, rows: usize, into: Option<(&DeviceVec, &DeviceVec, usize)>) -> bool {
@@ -1043,8 +1043,7 @@ impl QuantMoe {
         let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
         let d = rec.gpu().dummy().clone();
         let drw = rec.gpu().dummy_rw().clone();
-        rec.dispatch_wide("moe-route", ROUTE, [&buf(logits), &d, &d, &d, &d, &d, &buf(&st.jobs_gu), &buf(&st.w)], &[self.routed as u32, top_k as u32], (rows as u32, 1, 1));
-        rec.dispatch_wide("moe-down-jobs", DOWN_JOBS, [&buf(&st.jobs_gu), &d, &d, &d, &d, &d, &buf(&st.jobs_d), &drw], &[pairs as u32], (1, 1, 1));
+        record_route(rec, &buf(logits), &st, self.routed, top_k, rows);
         if many {
             // blocks of some three times the jobs an expert has on average; the most blocks the experts could fill (a
             // part-filled one each at most), the grid that wide
