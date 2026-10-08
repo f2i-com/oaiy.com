@@ -38,8 +38,24 @@ struct Mat {
     k: usize,
 }
 
-/// `names`' matrices one after another (their rows) as f16, a BF16 checkpoint's converted from its bytes on every core.
-fn mat(store: &mut Store, gpu: &ggml_rs_wgpu::WgpuBackend, names: &[String]) -> Result<Mat> {
+/// [`Mat`] on the host: its f16 words, read and converted, not yet on the GPU.
+struct MatHost {
+    words: Vec<f32>,
+    n: usize,
+    k: usize,
+}
+
+impl MatHost {
+    fn up(self, gpu: &ggml_rs_wgpu::WgpuBackend) -> Mat {
+        let v = gpu.vec(self.words.len());
+        gpu.upload(&v, &self.words);
+        Mat { v, n: self.n, k: self.k }
+    }
+}
+
+/// `names`' matrices one after another (their rows) as f16 words on the host, a BF16 checkpoint's converted from its
+/// bytes on every core.
+fn mat_host(store: &mut Store, names: &[String]) -> Result<MatHost> {
     let mut words: Vec<f32> = Vec::new();
     let (mut n, mut k) = (0, 0);
     for name in names {
@@ -61,16 +77,22 @@ fn mat(store: &mut Store, gpu: &ggml_rs_wgpu::WgpuBackend, names: &[String]) -> 
             words.extend(part);
         }
     }
-    let v = gpu.vec(words.len());
-    gpu.upload(&v, &words);
-    Ok(Mat { v, n, k })
+    Ok(MatHost { words, n, k })
 }
 
 fn vector(store: &mut Store, gpu: &ggml_rs_wgpu::WgpuBackend, name: &str, add: f32) -> Result<DeviceVec> {
-    let values: Vec<f32> = store.tensor_f32(name, &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?.into_iter().map(|v| v + add).collect();
+    Ok(vector_up(gpu, &vector_host(store, name, add)?))
+}
+
+/// A vector's values on the host, `add` added to each.
+fn vector_host(store: &mut Store, name: &str, add: f32) -> Result<Vec<f32>> {
+    Ok(store.tensor_f32(name, &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?.into_iter().map(|v| v + add).collect())
+}
+
+fn vector_up(gpu: &ggml_rs_wgpu::WgpuBackend, values: &[f32]) -> DeviceVec {
     let v = gpu.vec(values.len());
-    gpu.upload(&v, &values);
-    Ok(v)
+    gpu.upload(&v, values);
+    v
 }
 
 struct Layer {
@@ -101,41 +123,74 @@ fn mul(r: &mut dyn ChainRecorder, m: &Mat, x: &DeviceVec, y: &DeviceVec, rows: u
     r.matmul_f16_rows_f32(&m.v, m.n, m.k, x, y, rows);
 }
 
-/// The text model's layer `i` (its weights under `prefix`; `gemma4` LTX 2.5's Gemma 4) on `gpu`.
-fn layer(store: &mut Store, gpu: &ggml_rs_wgpu::WgpuBackend, prefix: &str, i: usize, gemma4: bool) -> Result<Layer> {
+/// [`Layer`] on the host: its weights read and converted to f16 words, not yet on the GPU (a thread of their own
+/// makes them a layer ahead of the one the GPU is given: [`contexts_streams`]).
+struct LayerHost {
+    input: Vec<f32>,
+    post_attn: Vec<f32>,
+    pre_ff: Vec<f32>,
+    post_ff: Vec<f32>,
+    qn: Vec<f32>,
+    kn: Vec<f32>,
+    q: MatHost,
+    k: MatHost,
+    v: Option<MatHost>,
+    o: MatHost,
+    gate_up: MatHost,
+    down: MatHost,
+    scalar: Option<Vec<f32>>,
+}
+
+/// The text model's layer `i` (its weights under `prefix`; `gemma4` LTX 2.5's Gemma 4) read and converted.
+fn layer_host(store: &mut Store, prefix: &str, i: usize, gemma4: bool) -> Result<LayerHost> {
     let p = format!("{prefix}layers.{i}.");
     let n = |s: &str| format!("{p}{s}");
     // Gemma 3's norms scale by 1 + w, Gemma 4's by w
     let add = if gemma4 { 0. } else { 1. };
     let v_name = n("self_attn.v_proj.weight");
-    let qn = vector(store, gpu, &n("self_attn.q_norm.weight"), add)?;
-    let (q, k) = (mat(store, gpu, &[n("self_attn.q_proj.weight")])?, mat(store, gpu, &[n("self_attn.k_proj.weight")])?);
-    let hd = qn.len;
     let scalar = if gemma4 {
         let s = store.tensor_f32(&n("layer_scalar"), &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
-        let values = vec![s.first().copied().ok_or_else(|| err(format!("{p}layer_scalar is empty")))? - 1.; G];
-        let v = gpu.vec(G);
-        gpu.upload(&v, &values);
-        Some(v)
+        Some(vec![s.first().copied().ok_or_else(|| err(format!("{p}layer_scalar is empty")))? - 1.; G])
     } else {
         None
     };
+    Ok(LayerHost {
+        input: vector_host(store, &n("input_layernorm.weight"), add)?,
+        post_attn: vector_host(store, &n("post_attention_layernorm.weight"), add)?,
+        pre_ff: vector_host(store, &n("pre_feedforward_layernorm.weight"), add)?,
+        post_ff: vector_host(store, &n("post_feedforward_layernorm.weight"), add)?,
+        qn: vector_host(store, &n("self_attn.q_norm.weight"), add)?,
+        kn: vector_host(store, &n("self_attn.k_norm.weight"), add)?,
+        q: mat_host(store, &[n("self_attn.q_proj.weight")])?,
+        k: mat_host(store, &[n("self_attn.k_proj.weight")])?,
+        v: if store.index.get(&v_name).is_some() { Some(mat_host(store, &[v_name])?) } else { None },
+        o: mat_host(store, &[n("self_attn.o_proj.weight")])?,
+        gate_up: mat_host(store, &[n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])?,
+        down: mat_host(store, &[n("mlp.down_proj.weight")])?,
+        scalar,
+    })
+}
+
+/// Layer `i`'s weights put on `gpu` (`gemma4` LTX 2.5's Gemma 4).
+fn layer_up(gpu: &ggml_rs_wgpu::WgpuBackend, h: LayerHost, i: usize, gemma4: bool) -> Result<Layer> {
+    let hd = h.qn.len();
+    let (q, k) = (h.q.up(gpu), h.k.up(gpu));
     let l = Layer {
-        input: vector(store, gpu, &n("input_layernorm.weight"), add)?,
-        post_attn: vector(store, gpu, &n("post_attention_layernorm.weight"), add)?,
-        pre_ff: vector(store, gpu, &n("pre_feedforward_layernorm.weight"), add)?,
-        post_ff: vector(store, gpu, &n("post_feedforward_layernorm.weight"), add)?,
-        kn: vector(store, gpu, &n("self_attn.k_norm.weight"), add)?,
-        qn,
-        v: if store.index.get(&v_name).is_some() { Some(mat(store, gpu, &[v_name])?) } else { None },
-        o: mat(store, gpu, &[n("self_attn.o_proj.weight")])?,
-        gate_up: mat(store, gpu, &[n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])?,
-        down: mat(store, gpu, &[n("mlp.down_proj.weight")])?,
+        input: vector_up(gpu, &h.input),
+        post_attn: vector_up(gpu, &h.post_attn),
+        pre_ff: vector_up(gpu, &h.pre_ff),
+        post_ff: vector_up(gpu, &h.post_ff),
+        kn: vector_up(gpu, &h.kn),
+        qn: vector_up(gpu, &h.qn),
+        v: h.v.map(|v| v.up(gpu)),
+        o: h.o.up(gpu),
+        gate_up: h.gate_up.up(gpu),
+        down: h.down.up(gpu),
         kv: k.n / hd.max(1),
         hd,
         q,
         k,
-        scalar,
+        scalar: h.scalar.map(|s| vector_up(gpu, &s)),
     };
     let fits = matches!(l.hd, HD | GLOBAL_HD) && l.q.n == HEADS * l.hd && l.k.n == l.kv * l.hd && l.kv >= 1 && l.kv * l.hd <= KV_WIDTH && l.o.k == l.q.n && l.gate_up.n == 2 * FF && (l.v.is_some() || gemma4);
     if !fits {
@@ -274,65 +329,102 @@ pub fn contexts_streams(gemma: &Path, tokenizer: Option<&Path>, transformer: &mu
             stack(rec.as_mut(), p, &p.x, 0);
         }
         rec.finish();
-        for i in 0..LAYERS {
-            let l = layer(&mut store, &gpu, prefix, i, gemma4)?;
-            let final_norm = if i == LAYERS - 1 { Some(vector(&mut store, &gpu, &format!("{prefix}norm.weight"), if gemma4 { 0. } else { 1. })?) } else { None };
-            let (hd, kv) = (l.hd, l.kv);
-            let (qd, kd) = (HEADS * hd, kv * hd);
-            let mut rec = gpu.begin();
-            rec.keep_groups(false);
-            let r = rec.as_mut();
-            for p in &prompts {
-                let (s, x, h) = (p.s, &p.x, &p.h);
-                let tv = if i % 6 == 5 { &p.global } else { &p.local };
-                r.rmsnorm_rows(x, &l.input, h, s, EPS);
-                mul(r, &l.q, h, &p.q, s);
-                mul(r, &l.k, h, &p.k, s);
-                match &l.v {
-                    Some(v) => mul(r, v, h, &p.vv, s),
-                    // (the keys as they come, before their norm and rotary, as values)
-                    None => r.copy(&p.k, 0, &p.vv, 0, s * kd),
-                }
-                r.rmsnorm_rows(&first(&p.q, s * qd), &l.qn, &first(&p.qq, s * qd), s * HEADS, EPS);
-                r.rmsnorm_rows(&first(&p.k, s * kd), &l.kn, &first(&p.kk, s * kd), s * kv, EPS);
-                r.rope_rows(&p.qq, s, HEADS, hd, tv, true);
-                r.rope_rows(&p.kk, s, kv, hd, tv, true);
-                let row = 2 * kd;
-                r.store_rows(&p.kk, &p.kv, s, kd, 0, row, 0);
-                if gemma4 {
-                    // Gemma 4's values over their RMS (no weights)
-                    r.rmsnorm_rows(&first(&p.vv, s * kd), &ones, &first(&p.vn, s * kd), s * kv, EPS);
-                    r.store_rows(&p.vn, &p.kv, s, kd, 0, row, kd);
-                } else {
-                    r.store_rows(&p.vv, &p.kv, s, kd, 0, row, kd);
-                }
-                r.attention_rows(&p.qq, &p.kv, &p.att, s, HEADS, kv, hd, 0, None, scale);
-                mul(r, &l.o, &p.att, &p.o, s);
-                r.rmsnorm_rows(&p.o, &l.post_attn, &p.an, s, EPS);
-                r.add(x, &p.an);
-                r.rmsnorm_rows(x, &l.pre_ff, h, s, EPS);
-                mul(r, &l.gate_up, h, &p.gu, s);
-                r.gelu_mul_split_rows(&p.gu, &p.act, s);
-                mul(r, &l.down, &p.act, &p.o, s);
-                r.rmsnorm_rows(&p.o, &l.post_ff, &p.an, s, EPS);
-                r.add(x, &p.an);
-                if let Some(sc) = &l.scalar {
-                    // the layer's output times its scalar (an affine: x (1 + (scalar - 1)))
-                    r.norm_mod_rows(x, &p.an, s, G, sc, 0, None, RowNorm::None, EPS);
-                    r.copy(&p.an, 0, x, 0, s * G);
-                }
-                match &final_norm {
-                    Some(norm) => {
-                        r.rmsnorm_rows(x, norm, h, s, EPS);
-                        stack(r, p, h, i + 1);
+        // a layer's weights are read and converted to f16 by a thread of their own (its own handle on the file), a
+        // layer ahead of the one the GPU is given: one thread reading, converting, uploading and running each layer in
+        // turn took 0.27 s a layer with the file in the system's cache, of it 0.06 the read and 0.06 the conversion
+        std::thread::scope(|scope| -> Result<()> {
+            // (at most a layer waiting and a layer being made: a gigabyte; the receiver gone, at an error here, ends
+            // the reader at its next layer)
+            let (made, ahead) = std::sync::mpsc::sync_channel::<std::result::Result<LayerHost, String>>(1);
+            scope.spawn(move || {
+                let mut file = match Store::open(gemma, 0) {
+                    Ok(file) => file,
+                    Err(e) => {
+                        let _ = made.send(Err(e.to_string()));
+                        return;
                     }
-                    None => stack(r, p, x, i + 1),
+                };
+                for i in 0..LAYERS {
+                    if made.send(layer_host(&mut file, prefix, i, gemma4).map_err(|e| e.to_string())).is_err() {
+                        return;
+                    }
                 }
+            });
+            // (OAIY_LOAD_PROFILE: where the layers' time went)
+            let (mut waited, mut up, mut recorded, mut ran) = (0f64, 0f64, 0f64, 0f64);
+            for i in 0..LAYERS {
+                let clock = std::time::Instant::now();
+                let host = ahead.recv().map_err(err)?.map_err(err)?;
+                waited += clock.elapsed().as_secs_f64();
+                let clock = std::time::Instant::now();
+                let l = layer_up(&gpu, host, i, gemma4)?;
+                up += clock.elapsed().as_secs_f64();
+                let clock = std::time::Instant::now();
+                let final_norm = if i == LAYERS - 1 { Some(vector(&mut store, &gpu, &format!("{prefix}norm.weight"), if gemma4 { 0. } else { 1. })?) } else { None };
+                let (hd, kv) = (l.hd, l.kv);
+                let (qd, kd) = (HEADS * hd, kv * hd);
+                let mut rec = gpu.begin();
+                rec.keep_groups(false);
+                let r = rec.as_mut();
+                for p in &prompts {
+                    let (s, x, h) = (p.s, &p.x, &p.h);
+                    let tv = if i % 6 == 5 { &p.global } else { &p.local };
+                    r.rmsnorm_rows(x, &l.input, h, s, EPS);
+                    mul(r, &l.q, h, &p.q, s);
+                    mul(r, &l.k, h, &p.k, s);
+                    match &l.v {
+                        Some(v) => mul(r, v, h, &p.vv, s),
+                        // (the keys as they come, before their norm and rotary, as values)
+                        None => r.copy(&p.k, 0, &p.vv, 0, s * kd),
+                    }
+                    r.rmsnorm_rows(&first(&p.q, s * qd), &l.qn, &first(&p.qq, s * qd), s * HEADS, EPS);
+                    r.rmsnorm_rows(&first(&p.k, s * kd), &l.kn, &first(&p.kk, s * kd), s * kv, EPS);
+                    r.rope_rows(&p.qq, s, HEADS, hd, tv, true);
+                    r.rope_rows(&p.kk, s, kv, hd, tv, true);
+                    let row = 2 * kd;
+                    r.store_rows(&p.kk, &p.kv, s, kd, 0, row, 0);
+                    if gemma4 {
+                        // Gemma 4's values over their RMS (no weights)
+                        r.rmsnorm_rows(&first(&p.vv, s * kd), &ones, &first(&p.vn, s * kd), s * kv, EPS);
+                        r.store_rows(&p.vn, &p.kv, s, kd, 0, row, kd);
+                    } else {
+                        r.store_rows(&p.vv, &p.kv, s, kd, 0, row, kd);
+                    }
+                    r.attention_rows(&p.qq, &p.kv, &p.att, s, HEADS, kv, hd, 0, None, scale);
+                    mul(r, &l.o, &p.att, &p.o, s);
+                    r.rmsnorm_rows(&p.o, &l.post_attn, &p.an, s, EPS);
+                    r.add(x, &p.an);
+                    r.rmsnorm_rows(x, &l.pre_ff, h, s, EPS);
+                    mul(r, &l.gate_up, h, &p.gu, s);
+                    r.gelu_mul_split_rows(&p.gu, &p.act, s);
+                    mul(r, &l.down, &p.act, &p.o, s);
+                    r.rmsnorm_rows(&p.o, &l.post_ff, &p.an, s, EPS);
+                    r.add(x, &p.an);
+                    if let Some(sc) = &l.scalar {
+                        // the layer's output times its scalar (an affine: x (1 + (scalar - 1)))
+                        r.norm_mod_rows(x, &p.an, s, G, sc, 0, None, RowNorm::None, EPS);
+                        r.copy(&p.an, 0, x, 0, s * G);
+                    }
+                    match &final_norm {
+                        Some(norm) => {
+                            r.rmsnorm_rows(x, norm, h, s, EPS);
+                            stack(r, p, h, i + 1);
+                        }
+                        None => stack(r, p, x, i + 1),
+                    }
+                }
+                recorded += clock.elapsed().as_secs_f64();
+                let clock = std::time::Instant::now();
+                rec.finish();
+                drop(l);
+                ran += clock.elapsed().as_secs_f64();
+                progress(i + 1, steps);
             }
-            rec.finish();
-            drop(l);
-            progress(i + 1, steps);
-        }
+            if std::env::var_os("OAIY_LOAD_PROFILE").is_some() {
+                eprintln!("the text model's {LAYERS} layers: waiting for their weights' reader {waited:.2} s, putting them on the GPU {up:.2} s, recording {recorded:.2} s, their runs {ran:.2} s");
+            }
+            Ok(())
+        })?;
         prompts.into_iter().map(|p| (p.feats, p.s)).collect()
     };
     gpu.release_cached();
@@ -472,6 +564,36 @@ mod tests {
                 upload += t.elapsed().as_secs_f64();
             }
             eprintln!("round {round}: {:.0} MB read in {read:.3} s, converted in {convert:.3} s, uploaded in {upload:.3} s", bytes as f64 / 1e6);
+        }
+        Ok(())
+    }
+
+    /// What a prompt's context costs (`--ignored --nocapture`): Gemma 3 12B (`OAIY_LTX_GEMMA`; its tokenizer
+    /// `OAIY_LTX_TOKENIZER`, else the folder's tokenizer.json) and the projection and connector of an LTX 2.3
+    /// checkpoint (`OAIY_LTX_NVFP4`), twice (the second with the files in the system's cache): the time at a few of
+    /// its steps, and the context's values' sum and a hash of their bits, the same from one build to the next unless
+    /// its arithmetic changes.
+    #[test]
+    #[ignore = "a timing; needs Gemma 3 12B (OAIY_LTX_GEMMA), LTX 2.3 (OAIY_LTX_NVFP4) and a WebGPU adapter"]
+    fn measure_a_prompts_context() -> Result<()> {
+        let (Some(gemma), Some(ltx)) = (std::env::var_os("OAIY_LTX_GEMMA"), std::env::var_os("OAIY_LTX_NVFP4")) else { return Ok(()) };
+        let (gemma, ltx) = (std::path::PathBuf::from(gemma), std::path::PathBuf::from(ltx));
+        let gemma4 = Store::open(&gemma, 0)?.index.get("model.layers.0.layer_scalar").is_some();
+        let tokenizer = (!gemma4).then(|| std::env::var_os("OAIY_LTX_TOKENIZER").map_or_else(|| gemma.join("tokenizer.json"), std::path::PathBuf::from));
+        let prompt = "A red fox trots through fresh snow at sunrise, its breath steaming, the camera tracking beside it".to_string();
+        for round in 0..2 {
+            let mut store = Store::open(&ltx, 0)?;
+            let started = std::time::Instant::now();
+            let mut marks = Vec::new();
+            let got = contexts(&gemma, tokenizer.as_deref(), &mut store, std::slice::from_ref(&prompt), 0, |n, of| {
+                if [1, 12, 24, 36, LAYERS, of].contains(&n) {
+                    marks.push(format!("step {n} at {:.1} s", started.elapsed().as_secs_f64()));
+                }
+            })?
+            .remove(0);
+            let sum: f64 = got.iter().map(|v| v.abs() as f64).sum();
+            let hash = got.iter().fold(0xcbf29ce484222325u64, |h, v| (h ^ v.to_bits() as u64).wrapping_mul(0x100000001b3));
+            eprintln!("round {round}: a prompt's context in {:.1} s ({}); {} values, their sum {sum:.3}, their bits' hash {hash:016x}", started.elapsed().as_secs_f64(), marks.join(", "), got.len());
         }
         Ok(())
     }

@@ -41,6 +41,17 @@ The server and inference core remain std-only and forbid unsafe Rust.
 > have no WebGPU path yet and are refused there; `backend: "cuda"` is refused by name,
 > and Candle's CPU backend cannot multiply the model's BF16 weights. What this page says of those, of CUDA and of its timings
 > describes the CUDA build, which stands on the branch `backup/cuda-support-2026-10-08`.
+>
+> **A prompt's context (2026-10-09).** A prompt that is not in the cache costs Gemma 3
+> 12B's 48 layers, each streamed through the card in turn (24 GB of BF16), then the
+> projection and the connector: 17.4 s on one RTX 5090 with the files in the system's
+> cache, 34 s read cold from the drive. A layer's weights are now read and converted to
+> f16 by a thread of their own, a layer ahead of the one being put on the card and run:
+> 13.3 s (the layers 8.7 s where 12.9, the same context to the bit;
+> `measure_a_prompts_context`, and `OAIY_LOAD_PROFILE` says where the layers' time
+> went). What is left is nearly all copying: a layer is 460 MB read, converted and
+> written to the card (0.18 s), its run for a short prompt 12 ms; the projection and
+> the connector are 3.1 s and the tokenizer and embeddings 1.4 s.
 
 Sulphur-2 and LTX 2.5 have been validated end to end locally in both text-to-video
 and image-to-video modes. The original LTX 2.3 checkpoint is still downloading;
