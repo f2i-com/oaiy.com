@@ -1228,10 +1228,12 @@ pub(crate) fn flashnext_gguf_on(path: &Path, gpus: &[&ggml_rs_wgpu::WgpuBackend]
                 // layer's it has room for)
                 let (here, routed) = (layers.div_ceil(gpus.len()) as u64, routed_bytes / gpus.len() as u64);
                 // (a card short of room for them all: half a gigabyte of it left for a prompt's scratch of the experts
-                // it reads from the host's memory)
+                // it reads from the host's memory, and where it is the only card three quarters more for its chunks
+                // of 1,024 rows: `FlashNext::prompt_rows`)
                 let asked: Option<usize> = std::env::var("OAIY_EXPERT_SLOTS").ok().and_then(|v| v.parse().ok());
                 let fits = asked.is_none() && allowance[device] >= here * shared + routed;
-                let share = allowance[device].saturating_sub(here * shared + (1 << 29)) as f64 / routed.max(1) as f64;
+                let scratch: u64 = if gpus.len() == 1 { 5 << 28 } else { 1 << 29 };
+                let share = allowance[device].saturating_sub(here * shared + scratch) as f64 / routed.max(1) as f64;
                 if part && !fits {
                     let slots = asked.unwrap_or((data.experts as f64 * share * 0.98) as usize);
                     if slots >= 64 {

@@ -29,6 +29,12 @@ pub trait Experts: std::fmt::Debug + Send + Sync {
     fn on_host(&self) -> bool {
         false
     }
+    /// VENDORED-LOCAL: whether the device holds only some of these and reads the others from the host's memory as
+    /// it runs (`ggml_rs_wgpu::quant_moe::Cache`): a prompt's chunk then copies each expert it uses that the device
+    /// lacks, once a chunk. Not by default.
+    fn part_held(&self) -> bool {
+        false
+    }
     /// VENDORED-LOCAL: [`Self::forward`] of experts on the host whose shared expert a device ran
     /// (`ChainRecorder::moe_shared`): `shared` its outputs (`[rows, hidden]`, not yet weighted), added by its gate to
     /// the routed experts' sums. By default the shared expert is run again here.

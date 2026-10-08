@@ -3066,20 +3066,23 @@ impl FlashNext {
         self.devices.len()
     }
 
-    /// The rows a prompt's chunk has at most: 512 (OAIY_FN_ROWS: as given, 64 to 1,024; on one card too). One card
-    /// that holds a part of its experts reads fewer of the others from the host's memory in chunks of 1,024 (a
-    /// chunk copies each it uses once: 4,086 tokens in 2.5 to 2.8 s where 3.1 to 3.5), but a chunk's vectors and
-    /// scratch are then 1.3 GiB more, past what the system lets a process keep on a 32 GB card beside 313 slots a
-    /// layer (a prompt in 6 to 7 s some runs, out of memory in others). A chunk's experts' weights
-    /// are decoded once a block of their rows, and a chunk of 512 gives each of the 512 experts some 10 rows of a
-    /// block's 32, so a chunk of 1,024 takes less of the GPUs a token (its kernels 298 ms where two of 512 take 342).
-    /// It is not the faster for that over two cards (2,148 tokens run together 679 to 691 ms in chunks of 1,024 where
-    /// 602 to 612 in 512s: fewer chunks one behind the other), and with 24 GB of weights a card its vectors do not
-    /// fit two RTX 5090s' 32 GB (out of memory at the server's second prompt); past 1,638 rows a kernel's grid is
-    /// wider than a dispatch may be.
+    /// The rows a prompt's chunk has at most: 512, or 1,024 on one card that holds a part of its experts
+    /// (OAIY_FN_ROWS: as given, 64 to 1,024). A chunk's experts' weights are decoded once a block of their rows, and
+    /// a chunk of 512 gives each of the 512 experts some 10 rows of a block's 32, so a chunk of 1,024 takes less of
+    /// the GPUs a token (its kernels 298 ms where two of 512 take 342). It is not the faster for that over two cards
+    /// (2,148 tokens run together 679 to 691 ms in chunks of 1,024 where 602 to 612 in 512s: fewer chunks one behind
+    /// the other), and with 24 GB of weights a card its vectors do not fit two RTX 5090s' 32 GB (out of memory at
+    /// the server's second prompt); past 1,638 rows a kernel's grid is wider than a dispatch may be.
+    ///
+    /// One card that holds a part of its experts copies those a chunk uses and it lacks from the host's memory, once
+    /// a chunk, so half as many chunks copy fewer (Strata's 4,086 tokens: 16,000 to 22,000 experts where 20,000 to
+    /// 26,000, the prompt in 2.5 to 2.8 s in most launches and 3.0 to 3.5 in the others, where chunks of 512 are 3.0
+    /// to 3.4 s). Their vectors and scratch are 0.7 GiB more, which the card's share of its experts leaves room for
+    /// (`flashnext_gguf_on`).
     pub fn prompt_rows(&self) -> usize {
         static ASKED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-        ASKED.get_or_init(|| std::env::var("OAIY_FN_ROWS").ok().and_then(|v| v.parse().ok()).filter(|n| (64..=1024).contains(n))).unwrap_or(512)
+        let asked = *ASKED.get_or_init(|| std::env::var("OAIY_FN_ROWS").ok().and_then(|v| v.parse().ok()).filter(|n| (64..=1024).contains(n)));
+        asked.unwrap_or(if self.devices.len() == 1 && self.layers.iter().any(|l| l.moe.experts.part_held()) { 1024 } else { 512 })
     }
 
     /// The layers whose experts run on the host (no GPU had room for them).

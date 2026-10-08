@@ -510,11 +510,18 @@ it the delta nets' (each of the 36 layers its own 16 MB at 512 rows:
 layer's now once its scan is recorded (`Recorder::done_with`), a chunk's scratch is
 0.63 GiB, and the card's most memory in use over the request 29.2 GiB where 29.9.
 Chunks of 1,024 rows (`OAIY_FN_ROWS`, which one card's chunks follow now) copy fewer
-experts from the host, each chunk the ones it uses once: 14,000 to 16,000 a prompt
-where 20,000 to 26,000, the prompt in 2.5 to 2.8 s where 3.1 to 3.5. But their
-vectors and scratch are 1.3 GiB more, past the budget beside 313 slots a layer, so
-512 stays what a chunk is. One card's chunks run together, as two cards' are, were
-the same 3.1 to 3.5 s for 1.5 GiB more.
+experts from the host, each chunk the ones it uses once, and a matrix decoded for a
+block serves more rows. Before the delta nets' scratch was shared their vectors and
+scratch were past the budget beside 313 slots a layer (a prompt in 6 to 7 s in some
+runs, out of memory in others); since, they are 0.7 GiB more than chunks of 512's,
+and a card that is alone and holds a part of its experts takes them: its share of
+slots leaves them the room (301 a layer where 313; the card's most memory in use
+29.7 GiB of the 30.68). Three launches, Strata's request: the prompt in 2.5 to 2.8 s
+in two and 2.9 to 3.25 in the third (a launch is one or the other, as the 27B's
+prompt is on a card under its power limit) where chunks of 512 gave 3.0 to 3.4, reading
+16,600 to 21,700 experts where 20,000 to 26,000; 256 tokens in 1.98 to 2.04 s after
+the first request's 2.26 to 2.36 (125 to 129 tokens a second). One card's chunks run
+together, as two cards' are, were no faster for 1.5 GiB more.
 
 A prompt's experts by rows (the model's routing again: `OAIY_ROUTE_DUMP`): a chunk
 of 512 uses 299 of a layer's 512 experts, and 158 of those take eight of its rows or

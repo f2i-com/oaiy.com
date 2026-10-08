@@ -1596,6 +1596,10 @@ impl Experts for QuantMoe {
         Some(self)
     }
 
+    fn part_held(&self) -> bool {
+        self.cache.is_some()
+    }
+
     fn forward(&self, x: &Tensor, logits: &Tensor, top_k: usize) -> Tensor {
         let h = self.hidden;
         let x = x.to_host();
