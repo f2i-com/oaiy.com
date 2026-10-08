@@ -270,25 +270,40 @@ drafting with the EXL3 checkpoint's prediction layer (`--mtp-from`), a 1,960-tok
 prompt in 0.50 to 0.56 s. Strata's published figure for the model on one RTX 5090
 (its IQ2_XS file, drafting four deep with suffix drafts, the card at its full 575 W;
 ours are capped at 400 W) is 179 tokens a second and 4,270 tokens a second of prompt
-at 4K: the prompt is matched on two cards, the reply is half. A decode step there
-takes 10.9 ms (10.6 of them the GPU's kernels), a check of four drafted rows 19.7,
-and a round of drafting adds some 5 ms for the drafts themselves.
+at 4K: this file's prompt is within a tenth of that on two cards, the reply is half. A
+decode step there takes 10.9 ms (10.6 of them the GPU's kernels), a check of four
+drafted rows 19.6, and a round of drafting adds some 4 ms for the drafts themselves.
 
 The IQ2_XS file is the one Strata's figure is for. Its routed experts' gate and up
 matrices are grid types (IQ2_S in 34 layers, IQ2_XXS in 11, IQ1_M in 3; their down
 matrices Q2_0): a group of eight weights is one entry of ggml's grid, with its signs and
 a scale. `quant_moe` decodes them on the card as it does Q2_0, the grid in a storage
 buffer of the layer's (as WGSL constants such tables are copied at each call, which
-once reset the driver). From that file over two RTX 5090s (2026-10-08): a reply at 78
-to 81 tokens a second, 80 to 88 drafting, a 1,960-token prompt in about 1 s; a decode
-step 11.6 ms, a check of four rows 21.8 (before these kernels every layer's experts ran
-on the host's reference path: 0.9 tokens a second). So Strata's own figure is still
-twice ours on its own file. Its log says where: 256 tokens in 96 passes of 3.4 rows,
-14.9 ms a pass; ours, on prose, 300 tokens in 145 passes of 2.7 rows, 23.7 ms a pass.
-A step's row costs much the same in both; each further row of a check costs 3.3 ms here
-(the IQ4_XS matrices 1.25 of it, the experts 0.7). On one card the layers it has no
-room for still run their experts on the reference path (the host's fast kernel reads
-Q2_0 only).
+once reset the driver). Before these kernels every layer's experts ran on the host's
+reference path: 0.9 tokens a second.
+
+From that file over two RTX 5090s (2026-10-08): a reply at 79 to 84 tokens a second,
+93 to 103 drafting. A decode step takes 11.5 ms; a check of drafts (every row's logits)
+14.2, 16.2 and 18.6 ms for two, three and four rows. A check's IQ4_XS rows go through
+an int8 kernel (`shaders::iq4_xs_few_q8`: each 32 of a row rounded to int8 by its own
+scale, which is llama.cpp's CPU arithmetic and what the K-quants' check kernels here
+do): 2.1 ms of a check of four where the f32 kernel took 7.8, more than a step's whole
+2.5. A check's rows then differ from a step's by that rounding: over 36 rows the logits'
+cosine is 0.99967 on average and 0.9987 at worst, the greedy token the same each time
+(with f32 rows they are the step's exactly; `OAIY_NO_Q8` gives those). The prompt is
+slower than the Q2_0 file's: 1,960 tokens in about 1 s where 0.5, a chunk of 512 rows
+362 ms where 217, of which the grid types' tensor-core kernel is 195 ms (it decodes a
+group of eight weights with seven loads where Q2_0 takes two: still to be reworked).
+
+Strata's 179 tokens a second is not matched: on its own file, drafting, ours is 93 to
+103 on two cards. The two runs are not yet like for like either way: Strata's is one
+card at 575 W, a 4K prompt of synthetic code, drafting four deep with suffix drafts;
+ours two cards at 400 W, prose, three deep. Its log gives 256 tokens in 96 passes of
+3.4 rows, 14.9 ms a pass all told. Ours gives 300 tokens in 144 passes: 117 checks of
+3.2 rows at 16.9 ms each, 27 plain steps, and 3.8 ms a pass making the drafts (the
+server's decode line now says these). On one card the layers it has no room for still
+run their experts on the reference path (the host's fast kernel reads Q2_0 only), so
+it is not usable there yet.
 
 On one card (`--devices 0`) the file does not fit: its experts are 34 GB, and a 32 GB
 card's budget holds 34 of the 48 layers' beside the dense matrices. The other 14

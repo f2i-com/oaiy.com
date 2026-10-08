@@ -493,6 +493,85 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     )
 }
 
+/// [`iq4_xs_few`] from `m` rows of `x` as int8 ([`QUANT_Q8`]'s; 2 to [`IQ4_FEW_MAX`]: a check of drafts' rows): laid
+/// out the same, a 32's nibbles packed as its values' bytes once (the type's values are int8) and four of them against
+/// four of a row's in one `dot4I8Packed`, the 32's sum by the weights' scale and the row's for that 32. A row of `x`
+/// then costs a 32 three loads and eight such products, where the f32 kernel's cost it eight loads and 32
+/// multiply-adds: Flash-Next's IQ4_XS matrices were 7.8 ms of a check of four rows against 2.5 of a step. The
+/// parameters as [`rb_kernel_q8`]'s (`xs_at` where the rows' scales start).
+pub(crate) fn iq4_xs_few_q8(m: usize) -> String {
+    assert!((1..=IQ4_FEW_MAX).contains(&m), "1 to {IQ4_FEW_MAX} rows");
+    let each = |f: &dyn Fn(usize) -> String| (0..m).map(f).collect::<String>();
+    let sums = each(&|i| format!("    var a{i} = 0.0;\n"));
+    let words: String = (0..4)
+        .map(|q| {
+            format!(
+                "            let wq{q} = vec4<u32>(w[qw + {q}u]);\n            let l{q} = (wq{q} >> vec4<u32>(0u, 8u, 16u, 24u)) & vec4<u32>(15u);\n            let h{q} = (wq{q} >> vec4<u32>(4u, 12u, 20u, 28u)) & vec4<u32>(15u);\n            let lo{q} = lut[l{q}.x] | (lut[l{q}.y] << 8u) | (lut[l{q}.z] << 16u) | (lut[l{q}.w] << 24u);\n            let hi{q} = lut[h{q}.x] | (lut[h{q}.y] << 8u) | (lut[h{q}.z] << 16u) | (lut[h{q}.w] << 24u);\n"
+            )
+        })
+        .collect();
+    let rows = each(&|i| {
+        format!(
+            "            {{\n                let xa = x8[{i}u * k16 + u * 2u];\n                let xb = x8[{i}u * k16 + u * 2u + 1u];\n                let xd = bitcast<f32>(x8[p.xs_at + {i}u * k32 + u].x);\n                let s = dot4I8Packed(lo0, xa.x) + dot4I8Packed(lo1, xa.y) + dot4I8Packed(lo2, xa.z) + dot4I8Packed(lo3, xa.w) + dot4I8Packed(hi0, xb.x) + dot4I8Packed(hi1, xb.y) + dot4I8Packed(hi2, xb.z) + dot4I8Packed(hi3, xb.w);\n                a{i} += dl * xd * f32(s);\n            }}\n"
+        )
+    });
+    let store = each(&|i| format!("    red[t * {m}u + {i}u] = a{i};\n"));
+    let out = each(&|i| format!("        {{\n            var s = 0.0;\n            for (var l = 0u; l < 32u; l++) {{ s += red[(t + l) * {m}u + {i}u]; }}\n            y[{i}u * p.n + p.row0 + r] = s;\n        }}\n"));
+    format!(
+        r#"
+struct Params {{
+    k: u32,
+    n: u32,
+    m: u32,
+    row0: u32,
+    rows: u32,
+    row_bytes: u32,
+    xs_at: u32,
+    _pad1: u32,
+}}
+@group(0) @binding(0) var<storage, read> w: array<u32>;
+@group(0) @binding(1) var<storage, read> x8: array<vec4<u32>>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> p: Params;
+
+// the type's 16 values, each as its int8's byte
+const KVALUES = array<u32, 16>(129u, 152u, 173u, 191u, 207u, 221u, 234u, 246u, 1u, 13u, 25u, 38u, 53u, 69u, 89u, 113u);
+var<workgroup> lut: array<u32, 16>;
+// each thread's sums, [weight row][lane][row of x]
+var<workgroup> red: array<f32, {red_len}>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {{
+    if (t < 16u) {{
+        lut[t] = KVALUES[t];
+    }}
+    workgroupBarrier();
+    let slot = t / 32u;
+    let lane = t % 32u;
+    let r = (wg.x + wg.y * 65535u) * 8u + slot;
+    let live = r < p.rows;
+    let k16 = p.k / 16u;
+    let k32 = p.k / 32u;
+{sums}    if (live) {{
+        let row = r * (p.row_bytes / 4u);
+        for (var u = lane; u < k32; u += 32u) {{
+            let bw = row + (u / 8u) * 34u;
+            let sub = u % 8u;
+            let head = w[bw];
+            let ls = ((w[bw + 1u] >> (4u * sub)) & 15u) | (((head >> (16u + 2u * sub)) & 3u) << 4u);
+            let dl = unpack2x16float(head).x * (f32(ls) - 32.0);
+            let qw = bw + 2u + sub * 4u;
+{words}{rows}        }}
+    }}
+{store}    workgroupBarrier();
+    if (live && lane == 0u) {{
+{out}    }}
+}}
+"#,
+        red_len = 256 * m,
+    )
+}
+
 /// Rows of `x` up to which the multi-row kernels go before the tiled one: they read `x` again for every weight row,
 /// where the tiled kernel keeps 64 rows of it in workgroup memory but costs the same for a few rows as for 64
 /// (Qwen3.8 27B's chunk of 22 tokens in 186 ms with them and in 199 with it, of 512 in 4.0 s and in 1.3).

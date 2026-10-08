@@ -307,6 +307,53 @@ fn iq4_xs_against_a_few_rows_is_the_generic_kernels() {
     }
 }
 
+/// IQ4_XS's kernel from int8 activations (a check of drafts' rows) gives the f32 one's sums within the rounding of a
+/// row's values to int8 (each 32 by its own scale): every count of rows, weight rows off a workgroup's eight, a width
+/// of one lane's turn and of three; and exactly what the weights give against rows that are int8 already (every value
+/// a whole number up to 127: the int8 kernel's sums are then the f32 kernel's but for the order they are added in).
+#[test]
+fn iq4_xs_from_int8_rows_is_the_f32_kernels() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    for (n, k) in [(37usize, 512usize), (64, 2560)] {
+        let mut next = rng(n as u32 + 3 * k as u32);
+        let mut raw = vec![0u8; n * (k / 256) * 136];
+        for v in raw.iter_mut() {
+            *v = ((next() + 1.0) * 127.9) as u8;
+        }
+        for blk in raw.chunks_exact_mut(136) {
+            let d = half::f16::from_f32(0.001 + (blk[9] as f32) * 1e-5).to_bits().to_le_bytes();
+            (blk[0], blk[1]) = (d[0], d[1]);
+        }
+        let w = ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(raw, vec![n, k], GgmlType::IQ4_XS));
+        for m in 1..=crate::shaders::IQ4_FEW_MAX {
+            for whole in [false, true] {
+                let (x, y, yq) = (b.vec(m * k), b.vec(m * n), b.vec(m * n));
+                // (whole: each 32 has a 127 or a -127, so its scale is one and its values are their own int8)
+                let xs: Vec<f32> = (0..m * k).map(|i| if !whole { next() } else if i % 32 == 5 { if next() > 0.0 { 127.0 } else { -127.0 } } else { (next() * 127.0).round() }).collect();
+                DeviceChain::upload(&b, &x, &xs);
+                let mut rec = Recorder::new(&b);
+                assert!(rec.matmul_rows_iq4_xs(&w, &x, &y, m));
+                rec.read(&y);
+                let want = Box::new(rec).finish().pop().unwrap();
+                let mut rec = Recorder::new(&b);
+                assert!(rec.matmul_rows_iq4_xs_q8(&w, &x, &yq, m), "IQ4_XS [{n}, {k}] of {m} rows from int8");
+                rec.read(&yq);
+                let got = Box::new(rec).finish().pop().unwrap();
+                let dot: f64 = got.iter().zip(&want).map(|(a, e)| *a as f64 * *e as f64).sum();
+                let norm = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+                let cos = dot / (norm(&got) * norm(&want));
+                let scale = want.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+                let worst = got.iter().zip(&want).map(|(a, e)| (a - e).abs()).fold(0.0f32, f32::max);
+                if whole {
+                    assert!(scale > 0.0 && worst <= scale * 2e-5, "IQ4_XS [{n}, {k}] of {m} whole rows: {worst} off of a largest {scale}");
+                } else {
+                    assert!(cos > 0.9999, "IQ4_XS [{n}, {k}] of {m} rows from int8: cosine {cos}");
+                }
+            }
+        }
+    }
+}
+
 /// The tensor-core matmuls (where the device has them) give their f32 tiled kernels' sums within f16's rounding:
 /// Q3_K, Q4_K, Q5_K, Q6_K and Q8_0, a tile's worth of tokens and a tile and a bit (the edge), rows off the tile.
 #[test]

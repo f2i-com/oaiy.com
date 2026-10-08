@@ -1334,7 +1334,9 @@ mod dense_webgpu_timing {
     /// Qwen3.8-Flash-Next from a GGUF (FLASHNEXT_GGUF, its first shard) chained on the GPUs answers as its own host
     /// path does (the same weights through the host's matmuls and its experts' reference): the prompt as one chunk,
     /// then step by step on the host path's greedy tokens, each step's logits close; and what it writes reads as an
-    /// answer (printed: a wrong tensor or layout writes noise). FLASHNEXT_STEPS: the steps (48).
+    /// answer (printed: a wrong tensor or layout writes noise). Then the same tokens again as checks of two to four
+    /// rows (as drafting runs them): each row's logits close to its step's (a check's rows go through the int8
+    /// kernels where the type has them, a step's through f32's). FLASHNEXT_STEPS: the steps (48).
     #[test]
     #[ignore = "needs WebGPU adapters with room for Qwen3.8-Flash-Next and its GGUF (FLASHNEXT_GGUF)"]
     fn a_flashnext_gguf_chained_answers_as_its_own_path() {
@@ -1370,6 +1372,8 @@ mod dense_webgpu_timing {
         let mut next = argmax(lh.data());
         let (mut worst, mut same, mut th, mut tc) = (1.0f64, 0usize, 0f64, 0f64);
         let mut written = vec![next];
+        // (each chained step's logits, for the checks after)
+        let mut stepped: Vec<Vec<f32>> = Vec::with_capacity(steps);
         for _ in 0..steps {
             let e = model.embed_text(&[next]).unwrap();
             let t = std::time::Instant::now();
@@ -1382,6 +1386,7 @@ mod dense_webgpu_timing {
             same += (argmax(host.data()) == argmax(chained.data())) as usize;
             next = argmax(host.data());
             written.push(next);
+            stepped.push(chained.data().to_vec());
         }
         let runs = model.chain_runs();
         eprintln!("{steps} steps: host {:.1} ms a step, chained {:.1} ms ({runs} chained); worst logits cosine {worst:.6}; the same greedy token {same} of {steps}", th * 1e3 / steps as f64, tc * 1e3 / steps as f64);
@@ -1389,6 +1394,29 @@ mod dense_webgpu_timing {
         assert!(prompt_cos > 0.99, "{prompt_cos}");
         assert!(worst > 0.99, "{worst}");
         assert_eq!(runs, steps + 1, "the prompt and every step chained");
+        // the same tokens as checks: row r of a check at token `at` against the step on token `at + r`
+        let mut kk = model.new_kv_cache(prompt.len() + steps + 64);
+        let _ = model.forward(&prompt, &e, &mut kk, None).unwrap();
+        let (mut at, mut rows_seen, mut same, mut worst, mut sum) = (0usize, 0usize, 0usize, 1.0f64, 0f64);
+        for rows in [4usize, 3, 2].into_iter().cycle() {
+            if at + rows > steps {
+                break;
+            }
+            let got = model.check(&written[at..at + rows], &mut kk).expect("a check chained");
+            for (r, row) in got.iter().enumerate() {
+                let want = &stepped[at + r];
+                let c = cosine(row.data(), want);
+                worst = worst.min(c);
+                sum += c;
+                same += (argmax(row.data()) == argmax(want)) as usize;
+                rows_seen += 1;
+            }
+            at += rows;
+        }
+        // (a rounding that changes a row's tenth expert in some layer moves its logits more than the rounding does:
+        // the steps against the host path are as far apart at worst)
+        eprintln!("{rows_seen} rows in checks of 4, 3 and 2 against their steps: logits cosine {:.6} on average, {worst:.6} at worst; the same greedy token {same} of {rows_seen}", sum / rows_seen.max(1) as f64);
+        assert!(rows_seen == 0 || worst > 0.99, "a check's rows against its steps': {worst}");
     }
 
     /// Qwen3.8-Flash-Next chained on the GPUs (its layers over every discrete one) answers as its own path does: the
@@ -2234,7 +2262,7 @@ mod dense_webgpu_timing {
             }
             next = l.data().iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
         }
-        // runs of a few rows (what a check of drafts would be): each a mean of 6 after one to warm
+        // runs of a few rows (a prompt's last few: the last row's logits only): each a mean of 6 after one to warm
         let mut runs = chunk_count + 4;
         for rows in [1usize, 2, 3, 4, 8] {
             let mut wall = 0.0;
@@ -2254,6 +2282,27 @@ mod dense_webgpu_timing {
                 runs += 1;
             }
             eprintln!("a run of {rows} rows: {:.1} ms", wall / 6.0);
+        }
+        // checks of drafts as the server makes them (`Flashnext::check`: every row's logits, the run kept undoable):
+        // each a mean of 6 after one to warm
+        for rows in 2..=crate::flashnext::CHECK_ROWS {
+            let mut wall = 0.0;
+            for rep in 0..7 {
+                let toks: Vec<u32> = (0..rows as u32).map(|i| 3000 + i * 31 + rep * 7).collect();
+                let _ = (ggml_rs_wgpu::profile::take_kernels(), ggml_rs_wgpu::profile::take_line());
+                let t = Instant::now();
+                let l = model.check(&toks, &mut kv).expect("a check chained");
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                assert_eq!(l.len(), rows, "a row of logits for each of a check's");
+                if rep > 0 {
+                    wall += ms;
+                }
+                if rep == 6 && rows == 4.min(crate::flashnext::CHECK_ROWS) {
+                    report(&format!("a check of {rows} rows"), ms);
+                }
+                runs += 1;
+            }
+            eprintln!("a check of {rows} rows: {:.1} ms", wall / 6.0);
         }
         assert_eq!(model.chain_runs(), runs, "every run chained");
     }

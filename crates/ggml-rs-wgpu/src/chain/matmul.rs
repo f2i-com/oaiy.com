@@ -36,6 +36,45 @@ impl Recorder<'_> {
         true
     }
 
+    /// [`Self::matmul_rows_iq4_xs`] from `x`'s rows as int8 ([`crate::shaders::iq4_xs_few_q8`]; quantized once, as for
+    /// [`Self::matmul_rows_q8`]): a check of drafts' rows. False as that one is.
+    pub(crate) fn matmul_rows_iq4_xs_q8(&mut self, w: &QuantizedTensor, x: &DeviceVec, y: &DeviceVec, m: usize) -> bool {
+        let q = w.device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).expect("a weight this adapter holds");
+        let (n, k) = (w.shape()[0], w.shape()[1]);
+        if q.dtype != ggml_quants::GgmlType::IQ4_XS || m == 0 || m > crate::shaders::IQ4_FEW_MAX || k % 256 != 0 || q.row_bytes != k / 256 * 136 {
+            return false;
+        }
+        assert!(x.len >= m * k && y.len >= m * n, "chain: an IQ4_XS int8 matmul [{n}, {k}] of {m} rows");
+        let (xq, xs_at) = self.x_q8(x, m, k);
+        const NAMES: [&str; crate::shaders::IQ4_FEW_MAX] =
+            ["chain-iq4xs-q8-1", "chain-iq4xs-q8-2", "chain-iq4xs-q8-3", "chain-iq4xs-q8-4", "chain-iq4xs-q8-5", "chain-iq4xs-q8-6", "chain-iq4xs-q8-7", "chain-iq4xs-q8-8"];
+        let pipeline = self.gpu().named_pipeline(NAMES[m - 1], || crate::shaders::iq4_xs_few_q8(m));
+        for (chunk, row0, rows) in &q.chunks {
+            let words = [k as u32, n as u32, m as u32, *row0, *rows, q.row_bytes as u32, xs_at as u32, 0];
+            let groups = rows.div_ceil(8);
+            self.dispatch_kept(&pipeline, chunk, buffer(&xq), buffer(y), &words, (groups.min(65535), groups.div_ceil(65535), 1));
+        }
+        true
+    }
+
+    /// `x`'s `m` rows of `k` as int8 ([`crate::shaders::QUANT_Q8`]), and where their scales start: made once for every
+    /// int8 matmul that reads them until something writes `x`.
+    pub(super) fn x_q8(&mut self, x: &DeviceVec, m: usize, k: usize) -> (DeviceVec, usize) {
+        let (len, xs_at) = crate::shaders::q8_len(m, k);
+        let xb = buffer(x).clone();
+        if let Some((.., xq)) = self.q8.iter().find(|(b, rows, width, _)| *b == xb && *rows == m && *width == k) {
+            return (xq.clone(), xs_at);
+        }
+        let xq = self.scratch(len);
+        let quant = self.gpu().named_pipeline("chain-q8-quantize", || crate::shaders::QUANT_Q8.to_string());
+        let blocks = (m * k / 32) as u32;
+        let groups = blocks.div_ceil(256);
+        let d = self.gpu().dummy().clone();
+        self.dispatch_kept(&quant, &d, buffer(x), buffer(&xq), &[k as u32, m as u32, xs_at as u32], (groups.min(65535), groups.div_ceil(65535), 1));
+        self.q8.push((xb, m, k, xq.clone()));
+        (xq, xs_at)
+    }
+
     /// `y[r] = W x[r]` as [`ChainRecorder::matmul_rows`] for a prompt's rows on the tensor cores
     /// ([`crate::shaders::coop_tiled`]: f16 weights and tokens into f32 sums). False where the device has no cooperative
     /// matrices or the type no such kernel.
@@ -183,22 +222,8 @@ impl Recorder<'_> {
         if q.dtype != ggml_quants::GgmlType::Q3_K || k % 256 != 0 {
             return false;
         }
-        let (len, xs_at) = crate::shaders::q8_len(m, k);
         assert!(x.len >= m * k && y.len >= m * n, "chain: an int8 tiled matmul [{n}, {k}] of {m} rows");
-        let xb = buffer(x).clone();
-        let xq = match self.q8.iter().find(|(b, rows, width, _)| *b == xb && *rows == m && *width == k) {
-            Some((.., xq)) => xq.clone(),
-            None => {
-                let xq = self.scratch(len);
-                let quant = self.gpu().named_pipeline("chain-q8-quantize", || crate::shaders::QUANT_Q8.to_string());
-                let blocks = (m * k / 32) as u32;
-                let groups = blocks.div_ceil(256);
-                let d = self.gpu().dummy().clone();
-                self.dispatch_kept(&quant, &d, buffer(x), buffer(&xq), &[k as u32, m as u32, xs_at as u32], (groups.min(65535), groups.div_ceil(65535), 1));
-                self.q8.push((xb, m, k, xq.clone()));
-                xq
-            }
-        };
+        let (xq, xs_at) = self.x_q8(x, m, k);
         let pipeline = self.gpu().named_pipeline("chain-tq8-Q3_K", || crate::shaders::tiled_q8(ggml_quants::GgmlType::Q3_K).expect("Q3_K's int8 tiled kernel"));
         for (chunk, row0, rows) in &q.chunks {
             let words = [k as u32, n as u32, m as u32, *row0, *rows, q.row_bytes as u32, xs_at as u32, 0];
@@ -219,22 +244,8 @@ impl Recorder<'_> {
         if !matches!(q.dtype, ggml_quants::GgmlType::Q3_K | ggml_quants::GgmlType::Q4_K | ggml_quants::GgmlType::Q5_K | ggml_quants::GgmlType::Q6_K | ggml_quants::GgmlType::Q4_0) || k % block != 0 {
             return false;
         }
-        let (len, xs_at) = crate::shaders::q8_len(m, k);
         assert!(x.len >= m * k && y.len >= m * n, "chain: an int8 matmul [{n}, {k}] of {m} rows");
-        let xb = buffer(x).clone();
-        let xq = match self.q8.iter().find(|(b, rows, width, _)| *b == xb && *rows == m && *width == k) {
-            Some((.., xq)) => xq.clone(),
-            None => {
-                let xq = self.scratch(len);
-                let quant = self.gpu().named_pipeline("chain-q8-quantize", || crate::shaders::QUANT_Q8.to_string());
-                let blocks = (m * k / 32) as u32;
-                let groups = blocks.div_ceil(256);
-                let d = self.gpu().dummy().clone();
-                self.dispatch_kept(&quant, &d, buffer(x), buffer(&xq), &[k as u32, m as u32, xs_at as u32], (groups.min(65535), groups.div_ceil(65535), 1));
-                self.q8.push((xb, m, k, xq.clone()));
-                xq
-            }
-        };
+        let (xq, xs_at) = self.x_q8(x, m, k);
         let mr = if m == 1 { 1 } else { crate::shaders::MULTI_ROWS };
         let name = match (q.dtype, mr == 1) {
             (ggml_quants::GgmlType::Q3_K, true) => "chain-q8-Q3_K-decode",

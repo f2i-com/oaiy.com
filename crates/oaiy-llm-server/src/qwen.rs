@@ -743,6 +743,8 @@ impl QwenEngine {
         let drafter = (job.images.is_empty() && hybrid.drafts()).then_some(hybrid);
         let mut pending: std::collections::VecDeque<(u32, Tensor)> = Default::default();
         let (mut check_rows, mut drafts_checked, mut drafts_taken) = (0usize, 0usize, 0usize);
+        // (for the log: the checks made and their rows, the time making drafts, in checks, and undoing rows)
+        let (mut checks, mut rows_checked, mut t_draft, mut t_check, mut t_undo) = (0usize, 0usize, 0f64, 0f64, 0f64);
         while generated.len() < job.max_tokens && self.kv.len < self.kv.max_len {
             if job.cancel.load(Ordering::Relaxed) {
                 if let (Some(m), false) = (drafter, pending.is_empty()) { m.rollback(&mut self.kv, check_rows, check_rows - pending.len()); }
@@ -757,7 +759,9 @@ impl QwenEngine {
             let ran = !stop && pending.front().is_some_and(|(d, _)| *d == next);
             if !ran && !pending.is_empty() {
                 let m = drafter.expect("drafts are a drafter's");
+                let clock = std::time::Instant::now();
                 m.rollback(&mut self.kv, check_rows, check_rows - pending.len());
+                t_undo += clock.elapsed().as_secs_f64();
                 pending.clear();
             }
             if stop { finish = Finish::Stop; break; }
@@ -788,13 +792,21 @@ impl QwenEngine {
                 let checked = drafter.filter(|_| self.kv.len + 1 + drafts_most() <= self.kv.max_len).and_then(|m| {
                     let recent: Vec<u32> = self.covered[self.covered.len().saturating_sub(m.draft_window())..].iter().map(|&k| k as u32).chain([next]).collect();
                     // none the layer is sure enough of: a step of the token alone
-                    let drafts = m.draft(&self.kv, &recent, drafts_most()).filter(|d| !d.is_empty())?;
+                    let began = std::time::Instant::now();
+                    let drafts = m.draft(&self.kv, &recent, drafts_most()).filter(|d| !d.is_empty());
+                    t_draft += began.elapsed().as_secs_f64();
+                    let drafts = drafts?;
                     let rows: Vec<u32> = std::iter::once(next).chain(drafts.iter().copied()).collect();
-                    Some((drafts, m.check(&rows, &mut self.kv)?))
+                    let began = std::time::Instant::now();
+                    let checked = m.check(&rows, &mut self.kv);
+                    t_check += began.elapsed().as_secs_f64();
+                    Some((drafts, checked?))
                 });
                 match checked {
                     Some((drafts, mut rows)) => {
                         check_rows = rows.len();
+                        checks += 1;
+                        rows_checked += check_rows;
                         drafts_checked += drafts.len();
                         logits = rows.remove(0);
                         pending = drafts.into_iter().zip(rows).collect();
@@ -818,7 +830,7 @@ impl QwenEngine {
         // and fixed; the server log never holds it.
         let text = stream.push(&raw, &job.tools, true)
             .map_err(|e| format!("tool_contract_error: {e}; no tool from this batch was executed. The model wrote: {}", call_excerpt(&raw)))?;
-        if self.log { eprintln!("  Qwen: {} prompt tokens ({} cached) in {:.2}s; {} generated in {:.2}s (sampling {t_sample:.2}s, text {t_text:.2}s, model {t_model:.2}s){}", job.prompt.len(),start,prefill_secs,generated.len(),decode_clock.elapsed().as_secs_f64(), if drafts_checked > 0 { format!("; {drafts_taken} of {drafts_checked} drafts taken") } else { String::new() }); }
+        if self.log { eprintln!("  Qwen: {} prompt tokens ({} cached) in {:.2}s; {} generated in {:.2}s (sampling {t_sample:.2}s, text {t_text:.2}s, model {t_model:.2}s){}", job.prompt.len(),start,prefill_secs,generated.len(),decode_clock.elapsed().as_secs_f64(), if drafts_checked > 0 { format!("; {drafts_taken} of {drafts_checked} drafts taken ({checks} checks of {rows_checked} rows {t_check:.2}s, drafting {t_draft:.2}s, undoing {t_undo:.2}s)") } else { String::new() }); }
         if !text.is_empty() { let _ = job.events.send(Event::Text(text)); }
         let _ = job.events.send(Event::Done { finish, completion_tokens: generated.len() });
         // the reply is out: this prompt's checkpoints' states, copied on their devices as it ran, to the host now
