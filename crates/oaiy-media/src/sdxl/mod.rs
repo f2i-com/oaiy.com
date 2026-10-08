@@ -285,6 +285,26 @@ fn encode_prompt(
     Ok((context, y, truncated))
 }
 
+/// [`encode_prompt`] with the two encoders on WebGPU.
+#[cfg(feature = "webgpu")]
+fn encode_prompt_webgpu(r: &Request, tokenizer: &tokenizers::Tokenizer, clips: &crate::sdxl_clip_wgpu::WgpuClips, prompt: &str) -> Result<(Tensor, Tensor, bool)> {
+    let dev = Device::Cpu;
+    let ids = |t: &Tensor| t.flatten_all()?.to_vec1::<u32>();
+    let mut encoded = Vec::new();
+    let mut truncated = false;
+    for p in [prompt, &r.negative] {
+        let (l, _, tl) = clip_ids(tokenizer, p, 49407, &dev)?;
+        // OpenCLIP-G pads with zero; CLIP-L pads with EOT.
+        let (g, eot, tg) = clip_ids(tokenizer, p, 0, &dev)?;
+        encoded.push(clips.encode(&ids(&l)?, &ids(&g)?, eot, r.clip_skip)?);
+        truncated |= tl || tg;
+    }
+    let context = Tensor::cat(&[&encoded[0].0, &encoded[1].0], 0)?;
+    let size = (r.height as u32, r.width as u32);
+    let y = Tensor::cat(&encoded.iter().map(|e| micro_cond::build_label_y(&e.1, size, (0, 0), size)).collect::<Result<Vec<_>>>()?, 0)?;
+    Ok((context, y, truncated))
+}
+
 /// The official CLIP tokenizer the request names, neither padding nor truncating.
 fn open_tokenizer(r: &Request) -> Result<tokenizers::Tokenizer> {
     let mut tokenizer =
@@ -372,10 +392,11 @@ fn save_image(r: &Request, out: &std::path::Path, manifest: &mut std::fs::File, 
     Ok(record)
 }
 
-/// [`generate`] with the UNet and the VAE's decoder on WebGPU ([`crate::sdxl_wgpu::WgpuUnet`],
-/// [`crate::sdxl_vae_wgpu::WgpuSdxlVae`]): the two CLIP encoders on the host through Candle in f32 (a prompt's two
-/// encodings, against a step's two passes of the UNet), the noise the host's from the seed (Candle seeds no generator on the CPU), a guided step's prompt and
-/// negative prompt two passes of one recording, a guidance of 1 the prompt's pass alone.
+/// [`generate`] with the UNet, the VAE's decoder and the two CLIP encoders on WebGPU ([`crate::sdxl_wgpu::WgpuUnet`],
+/// [`crate::sdxl_vae_wgpu::WgpuSdxlVae`], [`crate::sdxl_clip_wgpu::WgpuClips`]): every picture's prompt encoded first
+/// and the encoders let go (1.6 GB of the card's), the noise the host's from the seed (Candle seeds no generator on
+/// the CPU), a guided step's prompt and negative prompt two passes of one recording, a guidance of 1 the prompt's
+/// pass alone. OAIY_SDXL_CLIP_CPU: the encoders through Candle on the host in f32, as they were.
 #[cfg(feature = "webgpu")]
 fn generate_webgpu(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
     let clock = Instant::now();
@@ -400,7 +421,9 @@ fn generate_webgpu(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
     let unet_at = clock.elapsed().as_secs_f64();
     let vae = crate::sdxl_vae_wgpu::WgpuSdxlVae::load_on(&mut stages.weights, VAE, &config::VaeConfig::sdxl_default(), unet.backend().clone())?;
     let vae_at = clock.elapsed().as_secs_f64();
-    let (cl, cg) = stages.clips(&dev, DType::F32)?;
+    let on_host = std::env::var_os("OAIY_SDXL_CLIP_CPU").is_some();
+    let host_clips = if on_host { Some(stages.clips(&dev, DType::F32)?) } else { None };
+    let clips = if on_host { None } else { Some(crate::sdxl_clip_wgpu::WgpuClips::load(&mut stages.weights, CLIP_L, CLIP_G, unet.backend().clone())?) };
     let load_seconds = clock.elapsed().as_secs_f64();
     // (OAIY_LOAD_PROFILE: where the loading went)
     if std::env::var_os("OAIY_LOAD_PROFILE").is_some() {
@@ -411,18 +434,33 @@ fn generate_webgpu(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
     let (lh, lw) = (r.height / 8, r.width / 8);
     let row = |t: &Tensor, i: usize| -> Result<Vec<f32>> { t.narrow(0, i, 1)?.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>() };
     let mut files = Vec::new();
-    for i in 0..r.count {
-        let image_clock = Instant::now();
-        let prompt = &r.prompts[if r.prompts.len() == 1 { 0 } else { i }];
+    // every picture's prompt first (one prompt for all of them encoded once), then the encoders' memory is the
+    // pictures'
+    let encode_clock = Instant::now();
+    let mut encodings: Vec<(Tensor, Tensor, bool)> = Vec::new();
+    for i in 0..if r.prompts.len() == 1 { 1 } else { r.count } {
         event(Json::obj([
             ("stage", Json::str("encoding_prompt")),
             ("image", Json::Int(i as i64 + 1)),
         ]));
-        let (context, y, truncated) = encode_prompt(r, &tokenizer, &cl, &cg, prompt, &dev)?;
+        encodings.push(match (&clips, &host_clips) {
+            (Some(c), _) => encode_prompt_webgpu(r, &tokenizer, c, &r.prompts[i])?,
+            (None, Some((cl, cg))) => encode_prompt(r, &tokenizer, cl, cg, &r.prompts[i], &dev)?,
+            (None, None) => unreachable!("one way or the other"),
+        });
+    }
+    drop(clips);
+    drop(host_clips);
+    let encode_seconds = encode_clock.elapsed().as_secs_f64();
+    for i in 0..r.count {
+        let image_clock = Instant::now();
+        let prompt = &r.prompts[if r.prompts.len() == 1 { 0 } else { i }];
+        let (context, y, truncated) = &encodings[if r.prompts.len() == 1 { 0 } else { i }];
+        let truncated = *truncated;
         // the prompt's keys and values for every cross-attention, and the negative prompt's where it guides
-        let mut conds = vec![unet.prepare(&row(&context, 0)?, &row(&y, 0)?)?];
+        let mut conds = vec![unet.prepare(&row(context, 0)?, &row(y, 0)?)?];
         if r.cfg != 1.0 {
-            conds.push(unet.prepare(&row(&context, 1)?, &row(&y, 1)?)?);
+            conds.push(unet.prepare(&row(context, 1)?, &row(y, 1)?)?);
         }
         let conds: Vec<&crate::sdxl_wgpu::Cond> = conds.iter().collect();
         let seed = r.seed + i as u64;
@@ -464,6 +502,7 @@ fn generate_webgpu(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
         ("data", Json::Arr(files)),
         ("output_dir", Json::str(out.to_string_lossy())),
         ("load_seconds", Json::Num(load_seconds)),
+        ("encode_seconds", Json::Num(encode_seconds)),
         ("seconds", Json::Num(clock.elapsed().as_secs_f64())),
         ("backend", Json::str("webgpu")),
     ]))

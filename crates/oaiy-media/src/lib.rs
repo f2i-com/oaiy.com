@@ -40,6 +40,8 @@ pub mod sdxl;
 pub mod sdxl_wgpu;
 #[cfg(feature = "webgpu")]
 pub mod sdxl_vae_wgpu;
+#[cfg(feature = "webgpu")]
+pub mod sdxl_clip_wgpu;
 pub mod music;
 pub mod tts;
 pub mod sound;

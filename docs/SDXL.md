@@ -9,14 +9,19 @@ Rust implementation. Inference is native Rust/Candle; no Python service is used.
 Build with `tools/qwen-image/build.ps1` on Windows, or
 `cargo build --release -p oaiy-media` anywhere (WebGPU is its default feature, and
 nothing of a GPU's is needed to build it). A job runs on WebGPU, on a GPU of any
-make: the UNet and the VAE there, the two CLIP encoders on the CPU. `backend: "cpu"`
+make: the UNet, the VAE and the two CLIP encoders there. `backend: "cpu"`
 runs it with Candle on the CPU instead, which is the reference and slow; `backend:
 "cuda"` is refused by name. On one RTX 5090 at a 400 W cap (2026-10-08), a 1024x1024
-picture of 16 steps at CFG 5 is a job of 13.3 s: 7.2 s loading (the UNet 4.9 s, the
-CLIP encoders 1.9 s), then the prompt's encoding on the CPU 2.5 s, the steps 2.7 s
-and the decode 0.8 s. An F16 checkpoint's matrices and convolutions go to the card
-straight from their bytes; decoded to f32 on one core and rounded back, as they were,
-the same job took 20.5 s (14.4 s loading) for the same picture, pixel for pixel.
+picture of 16 steps at CFG 5 is a job of 11.1 s: 7.1 s loading (the UNet 5.1 s, the
+CLIP encoders 1.6 s), then the prompt's and the negative prompt's encoding 0.5 s, the
+steps 2.7 s and the decode 0.8 s. An F16 checkpoint's matrices and convolutions go to
+the card straight from their bytes (decoded to f32 on one core and rounded back, as
+they were, loading took 14.4 s), and the encoders run as chains of the device's ops:
+against Candle's on the CPU in f32 their context is within 0.04% and CLIP-G's pooled
+output within 0.02%, a prompt 20 ms where 1 s, the picture 41 dB from the one the
+CPU's encoders give (`OAIY_SDXL_CLIP_CPU` runs them there). CLIP-L's last layer is
+neither loaded nor run: SDXL's context is the states before it, and some checkpoints
+keep values there that are no numbers.
 `OAIY_LOAD_PROFILE` prints the loading's parts. The existing [media controller setup](QWEN_IMAGE.md) and
 image API supervise SDXL jobs too. Restart the server/coder-cli after rebuilding.
 
