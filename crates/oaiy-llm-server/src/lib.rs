@@ -481,7 +481,7 @@ fn a_loopback_address_has_the_other_familys() {
     assert_eq!(other_loopback(at("127.0.0.2:8080")), None);
 }
 
-fn host_cache_budget(requested_gib: usize, available: Option<u64>) -> u64 {
+pub(crate) fn host_cache_budget(requested_gib: usize, available: Option<u64>) -> u64 {
     let safe = available.map(|n|n / 5 * 4).unwrap_or(32u64 << 30);
     if requested_gib == 0 { safe } else { (requested_gib as u64).saturating_mul(1u64 << 30).min(safe) }
 }

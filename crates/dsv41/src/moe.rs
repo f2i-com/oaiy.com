@@ -32,6 +32,95 @@ pub struct Experts {
     /// The row kernel a prompt's experts on the CPU run through (`pool`'s is its own): the portable one unless a
     /// caller chose this CPU's ([`crate::model::Model::set_expert_row_kernel`]).
     pub kernel: crate::cpu_experts::RowKernel,
+    /// Every routed expert's uses of late: what the tiers are ordered by.
+    pub uses: Uses,
+}
+
+/// Decode steps after which every expert's count of uses halves ([`Uses`], and the RAM cache's own counts with
+/// them): some two or three replies. Unaged, an expert a long conversation used ten thousand times would outrank, for
+/// as long again, one a new subject uses at every step.
+pub const USES_AGE_STEPS: u64 = 512;
+
+/// Every routed expert's uses of late, whatever tier holds it: one for each call that routed to it (a decode step,
+/// or a prompt's pass), halved every [`USES_AGE_STEPS`] decode steps. The model's 15,360 experts fit no computer's
+/// memory whole, so where each lives is decided by this: the most used where they are computed quickest (a GPU's
+/// memory, where there is one), the next in RAM, the rest on the drive. It is also what a usage profile keeps from
+/// one run to the next, so a start-up reads the experts in that order.
+pub struct Uses {
+    counts: std::sync::Mutex<Vec<u32>>,
+    per_layer: usize,
+    decoded: std::sync::atomic::AtomicU64,
+}
+
+impl Uses {
+    pub fn new(layers: usize, per_layer: usize) -> Uses {
+        Uses { counts: std::sync::Mutex::new(vec![0; layers * per_layer]), per_layer, decoded: std::sync::atomic::AtomicU64::new(0) }
+    }
+
+    fn held(&self) -> std::sync::MutexGuard<'_, Vec<u32>> {
+        self.counts.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Where `(layer, expert)`'s count is, if it is one of a layer's experts.
+    fn at(&self, layer: u32, expert: u32) -> Option<usize> {
+        ((expert as usize) < self.per_layer).then(|| layer as usize * self.per_layer + expert as usize)
+    }
+
+    /// A call routed to `experts` of `layer`.
+    pub fn add(&self, layer: u32, experts: &[u32]) {
+        let mut counts = self.held();
+        for &e in experts {
+            if let Some(n) = self.at(layer, e).and_then(|i| counts.get_mut(i)) {
+                *n = n.saturating_add(1);
+            }
+        }
+    }
+
+    pub fn of(&self, layer: u32, expert: u32) -> u32 {
+        self.at(layer, expert).and_then(|i| self.held().get(i).copied()).unwrap_or(0)
+    }
+
+    /// `(layers, experts a layer)`.
+    pub fn shape(&self) -> (usize, usize) {
+        (self.held().len() / self.per_layer.max(1), self.per_layer)
+    }
+
+    /// Every count, layer by layer (`layer * experts a layer + expert`).
+    pub fn counts(&self) -> Vec<u32> {
+        self.held().clone()
+    }
+
+    /// Start from `counts` (another run's, by [`Self::counts`]); false, and nothing changed, if they are not this
+    /// model's shape.
+    pub fn seed(&self, counts: &[u32]) -> bool {
+        let mut held = self.held();
+        if counts.len() != held.len() {
+            return false;
+        }
+        held.copy_from_slice(counts);
+        true
+    }
+
+    /// The experts in the order a start-up should read them: the most used first, and of equals every layer's expert
+    /// `e` before any layer's `e + 1` (a step uses each layer's alike).
+    pub fn order(&self) -> Vec<(u32, u32)> {
+        let counts = self.held();
+        let layers = counts.len() / self.per_layer.max(1);
+        let mut order: Vec<(u32, u32)> = (0..counts.len()).map(|i| ((i % layers) as u32, (i / layers) as u32)).collect();
+        order.sort_by_key(|&(layer, expert)| std::cmp::Reverse(counts[layer as usize * self.per_layer + expert as usize]));
+        order
+    }
+
+    /// A decode step is done: whether the counts were halved for it.
+    pub fn step(&self) -> bool {
+        if (self.decoded.fetch_add(1, Ordering::Relaxed) + 1) % USES_AGE_STEPS != 0 {
+            return false;
+        }
+        for n in self.held().iter_mut() {
+            *n /= 2;
+        }
+        true
+    }
 }
 
 /// Tokens a pass needs before its layers' experts are read while their attention runs: a prompt this long uses most of
@@ -209,6 +298,7 @@ impl Moe {
         let mut used: Vec<u32> = routes.iter().flat_map(|r| r.experts.iter().copied()).collect();
         used.sort_unstable();
         used.dedup();
+        experts.uses.add(self.layer, &used);
         // Each expert's (tokens, outputs), every expert's computed before any is added, then added in ascending
         // expert order, as one at a time added them: the same sums either way.
         // Their records, read on several threads at once: an SSD serves a queue of reads several times faster than one
@@ -439,5 +529,33 @@ impl Moe {
             })
             .collect();
         w2.forward(&h, t, Out::Bf16)
+    }
+}
+
+#[cfg(test)]
+mod uses_tests {
+    use super::*;
+
+    /// The counts are a call's worth each, halve once every [`USES_AGE_STEPS`] decode steps, give a start-up its order
+    /// (the most used first, then every layer's expert e before any layer's e + 1), and carry over to another run of
+    /// the same shape and to no other.
+    #[test]
+    fn the_counts_age_and_order_a_start_up() {
+        let uses = Uses::new(3, 4);
+        assert_eq!(uses.shape(), (3, 4));
+        for _ in 0..6 {
+            uses.add(2, &[1, 3]);
+        }
+        uses.add(0, &[3]);
+        uses.add(0, &[3, 9]);
+        assert_eq!((uses.of(2, 1), uses.of(2, 3), uses.of(0, 3), uses.of(1, 0), uses.of(0, 9)), (6, 6, 2, 0, 0));
+        assert_eq!(uses.order()[..6], [(2, 1), (2, 3), (0, 3), (0, 0), (1, 0), (2, 0)]);
+        assert_eq!(uses.order().len(), 12);
+        assert_eq!((0..USES_AGE_STEPS - 1).filter(|_| uses.step()).count(), 0);
+        assert!(uses.step(), "the last of the steps halves");
+        assert_eq!((uses.of(2, 1), uses.of(0, 3)), (3, 1));
+        let next = Uses::new(3, 4);
+        assert!(next.seed(&uses.counts()) && next.counts() == uses.counts());
+        assert!(!Uses::new(3, 5).seed(&uses.counts()), "another shape's counts are not taken");
     }
 }

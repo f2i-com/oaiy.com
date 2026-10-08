@@ -652,6 +652,13 @@ impl Models {
         // The routed experts on the CPU through this CPU's fastest kernel (the same bits as the portable one).
         model.set_expert_row_kernel(dsv41_simd::row_kernel());
         self.say(format!("experts on the CPU: the {} kernel", dsv41_simd::row_kernel_name()));
+        // Its usage profile (`--usage`), if an earlier run left one: the experts' counts of uses, and with them the
+        // order the tiers are filled in at this start (the most used on the cards, the next in RAM), where without
+        // one they are filled by number and find their order as they are used.
+        let order = o.usage.as_deref().filter(|p| crate::dsv41_portable::read_usage(p, model.expert_uses())).map(|p| {
+            self.say(format!("the experts' usage profile read from {}: the most used are read first", p.display()));
+            model.expert_uses().order()
+        });
         let devices = self.devices_of(spec);
         let picked = crate::backend::open(o, &devices)?;
         let mut kernel = None;
@@ -672,6 +679,9 @@ impl Models {
                         // then change what they hold only while the server idles (OAIY_DSV41_INCLUSIVE: as before, the
                         // first card's tier replacing as it goes and RAM holding its experts too).
                         k.set_exclusive(std::env::var_os("OAIY_DSV41_INCLUSIVE").is_none());
+                        if let Some(order) = &order {
+                            k.start_from(order);
+                        }
                         let k = Arc::new(k);
                         model.set_experts_kernel(Some(Arc::clone(&k) as Arc<dyn dsv41::expert::ExpertsKernel>));
                         kernel = Some(k);
@@ -688,7 +698,7 @@ impl Models {
         // Its own placeholder (as the CUDA build): the default, token 0, is DeepSeek's start of sequence.
         cfg.image_token_id = model.cfg.image_token_id;
         let (jobs, rx) = std::sync::mpsc::channel();
-        let e = crate::dsv41_portable::Engine::new(model, Arc::clone(&tok), !o.quiet && !o.silent).with_kernel(kernel);
+        let e = crate::dsv41_portable::Engine::new(model, Arc::clone(&tok), !o.quiet && !o.silent).with_kernel(kernel).with_usage(o.usage.clone(), order).with_ram_ceiling(o.ram_gb);
         let thread = std::thread::Builder::new().name("deepseek-model".into()).spawn(move || e.run(rx)).map_err(Error::Io)?;
         Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Deepseek(tok)) })
     }

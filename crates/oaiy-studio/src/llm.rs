@@ -221,6 +221,9 @@ pub fn arguments(llm: &Json, root: &Path, port: u16, key: &str, local_images: bo
     if bool_or(llm, "prompt_cache", true) {
         push("--prompt-cache", root.join("cache").join("prompt-states").to_string_lossy().into_owned());
         push("--prompt-cache-gb", num_or(llm, "prompt_cache_gb", 4.0).to_string());
+        // DeepSeek-V4.1's experts' counts of uses, kept with what else the server keeps between runs: its next start
+        // reads the most used first, onto the GPUs and then into RAM (no other model reads it).
+        push("--usage", root.join("cache").join("expert-usage.bin").to_string_lossy().into_owned());
     }
     // Host RAM where Qwen3.8-Flash-Next sets aside the conversation another displaces (it keeps one
     // on the GPUs and nothing on disk); 0 = off. Passed only when `park_gb` is set: otherwise the
@@ -578,6 +581,7 @@ mod tests {
             assert!(joined.contains(flag), "{flag} missing from {joined}");
         }
         assert!(!joined.contains("--prompt-cache"));
+        assert!(!joined.contains("--usage"), "nothing kept between runs where the prompt states are not");
         let none = Json::parse(br#"{"models": []}"#).unwrap();
         assert!(arguments(&none, root, 1, "k", true).is_err());
         let auto = Json::parse(br#"{"models": [{"name": "a", "path": "a.gguf"}]}"#).unwrap();

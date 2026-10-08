@@ -138,6 +138,7 @@ impl Model {
                 gpu: None,
                 store: Arc::new(store),
                 cache: Ecache::new(opts.expert_cache_bytes, RECORD_BYTES, CachePolicy::Lfru),
+                uses: crate::moe::Uses::new(cfg.n_layers, cfg.n_routed_experts),
             },
             max_seq: opts.max_seq,
             cfg,
@@ -155,6 +156,11 @@ impl Model {
     /// Where the routed experts' records are read from.
     pub fn expert_store(&self) -> &Arc<dyn oaiy_engine::store::WeightStore> {
         &self.experts.store
+    }
+
+    /// Every routed expert's uses of late ([`crate::moe::Uses`]).
+    pub fn expert_uses(&self) -> &crate::moe::Uses {
+        &self.experts.uses
     }
 
     /// Run `ids` at positions `start_pos..` (a prefill at 0, then one token at
@@ -216,6 +222,11 @@ impl Model {
 
         if let Some(gpu) = &self.experts.gpu {
             gpu.pass_done(t, &self.experts.cache, self.experts.store.as_ref());
+        }
+        // The experts' counts of uses age as the tokens go by, and the RAM cache's own with them: both then say what
+        // has been used of late.
+        if t == 1 && self.experts.uses.step() {
+            self.experts.cache.decay();
         }
         let last = t - 1;
         let x = hc::pre(&h[last * HC * d..(last + 1) * HC * d], &pre_mix[last]);
@@ -325,16 +336,27 @@ impl Model {
     /// has been looked at or the cache is full (reading past that would only swap one unused record for another).
     /// `elsewhere(layer, expert)`: an expert another tier holds for good (a GPU's), which RAM need not.
     pub fn warm_experts(&self, cursor: &mut usize, count: usize, elsewhere: &dyn Fn(u32, u32) -> bool) -> bool {
-        let (layers, per_layer) = (self.cfg.n_layers, self.cfg.n_routed_experts);
+        let layers = self.cfg.n_layers;
+        self.warm_by(&|i| ((i % layers) as u32, (i / layers) as u32), cursor, count, elsewhere)
+    }
+
+    /// [`Self::warm_experts`] in `order` (every expert once: [`crate::moe::Uses::order`]'s, the most used of an
+    /// earlier run first), so what RAM holds when it is full is what is most likely to be asked for.
+    pub fn warm_experts_in(&self, order: &[(u32, u32)], cursor: &mut usize, count: usize, elsewhere: &dyn Fn(u32, u32) -> bool) -> bool {
+        assert_eq!(order.len(), self.cfg.n_layers * self.cfg.n_routed_experts, "an order of every expert");
+        self.warm_by(&|i| order[i], cursor, count, elsewhere)
+    }
+
+    fn warm_by(&self, at: &dyn Fn(usize) -> (u32, u32), cursor: &mut usize, count: usize, elsewhere: &dyn Fn(u32, u32) -> bool) -> bool {
         let cache = &self.experts.cache;
-        let total = layers * per_layer;
+        let total = self.cfg.n_layers * self.cfg.n_routed_experts;
         let room = cache.n_slots().saturating_sub(cache.len());
         if room == 0 {
             return false;
         }
         let mut picks = Vec::with_capacity(count.min(room));
         while *cursor < total && picks.len() < count.min(room) {
-            let (l, e) = ((*cursor % layers) as u32, (*cursor / layers) as u32);
+            let (l, e) = at(*cursor);
             *cursor += 1;
             if !cache.probe(l, e) && !elsewhere(l, e) {
                 picks.push((l, e));

@@ -23,6 +23,14 @@
 //! needed). [`Ecache::set_scan_layer`] tells the cache where a pass is;
 //! victims then come from the layers below it first.
 //!
+//! **Aging.** The counts are accesses since a record was read, so a record a
+//! long conversation used thousands of times would outrank, for good, the ones
+//! the next conversation uses. [`Ecache::decay`] halves every count; its owner
+//! calls it as its tokens go by (dsv41 every few replies' worth), and the cache
+//! then holds what has been used of late. [`Ecache::credit`] gives a record a
+//! count it earned elsewhere (in a tier that has just handed it back), where
+//! it would arrive as a newcomer and be among the first to go.
+//!
 //! **Leases.** [`Ecache::acquire`] hands out a [`HostLease`], a shared
 //! handle to the record's immutable bytes. A hit copies nothing, and a
 //! record with a live lease is never chosen for eviction, so a caller can
@@ -233,8 +241,9 @@ pub struct Ecache {
     /// Signalled whenever a read finishes, successfully or not.
     read_done: Condvar,
     rec_bytes: usize,
-    budget_bytes: usize,
-    capacity: usize,
+    /// The budget and the records it holds: set when the cache is made, and again by [`Ecache::set_budget`].
+    budget_bytes: std::sync::atomic::AtomicUsize,
+    capacity: std::sync::atomic::AtomicUsize,
     policy: CachePolicy,
 }
 
@@ -255,10 +264,27 @@ impl Ecache {
             }),
             read_done: Condvar::new(),
             rec_bytes,
-            budget_bytes,
-            capacity,
+            budget_bytes: std::sync::atomic::AtomicUsize::new(budget_bytes),
+            capacity: std::sync::atomic::AtomicUsize::new(capacity),
             policy,
         }
+    }
+
+    /// Change the budget to `budget_bytes`: more records may then be held, or, where it is less than what is held,
+    /// records are let go (as a miss lets them go: the least used first) until what is left fits or every record
+    /// left is leased. A cache is sized from the memory free when its model loads; this is for when that changes
+    /// (another program's memory come free, or wanted). The records it holds now.
+    pub fn set_budget(&self, budget_bytes: usize) -> usize {
+        use std::sync::atomic::Ordering;
+        let capacity = if self.rec_bytes == 0 { 0 } else { budget_bytes / self.rec_bytes };
+        let mut g = self.book();
+        self.budget_bytes.store(budget_bytes, Ordering::Relaxed);
+        self.capacity.store(capacity, Ordering::Relaxed);
+        while g.entries.len() > capacity {
+            let Some(k) = g.victim(self.policy) else { break };
+            g.evict(k);
+        }
+        capacity
     }
 
     fn book(&self) -> MutexGuard<'_, Book> {
@@ -273,7 +299,7 @@ impl Ecache {
 
     /// Records the budget holds.
     pub fn n_slots(&self) -> usize {
-        self.capacity
+        self.capacity.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Bytes per record.
@@ -283,7 +309,7 @@ impl Ecache {
 
     /// The budget the cache was sized from.
     pub fn budget_bytes(&self) -> usize {
-        self.budget_bytes
+        self.budget_bytes.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn policy(&self) -> CachePolicy {
@@ -292,7 +318,7 @@ impl Ecache {
 
     /// False when the budget buys no records and every access reads.
     pub fn is_enabled(&self) -> bool {
-        self.capacity > 0
+        self.n_slots() > 0
     }
 
     /// Records resident right now.
@@ -385,7 +411,7 @@ impl Ecache {
         }
 
         g.count_miss(self.rec_bytes);
-        if !self.is_enabled() || !g.make_room(self.capacity, self.policy) {
+        if !self.is_enabled() || !g.make_room(self.n_slots(), self.policy) {
             drop(g);
             return self.read_around(layer, expert, store);
         }
@@ -422,6 +448,25 @@ impl Ecache {
         Ok(HostLease(Arc::new(buf)))
     }
 
+    /// Halve every record's count of accesses (see the module's "Aging").
+    pub fn decay(&self) {
+        for e in self.book().entries.values_mut() {
+            e.uses /= 2;
+        }
+    }
+
+    /// Raise `(layer, expert)`'s count of accesses to `uses` if it is resident and has fewer: a record that comes
+    /// with a history. Whether it was resident.
+    pub fn credit(&self, layer: u32, expert: u32, uses: u64) -> bool {
+        match self.book().entries.get_mut(&(layer, expert)) {
+            Some(e) if e.loaded() => {
+                e.uses = e.uses.max(uses);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Insert a record the caller read itself (a batched read, say),
     /// taking ownership of the buffer. Counted as a miss, since it cost a
     /// read. If the record is already resident, or arrives meanwhile
@@ -454,7 +499,7 @@ impl Ecache {
                 None => break,
             }
         }
-        if g.make_room(self.capacity, self.policy) {
+        if g.make_room(self.n_slots(), self.policy) {
             g.entries.insert(key, Entry { bytes: None, uses: 1, last: now, slot: usize::MAX });
             g.publish(key, Arc::new(record));
         }
@@ -553,6 +598,54 @@ mod tests {
             dst.copy_from_slice(&self.record(l, e));
             Ok(())
         }
+    }
+
+    /// A budget set anew: a cache of two holds a third record once its budget is three records', and lets go of its
+    /// least used when the budget is one record's again.
+    #[test]
+    fn a_budget_set_anew_makes_room_or_lets_records_go() {
+        let s = Store::new(32);
+        let c = Ecache::new(64, 32, CachePolicy::Lfru);
+        for e in 0..2 {
+            c.acquire(0, e, &s).unwrap();
+        }
+        c.acquire(0, 1, &s).unwrap();
+        assert_eq!((c.n_slots(), c.len()), (2, 2));
+        assert_eq!(c.set_budget(96), 3);
+        c.acquire(0, 2, &s).unwrap();
+        c.acquire(0, 2, &s).unwrap();
+        assert_eq!((c.n_slots(), c.len(), c.budget_bytes()), (3, 3, 96));
+        assert_eq!(c.set_budget(40), 1);
+        assert_eq!(c.len(), 1);
+        assert!(c.probe(0, 1) || c.probe(0, 2), "one of the two used twice is what is left");
+        assert!(!c.probe(0, 0), "the one used once went first");
+    }
+
+    /// A record's count decides whether it stays: of two records in a cache of two, the one used ten times is
+    /// kept when a third arrives, until the counts are aged away and the other is used; and a record credited
+    /// with a count it earned elsewhere is kept as if it had been used that often here.
+    #[test]
+    fn aged_counts_let_go_of_an_old_favourite_and_a_credited_record_stays() {
+        let s = Store::new(32);
+        let c = Ecache::new(64, 32, CachePolicy::Lfru);
+        for _ in 0..10 {
+            c.acquire(0, 0, &s).unwrap();
+        }
+        c.acquire(0, 1, &s).unwrap();
+        c.acquire(0, 2, &s).unwrap();
+        assert!(c.probe(0, 0) && !c.probe(0, 1) && c.probe(0, 2), "the favourite stays, the other of the two goes");
+        // four halvings: ten uses are none, and two uses of the newcomer outrank them
+        for _ in 0..4 {
+            c.decay();
+        }
+        c.acquire(0, 2, &s).unwrap();
+        c.acquire(0, 2, &s).unwrap();
+        c.acquire(0, 3, &s).unwrap();
+        assert!(!c.probe(0, 0) && c.probe(0, 2) && c.probe(0, 3), "the old favourite goes once its count has aged away");
+        // 3 arrived last with one use; credited with nine it outranks 2's two
+        assert!(c.credit(0, 3, 9) && !c.credit(0, 0, 9));
+        c.acquire(0, 4, &s).unwrap();
+        assert!(c.probe(0, 3) && !c.probe(0, 2) && c.probe(0, 4));
     }
 
     #[test]
