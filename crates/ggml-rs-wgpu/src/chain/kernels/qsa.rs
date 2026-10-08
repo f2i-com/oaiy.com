@@ -233,10 +233,12 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 }
 "#;
 
-/// [`QSA_SELECT`] for few blocks (`p[0].y` at most [`QSA_RANKED`]): each block placed by how many come before it (a
-/// larger score, or as large at a lower block) and kept where fewer than `keep` do, where the sort took a round and a
-/// barrier for every stride of every size (36 for 256 blocks, 23 us a query's selection at 4,096 positions). The same
-/// blocks, written the same way. `p` as [`QSA_SELECT`]'s.
+/// [`QSA_SELECT`] for a step's query or a check's few, of few blocks (`p[0].y` at most [`QSA_RANKED`]): each block
+/// placed by how many come before it (a larger score, or as large at a lower block) and kept where fewer than `keep`
+/// do, where the sort took a round and a barrier for every stride of every size (36 for 256 blocks, 23 us a query's
+/// selection at 4,096 positions). The same blocks, written the same way. It is the shorter wait and the more work
+/// (every block against every other: 65,536 comparisons for 256 blocks, where the sort makes 4,600 exchanges), so a
+/// prompt's hundreds of queries are sorted. `p` as [`QSA_SELECT`]'s.
 pub(in crate::chain) const QSA_SELECT_RANKED: &str = r#"
 @group(0) @binding(0) var<storage, read> scores: array<f32>;
 @group(0) @binding(6) var<storage, read_write> list: array<u32>;

@@ -77,17 +77,23 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     for (var i = li; i < n4; i += 256u) { let v = x4[at + i]; s += v * v; }
     part[li] = s.x + s.y + s.z + s.w;
     workgroupBarrier();
-    // the threads' sums in sixteens, then the sixteens by every thread alike: two barriers, where a tree of halvings
-    // took eight (a Flash-Next reply has 16,000 of these norms, 4 us each with the tree)
+    // the threads' sums in sixteens, then the sixteens by one thread: three barriers, where a tree of halvings took
+    // eight (a Flash-Next reply has 16,000 of these norms, 4 us each with the tree). Every thread adding the
+    // sixteens for itself was 4,096 reads a row: a prompt's rows by the thousand were the slower for it (the 27B's
+    // 15.6K tokens 7.0 to 7.6 s where 6.3 to 6.5).
     if (li < 16u) {
         var t = 0.0;
         for (var j = 0u; j < 16u; j++) { t += part[li * 16u + j]; }
         lead[li] = t;
     }
     workgroupBarrier();
-    var total = 0.0;
-    for (var j = 0u; j < 16u; j++) { total += lead[j]; }
-    let inv = 1.0 / sqrt(total / f32(p[0].x) + bitcast<f32>(p[0].y));
+    if (li == 0u) {
+        var total = 0.0;
+        for (var j = 0u; j < 16u; j++) { total += lead[j]; }
+        lead[0] = total;
+    }
+    workgroupBarrier();
+    let inv = 1.0 / sqrt(lead[0] / f32(p[0].x) + bitcast<f32>(p[0].y));
     for (var i = li; i < n4; i += 256u) { y4[at + i] = x4[at + i] * inv * w4[wat + i]; }
 }
 "#;
@@ -117,17 +123,23 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     }
     part[li] = s.x + s.y + s.z + s.w;
     workgroupBarrier();
-    // the threads' sums in sixteens, then the sixteens by every thread alike: two barriers, where a tree of halvings
-    // took eight (a Flash-Next reply has 16,000 of these norms, 4 us each with the tree)
+    // the threads' sums in sixteens, then the sixteens by one thread: three barriers, where a tree of halvings took
+    // eight (a Flash-Next reply has 16,000 of these norms, 4 us each with the tree). Every thread adding the
+    // sixteens for itself was 4,096 reads a row: a prompt's rows by the thousand were the slower for it (the 27B's
+    // 15.6K tokens 7.0 to 7.6 s where 6.3 to 6.5).
     if (li < 16u) {
         var t = 0.0;
         for (var j = 0u; j < 16u; j++) { t += part[li * 16u + j]; }
         lead[li] = t;
     }
     workgroupBarrier();
-    var total = 0.0;
-    for (var j = 0u; j < 16u; j++) { total += lead[j]; }
-    let inv = 1.0 / sqrt(total / f32(p[0].x) + bitcast<f32>(p[0].y));
+    if (li == 0u) {
+        var total = 0.0;
+        for (var j = 0u; j < 16u; j++) { total += lead[j]; }
+        lead[0] = total;
+    }
+    workgroupBarrier();
+    let inv = 1.0 / sqrt(lead[0] / f32(p[0].x) + bitcast<f32>(p[0].y));
     for (var i = li; i < n4; i += 256u) { out[at + i] = x4[at + i] * inv * w4[i]; }
 }
 "#;

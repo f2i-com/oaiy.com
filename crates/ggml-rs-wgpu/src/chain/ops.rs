@@ -927,8 +927,9 @@ impl ChainRecorder for Recorder<'_> {
         assert!(nb <= 4096 && keep > 0 && scores.len >= rows * nb && list.len >= rows * keep, "chain: QSA's selection of {keep} of {nb} blocks");
         let dd = self.gpu().dummy().clone();
         let drw = self.gpu().dummy_rw().clone();
-        // (few blocks: each placed by how many come before it; many: sorted)
-        let (name, body) = if nb <= QSA_RANKED { ("chain-qsa-select-ranked", QSA_SELECT_RANKED) } else { ("chain-qsa-select", QSA_SELECT) };
+        // (a step's query or a check's few, of few blocks: each block placed by how many come before it, the shorter
+        // wait; a prompt's queries, or many blocks: sorted, the less work)
+        let (name, body) = if nb <= QSA_RANKED && rows <= 8 { ("chain-qsa-select-ranked", QSA_SELECT_RANKED) } else { ("chain-qsa-select", QSA_SELECT) };
         self.dispatch_wide(name, body, [buffer(scores), &dd, &dd, &dd, &dd, &dd, buffer(list), &drw], &[rows as u32, nb as u32, first as u32, ratio as u32, keep as u32], (rows as u32, 1, 1));
     }
 

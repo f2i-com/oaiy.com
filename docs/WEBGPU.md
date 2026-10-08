@@ -402,11 +402,15 @@ hyper-connections 214, QSA's attention 70 and its selection 28, the stream norms
 the delta nets 61, and 39 of copies (a check's backups of the delta nets' states).
 
 Of those, three small ones since: a row's norm adds its threads' sums in sixteens and
-then the sixteens (two barriers where a tree took eight); QSA's selection places up to
-1,024 blocks each by how many come before it (the sort took 36 rounds for 256); and
-the shared expert's gate and up matmul makes its SwiGLU and its down matmul the
-experts' sum into the streams, each one dispatch where two. Strata's request drafting:
-256 tokens in 1.65 to 1.72 s, 149 to 155 tokens a second (Strata 179).
+then one thread the sixteens (three barriers where a tree took eight); a step's or a
+check's QSA selection places up to 1,024 blocks each by how many come before it (the
+sort took 36 rounds for 256; a prompt's queries are still sorted, which is less work
+for many); and the shared expert's gate and up matmul makes its SwiGLU and its down
+matmul the experts' sum into the streams, each one dispatch where two. Strata's request
+drafting: 256 tokens in 1.63 to 1.75 s, 146 to 157 tokens a second (Strata 179), its
+prompt 1.11 s. (What shortens a few rows' wait can cost many rows work: the first
+version of the norm had every thread add the sixteens, and the ranked selection took a
+prompt's rows too; Strata's prompt was 1.6 s for it until both were put right.)
 
 On one card, which is what Strata's figure is for, this file is far from it: its
 experts are 35.5 GB, so 15 of the 48 layers' run on the host (`quant_host` reads the

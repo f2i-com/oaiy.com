@@ -625,3 +625,33 @@ fn qsa_chained_is_the_hosts() {
     let (dn, sp) = (got.pop().unwrap(), got.pop().unwrap());
     assert_eq!(sp.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), dn.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "every block kept: the dense attention");
 }
+
+/// QSA's selection by ranks (a step's query, a check's few) keeps the blocks the sort keeps, written the same way:
+/// scores with many equals (a tie to the lower block), queries that see fewer blocks than they keep, as many, and
+/// more; 37, 256 and 1,024 blocks.
+#[test]
+fn qsas_ranked_selection_is_the_sorted_one() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    let mut next = rng(71);
+    for (nb, keep, ratio, first, rows) in [(37usize, 12usize, 4usize, 40usize, 4usize), (256, 128, 16, 4000, 4), (256, 128, 16, 4090, 1), (1024, 128, 16, 16300, 8), (64, 128, 16, 1000, 3)] {
+        // (a few distinct values, negative ones too: equals are common)
+        let scores: Vec<f32> = (0..rows * nb).map(|_| (next() * 6.0).round() / 3.0).collect();
+        let sd = b.vec(rows * nb);
+        DeviceChain::upload(&b, &sd, &scores);
+        let (ranked, sorted) = (b.vec(rows * keep), b.vec(rows * keep));
+        let dd = b.gpu.dummy().clone();
+        let drw = b.gpu.dummy_rw().clone();
+        let mut rec = Recorder::new(&b);
+        ChainRecorder::qsa_select(&mut rec, &sd, &ranked, rows, nb, first, ratio, keep);
+        rec.dispatch_wide("chain-qsa-select", QSA_SELECT, [buffer(&sd), &dd, &dd, &dd, &dd, &dd, buffer(&sorted), &drw], &[rows as u32, nb as u32, first as u32, ratio as u32, keep as u32], (rows as u32, 1, 1));
+        rec.read(&ranked);
+        rec.read(&sorted);
+        let got = Box::new(rec).finish();
+        for r in 0..rows {
+            let count = ((first + r + 1) / ratio).min(nb).min(keep);
+            let (a, s) = (&got[0][r * keep..r * keep + count], &got[1][r * keep..r * keep + count]);
+            assert_eq!(a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), s.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "{nb} blocks keeping {keep}, row {r} of {rows}");
+            assert!(count == 0 || a.windows(2).all(|w| w[0].to_bits() < w[1].to_bits()), "{nb} blocks: row {r}'s ascending");
+        }
+    }
+}
