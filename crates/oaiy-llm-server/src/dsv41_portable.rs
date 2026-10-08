@@ -182,8 +182,10 @@ impl Engine {
                 free as f64 / (1u64 << 30) as f64
             );
         }
-        // more room: the idle reading takes it up again where it had finished
+        // more room: the idle reading takes it up again where it had finished, in the order of the counts as they are
+        // now (the most used of what no tier holds first), not the order it started with
         if want > now && self.warm.is_none() {
+            self.order = Some(self.model.expert_uses().order());
             self.warm = Some(Warm { cursor: 0, started: None, reading: std::time::Duration::ZERO, bytes_before: self.model.expert_cache().stats().bytes_read });
         }
     }
@@ -216,7 +218,7 @@ impl Engine {
             w.reading += slice.elapsed();
             return;
         }
-        let elsewhere = |l: u32, e: u32| kernel.is_some_and(|k| k.pins(l, e));
+        let elsewhere = |l: u32, e: u32| kernel.is_some_and(|k| k.elsewhere(l, e));
         let more = match &self.order {
             Some(order) => self.model.warm_experts_in(order, &mut w.cursor, WARM_SLICE, &elsewhere),
             None => self.model.warm_experts(&mut w.cursor, WARM_SLICE, &elsewhere),
@@ -768,11 +770,23 @@ impl WgpuExperts {
         }
     }
 
-    /// Whether `(layer, expert)` is one of the share the other GPUs are filled with at start-up (filled yet or not):
-    /// the idle reading's question, which leaves those out of RAM. It answers from the plan, not from what the cards
-    /// hold after a [`Self::rebalance`] ([`Self::pinned_now`] says that).
-    pub(crate) fn pins(&self, layer: u32, expert: u32) -> bool {
-        self.pinned.as_ref().is_some_and(|p| p.slot(layer, expert).is_some()) || self.first.contains(&(layer, expert))
+    /// Whether a card holds `(layer, expert)` now, or a slot of the start-up plan still waits to be filled with it:
+    /// the idle reading's question, which leaves those out of RAM (an expert in one place). By what the cards hold,
+    /// not by the plan: after a [`Self::rebalance`] the plan's experts may be in RAM and others on the cards, and a
+    /// reading begun again (RAM grown: `Engine::fit_ram`) that asked the plan read the cards' experts into RAM a
+    /// second time.
+    pub(crate) fn elsewhere(&self, layer: u32, expert: u32) -> bool {
+        use std::sync::atomic::Ordering;
+        let key = (layer, expert);
+        if self.resident.as_ref().is_some_and(|r| r.lock().unwrap_or_else(|p| p.into_inner()).index.contains_key(&key)) {
+            return true;
+        }
+        if let Some(p) = &self.pinned {
+            if p.index.read().unwrap_or_else(|e| e.into_inner()).contains_key(&key) || p.slot(layer, expert).is_some_and(|g| g >= p.next.load(Ordering::Relaxed)) {
+                return true;
+            }
+        }
+        self.first[self.first_next.load(Ordering::Relaxed).min(self.first.len())..].contains(&key)
     }
 
     /// Uses of the other GPUs' share so far.
@@ -1409,6 +1423,9 @@ mod tests {
         drop(cache.acquire(0, 6, &store).unwrap());
         assert_eq!(k.rebalance(&store, &cache, &uses, 8), 2, "4 and 5 in place of two of the card's least used");
         assert_eq!(k.holds(0, &[1, 4, 5, 6], &[1; 4]), [true, true, true, false]);
+        // the idle reading leaves out of RAM what the card holds now, and no longer what it held before
+        assert!(k.elsewhere(0, 1) && k.elsewhere(0, 4) && k.elsewhere(0, 5) && !k.elsewhere(0, 6));
+        assert_eq!([0u32, 2, 3].into_iter().filter(|&e| k.elsewhere(0, e)).count(), 1, "of the three it held, the one it kept");
         assert!(!cache.probe(0, 4) && !cache.probe(0, 5) && cache.probe(0, 6), "what the card took in is not in RAM too");
         let out: Vec<u32> = [0u32, 2, 3].into_iter().filter(|&e| !k.holds(0, &[e], &[1])[0]).collect();
         assert_eq!(out.len(), 2, "two of the three used least gave way: {out:?}");
@@ -1482,9 +1499,10 @@ mod tests {
         k.set_exclusive(true);
         k.start_from(&order);
         let (store, cache) = (Made, oaiy_engine::ecache::Ecache::new(8 * RECORD_BYTES, RECORD_BYTES, oaiy_engine::CachePolicy::Lfru));
-        assert!(k.pins(1, 40) && k.pins(0, 3) && k.pins(0, 7) && k.pins(1, 0) && !k.pins(0, 0));
+        assert!(k.elsewhere(1, 40) && k.elsewhere(0, 3) && k.elsewhere(0, 7) && k.elsewhere(1, 0) && !k.elsewhere(0, 0), "a slot waits for each of the four");
         assert!(k.pin_some(&store, &cache, 3), "three read, one to go");
         assert!(!k.pin_some(&store, &cache, 3), "and then the tier is as planned");
+        assert!(k.elsewhere(1, 40) && k.elsewhere(1, 0) && !k.elsewhere(0, 0), "and holds them");
         assert_eq!(k.holds(1, &[40, 0], &[1; 2]), [true, true]);
         assert_eq!(k.holds(0, &[3, 7, 0], &[1; 3]), [true, true, false]);
         assert!(cache.is_empty(), "none of it through RAM");
