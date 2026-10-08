@@ -1003,6 +1003,19 @@ impl Gpu {
         self.names.lock().unwrap_or_else(|p| p.into_inner()).get(&(Arc::as_ptr(pipeline) as usize)).copied().unwrap_or("other")
     }
 
+    /// A generated kernel's source, made once for its name and kept (what a recorder's wide dispatch is given each
+    /// time, its pipeline made of it the first).
+    fn named_source(&self, name: &'static str, make: impl FnOnce() -> String) -> &'static str {
+        static MADE: Mutex<Vec<(&'static str, &'static str)>> = Mutex::new(Vec::new());
+        let mut made = MADE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((_, source)) = made.iter().find(|(n, _)| *n == name) {
+            return source;
+        }
+        let source: &'static str = Box::leak(make().into_boxed_str());
+        made.push((name, source));
+        source
+    }
+
     fn named_pipeline_wide(&self, name: &'static str, source: impl FnOnce() -> String) -> Arc<wgpu::ComputePipeline> {
         let layout = &self.wide_layout().1;
         self.named_pipeline_in(name, layout, source)

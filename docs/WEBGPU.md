@@ -344,6 +344,18 @@ the rest mostly its bytes (6.6 MB a hyper-connection's matrix; a 31.5 MB one rea
 1.45 TB a second). The same matrix every time stays in the card's cache and takes 5.5,
 3.9 and 4.0 us for a row: a measurement that reuses its weights flatters the kernel.
 
+Past its dense span Flash-Next's attention (QSA: some 2,100 of a query's positions) took
+a workgroup a query head, and its 24 query heads are over 2 KV heads: each key and each
+value was read twelve times over, 163 us a layer for a check's four rows. A KV head's
+query heads are now taken six at a time there, as the step's dense attention takes the
+27B's six (the same kernel over QSA's entries; a KV head's twelve in two whole shares,
+which the dense one does for Flash-Next too): 52 us a layer. A check of four rows is
+15.5 ms where 17.1, of three 14.2 where 15.2, and Strata's request drafting 125 to 133
+tokens a second (256 tokens in 1.93 to 2.05 s). The grouped kernel adds a run's values
+up in another order than the one a head had (2e-5 of the largest value at most, which
+its test holds it to), so a long greedy reply can part from the earlier one's at a
+near-tie; with every block kept QSA's is the dense attention's bits, as before.
+
 On one card, which is what Strata's figure is for, this file is far from it: its
 experts are 35.5 GB, so 15 of the 48 layers' run on the host (`quant_host` reads the
 grid types as they lie too: 0.27 to 0.42 ms an expert a row on one AVX-512 core, where

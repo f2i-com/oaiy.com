@@ -623,8 +623,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 }
 "#;
 
-/// [`ATTENTION_PART4`] for a KV head's whole group of query heads at once (`attention_part_group`'s kernel before the
-/// group's size is put in), a workgroup a (KV head, run): each key and each value read once for the group's heads,
+/// [`ATTENTION_PART4`] for a KV head's whole group of query heads at once, or a whole share of them
+/// (`attention_part_group`'s kernel before the group's size is put in), a workgroup a (group, run): each key and each
+/// value read once for the group's heads,
 /// where a workgroup a query head read them a head each (the 27B's six heads a KV head: at 15,888 positions a step's
 /// sixteen layers' parts read the cache's 2 GB six times over, 4.3 ms of its 16.8). The scores a thread a key, a sum a
 /// head; the softmaxes together, a head a vec4's component; the values a thread a column of four over a share of the
@@ -651,12 +652,14 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let lo = p[1].x;
     let runs = p[1].y;
     let scale = bitcast<f32>(p[1].z);
-    let kh = wg.x;
+    // the group of query heads (a KV head's, or a whole share of them) and its KV head
+    let grp = wg.x;
+    let kh = grp * G / (n_h / n_kv);
     let run = wg.y;
     let hd4 = hd / 4u;
     let kvd4 = n_kv * hd4;
     let row4 = 2u * kvd4;
-    for (var i = li; i < G * hd4; i += 256u) { buf[i] = q4[kh * G * hd4 + i]; }
+    for (var i = li; i < G * hd4; i += 256u) { buf[i] = q4[grp * G * hd4 + i]; }
     workgroupBarrier();
     let start = lo + run * 256u;
     let end = min(start + 256u, hi);
@@ -762,11 +765,11 @@ pub(in crate::chain) fn attention_part_group(g: usize) -> String {
         .replace("SHARE_ADDS\n", &each(&|i| format!("            v{i} += buf[at + {i}u];\n")))
         .replace(
             "STORES\n",
-            &each(&|i| format!("        {{\n            let at = n_h * hd + ((kh * G + {i}u) * runs + run) * hd + d4 * 4u;\n            y[at] = v{i}.x;\n            y[at + 1u] = v{i}.y;\n            y[at + 2u] = v{i}.z;\n            y[at + 3u] = v{i}.w;\n        }}\n")),
+            &each(&|i| format!("        {{\n            let at = n_h * hd + ((grp * G + {i}u) * runs + run) * hd + d4 * 4u;\n            y[at] = v{i}.x;\n            y[at + 1u] = v{i}.y;\n            y[at + 2u] = v{i}.z;\n            y[at + 3u] = v{i}.w;\n        }}\n")),
         )
         .replace(
             "LARGEST_AND_SUMS\n",
-            &each(&|i| format!("        {{\n            let ml = n_h * hd + n_h * runs * hd + ((kh * G + {i}u) * runs + run) * 2u;\n            y[ml] = m{}.{};\n            y[ml + 1u] = l{}.{};\n        }}\n", i / 4, c(i), i / 4, c(i))),
+            &each(&|i| format!("        {{\n            let ml = n_h * hd + n_h * runs * hd + ((grp * G + {i}u) * runs + run) * 2u;\n            y[ml] = m{}.{};\n            y[ml + 1u] = l{}.{};\n        }}\n", i / 4, c(i), i / 4, c(i))),
         )
 }
 
@@ -799,6 +802,51 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     q[j] = pack2x16float(x2[j]);
 }
 "#;
+
+/// [`attention_part_group`] for QSA's entries ([`QSA_ATTENTION_PART`]'s: a query's kept blocks' positions from `list`,
+/// then its tail block's), the grid's third axis the queries, the parts laid out as [`ATTENTION_ROWS_PART`]'s for
+/// [`ATTENTION_ROWS_JOIN`]: the same sums as the step's kernel over the same entries, so a query that keeps every
+/// block gets the dense attention's bits. `p` as [`QSA_ATTENTION_PART`]'s. (Flash-Next past its dense span: 24 query
+/// heads over 2 KV heads of 256, some 2,100 entries a query; a workgroup a head read each key and value twelve times
+/// over, 74 us a layer for a step's row and 163 for a check's four.)
+pub(in crate::chain) fn qsa_attention_part_group(g: usize) -> String {
+    let swap = |s: String, old: &str, new: &str, times: usize| {
+        assert_eq!(s.matches(old).count(), times, "QSA's grouped parts: {old}");
+        s.replace(old, new)
+    };
+    let s = attention_part_group(g);
+    let s = swap(
+        s,
+        "@group(0) @binding(2) var<storage, read_write> y: array<f32>;\n@group(0) @binding(3) var<uniform> p: array<vec4<u32>, 2>;\n",
+        "@group(0) @binding(2) var<storage, read> list: array<u32>;\n@group(0) @binding(6) var<storage, read_write> y: array<f32>;\n@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;\n// each of the run's entries' position\nvar<workgroup> place: array<u32, 256>;\n",
+        1,
+    );
+    let s = swap(s, "fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {", "fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(local_invocation_index) li: u32) {", 1);
+    let s = swap(
+        s,
+        "    let hi = p[0].w;\n    let lo = p[1].x;\n",
+        "    let ratio = p[1].x;\n    let keep = p[1].w;\n    let rows = nwg.z;\n    let r = wg.z;\n    let pos = p[0].w + r;\n    let visible = (pos + 1u) / ratio;\n    let count = min(visible, keep);\n    let entries = count * ratio + (pos + 1u - visible * ratio);\n",
+        1,
+    );
+    let s = swap(s, "buf[i] = q4[grp * G * hd4 + i];", "buf[i] = q4[(r * n_h + grp * G) * hd4 + i];", 1);
+    let s = swap(
+        s,
+        "    let start = lo + run * 256u;\n    let end = min(start + 256u, hi);\n    let t = start + li;\n    let live = t < end;\n",
+        "    let start = run * 256u;\n    let end = min(start + 256u, entries);\n    let e = start + li;\n    let live = e < end;\n    // the entry's position: a kept block's, or the tail's\n    var t = 0u;\n    if (e < count * ratio) {\n        t = list[r * keep + e / ratio] * ratio + e % ratio;\n    } else {\n        t = visible * ratio + (e - count * ratio);\n    }\n    place[li] = t;\n",
+        1,
+    );
+    let s = swap(s, "    let vb = start * row4 + kvd4 + kh * hd4 + d4;\n", "    let vb = kvd4 + kh * hd4 + d4;\n", 1);
+    let s = swap(s, "let v = kv4[vb + i * row4];", "let v = kv4[vb + place[i] * row4];", 1);
+    let s = swap(s, "let ml = n_h * hd + n_h * runs * hd + ((grp * G + ", "let ml = rows * n_h * hd + rows * n_h * runs * hd + ((r * n_h + grp * G + ", g);
+    swap(s, "let at = n_h * hd + ((grp * G + ", "let at = rows * n_h * hd + ((r * n_h + grp * G + ", g)
+}
+
+/// The query heads [`ATTENTION_PART_GROUP`] takes at once of `per_kv` a KV head, `head_dim` wide: all of them, else
+/// the largest whole share of them it has room for (Flash-Next's 12 of 256 in two sixes); None where none
+/// ([`attention_group_for`]). `spare`: workgroup memory the kernel's variant takes besides (QSA's entries' positions).
+pub(in crate::chain) fn attention_group_of(per_kv: usize, head_dim: usize, workgroup_bytes: u32, spare: u32) -> Option<usize> {
+    (2..=per_kv.min(8)).rev().find(|g| per_kv % g == 0 && attention_group_for(*g, head_dim, workgroup_bytes.saturating_sub(spare)))
+}
 
 /// Whether a step's attention parts take a KV head's group of `g` query heads of `head_dim` at once
 /// ([`ATTENTION_PART_GROUP`]): 2 to 8 of them, the head 64, 128 or 256 wide, the shares' sums within the kernel's

@@ -64,12 +64,12 @@ impl Recorder<'_> {
             "chain: attention's buffers"
         );
         let params = self.uniform(&[n_h as u32, n_kv as u32, head_dim as u32, kv_len as u32, lo as u32, runs as u32, scale.to_bits()]);
-        let g = if n_kv > 0 && n_h % n_kv == 0 { n_h / n_kv } else { 0 };
-        if group && attention_group_for(g, head_dim, self.gpu().limits.max_compute_workgroup_storage_size) {
-            // a KV head's query heads together: its keys and values read once
+        let per_kv = if n_kv > 0 && n_h % n_kv == 0 { n_h / n_kv } else { 0 };
+        if let Some(g) = attention_group_of(per_kv, head_dim, self.gpu().limits.max_compute_workgroup_storage_size, 0).filter(|_| group) {
+            // a KV head's query heads together (or in whole shares): its keys and values read once a group
             const NAMES: [&str; 9] = ["", "", "chain-attention-group-2", "chain-attention-group-3", "chain-attention-group-4", "chain-attention-group-5", "chain-attention-group-6", "chain-attention-group-7", "chain-attention-group-8"];
             let part = self.gpu().named_pipeline(NAMES[g], || attention_part_group(g));
-            self.dispatch(&part, buffer(kv), buffer(q), buffer(out), &params, (n_kv as u32, runs as u32, 1));
+            self.dispatch(&part, buffer(kv), buffer(q), buffer(out), &params, ((n_h / g) as u32, runs as u32, 1));
         } else {
             // a head a multiple of 4 wide (at most 512): the vec4 kernel
             let part = if head_dim % 4 == 0 && head_dim <= 512 { self.gpu().named_pipeline("chain-attention-part4", || ATTENTION_PART4.to_string()) } else { self.named("chain-attention-part", ATTENTION_PART) };
@@ -191,10 +191,19 @@ impl Recorder<'_> {
         (q16, kv16)
     }
 
-    /// [`ChainRecorder::qsa_attention`] in f32 ([`QSA_ATTENTION_PART`]): a query's entries in runs of 256, a workgroup
-    /// a (head, run, query), the runs joined.
+    /// [`ChainRecorder::qsa_attention`] in f32: a query's entries in runs of 256, a workgroup a (group of a KV head's
+    /// query heads, run, query) where they can be taken together ([`qsa_attention_part_group`]; OAIY_QSA_BY_HEAD: not),
+    /// else a (head, run, query) ([`QSA_ATTENTION_PART`]), the runs joined.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn qsa_attention_f32(&mut self, q: &DeviceVec, kv: &DeviceVec, list: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, first: usize, ratio: usize, keep: usize, scale: f32) {
+        static BY_HEAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let group = !*BY_HEAD.get_or_init(|| std::env::var_os("OAIY_QSA_BY_HEAD").is_some());
+        self.qsa_attention_f32_by(q, kv, list, out, rows, n_h, n_kv, head_dim, first, ratio, keep, scale, group)
+    }
+
+    /// [`Self::qsa_attention_f32`], its parts a group of query heads at once with `group` where they can be.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn qsa_attention_f32_by(&mut self, q: &DeviceVec, kv: &DeviceVec, list: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, first: usize, ratio: usize, keep: usize, scale: f32, group: bool) {
         let runs = (keep * ratio + ratio).div_ceil(256);
         assert!(
             head_dim % 4 == 0 && head_dim <= 512 && q.len >= rows * n_h * head_dim && kv.len >= (first + rows) * 2 * n_kv * head_dim && list.len >= rows * keep && out.len >= self.backend.qsa_attention_out_len(rows, n_h, head_dim, keep, ratio),
@@ -203,7 +212,16 @@ impl Recorder<'_> {
         let dd = self.gpu().dummy().clone();
         let drw = self.gpu().dummy_rw().clone();
         let words = [n_h as u32, n_kv as u32, head_dim as u32, first as u32, ratio as u32, runs as u32, scale.to_bits(), keep as u32];
-        self.dispatch_wide("chain-qsa-attention-part", QSA_ATTENTION_PART, [buffer(kv), buffer(q), buffer(list), &dd, &dd, &dd, buffer(out), &drw], &words, (n_h as u32, runs as u32, rows as u32));
+        let per_kv = if n_kv > 0 && n_h % n_kv == 0 { n_h / n_kv } else { 0 };
+        // (the entries' positions: 1 KB of the workgroup's memory besides the step's kernel's)
+        match attention_group_of(per_kv, head_dim, self.gpu().limits.max_compute_workgroup_storage_size, 1024).filter(|_| group) {
+            Some(g) => {
+                const NAMES: [&str; 9] = ["", "", "chain-qsa-attention-group-2", "chain-qsa-attention-group-3", "chain-qsa-attention-group-4", "chain-qsa-attention-group-5", "chain-qsa-attention-group-6", "chain-qsa-attention-group-7", "chain-qsa-attention-group-8"];
+                let source = self.gpu().named_source(NAMES[g], || qsa_attention_part_group(g));
+                self.dispatch_wide(NAMES[g], source, [buffer(kv), buffer(q), buffer(list), &dd, &dd, &dd, buffer(out), &drw], &words, ((n_h / g) as u32, runs as u32, rows as u32));
+            }
+            None => self.dispatch_wide("chain-qsa-attention-part", QSA_ATTENTION_PART, [buffer(kv), buffer(q), buffer(list), &dd, &dd, &dd, buffer(out), &drw], &words, (n_h as u32, runs as u32, rows as u32)),
+        }
         // the runs joined as a prompt's are (an empty run's sum 0 adds nothing)
         let params = self.uniform(&[n_h as u32, n_kv as u32, head_dim as u32, first as u32, 0, runs as u32, scale.to_bits(), rows as u32]);
         let join = self.named("chain-attention-rows-join", ATTENTION_ROWS_JOIN);

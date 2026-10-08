@@ -120,11 +120,12 @@ fn qsa_attention_on_the_tensor_cores_is_the_f32_kernels() {
 }
 
 /// A step's attention with a KV head's query heads together gives what a workgroup a head gives: groups of 2, 3, 4
-/// and 6, heads 64, 128 and 256 wide, a window's start, a run short of its 256, a single position.
+/// and 6, heads 64, 128 and 256 wide, a window's start, a run short of its 256, a single position; and a KV head's
+/// twelve in two sixes (Flash-Next's).
 #[test]
 fn a_steps_attention_by_groups_is_the_heads() {
     let Ok(b) = WgpuBackend::new(Some(2 << 30)) else { return };
-    for (n_h, n_kv, hd, lo, kv_len) in [(24usize, 4usize, 256usize, 0usize, 3000usize), (8, 4, 64, 0, 700), (24, 8, 128, 100, 1111), (4, 1, 256, 0, 513), (16, 4, 128, 40, 41), (12, 2, 256, 0, 1)] {
+    for (n_h, n_kv, hd, lo, kv_len) in [(24usize, 4usize, 256usize, 0usize, 3000usize), (8, 4, 64, 0, 700), (24, 8, 128, 100, 1111), (4, 1, 256, 0, 513), (16, 4, 128, 40, 41), (12, 2, 256, 0, 1), (24, 2, 256, 0, 2052), (24, 2, 256, 0, 300)] {
         let (qd, row, cap) = (n_h * hd, 2 * n_kv * hd, kv_len + 3);
         let mut next = rng((qd + kv_len) as u32);
         let q: Vec<f32> = (0..qd).map(|_| next() * 2.0).collect();
@@ -135,7 +136,7 @@ fn a_steps_attention_by_groups_is_the_heads() {
         let scale = 1.0 / (hd as f32).sqrt();
         let len = b.attention_out_len(n_h, hd, cap);
         let (want, got) = (b.vec(len), b.vec(len));
-        assert!(attention_group_for(n_h / n_kv, hd, b.gpu.limits.max_compute_workgroup_storage_size), "{n_h} heads of {hd} over {n_kv}: by groups");
+        assert!(attention_group_of(n_h / n_kv, hd, b.gpu.limits.max_compute_workgroup_storage_size, 0).is_some(), "{n_h} heads of {hd} over {n_kv}: by groups");
         let mut rec = Recorder::new(&b);
         rec.attention_by(&qv, &kv, &want, n_h, n_kv, hd, lo, kv_len, cap, scale, false);
         rec.attention_by(&qv, &kv, &got, n_h, n_kv, hd, lo, kv_len, cap, scale, true);
@@ -147,6 +148,72 @@ fn a_steps_attention_by_groups_is_the_heads() {
         let worst = got.iter().zip(want).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
         assert!(top > 0.0 && worst <= 2e-5 * top, "{n_h} heads ({n_kv} kv) {hd} wide over {lo}..{kv_len}: worst {worst} of {top}");
     }
+}
+
+/// QSA's attention with a KV head's query heads together gives what a workgroup a head gives, for a step's row and a
+/// check's few: Flash-Next's 24 heads over 2 of 256 in sixes past its dense span (blocks of 16, 128 kept), and smaller
+/// shapes whose queries keep every block they see, a spread of them, and have a tail block or none. And with every
+/// block kept a query's is the dense step's attention by groups, bit for bit.
+#[test]
+fn qsas_attention_by_groups_is_the_heads() {
+    let Ok(b) = WgpuBackend::new(Some(2 << 30)) else { return };
+    for (n_h, n_kv, hd, first, rows, keep, ratio) in [(8usize, 2usize, 64usize, 300usize, 3usize, 24usize, 4usize), (24, 4, 128, 1000, 5, 64, 8), (24, 2, 256, 700, 2, 128, 16), (24, 2, 256, 4095, 1, 128, 16), (24, 2, 256, 4090, 4, 128, 16), (24, 2, 256, 4100, 8, 128, 16)] {
+        let (qd, row, kv_len) = (n_h * hd, 2 * n_kv * hd, first + rows);
+        let mut next = rng((qd + first + keep) as u32);
+        let q: Vec<f32> = (0..rows * qd).map(|_| next() * 2.0).collect();
+        let cache: Vec<f32> = (0..kv_len * row).map(|_| next() * 2.0).collect();
+        // a query's kept blocks: every visible one where it keeps as many, else a spread of them (ascending)
+        let mut list = vec![0f32; rows * keep];
+        for r in 0..rows {
+            let visible = (first + r + 1) / ratio;
+            let count = visible.min(keep);
+            for i in 0..count {
+                let blk = if visible <= keep { i } else if r % 2 == 0 { i * visible / count } else { visible - 1 - (count - 1 - i) * visible / count };
+                list[r * keep + i] = f32::from_bits(blk as u32);
+            }
+        }
+        let (qv, kv, lv) = (b.vec(rows * qd), b.vec(kv_len * row), b.vec(rows * keep));
+        DeviceChain::upload(&b, &qv, &q);
+        DeviceChain::upload(&b, &kv, &cache);
+        DeviceChain::upload(&b, &lv, &list);
+        let scale = 1.0 / (hd as f32).sqrt();
+        assert!(attention_group_of(n_h / n_kv, hd, b.gpu.limits.max_compute_workgroup_storage_size, 1024).is_some(), "{n_h} heads of {hd} over {n_kv}: by groups");
+        let len = b.qsa_attention_out_len(rows, n_h, hd, keep, ratio);
+        let (want, got) = (b.vec(len), b.vec(len));
+        let at = std::time::Instant::now();
+        let mut rec = Recorder::new(&b);
+        rec.qsa_attention_f32_by(&qv, &kv, &lv, &want, rows, n_h, n_kv, hd, first, ratio, keep, scale, false);
+        rec.qsa_attention_f32_by(&qv, &kv, &lv, &got, rows, n_h, n_kv, hd, first, ratio, keep, scale, true);
+        rec.read_range(&want, 0, rows * qd);
+        rec.read_range(&got, 0, rows * qd);
+        let r = Box::new(rec).finish();
+        // (the small shapes come first: a kernel that is slow there stops the test before the model's)
+        let took = at.elapsed().as_secs_f64();
+        assert!(took < 5.0, "QSA's attention by groups took {took:.1} s: stop and look");
+        let (want, got) = (&r[0], &r[1]);
+        let top = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let worst = got.iter().zip(want).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
+        eprintln!("{n_h} heads ({n_kv} kv) {hd} wide, {rows} rows after {first}, keeping {keep} of {ratio}: worst {worst:.2e} of {top:.2}, {:.0} ms with the pipelines", took * 1e3);
+        assert!(top > 0.0 && worst <= 2e-5 * top, "{n_h} heads ({n_kv} kv) {hd} wide, {rows} rows after {first}: worst {worst} of {top}");
+    }
+    // every block kept (37 positions, blocks of 4, 40 kept): the dense step's attention by groups, bit for bit
+    let (n_h, n_kv, hd, at, ratio, keep) = (24usize, 2usize, 256usize, 37usize, 4usize, 40usize);
+    let (qd, row, total) = (n_h * hd, 2 * n_kv * hd, at + 1);
+    let mut next = rng(77);
+    let (qv, kv, lv) = (b.vec(qd), b.vec(total * row), b.vec(keep));
+    DeviceChain::upload(&b, &qv, &(0..qd).map(|_| next() * 2.0).collect::<Vec<_>>());
+    DeviceChain::upload(&b, &kv, &(0..total * row).map(|_| next() * 2.0).collect::<Vec<_>>());
+    DeviceChain::upload(&b, &lv, &(0..keep).map(|i| f32::from_bits(i as u32)).collect::<Vec<_>>());
+    let scale = 1.0 / (hd as f32).sqrt();
+    let (dense, sparse) = (b.vec(b.attention_out_len(n_h, hd, total)), b.vec(b.qsa_attention_out_len(1, n_h, hd, keep, ratio)));
+    let mut rec = Recorder::new(&b);
+    rec.attention_by(&qv, &kv, &dense, n_h, n_kv, hd, 0, total, total, scale, true);
+    rec.qsa_attention_f32_by(&qv, &kv, &lv, &sparse, 1, n_h, n_kv, hd, at, ratio, keep, scale, true);
+    rec.read_range(&dense, 0, qd);
+    rec.read_range(&sparse, 0, qd);
+    let r = Box::new(rec).finish();
+    assert!(r[0].iter().any(|v| *v != 0.0), "values to compare");
+    assert_eq!(r[1].iter().map(|v| v.to_bits()).collect::<Vec<_>>(), r[0].iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "every block kept: the dense attention by groups");
 }
 
 /// A step's attention over its cache's f16 halves gives what the f32 cache gives, to f16's rounding: the halves
