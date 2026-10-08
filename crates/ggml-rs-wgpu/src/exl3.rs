@@ -249,66 +249,97 @@ impl Exl3Cpu {
 /// each warp, the warps in order. `x_at` is the WGSL of the input's index for row `r` of tile `kt`, `words_at` of a
 /// tile's first word, `out` of the column's sum's place (`total` the sum, `c` the column).
 fn one_lanes(x_at: &str, words_at: &str, out: &str) -> String {
-    one_lanes_of(x_at, words_at, out, false)
+    one_lanes_with(x_at, words_at, out, None)
 }
 
-/// [`one_lanes`], and with `near` its tile loop for tiles of at most 4 bits a weight ([`NEAR_TILE_WORDS`]): a lane's
-/// eight codes then lie within 60 bits of its first word's start, so it loads three words where four, makes the two
-/// 32-bit views that straddle them once a tile, and each code is one of the four views (by the 16 bits its window
-/// starts in) shifted, where the general loop picks two words of four for every code and joins them by its shift:
-/// some six operations a weight where twelve. The same codes, so the same sums.
-fn one_lanes_of(x_at: &str, words_at: &str, out: &str, near: bool) -> String {
-    let source = one_lanes_general(x_at, words_at, out);
-    if !near {
-        return source;
+/// The rates a tile may be written at, in 16-bit words a tile: 1 to 4 bits a weight by halves, and 5 to 8.
+pub(crate) const RATES: [usize; 11] = [16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128];
+
+/// What differs between [`one_lanes`]' forms ([`one_lanes_with`]): how a thread writes its table entry, what a lane
+/// reads of the table, its loads of a tile's words, and its eight codes.
+struct Lanes {
+    place: String,
+    held: String,
+    loads: String,
+    codes: Vec<String>,
+}
+
+fn lanes_general() -> Lanes {
+    Lanes {
+        place: "    places[t] = place(t, tw, first);\n".into(),
+        held: "    var at: array<u32, 8>;\n".to_string() + &(0..8).map(|jj| format!("    at[{jj}] = places[8u * l + {jj}u];\n")).collect::<String>(),
+        loads: (0..4).map(|i| format!("        let q{i} = words[tile + {}];\n", ["w0", "o1", "o2", "o3"][i])).collect(),
+        codes: (0..8).map(|jj| format!("code_in(q0, q1, q2, q3, at[{jj}])")).collect(),
     }
-    let swap = |s: String, old: &str, new: &str| {
-        assert_eq!(s.matches(old).count(), 1, "the one-row kernel's source has changed under its near variant: {old}");
-        s.replace(old, new)
-    };
-    let source = swap(source, "    places[t] = place(t, tw, first);\n", "    places[t] = place_near(t, tw, first);\n");
-    let source = swap(
-        source,
-        "        let q0 = words[tile + w0];\n        let q1 = words[tile + o1];\n        let q2 = words[tile + o2];\n        let q3 = words[tile + o3];\n",
-        "        let q0 = words[tile + w0];\n        let q1 = words[tile + o1];\n        let q2 = words[tile + o2];\n        let h1 = (q0 << 16u) | (q1 >> 16u);\n        let h3 = (q1 << 16u) | (q2 >> 16u);\n",
-    );
-    assert_eq!(source.matches("code_in(q0, q1, q2, q3, at[").count(), 8, "the one-row kernel's codes have changed under its near variant");
-    let source = source.replace("code_in(q0, q1, q2, q3, at[", "code_near(q0, h1, q1, h3, at[");
-    source
-        + r#"
-// Code `i`'s view and its shift, packed, for a lane whose first word is `w0`: the 32-bit view its window lies in (0:
-// the first word, 1: its low half and the next's high half, 2: the next word, 3: that one's low half and the third's
-// high half), and how far the code is above the view's low end.
-fn place_near(i: u32, tw: u32, w0: u32) -> u32 {
-    let nw = tw / 2u;
-    let wd = window(i, tw);
-    let o = 32u * ((wd.x + nw - w0) % nw) + (48u - wd.y);
-    return (o >> 4u) | ((16u - (o & 15u)) << 8u);
 }
 
-// A code from a lane's four views at its packed place (its low 16 bits: `decode_at` takes no more).
-fn code_near(h0: u32, h1: u32, h2: u32, h3: u32, at: u32) -> u32 {
-    let odd = (at & 1u) == 1u;
-    return select(select(h0, h1, odd), select(h2, h3, odd), (at & 2u) == 2u) >> (at >> 8u);
-}
-"#
+/// Where a lane's code `j` starts after its first, in bits, at `tw` words a tile (as `window` places them).
+fn code_offset(tw: usize, j: usize) -> usize {
+    j * (tw / 16) + if tw % 16 == 8 { j.div_ceil(2) } else { 0 }
 }
 
-/// The most words a tile may have for the near kernel ([`one_lanes_of`]): 4 bits a weight.
-pub(crate) const NEAR_TILE_WORDS: usize = 64;
+/// The furthest into its word any lane's first code starts, in bits, at `tw` words a tile.
+fn furthest_start(tw: usize) -> usize {
+    let total = tw * 16;
+    (0..32).map(|l| ((8 * l + 1) * (tw / 16) + if tw % 16 == 8 { (8 * l + 1) / 2 } else { 0 } + total - 16) % total % 32).max().unwrap()
+}
 
-fn one_lanes_general(x_at: &str, words_at: &str, out: &str) -> String {
-    let codes: String = (0..8)
-        .map(|jj| {
-            let acc = if jj < 4 { "lo" } else { "hi" };
-            format!("            {acc} = {acc} + xv[{}] * decode_at(code_in(q0, q1, q2, q3, at[{jj}]));\n", jj % 4)
+/// A lane's loop for tiles of `tw` words alone, each code's place written into the kernel. A lane's code `j` starts
+/// `j b` bits after its first (and `(j + 1) / 2` more at a half rate), whatever the lane; only where the first code
+/// starts in its word differs between lanes. So a lane shifts its words to its first code once a tile (`a0`, `a1`,
+/// `a2`: the stream's bits 0, 32 and 64 on; `m0`, `m1`: bits 16 and 48 on), and a code is one of those shifted by a
+/// constant, where the general loop picks each code's view of three by two selects and shifts it by a number it read.
+/// It loads only the words some lane's codes reach (two at 3 and 4 bits a weight, where the general loop loads four).
+/// The same codes, so the same sums.
+fn lanes_fixed(tw: usize) -> Lanes {
+    // code j's view (0: a0, 1: m0, 2: a1, 3: m1, 4: a2, 32 bits of the lane's stream from 16 times its number) and
+    // how far the code is above the view's low end
+    let at: Vec<(usize, usize)> = (0..8)
+        .map(|j| {
+            let f = code_offset(tw, j);
+            let view = if f <= 16 { 0 } else { (f - 1) / 16 };
+            (view, 16 * view + 16 - f)
         })
         .collect();
-    let places: String = (0..8).map(|jj| format!("    at[{jj}] = places[8u * l + {jj}u];\n")).collect();
+    let last = at.iter().map(|&(view, _)| view).max().unwrap();
+    assert!(last <= 4, "a lane's codes lie within 96 bits of its first");
+    // the words some lane reaches, and the aligned words the views are made of
+    let words = (furthest_start(tw) + code_offset(tw, 7) + 16).div_ceil(32);
+    let aligned = last.div_ceil(2) + 1;
+    assert!((aligned..=4).contains(&words), "a lane's views lie in the words it loads");
+    let mut loads: String = (0..words).map(|i| format!("        let q{i} = words[tile + {}];\n", ["w0", "o1", "o2", "o3"][i])).collect();
+    for i in 0..aligned {
+        // (a shift of 32 is no shift at all, so the next word's part goes down by one and then by `31 - s`)
+        loads += &if i + 1 < words { format!("        let a{i} = (q{i} << s) | ((q{} >> 1u) >> r);\n", i + 1) } else { format!("        let a{i} = q{i} << s;\n") };
+    }
+    for i in 0..2 {
+        if at.iter().any(|&(view, _)| view == 2 * i + 1) {
+            loads += &format!("        let m{i} = (a{i} << 16u) | (a{} >> 16u);\n", i + 1);
+        }
+    }
+    Lanes {
+        place: "    places[t] = 48u - window(t, tw).y;\n".into(),
+        held: "    let s = places[8u * l];\n    let r = 31u - s;\n".into(),
+        loads,
+        codes: at.iter().map(|&(view, shift)| format!("{} >> {shift}u", ["a0", "m0", "a1", "m1", "a2"][view])).collect(),
+    }
+}
+
+fn one_lanes_with(x_at: &str, words_at: &str, out: &str, fixed: Option<usize>) -> String {
+    let Lanes { place, held, loads, codes } = fixed.map_or_else(lanes_general, lanes_fixed);
+    let codes: String = codes
+        .iter()
+        .enumerate()
+        .map(|(jj, code)| {
+            let acc = if jj < 4 { "lo" } else { "hi" };
+            format!("            {acc} = {acc} + xv[{}] * decode_at({code});\n", jj % 4)
+        })
+        .collect();
     format!(
         r#"
 var<workgroup> red: array<vec2<f32>, 256>;
-// every code's place in a tile (`place`), the workgroup's threads one each: the same in every tile
+// every code's place in a tile (`place`; in a kernel written for one rate, how far into its word it starts, read of
+// a lane's first code alone), the workgroup's threads one each: the same in every tile
 var<workgroup> places: array<u32, 256>;
 var<workgroup> firsts: array<u32, 32>;
 // a code's value by its bytes' sum (0 to 1,020), the workgroup's threads four each: a weight is then a read where it
@@ -364,8 +395,7 @@ fn lanes(t: u32, nt: u32, ntiles: u32, ks: u32, ke: u32, tw: u32, base: u32) -> 
     let nw = tw / 2u;
     let rb = 2u * (l % 4u);
     let first = window(8u * (t / 8u), tw).x;
-    places[t] = place(t, tw, first);
-    if (t % 8u == 0u) {{
+{place}    if (t % 8u == 0u) {{
         firsts[t / 8u] = first;
     }}
     for (var i = 0u; i < 4u; i = i + 1u) {{
@@ -377,16 +407,11 @@ fn lanes(t: u32, nt: u32, ntiles: u32, ks: u32, ke: u32, tw: u32, base: u32) -> 
     let o1 = (w0 + 1u) % nw;
     let o2 = (w0 + 2u) % nw;
     let o3 = (w0 + 3u) % nw;
-    var at: array<u32, 8>;
-{places}    var lo = 0.0;
+{held}    var lo = 0.0;
     var hi = 0.0;
     for (var kt = ks + warp; kt < ke; kt = kt + 8u) {{
         let tile = {words_at};
-        let q0 = words[tile + w0];
-        let q1 = words[tile + o1];
-        let q2 = words[tile + o2];
-        let q3 = words[tile + o3];
-        let xv = array<f32, 4>(x[{x0}], x[{x1}], x[{x8}], x[{x9}]);
+{loads}        let xv = array<f32, 4>(x[{x0}], x[{x1}], x[{x8}], x[{x9}]);
         {{
 {codes}        }}
     }}
@@ -908,16 +933,16 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 /// splits + s) * n..]`, the jobs from `p[1].y` (a pass of a long list: 65535 workgroups an axis). `p[0]`: n, k, tile
 /// words, splits; `p[1]`: words a matrix, the pass's first job.
 fn g_mm_source() -> String {
-    g_mm_source_of(false)
+    g_mm_source_with(None)
 }
 
-/// [`g_mm_source`] for tiles of at most [`NEAR_TILE_WORDS`] words ([`one_lanes_of`]'s near loop).
-fn g_mm_near_source() -> String {
-    g_mm_source_of(true)
+/// [`g_mm_source`] for tiles of `tw` words alone ([`lanes_fixed`]).
+fn g_mm_fixed_source(tw: usize) -> String {
+    g_mm_source_with(Some(tw))
 }
 
-fn g_mm_source_of(near: bool) -> String {
-    let body = one_lanes_of("j * k + kt * 16u + {r}", "base + (kt * ntiles + nt) * nw", "", near);
+fn g_mm_source_with(fixed: Option<usize>) -> String {
+    let body = one_lanes_with("j * k + kt * 16u + {r}", "base + (kt * ntiles + nt) * nw", "", fixed);
     format!(
         r#"
 @group(0) @binding(0) var<storage, read> words: array<u32>;
@@ -1704,30 +1729,30 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
 /// The chain's kernels as WGSL: the input transform (of a SwiGLU's output, "pre-swiglu"), the matmul (a row a job; a
 /// prompt's is [`g_many`]), the output transform and its map; each made once.
-/// OAIY_EXL3_GENERAL: the one-row kernel's general form for every tile (to compare the near one with).
+/// OAIY_EXL3_GENERAL: the one-row kernel's general form at every rate (to compare a rate's own with).
 fn general_only() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("OAIY_EXL3_GENERAL").is_some())
 }
 
-/// The chain's one-row kernel for tiles of `tile_words`, and its name: the near one for tiles of up to 4 bits a
-/// weight ([`one_lanes_of`]), else the general one.
+/// The chain's one-row kernel for tiles of `tile_words`, and its name: the one written for that rate
+/// ([`lanes_fixed`]), each made when a tile of its rate is first met.
 pub(crate) fn one_row_kernel(tile_words: usize) -> (&'static str, &'static str) {
-    if tile_words <= NEAR_TILE_WORDS && !general_only() {
-        ("exl3-mm-near", chain_shader("mm-near"))
-    } else {
-        ("exl3-mm", chain_shader("mm"))
+    const NAMES: [&str; 11] = ["exl3-mm-16", "exl3-mm-24", "exl3-mm-32", "exl3-mm-40", "exl3-mm-48", "exl3-mm-56", "exl3-mm-64", "exl3-mm-80", "exl3-mm-96", "exl3-mm-112", "exl3-mm-128"];
+    static SOURCES: [std::sync::OnceLock<String>; 11] = [const { std::sync::OnceLock::new() }; 11];
+    match RATES.iter().position(|&rate| rate == tile_words) {
+        Some(at) if !general_only() => (NAMES[at], SOURCES[at].get_or_init(|| g_mm_fixed_source(tile_words))),
+        _ => ("exl3-mm", chain_shader("mm")),
     }
 }
 
 pub(crate) fn chain_shader(which: &str) -> &'static str {
-    static SOURCES: [std::sync::OnceLock<String>; 6] = [const { std::sync::OnceLock::new() }; 6];
+    static SOURCES: [std::sync::OnceLock<String>; 5] = [const { std::sync::OnceLock::new() }; 5];
     let (at, make): (usize, fn() -> String) = match which {
         "pre" => (0, || format!("{HALF}{G_PRE}")),
         "pre-swiglu" => (1, || format!("{HALF}{G_PRE_SWIGLU}")),
         "mm" => (2, g_mm_source),
         "post" => (3, || format!("{HALF}{G_POST}")),
-        "mm-near" => (5, g_mm_near_source),
         _ => (4, || G_GATHER.to_string()),
     };
     SOURCES[at].get_or_init(make)
@@ -3040,9 +3065,10 @@ mod tests {
     fn a_chained_projection_matches_the_projection() {
         let Some(b) = backend() else { return };
         let (k, n) = (512usize, 384usize);
-        // (3, 3.5 and 4 bits a weight through a step's near kernel, 5 and 8 through the general one: at 7 bits and
-        // more a lane's last codes lie in its third and fourth words)
-        for (tw, maps) in [(48usize, false), (56, false), (64, true), (80, true), (128, false)] {
+        // (every rate a checkpoint may hold: a step's kernel is written for each, and at 7 bits a weight and more a
+        // lane's last codes lie in its third and fourth words)
+        assert_eq!(RATES, [16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128]);
+        for (tw, maps) in RATES.into_iter().zip([false, false, true, false, false, false, true, true, false, true, false]) {
             let mut data = random_exl3(k, n, tw, 77 + tw as u32);
             if maps {
                 data.input_map = (0..k as u32).map(|i| (i * 7 + 3) % k as u32).collect();
