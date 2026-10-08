@@ -262,6 +262,20 @@ to 69 tokens a second, 66 to 83 with its drafting head; a 1,960-token prompt in 
 to 0.72 s. Its PEFT adapters run on its dense projections (an adapter of its routed
 experts is refused), and its vision tower is chained (a new picture answered in
 1.2 s).
+
+It also reads the GGUFs Strata runs (ISTA-DASLab's GSQ-RCO files: Q2_0 experts with
+K-quant, IQ4 and f16 matrices beside them; `quant_moe`, `quant_linear`). From the Q2_0
+file over two RTX 5090s (2026-10-10): a reply at 78 to 81 tokens a second, 84 to 91
+drafting with the EXL3 checkpoint's prediction layer (`--mtp-from`), a 1,960-token
+prompt in 0.50 to 0.61 s. Strata's published figure for the model on one RTX 5090
+(its IQ2_XS file, drafting four deep with suffix drafts) is 179 tokens a second and
+4,270 tokens a second of prompt at 4K: the prompt is matched on two cards, the reply
+is half. A decode step there is 11.2 ms of kernels (the f16 hyper-connection and
+shared-expert matrices 3.6, the routed experts 1.1), a check of four drafted rows
+19.4, and a round of drafting adds some 5 ms for the drafts themselves. On one card
+the experts that do not fit still run on a host path that is only a reference
+(a prompt at 7 to 8 tokens a second): that, a tier of experts by use as
+DeepSeek-V4.1 has, is what its one-card figures wait for.
 Image and video generation (`oaiy-media`) run on WebGPU too: each model's own page
 says what of it does.
 
