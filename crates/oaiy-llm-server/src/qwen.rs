@@ -437,6 +437,15 @@ impl Hybrid {
         }
         PREFILL_CHUNK
     }
+    /// Whether the model is chained on GPUs, its kernels' pipelines made as each first runs
+    /// ([`QwenEngine::warm_up`]): Flash-Next, a chained Qwen3.5 hybrid.
+    fn warms(&self) -> bool {
+        #[cfg(feature = "webgpu")]
+        if let Self::Flash(_) = self {
+            return true;
+        }
+        matches!(self, Self::Qwen35(Model::Qwen35(m)) if m.backend.chain().is_some())
+    }
     /// Whether a prompt's chunks go to [`Self::forward_chunks`] together: Flash-Next over several GPUs, a chained
     /// Qwen3.5 hybrid.
     fn pipelines(&self) -> bool {
@@ -554,6 +563,7 @@ impl QwenEngine {
         self
     }
     pub fn run(mut self, jobs: Receiver<Job>) {
+        self.warm_up();
         for job in jobs {
             // The end of an incognito session: wipe what is held of it.
             if job.wipe {
@@ -576,6 +586,66 @@ impl QwenEngine {
                 if job.session.is_some() { self.private_session = job.session.clone(); } else { self.forget_state(); }
             }
         }
+    }
+
+    /// The model run once before the first request, on tokens of no meaning, and what that left let go
+    /// (OAIY_NO_WARMUP: not). A chained model's kernels are made as each first runs (a shader compiled, a pipeline
+    /// built), so a server's first request paid for them: the 27B's first 15.6K-token prompt took 7.6 s where the
+    /// next took 6.3, its first reply ran at 62.6 tokens a second where 67.5. llama.cpp's server runs its model once
+    /// at load too.
+    fn warm_up(&mut self) {
+        if std::env::var_os("OAIY_NO_WARMUP").is_some() || !self.model.warms() {
+            return;
+        }
+        let clock = std::time::Instant::now();
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.warm()));
+        self.kv.reset();
+        self.covered.clear();
+        self.checkpoints.clear();
+        if self.log {
+            eprintln!("  Qwen warm-up: {:.2}s{}", clock.elapsed().as_secs_f64(), if matches!(ran, Ok(Ok(()))) { "" } else { " (not all of it ran)" });
+        }
+    }
+
+    /// [`Self::warm_up`]'s run: two of a prompt's chunks as a prompt's go, a decode step (its token picked on the GPU
+    /// and its logits read), and, a model that drafts, a round of drafts and a check of each size both ways, undone.
+    fn warm(&mut self) -> Result<(), String> {
+        let hybrid = &self.model;
+        let rows = hybrid.prompt_rows();
+        if self.kv.max_len < 2 * rows + 64 {
+            return Ok(());
+        }
+        let token = |i: usize| 1000 + (i as u32 * 7919) % 20000;
+        let prompt: Vec<u32> = (0..2 * rows).map(token).collect();
+        let spans = [(0, rows), (rows, 2 * rows)];
+        if hybrid.pipelines() {
+            let chunks = spans.iter().map(|&(a, b)| Ok((&prompt[a..b], hybrid.embed(&prompt[a..b])?))).collect::<Result<Vec<(&[u32], Tensor)>, String>>()?;
+            hybrid.forward_chunks(&chunks, &mut self.kv, &mut |_: usize| {})?;
+        } else {
+            for (a, b) in spans {
+                let embeds = hybrid.embed(&prompt[a..b])?;
+                hybrid.forward(&prompt[a..b], embeds, &mut self.kv, None)?;
+            }
+        }
+        let next = token(2 * rows);
+        let _ = hybrid.step_pick(next, &mut self.kv);
+        let embeds = hybrid.embed(&[next])?;
+        hybrid.forward(&[next], embeds, &mut self.kv, None)?;
+        if hybrid.drafts() {
+            let window = hybrid.draft_window().min(prompt.len());
+            let recent: Vec<u32> = prompt[prompt.len() - window..].iter().copied().chain([next]).collect();
+            let _ = hybrid.draft(&self.kv, &recent, drafts_most());
+            for n in 2..=1 + drafts_most() {
+                let checked: Vec<u32> = (0..n).map(|i| token(3 * rows + i)).collect();
+                if hybrid.check_picks(&checked, &mut self.kv).is_some() {
+                    hybrid.rollback(&mut self.kv, n, 1);
+                }
+                if hybrid.check(&checked, &mut self.kv).is_some() {
+                    hybrid.rollback(&mut self.kv, n, 1);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Forget everything held of a private request or session. Whatever was set aside in RAM
@@ -775,6 +845,8 @@ impl QwenEngine {
         let (mut check_rows, mut drafts_checked, mut drafts_taken) = (0usize, 0usize, 0usize);
         // (for the log: the checks made and their rows, the time making drafts, in checks, and undoing rows)
         let (mut checks, mut rows_checked, mut t_draft, mut t_check, mut t_undo) = (0usize, 0usize, 0f64, 0f64, 0f64);
+        // (OAIY_DECODE_LOG: the model's time at every fiftieth token)
+        let mut by_fifty: Vec<f64> = Vec::new();
         while generated.len() < job.max_tokens && self.kv.len < self.kv.max_len {
             if job.cancel.load(Ordering::Relaxed) {
                 if let (Some(m), false) = (drafter, pending.is_empty()) { m.rollback(&mut self.kv, check_rows, check_rows - pending.len()); }
@@ -857,12 +929,19 @@ impl QwenEngine {
                 }
             }
             t_model += clock.elapsed().as_secs_f64();
+            if generated.len() % 50 == 0 {
+                by_fifty.push(t_model);
+            }
             next_position += 1;
             self.covered.push(next as u64);
         }
         // a check's rows no token reached
         if let (Some(m), false) = (drafter, pending.is_empty()) {
             m.rollback(&mut self.kv, check_rows, check_rows - pending.len());
+        }
+        if self.log && std::env::var_os("OAIY_DECODE_LOG").is_some() {
+            let each: Vec<String> = by_fifty.iter().scan(0f64, |before, &t| { let d = t - *before; *before = t; Some(format!("{d:.3}")) }).collect();
+            eprintln!("  Qwen decode: the model's seconds by fifties of tokens: {}", each.join(" "));
         }
         let raw = tok.decode(&generated);
         // The client is told what the model wrote, so a rejected call can be read

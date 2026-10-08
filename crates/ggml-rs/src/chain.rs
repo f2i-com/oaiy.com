@@ -241,6 +241,11 @@ pub trait ChainRecorder {
     /// Submit what is recorded so far (its reads still [`Self::finish`]'s): a device's work running while the next
     /// device's is recorded.
     fn flush(&mut self) {}
+    /// [`Self::finish`] of a recording that reads nothing back, without its wait where the device can: what is
+    /// recorded goes to the device's queue and the caller goes on; whatever the device is given next runs after it.
+    fn send(self: Box<Self>) {
+        let _ = self.finish();
+    }
     /// Rotate `x` (`[heads, head_dim]`) in place: pair `k` of each head by `table[2k]` (sine) and `table[2k + 1]`
     /// (cosine), the pairs `(2k, 2k + 1)` or with `neox` `(k, k + head_dim / 2)`.
     fn rope(&mut self, x: &DeviceVec, heads: usize, head_dim: usize, table: &DeviceVec, neox: bool) {

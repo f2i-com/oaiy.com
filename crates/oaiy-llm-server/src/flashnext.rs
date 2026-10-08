@@ -1914,7 +1914,9 @@ impl FlashNext {
                     rec.ple_conv(&dv.logits, &dv.normed, &v.conv_in, &window, &p.conv, keep, cfg.streams * cfg.hidden, cfg.ple_kernel, cfg.ngram);
                 }
             }
-            rec.finish();
+            // (nothing of it is read back, and each device's next run goes to its queue behind it: not waited for,
+            // where the thread parked for the first card's undoing and then the second's)
+            rec.send();
         }
         // the n-gram history: the one before the check, then its kept tokens
         let ctx = cfg.ngram - 1;

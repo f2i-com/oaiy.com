@@ -387,6 +387,11 @@ tokens a second (Strata 179), where 1.93 to 2.05 s; of it the checks 1.23 to 1.3
 (13.9 ms each of 3.4 rows), drafting 0.31 s, undoing 0.07 s. A request with a
 temperature reads the logits as before.
 
+Undoing a check's refused rows reads nothing back, so it is sent to the two cards and
+not waited for (`ChainRecorder::send`; each card's next work is behind it on its
+queue): 0.04 s of the request where 0.07, 256 tokens in 1.71 to 1.84 s (139 to 150
+tokens a second).
+
 On one card, which is what Strata's figure is for, this file is far from it: its
 experts are 35.5 GB, so 15 of the 48 layers' run on the host (`quant_host` reads the
 grid types as they lie too: 0.27 to 0.42 ms an expert a row on one AVX-512 core, where
@@ -570,6 +575,22 @@ which also checks that the chain ran); the same replies through a conversation
 that goes back to a checkpoint as with `OAIY_NO_CHAIN`; and Qwen3.8 27B the right
 answer after up to 2,011 tokens. Its decode step is about 17 ms on the GPU, 12 of
 them the matmuls (Q3_K, 8 GB of its 13.4, at 1,090 GB/s).
+
+Against llama.cpp in one session (2026-10-09; LM Studio's CUDA build of its server and
+this engine's in turn, twice over, the same card at its 400 W cap, Qwen3.8 27B Q3_K_M,
+the same 15.6K-token prompt, greedy): llama.cpp wrote at 68.6, 68.6, 67.9 and 68.1
+tokens a second and read the prompt at 2,416 to 2,636; this engine wrote at 68.5, 68.3,
+68.0 and 66.7 after its first reply, and read the prompt in 6.44 to 6.47 s (2,410
+tokens a second) after its first. So a reply is llama.cpp's speed and a prompt 92 to
+100% of it. A server's first request is the slower one, here as there: the first
+prompt 7.2 s (llama.cpp's first 2,416 where 2,636 after), the first reply 64.2 tokens
+a second. That is not its kernels being made: all 52 pipelines take 89 ms together
+(`OAIY_PIPELINE_LOG` says each), and a run of the model at load (`QwenEngine::warm_up`:
+two chunks, a step, a model that drafts its drafts and checks too; half a second,
+`OAIY_NO_WARMUP` to skip it) leaves the first request as slow. By fifties of tokens
+(`OAIY_DECODE_LOG`) the first reply is 0.74 s a fifty where the later ones are 0.72,
+but for one fifty of 0.95: one stall of a fifth of a second, once a server's life,
+whose cause is not found.
 
 Gemma 3 itself was wrong on every backend until this day: one RoPE base on every
 layer, where its sliding-window layers take 10,000 and its global ones

@@ -131,6 +131,18 @@ impl ChainRecorder for Recorder<'_> {
         self.flushed = Some(self.gpu().submit_after(vec![enc.finish()]));
     }
 
+    fn send(mut self: Box<Self>) {
+        // (reads, or a profile's or the pieces' times to resolve: finished as any recording is)
+        if !self.reads.is_empty() || crate::profile::chain_on() || crate::profile::pieces_on() {
+            let _ = self.finish();
+            return;
+        }
+        self.flush();
+        // its scratch back to the pool at once: whatever takes it next goes to the queue behind this recording's work
+        let pooled = std::mem::take(&mut self.pooled);
+        self.gpu().unpool(pooled);
+    }
+
     fn exl3_rows(&mut self, w: &dyn ggml_rs::exl3::PackedLinear, x: &DeviceVec, y: &DeviceVec, rows: usize) {
         self.exl3_rows_of(w, x, None, y, rows);
     }

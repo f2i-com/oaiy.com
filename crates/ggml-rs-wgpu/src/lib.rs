@@ -388,6 +388,15 @@ fn encode(device: &wgpu::Device, dispatches: &[Dispatch]) -> wgpu::CommandBuffer
     piece.finish()
 }
 
+/// OAIY_PIPELINE_LOG: a kernel's pipeline said as it is made (its shader read and its pipeline built since `began`),
+/// with the process's time: which kernels a server's first request makes, and for how long.
+fn made(name: &str, began: std::time::Instant) {
+    static ON: std::sync::OnceLock<Option<std::time::Instant>> = std::sync::OnceLock::new();
+    if let Some(start) = ON.get_or_init(|| std::env::var_os("OAIY_PIPELINE_LOG").map(|_| std::time::Instant::now())) {
+        eprintln!("    pipeline {name}: {:.1} ms, at {:.2} s", began.elapsed().as_secs_f64() * 1e3, start.elapsed().as_secs_f64());
+    }
+}
+
 /// A device's [`Feed`]'s thread: what was handed over submitted in turn (a piece's dispatches encoded then), each
 /// once the device's pieces in flight are fewer than `limit` (as it is then; 0: at once). It ends with the device, or
 /// at a failure (said to whoever waits on the feed next).
@@ -1026,6 +1035,7 @@ impl Gpu {
         if let Some(p) = cache.get(name) {
             return Arc::clone(p);
         }
+        let began = std::time::Instant::now();
         let module = self.shader(name, source());
         let pipeline = Arc::new(self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(name),
@@ -1035,6 +1045,7 @@ impl Gpu {
             compilation_options: Default::default(),
             cache: None,
         }));
+        made(name, began);
         cache.insert(name, Arc::clone(&pipeline));
         self.names.lock().unwrap_or_else(|p| p.into_inner()).insert(Arc::as_ptr(&pipeline) as usize, name);
         pipeline
@@ -1054,6 +1065,7 @@ impl Gpu {
             3 => shaders::source_multi(dtype)?,
             _ => shaders::source(dtype)?,
         };
+        let began = std::time::Instant::now();
         let module = self.shader(&format!("oaiy-linear-q ({dtype:?}, kind {kind})"), source);
         let pipeline = Arc::new(self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("oaiy-linear-q"),
@@ -1066,6 +1078,7 @@ impl Gpu {
         cache.insert((dtype, kind), Arc::clone(&pipeline));
         // a name for a chain's profile (a few, made once each)
         let name: &'static str = Box::leak(format!("matmul-{dtype:?}-{}", ["one", "tiled", "decode", "multi"][kind as usize]).into_boxed_str());
+        made(name, began);
         self.names.lock().unwrap_or_else(|p| p.into_inner()).insert(Arc::as_ptr(&pipeline) as usize, name);
         Some(pipeline)
     }
