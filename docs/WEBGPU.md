@@ -330,6 +330,20 @@ same of itself: a window of rows there is one captured CUDA graph of more kernel
 this engine has dispatches, the dense quantised matrices against int8 activations for
 a step as for a check, and only token ids read back.
 
+A few rows' sums are each added up by a lane of its own (lane r row r's, in the order
+one lane added every row's in turn: the same bits), in the f16 kernels, IQ4_XS's and
+the experts'. At Strata's context (4,086 positions, past QSA's dense span, which is
+what its request runs: profile with `FLASHNEXT_PAST=4096`) a check of four rows is
+17.1 ms where 17.8 and of three 15.2 where 16.2, its IQ4_XS matrices 1.6 ms where 2.1;
+Strata's request drafting 122 to 128 tokens a second (256 tokens in 2.00 to 2.09 s),
+the replies the same to the byte. What an f16 kernel costs a dispatch is measured
+apart from a model (`measure_a_few_rows_f16_matmuls`, every dispatch another copy of
+the matrix): a hyper-connection's down matrix 7.8 us for one row and 10.8 for four, its
+up matrix 6.8 and 7.0, a router 6.2 and 6.8; of each some 2.5 us is any dispatch's and
+the rest mostly its bytes (6.6 MB a hyper-connection's matrix; a 31.5 MB one reads at
+1.45 TB a second). The same matrix every time stays in the card's cache and takes 5.5,
+3.9 and 4.0 us for a row: a measurement that reuses its weights flatters the kernel.
+
 On one card, which is what Strata's figure is for, this file is far from it: its
 experts are 35.5 GB, so 15 of the 48 layers' run on the host (`quant_host` reads the
 grid types as they lie too: 0.27 to 0.42 ms an expert a row on one AVX-512 core, where

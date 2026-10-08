@@ -487,7 +487,8 @@ fn few_source(kind: Kind, rows: usize, lanes: usize) -> String {
         format!("            if (on{i}) {{ a{i} += d * (dot(c0, x[xb{i} + at]) + dot(c1, x[xb{i} + at + 1u]) + dot(c2, x[xb{i} + at + 2u]) + dot(c3, x[xb{i} + at + 3u])); }}\n")
     });
     let store = each(&|i| format!("    red[t * {rows}u + {i}u] = a{i};\n"));
-    let out = each(&|i| format!("        if (on{i}) {{\n            var s = 0.0;\n            for (var q = 0u; q < {lanes}u; q++) {{ s += red[(t + q) * {rows}u + {i}u]; }}\n            y[j{i} * n + row] = s;\n        }}\n"));
+    // (a row of the block's sum by a lane of its own: lane i adds row i's, the lanes in order)
+    let out = each(&|i| format!("        if (lane == {i}u && on{i}) {{\n            var s = 0.0;\n            for (var q = 0u; q < {lanes}u; q++) {{ s += red[(t - {i}u + q) * {rows}u + {i}u]; }}\n            y[j{i} * n + row] = s;\n        }}\n"));
     format!(
         r#"
 @group(0) @binding(0) var<storage, read> words: array<u32>;
@@ -528,7 +529,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 {sums}        }}
     }}
 {store}    workgroupBarrier();
-    if (live && lane == 0u) {{
+    if (live) {{
 {out}    }}
 }}
 "#,
@@ -552,7 +553,8 @@ fn few_source_grid(kind: Kind, rows: usize, lanes: usize) -> String {
     });
     let sums = each(&|i| format!("            if (on{i}) {{ a{i} += dot(c0, x[xb{i} + at]) + dot(c1, x[xb{i} + at + 1u]); }}\n"));
     let store = each(&|i| format!("    red[t * {rows}u + {i}u] = a{i};\n"));
-    let out = each(&|i| format!("        if (on{i}) {{\n            var s = 0.0;\n            for (var q = 0u; q < {lanes}u; q++) {{ s += red[(t + q) * {rows}u + {i}u]; }}\n            y[j{i} * n + row] = s;\n        }}\n"));
+    // (a row of the block's sum by a lane of its own: lane i adds row i's, the lanes in order)
+    let out = each(&|i| format!("        if (lane == {i}u && on{i}) {{\n            var s = 0.0;\n            for (var q = 0u; q < {lanes}u; q++) {{ s += red[(t - {i}u + q) * {rows}u + {i}u]; }}\n            y[j{i} * n + row] = s;\n        }}\n"));
     format!(
         r#"
 @group(0) @binding(0) var<storage, read> words: array<u32>;
@@ -587,7 +589,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 {sums}        }}
     }}
 {store}    workgroupBarrier();
-    if (live && lane == 0u) {{
+    if (live) {{
 {out}    }}
 }}
 "#,

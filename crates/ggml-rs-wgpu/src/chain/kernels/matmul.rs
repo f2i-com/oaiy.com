@@ -84,6 +84,11 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 /// and it is the lanes that give the GPU its threads: 32 lanes a row left that one 10,000 threads and took three
 /// times as long as a workgroup a row.
 pub(in crate::chain) fn f16_lanes(k: usize) -> usize {
+    // (OAIY_F16_LANES: a measurement's)
+    static ASKED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    if let Some(l) = *ASKED.get_or_init(|| std::env::var("OAIY_F16_LANES").ok().and_then(|v| v.parse().ok()).filter(|l: &usize| l.is_power_of_two() && (8..=256).contains(l))) {
+        return l;
+    }
     let lanes = (k / 4 / 10).max(1);
     // (the power of two at or under it)
     (1usize << (usize::BITS - 1 - lanes.leading_zeros())).clamp(8, 256)
@@ -93,7 +98,8 @@ pub(in crate::chain) fn f16_lanes(k: usize) -> usize {
 /// of drafts'): a workgroup `256 / lanes` output rows, `lanes` threads a row ([`f16_lanes`]), each taking four weights
 /// in every `4 lanes` of the row with four of x at a load, so a row's threads read side by side; each weight is read
 /// once for every row of x, a row's products summed the same way whatever the rows (a lane's in four running sums,
-/// then the lanes in order), so a check's rows are a step's bit for bit. One barrier. `p[0]`: n, k.
+/// then the lanes in order, a row of x's by a lane of its own), so a check's rows are a step's bit for bit. One
+/// barrier. `p[0]`: n, k.
 ///
 /// It replaces, for such widths, [`MATVEC_F16`] (a workgroup an output row and eight barriers: Flash-Next's routers'
 /// 513 rows of 2,560 gave a thread ten weights) and [`MATVEC_F16_NARROW`] (eight threads an output, a word and two
@@ -105,7 +111,6 @@ pub(in crate::chain) fn matvec_f16_lanes(rows: usize, lanes: usize) -> String {
     let regs = each(&|r| format!("    var s{r} = vec4<f32>(0.0);"));
     let sums = each(&|r| format!("            s{r} += wv * x4[{r}u * k4 + i];"));
     let parts = each(&|r| format!("    part[{r}u * 256u + li] = s{r}.x + s{r}.y + s{r}.z + s{r}.w;"));
-    let outs = each(&|r| format!("        var t{r} = 0.0;\n        for (var j = 0u; j < {lanes}u; j++) {{ t{r} += part[{r}u * 256u + li + j]; }}\n        y[{r}u * n + o] = t{r};"));
     format!(
         r#"
 @group(0) @binding(0) var<storage, read> w2: array<vec2<u32>>;
@@ -132,8 +137,13 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     }}
 {parts}
     workgroupBarrier();
-    if (lane == 0u && o < n) {{
-{outs}
+    // a row of x's sum by a lane of its own: lane r adds row r's parts, the lanes in order (one lane adding every
+    // row's in turn was what a check's kernel waited for)
+    if (lane < {rows}u && o < n) {{
+        let at = lane * 256u + li - lane;
+        var t = 0.0;
+        for (var j = 0u; j < {lanes}u; j++) {{ t += part[at + j]; }}
+        y[lane * n + o] = t;
     }}
 }}
 "#,
@@ -152,11 +162,6 @@ pub(in crate::chain) fn hc_down_gates_lanes(rows: usize, lanes: usize) -> String
     let regs = each(&|r| format!("    var s{r} = vec4<f32>(0.0);"));
     let sums = each(&|r| format!("            s{r} += wv * x4[{r}u * k4 + i];"));
     let parts = each(&|r| format!("    part[{r}u * 256u + li] = s{r}.x + s{r}.y + s{r}.z + s{r}.w;"));
-    let outs = each(&|r| {
-        format!(
-            "        var t{r} = 0.0;\n        for (var j = 0u; j < {lanes}u; j++) {{ t{r} += part[{r}u * 256u + li + j]; }}\n        {{\n            let v = t{r} / streams;\n            if (o < rank) {{\n                gt[{r}u * n + o] = v / (1.0 + exp(-v));\n            }} else {{\n                post[{r}u * (n - rank) + o - rank] = 2.0 / (1.0 + exp(-v));\n                gt[{r}u * n + o] = 0.0;\n            }}\n        }}"
-        )
-    });
     format!(
         r#"
 @group(0) @binding(0) var<storage, read> w2: array<vec2<u32>>;
@@ -186,8 +191,18 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     }}
 {parts}
     workgroupBarrier();
-    if (lane == 0u && o < n) {{
-{outs}
+    // (a row of x's sum and its gate by a lane of its own, as [`matvec_f16_lanes`]'s)
+    if (lane < {rows}u && o < n) {{
+        let at = lane * 256u + li - lane;
+        var t = 0.0;
+        for (var j = 0u; j < {lanes}u; j++) {{ t += part[at + j]; }}
+        let v = t / streams;
+        if (o < rank) {{
+            gt[lane * n + o] = v / (1.0 + exp(-v));
+        }} else {{
+            post[lane * (n - rank) + o - rank] = 2.0 / (1.0 + exp(-v));
+            gt[lane * n + o] = 0.0;
+        }}
     }}
 }}
 "#,
@@ -198,8 +213,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 
 /// [`matvec_f16_lanes`] of a hyper-connection's up matrix with its mix ([`super::HC_MIX`]): a workgroup's `256 /
 /// lanes` output rows are `streams` logits each of some outputs `j` (row `s d + j` stream `s`'s), and where the
-/// matmul would store them the first stream's thread adds the streams' `normed / (1 + exp(-logit)) / streams` in
-/// their order into `out[j]`. The logits' sums and the mix as the two kernels make them, bit for bit. `p[0]`: n (the
+/// matmul would store them each stream's slot makes its `normed / (1 + exp(-logit)) / streams` and the first
+/// stream's adds them in their order into `out[j]` (a row of x's by a lane of its own in both). The logits' sums and the mix as the two kernels make them, bit for bit. `p[0]`: n (the
 /// streams' rows), k, d, the streams (which divide the workgroup's rows).
 pub(in crate::chain) fn hc_up_mix_lanes(rows: usize, lanes: usize, streams: usize) -> String {
     assert!((1..=8).contains(&rows) && lanes.is_power_of_two() && (8..=256).contains(&lanes) && streams > 0 && (256 / lanes) % streams == 0, "1 to 8 rows, 8 to 256 lanes, streams that divide a workgroup's rows");
@@ -207,11 +222,6 @@ pub(in crate::chain) fn hc_up_mix_lanes(rows: usize, lanes: usize, streams: usiz
     let regs = each(&|r| format!("    var s{r} = vec4<f32>(0.0);"));
     let sums = each(&|r| format!("            s{r} += wv * x4[{r}u * k4 + i];"));
     let parts = each(&|r| format!("    part[{r}u * 256u + li] = s{r}.x + s{r}.y + s{r}.z + s{r}.w;"));
-    let outs = each(&|r| {
-        format!(
-            "        var acc{r} = 0.0;\n        for (var s = 0u; s < {streams}u; s++) {{\n            var t = 0.0;\n            for (var q = 0u; q < {lanes}u; q++) {{ t += part[{r}u * 256u + li + s * {lanes}u + q]; }}\n            acc{r} += normed[({r}u * {streams}u + s) * d + j] / (1.0 + exp(-t)) / f32({streams}u);\n        }}\n        y[{r}u * d + j] = acc{r};"
-        )
-    });
     format!(
         r#"
 @group(0) @binding(0) var<storage, read> w2: array<vec2<u32>>;
@@ -243,8 +253,20 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     }}
 {parts}
     workgroupBarrier();
-    if (lane == 0u && s_of == 0u && j < d) {{
-{outs}
+    // row `lane`'s logit of this slot's stream (its lanes' parts in order) and that stream's term of the mix, left
+    // where the slot's parts of the row began (no other thread reads them); then the row's lane of each output's first
+    // stream adds the streams' terms in their order
+    let own = lane * 256u + li - lane;
+    if (lane < {rows}u && j < d) {{
+        var t = 0.0;
+        for (var q = 0u; q < {lanes}u; q++) {{ t += part[own + q]; }}
+        part[own] = normed[(lane * {streams}u + s_of) * d + j] / (1.0 + exp(-t)) / f32({streams}u);
+    }}
+    workgroupBarrier();
+    if (lane < {rows}u && s_of == 0u && j < d) {{
+        var acc = 0.0;
+        for (var s = 0u; s < {streams}u; s++) {{ acc += part[own + s * {lanes}u]; }}
+        y[lane * d + j] = acc;
     }}
 }}
 "#,

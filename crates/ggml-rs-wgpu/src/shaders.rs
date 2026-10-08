@@ -437,7 +437,6 @@ pub(crate) fn iq4_xs_few(m: usize) -> String {
     let zero = each(&|i| format!("            var s{i} = 0.0;\n"));
     let scale = each(&|i| format!("            a{i} += dl * s{i};\n"));
     let store = each(&|i| format!("    red[t * {m}u + {i}u] = a{i};\n"));
-    let out = each(&|i| format!("        {{\n            var s = 0.0;\n            for (var l = 0u; l < 32u; l++) {{ s += red[(t + l) * {m}u + {i}u]; }}\n            y[{i}u * p.n + p.row0 + r] = s;\n        }}\n"));
     format!(
         r#"
 struct Params {{
@@ -485,8 +484,13 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 {zero}{words}{scale}        }}
     }}
 {store}    workgroupBarrier();
-    if (live && lane == 0u) {{
-{out}    }}
+    // a row of x's sum by a lane of its own: lane i adds row i's, the lanes in order (one lane adding every row's in
+    // turn was what a check's kernel waited for)
+    if (live && lane < {m}u) {{
+        var s = 0.0;
+        for (var l = 0u; l < 32u; l++) {{ s += red[(t - lane + l) * {m}u + lane]; }}
+        y[lane * p.n + p.row0 + r] = s;
+    }}
 }}
 "#,
         red_len = 256 * m,
@@ -516,7 +520,6 @@ pub(crate) fn iq4_xs_few_q8(m: usize) -> String {
         )
     });
     let store = each(&|i| format!("    red[t * {m}u + {i}u] = a{i};\n"));
-    let out = each(&|i| format!("        {{\n            var s = 0.0;\n            for (var l = 0u; l < 32u; l++) {{ s += red[(t + l) * {m}u + {i}u]; }}\n            y[{i}u * p.n + p.row0 + r] = s;\n        }}\n"));
     format!(
         r#"
 struct Params {{
@@ -564,8 +567,13 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 {words}{rows}        }}
     }}
 {store}    workgroupBarrier();
-    if (live && lane == 0u) {{
-{out}    }}
+    // a row of x's sum by a lane of its own: lane i adds row i's, the lanes in order (one lane adding every row's in
+    // turn was what a check's kernel waited for)
+    if (live && lane < {m}u) {{
+        var s = 0.0;
+        for (var l = 0u; l < 32u; l++) {{ s += red[(t - lane + l) * {m}u + lane]; }}
+        y[lane * p.n + p.row0 + r] = s;
+    }}
 }}
 "#,
         red_len = 256 * m,

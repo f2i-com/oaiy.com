@@ -1167,3 +1167,62 @@ fn measure_the_dispatch_floor() {
         }
     }
 }
+
+/// What a step's row and a check's few cost Flash-Next's f16 matrices, a dispatch at a time (`--ignored --nocapture`):
+/// its hyper-connections' down and up (alone and with their gates and mix), its router, its shared expert's gate and
+/// up and its down, and a delta net's gate held as f16, each 200 times in a held recording whose finish is timed (the
+/// GPU's run of them, none of the recording), for 1, 2, 4 and 8 rows. Each dispatch takes another copy of the matrix
+/// (some 512 MB of them in turn, as a model's layers are each their own weights), then the same one every time (the
+/// card's cache holds it: the kernel's own time, its weights' traffic apart). OAIY_F16_LANES sets the lanes a row.
+#[test]
+#[ignore = "a measurement"]
+fn measure_a_few_rows_f16_matmuls() {
+    let Ok(b) = WgpuBackend::new(Some(4 << 30)) else { return };
+    let mut r = rng(5);
+    let times = 200usize;
+    for (what, n, k) in [("hyper-connection down", 324usize, 10240usize), ("hyper-connection up", 10240, 324), ("router", 513, 2560), ("shared gate and up", 1280, 2560), ("shared down", 2560, 640), ("a delta net's gate", 6144, 2560)] {
+        let w: Vec<f32> = (0..n * k).map(|_| half::f16::from_f32(r() * 0.05).to_f32()).collect();
+        let copies: Vec<DeviceVec> = (0..((512usize << 20) / (n * k * 2)).clamp(8, 200)).map(|_| b.vec_f16(&w).expect("f16 values")).collect();
+        let at = std::cell::Cell::new(0usize);
+        let mut line = format!("{what} [{n}, {k}], {:.1} MB:", (n * k * 2) as f64 / 1e6);
+        for (rows, cached) in [(1usize, false), (2, false), (4, false), (8, false), (1, true), (4, true)] {
+            // the next copy, or the first every time
+            let next = || {
+                at.set(at.get() + 1);
+                &copies[if cached { 0 } else { at.get() % copies.len() }]
+            };
+            let (x, y) = (b.vec(rows * k), b.vec(rows * n));
+            DeviceChain::upload(&b, &x, &(0..rows * k).map(|_| r()).collect::<Vec<_>>());
+            let time = |f: &dyn Fn(&mut Recorder)| {
+                let run = || {
+                    let mut rec = Recorder::new(&b);
+                    ChainRecorder::hold(&mut rec);
+                    for _ in 0..times {
+                        f(&mut rec);
+                    }
+                    rec.read_range(&y, 0, 1);
+                    let t = std::time::Instant::now();
+                    Box::new(rec).finish();
+                    t.elapsed().as_secs_f64() * 1e6 / times as f64
+                };
+                run();
+                (0..5).map(|_| run()).fold(f64::MAX, f64::min)
+            };
+            let us = time(&|rec| rec.matmul_f16_rows(next(), n, k, &x, &y, rows));
+            line += &format!(" {rows} rows{} {us:.1} us", if cached { " of one copy" } else { "" });
+            // the hyper-connections' fused kernels (4 streams of 2,560, a rank of 320 and 4 writes)
+            if n == 324 {
+                let post = b.vec(rows * 4);
+                let us = time(&|rec| rec.hc_down_gates(next(), k, &x, &y, &post, rows, 320, 4, 4));
+                line += &format!(" (with its gates {us:.1})");
+            }
+            if k == 324 {
+                let (normed, out, logits) = (b.vec(rows * n), b.vec(rows * 2560), b.vec(rows * n));
+                DeviceChain::upload(&b, &normed, &(0..rows * n).map(|_| r()).collect::<Vec<_>>());
+                let us = time(&|rec| rec.hc_up_mix(next(), k, &x, &logits, &normed, &out, rows, 4, 2560));
+                line += &format!(" (with its mix {us:.1})");
+            }
+        }
+        eprintln!("{line}");
+    }
+}
