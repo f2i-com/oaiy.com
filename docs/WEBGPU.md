@@ -125,6 +125,22 @@ measured"; `dsv41::profile` says where a pass's time goes):
   expert's whole step one submit a card (its gate and up projections, their SwiGLU
   quantized on the device, its down projection), while the CPU reads and computes the
   rest.
+- The order of the tiers is the model's own count of each expert's uses
+  (`dsv41::moe::Uses`: one for each call that routed to it, halved every 512 decode
+  steps, the RAM cache's own counts with it), whatever the computer has: with no GPU
+  it orders RAM alone, with one its tier and RAM, with more their share after the
+  first card's. A usage profile keeps the counts from one run to the next (`--usage
+  FILE`, written after each request; the studio keeps it with its prompt states, and
+  an incognito request adds nothing to it): a start that finds one fills the first
+  card's tier with the most used experts, the other cards with the next and RAM with
+  the next again, each read from the drive in that order while the server idles.
+  Without one the cards and RAM are filled by number and find their order as the
+  experts are used.
+- RAM for experts is four fifths of the memory that is free (`--ram-gb` a ceiling on
+  it, none by default), and the rule is applied again every few seconds of idle, the
+  tier's own records counted free: a server started while another program still held
+  memory takes the room when it comes free, and gives records up when another program
+  needs a tenth of it back.
 - The sparse attention, the indexer's scores and the hyper-connections' mixing spread
   over the CPU's threads (serial, the attention was most of a prompt's time and the
   mixing's dot products 29 s of it); a layer's expert records read eight at a time.
@@ -165,7 +181,13 @@ build on this drive, both cards too, gave 6.4 to 7.3 and 7.9 to 10.5 tokens a se
 and 5.1 to 6.1 s and 18.2 to 18.9 s. On one RTX 5090 (`--devices 0`: the trunk and
 960 experts on it, no second card's share) the same replies run at 4.8 to 5.2 tokens a
 second first-time and 5.4 to 6.1 read before, the prompts in 8.3 to 8.8 s and 21.5 to
-22.0 s: the same code, with more of a step's experts on the CPU. What did it, in the order of what each was worth: the experts each in one
+22.0 s: the same code, with more of a step's experts on the CPU. With a usage profile
+(here the one left by a run of the same eight requests, so as good as a profile gets:
+another conversation's experts overlap these less) the next start reads its first
+93-token prompt in 7.8 s where 42.7, and its replies run at 5.9 to 8.4 tokens a
+second the first time through and 7.1 to 9.0 the second on two cards (3.0 to 5.6 and
+6.8 to 7.8 without a profile); on one card the first prompt in 9.1 s where 50.9 and
+replies at 4.9 to 6.0 and 5.3 to 7.0 (2.6 to 5.1 and 5.4 to 5.9 without). What did it, in the order of what each was worth: the experts each in one
 tier and the cards rebalanced while idle (above); a decode step's dense calls through
 buffers the device keeps (`dense::Arena`: one write of the inputs, one of the
 parameters, kept bind groups, one read-back polled for, where each call made and freed
