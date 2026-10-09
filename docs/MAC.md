@@ -111,17 +111,18 @@ answers**. What it costs:
   memory. Qwen3.8-Flash-Next's GGUF experts the GPU has no room for are read from the
   mapped file.
 
-**For a 24 GB Mac** (by the two-thirds figure: 12 GiB of weights):
+**For a 24 GB Mac** (by the two-thirds figure: 12 GiB of weights, which is 12.9 GB):
 
-- a 9B model's 4-bit file (5.7 GB) is all on the GPU: the case to start with;
-- a 27B's 3- or 4-bit file (13 to 17 GB) is past the 12 GiB: part of it runs on the CPU,
-  slowly. It belongs on the card in the enclosure, with a 9B as the stand-in (below);
-- if the log shows Metal allowing the GPU 18 GiB there (three quarters), 14 GiB are
-  weights, and a 27B's 3-bit file (about 12.7 GiB on the GPU) is all on it;
-- to try a 27B on the Mac alone where it is not: a 3-bit file with *WebGPU weights (GB)*
-  at 13 and the context at 8,192. Not tried: the 4 GiB kept back is what an NVIDIA card
-  needed, and what a Mac needs is to be measured. A 4-bit file (15.4 GiB) does not fit a
-  24 GB Mac's GPU without taking memory macOS needs.
+- a 9B model's 4-bit file (5.7 GB; 5.1 GB of it weights the GPU holds) is all on the GPU:
+  the case to start with;
+- a 27B's 3-bit file (Qwen3.8 27B Q3_K_M: a 13.4 GB file, 12.5 GB of it weights the GPU
+  holds) is all on the GPU too, on its fast path, with 0.4 GB of the share to spare. That
+  is the server's own count on an RTX 5090 given a Mac's share (below); with the
+  context's cache beside it, it is most of what the Mac's GPU may hold, so close what
+  else uses memory;
+- a 27B's 4-bit file (16.6 GB) is past the share: a quarter of it would run on the CPU,
+  slowly. That one belongs on the card in the enclosure, with a smaller model as the
+  stand-in (below).
 
 **Slower prompts than an NVIDIA card:** Apple's GPUs have none of the tensor-core matrices
 the engine reads a prompt through on NVIDIA, so a prompt's rows go through the int8
@@ -136,25 +137,22 @@ Nothing here has run on a Mac. What was done instead, on a Windows PC:
   Metal backend gives an Apple GPU (`OAIY_PORTABLE_LIMITS=1 OAIY_NO_COOP=1`): 32,768 bytes
   of workgroup memory, 29 buffers a kernel, 65,535 workgroups a dimension, a uniform
   binding's offset a multiple of 256 and a storage one's of 32, no tensor-core matrices.
-  On Windows' software GPU held so, 74 of the backend's 96 tests pass. The other 22 did
-  not stop at a limit, but 19 of them did not run all their kernels there either: ten are
-  too slow for a software GPU to finish, and nine have kernels Microsoft's shader compiler
-  gives up on before they are made (a Mac does not use it). Two meet that software GPU's
-  own less exact `tanh`, and one is stopped by its own time guard. Those 19 are held to
-  the new limits by reading only (what a kernel binds, below); `sh tools/mac/check.sh`
-  runs them on the Mac. An RTX 5090 held to the workgroup's memory and to no tensor-core
-  matrices, before the other limits were added, passed all 95 there were then.
+  An RTX 5090 held so passes all 96 of the backend's tests, as it does unheld. (With no
+  card at hand the same check runs on Windows' software GPU, `OAIY_WEBGPU_ADAPTER=basic`:
+  74 of the 96 pass there, ten are too slow for it to finish, nine have kernels
+  Microsoft's shader compiler gives up on, two meet its own less exact `tanh`, one is
+  stopped by its own time guard, and none stops at a limit.)
 - **The kernels as Metal's shading language.** On a Mac, wgpu turns each kernel into
   Metal's language with its own translator (naga) before Apple's compiler reads it. That
   translator runs anywhere: all 205 kernels the tests make were written as Metal's
   language, for Metal 3.1 and 2.4, with the options wgpu gives it; the most buffers one
   of them binds is 10 of Metal's 31. Apple's compiler itself runs only on a Mac.
-- **Right answers under those limits** (on an RTX 5090, before the limits above were
-  widened from three to all of them): a Llama 3B and a Gemma 3 4B chained answer as their
-  host paths (64 greedy steps the same, logits' cosine 1.000000); the server with a 24 GB
-  Mac's share (`--webgpu-gb 12`) answered a 2,786-token prompt correctly with a Qwen3.5 9B
-  and a Qwen3.8 27B (the 27B's last weights on the CPU). That card's speeds say nothing of
-  a Mac's and are not given here.
+- **Right answers under those limits** (the same RTX 5090): a Llama 3B and a Gemma 3 4B
+  chained answer as their host paths (64 greedy steps the same, logits' cosine 1.000000);
+  the server with a 24 GB Mac's share (`--webgpu-gb 12`) answered a 2,786-token prompt
+  correctly with a Qwen3.5 9B and a Qwen3.8 27B Q3_K_M, and said of each that its weights
+  were all on the GPU (5.1 GB and 12.5 GB), the 27B on its chained path. That card's
+  speeds say nothing of a Mac's and are not given here.
 - **A model on the CPU alone, from the file** (`--backend cpu`, Windows): a Qwen3.5 9B
   (a 5.7 GB file) took 2.5 GB of memory of its own, the weights none of it; held to 3.1 GB
   of memory resident, less than its file, it gave the same reply, in 44 s where 7.7 s
@@ -166,7 +164,8 @@ Nothing here has run on a Mac. What was done instead, on a Windows PC:
   stand-ins for a Mac's programs.
 - **One hazard met ahead of time:** a GPU's `tanh` made of exponentials gives no number
   past an argument of a few dozen (others have met it on Metal). The kernels hold its
-  argument to 15 either way, where the result is what it was, to the last bit.
+  argument to 15 either way, where the result is what it was: four LTX clips made with
+  the changed kernels are, byte for byte, the files made before.
 
 **Not checked:** the build on a Mac; Apple's compiler on the kernels and its arithmetic
 (it compiles with fast math); that Metal accepts what wgpu's own checks accept; any speed;
@@ -203,7 +202,8 @@ or Linux at all.
      8,192 tokens unless set (tinygrad's own default is 4,096, less than an agent's prompt
      with its tools).
    - *When the card is not there, answer with*: the same model on the Mac's own GPU, or
-     another model of yours. On a 24 GB Mac with a 27B on the card, name a smaller one.
+     another model of yours. On a 24 GB Mac with a 27B's 4-bit file on the card, name a
+     smaller one: that file does not fit the Mac's own GPU (its 3-bit file does, just).
    - Tick **Use the eGPU** and save.
 3. **Models:** tick **On the eGPU** on each model that should run there. Only a model that
    is one `.gguf` file can be: tinygrad's server reads nothing else.
