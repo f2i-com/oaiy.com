@@ -825,3 +825,215 @@ fn experts_routed_on_the_gpu_are_the_hosts() {
         }
     }
 }
+
+/// A LoRA adapter's pairs for a layer of `count` routed experts and the shared one (the last), as `Experts::low_rank`
+/// takes them: the experts `with` have one of `rank` beside a projection `k -> n` (a slot each, in that order), values
+/// a seed makes, large beside the made experts' own outputs (so a wrong update shows).
+fn lora_pairs(count: usize, with: &[usize], rank: usize, k: usize, n: usize, seed: u32) -> Option<(Vec<u32>, Vec<f32>, Vec<f32>, usize)> {
+    let mut s = seed;
+    let mut next = || {
+        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        ((s >> 8) % 2001) as f32 / 1000.0 - 1.0
+    };
+    let mut slot_of = vec![u32::MAX; count + 1];
+    for (slot, &e) in with.iter().enumerate() {
+        slot_of[e] = slot as u32;
+    }
+    let a = (0..with.len() * rank * k).map(|_| next() * 0.3).collect();
+    let b = (0..with.len() * n * rank).map(|_| next() * 2.0).collect();
+    Some((slot_of, a, b, rank))
+}
+
+type Pairs = [Option<(Vec<u32>, Vec<f32>, Vec<f32>, usize)>; 3];
+
+/// [`reference`] with low-rank updates beside the experts' gate, up and down projections (`lora[which]`): each
+/// projection's output plus `b (a x)` of its input, the sums in f64.
+fn reference_adapted(experts: Vec<[Exl3Data; 3]>, lora: &Pairs, x: &[f32], logits: &[f32], top_k: usize) -> Vec<f32> {
+    let p: Vec<[Exl3Cpu; 3]> = experts.into_iter().map(|[g, u, d]| [Exl3Cpu::new(g).unwrap(), Exl3Cpu::new(u).unwrap(), Exl3Cpu::new(d).unwrap()]).collect();
+    let (h, width) = (p[0][0].t.k, p.len());
+    let update = |which: usize, e: usize, x: &[f32], y: &mut [f32]| {
+        let Some((slot_of, a, b, rank)) = &lora[which] else { return };
+        if slot_of[e] == u32::MAX {
+            return;
+        }
+        let (s, k, n) = (slot_of[e] as usize, x.len(), y.len());
+        let low: Vec<f64> = (0..*rank).map(|r| (0..k).map(|c| a[(s * rank + r) * k + c] as f64 * x[c] as f64).sum()).collect();
+        for (i, yv) in y.iter_mut().enumerate() {
+            *yv += (0..*rank).map(|r| b[(s * n + i) * rank + r] as f64 * low[r]).sum::<f64>() as f32;
+        }
+    };
+    let mut out = vec![];
+    for (r, row) in x.chunks_exact(h).enumerate() {
+        let xr = Tensor::from_vec(row.to_vec(), vec![1, h]);
+        let mut acc = vec![0f32; h];
+        for (e, w) in route(&logits[r * width..(r + 1) * width], top_k) {
+            let mut g = p[e][0].linear(&xr).data().to_vec();
+            update(0, e, row, &mut g);
+            let mut u = p[e][1].linear(&xr).data().to_vec();
+            update(1, e, row, &mut u);
+            let hid: Vec<f32> = g.iter().zip(&u).map(|(&g, &u)| g / (1.0 + (-g).exp()) * u).collect();
+            let f = hid.len();
+            let mut d = p[e][2].linear(&Tensor::from_vec(hid.clone(), vec![1, f])).data().to_vec();
+            update(2, e, &hid, &mut d);
+            for (a, v) in acc.iter_mut().zip(&d) {
+                *a += w * v;
+            }
+        }
+        out.extend(acc);
+    }
+    out
+}
+
+/// A LoRA adapter's low-rank updates beside a layer's experts (`Experts::low_rank`) are the definition's sums: the
+/// routed experts' in their groups' kernels and the shared expert's beside its projections on the GPU, and on the
+/// host's path with its projections on the CPU or a dispatch each. A step's (its kept scratch, twice), a check's few
+/// rows routed on the GPU (each row its own step's, to the bit), a prompt's rows by blocks; a gate and an up update of
+/// different ranks in one group; experts with no update beside ones with; and an update whose B is zeros leaves the
+/// layer as it was. Made experts and made pairs: 256 wide, 8 or 40 experts.
+#[test]
+fn a_low_rank_update_beside_the_experts_is_its_definition_on_the_gpu_and_the_host() {
+    let (count, hidden, ff, top_k, tw) = (8, 256, 128, 3, 48);
+    let lora: Pairs = [
+        lora_pairs(count, &[2, count], 2, hidden, ff, 5),
+        lora_pairs(count, &[2, 5], 4, hidden, ff, 6),
+        lora_pairs(count, &[1, 3, 4, 6, count], 2, ff, hidden, 7),
+    ];
+    let none: Pairs = [None, None, None];
+    // (by the sums' size: the made updates take them to tens, in terms that partly cancel, and the shared expert's
+    // update goes through f16, its pairs as they are held and a prompt's rows as the tensor cores read them: a part in
+    // 2,000 of a term at most. An update left out, or another expert's, is wrong by the sums' own size.)
+    let near = |actual: &[f32], expected: &[f32], what: &str| {
+        assert_eq!(actual.len(), expected.len(), "{what}");
+        let size = expected.iter().fold(0f32, |m, v| m.max(v.abs()));
+        for (i, (a, e)) in actual.iter().zip(expected).enumerate() {
+            assert!((a - e).abs() <= 0.003 + 1e-3 * size, "{what} [{i}]: {a} != {e} (sums up to {size})");
+        }
+    };
+    let adapt = |e: &mut Box<dyn ggml_rs::exl3::Experts>, lora: &Pairs| {
+        for (which, l) in lora.iter().enumerate() {
+            let (s, a, b, r) = l.as_ref().unwrap();
+            e.low_rank(which, s, a, b, *r).unwrap();
+        }
+    };
+    for rows in [1usize, 7] {
+        let x: Vec<f32> = (0..rows * hidden).map(|i| ((i * 37 % 101) as f32 - 50.0) / 60.0).collect();
+        let logits: Vec<f32> = (0..rows * (count + 1)).map(|i| ((i * 53 % 29) as f32 - 14.0) / 7.0).collect();
+        let want = reference_adapted(experts(count, hidden, ff, tw), &lora, &x, &logits, top_k);
+        let plain = reference_adapted(experts(count, hidden, ff, tw), &none, &x, &logits, top_k);
+        close(&plain, &reference(experts(count, hidden, ff, tw), &x, &logits, top_k), "the definition with no update");
+        let moved = want.iter().zip(&plain).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        let size = plain.iter().fold(0f32, |m, v| m.max(v.abs()));
+        assert!(moved > 10.0 * size.max(0.01), "the updates are most of the layer's sums: they move them by {moved} at most, where the sums without are up to {size}");
+        let xt = Tensor::from_vec(x.clone(), vec![rows, hidden]);
+        let lt = Tensor::from_vec(logits.clone(), vec![rows, count + 1]);
+        let mut cpu = exl3_experts_cpu(experts(count, hidden, ff, tw)).unwrap();
+        adapt(&mut cpu, &lora);
+        near(cpu.forward(&xt, &lt, top_k).data(), &want, &format!("adapted cpu moe rows={rows}"));
+        let Some(b) = backend() else { continue };
+        let mut gpu = b.exl3_experts(experts(count, hidden, ff, tw)).unwrap();
+        assert!(format!("{gpu:?}").contains("Exl3MoeGrouped"), "{gpu:?}");
+        adapt(&mut gpu, &lora);
+        near(gpu.forward(&xt, &lt, top_k).data(), &want, &format!("adapted grouped moe rows={rows}"));
+        if rows == 1 {
+            let assign = vec![route(&logits, top_k)];
+            let (xd, out) = (b.vec(hidden), b.vec(hidden));
+            DeviceChain::upload(&b, &xd, &x);
+            for _ in 0..2 {
+                let mut rec = b.begin();
+                rec.moe_rows(gpu.as_ref(), &xd, &out, &assign);
+                rec.read(&out);
+                near(&rec.finish().pop().unwrap(), &want, "adapted chained moe");
+            }
+        }
+        drop(gpu);
+        // each projection a dispatch of its own on the GPU, the sums the host's
+        let each: Vec<[Proj; 3]> = experts(count, hidden, ff, tw).into_iter().map(|[g, u, d]| [b.proj(g, 0).unwrap(), b.proj(u, 0).unwrap(), b.proj(d, 0).unwrap()]).collect();
+        let mut host: Box<dyn ggml_rs::exl3::Experts> = Box::new(Exl3MoeHost::new(each, Some((Arc::clone(&b.gpu), Arc::clone(&b.serial)))).unwrap());
+        adapt(&mut host, &lora);
+        near(host.forward(&xt, &lt, top_k).data(), &want, &format!("adapted gpu moe rows={rows}"));
+    }
+    let Some(b) = backend() else { return };
+    // routed on the GPU: a step, and a check's rows, each row its own step's bits; kept scratch and not
+    let (count, top_k) = (40, 6);
+    let lora: Pairs = [
+        lora_pairs(count, &[3, 7, 21, count], 2, hidden, ff, 15),
+        lora_pairs(count, &[3, 8], 4, hidden, ff, 16),
+        lora_pairs(count, &[0, 3, 5, 9, 17, 22, 31, 39, count], 2, ff, hidden, 17),
+    ];
+    let mut gpu = b.exl3_experts(experts(count, hidden, ff, tw)).unwrap();
+    adapt(&mut gpu, &lora);
+    let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+    let width = count + 1;
+    for rows in [1usize, 2, 5] {
+        let xs: Vec<f32> = (0..rows * hidden).map(|i| ((i * 29 % 97) as f32 - 48.0) / 50.0).collect();
+        // (expert 3, which has every update, on every row)
+        let ls: Vec<f32> = (0..rows * width).map(|i| if i % width == 3 { 4.0 } else { ((i * 53 % 89) as f32 - 44.0) / 15.0 }).collect();
+        let want = reference_adapted(experts(count, hidden, ff, tw), &lora, &xs, &ls, top_k);
+        let (xr, lr, yr) = (b.vec(rows * hidden), b.vec(rows * width), b.vec(rows * hidden));
+        DeviceChain::upload(&b, &xr, &xs);
+        DeviceChain::upload(&b, &lr, &ls);
+        for keep in [true, false] {
+            let began = std::time::Instant::now();
+            let mut rec = b.begin();
+            rec.keep_groups(keep);
+            assert!(rec.moe_routed(gpu.as_ref(), &xr, &yr, &lr, top_k, rows), "{rows} rows route on the GPU");
+            rec.read(&yr);
+            let got = rec.finish().pop().unwrap();
+            eprintln!("    adapted experts routed on the GPU: {rows} rows, keep {keep}: {:.2} ms", began.elapsed().as_secs_f64() * 1e3);
+            near(&got, &want, &format!("adapted {rows} rows routed on the GPU, keep {keep}"));
+            for r in 0..rows {
+                let (x1, l1, y1) = (b.vec(hidden), b.vec(width), b.vec(hidden));
+                DeviceChain::upload(&b, &x1, &xs[r * hidden..(r + 1) * hidden]);
+                DeviceChain::upload(&b, &l1, &ls[r * width..(r + 1) * width]);
+                let mut rec = b.begin();
+                rec.keep_groups(keep);
+                assert!(rec.moe_routed(gpu.as_ref(), &x1, &y1, &l1, top_k, 1));
+                rec.read(&y1);
+                assert_eq!(bits(&got[r * hidden..(r + 1) * hidden]), bits(&rec.finish().pop().unwrap()), "adapted {rows} rows keep {keep}: row {r} is its step");
+            }
+        }
+    }
+    // a prompt's rows: routed and grouped by expert on the GPU where the tensor cores take them, and the host's routing
+    for rows in [9usize, 40, 130] {
+        let xs: Vec<f32> = (0..rows * hidden).map(|i| ((i * 29 % 97) as f32 - 48.0) / 50.0).collect();
+        let ls: Vec<f32> = (0..rows * width)
+            .map(|i| match i % width {
+                3 => 4.0,
+                39 => -9.0,
+                e => (((i / width) * 7 + e * 13) % 31) as f32 / 10.0 - 1.5,
+            })
+            .collect();
+        let want = reference_adapted(experts(count, hidden, ff, tw), &lora, &xs, &ls, top_k);
+        let assign: Vec<Vec<(usize, f32)>> = (0..rows).map(|r| route(&ls[r * width..(r + 1) * width], top_k)).collect();
+        let (xr, lr, on_gpu, on_host) = (b.vec(rows * hidden), b.vec(rows * width), b.vec(rows * hidden), b.vec(rows * hidden));
+        DeviceChain::upload(&b, &xr, &xs);
+        DeviceChain::upload(&b, &lr, &ls);
+        let began = std::time::Instant::now();
+        let mut rec = b.begin();
+        rec.keep_groups(false);
+        let routed = coop_on(&b.gpu) && rec.moe_routed(gpu.as_ref(), &xr, &on_gpu, &lr, top_k, rows);
+        rec.moe_rows(gpu.as_ref(), &xr, &on_host, &assign);
+        if routed {
+            rec.read(&on_gpu);
+        }
+        rec.read(&on_host);
+        let mut got = rec.finish();
+        eprintln!("    adapted experts of a prompt's {rows} rows (routed on the GPU: {routed}): {:.2} ms", began.elapsed().as_secs_f64() * 1e3);
+        near(&got.pop().unwrap(), &want, &format!("adapted {rows} rows routed on the host"));
+        if routed {
+            near(&got.pop().unwrap(), &want, &format!("adapted {rows} rows routed on the GPU"));
+        }
+    }
+    // an update whose B is zeros adds nothing
+    let (slot_of, a, bm, rank) = lora[2].clone().unwrap();
+    let mut zeros = b.exl3_experts(experts(count, hidden, ff, tw)).unwrap();
+    zeros.low_rank(2, &slot_of, &a, &vec![0.0; bm.len()], rank).unwrap();
+    let plain = b.exl3_experts(experts(count, hidden, ff, tw)).unwrap();
+    let xs: Vec<f32> = (0..3 * hidden).map(|i| ((i * 29 % 97) as f32 - 48.0) / 50.0).collect();
+    let ls: Vec<f32> = (0..3 * width).map(|i| ((i * 53 % 89) as f32 - 44.0) / 15.0).collect();
+    let (xt, lt) = (Tensor::from_vec(xs, vec![3, hidden]), Tensor::from_vec(ls, vec![3, width]));
+    assert_eq!(zeros.forward(&xt, &lt, top_k).data(), plain.forward(&xt, &lt, top_k).data(), "an update of zeros");
+    // and an update the experts cannot take is refused, not dropped
+    assert!(zeros.low_rank(2, &slot_of[..count], &a, &bm, rank).is_err(), "pairs for another count of experts");
+    assert!(zeros.low_rank(2, &slot_of, &a, &bm, rank).is_err(), "a second update of the same matrices");
+}

@@ -589,8 +589,8 @@ impl Models {
         let tower_backend = backends.last().map(Arc::clone);
         let model = crate::flashnext::load_portable_with(&spec.path, backends, &adapters, &packed, &experts, o.mtp.contains(&spec.name)).map_err(|e| match adapters.is_empty() {
             true => e,
-            // (an adapter's target nothing took: the routed experts' are not applied on WebGPU yet)
-            false => Error::Arg(format!("{}: {e} (a LoRA that adapts the routed experts is not applied on WebGPU yet; one for the attention and dense projections is)", spec.name)),
+            // (an adapter's target that no matrix of the model took, or experts that take no update)
+            false => Error::Arg(format!("{}: {e} (a LoRA is applied beside the attention, dense and expert projections of the model; this one names something else, or experts that take none)", spec.name)),
         })?;
         for (adapter, (path, strength)) in adapters.iter().zip(o.lora_adapters.get(&spec.name).into_iter().flatten()) {
             self.say(format!("Flash-Next: loaded LoRA {} for {} projections (strength {})", path.display(), adapter.len(), strength.unwrap_or(default_strength)));

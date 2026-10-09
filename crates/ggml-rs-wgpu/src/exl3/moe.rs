@@ -67,6 +67,111 @@ pub(crate) fn moe_rows_for(pairs: usize, experts: usize) -> usize {
     [16, 32, 64, 128].into_iter().find(|&b| b >= target).unwrap_or(128)
 }
 
+/// Low-rank updates (a LoRA adapter's `B (A x)`) beside some matrices of one shape, on the host: each matrix's slot
+/// ([`NONE`]: it has none) among the slots' A (`[slots, rank, k]`) and B (`[slots, n, rank]`, the adapter's scale in
+/// it). No rank: none.
+#[derive(Clone, Default)]
+pub(super) struct LoraTables {
+    slot: Vec<u32>,
+    a: Vec<f32>,
+    b: Vec<f32>,
+    rank: usize,
+}
+
+impl LoraTables {
+    /// These (of `matrices` matrices, all without an update where there are none yet) with the updates `a` (`[slots,
+    /// rank, k]`) and `b` (`[slots, n, rank]`) beside the matrices `at` names (a matrix and its slot in them), at the
+    /// larger of the two ranks: the other's further rows of A and columns of B are zeros, which add nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn with(mut self, matrices: usize, at: &[(usize, u32)], a: &[f32], b: &[f32], rank: usize, k: usize, n: usize) -> Result<Self, String> {
+        if rank == 0 || a.is_empty() || a.len() % (rank * k) != 0 || b.len() != a.len() / (rank * k) * n * rank {
+            return Err(format!("a rank {rank} update of {} and {} floats beside projections [{n}, {k}]", a.len(), b.len()));
+        }
+        let slots = a.len() / (rank * k);
+        if self.slot.is_empty() {
+            self.slot = vec![NONE; matrices];
+        }
+        let to = self.rank.max(rank);
+        let pad = |a: &[f32], b: &[f32], from: usize| -> (Vec<f32>, Vec<f32>) {
+            if from == to {
+                return (a.to_vec(), b.to_vec());
+            }
+            (
+                a.chunks_exact(from * k).flat_map(|s| s.iter().copied().chain(std::iter::repeat_n(0.0, (to - from) * k))).collect(),
+                b.chunks_exact(from).flat_map(|row| row.iter().copied().chain(std::iter::repeat_n(0.0, to - from))).collect(),
+            )
+        };
+        let before = if self.rank == 0 { 0 } else { self.a.len() / (self.rank * k) };
+        let (mut a_all, mut b_all) = if before == 0 { (Vec::new(), Vec::new()) } else { pad(&self.a, &self.b, self.rank) };
+        let (a_new, b_new) = pad(a, b, rank);
+        a_all.extend(a_new);
+        b_all.extend(b_new);
+        for &(m, s) in at {
+            if m >= matrices || s as usize >= slots {
+                return Err(format!("a low-rank update's slot {s} of {slots} for matrix {m} of {matrices}"));
+            }
+            if self.slot[m] != NONE {
+                return Err(format!("matrix {m} has a low-rank update already"));
+            }
+            self.slot[m] = (before + s as usize) as u32;
+        }
+        Ok(LoraTables { slot: self.slot, a: a_all, b: b_all, rank: to })
+    }
+
+    /// The update of matrix `m` (`[n, k]`) added to `y` (`[rows, n]`) for its inputs `x` (`[rows, k]`), as the kernels
+    /// add it ([`LORA_A`], [`LORA_B`]): nothing where the matrix has none.
+    fn add(&self, m: usize, k: usize, n: usize, x: &[f32], y: &mut [f32]) {
+        if self.rank == 0 || self.slot[m] == NONE {
+            return;
+        }
+        let (s, r) = (self.slot[m] as usize, self.rank);
+        let (a, b) = (&self.a[s * r * k..(s + 1) * r * k], &self.b[s * n * r..(s + 1) * n * r]);
+        let mut low = vec![0f32; r];
+        for (xr, yr) in x.chunks_exact(k).zip(y.chunks_exact_mut(n)) {
+            for (lo, ar) in low.iter_mut().zip(a.chunks_exact(k)) {
+                *lo = ar.iter().zip(xr).map(|(a, x)| a * x).sum();
+            }
+            for (yv, br) in yr.iter_mut().zip(b.chunks_exact(r)) {
+                *yv += br.iter().zip(&low).map(|(b, l)| b * l).sum::<f32>();
+            }
+        }
+    }
+}
+
+/// A group's low-rank updates on its device: [`LoraTables`] as storage buffers (the slots a matrix's, A and B f32),
+/// and the vectors a step's and a check's `A x` go through (kept, as their bind groups are; a prompt's are its
+/// recording's).
+struct GroupLora {
+    /// The host's copy: a second update (the up projections' beside the gates') is merged into it.
+    host: LoraTables,
+    slot: DeviceVec,
+    a: DeviceVec,
+    b: DeviceVec,
+    low: Mutex<Vec<DeviceVec>>,
+}
+
+impl GroupLora {
+    fn new(b: &WgpuBackend, host: LoraTables) -> GroupLora {
+        let up = |v: &[f32]| {
+            let d = b.vec(v.len());
+            DeviceChain::upload(b, &d, v);
+            d
+        };
+        GroupLora { slot: u32_vec(b, &host.slot), a: up(&host.a), b: up(&host.b), low: Mutex::new(Vec::new()), host }
+    }
+
+    /// The kept vector of `len` floats (one a length: a step's, each of a check's row counts).
+    fn kept(&self, b: &WgpuBackend, len: usize) -> DeviceVec {
+        let mut kept = self.low.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(v) = kept.iter().find(|v| v.len == len) {
+            return v.clone();
+        }
+        let v = b.vec(len);
+        kept.push(v.clone());
+        v
+    }
+}
+
 /// One kind of a layer's routed experts' projection as a group (their gate and up matrices, or their down ones): their
 /// words in one buffer, a matrix's after another, and their transforms' tables (the maps the identity).
 pub(super) struct Group {
@@ -113,7 +218,11 @@ pub struct Exl3MoeGrouped {
     ff: usize,
     pub(super) gu: Group,
     down: Group,
-    shared: [Exl3Gpu; 3],
+    /// The shared expert's projections: EXL3 ones, each with an adapter's low-rank update beside it where it has one.
+    shared: [Arc<dyn PackedLinear>; 3],
+    /// The routed experts' low-rank updates (a LoRA adapter's): the gate and up group's, the down group's.
+    gu_lora: Option<GroupLora>,
+    down_lora: Option<GroupLora>,
 }
 
 impl std::fmt::Debug for Exl3MoeGrouped {
@@ -193,8 +302,9 @@ impl Exl3MoeGrouped {
         if shared.iter().any(|s| s.single_chunk().is_none()) {
             return Ok(None);
         }
+        let shared = shared.map(|s| Arc::new(s) as Arc<dyn PackedLinear>);
         // the routed groups' bytes stay counted as long as the layer lives
-        Ok(Some(Exl3MoeGrouped { b: b.clone(), routed: routed.len(), hidden, ff, gu, down, shared }))
+        Ok(Some(Exl3MoeGrouped { b: b.clone(), routed: routed.len(), hidden, ff, gu, down, shared, gu_lora: None, down_lora: None }))
     }
 
     pub(crate) fn is_on(&self, gpu: &Arc<Gpu>) -> bool {
@@ -295,6 +405,26 @@ impl Exl3MoeGrouped {
         rec.dispatch_wide("exl3-post", chain_shader("post"), [&pb, &svh, &jb, &d, &d, &d, &yb, &drw], &[g.n as u32, splits], ((g.n / 128) as u32, count as u32, 1));
     }
 
+    /// A group's low-rank updates added to its jobs' outputs `y`, after its pass ([`LORA_A`], [`LORA_B`]): `x`,
+    /// `pairs`, `jobs` and `count` as [`Self::group_pass`] took them. `kept`: a step's or a check's (the vector between
+    /// the two kernels the layer's own, kept).
+    #[allow(clippy::too_many_arguments)]
+    fn group_lora(&self, rec: &mut crate::chain::Recorder<'_>, l: &GroupLora, g: &Group, x: &DeviceVec, pairs: bool, jobs: &DeviceVec, count: usize, y: &DeviceVec, kept: bool) {
+        let rank = l.host.rank;
+        assert!(count > 0 && (count * g.n.max(rank)) as u64 <= u32::MAX as u64 && y.len >= count * g.n, "moe: {count} jobs' low-rank updates of rank {rank}");
+        let low = if kept { l.kept(&self.b, count * rank) } else { rec.scratch(count * rank) };
+        let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
+        let d = rec.gpu().dummy().clone();
+        let drw = rec.gpu().dummy_rw().clone();
+        let grid = |total: usize| {
+            let groups = (total as u32).div_ceil(256);
+            (groups.min(65535), groups.div_ceil(65535), 1)
+        };
+        let (sb, jb, lb) = (buf(&l.slot), buf(jobs), buf(&low));
+        rec.dispatch_wide("moe-lora-a", LORA_A, [&buf(x), &buf(&l.a), &sb, &jb, &d, &d, &lb, &drw], &[g.k as u32, rank as u32, count as u32, pairs as u32], grid(count * rank));
+        rec.dispatch_wide("moe-lora-b", LORA_B, [&lb, &buf(&l.b), &sb, &jb, &d, &d, &buf(y), &drw], &[g.n as u32, rank as u32, count as u32], grid(count * g.n));
+    }
+
     /// Record `assign`'s experts for each row of `x` into `out` (see `ChainRecorder::moe_rows`).
     pub(crate) fn record(&self, rec: &mut crate::chain::Recorder<'_>, x: &DeviceVec, out: &DeviceVec, assign: &[Vec<(usize, f32)>]) {
         let rows = assign.len();
@@ -335,7 +465,7 @@ impl Exl3MoeGrouped {
             Some(((g, gn), (d, dn))) => (Order::Many(g, *gn, block), Order::Many(d, *dn, block)),
             None => (Order::Jobs, Order::Jobs),
         };
-        self.run(rec, &st, x, out, rows, ogu, od, None);
+        self.run(rec, &st, x, out, rows, ogu, od, None, rows == 1 && rec.keeps());
     }
 
     /// `rows` rows' experts (a step's one, a check's few) routed on the GPU from the router's `logits` (`[rows, routed +
@@ -351,7 +481,8 @@ impl Exl3MoeGrouped {
         }
         assert!(x.len >= rows * self.hidden && (into.is_some() || out.len >= rows * self.hidden), "moe: {rows} rows of {}", self.hidden);
         // (a prompt's orders its own: the scratch's are a check's; its scratch the recording's, each layer's in turn)
-        let st = if rec.keeps() && !many {
+        let kept = rec.keeps() && !many;
+        let st = if kept {
             self.step(rows, top_k)
         } else if many {
             let key = [rows, top_k, self.hidden, self.ff];
@@ -389,7 +520,7 @@ impl Exl3MoeGrouped {
             rec.dispatch_wide("moe-many-count", MANY_COUNT, [&jd, &d, &d, &d, &d, &d, &drw, &buf(&od)], &words, ((pairs as u32).div_ceil(256), 1, 1));
             rec.dispatch_wide("moe-many-scan", MANY_SCAN, [&d, &d, &d, &d, &d, &d, &drw, &buf(&od)], &words, (1, 1, 1));
             rec.dispatch_wide("moe-many-scatter", MANY_SCATTER, [&jd, &d, &d, &d, &d, &d, &buf(&og), &buf(&od)], &words, ((pairs as u32).div_ceil(256), 1, 1));
-            self.run(rec, &st, x, out, rows, Order::Many(&og, 2 * blocks, bs), Order::Many(&od, blocks, bs), into);
+            self.run(rec, &st, x, out, rows, Order::Many(&og, 2 * blocks, bs), Order::Many(&od, blocks, bs), into, kept);
             return true;
         }
         // a check's few rows: an expert the rows share decoded once for them (its jobs one block; OAIY_MOE_UNGROUPED:
@@ -401,25 +532,33 @@ impl Exl3MoeGrouped {
         } else {
             (Order::Jobs, Order::Jobs)
         };
-        self.run(rec, &st, x, out, rows, ogu, od, into);
+        self.run(rec, &st, x, out, rows, ogu, od, into, kept);
         true
     }
 
     /// The experts' work once `st` holds the jobs and weights: gate and up, SwiGLU, down, the shared expert on every
     /// row, and each row's weighted sum (into `out`, or added to the streams `into` names); the gate and up jobs taken as
-    /// `ogu` has them, the down jobs as `od`, each SwiGLU computed as its down projection reads it.
+    /// `ogu` has them, the down jobs as `od`, each SwiGLU computed as its down projection reads it. An adapter's
+    /// low-rank updates are added to each group's outputs after its pass, and are part of the shared expert's
+    /// projections (`kept`: `st` is a step's or a check's kept scratch).
     #[allow(clippy::too_many_arguments)]
-    fn run(&self, rec: &mut crate::chain::Recorder<'_>, st: &Step, x: &DeviceVec, out: &DeviceVec, rows: usize, ogu: Order<'_>, od: Order<'_>, into: Option<(&DeviceVec, &DeviceVec, usize)>) {
+    fn run(&self, rec: &mut crate::chain::Recorder<'_>, st: &Step, x: &DeviceVec, out: &DeviceVec, rows: usize, ogu: Order<'_>, od: Order<'_>, into: Option<(&DeviceVec, &DeviceVec, usize)>, kept: bool) {
         use ggml_rs::ChainRecorder;
         let (h, top_k) = (self.hidden, st.top_k);
         let pairs = rows * top_k;
         let (jgu, jd, wv, xh_gu, part_gu, out_gu, xh_d, part_d, out_d, sg, su, sd) = (&st.jobs_gu, &st.jobs_d, &st.w, &st.xh_gu, &st.part_gu, &st.out_gu, &st.xh_d, &st.part_d, &st.out_d, &st.sg, &st.su, &st.sd);
         self.group_pass(rec, &self.gu, x, false, jgu, 2 * pairs, ogu, xh_gu, part_gu, out_gu);
+        if let Some(l) = &self.gu_lora {
+            self.group_lora(rec, l, &self.gu, x, false, jgu, 2 * pairs, out_gu, kept);
+        }
         self.group_pass(rec, &self.down, out_gu, true, jd, pairs, od, xh_d, part_d, out_d);
+        if let Some(l) = &self.down_lora {
+            self.group_lora(rec, l, &self.down, out_gu, true, jd, pairs, out_d, kept);
+        }
         // the shared expert on every row
-        rec.exl3_rows(&self.shared[0], x, sg, rows);
-        rec.exl3_rows(&self.shared[1], x, su, rows);
-        rec.exl3_rows_swiglu(&self.shared[2], sg, su, sd, rows);
+        rec.exl3_rows(&*self.shared[0], x, sg, rows);
+        rec.exl3_rows(&*self.shared[1], x, su, rows);
+        rec.exl3_rows_swiglu(&*self.shared[2], sg, su, sd, rows);
         let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
         let d = rec.gpu().dummy().clone();
         let drw = rec.gpu().dummy_rw().clone();
@@ -455,6 +594,35 @@ impl ggml_rs::exl3::Experts for Exl3MoeGrouped {
         let y = rec.finish().pop().expect("the experts' sum");
         Tensor::from_vec(y, vec![rows, h])
     }
+
+    fn low_rank(&mut self, which: usize, slot_of: &[u32], a: &[f32], b: &[f32], rank: usize) -> Result<(), String> {
+        if which > 2 || slot_of.len() != self.routed + 1 {
+            return Err(format!("a low-rank update of projection {which} for {} experts, of {} and the shared one", slot_of.len(), self.routed));
+        }
+        let (k, n) = if which == 2 { (self.ff, self.hidden) } else { (self.hidden, self.ff) };
+        if rank == 0 || a.is_empty() || a.len() % (rank * k) != 0 || b.len() != a.len() / (rank * k) * n * rank {
+            return Err(format!("a rank {rank} update of {} and {} floats beside experts' projections [{n}, {k}]", a.len(), b.len()));
+        }
+        let slots = a.len() / (rank * k);
+        if slot_of.iter().any(|&s| s != NONE && s as usize >= slots) {
+            return Err(format!("a low-rank update names a slot past its {slots}"));
+        }
+        let backend = self.b.clone();
+        // the shared expert's: beside its projection, as any packed projection's (a chain runs it with the projection)
+        if slot_of[self.routed] != NONE {
+            let s = slot_of[self.routed] as usize;
+            self.shared[which] = backend.low_rank(Arc::clone(&self.shared[which]), a[s * rank * k..(s + 1) * rank * k].to_vec(), b[s * n * rank..(s + 1) * n * rank].to_vec(), rank)?;
+        }
+        // the routed experts': beside their group's matrices (gate `2e` and up `2e + 1` of one group, down `e` of the other)
+        let at: Vec<(usize, u32)> = slot_of[..self.routed].iter().enumerate().filter(|(_, &s)| s != NONE).map(|(e, &s)| (if which == 2 { e } else { 2 * e + which }, s)).collect();
+        if at.is_empty() {
+            return Ok(());
+        }
+        let (matrices, group) = if which == 2 { (self.routed, &mut self.down_lora) } else { (2 * self.routed, &mut self.gu_lora) };
+        let host = group.take().map(|l| l.host).unwrap_or_default().with(matrices, &at, a, b, rank, k, n)?;
+        *group = Some(GroupLora::new(&backend, host));
+        Ok(())
+    }
 }
 
 /// One projection of an expert: its packed weights on the GPU, or decoded on the CPU.
@@ -485,6 +653,8 @@ pub struct Exl3MoeHost {
     hidden: usize,
     ff: usize,
     gpu: Option<(Arc<Gpu>, Arc<Mutex<()>>)>,
+    /// An adapter's low-rank updates beside the experts' gate, up and down projections (an expert a matrix).
+    lora: [LoraTables; 3],
 }
 
 impl std::fmt::Debug for Exl3MoeHost {
@@ -504,7 +674,7 @@ impl Exl3MoeHost {
                 return Err("every expert needs gate and up of hidden -> ff, and down of ff -> hidden".into());
             }
         }
-        Ok(Self { experts, hidden, ff, gpu })
+        Ok(Self { experts, hidden, ff, gpu, lora: Default::default() })
     }
 
     /// Each job's projection applied to its prepared rows: `(expert, which projection, rows [count, k])`. The GPU's
@@ -597,9 +767,19 @@ impl ggml_rs::exl3::Experts for Exl3MoeHost {
                 jobs.push((e, which, xh));
             }
         }
-        let gu = self.batch(&jobs);
+        let mut gu = self.batch(&jobs);
+        // (an adapter's low-rank updates of the gate and up projections, from each expert's rows as they are)
+        if self.lora[0].rank != 0 || self.lora[1].rank != 0 {
+            for (n, &e) in used.iter().enumerate() {
+                let rows: Vec<f32> = by_expert[e].iter().flat_map(|&(r, _)| x.data()[r * h..(r + 1) * h].iter().copied()).collect();
+                for which in 0..2 {
+                    self.lora[which].add(e, h, f, &rows, &mut gu[2 * n + which]);
+                }
+            }
+        }
         // silu(gate) * up, then down, every expert's rows at once.
         let mut jobs = Vec::new();
+        let mut hiddens = Vec::with_capacity(used.len());
         for (n, &e) in used.iter().enumerate() {
             let (g, u) = (&gu[2 * n], &gu[2 * n + 1]);
             let hidden: Vec<f32> = g.iter().zip(u).map(|(&g, &u)| g / (1.0 + (-g).exp()) * u).collect();
@@ -609,8 +789,13 @@ impl ggml_rs::exl3::Experts for Exl3MoeHost {
                 t.pre(&hidden[slot * f..(slot + 1) * f], &mut xh[slot * f..(slot + 1) * f]);
             }
             jobs.push((e, 2, xh));
+            hiddens.push(hidden);
         }
-        let down = self.batch(&jobs);
+        let mut down = self.batch(&jobs);
+        // (and of the down projections, from each SwiGLU's product)
+        for ((&e, hidden), y) in used.iter().zip(&hiddens).zip(&mut down) {
+            self.lora[2].add(e, f, h, hidden, y);
+        }
         // Each row's experts summed in its own order, each weighted: the same sum every run.
         let mut placed: Vec<Vec<Option<&[f32]>>> = assign.iter().map(|a| vec![None; a.len()]).collect();
         for (n, &e) in used.iter().enumerate() {
@@ -628,5 +813,15 @@ impl ggml_rs::exl3::Experts for Exl3MoeHost {
             }
         }
         Tensor::from_vec(out, vec![rows, h])
+    }
+
+    fn low_rank(&mut self, which: usize, slot_of: &[u32], a: &[f32], b: &[f32], rank: usize) -> Result<(), String> {
+        if which > 2 || slot_of.len() != self.experts.len() {
+            return Err(format!("a low-rank update of projection {which} for {} experts, of {}", slot_of.len(), self.experts.len()));
+        }
+        let (k, n) = if which == 2 { (self.ff, self.hidden) } else { (self.hidden, self.ff) };
+        let at: Vec<(usize, u32)> = slot_of.iter().enumerate().filter(|(_, &s)| s != NONE).map(|(e, &s)| (e, s)).collect();
+        self.lora[which] = std::mem::take(&mut self.lora[which]).with(self.experts.len(), &at, a, b, rank, k, n)?;
+        Ok(())
     }
 }

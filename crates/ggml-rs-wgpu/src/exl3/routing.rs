@@ -279,3 +279,69 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     og[(2u * b + 1u) * bs + slot] = 2u * j + 1u;
 }
 "#;
+
+/// A group's low-rank updates (a LoRA adapter's `B (A x)` beside some of its matrices), the first half ([`LORA_B`] the
+/// second): job `j`'s `A x`, `low[j, r] = sum over c of a[s, r, c] * x[row, c]`, `s` the slot of the job's matrix
+/// (`slot[jobs[2j]]`; `0xffffffff`, none: zeros) and `row` its input row (`jobs[2j + 1]`). With `p[0].w` set the input is
+/// a SwiGLU computed as it is read, `silu(g) * u` of rows `2 row` and `2 row + 1` of `x` (a group's gate and up rows of
+/// one hidden row), as the down projections' input transform reads it. A thread a (job, rank row): a job's sums are
+/// its own whatever jobs are beside it, so a check's rows are their steps'. The tables are storage buffers. `p[0]`: k,
+/// rank, jobs, pairs.
+pub(crate) const LORA_A: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> a: array<f32>;
+@group(0) @binding(2) var<storage, read> slot: array<u32>;
+@group(0) @binding(3) var<storage, read> jobs: array<u32>;
+@group(0) @binding(6) var<storage, read_write> low: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let k = p[0].x;
+    let rank = p[0].y;
+    let i = id.x + id.y * 16776960u;
+    if (i >= p[0].z * rank) { return; }
+    let j = i / rank;
+    let s = slot[jobs[2u * j]];
+    var acc = 0.0;
+    if (s != 0xffffffffu) {
+        let row = jobs[2u * j + 1u];
+        let at = (s * rank + i % rank) * k;
+        if (p[0].w == 0u) {
+            for (var c = 0u; c < k; c++) { acc += a[at + c] * x[row * k + c]; }
+        } else {
+            for (var c = 0u; c < k; c++) {
+                let g = x[2u * row * k + c];
+                acc += a[at + c] * ((g / (1.0 + exp(-g))) * x[(2u * row + 1u) * k + c]);
+            }
+        }
+    }
+    low[i] = acc;
+}
+"#;
+
+/// [`LORA_A`]'s second half: `y[j, c] += sum over r of b[s, c, r] * low[j, r]`, a thread an output of a job (a job
+/// whose matrix has no update is left as it is). `p[0]`: n, rank, jobs.
+pub(crate) const LORA_B: &str = r#"
+@group(0) @binding(0) var<storage, read> low: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<storage, read> slot: array<u32>;
+@group(0) @binding(3) var<storage, read> jobs: array<u32>;
+@group(0) @binding(6) var<storage, read_write> y: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let n = p[0].x;
+    let rank = p[0].y;
+    let i = id.x + id.y * 16776960u;
+    if (i >= p[0].z * n) { return; }
+    let j = i / n;
+    let s = slot[jobs[2u * j]];
+    if (s == 0xffffffffu) { return; }
+    let at = (s * n + i % n) * rank;
+    var acc = 0.0;
+    for (var r = 0u; r < rank; r++) { acc += b[at + r] * low[j * rank + r]; }
+    y[i] = y[i] + acc;
+}
+"#;

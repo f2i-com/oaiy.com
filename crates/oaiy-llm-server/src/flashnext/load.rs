@@ -165,6 +165,21 @@ pub(super) fn expert_lora(lora: &[Adapter], m: &str, cfg: &Config, which: usize)
     Ok(Some((slot_of, a_all, b_all, rank)))
 }
 
+/// A layer's experts (`m`'s, as `make` made them) with the adapters' low-rank updates beside their gate, up and down
+/// projections, where the adapters have any: the experts apply them from now on, or the load fails saying they do
+/// not (an adapter's target is never read and then left out).
+pub(super) fn adapt_experts(lora: &[Adapter], m: &str, cfg: &Config, mut experts: Box<dyn Experts>) -> Result<Box<dyn Experts>> {
+    if lora.is_empty() {
+        return Ok(experts);
+    }
+    for (which, proj) in ["gate_proj", "up_proj", "down_proj"].into_iter().enumerate() {
+        if let Some((slot_of, a, b, rank)) = expert_lora(lora, m, cfg, which)? {
+            experts.low_rank(which, &slot_of, &a, &b, rank).map_err(|e| bad(format!("{m}: a LoRA for its experts' {proj}: {e}")))?;
+        }
+    }
+    Ok(experts)
+}
+
 /// The multi-token-prediction layer of the EXL3 checkpoint `idx` indexes (its `mtp.*`: an attention block and a MoE
 /// block behind their hyper-connections, the projections either side), on `device` as `last` makes its matrices and
 /// `make_experts` its experts: None where the checkpoint has none.
@@ -255,8 +270,8 @@ pub(crate) fn load_portable(path: &Path, backends: Vec<Arc<dyn Backend>>, packed
 }
 
 /// [`load_portable`] with `lora`'s adapters applied, together, as the weights load: beside each dense projection
-/// they adapt, on its device. An adapter that also adapts the routed experts is refused (its targets there are
-/// left over when the model is built: `experts` makes them as the checkpoint has them).
+/// they adapt, on its device, and beside the experts' projections (the shared expert's and the routed ones'), which
+/// the experts `experts` makes are then given ([`adapt_experts`]).
 pub(crate) fn load_portable_with(path: &Path, backends: Vec<Arc<dyn Backend>>, lora: &[Adapter], packed: Packer<'_>, experts: ExpertMaker<'_>, mtp: bool) -> Result<FlashNext> {
     build(path, backends, Vec::new(), lora, packed, experts, mtp)
 }
@@ -349,7 +364,7 @@ pub(super) fn build(path: &Path, backends: Vec<Arc<dyn Backend>>, cudas: Vec<Arc
         })?.into_iter().flatten().collect();
         let mut router = l.host(&format!("{m}.gate.weight"), cfg.experts * h, false, None)?;
         router.extend(l.host(&format!("{m}.shared_expert_gate.weight"), h, false, None)?);
-        let experts = make_experts(device, &m, experts)?;
+        let experts = adapt_experts(lora, &m, &cfg, make_experts(device, &m, experts)?)?;
         let moe = Moe {
             router: l.adapt(half_or_dense(cudas.get(device), &backends[device], router, cfg.experts + 1, h), &[
                 Part { name: format!("{m}.gate"), offset: 0, rows: cfg.experts, output: None },

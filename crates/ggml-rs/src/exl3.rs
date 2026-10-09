@@ -42,6 +42,15 @@ pub trait Experts: std::fmt::Debug + Send + Sync {
         let _ = shared;
         self.forward(x, logits, top_k)
     }
+    /// VENDORED-LOCAL: a low-rank update (a LoRA adapter's `B (A x)`) beside projection `which` (0 gate, 1 up, 2
+    /// down) of these experts, from now on: `slot_of[e]` is the place of expert `e`'s pair (the shared expert last),
+    /// `u32::MAX` where it has none, in `a` (`[slots, rank, k]`) and `b` (`[slots, n, rank]`, the adapter's scale in
+    /// it). The base weights are not rewritten. An error where these experts take none (the default): an adapter's
+    /// update must be applied or refused, never dropped.
+    fn low_rank(&mut self, which: usize, slot_of: &[u32], a: &[f32], b: &[f32], rank: usize) -> Result<(), String> {
+        let _ = (which, slot_of, a, b, rank);
+        Err("these experts take no low-rank update".into())
+    }
 }
 
 /// VENDORED-LOCAL: one row's experts and their weights, as the CUDA routing gives them: the `top_k` of the routed

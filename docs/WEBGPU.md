@@ -316,9 +316,16 @@ split over two cards since, and it reads a GGUF of the same architecture too.)
 
 Since then (2026-10-08), its EXL3 checkpoint chained over two RTX 5090s: a reply at 68
 to 69 tokens a second, 66 to 83 with its drafting head; a 1,960-token prompt in 0.54
-to 0.72 s. Its PEFT adapters run on its dense projections (an adapter of its routed
-experts is refused), and its vision tower is chained (a new picture answered in
-1.2 s).
+to 0.72 s. Its adapters (a PEFT folder, or a llama.cpp GGUF LoRA) run beside the
+projections they adapt, and its vision tower is chained (a new picture answered in
+1.2 s). Since 2026-10-09 that is its experts' projections too, as the CUDA build had
+it: the shared expert's take an update as any packed projection does, and the routed
+experts' is two small kernels after their group's pass (each job's `A x`, then `B` of
+it added to the job's output, an expert with no update left as it is; the pairs in
+storage buffers). A step, a check's rows and a prompt's rows all go through them, a
+check's rows are still their steps' to the bit, and an adapter whose B matrices are
+zeros gives the model's own logits exactly. Until then an adapter that named an
+expert's projection stopped the model from loading on WebGPU.
 
 It also reads the GGUFs Strata runs (ISTA-DASLab's GSQ-RCO files: Q2_0 experts with
 K-quant, IQ4 and f16 matrices beside them; `quant_moe`, `quant_linear`). From the Q2_0

@@ -286,6 +286,79 @@ fn a_chained_flashnext_step_answers_as_its_own_path() {
     assert!(after_steps > 0.99 && after_host > 0.99, "{after_steps} {after_host}");
 }
 
+/// Qwen3.8-Flash-Next with a LoRA adapter that adapts its experts too (the shared expert's projections and some
+/// layers' routed experts', beside attention and delta-net outputs): chained, it answers as the host's path does with
+/// the same adapter, prompt and steps; the adapter changes the answer; and the same adapter with zeros for its B
+/// matrices gives the model's own logits and tokens. FLASHNEXT_LORA and FLASHNEXT_LORA_ZERO: the two adapters, made
+/// for the check (no trained adapter is needed); FLASHNEXT_MODEL: the checkpoint.
+#[test]
+#[ignore = "needs WebGPU adapters with room for Qwen3.8-Flash-Next, its checkpoint (FLASHNEXT_MODEL) and two made adapters (FLASHNEXT_LORA, FLASHNEXT_LORA_ZERO); run with --nocapture"]
+fn a_flashnext_adapter_for_its_experts_changes_its_answer_and_one_of_zeros_does_not() {
+    use std::sync::Arc;
+    let path = std::env::var("FLASHNEXT_MODEL").unwrap_or_else(|_| r"E:\models\Qwen3.8-Flash-Next\exl3-3.05bpw".into());
+    let (Ok(made), Ok(zeros)) = (std::env::var("FLASHNEXT_LORA"), std::env::var("FLASHNEXT_LORA_ZERO")) else {
+        eprintln!("FLASHNEXT_LORA and FLASHNEXT_LORA_ZERO name no adapters: nothing checked");
+        return;
+    };
+    let steps: usize = std::env::var("FLASHNEXT_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
+    let cosine = |a: &[f32], b: &[f32]| {
+        let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
+        let n = |v: &[f32]| v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+        dot / (n(a) * n(b))
+    };
+    // one load: the prompt's logits on the host's path and chained, then the chain's greedy tokens and their logits
+    let run = |adapter: Option<&str>| -> (Vec<f32>, Vec<f32>, Vec<u32>, Vec<f32>) {
+        let Ok(b0) = ggml_rs_wgpu::WgpuBackend::new(None) else { panic!("no WebGPU adapter") };
+        let others: Vec<Arc<ggml_rs_wgpu::WgpuBackend>> = b0.others(None).into_iter().map(Arc::new).collect();
+        let b0 = Arc::new(b0);
+        let gpus: Vec<&ggml_rs_wgpu::WgpuBackend> = std::iter::once(b0.as_ref()).chain(others.iter().map(|g| g.as_ref())).collect();
+        let backends: Vec<Arc<dyn ggml_rs::Backend>> = std::iter::once(Arc::clone(&b0) as Arc<dyn ggml_rs::Backend>).chain(others.iter().map(|g| Arc::clone(g) as Arc<dyn ggml_rs::Backend>)).collect();
+        type Make<'a> = Box<dyn Fn(ggml_rs::exl3::Exl3Data) -> std::result::Result<Arc<dyn ggml_rs::exl3::PackedLinear>, String> + Send + Sync + 'a>;
+        let packed = |device: usize| -> Make<'_> {
+            let b = gpus[device];
+            Box::new(move |d| b.exl3(d))
+        };
+        let p = std::path::Path::new(&path);
+        let reserve = crate::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
+        let experts = |device: usize, _layer: &str, list: Vec<[ggml_rs::exl3::Exl3Data; 3]>| -> oaiy_engine::Result<Box<dyn ggml_rs::exl3::Experts>> {
+            gpus[device].exl3_experts_leaving(list, reserve).map_err(oaiy_engine::Error::Arg)
+        };
+        let adapters: Vec<crate::lora::Adapter> = adapter.map(|dir| vec![crate::lora::Adapter::open_for(std::path::Path::new(dir), &crate::flashnext::lora_base(p).unwrap()).unwrap()]).unwrap_or_default();
+        let t = std::time::Instant::now();
+        let model = crate::flashnext::load_portable_with(p, backends, &adapters, &packed, &experts, false).unwrap();
+        eprintln!("loaded in {:.1} s{}", t.elapsed().as_secs_f64(), adapters.first().map(|a| format!(", with a LoRA for {} projections", a.len())).unwrap_or_default());
+        let prompt: Vec<u32> = model.tokenizer.encode("Write a short story about a cat called Moss who lives on a boat.", false).unwrap();
+        let (mut kh, mut kc) = (model.new_kv_cache(prompt.len() + steps + 8), model.new_kv_cache(prompt.len() + steps + 8));
+        let e = model.embed_text(&prompt).unwrap();
+        let host = model.forward_host(&prompt, &e, &mut kh, None).unwrap().data().to_vec();
+        let chained = model.forward(&prompt, &e, &mut kc, None).unwrap().data().to_vec();
+        let mut tokens = vec![argmax(&chained)];
+        let mut last = chained.clone();
+        for _ in 0..steps {
+            let next = *tokens.last().unwrap();
+            let e = model.embed_text(&[next]).unwrap();
+            last = model.forward(&[next], &e, &mut kc, None).unwrap().data().to_vec();
+            tokens.push(argmax(&last));
+        }
+        assert_eq!(model.chain_runs(), steps + 1, "the prompt and every step chained");
+        (host, chained, tokens, last)
+    };
+    let (_, plain, plain_tokens, plain_last) = run(None);
+    let (host, chained, tokens, last) = run(Some(&made));
+    let agree = cosine(&host, &chained);
+    eprintln!("with the adapter: the prompt's logits on the host's path and chained, cosine {agree:.6}, the same greedy token {}", argmax(&host) == argmax(&chained));
+    assert!(agree > 0.99, "{agree}");
+    let (moved, moved_last) = (cosine(&plain, &chained), cosine(&plain_last, &last));
+    eprintln!("the adapter against the model as it is: the prompt's logits cosine {moved:.6}, after {steps} steps {moved_last:.6}; {} of {} greedy tokens the same", tokens.iter().zip(&plain_tokens).filter(|(a, b)| a == b).count(), tokens.len());
+    assert!(moved < 0.999_99 || moved_last < 0.999_99 || tokens != plain_tokens, "the adapter changes nothing: {moved} {moved_last}");
+    let (zhost, zchained, ztokens, zlast) = run(Some(&zeros));
+    let (same, same_last, same_host) = (cosine(&plain, &zchained), cosine(&plain_last, &zlast), cosine(&zhost, &zchained));
+    let worst = plain.iter().zip(&zchained).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+    eprintln!("the adapter of zeros against the model as it is: the prompt's logits cosine {same:.9} (the largest difference {worst:e}), after {steps} steps {same_last:.9}; the same greedy tokens {}; its host path and chain {same_host:.6}", ztokens == plain_tokens);
+    assert!(same > 0.999_999 && same_last > 0.999_99 && ztokens == plain_tokens, "{same} {same_last}");
+}
+
 /// Qwen3.8-Flash-Next's prompt chunks run together (each chunk's first device's layers as the last device runs the
 /// chunk before's) answer as chunks run one at a time: a prompt of 4 chunks of 512 and one of 100, the last logits
 /// and steps after it bit for bit (the caches the same), and how long each takes. FLASHNEXT_MODEL: the checkpoint.
@@ -655,7 +728,15 @@ fn a_flashnext_check_answers_as_its_steps_do() {
     };
     // FLASHNEXT_DRAFT: with the prediction layer, a draft before each check (it changes nothing a check reads)
     let drafting = std::env::var_os("FLASHNEXT_DRAFT").is_some();
-    let model = crate::flashnext::load_portable(p, backends, &packed, &experts, drafting).unwrap();
+    // FLASHNEXT_LORA: an adapter's folder (or a GGUF LoRA), applied as the weights load: its rows are its steps' too
+    let adapters: Vec<crate::lora::Adapter> = std::env::var("FLASHNEXT_LORA")
+        .ok()
+        .map(|dir| vec![crate::lora::Adapter::open_for(std::path::Path::new(&dir), &crate::flashnext::lora_base(p).unwrap()).unwrap()])
+        .unwrap_or_default();
+    let model = crate::flashnext::load_portable_with(p, backends, &adapters, &packed, &experts, drafting).unwrap();
+    if let Some(a) = adapters.first() {
+        eprintln!("with a LoRA for {} projections", a.len());
+    }
     let prompt: Vec<u32> = model.tokenizer.encode("Write a short story about a cat called Moss who lives on a boat.", false).unwrap();
     let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
     let cosine = |a: &[f32], b: &[f32]| {
