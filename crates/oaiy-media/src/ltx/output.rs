@@ -126,3 +126,43 @@ pub(super) fn export(r: &Request, pixels: &Tensor, soundtrack: Option<&(Vec<f32>
     let _ = std::fs::remove_file(log);
     Ok((path, preview))
 }
+
+/// The clip's soundtrack as interleaved stereo and its rate: the one it was given, as it was, cut to the clip (or
+/// padded with silence); else its audio latent through the audio VAE's decoder and the vocoder, trimmed (or
+/// padded) to exactly the clip's length and set to the reference's level. None for a silent clip.
+pub(super) fn soundtrack_out(r: &Request, audio_latent: Option<&Tensor>, soundtrack_in: Option<&([Vec<f32>; 2], usize)>, reference_loudness: Option<f32>, dev: &Device, report: &mut dyn FnMut(Json)) -> Result<Option<(Vec<f32>, usize)>> {
+    let soundtrack = match (&audio_latent, &r.audio_vae) {
+        // A given soundtrack is kept as it was (the reference returns the
+        // input audio, not its VAE round trip), cut to the clip.
+        _ if soundtrack_in.is_some() => {
+            let (channels, rate) = soundtrack_in.as_ref().ok_or_else(|| candle_core::Error::Msg("soundtrack missing".into()))?;
+            let samples = (r.frames as f64 / r.fps as f64 * *rate as f64) as usize;
+            let at = |c: &Vec<f32>, i: usize| c.get(i).copied().unwrap_or(0.);
+            let interleaved: Vec<f32> = (0..samples).flat_map(|i| [at(&channels[0], i), at(&channels[1], i)]).collect();
+            Some((interleaved, *rate))
+        }
+        (Some(latent), Some(path)) => {
+            report(event("decoding_audio", 0, 1));
+            let decoder = audio::AudioDecoder::load(path, &dev)?;
+            // (a WebGPU job's: the vocoder and the bandwidth extension on its GPU, nearly all of the decoding)
+            #[cfg(feature = "webgpu")]
+            let wave = if r.webgpu { decoder.decode_webgpu(r.device, latent)? } else { decoder.decode(latent)? };
+            #[cfg(not(feature = "webgpu"))]
+            let wave = decoder.decode(latent)?;
+            let rate = decoder.sample_rate;
+            drop(decoder);
+            let samples = (r.frames * rate).div_ceil(r.fps);
+            let have = wave.dim(2)?;
+            let wave = if have >= samples { wave.narrow(2, 0, samples)? } else { wave.pad_with_zeros(2, 0, samples - have)? };
+            // Interleaved stereo, as FFmpeg's f32le input wants it.
+            let mut interleaved = wave.squeeze(0)?.transpose(0, 1)?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+            if interleaved.iter().any(|x| !x.is_finite()) {
+                candle_core::bail!("nonfinite decoded audio samples");
+            }
+            set_level(&mut interleaved, rate, reference_loudness);
+            Some((interleaved, rate))
+        }
+        _ => None,
+    };
+    Ok(soundtrack)
+}
