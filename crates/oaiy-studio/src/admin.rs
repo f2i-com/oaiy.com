@@ -135,6 +135,7 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
             let after = req.query("after").and_then(|a| a.parse().ok()).unwrap_or(0);
             let ring = match req.query("source").as_deref() {
                 Some("llm") => &studio.llm.log,
+                Some("egpu") => &studio.egpu.log,
                 Some("media") => &studio.media.log,
                 _ => &studio.log,
             };
@@ -148,6 +149,24 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
         ("POST", "/api/llm/restart") => {
             studio.llm.stop();
             studio.llm.start(&cfg, &studio.root).map(|_| studio.llm.status()).map_err(|e| (400, e))
+        }
+        // tinygrad's server on a Mac's eGPU: what the Pythons here have, and its start (with the model named, else
+        // the first set to it) and stop by hand. It starts by itself on the first request for a model of its own.
+        ("GET", "/api/egpu/check") => Ok(studio.egpu.check(&cfg, &studio.root)),
+        ("POST", "/api/egpu/start") => {
+            let llm = cfg.get("llm").cloned().unwrap_or(Json::Null);
+            let asked = body(req).ok().and_then(|b| b.get("model").and_then(Json::as_str).map(str::to_owned));
+            match asked.or_else(|| crate::egpu::models(&llm).into_iter().next()) {
+                Some(name) => {
+                    studio.egpu.stop();
+                    studio.egpu.start(&cfg, &studio.root, &name).map(|_| studio.egpu.status(&llm)).map_err(|e| (400, e))
+                }
+                None => Err((400, "no model is set to run on the eGPU (Models), or it is switched off (Settings)".into())),
+            }
+        }
+        ("POST", "/api/egpu/stop") => {
+            studio.egpu.stop();
+            Ok(studio.egpu.status(cfg.get("llm").unwrap_or(&Json::Null)))
         }
         ("GET", "/api/downloads") => Ok(studio.downloads.state(studio)),
         ("POST", "/api/downloads") => body(req).map_err(|e| (400, e)).and_then(|b| {

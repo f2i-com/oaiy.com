@@ -18,6 +18,7 @@ mod admin;
 mod config;
 mod detect;
 mod discovery;
+mod egpu;
 mod gateway;
 mod llm;
 mod media;
@@ -60,6 +61,8 @@ pub struct Studio {
     pub root: PathBuf,
     config: RwLock<Json>,
     pub llm: Arc<llm::Llm>,
+    /// tinygrad's LLM server on a card the engine cannot reach itself (a Mac's eGPU); nothing elsewhere.
+    pub egpu: Arc<egpu::Egpu>,
     pub media: Arc<media::Media>,
     pub system: system::System,
     pub log: Arc<LogRing>,
@@ -132,6 +135,17 @@ impl Studio {
                 }
             }
         }
+        // tinygrad's server holds one model under one set of settings: with either changed it stops, and the next
+        // request for a model of its own starts it again.
+        let egpu_launch = |v: &Json| {
+            let llm = v.get("llm").cloned().unwrap_or(Json::Null);
+            let file = self.egpu.held().as_deref().filter(|m| egpu::assigned(&llm, m)).and_then(|m| egpu::arguments(&llm, &self.root, m, std::path::Path::new(""), 0).ok());
+            (file, llm.get("egpu").cloned())
+        };
+        if self.egpu.state() != llm::State::Stopped && egpu_launch(&before) != egpu_launch(&next) {
+            self.log.push("eGPU settings changed: stopping tinygrad's server");
+            self.egpu.stop();
+        }
         self.log.push("configuration saved");
         Ok(next)
     }
@@ -140,6 +154,7 @@ impl Studio {
     /// studio holding GPU memory. Waits briefly for a media worker to be killed.
     pub fn shutdown(&self) {
         self.llm.stop();
+        self.egpu.stop();
         let mut cancelled = false;
         for job in self.media.list() {
             cancelled |= self.media.cancel(&job.id);
@@ -168,12 +183,36 @@ impl Studio {
             ("restart_required", Json::Bool(*self.restart_required.read().unwrap_or_else(|p| p.into_inner()))),
             ("media_pauses_llm", Json::Bool(media::pauses_llm(&self.config()))),
             ("llm", self.llm.status()),
+            ("egpu", self.egpu.status(self.config().get("llm").unwrap_or(&Json::Null))),
             ("media", Json::obj([
                 ("busy", Json::Bool(self.media.busy())),
                 ("jobs", Json::Arr(self.media.list().iter().take(60).map(|j| j.to_json(&root)).collect())),
                 ("private", self.media.private_activity()),
             ])),
         ])
+    }
+}
+
+#[cfg(test)]
+impl Studio {
+    /// A Studio with `cfg` (nothing started, nothing saved), for the tests of what a request comes to.
+    pub(crate) fn for_test(root: &std::path::Path, cfg: Json) -> Studio {
+        Studio {
+            config_path: root.join("oaiy-studio.json"),
+            root: root.to_path_buf(),
+            config: RwLock::new(cfg),
+            llm: Arc::new(llm::Llm::new()),
+            egpu: Arc::new(egpu::Egpu::new()),
+            media: Arc::new(media::Media::new()),
+            system: system::System::new(),
+            log: Arc::new(LogRing::new(50)),
+            downloads: Arc::new(downloads::Downloads::new()),
+            ui_url: RwLock::new(String::new()),
+            gateway_url: RwLock::new(String::new()),
+            restart_required: RwLock::new(false),
+            saving: std::sync::Mutex::new(()),
+            port_overrides: (None, None),
+        }
     }
 }
 
@@ -432,6 +471,7 @@ pub fn launch(args: &Args, quiet: bool) -> Result<Running, String> {
         root,
         config: RwLock::new(cfg.clone()),
         llm: Arc::new(llm::Llm::new()),
+        egpu: Arc::new(egpu::Egpu::new()),
         media: Arc::new(media::Media::new()),
         system: system::System::new(),
         log: Arc::new(LogRing::new(1000)),
@@ -473,6 +513,11 @@ pub fn launch(args: &Args, quiet: bool) -> Result<Running, String> {
             if minutes > 0 && idle.media.chats_active() == 0 && idle.llm.state() == llm::State::Ready && idle.llm.idle_for() > Duration::from_secs(minutes as u64 * 60) {
                 idle.log.push(format!("LLM idle for {minutes} min: stopping it to free memory"));
                 idle.llm.stop();
+            }
+            // tinygrad's server by the same rule: the card's memory back, the next request loads it again.
+            if minutes > 0 && idle.egpu.state() == llm::State::Ready && idle.egpu.idle_for().is_some_and(|t| t > Duration::from_secs(minutes as u64 * 60)) {
+                idle.log.push(format!("eGPU idle for {minutes} min: stopping tinygrad's server to free the card"));
+                idle.egpu.stop();
             }
             // Hourly: uploaded reference images older than a day.
             if ticks % 120 == 1 {

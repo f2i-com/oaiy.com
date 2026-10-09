@@ -25,7 +25,7 @@ pub enum State {
 }
 
 impl State {
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             State::Stopped => "stopped",
             State::Starting => "starting",
@@ -132,6 +132,16 @@ fn free_port() -> Result<u16, String> {
 
 /// The oaiy-llm-server command line for the `llm` section. `root` resolves relative paths.
 pub fn arguments(llm: &Json, root: &Path, port: u16, key: &str, local_images: bool) -> Result<(Vec<String>, Vec<String>), String> {
+    arguments_for(llm, root, port, key, local_images, None)
+}
+
+/// [`arguments`], with the model a request is waiting for (`first`) as the one the server loads as it starts.
+///
+/// The server loads its first model at once and the others when they are asked for. That first one is `first` where
+/// it names an enabled model, else the default. A default that is set to run on the eGPU (macOS, `crate::egpu`) is
+/// tinygrad's server's to hold, so the first model that is not is loaded here instead: a 24 GB Mac has no room to
+/// load a 27B beside the card for nothing.
+pub fn arguments_for(llm: &Json, root: &Path, port: u16, key: &str, local_images: bool, first: Option<&str>) -> Result<(Vec<String>, Vec<String>), String> {
     let models: Vec<&Json> = llm
         .get("models")
         .and_then(Json::as_array)
@@ -143,7 +153,9 @@ pub fn arguments(llm: &Json, root: &Path, port: u16, key: &str, local_images: bo
         return Err("no language model configured: add a GGUF (or EXL3/DeepSeek folder) under Models".into());
     }
     let default = str_or(llm, "default_model", "");
-    let primary = models.iter().position(|m| str_or(m, "name", "") == default).unwrap_or(0);
+    let named = |name: &str| models.iter().position(|m| str_or(m, "name", "") == name);
+    let here = |i: &usize| !crate::egpu::assigned(llm, str_or(models[*i], "name", ""));
+    let primary = first.and_then(named).or_else(|| named(default).filter(here)).or_else(|| (0..models.len()).find(here)).or_else(|| named(default)).unwrap_or(0);
     let mut ordered = vec![models[primary]];
     ordered.extend(models.iter().enumerate().filter(|(i, _)| *i != primary).map(|(_, m)| *m));
     let path = |m: &Json, key: &str| config::resolve(root, str_or(m, key, "")).to_string_lossy().into_owned();
@@ -312,8 +324,22 @@ impl Llm {
         self.lock().models.clone()
     }
 
+    /// A server that is already there (a test's stand-in), taken as this one's, ready.
+    #[cfg(test)]
+    pub(crate) fn adopt(&self, addr: &str, key: &str) {
+        let mut g = self.lock();
+        g.addr = addr.into();
+        g.key = key.into();
+        g.state = State::Ready;
+    }
+
     /// Start the server for `cfg` (the whole configuration) unless it runs.
     pub fn start(self: &Arc<Self>, cfg: &Json, root: &Path) -> Result<(), String> {
+        self.start_for(cfg, root, None)
+    }
+
+    /// [`Llm::start`], loading `first` (the model a request is waiting for) as it starts.
+    fn start_for(self: &Arc<Self>, cfg: &Json, root: &Path, first: Option<&str>) -> Result<(), String> {
         let llm = cfg.get("llm").ok_or("no llm section")?;
         if !bool_or(llm, "enabled", true) {
             return Err("the LLM is disabled in the configuration".into());
@@ -330,7 +356,7 @@ impl Llm {
         let key = random_id("sk-studio-");
         let gateway_host = cfg.get("gateway").map_or("127.0.0.1", |g| str_or(g, "host", "127.0.0.1"));
         let loopback = gateway_host == "localhost" || gateway_host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
-        let (mut args, names) = arguments(llm, root, port, &key, loopback)?;
+        let (mut args, names) = arguments_for(llm, root, port, &key, loopback, first)?;
         let webgpu_gb = llm.get("webgpu_gb").and_then(Json::as_i64).filter(|n| *n > 0).or_else(|| auto_webgpu_gb(&crate::system::System::new().gpus(), llm));
         if let Some(gb) = webgpu_gb {
             args.push("--webgpu-gb".into());
@@ -475,10 +501,11 @@ impl Llm {
         self.lock().resident = Some(name);
     }
 
-    /// Start if needed and wait until it serves (or fails, or `timeout` passes).
-    pub fn ensure_ready(self: &Arc<Self>, cfg: &Json, root: &Path, timeout: Duration) -> Result<Endpoint, String> {
+    /// Start if needed and wait until it serves (or fails, or `timeout` passes). A server started here loads
+    /// `first`, the model the request names, as it starts.
+    pub fn ensure_ready(self: &Arc<Self>, cfg: &Json, root: &Path, first: Option<&str>, timeout: Duration) -> Result<Endpoint, String> {
         if matches!(self.state(), State::Stopped | State::Failed) {
-            self.start(cfg, root)?;
+            self.start_for(cfg, root, first)?;
         }
         let deadline = Instant::now() + timeout;
         let mut g = self.lock();
@@ -566,19 +593,21 @@ mod tests {
 
     #[test]
     fn the_default_model_leads_and_extras_follow() {
-        let llm = Json::parse(br#"{
+        // (a whole path as this computer writes one: `C:/abs` is a folder's name anywhere but on Windows)
+        let whole = if cfg!(windows) { "C:/abs/b.gguf" } else { "/abs/b.gguf" };
+        let llm = Json::parse(format!(r#"{{
             "default_model": "b", "ctx": 4096, "devices": [1], "thinking": true, "vision": false, "prompt_cache": false,
             "extra_args": ["--quiet"],
             "models": [
-                {"name": "a", "path": "models/a.gguf"},
-                {"name": "b", "path": "C:/abs/b.gguf", "vision_projector": "mmproj.gguf"},
-                {"name": "off", "path": "x.gguf", "enabled": false}
-            ]}"#).unwrap();
+                {{"name": "a", "path": "models/a.gguf"}},
+                {{"name": "b", "path": "{whole}", "vision_projector": "mmproj.gguf"}},
+                {{"name": "off", "path": "x.gguf", "enabled": false}}
+            ]}}"#).as_bytes()).unwrap();
         let root = Path::new("/install");
         let (args, names) = arguments(&llm, root, 9000, "secret", true).unwrap();
         assert_eq!(names, ["b", "a"]);
         let joined = args.join(" ");
-        assert!(joined.starts_with("--model C:/abs/b.gguf --name b --also a="), "{joined}");
+        assert!(joined.starts_with(&format!("--model {whole} --name b --also a=")), "{joined}");
         assert!(joined.contains(&format!("a={}", root.join("models/a.gguf").display())));
         assert!(joined.contains("--vision-projector b="));
         for flag in ["--port 9000", "--api-key secret", "--ctx 4096", "--devices 1", "--thinking", "--no-vision", "--local-images off", "--quiet"] {
@@ -592,10 +621,11 @@ mod tests {
         let joined = arguments(&auto, root, 1, "k", true).unwrap().0.join(" ");
         assert!(joined.contains("--ctx auto"), "{joined}");
         // LoRAs stack: the adapter folder, then each of `loras` at its own strength.
-        let stacked = Json::parse(br#"{"models": [{"name": "q", "path": "C:/q", "lora": "C:/yes", "loras": [{"path": "C:/heresy", "strength": 0.5}, "C:/plain"]}]}"#).unwrap();
+        let at = if cfg!(windows) { "C:" } else { "" };
+        let stacked = Json::parse(format!(r#"{{"models": [{{"name": "q", "path": "{at}/q", "lora": "{at}/one", "loras": [{{"path": "{at}/two", "strength": 0.5}}, "{at}/three"]}}]}}"#).as_bytes()).unwrap();
         let args = arguments(&stacked, root, 1, "k", true).unwrap().0;
         let loras: Vec<&str> = args.windows(2).filter(|w| w[0] == "--lora").map(|w| w[1].as_str()).collect();
-        assert_eq!(loras, ["q=C:/yes", "q=C:/heresy@0.5", "q=C:/plain"]);
+        assert_eq!(loras, [format!("q={at}/one"), format!("q={at}/two@0.5"), format!("q={at}/three")]);
     }
 
     #[test]
@@ -656,8 +686,28 @@ mod tests {
     fn a_missing_server_fails_clearly_instead_of_hanging() {
         let llm = Arc::new(Llm::new());
         let cfg = Json::parse(br#"{"gateway":{"host":"127.0.0.1"},"llm":{"backend":"auto","server":"definitely-missing/oaiy-llm-server-x","server_webgpu":"definitely-missing/oaiy-llm-server-y","models":[{"name":"m","path":"m.gguf"}]}}"#).unwrap();
-        let err = llm.ensure_ready(&cfg, &std::env::temp_dir(), Duration::from_secs(5)).unwrap_err();
+        let err = llm.ensure_ready(&cfg, &std::env::temp_dir(), None, Duration::from_secs(5)).unwrap_err();
         assert!(err.contains("could not start the LLM server"), "{err}");
         assert_eq!(llm.state(), State::Failed);
+    }
+
+    #[test]
+    fn the_model_a_request_waits_for_is_loaded_first_and_one_set_to_the_egpu_is_not_loaded_for_nothing() {
+        let root = Path::new("/install");
+        let first = |llm: &str, want: Option<&str>| arguments_for(&Json::parse(llm.as_bytes()).unwrap(), root, 1, "k", true, want).unwrap().1;
+        let models = r#""models": [{"name": "big", "path": "big.gguf", "egpu": true}, {"name": "small", "path": "small.gguf"}, {"name": "tiny", "path": "tiny.gguf"}]"#;
+        // The default is tinygrad's to hold: this computer's engine starts with the first model that is its own.
+        let on = format!(r#"{{"default_model": "big", "egpu": {{"enabled": true}}, {models}}}"#);
+        assert_eq!(first(&on, None), ["small", "big", "tiny"]);
+        // A request waiting for a model (the eGPU's, when it does not answer there) gets that one loaded first.
+        assert_eq!(first(&on, Some("big")), ["big", "small", "tiny"]);
+        assert_eq!(first(&on, Some("tiny")), ["tiny", "big", "small"]);
+        assert_eq!(first(&on, Some("ghost")), ["small", "big", "tiny"]);
+        // The eGPU switched off, or a default of this computer's own: the default leads, as ever.
+        assert_eq!(first(&format!(r#"{{"default_model": "big", "egpu": {{"enabled": false}}, {models}}}"#), None), ["big", "small", "tiny"]);
+        assert_eq!(first(&format!(r#"{{"default_model": "tiny", "egpu": {{"enabled": true}}, {models}}}"#), None), ["tiny", "big", "small"]);
+        // Every model on the eGPU: the default, since something must lead.
+        let all = r#"{"default_model": "b", "egpu": {"enabled": true}, "models": [{"name": "a", "path": "a.gguf", "egpu": true}, {"name": "b", "path": "b.gguf", "egpu": true}]}"#;
+        assert_eq!(first(all, None), ["b", "a"]);
     }
 }

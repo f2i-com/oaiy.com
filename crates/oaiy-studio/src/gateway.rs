@@ -166,6 +166,78 @@ pub fn health(studio: &Studio) -> Json {
     ])
 }
 
+/// Pass a reply on as it arrives: an event stream (or a body of no stated length) chunk by chunk, anything else whole.
+fn relay(w: &mut TcpStream, response: oaiy_engine::http::Response) -> io::Result<bool> {
+    let status = response.status;
+    let rtype = response.header("content-type").unwrap_or("application/json").to_string();
+    let streamed = rtype.contains("event-stream") || response.header("transfer-encoding").is_some_and(|t| t.contains("chunked"));
+    if streamed {
+        let mut out = Stream::start_status(w, status, &rtype)?;
+        // A client that leaves makes `send` fail, which drops the upstream
+        // connection, which oaiy-llm-server takes as a cancel.
+        let r = response.for_each_chunk(|chunk| out.send(chunk));
+        if r.is_ok() {
+            out.finish()?;
+        }
+        // The stream said keep-alive and ended cleanly: the client may send its
+        // next request on this connection, so keep reading it rather than close
+        // it under a request already on its way.
+        r.map(|_| true)
+    } else {
+        let body = response.body(64 << 20)?;
+        respond(w, status, &rtype, &body, true).map(|_| true)
+    }
+}
+
+/// A chat request for a model set to run on the eGPU (macOS, `crate::egpu`): answered by tinygrad's server there
+/// (`Some`), or left to this computer's engine (`None`) because the request has a picture, which tinygrad's server
+/// does not read, or because that server cannot be started or has gone: the card unplugged, tinygrad not installed.
+/// A server that is only still loading is waited for, and past the wait the client is told to try again.
+fn egpu_chat(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, cfg: &Json, name: &str) -> Option<io::Result<bool>> {
+    use crate::egpu::{self, Unready};
+    let llm = cfg.get("llm")?;
+    let asked = Json::parse(&req.body).ok()?;
+    if egpu::has_picture(&asked) {
+        return None;
+    }
+    let body = egpu::request_body(llm, name, &req.body)?;
+    let here = |why: &str| {
+        if studio.egpu.news(why) {
+            let answers = egpu::fallback(llm, name);
+            studio.log.push(format!("the eGPU does not answer ({}): {answers} answers on this computer", why.lines().next().unwrap_or("")));
+        }
+    };
+    let (endpoint, lease) = match studio.egpu.ensure(cfg, &studio.root, name, LOAD_WAIT) {
+        Ok(ready) => ready,
+        Err(Unready::Gone(why)) => {
+            here(&why);
+            return None;
+        }
+        Err(Unready::Loading(why)) => return Some(send(w, Err(fail(503, why)))),
+    };
+    let auth = format!("Bearer {}", endpoint.key);
+    let headers = [("Authorization", auth.as_str()), ("Content-Type", "application/json")];
+    let response = match fetch(&endpoint.addr, "POST", "/v1/chat/completions", &headers, &body, UPSTREAM_READ) {
+        Ok(r) => r,
+        Err(e) => {
+            // Nothing has been sent to the client yet: this computer's engine can still answer.
+            drop(lease);
+            here(&studio.egpu.gone(&e.to_string()));
+            return None;
+        }
+    };
+    let result = relay(w, response);
+    drop(lease);
+    Some(result)
+}
+
+/// A request's body with another `model` (the one that answers on this computer for a model the eGPU does not).
+fn with_model(body: &[u8], model: &str) -> Option<Vec<u8>> {
+    let mut v = Json::parse(body).ok().filter(|v| v.as_object().is_some())?;
+    crate::util::set(&mut v, "model", Json::str(model));
+    Some(v.to_json().into_bytes())
+}
+
 /// Forward to oaiy-llm-server, starting it if needed, and stream the reply back.
 fn proxy(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, upstream: &str) -> io::Result<bool> {
     let cfg = studio.config();
@@ -182,13 +254,32 @@ fn proxy(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, upstream: &str)
     // A model on the media GPU waits for a media job there (and a server that is
     // not running loads its default model first); one on other GPUs goes ahead.
     let requested = Json::parse(&req.body).ok().and_then(|b| b.get("model").and_then(Json::as_str).map(str::to_owned));
-    let model = media::resolve_model(&cfg, requested.as_deref());
+    let mut model = media::resolve_model(&cfg, requested.as_deref());
+    // A model set to run on the eGPU (a Mac's, through tinygrad's server): its chats are answered there while that
+    // server answers. Otherwise, and for what that server does not do, this computer's engine answers, with the
+    // model named to stand in for it where one is.
+    let mut body = std::borrow::Cow::Borrowed(&req.body[..]);
+    let llm = cfg.get("llm").cloned().unwrap_or(Json::Null);
+    if let Some(name) = model.clone().filter(|m| crate::egpu::assigned(&llm, m)) {
+        if upstream == "/v1/chat/completions" {
+            if let Some(answered) = egpu_chat(studio, req, w, &cfg, &name) {
+                return answered;
+            }
+        }
+        let stands_in = crate::egpu::fallback(&llm, &name);
+        if stands_in != name {
+            if let Some(rewritten) = with_model(&req.body, &stands_in) {
+                body = std::borrow::Cow::Owned(rewritten);
+                model = Some(stands_in);
+            }
+        }
+    }
     let exclusive = media::needs_media_gpu(&cfg, model.as_deref()) || (!studio.llm.is_running() && media::needs_media_gpu(&cfg, None));
     let lease = match studio.media.chat_lease(exclusive, CHAT_WAIT) {
         Ok(l) => l,
         Err(e) => return send(w, Err(fail(503, e))),
     };
-    let endpoint = match studio.llm.ensure_ready(&cfg, &studio.root, LOAD_WAIT) {
+    let endpoint = match studio.llm.ensure_ready(&cfg, &studio.root, model.as_deref(), LOAD_WAIT) {
         Ok(e) => e,
         Err(e) => return send(w, Err(fail(503, e))),
     };
@@ -209,29 +300,11 @@ fn proxy(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, upstream: &str)
     if let Some(session) = req.header("x-oaiy-session") {
         headers.push(("X-OAIY-Session", session));
     }
-    let response = match fetch(&endpoint.addr, &req.method, upstream, &headers, &req.body, UPSTREAM_READ) {
+    let response = match fetch(&endpoint.addr, &req.method, upstream, &headers, &body, UPSTREAM_READ) {
         Ok(r) => r,
         Err(e) => return send(w, Err(fail(502, format!("the language model did not answer: {e}")))),
     };
-    let status = response.status;
-    let rtype = response.header("content-type").unwrap_or("application/json").to_string();
-    let streamed = rtype.contains("event-stream") || response.header("transfer-encoding").is_some_and(|t| t.contains("chunked"));
-    let result = if streamed {
-        let mut out = Stream::start_status(w, status, &rtype)?;
-        // A client that leaves makes `send` fail, which drops the upstream
-        // connection, which oaiy-llm-server takes as a cancel.
-        let r = response.for_each_chunk(|chunk| out.send(chunk));
-        if r.is_ok() {
-            out.finish()?;
-        }
-        // The stream said keep-alive and ended cleanly: the client may send its
-        // next request on this connection, so keep reading it rather than close
-        // it under a request already on its way.
-        r.map(|_| true)
-    } else {
-        let body = response.body(64 << 20)?;
-        respond(w, status, &rtype, &body, true).map(|_| true)
-    };
+    let result = relay(w, response);
     studio.llm.touch();
     drop(lease);
     result
@@ -1212,6 +1285,243 @@ mod tests {
         assert_eq!((m.target.as_str(), m.rest.as_str()), ("model3d", "/m3d_abc/content"));
         assert_eq!(route(&r, "GET", "/v1/3d/models").unwrap().target, "model3d");
         assert_eq!(route(&r, "POST", "/v1/3d/models/m3d_abc/cancel").unwrap().rest, "/m3d_abc/cancel");
+    }
+
+    /// A stand-in for a language-model server on a loopback port: every request's head and body are kept, and
+    /// answered with `answer`'s bytes, written whole before the connection closes (as tinygrad's server ends a
+    /// reply: no length, the connection closed). Dropped: nothing listens there any more.
+    struct StandIn {
+        addr: String,
+        seen: Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl StandIn {
+        fn new(answer: &'static str) -> StandIn {
+            use std::io::{BufRead, BufReader, Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (kept, stopped) = (Arc::clone(&seen), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    if stopped.load(std::sync::atomic::Ordering::SeqCst) {
+                        return;
+                    }
+                    let Ok(mut stream) = stream else { continue };
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let (mut head, mut length) = (String::new(), 0usize);
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                            length = n.trim().parse().unwrap_or(0);
+                        }
+                        head.push_str(&line);
+                    }
+                    let mut body = vec![0; length];
+                    let _ = reader.read_exact(&mut body);
+                    kept.lock().unwrap().push((head, body));
+                    let _ = stream.write_all(answer.as_bytes());
+                }
+            });
+            StandIn { addr, seen, stop }
+        }
+
+        fn requests(&self) -> Vec<(String, Json)> {
+            self.seen.lock().unwrap().iter().map(|(head, body)| (head.clone(), Json::parse(body).unwrap_or(Json::Null))).collect()
+        }
+    }
+
+    impl Drop for StandIn {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = std::net::TcpStream::connect(&self.addr);
+        }
+    }
+
+    /// A chat request as a client of the gateway sends it: the reply's status, its type and its body.
+    fn chat(studio: &Arc<Studio>, body: &str) -> (u16, String, String) {
+        ask(studio, "chat", body)
+    }
+
+    /// A request for the gateway's `target` (`chat` or `completions`), likewise.
+    fn ask(studio: &Arc<Studio>, target: &'static str, body: &str) -> (u16, String, String) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let served = Arc::clone(studio);
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            oaiy_engine::http::serve(stream, |req, w| handle(&served, req, w, Matched { target: target.into(), spec: "openai".into(), rest: String::new() }, true));
+        });
+        let reply = fetch(&addr, "POST", "/v1/whatever-the-route-is", &[("Content-Type", "application/json")], body.as_bytes(), Duration::from_secs(900)).unwrap();
+        let (status, kind) = (reply.status, reply.header("content-type").unwrap_or("").to_string());
+        (status, kind, String::from_utf8_lossy(&reply.body(8 << 20).unwrap()).into_owned())
+    }
+
+    /// As tinygrad's server streams a reply, and as OAIY's own engine answers one whole.
+    const TINYGRAD_SAYS: &str = "HTTP/1.0 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\ndata: {\"choices\": [{\"index\": 0, \"delta\": {\"content\": \"from the eGPU\"}}]}\n\ndata: [DONE]\n\n";
+    const ENGINE_SAYS: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 32\r\nConnection: close\r\n\r\n{\"answered\": \"on this computer\"}";
+
+    fn egpu_studio(root: &std::path::Path, stands_in: &str) -> Arc<Studio> {
+        let cfg = format!(
+            r#"{{"llm": {{"enabled": true, "temperature": 0.7, "max_tokens": 256, "server": "no-such/oaiy-llm-server", "server_webgpu": "no-such/oaiy-llm-server-webgpu",
+                "egpu": {{"enabled": true, "fallback_model": "{stands_in}"}},
+                "models": [{{"name": "big", "path": "big.gguf", "egpu": true}}, {{"name": "small", "path": "small.gguf"}}]}},
+                "media": {{"llm_policy": "coexist"}}}}"#
+        );
+        Arc::new(Studio::for_test(root, Json::parse(cfg.as_bytes()).unwrap()))
+    }
+
+    #[test]
+    fn a_chat_with_a_model_on_the_egpu_is_answered_by_tinygrads_server_and_the_others_by_this_computers() {
+        let root = std::env::temp_dir();
+        let studio = egpu_studio(&root, "small");
+        let (tinygrad, engine) = (StandIn::new(TINYGRAD_SAYS), StandIn::new(ENGINE_SAYS));
+        studio.egpu.adopt(&tinygrad.addr, "sk-egpu-test", "big");
+        studio.llm.adopt(&engine.addr, "sk-studio-test");
+        // The eGPU's model: tinygrad's server, with its key, OAIY's name for the model, and the settings tinygrad
+        // would otherwise decide differently. Its stream, which says no length and ends by closing, arrives whole.
+        let (status, kind, body) = chat(&studio, r#"{"model": "big", "stream": true, "messages": [{"role": "user", "content": "hi"}]}"#);
+        assert_eq!((status, kind.as_str()), (200, "text/event-stream"));
+        assert!(body.contains("from the eGPU") && body.trim_end().ends_with("data: [DONE]"), "{body}");
+        let sent = tinygrad.requests();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].0.starts_with("POST /v1/chat/completions ") && sent[0].0.contains("Authorization: Bearer sk-egpu-test"), "{}", sent[0].0);
+        assert_eq!(sent[0].1.get("model").and_then(Json::as_str), Some("big"));
+        assert_eq!(sent[0].1.get("temperature").and_then(Json::as_f64), Some(0.7));
+        assert_eq!(sent[0].1.get("max_tokens").and_then(Json::as_i64), Some(256));
+        assert!(engine.requests().is_empty(), "this computer's engine was not asked");
+        // Another model: this computer's engine, as it was sent.
+        let (status, _, body) = chat(&studio, r#"{"model": "small", "messages": [{"role": "user", "content": "hi"}]}"#);
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("on this computer"));
+        assert_eq!(engine.requests().last().unwrap().1.get("model").and_then(Json::as_str), Some("small"));
+        assert_eq!(engine.requests().last().unwrap().1.get("temperature"), None);
+        // A picture, which tinygrad's server does not read: this computer's engine, with the model that stands in.
+        let picture = r#"{"model": "big", "messages": [{"role": "user", "content": [{"type": "text", "text": "what is this"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]}]}"#;
+        assert_eq!(chat(&studio, picture).0, 200);
+        assert_eq!(engine.requests().last().unwrap().1.get("model").and_then(Json::as_str), Some("small"));
+        // And a plain completion, which tinygrad's server does not answer: likewise.
+        assert_eq!(ask(&studio, "completions", r#"{"model": "big", "prompt": "Once"}"#).0, 200);
+        let (head, sent) = engine.requests().last().unwrap().clone();
+        assert!(head.starts_with("POST /v1/completions "), "{head}");
+        assert_eq!(sent.get("model").and_then(Json::as_str), Some("small"));
+        assert_eq!(tinygrad.requests().len(), 1, "tinygrad's server was not asked again");
+    }
+
+    #[test]
+    fn when_tinygrads_server_is_gone_this_computers_engine_answers_in_its_place() {
+        let root = std::env::temp_dir();
+        for (stands_in, answers) in [("small", "small"), ("", "big")] {
+            let studio = egpu_studio(&root, stands_in);
+            let engine = StandIn::new(ENGINE_SAYS);
+            studio.llm.adopt(&engine.addr, "sk-studio-test");
+            // tinygrad's server was there and is not any more (the card unplugged): nothing listens at its address.
+            let gone = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().to_string() };
+            studio.egpu.adopt(&gone, "sk-egpu-test", "big");
+            let (status, _, body) = chat(&studio, r#"{"model": "big", "messages": [{"role": "user", "content": "hi"}]}"#);
+            assert_eq!(status, 200, "{body}");
+            assert!(body.contains("on this computer"), "{body}");
+            assert_eq!(engine.requests().last().unwrap().1.get("model").and_then(Json::as_str), Some(answers), "the model that stands in, else the same one");
+            assert_eq!(studio.egpu.state(), crate::llm::State::Failed);
+            let said = studio.log.tail(10);
+            assert!(said.contains("the eGPU does not answer") && said.contains(&format!("{answers} answers on this computer")), "{said}");
+            // The next requests go straight to this computer's engine until it is tried again, and the log says it once.
+            assert_eq!(chat(&studio, r#"{"model": "big", "messages": []}"#).0, 200);
+            assert_eq!(studio.log.tail(10).matches("the eGPU does not answer").count(), 1);
+        }
+    }
+
+    #[test]
+    fn with_the_egpu_switched_off_its_models_are_this_computers() {
+        let root = std::env::temp_dir();
+        let studio = egpu_studio(&root, "small");
+        let mut cfg = studio.config();
+        let mut llm = cfg.get("llm").cloned().unwrap();
+        crate::util::set(&mut llm, "egpu", Json::parse(br#"{"enabled": false, "fallback_model": "small"}"#).unwrap());
+        crate::util::set(&mut cfg, "llm", llm);
+        let studio = Arc::new(Studio::for_test(&root, cfg));
+        let (tinygrad, engine) = (StandIn::new(TINYGRAD_SAYS), StandIn::new(ENGINE_SAYS));
+        studio.egpu.adopt(&tinygrad.addr, "sk-egpu-test", "big");
+        studio.llm.adopt(&engine.addr, "sk-studio-test");
+        assert_eq!(chat(&studio, r#"{"model": "big", "messages": []}"#).0, 200);
+        assert!(tinygrad.requests().is_empty());
+        assert_eq!(engine.requests().last().unwrap().1.get("model").and_then(Json::as_str), Some("big"), "the model asked for, not a stand-in");
+    }
+
+    /// The whole way with the real tinygrad: a Python that has it (OAIY_EGPU_TEST_PYTHON), a small GGUF
+    /// (OAIY_EGPU_TEST_MODEL), on the device OAIY_EGPU_TEST_DEV names (CPU unless set). The launcher starts
+    /// tinygrad's server; it lists its model only with the key and listens on this computer only; a chat through the
+    /// gateway is answered by it, streamed and whole; and let go of, it stops by itself.
+    #[test]
+    #[ignore = "needs a Python with tinygrad (OAIY_EGPU_TEST_PYTHON) and a small GGUF (OAIY_EGPU_TEST_MODEL)"]
+    fn tinygrads_real_server_answers_through_the_gateway_held_to_this_computer_and_a_key() {
+        let (Ok(python), Ok(file)) = (std::env::var("OAIY_EGPU_TEST_PYTHON"), std::env::var("OAIY_EGPU_TEST_MODEL")) else { return };
+        let device = std::env::var("OAIY_EGPU_TEST_DEV").unwrap_or_else(|_| "CPU".into());
+        let dir = std::env::temp_dir().join(format!("oaiy-egpu-real-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = Json::obj([
+            ("llm", Json::obj([
+                ("enabled", Json::Bool(true)),
+                ("temperature", Json::Num(0.0)),
+                ("max_tokens", Json::Int(16)),
+                ("server", Json::str("no-such/oaiy-llm-server")),
+                ("server_webgpu", Json::str("no-such/oaiy-llm-server-webgpu")),
+                ("egpu", Json::obj([("enabled", Json::Bool(true)), ("python", Json::str(python)), ("device", Json::str(device)), ("ctx", Json::Int(1024))])),
+                ("models", Json::Arr(vec![Json::obj([("name", Json::str("m")), ("path", Json::str(file)), ("egpu", Json::Bool(true))])])),
+            ])),
+            ("media", Json::obj([("llm_policy", Json::str("coexist"))])),
+        ]);
+        let studio = Arc::new(Studio::for_test(&dir, cfg.clone()));
+        let said = studio.egpu.check(&cfg, &dir);
+        eprintln!("check: {}", said.to_json());
+        assert_eq!(said.get("ok").and_then(Json::as_bool), Some(true), "{}", said.to_json());
+        // The first chat starts it and waits for it; streamed, as tinygrad sends it.
+        let t = std::time::Instant::now();
+        let (status, kind, body) = chat(&studio, r#"{"model": "m", "stream": true, "messages": [{"role": "user", "content": "Say hello."}]}"#);
+        eprintln!("first chat after {:.1} s: {status} {kind}\n{}", t.elapsed().as_secs_f64(), body.chars().take(700).collect::<String>());
+        assert_eq!(status, 200, "{body}\n{}", studio.egpu.log.tail(40));
+        assert_eq!(kind, "text/event-stream");
+        assert!(body.contains("chat.completion.chunk") && body.trim_end().ends_with("data: [DONE]"), "{body}");
+        let status_now = studio.egpu.status(cfg.get("llm").unwrap());
+        eprintln!("status: {}", status_now.to_json());
+        assert_eq!(status_now.get("state").and_then(Json::as_str), Some("ready"));
+        // Whole, with its counts.
+        let (status, _, body) = chat(&studio, r#"{"model": "m", "messages": [{"role": "user", "content": "Say hello."}]}"#);
+        eprintln!("second chat: {status} {body}");
+        let reply = Json::parse(body.as_bytes()).unwrap();
+        assert_eq!((status, reply.get("model").and_then(Json::as_str)), (200, Some("m")));
+        assert!(reply.get("usage").and_then(|u| u.get("completion_tokens")).and_then(Json::as_i64).is_some_and(|n| (1..=16).contains(&n)), "the reply limit OAIY filled in: {body}");
+        // Itself: nothing without the key, its model with it, and nothing at all on the computer's other address.
+        let (endpoint, lease) = studio.egpu.ensure(&cfg, &dir, "m", Duration::from_secs(5)).map_err(|e| format!("{e:?}")).unwrap();
+        let models = |auth: &[(&str, &str)]| fetch(&endpoint.addr, "GET", "/v1/models", auth, b"", Duration::from_secs(10)).unwrap().status;
+        let auth = format!("Bearer {}", endpoint.key);
+        assert_eq!((models(&[]), models(&[("Authorization", "Bearer wrong")]), models(&[("Authorization", &auth)])), (401, 401, 200));
+        let port: u16 = endpoint.addr.rsplit(':').next().unwrap().parse().unwrap();
+        let elsewhere = std::net::UdpSocket::bind("0.0.0.0:0").and_then(|s| s.connect("192.0.2.1:9").and_then(|()| s.local_addr())).ok().map(|a| a.ip()).filter(|ip| !ip.is_loopback() && !ip.is_unspecified());
+        match elsewhere {
+            Some(ip) => {
+                let refused = std::net::TcpStream::connect_timeout(&std::net::SocketAddr::new(ip, port), Duration::from_secs(3)).is_err();
+                eprintln!("on {ip}:{port}: {}", if refused { "refused" } else { "ANSWERED" });
+                assert!(refused, "tinygrad's server answers on {ip}");
+            }
+            None => eprintln!("this computer has no other address to try"),
+        }
+        if let Ok(pause) = std::env::var("OAIY_EGPU_TEST_PAUSE") {
+            // (time for whoever runs this to read what listens on the port from the OS)
+            eprintln!("port {port}");
+            std::thread::sleep(Duration::from_secs(pause.parse().unwrap_or(5)));
+        }
+        drop(lease);
+        // Let go of without being stopped (as when the studio dies): its standard input closes and it goes.
+        let gone = studio.egpu.let_go(Duration::from_secs(15));
+        eprintln!("after its lifeline closed: {}", if gone { "exited by itself" } else { "STILL RUNNING" });
+        assert!(gone, "tinygrad's server outlived the studio");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

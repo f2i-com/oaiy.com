@@ -472,7 +472,11 @@ sections are:
   default of 8 and passes no flag, so a server from before the option still starts; a number
   is passed as `--park-gb`, 0 = off; see [FLASHNEXT.md](FLASHNEXT.md#two-conversations-on-one-model)),
   `vision`, `autostart`,
-  `idle_stop_minutes`, `extra_args`.
+  `idle_stop_minutes`, `extra_args`. On a Mac only: `egpu` (`enabled`, `python`, `tinygrad`,
+  `device`, `ctx`, `fallback_model`, `env`, `extra_args`) and a model's `egpu: true`, for a
+  card in a Thunderbolt enclosure through tinygrad's server: see
+  [MAC.md](MAC.md#a-card-in-a-thunderbolt-enclosure-through-tinygrad). The section is read
+  nowhere else.
 - `media`: `worker`, `output_dir`, `device`, `llm_policy`, `resume_llm`,
   `keep_jobs`, and:
   - `image`: `enabled`, `default_model`, `memory`, `ram_gb`, `vram_gb` (null =

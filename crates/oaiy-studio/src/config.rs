@@ -496,6 +496,38 @@ pub fn validate(v: &Json) -> Result<(), String> {
             return Err(format!("model {}: devices must be a list of GPU indices", str_or(m, "name", "")));
         }
     }
+    // The eGPU through tinygrad's server (`crate::egpu`, a Mac's): the section is optional, and read on a Mac only.
+    if let Some(egpu) = llm.get("egpu").filter(|e| !matches!(e, Json::Null)) {
+        if egpu.as_object().is_none() {
+            return Err("llm.egpu must be an object".into());
+        }
+        if egpu.get("enabled").is_some_and(|e| e.as_bool().is_none()) {
+            return Err("llm.egpu.enabled must be true or false".into());
+        }
+        for key in ["python", "tinygrad", "device", "fallback_model"] {
+            if egpu.get(key).is_some_and(|s| s.as_str().is_none()) {
+                return Err(format!("llm.egpu.{key} must be text"));
+            }
+        }
+        if egpu.get("ctx").is_some_and(|c| !c.as_i64().is_some_and(|n| (512..=1 << 20).contains(&n))) {
+            return Err("llm.egpu.ctx must be a whole number in 512..1048576".into());
+        }
+        let stands_in = str_or(egpu, "fallback_model", "");
+        if !stands_in.is_empty() && !names.contains(&stands_in) {
+            return Err(format!("llm.egpu.fallback_model {stands_in} is not one of the listed models"));
+        }
+        if egpu.get("env").is_some_and(|e| !e.as_object().is_some_and(|o| o.iter().all(|(k, v)| !k.is_empty() && !k.contains('=') && matches!(v, Json::Str(_) | Json::Int(_))))) {
+            return Err("llm.egpu.env must be an object of names and their values (text or whole numbers)".into());
+        }
+        if egpu.get("extra_args").is_some_and(|a| !a.as_array().is_some_and(|a| a.iter().all(|x| x.as_str().is_some()))) {
+            return Err("llm.egpu.extra_args must be a list of arguments".into());
+        }
+    }
+    for m in models {
+        if m.get("egpu").is_some_and(|e| e.as_bool().is_none()) {
+            return Err(format!("model {}: egpu must be true or false", str_or(m, "name", "")));
+        }
+    }
     for (key, min, max) in [("ctx", 512, 1 << 20), ("max_tokens", 1, 1 << 20), ("cpu_threads", 0, 1024), ("ram_gb", 0, 4096)] {
         // `cpu_threads: null` means "this machine's core count".
         if key == "cpu_threads" && matches!(llm.get(key), Some(Json::Null)) {
@@ -791,6 +823,39 @@ mod tests {
             let err = with(edit).unwrap_err();
             assert!(err.contains(needle), "{err} lacks {needle}");
         }
+    }
+
+    #[test]
+    fn the_egpu_section_is_optional_and_checked_where_there_is_one() {
+        // None in the defaults: a file from before it, and one on a computer that is not a Mac, has none.
+        assert!(default_json().get("llm").unwrap().get("egpu").is_none());
+        let set = |egpu: &str, models: &str| {
+            let (egpu, models) = (Json::parse(egpu.as_bytes()).unwrap(), Json::parse(models.as_bytes()).unwrap());
+            with(move |v| {
+                crate::util::set(field(v, &["llm"]), "egpu", egpu);
+                *field(v, &["llm", "models"]) = models;
+            })
+        };
+        let models = r#"[{"name": "big", "path": "big.gguf", "egpu": true}, {"name": "small", "path": "small.gguf"}]"#;
+        set(r#"{"enabled": true, "python": "", "tinygrad": "/src/tinygrad", "device": "NV", "ctx": 8192, "fallback_model": "small", "env": {"JITBEAM": 2, "X": "y"}, "extra_args": ["--shard", "1"]}"#, models).unwrap();
+        set("{}", models).unwrap();
+        set("null", models).unwrap();
+        for (egpu, needle) in [
+            (r#"[1]"#, "llm.egpu must be an object"),
+            (r#"{"enabled": "yes"}"#, "llm.egpu.enabled"),
+            (r#"{"python": 3}"#, "llm.egpu.python"),
+            (r#"{"ctx": 12}"#, "llm.egpu.ctx"),
+            (r#"{"ctx": "8192"}"#, "llm.egpu.ctx"),
+            (r#"{"fallback_model": "ghost"}"#, "llm.egpu.fallback_model ghost"),
+            (r#"{"env": {"A": true}}"#, "llm.egpu.env"),
+            (r#"{"env": ["A=1"]}"#, "llm.egpu.env"),
+            (r#"{"extra_args": "--shard 2"}"#, "llm.egpu.extra_args"),
+        ] {
+            let err = set(egpu, models).unwrap_err();
+            assert!(err.contains(needle), "{err} lacks {needle}");
+        }
+        let err = set("{}", r#"[{"name": "big", "path": "big.gguf", "egpu": "yes"}]"#).unwrap_err();
+        assert!(err.contains("model big: egpu must be true or false"), "{err}");
     }
 
     #[test]

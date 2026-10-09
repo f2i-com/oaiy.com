@@ -677,7 +677,9 @@ silently, so they get slower rather than failing.
 **Not run on a Mac yet.** The engine, its server and the studio type-check for
 `aarch64-apple-darwin` from Windows (`cargo check --target aarch64-apple-darwin
 -p ggml-rs-wgpu -p oaiy-llm-server -p oaiy-studio`); nothing below has been
-measured, and no release is built for macOS.
+measured on one, and no release is built for macOS. [MAC.md](MAC.md) has the
+steps to build OAIY on a Mac, and what an RTX 5090 held to an Apple GPU's
+limits ran on 2026-10-10.
 
 An M-series Mac has one GPU, and its memory is the computer's own (Metal's
 `hasUnifiedMemory`, which wgpu reports as an integrated GPU). Taken for an
@@ -708,7 +710,9 @@ the computer's memory", and leaves its budget to the engine. An Intel Mac's GPUs
 are not listed.
 
 A GPU on a Thunderbolt enclosure is not reached this way: macOS on Apple silicon
-has no Metal driver for one, so WebGPU does not see it.
+has no Metal driver for one, so WebGPU does not see it. tinygrad's server
+reaches one, and on a Mac the studio can send chosen models' chats to it
+([MAC.md](MAC.md#a-card-in-a-thunderbolt-enclosure-through-tinygrad)).
 
 These runs gave the same tokens as the CPU, but that is not guaranteed in
 general: the GPU sums each dot product in a different order, so a near-tie

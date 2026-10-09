@@ -13,3 +13,8 @@ docs/contracts/transfer/** text eol=lf
 crates/oaiy-relay-core/** text eol=lf
 # and the three files of its dependency that the harness's dependency mutants patch (the crate's tests of its small-order and sealed-box checks).
 crates/oaiy-crypto/src/** text eol=lf
+
+# The Mac's shell scripts, and the Python launcher a Mac's build carries: LF in every checkout. A shell script checked out with CRLF on Windows and
+# carried to a Mac does not run there (its first line names an interpreter that ends in a carriage return).
+tools/mac/** text eol=lf
+crates/oaiy-studio/src/egpu_serve.py text eol=lf

@@ -483,21 +483,7 @@ mod tests {
 
     /// A Studio with `cfg` (nothing started, nothing saved).
     fn studio_with(root: &std::path::Path, cfg: Json) -> crate::Studio {
-        crate::Studio {
-            config_path: root.join("oaiy-studio.json"),
-            root: root.to_path_buf(),
-            config: std::sync::RwLock::new(cfg),
-            llm: std::sync::Arc::new(crate::llm::Llm::new()),
-            media: std::sync::Arc::new(crate::media::Media::new()),
-            system: crate::system::System::new(),
-            log: std::sync::Arc::new(crate::util::LogRing::new(10)),
-            downloads: std::sync::Arc::new(crate::downloads::Downloads::new()),
-            ui_url: std::sync::RwLock::new(String::new()),
-            gateway_url: std::sync::RwLock::new(String::new()),
-            restart_required: std::sync::RwLock::new(false),
-            saving: std::sync::Mutex::new(()),
-            port_overrides: (None, None),
-        }
+        crate::Studio::for_test(root, cfg)
     }
 
     #[test]

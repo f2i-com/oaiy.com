@@ -982,6 +982,31 @@ dialog::backdrop { background: var(--backdrop); }
           <label class="check"><input type="checkbox" data-bind="llm.vision"> Vision</label>
         </div>
       </div>
+      <!-- A Mac's eGPU through tinygrad's server: shown where the engines offer it (macOS) -->
+      <div class="block" id="egpu-block" hidden>
+        <h2>eGPU through tinygrad</h2>
+        <p class="muted small" style="margin-top:0">macOS has no driver for a graphics card in a Thunderbolt enclosure, so OAIY's own engine cannot see one. tinygrad can, through its TinyGPU app. With that set up, a model ticked "On the eGPU" under Models is answered by tinygrad's server on the card, and by this Mac's own GPU whenever the card is not there. It holds one model at a time, reads GGUF files, and answers chats: a request with a picture goes to this Mac's engine.</p>
+        <div class="grid-f" style="grid-template-columns:1fr">
+          <label class="f"><span>Python that has tinygrad (empty = look for one)</span><div class="pathfield"><input type="text" data-bind="llm.egpu.python" placeholder="/opt/homebrew/bin/python3"><button class="btn" type="button" data-pick="llm.egpu.python">Browse</button></div></label>
+          <label class="f"><span>tinygrad folder (a checkout that is not installed; else empty)</span><div class="pathfield"><input type="text" data-bind="llm.egpu.tinygrad" placeholder="/Users/you/tinygrad"><button class="btn" type="button" data-pick="llm.egpu.tinygrad" data-dir="1">Browse</button></div></label>
+        </div>
+        <div class="grid-f" style="margin-top:12px">
+          <label class="f"><span>Card</span><select data-bind="llm.egpu.device" id="egpu-device">
+            <option value="NV">NVIDIA (tinygrad's NV)</option>
+            <option value="AMD">AMD (tinygrad's AMD)</option></select></label>
+          <label class="f"><span>Context (tokens; the card's memory for it is taken at the start)</span><input type="number" min="512" step="1024" data-bind="llm.egpu.ctx" data-type="intnull" placeholder="8192"></label>
+          <label class="f"><span>When the card is not there, answer with</span><select data-bind="llm.egpu.fallback_model" id="egpu-fallback"></select></label>
+        </div>
+        <div class="row" style="margin-top:14px; gap:14px; align-items:center">
+          <label class="check" style="margin-right:8px"><input type="checkbox" data-bind="llm.egpu.enabled"> Use the eGPU</label>
+          <button class="btn" type="button" id="egpu-check">Check tinygrad</button>
+          <button class="btn" type="button" id="egpu-start">Start</button>
+          <button class="btn" type="button" id="egpu-stop">Stop</button>
+          <span id="egpu-tag"></span>
+        </div>
+        <p class="muted small" id="egpu-detail" style="white-space:pre-wrap"></p>
+        <p class="small" id="egpu-check-out" style="white-space:pre-wrap" hidden></p>
+      </div>
       <div class="block">
         <h2>Programs and folders</h2>
         <div class="grid-f" style="grid-template-columns:1fr">
@@ -1259,7 +1284,10 @@ function renderConfig() {
   $("#incognito").checked = !!cfg.privacy?.incognito;
   document.body.classList.toggle("incognito", !!saved?.privacy?.incognito);
   $("#export-models").href = fileUrl("/api/models/export");
+  renderEgpuFallback();
   bindFields(); renderModels(); renderMemory(); renderRoutes(); renderExamples(); renderSelects();
+  // (a card not named yet is an NVIDIA one: shown so, written only when chosen)
+  if ($("#egpu-device") && !$("#egpu-device").value) $("#egpu-device").value = "NV";
   { const on = $("section.view.on"); if (on) renderJump(on.id.slice(2)); }
   $("#cfg-path").textContent = state ? "Configuration: " + state.config_path : "";
 }
@@ -1385,6 +1413,25 @@ function lastResidency(name) {
   if (r.mode) return `<span class="tag ${r.mode === "resident" ? "gpu" : "ram"}">${r.mode === "resident" ? "All on GPU" : "Staged"}</span>`;
   return "";
 }
+// A Mac's eGPU through tinygrad's server (Settings): offered where the engines say so, used where it is switched on.
+function egpuOffered() { return !!state?.egpu?.available; }
+function egpuOn() { return egpuOffered() && !!cfg?.llm?.egpu?.enabled; }
+// A model's tick for it: a GGUF file's only, since tinygrad's server reads nothing else.
+function egpuTick(m) {
+  if (!egpuOn() && !(egpuOffered() && m.egpu)) return "";
+  const gguf = /\.gguf$/i.test((m.path || "").trim());
+  const held = state.egpu.model === m.name ? {ready: "Loaded on the eGPU", starting: "Loading on the eGPU"}[state.egpu.state] : "";
+  return `<div class="row" style="margin-top:8px; gap:10px; align-items:center">
+    <label class="check" title="${gguf ? "Chats with this model are answered by tinygrad's server on the eGPU. When the card is not there, this Mac's GPU answers (Settings says with which model)." : "tinygrad's server reads GGUF files only."}"><input type="checkbox" data-egpu="${esc(m.name)}" ${m.egpu ? "checked" : ""} ${gguf || m.egpu ? "" : "disabled"}> On the eGPU (tinygrad), when the card is there</label>
+    ${held ? `<span class="tag gpu">${held}</span>` : ""}${m.egpu && !egpuOn() ? '<span class="muted small">The eGPU is switched off under Settings.</span>' : ""}</div>`;
+}
+// The models that can stand in for one on the eGPU: this Mac's own, the same model first.
+function renderEgpuFallback() {
+  const sel = $("#egpu-fallback");
+  if (!sel) return;
+  const own = cfg.llm.models.filter(m => m.enabled !== false && !m.egpu);
+  sel.innerHTML = '<option value="">The same model, on this Mac\'s GPU</option>' + own.map(m => `<option value="${esc(m.name)}">${esc(m.name)}</option>`).join("");
+}
 function renderModels() {
   const llm = cfg.llm.models;
   $("#m-llm").innerHTML = llm.length ? llm.map(m => `<div class="item">
@@ -1397,7 +1444,8 @@ function renderModels() {
     <label class="check" style="margin-bottom:8px" title="Qwen3.5 and Qwen3.8 GGUFs that have a multi-token-prediction layer, and Qwen3.8-Flash-Next, on WebGPU: the layer drafts the next few tokens and the model checks them in one run. Experimental: on Qwen3.8 27B a third to two fifths faster on predictable text (lists, facts, code), a little faster on stories and about even at higher temperatures, holding about 0.3 GB more on the GPU; on Flash-Next two fifths to three fifths faster on lists, facts and code (79 to 94 tokens a second where 55 to 58) and a little faster on stories, with the same replies as without it, holding about 1 GB more."><input type="checkbox" data-mtp="${esc(m.name)}" ${m.mtp ? "checked" : ""}> Draft tokens with its MTP layer (experimental)</label>
     <div class="cols" style="gap:12px">${field("Weights", "llm", m.name, "path", m.path)}${field("Vision projector (optional)", "llm", m.name, "vision_projector", m.vision_projector)}${field("LoRA adapter folder (optional)", "llm", m.name, "lora", m.lora, {dir: true})}<label class="f"><span>LoRA strength (1 = as trained)</span><input type="number" step="0.05" min="-4" max="4" value="${esc(String(m.lora_strength ?? 1))}" data-lorastrength="${esc(m.name)}"></label></div>
     ${loraList("llm", m.name, m.loras, "More LoRAs (optional; stacked with the one above, each with a strength)")}
-    <div class="f" style="margin-top:8px"><span class="small muted">GPUs of its own (none ticked: the language model GPUs under Memory)</span><div class="row">${gpuList().map(g => `<label class="check"><input type="checkbox" data-mgpu="${esc(m.name)}|${g.index}" ${(m.devices || []).includes(g.index) ? "checked" : ""}> GPU ${g.index}</label>`).join("")}</div></div>
+    <div class="f" style="margin-top:8px"><span class="small muted">GPUs of its own (none ticked: the language model GPUs under Memory)</span><div class="row">${gpuList().map(g => `<label class="check"><input type="checkbox" data-mgpu="${esc(m.name)}|${g.index}" ${(m.devices || []).includes(g.index) ? "checked" : ""}> ${gpuLabel(g)}</label>`).join("")}</div></div>
+    ${egpuTick(m)}
   </div>`).join("") : '<div class="empty">No language model yet. Add a .gguf file or model folder above.</div>';
 
   const img = Object.entries(cfg.media.image.models);
@@ -1481,6 +1529,13 @@ function renderModels() {
     touch(); shareNote();
   });
   $$("[data-mtp]").forEach(el => el.onchange = () => { const m = modelObj("llm", el.dataset.mtp); if (el.checked) m.mtp = true; else delete m.mtp; touch(); });
+  $$("[data-egpu]").forEach(el => el.onchange = () => {
+    const m = modelObj("llm", el.dataset.egpu);
+    if (el.checked) m.egpu = true; else delete m.egpu;
+    // (a model on the card cannot also be the one that stands in for the card)
+    if (el.checked && cfg.llm.egpu?.fallback_model === m.name) cfg.llm.egpu.fallback_model = "";
+    renderEgpuFallback(); bindFields(); touch();
+  });
   $$("[data-lorastrength]").forEach(el => el.oninput = () => { const m = modelObj("llm", el.dataset.lorastrength); const v = Number(el.value); m.lora_strength = el.value === "" || isNaN(v) ? 1 : v; touch(); });
   $$("[data-lora]").forEach(el => el.oninput = () => { const [s, n, i, k] = el.dataset.lora.split("|"); const l = modelLoras(s, n)[+i];
     l[k] = k === "strength" ? (el.value === "" || isNaN(Number(el.value)) ? 1 : Number(el.value)) : el.value; touch(); });
@@ -1562,6 +1617,11 @@ function renderStripOnly(kind) {
 function gpuList() {
   return sys?.gpus?.length ? sys.gpus : [{index: 0, name: "GPU 0"}, {index: 1, name: "GPU 1"}];
 }
+// A GPU as a tick names it: its number, and what it is where the computer says.
+function gpuLabel(g) {
+  const name = (g.name || "").replace(/^NVIDIA GeForce |^AMD Radeon |^Intel\(R\) /, "");
+  return `GPU ${g.index}${name && name !== "GPU " + g.index ? ` <span class="muted small">${esc(name)}</span>` : ""}`;
+}
 /* The GPUs a language model runs on: its own, else the language model GPUs, else the first two. */
 function modelGpus(m) {
   return m?.devices?.length ? m.devices : cfg.llm.devices.length ? cfg.llm.devices : [0, 1];
@@ -1576,7 +1636,7 @@ function renderDevices() {
   const gpus = gpuList();
   $("#media-device").innerHTML = gpus.map(g => `<option value="${g.index}" ${g.index === cfg.media.device ? "selected" : ""}>GPU ${g.index}: ${esc(g.name)}</option>`).join("");
   $("#media-device").onchange = e => { cfg.media.device = +e.target.value; touch(); renderDevices(); shareNote(); renderMemory(); };
-  $("#llm-devices").innerHTML = gpus.map(g => `<label class="check"><input type="checkbox" value="${g.index}" ${cfg.llm.devices.includes(g.index) ? "checked" : ""}> GPU ${g.index}</label>`).join("");
+  $("#llm-devices").innerHTML = gpus.map(g => `<label class="check"><input type="checkbox" value="${g.index}" ${cfg.llm.devices.includes(g.index) ? "checked" : ""}> ${gpuLabel(g)}</label>`).join("");
   $$("#llm-devices input").forEach(el => el.onchange = () => { cfg.llm.devices = $$("#llm-devices input").filter(i => i.checked).map(i => +i.value); touch(); renderDevices(); shareNote(); });
   // Two or more GPUs: a layout in one choice.
   $("#gpu-layout-f").style.display = gpus.length > 1 ? "" : "none";
@@ -1651,6 +1711,17 @@ function renderHardware() {
       <div class="meter"${known || shared ? ` title="${pct.toFixed(0)}% used"` : ""}><div style="width:${pct}%;background:var(--gpu)"></div></div>
       <div class="num small">${[size, does && `<span class="muted">${does}</span>`].filter(Boolean).join("<br>")}</div></div>`);
   }
+  // A Mac's eGPU, which only tinygrad's server reaches: no reading of its memory, so what it is doing.
+  const e = state?.egpu;
+  if (e?.available && e.enabled) {
+    const does = e.state === "ready" ? [`Runs ${esc(e.model || "")}`, "through tinygrad"]
+      : e.state === "starting" ? [`Loading ${esc(e.model || "")}`, "its first start compiles kernels: minutes"]
+      : e.state === "failed" ? ["Not answering", "this computer's GPU answers instead"]
+      : ["Not started", e.models?.length ? "starts on the first request" : "no model is set to it (Models)"];
+    rows.push(`<div class="hw-row"><div class="label">eGPU<small>${e.device === "AMD" ? "AMD" : "NVIDIA"} card, through tinygrad</small></div>
+      <div class="meter"><div style="width:${e.state === "ready" ? 100 : 0}%;background:var(--gpu)"></div></div>
+      <div class="num small">${does[0]}<br><span class="muted">${does[1]}</span></div></div>`);
+  }
   if (ram?.total_mb) {
     const used = ram.total_mb - ram.available_mb;
     rows.push(`<div class="hw-row"><div class="label">RAM<small>System memory</small></div>
@@ -1672,6 +1743,7 @@ function renderState() {
   $("#llm-stop").disabled = l.state === "stopped";
   $("#llm-note").textContent = state.restart_required ? "Listener changes apply after the studio restarts." : "";
   $("#foot-llm").className = "dot " + l.state; $("#foot-llm-text").textContent = "LLM " + label.toLowerCase();
+  renderEgpu();
   const priv = state.media.private || [];
   const active = state.media.jobs.find(j => j.status === "in_progress") || priv.find(j => j.status === "in_progress");
   $("#foot-media").className = "dot " + (active ? "starting" : ""); $("#foot-media-text").textContent = active ? `${kindText(active.kind)} ${active.progress.toFixed(0)}%` : "Media idle";
@@ -1701,6 +1773,40 @@ function renderState() {
   if ($("#v-gallery").classList.contains("on")) renderGallery(state.media.jobs);
   $("#cfg-path").textContent = "Configuration: " + state.config_path;
 }
+// The eGPU's block under Settings: there where the engines offer it (a Mac), with what tinygrad's server is doing.
+let egpuOfferedBefore = null;
+function renderEgpu() {
+  const e = state?.egpu, block = $("#egpu-block");
+  block.hidden = !e?.available;
+  // Its ticks under Models and its row on the Overview follow what the engines say, once they have said it.
+  if (egpuOfferedBefore !== !!e?.available && cfg) { egpuOfferedBefore = !!e?.available; renderModels(); }
+  if (!e?.available) return;
+  const label = !e.enabled ? "Off" : {stopped: "Not started", starting: "Loading", ready: "Ready", failed: "Not answering"}[e.state];
+  $("#egpu-tag").innerHTML = `<span class="tag ${e.enabled && e.state === "ready" ? "good" : e.enabled && e.state === "failed" ? "bad" : ""}">${label}</span>`;
+  const set = e.models?.length ? "" : " No model is set to it yet: tick one under Models.";
+  $("#egpu-detail").textContent = !e.enabled ? "Switched off: every model runs on this computer's own GPU."
+    : e.state === "ready" ? `Serving ${e.model}${e.runs_on ? " on " + e.runs_on : ""}, up to ${e.context_tokens} tokens of context. Loaded in ${e.load_seconds?.toFixed(1)} s, idle ${e.idle_seconds} s.`
+    : e.state === "starting" ? `Loading ${e.model || ""}. tinygrad compiles its kernels the first time a model starts, which takes minutes; requests wait for it.`
+    : e.state === "failed" ? `${e.error || "tinygrad's server failed."}\n\nThis computer's GPU answers meanwhile.${e.retry_seconds ? ` It is tried again in ${e.retry_seconds} s, or now with Start.` : ""}`
+    : "Not running. It starts on the first chat with a model set to it." + set;
+  $("#egpu-start").disabled = !e.enabled || !e.models?.length || e.state === "starting";
+  $("#egpu-stop").disabled = e.state === "stopped";
+}
+$("#egpu-check").onclick = async () => {
+  const out = $("#egpu-check-out");
+  out.hidden = false; out.textContent = "Asking the Pythons here what they have...";
+  try {
+    const c = await api("/api/egpu/check");
+    const tried = (c.tried || []).map(t => `  ${t.python}: ${t.error}`).join("\n");
+    out.textContent = c.ok
+      ? `Found: ${c.python} (Python ${c.version}) has tinygrad in ${c.tinygrad}${c.commit ? `, at commit ${c.commit}` : ""}.`
+        + (c.jinja2 ? "" : "\nIts jinja2 is missing: without it tinygrad uses a plain chat format and no tool calls. Install it with that Python: -m pip install jinja2")
+        + (tried ? `\nPassed over:\n${tried}` : "")
+      : `${c.error}\n\nName the Python that has tinygrad above (and the tinygrad folder, where it is a checkout that is not installed), save, and check again.`;
+  } catch (e) { out.textContent = e.message; }
+};
+$("#egpu-start").onclick = () => api("/api/egpu/start", {method: "POST"}).then(refresh, e => { toast(e.message, true); refresh(); });
+$("#egpu-stop").onclick = () => api("/api/egpu/stop", {method: "POST"}).then(refresh, e => toast(e.message, true));
 // Status lines include worker output: plain text, escaped here once.
 function statusText(j) { return esc(statusRaw(j)); }
 // A job's kind as people say it.
