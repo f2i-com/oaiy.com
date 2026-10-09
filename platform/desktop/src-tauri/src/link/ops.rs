@@ -857,7 +857,7 @@ mod guard_tests {
         // does not cover either (a gap the docs name, not a rule).
         let flows = local(&world);
         for verb in KEPT_HERE {
-            let outcome = flows("aokie", verb, &json!({}), "run-1#action1");
+            let outcome = flows("aokie", verb, &json!({}), "run-1:action1");
             assert_eq!(outcome.unwrap_err(), NOT_RUNNING, "{verb}");
         }
     }
@@ -1268,10 +1268,26 @@ process.stdin.on("data", (chunk) => {
             assert_eq!(reset["answered"], "dongle.reset");
 
             // A binding's follow-up after a flow run (not asked either, see the docs).
-            let follow_up = local(&world)("aokie", "consent.revoke", &json!({}), "run-1#action1").expect("a flow's follow-up");
-            assert_eq!(follow_up["requestId"], "relay-command-run-1#action1");
+            let follow_up = local(&world)("aokie", "consent.revoke", &json!({}), "run-1:action1").expect("a flow's follow-up");
+            assert_eq!(follow_up["requestId"], "relay-command-run-1:action1");
 
-            assert_eq!(verbs(&seen(&world)), ["dongle.installDriver", "dongle.reset", "consent.revoke"]);
+            // A real run's key is the binding's id and the event's own key. For a booking made in a call
+            // that is longer, with the relay's prefix, than the 128 characters Aokie takes in a request
+            // id, and Aokie refused it: the booking's confirmation text was never sent. It reaches the
+            // plugin in a form it takes, the same one when the event is delivered again, and another
+            // one for the binding's next action.
+            let run = "flow:11111111-2222-4333-8444-555555555555:aokie:call_0123456789abcdef0123456789abcdef:appointment.requested.appt_fedcba9876543210fedcba9876543210:v1";
+            let send = |action: &str| {
+                let answer = local(&world)("aokie", "sms.send", &json!({ "to": "0491 570 157", "body": "Booked" }), &format!("{run}:{action}")).expect("a booking's text");
+                answer["requestId"].as_str().expect("the request id the plugin saw").to_string()
+            };
+            let (first, again, next) = (send("action1"), send("action1"), send("action2"));
+            assert!(first.len() <= 128 && first.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':')), "{first}");
+            assert!(first.starts_with("relay-command-flow:11111111-2222-4333-8444-555555555555:"), "{first}");
+            assert_eq!(first, again);
+            assert_ne!(first, next);
+
+            assert_eq!(verbs(&seen(&world)), ["dongle.installDriver", "dongle.reset", "consent.revoke", "sms.send", "sms.send", "sms.send"]);
         }
     }
 }

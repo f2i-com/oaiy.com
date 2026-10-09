@@ -1163,7 +1163,8 @@ impl PluginHost {
             params["payload"] = p;
         }
         if let Some(k) = idempotency_key {
-            params["requestId"] = json!(k);
+            // What the plugin journals the command under: the caller's key, in a form a plugin takes.
+            params["requestId"] = json!(request_id_for(k));
         }
 
         process
@@ -2296,6 +2297,45 @@ pub enum ForwardError {
     Internal(String),
 }
 
+/// The longest request id a plugin is sent.
+pub const REQUEST_ID_MAX: usize = 128;
+
+/// Whether a plugin takes `c` in a request id: an ASCII letter or digit, or one of `-_.:`.
+fn request_id_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':')
+}
+
+/// The request id a plugin is sent for a caller's idempotency key.
+///
+/// A plugin journals a command under its request id and may refuse one it would not
+/// store, or put in an event, as it is. Aokie takes 1 to 128 ASCII letters, digits and
+/// `-_.:`, and answers anything else "requestId must be 1..=128 safe identifier
+/// characters" before it looks at the command. The keys callers make were not held to
+/// that: a binding's follow-up after a flow run was keyed `<the run's key>#action<n>`,
+/// and the run's key is `flow:<binding>:<the event's key>`, which passes 128 by itself
+/// for an event with a long key. So every such follow-up was refused, and a booking's
+/// confirmation text was never sent.
+///
+/// A key that fits goes as it is. One that does not goes as its first characters (any
+/// the plugin would not take as `.`) and the SHA-256 of the whole key: the same key
+/// gives the same id every time, which is what the plugin's journal needs to stop a
+/// redelivery from running a command twice, and two keys do not share one. A blank key
+/// is left alone, since a key is never made up for a caller that gave none.
+pub(crate) fn request_id_for(key: &str) -> std::borrow::Cow<'_, str> {
+    const MARK: &str = ":sha256:";
+    const DIGEST: usize = 64;
+    if key.trim().is_empty() || (key.len() <= REQUEST_ID_MAX && key.chars().all(request_id_char)) {
+        return std::borrow::Cow::Borrowed(key);
+    }
+    let head: String = key
+        .chars()
+        .take(REQUEST_ID_MAX - MARK.len() - DIGEST)
+        .map(|c| if request_id_char(c) { c } else { '.' })
+        .collect();
+    let digest = crate::link::script_profile::sha256_hex(key);
+    std::borrow::Cow::Owned(format!("{head}{MARK}{digest}"))
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2347,6 +2387,66 @@ mod tests {
 
     fn skipped(binding: &str, reason: SkipReason) -> DispatchOutcome {
         DispatchOutcome::Skipped { binding_id: binding.into(), reason }
+    }
+
+    /// The Aokie plugin's own rule for a request id, as its `connector.request` handler has it.
+    fn a_plugin_takes(id: &str) -> bool {
+        !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
+    }
+
+    #[test]
+    fn a_key_a_plugin_takes_is_sent_as_it_is() {
+        // What reaches the phone bridge today: the calendar's, a relayed command's, an outreach call's, a job's.
+        for key in [
+            "oaiy-calendar-1791524777484-2sqm7mjjz5q",
+            "relay-command-6b6e21fd-6cd2-41ed-ac1a-a30a91cbad3a",
+            "oaiy:outreach:out-muounl8y-yjtd:p1:1",
+            "job:push:358449de",
+            "screen-1",
+        ] {
+            assert!(a_plugin_takes(key), "{key}");
+            assert_eq!(request_id_for(key), key);
+        }
+        // 128 characters is still one the plugin takes.
+        let longest = "k".repeat(REQUEST_ID_MAX);
+        assert_eq!(request_id_for(&longest), longest.as_str());
+        // A key is not made up for a caller that gave none: the plugin's refusal of it stands.
+        assert_eq!(request_id_for(""), "");
+        assert_eq!(request_id_for("  "), "  ");
+    }
+
+    #[test]
+    fn a_key_a_plugin_would_refuse_is_sent_in_a_form_it_takes_and_the_same_one_each_time() {
+        // A binding's follow-up after a flow run, for an event whose own key is long (a booking made in a
+        // call), with the relay's prefix: far over the 128 a plugin takes. And the forms that carried a `#`.
+        let booking = "relay-command-flow:11111111-2222-4333-8444-555555555555:aokie:call_0123456789abcdef0123456789abcdef:appointment.requested.appt_fedcba9876543210fedcba9876543210:v1:action1";
+        assert!(booking.len() > REQUEST_ID_MAX, "{}", booking.len());
+        let keys = [
+            booking.to_string(),
+            booking.replace(":action1", ":action2"),
+            "relay-command-run-1#action1".to_string(),
+            "relay-command-run-1#action2".to_string(),
+            "flow:b1:evt-1#redrive2".to_string(),
+            "k".repeat(REQUEST_ID_MAX + 1),
+            "app-logic-evt-1-64e66cc1/aokie-call-turn-0".to_string(),
+            "réservation 12".to_string(),
+        ];
+        let ids: Vec<String> = keys.iter().map(|k| request_id_for(k).into_owned()).collect();
+        for (key, id) in keys.iter().zip(&ids) {
+            assert!(!a_plugin_takes(key), "{key}");
+            assert!(a_plugin_takes(id), "{key} -> {id}");
+            // A redelivery makes the same id, or the plugin's journal could not stop a second run.
+            assert_eq!(request_id_for(key), id.as_str());
+        }
+        // Two keys never share an id: two actions of one binding, two events with one beginning.
+        for (i, a) in ids.iter().enumerate() {
+            for b in &ids[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        // The plugin's journal still shows where the key came from.
+        assert!(ids[0].starts_with("relay-command-flow:11111111-2222-4333-8444-555555555555:"), "{}", ids[0]);
+        assert!(ids[2].starts_with("relay-command-run-1.action1:sha256:"), "{}", ids[2]);
     }
 
     #[test]

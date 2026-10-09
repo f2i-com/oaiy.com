@@ -113,7 +113,13 @@ choices were made by hand:
 
 Every command on the left that changes something is one the plugin journals, so it
 carries the idempotency key the relay makes from the command's id
-(`relay-command-<id>`), and a redelivery cannot run it twice. The provider keeps
+(`relay-command-<id>`), and a redelivery cannot run it twice. A plugin is sent that
+key as its request id when it is one a plugin takes (Aokie: 1 to 128 ASCII letters,
+digits and `-_.:`), and otherwise as its first 56 characters, `:sha256:` and the
+SHA-256 of the whole key, which is as stable. A binding's follow-up after a flow run
+is keyed `<the run's key>:action<n>`, and a run's key (`flow:<binding>:<the event's
+key>`) can pass 128 characters, so its request id is often of the second kind. The
+provider keeps
 `call.takeOver`, `call.resumeBot`, `call.endCaller`, `call.declineWaiting`,
 `call.remoteStatus`, `call.assistance.respond` and `remote.*` off its own relay;
 none of them is on the list here either.

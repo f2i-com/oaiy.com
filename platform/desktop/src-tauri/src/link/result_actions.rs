@@ -566,8 +566,13 @@ pub fn perform_all(
 /// retry of the same logical event — a redelivered call.ended must not send a
 /// second SMS — and distinct between two actions of one binding, which would
 /// otherwise collapse into each other and silently perform only the first.
+///
+/// One more `:` segment after the run's own, in the characters a plugin takes in a
+/// request id. It was `#action<n>`, and Aokie refuses a `#` there: no follow-up that
+/// sent it a command ever arrived. A key too long for a plugin is fitted where it is
+/// sent (`plugins::host::request_id_for`).
 fn action_key(run_key: &str, index: usize) -> String {
-    format!("{run_key}#action{}", index + 1)
+    format!("{run_key}:action{}", index + 1)
 }
 
 fn planned_name(action: &Planned, index: usize) -> String {
@@ -1111,6 +1116,10 @@ mod tests {
         assert_eq!(keys.len(), 2);
         assert_ne!(keys[0], keys[1]);
         assert!(keys[0].starts_with(run_key), "{}", keys[0]);
+        // Nothing in them a plugin refuses in a request id (a `#` was, by Aokie).
+        for key in &keys {
+            assert!(key.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':')), "{key}");
+        }
     }
 
     #[test]
