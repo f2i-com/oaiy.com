@@ -193,6 +193,22 @@ describe('text-message conversations', () => {
     expect(desktop.commands.map((c) => c.payload.body)).toEqual(['Who is this?']);
   });
 
+  it('a sender who opened with a link is not answered again for what the agent wrote back by itself', async () => {
+    const fake = fakeProvider('openai', []);
+    const messages = { answer: false, instructions: '' };
+    const { sessions, desktop } = setup(messages);
+    // As an earlier build left it: the scam kept, and the agent's own answer to it after it.
+    const scam = await sessions.textArrived('+61400000008', '', 'Your myGov account is on hold: mygov-refund.info');
+    scam.agent.turns.push({ role: 'assistant', text: 'I let them know we could not help.', calls: [] } as never);
+    messages.answer = true;
+    await sessions.textArrived('+61400000008', '', 'Final notice, act now: mygov-refund.info/pay');
+    await settled(sessions);
+    expect(fake.bodies).toHaveLength(0);
+    expect(desktop.commands).toEqual([]);
+    expect(sessions.notAnswered(scam)).toContain('opened with a link');
+    expect(sessions.answerWaiting()).toBe(0);
+  });
+
   it('a link from someone already answered, or with no link at all, is answered as before', async () => {
     fakeProvider('openai', [
       { calls: [{ name: 'send_text_message', input: { body: 'Yes, we are.' } }] },
@@ -209,8 +225,8 @@ describe('text-message conversations', () => {
   });
 
   it('a link is a web address, not any word with a full stop in it', () => {
-    for (const text of ['see https://example.com/x', 'http://a.co', 'go to www.example.com now', 'bit.ly/3xYz', 'claim: mygov-refund.example.net/login?id=1']) expect(hasLink(text), text).toBe(true);
-    for (const text of ['Thanks.See you at 3', 'It cost $4.50', 'e.g. tomorrow', 'Call me on 0400 000 000', 'ok', 'my email is sam@example.com']) expect(hasLink(text), text).toBe(false);
+    for (const text of ['see https://example.com/x', 'http://a.co', 'go to www.example.com now', 'bit.ly/3xYz', 'claim: mygov-refund.example.net/login?id=1', 'Your refund: mygov-refund.info', 'visit ato-gov.au today', 'see example.com.au.']) expect(hasLink(text), text).toBe(true);
+    for (const text of ['Thanks.See you at 3', 'It cost $4.50', 'e.g. tomorrow', 'Call me on 0400 000 000', 'ok', 'my email is sam@example.com', 'sam.smith@example.com.au', 'the file is notes.txt', 'I use node.js']) expect(hasLink(text), text).toBe(false);
   });
 
   it('a pretend text is answered but never sent', async () => {

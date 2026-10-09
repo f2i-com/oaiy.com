@@ -189,12 +189,21 @@ export function sameNumber(a: string, b: string): boolean {
   return x.length >= 8 && y.length >= 8 && x.slice(-9) === y.slice(-9);
 }
 
+/** How a site's name ends, where one is written bare ("mygov-refund.info"): the endings links in texts have. */
+const SITE_ENDINGS = 'com|net|org|info|biz|xyz|top|online|site|shop|club|live|link|click|vip|icu|app|io|cc|ly|gl|gd|ru|cn|au|nz|uk|gov|edu';
+const LINK = new RegExp(
+  // "http(s)://…", "www.…", a site with a path ("bit.ly/x"), or a bare site name with a known ending.
+  `\\bhttps?:\\/\\/\\S|\\bwww\\.\\S|(?<![@\\w.-])[a-z0-9-]+(?:\\.[a-z0-9-]+)*\\.(?:[a-z]{2,}\\/\\S|(?:${SITE_ENDINGS})(?![\\w@-]))`,
+  'i',
+);
+
 /**
- * Whether a text carries a link: "http(s)://…", "www.…", or a site with a
- * path ("bit.ly/x"). A word with a full stop in it ("Thanks.See you") is not one.
+ * Whether a text carries a link: "http(s)://…", "www.…", a site with a path
+ * ("bit.ly/x"), or a site's bare name ("mygov-refund.info"). A word with a full
+ * stop in it ("Thanks.See you") is not one, nor is an email address.
  */
 export function hasLink(text: string): boolean {
-  return /\bhttps?:\/\/\S|\bwww\.\S|\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,}\/\S/i.test(text);
+  return LINK.test(text);
 }
 
 /** A text message as the conversation's agent reads it. */
@@ -2178,25 +2187,29 @@ export class Sessions {
     if (session.key === TEST_NUMBER) return '';
     if (session.hidden || !isPersonNumber(session.key)) return "not a person's phone number (a sender's name or a short code)";
     if (isBlocked(session.key, blocked)) return "on the phone's blocked list";
-    // A scam or an advertisement nearly always carries a link, and comes from a number never dealt with. The
-    // phone may have that number blocked or marked as spam: neither is known here (they do not cross Bluetooth).
-    const linked = hasLink(incoming) || session.agent.turns.some((t) => t.role === 'user' && t.text.startsWith('Text message from ') && hasLink(t.text));
-    if (linked && this.stranger(session)) return 'someone you have not dealt with whose text carries a link (it reads like a scam or an advertisement)';
+    // A scam or an advertisement nearly always opens with a link. The phone may have its number blocked or
+    // marked as spam: neither is known here (they do not cross Bluetooth).
+    if (this.unsolicited(session, incoming)) return 'someone you have not dealt with who opened with a link (it reads like a scam or an advertisement)';
     return '';
   }
 
   /**
-   * Whether the business has had nothing to do with a text thread's sender:
-   * the person never wrote in their conversation or gave them a name or a note
-   * in Contacts, they never rang, they are not part of an outreach, and nothing
-   * was ever written back to them.
+   * Whether a text thread reads as a scam's or an advertisement's: its sender
+   * opened with a link (the first text of theirs kept here carries one, or this
+   * one does and it is their first), and the person has not taken them up:
+   * never wrote in the conversation themselves, gave them no name or note in
+   * Contacts, and they are not part of an outreach. What the agent wrote back
+   * by itself does not count: it answered such a text before this was looked
+   * at, and the sender's next one is not to be answered for that.
    */
-  private stranger(session: Session): boolean {
+  private unsolicited(session: Session, incoming: string): boolean {
     if (session.vouched || session.outreach || this.outreach?.forText(session.key)) return false;
     const note = this.callerNote(session.key);
     if (note && (note.nameBy === 'owner' || !!note.notes?.trim() || !!note.ownerFacts?.length)) return false;
-    const lanes = this.list.filter((s) => s.kind !== 'task' && s.thread === session.thread);
-    return !lanes.some((s) => s.agent.turns.some((t) => t.role !== 'user' || !t.text.startsWith('Text message from ')));
+    const isText = (t: Turn): t is Extract<Turn, { role: 'user' }> => t.role === 'user' && t.text.startsWith('Text message from ');
+    // The person's own words in it: not a text's, not a note of OAIY's.
+    if (session.agent.turns.some((t) => t.role === 'user' && !t.automatic && !t.text.startsWith('Text message from ') && !t.text.startsWith('[OAIY]'))) return false;
+    return hasLink(session.agent.turns.find(isText)?.text ?? incoming);
   }
 
   /** Whether a lane is the person at `key` (never a hidden caller's, and the pretend conversation only itself). */
