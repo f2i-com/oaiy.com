@@ -956,6 +956,7 @@ dependencies = [
  "ggml-quants",
  "ggml-rs",
  "half",
+ "objc2-metal",
  "pollster",
  "rayon",
  "wgpu",

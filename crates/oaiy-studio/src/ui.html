@@ -971,7 +971,7 @@ dialog::backdrop { background: var(--backdrop); }
             <option value="auto">Auto: a GPU (WebGPU), else the CPU</option>
             <option value="webgpu">WebGPU (any GPU)</option>
             <option value="cpu">CPU only</option></select></label>
-          <label class="f"><span>WebGPU weights (GB, empty = by GPU type)</span><input type="number" min="0" data-bind="llm.webgpu_gb" data-type="intnull" placeholder="8 discrete, 2 integrated"></label>
+          <label class="f"><span>WebGPU weights (GB, empty = by the GPU's memory)</span><input type="number" min="0" data-bind="llm.webgpu_gb" data-type="intnull" placeholder="a card's memory less 4, a Mac's share"></label>
         </div>
         <p class="muted small">WebGPU runs every model on any Direct3D 12, Vulkan or Metal GPU: weights past the limit stay in RAM and run on the CPU. A Mac's own GPU shares the computer's memory: left empty, it holds what a card with two thirds of that memory would.</p>
         <div class="row" style="margin-top:14px; gap:22px">

@@ -385,7 +385,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let row = i / p[0].x;
     let second = select(0u, p[1].z, row < p[1].x || row >= p[1].y);
     var g = mods[second + p[0].z + i % p[0].x];
-    if (p[0].w == 1u) { g = tanh(g); }
+    if (p[0].w == 1u) { g = tanh(clamp(g, -15.0, 15.0)); }
     x[i] += yv[i] * g;
 }
 "#;

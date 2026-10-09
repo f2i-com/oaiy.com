@@ -19,4 +19,9 @@ bytemuck    = "1.16"
 # Vulkan's memory budget (VK_EXT_memory_budget), through wgpu's own instance (its version, so its types)
 ash         = "0.38"
 
+# A Mac's GPU's own word on how much it should hold (MTLDevice.recommendedMaxWorkingSetSize), through wgpu's own
+# Metal device (its version, so its types)
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-metal = { version = "0.3", default-features = false, features = ["MTLDevice"] }
+
 [dev-dependencies]

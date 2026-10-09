@@ -696,9 +696,13 @@ left to the system, its programs and the model's own use of the CPU:
 | 48 GB | 28 GiB |
 | 64 GB | 38.7 GiB |
 
-Where the Mac's owner has told macOS how much its GPU may keep (`sudo sysctl
-iogpu.wired_limit_mb=N`; `sysctl iogpu.wired_limit_mb` reads it, 0 is the
-system's own choice), that is the card's size instead. `--webgpu-gb N`
+That table is the two-thirds rule, which is what is used where Metal does not
+say. Where it does (`MTLDevice.recommendedMaxWorkingSetSize`, read through wgpu's
+own Metal device), its figure for what the GPU should hold is the card's size
+instead: it is the system's own, and follows what the Mac's owner has told macOS
+the GPU may keep (`sudo sysctl iogpu.wired_limit_mb=N`; `sysctl
+iogpu.wired_limit_mb` reads it, 0 is the system's own choice), which is read too
+for where Metal gives no figure. The server's log says the figure. `--webgpu-gb N`
 (`llm.webgpu_gb` in OAIY) sets the weights' budget outright, as on any GPU.
 Weights on the GPU and weights left in RAM come out of the same memory there, so
 a budget past what is free makes the Mac swap rather than fail.
@@ -707,7 +711,15 @@ The computer's memory is read from `sysctl -n hw.memsize` and `vm_stat` (free,
 speculative and inactive pages are what a new allocation can have), by the engine
 for its caches and by the studio, which lists the chip as the one GPU, "sharing
 the computer's memory", and leaves its budget to the engine. An Intel Mac's GPUs
-are not listed.
+are not listed. A cache in RAM sized from the free memory before a model's
+weights go up (a streamed model's experts) takes the GPU's share off first
+there, since both come out of the same memory.
+
+Two aids for a GPU that is not at hand: `OAIY_PORTABLE_LIMITS=1` opens any
+device with what wgpu's Metal backend gives an Apple GPU (wgpu then refuses a
+kernel past one of those limits as it would on a Mac), and
+`OAIY_KERNEL_DUMP=folder` writes each kernel's WGSL there as it is made, for
+another API's translator (naga's Metal writer runs on any computer).
 
 A GPU on a Thunderbolt enclosure is not reached this way: macOS on Apple silicon
 has no Metal driver for one, so WebGPU does not see it. tinygrad's server

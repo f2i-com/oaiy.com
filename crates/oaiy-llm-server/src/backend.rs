@@ -51,6 +51,12 @@ fn webgpu(o: &Options, devices: &[usize]) -> std::result::Result<Picked, String>
     };
     let a = b.adapter().clone();
     let (_, budget) = b.usage();
+    // (once a process: what this GPU gives a kernel, for whoever reads the log of a computer the engine was not
+    // tried on)
+    static SAID: std::sync::Once = std::sync::Once::new();
+    if !o.silent && !o.quiet {
+        SAID.call_once(|| eprintln!("oaiy-llm-server: {} gives its kernels {}", a.name, b.limits_line()));
+    }
     Ok(Picked {
         backend: Arc::new(b),
         // (a GPU whose memory is the computer's says so: what it holds comes out of the RAM the rest would use)

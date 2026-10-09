@@ -188,7 +188,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         let j = i % ff;
         let g = x[r * 2u * ff + j];
         let inner = 0.7978845608028654 * (g + 0.044715 * g * g * g);
-        y[i] = 0.5 * g * (1.0 + tanh(inner)) * x[r * 2u * ff + ff + j];
+        y[i] = 0.5 * g * (1.0 + tanh(clamp(inner, -15.0, 15.0))) * x[r * 2u * ff + ff + j];
     }
 }
 "#;
@@ -353,7 +353,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if (i < p[0].x) {
         let g = x[i];
         let inner = 0.7978845608028654 * (g + 0.044715 * g * g * g);
-        y[i] = 0.5 * g * (1.0 + tanh(inner));
+        y[i] = 0.5 * g * (1.0 + tanh(clamp(inner, -15.0, 15.0)));
     }
 }
 "#;

@@ -261,6 +261,9 @@ fn dot(
     avx512: bool,
     out: &mut [f32],
 ) -> Result<()> {
+    // (another CPU has only the portable rows: an Apple-silicon Mac's)
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = avx512;
     match dtype {
         GgmlType::Q4_K => {
             #[cfg(target_arch = "x86_64")]

@@ -372,6 +372,16 @@ impl Gpu {
                 );
             }
         }
+        // OAIY_KERNEL_DUMP: a folder each kernel's text is written to as it is made, one file a text (its name and a
+        // hash of it): to read one, and to give them all to another API's translator where no such GPU is at hand (a
+        // Mac's is naga's Metal writer, which runs anywhere)
+        if let Some(dir) = std::env::var_os("OAIY_KERNEL_DUMP") {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            source.hash(&mut h);
+            let plain: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{plain}-{:016x}.wgsl", h.finish())), &source);
+        }
         self.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(name), source: wgpu::ShaderSource::Wgsl(source.into()) })
     }
 

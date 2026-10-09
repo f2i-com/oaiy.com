@@ -37,6 +37,22 @@ const ARENA_DISPATCHES: usize = 256;
 /// A dispatch's parameters (the kernels' `p`).
 const PARAM_BYTES: u64 = 48;
 
+/// Bytes from one dispatch's parameters to the next's: the least multiple of the device's alignment for a uniform's
+/// offset that holds them (64 on an NVIDIA card, 256 on a Mac and through Direct3D; the larger of the two alone
+/// gave 48 where the alignment is 32, which is no multiple of it).
+fn param_step(alignment: u32) -> u32 {
+    (PARAM_BYTES as u32).next_multiple_of(alignment.max(16))
+}
+
+#[cfg(test)]
+#[test]
+fn a_dispatchs_parameters_start_at_a_multiple_of_the_devices_alignment() {
+    for (alignment, step) in [(16u32, 48u32), (32, 64), (64, 64), (256, 256)] {
+        assert_eq!(param_step(alignment), step, "alignment {alignment}");
+        assert_eq!(step % alignment, 0);
+    }
+}
+
 impl Arena {
     fn new(gpu: &Gpu) -> Arena {
         let entry = |binding, ty| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::COMPUTE, ty, count: None };
@@ -52,7 +68,7 @@ impl Arena {
         });
         let pipeline_layout =
             gpu.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("oaiy-dense-arena"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
-        let step = gpu.limits.min_uniform_buffer_offset_alignment.max(PARAM_BYTES as u32).next_multiple_of(16);
+        let step = param_step(gpu.limits.min_uniform_buffer_offset_alignment);
         let buffer = |label, size, usage| gpu.device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: false });
         Arena {
             pipeline_layout,

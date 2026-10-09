@@ -12,7 +12,9 @@
 //! `OpenOptionsExt::custom_flags`, and the alignment comes from offsetting
 //! into an over-allocated `Vec`.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(any(windows, target_os = "linux"))]
+use std::fs::OpenOptions;
 use std::io;
 use std::path::Path;
 

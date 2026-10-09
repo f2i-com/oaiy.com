@@ -202,7 +202,7 @@ fn other_gpus() -> Vec<Json> {
         return Vec::new();
     }
     let chip = said("/usr/sbin/sysctl", &["-n", "machdep.cpu.brand_string"]).unwrap_or_default();
-    vec![apple_gpu(&chip, ram_mb().map(|(total, _)| total))]
+    vec![apple_gpu(&chip, mac_total_mb())]
 }
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
@@ -220,9 +220,15 @@ fn parse_vm_stat(text: &str) -> Option<u64> {
     Some((pages("Pages free:")? + pages("Pages inactive:")? + pages("Pages speculative:").unwrap_or(0)) * page / (1024 * 1024))
 }
 
+/// A Mac's memory in megabytes, by itself: its GPU's memory is this, whether or not `vm_stat` can be read too.
+#[cfg(target_os = "macos")]
+fn mac_total_mb() -> Option<u64> {
+    said("/usr/sbin/sysctl", &["-n", "hw.memsize"])?.trim().parse::<u64>().ok().map(|bytes| bytes / (1024 * 1024)).filter(|&mb| mb > 0)
+}
+
 #[cfg(target_os = "macos")]
 fn ram_mb() -> Option<(u64, u64)> {
-    let total = said("/usr/sbin/sysctl", &["-n", "hw.memsize"])?.trim().parse::<u64>().ok()? / (1024 * 1024);
+    let total = mac_total_mb()?;
     let available = parse_vm_stat(&said("/usr/bin/vm_stat", &[])?)?;
     Some((total, available.min(total)))
 }

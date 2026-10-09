@@ -59,18 +59,63 @@ pub(super) fn unified(info: &wgpu::AdapterInfo) -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64")) && info.backend == wgpu::Backend::Metal && info.device_type == wgpu::DeviceType::IntegratedGpu
 }
 
-/// The weights a GPU that shares the computer's memory holds by default: what a card with two thirds of that memory
-/// would ([`discrete_budget`]), the other third the system's, its programs' and the model's own use of the CPU. Where
-/// the computer's owner has said how much the GPU may have (`wired_limit`: a Mac's `sysctl iogpu.wired_limit_mb`, 0
-/// or absent where they have not), a card with that much, never more than the computer has.
-pub(super) fn unified_budget(total: u64, wired_limit: Option<u64>) -> u64 {
-    discrete_budget(wired_limit.filter(|&w| w > 0).unwrap_or(total / 3 * 2).min(total))
+/// The weights a GPU that shares the computer's memory holds by default: what a card ([`discrete_budget`]) with as
+/// much memory as the GPU may have would. That is what the system itself says (`metal`: Metal's recommended most for
+/// the GPU, which on a Mac follows its owner's `sysctl iogpu.wired_limit_mb`); where it does not say, the owner's
+/// limit (`wired_limit`; 0 or absent where they set none); else two thirds of the computer's memory (the least of
+/// what Macs are said to give their GPUs, two thirds to three quarters: none has told this code yet), the other
+/// third the system's, its programs' and the model's own use of the CPU. Never more than the computer has (`total`;
+/// 0 where that could not be read).
+pub(super) fn unified_budget(total: u64, wired_limit: Option<u64>, metal: Option<u64>) -> u64 {
+    let may = metal.filter(|&m| m > 0).or(wired_limit.filter(|&w| w > 0)).unwrap_or(total / 3 * 2);
+    discrete_budget(if total > 0 { may.min(total) } else { may })
 }
 
-/// [`unified_budget`] of this computer; None where its memory cannot be read.
-pub(super) fn host_unified_budget() -> Option<u64> {
-    let (_, total) = host_memory()?;
-    Some(unified_budget(total as u64, wired_limit()))
+/// [`unified_budget`] of this computer for `adapter`; None where neither its memory nor the GPU's share can be read.
+pub(super) fn host_unified_budget(adapter: Option<&wgpu::Adapter>) -> Option<u64> {
+    let (total, metal) = (total_memory(), adapter.and_then(metal_working_set));
+    (total.is_some() || metal.is_some()).then(|| unified_budget(total.unwrap_or(0), wired_limit(), metal))
+}
+
+/// What Metal says this GPU should hold at most (`MTLDevice.recommendedMaxWorkingSetSize`: on Apple silicon the share
+/// of the computer's memory the system lets the GPU keep). None on other systems and other APIs.
+pub(super) fn metal_working_set(adapter: &wgpu::Adapter) -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_metal::MTLDevice as _;
+        // SAFETY: the adapter's own device is only asked for a number: nothing is made, freed or kept.
+        let a = unsafe { adapter.as_hal::<wgpu::hal::api::Metal>() }?;
+        Some(a.raw_device().recommendedMaxWorkingSetSize()).filter(|&bytes| bytes > 0)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = adapter;
+        None
+    }
+}
+
+/// The computer's memory, in bytes. On a Mac by itself (`sysctl -n hw.memsize`): what is free there is another
+/// program's text ([`mac_available`]), and a GPU's share of the memory must not be lost with it.
+#[cfg(target_os = "macos")]
+fn total_memory() -> Option<u64> {
+    said("/usr/sbin/sysctl", &["-n", "hw.memsize"])?.trim().parse::<u64>().ok().filter(|&bytes| bytes > 0)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn total_memory() -> Option<u64> {
+    host_memory().map(|(_, total)| total as u64)
+}
+
+/// What this computer's GPU takes of the computer's own memory for weights by default, where its memory is the
+/// computer's (an Apple-silicon Mac's): what a caller that sizes something else from the free memory, before the
+/// weights go up, takes off it. None where a GPU has memory of its own.
+pub fn unified_gpu_share() -> Option<u64> {
+    // (no adapter is open yet where this is asked: the owner's limit or the two-thirds rule, not Metal's own word)
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        host_unified_budget(None)
+    } else {
+        None
+    }
 }
 
 /// What the Mac's owner allows its GPU, in bytes (`iogpu.wired_limit_mb`; 0: the system's own choice).
@@ -166,7 +211,7 @@ fn mac_available(vm_stat: &str) -> Option<usize> {
 pub(super) fn host_memory_impl() -> Option<(usize, usize)> {
     // std has no memory query and this crate's other readers are one call each: here two programs' text, so nothing
     // of the system's headers is declared by hand for a computer no test of this crate has run on.
-    let total = said("/usr/sbin/sysctl", &["-n", "hw.memsize"])?.trim().parse::<usize>().ok()?;
+    let total = total_memory()? as usize;
     let available = mac_available(&said("/usr/bin/vm_stat", &[])?)?;
     Some((available.min(total), total))
 }
@@ -183,14 +228,22 @@ mod host_memory_tests {
     #[test]
     fn a_gpu_that_shares_the_computers_memory_holds_weights_as_a_card_with_two_thirds_of_it() {
         // 24 GB: a card of 16, less 4 for the cache and the work buffers; 48 GB: a card of 32
-        assert_eq!(unified_budget(24 * GIB, None), 12 * GIB);
-        assert_eq!(unified_budget(48 * GIB, Some(0)), 28 * GIB, "a limit of 0 is the system's own choice");
+        assert_eq!(unified_budget(24 * GIB, None, None), 12 * GIB);
+        assert_eq!(unified_budget(48 * GIB, Some(0), None), 28 * GIB, "a limit of 0 is the system's own choice");
         // a small one: half of its two thirds, as a card under 8 GiB
-        assert_eq!(unified_budget(9 * GIB, None), 3 * GIB);
+        assert_eq!(unified_budget(9 * GIB, None, None), 3 * GIB);
         // the owner's own limit for the GPU, where they set one, and never more than there is
-        assert_eq!(unified_budget(32 * GIB, Some(28 * GIB)), 24 * GIB);
-        assert_eq!(unified_budget(32 * GIB, Some(100 * GIB)), 28 * GIB);
-        assert_eq!(unified_budget(0, None), 0);
+        assert_eq!(unified_budget(32 * GIB, Some(28 * GIB), None), 24 * GIB);
+        assert_eq!(unified_budget(32 * GIB, Some(100 * GIB), None), 28 * GIB);
+        assert_eq!(unified_budget(0, None, None), 0);
+        // what Metal itself recommends for the GPU comes first: 48 GiB of a Mac's 64, 16 of one's 24, and where the
+        // owner set a limit Metal's number, whatever it then is
+        assert_eq!(unified_budget(64 * GIB, None, Some(48 * GIB)), 44 * GIB);
+        assert_eq!(unified_budget(24 * GIB, Some(0), Some(16 * GIB)), 12 * GIB);
+        assert_eq!(unified_budget(24 * GIB, Some(20 * GIB), Some(20 * GIB)), 16 * GIB);
+        assert_eq!(unified_budget(24 * GIB, None, Some(0)), 12 * GIB, "a Metal that says nothing is no word");
+        // the computer's memory unread, Metal's word alone
+        assert_eq!(unified_budget(0, None, Some(16 * GIB)), 12 * GIB);
     }
 
     #[test]

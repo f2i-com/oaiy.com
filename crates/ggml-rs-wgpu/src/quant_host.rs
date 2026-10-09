@@ -730,6 +730,7 @@ mod tests {
 
     /// Every level this CPU has.
     fn levels() -> Vec<Level> {
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
         let mut all = vec![Level::Portable];
         #[cfg(target_arch = "x86_64")]
         {

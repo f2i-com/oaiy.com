@@ -1,8 +1,9 @@
 # OAIY on a Mac
 
-OAIY's engines run on an Apple-silicon Mac through WebGPU, which is Metal there, with the
-model's weights in the Mac's own (unified) memory. A graphics card in a Thunderbolt
-enclosure is a second place a model can run, through tinygrad's server.
+OAIY's engines run on an Apple-silicon Mac through WebGPU, which is Metal there: a model's
+weights on the chip's GPU, in the Mac's own (unified) memory, what does not fit there on the
+chip's CPU, read from the drive as it is needed. A graphics card in a Thunderbolt enclosure
+is a second place a model can run, through tinygrad's server.
 
 **Where this stands.** No release is built for macOS: you build it there
 ([Updates](UPDATES.md)). Nothing on this page has been run on a Mac by its authors yet. What
@@ -13,8 +14,9 @@ has been checked, and how, is at the end of each section; what has not is said t
 On the Mac, in a terminal, from the repository's folder:
 
 ```sh
-sh tools/mac/doctor.sh      # what this Mac has: chip, memory, Rust, Python, tinygrad (changes nothing)
+sh tools/mac/doctor.sh      # what this Mac has: chip, memory, GPU, Rust, Python, tinygrad (changes nothing)
 sh tools/mac/build.sh       # the Engines host and the language-model server
+sh tools/mac/check.sh       # the GPU backend's own tests, on this Mac's GPU (several minutes)
 target/release/oaiy-studio  # start them: the control pages open in the browser
 ```
 
@@ -23,6 +25,16 @@ It needs Apple's command line tools (`xcode-select --install`) and Rust
 pages are at `http://127.0.0.1:7860` and the OpenAI-style API at
 `http://127.0.0.1:8080/v1` ([the studio guide](STUDIO.md)). Add a model's `.gguf` file
 under **Models**, then try it in the **Playground**.
+
+Two of those scripts print text worth sending on:
+
+- `doctor.sh`: the chip and its cores, the memory and how much is free, the GPU's share of
+  it where you have set one, what Metal the GPU has, the drive's free space, the tools a
+  build needs, what is built, and what there is of tinygrad's.
+- `check.sh`: the tests that hold each kernel's results on the GPU against the CPU's. On a
+  Mac that is Apple's own compiler reading every kernel, Metal's limits and Metal's
+  arithmetic at once, which is what could not be run without one. It says how many passed
+  and, of those that did not, which and why; the whole text goes to a file it names.
 
 `sh tools/mac/build.sh --media` also builds the worker for pictures, video and speech
 (`oaiy-media`). It has not been built on a Mac, and it sizes its memory from readings a Mac
@@ -44,50 +56,120 @@ GPU backend, with their tests; the desktop app's Rust; and `oaiy-media`, `oaiy-v
 compiler here builds for a Mac, so a stand-in left the files their build scripts asked
 for: the Rust was read, and whether those parts compile and link on a Mac is not known.
 
-## The Mac's own GPU
+## The Mac's own chip: its GPU, its CPU and the drive
 
 Metal calls an M-series GPU "integrated", and an integrated GPU is given 2 GiB of weights.
-A Mac's GPU is not that: its memory is the computer's. So on an Apple-silicon Mac the engine
-gives the GPU what a card with **two thirds of the computer's memory** would hold (a card's
-memory less 4 GiB for the cache and the work buffers), and the rest of a model runs on the
-CPU from the same memory:
+A Mac's GPU is not that: its memory is the computer's. The engine finds this out by itself
+(Metal says the GPU's memory is unified) and gives the GPU a card's share of what it may
+hold:
 
-| The Mac's memory | Weights on its GPU |
-|---:|---:|
-| 16 GB | 6.7 GiB |
-| 24 GB | 12 GiB |
-| 32 GB | 17.3 GiB |
-| 48 GB | 28 GiB |
-| 64 GB | 38.7 GiB |
+- **How much the GPU may hold** is Metal's own figure for it
+  (`recommendedMaxWorkingSetSize`), which rises when you raise the GPU's share with
+  `sudo sysctl iogpu.wired_limit_mb=N`. Where Metal gives none, that setting, else two
+  thirds of the memory.
+- **Weights on the GPU:** that, less 4 GiB for the context's cache and the work buffers.
 
-- **To change it:** *WebGPU weights (GB)* under **Settings** (`llm.webgpu_gb`, or
-  `--webgpu-gb N` on the server). Where you have raised the share macOS gives the GPU
-  (`sudo sysctl iogpu.wired_limit_mb=N`), that share is used in place of the two thirds.
-- **What fits a 24 GB Mac:** a 9B model's 4-bit file (5.7 GB) is all on the GPU. A 27B's
-  3- or 4-bit file (13 to 17 GB) is past the 12 GiB, so part of it runs on the CPU, and
-  with the context's cache and macOS itself it leaves the Mac little memory for anything
-  else.
-- **Slower prompts than an NVIDIA card:** Apple's GPUs have none of the tensor-core
-  matrices the engine reads a prompt through on NVIDIA, so a prompt's rows go through the
-  int8 kernels instead (the arithmetic llama.cpp's uses).
+Which part of a Mac's memory Metal's figure is has not been read on a Mac by us: others
+report two thirds to three quarters. The server's log says it. By the lesser:
 
-**Checked** (2026-10-10, on an RTX 5090 held to an Apple GPU's limits with
-`OAIY_PORTABLE_LIMITS=1 OAIY_NO_COOP=1`: 32,768 bytes of workgroup memory, 256
-invocations, no tensor-core matrices; one card):
+| The Mac's memory | The GPU may hold (two thirds) | Weights on its GPU |
+|---:|---:|---:|
+| 16 GB | 10.7 GiB | 6.7 GiB |
+| 24 GB | 16 GiB | 12 GiB |
+| 32 GB | 21.3 GiB | 17.3 GiB |
 
-- the backend's tests pass (one test's tolerance was wrong for a GPU with no tensor cores,
-  and is corrected);
-- a Llama 3B and a Gemma 3 4B chained answer as their host paths (64 greedy steps the
-  same, logits' cosine 1.000000);
-- Qwen3.5 9B Q4_K_M: 6.6 ms a decode step, a 512-token chunk of a prompt in 0.39 to 0.46 s;
-- Qwen3.8 27B Q3_K_M: 13.8 ms a step, a 512-token chunk in 0.70 to 0.79 s;
-- the server with a 24 GB Mac's budget (`--webgpu-gb 12`): the 9B and the 27B each answer
-  a 2,786-token prompt correctly (1.8 s and 5.0 s to the reply's end; the 27B's file is
-  12.5 GiB, so the last of its weights ran on the CPU).
+To set the weights' share yourself: *WebGPU weights (GB)* under **Settings**
+(`llm.webgpu_gb`, or `--webgpu-gb N` on the server).
 
-Those are that card's speeds, not a Mac's: they show that the kernels stay within what
-Metal allows and give the right answers there. **Not checked:** anything on a Mac itself,
-Metal's own compiler included.
+**The log says what happened** (the Logs page, source `llm`): which GPU the model runs on
+and its share ("WebGPU on …, the computer's own memory, up to 12 GiB of weights"), what
+that GPU gives a kernel (its limits, and Metal's figure for its memory), and, once a model
+is loaded, where its weights are: all on the GPU, or how many gigabytes had no room there.
+On a first run, those three lines are the ones to send on.
+
+### What does not fit the GPU: the CPU, straight from the drive
+
+The part of a model past the GPU's share is multiplied by the chip's CPU cores, and it is
+never copied into memory of the program's own: a GGUF file is mapped, and those weights are
+read where they lie. macOS reads them from the SSD the first time they are used and keeps
+them in memory while it has room; when the Mac runs short it drops them and reads them
+again when they are next needed. There is no setting for it: it is how every GGUF model is
+opened, on every system. So **a model larger than the Mac's memory still loads and
+answers**. What it costs:
+
+- **The CPU's share is slow.** The engine's fast CPU kernels are written for x86 (AVX2,
+  AVX-512); on Apple silicon the plain loops run. And a Qwen3.5 or Qwen3.8 model with any
+  weight on the CPU leaves its fast path (a whole step chained on the GPU) and goes one
+  projection at a time.
+- **A dense model reads every weight for every token.** Weights that do not stay in memory
+  are read from the SSD again at each token: seconds a token, at the drive's speed.
+- **A model of experts reads only the ones a token is routed to**, so the drive serves it
+  far better. GLM-5.3-Flash and DeepSeek-V4.1 keep the ones they have read in a cache in
+  memory, *RAM expert cache (GB)* under **Settings** (`llm.ram_gb`); at 0 it is sized from
+  the memory that is free less the GPU's share, since on a Mac both come out of the same
+  memory. Qwen3.8-Flash-Next's GGUF experts the GPU has no room for are read from the
+  mapped file.
+
+**For a 24 GB Mac** (by the two-thirds figure: 12 GiB of weights):
+
+- a 9B model's 4-bit file (5.7 GB) is all on the GPU: the case to start with;
+- a 27B's 3- or 4-bit file (13 to 17 GB) is past the 12 GiB: part of it runs on the CPU,
+  slowly. It belongs on the card in the enclosure, with a 9B as the stand-in (below);
+- if the log shows Metal allowing the GPU 18 GiB there (three quarters), 14 GiB are
+  weights, and a 27B's 3-bit file (about 12.7 GiB on the GPU) is all on it;
+- to try a 27B on the Mac alone where it is not: a 3-bit file with *WebGPU weights (GB)*
+  at 13 and the context at 8,192, or `sudo sysctl iogpu.wired_limit_mb=20480` (20 GB to
+  the GPU until the next restart, 16 GiB of them weights) for a 4-bit file, with
+  everything else closed. Neither has been tried: the 4 GiB kept back is what an NVIDIA
+  card needed, and what a Mac needs is to be measured.
+
+**Slower prompts than an NVIDIA card:** Apple's GPUs have none of the tensor-core matrices
+the engine reads a prompt through on NVIDIA, so a prompt's rows go through the int8
+kernels instead (the arithmetic llama.cpp's uses).
+
+### Checked, and not
+
+Nothing here has run on a Mac. What was done instead, on a Windows PC:
+
+- **The kernels within Metal's limits** (2026-10-10). wgpu checks a kernel against the
+  limits its device was opened with, whatever the GPU, so a device was held to what wgpu's
+  Metal backend gives an Apple GPU (`OAIY_PORTABLE_LIMITS=1 OAIY_NO_COOP=1`): 32,768 bytes
+  of workgroup memory, 29 buffers a kernel, 65,535 workgroups a dimension, a uniform
+  binding's offset a multiple of 256 and a storage one's of 32, no tensor-core matrices.
+  On Windows' software GPU held so, 74 of the backend's 96 tests pass, and none of the
+  others stopped at a limit: ten are too slow for a software GPU to finish, nine have
+  kernels Microsoft's shader compiler gives up on (a Mac does not use it), two meet that
+  software GPU's own less exact `tanh`, and one is stopped by its own time guard. An RTX
+  5090 held to the workgroup's memory and to no tensor-core matrices, before the other
+  limits were added, passed all 95 there were then.
+- **The kernels as Metal's shading language.** On a Mac, wgpu turns each kernel into
+  Metal's language with its own translator (naga) before Apple's compiler reads it. That
+  translator runs anywhere: all 205 kernels the tests make were written as Metal's
+  language, for Metal 3.1 and 2.4, with the options wgpu gives it; the most buffers one
+  of them binds is 10 of Metal's 31. Apple's compiler itself runs only on a Mac.
+- **Right answers under those limits** (on an RTX 5090, before the limits above were
+  widened from three to all of them): a Llama 3B and a Gemma 3 4B chained answer as their
+  host paths (64 greedy steps the same, logits' cosine 1.000000); the server with a 24 GB
+  Mac's share (`--webgpu-gb 12`) answered a 2,786-token prompt correctly with a Qwen3.5 9B
+  and a Qwen3.8 27B (the 27B's last weights on the CPU). That card's speeds say nothing of
+  a Mac's and are not given here.
+- **A model on the CPU alone, from the file** (`--backend cpu`, Windows): a Qwen3.5 9B
+  (a 5.7 GB file) took 2.5 GB of memory of its own, the weights none of it; held to 3.1 GB
+  of memory resident, less than its file, it gave the same reply, in 44 s where 7.7 s
+  unheld (a 4B, 2.7 GB, held to 1.3 GB: the same reply, 28.5 s where 10.3 s). That is
+  Windows dropping the mapped file's pages and bringing them back; macOS's own doing under
+  pressure, and a drive's speed at it, were not run.
+- **The memory rule and the readers of a Mac's memory** by their tests (`sysctl`'s and
+  `vm_stat`'s text as a Mac prints it), and the three scripts under `tools/mac/` run with
+  stand-ins for a Mac's programs.
+- **One hazard met ahead of time:** a GPU's `tanh` made of exponentials gives no number
+  past an argument of a few dozen (others have met it on Metal). The kernels hold its
+  argument to 15 either way, where the result is what it was, to the last bit.
+
+**Not checked:** the build on a Mac; Apple's compiler on the kernels and its arithmetic
+(it compiles with fast math); that Metal accepts what wgpu's own checks accept; any speed;
+memory under real pressure on macOS; the CPU's share on Apple silicon's cores.
+`sh tools/mac/check.sh` on the Mac answers the first three.
 
 ## A card in a Thunderbolt enclosure, through tinygrad
 

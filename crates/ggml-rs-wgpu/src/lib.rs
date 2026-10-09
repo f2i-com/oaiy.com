@@ -141,6 +141,8 @@ pub struct WgpuBackend {
     gpu: Arc<Gpu>,
     budget: u64,
     used: Arc<AtomicU64>,
+    /// Bytes of the weights it was asked to hold and had no room for within the budget: they stay on the host.
+    left: Arc<AtomicU64>,
     summary: AdapterSummary,
     /// One projection at a time: the dispatch and read-back share the queue (EXL3 weights hold it too).
     serial: Arc<Mutex<()>>,
@@ -152,7 +154,7 @@ pub struct WgpuBackend {
 /// to record chains of their own (an expert group).
 impl Clone for WgpuBackend {
     fn clone(&self) -> Self {
-        Self { cpu: CpuBackend::new(), gpu: Arc::clone(&self.gpu), budget: self.budget, used: Arc::clone(&self.used), summary: self.summary.clone(), serial: Arc::clone(&self.serial), raw_adapter: self.raw_adapter.clone() }
+        Self { cpu: CpuBackend::new(), gpu: Arc::clone(&self.gpu), budget: self.budget, used: Arc::clone(&self.used), left: Arc::clone(&self.left), summary: self.summary.clone(), serial: Arc::clone(&self.serial), raw_adapter: self.raw_adapter.clone() }
     }
 }
 
@@ -321,6 +323,18 @@ impl WgpuBackend {
             limits.max_compute_workgroup_size_x = limits.max_compute_workgroup_size_x.min(d.max_compute_workgroup_size_x);
             limits.max_compute_workgroup_size_y = limits.max_compute_workgroup_size_y.min(d.max_compute_workgroup_size_y);
             limits.max_compute_workgroup_size_z = limits.max_compute_workgroup_size_z.min(d.max_compute_workgroup_size_z);
+            // and what else wgpu's Metal backend gives an Apple GPU less of than a card's driver does (wgpu-hal 30's
+            // metal/adapter.rs): 29 buffers a stage (Metal's 31 less wgpu's own two), 65,535 workgroups a dimension,
+            // a storage binding's offset a multiple of 32 and a uniform one's of 256 (macOS's). wgpu checks each of
+            // them against what the device was asked for, on any backend: a kernel past one fails here as it would
+            // there
+            limits.max_storage_buffers_per_shader_stage = limits.max_storage_buffers_per_shader_stage.min(29);
+            limits.max_uniform_buffers_per_shader_stage = limits.max_uniform_buffers_per_shader_stage.min(29);
+            limits.max_dynamic_storage_buffers_per_pipeline_layout = limits.max_dynamic_storage_buffers_per_pipeline_layout.min(29);
+            limits.max_dynamic_uniform_buffers_per_pipeline_layout = limits.max_dynamic_uniform_buffers_per_pipeline_layout.min(29);
+            limits.max_compute_workgroups_per_dimension = limits.max_compute_workgroups_per_dimension.min(0xFFFF);
+            limits.min_storage_buffer_offset_alignment = limits.min_storage_buffer_offset_alignment.max(32);
+            limits.min_uniform_buffer_offset_alignment = limits.min_uniform_buffer_offset_alignment.max(256);
         }
         let timestamps = if profile::chain_on() || profile::pieces_on() { adapter.features() & wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() };
         // the tensor cores' matrices (Vulkan's cooperative matrices) and f16 in shaders, where the adapter has them: a
@@ -404,7 +418,7 @@ impl WgpuBackend {
         let budget = budget_bytes.unwrap_or(match info.device_type {
             wgpu::DeviceType::DiscreteGpu => device_memory(&adapter).map_or(8 * GIB, discrete_budget),
             // (a Mac's own GPU: the computer's memory is its memory, so its share of that, not an integrated GPU's 2 GiB)
-            wgpu::DeviceType::IntegratedGpu if summary.unified => host_unified_budget().unwrap_or(2 * GIB),
+            wgpu::DeviceType::IntegratedGpu if summary.unified => host_unified_budget(Some(&adapter)).unwrap_or(2 * GIB),
             wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::VirtualGpu => 2 * GIB,
             _ => 0,
         });
@@ -413,6 +427,7 @@ impl WgpuBackend {
             gpu: Arc::new(Gpu { device, queue_raw: queue, lost, watch, feed: Arc::new(Feed::default()), in_flight_limit: Arc::new(std::sync::atomic::AtomicUsize::new(0)), layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), names: Mutex::new(HashMap::new()), pool: Mutex::new(Vec::new()), staging: Mutex::new(Vec::new()), chain_groups: Mutex::new(HashMap::new()), wide: std::sync::OnceLock::new(), chain_groups_wide: Mutex::new(HashMap::new()), dummy: std::sync::OnceLock::new(), dummy_rw: std::sync::OnceLock::new(), limits, staged: AtomicU64::new(0), few: std::sync::OnceLock::new(), moe_steps: Mutex::new(Vec::new()), coop_units: std::sync::OnceLock::new(), dense_arena: Mutex::new(None) }),
             budget,
             used: Arc::new(AtomicU64::new(0)),
+            left: Arc::new(AtomicU64::new(0)),
             summary,
             serial: Arc::new(Mutex::new(())),
             raw_adapter: adapter,
@@ -487,6 +502,25 @@ impl WgpuBackend {
         heap_budget(&self.raw_adapter)
     }
 
+    /// The device's limits that a kernel meets, for a log: what a GPU no test of this crate has run on gives its
+    /// kernels (an Apple GPU's are in wgpu-hal's Metal adapter; `OAIY_PORTABLE_LIMITS` holds another GPU to them).
+    pub fn limits_line(&self) -> String {
+        let l = &self.gpu.limits;
+        let gib = |bytes: u64| bytes as f64 / GIB as f64;
+        // (a Mac's: what Metal recommends the GPU hold at most, which its share for weights is taken from)
+        let metal = metal_working_set(&self.raw_adapter).map_or(String::new(), |bytes| format!("; Metal recommends it hold at most {:.1} GiB", gib(bytes)));
+        format!(
+            "a buffer up to {:.1} GiB and a binding {:.1} GiB, {} storage buffers a kernel, a workgroup of {} threads with {} KB, {} workgroups a dimension, tensor cores {}{metal}",
+            gib(l.max_buffer_size),
+            gib(l.max_storage_buffer_binding_size as u64),
+            l.max_storage_buffers_per_shader_stage,
+            l.max_compute_invocations_per_workgroup,
+            l.max_compute_workgroup_storage_size >> 10,
+            l.max_compute_workgroups_per_dimension,
+            if self.tensor_cores() { "used" } else { "not used" },
+        )
+    }
+
     /// At most `pieces` of the chains' pieces on this device's queue at once from here on (0: as many as are recorded,
     /// as it is until asked), each encoded just before it is submitted ([`Feed`]): for a loop of short steps, or a
     /// prompt's chunks, that runs the GPU for seconds on end. A recording's pieces otherwise go to the GPU as they are
@@ -507,6 +541,13 @@ impl WgpuBackend {
     /// Bytes of weights placed on the GPU, and the budget.
     pub fn usage(&self) -> (u64, u64) {
         (self.used.load(Ordering::Relaxed), self.budget)
+    }
+
+    /// Bytes of the weights a model asked this GPU to hold that it had no room for within its budget: they are on the
+    /// host, multiplied by the CPU straight from the model's file as it is mapped (so the system reads them from the
+    /// drive as they are used, and again where it has no memory to keep them in).
+    pub fn left_on_host(&self) -> u64 {
+        self.left.load(Ordering::Relaxed)
     }
 
     /// Whether this device's kernels can read weights from the host's memory ([`Gpu::host_buffer`]): a card of its own
@@ -555,6 +596,7 @@ impl WgpuBackend {
         let prev = self.used.fetch_add(nbytes as u64, Ordering::Relaxed);
         if prev + nbytes as u64 > self.budget {
             self.used.fetch_sub(nbytes as u64, Ordering::Relaxed);
+            self.left.fetch_add(nbytes as u64, Ordering::Relaxed);
             return w;
         }
         let chunks = match padded {

@@ -223,11 +223,38 @@ impl Options {
     /// the same way (`ggml_rs_wgpu::host_memory`): it used to assume 32 GB always.
     pub fn expert_cache_bytes(&self) -> u64 {
         #[cfg(feature = "webgpu")]
-        let free = ggml_rs_wgpu::host_memory().map(|(free, _)| free as u64);
+        let free = ggml_rs_wgpu::host_memory().map(|(free, _)| free_beside_gpu(free as u64, &self.backend, self.webgpu_gb, ggml_rs_wgpu::unified_gpu_share()));
         #[cfg(not(feature = "webgpu"))]
         let free = None;
         host_cache_budget(self.ram_gb, free)
     }
+}
+
+/// The free memory a RAM cache may count on before a model's weights go up to the GPU. Where the GPU's memory is the
+/// computer's own (an Apple-silicon Mac: `unified` is its default share of it for weights) those weights come out of
+/// the same free memory, so that share is taken off, or `--webgpu-gb` where it is given: a cache sized from all of
+/// it and the GPU's weights together would be more than the computer has. A GPU with memory of its own (`unified`
+/// None) and a model on the CPU alone take nothing off.
+#[cfg_attr(not(feature = "webgpu"), allow(dead_code))]
+pub(crate) fn free_beside_gpu(free: u64, backend: &str, webgpu_gb: Option<u64>, unified: Option<u64>) -> u64 {
+    match unified {
+        Some(own) if backend != "cpu" => free.saturating_sub(webgpu_gb.map_or(own, |gb| gb << 30)),
+        _ => free,
+    }
+}
+
+#[test]
+fn a_ram_cache_does_not_count_on_the_memory_a_macs_gpu_takes_for_weights() {
+    let gib = 1u64 << 30;
+    // a card of its own: all that is free, whatever the card holds
+    assert_eq!(free_beside_gpu(20 * gib, "auto", None, None), 20 * gib);
+    assert_eq!(free_beside_gpu(20 * gib, "webgpu", Some(27), None), 20 * gib);
+    // a 24 GB Mac: its GPU's 12 GiB of weights come out of what is free; --webgpu-gb says another share
+    assert_eq!(free_beside_gpu(20 * gib, "auto", None, Some(12 * gib)), 8 * gib);
+    assert_eq!(free_beside_gpu(20 * gib, "webgpu", Some(6), Some(12 * gib)), 14 * gib);
+    assert_eq!(free_beside_gpu(8 * gib, "auto", None, Some(12 * gib)), 0, "never under nothing");
+    // on the CPU alone the GPU takes none
+    assert_eq!(free_beside_gpu(20 * gib, "cpu", None, Some(12 * gib)), 20 * gib);
 }
 
 impl Default for Options {

@@ -546,7 +546,7 @@ pub(in crate::chain) const TANH_IN_PLACE: &str = r#"
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let i = id.x + id.y * 16776960u;
     if (i >= p[0].x) { return; }
-    x[i] = tanh(x[i]);
+    x[i] = tanh(clamp(x[i], -15.0, 15.0));
 }
 "#;
 

@@ -240,6 +240,43 @@ fn opens_empty_thought(template: &str) -> bool {
     template.contains(r"<|channel>thought\n<channel|>") || template.contains("<|channel>thought\n<channel|>")
 }
 
+/// Where a GGUF model's weights are once it is loaded on a GPU, for the log: `on_gpu` bytes there and `left` that had
+/// no room within the GPU's share (`WgpuBackend::left_on_host`). Those are multiplied by the CPU straight from the
+/// file as it is mapped: nothing of them is copied, the system reads them from the drive as they are used and keeps
+/// them in memory while it has room, and where it has not (`free`: what is free now) it reads them again at each
+/// token. So a model larger than the computer's memory still answers, at the drive's speed.
+#[cfg_attr(not(feature = "webgpu"), allow(dead_code))]
+pub(crate) fn placement(name: &str, on_gpu: u64, left: u64, free: Option<u64>) -> String {
+    let gb = |bytes: u64| bytes as f64 / 1e9;
+    if left == 0 {
+        return format!("{name}: its weights are all on the GPU ({:.1} GB)", gb(on_gpu));
+    }
+    let memory = match free {
+        Some(free) if left > free => format!(
+            "; {:.1} GB of memory are free for them, so what does not stay there is read from the drive again at each token (slow: a file that fits the GPU's share, or a larger share with --webgpu-gb, answers faster)",
+            gb(free)
+        ),
+        Some(free) => format!("; they fit the {:.1} GB of memory that are free", gb(free)),
+        None => String::new(),
+    };
+    format!(
+        "{name}: {:.1} GB of its weights are on the GPU and {:.1} GB had no room there: those run on the CPU straight from the file, which the system reads from the drive as they are used{memory}",
+        gb(on_gpu),
+        gb(left)
+    )
+}
+
+#[test]
+fn a_models_weights_are_said_to_be_on_the_gpu_or_read_from_the_file() {
+    let gb = 1_000_000_000u64;
+    assert_eq!(placement("m", 5_700_000_000, 0, Some(9 * gb)), "m: its weights are all on the GPU (5.7 GB)");
+    let part = placement("m", 12 * gb, 4 * gb, Some(6 * gb));
+    assert!(part.starts_with("m: 12.0 GB of its weights are on the GPU and 4.0 GB had no room there") && part.ends_with("; they fit the 6.0 GB of memory that are free"), "{part}");
+    let short = placement("m", 12 * gb, 10 * gb, Some(6 * gb));
+    assert!(short.contains("6.0 GB of memory are free for them") && short.contains("read from the drive again at each token"), "{short}");
+    assert!(placement("m", 12 * gb, 10 * gb, None).ends_with("as they are used"));
+}
+
 /// The architecture of a dense GGUF, which is loaded whole (see `load_gguf`); None for Qwen3.5 (a path of its
 /// own), the MoE families expert streaming serves, and what llama-rs does not know.
 fn dense_arch(gguf: &gguf::GgufFile) -> Option<llama_rs::Architecture> {
@@ -837,6 +874,16 @@ impl Models {
         Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Qwen(tok)) })
     }
 
+    /// Says where a GGUF model's weights are once it is loaded on a GPU ([`placement`]).
+    fn say_placement(&self, name: &str, backend: &dyn ggml_rs::Backend) {
+        #[cfg(feature = "webgpu")]
+        if let Some(b) = backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>() {
+            self.say(placement(name, b.usage().0, b.left_on_host(), ggml_rs_wgpu::host_memory().map(|(free, _)| free as u64)));
+        }
+        #[cfg(not(feature = "webgpu"))]
+        let _ = (name, backend);
+    }
+
     // ---------------------------------------------------------------- GGUF
     fn load_gguf(&self, spec: &Spec) -> Result<Live> {
         let o = &self.opts;
@@ -894,6 +941,7 @@ impl Models {
                     self.say(format!("{}: its chained runs ready in {:.1} s", spec.name, warm.elapsed().as_secs_f64()));
                 }
             }
+            self.say_placement(&spec.name, backend.as_ref());
             let tok = Arc::new(model.tokenizer().clone());
             // Dense Qwen fits one card; bound the initial KV allocation.
             let max_seq = self.context(model.config().context_length).min(16384);
@@ -940,6 +988,7 @@ impl Models {
         // GLM and Qwen3.5 formats only, so the Agent's tools need one of those.
         if let Some(arch) = dense_arch(&gguf) {
             let model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).map_err(|e| Error::Arg(e.to_string()))?;
+            self.say_placement(&spec.name, backend.as_ref());
             let empty_thought = gguf.get_str("tokenizer.chat_template").is_ok_and(opens_empty_thought);
             drop(gguf);
             let tok = Arc::new(model.tokenizer().clone());
