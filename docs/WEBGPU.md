@@ -769,6 +769,16 @@ later and one takes a second more, the last at one launch and the second at the 
 cache growing on the device: that copy is made once for the prompt's length now
 (`KvCache::expect`; it grew from 4,096 rows to 16,384 in three steps before), the
 first chunk is at its later time (1.52 s where 1.51), and the stall is where it was.
+Nor does it keep to the first prompt or to a time since the server began: with half a
+minute idle before the first prompt it came in that prompt's second chunk at one
+launch and in the next prompt's first at another. It is the GPU's own time, though,
+not a wait of the host's: by kernels (`OAIY_CHAIN_PROFILE`, each dispatch timed in a
+pass of its own) a first prompt's take 0.84 s more than the second's beyond what the
+warm-up's dispatches add, 0.33 s of it the Q3_K tensor-core matmuls' and 0.42 the
+delta-net scan's (805 ms where 365). So the card runs slow for about a second once,
+some two to eight seconds after work first comes to it; it is at its power cap from
+the first chunk on (nvidia-smi's throttle reason), and llama.cpp's first prompt on it
+is half a second slow as well.
 
 Gemma 3 itself was wrong on every backend until this day: one RoPE base on every
 layer, where its sliding-window layers take 10,000 and its global ones
