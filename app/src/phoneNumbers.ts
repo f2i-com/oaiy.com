@@ -235,7 +235,15 @@ export function toE164(raw: string | null | undefined, country: string | Country
  * id of letters (the carrier's "Missed calls", a bank's name), not a short code.
  */
 export function isPersonNumber(raw: string | null | undefined, country: string | Country = localCountry()): boolean {
-  return toE164(raw, country) !== null;
+  if (toE164(raw, country) !== null) return true;
+  // A number this country's rules do not read (the country is set wrong, or it is another country's number written
+  // as it is dialled there) is still a number, and was answered before senders were told apart: only what is plainly
+  // not a person's is turned away. Seven digits or more, written as a number is; not eight that begin with 1
+  // (Australia's 19xx xxxx premium numbers).
+  const text = (raw ?? '').trim();
+  if (!/^\+?[\d\s().-]+$/.test(text)) return false;
+  const digits = text.replace(/\D/g, '');
+  return digits.length >= 7 && digits.length <= 15 && !(digits.length === 8 && digits.startsWith('1'));
 }
 
 /**

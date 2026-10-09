@@ -96,6 +96,8 @@ export interface SessionInfo {
   thread?: string;
   /** A call from a hidden number: its own conversation, never another caller's. */
   hidden?: boolean;
+  /** The person took this sender up (wrote in the conversation, or texted them for an outreach): they are answered whatever their first text carried. */
+  vouched?: boolean;
 }
 
 /**

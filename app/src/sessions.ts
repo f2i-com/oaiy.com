@@ -97,8 +97,12 @@ export interface Session extends SessionInfo {
   handoff?: { at: number; reason: string };
   /** A flow's tasks waiting for their answers, each by its prompt (one task a run; a message of the person's answers none). */
   answers?: Array<{ prompt: string; settle: (reply: string, error?: string) => void }>;
-  /** The person wrote in this conversation themselves: its sender is someone they deal with (see `Sessions.notAnswered`). */
+  /** The person wrote in this conversation themselves, or texted its sender for an outreach: someone they deal with (see `Sessions.notAnswered`). Kept. */
   vouched?: boolean;
+  /** A text went to them and nothing has happened since (no message of theirs or the person's, no other tool): a second one in a row is not sent. */
+  justTexted?: boolean;
+  /** What the run going on was given to answer: no longer waiting, and a turn only once the run has read the person's contact and begun. */
+  answering?: string;
 }
 
 /**
@@ -177,6 +181,8 @@ export interface SessionHooks {
   named?: (note: CallerNote) => void;
   /** Aokie's call screening now: a number on its blocked list is not answered or texted either (null: the phone cannot be asked). */
   screening?: () => Promise<Screening | null>;
+  /** The blocked list as it was last read, kept across a restart: gone by until the phone says it again, and while it cannot. */
+  blockedKept?: { read: () => string; write: (list: string) => void };
 }
 
 /**
@@ -189,21 +195,82 @@ export function sameNumber(a: string, b: string): boolean {
   return x.length >= 8 && y.length >= 8 && x.slice(-9) === y.slice(-9);
 }
 
-/** How a site's name ends, where one is written bare ("mygov-refund.info"): the endings links in texts have. */
-const SITE_ENDINGS = 'com|net|org|info|biz|xyz|top|online|site|shop|club|live|link|click|vip|icu|app|io|cc|ly|gl|gd|ru|cn|au|nz|uk|gov|edu';
-const LINK = new RegExp(
-  // "http(s)://…", "www.…", a site with a path ("bit.ly/x"), or a bare site name with a known ending.
-  `\\bhttps?:\\/\\/\\S|\\bwww\\.\\S|(?<![@\\w.-])[a-z0-9-]+(?:\\.[a-z0-9-]+)*\\.(?:[a-z]{2,}\\/\\S|(?:${SITE_ENDINGS})(?![\\w@-]))`,
-  'i',
-);
+/** How a site's name ends where it is written bare, with nothing after it ("mygov-refund.info"). */
+const BARE_ENDINGS = new Set('com|net|org|info|biz|xyz|top|online|site|shop|store|club|live|link|click|vip|icu|app|dev|page|today|cfd|sbs|buzz|cyou|co|cc|ly|gl|gd|gy|ru|cn|tk|ml|ga|cf|gq|pw|ws|au|nz|uk|us|ca|ie|sg|za|gov|edu|io|tv|work|support|help|world|life|fun|win|bid|loan|pro|mobi'.split('|'));
+/** Endings nobody writes but in a link (none is a word, or a well-known site's): a bare name with one is a link as it stands. */
+const THROWAWAY_ENDINGS = new Set('xyz|click|vip|icu|cfd|sbs|buzz|cyou|co|cc|ly|gl|gd|gy|ru|cn|tk|ml|ga|cf|gq|pw|ws'.split('|'));
+/** How a site's name ends where a path follows it ("bit.ly/x", "shorturl.at/x", "wa.me/…"): the bare ones, and the shorteners'. */
+const PATH_ENDINGS = new Set([...BARE_ENDINGS, ...'me|at|in|to|id|li|ee|is|de|fr|es|it|nl|eu|jp|kr|ph|my|th|hk|tw|ae|cloud|tech|space|website|digital|email|news|express|delivery|post|pay|tax|cash|money|bank|finance|download|review|stream|trade|art|blog|one|red|gold'.split('|')]);
+/** A site's name as running text has it: labels of letters, digits and hyphens, an ending of letters, and a path or the name's end. Not the tail of an email address. */
+const HOST = /(?<![@\w-])(?<!@[\w.-]*\.)((?:[a-z0-9-]+\.)+)([a-z]{2,24})(?:(\/\S)|(?![\w@-]))/gi;
 
 /**
- * Whether a text carries a link: "http(s)://…", "www.…", a site with a path
- * ("bit.ly/x"), or a site's bare name ("mygov-refund.info"). A word with a full
- * stop in it ("Thanks.See you") is not one, nor is an email address.
+ * Whether a text carries a link, as a scam's or an advertisement's does:
+ * "http(s)://…", "www.…", a site or an address in digits with a path
+ * ("bit.ly/x", "103.21.4.9/pay"), or a site's bare name where it is plainly no
+ * mention of a business ("mygov-refund.info", "ato-gov.au", "tollpay.co"): a
+ * hyphen or a number in it, or an ending only links have. A well-known site's
+ * name with nothing after it ("found you on hipages.com.au") is how a customer
+ * says where they found the business, and is not one; nor is an email address,
+ * a file's name, or a sentence missing its space ("Thanks mate.Top job").
  */
 export function hasLink(text: string): boolean {
-  return LINK.test(text);
+  // A dot written so that it is not one ("refund[.]info").
+  const plain = text.replace(/\[\.\]|\(\.\)|\{\.\}/g, '.');
+  if (/\bh(?:tt|xx)ps?:\/\/\S|\bwww\.[a-z0-9-]+\.[a-z]{2,}/i.test(plain)) return true;
+  if (/(?<![\w.])\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\/\S/.test(plain)) return true;
+  for (const [, labels, end, path] of plain.matchAll(HOST)) {
+    const ending = end.toLowerCase();
+    if (path) {
+      if (PATH_ENDINGS.has(ending)) return true;
+      continue;
+    }
+    // Written as a site is (all small letters, or all capitals): "mate.Top" is a sentence missing its space.
+    const host = labels + end;
+    if (host !== host.toLowerCase() && host !== host.toUpperCase()) continue;
+    if (!BARE_ENDINGS.has(ending)) continue;
+    const name = labels.slice(0, -1);
+    const made = name.includes('-') || (/\d/.test(name) && name.length >= 6 && name.replace(/[^a-z]/gi, '').length >= 3);
+    if (made || THROWAWAY_ENDINGS.has(ending)) return true;
+  }
+  return false;
+}
+
+/** Why a text thread's sender is not answered (`Sessions.notAnswered`). */
+const NOT_A_PERSON = "not a person's phone number (a sender's name or a short code)";
+const ON_BLOCKED_LIST = "on the phone's blocked list";
+const OPENED_WITH_LINK = 'someone you have not dealt with who opened with a link (it reads like a scam or an advertisement)';
+/** How long the phone has to say its blocked list for a text: every later text waits behind this one, so a slow phone is not waited for (the list as last read is gone by). */
+const BLOCKED_WAIT_MS = 4000;
+
+/**
+ * What a text thread's turn (or a message waiting for its run) holds: the
+ * sender's texts in it (their words alone), and whether any of it is the
+ * person's own. A text is kept under its "Text message from …" line; the first
+ * turn of a conversation its agent ran is kept behind the project's summary
+ * (Agent.run), and one that came while the agent worked behind a note in square
+ * brackets (Agent.readInbox). A sender's words never read as the person's:
+ * whatever a text says, it is under that line.
+ */
+export function heardIn(text: string): { own: boolean; texts: string[] } {
+  let rest = text;
+  if (rest.startsWith('<project>')) {
+    const end = rest.indexOf('</project>');
+    if (end >= 0) rest = rest.slice(end + '</project>'.length).replace(/^\s+/, '');
+  }
+  if (rest.startsWith('[') && !rest.startsWith('[OAIY]')) {
+    const end = rest.indexOf(']\n\n');
+    if (end >= 0) rest = rest.slice(end + 3);
+  }
+  const texts: string[] = [];
+  let own = false;
+  for (const part of rest.split(/\n\n(?=Text message from )/)) {
+    if (part.startsWith('Text message from ')) {
+      const line = part.indexOf('\n');
+      texts.push(line < 0 ? '' : part.slice(line + 1));
+    } else if (part.trim() && !part.startsWith('[OAIY]')) own = true;
+  }
+  return { own, texts };
 }
 
 /** A text message as the conversation's agent reads it. */
@@ -882,6 +949,10 @@ export class Sessions {
   identity: () => Identity = () => NO_IDENTITY;
   /** Whether this page answers the phone's calls now (it holds their lease): a call ringing in is warmed only then. */
   answersCalls: () => boolean = () => true;
+  /** Whether another OAIY page answers the texts now (it holds their lease): what is kept here meanwhile is that page's to answer, and stays so. */
+  textsElsewhere: () => boolean = () => false;
+  /** The texts kept while another page answered them (see `answerWaiting`). */
+  private keptElsewhere = new WeakSet<Turn>();
   /** The warm going on for a call not begun yet (see warmCall). */
   private warming: { key: string; callId?: string; controller: AbortController } | null = null;
   /** Hold words said so far: the next is the next in HOLD_WORDS. */
@@ -2148,26 +2219,59 @@ export class Sessions {
         const body = String(input.body ?? '').trim();
         if (!body) throw new Error('body is empty: write the message to send');
         if (body.length > 1600) throw new Error(`the message is ${body.length} characters: keep it under 1600 (a text message is read on a phone)`);
-        if (test) return `Not sent (a test conversation): "${body}"`;
+        // One text at a time: a model that answers one message with two texts in a row sends its reply twice over.
+        // After something else (their next message, the person's, another tool's answer) it may text again.
+        if (session.justTexted) throw new Error('Not sent: your text to them went a moment ago, and nothing has happened since. One reply at a time: say it all in one message. Anything more waits for their next message. Do not try again.');
+        if (test) {
+          session.justTexted = true;
+          return `Not sent (a test conversation): "${body}"`;
+        }
         const refused = this.notAnswered(session, await this.readBlocked());
         if (refused) throw new Error(`Not sent: ${session.title || session.key} is ${refused}, and nothing is sent to them. Do not try again.`);
         const desktop = this.desktop();
         if (!desktop) throw new Error('OAIY Desktop is not connected, so the phone cannot send it. Tell the person you work for.');
         const key = `oaiy:sms:${session.id}:${crypto.randomUUID()}`;
         const sent = (await desktop.command('aokie', 'sms.send', { to: session.key, body }, key, signal)) as Record<string, unknown> | null;
+        session.justTexted = true;
         const id = sent && typeof sent.messageId === 'string' ? ` (message ${sent.messageId})` : '';
         return `Sent to ${session.title || session.key}${id}.`;
       },
     };
   }
 
-  /** The phone's blocked list, as last read. */
+  /** The phone's blocked list, as last read (here, or before the last restart: `hooks.blockedKept`). */
   private blocked = '';
+  private blockedKnown = false;
 
-  /** The phone's blocked list read again (as it last was while the phone cannot be asked). */
+  /**
+   * The phone's blocked list read again. While the phone cannot be asked, or
+   * takes longer than a text can wait behind it, the list as it last was is
+   * gone by, also the one kept from before a restart: a blocked number is not
+   * answered for the phone being slow to say so.
+   */
   private async readBlocked(): Promise<string> {
-    const read = await this.hooks.screening?.().catch(() => null);
-    if (read) this.blocked = read.blockedNumbers;
+    if (!this.blockedKnown) {
+      this.blockedKnown = true;
+      try {
+        this.blocked = this.hooks.blockedKept?.read() ?? '';
+      } catch {
+        // Nothing kept that can be read: as none.
+      }
+    }
+    const asked = this.hooks.screening?.().catch(() => null);
+    if (!asked) return this.blocked;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<null>((resolve) => (timer = setTimeout(() => resolve(null), BLOCKED_WAIT_MS)));
+    const read = await Promise.race([asked, late]);
+    clearTimeout(timer);
+    if (read && read.blockedNumbers !== this.blocked) {
+      this.blocked = read.blockedNumbers;
+      try {
+        this.hooks.blockedKept?.write(this.blocked);
+      } catch {
+        // Not kept: read again after the next restart.
+      }
+    }
     return this.blocked;
   }
 
@@ -2185,8 +2289,8 @@ export class Sessions {
     if (thread.kind !== 'person' || thread.key === TEST_NUMBER) return { blocked: false, why: '' };
     if (!thread.hidden && isBlocked(thread.key, this.blocked)) return { blocked: true, why: 'Blocked' };
     if (!thread.sms) return { blocked: false, why: '' };
-    if (!isPersonNumber(thread.sms.key)) return { blocked: false, why: "Not answered (not a person's number)" };
-    return { blocked: false, why: this.notAnswered(thread.sms) ? 'Not answered (opened with a link)' : '' };
+    const refused = this.notAnswered(thread.sms);
+    return { blocked: false, why: refused === NOT_A_PERSON ? "Not answered (not a person's number)" : refused === OPENED_WITH_LINK ? 'Not answered (opened with a link)' : refused ? 'Not answered' : '' };
   }
 
   /**
@@ -2198,31 +2302,58 @@ export class Sessions {
    */
   notAnswered(session: Session, blocked = this.blocked, incoming = ''): string {
     if (session.key === TEST_NUMBER) return '';
-    if (session.hidden || !isPersonNumber(session.key)) return "not a person's phone number (a sender's name or a short code)";
-    if (isBlocked(session.key, blocked)) return "on the phone's blocked list";
+    if (session.hidden || !isPersonNumber(session.key)) return NOT_A_PERSON;
+    if (isBlocked(session.key, blocked)) return ON_BLOCKED_LIST;
     // A scam or an advertisement nearly always opens with a link. The phone may have its number blocked or
     // marked as spam: neither is known here (they do not cross Bluetooth).
-    if (this.unsolicited(session, incoming)) return 'someone you have not dealt with who opened with a link (it reads like a scam or an advertisement)';
+    if (this.unsolicited(session, incoming)) return OPENED_WITH_LINK;
     return '';
   }
 
   /**
    * Whether a text thread reads as a scam's or an advertisement's: its sender
-   * opened with a link (the first text of theirs kept here carries one, or this
-   * one does and it is their first), and the person has not taken them up:
-   * never wrote in the conversation themselves, gave them no name or note in
-   * Contacts, and they are not part of an outreach. What the agent wrote back
-   * by itself does not count: it answered such a text before this was looked
-   * at, and the sender's next one is not to be answered for that.
+   * opened with a link (the first text of theirs, of what is kept here, what
+   * a run has taken up or still waits for one, and the one coming in), and
+   * nothing since shows them to be someone the business deals with:
+   *
+   * - the person never took them up: wrote in the conversation themselves, gave
+   *   them a name or a note in Contacts, or texted them for an outreach;
+   * - and they never wrote back, with no link, to a text that was sent to them:
+   *   that is a conversation, and a conversation an earlier build's agent had
+   *   with a customer whose first text named a site is not cut off.
+   *
+   * What the agent wrote back by itself does not make a sender known: it
+   * answered such a text before this was looked at, and that sender's next
+   * link is not to be answered for it. A text the business sent first (before
+   * any of theirs) does.
    */
   private unsolicited(session: Session, incoming: string): boolean {
     if (session.vouched || session.outreach || this.outreach?.forText(session.key)) return false;
     const note = this.callerNote(session.key);
     if (note && (note.nameBy === 'owner' || !!note.notes?.trim() || !!note.ownerFacts?.length)) return false;
-    const isText = (t: Turn): t is Extract<Turn, { role: 'user' }> => t.role === 'user' && t.text.startsWith('Text message from ');
-    // The person's own words in it: not a text's, not a note of OAIY's.
-    if (session.agent.turns.some((t) => t.role === 'user' && !t.automatic && !t.text.startsWith('Text message from ') && !t.text.startsWith('[OAIY]'))) return false;
-    return hasLink(session.agent.turns.find(isText)?.text ?? incoming);
+    // (Set in `settles`: said as a type, or the compiler takes it for null to the end.)
+    let opener = null as string | null;
+    // A text has gone to them since they opened.
+    let answered = false;
+    // What settles it as someone dealt with: the person's own words, or the sender's link-free words after an answer.
+    const settles = ({ own, texts }: { own: boolean; texts: string[] }): boolean => {
+      if (own) return true;
+      if (!texts.length) return false;
+      if (opener === null) opener = texts[0];
+      else if (answered && !texts.some(hasLink)) return true;
+      return false;
+    };
+    for (const t of session.agent.turns) {
+      if (t.role === 'tool') {
+        if (!t.results.some((r) => r.name === 'send_text_message' && !r.isError && r.content.startsWith('Sent to '))) continue;
+        if (opener === null) return false;
+        answered = true;
+      } else if (t.role === 'user' && !t.automatic && settles(heardIn(t.text))) return false;
+    }
+    // What the run going on took up (a turn only once it has begun: the same words twice change nothing), and what waits.
+    for (const waiting of [...(session.answering ? [session.answering] : []), ...session.waiting]) if (settles(heardIn(waiting))) return false;
+    if (incoming && settles({ own: false, texts: [incoming] })) return false;
+    return opener !== null && hasLink(opener);
   }
 
   /** Whether a lane is the person at `key` (never a hidden caller's, and the pretend conversation only itself). */
@@ -2314,15 +2445,31 @@ export class Sessions {
     this.hooks.arrived?.(session, text);
     // STOP from someone texted for an outreach is read by code, first: they are not contacted again, and nothing is sent back.
     const stopped = this.outreach?.stopWord(session.key, body) ?? false;
+    // Someone the business texted for an outreach is someone it deals with, from their first reply on
+    // (the outreach itself is forgotten two days after it ends; they are not).
+    if (!session.vouched && this.outreach?.forText(session.key)) session.vouched = true;
     // A sender that is no person's number (the carrier's "Missed calls", a short code), or one on the
     // phone's blocked list, is never answered: kept, as when answering is off.
-    const refused = this.notAnswered(session, await this.readBlocked(), body);
+    const blocked = await this.readBlocked();
+    let refused = this.notAnswered(session, blocked, body);
+    // Before a sender is kept for their link: their contact as it is now (the person may have named them
+    // since it was last read here, which takes them up).
+    if (refused === OPENED_WITH_LINK) {
+      const reading = this.freshen(session.key);
+      if (reading) {
+        await Promise.race([reading, new Promise((r) => setTimeout(r, TEXT_CONTACT_WAIT_MS))]);
+        refused = this.notAnswered(session, blocked, body);
+      }
+    }
     // A pretend text is always answered: trying the agent is what it is for. Someone texted for an
     // outreach is answered even while answering is off (only them: the outreach's objective is theirs).
     if (!stopped && !refused && (this.settings().answer || session.key === TEST_NUMBER || !!this.outreach?.forText(session.key))) this.deliver(session, text);
     else {
       // Kept, not answered: it is there when the person looks, or answers it themselves.
-      session.agent.turns.push({ role: 'user', text, at: Date.now() });
+      const kept: Turn = { role: 'user', text, at: Date.now() };
+      session.agent.turns.push(kept);
+      // Another page answers the texts now: this one is that page's, also once this page answers them.
+      if (this.textsElsewhere()) this.keptElsewhere.add(kept);
       await this.save(session);
     }
     this.sort();
@@ -2345,6 +2492,8 @@ export class Sessions {
       if (last?.role !== 'user' || !last.text.startsWith('Text message from ')) continue;
       // Never one from a sender who is not answered at all (no person's number, or a blocked one).
       if (session.kind !== 'sms' || this.notAnswered(session)) continue;
+      // Nor one kept while another page answered the texts: that page answered it.
+      if (this.keptElsewhere.has(last)) continue;
       session.agent.turns.pop();
       // Answered now, and kept as it came.
       if (typeof last.at === 'number') session.waitingSince ??= last.at;
@@ -2384,8 +2533,15 @@ export class Sessions {
   /** The person's own message in a conversation (to the lane `laneFor` gives), or in one lane: it goes first. */
   async say(target: Thread | Session, text: string): Promise<Session> {
     const session = 'lanes' in target ? await this.laneFor(target) : target;
-    // Writing in a conversation is dealing with its sender: a stranger's link no longer keeps it unanswered.
-    session.vouched = true;
+    // Writing in a conversation is dealing with its sender: a stranger's link no longer keeps it unanswered
+    // (their texts' lane too, when it is their call that is written in).
+    let taken = false;
+    for (const lane of this.list) {
+      if (lane.kind === 'task' || lane.thread !== session.thread || lane.vouched) continue;
+      lane.vouched = true;
+      taken = true;
+    }
+    if (taken) void this.saveIndex();
     this.deliver(session, text, true);
     return session;
   }
@@ -2396,6 +2552,8 @@ export class Sessions {
     if (session.kind !== 'task' && session.running && session.agent.interject(text)) {
       // Read by the run going on: no hold word of a run of its own.
       session.heardAt = undefined;
+      // Something new to answer: a text may go to them again.
+      session.justTexted = false;
       return;
     }
     session.waiting.push(text);
@@ -2435,6 +2593,9 @@ export class Sessions {
     // When the caller's words this run answers ended: a hold word follows them if nothing is said soon.
     const heardAt = session.heardAt;
     session.heardAt = undefined;
+    // A run answers something new: its first text goes.
+    session.justTexted = false;
+    session.answering = prompt;
     this.hooks.changed();
     // A text thread's agent reads the person's contact as it is now: a moment's wait at most (a text can
     // wait that long; a call's agent never waits, see callEvent).
@@ -2504,6 +2665,8 @@ export class Sessions {
         if (event.type === 'tool_result') {
           session.inTool = false;
           stopHolding();
+          // Another tool answered (the calendar's, what is remembered): what it found may be texted.
+          if (event.result.name !== 'send_text_message') session.justTexted = false;
           // What it says next is heard, even if the caller spoke over the words before the tool;
           // but nothing after the goodbye (end_call), even when another tool of the same reply answers after it: the call is ending.
           if (event.result.name === 'end_call' && !event.result.isError && !/^Not yet/.test(event.result.content)) goodbye = true;
@@ -2546,6 +2709,7 @@ export class Sessions {
       if (task >= 0) session.answers!.splice(task, 1)[0].settle(said.trim(), said.trim() ? undefined : failed || 'the agent finished without an answer');
       session.running = null;
       session.controller = null;
+      session.answering = undefined;
       finish();
       session.lastAt = Date.now();
       // Messages that came as it finished: its next turn.
@@ -2630,7 +2794,7 @@ export class Sessions {
   }
 
   private async saveIndex(): Promise<void> {
-    await this.project.saveSessions(this.list.map(({ id, kind, key, title, lastAt, unread, handles, thread, hidden }) => ({ id, kind, key, title, lastAt, unread, ...(handles?.length ? { handles } : {}), thread, ...(hidden ? { hidden } : {}) })));
+    await this.project.saveSessions(this.list.map(({ id, kind, key, title, lastAt, unread, handles, thread, hidden, vouched }) => ({ id, kind, key, title, lastAt, unread, ...(handles?.length ? { handles } : {}), thread, ...(hidden ? { hidden } : {}), ...(vouched ? { vouched } : {}) })));
   }
 }
 

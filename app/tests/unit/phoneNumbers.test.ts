@@ -212,4 +212,11 @@ describe('a caller id as a person: E.164, read with the country for local number
     for (const n of ['+61 491 570 006', '0491570006', '61491570006', '+1 415 555 0100', '(02) 9374 4000']) expect(isPersonNumber(n, 'AU'), n).toBe(true);
     for (const n of ['Missed calls', 'MyBank', 'VOICEMAIL', '55555', '321', '+61101', '', 'Private', 'No Caller ID', null, undefined]) expect(isPersonNumber(n, 'AU'), String(n)).toBe(false);
   });
+
+  it('a number the country set here does not read is still a person\'s; a premium number is not', () => {
+    // The country set wrong (an Australian mobile on a computer set to the United States), or a number as it is dialled abroad.
+    for (const n of ['0491570006', '0491 570 006', '07700 900123', '(0491) 570-006']) expect(isPersonNumber(n, 'US'), n).toBe(true);
+    for (const n of ['1912 3456', '19 123 456', '55555', 'Missed calls', '0491570006 ext', '12345678901234567']) expect(isPersonNumber(n, 'US'), n).toBe(false);
+    expect(isPersonNumber('1912 3456', 'AU')).toBe(false);
+  });
 });

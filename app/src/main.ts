@@ -715,8 +715,26 @@ async function main(): Promise<void> {
       () => desktop,
       {
         changed: () => renderSessions(),
-        // A number on the phone's blocked list is not answered or texted by a text thread either.
-        screening: readScreening,
+        // A number on the phone's blocked list is not answered or texted by a text thread either: the list alone
+        // is asked for (a text's answer does not wait on, or fail with, the rest of the screening), and kept for
+        // when the phone cannot say it.
+        screening: readBlockedNumbers,
+        blockedKept: {
+          read: () => {
+            try {
+              return window.localStorage.getItem(BLOCKED_KEPT) ?? '';
+            } catch {
+              return '';
+            }
+          },
+          write: (list) => {
+            try {
+              window.localStorage.setItem(BLOCKED_KEPT, list);
+            } catch {
+              // No storage: read again from the phone after a restart.
+            }
+          },
+        },
         // A caller's words, or a text, while an agent of theirs answers go where they came, without splitting the reply being written.
         arrived: (session, text) => {
           if (viewing !== session.thread) return;
@@ -757,6 +775,8 @@ async function main(): Promise<void> {
     own.identity = () => identity.get();
     // A call ringing in is warmed (its prompt read before it is answered) only by the page that answers the calls.
     own.answersCalls = () => holdsCalls;
+    // Texts kept here while another page answers them are that page's, also after this one takes over.
+    own.textsElsewhere = () => !holdsTexts && !!textHolder;
     await own.load();
     // The phone's blocked list, for the list of conversations (read again at each text, and after a change here).
     void own.refreshBlocked().then(() => renderSessions());
@@ -895,6 +915,17 @@ async function main(): Promise<void> {
     const read = async (key: string) => ((await d.command('aokie', 'settings.get', { key }, `oaiy:settings.get:${key}:${crypto.randomUUID()}`)) as { value?: unknown } | null)?.value;
     const [accept, blocked, hidden] = await Promise.all([read('acceptPattern'), read('blockedNumbers'), read('rejectPrivate')]);
     return { acceptPattern: typeof accept === 'string' ? accept : '', blockedNumbers: typeof blocked === 'string' ? blocked : '', rejectPrivate: hidden === true || hidden === 'true' };
+  }
+
+  /** Where the blocked list is kept as it was last read (see `SessionHooks.blockedKept`). */
+  const BLOCKED_KEPT = 'oaiy.phone.blockedNumbers';
+
+  /** Aokie's blocked numbers alone, as a screening that says nothing else; null when the phone cannot be asked. */
+  async function readBlockedNumbers(): Promise<Screening | null> {
+    const d = desktop;
+    if (!d) return null;
+    const value = ((await d.command('aokie', 'settings.get', { key: 'blockedNumbers' }, `oaiy:settings.get:blockedNumbers:${crypto.randomUUID()}`)) as { value?: unknown } | null)?.value;
+    return { acceptPattern: '', blockedNumbers: typeof value === 'string' ? value : '', rejectPrivate: false };
   }
 
   /** Whether Aokie sends its calls to OAIY (its realtime route, with OAIY's provider); null when the phone cannot be asked. */

@@ -302,6 +302,7 @@ export function regroup(stored: Stored, country: string): Regrouped {
         ...(handles.length ? { handles } : {}),
         thread,
         ...(lanes.some((l) => l.hidden) || (group.alone && group.key !== TEST && kind === 'call') ? { hidden: true } : {}),
+        ...(lanes.some((l) => l.vouched) ? { vouched: true } : {}),
       };
       // (A name alone is not a change to copy aside for: it is kept with the list's next save.)
       const was = lanes[0];
