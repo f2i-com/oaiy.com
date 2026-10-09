@@ -4,7 +4,7 @@ import type { Turn } from '../../src/agent/protocol';
 import { NetGate } from '../../src/gate/netgate';
 import { Vfs } from '../../src/vfs/vfs';
 import type { SessionInfo } from '../../src/vfs/projects';
-import { DesktopEvents, Sessions, TEST_NUMBER, textMessage, type SessionHooks } from '../../src/sessions';
+import { DesktopEvents, Sessions, TEST_NUMBER, hasLink, textMessage, type SessionHooks } from '../../src/sessions';
 import type { Desktop, DesktopEvent } from '../../src/desktop/bridge';
 import { DEFAULT_MESSAGE_SETTINGS, type MessageSettings } from '../../src/settings';
 import { OPENAI, fakeProvider } from './fakeProvider';
@@ -169,6 +169,48 @@ describe('text-message conversations', () => {
     expect(desktop.commands).toEqual([]);
     const result = events.find((e) => e.event.type === 'tool_result')?.event as Extract<AgentEvent, { type: 'tool_result' }>;
     expect(result.result.content).toContain("on the phone's blocked list");
+  });
+
+  it('a first text with a link, from a number never dealt with, is kept and not answered until the person writes in it', async () => {
+    const fake = fakeProvider('openai', []);
+    const { sessions, desktop } = setup({ answer: true, instructions: '' });
+    const scam = await sessions.textArrived('+61400000006', '', 'myGov: your refund is waiting. Claim it at https://mygov-refunds.example/claim');
+    await settled(sessions);
+    expect(scam.agent.turns).toHaveLength(1);
+    expect(fake.bodies).toHaveLength(0);
+    expect(desktop.commands).toEqual([]);
+    expect(sessions.notAnswered(scam)).toContain('you have not dealt with');
+    // Their next text, with no link, is not answered either: the thread is still a stranger's with a link in it.
+    await sessions.textArrived('+61400000006', '', 'Reply YES to confirm');
+    await settled(sessions);
+    expect(fake.bodies).toHaveLength(0);
+    expect(sessions.answerWaiting()).toBe(0);
+    // The person writes in the conversation: its agent may answer them now.
+    fakeProvider('openai', [{ calls: [{ name: 'send_text_message', input: { body: 'Who is this?' } }] }, { text: 'Asked.' }]);
+    await sessions.say(scam, 'Ask them who they are.');
+    await settled(sessions);
+    expect(sessions.notAnswered(scam)).toBe('');
+    expect(desktop.commands.map((c) => c.payload.body)).toEqual(['Who is this?']);
+  });
+
+  it('a link from someone already answered, or with no link at all, is answered as before', async () => {
+    fakeProvider('openai', [
+      { calls: [{ name: 'send_text_message', input: { body: 'Yes, we are.' } }] },
+      { text: 'Replied.' },
+      { calls: [{ name: 'send_text_message', input: { body: 'Thanks, got it.' } }] },
+      { text: 'Replied.' },
+    ]);
+    const { sessions, desktop } = setup({ answer: true, instructions: '' });
+    await sessions.textArrived('+61400000007', '', 'Are you open today?');
+    await settled(sessions);
+    await sessions.textArrived('+61400000007', '', 'Here is the listing: https://example.com/house/12');
+    await settled(sessions);
+    expect(desktop.commands.map((c) => c.payload.body)).toEqual(['Yes, we are.', 'Thanks, got it.']);
+  });
+
+  it('a link is a web address, not any word with a full stop in it', () => {
+    for (const text of ['see https://example.com/x', 'http://a.co', 'go to www.example.com now', 'bit.ly/3xYz', 'claim: mygov-refund.example.net/login?id=1']) expect(hasLink(text), text).toBe(true);
+    for (const text of ['Thanks.See you at 3', 'It cost $4.50', 'e.g. tomorrow', 'Call me on 0400 000 000', 'ok', 'my email is sam@example.com']) expect(hasLink(text), text).toBe(false);
   });
 
   it('a pretend text is answered but never sent', async () => {

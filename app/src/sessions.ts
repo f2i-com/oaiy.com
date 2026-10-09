@@ -97,6 +97,8 @@ export interface Session extends SessionInfo {
   handoff?: { at: number; reason: string };
   /** A flow's tasks waiting for their answers, each by its prompt (one task a run; a message of the person's answers none). */
   answers?: Array<{ prompt: string; settle: (reply: string, error?: string) => void }>;
+  /** The person wrote in this conversation themselves: its sender is someone they deal with (see `Sessions.notAnswered`). */
+  vouched?: boolean;
 }
 
 /**
@@ -187,6 +189,14 @@ export function sameNumber(a: string, b: string): boolean {
   return x.length >= 8 && y.length >= 8 && x.slice(-9) === y.slice(-9);
 }
 
+/**
+ * Whether a text carries a link: "http(s)://…", "www.…", or a site with a
+ * path ("bit.ly/x"). A word with a full stop in it ("Thanks.See you") is not one.
+ */
+export function hasLink(text: string): boolean {
+  return /\bhttps?:\/\/\S|\bwww\.\S|\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,}\/\S/i.test(text);
+}
+
 /** A text message as the conversation's agent reads it. */
 export function textMessage(title: string, number: string, body: string): string {
   const who = title && title !== number ? `${title} (${number})` : number;
@@ -235,7 +245,7 @@ export function smsInstructions(title: string, number: string, instructions: str
     identityInstructions(identity),
     'Their messages arrive as "Text message from …". Answer them with send_text_message: short plain text (no markdown), in the language they write in. Only what you send with it reaches them; anything else you write is seen only by the person you work for.',
     'A message without that label comes from the person you work for, who may be watching: do what they say (they may tell you what to reply, or ask you to do something first).',
-    `${REFERENCE} Use your flows made tools when a message needs one. You cannot change files, browse the web or run code here. There is no need to reply to a message that needs no answer (a thank-you, an emoji).`,
+    `${REFERENCE} Use your flows made tools when a message needs one. You cannot change files, browse the web or run code here. There is no need to reply to a message that needs no answer (a thank-you, an emoji). Do not answer a message that reads like a scam, an advertisement or an automated notice (a code, a delivery, a bank's or a government's notice, a prize, a link to click), and never open or pass on its link: say so to the person you work for instead.`,
     'To book them in: find a time with calendar_free_times, agree a day and time with them, then request_appointment. It is a request that staff confirm (they are texted when it is): never say it is booked.',
     "To cancel one of theirs: cancel_appointment. Tell them its result plainly (a confirmed booking is passed to staff, who confirm the cancellation), and don't check the calendar again.",
     'A message "[OAIY] A note from the runner" is your person\'s direction, passed on by the main agent they talk to: go by it, without quoting it.',
@@ -2164,11 +2174,29 @@ export class Sessions {
    * phone's blocked list. Their texts are kept, as when answering is off. The
    * pretend conversation is always answered.
    */
-  notAnswered(session: Session, blocked = this.blocked): string {
+  notAnswered(session: Session, blocked = this.blocked, incoming = ''): string {
     if (session.key === TEST_NUMBER) return '';
     if (session.hidden || !isPersonNumber(session.key)) return "not a person's phone number (a sender's name or a short code)";
     if (isBlocked(session.key, blocked)) return "on the phone's blocked list";
+    // A scam or an advertisement nearly always carries a link, and comes from a number never dealt with. The
+    // phone may have that number blocked or marked as spam: neither is known here (they do not cross Bluetooth).
+    const linked = hasLink(incoming) || session.agent.turns.some((t) => t.role === 'user' && t.text.startsWith('Text message from ') && hasLink(t.text));
+    if (linked && this.stranger(session)) return 'someone you have not dealt with whose text carries a link (it reads like a scam or an advertisement)';
     return '';
+  }
+
+  /**
+   * Whether the business has had nothing to do with a text thread's sender:
+   * the person never wrote in their conversation or gave them a name or a note
+   * in Contacts, they never rang, they are not part of an outreach, and nothing
+   * was ever written back to them.
+   */
+  private stranger(session: Session): boolean {
+    if (session.vouched || session.outreach || this.outreach?.forText(session.key)) return false;
+    const note = this.callerNote(session.key);
+    if (note && (note.nameBy === 'owner' || !!note.notes?.trim() || !!note.ownerFacts?.length)) return false;
+    const lanes = this.list.filter((s) => s.kind !== 'task' && s.thread === session.thread);
+    return !lanes.some((s) => s.agent.turns.some((t) => t.role !== 'user' || !t.text.startsWith('Text message from ')));
   }
 
   /** Whether a lane is the person at `key` (never a hidden caller's, and the pretend conversation only itself). */
@@ -2262,7 +2290,7 @@ export class Sessions {
     const stopped = this.outreach?.stopWord(session.key, body) ?? false;
     // A sender that is no person's number (the carrier's "Missed calls", a short code), or one on the
     // phone's blocked list, is never answered: kept, as when answering is off.
-    const refused = this.notAnswered(session, await this.readBlocked());
+    const refused = this.notAnswered(session, await this.readBlocked(), body);
     // A pretend text is always answered: trying the agent is what it is for. Someone texted for an
     // outreach is answered even while answering is off (only them: the outreach's objective is theirs).
     if (!stopped && !refused && (this.settings().answer || session.key === TEST_NUMBER || !!this.outreach?.forText(session.key))) this.deliver(session, text);
@@ -2330,6 +2358,8 @@ export class Sessions {
   /** The person's own message in a conversation (to the lane `laneFor` gives), or in one lane: it goes first. */
   async say(target: Thread | Session, text: string): Promise<Session> {
     const session = 'lanes' in target ? await this.laneFor(target) : target;
+    // Writing in a conversation is dealing with its sender: a stranger's link no longer keeps it unanswered.
+    session.vouched = true;
     this.deliver(session, text, true);
     return session;
   }
