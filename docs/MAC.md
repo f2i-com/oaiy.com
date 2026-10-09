@@ -46,8 +46,17 @@ them. If the build stops on that name, `rustup update`.
 **The desktop app** (the window with the Agent, the flows and the plugins) is the
 [production build](../platform/desktop/README.md#production-build) of `platform/desktop`,
 which also needs Node 22 or later. It has never been built on macOS either. The engines
-above do not need it: they are the same ones it would start. The phone plugin (Aokie) is
-built around a Windows Bluetooth driver and is not for a Mac.
+above do not need it: they are the same ones it would start.
+
+**The phone plugin (Aokie) does not run on a Mac yet.** Its Bluetooth stack drives a USB
+dongle itself, with no use of the system's Bluetooth, and is written to be portable: beside
+the Windows transport (WinUSB) it has one for libusb, written for Linux and not yet run on
+hardware. But the plugin's phone link is compiled for Windows only (for a Mac it does not
+compile at all), its secrets are sealed with Windows' own protection, and its bundle
+carries a Windows program. On a Mac no driver has to be installed or signed; what decides
+the rest is whether macOS attaches a driver of its own to the dongle, which
+`sh tools/mac/doctor.sh` shows (the section on a USB Bluetooth dongle), and whether call
+audio keeps time over libusb there, which only a call can show.
 
 **Checked from Windows and Linux** (`cargo check --target aarch64-apple-darwin`, which
 reads the Rust and links nothing): the Engines host, the language-model server and the

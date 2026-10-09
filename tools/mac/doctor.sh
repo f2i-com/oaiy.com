@@ -61,6 +61,21 @@ say "Thunderbolt devices:"
 system_profiler SPThunderboltDataType 2>/dev/null | grep -E "Device Name|Vendor Name" | sed 's/^ */  /' | head -12
 
 say
+say "== A USB Bluetooth dongle (for the phone link, Aokie, which does not run on a Mac yet: docs/MAC.md)"
+# (each USB device that looks like a Bluetooth controller, with what macOS has attached to it: a driver of its own
+# on the dongle is what a program that drives the dongle itself would have to take it from)
+dongles=$(ioreg -r -c IOUSBHostDevice -w 0 2>/dev/null | sed 's/, id 0x[0-9a-f]*//; s/, retain [0-9]*//; s/, busy [0-9]* ([0-9]* ms)//' | awk '
+  /^\+-o / { if (block ~ /[Bb]luetooth|BCM2070|RTL87|CSR8510/) printf "%s", block; block = "" }
+  { block = block "  " $0 "\n" }
+  END { if (block ~ /[Bb]luetooth|BCM2070|RTL87|CSR8510/) printf "%s", block }' | cut -c 1-150 | head -30)
+if [ -n "$dongles" ]; then say "USB devices that look like one, and what macOS has attached to each:"; say "$dongles"; else say "no USB device that looks like one (is it plugged in?)"; fi
+say "what macOS's own Bluetooth runs on:"
+system_profiler SPBluetoothDataType 2>/dev/null | grep -E "^ *(State|Chipset|Transport|Vendor ID|Product ID|Firmware Version):" | sed 's/^ */  /' | head -8
+switch=$(nvram bluetoothHostControllerSwitchBehavior 2>/dev/null | awk '{ print $2 }')
+say "bluetoothHostControllerSwitchBehavior (whether macOS moves its own Bluetooth onto a dongle): ${switch:-not set}"
+if have brew && brew list --versions libusb > /dev/null 2>&1; then say "libusb: $(brew list --versions libusb)"; else say "libusb: not installed by Homebrew"; fi
+
+say
 say "== Pythons, and which has tinygrad"
 check='
 import sys, os, importlib.util
