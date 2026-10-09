@@ -62,11 +62,13 @@ fn bad(s: impl Into<String>) -> Error {
 #[path = "flashnext_gguf.rs"]
 pub(crate) mod gguf_file;
 mod chain;
+mod chain_part;
+mod chain_state;
 mod load;
 mod ngram;
 mod runs;
 // (what the files make for each other, and for the rest of the server what they made for it)
-pub(crate) use {chain::*, load::*, runs::*};
+pub(crate) use {chain_state::*, load::*, runs::*};
 use ngram::*;
 
 /// A Qwen3.8-Flash-Next checkpoint: `qwen4_exp`, EXL3.
