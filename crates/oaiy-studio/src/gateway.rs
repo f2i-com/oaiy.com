@@ -216,13 +216,18 @@ fn egpu_chat(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, cfg: &Json,
         Err(Unready::Loading(why)) => return Some(send(w, Err(fail(503, why)))),
     };
     let auth = format!("Bearer {}", endpoint.key);
-    let headers = [("Authorization", auth.as_str()), ("Content-Type", "application/json")];
+    let thinking = if egpu::thinks(llm, &asked) { "1" } else { "0" };
+    let headers = [("Authorization", auth.as_str()), ("Content-Type", "application/json"), ("X-OAIY-Thinking", thinking)];
     let response = match fetch(&endpoint.addr, "POST", "/v1/chat/completions", &headers, &body, UPSTREAM_READ) {
         Ok(r) => r,
         Err(e) => {
-            // Nothing has been sent to the client yet: this computer's engine can still answer.
+            // Nothing has been sent to the client yet: this computer's engine can still answer. A server whose
+            // process is still there keeps its model (it gives no reply to a request it cannot render).
             drop(lease);
-            here(&studio.egpu.gone(&e.to_string()));
+            match studio.egpu.unanswered(&e.to_string()) {
+                Some(gone) => here(&gone),
+                None => here(&format!("tinygrad's server gave this request no reply ({e}) and is still running")),
+            }
             return None;
         }
     };
@@ -1381,7 +1386,7 @@ mod tests {
         let root = std::env::temp_dir();
         let studio = egpu_studio(&root, "small");
         let (tinygrad, engine) = (StandIn::new(TINYGRAD_SAYS), StandIn::new(ENGINE_SAYS));
-        studio.egpu.adopt(&tinygrad.addr, "sk-egpu-test", "big");
+        studio.egpu.adopt(&tinygrad.addr, "sk-egpu-test", "big", None);
         studio.llm.adopt(&engine.addr, "sk-studio-test");
         // The eGPU's model: tinygrad's server, with its key, OAIY's name for the model, and the settings tinygrad
         // would otherwise decide differently. Its stream, which says no length and ends by closing, arrives whole.
@@ -1395,6 +1400,11 @@ mod tests {
         assert_eq!(sent[0].1.get("temperature").and_then(Json::as_f64), Some(0.7));
         assert_eq!(sent[0].1.get("max_tokens").and_then(Json::as_i64), Some(256));
         assert!(engine.requests().is_empty(), "this computer's engine was not asked");
+        // Whether to think first, which tinygrad's server reads from no request: said beside each, as OAIY's own
+        // engine would decide it (not unless asked).
+        assert!(sent[0].0.contains("X-OAIY-Thinking: 0"), "{}", sent[0].0);
+        assert_eq!(chat(&studio, r#"{"model": "big", "reasoning_effort": "low", "messages": [{"role": "user", "content": "hi"}]}"#).0, 200);
+        assert!(tinygrad.requests()[1].0.contains("X-OAIY-Thinking: 1"));
         // Another model: this computer's engine, as it was sent.
         let (status, _, body) = chat(&studio, r#"{"model": "small", "messages": [{"role": "user", "content": "hi"}]}"#);
         assert_eq!(status, 200, "{body}");
@@ -1410,7 +1420,35 @@ mod tests {
         let (head, sent) = engine.requests().last().unwrap().clone();
         assert!(head.starts_with("POST /v1/completions "), "{head}");
         assert_eq!(sent.get("model").and_then(Json::as_str), Some("small"));
-        assert_eq!(tinygrad.requests().len(), 1, "tinygrad's server was not asked again");
+        assert_eq!(tinygrad.requests().len(), 2, "tinygrad's server was not asked again");
+    }
+
+    /// Something that stands for a server's process and stays for a minute.
+    fn idler() -> std::process::Child {
+        use std::process::{Command, Stdio};
+        let mut c = if cfg!(windows) { Command::new("ping") } else { Command::new("sleep") };
+        if cfg!(windows) { c.args(["-n", "60", "127.0.0.1"]) } else { c.arg("60") };
+        c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap()
+    }
+
+    #[test]
+    fn a_request_tinygrads_server_gives_no_reply_to_does_not_cost_it_its_model() {
+        let root = std::env::temp_dir();
+        let studio = egpu_studio(&root, "small");
+        // As tinygrad's server treats a request it cannot render: the connection closed, not a word sent. Its
+        // process is still there, holding a model that took minutes to load.
+        let (tinygrad, engine) = (StandIn::new(""), StandIn::new(ENGINE_SAYS));
+        studio.egpu.adopt(&tinygrad.addr, "sk-egpu-test", "big", Some(idler()));
+        studio.llm.adopt(&engine.addr, "sk-studio-test");
+        let (status, _, body) = chat(&studio, r#"{"model": "big", "messages": [{"role": "user", "content": "hi"}]}"#);
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("on this computer"), "this one request is answered here: {body}");
+        assert_eq!(studio.egpu.state(), crate::llm::State::Ready, "and the server keeps its model");
+        assert!(studio.log.tail(10).contains("gave this request no reply"), "{}", studio.log.tail(10));
+        // The next chat is tinygrad's again.
+        chat(&studio, r#"{"model": "big", "messages": []}"#);
+        assert_eq!(tinygrad.requests().len(), 2);
+        studio.egpu.stop();
     }
 
     #[test]
@@ -1422,7 +1460,7 @@ mod tests {
             studio.llm.adopt(&engine.addr, "sk-studio-test");
             // tinygrad's server was there and is not any more (the card unplugged): nothing listens at its address.
             let gone = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().to_string() };
-            studio.egpu.adopt(&gone, "sk-egpu-test", "big");
+            studio.egpu.adopt(&gone, "sk-egpu-test", "big", None);
             let (status, _, body) = chat(&studio, r#"{"model": "big", "messages": [{"role": "user", "content": "hi"}]}"#);
             assert_eq!(status, 200, "{body}");
             assert!(body.contains("on this computer"), "{body}");
@@ -1446,7 +1484,7 @@ mod tests {
         crate::util::set(&mut cfg, "llm", llm);
         let studio = Arc::new(Studio::for_test(&root, cfg));
         let (tinygrad, engine) = (StandIn::new(TINYGRAD_SAYS), StandIn::new(ENGINE_SAYS));
-        studio.egpu.adopt(&tinygrad.addr, "sk-egpu-test", "big");
+        studio.egpu.adopt(&tinygrad.addr, "sk-egpu-test", "big", None);
         studio.llm.adopt(&engine.addr, "sk-studio-test");
         assert_eq!(chat(&studio, r#"{"model": "big", "messages": []}"#).0, 200);
         assert!(tinygrad.requests().is_empty());
@@ -1490,12 +1528,22 @@ mod tests {
         let status_now = studio.egpu.status(cfg.get("llm").unwrap());
         eprintln!("status: {}", status_now.to_json());
         assert_eq!(status_now.get("state").and_then(Json::as_str), Some("ready"));
-        // Whole, with its counts.
+        // Whole, with its counts; and answered straight away, not thought about first, since nothing asked for that
+        // (a Qwen model's chat format thinks unless told not to, and tinygrad's server does not tell it).
         let (status, _, body) = chat(&studio, r#"{"model": "m", "messages": [{"role": "user", "content": "Say hello."}]}"#);
         eprintln!("second chat: {status} {body}");
         let reply = Json::parse(body.as_bytes()).unwrap();
         assert_eq!((status, reply.get("model").and_then(Json::as_str)), (200, Some("m")));
         assert!(reply.get("usage").and_then(|u| u.get("completion_tokens")).and_then(Json::as_i64).is_some_and(|n| (1..=16).contains(&n)), "the reply limit OAIY filled in: {body}");
+        let message = reply.get("choices").and_then(|c| c.at(0)).and_then(|c| c.get("message")).cloned().unwrap_or(Json::Null);
+        assert!(message.get("content").and_then(Json::as_str).is_some_and(|c| !c.trim().is_empty()), "an answer: {body}");
+        assert!(message.get("reasoning_content").is_none(), "no thinking unless asked: {body}");
+        // Asked to think, it does.
+        let (status, _, body) = chat(&studio, r#"{"model": "m", "reasoning_effort": "low", "messages": [{"role": "user", "content": "Say hello."}]}"#);
+        eprintln!("third chat, asked to think: {status} {body}");
+        let reply = Json::parse(body.as_bytes()).unwrap();
+        let message = reply.get("choices").and_then(|c| c.at(0)).and_then(|c| c.get("message")).cloned().unwrap_or(Json::Null);
+        assert!(message.get("reasoning_content").and_then(Json::as_str).is_some_and(|c| !c.trim().is_empty()), "thinking when asked: {body}");
         // Itself: nothing without the key, its model with it, and nothing at all on the computer's other address.
         let (endpoint, lease) = studio.egpu.ensure(&cfg, &dir, "m", Duration::from_secs(5)).map_err(|e| format!("{e:?}")).unwrap();
         let models = |auth: &[(&str, &str)]| fetch(&endpoint.addr, "GET", "/v1/models", auth, b"", Duration::from_secs(10)).unwrap().status;

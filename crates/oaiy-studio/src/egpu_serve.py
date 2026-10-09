@@ -6,14 +6,19 @@
 tinygrad's server listens on every network interface and asks for no key. Started through this file it listens on
 this computer only (127.0.0.1) and answers only requests that carry OAIY_EGPU_KEY as their bearer token. With
 --watch-stdin it stops when its standard input closes, so it never outlives the OAIY that started it while holding the
-graphics card. Nothing of tinygrad's is changed on disk, and nothing here names tinygrad's own classes: Python's socket
-server, which tinygrad's server is built on, is told where to listen and whom to answer.
+graphics card. A request's X-OAIY-Thinking header (1 or 0) says whether the model is to think first, which tinygrad's
+server reads from no request. Nothing of tinygrad's is changed on disk, and nothing here names tinygrad's own classes:
+Python's socket server, which tinygrad's server is built on, is told where to listen and whom to answer, and jinja2,
+which renders the model's chat format, is given the request's word on thinking.
 """
 import hmac, importlib.util, json, os, runpy, socketserver, sys, threading
 
 # Where tinygrad has kept its LLM server: a package since April 2026, a single module before.
 SERVERS = ("tinygrad.llm", "tinygrad.apps.llm")
 KEY = os.environ.pop("OAIY_EGPU_KEY", "")
+# Whether the request being answered is to be thought about first: "1", "0", or None when it did not say. One
+# value for the whole server, which answers one request at a time.
+THINKING = [None]
 
 
 def local_only():
@@ -35,6 +40,7 @@ def local_only():
 
             def do_POST(self):
                 if self._oaiy():
+                    THINKING[0] = self.headers.get("X-OAIY-Thinking")
                     super().do_POST()
 
         return Guarded
@@ -45,6 +51,27 @@ def local_only():
         init(self, ("127.0.0.1", server_address[1]), RequestHandlerClass, *args, **kwargs)
 
     socketserver.TCPServer.__init__ = listen
+
+
+def thinking_as_asked():
+    """Give the model's chat format the request's word on thinking (`enable_thinking`), where the request has one.
+
+    tinygrad renders a chat with the model's own template and passes it no such word, and a Qwen model's template
+    thinks unless told not to: every reply would begin with reasoning, whatever was asked. OAIY says with each
+    request whether to think (the X-OAIY-Thinking header); a template that knows no `enable_thinking` ignores it.
+    """
+    try:
+        import jinja2
+    except Exception:
+        return  # tinygrad then uses its plain chat format, which has no thinking to switch
+    render = jinja2.Template.render
+
+    def as_asked(self, *args, **kwargs):
+        if THINKING[0] in ("0", "1"):
+            kwargs.setdefault("enable_thinking", THINKING[0] == "1")
+        return render(self, *args, **kwargs)
+
+    jinja2.Template.render = as_asked
 
 
 def lifeline():
@@ -129,6 +156,7 @@ def main():
         args.remove("--watch-stdin")
         threading.Thread(target=lifeline, daemon=True).start()
     local_only()
+    thinking_as_asked()
     as_file(args)
     sys.argv = [name] + args
     runpy.run_module(name, run_name="__main__", alter_sys=True)

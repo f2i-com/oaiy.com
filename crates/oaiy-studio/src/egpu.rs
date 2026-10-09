@@ -207,6 +207,21 @@ pub fn request_body(llm: &Json, name: &str, body: &[u8]) -> Option<Vec<u8>> {
     Some(v.to_json().into_bytes())
 }
 
+/// Whether a request is to be thought about first, as OAIY's own engine decides it: `reasoning_effort` (`none` and
+/// `minimal` say no, anything else yes), else `thinking: {type: enabled | disabled}`, else the language model's
+/// *Think by default*. tinygrad's server reads none of these, and a Qwen model's chat format thinks unless told
+/// not to: the launcher is told with the request (`X-OAIY-Thinking`), and tells the model's chat format.
+pub fn thinks(llm: &Json, body: &Json) -> bool {
+    if let Some(effort) = body.get("reasoning_effort").filter(|v| !matches!(v, Json::Null)) {
+        return !matches!(effort.as_str(), Some("none" | "minimal"));
+    }
+    match body.get("thinking").and_then(|t| t.get("type")).and_then(Json::as_str) {
+        Some("enabled") => true,
+        Some("disabled") => false,
+        _ => bool_or(llm, "thinking", false),
+    }
+}
+
 /// Whether a chat request carries a picture: tinygrad's server reads text only, so such a request is this
 /// computer's engine's.
 pub fn has_picture(body: &Json) -> bool {
@@ -354,13 +369,15 @@ impl Egpu {
         matches!(self.lock().state, State::Starting | State::Ready)
     }
 
-    /// A server that is already there (a test's stand-in), taken as tinygrad's, ready with `model`.
+    /// A server that is already there (a test's stand-in), taken as tinygrad's, ready with `model`; `process` is
+    /// what stands for its process (None: one that has gone).
     #[cfg(test)]
-    pub(crate) fn adopt(&self, addr: &str, key: &str, model: &str) {
+    pub(crate) fn adopt(&self, addr: &str, key: &str, model: &str, process: Option<Child>) {
         let mut g = self.lock();
         g.addr = addr.into();
         g.key = key.into();
         g.model = Some(model.into());
+        g.child = process;
         g.state = State::Ready;
     }
 
@@ -637,28 +654,30 @@ impl Egpu {
         }
     }
 
-    /// A request found the server not answering (the connection refused or cut before a reply): it is taken as
-    /// gone, so the next requests go to this computer's engine until it is tried again. The reason as the next
-    /// requests will be given it.
-    pub fn gone(&self, why: &str) -> String {
+    /// A request got no reply from the server (the connection refused, or closed before an answer). Where its
+    /// process has exited, the server is taken as gone (the reason, as the next requests will be given it): they go
+    /// to this computer's engine until it is tried again. A process that is still there is left serving (None):
+    /// tinygrad closes a connection without a word on a request it cannot render, and one such request must not
+    /// cost a model that took minutes to load.
+    pub fn unanswered(&self, why: &str) -> Option<String> {
         let said = format!("tinygrad's server stopped answering: {why}");
         let mut g = self.lock();
         if g.state != State::Ready {
-            return g.error.clone().unwrap_or(said);
+            return Some(g.error.clone().unwrap_or(said));
+        }
+        if g.child.as_mut().is_some_and(|c| matches!(c.try_wait(), Ok(None))) {
+            return None;
         }
         g.generation += 1;
         g.lifeline = None;
-        if let Some(mut child) = g.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        g.child = None;
         g.state = State::Failed;
         g.failed_at = Some(Instant::now());
         g.error = Some(said.clone());
         drop(g);
-        self.log.push(format!("studio: tinygrad's server stopped answering ({why}): stopped"));
+        self.log.push(format!("studio: tinygrad's server has gone ({why})"));
         self.changed.notify_all();
-        said
+        Some(said)
     }
 
     /// Whether `why` is news: the reason a request went to this computer's engine, said once and not per request.
@@ -825,6 +844,18 @@ mod tests {
         assert_eq!(said.get("temperature").and_then(Json::as_f64), Some(0.0));
         assert_eq!(said.get("max_tokens"), None);
         assert!(request_body(&on, "big", b"[1, 2]").is_none() && request_body(&on, "big", b"not json").is_none());
+    }
+
+    #[test]
+    fn a_request_is_thought_about_as_ooiys_own_engine_would_decide() {
+        let asks = |settings: &str, body: &str| thinks(&llm(settings), &llm(body));
+        // Nothing said: the language model's own setting, which is not to.
+        assert!(!asks("{}", "{}") && !asks(r#"{"thinking": false}"#, "{}") && asks(r#"{"thinking": true}"#, "{}"));
+        // The request's own word wins either way.
+        assert!(asks("{}", r#"{"reasoning_effort": "low"}"#) && asks("{}", r#"{"reasoning_effort": 50}"#));
+        assert!(!asks(r#"{"thinking": true}"#, r#"{"reasoning_effort": "none"}"#) && !asks(r#"{"thinking": true}"#, r#"{"reasoning_effort": "minimal"}"#));
+        assert!(asks("{}", r#"{"thinking": {"type": "enabled"}}"#) && !asks(r#"{"thinking": true}"#, r#"{"thinking": {"type": "disabled"}}"#));
+        assert!(asks(r#"{"thinking": true}"#, r#"{"reasoning_effort": null}"#));
     }
 
     #[test]

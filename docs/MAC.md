@@ -26,13 +26,23 @@ under **Models**, then try it in the **Playground**.
 
 `sh tools/mac/build.sh --media` also builds the worker for pictures, video and speech
 (`oaiy-media`). It has not been built on a Mac, and it sizes its memory from readings a Mac
-does not give (`nvidia-smi`, Vulkan's heap budget): expect work there.
+does not give (`nvidia-smi`, Vulkan's heap budget): expect work there. It needs a recent
+Rust: Rust 1.92 refuses the NEON half-float types its tensor library (Candle) uses on
+Apple silicon as unstable (`stdarch_neon_f16`), and the Rust of September 2026 accepts
+them. If the build stops on that name, `rustup update`.
 
 **The desktop app** (the window with the Agent, the flows and the plugins) is the
 [production build](../platform/desktop/README.md#production-build) of `platform/desktop`,
 which also needs Node 22 or later. It has never been built on macOS either. The engines
 above do not need it: they are the same ones it would start. The phone plugin (Aokie) is
 built around a Windows Bluetooth driver and is not for a Mac.
+
+**Checked from Windows and Linux** (`cargo check --target aarch64-apple-darwin`, which
+reads the Rust and links nothing): the Engines host, the language-model server and the
+GPU backend, with their tests; the desktop app's Rust; and `oaiy-media`, `oaiy-voice` and
+`oaiy-tts`. The last two groups have C and Objective-C in their dependencies, which no
+compiler here builds for a Mac, so a stand-in left the files their build scripts asked
+for: the Rust was read, and whether those parts compile and link on a Mac is not known.
 
 ## The Mac's own GPU
 
@@ -130,17 +140,25 @@ or Linux at all.
   is not left held.
 - A request with **a picture** goes to the Mac's own engine (tinygrad's server reads
   text), and so does `/v1/completions`.
+- tinygrad's server gives **no reply at all** to a request it cannot render (it closes the
+  connection). That one request is answered on the Mac's engine, and the server, still
+  running, keeps its model.
 
 ### What tinygrad's server does differently
 
 - It has no `top_p`, no stop sequences and no repeat penalty: a request's are ignored.
 - Its own default temperature is 0 and it has no reply limit. OAIY fills in the language
-  model's *Temperature* and *Reply limit* where a request has none, so a model answers
+  model's *Temperature* and *Reply limit* where a request has none, so a model is asked
   alike on either side.
+- It tells the model's chat format nothing about thinking, and a Qwen model's format
+  thinks unless told not to: by itself, every reply there would begin with reasoning. OAIY
+  says with each request whether to think, as its own engine decides it: not unless the
+  request asks (`reasoning_effort`, `thinking`) or *Think by default* is ticked. There is
+  no thinking budget on that side.
 - A prompt longer than its context is refused (`context_length_exceeded`), not trimmed.
 - It answers one request at a time.
-- It opens the model's file for reading and writing (it does not change it), so the file
-  must be one you may write to.
+- It opens the model's file for reading and writing, so the file must be one you may
+  write to. It does not change it (the check below compared the file's hash).
 
 ### How it is kept to this Mac
 
@@ -191,13 +209,18 @@ container on its CPU device with a Qwen3 0.6B GGUF, started through the launcher
 - a chat through OAIY's gateway started it, waited for it and was answered, streamed (as
   tinygrad sends it: no length, the connection closed at the end) and whole, the whole
   reply stopping at the reply limit OAIY filled in;
-- when OAIY let go of it without stopping it, it exited by itself.
+- the same chat was answered straight away when nothing asked it to think, and began with
+  reasoning when the request asked for that;
+- a request it could not render got no reply, and it went on serving;
+- when OAIY let go of it without stopping it, it exited by itself;
+- the model's file had the same SHA-256 afterwards.
 
 Beside that, with stand-ins for the two servers (in the studio's tests, on Windows and
 Linux): a chat for a model on the eGPU reaches tinygrad's server with its key and OAIY's
 settings; another model's, a picture and `/v1/completions` reach the Mac's engine; a server
 that has gone hands the chat to the Mac's engine, with the stand-in model where one is
-named; and with the eGPU switched off nothing goes there. The Engines page's parts were
+named; a server that gives one request no reply keeps its model; and with the eGPU
+switched off nothing goes there. The Engines page's parts were
 read back in a browser for a Mac in each state (off, not started, loading, ready, not
 answering) and for a PC, where none of them shows.
 
