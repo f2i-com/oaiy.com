@@ -5,6 +5,17 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>OAIY</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='1' y='2' width='14' height='3' fill='%23E3A63B'/%3E%3Crect x='1' y='6.5' width='14' height='3' fill='%233DB5A6'/%3E%3Crect x='1' y='11' width='14' height='3' fill='%238E7DF2'/%3E%3C/svg%3E">
+<script>
+// Before the first paint: whether this is OAIY's window (`?in=oaiy`), and whether the sections go along the
+// bottom (`dock`): always there, where OAIY's own sidebar is already on the left, and in any window too narrow
+// for a rail with its names.
+(() => {
+  const root = document.documentElement, narrow = matchMedia("(max-width: 1180px)");
+  if (new URLSearchParams(location.search).get("in") === "oaiy") root.classList.add("in-oaiy");
+  const place = () => root.classList.toggle("dock", root.classList.contains("in-oaiy") || narrow.matches);
+  place(); narrow.addEventListener("change", place);
+})();
+</script>
 <style>
 :root {
   color-scheme: dark;
@@ -12,7 +23,7 @@
   --text: #f4f7ff; --muted: #98a6bd; --faint: #8592ab;
   --ssd: #f2b84b; --ram: #35d4e8; --gpu: #7167ff; --bad: #ff6e78; --good: #45d6a2; --magenta: #e76bf3; --azure: #4d8bff;
   --well: #060a13; --well-text: #c9d3e6; --media-bg: #05080f; --on-accent: #FFFFFF; --on-tier: #0b0f19; --backdrop: rgba(3, 6, 12, .6);
-  --rail-w: 216px; --pad: clamp(16px, 2.6vw, 44px);
+  --rail-w: 216px; --dock-h: 0px; --pad: clamp(16px, 2.6vw, 44px);
   --display: "Public Sans", "Bahnschrift", "Segoe UI Variable Display", system-ui, sans-serif;
   --body: "Public Sans", "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
   --code: "JetBrains Mono", "Cascadia Mono", "Cascadia Code", Consolas, "SF Mono", monospace;
@@ -59,13 +70,20 @@ a { color: var(--gpu); }
 .brand-mark i { display: block; height: 4px; border-radius: 1px; }
 .brand-name { font: 600 19px/1 var(--display); letter-spacing: .02em; }
 .brand-name small { display: block; font: 400 12px/1.4 var(--body); color: var(--muted); letter-spacing: 0; margin-top: 3px; }
-nav { display: grid; gap: 2px; }
-nav button { all: unset; cursor: pointer; padding: 8px 10px; border-radius: var(--r); color: var(--muted); display: flex; gap: 10px; align-items: center; white-space: nowrap; }
-nav button svg { width: 18px; height: 18px; flex: none; stroke: currentColor; fill: none; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
-nav button .count { margin-left: auto; font: 600 11px var(--display); color: var(--on-accent); background: var(--gpu); border-radius: 9px; padding: 0 6px; }
-nav button:hover { color: var(--text); background: var(--panel); }
-nav button[aria-current="page"] { color: var(--text); background: var(--panel-2); }
-nav button:focus-visible { outline: 2px solid var(--gpu); }
+.sections { display: grid; gap: 2px; }
+.sections button { all: unset; cursor: pointer; position: relative; padding: 8px 10px; border-radius: var(--r); color: var(--muted); display: flex; gap: 10px; align-items: center; white-space: nowrap; }
+.sections button svg { width: 18px; height: 18px; flex: none; stroke: currentColor; fill: none; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.sections button .count { margin-left: auto; font: 600 11px var(--display); color: var(--on-accent); background: var(--gpu); border-radius: 9px; padding: 0 6px; }
+.sections button:hover { color: var(--text); background: var(--panel); }
+.sections button[aria-current="page"] { color: var(--text); background: var(--panel-2); }
+.sections button[aria-current="page"] svg { color: var(--gpu); }
+.sections button[aria-current="page"]::before { content: ""; position: absolute; left: -14px; top: 22%; bottom: 22%; width: 3px; border-radius: 0 3px 3px 0; background: var(--gpu); }
+.sections button:focus-visible { outline: 2px solid var(--gpu); }
+/* Three groups: what you use, the models, the machinery. */
+.sections button[data-first] { margin-top: 12px; }
+.sections .more, .sections .more .i-less, .sections.open .more .i-more { display: none; }
+.sections.open .more .i-less { display: block; }
+.nav-shade { position: fixed; inset: 0; z-index: 6; background: var(--backdrop); }
 .rail-foot { margin-top: auto; font-size: 12px; color: var(--muted); display: grid; gap: 6px; padding: 0 6px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; background: var(--faint); flex: none; }
 .dot.ready { background: var(--good); } .dot.starting { background: var(--ssd); animation: pulse 1.2s infinite; } .dot.failed { background: var(--bad); }
@@ -213,7 +231,7 @@ body.incognito .banner { display: flex; }
 .job img { cursor: pointer; }
 .job img, .job .ph { width: 64px; height: 48px; object-fit: cover; border-radius: 4px; background: var(--panel-2); }
 .job .p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.log { background: var(--well); border: 1px solid var(--line); border-radius: var(--r); padding: 12px 14px; height: calc(100vh - 250px); height: calc(100dvh - 250px); min-height: 280px; overflow: auto; font: 12px/1.55 var(--code); white-space: pre-wrap; word-break: break-all; color: var(--well-text); }
+.log { background: var(--well); border: 1px solid var(--line); border-radius: var(--r); padding: 12px 14px; height: calc(100vh - 250px - var(--dock-h)); height: calc(100dvh - 250px - var(--dock-h)); min-height: 280px; overflow: auto; font: 12px/1.55 var(--code); white-space: pre-wrap; word-break: break-all; color: var(--well-text); }
 .endpoint { display: grid; grid-template-columns: minmax(90px, 120px) minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--line); }
 .endpoint code { font: 13px var(--code); color: var(--text); word-break: break-all; }
 pre.example { background: var(--well); border: 1px solid var(--line); border-radius: var(--r); padding: 12px 14px; font: 12px/1.55 var(--code); overflow-x: auto; color: var(--well-text); margin: 8px 0 0; }
@@ -329,14 +347,18 @@ figure .audio-card svg { width: 40px; height: 40px; stroke: currentColor; fill: 
   .stagewrap { grid-template-rows: auto auto; }
   .stage { height: clamp(260px, 60vw, 560px); }
 }
+/* Narrow: the seven kinds share the row, each a picture over its name (side by side they are wider than the window). */
+@media (max-width: 699px) {
+  .ptabs { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); width: 100%; }
+  .ptabs button { flex-direction: column; justify-content: center; gap: 3px; padding: 6px 2px; font-size: 12px; letter-spacing: 0; }
+}
 @media (max-width: 560px) {
-  .ptabs { width: 100%; } .ptabs button { flex: 1; justify-content: center; padding: 7px 8px; }
   .msg { max-width: 94%; }
-  .chatbar select { min-width: 0; flex: 1; }
+  .chatbar select { min-width: 0; flex: 1 1 100%; }
 }
 
 /* save bar, toasts, dialog */
-.savebar { position: fixed; left: var(--rail-w); right: 0; bottom: 0; background: var(--panel-2); border-top: 1px solid var(--line-2); padding: 12px 36px; display: none; justify-content: space-between; align-items: center; gap: 12px; z-index: 5; }
+.savebar { position: fixed; left: var(--rail-w); right: 0; bottom: var(--dock-h); background: var(--panel-2); border-top: 1px solid var(--line-2); padding: 12px 36px; display: none; justify-content: space-between; align-items: center; gap: 12px; z-index: 5; }
 .savebar.on { display: flex; }
 .toasts { position: fixed; right: 20px; top: 20px; display: grid; gap: 8px; z-index: 20; max-width: calc(100vw - 40px); }
 .toast { background: var(--panel-2); border: 1px solid var(--line-2); border-left: 3px solid var(--good); padding: 10px 14px; border-radius: var(--r); max-width: 420px; white-space: pre-wrap; box-shadow: 0 6px 24px rgba(0, 0, 0, .18); }
@@ -361,34 +383,61 @@ dialog::backdrop { background: var(--backdrop); }
 .dlg-foot { padding: 12px 20px 16px; display: flex; justify-content: space-between; gap: 10px; align-items: center; }
 /* Wide screens: more room for galleries and forms. */
 @media (min-width: 1700px) { :root { --rail-w: 236px; } }
-/* Medium: the rail folds to its icons. */
-@media (max-width: 1180px) and (min-width: 861px) {
-  :root { --rail-w: 68px; }
-  .rail { padding: 18px 10px; align-items: center; }
-  .brand-name, .rail-foot span:not(.dot), nav button .label, .theme-toggle .label, .incog .label { display: none; }
-  nav button { justify-content: center; padding: 9px; }
-  nav button .count { position: absolute; margin: -18px 0 0 18px; }
-  .rail-foot .row { justify-content: center; }
-}
 @media (max-width: 1080px) { .gen { grid-template-columns: minmax(0, 1fr); } .viewer { grid-template-columns: minmax(0, 1fr); } }
-/* Narrow: a bar across the top, sections scroll sideways. */
+
+/* ---------- the sections along the bottom ----------
+   Where a rail with its names has no room: always in OAIY's window (its own
+   sidebar is on the left already), and in any narrow one. Every section keeps
+   its name (there is no icons-only rail, and no strip that scrolls sideways),
+   and the status has a line of its own above the page. `dock` is set in the head. */
+.dock { --rail-w: 0px; --dock-h: calc(58px + env(safe-area-inset-bottom, 0px)); }
+.dock .app { grid-template-columns: minmax(0, 1560px); grid-template-rows: auto minmax(0, 1fr); justify-content: center; }
+.dock .rail { display: contents; }
+.dock .brand { grid-area: 1 / 1; justify-self: start; align-self: center; padding: 10px 0 0 var(--pad); }
+.dock .brand-name small { display: none; }
+.dock .rail-foot { grid-area: 1 / 1; justify-self: end; display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 6px 8px; margin: 0; padding: 10px var(--pad) 0; }
+.dock:not(.in-oaiy) .rail-foot { padding-left: calc(var(--pad) + 104px); }
+.dock .rail-foot > .row, .dock .incog { gap: 7px; padding: 3px 11px; border: 1px solid var(--line); border-radius: 999px; background: var(--panel); font-size: 12px; white-space: nowrap; flex-wrap: nowrap; }
+.dock .incog { padding-left: 8px; }
+.dock .theme-toggle .label { display: none; }
+.dock main { grid-area: 2 / 1; padding-top: 10px; padding-bottom: calc(96px + var(--dock-h)); }
+.dock .sections { position: fixed; left: 0; right: 0; bottom: 0; z-index: 7; display: flex; justify-content: center; align-items: stretch; gap: 2px; min-height: var(--dock-h); padding: 5px 8px calc(5px + env(safe-area-inset-bottom, 0px)); background: var(--panel); border-top: 1px solid var(--line-2); box-shadow: 0 -10px 28px rgba(0, 0, 0, .14); }
+.dock .sections button { flex: 1 1 0; min-width: 0; max-width: 112px; flex-direction: column; justify-content: center; gap: 3px; padding: 5px 2px 4px; font: 500 11.5px/1.25 var(--display); letter-spacing: .01em; }
+.dock .sections button svg { width: 20px; height: 20px; }
+.dock .sections button .label { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+.dock .sections button[aria-current="page"], .dock .sections.in-more:not(.open) .more { color: var(--text); background: color-mix(in srgb, var(--gpu) 15%, transparent); }
+.dock .sections.in-more:not(.open) .more svg { color: var(--gpu); }
+.dock .sections button[aria-current="page"]::before { left: 26%; right: 26%; top: -5px; bottom: auto; width: auto; height: 2px; border-radius: 0 0 2px 2px; }
+.dock .sections button .count { position: absolute; top: 1px; left: calc(50% + 5px); margin: 0; }
+.dock .sections button[data-first] { margin: 0 0 0 13px; }
+.dock .sections button[data-first]::after { content: ""; position: absolute; left: -8px; top: 24%; bottom: 24%; width: 1px; background: var(--line-2); }
+/* A short window: the playground keeps its height for the work. */
+@media (max-height: 700px) { .dock .play-head .lede { display: none; } }
+/* Too narrow for nine names in a row: four of them, and More unfolds the rest above. */
+@media (max-width: 699px) {
+  .dock .sections { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 4px 2px; }
+  .dock .sections button { max-width: none; }
+  .dock .sections button[data-first] { margin: 0; }
+  .dock .sections button[data-first]::after { content: none; }
+  .dock .sections button[data-more] { display: none; order: -1; }
+  .dock .sections.open button[data-more], .dock .sections .more { display: flex; }
+  .dock .sections.open { padding-top: 10px; border-radius: 14px 14px 0 0; }
+  .dock .sections.open button[aria-current="page"]::before { content: none; }
+  /* A count on a section More holds (downloads running) shows on More while it is folded. */
+  .dock .sections:not(.open):has(button[data-more] .count:not([hidden])) .more::after { content: ""; position: absolute; top: 5px; left: calc(50% + 9px); width: 8px; height: 8px; border-radius: 50%; background: var(--gpu); }
+}
 @media (max-width: 860px) {
-  :root { --rail-w: 0px; }
-  .app { grid-template-columns: minmax(0, 1fr); }
-  .rail { position: sticky; top: 0; z-index: 6; height: auto; flex-direction: row; align-items: center; border-right: 0; border-bottom: 1px solid var(--line); gap: 12px; padding: 10px var(--pad); background: var(--bg); overflow: visible; }
-  .brand-name small { display: none; }
-  nav { display: flex; flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; flex: 1; min-width: 0; }
-  nav button { padding: 7px 10px; }
-  .rail-foot { margin: 0; display: flex; gap: 8px; }
-  .rail-foot span:not(.dot), .theme-toggle .label, .incog .label { display: none; }
   .hw-row { grid-template-columns: minmax(0, 1fr); gap: 6px; }
-  .savebar { left: 0; padding: 12px var(--pad); }
+  .savebar { padding: 12px var(--pad); }
   .chat { height: calc(100dvh - 330px); }
 }
 /* Phones: stacked cards, full-width dialogs. */
 @media (max-width: 560px) {
   .brand-name { display: none; }
-  nav button svg { display: none; }
+  .dock:not(.in-oaiy) .rail-foot { padding-left: calc(var(--pad) + 30px); gap: 5px; }
+  .dock .rail-foot > .row, .dock .incog { padding: 3px 8px; gap: 6px; }
+  .dock .incog { padding-left: 6px; }
+  .dock .theme-toggle { padding: 5px 6px; }
   .endpoint { grid-template-columns: minmax(0, 1fr) auto; } .endpoint > span { grid-column: 1 / -1; }
   .now { grid-template-columns: 64px minmax(0, 1fr); } .now > :last-child { grid-column: 1 / -1; }
   table.routes { min-width: 0; } table.routes thead { display: none; }
@@ -400,6 +449,16 @@ dialog::backdrop { background: var(--backdrop); }
   .seg button { padding: 6px 10px; }
   .grid-f[style] { grid-template-columns: minmax(0, 1fr) !important; }
 }
+
+/* ---------- a long page's parts ---------- */
+.jump { position: sticky; top: 0; z-index: 3; display: flex; flex-wrap: wrap; gap: 6px; margin: -12px calc(var(--pad) * -1) 18px; padding: 8px var(--pad); background: var(--bg); border-bottom: 1px solid var(--line); }
+.jump button { all: unset; cursor: pointer; padding: 3px 12px; border: 1px solid var(--line-2); border-radius: 14px; color: var(--muted); font-size: 13px; white-space: nowrap; }
+.jump button:hover { color: var(--text); border-color: var(--muted); }
+.jump button:focus-visible { outline: 2px solid var(--gpu); }
+.jump + .block { border-top: 0; padding-top: 0; }
+.view .block { scroll-margin-top: 60px; }
+/* Narrow: the row wraps to several lines, so it stays where it is and scrolls away. */
+@media (max-width: 699px) { .jump { position: static; } .view .block { scroll-margin-top: 12px; } }
 
 /* ---------- get models ---------- */
 .dl-top { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(360px, 100%), 1fr)); gap: 18px 28px; margin-bottom: 22px; }
@@ -454,16 +513,17 @@ dialog::backdrop { background: var(--backdrop); }
       <div class="brand-mark" aria-hidden="true"><i style="background:var(--ssd)"></i><i style="background:var(--ram)"></i><i style="background:var(--gpu)"></i></div>
       <div class="brand-name">OAIY<small>NVMe to RAM to GPU</small></div>
     </div>
-    <nav aria-label="Sections">
+    <nav class="sections" id="sections" aria-label="Sections">
       <button data-view="overview" title="Overview" aria-current="page"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 13h8V3H3zM13 21h8V11h-8zM3 21h8v-6H3zM13 3v6h8V3z"/></svg><span class="label">Overview</span></button>
       <button data-view="play" title="Playground"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4l14 8-14 8z"/></svg><span class="label">Playground</span></button>
       <button data-view="gallery" title="Gallery"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="M21 17l-5-5-9 8"/></svg><span class="label">Gallery</span><span class="count" id="gallery-count" hidden></span></button>
-      <button data-view="models" title="Models"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l9 5-9 5-9-5z"/><path d="M3 13l9 5 9-5"/></svg><span class="label">Models</span></button>
-      <button data-view="get" title="Get models"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg><span class="label">Get models</span><span class="count" id="get-count" hidden></span></button>
-      <button data-view="memory" title="Memory"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="4" rx="1"/><rect x="3" y="10" width="18" height="4" rx="1"/><rect x="3" y="15" width="18" height="4" rx="1"/></svg><span class="label">Memory</span></button>
-      <button data-view="endpoints" title="Endpoints"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7l-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg><span class="label">Endpoints</span></button>
-      <button data-view="settings" title="Settings"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.3 1.8l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.8-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.5 1.7 1.7 0 00-1.8.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.7 1.7 0 00.3-1.8 1.7 1.7 0 00-1.5-1H3a2 2 0 110-4h.1a1.7 1.7 0 001.5-1.1 1.7 1.7 0 00-.3-1.8l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.8.3H9a1.7 1.7 0 001-1.5V3a2 2 0 114 0v.1a1.7 1.7 0 001 1.5 1.7 1.7 0 001.8-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.8V9a1.7 1.7 0 001.5 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1z"/></svg><span class="label">Settings</span></button>
-      <button data-view="logs" title="Logs"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg><span class="label">Logs</span></button>
+      <button data-view="models" title="Models" data-first><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l9 5-9 5-9-5z"/><path d="M3 13l9 5 9-5"/></svg><span class="label">Models</span></button>
+      <button data-view="get" title="Get models" data-more><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg><span class="label">Get models</span><span class="count" id="get-count" hidden></span></button>
+      <button data-view="memory" title="Memory" data-more><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="4" rx="1"/><rect x="3" y="10" width="18" height="4" rx="1"/><rect x="3" y="15" width="18" height="4" rx="1"/></svg><span class="label">Memory</span></button>
+      <button data-view="endpoints" title="Endpoints" data-first data-more><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7l-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg><span class="label">Endpoints</span></button>
+      <button data-view="settings" title="Settings" data-more><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.3 1.8l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.8-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.5 1.7 1.7 0 00-1.8.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.7 1.7 0 00.3-1.8 1.7 1.7 0 00-1.5-1H3a2 2 0 110-4h.1a1.7 1.7 0 001.5-1.1 1.7 1.7 0 00-.3-1.8l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.8.3H9a1.7 1.7 0 001-1.5V3a2 2 0 114 0v.1a1.7 1.7 0 001 1.5 1.7 1.7 0 001.8-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.8V9a1.7 1.7 0 001.5 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1z"/></svg><span class="label">Settings</span></button>
+      <button data-view="logs" title="Logs" data-more><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg><span class="label">Logs</span></button>
+      <button class="more" id="sections-more" title="All sections" aria-expanded="false" aria-controls="sections"><svg class="i-more" viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="19" cy="12" r="1.4"/></svg><svg class="i-less" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg><span class="label">More</span></button>
     </nav>
     <div class="rail-foot">
       <div class="row"><span class="dot" id="foot-llm"></span><span id="foot-llm-text">LLM stopped</span></div>
@@ -472,6 +532,7 @@ dialog::backdrop { background: var(--backdrop); }
       <button class="btn quiet theme-toggle" id="theme" title="Switch between light and dark"><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" style="stroke:currentColor;fill:none;stroke-width:1.7"><path d="M21 12.8A9 9 0 1111.2 3a7 7 0 009.8 9.8z"/></svg><span class="label" id="theme-label">Theme</span></button>
     </div>
   </aside>
+  <div class="nav-shade" id="nav-shade" hidden></div>
 
   <main>
     <div class="banner" role="status"><strong>Incognito</strong><span>Nothing about requests is kept: no prompt cache, no history or logs, and generated media is deleted after it is delivered.</span></div>
@@ -777,7 +838,7 @@ dialog::backdrop { background: var(--backdrop); }
     </section>
 
     <!-- Models -->
-    <section class="view" id="v-models">
+    <section class="view" id="v-models" data-jump>
       <h1>Models</h1>
       <div class="dl-empty-hint" id="models-first-run" hidden><p><strong>Nothing to add yet?</strong> Get models downloads ready-to-run models and adds them here.</p><button class="btn go" data-goto="get">Get models</button></div>
       <p class="lede">Pick a file or folder and the studio reads its headers to work out what it is. Language models go to chat, image models to images, video models to videos. Parts such as projectors, adapters, encoders and tokenizers attach to the model that needs them.</p>
@@ -793,18 +854,18 @@ dialog::backdrop { background: var(--backdrop); }
         </div>
       </div>
       <div class="block">
-        <div class="spread"><h2>Your model list</h2><div class="row">
+        <div class="spread"><h2 data-jump="Your list">Your model list</h2><div class="row">
           <a class="btn" id="export-models" href="/api/models/export" download="oaiy-models.json">Export models</a>
           <label class="btn" style="cursor:pointer">Import models<input type="file" id="import-models" accept="application/json,.json" hidden></label></div></div>
         <p class="muted small" style="margin:0">Export saves every model with its parts, defaults and memory settings to a file. Import it on this machine or another: models merge by name, or replace the whole list. Paths that do not exist there come in switched off and are listed.</p>
       </div>
-      <div class="block"><div class="spread"><h2>Language models</h2><span class="muted small">Served on chat and completions routes</span></div><div class="list" id="m-llm"></div></div>
-      <div class="block"><div class="spread"><h2>Image models</h2><span class="muted small">Served on the images route</span></div><div class="list" id="m-image"></div></div>
-      <div class="block"><div class="spread"><h2>Video models</h2><span class="muted small">Served on the videos route</span></div><div class="list" id="m-video"></div></div>
-      <div class="block"><div class="spread"><h2>Speech models</h2><span class="muted small">Served on /v1/audio/speech; saved voices on /v1/audio/voices</span></div><div class="list" id="m-speech"></div></div>
-      <div class="block"><div class="spread"><h2>Music models</h2><span class="muted small">Served on /v1/audio/music, and on /v1/audio/speech by name</span></div><div class="list" id="m-music"></div></div>
-      <div class="block"><div class="spread"><h2>Sound effect models</h2><span class="muted small">Served on /v1/audio/sound_effects</span></div><div class="list" id="m-sound"></div></div>
-      <div class="block"><div class="spread"><h2>3D models</h2><span class="muted small">Served on /v1/3d/models</span></div><div class="list" id="m-model3d"></div></div>
+      <div class="block"><div class="spread"><h2 data-jump="Language">Language models</h2><span class="muted small">Served on chat and completions routes</span></div><div class="list" id="m-llm"></div></div>
+      <div class="block"><div class="spread"><h2 data-jump="Image">Image models</h2><span class="muted small">Served on the images route</span></div><div class="list" id="m-image"></div></div>
+      <div class="block"><div class="spread"><h2 data-jump="Video">Video models</h2><span class="muted small">Served on the videos route</span></div><div class="list" id="m-video"></div></div>
+      <div class="block"><div class="spread"><h2 data-jump="Speech">Speech models</h2><span class="muted small">Served on /v1/audio/speech; saved voices on /v1/audio/voices</span></div><div class="list" id="m-speech"></div></div>
+      <div class="block"><div class="spread"><h2 data-jump="Music">Music models</h2><span class="muted small">Served on /v1/audio/music, and on /v1/audio/speech by name</span></div><div class="list" id="m-music"></div></div>
+      <div class="block"><div class="spread"><h2 data-jump="Sound effects">Sound effect models</h2><span class="muted small">Served on /v1/audio/sound_effects</span></div><div class="list" id="m-sound"></div></div>
+      <div class="block"><div class="spread"><h2 data-jump="3D">3D models</h2><span class="muted small">Served on /v1/3d/models</span></div><div class="list" id="m-model3d"></div></div>
     </section>
 
     <!-- Get models -->
@@ -827,7 +888,7 @@ dialog::backdrop { background: var(--backdrop); }
     </section>
 
     <!-- Memory -->
-    <section class="view" id="v-memory">
+    <section class="view" id="v-memory" data-jump>
       <h1>Memory</h1>
       <p class="lede">Choose where weights live for each kind of job. Keeping blocks on the GPU is fastest, keeping them in RAM costs one PCIe copy per block, and streaming from the SSD saves both kinds of memory. The output is identical either way; only speed and memory use change.</p>
       <div class="block" id="mem-image"></div>
@@ -863,7 +924,7 @@ dialog::backdrop { background: var(--backdrop); }
     </section>
 
     <!-- Endpoints -->
-    <section class="view" id="v-endpoints">
+    <section class="view" id="v-endpoints" data-jump>
       <h1>Endpoints</h1>
       <p class="lede">The API other apps call. Each route maps a path and method to a service and the dialect it speaks: OpenAI, or oaiy's job API for tools such as coder-cli.</p>
       <div class="block">
@@ -893,7 +954,7 @@ dialog::backdrop { background: var(--backdrop); }
     </section>
 
     <!-- Settings -->
-    <section class="view" id="v-settings">
+    <section class="view" id="v-settings" data-jump>
       <h1>Settings</h1>
       <p class="lede">Engine programs, generation defaults and where outputs go. Relative paths are relative to the folder holding the configuration file, so the whole folder can be moved to another machine.</p>
       <div class="block">
@@ -1092,8 +1153,7 @@ function applyTheme(t) {
 }
 (() => {
   const params = new URLSearchParams(location.search);
-  // Shown in OAIY's window: its theme, said in the address and again at each change.
-  if (params.get("in") === "oaiy") document.documentElement.classList.add("in-oaiy");
+  // Shown in OAIY's window (the head's script says so): its theme, said in the address and again at each change.
   let t = window.__OAIY_THEME__ || params.get("theme") || "";
   if (!["light", "dark"].includes(t)) { t = ""; try { t = localStorage.getItem("studio-theme") || ""; } catch {} }
   applyTheme(t);
@@ -1107,9 +1167,43 @@ $("#theme").onclick = () => {
 };
 
 /* ---------- navigation ---------- */
+const sections = $("#sections");
+// Along the bottom of a narrow window the bar has four sections and More, which unfolds the rest above them.
+function unfoldSections(open) {
+  sections.classList.toggle("open", open);
+  $("#nav-shade").hidden = !open;
+  $("#sections-more").setAttribute("aria-expanded", open);
+  $("#sections-more .label").textContent = open ? "Close" : "More";
+}
+$("#sections-more").onclick = () => unfoldSections(!sections.classList.contains("open"));
+$("#nav-shade").onclick = () => unfoldSections(false);
+matchMedia("(max-width: 699px)").addEventListener("change", () => unfoldSections(false));
+// The bar's height where the sections are along the bottom (its one row, also while More has it unfolded), else 0.
+const dockHeight = () => document.documentElement.classList.contains("dock") ? parseFloat(getComputedStyle(sections).minHeight) || 0 : 0;
+// A long page's blocks, as a row under its title that stays in reach while the page scrolls.
+function renderJump(view) {
+  const page = $("#v-" + view);
+  if (!page?.hasAttribute("data-jump")) return;
+  const heads = $$(".block h2", page).filter(h => !h.closest("[hidden]"));
+  let row = $(".jump", page);
+  if (heads.length < 3) { row?.remove(); return; }
+  if (!row) { row = document.createElement("nav"); row.className = "jump"; row.setAttribute("aria-label", "On this page"); $(".block", page).before(row); }
+  row.replaceChildren(...heads.map(h => {
+    const b = document.createElement("button");
+    b.type = "button"; b.textContent = h.dataset.jump || h.textContent;
+    b.onclick = () => h.closest(".block").scrollIntoView({behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start"});
+    return b;
+  }));
+}
 function show(view) {
-  $$("nav button").forEach(b => b.dataset.view === view ? b.setAttribute("aria-current", "page") : b.removeAttribute("aria-current"));
+  const moved = !$("#v-" + view)?.classList.contains("on");
+  $$(".sections button[data-view]").forEach(b => b.dataset.view === view ? b.setAttribute("aria-current", "page") : b.removeAttribute("aria-current"));
+  sections.classList.toggle("in-more", !!$(`.sections button[data-more][data-view="${view}"]`));
+  unfoldSections(false);
   $$("section.view").forEach(s => s.classList.toggle("on", s.id === "v-" + view));
+  renderJump(view);
+  // Another section starts at its top, not where the last one was scrolled to.
+  if (moved) scrollTo(0, 0);
   try { localStorage.setItem("studio-view", view); } catch {}
   if (location.hash.split(":")[0] !== "#" + view) history.replaceState(null, "", "#" + view);
   if (view === "logs") pollLogs(true);
@@ -1118,7 +1212,8 @@ function show(view) {
   if (view === "endpoints") renderCompanion();
   if (view === "get") refreshDownloads(true);
 }
-$$("nav button").forEach(b => b.onclick = () => show(b.dataset.view));
+// A press on a section goes to its top, the one already shown too.
+$$(".sections button[data-view]").forEach(b => b.onclick = () => { show(b.dataset.view); scrollTo(0, 0); });
 $$("#v-play .ptabs button").forEach(b => b.onclick = () => {
   $$("#v-play .ptabs button").forEach(x => x.setAttribute("aria-selected", x === b));
   $$("#v-play [data-panel]").forEach(p => p.hidden = p.dataset.panel !== b.dataset.tab);
@@ -1132,8 +1227,8 @@ function fitPlayground() {
   const panel = $$("#v-play [data-panel]").find(p => !p.hidden);
   if (!panel) return;
   const top = panel.getBoundingClientRect().top + scrollY;
-  const bottom = parseFloat(getComputedStyle($("main")).paddingBottom) > 60 ? 24 : 16;
-  view.style.setProperty("--play-h", Math.max(360, innerHeight - top - bottom) + "px");
+  const dock = dockHeight(), bottom = dock ? 14 : 24;
+  view.style.setProperty("--play-h", Math.max(360, innerHeight - top - bottom - dock) + "px");
 }
 addEventListener("resize", () => requestAnimationFrame(fitPlayground));
 
@@ -1165,6 +1260,7 @@ function renderConfig() {
   document.body.classList.toggle("incognito", !!saved?.privacy?.incognito);
   $("#export-models").href = fileUrl("/api/models/export");
   bindFields(); renderModels(); renderMemory(); renderRoutes(); renderExamples(); renderSelects();
+  { const on = $("section.view.on"); if (on) renderJump(on.id.slice(2)); }
   $("#cfg-path").textContent = state ? "Configuration: " + state.config_path : "";
 }
 
@@ -2217,6 +2313,7 @@ $("#disc-refresh").onclick = renderCompanion;
 $("#disc-copy").onclick = () => navigator.clipboard.writeText($("#disc-json").textContent).then(() => toast("Copied"));
 addEventListener("keydown", e => {
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s" && $("#savebar").classList.contains("on")) { e.preventDefault(); saveConfig(); }
+  if (e.key === "Escape" && sections.classList.contains("open")) { unfoldSections(false); $("#sections-more").focus(); }
 });
 
 /* ---------- logs ---------- */

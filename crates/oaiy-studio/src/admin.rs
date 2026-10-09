@@ -314,6 +314,30 @@ mod tests {
         }
     }
 
+    /// The page's sections and its menu are one list, in one order: every
+    /// section is in the menu under a name (the menu shows names at every
+    /// width, never pictures alone), and every entry opens a section that is there.
+    #[test]
+    fn every_section_of_the_page_is_in_its_menu_by_name() {
+        let start = PAGE.find(r#"<nav class="sections""#).expect("the page has its menu");
+        let menu = &PAGE[start..start + PAGE[start..].find("</nav>").expect("the menu ends")];
+        let quoted = |text: &str| text[..text.find('"').expect("a closing quote")].to_string();
+        let in_menu: Vec<String> = menu.match_indices(r#"data-view=""#).map(|(at, mark)| quoted(&menu[at + mark.len()..])).collect();
+        let pages: Vec<String> = PAGE
+            .match_indices(r#"<section class="view"#)
+            .map(|(at, _)| {
+                let rest = &PAGE[at..];
+                let id = r#"id="v-"#;
+                quoted(&rest[rest.find(id).expect("a section has its id") + id.len()..])
+            })
+            .collect();
+        assert!(pages.len() >= 9, "{pages:?}");
+        assert_eq!(in_menu, pages, "the menu's entries and the page's sections");
+        assert_eq!(menu.matches(r#"<span class="label">"#).count(), in_menu.len() + 1, "each entry has its name, and More has");
+        // The four a narrow window keeps in the bar, and the rest under More: none is in neither.
+        assert_eq!(menu.matches(" data-more>").count(), in_menu.len() - 4, "the entries More holds");
+    }
+
     #[test]
     fn only_this_listener_s_names_are_answered() {
         assert!(allowed_host("127.0.0.1:7860", 7860, "127.0.0.1"));
