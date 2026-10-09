@@ -175,8 +175,8 @@ The multi-token prediction head is not used.
 
 ## Checking it
 
-On main, the ignored tests of `models.rs` hold the WebGPU chain against the engine's own host
-path on the checkpoint (`FLASHNEXT_MODEL`). The comparison with exllamav3 below was the CUDA
+On main, the ignored tests of the server's `models/dense_webgpu_timing.rs` hold the WebGPU
+chain against the engine's own host path on the checkpoint (`FLASHNEXT_MODEL`). The comparison with exllamav3 below was the CUDA
 build's and is on that branch:
 
 `matches_the_reference` (in `flashnext.rs`, ignored by default) compares OAIY with
