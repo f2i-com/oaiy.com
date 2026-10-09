@@ -775,10 +775,17 @@ launch and in the next prompt's first at another. It is the GPU's own time, thou
 not a wait of the host's: by kernels (`OAIY_CHAIN_PROFILE`, each dispatch timed in a
 pass of its own) a first prompt's take 0.84 s more than the second's beyond what the
 warm-up's dispatches add, 0.33 s of it the Q3_K tensor-core matmuls' and 0.42 the
-delta-net scan's (805 ms where 365). So the card runs slow for about a second once,
-some two to eight seconds after work first comes to it; it is at its power cap from
-the first chunk on (nvidia-smi's throttle reason), and llama.cpp's first prompt on it
-is half a second slow as well.
+delta-net scan's (805 ms where 365). So the card runs slow for about a second, some
+two to eight seconds after a process's work first comes to it, and once a process:
+in one server, prompts sent after the card had idled for half a minute (back in its
+lowest state, its clocks down) took 6.23 and 6.29 s, a tenth of a second or so on
+their first chunk for the way back up and no more. So it is not the card waking, nor
+its power cap, which those prompts run under as well; sampled ten times a second
+(nvidia-smi, read only) its clocks and its state do not move in that second, and its
+memory is two to three times as busy as in the chunks beside it (60% and 40% where
+20%). That looks like the process's first use of its memory on the card; which
+memory, and whose work it is, is not found. llama.cpp's first prompt on the card is
+half a second slow as well.
 
 Gemma 3 itself was wrong on every backend until this day: one RoPE base on every
 layer, where its sliding-window layers take 10,000 and its global ones
