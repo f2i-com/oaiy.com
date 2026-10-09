@@ -766,6 +766,13 @@ impl Egpu {
         }
     }
 
+    /// Whether the server a request was sent to (`endpoint`, as [`Self::ensure`] gave it) is still the one serving:
+    /// ready, its process there, not stopped or started afresh since.
+    pub fn serves(&self, endpoint: &Endpoint) -> bool {
+        let mut g = self.lock();
+        g.state == State::Ready && g.addr == endpoint.addr && g.key == endpoint.key && g.child.as_mut().is_some_and(|c| matches!(c.try_wait(), Ok(None)))
+    }
+
     /// A request got no reply from the server (the connection refused, or closed before an answer). Where its
     /// process has exited, the server is taken as gone (the reason, as the next requests will be given it): they go
     /// to this computer's engine until it is tried again. A process that is still there is left serving (None):

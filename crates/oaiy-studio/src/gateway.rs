@@ -172,9 +172,12 @@ fn relay(w: &mut TcpStream, response: oaiy_engine::http::Response) -> io::Result
 }
 
 /// [`relay`], for a server whose streams say no length and end by closing the connection (tinygrad's): `mark` is what
-/// a stream that ran to its end closes with. One that stops before it (the server stopped, crashed or lost its card)
-/// is not finished for the client: its connection is closed on a broken stream, not on a reply that looks whole.
-fn relay_to_its_end(w: &mut TcpStream, response: oaiy_engine::http::Response, mark: Option<&[u8]>) -> io::Result<bool> {
+/// a stream that ran to its end closes with, and `gone` says whether the server that sent it is there no more. A
+/// stream with no mark from a server that has gone (stopped, crashed, its card unplugged) was cut short, and is not
+/// finished for the client: its connection is closed on a broken stream, not on a reply that looks whole. One with
+/// no mark from a server still serving is finished as it came (a tinygrad whose streams carry none).
+fn relay_to_its_end(w: &mut TcpStream, response: oaiy_engine::http::Response, ended: Option<(&[u8], &dyn Fn() -> bool)>) -> io::Result<bool> {
+    let mark = ended.map(|(mark, _)| mark);
     let status = response.status;
     let rtype = response.header("content-type").unwrap_or("application/json").to_string();
     let streamed = rtype.contains("event-stream") || response.header("transfer-encoding").is_some_and(|t| t.contains("chunked"));
@@ -195,8 +198,17 @@ fn relay_to_its_end(w: &mut TcpStream, response: oaiy_engine::http::Response, ma
             out.send(chunk)
         });
         if r.is_ok() {
-            if mark.is_some_and(|m| !tail.windows(m.len()).any(|part| part == m)) {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "the reply's stream ended before its end mark"));
+            if let Some((mark, gone)) = ended.filter(|(m, _)| !tail.windows(m.len()).any(|part| part == *m)) {
+                // (a process that is being ended closes its connections a moment before it is seen to have gone)
+                let _ = mark;
+                if (0..6).any(|turn| {
+                    if turn > 0 {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    gone()
+                }) {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "the reply's stream ended before its end, and its server has gone"));
+                }
             }
             out.finish()?;
         }
@@ -263,7 +275,8 @@ fn egpu_chat(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, cfg: &Json,
             };
         }
     };
-    let result = relay_to_its_end(w, response, Some(b"[DONE]"));
+    let gone = || !studio.egpu.serves(&endpoint);
+    let result = relay_to_its_end(w, response, Some((b"[DONE]", &gone)));
     drop(lease);
     Some(result)
 }
@@ -1617,6 +1630,21 @@ mod tests {
         assert!(body.contains("gave this request no reply"), "{body}");
         assert!(engine.requests().is_empty(), "this computer's engine was not asked to load it too");
         assert_eq!(studio.egpu.state(), crate::llm::State::Ready, "and the server keeps its model");
+        studio.egpu.stop();
+    }
+
+    #[test]
+    fn a_stream_with_no_end_mark_from_a_server_still_serving_is_finished_as_it_came() {
+        // (a tinygrad whose streams carry no end mark: its replies are not to be broken for the lack of one. Only a
+        // server that has gone leaves a stream cut short: `a_stream_cut_short_is_not_passed_on_as_a_finished_reply`)
+        const UNMARKED: &str = "HTTP/1.0 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: {\"choices\": [{\"index\": 0, \"delta\": {\"content\": \"all of it\"}}]}\n\n";
+        let root = std::env::temp_dir();
+        let studio = egpu_studio(&root, "small");
+        let tinygrad = StandIn::new(UNMARKED);
+        studio.egpu.adopt(&tinygrad.addr, "sk-egpu-test", "big", Some(idler()));
+        let (status, kind, body) = chat(&studio, r#"{"model": "big", "stream": true, "messages": [{"role": "user", "content": "hi"}]}"#);
+        assert_eq!((status, kind.as_str()), (200, "text/event-stream"), "{body}");
+        assert!(body.contains("all of it"), "{body}");
         studio.egpu.stop();
     }
 

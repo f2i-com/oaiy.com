@@ -66,7 +66,8 @@ hold:
 - **How much the GPU may hold** is Metal's own figure for it
   (`recommendedMaxWorkingSetSize`), which rises when you raise the GPU's share with
   `sudo sysctl iogpu.wired_limit_mb=N`. Where Metal gives none, that setting, else two
-  thirds of the memory.
+  thirds of the memory. Raising that share takes the memory from macOS itself: a Mac left
+  too little is reported to freeze or restart, and we have not tried any figure.
 - **Weights on the GPU:** that, less 4 GiB for the context's cache and the work buffers.
 
 Which part of a Mac's memory Metal's figure is has not been read on a Mac by us: others
@@ -118,10 +119,9 @@ answers**. What it costs:
 - if the log shows Metal allowing the GPU 18 GiB there (three quarters), 14 GiB are
   weights, and a 27B's 3-bit file (about 12.7 GiB on the GPU) is all on it;
 - to try a 27B on the Mac alone where it is not: a 3-bit file with *WebGPU weights (GB)*
-  at 13 and the context at 8,192, or `sudo sysctl iogpu.wired_limit_mb=20480` (20 GB to
-  the GPU until the next restart, 16 GiB of them weights) for a 4-bit file, with
-  everything else closed. Neither has been tried: the 4 GiB kept back is what an NVIDIA
-  card needed, and what a Mac needs is to be measured.
+  at 13 and the context at 8,192. Not tried: the 4 GiB kept back is what an NVIDIA card
+  needed, and what a Mac needs is to be measured. A 4-bit file (15.4 GiB) does not fit a
+  24 GB Mac's GPU without taking memory macOS needs.
 
 **Slower prompts than an NVIDIA card:** Apple's GPUs have none of the tensor-core matrices
 the engine reads a prompt through on NVIDIA, so a prompt's rows go through the int8
@@ -136,12 +136,14 @@ Nothing here has run on a Mac. What was done instead, on a Windows PC:
   Metal backend gives an Apple GPU (`OAIY_PORTABLE_LIMITS=1 OAIY_NO_COOP=1`): 32,768 bytes
   of workgroup memory, 29 buffers a kernel, 65,535 workgroups a dimension, a uniform
   binding's offset a multiple of 256 and a storage one's of 32, no tensor-core matrices.
-  On Windows' software GPU held so, 74 of the backend's 96 tests pass, and none of the
-  others stopped at a limit: ten are too slow for a software GPU to finish, nine have
-  kernels Microsoft's shader compiler gives up on (a Mac does not use it), two meet that
-  software GPU's own less exact `tanh`, and one is stopped by its own time guard. An RTX
-  5090 held to the workgroup's memory and to no tensor-core matrices, before the other
-  limits were added, passed all 95 there were then.
+  On Windows' software GPU held so, 74 of the backend's 96 tests pass. The other 22 did
+  not stop at a limit, but 19 of them did not run all their kernels there either: ten are
+  too slow for a software GPU to finish, and nine have kernels Microsoft's shader compiler
+  gives up on before they are made (a Mac does not use it). Two meet that software GPU's
+  own less exact `tanh`, and one is stopped by its own time guard. Those 19 are held to
+  the new limits by reading only (what a kernel binds, below); `sh tools/mac/check.sh`
+  runs them on the Mac. An RTX 5090 held to the workgroup's memory and to no tensor-core
+  matrices, before the other limits were added, passed all 95 there were then.
 - **The kernels as Metal's shading language.** On a Mac, wgpu turns each kernel into
   Metal's language with its own translator (naga) before Apple's compiler reads it. That
   translator runs anywhere: all 205 kernels the tests make were written as Metal's
@@ -225,8 +227,9 @@ or Linux at all.
   change, with **Stop**, and with OAIY: its launcher watches for OAIY going, however it
   goes, so the card is not left held. A stop holds: a start under way stands down, and a
   chat that was waiting for the server is answered on the Mac's own engine.
-- A reply's stream that **stops before its end** (the card unplugged mid-reply) breaks the
-  client's connection: it is not handed on as a finished reply.
+- A reply's stream that **stops before its end** because the server has gone (the card
+  unplugged mid-reply, a stop) breaks the client's connection: it is not handed on as a
+  finished reply.
 - A request with **a picture** goes to the Mac's own engine (tinygrad's server reads
   text), and so does `/v1/completions`.
 - tinygrad's server gives **no reply at all** to a request it cannot render (it closes the
