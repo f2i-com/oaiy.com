@@ -62,13 +62,28 @@ system_profiler SPThunderboltDataType 2>/dev/null | grep -E "Device Name|Vendor 
 
 say
 say "== A USB Bluetooth dongle (for the phone link, Aokie, which does not run on a Mac yet: docs/MAC.md)"
-# (each USB device that looks like a Bluetooth controller, with what macOS has attached to it: a driver of its own
-# on the dongle is what a program that drives the dongle itself would have to take it from)
-dongles=$(ioreg -r -c IOUSBHostDevice -w 0 2>/dev/null | sed 's/, id 0x[0-9a-f]*//; s/, retain [0-9]*//; s/, busy [0-9]* ([0-9]* ms)//' | awk '
-  /^\+-o / { if (block ~ /[Bb]luetooth|BCM2070|RTL87|CSR8510/) printf "%s", block; block = "" }
-  { block = block "  " $0 "\n" }
-  END { if (block ~ /[Bb]luetooth|BCM2070|RTL87|CSR8510/) printf "%s", block }' | cut -c 1-150 | head -30)
-if [ -n "$dongles" ]; then say "USB devices that look like one, and what macOS has attached to each:"; say "$dongles"; else say "no USB device that looks like one (is it plugged in?)"; fi
+# (each USB device that is a Bluetooth controller by its own entry: its name, its USB class 224, or a vendor and
+# product the phone link's list has; then what macOS has attached to it. A driver of macOS's own on the dongle is
+# what a program that drives the dongle itself would have to take it from)
+dongles=$(ioreg -p IOUSB -l -w 0 2>/dev/null | awk '
+  function flush() {
+    if (name != "" && (name ~ /[Bb]luetooth|BCM20|CSR|RTL87|UB[45]00|BT[0-9]/ || cls == 224 || ven == 2652 || ven == 2578 || (ven == 3034 && (prod == 34673 || prod == 51234))))
+      printf "%s|%04x:%04x|%d\n", name, ven, prod, cls
+    name = ""; ven = 0; prod = 0; cls = -1
+  }
+  /\+-o .*<class/ { flush(); n = $0; sub(/^.*\+-o /, "", n); sub(/  <class.*$/, "", n); sub(/@[0-9a-fA-F]*$/, "", n); name = n }
+  /"idVendor" = / { ven = $NF + 0 }
+  /"idProduct" = / { prod = $NF + 0 }
+  /"bDeviceClass" = / { cls = $NF + 0 }
+  END { flush() }')
+if [ -n "$dongles" ]; then
+  printf '%s\n' "$dongles" | while IFS='|' read -r name ids cls; do
+    say "$name ($ids, USB class $cls), and what macOS has attached to it:"
+    ioreg -r -n "$name" -w 0 2>/dev/null | grep -e "+-o" | sed 's/, id 0x[0-9a-f]*//; s/, retain [0-9]*//; s/, busy [0-9]* ([0-9]* ms)//; s/^/  /' | cut -c 1-150 | head -12
+  done
+else
+  say "no USB device that looks like one (is it plugged in?)"
+fi
 say "what macOS's own Bluetooth runs on:"
 system_profiler SPBluetoothDataType 2>/dev/null | grep -E "^ *(State|Chipset|Transport|Vendor ID|Product ID|Firmware Version):" | sed 's/^ */  /' | head -8
 switch=$(nvram bluetoothHostControllerSwitchBehavior 2>/dev/null | awk '{ print $2 }')
