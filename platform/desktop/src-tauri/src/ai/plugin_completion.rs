@@ -380,7 +380,7 @@ async fn complete(
                     )
                 })?
         } else {
-            super::routes::resolve_chat_provider(&st.ai, Some(&provider_id)).await
+            super::routes::resolve_chat_provider(&st.ai, Some(&provider_id)).await.map(|(provider, _)| provider)
                 .map_err(|(status, code, _)| (status,code,"The configured AI source is unavailable. Check its provider settings and running state."))?
         };
         if !provider

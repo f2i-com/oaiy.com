@@ -404,11 +404,13 @@ async fn chat_impl(st: &AiState, provider_id: Option<&str>, mut body: Value) -> 
         let codex = st.codex.clone();
         return codex_answer(body, codex_alias, move |body, alias, emit| codex.chat_streaming(body, alias, emit)).await;
     }
-    let p = match resolve_chat_provider(st, provider_id).await {
-        Ok(p) => p,
+    let (p, engine) = match resolve_chat_provider(st, provider_id).await {
+        Ok(found) => found,
         Err((status, code, message)) => return ai_error(status, code, message),
     };
-    if provider_id == Some(ENGINE_PROVIDER_ID) {
+    // The engine answers with the model chosen in Engines, whatever the caller named: a
+    // flow's chat node may still carry the name of a model on a server it used before.
+    if engine {
         if let Some(obj) = body.as_object_mut() { obj.remove("model"); }
     }
     if let Some(obj) = body.as_object_mut() {
@@ -440,32 +442,62 @@ async fn chat_impl(st: &AiState, provider_id: Option<&str>, mut body: Value) -> 
 
 /// Resolve only the host's named provider records or its chosen engine. A
 /// caller's catalogue metadata is never used as a provider configuration.
-pub(super) async fn resolve_chat_provider(st: &AiState, provider_id: Option<&str>) -> Result<AiProvider, (StatusCode, &'static str, String)> {
-    let provider = if provider_id == Some(ENGINE_PROVIDER_ID) {
+///
+/// A chat that names no provider (a flow's chat node, by default) goes to the first AI
+/// provider that is switched on, and with none switched on to OAIY's own engine, as
+/// `oaiy-engine` names it. Without that a computer whose only AI is its engine answered
+/// every such chat "no provider", and one left with a provider for a server that no
+/// longer runs could not be pointed at the engine at all: switching the provider off
+/// left nothing. A provider named outright is never swapped for the engine.
+///
+/// The `bool` says the engine is the one answering.
+pub(super) async fn resolve_chat_provider(st: &AiState, provider_id: Option<&str>) -> Result<(AiProvider, bool), (StatusCode, &'static str, String)> {
+    if provider_id == Some(ENGINE_PROVIDER_ID) {
         let (gateway, model) = engine_now(st).await.map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, "engine_unavailable", e))?;
-        Some(engine_provider(gateway, model))
-    } else {
+        return Ok((engine_provider(gateway, model), true));
+    }
+    // The lock is let go before the engines are asked anything.
+    let stored = {
         let store = st.providers.lock().unwrap_or_else(|e| e.into_inner());
         match provider_id {
             Some(id) => store.get_full(id).filter(|p| p.supports(Capability::Chat)),
             None => store.default_for(Capability::Chat),
         }
     };
-    let p = provider.ok_or((StatusCode::NOT_FOUND, "no_provider", "No enabled AI chat provider is configured for this source.".into()))?;
+    let p = match (stored, provider_id) {
+        (Some(p), _) => p,
+        (None, Some(_)) => return Err((StatusCode::NOT_FOUND, "no_provider", "No enabled AI chat provider is configured for this source.".into())),
+        (None, None) => {
+            return match engine_now(st).await {
+                Ok((gateway, model)) => Ok((engine_provider(gateway, model), true)),
+                Err(why) => Err((
+                    StatusCode::NOT_FOUND,
+                    "no_provider",
+                    format!("No AI chat provider is switched on, and OAIY's own engine cannot answer in its place: {why}."),
+                )),
+            };
+        }
+    };
     if !p.enabled {
         return Err((StatusCode::BAD_REQUEST, "invalid_request", "The configured provider is disabled.".into()));
     }
     if !p.has_key() && !p.allow_local {
         return Err((StatusCode::BAD_REQUEST, "invalid_request", "The configured provider has no API key.".into()));
     }
-    Ok(p)
+    Ok((p, false))
 }
 
 async fn models_default(State(st): State<AiState>) -> Response {
     let provider = { st.providers.lock().unwrap_or_else(|e| e.into_inner()).default_for(Capability::Chat) };
+    // With no provider switched on, the engine's: it is what a chat with no provider is
+    // answered by (see `resolve_chat_provider`).
+    let provider = match provider {
+        Some(p) => Some(p),
+        None => engine_now(&st).await.ok().map(|(gateway, model)| engine_provider(gateway, model)),
+    };
     match provider {
-        // No provider configured: an empty list (not a 404), so a discovery probe
-        // reads "endpoint present, no models yet".
+        // No provider configured and no engine: an empty list (not a 404), so a discovery
+        // probe reads "endpoint present, no models yet".
         None => (StatusCode::OK, Json(json!({ "object": "list", "data": [] }))).into_response(),
         Some(p) => match gateway::models(&p).await {
             Ok(v) => (StatusCode::OK, Json(v)).into_response(),
@@ -1339,10 +1371,18 @@ mod tests {
 
     /// The AI routes with nothing else around them, told where the engines are (none: nowhere).
     fn engine_routes(engines: Option<&FakeEngines>) -> (Router, crate::secret_file::testing::TempDir) {
+        engine_routes_with(engines, &[])
+    }
+
+    /// The same, with these AI providers set up (as the providers' own route takes them).
+    fn engine_routes_with(engines: Option<&FakeEngines>, providers: &[Value]) -> (Router, crate::secret_file::testing::TempDir) {
         let dir = crate::secret_file::testing::TempDir::new("engine-routes");
         let registry = Arc::new(Mutex::new(crate::services::registry::Registry::empty(dir.0.join("data"), dir.0.join("models"))));
-        let state = AiState::new(crate::ai::providers::new_handle(), registry, crate::ai::codex::absent_for_tests())
-            .with_engines_at(engines.map(|e| e.ui.clone()));
+        let store = crate::ai::providers::new_handle();
+        for provider in providers {
+            store.lock().unwrap().upsert(serde_json::from_value(provider.clone()).unwrap()).unwrap();
+        }
+        let state = AiState::new(store, registry, crate::ai::codex::absent_for_tests()).with_engines_at(engines.map(|e| e.ui.clone()));
         (router(state), dir)
     }
 
@@ -1384,6 +1424,71 @@ mod tests {
         let (status, models) = ask(&app, "GET", "/api/ai/providers/oaiy-engine/v1/models", None).await;
         assert_eq!(status, StatusCode::OK, "{models}");
         assert_eq!(models["data"][0]["id"], "flash");
+    }
+
+    #[tokio::test]
+    async fn a_chat_that_names_no_provider_is_answered_by_the_engine_when_none_is_set_up() {
+        let engines = fake_engines().await;
+        let (app, _dir) = engine_routes(Some(&engines));
+        // As a flow's chat node sends it: no provider, and a model its author named for another server.
+        let request = json!({ "model": "a-model-of-another-server", "messages": [{ "role": "user", "content": "hi" }], "stream": false });
+        let (status, answer) = ask(&app, "POST", "/api/ai/v1/chat/completions", Some(request)).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(answer["choices"][0]["message"]["content"], "hello from the engine");
+        {
+            let asked = engines.asked.lock().unwrap();
+            assert_eq!(asked.len(), 1, "one call reached the engines' gateway");
+            assert_eq!(asked[0].1["model"], "flash", "the model chosen in Engines, not the one the node named");
+            assert_eq!(asked[0].1["messages"][0]["content"], "hi");
+        }
+        // And what such a chat can run is the engine's.
+        let (status, models) = ask(&app, "GET", "/api/ai/v1/models", None).await;
+        assert_eq!(status, StatusCode::OK, "{models}");
+        assert_eq!(models["data"][0]["id"], "flash");
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_is_switched_on_still_answers_and_one_switched_off_is_passed_over_for_the_engine() {
+        let engines = fake_engines().await;
+        // A server of the person's own, OpenAI-compatible, on this computer.
+        let theirs = fake_engines().await;
+        let provider = |enabled: bool| {
+            json!({ "id": "their-server", "name": "Their server", "protocol": "openai", "baseUrl": format!("{}/gw", theirs.ui), "model": "theirs", "enabled": enabled, "allowLocal": true })
+        };
+        let request = || json!({ "messages": [{ "role": "user", "content": "hi" }] });
+
+        // Switched on: it is the one asked, for its own model, and the engine is left alone.
+        let (app, _dir) = engine_routes_with(Some(&engines), &[provider(true)]);
+        let (status, answer) = ask(&app, "POST", "/api/ai/v1/chat/completions", Some(request())).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(theirs.asked.lock().unwrap().len(), 1);
+        assert_eq!(theirs.asked.lock().unwrap()[0].1["model"], "theirs");
+        assert!(engines.asked.lock().unwrap().is_empty(), "the engine was not asked");
+
+        // Switched off: the engine answers, with its own model.
+        let (app, _dir) = engine_routes_with(Some(&engines), &[provider(false)]);
+        let (status, answer) = ask(&app, "POST", "/api/ai/v1/chat/completions", Some(request())).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(engines.asked.lock().unwrap().len(), 1);
+        assert_eq!(engines.asked.lock().unwrap()[0].1["model"], "flash");
+        assert_eq!(theirs.asked.lock().unwrap().len(), 1, "nothing more went to the one switched off");
+        // Named outright it is refused as switched off, not swapped for the engine.
+        let (status, refused) = ask(&app, "POST", "/api/ai/providers/their-server/v1/chat/completions", Some(request())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+        assert_eq!(engines.asked.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn with_no_provider_and_no_engines_a_chat_that_names_none_is_told_so() {
+        let (app, _dir) = engine_routes(None);
+        let request = json!({ "messages": [{ "role": "user", "content": "hi" }] });
+        let (status, refused) = ask(&app, "POST", "/api/ai/v1/chat/completions", Some(request)).await;
+        assert_eq!((status, refused["error"]["code"].as_str()), (StatusCode::NOT_FOUND, Some("no_provider")), "{refused}");
+        let why = refused["error"]["message"].as_str().unwrap_or_default();
+        assert!(why.contains("No AI chat provider is switched on") && why.contains("engine"), "{why}");
+        // The list is still an empty one, not an error: the endpoint is there, with nothing to run yet.
+        let (status, models) = ask(&app, "GET", "/api/ai/v1/models", None).await;
+        assert_eq!((status, models["data"].as_array().map(Vec::len)), (StatusCode::OK, Some(0)), "{models}");
     }
 
     #[tokio::test]
