@@ -369,11 +369,15 @@ describe('text-message conversations', () => {
       'see https://example.com/x', 'http://a.co', 'go to www.example.com now', 'bit.ly/3xYz', 'claim: mygov-refund.example.net/login?id=1',
       'Your refund: mygov-refund.info', 'visit ato-gov.au today', 'Pay your toll at linkt-tolls.today', 'parcel held: auspost-redeliver.cfd', 'tollpay.co',
       'Claim your refund...mygov-refund.info', 'mygov-refund[.]info', 'hxxps://mygov-refund.example/a', '103.21.4.9/pay', 'MYGOV-REFUND.INFO', 'shorturl.at/abc', 'wa.me/61400000000',
+      // No hyphen, an everyday ending: a service's name or an errand in it, or a real site's ending in the middle of it.
+      'myGov: you have a refund. mygovrefund.com', 'your parcel is held auspostredelivery.com', 'auspost.com.au.redeliver.info', 'my.gov.au.confirm.com', 'ato.refunds.com', 'linktpayments.com.au', 'secureupdate.net',
     ]) expect(hasLink(text), text).toBe(true);
     for (const text of [
       'Thanks.See you at 3', 'It cost $4.50', 'e.g. tomorrow', 'Call me on 0400 000 000', 'ok', 'my email is sam@example.com', 'sam.smith@example.com.au', 'the file is notes.txt', 'I use node.js',
       'Hi, found you on hipages.com.au, can you quote a fence?', 'saw your ad on gumtree.com.au', 'Is this joesplumbing.com.au?', 'I booked through Booking.com', 'email me at john at bigpond.com', 'see example.com.au.',
       'Running late.Live traffic is bad', 'Thanks mate.Top job', 'Ok.Info on prices?', '12 King St.Shop 4', '$50 inc.gst/delivery', 'Ciao.Io sono Marco', 'thanks mate.top job', 'see you at 3pm.today is fine',
+      // A real site of the government's or a council's, a business with a common word in its name.
+      'the form is on service.nsw.gov.au', 'see brisbane.qld.gov.au', 'my site is tomatofarm.com.au', 'potatoes.com', 'banksianursery.com.au', 'joes.ie',
     ]) expect(hasLink(text), text).toBe(false);
   });
 

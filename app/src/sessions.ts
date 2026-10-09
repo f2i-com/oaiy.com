@@ -201,6 +201,10 @@ const BARE_ENDINGS = new Set('com|net|org|info|biz|xyz|top|online|site|shop|stor
 const THROWAWAY_ENDINGS = new Set('xyz|click|vip|icu|cfd|sbs|buzz|cyou|co|cc|ly|gl|gd|gy|ru|cn|tk|ml|ga|cf|gq|pw|ws'.split('|'));
 /** How a site's name ends where a path follows it ("bit.ly/x", "shorturl.at/x", "wa.me/…"): the bare ones, and the shorteners'. */
 const PATH_ENDINGS = new Set([...BARE_ENDINGS, ...'me|at|in|to|id|li|ee|is|de|fr|es|it|nl|eu|jp|kr|ph|my|th|hk|tw|ae|cloud|tech|space|website|digital|email|news|express|delivery|post|pay|tax|cash|money|bank|finance|download|review|stream|trade|art|blog|one|red|gold'.split('|')]);
+/** A label that ends a real site's name before its country ("joes.com.au", "nsw.gov.au"): anywhere else in a name it is there to look like one ("auspost.com.au.redeliver.info"). */
+const SECOND_LEVEL = new Set('com|net|org|gov|edu|co|ac|id|asn'.split('|'));
+/** What a scam's site calls itself: the services people are told to "verify" with, and what it asks them to do. */
+const BAIT = /mygov|centrelink|medicare|auspost|linkt|etoll|netbank|refund|parcel|redeliver|verify|secure|login|signin|(?:^|[.-])(?:ato|gov|tolls?)(?:[.-]|$)/i;
 /** A site's name as running text has it: labels of letters, digits and hyphens, an ending of letters, and a path or the name's end. Not the tail of an email address. */
 const HOST = /(?<![@\w-])(?<!@[\w.-]*\.)((?:[a-z0-9-]+\.)+)([a-z]{2,24})(?:(\/\S)|(?![\w@-]))/gi;
 
@@ -208,11 +212,15 @@ const HOST = /(?<![@\w-])(?<!@[\w.-]*\.)((?:[a-z0-9-]+\.)+)([a-z]{2,24})(?:(\/\S
  * Whether a text carries a link, as a scam's or an advertisement's does:
  * "http(s)://…", "www.…", a site or an address in digits with a path
  * ("bit.ly/x", "103.21.4.9/pay"), or a site's bare name where it is plainly no
- * mention of a business ("mygov-refund.info", "ato-gov.au", "tollpay.co"): a
- * hyphen or a number in it, or an ending only links have. A well-known site's
- * name with nothing after it ("found you on hipages.com.au") is how a customer
- * says where they found the business, and is not one; nor is an email address,
- * a file's name, or a sentence missing its space ("Thanks mate.Top job").
+ * mention of a business ("mygov-refund.info", "mygovrefund.com",
+ * "auspost.com.au.redeliver.info", "tollpay.co"): a hyphen or a number in it,
+ * a real site's ending in the middle of it, the name of a service scams pass
+ * themselves off as or of what they ask for, or an ending only links have. A
+ * site's name with nothing after it ("found you on hipages.com.au") is how a
+ * customer says where they found the business, and is not one; nor is an
+ * email address, a file's name, or a sentence missing its space ("Thanks
+ * mate.Top job"). Where it errs, the conversation's list says "Not answered
+ * (opened with a link)", and writing in it answers them.
  */
 export function hasLink(text: string): boolean {
   // A dot written so that it is not one ("refund[.]info").
@@ -229,8 +237,12 @@ export function hasLink(text: string): boolean {
     const host = labels + end;
     if (host !== host.toLowerCase() && host !== host.toUpperCase()) continue;
     if (!BARE_ENDINGS.has(ending)) continue;
-    const name = labels.slice(0, -1);
-    const made = name.includes('-') || (/\d/.test(name) && name.length >= 6 && name.replace(/[^a-z]/gi, '').length >= 3);
+    const parts = labels.slice(0, -1).toLowerCase().split('.');
+    // A real site's own second level ("x.com.au", "nsw.gov.au") is not part of what it calls itself.
+    const own = ending.length === 2 && parts.length > 1 && SECOND_LEVEL.has(parts[parts.length - 1]) ? parts.slice(0, -1) : parts;
+    const name = own.join('.');
+    // Made up to be clicked: a hyphen or a number in it, a real site's ending in the middle of it, or a service's name or an errand in it.
+    const made = name.includes('-') || (/\d/.test(name) && name.length >= 6 && name.replace(/[^a-z]/g, '').length >= 3) || own.slice(1).some((label) => SECOND_LEVEL.has(label) || label === 'au') || BAIT.test(name);
     if (made || THROWAWAY_ENDINGS.has(ending)) return true;
   }
   return false;

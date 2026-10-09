@@ -2154,6 +2154,8 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     if (!desktop || !(messages.answer || outreach?.textsOpen()) || !phoneOn()) {
       if (holdsTexts && desktop) void desktop.release('answer-texts', pageId);
       holdsTexts = false;
+      // Not asking for the texts any more: who else holds them is no longer known (and what is kept from now is this page's own).
+      textHolder = '';
     } else {
       try {
         const lease = await desktop.lease('answer-texts', pageId, 30_000, IN_OAIY);
@@ -2161,6 +2163,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
         textHolder = lease.granted ? '' : lease.holder;
       } catch {
         holdsTexts = false;
+        textHolder = '';
       }
     }
     if (holdsTexts && !was && messages.answer) {
@@ -2300,6 +2303,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     if (holdsCalls && desktop) void desktop.release('answer-calls', pageId);
     if (holdsTexts && desktop) void desktop.release('answer-texts', pageId);
     holdsCalls = holdsTexts = false;
+    textHolder = '';
     phoneConnected = null;
     for (const s of sessions?.list ?? []) if (s.kind !== 'task' && s.running) sessions?.stop(s);
     const shown = viewing ? sessions?.thread(viewing) : null;
