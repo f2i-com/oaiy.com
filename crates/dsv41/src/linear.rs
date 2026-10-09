@@ -69,6 +69,47 @@ pub trait DenseKernel: Send + Sync + std::any::Any {
         let _ = (up, down, x, limit, others);
         None
     }
+
+    /// A projection of projections in one call of this kernel's kind (a GPU's: one submit, one round trip), this
+    /// kernel the last: `first`'s sums of one row each, rounded to bf16 and laid end to end, quantized to fp8 where
+    /// `quantized` (as an fp8 weight takes its activation), against this kernel; its sums. None when it cannot
+    /// (another kind among them, a row that is not whole 32s), and the caller makes each projection on its own.
+    fn forward_after(&self, first: &[(&dyn DenseKernel, &[f32], std::ops::Range<usize>)], quantized: bool) -> Option<Vec<f32>> {
+        let _ = (first, quantized);
+        None
+    }
+}
+
+/// `then`'s [`Weight::forward`] of the row `first` make: each `(weight, x, rows)`'s [`Weight::forward_rows`] of one
+/// row, rounded to bf16, laid end to end. One call where a device holds them all and takes them together
+/// ([`DenseKernel::forward_after`]), the row between them never brought here; None where it does not, and the caller
+/// makes them as before. The roundings between the two are the reference's and are made of the values' bits, there
+/// as here: the result is the same to the bit.
+pub fn chained_together(first: &[(&Weight, &[f32], std::ops::Range<usize>)], then: &Weight, out: Out) -> Option<Vec<f32>> {
+    let Weight::Device { kernel: last, .. } = then else { return None };
+    let kernels: Vec<&dyn DenseKernel> = first.iter().map(|(w, ..)| if let Weight::Device { kernel, .. } = w { Some(&**kernel) } else { None }).collect::<Option<_>>()?;
+    let width: usize = first.iter().map(|(_, _, rows)| rows.len()).sum();
+    if width != then.k() || width % FP8_BLOCK != 0 {
+        return None;
+    }
+    let prepared: Vec<Vec<f32>> = first
+        .iter()
+        .map(|(w, x, rows)| {
+            assert_eq!(x.len(), w.k(), "linear: input is not [1, k]");
+            assert!(rows.end <= w.n(), "linear: row range past the weight");
+            w.prepare(x, Out::Bf16).0
+        })
+        .collect();
+    let with: Vec<(&dyn DenseKernel, &[f32], std::ops::Range<usize>)> = kernels.iter().zip(first).zip(&prepared).map(|((k, (_, _, rows)), x)| (*k, x.as_slice(), rows.clone())).collect();
+    let start = std::time::Instant::now();
+    let mut y = last.forward_after(&with, then.quantizes())?;
+    crate::profile::add(crate::profile::Part::DeviceDense, start);
+    if out == Out::Bf16 || then.quantizes() {
+        for v in y.iter_mut() {
+            *v = to_bf16(*v);
+        }
+    }
+    Some(y)
 }
 
 /// A token's fp8 gated unit (the shared expert: `gate` and `up` of `x`, the SwiGLU of the two clamped at `limit`,

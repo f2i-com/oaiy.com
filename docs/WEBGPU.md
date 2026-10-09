@@ -118,11 +118,12 @@ measured"; `dsv41::profile` says where a pass's time goes):
   Projections of one input go in one submit (a layer's eight `wo_a` groups, `wq_a` with
   `wkv`, the router with the shared expert's gate and up): a decode step's 667 round
   trips became 270.
-- Its routed experts there too (`WgpuExperts`). A prompt's busy ones (eight tokens or
-  more) pass through slots made once, each record uploaded as stored and its MXFP4
-  matrices read in place with their e8m0 scales (`RecordSlots`); a prompt's MoE hands
-  each record over as it is read, the busy ones to the GPU a group of 32 at a time and
-  the rest to the CPU's workers meanwhile, so the reads and the matmuls overlap. What
+- Its routed experts there too (`WgpuExperts`). A prompt's experts that a card takes
+  pass through slots made once, each record uploaded as stored and its MXFP4
+  matrices read in place with their e8m0 scales (`RecordSlots`); a prompt's MoE
+  shares what it reads between the CPU's workers and the card, the experts of most
+  tokens the card's, a group of 32 at a time ("A day on", below), so the reads and
+  the matmuls overlap. What
   the budget has left after the trunk and the slots keeps experts between passes: 935
   of them on a 32 GB card with a 27 GiB budget, and a second card 1,509 more. The
   15,360 routed experts are 290 GB and fit nowhere whole, so each is in one place (a
@@ -208,6 +209,50 @@ expert each one submit. A step on a prompt read before is 130 to 146 ms: the tru
 228 dense calls 40, the experts 50 to 57 (the drive 22 to 29 for the one or two of its
 240 that are in no tier, the CPU's 26 to 28, the cards' beside them), sparse attention
 11, mixing 6. `OAIY_DSV41_PROFILE` prints each prompt's and reply's.
+
+A day on (2026-10-09), the same machine and the same eight requests with a profile
+kept from a run of them. Two cards: replies at 5.9 to 9.0 tokens a second the first
+time through and 7.9 to 10.0 the second (5.8 to 8.4 and 4.6 to 7.7 that morning), a
+93-token prompt in 5.8 to 6.6 s (7.9 to 8.9) and a 276-token one in 14.2 to 14.4 s
+read before, 16.4 to 19.9 the first time (20.7 to 24.5). One card: replies at 5.0 to
+5.7 and 5.4 to 6.5 (4.7 to 5.9 and 5.3 to 6.4), the prompts in 6.2 to 6.9 s (8.7 to
+9.8) and 16.6 to 23.1 s (22.1 to 27.0). What changed:
+
+- A prompt's experts on the CPU take all of an expert's tokens at once
+  (`cpu_experts::TokensKernel`, `expert_forward_tokens`; `dsv41-simd` picks this
+  CPU's): a block of sixteen rows of a matrix is decoded once and multiplied by each
+  token's row, in the order a token alone is summed, so the same bits. A token at a
+  time read the 18.9 MB record once a token, and workers on every core were then
+  waiting for memory: an expert of 13 tokens costs a core 9 ms where 21, one of 40
+  tokens 23 where 61 (`measure_an_experts_tokens`), and 3,500 experts of a 276-token
+  prompt take the workers 3.7 s where 16.
+- What a prompt has read lies in one queue kept by tokens, and both ends are taken as
+  hands come free: the workers the fewest tokens', a card, once it has made what it
+  holds, the most tokens' a group at a time. So the two work at once and share by
+  what each gets through, with no GPU the workers take all, and a GPU beside few
+  cores takes most. Before, an expert of eight tokens or more was the card's whatever
+  the workers had to do, and what the card held was made before a worker was given
+  anything: 9.5 s of a 276-token prompt on a card with every core idle. Two hardware
+  threads are left to the thread that drives the card, whose calls quantize their
+  rows and make their SwiGLU on the host.
+- A decode step: the attention's `wo_a` groups and `wo_b` are one call, the row
+  between them rounded to bf16 and quantized to fp8 on the device (`dense::Chain`,
+  `linear::chained_together`; every step of it integer steps on the values' bits, so
+  the two calls' result to the bit: `a_chained_projection_is_the_two_calls_to_the_bit`),
+  188 trunk calls a step where 228. The cards' experts are begun and later read
+  (`dense::begin_units`, `ExpertsKernel::begin_held`): the CPU's workers are started,
+  each card's call is submitted beside them, and the results are taken after, with
+  no thread started for a card (one was, each layer, and one more for each card past
+  the first): the cards' experts 16 to 27 ms of a step where 37 to 58. And a step's
+  records that are in RAM are taken by the thread that asks (a thread was started
+  for each: 75 us a layer).
+
+The model on the GPU against the CPU model (`the_trunk_and_the_experts_on_the_gpu_
+answer_as_the_cpu_model_does`): cosine 0.9996 to 0.9998 and the same greedy tokens,
+where 0.998951 before: most of a prompt's experts are now the CPU's, whose sums are
+the reference's own. It is a range because which experts a card takes follows what
+has landed when it comes free (a card sums an expert in another order than the CPU,
+as before, and which tier holds an expert already followed the idle rebalance).
 
 ## EXL3 (OrcaSAQ)
 

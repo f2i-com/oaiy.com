@@ -287,6 +287,33 @@ pub fn expert_forward_rows(kernel: crate::cpu_experts::RowKernel, record: &[u8],
     out
 }
 
+/// [`expert_forward_batch`] on the caller's thread through a tokens kernel (the model's: `dsv41-simd`'s SIMD one where
+/// a caller chose it for this CPU): the record read once for all the rows of `x`, each sum in [`expert_forward`]'s
+/// order, so the same bits. For a prompt's experts, many of them computed at once on workers that fill the cores:
+/// [`expert_forward_rows`] read the record once a row (an expert of 13 tokens streamed 245 MB, and 3,500 such on
+/// every core took 16 s, the cores waiting for memory).
+pub fn expert_forward_tokens(kernel: crate::cpu_experts::TokensKernel, record: &[u8], x: &[f32], route_weights: Option<&[f32]>, swiglu_limit: f32) -> Vec<f32> {
+    assert_eq!(record.len(), RECORD_BYTES);
+    assert_eq!(x.len() % DIM, 0);
+    let nt = x.len() / DIM;
+    if let Some(w) = route_weights {
+        assert_eq!(w.len(), nt);
+    }
+    if nt == 0 {
+        return Vec::new();
+    }
+    let xq = fake_quant_fp8(x, BLOCK);
+    let (mut gate, mut up, mut y) = (vec![0.0f32; nt * INTER], vec![0.0f32; nt * INTER], vec![0.0f32; nt * DIM]);
+    kernel(&xq, nt, &record[W1], &record[S1], DIM, 0, &mut gate);
+    kernel(&xq, nt, &record[W3], &record[S3], DIM, 0, &mut up);
+    let hq = fake_quant_fp8(&swiglu(&gate, &up, route_weights, swiglu_limit), BLOCK);
+    kernel(&hq, nt, &record[W2], &record[S2], INTER, 0, &mut y);
+    for v in y.iter_mut() {
+        *v = to_bf16(*v);
+    }
+    y
+}
+
 /// The middle of [`expert_forward_batch`]: from the gate and up sums (`[rows, INTER]`, f32) to the activation the down
 /// projection takes (before its fp8 quantization): each rounded to bf16, clamped, `silu(gate) * up`, times the row's
 /// routing weight, rounded again.
@@ -335,6 +362,17 @@ pub trait ExpertsKernel: Send + Sync {
     fn forward_held(&self, layer: u32, jobs: &[(u32, &[f32], &[f32])], swiglu_limit: f32) -> Vec<Vec<f32>> {
         let _ = (layer, jobs, swiglu_limit);
         panic!("this experts kernel holds no experts")
+    }
+
+    /// [`Self::forward_held`] begun: what is left of it is the closure's to finish, and what the caller does before
+    /// it calls that runs beside the device's work (a decode step's experts on the CPU, with no thread started for
+    /// the device). By default nothing is begun and the closure makes it all.
+    fn begin_held<'a>(&'a self, layer: u32, jobs: &[(u32, &[f32], &[f32])], swiglu_limit: f32) -> Box<dyn FnOnce() -> Vec<Vec<f32>> + 'a> {
+        let owned: Vec<(u32, Vec<f32>, Vec<f32>)> = jobs.iter().map(|(e, x, w)| (*e, x.to_vec(), w.to_vec())).collect();
+        Box::new(move || {
+            let jobs: Vec<(u32, &[f32], &[f32])> = owned.iter().map(|(e, x, w)| (*e, &x[..], &w[..])).collect();
+            self.forward_held(layer, &jobs, swiglu_limit)
+        })
     }
 
     /// The order to read a layer's `experts` in before its router has chosen (a prompt's, while its attention runs):

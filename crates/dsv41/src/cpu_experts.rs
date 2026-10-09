@@ -121,6 +121,72 @@ pub fn fp4_rows(x: &[f32], w: &[u8], s: &[u8], k: usize, r0: usize, out: &mut [f
 /// [`fp4_rows`]'s order (so every kernel gives the same bits).
 pub type RowKernel = fn(x: &[f32], w: &[u8], s: &[u8], k: usize, r0: usize, out: &mut [f32]);
 
+/// A kernel for several rows of `x` at once (a prompt's tokens that chose one expert): `out[t * n + j] = sum_k
+/// x[t][k] * dequant(w)[r0 + j, k]` for `nt` rows of `x` (`[nt, k]`) and the `n = out.len() / nt` rows of the matrix
+/// from `r0`, each sum made in [`fp4_rows`]'s order (a row of `x` at a time through a [`RowKernel`] gives the same
+/// bits), each weight decoded once for all the rows of `x`.
+pub type TokensKernel = fn(x: &[f32], nt: usize, w: &[u8], s: &[u8], k: usize, r0: usize, out: &mut [f32]);
+
+/// `x` (`[nt, k]`) a 32 of k at a time: block `b`'s 32 values of every row together (`[k / 32][nt][32]`), which is
+/// the order a tokens kernel reads them in (a block of the weights against each row's same block: taken from the
+/// rows as they lie, each was a line of another row's 16 KB).
+fn by_blocks(x: &[f32], nt: usize, k: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(nt * k);
+    for b in 0..k / BLOCK {
+        for t in 0..nt {
+            out.extend_from_slice(&x[t * k + b * BLOCK..t * k + (b + 1) * BLOCK]);
+        }
+    }
+    out
+}
+
+/// The portable [`TokensKernel`]: [`fp4_rows`]'s sums for every row of `x`, a block of 16 rows of the matrix decoded
+/// once and multiplied by each row of `x` in turn. A prompt's expert of a dozen tokens reads its record once this
+/// way; a row of `x` at a time it read it a dozen times, and the workers that fill the cores were then waiting for
+/// memory.
+pub fn fp4_tokens(x: &[f32], nt: usize, w: &[u8], s: &[u8], k: usize, r0: usize, out: &mut [f32]) {
+    const HALF: usize = BLOCK / 2;
+    assert!(nt > 0 && out.len() % nt == 0 && x.len() >= nt * k, "a tokens kernel's rows");
+    let n = out.len() / nt;
+    let (row_bytes, row_scales) = (k / 2, k / BLOCK);
+    let xt = by_blocks(x, nt, k);
+    let mut blk = [[0.0f32; LANES]; BLOCK];
+    let mut acc = vec![[0.0f32; LANES]; nt];
+    for g in 0..n.div_ceil(LANES) {
+        let r = r0 + g * LANES;
+        let m = LANES.min(n - g * LANES);
+        acc.iter_mut().for_each(|a| *a = [0.0; LANES]);
+        for b in 0..row_scales {
+            let mut sc = [0.0f32; LANES];
+            for lane in 0..m {
+                let bytes: &[u8; HALF] = w[(r + lane) * row_bytes + b * HALF..(r + lane) * row_bytes + (b + 1) * HALF].try_into().expect("block");
+                for (i, &byte) in bytes.iter().enumerate() {
+                    let [lo, hi] = PAIRS[byte as usize];
+                    blk[2 * i][lane] = lo;
+                    blk[2 * i + 1][lane] = hi;
+                }
+                sc[lane] = e8m0_to_f32(s[(r + lane) * row_scales + b]);
+            }
+            for (t, a) in acc.iter_mut().enumerate() {
+                let xb: &[f32; BLOCK] = xt[(b * nt + t) * BLOCK..(b * nt + t + 1) * BLOCK].try_into().expect("block");
+                let mut part = [0.0f32; LANES];
+                for i in 0..HALF {
+                    let (x0, x1, w0, w1) = (xb[2 * i], xb[2 * i + 1], &blk[2 * i], &blk[2 * i + 1]);
+                    for lane in 0..LANES {
+                        part[lane] += x0 * w0[lane] + x1 * w1[lane];
+                    }
+                }
+                for lane in 0..LANES {
+                    a[lane] += part[lane] * sc[lane];
+                }
+            }
+        }
+        for (t, a) in acc.iter().enumerate() {
+            out[t * n + g * LANES..t * n + g * LANES + m].copy_from_slice(&a[..m]);
+        }
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 pub mod avx512 {
     //! [`fp4_rows`](super::fp4_rows) with AVX-512F/BW: the same 16-rows-per-
@@ -270,6 +336,59 @@ pub mod avx512 {
                 acc = _mm512_add_ps(acc, _mm512_mul_ps(part, from_lanes(&sc)));
             }
             dst.copy_from_slice(&lanes(acc)[..n]);
+        }
+    }
+
+    /// [`super::fp4_tokens`], 16 rows per register: a block's weights decoded once (the two permutes a byte column)
+    /// and kept in registers' worth of stack, then each row of `x` multiplied in [`fp4_rows`]'s order.
+    ///
+    /// # Safety
+    ///
+    /// As [`fp4_rows`]: safe code, callable only where the CPU has AVX-512F and AVX-512BW.
+    #[target_feature(enable = "avx512f,avx512bw")]
+    pub fn fp4_tokens(x: &[f32], nt: usize, w: &[u8], s: &[u8], k: usize, r0: usize, out: &mut [f32]) {
+        const HALF: usize = BLOCK / 2;
+        assert!(nt > 0 && out.len() % nt == 0 && x.len() >= nt * k, "a tokens kernel's rows");
+        let n = out.len() / nt;
+        let (row_bytes, row_scales) = (k / 2, k / BLOCK);
+        let table = from_lanes(&FP4_VALUES);
+        let xt = super::by_blocks(x, nt, k);
+        let mut acc = vec![_mm512_setzero_ps(); nt];
+        for g in 0..n.div_ceil(16) {
+            let r = r0 + g * 16;
+            let m = 16.min(n - g * 16);
+            for a in acc.iter_mut() {
+                *a = _mm512_setzero_ps();
+            }
+            for b in 0..row_scales {
+                let mut v = [_mm_setzero_si128(); 16];
+                let mut sc = [0.0f32; 16];
+                for lane in 0..m {
+                    let row = (r + lane) * row_bytes;
+                    v[lane] = load16(&w[row + b * HALF..row + (b + 1) * HALF]);
+                    sc[lane] = e8m0_to_f32(s[(r + lane) * row_scales + b]);
+                }
+                let cols = transpose(&v);
+                let (mut lo, mut hi) = ([_mm512_setzero_ps(); 16], [_mm512_setzero_ps(); 16]);
+                for (i, col) in cols.iter().enumerate() {
+                    let idx = _mm512_cvtepu8_epi32(*col);
+                    lo[i] = _mm512_permutexvar_ps(idx, table);
+                    hi[i] = _mm512_permutexvar_ps(_mm512_srli_epi32::<4>(idx), table);
+                }
+                let scales = from_lanes(&sc);
+                for (t, a) in acc.iter_mut().enumerate() {
+                    let xb = &xt[(b * nt + t) * BLOCK..(b * nt + t + 1) * BLOCK];
+                    let mut part = _mm512_setzero_ps();
+                    for i in 0..16 {
+                        let pair = _mm512_add_ps(_mm512_mul_ps(_mm512_set1_ps(xb[2 * i]), lo[i]), _mm512_mul_ps(_mm512_set1_ps(xb[2 * i + 1]), hi[i]));
+                        part = _mm512_add_ps(part, pair);
+                    }
+                    *a = _mm512_add_ps(*a, _mm512_mul_ps(part, scales));
+                }
+            }
+            for (t, a) in acc.iter().enumerate() {
+                out[t * n + g * 16..t * n + g * 16 + m].copy_from_slice(&lanes(*a)[..m]);
+            }
         }
     }
 }

@@ -651,6 +651,7 @@ impl Models {
         let mut model = dsv41::model::Model::load(&spec.path, &engram_meta, &opts)?;
         // The routed experts on the CPU through this CPU's fastest kernel (the same bits as the portable one).
         model.set_expert_row_kernel(dsv41_simd::row_kernel());
+        model.set_expert_tokens_kernel(dsv41_simd::tokens_kernel());
         self.say(format!("experts on the CPU: the {} kernel", dsv41_simd::row_kernel_name()));
         // Its usage profile (`--usage`), if an earlier run left one: the experts' counts of uses, and with them the
         // order the tiers are filled in at this start (the most used on the cards, the next in RAM), where without

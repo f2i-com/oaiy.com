@@ -54,6 +54,20 @@ impl DenseKernel for WgpuDense {
         let (mut downs, sums) = ggml_rs_wgpu::dense::forward_units(&[unit], &with, limit)?;
         Some((downs.pop()?, sums))
     }
+
+    /// The projections on this adapter in one submit, the row between them made on the device
+    /// ([`ggml_rs_wgpu::dense::forward_chained`]).
+    fn forward_after(&self, first: &[(&dyn DenseKernel, &[f32], std::ops::Range<usize>)], quantized: bool) -> Option<Vec<f32>> {
+        let held: Vec<Arc<DenseGpu>> = first
+            .iter()
+            .map(|(k, ..)| {
+                let w = &(*k as &dyn std::any::Any).downcast_ref::<WgpuDense>()?.0;
+                w.same_device(&self.0).then(|| Arc::clone(w))
+            })
+            .collect::<Option<_>>()?;
+        let with: Vec<(&DenseGpu, &[f32], std::ops::Range<usize>)> = held.iter().zip(first).map(|(w, (_, x, rows))| (&**w, *x, rows.clone())).collect();
+        ggml_rs_wgpu::dense::forward_chained(&ggml_rs_wgpu::dense::Chain { first: &with, then: &self.0, quantized })
+    }
 }
 
 /// The tokens one forward pass reads of a prompt. A pass reads each layer's experts once for all its tokens, so a
@@ -908,7 +922,87 @@ fn run(slots: &RecordSlots, picks: &[(usize, &[f32], &[f32])], swiglu_limit: f32
     ggml_rs_wgpu::dense::forward_batch(&items).into_iter().map(|y| y.into_iter().map(to_bf16).collect()).collect()
 }
 
+/// A decode step's experts on one card, begun ([`begin`]): the call submitted and its results pending, or, where it
+/// did not go through the device's arena, made already.
+enum Begun {
+    Pending(ggml_rs_wgpu::dense::Pending),
+    Made(Vec<Vec<f32>>),
+}
+
+impl Begun {
+    fn finish(self) -> Vec<Vec<f32>> {
+        match self {
+            Begun::Pending(pending) => pending.finish().0.into_iter().map(|y| y.into_iter().map(dsv41::formats::to_bf16).collect()).collect(),
+            Begun::Made(outs) => outs,
+        }
+    }
+}
+
+/// [`run`] begun for a decode step's experts (one row each, a group of them at most): submitted to their card in one
+/// call ([`ggml_rs_wgpu::dense::begin_units`]) and left for [`Begun::finish`], so the caller's own work meanwhile is
+/// beside the card's.
+fn begin(slots: &RecordSlots, picks: &[(usize, &[f32], &[f32])], swiglu_limit: f32) -> Begun {
+    use dsv41::expert::{BLOCK, DIM, INTER, S1, S2, S3, W1, W2, W3};
+    if picks.len() <= dsv41::moe::GPU_GROUP && picks.iter().all(|(_, x, w)| x.len() == DIM && w.len() == 1) {
+        let mats: Vec<[DenseGpu; 3]> = picks
+            .iter()
+            .map(|&(i, ..)| [slots.mxfp4(i, W1.start, S1.start, INTER, DIM), slots.mxfp4(i, W3.start, S3.start, INTER, DIM), slots.mxfp4(i, W2.start, S2.start, DIM, INTER)])
+            .collect();
+        // (each input quantized once, however many experts take it: a step's all take the token's one row)
+        let mut quantized: Vec<(*const f32, Vec<f32>)> = Vec::new();
+        for (_, x, _) in picks {
+            if !quantized.iter().any(|(at, _)| *at == x.as_ptr()) {
+                quantized.push((x.as_ptr(), dsv41::formats::fake_quant_fp8(x, BLOCK)));
+            }
+        }
+        let units: Vec<ggml_rs_wgpu::dense::Unit<'_>> = picks
+            .iter()
+            .zip(&mats)
+            .map(|((_, x, w), m)| ggml_rs_wgpu::dense::Unit { gate: &m[0], up: &m[1], down: &m[2], x: &quantized.iter().find(|(at, _)| *at == x.as_ptr()).expect("quantized above").1, weight: w[0] })
+            .collect();
+        if let Some(pending) = ggml_rs_wgpu::dense::begin_units(&units, &[], swiglu_limit) {
+            return Begun::Pending(pending);
+        }
+    }
+    Begun::Made(picks.chunks(dsv41::moe::GPU_GROUP).flat_map(|part| run(slots, part, swiglu_limit)).collect())
+}
+
 impl dsv41::expert::ExpertsKernel for WgpuExperts {
+    /// Each card's share of a decode step's held experts submitted in turn (the other cards', then the first card's
+    /// tier), and all read back by the closure: the cards work beside each other and beside whatever the caller does
+    /// before it asks, and no thread is started for any of them.
+    fn begin_held<'a>(&'a self, layer: u32, jobs: &[(u32, &[f32], &[f32])], swiglu_limit: f32) -> Box<dyn FnOnce() -> Vec<Vec<f32>> + 'a> {
+        let experts: Vec<u32> = jobs.iter().map(|j| j.0).collect();
+        let there = self.pinned_now(layer, &experts);
+        let cards = self.pinned.as_ref().map_or(0, |p| p.cards.len());
+        let mut begun: Vec<(Vec<usize>, Begun)> = Vec::new();
+        for c in 0..cards {
+            let mine: Vec<usize> = (0..jobs.len()).filter(|&j| there[j].is_some_and(|(card, _)| card == c)).collect();
+            if !mine.is_empty() {
+                let slots = &self.pinned.as_ref().expect("a share's card").cards[c].0;
+                let picks: Vec<(usize, &[f32], &[f32])> = mine.iter().map(|&j| (there[j].expect("its slot").1, jobs[j].1, jobs[j].2)).collect();
+                begun.push((mine, begin(slots, &picks, swiglu_limit)));
+            }
+        }
+        let first: Vec<usize> = (0..jobs.len()).filter(|&j| there[j].is_none()).collect();
+        if !first.is_empty() {
+            let r = self.resident.as_ref().expect("a kernel that holds experts").lock().unwrap_or_else(|p| p.into_inner());
+            let picks: Vec<(usize, &[f32], &[f32])> = first.iter().map(|&j| (r.index[&(layer, jobs[j].0)], jobs[j].1, jobs[j].2)).collect();
+            let b = begin(&r.slots, &picks, swiglu_limit);
+            begun.push((first, b));
+        }
+        let n = jobs.len();
+        Box::new(move || {
+            let mut outs: Vec<Option<Vec<f32>>> = (0..n).map(|_| None).collect();
+            for (mine, b) in begun {
+                for (j, out) in mine.into_iter().zip(b.finish()) {
+                    outs[j] = Some(out);
+                }
+            }
+            outs.into_iter().map(|o| o.expect("every held expert computed")).collect()
+        })
+    }
+
     fn forward(&self, jobs: &[dsv41::expert::ExpertJob<'_>], swiglu_limit: f32) -> Vec<Vec<f32>> {
         let slots = self.group.lock().unwrap_or_else(|p| p.into_inner());
         let mut out = Vec::with_capacity(jobs.len());
@@ -1634,5 +1728,47 @@ mod tests {
         }
         let tail = &times[times.len() / 2..];
         eprintln!("last {} steps: {:.2} s a token on average", tail.len(), tail.iter().sum::<f64>() / tail.len() as f64);
+    }
+
+    /// A projection of projections in one call ([`dsv41::linear::chained_together`]) is the two calls to the bit:
+    /// eight groups of a bf16 weight (a layer's `wo_a`) whose row an fp8 weight (`wo_b`) takes quantized, and a bf16
+    /// weight after a bf16 weight (the row rounded and not quantized), each on rows of several sizes of value.
+    #[test]
+    #[ignore = "needs a WebGPU adapter"]
+    fn a_chained_projection_is_the_two_calls_to_the_bit() {
+        use dsv41::linear::{chained_together, forward_together, Out};
+        let b = WgpuBackend::new(Some(1 << 30)).expect("a WebGPU adapter");
+        let mut s = 0x1234_5678_9abc_def1u64;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let (groups, gd, rank, n) = (8usize, 512usize, 128usize, 1024usize);
+        let bf16 = |n: usize, k: usize, next: &mut dyn FnMut() -> u64| DenseData::Bf16 { w: (0..n * k).map(|_| ((((next() % 2000) as f32 / 1000.0) - 1.0).to_bits() >> 16) as u16).collect(), n, k };
+        let fp8 = |n: usize, k: usize, next: &mut dyn FnMut() -> u64| DenseData::Fp8 {
+            w: (0..n * k).map(|_| { let b = (next() & 255) as u8; if b & 0x7f == 0x7f { b ^ 1 } else { b } }).collect(),
+            scales: (0..n.div_ceil(32) * (k / 32)).map(|_| 2f32.powi((next() % 10) as i32 - 8)).collect(),
+            n,
+            k,
+        };
+        let device = |data: DenseData, n: usize, k: usize, fp8: bool| Weight::Device { kernel: Arc::new(WgpuDense(b.dense(data).unwrap().expect("on the GPU"))), n, k, fp8 };
+        let a = device(bf16(groups * rank, gd, &mut next), groups * rank, gd, false);
+        let thens = [(device(fp8(n, groups * rank, &mut next), n, groups * rank, true), "an fp8 weight after"), (device(bf16(n, groups * rank, &mut next), n, groups * rank, false), "a bf16 weight after")];
+        for (then, what) in thens {
+            for scale in [1.0f32, 1e-3, 40.0] {
+                let xs: Vec<Vec<f32>> = (0..groups).map(|_| (0..gd).map(|_| (((next() % 2001) as f32 / 1000.0) - 1.0) * scale).collect()).collect();
+                let two: Vec<(&Weight, &[f32], usize, std::ops::Range<usize>, Out)> = xs.iter().enumerate().map(|(g, x)| (&a, x.as_slice(), 1, g * rank..(g + 1) * rank, Out::Bf16)).collect();
+                let row: Vec<f32> = forward_together(&two).concat();
+                let want = then.forward(&row, 1, Out::Bf16);
+                let first: Vec<(&Weight, &[f32], std::ops::Range<usize>)> = xs.iter().enumerate().map(|(g, x)| (&a, x.as_slice(), g * rank..(g + 1) * rank)).collect();
+                let got = chained_together(&first, &then, Out::Bf16).expect("the chain goes through the arena");
+                assert_eq!(got.len(), n);
+                assert!(want.iter().any(|v| *v != 0.0), "{what}: sums that are something");
+                let differing = got.iter().zip(&want).filter(|(g, w)| g.to_bits() != w.to_bits()).count();
+                assert_eq!(differing, 0, "{what}, inputs of {scale}: {differing} of {n} sums differ");
+            }
+        }
     }
 }

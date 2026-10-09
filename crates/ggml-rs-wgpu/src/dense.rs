@@ -384,7 +384,7 @@ pub(crate) struct Arena {
     /// bytes from one dispatch's parameters to the next's (the device's alignment of a uniform's offset)
     step: u32,
     groups: std::collections::HashMap<wgpu::Buffer, wgpu::BindGroup>,
-    /// [`SWIGLU`]'s bind group: the results read, the inputs written.
+    /// The stages' bind group ([`STAGE`]): the results read, the inputs written.
     stage: Option<wgpu::BindGroup>,
 }
 
@@ -424,7 +424,7 @@ impl Arena {
         }
     }
 
-    /// [`SWIGLU`]'s bind group, made the first time it is asked for.
+    /// The stages' bind group, made the first time it is asked for.
     fn stage(&mut self, gpu: &Gpu) -> &wgpu::BindGroup {
         let Arena { layout, x, y, params, stage, .. } = self;
         stage.get_or_insert_with(|| {
@@ -478,15 +478,20 @@ pub struct Unit<'a> {
     pub weight: f32,
 }
 
-/// The stage between a unit's projections ([`forward_units`]), a workgroup 32 of its width (the reach of one fp8
-/// scale): the gate's and the up's sums rounded to bf16 and clamped at the limit, `silu(gate) * up * weight` rounded
-/// to bf16, and that quantized to fp8 as the reference quantizes an activation (a power-of-two scale from the 32's
-/// largest, each value rounded to nearest even on the e4m3 grid), which is what the down projection multiplies. The
-/// roundings are the host's to the bit (integer steps on the values' bits, products by powers of two); the
-/// exponential and the division are the device's own, so a result now and then is a bf16 step from the host's.
-/// `p[0]`: where the gate's sums start in the results, the up's, where the activation goes in the inputs; `p[1]`: the
-/// weight's bits, the limit's (0: none).
-const SWIGLU: &str = r#"
+/// A projection of other projections' results for [`forward_chained`]: `first`'s sums of one row each (`(weight, x,
+/// rows)`), rounded to bf16 and laid end to end, are the row `then` multiplies, quantized to fp8 first where
+/// `quantized` (as an fp8 weight takes its activation).
+pub struct Chain<'a> {
+    pub first: &'a [(&'a DenseGpu, &'a [f32], Range<usize>)],
+    pub then: &'a DenseGpu,
+    pub quantized: bool,
+}
+
+/// What the stages between a call's projections share ([`swiglu_stage`], [`round_stage`]): a workgroup 32 of the row
+/// (the reach of one fp8 scale), and the reference's roundings, made of the values' bits (integer steps, products by
+/// powers of two) and so the host's to the bit: to bf16, and an activation's quantization to fp8 (a power-of-two
+/// scale from the 32's largest, each value rounded to nearest even on the e4m3 grid).
+const STAGE: &str = r#"
 @group(0) @binding(0) var<storage, read> src: array<f32>;
 @group(0) @binding(2) var<storage, read_write> dst: array<f32>;
 @group(0) @binding(3) var<uniform> p: array<vec4<u32>, 3>;
@@ -511,6 +516,26 @@ fn e4m3(v: f32) -> f32 {
     return select(q, -q, (bitcast<u32>(v) >> 31u) == 1u);
 }
 
+// `v`, one of the workgroup's 32 in `h`, quantized to fp8 with them: the scale 2^ceil(log2(most / 448)), most at
+// least 1e-4 (its exponent, one more unless its mantissa is zero)
+fn fp8_of(v: f32) -> f32 {
+    var most = 0.0;
+    for (var l = 0u; l < 32u; l++) { most = max(most, abs(h[l])); }
+    let b = bitcast<u32>(max(most, 0.0001) * 0.002232142857142857);
+    let e = ((b >> 23u) & 0xffu) + select(0u, 1u, (b & 0x7fffffu) != 0u);
+    return e4m3(clamp(v * bitcast<f32>((254u - e) << 23u), -448.0, 448.0)) * bitcast<f32>(e << 23u);
+}
+"#;
+
+/// The stage between a unit's projections ([`forward_units`]): the gate's and the up's sums rounded to bf16 and
+/// clamped at the limit, `silu(gate) * up * weight` rounded to bf16, and that quantized to fp8 ([`STAGE`]), which is
+/// what the down projection multiplies. The exponential and the division are the device's own, so a result now and
+/// then is a bf16 step from the host's. `p[0]`: where the gate's sums start in the results, the up's, where the
+/// activation goes in the inputs; `p[1]`: the weight's bits, the limit's (0: none).
+fn swiglu_stage() -> String {
+    format!(
+        "{STAGE}{}",
+        r#"
 @compute @workgroup_size(32)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
     let i = wg.x * 32u + li;
@@ -525,27 +550,63 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let v = bf16(g / (1.0 + exp(-g)) * u * weight);
     h[li] = v;
     workgroupBarrier();
-    var most = 0.0;
-    for (var l = 0u; l < 32u; l++) { most = max(most, abs(h[l])); }
-    // the scale: 2^ceil(log2(most / 448)), most at least 1e-4; its exponent, one more unless its mantissa is zero
-    let b = bitcast<u32>(max(most, 0.0001) * 0.002232142857142857);
-    let e = ((b >> 23u) & 0xffu) + select(0u, 1u, (b & 0x7fffffu) != 0u);
-    dst[p[0].z + i] = e4m3(clamp(v * bitcast<f32>((254u - e) << 23u), -448.0, 448.0)) * bitcast<f32>(e << 23u);
+    dst[p[0].z + i] = fp8_of(v);
 }
-"#;
+"#
+    )
+}
+
+/// The stage between a chain's projections ([`forward_chained`]): the first's sums rounded to bf16, and quantized to
+/// fp8 where the last takes its activation so ([`STAGE`]); every step of it the host's to the bit. `p[0]`: where the
+/// sums start in the results, (nothing), where the row goes in the inputs; `p[1].x`: 1 where it is quantized.
+fn round_stage() -> String {
+    format!(
+        "{STAGE}{}",
+        r#"
+@compute @workgroup_size(32)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let i = wg.x * 32u + li;
+    let v = bf16(src[p[0].x + i]);
+    h[li] = v;
+    workgroupBarrier();
+    let q = fp8_of(v);
+    dst[p[0].z + i] = select(v, q, p[1].x == 1u);
+}
+"#
+    )
+}
 
 /// A decode step's experts on one device in one submit and one read back: each unit's gate and up projections of its
-/// row, their SwiGLU quantized on the device ([`SWIGLU`]) and its down projection (its sums, f32), and with them the
-/// sums of `others` (plain weights against one row each, `(weight, x, rows)`). None when it does not go through the
-/// device's [`Arena`] (past its sizes, or OAIY_DENSE_FEW): the caller then makes the projections in calls of their own
-/// with the SwiGLU on the host between them, which was two round trips an expert's step and is what a prompt's rows
-/// still take.
+/// row, their SwiGLU quantized on the device ([`swiglu_stage`]) and its down projection (its sums, f32), and with them
+/// the sums of `others` (plain weights against one row each, `(weight, x, rows)`). None when it does not go through
+/// the device's [`Arena`] (past its sizes, or OAIY_DENSE_FEW): the caller then makes the projections in calls of their
+/// own with the SwiGLU on the host between them, which was two round trips an expert's step and is what a prompt's
+/// rows still take.
 pub fn forward_units(units: &[Unit<'_>], others: &[(&DenseGpu, &[f32], Range<usize>)], limit: f32) -> Option<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+    let (downs, _, sums) = begin_units(units, others, limit)?.finish();
+    Some((downs, sums))
+}
+
+/// [`forward_units`] begun: the call submitted, its results [`Pending`] until they are asked for. What the caller
+/// does meanwhile runs beside the device's work: a decode step's experts on the host's cores beside a card's, with no
+/// thread started for the card.
+pub fn begin_units(units: &[Unit<'_>], others: &[(&DenseGpu, &[f32], Range<usize>)], limit: f32) -> Option<Pending> {
     let first = units.first().map(|u| u.gate).or(others.first().map(|o| o.0))?;
     let gpu = &first.gpu;
     assert!(units.iter().flat_map(|u| [u.gate, u.up, u.down]).chain(others.iter().map(|o| o.0)).all(|w| Arc::ptr_eq(&w.gpu, gpu)), "dense: a call on more than one GPU");
     let _one = first.serial.lock().unwrap_or_else(|p| p.into_inner());
-    arena_call(gpu, others, units, limit)
+    arena_begin(gpu, others, units, &[], limit)
+}
+
+/// A chain's last projection's sums (f32), all of it in one submit and one read back: the first projections, their
+/// row rounded and quantized on the device ([`round_stage`]), and the last. Two calls with the rounding on the host
+/// between them give the same to the bit. None when it does not go through the device's [`Arena`] (the row not the
+/// last's width or not whole 32s, past the arena's sizes, or OAIY_DENSE_FEW): the caller then makes those two calls.
+pub fn forward_chained(chain: &Chain<'_>) -> Option<Vec<f32>> {
+    let gpu = &chain.then.gpu;
+    assert!(chain.first.iter().all(|(w, ..)| Arc::ptr_eq(&w.gpu, gpu)), "dense: a call on more than one GPU");
+    let _one = chain.then.serial.lock().unwrap_or_else(|p| p.into_inner());
+    arena_begin(gpu, &[], &[], std::slice::from_ref(chain), 0.0)?.finish().1.pop()
 }
 
 /// [`forward_batch`] for a call whose every item is one row of x, through the device's [`Arena`]: None when it is not
@@ -555,10 +616,10 @@ fn forward_in_arena(gpu: &Arc<Gpu>, items: &[(&DenseGpu, &[f32], usize, Range<us
         return None;
     }
     let plain: Vec<(&DenseGpu, &[f32], Range<usize>)> = items.iter().map(|(w, x, _, rows)| (*w, *x, rows.clone())).collect();
-    arena_call(gpu, &plain, &[], 0.0).map(|(_, sums)| sums)
+    arena_begin(gpu, &plain, &[], &[], 0.0).map(|pending| pending.finish().2)
 }
 
-/// A dispatch of an [`arena_call`]: the weight's buffer it reads, its kernel's kind and grid, and its parameters.
+/// A dispatch of an [`arena_begin`]: the weight's buffer it reads, its kernel's kind and grid, and its parameters.
 struct Step<'a> {
     buffer: &'a wgpu::Buffer,
     kind: Kind,
@@ -582,12 +643,45 @@ fn steps_of<'a>(w: &'a DenseGpu, rows: &Range<usize>, xo: u32, yo: u32, steps: &
     }
 }
 
-/// One submit through the device's [`Arena`]: `plain` weights against one row each, and `units` ([`forward_units`]).
-/// The inputs go one after another (each once, however many weights take it), then each unit's activation, which
-/// [`SWIGLU`] writes; the results are each unit's gate and up sums, then what is read back: the units' down sums and
-/// `plain`'s. Three passes: the gate, up and plain projections; the units' stage; their down projections.
-fn arena_call(gpu: &Arc<Gpu>, plain: &[(&DenseGpu, &[f32], Range<usize>)], units: &[Unit<'_>], limit: f32) -> Option<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
-    if few_only() || plain.iter().any(|(_, _, rows)| rows.is_empty()) {
+/// An [`Arena`]'s call submitted and not yet read back ([`begin_units`]). The arena is the call's own until then:
+/// another call on the device meanwhile makes itself one.
+pub struct Pending {
+    gpu: Arc<Gpu>,
+    arena: Arena,
+    /// the bytes to read back
+    bytes: u64,
+    /// how many sums each result holds: the units' down projections', the chains' last projections', the plain weights'
+    lens: [Vec<usize>; 3],
+}
+
+impl Pending {
+    /// The call's results, waited for: each unit's down sums, each chain's last projection's, the plain weights'.
+    pub fn finish(self) -> (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<f32>>) {
+        let Pending { gpu, arena, bytes, lens } = self;
+        let waiting = std::time::Instant::now();
+        let raw = gpu.map_read_soon(&arena.staging, bytes);
+        crate::profile::add(&crate::profile::DENSE_WAIT, waiting);
+        let mut at = 0usize;
+        let mut take = |n: &usize| -> Vec<f32> {
+            let v = raw[at..at + n * 4].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            at += n * 4;
+            v
+        };
+        let [downs, thens, sums] = lens.map(|of| of.iter().map(&mut take).collect::<Vec<Vec<f32>>>());
+        // the arena back for the next call (let go if one came back before it)
+        gpu.dense_arena.lock().unwrap_or_else(|p| p.into_inner()).get_or_insert(arena);
+        (downs, thens, sums)
+    }
+}
+
+/// One submit through the device's [`Arena`], left [`Pending`]: `plain` weights against one row each, `units`
+/// ([`forward_units`]) and `chains` ([`forward_chained`]). The inputs go one after another (each once, however many
+/// weights take it), then each unit's activation and each chain's row, which the stages write; the results are each
+/// unit's gate and up sums and each chain's first sums, then what is read back: the units' down sums, the chains'
+/// last projections' and `plain`'s. Three passes: the gate, up, first and plain projections; the stages; the down and
+/// last projections. None when it does not go through an arena.
+fn arena_begin(gpu: &Arc<Gpu>, plain: &[(&DenseGpu, &[f32], Range<usize>)], units: &[Unit<'_>], chains: &[Chain<'_>], limit: f32) -> Option<Pending> {
+    if few_only() || plain.iter().any(|(_, _, rows)| rows.is_empty()) || chains.iter().any(|c| c.first.iter().any(|(_, _, rows)| rows.is_empty())) {
         return None;
     }
     let making = std::time::Instant::now();
@@ -610,23 +704,41 @@ fn arena_call(gpu: &Arc<Gpu>, plain: &[(&DenseGpu, &[f32], Range<usize>)], units
             place(u.x, u.gate.k)
         })
         .collect();
+    let chain_inputs: Vec<Vec<u32>> = chains.iter().map(|c| c.first.iter().map(|(w, x, _)| place(x, w.k)).collect()).collect();
     let plain_inputs: Vec<u32> = plain.iter().map(|(w, x, _)| place(x, w.k)).collect();
     let given = (xs.len() / 4) as u32;
-    // the inputs' buffer after what is given: each unit's activation; the results: each unit's gate and up sums, then
-    // (read back) each unit's down sums and the plain weights' sums
+    // the inputs' buffer after what is given: each unit's activation and each chain's row; the results: each unit's
+    // gate and up sums and each chain's first sums, then (read back) each unit's down sums, each chain's last
+    // projection's and the plain weights' sums
     let width: u32 = units.iter().map(|u| u.gate.n as u32).sum();
-    let kept = 2 * width;
-    let (mut first, mut stage, mut last): (Vec<Step<'_>>, Vec<[u32; 12]>, Vec<Step<'_>>) = (Vec::new(), Vec::new(), Vec::new());
+    let widths: Vec<u32> = chains.iter().map(|c| c.first.iter().map(|(_, _, rows)| rows.len() as u32).sum()).collect();
+    if chains.iter().zip(&widths).any(|(c, &w)| w as usize != c.then.k || w % 32 != 0) {
+        return None;
+    }
+    let kept = 2 * width + widths.iter().sum::<u32>();
+    // (a stage: whether it is a unit's SwiGLU, else a chain's rounding, and its parameters)
+    let (mut first, mut stage, mut last): (Vec<Step<'_>>, Vec<(bool, [u32; 12])>, Vec<Step<'_>>) = (Vec::new(), Vec::new(), Vec::new());
     let (mut act, mut sums, mut out) = (given, 0u32, kept);
     for (u, &xo) in units.iter().zip(&unit_inputs) {
         let inter = u.gate.n as u32;
         steps_of(u.gate, &(0..u.gate.n), xo, sums, &mut first);
         steps_of(u.up, &(0..u.up.n), xo, sums + inter, &mut first);
-        stage.push([sums, sums + inter, act, inter, u.weight.to_bits(), limit.to_bits(), 0, 0, 0, 0, 0, 0]);
+        stage.push((true, [sums, sums + inter, act, inter, u.weight.to_bits(), limit.to_bits(), 0, 0, 0, 0, 0, 0]));
         steps_of(u.down, &(0..u.down.n), act, out, &mut last);
         act += inter;
         sums += 2 * inter;
         out += u.down.n as u32;
+    }
+    for ((c, ins), &row) in chains.iter().zip(&chain_inputs).zip(&widths) {
+        let from = sums;
+        for ((w, _, rows), &xo) in c.first.iter().zip(ins) {
+            steps_of(w, rows, xo, sums, &mut first);
+            sums += rows.len() as u32;
+        }
+        stage.push((false, [from, 0, act, row, c.quantized as u32, 0, 0, 0, 0, 0, 0, 0]));
+        steps_of(c.then, &(0..c.then.n), act, out, &mut last);
+        act += row;
+        out += c.then.n as u32;
     }
     for ((w, _, rows), &xo) in plain.iter().zip(&plain_inputs) {
         steps_of(w, rows, xo, out, &mut first);
@@ -636,11 +748,11 @@ fn arena_call(gpu: &Arc<Gpu>, plain: &[(&DenseGpu, &[f32], Range<usize>)], units
     if act as u64 * 4 > ARENA_BYTES || out as u64 * 4 > ARENA_BYTES || dispatches > ARENA_DISPATCHES || first.is_empty() {
         return None;
     }
-    let mut slot = gpu.dense_arena.lock().unwrap_or_else(|p| p.into_inner());
-    let arena = slot.get_or_insert_with(|| Arena::new(gpu));
+    // (the device's arena taken for this call, or one made: it comes back when the call is read)
+    let mut arena = gpu.dense_arena.lock().unwrap_or_else(|p| p.into_inner()).take().unwrap_or_else(|| Arena::new(gpu));
     let step = arena.step as usize;
     let mut table = vec![0u8; dispatches * step];
-    for (i, p) in first.iter().map(|s| &s.params).chain(&stage).chain(last.iter().map(|s| &s.params)).enumerate() {
+    for (i, p) in first.iter().map(|s| &s.params).chain(stage.iter().map(|(_, p)| p)).chain(last.iter().map(|s| &s.params)).enumerate() {
         for (j, v) in p.iter().enumerate() {
             table[i * step + 4 * j..i * step + 4 * j + 4].copy_from_slice(&v.to_le_bytes());
         }
@@ -650,56 +762,58 @@ fn arena_call(gpu: &Arc<Gpu>, plain: &[(&DenseGpu, &[f32], Range<usize>)], units
     // (the pipelines and the groups first: a pass borrows them)
     let pipelines: Vec<Arc<wgpu::ComputePipeline>> =
         first.iter().chain(&last).map(|s| gpu.named_pipeline_in(one_name(s.kind), &arena.pipeline_layout, || one_shader(s.kind))).collect();
-    let swiglu = (!stage.is_empty()).then(|| gpu.named_pipeline_in("dense-swiglu", &arena.pipeline_layout, || SWIGLU.to_string()));
+    let swiglu = stage.iter().any(|(unit, _)| *unit).then(|| gpu.named_pipeline_in("dense-swiglu", &arena.pipeline_layout, swiglu_stage));
+    let round = stage.iter().any(|(unit, _)| !*unit).then(|| gpu.named_pipeline_in("dense-round", &arena.pipeline_layout, round_stage));
     for s in first.iter().chain(&last) {
         arena.group(gpu, s.buffer);
     }
-    if swiglu.is_some() {
+    if !stage.is_empty() {
         arena.stage(gpu);
     }
     let mut enc = gpu.device.create_command_encoder(&Default::default());
-    let project = |enc: &mut wgpu::CommandEncoder, steps: &[Step<'_>], pipelines: &[Arc<wgpu::ComputePipeline>], at: usize| {
-        let mut pass = enc.begin_compute_pass(&Default::default());
-        for (i, (s, pipeline)) in steps.iter().zip(pipelines).enumerate() {
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &arena.groups[s.buffer], &[((at + i) * step) as u32]);
-            pass.dispatch_workgroups(s.grid, 1, 1);
-        }
-    };
-    project(&mut enc, &first, &pipelines[..first.len()], 0);
-    if let Some(swiglu) = &swiglu {
-        {
+    {
+        let project = |enc: &mut wgpu::CommandEncoder, steps: &[Step<'_>], pipelines: &[Arc<wgpu::ComputePipeline>], at: usize| {
             let mut pass = enc.begin_compute_pass(&Default::default());
-            pass.set_pipeline(swiglu);
-            for (i, p) in stage.iter().enumerate() {
-                pass.set_bind_group(0, arena.stage.as_ref().expect("made above"), &[((first.len() + i) * step) as u32]);
-                pass.dispatch_workgroups(p[3] / 32, 1, 1);
+            for (i, (s, pipeline)) in steps.iter().zip(pipelines).enumerate() {
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &arena.groups[s.buffer], &[((at + i) * step) as u32]);
+                pass.dispatch_workgroups(s.grid, 1, 1);
             }
+        };
+        project(&mut enc, &first, &pipelines[..first.len()], 0);
+        if !stage.is_empty() {
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                for (i, (unit, p)) in stage.iter().enumerate() {
+                    let pipeline = match unit {
+                        true => swiglu.as_ref(),
+                        false => round.as_ref(),
+                    };
+                    pass.set_pipeline(pipeline.expect("made above"));
+                    pass.set_bind_group(0, arena.stage.as_ref().expect("made above"), &[((first.len() + i) * step) as u32]);
+                    pass.dispatch_workgroups(p[3] / 32, 1, 1);
+                }
+            }
+            project(&mut enc, &last, &pipelines[first.len()..], first.len() + stage.len());
         }
-        project(&mut enc, &last, &pipelines[first.len()..], first.len() + stage.len());
     }
     let bytes = (out - kept) as u64 * 4;
     enc.copy_buffer_to_buffer(&arena.y, kept as u64 * 4, &arena.staging, 0, bytes);
     crate::profile::add(&crate::profile::DENSE_MAKE, making);
-    for (w, rows) in units.iter().flat_map(|u| [(u.gate, u.gate.n), (u.up, u.up.n), (u.down, u.down.n)]).chain(plain.iter().map(|(w, _, rows)| (*w, rows.len()))) {
+    let read = units
+        .iter()
+        .flat_map(|u| [(u.gate, u.gate.n), (u.up, u.up.n), (u.down, u.down.n)])
+        .chain(chains.iter().flat_map(|c| c.first.iter().map(|(w, _, rows)| (*w, rows.len())).chain([(c.then, c.then.n)])))
+        .chain(plain.iter().map(|(w, _, rows)| (*w, rows.len())));
+    for (w, rows) in read {
         crate::profile::DENSE_BYTES[0].fetch_add(w.nbytes_of(rows), Ordering::Relaxed);
         crate::profile::DENSE_BYTES[1].fetch_add(1, Ordering::Relaxed);
     }
     let submitting = std::time::Instant::now();
     gpu.queue().submit([enc.finish()]);
     crate::profile::add(&crate::profile::DENSE_SUBMIT, submitting);
-    let waiting = std::time::Instant::now();
-    let raw = gpu.map_read_soon(&arena.staging, bytes);
-    crate::profile::add(&crate::profile::DENSE_WAIT, waiting);
-    let mut at = 0usize;
-    let mut take = |n: usize| -> Vec<f32> {
-        let v = raw[at..at + n * 4].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-        at += n * 4;
-        v
-    };
-    let downs: Vec<Vec<f32>> = units.iter().map(|u| take(u.down.n)).collect();
-    let sums: Vec<Vec<f32>> = plain.iter().map(|(_, _, rows)| take(rows.len())).collect();
-    Some((downs, sums))
+    let lens = [units.iter().map(|u| u.down.n).collect(), chains.iter().map(|c| c.then.n).collect(), plain.iter().map(|(_, _, rows)| rows.len()).collect()];
+    Some(Pending { gpu: Arc::clone(gpu), arena, bytes, lens })
 }
 
 /// A dense weight on the GPU.
@@ -934,12 +1048,18 @@ impl RecordSlots {
         self.slots.is_empty()
     }
 
-    /// Queue `record`'s upload into slot `i`: it lands before the matmuls of the next call, and starts over the link at
-    /// once (an empty submit), so one record goes up while the next is written.
+    /// `record` into slot `i`, there before the matmuls of the next call: written, submitted and waited for. A
+    /// write's staging memory is let go when its submission has run, so each record's is then the memory the one
+    /// before had; queued one behind another with no wait, as they were, every record's staging was new memory,
+    /// which the system hands over zeroed. `measure_the_upload_rate`, 32 records (604 MB), an RTX 5090 on eight
+    /// lanes: 6.4 ms a record queued together (2.9 GB a second), 0.93 ms each waited for (20 GB a second; on four
+    /// lanes 5.2 and 1.8 ms). One core's copy, as `write_buffer` makes it: a record copied on every core
+    /// ([`Gpu::write`]) was 1.26 ms, its threads' start more than the copy they shared.
     pub fn write(&self, i: usize, record: &[u8]) {
         assert_eq!(record.len(), self.record_bytes, "dense: a record of another size");
         self.gpu.queue().write_buffer(&self.slots[i], 0, record);
         self.gpu.queue().submit([]);
+        self.gpu.wait(None);
     }
 
     /// Slot `i`'s MXFP4 matrix `[n, k]`: its nibbles from byte `w` (`[n, k]`, two to a byte, low first), its e8m0 scales
@@ -1440,27 +1560,44 @@ mod tests {
         drop(held);
     }
 
-    /// What the link to the adapter carries: 32 expert-sized writes (600 MB) into buffers made once, then waited for.
+    /// What an expert's record costs to put in its slot, by the way: 32 expert-sized writes (600 MB) into buffers made
+    /// once, queued one behind another and waited for together (as [`RecordSlots::write`] did: `write_buffer`, one
+    /// core's copy); the same each waited for; and each copied on every core and waited for, as it does now. Four
+    /// rounds of each.
     #[test]
     #[ignore = "a timing; run with --nocapture"]
     fn measure_the_upload_rate() {
         let Some(b) = backend() else { return };
         let gpu = &b.gpu;
         let size = 18_874_368u64;
-        let host = vec![7u8; size as usize];
+        let host: Vec<u8> = (0..size as usize).map(|i| (i * 31 + i / 7) as u8).collect();
         let bufs: Vec<wgpu::Buffer> = (0..32)
-            .map(|_| gpu.device.create_buffer(&wgpu::BufferDescriptor { label: None, size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }))
+            .map(|_| gpu.device.create_buffer(&wgpu::BufferDescriptor { label: None, size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false }))
             .collect();
-        for round in 0..4 {
-            let t = std::time::Instant::now();
-            for buf in &bufs {
-                gpu.queue().write_buffer(buf, 0, &host);
+        for (way, what) in ["queued together, one core's copy", "each waited for, one core's copy", "each waited for, every core's copy"].iter().enumerate() {
+            for round in 0..4 {
+                let t = std::time::Instant::now();
+                for buf in &bufs {
+                    match way {
+                        0 => gpu.queue().write_buffer(buf, 0, &host),
+                        1 => {
+                            gpu.queue().write_buffer(buf, 0, &host);
+                            gpu.queue().submit([]);
+                            gpu.wait(None);
+                        }
+                        _ => {
+                            gpu.write(buf, 0, &host);
+                            gpu.queue().submit([]);
+                            gpu.wait(None);
+                        }
+                    }
+                }
+                gpu.queue().submit([]);
+                gpu.wait(None);
+                let secs = t.elapsed().as_secs_f64();
+                eprintln!("{what}, round {round}: {:.0} MB in {secs:.3} s ({:.2} GB/s, {:.2} ms a record)", 32.0 * size as f64 / 1e6, 32.0 * size as f64 / secs / 1e9, secs * 1e3 / 32.0);
             }
-            let queued = t.elapsed().as_secs_f64();
-            gpu.queue().submit([]);
-            gpu.wait(None);
-            let secs = t.elapsed().as_secs_f64();
-            eprintln!("round {round}: {:.0} MB in {secs:.3} s ({:.2} GB/s; the writes queued in {queued:.3} s)", 32.0 * size as f64 / 1e6, 32.0 * size as f64 / secs / 1e9);
+            assert_eq!(gpu.read(&bufs[31], size), host, "{what}: the last buffer holds the record");
         }
     }
 }

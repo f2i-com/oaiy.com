@@ -32,6 +32,9 @@ pub struct Experts {
     /// The row kernel a prompt's experts on the CPU run through (`pool`'s is its own): the portable one unless a
     /// caller chose this CPU's ([`crate::model::Model::set_expert_row_kernel`]).
     pub kernel: crate::cpu_experts::RowKernel,
+    /// The kernel a prompt's experts on the CPU run through, all of an expert's tokens at once: the portable one
+    /// unless a caller chose this CPU's ([`crate::model::Model::set_expert_tokens_kernel`]).
+    pub tokens: crate::cpu_experts::TokensKernel,
     /// Every routed expert's uses of late: what the tiers are ordered by.
     pub uses: Uses,
 }
@@ -171,9 +174,16 @@ impl Experts {
     }
 }
 
-/// Tokens of a prompt an expert needs before a GPU is worth its record's upload (18.8 MB): with fewer, the CPU's
-/// matmuls of a few rows are quicker than the copy.
+/// Tokens of a prompt an expert needs before a GPU may take it from the CPU's workers (its record's upload is 18.8 MB):
+/// with fewer, a worker's matmuls of a few rows are quicker than the copy.
 pub const GPU_MIN_ROWS: usize = 8;
+
+/// [`GPU_MIN_ROWS`], or what OAIY_DSV41_GPU_MIN_ROWS says (a measurement's: where the CPU's workers and a card's
+/// uploads balance on a machine).
+fn gpu_min_rows() -> usize {
+    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ROWS.get_or_init(|| std::env::var("OAIY_DSV41_GPU_MIN_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(GPU_MIN_ROWS))
+}
 /// Experts a GPU takes in one call: their records' upload bounded (about 600 MB), the matmuls a stage's round trip.
 pub const GPU_GROUP: usize = 32;
 /// Threads reading a layer's expert records from the drive at once.
@@ -194,19 +204,28 @@ impl Moe {
     }
 }
 
-/// `ids`' records, in order, read on up to [`READERS`] threads at once.
-fn read_all(ids: &[u32], acquire: &(dyn Fn(u32) -> Result<HostLease> + Sync)) -> Result<Vec<HostLease>> {
-    if ids.len() <= 1 {
+/// `ids`' records, in order: those `there` (in the RAM tier) taken on this thread, the rest read on up to [`READERS`]
+/// threads at once. A decode step's are nearly all there, and a thread started for each cost more than taking it (75 us
+/// a layer, 3 ms a token); one alone to read is read here too.
+fn read_all(ids: &[u32], there: &dyn Fn(u32) -> bool, acquire: &(dyn Fn(u32) -> Result<HostLease> + Sync)) -> Result<Vec<HostLease>> {
+    let missing: Vec<usize> = (0..ids.len()).filter(|&i| !there(ids[i])).collect();
+    if missing.len() <= 1 {
         return ids.iter().map(|&e| acquire(e)).collect();
     }
-    let readers = READERS.min(ids.len());
-    let got: Vec<Result<HostLease>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..readers).map(|r| scope.spawn(move || (r..ids.len()).step_by(readers).map(|i| (i, acquire(ids[i]))).collect::<Vec<_>>())).collect();
-        let mut all: Vec<(usize, Result<HostLease>)> = handles.into_iter().flat_map(|h| h.join().expect("an expert reader panicked")).collect();
-        all.sort_by_key(|(i, _)| *i);
-        all.into_iter().map(|(_, r)| r).collect()
+    let readers = READERS.min(missing.len());
+    let mut got: Vec<Option<Result<HostLease>>> = (0..ids.len()).map(|_| None).collect();
+    std::thread::scope(|scope| {
+        let missing = &missing;
+        let handles: Vec<_> =
+            (0..readers).map(|r| scope.spawn(move || (r..missing.len()).step_by(readers).map(|m| (missing[m], acquire(ids[missing[m]]))).collect::<Vec<_>>())).collect();
+        for i in (0..ids.len()).filter(|i| !missing.contains(i)) {
+            got[i] = Some(acquire(ids[i]));
+        }
+        for (i, record) in handles.into_iter().flat_map(|h| h.join().expect("an expert reader panicked")) {
+            got[i] = Some(record);
+        }
     });
-    got.into_iter().collect()
+    got.into_iter().map(|record| record.expect("every record asked for")).collect()
 }
 
 /// Routed experts one token was sent to, with their weights.
@@ -314,48 +333,61 @@ impl Moe {
                 let held = gpu.map_or_else(|| vec![false; used.len()], |g| g.holds(self.layer, &used, &vec![1; used.len()]));
                 let (there, here): (Vec<usize>, Vec<usize>) = (0..used.len()).partition(|&j| held[j]);
                 let mut outs: Vec<Vec<f32>> = vec![Vec::new(); used.len()];
-                std::thread::scope(|scope| -> Result<()> {
-                    let device = gpu.filter(|_| !there.is_empty()).map(|gpu| {
-                        let (there, weights, used) = (&there, &weights, &used);
-                        scope.spawn(move || {
-                            let w: Vec<[f32; 1]> = there.iter().map(|&j| [weights[j]]).collect();
-                            let jobs: Vec<(u32, &[f32], &[f32])> = there.iter().zip(&w).map(|(&j, w)| (used[j], x, &w[..])).collect();
-                            let computing = std::time::Instant::now();
-                            let got = gpu.forward_held(self.layer, &jobs, cfg.swiglu_limit);
-                            crate::profile::add(crate::profile::Part::ExpertGpu, computing);
-                            got
-                        })
-                    });
-                    let ids: Vec<u32> = here.iter().map(|&j| used[j]).collect();
-                    let reading = std::time::Instant::now();
-                    let leases = read_all(&ids, &acquire)?;
-                    crate::profile::add(crate::profile::Part::ExpertRead, reading);
-                    if !here.is_empty() {
-                        let records: Vec<_> = leases.iter().map(|l| l.to_arc()).collect();
-                        let w: Vec<f32> = here.iter().map(|&j| weights[j]).collect();
-                        let computing = std::time::Instant::now();
-                        for (&j, out) in here.iter().zip(pool.forward(&records, &w, x, cfg.swiglu_limit)) {
-                            outs[j] = out;
-                        }
-                        crate::profile::add(crate::profile::Part::ExpertCpu, computing);
+                // The device's experts are begun and later taken, the rest read and computed by the workers meanwhile:
+                // no thread is started for the device (one was each layer, and one more for each card past the first:
+                // some 60 us each to start and as much to join). Which is begun first is what hides the other: with a
+                // record to read from the drive, the device's (the read is milliseconds); with all of them in RAM,
+                // the workers', and the device's calls are made beside their matmuls.
+                let begin = || {
+                    gpu.filter(|_| !there.is_empty()).map(|gpu| {
+                        let w: Vec<[f32; 1]> = there.iter().map(|&j| [weights[j]]).collect();
+                        let jobs: Vec<(u32, &[f32], &[f32])> = there.iter().zip(&w).map(|(&j, w)| (used[j], x, &w[..])).collect();
+                        let beginning = std::time::Instant::now();
+                        let finish = gpu.begin_held(self.layer, &jobs, cfg.swiglu_limit);
+                        (finish, beginning.elapsed())
+                    })
+                };
+                let ids: Vec<u32> = here.iter().map(|&j| used[j]).collect();
+                let to_read = ids.iter().any(|&e| !experts.cache.probe(self.layer, e));
+                let mut device = if to_read { begin() } else { None };
+                let reading = std::time::Instant::now();
+                let leases = read_all(&ids, &|e| experts.cache.probe(self.layer, e), &acquire)?;
+                crate::profile::add(crate::profile::Part::ExpertRead, reading);
+                let computing = std::time::Instant::now();
+                let workers = (!here.is_empty()).then(|| {
+                    let (tx, rx) = mpsc::channel();
+                    let records: Vec<_> = leases.iter().map(|l| l.to_arc()).collect();
+                    let w: Vec<f32> = here.iter().map(|&j| weights[j]).collect();
+                    pool.spawn(records, w, x.to_vec(), cfg.swiglu_limit, Box::new(move |out| drop(tx.send(out))));
+                    rx
+                });
+                if !to_read {
+                    device = begin();
+                }
+                if let Some(rx) = workers {
+                    let made = rx.recv().expect("CPU expert job answered").expect("CPU expert job");
+                    for (&j, out) in here.iter().zip(made) {
+                        outs[j] = out;
                     }
-                    if let Some(device) = device {
-                        for (&j, out) in there.iter().zip(device.join().expect("the GPU's experts panicked")) {
-                            outs[j] = out;
-                        }
+                    crate::profile::add(crate::profile::Part::ExpertCpu, computing);
+                }
+                if let Some((finish, begun)) = device {
+                    let finishing = std::time::Instant::now();
+                    for (&j, out) in there.iter().zip(finish()) {
+                        outs[j] = out;
                     }
-                    // What the GPU takes in leaves the RAM tier (once the leases are gone): the two hold different
-                    // experts, so between them more.
-                    let taken = gpu.map_or_else(Vec::new, |gpu| {
-                        let read: Vec<(u32, &[u8])> = ids.iter().zip(&leases).map(|(&e, l)| (e, &**l)).collect();
-                        gpu.offer(self.layer, &read)
-                    });
-                    drop(leases);
-                    for e in taken {
-                        experts.cache.remove(self.layer, e);
-                    }
-                    Ok(())
-                })?;
+                    crate::profile::add_spent(crate::profile::Part::ExpertGpu, begun + finishing.elapsed());
+                }
+                // What the GPU takes in leaves the RAM tier (once the leases are gone): the two hold different
+                // experts, so between them more.
+                let taken = gpu.map_or_else(Vec::new, |gpu| {
+                    let read: Vec<(u32, &[u8])> = ids.iter().zip(&leases).map(|(&e, l)| (e, &**l)).collect();
+                    gpu.offer(self.layer, &read)
+                });
+                drop(leases);
+                for e in taken {
+                    experts.cache.remove(self.layer, e);
+                }
                 outs.into_iter().map(|out| (vec![0], out)).collect()
             }
             // A prompt: each expert's tokens as one batch. The records are handed over as they land, the busy experts'
@@ -401,10 +433,15 @@ impl Moe {
     }
 
     /// A prompt's routed experts, each expert `used[j]` on its tokens' rows `gathered[j]`: its outputs, in `used`'s
-    /// order. Readers fetch the records (the busy experts' first, so the GPU's groups start while the rest are read) and
-    /// hand each over as it lands; this thread sends a group of busy ones to the GPU whenever a group's worth is in, and
-    /// the rest to workers on the CPU's threads. The outputs are the ones each expert alone gives, whatever the order
-    /// they are made in (a GPU's group or a worker computes each expert by itself).
+    /// order. What a GPU holds it computes, and nobody reads. The rest are read (most tokens first) into one queue
+    /// kept by their tokens, and taken from both ends as hands come free: the CPU's workers the fewest tokens' (an
+    /// expert's tokens all at once through the tokens kernel, each worker its own thread's), the GPU, once it has
+    /// made what it holds, the most tokens' a group at a time ([`GPU_MIN_ROWS`] tokens or more: under that the upload
+    /// costs more than a worker's matmuls). So the two work at once and share the experts by what each gets
+    /// through, whatever the machine: with no GPU the workers take all, and a GPU beside few cores takes most.
+    /// Before, the busy ones were the GPU's whatever the workers had to do, and what it held was made before a
+    /// worker was given anything: a 276-token prompt's experts were 9.5 s on a card with every core idle. The
+    /// outputs are the ones each expert alone gives, whatever makes them and in whatever order.
     fn prompt_experts(
         &self,
         cfg: &Config,
@@ -413,42 +450,76 @@ impl Moe {
         gathered: &[(Vec<usize>, Vec<f32>, Vec<f32>)],
         acquire: &(dyn Fn(u32) -> Result<HostLease> + Sync),
     ) -> Result<Vec<Vec<f32>>> {
+        /// What has been read and nobody has taken (fewest tokens first), how many records are still to land, and
+        /// the first read that failed.
+        struct Landed<E> {
+            ready: std::collections::VecDeque<(usize, HostLease)>,
+            left: usize,
+            failed: Option<E>,
+        }
         let n = used.len();
         let gpu = experts.gpu.as_ref();
         let tokens: Vec<usize> = gathered.iter().map(|g| g.0.len()).collect();
-        // What the GPU keeps is computed there and not read; of the rest, the busy experts go to it a group at a time.
         let held = gpu.map_or_else(|| vec![false; n], |g| g.holds(self.layer, used, &tokens));
-        let busy: Vec<bool> = (0..n).map(|j| !held[j] && gpu.is_some() && tokens[j] >= GPU_MIN_ROWS).collect();
-        let order: Vec<usize> = (0..n).filter(|&j| busy[j]).chain((0..n).filter(|&j| !busy[j] && !held[j])).collect();
-        let light = order.iter().filter(|&&j| !busy[j]).count();
-        let threads = if experts.pool.is_some() { std::thread::available_parallelism().map_or(1, |n| n.get()) } else { 1 };
-        let mut done: Vec<Option<Vec<f32>>> = (0..n).map(|_| None).collect();
-        let mut failed = None;
-        let (got_tx, got_rx) = mpsc::channel::<(usize, Result<HostLease>)>();
+        let mut order: Vec<usize> = (0..n).filter(|&j| !held[j]).collect();
+        order.sort_by_key(|&j| std::cmp::Reverse(tokens[j]));
+        // (workers on every hardware thread but two where a GPU works beside them: the thread that drives it quantizes
+        // its rows and makes their SwiGLU between its calls, and on a core it shared with a worker what the GPU held
+        // took 5.8 s of a 276-token prompt where 3.5)
+        let all = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let threads = if experts.pool.is_none() { 1 } else if gpu.is_some() { all.saturating_sub(2).max(1) } else { all };
+        let floor = gpu_min_rows();
+        let state = Mutex::new(Landed { ready: std::collections::VecDeque::new(), left: order.len(), failed: None });
+        let landed = std::sync::Condvar::new();
         let next = AtomicUsize::new(0);
-        let (work_tx, work_rx) = mpsc::channel::<(usize, HostLease)>();
-        let work_rx = Mutex::new(work_rx);
+        let mut done: Vec<Option<Vec<f32>>> = (0..n).map(|_| None).collect();
         let (out_tx, out_rx) = mpsc::channel::<(usize, Vec<f32>)>();
         std::thread::scope(|scope| {
-            for _ in 0..READERS.min(n) {
-                let (tx, order, next) = (got_tx.clone(), &order, &next);
+            let (state, landed, order, next, tokens) = (&state, &landed, &order, &next, &tokens);
+            for _ in 0..READERS.min(order.len()) {
                 scope.spawn(move || {
                     while let Some(&j) = order.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        if tx.send((j, acquire(used[j]))).is_err() {
-                            break;
+                        let record = acquire(used[j]);
+                        let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+                        s.left -= 1;
+                        match record {
+                            Ok(record) => {
+                                let at = s.ready.partition_point(|(i, _)| tokens[*i] <= tokens[j]);
+                                s.ready.insert(at, (j, record));
+                            }
+                            Err(e) => {
+                                s.failed.get_or_insert(e);
+                            }
                         }
+                        drop(s);
+                        landed.notify_all();
                     }
                 });
             }
-            drop(got_tx);
-            let kernel = experts.kernel;
-            for _ in 0..threads.min(light) {
-                let (work_rx, out_tx) = (&work_rx, out_tx.clone());
+            let (row_kernel, tokens_kernel) = (experts.kernel, experts.tokens);
+            for _ in 0..threads.min(order.len()) {
+                let out_tx = out_tx.clone();
                 scope.spawn(move || loop {
-                    let job = work_rx.lock().unwrap_or_else(|p| p.into_inner()).recv();
-                    let Ok((j, record)) = job else { break };
-                    // (each worker its own thread's: the row kernel, not the matmul that starts threads of its own)
-                    let out = crate::expert::expert_forward_rows(kernel, &record, &gathered[j].1, Some(&gathered[j].2), cfg.swiglu_limit);
+                    let job = {
+                        let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+                        loop {
+                            if let Some(job) = s.ready.pop_front() {
+                                break Some(job);
+                            }
+                            if s.left == 0 {
+                                break None;
+                            }
+                            s = landed.wait(s).unwrap_or_else(|p| p.into_inner());
+                        }
+                    };
+                    let Some((j, record)) = job else { break };
+                    // (one token: the row kernel, which decodes nothing it does not multiply at once)
+                    let (x, w) = (&gathered[j].1, &gathered[j].2);
+                    let out = if w.len() == 1 {
+                        crate::expert::expert_forward_rows(row_kernel, &record, x, Some(w), cfg.swiglu_limit)
+                    } else {
+                        crate::expert::expert_forward_tokens(tokens_kernel, &record, x, Some(w), cfg.swiglu_limit)
+                    };
                     if out_tx.send((j, out)).is_err() {
                         break;
                     }
@@ -466,51 +537,48 @@ impl Moe {
                         done[j] = Some(out);
                     }
                 }
-            }
-            let mut group: Vec<(usize, HostLease)> = Vec::with_capacity(GPU_GROUP);
-            let on_gpu = |group: &mut Vec<(usize, HostLease)>, done: &mut Vec<Option<Vec<f32>>>| {
-                let Some(gpu) = gpu else { return };
-                let jobs: Vec<crate::expert::ExpertJob<'_>> =
-                    group.iter().map(|(j, record)| crate::expert::ExpertJob { record, x: &gathered[*j].1, weights: &gathered[*j].2 }).collect();
-                let computing = std::time::Instant::now();
-                let got = gpu.forward(&jobs, cfg.swiglu_limit);
-                crate::profile::add(crate::profile::Part::ExpertGpu, computing);
-                for ((j, _), out) in group.drain(..).zip(got) {
-                    done[j] = Some(out);
-                }
-            };
-            loop {
-                let waiting = std::time::Instant::now();
-                let Ok((j, record)) = got_rx.recv() else { break };
-                crate::profile::add(crate::profile::Part::ExpertRead, waiting);
-                match record {
-                    Err(e) => {
-                        failed.get_or_insert(e);
-                    }
-                    Ok(record) if busy[j] => {
-                        group.push((j, record));
-                        if group.len() == GPU_GROUP {
-                            on_gpu(&mut group, &mut done);
+                // then the most tokens' of what has landed, a group at a time, until nothing of its kind is left
+                loop {
+                    let group: Vec<(usize, HostLease)> = {
+                        let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+                        loop {
+                            let mine = s.ready.iter().rev().take_while(|(j, _)| tokens[*j] >= floor).count().min(GPU_GROUP);
+                            if mine > 0 {
+                                let at = s.ready.len() - mine;
+                                break s.ready.split_off(at).into_iter().collect();
+                            }
+                            if s.left == 0 {
+                                break Vec::new();
+                            }
+                            let waiting = std::time::Instant::now();
+                            s = landed.wait(s).unwrap_or_else(|p| p.into_inner());
+                            crate::profile::add(crate::profile::Part::ExpertRead, waiting);
                         }
+                    };
+                    if group.is_empty() {
+                        break;
                     }
-                    Ok(record) => {
-                        let _ = work_tx.send((j, record));
+                    let jobs: Vec<crate::expert::ExpertJob<'_>> =
+                        group.iter().map(|(j, record)| crate::expert::ExpertJob { record, x: &gathered[*j].1, weights: &gathered[*j].2 }).collect();
+                    let computing = std::time::Instant::now();
+                    let got = gpu.forward(&jobs, cfg.swiglu_limit);
+                    crate::profile::add(crate::profile::Part::ExpertGpu, computing);
+                    for ((j, _), out) in group.iter().zip(got) {
+                        done[*j] = Some(out);
                     }
                 }
             }
-            if !group.is_empty() {
-                on_gpu(&mut group, &mut done);
-            }
-            drop(work_tx);
             let waiting = std::time::Instant::now();
+            let mut made = 0usize;
             for (j, out) in out_rx {
                 done[j] = Some(out);
+                made += 1;
             }
-            if light > 0 {
+            if made > 0 {
                 crate::profile::add(crate::profile::Part::ExpertCpu, waiting);
             }
         });
-        if let Some(e) = failed {
+        if let Some(e) = state.into_inner().unwrap_or_else(|p| p.into_inner()).failed {
             return Err(e);
         }
         Ok(done.into_iter().map(|o| o.expect("every expert computed")).collect())

@@ -78,6 +78,13 @@ pub fn add(part: Part, start: Instant) {
     CALLS[i].fetch_add(1, Ordering::Relaxed);
 }
 
+/// [`add`] for a call whose time is `spent` (made of pieces timed apart: a call begun, and finished later).
+pub fn add_spent(part: Part, spent: std::time::Duration) {
+    let i = part.index();
+    NANOS[i].fetch_add(spent.as_nanos() as u64, Ordering::Relaxed);
+    CALLS[i].fetch_add(1, Ordering::Relaxed);
+}
+
 /// Every part's seconds and calls since the last `take`, and reset them.
 pub fn take() -> Vec<(Part, f64, u64)> {
     PARTS

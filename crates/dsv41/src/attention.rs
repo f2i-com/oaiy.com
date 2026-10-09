@@ -397,6 +397,14 @@ impl Attention {
         let (g, gd, orank) = (cfg.o_groups, nh * hd / cfg.o_groups, cfg.o_lora_rank);
         let mut og = vec![0.0f32; t * g * orank];
         let xgs: Vec<Vec<f32>> = (0..g).map(|grp| (0..t).flat_map(|i| o[(i * g + grp) * gd..(i * g + grp + 1) * gd].iter().copied()).collect()).collect();
+        // A decode step's two projections in one call where a device holds both, the groups' row rounded there (the
+        // second was a round trip of its own, a layer).
+        if t == 1 {
+            let first: Vec<(&Weight, &[f32], std::ops::Range<usize>)> = xgs.iter().enumerate().map(|(grp, xg)| (&self.wo_a, xg.as_slice(), grp * orank..(grp + 1) * orank)).collect();
+            if let Some(y) = crate::linear::chained_together(&first, &self.wo_b, Out::Bf16) {
+                return Ok(y);
+            }
+        }
         let groups: Vec<(&Weight, &[f32], usize, std::ops::Range<usize>, Out)> =
             xgs.iter().enumerate().map(|(grp, xg)| (&self.wo_a, xg.as_slice(), t, grp * orank..(grp + 1) * orank, Out::Bf16)).collect();
         for (grp, yg) in crate::linear::forward_together(&groups).into_iter().enumerate() {

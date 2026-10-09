@@ -135,6 +135,7 @@ impl Model {
                 // Every hardware thread for the routed experts (a decode step's at once, a prompt's spread out).
                 pool: Some(crate::cpu_experts::CpuExperts::new(0)),
                 kernel: crate::cpu_experts::fp4_rows,
+                tokens: crate::cpu_experts::fp4_tokens,
                 gpu: None,
                 store: Arc::new(store),
                 cache: Ecache::new(opts.expert_cache_bytes, RECORD_BYTES, CachePolicy::Lfru),
@@ -372,6 +373,12 @@ impl Model {
     pub fn set_expert_row_kernel(&mut self, kernel: crate::cpu_experts::RowKernel) {
         self.experts.pool = Some(crate::cpu_experts::CpuExperts::with_kernel(0, kernel));
         self.experts.kernel = kernel;
+    }
+
+    /// Run a prompt's routed experts on the CPU through `kernel` (all of an expert's tokens at once), as
+    /// [`Self::set_expert_row_kernel`] sets a decode step's: `dsv41-simd` picks this CPU's. The same bits each.
+    pub fn set_expert_tokens_kernel(&mut self, kernel: crate::cpu_experts::TokensKernel) {
+        self.experts.tokens = kernel;
     }
 
     /// Have a prompt's busy routed experts' matmuls made by `kernel` (a GPU's: see [`crate::moe::Experts::gpu`]).
