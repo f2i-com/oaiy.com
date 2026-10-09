@@ -469,10 +469,12 @@ kbd { display: inline-block; padding: 1px 6px; border: 1px solid var(--border); 
 .session-switch[hidden] { display: none; }
 .session-switch .session-picker { flex: 1; }
 /* A person's conversation: their contact, beside who is on screen. */
-.convo-contact { flex: none; display: inline-flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-width: 58px; padding: 4px 8px; border: 1px solid var(--border); border-radius: var(--r-card); background: var(--surface-soft); color: var(--muted); font-size: 11px; font-weight: 600; }
-.convo-contact .icon { width: 15px; height: 15px; }
-.convo-contact:hover:not(:disabled), .convo-contact[aria-expanded='true'] { border-color: var(--strong-border); background: var(--panel-2); color: var(--text); }
-.convo-contact[hidden] { display: none; }
+.convo-contact, .convo-block { flex: none; display: inline-flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-width: 58px; padding: 4px 8px; border: 1px solid var(--border); border-radius: var(--r-card); background: var(--surface-soft); color: var(--muted); font-size: 11px; font-weight: 600; }
+.convo-contact .icon, .convo-block .icon { width: 15px; height: 15px; }
+.convo-contact:hover:not(:disabled), .convo-contact[aria-expanded='true'], .convo-block:hover:not(:disabled) { border-color: var(--strong-border); background: var(--panel-2); color: var(--text); }
+.convo-contact[hidden], .convo-block[hidden] { display: none; }
+/* Their number on the phone's blocked list: said in the button itself. */
+.convo-block[aria-pressed='true'], .convo-block[aria-pressed='true']:hover:not(:disabled) { border-color: color-mix(in srgb, var(--err) 45%, var(--border)); background: var(--err-soft); color: var(--err); }
 .contact-pop { position: absolute; top: calc(100% + 6px); right: 10px; z-index: 41; width: min(340px, calc(100% - 20px)); max-height: min(440px, 64vh); overflow-y: auto; overscroll-behavior: contain; padding: 12px 14px; background: var(--panel); border: 1px solid var(--border); border-radius: calc(var(--r-card) + 1px); box-shadow: var(--shadow); }
 .contact-head { display: flex; align-items: center; gap: 10px; }
 .contact-avatar { display: grid; place-items: center; width: 30px; height: 30px; flex: none; border-radius: 50%; background: var(--primary-soft); color: var(--accent); }

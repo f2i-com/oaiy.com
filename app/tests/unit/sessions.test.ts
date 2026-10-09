@@ -229,6 +229,27 @@ describe('text-message conversations', () => {
     for (const text of ['Thanks.See you at 3', 'It cost $4.50', 'e.g. tomorrow', 'Call me on 0400 000 000', 'ok', 'my email is sam@example.com', 'sam.smith@example.com.au', 'the file is notes.txt', 'I use node.js']) expect(hasLink(text), text).toBe(false);
   });
 
+  it('the list of conversations says who is blocked and who is not answered, and follows the blocked list as it changes', async () => {
+    fakeProvider('openai', []);
+    let blocked = '0400 000 021';
+    const { sessions } = setup({ answer: true, instructions: '' }, fakeDesktop(), { screening: async () => ({ acceptPattern: '', blockedNumbers: blocked, rejectPrivate: false }) });
+    await sessions.textArrived('+61400000021', '', 'Hi');
+    await sessions.textArrived('+61400000022', '', 'Your parcel is held: track-it.example.info/9');
+    await sessions.textArrived('Missed calls', '', 'You missed 1 call.');
+    const about = (key: string) => sessions.unanswered(sessions.threads().find((t) => t.key === key)!);
+    expect(about('+61400000021')).toEqual({ blocked: true, why: 'Blocked' });
+    expect(about('+61400000022')).toEqual({ blocked: false, why: 'Not answered (opened with a link)' });
+    expect(about('Missed calls')).toEqual({ blocked: false, why: "Not answered (not a person's number)" });
+    // Taken off the list (the conversation's Block button, pressed again): said once the list is read again.
+    blocked = '';
+    await sessions.refreshBlocked();
+    expect(about('+61400000021')).toEqual({ blocked: false, why: '' });
+    // Put on it: the one with the link is now blocked, which is said first.
+    blocked = '+61 400 000 022';
+    await sessions.refreshBlocked();
+    expect(about('+61400000022')).toEqual({ blocked: true, why: 'Blocked' });
+  });
+
   it('a pretend text is answered but never sent', async () => {
     fakeProvider('openai', [{ calls: [{ name: 'send_text_message', input: { body: 'We are open.' } }] }, { text: 'done' }]);
     const { sessions, desktop, events } = setup({ answer: false, instructions: '' });

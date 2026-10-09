@@ -97,6 +97,9 @@ const contacts = new Map([
 const posted = [];
 /** Every MCP request: its method, its session header, the tool and its arguments. */
 const mcp = [];
+/** The phone's settings as the bridge keeps them (who is answered), and each change of its blocked numbers. */
+const phoneSettings = {};
+const blockedSet = [];
 const voiceClients = new Set();
 let liveCalls = [];
 const desktopServer = createHttpServer(async (req, res) => {
@@ -128,8 +131,12 @@ const desktopServer = createHttpServer(async (req, res) => {
   if (path === '/api/bridge/events') return json({ events: [], next: 0 });
   if (path.startsWith('/api/bridge/leases/')) return json({ granted: true, holder: (JSON.parse(body || '{}').holder ?? '') });
   if (path.startsWith('/api/bridge/connectors/')) {
-    const { command } = JSON.parse(body || '{}');
-    return json({ ok: true, result: { ok: true, data: command === 'phone.status' ? { connected: true } : command === 'settings.get' ? { value: '' } : {} } });
+    const { command, payload } = JSON.parse(body || '{}');
+    if (command === 'settings.set') {
+      Object.assign(phoneSettings, payload ?? {});
+      if (payload && 'blockedNumbers' in payload) blockedSet.push(payload.blockedNumbers);
+    }
+    return json({ ok: true, result: { ok: true, data: command === 'phone.status' ? { connected: true } : command === 'settings.get' ? { value: phoneSettings[payload?.key] ?? '' } : {} } });
   }
   if (path === '/api/bridge/flows') return json({ flows: [] });
   if (path === '/api/plugins') return json({ plugins: [{ id: 'aokie', state: 'running' }] });
@@ -365,6 +372,53 @@ try {
   voice({ type: 'call.ended', callId: 'live-1' });
   liveCalls = [];
   await wait(500);
+
+  const liamRow = (p) => p.evaluate(() => [...document.querySelectorAll('.chat .combo-option')].find((o) => o.querySelector('.combo-name')?.textContent === 'Liam')?.textContent ?? '');
+  const blockButton = (p) => p.evaluate(() => {
+    const b = document.querySelector('.chat .convo-block');
+    return { visible: !!b && !b.hidden && b.getBoundingClientRect().width > 0, text: b?.textContent ?? '', pressed: b?.getAttribute('aria-pressed') ?? '' };
+  });
+  await check('"Block" in his conversation puts his number on the phone\'s blocked list (asked first), the list of conversations says so, and the same button takes it off', async () => {
+    await openPicker(page);
+    await page.waitForFunction(() => [...document.querySelectorAll('.chat .combo-option .combo-name')].some((n) => n.textContent === 'Liam'), { timeout: 10_000 });
+    await page.evaluate(() => [...document.querySelectorAll('.chat .combo-option')].find((o) => o.querySelector('.combo-name')?.textContent === 'Liam')?.click());
+    await wait(400);
+    let b = await blockButton(page);
+    expect(b.visible && b.text === 'Block' && b.pressed === 'false', JSON.stringify(b));
+    await page.click('.chat .convo-block');
+    await page.waitForSelector('dialog.modal[open]', { timeout: 10_000 });
+    const asked = await page.evaluate(() => document.querySelector('dialog.modal[open]').textContent ?? '');
+    expect(/Block Liam/.test(asked) && /will not answer their calls or texts/.test(asked), asked);
+    // Nothing is changed before the answer.
+    expect(!blockedSet.length, JSON.stringify(blockedSet));
+    await page.click('dialog.modal[open] button.primary');
+    for (let i = 0; i < 50 && (await blockButton(page)).text !== 'Blocked'; i++) await wait(100);
+    b = await blockButton(page);
+    expect(b.text === 'Blocked' && b.pressed === 'true', JSON.stringify(b));
+    expect(blockedSet.length === 1 && blockedSet[0] === '+61491570006', JSON.stringify(blockedSet));
+    await openPicker(page);
+    const row = await liamRow(page);
+    expect(/Blocked/.test(row), row);
+    await page.keyboard.press('Escape');
+    await wait(200);
+  });
+  await shoot(page, 'blocked');
+  await check('pressed again, the same button takes the number off the list (asked first)', async () => {
+    await page.click('.chat .convo-block');
+    await page.waitForSelector('dialog.modal[open]', { timeout: 10_000 });
+    const asked = await page.evaluate(() => document.querySelector('dialog.modal[open]').textContent ?? '');
+    expect(/Unblock Liam/.test(asked), asked);
+    await page.click('dialog.modal[open] button.primary');
+    for (let i = 0; i < 50 && (await blockButton(page)).text !== 'Block'; i++) await wait(100);
+    const b = await blockButton(page);
+    expect(b.text === 'Block' && b.pressed === 'false', JSON.stringify(b));
+    expect(blockedSet.length === 2 && blockedSet[1] === '', JSON.stringify(blockedSet));
+    await openPicker(page);
+    const row = await liamRow(page);
+    expect(!!row && !/Blocked/.test(row), row);
+    await page.keyboard.press('Escape');
+  });
+
   await check('the page raised no errors', async () => {
     expect(!pageErrors.length, pageErrors.join('; '));
   });

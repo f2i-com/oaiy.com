@@ -2171,9 +2171,22 @@ export class Sessions {
     return this.blocked;
   }
 
-  /** The blocked list read now, before something that goes by it as last read (`answerWaiting`). */
+  /** The blocked list read now, before something that goes by it as last read (`answerWaiting`, the list of conversations). */
   async refreshBlocked(): Promise<void> {
     await this.readBlocked();
+  }
+
+  /**
+   * For the list of conversations: whether a person's number is on the phone's
+   * blocked list (as last read: the page's Block button undoes it), and in a few
+   * words why their texts are not answered ('' when they are).
+   */
+  unanswered(thread: Thread): { blocked: boolean; why: string } {
+    if (thread.kind !== 'person' || thread.key === TEST_NUMBER) return { blocked: false, why: '' };
+    if (!thread.hidden && isBlocked(thread.key, this.blocked)) return { blocked: true, why: 'Blocked' };
+    if (!thread.sms) return { blocked: false, why: '' };
+    if (!isPersonNumber(thread.sms.key)) return { blocked: false, why: "Not answered (not a person's number)" };
+    return { blocked: false, why: this.notAnswered(thread.sms) ? 'Not answered (opened with a link)' : '' };
   }
 
   /**

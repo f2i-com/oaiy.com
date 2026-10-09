@@ -38,6 +38,10 @@ export interface ConversationTab {
   hidden?: boolean;
   /** A person's: where they are on an outreach list ("Outreach · texted, waiting for a reply"), shown in place of the ways. */
   outreach?: string;
+  /** A person's: their number is on the phone's blocked list (not answered, rung or texted). */
+  blocked?: boolean;
+  /** A person's: why the receptionist does not answer them ("Blocked", "Not answered (opened with a link)"), said before the ways. */
+  quiet?: string;
 }
 
 export type ConversationKind = 'project' | 'runner' | 'setup' | 'person' | 'call' | 'sms' | 'task';
@@ -88,7 +92,9 @@ export function conversationDetail(tab: ConversationTab, forButton = false): str
   if ((kind === 'sms' || kind === 'person') && key === TEST) return 'Test conversation: replies are shown, not sent';
   if ((kind === 'call' || kind === 'sms' || kind === 'person') && key) {
     const number = key !== name && !tab.hidden && /\d{4,}/.test(key) ? formatNumber(key) : '';
-    const what = kind === 'person' ? tab.outreach || waysText(tab.ways ?? []) : kind === 'call' ? 'Calls' : 'Text messages';
+    const ways = kind === 'person' ? tab.outreach || waysText(tab.ways ?? []) : kind === 'call' ? 'Calls' : 'Text messages';
+    // Someone the receptionist does not answer: said first, so a silence is not taken for a fault.
+    const what = kind === 'person' && tab.quiet ? `${tab.quiet} · ${ways}` : ways;
     return number ? `${number} · ${what}` : what;
   }
   if (kind === 'task') return 'Tasks from a flow';

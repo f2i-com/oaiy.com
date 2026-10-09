@@ -9,7 +9,7 @@ import { loadSettings, saveAgentSettings, saveDesktop, saveGate, saveLastKeptPro
 import { Desktop, type Contact } from './desktop/bridge';
 import { DesktopEvents, Sessions, TEST_NUMBER, callerNotesTool, phoneConversationsTool, tellAgentTool, type Session, type Thread } from './sessions';
 import { displayNumber, samePerson, setLocalCountry } from './phoneNumbers';
-import { Callbacks, type Screening } from './callbacks';
+import { Callbacks, isBlocked, type Screening } from './callbacks';
 import { PhoneLine } from './phoneLine';
 import { contactKey, desktopContacts } from './contacts';
 import { showContactCard, type ContactCardData } from './ui/contactCard';
@@ -362,6 +362,8 @@ async function main(): Promise<void> {
     },
     // A person's contact: the dashboard's Contacts page on them (OAIY's window), or a card here (a browser tab).
     contact: (tab, anchor) => void openContact(tab.key ?? '', tab.name ?? '', anchor),
+    // Their number onto the phone's blocked list, or off it: from their conversation, with nothing to type.
+    block: (tab) => void toggleBlocked(tab.key ?? '', tab.name ?? ''),
   });
 
   /** Stop an outreach from its card: asked first. */
@@ -756,6 +758,8 @@ async function main(): Promise<void> {
     // A call ringing in is warmed (its prompt read before it is answered) only by the page that answers the calls.
     own.answersCalls = () => holdsCalls;
     await own.load();
+    // The phone's blocked list, for the list of conversations (read again at each text, and after a change here).
+    void own.refreshBlocked().then(() => renderSessions());
     // Missed calls rung back: by the page that answers the calls, when the line is free (started with the phone).
     // (Never anyone on the do-not-contact list: they asked not to be called.)
     callbacks = new Callbacks(frontDesk, () => messages, () => desktop, () => holdsCalls && line.idle(Date.now(), own.list.some((s) => s.callId)) && !outreach?.busy, readScreening, () => {}, callsToOaiy, (number) => !!outreach?.doNotContact.some((d) => samePerson(d.number, number)), (number, purpose) => own.warmCall({ number, outbound: { purpose } }));
@@ -1793,6 +1797,8 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
         // Someone on an outreach list: where they are in it.
         const listed = t.kind === 'person' && !t.hidden ? outreach?.about(t.key) : null;
         const onList = listed ? `Outreach · ${listed.c.name} · ${personState(listed.c, listed.p).words}` : '';
+        // Someone the receptionist does not answer: said in the list, so a silence is not taken for a fault.
+        const quiet = sessions!.unanswered(t);
         return {
           id: t.id,
           kind: t.kind,
@@ -1806,7 +1812,9 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
           ...(t.kind === 'person' ? { to: t.live || t.hidden ? ('call' as const) : ('sms' as const) } : {}),
           ...(t.hidden ? { hidden: true } : {}),
           ...(listed ? { outreach: `Outreach · ${personState(listed.c, listed.p).words}` } : {}),
-          status: t.live ? (listed ? `On a call now · Outreach · ${listed.c.name}` : 'On a call now') : t.running ? 'Working…' : onList || `${what} · ${since(t.lastAt)}`,
+          ...(quiet.blocked ? { blocked: true } : {}),
+          ...(quiet.why ? { quiet: quiet.why } : {}),
+          status: t.live ? (listed ? `On a call now · Outreach · ${listed.c.name}` : 'On a call now') : t.running ? 'Working…' : onList || `${quiet.why ? `${quiet.why} · ` : ''}${what} · ${since(t.lastAt)}`,
           label: t.key === TEST_NUMBER ? '💬 Test' : `${t.kind === 'task' ? '🔀' : t.lastWay === 'sms' ? '💬' : '📞'} ${t.title}`,
           title: t.kind === 'task' ? `The tasks your flow "${t.title}" gives the agent` : `${t.live ? 'On a call with' : `${what} with`} ${t.title}${t.title !== t.key && !t.hidden ? ` (${displayNumber(t.key)})` : ''}${listed ? `, on the outreach "${listed.c.name}"` : ''}`,
           unread: t.id === viewing ? 0 : t.unread,
@@ -1866,6 +1874,46 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     const known = note?.name || (name && !/\d{4,}/.test(name) ? name : '');
     if (contact === null) return { ...base, name: known, nameBy: null, notes: '', ownerFacts: [], facts: note?.unsent ?? [], source: 'desktop', none: true };
     return { ...base, name: known, nameBy: note?.nameBy ?? null, notes: note?.notes ?? '', ownerFacts: note?.ownerFacts ?? [], facts: note?.facts ?? [], source: 'copy' };
+  }
+
+  /**
+   * A conversation's Block button: the person's number onto the phone's blocked
+   * list, or off it when it is there (asked first, either way). The list is
+   * Aokie's `blockedNumbers` (the Phone dialog's "Blocked numbers"): a number on
+   * it is not answered, rung or texted. The phone's OWN block list and spam
+   * marks do not cross Bluetooth, so this is how a number blocked on the phone
+   * is made known here.
+   */
+  async function toggleBlocked(number: string, name: string): Promise<void> {
+    if (!number) return;
+    const who = name && name !== number && name !== displayNumber(number) ? `${name} (${displayNumber(number)})` : displayNumber(number);
+    let screening: Screening | null;
+    try {
+      screening = await readScreening();
+    } catch (error) {
+      chat.system(`The phone's blocked list could not be read (${(error as Error).message}), so nothing was changed. Is the phone bridge running?`, 'error');
+      return;
+    }
+    if (!screening) {
+      chat.system("OAIY Desktop is not connected, so the phone's blocked list cannot be changed from here.", 'error');
+      return;
+    }
+    const entries = screening.blockedNumbers.split(/[,;\n]/).map((n) => n.trim()).filter(Boolean);
+    const on = isBlocked(number, screening.blockedNumbers);
+    if (on) {
+      if (!(await confirmAction({ title: `Unblock ${who}?`, message: 'The receptionist answers their calls and texts again.', ok: 'Unblock' }))) return;
+    } else if (!(await confirmAction({ title: `Block ${who}?`, message: 'The receptionist will not answer their calls or texts, and will not ring or text them. What they send is still kept here. Unblock them with the same button, or in Phone, Who is answered.', ok: 'Block', danger: true }))) return;
+    // Off the list: every entry that is this number, however it was written there.
+    const next = on ? entries.filter((entry) => !isBlocked(number, entry)) : [...entries, number];
+    try {
+      await saveScreening({ ...screening, blockedNumbers: next.join(', ') });
+    } catch (error) {
+      chat.system(`The phone did not take the change (${(error as Error).message}): ${who} is ${on ? 'still blocked' : 'not blocked'}.`, 'error');
+      return;
+    }
+    await sessions?.refreshBlocked();
+    renderSessions();
+    chat.system(on ? `${who} is unblocked: the receptionist answers them again.` : `${who} is blocked: the receptionist will not answer their calls or texts, or contact them.`);
   }
 
   /** When something last happened, as a person says it. */
@@ -2342,6 +2390,8 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       // Turned on: take the lease now (and answer what waits); turned off: give it up.
       await keepTextLease();
     }
+    // Who is answered may have changed in the dialog (its blocked numbers): the list of conversations says so.
+    void sessions?.refreshBlocked().then(() => renderSessions());
   }
 
   // Ask the browser to keep this site's storage (projects live there) rather than clear it under pressure.

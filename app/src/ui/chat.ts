@@ -148,6 +148,8 @@ export class ChatPane {
   private readonly contactButton = h('button.convo-contact', { type: 'button', hidden: true, 'aria-haspopup': 'dialog', 'aria-expanded': 'false', title: "Their contact: the name they go by, your notes for the receptionist, and what it remembered" }, icon('user'), h('span', 'Contact'));
   /** The person whose contact the button opens. */
   private contactTab: ConversationTab | null = null;
+  /** A person's conversation: their number onto the phone's blocked list (or off it again), without typing it into the phone's settings. */
+  private readonly blockButton = h('button.convo-block', { type: 'button', hidden: true, 'aria-pressed': 'false' }, icon('ban'), h('span', 'Block'));
   /** A call going on now, in the conversation shown: how long it has run. */
   private readonly liveBar = h('div.call-live', { role: 'status', hidden: true });
   private liveTimer: ReturnType<typeof setInterval> | null = null;
@@ -219,15 +221,20 @@ export class ChatPane {
       outreach?: OutreachHost;
       /** A person's contact, from their conversation's Contact button (`anchor`). */
       contact?: (tab: ConversationTab, anchor: HTMLElement) => void;
+      /** Block the person of a conversation, or unblock one who is (`tab.blocked`): asked first, by the handler. */
+      block?: (tab: ConversationTab) => void;
     },
   ) {
     this.planBox.hidden = true;
     this.meter.hidden = true;
     this.log.append(this.feed);
     this.feed.append(this.status);
-    this.sessionTabs.append(this.sessionPicker.element, this.contactButton);
+    this.sessionTabs.append(this.sessionPicker.element, this.contactButton, this.blockButton);
     this.contactButton.addEventListener('click', () => {
       if (this.contactTab) this.handlers.contact?.(this.contactTab, this.contactButton);
+    });
+    this.blockButton.addEventListener('click', () => {
+      if (this.contactTab) this.handlers.block?.(this.contactTab);
     });
     this.log.addEventListener('scroll', () => {
       this.follow.scrolled(this.log);
@@ -534,6 +541,14 @@ export class ChatPane {
     if (person?.id !== this.contactTab?.id) closeContactCard();
     this.contactTab = person;
     this.contactButton.hidden = !person || !this.handlers.contact;
+    // Only a number can go on the list (a sender's name, such as the carrier's "Missed calls", is never answered anyway).
+    this.blockButton.hidden = !person || !this.handlers.block || (person.key ?? '').replace(/\D/g, '').length < 6;
+    const blocked = !!person?.blocked;
+    this.blockButton.setAttribute('aria-pressed', String(blocked));
+    this.blockButton.lastElementChild!.textContent = blocked ? 'Blocked' : 'Block';
+    this.blockButton.title = blocked
+      ? 'Blocked: the receptionist does not answer their calls or texts, and does not ring or text them. Click to unblock.'
+      : 'Block this number: the receptionist will not answer their calls or texts, or ring or text them';
     const own = tabs.find((t) => t.id === null);
     const kind = own ? tabKind(own) : 'project';
     const ownKind: OwnKind = kind === 'runner' || kind === 'setup' ? kind : 'project';
