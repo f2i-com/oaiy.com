@@ -879,7 +879,8 @@ impl FlashNext {
         for (d, layers) in st.attn_of.iter().enumerate().filter(|_| !resumed) {
             let g = &mut m.kv[d];
             if g.cap < past + t {
-                let cap = (past + t).next_power_of_two().max(256);
+                // (room for the rows the cache's user has said are coming, a prompt's: made once, not as they come)
+                let cap = (past + t).max(kv.expect.min(kv.max_len)).next_power_of_two().max(256);
                 g.layers = (0..layers.len()).map(|i| match g.layers.get(i) { Some(old) => chains[d].resize(old, cap * row), None => chains[d].vec(cap * row) }).collect();
                 g.raw = (0..layers.len()).map(|i| match g.raw.get(i) { Some(old) => chains[d].resize(old, cap * id_dim), None => chains[d].vec(cap * id_dim) }).collect();
                 g.out = chains[d].vec(chains[d].attention_out_len(nh, hd, cap));

@@ -50,6 +50,11 @@ pub struct KvCache {
     /// them; `usize::MAX`: none).
     pub id:          u64,
     pub dirty_from:  usize,
+    /// Rows the cache is about to hold, where its user knows (a prompt's length, before its first chunk runs): a
+    /// device's copy of the attention cache takes room for them at once. Grown as the rows came, a 15.6K-token
+    /// prompt's copy was made three times (for 4,096 rows, 8,192 and 16,384: 3.8 GiB of new memory on the card where
+    /// 2.2, and new memory there costs a third of a second a GiB).
+    pub expect:      usize,
 }
 
 impl KvCache {
@@ -108,11 +113,13 @@ impl KvCache {
             ssm_conv:  (0..n_layers).map(|_| None).collect(),
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             dirty_from: 0,
+            expect: 0,
         }
     }
 
     pub fn reset(&mut self) {
         self.dirty_from = 0;
+        self.expect = 0;
         self.len = 0;
         for s in &mut self.ssm_state { *s = None; }
         for c in &mut self.ssm_conv  { *c = None; }
@@ -129,7 +136,7 @@ impl KvCache {
             n_kv_heads_per_layer: heads.to_vec(), head_dims: dims.to_vec(),
             ssm_state: (0..heads.len()).map(|_| None).collect(),
             ssm_conv: (0..heads.len()).map(|_| None).collect(), layer_backends: backends,
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed), dirty_from: 0 }
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed), dirty_from: 0, expect: 0 }
     }
 
     pub fn reserve_layer(&mut self, backend: &dyn Backend, layer: usize, needed: usize) {

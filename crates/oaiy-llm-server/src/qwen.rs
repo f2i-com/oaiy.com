@@ -724,6 +724,8 @@ impl QwenEngine {
         let _ = job.events.send(Event::CacheReuse { cached: start, source, common });
         if self.log { eprintln!("  Qwen cache: {start}/{} tokens from {source} (common {common}) in {:.3}s", keys.len(), cache_clock.elapsed().as_secs_f64()); }
         let total = keys.len()-start;
+        // (the prompt's length, for the devices' copies of the attention cache: room for it made once)
+        self.kv.expect = keys.len();
         let _ = job.events.send(Event::Progress { done: 0, total });
         #[cfg(feature = "webgpu")]
         let cold_at_start = ggml_rs_wgpu::quant_moe::cached_experts();

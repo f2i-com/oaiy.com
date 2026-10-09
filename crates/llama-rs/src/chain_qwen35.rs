@@ -1559,12 +1559,12 @@ impl Qwen35Chain {
         let mut g = st.kv.lock().unwrap_or_else(|p| p.into_inner());
         // (the prompt's rows are written from here on: the halves' end there)
         g.halved = g.halved.min(past0);
-        reserve(chain, &mut g, &s, st.attention_layers.len(), end);
+        reserve(chain, &mut g, &s, st.attention_layers.len(), end.max(kv.expect.min(kv.max_len)));
         sync(chain, &mut g, &s, &st.attention_layers, kv, past0);
         // the second's, of its layers: the rows it lacks (the host's since, and those the first wrote)
         let mut g1 = sp.kv.lock().unwrap_or_else(|p| p.into_inner());
         let layers1: Vec<usize> = sp.attention_slots.iter().map(|&a| st.attention_layers[a]).collect();
-        reserve(chain1, &mut g1.kv, &s, layers1.len(), end);
+        reserve(chain1, &mut g1.kv, &s, layers1.len(), end.max(kv.expect.min(kv.max_len)));
         let from1 = if g1.kv.owner == kv.id { g1.upto.min(kv.dirty_from).min(past0) } else { 0 };
         upload_rows(chain1, &g1.kv, &s, &layers1, kv, from1, past0);
         g1.kv.owner = kv.id;
@@ -1717,7 +1717,7 @@ impl Qwen35Chain {
         let eps = cfg.rms_eps;
         self.split_written(kv, past);
         let mut g = st.kv.lock().unwrap_or_else(|p| p.into_inner());
-        reserve(chain, &mut g, &s, st.attention_layers.len(), past + t);
+        reserve(chain, &mut g, &s, st.attention_layers.len(), (past + t).max(kv.expect.min(kv.max_len)));
         sync(chain, &mut g, &s, &st.attention_layers, kv, past);
         // the layers' rows from `past` on are written here: their halves' rows end there; a step deep in a long cache
         // reads the halves, brought up to its own row as it goes
