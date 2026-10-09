@@ -216,7 +216,9 @@ time through and 7.9 to 10.0 the second (5.8 to 8.4 and 4.6 to 7.7 that morning)
 93-token prompt in 5.8 to 6.6 s (7.9 to 8.9) and a 276-token one in 14.2 to 14.4 s
 read before, 16.4 to 19.9 the first time (20.7 to 24.5). One card: replies at 5.0 to
 5.7 and 5.4 to 6.5 (4.7 to 5.9 and 5.3 to 6.4), the prompts in 6.2 to 6.9 s (8.7 to
-9.8) and 16.6 to 23.1 s (22.1 to 27.0). What changed:
+9.8) and 16.6 to 23.1 s (22.1 to 27.0). Two cards again once the code had been
+reorganised (the same day, nothing else running): 5.9 to 8.7 and 8.1 to 9.9, the
+prompts in 6.0 to 7.4 s and 14.4 to 19.1 s. What changed:
 
 - A prompt's experts on the CPU take all of an expert's tokens at once
   (`cpu_experts::TokensKernel`, `expert_forward_tokens`; `dsv41-simd` picks this
@@ -760,7 +762,13 @@ two chunks, a step, a model that drafts its drafts and checks too; half a second
 `OAIY_NO_WARMUP` to skip it) leaves the first request as slow. By fifties of tokens
 (`OAIY_DECODE_LOG`) the first reply is 0.74 s a fifty where the later ones are 0.72,
 but for one fifty of 0.95: one stall of a fifth of a second, once a server's life,
-whose cause is not found.
+whose cause is not found. A first prompt's second is one stall too, not spread over
+it: by chunks (`OAIY_PREFILL_LOG` prints each) three of its four take what they take
+later and one takes a second more, the last at one launch and the second at the next
+(7.05 and 7.17 s where the prompts after take 6.15 to 6.23). It is not the attention
+cache growing on the device: that copy is made once for the prompt's length now
+(`KvCache::expect`; it grew from 4,096 rows to 16,384 in three steps before), the
+first chunk is at its later time (1.52 s where 1.51), and the stall is where it was.
 
 Gemma 3 itself was wrong on every backend until this day: one RoPE base on every
 layer, where its sliding-window layers take 10,000 and its global ones
