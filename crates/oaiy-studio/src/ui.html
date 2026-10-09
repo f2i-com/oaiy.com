@@ -1040,6 +1040,7 @@ dialog::backdrop { background: var(--backdrop); }
         <button role="tab" aria-selected="true" data-log="studio">Studio</button>
         <button role="tab" aria-selected="false" data-log="llm">Language model</button>
         <button role="tab" aria-selected="false" data-log="media">Media</button>
+        <button role="tab" aria-selected="false" data-log="egpu" id="log-egpu" hidden>eGPU</button>
       </div>
       <div class="log" id="log" tabindex="0" aria-live="polite"></div>
     </section>
@@ -1790,6 +1791,7 @@ function renderEgpu() {
     : e.state === "failed" ? `${e.error || "tinygrad's server failed."}\n\nThis computer's GPU answers meanwhile.${e.retry_seconds ? ` It is tried again in ${e.retry_seconds} s, or now with Start.` : ""}`
     : "Not running. It starts on the first chat with a model set to it." + set;
   $("#egpu-start").disabled = !e.enabled || !e.models?.length || e.state === "starting";
+  $("#log-egpu").hidden = !e.available;
   $("#egpu-stop").disabled = e.state === "stopped";
 }
 $("#egpu-check").onclick = async () => {

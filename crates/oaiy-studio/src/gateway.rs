@@ -168,6 +168,13 @@ pub fn health(studio: &Studio) -> Json {
 
 /// Pass a reply on as it arrives: an event stream (or a body of no stated length) chunk by chunk, anything else whole.
 fn relay(w: &mut TcpStream, response: oaiy_engine::http::Response) -> io::Result<bool> {
+    relay_to_its_end(w, response, None)
+}
+
+/// [`relay`], for a server whose streams say no length and end by closing the connection (tinygrad's): `mark` is what
+/// a stream that ran to its end closes with. One that stops before it (the server stopped, crashed or lost its card)
+/// is not finished for the client: its connection is closed on a broken stream, not on a reply that looks whole.
+fn relay_to_its_end(w: &mut TcpStream, response: oaiy_engine::http::Response, mark: Option<&[u8]>) -> io::Result<bool> {
     let status = response.status;
     let rtype = response.header("content-type").unwrap_or("application/json").to_string();
     let streamed = rtype.contains("event-stream") || response.header("transfer-encoding").is_some_and(|t| t.contains("chunked"));
@@ -175,8 +182,22 @@ fn relay(w: &mut TcpStream, response: oaiy_engine::http::Response) -> io::Result
         let mut out = Stream::start_status(w, status, &rtype)?;
         // A client that leaves makes `send` fail, which drops the upstream
         // connection, which oaiy-llm-server takes as a cancel.
-        let r = response.for_each_chunk(|chunk| out.send(chunk));
+        // (the last bytes passed on, enough to hold the mark and the blank lines after it)
+        let mut tail: Vec<u8> = Vec::new();
+        let r = response.for_each_chunk(|chunk| {
+            if let Some(mark) = mark {
+                tail.extend_from_slice(chunk);
+                let keep = mark.len() + 16;
+                if tail.len() > keep {
+                    tail.drain(..tail.len() - keep);
+                }
+            }
+            out.send(chunk)
+        });
         if r.is_ok() {
+            if mark.is_some_and(|m| !tail.windows(m.len()).any(|part| part == m)) {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "the reply's stream ended before its end mark"));
+            }
             out.finish()?;
         }
         // The stream said keep-alive and ended cleanly: the client may send its
@@ -221,17 +242,28 @@ fn egpu_chat(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, cfg: &Json,
     let response = match fetch(&endpoint.addr, "POST", "/v1/chat/completions", &headers, &body, UPSTREAM_READ) {
         Ok(r) => r,
         Err(e) => {
-            // Nothing has been sent to the client yet: this computer's engine can still answer. A server whose
-            // process is still there keeps its model (it gives no reply to a request it cannot render).
+            // Nothing has been sent to the client yet. A server whose process has gone is the case this computer's
+            // engine is there for. One that is still there keeps its model (it gives no reply to a request it
+            // cannot render, and one such request must not cost a model that took minutes to load), and what
+            // becomes of this request depends on what would answer it here: a model named to stand in does; the
+            // same model does not, for that would load it a second time beside the card's copy, for one request.
             drop(lease);
-            match studio.egpu.unanswered(&e.to_string()) {
-                Some(gone) => here(&gone),
-                None => here(&format!("tinygrad's server gave this request no reply ({e}) and is still running")),
-            }
-            return None;
+            let late = matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock);
+            return match studio.egpu.unanswered(&e.to_string()) {
+                Some(gone) => {
+                    here(&gone);
+                    None
+                }
+                None if late => Some(send(w, Err(fail(504, format!("tinygrad's server did not answer within {} minutes; it is still running", UPSTREAM_READ.as_secs() / 60))))),
+                None if egpu::fallback(llm, name) != name => {
+                    here(&format!("tinygrad's server gave this request no reply ({e}) and is still running"));
+                    None
+                }
+                None => Some(send(w, Err(fail(502, format!("tinygrad's server gave this request no reply ({e}): it closes the connection on a request it cannot put into the model's chat format. It is still running, and no other model is named to answer in its place"))))),
+            };
         }
     };
-    let result = relay(w, response);
+    let result = relay_to_its_end(w, response, Some(b"[DONE]"));
     drop(lease);
     Some(result)
 }
@@ -1569,6 +1601,226 @@ mod tests {
         let gone = studio.egpu.let_go(Duration::from_secs(15));
         eprintln!("after its lifeline closed: {}", if gone { "exited by itself" } else { "STILL RUNNING" });
         assert!(gone, "tinygrad's server outlived the studio");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_request_that_gets_no_reply_is_an_error_where_no_other_model_stands_in() {
+        let root = std::env::temp_dir();
+        // (no stand-in named: what would answer here is the same model, loaded a second time for one request)
+        let studio = egpu_studio(&root, "");
+        let (tinygrad, engine) = (StandIn::new(""), StandIn::new(ENGINE_SAYS));
+        studio.egpu.adopt(&tinygrad.addr, "sk-egpu-test", "big", Some(idler()));
+        studio.llm.adopt(&engine.addr, "sk-studio-test");
+        let (status, _, body) = chat(&studio, r#"{"model": "big", "messages": [{"role": "user", "content": "hi"}]}"#);
+        assert_eq!(status, 502, "{body}");
+        assert!(body.contains("gave this request no reply"), "{body}");
+        assert!(engine.requests().is_empty(), "this computer's engine was not asked to load it too");
+        assert_eq!(studio.egpu.state(), crate::llm::State::Ready, "and the server keeps its model");
+        studio.egpu.stop();
+    }
+
+    /// tinygrad's LLM server as far as OAIY's side can tell, for [`fake_tinygrad`]: Python's socket server asked to
+    /// listen on every interface, HTTP/1.0, its model listed once it has "loaded" (FAKE_LOAD seconds), a chat
+    /// streamed with no length and ended by closing, or whole, and no reply at all to a chat with no messages. A
+    /// reply says which model file it was started with and what it was told of thinking; a chat that says `cut`
+    /// has it die mid-stream, as a card unplugged would.
+    const FAKE_TINYGRAD: &str = r#"
+import argparse, http.server, json, os, socketserver, time
+p = argparse.ArgumentParser()
+p.add_argument("--model"); p.add_argument("--serve", type=int); p.add_argument("--max_context", type=int)
+a = p.parse_args()
+name = os.path.basename(a.model)
+time.sleep(float(os.environ.get("FAKE_LOAD", "0.3")))
+
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args): pass
+    def whole(self, code, kind, body):
+        self.send_response(code); self.send_header("Content-Type", kind); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def do_GET(self):
+        if self.path == "/v1/models": self.whole(200, "application/json", json.dumps({"object": "list", "data": [{"id": name}]}).encode())
+        else: self.whole(200, "text/html", b"<html>the chat page</html>")
+    def do_PUT(self): self.whole(200, "text/plain", b"put")
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
+        messages = body.get("messages") or []
+        if not messages: return
+        said = "%s thinking=%s" % (name, self.headers.get("X-OAIY-Thinking"))
+        if body.get("stream"):
+            self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+            self.wfile.write(("data: " + json.dumps({"choices": [{"index": 0, "delta": {"content": said}}]}) + "\n\n").encode()); self.wfile.flush()
+            if messages[-1].get("content") == "cut": os._exit(3)
+            self.wfile.write(b"data: [DONE]\n\n")
+        else:
+            time.sleep(float(os.environ.get("FAKE_REPLY", "0")))
+            self.whole(200, "application/json", json.dumps({"model": body.get("model"), "choices": [{"index": 0, "message": {"role": "assistant", "content": said}}]}).encode())
+
+class S(socketserver.TCPServer):
+    allow_reuse_address = True
+
+print("loaded model", name, "on FAKE", flush=True)
+S(("", a.serve), H).serve_forever()
+"#;
+
+    /// A stand-in for tinygrad itself in `dir` ([`FAKE_TINYGRAD`]) and two model files, `x.gguf` and `y.gguf`, and a
+    /// studio whose eGPU is set to them: the launcher and the supervisor then run for real. None where this computer
+    /// has no Python to run it with.
+    fn fake_tinygrad(dir: &std::path::Path, load_seconds: &str, stands_in: &str) -> Option<Arc<Studio>> {
+        use std::process::{Command, Stdio};
+        let runs = |p: &&str| Command::new(p).arg("--version").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
+        let python = ["python3", "python"].into_iter().find(runs)?;
+        let _ = std::fs::remove_dir_all(dir);
+        let package = dir.join("tinygrad").join("llm");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(dir.join("tinygrad").join("__init__.py"), "").unwrap();
+        std::fs::write(package.join("__init__.py"), "").unwrap();
+        std::fs::write(package.join("__main__.py"), FAKE_TINYGRAD).unwrap();
+        let model = |name: &str, egpu: bool| {
+            let file = dir.join(format!("{name}.gguf"));
+            std::fs::write(&file, b"GGUF").unwrap();
+            Json::obj([("name", Json::str(name)), ("path", Json::str(file.to_string_lossy())), ("egpu", Json::Bool(egpu))])
+        };
+        let cfg = Json::obj([
+            ("llm", Json::obj([
+                ("enabled", Json::Bool(true)),
+                ("temperature", Json::Num(0.0)),
+                ("max_tokens", Json::Int(16)),
+                ("server", Json::str("no-such/oaiy-llm-server")),
+                ("server_webgpu", Json::str("no-such/oaiy-llm-server-webgpu")),
+                ("egpu", Json::obj([
+                    ("enabled", Json::Bool(true)),
+                    ("python", Json::str(python)),
+                    ("tinygrad", Json::str(dir.to_string_lossy())),
+                    ("device", Json::str("CPU")),
+                    ("fallback_model", Json::str(stands_in)),
+                    ("env", Json::obj([("FAKE_LOAD", Json::str(load_seconds))])),
+                ])),
+                ("models", Json::Arr(vec![model("x", true), model("y", true), model("small", false)])),
+            ])),
+            ("media", Json::obj([("llm_policy", Json::str("coexist"))])),
+        ]);
+        Some(Arc::new(Studio::for_test(dir, cfg)))
+    }
+
+    fn fake_dir(what: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("oaiy-egpu-fake-{what}-{}", std::process::id()))
+    }
+
+    /// How often the supervisor started a server, by its log.
+    fn starts(studio: &Studio) -> usize {
+        studio.egpu.log.tail(400).matches("studio: starting").count()
+    }
+
+    fn until(what: &str, done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "waited a minute for {what}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn two_models_asked_for_at_once_are_each_answered_and_neither_load_is_stopped_for_the_other() {
+        let dir = fake_dir("two");
+        let Some(studio) = fake_tinygrad(&dir, "1.5", "") else { return };
+        let engine = StandIn::new(ENGINE_SAYS);
+        studio.llm.adopt(&engine.addr, "sk-studio-test");
+        // Both at once: one loads and answers, then the other, each started once. (Counted as waiting for the
+        // model that is loading, the first's request keeps it; before, each stopped the other's load in turn.)
+        let asked = ["x", "y"].map(|m| {
+            let studio = Arc::clone(&studio);
+            std::thread::spawn(move || chat(&studio, &format!(r#"{{"model": "{m}", "messages": [{{"role": "user", "content": "hi"}}]}}"#)))
+        });
+        for (m, reply) in ["x", "y"].into_iter().zip(asked) {
+            let (status, _, body) = reply.join().unwrap();
+            assert_eq!(status, 200, "{m}: {body}\n{}", studio.egpu.log.tail(40));
+            assert!(body.contains(&format!("{m}.gguf thinking=0")), "{m} answered by its own model, not asked to think: {body}");
+        }
+        assert_eq!(starts(&studio), 2, "each model started once:\n{}", studio.egpu.log.tail(40));
+        assert!(engine.requests().is_empty(), "this computer's engine was not asked");
+        // Itself: nothing without the key, whatever the method, and nothing at all on the computer's other address.
+        let cfg = studio.config();
+        let held = studio.egpu.held().unwrap();
+        let (endpoint, lease) = studio.egpu.ensure(&cfg, &dir, &held, Duration::from_secs(30)).map_err(|e| format!("{e:?}")).unwrap();
+        let auth = format!("Bearer {}", endpoint.key);
+        let status = |method: &str, path: &str, headers: &[(&str, &str)]| fetch(&endpoint.addr, method, path, headers, b"{}", Duration::from_secs(10)).unwrap().status;
+        assert_eq!((status("GET", "/v1/models", &[]), status("GET", "/", &[]), status("PUT", "/x", &[]), status("POST", "/v1/chat/completions", &[("Authorization", "Bearer wrong")])), (401, 401, 401, 401));
+        assert_eq!((status("GET", "/v1/models", &[("Authorization", &auth)]), status("PUT", "/x", &[("Authorization", &auth)])), (200, 200));
+        let port: u16 = endpoint.addr.rsplit(':').next().unwrap().parse().unwrap();
+        let elsewhere = std::net::UdpSocket::bind("0.0.0.0:0").and_then(|s| s.connect("192.0.2.1:9").and_then(|()| s.local_addr())).ok().map(|a| a.ip()).filter(|ip| !ip.is_loopback() && !ip.is_unspecified());
+        if let Some(ip) = elsewhere {
+            assert!(std::net::TcpStream::connect_timeout(&std::net::SocketAddr::new(ip, port), Duration::from_secs(3)).is_err(), "it answers on {ip}");
+        }
+        // A start by hand of the model it has changes nothing; of the other, while this one is being used, is
+        // refused and cuts nothing off.
+        let other = if held == "x" { "y" } else { "x" };
+        assert_eq!(studio.egpu.start(&cfg, &dir, &held), Ok(()));
+        let refused = studio.egpu.start(&cfg, &dir, other).unwrap_err();
+        assert!(refused.contains(&format!("answering with {held}")), "{refused}");
+        assert_eq!((starts(&studio), studio.egpu.state()), (2, crate::llm::State::Ready));
+        drop(lease);
+        // Let go of without being stopped (as when the studio dies): its standard input closes and it goes.
+        assert!(studio.egpu.let_go(Duration::from_secs(15)), "the server outlived the studio");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stop_while_the_server_is_starting_holds_and_the_waiting_request_is_answered_here() {
+        let dir = fake_dir("stop");
+        let Some(studio) = fake_tinygrad(&dir, "4", "small") else { return };
+        let engine = StandIn::new(ENGINE_SAYS);
+        studio.llm.adopt(&engine.addr, "sk-studio-test");
+        let asking = {
+            let studio = Arc::clone(&studio);
+            std::thread::spawn(move || chat(&studio, r#"{"model": "x", "messages": [{"role": "user", "content": "hi"}]}"#))
+        };
+        until("the server to be starting", || studio.egpu.state() == crate::llm::State::Starting);
+        studio.egpu.stop();
+        // The request that was waiting for it is answered by this computer's engine, with the model that stands
+        // in, and does not start the server again.
+        let (status, _, body) = asking.join().unwrap();
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("on this computer"), "{body}");
+        assert_eq!(engine.requests().last().unwrap().1.get("model").and_then(Json::as_str), Some("small"));
+        std::thread::sleep(Duration::from_secs(1));
+        assert_eq!((starts(&studio), studio.egpu.state()), (1, crate::llm::State::Stopped), "{}", studio.egpu.log.tail(20));
+        // The next request starts it afresh.
+        let (status, _, body) = chat(&studio, r#"{"model": "x", "messages": [{"role": "user", "content": "hi"}]}"#);
+        assert_eq!(status, 200, "{body}\n{}", studio.egpu.log.tail(20));
+        assert!(body.contains("x.gguf"), "{body}");
+        studio.egpu.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stream_cut_short_is_not_passed_on_as_a_finished_reply() {
+        let dir = fake_dir("cut");
+        let Some(studio) = fake_tinygrad(&dir, "0.2", "small") else { return };
+        let engine = StandIn::new(ENGINE_SAYS);
+        studio.llm.adopt(&engine.addr, "sk-studio-test");
+        // A stream that runs to its end arrives whole.
+        let (status, kind, body) = chat(&studio, r#"{"model": "x", "stream": true, "messages": [{"role": "user", "content": "hi"}]}"#);
+        assert_eq!((status, kind.as_str()), (200, "text/event-stream"), "{body}\n{}", studio.egpu.log.tail(20));
+        assert!(body.contains("x.gguf") && body.trim_end().ends_with("data: [DONE]"), "{body}");
+        // One whose server dies mid-reply (the card unplugged): the client's connection breaks; it is not handed
+        // the first words as a whole reply.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let served = Arc::clone(&studio);
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            oaiy_engine::http::serve(stream, |req, w| handle(&served, req, w, Matched { target: "chat".into(), spec: "openai".into(), rest: String::new() }, true));
+        });
+        let reply = fetch(&addr, "POST", "/v1/chat/completions", &[("Content-Type", "application/json")], br#"{"model": "x", "stream": true, "messages": [{"role": "user", "content": "cut"}]}"#, Duration::from_secs(60)).unwrap();
+        assert_eq!(reply.status, 200);
+        let read = reply.body(8 << 20);
+        assert!(read.is_err(), "a broken stream, not a reply: {:?}", read.map(|b| String::from_utf8_lossy(&b).into_owned()));
+        // Its process has gone: the next chats are this computer's engine's.
+        until("the server to be seen gone", || studio.egpu.state() == crate::llm::State::Failed);
+        let (status, _, body) = chat(&studio, r#"{"model": "x", "messages": [{"role": "user", "content": "hi"}]}"#);
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("on this computer"), "{body}");
+        studio.egpu.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -156,11 +156,11 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
         ("POST", "/api/egpu/start") => {
             let llm = cfg.get("llm").cloned().unwrap_or(Json::Null);
             let asked = body(req).ok().and_then(|b| b.get("model").and_then(Json::as_str).map(str::to_owned));
-            match asked.or_else(|| crate::egpu::models(&llm).into_iter().next()) {
-                Some(name) => {
-                    studio.egpu.stop();
-                    studio.egpu.start(&cfg, &studio.root, &name).map(|_| studio.egpu.status(&llm)).map_err(|e| (400, e))
-                }
+            // (none named: the one it held, was loading or failed to load, else the first set to it. A server that
+            // has the model is left as it is, and one answering with another is not cut off: `start` says so)
+            let again = studio.egpu.held().filter(|m| crate::egpu::assigned(&llm, m));
+            match asked.or(again).or_else(|| crate::egpu::models(&llm).into_iter().next()) {
+                Some(name) => studio.egpu.start(&cfg, &studio.root, &name).map(|_| studio.egpu.status(&llm)).map_err(|e| (400, e)),
                 None => Err((400, "no model is set to run on the eGPU (Models), or it is switched off (Settings)".into())),
             }
         }
@@ -300,6 +300,15 @@ fn remove_model(cfg: &mut Json, section: &str, name: &str) -> Result<(), String>
                 }
             }
             clear_default(llm);
+            // (and the eGPU's stand-in, where it was this model: the configuration is refused while it names one
+            // that is not listed, so the model could not be removed at all)
+            if let Json::Obj(fields) = llm {
+                if let Some((_, egpu)) = fields.iter_mut().find(|(k, _)| k == "egpu") {
+                    if str_or(egpu, "fallback_model", "") == name {
+                        crate::util::set(egpu, "fallback_model", Json::str(""));
+                    }
+                }
+            }
         }
         "image" | "video" | "speech" | "music" | "sound" | "model3d" => {
             let media = &mut top.iter_mut().find(|(k, _)| k == "media").ok_or("no media")?.1;
@@ -381,6 +390,17 @@ mod tests {
         assert_eq!(cfg.get("llm").unwrap().get("default_model").and_then(Json::as_str), Some(""));
         assert!(remove_model(&mut cfg, "llm", "a").is_err());
         config::validate(&cfg).unwrap();
+        // The model that stands in for the eGPU's goes as that too: the configuration is refused while it names
+        // a model that is not listed, so it could not be removed at all.
+        let mut llm = cfg.get("llm").unwrap().clone();
+        crate::util::set(&mut llm, "models", Json::parse(br#"[{"name":"big","path":"big.gguf","egpu":true},{"name":"small","path":"small.gguf"}]"#).unwrap());
+        crate::util::set(&mut llm, "egpu", Json::parse(br#"{"enabled":true,"fallback_model":"small"}"#).unwrap());
+        crate::util::set(&mut cfg, "llm", llm);
+        config::validate(&cfg).unwrap();
+        remove_model(&mut cfg, "llm", "small").unwrap();
+        assert_eq!(cfg.get("llm").unwrap().get("egpu").unwrap().get("fallback_model").and_then(Json::as_str), Some(""));
+        config::validate(&cfg).unwrap();
+        remove_model(&mut cfg, "llm", "big").unwrap();
         // Sound effect and 3D models are removed the same way.
         for section in ["sound", "model3d"] {
             let media = crate::registry::obj_mut(&mut cfg, &["media", section]).unwrap();

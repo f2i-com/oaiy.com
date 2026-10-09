@@ -515,9 +515,8 @@ pub fn launch(args: &Args, quiet: bool) -> Result<Running, String> {
                 idle.llm.stop();
             }
             // tinygrad's server by the same rule: the card's memory back, the next request loads it again.
-            if minutes > 0 && idle.egpu.state() == llm::State::Ready && idle.egpu.idle_for().is_some_and(|t| t > Duration::from_secs(minutes as u64 * 60)) {
-                idle.log.push(format!("eGPU idle for {minutes} min: stopping tinygrad's server to free the card"));
-                idle.egpu.stop();
+            if minutes > 0 && idle.egpu.stop_if_idle(Duration::from_secs(minutes as u64 * 60)) {
+                idle.log.push(format!("eGPU idle for {minutes} min: tinygrad's server stopped to free the card"));
             }
             // Hourly: uploaded reference images older than a day.
             if ticks % 120 == 1 {

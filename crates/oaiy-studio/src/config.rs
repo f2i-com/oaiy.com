@@ -509,7 +509,8 @@ pub fn validate(v: &Json) -> Result<(), String> {
                 return Err(format!("llm.egpu.{key} must be text"));
             }
         }
-        if egpu.get("ctx").is_some_and(|c| !c.as_i64().is_some_and(|n| (512..=1 << 20).contains(&n))) {
+        // (null: the page's field emptied, which is the default)
+        if egpu.get("ctx").is_some_and(|c| !matches!(c, Json::Null) && !c.as_i64().is_some_and(|n| (512..=1 << 20).contains(&n))) {
             return Err("llm.egpu.ctx must be a whole number in 512..1048576".into());
         }
         let stands_in = str_or(egpu, "fallback_model", "");
@@ -840,6 +841,8 @@ mod tests {
         set(r#"{"enabled": true, "python": "", "tinygrad": "/src/tinygrad", "device": "NV", "ctx": 8192, "fallback_model": "small", "env": {"JITBEAM": 2, "X": "y"}, "extra_args": ["--shard", "1"]}"#, models).unwrap();
         set("{}", models).unwrap();
         set("null", models).unwrap();
+        // (the page's Context field emptied: the default, not a refusal of the whole save)
+        set(r#"{"enabled": true, "ctx": null}"#, models).unwrap();
         for (egpu, needle) in [
             (r#"[1]"#, "llm.egpu must be an object"),
             (r#"{"enabled": "yes"}"#, "llm.egpu.enabled"),

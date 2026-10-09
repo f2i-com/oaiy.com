@@ -9,6 +9,7 @@ set -u
 cd "$(dirname "$0")/../.."
 
 [ "$(uname -s)" = "Darwin" ] || { echo "This is for a Mac (uname says $(uname -s))."; exit 1; }
+xcode-select -p > /dev/null 2>&1 || { echo "Apple's command line tools are missing. Install them with: xcode-select --install"; exit 1; }
 command -v cargo > /dev/null 2>&1 || { echo "Rust is missing. Install it from https://rustup.rs and open a new terminal."; exit 1; }
 
 out="${TMPDIR:-/tmp}/oaiy-mac-check.txt"

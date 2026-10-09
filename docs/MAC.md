@@ -189,7 +189,8 @@ or Linux at all.
    `sh tools/mac/doctor.sh --egpu` shows what is there and has tinygrad add three numbers
    on the card.
 2. **Settings → eGPU through tinygrad:**
-   - *Python that has tinygrad*: empty, and OAIY looks in the tinygrad folder's `.venv`,
+   - *Python that has tinygrad*: a path, or a bare name for the PATH to find
+     (`python3.12`); empty, and OAIY looks in the tinygrad folder's `.venv`,
      then `/opt/homebrew/bin/python3`, `/usr/local/bin/python3`, `/usr/bin/python3` and
      the `python3` on the PATH, and takes the first that has tinygrad's LLM server.
    - *tinygrad folder*: where tinygrad is a checkout that is not installed into that
@@ -210,21 +211,30 @@ or Linux at all.
 - A chat that names a model set to the eGPU goes to tinygrad's server. The first one
   starts it with that model and waits for it (up to ten minutes: tinygrad compiles its
   kernels the first time a model runs). It holds **one model at a time**: a chat for
-  another of its models waits for the chats being answered, then swaps.
+  another of its models waits for the chats being answered, and for those waiting on a
+  model that is still loading, then swaps. Two models asked for at once are loaded and
+  answered one after the other.
 - When the server **cannot be started or has gone** (the card unplugged, tinygrad not
   found, the model not one it reads), the chat is answered on the Mac's own GPU instead,
   by the stand-in model where one is named. The log says so once, the **Overview** shows
   the card as not answering, and it is tried again after a minute, or at once with
-  **Start** under Settings. A server that is only still loading is waited for, never given
-  up on.
+  **Start** under Settings (which starts the model it last had; a server that has it is
+  left as it is, and one answering with another model is not cut off). A server that is
+  only still loading is waited for, never given up on.
 - It stops when it has been idle for *Stop when idle* minutes (Memory), when its settings
-  change, and with OAIY: its launcher watches for OAIY going, however it goes, so the card
-  is not left held.
+  change, with **Stop**, and with OAIY: its launcher watches for OAIY going, however it
+  goes, so the card is not left held. A stop holds: a start under way stands down, and a
+  chat that was waiting for the server is answered on the Mac's own engine.
+- A reply's stream that **stops before its end** (the card unplugged mid-reply) breaks the
+  client's connection: it is not handed on as a finished reply.
 - A request with **a picture** goes to the Mac's own engine (tinygrad's server reads
   text), and so does `/v1/completions`.
 - tinygrad's server gives **no reply at all** to a request it cannot render (it closes the
-  connection). That one request is answered on the Mac's engine, and the server, still
-  running, keeps its model.
+  connection). The server, still running, keeps its model, and that one request is answered
+  by the stand-in model on the Mac's engine where one is named. Where none is, the client
+  is told so (502): the same model would otherwise be loaded a second time, beside the
+  card's copy, for one request. A request it has not answered in thirty minutes is an error
+  too (504).
 
 ### What tinygrad's server does differently
 
@@ -277,7 +287,7 @@ tinygrad's is built on, where to listen and whom to answer, then runs `tinygrad.
 kernels once and keep them); `extra_args` to its command line. The control port has
 `GET /api/egpu/check`, `POST /api/egpu/start` (`{"model": name}`, else the first set to
 it) and `POST /api/egpu/stop`; `/api/state` has an `egpu` section, and the Logs page's
-source `egpu` is tinygrad's own output.
+**eGPU** tab (`/api/logs?source=egpu`) is tinygrad's own output.
 
 ### Checked, and not
 
@@ -302,7 +312,14 @@ Linux): a chat for a model on the eGPU reaches tinygrad's server with its key an
 settings; another model's, a picture and `/v1/completions` reach the Mac's engine; a server
 that has gone hands the chat to the Mac's engine, with the stand-in model where one is
 named; a server that gives one request no reply keeps its model; and with the eGPU
-switched off nothing goes there. The Engines page's parts were
+switched off nothing goes there. And with a stand-in for tinygrad itself (a package of
+that name that serves as tinygrad's does), so that the launcher and the supervisor run for
+real on any computer with a Python: two models asked for at once are each loaded once and
+answered; a stop while the server is starting holds, and the chat that waited is answered
+on the Mac's engine; every method is refused without the key, and nothing answers on the
+computer's other address; a start by hand leaves a ready server alone and does not cut off
+another model's chat; a stream cut short breaks the client's connection. The Engines
+page's parts were
 read back in a browser for a Mac in each state (off, not started, loading, ready, not
 answering) and for a PC, where none of them shows.
 

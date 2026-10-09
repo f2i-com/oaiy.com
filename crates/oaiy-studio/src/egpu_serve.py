@@ -25,30 +25,23 @@ def local_only():
     """Every server made from here on listens on this computer only, and answers only OAIY."""
     init = socketserver.TCPServer.__init__
 
+    def keyed(answer):
+        def asked(self, *args, **kwargs):
+            given = self.headers.get("Authorization", "")
+            if not hmac.compare_digest(given.encode(), ("Bearer " + KEY).encode()):
+                return self.send_error(401, "this server answers OAIY only")
+            THINKING[0] = self.headers.get("X-OAIY-Thinking")
+            return answer(self, *args, **kwargs)
+
+        return asked
+
     def guarded(handler):
-        class Guarded(handler):
-            def _oaiy(self):
-                given = self.headers.get("Authorization", "")
-                if not KEY or hmac.compare_digest(given.encode(), ("Bearer " + KEY).encode()):
-                    return True
-                self.send_error(401, "this server answers OAIY only")
-                return False
-
-            def do_GET(self):
-                if self._oaiy():
-                    super().do_GET()
-
-            def do_POST(self):
-                if self._oaiy():
-                    THINKING[0] = self.headers.get("X-OAIY-Thinking")
-                    super().do_POST()
-
-        return Guarded
+        # Every method the handler answers (do_GET, do_POST, and any it has besides or comes to have), not two by name.
+        methods = {name: keyed(getattr(handler, name)) for name in dir(handler) if name.startswith("do_") and callable(getattr(handler, name))}
+        return type("Guarded", (handler,), methods) if methods else handler
 
     def listen(self, server_address, RequestHandlerClass, *args, **kwargs):
-        if hasattr(RequestHandlerClass, "do_POST"):
-            RequestHandlerClass = guarded(RequestHandlerClass)
-        init(self, ("127.0.0.1", server_address[1]), RequestHandlerClass, *args, **kwargs)
+        init(self, ("127.0.0.1", server_address[1]), guarded(RequestHandlerClass), *args, **kwargs)
 
     socketserver.TCPServer.__init__ = listen
 
@@ -152,6 +145,9 @@ def main():
     name, why = server()
     if name is None:
         sys.exit(f"oaiy-egpu: {why}")
+    if not KEY:
+        # (never a server that answers anyone: OAIY starts this with a key of that run's)
+        sys.exit("oaiy-egpu: OAIY_EGPU_KEY is not set; this is started by OAIY, which gives it one")
     if "--watch-stdin" in args:
         args.remove("--watch-stdin")
         threading.Thread(target=lifeline, daemon=True).start()

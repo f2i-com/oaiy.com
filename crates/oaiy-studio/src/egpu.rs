@@ -35,6 +35,8 @@ const RETRY_AFTER: Duration = Duration::from_secs(60);
 const DEFAULT_CTX: i64 = 8192;
 /// How long a Python has to say what it has installed.
 const CHECK_WAIT: Duration = Duration::from_secs(30);
+/// What a start, or a request waiting for one, is told when the server was stopped by someone meanwhile.
+const STOPPED: &str = "the eGPU was stopped, or its settings changed, while it was being started";
 
 /// Whether this build offers it at all: a Mac's (and the tests', which run its logic on any computer).
 pub fn available() -> bool {
@@ -93,7 +95,8 @@ pub fn pythons(llm: &Json, root: &Path) -> Vec<PathBuf> {
     let egpu = section(llm);
     let named = str_or(egpu, "python", "").trim();
     if !named.is_empty() {
-        return vec![typed(root, named, std::env::var_os("HOME").as_deref())];
+        // (a bare name, `python3.12`, is one for the PATH to find, not a file beside the configuration)
+        return vec![if named.contains(['/', '\\']) { typed(root, named, std::env::var_os("HOME").as_deref()) } else { PathBuf::from(named) }];
     }
     let mut found = Vec::new();
     if let Some(folder) = tinygrad_folder(llm, root) {
@@ -256,6 +259,12 @@ struct Inner {
     failed_at: Option<Instant>,
     /// Requests it is answering now: a model is not swapped out from under them.
     busy: usize,
+    /// Requests waiting for the model it is loading: it is not swapped out from under them either (two models
+    /// asked for at once would otherwise stop each other's load in turn, and neither would ever be ready).
+    waiting: usize,
+    /// Stops someone asked for (Stop, a change of settings, the studio going), counted: a start that began before
+    /// one stands down, and a request that waited through one does not start the server again.
+    epoch: u64,
     last_used: Instant,
     command: String,
     /// The Python that has tinygrad, for the configuration it was found under.
@@ -283,6 +292,16 @@ impl Drop for Lease {
         drop(g);
         self.0.changed.notify_all();
     }
+}
+
+/// What a start came to.
+enum Begun {
+    /// The server was started with the model (and the caller counted as waiting for it, where it asked to be).
+    Launched,
+    /// It has the model already, loading or ready.
+    Held,
+    /// It is answering, or awaited, with another model (which): not cut off.
+    InUse(String),
 }
 
 /// What a Python said of itself (`egpu_serve.py --check`), or why it could not be asked.
@@ -346,6 +365,8 @@ impl Egpu {
                 model: None,
                 failed_at: None,
                 busy: 0,
+                waiting: 0,
+                epoch: 0,
                 last_used: Instant::now(),
                 command: String::new(),
                 python: None,
@@ -416,12 +437,15 @@ impl Egpu {
         (g.busy == 0).then(|| g.last_used.elapsed())
     }
 
-    /// The launcher's file, written again at each use (a small file; an older OAIY's copy must not linger).
+    /// The launcher's file, made what this OAIY carries at each use (an older OAIY's copy must not linger). Written
+    /// only where it differs: a Python that is starting on it must not read half of it.
     fn script(root: &Path) -> Result<PathBuf, String> {
         let dir = root.join("cache").join("egpu");
         std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let file = dir.join("egpu_serve.py");
-        std::fs::write(&file, SERVE_PY).map_err(|e| format!("{}: {e}", file.display()))?;
+        if std::fs::read(&file).ok().as_deref() != Some(SERVE_PY.as_bytes()) {
+            std::fs::write(&file, SERVE_PY).map_err(|e| format!("{}: {e}", file.display()))?;
+        }
         Ok(file)
     }
 
@@ -471,8 +495,23 @@ impl Egpu {
         }
     }
 
-    /// Start tinygrad's server with `name`, replacing whatever it held.
+    /// Start tinygrad's server with `name` by hand. A server that has `name` already is left as it is, and one that
+    /// is answering (or awaited) with another model is not cut off: that is said instead.
     pub fn start(self: &Arc<Self>, cfg: &Json, root: &Path, name: &str) -> Result<(), String> {
+        let epoch = self.lock().epoch;
+        match self.begin(cfg, root, name, epoch, true, false)? {
+            Begun::Launched | Begun::Held => Ok(()),
+            Begun::InUse(other) => Err(format!("the eGPU is answering with {other}: wait for it, or stop it first")),
+        }
+    }
+
+    /// Start the server with `name` unless it has it, in place of a model nobody is using. `epoch`: the stops
+    /// someone asked for that the caller had seen; one more since, and this start stands down. `again`: start even
+    /// where a start with `name` has just failed (a start by hand: a request waits out [`RETRY_AFTER`], or every
+    /// request queued behind a failure would try all the Pythons once more). `count`: the caller is a request, to
+    /// be counted as waiting for the model from the moment the server is set to starting, so that another model's
+    /// request arriving just then does not find it unawaited and stop it.
+    fn begin(self: &Arc<Self>, cfg: &Json, root: &Path, name: &str, epoch: u64, again: bool, count: bool) -> Result<Begun, String> {
         let llm = cfg.get("llm").ok_or("no llm section")?;
         if !enabled(llm) {
             return Err(if available() { "the eGPU is switched off (Settings)".into() } else { "tinygrad's server is used on a Mac only".into() });
@@ -482,27 +521,44 @@ impl Egpu {
         }
         let _one = self.launching.lock().unwrap_or_else(|p| p.into_inner());
         {
-            let g = self.lock();
-            if matches!(g.state, State::Starting | State::Ready) && g.model.as_deref() == Some(name) {
-                return Ok(());
+            let mut g = self.lock();
+            if g.epoch != epoch {
+                return Err(STOPPED.into());
+            }
+            let holds = g.model.as_deref() == Some(name);
+            match g.state {
+                State::Starting | State::Ready if holds => return Ok(Begun::Held),
+                State::Starting | State::Ready if g.busy > 0 || g.waiting > 0 => return Ok(Begun::InUse(g.model.clone().unwrap_or_default())),
+                State::Failed if holds && !again && g.failed_at.is_some_and(|t| t.elapsed() < RETRY_AFTER) => {
+                    return Err(g.error.clone().unwrap_or_else(|| "tinygrad's server failed".into()));
+                }
+                _ => {}
+            }
+            // (under the lock the check was made under: no request can take the old model between the two)
+            self.halt(&mut g);
+        }
+        self.changed.notify_all();
+        match self.launch(cfg, llm, root, name, epoch, count) {
+            Ok(true) => Ok(Begun::Launched),
+            Ok(false) => Err(STOPPED.into()),
+            Err(e) => {
+                let mut g = self.lock();
+                if g.epoch == epoch {
+                    g.state = State::Failed;
+                    g.error = Some(e.clone());
+                    g.model = Some(name.to_string());
+                    g.failed_at = Some(Instant::now());
+                }
+                drop(g);
+                self.log.push(format!("studio: tinygrad's server was not started: {e}"));
+                self.changed.notify_all();
+                Err(e)
             }
         }
-        self.stop();
-        let started = self.launch(cfg, llm, root, name);
-        if let Err(e) = &started {
-            let mut g = self.lock();
-            g.state = State::Failed;
-            g.error = Some(e.clone());
-            g.model = Some(name.to_string());
-            g.failed_at = Some(Instant::now());
-            drop(g);
-            self.log.push(format!("studio: tinygrad's server was not started: {e}"));
-            self.changed.notify_all();
-        }
-        started
     }
 
-    fn launch(self: &Arc<Self>, cfg: &Json, llm: &Json, root: &Path, name: &str) -> Result<(), String> {
+    /// Whether the server was started (false: someone asked for a stop meanwhile, and it stood down).
+    fn launch(self: &Arc<Self>, cfg: &Json, llm: &Json, root: &Path, name: &str, epoch: u64, count: bool) -> Result<bool, String> {
         let python = self.python(cfg, root)?;
         let script = Self::script(root)?;
         let port = free_port()?;
@@ -521,16 +577,32 @@ impl Egpu {
         let device = env.iter().find(|(k, _)| k == "DEV").map_or("NV", |(_, v)| v.as_str());
         let shown = format!("DEV={device} {} {}", python.display(), args.join(" "));
         self.log.push(format!("studio: starting {shown}"));
-        let mut child = command.spawn().map_err(|e| format!("{}: {e}", python.display()))?;
+        let mut child = command.spawn().map_err(|e| {
+            // (a Python that was found earlier and is not there now: looked for again at the next start)
+            self.lock().python = None;
+            format!("{}: {e}", python.display())
+        })?;
         for pipe in [child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>), child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>)].into_iter().flatten() {
             let log = Arc::clone(&self.log);
             std::thread::spawn(move || {
-                for line in BufReader::new(pipe).lines().map_while(Result::ok) {
-                    log.push(line);
+                // Bytes, not text: a line that is not UTF-8 (a compiler's, a progress bar's) must not end the reading,
+                // or the pipe fills and the server blocks on its next word. A line with no end (a bar redrawn in
+                // place) is passed on in pieces.
+                let (mut reader, mut line) = (BufReader::new(pipe), Vec::new());
+                while reader.by_ref().take(16 << 10).read_until(b'\n', &mut line).is_ok_and(|n| n > 0) {
+                    log.push(String::from_utf8_lossy(&line).trim_end_matches(['\r', '\n']).to_string());
+                    line.clear();
                 }
             });
         }
         let mut g = self.lock();
+        if g.epoch != epoch {
+            drop(g);
+            let _ = child.kill();
+            let _ = child.wait();
+            self.log.push("studio: tinygrad's server was stopped as it started");
+            return Ok(false);
+        }
         g.generation += 1;
         let generation = g.generation;
         g.lifeline = child.stdin.take();
@@ -538,6 +610,7 @@ impl Egpu {
         g.addr = format!("127.0.0.1:{port}");
         g.key = key;
         g.state = State::Starting;
+        g.waiting += count as usize;
         g.error = None;
         g.started = Some(Instant::now());
         g.ready_after = None;
@@ -549,7 +622,7 @@ impl Egpu {
         self.changed.notify_all();
         let this = Arc::clone(self);
         std::thread::Builder::new().name("egpu-watch".into()).spawn(move || this.watch(generation)).map_err(|e| e.to_string())?;
-        Ok(())
+        Ok(true)
     }
 
     /// Wait for the server to list its model (it does once the model has loaded and its kernels are compiled), then
@@ -600,8 +673,8 @@ impl Egpu {
         }
     }
 
-    pub fn stop(&self) {
-        let mut g = self.lock();
+    /// The server stopped and forgotten, the state's lock held.
+    fn halt(&self, g: &mut Inner) {
         g.generation += 1;
         g.lifeline = None;
         if let Some(mut child) = g.child.take() {
@@ -614,8 +687,30 @@ impl Egpu {
         g.ready_after = None;
         g.model = None;
         g.failed_at = None;
+    }
+
+    /// Stop the server because someone asked: Stop, a change of settings, the studio going. A start that is under
+    /// way stands down, and requests waiting for the server go to this computer's engine: they do not start it
+    /// again.
+    pub fn stop(&self) {
+        let mut g = self.lock();
+        g.epoch += 1;
+        self.halt(&mut g);
         drop(g);
         self.changed.notify_all();
+    }
+
+    /// Stop a ready server that has answered nothing for `idle`, and say whether it was. Decided and done under one
+    /// lock: a request that comes meanwhile is counted first, and keeps the server, or finds it stopped.
+    pub fn stop_if_idle(&self, idle: Duration) -> bool {
+        let mut g = self.lock();
+        if g.state != State::Ready || g.busy > 0 || g.waiting > 0 || g.last_used.elapsed() <= idle {
+            return false;
+        }
+        self.halt(&mut g);
+        drop(g);
+        self.changed.notify_all();
+        true
     }
 
     /// Where `name` is answered on the eGPU, starting tinygrad's server with it if it is not held, and waiting up
@@ -623,7 +718,16 @@ impl Egpu {
     pub fn ensure(self: &Arc<Self>, cfg: &Json, root: &Path, name: &str, timeout: Duration) -> Result<(Endpoint, Lease), Unready> {
         let deadline = Instant::now() + timeout;
         let mut g = self.lock();
+        let epoch = g.epoch;
+        // (whether this request is counted among those the loading model is awaited by: for as long as it sleeps)
+        let mut counted = false;
         loop {
+            if std::mem::take(&mut counted) {
+                g.waiting = g.waiting.saturating_sub(1);
+            }
+            if g.epoch != epoch {
+                return Err(Unready::Gone(STOPPED.into()));
+            }
             let holds = g.model.as_deref() == Some(name);
             match g.state {
                 State::Ready if holds => {
@@ -633,21 +737,29 @@ impl Egpu {
                     drop(g);
                     return Ok((endpoint, Lease(Arc::clone(self))));
                 }
-                State::Starting if holds => {}
+                State::Starting if holds => {
+                    g.waiting += 1;
+                    counted = true;
+                }
                 State::Failed if holds && g.failed_at.is_some_and(|t| t.elapsed() < RETRY_AFTER) => {
                     return Err(Unready::Gone(g.error.clone().unwrap_or_else(|| "tinygrad's server failed".into())));
                 }
-                // Another model's request is being answered: it is not cut off.
-                State::Ready | State::Starting if g.busy > 0 => {}
+                // Another model's requests are being answered, or waiting for it to load: it is not cut off.
+                State::Ready | State::Starting if g.busy > 0 || g.waiting > 0 => {}
                 _ => {
                     drop(g);
-                    self.start(cfg, root, name).map_err(Unready::Gone)?;
+                    // (in use after all, taken between this check and the start's: the next turn waits for it)
+                    let begun = self.begin(cfg, root, name, epoch, false, true).map_err(Unready::Gone)?;
                     g = self.lock();
+                    counted = matches!(begun, Begun::Launched);
                     continue;
                 }
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
+                if counted {
+                    g.waiting = g.waiting.saturating_sub(1);
+                }
                 return Err(Unready::Loading(if holds { format!("{name} is still loading on the eGPU; try again shortly") } else { "the eGPU is answering with another model; try again shortly".into() }));
             }
             g = self.changed.wait_timeout(g, left.min(Duration::from_millis(500))).unwrap_or_else(|p| p.into_inner()).0;
@@ -818,6 +930,14 @@ mod tests {
         assert_eq!(typed(root, "~/tinygrad", Some(home)), Path::new("/Users/sam").join("tinygrad"));
         assert_eq!(typed(root, "~/tinygrad", None), config::resolve(root, "~/tinygrad"), "no home known: as any path");
         assert_eq!(typed(root, "tinygrad", Some(home)), config::resolve(root, "tinygrad"));
+    }
+
+    #[test]
+    fn a_named_python_that_is_a_bare_name_is_the_paths_to_find() {
+        let root = Path::new("/conf");
+        let named = |python: &str| pythons(&Json::parse(format!(r#"{{"egpu": {{"python": "{python}"}}}}"#).as_bytes()).unwrap(), root);
+        assert_eq!(named("python3.12"), [PathBuf::from("python3.12")], "not a file beside the configuration");
+        assert_eq!(named("bin/python3"), [config::resolve(root, "bin/python3")]);
     }
 
     #[test]

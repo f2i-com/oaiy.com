@@ -24,5 +24,5 @@ fi
 
 echo
 echo "Built. Start the engines with:"
-echo "  $(pwd)/target/release/oaiy-studio"
+echo "  \"${CARGO_TARGET_DIR:-$(pwd)/target}/release/oaiy-studio\""
 echo "Their control pages open in the browser (http://127.0.0.1:7860); the API is http://127.0.0.1:8080/v1."

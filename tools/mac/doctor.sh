@@ -10,6 +10,10 @@
 say() { printf '%s\n' "$*"; }
 have() { command -v "$1" > /dev/null 2>&1; }
 cd "$(dirname "$0")/../.." 2>/dev/null || true
+# Without Apple's command line tools, /usr/bin/git and /usr/bin/python3 are stand-ins that put up the dialog to
+# install them: this script installs nothing, so it does not run those two then.
+if xcode-select -p > /dev/null 2>&1; then tools=yes; else tools=""; fi
+apples() { [ -z "$tools" ] && [ "$(command -v "$1" 2>/dev/null)" = "/usr/bin/$1" ]; }
 
 say "== This Mac"
 say "macOS $(sw_vers -productVersion 2>/dev/null) ($(uname -m))"
@@ -38,9 +42,10 @@ if have node; then say "Node: $(node --version) (the desktop app's pages need 22
 
 say
 say "== OAIY here"
-say "this checkout: $(git rev-parse --short HEAD 2>/dev/null || echo "not a git checkout") in $(pwd)"
+if apples git; then say "this checkout: in $(pwd) (git not asked: it is Apple's stand-in until the command line tools are there)"
+else say "this checkout: $(git rev-parse --short HEAD 2>/dev/null || echo "not a git checkout") in $(pwd)"; fi
 for b in oaiy-studio oaiy-llm-server oaiy-media; do
-  if [ -x "target/release/$b" ]; then say "$b: built"; else say "$b: not built yet (sh tools/mac/build.sh)"; fi
+  if [ -x "${CARGO_TARGET_DIR:-target}/release/$b" ]; then say "$b: built"; else say "$b: not built yet (sh tools/mac/build.sh)"; fi
 done
 
 say
@@ -63,7 +68,10 @@ out = "Python " + sys.version.split()[0]
 try:
     import tinygrad
     folder = os.path.dirname(os.path.abspath(tinygrad.__file__))
-    server = next((n for n in ("tinygrad.llm", "tinygrad.apps.llm") if importlib.util.find_spec(n) is not None), None)
+    def has(n):
+        try: return importlib.util.find_spec(n) is not None
+        except Exception: return False
+    server = next((n for n in ("tinygrad.llm", "tinygrad.apps.llm") if has(n)), None)
     commit = ""
     try:
         git = os.path.join(os.path.dirname(folder), ".git")
@@ -86,6 +94,7 @@ with=""
 probe() {
   [ -x "$1" ] || return 0
   case " $found " in *" $1 "*) return 0 ;; esac
+  if [ "$1" = /usr/bin/python3 ] && [ -z "$tools" ]; then say "$1: not asked (Apple's stand-in until the command line tools are there)"; return 0; fi
   found="$found $1"
   if [ -n "${TINYGRAD:-}" ]; then line=$(PYTHONPATH="$TINYGRAD" "$1" -c "$check" 2>&1 | tail -1); else line=$("$1" -c "$check" 2>&1 | tail -1); fi
   say "$1: $line"
@@ -103,11 +112,11 @@ if [ "${1:-}" = "--egpu" ]; then
   say
   say "== tinygrad on the card (DEV=${DEV:-NV})"
   py="${PYTHON:-${with:-$(command -v python3 2>/dev/null)}}"
-  if [ -z "$py" ]; then
+  if [ -z "$py" ] || { [ "$py" = /usr/bin/python3 ] && [ -z "$tools" ]; }; then
     say "no python3 to try it with (PYTHON=/path/to/python3 sh tools/mac/doctor.sh --egpu)"
   else
     say "with $py"
-    export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+    export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/Applications/Docker.app/Contents/Resources/bin:$PATH"
     if [ -n "${TINYGRAD:-}" ]; then export PYTHONPATH="$TINYGRAD"; fi
     DEV="${DEV:-NV}" "$py" -c '
 from tinygrad import Tensor, Device

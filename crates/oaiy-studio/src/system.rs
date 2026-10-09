@@ -276,7 +276,8 @@ pub fn browse(path: Option<&str>) -> Result<Json, String> {
     for entry in read.flatten() {
         let p = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') || name.starts_with('$') {
+        // (a Python's own folder is the one hidden folder there is a reason to open: `.venv/bin/python3`)
+        if (name.starts_with('.') && name != ".venv") || name.starts_with('$') {
             continue;
         }
         let Ok(meta) = entry.metadata() else { continue };
@@ -285,8 +286,10 @@ pub fn browse(path: Option<&str>) -> Result<Json, String> {
         } else {
             let ext = p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
             let shown = SHOWN.contains(&ext.as_str()) && (ext != "exe" || name.to_ascii_lowercase().contains("ffmpeg")) && (!ext.is_empty() || name.contains("ffmpeg"));
+            // A Python to run tinygrad with (`python3`, `python3.12`, `python.exe`: the eGPU's setting on a Mac).
+            let python = name.to_ascii_lowercase().starts_with("python") && !name.to_ascii_lowercase().ends_with(".py");
             // NAF's and Real-ESRGAN's weights, the PyTorch files a model needs.
-            if shown || crate::detect::readable_pth(&name) {
+            if shown || python || crate::detect::readable_pth(&name) {
                 files.push((name.to_ascii_lowercase(), entry_json(&p, &name, false, meta.len())));
             }
         }
@@ -419,12 +422,16 @@ mod tests {
         assert!(parse_gpu("garbage").is_none());
         let d = std::env::temp_dir().join(format!("oaiy-studio-browse-{}", std::process::id()));
         std::fs::create_dir_all(d.join("sub")).unwrap();
-        for f in ["a.gguf", "notes.txt", "b.safetensors", "naf_release.pth", "other.pth"] {
+        // (a Python's own folder is shown, other hidden folders are not; and a Python to run tinygrad with, by
+        // any of its names, but not a Python file)
+        std::fs::create_dir_all(d.join(".venv")).unwrap();
+        std::fs::create_dir_all(d.join(".git")).unwrap();
+        for f in ["a.gguf", "notes.txt", "b.safetensors", "naf_release.pth", "other.pth", "python3", "python3.12", "python_notes.py", "tool"] {
             std::fs::write(d.join(f), b"x").unwrap();
         }
         let listing = browse(Some(d.to_str().unwrap())).unwrap();
         let names: Vec<_> = listing.get("entries").unwrap().as_array().unwrap().iter().map(|e| e.get("name").unwrap().as_str().unwrap().to_string()).collect();
-        assert_eq!(names, ["sub", "a.gguf", "b.safetensors", "naf_release.pth"]);
+        assert_eq!(names, [".venv", "sub", "a.gguf", "b.safetensors", "naf_release.pth", "python3", "python3.12"]);
         assert!(browse(Some(d.join("missing").to_str().unwrap())).is_err());
         std::fs::remove_dir_all(d).unwrap();
         assert!(!browse(None).unwrap().get("entries").unwrap().as_array().unwrap().is_empty());
