@@ -973,7 +973,7 @@ dialog::backdrop { background: var(--backdrop); }
             <option value="cpu">CPU only</option></select></label>
           <label class="f"><span>WebGPU weights (GB, empty = by GPU type)</span><input type="number" min="0" data-bind="llm.webgpu_gb" data-type="intnull" placeholder="8 discrete, 2 integrated"></label>
         </div>
-        <p class="muted small">WebGPU runs every model on any Direct3D 12, Vulkan or Metal GPU: weights past the limit stay in RAM and run on the CPU.</p>
+        <p class="muted small">WebGPU runs every model on any Direct3D 12, Vulkan or Metal GPU: weights past the limit stay in RAM and run on the CPU. A Mac's own GPU shares the computer's memory: left empty, it holds what a card with two thirds of that memory would.</p>
         <div class="row" style="margin-top:14px; gap:22px">
           <label class="check"><input type="checkbox" data-bind="llm.enabled"> Enabled</label>
           <label class="check"><input type="checkbox" data-bind="llm.autostart"> Load at startup</label>
@@ -1510,7 +1510,7 @@ function segment(el, value, onpick) {
   el.innerHTML = tiers.map(([v, l]) => `<button type="button" data-tier="${v}" aria-pressed="${v === value}">${l}</button>`).join("");
   $$("button", el).forEach(b => b.onclick = () => { $$("button", el).forEach(x => x.setAttribute("aria-pressed", x === b)); onpick(b.dataset.tier); });
 }
-function gpuTotalGb(i) { const g = sys?.gpus?.find(g => g.index === i); return g ? g.memory_total_mb / 1024 : 32; }
+function gpuTotalGb(i) { const g = sys?.gpus?.find(g => g.index === i); return g?.memory_total_mb ? g.memory_total_mb / 1024 : 32; }
 function strip(memory, vramCap, ramCap, modelGb) {
   // Where a model's blocks land for this mode and budget.
   const total = Math.max(modelGb, 1);
@@ -1635,17 +1635,22 @@ function renderExamples() {
 /* ---------- overview ---------- */
 function renderHardware() {
   const hw = $("#hw"), rows = [];
+  const ram = sys?.ram;
   for (const g of sys?.gpus || []) {
-    const pct = g.memory_total_mb ? g.memory_used_mb / g.memory_total_mb * 100 : 0;
+    // What a GPU's memory holds is known of an NVIDIA card (nvidia-smi); a GPU whose memory is the computer's own
+    // (a Mac's) is as full as the RAM is; of the others only the size is known.
+    const known = g.memory_used_mb != null && g.memory_total_mb, shared = g.unified && ram?.total_mb;
+    const pct = known ? g.memory_used_mb / g.memory_total_mb * 100 : shared ? (ram.total_mb - ram.available_mb) / ram.total_mb * 100 : 0;
     const roles = [];
     const resident = cfg && state?.llm?.resident ? cfg.llm.models.find(m => m.name === state.llm.resident) : null;
     if (cfg && state?.llm?.state === "ready" && modelGpus(resident).includes(g.index)) roles.push("LLM");
     if (cfg && cfg.media.device === g.index) roles.push("media");
+    const size = g.unified ? `Shares the computer's ${g.memory_total_mb ? gb(g.memory_total_mb) + " GB" : "memory"}` : known ? `${gb(g.memory_used_mb)} / ${gb(g.memory_total_mb)} GB` : g.memory_total_mb ? `${gb(g.memory_total_mb)} GB` : "";
+    const does = roles.length ? "Runs " + roles.join(" and ") : g.utilization != null ? g.utilization + "% busy" : "";
     rows.push(`<div class="hw-row"><div class="label">GPU ${g.index}<small>${esc(g.name)}</small></div>
-      <div class="meter" title="${pct.toFixed(0)}% used"><div style="width:${pct}%;background:var(--gpu)"></div></div>
-      <div class="num small">${gb(g.memory_used_mb)} / ${gb(g.memory_total_mb)} GB<br><span class="muted">${roles.length ? "Runs " + roles.join(" and ") : g.utilization + "% busy"}</span></div></div>`);
+      <div class="meter"${known || shared ? ` title="${pct.toFixed(0)}% used"` : ""}><div style="width:${pct}%;background:var(--gpu)"></div></div>
+      <div class="num small">${[size, does && `<span class="muted">${does}</span>`].filter(Boolean).join("<br>")}</div></div>`);
   }
-  const ram = sys?.ram;
   if (ram?.total_mb) {
     const used = ram.total_mb - ram.available_mb;
     rows.push(`<div class="hw-row"><div class="label">RAM<small>System memory</small></div>

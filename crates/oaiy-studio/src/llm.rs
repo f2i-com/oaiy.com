@@ -100,9 +100,11 @@ pub fn launches(llm: &Json, root: &Path) -> Vec<Launch> {
 /// largest GPU's memory, less `llm.vram_headroom_gb` and 2 GB for the cache and the work buffers. WebGPU cannot report
 /// free memory, so the engine otherwise assumes 8 GiB of any discrete card, and a 27B model ran mostly on the CPU of a
 /// 32 GB card. None (the engine's own default) when no GPU says, or the result would be under 4 GB (an integrated GPU,
-/// whose memory is the computer's).
+/// whose memory is the computer's). A GPU whose memory is all of the computer's (`unified`: an Apple-silicon Mac's) is
+/// not a card to fill: the engine picks its share of that memory itself.
 pub fn auto_webgpu_gb(gpus: &Json, llm: &Json) -> Option<i64> {
-    let largest_mb = gpus.as_array()?.iter().filter_map(|g| g.get("memory_total_mb").and_then(Json::as_i64)).max()?;
+    let card = |g: &&Json| g.get("unified").and_then(Json::as_bool) != Some(true);
+    let largest_mb = gpus.as_array()?.iter().filter(card).filter_map(|g| g.get("memory_total_mb").and_then(Json::as_i64)).max()?;
     let headroom = int_or(llm, "vram_headroom_gb", 2).max(0);
     let gb = largest_mb / 1024 - headroom - 2;
     (gb >= 4).then_some(gb)
@@ -550,6 +552,8 @@ mod tests {
         assert_eq!(auto_webgpu_gb(&gpus(&[2048]), &llm(None)), None);
         assert_eq!(auto_webgpu_gb(&gpus(&[]), &llm(None)), None);
         assert_eq!(auto_webgpu_gb(&Json::Arr(vec![Json::obj([("memory_total_mb", Json::Null)])]), &llm(None)), None);
+        // A Mac's GPU, whose 48 GB are the computer's: the engine's own share of them, not 44 of them.
+        assert_eq!(auto_webgpu_gb(&Json::Arr(vec![Json::obj([("memory_total_mb", Json::Int(49152)), ("unified", Json::Bool(true))])]), &llm(None)), None);
     }
 
     #[test]

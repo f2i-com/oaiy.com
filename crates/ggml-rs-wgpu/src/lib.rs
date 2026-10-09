@@ -132,6 +132,8 @@ pub struct AdapterSummary {
     pub device_type: String,
     /// Where the adapter sits on the PCI bus, as the API says (two cards of one model differ only here).
     pub pci_bus_id: String,
+    /// Its memory is the computer's own (an Apple-silicon Mac's GPU): weights on it and weights in RAM share one pool.
+    pub unified: bool,
 }
 
 pub struct WgpuBackend {
@@ -221,7 +223,8 @@ impl WgpuBackend {
     /// "03:00" of two cards alike), for a computer with more than one GPU. `budget_bytes` caps the weights placed on it (WebGPU
     /// cannot report free memory); `None` picks a default: a discrete card's
     /// memory less 4 GiB where Vulkan says how much it has (27.8 GiB of a 32 GB
-    /// card), else 8 GiB; 2 GiB integrated, none for software.
+    /// card), else 8 GiB; an Apple-silicon Mac's GPU as a card with two thirds of
+    /// the computer's memory (`unified_budget`); 2 GiB integrated, none for software.
     ///
     /// Vulkan, D3D12 and Metal only, unless `WGPU_BACKEND` names others: an
     /// instance with OpenGL too starts a WGL thread in NVIDIA's GL driver, and
@@ -304,6 +307,7 @@ impl WgpuBackend {
             backend: format!("{:?}", info.backend),
             device_type: format!("{:?}", info.device_type),
             pci_bus_id: info.device_pci_bus_id.clone(),
+            unified: unified(&info),
         };
         let mut limits = adapter.limits();
         if let Some(v) = std::env::var_os("OAIY_PORTABLE_LIMITS") {
@@ -399,6 +403,8 @@ impl WgpuBackend {
         });
         let budget = budget_bytes.unwrap_or(match info.device_type {
             wgpu::DeviceType::DiscreteGpu => device_memory(&adapter).map_or(8 * GIB, discrete_budget),
+            // (a Mac's own GPU: the computer's memory is its memory, so its share of that, not an integrated GPU's 2 GiB)
+            wgpu::DeviceType::IntegratedGpu if summary.unified => host_unified_budget().unwrap_or(2 * GIB),
             wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::VirtualGpu => 2 * GIB,
             _ => 0,
         });

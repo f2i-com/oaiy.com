@@ -1,5 +1,6 @@
 //! What the machine has: GPUs (through `nvidia-smi`; without an NVIDIA driver,
-//! the display adapters the OS knows, AMD and Intel among them), RAM, and a
+//! the display adapters the OS knows, AMD and Intel among them, and an
+//! Apple-silicon Mac's own, whose memory is the computer's), RAM, and a
 //! directory listing for the UI's file picker.
 
 use oaiy_engine::json::Json;
@@ -49,7 +50,8 @@ impl System {
     /// from `nvidia-smi`. Without an NVIDIA driver, the display adapters the OS
     /// knows (an AMD or Intel GPU, which the engine runs on through WebGPU), with
     /// their `vendor` and total memory only: `index` is then their place in that
-    /// list, not nvidia-smi's. Empty when neither says.
+    /// list, not nvidia-smi's. A Mac's GPU also says `unified`: its memory is the
+    /// computer's. Empty when neither says.
     pub fn gpus(&self) -> Json {
         Self::cached(&self.gpus, GPU_TTL, || {
             let out = quiet("nvidia-smi")
@@ -166,9 +168,63 @@ fn other_gpus() -> Vec<Json> {
     out
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+/// An Apple-silicon Mac's GPU, in the shape the others have: the chip's own name (its GPU has no other) and, for its
+/// memory, the computer's, which is what it has. `unified` says so: a page shows it as sharing the RAM, and the
+/// weights' share of it is the engine's own to pick ([`crate::llm::auto_webgpu_gb`] leaves it alone).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn apple_gpu(chip: &str, total_mb: Option<u64>) -> Json {
+    let name = match chip.trim() {
+        "" => "Apple GPU",
+        chip => chip,
+    };
+    match adapter(0, name, "apple", total_mb) {
+        Json::Obj(mut fields) => {
+            fields.push(("unified".into(), Json::Bool(true)));
+            Json::Obj(fields)
+        }
+        other => other,
+    }
+}
+
+/// What one of the programs every Mac has printed (`sysctl`, `vm_stat`), or None. By its full path: a program started
+/// from the Finder has a short PATH.
+#[cfg(target_os = "macos")]
+fn said(program: &str, args: &[&str]) -> Option<String> {
+    let out = quiet(program).args(args).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// macOS on Apple silicon: the chip's GPU, whose memory is the computer's. An Intel Mac's adapters are not read (its
+/// GPUs have memory of their own that `sysctl` does not tell), so it lists none, as before.
+#[cfg(target_os = "macos")]
+fn other_gpus() -> Vec<Json> {
+    if !cfg!(target_arch = "aarch64") {
+        return Vec::new();
+    }
+    let chip = said("/usr/sbin/sysctl", &["-n", "machdep.cpu.brand_string"]).unwrap_or_default();
+    vec![apple_gpu(&chip, ram_mb().map(|(total, _)| total))]
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn other_gpus() -> Vec<Json> {
     Vec::new()
+}
+
+/// The megabytes a new allocation can have on a Mac, from `vm_stat`'s text: its free, speculative and inactive pages
+/// (the last the file cache the system drops when asked), at the page size the first line says (16 KB on Apple
+/// silicon). "Pages free" alone undercounts badly, as Linux's MemFree does.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn parse_vm_stat(text: &str) -> Option<u64> {
+    let page = text.lines().next()?.split("page size of ").nth(1)?.split_whitespace().next()?.parse::<u64>().ok()?;
+    let pages = |name: &str| text.lines().find_map(|l| l.strip_prefix(name)).and_then(|v| v.trim().trim_end_matches('.').parse::<u64>().ok());
+    Some((pages("Pages free:")? + pages("Pages inactive:")? + pages("Pages speculative:").unwrap_or(0)) * page / (1024 * 1024))
+}
+
+#[cfg(target_os = "macos")]
+fn ram_mb() -> Option<(u64, u64)> {
+    let total = said("/usr/sbin/sysctl", &["-n", "hw.memsize"])?.trim().parse::<u64>().ok()? / (1024 * 1024);
+    let available = parse_vm_stat(&said("/usr/bin/vm_stat", &[])?)?;
+    Some((total, available.min(total)))
 }
 
 #[cfg(target_os = "linux")]
@@ -192,7 +248,7 @@ fn ram_mb() -> Option<(u64, u64)> {
     Some((it.next()? / 1024, it.next()? / 1024))
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn ram_mb() -> Option<(u64, u64)> {
     None
 }
@@ -311,6 +367,42 @@ mod tests {
         assert!(parse_windows_adapters("").is_empty());
         assert_eq!(vendor_of("0x1002"), "amd");
         assert_eq!(vendor_of("0x8086"), "intel");
+    }
+
+    #[test]
+    fn an_apple_silicon_macs_gpu_is_the_chip_with_the_computers_memory() {
+        let g = apple_gpu("Apple M4 Pro\n", Some(49152));
+        assert_eq!(g.get("index").and_then(Json::as_i64), Some(0));
+        assert_eq!(g.get("name").and_then(Json::as_str), Some("Apple M4 Pro"));
+        assert_eq!(g.get("vendor").and_then(Json::as_str), Some("apple"));
+        assert_eq!(g.get("memory_total_mb").and_then(Json::as_i64), Some(49152));
+        assert_eq!(g.get("unified").and_then(Json::as_bool), Some(true));
+        // what it uses is the computer's use, which the RAM's own row shows
+        assert_eq!(g.get("memory_used_mb"), Some(&Json::Null));
+        // a chip `sysctl` would not name, on a Mac whose memory could not be read
+        let unknown = apple_gpu("", None);
+        assert_eq!(unknown.get("name").and_then(Json::as_str), Some("Apple GPU"));
+        assert_eq!(unknown.get("memory_total_mb"), Some(&Json::Null));
+        // the others say nothing of it
+        assert_eq!(adapter(0, "AMD Radeon(TM) Graphics", "amd", Some(2048)).get("unified"), None);
+    }
+
+    #[test]
+    fn a_macs_available_memory_is_read_from_vm_stat() {
+        // (the lines `vm_stat` prints, their counts made up: 16 KB pages, as Apple silicon's)
+        let text = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
+                    Pages free:                               20000.\n\
+                    Pages active:                            400000.\n\
+                    Pages inactive:                          300000.\n\
+                    Pages speculative:                         5000.\n\
+                    Pages wired down:                        150000.\n\
+                    Pages purgeable:                           1000.\n\
+                    \"Translation faults\":                 123456789.\n\
+                    Pages occupied by compressor:             30000.\n";
+        assert_eq!(parse_vm_stat(text), Some((20000 + 300000 + 5000) * 16384 / (1024 * 1024)));
+        assert_eq!(parse_vm_stat("Mach Virtual Memory Statistics: (page size of 4096 bytes)\nPages free: 512.\nPages inactive: 256.\n"), Some(3));
+        assert_eq!(parse_vm_stat(""), None);
+        assert_eq!(parse_vm_stat("Pages free: 10.\nPages inactive: 5.\n"), None);
     }
 
     #[test]

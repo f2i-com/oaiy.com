@@ -41,7 +41,9 @@ GPU").
 - **Budget:** WebGPU cannot report free memory, so a budget caps the weights
   placed on the GPU: a discrete card's memory less 4 GiB where Vulkan reports it
   (its largest device-local heap: 27.8 GiB of a 32 GB card), else 8 GiB; 2 GiB on
-  an integrated GPU; or `--webgpu-gb N`. The old 8 GiB of any discrete card kept
+  an integrated GPU; an Apple-silicon Mac's GPU, whose memory is the computer's,
+  as a card with two thirds of that memory ("Apple silicon", below); or
+  `--webgpu-gb N`. The old 8 GiB of any discrete card kept
   5 GB of Qwen3.8 27B Q3_K_M (13.4 GB) on the CPU of a 32 GB card: 2.0 tokens a
   second where the whole model on the GPU made 6.0. Weights past it (and types without a shader) stay in RAM and
   use the CPU path. A model bigger than the GPU still runs, split between the two.
@@ -669,6 +671,44 @@ card has been tried. The shaders are plain WGSL, but driver compilers differ, so
 run `cargo test -p ggml-rs-wgpu` on a new adapter before trusting it. The budgets
 are not measurements: drivers often spill oversubscribed buffers to system memory
 silently, so they get slower rather than failing.
+
+### Apple silicon
+
+**Not run on a Mac yet.** The engine, its server and the studio type-check for
+`aarch64-apple-darwin` from Windows (`cargo check --target aarch64-apple-darwin
+-p ggml-rs-wgpu -p oaiy-llm-server -p oaiy-studio`); nothing below has been
+measured, and no release is built for macOS.
+
+An M-series Mac has one GPU, and its memory is the computer's own (Metal's
+`hasUnifiedMemory`, which wgpu reports as an integrated GPU). Taken for an
+integrated GPU it got 2 GiB of weights and ran the rest of a model on the CPU.
+It now holds what a card with two thirds of the computer's memory would
+(`unified_budget`: that less 4 GiB, or half of it under 8 GiB), the other third
+left to the system, its programs and the model's own use of the CPU:
+
+| The Mac's memory | Weights on its GPU |
+| --- | --- |
+| 16 GB | 6.7 GiB |
+| 24 GB | 12 GiB |
+| 32 GB | 17.3 GiB |
+| 48 GB | 28 GiB |
+| 64 GB | 38.7 GiB |
+
+Where the Mac's owner has told macOS how much its GPU may keep (`sudo sysctl
+iogpu.wired_limit_mb=N`; `sysctl iogpu.wired_limit_mb` reads it, 0 is the
+system's own choice), that is the card's size instead. `--webgpu-gb N`
+(`llm.webgpu_gb` in OAIY) sets the weights' budget outright, as on any GPU.
+Weights on the GPU and weights left in RAM come out of the same memory there, so
+a budget past what is free makes the Mac swap rather than fail.
+
+The computer's memory is read from `sysctl -n hw.memsize` and `vm_stat` (free,
+speculative and inactive pages are what a new allocation can have), by the engine
+for its caches and by the studio, which lists the chip as the one GPU, "sharing
+the computer's memory", and leaves its budget to the engine. An Intel Mac's GPUs
+are not listed.
+
+A GPU on a Thunderbolt enclosure is not reached this way: macOS on Apple silicon
+has no Metal driver for one, so WebGPU does not see it.
 
 These runs gave the same tokens as the CPU, but that is not guaranteed in
 general: the GPU sums each dot product in a different order, so a near-tie
