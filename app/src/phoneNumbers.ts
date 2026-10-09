@@ -230,6 +230,15 @@ export function toE164(raw: string | null | undefined, country: string | Country
 }
 
 /**
+ * Whether a sender is a phone number a person texts from, and can be texted
+ * back at: one that reads as a phone number. Not a hidden caller, not a sender
+ * id of letters (the carrier's "Missed calls", a bank's name), not a short code.
+ */
+export function isPersonNumber(raw: string | null | undefined, country: string | Country = localCountry()): boolean {
+  return toE164(raw, country) !== null;
+}
+
+/**
  * The key a caller is known by: their number's E.164 form; anything else as
  * it is (a short code's digits, a sender id of letters). A hidden caller has
  * none (''): each such call is its own.

@@ -15,7 +15,8 @@ import { TOOLS } from './agent/tools';
 import type { Turn } from './agent/protocol';
 import type { Contact, Desktop, DesktopEvent } from './desktop/bridge';
 import { callCalendarTools, textCalendarTools } from './desktop/calendarTools';
-import { isHidden, localCountry, phoneKey, samePerson } from './phoneNumbers';
+import { isBlocked, type Screening } from './callbacks';
+import { isHidden, isPersonNumber, localCountry, phoneKey, samePerson } from './phoneNumbers';
 import type { MessageSettings } from './settings';
 import { MAX_FACTS, regroup, threadId, threadOrder, type Way } from './threads';
 import type { CallerNote, OpenProject, SessionInfo } from './vfs/projects';
@@ -172,6 +173,8 @@ export interface SessionHooks {
   finished?: (session: Session) => void;
   /** What is known about a person changed (the phone greets them by name). */
   named?: (note: CallerNote) => void;
+  /** Aokie's call screening now: a number on its blocked list is not answered or texted either (null: the phone cannot be asked). */
+  screening?: () => Promise<Screening | null>;
 }
 
 /**
@@ -1066,19 +1069,25 @@ export class Sessions {
       return session;
     }
     const test = info.key === TEST_NUMBER;
-    const own = [this.replyTool(session, test), ...this.personTools(session)];
+    const reply = this.replyTool(session, test);
+    const person = this.personTools(session);
     // A pretend thread does not put requests in the real calendar.
     const calendar = test ? [] : textCalendarTools(this.desktop, session.key, () => session.title);
     // Someone texted for an outreach: its objective and record_result, while their replies are its (and a while after).
     const link = () => this.outreach?.forText(session.key);
     session.agent = this.makeAgent({
-      instructions: () => this.directed([smsInstructions(session.title, session.key, this.settings().instructions, test, knownText(this.callerNote(session.key)), new Date(), this.identity()), link()?.instructions()].filter(Boolean).join('\n')),
+      instructions: () => {
+        const refused = this.notAnswered(session);
+        // Their texts are kept for the person to read: the agent has nothing to send them with, and is told why.
+        const kept = refused ? `This sender is ${refused}: nothing is sent to them, and you have no send_text_message here. Their messages are kept for the person you work for to read.` : '';
+        return this.directed([smsInstructions(session.title, session.key, this.settings().instructions, test, knownText(this.callerNote(session.key)), new Date(), this.identity()), kept, link()?.instructions()].filter(Boolean).join('\n'));
+      },
       // A texter reaches the front desk's files, to read (see KNOWLEDGE_TOOLS).
       tools: TOOLS.filter((t) => KNOWLEDGE_TOOLS.has(t.name)),
       // The calendar's tools only while there is a calendar (a plugin provides it).
       sessionTools: () => {
         const outreach = link();
-        return [...own, ...(this.calendarOn() ? calendar : []), ...(outreach ? [outreach.resultTool()] : [])];
+        return [...(this.notAnswered(session) ? [] : [reply]), ...person, ...(this.calendarOn() ? calendar : []), ...(outreach ? [outreach.resultTool()] : [])];
       },
       conversation: true,
     }, 'sms');
@@ -2121,6 +2130,8 @@ export class Sessions {
         if (!body) throw new Error('body is empty: write the message to send');
         if (body.length > 1600) throw new Error(`the message is ${body.length} characters: keep it under 1600 (a text message is read on a phone)`);
         if (test) return `Not sent (a test conversation): "${body}"`;
+        const refused = this.notAnswered(session, await this.readBlocked());
+        if (refused) throw new Error(`Not sent: ${session.title || session.key} is ${refused}, and nothing is sent to them. Do not try again.`);
         const desktop = this.desktop();
         if (!desktop) throw new Error('OAIY Desktop is not connected, so the phone cannot send it. Tell the person you work for.');
         const key = `oaiy:sms:${session.id}:${crypto.randomUUID()}`;
@@ -2129,6 +2140,35 @@ export class Sessions {
         return `Sent to ${session.title || session.key}${id}.`;
       },
     };
+  }
+
+  /** The phone's blocked list, as last read. */
+  private blocked = '';
+
+  /** The phone's blocked list read again (as it last was while the phone cannot be asked). */
+  private async readBlocked(): Promise<string> {
+    const read = await this.hooks.screening?.().catch(() => null);
+    if (read) this.blocked = read.blockedNumbers;
+    return this.blocked;
+  }
+
+  /** The blocked list read now, before something that goes by it as last read (`answerWaiting`). */
+  async refreshBlocked(): Promise<void> {
+    await this.readBlocked();
+  }
+
+  /**
+   * Why the sender of a text thread is not answered or texted ('' when they
+   * are): no person's phone number (a sender id of letters such as the
+   * carrier's "Missed calls", a short code, a hidden caller), or a number on the
+   * phone's blocked list. Their texts are kept, as when answering is off. The
+   * pretend conversation is always answered.
+   */
+  notAnswered(session: Session, blocked = this.blocked): string {
+    if (session.key === TEST_NUMBER) return '';
+    if (session.hidden || !isPersonNumber(session.key)) return "not a person's phone number (a sender's name or a short code)";
+    if (isBlocked(session.key, blocked)) return "on the phone's blocked list";
+    return '';
   }
 
   /** Whether a lane is the person at `key` (never a hidden caller's, and the pretend conversation only itself). */
@@ -2185,7 +2225,8 @@ export class Sessions {
     if (event.name === 'aokie.call.incoming') {
       // (Not one heard of late, as when the desktop was out of reach a while: it has been answered or missed by now.)
       const at = Date.parse(event.occurredAt);
-      if (this.answersCalls() && !(now - at > RING_FRESH_MS)) this.warmCall({ number: String(event.data.from ?? ''), name: String(event.data.name ?? ''), ...(call ? { callId: call } : {}) });
+      // (Nor a blocked number's: the phone hangs up on it.)
+      if (this.answersCalls() && !(now - at > RING_FRESH_MS) && !isBlocked(String(event.data.from ?? ''), this.blocked)) this.warmCall({ number: String(event.data.from ?? ''), name: String(event.data.name ?? ''), ...(call ? { callId: call } : {}) });
       return null;
     }
     if (event.name === 'aokie.call.ended') {
@@ -2219,9 +2260,12 @@ export class Sessions {
     this.hooks.arrived?.(session, text);
     // STOP from someone texted for an outreach is read by code, first: they are not contacted again, and nothing is sent back.
     const stopped = this.outreach?.stopWord(session.key, body) ?? false;
+    // A sender that is no person's number (the carrier's "Missed calls", a short code), or one on the
+    // phone's blocked list, is never answered: kept, as when answering is off.
+    const refused = this.notAnswered(session, await this.readBlocked());
     // A pretend text is always answered: trying the agent is what it is for. Someone texted for an
     // outreach is answered even while answering is off (only them: the outreach's objective is theirs).
-    if (!stopped && (this.settings().answer || session.key === TEST_NUMBER || !!this.outreach?.forText(session.key))) this.deliver(session, text);
+    if (!stopped && !refused && (this.settings().answer || session.key === TEST_NUMBER || !!this.outreach?.forText(session.key))) this.deliver(session, text);
     else {
       // Kept, not answered: it is there when the person looks, or answers it themselves.
       session.agent.turns.push({ role: 'user', text, at: Date.now() });
@@ -2245,6 +2289,8 @@ export class Sessions {
       if (session.running || this.queue.includes(session) || Date.now() - session.lastAt > within) continue;
       const last = session.agent.turns.at(-1);
       if (last?.role !== 'user' || !last.text.startsWith('Text message from ')) continue;
+      // Never one from a sender who is not answered at all (no person's number, or a blocked one).
+      if (session.kind !== 'sms' || this.notAnswered(session)) continue;
       session.agent.turns.pop();
       // Answered now, and kept as it came.
       if (typeof last.at === 'number') session.waitingSince ??= last.at;

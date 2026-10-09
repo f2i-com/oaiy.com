@@ -4,7 +4,7 @@ import type { Turn } from '../../src/agent/protocol';
 import { NetGate } from '../../src/gate/netgate';
 import { Vfs } from '../../src/vfs/vfs';
 import type { SessionInfo } from '../../src/vfs/projects';
-import { DesktopEvents, Sessions, TEST_NUMBER, textMessage } from '../../src/sessions';
+import { DesktopEvents, Sessions, TEST_NUMBER, textMessage, type SessionHooks } from '../../src/sessions';
 import type { Desktop, DesktopEvent } from '../../src/desktop/bridge';
 import { DEFAULT_MESSAGE_SETTINGS, type MessageSettings } from '../../src/settings';
 import { OPENAI, fakeProvider } from './fakeProvider';
@@ -48,7 +48,7 @@ function fakeDesktop() {
   return desktop;
 }
 
-function setup(partial: Partial<MessageSettings> & { answer: boolean; instructions: string }, desktop = fakeDesktop()) {
+function setup(partial: Partial<MessageSettings> & { answer: boolean; instructions: string }, desktop = fakeDesktop(), hooks: Partial<SessionHooks> = {}) {
   // The same object the test may change later.
   const messages = Object.assign(partial, { calls: partial.calls ?? false, callInstructions: partial.callInstructions ?? '' }) as MessageSettings;
   const store = fakeProject();
@@ -60,7 +60,7 @@ function setup(partial: Partial<MessageSettings> & { answer: boolean; instructio
     (extra) => new Agent({ vfs, gate: new NetGate(), provider: () => OPENAI, projectSummary: () => 'Project: phone', ...extra }),
     () => messages,
     () => desktop as unknown as Desktop,
-    { changed: () => changes++, event: (session, event) => events.push({ id: session.id, event }) },
+    { changed: () => changes++, event: (session, event) => events.push({ id: session.id, event }), ...hooks },
   );
   return { sessions, store, desktop, events, changes: () => changes };
 }
@@ -114,6 +114,61 @@ describe('text-message conversations', () => {
     expect(desktop.commands.map((c) => c.payload.body)).toEqual(['Hi! How can I help?']);
     // The text is in the conversation once, not twice.
     expect(session.agent.turns.filter((t) => t.role === 'user' && t.text.includes('Hello'))).toHaveLength(1);
+  });
+
+  it('a sender that is no person\'s number (the carrier\'s "Missed calls", a short code) is kept and never answered or texted', async () => {
+    const fake = fakeProvider('openai', []);
+    const messages = { answer: true, instructions: '' };
+    const { sessions, desktop } = setup(messages);
+    const missed = await sessions.textArrived('Missed calls', '', 'You missed 1 call from +61400000003.');
+    const code = await sessions.textArrived('55555', '', 'Your code is 123456');
+    await settled(sessions);
+    // Kept as they came; nothing was asked of the model, and nothing of the phone.
+    expect(missed.agent.turns).toEqual([{ role: 'user', text: textMessage('Missed calls', 'Missed calls', 'You missed 1 call from +61400000003.'), at: expect.any(Number), via: 'sms' }]);
+    expect(code.agent.turns).toHaveLength(1);
+    expect(fake.bodies).toHaveLength(0);
+    expect(desktop.commands).toEqual([]);
+    expect(sessions.notAnswered(missed)).toContain("not a person's phone number");
+    expect(sessions.notAnswered(code)).toContain("not a person's phone number");
+    // Answering switched on again does not take them up either.
+    expect(sessions.answerWaiting()).toBe(0);
+    expect(sessions.busy).toBe(false);
+  });
+
+  it("a number on the phone's blocked list is kept, not answered, and answered again once it is taken off", async () => {
+    const fake = fakeProvider('openai', []);
+    let blocked = '0400 000 004';
+    const { sessions, desktop } = setup({ answer: true, instructions: '' }, fakeDesktop(), { screening: async () => ({ acceptPattern: '', blockedNumbers: blocked, rejectPrivate: false }) });
+    const session = await sessions.textArrived('+61400000004', '', 'Hi there');
+    await settled(sessions);
+    expect(session.agent.turns).toHaveLength(1);
+    expect(fake.bodies).toHaveLength(0);
+    expect(desktop.commands).toEqual([]);
+    expect(sessions.notAnswered(session)).toBe("on the phone's blocked list");
+    expect(sessions.answerWaiting()).toBe(0);
+    // Taken off the list: their next text is answered.
+    blocked = '';
+    fakeProvider('openai', [{ calls: [{ name: 'send_text_message', input: { body: 'Hello!' } }] }, { text: 'Replied.' }]);
+    await sessions.textArrived('+61400000004', '', 'Anyone there?');
+    await settled(sessions);
+    expect(desktop.commands.map((c) => c.payload.body)).toEqual(['Hello!']);
+  });
+
+  it('a number blocked while its reply is being written is not texted: the reply tool refuses', async () => {
+    let blocked = '';
+    fakeProvider('openai', [
+      () => {
+        blocked = '+61400000005';
+        return { calls: [{ name: 'send_text_message', input: { body: 'On our way.' } }] };
+      },
+      { text: 'It could not be sent.' },
+    ]);
+    const { sessions, desktop, events } = setup({ answer: true, instructions: '' }, fakeDesktop(), { screening: async () => ({ acceptPattern: '', blockedNumbers: blocked, rejectPrivate: false }) });
+    await sessions.textArrived('+61400000005', '', 'Where are you?');
+    await settled(sessions);
+    expect(desktop.commands).toEqual([]);
+    const result = events.find((e) => e.event.type === 'tool_result')?.event as Extract<AgentEvent, { type: 'tool_result' }>;
+    expect(result.result.content).toContain("on the phone's blocked list");
   });
 
   it('a pretend text is answered but never sent', async () => {

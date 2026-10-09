@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { PersonIndex, detectCountry, displayNumber, isHidden, phoneKey, samePerson, setLocalCountry, splitE164, toE164 } from '../../src/phoneNumbers';
+import { PersonIndex, detectCountry, displayNumber, isHidden, isPersonNumber, phoneKey, samePerson, setLocalCountry, splitE164, toE164 } from '../../src/phoneNumbers';
 
 /** A small deterministic random generator (mulberry32), so that a failure can be found again. */
 function seeded(seed: number): () => number {
@@ -206,5 +206,10 @@ describe('a caller id as a person: E.164, read with the country for local number
     expect(phoneKey('020 7946 0958')).toBe('+442079460958');
     setLocalCountry('AU');
     expect(phoneKey('0491 570 006')).toBe('+61491570006');
+  });
+
+  it("a person's number is one that reads as a phone number: not a sender's name, a short code or a hidden caller", () => {
+    for (const n of ['+61 491 570 006', '0491570006', '61491570006', '+1 415 555 0100', '(02) 9374 4000']) expect(isPersonNumber(n, 'AU'), n).toBe(true);
+    for (const n of ['Missed calls', 'MyBank', 'VOICEMAIL', '55555', '321', '+61101', '', 'Private', 'No Caller ID', null, undefined]) expect(isPersonNumber(n, 'AU'), String(n)).toBe(false);
   });
 });

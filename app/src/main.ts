@@ -713,6 +713,8 @@ async function main(): Promise<void> {
       () => desktop,
       {
         changed: () => renderSessions(),
+        // A number on the phone's blocked list is not answered or texted by a text thread either.
+        screening: readScreening,
         // A caller's words, or a text, while an agent of theirs answers go where they came, without splitting the reply being written.
         arrived: (session, text) => {
           if (viewing !== session.thread) return;
@@ -2083,6 +2085,8 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       }
     }
     if (holdsTexts && !was && messages.answer) {
+      // (The blocked list first: a blocked number's waiting text is not answered.)
+      await sessions?.refreshBlocked();
       const n = sessions?.answerWaiting() ?? 0;
       if (n) chat.system(`Answering ${n} text message${n > 1 ? 's' : ''} that came while this page was not answering.`);
     }
