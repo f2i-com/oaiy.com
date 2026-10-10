@@ -222,6 +222,19 @@ is whether macOS attaches a driver of its own to the dongle, which the probe and
 `sh tools/mac/doctor.sh` show (the section on a USB Bluetooth dongle), and whether call
 audio keeps time over libusb there, which only a call can show.
 
+**OAIY Voice runs on a Mac.** No installer carries its server, `oaiy-voice` (see
+[RELEASING.md](RELEASING.md#what-is-not-in-a-release)): `sh tools/mac/build.sh --voice` builds it, and its last
+lines say to copy it into `~/Library/Application Support/com.oaiy.app/bin`, where the service runs it from. The
+service's **Install** fetches its models with `install-oaiy-voice.sh` (Parakeet TDT 0.6B v2 and Qwen3-TTS 0.6B
+Base, about 4.3 GB, each large file checked against its SHA-256), as `install-oaiy-voice.ps1` does on Windows; an
+app built before 11 October 2026 has only the Windows script and says "no install script for oaiy-voice on unix".
+On an M5 Pro (11 October 2026): speech to text runs on the CPU at a seventh of real time (3.5 s of speech in
+0.47 s); speech is made on the Mac's GPU through WebGPU, a line at 0.82 to 0.85 of real time with its first sound
+after about 0.2 s, or later when the model starts a line with silence, which is made and then cut. Most of that is
+the talker (37 ms a frame of 80 ms); the codec's share fell from 520 ms a chunk to about 100 when only its
+transformer went on reading the stream's 120 frames of context and the stages after it the chunk and the 14 frames
+they reach back (the same samples).
+
 **Checked from Windows and Linux** (`cargo check --target aarch64-apple-darwin`, which
 reads the Rust and links nothing): the Engines host, the language-model server and the
 GPU backend, with their tests; the desktop app's Rust; and `oaiy-media`, `oaiy-voice` and

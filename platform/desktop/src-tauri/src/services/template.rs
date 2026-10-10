@@ -261,6 +261,16 @@ mod tests {
             assert!(script.contains(&format!("name = '{model}'")), "the installer must find or fetch {model}");
         }
         assert!(t.installed_marker.as_deref().is_some_and(|m| script.contains("'.oaiy-installed'") && m.ends_with("oaiy-voice/.oaiy-installed")));
+        // A Mac and Linux install the same models with the same checks.
+        assert!(matches!(&t.install, super::InstallSpec::Script { unix: Some(s), .. } if s == "install-oaiy-voice.sh"));
+        let sh = &t.files["install-oaiy-voice.sh"];
+        for model in [arg("--stt-model-dir").unwrap(), arg("--tts-model-dir").unwrap()] {
+            assert!(sh.contains(&format!("install_model {model} ")), "the Unix installer must find or fetch {model}");
+        }
+        for sha in script.match_indices("sha256 = '").map(|(i, _)| &script[i + 10..i + 74]) {
+            assert!(sh.contains(sha), "the Unix installer must check {sha} as the Windows one does");
+        }
+        assert!(sh.contains("/oaiy-voice/.oaiy-installed\""), "the Unix installer must write the marker");
         assert!(t.autostart, "the voice is loaded before the first call");
     }
 
