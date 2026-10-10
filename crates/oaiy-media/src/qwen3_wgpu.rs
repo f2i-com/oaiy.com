@@ -100,8 +100,17 @@ impl WgpuQwen3 {
 
     /// A key-value cache for `capacity` positions (each layer's keys then values a row), from position 0.
     pub fn cache(&self, gpu: &WgpuBackend, capacity: usize) -> Cache {
-        let row = 2 * self.kv_heads * self.head_dim;
-        Cache { kv: (0..self.layers.len()).map(|_| gpu.vec(capacity * row)).collect(), len: 0, capacity }
+        let (row, hd) = (2 * self.kv_heads * self.head_dim, self.head_dim);
+        // rotate-half RoPE's table for every position: each position's (sin, cos) a pair
+        let table: Vec<f32> = (0..capacity)
+            .flat_map(|p| (0..hd / 2).flat_map(move |i| {
+                let a = p as f64 / self.theta.powf(2. * i as f64 / hd as f64);
+                [a.sin() as f32, a.cos() as f32]
+            }))
+            .collect();
+        let rope = gpu.vec(table.len());
+        gpu.upload(&rope, &table);
+        Cache { kv: (0..self.layers.len()).map(|_| gpu.vec(capacity * row)).collect(), len: 0, capacity, rope, scratch: Vec::new() }
     }
 
     /// The final, normed hidden states (`[t, hidden]`) of a prompt's embeddings `x` (`[t, hidden]`, from position 0),
@@ -118,20 +127,44 @@ impl WgpuQwen3 {
         assert_eq!(out.len, t * h, "Qwen3 on WebGPU: a step's states exactly its rows");
         let past = cache.len;
         assert!(past + t <= cache.capacity, "Qwen3 on WebGPU: {} positions past its cache's {}", past + t, cache.capacity);
-        // rotate-half RoPE's table for the rows' positions: each position's (sin, cos) a pair
-        let table: Vec<f32> = (past..past + t)
-            .flat_map(|p| (0..hd / 2).flat_map(move |i| {
-                let a = p as f64 / self.theta.powf(2. * i as f64 / hd as f64);
-                [a.sin() as f32, a.cos() as f32]
-            }))
-            .collect();
-        let td = gpu.vec(table.len());
-        gpu.upload(&td, &table);
-        let v = |n: usize| gpu.vec(n);
-        let (n, q, k, vv, qn, kn, att, o) = (v(t * h), v(t * nq * hd), v(t * nkv * hd), v(t * nkv * hd), v(t * nq * hd), v(t * nkv * hd), v(gpu.attention_rows_out_len(t, nq, hd, past + t)), v(t * h));
-        let (g, u, act) = (v(t * self.ff), v(t * self.ff), v(t * self.ff));
-        let one = gpu.vec(1);
-        gpu.upload(&one, &[1.0]);
+        // The step's vectors are the cache's, kept for its row count: a step made new ones each time (and new bind
+        // groups for them), which was most of a code predictor's step of 1 row. Their values are this step's alone:
+        // the rows' RoPE table is copied from the cache's on the GPU, in the recording's order.
+        let at = match cache.scratch.iter().position(|s| s.rows == t) {
+            Some(at) => at,
+            None => {
+                let v = |n: usize| gpu.vec(n);
+                let one = v(1);
+                gpu.upload(&one, &[1.0]);
+                let att = v(gpu.attention_rows_out_len(t, nq, hd, cache.capacity));
+                cache.scratch.push(Scratch {
+                    rows: t,
+                    td: v(t * hd),
+                    n: v(t * h),
+                    q: v(t * nq * hd),
+                    k: v(t * nkv * hd),
+                    vv: v(t * nkv * hd),
+                    qn: v(t * nq * hd),
+                    kn: v(t * nkv * hd),
+                    att,
+                    o: v(t * h),
+                    g: v(t * self.ff),
+                    u: v(t * self.ff),
+                    act: v(t * self.ff),
+                    one,
+                });
+                cache.scratch.len() - 1
+            }
+        };
+        let Scratch { td, n, q, k, vv, qn, kn, att, o, g, u, act, one, .. } = &cache.scratch[at];
+        let wider;
+        let att = if att.len >= gpu.attention_rows_out_len(t, nq, hd, past + t) {
+            att
+        } else {
+            wider = gpu.vec(gpu.attention_rows_out_len(t, nq, hd, past + t));
+            &wider
+        };
+        r.copy(&cache.rope, past * hd, td, 0, t * hd);
         r.copy(x, 0, out, 0, t * h);
         for (l, kv) in self.layers.iter().zip(&cache.kv) {
             r.rmsnorm_rows(out, &l.input_norm, &n, t, self.eps);
@@ -165,4 +198,26 @@ pub struct Cache {
     kv: Vec<DeviceVec>,
     pub len: usize,
     capacity: usize,
+    /// RoPE's table for every position (`[capacity, head_dim]`: each position's (sin, cos) pairs).
+    rope: DeviceVec,
+    /// A step's vectors, kept for each row count it has taken.
+    scratch: Vec<Scratch>,
+}
+
+/// The vectors a step of `rows` rows works in (its rows' RoPE table, the layers' intermediates, a 1 for the sums).
+struct Scratch {
+    rows: usize,
+    td: DeviceVec,
+    n: DeviceVec,
+    q: DeviceVec,
+    k: DeviceVec,
+    vv: DeviceVec,
+    qn: DeviceVec,
+    kn: DeviceVec,
+    att: DeviceVec,
+    o: DeviceVec,
+    g: DeviceVec,
+    u: DeviceVec,
+    act: DeviceVec,
+    one: DeviceVec,
 }

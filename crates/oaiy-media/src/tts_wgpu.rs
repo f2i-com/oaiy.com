@@ -85,6 +85,29 @@ pub struct WgpuTalker {
     config: Json,
     hidden: usize,
     predictor_hidden: usize,
+    /// What a line's frames keep for the next line: the code predictor's cache and its steps' vectors.
+    kept: Option<Kept>,
+}
+
+/// The code predictor's cache (17 positions: a frame's) and the vectors its steps read and write, for one or two rows
+/// (a frame's first step reads the talker's state and the first code's embedding): kept from step to step and line
+/// to line, so its 15 steps a frame record the same vectors each time, and their bind groups are kept
+/// (`keep_groups`). Made new for each, a step cost some 1.9 ms on an M5 Pro, nearly all of it outside the GPU.
+struct Kept {
+    pcache: crate::qwen3_wgpu::Cache,
+    io: Vec<Io>,
+    /// The talker's step of one row: its input, its states and its logits.
+    talker: Option<(DeviceVec, DeviceVec, DeviceVec)>,
+}
+
+/// A predictor step's vectors for `rows` rows: its input, the input projected to its width (the 1.7B's), its states
+/// and its logits.
+struct Io {
+    rows: usize,
+    x: DeviceVec,
+    xp: DeviceVec,
+    states: DeviceVec,
+    logits: DeviceVec,
 }
 
 impl WgpuTalker {
@@ -127,6 +150,7 @@ impl WgpuTalker {
             config,
             hidden,
             predictor_hidden,
+            kept: None,
             gpu,
         })
     }
@@ -279,21 +303,35 @@ impl WgpuTalker {
 
     /// [`Self::frames`], each frame shown to `on_frame` as it is drawn (a stream decodes and plays it while the next
     /// is made); `on_frame` answering false stops the line there. Why it stopped.
-    pub fn frames_with(&mut self, prefill: &[f32], trailing: Option<Vec<f32>>, sampling: Sampling, max_frames: usize, mut on_frame: impl FnMut(&[u32; 16]) -> Result<bool>) -> Result<FramesEnd> {
-        let (h, ph) = (self.hidden, self.predictor_hidden);
+    pub fn frames_with(&mut self, prefill: &[f32], trailing: Option<Vec<f32>>, sampling: Sampling, max_frames: usize, on_frame: impl FnMut(&[u32; 16]) -> Result<bool>) -> Result<FramesEnd> {
         let pad = self.text(&[TTS_PAD])?;
+        let mut kept = self.kept.take().unwrap_or_else(|| Kept { pcache: self.predictor.cache(&self.gpu, 17), io: Vec::new(), talker: None });
+        let end = self.run_frames(&pad, &mut kept, prefill, trailing, sampling, max_frames, on_frame);
+        self.kept = Some(kept);
+        end
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_frames(&self, pad: &[f32], kept: &mut Kept, prefill: &[f32], trailing: Option<Vec<f32>>, sampling: Sampling, max_frames: usize, mut on_frame: impl FnMut(&[u32; 16]) -> Result<bool>) -> Result<FramesEnd> {
+        let (h, ph) = (self.hidden, self.predictor_hidden);
         let g = &self.gpu;
         let n = prefill.len() / h;
         let trailing_len = trailing.as_ref().map_or(0, |t| t.len() / h);
         let mut cache = self.talker.cache(g, n + max_frames + 1);
-        let mut pcache = self.predictor.cache(g, 17);
         let vocab = self.codec_head.m.n;
         let mut rng = Rng::new(sampling.seed);
         let mut seen = vec![false; AUDIO_CODES as usize];
         // the talker's step: its last row's state and the first codebook's logits
-        let talker_step = |this: &Self, cache: &mut crate::qwen3_wgpu::Cache, x: &[f32]| -> Result<(Vec<f32>, Vec<f32>)> {
+        let talker_step = |this: &Self, kept: &mut Kept, cache: &mut crate::qwen3_wgpu::Cache, x: &[f32]| -> Result<(Vec<f32>, Vec<f32>)> {
             let t = x.len() / h;
-            let (xd, states, logits) = (g.vec(x.len()), g.vec(t * h), g.vec(t * vocab));
+            // (a frame's one row in the vectors kept for it; a prompt's rows in their own)
+            let (xd, states, logits) = match (t, &kept.talker) {
+                (1, Some(v)) => v.clone(),
+                _ => (g.vec(x.len()), g.vec(t * h), g.vec(t * vocab)),
+            };
+            if t == 1 && kept.talker.is_none() {
+                kept.talker = Some((xd.clone(), states.clone(), logits.clone()));
+            }
             g.upload(&xd, x);
             let mut rec = g.begin();
             rec.keep_groups(false);
@@ -307,13 +345,21 @@ impl WgpuTalker {
             Ok((out.pop().ok_or_else(|| err("the state was not read"))?, l))
         };
         // the predictor's step: its last row's logits from head `i` (its inputs the talker's width, projected to its own)
-        let predictor_step = |this: &Self, pcache: &mut crate::qwen3_wgpu::Cache, x: &[f32], i: usize| -> Result<Vec<f32>> {
+        let predictor_step = |this: &Self, kept: &mut Kept, x: &[f32], i: usize| -> Result<Vec<f32>> {
             let t = x.len() / h;
             let head = &this.predictor_heads[i];
-            let (xd, xp, states, logits) = (g.vec(x.len()), g.vec(t * ph), g.vec(t * ph), g.vec(t * head.m.n));
-            g.upload(&xd, x);
+            let at = match kept.io.iter().position(|io| io.rows == t) {
+                Some(at) => at,
+                None => {
+                    let most = this.predictor_heads.iter().map(|hd| hd.m.n).max().unwrap_or(0);
+                    kept.io.push(Io { rows: t, x: g.vec(t * h), xp: g.vec(t * ph), states: g.vec(t * ph), logits: g.vec(t * most) });
+                    kept.io.len() - 1
+                }
+            };
+            let Kept { pcache, io, .. } = kept;
+            let Io { x: xd, xp, states, logits, .. } = &io[at];
+            g.upload(xd, x);
             let mut rec = g.begin();
-            rec.keep_groups(false);
             let r = rec.as_mut();
             let input = match &this.to_predictor {
                 Some(p) => {
@@ -327,7 +373,7 @@ impl WgpuTalker {
             r.read_range(&logits, (t - 1) * head.m.n, head.m.n);
             rec.finish().pop().ok_or_else(|| err("the logits were not read"))
         };
-        let (mut hidden, mut logits) = talker_step(self, &mut cache, prefill)?;
+        let (mut hidden, mut logits) = talker_step(self, kept, &mut cache, prefill)?;
         let mut made = 0usize;
         while made < max_frames {
             let s = &sampling;
@@ -351,13 +397,13 @@ impl WgpuTalker {
             }
             seen[c0 as usize] = true;
             // the other 15 codes, the predictor's from this frame's start
-            pcache.len = 0;
+            kept.pcache.len = 0;
             let mut frame = [0u32; 16];
             frame[0] = c0;
             let mut x = hidden.clone();
             x.extend_from_slice(self.codec_embedding.row(c0));
             for i in 0..15 {
-                let l = predictor_step(self, &mut pcache, &x, i)?;
+                let l = predictor_step(self, kept, &x, i)?;
                 let code = sample(&l, s.sub_temperature, s.sub_top_k, 1.0, s.greedy, &mut rng);
                 frame[i + 1] = code;
                 x = self.predictor_embeddings[i].row(code).to_vec();
@@ -377,7 +423,7 @@ impl WgpuTalker {
                 _ => &pad[..],
             };
             e.iter_mut().zip(text).for_each(|(a, b)| *a += b);
-            (hidden, logits) = talker_step(self, &mut cache, &e)?;
+            (hidden, logits) = talker_step(self, kept, &mut cache, &e)?;
         }
         Ok(FramesEnd::Full)
     }
