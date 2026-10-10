@@ -134,6 +134,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Options, Stri
             "--ctx" => {
                 let v = val()?;
                 a.ctx = if v.trim() == "auto" { 0 } else { num(v)? };
+                a.ctx_asked = a.ctx != 0;
             }
             "--ram-gb" => a.ram_gb = num(val()?)?,
             "--model" => a.model = val()?.into(),

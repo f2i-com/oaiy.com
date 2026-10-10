@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Agent, type AgentEvent } from '../../src/agent/agent';
-import { budgetFor, contextWindow, overflowWindow } from '../../src/agent/context';
+import { budgetFor, contextWindow, detectContextWindow, overflowWindow } from '../../src/agent/context';
 import type { Turn } from '../../src/agent/protocol';
 import type { ProviderConfig } from '../../src/agent/providers/types';
 import { NetGate } from '../../src/gate/netgate';
@@ -17,6 +17,26 @@ describe('the context window', () => {
     expect(contextWindow({ ...OPENAI, modelId: 'gpt-4o', detectedContext: { model: 'other', tokens: 9000, how: 'x', at: 0 } }).tokens).toBe(128_000);
     expect(contextWindow({ ...ANTHROPIC, modelId: 'claude-sonnet-4-5' }).source).toBe('known');
     expect(contextWindow({ id: 'l', type: 'local', name: 'x', apiKey: '', modelId: 'qwen3' })).toEqual({ tokens: 8192, source: 'default' });
+  });
+
+  it("is OAIY's own engine's least, for a model of OAIY's that has not said yet", async () => {
+    // OAIY tells a model's window once the model is loaded. Planned for 8,192 a first message could not be sent
+    // (the instructions and tools alone are past that), so the model was never loaded and never said.
+    const oaiy: ProviderConfig = { id: 'o', type: 'local', serverKind: 'oaiy', name: 'OAIY', apiKey: '', baseUrl: 'http://127.0.0.1:8080', modelId: 'qwen3.5-9b', followEngine: true };
+    expect(contextWindow(oaiy)).toEqual({ tokens: 16_384, source: 'default' });
+    expect(budgetFor(contextWindow(oaiy).tokens, 7000).prompt).toBeGreaterThan(1024 * 4);
+    // What OAIY says, once it does, and what the person sets, still come first.
+    expect(contextWindow({ ...oaiy, detectedContext: { model: 'qwen3.5-9b', tokens: 65_536, how: 'OAIY (/v1/discovery)', at: 0 } }).tokens).toBe(65_536);
+    expect(contextWindow({ ...oaiy, contextTokens: 32_000 })).toEqual({ tokens: 32_000, source: 'yours' });
+
+    // Asked before the model is loaded, OAIY's discovery names no window: a guess, to be asked again after a reply.
+    const answers: Array<Record<string, unknown>> = [{ service: 'oaiy-studio', llm: { context_tokens: null } }, { service: 'oaiy-studio', llm: { context_tokens: 16_384 } }];
+    vi.stubGlobal('fetch', async (url: string) => {
+      expect(String(url)).toBe('http://127.0.0.1:8080/v1/discovery');
+      return new Response(JSON.stringify(answers.shift()), { status: 200, headers: { 'content-type': 'application/json' } });
+    });
+    expect(await detectContextWindow(oaiy)).toEqual({ tokens: 16_384, how: 'OAIY, before the model is loaded', guess: true });
+    expect(await detectContextWindow(oaiy)).toEqual({ tokens: 16_384, how: 'OAIY (/v1/discovery)' });
   });
 
   it("reads the window out of servers' overflow errors", () => {

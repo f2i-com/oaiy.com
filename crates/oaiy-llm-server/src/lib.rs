@@ -92,6 +92,9 @@ pub struct Options {
     /// Context length in tokens, prompt and reply together. 0 (`--ctx auto`):
     /// the most each model allows.
     pub ctx: usize,
+    /// Whether [`Options::ctx`] is a number the person gave (`--ctx N`), not the default and not `auto`. A model whose
+    /// attention cache is sized by its context is held to a modest one unless they did (`models::dense_context`).
+    pub ctx_asked: bool,
     /// Host RAM for the expert cache, in GB.
     /// Host RAM for the expert cache, in GB. **0 means decide from what is free**:
     /// see [`Options::expert_cache_bytes`].
@@ -266,6 +269,7 @@ impl Default for Options {
             port: 8000,
             devices: Vec::new(),
             ctx: DEFAULT_CTX,
+            ctx_asked: false,
             // Decided at load from what the machine actually has free, rather than
             // a number that is right for one machine: see `expert_cache_bytes`.
             ram_gb: 0,

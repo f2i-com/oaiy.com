@@ -960,7 +960,7 @@ dialog::backdrop { background: var(--backdrop); }
       <div class="block">
         <h2>Language model</h2>
         <div class="grid-f">
-          <label class="f"><span>Context (tokens, 0 = the model's maximum)</span><input type="number" min="0" data-bind="llm.ctx" data-type="int"></label>
+          <label class="f"><span>Context (tokens; 0 = the engine's choice, 16,384 for most models. More, such as 64000, takes more memory)</span><input type="number" min="0" data-bind="llm.ctx" data-type="int"></label>
           <label class="f"><span>Reply limit (tokens)</span><input type="number" data-bind="llm.max_tokens" data-type="int"></label>
           <label class="f"><span>Temperature</span><input type="number" step="0.05" data-bind="llm.temperature" data-type="num"></label>
           <label class="f"><span>Top-p</span><input type="number" step="0.01" data-bind="llm.top_p" data-type="num"></label>

@@ -246,6 +246,22 @@ fn opens_empty_thought(template: &str) -> bool {
 /// them in memory while it has room, and where it has not (`free`: what is free now) it reads them again at each
 /// token. So a model larger than the computer's memory still answers, at the drive's speed.
 #[cfg_attr(not(feature = "webgpu"), allow(dead_code))]
+/// What a model whose attention cache is sized by its context is served with when nobody has said: these models
+/// name maximums of a quarter of a million tokens, and a cache for that is tens of gigabytes.
+pub(crate) const DENSE_CTX: usize = 16384;
+
+/// The context of a model whose attention cache is sized by it (Qwen3.5 and 3.8, and the dense families): `ctx`,
+/// the server's setting (0: the model's own maximum), never more than `model_max`.
+///
+/// A number the person gave (`--ctx N`, Engines' "Context") is what they get: the memory it takes is theirs to
+/// spend (about 64 KiB a token for a 9B Qwen3.5 and 128 KiB for a 27B, for each copy of the cache, and a GPU's
+/// chained runs keep a second). It was held to [`DENSE_CTX`] whatever was asked, so the setting could lower the
+/// context and never raise it. With no number given (the default, and `auto`) it is held to [`DENSE_CTX`] as before.
+pub(crate) fn dense_context(ctx: usize, asked: bool, model_max: usize) -> usize {
+    let most = if ctx == 0 { model_max } else { ctx.min(model_max) };
+    if asked && ctx != 0 { most } else { most.min(DENSE_CTX) }
+}
+
 pub(crate) fn placement(name: &str, on_gpu: u64, left: u64, free: Option<u64>) -> String {
     let gb = |bytes: u64| bytes as f64 / 1e9;
     if left == 0 {
@@ -556,6 +572,11 @@ impl Models {
         if self.opts.ctx == 0 { model_max } else { self.opts.ctx.min(model_max) }
     }
 
+    /// The context of a model whose attention cache is sized by it (Qwen3.5 and 3.8, and the dense families).
+    fn dense_context(&self, model_max: usize) -> usize {
+        dense_context(self.opts.ctx, self.opts.ctx_asked, model_max)
+    }
+
     fn say(&self, msg: String) {
         if !self.opts.silent {
             eprintln!("{msg}");
@@ -645,7 +666,7 @@ impl Models {
         }
         let tok = Arc::new(model.tokenizer.clone());
         // The cache is on the host: bound it as the other portable models are.
-        let max_seq = self.context(model.config.context_length).min(16384);
+        let max_seq = self.dense_context(model.config.context_length);
         let mut cfg = self.base_cfg(spec, max_seq);
         cfg.image_token_id = tok.token_id("<|image_pad|>").ok_or_else(|| Error::Arg("Flash-Next tokenizer lacks image_pad".into()))?;
         // Its vision tower, where the alias is given one: on the last GPU (the first carries the head's side of the
@@ -778,7 +799,7 @@ impl Models {
         }
         let tok = Arc::new(model.tokenizer().clone());
         // The cache is on the host: bound it as the other portable models are.
-        let max_seq = self.context(model.config().context_length).min(16384);
+        let max_seq = self.dense_context(model.config().context_length);
         let mut cfg = self.base_cfg(spec, max_seq);
         cfg.image_token_id = tok.token_id("<|image_pad|>").ok_or_else(|| Error::Arg("Orca tokenizer lacks image_pad".into()))?;
         // Its vision tower, where the alias is given one (the checkpoint's `vision` folder): on the model's backend.
@@ -864,7 +885,7 @@ impl Models {
             self.say(format!("{}: {:.1} GB of its weights on GPU {d} ({} at {}, budget {:.0} GB), the rest on the CPU", spec.name, used as f64 / 1e9, g.adapter().name, g.adapter().pci_bus_id, budget as f64 / 1e9));
         }
         let tok = Arc::new(model.tokenizer.clone());
-        let max_seq = self.context(model.config.context_length).min(16384);
+        let max_seq = self.dense_context(model.config.context_length);
         let mut cfg = self.base_cfg(spec, max_seq);
         cfg.image_token_id = tok.token_id("<|image_pad|>").ok_or_else(|| Error::Arg("Flash-Next tokenizer lacks image_pad".into()))?;
         let (jobs, rx) = std::sync::mpsc::channel();
@@ -944,7 +965,7 @@ impl Models {
             self.say_placement(&spec.name, backend.as_ref());
             let tok = Arc::new(model.tokenizer().clone());
             // Dense Qwen fits one card; bound the initial KV allocation.
-            let max_seq = self.context(model.config().context_length).min(16384);
+            let max_seq = self.dense_context(model.config().context_length);
             let mut cfg = self.base_cfg(spec, max_seq);
             cfg.image_token_id = tok.token_id("<|image_pad|>").ok_or_else(|| Error::Arg("Qwen tokenizer lacks image_pad".into()))?;
             let projector = if o.vision {
@@ -993,7 +1014,7 @@ impl Models {
             drop(gguf);
             let tok = Arc::new(model.tokenizer().clone());
             // Bound the initial KV allocation, as for dense Qwen3.5: a full context of an 8B model is gigabytes.
-            let max_seq = self.context(model.config().context_length).min(16384);
+            let max_seq = self.dense_context(model.config().context_length);
             let cfg = self.base_cfg(spec, max_seq);
             let (jobs, rx) = std::sync::mpsc::channel();
             let e = glm::GlmEngine::new(model, Arc::clone(&tok), max_seq, !o.quiet && !o.silent);
@@ -1120,6 +1141,23 @@ fn startup_warm_profile(usage: Option<&Path>, tool_experts: bool) -> Option<(&Pa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_context_someone_asked_for_is_served_and_the_default_is_as_it_was() {
+        const QWEN: usize = 262_144; // what a Qwen3.5 file names as its maximum
+        // Nobody said (the binary's default, and `--ctx auto`): held to DENSE_CTX, as before.
+        assert_eq!(dense_context(crate::DEFAULT_CTX, false, QWEN), DENSE_CTX);
+        assert_eq!(dense_context(0, false, QWEN), DENSE_CTX);
+        assert_eq!(dense_context(0, true, QWEN), DENSE_CTX, "auto is nobody's number, however it was written");
+        // A number the person gave is served: more than the default, or less.
+        assert_eq!(dense_context(64_000, true, QWEN), 64_000);
+        assert_eq!(dense_context(65_536, true, QWEN), 65_536);
+        assert_eq!(dense_context(4096, true, QWEN), 4096);
+        assert_eq!(dense_context(4096, false, QWEN), 4096, "a smaller default is still the bound");
+        // Never more than the model allows, asked or not.
+        assert_eq!(dense_context(64_000, true, 8192), 8192);
+        assert_eq!(dense_context(0, false, 8192), 8192);
+    }
 
     #[test]
     fn orcasaq_vision_configuration_is_accepted_and_scoped() {

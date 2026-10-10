@@ -37,6 +37,12 @@ const KNOWN: Array<[RegExp, number]> = [
 /** When nothing better is known: generous for a cloud API, cautious for a local server. */
 export const DEFAULT_CLOUD_WINDOW = 128_000;
 export const DEFAULT_LOCAL_WINDOW = 8_192;
+/**
+ * OAIY's own engine, before it has said: it tells a model's window only once the model is loaded, and serves every
+ * model with at least this much. Planned for 8,192, a first message could not be sent at all: the instructions and
+ * tools alone are past that, so the model was never loaded and never said. Asked again once it has answered.
+ */
+export const OAIY_ENGINE_WINDOW = 16_384;
 
 export function knownWindow(provider: Pick<ProviderConfig, 'type' | 'modelId'>): number | null {
   const id = provider.modelId ?? '';
@@ -52,6 +58,7 @@ export function contextWindow(provider: ProviderConfig): { tokens: number; sourc
   if (provider.detectedContext && provider.detectedContext.model === provider.modelId && provider.detectedContext.tokens >= 1024) return { tokens: provider.detectedContext.tokens, source: 'server' };
   const known = knownWindow(provider);
   if (known) return { tokens: known, source: 'known' };
+  if (provider.serverKind === 'oaiy') return { tokens: OAIY_ENGINE_WINDOW, source: 'default' };
   return { tokens: provider.type === 'local' ? DEFAULT_LOCAL_WINDOW : DEFAULT_CLOUD_WINDOW, source: 'default' };
 }
 
@@ -104,7 +111,9 @@ export async function detectContextWindow(provider: ProviderConfig, signal?: Abo
     attempts.push(async () => {
       const body = (await getJson(`${origin}/v1/discovery`, { headers }, signal)) as { llm?: { context_tokens?: unknown } };
       const tokens = num(body.llm?.context_tokens);
-      return tokens ? { tokens, how: 'OAIY (/v1/discovery)' } : null;
+      if (tokens) return { tokens, how: 'OAIY (/v1/discovery)' };
+      // OAIY answers, and says no window: the model is not loaded yet. A guess, so that it is asked again after a reply.
+      return { tokens: OAIY_ENGINE_WINDOW, how: 'OAIY, before the model is loaded', guess: true };
     });
   }
   // Any OpenAI-compatible server: the models list, then llama.cpp's /props.
