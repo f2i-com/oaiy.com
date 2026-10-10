@@ -1039,8 +1039,14 @@ fn drafts_most() -> usize {
     *MOST.get_or_init(|| std::env::var("OAIY_DRAFTS").ok().and_then(|v| v.parse().ok()).filter(|n| (1..=7).contains(n)).unwrap_or(DRAFTS))
 }
 
+/// Checkpoints kept in memory: the base and the last two requests' two (each request's before the assistant's header
+/// and a token short of its prompt). Three kept only the last request's, and an agent's next prompt that renders the
+/// reply before a tool's answer otherwise (a call's, twice in one call) went back to the base: 768 and 1,010 tokens
+/// read again on the eGPU's 27B, 0.8 and 1.0 s, where they were 30 or so. Its recurrent states are some 150 MB each.
+const KEPT_CHECKPOINTS: usize = 5;
+
 fn trim_checkpoints(checkpoints: &mut Vec<(Vec<u64>, RecurrentSnapshot, bool)>) {
-    while checkpoints.len() > 1 && (checkpoints.len() > 3 ||
+    while checkpoints.len() > 1 && (checkpoints.len() > KEPT_CHECKPOINTS ||
         checkpoints.iter().map(|(_, s, _)| s.bytes()).sum::<usize>() > 1024 * 1024 * 1024) {
         let remove = (0..checkpoints.len()-1).min_by_key(|&i| (checkpoints[i].2, i)).unwrap();
         checkpoints.remove(remove);

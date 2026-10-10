@@ -225,6 +225,7 @@ impl Mini {
 /// A conversation: the system prompt every conversation starts with (520 tokens), a system
 /// prompt of its own after it (300 tokens, so that the first message boundary lies past what
 /// they share), and the messages that follow.
+#[derive(Clone)]
 struct Chat { id: u32, messages: Vec<Vec<u32>>, shared_system: bool }
 
 impl Chat {
@@ -318,6 +319,28 @@ fn two_conversations_taking_turns_swap_in_with_full_reuse_after_the_first_round(
     let s = m.serve(&b3, &rb3, false);
     assert_eq!((s.source, s.swapped, s.start), ("ram", true, b2.len() + rb2.len()));
     assert_eq!(dump(&m.kv), cold(&b3, &rb3));
+}
+
+#[test]
+fn a_reply_rendered_otherwise_after_a_tools_round_trip_goes_back_to_its_own_checkpoint() {
+    // A call's agent: a reply, the tool's answer and the agent's next request, then a prompt that renders that reply
+    // otherwise (the tool's call written out). Its checkpoints are the request before last's: still kept.
+    let (r1, r2, r3) = (vec![905_000; 40], vec![906_000; 20], vec![907_000; 30]);
+    let mut m = Mini::new(1 << 40, false);
+    let mut c = Chat::new(30, 2_600);
+    let p1 = c.prompt();
+    m.serve(&p1, &r1, false);
+    let mut later = c.clone();
+    c.answered(&r1, None, 120);
+    let p2 = c.prompt();
+    let s = m.serve(&p2, &r2, false);
+    assert_eq!(s.source, "memory");
+    later.answered(&r1, Some(9), 150);
+    let p3 = later.prompt();
+    let s = m.serve(&p3, &r3, false);
+    assert_eq!((s.source, s.start), ("checkpoint", p1.len() - 1), "the checkpoint a token short of the first prompt, not the base");
+    assert!(s.read < 250, "{} read again", s.read);
+    assert_eq!(dump(&m.kv), cold(&p3, &r3));
 }
 
 #[test]
