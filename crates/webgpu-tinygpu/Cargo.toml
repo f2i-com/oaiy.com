@@ -1,0 +1,18 @@
+[package]
+name = "webgpu-tinygpu"
+version = "0.1.0"
+edition = "2021"
+description = "webgpu.h (WebGPU's C API, as wgpu-native's library has it) for the NVIDIA card a Mac reaches only through tinygrad: a program written against the standard header runs its compute through the TinyGPU adapter (crates/wgpu-tinygpu)."
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "webgpu_tinygpu"
+crate-type = ["cdylib"]
+
+[dependencies]
+wgpu = { version = "30", features = ["custom"] }
+wgpu-tinygpu = { path = "../wgpu-tinygpu" }
+pollster = "0.4"
+
+[build-dependencies]
+cc = "1"

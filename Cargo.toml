@@ -59,6 +59,7 @@ members = [
     # wgpu's compute on that card: a wgpu adapter (its `custom` backend) that hands a program's buffers, kernels (as
     # wgsl-cuda's CUDA) and submissions to tools/tinygpu/webgpu_server.py, which holds the card through tinygrad.
     "crates/wgpu-tinygpu",
+    "crates/webgpu-tinygpu",
 ]
 default-members = [
     "crates/oaiy-engine",

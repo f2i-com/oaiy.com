@@ -6,7 +6,7 @@ extension), and OAIY already sends a model's chats to tinygrad's own server ther
 Thunderbolt enclosure"). This is the other way: **the card as a WebGPU adapter**, so a program written against wgpu's
 compute (OAIY's own engine among them) runs its kernels on it as they are.
 
-Three parts, each its own:
+Four parts, each its own:
 
 - **`crates/wgsl-cuda`**: a WGSL compute kernel as CUDA C++. naga parses and validates the WGSL as wgpu does; its
   module is walked into one `extern "C" __global__` kernel beside a prelude of WGSL's types and built-ins
@@ -23,6 +23,22 @@ Three parts, each its own:
 - **`crates/wgpu-tinygpu`**: a `wgpu::Adapter` (wgpu's `custom` backend) that asks that server. A compute pipeline's
   WGSL becomes CUDA at creation; a command buffer's work goes in one message at `Queue::submit`. Compute alone: render
   pipelines, textures, samplers and queries are refused.
+- **`crates/webgpu-tinygpu`**: `webgpu.h`, WebGPU's standard C API, over that adapter: `libwebgpu_tinygpu.dylib`, with
+  wgpu-native's ABI (its headers are in `include/`), so a program written against the header, in any language, runs
+  its compute on the card. Python's `wgpu` takes it as it is:
+
+  ```sh
+  cargo build --release -p webgpu-tinygpu
+  pip install wgpu numpy
+  WGPU_LIB_PATH=$PWD/target/release/libwebgpu_tinygpu.dylib python tools/tinygpu/wgpu_py_smoke.py
+  ```
+
+  and C as `examples/compute.c` shows (`-lwebgpu_tinygpu`). `src/webgpu.c` reads the header's structs (the compiler
+  lays them out from the header itself) and keeps references and futures; every operation is done as it is asked, so a
+  callback fires at once (AllowSpontaneous), at the next `wgpuInstanceProcessEvents` or `wgpuDevicePoll`, or in
+  `wgpuInstanceWaitAny`; errors go to the innermost error scope of their kind, else the uncaptured-error callback.
+  Every function of the header that is not compute is there, and says so on stderr. `WEBGPU_TINYGPU_BACKEND=native`
+  takes wgpu's own adapter instead (Metal on a Mac), to check a program against both.
 
 OAIY's engine takes it with the feature `tinygpu` (`oaiy-llm-server`, `ggml-rs-wgpu`) and
 `OAIY_WEBGPU_ADAPTER=tinygpu` (or `tinygpu:<socket>`).
@@ -104,6 +120,12 @@ On the emulator (the same day, the card off its link):
   Metal, finds "marigold" at the start of a 946-token prompt, and writes three sentences about the ocean, at about two
   tokens a second;
 - all 309 kernels, translated again, compile with nvcc for sm_89, each a cubin of one kernel.
+
+Through `webgpu.h`, on the emulator and on Metal alike: Python's `wgpu` 0.32 (its own build of wgpu-native swapped
+for this library) runs a kernel with workgroup memory and a barrier over 1,048,576 values, its `compute_with_buffers`,
+a write, a clear, a copy at offsets, a buffer mapped at creation and one mapped for reading, and raises
+`GPUValidationError` for a kernel that is not WGSL, the device going on after; `examples/compute.c` waits for its
+adapter, device and map with futures and counts 4096 numbers' Collatz steps right.
 
 Two translations the emulator found wrong, now right: an integer's `/` and `%` by zero (WGSL's are the dividend and 0;
 CUDA's are anything), and a struct whose member follows a `vec3` in its last 4 bytes (a struct's `vec3` is now its 12

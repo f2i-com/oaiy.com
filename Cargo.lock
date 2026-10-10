@@ -2706,6 +2706,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "webgpu-tinygpu"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "pollster",
+ "wgpu",
+ "wgpu-tinygpu",
+]
+
+[[package]]
 name = "wgpu"
 version = "30.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
