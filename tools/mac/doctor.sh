@@ -61,7 +61,7 @@ say "Thunderbolt devices:"
 system_profiler SPThunderboltDataType 2>/dev/null | grep -E "Device Name|Vendor Name" | sed 's/^ */  /' | head -12
 
 say
-say "== A USB Bluetooth dongle (for the phone link, Aokie, which does not run on a Mac yet: docs/MAC.md)"
+say "== A USB Bluetooth dongle (for the phone link, Aokie, which builds for a Mac and has not run on one: docs/MAC.md)"
 # (each USB device that is a Bluetooth controller by its own entry: its name, its USB class 224, or a vendor and
 # product the phone link's list has; then what macOS has attached to it. A driver of macOS's own on the dongle is
 # what a program that drives the dongle itself would have to take it from)

@@ -48,14 +48,17 @@ them. If the build stops on that name, `rustup update`.
 which also needs Node 22 or later. It has never been built on macOS either. The engines
 above do not need it: they are the same ones it would start.
 
-**The phone plugin (Aokie) does not run on a Mac yet.** Its Bluetooth stack drives a USB
-dongle itself, with no use of the system's Bluetooth, and is written to be portable: beside
-the Windows transport (WinUSB) it has one for libusb, written for Linux and not yet run on
-hardware. But the plugin's phone link is compiled for Windows only (for a Mac it does not
-compile at all), its secrets are sealed with Windows' own protection, and its bundle
-carries a Windows program. On a Mac no driver has to be installed or signed; what decides
-the rest is whether macOS attaches a driver of its own to the dongle, which
-`sh tools/mac/doctor.sh` shows (the section on a USB Bluetooth dongle), and whether call
+**The phone plugin (Aokie) builds for a Mac, and has not been run on one.** Its Bluetooth
+stack drives a USB dongle itself, with no use of the system's Bluetooth: on a Mac it opens
+the dongle through libusb (built into the plugin), installs no driver, and seals its
+secrets with a key in the login Keychain where Windows uses its own protection. The Mac
+shares that code with Linux, where the plugin was built, its tests passed, and it was run
+against a stand-in dongle; no real dongle has been opened through libusb yet. In Aokie's
+repository, `docs/HARDWARE.md` (macOS) says how to try it: first
+`cargo run -p aokie-bluetooth --example dongle_probe` with the dongle plugged in, then
+`sh scripts/bundle-unix.sh` for a plugin folder to copy into OAIY's. What decides the rest
+is whether macOS attaches a driver of its own to the dongle, which the probe and
+`sh tools/mac/doctor.sh` show (the section on a USB Bluetooth dongle), and whether call
 audio keeps time over libusb there, which only a call can show.
 
 **Checked from Windows and Linux** (`cargo check --target aarch64-apple-darwin`, which
