@@ -403,6 +403,14 @@ impl Gpu {
         self.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(name), source: wgpu::ShaderSource::Wgsl(source.into()) })
     }
 
+    /// Whether a few rows' K-quant matmuls (a prompt's short chunk, a check of drafts) take the int8 kernels: not
+    /// where the packed dot products they are made of are wrapped ([`Self::wraps_packed_dots`]), on Metal, where they
+    /// are the slower: an M5 Pro's Q4_K [17408, 5120] took 9.6 ms for 20 rows in int8 and 4.3 in f32 (one row: 1.3
+    /// and 0.25), a conversation's next turn of 20 tokens 0.8 s and 0.4 (Qwen3.5 9B).
+    pub(crate) fn int8_rows(&self) -> bool {
+        *self.int8_rows.get_or_init(|| !self.wraps_packed_dots())
+    }
+
     /// Whether this device's kernels have their packed dot products wrapped: on Metal, and anywhere
     /// `OAIY_WRAP_PACKED_DOTS=1` asks (so the wrapped kernels can be run and compared where there is no Mac).
     fn wraps_packed_dots(&self) -> bool {

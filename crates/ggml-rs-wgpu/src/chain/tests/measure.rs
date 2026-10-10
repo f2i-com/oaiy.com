@@ -1344,3 +1344,62 @@ fn measure_a_few_rows_f16_matmuls() {
         eprintln!("{line}");
     }
 }
+
+/// A prompt's few rows (a conversation's next turn: 10 to 40 tokens) through each kernel that takes them, against as
+/// many one-row steps (`--ignored --nocapture`): Q4_K at Qwen3.8 27B's widest and squarest.
+#[test]
+#[ignore = "a measurement"]
+fn measure_few_rows() {
+    let Ok(b) = WgpuBackend::new(Some(8 << 30)) else { return };
+    for (n, k) in [(17408usize, 5120usize), (5120, 5120)] {
+        let (block, bytes) = (256usize, 144usize);
+        let mut next = rng(n as u32);
+        let mut raw = vec![0u8; n * (k / block) * bytes];
+        for v in raw.iter_mut() {
+            *v = ((next() + 1.0) * 100.0) as u8;
+        }
+        for blk in raw.chunks_exact_mut(bytes) {
+            let d = half::f16::from_f32(0.01 + (blk[4] as f32) * 1e-4).to_bits().to_le_bytes();
+            let dmin = half::f16::from_f32(0.001 + (blk[5] as f32) * 1e-5).to_bits().to_le_bytes();
+            blk[..4].copy_from_slice(&[d[0], d[1], dmin[0], dmin[1]]);
+        }
+        let w = ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(raw, vec![n, k], GgmlType::Q4_K));
+        for m in [1usize, 4, 8, 12, 16, 20, 24, 32, 48] {
+            let (x, y) = (b.vec(m * k), b.vec(m * n));
+            DeviceChain::upload(&b, &x, &(0..m * k).map(|_| next()).collect::<Vec<_>>());
+            let time = |how: u8| {
+                let run = || {
+                    let mut r = Recorder::new(&b);
+                    for _ in 0..4 {
+                        r.q8.clear();
+                        r.x16.clear();
+                        let ok = match how {
+                            0 => r.matmul_rows_q8(&w, &x, &y, m),
+                            1 => r.matmul_rows_coop(&w, &x, &y, m),
+                            _ => {
+                                r.matmul_rows_f32(&w, &x, &y, m);
+                                true
+                            }
+                        };
+                        if !ok {
+                            return false;
+                        }
+                    }
+                    r.read_range(&y, 0, 1);
+                    Box::new(r).finish();
+                    true
+                };
+                if !run() {
+                    return f64::NAN;
+                }
+                let t = std::time::Instant::now();
+                for _ in 0..3 {
+                    run();
+                }
+                t.elapsed().as_secs_f64() / 12.0 * 1e3
+            };
+            let (q8, coop, f32) = (time(0), time(1), time(2));
+            eprintln!("Q4_K [{n}, {k}] x {m:2}: int8 rows {q8:6.2} ms, tensor cores {coop:6.2} ms, f32 {f32:6.2} ms");
+        }
+    }
+}

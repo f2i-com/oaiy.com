@@ -4,9 +4,11 @@ use super::*;
 impl ChainRecorder for Recorder<'_> {
     fn matmul_rows(&mut self, w: &QuantizedTensor, x: &DeviceVec, y: &DeviceVec, m: usize) {
         // several rows (a check of drafts, a short chunk) from int8 activations, where the type has kernels for them
-        // (OAIY_NO_Q8: the f32 ones)
+        // (OAIY_NO_Q8: the f32 ones); the K-quants' only where the device does them well (`Gpu::int8_rows`: on Metal
+        // their f32 ones)
         static Q8: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let q8 = *Q8.get_or_init(|| std::env::var_os("OAIY_NO_Q8").is_none());
+        let kq8 = q8 && self.gpu().int8_rows();
         // (a prompt's rows: the tensor cores where the device has them (f16 into f32), else the int8 tiled kernel,
         // llama.cpp's MMQ's arithmetic, where the type has one)
         // (IQ4_XS against a step's row or a check's few: a kernel of its own, a check's rows from int8 activations as
@@ -17,9 +19,9 @@ impl ChainRecorder for Recorder<'_> {
         let one = self.alike;
         let done = (iq4 && q8 && (m >= 2 || one) && self.matmul_rows_iq4_xs_q8(w, x, y, m))
             || (iq4 && self.matmul_rows_iq4_xs(w, x, y, m))
-            || (((2..=crate::shaders::MULTI_MAX).contains(&m) || (one && m == 1)) && q8 && self.matmul_rows_q8(w, x, y, m))
+            || (((2..=crate::shaders::MULTI_MAX).contains(&m) || (one && m == 1)) && kq8 && self.matmul_rows_q8(w, x, y, m))
             || (m > crate::shaders::MULTI_MAX && self.matmul_rows_coop(w, x, y, m))
-            || (m > crate::shaders::MULTI_MAX && q8 && self.matmul_rows_tq8(w, x, y, m));
+            || (m > crate::shaders::MULTI_MAX && kq8 && self.matmul_rows_tq8(w, x, y, m));
         if !done {
             self.matmul_rows_f32(w, x, y, m);
         }
