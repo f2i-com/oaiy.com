@@ -346,8 +346,15 @@ pub struct Egpu {
     changed: Condvar,
     /// One start at a time: finding the Python runs processes, outside the state's lock.
     launching: Mutex<()>,
+    /// Servers stopped and not gone yet. Only one process may hold the card: a server started while the last still
+    /// lets it go finds tinygrad's lock taken and fails, and the request that started it goes to this computer's
+    /// engine (a change of settings, then a request at once, did that). So a start waits for them ([`GONE_WAIT`]).
+    going: Arc<(Mutex<usize>, Condvar)>,
     pub log: Arc<LogRing>,
 }
+
+/// How long a start waits for a stopped server to let the card go: a stop that takes longer kills it at 20 s.
+const GONE_WAIT: Duration = Duration::from_secs(25);
 
 /// A request being answered by tinygrad's server: while one is held, the model is not swapped.
 pub struct Lease(Arc<Egpu>);
@@ -495,12 +502,28 @@ impl Egpu {
             }),
             changed: Condvar::new(),
             launching: Mutex::new(()),
+            going: Arc::default(),
             log: Arc::new(LogRing::new(2000)),
         }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Wait (`wait` at most) until every stopped server has let the card go.
+    fn wait_gone(&self, wait: Duration) -> Result<(), String> {
+        let (count, gone) = &*self.going;
+        let deadline = Instant::now() + wait;
+        let mut n = count.lock().unwrap_or_else(|p| p.into_inner());
+        while *n > 0 {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err("the eGPU's last server has not let the card go yet".into());
+            }
+            n = gone.wait_timeout(n, left).unwrap_or_else(|p| p.into_inner()).0;
+        }
+        Ok(())
     }
 
     pub fn state(&self) -> State {
@@ -685,6 +708,7 @@ impl Egpu {
     /// Whether the server was started (false: someone asked for a stop meanwhile, and it stood down).
     #[allow(clippy::too_many_arguments)]
     fn launch(self: &Arc<Self>, cfg: &Json, llm: &Json, root: &Path, name: &str, epoch: u64, count: bool, paused: bool) -> Result<bool, String> {
+        self.wait_gone(GONE_WAIT)?;
         let python = self.python(cfg, root)?;
         let script = Self::script(root)?;
         let port = free_port()?;
@@ -823,19 +847,26 @@ impl Egpu {
         g.generation += 1;
         g.lifeline = None;
         if let Some(mut child) = g.child.take() {
-            let log = self.log.clone();
+            let (log, going) = (self.log.clone(), Arc::clone(&self.going));
+            *going.0.lock().unwrap_or_else(|p| p.into_inner()) += 1;
             std::thread::spawn(move || {
                 let deadline = Instant::now() + Duration::from_secs(20);
+                let mut gone = false;
                 while Instant::now() < deadline {
                     if child.try_wait().is_ok_and(|done| done.is_some()) {
                         log.push("studio: tinygrad's server stopped");
-                        return;
+                        gone = true;
+                        break;
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
-                let _ = child.kill();
-                let _ = child.wait();
-                log.push("studio: tinygrad's server stopped (killed after 20 s)");
+                if !gone {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    log.push("studio: tinygrad's server stopped (killed after 20 s)");
+                }
+                *going.0.lock().unwrap_or_else(|p| p.into_inner()) -= 1;
+                going.1.notify_all();
             });
         }
         g.state = State::Stopped;
@@ -1149,6 +1180,28 @@ mod tests {
         "egpu": {"enabled": true, "ctx": 16384, "fallback_model": "small", "env": {"JITBEAM": 2, "DEV": "AMD"}, "extra_args": ["--shard", "1"]},
         "models": [{"name": "big", "path": "models/big.gguf", "egpu": true}, {"name": "small", "path": "models/small.gguf"},
                    {"name": "off", "path": "models/off.gguf", "egpu": true, "enabled": false}, {"name": "folder", "path": "models/exl3", "egpu": true}]}"#;
+
+    #[test]
+    fn a_start_waits_for_the_last_server_to_let_the_card_go() {
+        let egpu = Egpu::new();
+        assert!(egpu.wait_gone(Duration::from_millis(10)).is_ok(), "nothing stopped: no wait");
+        // a server stopped, still letting the card go
+        *egpu.going.0.lock().unwrap() += 1;
+        let going = Arc::clone(&egpu.going);
+        let started = Instant::now();
+        let gone = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            *going.0.lock().unwrap() -= 1;
+            going.1.notify_all();
+        });
+        assert!(egpu.wait_gone(Duration::from_secs(5)).is_ok());
+        assert!(started.elapsed() >= Duration::from_millis(150), "the start went before the card was let go");
+        gone.join().unwrap();
+        // one that never goes: the start gives up, and says why
+        *egpu.going.0.lock().unwrap() += 1;
+        let err = egpu.wait_gone(Duration::from_millis(50)).unwrap_err();
+        assert!(err.contains("not let the card go"), "{err}");
+    }
 
     #[test]
     fn a_model_runs_on_the_egpu_only_where_it_is_set_to_and_the_egpu_is_switched_on() {
