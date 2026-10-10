@@ -963,7 +963,7 @@ describe('a phone call answered by the agent', () => {
       { text: '', calls: [{ name: 'request_appointment', input: booking }] },
       { text: 'Let me get that in for you now.' },
       (body) => {
-        expect(JSON.stringify(body.messages)).toContain('or the phone refused it');
+        expect(JSON.stringify(body.messages)).toContain('or it was refused');
         return { text: '', calls: [{ name: 'request_appointment', input: booking }] };
       },
       { text: "That's requested for Friday at ten." },
@@ -975,7 +975,7 @@ describe('a phone call answered by the agent', () => {
       if (name === 'request_appointment' && !refused) {
         refused = true;
         calls.push([name, callId, args]);
-        return { ok: false, output: { error: "appointment date does not match the caller's selected weekday", recorded: false, status: 'not_recorded' } } as never;
+        return { ok: false, output: { error: 'the caller named two days (thursday or friday): ask which one, then call this tool again', recorded: false, status: 'not_recorded' } } as never;
       }
       return accept(callId, name, args);
     };
@@ -1027,13 +1027,15 @@ describe("what the agents remember about a customer is written for the business'
     await settled(sessions);
     const notes = callerNotesTool(() => sessions).spec;
     for (const description of [remember!.description, notes.description]) {
-      expect(description).toContain('Write each fact as a short plain note about the customer, e.g. "Wants to keep the Fri 2 Oct 1 pm booking".');
+      expect(description).toContain('Write each fact as a short plain note about the customer.');
+      // (no example dates or times: the model takes them for real ones)
+      expect(description).not.toMatch(/\d/);
       expect(description).toContain('or as "the owner", never "your person"');
       expect(description).toContain('no internal wording');
     }
     // A call's agent knows the business's name.
     expect(remember!.description).toContain('Refer to the business by its name ("Green Lawns")');
-    expect(remember!.parameters.properties.fact.description).toContain('"Wants to keep the Fri 2 Oct 1 pm booking"');
+    expect(remember!.parameters.properties.fact.description).toBe('One short fact: a plain note about them');
     expect(notes.parameters.properties).toMatchObject({ add: { description: expect.stringContaining('a short plain note about the customer') } });
   });
 });

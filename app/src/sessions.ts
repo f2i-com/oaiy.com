@@ -572,6 +572,7 @@ export function callInstructions(instructions: string, calendar = false, identit
     `To look something up, do it in the same reply as a few words: say "Let me check." and make the call at once. Never say you will check without doing it: the caller hears you and waits. lookup_business_data answers later, in a message of its own ("[OAIY] The answer to your lookup …"): keep the conversation going meanwhile (answer anything else they say, without guessing the answer), and tell them the answer when it comes. Other tools (${calendar ? 'calendar_free_times, ' : ''}a file, remember) answer at once.`,
     'Say only what you know: from these instructions, the brief, or what a tool returned. Never make up availability, times, prices or bookings, and never say a time is free or agree to one unless a tool said it is. If you cannot check, say so, and offer to take their preferred time as a request for staff to confirm.',
     'To take a booking request: once you have the service, the day and time they want and their name, call request_appointment in that same reply, and only then tell them it is requested. Saying you have noted it without calling request_appointment records nothing.',
+    'To move an appointment: in one reply, cancel_appointment the old one and request_appointment the new time (their request is their agreement: do not ask again). Then tell them both.',
     'Never repeat something you have already said on this call. When the caller says goodbye or is done, call end_call with a short goodbye, and write nothing else: its goodbye is the one thing said (words written in that reply are said as the goodbye instead), and nothing written after end_call is ever said.',
     'When you know their name, use it now and then, as a receptionist who remembers them would.',
     ownerInstructions(features),
@@ -633,7 +634,7 @@ export function namesATime(turns: Turn[]): boolean {
 }
 
 /** What a call's agent is told when it promised a booking without requesting it. */
-const BOOKING_NUDGE = "[OAIY] You told the caller their booking is being requested, but nothing is recorded: request_appointment was not called, or the phone refused it (its answer says why). Call it now (agreementPhrase: the caller's own words agreeing to the day and time); if its answer said to check something with the caller, ask them in one short question first. Then tell them in a few words that it is requested.";
+const BOOKING_NUDGE = "[OAIY] You said you would book it, but nothing is recorded: request_appointment was not called, or it was refused (its answer says why). Call it now, or first ask the caller what its answer says to check. Then tell them it is requested.";
 
 /** How long a tool may run on a call before a short line is said, and the line. */
 const HOLD_AFTER_MS = 2_000;
@@ -848,7 +849,7 @@ export function phoneConversationsTool(sessions: () => Sessions | null): Session
  * the customer, with none of the agents' own words for things.
  */
 export function factStyle(business = ''): string {
-  return `Write each fact as a short plain note about the customer, e.g. "Wants to keep the Fri 2 Oct 1 pm booking". Refer to the business by its name (${business ? `"${business}"` : 'e.g. "Green Lawns"'}) or as "the owner", never "your person", and use no internal wording (no agents, runner, tools, notes or instructions).`;
+  return `Write each fact as a short plain note about the customer. Refer to the business by its name${business ? ` ("${business}")` : ''} or as "the owner", never "your person", and use no internal wording (no agents, runner, tools, notes or instructions).`;
 }
 
 /** One person's note, as the runner reads it: their name (and who gave it), the business's notes, and what was remembered. */
@@ -877,7 +878,7 @@ export function callerNotesTool(sessions: () => Sessions | null): SessionTool {
         properties: {
           number: { type: 'string', description: 'Their phone number' },
           name: { type: 'string' },
-          add: { type: 'string', description: 'A fact to add: a short plain note about the customer, e.g. "Wants to keep the Fri 2 Oct 1 pm booking"' },
+          add: { type: 'string', description: 'A fact to add: a short plain note about the customer' },
           remove: { type: 'string' },
           facts: { type: 'array', items: { type: 'string' } },
         },
@@ -1464,7 +1465,7 @@ export class Sessions {
           return {
             name: 'remember',
             description: `Save something about the person you are talking with, for their next call or text: their name when they tell you it, or one short fact worth knowing next time (what they usually book, a preference, where the job is). Only about them, and only what they said or what happened. The business reads these facts in its Contacts: ${factStyle(business())}`,
-            parameters: { type: 'object', properties: { name: { type: 'string', description: 'Their name, as they said it' }, fact: { type: 'string', description: 'One short fact: a plain note about them, e.g. "Wants to keep the Fri 2 Oct 1 pm booking"' } } },
+            parameters: { type: 'object', properties: { name: { type: 'string', description: 'Their name, as they said it' }, fact: { type: 'string', description: 'One short fact: a plain note about them' } } },
           };
         },
         run: async (input) => {
@@ -1480,7 +1481,7 @@ export class Sessions {
         spec: {
           name: 'earlier_conversations',
           description: 'Your earlier calls and text messages with this person (only theirs): what was said and done. With words: the lines that mention any of them. Without: how the last ones went.',
-          parameters: { type: 'object', properties: { words: { type: 'string', description: 'Words to look for, e.g. "mowing Tuesday"' } } },
+          parameters: { type: 'object', properties: { words: { type: 'string', description: 'Words to look for: a name, a service or a topic' } } },
         },
         run: async (input) => this.earlierWith(session, typeof input.words === 'string' ? input.words : ''),
       },

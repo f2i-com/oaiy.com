@@ -151,7 +151,7 @@ describe("cancel_appointment: the caller's own, found by their number", () => {
     expect(tool.spec.name).toBe('cancel_appointment');
     expect(tool.spec.description).toContain("don't check the calendar again");
     const out = await tool.run({ date: '2026-10-01' }, signal);
-    expect(out).toBe("Cancelled: their Lawn mowing on Thu 1 Oct at 10 am (a request, not yet confirmed). Tell them it is cancelled. Don't check the calendar again.");
+    expect(out).toBe("Cancelled: their Lawn mowing on Thu 1 Oct at 10 am (a request, not yet confirmed). Tell them it is cancelled. If they asked for a new time instead, request it now with request_appointment, without asking again. Don't check the calendar again.");
     expect(appointments[0].status).toBe('cancelled');
     expect(appointments[0].notes).toMatch(/^Cancelled by the caller on a call \(\w{3} \d+ \w{3}\)\.$/);
     expect(appointments.slice(1).map((a) => a.status)).toEqual(['confirmed', 'confirmed']);
@@ -161,7 +161,7 @@ describe("cancel_appointment: the caller's own, found by their number", () => {
     const { desktop, appointments } = booked();
     const tool = cancel(desktop, '0491 570 006');
     const out = await tool.run({ date: '2026-10-02', time: '13:00' }, signal);
-    expect(out).toBe("Their Lawn mowing on Fri 2 Oct at 1 pm is confirmed, so staff cancel it: the cancellation is asked for (noted on it for the team). Tell them the team will confirm the cancellation. Don't check the calendar again.");
+    expect(out).toBe("Their Lawn mowing on Fri 2 Oct at 1 pm is confirmed, so staff cancel it: the cancellation is asked for (noted on it for the team). Tell them the team will confirm the cancellation. If they asked for a new time instead, request it now with request_appointment, without asking again. Don't check the calendar again.");
     expect(appointments[1].status).toBe('confirmed');
     expect(appointments[1].notes).toMatch(/^Side gate\nCancellation asked for by the caller on a call \(.+\): staff to cancel it and let them know\.$/);
     await tool.run({ date: '2026-10-02' }, signal);

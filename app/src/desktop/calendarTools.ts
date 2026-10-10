@@ -30,7 +30,7 @@ function freeQuery(input: Record<string, unknown>): { from: string; days: number
   const from = typeof input.from === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(input.from) ? input.from : today();
   const time = typeof input.time === 'string' ? input.time.trim() : '';
   const at = time ? parseClock(time) : null;
-  if (time && at === null) throw new Error('time is HH:MM, 24-hour (e.g. 13:00)');
+  if (time && at === null) throw new Error('time is HH:MM, 24-hour');
   // A time is checked on the day `from`.
   const days = at !== null ? 1 : Math.min(31, Math.max(1, Number(input.days) || 7));
   const service = typeof input.service === 'string' && input.service.trim() ? input.service.trim() : undefined;
@@ -120,7 +120,7 @@ function freeTool(desktop: () => Desktop | null, audience: Audience): SessionToo
           from: { type: 'string', description: 'The first day, YYYY-MM-DD (default today)' },
           days: { type: 'number', description: 'How many days to look at (default 7, at most 31)' },
           service: { type: 'string', description: 'The service, by name (sets the length)' },
-          time: { type: 'string', description: 'One start time to check on the day from, HH:MM 24-hour (e.g. 13:00)' },
+          time: { type: 'string', description: 'One start time to check on the day from, HH:MM 24-hour' },
         },
       },
     },
@@ -176,7 +176,7 @@ function cancelTool(desktop: () => Desktop | null, phone: () => string, audience
       if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error('date is YYYY-MM-DD');
       const time = typeof input.time === 'string' ? input.time.trim() : '';
       const at = time ? parseClock(time) : null;
-      if (time && at === null) throw new Error('time is HH:MM, 24-hour (e.g. 10:00)');
+      if (time && at === null) throw new Error('time is HH:MM, 24-hour');
       const tail = numberTail(phone());
       if (!tail) return `Their number is hidden, so their appointments can't be found: nothing was cancelled. Offer to take a message for staff.`;
       const d = connected(desktop);
@@ -196,14 +196,21 @@ function cancelTool(desktop: () => Desktop | null, phone: () => string, audience
       const on = sayDate(today());
       if (a.status === 'requested') {
         await d.calendarUpdate(String(a.id), { status: 'cancelled', notes: noted(`Cancelled by the ${who} ${via} (${on}).`) }, signal);
-        return `Cancelled: their ${named(a)} (a request, not yet confirmed). Tell them it is cancelled. Don't check the calendar again.`;
+        return `Cancelled: their ${named(a)} (a request, not yet confirmed). Tell them it is cancelled.${RESCHEDULE} Don't check the calendar again.`;
       }
       // Confirmed: staff cancel it (the calendar keeps it until they do), asked for once.
       if (!/Cancellation asked for/.test(notes)) await d.calendarUpdate(String(a.id), { notes: noted(`Cancellation asked for by the ${who} ${via} (${on}): staff to cancel it and let them know.`) }, signal);
-      return `Their ${named(a)} is confirmed, so staff cancel it: the cancellation is asked for (noted on it for the team). Tell them the team will confirm the cancellation. Don't check the calendar again.`;
+      return `Their ${named(a)} is confirmed, so staff cancel it: the cancellation is asked for (noted on it for the team). Tell them the team will confirm the cancellation.${RESCHEDULE} Don't check the calendar again.`;
     },
   };
 }
+
+/**
+ * What a cancellation's answer adds for a change of appointment ("cancel that one and book me in on another day
+ * instead"): the new time was asked for too, and asking for it is the agreement to it. Told only "Tell them it is
+ * cancelled", a call's agent cancelled, then asked again whether to request the new time the caller had just asked for.
+ */
+const RESCHEDULE = ' If they asked for a new time instead, request it now with request_appointment, without asking again.';
 
 /**
  * A call's calendar tools: what is free, worded for the caller (a call requests its appointment through the
