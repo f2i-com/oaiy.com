@@ -389,6 +389,14 @@ or Linux at all.
    - Tick **Use the eGPU** and save.
 3. **Models:** tick **On the eGPU** on each model that should run there. With tinygrad's
    server, only a model that is one `.gguf` file can be: it reads nothing else.
+4. **Or from the Agent's page:** with the eGPU switched on, its header has an **eGPU** menu
+   beside the model: choosing a model there sets it as the one on the card (it alone) and
+   starts loading it now, and the menu says how that goes (loading, ready, failed); *no
+   model* lets the card go. The model menu beside it lists the engine's language models,
+   the one on the card marked *eGPU*: choosing one chooses it in Engines, so it is what
+   loads, for the Agent, the phone's agents and flows alike (`PUT /api/engines/egpu` and
+   `PUT /api/engines/defaults` on the desktop; the discovery document's `egpu` says the
+   card's state, and each language model whether it is set to the card).
 
 ### What happens to a request
 

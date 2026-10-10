@@ -5,6 +5,8 @@
 //!
 //!   GET  /api/engines/defaults              → {running, defaults: {group: model|null}, models: {group: [id]}}
 //!   PUT  /api/engines/defaults {group, model} → {group, model}
+//!   PUT  /api/engines/egpu {model|null}     → {model, egpu} (the language model set to run on a Mac's eGPU, loading on
+//!                                             it; null: none)
 //!   POST /api/engines/llm/:action           → {llm: {state, resident, models, error}} (start | stop | restart)
 //!   GET  /api/engines/logs?source=studio|llm|media&lines=100 → {source, lines}
 //!
@@ -18,7 +20,7 @@
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -36,6 +38,7 @@ pub fn router(control: Control) -> Router {
     Router::new()
         .route("/api/engines/defaults", get(defaults).put(set_default))
         .route("/api/engines/llm/:action", post(llm))
+        .route("/api/engines/egpu", put(set_egpu))
         .route("/api/engines/logs", get(logs))
         .with_state(control)
 }
@@ -126,6 +129,60 @@ pub(crate) async fn set_default_at(ui: Option<String>, group: &str, model: &str)
 
 async fn set_default(State(control): State<Control>, Json(body): Json<DefaultBody>) -> Response {
     answer(set_default_at(control.engines_ui(), body.group.trim(), &body.model).await)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EgpuBody {
+    model: Option<String>,
+}
+
+/// Set `model` (None: no model) as the one language model that runs on the eGPU at `ui` (a Mac's card in a Thunderbolt
+/// enclosure: the engines' `llm.egpu`), and start loading it there. The engines' configuration is read, the models'
+/// `egpu` set (that model alone), and written back, which the engines check; the eGPU itself is switched on in their
+/// Settings, where the card is set up, not here.
+pub(crate) async fn set_egpu_at(ui: Option<String>, model: Option<&str>) -> Result<Value, (u16, String)> {
+    let model = model.map(str::trim).filter(|m| !m.is_empty());
+    if model.is_some_and(|m| !model_name(m)) {
+        return Err((400, "a model is its name in the engines, as models_list shows it".into()));
+    }
+    let ui = ui.ok_or((409, NOT_RUNNING.to_string()))?;
+    let mut config = studio_json(&ui, reqwest::Method::GET, "/api/config", None).await?;
+    let llm = config.get_mut("llm").filter(|v| v.is_object()).ok_or((502, "the engines' configuration has no llm section".to_string()))?;
+    let on = llm.pointer("/egpu/enabled").and_then(Value::as_bool).unwrap_or(false);
+    if model.is_some() && !on {
+        return Err((409, "the eGPU is switched off: switch it on in Engines → Settings → eGPU, where the card is set up".into()));
+    }
+    let models = llm.get_mut("models").and_then(Value::as_array_mut).ok_or((502, "the engines' configuration lists no language models".to_string()))?;
+    let name = |m: &Value| m.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+    if let Some(m) = model {
+        if !models.iter().any(|x| name(x) == m) {
+            return Err((404, format!("the engines have no language model called {m}")));
+        }
+    }
+    for x in models.iter_mut() {
+        let here = model.is_some_and(|m| name(x) == m);
+        if let Some(obj) = x.as_object_mut() {
+            if here {
+                obj.insert("egpu".into(), Value::Bool(true));
+            } else {
+                obj.remove("egpu");
+            }
+        }
+    }
+    studio_json(&ui, reqwest::Method::PUT, "/api/config", Some(config)).await?;
+    // (loading starts now, not at the first chat: a model of 16 GB takes a minute to reach the card)
+    let started = match model {
+        Some(m) => studio_json(&ui, reqwest::Method::POST, "/api/egpu/start", Some(json!({ "model": m }))).await.err().map(|(_, e)| e),
+        None => studio_json(&ui, reqwest::Method::POST, "/api/egpu/stop", None).await.err().map(|(_, e)| e),
+    };
+    let state = studio_json(&ui, reqwest::Method::GET, "/api/state", None).await.ok().and_then(|s| s.get("egpu").cloned());
+    let egpu = state.map(|e| json!({ "state": e.get("state"), "model": e.get("model"), "error": e.get("error") })).unwrap_or(Value::Null);
+    Ok(json!({ "model": model, "egpu": egpu, "error": started }))
+}
+
+async fn set_egpu(State(control): State<Control>, Json(body): Json<EgpuBody>) -> Response {
+    answer(set_egpu_at(control.engines_ui(), body.model.as_deref()).await)
 }
 
 /// Start, stop or restart the language model at `ui`.

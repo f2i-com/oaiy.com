@@ -700,10 +700,11 @@ fn the_walker_finds_the_routes_the_design_counted_and_the_ones_added_since() {
     // and `GET|PUT /api/ring/settings`, and seven it did not have), the eight of the encrypted backup
     // (`backup/routes.rs`: the status and the Agent page's hand-over of its storage), and the routes of
     // `/api/auth/` that the access model has built so far are the rows with `since: 2` that exist:
-    // `info`, `whoami` and `derive`, and the web login's fifteen (`login.rs`, `console.rs`).
+    // `info`, `whoami` and `derive`, and the web login's fifteen (`login.rs`, `console.rs`). The last one is the
+    // eGPU's model (`PUT /api/engines/egpu`, `control/engines.rs`).
     assert_eq!(
         pairs.len(),
-        165 + 11 + 8 + 3 + 15 + 3 + 6,
+        165 + 11 + 8 + 3 + 15 + 3 + 6 + 1,
         "main-router (method, path) pairs"
     );
     let mut built: Vec<String> = ROUTES
@@ -768,8 +769,9 @@ fn the_walker_finds_the_routes_the_design_counted_and_the_ones_added_since() {
 fn the_table_has_a_row_for_every_route_the_boot_test_probes_and_the_counts_the_design_gives() {
     let existing = ROUTES.iter().filter(|r| r.since == 1).count();
     let new_or_reserved = ROUTES.iter().filter(|r| r.since == 2).count();
-    // 161 in the design, the eleven routes the code gained since (see above), and the eight of the encrypted backup.
-    assert_eq!(existing, 165 + 11 + 8 + 3 + 6);
+    // 161 in the design, the eleven routes the code gained since (see above), the eight of the encrypted backup, and
+    // the eGPU's model.
+    assert_eq!(existing, 165 + 11 + 8 + 3 + 6 + 1);
     // 41 new and 60 reserved in the design; `GET /api/update` (reserved) is gone, replaced by the
     // real `GET /api/update/status`, and four reserved rows (`GET|PATCH /api/messages`,
     // `GET|PUT /api/ring/settings`) are `since: 1` now that their routes exist.

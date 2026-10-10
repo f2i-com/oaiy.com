@@ -57,6 +57,8 @@ has it) and `OAIY_WEBGPU_ADAPTER=tinygpu` (or `tinygpu:<socket>`).
 [MAC.md](MAC.md)). A chat with a model ticked *On the eGPU* then starts `egpu_serve.py --webgpu`, which holds the card
 in-process (this server, written beside it) and runs the app's own `oaiy-llm-server-webgpu` on it with the model; when
 OAIY stops it or goes, the launcher's lifeline stops the engine and Python's exit releases the card.
+The Agent's page chooses the model on the card from its header (its **eGPU** menu), and the model the engine runs
+from the menu beside it.
 
 ## Without the card: the emulator
 

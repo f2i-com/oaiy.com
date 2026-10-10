@@ -316,6 +316,8 @@ pub static ROUTES: &[Route] = &[
     scope(Verb::Post, "/api/engines/downloads", "models.write"),
     scope(Verb::Put, "/api/engines/defaults", "models.write"),
     scope(Verb::Post, "/api/engines/llm/:action", "models.write"),
+    // the language model set to run on a Mac's eGPU, and loading it there
+    scope(Verb::Put, "/api/engines/egpu", "models.write"),
     // runtimes.install
     scope(Verb::Post, "/api/python/install", "runtimes.install"),
     scope(Verb::Post, "/api/python/venvs", "runtimes.install"),
@@ -1133,12 +1135,12 @@ mod tests {
         // seven of the receptionist's transfers and messages).
         assert_eq!(
             want.len(),
-            161 + 41 + 60 - 1 + 4 + 7 + 8 + 3 + 6,
+            161 + 41 + 60 - 1 + 4 + 7 + 8 + 3 + 6 + 1,
             "the rows of the design and its documented differences"
         );
         assert_eq!(
-            added, 28,
-            "the routes added since the appendix are the twenty-eight the file lists"
+            added, 29,
+            "the routes added since the appendix are the twenty-nine the file lists"
         );
         // Four rows the appendix reserves were built (the messages and the ring's settings): the scope is the
         // design's and the `since` is 1, since the routes exist.

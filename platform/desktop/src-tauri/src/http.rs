@@ -817,7 +817,7 @@ fn is_control_path(path: &str) -> bool {
 /// model (`control/engines.rs`): the engines' configuration, taken on the
 /// privileged gate like their downloads.
 fn is_engine_control_path(path: &str) -> bool {
-    path == "/api/engines/defaults" || path.starts_with("/api/engines/llm/")
+    path == "/api/engines/defaults" || path == "/api/engines/egpu" || path.starts_with("/api/engines/llm/")
 }
 
 /// Where the engines' control pages are, once the desktop found or started them (see `engines.rs`).
@@ -2589,6 +2589,7 @@ mod tests {
             (Method::DELETE, "/api/control/log"),
             // Choosing the engines' models, starting and stopping their language model.
             (Method::PUT, "/api/engines/defaults"),
+            (Method::PUT, "/api/engines/egpu"),
             (Method::POST, "/api/engines/llm/start"),
             (Method::POST, "/api/engines/llm/stop"),
             (Method::POST, "/api/engines/llm/restart"),

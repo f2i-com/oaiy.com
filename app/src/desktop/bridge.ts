@@ -385,6 +385,22 @@ export class Desktop {
     await reply(await fetch(`${this.origin}/api/bridge/flows/${encodeURIComponent(id)}`, { method: 'PUT', headers: this.headers(), body: JSON.stringify(doc), signal }));
   }
 
+  /** Choose the language model OAIY's engines run, as their Engines page does (it loads when it is first asked). */
+  async chooseEngineModel(model: string, signal?: AbortSignal): Promise<void> {
+    await reply(await fetch(`${this.origin}/api/engines/defaults`, { method: 'PUT', headers: this.headers(), body: JSON.stringify({ group: 'llm', model }), signal }));
+  }
+
+  /**
+   * Set the language model that runs on the Mac's eGPU (null: none), and start loading it there. The answer: the
+   * eGPU's state then, and why it did not start (`error`).
+   */
+  async setEgpuModel(model: string | null, signal?: AbortSignal): Promise<{ state?: string; model?: string; error?: string }> {
+    const body = await reply(await fetch(`${this.origin}/api/engines/egpu`, { method: 'PUT', headers: this.headers(), body: JSON.stringify({ model }), signal }));
+    const egpu = isRecord(body) && isRecord(body.egpu) ? body.egpu : {};
+    const text = (v: unknown) => (typeof v === 'string' && v ? v : undefined);
+    return { state: text(egpu.state), model: text(egpu.model), error: (isRecord(body) ? text(body.error) : undefined) ?? text(egpu.error) };
+  }
+
   /** The flows stored on the desktop. */
   async flows(signal?: AbortSignal): Promise<Array<{ id: string; name: string }>> {
     const body = await reply(await fetch(`${this.origin}/api/bridge/flows`, { headers: this.headers(), signal }));

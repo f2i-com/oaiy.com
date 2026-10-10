@@ -198,6 +198,8 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
                     ("default", Json::Bool(name == llm_default)),
                     ("loaded", Json::Bool(loaded.iter().any(|l| l == name))),
                     ("vision", Json::Bool(!str_or(m, "vision_projector", "").is_empty())),
+                    // set to run on the eGPU (a Mac's card in a Thunderbolt enclosure, `crate::egpu`), where it is on
+                    ("egpu", Json::Bool(crate::egpu::assigned(&llm, name))),
                 ]),
                 missing_files(&studio.root, m, &LLM_FILES),
             )
@@ -451,6 +453,24 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
                 ("starts_on_demand", Json::Bool(true)),
             ]),
         ),
+        // The eGPU, where a Mac offers it: switched on or not, which engine, and the model it holds or is loading
+        // (no paths: what a chat's picker shows)
+        (
+            "egpu".into(),
+            if crate::egpu::available() {
+                let e = studio.egpu.status(&llm);
+                Json::obj([
+                    ("available", Json::Bool(true)),
+                    ("enabled", e.get("enabled").cloned().unwrap_or(Json::Bool(false))),
+                    ("engine", Json::str(if crate::egpu::webgpu(&llm) { "webgpu" } else { "tinygrad" })),
+                    ("state", e.get("state").cloned().unwrap_or(Json::Null)),
+                    ("model", e.get("model").cloned().unwrap_or(Json::Null)),
+                    ("models", e.get("models").cloned().unwrap_or(Json::Arr(Vec::new()))),
+                ])
+            } else {
+                Json::obj([("available", Json::Bool(false))])
+            },
+        ),
         ("media".into(), Json::obj([("busy", Json::Bool(studio.media.busy()))])),
         (
             "incognito".into(),
@@ -531,6 +551,30 @@ mod tests {
         // A LoRA counts: the model would not run without it.
         assert_eq!(model("music", "song").get("missing_files").and_then(Json::as_array).unwrap()[0].as_str(), Some("loras[0]"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_language_models_say_which_runs_on_the_egpu_and_the_egpu_says_no_paths() {
+        let root = std::env::temp_dir().join(format!("oaiy-studio-egpu-{}", std::process::id()));
+        let mut cfg = crate::config::default_json();
+        let llm = crate::registry::obj_mut(&mut cfg, &["llm"]).unwrap();
+        crate::util::set(llm, "egpu", Json::parse(br#"{"enabled": true, "engine": "webgpu", "python": "/Users/someone/tinygrad/.venv/bin/python"}"#).unwrap());
+        crate::util::set(llm, "models", Json::parse(br#"[{"name": "big", "path": "big.gguf", "egpu": true}, {"name": "small", "path": "small.gguf"}]"#).unwrap());
+        crate::util::set(llm, "default_model", Json::str("small"));
+        let doc = document(&studio_with(&root, cfg), "http://127.0.0.1:8080", true);
+        let listed = doc.get("models").and_then(|m| m.get("llm")).and_then(Json::as_array).unwrap();
+        let egpu = |id: &str| listed.iter().find(|m| str_or(m, "id", "") == id).and_then(|m| m.get("egpu")).cloned();
+        assert_eq!(egpu("big"), Some(Json::Bool(true)));
+        assert_eq!(egpu("small"), Some(Json::Bool(false)));
+        let card = doc.get("egpu").unwrap();
+        assert_eq!(card.get("available"), Some(&Json::Bool(true)));
+        assert_eq!(card.get("enabled"), Some(&Json::Bool(true)));
+        assert_eq!(card.get("engine").and_then(Json::as_str), Some("webgpu"));
+        assert_eq!(card.get("state").and_then(Json::as_str), Some("stopped"));
+        assert_eq!(card.get("models").and_then(Json::as_array).map(|m| m.len()), Some(1));
+        // what a chat's picker shows, and nothing of the computer's folders
+        assert!(card.get("python").is_none() && card.get("command").is_none());
+        assert!(!card.to_json().contains("/Users/"), "{}", card.to_json());
     }
 
     #[test]

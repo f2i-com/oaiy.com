@@ -56,7 +56,15 @@ describe('OAIY discovery', () => {
     expect(found.media.videoModel).toBe('sulphur-2');
     expect(found.media.imageModels[1]).toMatchObject({ id: 'unholy-desire-sdxl', edits: false, sizeStep: 64, negativePrompt: true });
     expect(found.media.videoModels[0]).toMatchObject({ maxSeconds: 5, maxSide: 1024, startImage: true, fps: 24 });
-    expect(found.llm).toEqual({ base: 'http://127.0.0.1:8080/v1', models: ['qwen3.8-27b', 'qwen3.5-9b'], default: 'qwen3.8-27b', contextTokens: 32768 });
+    expect(found.llm).toEqual({
+      base: 'http://127.0.0.1:8080/v1',
+      models: ['qwen3.8-27b', 'qwen3.5-9b'],
+      default: 'qwen3.8-27b',
+      contextTokens: 32768,
+      details: [{ id: 'qwen3.8-27b', default: true, loaded: false, egpu: false }, { id: 'qwen3.5-9b', default: false, loaded: false, egpu: false }],
+      // an OAIY from before the eGPU was said: none
+      egpu: { available: false, enabled: false, engine: undefined, state: undefined, model: undefined },
+    });
     expect(mediaReady(found.media)).toEqual({ image: true, video: true, speech: true, music: true, sound: true, model3d: true, background: true, upscale: true });
     expect(mediaAbilities(found.media)).toBe('images, video, speech, music, sound effects, 3D models, background removal and upscaling');
     expect(found.media.upscaleModels?.[0]).toMatchObject({ id: 'real-esrgan-x4plus', scales: [2, 4], maxPixels: 4194304 });
@@ -72,6 +80,19 @@ describe('OAIY discovery', () => {
     expect(found.media.voices).toEqual([{ name: 'Narrator', description: 'A deep, calm male narrator', language: 'english' }]);
     expect(found.media.openaiVoices).toEqual(['alloy', 'onyx']);
     expect(found.media.endpoints?.music).toBe('http://127.0.0.1:8080/v1/audio/music');
+  });
+
+  it("reads which model is on a Mac's eGPU, and how its loading goes", () => {
+    const doc = {
+      ...DOC,
+      models: { ...DOC.models, llm: [{ id: 'qwen3.8-27b', default: true, loaded: false, egpu: true }, { id: 'qwen3.5-9b', default: false, loaded: true }] },
+      egpu: { available: true, enabled: true, engine: 'webgpu', state: 'starting', model: 'qwen3.8-27b', models: ['qwen3.8-27b'] },
+    };
+    const found = readDiscovery(doc, 'http://127.0.0.1:8080');
+    expect(found.llm.details).toEqual([{ id: 'qwen3.8-27b', default: true, loaded: false, egpu: true }, { id: 'qwen3.5-9b', default: false, loaded: true, egpu: false }]);
+    expect(found.llm.egpu).toEqual({ available: true, enabled: true, engine: 'webgpu', state: 'starting', model: 'qwen3.8-27b' });
+    // A computer with no eGPU to offer says only that.
+    expect(readDiscovery({ ...DOC, egpu: { available: false } }, 'http://127.0.0.1:8080').llm.egpu).toMatchObject({ available: false, enabled: false });
   });
 
   it('keeps the key and a chosen model that still exists when found again', () => {

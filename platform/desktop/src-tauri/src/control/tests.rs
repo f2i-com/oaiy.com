@@ -877,6 +877,89 @@ async fn choosing_a_model_writes_only_that_groups_default_and_answers_no_secret(
     server.abort();
 }
 
+/// Engines with an eGPU (`llm.egpu`, switched on or off), whose start and stop are recorded.
+async fn fake_egpu_engines(on: bool) -> (String, Arc<Mutex<Vec<Value>>>, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+    use axum::routing::post;
+    let saved: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+    let config = json!({
+        "gateway": { "api_key": "sk-gateway-secret" },
+        "llm": { "default_model": "qwen", "egpu": { "enabled": on, "python": "/Users/someone/tinygrad/.venv/bin/python" }, "models": [{ "name": "qwen", "egpu": true }, { "name": "gemma" }] }
+    });
+    let (recorder, starts, stops) = (saved.clone(), asked.clone(), asked.clone());
+    let app = Router::new()
+        .route(
+            "/api/config",
+            get(move || {
+                let config = config.clone();
+                async move { Json(config) }
+            })
+            .put(move |Json(body): Json<Value>| {
+                let recorder = recorder.clone();
+                async move {
+                    recorder.lock().unwrap().push(body.clone());
+                    Json(body)
+                }
+            }),
+        )
+        .route(
+            "/api/egpu/start",
+            post(move |Json(body): Json<Value>| {
+                let starts = starts.clone();
+                async move {
+                    starts.lock().unwrap().push(format!("start {}", body["model"].as_str().unwrap_or_default()));
+                    Json(json!({ "state": "starting" }))
+                }
+            }),
+        )
+        .route(
+            "/api/egpu/stop",
+            post(move || {
+                let stops = stops.clone();
+                async move {
+                    stops.lock().unwrap().push("stop".into());
+                    Json(json!({ "state": "stopped" }))
+                }
+            }),
+        )
+        .route("/api/state", get(|| async { Json(json!({ "egpu": { "state": "starting", "model": "gemma", "error": null, "command": "secret command line" } })) }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ui = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (ui, saved, asked, server)
+}
+
+#[tokio::test]
+async fn the_egpus_model_is_the_one_set_there_and_it_starts_loading() {
+    use super::engines::set_egpu_at;
+    let (ui, saved, asked, server) = fake_egpu_engines(true).await;
+    let v = set_egpu_at(Some(ui.clone()), Some(" gemma ")).await.unwrap();
+    assert_eq!(v, json!({ "model": "gemma", "egpu": { "state": "starting", "model": "gemma", "error": null }, "error": null }));
+    assert!(!v.to_string().contains("secret") && !v.to_string().contains("/Users/"), "{v}");
+    let written = saved.lock().unwrap().last().unwrap().clone();
+    assert_eq!(written["llm"]["models"], json!([{ "name": "qwen" }, { "name": "gemma", "egpu": true }]), "that model alone");
+    assert_eq!(written["gateway"]["api_key"], "sk-gateway-secret", "the rest of the configuration goes back as it was");
+    assert_eq!(asked.lock().unwrap().as_slice(), ["start gemma"]);
+
+    // None: no model is set, and the card is let go.
+    set_egpu_at(Some(ui.clone()), None).await.unwrap();
+    assert_eq!(saved.lock().unwrap().last().unwrap()["llm"]["models"], json!([{ "name": "qwen" }, { "name": "gemma" }]));
+    assert_eq!(asked.lock().unwrap().last().map(String::as_str), Some("stop"));
+
+    assert_eq!(set_egpu_at(Some(ui.clone()), Some("ghost")).await.unwrap_err().0, 404);
+    assert_eq!(set_egpu_at(Some(ui.clone()), Some("bad\nname")).await.unwrap_err().0, 400);
+    assert_eq!(set_egpu_at(None, Some("qwen")).await.unwrap_err().0, 409);
+    server.abort();
+
+    // Switched off, a model is refused (it is switched on where the card is set up); none is still fine.
+    let (ui, saved, _, server) = fake_egpu_engines(false).await;
+    let (status, why) = set_egpu_at(Some(ui.clone()), Some("qwen")).await.unwrap_err();
+    assert!(status == 409 && why.contains("switched off"), "{why}");
+    assert!(saved.lock().unwrap().is_empty(), "nothing is written");
+    set_egpu_at(Some(ui.clone()), None).await.unwrap();
+    server.abort();
+}
+
 // ---------------------------------------------------------------------------
 // Whether a plugin is set up: the dashboard's rule
 // ---------------------------------------------------------------------------

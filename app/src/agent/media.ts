@@ -272,9 +272,16 @@ export type Discovery =
       version: string;
       media: MediaSettings;
       /** The chat side: its OpenAI base, models and window. */
-      llm: { base: string; models: string[]; default?: string; contextTokens?: number };
+      llm: { base: string; models: string[]; default?: string; contextTokens?: number; details: LlmModel[]; egpu: Egpu };
     }
   | { state: 'needs-key' | 'forbidden' | 'absent'; origin: string; message: string };
+
+/** A language model the engine has: chosen in Engines (`default`), the one loaded, set to run on the eGPU. */
+export type LlmModel = { id: string; default: boolean; loaded: boolean; egpu: boolean };
+
+/** A Mac's eGPU (a card in a Thunderbolt enclosure), where OAIY offers it: switched on, which engine runs there, and
+ * the model it holds or is loading (`state`: stopped, starting, ready, failed). */
+export type Egpu = { available: boolean; enabled: boolean; engine?: string; state?: string; model?: string };
 
 type Json = Record<string, unknown>;
 const isRecord = (v: unknown): v is Json => !!v && typeof v === 'object' && !Array.isArray(v);
@@ -360,6 +367,11 @@ export function readDiscovery(doc: Json, origin: string): Extract<Discovery, { s
   const openaiVoices = Array.isArray(voiceDoc.openai_names) ? voiceDoc.openai_names.filter((n): n is string => typeof n === 'string') : [];
   const base = str(doc.openai_base_url) ?? `${origin}/v1`;
   const llmModels = list(models.llm).map((m) => str(m.id)).filter((id): id is string => !!id);
+  const llmDetails: LlmModel[] = list(models.llm)
+    .filter((m) => !!str(m.id))
+    .map((m) => ({ id: str(m.id) as string, default: bool(m.default) ?? false, loaded: bool(m.loaded) ?? false, egpu: bool(m.egpu) ?? false }));
+  const egpuDoc = isRecord(doc.egpu) ? doc.egpu : {};
+  const egpu: Egpu = { available: bool(egpuDoc.available) ?? false, enabled: bool(egpuDoc.enabled) ?? false, engine: str(egpuDoc.engine), state: str(egpuDoc.state), model: str(egpuDoc.model) };
   const llm = isRecord(doc.llm) ? doc.llm : {};
   const service = str(doc.service) ?? 'OAIY';
   const version = str(doc.version) ?? '';
@@ -395,6 +407,8 @@ export function readDiscovery(doc: Json, origin: string): Extract<Discovery, { s
       models: llmModels,
       default: str(defaults.llm) ?? llmModels[0],
       contextTokens: num(llm.context_tokens),
+      details: llmDetails,
+      egpu,
     },
   };
 }
