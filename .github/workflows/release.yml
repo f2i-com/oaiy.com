@@ -427,7 +427,8 @@ jobs:
       # started as it is, each on a virtual screen, and a flow run through each
       # (platform/desktop/scripts/smoke-desktop.mjs). A package keeps the app's resources away from the program
       # (/usr/lib/OAIY), and an app that looked for them beside itself started, showed its window and ran no flow:
-      # nothing that only builds an installer sees that.
+      # nothing that only builds an installer sees that. The .deb's app is started as on a machine with no Node
+      # (SMOKE_OWN_NODE), so it installs its own, as a person's does.
       - name: Run a flow in the installed app (Linux)
         if: matrix.label == 'linux'
         env:
@@ -438,7 +439,7 @@ jobs:
           set -euo pipefail
           bundle=platform/desktop/src-tauri/target/release/bundle
           sudo apt-get install -y --no-install-recommends xvfb xauth dbus-x11 "./$(ls $bundle/deb/*.deb)"
-          xvfb-run -a dbus-run-session -- node platform/desktop/scripts/smoke-desktop.mjs /usr/bin/oaiy-desktop
+          SMOKE_OWN_NODE=1 xvfb-run -a dbus-run-session -- node platform/desktop/scripts/smoke-desktop.mjs /usr/bin/oaiy-desktop
           xvfb-run -a dbus-run-session -- node platform/desktop/scripts/smoke-desktop.mjs "$(ls $bundle/appimage/*.AppImage)" --appimage-extract-and-run
 
       # WITH the web login (the `web` feature): oaiy-server's startup rules (design 4.5.5) make a lan or a proxied install

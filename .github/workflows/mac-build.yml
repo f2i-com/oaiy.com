@@ -142,8 +142,11 @@ jobs:
 
       # The image as a person uses it: opened, the app dragged out (here: copied to a folder of the run's), the image
       # put away, the app started from where it now is. Its signature is checked first: one that does not hold is an
-      # app macOS will not start on Apple silicon.
+      # app macOS will not start on Apple silicon. The app is started as on a Mac with no Node (SMOKE_OWN_NODE):
+      # it has to fetch and unpack its own, as it will on the Mac this image is for.
       - name: Run a flow in the app from the disk image
+        env:
+          SMOKE_OWN_NODE: '1'
         run: |
           set -euo pipefail
           mount="$RUNNER_TEMP/oaiy-dmg"; apps="$RUNNER_TEMP/Applications"; mkdir -p "$apps"

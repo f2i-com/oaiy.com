@@ -16,8 +16,12 @@
 //     says it is. The second start is the one that shows a path the first start wrote and the second cannot use
 //     (an AppImage is mounted somewhere else every time).
 //
+// SMOKE_OWN_NODE=1 starts the app with a PATH of the system's own folders only, as a machine with no Node has it:
+// the app then has to install its Node runtime itself (the download from nodejs.org, the unpacking), which is what
+// a person's first flow waits on. Without it the app may use the Node that runs this script.
+//
 // headless-dist has its own smoke (smoke-server.mjs); this is the window app's. It needs a display (Linux: Xvfb will
-// do) and, where the machine has no Node of its own, the network once, for the Node runtime.
+// do) and, where the app finds no Node, the network once, for the Node runtime.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -56,6 +60,11 @@ const env = {
   XDG_DATA_HOME: path.join(home, '.local', 'share'), XDG_CONFIG_HOME: path.join(home, '.config'), XDG_CACHE_HOME: path.join(home, '.cache'),
   APPDATA: path.join(home, 'AppData', 'Roaming'), LOCALAPPDATA: path.join(home, 'AppData', 'Local'),
 };
+const ownNode = process.env.SMOKE_OWN_NODE === '1';
+if (ownNode) {
+  env.PATH = process.platform === 'win32' ? path.join(process.env.SystemRoot, 'System32') : '/usr/bin:/bin:/usr/sbin:/sbin';
+  delete env.Path;
+}
 const dataDir = process.platform === 'win32' ? path.join(env.APPDATA, 'com.oaiy.app')
   : process.platform === 'darwin' ? path.join(home, 'Library', 'Application Support', 'com.oaiy.app')
   : path.join(env.XDG_DATA_HOME, 'com.oaiy.app');
@@ -107,6 +116,7 @@ async function launch(round) {
       }
     }
     assert.equal(node.available, true, `no Node runtime, and installing one did not make one: ${JSON.stringify(node)}`);
+    if (ownNode) assert.equal(node.source, 'portable', `the app was to install its own Node and uses another: ${JSON.stringify(node)}`);
 
     const flowId = `desktop-smoke-${round}`;
     await request(`/api/bridge/flows/${flowId}`, {
