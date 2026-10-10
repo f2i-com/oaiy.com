@@ -37,6 +37,55 @@ oaiy-studio --config D:/ai/studio.json --ui-port 7000 --port 9000 --start-llm
 
 The console accepts `status`, `start`, `stop`, `open`, `jobs` and `quit`.
 
+### On a server with no screen
+
+`oaiy-studio --headless` opens no window and serves the same pages: the whole UI, in a
+browser on another computer. It is the way to run the engines on a machine in a cupboard.
+Two settings in `oaiy-studio.json` open it to the network, and the second is not optional:
+
+```json
+{ "ui":      { "host": "0.0.0.0", "port": 7860, "open": "none" },
+  "gateway": { "host": "0.0.0.0", "port": 8080, "api_key": "a long random key" } }
+```
+
+Then `http://<the server>:7860/` is the UI (it asks for the key once, or takes it as
+`?key=`), and `http://<the server>:8080/v1` the API, with the key as its bearer token. A
+call from another machine without the key is refused on both ports; saving a host that is
+not loopback is refused until there is a key ([The control port](#the-control-port)).
+Started with no terminal (a service's `/dev/null` for input) it stays up, and when it is
+stopped the model's server goes with it. A unit for systemd:
+
+```ini
+[Unit]
+Description=OAIY engines
+After=network-online.target
+
+[Service]
+User=oaiy
+WorkingDirectory=/srv/oaiy
+ExecStart=/opt/oaiy/oaiy-studio --headless --config /srv/oaiy/oaiy-studio.json
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The key crosses the network as it is: this is plain HTTP. On a network you do not own
+end to end, leave both hosts on `127.0.0.1` and reach them through an SSH tunnel
+(`ssh -L 7860:127.0.0.1:7860 -L 8080:127.0.0.1:8080 <the server>`), or put a proxy that
+speaks HTTPS in front.
+
+It is built by hand, like the other engines ([what a release does not
+contain](RELEASING.md#what-is-not-in-a-release)): `cargo build --release -p oaiy-studio -p
+oaiy-media`, and the language-model server as the installer's build does it (`cargo build
+--release -p oaiy-llm-server --no-default-features --features webgpu --bin
+oaiy-llm-server-webgpu`), the three programs in one folder. Checked on a clean Ubuntu
+24.04 with no screen and no graphics card: the three build on Ubuntu 22.04, the host
+starts, and from another machine the page comes, the API answers the key and refuses
+without it. No model was run there. `oaiy-server` is the other half of OAIY without a
+window (flows, plugins, services: [its section](../platform/desktop/README.md#headless-server-oaiy-server));
+it serves an API and no pages.
+
 ### The UI
 
 - **Layout:** the UI fills any window. Wide screens get more room; under
