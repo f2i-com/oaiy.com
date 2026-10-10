@@ -256,10 +256,33 @@ it is not built: an installed OAIY runs the model its setup downloads on it, fro
 makes the three folders, empty, and in a debug build the pages come from their build
 folders.
 
-Output is the installers (Windows NSIS and MSI; Linux AppImage, deb and rpm, on Linux)
-under `src-tauri/target/release/bundle/`. The engines' programs are not in them:
-[docs/RELEASING.md](../../docs/RELEASING.md) says what a release contains and what it does
-not.
+Output is the installers (Windows NSIS and MSI; Linux AppImage, deb and rpm, on Linux; a
+Mac's `OAIY.app` and `.dmg`, on a Mac: [docs/MAC.md](../../docs/MAC.md) says how one is made
+without a Mac at hand) under `src-tauri/target/release/bundle/`. The engines' programs are
+not in them: [docs/RELEASING.md](../../docs/RELEASING.md) says what a release contains and
+what it does not.
+
+**Where an install keeps `resources/`.** Windows' installer has them beside the program. A
+Linux package has the program in `/usr/bin` and the resources in `/usr/lib/OAIY` (the same
+tree is inside an AppImage). A Mac's app has them in `Contents/Resources`. `src/installed.rs`
+knows each place, and the lookups that ask no Tauri API (the CLI a flow runs on, a bundled
+Node) go through it: a lookup beside the program alone finds nothing in a Linux package or
+a Mac's app.
+
+**The installed app is used before it is published.** `node scripts/smoke-desktop.mjs
+<program>` starts an installed app twice, in a home folder of its own, and each time asks
+its API as its window does: it answers, Node is there or is installed, a stored flow runs
+on ZIPP, and the engine the installer carries is where the engines' configuration says.
+The release's Linux leg runs it on the `.deb` it installs and on the AppImage (under
+`xvfb-run -a dbus-run-session --`), and the Mac build on the app out of its disk image.
+The second start is there for the AppImage: mounted somewhere new every time, it is the
+install whose first start can write a path its second cannot use.
+
+**On Ubuntu.** `sudo apt install ./oaiy-desktop-<v>-linux-amd64.deb` brings what the app
+needs (WebKitGTK, GTK, the tray library), and OAIY is in the applications menu. The
+AppImage is one file: make it executable and start it. It mounts itself with FUSE, which a
+desktop has; where there is none (a container, a minimal server),
+`./oaiy-desktop-<v>-linux-x86_64.AppImage --appimage-extract-and-run` starts it without.
 
 ## Headless server (`oaiy-server`)
 

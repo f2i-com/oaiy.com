@@ -915,7 +915,6 @@
       "relay-reads.jsonl": "relay-logs",
       "relay.json": "companion",
       "resources": "not-a-store: the folder of files that ship inside the program",
-      "resources/node": "not-a-store: the folder of files that ship inside the program",
       "result.json": "not-a-store: a file in the scratch folder of one job or flow run, deleted when it ends",
       "ring-attempts.json": "ring-attempts",
       "ring.json": "ring",

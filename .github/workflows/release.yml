@@ -423,6 +423,24 @@ jobs:
           npm run tauri:build
           echo "::notice::this build is unsigned: no step that builds is given the updater key. A tag run signs the setup.exe and the AppImage afterwards, in the sign job; a run on a branch never signs."
 
+      # The Linux installers are used before they are published: the .deb installed on this runner, the AppImage
+      # started as it is, each on a virtual screen, and a flow run through each
+      # (platform/desktop/scripts/smoke-desktop.mjs). A package keeps the app's resources away from the program
+      # (/usr/lib/OAIY), and an app that looked for them beside itself started, showed its window and ran no flow:
+      # nothing that only builds an installer sees that.
+      - name: Run a flow in the installed app (Linux)
+        if: matrix.label == 'linux'
+        env:
+          WEBKIT_DISABLE_COMPOSITING_MODE: '1'
+          WEBKIT_DISABLE_DMABUF_RENDERER: '1'
+          LIBGL_ALWAYS_SOFTWARE: '1'
+        run: |
+          set -euo pipefail
+          bundle=platform/desktop/src-tauri/target/release/bundle
+          sudo apt-get install -y --no-install-recommends xvfb xauth dbus-x11 "./$(ls $bundle/deb/*.deb)"
+          xvfb-run -a dbus-run-session -- node platform/desktop/scripts/smoke-desktop.mjs /usr/bin/oaiy-desktop
+          xvfb-run -a dbus-run-session -- node platform/desktop/scripts/smoke-desktop.mjs "$(ls $bundle/appimage/*.AppImage)" --appimage-extract-and-run
+
       # WITH the web login (the `web` feature): oaiy-server's startup rules (design 4.5.5) make a lan or a proxied install
       # need it (the owner, the sign-in, `oaiy-server auth init`), and a build without it cannot serve either. Its default
       # access mode is then `scoped`, and it refuses OAIY_ACCESS_MODE=legacy. `check-access.mjs` fails if this line loses it.

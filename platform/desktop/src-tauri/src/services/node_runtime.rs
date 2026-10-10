@@ -80,8 +80,7 @@ fn portable_exe(root: &Path) -> Option<PathBuf> {
 /// Headless distributions carry a tested runtime beside the shipped CLI.
 /// Prefer that version over mutable data directories and arbitrary PATH entries.
 fn bundled_exe() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    portable_exe(&exe.parent()?.join("resources/node"))
+    portable_exe(&crate::installed::resource("node", |p| portable_exe(p).is_some())?)
 }
 
 /// `node` on PATH, if any.

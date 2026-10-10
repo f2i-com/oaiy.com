@@ -44,6 +44,8 @@ pub mod control;
 pub mod update;
 /// The access model: the route table (which scope each route takes), credentials, scopes, presets.
 pub mod auth;
+/// Where each system's package keeps the files the installer carries (the CLI, a Node runtime).
+pub mod installed;
 
 /// Port the localhost API binds to. Fixed so oaiy-web's detection probe has a
 /// stable target. Shared by both binaries (the GUI and the headless server).
@@ -1316,6 +1318,10 @@ pub fn run() {
             } else { handler(invoke) }
         })
         .setup(move |app| {
+            // Where this install's resources are, before anything looks for one (the CLI a flow runs on).
+            if let Ok(resources) = app.path().resource_dir() {
+                crate::installed::set_resource_dir(resources);
+            }
             if let Some(launch) = crate::isolated::current() {
                 let window = app.config().app.windows.first().ok_or("missing main window configuration")?;
                 tauri::WebviewWindowBuilder::from_config(app, window)?

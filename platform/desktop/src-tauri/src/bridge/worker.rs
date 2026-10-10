@@ -673,29 +673,14 @@ pub(crate) fn engine_fix_hint() -> &'static str {
     }
 }
 
-/// Candidate locations for the CLI bundle that ships INSIDE the app.
-///
-/// Tauri lays resources out beside the executable (`<install>/resources/…` on
-/// Windows/Linux, `…/Contents/Resources/…` in a macOS bundle), and `cargo run`
-/// leaves them under the target dir — so this probes the handful of places the
-/// same file legitimately lands rather than depending on a Tauri API, which
-/// keeps `worker.rs` usable from the headless binary that has no AppHandle.
+/// The CLI that ships INSIDE the app: `resources/cli/oaiy.mjs`, wherever this
+/// system's package keeps the app's resources (beside the program on Windows
+/// and in the headless archive, `/usr/lib/OAIY` for a Linux package, the
+/// bundle's `Contents/Resources` on a Mac: `crate::installed` knows each). It
+/// asks no Tauri API, so the headless binary, which has no AppHandle, finds
+/// its copy the same way.
 fn bundled_cli_script() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?;
-    let rel = [
-        "resources/cli/oaiy.mjs",
-        "../resources/cli/oaiy.mjs",
-        "../Resources/cli/oaiy.mjs",
-        // `cargo run` / `tauri dev`: resources are not copied, so fall back to
-        // the source tree next to the crate.
-        "../../resources/cli/oaiy.mjs",
-    ];
-    // NOT canonicalized: on Windows that yields a verbatim UNC path
-    // (`\\?\C:\…`), which node fails to resolve as a main module — it reported
-    // `EISDIR: illegal operation on a directory, lstat 'C:'`. `current_exe()` is
-    // already absolute, so joining is enough.
-    rel.iter().map(|r| dir.join(r)).find(|p| p.is_file())
+    crate::installed::resource("cli/oaiy.mjs", |p| p.is_file())
 }
 
 /// Resolve how to invoke the OAIY CLI.
