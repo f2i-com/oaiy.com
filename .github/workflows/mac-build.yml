@@ -6,10 +6,15 @@
 # for a Mac as its artifacts and does nothing else: it publishes no release, pushes no tag, and is given no secret
 # (no updater key, no signing certificate).
 #
-# The app is signed ad hoc (tauri.conf.json, bundle.macOS.signingIdentity "-"): a signature an Apple-silicon Mac
-# will run, with no Apple Developer ID behind it. So it is not notarised, and macOS asks before it opens it the
-# first time: docs/MAC.md says what to click. A release for the Mac (a notarised app, an update feed entry) is
-# another job, and needs that identity.
+# The build signs the app ad hoc (tauri.conf.json, bundle.macOS.signingIdentity "-"): a signature an Apple-silicon
+# Mac will run, with no Apple Developer ID behind it, which macOS asks about before it opens it the first time
+# (docs/MAC.md says what to click). The builds are given no secret.
+#
+# The job `sign` then signs that app with the repository's Developer ID and has Apple notarise it, so that a Mac
+# opens it like any app. It runs only when the repository says it has the identity (the variable MAC_SIGNING is
+# `on`), in the environment `mac-signing`, which holds the certificate and the notary's key and whose every use the
+# repository's owner approves. It is the only job that is given them, and it runs Apple's own tools and nothing of
+# the project's: the jobs that build run the project's npm packages and crates, and see no secret.
 #
 # Before the upload's last word, the image is used as a person uses it: opened, the app copied out of it, started,
 # and a flow run through it (platform/desktop/scripts/smoke-desktop.mjs). The artifacts are uploaded first, so a
@@ -224,3 +229,140 @@ jobs:
           codesign -dv --verbose=2 "$apps/OAIY.app" 2>&1 | head -14
           find "$apps/OAIY.app/Contents" -type f -perm +111 | head -40
           node platform/desktop/scripts/smoke-desktop.mjs "$apps/OAIY.app/Contents/MacOS/oaiy-desktop"
+
+  # ---------------------------------------------------------------- sign
+  # The image the job above made, signed with the Developer ID and notarised. Every program inside the app is
+  # signed first (the engine and the headless server are programs of their own, and Apple's notary refuses an app
+  # with one that is not signed with the hardened runtime and a timestamp), then the app with its entitlements, then
+  # a new image of it. With the notary's key the image is sent to Apple, waited for, and has its ticket stapled on;
+  # without it the image is signed and says so. The app is then started from the signed image and a flow run
+  # through it, as the build's own was.
+  sign:
+    name: Sign with the Developer ID and notarise
+    needs: dmg
+    if: ${{ vars.MAC_SIGNING == 'on' }}
+    runs-on: macos-15
+    environment: mac-signing
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: oaiy-macos-arm64
+          path: built
+
+      - name: Sign the app and make its image
+        env:
+          VERSION: ${{ inputs.version }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          [ -n "$APPLE_CERTIFICATE" ] && [ -n "$APPLE_SIGNING_IDENTITY" ] || { echo "::error::the environment mac-signing has no certificate"; exit 1; }
+          # A keychain of this job's own, for the certificate and its key; gone with the runner.
+          keychain="$RUNNER_TEMP/oaiy-signing.keychain-db"
+          key="$(openssl rand -base64 24)"
+          security create-keychain -p "$key" "$keychain"
+          security set-keychain-settings -lut 7200 "$keychain"
+          security unlock-keychain -p "$key" "$keychain"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/developer-id.p12"
+          security import "$RUNNER_TEMP/developer-id.p12" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign > /dev/null
+          : > "$RUNNER_TEMP/developer-id.p12"
+          # Apple's intermediate for Developer ID certificates of the G2 kind, in case the runner has not got it.
+          curl -fsSL -o "$RUNNER_TEMP/DeveloperIDG2CA.cer" https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer && security import "$RUNNER_TEMP/DeveloperIDG2CA.cer" -k "$keychain" > /dev/null 2>&1 || true
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$key" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          echo "identities for signing code in the job's keychain: $(security find-identity -v -p codesigning "$keychain" | grep -c 'Developer ID Application')"
+
+          # The app, out of the image the build made.
+          mount="$RUNNER_TEMP/built-image"; stage="$RUNNER_TEMP/stage"; mkdir -p "$stage"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount" built/*.dmg > /dev/null
+          cp -R "$mount/OAIY.app" "$stage/"
+          hdiutil detach "$mount" > /dev/null
+          app="$stage/OAIY.app"
+
+          # Inside out: each program that is not the app's own first, then the app.
+          main="$app/Contents/MacOS/oaiy-desktop"
+          find "$app/Contents" -type f -print0 | while IFS= read -r -d '' file; do
+            [ "$file" = "$main" ] && continue
+            if file -b "$file" | grep -q 'Mach-O'; then
+              echo "signing ${file#$app/}"
+              codesign --force --timestamp --options runtime --sign "$APPLE_SIGNING_IDENTITY" --keychain "$keychain" "$file"
+            fi
+          done
+          codesign --force --timestamp --options runtime --entitlements platform/desktop/src-tauri/entitlements.plist --sign "$APPLE_SIGNING_IDENTITY" --keychain "$keychain" "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dv --verbose=2 "$app" 2>&1 | grep -E "^(Identifier|Authority|TeamIdentifier|Timestamp|Runtime|CodeDirectory)" || true
+
+          # A new image: the app, and the way to Applications beside it.
+          mkdir -p signed
+          ln -s /Applications "$stage/Applications"
+          image="signed/oaiy-desktop-$VERSION-macos-arm64.dmg"
+          hdiutil create -volname "OAIY" -srcfolder "$stage" -ov -format UDZO "$image" > /dev/null
+          codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" --keychain "$keychain" "$image"
+          codesign --verify --verbose=2 "$image"
+          echo "IMAGE=$image" >> "$GITHUB_ENV"
+
+      - name: Have Apple notarise the image
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          if [ -z "$APPLE_API_KEY_P8" ] || [ -z "$APPLE_API_KEY_ID" ] || [ -z "$APPLE_API_ISSUER" ]; then
+            echo "::warning::the environment mac-signing has no notary key: the image is signed with the Developer ID and NOT notarised, so macOS still asks before it opens it the first time."
+            echo "NOTARISED=no" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          printf '%s' "$APPLE_API_KEY_P8" > "$RUNNER_TEMP/notary.p8"
+          xcrun notarytool submit "$IMAGE" --key "$RUNNER_TEMP/notary.p8" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" --wait --timeout 45m --output-format json > "$RUNNER_TEMP/notary.json" || true
+          status="$(node -p 'try { JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).status } catch { "no answer" }' "$RUNNER_TEMP/notary.json")"
+          id="$(node -p 'try { JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).id } catch { "" }' "$RUNNER_TEMP/notary.json")"
+          echo "Apple's notary says: $status"
+          if [ "$status" != "Accepted" ]; then
+            # Why not, in Apple's words (which file, which rule).
+            [ -n "$id" ] && xcrun notarytool log "$id" --key "$RUNNER_TEMP/notary.p8" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" | head -80 || true
+            : > "$RUNNER_TEMP/notary.p8"
+            echo "::error::Apple did not notarise the image ($status)"
+            exit 1
+          fi
+          : > "$RUNNER_TEMP/notary.p8"
+          xcrun stapler staple "$IMAGE"
+          xcrun stapler validate "$IMAGE"
+          echo "NOTARISED=yes" >> "$GITHUB_ENV"
+
+      # What macOS itself will say of it on a Mac, and the signed app used as the build's was.
+      - name: What Gatekeeper says, and a flow in the signed app
+        env:
+          SMOKE_OWN_NODE: '1'
+        run: |
+          set -euo pipefail
+          mount="$RUNNER_TEMP/signed-image"; apps="$RUNNER_TEMP/Applications"; mkdir -p "$apps"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount" "$IMAGE" > /dev/null
+          cp -R "$mount/OAIY.app" "$apps/"
+          hdiutil detach "$mount" > /dev/null
+          codesign --verify --deep --strict "$apps/OAIY.app"
+          if [ "$NOTARISED" = yes ]; then
+            spctl --assess --type open --context context:primary-signature -vv "$IMAGE"
+            spctl --assess --type execute -vv "$apps/OAIY.app"
+          else
+            spctl --assess --type execute -vv "$apps/OAIY.app" || echo "(as expected of an app that is not notarised)"
+          fi
+          node platform/desktop/scripts/smoke-desktop.mjs "$apps/OAIY.app/Contents/MacOS/oaiy-desktop"
+          ( cd signed && shasum -a 256 *.dmg > SHA256SUMS.txt && cat SHA256SUMS.txt )
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: oaiy-macos-arm64-signed
+          path: signed/
+          if-no-files-found: error
+          retention-days: 30
