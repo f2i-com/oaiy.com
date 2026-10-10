@@ -183,7 +183,8 @@ With the tensor cores (the adapter's cooperative matrices, `TINYGPU_NO_COOP` for
   a `vec4<f16>` array's stride, f32 and f16 sums, exact; and every one of OAIY's GPU tests, 98 (36 of their 380
   kernels on the tensor cores), all 380 compiled by nvcc for sm_89;
 - Qwen3.8-27B reads the 946-token prompt in 0.80 s (2.23 s without: 1,180 tokens a second, not 425), and writes
-  as before, about 28 tokens a second.
+  as before, about 28 tokens a second; through OAIY 0.1.3-mac.9's gateway (its eGPU's engine WebGPU), "marigold" out
+  of a 4,726-token prompt in 6.3 s, and 20.8 tokens a second end to end.
 
 Qwen-Image 2.1 (`oaiy-media`, which takes the adapter as the LLM engine does) **faulted the card** on the tensor cores
 (its GGUF's blocks kept quantized, 4.5 GB): an MMU fault, a write where no memory is mapped, found as its transformer
