@@ -20,13 +20,15 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> y: array<f32>;
 @group(0) @binding(3) var<uniform> p: Params;
 
-// k-major: the step's k index kk, then tokens (xs) or rows (ws) four to a vec4
-var<workgroup> xs: array<vec4<f32>, 1024>;
-var<workgroup> ws: array<vec4<f32>, 1024>;
+// k-major: the step's k index kk, then its 64 tokens (xs) or rows (ws), read four at a time. Scalars, not vec4s:
+// each thread writes its own token's or row's value, and WGSL lets a write to one component of a vector in
+// memory write the whole vector (Metal does), so four threads writing a vec4's four would race
+var<workgroup> xs: array<f32, 4096>;
+var<workgroup> ws: array<f32, 4096>;
 
 // row `row`'s weight at the step's `kk`
 fn put_w(kk: u32, row: u32, v: f32) {
-    ws[kk * 16u + row / 4u][row % 4u] = v;
+    ws[kk * 64u + row] = v;
 }
 
 fn decode_step(row4: u32, s: u32, wr: u32, wq: u32) {
@@ -85,10 +87,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
             var v = vec4<f32>(0.0);
             if (tok < p.m) { v = x4[tok * k4 + s * 16u + xq * 4u + i]; }
             let kk = xq * 16u + i * 4u;
-            xs[kk * 16u + xt / 4u][xt % 4u] = v.x;
-            xs[(kk + 1u) * 16u + xt / 4u][xt % 4u] = v.y;
-            xs[(kk + 2u) * 16u + xt / 4u][xt % 4u] = v.z;
-            xs[(kk + 3u) * 16u + xt / 4u][xt % 4u] = v.w;
+            xs[kk * 64u + xt] = v.x;
+            xs[(kk + 1u) * 64u + xt] = v.y;
+            xs[(kk + 2u) * 64u + xt] = v.z;
+            xs[(kk + 3u) * 64u + xt] = v.w;
         }
         let r = r0 + wr;
         if (r < p.rows) {
@@ -101,8 +103,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         }
         workgroupBarrier();
         for (var kk = 0u; kk < 64u; kk++) {
-            let wv = ws[kk * 16u + tx];
-            let xv = xs[kk * 16u + ty];
+            let wi = kk * 64u + tx * 4u;
+            let xi = kk * 64u + ty * 4u;
+            let wv = vec4<f32>(ws[wi], ws[wi + 1u], ws[wi + 2u], ws[wi + 3u]);
+            let xv = vec4<f32>(xs[xi], xs[xi + 1u], xs[xi + 2u], xs[xi + 3u]);
             acc0 += xv.x * wv;
             acc1 += xv.y * wv;
             acc2 += xv.z * wv;
@@ -144,9 +148,11 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> y: array<f32>;
 @group(0) @binding(3) var<uniform> p: Params;
 
-// k-major: the step's k index kk, then tokens (xs) or rows (ws) four to a vec4
-var<workgroup> xs: array<vec4<f32>, 512>;
-var<workgroup> ws: array<vec4<f32>, 512>;
+// k-major: the step's k index kk, then its 64 tokens (xs) or rows (ws), read four at a time. Scalars, not vec4s:
+// each thread writes its own token's or row's value, and WGSL lets a write to one component of a vector in
+// memory write the whole vector (Metal does), so four threads writing a vec4's four would race
+var<workgroup> xs: array<f32, 2048>;
+var<workgroup> ws: array<f32, 2048>;
 
 // A word's four int8, low byte first.
 fn i8x4(v: u32) -> vec4<f32> {
@@ -178,10 +184,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
             var v = vec4<f32>(0.0);
             if (tok < p.m) { v = x4[tok * k4 + s * 8u + xq * 2u + i]; }
             let kk = xq * 8u + i * 4u;
-            xs[kk * 16u + xt / 4u][xt % 4u] = v.x;
-            xs[(kk + 1u) * 16u + xt / 4u][xt % 4u] = v.y;
-            xs[(kk + 2u) * 16u + xt / 4u][xt % 4u] = v.z;
-            xs[(kk + 3u) * 16u + xt / 4u][xt % 4u] = v.w;
+            xs[kk * 64u + xt] = v.x;
+            xs[(kk + 1u) * 64u + xt] = v.y;
+            xs[(kk + 2u) * 64u + xt] = v.z;
+            xs[(kk + 3u) * 64u + xt] = v.w;
         }
         var lo = vec4<f32>(0.0);
         var hi = vec4<f32>(0.0);
@@ -204,18 +210,20 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
             hi = d * i8x4(w1);
         }
         let kw = wq * 8u;
-        ws[kw * 16u + wr / 4u][wr % 4u] = lo.x;
-        ws[(kw + 1u) * 16u + wr / 4u][wr % 4u] = lo.y;
-        ws[(kw + 2u) * 16u + wr / 4u][wr % 4u] = lo.z;
-        ws[(kw + 3u) * 16u + wr / 4u][wr % 4u] = lo.w;
-        ws[(kw + 4u) * 16u + wr / 4u][wr % 4u] = hi.x;
-        ws[(kw + 5u) * 16u + wr / 4u][wr % 4u] = hi.y;
-        ws[(kw + 6u) * 16u + wr / 4u][wr % 4u] = hi.z;
-        ws[(kw + 7u) * 16u + wr / 4u][wr % 4u] = hi.w;
+        ws[kw * 64u + wr] = lo.x;
+        ws[(kw + 1u) * 64u + wr] = lo.y;
+        ws[(kw + 2u) * 64u + wr] = lo.z;
+        ws[(kw + 3u) * 64u + wr] = lo.w;
+        ws[(kw + 4u) * 64u + wr] = hi.x;
+        ws[(kw + 5u) * 64u + wr] = hi.y;
+        ws[(kw + 6u) * 64u + wr] = hi.z;
+        ws[(kw + 7u) * 64u + wr] = hi.w;
         workgroupBarrier();
         for (var kk = 0u; kk < 32u; kk++) {
-            let wv = ws[kk * 16u + tx];
-            let xv = xs[kk * 16u + ty];
+            let wi = kk * 64u + tx * 4u;
+            let xi = kk * 64u + ty * 4u;
+            let wv = vec4<f32>(ws[wi], ws[wi + 1u], ws[wi + 2u], ws[wi + 3u]);
+            let xv = vec4<f32>(xs[xi], xs[xi + 1u], xs[xi + 2u], xs[xi + 3u]);
             acc0 += xv.x * wv;
             acc1 += xv.y * wv;
             acc2 += xv.z * wv;
@@ -252,13 +260,15 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> y: array<f32>;
 @group(0) @binding(3) var<uniform> p: Params;
 
-// k-major: the step's k index kk, then tokens (xs) or rows (ws) four to a vec4
-var<workgroup> xs: array<vec4<f32>, 1024>;
-var<workgroup> ws: array<vec4<f32>, 1024>;
+// k-major: the step's k index kk, then its 64 tokens (xs) or rows (ws), read four at a time. Scalars, not vec4s:
+// each thread writes its own token's or row's value, and WGSL lets a write to one component of a vector in
+// memory write the whole vector (Metal does), so four threads writing a vec4's four would race
+var<workgroup> xs: array<f32, 4096>;
+var<workgroup> ws: array<f32, 4096>;
 
 // row `row`'s weight at the step's `kk`
 fn put_w(kk: u32, row: u32, v: f32) {
-    ws[kk * 16u + row / 4u][row % 4u] = v;
+    ws[kk * 64u + row] = v;
 }
 
 // Byte `b` (0..12) of a block's scales, the header's last three words.
@@ -324,10 +334,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
             var v = vec4<f32>(0.0);
             if (tok < p.m) { v = x4[tok * k4 + s * 16u + xq * 4u + i]; }
             let kk = xq * 16u + i * 4u;
-            xs[kk * 16u + xt / 4u][xt % 4u] = v.x;
-            xs[(kk + 1u) * 16u + xt / 4u][xt % 4u] = v.y;
-            xs[(kk + 2u) * 16u + xt / 4u][xt % 4u] = v.z;
-            xs[(kk + 3u) * 16u + xt / 4u][xt % 4u] = v.w;
+            xs[kk * 64u + xt] = v.x;
+            xs[(kk + 1u) * 64u + xt] = v.y;
+            xs[(kk + 2u) * 64u + xt] = v.z;
+            xs[(kk + 3u) * 64u + xt] = v.w;
         }
         let r = r0 + wr;
         if (r < p.rows) {
@@ -340,8 +350,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         }
         workgroupBarrier();
         for (var kk = 0u; kk < 64u; kk++) {
-            let wv = ws[kk * 16u + tx];
-            let xv = xs[kk * 16u + ty];
+            let wi = kk * 64u + tx * 4u;
+            let xi = kk * 64u + ty * 4u;
+            let wv = vec4<f32>(ws[wi], ws[wi + 1u], ws[wi + 2u], ws[wi + 3u]);
+            let xv = vec4<f32>(xs[xi], xs[xi + 1u], xs[xi + 2u], xs[xi + 3u]);
             acc0 += xv.x * wv;
             acc1 += xv.y * wv;
             acc2 += xv.z * wv;
@@ -378,13 +390,15 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> y: array<f32>;
 @group(0) @binding(3) var<uniform> p: Params;
 
-// k-major: the step's k index kk, then tokens (xs) or rows (ws) four to a vec4
-var<workgroup> xs: array<vec4<f32>, 1024>;
-var<workgroup> ws: array<vec4<f32>, 1024>;
+// k-major: the step's k index kk, then its 64 tokens (xs) or rows (ws), read four at a time. Scalars, not vec4s:
+// each thread writes its own token's or row's value, and WGSL lets a write to one component of a vector in
+// memory write the whole vector (Metal does), so four threads writing a vec4's four would race
+var<workgroup> xs: array<f32, 4096>;
+var<workgroup> ws: array<f32, 4096>;
 
 // row `row`'s weight at the step's `kk`
 fn put_w(kk: u32, row: u32, v: f32) {
-    ws[kk * 16u + row / 4u][row % 4u] = v;
+    ws[kk * 64u + row] = v;
 }
 
 
@@ -451,10 +465,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
             var v = vec4<f32>(0.0);
             if (tok < p.m) { v = x4[tok * k4 + s * 16u + xq * 4u + i]; }
             let kk = xq * 16u + i * 4u;
-            xs[kk * 16u + xt / 4u][xt % 4u] = v.x;
-            xs[(kk + 1u) * 16u + xt / 4u][xt % 4u] = v.y;
-            xs[(kk + 2u) * 16u + xt / 4u][xt % 4u] = v.z;
-            xs[(kk + 3u) * 16u + xt / 4u][xt % 4u] = v.w;
+            xs[kk * 64u + xt] = v.x;
+            xs[(kk + 1u) * 64u + xt] = v.y;
+            xs[(kk + 2u) * 64u + xt] = v.z;
+            xs[(kk + 3u) * 64u + xt] = v.w;
         }
         let r = r0 + wr;
         if (r < p.rows) {
@@ -467,8 +481,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         }
         workgroupBarrier();
         for (var kk = 0u; kk < 64u; kk++) {
-            let wv = ws[kk * 16u + tx];
-            let xv = xs[kk * 16u + ty];
+            let wi = kk * 64u + tx * 4u;
+            let xi = kk * 64u + ty * 4u;
+            let wv = vec4<f32>(ws[wi], ws[wi + 1u], ws[wi + 2u], ws[wi + 3u]);
+            let xv = vec4<f32>(xs[xi], xs[xi + 1u], xs[xi + 2u], xs[xi + 3u]);
             acc0 += xv.x * wv;
             acc1 += xv.y * wv;
             acc2 += xv.z * wv;
@@ -505,13 +521,15 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> y: array<f32>;
 @group(0) @binding(3) var<uniform> p: Params;
 
-// k-major: the step's k index kk, then tokens (xs) or rows (ws) four to a vec4
-var<workgroup> xs: array<vec4<f32>, 1024>;
-var<workgroup> ws: array<vec4<f32>, 1024>;
+// k-major: the step's k index kk, then its 64 tokens (xs) or rows (ws), read four at a time. Scalars, not vec4s:
+// each thread writes its own token's or row's value, and WGSL lets a write to one component of a vector in
+// memory write the whole vector (Metal does), so four threads writing a vec4's four would race
+var<workgroup> xs: array<f32, 4096>;
+var<workgroup> ws: array<f32, 4096>;
 
 // row `row`'s weight at the step's `kk`
 fn put_w(kk: u32, row: u32, v: f32) {
-    ws[kk * 16u + row / 4u][row % 4u] = v;
+    ws[kk * 64u + row] = v;
 }
 
 // Byte `b` (0..12) of a block's scales, the header's last three words.
@@ -582,10 +600,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
             var v = vec4<f32>(0.0);
             if (tok < p.m) { v = x4[tok * k4 + s * 16u + xq * 4u + i]; }
             let kk = xq * 16u + i * 4u;
-            xs[kk * 16u + xt / 4u][xt % 4u] = v.x;
-            xs[(kk + 1u) * 16u + xt / 4u][xt % 4u] = v.y;
-            xs[(kk + 2u) * 16u + xt / 4u][xt % 4u] = v.z;
-            xs[(kk + 3u) * 16u + xt / 4u][xt % 4u] = v.w;
+            xs[kk * 64u + xt] = v.x;
+            xs[(kk + 1u) * 64u + xt] = v.y;
+            xs[(kk + 2u) * 64u + xt] = v.z;
+            xs[(kk + 3u) * 64u + xt] = v.w;
         }
         let r = r0 + wr;
         if (r < p.rows) {
@@ -598,8 +616,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         }
         workgroupBarrier();
         for (var kk = 0u; kk < 64u; kk++) {
-            let wv = ws[kk * 16u + tx];
-            let xv = xs[kk * 16u + ty];
+            let wi = kk * 64u + tx * 4u;
+            let xi = kk * 64u + ty * 4u;
+            let wv = vec4<f32>(ws[wi], ws[wi + 1u], ws[wi + 2u], ws[wi + 3u]);
+            let xv = vec4<f32>(xs[xi], xs[xi + 1u], xs[xi + 2u], xs[xi + 3u]);
             acc0 += xv.x * wv;
             acc1 += xv.y * wv;
             acc2 += xv.z * wv;

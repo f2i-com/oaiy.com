@@ -212,8 +212,10 @@ pub(in crate::chain) const DELTA_NET: &str = r#"
 const DK: u32 = DK_VALUEu;
 const DK4: u32 = DK_VALUEu / 4u;
 
-var<workgroup> qn: array<vec4<f32>, DK4>;
-var<workgroup> kn: array<vec4<f32>, DK4>;
+// the token's normed q and k, read four at a time. Scalars, not vec4s: a thread writes its own, and WGSL lets a write
+// to one component of a vector in memory write the whole vector (Metal does), so four threads writing one would race
+var<workgroup> qn: array<f32, DK>;
+var<workgroup> kn: array<f32, DK>;
 var<workgroup> red: array<f32, 2 * DK>;
 
 @compute @workgroup_size(DK)
@@ -245,8 +247,8 @@ ROW_LOAD
         }
         let inv_q = 1.0 / sqrt(red[0] + eps);
         let inv_k = 1.0 / sqrt(red[DK] + eps);
-        qn[i / 4u][i % 4u] = q * inv_q * scale_q;
-        kn[i / 4u][i % 4u] = k * inv_k;
+        qn[i] = q * inv_q * scale_q;
+        kn[i] = k * inv_k;
         workgroupBarrier();
         let bt = 1.0 / (1.0 + exp(-ba[t * 2u * nv + h]));
         let ab = ba[t * 2u * nv + nv + h] + dt[h];
@@ -285,10 +287,10 @@ pub(in crate::chain) fn delta_net_one(dk: usize) -> String {
     let n = dk / 4;
     let load: String = (0..n).map(|c| format!("    var sr{c} = st[base + {c}u];\n")).collect();
     let kv: String = (0..n)
-        .map(|c| format!("        {{\n            let s = sr{c} * g;\n            let kk = kn[{c}u];\n            kv += s.x * kk.x;\n            kv += s.y * kk.y;\n            kv += s.z * kk.z;\n            kv += s.w * kk.w;\n        }}\n"))
+        .map(|c| format!("        {{\n            let s = sr{c} * g;\n            let kk = vec4<f32>(kn[{a}u], kn[{b}u], kn[{c2}u], kn[{d}u]);\n            kv += s.x * kk.x;\n            kv += s.y * kk.y;\n            kv += s.z * kk.z;\n            kv += s.w * kk.w;\n        }}\n", a = 4 * c, b = 4 * c + 1, c2 = 4 * c + 2, d = 4 * c + 3))
         .collect();
     let update: String = (0..n)
-        .map(|c| format!("        {{\n            let s = sr{c} * g + delta * kn[{c}u];\n            sr{c} = s;\n            let qq = qn[{c}u];\n            core += s.x * qq.x;\n            core += s.y * qq.y;\n            core += s.z * qq.z;\n            core += s.w * qq.w;\n        }}\n"))
+        .map(|c| format!("        {{\n            let s = sr{c} * g + delta * vec4<f32>(kn[{a}u], kn[{b}u], kn[{c2}u], kn[{d}u]);\n            sr{c} = s;\n            let qq = vec4<f32>(qn[{a}u], qn[{b}u], qn[{c2}u], qn[{d}u]);\n            core += s.x * qq.x;\n            core += s.y * qq.y;\n            core += s.z * qq.z;\n            core += s.w * qq.w;\n        }}\n", a = 4 * c, b = 4 * c + 1, c2 = 4 * c + 2, d = 4 * c + 3))
         .collect();
     let store: String = (0..n).map(|c| format!("    st[base + {c}u] = sr{c};\n")).collect();
     DELTA_NET

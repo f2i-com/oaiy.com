@@ -163,14 +163,15 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 
 /// The tiled kernel for a prompt (more than [`M_TILE`] rows of `x`): 64 tokens by 64 weight rows a workgroup, a
 /// 32-element sub-block of `k` a step. Each of 64 threads decodes one weight row's sub-block with the type's own
-/// `dequant` (so the weights are the CPU's exactly) into workgroup memory, kept as vec4s of four rows; then every
+/// `dequant` (so the weights are the CPU's exactly) into workgroup memory, read four rows at a time; then every
 /// thread adds 4 tokens by 4 rows, its sums four vec4s. The one-row kernel decodes a row's weights once for every 8
 /// tokens and adds them in arrays the compiler keeps in memory: a 4096 x 4096 Q4_K weight against 512 tokens took
 /// 24 ms (0.7 TFLOP/s).
 const MANY_BODY: &str = r#"
 var<workgroup> xs: array<f32, 2048>;
-// k step kk, rows 4q..4q+3: wt[kk * 16 + q]
-var<workgroup> wt: array<vec4<f32>, 512>;
+// k step kk, row r: wt[kk * 64 + r]. Scalars, not vec4s of 4 rows: a thread writes one row's, and WGSL lets a write to
+// one component of a vector in memory write the whole vector (Metal does), so four threads writing one would race
+var<workgroup> wt: array<f32, 2048>;
 
 // Token `tok`'s sums of rows row0..row0+3 of this chunk, those it has and of a token there is.
 fn put(v: vec4<f32>, tok: u32, row0: u32) {
@@ -204,14 +205,15 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
             let r = r0 + li;
             if (r < p.rows) {
                 dequant(r * p.row_bytes + (u / SUBS) * BLOCK_BYTES, u % SUBS);
-                for (var j = 0u; j < 32u; j++) { wt[j * 16u + li / 4u][li % 4u] = v[j]; }
+                for (var j = 0u; j < 32u; j++) { wt[j * 64u + li] = v[j]; }
             } else {
-                for (var j = 0u; j < 32u; j++) { wt[j * 16u + li / 4u][li % 4u] = 0.0; }
+                for (var j = 0u; j < 32u; j++) { wt[j * 64u + li] = 0.0; }
             }
         }
         workgroupBarrier();
         for (var kk = 0u; kk < 32u; kk++) {
-            let w4 = wt[kk * 16u + tx];
+            let wb = kk * 64u + tx * 4u;
+            let w4 = vec4<f32>(wt[wb], wt[wb + 1u], wt[wb + 2u], wt[wb + 3u]);
             let xb = kk * 64u + ty * 4u;
             acc0 += xs[xb] * w4;
             acc1 += xs[xb + 1u] * w4;

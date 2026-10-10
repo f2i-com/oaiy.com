@@ -80,33 +80,46 @@ products go through a function of their own on Metal), and the workflow has a se
 since, on the runner's GPU: the catalog's small model (Qwen3.5 4B) is loaded through
 Metal and asked a question, and has answered in sentences; and the GPU backend's own
 tests are run. Of those, 72 pass there and 25 give other numbers than the CPU (f16 and
-tiled matmuls, the media models' convolutions, grouped experts, Q2_0). The runner's GPU is
-a virtual one; whether a Mac's own GPU gives the same is not known, and `tools/mac/check.sh`
-on a Mac is what says.
+tiled matmuls, the media models' convolutions, grouped experts, Q2_0). A Mac's own GPU (an
+M5 Pro, macOS 27) gave the same 72 and 25; why, and that it is fixed, is the first of the
+three below.
 
-**Seen on the first Mac, and open.** With the signed image (0.1.3-mac.5) the same person
-then met three things that are not fixed, because each needs a Mac to look at:
+**Seen on the first Mac.** With the signed image (0.1.3-mac.5) the same person then met
+three things, each of which needed a Mac to look at. The first is fixed; two are open:
 
-- **A long prompt is answered with one syllable over and over.** The Agent's first message
-  carries several thousand tokens of instructions, and a Qwen3.5 9B answered it with
-  "angangang…". A prompt that long is read by other kernels than a short one (in blocks of
-  rows, chained on the GPU), and the short question above goes through none of them.
-  `tools/engine-smoke.sh` asks such a prompt with `ENGINE_SMOKE_LONG=1` (it names a word, a
-  page of sentences follows, and it asks for the word), and with `OAIY_NO_CHAIN=1` as well
-  it asks it with the chained runs off. Nothing has to be built for it: the engine is in the
-  installed app, and the model is where the app downloaded it. Quit OAIY first (its own
-  engine holds the GPU's memory), then:
+- **Fixed: a prompt was answered with one syllable over and over.** The Agent's first
+  message carries several thousand tokens of instructions, and a Qwen3.5 9B answered it
+  with "angangang…"; on that Mac a 256-token prompt had "amon!!!!" and "Reply with the
+  single word: ready" an empty reply, through the chained runs or not, and the CPU
+  answered all of them. The kernels staged their tiles in the workgroup's memory a value a
+  thread into a component of a vec4 (`xs[i / 4u][i % 4u] = v`), and WGSL lets a write to
+  one component of a vector write the whole vector ("Component Reference from Vector Memory
+  View"): Apple's compiler does, so of four threads writing one vector's four, one's value
+  stood and three were lost. Vulkan's and D3D12's compilers store the one component, so it
+  was seen only on a Mac. Every such kernel (the K-quants' and Q8_0's tiled matmuls, Q3_K's
+  int8 one, the generic one, the f32, f16 and bf16 tiled matmuls, the convolutions', the
+  dense experts', EXL3's for a block of rows, the delta net's q and k, the tiled attention's
+  weights: 17 of the 206 the tests made) now stages scalars and reads them four at a time,
+  and the crate's tests check every kernel they make for such a write (`lane_writes`), on
+  any GPU. On the M5 Pro: `check.sh` 97 pass of 98 (the one left is the hyper-connections'
+  fused mix against its two ops bit for bit, a few units in the last place apart: Flash-Next's,
+  not Qwen3.5's), the 9B answers each length asked up to the Agent's size, and the long
+  prompt below (7,846 tokens) is answered with its word chained (88 s) and with
+  `OAIY_NO_CHAIN=1` (129 s). A prompt is read some 8% slower there than the wrong answers
+  were (946 tokens in 10.2 s, from 9.4 s); a card's speeds with these kernels were not
+  measured again.
+
+  An image has the fix when the engine inside it passes the same check, with nothing built:
+  quit OAIY first (its own engine holds the GPU's memory), then
 
   ```sh
   engine=/Applications/OAIY.app/Contents/Resources/resources/engines/oaiy-llm-server-webgpu
   model="$HOME/Library/Application Support/com.oaiy.app/engines/models/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf"
   ENGINE_SMOKE_LONG=1 ENGINE_SMOKE_LONG_LINES=330 sh tools/engine-smoke.sh "$engine" "$model"
-  OAIY_NO_CHAIN=1 ENGINE_SMOKE_LONG=1 ENGINE_SMOKE_LONG_LINES=330 sh tools/engine-smoke.sh "$engine" "$model"
   ```
 
-  (330 lines is about the Agent's seven thousand tokens. If either path is not there,
-  `ls` beside it says what is.) Which of the two answers wrong, and what `check.sh` says on
-  that Mac (it needs Rust), is where to start.
+  (330 lines is about the Agent's seven thousand tokens; `target/release/oaiy-llm-server-webgpu`
+  for an engine built here.) 0.1.3-mac.5's does not have it.
 - **The Agent says "The code sandbox is unavailable: the page is not cross-origin
   isolated".** The window serves the Agent's page from a scheme of its own with the opener
   and embedder policies that isolate a page in a browser (`require-corp` off Windows), and

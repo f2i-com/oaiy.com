@@ -262,8 +262,11 @@ pub(in crate::chain) const CONV1D_F32_TILED: &str = r#"
 @group(0) @binding(6) var<storage, read_write> y: array<f32>;
 @group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
 
-var<workgroup> xs: array<vec4<f32>, 272>;
-var<workgroup> ws: array<vec4<f32>, 272>;
+// [16 of k][64 rows (or outputs)], a row of 68 values (the last 4 padding, against bank conflicts), read four at
+// a time. Scalars, not vec4s: each thread writes one row's value, and WGSL lets a write to one component of a
+// vector in memory write the whole vector (Metal does), so four threads writing a vec4's four would race
+var<workgroup> xs: array<f32, 1088>;
+var<workgroup> ws: array<f32, 1088>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
@@ -294,18 +297,20 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
             let s = i32(r0 + rr) + tap * dil - pad;
             var v = 0.0;
             if (live && r0 + rr < m && s >= 0 && s < i32(m)) { v = x[u32(s) * cin + c]; }
-            xs[kk * 17u + rr / 4u][rr % 4u] = v;
+            xs[kk * 68u + rr] = v;
             var u = 0.0;
             if (o0 + rr < n && gk < kt) {
                 let e = (o0 + rr) * kt + gk;
                 u = unpack2x16float(w[e / 2u])[e % 2u];
             }
-            ws[kk * 17u + rr / 4u][rr % 4u] = u;
+            ws[kk * 68u + rr] = u;
         }
         workgroupBarrier();
         for (var j = 0u; j < 16u; j++) {
-            let xv = xs[j * 17u + tr];
-            let wv = ws[j * 17u + to];
+            let xi = j * 68u + tr * 4u;
+            let wi = j * 68u + to * 4u;
+            let xv = vec4<f32>(xs[xi], xs[xi + 1u], xs[xi + 2u], xs[xi + 3u]);
+            let wv = vec4<f32>(ws[wi], ws[wi + 1u], ws[wi + 2u], ws[wi + 3u]);
             a0 += xv.x * wv;
             a1 += xv.y * wv;
             a2 += xv.z * wv;

@@ -374,6 +374,12 @@ impl Gpu {
                 );
             }
         }
+        // (the tests: no kernel writes a component of a workgroup vector a thread, which races on a Mac; `lane_writes`)
+        #[cfg(test)]
+        {
+            let racing = lane_writes(&source);
+            assert!(racing.is_empty(), "webgpu: kernel {name} writes single components of the workgroup's vectors {racing:?}, which threads race on (a Mac's compiler writes the whole vector): stage them as scalars");
+        }
         // OAIY_KERNEL_DUMP: a folder each kernel's text is written to as it is made, one file a text (its name and a
         // hash of it): to read one, and to give them all to another API's translator where no such GPU is at hand (a
         // Mac's is naga's Metal writer, which runs anywhere)

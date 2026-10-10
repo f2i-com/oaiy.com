@@ -112,12 +112,13 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 "#;
 
 /// The prompt kernel: 64 tokens by 64 rows a workgroup, 32 of k a step; each thread 4 tokens by 4 rows, its sums four
-/// vec4s (rows) and the decoded weights kept as vec4s of 4 rows, read a vec4 at a time. (Its sums an array indexed in
+/// vec4s (rows) and the decoded weights kept k-major, read four rows at a time. (Its sums an array indexed in
 /// loops, the compiler kept them in memory, not registers: 64 expert matrices of 31 tokens took 0.15 s.)
 const MANY_KERNEL: &str = r#"
 var<workgroup> xs: array<f32, 2048>;
-// k step kk, rows 4q..4q+3: wt[kk * 16 + q]
-var<workgroup> wt: array<vec4<f32>, 512>;
+// k step kk, row r: wt[kk * 64 + r]. Scalars, not vec4s of 4 rows: a thread writes one row's, and WGSL lets a write to
+// one component of a vector in memory write the whole vector (Metal does), so four threads writing one would race
+var<workgroup> wt: array<f32, 2048>;
 
 // Token `tok`'s sums of rows row0..row0+3, those in [lo, end) and of a token there is.
 fn put(v: vec4<f32>, tok: u32, row0: u32, t: u32, end: u32, lo: u32, count: u32) {
@@ -170,12 +171,13 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
                 s = scale(kind, soff, local, k0, kb);
             }
             for (var j = 0u; j < wd; j++) {
-                wt[(q * wd + j) * 16u + r / 4u][r % 4u] = select(0.0, weight(word, kind, j) * s, live);
+                wt[(q * wd + j) * 64u + r] = select(0.0, weight(word, kind, j) * s, live);
             }
         }
         workgroupBarrier();
         for (var kk = 0u; kk < 32u; kk++) {
-            let w = wt[kk * 16u + tx];
+            let wb = kk * 64u + tx * 4u;
+            let w = vec4<f32>(wt[wb], wt[wb + 1u], wt[wb + 2u], wt[wb + 3u]);
             let xb = kk * 64u + ty * 4u;
             acc0 += xs[xb] * w;
             acc1 += xs[xb + 1u] * w;

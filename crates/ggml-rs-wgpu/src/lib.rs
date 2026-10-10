@@ -74,6 +74,68 @@ fn workgroup_bytes(source: &str) -> Option<u64> {
     Some(module.global_variables.iter().filter(|(_, g)| g.space == naga::AddressSpace::WorkGroup).map(|(_, g)| layouter[g.ty].size as u64).sum())
 }
 
+/// The workgroup variables a kernel writes one component of a vector of (`v[i][c] = ..`, `v[i].x = ..`), by name.
+///
+/// WGSL lets a write to one component of a vector in memory read and write the whole vector, so threads that each
+/// write their own component of one vector race (the WGSL spec, "Component Reference from Vector Memory View").
+/// Apple's compiler takes that leave: on a Mac every tile staged into the workgroup's memory a component a thread came
+/// out three quarters zeros, and Qwen3.5 answered "amon!!!!". Vulkan's and D3D12's compilers store the one component,
+/// so it is seen only on a Mac; the crate's tests ask this of every kernel they make, so it is seen anywhere. A kernel
+/// stages such values in an array of scalars and reads them four at a time.
+#[cfg(test)]
+fn lane_writes(source: &str) -> Vec<String> {
+    use wgpu::naga::{self, Expression, Statement, TypeInner};
+    fn walk(module: &naga::Module, f: &naga::Function, info: &naga::valid::FunctionInfo, block: &naga::Block, out: &mut Vec<String>) {
+        for statement in block.iter() {
+            match statement {
+                Statement::Store { pointer, .. } => {
+                    // a pointer to a component, taken from a pointer to a vector ..
+                    let (Expression::Access { base, .. } | Expression::AccessIndex { base, .. }) = f.expressions[*pointer] else { continue };
+                    let lane = match info[base].ty.inner_with(&module.types) {
+                        TypeInner::Pointer { base: ty, .. } => matches!(module.types[*ty].inner, TypeInner::Vector { .. }),
+                        TypeInner::ValuePointer { size, .. } => size.is_some(),
+                        _ => false,
+                    };
+                    // .. into a workgroup variable
+                    let mut root = base;
+                    while let Expression::Access { base, .. } | Expression::AccessIndex { base, .. } = f.expressions[root] {
+                        root = base;
+                    }
+                    if let (true, Expression::GlobalVariable(g)) = (lane, &f.expressions[root]) {
+                        let global = &module.global_variables[*g];
+                        if global.space == naga::AddressSpace::WorkGroup {
+                            out.push(global.name.clone().unwrap_or_default());
+                        }
+                    }
+                }
+                Statement::Block(b) => walk(module, f, info, b, out),
+                Statement::If { accept, reject, .. } => {
+                    walk(module, f, info, accept, out);
+                    walk(module, f, info, reject, out);
+                }
+                Statement::Loop { body, continuing, .. } => {
+                    walk(module, f, info, body, out);
+                    walk(module, f, info, continuing, out);
+                }
+                Statement::Switch { cases, .. } => cases.iter().for_each(|c| walk(module, f, info, &c.body, out)),
+                _ => {}
+            }
+        }
+    }
+    let Ok(module) = naga::front::wgsl::parse_str(source) else { return Vec::new() };
+    let Ok(info) = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all()).validate(&module) else { return Vec::new() };
+    let mut out = Vec::new();
+    for (handle, f) in module.functions.iter() {
+        walk(&module, f, &info[handle], &f.body, &mut out);
+    }
+    for (i, entry) in module.entry_points.iter().enumerate() {
+        walk(&module, &entry.function, info.get_entry_point(i), &entry.function.body, &mut out);
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// A kernel's text with each packed dot product (`dot4I8Packed`, `dot4U8Packed`) called through a function of its
 /// own, for Metal.
 ///

@@ -220,3 +220,36 @@ fn a_kernels_packed_dot_products_go_through_a_function_of_their_own_for_metal() 
     let plain = "@compute @workgroup_size(1) fn main() { }".to_string();
     assert_eq!(packed_dots_wrapped(plain.clone()), plain);
 }
+
+/// A write of one component of a vector in the workgroup's memory, a thread each, races (WGSL lets it write the whole
+/// vector, and Metal's compiler does: a Mac's tiles came out three quarters zeros). `lane_writes` finds one however it
+/// is written, and the crate's tests ask it of every kernel they make; the prompt's kernels a test may not make (Q3_K's
+/// int8 one) are asked here.
+#[test]
+fn no_kernel_writes_a_component_of_a_workgroup_vector() {
+    let kernel = |body: &str| format!("@group(0) @binding(0) var<storage, read_write> out: array<f32>;\n{body}");
+    for racing in [
+        "var<workgroup> s: array<vec4<f32>, 64>;\n@compute @workgroup_size(256) fn main(@builtin(local_invocation_index) t: u32) { s[t / 4u][t % 4u] = 1.0; workgroupBarrier(); out[t] = s[t / 4u].x; }",
+        "var<workgroup> s: array<vec4<f32>, 64>;\n@compute @workgroup_size(256) fn main(@builtin(local_invocation_index) t: u32) { if (t % 4u == 1u) { s[t / 4u].y = 1.0; } workgroupBarrier(); out[t] = s[0].y; }",
+        "var<workgroup> s: array<array<vec2<u32>, 8>, 2>;\nfn put(i: u32) { s[i % 2u][i / 2u][i % 2u] += 1u; }\n@compute @workgroup_size(32) fn main(@builtin(local_invocation_index) t: u32) { put(t); workgroupBarrier(); out[t] = f32(s[0][0].x); }",
+    ] {
+        assert_eq!(lane_writes(&kernel(racing)), vec!["s".to_string()], "{racing}");
+    }
+    for apart in [
+        // a whole vector a thread; scalars read four at a time; a thread's own vector's components
+        "var<workgroup> s: array<vec4<f32>, 64>;\n@compute @workgroup_size(64) fn main(@builtin(local_invocation_index) t: u32) { s[t] = vec4<f32>(1.0); workgroupBarrier(); out[t] = s[t].x; }",
+        "var<workgroup> s: array<f32, 256>;\n@compute @workgroup_size(256) fn main(@builtin(local_invocation_index) t: u32) { s[t] = 1.0; workgroupBarrier(); let b = t / 4u * 4u; out[t] = dot(vec4<f32>(s[b], s[b + 1u], s[b + 2u], s[b + 3u]), vec4<f32>(1.0)); }",
+        "@compute @workgroup_size(64) fn main(@builtin(local_invocation_index) t: u32) { var v = vec4<f32>(0.0); v[t % 4u] = 1.0; out[t] = v.x; }",
+    ] {
+        assert!(lane_writes(&kernel(apart)).is_empty(), "{apart}");
+    }
+    let mut asked = 0;
+    for dtype in [GgmlType::Q2_0, GgmlType::Q4_0, GgmlType::Q3_K, GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K, GgmlType::Q8_0] {
+        for kernel in [crate::shaders::source_many(dtype), crate::shaders::tiled_q8(dtype)].into_iter().flatten() {
+            assert!(wgpu::naga::front::wgsl::parse_str(&kernel).is_ok(), "{dtype:?}'s prompt kernel parses");
+            assert_eq!(lane_writes(&kernel), Vec::<String>::new(), "{dtype:?}'s prompt kernel");
+            asked += 1;
+        }
+    }
+    assert!(asked >= 8, "only {asked} prompt kernels were asked");
+}

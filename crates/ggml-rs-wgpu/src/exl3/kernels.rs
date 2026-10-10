@@ -166,11 +166,11 @@ pub(crate) fn g_many(rows: usize) -> String {
     let ids = each(&|i| format!("    let j{i} = ids[r + {}u];", 16 * i));
     let regs = each(&|i| format!("    var xn{i} = 0.0;\n    var acc{i} = 0.0;"));
     let first = each(&|i| format!("        if (j{i} != 0xffffffffu) {{ xn{i} = x[j{i} * k + ks * 16u + c]; }}"));
-    let store = each(&|i| format!("        xs[b][(r + {}u) * 4u + c / 4u][c % 4u] = xn{i};", 16 * i));
+    let store = each(&|i| format!("        xs[b][(r + {}u) * 16u + c] = xn{i};", 16 * i));
     let next = each(&|i| format!("            if (j{i} != 0xffffffffu) {{ xn{i} = x[j{i} * k + (kt + 1u) * 16u + c]; }}"));
     let sums = each(&|i| {
         format!(
-            "            let x{i} = xs[b][(r + {}u) * 4u + q];\n            acc{i} = acc{i} + x{i}.x * w4.x;\n            acc{i} = acc{i} + x{i}.y * w4.y;\n            acc{i} = acc{i} + x{i}.z * w4.z;\n            acc{i} = acc{i} + x{i}.w * w4.w;",
+            "            let xb{i} = (r + {}u) * 16u + 4u * q;\n            let x{i} = vec4<f32>(xs[b][xb{i}], xs[b][xb{i} + 1u], xs[b][xb{i} + 2u], xs[b][xb{i} + 3u]);\n            acc{i} = acc{i} + x{i}.x * w4.x;\n            acc{i} = acc{i} + x{i}.y * w4.y;\n            acc{i} = acc{i} + x{i}.z * w4.z;\n            acc{i} = acc{i} + x{i}.w * w4.w;",
             16 * i
         )
     });
@@ -185,10 +185,11 @@ pub(crate) fn g_many(rows: usize) -> String {
 @group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
 
 var<workgroup> tile: array<array<u32, 64>, 2>;
-// a block's inputs, [row][16 of k]
-var<workgroup> xs: array<array<vec4<f32>, {xs_len}>, 2>;
-// the decoded tile, [column][16 of k] (20 apart, against bank conflicts)
-var<workgroup> wt: array<array<vec4<f32>, 80>, 2>;
+// a block's inputs, [row][16 of k]; the decoded tile, [column][16 of k] (20 apart, against bank conflicts); each read
+// four of k at a time. Scalars, not vec4s: a thread writes one value, and WGSL lets a write to one component of a
+// vector in memory write the whole vector (Metal does), so four threads writing one would race
+var<workgroup> xs: array<array<f32, {xs_len}>, 2>;
+var<workgroup> wt: array<array<f32, 320>, 2>;
 var<workgroup> ids: array<u32, {rows}>;
 
 fn round_f16(v: f32) -> f32 {{
@@ -263,10 +264,11 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
             if (t < nw) {{ wn = words[base + ((kt + 1u) * ntiles + nt) * nw + t]; }}
 {next}
         }}
-        wt[b][c * 5u + r / 4u][r % 4u] = weight(r, c, tw, b);
+        wt[b][c * 20u + r] = weight(r, c, tw, b);
         workgroupBarrier();
         for (var q = 0u; q < 4u; q = q + 1u) {{
-            let w4 = wt[b][c * 5u + q];
+            let wb = c * 20u + 4u * q;
+            let w4 = vec4<f32>(wt[b][wb], wt[b][wb + 1u], wt[b][wb + 2u], wt[b][wb + 3u]);
 {sums}
         }}
         b = 1u - b;
@@ -274,7 +276,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 {out}
 }}
 "#,
-        xs_len = rows * 4,
+        xs_len = rows * 16,
     )
 }
 

@@ -237,12 +237,14 @@ pub(in crate::chain) const ATTENTION_TILED: &str = r#"
 
 const HD4: u32 = HD4_u;
 const TQ: u32 = TQ_u;
-const TQ4: u32 = TQ_u / 4u;
 const TK: u32 = TK_u;
 const KS: u32 = HD4_u + 1u;
 
 var<workgroup> kt: array<vec4<f32>, KT_LEN>;
-var<workgroup> pt: array<vec4<f32>, PT_LEN>;
+// the block's scores, then weights, `[key][query]`, read four queries at a time. Scalars, not vec4s: a thread a query
+// writes its own, and WGSL lets a write to one component of a vector in memory write the whole vector (Metal does),
+// so four threads writing one would race
+var<workgroup> pt: array<f32, PT_LEN>;
 var<workgroup> al: array<f32, TQ_u>;
 
 @compute @workgroup_size(256)
@@ -290,15 +292,15 @@ SCORES
         // the weights, a thread a query; the block's values in its keys' place meanwhile
         if (li < TQ) {
             var mb = -3.0e38;
-            for (var j = 0u; j < TK; j++) { mb = max(mb, pt[j * TQ4 + li / 4u][li % 4u]); }
+            for (var j = 0u; j < TK; j++) { mb = max(mb, pt[j * TQ + li]); }
             let mn = max(m, mb);
             let a = exp(m - mn);
             var sum = 0.0;
             for (var j = 0u; j < TK; j++) {
-                let s = pt[j * TQ4 + li / 4u][li % 4u];
+                let s = pt[j * TQ + li];
                 var e = 0.0;
                 if (s > -1.0e38) { e = exp(s - mn); }
-                pt[j * TQ4 + li / 4u][li % 4u] = e;
+                pt[j * TQ + li] = e;
                 sum += e;
             }
             l = l * a + sum;
@@ -351,10 +353,10 @@ pub(in crate::chain) fn attention_tiled(hd: usize) -> String {
         );
     }
     if qpt == 4 {
-        scores += "        pt[sj * TQ4 + sg] = vec4<f32>(w0, w1, w2, w3);\n";
+        scores += "        pt[sj * TQ + 4u * sg] = w0;\n        pt[sj * TQ + 4u * sg + 1u] = w1;\n        pt[sj * TQ + 4u * sg + 2u] = w2;\n        pt[sj * TQ + 4u * sg + 3u] = w3;\n";
     } else {
         assert_eq!(qpt, 1);
-        scores += "        pt[sj * TQ4 + sg / 4u][sg % 4u] = w0;\n";
+        scores += "        pt[sj * TQ + sg] = w0;\n";
     }
     let mut values = String::new();
     for i in 0..qo {
@@ -362,7 +364,7 @@ pub(in crate::chain) fn attention_tiled(hd: usize) -> String {
     }
     values += "        for (var j = 0u; j < TK; j++) {\n            let v = kt[j * KS + vl];\n";
     for c in 0..qo / 4 {
-        values += &format!("            let p{c} = pt[j * TQ4 + vq4 + {c}u];\n");
+        values += &format!("            let p{c} = vec4<f32>(pt[j * TQ + 4u * (vq4 + {c}u)], pt[j * TQ + 4u * (vq4 + {c}u) + 1u], pt[j * TQ + 4u * (vq4 + {c}u) + 2u], pt[j * TQ + 4u * (vq4 + {c}u) + 3u]);\n");
         for (e, comp) in ["x", "y", "z", "w"].iter().enumerate() {
             values += &format!("            o{} += p{c}.{comp} * v;\n", 4 * c + e);
         }
@@ -377,7 +379,7 @@ pub(in crate::chain) fn attention_tiled(hd: usize) -> String {
         .replace("TK_u", &format!("{tk}u"))
         .replace("QO_u", &format!("{qo}u"))
         .replace("KT_LEN", &(tk * (hd4 + 1)).to_string())
-        .replace("PT_LEN", &(tk * tq / 4).to_string())
+        .replace("PT_LEN", &(tk * tq).to_string())
         .replace("QB\n", &qb)
         .replace("OACC\n", &oacc)
         .replace("STAGE_K\n", &stage("kh * HD4"))

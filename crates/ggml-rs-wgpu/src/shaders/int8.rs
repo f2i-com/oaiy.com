@@ -279,11 +279,13 @@ const TQ8_HEAD: &str = r#"struct Params { k: u32, n: u32, m: u32, row0: u32, row
 @group(0) @binding(1) var<storage, read> x8: array<vec4<u32>>;
 @group(0) @binding(2) var<storage, read_write> y: array<f32>;
 @group(0) @binding(3) var<uniform> p: Params;
-// the step's weights: [word][a group of 4 rows] a vec4 (32 groups), and a row's (scale a, scale b, offset a, offset b)
-var<workgroup> wq: array<vec4<u32>, 256>;
+// the step's weights: [word][128 rows], read a group of 4 rows at a time, and a row's (scale a, scale b, offset a,
+// offset b); the step's tokens: [word][64 tokens], read 4 at a time, and a token's (d, its halves' sums). The words
+// are scalars, not vec4s of 4 rows or tokens: a thread writes one row's or token's, and WGSL lets a write to one
+// component of a vector in memory write the whole vector (Metal does), so four threads writing one would race
+var<workgroup> wq: array<u32, 1024>;
 var<workgroup> ws: array<vec4<f32>, 128>;
-// the step's tokens: [word][a group of 4 tokens] a vec4 (16 groups), and a token's (d, its halves' sums)
-var<workgroup> xq: array<vec4<u32>, 128>;
+var<workgroup> xq: array<u32, 512>;
 var<workgroup> xs: array<vec4<f32>, 64>;
 
 fn q3_bytes(qw: u32, hw: u32, j: u32, h: u32) -> u32 {
@@ -330,12 +332,10 @@ const TQ8_LOOP: &str = r#"    for (var b = 0u; b < k32; b++) {
         let b4 = rr * (p.row_bytes / 16u) + blk * 7u;
         let hm = w4[b4 + part];
         let qs = w4[b4 + 2u + 2u * h + part];
-        let g = lr / 4u;
-        let c = lr % 4u;
-        wq[(part * 4u) * 32u + g][c] = q3_bytes(qs.x, hm.x, j, h);
-        wq[(part * 4u + 1u) * 32u + g][c] = q3_bytes(qs.y, hm.y, j, h);
-        wq[(part * 4u + 2u) * 32u + g][c] = q3_bytes(qs.z, hm.z, j, h);
-        wq[(part * 4u + 3u) * 32u + g][c] = q3_bytes(qs.w, hm.w, j, h);
+        wq[(part * 4u) * 128u + lr] = q3_bytes(qs.x, hm.x, j, h);
+        wq[(part * 4u + 1u) * 128u + lr] = q3_bytes(qs.y, hm.y, j, h);
+        wq[(part * 4u + 2u) * 128u + lr] = q3_bytes(qs.z, hm.z, j, h);
+        wq[(part * 4u + 3u) * 128u + lr] = q3_bytes(qs.w, hm.w, j, h);
         if (part == 0u) {
             let sd = w4[b4 + 6u];
             let d = unpack2x16float(sd.w & 0xffffu).x;
@@ -344,12 +344,10 @@ const TQ8_LOOP: &str = r#"    for (var b = 0u; b < k32; b++) {
         }
         if (li < 128u) {
             let xv = x8[tok * k16 + b * 2u + lh];
-            let xg = lt / 4u;
-            let xc = lt % 4u;
-            xq[(lh * 4u) * 16u + xg][xc] = xv.x;
-            xq[(lh * 4u + 1u) * 16u + xg][xc] = xv.y;
-            xq[(lh * 4u + 2u) * 16u + xg][xc] = xv.z;
-            xq[(lh * 4u + 3u) * 16u + xg][xc] = xv.w;
+            xq[(lh * 4u) * 64u + lt] = xv.x;
+            xq[(lh * 4u + 1u) * 64u + lt] = xv.y;
+            xq[(lh * 4u + 2u) * 64u + lt] = xv.z;
+            xq[(lh * 4u + 3u) * 64u + lt] = xv.w;
         } else if (li < 192u) {
             let st = min(t0 + li - 128u, p.m - 1u);
             xs[li - 128u] = bitcast<vec4<f32>>(x8[p.xs_at + st * k32 + b]);
@@ -365,7 +363,7 @@ PLACEHOLDER_STORE
 /// A prompt's matmul from its rows of `x` as int8 ([`QUANT_Q8`]'s), as llama.cpp's MMQ: a workgroup a tile of
 /// [`TQ8_ROWS`] weight rows by [`TQ8_TOKENS`] tokens, `k` a 32-block at a time; each step the tile's weights decoded to
 /// int8 (four to a word) with their halves' scales and offsets, and the tokens' int8 values and scales, in the
-/// workgroup's memory (a word of 4 rows, or of 4 tokens, a vec4, so a warp's loads take every bank once); a thread 8
+/// workgroup's memory (a word of 4 rows, or of 4 tokens, read at once, so a warp's loads take every bank once); a thread 8
 /// rows by 4 tokens, each half-block's 4 words of products in one `dot4I8Packed` each, then scaled into f32 sums.
 /// Where the f32 tiled kernel waits on the workgroup's memory (two vec4 loads for 16 multiply-adds), this does four
 /// int8 multiply-adds an instruction from a quarter of the bytes. None for a type without one.
@@ -390,7 +388,9 @@ pub fn tiled_q8(dtype: GgmlType) -> Option<String> {
             }
         }
         for w in (half * 4)..(half * 4 + 4) {
-            compute.push_str(&format!("        {{\n            let wa = wq[{w}u * 32u + tx];\n            let wb = wq[{w}u * 32u + 16u + tx];\n            let xv = xq[{w}u * 16u + ty];\n"));
+            compute.push_str(&format!(
+                "        {{\n            let wi = {w}u * 128u + tx * 4u;\n            let xi = {w}u * 64u + ty * 4u;\n            let wa = vec4<u32>(wq[wi], wq[wi + 1u], wq[wi + 2u], wq[wi + 3u]);\n            let wb = vec4<u32>(wq[wi + 64u], wq[wi + 65u], wq[wi + 66u], wq[wi + 67u]);\n            let xv = vec4<u32>(xq[xi], xq[xi + 1u], xq[xi + 2u], xq[xi + 3u]);\n"
+            ));
             for ri in 0..8u32 {
                 let wv = if ri < 4 { format!("wa.{}", comps[ri as usize]) } else { format!("wb.{}", comps[(ri - 4) as usize]) };
                 for (c, comp) in comps.iter().enumerate() {
