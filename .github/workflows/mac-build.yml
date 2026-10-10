@@ -28,6 +28,11 @@ on:
         description: 'Version to stamp, above the last release (0.1.2 is out: 0.1.3-mac.1)'
         required: true
         default: '0.1.3-mac.1'
+      what:
+        description: 'all: the image (and its signing) and the engine on the GPU. engine: only the engine on the GPU, to look at something there without building an image.'
+        type: choice
+        options: [all, engine]
+        default: all
 
 # Nothing may write: the run builds and uploads its own artifacts.
 permissions:
@@ -76,6 +81,43 @@ jobs:
           ENGINE_SMOKE_NEEDS_GPU: '1'
         run: sh tools/engine-smoke.sh target/release/oaiy-llm-server-webgpu "$RUNNER_TEMP/Qwen3.5-4B-Q4_K_M.gguf"
 
+      # What an agent sends is thousands of tokens of instructions, and a prompt that long is read by other kernels
+      # than a short one (in blocks of rows, chained on the GPU). On the first Mac the Agent answered such a prompt
+      # with one syllable over and over. Asked both ways, so that the run says which path is wrong: as the engine
+      # runs by default, and with its chained runs off (OAIY_NO_CHAIN), each kernel then an operation of its own.
+      - name: A long prompt to the model, on the GPU
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        env:
+          ENGINE_SMOKE_NEEDS_GPU: '1'
+          ENGINE_SMOKE_LONG: '1'
+          ENGINE_SMOKE_LONG_LINES: '120'
+        run: sh tools/engine-smoke.sh target/release/oaiy-llm-server-webgpu "$RUNNER_TEMP/Qwen3.5-4B-Q4_K_M.gguf"
+
+      - name: The same long prompt with the chained runs off
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        env:
+          ENGINE_SMOKE_NEEDS_GPU: '1'
+          ENGINE_SMOKE_LONG: '1'
+          ENGINE_SMOKE_LONG_LINES: '120'
+          OAIY_NO_CHAIN: '1'
+        run: sh tools/engine-smoke.sh target/release/oaiy-llm-server-webgpu "$RUNNER_TEMP/Qwen3.5-4B-Q4_K_M.gguf"
+
+      # What a Mac's webview needs before it calls a page cross-origin isolated (the Agent's code sandbox): a page
+      # on a scheme of its own, as the window serves the Agent's, under each embedder policy, and the same page from
+      # a local server.
+      - name: What WebKit isolates a page for
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: |
+          swiftc tools/mac/webview-probe.swift -o "$RUNNER_TEMP/webview-probe"
+          python3 tools/mac/isolated-page-server.py 18477 require-corp &
+          python3 tools/mac/isolated-page-server.py 18478 credentialless &
+          sleep 2
+          "$RUNNER_TEMP/webview-probe" http://127.0.0.1:18477/ http://127.0.0.1:18478/ http://localhost:18477/ || true
+          kill %1 %2 2> /dev/null || true
+
       # Told, and not yet held to: on this runner (an Apple M1 that is a virtual machine, with a virtual GPU) 25 of
       # these 97 tests gave other numbers than the CPU the first time the step ran (f16 and tiled matmuls, the media
       # models' convolutions, grouped experts, Q2_0), while the model above answered in sentences. Whether a Mac's
@@ -105,6 +147,7 @@ jobs:
 
   dmg:
     name: OAIY Desktop (.dmg, Apple silicon)
+    if: ${{ inputs.what != 'engine' }}
     runs-on: macos-15
     timeout-minutes: 120
     steps:

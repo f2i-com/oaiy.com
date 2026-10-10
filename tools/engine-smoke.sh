@@ -70,4 +70,36 @@ if [ -z "$text" ]; then
   exit 1
 fi
 echo "It replied in $took s: $text"
+
+# ENGINE_SMOKE_LONG=1: a prompt of a few thousand tokens as well, which is what an agent sends (its instructions and
+# tools) and takes other kernels than a short one: a prompt is read in blocks of rows, a reply a token at a time. A
+# word is named at the start, a page of plain sentences follows, and the model is asked for the word.
+if [ "${ENGINE_SMOKE_LONG:-0}" = 1 ]; then
+  filler=""
+  i=0
+  while [ "$i" -lt "${ENGINE_SMOKE_LONG_LINES:-260}" ]; do
+    filler="$filler Line $i of the notes says that the river was calm and the boats stayed in the harbour that day."
+    i=$((i + 1))
+  done
+  body="{\"model\":\"smoke\",\"messages\":[{\"role\":\"user\",\"content\":\"The secret word is marigold. Remember it.$filler Now answer with one word only: what is the secret word?\"}],\"max_tokens\":48,\"temperature\":0,\"stream\":false}"
+  asked=$(date +%s)
+  reply=$(printf '%s' "$body" | curl -sS -m 3000 -H "Content-Type: application/json" --data-binary @- "http://127.0.0.1:$port/v1/chat/completions" 2>&1)
+  took=$(( $(date +%s) - asked ))
+  if ! kill -0 "$pid" 2> /dev/null; then
+    echo "The server ended while it read the long prompt:"
+    said 40
+    exit 1
+  fi
+  text=$(printf '%s' "$reply" | grep -o '"content":"[^"]*"' | head -1 | sed 's/^"content":"//; s/"$//')
+  tokens=$(printf '%s' "$reply" | grep -o '"prompt_tokens":[0-9]*' | head -1 | sed 's/.*://')
+  echo "The long prompt (${tokens:-?} tokens) was answered in $took s: ${text:-<nothing>}"
+  case "$text" in
+    *[Mm]arigold*) ;;
+    *)
+      echo "FAIL: the answer does not have the word the prompt named. What the server sent:"
+      printf '%s\n' "$reply" | cut -c 1-600
+      said 20
+      exit 1 ;;
+  esac
+fi
 echo "PASS: the model loaded and answered ($(( $(date +%s) - started )) s in all). The server's whole text is in $log"
