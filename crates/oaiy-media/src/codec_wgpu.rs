@@ -201,10 +201,32 @@ pub struct WgpuCodec {
     theta: f64,
     eps: f32,
     one: DeviceVec,
+    /// Frames the stages after the transformer reach back (their causal convolutions, through each upsampling): a
+    /// frame's sound is settled by the transformer's output for it and these frames before it.
+    reach: usize,
 }
 
 /// Codes a codebook holds.
 const CODES: usize = 2048;
+
+/// Frames the stages after the transformer reach back, from their shapes: walked from the waveform back to the frames,
+/// each causal convolution adds `(k - 1) dilation` steps at its rate, and each transposed convolution (stride `s`,
+/// `k` taps) turns `n` steps after it into `(n + k - 1) / s` before it, rounded up and one more. Counted generously:
+/// a frame too many costs a little time, a frame too few changes the sound.
+fn vocoder_reach(upsample: &[(Up, ConvNext)], first_k: usize, blocks: &[Block], last_k: usize) -> usize {
+    let up = |n: usize, u: &Up| (n + u.k - 1).div_ceil(u.stride) + 1;
+    let mut n = last_k - 1;
+    for b in blocks.iter().rev() {
+        n += b.units.iter().map(|u| (u.conv1.k - 1) * u.dilation + (u.conv2.k - 1)).sum::<usize>();
+        n = up(n, &b.up);
+    }
+    n += first_k - 1;
+    for (u, c) in upsample.iter().rev() {
+        n += c.k - 1;
+        n = up(n, u);
+    }
+    n + 1
+}
 
 impl WgpuCodec {
     /// `decoder.*` of a speech tokenizer's `model.safetensors` (its `config.json` beside it) onto `gpu`.
@@ -306,7 +328,7 @@ impl WgpuCodec {
             blocks.push(Block { snake: Snake::load(s, gpu, &format!("{b}.0"))?, up: Up::load(s, gpu, &format!("{b}.1.conv"), Some(rate))?, units });
         }
         let n = cfg.upsample_rates.len();
-        Ok(Self {
+        let mut codec = Self {
             gpu: gpu.clone(),
             codebooks,
             dim,
@@ -327,7 +349,10 @@ impl WgpuCodec {
             theta: cfg.rope_theta,
             eps,
             one: upload(gpu, &[1.0]),
-        })
+            reach: 0,
+        };
+        codec.reach = vocoder_reach(&codec.upsample, codec.first.k, &codec.blocks, codec.last.k);
+        Ok(codec)
     }
 
     /// Frames of 16 codes to a 24 kHz waveform, in the official 300-frame chunks with 25 frames of left context.
@@ -351,7 +376,8 @@ impl WgpuCodec {
         self.decode_after_with(before, new, LEFT_CONTEXT)
     }
 
-    /// [`Self::decode_after`] with `context` frames of `before` read ahead of `new`.
+    /// [`Self::decode_after`] with `context` frames of `before` read ahead of `new` by the transformer (the stages
+    /// after it run on `new` and the frames they reach back for alone: [`Self::forward_tail`]).
     pub fn decode_after_with(&self, before: &[[u32; 16]], new: &[[u32; 16]], context: usize) -> Result<Vec<f32>> {
         if new.is_empty() {
             return Ok(Vec::new());
@@ -359,8 +385,7 @@ impl WgpuCodec {
         let context = before.len().min(context);
         let mut frames = before[before.len() - context..].to_vec();
         frames.extend_from_slice(new);
-        let wave = self.forward(&frames)?;
-        Ok(wave[context * SAMPLES_PER_FRAME..].to_vec())
+        self.forward_tail(&frames, new.len())
     }
 
     /// One whole decode of `frames` (`frames.len() * 1920` samples).
@@ -371,6 +396,28 @@ impl WgpuCodec {
         let y = self.record(rec.as_mut(), &x, frames.len(), &mut |_, _, _| {});
         rec.as_mut().read(&y);
         rec.finish().pop().ok_or_else(|| err("the waveform was not read"))
+    }
+
+    /// The samples of `frames`' last `tail` frames: the transformer reads every frame, and the stages after it (whose
+    /// cost is nearly all of a decode's: they run at up to 1920 steps a frame) only the tail and the [`Self::reach`]
+    /// frames before it, which is all they look back at. The same samples as [`Self::forward`]'s for the tail.
+    fn forward_tail(&self, frames: &[[u32; 16]], tail: usize) -> Result<Vec<f32>> {
+        let t = frames.len();
+        let kept = (tail + self.reach).min(t);
+        let x = upload(&self.gpu, &self.rows(frames)?);
+        let mut rec = self.gpu.begin();
+        rec.keep_groups(false);
+        let mut h = self.front(rec.as_mut(), &x, t, &mut |_, _, _| {});
+        if kept < t {
+            let c = self.output_proj.n;
+            let part = self.gpu.vec(kept * c);
+            rec.as_mut().copy(&h, (t - kept) * c, &part, 0, kept * c);
+            h = part;
+        }
+        let y = self.back(rec.as_mut(), h, kept, &mut |_, _, _| {});
+        rec.as_mut().read(&y);
+        let wave = rec.finish().pop().ok_or_else(|| err("the waveform was not read"))?;
+        Ok(wave[(kept - tail.min(kept)) * SAMPLES_PER_FRAME..].to_vec())
     }
 
     /// Each frame's codebook rows (`[frames, 2 dim]`): the first codebook's, then the sum of the other 15's.
@@ -395,6 +442,12 @@ impl WgpuCodec {
     /// A whole decode recorded on `r` from the frames' codebook rows `x` ([`Self::rows`]): the waveform (`[t 1920]`,
     /// clamped), each stage's output shown to `tap` (by the reference's name for it) as it is made.
     fn record(&self, r: &mut dyn ChainRecorder, x: &DeviceVec, t: usize, tap: &mut dyn FnMut(&mut dyn ChainRecorder, &str, &DeviceVec)) -> DeviceVec {
+        let h = self.front(r, x, t, tap);
+        self.back(r, h, t, tap)
+    }
+
+    /// The stages up to the transformer's output (`[t, 1024]`), recorded on `r` from the codebook rows `x`.
+    fn front(&self, r: &mut dyn ChainRecorder, x: &DeviceVec, t: usize, tap: &mut dyn FnMut(&mut dyn ChainRecorder, &str, &DeviceVec)) -> DeviceVec {
         let g = &self.gpu;
         let q = g.vec(t * self.project.n);
         self.project.run(r, x, &q, t);
@@ -402,8 +455,14 @@ impl WgpuCodec {
         let h = g.vec(t * self.pre_conv.cout);
         self.pre_conv.run(r, &q, t, 1, &h);
         tap(r, "pre_conv", &h);
-        let mut h = self.transformer(r, &h, t);
+        let h = self.transformer(r, &h, t);
         tap(r, "pre_transformer", &h);
+        h
+    }
+
+    /// The stages after the transformer, from its output for `t` frames (`h`, `[t, 1024]`) to their waveform.
+    fn back(&self, r: &mut dyn ChainRecorder, mut h: DeviceVec, t: usize, tap: &mut dyn FnMut(&mut dyn ChainRecorder, &str, &DeviceVec)) -> DeviceVec {
+        let g = &self.gpu;
         let mut len = t;
         for (i, (up, block)) in self.upsample.iter().enumerate() {
             h = up.run(g, r, &h, len);
@@ -557,6 +616,46 @@ mod golden {
         let wave = codec.decode(&frames)?;
         eprintln!("{t} frames decoded in {:.3} s ({} samples)", started.elapsed().as_secs_f64(), wave.len());
         assert!(worst < 1e-3, "{worst}");
+        Ok(())
+    }
+
+    /// A stream's chunk decoded after its context with the stages after the transformer on the tail alone
+    /// ([`WgpuCodec::forward_tail`]) against the whole decode's last samples (`--ignored --nocapture`; OAIY_TTS the
+    /// model's folder, OAIY_TTS_DEVICE the adapter): the same, for chunks of one to eight frames after 120.
+    #[test]
+    #[ignore = "needs Qwen3-TTS's speech tokenizer and a WebGPU adapter"]
+    fn a_chunks_tail_is_the_whole_decodes() -> Result<()> {
+        let model = std::path::PathBuf::from(std::env::var("OAIY_TTS").unwrap_or_else(|_| "E:/models/Qwen3-TTS-12Hz-0.6B-Base".into()));
+        let device = std::env::var("OAIY_TTS_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let gpu = WgpuBackend::nth(device, None).map_err(err)?;
+        let mut codec = WgpuCodec::load(&model.join("speech_tokenizer").join("model.safetensors"), &gpu)?;
+        eprintln!("the stages after the transformer reach {} frames back", codec.reach);
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut code = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % CODES as u64) as u32
+        };
+        for tail in [1, 4, 8] {
+            let frames: Vec<[u32; 16]> = (0..120 + tail).map(|_| std::array::from_fn(|_| code())).collect();
+            let whole = codec.forward(&frames)?;
+            let started = std::time::Instant::now();
+            let ours = codec.forward_tail(&frames, tail)?;
+            let took = started.elapsed().as_secs_f64();
+            let theirs = &whole[(frames.len() - tail) * SAMPLES_PER_FRAME..];
+            assert_eq!(ours.len(), theirs.len());
+            let e = relative(&ours, theirs);
+            eprintln!("{tail} frame(s) after 120: relative RMS error {e:.2e}, {:.0} ms", took * 1e3);
+            assert!(e < 1e-5, "{e}");
+        }
+        // and a reach too short is heard: the check above can tell
+        let frames: Vec<[u32; 16]> = (0..124).map(|_| std::array::from_fn(|_| code())).collect();
+        let whole = codec.forward(&frames)?;
+        codec.reach = 2;
+        let e = relative(&codec.forward_tail(&frames, 4)?, &whole[120 * SAMPLES_PER_FRAME..]);
+        eprintln!("with a reach of 2 frames: relative RMS error {e:.2e}");
+        assert!(e > 1e-3, "{e}");
         Ok(())
     }
 

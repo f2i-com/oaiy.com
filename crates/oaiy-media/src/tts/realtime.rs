@@ -26,9 +26,12 @@ fn err(e: impl std::fmt::Display) -> candle_core::Error {
 /// its whole decode (`a_streams_chunks_against_the_whole_decode`): after the official chunked decode's 25 frames a
 /// chunk is 17 dB from it (a fiftieth of its power in error, at every chunk's edge), after 80 frames 33 dB, after 120
 /// 48 dB, after 160 62 dB, a chunk of four frames costing 29, 55, 74 and 87 ms. 120: an error 48 dB under the
-/// speech, for a quarter of real time. Only a stream that keeps each stage's state (Candle's does: the
-/// transformer's keys and values, each causal convolution's last inputs) is the whole decode's at any length, at
-/// the cost of the new frames alone; this one is to become that.
+/// speech, for a quarter of real time. Those costs were the whole decode's of context and chunk; now only the
+/// transformer reads the context, and the stages after it (nearly all of the cost) the chunk and the 14 frames they
+/// reach back ([`WgpuCodec::decode_after_with`]): the same samples, and a chunk of four after 120 costs 105 ms on an
+/// M5 Pro's GPU, where it cost 520. Only a stream that keeps each stage's state (Candle's does: the transformer's
+/// keys and values, each causal convolution's last inputs) is the whole decode's at any length, at the cost of the
+/// new frames alone; this one is to become that.
 const STREAM_CONTEXT: usize = 120;
 /// Frames a chunk after the first: four (0.32 s of sound), which halves what the decodes cost against two.
 const CHUNK_FRAMES: usize = 4;
