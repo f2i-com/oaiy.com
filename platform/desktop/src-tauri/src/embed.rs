@@ -188,6 +188,23 @@ fn not_found(what: &str) -> Response<Vec<u8>> {
         .expect("a response")
 }
 
+/// The embedder policy an embedded page is served with, which with the opener policy is what makes it cross-origin
+/// isolated (the Agent's code sandbox blocks on shared memory, which a page has only then).
+///
+/// `credentialless` is Chromium's, so Windows' webview's: it lets a page load what other sites serve without their
+/// saying so, with no credentials. WebKit, which is the webview of a Mac and of Linux, does not know that value and
+/// takes a page served with it as not isolated at all: the Agent said "The code sandbox is unavailable: the page is
+/// not cross-origin isolated" on the first Mac that ran it. WebKit isolates a page with `require-corp`, under which
+/// a file from elsewhere loads only if its server says it may (the page's own files do, just below; what the page
+/// asks of the desktop and of the engines it asks with CORS, which that policy lets through).
+fn embedder_policy(windows: bool) -> &'static str {
+    if windows {
+        "credentialless"
+    } else {
+        "require-corp"
+    }
+}
+
 /// A file of an embedded page, with the headers that make it cross-origin isolated.
 pub fn serve<R: Runtime>(app: &AppHandle<R>, page: Page, request: &Request<Vec<u8>>) -> Response<Vec<u8>> {
     let raw = percent_decode_str(request.uri().path()).decode_utf8_lossy().into_owned();
@@ -211,7 +228,7 @@ pub fn serve<R: Runtime>(app: &AppHandle<R>, page: Page, request: &Request<Vec<u
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, mime(&file.to_string_lossy()))
         .header("Cross-Origin-Opener-Policy", "same-origin")
-        .header("Cross-Origin-Embedder-Policy", "credentialless")
+        .header("Cross-Origin-Embedder-Policy", embedder_policy(cfg!(windows)))
         .header("Cross-Origin-Resource-Policy", "cross-origin")
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .header(header::CACHE_CONTROL, "no-cache");
@@ -442,6 +459,14 @@ pub async fn hide_embedded<R: Runtime>(app: AppHandle<R>) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_webview_is_given_the_embedder_policy_it_isolates_a_page_for() {
+        // Chromium's (Windows) own value, which lets the page load other sites' files without credentials.
+        assert_eq!(embedder_policy(true), "credentialless");
+        // WebKit (a Mac, Linux) does not know that one, and with it the page is not isolated: no code sandbox.
+        assert_eq!(embedder_policy(false), "require-corp");
+    }
 
     #[test]
     fn the_embedded_pages_are_named_and_have_their_schemes() {

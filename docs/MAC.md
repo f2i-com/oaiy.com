@@ -64,6 +64,17 @@ engine inside its own bundle, and ran a flow. The headless server ran a flow too
 run started the app as on a Mac with no Node: it fetched Node 24.19.0 itself, unpacked it
 and ran the flow on it.
 
+The first person to run the image met what that run could not show: the language-model
+server ended as it made its first pipeline, because Apple's compiler refused a kernel as
+naga writes it for Metal (a temporary declared twice). That is fixed (the packed dot
+products go through a function of their own on Metal), and the workflow has a second job
+since, on the runner's GPU: the catalog's small model (Qwen3.5 4B) is loaded through
+Metal and asked a question, and has answered in sentences; and the GPU backend's own
+tests are run. Of those, 72 pass there and 25 give other numbers than the CPU (f16 and
+tiled matmuls, the media models' convolutions, grouped experts, Q2_0). The runner's GPU is
+a virtual one; whether a Mac's own GPU gives the same is not known, and `tools/mac/check.sh`
+on a Mac is what says.
+
 That is a Mac nobody sits at. Not checked by anyone: the app on a Mac with a screen and a
 person (its window, its tray icon, what macOS says of an app signed by nobody on your
 version of it, the question about the microphone), an image that came through a browser
