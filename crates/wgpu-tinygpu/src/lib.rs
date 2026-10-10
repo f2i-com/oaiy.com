@@ -210,7 +210,7 @@ impl PipelineLayoutInterface for TgPipelineLayout {}
 /// A bind group: each binding's buffer and offset, and which take a dynamic offset (in the layout's order).
 #[derive(Debug)]
 struct TgBindGroup {
-    entries: HashMap<u32, (u64, u64)>,
+    entries: HashMap<u32, (Arc<Allocation>, u64)>,
     dynamic: Vec<u32>,
 }
 impl BindGroupInterface for TgBindGroup {}
@@ -264,7 +264,7 @@ impl DeviceInterface for TgDevice {
             match &e.resource {
                 wgpu::BindingResource::Buffer(b) => {
                     let buf = b.buffer.as_custom::<TgBuffer>().expect("tinygpu: a buffer of this adapter's");
-                    entries.insert(e.binding, (buf.id, b.offset));
+                    entries.insert(e.binding, (Arc::clone(&buf.mem), b.offset));
                 }
                 _ => unsupported("bindings other than buffers"),
             }
@@ -299,7 +299,8 @@ impl DeviceInterface for TgDevice {
     fn create_buffer(&self, desc: &wgpu::BufferDescriptor<'_>) -> DispatchBuffer {
         let id = u64_of(&self.conn.must(ALLOC, &desc.size.max(4).to_le_bytes()));
         let mapped = desc.mapped_at_creation.then(|| Mapping { start: 0, data: vec![0; desc.size as usize], write: true });
-        DispatchBuffer::custom(TgBuffer { conn: Arc::clone(&self.conn), id, size: desc.size, state: Arc::new(Mutex::new(mapped)) })
+        let mem = Arc::new(Allocation { conn: Arc::clone(&self.conn), id });
+        DispatchBuffer::custom(TgBuffer { mem, size: desc.size, state: Arc::new(Mutex::new(mapped)) })
     }
     fn create_texture(&self, _desc: &wgpu::TextureDescriptor<'_>) -> DispatchTexture {
         unsupported("textures")
@@ -320,7 +321,7 @@ impl DeviceInterface for TgDevice {
         unsupported("query sets")
     }
     fn create_command_encoder(&self, _desc: &wgpu::CommandEncoderDescriptor<'_>) -> DispatchCommandEncoder {
-        DispatchCommandEncoder::custom(TgEncoder { ops: Arc::new(Mutex::new(Vec::new())) })
+        DispatchCommandEncoder::custom(TgEncoder { ops: Ops::default() })
     }
     fn create_render_bundle_encoder(&self, _desc: &wgpu::RenderBundleEncoderDescriptor<'_>) -> DispatchRenderBundleEncoder {
         unsupported("render bundles")
@@ -364,18 +365,25 @@ struct Mapping {
     write: bool,
 }
 
+/// A buffer's memory on the card, freed there when the last that uses it lets it go: the program's handle, a bind
+/// group, a command buffer not yet submitted (as wgpu's own buffers outlive their handle while work holds them).
 #[derive(Debug)]
-struct TgBuffer {
+struct Allocation {
     conn: Arc<Conn>,
     id: u64,
-    size: u64,
-    state: Arc<Mutex<Option<Mapping>>>,
 }
 
-impl Drop for TgBuffer {
+impl Drop for Allocation {
     fn drop(&mut self) {
         let _ = self.conn.call(FREE, &self.id.to_le_bytes());
     }
+}
+
+#[derive(Debug)]
+struct TgBuffer {
+    mem: Arc<Allocation>,
+    size: u64,
+    state: Arc<Mutex<Option<Mapping>>>,
 }
 
 fn read_range(conn: &Conn, id: u64, start: u64, len: u64) -> Vec<u8> {
@@ -397,7 +405,7 @@ fn write_range(conn: &Conn, id: u64, start: u64, data: &[u8]) {
 impl BufferInterface for TgBuffer {
     fn map_async(&self, mode: wgpu::MapMode, range: Range<wgpu::BufferAddress>, callback: BufferMapCallback) {
         // (a buffer mapped for writing starts as it is, as WebGPU's does)
-        let data = read_range(&self.conn, self.id, range.start, range.end - range.start);
+        let data = read_range(&self.mem.conn, self.mem.id, range.start, range.end - range.start);
         *self.state.lock().unwrap_or_else(|p| p.into_inner()) = Some(Mapping { start: range.start, data, write: mode == wgpu::MapMode::Write });
         callback(Ok(()));
     }
@@ -410,7 +418,7 @@ impl BufferInterface for TgBuffer {
     fn unmap(&self) {
         if let Some(m) = self.state.lock().unwrap_or_else(|p| p.into_inner()).take() {
             if m.write {
-                write_range(&self.conn, self.id, m.start, &m.data);
+                write_range(&self.mem.conn, self.mem.id, m.start, &m.data);
             }
         }
     }
@@ -448,8 +456,13 @@ impl BufferMappedRangeInterface for TgMappedRange {
 
 // ---- commands ----
 
-/// A command buffer's operations, as the server's SUBMIT takes them.
-type Ops = Arc<Mutex<Vec<u8>>>;
+/// A command buffer's operations, as the server's SUBMIT takes them, and the buffers they use (kept until submitted).
+#[derive(Debug, Default)]
+struct Recorded {
+    bytes: Vec<u8>,
+    keep: Vec<Arc<Allocation>>,
+}
+type Ops = Arc<Mutex<Recorded>>;
 
 #[derive(Debug)]
 struct TgEncoder {
@@ -458,7 +471,7 @@ struct TgEncoder {
 
 #[derive(Debug)]
 struct TgCommandBuffer {
-    ops: Vec<u8>,
+    ops: Recorded,
 }
 impl CommandBufferInterface for TgCommandBuffer {}
 
@@ -471,10 +484,11 @@ impl CommandEncoderInterface for TgEncoder {
         let (s, d) = (buffer_of(source), buffer_of(destination));
         let size = copy_size.unwrap_or(s.size - source_offset);
         let mut ops = self.ops.lock().unwrap_or_else(|p| p.into_inner());
-        ops.push(2);
-        for v in [s.id, source_offset, d.id, destination_offset, size] {
-            ops.extend(v.to_le_bytes());
+        ops.bytes.push(2);
+        for v in [s.mem.id, source_offset, d.mem.id, destination_offset, size] {
+            ops.bytes.extend(v.to_le_bytes());
         }
+        ops.keep.extend([Arc::clone(&s.mem), Arc::clone(&d.mem)]);
     }
     fn copy_buffer_to_texture(&self, _s: wgpu::TexelCopyBufferInfo<'_>, _d: wgpu::TexelCopyTextureInfo<'_>, _size: wgpu::Extent3d) {
         unsupported("textures")
@@ -502,10 +516,11 @@ impl CommandEncoderInterface for TgEncoder {
         let b = buffer_of(buffer);
         let size = size.unwrap_or(b.size - offset);
         let mut ops = self.ops.lock().unwrap_or_else(|p| p.into_inner());
-        ops.push(3);
-        for v in [b.id, offset, size] {
-            ops.extend(v.to_le_bytes());
+        ops.bytes.push(3);
+        for v in [b.mem.id, offset, size] {
+            ops.bytes.extend(v.to_le_bytes());
         }
+        ops.keep.push(Arc::clone(&b.mem));
     }
     fn insert_debug_marker(&self, _label: &str) {}
     fn push_debug_group(&self, _label: &str) {}
@@ -528,7 +543,7 @@ impl CommandEncoderInterface for TgEncoder {
 /// A bind group as set: its bindings' buffers and offsets, the dynamic offsets applied.
 #[derive(Debug, Clone, Default)]
 struct BoundGroup {
-    entries: HashMap<u32, (u64, u64)>,
+    entries: HashMap<u32, (Arc<Allocation>, u64)>,
 }
 
 #[derive(Debug)]
@@ -575,21 +590,21 @@ impl ComputePassInterface for TgComputePass {
     fn end_pipeline_statistics_query(&mut self) {}
     fn dispatch_workgroups(&mut self, x: u32, y: u32, z: u32) {
         let (program, bindings) = self.pipeline.as_ref().expect("tinygpu: a dispatch with no pipeline set");
-        let mut op = Vec::with_capacity(25 + 16 * bindings.len());
-        op.push(1);
-        op.extend(program.to_le_bytes());
+        let mut ops = self.ops.lock().unwrap_or_else(|p| p.into_inner());
+        ops.bytes.push(1);
+        ops.bytes.extend(program.to_le_bytes());
         for v in [x, y, z, bindings.len() as u32] {
-            op.extend(v.to_le_bytes());
+            ops.bytes.extend(v.to_le_bytes());
         }
         for (group, binding) in bindings {
-            let (buf, offset) = self.groups[*group as usize]
+            let (mem, offset) = self.groups[*group as usize]
                 .as_ref()
-                .and_then(|g| g.entries.get(binding).copied())
+                .and_then(|g| g.entries.get(binding))
                 .unwrap_or_else(|| panic!("tinygpu: a dispatch with nothing bound at group {group}, binding {binding}"));
-            op.extend(buf.to_le_bytes());
-            op.extend(offset.to_le_bytes());
+            ops.bytes.extend(mem.id.to_le_bytes());
+            ops.bytes.extend(offset.to_le_bytes());
+            ops.keep.push(Arc::clone(mem));
         }
-        self.ops.lock().unwrap_or_else(|p| p.into_inner()).extend(op);
     }
     fn dispatch_workgroups_indirect(&mut self, _buffer: &DispatchBuffer, _offset: wgpu::BufferAddress) {
         unsupported("indirect dispatches")
@@ -620,7 +635,7 @@ impl QueueWriteBufferInterface for TgStaging {
 
 impl QueueInterface for TgQueue {
     fn write_buffer(&self, buffer: &DispatchBuffer, offset: wgpu::BufferAddress, data: &[u8]) {
-        write_range(&self.conn, buffer_of(buffer).id, offset, data);
+        write_range(&self.conn, buffer_of(buffer).mem.id, offset, data);
     }
     fn create_staging_buffer(&self, size: wgpu::BufferSize) -> Option<DispatchQueueWriteBuffer> {
         Some(DispatchQueueWriteBuffer::custom(TgStaging { data: vec![0; size.get() as usize] }))
@@ -630,17 +645,20 @@ impl QueueInterface for TgQueue {
     }
     fn write_staging_buffer(&self, buffer: &DispatchBuffer, offset: wgpu::BufferAddress, staging: &DispatchQueueWriteBuffer) {
         let s = staging.as_custom::<TgStaging>().expect("tinygpu: a staging buffer of this adapter's");
-        write_range(&self.conn, buffer_of(buffer).id, offset, &s.data);
+        write_range(&self.conn, buffer_of(buffer).mem.id, offset, &s.data);
     }
     fn write_texture(&self, _t: wgpu::TexelCopyTextureInfo<'_>, _d: &[u8], _l: wgpu::TexelCopyBufferLayout, _s: wgpu::Extent3d) {
         unsupported("textures")
     }
     fn submit(&self, command_buffers: &mut dyn Iterator<Item = DispatchCommandBuffer>) -> u64 {
+        // (the command buffers, and the buffers they keep, are let go once the server has the work)
         let mut all = Vec::new();
+        let mut held = Vec::new();
         for cb in command_buffers {
             if let Some(c) = cb.as_custom::<TgCommandBuffer>() {
-                all.extend_from_slice(&c.ops);
+                all.extend_from_slice(&c.ops.bytes);
             }
+            held.push(cb);
         }
         if !all.is_empty() {
             self.conn.must(SUBMIT, &all);

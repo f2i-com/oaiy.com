@@ -10,7 +10,8 @@
 //! - every expression naga emits is a `const auto` named after it, at the place naga emits it, so its value is the
 //!   one at that point (a load before a later store); a pointer is written where it is used, as an lvalue;
 //! - a vector is `vec<T, N>`, laid out as WGSL lays it out; an array of fixed size a struct around its elements (so
-//!   it is copied as a value); a struct its members at naga's offsets, padded between;
+//!   it is copied as a value); a struct its members at naga's offsets, padded between (a vec3 member its 12 bytes, which
+//!   a member after it may follow at once);
 //! - a buffer is a pointer the kernel takes, and every function that uses one (naga's `global_uses`) takes it too; a
 //!   private variable is the kernel's own, passed the same way; a workgroup variable is `__shared__`, zeroed as the
 //!   kernel starts (WebGPU's default);
@@ -251,10 +252,15 @@ impl<'a> Writer<'a> {
                             T::Array { size: ArraySize::Dynamic, base, .. } => (format!("{}", self.type_name(*base)?), 0),
                             inner => (self.type_name(m.ty)?, inner.size(self.module.to_ctx())),
                         };
+                        // (a vec3 member is its 12 bytes, as WGSL lays it out: the next member may take the 4 after)
+                        let stored = match &self.module.types[m.ty].inner {
+                            T::Vector { size: naga::VectorSize::Tri, scalar } => format!("pvec3<{}>", Self::scalar_name(*scalar)?),
+                            _ => mty.clone(),
+                        };
                         if msize == 0 {
                             writeln!(self.out, "    {mty} m{i}[1];").unwrap();
                         } else {
-                            writeln!(self.out, "    {mty} m{i};").unwrap();
+                            writeln!(self.out, "    {stored} m{i};").unwrap();
                             params.push(format!("{mty} v{i}"));
                             sets.push(format!("r.m{i} = v{i};"));
                         }
@@ -606,6 +612,14 @@ impl<'a> Writer<'a> {
     }
 
     /// `.member` (or `[n]`) of a value of `inner`'s type.
+    fn as_vec3(&self, ctx: &Ctx, h: Handle<naga::Expression>, v: String) -> String {
+        if matches!(self.resolve(ctx, h), T::Vector { size: naga::VectorSize::Tri, .. }) {
+            format!("wgsl_v3({v})")
+        } else {
+            v
+        }
+    }
+
     fn member(&self, inner: &naga::TypeInner, n: u32) -> Result<String, String> {
         Ok(match inner {
             T::Struct { .. } => format!(".m{n}"),
@@ -643,11 +657,12 @@ impl<'a> Writer<'a> {
                 let i = self.expr(ctx, *index)?;
                 format!("{b}{}", self.subscript(self.resolve(ctx, *base), &i)?)
             }
+            // (a vec3 read where it may be a struct's, 12 bytes: made a vector)
             E::AccessIndex { base, index } => {
                 let b = self.expr(ctx, *base)?;
-                format!("{b}{}", self.member(self.resolve(ctx, *base), *index)?)
+                self.as_vec3(ctx, h, format!("{b}{}", self.member(self.resolve(ctx, *base), *index)?))
             }
-            E::Load { pointer } => self.lvalue(ctx, *pointer)?,
+            E::Load { pointer } => self.as_vec3(ctx, h, self.lvalue(ctx, *pointer)?),
             E::Unary { op, expr } => {
                 let v = self.expr(ctx, *expr)?;
                 match op {
@@ -660,10 +675,13 @@ impl<'a> Writer<'a> {
                 let (l, r) = (self.expr(ctx, *left)?, self.expr(ctx, *right)?);
                 use BinaryOperator as B;
                 let infix = |o: &str| format!("({l} {o} {r})");
+                // (an integer's division is WGSL's: by zero it is the dividend, as the most negative by -1 is)
+                let integer = matches!(self.resolve(ctx, *left).scalar_kind(), Some(naga::ScalarKind::Sint | naga::ScalarKind::Uint));
                 match op {
                     B::Add => infix("+"),
                     B::Subtract => infix("-"),
                     B::Multiply => infix("*"),
+                    B::Divide if integer => format!("wgsl_div({l}, {r})"),
                     B::Divide => infix("/"),
                     B::Modulo => format!("wgsl_rem({l}, {r})"),
                     B::Equal => infix("=="),

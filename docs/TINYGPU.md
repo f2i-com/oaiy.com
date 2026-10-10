@@ -16,13 +16,36 @@ Three parts, each its own:
   bindings.
 - **`tools/tinygpu/webgpu_server.py`**: one process that holds the card through tinygrad and does what WebGPU's compute
   needs, over a Unix socket: buffers (zeroed), writes and reads, kernels (CUDA compiled by nvcc, kept by the source's
-  hash), and submissions of dispatches, copies and clears, run in order on the card's compute queue.
+  hash), and submissions of dispatches, copies and clears, run in order on the card's compute queue. A submission's
+  kernels go to the card as one queue of tinygrad's (each launched as the one before it ends, as tinygrad's own graphs
+  chain them), and a write goes by the copy queue, which waits for what was submitted before it: neither waits for the
+  card. Clients connect at once, their requests one at a time; a client's buffers are freed as it goes.
 - **`crates/wgpu-tinygpu`**: a `wgpu::Adapter` (wgpu's `custom` backend) that asks that server. A compute pipeline's
   WGSL becomes CUDA at creation; a command buffer's work goes in one message at `Queue::submit`. Compute alone: render
   pipelines, textures, samplers and queries are refused.
 
 OAIY's engine takes it with the feature `tinygpu` (`oaiy-llm-server`, `ggml-rs-wgpu`) and
 `OAIY_WEBGPU_ADAPTER=tinygpu` (or `tinygpu:<socket>`).
+
+## Without the card: the emulator
+
+`webgpu_server.py --emulate` is the same server with no card: each kernel's CUDA is compiled for the CPU (clang++, with
+`tools/tinygpu/emu/cuda_emu.h` before it) and run there, its workgroups shared out among the cores. CUDA's words are the
+CPU's (`__half` is `_Float16`, atomics the compiler's); a workgroup runs on one thread, each invocation a fiber of its
+own stack, so `__syncthreads()` passes to the next invocation and the workgroup goes on once every one has reached it;
+workgroup memory is the thread's. It needs python3 and clang++ alone (no tinygrad), and it is how a translation is
+checked before it goes to the card, where a kernel that faults costs the card its link (below):
+
+```sh
+python3 tools/tinygpu/webgpu_server.py --emulate        # listens on ~/.cache/tinygpu-webgpu/emulator.sock
+OAIY_WEBGPU_ADAPTER=tinygpu:$HOME/.cache/tinygpu-webgpu/emulator.sock \
+  cargo test --release -p ggml-rs-wgpu --features tinygpu --lib -- --test-threads=1
+```
+
+`cargo test -p wgpu-tinygpu` starts one itself (`tests/emulator.rs`) and checks WGSL's meaning through the translation:
+an integer divided by zero, shifts past the width, workgroup memory zeroed and shared across a barrier, atomics,
+`workgroupUniformLoad`, a struct's members where WGSL lays them out, a float made an integer, a buffer kept while work
+holds it.
 
 ## Set up
 
@@ -73,6 +96,20 @@ A cubin of several kernels faulted every SM: tinygrad reads a program's register
 the last kernel's of several, so the server compiles one kernel a cubin and refuses any other (the card was lost to
 that fault, and is off its link as this is written).
 
-**Not checked yet:** OAIY's GPU tests on the adapter (`OAIY_WEBGPU_ADAPTER=tinygpu cargo test -p ggml-rs-wgpu
---features tinygpu`), a model on it, any speed. The tensor cores are not used (no cooperative matrices: CUDA's `wmma` is
-where 16 x 16 fragments would go); a write to a buffer waits for the card first; each dispatch is a Python call.
+On the emulator (the same day, the card off its link):
+
+- every one of OAIY's GPU tests passes on the adapter: 98, each kernel translated and run as CUDA (the 36 ignored are
+  timings, as they are on any GPU);
+- a model answers through the whole engine: Qwen3-0.6B (Q4_K_M) says "The capital of France is Paris.", as it does on
+  Metal, finds "marigold" at the start of a 946-token prompt, and writes three sentences about the ocean, at about two
+  tokens a second;
+- all 309 kernels, translated again, compile with nvcc for sm_89, each a cubin of one kernel.
+
+Two translations the emulator found wrong, now right: an integer's `/` and `%` by zero (WGSL's are the dividend and 0;
+CUDA's are anything), and a struct whose member follows a `vec3` in its last 4 bytes (a struct's `vec3` is now its 12
+bytes). And one of the adapter's: a buffer whose handle was dropped while a bind group still held it was freed before
+the work ran (a buffer now lives while a bind group or an unsubmitted command buffer holds it, as wgpu's own do).
+
+**Not checked yet on the card:** OAIY's GPU tests, a model, any speed, and a submission as one queue. The tensor cores
+are not used (no cooperative matrices: CUDA's `wmma` is where 16 x 16 fragments would go); each dispatch is still a
+Python call (tinygrad's launch), batched to one doorbell a submission.

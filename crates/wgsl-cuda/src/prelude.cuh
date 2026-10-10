@@ -22,6 +22,24 @@ template <typename T, int N> struct alignas(vec_align<T, N>::value) vec {
     __device__ __forceinline__ const T& operator[](uint i) const { return c[i]; }
 };
 
+// a struct's vec3 member: its 12 bytes, as WGSL lays a struct out (the member after it may take the next 4, which a
+// vec<T, 3> of 16 would cover); a vector as it is read, and written from one
+template <typename T> struct pvec3 {
+    T c[3];
+    pvec3() = default;
+    __device__ __forceinline__ pvec3(const vec<T, 3>& v) : c{v.c[0], v.c[1], v.c[2]} {}
+    __device__ __forceinline__ pvec3& operator=(const vec<T, 3>& v) {
+        c[0] = v.c[0];
+        c[1] = v.c[1];
+        c[2] = v.c[2];
+        return *this;
+    }
+    __device__ __forceinline__ T& operator[](uint i) { return c[i]; }
+    __device__ __forceinline__ const T& operator[](uint i) const { return c[i]; }
+};
+template <typename T> __device__ __forceinline__ vec<T, 3> wgsl_v3(const pvec3<T>& p) { return vec<T, 3>(p.c[0], p.c[1], p.c[2]); }
+template <typename T> __device__ __forceinline__ vec<T, 3> wgsl_v3(const vec<T, 3>& v) { return v; }
+
 // component-wise maps, one and two operands
 template <typename R, typename T, int N, typename F> __device__ __forceinline__ vec<R, N> vmap(const vec<T, N>& a, F f) {
     vec<R, N> r;
@@ -74,8 +92,16 @@ template <typename T, int N> __device__ __forceinline__ vec<T, N> operator-(cons
 template <typename T, int N> __device__ __forceinline__ vec<T, N> operator~(const vec<T, N>& a) { return vmap<T>(a, [](T x) { return T(~x); }); }
 template <int N> __device__ __forceinline__ vec<bool, N> operator!(const vec<bool, N>& a) { return vmap<bool>(a, [](bool x) { return !x; }); }
 
-// WGSL's %: an integer's remainder; a float's truncated one
-template <typename T> __device__ __forceinline__ T wgsl_rem(T a, T b) { return a % b; }
+// WGSL's integer / and %, which never fault: by zero the dividend and 0, the most negative by -1 itself and 0
+__device__ __forceinline__ uint wgsl_div(uint a, uint b) { return a / (b == 0u ? 1u : b); }
+__device__ __forceinline__ int wgsl_div(int a, int b) { return a / ((b == 0 || (a == int(0x80000000) && b == -1)) ? 1 : b); }
+template <typename T, int N> __device__ __forceinline__ vec<T, N> wgsl_div(const vec<T, N>& a, const vec<T, N>& b) { return vmap2<T>(a, b, [](T x, T y) { return wgsl_div(x, y); }); }
+template <typename T, int N> __device__ __forceinline__ vec<T, N> wgsl_div(const vec<T, N>& a, T b) { return vmap<T>(a, [b](T x) { return wgsl_div(x, b); }); }
+template <typename T, int N> __device__ __forceinline__ vec<T, N> wgsl_div(T a, const vec<T, N>& b) { return vmap<T>(b, [a](T y) { return wgsl_div(a, y); }); }
+
+// WGSL's %: an integer's remainder (as its division, above); a float's truncated one
+__device__ __forceinline__ uint wgsl_rem(uint a, uint b) { return a % (b == 0u ? 1u : b); }
+__device__ __forceinline__ int wgsl_rem(int a, int b) { return a % ((b == 0 || (a == int(0x80000000) && b == -1)) ? 1 : b); }
 __device__ __forceinline__ float wgsl_rem(float a, float b) { return fmodf(a, b); }
 __device__ __forceinline__ __half wgsl_rem(__half a, __half b) { return __float2half(fmodf(__half2float(a), __half2float(b))); }
 template <typename T, int N> __device__ __forceinline__ vec<T, N> wgsl_rem(const vec<T, N>& a, const vec<T, N>& b) { return vmap2<T>(a, b, [](T x, T y) { return wgsl_rem(x, y); }); }
