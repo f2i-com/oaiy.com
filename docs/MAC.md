@@ -201,18 +201,21 @@ instead, it is the [production build](../platform/desktop/README.md#production-b
 `platform/desktop`, which also needs Node 22 or later. The engines above do not need it:
 they are the same ones it starts.
 
-**The phone plugin (Aokie) is built for a Mac, and has not been run on one with a
-dongle.** Its bundle comes from a workflow, with nothing to build
+**The phone plugin (Aokie) runs on a Mac with a dongle; a phone has not been paired with
+it there yet.** Its bundle comes from a workflow, with nothing to build
 ([above](#the-app-from-a-disk-image)); on GitHub's Mac it was built with its speech stack,
 started from its folder and answered OAIY's first calls, with no dongle there. Its Bluetooth
 stack drives a USB dongle itself, with no use of the system's Bluetooth: on a Mac it opens
 the dongle through libusb (built into the plugin), installs no driver, and seals its
 secrets with a key in the login Keychain where Windows uses its own protection. The Mac
 shares that code with Linux, where the plugin was built, its tests passed, and it was run
-against a stand-in dongle; no real dongle has been opened through libusb yet. In Aokie's
+against a stand-in dongle. On an M5 Pro Mac (macOS 27) with a Broadcom BCM20702A0
+(`0a5c:21ec`), macOS attached no driver to the dongle, Aokie opened it as the user, and
+the plugin's radio came up on it and opened a pairing window (11 October 2026; that
+dongle's vendor-specific interface class needed Aokie's transport to know it). In Aokie's
 repository, `docs/HARDWARE.md` (macOS) says how to try it: first
 `cargo run -p aokie-bluetooth --example dongle_probe` with the dongle plugged in, then
-`sh scripts/bundle-unix.sh` for a plugin folder to copy into OAIY's. With nothing to build
+`sh scripts/bundle-unix.sh` for a plugin folder to give OAIY's Plugins screen. With nothing to build
 with, install the bundle and open Aokie's dongle screen: it lists the dongle and, when the
 radio has not opened it, says why in the radio's own words. What decides the rest
 is whether macOS attaches a driver of its own to the dongle, which the probe and
