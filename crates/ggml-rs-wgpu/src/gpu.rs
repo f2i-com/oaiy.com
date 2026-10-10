@@ -363,6 +363,8 @@ impl Gpu {
     /// OAIY_PORTABLE_LIMITS's): wgpu 30 does not check it, and a kernel past the limit fails where it runs, if its
     /// driver says at all.
     pub(super) fn shader(&self, name: &str, source: String) -> wgpu::ShaderModule {
+        // Metal: the packed dot products go through a function of their own (`packed_dots_wrapped` says why).
+        let source = if self.wraps_packed_dots() { packed_dots_wrapped(source) } else { source };
         if self.limits.max_compute_workgroup_storage_size < 48 << 10 {
             if let Some(bytes) = workgroup_bytes(&source) {
                 assert!(
@@ -383,6 +385,12 @@ impl Gpu {
             let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{plain}-{:016x}.wgsl", h.finish())), &source);
         }
         self.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(name), source: wgpu::ShaderSource::Wgsl(source.into()) })
+    }
+
+    /// Whether this device's kernels have their packed dot products wrapped: on Metal, and anywhere
+    /// `OAIY_WRAP_PACKED_DOTS=1` asks (so the wrapped kernels can be run and compared where there is no Mac).
+    fn wraps_packed_dots(&self) -> bool {
+        self.device.adapter_info().backend == wgpu::Backend::Metal || std::env::var_os("OAIY_WRAP_PACKED_DOTS").is_some_and(|v| v == "1")
     }
 
     pub(super) fn exl3_pipeline(&self, many: bool) -> Arc<wgpu::ComputePipeline> {

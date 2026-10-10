@@ -32,6 +32,66 @@ env:
   NODE_VERSION: '24'
 
 jobs:
+  # The engine the image carries, on a Mac's GPU, beside the build and not in its way. Each kernel is compiled by
+  # Apple's own compiler the first time it runs, and only there: a kernel naga writes for Metal in a way that
+  # compiler refuses ends the language-model server on every Mac, and nothing short of running it on one shows it
+  # (the first image did exactly that: "redefinition of 'reinterpreted_packed_char4_e1455'"). Two looks: a model
+  # of the catalog asked one question, and the GPU backend's own tests, each kernel's results held against the CPU's.
+  engine:
+    name: The engine on a Mac's GPU (Apple's compiler)
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (pinned revision)
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          key: engine-on-metal
+
+      - name: The Mac and its GPU
+        run: |
+          sw_vers | tr '\n' ' '; echo
+          sysctl -n machdep.cpu.brand_string; echo "memory: $(( $(sysctl -n hw.memsize) / 1073741824 )) GiB"
+          system_profiler SPDisplaysDataType | head -24
+
+      - name: Build the portable language-model engine
+        run: cargo build --release --locked -p oaiy-llm-server --no-default-features --features webgpu --bin oaiy-llm-server-webgpu
+
+      # The catalog's small language model (crates/oaiy-studio/src/catalog.json, qwen3.5-4b): the same family and
+      # the same kind of file as the model the setup wizard recommends, so the same kernels.
+      - name: Fetch the catalog's small language model
+        run: curl -fL --retry 3 --retry-delay 5 -o "$RUNNER_TEMP/Qwen3.5-4B-Q4_K_M.gguf" https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf
+
+      - name: One question to the model, on the GPU
+        env:
+          ENGINE_SMOKE_NEEDS_GPU: '1'
+        run: sh tools/engine-smoke.sh target/release/oaiy-llm-server-webgpu "$RUNNER_TEMP/Qwen3.5-4B-Q4_K_M.gguf"
+
+      - name: The GPU backend's own tests, on the GPU
+        if: ${{ !cancelled() }}
+        run: sh tools/mac/check.sh
+
+      - name: Keep what the server and the tests said
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p engine-said
+          for file in oaiy-engine-smoke.txt oaiy-mac-check.txt; do
+            [ -f "${TMPDIR:-/tmp}/$file" ] && cp "${TMPDIR:-/tmp}/$file" engine-said/ || true
+          done
+          ls -la engine-said
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ !cancelled() }}
+        with:
+          name: engine-on-metal
+          path: engine-said/
+          if-no-files-found: warn
+          retention-days: 30
+
   dmg:
     name: OAIY Desktop (.dmg, Apple silicon)
     runs-on: macos-15

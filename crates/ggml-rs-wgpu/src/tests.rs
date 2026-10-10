@@ -181,3 +181,42 @@ fn a_discrete_cards_default_budget_leaves_room() {
     assert_eq!(discrete_budget(6 * G), 3 * G);
     assert_eq!(discrete_budget(0), 0);
 }
+
+/// The Metal text of a kernel declares a temporary for each operand of a packed dot product, named after the operand:
+/// a kernel that uses one operand in several of them was refused by Apple's compiler ("redefinition of ..."). On
+/// Metal each goes through a function of its own. This holds what that rewriting must keep: the kernel is still one
+/// naga takes, no dot product is left outside its function, and a kernel with none is not touched.
+#[test]
+fn a_kernels_packed_dot_products_go_through_a_function_of_their_own_for_metal() {
+    use wgpu::naga;
+    let valid = |text: &str| {
+        let module = naga::front::wgsl::parse_str(text).unwrap_or_else(|e| panic!("WGSL: {}", e.emit_to_string(text)));
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all()).validate(&module).unwrap_or_else(|e| panic!("validation: {e:?}"));
+        module
+    };
+    let calls = |text: &str, name: &str| text.matches(&format!("{name}(")).count();
+    let mut seen = 0;
+    for dtype in [GgmlType::Q4_0, GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K, GgmlType::Q8_0] {
+        for mr in [1u32, 2, 4] {
+            let Some(kernel) = crate::shaders::rb_kernel_q8(dtype, crate::shaders::rb_rows(dtype, mr), mr) else { continue };
+            let before = calls(&kernel, "dot4I8Packed");
+            assert!(before > 0, "{dtype:?} for {mr} tokens has no packed dot product: the test looks at the wrong kernel");
+            let wrapped = packed_dots_wrapped(kernel.clone());
+            assert_eq!(calls(&wrapped, "dot4I8Packed"), 1, "{dtype:?}, {mr}: one use is left, the function's own");
+            assert_eq!(calls(&wrapped, "oaiy_dot4_i8"), before + 1, "{dtype:?}, {mr}: every use and the function's heading");
+            let (was, is) = (valid(&kernel), valid(&wrapped));
+            assert_eq!(is.functions.len(), was.functions.len() + 1, "{dtype:?}, {mr}: one function more");
+            assert_eq!(workgroup_bytes(&wrapped), workgroup_bytes(&kernel), "{dtype:?}, {mr}: the workgroup's memory is as it was");
+            seen += 1;
+        }
+    }
+    assert!(seen >= 6, "only {seen} multi-token kernels were made");
+    // The unsigned one, in a kernel of the same shape as the EXL3 ones' use of it.
+    let unsigned = "@compute @workgroup_size(1) fn main() { let hx = 0x01020304u; let a = dot4U8Packed(hx, 0x01010101u); let b = dot4U8Packed(hx, 0x02020202u); _ = a + b; }".to_string();
+    let wrapped = packed_dots_wrapped(unsigned);
+    assert_eq!((calls(&wrapped, "dot4U8Packed"), calls(&wrapped, "oaiy_dot4_u8")), (1, 3));
+    valid(&wrapped);
+    // A kernel with neither is the text it was.
+    let plain = "@compute @workgroup_size(1) fn main() { }".to_string();
+    assert_eq!(packed_dots_wrapped(plain.clone()), plain);
+}

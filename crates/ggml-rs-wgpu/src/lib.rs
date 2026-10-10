@@ -74,6 +74,30 @@ fn workgroup_bytes(source: &str) -> Option<u64> {
     Some(module.global_variables.iter().filter(|(_, g)| g.space == naga::AddressSpace::WorkGroup).map(|(_, g)| layouter[g.ty].size as u64).sum())
 }
 
+/// A kernel's text with each packed dot product (`dot4I8Packed`, `dot4U8Packed`) called through a function of its
+/// own, for Metal.
+///
+/// naga writes one of those for Metal as a temporary for each operand, named after the operand, and the dot product
+/// of the temporaries. A kernel that uses one operand in several dot products (a row's four weights against each of
+/// four tokens: the multi-token 8-bit kernels) gets that temporary declared once a use, in one block, and Apple's
+/// compiler refuses the kernel: "redefinition of 'reinterpreted_packed_char4_e1455'". The language-model server then
+/// ended as it made its first pipeline, on every Mac. Inside a function of its own a dot product's operands are the
+/// function's two parameters, used once, whatever the caller passed; Metal's compiler puts the function back in line.
+///
+/// Other APIs' kernels are left as they are written: their text is what the speed measurements were made with.
+fn packed_dots_wrapped(source: String) -> String {
+    let mut out = source;
+    for (builtin, wrapper, result) in [("dot4I8Packed", "oaiy_dot4_i8", "i32"), ("dot4U8Packed", "oaiy_dot4_u8", "u32")] {
+        let call = format!("{builtin}(");
+        if !out.contains(&call) {
+            continue;
+        }
+        out = out.replace(&call, &format!("{wrapper}("));
+        out.push_str(&format!("\nfn {wrapper}(a: u32, b: u32) -> {result} {{\n    return {builtin}(a, b);\n}}\n"));
+    }
+    out
+}
+
 struct Gpu {
     device: wgpu::Device,
     /// The device's queue as it is; [`Gpu::queue`] for anyone's use of it but the feed's.
