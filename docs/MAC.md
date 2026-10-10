@@ -91,10 +91,22 @@ then met three things that are not fixed, because each needs a Mac to look at:
   carries several thousand tokens of instructions, and a Qwen3.5 9B answered it with
   "angangang…". A prompt that long is read by other kernels than a short one (in blocks of
   rows, chained on the GPU), and the short question above goes through none of them.
-  `ENGINE_SMOKE_LONG=1 sh tools/engine-smoke.sh target/release/oaiy-llm-server-webgpu <model.gguf>`
-  asks such a prompt (it names a word, a page of sentences follows, and it asks for the
-  word); with `OAIY_NO_CHAIN=1` as well it asks it with the chained runs off. Which of the
-  two is wrong, and what `check.sh` says on that Mac, is where to start.
+  `tools/engine-smoke.sh` asks such a prompt with `ENGINE_SMOKE_LONG=1` (it names a word, a
+  page of sentences follows, and it asks for the word), and with `OAIY_NO_CHAIN=1` as well
+  it asks it with the chained runs off. Nothing has to be built for it: the engine is in the
+  installed app, and the model is where the app downloaded it. Quit OAIY first (its own
+  engine holds the GPU's memory), then:
+
+  ```sh
+  engine=/Applications/OAIY.app/Contents/Resources/resources/engines/oaiy-llm-server-webgpu
+  model="$HOME/Library/Application Support/com.oaiy.app/engines/models/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf"
+  ENGINE_SMOKE_LONG=1 ENGINE_SMOKE_LONG_LINES=330 sh tools/engine-smoke.sh "$engine" "$model"
+  OAIY_NO_CHAIN=1 ENGINE_SMOKE_LONG=1 ENGINE_SMOKE_LONG_LINES=330 sh tools/engine-smoke.sh "$engine" "$model"
+  ```
+
+  (330 lines is about the Agent's seven thousand tokens. If either path is not there,
+  `ls` beside it says what is.) Which of the two answers wrong, and what `check.sh` says on
+  that Mac (it needs Rust), is where to start.
 - **The Agent says "The code sandbox is unavailable: the page is not cross-origin
   isolated".** The window serves the Agent's page from a scheme of its own with the opener
   and embedder policies that isolate a page in a browser (`require-corp` off Windows), and
@@ -104,7 +116,9 @@ then met three things that are not fixed, because each needs a Mac to look at:
   `python3 tools/mac/isolated-page-server.py <port> require-corp` running, the same page
   from a local server. If only the local server's page is isolated, the Agent's page has to
   come from the desktop's own port on a Mac, and that is another origin: what the page keeps
-  under `oaiy://localhost` (its projects, its settings) is not seen from it.
+  under `oaiy://localhost` (its projects, its settings) is not seen from it. The probe needs
+  Apple's command line tools (`xcode-select --install`) and has not been compiled by anyone
+  yet: it was written without a Mac.
 - **The tabs of the Engines and Flows sections are half covered by the page under them.**
   Those pages are webviews of their own, laid over a box the dashboard measures. A build
   after that image writes a line beginning `embed:` to the desktop's log
