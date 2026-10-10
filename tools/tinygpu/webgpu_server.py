@@ -121,6 +121,105 @@ class Program:
     return self.prg.fill_kernargs(tuple(bufs), tuple(vals))
 
 
+class Fast:
+  """A launch as tinygrad's NVComputeQueue.exec writes it, without the objects it makes a launch (a view of memory a
+  word, its QMD's fields set by name): a launch's arguments and its QMD written in a few copies, its fields' places
+  found once, from tinygrad's own tables. On with TINYGPU_FAST=1 (else tinygrad's own launch); TINYGPU_FAST_CHECK=1 has
+  tinygrad write each launch too (in its own slot, never submitted) and compares the two before the card is given it.
+
+  A launch's arguments (a slot of tinygrad's ring) are the program's constant bank 0 (its words, the workgroup's size
+  and the grid in the first six), its pointers, then its 32-bit values; its QMD is the program's (its workgroup's size
+  set once), the grid and where the arguments are set, and the queue's last QMD is pointed at it (or it is sent, the
+  queue's first)."""
+
+  def __init__(self, dev):
+    import tinygrad.runtime.ops_nv as nv
+    self.nv, self.dev = nv, dev
+    probe = nv.QMD(dev)
+    if probe.ver != 3: raise NotImplementedError(f"QMD version {probe.ver}")
+    if dev.pma_enabled: raise NotImplementedError("tinygrad's performance counters")
+    f = nv.QMD.fields[probe.pref]
+    self.ring, self.ring_va = dev.kernargs_buf.cpu_view().mv, dev.kernargs_buf.va_addr
+    self.grid_at = f["CTA_RASTER_WIDTH"][1] // 8
+    self.dims = (f["CTA_THREAD_DIMENSION0"][1] // 8, f["CTA_THREAD_DIMENSION2"][1] // 8)
+    self.cbuf_hi, self.cbuf_lo = self.bits(f, "CONSTANT_BUFFER_ADDR_UPPER_0"), self.bits(f, "CONSTANT_BUFFER_ADDR_LOWER_0")
+    self.next_qmd = self.bits(f, "DEPENDENT_QMD0_POINTER")
+    # (the dependent QMD's action, prefetch and enable, each 1: tinygrad's)
+    self.next_flags = [self.bits(f, k) for k in ("DEPENDENT_QMD0_ACTION", "DEPENDENT_QMD0_PREFETCH", "DEPENDENT_QMD0_ENABLE")]
+    # a field that is a whole 32-bit word written as one; the flags, where they share their bytes, in one write
+    self.word = lambda spec: spec[0] if spec[3] == 0 and spec[4] == 32 and spec[1] - spec[0] == 4 else None
+    self.cbuf_lo_word, self.next_qmd_word = self.word(self.cbuf_lo), self.word(self.next_qmd)
+    spans = {(sp[0], sp[1]) for sp in self.next_flags}
+    self.flags = None
+    if len(spans) == 1:
+      (b0, b1), = spans
+      self.flags = (b0, b1, sum(sp[2] for sp in self.next_flags), sum((1 << sp[3]) & sp[2] for sp in self.next_flags))
+    self.pcas = (nv.nv_gpu.NVC6C0_SEND_PCAS_A, nv.nv_gpu.NVC6C0_SEND_SIGNALING_PCAS2_B)
+    self.qmd_size = probe.sz * 4
+    self.last = None   # the ring's offset of the queue's last QMD, None where the queue has none since its start
+
+  @staticmethod
+  def bits(fields, name):
+    """A field's bytes (first, past last), its mask in them and its shift: what tinygrad's QMD._rw_bits works out a write."""
+    hi, lo = fields[name]
+    return lo // 8, hi // 8 + 1, ((1 << (hi - lo + 1)) - 1) << (lo % 8), lo % 8, hi - lo + 1
+
+  def put(self, at: int, spec, value: int):
+    b0, b1, mask, shift, width = spec
+    if value >> width: raise ValueError(f"{value:#x} does not fit {width} bits")
+    num = int.from_bytes(self.ring[at + b0:at + b1], "little")
+    self.ring[at + b0:at + b1] = ((num & ~mask) | ((value << shift) & mask)).to_bytes(b1 - b0, "little")
+
+  def program(self, prog):
+    """What a launch of `prog` writes that is the same each time: its constant bank's words and its QMD (its
+    workgroup's size in both), their layout in its slot."""
+    p = prog.prg
+    words = list(p.cbuf_0)
+    words[0:3] = prog.workgroup
+    qmd = bytearray(p.qmd.mv)
+    struct.pack_into("<HH", qmd, self.dims[0], *prog.workgroup[:2])
+    struct.pack_into("<B", qmd, self.dims[1], prog.workgroup[2])
+    prog.fast = (struct.pack(f"<{len(words)}I", *words), len(words) * 4, self.nv.round_up(p.constbufs[0][1], 1 << 8), bytes(qmd), p.kernargs_alloc_size)
+    return prog.fast
+
+  def launch(self, q, prog, ptrs: list, grid: tuple, vals: tuple):
+    """`prog` over `grid`, its pointers and values, added to queue `q` (its last QMD pointed at this one)."""
+    prefix, plen, qmd_at, qmd, size = getattr(prog, "fast", None) or self.program(prog)
+    off = self.dev.kernargs_offset_allocator.alloc(size, 8)
+    ring, va = self.ring, self.ring_va + off
+    ring[off:off + plen] = prefix
+    struct.pack_into("<3I", ring, off + 12, *grid)
+    struct.pack_into(f"<{len(ptrs)}Q{len(vals)}I", ring, off + plen, *ptrs, *vals)
+    qo = off + qmd_at
+    ring[qo:qo + len(qmd)] = qmd
+    struct.pack_into("<3I", ring, qo + self.grid_at, *grid)
+    self.put(qo, self.cbuf_hi, va >> 32)
+    if self.cbuf_lo_word is not None: struct.pack_into("<I", ring, qo + self.cbuf_lo_word, va & 0xffffffff)
+    else: self.put(qo, self.cbuf_lo, va & 0xffffffff)
+    if self.last is None:
+      q.nvm(1, self.pcas[0], (va + qmd_at) >> 8)
+      q.nvm(1, self.pcas[1], 9)
+    else:
+      at = self.last
+      if self.next_qmd_word is not None: struct.pack_into("<I", ring, at + self.next_qmd_word, (va + qmd_at) >> 8)
+      else: self.put(at, self.next_qmd, (va + qmd_at) >> 8)
+      if self.flags is not None:
+        b0, b1, mask, value = self.flags
+        num = int.from_bytes(ring[at + b0:at + b1], "little")
+        ring[at + b0:at + b1] = ((num & ~mask) | value).to_bytes(b1 - b0, "little")
+      else:
+        for spec in self.next_flags: self.put(at, spec, 1)
+    self.last = qo
+    return off
+
+  def ending(self, q):
+    """The queue's last QMD as tinygrad's queue keeps it, for its signal to be written into (a release of it)."""
+    if self.last is None: return
+    buf = self.dev.kernargs_buf.offset(offset=self.last, size=self.qmd_size)
+    q.active_qmd, q.active_qmd_buf = self.nv.QMD(dev=self.dev, view=buf.cpu_view()), buf
+    self.last = None
+
+
 class Card:
   """The NVIDIA card tinygrad holds (DEV=NV). A buffer is (tinygrad's buffer, its size).
 
@@ -147,14 +246,82 @@ class Card:
     self.profiled: dict = {}   # (TINYGPU_PROFILE: a kernel's calls, its time, its last grid, its workgroup)
     built = {name: Program(self.dev, compile_cuda(src, self.arch), name, (256, 1, 1), 1) for name, src in BUILTINS.items()}
     self.copy4, self.copy1, self.fill4, self.fill1 = built["tg_copy4"], built["tg_copy1"], built["tg_fill4"], built["tg_fill1"]
+    self.fast = None
+    if os.environ.get("TINYGPU_FAST") == "1" and not (self.SYNC_EACH or self.PROFILE):
+      try: self.fast = Fast(self.dev)
+      except (NotImplementedError, KeyError, AttributeError) as e: print(f"tinygpu-webgpu: launches through tinygrad ({e})", file=sys.stderr, flush=True)
+    self.check = self.fast is not None and os.environ.get("TINYGPU_FAST_CHECK") == "1"
+    if self.fast is not None:
+      # (SIGUSR1 turns the check on or off, as the server runs)
+      def toggle(*_):
+        self.check = not self.check
+        print(f"tinygpu-webgpu: fast launches {'checked' if self.check else 'not checked'}", file=sys.stderr, flush=True)
+      signal.signal(signal.SIGUSR1, toggle)
 
   def begin(self):
     if self.q is None:
       self.q = self.dev.hw_compute_queue_t().wait(self.dev.timeline_signal, self.dev.timeline_value - 1).memory_barrier()
+      if self.fast: self.fast.last = None
+      self.ref = self.dev.hw_compute_queue_t() if self.check else None
 
   def end(self):
-    if self.q is not None and self.queued: self.q.signal(self.dev.timeline_signal, self.dev.next_timeline()).submit(self.dev)
+    if self.q is not None and self.queued:
+      if self.fast: self.fast.ending(self.q)
+      self.q.signal(self.dev.timeline_signal, self.dev.next_timeline()).submit(self.dev)
     self.q, self.queued = None, 0
+
+  def launch_fast(self, prog: Program, ptrs: list, grid, vals):
+    """`prog` launched by Fast: as launch(), its arguments as addresses."""
+    inside = self.q is not None
+    if self.since_sync >= self.ARGS_RING: self.sync()
+    self.begin()
+    before = self.fast.last
+    off = self.fast.launch(self.q, prog, ptrs, grid, vals)
+    if self.check and self.ref is not None:
+      try: self.compare(prog, ptrs, grid, vals, off, before)
+      except Exception:
+        # (the queue let go, never submitted: what differs from tinygrad's must not reach the card)
+        self.q, self.queued, self.fast.last = None, 0, None
+        raise
+    self.queued, self.since_sync = self.queued + 1, self.since_sync + 1
+    if not inside: self.end()
+    elif self.queued >= self.BATCH:
+      self.end()
+      self.begin()
+
+  def compare(self, prog, ptrs, grid, vals, off, before):
+    """TINYGPU_FAST_CHECK: the launch written by tinygrad as well, into a queue never submitted, and the two compared:
+    the arguments byte for byte, the QMD with its arguments' address set to Fast's, and the QMD before it in the
+    queue pointed the same way (each at its own next)."""
+    from tinygrad.runtime.support.hcq import HCQBuffer
+    nv, f, ring = self.fast.nv, self.fast, self.fast.ring
+    prefix, plen, qmd_at, qmd, size = prog.fast
+    views = [HCQBuffer(a, 8) for a in ptrs]
+    prog.prg.cbuf_0[0:6] = [*prog.workgroup, *grid]
+    args = prog.prg.fill_kernargs(tuple(views), tuple(vals))
+    ref_prev = self.ref.active_qmd_buf.va_addr - f.ring_va if self.ref.active_qmd is not None else None
+    self.ref.exec(prog.prg, args, grid, prog.workgroup)
+    ro = args.buf.va_addr - f.ring_va
+    n = plen + 8 * len(ptrs) + 4 * len(vals)
+    if bytes(ring[off:off + n]) != bytes(ring[ro:ro + n]):
+      raise RuntimeError(f"fast launch: {prog.label}'s arguments differ from tinygrad's")
+    mine, theirs = bytearray(ring[off + qmd_at:off + qmd_at + f.qmd_size]), bytearray(ring[ro + qmd_at:ro + qmd_at + f.qmd_size])
+    def same(a, b, at_a, at_b, specs):
+      # (each with the given fields cleared: what differs by where each one is)
+      for spec in specs:
+        for buf in (a, b):
+          b0, b1, mask, _, _ = spec
+          num = int.from_bytes(buf[b0:b1], "little") & ~mask
+          buf[b0:b1] = num.to_bytes(b1 - b0, "little")
+      return a == b
+    if not same(mine, theirs, 0, 0, [f.cbuf_hi, f.cbuf_lo]):
+      raise RuntimeError(f"fast launch: {prog.label}'s QMD differs from tinygrad's")
+    if (before is None) != (ref_prev is None):
+      raise RuntimeError("fast launch: the queue's QMDs chained otherwise than tinygrad's")
+    if before is not None:
+      a, b = bytearray(ring[before:before + f.qmd_size]), bytearray(ring[ref_prev:ref_prev + f.qmd_size])
+      if not same(a, b, 0, 0, [f.cbuf_hi, f.cbuf_lo, f.next_qmd]):
+        raise RuntimeError(f"fast launch: the QMD before {prog.label}'s chained otherwise than tinygrad's")
 
   def launch(self, prog: Program, bufs, grid, vals=()):
     inside = self.q is not None   # (a submission's, else a launch of its own: an ALLOC's clear)
@@ -235,18 +402,26 @@ class Card:
     return Program(self.dev, compile_cuda(src, self.arch), "oaiy_main", workgroup, sizes, scratch)
 
   def dispatch(self, prog: Program, bufs: list, grid: tuple, sizes: list):
+    if self.fast:
+      ptrs = [b[0].va_addr + off for b, off in bufs]
+      if prog.scratch: ptrs.append(self.scratch[0].va_addr)
+      return self.launch_fast(prog, ptrs, grid, tuple(sizes))
     views = [self.view(b, off, b[1] - off) for b, off in bufs] + ([self.scratch[0]] if prog.scratch else [])
     self.launch(prog, views, grid, sizes)
 
   def copy(self, src, soff: int, dst, doff: int, size: int):
-    s, d = self.view(src, soff, size), self.view(dst, doff, size)
-    if (soff | doff | size) % 4 == 0: self.launch(self.copy4, (s, d), (min(1024, (size // 4 + 255) // 256), 1, 1), (size // 4,))
-    else: self.launch(self.copy1, (s, d), (min(1024, (size + 255) // 256), 1, 1), (size,))
+    words = (soff | doff | size) % 4 == 0
+    prog, n = (self.copy4, size // 4) if words else (self.copy1, size)
+    grid = (min(1024, (n + 255) // 256), 1, 1)
+    if self.fast: return self.launch_fast(prog, [src[0].va_addr + soff, dst[0].va_addr + doff], grid, (n,))
+    self.launch(prog, (self.view(src, soff, size), self.view(dst, doff, size)), grid, (n,))
 
   def clear(self, buf, off: int, size: int):
-    d = self.view(buf, off, size)
-    if (off | size) % 4 == 0: self.launch(self.fill4, (d,), (min(1024, (size // 4 + 255) // 256), 1, 1), (size // 4,))
-    else: self.launch(self.fill1, (d,), (min(1024, (size + 255) // 256), 1, 1), (size,))
+    words = (off | size) % 4 == 0
+    prog, n = (self.fill4, size // 4) if words else (self.fill1, size)
+    grid = (min(1024, (n + 255) // 256), 1, 1)
+    if self.fast: return self.launch_fast(prog, [buf[0].va_addr + off], grid, (n,))
+    self.launch(prog, (self.view(buf, off, size),), grid, (n,))
 
   def sync(self):
     self.end()
@@ -368,6 +543,7 @@ class Server:
     self.buffers: dict = {}
     self.programs: dict = {}
     self.next_id = 1
+    self.dispatched = 0   # (the last submission's dispatches, for TINYGPU_STATS)
 
   def new_id(self) -> int:
     self.next_id += 1
@@ -420,9 +596,11 @@ class Server:
 
   def ops(self, p):
     at = 0
+    self.dispatched = 0
     while at < len(p):
       op = p[at]; at += 1
       if op == 1:
+        self.dispatched += 1
         prog, gx, gy, gz, n = struct.unpack_from("<QIIII", p, at); at += 24
         bufs, sizes = [], []
         for _ in range(n):
@@ -454,6 +632,31 @@ def recv_exact(conn: socket.socket, n: int, into: bytearray | None = None) -> by
     if k == 0: raise ConnectionError("client closed")
     got += k
   return buf
+
+
+# TINYGPU_STATS=1: each kind of request's count and time (the server's, inside it), the dispatches submitted, and
+# the time between requests (the client's), said on stderr every 5 seconds: where a program's time goes, the server's
+# Python or the card's work or the client.
+STATS = os.environ.get("TINYGPU_STATS") == "1"
+# TINYGPU_CPROFILE=FILE: the server's Python profiled while it answers (cProfile), written to FILE as a client goes
+CPROFILE = os.environ.get("TINYGPU_CPROFILE")
+NAMES = {1: "hello", 2: "alloc", 3: "free", 4: "write", 5: "read", 6: "program", 7: "submit", 8: "sync"}
+stats = {"since": time.perf_counter(), "idle": 0.0, "dispatches": 0}
+
+
+def counted(cmd: int, took: float, idle: float, dispatches: int):
+  """A request's time added to its kind's (TINYGPU_STATS), and the totals said every 5 seconds."""
+  n, t = stats.get(cmd, (0, 0.0))
+  stats[cmd] = (n + 1, t + took)
+  stats["idle"] += idle
+  stats["dispatches"] += dispatches
+  now = time.perf_counter()
+  if now - stats["since"] < 5: return
+  span = now - stats["since"]
+  kinds = "  ".join(f"{NAMES.get(k, k)} {n} {1e3 * t:.0f} ms" for k, (n, t) in sorted((k, v) for k, v in stats.items() if isinstance(k, int)))
+  print(f"tinygpu-webgpu: {span:.1f} s: {kinds}  dispatches {stats['dispatches']} ({1e6 * stats.get(7, (0, 0.0))[1] / max(1, stats['dispatches']):.1f} us each in submits)  between requests {1e3 * stats['idle']:.0f} ms", file=sys.stderr, flush=True)
+  stats.clear()
+  stats.update({"since": now, "idle": 0.0, "dispatches": 0})
 
 
 # A large write is taken in pieces of this size, each sent on to the card as it comes: the card's copy (tinygrad's, by
@@ -492,10 +695,16 @@ def wait_clients(most: int, timeout: float) -> bool:
 def handle(server: Server, conn: socket.socket, lock: threading.Lock, closing: threading.Event):
   """One client's requests, each run with the card to itself; the buffers it did not free are freed as it goes."""
   owned, piece = set(), None
+  profile = None
+  if CPROFILE:
+    import cProfile
+    profile = cProfile.Profile()
   with CLIENTS: connected[0] += 1
+  answered = time.perf_counter()
   try:
     while True:
       cmd, n = struct.unpack("<IQ", recv_exact(conn, 12))
+      asked = time.perf_counter()
       if cmd == 4 and n > 16 + PIECE:
         # (with the card to itself throughout, as any request: its pieces are not another client's requests' business)
         with lock:
@@ -509,6 +718,7 @@ def handle(server: Server, conn: socket.socket, lock: threading.Lock, closing: t
             out, status = f"{type(e).__name__}: {e}".encode(), 1
             traceback.print_exc()
         conn.sendall(struct.pack("<IQ", status, len(out)) + out)
+        answered = time.perf_counter()
         continue
       payload = recv_exact(conn, n) if n else b""
       if cmd == 9:
@@ -519,13 +729,19 @@ def handle(server: Server, conn: socket.socket, lock: threading.Lock, closing: t
         if closing.is_set(): return
         try:
           if cmd not in Server.COMMANDS: raise RuntimeError(f"unknown command {cmd}")
-          out, status = Server.COMMANDS[cmd](server, payload), 0
+          t = time.perf_counter()
+          if profile: profile.enable()
+          try: out, status = Server.COMMANDS[cmd](server, payload), 0
+          finally:
+            if profile: profile.disable()
+          if STATS: counted(cmd, time.perf_counter() - t, asked - answered, server.dispatched if cmd == 7 else 0)
           if cmd == 2: owned.add(struct.unpack("<Q", out)[0])
           elif cmd == 3: owned.discard(struct.unpack_from("<Q", payload)[0])
         except Exception as e:
           out, status = f"{type(e).__name__}: {e}".encode(), 1
           traceback.print_exc()
       conn.sendall(struct.pack("<IQ", status, len(out)) + out)
+      answered = time.perf_counter()
   except OSError:   # (the client gone: ConnectionError, BrokenPipeError)
     pass
   finally:
@@ -535,6 +751,7 @@ def handle(server: Server, conn: socket.socket, lock: threading.Lock, closing: t
         if not closing.is_set():
           for h in owned: server.free(struct.pack("<Q", h))
           if hasattr(server.card, "report"): server.card.report()
+          if profile: profile.dump_stats(CPROFILE)
     finally:
       with CLIENTS:
         connected[0] -= 1
@@ -563,9 +780,20 @@ def accept(server: Server, sock: socket.socket, lock: threading.Lock, closing: t
     threading.Thread(target=handle, args=(server, conn, lock, closing), daemon=True).start()
 
 
+# The signals that end a process unless it handles them. A holder of the card ended by one of them leaves its firmware
+# up, and the next open resets the card: one such reset (after a SIGUSR1 a server of older code had no handler for)
+# took the card's link down until the enclosure was powered off and on. Each is a normal exit here instead.
+ENDING = [getattr(signal, n) for n in ("SIGTERM", "SIGHUP", "SIGQUIT", "SIGUSR1", "SIGUSR2", "SIGALRM", "SIGVTALRM", "SIGPROF", "SIGXCPU", "SIGXFSZ") if hasattr(signal, n)]
+
+
+def exit_cleanly_on_signals():
+  """Every signal that would end the process without tinygrad's exit made a normal exit (Card's SIGUSR1 replaces its)."""
+  for sig in ENDING: signal.signal(sig, lambda *_: sys.exit(0))
+
+
 def serve(path: str, emulate: bool):
   # (a stop by signal is a normal exit, so tinygrad's own exit releases the card)
-  for sig in (signal.SIGTERM, signal.SIGHUP): signal.signal(sig, lambda *_: sys.exit(0))
+  exit_cleanly_on_signals()
   server = Server(Emulator() if emulate else Card())
   sock = listen(path)
   print(f"tinygpu-webgpu: {server.card.info()['name']} ready on {path}", flush=True)

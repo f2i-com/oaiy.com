@@ -263,6 +263,27 @@ takes 32 queries a workgroup and its fragments straight from memory, so each hea
 it is where a step has most to gain. `OAIY_EGPU_EMULATE=1` in the eGPU's environment has OAIY's launcher hold the
 emulator instead of the card (its tests run the launcher, the pause and the image worker's way in that way).
 
+**A language model's tokens.** Qwen3.8-27B writes 28 tokens a second on the card, where its 16.5 GB of weights at the
+card's 1 TB/s would allow about twice that. `TINYGPU_STATS=1` (each kind of request's count and time, the dispatches
+submitted, the time between requests, every 5 s on stderr) and `TINYGPU_CPROFILE=FILE` (the server's Python profiled)
+say where a token's 35 ms go: about 870 kernels in 7 submissions, each kernel 16.6 us of the server's Python (14 ms),
+and 17 reads that wait for the card (14 ms); about 49 buffers made and freed besides. A kernel's 16.6 us are tinygrad's
+launch: a view of memory made for each word it writes (8 million in a 200-token answer) and its QMD's fields set by
+name. `TINYGPU_FAST=1` launches through `Fast` instead: a launch's arguments and its QMD written in a few copies, its
+fields' places found once from tinygrad's own tables (about 6 us a kernel). Its bytes are tinygrad's:
+`TINYGPU_FAST_CHECK=1` has tinygrad write each launch as well (in a queue never submitted) and compares them before the
+card is given anything, a difference dropping the queue; checked so on the card, OAIY's 98 GPU tests, the adapter's
+and a 200-token answer of the 27B were the same bytes, and `tools/tinygpu/fast_check.py` checks the same with no card
+(a stand-in for tinygrad's NV device, thousands of random launches, chains and releases). It is not yet on by default:
+its gain on the card is still to be measured. Submissions of a token are not byte for byte those of the token before
+(a buffer made afresh each token is bound in some), so they cannot simply be replayed.
+
+A process that holds the card and is ended by a signal it does not handle leaves the card's firmware up, and the next
+open resets the card: on 2026-10-10 a server ended so (a SIGUSR1, which a server of older code had no handler for)
+was followed by a reset that took the card's link down, until the enclosure was powered off and on. The server
+(`ENDING`) and OAIY's launcher now take every such signal as a normal exit, the card released; the server's SIGUSR1
+turns `TINYGPU_FAST_CHECK` on or off.
+
 What could write past a buffer on the card and not on the emulator is now kept from it: a fragment not as
 `wmma` takes it (32-byte aligned, its stride a multiple of 16 bytes; SPIR-V's and Metal's take any) is staged as one
 past its array is, and the server refuses a copy, clear, write, read or binding past its buffer, as wgpu checks them

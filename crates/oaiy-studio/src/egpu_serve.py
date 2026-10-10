@@ -251,6 +251,12 @@ def main():
         # and the lifeline's last resort (os._exit) would leave the card's firmware up.
         import signal
         signal.signal(signal.SIGINT, signal.default_int_handler)
+        # Any other signal that would end this unhandled ends it as the interrupt does: the card released (tinygrad's
+        # exit). One killed by a signal it had no handler for left the firmware up, and the reset at the next open took
+        # the card's link down until the enclosure was powered off and on.
+        for ending in ("SIGTERM", "SIGHUP", "SIGQUIT", "SIGUSR1", "SIGUSR2", "SIGALRM", "SIGVTALRM", "SIGPROF", "SIGXCPU", "SIGXFSZ"):
+            if hasattr(signal, ending):
+                signal.signal(getattr(signal, ending), signal.default_int_handler)
         threading.Thread(target=lifeline, daemon=True).start()
     if "--webgpu" in args:
         return webgpu(args)
