@@ -16,14 +16,16 @@ that faults costs the card its link). No tinygrad is needed for it.
 A request is `<u32 command><u64 length><payload>`; its answer `<u32 status><u64 length><payload>`, status 0 with the
 command's result, else 1 with the error's text. Numbers are little-endian. Commands:
 
-    1 HELLO                                         -> JSON: the card (arch, name, memory)
+    1 HELLO                                         -> JSON: the card (arch, name, memory) and the protocol's version
     2 ALLOC   u64 size                              -> u64 buffer (zeroed)
     3 FREE    u64 buffer
     4 WRITE   u64 buffer, u64 offset, bytes         (after all that was submitted)
     5 READ    u64 buffer, u64 offset, u64 size      -> bytes (after all that was submitted)
-    6 PROGRAM u32 x, u32 y, u32 z, CUDA source       -> u64 program (its workgroup x by y by z)
+    6 PROGRAM u32 x, u32 y, u32 z, u32 n, u32 flags, CUDA source  -> u64 program (its workgroup x by y by z; after
+                                                       its n pointers it takes the scratch where flags' bit 0 says,
+                                                       then n uints, each binding's size)
     7 SUBMIT  ops                                   (queued; in order)
-        u8 1 DISPATCH u64 program, u32 gx, gy, gz, u32 n, n x (u64 buffer, u64 offset)
+        u8 1 DISPATCH u64 program, u32 gx, gy, gz, u32 n, n x (u64 buffer, u64 offset, u64 size)
         u8 2 COPY     u64 source, u64 source offset, u64 destination, u64 destination offset, u64 size
         u8 3 CLEAR    u64 buffer, u64 offset, u64 size
     8 SYNC                                          (until the card has done all that was submitted)
@@ -44,6 +46,8 @@ from concurrent.futures import ThreadPoolExecutor
 CACHE = pathlib.Path.home() / ".cache" / "tinygpu-webgpu"
 EMU = pathlib.Path(__file__).resolve().parent / "emu"
 ALIGN = 256
+PROTOCOL = 3   # the requests as below; a client of another version is told so at HELLO (crates/wgpu-tinygpu's PROTOCOL)
+SCRATCH = 160 * 64 * 1024   # a kernel's scratch, where it takes one (wgsl-cuda's SCRATCH_BYTES: 1 KB a warp)
 
 # the queue's own copies and clears: kernels on the compute queue, so they keep their place among the dispatches. One
 # kernel a translation unit: tinygrad reads a program's registers and stack from the cubin's .nv.info, taking the last
@@ -87,7 +91,7 @@ def compile_cuda(src: str, arch: str) -> bytes:
   """A translation unit's cubin, from the cache or nvcc."""
   from tinygrad.runtime.support.elf import elf_loader
   def build(tmp: pathlib.Path):
-    cu = tmp.with_suffix(".cu")
+    cu = tmp.with_suffix(f".{threading.get_ident()}.cu")
     cu.write_text(src)
     run_compiler(["nvcc", f"-arch={arch}", "-cubin", "-o", str(tmp), str(cu)], "nvcc")
   lib = cached(".cubin", (arch + "\0" + src).encode(), build).read_bytes()
@@ -97,14 +101,14 @@ def compile_cuda(src: str, arch: str) -> bytes:
 
 
 class Program:
-  def __init__(self, dev, lib: bytes, name: str, workgroup: tuple, vals: int = 0):
+  def __init__(self, dev, lib: bytes, name: str, workgroup: tuple, vals: int = 0, scratch: bool = False):
     from tinygrad import dtypes
     from tinygrad.device import TinyELF
     from tinygrad.helpers import Target
     from tinygrad.runtime.ops_nv import NVProgram
     sig = tuple((f"v{i}", i, dtypes.uint32, ()) for i in range(vals))
     self.prg = NVProgram(dev, TinyELF(lib, name, Target(device="NV"), sig))
-    self.workgroup = workgroup
+    self.workgroup, self.scratch = workgroup, scratch
 
   def args(self, bufs, grid, vals=()):
     # CUDA's blockDim and gridDim are the driver's words in constant bank 0, which tinygrad's launches leave 0 (the
@@ -129,6 +133,7 @@ class Card:
     self.dev, self.spec = Device["NV"], BufferSpec()
     self.arch = self.dev.arch
     self.q, self.queued, self.since_sync = None, 0, 0
+    self.scratch = None
     built = {name: Program(self.dev, compile_cuda(src, self.arch), name, (256, 1, 1), 1) for name, src in BUILTINS.items()}
     self.copy4, self.copy1, self.fill4, self.fill1 = built["tg_copy4"], built["tg_copy1"], built["tg_fill4"], built["tg_fill1"]
 
@@ -177,11 +182,13 @@ class Card:
     self.since_sync = 0
     return bytes(out)
 
-  def program(self, workgroup: tuple, src: str):
-    return Program(self.dev, compile_cuda(src, self.arch), "oaiy_main", workgroup)
+  def program(self, workgroup: tuple, src: str, sizes: int, scratch: bool):
+    if scratch and self.scratch is None: self.scratch = self.alloc(SCRATCH)
+    return Program(self.dev, compile_cuda(src, self.arch), "oaiy_main", workgroup, sizes, scratch)
 
-  def dispatch(self, prog: Program, bufs: list, grid: tuple):
-    self.launch(prog, [self.view(b, off, b[1] - off) for b, off in bufs], grid)
+  def dispatch(self, prog: Program, bufs: list, grid: tuple, sizes: list):
+    views = [self.view(b, off, b[1] - off) for b, off in bufs] + ([self.scratch[0]] if prog.scratch else [])
+    self.launch(prog, views, grid, sizes)
 
   def copy(self, src, soff: int, dst, doff: int, size: int):
     s, d = self.view(src, soff, size), self.view(dst, doff, size)
@@ -208,7 +215,7 @@ class Emulator:
   and size): it ends where a page that is not readable begins, so a kernel that reads or writes past a buffer's end
   faults here as it would fault the card (where it costs the card its link). TINYGPU_EMU_TRACE=1 says each dispatch's
   kernel (its file in the cache) on stderr first, so the last said is a fault's."""
-  STACK = 256 << 10   # an invocation's stack
+  STACK = int(os.environ.get("TINYGPU_EMU_STACK_KB", 1024)) << 10   # an invocation's stack (a fragment of a tensor core's is all its matrix here)
   MAX_INVOCATIONS = 1024
 
   def __init__(self):
@@ -238,6 +245,7 @@ class Emulator:
     span = (size + page - 1) // page * page + page
     at = self.map(span)
     self.mprotect(at + span - page, page, 0)   # (PROT_NONE)
+    if self.trace: print(f"emu: buffer 0x{at + span - page - size:016x} to 0x{at + span - page:016x} ({size} bytes)", file=sys.stderr, flush=True)
     return (at + span - page - size, size, at, span)
 
   def free(self, buf):
@@ -249,21 +257,24 @@ class Emulator:
   def read(self, buf, off: int, size: int) -> bytes:
     return ctypes.string_at(buf[0] + off, size)
 
-  def program(self, workgroup: tuple, src: str):
-    header = (EMU / "cuda_emu.h").read_bytes()
+  def program(self, workgroup: tuple, src: str, sizes: int, scratch: bool):
+    header = (EMU / "cuda_emu.h").read_bytes() + (EMU / "mma.h").read_bytes()
     barriers = "__syncthreads()" in src
     def build(tmp: pathlib.Path):
-      cpp = tmp.with_name(tmp.name.split(".")[0] + ".cpp")   # (beside the library, as it will be named)
+      # (the source under this build's own name, then beside the library as it will be named: two builds of one
+      # kernel at once, two servers', must not write one file)
+      cpp = tmp.with_suffix(f".{threading.get_ident()}.cpp")
       cpp.write_text(f"{src}\nEMU_LAUNCHER(oaiy_main, {'true' if barriers else 'false'})\n")
       run_compiler(["clang++", "-std=c++20", "-O2", "-fwrapv", "-shared", "-fPIC", "-w", "-include", str(EMU / "cuda_emu.h"),
                     "-I", str(EMU), str(cpp), "-o", str(tmp)], "clang++")
+      cpp.rename(tmp.with_name(tmp.name.split(".")[0] + ".cpp"))
     path = cached(".dylib", b"cpu\0" + header + b"\0" + src.encode(), build)
     lib = ctypes.CDLL(str(path))
     launch = lib.emu_launch
     launch.restype = None
     launch.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint64,
                        ctypes.c_uint64, ctypes.c_void_p, ctypes.c_size_t]
-    return (lib, launch, workgroup, path.with_suffix(".cpp"))
+    return (lib, launch, workgroup, path.with_suffix(".cpp"), scratch)
 
   def stacks(self) -> int:
     """This thread's room for a workgroup's stacks, each with a guard page under it."""
@@ -277,11 +288,13 @@ class Emulator:
   def run(self, launch, args, grid, first, count):
     launch(args, *grid, first, count, self.stacks(), self.STACK)
 
-  def dispatch(self, prog, bufs: list, grid: tuple):
-    _, launch, workgroup, name = prog
-    if self.trace: print(f"emu: {name} {grid}", file=sys.stderr, flush=True)
+  def dispatch(self, prog, bufs: list, grid: tuple, sizes: list):
+    _, launch, workgroup, name, scratch = prog
+    if self.trace: print(f"emu: {name} {grid} " + " ".join(f"0x{b[0] + off:x}+{b[1] - off}" for b, off in bufs), file=sys.stderr, flush=True)
     if workgroup[0] * workgroup[1] * workgroup[2] > self.MAX_INVOCATIONS: raise RuntimeError(f"a workgroup of {workgroup}")
-    args = (ctypes.c_void_p * max(1, len(bufs)))(*[b[0] + off for b, off in bufs])
+    # (the pointers, the scratch where it takes one (the CPU's kernels stage on their own stacks), then the bindings'
+    # sizes: integers in the same words)
+    args = (ctypes.c_void_p * max(1, 2 * len(bufs) + 1))(*[b[0] + off for b, off in bufs], *([0] if scratch else []), *sizes)
     total = grid[0] * grid[1] * grid[2]
     parts = min(total, self.workers * 4)
     if parts <= 1: return self.run(launch, args, grid, 0, total)
@@ -313,7 +326,7 @@ class Server:
     return self.next_id - 1
 
   def hello(self, _p):
-    return json.dumps(self.card.info()).encode()
+    return json.dumps({**self.card.info(), "protocol": PROTOCOL}).encode()
 
   def alloc(self, p):
     (size,) = struct.unpack_from("<Q", p)
@@ -327,20 +340,27 @@ class Server:
     if b is not None: self.card.free(b)
     return b""
 
+  def within(self, h: int, off: int, size: int, what: str):
+    """The buffer, where off..off + size is in it (wgpu's own checks of a copy, a write, a binding: a range past a
+    buffer is the card's memory past it, and a write there may fault the card)."""
+    b = self.buffers[h]
+    if off + size > b[1]: raise RuntimeError(f"{what}: bytes {off}..{off + size} of a buffer of {b[1]}")
+    return b
+
   def write(self, p):
     h, off = struct.unpack_from("<QQ", p)
     data = memoryview(p)[16:]
-    if len(data): self.card.write(self.buffers[h], off, data)
+    if len(data): self.card.write(self.within(h, off, len(data), "a write"), off, data)
     return b""
 
   def read(self, p):
     h, off, size = struct.unpack_from("<QQQ", p)
-    return self.card.read(self.buffers[h], off, size) if size else b""
+    return self.card.read(self.within(h, off, size, "a read"), off, size) if size else b""
 
   def program(self, p):
-    x, y, z = struct.unpack_from("<III", p)
+    x, y, z, n, flags = struct.unpack_from("<IIIII", p)
     h = self.new_id()
-    self.programs[h] = self.card.program((x, y, z), bytes(p[12:]).decode())
+    self.programs[h] = self.card.program((x, y, z), bytes(p[20:]).decode(), n, bool(flags & 1))
     return struct.pack("<Q", h)
 
   def submit(self, p):
@@ -356,17 +376,18 @@ class Server:
       op = p[at]; at += 1
       if op == 1:
         prog, gx, gy, gz, n = struct.unpack_from("<QIIII", p, at); at += 24
-        bufs = []
+        bufs, sizes = [], []
         for _ in range(n):
-          b, off = struct.unpack_from("<QQ", p, at); at += 16
-          bufs.append((self.buffers[b], off))
-        if gx and gy and gz: self.card.dispatch(self.programs[prog], bufs, (gx, gy, gz))
+          b, off, size = struct.unpack_from("<QQQ", p, at); at += 24
+          bufs.append((self.within(b, off, size, "a binding"), off))
+          sizes.append(min(size, 0xffffffff))
+        if gx and gy and gz: self.card.dispatch(self.programs[prog], bufs, (gx, gy, gz), sizes)
       elif op == 2:
         s, so, d, do, size = struct.unpack_from("<QQQQQ", p, at); at += 40
-        if size: self.card.copy(self.buffers[s], so, self.buffers[d], do, size)
+        if size: self.card.copy(self.within(s, so, size, "a copy's source"), so, self.within(d, do, size, "a copy's destination"), do, size)
       elif op == 3:
         b, off, size = struct.unpack_from("<QQQ", p, at); at += 24
-        if size: self.card.clear(self.buffers[b], off, size)
+        if size: self.card.clear(self.within(b, off, size, "a clear"), off, size)
       else: raise RuntimeError(f"unknown op {op}")
 
   def sync(self, _p):

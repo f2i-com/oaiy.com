@@ -15,10 +15,18 @@
 //! - a buffer is a pointer the kernel takes, and every function that uses one (naga's `global_uses`) takes it too; a
 //!   private variable is the kernel's own, passed the same way; a workgroup variable is `__shared__`, zeroed as the
 //!   kernel starts (WebGPU's default);
-//! - a loop's continuing block runs as the next pass starts (naga's Metal backend's shape: `continue` is C's).
+//! - a loop's continuing block runs as the next pass starts (naga's Metal backend's shape: `continue` is C's);
+//! - an index stays in its array, as WebGPU's robust access has it (naga's `Restrict`): clamped to a runtime-sized
+//!   array's length, which the binding's size gives (the kernel takes each binding's size in bytes after the
+//!   pointers, `gN_n`), and to a fixed array's or a vector's size; `arrayLength` is that length.
 //!
-//! What it does not take, it says (an `Err` naming it): images, samplers, matrices, cooperative matrices, subgroup
-//! operations, overrides, `arrayLength`.
+//! - a cooperative matrix (16 x 16, f16's into f32 or f16 sums) is a fragment of CUDA's `wmma`, on the tensor cores:
+//!   `coopLoad` and `coopLoadT` load column- and row-major memory (an A's or B's layout its fragment's type, so a
+//!   variable of one is not taken; a C's at the load), `coopMultiplyAdd` is `mma_sync`, `coopStore` and `coopStoreT`
+//!   store; a stride counts the pointer's own elements (a `vec4<f16>`'s four halves each), as SPIR-V's does. Such a
+//!   kernel has [`COOP_PRELUDE`] after the prelude.
+//!
+//! What it does not take, it says (an `Err` naming it): images, samplers, matrices, subgroup operations, overrides.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -30,6 +38,9 @@ use naga::{
 
 /// The prelude every kernel is compiled with.
 pub const PRELUDE: &str = include_str!("prelude.cuh");
+
+/// What a kernel with cooperative matrices has besides: CUDA's `wmma`, as WGSL's cooperative ops.
+pub const COOP_PRELUDE: &str = include_str!("coop.cuh");
 
 /// The name of the kernel's function.
 pub const ENTRY: &str = "oaiy_main";
@@ -46,7 +57,8 @@ pub enum BindingKind {
 }
 
 /// One of the kernel's bindings: its group and number, and what it is. The kernel takes one pointer a binding, in
-/// [`Kernel::bindings`]' order: the buffer's address plus the binding's offset.
+/// [`Kernel::bindings`]' order (the buffer's address plus the binding's offset), then each binding's size in bytes as
+/// a `uint`, in the same order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Binding {
     pub group: u32,
@@ -63,7 +75,13 @@ pub struct Kernel {
     pub workgroup_size: [u32; 3],
     /// The bindings, in the order the kernel takes them (by group, then number).
     pub bindings: Vec<Binding>,
+    /// Whether the kernel takes a scratch buffer after the bindings' pointers (a kernel with cooperative matrices:
+    /// a fragment that would reach past its array is staged through its warp's 1 KB of it, 160 x 64 of them).
+    pub scratch: bool,
 }
+
+/// The scratch a kernel with [`Kernel::scratch`] takes, in bytes: 1 KB for each of 64 warps on each of 160 SMs.
+pub const SCRATCH_BYTES: u64 = 160 * 64 * 1024;
 
 /// `wgsl`'s compute entry point (its first, or the one called `entry`) as a CUDA kernel.
 pub fn translate(wgsl: &str, entry: Option<&str>) -> Result<Kernel, String> {
@@ -78,13 +96,16 @@ pub fn translate(wgsl: &str, entry: Option<&str>) -> Result<Kernel, String> {
     if !module.overrides.is_empty() {
         return Err("overrides are not taken".into());
     }
-    Writer { module: &module, info: &info, out: String::new() }.write(index)
+    let coop = module.types.iter().any(|(_, t)| matches!(t.inner, T::CooperativeMatrix { .. }));
+    Writer { module: &module, info: &info, out: String::new(), coop }.write(index)
 }
 
 struct Writer<'a> {
     module: &'a Module,
     info: &'a naga::valid::ModuleInfo,
     out: String,
+    /// The module has cooperative matrices: its functions take the scratch.
+    coop: bool,
 }
 
 /// What a function body is written within.
@@ -109,6 +130,10 @@ impl<'a> Writer<'a> {
         let [wx, wy, wz] = ep.workgroup_size;
         writeln!(self.out, "#define WGSL_WG_X {wx}u\n#define WGSL_WG_Y {wy}u\n#define WGSL_WG_Z {wz}u").unwrap();
         self.out.push_str(PRELUDE);
+        if self.coop {
+            self.out.push('\n');
+            self.out.push_str(COOP_PRELUDE);
+        }
         self.out.push_str("\n// ---- the kernel's types ----\n");
         self.write_types()?;
         // the bindings, by group and number
@@ -160,6 +185,12 @@ impl<'a> Writer<'a> {
             params.push(format!("{} {}", self.global_pointer_type(*h)?, gname(*h)));
             bindings.push(Binding { group: *group, binding: *binding, kind });
         }
+        if self.coop {
+            params.push("float* __restrict__ wgsl_scratch".into());
+        }
+        for (_, _, h) in &bound {
+            params.push(format!("uint {}_n", gname(*h)));
+        }
         writeln!(self.out, "\nextern \"C\" __global__ void __launch_bounds__({}) {ENTRY}({}) {{", x * y * z, params.join(", ")).unwrap();
         // workgroup memory zeroed, then a barrier
         let mut zeroed = false;
@@ -193,7 +224,7 @@ impl<'a> Writer<'a> {
         self.write_locals(&mut ctx, 1)?;
         self.write_block(&mut ctx, &f.body, 1)?;
         self.out.push_str("}\n");
-        Ok(Kernel { source: self.out, workgroup_size: [x, y, z], bindings })
+        Ok(Kernel { source: self.out, workgroup_size: [x, y, z], bindings, scratch: self.coop })
     }
 
     // ---- types ----
@@ -220,8 +251,63 @@ impl<'a> Writer<'a> {
             T::Array { size: ArraySize::Constant(_), .. } => format!("arr_{}", ty.index()),
             T::Array { size: ArraySize::Dynamic, base, .. } => self.type_name(*base)?,
             T::Struct { .. } => format!("st_{}", ty.index()),
+            // (an accumulator's: an A's or B's layout is its load's, part of its type, so only its value is named)
+            T::CooperativeMatrix { columns: naga::CooperativeSize::Sixteen, rows: naga::CooperativeSize::Sixteen, scalar, role: naga::CooperativeRole::C } => {
+                format!("wmma::fragment<wmma::accumulator, 16, 16, 16, {}>", Self::coop_scalar(*scalar)?)
+            }
+            T::CooperativeMatrix { role: naga::CooperativeRole::A | naga::CooperativeRole::B, .. } => {
+                return err("a variable of a cooperative matrix A or B is not taken (its layout is its load's)")
+            }
             other => return err(format!("the type {other:?} is not taken")),
         })
+    }
+
+    /// A value of `ty` that is all zeros (WGSL's zero value).
+    fn zero(&self, ty: Handle<Type>) -> Result<String, String> {
+        let name = self.type_name(ty)?;
+        Ok(if matches!(self.module.types[ty].inner, T::CooperativeMatrix { .. }) { format!("wgsl_coop_zero<{name}>()") } else { format!("{name}{{}}") })
+    }
+
+    /// A cooperative matrix's scalar: f16 or f32 (wmma's 16 x 16 x 16 shapes on the tensor cores).
+    fn coop_scalar(s: Scalar) -> Result<&'static str, String> {
+        match (s.kind, s.width) {
+            (ScalarKind::Float, 2) => Ok("__half"),
+            (ScalarKind::Float, 4) => Ok("float"),
+            _ => err(format!("a cooperative matrix of {:?} {} bytes is not taken", s.kind, s.width)),
+        }
+    }
+
+    /// A cooperative load's or store's memory: the pointer as one to its scalars, and the stride in them (a
+    /// `vec4<f16>`'s four halves an element).
+    /// A cooperative load's or store's memory: the pointer as one to its scalars, the stride in them (a `vec4<f16>`'s
+    /// four halves an element), and the scalars its array has from there (a fragment that would reach past them is
+    /// staged: `coop.cuh`).
+    fn coop_memory(&self, ctx: &Ctx, data: &naga::CooperativeData) -> Result<(String, String, String), String> {
+        let T::Pointer { base, .. } = self.resolve(ctx, data.pointer) else { return err("a cooperative load or store not through a pointer") };
+        let (scalar, lanes) = match &self.module.types[*base].inner {
+            T::Scalar(s) => (*s, 1u32),
+            T::Vector { size, scalar } => (*scalar, *size as u32),
+            other => return err(format!("a cooperative load or store of {other:?}")),
+        };
+        let st = Self::coop_scalar(scalar)?;
+        let p = self.lvalue(ctx, data.pointer)?;
+        let stride = self.expr(ctx, data.stride)?;
+        let scalars = |n: String| if lanes == 1 { n } else { format!("(({n}) * {lanes}u)") };
+        // (the array the pointer is into, and the element it points at)
+        let (array, index) = match &ctx.function.expressions[data.pointer] {
+            E::Access { base, index } => (Some(*base), self.expr(ctx, *index)?),
+            E::AccessIndex { base, index } => (Some(*base), format!("{index}u")),
+            _ => (None, String::new()),
+        };
+        let avail = match array {
+            Some(a) => match self.pointee(ctx, a)? {
+                T::Array { size: ArraySize::Constant(n), .. } => scalars(format!("wgsl_avail({index}, {n}u)")),
+                T::Array { size: ArraySize::Dynamic, .. } => scalars(format!("wgsl_avail({index}, {})", self.runtime_length(ctx, a)?.ok_or("a runtime-sized array of unknown length")?)),
+                _ => "0xffffffffu".into(),
+            },
+            None => "0xffffffffu".into(),
+        };
+        Ok((format!("(({st}*)&({p}))"), scalars(stride), avail))
     }
 
     /// Every array of fixed size and struct, in naga's order (each after what it is made of).
@@ -304,6 +390,12 @@ impl<'a> Writer<'a> {
         }
         for g in self.passed_globals(h) {
             params.push(self.passed_param(g)?);
+            if self.is_buffer(g) {
+                params.push(format!("uint {}_n", gname(g)));
+            }
+        }
+        if self.coop {
+            params.push("float* wgsl_scratch".into());
         }
         Ok(format!("__device__ {ret} f{}({})", h.index(), params.join(", ")))
     }
@@ -317,6 +409,10 @@ impl<'a> Writer<'a> {
             .filter(|(g, v)| !matches!(v.space, AddressSpace::WorkGroup) && !fi[*g].is_empty())
             .map(|(g, _)| g)
             .collect()
+    }
+
+    fn is_buffer(&self, g: Handle<naga::GlobalVariable>) -> bool {
+        matches!(self.module.global_variables[g].space, AddressSpace::Storage { .. } | AddressSpace::Uniform)
     }
 
     fn passed_param(&self, g: Handle<naga::GlobalVariable>) -> Result<String, String> {
@@ -371,7 +467,7 @@ impl<'a> Writer<'a> {
             let ty = self.type_name(l.ty)?;
             let init = match l.init {
                 Some(e) => self.expr(ctx, e)?,
-                None => format!("{ty}{{}}"),
+                None => self.zero(l.ty)?,
             };
             writeln!(self.out, "{}{ty} l{} = {init};", indent(level), h.index()).unwrap();
         }
@@ -490,6 +586,12 @@ impl<'a> Writer<'a> {
                 }
                 for g in self.passed_globals(*function) {
                     args.push(gname(g));
+                    if self.is_buffer(g) {
+                        args.push(format!("{}_n", gname(g)));
+                    }
+                }
+                if self.coop {
+                    args.push("wgsl_scratch".into());
                 }
                 let call = format!("f{}({})", function.index(), args.join(", "));
                 match result {
@@ -534,6 +636,10 @@ impl<'a> Writer<'a> {
                 let p = self.lvalue(ctx, *pointer)?;
                 writeln!(self.out, "{pad}__syncthreads();\n{pad}const auto e{} = {p};\n{pad}__syncthreads();", result.index()).unwrap();
                 ctx.named.insert(*result);
+            }
+            S::CooperativeStore { target, data } => {
+                let (p, stride, avail) = self.coop_memory(ctx, data)?;
+                writeln!(self.out, "{pad}wgsl_coop_store({p}, {}, {stride}, {}, {avail}, wgsl_scratch);", self.expr(ctx, *target)?, data.row_major).unwrap();
             }
             other => return err(format!("the statement {} is not taken", short(other))),
         }
@@ -582,14 +688,34 @@ impl<'a> Writer<'a> {
             E::Access { base, index } => {
                 let b = self.lvalue(ctx, *base)?;
                 let i = self.expr(ctx, *index)?;
-                Ok(format!("{b}{}", self.subscript(self.pointee(ctx, *base)?, &i)?))
+                let len = self.runtime_length(ctx, *base)?;
+                Ok(format!("{b}{}", self.subscript(self.pointee(ctx, *base)?, &i, len.as_deref())?))
             }
             E::AccessIndex { base, index } => {
                 let b = self.lvalue(ctx, *base)?;
-                Ok(format!("{b}{}", self.member(self.pointee(ctx, *base)?, *index)?))
+                let pointee = self.pointee(ctx, *base)?;
+                Ok(match pointee {
+                    T::Array { size: ArraySize::Dynamic, .. } => format!("{b}{}", self.subscript(pointee, &format!("{index}u"), self.runtime_length(ctx, *base)?.as_deref())?),
+                    _ => format!("{b}{}", self.member(pointee, *index)?),
+                })
             }
             other => err(format!("the pointer {} is not taken", short(other))),
         }
+    }
+
+    /// A runtime-sized array's length, where `pointer` points at one: the binding's size past the array's start, in
+    /// its elements. The array is a buffer's whole, or the last member of a buffer's struct.
+    fn runtime_length(&self, ctx: &Ctx, pointer: Handle<naga::Expression>) -> Result<Option<String>, String> {
+        let T::Array { size: ArraySize::Dynamic, stride, .. } = self.pointee(ctx, pointer)? else { return Ok(None) };
+        let (g, start) = match &ctx.function.expressions[pointer] {
+            E::GlobalVariable(g) => (*g, 0),
+            E::AccessIndex { base, index } => match (&ctx.function.expressions[*base], self.pointee(ctx, *base)?) {
+                (E::GlobalVariable(g), T::Struct { members, .. }) => (*g, members[*index as usize].offset),
+                _ => return err("a runtime-sized array not a buffer's own or its struct's last member"),
+            },
+            _ => return err("a runtime-sized array not a buffer's own or its struct's last member"),
+        };
+        Ok(Some(format!("wgsl_length({}_n, {start}u, {stride}u)", gname(g))))
     }
 
     /// The type a pointer expression points at.
@@ -601,12 +727,13 @@ impl<'a> Writer<'a> {
         })
     }
 
-    /// `[i]` into a value of `inner`'s type.
-    fn subscript(&self, inner: &naga::TypeInner, i: &str) -> Result<String, String> {
+    /// `[i]` into a value of `inner`'s type, the index kept in it (a runtime-sized array's to `len`).
+    fn subscript(&self, inner: &naga::TypeInner, i: &str, len: Option<&str>) -> Result<String, String> {
         Ok(match inner {
-            T::Array { size: ArraySize::Dynamic, .. } => format!("[{i}]"),
-            T::Array { .. } => format!(".inner[{i}]"),
-            T::Vector { .. } => format!(".c[{i}]"),
+            T::Array { size: ArraySize::Dynamic, .. } => format!("[wgsl_index({i}, {})]", len.ok_or("a runtime-sized array of unknown length")?),
+            T::Array { size: ArraySize::Constant(n), .. } => format!(".inner[wgsl_index({i}, {n}u)]"),
+            T::Array { .. } => return err("an array sized by an override is not taken"),
+            T::Vector { size, .. } => format!(".c[wgsl_index({i}, {}u)]", *size as u8),
             other => return err(format!("indexing a {other:?} is not taken")),
         })
     }
@@ -623,7 +750,10 @@ impl<'a> Writer<'a> {
     fn member(&self, inner: &naga::TypeInner, n: u32) -> Result<String, String> {
         Ok(match inner {
             T::Struct { .. } => format!(".m{n}"),
-            other => self.subscript(other, &format!("{n}"))?,
+            // (a constant index: naga has checked it against a fixed size)
+            T::Array { size: ArraySize::Constant(_), .. } => format!(".inner[{n}]"),
+            T::Vector { .. } => format!(".c[{n}]"),
+            other => self.subscript(other, &format!("{n}u"), None)?,
         })
     }
 
@@ -632,7 +762,7 @@ impl<'a> Writer<'a> {
         Ok(match ex {
             E::Literal(l) => literal(l)?,
             E::Constant(c) => self.const_expr(self.module.constants[*c].init)?,
-            E::ZeroValue(ty) => format!("{}{{}}", self.type_name(*ty)?),
+            E::ZeroValue(ty) => self.zero(*ty)?,
             E::Compose { ty, components } => {
                 let mut parts = Vec::new();
                 for c in components {
@@ -655,7 +785,7 @@ impl<'a> Writer<'a> {
             E::Access { base, index } => {
                 let b = self.expr(ctx, *base)?;
                 let i = self.expr(ctx, *index)?;
-                format!("{b}{}", self.subscript(self.resolve(ctx, *base), &i)?)
+                format!("{b}{}", self.subscript(self.resolve(ctx, *base), &i, None)?)
             }
             // (a vec3 read where it may be a struct's, 12 bytes: made a vector)
             E::AccessIndex { base, index } => {
@@ -738,7 +868,20 @@ impl<'a> Writer<'a> {
                 }
             }
             E::CallResult(_) | E::AtomicResult { .. } | E::WorkGroupUniformLoadResult { .. } => return err("a result used before its statement"),
-            E::ArrayLength(_) => return err("arrayLength is not taken"),
+            E::ArrayLength(pointer) => self.runtime_length(ctx, *pointer)?.ok_or("arrayLength of what is not a runtime-sized array")?,
+            E::CooperativeLoad { columns: naga::CooperativeSize::Sixteen, rows: naga::CooperativeSize::Sixteen, role, data } => {
+                let (p, stride, avail) = self.coop_memory(ctx, data)?;
+                match role {
+                    naga::CooperativeRole::C => format!("wgsl_coop_load_c({p}, {stride}, {}, {avail}, wgsl_scratch)", data.row_major),
+                    _ => {
+                        let used = if *role == naga::CooperativeRole::A { "wmma::matrix_a" } else { "wmma::matrix_b" };
+                        let layout = if data.row_major { "wmma::row_major" } else { "wmma::col_major" };
+                        format!("wgsl_coop_load<{used}, {layout}>({p}, {stride}, {avail}, wgsl_scratch)")
+                    }
+                }
+            }
+            E::CooperativeLoad { .. } => return err("a cooperative matrix other than 16 x 16 is not taken"),
+            E::CooperativeMultiplyAdd { a, b, c } => format!("wgsl_coop_mma({}, {}, {})", self.expr(ctx, *a)?, self.expr(ctx, *b)?, self.expr(ctx, *c)?),
             other => return err(format!("the expression {} is not taken", short(other))),
         })
     }
@@ -768,7 +911,7 @@ impl<'a> Writer<'a> {
         Ok(match ex {
             E::Literal(l) => literal(l)?,
             E::Constant(c) => self.const_expr(self.module.constants[*c].init)?,
-            E::ZeroValue(ty) => format!("{}{{}}", self.type_name(*ty)?),
+            E::ZeroValue(ty) => self.zero(*ty)?,
             E::Compose { ty, components } => {
                 let mut parts = Vec::new();
                 let mut kinds = Vec::new();
@@ -964,5 +1107,31 @@ mod tests {
         let e = translate(src, None).unwrap_err();
         assert!(e.contains("Handle") || e.contains("Image") || e.contains("not taken"), "{e}");
         assert!(translate("@compute @workgroup_size(1) fn main() {}", Some("nope")).unwrap_err().contains("no entry point called nope"));
+    }
+
+    #[test]
+    fn a_cooperative_matrix_is_a_wmma_fragment_and_a_vec4s_stride_counts_its_halves() {
+        let src = "enable f16;
+            enable wgpu_cooperative_matrix;
+            @group(0) @binding(0) var<storage, read> a: array<vec4<f16>>;
+            @group(0) @binding(1) var<storage, read_write> c: array<f32>;
+            @compute @workgroup_size(32) fn main() {
+                var acc = coop_mat16x16<f32, C>();
+                let z = 0u;
+                let s = 4u;
+                let x = coopLoadT<coop_mat16x16<f16, A>>(&a[z], s);
+                let y = coopLoad<coop_mat16x16<f16, B>>(&a[z], s);
+                acc = coopMultiplyAdd(x, y, acc);
+                coopStore(acc, &c[z], s);
+            }";
+        let k = translate(src, None).unwrap();
+        assert!(k.source.contains(COOP_PRELUDE) && !translate(KERNEL, None).unwrap().source.contains("wmma::"), "only a kernel that has them");
+        assert!(k.scratch && !translate(KERNEL, None).unwrap().scratch);
+        for want in ["wgsl_coop_load<wmma::matrix_a, wmma::row_major>", "wgsl_coop_load<wmma::matrix_b, wmma::col_major>", "* 4u)", "wgsl_coop_mma(", "wgsl_coop_store(((float*)&(g1[wgsl_index(0u, wgsl_length(g1_n, 0u, 4u))]))", "wgsl_coop_zero<wmma::fragment<wmma::accumulator, 16, 16, 16, float>>()", "float* __restrict__ wgsl_scratch, uint g0_n", "((wgsl_avail(0u, wgsl_length(g0_n, 0u, 8u))) * 4u), wgsl_scratch)", "4u, false, wgsl_avail(0u, wgsl_length(g1_n, 0u, 4u)), wgsl_scratch)"] {
+            assert!(k.source.contains(want), "{want} in {}", &k.source[k.source.find("extern \"C\"").unwrap()..]);
+        }
+        // an A's or B's layout is its load's: a variable of one is refused
+        let var = src.replace("let x = coopLoadT", "var x = coopLoadT");
+        assert!(translate(&var, None).unwrap_err().contains("cooperative matrix A or B"));
     }
 }

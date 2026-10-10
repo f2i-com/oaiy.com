@@ -12,7 +12,17 @@ Four parts, each its own:
   module is walked into one `extern "C" __global__` kernel beside a prelude of WGSL's types and built-ins
   (`src/prelude.cuh`): a vector as WGSL lays it out, its operators WGSL's (shifts by the amount modulo the width,
   comparisons a vector of bool), `dot4I8Packed` as `__dp4a`, workgroup memory `__shared__` and zeroed as WebGPU does,
-  every expression named where naga emits it. `wgsl-cuda IN.wgsl OUT.cu` writes one and says its workgroup size and
+  every expression named where naga emits it. An index stays in its array, as WebGPU's robust access has it (naga's
+  `Restrict`: clamped), a runtime-sized array's length from its binding's size, which the kernel takes after its
+  pointers (so `arrayLength` is there too): an index past a buffer's end reads the card's memory past it, and a
+  fault there costs the card its link, where Vulkan and Metal give the kernel a value of the buffer's. WGSL's
+  cooperative matrices (16 x 16, f16's into f32 or f16 sums) are CUDA's `wmma` fragments, on the tensor cores
+  (`src/coop.cuh`, in such a kernel alone): `coopLoadT` and `coopLoad` row- and column-major memory, a stride in the
+  pointer's own elements (a `vec4<f16>`'s four halves each), as SPIR-V's is. Each load and store is told what its
+  array has from the fragment's start: a fragment that fits is read and written in place, and one that would reach
+  past the array (the last rows of a matrix whose buffer is not padded to them) goes through 256 elements of its
+  warp's own in a scratch the server gives such a kernel (1 KB a warp, 64 warps on each of 160 SMs), an element past
+  the array read as 0 and not written. `wgsl-cuda IN.wgsl OUT.cu` writes one and says its workgroup size and
   bindings.
 - **`tools/tinygpu/webgpu_server.py`**: one process that holds the card through tinygrad and does what WebGPU's compute
   needs, over a Unix socket: buffers (zeroed), writes and reads, kernels (CUDA compiled by nvcc, kept by the source's
@@ -54,7 +64,8 @@ OAIY stops it or goes, the launcher's lifeline stops the engine and Python's exi
 `tools/tinygpu/emu/cuda_emu.h` before it) and run there, its workgroups shared out among the cores. CUDA's words are the
 CPU's (`__half` is `_Float16`, atomics the compiler's); a workgroup runs on one thread, each invocation a fiber of its
 own stack, so `__syncthreads()` passes to the next invocation and the workgroup goes on once every one has reached it;
-workgroup memory is the thread's. It needs python3 and clang++ alone (no tinygrad), and it is how a translation is
+workgroup memory is the thread's; a tensor core's fragment (`emu/mma.h`) is its whole matrix, every invocation doing
+its warp's op. It needs python3 and clang++ alone (no tinygrad), and it is how a translation is
 checked before it goes to the card, where a kernel that faults costs the card its link (below):
 
 ```sh
@@ -166,5 +177,23 @@ On the card, its link back up (the same day):
   submission of many (45 us alone, a submission's own cost with it); writes at 1.1 to 1.4 GB/s and reads at 0.95 GB/s,
   over Thunderbolt 3.
 
-The tensor cores are not used (no cooperative matrices: CUDA's `wmma` is where 16 x 16 fragments would go), and each
-dispatch is still a Python call (tinygrad's launch), batched to one doorbell a submission.
+With the tensor cores (the adapter's cooperative matrices, `TINYGPU_NO_COOP` for none):
+
+- `tests/emulator.rs`'s cooperative matrices on the card's own tensor cores: row- and column-major loads and stores,
+  a `vec4<f16>` array's stride, f32 and f16 sums, exact; and every one of OAIY's GPU tests, 98 (36 of their 380
+  kernels on the tensor cores), all 380 compiled by nvcc for sm_89;
+- Qwen3.8-27B reads the 946-token prompt in 0.80 s (2.23 s without: 1,180 tokens a second, not 425), and writes
+  as before, about 28 tokens a second.
+
+Qwen-Image 2.1 (`oaiy-media`, which takes the adapter as the LLM engine does) **faulted the card** on the tensor cores
+(its GGUF's blocks kept quantized, 4.5 GB): an MMU fault, a write where no memory is mapped, found as its transformer
+loaded after the prompt was encoded. Its whole pipeline had run on the emulator without the tensor cores; with them
+(the card's very request, 512 x 512) the emulator encoded the prompt and loaded the transformer without a fault and
+with no fragment past its array (its tensor cores are too slow to go further: each invocation does its warp's whole
+product), so the cause is not known. What could write past a buffer on the card and not on the emulator is now kept from it: a fragment not as
+`wmma` takes it (32-byte aligned, its stride a multiple of 16 bytes; SPIR-V's and Metal's take any) is staged as one
+past its array is, and the server refuses a copy, clear, write, read or binding past its buffer, as wgpu checks them
+(a range far past a buffer's end jumps the emulator's page that cannot be read, and lands in the card's memory past
+it). The server and the adapter say their protocol's version at HELLO (3), and a program of another is refused: an
+older build would send a kernel's header short and the server read its first bytes as the source's. Each dispatch is
+still a Python call (tinygrad's launch), batched to one doorbell a submission.

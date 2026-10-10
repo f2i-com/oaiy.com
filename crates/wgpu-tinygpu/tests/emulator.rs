@@ -180,3 +180,135 @@ fn a_buffer_outlives_its_handle_while_work_holds_it() {
     queue.submit([enc.finish()]);
     assert_eq!(read(&device, &queue, &b, 16), [2, 3, 4, 5]);
 }
+
+/// An integer's f16 bits (exact for the small ones the test uses).
+fn f16_bits(v: i32) -> u16 {
+    if v == 0 {
+        return 0;
+    }
+    let (sign, mut m) = (if v < 0 { 0x8000u16 } else { 0 }, v.unsigned_abs());
+    let mut e = 0u16;
+    while m >= 2 {
+        m >>= 1;
+        e += 1;
+    }
+    let frac = ((v.unsigned_abs() << (10 - e)) & 0x3ff) as u16;
+    sign | ((e + 15) << 10) | frac
+}
+
+#[test]
+fn the_tensor_cores_multiply_as_wgsl_says() {
+    let Some((_emu, device, queue)) = emulator() else { return };
+    if !device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+        return;
+    }
+    let a = |m: i32, k: i32| (m + 2 * k) % 7 - 3;
+    let b = |k: i32, n: i32| (3 * k + n) % 5 - 2;
+    let c = |m: i32, n: i32| m - n;
+    // A row-major in vec4<f16>s, B column-major in f16s (two to a word), C row-major in f32s
+    let pack = |v: Vec<u16>| -> Vec<u32> { v.chunks(2).map(|p| p[0] as u32 | (p[1] as u32) << 16).collect() };
+    let a_mem = pack((0..256).map(|i| f16_bits(a(i / 16, i % 16))).collect());
+    let b_mem = pack((0..256).map(|i| f16_bits(b(i % 16, i / 16))).collect());
+    let c_mem: Vec<u32> = (0..256).map(|i| (c(i / 16, i % 16) as f32).to_bits()).collect();
+    let out = run(&device, &queue, "
+        enable f16;
+        enable wgpu_cooperative_matrix;
+        @group(0) @binding(0) var<storage, read_write> a: array<vec4<f16>>;
+        @group(0) @binding(1) var<storage, read_write> b: array<f16>;
+        @group(0) @binding(2) var<storage, read_write> c: array<f32>;
+        @group(0) @binding(3) var<storage, read_write> rows: array<f32>;
+        @group(0) @binding(4) var<storage, read_write> cols: array<f32>;
+        @group(0) @binding(5) var<storage, read_write> halves: array<f16>;
+        var<workgroup> t: array<vec4<f16>, 64>;
+        @compute @workgroup_size(32) fn main(@builtin(local_invocation_index) li: u32) {
+            for (var i = li; i < 64u; i += 32u) { t[i] = a[i]; }
+            workgroupBarrier();
+            let z = 0u;
+            let s4 = 4u;
+            let s16 = 16u;
+            let x = coopLoadT<coop_mat16x16<f16, A>>(&t[z], s4);
+            let y = coopLoad<coop_mat16x16<f16, B>>(&b[z], s16);
+            let c0 = coopLoadT<coop_mat16x16<f32, C>>(&c[z], s16);
+            let d = coopMultiplyAdd(x, y, c0);
+            coopStoreT(d, &rows[z], s16);
+            coopStore(d, &cols[z], s16);
+            var h = coop_mat16x16<f16, C>();
+            h = coopMultiplyAdd(x, y, h);
+            coopStoreT(h, &halves[z], s16);
+        }", &[a_mem, b_mem, c_mem, vec![0; 256], vec![0; 256], vec![0; 128]], 1);
+    let want = |m: i32, n: i32| (0..16).map(|k| a(m, k) * b(k, n)).sum::<i32>();
+    for m in 0..16 {
+        for n in 0..16 {
+            let i = (m * 16 + n) as usize;
+            assert_eq!(f32::from_bits(out[3][i]), (want(m, n) + c(m, n)) as f32, "row-major D[{m}][{n}]");
+            assert_eq!(f32::from_bits(out[4][(n * 16 + m) as usize]), (want(m, n) + c(m, n)) as f32, "column-major D[{m}][{n}]");
+            let half = (out[5][i / 2] >> (16 * (i % 2))) as u16;
+            assert_eq!(half, f16_bits(want(m, n)), "f16 sums H[{m}][{n}]");
+        }
+    }
+}
+
+#[test]
+fn a_fragment_past_its_array_reads_zeros_there_and_writes_nothing_there() {
+    let Some((_emu, device, queue)) = emulator() else { return };
+    if !device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+        return;
+    }
+    // A whole; B's binding 200 halves of a buffer of 256 whose last 56 hold 1.0 (outside the binding: read as 0); D's
+    // binding 200 floats of a buffer of 256 whose last 56 hold 9.0 (outside it: not written)
+    let pack = |v: Vec<u16>| -> Vec<u32> { v.chunks(2).map(|p| p[0] as u32 | (p[1] as u32) << 16).collect() };
+    let a = |m: i32, k: i32| (m * 3 + k) % 5 - 2;
+    let b = |k: i32, n: i32| if k * 16 + n < 200 { (k + 2 * n) % 7 - 3 } else { 0 };
+    let a_mem = pack((0..256).map(|i| f16_bits(a(i / 16, i % 16))).collect());
+    let b_mem = pack((0..256).map(|i| if i < 200 { f16_bits(b(i / 16, i % 16)) } else { f16_bits(1) }).collect());
+    let d_mem: Vec<u32> = (0..256).map(|i| if i < 200 { 0 } else { 9f32.to_bits() }).collect();
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: None,
+        source: wgpu::ShaderSource::Wgsl("
+            enable f16;
+            enable wgpu_cooperative_matrix;
+            @group(0) @binding(0) var<storage, read_write> a: array<f16>;
+            @group(0) @binding(1) var<storage, read_write> b: array<f16>;
+            @group(0) @binding(2) var<storage, read_write> d: array<f32>;
+            @compute @workgroup_size(32) fn main() {
+                let z = 0u;
+                let s = 16u;
+                let x = coopLoadT<coop_mat16x16<f16, A>>(&a[z], s);
+                let y = coopLoadT<coop_mat16x16<f16, B>>(&b[z], s);
+                var acc = coop_mat16x16<f32, C>();
+                acc = coopMultiplyAdd(x, y, acc);
+                coopStoreT(acc, &d[z], s);
+            }".into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: None, module: &module, entry_point: Some("main"), compilation_options: Default::default(), cache: None });
+    let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
+    let make = |words: &[u32]| device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(words), usage });
+    let (ab, bb, db) = (make(&a_mem), make(&b_mem), make(&d_mem));
+    fn part(buf: &wgpu::Buffer, bytes: u64) -> wgpu::BindingResource<'_> {
+        wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: buf, offset: 0, size: wgpu::BufferSize::new(bytes) })
+    }
+    let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: ab.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: part(&bb, 400) },
+            wgpu::BindGroupEntry { binding: 2, resource: part(&db, 800) },
+        ],
+    });
+    let mut enc = device.create_command_encoder(&Default::default());
+    {
+        let mut pass = enc.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &group, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    queue.submit([enc.finish()]);
+    let d = read(&device, &queue, &db, 1024);
+    for i in 0..200 {
+        let (m, n) = (i / 16, i % 16);
+        let want = (0..16).map(|k| a(m, k) * b(k, n)).sum::<i32>();
+        assert_eq!(f32::from_bits(d[i as usize]), want as f32, "D[{m}][{n}] (B's elements past its binding read as 0)");
+    }
+    assert!(d[200..].iter().all(|&v| f32::from_bits(v) == 9.0), "nothing written past D's binding");
+}

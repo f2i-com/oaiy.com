@@ -33,6 +33,10 @@ const PROGRAM: u32 = 6;
 const SUBMIT: u32 = 7;
 const SYNC: u32 = 8;
 
+/// The server's requests as this adapter makes them (tools/tinygpu/webgpu_server.py's PROTOCOL): a server of another
+/// version would read a kernel or a dispatch other than it was sent, so it is refused at HELLO.
+const PROTOCOL: u32 = 3;
+
 /// The server's socket, one request at a time.
 #[derive(Debug)]
 struct Conn {
@@ -87,6 +91,10 @@ pub fn adapter(socket: &Path) -> Result<wgpu::Adapter, String> {
         let end = rest.find([',', '}']).unwrap_or(rest.len());
         Some(rest[..end].trim().trim_matches('"').to_string())
     };
+    let protocol = field("protocol").and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+    if protocol != PROTOCOL {
+        return Err(format!("tinygpu: the server at {} speaks version {protocol} of its requests, this program {PROTOCOL}: run the webgpu_server.py of this program's version", socket.display()));
+    }
     let arch = field("arch").unwrap_or_default();
     let memory = field("memory").and_then(|m| m.parse().ok()).unwrap_or(24u64 << 30);
     let name = field("name").unwrap_or_else(|| format!("NVIDIA {arch} via tinygrad (TinyGPU)"));
@@ -153,7 +161,7 @@ impl AdapterInterface for TgAdapter {
         false
     }
     fn features(&self) -> wgpu::Features {
-        wgpu::Features::SHADER_F16
+        features()
     }
     fn limits(&self) -> wgpu::Limits {
         limits(self.memory)
@@ -171,7 +179,22 @@ impl AdapterInterface for TgAdapter {
         wgpu::PresentationTimestamp::INVALID_TIMESTAMP
     }
     fn cooperative_matrix_properties(&self) -> Vec<wgpu::wgt::CooperativeMatrixProperties> {
-        Vec::new()
+        // (wmma's 16 x 16 x 16 on the tensor cores: f16's into f32 sums and into f16 ones; `wgsl-cuda`'s fragments)
+        if !features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+            return Vec::new();
+        }
+        [wgpu::CooperativeScalarType::F32, wgpu::CooperativeScalarType::F16]
+            .map(|sums| wgpu::wgt::CooperativeMatrixProperties { m_size: 16, n_size: 16, k_size: 16, ab_type: wgpu::CooperativeScalarType::F16, cr_type: sums, saturating_accumulation: false })
+            .to_vec()
+    }
+}
+
+/// f16 in kernels, and the tensor cores' cooperative matrices (`TINYGPU_NO_COOP` set: none).
+fn features() -> wgpu::Features {
+    if std::env::var_os("TINYGPU_NO_COOP").is_some() {
+        wgpu::Features::SHADER_F16
+    } else {
+        wgpu::Features::SHADER_F16 | wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX
     }
 }
 
@@ -207,10 +230,11 @@ impl BindGroupLayoutInterface for TgBindGroupLayout {}
 struct TgPipelineLayout;
 impl PipelineLayoutInterface for TgPipelineLayout {}
 
-/// A bind group: each binding's buffer and offset, and which take a dynamic offset (in the layout's order).
+/// A bind group: each binding's buffer, offset and size (None: to the buffer's end), and which take a dynamic offset
+/// (in the layout's order).
 #[derive(Debug)]
 struct TgBindGroup {
-    entries: HashMap<u32, (Arc<Allocation>, u64)>,
+    entries: HashMap<u32, (Arc<Allocation>, u64, Option<u64>)>,
     dynamic: Vec<u32>,
 }
 impl BindGroupInterface for TgBindGroup {}
@@ -230,7 +254,7 @@ impl ComputePipelineInterface for TgComputePipeline {
 
 impl DeviceInterface for TgDevice {
     fn features(&self) -> wgpu::Features {
-        wgpu::Features::SHADER_F16
+        features()
     }
     fn limits(&self) -> wgpu::Limits {
         limits(self.memory)
@@ -264,7 +288,7 @@ impl DeviceInterface for TgDevice {
             match &e.resource {
                 wgpu::BindingResource::Buffer(b) => {
                     let buf = b.buffer.as_custom::<TgBuffer>().expect("tinygpu: a buffer of this adapter's");
-                    entries.insert(e.binding, (Arc::clone(&buf.mem), b.offset));
+                    entries.insert(e.binding, (Arc::clone(&buf.mem), b.offset, b.size.map(|s| s.get())));
                 }
                 _ => unsupported("bindings other than buffers"),
             }
@@ -288,6 +312,10 @@ impl DeviceInterface for TgDevice {
         for d in kernel.workgroup_size {
             payload.extend(d.to_le_bytes());
         }
+        // (after its pointers the kernel takes the server's scratch where it has cooperative matrices, then each
+        // binding's size: its indexes are kept in its arrays by them)
+        payload.extend((kernel.bindings.len() as u32).to_le_bytes());
+        payload.extend((kernel.scratch as u32).to_le_bytes());
         payload.extend(kernel.source.as_bytes());
         let program = u64_of(&self.conn.call(PROGRAM, &payload).unwrap_or_else(|e| panic!("{}: {e}", desc.label.unwrap_or("a kernel"))));
         let bindings = kernel.bindings.iter().map(|b| (b.group, b.binding)).collect();
@@ -299,7 +327,7 @@ impl DeviceInterface for TgDevice {
     fn create_buffer(&self, desc: &wgpu::BufferDescriptor<'_>) -> DispatchBuffer {
         let id = u64_of(&self.conn.must(ALLOC, &desc.size.max(4).to_le_bytes()));
         let mapped = desc.mapped_at_creation.then(|| Mapping { start: 0, data: vec![0; desc.size as usize], write: true });
-        let mem = Arc::new(Allocation { conn: Arc::clone(&self.conn), id });
+        let mem = Arc::new(Allocation { conn: Arc::clone(&self.conn), id, size: desc.size });
         DispatchBuffer::custom(TgBuffer { mem, size: desc.size, state: Arc::new(Mutex::new(mapped)) })
     }
     fn create_texture(&self, _desc: &wgpu::TextureDescriptor<'_>) -> DispatchTexture {
@@ -371,6 +399,7 @@ struct Mapping {
 struct Allocation {
     conn: Arc<Conn>,
     id: u64,
+    size: u64,
 }
 
 impl Drop for Allocation {
@@ -543,7 +572,7 @@ impl CommandEncoderInterface for TgEncoder {
 /// A bind group as set: its bindings' buffers and offsets, the dynamic offsets applied.
 #[derive(Debug, Clone, Default)]
 struct BoundGroup {
-    entries: HashMap<u32, (Arc<Allocation>, u64)>,
+    entries: HashMap<u32, (Arc<Allocation>, u64, Option<u64>)>,
 }
 
 #[derive(Debug)]
@@ -597,12 +626,13 @@ impl ComputePassInterface for TgComputePass {
             ops.bytes.extend(v.to_le_bytes());
         }
         for (group, binding) in bindings {
-            let (mem, offset) = self.groups[*group as usize]
+            let (mem, offset, size) = self.groups[*group as usize]
                 .as_ref()
                 .and_then(|g| g.entries.get(binding))
                 .unwrap_or_else(|| panic!("tinygpu: a dispatch with nothing bound at group {group}, binding {binding}"));
             ops.bytes.extend(mem.id.to_le_bytes());
             ops.bytes.extend(offset.to_le_bytes());
+            ops.bytes.extend(size.unwrap_or(mem.size.saturating_sub(*offset)).to_le_bytes());
             ops.keep.push(Arc::clone(mem));
         }
     }

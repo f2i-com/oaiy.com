@@ -294,6 +294,15 @@ WGSL_VEC3(wgsl_clamp) WGSL_VEC3(wgsl_fma) WGSL_VEC3(wgsl_mix) WGSL_VEC3(wgsl_smo
 #undef WGSL_VEC3
 template <typename T, int N> __device__ __forceinline__ vec<T, N> wgsl_mix(const vec<T, N>& a, const vec<T, N>& b, T t) { return vmap2<T>(a, b, [t](T x, T y) { return wgsl_mix(x, y, t); }); }
 
+// an index kept in its array (WebGPU's robust access, as naga's Restrict policy: the last element for one past it,
+// a negative one included), and a runtime-sized array's length from its binding's size in bytes
+__device__ __forceinline__ uint wgsl_index(uint i, uint len) { return min(i, len == 0u ? 0u : len - 1u); }
+__device__ __forceinline__ uint wgsl_index(int i, uint len) { return wgsl_index(uint(i), len); }
+__device__ __forceinline__ uint wgsl_length(uint bytes, uint start, uint stride) { return bytes > start ? (bytes - start) / stride : 0u; }
+// an array's elements from index i on (none past its end)
+__device__ __forceinline__ uint wgsl_avail(uint i, uint len) { return i < len ? len - i : 0u; }
+__device__ __forceinline__ uint wgsl_avail(int i, uint len) { return wgsl_avail(uint(i), len); }
+
 // the invocation's own index in its workgroup, as WGSL counts it. The workgroup's size is the kernel's constants
 // (WGSL_WG_X, _Y, _Z, defined before this prelude): a runtime need not fill CUDA's blockDim, which tinygrad's launches
 // leave as 0 (its own kernels never read it)

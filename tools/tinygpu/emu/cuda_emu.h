@@ -137,7 +137,31 @@ asm(".text\n.p2align 4\n" EMU_LOCAL(emu_switch) EMU_SYM(emu_switch) ":\n"
 #error "cuda_emu.h: fibers for arm64 and x86-64"
 #endif
 
+#include <signal.h>
+#include <unistd.h>
+
 namespace emu {
+
+// with TINYGPU_EMU_TRACE=1, a fault's address on stderr (to set beside the server's buffers' ranges), then the fault
+inline void on_fault(int sig, siginfo_t* info, void*) {
+    char line[64] = "emu: fault at 0x";
+    int n = 16;
+    uintptr_t a = (uintptr_t)info->si_addr;
+    for (int i = 60; i >= 0; i -= 4) line[n++] = "0123456789abcdef"[(a >> i) & 15];
+    line[n++] = '\n';
+    (void)!write(2, line, n);
+    signal(sig, SIG_DFL);
+}
+__attribute__((constructor)) inline void watch_faults() {
+    const char* t = getenv("TINYGPU_EMU_TRACE");
+    if (!t || t[0] != '1') return;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = on_fault;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigaction(SIGSEGV, &sa, nullptr);
+    sigaction(SIGBUS, &sa, nullptr);
+}
 
 typedef void (*Call)(void** args);
 
@@ -169,7 +193,12 @@ inline void* new_fiber(char* top) {
     return f;
 }
 
-template <typename... P, size_t... I> inline void call_with(void (*f)(P...), void** a, std::index_sequence<I...>) { f((P)a[I]...); }
+// an argument as the kernel takes it: a pointer, or an integer (a binding's size) in the same word
+template <typename P> inline P argument(void* a) {
+    if constexpr (std::is_pointer_v<P>) return (P)a;
+    else return (P)(uintptr_t)a;
+}
+template <typename... P, size_t... I> inline void call_with(void (*f)(P...), void** a, std::index_sequence<I...>) { f(argument<P>(a[I])...); }
 template <typename... P> inline void call(void (*f)(P...), void** a) { call_with(f, a, std::index_sequence_for<P...>{}); }
 
 // the workgroups first .. first + count of the grid, in turn on this thread; `stacks` is room for a stack of

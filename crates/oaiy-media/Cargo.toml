@@ -27,3 +27,8 @@ ggml-quants = { path = "../ggml-quants", optional = true }
 [features]
 default = ["webgpu"]
 webgpu = ["dep:ggml-rs", "dep:ggml-rs-wgpu", "dep:ggml-quants"]
+
+# On a Mac its WebGPU also takes the TinyGPU adapter (a card in a Thunderbolt enclosure, through tinygrad), where
+# OAIY_WEBGPU_ADAPTER names it (docs/TINYGPU.md), as the LLM engine's does.
+[target.'cfg(target_os = "macos")'.dependencies]
+ggml-rs-wgpu = { path = "../ggml-rs-wgpu", optional = true, features = ["tinygpu"] }
