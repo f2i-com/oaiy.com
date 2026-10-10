@@ -1364,6 +1364,18 @@ pub fn run() {
                     handle.emit(crate::control::NAVIGATE_EVENT, payload).map_err(|e| e.to_string())
                 }));
             }
+            // OAIY_START_VIEW=engines (or flows, agent, ...): the window opens that section once it is up. For a
+            // picture of a section on a system nobody is sitting at (the Mac build takes one of the Engines and Flows
+            // sections, whose pages are webviews of their own laid over the window): nothing in the app sets it.
+            if let Ok(view) = std::env::var("OAIY_START_VIEW") {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    use tauri::Emitter as _;
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                    crate::tray::show_main(&handle);
+                    let _ = handle.emit(crate::control::NAVIGATE_EVENT, serde_json::json!({ "view": view.trim() }));
+                });
+            }
             // A caller asking for the owner, and a message left, reach them with a native
             // notification (and, for a call, the window brought up).
             if !isolated {
@@ -1377,6 +1389,8 @@ pub fn run() {
                 if let Ok(resources) = app.path().resource_dir() {
                     crate::engines::set_bundled(resources.join("resources").join("engines"));
                 }
+                // The folder the window calls the models' is where the engines keep what they download, too.
+                crate::engines::set_models_dir(resolve_models_dir(app.handle(), &data_dir));
                 let data_dir = data_dir.clone();
                 std::thread::spawn(move || {
                     if let Err(e) = crate::engines::start(&data_dir) {

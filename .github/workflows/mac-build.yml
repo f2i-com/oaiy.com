@@ -273,6 +273,34 @@ jobs:
           find "$apps/OAIY.app/Contents" -type f -perm +111 | head -40
           node platform/desktop/scripts/smoke-desktop.mjs "$apps/OAIY.app/Contents/MacOS/oaiy-desktop"
 
+      # Pictures of the sections whose pages are webviews of their own laid over the window (Engines, Flows, the
+      # Agent): where such a page lands in the window is a thing to look at, and nobody sits at this Mac. The app
+      # is started in a home folder of the step's own and told which section to open (OAIY_START_VIEW).
+      - name: Pictures of the sections that are pages of their own
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: |
+          mkdir -p screens
+          app="$RUNNER_TEMP/Applications/OAIY.app/Contents/MacOS/oaiy-desktop"
+          for view in engines flows agent; do
+            home="$RUNNER_TEMP/home-$view"; mkdir -p "$home"
+            HOME="$home" OAIY_START_VIEW="$view" "$app" > "screens/$view.log" 2>&1 &
+            pid=$!
+            sleep 45
+            screencapture -x "screens/$view.png" || echo "no picture of $view"
+            kill "$pid" 2> /dev/null || true
+            sleep 5
+          done
+          ls -la screens
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ !cancelled() }}
+        with:
+          name: mac-screens
+          path: screens/
+          if-no-files-found: warn
+          retention-days: 14
+
   # ---------------------------------------------------------------- sign
   # The image the job above made, signed with the Developer ID and notarised. Every program inside the app is
   # signed first (the engine and the headless server are programs of their own, and Apple's notary refuses an app

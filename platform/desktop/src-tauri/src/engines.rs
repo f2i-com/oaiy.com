@@ -29,6 +29,16 @@ pub fn set_bundled(dir: PathBuf) {
     let _ = BUNDLED.set(dir);
 }
 
+static MODELS_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// The desktop's models folder: the one its "Model files" lists and "models downloaded to" opens. The engines kept
+/// what they downloaded in a folder of their own beside their configuration (`<data>/engines/models`), so a person
+/// who downloaded a model in the setup wizard opened the models folder and did not find it. An install whose
+/// engines have downloaded nothing yet keeps their downloads here (`oaiy_studio::use_downloads_dir`).
+pub fn set_models_dir(dir: PathBuf) {
+    let _ = MODELS_DIR.set(dir);
+}
+
 /// How the desktop treats the engines (see the module docs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -129,6 +139,13 @@ fn start_with(data_dir: &Path, m: Mode) -> Result<String, String> {
     if let Some(programs) = programs_dir() {
         if oaiy_studio::use_programs_from(&config, &programs)? {
             log::info!("engines: the programs are in {}", programs.display());
+        }
+    }
+    if let Some(models) = MODELS_DIR.get() {
+        match oaiy_studio::use_downloads_dir(&config, models) {
+            Ok(true) => log::info!("engines: what they download is kept in {}", models.display()),
+            Ok(false) => {}
+            Err(e) => log::warn!("engines: where their downloads go was not set: {e}"),
         }
     }
     let args = oaiy_studio::Args { config: config.clone(), open: Some("none".into()), ui_port: None, port: None, start_llm: false };

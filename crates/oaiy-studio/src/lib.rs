@@ -459,6 +459,27 @@ pub fn use_programs_from(config_path: &std::path::Path, dir: &std::path::Path) -
     Ok(changed)
 }
 
+/// For a host with a models folder of its own (OAIY Desktop: the folder its window lists and opens): `downloads.dir`
+/// in the configuration at `config_path` set to `dir`, where the configuration names none and nothing has been
+/// downloaded into the default folder yet (`models` beside the configuration). A folder the person chose stays
+/// theirs, and an install that already has downloads keeps finding them where they are: the catalog tells what is
+/// installed by looking in the downloads folder. Returns whether anything changed.
+pub fn use_downloads_dir(config_path: &std::path::Path, dir: &std::path::Path) -> Result<bool, String> {
+    let mut cfg = config::load(config_path)?;
+    let mut downloads = cfg.get("downloads").cloned().unwrap_or(Json::Obj(Vec::new()));
+    if !str_or(&downloads, "dir", "").trim().is_empty() {
+        return Ok(false);
+    }
+    let root = config_path.parent().unwrap_or(std::path::Path::new("."));
+    if std::fs::read_dir(root.join("models")).is_ok_and(|mut entries| entries.next().is_some()) {
+        return Ok(false);
+    }
+    util::set(&mut downloads, "dir", Json::str(dir.to_string_lossy()));
+    util::set(&mut cfg, "downloads", downloads);
+    config::save(config_path, &cfg)?;
+    Ok(true)
+}
+
 fn running_at(args: &Args) -> Option<String> {
     let cfg = effective_config(args).ok()?;
     let ui = cfg.get("ui")?;
@@ -647,6 +668,32 @@ mod tests {
         // A program that is not in the folder (the WebGPU server) keeps its name; a second call changes nothing.
         assert_eq!(cfg.get("llm").and_then(|l| l.get("server_webgpu")).and_then(Json::as_str), Some("oaiy-llm-server-webgpu"));
         assert!(!use_programs_from(&path, &bin).unwrap());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_hosts_models_folder_takes_the_downloads_of_an_install_that_has_none() {
+        let base = std::env::temp_dir().join(format!("oaiy-downloads-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (conf_dir, models) = (base.join("engines"), base.join("models"));
+        std::fs::create_dir_all(&conf_dir).unwrap();
+        let path = conf_dir.join(config::FILE_NAME);
+        let named = |path: &std::path::Path| str_or(config::load(path).unwrap().get("downloads").unwrap(), "dir", "").to_string();
+        // A new install: the host's folder is where downloads go, and a second call changes nothing.
+        assert!(use_downloads_dir(&path, &models).unwrap());
+        assert_eq!(std::path::PathBuf::from(named(&path)), models);
+        assert!(!use_downloads_dir(&path, &base.join("other")).unwrap(), "a folder that is named stays");
+        assert_eq!(std::path::PathBuf::from(named(&path)), models);
+        // An install with something in the engines' own folder keeps it there: the catalog looks for it in that folder.
+        let old = base.join("old");
+        std::fs::create_dir_all(old.join("models").join("Qwen3.5-9B-GGUF")).unwrap();
+        let old_path = old.join(config::FILE_NAME);
+        assert!(!use_downloads_dir(&old_path, &models).unwrap());
+        assert_eq!(named(&old_path), "");
+        // An empty folder of its own is not a download.
+        let empty = base.join("empty");
+        std::fs::create_dir_all(empty.join("models")).unwrap();
+        assert!(use_downloads_dir(&empty.join(config::FILE_NAME), &models).unwrap());
         let _ = std::fs::remove_dir_all(&base);
     }
 
