@@ -136,6 +136,19 @@ impl Recorder<'_> {
         if window.is_some() || rows < 16 || n_kv == 0 || n_h % n_kv != 0 || !self.gpu().coop16() {
             return false;
         }
+        // (OAIY_ATTENTION_KERNEL=rows: a full attention's queries 64 a workgroup, each subgroup's 16 rows its own)
+        if full && matches!(head_dim, 64 | 128) && rows_kernel() {
+            let (qs, row) = (n_h * head_dim, 2 * n_kv * head_dim);
+            assert!(kv.len >= past * row && q.len >= rows * qs && out.len >= rows.div_ceil(64) * 64 * qs, "chain: a full attention's buffers");
+            let (q16, kv16) = self.attention_f16(q, kv, rows, past, qs, row, Some((n_kv, head_dim)));
+            let words = [n_h as u32, n_kv as u32, past as u32, rows as u32, past as u32, scale.to_bits(), 0, 0];
+            let name = if head_dim == 64 { "chain-attention-coop-rows-64" } else { "chain-attention-coop-rows-128" };
+            let pipeline = self.gpu().named_pipeline(name, || attention_coop_rows(head_dim));
+            self.dispatch_kept(&pipeline, buffer(&kv16), buffer(&q16), buffer(out), &words, (n_h as u32, rows.div_ceil(64) as u32, 1));
+            self.att16 = Some((q16, kv16));
+            self.weigh(4.0 * rows as f64 * past as f64 * (n_h * head_dim) as f64);
+            return true;
+        }
         // (a full attention's `past` its positions, whatever its queries)
         let kv_len = if full { past } else { past + rows };
         let (qs, row) = (n_h * head_dim, 2 * n_kv * head_dim);
@@ -169,8 +182,8 @@ impl Recorder<'_> {
     /// attention, each padded to 32 (the copies one pair a recording, grown as it needs: each attention's converted
     /// as it runs; put back in `att16` once used).
     pub(super) fn attention_f16(&mut self, q: &DeviceVec, kv: &DeviceVec, rows: usize, kv_len: usize, qs: usize, row: usize, tiled: Option<(usize, usize)>) -> (DeviceVec, DeviceVec) {
-        // (the keys to a block of the wide kernel's: 128)
-        let (rp, kp) = (rows.div_ceil(32) * 32, kv_len.div_ceil(128) * 128);
+        // (the keys to a block of the wide kernel's: 128; the queries to the rows kernel's workgroup: 64)
+        let (rp, kp) = (rows.div_ceil(64) * 64, kv_len.div_ceil(128) * 128);
         let (q16, kv16) = match self.att16.take() {
             Some((a, b)) if a.len >= rp * qs / 2 && b.len >= kp * row / 2 => (a, b),
             _ => (self.scratch(rp * qs / 2), self.scratch(kp * row / 2)),
@@ -263,4 +276,10 @@ impl Recorder<'_> {
         self.att16 = Some((q16, kv16));
         true
     }
+}
+
+/// Whether a full attention takes [`attention_coop_rows`]'s kernel (OAIY_ATTENTION_KERNEL=rows).
+pub(crate) fn rows_kernel() -> bool {
+    static ROWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ROWS.get_or_init(|| std::env::var("OAIY_ATTENTION_KERNEL").is_ok_and(|v| v == "rows"))
 }

@@ -462,6 +462,160 @@ pub(in crate::chain) fn attention_coop_one(hd: usize, full: bool) -> String {
         .replace("STORES\n", &stores)
 }
 
+/// A diffusion's attention (every query over every position) on the tensor cores, its queries 64 a workgroup, each of
+/// its 4 subgroups their 16 rows alone (`attention_coop_rows`'s kernel before its head's width is put in): a subgroup's
+/// queries' fragments loaded once and kept, each block of 64 keys staged (its keys, then its values, one run of the
+/// cache's tiled copy, [`crate::shaders::KV_F16_TILED`]) for the 4 subgroups to read, each subgroup's scores, weights and
+/// sums its own. [`ATTENTION_COOP_ONE`] reads a head's keys and values once a 32 queries, each subgroup's fragments
+/// straight from memory, and every query's fragments again for each block; this, once a 64, from the workgroup's
+/// memory. Its weights' reference is [`ATTENTION_COOP_ONE`]'s (a query's first block's largest score; one more than 8
+/// past it the new one, the sums so far scaled down to it through the output). Heads 64 or 128 wide.
+pub(in crate::chain) const ATTENTION_COOP_ROWS: &str = r#"enable f16;
+enable wgpu_cooperative_matrix;
+struct Params { n_h: u32, n_kv: u32, past: u32, rows: u32, kv_len: u32, scale: u32, _pad0: u32, _pad1: u32, }
+@group(0) @binding(0) var<storage, read> kv16: array<vec4<f16>>;
+@group(0) @binding(1) var<storage, read> q16: array<f16>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> p: Params;
+
+const HD: u32 = HEAD_DIMu;
+// a head's fragments across its width
+const F: u32 = HD / 16u;
+// a block's 64 keys staged (then its values in their place): 4 runs of 16 positions, `F` fragments of 64 vec4s each
+var<workgroup> kv_sh: array<vec4<f16>, STAGED>;
+// each subgroup's scores (16 queries by 64 keys) and weights (as f16), 16 vec4s a query, 256 a subgroup
+var<workgroup> s_sh: array<vec4<f32>, 1024>;
+var<workgroup> p_sh: array<vec4<f16>, 1024>;
+// each thread's largest score of the block (then its sum), and whether some query's reference moves at this block
+var<workgroup> m_sh: array<f32, 128>;
+var<workgroup> moved: u32;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let h = wg.x;
+    let q0 = wg.y * 64u;
+    let sg = li / 32u;
+    let lane = li % 32u;
+    let kh = h / (p.n_h / p.n_kv);
+    let qs = p.n_h * HD;
+    let scale = bitcast<f32>(p.scale);
+    // the cache's 16-position blocks a KV head has (its positions padded to 128), and where the values begin (vec4s)
+    let nb = ((p.kv_len + 127u) / 128u) * 8u;
+    let voff = p.n_kv * nb * F * 64u;
+    // the thread's query of its subgroup's 16 (two threads a query), its half of a block's keys, its place in the
+    // scores and in the output's row
+    let tr = lane / 2u;
+    let half = lane % 2u;
+    let sb = sg * 256u + tr * 16u + half * 8u;
+    let yb = (q0 + sg * 16u + tr) * qs + h * HD + half * (HD / 2u);
+    let blocks = (p.kv_len + 63u) / 64u;
+    let none = vec4<f32>(-3.4e38);
+DECLARE_Q
+DECLARE_O
+    // the query's reference (none yet) and the thread's keys' weights' sum against it
+    var c = -3.4e38;
+    var l = 0.0;
+    for (var kb = 0u; kb < blocks; kb++) {
+        let kbase = (kh * nb + kb * 4u) * F * 64u;
+        for (var i = li; i < STAGEDu; i += 128u) { kv_sh[i] = kv16[kbase + i]; }
+        workgroupBarrier();
+SCORES
+        workgroupBarrier();
+        // the block's values in the keys' place, as the scores become weights
+        for (var i = li; i < STAGEDu; i += 128u) { kv_sh[i] = kv16[voff + kbase + i]; }
+LOAD_S
+        let tm = max(max(bm.x, bm.y), max(bm.z, bm.w));
+        m_sh[li] = tm;
+        if (c > -1.0e38 && tm > c + 8.0) { moved = 1u; }
+        let go = workgroupUniformLoad(&moved);
+        let bq = max(m_sh[li], m_sh[li ^ 1u]);
+        var factor = 1.0;
+        if (bq > -1.0e38) {
+            if (c < -1.0e38) {
+                c = bq;
+            } else if (bq > c + 8.0) {
+                factor = exp(c - bq);
+                c = bq;
+            }
+        }
+        l *= factor;
+        if (go != 0u) {
+STORES
+            storageBarrier();
+            workgroupBarrier();
+            if (factor != 1.0) {
+                for (var d = 0u; d < HD / 2u; d++) { y[yb + d] = y[yb + d] * factor; }
+            }
+            if (li == 0u) { moved = 0u; }
+            storageBarrier();
+            workgroupBarrier();
+RELOADS
+        }
+        let on = select(0.0, 1.0, c > -1.0e38);
+        var add = vec4<f32>(0.0);
+WEIGHTS
+        l += add.x + add.y + add.z + add.w;
+        workgroupBarrier();
+VALUES
+        workgroupBarrier();
+    }
+    // the query's weights' sum (its two threads'), and its row over it
+    m_sh[li] = l;
+    workgroupBarrier();
+    let inv = 1.0 / max(m_sh[li] + m_sh[li ^ 1u], 1.0e-30);
+STORES
+    storageBarrier();
+    workgroupBarrier();
+    for (var d = 0u; d < HD / 2u; d++) { y[yb + d] = y[yb + d] * inv; }
+}
+"#;
+
+/// [`ATTENTION_COOP_ROWS`] for a head `hd` wide (64 or 128).
+pub(in crate::chain) fn attention_coop_rows(hd: usize) -> String {
+    assert!(hd == 64 || hd == 128, "the rows kernel takes heads 64 or 128 wide");
+    let f = hd / 16;
+    let declare_q: String = (0..f)
+        .map(|d| format!("    let qi{d} = (q0 + sg * 16u) * qs + h * HD + {o}u;\n    let qf{d} = coopLoadT<coop_mat16x16<f16, A>>(&q16[qi{d}], qs);\n", o = 16 * d))
+        .collect();
+    let declare_o: String = (0..f).map(|d| format!("    var o{d} = coop_mat16x16<f32, C>();\n")).collect();
+    let mut scores = String::new();
+    for j in 0..4 {
+        scores += &format!("        var s{j} = coop_mat16x16<f32, C>();\n");
+        for d in 0..f {
+            scores += &format!("        {{\n            let at = {i}u * 64u;\n            let s4 = 4u;\n            let kf = coopLoad<coop_mat16x16<f16, B>>(&kv_sh[at], s4);\n            s{j} = coopMultiplyAdd(qf{d}, kf, s{j});\n        }}\n", i = j * f + d);
+        }
+        scores += &format!("        {{\n            let at = sg * 256u + {o}u;\n            let s16 = 16u;\n            coopStoreT(s{j}, &s_sh[at], s16);\n        }}\n", o = 4 * j);
+    }
+    let load: String = (0..8)
+        .map(|j| format!("        let k{j} = vec4<u32>(kb * 64u + half * 32u + {o}u) + vec4<u32>(0u, 1u, 2u, 3u);\n        let v{j} = select(none, s_sh[sb + {j}u] * scale, k{j} < vec4<u32>(p.kv_len));\n", o = 4 * j))
+        .chain(std::iter::once(format!("        let bm = {};\n", (1..8).fold("v0".to_string(), |m, j| format!("max({m}, v{j})")))))
+        .collect();
+    let weights: String = (0..8).map(|j| format!("        let w{j} = vec4<f16>(exp(v{j} - vec4<f32>(c)) * on);\n        p_sh[sb + {j}u] = w{j};\n        add += vec4<f32>(w{j});\n")).collect();
+    let mut values = String::new();
+    for j in 0..4 {
+        values += &format!("        {{\n            let pa = sg * 256u + {o}u;\n            let s16 = 16u;\n            let pf = coopLoadT<coop_mat16x16<f16, A>>(&p_sh[pa], s16);\n", o = 4 * j);
+        for d in 0..f {
+            values += &format!("            {{\n                let at = {i}u * 64u;\n                let s4 = 4u;\n                let vf = coopLoadT<coop_mat16x16<f16, B>>(&kv_sh[at], s4);\n                o{d} = coopMultiplyAdd(pf, vf, o{d});\n            }}\n", i = j * f + d);
+        }
+        values += "        }\n";
+    }
+    let place = |d: usize| format!("(q0 + sg * 16u) * qs + h * HD + {}u", 16 * d);
+    let stores: String = (0..f).map(|d| format!("    {{\n        let io = {};\n        coopStoreT(o{d}, &y[io], qs);\n    }}\n", place(d))).collect();
+    let reloads: String = (0..f).map(|d| format!("    {{\n        let io = {};\n        o{d} = coopLoadT<coop_mat16x16<f32, C>>(&y[io], qs);\n    }}\n", place(d))).collect();
+    let staged = 4 * f * 64;
+    ATTENTION_COOP_ROWS
+        .replace("HEAD_DIM", &hd.to_string())
+        .replace("STAGED", &staged.to_string())
+        .replace("DECLARE_Q\n", &declare_q)
+        .replace("DECLARE_O\n", &declare_o)
+        .replace("SCORES\n", &scores)
+        .replace("LOAD_S\n", &load)
+        .replace("WEIGHTS\n", &weights)
+        .replace("VALUES\n", &values)
+        .replace("RELOADS\n", &reloads)
+        .replace("STORES\n", &stores)
+}
+
 /// [`attention_coop`] with no causal mask: every query over all `kv_len` positions.
 pub(in crate::chain) fn attention_coop_full(hd: usize) -> String {
     let causal = "    let qpos = p.past + q0 + tr;\n    // the blocks the last query sees\n    let hi = min(p.kv_len, p.past + q0 + 32u);\n";

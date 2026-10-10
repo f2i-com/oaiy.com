@@ -263,7 +263,13 @@ card as the next arrives, and the adapter sends a write's bytes without copying 
 steps are 49% the quantized matmul (2.4 ms a call, about 118 TFLOPS: 70% of the card's f16 with f32 sums) and 33% the
 attention (OAIY's one pass, 10.3 ms a layer for 4,096 queries over 4,160 positions: about 27 TFLOPS). The attention
 takes 32 queries a workgroup and its fragments straight from memory, so each head's keys and values are read 128 times;
-it is where a step has most to gain. `OAIY_EGPU_EMULATE=1` in the eGPU's environment has OAIY's launcher hold the
+it is where a step has most to gain. `OAIY_ATTENTION_KERNEL=rows` takes a full attention (heads 64 or 128 wide) through
+`attention_coop_rows` instead: 64 queries a workgroup, each subgroup's 16 rows its own (their fragments loaded once and
+kept, their scores, weights and sums the subgroup's), each block of 64 keys staged in the workgroup's memory (its keys,
+then its values: a run of the cache's tiled copy) for the four subgroups, the one pass's reference as before. It is the
+f32 kernel's within f16's rounding on the emulator and on the card, its reference moved too. On the card a Turbo step
+is 0.946 s with it, 0.995 s without (13.0 s a picture, from 13.4), the pictures alike: OAIY's kept image worker on
+the card takes it; elsewhere (Vulkan) it is still to be tried, and is not the default. `OAIY_EGPU_EMULATE=1` in the eGPU's environment has OAIY's launcher hold the
 emulator instead of the card (its tests run the launcher, the pause and the image worker's way in that way).
 
 **A language model's tokens.** Qwen3.8-27B writes 28 tokens a second on the card, where its 16.5 GB of weights at the
@@ -285,6 +291,18 @@ The adapter keeps the buffers a program lets go (up to 256 MB of them, each 64 M
 none) for the next buffer of their size: the dozens a token makes and lets go were each two round trips to the server
 and a launch of a clear there. A buffer from the pool is cleared before anything else reaches the server (WebGPU's
 begin as zeros): at the head of the next submission, or in one of its own before a write or a read.
+
+**The faults, found.** A write to the card's memory faulted (an MMU fault, a REGION_VIOLATION, at a page's start)
+whenever the card's memory was all but full: a language model loaded after pictures (their freed buffers still in
+tinygrad's cache: 23.2 GB in all) three times at the same place, a picture after a language model once, and Qwen-Image
+with its f16 transformer the first time. tinygrad keeps the last 64 MB of the card's memory out of its allocator, but
+lays the GSP firmware out below that (`GspFwWprMeta`: its 129 MB heap, its image and boot code, down to
+`gspFwRsvdStart`, some 180 MB), a region the card protects: a buffer given pages there faults at its first write. The
+server takes the firmware's region (at least the top 512 MB) out of the allocator as the card opens
+(`reserve_firmware_memory`); a full card then raises out of memory as it should, tinygrad's cache of freed buffers is
+let go, and the allocation is made again. Its buffers, programs and the card's local memory can be traced
+(`TINYGPU_TRACE_ALLOC=FILE`: a fault's address against the buffers there were), and the card's local memory is grown
+with the work in flight waited for, its new buffer made before the old is let go.
 
 A process that holds the card and is ended by a signal it does not handle leaves the card's firmware up, and the next
 open resets the card: on 2026-10-10 a server ended so (a SIGUSR1, which a server of older code had no handler for)

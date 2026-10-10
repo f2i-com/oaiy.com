@@ -352,3 +352,19 @@ fn a_buffer_from_the_pool_begins_as_zeros_and_keeps_what_is_written_into_it() {
         @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) { v[id.x] = v[id.x] + 1u; }", &[vec![5u32; 256]], 4);
     assert!(out[0].iter().all(|&v| v == 6));
 }
+
+/// The server's fast launches (`Fast` in tools/tinygpu/webgpu_server.py) are tinygrad's own bytes: thousands of random
+/// launches, chains and releases written both ways with no card (tools/tinygpu/fast_check.py). Skipped where there is
+/// no Python with tinygrad (TINYGRAD_PYTHON, else ~/tinygrad/.venv's).
+#[test]
+fn the_servers_fast_launches_are_tinygrads_bytes() {
+    let python = std::env::var_os("TINYGRAD_PYTHON").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join("tinygrad/.venv/bin/python"));
+    if !python.is_file() {
+        eprintln!("skipping: no Python with tinygrad at {}", python.display());
+        return;
+    }
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/tinygpu/fast_check.py");
+    let out = Command::new(&python).arg(&script).arg("2000").output().expect("python");
+    let said = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success() && said.contains("the same bytes as tinygrad's"), "{said}");
+}

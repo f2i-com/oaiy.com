@@ -241,6 +241,8 @@ class Card:
     from tinygrad.device import BufferSpec
     self.dev, self.spec = Device["NV"], BufferSpec()
     self.arch = self.dev.arch
+    self.reserve_firmware_memory()
+    self.local_memory()
     self.q, self.queued, self.since_sync = None, 0, 0
     self.scratch = None
     self.profiled: dict = {}   # (TINYGPU_PROFILE: a kernel's calls, its time, its last grid, its workgroup)
@@ -257,6 +259,84 @@ class Card:
         self.check = not self.check
         print(f"tinygpu-webgpu: fast launches {'checked' if self.check else 'not checked'}", file=sys.stderr, flush=True)
       signal.signal(signal.SIGUSR1, toggle)
+
+  # The least of the card's memory kept from buffers at its top (the GSP firmware's, with room to spare)
+  FIRMWARE_RESERVE = 512 << 20
+
+  def reserve_firmware_memory(self):
+    """The card's memory where the GSP firmware lives kept from tinygrad's allocator. tinygrad keeps the last 64 MB of
+    the card's memory out of it, but lays the firmware out below that (tinygrad's GspFwWprMeta: its heap, 129 MB, its
+    image, its boot code, from the top down to gspFwRsvdStart): with the card's memory all but full, a buffer is given
+    pages there, and the first write to them faults the card (a REGION_VIOLATION: the firmware's region is protected).
+    On 2026-10-10 a language model loaded after pictures (the pictures' buffers in tinygrad's cache, 23.2 GB in all)
+    faulted so three times at the same place, and a picture after a language model once. The range from the
+    firmware's start (or FIRMWARE_RESERVE below the top, where that is lower) is taken out of the allocator's free
+    space once, as the card opens, before any buffer can be there."""
+    impl = getattr(self.dev.iface, "dev_impl", None)
+    mm = getattr(impl, "mm", None)
+    if mm is None or not hasattr(mm, "pa_allocator"): return   # (a card the kernel's driver manages)
+    pa, top = mm.pa_allocator, impl.vram_size
+    start = top - self.FIRMWARE_RESERVE
+    try:
+      from tinygrad.runtime.autogen import nv as nvs
+      meta = nvs.GspFwWprMeta.from_buffer_copy(bytes(impl.gsp.wpr_meta[:ctypes.sizeof(nvs.GspFwWprMeta)]))
+      start = min(start, meta.gspFwRsvdStart)
+    except Exception as e:
+      print(f"tinygpu-webgpu: the firmware's layout not read ({type(e).__name__}: {e}); the top {self.FIRMWARE_RESERVE >> 20} MB kept", file=sys.stderr, flush=True)
+    start -= start % (2 << 20)
+    lo, hi = start - pa.base, pa.size
+    if lo >= hi: return
+    # the free block that holds [lo, hi), cut to it and taken
+    for at, (size, _nxt, _prev, free) in list(pa.blocks.items()):
+      if free and at <= lo and lo + (hi - lo) <= at + size: break
+    else:
+      raise RuntimeError(f"the card's memory from {start:#x} is already in use: the firmware's region cannot be kept from buffers")
+    if at < lo:
+      pa._split_block(at, size, lo - at)
+      at, size = lo, pa.blocks[lo][0]
+    if size > hi - lo: pa._split_block(at, size, hi - lo)
+    pa._remove_block(at, hi - lo)
+    print(f"tinygpu-webgpu: the card's memory from {start:#x} to its top ({(top - start) >> 20} MB: the firmware's) kept from buffers", file=sys.stderr, flush=True)
+
+  def local_memory(self):
+    """The card's local memory (a thread's spills and stack) grown as tinygrad's NVDevice._ensure_has_local_memory does,
+    but safely: the work in flight, which spills into the old buffer, waited for first; the new buffer made before the
+    old is let go, and none given to the card that it was not made for. tinygrad's sets the new size a TPC first, and
+    where the larger buffer cannot be had (the card's memory full: another program's models loaded) keeps the old one
+    and still gives the card the new size: threads then spill past its end, a write to memory that is no one's. Two
+    faults on 2026-10-10, each as a second program's models went to a card the first had filled, were writes at a page's
+    start. Each growth, and each emptying of tinygrad's cache of freed buffers, is said on stderr."""
+    import tinygrad.runtime.ops_nv as nv
+    from tinygrad.helpers import round_up
+    dev = self.dev
+
+    def ensure(required: int):
+      if dev.slm_per_thread >= required: return
+      slm = round_up(required, 32)
+      per_tpc = round_up(round_up(slm * 32, 0x200) * dev.max_warps_per_sm * dev.num_sm_per_tpc, 0x8000)
+      size = round_up(per_tpc * dev.num_tpc_per_gpc * dev.num_gpcs, 0x20000)
+      dev.synchronize()
+      try: buf = dev.allocator.alloc(size)
+      except MemoryError as e: raise RuntimeError(f"the card has no room for a kernel's local memory ({size >> 20} MB): {e}") from e
+      old = dev.shader_local_mem
+      nv.NVComputeQueue().wait(dev.timeline_signal, dev.timeline_value - 1).setup(local_mem=buf.va_addr, local_mem_tpc_bytes=per_tpc) \
+                         .signal(dev.timeline_signal, dev.next_timeline()).submit(dev)
+      dev.synchronize()
+      dev.shader_local_mem, dev.slm_per_thread = buf, slm
+      if old is not None: dev.allocator.free(old, old.size)
+      print(f"tinygpu-webgpu: local memory {slm} bytes a thread, {size >> 20} MB at {buf.va_addr:#x}..{buf.va_addr + size:#x}", file=sys.stderr, flush=True)
+
+    dev._ensure_has_local_memory = ensure
+    allocator = dev.allocator
+    if hasattr(allocator, "free_cache"):
+      emptied = allocator.free_cache
+
+      def free_cache(*args, **kwargs):
+        n = sum(len(v) for v in getattr(allocator, "cache", {}).values())
+        print(f"tinygpu-webgpu: the card's memory full: tinygrad's {n} cached buffers let go", file=sys.stderr, flush=True)
+        return emptied(*args, **kwargs)
+
+      allocator.free_cache = free_cache
 
   def begin(self):
     if self.q is None:
@@ -283,7 +363,9 @@ class Card:
         # (the queue let go, never submitted: what differs from tinygrad's must not reach the card)
         self.q, self.queued, self.fast.last = None, 0, None
         raise
-    self.queued, self.since_sync = self.queued + 1, self.since_sync + 1
+    # (a checked launch takes two slots of the arguments' ring, its own and tinygrad's: counted so, or the ring would
+    # wrap onto launches the card has yet to run)
+    self.queued, self.since_sync = self.queued + 1, self.since_sync + (2 if self.check else 1)
     if not inside: self.end()
     elif self.queued >= self.BATCH:
       self.end()
@@ -538,8 +620,13 @@ class Emulator:
 # ---- the protocol ----
 
 class Server:
+  # TINYGPU_TRACE_ALLOC=FILE: each buffer made (its id, its place on the card, its size) and let go, and each program
+  # made, a line in FILE: a fault's address against the buffers there were
+  TRACE = os.environ.get("TINYGPU_TRACE_ALLOC")
+
   def __init__(self, card):
     self.card = card
+    self.trace = open(self.TRACE, "a", buffering=1) if self.TRACE else None
     self.buffers: dict = {}
     self.programs: dict = {}
     self.next_id = 1
@@ -556,12 +643,18 @@ class Server:
     (size,) = struct.unpack_from("<Q", p)
     h = self.new_id()
     self.buffers[h] = self.card.alloc(max(ALIGN, (size + ALIGN - 1) // ALIGN * ALIGN))
+    if self.trace:
+      b = self.buffers[h][0]
+      va = getattr(b, "va_addr", b) if not isinstance(b, int) else b
+      self.trace.write(f"alloc {h} {va:#x}..{va + self.buffers[h][1]:#x} {size}\n")
     return struct.pack("<Q", h)
 
   def free(self, p):
     (h,) = struct.unpack_from("<Q", p)
     b = self.buffers.pop(h, None)
-    if b is not None: self.card.free(b)
+    if b is not None:
+      if self.trace: self.trace.write(f"free {h}\n")
+      self.card.free(b)
     return b""
 
   def within(self, h: int, off: int, size: int, what: str):
@@ -585,6 +678,7 @@ class Server:
     x, y, z, n, flags = struct.unpack_from("<IIIII", p)
     h = self.new_id()
     self.programs[h] = self.card.program((x, y, z), bytes(p[20:]).decode(), n, bool(flags & 1))
+    if self.trace: self.trace.write(f"program {h} {getattr(self.programs[h], 'label', '')}\n")
     return struct.pack("<Q", h)
 
   def submit(self, p):

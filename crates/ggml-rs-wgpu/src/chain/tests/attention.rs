@@ -468,44 +468,55 @@ fn rope_store_and_attention_case(cap: usize, past: usize) {
 fn full_attention_is_the_hosts() {
     let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
     let mut r = rng(91);
-    let (n_h, hd, scale) = (4usize, 128usize, 1.0 / (128f32).sqrt());
-    // (queries over a prefix and themselves, and over fewer positions than they are: a video's over a text's)
-    for (rows, kv_len) in [(70usize, 93usize), (5, 14), (70, 23)] {
-        let q: Vec<f32> = (0..rows * n_h * hd).map(|_| r()).collect();
-        let kv: Vec<f32> = (0..kv_len * 2 * n_h * hd).map(|_| r()).collect();
-        let row = 2 * n_h * hd;
-        let mut want = vec![0f64; rows * n_h * hd];
-        for s in 0..rows {
-            for h in 0..n_h {
-                let qv = &q[(s * n_h + h) * hd..(s * n_h + h + 1) * hd];
-                let scores: Vec<f64> = (0..kv_len).map(|t| (0..hd).map(|d| qv[d] as f64 * kv[t * row + h * hd + d] as f64).sum::<f64>() * scale as f64).collect();
-                let m = scores.iter().cloned().fold(f64::MIN, f64::max);
-                let e: Vec<f64> = scores.iter().map(|v| (v - m).exp()).collect();
-                let l: f64 = e.iter().sum();
-                for d in 0..hd {
-                    want[(s * n_h + h) * hd + d] = (0..kv_len).map(|t| e[t] * kv[t * row + n_h * hd + h * hd + d] as f64).sum::<f64>() / l;
+    for hd in [128usize, 64] {
+        let (n_h, scale) = (4usize, 1.0 / (hd as f32).sqrt());
+        // (queries over a prefix and themselves, and over fewer positions than they are: a video's over a text's; and with
+        // keys late in the cache made long, a score far past a query's largest before it: the one-pass kernels' reference
+        // moved and their sums scaled down, f16 keeping so large a score to a hundredth)
+        for (rows, kv_len, planted) in [(70usize, 93usize, false), (5, 14, false), (70, 23, false), (70, 150, true)] {
+            let q: Vec<f32> = (0..rows * n_h * hd).map(|_| r()).collect();
+            let mut kv: Vec<f32> = (0..kv_len * 2 * n_h * hd).map(|_| r()).collect();
+            let row = 2 * n_h * hd;
+            if planted {
+                for at in [kv_len / 2 + 7, kv_len - 9] {
+                    for v in &mut kv[at * row..at * row + n_h * hd] {
+                        *v *= 36.0;
+                    }
                 }
             }
-        }
-        let (qd, kvd) = (b.vec(q.len()), b.vec(kv.len()));
-        DeviceChain::upload(&b, &qd, &q);
-        DeviceChain::upload(&b, &kvd, &kv);
-        for coop in [true, false] {
-            if coop && (rows < 16 || !b.gpu.coop16()) {
-                continue;
+            let mut want = vec![0f64; rows * n_h * hd];
+            for s in 0..rows {
+                for h in 0..n_h {
+                    let qv = &q[(s * n_h + h) * hd..(s * n_h + h + 1) * hd];
+                    let scores: Vec<f64> = (0..kv_len).map(|t| (0..hd).map(|d| qv[d] as f64 * kv[t * row + h * hd + d] as f64).sum::<f64>() * scale as f64).collect();
+                    let m = scores.iter().cloned().fold(f64::MIN, f64::max);
+                    let e: Vec<f64> = scores.iter().map(|v| (v - m).exp()).collect();
+                    let l: f64 = e.iter().sum();
+                    for d in 0..hd {
+                        want[(s * n_h + h) * hd + d] = (0..kv_len).map(|t| e[t] * kv[t * row + n_h * hd + h * hd + d] as f64).sum::<f64>() / l;
+                    }
+                }
             }
-            let out = b.vec(b.attention_rows_out_len(rows.div_ceil(32) * 32, n_h, hd, kv_len));
-            let mut rec = Recorder::new(&b);
-            if coop {
-                assert!(rec.attention_rows_coop_masked(&qd, &kvd, &out, rows, n_h, n_h, hd, kv_len, None, scale, true));
-            } else {
-                rec.attention_rows_f32_masked(&qd, &kvd, &out, rows, n_h, n_h, hd, kv_len, None, scale, true);
-            }
-            rec.read_range(&out, 0, rows * n_h * hd);
-            let got = Box::new(rec).finish().pop().unwrap();
-            let tol = if coop { 2e-3 } else { 1e-5 };
-            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-                assert!((*g as f64 - w).abs() <= tol, "{} {rows} queries over {kv_len} [{i}]: {g} against {w}", if coop { "tensor cores" } else { "f32" });
+            let (qd, kvd) = (b.vec(q.len()), b.vec(kv.len()));
+            DeviceChain::upload(&b, &qd, &q);
+            DeviceChain::upload(&b, &kvd, &kv);
+            for coop in [true, false] {
+                if coop && (rows < 16 || !b.gpu.coop16()) {
+                    continue;
+                }
+                let out = b.vec(b.attention_rows_full_out_len(rows, n_h, hd, kv_len).max(b.attention_rows_out_len(rows.div_ceil(32) * 32, n_h, hd, kv_len)));
+                let mut rec = Recorder::new(&b);
+                if coop {
+                    assert!(rec.attention_rows_coop_masked(&qd, &kvd, &out, rows, n_h, n_h, hd, kv_len, None, scale, true));
+                } else {
+                    rec.attention_rows_f32_masked(&qd, &kvd, &out, rows, n_h, n_h, hd, kv_len, None, scale, true);
+                }
+                rec.read_range(&out, 0, rows * n_h * hd);
+                let got = Box::new(rec).finish().pop().unwrap();
+                let tol = if planted && coop { 2e-2 } else if coop { 2e-3 } else { 1e-5 };
+                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert!((*g as f64 - w).abs() <= tol, "{} {rows} queries over {kv_len} [{i}]: {g} against {w}", if coop { "tensor cores" } else { "f32" });
+                }
             }
         }
     }

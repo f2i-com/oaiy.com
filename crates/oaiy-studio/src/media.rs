@@ -1475,6 +1475,11 @@ impl Media {
         if slot.is_none() {
             let mut command = Command::new(&program);
             command.arg("--serve").env("OAIY_WEBGPU_ADAPTER", format!("tinygpu:{card}"));
+            // (the full attention's rows kernel: a picture's steps 5% faster on the card, its answers the f32 kernel's
+            // there; elsewhere it is still to be tried, docs/TINYGPU.md)
+            if std::env::var_os("OAIY_ATTENTION_KERNEL").is_none() {
+                command.env("OAIY_ATTENTION_KERNEL", "rows");
+            }
             command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
             let mut child = command.spawn().map_err(|e| format!("could not start {}: {e}", program.display()))?;
             let (tx, said) = std::sync::mpsc::channel();
