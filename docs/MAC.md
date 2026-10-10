@@ -29,9 +29,18 @@ a run with a green last step is an app that started on a Mac and found its own f
 **Installing it.** Download the artifact from the run's page (a zip: the `.dmg` is inside),
 open the `.dmg`, drag **OAIY** to **Applications**.
 
-**Opening it the first time.** The app is signed, but by nobody: there is no Apple
-Developer ID behind it, so Apple has not checked it (it is not notarised), and macOS will
-not open a downloaded app like that on a double-click. Either:
+**Signed and notarised, where the repository has a Developer ID.** With the variable
+`MAC_SIGNING` set to `on`, the workflow's job `sign` signs the app and every program in it
+with the Developer ID, has Apple notarise the image and staples the ticket on. It waits for
+the repository's owner to approve it on the run's page (its certificate and notary key are
+in the environment `mac-signing`, which nothing else may use), and uploads the image as the
+artifact `oaiy-macos-arm64-signed`. That image opens like any app: macOS says "Notarized
+Developer ID" of it and of the app inside (run 38021513866, 10 October 2026, which also ran
+a flow in the signed app). The rest of this part is for an image that is not signed so.
+
+**Opening an unsigned one the first time.** The build's own image is signed, but by
+nobody: there is no Apple Developer ID behind it, so Apple has not checked it (it is not
+notarised), and macOS will not open a downloaded app like that on a double-click. Either:
 
 - open it once, and when macOS refuses, go to **System Settings**, **Privacy & Security**,
   and press **Open Anyway** beside OAIY's name (before macOS 15: right-click the app,
