@@ -420,6 +420,14 @@ pub fn set_llm_server(config_path: &std::path::Path, value: &str) -> Result<(), 
 /// with each engine program it names bare (`oaiy-llm-server`, `oaiy-media`)
 /// pointed at `dir` when it is there and not beside the configuration.
 /// Returns whether anything changed.
+///
+/// A program named by a path is the owner's choice and is left alone, but for
+/// one case: the path leads to no program any more and `dir` has a program of
+/// that name. That is the path an earlier start wrote, to a folder the host
+/// was in then: an AppImage is mounted somewhere new at every start, a Mac's
+/// app runs from a holding folder until it is moved to Applications, and an
+/// install can be moved. Left alone, the model would not start from the second
+/// launch on.
 pub fn use_programs_from(config_path: &std::path::Path, dir: &std::path::Path) -> Result<bool, String> {
     let mut cfg = config::load(config_path)?;
     let root = config_path.parent().unwrap_or(std::path::Path::new("."));
@@ -427,10 +435,17 @@ pub fn use_programs_from(config_path: &std::path::Path, dir: &std::path::Path) -
     for (section, key) in [("llm", "server"), ("llm", "server_webgpu"), ("media", "worker")] {
         let Some(mut part) = cfg.get(section).cloned() else { continue };
         let Some(name) = part.get(key).and_then(Json::as_str).map(str::to_string) else { continue };
-        if name.contains(['/', '\\']) {
-            continue;
-        }
-        let file = if cfg!(windows) && !name.to_ascii_lowercase().ends_with(".exe") { format!("{name}.exe") } else { name.clone() };
+        let file = if name.contains(['/', '\\']) {
+            let path = std::path::Path::new(&name);
+            match path.file_name().and_then(|f| f.to_str()) {
+                Some(file) if !root.join(path).is_file() => file.to_string(),
+                _ => continue,
+            }
+        } else if cfg!(windows) && !name.to_ascii_lowercase().ends_with(".exe") {
+            format!("{name}.exe")
+        } else {
+            name.clone()
+        };
         if root.join(&file).is_file() || !dir.join(&file).is_file() {
             continue;
         }
@@ -632,6 +647,47 @@ mod tests {
         // A program that is not in the folder (the WebGPU server) keeps its name; a second call changes nothing.
         assert_eq!(cfg.get("llm").and_then(|l| l.get("server_webgpu")).and_then(Json::as_str), Some("oaiy-llm-server-webgpu"));
         assert!(!use_programs_from(&path, &bin).unwrap());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_host_that_moved_takes_its_programs_with_it() {
+        let base = std::env::temp_dir().join(format!("oaiy-programs-moved-{}", std::process::id()));
+        let (conf_dir, first, second, own) = (base.join("conf"), base.join("mount-1"), base.join("mount-2"), base.join("own"));
+        for dir in [&conf_dir, &first, &second, &own] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let exe = |n: &str| if cfg!(windows) { format!("{n}.exe") } else { n.to_string() };
+        let named = |path: &std::path::Path, section: &str, key: &str| {
+            let cfg = config::load(path).unwrap();
+            std::path::PathBuf::from(cfg.get(section).and_then(|s| s.get(key)).and_then(Json::as_str).unwrap())
+        };
+        std::fs::write(first.join(exe("oaiy-llm-server-webgpu")), b"").unwrap();
+        std::fs::write(second.join(exe("oaiy-llm-server-webgpu")), b"").unwrap();
+        let path = conf_dir.join(config::FILE_NAME);
+        // The first start (an AppImage's mount, say) writes where the program was then.
+        assert!(use_programs_from(&path, &first).unwrap());
+        assert_eq!(named(&path, "llm", "server_webgpu"), first.join(exe("oaiy-llm-server-webgpu")));
+        // The next start is somewhere else, and the first place is gone: the program is taken from the new one.
+        std::fs::remove_dir_all(&first).unwrap();
+        assert!(use_programs_from(&path, &second).unwrap());
+        assert_eq!(named(&path, "llm", "server_webgpu"), second.join(exe("oaiy-llm-server-webgpu")));
+        assert!(!use_programs_from(&path, &second).unwrap(), "a second call changes nothing");
+        // A program of the owner's own, which is there, stays theirs wherever the host is.
+        let theirs = own.join(exe("oaiy-llm-server-webgpu"));
+        std::fs::write(&theirs, b"").unwrap();
+        let mut cfg = config::load(&path).unwrap();
+        let mut llm = cfg.get("llm").cloned().unwrap();
+        util::set(&mut llm, "server_webgpu", Json::str(theirs.to_string_lossy()));
+        util::set(&mut cfg, "llm", llm);
+        config::save(&path, &cfg).unwrap();
+        assert!(!use_programs_from(&path, &second).unwrap());
+        assert_eq!(named(&path, "llm", "server_webgpu"), theirs);
+        // A path to a program this folder has none of is left as it is: there is nothing better to say.
+        std::fs::remove_file(&theirs).unwrap();
+        std::fs::remove_file(second.join(exe("oaiy-llm-server-webgpu"))).unwrap();
+        assert!(!use_programs_from(&path, &second).unwrap());
+        assert_eq!(named(&path, "llm", "server_webgpu"), theirs);
         let _ = std::fs::remove_dir_all(&base);
     }
 }
