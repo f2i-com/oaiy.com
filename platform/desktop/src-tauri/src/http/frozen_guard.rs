@@ -5,11 +5,12 @@
 //! except that `AuthConfig`, its fields and `origin_guard` are `pub(super)` so the test can reach them, and
 //! for four lines of `is_personal_path` (marked there) that name the routes the receptionist's transfers and
 //! messages add (`/api/ring/*`, `/api/messages/*`) and for the lines (marked there) that name the routes of the
-//! backup (`/api/backup/status`, `/api/backup/agent/*`, `/api/backup/agent-import*`). Those routes did not exist at
+//! backup (`/api/backup/status`, `/api/backup/agent/*`, `/api/backup/agent-import*`) and for the line (marked there)
+//! that names the route choosing the eGPU's model (`/api/engines/egpu`). Those routes did not exist at
 //! 2ea1ee8 and were given the guard of every route of their kind (a read is a restricted read, a change is
 //! privileged, what carries the Agent's storage is an export read) when they were built, before the access model
-//! merged; the differential compares the live guard with this one on them, and can only do so fairly if this one
-//! knows them. Nothing else is changed. Do not edit it: the differential
+//! merged (the eGPU's, built after it, has the guard of the engines' other choices); the differential compares the
+//! live guard with this one on them, and can only do so fairly if this one knows them. Nothing else is changed. Do not edit it: the differential
 //! test in `legacy_neutrality.rs` exists to notice when the live guard stops answering as this one does, and
 //! it can only do that against a copy that does not move with it.
 
@@ -166,7 +167,11 @@ fn is_control_path(path: &str) -> bool {
 /// model (`control/engines.rs`): the engines' configuration, taken on the
 /// privileged gate like their downloads.
 fn is_engine_control_path(path: &str) -> bool {
-    path == "/api/engines/defaults" || path.starts_with("/api/engines/llm/")
+    path == "/api/engines/defaults"
+        // (Not in the guard of 2ea1ee8: the same line as the live guard's, for the route that chooses the eGPU's
+        // model. See the module docs.)
+        || path == "/api/engines/egpu"
+        || path.starts_with("/api/engines/llm/")
 }
 
 /// The setup wizard's record and its checks (`setup.rs`). Changing it is
