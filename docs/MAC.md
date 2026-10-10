@@ -120,6 +120,12 @@ three things, each of which needed a Mac to look at. The first is fixed; two are
 
   (330 lines is about the Agent's seven thousand tokens; `target/release/oaiy-llm-server-webgpu`
   for an engine built here.) 0.1.3-mac.5's does not have it.
+
+  The prompt states an engine keeps on disk (`engines/cache/prompt-states`) carried it on:
+  given the fixed engine, the Agent read 10,340 tokens of its system prompt from a state the
+  wrong kernels had made, and answered "angangang" again. A state names the model's file,
+  not the engine that made it, so on a Mac the states' namespace has moved on once, and a
+  model's states from before are deleted as its cache opens.
 - **The Agent says "The code sandbox is unavailable: the page is not cross-origin
   isolated".** The window serves the Agent's page from a scheme of its own with the opener
   and embedder policies that isolate a page in a browser (`require-corp` off Windows), and

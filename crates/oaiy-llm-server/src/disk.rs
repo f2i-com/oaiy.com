@@ -136,9 +136,25 @@ fn read_header(r: &mut impl Read, fingerprint: u64) -> Option<(bool, Vec<u64>, u
     Some((head[16] == 1, keys, 25 + raw.len() as u64))
 }
 
+/// The namespace a model's states are kept under on this computer: on a Mac its fingerprint moved on once.
+///
+/// A Mac's states from before the GPU's kernels staged their tiles a scalar a thread (`lane_writes` in ggml-rs-wgpu
+/// says why) were made by kernels that lost three values in four. The first Mac's Agent, given the fixed engine, read
+/// 10,340 tokens of its system prompt from such a state and answered "angangang": the fingerprint names the model's
+/// file, not the engine that made the state. Elsewhere the kernels were right, and the namespace is the fingerprint.
+fn namespace(fingerprint: u64) -> u64 {
+    if cfg!(target_os = "macos") {
+        fnv(b"metal-tiles-a-scalar-a-thread", fingerprint)
+    } else {
+        fingerprint
+    }
+}
+
 impl<S: PromptState> DiskCache<S> {
-    /// Open (or make) the directory and index this model's entries.
+    /// Open (or make) the directory and index this model's entries. This model's states from before its
+    /// [`namespace`] moved on are deleted: they are wrong, and as another namespace's no budget would ever take them.
     pub fn open(dir: &Path, fingerprint: u64, budget_bytes: u64) -> oaiy_engine::Result<DiskCache<S>> {
+        let (before, fingerprint) = (fingerprint, namespace(fingerprint));
         fs::create_dir_all(dir)?;
         let mut entries = Vec::new();
         for item in fs::read_dir(dir)?.flatten() {
@@ -147,7 +163,12 @@ impl<S: PromptState> DiskCache<S> {
                 continue;
             }
             let Ok(mut file) = File::open(&path) else { continue };
-            let Some((base, keys, _)) = read_header(&mut file, fingerprint) else { continue };
+            let Some((base, keys, _)) = read_header(&mut file, fingerprint) else {
+                if before != fingerprint && File::open(&path).is_ok_and(|mut f| read_header(&mut f, before).is_some()) {
+                    let _ = fs::remove_file(&path);
+                }
+                continue;
+            };
             let meta = item.metadata()?;
             entries.push(Entry { path, keys, bytes: meta.len(), used: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH), base, ready: Arc::new(AtomicU8::new(1)) });
         }
@@ -342,11 +363,38 @@ mod publication_tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// A Mac's states written before the namespace moved on are not read, and go; another model's stay. Elsewhere the
+    /// namespace is the fingerprint, and the same file is read.
+    #[test]
+    fn a_macs_states_from_before_the_scalar_tiles_are_not_read() {
+        let dir = directory("namespace");
+        let write = |fingerprint: u64, keys: &[u64]| {
+            let path = dir.join(format!("{fingerprint:016x}-{:016x}.{EXT}", keys_hash(keys)));
+            let mut bytes = header(fingerprint, false, keys);
+            state(keys.len()).encode(&mut bytes);
+            fs::write(&path, bytes).unwrap();
+            path
+        };
+        let old = write(1, &[1, 2]);
+        let other = write(7, &[1, 2]);
+        let mut cache: DiskCache<State> = DiskCache::open(&dir, 1, 10000).unwrap();
+        if cfg!(target_os = "macos") {
+            assert_eq!(cache.len(), 0, "a state from before is not this namespace's");
+            assert!(cache.load_best(&[1, 2, 3], 2, 0, false).is_none());
+            assert!(!old.exists(), "and it is deleted");
+        } else {
+            assert_eq!(cache.load_best(&[1, 2, 3], 2, 0, false).unwrap().0, [1, 2]);
+        }
+        assert!(other.exists(), "another model's state is left alone");
+        drop(cache);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn failed_publication_can_be_saved_again() {
         let dir = directory("retry");
         let mut cache = DiskCache::open(&dir, 1, 10000).unwrap();
-        let path = dir.join(format!("{:016x}-{:016x}.{EXT}", 1, keys_hash(&[1,2])));
+        let path = dir.join(format!("{:016x}-{:016x}.{EXT}", namespace(1), keys_hash(&[1,2])));
         fs::create_dir(&path).unwrap(); // atomic rename fails against this directory
         cache.save(vec![1,2], state(2), false);
         settled(&cache);
