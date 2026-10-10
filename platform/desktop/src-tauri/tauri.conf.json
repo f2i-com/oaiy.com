@@ -14,6 +14,7 @@
     "windows": [
       {
         "title": "OAIY",
+        "titleBarStyle": "Transparent",
         "width": 1280,
         "height": 820,
         "minWidth": 760,
