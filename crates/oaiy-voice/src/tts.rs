@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
 
 use oaiy_media::tts::realtime::WgpuTts as Tts;
@@ -134,7 +134,27 @@ pub struct Speaker {
     pub model: String,
     pub device: String,
     pub voices: Voices,
+    remembered: Mutex<Vec<(Line, Arc<Vec<i16>>)>>,
 }
+
+/// A short line in a voice, as [`Speaker`] keeps what it said: its clip (and the clip's time and size: a changed clip
+/// is a new voice) and its words.
+#[derive(Clone, PartialEq, Eq)]
+struct Line {
+    clip: PathBuf,
+    stamp: (Option<SystemTime>, u64),
+    text: String,
+}
+
+/// Lines this short are kept once said, and said again from memory at once: a call's fillers ("Okay —"), its
+/// greeting, "One moment, let me check." come up in call after call, and made again each time they held the engine
+/// just as the reply's first sentence wanted it. A line made again is the same audio (its sampling is seeded the
+/// same), so nothing is heard differently.
+const REMEMBER_CHARS: usize = 160;
+/// The most recent lines kept: some 10 seconds of 24 kHz audio at most each, under 25 MB in all.
+const REMEMBERED: usize = 48;
+/// Samples handed out at a time from a kept line (0.2 s).
+const RECALL_PIECE: usize = 4_800;
 
 /// How the engine is started.
 pub struct Setup {
@@ -164,7 +184,36 @@ impl Speaker {
             .map_err(|e| format!("the speech thread: {e}"))?;
         let loaded = ready.recv().map_err(|_| "the speech engine stopped while loading".to_string())??;
         eprintln!("[oaiy-voice] {loaded}");
-        Ok(Self { jobs, model, device: format!("webgpu:{gpu}"), voices })
+        Ok(Self { jobs, model, device: format!("webgpu:{gpu}"), voices, remembered: Mutex::default() })
+    }
+
+    /// The line `text` in `voice` is, where it is short enough to keep.
+    fn line(&self, text: &str, voice: Option<&str>) -> Option<Line> {
+        let text = text.trim();
+        if text.is_empty() || text.chars().count() > REMEMBER_CHARS {
+            return None;
+        }
+        let clip = self.voices.clip(voice).ok()?;
+        let stamp = (modified(&clip), std::fs::metadata(&clip).map(|m| m.len()).unwrap_or(0));
+        Some(Line { clip, stamp, text: text.to_string() })
+    }
+
+    /// A kept line's audio (now the most recent).
+    fn recall(&self, line: &Line) -> Option<Arc<Vec<i16>>> {
+        let mut kept = self.remembered.lock().unwrap_or_else(|p| p.into_inner());
+        let at = kept.iter().position(|(l, _)| l == line)?;
+        let entry = kept.remove(at);
+        let pcm = Arc::clone(&entry.1);
+        kept.push(entry);
+        Some(pcm)
+    }
+
+    fn remember(&self, line: Line, pcm: Vec<i16>) {
+        let mut kept = self.remembered.lock().unwrap_or_else(|p| p.into_inner());
+        kept.retain(|(l, _)| l != &line);
+        kept.push((line, Arc::new(pcm)));
+        let over = kept.len().saturating_sub(REMEMBERED);
+        kept.drain(..over);
     }
 
     /// Speak `text` in `voice` (the default when `None`), handing each piece of
@@ -201,7 +250,23 @@ impl crate::server::TextToSpeech for Speaker {
     }
 
     fn speak(&self, text: &str, voice: Option<&str>, cancel: Arc<AtomicBool>, on_chunk: &mut dyn FnMut(&[i16]) -> bool) -> Result<(), String> {
-        let spoken = self.say(text, voice, cancel, on_chunk)?;
+        let line = self.line(text, voice);
+        if let Some(pcm) = line.as_ref().and_then(|l| self.recall(l)) {
+            for piece in pcm.chunks(RECALL_PIECE) {
+                if cancel.load(Ordering::Relaxed) || !on_chunk(piece) {
+                    break;
+                }
+            }
+            eprintln!("[oaiy-voice] {:.2} s of speech from memory (said before)", pcm.len() as f64 / 24_000.);
+            return Ok(());
+        }
+        let mut heard: Option<Vec<i16>> = line.is_some().then(Vec::new);
+        let spoken = self.say(text, voice, cancel, &mut |pcm| {
+            if let Some(h) = heard.as_mut() {
+                h.extend_from_slice(pcm);
+            }
+            on_chunk(pcm)
+        })?;
         if !spoken.cancelled {
             eprintln!(
                 "[oaiy-voice] {:.2} s of speech in {:.2} s (first audio {:.0} ms)",
@@ -209,6 +274,9 @@ impl crate::server::TextToSpeech for Speaker {
                 spoken.total_seconds,
                 spoken.first_chunk_seconds.unwrap_or(0.) * 1e3
             );
+            if let (Some(line), Some(pcm)) = (line, heard.filter(|h| !h.is_empty())) {
+                self.remember(line, pcm);
+            }
         }
         Ok(())
     }
@@ -310,6 +378,30 @@ mod tests {
             std::fs::write(dir.join(name), body).unwrap();
         }
         dir
+    }
+
+    #[test]
+    fn a_short_line_said_once_is_kept_and_a_changed_clip_is_a_new_voice() {
+        let dir = folder("kept", &[("phone.wav", "RIFF")]);
+        let (jobs, _inbox) = mpsc::channel();
+        let speaker = Speaker { jobs, model: "m".into(), device: "webgpu:0".into(), voices: Voices { dir: Some(dir.clone()), default: Some("phone".into()) }, remembered: Mutex::default() };
+        let okay = speaker.line(" Okay — ", None).expect("a short line");
+        assert!(speaker.recall(&okay).is_none(), "nothing said yet");
+        speaker.remember(okay.clone(), vec![1, 2, 3]);
+        assert_eq!(speaker.recall(&speaker.line("Okay —", Some("phone")).unwrap()).as_deref(), Some(&vec![1, 2, 3]));
+        // a long line is not kept, nor one in no voice there is
+        assert!(speaker.line(&"word ".repeat(40), None).is_none());
+        assert!(speaker.line("Okay —", Some("nobody")).is_none());
+        // the clip changed: another voice, nothing kept for it
+        std::fs::write(dir.join("phone.wav"), "RIFF and more").unwrap();
+        assert!(speaker.recall(&speaker.line("Okay —", None).unwrap()).is_none());
+        // the most recent lines are kept, the oldest go
+        for i in 0..REMEMBERED + 2 {
+            speaker.remember(speaker.line(&format!("line {i}"), None).unwrap(), vec![i as i16]);
+        }
+        assert!(speaker.recall(&speaker.line("line 0", None).unwrap()).is_none());
+        assert_eq!(speaker.recall(&speaker.line(&format!("line {}", REMEMBERED + 1), None).unwrap()).as_deref(), Some(&vec![(REMEMBERED + 1) as i16]));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
