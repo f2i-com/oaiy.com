@@ -5,9 +5,9 @@
 //! The weights f16 on the GPU (the BF16 checkpoint's rounded) a layer at a time, every prompt through it (its 16 GB
 //! never all on the card), the embedding's rows looked up on the host; the matmuls read their inputs as f32 (an LLM's
 //! hidden states reach some 500).
-use crate::{text::Conditioning, weights::Weights};
+use crate::{text::Conditioning, weights::{Raw, Weights}};
 use candle_core::{DType, Device, Result, Tensor};
-use ggml_rs::{ChainRecorder, DeviceChain, DeviceVec};
+use ggml_rs::{Backend, ChainRecorder, DeviceChain, DeviceVec, QuantizedTensor};
 use std::path::Path;
 
 const LAYERS: usize = 36;
@@ -24,11 +24,17 @@ fn err(e: impl std::fmt::Display) -> candle_core::Error {
     candle_core::Error::Msg(e.to_string())
 }
 
-/// A matrix on the GPU as f16 (`[n, k]`).
+/// A matrix on the GPU (`[n, k]`): f16, or a GGUF checkpoint's quantized blocks as they are (a K-quant's or Q8_0's,
+/// a third of the f16's bytes over a card's link, and no unpacking on the CPU: the GPU's quantized matmul reads them).
 struct Mat {
-    v: DeviceVec,
+    w: W,
     n: usize,
     k: usize,
+}
+
+enum W {
+    F16(DeviceVec),
+    Quant(QuantizedTensor),
 }
 
 struct Layer {
@@ -111,8 +117,18 @@ impl WgpuTextEncoder {
         let mut none = crate::lora::Loras::open(&[])?;
         let w = &mut self.w;
         let mut mat = |w: &mut Weights, name: &str| -> Result<Mat> {
+            let key = format!("{p}.{name}.weight");
+            let quant = w.ggml_dtype(&key).and_then(crate::qwen_wgpu::coop_type).filter(|_| std::env::var_os("OAIY_WEBGPU_DEQUANTIZE").is_none());
+            if let (Some(g), &[n, k]) = (quant, w.shape(&key)?.as_slice()) {
+                if let (0, Some(Raw::Ggml(_, bytes))) = (k % 256, w.raw(&key)?) {
+                    let q = gpu.to_device_quant(QuantizedTensor::from_bytes_cpu(bytes, vec![n, k], g));
+                    if q.is_device() {
+                        return Ok(Mat { w: W::Quant(q), n, k });
+                    }
+                }
+            }
             let (v, n, k) = crate::wgpu_weights::f16_matrix(w, gpu, &format!("{p}.{name}"), &mut none)?;
-            Ok(Mat { v, n, k })
+            Ok(Mat { w: W::F16(v), n, k })
         };
         let vector = |w: &mut Weights, name: &str| -> Result<DeviceVec> {
             let values = w.tensor(&format!("{p}.{name}.weight"), &Device::Cpu, DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
@@ -254,7 +270,10 @@ impl WgpuTextEncoder {
             let r = rec.as_mut();
             for p in &all {
                 let s = p.s;
-                let mul = |r: &mut dyn ChainRecorder, m: &Mat, a: &DeviceVec, y: &DeviceVec| r.matmul_f16_rows_f32(&m.v, m.n, m.k, a, y, s);
+                let mul = |r: &mut dyn ChainRecorder, m: &Mat, a: &DeviceVec, y: &DeviceVec| match &m.w {
+                    W::F16(v) => r.matmul_f16_rows_f32(v, m.n, m.k, a, y, s),
+                    W::Quant(q) => r.matmul_rows(q, a, y, s),
+                };
                 r.rmsnorm_rows(&p.x, &l.input, &p.norm, s, EPS);
                 mul(r, &l.q, &p.norm, &p.q);
                 mul(r, &l.k, &p.norm, &p.k);

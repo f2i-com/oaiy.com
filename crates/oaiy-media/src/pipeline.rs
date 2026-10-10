@@ -17,6 +17,9 @@ pub struct Request {
     pub text_encoder: Option<PathBuf>,
     pub model: Option<String>,
     pub adapter: Option<PathBuf>,
+    /// The transformer is Qwen-Image-2.1-Turbo, the distilled checkpoint (`distilled`; else a transformer file whose
+    /// name says Turbo, with no adapter): its own 8 steps at CFG 1 ([`schedule::DISTILLED`]).
+    pub distilled: bool,
     /// More LoRA adapters, each with its strength, applied with the turbo one.
     pub loras: Vec<(PathBuf, f64)>,
     pub output: PathBuf,
@@ -38,6 +41,15 @@ pub struct Request {
     pub webgpu: bool,
 }
 impl Request {
+    /// The sampling schedule: the distilled checkpoint's own, the turbo adapter's, or the base's.
+    pub fn sigmas(&self) -> std::result::Result<Vec<f64>, String> {
+        if self.distilled {
+            schedule::distilled(self.steps)
+        } else {
+            schedule::sigmas(self.steps, self.width * self.height / 256, self.adapter.is_some())
+        }
+    }
+
     pub fn parse(j: &Json) -> std::result::Result<Self, String> {
         let string = |key: &str| {
             j.get(key)
@@ -73,9 +85,16 @@ impl Request {
         } else {
             vec![string("prompt")?]
         };
+        let distilled = match j.get("distilled") {
+            None | Some(Json::Null) => {
+                adapter.is_none()
+                    && j.get("transformer").and_then(Json::as_str).and_then(|t| Path::new(t).file_name()).is_some_and(|f| f.to_string_lossy().to_ascii_lowercase().contains("turbo"))
+            }
+            Some(v) => v.as_bool().ok_or("distilled must be true or false")?,
+        };
         let cfg = match j.get("cfg") {
             None => {
-                if adapter.is_some() {
+                if adapter.is_some() || distilled {
                     1.
                 } else {
                     6.
@@ -104,6 +123,7 @@ impl Request {
             text_encoder: match j.get("text_encoder") { None | Some(Json::Null) => None, _ => Some(string("text_encoder")?.into()) },
             model: j.get("model").and_then(Json::as_str).map(str::to_owned),
             adapter,
+            distilled,
             loras: parse_loras(j)?,
             output: string("output_dir")?.into(),
             prompts,
@@ -112,7 +132,9 @@ impl Request {
             height: number("height", 1024)?,
             steps: number(
                 "steps",
-                if j.get("adapter").and_then(Json::as_str).is_some() {
+                if distilled {
+                    8
+                } else if j.get("adapter").and_then(Json::as_str).is_some() {
                     6
                 } else {
                     40
@@ -161,15 +183,14 @@ impl Request {
         }
         if !self.cfg.is_finite()
             || !(1. ..=10.).contains(&self.cfg)
-            || (self.adapter.is_some() && self.cfg != 1.)
+            || ((self.adapter.is_some() || self.distilled) && self.cfg != 1.)
         {
             return Err("CFG must be 1 for turbo, or between 1 and 10 for base".into());
         }
-        schedule::sigmas(
-            self.steps,
-            self.width * self.height / 256,
-            self.adapter.is_some(),
-        )?;
+        if self.distilled && self.adapter.is_some() {
+            return Err("the distilled Turbo checkpoint takes no turbo adapter".into());
+        }
+        self.sigmas()?;
         if self
             .seed
             .checked_add(self.count as u64 - 1)
@@ -469,8 +490,7 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
         event(Json::obj([("stage", Json::str("lora_note")), ("note", Json::str(note))]));
     }
     let (h, w) = (r.height / 16, r.width / 16);
-    let sigmas =
-        schedule::sigmas(r.steps, h * w, r.adapter.is_some()).map_err(candle_core::Error::Msg)?;
+    let sigmas = r.sigmas().map_err(candle_core::Error::Msg)?;
     let mut files = Vec::new();
     let mut prefix = None;
     let negative_prefix = negative
@@ -620,6 +640,7 @@ fn save_picture(r: &Request, out: &Path, manifest: &mut File, files: &mut Vec<Js
         ("text_encoder", Json::str(r.text_encoder.clone().unwrap_or_else(|| r.base.join("text_encoder")).to_string_lossy())),
         ("model", r.model.as_ref().map(Json::str).unwrap_or(Json::Null)),
         ("adapter", r.adapter.as_ref().map_or(Json::Null, |p| Json::str(p.to_string_lossy()))),
+        ("distilled", Json::Bool(r.distilled)),
         ("loras", Json::Arr(r.loras.iter().map(|(p, s)| Json::obj([("path", Json::str(p.to_string_lossy())), ("strength", Json::Num(*s))])).collect())),
     ]);
     writeln!(manifest, "{}", record.to_json())?;

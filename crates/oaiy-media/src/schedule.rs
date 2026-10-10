@@ -1,4 +1,17 @@
 //! FlowMatch Euler with the resolution-dependent exponential time shift.
+
+/// Qwen-Image-2.1-Turbo's own schedule (the distilled checkpoint, not an adapter): its 8 steps at CFG 1, as its
+/// release samples them (stable-diffusion.cpp's `--sigmas` in AtomicChat's GGUF release).
+pub const DISTILLED: [f64; 9] = [1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568, 0.0];
+
+/// The distilled checkpoint's sigmas for `steps` (8, the steps it was distilled to).
+pub fn distilled(steps: usize) -> Result<Vec<f64>, String> {
+    if steps != 8 {
+        return Err("Qwen-Image-2.1-Turbo is distilled to 8 steps".into());
+    }
+    Ok(DISTILLED.to_vec())
+}
+
 pub fn sigmas(steps: usize, tokens: usize, turbo: bool) -> Result<Vec<f64>, String> {
     let raw = if turbo {
         match steps {

@@ -67,7 +67,7 @@ pub(crate) fn first(v: &DeviceVec, len: usize) -> DeviceVec {
 }
 
 /// The K-quants with tensor-core kernels.
-fn coop_type(t: GgmlDType) -> Option<ggml_quants::GgmlType> {
+pub(crate) fn coop_type(t: GgmlDType) -> Option<ggml_quants::GgmlType> {
     use ggml_quants::GgmlType as G;
     Some(match t {
         GgmlDType::Q3K => G::Q3_K,

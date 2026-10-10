@@ -50,7 +50,10 @@ impl Weights {
             name.to_owned(),
             format!("model.diffusion_model.{name}"),
             format!("diffusion_model.{name}"),
-        ] {
+        ]
+        .into_iter()
+        .chain(llama_name(name))
+        {
             let exists = match self {
                 Self::Safe(s) => s.get(&candidate).is_some(),
                 Self::Gguf { content, .. } => content.tensor_infos.contains_key(&candidate),
@@ -66,9 +69,52 @@ impl Weights {
         self.resolve(name).is_ok()
     }
 
+    /// A GGUF's fused gate or up half as a quantized tensor of its own (None where `name` is not one).
+    fn gguf_half_qtensor(&mut self, name: &str, dev: &Device) -> Result<Option<candle_core::quantized::QTensor>> {
+        let Some((key, half)) = self.gguf_half(name) else { return Ok(None) };
+        let (t, bytes, dims) = self.gguf_bytes(&key, Some(half))?;
+        Ok(Some(ggml_file::qtensor_from_ggml(t, &bytes, dims, dev)?))
+    }
+
+    /// Where a GGUF keeps a block's MLP gate and up projections as one `img_mlp.gate_up` (gate rows first, as
+    /// AtomicChat's Qwen-Image-2.1-Turbo GGUFs do): the fused tensor's key and the half `name` is (0 gate, 1 up).
+    fn gguf_half(&self, name: &str) -> Option<(String, usize)> {
+        if !matches!(self, Self::Gguf { .. }) || self.has(name) {
+            return None;
+        }
+        [("img_mlp.gate_layer.weight", 0), ("img_mlp.proj.weight", 1)]
+            .into_iter()
+            .find_map(|(suffix, half)| Some((self.resolve(&format!("{}img_mlp.gate_up.weight", name.strip_suffix(suffix)?)).ok()?, half)))
+    }
+
+    /// A GGUF tensor's bytes as stored (its blocks): rows `half` of two, or all of it.
+    fn gguf_bytes(&mut self, key: &str, half: Option<usize>) -> Result<(GgmlDType, Vec<u8>, Vec<usize>)> {
+        use std::io::{Read, Seek, SeekFrom};
+        let Self::Gguf { content, file } = self else { candle_core::bail!("{key}: not a GGUF tensor") };
+        let info = content.tensor_infos.get(key).ok_or_else(|| candle_core::Error::Msg(format!("missing tensor {key}")))?;
+        let t = info.ggml_dtype;
+        let mut dims = info.shape.dims().to_vec();
+        let size = info.shape.elem_count() / t.block_size() * t.type_size();
+        let (start, len) = match half {
+            None => (0, size),
+            Some(h) => {
+                // (each row whole blocks: a half's rows are a half's bytes)
+                if dims.len() != 2 || dims[0] % 2 != 0 || dims[1] % t.block_size() != 0 {
+                    candle_core::bail!("{key}: a fused gate and up of shape {dims:?} in {t:?} blocks");
+                }
+                dims[0] /= 2;
+                (h * size / 2, size / 2)
+            }
+        };
+        let mut bytes = vec![0u8; len];
+        file.seek(SeekFrom::Start(content.tensor_data_offset + info.offset + start as u64))?;
+        file.read_exact(&mut bytes)?;
+        Ok((t, bytes, dims))
+    }
+
     /// `name`'s GGUF block type (a GGUF file's tensor; None for safetensors), without reading it.
     pub fn ggml_dtype(&self, name: &str) -> Option<GgmlDType> {
-        let key = self.resolve(name).ok()?;
+        let key = self.resolve(name).ok().or_else(|| self.gguf_half(name).map(|(k, _)| k))?;
         match self {
             Self::Gguf { content, .. } => content.tensor_infos.get(&key).map(|i| i.ggml_dtype),
             Self::Safe(_) => None,
@@ -78,6 +124,10 @@ impl Weights {
     /// `name`'s bytes as stored where [`Raw`] holds them; None where only [`Self::tensor`] reads it (ComfyUI's
     /// quantized weights, F16, F32, a fused gate and up it splits).
     pub fn raw(&mut self, name: &str) -> Result<Option<Raw>> {
+        if let Some((key, half)) = self.gguf_half(name) {
+            let (t, bytes, _) = self.gguf_bytes(&key, Some(half))?;
+            return Ok(Some(Raw::Ggml(t, bytes)));
+        }
         let Ok(key) = self.resolve(name) else { return Ok(None) };
         match self {
             Self::Safe(s) => {
@@ -127,6 +177,12 @@ impl Weights {
 
     /// Inspect dimensions without materializing tensor payloads.
     pub fn shape(&self, name: &str) -> Result<Vec<usize>> {
+        if let Some((key, _)) = self.gguf_half(name) {
+            let Self::Gguf { content, .. } = self else { unreachable!() };
+            let mut dims = content.tensor_infos[&key].shape.dims().to_vec();
+            dims[0] /= 2;
+            return Ok(dims);
+        }
         let key = self.resolve(name)?;
         match self {
             // (ComfyUI's W4A8: its codes two to a byte, the matrix [rows, 2 x the bytes'], as Self::tensor reads it)
@@ -137,6 +193,9 @@ impl Weights {
     }
 
     pub fn tensor(&mut self, name: &str, dev: &Device, dtype: DType) -> Result<Tensor> {
+        if let Some(q) = self.gguf_half_qtensor(name, dev)? {
+            return q.dequantize(dev)?.to_dtype(dtype);
+        }
         // Comfy's fused Qwen 2.1 MLP stores gate rows followed by up rows.
         // Read only the requested half, preserving the original logical LoRA keys.
         if !self.has(name) {
@@ -193,11 +252,12 @@ impl Weights {
         lora: &mut crate::lora::Loras,
     ) -> Result<Linear> {
         let key = format!("{name}.weight");
-        let key = if matches!(self, Self::Gguf { .. }) { self.resolve(&key)? } else { key };
+        let key = if matches!(self, Self::Gguf { .. }) && self.gguf_half(&key).is_none() { self.resolve(&key)? } else { key };
         // ([`gguf_dense`], or OAIY_GGUF_DENSE: a GGUF's matrices dequantized whole, their products exact)
         static ASKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let dense = GGUF_DENSE.load(std::sync::atomic::Ordering::Relaxed) || *ASKED.get_or_init(|| std::env::var_os("OAIY_GGUF_DENSE").is_some());
         let weight = match self {
+            Self::Gguf { .. } if !dense && self.gguf_half(&key).is_some() => Weight::Quant(QMatMul::from_qtensor(self.gguf_half_qtensor(&key, dev)?.expect("a fused half"))?),
             Self::Gguf { content, file } if !dense => {
                 Weight::Quant(QMatMul::from_qtensor(content.tensor(file, &key, dev)?)?)
             }
@@ -342,4 +402,56 @@ impl Linear {
 /// Device bytes of a plain tensor (norm scales and the like), for block sizes.
 pub fn bytes_of(t: &Tensor) -> u64 {
     tensor_bytes(t)
+}
+
+/// A language model's tensor as llama.cpp's GGUF names it (a text encoder in a GGUF, e.g. Qwen3-VL 8B's as
+/// stable-diffusion.cpp's `--llm` takes it), for its Hugging Face name: `model.layers.3.self_attn.q_proj.weight` is
+/// `blk.3.attn_q.weight`.
+fn llama_name(name: &str) -> Option<String> {
+    let rest = name.strip_prefix("model.language_model.").or_else(|| name.strip_prefix("model."))?;
+    match rest {
+        "embed_tokens.weight" => return Some("token_embd.weight".into()),
+        "norm.weight" => return Some("output_norm.weight".into()),
+        _ => {}
+    }
+    let rest = rest.strip_prefix("layers.")?;
+    let (layer, part) = rest.split_once('.')?;
+    layer.parse::<usize>().ok()?;
+    let (module, kind) = part.rsplit_once('.')?;
+    let llama = match module {
+        "self_attn.q_proj" => "attn_q",
+        "self_attn.k_proj" => "attn_k",
+        "self_attn.v_proj" => "attn_v",
+        "self_attn.o_proj" => "attn_output",
+        "self_attn.q_norm" => "attn_q_norm",
+        "self_attn.k_norm" => "attn_k_norm",
+        "mlp.gate_proj" => "ffn_gate",
+        "mlp.up_proj" => "ffn_up",
+        "mlp.down_proj" => "ffn_down",
+        "input_layernorm" => "attn_norm",
+        "post_attention_layernorm" => "ffn_norm",
+        _ => return None,
+    };
+    Some(format!("blk.{layer}.{llama}.{kind}"))
+}
+
+#[cfg(test)]
+mod llama_names {
+    use super::llama_name;
+
+    #[test]
+    fn a_language_models_hugging_face_names_are_llama_cpps_in_a_gguf() {
+        for (hf, llama) in [
+            ("model.layers.3.self_attn.q_proj.weight", "blk.3.attn_q.weight"),
+            ("model.language_model.layers.35.mlp.down_proj.weight", "blk.35.ffn_down.weight"),
+            ("model.layers.0.post_attention_layernorm.weight", "blk.0.ffn_norm.weight"),
+            ("model.layers.7.self_attn.k_norm.weight", "blk.7.attn_k_norm.weight"),
+            ("model.language_model.embed_tokens.weight", "token_embd.weight"),
+            ("model.norm.weight", "output_norm.weight"),
+        ] {
+            assert_eq!(llama_name(hf).as_deref(), Some(llama), "{hf}");
+        }
+        assert_eq!(llama_name("transformer_blocks.0.attn.to_q.weight"), None);
+        assert_eq!(llama_name("model.layers.x.self_attn.q_proj.weight"), None);
+    }
 }

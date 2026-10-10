@@ -203,6 +203,31 @@ TINYGPU_NO_COOP=1 OAIY_WEBGPU_ADAPTER=tinygpu target/release/oaiy-media --reques
 #  "prompt": "...", "width": 1024, "height": 1024, "steps": 30}
 ```
 
+**Qwen-Image-2.1-Turbo** (the distilled checkpoint: 8 steps at CFG 1, its own sigmas; AtomicChat's GGUFs, the
+denoiser `Qwen-Image-2.1-Turbo-AD-Q4_K.gguf` and the abliterated text encoder
+`Qwen-Image-2.1-Turbo-Abliterated-Uncensored-AD-Q4_K.gguf`, the base model's folder for the VAE and tokenizer) on the
+card, on its tensor cores, the guards below in place (and the run that faulted run again, clean):
+
+| 1024 x 1024 | sampling | in all |
+|---|---|---|
+| Qwen-Image 2.1, 30 steps at CFG 6, no tensor cores | 215 s | 290 s |
+| Turbo, 8 steps, no tensor cores | 28 s | 57 s |
+| Turbo, the tensor cores | 8.0 s | 38 s |
+| Turbo, the tensor cores, the text encoder's blocks kept quantized | 8.0 s | 22.7 s |
+
+```sh
+OAIY_WEBGPU_ADAPTER=tinygpu target/release/oaiy-media --request request.json
+# {"base": "/Volumes/T9/Qwen-Image-2.1", "transformer": ".../Qwen-Image-2.1-Turbo-AD-Q4_K.gguf",
+#  "text_encoder": ".../Qwen-Image-2.1-Turbo-Abliterated-Uncensored-AD-Q4_K.gguf", "output_dir": "...",
+#  "prompt": "...", "width": 1024, "height": 1024}
+```
+
+A transformer whose file is a Turbo one (or `"distilled": true`) samples Turbo's schedule (`schedule::DISTILLED`); a
+GGUF text encoder in llama.cpp's names (`blk.N.attn_q`, as stable-diffusion.cpp's `--llm` takes it) is read as the
+Hugging Face one is, and its K-quant blocks go to the card as they are (a third of the f16's bytes over the link, and
+nothing unpacked on the CPU: the encoding 5.3 s, from 18); a GGUF's fused `img_mlp.gate_up` is split into its gate and
+up halves by rows.
+
 What could write past a buffer on the card and not on the emulator is now kept from it: a fragment not as
 `wmma` takes it (32-byte aligned, its stride a multiple of 16 bytes; SPIR-V's and Metal's take any) is staged as one
 past its array is, and the server refuses a copy, clear, write, read or binding past its buffer, as wgpu checks them

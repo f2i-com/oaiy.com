@@ -88,13 +88,16 @@ def run_compiler(argv: list, what: str):
 # ---- the card, through tinygrad ----
 
 def compile_cuda(src: str, arch: str) -> bytes:
-  """A translation unit's cubin, from the cache or nvcc."""
+  """A translation unit's cubin, from the cache or nvcc (its name, the source's hash, is the program's label)."""
   from tinygrad.runtime.support.elf import elf_loader
   def build(tmp: pathlib.Path):
     cu = tmp.with_suffix(f".{threading.get_ident()}.cu")
     cu.write_text(src)
     run_compiler(["nvcc", f"-arch={arch}", "-cubin", "-o", str(tmp), str(cu)], "nvcc")
-  lib = cached(".cubin", (arch + "\0" + src).encode(), build).read_bytes()
+    cu.rename(tmp.with_name(tmp.name.split(".")[0] + ".cu"))   # (beside its cubin, as it will be named)
+  path = cached(".cubin", (arch + "\0" + src).encode(), build)
+  compile_cuda.last = path.stem
+  lib = path.read_bytes()
   kernels = [s.name for s in elf_loader(lib)[1] if s.name.startswith(".text.")]
   if len(kernels) != 1: raise RuntimeError(f"a cubin of one kernel is what tinygrad loads, and this has {kernels}")
   return lib
@@ -109,6 +112,7 @@ class Program:
     sig = tuple((f"v{i}", i, dtypes.uint32, ()) for i in range(vals))
     self.prg = NVProgram(dev, TinyELF(lib, name, Target(device="NV"), sig))
     self.workgroup, self.scratch = workgroup, scratch
+    self.label = getattr(compile_cuda, "last", name)
 
   def args(self, bufs, grid, vals=()):
     # CUDA's blockDim and gridDim are the driver's words in constant bank 0, which tinygrad's launches leave 0 (the
@@ -125,6 +129,9 @@ class Card:
   neither waits for the card. A freed buffer goes to tinygrad's cache, from where the next of its size reuses it in the
   queue's order."""
   BATCH = 256      # kernels a queue, before it goes to the card and the next starts
+  # TINYGPU_SYNC_EACH=1: each kernel waited for as it is launched, so a fault is the kernel that made it (slow; to
+  # find a kernel the emulator lets through)
+  SYNC_EACH = os.environ.get("TINYGPU_SYNC_EACH") == "1"
   ARGS_RING = 4096  # launches between waits: their arguments are a ring of tinygrad's (16 MB), reused as it wraps
 
   def __init__(self):
@@ -151,6 +158,14 @@ class Card:
     self.begin()
     self.q.exec(prog.prg, prog.args(bufs, grid, vals), grid, prog.workgroup)
     self.queued, self.since_sync = self.queued + 1, self.since_sync + 1
+    if self.SYNC_EACH:
+      self.end()
+      try: self.dev.synchronize()
+      except Exception:
+        print(f"tinygpu-webgpu: the card faulted at {prog.label} {grid} {prog.workgroup} (its CUDA: {CACHE / (prog.label + '.cu')})", file=sys.stderr, flush=True)
+        raise
+      if inside: self.begin()
+      return
     if not inside: self.end()
     elif self.queued >= self.BATCH:
       self.end()
