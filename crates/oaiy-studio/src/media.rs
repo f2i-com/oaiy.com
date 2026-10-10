@@ -1369,7 +1369,9 @@ impl Media {
     fn resume_llm(&self, studio: &crate::Studio) {
         studio.llm.set_paused(false);
         let cfg = studio.config();
-        if cfg.get("media").is_none_or(|m| bool_or(m, "resume_llm", true)) {
+        if !crate::llm::holds_a_model(cfg.get("llm").unwrap_or(&Json::Null)) {
+            self.log.push(crate::llm::ALL_ON_EGPU);
+        } else if cfg.get("media").is_none_or(|m| bool_or(m, "resume_llm", true)) {
             self.log.push("restarting the LLM after media jobs");
             if let Err(e) = studio.llm.start(&cfg, &studio.root) {
                 self.log.push(format!("LLM restart failed: {e}"));

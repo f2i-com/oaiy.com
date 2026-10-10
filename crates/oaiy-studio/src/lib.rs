@@ -129,7 +129,10 @@ impl Studio {
         if llm_changed && self.llm.is_running() {
             self.log.push("LLM settings changed: restarting oaiy-llm-server");
             self.llm.stop();
-            if bool_or(next.get("llm").unwrap_or(&Json::Null), "enabled", true) {
+            let llm = next.get("llm").unwrap_or(&Json::Null);
+            if !llm::holds_a_model(llm) {
+                self.log.push(llm::ALL_ON_EGPU);
+            } else if bool_or(llm, "enabled", true) {
                 // Saved either way; a failed restart is reported, not a failed save.
                 if let Err(e) = self.llm.start(&next, &self.root) {
                     self.log.push(format!("the LLM did not restart: {e}"));
@@ -578,7 +581,9 @@ pub fn launch(args: &Args, quiet: bool) -> Result<Running, String> {
         println!("  type 'help' for console commands");
     }
     let llm_cfg = cfg.get("llm").cloned().unwrap_or(Json::Null);
-    if args.start_llm || bool_or(&llm_cfg, "autostart", false) {
+    if (args.start_llm || bool_or(&llm_cfg, "autostart", false)) && !llm::holds_a_model(&llm_cfg) {
+        studio.log.push(llm::ALL_ON_EGPU);
+    } else if args.start_llm || bool_or(&llm_cfg, "autostart", false) {
         if let Err(e) = studio.llm.start(&cfg, &studio.root) {
             studio.log.push(format!("LLM not started: {e}"));
             if !quiet {
