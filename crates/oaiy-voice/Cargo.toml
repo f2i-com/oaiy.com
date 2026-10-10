@@ -19,3 +19,7 @@ oaiy-media = { path = "../oaiy-media" }
 
 [features]
 default = []
+
+# On a Mac, Candle's matrix products through Apple's Accelerate (the CPU's matrix units): speech to text runs there.
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { version = "0.11.0", features = ["accelerate"] }
