@@ -128,27 +128,37 @@ impl Recorder<'_> {
         let q = w.device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).expect("a weight this adapter holds");
         let (n, k) = (w.shape()[0], w.shape()[1]);
         use ggml_quants::GgmlType as T;
-        let name = match q.dtype {
-            T::Q3_K => "chain-coop-Q3_K",
-            T::Q4_K => "chain-coop-Q4_K",
-            T::Q5_K => "chain-coop-Q5_K",
-            T::Q6_K => "chain-coop-Q6_K",
-            T::Q8_0 => "chain-coop-Q8_0",
-            T::Q2_0 => "chain-coop-Q2_0",
-            T::Q4_0 => "chain-coop-Q4_0",
-            T::Q5_0 => "chain-coop-Q5_0",
-            T::IQ4_NL => "chain-coop-IQ4_NL",
-            T::IQ4_XS => "chain-coop-IQ4_XS",
+        // (each type's kernel in 16 x 16 fragments, and in Metal's 8 x 8: `Gpu::coop_tile`)
+        let names = match q.dtype {
+            T::Q3_K => ("chain-coop-Q3_K", "chain-coop8-Q3_K"),
+            T::Q4_K => ("chain-coop-Q4_K", "chain-coop8-Q4_K"),
+            T::Q5_K => ("chain-coop-Q5_K", "chain-coop8-Q5_K"),
+            T::Q6_K => ("chain-coop-Q6_K", "chain-coop8-Q6_K"),
+            T::Q8_0 => ("chain-coop-Q8_0", "chain-coop8-Q8_0"),
+            T::Q2_0 => ("chain-coop-Q2_0", "chain-coop8-Q2_0"),
+            T::Q4_0 => ("chain-coop-Q4_0", "chain-coop8-Q4_0"),
+            T::Q5_0 => ("chain-coop-Q5_0", "chain-coop8-Q5_0"),
+            T::IQ4_NL => ("chain-coop-IQ4_NL", "chain-coop8-IQ4_NL"),
+            T::IQ4_XS => ("chain-coop-IQ4_XS", "chain-coop8-IQ4_XS"),
             _ => return false,
         };
-        if !self.gpu().device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) || k % 256 != 0 {
+        let eight = match self.gpu().coop_tile() {
+            16 => false,
+            8 => true,
+            _ => return false,
+        };
+        if k % 256 != 0 {
             return false;
         }
         assert!(x.len >= m * k && y.len >= m * n, "chain: a tensor-core matmul [{n}, {k}] of {m} rows");
         let x16 = self.x16_tiled(x, m, k);
         let tile = crate::shaders::COOP_TILE;
         let dtype = q.dtype;
-        let pipeline = self.gpu().named_pipeline(name, || crate::shaders::coop_tiled(dtype).expect("a K-quant's tensor-core kernel"));
+        let pipeline = if eight {
+            self.gpu().named_pipeline(names.1, || crate::shaders::coop8_tiled(dtype).expect("a K-quant's kernel in 8 x 8 fragments"))
+        } else {
+            self.gpu().named_pipeline(names.0, || crate::shaders::coop_tiled(dtype).expect("a K-quant's tensor-core kernel"))
+        };
         let tiles = q.chunks.iter().map(|(_, _, rows)| rows.div_ceil(tile)).max().unwrap_or(1) * (m as u32).div_ceil(tile);
         let (splits, out, parts) = self.coop_parts(tiles, k, m, n, y, split);
         for (chunk, row0, rows) in &q.chunks {
@@ -252,7 +262,7 @@ impl Recorder<'_> {
     /// ([`crate::shaders::coop_tiled_f16`]), split along k as given (else as chosen). False where the device has no
     /// cooperative matrices.
     pub(crate) fn matmul_f16_coop(&mut self, w: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, m: usize, split: Option<u32>) -> bool {
-        if !self.gpu().device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) || k % 4 != 0 || m.div_ceil(crate::shaders::COOP_TILE as usize) > 65535 {
+        if !self.gpu().coop16() || k % 4 != 0 || m.div_ceil(crate::shaders::COOP_TILE as usize) > 65535 {
             return false;
         }
         let x16 = self.x16_tiled(x, m, k);

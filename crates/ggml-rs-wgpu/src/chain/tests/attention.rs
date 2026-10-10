@@ -75,7 +75,7 @@ fn a_prompts_rope_store_and_attention_match_the_cpus() {
 #[test]
 fn qsa_attention_on_the_tensor_cores_is_the_f32_kernels() {
     let Ok(b) = WgpuBackend::new(Some(2 << 30)) else { return };
-    if !b.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+    if !b.gpu.coop16() {
         return;
     }
     let ratio = 4usize;
@@ -340,7 +340,7 @@ fn a_tiled_attention_is_the_runs_kernels() {
 #[test]
 fn a_prompts_attention_on_the_tensor_cores_is_the_f32_kernels() {
     let Ok(b) = WgpuBackend::new(Some(2 << 30)) else { return };
-    if !b.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+    if !b.gpu.coop16() {
         return;
     }
     // (each as it is, then with keys far past the rest planted)
@@ -491,7 +491,7 @@ fn full_attention_is_the_hosts() {
         DeviceChain::upload(&b, &qd, &q);
         DeviceChain::upload(&b, &kvd, &kv);
         for coop in [true, false] {
-            if coop && (rows < 16 || !b.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)) {
+            if coop && (rows < 16 || !b.gpu.coop16()) {
                 continue;
             }
             let out = b.vec(b.attention_rows_out_len(rows.div_ceil(32) * 32, n_h, hd, kv_len));

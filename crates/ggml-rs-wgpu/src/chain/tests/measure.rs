@@ -168,7 +168,7 @@ fn measure_tiled_attention() {
 #[ignore = "a measurement"]
 fn measure_prompt_attention() {
     let Ok(b) = WgpuBackend::new(Some(2 << 30)) else { return };
-    if !b.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+    if !b.gpu.coop16() {
         return;
     }
     // (OAIY_ATT_HD: heads that wide, as many more of them)
@@ -251,7 +251,7 @@ fn measure_delta_net_rows() {
 #[ignore = "a measurement"]
 fn measure_f16_matmuls() {
     let Ok(b) = WgpuBackend::new(Some(4 << 30)) else { return };
-    if !b.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+    if !b.gpu.coop16() {
         return;
     }
     let m = 512usize;
@@ -297,7 +297,7 @@ fn measure_f16_matmuls() {
 #[ignore = "a measurement"]
 fn measure_coop_fold_error() {
     let Ok(b) = WgpuBackend::new(Some(2 << 30)) else { return };
-    if !b.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+    if !b.gpu.coop16() {
         return;
     }
     for (dtype, bytes, scales) in [(GgmlType::Q3_K, 110usize, &[108usize][..]), (GgmlType::Q6_K, 210, &[208][..])] {
@@ -342,7 +342,7 @@ fn measure_coop_fold_error() {
 #[ignore = "a measurement"]
 fn measure_coop_splits() {
     let Ok(b) = WgpuBackend::new(Some(4 << 30)) else { return };
-    if !b.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+    if !b.gpu.coop16() {
         return;
     }
     let m = 512usize;
@@ -414,7 +414,7 @@ fn measure_coop_splits() {
 fn measure_coop_parts() {
     use ggml_rs::ChainRecorder;
     let Ok(b) = WgpuBackend::new(Some(4 << 30)) else { return };
-    if !b.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+    if !b.gpu.coop16() {
         return;
     }
     let (n, k, m) = (17408usize, 5120usize, 512usize);
@@ -467,7 +467,7 @@ fn measure_coop_parts() {
 #[ignore = "a measurement"]
 fn measure_coop_variants() {
     let Ok(b) = WgpuBackend::new(Some(4 << 30)) else { return };
-    if !b.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+    if !b.gpu.coop16() {
         return;
     }
     let (m, n, k) = (512usize, 34816usize, 5120usize);
@@ -538,7 +538,7 @@ fn measure_coop_variants() {
 #[ignore = "a measurement"]
 fn measure_coop_skeletons() {
     let Ok(b) = WgpuBackend::new(Some(4 << 30)) else { return };
-    if !b.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+    if !b.gpu.coop16() {
         return;
     }
     let (m, n, k) = (512usize, 34816usize, 5120usize);
@@ -673,7 +673,7 @@ fn measure_dispatch_overhead() {
 fn measure_coop_tiles() {
     use ggml_rs::ChainRecorder;
     let Ok(b) = WgpuBackend::new(Some(4 << 30)) else { return };
-    if !b.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+    if !b.gpu.coop16() {
         return;
     }
     // (rows, tokens of the workgroup's tile; subgroups down the rows, across the tokens; k a step)
@@ -763,7 +763,7 @@ fn list_cooperative_matrices() {
 fn measure_cooperative_matrices() {
     use ggml_rs::ChainRecorder;
     let Ok(b) = WgpuBackend::new(Some(4 << 30)) else { return };
-    if !b.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+    if !b.gpu.coop16() {
         return;
     }
     // the arithmetic alone, its sums f32 and f16

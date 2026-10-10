@@ -133,7 +133,7 @@ impl Recorder<'_> {
             (256, true) => "chain-attention-coop-full-256",
             _ => return false,
         };
-        if window.is_some() || rows < 16 || n_kv == 0 || n_h % n_kv != 0 || !self.gpu().device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+        if window.is_some() || rows < 16 || n_kv == 0 || n_h % n_kv != 0 || !self.gpu().coop16() {
             return false;
         }
         // (a full attention's `past` its positions, whatever its queries)
@@ -240,7 +240,7 @@ impl Recorder<'_> {
             256 => "chain-qsa-attention-coop-256",
             _ => return false,
         };
-        if rows < 16 || ratio == 0 || n_kv == 0 || n_h % n_kv != 0 || !self.gpu().device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+        if rows < 16 || ratio == 0 || n_kv == 0 || n_h % n_kv != 0 || !self.gpu().coop16() {
             return false;
         }
         let kv_len = first + rows;

@@ -162,6 +162,9 @@ fn packed_dots_wrapped(source: String) -> String {
 
 struct Gpu {
     device: wgpu::Device,
+    /// The side of the cooperative matrices' fragments the kernels use (the tensor cores'): 16 (Vulkan's, D3D12's: every
+    /// tensor-core kernel), 8 (Metal's simdgroup matrices: the K-quants' and Q8_0's prompt matmuls alone), 0 (none).
+    coop_tile: u32,
     /// The device's queue as it is; [`Gpu::queue`] for anyone's use of it but the feed's.
     queue_raw: wgpu::Queue,
     /// Why the device was lost, once its callback has said (a wait then fails rather than waiting on).
@@ -426,12 +429,20 @@ impl WgpuBackend {
         // the tensor cores' matrices (Vulkan's cooperative matrices) and f16 in shaders, where the adapter has them: a
         // prompt's matmuls through them
         let coop = adapter.features() & (wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX | wgpu::Features::SHADER_F16);
-        // (the kernels' fragments are 16 x 16 x 16, f16 into f32 sums and f16 ones: an adapter with only other shapes,
-        // Metal's 8 x 8, has none of them)
+        // (the kernels' fragments are 16 x 16 x 16, f16 into f32 sums and f16 ones; an adapter with Metal's 8 x 8 alone
+        // (an Apple GPU's simdgroup matrices) has the K-quants' prompt matmuls in those, `shaders::coop8_tiled`, and
+        // none of the others: `Gpu::coop_tile`)
         let shapes = adapter.cooperative_matrix_properties();
-        let shape = |sums: wgpu::CooperativeScalarType| shapes.iter().any(|p| (p.m_size, p.n_size, p.k_size) == (16, 16, 16) && p.ab_type == wgpu::CooperativeScalarType::F16 && p.cr_type == sums);
-        let fits = shape(wgpu::CooperativeScalarType::F32) && shape(wgpu::CooperativeScalarType::F16);
-        let coop = if coop == wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX | wgpu::Features::SHADER_F16 && fits && std::env::var_os("OAIY_NO_COOP").is_none() { coop } else { wgpu::Features::empty() };
+        let shape = |size: u32, sums: wgpu::CooperativeScalarType| shapes.iter().any(|p| (p.m_size, p.n_size, p.k_size) == (size, size, size) && p.ab_type == wgpu::CooperativeScalarType::F16 && p.cr_type == sums);
+        let tile = if shape(16, wgpu::CooperativeScalarType::F32) && shape(16, wgpu::CooperativeScalarType::F16) {
+            16
+        } else if shape(8, wgpu::CooperativeScalarType::F32) {
+            8
+        } else {
+            0
+        };
+        let coop = if coop == wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX | wgpu::Features::SHADER_F16 && tile != 0 && std::env::var_os("OAIY_NO_COOP").is_none() { coop } else { wgpu::Features::empty() };
+        let coop_tile = if coop.is_empty() { 0 } else { tile };
         // SAFETY: wgpu's cooperative matrices are an experimental feature (its implementation may misbehave where
         // misused); only the prompt kernels use them, each checked against the f32 kernels (OAIY_NO_COOP: none).
         let experimental = if coop.is_empty() { wgpu::ExperimentalFeatures::disabled() } else { unsafe { wgpu::ExperimentalFeatures::enabled() } };
@@ -510,7 +521,7 @@ impl WgpuBackend {
         });
         Ok(Self {
             cpu: CpuBackend::new(),
-            gpu: Arc::new(Gpu { device, queue_raw: queue, lost, watch, feed: Arc::new(Feed::default()), in_flight_limit: Arc::new(std::sync::atomic::AtomicUsize::new(0)), layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), names: Mutex::new(HashMap::new()), pool: Mutex::new(Vec::new()), staging: Mutex::new(Vec::new()), chain_groups: Mutex::new(HashMap::new()), wide: std::sync::OnceLock::new(), chain_groups_wide: Mutex::new(HashMap::new()), dummy: std::sync::OnceLock::new(), dummy_rw: std::sync::OnceLock::new(), limits, staged: AtomicU64::new(0), few: std::sync::OnceLock::new(), moe_steps: Mutex::new(Vec::new()), coop_units: std::sync::OnceLock::new(), dense_arena: Mutex::new(None) }),
+            gpu: Arc::new(Gpu { device, coop_tile, queue_raw: queue, lost, watch, feed: Arc::new(Feed::default()), in_flight_limit: Arc::new(std::sync::atomic::AtomicUsize::new(0)), layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), names: Mutex::new(HashMap::new()), pool: Mutex::new(Vec::new()), staging: Mutex::new(Vec::new()), chain_groups: Mutex::new(HashMap::new()), wide: std::sync::OnceLock::new(), chain_groups_wide: Mutex::new(HashMap::new()), dummy: std::sync::OnceLock::new(), dummy_rw: std::sync::OnceLock::new(), limits, staged: AtomicU64::new(0), few: std::sync::OnceLock::new(), moe_steps: Mutex::new(Vec::new()), coop_units: std::sync::OnceLock::new(), dense_arena: Mutex::new(None) }),
             budget,
             used: Arc::new(AtomicU64::new(0)),
             left: Arc::new(AtomicU64::new(0)),
@@ -574,9 +585,9 @@ impl WgpuBackend {
     }
 
     /// Whether the adapter has cooperative matrices (the tensor cores' kernels: f16, NVFP4 and the K-quants' and Q8_0's
-    /// for a prompt's rows).
+    /// for a prompt's rows; on Metal, 8 x 8, the K-quants' and Q8_0's alone).
     pub fn tensor_cores(&self) -> bool {
-        self.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+        self.gpu.coop_tile != 0
     }
 
     /// The most bytes one vector an op reads or writes may hold (the adapter's storage binding limit: 2 GB here).
@@ -603,7 +614,11 @@ impl WgpuBackend {
             l.max_compute_invocations_per_workgroup,
             l.max_compute_workgroup_storage_size >> 10,
             l.max_compute_workgroups_per_dimension,
-            if self.tensor_cores() { "used" } else { "not used" },
+            match self.gpu.coop_tile {
+                16 => "used",
+                8 => "used as Metal's 8x8 simdgroup matrices (a prompt's K-quant and Q8_0 matmuls)",
+                _ => "not used",
+            },
         )
     }
 

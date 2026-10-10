@@ -170,7 +170,7 @@ impl DeviceChain for WgpuBackend {
 
     fn attention_rows_full_out_len(&self, rows: usize, n_h: usize, head_dim: usize, kv_len: usize) -> usize {
         // the tensor cores' kernel writes its rows padded to 32 and keeps nothing else there
-        if rows >= 16 && matches!(head_dim, 64 | 128 | 256) && self.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+        if rows >= 16 && matches!(head_dim, 64 | 128 | 256) && self.gpu.coop16() {
             rows.div_ceil(32) * 32 * n_h * head_dim
         } else {
             self.attention_rows_out_len(rows, n_h, head_dim, kv_len)
@@ -178,7 +178,7 @@ impl DeviceChain for WgpuBackend {
     }
 
     fn nvfp4_weights(&self, packed: &[u8], scales: &[u8], global: f32, rows: usize, cols: usize) -> Option<(DeviceVec, DeviceVec)> {
-        if cols % 64 != 0 || packed.len() != rows * cols / 2 || scales.len() != rows * cols / 16 || !self.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+        if cols % 64 != 0 || packed.len() != rows * cols / 2 || scales.len() != rows * cols / 16 || !self.gpu.coop16() {
             return None;
         }
         // a row's nibbles' words, then its scales' (four a word)

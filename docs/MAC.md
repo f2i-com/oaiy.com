@@ -294,9 +294,14 @@ answers**. What it costs:
   slowly. That one belongs on the card in the enclosure, with a smaller model as the
   stand-in (below).
 
-**Slower prompts than an NVIDIA card:** Apple's GPUs have none of the tensor-core matrices
-the engine reads a prompt through on NVIDIA, so a prompt's rows go through the int8
-kernels instead (the arithmetic llama.cpp's uses).
+**A prompt through Metal's simdgroup matrices:** the engine reads a prompt on NVIDIA through
+cooperative matrices of 16 x 16; Metal's (an Apple GPU's simdgroup matrices) are 8 x 8, and
+the K-quants' and Q8_0's prompt matmuls have a kernel of their own in those
+(`shaders::coop8_tiled`: the same tiles and decode, one step's tiles in Metal's 32 KB, f16
+into f32 sums). The other tensor-core kernels (attention, convolutions, NVFP4, f16, the
+experts') are 16 x 16 alone and are not used on a Mac (`Gpu::coop_tile`). On the M5 Pro a
+Qwen3.5 9B Q4_K_M read a 7,846-token prompt in 27.7 s where the f32 tiled kernels took 88 s
+(283 tokens a second, from 89); those three matmuls had been 93% of the time.
 
 ### Checked, and not
 

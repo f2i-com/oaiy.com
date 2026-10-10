@@ -200,7 +200,7 @@ fn an_f16_matrix_multiplies_as_its_f32_one() {
             let three = rec.finish().pop().unwrap();
             assert_eq!(three[2 * n..].iter().map(|v| v.to_bits()).collect::<Vec<_>>(), h.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "[{n}, {k}]: a check's row is a step's");
         }
-        if rows > 8 && b.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+        if rows > 8 && b.gpu.coop16() {
             // on the tensor cores: the tokens rounded to f16, the sums f16 a window
             let rms = (f.iter().map(|e| (*e as f64).powi(2)).sum::<f64>() / f.len() as f64).sqrt();
             let err = (h.iter().zip(&f).map(|(a, e)| ((*a - *e) as f64).powi(2)).sum::<f64>() / f.len() as f64).sqrt();
@@ -227,9 +227,9 @@ fn a_cooperative_matrix_multiplies_as_the_host() {
             return;
         }
     };
-    let features = b.gpu.device.features();
-    eprintln!("cooperative matrices {}, f16 {}", features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX), features.contains(wgpu::Features::SHADER_F16));
-    if !features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX | wgpu::Features::SHADER_F16) {
+    eprintln!("cooperative matrices of {}, f16 {}", b.gpu.coop_tile(), b.gpu.device.features().contains(wgpu::Features::SHADER_F16));
+    // (its probe is a 16 x 16 fragment's)
+    if !b.gpu.coop16() {
         return;
     }
     const PROBE: &str = r#"
@@ -359,7 +359,8 @@ fn iq4_xs_from_int8_rows_is_the_f32_kernels() {
 #[test]
 fn the_tensor_core_matmuls_are_the_f32_ones() {
     let Ok(b) = WgpuBackend::new(Some(2 << 30)) else { return };
-    if !b.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+    // (Metal's 8 x 8 kernels as well as the 16 x 16 ones)
+    if b.gpu.coop_tile() == 0 {
         return;
     }
     // the f16 scales' places in each type's block (d, and dmin where it has one)
@@ -420,7 +421,7 @@ fn a_tensor_core_matmul_is_split_to_fill_the_gpu() {
     assert_eq!(coop_splits(1, 170, 15), 1);
     assert_eq!(coop_splits(1, 1, 160), 1);
     let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
-    if b.gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+    if b.gpu.coop_tile() != 0 {
         let units = b.gpu.coop_units();
         eprintln!("{units} units (SMs)");
         assert!(units >= 1);

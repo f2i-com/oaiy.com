@@ -322,6 +322,147 @@ const COOP_EDGE: &str = r#"        {
         }
 "#;
 
+/// [`coop8_tiled`]'s kernel: [`COOP_KERNEL`]'s tiles and steps, its fragments Metal's 8 x 8 (an Apple GPU's simdgroup
+/// matrices), f16 into f32 sums.
+const COOP8_KERNEL: &str = r#"enable f16;
+enable wgpu_cooperative_matrix;
+struct Params { k: u32, n: u32, m: u32, row0: u32, rows: u32, row_bytes: u32, splits: u32, _pad1: u32, }
+WEIGHTS_BINDING
+@group(0) @binding(1) var<storage, read> x16: array<vec4<f16>>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> p: Params;
+
+// a step's weights [row][k] and tokens [token][k], as halves: Metal loads a fragment from an array of its scalar, a
+// row S halves apart (the decodes' indices are vec4s', S4 apart, each write four halves: `wt_put`); a subgroup's
+// fragment staged at a tile's edge. One step's, not COOP_KERNEL's two: two take 43 KB, past Metal's 32, so the next
+// step is decoded once every subgroup has multiplied this one (a barrier more a step)
+const S4: u32 = 10u;
+const S: u32 = 40u;
+var<workgroup> wt: array<f16, 5120>;
+var<workgroup> xt: array<f16, 5120>;
+var<workgroup> edge: array<f32, 512>;
+
+fn wt_put(i: u32, v: vec4<f16>) {
+    let o = 4u * i;
+    wt[o] = v.x;
+    wt[o + 1u] = v.y;
+    wt[o + 2u] = v.z;
+    wt[o + 3u] = v.w;
+}
+
+fn xt_put(i: u32, v: vec4<f16>) {
+    let o = 4u * i;
+    xt[o] = v.x;
+    xt[o + 1u] = v.y;
+    xt[o + 2u] = v.z;
+    xt[o + 3u] = v.w;
+}
+
+DECODE_HELPERS
+
+// a byte as f32, less `o`: its bits in 2^23's mantissa (exact, no conversion)
+fn byte_less(w: u32, o: f32) -> vec4<f32> {
+    let b = vec4<u32>(w & 255u, (w >> 8u) & 255u, (w >> 16u) & 255u, w >> 24u);
+    return bitcast<vec4<f32>>(b | vec4<u32>(0x4b000000u)) - vec4<f32>(8388608.0 + o);
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let r0 = wg.x * 128u;
+    let t0 = wg.y * 128u;
+    let sg = li / 32u;
+    let lane = li % 32u;
+    // the subgroup's 32 rows by 64 tokens of the tile
+    let sr = (sg % 4u) * 32u;
+    let st = (sg / 4u) * 64u;
+    // what this thread decodes and copies: weight row lr's half lh of a step's 32, and token row lr's
+    let lr = li / 2u;
+    let lh = li % 2u;
+    let rr = r0 + lr;
+    let rl = min(rr, p.rows - 1u);
+    let kx = p.k;
+    // the workgroup's split of the steps (`wg.z` of `p.splits`, none empty), its sums that split's part of `y`
+    let all = (p.k + 31u) / 32u;
+    let per = (all + p.splits - 1u) / p.splits;
+    let s0 = wg.z * per;
+    let s1 = min(all, s0 + per);
+    let zo = wg.z * p.m * p.n;
+    // (the tokens as [`X_F16_TILED`] gives them: a step's for every padded token together)
+    let padded = ((p.m + 127u) / 128u) * 128u;
+    let xo = (t0 + lr) * 8u + lh * 4u;
+    let xs = padded * 8u;
+    // the subgroup's 4 by 8 fragments' sums: weight rows 8 r.., tokens 8 t..
+SUMS
+    // the words of a step's weights and tokens this thread decodes and copies, loaded a step ahead
+DECODE_REGS
+    var xr0 = vec4<f16>();
+    var xr1 = vec4<f16>();
+    var xr2 = vec4<f16>();
+    var xr3 = vec4<f16>();
+    {
+        let b = s0;
+        LOAD_BLOCK
+X_LOAD
+    }
+    let buf = 0u;
+    let cur = 0u;
+    {
+        let b = s0;
+        DECODE_STEP
+        let xa = buf + lr * S4 + lh * 4u;
+        xt_put(xa, xr0);
+        xt_put(xa + 1u, xr1);
+        xt_put(xa + 2u, xr2);
+        xt_put(xa + 3u, xr3);
+    }
+    workgroupBarrier();
+    for (var b0 = s0; b0 < s1; b0++) {
+        // the next step's words (the last's own again, decoded where no one reads it after): loaded as this one is
+        // multiplied, then decoded over it once every subgroup has
+        let b = min(b0 + 1u, s1 - 1u);
+        if (b % 8u == 0u && b != b0) {
+            LOAD_BLOCK
+        }
+X_LOAD
+        // (every index and stride a `let` of its own, as COOP_KERNEL's); k's four eights written out
+MULTIPLY
+        workgroupBarrier();
+        DECODE_STEP
+        let xa = buf + lr * S4 + lh * 4u;
+        xt_put(xa, xr0);
+        xt_put(xa + 1u, xr1);
+        xt_put(xa + 2u, xr2);
+        xt_put(xa + 3u, xr3);
+        workgroupBarrier();
+    }
+    // out: y[token, row] is the tile's (row, token) column-major, a token's rows `n` apart
+    let ns = p.n;
+    let full = r0 + 128u <= p.rows && t0 + 128u <= p.m;
+    if (full) {
+        let o = zo + (t0 + st) * ns + p.row0 + r0 + sr;
+FULL_STORES
+    } else {
+        // a tile at the edge: each fragment through the subgroup's staging, its rows and tokens in bounds
+EDGE_STORES
+    }
+}
+"#;
+
+/// [`coop8_tiled`]'s store of a fragment at a tile's edge.
+const COOP8_EDGE: &str = r#"        {
+            let eo = sg * 64u;
+            let es = 8u;
+            coopStore(CF, &edge[eo], es);
+            workgroupBarrier();
+            for (var e = lane; e < 64u; e += 32u) {
+                let row = r0 + sr + FR + e % 8u;
+                let t = t0 + st + FT + e / 8u;
+                if (row < p.rows && t < p.m) { y[zo + t * p.n + p.row0 + row] = edge[eo + e]; }
+            }
+            workgroupBarrier();
+        }
+"#;
+
 /// Q3_K's decode for [`coop_tiled`]: its helpers, and a thread's half of a row's 32-block.
 const COOP_Q3K_HELPERS: &str = r#"fn q3_bytes(qw: u32, hw: u32, j: u32, h: u32) -> u32 {
     return ((qw >> (2u * j)) & 0x03030303u) | (((hw >> (j + 4u * h)) & 0x01010101u) << 2u);
@@ -691,9 +832,16 @@ pub fn coop_tiled_nvfp4() -> String {
 /// decode, the loop 207 with both in the workgroup's); the sums stored straight into `y` (a tile at the edge through a
 /// fragment's staging). None for a type without one.
 pub fn coop_tiled(dtype: GgmlType) -> Option<String> {
+    let (binding, helpers, regs, load, step) = coop_parts_of(dtype)?;
+    Some(coop_source(binding, helpers, regs, load, "", step, COOP_X_TILED))
+}
+
+/// A type's parts of [`coop_tiled`] and [`coop8_tiled`]: its weights' binding, helpers, registers, a block's loads and
+/// a step's decode. None for a type without them.
+fn coop_parts_of(dtype: GgmlType) -> Option<(&'static str, &'static str, &'static str, &'static str, &'static str)> {
     let vec4s = "@group(0) @binding(0) var<storage, read> w4: array<vec4<u32>>;";
     // (Q6_K's words, 210-byte blocks two bytes off in every other, loaded as they are decoded)
-    let (binding, helpers, regs, load, step) = match dtype {
+    Some(match dtype {
         GgmlType::Q3_K => (vec4s, COOP_Q3K_HELPERS, COOP_Q3K_REGS, COOP_Q3K_LOAD, COOP_Q3K_STEP),
         GgmlType::Q4_K => (vec4s, COOP_K_HELPERS, COOP_Q4K_REGS, COOP_Q4K_LOAD, COOP_Q4K_STEP),
         GgmlType::Q5_K => (vec4s, COOP_K_HELPERS, COOP_Q5K_REGS, COOP_Q5K_LOAD, COOP_Q5K_STEP),
@@ -707,8 +855,81 @@ pub fn coop_tiled(dtype: GgmlType) -> Option<String> {
         GgmlType::IQ4_NL => ("@group(0) @binding(0) var<storage, read> w: array<u32>;", COOP_IQ4_HELPERS, "", "", COOP_IQ4_NL_STEP),
         GgmlType::IQ4_XS => ("@group(0) @binding(0) var<storage, read> w: array<u32>;", COOP_IQ4_HELPERS, "", "", COOP_IQ4_XS_STEP),
         _ => return None,
-    };
-    Some(coop_source(binding, helpers, regs, load, "", step, COOP_X_TILED))
+    })
+}
+
+/// [`coop_tiled`] for Metal, whose cooperative matrices (an Apple GPU's simdgroup matrices) are 8 x 8: the same tiles of
+/// 128 weight rows by 128 tokens, the same steps of 32 of `k` decoded and loaded a step ahead, each subgroup's 32 rows by
+/// 64 tokens as 4 by 8 fragments, f16 into f32 sums (no f16 sums to fold). None for a type without one.
+///
+/// Metal loads a fragment from an array of its scalar, a row its stride of them apart: the tiles are halves here, and
+/// each type's decode, written for vec4s, writes four of them at a time (`wt_put`).
+pub fn coop8_tiled(dtype: GgmlType) -> Option<String> {
+    let (binding, helpers, regs, load, step) = coop_parts_of(dtype)?;
+    Some(coop8_source(binding, helpers, regs, load, step))
+}
+
+/// [`COOP8_KERNEL`] with a type's weights put in, and its fragments' sums, multiply-adds and stores written out.
+fn coop8_source(binding: &str, helpers: &str, regs: &str, load: &str, step: &str) -> String {
+    let frags: Vec<(u32, u32)> = (0..4).flat_map(|r| (0..8).map(move |t| (r, t))).collect();
+    let sums: String = frags.iter().map(|(r, t)| format!("    var c{r}{t} = coop_mat8x8<f32, C>();\n")).collect();
+    let mut multiply = String::new();
+    for kk in [0u32, 8, 16, 24] {
+        multiply += &format!("        {{\n            let kk = {kk}u;\n            let s = S;\n");
+        for r in 0..4 {
+            multiply += &format!("            let ia{r} = 4u * cur + (sr + {}u) * S + kk;\n", 8 * r);
+        }
+        for t in 0..8 {
+            multiply += &format!("            let ib{t} = 4u * cur + (st + {}u) * S + kk;\n", 8 * t);
+        }
+        for r in 0..4 {
+            multiply += &format!("            let a{r} = coopLoadT<coop_mat8x8<f16, A>>(&wt[ia{r}], s);\n");
+        }
+        for t in 0..8 {
+            multiply += &format!("            let b{t}f = coopLoad<coop_mat8x8<f16, B>>(&xt[ib{t}], s);\n");
+        }
+        for (r, t) in &frags {
+            multiply += &format!("            c{r}{t} = coopMultiplyAdd(a{r}, b{t}f, c{r}{t});\n");
+        }
+        multiply += "        }\n";
+    }
+    let full: String = frags.iter().map(|(r, t)| format!("        let o{r}{t} = o + {}u * ns + {}u;\n        coopStore(c{r}{t}, &y[o{r}{t}], ns);\n", 8 * t, 8 * r)).collect();
+    let edges: String = frags.iter().map(|(r, t)| COOP8_EDGE.replace("CF", &format!("c{r}{t}")).replace("FR", &format!("{}u", 8 * r)).replace("FT", &format!("{}u", 8 * t))).collect();
+    COOP8_KERNEL
+        .replace("WEIGHTS_BINDING", binding)
+        .replace("DECODE_HELPERS", helpers)
+        .replace("DECODE_REGS", regs)
+        .replace("LOAD_BLOCK", load)
+        .replace("X_LOAD", COOP_X_TILED)
+        .replace("DECODE_STEP", &tile_writes_as_halves(step))
+        .replace("SUMS\n", &sums)
+        .replace("MULTIPLY\n", &multiply)
+        .replace("FULL_STORES\n", &full)
+        .replace("EDGE_STORES\n", &edges)
+}
+
+/// A type's decode with each write of four of its weights (`wt[i] = v;`, a vec4 of the tile) as [`COOP8_KERNEL`]'s
+/// `wt_put(i, v);`, the tile being halves there.
+fn tile_writes_as_halves(step: &str) -> String {
+    let mut out = String::with_capacity(step.len());
+    let mut rest = step;
+    while let Some(at) = rest.find("wt[") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 3..];
+        // the index, to its bracket; then ` = ` and the value, to its `;`
+        let mut depth = 1;
+        let close = after.char_indices().find(|&(_, c)| {
+            depth += match c { '[' => 1, ']' => -1, _ => 0 };
+            depth == 0
+        }).expect("a write's index ends").0;
+        let index = &after[..close];
+        let value_start = after[close..].strip_prefix("] = ").expect("a decode's tile is written, `wt[i] = v;`");
+        let end = value_start.find(';').expect("a write ends");
+        out.push_str(&format!("wt_put({index}, {})", &value_start[..end]));
+        rest = &value_start[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// [`coop_tiled`] for f16 weights (`[n, k]` two to a word, `k` of 4: a last step short of 32 padded with zeros), its

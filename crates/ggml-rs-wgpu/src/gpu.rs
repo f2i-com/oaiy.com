@@ -11,6 +11,16 @@ impl Drop for Gpu {
 }
 
 impl Gpu {
+    /// Whether the device has the 16 x 16 cooperative matrices every tensor-core kernel is written in.
+    pub(crate) fn coop16(&self) -> bool {
+        self.coop_tile == 16
+    }
+
+    /// The cooperative matrices' fragment side (16, 8: Metal's, the K-quants' and Q8_0's prompt matmuls alone; 0: none).
+    pub(crate) fn coop_tile(&self) -> u32 {
+        self.coop_tile
+    }
+
     /// The EXL3 projections' few-rows scratch ([`exl3::FewScratch`]), made by `b` when first asked for.
     pub(crate) fn few(&self, b: &WgpuBackend) -> &exl3::FewScratch {
         self.few.get_or_init(|| exl3::FewScratch::new(b))

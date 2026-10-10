@@ -45,7 +45,7 @@ fn moe_block() -> usize {
 
 /// Whether a prompt's EXL3 matmuls go through the tensor cores ([`g_coop`]): where the device has them.
 pub(crate) fn coop_on(gpu: &Gpu) -> bool {
-    gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+    gpu.coop16()
 }
 
 /// Rows a block of a prompt's experts' jobs takes: [`g_coop`]'s 16 (an expert's some 10 rows of a 512-row chunk in

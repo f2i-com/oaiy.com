@@ -12,7 +12,7 @@ impl Recorder<'_> {
         assert!(cp < 1 << 16 && xs < 1 << 14, "chain: a convolution's {cin} channels {xs} apart");
         let d = self.gpu().dummy().clone();
         let drw = self.gpu().dummy_rw().clone();
-        if !self.gpu().device.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+        if !self.gpu().coop16() {
             // no tensor cores: the f32 tiled kernel, the voxels' tiles in chunks of bounded work (the inputs as they
             // are, no f16 copy or range to keep)
             let tiles = m.div_ceil(64);
