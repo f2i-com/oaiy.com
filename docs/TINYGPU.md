@@ -190,7 +190,19 @@ Qwen-Image 2.1 (`oaiy-media`, which takes the adapter as the LLM engine does) **
 loaded after the prompt was encoded. Its whole pipeline had run on the emulator without the tensor cores; with them
 (the card's very request, 512 x 512) the emulator encoded the prompt and loaded the transformer without a fault and
 with no fragment past its array (its tensor cores are too slow to go further: each invocation does its warp's whole
-product), so the cause is not known. What could write past a buffer on the card and not on the emulator is now kept from it: a fragment not as
+product), so the cause is not known (with the guards below, the emulator stages no fragment there either: none is past its array
+or misaligned). Without the tensor cores (`TINYGPU_NO_COOP=1`, its transformer f16, 14 GB) it runs on the card, after
+the card's reset (which came back): "A red apple on a wooden table, soft morning light, photograph" at 512 x 512 in
+20 steps, 1.5 s each (the image 35 s, 82 s with the models' loading and the prompt's encoding), and at 1024 x 1024 in
+30 steps, 7.1 s each (220 s; 290 s in all), the pictures as asked:
+
+```sh
+TINYGPU_NO_COOP=1 OAIY_WEBGPU_ADAPTER=tinygpu target/release/oaiy-media --request request.json
+# {"base": "/Volumes/T9/Qwen-Image-2.1", "transformer": "/Volumes/T9/qwen-image-2.1-UC-Q4_K_M.gguf", "output_dir": "...",
+#  "prompt": "...", "width": 1024, "height": 1024, "steps": 30}
+```
+
+What could write past a buffer on the card and not on the emulator is now kept from it: a fragment not as
 `wmma` takes it (32-byte aligned, its stride a multiple of 16 bytes; SPIR-V's and Metal's take any) is staged as one
 past its array is, and the server refuses a copy, clear, write, read or binding past its buffer, as wgpu checks them
 (a range far past a buffer's end jumps the emulator's page that cannot be read, and lands in the card's memory past
