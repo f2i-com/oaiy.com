@@ -1804,8 +1804,12 @@ pub fn run() {
             }
 
             // The agent runs from the start, hidden until its page is shown:
-            // texts and calls are answered whatever the window shows.
-            if !isolated { crate::embed::preload(app.handle()); }
+            // texts and calls are answered whatever the window shows. (On a
+            // Mac its page is served from a port of its own, held first.)
+            if !isolated {
+                crate::embed::serve_agent_over_http(app.handle());
+                crate::embed::preload(app.handle());
+            }
 
             Ok(())
         })

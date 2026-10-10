@@ -534,10 +534,13 @@ pub(super) fn scan(files: &[(String, String)]) -> Scan {
 // ---------------------------------------------------------------------------------------------
 
 /// Routes the scan finds that are not on the main router: the voice gateway's own listener
-/// (`voice/mod.rs`, port 17872, its own token) answers its own `/api/health` and realtime stream.
+/// (`voice/mod.rs`, port 17872, its own token) answers its own `/api/health` and realtime stream;
+/// a Mac's listener for the Agent's page (`embed.rs`, port 17974) answers with its built files alone.
 pub(super) const NOT_ON_MAIN_ROUTER: &[(&str, &str)] = &[
     ("voice/mod.rs", "/api/health"),
     ("voice/mod.rs", "/api/ai/providers/:id/v1/realtime/stream"),
+    ("embed.rs", "/"),
+    ("embed.rs", "/*path"),
 ];
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1027,7 +1030,9 @@ mod fixtures {
         for (file, _) in NOT_ON_MAIN_ROUTER {
             *names.entry(file).or_default() += 1;
         }
-        assert_eq!(names.len(), 1);
+        assert_eq!(names.len(), 2);
         assert_eq!(names["voice/mod.rs"], 2);
+        // (a Mac's Agent page: its files, from a listener that serves nothing else)
+        assert_eq!(names["embed.rs"], 2);
     }
 }

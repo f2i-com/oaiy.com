@@ -85,7 +85,7 @@ M5 Pro, macOS 27) gave the same 72 and 25; why, and that it is fixed, is the fir
 three below.
 
 **Seen on the first Mac.** With the signed image (0.1.3-mac.5) the same person then met
-three things, each of which needed a Mac to look at. The first is fixed; two are open:
+three things, each of which needed a Mac to look at. All three are fixed:
 
 - **Fixed: a prompt was answered with one syllable over and over.** The Agent's first
   message carries several thousand tokens of instructions, and a Qwen3.5 9B answered it
@@ -126,28 +126,34 @@ three things, each of which needed a Mac to look at. The first is fixed; two are
   wrong kernels had made, and answered "angangang" again. A state names the model's file,
   not the engine that made it, so on a Mac the states' namespace has moved on once, and a
   model's states from before are deleted as its cache opens.
-- **The Agent says "The code sandbox is unavailable: the page is not cross-origin
-  isolated".** The window serves the Agent's page from a scheme of its own with the opener
-  and embedder policies that isolate a page in a browser (`require-corp` off Windows), and
-  WebKit did not isolate it. `swiftc tools/mac/webview-probe.swift -o /tmp/webview-probe`
-  and then `/tmp/webview-probe` asks WebKit itself: a page on a scheme of its own under each
-  embedder policy, and, for each `http://127.0.0.1:<port>/` given to it with
-  `python3 tools/mac/isolated-page-server.py <port> require-corp` running, the same page
-  from a local server. If only the local server's page is isolated, the Agent's page has to
-  come from the desktop's own port on a Mac, and that is another origin: what the page keeps
-  under `oaiy://localhost` (its projects, its settings) is not seen from it. The probe needs
-  Apple's command line tools (`xcode-select --install`) and has not been compiled by anyone
-  yet: it was written without a Mac.
-- **The tabs of the Engines and Flows sections are half covered by the page under them.**
-  Those pages are webviews of their own, laid over a box the dashboard measures. A build
-  after that image writes a line beginning `embed:` to the desktop's log
-  (`~/Library/Application Support/com.oaiy.app/logs/oaiy-desktop.log`) for each page's first
-  placements: where the dashboard asked for the page, what the dashboard saw as it measured
-  (its viewport, how far it was scrolled), and where the window says the page and the
-  dashboard's own page then are. `OAIY_START_VIEW=engines` (or `flows`, `agent`) in the
-  app's environment opens that section as the window comes up, for a picture of it. Since
-  then the dashboard also says where the box is again when it has moved without changing
-  size, which it did not; whether that was the cause is not known.
+- **Fixed: the Agent said "The code sandbox is unavailable: the page is not cross-origin
+  isolated".** The window served the Agent's page from a scheme of its own with the opener
+  and embedder policies that isolate a page (`require-corp` off Windows). Asked on that Mac
+  (macOS 27, `tools/mac/webview-probe.swift`), WebKit calls such a page isolated and still
+  gives it no `SharedArrayBuffer`, which the sandbox blocks on; the same page from
+  `http://127.0.0.1:<port>` with the same headers has both (with `credentialless` neither
+  is isolated). So on a Mac the desktop serves the Agent's page from a port of its own,
+  `http://127.0.0.1:17974` (`embed.rs`: its built files and nothing else, held before the
+  page is made), and its webview opens it there. The desktop's API and its backup routes
+  take that origin for the Agent's window only while this desktop holds the port, the
+  engines' gateway lets it in (`origins_version` 4, on a Mac), and the window's script that
+  hands the page the desktop's token stays on the page's own port. Where the port is taken
+  the page stays on its scheme and the log says why. It is another origin than
+  `oaiy://localhost`: what the Agent kept there before (its projects, its settings) is not
+  seen from it. Checked on the M5 Pro: the probe on the Agent's real page from that port
+  says isolated with `SharedArrayBuffer`, and the Agent opened without the message.
+- **Fixed: the tabs of the Engines and Flows sections were half covered by the page under
+  them.** Those pages are webviews of their own, laid over a box the dashboard measures.
+  Tauri's own title bar on a Mac (`Visible`) makes the window's content view run under the
+  title bar, so the webviews are laid from its top; WebKit insets the dashboard's page by
+  the title bar's height there, so the dashboard measured from below it, and each page sat
+  that much (32 points on macOS 27) too high. The window's title bar is `Transparent` now
+  (`tauri.conf.json`): the content view starts below it, as on Windows, and the `embed:`
+  lines in the desktop's log
+  (`~/Library/Application Support/com.oaiy.app/logs/oaiy-desktop.log`) say a page is where
+  it was asked to be (the window 1280x820 inside, 1280x852 outside, the dashboard's view
+  820 tall). `OAIY_START_VIEW=engines` (or `flows`, `agent`) in the app's environment opens
+  that section as the window comes up.
 
 That is a Mac nobody sits at. Not checked by anyone: the app on a Mac with a screen and a
 person (its window, its tray icon, what macOS says of an app signed by nobody on your

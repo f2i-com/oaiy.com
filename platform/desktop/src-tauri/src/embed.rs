@@ -8,7 +8,9 @@
 //! memory), and a frame of the dashboard could not be. Each is served from a
 //! scheme of its own (`oaiy`, `oaiyflows`; `http://<scheme>.localhost` on
 //! Windows) with the headers that isolation takes, and starts knowing the
-//! desktop's address and a token for it, so neither has to pair.
+//! desktop's address and a token for it, so neither has to pair. On a Mac the
+//! agent's comes from a port of its own instead ([`AGENT_PORT`]): WebKit gives a
+//! page on a scheme of its own no shared memory.
 //!
 //! All three follow the dashboard's light or dark (`set_theme`): each starts
 //! in it and is told when it changes.
@@ -22,6 +24,62 @@ use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager, Runtime, Url, Webv
 
 pub const AGENT_SCHEME: &str = "oaiy";
 pub const FLOWS_SCHEME: &str = "oaiyflows";
+
+/// The port a Mac serves the agent's page from, on this computer alone ([`serve_agent_over_http`]).
+///
+/// The agent's code sandbox blocks on shared memory. WebKit calls a page on a scheme of its own, served with the
+/// headers that isolate a page, cross-origin isolated, and still gives it no `SharedArrayBuffer`; the same page from
+/// `http://127.0.0.1` has both (`tools/mac/webview-probe.swift` on the first Mac, macOS 27). The port is fixed because a
+/// page's storage is its origin's: another port would be an agent with none of its projects. The engines' gateway lets
+/// this origin in (`oaiy_studio::MAC_AGENT_ORIGIN`, which a test holds to this port).
+pub const AGENT_PORT: u16 = 17974;
+
+/// Whether this process holds [`AGENT_PORT`] and serves the agent's page there.
+static AGENT_PORT_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The agent page's origin while this process serves it over http (a Mac, its port held), and only then: the desktop's
+/// API takes it for the agent's window ([`crate::http::is_embedded_origin`]). A program that had taken the port would
+/// serve its own pages from that origin to any browser here; while OAIY holds it, nothing else answers there.
+pub fn agent_http_origin() -> Option<&'static str> {
+    AGENT_PORT_HELD.load(std::sync::atomic::Ordering::Acquire).then_some(oaiy_studio::MAC_AGENT_ORIGIN)
+}
+
+/// On a Mac: hold [`AGENT_PORT`] and serve the agent's page from it, with the headers that isolate it ([`serve_path`]),
+/// so that its webview opens it there. Before the page is made. Where the port is taken (or this is not a Mac) the page
+/// stays on its own scheme, and its code sandbox says it is unavailable.
+pub fn serve_agent_over_http<R: Runtime>(app: &AppHandle<R>) {
+    use std::sync::atomic::Ordering;
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let Some(root) = dist(app, Page::Agent) else { return };
+    let listener = match std::net::TcpListener::bind(("127.0.0.1", AGENT_PORT)).and_then(|l| l.set_nonblocking(true).map(|()| l)) {
+        Ok(listener) => listener,
+        Err(e) => {
+            log::warn!("embed: the agent's page stays on {AGENT_SCHEME}://localhost, where it has no code sandbox: port {AGENT_PORT} is not free ({e})");
+            return;
+        }
+    };
+    AGENT_PORT_HELD.store(true, Ordering::Release);
+    log::info!("embed: the agent's page is served from {} (its code sandbox needs shared memory)", oaiy_studio::MAC_AGENT_ORIGIN);
+    tauri::async_runtime::spawn(async move {
+        let served = async {
+            let listener = tokio::net::TcpListener::from_std(listener)?;
+            // (the page's files and nothing else: no route of the desktop's API is here, and the route check lists
+            // these two as another listener's, `auth::route_coverage::NOT_ON_MAIN_ROUTER`)
+            let file = move |uri: axum::http::Uri| {
+                let root = root.clone();
+                async move { serve_path(Some(&root), Page::Agent, uri.path()).map(axum::body::Body::from) }
+            };
+            let pages = axum::Router::new().route("/", axum::routing::get(file.clone())).route("/*path", axum::routing::get(file));
+            axum::serve(listener, pages).await
+        };
+        if let Err(e) = served.await {
+            log::warn!("embed: the agent's page server on port {AGENT_PORT} stopped: {e}");
+        }
+        AGENT_PORT_HELD.store(false, Ordering::Release);
+    });
+}
 
 /// The browser arguments of every webview in the window: WebView2 refuses a
 /// second webview whose arguments differ from the first's. A hidden window
@@ -84,11 +142,15 @@ impl Page {
         }
     }
 
-    /// Its address in the webview: WebView2 (Windows) maps a custom scheme to `http://<scheme>.localhost`.
+    /// Its address in the webview: WebView2 (Windows) maps a custom scheme to `http://<scheme>.localhost`; a Mac
+    /// serves the agent's from a port of its own where it holds one ([`agent_http_origin`]).
     fn url(self) -> Url {
         if self == Page::Engines {
             let base = crate::engines::ui_url().unwrap_or_else(|| "http://127.0.0.1:7860".into());
             return base.parse().unwrap_or_else(|_| "http://127.0.0.1:7860/".parse().expect("a valid URL"));
+        }
+        if let (Page::Agent, Some(origin)) = (self, agent_http_origin()) {
+            return format!("{origin}{}", self.start()).parse().expect("the agent's page's URL is valid");
         }
         let text = if cfg!(windows) {
             format!("http://{}.localhost{}", self.scheme(), self.start())
@@ -207,14 +269,20 @@ fn embedder_policy(windows: bool) -> &'static str {
 
 /// A file of an embedded page, with the headers that make it cross-origin isolated.
 pub fn serve<R: Runtime>(app: &AppHandle<R>, page: Page, request: &Request<Vec<u8>>) -> Response<Vec<u8>> {
-    let raw = percent_decode_str(request.uri().path()).decode_utf8_lossy().into_owned();
+    serve_path(dist(app, page).as_deref(), page, request.uri().path())
+}
+
+/// The file at `uri_path` of an embedded page whose built files are in `root`, with the headers that make it
+/// cross-origin isolated: for its scheme ([`serve`]) and, on a Mac, the agent's port ([`serve_agent_over_http`]).
+fn serve_path(root: Option<&Path>, page: Page, uri_path: &str) -> Response<Vec<u8>> {
+    let raw = percent_decode_str(uri_path).decode_utf8_lossy().into_owned();
     let path = if raw == "/" || raw.is_empty() { page.start().to_string() } else { raw };
     // Only plain names inside the page's folder.
     let relative = Path::new(path.trim_start_matches('/'));
     if relative.components().any(|c| !matches!(c, Component::Normal(_))) {
         return not_found(&path);
     }
-    let Some(root) = dist(app, page) else {
+    let Some(root) = root else {
         return not_found(&format!("{path} (the {} page is not built)", page.folder()));
     };
     let mut file = root.join(relative);
@@ -339,8 +407,14 @@ fn open_outside<R: Runtime>(app: &AppHandle<R>, url: &Url) {
 }
 
 fn own(page: Page, url: &Url) -> bool {
-    let mine = page.url();
-    (url.scheme() == mine.scheme() && url.host_str() == mine.host_str()) || matches!(url.scheme(), "blob" | "data" | "about")
+    own_at(&page.url(), url)
+}
+
+/// Whether `url` is at the page's own address `mine`: its scheme, host and port (another port of 127.0.0.1 is another
+/// program's, which the window's script would hand the desktop's token), or a blob, data or blank page of its own.
+fn own_at(mine: &Url, url: &Url) -> bool {
+    (url.scheme() == mine.scheme() && url.host_str() == mine.host_str() && url.port_or_known_default() == mine.port_or_known_default())
+        || matches!(url.scheme(), "blob" | "data" | "about")
 }
 
 /// Show an embedded page over the dashboard's content area (logical pixels
@@ -489,6 +563,9 @@ fn builder<R: Runtime>(app: &AppHandle<R>, page: Page) -> WebviewBuilder<R> {
         let mut url = page.url();
         url.query_pairs_mut().append_pair("in", "oaiy").append_pair("theme", first);
         WebviewBuilder::new(page.label(), WebviewUrl::External(url))
+    } else if page == Page::Agent && agent_http_origin().is_some() {
+        // (a Mac's agent, from its own port: an address, not a scheme the window serves)
+        WebviewBuilder::new(page.label(), WebviewUrl::External(page.url())).initialization_script(&desktop_script(first, page))
     } else {
         WebviewBuilder::new(page.label(), WebviewUrl::CustomProtocol(page.url())).initialization_script(&desktop_script(first, page))
     };
@@ -537,6 +614,49 @@ mod tests {
         assert_eq!(embedder_policy(true), "credentialless");
         // WebKit (a Mac, Linux) does not know that one, and with it the page is not isolated: no code sandbox.
         assert_eq!(embedder_policy(false), "require-corp");
+    }
+
+    #[test]
+    fn a_macs_agent_is_served_from_the_port_the_gateway_lets_in() {
+        // The engines' gateway names the origin in its own crate (it lets the page in); it is this port's.
+        assert_eq!(oaiy_studio::MAC_AGENT_ORIGIN, format!("http://127.0.0.1:{AGENT_PORT}"));
+        // Not held (nothing here served it), the page is at its scheme and the origin is nobody's.
+        assert_eq!(agent_http_origin(), None);
+        assert!(!crate::http::is_embedded_origin(oaiy_studio::MAC_AGENT_ORIGIN));
+        assert!(!crate::backup::routes::is_agent_origin(oaiy_studio::MAC_AGENT_ORIGIN));
+    }
+
+    #[test]
+    fn a_page_on_127_0_0_1_owns_its_port_alone() {
+        let mine: Url = "http://127.0.0.1:17974/index.html".parse().unwrap();
+        assert!(own_at(&mine, &"http://127.0.0.1:17974/softn/x.js".parse().unwrap()));
+        // Another program's port on this computer would be handed the desktop's token by the window's script.
+        for other in ["http://127.0.0.1:7860/", "http://127.0.0.1/", "http://localhost:17974/", "https://127.0.0.1:17974/"] {
+            assert!(!own_at(&mine, &other.parse().unwrap()), "{other}");
+        }
+        let scheme: Url = "oaiy://localhost/index.html".parse().unwrap();
+        assert!(own_at(&scheme, &"oaiy://localhost/assets/a.js".parse().unwrap()));
+        assert!(!own_at(&scheme, &"oaiyflows://localhost/app.html".parse().unwrap()));
+        assert!(own_at(&scheme, &"blob:oaiy://localhost/1".parse().unwrap()));
+    }
+
+    #[test]
+    fn a_page_file_is_served_isolated_from_its_folder_alone() {
+        let root = std::env::temp_dir().join(format!("oaiy-embed-serve-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        std::fs::write(root.join("index.html"), "<!doctype html>").unwrap();
+        std::fs::write(root.join("assets/a.js"), "1").unwrap();
+        let start = serve_path(Some(&root), Page::Agent, "/");
+        assert_eq!(start.status(), StatusCode::OK);
+        assert_eq!(start.headers()["Cross-Origin-Opener-Policy"], "same-origin");
+        assert_eq!(start.headers()["Cross-Origin-Embedder-Policy"], embedder_policy(cfg!(windows)));
+        assert_eq!(start.body(), b"<!doctype html>");
+        assert_eq!(serve_path(Some(&root), Page::Agent, "/assets/a.js").headers()[header::CONTENT_TYPE], "text/javascript; charset=utf-8");
+        for outside in ["/../x", "/assets/../../x", "/%2e%2e/x", "/nope.js"] {
+            assert_eq!(serve_path(Some(&root), Page::Agent, outside).status(), StatusCode::NOT_FOUND, "{outside}");
+        }
+        assert_eq!(serve_path(None, Page::Agent, "/").status(), StatusCode::NOT_FOUND);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -52,9 +52,10 @@ fn part_error(e: PartError) -> Response {
     }
 }
 
-/// The origins the Agent's own page has, in its window: the scheme this desktop serves it from.
+/// The origins the Agent's own page has, in its window: the scheme this desktop serves it from, or on a Mac its own
+/// port while this desktop holds it (`embed::agent_http_origin`).
 pub fn is_agent_origin(origin: &str) -> bool {
-    matches!(origin, "oaiy://localhost" | "http://oaiy.localhost" | "https://oaiy.localhost")
+    matches!(origin, "oaiy://localhost" | "http://oaiy.localhost" | "https://oaiy.localhost") || crate::embed::agent_http_origin().is_some_and(|own| own == origin)
 }
 
 /// The hand-over routes are for the Agent's own page and nobody else: a paired token, a page of the

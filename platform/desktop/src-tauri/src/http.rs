@@ -689,20 +689,26 @@ pub const EMBEDDED_SCHEMES: [&str; 2] = ["oaiy", "oaiyflows"];
 /// page of each scheme is `http://<scheme>.localhost` on Windows (WebView2 maps
 /// a custom scheme to that) and `<scheme>://localhost` elsewhere. The same in a
 /// debug build under `tauri dev` and in an installed one: both serve the pages
-/// from these schemes, not from a dev server.
+/// from these schemes, not from a dev server. On a Mac the agent's is also its
+/// own port, while this desktop holds it (`embed::agent_http_origin`).
 pub fn embedded_window_origins(windows: bool) -> Vec<String> {
-    EMBEDDED_SCHEMES
+    let mut origins: Vec<String> = EMBEDDED_SCHEMES
         .iter()
         .map(|s| if windows { format!("http://{s}.localhost") } else { format!("{s}://localhost") })
-        .collect()
+        .collect();
+    if !windows {
+        origins.extend(crate::embed::agent_http_origin().map(String::from));
+    }
+    origins
 }
 
 /// Whether `origin` is one of the pages OAIY shows in its own window (the
-/// agent, `oaiy`; the flow editor, `oaiyflows`), served from its own schemes.
+/// agent, `oaiy`; the flow editor, `oaiyflows`), served from its own schemes,
+/// or a Mac's agent from its own port while this desktop holds it.
 pub fn is_embedded_origin(origin: &str) -> bool {
     EMBEDDED_SCHEMES.iter().any(|s| {
         origin == format!("{s}://localhost") || origin == format!("http://{s}.localhost") || origin == format!("https://{s}.localhost")
-    })
+    }) || crate::embed::agent_http_origin().is_some_and(|own| own == origin)
 }
 
 /// `GET /api/update/status`: open on the headless server (like health), a restricted read on the desktop.

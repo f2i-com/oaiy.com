@@ -56,6 +56,14 @@ export function zippModule(): Promise<WebAssembly.Module> {
 }
 
 export function sandboxAvailable(): { ok: true } | { ok: false; reason: string } {
+  // WebKit calls a page on a scheme of its own isolated and still gives it no SharedArrayBuffer (OAIY on a Mac serves
+  // the page over http for it: the desktop's embed.rs).
+  if (typeof SharedArrayBuffer === 'undefined' && globalThis.crossOriginIsolated) {
+    return {
+      ok: false,
+      reason: 'the page is cross-origin isolated but has no SharedArrayBuffer, so the sandbox cannot block on shared memory (WebKit gives none to a page on a scheme of its own: serve it over http)',
+    };
+  }
   if (typeof SharedArrayBuffer === 'undefined' || !globalThis.crossOriginIsolated) {
     return {
       ok: false,
