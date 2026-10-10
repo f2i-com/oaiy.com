@@ -178,8 +178,28 @@ fn extract_zip(archive: &Path, dst: &Path) -> Result<(), String> {
             let copied = std::io::copy(&mut std::io::Read::take(&mut entry, size + 1), &mut out)
                 .map_err(|e| e.to_string())?;
             if copied != size { return Err("ZIP entry size differs from its declaration".into()); }
+            keep_executable(&out, entry.unix_mode())?;
         }
     }
+    Ok(())
+}
+
+/// A ZIP made on macOS or Linux records each file's mode, and a plugin's program is one of its files: without its
+/// executable bit the plugin is installed and cannot be started. Only that bit is taken from the archive (for
+/// everyone the file can be read by); nothing else of the mode is, and a ZIP made on Windows records none.
+#[cfg(unix)]
+fn keep_executable(file: &std::fs::File, mode: Option<u32>) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    if mode.is_some_and(|m| m & 0o111 != 0) {
+        file.set_permissions(std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("cannot make a ZIP entry executable: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Windows has no executable bit: a program is one by its name.
+#[cfg(not(unix))]
+fn keep_executable(_file: &std::fs::File, _mode: Option<u32>) -> Result<(), String> {
     Ok(())
 }
 
@@ -458,6 +478,33 @@ mod tests {
         assert!(install_from_path(&archive, &root, &dev_trust(&base)).is_err());
         assert!(!root.join("outside.txt").exists());
         assert_eq!(std::fs::read(root.join("demo/manifest.json")).unwrap(), original);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// A plugin for macOS or Linux comes as a ZIP too, and its program has to be one after the install.
+    #[cfg(unix)]
+    #[test]
+    fn a_zip_keeps_its_programs_executable_and_nothing_else_of_their_modes() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = tmp("zip-modes");
+        let src = base.join("src");
+        let root = base.join("plugins");
+        write_plugin(&src, "demo");
+        let archive = base.join("plugin.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        // The program as a Unix zip records it, and a file whose mode asks for more than a plugin is given
+        // (set-user-id, writable by everyone).
+        for (name, mode) in [("manifest.json", 0o4666), ("x.exe", 0o755)] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default().unix_permissions(mode)).unwrap();
+            zip.write_all(&std::fs::read(src.join(name)).unwrap()).unwrap();
+        }
+        zip.finish().unwrap();
+        assert_eq!(install_from_path(&archive, &root, &dev_trust(&base)).unwrap().id, "demo");
+        let mode = |name: &str| std::fs::metadata(root.join("demo").join(name)).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode("x.exe") & 0o111, 0o111, "the program can be run");
+        assert_eq!(mode("manifest.json") & 0o111, 0, "a file that is not a program is not made one");
+        assert_eq!(mode("manifest.json") & 0o7022, 0, "and no other bit of the archive's mode is taken");
         let _ = std::fs::remove_dir_all(base);
     }
 
