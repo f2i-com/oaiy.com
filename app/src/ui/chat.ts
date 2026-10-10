@@ -16,6 +16,7 @@ import { planAfter, planChanges, readPlan, readTasks, settlePlan, type Plan } fr
 import { formatTokens } from '../agent/context';
 import { clear, h } from './dom';
 import { icon } from './icons';
+import { confirmAction } from './modal';
 import { mediaElement, mediaKind, type Media } from './media';
 import { renderMarkdown } from './markdown';
 import { SessionPicker, tabKind, tabName, type ConversationTab } from './sessionPicker';
@@ -67,6 +68,9 @@ const PLAN_UPCOMING = 4;
 
 /** How many turns of a saved conversation are drawn at a time (the latest first; older ones as the log is scrolled up to them). */
 const REPLAY_PAGE = 60;
+
+/** What the Clear button says it does, while there is no run to stop first. */
+const CLEAR_TITLE = 'Clear this conversation: its messages go and the model\'s context is empty again. The project\'s files stay.';
 
 /** Where the last page of `turns` starts: `size` turns back, moved back to the request they belong to. */
 function pageStart(turns: Turn[], size: number): number {
@@ -136,6 +140,8 @@ export class ChatPane {
   private readonly meterFill = h('span.context-fill');
   private readonly meterText = h('span.context-text');
   private readonly meter = h('span.context-meter', { title: 'How much of the model\'s context the conversation uses. Older turns are summarized before it fills up.' }, h('span.context-bar', this.meterFill), this.meterText);
+  /** Beside the meter: the conversation started again (its messages gone, the context empty), asked first. The same as /clear. */
+  private readonly clearButton = h('button.chat-clear', { type: 'button', title: CLEAR_TITLE, 'aria-label': 'Clear the conversation' }, icon('trash'), h('span', 'Clear')) as HTMLButtonElement;
   /** The agent's checklist for the current request, pinned above the log. */
   private readonly planBox = h('section.plan', { 'aria-live': 'polite' });
   /**
@@ -236,6 +242,7 @@ export class ChatPane {
     this.blockButton.addEventListener('click', () => {
       if (this.contactTab) this.handlers.block?.(this.contactTab);
     });
+    this.clearButton.addEventListener('click', () => void this.askToClear());
     this.log.addEventListener('scroll', () => {
       this.follow.scrolled(this.log);
       this.showJump();
@@ -263,7 +270,7 @@ export class ChatPane {
       if (e.target === composer) this.input.focus();
     });
     this.element.append(
-      h('div.pane-title.chat-head', h('span.pane-kicker', 'Agent'), this.meter),
+      h('div.pane-title.chat-head', h('span.pane-kicker', 'Agent'), h('span.chat-head-tools', this.meter, this.clearButton)),
       this.sessionTabs,
       this.liveBar,
       this.planBox,
@@ -360,6 +367,21 @@ export class ChatPane {
     this.handlers.submit(text, files);
   }
 
+  /**
+   * The Clear button: asked first (the messages do not come back), then the conversation's own /clear, which is
+   * what starts it again and says so: the project's conversation, or a phone conversation's (not during its call).
+   */
+  private async askToClear(): Promise<void> {
+    if (this.busy) return;
+    const yes = await confirmAction({
+      title: 'Clear this conversation?',
+      message: 'Its messages are removed and the model starts with an empty context. Files in the project, and texts already sent, stay as they are.',
+      ok: 'Clear',
+      danger: true,
+    });
+    if (yes && !this.busy) this.handlers.submit('/clear', []);
+  }
+
   focus(): void {
     this.input.focus();
   }
@@ -379,6 +401,9 @@ export class ChatPane {
     if (this.currentPlan) this.showPlan(this.currentPlan, busy);
     this.input.placeholder = busy ? 'Message the agent while it works…' : this.placeholder();
     this.element.classList.toggle('busy', busy);
+    // While the agent works there is a run to stop first (/clear says so too).
+    this.clearButton.disabled = busy;
+    this.clearButton.title = busy ? 'The agent is working: stop it first, then clear the conversation.' : CLEAR_TITLE;
     this.updateSend();
     if (!busy) this.setStatus('');
   }

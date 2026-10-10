@@ -1012,8 +1012,14 @@ footer.dialog-buttons { flex: none; padding: 12px 22px 16px; border-top: 1px sol
 .plan-item.active.running .plan-mark { border-top-color: transparent; animation: spin 0.9s linear infinite; }
 
 /* The context meter in the Agent pane's title. */
-.context-meter { margin-left: auto; display: inline-flex; align-items: center; gap: 7px; font: 500 10.5px var(--mono); color: var(--muted); text-transform: none; letter-spacing: 0; font-variant-numeric: tabular-nums; }
+.chat-head-tools { margin-left: auto; display: inline-flex; align-items: center; gap: 10px; min-width: 0; }
+.context-meter { display: inline-flex; align-items: center; gap: 7px; font: 500 10.5px var(--mono); color: var(--muted); text-transform: none; letter-spacing: 0; font-variant-numeric: tabular-nums; }
 .context-meter[hidden] { display: none; }
+/* Beside it: the conversation cleared (its messages and the model's context). */
+.chat-clear { flex: none; display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border: 1px solid var(--border); border-radius: 6px; background: transparent; color: var(--muted); font-size: 12px; font-weight: 500; text-transform: none; letter-spacing: 0; white-space: nowrap; cursor: pointer; }
+.chat-clear .icon { width: 12px; height: 12px; }
+.chat-clear:hover:not(:disabled) { border-color: color-mix(in srgb, var(--err) 45%, var(--border)); background: var(--err-soft); color: var(--err); }
+.chat-clear:disabled { opacity: 0.5; cursor: default; }
 .context-bar { width: 56px; height: 4px; border-radius: 3px; background: var(--border); overflow: hidden; }
 .context-fill { display: block; height: 100%; background: var(--accent); transition: width 300ms ease; }
 .context-meter[data-level='mid'] .context-fill { background: var(--warn); }

@@ -126,6 +126,34 @@ try {
     expect((await chip()) === `OAIY · ${MODEL}`, await chip());
   });
 
+  // The Clear button beside the context meter: asked first, then the conversation starts again.
+  await check('Clear asks first, and Cancel leaves the conversation as it is', async () => {
+    await page.waitForFunction(() => !document.querySelector('.chat-clear')?.disabled, { timeout: 15_000 });
+    await page.click('.chat-clear');
+    await page.waitForSelector('dialog.modal[open]', { timeout: 5_000 });
+    expect((await page.$eval('dialog.modal h2', (e) => e.textContent)) === 'Clear this conversation?', 'the question is not the one for clearing');
+    await page.click('dialog.modal .dialog-buttons button[type=button]');
+    await page.waitForFunction(() => !document.querySelector('dialog.modal'), { timeout: 5_000 });
+    expect((await log()).includes(REPLY), 'the reply went although the person said Cancel');
+  });
+
+  await check('Clear removes the messages, and the model is next sent none of them', async () => {
+    await page.click('.chat-clear');
+    await page.waitForSelector('dialog.modal[open]', { timeout: 5_000 });
+    await page.click('dialog.modal .dialog-buttons button.danger');
+    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('New conversation.'), { timeout: 10_000 });
+    const text = await log();
+    expect(!text.includes(REPLY) && !text.includes('Hello, are you there?'), text.slice(0, 400));
+    expect(await page.$eval('.context-meter', (e) => e.hidden), 'the context meter still shows the conversation that was cleared');
+    const before = chats.length;
+    await page.type('.chat-input', 'A second question.');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction((reply) => document.querySelector('.chat-log')?.textContent.includes(reply), { timeout: 30_000 }, REPLY);
+    const sent = JSON.stringify(chats[before]?.messages ?? []);
+    expect(sent.includes('A second question.'), sent.slice(0, 300));
+    expect(!sent.includes('Hello, are you there?') && !sent.includes(REPLY), 'the cleared conversation was sent to the model again');
+  });
+
   await check('and it is kept: a page opened again has the provider without looking twice', async () => {
     const again = await browser.newPage();
     await again.goto(`${base}/?oaiy=${encodeURIComponent(oaiyUrl)}`);
