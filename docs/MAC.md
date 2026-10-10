@@ -373,6 +373,13 @@ or Linux at all.
      Python (its own instructions run it with `PYTHONPATH=.`).
    - **Check tinygrad** says which Python was found, where its tinygrad is and at which
      commit, and what was passed over and why.
+   - *Engine on the card*: **tinygrad's LLM server** (the default), or **OAIY's own, over
+     WebGPU** (NVIDIA): the launcher holds the card through tinygrad as a WebGPU adapter and
+     runs OAIY's engine on it ([TINYGPU.md](TINYGPU.md)). Every model OAIY's engine runs runs
+     there (not GGUF files alone), with the engine's own settings, and fast: a 27B model
+     writes about 20 tokens a second through the gateway, where tinygrad's server writes 2.
+     It needs NVIDIA's compiler as tinygrad's setup puts it (Docker), and compiles each
+     kernel once.
    - *Context*: tinygrad takes the card's memory for the whole context when it starts.
      8,192 tokens unless set (tinygrad's own default is 4,096, less than an agent's prompt
      with its tools).
@@ -380,8 +387,8 @@ or Linux at all.
      another model of yours. On a 24 GB Mac with a 27B's 4-bit file on the card, name a
      smaller one: that file does not fit the Mac's own GPU (its 3-bit file does, just).
    - Tick **Use the eGPU** and save.
-3. **Models:** tick **On the eGPU** on each model that should run there. Only a model that
-   is one `.gguf` file can be: tinygrad's server reads nothing else.
+3. **Models:** tick **On the eGPU** on each model that should run there. With tinygrad's
+   server, only a model that is one `.gguf` file can be: it reads nothing else.
 
 ### What happens to a request
 
@@ -449,6 +456,7 @@ tinygrad's is built on, where to listen and whom to answer, then runs `tinygrad.
     "python": "",
     "tinygrad": "/Users/you/tinygrad",
     "device": "NV",
+    "engine": "tinygrad",
     "ctx": 8192,
     "fallback_model": "Qwen3.5-9B-Q4_K_M",
     "env": { "JITBEAM": 2 },
@@ -461,8 +469,12 @@ tinygrad's is built on, where to listen and whom to answer, then runs `tinygrad.
 }
 ```
 
-`env` adds to the server's environment (`JITBEAM=2` has tinygrad search for faster
-kernels once and keep them); `extra_args` to its command line. The control port has
+`engine` is `tinygrad` (its LLM server, the default) or `webgpu` (OAIY's own engine on the
+card: the launcher, `egpu_serve.py --webgpu`, runs the engine's program with the model, the
+eGPU's context and the engine's other settings, its key in the environment, and its prompt
+cache in `cache/prompt-states-egpu`). `env` adds to the server's environment (`JITBEAM=2`
+has tinygrad search for faster kernels once and keep them); `extra_args` to tinygrad's
+server's command line. The control port has
 `GET /api/egpu/check`, `POST /api/egpu/start` (`{"model": name}`, else the first set to
 it) and `POST /api/egpu/stop`; `/api/state` has an `egpu` section, and the Logs page's
 **eGPU** tab (`/api/logs?source=egpu`) is tinygrad's own output.

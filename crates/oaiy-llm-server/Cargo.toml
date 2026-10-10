@@ -41,3 +41,9 @@ ggml-quants = { path = "../ggml-quants" }
 ggml-rs = { path = "../ggml-rs" }
 rayon = "1.10"
 ggml-rs-wgpu = { path = "../ggml-rs-wgpu", optional = true }
+
+# On a Mac the WebGPU engine also takes the TinyGPU adapter (`tinygpu` above): a card in a Thunderbolt enclosure, held
+# through tinygrad, which OAIY's eGPU launcher gives it (docs/TINYGPU.md). Every Mac build of the engine has it; it is
+# used only where OAIY_WEBGPU_ADAPTER names it.
+[target.'cfg(target_os = "macos")'.dependencies]
+ggml-rs-wgpu = { path = "../ggml-rs-wgpu", optional = true, features = ["tinygpu"] }

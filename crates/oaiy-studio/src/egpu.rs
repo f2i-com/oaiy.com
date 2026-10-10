@@ -13,6 +13,11 @@
 //!
 //! Only on a Mac ([`available`]): everywhere else nothing is offered and nothing is started, whatever the
 //! configuration says.
+//!
+//! With `llm.egpu.engine` set to `webgpu`, the card answers with OAIY's own engine in place of tinygrad's server: the
+//! launcher holds the card through tinygrad as a WebGPU adapter (`webgpu_server.py`, written beside it) and runs this
+//! computer's `oaiy-llm-server` on it with the model (docs/TINYGPU.md). Every model the engine runs runs there, at the
+//! card's speed (a 27B model ten times tinygrad's server's), and nothing else of the arrangement changes.
 
 use crate::config;
 use crate::llm::{Endpoint, State};
@@ -29,6 +34,11 @@ use std::time::{Duration, Instant};
 const SERVE_PY: &str = include_str!("egpu_serve.py");
 #[cfg(not(any(target_os = "macos", test)))]
 const SERVE_PY: &str = "";
+/// The card's WebGPU server, written beside the launcher for `llm.egpu.engine` `webgpu`.
+#[cfg(any(target_os = "macos", test))]
+const CARD_PY: &str = include_str!("../../../tools/tinygpu/webgpu_server.py");
+#[cfg(not(any(target_os = "macos", test)))]
+const CARD_PY: &str = "";
 /// After a start that failed, how long requests go to this computer's engine before it is tried again.
 const RETRY_AFTER: Duration = Duration::from_secs(60);
 /// tinygrad's own default is 4,096 tokens, less than an agent's prompt with its tools.
@@ -78,6 +88,12 @@ pub fn fallback(llm: &Json, name: &str) -> String {
         return other.to_string();
     }
     name.to_string()
+}
+
+/// Whether the card answers with OAIY's own engine (`llm.egpu.engine`: `webgpu`) rather than tinygrad's LLM server
+/// (`tinygrad`, the default).
+pub fn webgpu(llm: &Json) -> bool {
+    str_or(section(llm), "engine", "tinygrad").trim() == "webgpu"
 }
 
 /// The context tinygrad's server is started with (`llm.egpu.ctx`; it sets its cache aside for all of it at once).
@@ -178,6 +194,9 @@ fn environment(llm: &Json, root: &Path) -> Vec<(String, String)> {
 /// `llm.egpu.extra_args`. A model that is not one GGUF file is refused: tinygrad's server reads nothing else.
 pub fn arguments(llm: &Json, root: &Path, name: &str, script: &Path, port: u16) -> Result<Vec<String>, String> {
     let m = model(llm, name).ok_or_else(|| format!("{name} is not one of the enabled language models"))?;
+    if webgpu(llm) {
+        return engine_arguments(llm, root, m, script, port);
+    }
     let path = config::resolve(root, str_or(m, "path", ""));
     if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf")) {
         return Err(format!("{name} is not a GGUF file, and tinygrad's server reads nothing else"));
@@ -189,6 +208,41 @@ pub fn arguments(llm: &Json, root: &Path, name: &str, script: &Path, port: u16) 
     for extra in section(llm).get("extra_args").and_then(Json::as_array).unwrap_or(&[]) {
         if let Some(s) = extra.as_str() {
             a.push(s.into());
+        }
+    }
+    Ok(a)
+}
+
+/// The launcher's command line for OAIY's own engine on the card: `--webgpu`, the engine's program (the one this
+/// computer's engine runs), and the engine's arguments as this computer's are made, for this model alone, with the
+/// eGPU's context. Not among them: the key (the launcher passes it in the environment), the GPUs to use (the card is
+/// the engine's one adapter), the stdin watch (the launcher's own), and the expert counts kept with this computer's
+/// engine; the prompt cache is a folder of its own.
+fn engine_arguments(llm: &Json, root: &Path, m: &Json, script: &Path, port: u16) -> Result<Vec<String>, String> {
+    let launches = crate::llm::launches(llm, root);
+    let program = launches.iter().map(|l| l.program.clone()).find(|p| p.is_file()).or_else(|| launches.first().map(|l| l.program.clone())).ok_or("no engine program")?;
+    let mut alone = llm.clone();
+    let mut one = m.clone();
+    crate::util::set(&mut one, "egpu", Json::Bool(false));
+    crate::util::set(&mut one, "devices", Json::Arr(Vec::new()));
+    crate::util::set(&mut alone, "models", Json::Arr(vec![one]));
+    crate::util::set(&mut alone, "ctx", Json::Int(context(llm)));
+    crate::util::set(&mut alone, "devices", Json::Arr(Vec::new()));
+    let (engine, _) = crate::llm::arguments_for(&alone, root, port, "", false, Some(str_or(m, "name", "")))?;
+    let mut a = vec!["-u".to_string(), script.to_string_lossy().into_owned(), "--watch-stdin".into(), "--webgpu".into(), program.to_string_lossy().into_owned()];
+    let mut it = engine.into_iter();
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--api-key" | "--usage" | "--devices" => {
+                it.next();
+            }
+            "--watch-stdin" => {}
+            "--prompt-cache" => {
+                it.next();
+                a.push(flag);
+                a.push(root.join("cache").join("prompt-states-egpu").to_string_lossy().into_owned());
+            }
+            _ => a.push(flag),
         }
     }
     Ok(a)
@@ -442,11 +496,13 @@ impl Egpu {
     fn script(root: &Path) -> Result<PathBuf, String> {
         let dir = root.join("cache").join("egpu");
         std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let file = dir.join("egpu_serve.py");
-        if std::fs::read(&file).ok().as_deref() != Some(SERVE_PY.as_bytes()) {
-            std::fs::write(&file, SERVE_PY).map_err(|e| format!("{}: {e}", file.display()))?;
+        for (name, text) in [("webgpu_server.py", CARD_PY), ("egpu_serve.py", SERVE_PY)] {
+            let file = dir.join(name);
+            if std::fs::read(&file).ok().as_deref() != Some(text.as_bytes()) {
+                std::fs::write(&file, text).map_err(|e| format!("{}: {e}", file.display()))?;
+            }
         }
-        Ok(file)
+        Ok(dir.join("egpu_serve.py"))
     }
 
     /// Ask each Python in turn what it has: `{ok, python, version, tinygrad, commit, server, jinja2, tried}`, `ok`
@@ -923,6 +979,29 @@ mod tests {
         // A folder of weights (an EXL3 checkpoint) is not something tinygrad's server reads.
         assert!(arguments(&on, root, "folder", &script, 1).unwrap_err().contains("not a GGUF file"));
         assert!(arguments(&on, root, "ghost", &script, 1).unwrap_err().contains("not one of the enabled"));
+    }
+
+    #[test]
+    fn oaiys_own_engine_is_started_on_the_card_through_the_launcher_with_this_model_alone() {
+        let text = TWO.replace(r#""egpu": {"enabled": true,"#, r#""devices": [1], "egpu": {"enabled": true, "engine": "webgpu","#);
+        let on = llm(&text);
+        assert!(webgpu(&on) && !webgpu(&llm(TWO)));
+        let root = Path::new("/data/engines");
+        let script = root.join("cache").join("egpu").join("egpu_serve.py");
+        let a = arguments(&on, root, "big", &script, 18000).unwrap();
+        assert_eq!(a[..4], ["-u", script.to_string_lossy().as_ref(), "--watch-stdin", "--webgpu"]);
+        assert!(a[4].ends_with("oaiy-llm-server") || a[4].ends_with("oaiy-llm-server-webgpu"), "{}", a[4]);
+        let after = |flag: &str| a.iter().position(|x| x == flag).map(|i| a[i + 1].clone());
+        assert_eq!(after("--model"), Some(root.join("models/big.gguf").to_string_lossy().into_owned()));
+        assert_eq!((after("--name").as_deref(), after("--port").as_deref(), after("--ctx").as_deref()), (Some("big"), Some("18000"), Some("16384")));
+        assert_eq!(after("--prompt-cache"), Some(root.join("cache/prompt-states-egpu").to_string_lossy().into_owned()));
+        // This model alone, the key out of sight, and nothing of this computer's GPUs or tinygrad's own arguments.
+        for absent in ["--also", "--api-key", "--devices", "--devices-for", "--usage", "--shard", "--serve", "--max_context"] {
+            assert!(!a.contains(&absent.to_string()), "{absent} in {a:?}");
+        }
+        assert_eq!(a.iter().filter(|x| *x == "--watch-stdin").count(), 1, "the launcher's own");
+        // Any model the engine reads, not only a GGUF file.
+        assert!(arguments(&on, root, "folder", &script, 1).is_ok());
     }
 
     #[test]

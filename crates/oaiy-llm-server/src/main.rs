@@ -48,7 +48,7 @@ const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|
                        ternary elsewhere, trunk stays loaded (experimental)
   --repetition-guard on|off  stop repeated prose/reasoning blocks (default on)
   --expert-trace FILE  write JSONL token/layer/expert/precision routing records
-  --api-key KEY        require `Authorization: Bearer KEY`
+  --api-key KEY        require `Authorization: Bearer KEY` (else OAIY_LLM_API_KEY)
   --thinking           reason before answering unless a request says otherwise
                        (default: answer directly; requests turn reasoning on with
                        reasoning_effort, or thinking: {type: enabled})
@@ -109,6 +109,11 @@ fn parse_args() -> Result<Options, String> {
     // Compatibility for older one-model launchers; never inherited by extras.
     if let Some(path) = std::env::var_os("DSV41_TERNARY_DIR").filter(|p| !p.is_empty()) {
         a.ternary_experts.entry(a.name.clone()).or_insert(path.into());
+    }
+    // The key as a launcher passes it out of sight of other users' `ps` (OAIY's eGPU launcher does), where no
+    // --api-key gives one.
+    if a.api_key.is_none() {
+        a.api_key = std::env::var("OAIY_LLM_API_KEY").ok().filter(|k| !k.is_empty());
     }
     Ok(a)
 }

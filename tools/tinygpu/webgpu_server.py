@@ -417,22 +417,33 @@ def handle(server: Server, conn: socket.socket, lock: threading.Lock, closing: t
         for h in owned: server.free(struct.pack("<Q", h))
 
 
-def serve(path: str, emulate: bool):
-  # (a stop by signal is a normal exit, so tinygrad's own exit releases the card)
-  for sig in (signal.SIGTERM, signal.SIGHUP): signal.signal(sig, lambda *_: sys.exit(0))
-  server = Server(Emulator() if emulate else Card())
+def listen(path: str) -> socket.socket:
+  """The socket clients connect to, at `path` (for this user alone)."""
   if os.path.exists(path): os.unlink(path)
   sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
   sock.bind(path)
   os.chmod(path, 0o600)
   sock.listen(16)
+  return sock
+
+
+def accept(server: Server, sock: socket.socket, lock: threading.Lock, closing: threading.Event):
+  """Clients at once, each on a thread of its own; their requests one at a time. Until the socket is closed."""
+  while not closing.is_set():
+    try: conn, _ = sock.accept()
+    except OSError: return
+    threading.Thread(target=handle, args=(server, conn, lock, closing), daemon=True).start()
+
+
+def serve(path: str, emulate: bool):
+  # (a stop by signal is a normal exit, so tinygrad's own exit releases the card)
+  for sig in (signal.SIGTERM, signal.SIGHUP): signal.signal(sig, lambda *_: sys.exit(0))
+  server = Server(Emulator() if emulate else Card())
+  sock = listen(path)
   print(f"tinygpu-webgpu: {server.card.info()['name']} ready on {path}", flush=True)
-  # clients at once, each on a thread of its own; their requests one at a time
   lock, closing = threading.Lock(), threading.Event()
   try:
-    while True:
-      conn, _ = sock.accept()
-      threading.Thread(target=handle, args=(server, conn, lock, closing), daemon=True).start()
+    accept(server, sock, lock, closing)
   finally:
     closing.set()
     lock.acquire(timeout=60)   # (a request under way ends first: the card is let go between requests)
@@ -449,4 +460,4 @@ if __name__ == "__main__":
     faulthandler.enable()   # (a kernel's fault: where the server was, with TINYGPU_EMU_TRACE's last kernel)
   try: serve(argv[0] if argv else str(CACHE / ("emulator.sock" if emulate else "server.sock")), emulate)
   except KeyboardInterrupt: pass
-  print("tinygpu-webgpu: " + ("the emulator ended" if emulate else "the card released"), flush=True)
+  finally: print("tinygpu-webgpu: " + ("the emulator ended" if emulate else "the card released as Python exits"), flush=True)

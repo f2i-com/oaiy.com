@@ -40,8 +40,13 @@ Four parts, each its own:
   Every function of the header that is not compute is there, and says so on stderr. `WEBGPU_TINYGPU_BACKEND=native`
   takes wgpu's own adapter instead (Metal on a Mac), to check a program against both.
 
-OAIY's engine takes it with the feature `tinygpu` (`oaiy-llm-server`, `ggml-rs-wgpu`) and
-`OAIY_WEBGPU_ADAPTER=tinygpu` (or `tinygpu:<socket>`).
+OAIY's engine takes it with the feature `tinygpu` (`oaiy-llm-server`, `ggml-rs-wgpu`; every Mac build of the engine
+has it) and `OAIY_WEBGPU_ADAPTER=tinygpu` (or `tinygpu:<socket>`).
+
+**In OAIY**, Settings → eGPU → *Engine on the card*: **OAIY's own, over WebGPU** (`llm.egpu.engine: "webgpu"`,
+[MAC.md](MAC.md)). A chat with a model ticked *On the eGPU* then starts `egpu_serve.py --webgpu`, which holds the card
+in-process (this server, written beside it) and runs the app's own `oaiy-llm-server-webgpu` on it with the model; when
+OAIY stops it or goes, the launcher's lifeline stops the engine and Python's exit releases the card.
 
 ## Without the card: the emulator
 
@@ -91,12 +96,15 @@ holds it.
 
 ## The card's link
 
-A process that holds the card and ends without tinygrad's own exit (killed, or after the card faulted) leaves the card's
-firmware up; the next process to open it finds its region (WPR2) and resets the card, and over Thunderbolt that reset
-has twice not come back: "Booter failed to execute, mailbox is ffffffff", the PCI link down until the enclosure was
-powered off and on (`system_profiler SPPCIDataType` says "Link down"). So the server ends by releasing the card at
-SHUTDOWN, SIGTERM, SIGHUP or an interrupt, and OAIY's own launcher for tinygrad's LLM server does the same since
-(`egpu_serve.py`, `egpu.rs`'s `halt`). A kernel that faults the card still costs it: the server's next start resets it.
+The card's firmware region (WPR2) is up after any process that held the card, even one that released it at tinygrad's
+own exit (read on 10 October 2026, with the card's registers read and nothing set up), so every open of the card begins
+with a full reset. Over Thunderbolt that reset has come back after a clean exit and after a killed process, and has
+twice not come back after a kernel faulted the card: "Booter failed to execute, mailbox is ffffffff", the PCI link down
+until the enclosure was powered off and on (`system_profiler SPPCIDataType` says "Link down"). So a kernel is checked on
+the emulator first (below), and the server still ends by releasing the card (SHUTDOWN, SIGTERM, SIGHUP or an
+interrupt), as OAIY's launcher does (`egpu_serve.py`, which also restores Python's interrupt handler: a launcher
+started from a shell in the background had SIGINT ignored, its lifeline's interrupt did nothing, and its last resort
+skipped tinygrad's exit).
 
 ## Checked, and not
 
@@ -150,6 +158,10 @@ On the card, its link back up (the same day):
   The same 27B model is 2.5 tokens a second on the Mac's own GPU (it does not all fit) and about 2 through tinygrad's
   own LLM server on this card;
 - Python's `wgpu` and `examples/compute.c` through `webgpu.h`, as on the emulator;
+- through OAIY 0.1.3-mac.8, the eGPU's engine set to WebGPU: a chat with Qwen3.8-27B through the gateway started the
+  launcher (252 s: the card's reset, the 16 GB file read from an external drive and sent over the link), answered
+  "The capital of France is Paris.", then wrote three sentences about the ocean at 19.4 tokens a second end to end;
+  Stop let the engine and the card go within a second;
 - what the adapter's own work costs (`cargo run --release -p wgpu-tinygpu --example costs`): a dispatch 13.7 us in a
   submission of many (45 us alone, a submission's own cost with it); writes at 1.1 to 1.4 GB/s and reads at 0.95 GB/s,
   over Thunderbolt 3.

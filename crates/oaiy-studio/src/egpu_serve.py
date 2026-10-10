@@ -1,7 +1,13 @@
-"""OAIY's way into tinygrad's LLM server (docs/MAC.md).
+"""OAIY's way into tinygrad's LLM server (docs/MAC.md), or onto the card for OAIY's own engine (docs/TINYGPU.md).
 
     python egpu_serve.py [--watch-stdin] --model FILE --serve PORT --max_context N ...   tinygrad.llm's own arguments
+    python egpu_serve.py [--watch-stdin] --webgpu PROGRAM ARGS...                        OAIY's engine on the card
     python egpu_serve.py --check                                                          what this Python has, as JSON
+
+With --webgpu the card is held here, through tinygrad, by webgpu_server.py (written beside this file): WebGPU's compute
+on it, for the engine's server PROGRAM (oaiy-llm-server, run with ARGS) to take as its WebGPU adapter. The engine then
+runs every model it runs anywhere, on the card; the key goes to it in its environment (OAIY_LLM_API_KEY), and it
+listens on this computer only.
 
 tinygrad's server listens on every network interface and asks for no key. Started through this file it listens on
 this computer only (127.0.0.1) and answers only requests that carry OAIY_EGPU_KEY as their bearer token. With
@@ -144,19 +150,66 @@ def check():
     print(json.dumps(found))
 
 
+def webgpu(args):
+    """Hold the card for OAIY's engine and run the engine's server on it, until either goes.
+
+    The card's server answers on a socket of this run's own; the engine is told it as its adapter. At the lifeline's
+    interrupt the engine is stopped first, then the card's last request let finish, and Python's exit releases the
+    card (within the lifeline's 15 s)."""
+    import shutil, subprocess, tempfile
+
+    at = args.index("--webgpu")
+    program, rest = args[at + 1], args[at + 2:]
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import webgpu_server
+
+    card = webgpu_server.Server(webgpu_server.Card())
+    folder = tempfile.mkdtemp(prefix="oaiy-egpu-")
+    path = os.path.join(folder, "card.sock")
+    sock = webgpu_server.listen(path)
+    lock, closing = threading.Lock(), threading.Event()
+    threading.Thread(target=webgpu_server.accept, args=(card, sock, lock, closing), daemon=True).start()
+    print(f"oaiy-egpu: {card.card.info()['name']} held for OAIY's engine", flush=True)
+    env = dict(os.environ, OAIY_WEBGPU_ADAPTER="tinygpu:" + path, OAIY_LLM_API_KEY=KEY)
+    child = subprocess.Popen([program, *rest], env=env)
+    code = 1
+    try:
+        code = child.wait()
+    except KeyboardInterrupt:
+        child.terminate()
+        try:
+            code = child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            code = child.wait()
+    finally:
+        closing.set()
+        lock.acquire(timeout=5)
+        sock.close()
+        shutil.rmtree(folder, ignore_errors=True)
+    sys.exit(code)
+
+
 def main():
     args = sys.argv[1:]
     if "--check" in args:
         return check()
     name, why = server()
-    if name is None:
+    if name is None and "--webgpu" not in args:
         sys.exit(f"oaiy-egpu: {why}")
     if not KEY:
         # (never a server that answers anyone: OAIY starts this with a key of that run's)
         sys.exit("oaiy-egpu: OAIY_EGPU_KEY is not set; this is started by OAIY, which gives it one")
     if "--watch-stdin" in args:
         args.remove("--watch-stdin")
+        # The lifeline's interrupt raised as Python's own, whatever this was started with: a process started in the
+        # background by a shell has SIGINT ignored, and Python then sets no handler, so the interrupt would do nothing
+        # and the lifeline's last resort (os._exit) would leave the card's firmware up.
+        import signal
+        signal.signal(signal.SIGINT, signal.default_int_handler)
         threading.Thread(target=lifeline, daemon=True).start()
+    if "--webgpu" in args:
+        return webgpu(args)
     local_only()
     thinking_as_asked()
     as_file(args)

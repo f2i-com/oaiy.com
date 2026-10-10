@@ -518,6 +518,10 @@ pub fn validate(v: &Json) -> Result<(), String> {
                 return Err(format!("llm.egpu.{key} must be text"));
             }
         }
+        // Which engine answers on the card: tinygrad's LLM server, or OAIY's own over WebGPU on it (`crate::egpu`).
+        if egpu.get("engine").is_some_and(|e| !matches!(e, Json::Null) && !matches!(e.as_str(), Some("" | "tinygrad" | "webgpu"))) {
+            return Err("llm.egpu.engine must be tinygrad or webgpu".into());
+        }
         // (null: the page's field emptied, which is the default)
         if egpu.get("ctx").is_some_and(|c| !matches!(c, Json::Null) && !c.as_i64().is_some_and(|n| (512..=1 << 20).contains(&n))) {
             return Err("llm.egpu.ctx must be a whole number in 512..1048576".into());
@@ -874,6 +878,8 @@ mod tests {
         set("null", models).unwrap();
         // (the page's Context field emptied: the default, not a refusal of the whole save)
         set(r#"{"enabled": true, "ctx": null}"#, models).unwrap();
+        set(r#"{"enabled": true, "engine": "webgpu"}"#, models).unwrap();
+        set(r#"{"enabled": true, "engine": "tinygrad"}"#, models).unwrap();
         for (egpu, needle) in [
             (r#"[1]"#, "llm.egpu must be an object"),
             (r#"{"enabled": "yes"}"#, "llm.egpu.enabled"),
@@ -884,6 +890,8 @@ mod tests {
             (r#"{"env": {"A": true}}"#, "llm.egpu.env"),
             (r#"{"env": ["A=1"]}"#, "llm.egpu.env"),
             (r#"{"extra_args": "--shard 2"}"#, "llm.egpu.extra_args"),
+            (r#"{"engine": "cuda"}"#, "llm.egpu.engine"),
+            (r#"{"engine": true}"#, "llm.egpu.engine"),
         ] {
             let err = set(egpu, models).unwrap_err();
             assert!(err.contains(needle), "{err} lacks {needle}");

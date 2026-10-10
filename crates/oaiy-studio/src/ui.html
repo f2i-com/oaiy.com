@@ -994,6 +994,9 @@ dialog::backdrop { background: var(--backdrop); }
           <label class="f"><span>Card</span><select data-bind="llm.egpu.device" id="egpu-device">
             <option value="NV">NVIDIA (tinygrad's NV)</option>
             <option value="AMD">AMD (tinygrad's AMD)</option></select></label>
+          <label class="f" title="tinygrad's own LLM server, or OAIY's engine run on the card over WebGPU through tinygrad (NVIDIA only; NVIDIA's compiler in Docker, as tinygrad's setup puts it): every model OAIY runs, and a 27B model about ten times as fast"><span>Engine on the card</span><select data-bind="llm.egpu.engine" id="egpu-engine">
+            <option value="tinygrad">tinygrad's LLM server</option>
+            <option value="webgpu">OAIY's own, over WebGPU (NVIDIA)</option></select></label>
           <label class="f"><span>Context (tokens; the card's memory for it is taken at the start)</span><input type="number" min="512" step="1024" data-bind="llm.egpu.ctx" data-type="intnull" placeholder="8192"></label>
           <label class="f"><span>When the card is not there, answer with</span><select data-bind="llm.egpu.fallback_model" id="egpu-fallback"></select></label>
         </div>
@@ -1289,6 +1292,7 @@ function renderConfig() {
   bindFields(); renderModels(); renderMemory(); renderRoutes(); renderExamples(); renderSelects();
   // (a card not named yet is an NVIDIA one: shown so, written only when chosen)
   if ($("#egpu-device") && !$("#egpu-device").value) $("#egpu-device").value = "NV";
+  if ($("#egpu-engine") && !$("#egpu-engine").value) $("#egpu-engine").value = "tinygrad";
   { const on = $("section.view.on"); if (on) renderJump(on.id.slice(2)); }
   $("#cfg-path").textContent = state ? "Configuration: " + state.config_path : "";
 }
@@ -1417,13 +1421,16 @@ function lastResidency(name) {
 // A Mac's eGPU through tinygrad's server (Settings): offered where the engines say so, used where it is switched on.
 function egpuOffered() { return !!state?.egpu?.available; }
 function egpuOn() { return egpuOffered() && !!cfg?.llm?.egpu?.enabled; }
-// A model's tick for it: a GGUF file's only, since tinygrad's server reads nothing else.
+// A model's tick for it: a GGUF file's only where tinygrad's server answers (it reads nothing else); any model where
+// OAIY's own engine does, over WebGPU on the card.
 function egpuTick(m) {
   if (!egpuOn() && !(egpuOffered() && m.egpu)) return "";
-  const gguf = /\.gguf$/i.test((m.path || "").trim());
+  const own = cfg?.llm?.egpu?.engine === "webgpu";
+  const gguf = own || /\.gguf$/i.test((m.path || "").trim());
+  const who = own ? "OAIY's engine on the eGPU (over WebGPU)" : "tinygrad's server on the eGPU";
   const held = state.egpu.model === m.name ? {ready: "Loaded on the eGPU", starting: "Loading on the eGPU"}[state.egpu.state] : "";
   return `<div class="row" style="margin-top:8px; gap:10px; align-items:center">
-    <label class="check" title="${gguf ? "Chats with this model are answered by tinygrad's server on the eGPU. When the card is not there, this Mac's GPU answers (Settings says with which model)." : "tinygrad's server reads GGUF files only."}"><input type="checkbox" data-egpu="${esc(m.name)}" ${m.egpu ? "checked" : ""} ${gguf || m.egpu ? "" : "disabled"}> On the eGPU (tinygrad), when the card is there</label>
+    <label class="check" title="${gguf ? `Chats with this model are answered by ${who}. When the card is not there, this Mac's GPU answers (Settings says with which model).` : "tinygrad's server reads GGUF files only."}"><input type="checkbox" data-egpu="${esc(m.name)}" ${m.egpu ? "checked" : ""} ${gguf || m.egpu ? "" : "disabled"}> On the eGPU (${own ? "WebGPU" : "tinygrad"}), when the card is there</label>
     ${held ? `<span class="tag gpu">${held}</span>` : ""}${m.egpu && !egpuOn() ? '<span class="muted small">The eGPU is switched off under Settings.</span>' : ""}</div>`;
 }
 // The models that can stand in for one on the eGPU: this Mac's own, the same model first.
