@@ -617,13 +617,14 @@ export function callOwnInstructions(brief: string, outreach = ''): string {
 
 /**
  * Whether a reply tells the caller a booking is (or will be) requested or noted:
- * "I'll request Tuesday at one", "I've noted that down", "I'll put you in for…".
+ * "I'll request Tuesday at one", "I've noted that down", "I'll put you in for…",
+ * "Let me get that in for you now", "Let me just get that Friday booked in".
  */
 export function promisesBooking(text: string): boolean {
   const t = text.trim();
   // Asking, or offering on a condition ("tell me a time and I'll take it as a request"), is not a promise.
   if (!t || /\?\s*$/.test(t) || /\b(if|tell me|let me know|would you like|what day|what time|which day|when would)\b/i.test(t)) return false;
-  return /\b(i['’]ll|i will|i['’]ve|i have|i['’]m going to)\s+(just\s+)?(request|book|note|pencil|put (you|it|that|this) (in|down)|lock)/i.test(t);
+  return /\b(i['’]ll|i will|i['’]ve|i have|i['’]m going to|let me)\s+(just\s+)?(request|book|note|pencil|lock|put (you|it|that|this|them) (in|down)|get (you|it|that|this|them)\b[^.?!]{0,30}?\b(in|down|booked|requested)\b)/i.test(t);
 }
 
 /** Whether the caller has said when they want to come: a day, a date or a time. */
@@ -632,7 +633,7 @@ export function namesATime(turns: Turn[]): boolean {
 }
 
 /** What a call's agent is told when it promised a booking without requesting it. */
-const BOOKING_NUDGE = "[OAIY] You told the caller their booking is requested, but request_appointment was not called, so nothing is recorded. Call it now (agreementPhrase: the caller's own words agreeing to the day and time), then tell them in a few words that it is requested.";
+const BOOKING_NUDGE = "[OAIY] You told the caller their booking is being requested, but nothing is recorded: request_appointment was not called, or the phone refused it (its answer says why). Call it now (agreementPhrase: the caller's own words agreeing to the day and time); if its answer said to check something with the caller, ask them in one short question first. Then tell them in a few words that it is requested.";
 
 /** How long a tool may run on a call before a short line is said, and the line. */
 const HOLD_AFTER_MS = 2_000;
@@ -2903,6 +2904,13 @@ function keptTurns(turns: Turn[]): Turn[] {
 }
 
 /** Whether this call's agent has requested an appointment. */
+/**
+ * Whether this call's agent has a booking request on record: request_appointment called, and its answer not a
+ * refusal (the phone's: it ends "(The phone refused it.)", or says nothing was recorded). A refused one is no request:
+ * an agent that promised a booking after one ("Let me get that in for you now.") booked nothing, and was not told.
+ */
 function requested(session: Session): boolean {
-  return session.agent.view().some((t) => t.role === 'assistant' && t.calls.some((c) => c.name === 'request_appointment'));
+  const turns = session.agent.view();
+  const asked = new Set(turns.flatMap((t) => (t.role === 'assistant' ? t.calls.filter((c) => c.name === 'request_appointment').map((c) => c.id) : [])));
+  return turns.some((t) => t.role === 'tool' && t.results.some((r) => asked.has(r.id) && !r.isError && !/\(The phone refused it\.\)\s*$/.test(r.content) && !/"recorded":\s*false/.test(r.content)));
 }

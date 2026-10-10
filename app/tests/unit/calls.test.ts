@@ -121,6 +121,11 @@ describe('speaking what the agent writes', () => {
     expect(promisesBooking("I can't check right now, so tell me the day and time you'd like and I'll take it as a request.")).toBe(false);
     expect(promisesBooking("I'll request that. What name should I use?")).toBe(false);
     expect(promisesBooking('Let me check what days we have open.')).toBe(false);
+    // as a live call's agent said it, twice, having booked nothing
+    expect(promisesBooking('Let me get that in for you now.')).toBe(true);
+    expect(promisesBooking("I'm doing well, thanks! Let me just get that Friday booked in for you.")).toBe(true);
+    expect(promisesBooking('Let me just double-check that date for you.')).toBe(false);
+    expect(promisesBooking('Let me get you some information about what we do.')).toBe(false);
   });
 
   it('a reply in quotation marks is said without them', () => {
@@ -196,7 +201,7 @@ function setup(provider: ProviderConfig = OPENAI, toolWait?: Promise<void>) {
     () => desktop as unknown as Desktop,
     { changed: () => {}, event: () => {} },
   );
-  return { sessions, calls, chats, project };
+  return { sessions, calls, chats, project, desktop };
 }
 
 async function settled(sessions: Sessions): Promise<void> {
@@ -950,6 +955,35 @@ describe('a phone call answered by the agent', () => {
     expect(a?.title).toBe('Hidden number');
     expect(b?.title).toBe('Hidden number');
     expect(a).not.toBe(b);
+  });
+
+  it('a booking the phone refused is no request: a promise after it is caught, and the agent asks again', async () => {
+    const booking = { callerName: 'Lance', service: 'Lawn mowing', date: '2026-10-16', time: '10:00', agreementPhrase: "Yes, please, that'd be great actually." };
+    const fake = fakeProvider('openai', [
+      { text: '', calls: [{ name: 'request_appointment', input: booking }] },
+      { text: 'Let me get that in for you now.' },
+      (body) => {
+        expect(JSON.stringify(body.messages)).toContain('or the phone refused it');
+        return { text: '', calls: [{ name: 'request_appointment', input: booking }] };
+      },
+      { text: "That's requested for Friday at ten." },
+    ]);
+    const { sessions, calls, desktop } = setup();
+    let refused = false;
+    const accept = desktop.callTool;
+    desktop.callTool = async (callId: string, name: string, args: unknown) => {
+      if (name === 'request_appointment' && !refused) {
+        refused = true;
+        calls.push([name, callId, args]);
+        return { ok: false, output: { error: "appointment date does not match the caller's selected weekday", recorded: false, status: 'not_recorded' } } as never;
+      }
+      return accept(callId, name, args);
+    };
+    await sessions.callEvent({ type: 'call.started', callId: 'call_r1', from: '+61400000041' });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_r1', text: 'Make it Friday at 10am. Yes please, book it.' });
+    await settled(sessions);
+    expect(calls.filter((c) => c[0] === 'request_appointment')).toHaveLength(2);
+    expect(fake.bodies).toHaveLength(4);
   });
 
   it('a booking promised but not requested: the agent is told once, and requests it', async () => {
