@@ -7,8 +7,9 @@ is a second place a model can run, through tinygrad's server.
 
 **Where this stands.** No release is built for macOS ([Updates](UPDATES.md)). The app can
 be made as a disk image without a Mac at hand (below), or built on the Mac. Nothing on this
-page has been run on a Mac by its authors yet. What has been checked, and how, is at the end
-of each section; what has not is said too.
+page has been run on a Mac that a person sits at: the app has been built, started and used
+on GitHub's Mac runner, and that is all. What has been checked, and how, is at the end of
+each section; what has not is said too.
 
 ## The app, from a disk image
 
@@ -54,12 +55,18 @@ image is installed over it.
 **Connections**, **Plugins**, give the path of that file to install it, then press
 **Trust this plugin** and **Start**. What has and has not been tried of it is below.
 
-**Checked, and not.** The app's Rust is read for a Mac from Windows (`cargo check
---target aarch64-apple-darwin`: the app, the headless server and the engine, no errors),
-which links nothing. The same sources are built, installed on a clean Ubuntu and used
-there by the same script the workflow's last step runs. Whether the app starts on a Mac,
-shows its tray icon, and what macOS says of an app signed by nobody on your version of it,
-only a run of the workflow and a Mac can say.
+**Checked, and not.** The workflow has run (10 October 2026, on GitHub's macOS 15
+Apple-silicon runner), and its first run went through: the engine, the app and the
+headless server built and linked for a Mac for the first time, the image was made, and the
+app copied out of it has a signature that holds (`codesign --verify --deep --strict`: ad
+hoc, with the hardened runtime). Started there twice, it answered, found the CLI and the
+engine inside its own bundle, and ran a flow. The headless server ran a flow too.
+
+That is a Mac nobody sits at. Not checked by anyone: the app on a Mac with a screen and a
+person (its window, its tray icon, what macOS says of an app signed by nobody on your
+version of it, the question about the microphone), an image that came through a browser
+(the runner's copy was never quarantined), and a model on the Mac's GPU from inside the
+app. The engines' own tests on a Mac's GPU are `tools/mac/check.sh`, below.
 
 ## Build and start
 
