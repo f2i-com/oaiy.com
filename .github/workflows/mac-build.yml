@@ -29,9 +29,9 @@ on:
         required: true
         default: '0.1.3-mac.1'
       what:
-        description: 'all: the image (and its signing) and the engine on the GPU. engine: only the engine on the GPU, to look at something there without building an image.'
+        description: 'all: the image (and its signing) and the engine asked one question on the GPU. engine: no image, and a long prompt to the engine too (an hour). webkit: only what WebKit isolates a page for.'
         type: choice
-        options: [all, engine]
+        options: [all, engine, webkit]
         default: all
 
 # Nothing may write: the run builds and uploads its own artifacts.
@@ -49,6 +49,7 @@ jobs:
   # of the catalog asked one question, and the GPU backend's own tests, each kernel's results held against the CPU's.
   engine:
     name: The engine on a Mac's GPU (Apple's compiler)
+    if: ${{ inputs.what != 'webkit' }}
     runs-on: macos-15
     timeout-minutes: 120
     steps:
@@ -85,8 +86,11 @@ jobs:
       # than a short one (in blocks of rows, chained on the GPU). On the first Mac the Agent answered such a prompt
       # with one syllable over and over. Asked both ways, so that the run says which path is wrong: as the engine
       # runs by default, and with its chained runs off (OAIY_NO_CHAIN), each kernel then an operation of its own.
+      # Only when the run is for the engine alone (`what: engine`): on this runner's virtual GPU a prompt of that
+      # length takes most of an hour, which a run that makes an image should not spend. A Mac with a GPU of its
+      # own answers it in a minute: `ENGINE_SMOKE_LONG=1 sh tools/engine-smoke.sh ...` there (docs/MAC.md).
       - name: A long prompt to the model, on the GPU
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && inputs.what == 'engine' }}
         continue-on-error: true
         env:
           ENGINE_SMOKE_NEEDS_GPU: '1'
@@ -95,7 +99,7 @@ jobs:
         run: sh tools/engine-smoke.sh target/release/oaiy-llm-server-webgpu "$RUNNER_TEMP/Qwen3.5-4B-Q4_K_M.gguf"
 
       - name: The same long prompt with the chained runs off
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && inputs.what == 'engine' }}
         continue-on-error: true
         env:
           ENGINE_SMOKE_NEEDS_GPU: '1'
@@ -103,20 +107,6 @@ jobs:
           ENGINE_SMOKE_LONG_LINES: '120'
           OAIY_NO_CHAIN: '1'
         run: sh tools/engine-smoke.sh target/release/oaiy-llm-server-webgpu "$RUNNER_TEMP/Qwen3.5-4B-Q4_K_M.gguf"
-
-      # What a Mac's webview needs before it calls a page cross-origin isolated (the Agent's code sandbox): a page
-      # on a scheme of its own, as the window serves the Agent's, under each embedder policy, and the same page from
-      # a local server.
-      - name: What WebKit isolates a page for
-        if: ${{ !cancelled() }}
-        continue-on-error: true
-        run: |
-          swiftc tools/mac/webview-probe.swift -o "$RUNNER_TEMP/webview-probe"
-          python3 tools/mac/isolated-page-server.py 18477 require-corp &
-          python3 tools/mac/isolated-page-server.py 18478 credentialless &
-          sleep 2
-          "$RUNNER_TEMP/webview-probe" http://127.0.0.1:18477/ http://127.0.0.1:18478/ http://localhost:18477/ || true
-          kill %1 %2 2> /dev/null || true
 
       # Told, and not yet held to: on this runner (an Apple M1 that is a virtual machine, with a virtual GPU) 25 of
       # these 97 tests gave other numbers than the CPU the first time the step ran (f16 and tiled matmuls, the media
@@ -145,9 +135,33 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+  # What a Mac's webview needs before it calls a page cross-origin isolated (the Agent's code sandbox): a page on a
+  # scheme of its own, as the window serves the Agent's, under each embedder policy, and the same page from a local
+  # server. A job of its own, and only when asked for (`what: webkit`): the same two files answer it on any Mac in
+  # a minute (docs/MAC.md), which is the better place to ask.
+  webkit:
+    name: What WebKit isolates a page for
+    if: ${{ inputs.what == 'webkit' }}
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Ask WebKit
+        run: |
+          sw_vers | tr '\n' ' '; echo
+          swiftc tools/mac/webview-probe.swift -o "$RUNNER_TEMP/webview-probe"
+          python3 tools/mac/isolated-page-server.py 18477 require-corp &
+          python3 tools/mac/isolated-page-server.py 18478 credentialless &
+          sleep 2
+          "$RUNNER_TEMP/webview-probe" http://127.0.0.1:18477/ http://127.0.0.1:18478/ http://localhost:18477/ || true
+          kill %1 %2 2> /dev/null || true
+
   dmg:
     name: OAIY Desktop (.dmg, Apple silicon)
-    if: ${{ inputs.what != 'engine' }}
+    if: ${{ inputs.what == 'all' }}
     runs-on: macos-15
     timeout-minutes: 120
     steps:
@@ -290,6 +304,9 @@ jobs:
             screencapture -x "screens/$view.png" || echo "no picture of $view"
             kill "$pid" 2> /dev/null || true
             sleep 5
+            # Where the window put the page, against where the dashboard asked for it (embed.rs, `note_placement`).
+            cp "$home/Library/Application Support/com.oaiy.app/logs/oaiy-desktop.log" "screens/$view-desktop.log" 2> /dev/null || echo "no log of $view"
+            grep -h "embed: " "screens/$view-desktop.log" 2> /dev/null || echo "nothing was placed for $view"
           done
           ls -la screens
 

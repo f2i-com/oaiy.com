@@ -84,6 +84,38 @@ tiled matmuls, the media models' convolutions, grouped experts, Q2_0). The runne
 a virtual one; whether a Mac's own GPU gives the same is not known, and `tools/mac/check.sh`
 on a Mac is what says.
 
+**Seen on the first Mac, and open.** With the signed image (0.1.3-mac.5) the same person
+then met three things that are not fixed, because each needs a Mac to look at:
+
+- **A long prompt is answered with one syllable over and over.** The Agent's first message
+  carries several thousand tokens of instructions, and a Qwen3.5 9B answered it with
+  "angangang…". A prompt that long is read by other kernels than a short one (in blocks of
+  rows, chained on the GPU), and the short question above goes through none of them.
+  `ENGINE_SMOKE_LONG=1 sh tools/engine-smoke.sh target/release/oaiy-llm-server-webgpu <model.gguf>`
+  asks such a prompt (it names a word, a page of sentences follows, and it asks for the
+  word); with `OAIY_NO_CHAIN=1` as well it asks it with the chained runs off. Which of the
+  two is wrong, and what `check.sh` says on that Mac, is where to start.
+- **The Agent says "The code sandbox is unavailable: the page is not cross-origin
+  isolated".** The window serves the Agent's page from a scheme of its own with the opener
+  and embedder policies that isolate a page in a browser (`require-corp` off Windows), and
+  WebKit did not isolate it. `swiftc tools/mac/webview-probe.swift -o /tmp/webview-probe`
+  and then `/tmp/webview-probe` asks WebKit itself: a page on a scheme of its own under each
+  embedder policy, and, for each `http://127.0.0.1:<port>/` given to it with
+  `python3 tools/mac/isolated-page-server.py <port> require-corp` running, the same page
+  from a local server. If only the local server's page is isolated, the Agent's page has to
+  come from the desktop's own port on a Mac, and that is another origin: what the page keeps
+  under `oaiy://localhost` (its projects, its settings) is not seen from it.
+- **The tabs of the Engines and Flows sections are half covered by the page under them.**
+  Those pages are webviews of their own, laid over a box the dashboard measures. A build
+  after that image writes a line beginning `embed:` to the desktop's log
+  (`~/Library/Application Support/com.oaiy.app/logs/oaiy-desktop.log`) for each page's first
+  placements: where the dashboard asked for the page, what the dashboard saw as it measured
+  (its viewport, how far it was scrolled), and where the window says the page and the
+  dashboard's own page then are. `OAIY_START_VIEW=engines` (or `flows`, `agent`) in the
+  app's environment opens that section as the window comes up, for a picture of it. Since
+  then the dashboard also says where the box is again when it has moved without changing
+  size, which it did not; whether that was the cause is not known.
+
 That is a Mac nobody sits at. Not checked by anyone: the app on a Mac with a screen and a
 person (its window, its tray icon, what macOS says of an app signed by nobody on your
 version of it, the question about the microphone), an image that came through a browser

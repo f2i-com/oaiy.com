@@ -350,9 +350,80 @@ fn own(page: Page, url: &Url) -> bool {
 /// command (which runs on the main thread) waits on that thread's own event
 /// loop, and on Windows never returns.
 #[tauri::command]
-pub async fn show_embedded<R: Runtime>(app: AppHandle<R>, window: tauri::Window<R>, page: String, x: f64, y: f64, width: f64, height: f64) -> Result<(), String> {
+#[allow(clippy::too_many_arguments)]
+pub async fn show_embedded<R: Runtime>(app: AppHandle<R>, window: tauri::Window<R>, page: String, x: f64, y: f64, width: f64, height: f64, seen: Option<Seen>) -> Result<(), String> {
     let page = Page::parse(&page).ok_or_else(|| format!("no embedded page called {page}"))?;
     let _one = placing();
+    let placed = show_at(&app, &window, page, x, y, width, height);
+    if placed.is_ok() {
+        note_placement(&app, &window, page, [x, y, width, height], seen);
+    }
+    placed
+}
+
+/// What the dashboard's page saw as it measured the box (`EmbeddedPage.tsx`), for the log: its viewport in CSS
+/// pixels, how far it was scrolled, and the pixels of the screen to one of its own.
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Seen {
+    #[serde(default)]
+    width: f64,
+    #[serde(default)]
+    height: f64,
+    #[serde(default)]
+    scroll_x: f64,
+    #[serde(default)]
+    scroll_y: f64,
+    #[serde(default)]
+    ratio: f64,
+}
+
+/// How many placements of each page are written to the log in a run. A page is placed again at every change of
+/// the window's size, so not all of them: the first few say what there is to say.
+const PLACEMENTS_LOGGED: usize = 4;
+
+/// One line in the log for a page's first placements: the box the dashboard asked for, what the dashboard saw as
+/// it measured, and where the window says the page and the dashboard's own page then are. The page is laid by
+/// the window's toolkit from numbers measured in the dashboard, two things that agree on Windows and were seen
+/// not to on a Mac (the page over half of a section's tabs); this is what tells which of them is off, on a
+/// system nobody here can look at.
+fn note_placement<R: Runtime>(app: &AppHandle<R>, window: &tauri::Window<R>, page: Page, asked: [f64; 4], seen: Option<Seen>) {
+    static LOGGED: [std::sync::atomic::AtomicUsize; 3] = [const { std::sync::atomic::AtomicUsize::new(0) }; 3];
+    let slot = Page::ALL.iter().position(|p| *p == page).unwrap_or(0);
+    if LOGGED[slot].fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= PLACEMENTS_LOGGED {
+        return;
+    }
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let of = |label: &str| -> String {
+        let Some(webview) = app.get_webview(label) else { return "none".into() };
+        match (webview.position(), webview.size()) {
+            (Ok(at), Ok(size)) => {
+                let (at, size) = (at.to_logical::<f64>(scale), size.to_logical::<f64>(scale));
+                format!("{:.1},{:.1} {:.1}x{:.1}", at.x, at.y, size.width, size.height)
+            }
+            _ => "not told".into(),
+        }
+    };
+    let size = |size: tauri::Result<tauri::PhysicalSize<u32>>| size.map_or_else(|_| "not told".to_string(), |s| {
+        let s = s.to_logical::<f64>(scale);
+        format!("{:.1}x{:.1}", s.width, s.height)
+    });
+    let seen = seen.map_or_else(|| "not said".to_string(), |s| format!("viewport {:.1}x{:.1}, scrolled {:.1},{:.1}, {} screen pixels to one of its own", s.width, s.height, s.scroll_x, s.scroll_y, s.ratio));
+    log::info!(
+        "embed: {} asked for at {:.1},{:.1} {:.1}x{:.1} (the dashboard saw: {seen}); it is at {}; the dashboard's page is at {}; the window is {} inside, {} outside, scale {scale}",
+        page.label(),
+        asked[0],
+        asked[1],
+        asked[2],
+        asked[3],
+        of(page.label()),
+        of(window.label()),
+        size(window.inner_size()),
+        size(window.outer_size()),
+    );
+}
+
+fn show_at<R: Runtime>(app: &AppHandle<R>, window: &tauri::Window<R>, page: Page, x: f64, y: f64, width: f64, height: f64) -> Result<(), String> {
     for other in Page::ALL {
         if other != page {
             if let Some(w) = app.get_webview(other.label()) {
@@ -366,20 +437,20 @@ pub async fn show_embedded<R: Runtime>(app: AppHandle<R>, window: tauri::Window<
         webview.set_size(size).map_err(|e| e.to_string())?;
         webview.show().map_err(|e| e.to_string())?;
         let _ = webview.set_focus();
-        let _ = webview.eval(theme_script(theme(&app)));
+        let _ = webview.eval(theme_script(theme(app)));
         return Ok(());
     }
     if page == Page::Engines {
         if crate::engines::ui_url().is_none() {
             return Err("the engines are not running yet: they start with OAIY, or run oaiy-studio".into());
         }
-    } else if dist(&app, page).is_none() {
+    } else if dist(app, page).is_none() {
         return Err(format!("the {} page is not built: run `npm run build` in {}", page.folder(), match page {
             Page::Agent => "app/",
             _ => "platform/ui/",
         }));
     }
-    window.add_child(builder(&app, page), position, size).map_err(|e| e.to_string())?;
+    window.add_child(builder(app, page), position, size).map_err(|e| e.to_string())?;
     Ok(())
 }
 
