@@ -960,6 +960,7 @@ dependencies = [
  "pollster",
  "rayon",
  "wgpu",
+ "wgpu-tinygpu",
 ]
 
 [[package]]
@@ -2862,6 +2863,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wgpu-tinygpu"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "pollster",
+ "wgpu",
+ "wgsl-cuda",
+]
+
+[[package]]
 name = "wgpu-types"
 version = "30.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2875,6 +2886,13 @@ dependencies = [
  "raw-window-handle",
  "static_assertions",
  "web-sys",
+]
+
+[[package]]
+name = "wgsl-cuda"
+version = "0.1.0"
+dependencies = [
+ "naga",
 ]
 
 [[package]]

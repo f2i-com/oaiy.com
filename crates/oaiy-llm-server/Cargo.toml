@@ -22,6 +22,9 @@ default = ["webgpu"]
 # Every model's kernels on any GPU wgpu reaches (see crates/ggml-rs-wgpu); without it
 # (`--no-default-features`) the server runs GGUF models on the CPU.
 webgpu = ["dep:ggml-rs-wgpu"]
+# The WebGPU engine also on an NVIDIA card a Mac reaches only through tinygrad's TinyGPU (OAIY_WEBGPU_ADAPTER=tinygpu;
+# docs/TINYGPU.md).
+tinygpu = ["webgpu", "ggml-rs-wgpu/tinygpu"]
 
 # std-only apart from the workspace crates.
 [dependencies]

@@ -1,0 +1,14 @@
+[package]
+name = "wgpu-tinygpu"
+version = "0.1.0"
+edition = "2021"
+description = "A wgpu adapter for an NVIDIA card a Mac reaches only through tinygrad's TinyGPU: WebGPU's compute, its kernels as CUDA (wgsl-cuda), run by tools/tinygpu/webgpu_server.py."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+wgpu = { version = "30", features = ["custom"] }
+wgsl-cuda = { path = "../wgsl-cuda" }
+
+[dev-dependencies]
+pollster = "0.4"
+bytemuck = "1.16"

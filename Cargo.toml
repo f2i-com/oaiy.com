@@ -53,6 +53,12 @@ members = [
     # strict JSON and base64url, the protocol's signed objects, pairing v3 for both parties, the poll loop's rules (README 5.1.1) and the client behind traits.
     # A library on `oaiy-crypto` with no consumer yet, so a member and not a default member, like the two above.
     "crates/oaiy-relay-core",
+    # A WGSL compute kernel as CUDA C++ (naga's module walked into a __global__ kernel): for a WebGPU runtime on an
+    # NVIDIA card no WebGPU driver reaches, a Mac's eGPU through tinygrad's TinyGPU. A member, not a default member.
+    "crates/wgsl-cuda",
+    # wgpu's compute on that card: a wgpu adapter (its `custom` backend) that hands a program's buffers, kernels (as
+    # wgsl-cuda's CUDA) and submissions to tools/tinygpu/webgpu_server.py, which holds the card through tinygrad.
+    "crates/wgpu-tinygpu",
 ]
 default-members = [
     "crates/oaiy-engine",

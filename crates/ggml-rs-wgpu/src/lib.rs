@@ -326,6 +326,8 @@ impl WgpuBackend {
         desc.backends = wgpu::Backends::PRIMARY;
         let instance = wgpu::Instance::new(desc.with_env());
         let adapter = match std::env::var("OAIY_WEBGPU_ADAPTER").ok().map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()) {
+            // (an NVIDIA card a Mac reaches only through tinygrad: its server's socket after a colon)
+            Some(wanted) if wanted == "tinygpu" || wanted.starts_with("tinygpu:") => tinygpu_adapter(wanted.strip_prefix("tinygpu:"))?,
             Some(wanted) => {
                 let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
                 let names: Vec<String> = adapters.iter().map(|a| { let i = a.get_info(); format!("{} ({:?})", i.name, i.backend) }).collect();
@@ -854,3 +856,16 @@ impl WgpuBackend {
 
 #[cfg(test)]
 mod tests;
+
+/// The card tinygrad's server holds (`tools/tinygpu/webgpu_server.py`), as a wgpu adapter: at `socket`, else where
+/// the server listens by default.
+#[cfg(feature = "tinygpu")]
+fn tinygpu_adapter(socket: Option<&str>) -> Result<wgpu::Adapter, String> {
+    let path = socket.map(std::path::PathBuf::from).unwrap_or_else(wgpu_tinygpu::default_socket);
+    wgpu_tinygpu::adapter(&path)
+}
+
+#[cfg(not(feature = "tinygpu"))]
+fn tinygpu_adapter(_socket: Option<&str>) -> Result<wgpu::Adapter, String> {
+    Err("OAIY_WEBGPU_ADAPTER=tinygpu: this build has no TinyGPU adapter (its feature `tinygpu`)".into())
+}

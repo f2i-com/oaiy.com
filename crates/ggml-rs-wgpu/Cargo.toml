@@ -5,12 +5,18 @@ edition     = "2021"
 license     = "MIT OR Apache-2.0"
 description = "WebGPU backend for ggml-rs: quantized matmuls in WGSL on any wgpu adapter, the rest on the CPU backend."
 
+[features]
+# An NVIDIA card a Mac reaches only through tinygrad (TinyGPU), as a wgpu adapter: OAIY_WEBGPU_ADAPTER=tinygpu (its
+# server's socket after a colon, else ~/.cache/tinygpu-webgpu/server.sock; tools/tinygpu/webgpu_server.py).
+tinygpu = ["dep:wgpu-tinygpu"]
+
 [dependencies]
 ggml-rs     = { path = "../ggml-rs", version = "0.0.1" }
 ggml-quants = { path = "../ggml-quants", version = "0.0.1" }
 # (naga-ir: its WGSL parser, to measure a kernel's workgroup memory, which wgpu does not check against the limit)
 wgpu        = { version = "30", features = ["naga-ir"] }
 pollster    = "0.4"
+wgpu-tinygpu = { path = "../wgpu-tinygpu", optional = true }
 # f16 rounding of EXL3 projections' activations, as exllamav3 rounds them.
 half        = { version = "2.4" }
 rayon       = "1.10"

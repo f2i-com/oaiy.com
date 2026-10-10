@@ -1,0 +1,9 @@
+[package]
+name = "wgsl-cuda"
+version = "0.1.0"
+edition = "2021"
+description = "A WGSL compute kernel as CUDA C++: naga's module walked into one __global__ kernel, for a WebGPU runtime on an NVIDIA card no WebGPU driver reaches (a Mac's eGPU through TinyGPU)."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+naga = { version = "30.0.1", features = ["wgsl-in"] }

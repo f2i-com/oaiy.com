@@ -1,0 +1,38 @@
+From 4fbffd88d8c300a80d38921b57b4bef2a2fbd55e Mon Sep 17 00:00:00 2001
+From: izuc <the@lance.name>
+Date: Sat, 10 Oct 2026 17:51:37 +1100
+Subject: [PATCH] compile_server: read and write the unbuffered pipes to their
+ end (a cubin past 64 KB came back cut short)
+
+---
+ tinygrad/device.py | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/tinygrad/device.py b/tinygrad/device.py
+index 5b1a85cca..7335b2d17 100644
+--- a/tinygrad/device.py
++++ b/tinygrad/device.py
+@@ -307,8 +307,18 @@ class Compiler:
+     argv = f"{cmd} {pathlib.Path(__file__).parent}/runtime/support/compileserver.py {type(self).__module__}:{type(self).__name__} {arch}"
+     return subprocess.Popen(argv.split() + [str(a) for a in args], stdout=subprocess.PIPE, stdin=subprocess.PIPE, bufsize=0)
+   def compile_server(self, src:str, proc:subprocess.Popen) -> bytes:
+-    unwrap(proc.stdin).write(struct.pack("I", len(src.encode())) + src.encode())
+-    if (lib:=unwrap(proc.stdout).read(struct.unpack("I", unwrap(proc.stdout).read(4))[0])): return lib
++    # the pipes are unbuffered (bufsize=0): a read or a write may move fewer bytes than asked, so both loop to the end
++    # (a cubin past the pipe's 64 KB came back cut short, and its ELF had no section headers)
++    stdin, stdout = unwrap(proc.stdin), unwrap(proc.stdout)
++    pending = memoryview(struct.pack("I", len(src.encode())) + src.encode())
++    while pending: pending = pending[stdin.write(pending):]
++    def read_exact(n:int) -> bytes:
++      got = bytearray()
++      while len(got) < n:
++        if not (chunk:=stdout.read(n - len(got))): raise CompileError("the compile server closed its output")
++        got += chunk
++      return bytes(got)
++    if (lib:=read_exact(struct.unpack("I", read_exact(4))[0])): return lib
+     raise CompileError("Compilation Error")
+ 
+ 
+-- 
+2.54.0 (Apple Git-157)
+
