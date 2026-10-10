@@ -211,6 +211,8 @@ async function main(): Promise<void> {
   let agentModelKnown = false;
   /** When the desktop last said (ms): a run a while after asks again first. */
   let agentModelAt = 0;
+  /** When OAIY was last looked at again for a model to chat on (ms): see lookAgainForOaiy. */
+  let lookedAgainAt = 0;
   /** Codex's own default model, once looked up (for a ChatGPT choice that names none). */
   let codexDefault: string | null = null;
   /** Why ChatGPT cannot be used now, for the model chip ('' when nothing is known against it). */
@@ -300,6 +302,9 @@ async function main(): Promise<void> {
     // (Codex's default, if it is needed, is looked up just below, once.)
     if (desktop && !desktopProblem && k !== 'call' && Date.now() - agentModelAt > 15_000) await followAgentModel(2000, false);
     if (agentModel.source === 'chatgpt' && desktop && k !== 'call' && !agentModel.model && !codexDefault) await lookUpCodexDefault(signal);
+    // On the engine with nothing to run on: OAIY may have a language model now that it had not when the page looked
+    // (see lookAgainForOaiy). Looked for before the run says there is no provider.
+    if (agentModel.source === 'engine' && !activeProvider()) await lookAgainForOaiy();
     const c = control;
     if (!c) {
       if (k === 'setup') throw new Error('Setting up OAIY needs OAIY Desktop: pair this page with it (the desktop chip), then ask again.');
@@ -1653,7 +1658,8 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     const chatProvider = oaiyProvider(providers, found);
     if (chatProvider) {
       providers.push(chatProvider);
-      activeId ??= chatProvider.id;
+      // In use when nothing else is (an id kept for a provider that is gone is nothing else).
+      if (!activeProvider()) activeId = chatProvider.id;
       await saveProviders(providers, activeId);
       renderChips();
     }
@@ -1661,6 +1667,21 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       const can = mediaAbilities(media);
       chat.system(`Found ${found.service} ${found.version} at ${found.origin}.${can ? ` The agent can make ${can} with it.` : ''}${chatProvider ? ` It is in the AI providers for chat too${activeId === chatProvider.id ? ', and in use' : ''}.` : ''} Change this in Settings → Images, video and audio.`);
     }
+  }
+
+  /**
+   * OAIY looked at again, for a page with no provider to chat on. The page looks as it loads, and an OAIY that has no
+   * language model then gives it no provider. In OAIY's own window that is every first run: the Agent's page is made,
+   * hidden, as the desktop starts, and the setup wizard downloads the model after that. Nothing looked again (the
+   * minute's look only followed a provider that was there), so the person's first message was answered "No AI provider
+   * is set up yet" with the model they had just downloaded sitting in Engines. It is looked for before a run and
+   * every minute while there is no provider, where the page looks at all (agent/lookup.ts), and not more often than
+   * every few seconds.
+   */
+  async function lookAgainForOaiy(): Promise<void> {
+    if (Date.now() - lookedAgainAt < 5000) return;
+    lookedAgainAt = Date.now();
+    await lookForOaiy().catch(() => {});
   }
 
   /**
@@ -1695,6 +1716,12 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
 
   // What Engines has chosen is looked at again now and then (it may be changed there at any time).
   setInterval(() => {
+    // With no provider at all, OAIY is looked at whole: it may have a model to chat on by now, and the chip says so
+    // before the person writes anything.
+    if (agentModel.source === 'engine' && !activeProvider()) {
+      void lookAgainForOaiy();
+      return;
+    }
     if (!providers.some((p) => p.followEngine)) return;
     const origin = whereToFollow({ host: HOST, discovered: media.discovered?.origin });
     if (!origin) return;
