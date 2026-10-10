@@ -208,10 +208,13 @@ Two transports, neither a WebSocket.
 
 ## Services, models and the provider gateway
 
-- Service templates (`services/registry.rs`, `resources/templates`): oaiy-voice, aokie-stt,
-  aokie-tts, playwright-browser; health checks, crash backoff, autostart, GPU pinning. Models
+- Service templates (`services/registry.rs`, `resources/templates`): oaiy-voice is the one
+  every install is given; health checks, crash backoff, autostart, GPU pinning. Models
   run in OAIY's own engine, so the krea2, lance, llama-cpp, ollama and ltx2-video templates
-  are retired: at startup the copies OAIY seeded are removed, and edited ones are kept.
+  are retired, and so are aokie-stt, aokie-tts and playwright-browser (calls run on OAIY
+  Voice, and no install needs a browser service until a flow of its own does): at startup
+  the copies OAIY seeded are removed, and edited ones are kept. Those three templates are
+  still in `resources/templates`: one copied into `<data>/templates` is a service again.
 - Downloads (`downloads.rs`): HF blob → resolve, Range resume, SHA-256 from `X-Linked-ETag`;
   a curated catalog (`catalog.rs`). Portable Python and venvs (`python.rs`), a pinned Node for
   the CLI (`node_runtime.rs`).

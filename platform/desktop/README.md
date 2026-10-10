@@ -464,7 +464,10 @@ and executes a real flow through HTTP with system Node excluded from PATH.
 **Service installs on Linux:** a service template can carry a `unix` install
 script (`.sh`) alongside the Windows one, embedded + seeded by the registry.
 `playwright-browser` has a working `.sh` installer; OAIY Voice and the Aokie
-voices install on Windows. The portable Python
+voices install on Windows. (Of these only OAIY Voice is listed in every install now.
+The browser service and the Aokie voices are no longer seeded: their templates are in
+`src-tauri/resources/templates`, and one copied into `<data>/templates` is listed and
+kept like any service of your own.) The portable Python
 runtime + venvs are already cross-platform, and venv `run.command` paths
 (`…/Scripts/python.exe`) are rewritten to `…/bin/python` on Unix automatically.
 

@@ -46,28 +46,17 @@ fn allowed_origins_env(has_windows: bool, on_windows: bool) -> String {
 /// no built-in LLM, picture or video server here. The ones that used to be are
 /// in [`RETIRED_BUILTINS`], which removes their seeded copies at startup.
 const BUILTIN_TEMPLATES: &[(&str, &str)] = &[
-    (
-        "playwright-browser.json",
-        include_str!("../../resources/templates/playwright-browser.json"),
-    ),
-    // The Aokie receptionist's ears and voice. Shipped as ordinary services —
-    // installable, startable and visible in the Services panel — because that
-    // is what they were in FormLogic Desktop, and because loading ~800 MB of
-    // ONNX weights once and keeping them warm is the difference between a
-    // receptionist that answers and one that misses the first sentence of
-    // every call. Their run command lives inside the Aokie plugin directory;
-    // installing them without the plugin present fails with that as the reason.
-    (
-        "aokie-stt.json",
-        include_str!("../../resources/templates/aokie-stt.json"),
-    ),
-    (
-        "aokie-tts.json",
-        include_str!("../../resources/templates/aokie-tts.json"),
-    ),
     // OAIY's own voice for calls (speech-to-text and text-to-speech in one
-    // resident process on the GPU), which calls use in place of the two above.
-    // Its program ships with OAIY (see `oaiy_program`).
+    // resident process on the GPU). Its program ships with OAIY (see
+    // `oaiy_program`).
+    //
+    // It is the only one. The Aokie receptionist's own ears and voice
+    // (`aokie-stt`, `aokie-tts`) were listed beside it and were not what calls
+    // used, and the browser service (`playwright-browser`) was listed for every
+    // install whether or not a flow ever drove a browser: all three are in
+    // [`RETIRED_BUILTINS`] now. Their templates are still in
+    // `resources/templates`, for whoever wants one: a copy put in
+    // `<data>/templates` by hand is a service like any other, and is kept.
     (
         "oaiy-voice.json",
         include_str!("../../resources/templates/oaiy-voice.json"),
@@ -146,6 +135,33 @@ const RETIRED_BUILTINS: &[RetiredBuiltin] = &[
         file: "ollama.json",
         id: "ollama",
         shipped: &["1c099a38bf7789f940b76fd76b5c98afd4f53f27f26609a97c4a2a6d33cee484"],
+    },
+    // Not the engine's work, these three: services nobody had asked for, listed in every install. The receptionist's
+    // calls run on OAIY Voice, and no flow needs a browser until someone builds one that does.
+    RetiredBuiltin {
+        file: "playwright-browser.json",
+        id: "playwright-browser",
+        shipped: &[
+            "8f781d1622e93a70eef6a3dd3cd75301e25068760b7b64bb4d4b52159985e833",
+            "246c7521b787677d6a6069a7d404c3573a0f12d76d0c2be5590533e80e314f21",
+            "0465908dfaf31c6e06eeef1e2c443599a6337c1fda4b1ee1ba40b9507f37d51c",
+        ],
+    },
+    RetiredBuiltin {
+        file: "aokie-stt.json",
+        id: "aokie-stt",
+        shipped: &[
+            "dade085fd421825e85d5e6c99ce6ef1a93db8639abded1fa68028ba0dd1152e1",
+            "eaec7f8e74a17408edb4b65b4479aa63ed1fb4e38129746e0fa8a4047f7490be",
+        ],
+    },
+    RetiredBuiltin {
+        file: "aokie-tts.json",
+        id: "aokie-tts",
+        shipped: &[
+            "6fd3d2659adb3861567f4bfbaa7e9e2ce262fd323e628a3616ab16fb1f3f0858",
+            "fe07b74c9691df83c0436d8f651b8478d44bd091713bc893635ec0500ad1dbce",
+        ],
     },
 ];
 
@@ -3000,9 +3016,22 @@ mod tests {
         assert_eq!(allowed_origins_env(false, false), "");
     }
 
+    /// A registry of a folder that has the browser service in it as a person put it there (OAIY lists it for
+    /// nobody any more): the template OAIY used to seed, with a change of theirs, so it is not taken for a seeded copy.
+    fn scratch_registry_with_browser(tag: &str) -> (PathBuf, Registry) {
+        let dir = std::env::temp_dir().join(format!("oaiy-browser-{tag}-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("templates")).unwrap();
+        let own = include_str!("../../resources/templates/playwright-browser.json").replacen('{', "{ ", 1);
+        std::fs::write(dir.join("templates/playwright-browser.json"), own).unwrap();
+        let reg = Registry::init(dir.clone(), dir.join("models"), Vec::new()).expect("a fresh temp dir is writable");
+        assert!(reg.services.contains_key(BROWSER_SERVICE_ID), "a browser service someone added themselves is kept and listed");
+        (dir, reg)
+    }
+
     #[test]
     fn the_registry_passes_the_browser_service_the_windows_origins() {
-        let (dir, reg) = scratch_registry("origins-env");
+        let (dir, reg) = scratch_registry_with_browser("origins-env");
         let env = env_of(&reg, "playwright-browser");
         let expected = allowed_origins_env(cfg!(feature = "gui"), cfg!(windows));
         assert_eq!(env.get("OAIY_ALLOWED_ORIGINS"), Some(&expected), "the variable is passed, resolved");
@@ -3031,7 +3060,7 @@ mod tests {
         // Editing a built-in service in the Services panel rewrites its template as the person's own,
         // and OAIY never refreshes it: one from before this variable existed must not start a server
         // that lets no window in.
-        let (dir, reg) = scratch_registry("origins-edited");
+        let (dir, reg) = scratch_registry_with_browser("origins-edited");
         let svc = &reg.services["playwright-browser"];
         let mut older = svc.template.run.clone();
         older.env.remove("OAIY_ALLOWED_ORIGINS");
@@ -3052,10 +3081,51 @@ mod tests {
     fn no_other_service_is_given_the_origins() {
         // The voice services and the rest are not hardened here (N12): they get what their templates say.
         let (dir, reg) = scratch_registry("origins-others");
-        for id in ["oaiy-voice", "aokie-stt", "aokie-tts"] {
+        for id in ["oaiy-voice"] {
             assert!(!env_of(&reg, id).contains_key("OAIY_ALLOWED_ORIGINS"), "{id}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The three services OAIY listed for everyone and no longer does: a copy OAIY seeded goes (recognised by its
+    /// snapshot, or with none by what OAIY shipped), a copy the person changed stays and is listed.
+    #[test]
+    fn the_aokie_voices_and_the_browser_service_are_no_longer_listed_for_everyone() {
+        let shipped = [
+            ("playwright-browser.json", "playwright-browser", include_str!("../../resources/templates/playwright-browser.json")),
+            ("aokie-stt.json", "aokie-stt", include_str!("../../resources/templates/aokie-stt.json")),
+            ("aokie-tts.json", "aokie-tts", include_str!("../../resources/templates/aokie-tts.json")),
+        ];
+        // A new install has OAIY Voice and nothing else.
+        let (dir, reg) = scratch_registry("only-voice");
+        assert_eq!(reg.services.keys().map(String::as_str).collect::<Vec<_>>(), vec!["oaiy-voice"]);
+        for (file, _, _) in shipped {
+            assert!(!dir.join("templates").join(file).exists(), "{file} is not seeded");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        for (file, id, body) in shipped {
+            // What every install up to now has: the copy OAIY seeded, as a Windows checkout wrote it (CRLF), with its snapshot.
+            let seeded = body.replace("\r\n", "\n").replace('\n', "\r\n");
+            let dir = install_with_seeded(&format!("retired-{id}"), file, &seeded);
+            let reg = Registry::init(dir.clone(), dir.join("models"), Vec::new()).unwrap();
+            assert!(!reg.services.contains_key(id) && !dir.join("templates").join(file).exists(), "{id}: the seeded copy is removed");
+            let _ = std::fs::remove_dir_all(&dir);
+
+            // From a build before snapshots: known by what OAIY shipped.
+            let dir = install_with_seeded(&format!("retired-old-{id}"), file, body);
+            std::fs::remove_file(dir.join("templates").join(format!(".{file}.seed"))).unwrap();
+            let reg = Registry::init(dir.clone(), dir.join("models"), Vec::new()).unwrap();
+            assert!(!reg.services.contains_key(id), "{id}: a copy with no snapshot is known by its digest");
+            let _ = std::fs::remove_dir_all(&dir);
+
+            // The person's own: kept, and listed.
+            let dir = install_with_seeded(&format!("retired-own-{id}"), file, body);
+            std::fs::write(dir.join("templates").join(file), body.replacen('{', "{ ", 1)).unwrap();
+            let reg = Registry::init(dir.clone(), dir.join("models"), Vec::new()).unwrap();
+            assert!(reg.services.contains_key(id) && dir.join("templates").join(file).exists(), "{id}: a copy the person changed is theirs");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
@@ -3449,10 +3519,10 @@ mod tests {
         assert!(!dir.join("templates/ollama.json").exists(), "the seeded copy is removed");
         assert!(!dir.join("templates/.ollama.json.seed").exists(), "and its snapshot");
         assert!(!reg.services.contains_key("ollama"), "no longer listed");
-        for kept in ["oaiy-voice", "aokie-stt", "aokie-tts", "playwright-browser"] {
+        for kept in ["oaiy-voice"] {
             assert!(reg.services.contains_key(kept), "{kept} is still a built-in");
         }
-        assert_eq!(reg.services.len(), 4, "only the kept built-ins: {:?}", reg.services.keys());
+        assert_eq!(reg.services.len(), 1, "only the kept built-ins: {:?}", reg.services.keys());
         assert_eq!(note(&dir, "services-autostart.json"), vec!["oaiy-voice"]);
         assert_eq!(note(&dir, "services-running.json"), vec!["oaiy-voice"]);
         assert_eq!(reg.boot_start_ids(), vec!["oaiy-voice".to_string()]);
@@ -3533,7 +3603,7 @@ mod tests {
         let report = retire_seeded_templates(&dir.join("templates"));
         assert_eq!(report, RetireReport::default(), "nothing left to retire");
         let again = Registry::init(dir.clone(), dir.join("models"), Vec::new()).unwrap();
-        assert_eq!(again.services.len(), 4);
+        assert_eq!(again.services.len(), 1);
         let after = std::fs::metadata(dir.join("services-running.json")).unwrap().modified().unwrap();
         assert_eq!(before, after, "a note with nothing to drop is not rewritten");
         let _ = std::fs::remove_dir_all(&dir);
