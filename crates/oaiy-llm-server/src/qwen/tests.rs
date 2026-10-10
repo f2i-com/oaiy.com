@@ -65,6 +65,17 @@ fn checkpoints_survive_changed_assistant_suffix_and_leave_logits_token() {
     assert_eq!(checkpoint_positions(&[1], Some(1)), []);
     assert_eq!(checkpoint_positions(&[7, 8, 9], None), [2]);
 }
+
+#[test]
+fn the_disk_keeps_a_turns_checkpoints_but_the_one_a_few_tokens_after_the_assistants_header() {
+    // a conversation's: before its first user message, before the assistant's header, a token short of the prompt
+    assert_eq!(disk_positions(&[120, 3432, 3438], 3439), [120, 3432]);
+    // the last one alone, or far from the one before it: kept
+    assert_eq!(disk_positions(&[2], 3), [2]);
+    assert_eq!(disk_positions(&[120, 3438], 3439), [120, 3438]);
+    assert_eq!(disk_positions(&[120, 3000], 3439), [120, 3000]);
+    assert_eq!(disk_positions(&[120, 3000, 3438], 3439), [120, 3000, 3438]);
+}
 fn tools() -> Vec<Json> { vec![Json::parse(br#"{"function":{"name":"computer","parameters":{"type":"object","properties":{"action":{"type":"string"},"keys":{"type":"array"}},"required":["action"]}}}"#).unwrap()] }
 #[test]
 fn native_calls_preserve_types_and_reject_partial_or_unknown_calls() {

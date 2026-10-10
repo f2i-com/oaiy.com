@@ -175,6 +175,30 @@ impl Snapshot {
         Self { pos: kv.len, layers }
     }
 
+    /// The whole state at a checkpoint, for the disk, taken after the run went past it: the checkpoint's recurrent
+    /// tensors, and the attention cache's keys and values up to its position, which later tokens only added to. So a
+    /// prompt's run copies a checkpoint's recurrent state alone (on its device), and the attention cache is read out
+    /// once the reply is out, not between the prompt's last tokens: the 27B's keys and values for 2,800 tokens are
+    /// some 350 MB, which a card in a Thunderbolt enclosure gave back in a quarter of a second each. `None` where the
+    /// checkpoint is not of this cache's shape, or past what it holds.
+    pub fn from_checkpoint(checkpoint: &RecurrentSnapshot, kv: &KvCache, attention: &[bool], backend: &dyn Backend) -> Option<Self> {
+        let pos = checkpoint.0.pos;
+        if pos == 0 || pos > kv.len || checkpoint.0.layers.len() != attention.len() {
+            return None;
+        }
+        let layers = attention.iter().enumerate().map(|(i, &attn)| {
+            if attn {
+                let backend = kv.layer_backends.get(i).map(|b| b.as_ref()).unwrap_or(backend);
+                [Some(backend.slice_axis0(&kv.k[i], pos).to_host()),
+                 Some(backend.slice_axis0(&kv.v[i], pos).to_host()), None, None]
+            } else {
+                let layer = &checkpoint.0.layers[i];
+                [None, None, layer[2].as_ref().map(its_own), layer[3].as_ref().map(its_own)]
+            }
+        }).collect();
+        Some(Self { pos, layers })
+    }
+
     pub fn restore(&self, kv: &mut KvCache, attention: &[bool], ssm: SsmConfig, backend: &dyn Backend) -> Result<(), String> {
         self.restore_inner(kv, attention, ssm, backend, false)
     }
@@ -320,6 +344,33 @@ mod tests {
         assert_eq!(&kv.v[0].data()[..6], &[3.0; 6]);
         assert_eq!(kv.ssm_state[1].as_ref().unwrap().data(), &[4.0; 4]);
         assert_eq!(kv.ssm_conv[1].as_ref().unwrap().data(), &[5.0; 12]);
+    }
+
+    #[test]
+    fn a_disk_state_made_after_the_run_is_the_one_taken_at_its_checkpoint() {
+        let backend = ggml_rs::CpuBackend::new();
+        let mut kv = KvCache::new(&backend, 2, 16, 1, 2);
+        kv.len = 3;
+        kv.k[0].data_mut()[..6].copy_from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        kv.v[0].data_mut()[..6].copy_from_slice(&[7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+        kv.ssm_state[1] = Some(Tensor::from_vec(vec![4.0; 4], vec![1, 2, 2]));
+        kv.ssm_conv[1] = Some(Tensor::from_vec(vec![5.0; 12], vec![2, 6]));
+        let then = Snapshot::capture(&kv, &[true, false], &backend);
+        let checkpoint = RecurrentSnapshot::capture(&kv);
+        // the run goes on: more keys and values after the checkpoint's, the recurrent state moved on
+        kv.k[0].data_mut()[6..14].fill(99.0);
+        kv.v[0].data_mut()[6..14].fill(98.0);
+        kv.len = 7;
+        kv.ssm_state[1].as_mut().unwrap().data_mut().fill(97.0);
+        let later = Snapshot::from_checkpoint(&checkpoint, &kv, &[true, false], &backend).unwrap();
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        Arc::new(then).encode(&mut a);
+        Arc::new(later).encode(&mut b);
+        assert_eq!(a, b);
+        // not of this cache: a layout of another model, or a position past what it holds
+        assert!(Snapshot::from_checkpoint(&checkpoint, &kv, &[true, false, true], &backend).is_none());
+        kv.len = 2;
+        assert!(Snapshot::from_checkpoint(&checkpoint, &kv, &[true, false], &backend).is_none());
     }
 
     #[test]

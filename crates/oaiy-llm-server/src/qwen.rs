@@ -684,6 +684,7 @@ impl QwenEngine {
         // Checkpoints and disk states are the Qwen3.5 hybrid's (Flash-Next continues from memory only).
         let model = hybrid.qwen35();
         let stops = checkpoint_positions(&job.prompt, hybrid.tokenizer()?.token_id("<|im_start|>"));
+        let to_disk = disk_positions(&stops, keys.len());
         let common = self.covered.iter().zip(&keys).take_while(|(a,b)| a==b).count();
         // An attention suffix overwritten by a different branch cannot support
         // a recurrent-only checkpoint, even if a later request matches its keys.
@@ -758,10 +759,10 @@ impl QwenEngine {
                 // the checkpoints this run would reach that are not kept yet: kept from inside it where the model can
                 // (its states copied as the run goes: a prompt's last two, before the assistant's header and before
                 // its last token, were a run of 6 rows and a run of 1 of their own), else a run's end each as before
-                // (a disk's checkpoints are whole states: a run's end too)
+                // (the disk's whole states are made from them once the reply is out: `Snapshot::from_checkpoint`)
                 let far = (pos + 8 * PREFILL_CHUNK).min(keys.len());
                 let due: Vec<usize> = stops.iter().copied().filter(|&s| s > pos && s <= far && !self.checkpoints.iter().any(|(saved, _, _)| saved == &keys[..s])).collect();
-                let inside = !due.is_empty() && (self.disk.is_none() || job.forget) && self.kv.len == pos && hybrid.can_tap(far - pos, &self.kv, &due.iter().map(|s| s - pos).collect::<Vec<_>>());
+                let inside = !due.is_empty() && self.kv.len == pos && hybrid.can_tap(far - pos, &self.kv, &due.iter().map(|s| s - pos).collect::<Vec<_>>());
                 let stop = if inside { far } else { stops.iter().copied().find(|&s| s > pos).unwrap_or(keys.len()).min(keys.len()).min(pos + 8 * PREFILL_CHUNK) };
                 let rows = hybrid.prompt_rows();
                 let spans: Vec<(usize, usize)> = (pos..stop).step_by(rows).map(|a| (a, (a + rows).min(stop))).collect();
@@ -810,15 +811,7 @@ impl QwenEngine {
             if stops.contains(&pos) && !self.checkpoints.iter().any(|(saved, _, _)| saved == &keys[..pos]) {
                 if self.log { eprintln!("  Qwen checkpoint: {pos} tokens; disk={}", self.disk.is_some()); }
                 let base = stops.first() == Some(&pos);
-                // Disk states are the Qwen3.5 hybrid's; memory checkpoints any model's.
-                if let Some(model) = model.filter(|_| job.images.is_empty() || self.image_disk_cache) {
-                    if let Some(disk) = self.disk.as_mut().filter(|_| !job.forget) {
-                        if !disk.has(&keys[..pos]) {
-                            let snap = Arc::new(Snapshot::capture(&self.kv, &model.attention_layers, model.backend.as_ref()));
-                            disk.save(keys[..pos].to_vec(), snap, base);
-                        }
-                    }
-                }
+                // (the disk's state of it is made once the reply is out, from this and the attention cache)
                 let snap = RecurrentSnapshot::capture_later(&self.kv, model.map(|m| &m.backend));
                 self.checkpoints.push((keys[..pos].to_vec(), snap, base));
                 // Keep the system prefix plus recent conversation boundaries.
@@ -1001,6 +994,18 @@ impl QwenEngine {
         for (_, snap, _) in &mut self.checkpoints {
             snap.settle(&self.kv, device);
         }
+        // and the disk's whole states of them (disk states are the Qwen3.5 hybrid's; memory checkpoints any model's)
+        if let (Some(model), Some(disk)) = (self.model.qwen35().filter(|_| job.images.is_empty() || self.image_disk_cache), self.disk.as_mut().filter(|_| !job.forget)) {
+            for &at in &to_disk {
+                if disk.has(&keys[..at]) {
+                    continue;
+                }
+                let Some((_, snap, base)) = self.checkpoints.iter().find(|(saved, _, _)| saved.as_slice() == &keys[..at]) else { continue };
+                if let Some(whole) = Snapshot::from_checkpoint(snap, &self.kv, &model.attention_layers, model.backend.as_ref()) {
+                    disk.save(keys[..at].to_vec(), Arc::new(whole), *base);
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -1040,6 +1045,15 @@ fn trim_checkpoints(checkpoints: &mut Vec<(Vec<u64>, RecurrentSnapshot, bool)>) 
         let remove = (0..checkpoints.len()-1).min_by_key(|&i| (checkpoints[i].2, i)).unwrap();
         checkpoints.remove(remove);
     }
+}
+
+/// Of a prompt's checkpoints (`stops`), those its disk keeps: all but the one a token short of the whole prompt where
+/// another comes a few tokens before it (the assistant's header: an identical retry from the disk runs those few tokens
+/// more, and a disk state is a whole one, the attention cache's keys and values too).
+fn disk_positions(stops: &[usize], len: usize) -> Vec<usize> {
+    let last = len.saturating_sub(1);
+    let near = stops.iter().any(|&s| s < last && last - s <= 16);
+    stops.iter().copied().filter(|&s| !(s == last && near)).collect()
 }
 
 /// Save before the first user message, before the current assistant header
