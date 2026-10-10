@@ -250,6 +250,7 @@ it is attached as the model's text encoder, not added as a chat model. On the RT
 | mac.10 (the first) | 21.9 s | 27.7 s |
 | mac.11 (writes streamed to the card, the prompt's embedding rows alone unpacked) | 17.5 s | 25.7 s |
 | mac.12 (the socket's buffers 4 MB) | 13.7 s | 21.3 s |
+| mac.14 (the worker kept with its models, the rows attention, the firmware's memory kept from buffers) | 10.3 s | 20.7 s |
 
 Of the worker's own time, sampling is 8 s (8 steps of 1.0 s) and the VAE 1.4 s; the rest is the weights' way to the
 card. That way was half the link's: a Mac gives a local socket 8 KB of buffer each way, so a write crossed it 8 KB a
