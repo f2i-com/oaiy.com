@@ -337,6 +337,8 @@ struct Inner {
     paused: bool,
     /// Bring the engine back as the card is given back (it was running when it was lent).
     resume_after: bool,
+    /// A request waits for the lent card: whoever has it gives it back as soon as it may (`crate::media`).
+    wanted: bool,
 }
 
 pub struct Egpu {
@@ -489,6 +491,7 @@ impl Egpu {
                 lent: false,
                 paused: false,
                 resume_after: false,
+                wanted: false,
             }),
             changed: Condvar::new(),
             launching: Mutex::new(()),
@@ -844,6 +847,7 @@ impl Egpu {
         g.lent = false;
         g.paused = false;
         g.resume_after = false;
+        g.wanted = false;
     }
 
     /// Stop the server because someone asked: Stop, a change of settings, the studio going. A start that is under
@@ -943,6 +947,7 @@ impl Egpu {
             return;
         }
         g.lent = false;
+        g.wanted = false;
         g.last_used = Instant::now();
         if g.paused && g.resume_after {
             self.resume(&mut g);
@@ -954,6 +959,12 @@ impl Egpu {
     /// Whether the card is lent to the image worker now.
     pub fn is_lent(&self) -> bool {
         self.lock().lent
+    }
+
+    /// Whether a request waits for the lent card (its model's): the image worker is to give it back once its job is done.
+    pub fn wanted(&self) -> bool {
+        let g = self.lock();
+        g.lent && g.wanted
     }
 
     /// The engine on the card asked back from a pause, the state's lock held: starting again, its model loading.
@@ -989,6 +1000,10 @@ impl Egpu {
             // model of an engine that is paused brings it back.
             if g.paused && !g.lent && holds && matches!(g.state, State::Starting | State::Ready) {
                 self.resume(&mut g);
+            }
+            // (one waiting for the lent card says so: the image worker keeps it no longer than its job)
+            if g.lent {
+                g.wanted = true;
             }
             if !g.lent { match g.state {
                 State::Ready if holds => {

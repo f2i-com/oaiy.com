@@ -167,7 +167,31 @@ struct Broker {
     waiting_media: bool,
 }
 
+/// The image worker kept between pictures on the eGPU's card (`oaiy-media --serve`): it keeps the models a job loaded
+/// for the next that names the same files (a picture's 5 s of loading on the card). It is let go when no picture has
+/// come for [`KEEP_CARD`], when a chat waits for the card, or when the card is not lent any more.
+struct Serving {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    /// Its answers (standard output's lines) and its events (standard error's), as they come; `None` once both end.
+    said: std::sync::mpsc::Receiver<Said>,
+    /// The program and the card's socket it was started for.
+    key: String,
+    /// When its last job ended.
+    idle_since: std::time::Instant,
+}
+
+enum Said {
+    Answer(String),
+    Event(String),
+    Gone,
+}
+
+/// How long the kept image worker (and the lent card) waits for another picture.
+const KEEP_CARD: Duration = Duration::from_secs(120);
+
 pub struct Media {
+    serving: Mutex<Option<Serving>>,
     jobs: Mutex<VecDeque<Job>>,
     changed: Condvar,
     broker: Mutex<Broker>,
@@ -1035,6 +1059,7 @@ impl Media {
             broker: Mutex::new(Broker { chats: 0, media: false, waiting_media: false }),
             broker_changed: Condvar::new(),
             queue_signal: Condvar::new(),
+            serving: Mutex::new(None),
             log: Arc::new(LogRing::new(2000)),
         }
     }
@@ -1264,11 +1289,23 @@ impl Media {
                     // Nothing queued: bring back an LLM that media paused. Here
                     // rather than after each job, so a batch does not reload it
                     // between jobs, and a cancelled last job still resumes it.
-                    // (The eGPU's card likewise.)
+                    // (The eGPU's card likewise, once its kept worker has waited for another picture for long enough,
+                    // or at once where a chat waits for the card.)
                     if studio.egpu.is_lent() {
+                        if self.lingers() && !studio.egpu.wanted() {
+                            jobs = self.queue_signal.wait_timeout(jobs, Duration::from_secs(1)).unwrap_or_else(|p| p.into_inner()).0;
+                            continue;
+                        }
                         drop(jobs);
+                        self.end_serving(false);
                         self.log.push("giving the eGPU back to its language model");
                         studio.egpu.give_back();
+                        jobs = self.lock();
+                        continue;
+                    }
+                    if self.serving.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
+                        drop(jobs);
+                        self.end_serving(false);
                         jobs = self.lock();
                         continue;
                     }
@@ -1349,7 +1386,7 @@ impl Media {
             match studio.egpu.lend(&cfg, &studio.root, CARD_WAIT) {
                 Ok(socket) => {
                     self.update(&job.id, |j| j.stage = "on the eGPU".into());
-                    match self.worker(studio, &cfg, job, Some(&socket)) {
+                    match self.serve_job(studio, &cfg, job, &socket) {
                         Ok(done) => return Ok(done),
                         Err(e) if job.cancel.load(Ordering::Relaxed) => return Err(e),
                         // (the card's language model comes back while this computer makes it)
@@ -1395,6 +1432,134 @@ impl Media {
             self.broker_changed.notify_all();
         }
         result
+    }
+
+    /// Whether the kept worker is to wait on for another picture: it has waited less than [`KEEP_CARD`].
+    fn lingers(&self) -> bool {
+        self.serving.lock().unwrap_or_else(|p| p.into_inner()).as_ref().is_some_and(|s| s.idle_since.elapsed() < KEEP_CARD)
+    }
+
+    /// The kept worker let go: its standard input closed (it ends, its memory on the card freed), and killed past a wait
+    /// (`now`: killed at once, a job it is doing cancelled).
+    fn end_serving(&self, now: bool) {
+        let Some(mut s) = self.serving.lock().unwrap_or_else(|p| p.into_inner()).take() else { return };
+        drop(s.stdin);
+        let deadline = std::time::Instant::now() + if now { Duration::ZERO } else { Duration::from_secs(10) };
+        while std::time::Instant::now() < deadline {
+            if s.child.try_wait().is_ok_and(|done| done.is_some()) {
+                self.log.push("the kept image worker ended");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = s.child.kill();
+        let _ = s.child.wait();
+        self.log.push("the kept image worker was killed (it had not ended)");
+    }
+
+    /// `job` done by the worker kept for pictures on the eGPU's card (at `card`, its socket), started for it where
+    /// there is none for this program and card: its request a line in, its answer a line out, its events read as a
+    /// worker's are.
+    fn serve_job(&self, studio: &crate::Studio, cfg: &Json, job: &Job, card: &str) -> Result<Json, String> {
+        let media = cfg.get("media").ok_or("no media section")?;
+        let program = config::program(&studio.root, str_or(media, "worker", "oaiy-media"));
+        std::fs::create_dir_all(studio.output_root()).map_err(|e| e.to_string())?;
+        let key = format!("{}|{card}", program.display());
+        let label = if job.incognito { "incognito job".to_string() } else { job.id.clone() };
+        let mut slot = self.serving.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.as_mut().is_some_and(|s| s.key != key || !matches!(s.child.try_wait(), Ok(None))) {
+            drop(slot);
+            self.end_serving(false);
+            slot = self.serving.lock().unwrap_or_else(|p| p.into_inner());
+        }
+        if slot.is_none() {
+            let mut command = Command::new(&program);
+            command.arg("--serve").env("OAIY_WEBGPU_ADAPTER", format!("tinygpu:{card}"));
+            command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            let mut child = command.spawn().map_err(|e| format!("could not start {}: {e}", program.display()))?;
+            let (tx, said) = std::sync::mpsc::channel();
+            let (out, err) = (child.stdout.take().ok_or("worker stdout missing")?, child.stderr.take().ok_or("worker stderr missing")?);
+            let (to_out, to_err) = (tx.clone(), tx);
+            std::thread::spawn(move || {
+                for line in BufReader::new(out).lines().map_while(Result::ok) {
+                    if to_out.send(Said::Answer(line)).is_err() {
+                        return;
+                    }
+                }
+                let _ = to_out.send(Said::Gone);
+            });
+            std::thread::spawn(move || {
+                for line in BufReader::new(err).lines().map_while(Result::ok) {
+                    if to_err.send(Said::Event(line)).is_err() {
+                        return;
+                    }
+                }
+            });
+            let stdin = child.stdin.take().ok_or("worker stdin missing")?;
+            self.log.push(format!("{label}: an image worker kept for the eGPU started ({})", program.display()));
+            *slot = Some(Serving { child, stdin, said, key, idle_since: std::time::Instant::now() });
+        }
+        let s = slot.as_mut().expect("a kept worker");
+        if job.incognito {
+            self.log.push(format!("incognito {} job on the eGPU (kept worker)", job.kind.name()));
+        } else {
+            self.log.push(format!("{}: {} job on the eGPU, kept worker ({} {})", job.id, job.kind.name(), job.model, str_or(&job.request, "memory", "auto")));
+        }
+        let sent = writeln!(s.stdin, "{}", job.request.to_json()).and_then(|_| s.stdin.flush());
+        if let Err(e) = sent {
+            drop(slot);
+            self.end_serving(true);
+            return Err(format!("sending the request to the kept worker: {e}"));
+        }
+        let (id, kind, n, incognito) = (job.id.clone(), job.kind, job.n, job.incognito);
+        let mut last_error = None;
+        let outcome = loop {
+            if job.cancel.load(Ordering::Relaxed) {
+                break Err("cancelled".to_string());
+            }
+            match s.said.recv_timeout(Duration::from_millis(200)) {
+                Ok(Said::Answer(line)) => break Ok(line),
+                Ok(Said::Event(line)) => {
+                    if let Ok(e) = Json::parse(line.as_bytes()) {
+                        if let Some(msg) = e.get("error").and_then(Json::as_str) {
+                            last_error = Some(msg.to_string());
+                        }
+                        if let Some((p, stage)) = progress_of(kind, n, &e) {
+                            self.update(&id, |j| {
+                                j.progress = j.progress.max(p.min(99.0));
+                                j.stage = stage;
+                            });
+                        }
+                    } else if !incognito {
+                        self.log.push(format!("{id}: {line}"));
+                    }
+                }
+                Ok(Said::Gone) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break Err(last_error.clone().unwrap_or_else(|| "the kept image worker ended".into())),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        };
+        let line = match outcome {
+            Ok(line) => line,
+            Err(e) => {
+                // (a cancelled job, or a worker gone: it is let go at once, its memory with it)
+                drop(slot);
+                self.end_serving(true);
+                if !incognito && e != "cancelled" {
+                    self.log.push(format!("{label}: the kept worker failed: {e}"));
+                }
+                return Err(e);
+            }
+        };
+        s.idle_since = std::time::Instant::now();
+        let result = Json::parse(line.as_bytes()).map_err(|e| format!("invalid worker result: {e}"))?;
+        if let Some(e) = result.get("error").and_then(Json::as_str) {
+            if !incognito {
+                self.log.push(format!("{label}: worker failed: {e}"));
+            }
+            return Err(e.to_string());
+        }
+        self.log.push(format!("{label}: done in {:.1}s", num_or(&result, "seconds", 0.0)));
+        Ok(result)
     }
 
     /// The worker run for `job`; `card`: the eGPU card's socket, its WebGPU adapter (`crate::egpu`), else this

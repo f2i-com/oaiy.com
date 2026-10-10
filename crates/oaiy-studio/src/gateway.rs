@@ -1800,6 +1800,76 @@ http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
         Some(Arc::new(Studio::for_test(dir, cfg)))
     }
 
+    /// A stand-in for `oaiy-media --serve`: each job a line in, its answer a line out (a picture's path), and when it
+    /// started (with its adapter) and ended noted beside it, in `fake-media.log`.
+    const FAKE_SERVE: &str = r#"#!/usr/bin/env python3
+import json, os, sys
+log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fake-media.log")
+open(log, "a").write("started " + os.environ.get("OAIY_WEBGPU_ADAPTER", "") + "\n")
+assert sys.argv[1:] == ["--serve"], sys.argv
+for line in sys.stdin:
+    ask = json.loads(line)
+    print(json.dumps({"stage": "sampling", "image": 1, "step": 1, "steps": 1}), file=sys.stderr, flush=True)
+    if ask["prompt"] == "slow":
+        import time; time.sleep(60)
+    os.makedirs(ask["output_dir"], exist_ok=True)
+    path = os.path.join(ask["output_dir"], ask["prompt"] + ".png")
+    open(path, "wb").write(b"\x89PNG\r\n\x1a\n")
+    print(json.dumps({"data": [{"path": path}], "seconds": 0.01}), flush=True)
+open(log, "a").write("ended\n")
+"#;
+
+    #[cfg(unix)]
+    #[test]
+    fn pictures_on_the_card_share_one_kept_worker_which_a_chat_for_the_card_ends() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = fake_dir("serve");
+        let Some(first) = fake_card(&dir) else { return };
+        let worker = dir.join("fake-media");
+        std::fs::write(&worker, FAKE_SERVE).unwrap();
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut cfg = first.config();
+        let media = crate::registry::obj_mut(&mut cfg, &["media"]).unwrap();
+        crate::util::set(media, "worker", Json::str(worker.to_string_lossy()));
+        let studio = Arc::new(Studio::for_test(&dir, cfg));
+        let runner = Arc::clone(&studio);
+        std::thread::spawn(move || {
+            let media = Arc::clone(&runner.media);
+            media.run(&runner);
+        });
+        let log = || std::fs::read_to_string(dir.join("fake-media.log")).unwrap_or_default();
+        let out = dir.join("out");
+        let picture = |prompt: &str| Json::obj([("prompt", Json::str(prompt)), ("output_dir", Json::str(out.to_string_lossy()))]);
+        // Two pictures one after the other: one worker for both, on the card's socket, and kept after them.
+        for prompt in ["fox", "owl"] {
+            let job = studio.media.submit(Kind::Image, picture(prompt), "turbo".into(), "1024x1024".into(), 1, 0.0, 8, None);
+            let done = studio.media.wait(&job.id, Duration::from_secs(60)).unwrap();
+            assert_eq!(done.status, "completed", "{:?}\n{}\n{}", done.error, studio.media.log.tail(20), studio.egpu.log.tail(20));
+            assert!(done.files[0].ends_with(format!("{prompt}.png")), "{:?}", done.files);
+        }
+        assert_eq!(log().matches("started").count(), 1, "{}", log());
+        assert!(log().contains("started tinygpu:/"), "the card's socket its adapter: {}", log());
+        assert!(!log().contains("ended") && studio.egpu.is_lent(), "kept, with the card, for the next picture");
+        // A picture cancelled as it is made: the worker killed at once, and the next picture has a new one.
+        let slow = studio.media.submit(Kind::Image, picture("slow"), "turbo".into(), "1024x1024".into(), 1, 0.0, 8, None);
+        until("the slow picture to start", || studio.media.get(&slow.id).is_some_and(|j| j.status == "in_progress"));
+        std::thread::sleep(Duration::from_millis(300));
+        let asked = std::time::Instant::now();
+        assert!(studio.media.cancel(&slow.id));
+        let done = studio.media.wait(&slow.id, Duration::from_secs(10)).unwrap();
+        assert!(done.status == "cancelled" && asked.elapsed() < Duration::from_secs(5), "{} after {:?}", done.status, asked.elapsed());
+        let job = studio.media.submit(Kind::Image, picture("cat"), "turbo".into(), "1024x1024".into(), 1, 0.0, 8, None);
+        assert_eq!(studio.media.wait(&job.id, Duration::from_secs(60)).unwrap().status, "completed");
+        assert_eq!(log().matches("started").count(), 2, "{}", log());
+        // A chat for the card's model: the kept worker ends, the card is given back, and the chat is answered on it.
+        let (status, _, body) = chat(&studio, r#"{"model": "x", "messages": [{"role": "user", "content": "hi"}]}"#);
+        assert!(status == 200 && body.contains("from the card"), "{status} {body}\n{}", studio.media.log.tail(20));
+        until("the kept worker to end", || log().contains("ended"));
+        assert!(!studio.egpu.is_lent());
+        studio.egpu.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The card's server, asked who it is at `socket` (as the image worker's adapter first does).
     #[cfg(unix)]
     fn card_hello(socket: &str) -> String {

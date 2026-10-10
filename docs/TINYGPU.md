@@ -237,7 +237,10 @@ OAIY (its buffers freed as its connection goes), and the image worker (`oaiy-med
 folder or beside the app: no installer carries it) takes the card's socket as its WebGPU adapter. Chats with the model
 wait meanwhile; when the queue of pictures is empty the card is given back and the engine starts again, or, where the
 card was opened only for pictures, stays paused until a chat asks for its model (and is let go with the eGPU's idle
-stop). A picture the card fails is made on the Mac. The engines' files (`detect.rs`) know Turbo's GGUFs: the
+stop). The worker is kept (`oaiy-media --serve`, a job a line in and its answer a line out) with the models it loaded:
+the next picture that names the same files is spared their 5 s of loading. It waits for another picture for two
+minutes, the card lent meanwhile, and is let go at once when a chat waits for the card's model (and when the card is no
+longer lent). A picture the card fails is made on the Mac. The engines' files (`detect.rs`) know Turbo's GGUFs: the
 transformer is marked `distilled` (8 steps at CFG 1, no turbo adapter beside it) and the Qwen3-VL text encoder made for
 it is attached as the model's text encoder, not added as a chat model. On the RTX 4090, through OAIY's gateway, a
 1024 x 1024 Turbo picture:
@@ -277,6 +280,11 @@ and a 200-token answer of the 27B were the same bytes, and `tools/tinygpu/fast_c
 (a stand-in for tinygrad's NV device, thousands of random launches, chains and releases). It is not yet on by default:
 its gain on the card is still to be measured. Submissions of a token are not byte for byte those of the token before
 (a buffer made afresh each token is bound in some), so they cannot simply be replayed.
+
+The adapter keeps the buffers a program lets go (up to 256 MB of them, each 64 MB or less; `TINYGPU_NO_POOL=1` for
+none) for the next buffer of their size: the dozens a token makes and lets go were each two round trips to the server
+and a launch of a clear there. A buffer from the pool is cleared before anything else reaches the server (WebGPU's
+begin as zeros): at the head of the next submission, or in one of its own before a write or a read.
 
 A process that holds the card and is ended by a signal it does not handle leaves the card's firmware up, and the next
 open resets the card: on 2026-10-10 a server ended so (a SIGUSR1, which a server of older code had no handler for)

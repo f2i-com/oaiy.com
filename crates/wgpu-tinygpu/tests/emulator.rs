@@ -326,3 +326,29 @@ fn a_write_larger_than_the_servers_pieces_lands_whole_where_it_was_put() {
     assert!(back[..1024].iter().all(|&v| v == 0), "before the offset: as it was");
     assert!(back[1024..] == data[..], "the write, whole and in order");
 }
+
+#[test]
+fn a_buffer_from_the_pool_begins_as_zeros_and_keeps_what_is_written_into_it() {
+    let Some((_emu, device, queue)) = emulator() else { return };
+    let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
+    let size = 1 << 20;
+    let make = || device.create_buffer(&wgpu::BufferDescriptor { label: None, size, usage, mapped_at_creation: false });
+    // one written and let go: the next of its size is the same buffer on the server, and is zeros
+    let a = make();
+    queue.write_buffer(&a, 0, &vec![0xabu8; size as usize]);
+    assert!(read(&device, &queue, &a, size as usize).iter().all(|&v| v == 0xabababab));
+    drop(a);
+    let b = make();
+    assert!(read(&device, &queue, &b, size as usize).iter().all(|&v| v == 0), "a buffer from the pool is zeros");
+    drop(b);
+    // written as soon as it is made: the write is after its clear, not under it
+    let c = make();
+    queue.write_buffer(&c, 4096, &[7u8; 64]);
+    let back = read(&device, &queue, &c, size as usize);
+    assert!(back[1024..1040].iter().all(|&v| v == 0x07070707) && back[..1024].iter().all(|&v| v == 0) && back[1040..].iter().all(|&v| v == 0));
+    // and one used in a dispatch first: cleared at the head of that submission
+    drop(c);
+    let out = run(&device, &queue, "@group(0) @binding(0) var<storage, read_write> v: array<u32>;
+        @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) { v[id.x] = v[id.x] + 1u; }", &[vec![5u32; 256]], 4);
+    assert!(out[0].iter().all(|&v| v == 6));
+}

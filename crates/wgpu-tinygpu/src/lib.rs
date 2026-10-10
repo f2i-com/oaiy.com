@@ -37,20 +37,91 @@ const SYNC: u32 = 8;
 /// version would read a kernel or a dispatch other than it was sent, so it is refused at HELLO.
 const PROTOCOL: u32 = 3;
 
-/// The server's socket, one request at a time.
+/// The server's socket, one request at a time, and the buffers let go that are kept for the next of their size.
 #[derive(Debug)]
 struct Conn {
     stream: Mutex<UnixStream>,
+    pool: Mutex<Pool>,
 }
 
+/// Buffers this program let go, kept by size for the next buffer of that size: a language model's token makes and
+/// lets go dozens, each two requests to the server (a round trip each) and a launch of its clear there. A buffer taken
+/// from it is cleared (WebGPU's buffers begin as zeros) before anything else reaches the server: in the same submission
+/// as the next work where that comes next, else in one of its own first. Up to [`POOL_BYTES`] of buffers of
+/// [`POOL_LARGEST`] or less; TINYGPU_NO_POOL=1 keeps none.
+#[derive(Debug, Default)]
+struct Pool {
+    free: std::collections::HashMap<u64, Vec<u64>>,
+    bytes: u64,
+    /// Buffers taken from it, to be cleared (id, size) before the next request.
+    clears: Vec<(u64, u64)>,
+    off: bool,
+}
+
+const POOL_BYTES: u64 = 256 << 20;
+const POOL_LARGEST: u64 = 64 << 20;
+
 impl Conn {
+    fn new(stream: UnixStream) -> Conn {
+        let off = std::env::var("TINYGPU_NO_POOL").is_ok_and(|v| v == "1");
+        Conn { stream: Mutex::new(stream), pool: Mutex::new(Pool { off, ..Pool::default() }) }
+    }
+
+    /// A buffer of `size` bytes: one the pool has (to be cleared), else a new one from the server.
+    fn alloc(&self, size: u64) -> u64 {
+        {
+            let mut pool = self.pool.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(id) = pool.free.get_mut(&size).and_then(Vec::pop) {
+                pool.bytes -= size;
+                pool.clears.push((id, size));
+                return id;
+            }
+        }
+        u64_of(&self.must(ALLOC, &size.to_le_bytes()))
+    }
+
+    /// Buffer `id` (of `size` bytes) let go: into the pool where it has room, else freed on the server.
+    fn release(&self, id: u64, size: u64) {
+        {
+            let mut pool = self.pool.lock().unwrap_or_else(|p| p.into_inner());
+            if !pool.off && size <= POOL_LARGEST && pool.bytes + size <= POOL_BYTES {
+                pool.bytes += size;
+                pool.free.entry(size).or_default().push(id);
+                return;
+            }
+        }
+        let _ = self.call(FREE, &id.to_le_bytes());
+    }
+
     fn call(&self, cmd: u32, payload: &[u8]) -> Result<Vec<u8>, String> {
         self.call_parts(cmd, &[payload])
     }
 
     /// A request whose payload is `parts`, one after another: sent as they are, not copied into one (a write's bytes
-    /// are a model's weights, hundreds of megabytes a tensor).
+    /// are a model's weights, hundreds of megabytes a tensor). The pool's buffers taken since the last request are
+    /// cleared first: at the head of a submission, or in a submission of their own before any other request.
     fn call_parts(&self, cmd: u32, parts: &[&[u8]]) -> Result<Vec<u8>, String> {
+        let clears = std::mem::take(&mut self.pool.lock().unwrap_or_else(|p| p.into_inner()).clears);
+        if !clears.is_empty() {
+            let mut ops = Vec::with_capacity(25 * clears.len());
+            for (id, size) in clears {
+                ops.push(3u8);
+                ops.extend(id.to_le_bytes());
+                ops.extend(0u64.to_le_bytes());
+                ops.extend(size.to_le_bytes());
+            }
+            if cmd == SUBMIT {
+                let mut all = vec![ops.as_slice()];
+                all.extend_from_slice(parts);
+                return self.send(cmd, &all);
+            }
+            self.send(SUBMIT, &[&ops])?;
+        }
+        self.send(cmd, parts)
+    }
+
+    /// The request itself.
+    fn send(&self, cmd: u32, parts: &[&[u8]]) -> Result<Vec<u8>, String> {
         let mut s = self.stream.lock().unwrap_or_else(|p| p.into_inner());
         let len: usize = parts.iter().map(|p| p.len()).sum();
         let mut head = Vec::with_capacity(12 + if len <= 64 << 10 { len } else { 0 });
@@ -112,7 +183,7 @@ pub fn default_socket() -> PathBuf {
 pub fn adapter(socket: &Path) -> Result<wgpu::Adapter, String> {
     let stream = UnixStream::connect(socket).map_err(|e| format!("tinygpu: no server at {} ({e}): start tools/tinygpu/webgpu_server.py", socket.display()))?;
     roomy(&stream);
-    let conn = Arc::new(Conn { stream: Mutex::new(stream) });
+    let conn = Arc::new(Conn::new(stream));
     let hello = String::from_utf8_lossy(&conn.call(HELLO, &[])?).into_owned();
     let field = |key: &str| -> Option<String> {
         let at = hello.find(&format!("\"{key}\""))? + key.len() + 2;
@@ -354,7 +425,7 @@ impl DeviceInterface for TgDevice {
         unsupported("pipeline caches")
     }
     fn create_buffer(&self, desc: &wgpu::BufferDescriptor<'_>) -> DispatchBuffer {
-        let id = u64_of(&self.conn.must(ALLOC, &desc.size.max(4).to_le_bytes()));
+        let id = self.conn.alloc(desc.size.max(4));
         let mapped = desc.mapped_at_creation.then(|| Mapping { start: 0, data: vec![0; desc.size as usize], write: true });
         let mem = Arc::new(Allocation { conn: Arc::clone(&self.conn), id, size: desc.size });
         DispatchBuffer::custom(TgBuffer { mem, size: desc.size, state: Arc::new(Mutex::new(mapped)) })
@@ -433,7 +504,7 @@ struct Allocation {
 
 impl Drop for Allocation {
     fn drop(&mut self) {
-        let _ = self.conn.call(FREE, &self.id.to_le_bytes());
+        self.conn.release(self.id, self.size.max(4));
     }
 }
 

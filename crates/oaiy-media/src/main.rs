@@ -32,6 +32,9 @@ fn run() -> candle_core::Result<()> {
         println!("Klein: architecture=flux2-klein-4b, transformer (original BFL safetensors), text_encoder (Qwen3-4B), tokenizer, vae (Flux2), prompt, output_dir. Distilled: 4 steps, CFG=1. Style adapters: loras=[{{path,strength}}]. Native text-to-image; dimensions multiple of 16; no Qwen turbo, negative prompts or references. Explicit variant=base for Klein base 4B weights.");
         return Ok(());
     }
+    if args.first().is_some_and(|a| a == "--serve") {
+        return serve();
+    }
     let bytes = match args.first().map(String::as_str) {
         Some("--stdin") => {
             let mut b = Vec::new();
@@ -125,6 +128,39 @@ fn run() -> candle_core::Result<()> {
         eprintln!("{}", event.to_json());
     })?;
     writeln!(std::io::stdout(), "{}", result.to_json())?;
+    Ok(())
+}
+
+/// `oaiy-media --serve`: Qwen Image jobs one after another, each a line of JSON on standard input, each one's answer a
+/// line on standard output (its result, or `{"error": ...}`), its events on standard error as a job's are. The models a
+/// job loads are kept for the next that names the same files (`pipeline::Kept`): a worker that OAIY keeps while
+/// pictures come one after another. It ends when its standard input does.
+fn serve() -> candle_core::Result<()> {
+    use std::io::BufRead;
+    let mut kept = oaiy_media::pipeline::Kept::default();
+    for line in std::io::stdin().lock().lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let answer = (|| -> candle_core::Result<Json> {
+            let j = Json::parse(line.as_bytes()).map_err(candle_core::Error::wrap)?;
+            if j.get("architecture").is_some_and(|a| a.as_str() != Some("qwen-image")) || j.get("kind").is_some() {
+                candle_core::bail!("a worker that serves takes Qwen Image jobs");
+            }
+            let r = oaiy_media::pipeline::Request::parse(&j).map_err(candle_core::Error::Msg)?;
+            configure_cache(&r.output)?;
+            oaiy_media::pipeline::generate_kept(&r, Some(&mut kept), |event| eprintln!("{}", event.to_json()))
+        })();
+        let answer = answer.unwrap_or_else(|e| {
+            // (what it had is let go: a job that failed may have left a model half made)
+            kept = oaiy_media::pipeline::Kept::default();
+            Json::obj([("error", Json::str(e.to_string()))])
+        });
+        let mut out = std::io::stdout().lock();
+        writeln!(out, "{}", answer.to_json())?;
+        out.flush()?;
+    }
     Ok(())
 }
 

@@ -367,8 +367,42 @@ pub(crate) fn parse_loras(j: &Json) -> std::result::Result<Vec<(PathBuf, f64)>, 
 
 /// Prompt encoding and diffusion are sequential to bound peak VRAM. All images
 /// in a batch reuse one transformer and VAE; completed images survive failure.
-pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
+/// What a worker that takes job after job (`oaiy-media --serve`) keeps of a Qwen Image job's models for the next one
+/// that names the same files: its text encoder, its transformer and its VAE's decoder, each loaded once (on an eGPU's
+/// card, 5 s of a picture's 14). WebGPU's alone: a job on the CPU lets each go as soon as it is done, as a job in a
+/// process of its own does.
+#[derive(Default)]
+pub struct Kept {
+    encoder: Option<(String, Encoder)>,
+    model: Option<(String, Model)>,
+    decoder: Option<(String, Decoder)>,
+}
+
+impl Kept {
+    /// What it holds, by its keys (for the worker's log).
+    pub fn holds(&self) -> Vec<&str> {
+        [self.encoder.as_ref().map(|_| "text encoder"), self.model.as_ref().map(|_| "transformer"), self.decoder.as_ref().map(|_| "decoder")].into_iter().flatten().collect()
+    }
+}
+
+/// `r`'s pictures, each model loaded for it and let go as soon as it is done.
+pub fn generate(r: &Request, event: impl FnMut(Json)) -> Result<Json> {
+    generate_kept(r, None, event)
+}
+
+/// [`generate`], with `kept` the models a worker keeps from job to job: those it has for `r` used as they are, the
+/// others loaded (what it had of them let go first), and all kept for the next job.
+pub fn generate_kept(r: &Request, mut kept: Option<&mut Kept>, mut event: impl FnMut(Json)) -> Result<Json> {
     r.validate().map_err(candle_core::Error::Msg)?;
+    // (WebGPU's models alone are kept)
+    if !r.webgpu {
+        kept = None;
+    }
+    let keys = (
+        format!("{:?}|{:?}|{}", r.base, r.text_encoder, r.device),
+        format!("{:?}|{:?}|{:?}|{}", r.transformer, r.adapter, r.loras, r.device),
+        format!("{:?}|{}", r.base, r.device),
+    );
     let dev = Device::Cpu;
     let dtype = if dev.is_cuda() {
         DType::BF16
@@ -438,14 +472,18 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
     let reference_encoding_seconds = t.elapsed().as_secs_f64();
     event(Json::obj([("stage", Json::str("loading_text_encoder"))]));
     let text_load_start = Instant::now();
+    let had = kept.as_mut().and_then(|k| k.encoder.take()).filter(|(k, _)| *k == keys.0).map(|(_, e)| e);
     #[cfg(feature = "webgpu")]
-    let mut encoder = if r.webgpu {
-        Encoder::Wgpu(crate::text_wgpu::WgpuTextEncoder::load(&r.base, r.text_encoder.as_deref(), r.device)?)
-    } else {
-        Encoder::Candle(TextEncoder::load(&r.base, r.text_encoder.as_deref(), &dev, dtype, &r.budget)?)
+    let mut encoder = match had {
+        Some(e) => e,
+        None if r.webgpu => Encoder::Wgpu(crate::text_wgpu::WgpuTextEncoder::load(&r.base, r.text_encoder.as_deref(), r.device)?),
+        None => Encoder::Candle(TextEncoder::load(&r.base, r.text_encoder.as_deref(), &dev, dtype, &r.budget)?),
     };
     #[cfg(not(feature = "webgpu"))]
-    let mut encoder = Encoder::Candle(TextEncoder::load(&r.base, r.text_encoder.as_deref(), &dev, dtype, &r.budget)?);
+    let mut encoder = match had {
+        Some(e) => e,
+        None => Encoder::Candle(TextEncoder::load(&r.base, r.text_encoder.as_deref(), &dev, dtype, &r.budget)?),
+    };
     dev.synchronize()?;
     let text_load_seconds = text_load_start.elapsed().as_secs_f64();
     let encoding_start = Instant::now();
@@ -463,7 +501,10 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
         ]));
     }
     let text_residency = encoder.residency();
-    drop(encoder);
+    match kept.as_mut() {
+        Some(k) => k.encoder = Some((keys.0.clone(), encoder)),
+        None => drop(encoder),
+    }
     drop(features);
     dev.synchronize()?;
     let encoding_seconds = encoding_start.elapsed().as_secs_f64();
@@ -476,14 +517,18 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
             ("blocks", Json::Int(32)),
         ]))
     };
+    let had = kept.as_mut().and_then(|k| k.model.take()).filter(|(k, _)| *k == keys.1).map(|(_, m)| m);
     #[cfg(feature = "webgpu")]
-    let mut model = if r.webgpu {
-        Model::Wgpu(crate::qwen_wgpu::WgpuTransformer::load(&r.transformer, r.device, r.adapter.as_deref(), &r.loras, progress)?)
-    } else {
-        Model::Candle(Transformer::load(&r.transformer, r.adapter.as_deref(), &r.loras, &dev, dtype, &r.budget, progress)?)
+    let mut model = match had {
+        Some(m) => m,
+        None if r.webgpu => Model::Wgpu(crate::qwen_wgpu::WgpuTransformer::load(&r.transformer, r.device, r.adapter.as_deref(), &r.loras, progress)?),
+        None => Model::Candle(Transformer::load(&r.transformer, r.adapter.as_deref(), &r.loras, &dev, dtype, &r.budget, progress)?),
     };
     #[cfg(not(feature = "webgpu"))]
-    let mut model = Model::Candle(Transformer::load(&r.transformer, r.adapter.as_deref(), &r.loras, &dev, dtype, &r.budget, progress)?);
+    let mut model = match had {
+        Some(m) => m,
+        None => Model::Candle(Transformer::load(&r.transformer, r.adapter.as_deref(), &r.loras, &dev, dtype, &r.budget, progress)?),
+    };
     dev.synchronize()?;
     let transformer_load_seconds = load_start.elapsed().as_secs_f64();
     for note in model.lora_notes() {
@@ -559,18 +604,32 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
     drop(prefix);
     drop(negative_prefix);
     model.release_scratch();
-    drop(model);
+    match kept.as_mut() {
+        Some(k) => k.model = Some((keys.1.clone(), model)),
+        None => drop(model),
+    }
     if !sampled.is_empty() {
         event(Json::obj([("stage", Json::str("loading_vae"))]));
         let load_start = Instant::now();
+        let had = kept.as_mut().and_then(|k| k.decoder.take()).filter(|(k, _)| *k == keys.2).map(|(_, d)| d);
         #[cfg(feature = "webgpu")]
-        let decoder = if r.webgpu { Decoder::Wgpu(crate::vae_wgpu::WgpuVae::load(&r.base, r.device)?) } else { Decoder::Candle(Vae::load(&r.base, &dev, dtype)?) };
+        let decoder = match had {
+            Some(d) => d,
+            None if r.webgpu => Decoder::Wgpu(crate::vae_wgpu::WgpuVae::load(&r.base, r.device)?),
+            None => Decoder::Candle(Vae::load(&r.base, &dev, dtype)?),
+        };
         #[cfg(not(feature = "webgpu"))]
-        let decoder = Decoder::Candle(Vae::load(&r.base, &dev, dtype)?);
+        let decoder = match had {
+            Some(d) => d,
+            None => Decoder::Candle(Vae::load(&r.base, &dev, dtype)?),
+        };
         dev.synchronize()?;
         vae_load_seconds = load_start.elapsed().as_secs_f64();
         for p in sampled {
             save_picture(r, &out, &mut manifest, &mut files, &mut event, &decoder, p, h, w)?;
+        }
+        if let Some(k) = kept.as_mut() {
+            k.decoder = Some((keys.2.clone(), decoder));
         }
     }
     if let Some(e) = failure {
