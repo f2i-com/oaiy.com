@@ -79,7 +79,13 @@ def lifeline():
             pass
     except OSError:
         pass
-    os._exit(0)
+    # The card released as Python exits: an interrupt to the main thread unwinds it, and the interpreter's exit runs
+    # tinygrad's own (its devices finalized: on an NVIDIA card, its GSP firmware unloaded). os._exit alone skips that,
+    # and the next start then finds the firmware's region up and resets the card, which over Thunderbolt has taken
+    # its link down until it was powered off and on. Past a wait, it goes anyway.
+    import signal, threading
+    threading.Timer(15.0, lambda: os._exit(0)).start()
+    os.kill(os.getpid(), signal.SIGINT)
 
 
 def as_file(args):

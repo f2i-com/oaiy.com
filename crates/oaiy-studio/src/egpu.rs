@@ -674,13 +674,29 @@ impl Egpu {
     }
 
     /// The server stopped and forgotten, the state's lock held.
+    ///
+    /// Its standard input closed first, which has it release the card and exit (`egpu_serve.py`'s lifeline), and only
+    /// past a wait killed: a server killed outright leaves the card's firmware up, and the next start resets the card,
+    /// which over Thunderbolt has taken its link down until it was powered off and on. The wait is a thread's, not
+    /// the lock's.
     fn halt(&self, g: &mut Inner) {
         g.generation += 1;
         g.lifeline = None;
         if let Some(mut child) = g.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-            self.log.push("studio: tinygrad's server stopped");
+            let log = self.log.clone();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while Instant::now() < deadline {
+                    if child.try_wait().is_ok_and(|done| done.is_some()) {
+                        log.push("studio: tinygrad's server stopped");
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                log.push("studio: tinygrad's server stopped (killed after 20 s)");
+            });
         }
         g.state = State::Stopped;
         g.error = None;
