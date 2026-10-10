@@ -345,14 +345,21 @@ pub struct LeadIn {
 }
 
 impl LeadIn {
-    const LEAD: usize = codec::SAMPLE_RATE / 10;
-    const MAX_SILENCE: usize = codec::SAMPLE_RATE;
+    /// The silence kept before speech (a tenth of a second).
+    pub const LEAD: usize = codec::SAMPLE_RATE / 10;
+    /// The most silence held before it lets go (a second).
+    pub const MAX_SILENCE: usize = codec::SAMPLE_RATE;
     const WINDOW: usize = codec::SAMPLE_RATE / 100;
     /// -46 dBFS: quieter than any speech, louder than the model's silence.
     const LEVEL: f32 = 0.005;
 
     pub fn new(enabled: bool) -> Self {
         Self { open: !enabled, held: Vec::new(), silent: 0 }
+    }
+
+    /// Whether `samples` have speech in them, as the gate hears it (a window louder than [`Self::LEVEL`]).
+    pub fn loud(samples: &[f32]) -> bool {
+        samples.chunks(Self::WINDOW).any(|w| (w.iter().map(|x| x * x).sum::<f32>() / w.len() as f32).sqrt() > Self::LEVEL)
     }
 
     pub fn pass(&mut self, samples: Vec<f32>) -> Vec<f32> {

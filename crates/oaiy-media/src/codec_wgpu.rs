@@ -388,6 +388,20 @@ impl WgpuCodec {
         self.forward_tail(&frames, new.len())
     }
 
+    /// `new` after `before` heard roughly: as [`Self::decode_after_with`], but the stages after the transformer run on
+    /// `new` alone, with nothing before it (zeros where they reach back), so its first samples are not the decode's
+    /// (a fifth of a frame or so). For telling whether a line has begun to speak: a frame in 21 ms on an M5 Pro,
+    /// where the exact decode takes 91.
+    pub fn hear_after(&self, before: &[[u32; 16]], new: &[[u32; 16]], context: usize) -> Result<Vec<f32>> {
+        if new.is_empty() {
+            return Ok(Vec::new());
+        }
+        let context = before.len().min(context);
+        let mut frames = before[before.len() - context..].to_vec();
+        frames.extend_from_slice(new);
+        self.forward_reaching(&frames, new.len(), 0)
+    }
+
     /// One whole decode of `frames` (`frames.len() * 1920` samples).
     fn forward(&self, frames: &[[u32; 16]]) -> Result<Vec<f32>> {
         let x = upload(&self.gpu, &self.rows(frames)?);
@@ -402,8 +416,13 @@ impl WgpuCodec {
     /// cost is nearly all of a decode's: they run at up to 1920 steps a frame) only the tail and the [`Self::reach`]
     /// frames before it, which is all they look back at. The same samples as [`Self::forward`]'s for the tail.
     fn forward_tail(&self, frames: &[[u32; 16]], tail: usize) -> Result<Vec<f32>> {
+        self.forward_reaching(frames, tail, self.reach)
+    }
+
+    /// [`Self::forward_tail`] with the stages after the transformer reaching `reach` frames back.
+    fn forward_reaching(&self, frames: &[[u32; 16]], tail: usize, reach: usize) -> Result<Vec<f32>> {
         let t = frames.len();
-        let kept = (tail + self.reach).min(t);
+        let kept = (tail + reach).min(t);
         let x = upload(&self.gpu, &self.rows(frames)?);
         let mut rec = self.gpu.begin();
         rec.keep_groups(false);

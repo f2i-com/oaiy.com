@@ -8,7 +8,7 @@
 use crate::codec_wgpu::WgpuCodec;
 use crate::tts_wgpu::{FramesEnd, WgpuTalker};
 use candle_core::{Device, Result};
-use oaiy_tts::codec::SAMPLE_RATE;
+use oaiy_tts::codec::{SAMPLES_PER_FRAME, SAMPLE_RATE};
 use oaiy_tts::talker::FRAMES_PER_SECOND;
 use oaiy_tts::voice::Voice;
 use oaiy_tts::{clone, Finish, LeadIn, SpeakOptions, SpeakReport};
@@ -35,6 +35,9 @@ fn err(e: impl std::fmt::Display) -> candle_core::Error {
 const STREAM_CONTEXT: usize = 120;
 /// Frames a chunk after the first: four (0.32 s of sound), which halves what the decodes cost against two.
 const CHUNK_FRAMES: usize = 4;
+/// The silent frames before a line's speech that are decoded with it: what the lead-in gate keeps of the silence
+/// ([`LeadIn::LEAD`], a tenth of a second) is within them.
+const QUIET_KEPT: usize = 2;
 
 /// The engine: a Qwen3-TTS Base model resident on one WebGPU adapter.
 pub struct WgpuTts {
@@ -201,11 +204,42 @@ impl WgpuTts {
             before.drain(..extra);
             Ok(samples)
         };
+        // While the line opens with silence (the gate closed, nothing heard yet), a frame is heard roughly first
+        // (`WgpuCodec::hear_after`, 21 ms where its decode takes 91), and the frames the gate keeps are decoded once one
+        // is heard to speak, with it (or once a second of silence makes the gate let go): the same samples, sooner. A
+        // line that opened with five silent frames waited for five decodes before its first sound.
+        let mut quiet: Vec<[u32; 16]> = Vec::new();
+        let mut quiet_samples = 0usize;
         let end = talker.frames_with(&prefill, Some(trailing), o.sampling.clone(), max_frames, |frame| {
             if cancel.load(Ordering::Relaxed) {
                 return Ok(false);
             }
             report.frames += 1;
+            if !gate.open && report.first_chunk_seconds.is_none() {
+                let mut heard_after = before.clone();
+                heard_after.extend_from_slice(&quiet);
+                let heard = codec.hear_after(&heard_after, std::slice::from_ref(frame), STREAM_CONTEXT)?;
+                // (its first samples are the rough decode's own: they are not listened to)
+                let speaks = LeadIn::loud(&heard[heard.len() / 4..]);
+                quiet.push(*frame);
+                quiet_samples += SAMPLES_PER_FRAME;
+                if speaks || quiet_samples >= LeadIn::MAX_SILENCE {
+                    let samples = decode(&mut before, &mut quiet)?;
+                    let mut out = gate.pass(samples);
+                    if !speaks && !gate.open {
+                        // a second of silence: the gate lets go with what it keeps, as it does after a second
+                        gate.open = true;
+                        out = std::mem::take(&mut gate.held);
+                    }
+                    emit(out, &mut report);
+                } else if quiet.len() > QUIET_KEPT {
+                    // the earliest quiet frame is past what the gate could keep: context for the decodes after it
+                    before.push(quiet.remove(0));
+                    let extra = before.len().saturating_sub(STREAM_CONTEXT);
+                    before.drain(..extra);
+                }
+                return Ok(true);
+            }
             pending.push(*frame);
             let want = if report.first_chunk_seconds.is_none() { o.first_chunk_frames } else { o.chunk_frames };
             if pending.len() >= want.max(1) {
@@ -220,6 +254,8 @@ impl WgpuTts {
             FramesEnd::Ended => Finish::Stop,
         };
         if report.finish != Finish::Cancelled {
+            // (a line silent to its end: its quiet frames are what is left)
+            pending.splice(0..0, quiet.drain(..));
             let rest = decode(&mut before, &mut pending)?;
             let mut out = gate.pass(rest);
             if !gate.open {
