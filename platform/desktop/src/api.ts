@@ -2028,7 +2028,7 @@ export interface EngineDownload {
   file?: string;
   filesDone?: number;
   filesTotal?: number;
-  /** MB/s. */
+  /** Bytes a second, as the engines measure it (smoothed, to a tenth); 0 while nothing is moving. */
   speed?: number;
   error?: string | null;
 }

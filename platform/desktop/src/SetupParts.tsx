@@ -4,6 +4,7 @@ import ChatGptConnector from './ChatGptConnector';
 import {
   engines,
   formatBytes,
+  formatSpeed,
   isTauri,
   services as servicesApi,
   type AddedModelFile,
@@ -352,8 +353,11 @@ function modelFacts(m: EngineCatalogModel, gpuGb?: number): string {
     .join(' · ');
 }
 
-/** A download as it goes: a bar, and how far. */
-function DownloadProgress({ name, dl }: { name: string; dl: EngineDownload }) {
+/**
+ * A download as it goes: a bar, how far, and how fast. The engines give the speed in bytes a second, so it is put in
+ * a unit here, as the sizes beside it are (it was printed as it came with "MB/s" after it: "24117248.3 MB/s").
+ */
+export function DownloadProgress({ name, dl }: { name: string; dl: EngineDownload }) {
   return (
     <span className="setup-req-progress">
       <span className="setup-progress" role="progressbar" aria-label={`Downloading ${name}`} aria-valuenow={dl.total ? Math.round((dl.done / dl.total) * 100) : undefined}>
@@ -361,7 +365,7 @@ function DownloadProgress({ name, dl }: { name: string; dl: EngineDownload }) {
       </span>
       <small className="setup-mono">
         {dl.status === 'queued' ? 'Waiting to start…' : dl.status === 'adding' ? 'Adding it to Engines…' : `${formatBytes(dl.done)} of ${formatBytes(dl.total)}`}
-        {dl.speed ? ` · ${dl.speed} MB/s` : ''}
+        {dl.speed ? ` · ${formatSpeed(dl.speed)}` : ''}
         {dl.filesTotal && dl.filesTotal > 1 ? ` · file ${Math.min((dl.filesDone ?? 0) + 1, dl.filesTotal)} of ${dl.filesTotal}` : ''}
       </small>
     </span>
