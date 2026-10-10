@@ -352,6 +352,11 @@ a release matter here:
   on the branch `backup/cuda-support-2026-10-08`.)
 - **Aokie**, the phone plugin. It is a separate product: OAIY installs it from a folder or
   an archive, and no release of OAIY contains it.
+- **A Mac build.** No release has one, and the update feed has no entry for a Mac. The
+  workflow `mac-build.yml` makes OAIY Desktop's `.dmg` for Apple silicon on demand, as a
+  run's artifact: signed by nobody (ad hoc), not notarised, published nowhere
+  ([MAC.md](MAC.md#the-app-from-a-disk-image)). A Mac release needs an Apple Developer ID
+  to sign and notarise with.
 - **Windows code signing.** The installers are not signed with a certificate
   (Authenticode), so Windows SmartScreen warns on a download (below). The update signature
   above is another thing: OAIY checks it, Windows does not.

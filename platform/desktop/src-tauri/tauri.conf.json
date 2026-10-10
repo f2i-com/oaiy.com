@@ -46,7 +46,11 @@
       "resources/app",
       "resources/flows",
       "resources/engines"
-    ]
+    ],
+    "macOS": {
+      "signingIdentity": "-",
+      "entitlements": "entitlements.plist"
+    }
   },
   "plugins": {
     "updater": {

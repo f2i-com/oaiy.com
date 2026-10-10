@@ -5,9 +5,61 @@ weights on the chip's GPU, in the Mac's own (unified) memory, what does not fit 
 chip's CPU, read from the drive as it is needed. A graphics card in a Thunderbolt enclosure
 is a second place a model can run, through tinygrad's server.
 
-**Where this stands.** No release is built for macOS: you build it there
-([Updates](UPDATES.md)). Nothing on this page has been run on a Mac by its authors yet. What
-has been checked, and how, is at the end of each section; what has not is said too.
+**Where this stands.** No release is built for macOS ([Updates](UPDATES.md)). The app can
+be made as a disk image without a Mac at hand (below), or built on the Mac. Nothing on this
+page has been run on a Mac by its authors yet. What has been checked, and how, is at the end
+of each section; what has not is said too.
+
+## The app, from a disk image
+
+The whole app (the window with the Agent, the flows, the plugins and the engines) as
+`OAIY.app` in a `.dmg`, for an Apple-silicon Mac. Nothing is built on the Mac and nothing
+has to be installed there first: no Rust, no Node, no Xcode tools.
+
+**Making it.** A `.dmg` can only be made on a Mac, so GitHub's Mac makes it: on the
+repository's page, **Actions**, **Mac build**, **Run workflow**
+(`.github/workflows/mac-build.yml`; or `gh workflow run mac-build.yml`). It runs only when
+started like that. It builds what a release's Linux and Windows builds do, uploads
+`oaiy-desktop-<version>-macos-arm64.dmg` (and the headless server for a Mac) as the run's
+artifacts, and publishes nothing. Its last step opens the image on the runner, copies the
+app out, starts it, and runs a flow through it (`platform/desktop/scripts/smoke-desktop.mjs`):
+a run with a green last step is an app that started on a Mac and found its own files.
+
+**Installing it.** Download the artifact from the run's page (a zip: the `.dmg` is inside),
+open the `.dmg`, drag **OAIY** to **Applications**.
+
+**Opening it the first time.** The app is signed, but by nobody: there is no Apple
+Developer ID behind it, so Apple has not checked it (it is not notarised), and macOS will
+not open a downloaded app like that on a double-click. Either:
+
+- open it once, and when macOS refuses, go to **System Settings**, **Privacy & Security**,
+  and press **Open Anyway** beside OAIY's name (before macOS 15: right-click the app,
+  **Open**, **Open**); or
+- in a terminal: `xattr -dr com.apple.quarantine /Applications/OAIY.app`
+
+Once is enough. A build with an Apple Developer ID, notarised, would open like any app:
+that needs the identity, which the workflow is not given.
+
+**What it carries, and what it fetches.** The language-model engine is inside it
+(`oaiy-llm-server-webgpu`, on the Mac's GPU through Metal): add a model's `.gguf` under
+**Engines** and it runs. Flows run on Node, which the app installs under its own data
+folder the first time, at a press of **Install Node** on the Overview (from nodejs.org:
+that once, it needs the network). Pictures, video and speech are another program
+(`oaiy-media`), which no installer carries on any system. The app's data is in
+`~/Library/Application Support/com.oaiy.app`. It does not update itself on a Mac: a newer
+image is installed over it.
+
+**The phone plugin (Aokie)** is made the same way, in Aokie's repository: **Actions**,
+**Unix bundles**, **Run workflow** gives `aokie-plugin-macos-arm64.tar.gz`. In OAIY, under
+**Connections**, **Plugins**, give the path of that file to install it, then press
+**Trust this plugin** and **Start**. What has and has not been tried of it is below.
+
+**Checked, and not.** The app's Rust is read for a Mac from Windows (`cargo check
+--target aarch64-apple-darwin`: the app, the headless server and the engine, no errors),
+which links nothing. The same sources are built, installed on a clean Ubuntu and used
+there by the same script the workflow's last step runs. Whether the app starts on a Mac,
+shows its tray icon, and what macOS says of an app signed by nobody on your version of it,
+only a run of the workflow and a Mac can say.
 
 ## Build and start
 
@@ -43,10 +95,11 @@ Rust: Rust 1.92 refuses the NEON half-float types its tensor library (Candle) us
 Apple silicon as unstable (`stdarch_neon_f16`), and the Rust of September 2026 accepts
 them. If the build stops on that name, `rustup update`.
 
-**The desktop app** (the window with the Agent, the flows and the plugins) is the
-[production build](../platform/desktop/README.md#production-build) of `platform/desktop`,
-which also needs Node 22 or later. It has never been built on macOS either. The engines
-above do not need it: they are the same ones it would start.
+**The desktop app** (the window with the Agent, the flows and the plugins) comes as a disk
+image ([above](#the-app-from-a-disk-image)), with nothing to build. To build it on the Mac
+instead, it is the [production build](../platform/desktop/README.md#production-build) of
+`platform/desktop`, which also needs Node 22 or later. The engines above do not need it:
+they are the same ones it starts.
 
 **The phone plugin (Aokie) builds for a Mac, and has not been run on one.** Its Bluetooth
 stack drives a USB dongle itself, with no use of the system's Bluetooth: on a Mac it opens

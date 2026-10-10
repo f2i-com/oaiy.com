@@ -1,0 +1,157 @@
+# Mac build: OAIY Desktop for an Apple-silicon Mac, as a disk image, made on demand.
+#
+# A manual run only (Actions, "Mac build", Run workflow): nothing starts it by itself, a push or a tag least of all.
+# It builds what the release workflow's `desktop` job builds, step for step, on a macOS runner, because a .dmg can
+# only be made on a Mac: the bundler needs macOS's own tools. The run uploads the disk image and the headless server
+# for a Mac as its artifacts and does nothing else: it publishes no release, pushes no tag, and is given no secret
+# (no updater key, no signing certificate).
+#
+# The app is signed ad hoc (tauri.conf.json, bundle.macOS.signingIdentity "-"): a signature an Apple-silicon Mac
+# will run, with no Apple Developer ID behind it. So it is not notarised, and macOS asks before it opens it the
+# first time: docs/MAC.md says what to click. A release for the Mac (a notarised app, an update feed entry) is
+# another job, and needs that identity.
+#
+# Before the upload's last word, the image is used as a person uses it: opened, the app copied out of it, started,
+# and a flow run through it (platform/desktop/scripts/smoke-desktop.mjs). The artifacts are uploaded first, so a
+# run whose app does not start still leaves the image to look at.
+name: Mac build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to stamp, above the last release (0.1.2 is out: 0.1.3-mac.1)'
+        required: true
+        default: '0.1.3-mac.1'
+
+# Nothing may write: the run builds and uploads its own artifacts.
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '24'
+
+jobs:
+  dmg:
+    name: OAIY Desktop (.dmg, Apple silicon)
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install the ZIPP release
+        run: node platform/scripts/fetch-zipp-release.mjs --ensure
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (pinned revision)
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          workspaces: |
+            platform/desktop/src-tauri
+            . -> target
+
+      - name: Stamp the version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          node -e '
+            const fs = require("fs"); const v = process.argv[1];
+            if (!/^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$/.test(v)) { console.error("not a version: " + v); process.exit(1); }
+            const conf = "platform/desktop/src-tauri/tauri.conf.json";
+            const j = JSON.parse(fs.readFileSync(conf, "utf8")); j.version = v;
+            fs.writeFileSync(conf, JSON.stringify(j, null, 2) + "\n");
+            const toml = "platform/desktop/src-tauri/Cargo.toml";
+            fs.writeFileSync(toml, fs.readFileSync(toml, "utf8").replace(/^version = "[^"]+"/m, `version = "${v}"`));
+            console.log("stamped", v);
+          ' "$VERSION"
+
+      - name: Install and build the CLI
+        working-directory: platform/cli
+        run: |
+          npm ci
+          npm run build
+
+      - name: Check CLI HTTPS shutdown
+        working-directory: platform/cli
+        run: node test/cli-http-exit.mjs
+
+      # The Agent pins its own ZIPP (release.yml says why the pair is cleared for it).
+      - name: Install and build the Agent
+        working-directory: app
+        env:
+          ZIPP_RELEASE: ''
+          ZIPP_SUMS_SHA256: ''
+        run: |
+          npm ci
+          npm run build:desktop
+
+      - name: Install and build the flow editor
+        working-directory: platform/ui
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install the desktop app's dependencies
+        working-directory: platform/desktop
+        run: npm ci
+
+      # The engine the app carries: on a Mac its GPU is Metal's, through WebGPU.
+      - name: Build the portable language-model engine
+        run: cargo build --release --locked -p oaiy-llm-server --no-default-features --features webgpu --bin oaiy-llm-server-webgpu
+
+      - name: Build OAIY Desktop
+        working-directory: platform/desktop
+        run: npm run tauri:build -- --bundles app,dmg
+
+      - name: Build the headless server
+        working-directory: platform/desktop/src-tauri
+        run: cargo build --release --no-default-features --features web --bin oaiy-server
+
+      - name: Stage complete headless distribution
+        run: node platform/desktop/scripts/package-server.mjs platform/desktop/src-tauri/target/release/oaiy-server headless-dist
+
+      - name: Execute a flow from the headless distribution
+        run: node platform/desktop/scripts/smoke-server.mjs headless-dist
+
+      - name: Collect
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          out="$PWD/release"; mkdir -p "$out"
+          bundle=platform/desktop/src-tauri/target/release/bundle
+          dmg="$(find "$bundle/dmg" -maxdepth 1 -type f -name '*.dmg' | head -1)"
+          [ -n "$dmg" ] || { echo "::error::no .dmg was built"; exit 1; }
+          cp "$dmg" "$out/oaiy-desktop-$VERSION-macos-arm64.dmg"
+          tar -C headless-dist -czf "$out/oaiy-server-$VERSION-macos-arm64.tar.gz" .
+          ( cd "$out" && shasum -a 256 * > SHA256SUMS.txt && cat SHA256SUMS.txt )
+          echo "::notice::the app is signed ad hoc and is not notarised: macOS asks before it opens it the first time (docs/MAC.md)."
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: oaiy-macos-arm64
+          path: release/
+          if-no-files-found: error
+          retention-days: 30
+
+      # The image as a person uses it: opened, the app dragged out (here: copied to a folder of the run's), the image
+      # put away, the app started from where it now is. Its signature is checked first: one that does not hold is an
+      # app macOS will not start on Apple silicon.
+      - name: Run a flow in the app from the disk image
+        run: |
+          set -euo pipefail
+          mount="$RUNNER_TEMP/oaiy-dmg"; apps="$RUNNER_TEMP/Applications"; mkdir -p "$apps"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount" release/*.dmg
+          ls -la "$mount"
+          cp -R "$mount/OAIY.app" "$apps/"
+          hdiutil detach "$mount"
+          codesign --verify --deep --strict --verbose=2 "$apps/OAIY.app"
+          codesign -dv --verbose=2 "$apps/OAIY.app" 2>&1 | head -14
+          find "$apps/OAIY.app/Contents" -type f -perm +111 | head -40
+          node platform/desktop/scripts/smoke-desktop.mjs "$apps/OAIY.app/Contents/MacOS/oaiy-desktop"

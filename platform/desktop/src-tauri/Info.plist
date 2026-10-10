@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- macOS asks before an app hears the microphone, and shows this sentence when it asks; an app that has none
+	     is refused the microphone without a question. A plugin's call screen (answering a phone call at the
+	     computer) is the one place the window listens. -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>OAIY uses the microphone when you answer or make a phone call at this computer.</string>
+</dict>
+</plist>
