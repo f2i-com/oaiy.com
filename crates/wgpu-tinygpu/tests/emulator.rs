@@ -1,6 +1,7 @@
 //! WGSL's meaning, kept by the translation to CUDA: kernels run through the adapter on the server's emulator
 //! (`tools/tinygpu/webgpu_server.py --emulate`: each kernel compiled for the CPU), so no card is needed. Skipped where
-//! the emulator cannot start (no python3 or clang++).
+//! the emulator cannot start (no python3 or clang++). With `TINYGPU_TEST_SOCKET` set they run on the server there
+//! instead: the card itself.
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -9,26 +10,34 @@ use std::time::{Duration, Instant};
 
 use wgpu::util::DeviceExt;
 
-/// The emulator, for as long as the test holds it.
+/// The emulator, for as long as the test holds it (none where the test runs on a server of its own).
 struct Emulator {
-    child: Child,
+    child: Option<Child>,
     socket: PathBuf,
 }
 
 impl Drop for Emulator {
     fn drop(&mut self) {
-        let _ = Command::new("kill").arg("-TERM").arg(self.child.id().to_string()).status();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_file(&self.socket);
+        if let Some(child) = &mut self.child {
+            let _ = Command::new("kill").arg("-TERM").arg(child.id().to_string()).status();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&self.socket);
+        }
     }
 }
 
 fn emulator() -> Option<(Emulator, wgpu::Device, wgpu::Queue)> {
+    if let Some(socket) = std::env::var_os("TINYGPU_TEST_SOCKET") {
+        let emu = Emulator { child: None, socket: socket.into() };
+        let adapter = wgpu_tinygpu::adapter(&emu.socket).unwrap_or_else(|e| panic!("{e}"));
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).ok()?;
+        return Some((emu, device, queue));
+    }
     let server = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/tinygpu/webgpu_server.py");
     static STARTED: AtomicUsize = AtomicUsize::new(0);
     let socket = std::env::temp_dir().join(format!("tinygpu-emu-{}-{}.sock", std::process::id(), STARTED.fetch_add(1, Ordering::Relaxed)));
     let child = Command::new("python3").arg(&server).arg("--emulate").arg(&socket).stdout(Stdio::null()).spawn().ok()?;
-    let emu = Emulator { child, socket };
+    let emu = Emulator { child: Some(child), socket };
     let start = Instant::now();
     while !emu.socket.exists() {
         if start.elapsed() > Duration::from_secs(20) {

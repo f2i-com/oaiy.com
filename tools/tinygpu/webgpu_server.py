@@ -204,7 +204,10 @@ class Card:
 class Emulator:
   """The card's work on the CPU: memory the process's own, each kernel compiled by clang++ with emu/cuda_emu.h and its
   workgroups shared out among the cores (ctypes lets go of Python's lock while a kernel runs). Each piece of work is
-  done before the next is taken, so the queue is always done. A buffer is (its address, its size)."""
+  done before the next is taken, so the queue is always done. A buffer is (its address, its size, its mapping's address
+  and size): it ends where a page that is not readable begins, so a kernel that reads or writes past a buffer's end
+  faults here as it would fault the card (where it costs the card its link). TINYGPU_EMU_TRACE=1 says each dispatch's
+  kernel (its file in the cache) on stderr first, so the last said is a fault's."""
   STACK = 256 << 10   # an invocation's stack
   MAX_INVOCATIONS = 1024
 
@@ -218,6 +221,7 @@ class Emulator:
     self.workers = os.cpu_count() or 4
     self.pool = ThreadPoolExecutor(self.workers, thread_name_prefix="emu")
     self.local = threading.local()
+    self.trace = os.environ.get("TINYGPU_EMU_TRACE") == "1"
 
   def info(self) -> dict:
     return {"arch": "cpu", "name": "the card's work on the CPU (tinygpu-webgpu --emulate)", "device": "CPU",
@@ -230,10 +234,14 @@ class Emulator:
     return at
 
   def alloc(self, size: int):
-    return (self.map(size), size)
+    page = mmap.PAGESIZE
+    span = (size + page - 1) // page * page + page
+    at = self.map(span)
+    self.mprotect(at + span - page, page, 0)   # (PROT_NONE)
+    return (at + span - page - size, size, at, span)
 
   def free(self, buf):
-    self.munmap(buf[0], buf[1])
+    self.munmap(buf[2], buf[3])
 
   def write(self, buf, off: int, data: memoryview):
     ctypes.memmove(buf[0] + off, bytes(data), len(data))
@@ -245,16 +253,17 @@ class Emulator:
     header = (EMU / "cuda_emu.h").read_bytes()
     barriers = "__syncthreads()" in src
     def build(tmp: pathlib.Path):
-      cpp = tmp.with_suffix(".cpp")
+      cpp = tmp.with_name(tmp.name.split(".")[0] + ".cpp")   # (beside the library, as it will be named)
       cpp.write_text(f"{src}\nEMU_LAUNCHER(oaiy_main, {'true' if barriers else 'false'})\n")
       run_compiler(["clang++", "-std=c++20", "-O2", "-fwrapv", "-shared", "-fPIC", "-w", "-include", str(EMU / "cuda_emu.h"),
                     "-I", str(EMU), str(cpp), "-o", str(tmp)], "clang++")
-    lib = ctypes.CDLL(str(cached(".dylib", b"cpu\0" + header + b"\0" + src.encode(), build)))
+    path = cached(".dylib", b"cpu\0" + header + b"\0" + src.encode(), build)
+    lib = ctypes.CDLL(str(path))
     launch = lib.emu_launch
     launch.restype = None
     launch.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint64,
                        ctypes.c_uint64, ctypes.c_void_p, ctypes.c_size_t]
-    return (lib, launch, workgroup)
+    return (lib, launch, workgroup, path.with_suffix(".cpp"))
 
   def stacks(self) -> int:
     """This thread's room for a workgroup's stacks, each with a guard page under it."""
@@ -269,7 +278,8 @@ class Emulator:
     launch(args, *grid, first, count, self.stacks(), self.STACK)
 
   def dispatch(self, prog, bufs: list, grid: tuple):
-    _, launch, workgroup = prog
+    _, launch, workgroup, name = prog
+    if self.trace: print(f"emu: {name} {grid}", file=sys.stderr, flush=True)
     if workgroup[0] * workgroup[1] * workgroup[2] > self.MAX_INVOCATIONS: raise RuntimeError(f"a workgroup of {workgroup}")
     args = (ctypes.c_void_p * max(1, len(bufs)))(*[b[0] + off for b, off in bufs])
     total = grid[0] * grid[1] * grid[2]
@@ -434,6 +444,9 @@ if __name__ == "__main__":
   emulate = "--emulate" in argv
   argv = [a for a in argv if a != "--emulate"]
   CACHE.mkdir(parents=True, exist_ok=True)
+  if emulate:
+    import faulthandler
+    faulthandler.enable()   # (a kernel's fault: where the server was, with TINYGPU_EMU_TRACE's last kernel)
   try: serve(argv[0] if argv else str(CACHE / ("emulator.sock" if emulate else "server.sock")), emulate)
   except KeyboardInterrupt: pass
   print("tinygpu-webgpu: " + ("the emulator ended" if emulate else "the card released"), flush=True)

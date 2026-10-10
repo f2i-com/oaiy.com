@@ -132,6 +132,27 @@ CUDA's are anything), and a struct whose member follows a `vec3` in its last 4 b
 bytes). And one of the adapter's: a buffer whose handle was dropped while a bind group still held it was freed before
 the work ran (a buffer now lives while a bind group or an unsubmitted command buffer holds it, as wgpu's own do).
 
-**Not checked yet on the card:** OAIY's GPU tests, a model, any speed, and a submission as one queue. The tensor cores
-are not used (no cooperative matrices: CUDA's `wmma` is where 16 x 16 fragments would go); each dispatch is still a
-Python call (tinygrad's launch), batched to one doorbell a submission.
+The emulator's buffers end where a page that cannot be read begins, so a kernel that reads or writes past a buffer's
+end faults there as it would fault the card: none of OAIY's does, over the tests' 6,214 dispatches and a model's 8,000
+more.
+
+On the card, its link back up (the same day):
+
+- `tests/emulator.rs` (with `TINYGPU_TEST_SOCKET` at the card's server) and every one of OAIY's GPU tests pass: 98;
+- a model through OAIY's own engine (`oaiy-llm-server-webgpu`, built with `--features tinygpu`,
+  `OAIY_WEBGPU_ADAPTER=tinygpu`), its weights all on the card:
+
+  | model | load | 946-token prompt | writing | answers |
+  |---|---|---|---|---|
+  | Qwen3-0.6B Q4_K_M | 1.1 s | 0.5 s | 60 tokens/s | Paris, "marigold" |
+  | Qwen3.8-27B Q4_K_M (15.8 GB) | 64 s | 2.2 s | 30 tokens/s | Paris, "marigold" |
+
+  The same 27B model is 2.5 tokens a second on the Mac's own GPU (it does not all fit) and about 2 through tinygrad's
+  own LLM server on this card;
+- Python's `wgpu` and `examples/compute.c` through `webgpu.h`, as on the emulator;
+- what the adapter's own work costs (`cargo run --release -p wgpu-tinygpu --example costs`): a dispatch 13.7 us in a
+  submission of many (45 us alone, a submission's own cost with it); writes at 1.1 to 1.4 GB/s and reads at 0.95 GB/s,
+  over Thunderbolt 3.
+
+The tensor cores are not used (no cooperative matrices: CUDA's `wmma` is where 16 x 16 fragments would go), and each
+dispatch is still a Python call (tinygrad's launch), batched to one doorbell a submission.

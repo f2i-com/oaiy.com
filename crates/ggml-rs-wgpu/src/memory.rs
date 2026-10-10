@@ -2,9 +2,13 @@
 
 use super::*;
 
-/// The adapter's own memory where its API says: Vulkan's largest device-local heap (a discrete card's VRAM). None on
-/// Direct3D 12 and Metal.
+/// The adapter's own memory where its API says: Vulkan's largest device-local heap (a discrete card's VRAM), or the
+/// card's memory the TinyGPU adapter gives as its largest buffer. None on Direct3D 12 and Metal.
 pub(super) fn device_memory(adapter: &wgpu::Adapter) -> Option<u64> {
+    #[cfg(feature = "tinygpu")]
+    if adapter.get_info().driver.starts_with("tinygrad") {
+        return Some(adapter.limits().max_buffer_size);
+    }
     #[cfg(any(windows, target_os = "linux"))]
     {
         // SAFETY: the adapter's handles are only read, by a query that creates and frees nothing.
