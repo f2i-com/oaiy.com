@@ -21,7 +21,7 @@ The caller is heard the whole call, including while the agent talks.
 `voice/audio.rs`'s detector runs on every 20 ms frame. While our voice
 plays it asks more of the line: its threshold rises, since what is left of
 the agent's own echo would otherwise be heard as the caller. Each utterance
-is transcribed as soon as the caller pauses (800 ms), and goes to Aokie (it
+is transcribed as soon as the caller pauses (600 ms), and goes to Aokie (it
 keeps the transcript) and to the app.
 
 Everything carries a time, in milliseconds from the moment the call began:

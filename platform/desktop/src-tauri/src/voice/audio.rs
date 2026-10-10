@@ -150,8 +150,9 @@ const FRAME_MS: u32 = 20;
 /// Voiced frames among the last `START_WINDOW` for speech to have started (100 ms of 140).
 const START_VOICED: usize = 5;
 const START_WINDOW: usize = 7;
-/// A pause this long ends the utterance (a breath between two sentences does not).
-const END_QUIET_MS: u32 = 800;
+/// A pause this long ends the utterance (a breath between two sentences does not: 300 to 500 ms). Every turn waits it
+/// out before the caller's words are heard, so it is no longer than a breath needs (it was 800).
+const END_QUIET_MS: u32 = 600;
 /// ...or this long, for one begun over our voice: the caller is mid-conversation,
 /// and has either said "mm-hmm, go on" or wants an answer. (OpenAI's realtime
 /// voice waits the same by default.)
@@ -355,10 +356,10 @@ mod tests {
             // (Its audio: 500 ms from before, and the voice and quiet after the start was seen.)
             vec!["1100: start at 1000", "1600: sustained", "2000: paused, 1000 to 1700", "2200: 38400 samples, 1000 to 1700"],
         );
-        // Not over our voice: no pause is heard, and 800 ms of quiet ends it, as ever.
+        // Not over our voice: no pause is heard, and 600 ms of quiet ends it, as ever.
         let mut d = Detector::new(24_000);
         let heard = fed(&mut d, &[(1000, 40.0), (700, 6000.0), (1000, 40.0)]);
-        assert_eq!(heard.iter().map(|(at, h)| format!("{at}: {h}")).collect::<Vec<_>>(), vec!["1100: start at 1000", "1600: sustained", "2500: 45600 samples, 1000 to 1700"]);
+        assert_eq!(heard.iter().map(|(at, h)| format!("{at}: {h}")).collect::<Vec<_>>(), vec!["1100: start at 1000", "1600: sustained", "2300: 40800 samples, 1000 to 1700"]);
     }
 
     #[test]
