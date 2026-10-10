@@ -333,3 +333,42 @@ fn chat_leases_wait_for_exclusive_media_and_time_out() {
     assert!(m.chat_lease(true, Duration::from_millis(20)).is_err());
     assert!(m.chat_lease(false, Duration::ZERO).is_ok(), "coexisting devices never wait");
 }
+
+#[test]
+fn qwen_image_turbo_takes_its_own_eight_steps_at_cfg_one_and_no_adapter() {
+    let mut c = cfg("", "");
+    let turbo = body(r#"{"architecture":"qwen-image","base":"base","transformer":"Qwen-Image-2.1-Turbo-AD-Q4_K.gguf","text_encoder":"te.gguf","distilled":true}"#);
+    let mut models = c.get("media").and_then(|m| m.get("image")).and_then(|i| i.get("models")).unwrap().clone();
+    crate::util::set(&mut models, "turbo", turbo);
+    crate::util::set(crate::registry::obj_mut(&mut c, &["media", "image"]).unwrap(), "models", models);
+    config::validate(&c).unwrap();
+    let root = Path::new("/install");
+    let (r, ..) = image_request(&c, root, root, &body(r#"{"model":"turbo","prompt":"a fox"}"#), false).unwrap();
+    assert_eq!(r.get("steps").and_then(Json::as_i64), Some(8));
+    assert_eq!(r.get("distilled"), Some(&Json::Bool(true)));
+    assert!(r.get("cfg").is_none(), "the worker's own, 1");
+    assert_eq!(r.get("adapter"), Some(&Json::Null));
+    assert_eq!(r.get("text_encoder").and_then(Json::as_str), Some("/install/te.gguf"));
+    let err = image_request(&c, root, root, &body(r#"{"model":"turbo","prompt":"a fox","steps":30}"#), false).unwrap_err();
+    assert!(err.contains("8 steps"), "{err}");
+    // An adapter beside a distilled checkpoint is refused where it is set.
+    let image = crate::registry::obj_mut(&mut c, &["media", "image", "models", "turbo"]).unwrap();
+    crate::util::set(image, "adapter", Json::str("turbo.safetensors"));
+    assert!(config::validate(&c).unwrap_err().contains("no turbo adapter"));
+}
+
+#[test]
+fn qwen_image_pictures_go_to_the_egpu_where_it_runs_oaiys_engine() {
+    let mut c = cfg("", "");
+    let llm = crate::registry::obj_mut(&mut c, &["llm"]).unwrap();
+    crate::util::set(llm, "egpu", body(r#"{"enabled":true,"engine":"webgpu"}"#));
+    let qwen = body(r#"{"base":"b","transformer":"t.gguf","steps":8}"#);
+    assert!(on_card(&c, Kind::Image, &qwen));
+    assert!(!on_card(&c, Kind::Video, &qwen), "pictures only");
+    assert!(!on_card(&c, Kind::Image, &body(r#"{"architecture":"sdxl","checkpoint":"c"}"#)), "Qwen Image only");
+    assert!(!on_card(&c, Kind::Image, &body(r#"{"base":"b","backend":"cpu"}"#)));
+    for egpu in [r#"{"enabled":true,"engine":"webgpu","images":false}"#, r#"{"enabled":true,"engine":"tinygrad"}"#, r#"{"enabled":false,"engine":"webgpu"}"#] {
+        crate::util::set(crate::registry::obj_mut(&mut c, &["llm"]).unwrap(), "egpu", body(egpu));
+        assert!(!on_card(&c, Kind::Image, &qwen), "{egpu}");
+    }
+}

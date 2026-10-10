@@ -274,12 +274,24 @@ fn gguf_file(path: &Path) -> Result<Detected, String> {
             format!("Vision projector for an LLM ({label})"), vec![("vision_projector", path_json(path))]));
     }
     let image_tensors = g.tensors.iter().any(|t| t.contains("img_in.") || t.contains("transformer_blocks.0.img_mlp"));
+    // A file's own name is all that tells Qwen Image's checkpoints apart: Turbo (2.1's, distilled to 8 steps at CFG 1,
+    // taking no adapter) and the text encoder made for it, which is a Qwen3-VL as a chat model's GGUF is.
+    let file = stem(path).to_ascii_lowercase();
+    let for_qwen_image = file.contains("qwen-image") || file.contains("qwen_image");
     if arch.starts_with("qwen_image") || image_tensors {
+        let distilled = file.contains("turbo");
+        let mut fields = vec![("architecture", Json::str("qwen-image")), ("transformer", path_json(path)), ("weights", Json::str("gguf"))];
+        if distilled {
+            fields.push(("distilled", Json::Bool(true)));
+        }
         let mut d = detected(Role::Image { architecture: "qwen-image" }, "gguf",
-            format!("Qwen Image transformer, quantized GGUF ({arch})"),
-            vec![("architecture", Json::str("qwen-image")), ("transformer", path_json(path)), ("weights", Json::str("gguf"))]);
+            format!("Qwen Image transformer{}, quantized GGUF ({arch})", if distilled { " (Turbo: 8 steps)" } else { "" }), fields);
         d.missing.push("base".into());
         return Ok(d);
+    }
+    if for_qwen_image && (arch == "qwen3vl" || arch == "qwen2vl" || arch == "qwen25vl") {
+        return Ok(detected(Role::Component { kind: "text_encoder" }, "gguf",
+            format!("Qwen3-VL text encoder for Qwen Image, quantized GGUF ({label})"), vec![("text_encoder", path_json(path))]));
     }
     if arch.is_empty() {
         return Err(format!("{}: GGUF without general.architecture", path.display()));
@@ -785,6 +797,24 @@ mod tests {
         let r = detect(&image).unwrap();
         assert_eq!(r.role, Role::Image { architecture: "qwen-image" });
         assert_eq!(r.missing, vec!["base".to_string()]);
+        // Qwen Image 2.1 Turbo (AtomicChat's GGUFs): the distilled checkpoint, and its text encoder, a Qwen3-VL whose
+        // file says what it is for (another Qwen3-VL GGUF is a chat model).
+        let turbo = d.0.join("Qwen-Image-2.1-Turbo-AD-Q4_K.gguf");
+        gguf(&turbo, &[], &["model.diffusion_model.img_in.weight"]);
+        let r = detect(&turbo).unwrap();
+        assert_eq!(r.role, Role::Image { architecture: "qwen-image" });
+        assert!(r.fields.iter().any(|(k, v)| k == "distilled" && *v == Json::Bool(true)), "{:?}", r.fields);
+        assert!(r.summary.contains("Turbo"), "{}", r.summary);
+        assert!(!detect(&image).unwrap().fields.iter().any(|(k, _)| k == "distilled"));
+        let encoder = d.0.join("Qwen-Image-2.1-Turbo-Abliterated-Uncensored-AD-Q4_K.gguf");
+        gguf(&encoder, &[("general.architecture", "qwen3vl")], &["token_embd.weight"]);
+        assert_eq!(detect(&encoder).unwrap().kind(), "text_encoder");
+        let chat = d.0.join("Qwen3-VL-8B-Instruct-Q4_K_M.gguf");
+        gguf(&chat, &[("general.architecture", "qwen3vl")], &["token_embd.weight"]);
+        assert_eq!(detect(&chat).unwrap().role, Role::Llm);
+        for f in [&turbo, &encoder, &chat] {
+            std::fs::remove_file(f).unwrap();
+        }
         // The folder holding the LLM (and its projector) is the LLM, projector attached.
         std::fs::remove_file(&image).unwrap();
         let folder = detect(&d.0).unwrap();

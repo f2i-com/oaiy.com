@@ -1,7 +1,7 @@
 """OAIY's way into tinygrad's LLM server (docs/MAC.md), or onto the card for OAIY's own engine (docs/TINYGPU.md).
 
     python egpu_serve.py [--watch-stdin] --model FILE --serve PORT --max_context N ...   tinygrad.llm's own arguments
-    python egpu_serve.py [--watch-stdin] --webgpu PROGRAM ARGS...                        OAIY's engine on the card
+    python egpu_serve.py [--watch-stdin] [--paused] --webgpu PROGRAM ARGS...             OAIY's engine on the card
     python egpu_serve.py --check                                                          what this Python has, as JSON
 
 With --webgpu the card is held here, through tinygrad, by webgpu_server.py (written beside this file): WebGPU's compute
@@ -17,7 +17,7 @@ server reads from no request. Nothing of tinygrad's is changed on disk, and noth
 Python's socket server, which tinygrad's server is built on, is told where to listen and whom to answer, and jinja2,
 which renders the model's chat format, is given the request's word on thinking.
 """
-import hmac, importlib.util, json, os, runpy, socketserver, sys, threading
+import hmac, importlib.util, json, os, queue, runpy, socketserver, sys, threading
 
 # Where tinygrad has kept its LLM server: a package since April 2026, a single module before.
 SERVERS = ("tinygrad.llm", "tinygrad.apps.llm")
@@ -25,6 +25,8 @@ KEY = os.environ.pop("OAIY_EGPU_KEY", "")
 # Whether the request being answered is to be thought about first: "1", "0", or None when it did not say. One
 # value for the whole server, which answers one request at a time.
 THINKING = [None]
+# The lines read from standard input meanwhile (--webgpu: `pause` and `resume`, for the engine on the card).
+ASKED = queue.Queue()
 
 
 def local_only():
@@ -78,11 +80,15 @@ def lifeline():
 
     Read from the descriptor itself, not through sys.stdin: a thread waiting inside Python's buffered reader holds
     its lock, and an interpreter that exits meanwhile (tinygrad failing to load a model) dies on that lock with a
-    crash in place of its own error message.
+    crash in place of its own error message. A line read meanwhile is passed on (ASKED).
     """
+    pending = b""
     try:
-        while os.read(0, 4096):
-            pass
+        while chunk := os.read(0, 4096):
+            pending += chunk
+            while b"\n" in pending:
+                line, pending = pending.split(b"\n", 1)
+                ASKED.put(line.decode("utf-8", "replace").strip())
     except OSError:
         pass
     # The card released as Python exits: an interrupt to the main thread unwinds it, and the interpreter's exit runs
@@ -153,36 +159,74 @@ def check():
 def webgpu(args):
     """Hold the card for OAIY's engine and run the engine's server on it, until either goes.
 
-    The card's server answers on a socket of this run's own; the engine is told it as its adapter. At the lifeline's
-    interrupt the engine is stopped first, then the card's last request let finish, and Python's exit releases the
-    card (within the lifeline's 15 s)."""
+    The card's server answers on a socket of this run's own, said on standard output (`oaiy-egpu: card at PATH`); the
+    engine is told it as its adapter. A line on standard input pauses the engine or brings it back (`pause`, `resume`):
+    paused, the engine is stopped and the card kept, its memory free for another program on that socket (OAIY's image
+    worker), which `oaiy-egpu: paused` says once the engine's buffers are freed; `oaiy-egpu: resumed` says it is
+    starting again. With --paused (before --webgpu) it starts so: the card held, the engine not started until a
+    `resume`. The engine exiting by itself ends this. At the lifeline's interrupt the engine is stopped first, then the
+    card's last request let finish, and Python's exit releases the card (within the lifeline's 15 s)."""
     import shutil, subprocess, tempfile
 
     at = args.index("--webgpu")
+    paused = "--paused" in args[:at]
     program, rest = args[at + 1], args[at + 2:]
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import webgpu_server
 
-    card = webgpu_server.Server(webgpu_server.Card())
+    # (OAIY_EGPU_EMULATE=1: no card, its work on the CPU, as webgpu_server.py --emulate: for tests, and to try a change)
+    card = webgpu_server.Server(webgpu_server.Emulator() if os.environ.get("OAIY_EGPU_EMULATE") == "1" else webgpu_server.Card())
     folder = tempfile.mkdtemp(prefix="oaiy-egpu-")
     path = os.path.join(folder, "card.sock")
     sock = webgpu_server.listen(path)
     lock, closing = threading.Lock(), threading.Event()
     threading.Thread(target=webgpu_server.accept, args=(card, sock, lock, closing), daemon=True).start()
     print(f"oaiy-egpu: {card.card.info()['name']} held for OAIY's engine", flush=True)
+    print(f"oaiy-egpu: card at {path}", flush=True)
     env = dict(os.environ, OAIY_WEBGPU_ADAPTER="tinygpu:" + path, OAIY_LLM_API_KEY=KEY)
-    child = subprocess.Popen([program, *rest], env=env)
-    code = 1
-    try:
-        code = child.wait()
-    except KeyboardInterrupt:
+
+    def halt(child, wait=10):
         child.terminate()
         try:
-            code = child.wait(timeout=5)
+            return child.wait(timeout=wait)
         except subprocess.TimeoutExpired:
             child.kill()
-            code = child.wait()
+            return child.wait()
+
+    def said_paused():
+        # (the engine's memory on the card is free once its connection has gone, and its buffers with it)
+        if not webgpu_server.wait_clients(0, 10):
+            print("oaiy-egpu: a program is still connected to the card", flush=True)
+        print("oaiy-egpu: paused", flush=True)
+
+    engine, code = [None], 1
+    try:
+        if paused:
+            said_paused()
+        else:
+            engine[0] = subprocess.Popen([program, *rest], env=env)
+        while True:
+            try:
+                asked = ASKED.get(timeout=0.5)
+            except queue.Empty:
+                asked = None
+            if engine[0] is not None and engine[0].poll() is not None:
+                code = engine[0].returncode
+                break
+            if asked == "pause":
+                if engine[0] is not None:
+                    halt(engine[0])
+                    engine[0] = None
+                said_paused()
+            elif asked == "resume" and engine[0] is None:
+                engine[0] = subprocess.Popen([program, *rest], env=env)
+                print("oaiy-egpu: resumed", flush=True)
+    except KeyboardInterrupt:
+        # (within the lifeline's 15 s, with the card's last request)
+        code = halt(engine[0], 5) if engine[0] is not None else 0
     finally:
+        if engine[0] is not None and engine[0].poll() is None:
+            engine[0].kill()
         closing.set()
         lock.acquire(timeout=5)
         sock.close()

@@ -40,7 +40,7 @@ the card, which over Thunderbolt has taken its link down until the enclosure was
 """
 from __future__ import annotations
 
-import ctypes, hashlib, json, mmap, os, pathlib, signal, socket, struct, subprocess, sys, threading, traceback
+import ctypes, hashlib, json, mmap, os, pathlib, signal, socket, struct, subprocess, sys, threading, time, traceback
 from concurrent.futures import ThreadPoolExecutor
 
 CACHE = pathlib.Path.home() / ".cache" / "tinygpu-webgpu"
@@ -133,6 +133,9 @@ class Card:
   # find a kernel the emulator lets through)
   SYNC_EACH = os.environ.get("TINYGPU_SYNC_EACH") == "1"
   ARGS_RING = 4096  # launches between waits: their arguments are a ring of tinygrad's (16 MB), reused as it wraps
+  # TINYGPU_PROFILE=1: each kernel run alone and timed (the wall clock's, its own submission's 45 us in it), the times
+  # by kernel written to ~/.cache/tinygpu-webgpu/profile.txt as each client goes: where a program's time is spent
+  PROFILE = os.environ.get("TINYGPU_PROFILE") == "1"
 
   def __init__(self):
     from tinygrad import Device
@@ -141,6 +144,7 @@ class Card:
     self.arch = self.dev.arch
     self.q, self.queued, self.since_sync = None, 0, 0
     self.scratch = None
+    self.profiled: dict = {}   # (TINYGPU_PROFILE: a kernel's calls, its time, its last grid, its workgroup)
     built = {name: Program(self.dev, compile_cuda(src, self.arch), name, (256, 1, 1), 1) for name, src in BUILTINS.items()}
     self.copy4, self.copy1, self.fill4, self.fill1 = built["tg_copy4"], built["tg_copy1"], built["tg_fill4"], built["tg_fill1"]
 
@@ -154,6 +158,7 @@ class Card:
 
   def launch(self, prog: Program, bufs, grid, vals=()):
     inside = self.q is not None   # (a submission's, else a launch of its own: an ALLOC's clear)
+    if self.PROFILE: return self.timed(prog, bufs, grid, vals, inside)
     if self.since_sync >= self.ARGS_RING: self.sync()
     self.begin()
     self.q.exec(prog.prg, prog.args(bufs, grid, vals), grid, prog.workgroup)
@@ -170,6 +175,34 @@ class Card:
     elif self.queued >= self.BATCH:
       self.end()
       self.begin()
+
+  def timed(self, prog: Program, bufs, grid, vals, inside: bool):
+    """`prog` launched alone and waited for (TINYGPU_PROFILE), its time added to its kernel's."""
+    self.end()
+    self.dev.synchronize()
+    t = time.perf_counter()
+    self.begin()
+    self.q.exec(prog.prg, prog.args(bufs, grid, vals), grid, prog.workgroup)
+    self.queued = 1
+    self.end()
+    self.dev.synchronize()
+    took = time.perf_counter() - t
+    self.since_sync = 0
+    seen = self.profiled.setdefault(prog.label, [0, 0.0, grid, prog.workgroup])
+    seen[0] += 1
+    seen[1] += took
+    seen[2] = grid
+    if inside: self.begin()
+
+  def report(self):
+    """The kernels' times so far (TINYGPU_PROFILE), the most first, written to the cache's profile.txt."""
+    if not self.PROFILE or not self.profiled: return
+    total = sum(s[1] for s in self.profiled.values())
+    lines = [f"{total * 1e3:10.1f} ms in {sum(s[0] for s in self.profiled.values())} kernels (each alone: a submission's 45 us in each)",
+             f"{'ms':>10} {'%':>5} {'calls':>7} {'ms each':>9}  {'grid':<16} {'workgroup':<12} kernel (its CUDA: <cache>/<kernel>.cu)"]
+    for label, (n, t, grid, wg) in sorted(self.profiled.items(), key=lambda kv: -kv[1][1]):
+      lines.append(f"{t * 1e3:10.1f} {100 * t / total:5.1f} {n:7d} {t * 1e3 / n:9.3f}  {str(grid):<16} {str(wg):<12} {label}")
+    (CACHE / "profile.txt").write_text("\n".join(lines) + "\n")
 
   def info(self) -> dict:
     return {"arch": self.arch, "name": f"NVIDIA {self.arch} via tinygrad (TinyGPU)", "device": "NV",
@@ -412,22 +445,71 @@ class Server:
   COMMANDS = {1: hello, 2: alloc, 3: free, 4: write, 5: read, 6: program, 7: submit, 8: sync}
 
 
-def recv_exact(conn: socket.socket, n: int) -> bytes:
-  buf = bytearray(n)
+def recv_exact(conn: socket.socket, n: int, into: bytearray | None = None) -> bytearray:
+  """`n` bytes from the client (in `into`'s first n, where it is given: a buffer kept for it)."""
+  buf = bytearray(n) if into is None else into
   view, got = memoryview(buf), 0
   while got < n:
-    k = conn.recv_into(view[got:], n - got)
+    k = conn.recv_into(view[got:n], n - got)
     if k == 0: raise ConnectionError("client closed")
     got += k
-  return bytes(buf)
+  return buf
+
+
+# A large write is taken in pieces of this size, each sent on to the card as it comes: the card's copy (tinygrad's, by
+# its staging buffers, which it does not wait for) runs while the next piece is received.
+PIECE = 16 << 20
+
+
+def write_in_pieces(server: Server, conn: socket.socket, n: int, piece: bytearray):
+  """A WRITE of `n` bytes (its buffer, its offset, its bytes) taken from the socket piece by piece. Its bytes are all
+  read, an error or not, so the next request is where the client put it."""
+  h, off = struct.unpack("<QQ", recv_exact(conn, 16))
+  size, error = n - 16, None
+  try: buf = server.within(h, off, size, "a write")
+  except Exception as e: buf, error = None, e
+  at = 0
+  while at < size:
+    k = min(PIECE, size - at)
+    recv_exact(conn, k, piece)
+    if error is None:
+      try: server.card.write(buf, off + at, memoryview(piece)[:k])
+      except Exception as e: error = e
+    at += k
+  if error is not None: raise error
+
+
+# How many clients are connected, and a word to whoever waits for that to change (egpu_serve.py, pausing OAIY's engine:
+# its memory on the card is free once its connection's buffers are).
+CLIENTS, connected = threading.Condition(), [0]
+
+
+def wait_clients(most: int, timeout: float) -> bool:
+  """Whether the clients came down to `most` within `timeout` seconds, each one's buffers freed as it went."""
+  with CLIENTS: return CLIENTS.wait_for(lambda: connected[0] <= most, timeout)
 
 
 def handle(server: Server, conn: socket.socket, lock: threading.Lock, closing: threading.Event):
   """One client's requests, each run with the card to itself; the buffers it did not free are freed as it goes."""
-  owned = set()
+  owned, piece = set(), None
+  with CLIENTS: connected[0] += 1
   try:
     while True:
       cmd, n = struct.unpack("<IQ", recv_exact(conn, 12))
+      if cmd == 4 and n > 16 + PIECE:
+        # (with the card to itself throughout, as any request: its pieces are not another client's requests' business)
+        with lock:
+          if closing.is_set(): return
+          try:
+            if piece is None: piece = bytearray(PIECE)
+            write_in_pieces(server, conn, n, piece)
+            out, status = b"", 0
+          except (ConnectionError, OSError): raise
+          except Exception as e:
+            out, status = f"{type(e).__name__}: {e}".encode(), 1
+            traceback.print_exc()
+        conn.sendall(struct.pack("<IQ", status, len(out)) + out)
+        continue
       payload = recv_exact(conn, n) if n else b""
       if cmd == 9:
         conn.sendall(struct.pack("<IQ", 0, 0))
@@ -448,9 +530,15 @@ def handle(server: Server, conn: socket.socket, lock: threading.Lock, closing: t
     pass
   finally:
     conn.close()
-    with lock:
-      if not closing.is_set():
-        for h in owned: server.free(struct.pack("<Q", h))
+    try:
+      with lock:
+        if not closing.is_set():
+          for h in owned: server.free(struct.pack("<Q", h))
+          if hasattr(server.card, "report"): server.card.report()
+    finally:
+      with CLIENTS:
+        connected[0] -= 1
+        CLIENTS.notify_all()
 
 
 def listen(path: str) -> socket.socket:
@@ -468,6 +556,10 @@ def accept(server: Server, sock: socket.socket, lock: threading.Lock, closing: t
   while not closing.is_set():
     try: conn, _ = sock.accept()
     except OSError: return
+    # (a Mac gives a local socket 8 KB each way: a read's bytes cross it in 4 MB calls instead)
+    for option in (socket.SO_SNDBUF, socket.SO_RCVBUF):
+      try: conn.setsockopt(socket.SOL_SOCKET, option, 4 << 20)
+      except OSError: pass
     threading.Thread(target=handle, args=(server, conn, lock, closing), daemon=True).start()
 
 

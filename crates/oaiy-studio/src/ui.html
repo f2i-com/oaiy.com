@@ -1002,6 +1002,7 @@ dialog::backdrop { background: var(--backdrop); }
         </div>
         <div class="row" style="margin-top:14px; gap:14px; align-items:center">
           <label class="check" style="margin-right:8px"><input type="checkbox" data-bind="llm.egpu.enabled"> Use the eGPU</label>
+          <label class="check" style="margin-right:8px" title="With OAIY's own engine on the card: a Qwen Image picture is made on the card, its language model paused meanwhile (the card's memory is the picture's) and loaded again after. Pictures made while it is off, or while the card is not there, are made on this Mac."><input type="checkbox" data-bind="llm.egpu.images" id="egpu-images"> Make pictures on it too</label>
           <button class="btn" type="button" id="egpu-check">Check tinygrad</button>
           <button class="btn" type="button" id="egpu-start">Start</button>
           <button class="btn" type="button" id="egpu-stop">Stop</button>
@@ -1293,6 +1294,7 @@ function renderConfig() {
   // (a card not named yet is an NVIDIA one: shown so, written only when chosen)
   if ($("#egpu-device") && !$("#egpu-device").value) $("#egpu-device").value = "NV";
   if ($("#egpu-engine") && !$("#egpu-engine").value) $("#egpu-engine").value = "tinygrad";
+  if ($("#egpu-images") && getPath(cfg, "llm.egpu.images") == null) $("#egpu-images").checked = true;
   { const on = $("section.view.on"); if (on) renderJump(on.id.slice(2)); }
   $("#cfg-path").textContent = state ? "Configuration: " + state.config_path : "";
 }
@@ -1789,10 +1791,12 @@ function renderEgpu() {
   // Its ticks under Models and its row on the Overview follow what the engines say, once they have said it.
   if (egpuOfferedBefore !== !!e?.available && cfg) { egpuOfferedBefore = !!e?.available; renderModels(); }
   if (!e?.available) return;
-  const label = !e.enabled ? "Off" : {stopped: "Not started", starting: "Loading", ready: "Ready", failed: "Not answering"}[e.state];
+  const label = !e.enabled ? "Off" : e.lent ? "Making a picture" : e.paused ? "Paused" : {stopped: "Not started", starting: "Loading", ready: "Ready", failed: "Not answering"}[e.state];
   $("#egpu-tag").innerHTML = `<span class="tag ${e.enabled && e.state === "ready" ? "good" : e.enabled && e.state === "failed" ? "bad" : ""}">${label}</span>`;
   const set = e.models?.length ? "" : " No model is set to it yet: tick one under Models.";
   $("#egpu-detail").textContent = !e.enabled ? "Switched off: every model runs on this computer's own GPU."
+    : e.lent ? `The card is making a picture: ${e.model || "its model"} is paused, and chats with it wait for the card.`
+    : e.paused ? `The card is held with ${e.model || "its model"} paused (after a picture): the next chat with it loads it again.`
     : e.state === "ready" ? `Serving ${e.model}${e.runs_on ? " on " + e.runs_on : ""}, up to ${e.context_tokens} tokens of context. Loaded in ${e.load_seconds?.toFixed(1)} s, idle ${e.idle_seconds} s.`
     : e.state === "starting" ? `Loading ${e.model || ""}. tinygrad compiles its kernels the first time a model starts, which takes minutes; requests wait for it.`
     : e.state === "failed" ? `${e.error || "tinygrad's server failed."}\n\nThis computer's GPU answers meanwhile.${e.retry_seconds ? ` It is tried again in ${e.retry_seconds} s, or now with Start.` : ""}`

@@ -45,12 +45,27 @@ struct Conn {
 
 impl Conn {
     fn call(&self, cmd: u32, payload: &[u8]) -> Result<Vec<u8>, String> {
+        self.call_parts(cmd, &[payload])
+    }
+
+    /// A request whose payload is `parts`, one after another: sent as they are, not copied into one (a write's bytes
+    /// are a model's weights, hundreds of megabytes a tensor).
+    fn call_parts(&self, cmd: u32, parts: &[&[u8]]) -> Result<Vec<u8>, String> {
         let mut s = self.stream.lock().unwrap_or_else(|p| p.into_inner());
-        let mut head = Vec::with_capacity(12 + payload.len());
+        let len: usize = parts.iter().map(|p| p.len()).sum();
+        let mut head = Vec::with_capacity(12 + if len <= 64 << 10 { len } else { 0 });
         head.extend(cmd.to_le_bytes());
-        head.extend((payload.len() as u64).to_le_bytes());
-        head.extend(payload);
-        s.write_all(&head).map_err(|e| format!("tinygpu: {e}"))?;
+        head.extend((len as u64).to_le_bytes());
+        // (a small request goes in one write, as it did)
+        if len <= 64 << 10 {
+            parts.iter().for_each(|p| head.extend_from_slice(p));
+            s.write_all(&head).map_err(|e| format!("tinygpu: {e}"))?;
+        } else {
+            s.write_all(&head).map_err(|e| format!("tinygpu: {e}"))?;
+            for p in parts {
+                s.write_all(p).map_err(|e| format!("tinygpu: {e}"))?;
+            }
+        }
         let mut answer = [0u8; 12];
         s.read_exact(&mut answer).map_err(|e| format!("tinygpu: {e}"))?;
         let status = u32::from_le_bytes(answer[..4].try_into().unwrap());
@@ -69,6 +84,19 @@ impl Conn {
     }
 }
 
+/// The socket's buffers made large: a Mac gives a local socket 8 KB each way, and a model's weights then cross it a
+/// few kilobytes a call, at half what the card's link takes (1.4 GB/s, where 4 MB buffers give 2.4 and the link 2.6).
+fn roomy(stream: &UnixStream) {
+    use std::os::fd::AsRawFd;
+    let size: libc::c_int = 4 << 20;
+    for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+        // (a smaller buffer only costs speed: what the system will not give is left as it is)
+        unsafe {
+            libc::setsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, option, (&size as *const libc::c_int).cast(), std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+        }
+    }
+}
+
 fn u64_of(b: &[u8]) -> u64 {
     u64::from_le_bytes(b[..8].try_into().expect("8 bytes"))
 }
@@ -83,6 +111,7 @@ pub fn default_socket() -> PathBuf {
 /// The card the server at `socket` holds, as a `wgpu::Adapter`.
 pub fn adapter(socket: &Path) -> Result<wgpu::Adapter, String> {
     let stream = UnixStream::connect(socket).map_err(|e| format!("tinygpu: no server at {} ({e}): start tools/tinygpu/webgpu_server.py", socket.display()))?;
+    roomy(&stream);
     let conn = Arc::new(Conn { stream: Mutex::new(stream) });
     let hello = String::from_utf8_lossy(&conn.call(HELLO, &[])?).into_owned();
     let field = |key: &str| -> Option<String> {
@@ -424,11 +453,10 @@ fn read_range(conn: &Conn, id: u64, start: u64, len: u64) -> Vec<u8> {
 }
 
 fn write_range(conn: &Conn, id: u64, start: u64, data: &[u8]) {
-    let mut p = Vec::with_capacity(16 + data.len());
-    p.extend(id.to_le_bytes());
-    p.extend(start.to_le_bytes());
-    p.extend(data);
-    conn.must(WRITE, &p);
+    let mut at = [0u8; 16];
+    at[..8].copy_from_slice(&id.to_le_bytes());
+    at[8..].copy_from_slice(&start.to_le_bytes());
+    conn.call_parts(WRITE, &[&at, data]).unwrap_or_else(|e| panic!("{e}"));
 }
 
 impl BufferInterface for TgBuffer {

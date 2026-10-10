@@ -513,6 +513,10 @@ pub fn validate(v: &Json) -> Result<(), String> {
         if egpu.get("enabled").is_some_and(|e| e.as_bool().is_none()) {
             return Err("llm.egpu.enabled must be true or false".into());
         }
+        // Whether Qwen Image pictures are made on the card, with OAIY's engine on it (`crate::media::on_card`).
+        if egpu.get("images").is_some_and(|e| e.as_bool().is_none()) {
+            return Err("llm.egpu.images must be true or false".into());
+        }
         for key in ["python", "tinygrad", "device", "fallback_model"] {
             if egpu.get(key).is_some_and(|s| s.as_str().is_none()) {
                 return Err(format!("llm.egpu.{key} must be text"));
@@ -588,6 +592,13 @@ pub fn validate(v: &Json) -> Result<(), String> {
         }
         if arch == "qwen-image" && str_or(m, "transformer", "").is_empty() && str_or(m, "safetensors_transformer", "").is_empty() {
             return Err(format!("image model {name} needs a transformer (a .gguf or a .safetensors checkpoint)"));
+        }
+        // Qwen Image 2.1 Turbo, the distilled checkpoint: 8 steps at CFG 1, and no turbo adapter beside it.
+        if arch == "qwen-image" && m.get("distilled").is_some_and(|d| d.as_bool().is_none()) {
+            return Err(format!("image model {name}: distilled must be true or false"));
+        }
+        if arch == "qwen-image" && bool_or(m, "distilled", false) && !str_or(m, "adapter", "").trim().is_empty() {
+            return Err(format!("image model {name} is distilled (Turbo): it takes no turbo adapter"));
         }
         if arch == "flux2-klein-4b" {
             let variant=str_or(m,"variant","distilled");
@@ -880,6 +891,7 @@ mod tests {
         set(r#"{"enabled": true, "ctx": null}"#, models).unwrap();
         set(r#"{"enabled": true, "engine": "webgpu"}"#, models).unwrap();
         set(r#"{"enabled": true, "engine": "tinygrad"}"#, models).unwrap();
+        set(r#"{"enabled": true, "engine": "webgpu", "images": false}"#, models).unwrap();
         for (egpu, needle) in [
             (r#"[1]"#, "llm.egpu must be an object"),
             (r#"{"enabled": "yes"}"#, "llm.egpu.enabled"),
@@ -892,6 +904,7 @@ mod tests {
             (r#"{"extra_args": "--shard 2"}"#, "llm.egpu.extra_args"),
             (r#"{"engine": "cuda"}"#, "llm.egpu.engine"),
             (r#"{"engine": true}"#, "llm.egpu.engine"),
+            (r#"{"images": "yes"}"#, "llm.egpu.images"),
         ] {
             let err = set(egpu, models).unwrap_err();
             assert!(err.contains(needle), "{err} lacks {needle}");

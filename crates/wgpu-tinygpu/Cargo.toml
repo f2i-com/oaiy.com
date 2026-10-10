@@ -6,6 +6,7 @@ description = "A wgpu adapter for an NVIDIA card a Mac reaches only through tiny
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+libc = "0.2"
 wgpu = { version = "30", features = ["custom"] }
 wgsl-cuda = { path = "../wgsl-cuda" }
 

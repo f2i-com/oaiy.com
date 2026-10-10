@@ -6,6 +6,11 @@
 //! (auto|gpu|ram|ssd), `ram_gb` and `vram_gb`, and the worker places every block
 //! of the model on the GPU, in RAM or on the SSD accordingly. The studio decides
 //! only what a job may use and whether the LLM must leave the GPU first.
+//!
+//! On a Mac whose eGPU runs OAIY's engine, a Qwen Image picture is made on the
+//! card instead ([`on_card`]): the card is lent to the worker (`crate::egpu`),
+//! its language model paused, until the queue is empty. This computer's GPU and
+//! language model are left alone; a picture the card fails is made here.
 
 use crate::config::{self, VIDEO_FAMILIES};
 use crate::util::{base64_decode, bool_or, int_or, now, num_or, random_id, str_or, LogRing};
@@ -497,15 +502,22 @@ pub fn image_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
             _ => return Err("Qwen Image model needs a transformer".into()),
         };
         f.push(("transformer".into(), Json::str(transformer)));
+        // Qwen Image 2.1 Turbo, the distilled checkpoint: its own 8 steps at CFG 1, and no adapter.
+        let distilled = bool_or(model, "distilled", false);
         let turbo = body.get("turbo").and_then(Json::as_bool).unwrap_or(true);
-        let adapter = path_field(root, model, "adapter").filter(|_| turbo);
-        let default_steps = if adapter.is_some() { 6 } else { 40 };
+        let adapter = path_field(root, model, "adapter").filter(|_| turbo && !distilled);
+        let default_steps = if distilled { 8 } else if adapter.is_some() { 6 } else { 40 };
         let steps = steps(default_steps, 2, 100)?;
         if adapter.is_some() && !matches!(steps, 4 | 6) {
             return Err("turbo (adapter) models take 4 or 6 steps".into());
         }
+        if distilled && steps != 8 {
+            return Err(format!("{name} is Qwen Image Turbo, distilled to 8 steps: it takes no other number"));
+        }
         f.push(("steps".into(), Json::Int(steps)));
-        if adapter.is_none() {
+        if distilled {
+            f.push(("distilled".into(), Json::Bool(true)));
+        } else if adapter.is_none() {
             let cfg_scale = body.get("cfg").and_then(Json::as_f64).unwrap_or(num_or(model, "cfg", 4.0));
             f.push(("cfg".into(), Json::Num(cfg_scale)));
         }
@@ -913,6 +925,23 @@ pub fn needs_media_gpu(cfg: &Json, model: Option<&str>) -> bool {
     }
 }
 
+/// Whether a job of `kind` with `request` is made on the eGPU's card (a Mac's, `crate::egpu`): a Qwen Image picture on
+/// WebGPU, where the eGPU is switched on, answers with OAIY's own engine, and makes pictures (`llm.egpu.images`, on
+/// unless switched off).
+pub fn on_card(cfg: &Json, kind: Kind, request: &Json) -> bool {
+    let Some(llm) = cfg.get("llm") else { return false };
+    kind == Kind::Image
+        && crate::egpu::enabled(llm)
+        && crate::egpu::webgpu(llm)
+        && bool_or(llm.get("egpu").unwrap_or(&Json::Null), "images", true)
+        && request.get("architecture").is_none_or(|a| a.as_str() == Some("qwen-image"))
+        && request.get("backend").is_none_or(|b| b.as_str() == Some("webgpu"))
+}
+
+/// How long a picture waits for the eGPU's language model to finish the requests it is answering, before it is made
+/// on this computer instead.
+const CARD_WAIT: Duration = Duration::from_secs(5 * 60);
+
 /// Whether a media job can stop the LLM at all: `llm_policy` `pause_llm`
 /// always, `coexist` never, `auto` when the media device is one the LLM uses
 /// (its `devices`, or those of an enabled model with GPUs of its own).
@@ -1235,6 +1264,14 @@ impl Media {
                     // Nothing queued: bring back an LLM that media paused. Here
                     // rather than after each job, so a batch does not reload it
                     // between jobs, and a cancelled last job still resumes it.
+                    // (The eGPU's card likewise.)
+                    if studio.egpu.is_lent() {
+                        drop(jobs);
+                        self.log.push("giving the eGPU back to its language model");
+                        studio.egpu.give_back();
+                        jobs = self.lock();
+                        continue;
+                    }
                     if studio.llm.paused() {
                         drop(jobs);
                         self.resume_llm(studio);
@@ -1307,6 +1344,24 @@ impl Media {
         let cfg = studio.config();
         let media = cfg.get("media").cloned().unwrap_or(Json::Null);
         let device = int_or(&media, "device", 0);
+        if on_card(&cfg, job.kind, &job.request) && !job.cancel.load(Ordering::Relaxed) {
+            let label = if job.incognito { "incognito job" } else { job.id.as_str() };
+            match studio.egpu.lend(&cfg, &studio.root, CARD_WAIT) {
+                Ok(socket) => {
+                    self.update(&job.id, |j| j.stage = "on the eGPU".into());
+                    match self.worker(studio, &cfg, job, Some(&socket)) {
+                        Ok(done) => return Ok(done),
+                        Err(e) if job.cancel.load(Ordering::Relaxed) => return Err(e),
+                        // (the card's language model comes back while this computer makes it)
+                        Err(e) => {
+                            self.log.push(format!("{label}: the eGPU did not make it ({}); this computer makes it", e.lines().next().unwrap_or("")));
+                            studio.egpu.give_back();
+                        }
+                    }
+                }
+                Err(e) => self.log.push(format!("{label}: the eGPU is not free for it ({e}); this computer makes it")),
+            }
+        }
         {
             let mut b = self.broker.lock().unwrap_or_else(|p| p.into_inner());
             // Chats whose model shares this GPU finish first (and no new ones start),
@@ -1333,7 +1388,7 @@ impl Media {
             studio.llm.stop();
             studio.llm.set_paused(true);
         }
-        let result = if job.cancel.load(Ordering::Relaxed) { Err("cancelled".into()) } else { self.worker(studio, &cfg, job) };
+        let result = if job.cancel.load(Ordering::Relaxed) { Err("cancelled".into()) } else { self.worker(studio, &cfg, job, None) };
         {
             let mut b = self.broker.lock().unwrap_or_else(|p| p.into_inner());
             b.media = false;
@@ -1342,23 +1397,29 @@ impl Media {
         result
     }
 
-    fn worker(&self, studio: &crate::Studio, cfg: &Json, job: &Job) -> Result<Json, String> {
+    /// The worker run for `job`; `card`: the eGPU card's socket, its WebGPU adapter (`crate::egpu`), else this
+    /// computer's GPU.
+    fn worker(&self, studio: &crate::Studio, cfg: &Json, job: &Job, card: Option<&str>) -> Result<Json, String> {
         let media = cfg.get("media").ok_or("no media section")?;
         let program = config::program(&studio.root, str_or(media, "worker", "oaiy-media"));
         let output_root = studio.output_root();
         std::fs::create_dir_all(&output_root).map_err(|e| e.to_string())?;
         let mut command = Command::new(&program);
         command.arg("--stdin").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        if let Some(socket) = card {
+            command.env("OAIY_WEBGPU_ADAPTER", format!("tinygpu:{socket}"));
+        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x0800_0000);
         }
         let label = if job.incognito { "incognito job".to_string() } else { job.id.clone() };
+        let gpu = if card.is_some() { "the eGPU".to_string() } else { format!("GPU {}", int_or(&job.request, "device", 0)) };
         if job.incognito {
-            self.log.push(format!("incognito {} job on GPU {}", job.kind.name(), int_or(&job.request, "device", 0)));
+            self.log.push(format!("incognito {} job on {gpu}", job.kind.name()));
         } else {
-            self.log.push(format!("{}: {} job on GPU {} ({} {})", job.id, job.kind.name(), int_or(&job.request, "device", 0), job.model, str_or(&job.request, "memory", "auto")));
+            self.log.push(format!("{}: {} job on {gpu} ({} {})", job.id, job.kind.name(), job.model, str_or(&job.request, "memory", "auto")));
         }
         let mut child = command.spawn().map_err(|e| format!("could not start {}: {e} (is oaiy-media built with --features flash-attn? set media.worker)", program.display()))?;
         let payload = job.request.to_json();

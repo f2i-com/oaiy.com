@@ -18,12 +18,16 @@
 //! launcher holds the card through tinygrad as a WebGPU adapter (`webgpu_server.py`, written beside it) and runs this
 //! computer's `oaiy-llm-server` on it with the model (docs/TINYGPU.md). Every model the engine runs runs there, at the
 //! card's speed (a 27B model ten times tinygrad's server's), and nothing else of the arrangement changes.
+//!
+//! The card can then be lent to OAIY's image worker ([`Egpu::lend`], `crate::media`): the launcher stops the engine,
+//! keeps the card (opening it again would reset it), and the worker takes the card's socket as its WebGPU adapter, with
+//! the memory the engine had. Requests for the model wait meanwhile; given back, the engine starts again.
 
 use crate::config;
 use crate::llm::{Endpoint, State};
 use crate::util::{bool_or, int_or, random_id, str_or, LogRing};
 use oaiy_engine::json::Json;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
@@ -325,6 +329,14 @@ struct Inner {
     python: Option<(String, PathBuf)>,
     /// The last reason a request went to this computer's engine, so the log says it once.
     said: Option<String>,
+    /// The launcher's word on the card (OAIY's engine on it).
+    card: Arc<Card>,
+    /// The card is lent to OAIY's image worker: the engine on it paused, requests for its model waiting.
+    lent: bool,
+    /// The engine on the card is paused: asked to be, and not yet asked back.
+    paused: bool,
+    /// Bring the engine back as the card is given back (it was running when it was lent).
+    resume_after: bool,
 }
 
 pub struct Egpu {
@@ -345,6 +357,54 @@ impl Drop for Lease {
         g.last_used = Instant::now();
         drop(g);
         self.0.changed.notify_all();
+    }
+}
+
+/// What the launcher has said of the card (`llm.egpu.engine` `webgpu`), one for each of its processes: where the
+/// card's socket is, and whether OAIY's engine on it is paused (its memory free for another program on the socket).
+#[derive(Default)]
+struct Card {
+    said: Mutex<CardSaid>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct CardSaid {
+    socket: Option<String>,
+    paused: bool,
+}
+
+impl Card {
+    /// A line of the launcher's output, taken where it is one of its words on the card.
+    fn heard(&self, line: &str) {
+        let mut s = self.said.lock().unwrap_or_else(|p| p.into_inner());
+        match line.trim_end() {
+            "oaiy-egpu: paused" => s.paused = true,
+            "oaiy-egpu: resumed" => s.paused = false,
+            l => match l.strip_prefix("oaiy-egpu: card at ") {
+                Some(path) => s.socket = Some(path.to_string()),
+                None => return,
+            },
+        }
+        drop(s);
+        self.changed.notify_all();
+    }
+
+    /// The card's socket once the launcher has said where it is and that the engine is paused, waiting up to `wait`
+    /// (in slices, `gone` asked between them: whether to stop waiting, the launcher gone).
+    fn paused_at(&self, wait: Duration, gone: impl Fn() -> bool) -> Option<String> {
+        let deadline = Instant::now() + wait;
+        let mut s = self.said.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if s.paused && s.socket.is_some() {
+                return s.socket.clone();
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() || gone() {
+                return None;
+            }
+            s = self.changed.wait_timeout(s, left.min(Duration::from_millis(500))).unwrap_or_else(|p| p.into_inner()).0;
+        }
     }
 }
 
@@ -425,6 +485,10 @@ impl Egpu {
                 command: String::new(),
                 python: None,
                 said: None,
+                card: Arc::default(),
+                lent: false,
+                paused: false,
+                resume_after: false,
             }),
             changed: Condvar::new(),
             launching: Mutex::new(()),
@@ -555,7 +619,7 @@ impl Egpu {
     /// is answering (or awaited) with another model is not cut off: that is said instead.
     pub fn start(self: &Arc<Self>, cfg: &Json, root: &Path, name: &str) -> Result<(), String> {
         let epoch = self.lock().epoch;
-        match self.begin(cfg, root, name, epoch, true, false)? {
+        match self.begin(cfg, root, name, epoch, true, false, false)? {
             Begun::Launched | Begun::Held => Ok(()),
             Begun::InUse(other) => Err(format!("the eGPU is answering with {other}: wait for it, or stop it first")),
         }
@@ -566,8 +630,10 @@ impl Egpu {
     /// where a start with `name` has just failed (a start by hand: a request waits out [`RETRY_AFTER`], or every
     /// request queued behind a failure would try all the Pythons once more). `count`: the caller is a request, to
     /// be counted as waiting for the model from the moment the server is set to starting, so that another model's
-    /// request arriving just then does not find it unawaited and stop it.
-    fn begin(self: &Arc<Self>, cfg: &Json, root: &Path, name: &str, epoch: u64, again: bool, count: bool) -> Result<Begun, String> {
+    /// request arriving just then does not find it unawaited and stop it. `paused`: the card held and the engine not
+    /// started (OAIY's engine only: the card is wanted for the image worker).
+    #[allow(clippy::too_many_arguments)]
+    fn begin(self: &Arc<Self>, cfg: &Json, root: &Path, name: &str, epoch: u64, again: bool, count: bool, paused: bool) -> Result<Begun, String> {
         let llm = cfg.get("llm").ok_or("no llm section")?;
         if !enabled(llm) {
             return Err(if available() { "the eGPU is switched off (Settings)".into() } else { "tinygrad's server is used on a Mac only".into() });
@@ -594,7 +660,7 @@ impl Egpu {
             self.halt(&mut g);
         }
         self.changed.notify_all();
-        match self.launch(cfg, llm, root, name, epoch, count) {
+        match self.launch(cfg, llm, root, name, epoch, count, paused) {
             Ok(true) => Ok(Begun::Launched),
             Ok(false) => Err(STOPPED.into()),
             Err(e) => {
@@ -614,12 +680,19 @@ impl Egpu {
     }
 
     /// Whether the server was started (false: someone asked for a stop meanwhile, and it stood down).
-    fn launch(self: &Arc<Self>, cfg: &Json, llm: &Json, root: &Path, name: &str, epoch: u64, count: bool) -> Result<bool, String> {
+    #[allow(clippy::too_many_arguments)]
+    fn launch(self: &Arc<Self>, cfg: &Json, llm: &Json, root: &Path, name: &str, epoch: u64, count: bool, paused: bool) -> Result<bool, String> {
         let python = self.python(cfg, root)?;
         let script = Self::script(root)?;
         let port = free_port()?;
         let key = random_id("sk-egpu-");
-        let args = arguments(llm, root, name, &script, port)?;
+        let mut args = arguments(llm, root, name, &script, port)?;
+        let paused = paused && webgpu(llm);
+        if paused {
+            // (before --webgpu, where the launcher reads its own flags)
+            let at = args.iter().position(|a| a == "--webgpu").ok_or("the launcher's command line has no --webgpu")?;
+            args.insert(at, "--paused".into());
+        }
         let file = config::resolve(root, str_or(model(llm, name).unwrap_or(&Json::Null), "path", ""));
         if !file.is_file() {
             return Err(format!("{} is not there", file.display()));
@@ -638,15 +711,19 @@ impl Egpu {
             self.lock().python = None;
             format!("{}: {e}", python.display())
         })?;
+        let card = Arc::new(Card::default());
         for pipe in [child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>), child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>)].into_iter().flatten() {
             let log = Arc::clone(&self.log);
+            let card = Arc::clone(&card);
             std::thread::spawn(move || {
                 // Bytes, not text: a line that is not UTF-8 (a compiler's, a progress bar's) must not end the reading,
                 // or the pipe fills and the server blocks on its next word. A line with no end (a bar redrawn in
                 // place) is passed on in pieces.
                 let (mut reader, mut line) = (BufReader::new(pipe), Vec::new());
                 while reader.by_ref().take(16 << 10).read_until(b'\n', &mut line).is_ok_and(|n| n > 0) {
-                    log.push(String::from_utf8_lossy(&line).trim_end_matches(['\r', '\n']).to_string());
+                    let text = String::from_utf8_lossy(&line).trim_end_matches(['\r', '\n']).to_string();
+                    card.heard(&text);
+                    log.push(text);
                     line.clear();
                 }
             });
@@ -674,6 +751,10 @@ impl Egpu {
         g.failed_at = None;
         g.last_used = Instant::now();
         g.command = shown;
+        g.card = card;
+        g.lent = false;
+        g.paused = paused;
+        g.resume_after = false;
         drop(g);
         self.changed.notify_all();
         let this = Arc::clone(self);
@@ -759,6 +840,10 @@ impl Egpu {
         g.ready_after = None;
         g.model = None;
         g.failed_at = None;
+        g.card = Arc::default();
+        g.lent = false;
+        g.paused = false;
+        g.resume_after = false;
     }
 
     /// Stop the server because someone asked: Stop, a change of settings, the studio going. A start that is under
@@ -772,17 +857,116 @@ impl Egpu {
         self.changed.notify_all();
     }
 
-    /// Stop a ready server that has answered nothing for `idle`, and say whether it was. Decided and done under one
-    /// lock: a request that comes meanwhile is counted first, and keeps the server, or finds it stopped.
+    /// Stop a ready server that has answered nothing for `idle`, or a card held with its engine paused (since a
+    /// picture) for as long, and say whether it was. Decided and done under one lock: a request that comes meanwhile
+    /// is counted first, and keeps the server, or finds it stopped.
     pub fn stop_if_idle(&self, idle: Duration) -> bool {
         let mut g = self.lock();
-        if g.state != State::Ready || g.busy > 0 || g.waiting > 0 || g.last_used.elapsed() <= idle {
+        let held = g.state == State::Ready || (g.paused && matches!(g.state, State::Starting | State::Ready));
+        if !held || g.busy > 0 || g.waiting > 0 || g.lent || g.last_used.elapsed() <= idle {
             return false;
         }
         self.halt(&mut g);
         drop(g);
         self.changed.notify_all();
         true
+    }
+
+    /// The card lent to OAIY's image worker (`llm.egpu.engine` `webgpu`): the engine on it paused once the requests it
+    /// is answering are done, its memory freed, the card still held (opened again, it would be reset). The answer is
+    /// the card's socket, for the worker to take as its WebGPU adapter. Where the card is not held, it is opened for
+    /// this, the engine paused from the start (with the model set to the eGPU, which loads at the first request for
+    /// it). Requests for the model wait until [`Self::give_back`]. `wait`: for the requests being answered.
+    pub fn lend(self: &Arc<Self>, cfg: &Json, root: &Path, wait: Duration) -> Result<String, String> {
+        let llm = cfg.get("llm").ok_or("no llm section")?;
+        if !enabled(llm) || !webgpu(llm) {
+            return Err("the eGPU does not run OAIY's engine".into());
+        }
+        let name = models(llm).into_iter().next().ok_or("no language model is set to run on the eGPU, so the card is not held")?;
+        let deadline = Instant::now() + wait;
+        let mut g = self.lock();
+        let epoch = g.epoch;
+        loop {
+            if g.epoch != epoch {
+                return Err(STOPPED.into());
+            }
+            if matches!(g.state, State::Starting | State::Ready) {
+                if !g.lent {
+                    g.lent = true;
+                    g.resume_after = !g.paused;
+                }
+                if g.busy == 0 {
+                    break;
+                }
+            } else {
+                drop(g);
+                self.begin(cfg, root, &name, epoch, false, false, true)?;
+                g = self.lock();
+                continue;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                drop(g);
+                self.give_back();
+                return Err("the eGPU's language model is still answering".into());
+            }
+            g = self.changed.wait_timeout(g, left.min(Duration::from_millis(500))).unwrap_or_else(|p| p.into_inner()).0;
+        }
+        if !g.paused {
+            g.paused = true;
+            if let Some(pipe) = g.lifeline.as_mut() {
+                let _ = pipe.write_all(b"pause\n").and_then(|_| pipe.flush());
+            }
+            self.log.push("studio: the engine on the card pauses for a picture");
+        }
+        let (card, generation) = (Arc::clone(&g.card), g.generation);
+        drop(g);
+        // (opening the card takes a while the first time: its firmware boots)
+        let gone = || {
+            let g = self.lock();
+            g.generation != generation || !g.lent || !matches!(g.state, State::Starting | State::Ready)
+        };
+        match card.paused_at(Duration::from_secs(180), gone) {
+            Some(socket) => Ok(socket),
+            None => {
+                self.give_back();
+                Err("the eGPU's launcher did not say the card was free".into())
+            }
+        }
+    }
+
+    /// The card back from the image worker: the engine on it brought back where it was running when it was lent
+    /// (its model loads again), else left paused until a request for its model comes.
+    pub fn give_back(&self) {
+        let mut g = self.lock();
+        if !g.lent {
+            return;
+        }
+        g.lent = false;
+        g.last_used = Instant::now();
+        if g.paused && g.resume_after {
+            self.resume(&mut g);
+        }
+        drop(g);
+        self.changed.notify_all();
+    }
+
+    /// Whether the card is lent to the image worker now.
+    pub fn is_lent(&self) -> bool {
+        self.lock().lent
+    }
+
+    /// The engine on the card asked back from a pause, the state's lock held: starting again, its model loading.
+    fn resume(&self, g: &mut Inner) {
+        g.paused = false;
+        g.resume_after = false;
+        if let Some(pipe) = g.lifeline.as_mut() {
+            let _ = pipe.write_all(b"resume\n").and_then(|_| pipe.flush());
+        }
+        g.state = State::Starting;
+        g.started = Some(Instant::now());
+        g.ready_after = None;
+        self.log.push("studio: the engine on the card starts again");
     }
 
     /// Where `name` is answered on the eGPU, starting tinygrad's server with it if it is not held, and waiting up
@@ -801,7 +985,12 @@ impl Egpu {
                 return Err(Unready::Gone(STOPPED.into()));
             }
             let holds = g.model.as_deref() == Some(name);
-            match g.state {
+            // While the card is lent to the image worker, requests wait for it as for a model loading; one for the
+            // model of an engine that is paused brings it back.
+            if g.paused && !g.lent && holds && matches!(g.state, State::Starting | State::Ready) {
+                self.resume(&mut g);
+            }
+            if !g.lent { match g.state {
                 State::Ready if holds => {
                     g.busy += 1;
                     g.last_used = Instant::now();
@@ -821,18 +1010,24 @@ impl Egpu {
                 _ => {
                     drop(g);
                     // (in use after all, taken between this check and the start's: the next turn waits for it)
-                    let begun = self.begin(cfg, root, name, epoch, false, true).map_err(Unready::Gone)?;
+                    let begun = self.begin(cfg, root, name, epoch, false, true, false).map_err(Unready::Gone)?;
                     g = self.lock();
                     counted = matches!(begun, Begun::Launched);
                     continue;
                 }
-            }
+            } }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 if counted {
                     g.waiting = g.waiting.saturating_sub(1);
                 }
-                return Err(Unready::Loading(if holds { format!("{name} is still loading on the eGPU; try again shortly") } else { "the eGPU is answering with another model; try again shortly".into() }));
+                return Err(Unready::Loading(if g.lent {
+                    "the eGPU is making a picture; try again shortly".into()
+                } else if holds {
+                    format!("{name} is still loading on the eGPU; try again shortly")
+                } else {
+                    "the eGPU is answering with another model; try again shortly".into()
+                }));
             }
             g = self.changed.wait_timeout(g, left.min(Duration::from_millis(500))).unwrap_or_else(|p| p.into_inner()).0;
         }
@@ -908,6 +1103,9 @@ impl Egpu {
             ("command", Json::str(&g.command)),
             ("python", g.python.as_ref().map_or(Json::Null, |(_, p)| Json::str(p.to_string_lossy()))),
             ("runs_on", self.runs_on().filter(|_| g.state == State::Ready).map_or(Json::Null, Json::str)),
+            // the card lent to the image worker, and the engine on it paused (for that, or since)
+            ("lent", Json::Bool(g.lent)),
+            ("paused", Json::Bool(g.paused)),
         ])
     }
 }

@@ -312,3 +312,17 @@ fn a_fragment_past_its_array_reads_zeros_there_and_writes_nothing_there() {
     }
     assert!(d[200..].iter().all(|&v| f32::from_bits(v) == 9.0), "nothing written past D's binding");
 }
+
+#[test]
+fn a_write_larger_than_the_servers_pieces_lands_whole_where_it_was_put() {
+    let Some((_emu, device, queue)) = emulator() else { return };
+    // 40 MB at an offset: the server takes it in pieces of 16 MB, each sent on to the card as it comes.
+    let words = 10 << 20;
+    let data: Vec<u32> = (0..words as u32).map(|i| i.wrapping_mul(2_654_435_761)).collect();
+    let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
+    let b = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (words as u64 + 1024) * 4, usage, mapped_at_creation: false });
+    queue.write_buffer(&b, 4096, bytemuck::cast_slice(&data));
+    let back = read(&device, &queue, &b, (words + 1024) * 4);
+    assert!(back[..1024].iter().all(|&v| v == 0), "before the offset: as it was");
+    assert!(back[1024..] == data[..], "the write, whole and in order");
+}

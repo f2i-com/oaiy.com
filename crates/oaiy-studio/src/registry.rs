@@ -368,7 +368,8 @@ fn attach(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>, picked: &P
     type Fits = Box<dyn Fn(&Json) -> bool>;
     let (section, field, fits): (&str, &str, Fits) = match d.kind() {
         "vision_projector" => ("llm", "vision_projector", Box::new(|_| true)),
-        "adapter" => ("image", "adapter", Box::new(|m| str_or(m, "architecture", "qwen-image") == "qwen-image")),
+        // (not a distilled Turbo checkpoint: it takes no adapter)
+        "adapter" => ("image", "adapter", Box::new(|m| str_or(m, "architecture", "qwen-image") == "qwen-image" && !bool_or(m, "distilled", false))),
         "klein_lora" => {
             let Some(Json::Obj(models)) = obj_mut(cfg, &["media", "image", "models"]) else { return Err("no image models".into()) };
             let (name, model) = models.iter_mut().find(|(n,m)| str_or(m,"architecture","") == "flux2-klein-4b" && target.is_none_or(|(_,t)| n == t))
@@ -558,7 +559,7 @@ pub fn add(cfg: &mut Json, path: &Path, name: Option<&str>, target: Option<(&str
                     set(&mut entry, "audio_vae", a);
                 }
             }
-            if section == "image" && str_or(&entry, "architecture", "") == "qwen-image" && str_or(&entry, "adapter", "").is_empty() {
+            if section == "image" && str_or(&entry, "architecture", "") == "qwen-image" && str_or(&entry, "adapter", "").is_empty() && !bool_or(&entry, "distilled", false) {
                 // Reuse the turbo adapter another Qwen Image model already runs with.
                 if let Some(a) = companion(cfg, "image", &entry, "adapter", path) {
                     set(&mut entry, "adapter", a);

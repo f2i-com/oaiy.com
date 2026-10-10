@@ -279,9 +279,10 @@ export type Discovery =
 /** A language model the engine has: chosen in Engines (`default`), the one loaded, set to run on the eGPU. */
 export type LlmModel = { id: string; default: boolean; loaded: boolean; egpu: boolean };
 
-/** A Mac's eGPU (a card in a Thunderbolt enclosure), where OAIY offers it: switched on, which engine runs there, and
- * the model it holds or is loading (`state`: stopped, starting, ready, failed). */
-export type Egpu = { available: boolean; enabled: boolean; engine?: string; state?: string; model?: string };
+/** A Mac's eGPU (a card in a Thunderbolt enclosure), where OAIY offers it: switched on, which engine runs there, the
+ * model it holds or is loading (`state`: stopped, starting, ready, failed), and whether it is making a picture (`lent`:
+ * its model paused meanwhile) or its model is paused since. */
+export type Egpu = { available: boolean; enabled: boolean; engine?: string; state?: string; model?: string; lent?: boolean; paused?: boolean };
 
 type Json = Record<string, unknown>;
 const isRecord = (v: unknown): v is Json => !!v && typeof v === 'object' && !Array.isArray(v);
@@ -371,7 +372,15 @@ export function readDiscovery(doc: Json, origin: string): Extract<Discovery, { s
     .filter((m) => !!str(m.id))
     .map((m) => ({ id: str(m.id) as string, default: bool(m.default) ?? false, loaded: bool(m.loaded) ?? false, egpu: bool(m.egpu) ?? false }));
   const egpuDoc = isRecord(doc.egpu) ? doc.egpu : {};
-  const egpu: Egpu = { available: bool(egpuDoc.available) ?? false, enabled: bool(egpuDoc.enabled) ?? false, engine: str(egpuDoc.engine), state: str(egpuDoc.state), model: str(egpuDoc.model) };
+  const egpu: Egpu = {
+    available: bool(egpuDoc.available) ?? false,
+    enabled: bool(egpuDoc.enabled) ?? false,
+    engine: str(egpuDoc.engine),
+    state: str(egpuDoc.state),
+    model: str(egpuDoc.model),
+    ...(bool(egpuDoc.lent) ? { lent: true } : {}),
+    ...(bool(egpuDoc.paused) ? { paused: true } : {}),
+  };
   const llm = isRecord(doc.llm) ? doc.llm : {};
   const service = str(doc.service) ?? 'OAIY';
   const version = str(doc.version) ?? '';

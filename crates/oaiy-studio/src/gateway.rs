@@ -1747,6 +1747,121 @@ S(("", a.serve), H).serve_forever()
         }
     }
 
+    /// A stand-in for OAIY's engine on the card: it takes a buffer on the card through its socket (as its weights
+    /// would), says it has its model, and answers every chat "from the card".
+    const FAKE_ENGINE: &str = r#"#!/usr/bin/env python3
+import http.server, json, os, socket, struct, sys
+port = int(sys.argv[sys.argv.index("--port") + 1])
+card = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+card.connect(os.environ["OAIY_WEBGPU_ADAPTER"].split(":", 1)[1])
+def ask(cmd, payload=b""):
+    card.sendall(struct.pack("<IQ", cmd, len(payload)) + payload)
+    head = b""
+    while len(head) < 12: head += card.recv(12 - len(head))
+    status, n = struct.unpack("<IQ", head)
+    body = b""
+    while len(body) < n: body += card.recv(n - len(body))
+    assert status == 0, body
+ask(1)
+ask(2, struct.pack("<Q", 1 << 20))
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args): pass
+    def whole(self, body):
+        body = json.dumps(body).encode()
+        self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def do_GET(self): self.whole({"data": [{"id": "x"}]})
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        self.whole({"choices": [{"index": 0, "message": {"role": "assistant", "content": "from the card"}}]})
+http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
+"#;
+
+    /// [`fake_tinygrad`]'s studio with OAIY's engine on the card ([`FAKE_ENGINE`]), the card's work on the CPU
+    /// (`OAIY_EGPU_EMULATE`): the launcher, the card's server and the supervisor run for real. Only `x` is set to the
+    /// eGPU.
+    #[cfg(unix)]
+    fn fake_card(dir: &std::path::Path) -> Option<Arc<Studio>> {
+        use std::os::unix::fs::PermissionsExt;
+        let studio = fake_tinygrad(dir, "0", "")?;
+        let engine = dir.join("fake-engine");
+        std::fs::write(&engine, FAKE_ENGINE).unwrap();
+        std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut cfg = studio.config();
+        let llm = crate::registry::obj_mut(&mut cfg, &["llm"]).unwrap();
+        crate::util::set(llm, "server", Json::str(engine.to_string_lossy()));
+        let egpu = crate::registry::obj_mut(&mut cfg, &["llm", "egpu"]).unwrap();
+        crate::util::set(egpu, "engine", Json::str("webgpu"));
+        crate::util::set(egpu, "env", Json::obj([("OAIY_EGPU_EMULATE", Json::str("1"))]));
+        if let Some(Json::Arr(models)) = crate::registry::obj_mut(&mut cfg, &["llm", "models"]) {
+            for m in models.iter_mut().filter(|m| str_or(m, "name", "") == "y") {
+                crate::util::set(m, "egpu", Json::Bool(false));
+            }
+        }
+        Some(Arc::new(Studio::for_test(dir, cfg)))
+    }
+
+    /// The card's server, asked who it is at `socket` (as the image worker's adapter first does).
+    #[cfg(unix)]
+    fn card_hello(socket: &str) -> String {
+        use std::io::{Read, Write};
+        let mut s = std::os::unix::net::UnixStream::connect(socket).unwrap();
+        s.write_all(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+        let mut head = [0u8; 12];
+        s.read_exact(&mut head).unwrap();
+        let n = u64::from_le_bytes(head[4..].try_into().unwrap()) as usize;
+        let mut body = vec![0u8; n];
+        s.read_exact(&mut body).unwrap();
+        String::from_utf8_lossy(&body).into_owned()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_picture_borrows_the_card_its_engine_pauses_and_comes_back_after() {
+        let dir = fake_dir("lend");
+        let Some(studio) = fake_card(&dir) else { return };
+        let ask_x = r#"{"model": "x", "messages": [{"role": "user", "content": "hi"}]}"#;
+        let (status, _, body) = chat(&studio, ask_x);
+        assert!(status == 200 && body.contains("from the card"), "{status} {body}\n{}", studio.egpu.log.tail(40));
+
+        // Lent: the engine stopped and its buffer freed, the card still held, its socket answering the worker.
+        let cfg = studio.config();
+        let socket = studio.egpu.lend(&cfg, &studio.root, Duration::from_secs(30)).unwrap_or_else(|e| panic!("{e}\n{}", studio.egpu.log.tail(40)));
+        assert!(card_hello(&socket).contains("\"protocol\""));
+        let status_now = studio.egpu.status(cfg.get("llm").unwrap());
+        assert_eq!((status_now.get("lent"), status_now.get("paused")), (Some(&Json::Bool(true)), Some(&Json::Bool(true))));
+        assert!(studio.egpu.log.tail(400).contains("oaiy-egpu: paused"));
+
+        // A chat meanwhile waits for the card, and is answered once it is given back and the engine is there again.
+        let asked = {
+            let studio = Arc::clone(&studio);
+            std::thread::spawn(move || chat(&studio, ask_x))
+        };
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(!asked.is_finished(), "a chat is not answered while the card is lent");
+        studio.egpu.give_back();
+        let (status, _, body) = asked.join().unwrap();
+        assert!(status == 200 && body.contains("from the card"), "{status} {body}");
+        assert!(studio.egpu.log.tail(400).contains("oaiy-egpu: resumed"));
+        assert_eq!(starts(&studio), 1, "the card was opened once");
+
+        // Not running: lent all the same, the card opened with its engine paused, which a chat for its model brings.
+        studio.egpu.stop();
+        until("the launcher to go", || studio.egpu.log.tail(400).contains("studio: tinygrad's server stopped"));
+        let socket = studio.egpu.lend(&cfg, &studio.root, Duration::from_secs(30)).unwrap_or_else(|e| panic!("{e}\n{}", studio.egpu.log.tail(40)));
+        assert!(card_hello(&socket).contains("\"protocol\""));
+        studio.egpu.give_back();
+        let status_now = studio.egpu.status(cfg.get("llm").unwrap());
+        assert_eq!(status_now.get("paused"), Some(&Json::Bool(true)), "not brought back for nothing");
+        let (status, _, body) = chat(&studio, ask_x);
+        assert!(status == 200 && body.contains("from the card"), "{status} {body}");
+        assert_eq!(starts(&studio), 2);
+        studio.egpu.stop();
+        if std::env::var("SHOW_EGPU_LOG").is_ok() {
+            eprintln!("{}", studio.egpu.log.tail(400));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn two_models_asked_for_at_once_are_each_answered_and_neither_load_is_stopped_for_the_other() {
         let dir = fake_dir("two");

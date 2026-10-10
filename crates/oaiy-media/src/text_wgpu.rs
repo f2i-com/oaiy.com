@@ -24,6 +24,53 @@ fn err(e: impl std::fmt::Display) -> candle_core::Error {
     candle_core::Error::Msg(e.to_string())
 }
 
+/// The token embedding (`[vocab, D]`), on the host: a prompt's rows looked up there. A GGUF's quantized one is kept as
+/// its file has it, and only the rows a prompt uses are unpacked (Qwen3-VL's whole, as f32, is 2.5 GB, and a second of
+/// the text encoder's load).
+enum Embedding {
+    F32(Vec<f32>),
+    Ggml { dtype: candle_core::quantized::GgmlDType, bytes: Vec<u8> },
+}
+
+impl Embedding {
+    fn load(w: &mut Weights, name: &str) -> Result<Self> {
+        use candle_core::quantized::GgmlDType;
+        if w.ggml_dtype(name).is_some_and(|t| !matches!(t, GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16)) {
+            if let Some(Raw::Ggml(dtype, bytes)) = w.raw(name)? {
+                if D % dtype.block_size() == 0 && bytes.len() % Self::row_bytes(dtype) == 0 {
+                    return Ok(Self::Ggml { dtype, bytes });
+                }
+            }
+        }
+        Ok(Self::F32(w.tensor(name, &Device::Cpu, DType::F32)?.flatten_all()?.to_vec1::<f32>()?))
+    }
+
+    fn row_bytes(dtype: candle_core::quantized::GgmlDType) -> usize {
+        D / dtype.block_size() * dtype.type_size()
+    }
+
+    /// The tokens it has rows for.
+    fn rows(&self) -> usize {
+        match self {
+            Self::F32(v) => v.len() / D,
+            Self::Ggml { dtype, bytes } => bytes.len() / Self::row_bytes(*dtype),
+        }
+    }
+
+    /// Token `id`'s row, appended to `out`.
+    fn row(&self, id: usize, out: &mut Vec<f32>) -> Result<()> {
+        match self {
+            Self::F32(v) => out.extend_from_slice(&v[id * D..(id + 1) * D]),
+            Self::Ggml { dtype, bytes } => {
+                let n = Self::row_bytes(*dtype);
+                let q = candle_core::quantized::ggml_file::qtensor_from_ggml(*dtype, &bytes[id * n..(id + 1) * n], vec![D], &Device::Cpu)?;
+                out.extend(q.dequantize(&Device::Cpu)?.to_vec1::<f32>()?);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A matrix on the GPU (`[n, k]`): f16, or a GGUF checkpoint's quantized blocks as they are (a K-quant's or Q8_0's,
 /// a third of the f16's bytes over a card's link, and no unpacking on the CPU: the GPU's quantized matmul reads them).
 struct Mat {
@@ -53,8 +100,8 @@ struct Layer {
 
 pub struct WgpuTextEncoder {
     gpu: ggml_rs_wgpu::WgpuBackend,
-    /// The token embedding (`[vocab, D]`), on the host: a prompt's rows looked up there.
-    embedding: Vec<f32>,
+    /// The token embedding, on the host.
+    embedding: Embedding,
     /// The weights, a layer's read as the prompts reach it, and their names' prefix.
     w: Weights,
     prefix: String,
@@ -101,7 +148,7 @@ impl WgpuTextEncoder {
         if q != [HEADS * HD, D] || k != [KV_HEADS * HD, D] || gate != [FF, D] {
             candle_core::bail!("not Qwen3-VL 8B's language model (q {q:?}, k {k:?}, gate {gate:?})");
         }
-        let embedding = w.tensor(&format!("{prefix}.embed_tokens.weight"), &Device::Cpu, DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        let embedding = Embedding::load(&mut w, &format!("{prefix}.embed_tokens.weight"))?;
         let tokenizer = tokenizers::Tokenizer::from_file(root.join("processor/tokenizer.json")).map_err(err)?;
         Ok(Self { gpu, embedding, w, prefix: prefix.to_owned(), tokenizer })
     }
@@ -162,7 +209,7 @@ impl WgpuTextEncoder {
     pub fn encode_all(&mut self, prompts: &[&str], images: &[crate::vision::Features]) -> Result<Vec<Conditioning>> {
         const IMAGE_PAD: u32 = 151655;
         let system = self.tokenizer.encode(SYSTEM, false).map_err(err)?.len();
-        let vocab = self.embedding.len() / D;
+        let vocab = self.embedding.rows();
         let host = |t: &Tensor| -> Result<Vec<f32>> { t.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>() };
         let embeddings: Vec<Vec<f32>> = images.iter().map(|f| host(&f.embedding)).collect::<Result<_>>()?;
         let deeps: Vec<Vec<Vec<f32>>> = images.iter().map(|f| f.deep.iter().map(host).collect::<Result<Vec<_>>>()).collect::<Result<_>>()?;
@@ -204,7 +251,7 @@ impl WgpuTextEncoder {
                 if id >= vocab {
                     candle_core::bail!("token {id} past the embedding's {vocab}");
                 }
-                x0.extend_from_slice(&self.embedding[id * D..(id + 1) * D]);
+                self.embedding.row(id, &mut x0)?;
             }
             for (&(start, len), e) in spans.iter().zip(&embeddings) {
                 if e.len() != len * D {
@@ -404,5 +451,29 @@ mod tests {
         eprintln!("{n} tokens ({:?} the image's): the worst token's cosine {worst:.6}", want.spans);
         assert!(worst > 0.999, "the worst token's cosine {worst}");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod embedding_tests {
+    use super::*;
+    use candle_core::quantized::{GgmlDType, QTensor};
+
+    #[test]
+    fn a_quantized_embeddings_rows_are_the_whole_tables_rows() {
+        let rows = 3;
+        let values: Vec<f32> = (0..rows * D).map(|i| ((i * 7919) % 1000) as f32 / 500. - 1.).collect();
+        let table = Tensor::from_vec(values, (rows, D), &Device::Cpu).unwrap();
+        for dtype in [GgmlDType::Q6K, GgmlDType::Q4K, GgmlDType::Q8_0] {
+            let q = QTensor::quantize(&table, dtype).unwrap();
+            let whole = q.dequantize(&Device::Cpu).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let e = Embedding::Ggml { dtype, bytes: q.data().unwrap().to_vec() };
+            assert_eq!(e.rows(), rows);
+            for id in 0..rows {
+                let mut out = Vec::new();
+                e.row(id, &mut out).unwrap();
+                assert_eq!(out, whole[id * D..(id + 1) * D], "{dtype:?} row {id}");
+            }
+        }
     }
 }

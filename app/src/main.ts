@@ -571,13 +571,13 @@ async function main(): Promise<void> {
     egpuPick.hidden = !showEgpu;
     if (!showEgpu || !egpu) return;
     const held = models.find((m) => m.egpu)?.id ?? '';
-    const how = !held ? '' : egpu.state === 'ready' ? ' · ready' : egpu.state === 'starting' ? ' · loading…' : egpu.state === 'failed' ? ' · failed' : ' · not loaded';
+    const how = !held ? '' : egpu.lent ? ' · making a picture' : egpu.paused ? ' · paused' : egpu.state === 'ready' ? ' · ready' : egpu.state === 'starting' ? ' · loading…' : egpu.state === 'failed' ? ' · failed' : ' · not loaded';
     egpuPick.replaceChildren(
       h('option', { value: '', selected: !held }, 'eGPU: no model'),
       ...models.map((m) => h('option', { value: m.id, selected: m.id === held }, `eGPU: ${m.id}${m.id === held ? how : ''}`)),
     );
-    egpuPick.dataset.state = held ? (egpu.state ?? 'stopped') : 'none';
-    egpuPick.title = `The language model on the eGPU (${egpu.engine === 'webgpu' ? "OAIY's engine over WebGPU" : "tinygrad's LLM server"} on the card): a chat with it is answered there. ${held ? `${held} is ${egpu.state === 'ready' ? 'loaded' : egpu.state === 'starting' ? 'loading' : egpu.state === 'failed' ? 'set, but did not load (see Engines → Logs)' : 'set, and loads when it is first asked'}.` : 'None is set.'}`;
+    egpuPick.dataset.state = !held ? 'none' : egpu.lent || egpu.paused ? 'starting' : (egpu.state ?? 'stopped');
+    egpuPick.title = `The language model on the eGPU (${egpu.engine === 'webgpu' ? "OAIY's engine over WebGPU" : "tinygrad's LLM server"} on the card): a chat with it is answered there. ${held ? `${held} is ${egpu.lent ? 'paused while the card makes a picture' : egpu.paused ? 'paused after a picture, and loads with the next chat' : egpu.state === 'ready' ? 'loaded' : egpu.state === 'starting' ? 'loading' : egpu.state === 'failed' ? 'set, but did not load (see Engines → Logs)' : 'set, and loads when it is first asked'}.` : 'None is set.'}`;
   }
 
   /** OAIY's discovery document read again, after a change made here: the pickers and the providers that follow Engines. */

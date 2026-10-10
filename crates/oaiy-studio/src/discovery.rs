@@ -466,6 +466,9 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
                     ("state", e.get("state").cloned().unwrap_or(Json::Null)),
                     ("model", e.get("model").cloned().unwrap_or(Json::Null)),
                     ("models", e.get("models").cloned().unwrap_or(Json::Arr(Vec::new()))),
+                    // making a picture (the card lent to the image worker), and its model paused
+                    ("lent", e.get("lent").cloned().unwrap_or(Json::Bool(false))),
+                    ("paused", e.get("paused").cloned().unwrap_or(Json::Bool(false))),
                 ])
             } else {
                 Json::obj([("available", Json::Bool(false))])

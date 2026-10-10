@@ -230,6 +230,39 @@ Hugging Face one is, and its K-quant blocks go to the card as they are (a third 
 nothing unpacked on the CPU: the encoding 5.3 s, from 18); a GGUF's fused `img_mlp.gate_up` is split into its gate and
 up halves by rows.
 
+**Pictures in OAIY on the card.** With the eGPU's engine OAIY's own, a Qwen Image picture is made on the card
+(`llm.egpu.images`, on unless switched off: Settings → eGPU → *Make pictures on it too*). The card is not opened a
+second time (each open resets it): the launcher that holds it for the language model pauses that engine on a word from
+OAIY (its buffers freed as its connection goes), and the image worker (`oaiy-media`, which must be in the engines'
+folder or beside the app: no installer carries it) takes the card's socket as its WebGPU adapter. Chats with the model
+wait meanwhile; when the queue of pictures is empty the card is given back and the engine starts again, or, where the
+card was opened only for pictures, stays paused until a chat asks for its model (and is let go with the eGPU's idle
+stop). A picture the card fails is made on the Mac. The engines' files (`detect.rs`) know Turbo's GGUFs: the
+transformer is marked `distilled` (8 steps at CFG 1, no turbo adapter beside it) and the Qwen3-VL text encoder made for
+it is attached as the model's text encoder, not added as a chat model. On the RTX 4090, through OAIY's gateway, a
+1024 x 1024 Turbo picture:
+
+| through OAIY 0.1.3-mac | the card already held | the card opened for it |
+|---|---|---|
+| mac.10 (the first) | 21.9 s | 27.7 s |
+| mac.11 (writes streamed to the card, the prompt's embedding rows alone unpacked) | 17.5 s | 25.7 s |
+| mac.12 (the socket's buffers 4 MB) | 13.7 s | 21.3 s |
+
+Of the worker's own time, sampling is 8 s (8 steps of 1.0 s) and the VAE 1.4 s; the rest is the weights' way to the
+card. That way was half the link's: a Mac gives a local socket 8 KB of buffer each way, so a write crossed it 8 KB a
+call (1.36 GB/s); with 4 MB buffers (the adapter's and the server's) it is 2.42 GB/s, the link itself 2.6 (tinygrad's
+staged copy from memory reaches it, as does its DMA alone). The text encoder's load and prompt then take 2.7 s (from
+5.8) and the transformer's load 2.7 s (from 4.5). A large write is also taken in 16 MB pieces, each copied on to the
+card as the next arrives, and the adapter sends a write's bytes without copying them into its request first.
+
+`TINYGPU_PROFILE=1` has the server run each kernel alone and time it, and write the kernels' times, the most first, to
+`~/.cache/tinygpu-webgpu/profile.txt` as each client goes (each kernel's CUDA beside it by its name). A Turbo picture's
+steps are 49% the quantized matmul (2.4 ms a call, about 118 TFLOPS: 70% of the card's f16 with f32 sums) and 33% the
+attention (OAIY's one pass, 10.3 ms a layer for 4,096 queries over 4,160 positions: about 27 TFLOPS). The attention
+takes 32 queries a workgroup and its fragments straight from memory, so each head's keys and values are read 128 times;
+it is where a step has most to gain. `OAIY_EGPU_EMULATE=1` in the eGPU's environment has OAIY's launcher hold the
+emulator instead of the card (its tests run the launcher, the pause and the image worker's way in that way).
+
 What could write past a buffer on the card and not on the emulator is now kept from it: a fragment not as
 `wmma` takes it (32-byte aligned, its stride a multiple of 16 bytes; SPIR-V's and Metal's take any) is staged as one
 past its array is, and the server refuses a copy, clear, write, read or binding past its buffer, as wgpu checks them

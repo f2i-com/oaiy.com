@@ -397,6 +397,15 @@ or Linux at all.
    loads, for the Agent, the phone's agents and flows alike (`PUT /api/engines/egpu` and
    `PUT /api/engines/defaults` on the desktop; the discovery document's `egpu` says the
    card's state, and each language model whether it is set to the card).
+5. **Pictures on it too** (with OAIY's own engine on the card): a Qwen Image picture is made
+   on the card, its language model paused meanwhile and loaded again after (Settings →
+   eGPU → *Make pictures on it too*, on unless switched off; docs/TINYGPU.md). The worker
+   is `oaiy-media`, which the app does not carry: build it (`cargo build --release -p
+   oaiy-media`) and copy `target/release/oaiy-media` into the engines' folder
+   (`~/Library/Application Support/com.oaiy.app/engines`). A model on an external drive
+   asks macOS for the app's access to removable volumes the first time it is read (and
+   again for each new local build, which macOS takes for another app): until that is
+   answered, the read waits.
 
 ### What happens to a request
 
