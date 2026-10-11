@@ -286,27 +286,41 @@ impl Tier {
     /// Expert `e` taken into a slot (`record` its record), if one can be had: a free one, else the least recently used
     /// whose expert this run does not use (`busy`). Its slot and the map written (in the queue's order).
     fn take(&self, st: &mut TierState, e: usize, record: &[u8], layout: &RecordLayout, busy: &dyn Fn(usize) -> bool) -> bool {
+        let Some(given) = self.give(st, e, busy) else { return false };
+        self.upload(given, record, layout);
+        true
+    }
+
+    /// A slot given to expert `e`, in what the host keeps of the slots (see [`Self::take`]): the slot, and the expert
+    /// it was another's ([`NONE`]: no one's), for [`Self::upload`] to write to the card.
+    fn give(&self, st: &mut TierState, e: usize, busy: &dyn Fn(usize) -> bool) -> Option<(usize, usize, u32)> {
         let now = st.runs;
         let free = st.owner.iter().position(|&o| o == NONE);
-        let slot = free.or_else(|| (0..st.owner.len()).filter(|&s| st.last[s] < now && !busy(st.owner[s] as usize)).min_by_key(|&s| st.last[s]));
-        let Some(slot) = slot else { return false };
-        let gpu = &self.grouped.b.gpu;
-        let map = self.map.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU vector");
+        let slot = free.or_else(|| (0..st.owner.len()).filter(|&s| st.last[s] < now && !busy(st.owner[s] as usize)).min_by_key(|&s| st.last[s]))?;
         let old = st.owner[slot];
         if old != NONE {
             st.slot_of[old as usize] = NONE;
-            gpu.write(map, old as u64 * 4, &NONE.to_le_bytes());
         }
-        self.grouped.put(slot, record, layout);
-        self.slot_lora(slot, e);
         st.owner[slot] = e as u32;
         st.slot_of[e] = slot as u32;
         st.last[slot] = now;
         st.missed[e] = 0;
         st.taken += 1;
         counted(2, 1);
+        Some((slot, e, old))
+    }
+
+    /// What [`Self::give`] gave, written to the card (in the queue's order): the expert's record into the slot, and
+    /// the map (the slot's last expert no longer there, this one there).
+    fn upload(&self, (slot, e, old): (usize, usize, u32), record: &[u8], layout: &RecordLayout) {
+        let gpu = &self.grouped.b.gpu;
+        let map = self.map.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU vector");
+        if old != NONE {
+            gpu.write(map, old as u64 * 4, &NONE.to_le_bytes());
+        }
+        self.grouped.put(slot, record, layout);
+        self.slot_lora(slot, e);
         gpu.write(map, e as u64 * 4, &(slot as u32).to_le_bytes());
-        true
     }
 }
 
@@ -775,11 +789,8 @@ impl Exl3MoeTiered {
         drop(st);
         let read = self.records(&taking);
         let mut st = tier.state.lock().unwrap_or_else(|p| p.into_inner());
-        let t = std::time::Instant::now();
-        for (&e, record) in taking.iter().zip(&read) {
-            tier.take(&mut st, e, record, &self.layout, &|o| count[o] > 0);
-        }
-        timed(7, t);
+        // (their slots given now, for the rows' plan; their records go up while the host runs what the card still lacks)
+        let given: Vec<((usize, usize, u32), &Arc<Vec<u8>>)> = taking.iter().zip(&read).filter_map(|(&e, record)| Some((tier.give(&mut st, e, &|o| count[o] > 0)?, record))).collect();
         let slots = tier.grouped.slots();
         let mut gpu = Vec::with_capacity(rows);
         for a in &assign {
@@ -803,11 +814,22 @@ impl Exl3MoeTiered {
         counted(0, hits);
         counted(1, misses);
         drop(st);
-        if misses == 0 {
-            return (gpu, None);
-        }
-        let (out, _) = self.sum_host(x.data(), &assign, &|e| held[e], None);
-        (gpu, Some(Tensor::from_vec(out, vec![rows, h])))
+        // The uploads on a thread of their own, the link's work (0.7 ms a record), while the cores run the experts
+        // still not held: one after the other, a 560-token chunk's uploads were a second of its five. Both are done
+        // before the plan is the caller's, whose next submission reads the slots.
+        let sums = std::thread::scope(|scope| {
+            let up = scope.spawn(|| {
+                let t = std::time::Instant::now();
+                for (slot, record) in &given {
+                    tier.upload(*slot, record, &self.layout);
+                }
+                timed(7, t);
+            });
+            let sums = (misses > 0).then(|| self.sum_host(x.data(), &assign, &|e| held[e], None).0);
+            up.join().expect("the experts' uploads");
+            sums
+        });
+        (gpu, sums.map(|out| Tensor::from_vec(out, vec![rows, h])))
     }
 
     /// [`Self::sum_host`] of every routed expert in `assign`, for a measurement.
