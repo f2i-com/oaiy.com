@@ -363,11 +363,14 @@ Where a token's time then went (11 October 2026, Qwen3.5 9B, 61 tokens a second;
   | launches on the card | 85 | |
   | and in batches, round trips gone | 94 | |
   | and one read a token | 99 | 38 |
+  | and the delta nets in three passes | 103 | 40 |
 
   Each step gave the same text, temperature 0, as before it (and OAIY's 98 GPU tests pass on the card with it all).
-  What is left is the card's own time: the 27B's token is 80% its quantized matmuls (16 ms of Q4_K, 5.6 of Q6_K, at
-  about 760 GB/s of the card's 1,008), then its delta nets (1.5 ms: a workgroup a head, 48 of the card's 128 SMs).
-  The register-blocked kernel's rows and k-split, tuned on an RTX 5090, change this card's time by 3% at most. Int8
+  What is left is the card's own time: the 27B's token is 80% its quantized matmuls (16 ms of Q4_K, 5.6 of Q6_K; the
+  profile's GB/s, each kernel's first binding's bytes, a 9B's Q4_K 730, Q6_K 800, Q5_K 650, of the card's 1,008).
+  A step's delta net was one kernel, a workgroup a head (48 of the card's 128 SMs, 30 us a layer of the 27B): it now
+  takes a prompt's three passes, the recurrence a warp's 32 rows of a head a workgroup (Metal's speed as it was). The
+  register-blocked kernel's rows and k-split, tuned on an RTX 5090, change this card's time by 3% at most; int8
   activations (`dot4I8Packed`, `__dp4a`) for a step's row are no faster here than f32's.
 
 The adapter keeps the buffers a program lets go (up to 256 MB of them, each 64 MB or less; `TINYGPU_NO_POOL=1` for

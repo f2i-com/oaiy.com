@@ -442,7 +442,7 @@ class Card:
       self.ref = self.dev.hw_compute_queue_t() if self.check else None
       if self.PROFILE and not self.ALONE: self.stamp(None, None)
 
-  def stamp(self, prog, grid):
+  def stamp(self, prog, grid, first=0):
     """A timestamp in the queue (TINYGPU_PROFILE), once what is before it is done: the queue's start (no `prog`), else
     `prog`'s end. Written by the queue itself, not by its last kernel's release (which writes no time): the chain of
     kernels starts again after it, the wait for the card to be idle keeping their order."""
@@ -450,18 +450,19 @@ class Card:
     self.q.active_qmd = None
     if self.fast: self.fast.last = None
     self.q.timestamp(signal)
-    self.stamps.append((prog, grid, signal))
+    self.stamps.append((prog, grid, signal, first))
 
   def settle(self):
     """The timestamps the card has written (its value 1 made 0), each kernel's time from the one before it."""
     while self.stamps and self.stamps[0][2].value == 0:
-      prog, grid, signal = self.stamps.pop(0)
+      prog, grid, signal, first = self.stamps.pop(0)
       at = float(signal.timestamp) / 1e6
       if prog is not None and self.stamped is not None:
-        seen = self.profiled.setdefault(prog.label, [0, 0.0, grid, prog.workgroup])
+        seen = self.profiled.setdefault(prog.label, [0, 0.0, grid, prog.workgroup, 0])
         seen[0] += 1
         seen[1] += at - self.stamped
         seen[2] = grid
+        seen[4] += first
       self.stamped = at
 
   def end(self):
@@ -482,7 +483,8 @@ class Card:
     self.begin()
     before = self.fast.last
     off = self.fast.launch(self.q, prog, ptrs, grid, vals)
-    if self.PROFILE: self.stamp(prog, grid)
+    # (a dispatch's values are its bindings' sizes: the first's bytes, a matmul's weights, counted for its GB/s)
+    if self.PROFILE: self.stamp(prog, grid, vals[0] if vals and len(ptrs) == len(vals) else 0)
     if self.check and self.ref is not None:
       try: self.compare(prog, ptrs, grid, vals, off, before)
       except Exception:
@@ -581,10 +583,11 @@ class Card:
     if not self.profiled: return
     total = sum(s[1] for s in self.profiled.values())
     how = "each alone: a submission's 45 us in each" if self.ALONE else "each timed by the card, its launch in it"
-    lines = [f"{total * 1e3:10.1f} ms in {sum(s[0] for s in self.profiled.values())} kernels ({how})",
-             f"{'ms':>10} {'%':>5} {'calls':>7} {'ms each':>9}  {'grid':<16} {'workgroup':<12} kernel (its CUDA: <cache>/<kernel>.cu)"]
-    for label, (n, t, grid, wg) in sorted(self.profiled.items(), key=lambda kv: -kv[1][1]):
-      lines.append(f"{t * 1e3:10.1f} {100 * t / total:5.1f} {n:7d} {t * 1e3 / n:9.3f}  {str(grid):<16} {str(wg):<12} {label}")
+    lines = [f"{total * 1e3:10.1f} ms in {sum(s[0] for s in self.profiled.values())} kernels ({how}; GB/s: its first binding's bytes, a matmul's weights)",
+             f"{'ms':>10} {'%':>5} {'calls':>7} {'ms each':>9}  {'grid':<16} {'workgroup':<12} {'GB/s':>6}  kernel (its CUDA: <cache>/<kernel>.cu)"]
+    for label, (n, t, grid, wg, *first) in sorted(self.profiled.items(), key=lambda kv: -kv[1][1]):
+      rate = f"{(first[0] if first else 0) / t / 1e9:6.0f}" if t > 0 else ""
+      lines.append(f"{t * 1e3:10.1f} {100 * t / total:5.1f} {n:7d} {t * 1e3 / n:9.3f}  {str(grid):<16} {str(wg):<12} {rate:>6}  {label}")
     (CACHE / "profile.txt").write_text("\n".join(lines) + "\n")
 
   def info(self) -> dict:

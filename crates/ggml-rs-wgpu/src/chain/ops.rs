@@ -847,9 +847,14 @@ impl ChainRecorder for Recorder<'_> {
             "chain: a delta net's buffers"
         );
         let words = [d.v_heads as u32, d.k_heads as u32, d.k_dim as u32, d.v_dim as u32, d.rows as u32, d.scale_q.to_bits(), d.eps.to_bits(), d.sigmoid_gate as u32];
-        // a prompt's in three passes (the recurrence's alone in turn); a step's and a check's few rows the one kernel
-        // (a check's rows a step's bit for bit)
-        if d.rows >= 16 && d.k_dim >= 32 && d.v_heads % d.k_heads == 0 {
+        // in three passes (the recurrence's alone in turn, a warp's 32 rows of a head a workgroup), a step's and a
+        // check's few rows as a prompt's: the one kernel (a workgroup a head) was 30 us a layer of Qwen3.8 27B's step
+        // on an RTX 4090 over Thunderbolt, 48 of its 128 SMs busy, and the three passes take a 9B's steps from 97 to
+        // 103 tokens a second there, the same tokens, and Metal's as they were (27.9). OAIY_DELTA_NET_ONE=1: the one
+        // kernel for a step's and a check's rows (a check's rows a step's bit for bit either way)
+        static ONE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let one = *ONE.get_or_init(|| std::env::var_os("OAIY_DELTA_NET_ONE").is_some_and(|v| v == "1"));
+        if (d.rows >= 16 || !one) && d.k_dim >= 32 && d.v_heads % d.k_heads == 0 {
             self.delta_net_rows(conv, z, beta_alpha, ssm_a, dt_bias, norm, state, out, &d, &words);
             return;
         }
