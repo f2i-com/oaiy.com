@@ -322,8 +322,9 @@ try {
     expect(!r.frames.isError && JSON.stringify(r.colours.map((c) => c.is)) === '["red","blue","blue"]' && r.colours.every((c) => c.size === '320x240'), all);
     expect(r.frames.content.includes('frame 119'), all);
     expect(!r.split.isError && r.split.content.includes('into 2 parts') && r.part2.content.includes('duration 2 s'), all);
-    // AAC's encoder delay adds a few milliseconds to the container's duration.
-    expect(!r.rejoin.isError && /duration 4(\.0[0-4]\d*)? s/.test(r.rejoinInfo.content) && /audio (aac|opus)/.test(r.rejoinInfo.content), all);
+    // AAC's encoder delay adds to the container's duration: a few milliseconds from Chrome's own encoder, 75 from
+    // macOS's (4.075 s on an Apple-silicon Mac).
+    expect(!r.rejoin.isError && /duration 4(\.0\d*)? s/.test(r.rejoinInfo.content) && /audio (aac|opus)/.test(r.rejoinInfo.content), all);
     expect(r.firstColour.is === 'blue', all);
     expect(!r.mix.isError && r.mix.content.includes('4 s') && r.mixInfo.content.includes('audio') && r.mixInfo.content.includes('2 channels'), all);
     expect(r.bad.isError && r.bad.content.includes('.wav or .m4a'), all);

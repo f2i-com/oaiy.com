@@ -142,7 +142,9 @@ await check('the script is a working worker: run in a scope it wires install, ac
 });
 
 await check('in a real Vite build the plugin sees the page and emits /sw.js beside it; a shell file over the limit fails that build', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oaiy-sw-build-'));
+  // (the folder as it really is: a Mac's temporary folder is a link, /var to /private/var, and Vite, which follows
+  // it, then finds the page outside the root it was given and refuses its name)
+  const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'oaiy-sw-build-'));
   try {
     const project = (name, extra = '') => {
       const root = path.join(dir, name);

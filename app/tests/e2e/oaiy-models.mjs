@@ -141,7 +141,7 @@ try {
     expect(e.options[0] === 'eGPU: no model' && e.options.includes('eGPU: qwen3.5-9b'), JSON.stringify(e.options));
   });
 
-  await check('choosing a model chooses it in Engines, through the desktop, and the Agent's chats are answered by it', async () => {
+  await check("choosing a model chooses it in Engines, through the desktop, and the Agent's chats are answered by it", async () => {
     await page.select('select.model.pick', 'qwen3.5-9b');
     await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes("OAIY's engine now runs qwen3.5-9b"), { timeout: 10_000 });
     const put = asked.find((a) => a.url === '/api/engines/defaults');

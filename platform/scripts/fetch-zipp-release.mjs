@@ -931,7 +931,23 @@ async function main(args) {
   }
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+/**
+ * Whether this file is the program `node` was started on. Node names a module by where its file really is, so the
+ * path it was started with is followed through its links too: a Mac's temporary folder is one (/var to /private/var),
+ * and a script started from a copy there would otherwise say and do nothing.
+ */
+function startedAsTheProgram() {
+  if (!process.argv[1]) return false;
+  const self = fileURLToPath(import.meta.url);
+  if (path.resolve(process.argv[1]) === self) return true;
+  try {
+    return fs.realpathSync(process.argv[1]) === self;
+  } catch {
+    return false;
+  }
+}
+
+if (startedAsTheProgram()) {
   main(process.argv.slice(2)).catch((error) => {
     if (!(error instanceof ZippReleaseError)) throw error;
     console.error(`fetch-zipp-release: ${error.message}`);

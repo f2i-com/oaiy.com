@@ -43,8 +43,15 @@ const blank = (text) => DYNAMIC.repeat(text.length);
 /** `with:` inputs that name paths, and are read from the repository's root whatever the step's working directory. */
 export const WITH_PATHS = ['path', 'cache-dependency-path', 'workspaces', 'files', 'body_path'];
 
-/** Made in the checkout's root by the jobs themselves: what they collect, download, unpack, sign and describe. */
-export const SCRATCH = ['release', 'artifacts', 'signatures', 'headless-dist', 'headless-verified', 'notes.md', 'cli-asset-summary.json'];
+/**
+ * Made in the checkout's root by the jobs themselves: what they collect, download, unpack, sign and describe. The
+ * second line is the Mac build's (mac-build.yml): what its engine said, the app's pictures, the image the build made
+ * and the signed one.
+ */
+export const SCRATCH = [
+  'release', 'artifacts', 'signatures', 'headless-dist', 'headless-verified', 'notes.md', 'cli-asset-summary.json',
+  'engine-said', 'screens', 'built', 'signed',
+];
 
 /** Named in any folder: build output and installed dependencies. */
 export const BUILD_FOLDERS = ['dist', 'target', 'node_modules'];
