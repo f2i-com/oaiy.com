@@ -66,7 +66,10 @@ impl FlashNext {
                 // The old vectors go as the new ones come, a layer at a time, and before any new one where none of
                 // their rows is kept (`from`: the rest is written again below): made all at once beside the old ones,
                 // a cache's growth took both caches' memory of a card that holds little more than one (the 27B's did,
-                // llama-rs's `reserve`).
+                // llama-rs's `reserve`). And nobody's copy, of no rows, until it is whole again: a device that has no
+                // room for one of these vectors ends the run here, and the next one then makes all of it anew.
+                let owner = std::mem::take(&mut g.owner);
+                g.cap = 0;
                 g.out = chains[d].vec(1);
                 g.qsa = None;
                 if from == 0 {
@@ -89,6 +92,7 @@ impl FlashNext {
                 }
                 g.out = chains[d].vec(chains[d].attention_out_len(nh, hd, cap));
                 g.cap = cap;
+                g.owner = owner;
             }
             if from < past {
                 for (slot, &l) in layers.iter().enumerate() {

@@ -596,6 +596,9 @@ mod position_tests {
     struct Counting {
         live: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         most: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// The vectors it still makes before it refuses one, as a device with no room does (a panic): none refused
+        /// where this is `usize::MAX`.
+        left: std::sync::atomic::AtomicUsize,
     }
 
     struct Counted(usize, std::sync::Arc<std::sync::atomic::AtomicUsize>);
@@ -609,6 +612,10 @@ mod position_tests {
     impl ggml_rs::DeviceChain for Counting {
         fn vec(&self, len: usize) -> ggml_rs::DeviceVec {
             use std::sync::atomic::Ordering::SeqCst;
+            if self.left.load(SeqCst) != usize::MAX && self.left.fetch_sub(1, SeqCst) == 0 {
+                self.left.store(usize::MAX, SeqCst);
+                panic!("the device has no room");
+            }
             let now = self.live.fetch_add(len * 4, SeqCst) + len * 4;
             self.most.fetch_max(now, SeqCst);
             ggml_rs::DeviceVec { len, inner: std::sync::Arc::new(Counted(len * 4, std::sync::Arc::clone(&self.live))) }
@@ -644,6 +651,36 @@ mod position_tests {
         }
     }
 
+    /// A device that refuses a vector part way through a cache's growth (no room: a panic, which the model's thread
+    /// is brought back from) leaves a cache that is nobody's and of no rows, whichever way it was growing: the next
+    /// prompt makes every layer and the output anew. Left at its old size with some layers grown, some gone and no
+    /// output, the next prompt that fitted the old size read past what was there, and so did every one after.
+    #[test]
+    fn a_growth_the_device_refuses_leaves_a_cache_the_next_prompt_makes_anew() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let s = super::Dims { d: 5120, n_h: 24, n_kv: 4, hd: 256, rot: 0, ff: 0, nv: 0, nk: 0, dk: 0, dv: 0, ch: 0, kern: 0, vocab: 0 };
+        let (slots, row) = (16, 2 * s.n_kv * s.hd);
+        for keep in [1024, 0] {
+            let chain = Counting { live: Default::default(), most: Default::default(), left: usize::MAX.into() };
+            let mut g = super::Kv { layers: Vec::new(), cap: 0, out: ggml_rs::DeviceChain::vec(&chain, 1), owner: 0, half: Vec::new(), halved: 0, refused: 0 };
+            super::reserve(&chain, &mut g, &s, slots, 1024, 0);
+            g.owner = 7;
+            // (the output's stand-in, then five layers, and the sixth refused)
+            chain.left.store(6, SeqCst);
+            let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| super::reserve(&chain, &mut g, &s, slots, 2048, keep)));
+            assert!(refused.is_err());
+            assert_eq!((g.cap, g.owner), (0, 0), "keep {keep}: nobody's, of no rows");
+            // the next prompt, one the old size would have held: whoever asks finds the copy is not theirs, keeps
+            // nothing of it, and it is whole again
+            let cache = crate::kv_cache::KvCache::new_lazy_per_layer_kv(Vec::new(), 4096, &[], &[]);
+            assert_eq!(super::kept(&g, &cache, 512), 0);
+            super::reserve(&chain, &mut g, &s, slots, 900, 0);
+            assert_eq!((g.cap, g.layers.len()), (1024, slots));
+            assert!(g.layers.iter().all(|l| l.len == 1024 * row), "keep {keep}: {:?}", g.layers.iter().map(|l| l.len).collect::<Vec<_>>());
+            assert_eq!(g.out.len, ggml_rs::DeviceChain::attention_out_len(&chain, s.n_h, s.hd, 1024));
+        }
+    }
+
     /// The 27B's attention cache on a 24 GB card: 16 layers of 4 KV heads of 256, grown from 16,384 rows to 32,768 by
     /// a prompt past the first's length. All the new layers made beside all the old ones is 6 GB at once, which the
     /// card did not have beside the model's weights. A layer at a time it is the new cache and one old layer; and
@@ -655,7 +692,7 @@ mod position_tests {
         let (slots, row) = (16, 2 * s.n_kv * s.hd);
         let layer = |cap: usize| cap * row * 4;
         for keep in [16_384, 0] {
-            let chain = Counting { live: Default::default(), most: Default::default() };
+            let chain = Counting { live: Default::default(), most: Default::default(), left: usize::MAX.into() };
             let mut g = super::Kv { layers: Vec::new(), cap: 0, out: ggml_rs::DeviceChain::vec(&chain, 1), owner: 0, half: Vec::new(), halved: 0, refused: 0 };
             super::reserve(&chain, &mut g, &s, slots, 15_088, 0);
             assert_eq!((g.cap, g.layers.len()), (16_384, slots));
@@ -691,6 +728,13 @@ fn reserve(chain: &dyn DeviceChain, g: &mut Kv, s: &Dims, slots: usize, needed: 
     }
     let row = 2 * s.n_kv * s.hd;
     let cap = needed.next_power_of_two().max(256);
+    // Nobody's copy, of no rows, until it is whole again: a device that has no room for one of the vectors below
+    // ends this where it stands (its refusal is a panic the model's thread is brought back from), with some layers
+    // grown and some not and no output. Left as a cache of the old size, the next prompt that fitted the old size
+    // would have read past the layers that were there, and every request after failed until the engine was started
+    // again. As it is, the next one makes all of it anew and writes every row.
+    let owner = std::mem::take(&mut g.owner);
+    g.cap = 0;
     // (the halves' vectors are the old layers': made again, and filled, at the next step that reads them)
     g.half.clear();
     g.halved = 0;
@@ -709,6 +753,7 @@ fn reserve(chain: &dyn DeviceChain, g: &mut Kv, s: &Dims, slots: usize, needed: 
     }
     g.out = chain.vec(chain.attention_out_len(s.n_h, s.hd, cap));
     g.cap = cap;
+    g.owner = owner;
 }
 
 /// The rows of the chain's copy that are still the cache's, of its first `past`: those [`sync`] leaves as they are

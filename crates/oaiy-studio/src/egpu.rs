@@ -1557,12 +1557,24 @@ mod tests {
                 line.clear();
             }
             assert!(line.contains(until), "the launcher never said {until:?}");
+            // (what it says after is still read, as OAIY reads it: with nobody reading, its next line would end it by
+            // a broken pipe, and not by what the test is of)
+            std::thread::spawn(move || {
+                let mut rest = String::new();
+                while said.read_line(&mut rest).is_ok_and(|n| n > 0) {
+                    rest.clear();
+                }
+            });
             child
         }
 
         /// The engines started since `start` that are still running: each is ended here, and counted.
         fn engines_left(&self) -> usize {
-            let alive = |pid: &&str| std::process::Command::new("kill").args(["-0", pid]).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success());
+            // (running: one that has ended and waits to be reaped, where nothing reaps an orphan at once, is not)
+            let alive = |pid: &&str| {
+                let state = std::process::Command::new("ps").args(["-o", "stat=", "-p", pid]).output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+                !state.is_empty() && !state.starts_with('Z')
+            };
             let pids = std::fs::read_to_string(self.dir.join("pids")).unwrap_or_default();
             let left: Vec<&str> = pids.split_whitespace().filter(alive).collect();
             for pid in &left {
