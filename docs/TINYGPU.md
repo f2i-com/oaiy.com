@@ -105,6 +105,36 @@ with an empty kernel cache, an empty tinygrad cache, no nvcc on the PATH and the
 nothing), opened the card, loaded Qwen3.5 9B in 6.3 s, and answered chats and a tool call, every kernel from the pack
 (1,122 cubins, 19 MB); the plugin's folder was unchanged after, and the card's link up.
 
+## Media on the card
+
+Every job of the media worker (`oaiy-media`) is WebGPU, and each opens the adapter `OAIY_WEBGPU_ADAPTER` names, so
+each is made on the card where the eGPU runs OAIY's engine: pictures (`llm.egpu.images`), and video, music, sound
+effects, speech and 3D models (`llm.egpu.media`), each on unless switched off (Settings, eGPU). The card is lent to
+the job as to a picture (`Egpu::lend`): its language model paused, its memory the job's, and loaded again once no job
+has come for two minutes (a Qwen Image picture is the kept worker's; the others a worker's of their own with the
+card's socket).
+
+On the RTX 4090 against the M5 Pro's own GPU (24 GB), 11 October 2026, each the worker's own time:
+
+| job | the Mac's GPU | the card |
+|---|---|---|
+| Qwen-Image 2.1 Turbo, 1024 x 1024 | 149 s | 10.3 s (warm) |
+| MOSS-SoundEffect v2.0, a 5 s clip at 100 steps | 540 s | 31 s (the same sound: its RMS 0.0495 and 0.0496) |
+| MiniMax Music 3, an instrumental of about 11 s | 334 s | 40 s (f16 language model; 91 s with Q8_0's, as the Mac's) |
+| Qwen3-TTS 0.6B, a 9 s line in a saved voice | 5.3 s | 6.1 s |
+| Qwen3-TTS 1.7B VoiceDesign, an 8 s line | 6.4 s | 7.1 s (3.1 to 3.5 s a 4 s line warm, through OAIY) |
+
+Every line spoken either way is Parakeet's word for word. A song's language model samples its tokens, so the same
+seed makes another song on the other GPU (their sums' order differs); each is music (spectral flatness 0.000, its
+peaks harmonics). Speech is no faster on the card: a 0.6B or 1.7B talker's steps are small kernels, each a launch
+across the link, and OAIY Voice's streamed speech (`tts::realtime`) on the card has its first audio later (338 and
+581 ms, against the Mac's 241 and 524) at a better real-time factor (0.54 to 0.60, against 0.71 to 0.74): calls keep
+it on the Mac's GPU, beside the card's language model rather than in its place.
+
+LTX 2.5's WebGPU path takes Lightricks' `-nvfp4` transformer as it is stored (18.7 GB, its blocks decoded by the
+tensor cores as they multiply) and a BF16 checkpoint as Q8_0, so the card holds it; its files are gated (a Hugging Face
+token, the licence accepted).
+
 ## Without the card: the emulator
 
 `webgpu_server.py --emulate` is the same server with no card: each kernel's CUDA is compiled for the CPU (clang++, with

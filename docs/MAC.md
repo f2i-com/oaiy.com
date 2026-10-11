@@ -425,7 +425,8 @@ whether it is.
    loads, for the Agent, the phone's agents and flows alike (`PUT /api/engines/egpu` and
    `PUT /api/engines/defaults` on the desktop; the discovery document's `egpu` says the
    card's state, and each language model whether it is set to the card).
-5. **Pictures on it too** (with OAIY's own engine on the card): a Qwen Image picture is made
+5. **Pictures, video, music, sound and speech on it too** (with OAIY's own engine on the card; TINYGPU.md, "Media
+   on the card": a sound effect 17 times as fast as on the M5 Pro's GPU, a picture 14, a song 8): a Qwen Image picture is made
    on the card, its language model paused meanwhile and loaded again after (Settings →
    eGPU → *Make pictures on it too*, on unless switched off; docs/TINYGPU.md). The worker
    is `oaiy-media`, which the app does not carry: build it (`cargo build --release -p
