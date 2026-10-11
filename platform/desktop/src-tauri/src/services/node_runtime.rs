@@ -64,8 +64,18 @@ pub fn new_handle(data_dir: PathBuf) -> NodeHandle {
     })
 }
 
-/// The portable node executable path under `root`, if it exists.
-fn portable_exe(root: &Path) -> Option<PathBuf> {
+/// A file an install keeps in the folder it unpacks into, from before its first file until the node there has run.
+///
+/// The archive is unpacked straight into place, a file at a time: `bin/node` is there, as a file, before its bytes are
+/// and before it may be executed. Anything that took it for the node to run in that time was refused by the system
+/// ("Permission denied"), and the flow engine's readiness check, which the Overview starts by itself, remembers a
+/// refusal for a while: a flow run just after "Node runtime ready" then failed with the check's stale answer (the
+/// release's own smoke test met it). A folder with this file in it has no node to run yet; one a crash left has none
+/// either, and no longer stands in the way of a working system Node.
+const INSTALLING_MARK: &str = ".installing";
+
+/// The node executable an archive unpacked under `root`, whether or not its install has finished.
+fn unpacked_exe(root: &Path) -> Option<PathBuf> {
     let candidates: [&str; 2] = if cfg!(windows) {
         ["node.exe", "bin/node.exe"]
     } else {
@@ -75,6 +85,14 @@ fn portable_exe(root: &Path) -> Option<PathBuf> {
         .iter()
         .map(|c| root.join(c))
         .find(|p| p.is_file())
+}
+
+/// The portable node executable path under `root`, if a finished install left one ([`INSTALLING_MARK`]).
+fn portable_exe(root: &Path) -> Option<PathBuf> {
+    if root.join(INSTALLING_MARK).exists() {
+        return None;
+    }
+    unpacked_exe(root)
 }
 
 /// Headless distributions carry a tested runtime beside the shipped CLI.
@@ -317,6 +335,9 @@ pub(super) fn safe_member(path: &Path) -> bool {
 fn install_node_native(dest: &Path, logs: &LogBuffer) -> Result<(), String> {
     let (asset, url, is_zip) = asset_for_platform()?;
     std::fs::create_dir_all(dest).map_err(|e| format!("mkdir {}: {e}", dest.display()))?;
+    // Before the first file of it: nothing takes what is unpacked here for a node to run until this is gone.
+    let mark = dest.join(INSTALLING_MARK);
+    std::fs::write(&mark, b"").map_err(|e| format!("mark {}: {e}", mark.display()))?;
 
     logs.push("stdout", format!("downloading {url}"));
     let client = reqwest::blocking::Client::builder()
@@ -364,17 +385,17 @@ fn install_node_native(dest: &Path, logs: &LogBuffer) -> Result<(), String> {
     let _ = std::fs::remove_file(&tmp);
     out?;
 
-    let exe = portable_exe(dest)
+    let exe = unpacked_exe(dest)
         .ok_or_else(|| "the archive unpacked but no node executable was found".to_string())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755));
     }
-    match probe_version(&exe) {
-        Some(v) => logs.push("stdout", format!("installed node {v}")),
-        None => return Err("the unpacked node did not run".into()),
-    }
+    let version = probe_version(&exe).ok_or_else(|| "the unpacked node did not run".to_string())?;
+    // It has run: from here it is the node to run.
+    std::fs::remove_file(&mark).map_err(|e| format!("unmark {}: {e}", mark.display()))?;
+    logs.push("stdout", format!("installed node {version}"));
     Ok(())
 }
 
@@ -564,6 +585,44 @@ mod tests {
         assert_eq!(snap.version, None, "it cannot answer `node -v`");
         assert!(!snap.available, "presence is not health");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_node_still_being_unpacked_is_not_the_node_to_run() {
+        // The archive is unpacked in place, so the file is there before it can be run. Until the install has run
+        // it and taken its mark away, neither `resolve()` (what a flow is run with) nor the snapshot names it.
+        let dir = std::env::temp_dir().join(format!("oaiy-node-unpacking-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.join("node");
+        let exe = if cfg!(windows) { root.join("node.exe") } else { root.join("bin").join("node") };
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(root.join(INSTALLING_MARK), b"").unwrap();
+        std::fs::write(&exe, b"the first bytes of it").unwrap();
+
+        assert_eq!(unpacked_exe(&root), Some(exe.clone()), "the install itself finds what it unpacked");
+        assert_eq!(portable_exe(&root), None, "nothing else does");
+        let rt = new_handle(dir.clone());
+        assert_ne!(rt.resolve(), Some(exe.clone()), "a flow is not run with it");
+        assert_ne!(rt.snapshot().source, "portable");
+
+        std::fs::remove_file(root.join(INSTALLING_MARK)).unwrap();
+        assert_eq!(portable_exe(&root), Some(exe), "the mark gone, it is the portable node");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The whole install, from nodejs.org: `cargo test -- --ignored the_pinned_node_installs`.
+    #[test]
+    #[ignore = "downloads the pinned Node from nodejs.org"]
+    fn the_pinned_node_installs_and_is_the_portable_node_only_once_it_has_run() {
+        let dir = std::env::temp_dir().join(format!("oaiy-node-install-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.join("node");
+        let logs = LogBuffer::new();
+        install_node_native(&root, &logs).expect("the install");
+        assert!(!root.join(INSTALLING_MARK).exists(), "the mark is gone once the node has run");
+        let exe = portable_exe(&root).expect("a portable node");
+        assert_eq!(probe_version(&exe).as_deref(), Some(format!("v{NODE_VERSION}").as_str()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
