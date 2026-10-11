@@ -122,7 +122,7 @@ impl<'a> Recorder<'a> {
     /// A recording on `backend`, its bind groups kept (the crate's own measurements record kernels directly).
     #[cfg(test)]
     pub(crate) fn new(backend: &'a WgpuBackend) -> Self {
-        Recorder { backend, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), low_rank: [None, None, None], q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0, alike: false, settles: Vec::new(), moe_stage: None }
+        Recorder { backend, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), low_rank: [None, None, None], q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, joined: Vec::new(), places: Vec::new(), flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0, alike: false, settles: Vec::new(), moe_stage: None }
     }
 }
 
@@ -202,6 +202,10 @@ pub(crate) struct Recorder<'a> {
     /// The reads copied out by a flush (the first so many of `reads`), and that flush's submission: a recording
     /// waits for its own work, not what went after it (the next chunk's).
     copied: usize,
+    /// Staging buffers each holding several reads ([`Recorder::copy_reads`]), and how much of each is theirs; and a
+    /// read's place, by its index among `reads`: (its buffer among those, where in it), None where it has its own.
+    joined: Vec<(wgpu::Buffer, u64)>,
+    places: Vec<Option<(usize, u64)>>,
     flushed: Option<crate::Piece>,
     /// `OAIY_PIECE_STAMPS`: the pieces' timestamps, and how many pieces so far; once a flush has copied them out
     /// (with its reads: a finish waits for its own work, not for what went after), where to
@@ -378,6 +382,32 @@ impl Recorder<'_> {
         let staging = self.gpu().staging(((len.max(1) * 4) as u64).next_power_of_two().max(256));
         self.reads.push((buffer.clone(), offset, staging, len));
         self.reads.len() - 1
+    }
+
+    /// The reads recorded since the last copy, copied out into staging in `enc`: into one buffer together, each at its
+    /// place, where they are several and small (a step's logits and its attention layers' new rows: one mapping where
+    /// each had its own, and a card behind a link pays a round trip a mapping, TinyGPU's 50 us, nine a 9B's step); else
+    /// each into its own (a prompt chunk's rows, copied out on every core).
+    pub(crate) fn copy_reads(&mut self, enc: &mut wgpu::CommandEncoder) {
+        let sizes: Vec<u64> = self.reads[self.copied..].iter().map(|r| (r.3 as u64 * 4).max(4)).collect();
+        let total: u64 = sizes.iter().sum();
+        let group = if sizes.len() >= 2 && total <= 8 << 20 {
+            self.joined.push((self.gpu().staging(total.next_power_of_two().max(256)), total));
+            Some(self.joined.len() - 1)
+        } else {
+            None
+        };
+        let mut at = 0;
+        for (i, (from, offset, staging, len)) in self.reads[self.copied..].iter().enumerate() {
+            let place = group.map(|g| (g, at));
+            if *len > 0 {
+                let (to, to_at) = place.map_or((staging, 0), |(g, at)| (&self.joined[g].0, at));
+                enc.copy_buffer_to_buffer(from, (*offset * 4) as u64, to, to_at, (*len * 4) as u64);
+            }
+            self.places.push(place);
+            at += sizes[i];
+        }
+        self.copied = self.reads.len();
     }
 
     /// Whether this recording keeps its bind groups.

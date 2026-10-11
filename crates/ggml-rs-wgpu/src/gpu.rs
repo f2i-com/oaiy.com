@@ -603,8 +603,10 @@ impl Gpu {
         };
         let began = std::time::Instant::now();
         let module = self.shader(&format!("oaiy-linear-q ({dtype:?}, kind {kind})"), source);
+        // a name for a chain's profile (a few, made once each)
+        let name: &'static str = Box::leak(format!("matmul-{dtype:?}-{}", ["one", "tiled", "decode", "multi"][kind as usize]).into_boxed_str());
         let pipeline = Arc::new(self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("oaiy-linear-q"),
+            label: Some(name),
             layout: Some(&self.pipeline_layout),
             module: &module,
             entry_point: Some("main"),
@@ -612,8 +614,6 @@ impl Gpu {
             cache: None,
         }));
         cache.insert((dtype, kind), Arc::clone(&pipeline));
-        // a name for a chain's profile (a few, made once each)
-        let name: &'static str = Box::leak(format!("matmul-{dtype:?}-{}", ["one", "tiled", "decode", "multi"][kind as usize]).into_boxed_str());
         made(name, began);
         self.names.lock().unwrap_or_else(|p| p.into_inner()).insert(Arc::as_ptr(&pipeline) as usize, name);
         Some(pipeline)

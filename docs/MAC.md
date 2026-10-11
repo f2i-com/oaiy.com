@@ -405,9 +405,9 @@ whether it is.
      WebGPU** (NVIDIA): the launcher holds the card through tinygrad as a WebGPU adapter and
      runs OAIY's engine on it ([TINYGPU.md](TINYGPU.md)). Every model OAIY's engine runs runs
      there (not GGUF files alone), with the engine's own settings, and fast: a 27B model
-     writes about 20 tokens a second through the gateway, where tinygrad's server writes 2.
+     writes about 38 tokens a second through the gateway (RTX 4090), where tinygrad's server writes 2.
      It needs NVIDIA's compiler as tinygrad's setup puts it (Docker), and compiles each
-     kernel once.
+     kernel once; with the eGPU plugin (above) neither, its kernels compiled ahead of time.
    - *Context*: tinygrad takes the card's memory for the whole context when it starts.
      8,192 tokens unless set (tinygrad's own default is 4,096, less than an agent's prompt
      with its tools).

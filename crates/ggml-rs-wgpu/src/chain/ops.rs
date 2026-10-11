@@ -121,12 +121,7 @@ impl ChainRecorder for Recorder<'_> {
         }
         self.submit_piece();
         let mut enc = self.gpu().device.create_command_encoder(&Default::default());
-        for (from, offset, staging, len) in &self.reads[self.copied..] {
-            if *len > 0 {
-                enc.copy_buffer_to_buffer(from, (*offset * 4) as u64, staging, 0, (*len * 4) as u64);
-            }
-        }
-        self.copied = self.reads.len();
+        self.copy_reads(&mut enc);
         if let Some(staging) = self.resolve_pieces(&mut enc) {
             self.stamped = Some(staging);
         }
@@ -1009,13 +1004,10 @@ impl ChainRecorder for Recorder<'_> {
         // (the pieces since a flush, if any, resolved with this; else the flush's)
         let late = self.resolve_pieces(&mut enc);
         let pieces = late.clone().or_else(|| self.stamped.take());
-        for (from, offset, staging, len) in &self.reads[self.copied..] {
-            if *len > 0 {
-                enc.copy_buffer_to_buffer(from, (*offset * 4) as u64, staging, 0, (*len * 4) as u64);
-            }
-        }
+        let reads_since = self.copied < self.reads.len();
+        self.copy_reads(&mut enc);
         // nothing recorded since a flush: its submission the one waited for (profiled: this one, after every timed piece)
-        let since = !self.dispatches.is_empty() || !self.held.is_empty() || !self.lists.is_empty() || self.copied < self.reads.len() || profiled || late.is_some();
+        let since = !self.dispatches.is_empty() || !self.held.is_empty() || !self.lists.is_empty() || reads_since || profiled || late.is_some();
         let command = enc.finish();
         crate::profile::add(&crate::profile::CHAIN_ENCODE, start);
         let submitted = std::time::Instant::now();
@@ -1038,10 +1030,13 @@ impl ChainRecorder for Recorder<'_> {
         // (the last read's mapping says when the reads are there)
         let mapped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let count = self.reads.len();
-        for (i, (_, _, staging, len)) in self.reads.iter().enumerate() {
+        let mut mappings: Vec<(&wgpu::Buffer, u64)> = self.reads.iter().zip(&self.places).filter(|(_, place)| place.is_none()).map(|((_, _, staging, len), _)| (staging, (*len as u64 * 4).max(4))).collect();
+        mappings.extend(self.joined.iter().map(|(staging, total)| (staging, *total)));
+        let maps = mappings.len();
+        for (i, (staging, bytes)) in mappings.into_iter().enumerate() {
             let flag = std::sync::Arc::clone(&mapped);
-            let last = i + 1 == count;
-            staging.slice(..(*len as u64 * 4).max(4)).map_async(wgpu::MapMode::Read, move |_| {
+            let last = i + 1 == maps;
+            staging.slice(..bytes).map_async(wgpu::MapMode::Read, move |_| {
                 if last {
                     flag.store(true, std::sync::atomic::Ordering::Release);
                 }
@@ -1136,13 +1131,34 @@ impl ChainRecorder for Recorder<'_> {
             staging.unmap();
             v
         };
-        let mut out: Vec<Vec<f32>> = if self.reads.iter().map(|r| r.3 * 4).sum::<usize>() >= 8 << 20 && self.reads.len() > 1 {
+        // (each read from its own staging buffer, or from its place in one it shares)
+        let own: Vec<usize> = (0..count).filter(|&i| self.places[i].is_none()).collect();
+        let mut out: Vec<Vec<f32>> = vec![Vec::new(); count];
+        let theirs: Vec<Vec<f32>> = if own.iter().map(|&i| self.reads[i].3 * 4).sum::<usize>() >= 8 << 20 && own.len() > 1 {
             use rayon::prelude::*;
-            self.reads.par_iter().map(|(_, _, staging, len)| copied(staging, *len)).collect()
+            own.par_iter().map(|&i| copied(&self.reads[i].2, self.reads[i].3)).collect()
         } else {
-            self.reads.iter().map(|(_, _, staging, len)| copied(staging, *len)).collect()
+            own.iter().map(|&i| copied(&self.reads[i].2, self.reads[i].3)).collect()
         };
-        let staged: Vec<(u64, wgpu::Buffer)> = std::mem::take(&mut self.reads).into_iter().map(|(_, _, staging, _)| (staging.size(), staging)).collect();
+        for (i, v) in own.into_iter().zip(theirs) {
+            out[i] = v;
+        }
+        for (g, (staging, total)) in self.joined.iter().enumerate() {
+            let view = staging.slice(..*total).get_mapped_range().expect("webgpu: mapping a finished buffer");
+            for (i, place) in self.places.iter().enumerate() {
+                if let Some((_, at)) = place.filter(|(pg, _)| *pg == g) {
+                    let len = self.reads[i].3;
+                    let mut v = vec![0f32; len];
+                    bytemuck::cast_slice_mut::<f32, u8>(&mut v).copy_from_slice(&view[at as usize..at as usize + len * 4]);
+                    out[i] = v;
+                }
+            }
+            drop(view);
+            staging.unmap();
+        }
+        let mut staged: Vec<(u64, wgpu::Buffer)> = std::mem::take(&mut self.reads).into_iter().map(|(_, _, staging, _)| (staging.size(), staging)).collect();
+        staged.extend(std::mem::take(&mut self.joined).into_iter().map(|(staging, _)| (staging.size(), staging)));
+        self.places.clear();
         self.gpu().unstage(staged);
         // (the layers' experts' use, read for what a card holds of them: not the caller's reads; the last first, each
         // from its place)

@@ -94,6 +94,10 @@ holds nothing: the engines start the launcher and stop it cleanly, as before (a 
 stopped, and a card's holder killed has taken its link down). `card.status` says whether the card can be used, and why
 not (the driver extension not installed, or not allowed). Turned off or removed, the engines go back to their settings.
 
+tinygrad's own compiler is never started either: the server takes tinygrad's NVCC renderer for the card (`NV:CC`),
+which starts nothing until it is asked (it never is: the kernels come as cubins), where its default (NVRTC's) started
+a compile server in a Docker container as the first program loaded.
+
 A plugin is trusted by the digest of its files, so nothing in its folder may change: every Python file has its bytecode
 beside it (unchecked-hash, so a source edited in place is not what runs: build the plugin again), its Python runs with
 `-B` and `PYTHONDONTWRITEBYTECODE`, and it has no links. Checked on 11 October 2026 on the RTX 4090: the plugin's Python,
@@ -302,8 +306,12 @@ staged copy from memory reaches it, as does its DMA alone). The text encoder's l
 5.8) and the transformer's load 2.7 s (from 4.5). A large write is also taken in 16 MB pieces, each copied on to the
 card as the next arrives, and the adapter sends a write's bytes without copying them into its request first.
 
-`TINYGPU_PROFILE=1` has the server run each kernel alone and time it, and write the kernels' times, the most first, to
-`~/.cache/tinygpu-webgpu/profile.txt` as each client goes (each kernel's CUDA beside it by its name). A Turbo picture's
+`TINYGPU_PROFILE=1` has the card time each kernel (a timestamp after each, written by the queue once the card is
+idle: from the end of the one before to its own end, its launch in it), and the server write the kernels' times, the
+most first, to `~/.cache/tinygpu-webgpu/profile.txt` as each client goes (each kernel's CUDA beside it by its name;
+`TINYGPU_LABELS=DIR` in the program's environment has the adapter keep each kernel's CUDA as `DIR/<its pipeline's
+name>.<n>.cu`, so the hashes can be named). `TINYGPU_PROFILE=alone` runs each kernel alone and times it by the clock
+instead (a submission's 45 us in each), as the numbers below for pictures were taken. A Turbo picture's
 steps are 49% the quantized matmul (2.4 ms a call, about 118 TFLOPS: 70% of the card's f16 with f32 sums) and 33% the
 attention (OAIY's one pass, 10.3 ms a layer for 4,096 queries over 4,160 positions: about 27 TFLOPS). The attention
 takes 32 queries a workgroup and its fragments straight from memory, so each head's keys and values are read 128 times;
@@ -327,9 +335,40 @@ fields' places found once from tinygrad's own tables (about 6 us a kernel). Its 
 `TINYGPU_FAST_CHECK=1` has tinygrad write each launch as well (in a queue never submitted) and compares them before the
 card is given anything, a difference dropping the queue; checked so on the card, OAIY's 98 GPU tests, the adapter's
 and a 200-token answer of the 27B were the same bytes, and `tools/tinygpu/fast_check.py` checks the same with no card
-(a stand-in for tinygrad's NV device, thousands of random launches, chains and releases). It is not yet on by default:
-its gain on the card is still to be measured. Submissions of a token are not byte for byte those of the token before
-(a buffer made afresh each token is bound in some), so they cannot simply be replayed.
+(a stand-in for tinygrad's NV device, thousands of random launches, chains and releases). It is on unless
+`TINYGPU_FAST=0`. Submissions of a token are not byte for byte those of the token before (a buffer made afresh each
+token is bound in some), so they cannot simply be replayed.
+
+Where a token's time then went (11 October 2026, Qwen3.5 9B, 61 tokens a second; the card's own timestamps, and
+`TINYGPU_TRACE_IO=FILE`, each request a line), and what took it back:
+
+- **A launch read across the link.** A kernel chained to the one before it reads its QMD and arguments where tinygrad
+  writes them, the Mac's memory (the card's own is reached through TinyGPU's server, a call a write): 7.1 us a launch
+  of a kernel that does nothing, where a card in its own slot takes 1 or 2, and some 470 launches a 9B's token. With
+  `Fast` the card reads them from its own memory (`TINYGPU_ARGS_ON_CARD`, on unless 0): each is written into the ring
+  as before, its addresses those of a copy of the ring on the card, and a queue's slots are copied there by the copy
+  engine (one DMA a run of them) before it starts, which waits for it: 0.9 us a launch.
+- **A submission sent whole.** `Fast` queued a submission's every launch before the card started on the first: the
+  first 16 now go as soon as they are written, then 64, then 256 at a time.
+- **Round trips.** A token made two dozen writes and submissions that the adapter waited on, each 70 us (a buffer
+  from its pool cleared, then written); it now sends a write, a submission and a free without waiting (their answers
+  are nothing, or an error: read before the next request that has an answer), and a pooled buffer written whole is not
+  cleared first. A token's reads (its logits, and its attention layers' new K and V rows for the host's cache) were a
+  mapping, a round trip, each: a recording's small reads now go into one staging buffer, each at its place, one
+  mapping (`ggml-rs-wgpu`'s `Recorder::copy_reads`).
+
+  | | 9B, tokens a second | 27B through OAIY's gateway |
+  |---|---|---|
+  | before | 61 | 28.1 |
+  | launches on the card | 85 | |
+  | and in batches, round trips gone | 94 | |
+  | and one read a token | 99 | 38 |
+
+  Each step gave the same text, temperature 0, as before it (and OAIY's 98 GPU tests pass on the card with it all).
+  What is left is the card's own time: the 27B's token is 80% its quantized matmuls (16 ms of Q4_K, 5.6 of Q6_K, at
+  about 760 GB/s of the card's 1,008), then its delta nets (1.5 ms: a workgroup a head, 48 of the card's 128 SMs).
+  The register-blocked kernel's rows and k-split, tuned on an RTX 5090, change this card's time by 3% at most. Int8
+  activations (`dot4I8Packed`, `__dp4a`) for a step's row are no faster here than f32's.
 
 The adapter keeps the buffers a program lets go (up to 256 MB of them, each 64 MB or less; `TINYGPU_NO_POOL=1` for
 none) for the next buffer of their size: the dozens a token makes and lets go were each two round trips to the server

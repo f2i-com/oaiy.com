@@ -40,9 +40,24 @@ const PROTOCOL: u32 = 3;
 /// The server's socket, one request at a time, and the buffers let go that are kept for the next of their size.
 #[derive(Debug)]
 struct Conn {
-    stream: Mutex<UnixStream>,
+    stream: Mutex<Link>,
     pool: Mutex<Pool>,
 }
+
+/// The socket, and how many requests sent on it have answers not read yet: a write, a submission and a buffer let go
+/// are answered with nothing (or an error), so the next request is sent without waiting for them, and their answers
+/// are read before the answer of the next request that has one. The server takes its requests in order, so nothing
+/// changes but the round trips: a model's step made dozens, each waited for (70 us of a 9B's 11 ms step, two dozen
+/// times), while the card waited for the work after them.
+#[derive(Debug)]
+struct Link {
+    stream: UnixStream,
+    unread: usize,
+}
+
+/// Answers left unread at most: read before more is sent (each 12 bytes in the socket's buffer, and the server stops
+/// taking requests while its answers have no room).
+const UNREAD_AT_MOST: usize = 4096;
 
 /// Buffers this program let go, kept by size for the next buffer of that size: a language model's token makes and
 /// lets go dozens, each two requests to the server (a round trip each) and a launch of its clear there. A buffer taken
@@ -64,7 +79,7 @@ const POOL_LARGEST: u64 = 64 << 20;
 impl Conn {
     fn new(stream: UnixStream) -> Conn {
         let off = std::env::var("TINYGPU_NO_POOL").is_ok_and(|v| v == "1");
-        Conn { stream: Mutex::new(stream), pool: Mutex::new(Pool { off, ..Pool::default() }) }
+        Conn { stream: Mutex::new(Link { stream, unread: 0 }), pool: Mutex::new(Pool { off, ..Pool::default() }) }
     }
 
     /// A buffer of `size` bytes: one the pool has (to be cleared), else a new one from the server.
@@ -90,7 +105,7 @@ impl Conn {
                 return;
             }
         }
-        let _ = self.call(FREE, &id.to_le_bytes());
+        let _ = self.call_parts(FREE, &[&id.to_le_bytes()]);
     }
 
     fn call(&self, cmd: u32, payload: &[u8]) -> Result<Vec<u8>, String> {
@@ -113,16 +128,21 @@ impl Conn {
             if cmd == SUBMIT {
                 let mut all = vec![ops.as_slice()];
                 all.extend_from_slice(parts);
-                return self.send(cmd, &all);
+                return self.send(cmd, &all, false);
             }
-            self.send(SUBMIT, &[&ops])?;
+            self.send(SUBMIT, &[&ops], false)?;
         }
-        self.send(cmd, parts)
+        // (a write, a submission or a buffer let go is answered with nothing: not waited for)
+        self.send(cmd, parts, !matches!(cmd, WRITE | SUBMIT | FREE))
     }
 
-    /// The request itself.
-    fn send(&self, cmd: u32, parts: &[&[u8]]) -> Result<Vec<u8>, String> {
-        let mut s = self.stream.lock().unwrap_or_else(|p| p.into_inner());
+    /// The request itself; its answer where `wait` (else read before the next that is waited for).
+    fn send(&self, cmd: u32, parts: &[&[u8]], wait: bool) -> Result<Vec<u8>, String> {
+        let mut link = self.stream.lock().unwrap_or_else(|p| p.into_inner());
+        if link.unread >= UNREAD_AT_MOST {
+            Self::answers(&mut link)?;
+        }
+        let s = &mut link.stream;
         let len: usize = parts.iter().map(|p| p.len()).sum();
         let mut head = Vec::with_capacity(12 + if len <= 64 << 10 { len } else { 0 });
         head.extend(cmd.to_le_bytes());
@@ -137,6 +157,27 @@ impl Conn {
                 s.write_all(p).map_err(|e| format!("tinygpu: {e}"))?;
             }
         }
+        if !wait {
+            link.unread += 1;
+            return Ok(Vec::new());
+        }
+        Self::answers(&mut link)?;
+        Self::answer(&mut link.stream)
+    }
+
+    /// The answers not read yet, read: the first error among them, if one failed (an earlier request's).
+    fn answers(link: &mut Link) -> Result<(), String> {
+        let mut first = None;
+        while link.unread > 0 {
+            link.unread -= 1;
+            if let Err(e) = Self::answer(&mut link.stream) {
+                first.get_or_insert(e);
+            }
+        }
+        first.map_or(Ok(()), |e| Err(format!("{e} (a request before this one)")))
+    }
+
+    fn answer(s: &mut UnixStream) -> Result<Vec<u8>, String> {
         let mut answer = [0u8; 12];
         s.read_exact(&mut answer).map_err(|e| format!("tinygpu: {e}"))?;
         let status = u32::from_le_bytes(answer[..4].try_into().unwrap());
@@ -417,6 +458,14 @@ impl DeviceInterface for TgDevice {
         payload.extend((kernel.bindings.len() as u32).to_le_bytes());
         payload.extend((kernel.scratch as u32).to_le_bytes());
         payload.extend(kernel.source.as_bytes());
+        // TINYGPU_LABELS=DIR: each kernel's CUDA kept as DIR/<its pipeline's label>.<n>.cu, so a profile's kernels (the
+        // server names them by their sources' hashes) can be named
+        if let Some(dir) = std::env::var_os("TINYGPU_LABELS") {
+            static KEPT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let label: String = desc.label.unwrap_or("kernel").chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect();
+            let n = KEPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{label}.{n}.cu")), &kernel.source);
+        }
         let program = u64_of(&self.conn.call(PROGRAM, &payload).unwrap_or_else(|e| panic!("{}: {e}", desc.label.unwrap_or("a kernel"))));
         let bindings = kernel.bindings.iter().map(|b| (b.group, b.binding)).collect();
         DispatchComputePipeline::custom(TgComputePipeline { program, bindings })
@@ -524,6 +573,8 @@ fn read_range(conn: &Conn, id: u64, start: u64, len: u64) -> Vec<u8> {
 }
 
 fn write_range(conn: &Conn, id: u64, start: u64, data: &[u8]) {
+    // (a buffer from the pool written whole is not cleared first: nothing of it is left to read as zeros)
+    conn.pool.lock().unwrap_or_else(|p| p.into_inner()).clears.retain(|&(c, size)| c != id || start != 0 || (data.len() as u64) < size);
     let mut at = [0u8; 16];
     at[..8].copy_from_slice(&id.to_le_bytes());
     at[8..].copy_from_slice(&start.to_le_bytes());
