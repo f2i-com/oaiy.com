@@ -376,7 +376,11 @@ Where a token's time then went (11 October 2026, Qwen3.5 9B, 61 tokens a second;
 The adapter keeps the buffers a program lets go (up to 256 MB of them, each 64 MB or less; `TINYGPU_NO_POOL=1` for
 none) for the next buffer of their size: the dozens a token makes and lets go were each two round trips to the server
 and a launch of a clear there. A buffer from the pool is cleared before anything else reaches the server (WebGPU's
-begin as zeros): at the head of the next submission, or in one of its own before a write or a read.
+begin as zeros): at the head of the next submission, or in one of its own before a write or a read. The clears are
+taken and sent under the socket's lock, with the request they go before: the engine's feed submits from a thread of
+its own, and a clear taken by it and sent after the other thread's write to its buffer zeroed what was written (a
+step's input, now and then: the 27B answered "!!!!" or nothing to about one tool request in fifteen once writes and
+submissions stopped waiting for their answers, and none in 140 since).
 
 **The faults, found.** A write to the card's memory faulted (an MMU fault, a REGION_VIOLATION, at a page's start)
 whenever the card's memory was all but full: a language model loaded after pictures (their freed buffers still in

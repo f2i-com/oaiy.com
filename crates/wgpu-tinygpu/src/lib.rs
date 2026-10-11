@@ -114,8 +114,12 @@ impl Conn {
 
     /// A request whose payload is `parts`, one after another: sent as they are, not copied into one (a write's bytes
     /// are a model's weights, hundreds of megabytes a tensor). The pool's buffers taken since the last request are
-    /// cleared first: at the head of a submission, or in a submission of their own before any other request.
+    /// cleared first: at the head of a submission, or in a submission of their own before any other request. The
+    /// clears are taken and sent under the socket's lock, with the request: taken by one thread (the engine's feed
+    /// submits from its own) and sent after another's write to the buffer, a clear zeroed what was just written (a
+    /// model's input for its step, now and then, and its answer was garbage).
     fn call_parts(&self, cmd: u32, parts: &[&[u8]]) -> Result<Vec<u8>, String> {
+        let mut link = self.stream.lock().unwrap_or_else(|p| p.into_inner());
         let clears = std::mem::take(&mut self.pool.lock().unwrap_or_else(|p| p.into_inner()).clears);
         if !clears.is_empty() {
             let mut ops = Vec::with_capacity(25 * clears.len());
@@ -128,19 +132,19 @@ impl Conn {
             if cmd == SUBMIT {
                 let mut all = vec![ops.as_slice()];
                 all.extend_from_slice(parts);
-                return self.send(cmd, &all, false);
+                return Self::send(&mut link, cmd, &all, false);
             }
-            self.send(SUBMIT, &[&ops], false)?;
+            Self::send(&mut link, SUBMIT, &[&ops], false)?;
         }
         // (a write, a submission or a buffer let go is answered with nothing: not waited for)
-        self.send(cmd, parts, !matches!(cmd, WRITE | SUBMIT | FREE))
+        Self::send(&mut link, cmd, parts, !matches!(cmd, WRITE | SUBMIT | FREE))
     }
 
-    /// The request itself; its answer where `wait` (else read before the next that is waited for).
-    fn send(&self, cmd: u32, parts: &[&[u8]], wait: bool) -> Result<Vec<u8>, String> {
-        let mut link = self.stream.lock().unwrap_or_else(|p| p.into_inner());
+    /// The request itself, on the locked socket; its answer where `wait` (else read before the next that is waited
+    /// for).
+    fn send(link: &mut Link, cmd: u32, parts: &[&[u8]], wait: bool) -> Result<Vec<u8>, String> {
         if link.unread >= UNREAD_AT_MOST {
-            Self::answers(&mut link)?;
+            Self::answers(link)?;
         }
         let s = &mut link.stream;
         let len: usize = parts.iter().map(|p| p.len()).sum();
@@ -161,7 +165,7 @@ impl Conn {
             link.unread += 1;
             return Ok(Vec::new());
         }
-        Self::answers(&mut link)?;
+        Self::answers(link)?;
         Self::answer(&mut link.stream)
     }
 
