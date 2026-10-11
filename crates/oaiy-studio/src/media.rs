@@ -198,6 +198,9 @@ pub struct Media {
     broker_changed: Condvar,
     queue_signal: Condvar,
     pub log: Arc<LogRing>,
+    /// When a job of a worker of its own (not the kept one's) last ended on the card: the card is kept for another
+    /// for [`KEEP_CARD`], as the kept worker keeps it for a picture (each lending's end loads the language model again).
+    card_used: Mutex<Option<std::time::Instant>>,
 }
 
 /// A chat request's hold on the LLM; released on drop.
@@ -949,17 +952,21 @@ pub fn needs_media_gpu(cfg: &Json, model: Option<&str>) -> bool {
     }
 }
 
-/// Whether a job of `kind` with `request` is made on the eGPU's card (a Mac's, `crate::egpu`): a Qwen Image picture on
-/// WebGPU, where the eGPU is switched on, answers with OAIY's own engine, and makes pictures (`llm.egpu.images`, on
-/// unless switched off).
+/// Whether a job of `kind` with `request` is made on the eGPU's card (a Mac's, `crate::egpu`): a job on WebGPU (every
+/// one of the worker's: pictures, video, music, sound effects, speech, 3D models, picture tools), where the eGPU is
+/// switched on and answers with OAIY's own engine; pictures where it makes them (`llm.egpu.images`), the others where
+/// it makes media (`llm.egpu.media`), each on unless switched off.
 pub fn on_card(cfg: &Json, kind: Kind, request: &Json) -> bool {
     let Some(llm) = cfg.get("llm") else { return false };
-    kind == Kind::Image
-        && crate::egpu::enabled(llm)
-        && crate::egpu::webgpu(llm)
-        && bool_or(llm.get("egpu").unwrap_or(&Json::Null), "images", true)
-        && request.get("architecture").is_none_or(|a| a.as_str() == Some("qwen-image"))
-        && request.get("backend").is_none_or(|b| b.as_str() == Some("webgpu"))
+    let egpu = llm.get("egpu").unwrap_or(&Json::Null);
+    let wanted = if kind == Kind::Image { bool_or(egpu, "images", true) } else { bool_or(egpu, "media", true) };
+    wanted && crate::egpu::enabled(llm) && crate::egpu::webgpu(llm) && request.get("backend").is_none_or(|b| b.as_str() == Some("webgpu"))
+}
+
+/// Whether a job on the card is the kept worker's (`oaiy-media --serve`, which takes Qwen Image pictures alone): the
+/// others are a worker's of their own, as on this computer.
+fn kept_on_card(kind: Kind, request: &Json) -> bool {
+    kind == Kind::Image && request.get("architecture").is_none_or(|a| a.as_str() == Some("qwen-image"))
 }
 
 /// How long a picture waits for the eGPU's language model to finish the requests it is answering, before it is made
@@ -1061,6 +1068,7 @@ impl Media {
             queue_signal: Condvar::new(),
             serving: Mutex::new(None),
             log: Arc::new(LogRing::new(2000)),
+            card_used: Mutex::new(None),
         }
     }
 
@@ -1388,7 +1396,16 @@ impl Media {
             match studio.egpu.lend(&cfg, &studio.root, CARD_WAIT) {
                 Ok(socket) => {
                     self.update(&job.id, |j| j.stage = "on the eGPU".into());
-                    match self.serve_job(studio, &cfg, job, &socket) {
+                    let made = if kept_on_card(job.kind, &job.request) {
+                        self.serve_job(studio, &cfg, job, &socket)
+                    } else {
+                        // (the kept picture worker let go first: the card's memory the job's)
+                        self.end_serving(false);
+                        let made = self.worker(studio, &cfg, job, Some(&socket));
+                        *self.card_used.lock().unwrap_or_else(|p| p.into_inner()) = Some(std::time::Instant::now());
+                        made
+                    };
+                    match made {
                         Ok(done) => return Ok(done),
                         Err(e) if job.cancel.load(Ordering::Relaxed) => return Err(e),
                         // (the card's language model comes back while this computer makes it)
@@ -1436,9 +1453,11 @@ impl Media {
         result
     }
 
-    /// Whether the kept worker is to wait on for another picture: it has waited less than [`KEEP_CARD`].
+    /// Whether the card is kept for another job: the kept worker has waited less than [`KEEP_CARD`] for another
+    /// picture, or a job of a worker of its own ended on the card less than that ago.
     fn lingers(&self) -> bool {
         self.serving.lock().unwrap_or_else(|p| p.into_inner()).as_ref().is_some_and(|s| s.idle_since.elapsed() < KEEP_CARD)
+            || self.card_used.lock().unwrap_or_else(|p| p.into_inner()).is_some_and(|t| t.elapsed() < KEEP_CARD)
     }
 
     /// The kept worker let go: its standard input closed (it ends, its memory on the card freed), and killed past a wait

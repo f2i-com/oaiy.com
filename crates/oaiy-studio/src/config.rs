@@ -513,9 +513,12 @@ pub fn validate(v: &Json) -> Result<(), String> {
         if egpu.get("enabled").is_some_and(|e| e.as_bool().is_none()) {
             return Err("llm.egpu.enabled must be true or false".into());
         }
-        // Whether Qwen Image pictures are made on the card, with OAIY's engine on it (`crate::media::on_card`).
-        if egpu.get("images").is_some_and(|e| e.as_bool().is_none()) {
-            return Err("llm.egpu.images must be true or false".into());
+        // Whether pictures (`images`), and video, music, sound effects, speech and 3D models (`media`), are made on the
+        // card, with OAIY's engine on it (`crate::media::on_card`).
+        for key in ["images", "media"] {
+            if egpu.get(key).is_some_and(|e| e.as_bool().is_none()) {
+                return Err(format!("llm.egpu.{key} must be true or false"));
+            }
         }
         for key in ["python", "tinygrad", "device", "fallback_model"] {
             if egpu.get(key).is_some_and(|s| s.as_str().is_none()) {
@@ -905,6 +908,7 @@ mod tests {
             (r#"{"engine": "cuda"}"#, "llm.egpu.engine"),
             (r#"{"engine": true}"#, "llm.egpu.engine"),
             (r#"{"images": "yes"}"#, "llm.egpu.images"),
+            (r#"{"media": 1}"#, "llm.egpu.media"),
         ] {
             let err = set(egpu, models).unwrap_err();
             assert!(err.contains(needle), "{err} lacks {needle}");

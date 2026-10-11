@@ -1003,6 +1003,7 @@ dialog::backdrop { background: var(--backdrop); }
         <div class="row" style="margin-top:14px; gap:14px; align-items:center">
           <label class="check" style="margin-right:8px"><input type="checkbox" data-bind="llm.egpu.enabled"> Use the eGPU</label>
           <label class="check" style="margin-right:8px" title="With OAIY's own engine on the card: a Qwen Image picture is made on the card, its language model paused meanwhile (the card's memory is the picture's) and loaded again after. Pictures made while it is off, or while the card is not there, are made on this Mac."><input type="checkbox" data-bind="llm.egpu.images" id="egpu-images"> Make pictures on it too</label>
+          <label class="check" style="margin-right:8px" title="With OAIY's own engine on the card: video, music, sound effects, speech and 3D models are made on the card, its language model paused meanwhile and loaded again after. Made while it is off, or while the card is not there, they are made on this Mac."><input type="checkbox" data-bind="llm.egpu.media" id="egpu-media"> Make video, music, sound and speech on it too</label>
           <button class="btn" type="button" id="egpu-check">Check tinygrad</button>
           <button class="btn" type="button" id="egpu-start">Start</button>
           <button class="btn" type="button" id="egpu-stop">Stop</button>
@@ -1295,6 +1296,7 @@ function renderConfig() {
   if ($("#egpu-device") && !$("#egpu-device").value) $("#egpu-device").value = "NV";
   if ($("#egpu-engine") && !$("#egpu-engine").value) $("#egpu-engine").value = "tinygrad";
   if ($("#egpu-images") && getPath(cfg, "llm.egpu.images") == null) $("#egpu-images").checked = true;
+  if ($("#egpu-media") && getPath(cfg, "llm.egpu.media") == null) $("#egpu-media").checked = true;
   { const on = $("section.view.on"); if (on) renderJump(on.id.slice(2)); }
   $("#cfg-path").textContent = state ? "Configuration: " + state.config_path : "";
 }

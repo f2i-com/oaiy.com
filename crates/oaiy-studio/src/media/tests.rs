@@ -358,17 +358,27 @@ fn qwen_image_turbo_takes_its_own_eight_steps_at_cfg_one_and_no_adapter() {
 }
 
 #[test]
-fn qwen_image_pictures_go_to_the_egpu_where_it_runs_oaiys_engine() {
+fn webgpu_media_goes_to_the_egpu_where_it_runs_oaiys_engine() {
     let mut c = cfg("", "");
     let llm = crate::registry::obj_mut(&mut c, &["llm"]).unwrap();
     crate::util::set(llm, "egpu", body(r#"{"enabled":true,"engine":"webgpu"}"#));
     let qwen = body(r#"{"base":"b","transformer":"t.gguf","steps":8}"#);
+    let sdxl = body(r#"{"architecture":"sdxl","checkpoint":"c"}"#);
     assert!(on_card(&c, Kind::Image, &qwen));
-    assert!(!on_card(&c, Kind::Video, &qwen), "pictures only");
-    assert!(!on_card(&c, Kind::Image, &body(r#"{"architecture":"sdxl","checkpoint":"c"}"#)), "Qwen Image only");
-    assert!(!on_card(&c, Kind::Image, &body(r#"{"base":"b","backend":"cpu"}"#)));
-    for egpu in [r#"{"enabled":true,"engine":"webgpu","images":false}"#, r#"{"enabled":true,"engine":"tinygrad"}"#, r#"{"enabled":false,"engine":"webgpu"}"#] {
+    assert!(on_card(&c, Kind::Image, &sdxl), "any picture on WebGPU");
+    for kind in [Kind::Video, Kind::Music, Kind::Sound, Kind::Speech, Kind::Model3d, Kind::Picture] {
+        assert!(on_card(&c, kind, &body("{}")), "{kind:?}");
+    }
+    // (the kept worker takes Qwen Image pictures; the others are a worker's of their own)
+    assert!(kept_on_card(Kind::Image, &qwen) && !kept_on_card(Kind::Image, &sdxl) && !kept_on_card(Kind::Music, &body("{}")));
+    assert!(!on_card(&c, Kind::Image, &body(r#"{"base":"b","backend":"cpu"}"#)), "not on WebGPU");
+    // pictures and the rest each switched off on their own
+    crate::util::set(crate::registry::obj_mut(&mut c, &["llm"]).unwrap(), "egpu", body(r#"{"enabled":true,"engine":"webgpu","images":false}"#));
+    assert!(!on_card(&c, Kind::Image, &qwen) && on_card(&c, Kind::Music, &body("{}")));
+    crate::util::set(crate::registry::obj_mut(&mut c, &["llm"]).unwrap(), "egpu", body(r#"{"enabled":true,"engine":"webgpu","media":false}"#));
+    assert!(on_card(&c, Kind::Image, &qwen) && !on_card(&c, Kind::Music, &body("{}")));
+    for egpu in [r#"{"enabled":true,"engine":"tinygrad"}"#, r#"{"enabled":false,"engine":"webgpu"}"#] {
         crate::util::set(crate::registry::obj_mut(&mut c, &["llm"]).unwrap(), "egpu", body(egpu));
-        assert!(!on_card(&c, Kind::Image, &qwen), "{egpu}");
+        assert!(!on_card(&c, Kind::Image, &qwen) && !on_card(&c, Kind::Video, &body("{}")), "{egpu}");
     }
 }
