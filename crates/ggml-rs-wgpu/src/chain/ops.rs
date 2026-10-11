@@ -958,12 +958,19 @@ impl ChainRecorder for Recorder<'_> {
     }
 
     fn qsa_select(&mut self, scores: &DeviceVec, list: &DeviceVec, rows: usize, nb: usize, first: usize, ratio: usize, keep: usize) {
-        assert!(nb <= 4096 && keep > 0 && scores.len >= rows * nb && list.len >= rows * keep, "chain: QSA's selection of {keep} of {nb} blocks");
+        assert!(keep > 0 && scores.len >= rows * nb && list.len >= rows * keep, "chain: QSA's selection of {keep} of {nb} blocks");
         let dd = self.gpu().dummy().clone();
         let drw = self.gpu().dummy_rw().clone();
         // (a step's query or a check's few, of few blocks: each block placed by how many come before it, the shorter
-        // wait; a prompt's queries, or many blocks: sorted, the less work)
-        let (name, body) = if nb <= QSA_RANKED && rows <= 8 { ("chain-qsa-select-ranked", QSA_SELECT_RANKED) } else { ("chain-qsa-select", QSA_SELECT) };
+        // wait; a prompt's queries, or many blocks: sorted, the less work; more blocks than a workgroup's memory
+        // holds to sort, past 16,384 positions of 4: the least key kept found a bit at a time)
+        let (name, body) = if nb > QSA_SORTED {
+            ("chain-qsa-select-wide", QSA_SELECT_WIDE)
+        } else if nb <= QSA_RANKED && rows <= 8 {
+            ("chain-qsa-select-ranked", QSA_SELECT_RANKED)
+        } else {
+            ("chain-qsa-select", QSA_SELECT)
+        };
         self.dispatch_wide(name, body, [buffer(scores), &dd, &dd, &dd, &dd, &dd, buffer(list), &drw], &[rows as u32, nb as u32, first as u32, ratio as u32, keep as u32], (rows as u32, 1, 1));
     }
 

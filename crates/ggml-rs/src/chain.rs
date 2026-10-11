@@ -427,8 +427,7 @@ pub trait ChainRecorder {
         unimplemented!("QSA on this device")
     }
     /// QSA's selection (`Backend::qsa_select`): each query's `keep` best whole blocks (all of them where it sees no
-    /// more), the larger score first and the lower block of equals, into `list[r, ..keep]` in ascending order. At most
-    /// 4096 blocks (16,384 positions of 4).
+    /// more), the larger score first and the lower block of equals, into `list[r, ..keep]` in ascending order.
     #[allow(clippy::too_many_arguments)]
     fn qsa_select(&mut self, scores: &DeviceVec, list: &DeviceVec, rows: usize, nb: usize, first: usize, ratio: usize, keep: usize) {
         let _ = (scores, list, rows, nb, first, ratio, keep);

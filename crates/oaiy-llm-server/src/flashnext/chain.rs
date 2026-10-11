@@ -169,14 +169,13 @@ impl FlashNext {
     /// recurrent states from inside them once each of `taps` rows is in ([`Self::forward_chunks_tapped`]): chained,
     /// the n-gram layer too (its window a device's vector), and each chunk's rows after the first state it keeps few
     /// ([`TAP_ROWS`]: their recurrences go through vectors of their own). OAIY_NO_TAPS: never.
-    pub fn can_tap(&self, rows: usize, kv: &KvCache, taps: &[usize]) -> bool {
+    pub fn can_tap(&self, rows: usize, _kv: &KvCache, taps: &[usize]) -> bool {
         if std::env::var_os("OAIY_NO_CHAIN").is_some() || std::env::var_os("OAIY_NO_TAPS").is_some() || profile::on() || rows == 0 || taps.is_empty() {
             return false;
         }
         let most = self.prompt_rows();
         self.chain_state().is_some_and(|st| st.ple.is_some())
             && self.devices.iter().all(|b| b.chain().is_some())
-            && (kv.len + rows) / self.config.index_ratio <= 4096
             && taps.windows(2).all(|w| w[0] < w[1])
             && taps[0] > 0
             && taps[taps.len() - 1] <= rows

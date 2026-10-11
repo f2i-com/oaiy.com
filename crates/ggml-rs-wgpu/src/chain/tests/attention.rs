@@ -594,10 +594,12 @@ fn qsa_chained_is_the_hosts() {
     for (i, (g, w)) in got_out.iter().zip(want_out.data()).enumerate() {
         assert!((g - w).abs() <= 1e-5 * scale_out, "attention {i}: {g} against {w}");
     }
-    // the selection at its limits: 4096 blocks (the sort filling the workgroup's memory) and an odd count
-    for nb in [4096usize, 3001] {
+    // the selection at its limits: 4096 blocks (the sort filling the workgroup's memory) and an odd count; then more
+    // than are sorted (the least key kept found a bit at a time): one more, a 32,768-position cache's, an odd count;
+    // and each with scores of few values, half of them negative, so that most of what is kept is kept among equals
+    for (nb, few_values) in [(4096usize, false), (3001, false), (4097, false), (8192, false), (6001, false), (4096, true), (8192, true), (6001, true)] {
         let first = nb * ratio - 2;
-        let sc: Vec<f32> = (0..2 * nb).map(|_| r().abs() * 4.0).collect();
+        let sc: Vec<f32> = (0..2 * nb).map(|_| if few_values { (r() * 3.0).round() / 2.0 } else { r().abs() * 4.0 }).collect();
         let (sd, ld) = (up(&sc), b.vec(2 * keep));
         let mut rec = b.begin();
         rec.qsa_select(&sd, &ld, 2, nb, first, ratio, keep);

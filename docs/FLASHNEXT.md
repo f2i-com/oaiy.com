@@ -92,6 +92,15 @@ step with the slots warm, and within 0.1 to 0.3 after a cold 1,485-token prompt.
 A host that takes a model to be one file may name the checkpoint by the `config.json` in it: the engine takes that
 file's folder.
 
+**Past 16,384 positions.** The attention layers' queries attend, past their dense span, to the best 512 of the
+cache's blocks of four positions. A device chose them by sorting a query's blocks in a workgroup's memory, which
+holds 4096 of them: a run that reached past position 16,384 left the chained run for the host's path, every row of a
+prompt from there on and every token decoded after. A 17,619-token prompt took 338 s (its first 15,792 tokens 80 s
+of that) and its reply came at under 2 tokens a second. More blocks than that are now chosen without a sort (the
+least key kept found a bit at a time: `QSA_SELECT_WIDE`), the same blocks in the same order: that prompt takes 92 s
+and its reply comes at 8.8 tokens a second, a 29,866-token prompt 159 s and 8.7. Each step's five largest logits are
+the host path's, in its order, within 0.4 (12 October 2026).
+
 Measured on an RTX 4090 in a Thunderbolt 3 enclosure beside an M5 Pro with 24 GB (11 October 2026), see
 [TINYGPU.md](TINYGPU.md#a-model-larger-than-the-card-qwen38-flash-next).
 

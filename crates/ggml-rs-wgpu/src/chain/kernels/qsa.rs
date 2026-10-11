@@ -233,6 +233,108 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 }
 "#;
 
+/// [`QSA_SELECT`] for more blocks than a workgroup's memory holds to sort (past 4096: positions past 16,384 of 4), a
+/// workgroup a query still, and the same blocks in the same order: nothing is sorted. The `keep`-th largest key is
+/// found a bit at a time from the top (the largest value that `keep` keys or more are at least: 32 counts of the
+/// blocks the query sees, each thread its own run of them), then every block above it is kept, and of the blocks
+/// equal to it the lowest, as many as are still wanted; a thread writes its run's in ascending order from the count
+/// of those kept before its run. Its memory is two counts a thread. `p[0]`: rows, nb, first, ratio; `p[1]`: keep.
+///
+/// Without it a prompt's rows past position 16,384, and every token decoded there, left the chained run for the
+/// host's path: Flash-Next's 17,619-token prompt took 338 s where its first 15,792 tokens took 80.
+pub(in crate::chain) const QSA_SELECT_WIDE: &str = r#"
+@group(0) @binding(0) var<storage, read> scores: array<f32>;
+@group(0) @binding(6) var<storage, read_write> list: array<u32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> part: array<u32, 256>;
+var<workgroup> same: array<u32, 256>;
+var<workgroup> found: array<u32, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    let nb = p[0].y;
+    let first = p[0].z;
+    let ratio = p[0].w;
+    let keep = p[1].x;
+    let r = wg.x;
+    let visible = min((first + r + 1u) / ratio, nb);
+    // each thread a run of the blocks the query sees, in order
+    let per = (visible + 255u) / 256u;
+    let lo = min(t * per, visible);
+    let hi = min(lo + per, visible);
+    if (visible > keep) {
+        if (t == 0u) { found[0] = 0u; }
+        workgroupBarrier();
+        // a larger score a larger key (positive scores' sign bit set, negative ones' bits flipped)
+        for (var bit = 32u; bit > 0u; bit--) {
+            let wanted = found[0] | (1u << (bit - 1u));
+            var mine = 0u;
+            for (var i = lo; i < hi; i++) {
+                let u = bitcast<u32>(scores[r * nb + i]);
+                let key = select(u | 0x80000000u, ~u, (u >> 31u) == 1u);
+                if (key >= wanted) { mine += 1u; }
+            }
+            part[t] = mine;
+            workgroupBarrier();
+            if (t == 0u) {
+                var all = 0u;
+                for (var w = 0u; w < 256u; w++) { all += part[w]; }
+                if (all >= keep) { found[0] = wanted; }
+            }
+            workgroupBarrier();
+        }
+        let least = found[0];
+        // the blocks above it and the blocks equal to it, a run; then how many of each come before a run, and how
+        // many of the equals are still wanted
+        var above = 0u;
+        var equal = 0u;
+        for (var i = lo; i < hi; i++) {
+            let u = bitcast<u32>(scores[r * nb + i]);
+            let key = select(u | 0x80000000u, ~u, (u >> 31u) == 1u);
+            if (key > least) { above += 1u; } else if (key == least) { equal += 1u; }
+        }
+        part[t] = above;
+        same[t] = equal;
+        workgroupBarrier();
+        if (t == 0u) {
+            var a = 0u;
+            var e = 0u;
+            for (var w = 0u; w < 256u; w++) {
+                let ca = part[w];
+                let ce = same[w];
+                part[w] = a;
+                same[w] = e;
+                a += ca;
+                e += ce;
+            }
+            found[1] = keep - a;
+        }
+        workgroupBarrier();
+        let wanted_equals = found[1];
+        var before = same[t];
+        var slot = part[t] + min(before, wanted_equals);
+        for (var i = lo; i < hi; i++) {
+            let u = bitcast<u32>(scores[r * nb + i]);
+            let key = select(u | 0x80000000u, ~u, (u >> 31u) == 1u);
+            if (key > least) {
+                list[r * keep + slot] = i;
+                slot += 1u;
+            } else if (key == least) {
+                if (before < wanted_equals) {
+                    list[r * keep + slot] = i;
+                    slot += 1u;
+                }
+                before += 1u;
+            }
+        }
+    } else {
+        // (it sees no more than are kept: all of them)
+        for (var i = lo; i < hi; i++) { list[r * keep + i] = i; }
+    }
+}
+"#;
+
 /// [`QSA_SELECT`] for a step's query or a check's few, of few blocks (`p[0].y` at most [`QSA_RANKED`]): each block
 /// placed by how many come before it (a larger score, or as large at a lower block) and kept where fewer than `keep`
 /// do, where the sort took a round and a barrier for every stride of every size (36 for 256 blocks, 23 us a query's
@@ -306,6 +408,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 /// The most blocks [`QSA_SELECT_RANKED`] takes (16,384 positions of 16): past them a thread's comparisons are more
 /// than the sort's rounds.
 pub(in crate::chain) const QSA_RANKED: usize = 1024;
+
+/// The blocks [`QSA_SELECT`] sorts at most (its keys and indices fill a workgroup's memory: 32 KB); more go by
+/// [`QSA_SELECT_WIDE`].
+pub(in crate::chain) const QSA_SORTED: usize = 4096;
 
 /// QSA's attention part, [`ATTENTION_PART4`]'s sums over a query's entries in turn: its kept blocks' positions (from
 /// `list`, ascending) then its tail block's, a workgroup a (head, run of 256 entries, query), the runs' parts as

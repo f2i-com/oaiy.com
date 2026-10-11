@@ -35,8 +35,11 @@ impl FlashNext {
                 marks.push((what, clock.elapsed().as_secs_f64() * 1e3));
             }
         };
-        // past the dense span the attention layers' queries attend to their QSA blocks (at most 4096 blocks)
-        if t == 0 || (past + t) / ratio > 4096 {
+        // (past the dense span the attention layers' queries attend to their QSA blocks: however many there are. Up
+        // to 4096, 16,384 positions, was all a device selected among, and a run that reached past them was left to
+        // the host's path, every row of a prompt from there on and every token decoded: 7 rows a second and under 2
+        // tokens where 200 and 10)
+        if t == 0 {
             return None;
         }
         let sparse = past + t > cfg.index_budget / ratio * ratio + ratio - 1;
