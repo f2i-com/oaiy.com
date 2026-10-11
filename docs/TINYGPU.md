@@ -451,6 +451,8 @@ and a 200-token answer of the 27B were the same bytes, and `tools/tinygpu/fast_c
 (a stand-in for tinygrad's NV device, thousands of random launches, chains and releases). It is on unless
 `TINYGPU_FAST=0`. Submissions of a token are not byte for byte those of the token before (a buffer made afresh each
 token is bound in some), so they cannot simply be replayed.
+`TINYGPU_LARGE=MB`, in the engine's environment, says each buffer of that size or more as it is asked for (with its
+label) and let go, and how much of such it then holds: what a card with no room left was full of.
 
 Where a token's time then went (11 October 2026, Qwen3.5 9B, 61 tokens a second; the card's own timestamps, and
 `TINYGPU_TRACE_IO=FILE`, each request a line), and what took it back:

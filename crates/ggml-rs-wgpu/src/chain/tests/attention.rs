@@ -668,3 +668,42 @@ fn qsas_ranked_selection_is_the_sorted_one() {
         }
     }
 }
+
+/// What is kept for the next run can be let go, and is where a buffer is refused: the bind groups made once and kept
+/// (each holds its buffers: a cache's old layers stayed on a card beside the new ones for as long as they were kept),
+/// the scratch pool and the read-backs' staging. A buffer the device refuses is asked for once more after that, and
+/// a second refusal is the caller's.
+#[test]
+fn what_is_kept_for_the_next_run_is_let_go_where_a_buffer_is_refused() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    // a step's work, kept: its bind groups, and scratch back in the pool
+    let (x, y) = (b.vec(64), b.vec(64));
+    DeviceChain::upload(&b, &x, &[1.0; 64]);
+    let mut rec = b.begin();
+    rec.copy(&x, 0, &y, 0, 64);
+    rec.read(&y);
+    let _ = rec.finish();
+    b.gpu.unpool(vec![(1 << 16, b.gpu.pooled(1 << 16))]);
+    let kept = |b: &crate::WgpuBackend| {
+        (b.gpu.chain_groups.lock().unwrap().len() + b.gpu.chain_groups_wide.lock().unwrap().len(), b.gpu.pool.lock().unwrap().len())
+    };
+    assert!(kept(&b).1 >= 1, "{:?}", kept(&b));
+    // refused once: what is kept goes, and the second asking's buffer is the answer
+    let asked = AtomicUsize::new(0);
+    let got = b.gpu.with_room(|| {
+        if asked.fetch_add(1, Ordering::SeqCst) == 0 {
+            panic!("no room (a test's)");
+        }
+        7
+    });
+    assert_eq!((got, asked.load(Ordering::SeqCst)), (7, 2));
+    assert_eq!(kept(&b), (0, 0), "nothing kept after a refusal");
+    // refused twice: the caller's to deal with
+    let twice = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| b.gpu.with_room(|| -> u32 { panic!("no room at all (a test's)") })));
+    assert!(twice.is_err());
+    // and by the name a cache's growth asks by
+    b.gpu.unpool(vec![(1 << 16, b.gpu.pooled(1 << 16))]);
+    DeviceChain::let_go_of_spare(&b);
+    assert_eq!(kept(&b), (0, 0));
+}

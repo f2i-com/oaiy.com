@@ -133,6 +133,10 @@ pub trait DeviceChain: Send + Sync {
     }
     /// A vector of `len` holding `v`'s first `min(len, v.len)` elements (the rest zero).
     fn resize(&self, v: &DeviceVec, len: usize) -> DeviceVec;
+    /// What the device keeps for its next run and could make again let go (bind groups made once and kept, which hold
+    /// their buffers; scratch of the last run's sizes): asked before something large and lasting is made on a device
+    /// with little room, a cache's growth, whose old vectors those bind groups would otherwise keep there.
+    fn let_go_of_spare(&self) {}
     /// Whether this device holds `w` where its matmuls read it.
     fn holds(&self, w: &QuantizedTensor) -> bool;
     /// Whether this device holds the EXL3 projection `w` where [`ChainRecorder::exl3_rows`] reads it.

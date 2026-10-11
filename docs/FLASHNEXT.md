@@ -101,6 +101,17 @@ least key kept found a bit at a time: `QSA_SELECT_WIDE`), the same blocks in the
 and its reply comes at 8.8 tokens a second, a 29,866-token prompt 159 s and 8.7. Each step's five largest logits are
 the host path's, in its order, within 0.4 (12 October 2026).
 
+The cache's copy on the card is twice the size past 16,384 rows (1.5 GB at 32,768), on a card its experts' slots
+leave little of. It is made at a prompt's first run, for the whole prompt, and what the device keeps for its next
+run is let go first: the scratch pool, and the bind groups made once and kept, each of which holds its buffers, the
+old cache's layers among them (768 MB that stayed beside the new ones until they went). Made when a run first
+reached past the old size, in the middle of a prompt, or with those kept, a longer prompt after a long one found no
+room ("Allocation of 512.00 MB failed"). Where the card has no room for the whole of it all the same, the copy is
+made at the size the run needs, and a run past that is the host's, slowly, as every run past 16,384 rows was: the
+engine says so once a prompt. A buffer the card refuses is asked for once more with what is kept let go.
+On the card: 14,974 tokens then another prompt's 17,619, a conversation grown from 14,977 to 17,955, and two
+prompts of 30,000 one after the other, alone and through OAIY with a LoRA; the least the card had free was 0.25 GB.
+
 Measured on an RTX 4090 in a Thunderbolt 3 enclosure beside an M5 Pro with 24 GB (11 October 2026), see
 [TINYGPU.md](TINYGPU.md#a-model-larger-than-the-card-qwen38-flash-next).
 

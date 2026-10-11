@@ -136,6 +136,57 @@ pub(super) struct ChainKv {
     pub(super) qsa: Option<QsaVecs>,
     /// The `KvCache::id` the rows are a copy of (0: none).
     pub(super) owner: u64,
+    /// The `cap` the device had no room for (0: none it was asked for and refused): not asked for again until a
+    /// prompt is begun anew.
+    pub(super) refused: usize,
+}
+
+impl ChainKv {
+    /// The copy made again at `cap` rows, its first `kept` rows kept (the old vectors go as the new ones come, a
+    /// layer at a time, and before any new one where no row is kept: `chain_part.rs`), or not at all where the device
+    /// has no room for it: then it is nobody's and of no rows, what was made of it let go, and `false`. (A device
+    /// with no room refuses a vector by a panic, which is caught here: the run goes on with a smaller copy, or is
+    /// left to the host.)
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn grow(&mut self, chain: &dyn ggml_rs::DeviceChain, slots: usize, cap: usize, kept: usize, row: usize, id_dim: usize, out_len: usize) -> bool {
+        // (the scratch the device keeps for its next run first: the room it takes is the cache's)
+        chain.let_go_of_spare();
+        let grown = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let owner = std::mem::take(&mut self.owner);
+            self.cap = 0;
+            self.out = chain.vec(1);
+            self.qsa = None;
+            if kept == 0 {
+                self.layers.clear();
+                self.raw.clear();
+            }
+            self.layers.truncate(slots);
+            self.raw.truncate(slots);
+            for i in 0..slots {
+                if i < self.layers.len() {
+                    self.layers[i] = chain.resize(&self.layers[i], cap * row);
+                } else {
+                    self.layers.push(chain.vec(cap * row));
+                }
+                if i < self.raw.len() {
+                    self.raw[i] = chain.resize(&self.raw[i], cap * id_dim);
+                } else {
+                    self.raw.push(chain.vec(cap * id_dim));
+                }
+            }
+            self.out = chain.vec(out_len);
+            self.cap = cap;
+            self.owner = owner;
+        }));
+        if grown.is_err() {
+            self.layers.clear();
+            self.raw.clear();
+            self.qsa = None;
+            self.owner = 0;
+            self.cap = 0;
+        }
+        grown.is_ok()
+    }
 }
 
 /// QSA's vectors on a device for runs of up to `rows` rows over a cache of `cap` positions: the indexer's queries (in,
@@ -442,7 +493,7 @@ impl FlashNext {
                 let rank = layers.iter().map(|l| l.attn_hc.rank.max(l.mlp_hc.rank)).max().unwrap_or(0).max(collapse.rank).max(mtp_rank);
                 let devs = chains.iter().map(|c| chain_dev(*c, cfg, rank, 1, 1)).collect();
                 let keys = chains.iter().zip(&attn_of).map(|(c, a)| c.vec(a.len().max(1) * cfg.index_dim)).collect();
-                let kv = chains.iter().map(|c| ChainKv { layers: Vec::new(), raw: Vec::new(), cap: 0, out: c.vec(1), qsa: None, owner: 0 }).collect();
+                let kv = chains.iter().map(|c| ChainKv { layers: Vec::new(), raw: Vec::new(), cap: 0, out: c.vec(1), qsa: None, owner: 0, refused: 0 }).collect();
                 let pool = gdn
                     .iter()
                     .map(|&i| {
@@ -464,5 +515,97 @@ impl FlashNext {
                 Some(FnChain { layers, devs, attn_of, gdn, collapse, rank, keys, ple, few: Default::default(), seg: Default::default(), mtp, m: std::sync::Mutex::new(ChainMut { kv, pool, ple_window, rows_out, undo: None, mtp_kv: None, mtp_hid: (0, 0) }), runs: Default::default() })
             })
             .as_ref()
+    }
+}
+
+
+#[cfg(test)]
+mod grow_tests {
+    use super::ChainKv;
+    use ggml_rs::{DeviceChain, DeviceVec, Tensor};
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::sync::Arc;
+
+    /// A device with room for `room` bytes of vectors and no more: one past that is refused, as the card's adapter
+    /// refuses (a panic).
+    struct Small {
+        held: Arc<AtomicUsize>,
+        room: usize,
+        let_go: AtomicUsize,
+    }
+
+    struct Held(usize, Arc<AtomicUsize>);
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            self.1.fetch_sub(self.0, SeqCst);
+        }
+    }
+
+    impl DeviceChain for Small {
+        fn vec(&self, len: usize) -> DeviceVec {
+            if self.held.load(SeqCst) + len * 4 > self.room {
+                panic!("no room (a test's device)");
+            }
+            self.held.fetch_add(len * 4, SeqCst);
+            DeviceVec { len, inner: Arc::new(Held(len * 4, Arc::clone(&self.held))) }
+        }
+        fn zero(&self, _: &DeviceVec) {}
+        fn alias(&self, _: &DeviceVec, _: Vec<usize>) -> Tensor {
+            unimplemented!()
+        }
+        fn aliased(&self, _: &Tensor) -> Option<DeviceVec> {
+            None
+        }
+        fn upload_at(&self, _: &DeviceVec, _: usize, _: &[f32]) {}
+        fn resize(&self, _: &DeviceVec, len: usize) -> DeviceVec {
+            self.vec(len)
+        }
+        fn let_go_of_spare(&self) {
+            self.let_go.fetch_add(1, SeqCst);
+        }
+        fn holds(&self, _: &ggml_rs::QuantizedTensor) -> bool {
+            false
+        }
+        fn holds_exl3(&self, _: &dyn ggml_rs::exl3::PackedLinear) -> bool {
+            false
+        }
+        fn holds_experts(&self, _: &dyn ggml_rs::exl3::Experts) -> bool {
+            false
+        }
+        fn attention_out_len(&self, n_h: usize, head_dim: usize, _: usize) -> usize {
+            n_h * head_dim
+        }
+        fn attention_rows_out_len(&self, _: usize, _: usize, _: usize, _: usize) -> usize {
+            0
+        }
+        fn begin(&self) -> Box<dyn ggml_rs::ChainRecorder + '_> {
+            unimplemented!()
+        }
+    }
+
+    /// A device's copy of the cache grows to the size asked, or, where the device has no room for that, is left
+    /// nobody's and empty (what was made of it let go) for a smaller one to be made: the run then goes on with that,
+    /// or is the host's. Whichever way it grows, what the device keeps for its next run is let go first.
+    #[test]
+    fn a_copy_the_device_has_no_room_for_is_left_empty_for_a_smaller_one() {
+        let (slots, row, id_dim) = (12usize, 1024usize, 128usize);
+        let bytes = |cap: usize| slots * cap * (row + id_dim) * 4;
+        for kept in [0usize, 1000] {
+            // room for the cache at 16,384 rows and half as much again: not for it at 32,768
+            let chain = Small { held: Default::default(), room: bytes(16_384) * 3 / 2, let_go: 0.into() };
+            let mut g = ChainKv { layers: Vec::new(), raw: Vec::new(), cap: 0, out: chain.vec(1), qsa: None, owner: 0, refused: 0 };
+            assert!(g.grow(&chain, slots, 16_384, 0, row, id_dim, 8));
+            g.owner = 7;
+            assert_eq!((g.cap, g.layers.len(), g.raw.len()), (16_384, slots, slots));
+            assert!(!g.grow(&chain, slots, 32_768, kept, row, id_dim, 8), "kept {kept}: no room for it");
+            assert_eq!((g.cap, g.owner, g.layers.len(), g.raw.len()), (0, 0, 0, 0), "kept {kept}: nobody's, and empty");
+            assert!(chain.held.load(SeqCst) <= 8, "kept {kept}: what was made of it is let go ({} bytes held)", chain.held.load(SeqCst));
+            // (nobody's copy keeps none of its rows: the smaller one is made anew)
+            assert!(g.grow(&chain, slots, 16_384, 0, row, id_dim, 8));
+            assert_eq!((g.cap, g.layers.len()), (16_384, slots));
+            assert!(g.layers.iter().all(|l| l.len == 16_384 * row) && g.raw.iter().all(|r| r.len == 16_384 * id_dim));
+            assert_eq!(chain.let_go.load(SeqCst), 3, "the device's spare let go before each");
+        }
     }
 }

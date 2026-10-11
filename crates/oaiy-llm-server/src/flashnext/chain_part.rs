@@ -62,41 +62,33 @@ impl FlashNext {
         // chunk's when it began)
         for (d, layers) in st.attn_of.iter().enumerate().filter(|_| !resumed) {
             let g = &mut m.kv[d];
-            let from = if g.owner == kv.id { kv.dirty_from.min(past) } else { 0 };
-            if g.cap < past + t {
-                // (room for the rows the cache's user has said are coming, a prompt's: made once, not as they come)
-                let cap = (past + t).max(kv.expect.min(kv.max_len)).next_power_of_two().max(256);
-                // The old vectors go as the new ones come, a layer at a time, and before any new one where none of
-                // their rows is kept (`from`: the rest is written again below): made all at once beside the old ones,
-                // a cache's growth took both caches' memory of a card that holds little more than one (the 27B's did,
-                // llama-rs's `reserve`). And nobody's copy, of no rows, until it is whole again: a device that has no
-                // room for one of these vectors ends the run here, and the next one then makes all of it anew.
-                let owner = std::mem::take(&mut g.owner);
-                g.cap = 0;
-                g.out = chains[d].vec(1);
-                g.qsa = None;
-                if from == 0 {
-                    g.layers.clear();
-                    g.raw.clear();
-                }
-                g.layers.truncate(layers.len());
-                g.raw.truncate(layers.len());
-                for i in 0..layers.len() {
-                    if i < g.layers.len() {
-                        g.layers[i] = chains[d].resize(&g.layers[i], cap * row);
-                    } else {
-                        g.layers.push(chains[d].vec(cap * row));
-                    }
-                    if i < g.raw.len() {
-                        g.raw[i] = chains[d].resize(&g.raw[i], cap * id_dim);
-                    } else {
-                        g.raw.push(chains[d].vec(cap * id_dim));
-                    }
-                }
-                g.out = chains[d].vec(chains[d].attention_out_len(nh, hd, cap));
-                g.cap = cap;
-                g.owner = owner;
+            let kept = |g: &ChainKv| if g.owner == kv.id { kv.dirty_from.min(past) } else { 0 };
+            // Room for this run's rows, and for those the cache's user has said are coming (a prompt's): made at the
+            // prompt's first run, before anything of the prompt is on the device, and not as its rows come. (It was
+            // made when a run first reached past what was there: for a prompt longer than the last, in the middle of
+            // it, beside its chunk's scratch and its experts just taken in, and a 17,619-token prompt after a
+            // 14,974-token one found no room, "Allocation of 512.00 MB failed", where the same prompt alone had it.)
+            // The old vectors go as the new ones come, a layer at a time, and before any new one where none of their
+            // rows is kept: made all at once beside the old ones, a cache's growth took both caches' memory of a card
+            // that holds little more than one (the 27B's did, llama-rs's `reserve`).
+            let least = (past + t).next_power_of_two().max(256);
+            let whole = (past + t).max(kv.expect.min(kv.max_len)).next_power_of_two().max(256);
+            let out_len = |cap: usize| chains[d].attention_out_len(nh, hd, cap);
+            if past == 0 {
+                g.refused = 0;
             }
+            if g.cap < whole && g.refused != whole && !g.grow(chains[d], layers.len(), whole, kept(g), row, id_dim, out_len(whole)) {
+                g.refused = whole;
+                eprintln!("flash-next: the GPU has no room for its attention cache at {whole} rows: what reaches past {} rows is run on the host, slowly", whole / 2);
+            }
+            // (no room for the whole of it, at this run or an earlier one: for this run's rows then, or the run is the
+            // host's, as every run past 16,384 rows was)
+            if g.cap < past + t && (least == g.refused || !g.grow(chains[d], layers.len(), least, kept(g), row, id_dim, out_len(least))) {
+                g.refused = least;
+                return None;
+            }
+            // (a growth the device refused left nobody's copy: every row is written again)
+            let from = kept(g);
             if from < past {
                 for (slot, &l) in layers.iter().enumerate() {
                     let (kh, vh) = (kv.k_buffer(l).to_host(), kv.v_buffer(l).to_host());

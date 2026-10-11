@@ -581,10 +581,7 @@ impl WgpuBackend {
     /// scratch and staging pools), then [`Self::settle`]: the room for another model's work on the same card (a
     /// diffusion step's kept some 10 GB past its weights).
     pub fn release_cached(&self) {
-        self.gpu.chain_groups.lock().unwrap_or_else(|p| p.into_inner()).clear();
-        self.gpu.chain_groups_wide.lock().unwrap_or_else(|p| p.into_inner()).clear();
-        self.gpu.pool.lock().unwrap_or_else(|p| p.into_inner()).clear();
-        self.gpu.staging.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        self.gpu.let_go();
         self.settle();
     }
 

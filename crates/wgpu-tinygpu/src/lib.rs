@@ -507,6 +507,7 @@ impl DeviceInterface for TgDevice {
     fn create_buffer(&self, desc: &wgpu::BufferDescriptor<'_>) -> DispatchBuffer {
         // (a small buffer mapped to read, a read-back's staging: in the computer's memory where the server gives it)
         let host = self.conn.hosts(desc.size.max(4), desc.usage.contains(wgpu::BufferUsages::MAP_READ) && !desc.mapped_at_creation);
+        trace_large(desc.size, desc.label.unwrap_or("?"), true);
         let id = self.conn.alloc(desc.size.max(4), host);
         let mapped = desc.mapped_at_creation.then(|| Mapping { start: 0, data: vec![0; desc.size as usize], write: true });
         let mem = Arc::new(Allocation { conn: Arc::clone(&self.conn), id, size: desc.size, host });
@@ -588,8 +589,22 @@ struct Allocation {
 
 impl Drop for Allocation {
     fn drop(&mut self) {
+        trace_large(self.size, "", false);
         self.conn.release(self.id, self.size.max(4), self.host);
     }
+}
+
+/// TINYGPU_LARGE=MB: each buffer of that many megabytes or more said as it is asked for (with its label) and as it
+/// is let go, and the bytes of such buffers this program then holds: what a card with no room left was full of.
+fn trace_large(size: u64, label: &str, made: bool) {
+    static AT_LEAST: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    static HELD: AtomicU64 = AtomicU64::new(0);
+    let Some(least) = *AT_LEAST.get_or_init(|| std::env::var("TINYGPU_LARGE").ok().and_then(|v| v.parse::<u64>().ok()).map(|mb| mb << 20)) else { return };
+    if size < least {
+        return;
+    }
+    let held = if made { HELD.fetch_add(size, Ordering::Relaxed) + size } else { HELD.fetch_sub(size, Ordering::Relaxed) - size };
+    eprintln!("tinygpu: {} {} MB {label}: {} MB of such held", if made { "asks for" } else { "lets go" }, size >> 20, held >> 20);
 }
 
 #[derive(Debug)]

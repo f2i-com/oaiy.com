@@ -490,13 +490,42 @@ impl Gpu {
         };
         taken.unwrap_or_else(|| {
             SCRATCH_MADE.fetch_add(bytes, Ordering::Relaxed);
-            self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("oaiy-chain-scratch"),
-                size: bytes,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
+            self.with_room(|| {
+                self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("oaiy-chain-scratch"),
+                    size: bytes,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                })
             })
         })
+    }
+
+    /// What is kept for the next run let go: the bind groups made once and kept (each holds its buffers, a cache's
+    /// layers among them, for as long as it is kept: a cache made again larger stayed on the card beside the new one,
+    /// Flash-Next's 768 MB at 16,384 rows), the scratch (up to [`POOL_BYTES`]) and the read-backs' staging. A device
+    /// short of room has it back; what is recorded and not yet run holds its own.
+    pub(crate) fn let_go(&self) {
+        self.chain_groups.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        self.chain_groups_wide.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        self.pool.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        self.staging.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    }
+
+    /// `make`'s buffer; and where the device has no room for it, what the pools keep is let go and it is asked for
+    /// once more. The pool kept 1.5 GiB of a prompt's scratch for the next, of whatever sizes that prompt used, and
+    /// kept it while a buffer of another size was refused: a card with Flash-Next's experts and a 32,768-row cache
+    /// on it had no 512 MB for a second prompt's chunk, with three times that idle. (A device with no room refuses
+    /// by a panic where it is the card's adapter, which is what is caught; wgpu's own report an error later, and
+    /// are as they were.)
+    pub(crate) fn with_room<T>(&self, make: impl Fn() -> T) -> T {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(&make)) {
+            Ok(made) => made,
+            Err(_) => {
+                self.let_go();
+                make()
+            }
+        }
     }
 
     /// A staging buffer of `bytes` (a power of two) for a read-back: one a read before used, or a new one.

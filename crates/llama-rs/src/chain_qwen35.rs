@@ -735,6 +735,8 @@ fn reserve(chain: &dyn DeviceChain, g: &mut Kv, s: &Dims, slots: usize, needed: 
     // again. As it is, the next one makes all of it anew and writes every row.
     let owner = std::mem::take(&mut g.owner);
     g.cap = 0;
+    // (and the scratch the device keeps for its next run: the room it takes is the cache's first)
+    chain.let_go_of_spare();
     // (the halves' vectors are the old layers': made again, and filled, at the next step that reads them)
     g.half.clear();
     g.halved = 0;

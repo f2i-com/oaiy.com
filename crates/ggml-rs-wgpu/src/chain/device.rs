@@ -102,7 +102,12 @@ impl DeviceChain for WgpuBackend {
     }
 
     fn vec(&self, len: usize) -> DeviceVec {
-        DeviceVec { len, inner: Arc::new(vec_buffer(&self.gpu, len)) }
+        DeviceVec { len, inner: Arc::new(self.gpu.with_room(|| vec_buffer(&self.gpu, len))) }
+    }
+
+    fn let_go_of_spare(&self) {
+        // (and the device's work waited for: wgpu's own devices free a dropped buffer at a poll)
+        self.release_cached();
     }
 
     fn vec_f16(&self, values: &[f32]) -> Option<DeviceVec> {
