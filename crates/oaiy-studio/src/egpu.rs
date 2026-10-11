@@ -760,8 +760,9 @@ impl Egpu {
             let at = args.iter().position(|a| a == "--webgpu").ok_or("the launcher's command line has no --webgpu")?;
             args.insert(at, "--paused".into());
         }
+        // (a file, or a folder of weights: an EXL3 checkpoint, which OAIY's engine reads on the card too)
         let file = config::resolve(root, str_or(model(llm, name).unwrap_or(&Json::Null), "path", ""));
-        if !file.is_file() {
+        if !file.exists() {
             return Err(format!("{} is not there", file.display()));
         }
         let env = environment(llm, root, runtime);
