@@ -1213,6 +1213,9 @@ impl Egpu {
             ("error", g.error.as_ref().map_or(Json::Null, Json::str)),
             ("model", g.model.as_ref().map_or(Json::Null, Json::str)),
             ("models", Json::Arr(models(llm).iter().map(Json::str).collect())),
+            // every enabled model is set to it (and it is on): "the language model" is then its server's, for the
+            // page's own card of that name
+            ("holds_all", Json::Bool(!crate::llm::holds_a_model(llm))),
             ("device", Json::str(match str_or(egpu, "device", "NV").trim() { "" => "NV", d => d })),
             ("context_tokens", Json::Int(context(llm))),
             ("busy", Json::Int(g.busy as i64)),

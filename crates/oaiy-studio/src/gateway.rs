@@ -1884,6 +1884,53 @@ open(log, "a").write("ended\n")
         String::from_utf8_lossy(&body).into_owned()
     }
 
+    /// With every enabled model set to the eGPU, the page's "Language model" card is the card's server's: its Stop
+    /// unloads the model from the card, and its Start and Restart bring it back there. This computer's engine, which
+    /// would load the same model a second time, is never started by them.
+    #[cfg(unix)]
+    #[test]
+    fn with_every_model_on_the_egpu_the_language_models_buttons_are_its_servers() {
+        let dir = fake_dir("buttons");
+        let Some(first) = fake_card(&dir) else { return };
+        let mut cfg = first.config();
+        if let Some(Json::Arr(models)) = crate::registry::obj_mut(&mut cfg, &["llm", "models"]) {
+            models.retain(|m| str_or(m, "name", "") == "x");
+        }
+        crate::util::set(crate::registry::obj_mut(&mut cfg, &["llm"]).unwrap(), "default_model", Json::str("x"));
+        let studio = Arc::new(Studio::for_test(&dir, cfg));
+        let cfg = studio.config();
+        let llm = cfg.get("llm").unwrap();
+        assert!(!crate::llm::holds_a_model(llm));
+        assert_eq!(studio.egpu.status(llm).get("holds_all"), Some(&Json::Bool(true)));
+        let here = || studio.llm.status().get("state").and_then(Json::as_str).unwrap_or("").to_string();
+        let there = || studio.egpu.status(llm).get("state").and_then(Json::as_str).unwrap_or("").to_string();
+
+        let ask_x = r#"{"model": "x", "messages": [{"role": "user", "content": "hi"}]}"#;
+        let (status, _, body) = chat(&studio, ask_x);
+        assert!(status == 200 && body.contains("from the card"), "{status} {body}\n{}", studio.egpu.log.tail(40));
+        assert_eq!((here().as_str(), there().as_str(), starts(&studio)), ("stopped", "ready", 1));
+
+        // Stop: the model is the card's, and it is the card's server that stops.
+        crate::admin::llm_stop(&studio, &cfg);
+        until("the launcher to go", || studio.egpu.log.tail(400).contains("studio: tinygrad's server stopped"));
+        assert_eq!((here().as_str(), there().as_str()), ("stopped", "stopped"));
+
+        // Start: on the card again, and nothing on this computer.
+        crate::admin::llm_start(&studio, &cfg).unwrap_or_else(|e| panic!("{e}\n{}", studio.egpu.log.tail(40)));
+        until("the card's server again", || there() == "ready");
+        assert_eq!((here().as_str(), starts(&studio)), ("stopped", 2));
+        let (status, _, body) = chat(&studio, ask_x);
+        assert!(status == 200 && body.contains("from the card"), "{status} {body}");
+
+        // Restart: stopped and started there.
+        crate::admin::llm_stop(&studio, &cfg);
+        crate::admin::llm_start(&studio, &cfg).unwrap();
+        until("the card's server a third time", || there() == "ready" && starts(&studio) == 3);
+        assert_eq!(here(), "stopped");
+        studio.egpu.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_picture_borrows_the_card_its_engine_pauses_and_comes_back_after() {

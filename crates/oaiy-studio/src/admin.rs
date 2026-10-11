@@ -141,14 +141,16 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
             };
             Ok(Json::obj([("lines", ring.since(after))]))
         }
-        ("POST", "/api/llm/start") => studio.llm.start(&cfg, &studio.root).map(|_| studio.llm.status()).map_err(|e| (400, e)),
+        // The page's "Language model" card: this computer's engine's, and the card's where every model is the card's
+        // ([`llm_start`]).
+        ("POST", "/api/llm/start") => llm_start(studio, &cfg).map(|_| studio.llm.status()).map_err(|e| (400, e)),
         ("POST", "/api/llm/stop") => {
-            studio.llm.stop();
+            llm_stop(studio, &cfg);
             Ok(studio.llm.status())
         }
         ("POST", "/api/llm/restart") => {
-            studio.llm.stop();
-            studio.llm.start(&cfg, &studio.root).map(|_| studio.llm.status()).map_err(|e| (400, e))
+            llm_stop(studio, &cfg);
+            llm_start(studio, &cfg).map(|_| studio.llm.status()).map_err(|e| (400, e))
         }
         // tinygrad's server on a Mac's eGPU: what the Pythons here have, and its start (with the model named, else
         // the first set to it) and stop by hand. It starts by itself on the first request for a model of its own.
@@ -156,13 +158,7 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
         ("POST", "/api/egpu/start") => {
             let llm = cfg.get("llm").cloned().unwrap_or(Json::Null);
             let asked = body(req).ok().and_then(|b| b.get("model").and_then(Json::as_str).map(str::to_owned));
-            // (none named: the one it held, was loading or failed to load, else the first set to it. A server that
-            // has the model is left as it is, and one answering with another is not cut off: `start` says so)
-            let again = studio.egpu.held().filter(|m| crate::egpu::assigned(&llm, m));
-            match asked.or(again).or_else(|| crate::egpu::models(&llm).into_iter().next()) {
-                Some(name) => studio.egpu.start(&cfg, &studio.root, &name).map(|_| studio.egpu.status(&llm)).map_err(|e| (400, e)),
-                None => Err((400, "no model is set to run on the eGPU (Models), or it is switched off (Settings)".into())),
-            }
+            egpu_start(studio, &cfg, asked).map(|_| studio.egpu.status(&llm)).map_err(|e| (400, e))
         }
         ("POST", "/api/egpu/stop") => {
             studio.egpu.stop();
@@ -328,6 +324,46 @@ fn remove_model(cfg: &mut Json, section: &str, name: &str) -> Result<(), String>
         _ => return Err("section must be llm, image, video, speech, music, sound or model3d".into()),
     }
     Ok(())
+}
+
+/// The eGPU's server started by hand with `asked`, else the model it held (was loading, or failed to load), else the
+/// first set to it. A server that has the model is left as it is, and one answering with another is not cut off:
+/// `start` says so.
+fn egpu_start(studio: &Arc<Studio>, cfg: &Json, asked: Option<String>) -> Result<(), String> {
+    let llm = cfg.get("llm").cloned().unwrap_or(Json::Null);
+    let again = studio.egpu.held().filter(|m| crate::egpu::assigned(&llm, m));
+    match asked.or(again).or_else(|| crate::egpu::models(&llm).into_iter().next()) {
+        Some(name) => studio.egpu.start(cfg, &studio.root, &name),
+        None => Err("no model is set to run on the eGPU (Models), or it is switched off (Settings)".into()),
+    }
+}
+
+/// Whether "the language model" is the eGPU's to hold: every enabled model is set to run there, and it is switched on
+/// ([`crate::llm::holds_a_model`] says this computer's engine then holds none).
+fn all_on_the_egpu(cfg: &Json) -> bool {
+    cfg.get("llm").is_some_and(|llm| !crate::llm::holds_a_model(llm))
+}
+
+/// The page's "Language model" card's Start. This computer's engine's, unless every enabled model is set to run on
+/// the eGPU: then the card's server's, with the default where it is the card's (else the one it held, else its
+/// first). Not that model here as well: the card showed "Stopped" over a model loaded on the eGPU, and its Start
+/// loaded the 27B a second time, on a 24 GB Mac's own GPU, beside the card's copy.
+pub(crate) fn llm_start(studio: &Arc<Studio>, cfg: &Json) -> Result<(), String> {
+    if !all_on_the_egpu(cfg) {
+        return studio.llm.start(cfg, &studio.root);
+    }
+    let llm = cfg.get("llm").cloned().unwrap_or(Json::Null);
+    let default = Some(str_or(&llm, "default_model", "").to_string()).filter(|m| crate::egpu::assigned(&llm, m));
+    egpu_start(studio, cfg, default)
+}
+
+/// The card's Stop: this computer's engine stopped, and where every enabled model is set to run on the eGPU, the
+/// card's server too, which is where the model then is: a Stop that left it loaded there stopped nothing.
+pub(crate) fn llm_stop(studio: &Arc<Studio>, cfg: &Json) {
+    studio.llm.stop();
+    if all_on_the_egpu(cfg) {
+        studio.egpu.stop();
+    }
 }
 
 #[cfg(test)]
