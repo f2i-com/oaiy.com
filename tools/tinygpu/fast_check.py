@@ -55,17 +55,27 @@ def main(launches: int):
   card = ws.Card.__new__(ws.Card)
   card.fast, card.check = fast, True
   signal = types.SimpleNamespace(value_addr=0x7f3300000000 + 0x40)
-  done, queues = 0, 0
+  done, queues, again = 0, 0, 0
+  # launches made before, some of them launched again from what was made (the server keeps a step's, by its request)
+  kept: list = []
   while done < launches:
     q, card.ref, fast.last = nv.NVComputeQueue(), nv.NVComputeQueue(), None
     for _ in range(rng.randint(1, 40)):
-      prog = rng.choice(progs)
-      n = len(prog.prg.signature)
-      ptrs = [0x7f0000000000 + rng.getrandbits(32) * 16 for _ in range(n)]
-      grid = (rng.randint(1, 65535), rng.choice([1, rng.randint(1, 1024)]), rng.choice([1, 1, rng.randint(1, 64)]))
-      vals = tuple(rng.getrandbits(32) for _ in range(n))
       before = fast.last
-      off = fast.launch(q, prog, ptrs, grid, vals)
+      if kept and rng.random() < 0.4:
+        prog, ptrs, grid, vals, made = rng.choice(kept)
+        off = fast.launch_blob(q, made)
+        again += 1
+      else:
+        prog = rng.choice(progs)
+        n = len(prog.prg.signature)
+        ptrs = [0x7f0000000000 + rng.getrandbits(32) * 16 for _ in range(n)]
+        grid = (rng.randint(1, 65535), rng.choice([1, rng.randint(1, 1024)]), rng.choice([1, 1, rng.randint(1, 64)]))
+        vals = tuple(rng.getrandbits(32) for _ in range(n))
+        made = fast.template(prog, ptrs, grid, vals)
+        off = fast.launch_blob(q, made)
+        kept.append((prog, ptrs, grid, vals, made))
+        if len(kept) > 200: kept.pop(rng.randrange(len(kept)))
       card.compare(prog, ptrs, grid, vals, off, before)
       done += 1
     # the queue's end: its last QMD released, as each side's queue writes it
@@ -85,7 +95,7 @@ def main(launches: int):
     differ = [i for i, (x, y) in enumerate(zip(q._q, card.ref._q)) if x != y]
     assert len(differ) <= 1, f"words {differ} differ"
     queues += 1
-  print(f"fast launches: {done} in {queues} queues, each the same bytes as tinygrad's")
+  print(f"fast launches: {done} in {queues} queues ({again} of them made before and launched again), each the same bytes as tinygrad's")
 
 
 if __name__ == "__main__":

@@ -352,6 +352,8 @@ pub(super) fn build(path: &Path, backends: Vec<Arc<dyn Backend>>, cudas: Vec<Arc
         Some(_) => (0..idx.shard_count()).map(|i| File::open(idx.shard_path(i)).map(Arc::new)).collect::<std::io::Result<_>>()?,
         None => Vec::new(),
     };
+    // (the records' reads timed together, every layer's: whether the drive is quick enough to read ahead from)
+    let reads_timed: Arc<[std::sync::atomic::AtomicU64; 3]> = Arc::new(Default::default());
     let on = |d: usize| Loader { idx: &idx, backend: backends[d].clone(), card: cudas.get(d).cloned(), lora, packed: packed(d) };
     let p = "model.language_model";
     let h = cfg.hidden;
@@ -429,7 +431,7 @@ pub(super) fn build(path: &Path, backends: Vec<Arc<dyn Backend>>, cudas: Vec<Arc
             // the routed experts where their records lie, the shared one read
             Some(make) => {
                 let (layout, at) = expert_records(&idx, &m, &cfg)?;
-                let source = ggml_rs_wgpu::exl3::FileRecords::new(shards.clone(), at, layout.bytes).map_err(bad)?;
+                let source = ggml_rs_wgpu::exl3::FileRecords::new(shards.clone(), at, layout.bytes, Arc::clone(&reads_timed)).map_err(bad)?;
                 make(device, &m, layout, Arc::new(source), read(&names[cfg.experts])?)?
             }
             None => {

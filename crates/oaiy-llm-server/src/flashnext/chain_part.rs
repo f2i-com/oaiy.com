@@ -662,10 +662,10 @@ impl FlashNext {
                 // most of the experts it will route to (those it does not hold read ahead from the drive meanwhile)
                 rec.read(&dv.router);
                 rec.read_range(&dv.y2_in, 0, t * h);
-                // (OAIY_FN_READ_AHEAD=1: read ahead; off, it read about three records for each one used from a USB
-                // drive whose reads were what the steps waited on)
+                // (OAIY_FN_READ_AHEAD=0: none read ahead, and the next layer's router not run for it; else the experts
+                // read ahead where their drive is quick, about three records for each one used)
                 static AHEAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                let ahead = *AHEAD.get_or_init(|| std::env::var_os("OAIY_FN_READ_AHEAD").is_some_and(|v| v == "1"));
+                let ahead = *AHEAD.get_or_init(|| std::env::var_os("OAIY_FN_READ_AHEAD").is_none_or(|v| v != "0"));
                 let next = (ahead && i + 1 < cfg.layers && self.layers[i + 1].device == d && self.layers[i + 1].moe.experts.host_rest()).then(|| &st.layers[i + 1]);
                 if let Some(nl) = next {
                     nl.router.mul(&mut *rec, cfg.experts + 1, h, &dv.y2_in, &dv.router_next, t);

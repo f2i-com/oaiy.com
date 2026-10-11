@@ -224,11 +224,12 @@ class Fast:
     hi, lo = fields[name]
     return lo // 8, hi // 8 + 1, ((1 << (hi - lo + 1)) - 1) << (lo % 8), lo % 8, hi - lo + 1
 
-  def put(self, at: int, spec, value: int):
+  def put(self, at: int, spec, value: int, into=None):
     b0, b1, mask, shift, width = spec
     if value >> width: raise ValueError(f"{value:#x} does not fit {width} bits")
-    num = int.from_bytes(self.ring[at + b0:at + b1], "little")
-    self.ring[at + b0:at + b1] = ((num & ~mask) | ((value << shift) & mask)).to_bytes(b1 - b0, "little")
+    buf = self.ring if into is None else into
+    num = int.from_bytes(buf[at + b0:at + b1], "little")
+    buf[at + b0:at + b1] = ((num & ~mask) | ((value << shift) & mask)).to_bytes(b1 - b0, "little")
 
   def program(self, prog):
     """What a launch of `prog` writes that is the same each time: its constant bank's words and its QMD (its
@@ -245,21 +246,37 @@ class Fast:
     prog.fast = (struct.pack(f"<{len(words)}I", *words), len(words) * 4, qmd_at, bytes(qmd), size)
     return prog.fast
 
+  def template(self, prog, ptrs: list, grid: tuple, vals: tuple):
+    """A launch of `prog` over `grid` with these pointers and values, as the bytes of its slot (its arguments, then its
+    QMD), all but where the slot is: the same bytes each time the same launch is made, which a model's step makes of
+    most of its kernels, token after token. The upper word of the slot's address is the ring's (a slot past a 4 GiB
+    line has its own written as it is launched)."""
+    prefix, plen, qmd_at, qmd, size = getattr(prog, "fast", None) or self.program(prog)
+    blob = bytearray(qmd_at + len(qmd))
+    blob[0:plen] = prefix
+    struct.pack_into("<3I", blob, 12, *grid)
+    struct.pack_into(f"<{len(ptrs)}Q{len(vals)}I", blob, plen, *ptrs, *vals)
+    blob[qmd_at:qmd_at + len(qmd)] = qmd
+    struct.pack_into("<3I", blob, qmd_at + self.grid_at, *grid)
+    self.put(qmd_at, self.cbuf_hi, self.gpu_va >> 32, into=blob)
+    return (bytes(blob), qmd_at, size, self.gpu_va >> 32)
+
   def launch(self, q, prog, ptrs: list, grid: tuple, vals: tuple):
     """`prog` over `grid`, its pointers and values, added to queue `q` (its last QMD pointed at this one)."""
-    prefix, plen, qmd_at, qmd, size = getattr(prog, "fast", None) or self.program(prog)
+    return self.launch_blob(q, self.template(prog, ptrs, grid, vals))
+
+  def launch_blob(self, q, made):
+    """A launch [`template`] made, added to queue `q`: its bytes copied into a slot, the slot's address written into
+    its QMD, and the queue's last QMD pointed at it."""
+    blob, qmd_at, size, upper = made
     off = self.dev.kernargs_offset_allocator.alloc(size, 256)
     ring, va = self.ring, self.gpu_va + off
     if self.mirror is not None:
       if self.spans and 0 <= off - self.spans[-1][1] < 256: self.spans[-1][1] = off + size
       else: self.spans.append([off, off + size])
-    ring[off:off + plen] = prefix
-    struct.pack_into("<3I", ring, off + 12, *grid)
-    struct.pack_into(f"<{len(ptrs)}Q{len(vals)}I", ring, off + plen, *ptrs, *vals)
+    ring[off:off + len(blob)] = blob
     qo = off + qmd_at
-    ring[qo:qo + len(qmd)] = qmd
-    struct.pack_into("<3I", ring, qo + self.grid_at, *grid)
-    self.put(qo, self.cbuf_hi, va >> 32)
+    if va >> 32 != upper: self.put(qo, self.cbuf_hi, va >> 32)
     if self.cbuf_lo_word is not None: struct.pack_into("<I", ring, qo + self.cbuf_lo_word, va & 0xffffffff)
     else: self.put(qo, self.cbuf_lo, va & 0xffffffff)
     if self.last is None:
@@ -329,6 +346,8 @@ class Card:
     # NVCCRenderer) starts nothing
     DEV.value = [dataclasses.replace(t, renderer="CC") if t.device == "NV" and not t.renderer else t for t in DEV.value]
     self.dev, self.spec = Device["NV"], BufferSpec()
+    # (a buffer in the computer's memory, mapped for the card: where tinygrad's interface gives one a view of it here)
+    self.host_spec = BufferSpec(host=True)
     self.arch = self.dev.arch
     self.reserve_firmware_memory()
     self.local_memory()
@@ -483,13 +502,15 @@ class Card:
       self.stamps.pop()   # (a queue with nothing in it is not submitted: its start is never written)
     self.q, self.queued = None, 0
 
-  def launch_fast(self, prog: Program, ptrs: list, grid, vals):
-    """`prog` launched by Fast: as launch(), its arguments as addresses."""
+  def launch_fast(self, prog: Program, ptrs: list, grid, vals, made=None):
+    """`prog` launched by Fast: as launch(), its arguments as addresses. `made`: the launch as Fast.template made it
+    before (the same program, addresses, grid and values); what was made is the answer, for the next time."""
     inside = self.q is not None
     if self.since_sync >= self.ARGS_RING: self.sync()
     self.begin()
     before = self.fast.last
-    off = self.fast.launch(self.q, prog, ptrs, grid, vals)
+    if made is None: made = self.fast.template(prog, ptrs, grid, vals)
+    off = self.fast.launch_blob(self.q, made)
     # (a dispatch's values are its bindings' sizes: the first's bytes, a matmul's weights, counted for its GB/s)
     if self.PROFILE: self.stamp(prog, grid, vals[0] if vals and len(ptrs) == len(vals) else 0)
     if self.check and self.ref is not None:
@@ -509,6 +530,7 @@ class Card:
     elif self.queued >= self.BATCH:
       self.end()
       self.begin()
+    return made
 
   def compare(self, prog, ptrs, grid, vals, off, before):
     """TINYGPU_FAST_CHECK: the launch written by tinygrad as well, into a queue never submitted, and the two compared:
@@ -606,18 +628,45 @@ class Card:
     b, whole = buf
     return b if offset == 0 and size == whole else b.offset(offset, size)
 
-  def alloc(self, size: int):
+  def alloc(self, size: int, host: bool = False):
+    if host:
+      # (the computer's memory: zeros as the system gives it, and cleared here where tinygrad kept it from a buffer
+      # let go; its bytes are read and written here, once the card has done what it was given before)
+      b = self.dev.allocator.alloc(size, self.host_spec)
+      if getattr(b, "view", None) is None:
+        self.dev.allocator.free(b, size, self.host_spec)
+        raise RuntimeError("the card's interface gives no view of a buffer in the computer's memory")
+      self.dev.synchronize()
+      b.cpu_view().mv[:size] = bytes(size)
+      return (b, size)
     buf = (self.dev.allocator.alloc(size, self.spec), size)
     self.clear(buf, 0, size)
     return buf
 
+  @staticmethod
+  def hosted(buf) -> bool:
+    """Whether `buf` is in the computer's memory (alloc's `host`): it has a view here, where a buffer on the card has
+    none (the card's memory is reached through its copies)."""
+    return getattr(buf[0], "view", None) is not None
+
   def free(self, buf):
-    self.dev.allocator.free(buf[0], buf[1], self.spec)
+    self.dev.allocator.free(buf[0], buf[1], self.host_spec if self.hosted(buf) else self.spec)
 
   def write(self, buf, off: int, data: memoryview):
+    if self.hosted(buf):
+      self.dev.synchronize()
+      buf[0].cpu_view().mv[off:off + len(data)] = data
+      self.since_sync = 0
+      return
     self.dev.allocator._copyin(self.view(buf, off, len(data)), data)
 
   def read(self, buf, off: int, size: int) -> bytes:
+    if self.hosted(buf):
+      # (the card wrote it across the link as its kernels ran: no copy by the card, and no second wait for one)
+      self.dev.synchronize()
+      self.since_sync = 0
+      if self.stamps: self.settle()
+      return bytes(buf[0].cpu_view().mv[off:off + size])
     out = memoryview(bytearray(size))
     self.dev.allocator._copyout(out, self.view(buf, off, size))
     self.since_sync = 0
@@ -629,12 +678,21 @@ class Card:
     return Program(self.dev, compile_cuda(src, self.arch), "oaiy_main", workgroup, sizes, scratch)
 
   def dispatch(self, prog: Program, bufs: list, grid: tuple, sizes: list):
+    """`prog` over `grid` on `bufs`. With Fast, the answer is the launch as it was made (`again` launches it once
+    more: the same program, buffers, grid and sizes)."""
     if self.fast:
       ptrs = [b[0].va_addr + off for b, off in bufs]
       if prog.scratch: ptrs.append(self.scratch[0].va_addr)
-      return self.launch_fast(prog, ptrs, grid, tuple(sizes))
+      vals = tuple(sizes)
+      return (prog, ptrs, grid, vals, self.launch_fast(prog, ptrs, grid, vals))
     views = [self.view(b, off, b[1] - off) for b, off in bufs] + ([self.scratch[0]] if prog.scratch else [])
     self.launch(prog, views, grid, sizes)
+    return None
+
+  def again(self, kept):
+    """A dispatch made before ([`dispatch`]'s answer), launched once more."""
+    prog, ptrs, grid, vals, made = kept
+    self.launch_fast(prog, ptrs, grid, vals, made)
 
   def copy(self, src, soff: int, dst, doff: int, size: int):
     words = (soff | doff | size) % 4 == 0
@@ -777,6 +835,11 @@ class Server:
     self.programs: dict = {}
     self.next_id = 1
     self.dispatched = 0   # (the last submission's dispatches, for TINYGPU_STATS)
+    # A dispatch made before, by its request's bytes (its program, grid and bindings): a model's step asks for the same
+    # ones token after token, and reading a request (its bindings checked against their buffers) and writing its
+    # launch were most of a dispatch's 5 us here. Emptied when a buffer is let go (its number is never given again, but
+    # a kept launch must not outlive what it points at). TINYGPU_NO_KEPT=1: none kept.
+    self.kept = None if os.environ.get("TINYGPU_NO_KEPT") == "1" else {}
     if hasattr(card, "free_memory"): stats_memory[0] = card.free_memory
 
   def new_id(self) -> int:
@@ -784,12 +847,17 @@ class Server:
     return self.next_id - 1
 
   def hello(self, _p):
-    return json.dumps({**self.card.info(), "protocol": PROTOCOL}).encode()
+    # (host_buffers: an ALLOC may ask for the computer's memory, see alloc; a client that does not know of it asks for none)
+    return json.dumps({**self.card.info(), "protocol": PROTOCOL, "host_buffers": int(hasattr(self.card, "host_spec"))}).encode()
 
   def alloc(self, p):
     (size,) = struct.unpack_from("<Q", p)
+    # (a second word, where the client sends one: bit 0 asks for the computer's memory, which the card reads and writes
+    # across the link and a READ takes with no copy by the card: a small buffer a program reads back often)
+    host = len(p) >= 16 and bool(struct.unpack_from("<Q", p, 8)[0] & 1) and hasattr(self.card, "host_spec")
     h = self.new_id()
-    self.buffers[h] = self.card.alloc(max(ALIGN, (size + ALIGN - 1) // ALIGN * ALIGN))
+    size = max(ALIGN, (size + ALIGN - 1) // ALIGN * ALIGN)
+    self.buffers[h] = self.card.alloc(size, host=True) if host else self.card.alloc(size)
     if self.trace:
       b = self.buffers[h][0]
       va = getattr(b, "va_addr", b) if not isinstance(b, int) else b
@@ -801,6 +869,7 @@ class Server:
     b = self.buffers.pop(h, None)
     if b is not None:
       if self.trace: self.trace.write(f"free {h}\n")
+      if self.kept: self.kept.clear()
       self.card.free(b)
     return b""
 
@@ -843,13 +912,26 @@ class Server:
       op = p[at]; at += 1
       if op == 1:
         self.dispatched += 1
+        kept = self.kept
+        if kept is not None:
+          # (the request's bytes: 24 of its program and grid, then 24 a binding)
+          key = bytes(p[at:at + 24 + 24 * (p[at + 20] | p[at + 21] << 8 | p[at + 22] << 16 | p[at + 23] << 24)])
+          again = kept.get(key)
+          if again is not None:
+            at += len(key)
+            self.card.again(again)
+            continue
         prog, gx, gy, gz, n = struct.unpack_from("<QIIII", p, at); at += 24
         bufs, sizes = [], []
         for _ in range(n):
           b, off, size = struct.unpack_from("<QQQ", p, at); at += 24
           bufs.append((self.within(b, off, size, "a binding"), off))
           sizes.append(min(size, 0xffffffff))
-        if gx and gy and gz: self.card.dispatch(self.programs[prog], bufs, (gx, gy, gz), sizes)
+        if gx and gy and gz:
+          made = self.card.dispatch(self.programs[prog], bufs, (gx, gy, gz), sizes)
+          if kept is not None and made is not None:
+            if len(kept) >= 50000: kept.clear()
+            kept[key] = made
       elif op == 2:
         s, so, d, do, size = struct.unpack_from("<QQQQQ", p, at); at += 40
         if size: self.card.copy(self.within(s, so, size, "a copy's source"), so, self.within(d, do, size, "a copy's destination"), do, size)

@@ -67,6 +67,12 @@ pub trait ExpertSource: Send + Sync + std::fmt::Debug {
     fn bytes_read(&self) -> u64 {
         0
     }
+    /// Whether records come quickly enough to read some ahead that may not be used (three were read for each one
+    /// used: on a USB drive at 1 GB/s those reads were what the steps waited on, on a computer's own SSD they hide
+    /// most of a miss's read). Not unless the source says so.
+    fn quick(&self) -> bool {
+        false
+    }
 }
 
 /// Records in files: expert `e`'s `bytes` at `at[e]` (a file of `files`, and an offset), read through the page cache
@@ -77,16 +83,25 @@ pub struct FileRecords {
     at: Vec<(u32, u64)>,
     bytes: usize,
     read: AtomicU64,
+    /// Of every file of the checkpoint (one drive's): the reads that ran alone so far, their time's moving mean in
+    /// nanoseconds, and the reads running now.
+    timed: Arc<[AtomicU64; 3]>,
 }
 
 impl FileRecords {
-    pub fn new(files: Vec<Arc<std::fs::File>>, at: Vec<(u32, u64)>, bytes: usize) -> Result<Self, String> {
+    /// `timed`: the reads' count and time, shared by a checkpoint's layers (one drive's).
+    pub fn new(files: Vec<Arc<std::fs::File>>, at: Vec<(u32, u64)>, bytes: usize, timed: Arc<[AtomicU64; 3]>) -> Result<Self, String> {
         if at.iter().any(|&(f, _)| f as usize >= files.len()) {
             return Err("an expert's record is in a file not given".into());
         }
-        Ok(Self { files, at, bytes, read: AtomicU64::new(0) })
+        Ok(Self { files, at, bytes, read: AtomicU64::new(0), timed })
     }
 }
+
+/// The time of a record's read below which a drive is quick ([`ExpertSource::quick`]): a moving mean over the reads
+/// that ran alone (a prompt's run fifteen at a time, each the slower for the others), the page cache's among them (a
+/// USB SSD at 1 GB/s reads a record in 2 ms, a computer's own in 0.3 to 0.6).
+const QUICK_READ_NS: u64 = 700_000;
 
 impl ExpertSource for FileRecords {
     fn experts(&self) -> usize {
@@ -96,13 +111,27 @@ impl ExpertSource for FileRecords {
     fn read(&self, e: usize, into: &mut Vec<u8>) -> std::io::Result<()> {
         let (f, offset) = self.at[e];
         into.resize(self.bytes, 0);
-        read_exact_at(&self.files[f as usize], into, offset)?;
+        let alone = self.timed[2].fetch_add(1, Ordering::Relaxed) == 0;
+        let t = std::time::Instant::now();
+        let read = read_exact_at(&self.files[f as usize], into, offset);
+        let alone = self.timed[2].fetch_sub(1, Ordering::Relaxed) == 1 && alone;
+        read?;
+        if alone {
+            // (a mean over some 64 reads; the first is its own)
+            let (ns, n) = (t.elapsed().as_nanos() as u64, self.timed[0].fetch_add(1, Ordering::Relaxed));
+            let mean = self.timed[1].load(Ordering::Relaxed);
+            self.timed[1].store(if n == 0 { ns } else { mean - mean / 64 + ns / 64 }, Ordering::Relaxed);
+        }
         self.read.fetch_add(self.bytes as u64, Ordering::Relaxed);
         Ok(())
     }
 
     fn bytes_read(&self) -> u64 {
         self.read.load(Ordering::Relaxed)
+    }
+
+    fn quick(&self) -> bool {
+        self.timed[0].load(Ordering::Relaxed) >= 64 && self.timed[1].load(Ordering::Relaxed) < QUICK_READ_NS
     }
 }
 
@@ -387,6 +416,11 @@ impl Exl3MoeTiered {
     /// to). What was read ahead and not yet used is let go.
     fn read_ahead(&self, logits: &Tensor, top_k: usize) {
         let Some(tier) = &self.tier else { return };
+        // (OAIY_FN_READ_AHEAD: 1 always, 0 never; else where the drive is quick)
+        static ASKED: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+        if !ASKED.get_or_init(|| std::env::var("OAIY_FN_READ_AHEAD").ok().map(|v| v == "1")).unwrap_or_else(|| self.source.quick()) {
+            return;
+        }
         let logits = logits.to_host();
         let width = self.routed + 1;
         let rows = logits.numel() / width;

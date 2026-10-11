@@ -42,7 +42,15 @@ const PROTOCOL: u32 = 3;
 struct Conn {
     stream: Mutex<Link>,
     pool: Mutex<Pool>,
+    /// Whether the server gives buffers in the computer's memory where asked (its HELLO's `host_buffers`): a small
+    /// buffer a program maps to read is one, so a read of it is no copy by the card ([`HOST_LARGEST`]).
+    host_buffers: std::sync::atomic::AtomicBool,
 }
+
+/// The largest buffer asked for in the computer's memory: a step's read-backs (a layer's routing and input, a
+/// model's logits' picks) are a few kilobytes, read a round trip each, where a prompt chunk's megabytes go as fast
+/// by the card's own copy. TINYGPU_NO_HOST_BUFFERS=1 asks for none.
+const HOST_LARGEST: u64 = 256 << 10;
 
 /// The socket, and how many requests sent on it have answers not read yet: a write, a submission and a buffer let go
 /// are answered with nothing (or an error), so the next request is sent without waiting for them, and their answers
@@ -66,7 +74,8 @@ const UNREAD_AT_MOST: usize = 4096;
 /// [`POOL_LARGEST`] or less; TINYGPU_NO_POOL=1 keeps none.
 #[derive(Debug, Default)]
 struct Pool {
-    free: std::collections::HashMap<u64, Vec<u64>>,
+    /// (by size, and whether in the computer's memory)
+    free: std::collections::HashMap<(u64, bool), Vec<u64>>,
     bytes: u64,
     /// Buffers taken from it, to be cleared (id, size) before the next request.
     clears: Vec<(u64, u64)>,
@@ -79,29 +88,41 @@ const POOL_LARGEST: u64 = 64 << 20;
 impl Conn {
     fn new(stream: UnixStream) -> Conn {
         let off = std::env::var("TINYGPU_NO_POOL").is_ok_and(|v| v == "1");
-        Conn { stream: Mutex::new(Link { stream, unread: 0 }), pool: Mutex::new(Pool { off, ..Pool::default() }) }
+        Conn { stream: Mutex::new(Link { stream, unread: 0 }), pool: Mutex::new(Pool { off, ..Pool::default() }), host_buffers: std::sync::atomic::AtomicBool::new(false) }
     }
 
-    /// A buffer of `size` bytes: one the pool has (to be cleared), else a new one from the server.
-    fn alloc(&self, size: u64) -> u64 {
+    /// Whether a buffer of `size` bytes that a program maps to read (`read`) is asked for in the computer's memory.
+    fn hosts(&self, size: u64, read: bool) -> bool {
+        read && size <= HOST_LARGEST && self.host_buffers.load(Ordering::Relaxed)
+    }
+
+    /// A buffer of `size` bytes (`host`: in the computer's memory): one the pool has (to be cleared), else a new one
+    /// from the server.
+    fn alloc(&self, size: u64, host: bool) -> u64 {
         {
             let mut pool = self.pool.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(id) = pool.free.get_mut(&size).and_then(Vec::pop) {
+            if let Some(id) = pool.free.get_mut(&(size, host)).and_then(Vec::pop) {
                 pool.bytes -= size;
                 pool.clears.push((id, size));
                 return id;
             }
         }
+        if host {
+            let mut p = [0u8; 16];
+            p[..8].copy_from_slice(&size.to_le_bytes());
+            p[8] = 1;
+            return u64_of(&self.must(ALLOC, &p));
+        }
         u64_of(&self.must(ALLOC, &size.to_le_bytes()))
     }
 
     /// Buffer `id` (of `size` bytes) let go: into the pool where it has room, else freed on the server.
-    fn release(&self, id: u64, size: u64) {
+    fn release(&self, id: u64, size: u64, host: bool) {
         {
             let mut pool = self.pool.lock().unwrap_or_else(|p| p.into_inner());
             if !pool.off && size <= POOL_LARGEST && pool.bytes + size <= POOL_BYTES {
                 pool.bytes += size;
-                pool.free.entry(size).or_default().push(id);
+                pool.free.entry((size, host)).or_default().push(id);
                 return;
             }
         }
@@ -239,6 +260,9 @@ pub fn adapter(socket: &Path) -> Result<wgpu::Adapter, String> {
     let protocol = field("protocol").and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
     if protocol != PROTOCOL {
         return Err(format!("tinygpu: the server at {} speaks version {protocol} of its requests, this program {PROTOCOL}: run the webgpu_server.py of this program's version", socket.display()));
+    }
+    if field("host_buffers").as_deref() == Some("1") && std::env::var("TINYGPU_NO_HOST_BUFFERS").map_or(true, |v| v != "1") {
+        conn.host_buffers.store(true, Ordering::Relaxed);
     }
     let arch = field("arch").unwrap_or_default();
     let memory = field("memory").and_then(|m| m.parse().ok()).unwrap_or(24u64 << 30);
@@ -478,9 +502,11 @@ impl DeviceInterface for TgDevice {
         unsupported("pipeline caches")
     }
     fn create_buffer(&self, desc: &wgpu::BufferDescriptor<'_>) -> DispatchBuffer {
-        let id = self.conn.alloc(desc.size.max(4));
+        // (a small buffer mapped to read, a read-back's staging: in the computer's memory where the server gives it)
+        let host = self.conn.hosts(desc.size.max(4), desc.usage.contains(wgpu::BufferUsages::MAP_READ) && !desc.mapped_at_creation);
+        let id = self.conn.alloc(desc.size.max(4), host);
         let mapped = desc.mapped_at_creation.then(|| Mapping { start: 0, data: vec![0; desc.size as usize], write: true });
-        let mem = Arc::new(Allocation { conn: Arc::clone(&self.conn), id, size: desc.size });
+        let mem = Arc::new(Allocation { conn: Arc::clone(&self.conn), id, size: desc.size, host });
         DispatchBuffer::custom(TgBuffer { mem, size: desc.size, state: Arc::new(Mutex::new(mapped)) })
     }
     fn create_texture(&self, _desc: &wgpu::TextureDescriptor<'_>) -> DispatchTexture {
@@ -553,11 +579,13 @@ struct Allocation {
     conn: Arc<Conn>,
     id: u64,
     size: u64,
+    /// In the computer's memory ([`Conn::hosts`]).
+    host: bool,
 }
 
 impl Drop for Allocation {
     fn drop(&mut self) {
-        self.conn.release(self.id, self.size.max(4));
+        self.conn.release(self.id, self.size.max(4), self.host);
     }
 }
 
