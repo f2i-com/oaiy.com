@@ -27,6 +27,20 @@ KEY = os.environ.pop("OAIY_EGPU_KEY", "")
 THINKING = [None]
 # The lines read from standard input meanwhile (--webgpu: `pause` and `resume`, for the engine on the card).
 ASKED = queue.Queue()
+# An ending held off while the engine is being started ([`ending`]): whether one is, and whether an ending came meanwhile.
+HOLD = {"on": False, "came": False}
+
+
+def ending(signum=None, frame=None):
+    """What ends this (the lifeline's interrupt, or a signal that would): an interrupt raised in the main thread,
+    wherever it is. Not inside the start of an engine: there it is after the engine is running and before this knows of
+    it, so nothing stopped that engine, and it lived on with no card (the card's socket gone with this) and no one to
+    end it. OAIY met it by asking for another model as a picture's pause ended: `resume`, then its standard input
+    closed. Held, the ending is raised as soon as the engine is known (`webgpu`'s `start`)."""
+    if HOLD["on"]:
+        HOLD["came"] = True
+        return
+    raise KeyboardInterrupt
 
 
 def local_only():
@@ -165,7 +179,10 @@ def webgpu(args):
     worker), which `oaiy-egpu: paused` says once the engine's buffers are freed; `oaiy-egpu: resumed` says it is
     starting again. With --paused (before --webgpu) it starts so: the card held, the engine not started until a
     `resume`. The engine exiting by itself ends this. At the lifeline's interrupt the engine is stopped first, then the
-    card's last request let finish, and Python's exit releases the card (within the lifeline's 15 s)."""
+    card's last request let finish, and Python's exit releases the card (within the lifeline's 15 s).
+
+    The engine has a lifeline of its own, as this has OAIY's: its standard input is a pipe this holds, and it is told
+    to stop when that closes (--watch-stdin). However this goes, the engine goes with it."""
     import shutil, subprocess, tempfile
 
     at = args.index("--webgpu")
@@ -184,6 +201,16 @@ def webgpu(args):
     print(f"oaiy-egpu: {card.card.info()['name']} held for OAIY's engine", flush=True)
     print(f"oaiy-egpu: card at {path}", flush=True)
     env = dict(os.environ, OAIY_WEBGPU_ADAPTER="tinygpu:" + path, OAIY_LLM_API_KEY=KEY)
+
+    def start():
+        # (no ending between the engine running and this knowing of it: see `ending`)
+        HOLD["on"] = True
+        try:
+            engine[0] = subprocess.Popen([program, *rest, "--watch-stdin"], env=env, stdin=subprocess.PIPE)
+        finally:
+            HOLD["on"] = False
+        if HOLD["came"]:
+            raise KeyboardInterrupt
 
     def halt(child, wait=10):
         child.terminate()
@@ -204,7 +231,7 @@ def webgpu(args):
         if paused:
             said_paused()
         else:
-            engine[0] = subprocess.Popen([program, *rest], env=env)
+            start()
         while True:
             try:
                 asked = ASKED.get(timeout=0.5)
@@ -219,7 +246,7 @@ def webgpu(args):
                     engine[0] = None
                 said_paused()
             elif asked == "resume" and engine[0] is None:
-                engine[0] = subprocess.Popen([program, *rest], env=env)
+                start()
                 print("oaiy-egpu: resumed", flush=True)
     except KeyboardInterrupt:
         # (within the lifeline's 15 s, with the card's last request)
@@ -250,13 +277,13 @@ def main():
         # background by a shell has SIGINT ignored, and Python then sets no handler, so the interrupt would do nothing
         # and the lifeline's last resort (os._exit) would leave the card's firmware up.
         import signal
-        signal.signal(signal.SIGINT, signal.default_int_handler)
+        signal.signal(signal.SIGINT, ending)
         # Any other signal that would end this unhandled ends it as the interrupt does: the card released (tinygrad's
         # exit). One killed by a signal it had no handler for left the firmware up, and the reset at the next open took
         # the card's link down until the enclosure was powered off and on.
-        for ending in ("SIGTERM", "SIGHUP", "SIGQUIT", "SIGUSR1", "SIGUSR2", "SIGALRM", "SIGVTALRM", "SIGPROF", "SIGXCPU", "SIGXFSZ"):
-            if hasattr(signal, ending):
-                signal.signal(getattr(signal, ending), signal.default_int_handler)
+        for signame in ("SIGTERM", "SIGHUP", "SIGQUIT", "SIGUSR1", "SIGUSR2", "SIGALRM", "SIGVTALRM", "SIGPROF", "SIGXCPU", "SIGXFSZ"):
+            if hasattr(signal, signame):
+                signal.signal(getattr(signal, signame), ending)
         threading.Thread(target=lifeline, daemon=True).start()
     if "--webgpu" in args:
         return webgpu(args)

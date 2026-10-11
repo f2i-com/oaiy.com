@@ -241,8 +241,10 @@ pub fn arguments(llm: &Json, root: &Path, name: &str, script: &Path, port: u16) 
 /// The launcher's command line for OAIY's own engine on the card: `--webgpu`, the engine's program (the one this
 /// computer's engine runs), and the engine's arguments as this computer's are made, for this model alone, with the
 /// eGPU's context. Not among them: the key (the launcher passes it in the environment), the GPUs to use (the card is
-/// the engine's one adapter), the stdin watch (the launcher's own), and the expert counts kept with this computer's
-/// engine; the prompt cache is a folder of its own.
+/// the engine's one adapter), the stdin watch (the launcher's own, which gives the engine one of its own pipe), and the
+/// expert counts kept with this computer's engine; the prompt cache is a folder of its own. And the backend is the
+/// GPU's and nothing else (`--backend webgpu`): an engine that cannot reach the card ends, saying so, where one left
+/// to choose ran the model on this computer's CPU under the eGPU's name (Flash-Next at a token a second).
 fn engine_arguments(llm: &Json, root: &Path, m: &Json, script: &Path, port: u16) -> Result<Vec<String>, String> {
     let launches = crate::llm::launches(llm, root);
     let program = launches.iter().map(|l| l.program.clone()).find(|p| p.is_file()).or_else(|| launches.first().map(|l| l.program.clone())).ok_or("no engine program")?;
@@ -270,6 +272,8 @@ fn engine_arguments(llm: &Json, root: &Path, m: &Json, script: &Path, port: u16)
             _ => a.push(flag),
         }
     }
+    a.push("--backend".into());
+    a.push("webgpu".into());
     Ok(a)
 }
 
@@ -1390,6 +1394,9 @@ mod tests {
             assert!(!a.contains(&absent.to_string()), "{absent} in {a:?}");
         }
         assert_eq!(a.iter().filter(|x| *x == "--watch-stdin").count(), 1, "the launcher's own");
+        // On the card or not at all: never this computer's CPU under the eGPU's name.
+        assert_eq!(after("--backend").as_deref(), Some("webgpu"));
+        assert_eq!(a.iter().filter(|x| *x == "--backend").count(), 1);
         // Any model the engine reads, not only a GGUF file.
         assert!(arguments(&on, root, "folder", &script, 1).is_ok());
     }
@@ -1502,5 +1509,113 @@ mod tests {
         egpu.stop();
         assert_eq!(egpu.state(), State::Stopped);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The launcher itself with a card on the CPU (`OAIY_EGPU_EMULATE`) and a stand-in for the engine that writes its
+    /// pid down and stays; `heeds` its standard input closing as OAIY's engine does (--watch-stdin), or not at all.
+    #[cfg(unix)]
+    struct Launched {
+        dir: PathBuf,
+        python: &'static str,
+    }
+
+    #[cfg(unix)]
+    impl Launched {
+        fn new(name: &str, heeds: bool) -> Option<Launched> {
+            use std::os::unix::fs::PermissionsExt;
+            use std::process::{Command, Stdio};
+            let runs = |p: &&str| Command::new(p).arg("--version").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
+            let python = ["python3", "python"].into_iter().find(runs)?;
+            let dir = std::env::temp_dir().join(format!("oaiy-egpu-launched-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("egpu_serve.py"), SERVE_PY).unwrap();
+            std::fs::write(dir.join("webgpu_server.py"), CARD_PY).unwrap();
+            let heed = if heeds { "import threading\ndef gone():\n    while os.read(0, 256): pass\n    os._exit(0)\nif '--watch-stdin' in sys.argv: threading.Thread(target=gone, daemon=True).start()\n" } else { "" };
+            let engine = format!("#!/usr/bin/env python3\nimport os, sys, time\nopen(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pids'), 'a').write(str(os.getpid()) + '\\n')\n{heed}time.sleep(120)\n");
+            std::fs::write(dir.join("fake-engine"), engine).unwrap();
+            std::fs::set_permissions(dir.join("fake-engine"), std::fs::Permissions::from_mode(0o755)).unwrap();
+            Some(Launched { dir, python })
+        }
+
+        /// The launcher started (`paused`: holding the card, its engine not started), once it has said `until`.
+        fn start(&self, paused: bool, until: &str) -> std::process::Child {
+            use std::io::BufRead;
+            use std::process::{Command, Stdio};
+            let _ = std::fs::remove_file(self.dir.join("pids"));
+            let mut command = Command::new(self.python);
+            command.arg("-u").arg(self.dir.join("egpu_serve.py")).arg("--watch-stdin");
+            if paused {
+                command.arg("--paused");
+            }
+            command.arg("--webgpu").arg(self.dir.join("fake-engine")).args(["--port", "1"]);
+            command.env("OAIY_EGPU_KEY", "k").env("OAIY_EGPU_EMULATE", "1").env("PYTHONDONTWRITEBYTECODE", "1");
+            let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+            let mut said = std::io::BufReader::new(child.stdout.take().unwrap());
+            let mut line = String::new();
+            while said.read_line(&mut line).is_ok_and(|n| n > 0) && !line.contains(until) {
+                line.clear();
+            }
+            assert!(line.contains(until), "the launcher never said {until:?}");
+            child
+        }
+
+        /// The engines started since `start` that are still running: each is ended here, and counted.
+        fn engines_left(&self) -> usize {
+            let alive = |pid: &&str| std::process::Command::new("kill").args(["-0", pid]).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success());
+            let pids = std::fs::read_to_string(self.dir.join("pids")).unwrap_or_default();
+            let left: Vec<&str> = pids.split_whitespace().filter(alive).collect();
+            for pid in &left {
+                let _ = std::process::Command::new("kill").args(["-9", pid]).status();
+            }
+            left.len()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Launched {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// OAIY asking for another model as a picture's pause ended: `resume`, and the launcher's standard input closed at
+    /// once. The interrupt that ends the launcher then came while it was starting the engine, after the engine was
+    /// running and before the launcher knew of it: nothing stopped that engine, which ran the model on this computer's
+    /// CPU for as long as the Mac was up. The engine here does not heed its own standard input, so only the launcher
+    /// can end it. (Where the interrupt lands is the scheduler's: of 30 such starts, 9 left an engine before the
+    /// ending was held, and 7 were held after.)
+    #[cfg(unix)]
+    #[test]
+    fn an_engine_started_as_its_launcher_is_told_to_end_is_ended_with_it() {
+        use std::io::Write;
+        let Some(launched) = Launched::new("ending", false) else { return };
+        for round in 0..10 {
+            let mut child = launched.start(true, "oaiy-egpu: paused");
+            let mut pipe = child.stdin.take().unwrap();
+            pipe.write_all(b"resume\n").unwrap();
+            drop(pipe);
+            child.wait().unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            assert_eq!(launched.engines_left(), 0, "round {round}: an engine outlived its launcher");
+        }
+    }
+
+    /// A launcher that goes without a word (killed, as a crash would have it) takes its engine with it: the engine's
+    /// standard input is the launcher's pipe, and OAIY's engine ends when that closes.
+    #[cfg(unix)]
+    #[test]
+    fn an_engine_ends_when_its_launcher_is_killed() {
+        let Some(launched) = Launched::new("killed", true) else { return };
+        let mut child = launched.start(false, "oaiy-egpu: card at");
+        let started = Instant::now();
+        while std::fs::read_to_string(launched.dir.join("pids")).unwrap_or_default().trim().is_empty() {
+            assert!(started.elapsed() < Duration::from_secs(20), "the engine was never started");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
+        std::thread::sleep(Duration::from_secs(1));
+        assert_eq!(launched.engines_left(), 0, "the engine outlived its launcher");
     }
 }
