@@ -5,7 +5,8 @@ The card is held by this one process for as long as it runs (each process that o
 Thunderbolt has taken the card's link down): a client (crates/wgpu-tinygpu, a wgpu backend) connects to SOCKET, a Unix
 socket, and asks for what WebGPU's compute does: buffers, writes and reads, kernels, and submissions of dispatches,
 copies and clears, run in order on the card's compute queue. Kernels come as CUDA C++ (crates/wgsl-cuda's), compiled
-by nvcc (tinygrad's Docker shim on a Mac) to a cubin kept in ~/.cache/tinygpu-webgpu by the source's hash.
+by nvcc (tinygrad's Docker shim on a Mac) to a cubin kept in ~/.cache/tinygpu-webgpu by the source's hash, or found in
+a kernel pack compiled ahead of time (PACKS: the eGPU plugin carries one, and a Mac with it needs no nvcc).
 
     DEV=NV PATH=~/.local/bin:$PATH ~/tinygrad/.venv/bin/python tools/tinygpu/webgpu_server.py ~/.cache/tinygpu-webgpu/server.sock
 
@@ -43,8 +44,17 @@ from __future__ import annotations
 import ctypes, hashlib, json, mmap, os, pathlib, signal, socket, struct, subprocess, sys, threading, time, traceback
 from concurrent.futures import ThreadPoolExecutor
 
-CACHE = pathlib.Path.home() / ".cache" / "tinygpu-webgpu"
+CACHE = pathlib.Path(os.environ.get("TINYGPU_CACHE") or pathlib.Path.home() / ".cache" / "tinygpu-webgpu")
 EMU = pathlib.Path(__file__).resolve().parent / "emu"
+# Kernel packs: folders of cubins compiled ahead of time (tools/tinygpu/kernel_pack.py), each named as the cache names
+# it (the hash of the architecture and the source). They are looked in first, so a card needs no compiler (nvcc, which
+# a Mac has only through Docker) for a kernel a pack has. TINYGPU_KERNELS lists them (os.pathsep between); a `kernels`
+# folder beside this file is one too (the eGPU plugin's).
+PACKS = [pathlib.Path(p) for p in os.environ.get("TINYGPU_KERNELS", "").split(os.pathsep) if p] + \
+        [pathlib.Path(__file__).resolve().parent / "kernels"]
+# What tinygrad downloads as it first opens a card, carried: NVIDIA's GSP firmware (from linux-firmware) and tinygrad's
+# TinyGPU app (from GitHub). A `firmware` folder beside this file (the eGPU plugin's), or TINYGPU_FIRMWARE ([`carried`]).
+FIRMWARE = pathlib.Path(os.environ.get("TINYGPU_FIRMWARE") or pathlib.Path(__file__).resolve().parent / "firmware")
 ALIGN = 256
 PROTOCOL = 3   # the requests as below; a client of another version is told so at HELLO (crates/wgpu-tinygpu's PROTOCOL)
 SCRATCH = 160 * 64 * 1024   # a kernel's scratch, where it takes one (wgsl-cuda's SCRATCH_BYTES: 1 KB a warp)
@@ -80,6 +90,26 @@ def cached(suffix: str, key: bytes, build) -> pathlib.Path:
   return out
 
 
+def carried():
+  """tinygrad's downloads answered from FIRMWARE where it has them, so a card opens with no network: the firmware by
+  its path in linux-firmware (FIRMWARE/nvidia/ad102/gsp/...), checked by the sha256 tinygrad checks a download by; and
+  tinygrad's TinyGPU app (FIRMWARE/TinyGPU_COMMIT.zip) put where tinygrad keeps its download, which it then installs
+  from, where /Applications has none (or no copy that tinygrad's commit asks for). What FIRMWARE lacks is downloaded."""
+  if not FIRMWARE.is_dir(): return
+  import shutil
+  import tinygrad.helpers as helpers
+  import tinygrad.runtime.support.nv.ip as ip
+  downloaded = helpers.fetch_fw
+  def fetch_fw(path: str, name: str, sha256: str) -> bytes:
+    if (f := FIRMWARE / path / name).is_file() and hashlib.sha256(b := f.read_bytes()).hexdigest() == sha256: return b
+    return downloaded(path, name, sha256)
+  helpers.fetch_fw = ip.fetch_fw = fetch_fw   # (ip imported the name: its own is the one called)
+  for app in FIRMWARE.glob("TinyGPU_*.zip"):
+    if not (kept := helpers._ensure_downloads_dir() / app.name).is_file():
+      kept.parent.mkdir(parents=True, exist_ok=True)
+      shutil.copyfile(app, kept)
+
+
 def run_compiler(argv: list, what: str):
   run = subprocess.run(argv, capture_output=True, text=True)
   if run.returncode != 0: raise RuntimeError(f"{what}: {run.stderr.strip()[-3000:]}")
@@ -87,15 +117,31 @@ def run_compiler(argv: list, what: str):
 
 # ---- the card, through tinygrad ----
 
+def kernel_name(arch: str, src: str) -> str:
+  """What a kernel's cubin is called in the cache and in a pack: the hash of its architecture and its source."""
+  return hashlib.sha256((arch + "\0" + src).encode()).hexdigest()[:24]
+
+
 def compile_cuda(src: str, arch: str) -> bytes:
-  """A translation unit's cubin, from the cache or nvcc (its name, the source's hash, is the program's label)."""
+  """A translation unit's cubin, from a kernel pack, the cache or nvcc (its name, the source's hash, is the program's
+  label). Where none has it and there is no nvcc, the source is kept in the cache's `missing` folder for the next
+  pack (tools/tinygpu/kernel_pack.py reads it), and the error says so."""
   from tinygrad.runtime.support.elf import elf_loader
+  name = kernel_name(arch, src)
+  packed = next((p / f"{name}.cubin" for p in PACKS if (p / f"{name}.cubin").is_file()), None)
   def build(tmp: pathlib.Path):
+    import shutil
     cu = tmp.with_suffix(f".{threading.get_ident()}.cu")
     cu.write_text(src)
+    if shutil.which("nvcc") is None:
+      missing = CACHE / "missing"
+      missing.mkdir(parents=True, exist_ok=True)
+      cu.rename(missing / f"{name}.cu")
+      raise RuntimeError(f"kernel {name} ({arch}) is not in the eGPU's kernel pack, and there is no nvcc here to compile "
+                         f"it: an update of the eGPU plugin brings it (its source is kept in {missing})")
     run_compiler(["nvcc", f"-arch={arch}", "-cubin", "-o", str(tmp), str(cu)], "nvcc")
     cu.rename(tmp.with_name(tmp.name.split(".")[0] + ".cu"))   # (beside its cubin, as it will be named)
-  path = cached(".cubin", (arch + "\0" + src).encode(), build)
+  path = packed or cached(".cubin", (arch + "\0" + src).encode(), build)
   compile_cuda.last = path.stem
   lib = path.read_bytes()
   kernels = [s.name for s in elf_loader(lib)[1] if s.name.startswith(".text.")]
@@ -239,6 +285,7 @@ class Card:
   def __init__(self):
     from tinygrad import Device
     from tinygrad.device import BufferSpec
+    carried()
     self.dev, self.spec = Device["NV"], BufferSpec()
     self.arch = self.dev.arch
     self.reserve_firmware_memory()
