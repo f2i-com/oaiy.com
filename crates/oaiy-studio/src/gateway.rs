@@ -1910,6 +1910,16 @@ open(log, "a").write("ended\n")
         assert!(status == 200 && body.contains("from the card"), "{status} {body}\n{}", studio.egpu.log.tail(40));
         assert_eq!((here().as_str(), there().as_str(), starts(&studio)), ("stopped", "ready", 1));
 
+        // Not while the card is lent to a picture in the making: its worker is on the socket that server holds.
+        let socket = studio.egpu.lend(&cfg, &studio.root, Duration::from_secs(30)).unwrap_or_else(|e| panic!("{e}\n{}", studio.egpu.log.tail(40)));
+        crate::admin::llm_stop(&studio, &cfg);
+        assert!(card_hello(&socket).contains("\"protocol\""), "the card is the job's still");
+        assert!(!studio.egpu.log.tail(400).contains("studio: tinygrad's server stopped"));
+        studio.egpu.give_back();
+        let (status, _, body) = chat(&studio, ask_x);
+        assert!(status == 200 && body.contains("from the card"), "{status} {body}");
+        assert_eq!(starts(&studio), 1, "the card was opened once");
+
         // Stop: the model is the card's, and it is the card's server that stops.
         crate::admin::llm_stop(&studio, &cfg);
         until("the launcher to go", || studio.egpu.log.tail(400).contains("studio: tinygrad's server stopped"));

@@ -74,17 +74,24 @@ impl FlashNext {
             let least = (past + t).next_power_of_two().max(256);
             let whole = (past + t).max(kv.expect.min(kv.max_len)).next_power_of_two().max(256);
             let out_len = |cap: usize| chains[d].attention_out_len(nh, hd, cap);
-            if past == 0 {
+            // (a size the device had no room for is not asked for again in the same request, nor a larger one;
+            // another request, a prompt of another length or one begun anew, asks afresh)
+            if past == 0 || kv.expect != g.refused_for {
                 g.refused = 0;
             }
-            if g.cap < whole && g.refused != whole && !g.grow(chains[d], layers.len(), whole, kept(g), row, id_dim, out_len(whole)) {
-                g.refused = whole;
+            let refused = |g: &ChainKv, cap: usize| g.refused != 0 && cap >= g.refused;
+            if g.cap < whole && !refused(g, whole) && !g.grow(chains[d], layers.len(), whole, kept(g), row, id_dim, out_len(whole)) {
+                (g.refused, g.refused_for) = (whole, kv.expect);
                 eprintln!("flash-next: the GPU has no room for its attention cache at {whole} rows: what reaches past {} rows is run on the host, slowly", whole / 2);
             }
             // (no room for the whole of it, at this run or an earlier one: for this run's rows then, or the run is the
             // host's, as every run past 16,384 rows was)
-            if g.cap < past + t && (least == g.refused || !g.grow(chains[d], layers.len(), least, kept(g), row, id_dim, out_len(least))) {
-                g.refused = least;
+            if g.cap < past + t && (refused(g, least) || !g.grow(chains[d], layers.len(), least, kept(g), row, id_dim, out_len(least))) {
+                (g.refused, g.refused_for) = (least, kv.expect);
+                // Over two devices a chunk's first part may have gone ahead on the other device, and its second
+                // part reads this copy: the run is not left to the host from here. The refusal is the request's, as
+                // a device's refusal was before any of this.
+                assert!(st.attn_of.len() == 1, "flash-next: no room on GPU {d} for its attention cache at {least} rows (MemoryError)");
                 return None;
             }
             // (a growth the device refused left nobody's copy: every row is written again)

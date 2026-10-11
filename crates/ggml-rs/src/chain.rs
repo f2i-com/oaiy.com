@@ -12,6 +12,14 @@ use std::sync::Arc;
 use crate::quantized::QuantizedTensor;
 use crate::tensor::Tensor;
 
+/// Whether a caught panic is a device saying it has no room for a buffer (the card's adapter refuses one so:
+/// "MemoryError: Allocation of 512.00 MB failed"), and not anything else gone wrong: only that is answered by letting
+/// go of what is kept and asking again, or by a smaller cache. Any other panic is passed on as it came.
+pub fn no_room(panic: &(dyn Any + Send)) -> bool {
+    let said = panic.downcast_ref::<String>().map(String::as_str).or_else(|| panic.downcast_ref::<&str>().copied()).unwrap_or("");
+    said.contains("MemoryError") || said.contains("Allocation of") || said.contains("no room")
+}
+
 /// An f32 vector held by a [`DeviceChain`]'s device: the backend's own buffer behind it.
 #[derive(Clone)]
 pub struct DeviceVec {

@@ -136,22 +136,37 @@ pub(super) struct ChainKv {
     pub(super) qsa: Option<QsaVecs>,
     /// The `KvCache::id` the rows are a copy of (0: none).
     pub(super) owner: u64,
-    /// The `cap` the device had no room for (0: none it was asked for and refused): not asked for again until a
-    /// prompt is begun anew.
+    /// The least `cap` the device had no room for in this request (0: none): neither it nor a larger one is asked for
+    /// again until another request ([`Self::refused_for`]).
     pub(super) refused: usize,
+    /// The prompt's length (`KvCache::expect`) of the request `refused` is of.
+    pub(super) refused_for: usize,
 }
 
 impl ChainKv {
     /// The copy made again at `cap` rows, its first `kept` rows kept (the old vectors go as the new ones come, a
     /// layer at a time, and before any new one where no row is kept: `chain_part.rs`), or not at all where the device
-    /// has no room for it: then it is nobody's and of no rows, what was made of it let go, and `false`. (A device
-    /// with no room refuses a vector by a panic, which is caught here: the run goes on with a smaller copy, or is
-    /// left to the host.)
+    /// has no room for it: then it is nobody's and of no rows, what was made of it let go, and `false`. With rows
+    /// kept it takes the new copy and an old layer at once, so one refused that way is asked for once more from
+    /// nothing, which takes the new copy alone (nobody's then: its rows are written again). A device with no room
+    /// refuses a vector by a panic, which is caught here ([`ggml_rs::chain::no_room`]: any other is passed on): the
+    /// run goes on with a smaller copy, or is left to the host.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn grow(&mut self, chain: &dyn ggml_rs::DeviceChain, slots: usize, cap: usize, kept: usize, row: usize, id_dim: usize, out_len: usize) -> bool {
-        // (the scratch the device keeps for its next run first: the room it takes is the cache's)
+        // (the scratch the device keeps for its next run first, and the bind groups that hold the old vectors: the
+        // room they take is the cache's)
         chain.let_go_of_spare();
-        let grown = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut grown = self.made(chain, slots, cap, kept, row, id_dim, out_len);
+        if !grown && kept > 0 {
+            grown = self.made(chain, slots, cap, 0, row, id_dim, out_len);
+        }
+        grown
+    }
+
+    /// [`Self::grow`]'s one asking: the copy at `cap` rows, or emptied and `false` where the device had no room.
+    #[allow(clippy::too_many_arguments)]
+    fn made(&mut self, chain: &dyn ggml_rs::DeviceChain, slots: usize, cap: usize, kept: usize, row: usize, id_dim: usize, out_len: usize) -> bool {
+        let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let owner = std::mem::take(&mut self.owner);
             self.cap = 0;
             self.out = chain.vec(1);
@@ -178,14 +193,20 @@ impl ChainKv {
             self.cap = cap;
             self.owner = owner;
         }));
-        if grown.is_err() {
-            self.layers.clear();
-            self.raw.clear();
-            self.qsa = None;
-            self.owner = 0;
-            self.cap = 0;
+        match made {
+            Ok(()) => true,
+            Err(panic) => {
+                self.layers.clear();
+                self.raw.clear();
+                self.qsa = None;
+                self.owner = 0;
+                self.cap = 0;
+                if !ggml_rs::chain::no_room(panic.as_ref()) {
+                    std::panic::resume_unwind(panic);
+                }
+                false
+            }
         }
-        grown.is_ok()
     }
 }
 
@@ -493,7 +514,7 @@ impl FlashNext {
                 let rank = layers.iter().map(|l| l.attn_hc.rank.max(l.mlp_hc.rank)).max().unwrap_or(0).max(collapse.rank).max(mtp_rank);
                 let devs = chains.iter().map(|c| chain_dev(*c, cfg, rank, 1, 1)).collect();
                 let keys = chains.iter().zip(&attn_of).map(|(c, a)| c.vec(a.len().max(1) * cfg.index_dim)).collect();
-                let kv = chains.iter().map(|c| ChainKv { layers: Vec::new(), raw: Vec::new(), cap: 0, out: c.vec(1), qsa: None, owner: 0, refused: 0 }).collect();
+                let kv = chains.iter().map(|c| ChainKv { layers: Vec::new(), raw: Vec::new(), cap: 0, out: c.vec(1), qsa: None, owner: 0, refused: 0, refused_for: 0 }).collect();
                 let pool = gdn
                     .iter()
                     .map(|&i| {
@@ -594,7 +615,7 @@ mod grow_tests {
         for kept in [0usize, 1000] {
             // room for the cache at 16,384 rows and half as much again: not for it at 32,768
             let chain = Small { held: Default::default(), room: bytes(16_384) * 3 / 2, let_go: 0.into() };
-            let mut g = ChainKv { layers: Vec::new(), raw: Vec::new(), cap: 0, out: chain.vec(1), qsa: None, owner: 0, refused: 0 };
+            let mut g = ChainKv { layers: Vec::new(), raw: Vec::new(), cap: 0, out: chain.vec(1), qsa: None, owner: 0, refused: 0, refused_for: 0 };
             assert!(g.grow(&chain, slots, 16_384, 0, row, id_dim, 8));
             g.owner = 7;
             assert_eq!((g.cap, g.layers.len(), g.raw.len()), (16_384, slots, slots));
@@ -607,5 +628,64 @@ mod grow_tests {
             assert!(g.layers.iter().all(|l| l.len == 16_384 * row) && g.raw.iter().all(|r| r.len == 16_384 * id_dim));
             assert_eq!(chain.let_go.load(SeqCst), 3, "the device's spare let go before each");
         }
+        // Room for the copy at 32,768 rows and its output, and not for an old layer beside it: with rows kept that
+        // is refused, and asked for once more from nothing it is made, nobody's, so that its rows are written again.
+        let chain = Small { held: Default::default(), room: bytes(32_768) + 8 + 4, let_go: 0.into() };
+        let mut g = ChainKv { layers: Vec::new(), raw: Vec::new(), cap: 0, out: chain.vec(1), qsa: None, owner: 0, refused: 0, refused_for: 0 };
+        assert!(g.grow(&chain, slots, 16_384, 0, row, id_dim, 2));
+        g.owner = 7;
+        assert!(g.grow(&chain, slots, 32_768, 1000, row, id_dim, 2));
+        assert_eq!((g.cap, g.layers.len(), g.owner), (32_768, slots, 0));
+    }
+
+    /// Anything else gone wrong as a copy is made is not a want of room, and is passed on as it came.
+    #[test]
+    fn a_panic_that_is_not_for_want_of_room_is_passed_on() {
+        assert!(ggml_rs::chain::no_room(&String::from("tinygpu: MemoryError: Allocation of 512.00 MB failed on NV. Used: 0 B") as &(dyn std::any::Any + Send)));
+        assert!(!ggml_rs::chain::no_room(&"index out of bounds: the len is 3 but the index is 7" as &(dyn std::any::Any + Send)));
+        // (a device whose vectors past the first are refused for another reason)
+        struct Broken(Small);
+        impl DeviceChain for Broken {
+            fn vec(&self, len: usize) -> DeviceVec {
+                if len > 4 {
+                    panic!("an answer out of turn (a test's)");
+                }
+                self.0.vec(len)
+            }
+            fn zero(&self, _: &DeviceVec) {}
+            fn alias(&self, v: &DeviceVec, shape: Vec<usize>) -> Tensor {
+                self.0.alias(v, shape)
+            }
+            fn aliased(&self, _: &Tensor) -> Option<DeviceVec> {
+                None
+            }
+            fn upload_at(&self, _: &DeviceVec, _: usize, _: &[f32]) {}
+            fn resize(&self, _: &DeviceVec, len: usize) -> DeviceVec {
+                self.vec(len)
+            }
+            fn holds(&self, _: &ggml_rs::QuantizedTensor) -> bool {
+                false
+            }
+            fn holds_exl3(&self, _: &dyn ggml_rs::exl3::PackedLinear) -> bool {
+                false
+            }
+            fn holds_experts(&self, _: &dyn ggml_rs::exl3::Experts) -> bool {
+                false
+            }
+            fn attention_out_len(&self, _: usize, _: usize, _: usize) -> usize {
+                1
+            }
+            fn attention_rows_out_len(&self, _: usize, _: usize, _: usize, _: usize) -> usize {
+                0
+            }
+            fn begin(&self) -> Box<dyn ggml_rs::ChainRecorder + '_> {
+                unimplemented!()
+            }
+        }
+        let chain = Broken(Small { held: Default::default(), room: usize::MAX, let_go: 0.into() });
+        let mut g = ChainKv { layers: Vec::new(), raw: Vec::new(), cap: 0, out: chain.vec(1), qsa: None, owner: 0, refused: 0, refused_for: 0 };
+        let passed_on = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| g.grow(&chain, 12, 1024, 0, 1024, 128, 1)));
+        assert!(passed_on.is_err(), "not taken for a want of room");
+        assert_eq!((g.cap, g.layers.len()), (0, 0));
     }
 }

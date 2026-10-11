@@ -521,10 +521,13 @@ impl Gpu {
     pub(crate) fn with_room<T>(&self, make: impl Fn() -> T) -> T {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(&make)) {
             Ok(made) => made,
-            Err(_) => {
+            // (only a refusal for want of room: anything else, a request the device answered out of turn say, is
+            // not made good by asking again, and goes on as it came)
+            Err(panic) if ggml_rs::chain::no_room(panic.as_ref()) => {
                 self.let_go();
                 make()
             }
+            Err(panic) => std::panic::resume_unwind(panic),
         }
     }
 

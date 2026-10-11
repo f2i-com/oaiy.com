@@ -338,30 +338,40 @@ fn egpu_start(studio: &Arc<Studio>, cfg: &Json, asked: Option<String>) -> Result
     }
 }
 
-/// Whether "the language model" is the eGPU's to hold: every enabled model is set to run there, and it is switched on
-/// ([`crate::llm::holds_a_model`] says this computer's engine then holds none).
+/// Whether "the language model" is the eGPU's to hold: it is switched on, a model is set to it, and every enabled
+/// model is ([`crate::llm::holds_a_model`] says this computer's engine then holds none).
 fn all_on_the_egpu(cfg: &Json) -> bool {
-    cfg.get("llm").is_some_and(|llm| !crate::llm::holds_a_model(llm))
+    cfg.get("llm").is_some_and(|llm| !crate::llm::holds_a_model(llm) && !crate::egpu::models(llm).is_empty())
 }
 
 /// The page's "Language model" card's Start. This computer's engine's, unless every enabled model is set to run on
 /// the eGPU: then the card's server's, with the default where it is the card's (else the one it held, else its
 /// first). Not that model here as well: the card showed "Stopped" over a model loaded on the eGPU, and its Start
-/// loaded the 27B a second time, on a 24 GB Mac's own GPU, beside the card's copy.
+/// loaded the 27B a second time, on a 24 GB Mac's own GPU, beside the card's copy. (This computer's engine left
+/// failed, from standing in for a card that did not answer, is cleared by it: nothing else but Stop did.)
 pub(crate) fn llm_start(studio: &Arc<Studio>, cfg: &Json) -> Result<(), String> {
     if !all_on_the_egpu(cfg) {
         return studio.llm.start(cfg, &studio.root);
     }
     let llm = cfg.get("llm").cloned().unwrap_or(Json::Null);
+    if !crate::util::bool_or(&llm, "enabled", true) {
+        return Err("the LLM is disabled in the configuration".into());
+    }
+    if studio.llm.state() == crate::llm::State::Failed {
+        studio.llm.stop();
+    }
     let default = Some(str_or(&llm, "default_model", "").to_string()).filter(|m| crate::egpu::assigned(&llm, m));
     egpu_start(studio, cfg, default)
 }
 
 /// The card's Stop: this computer's engine stopped, and where every enabled model is set to run on the eGPU, the
-/// card's server too, which is where the model then is: a Stop that left it loaded there stopped nothing.
+/// card's server too, which is where the model then is: a Stop that left it loaded there stopped nothing. Not while
+/// the card is lent to a picture or a video in the making, whose worker is on the socket that server holds: the
+/// model is not on the card then, and comes back when the job has it no more.
 pub(crate) fn llm_stop(studio: &Arc<Studio>, cfg: &Json) {
     studio.llm.stop();
-    if all_on_the_egpu(cfg) {
+    let lent = cfg.get("llm").is_some_and(|llm| studio.egpu.status(llm).get("lent") == Some(&Json::Bool(true)));
+    if all_on_the_egpu(cfg) && !lent {
         studio.egpu.stop();
     }
 }

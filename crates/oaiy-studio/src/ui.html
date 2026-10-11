@@ -1750,22 +1750,29 @@ function renderState() {
   // Every model set to the eGPU: "the language model" is the card's server's, and this card is of that one (its
   // buttons too: the studio starts and stops the card's). It said "Stopped" over a model loaded on the eGPU, its
   // Stop left that model there, and its Start loaded the model a second time on this computer. This computer's
-  // engine is shown instead only while it runs (standing in for a card that does not answer).
-  const onCard = !!(card?.enabled && card.holds_all) && own.state === "stopped";
+  // engine is shown instead only while it runs or loads (standing in for a card that does not answer); one that
+  // failed to stand in is said in the line under the buttons, and the card's server is still what is shown.
+  const allOnCard = !!(card?.enabled && card.holds_all);
+  const standingIn = allOnCard && (own.state === "ready" || own.state === "starting");
+  const onCard = allOnCard && !standingIn;
   const l = onCard ? card : own;
-  const label = {stopped: "Stopped", starting: "Loading", ready: "Ready", failed: "Failed"}[l.state];
-  $("#llm-tag").innerHTML = `<span class="tag ${l.state === "ready" ? "good" : l.state === "failed" ? "bad" : ""}">${label}</span>`;
+  // (the card lent to a picture or a video in the making: its engine is paused, and its server is the job's too)
+  const lent = onCard && !!(card.lent || card.paused);
+  const label = lent ? "Paused" : {stopped: "Stopped", starting: "Loading", ready: "Ready", failed: "Failed"}[l.state];
+  $("#llm-tag").innerHTML = `<span class="tag ${lent ? "" : l.state === "ready" ? "good" : l.state === "failed" ? "bad" : ""}">${label}</span>`;
   $("#llm-detail").textContent = onCard
-    ? (l.state === "ready" ? `Serving ${l.model || ""} on the eGPU${l.runs_on ? ` (${l.runs_on})` : ""}. Loaded in ${l.load_seconds?.toFixed(1)} s, idle ${l.idle_seconds} s.`
+    ? (lent ? `Paused on the eGPU while a media job uses the card${l.model ? `: ${l.model} comes back after it` : ""}.`
+      : l.state === "ready" ? `Serving ${l.model || ""} on the eGPU${l.runs_on ? ` (${l.runs_on})` : ""}. Loaded in ${l.load_seconds?.toFixed(1)} s, idle ${l.idle_seconds} s.`
       : l.state === "starting" ? `Loading ${l.model || ""} on the eGPU...` : l.state === "failed" ? l.error
-      : l.paused ? "Paused on the eGPU while a media job uses the card." : "Not running. It starts on the eGPU at the first chat request.")
+      : "Not running. It starts on the eGPU at the first chat request.")
     : l.state === "ready" ? `Serving ${l.models.join(", ")} on ${l.runs_on || "the GPU"}. Loaded in ${l.load_seconds?.toFixed(1)} s, idle ${l.idle_seconds} s.`
     : l.state === "starting" ? `Loading ${l.models[0] || ""}...` : l.state === "failed" ? l.error : l.paused_for_media ? "Paused while a media job uses its GPU." : "Not running. It starts on the first chat request.";
-  $("#llm-start").disabled = l.state === "ready" || l.state === "starting";
-  $("#llm-restart").disabled = l.state !== "ready";
-  $("#llm-stop").disabled = l.state === "stopped";
+  $("#llm-start").disabled = lent || l.state === "ready" || l.state === "starting";
+  $("#llm-restart").disabled = lent || l.state !== "ready";
+  $("#llm-stop").disabled = lent || l.state === "stopped";
   $("#llm-note").textContent = state.restart_required ? "Listener changes apply after the studio restarts."
-    : card?.enabled && card.holds_all && !onCard ? "Every model is set to run on the eGPU: this computer's engine is standing in for it. Stop stops both." : "";
+    : standingIn ? "Every model is set to run on the eGPU: this computer's engine is standing in for it. Stop stops both."
+    : onCard && own.state === "failed" ? `This computer's engine could not stand in for the eGPU earlier (${own.error || "it failed to start"}).` : "";
   $("#foot-llm").className = "dot " + l.state; $("#foot-llm-text").textContent = "LLM " + label.toLowerCase();
   renderEgpu();
   const priv = state.media.private || [];
