@@ -170,15 +170,22 @@ class Program:
 class Fast:
   """A launch as tinygrad's NVComputeQueue.exec writes it, without the objects it makes a launch (a view of memory a
   word, its QMD's fields set by name): a launch's arguments and its QMD written in a few copies, its fields' places
-  found once, from tinygrad's own tables. On with TINYGPU_FAST=1 (else tinygrad's own launch); TINYGPU_FAST_CHECK=1 has
+  found once, from tinygrad's own tables. On unless TINYGPU_FAST=0 (then tinygrad's own launch); TINYGPU_FAST_CHECK=1 has
   tinygrad write each launch too (in its own slot, never submitted) and compares the two before the card is given it.
 
   A launch's arguments (a slot of tinygrad's ring) are the program's constant bank 0 (its words, the workgroup's size
   and the grid in the first six), its pointers, then its 32-bit values; its QMD is the program's (its workgroup's size
   set once), the grid and where the arguments are set, and the queue's last QMD is pointed at it (or it is sent, the
-  queue's first)."""
+  queue's first).
 
-  def __init__(self, dev):
+  With `mirror` (TINYGPU_ARGS_ON_CARD, on unless 0) the card reads them from its own memory, not the Mac's: a launch's
+  arguments and QMD are written as before, into a slot of the ring (the Mac's memory, where the CPU writes fast; the
+  card's own is reached only through TinyGPU's server, a call a write), but every address the card is given is the
+  slot's in a copy of the ring on the card, and a queue's slots are copied there by the copy engine (one DMA a run of
+  them) before the queue starts, which waits for it. A launch chained to the one before it otherwise reads its QMD and
+  arguments across Thunderbolt: 7 us a launch, where a card on its own slot takes 1 or 2."""
+
+  def __init__(self, dev, mirror=False):
     import tinygrad.runtime.ops_nv as nv
     self.nv, self.dev = nv, dev
     probe = nv.QMD(dev)
@@ -203,6 +210,13 @@ class Fast:
     self.pcas = (nv.nv_gpu.NVC6C0_SEND_PCAS_A, nv.nv_gpu.NVC6C0_SEND_SIGNALING_PCAS2_B)
     self.qmd_size = probe.sz * 4
     self.last = None   # the ring's offset of the queue's last QMD, None where the queue has none since its start
+    self.mirror, self.gpu_va = None, self.ring_va
+    if mirror:
+      from tinygrad.device import BufferSpec
+      self.mirror = dev.allocator.alloc(dev.kernargs_buf.size, BufferSpec())
+      self.gpu_va = self.mirror.va_addr
+      self.spans: list = []                            # the ring's runs written since the last copy, [first, past last]
+      self.copied, self.copies = dev.new_signal(value=0), 0   # the copies made: a queue waits for its own
 
   @staticmethod
   def bits(fields, name):
@@ -225,14 +239,20 @@ class Fast:
     qmd = bytearray(p.qmd.mv)
     struct.pack_into("<HH", qmd, self.dims[0], *prog.workgroup[:2])
     struct.pack_into("<B", qmd, self.dims[1], prog.workgroup[2])
-    prog.fast = (struct.pack(f"<{len(words)}I", *words), len(words) * 4, self.nv.round_up(p.constbufs[0][1], 1 << 8), bytes(qmd), p.kernargs_alloc_size)
+    qmd_at = self.nv.round_up(p.constbufs[0][1], 1 << 8)
+    # (on the card a slot is what is written in it, its arguments and its QMD, so a queue's copy is no larger)
+    size = qmd_at + self.qmd_size if self.mirror is not None else p.kernargs_alloc_size
+    prog.fast = (struct.pack(f"<{len(words)}I", *words), len(words) * 4, qmd_at, bytes(qmd), size)
     return prog.fast
 
   def launch(self, q, prog, ptrs: list, grid: tuple, vals: tuple):
     """`prog` over `grid`, its pointers and values, added to queue `q` (its last QMD pointed at this one)."""
     prefix, plen, qmd_at, qmd, size = getattr(prog, "fast", None) or self.program(prog)
-    off = self.dev.kernargs_offset_allocator.alloc(size, 8)
-    ring, va = self.ring, self.ring_va + off
+    off = self.dev.kernargs_offset_allocator.alloc(size, 256)
+    ring, va = self.ring, self.gpu_va + off
+    if self.mirror is not None:
+      if self.spans and 0 <= off - self.spans[-1][1] < 256: self.spans[-1][1] = off + size
+      else: self.spans.append([off, off + size])
     ring[off:off + plen] = prefix
     struct.pack_into("<3I", ring, off + 12, *grid)
     struct.pack_into(f"<{len(ptrs)}Q{len(vals)}I", ring, off + plen, *ptrs, *vals)
@@ -258,6 +278,15 @@ class Fast:
     self.last = qo
     return off
 
+  def flush(self):
+    """The slots written since the last flush copied to the card (TINYGPU_ARGS_ON_CARD), the copy counted: the queue
+    that launches from them waits for it (Card.begin)."""
+    q = self.dev.hw_copy_queue_t()
+    for lo, hi in self.spans: q.copy(self.mirror.offset(offset=lo, size=hi - lo), self.dev.kernargs_buf.offset(offset=lo, size=hi - lo), hi - lo)
+    self.copies += 1
+    q.signal(self.copied, self.copies).submit(self.dev)
+    self.spans = []
+
   def ending(self, q):
     """The queue's last QMD as tinygrad's queue keeps it, for its signal to be written into (a release of it)."""
     if self.last is None: return
@@ -274,30 +303,48 @@ class Card:
   neither waits for the card. A freed buffer goes to tinygrad's cache, from where the next of its size reuses it in the
   queue's order."""
   BATCH = 256      # kernels a queue, before it goes to the card and the next starts
+  # (the fast path's queues: a submission's first 16 kernels go to the card as soon as they are written, then 64, then
+  # 256 at a time, so the card starts on a step's kernels while the rest are written: it waited for all of them, a step
+  # of a 9B's 476 written in 2.8 ms, before it ran the first)
+  FIRST = 16
   # TINYGPU_SYNC_EACH=1: each kernel waited for as it is launched, so a fault is the kernel that made it (slow; to
   # find a kernel the emulator lets through)
   SYNC_EACH = os.environ.get("TINYGPU_SYNC_EACH") == "1"
   ARGS_RING = 4096  # launches between waits: their arguments are a ring of tinygrad's (16 MB), reused as it wraps
-  # TINYGPU_PROFILE=1: each kernel run alone and timed (the wall clock's, its own submission's 45 us in it), the times
-  # by kernel written to ~/.cache/tinygpu-webgpu/profile.txt as each client goes: where a program's time is spent
-  PROFILE = os.environ.get("TINYGPU_PROFILE") == "1"
+  # TINYGPU_PROFILE=1: each kernel timed by the card (a timestamp after each, with a wait for the card to be idle: from
+  # the end of the one before it to its own end, its launch in it), the times by kernel written to
+  # ~/.cache/tinygpu-webgpu/profile.txt as each client goes: where a program's time is spent. TINYGPU_PROFILE=alone:
+  # each run alone and timed by the wall clock instead (its own submission's 45 us in each)
+  PROFILE = os.environ.get("TINYGPU_PROFILE") in ("1", "alone")
+  ALONE = os.environ.get("TINYGPU_PROFILE") == "alone"
 
   def __init__(self):
+    import dataclasses
     from tinygrad import Device
     from tinygrad.device import BufferSpec
+    from tinygrad.helpers import DEV
     carried()
+    # tinygrad's own compiler is never asked here (the kernels come as cubins), and the one it takes unless told
+    # (NVRTC's) starts a compile server as the first program loads, in Docker on a Mac: NVCC's ("CC", as tinygrad names
+    # NVCCRenderer) starts nothing
+    DEV.value = [dataclasses.replace(t, renderer="CC") if t.device == "NV" and not t.renderer else t for t in DEV.value]
     self.dev, self.spec = Device["NV"], BufferSpec()
     self.arch = self.dev.arch
     self.reserve_firmware_memory()
     self.local_memory()
     self.q, self.queued, self.since_sync = None, 0, 0
+    self.queues = 0   # (the fast path: the submission's queues so far, each FIRST times 4 to the count's power, at most BATCH)
     self.scratch = None
     self.profiled: dict = {}   # (TINYGPU_PROFILE: a kernel's calls, its time, its last grid, its workgroup)
+    self.stamps: list = []     # (TINYGPU_PROFILE: the timestamps not read yet, each (program or None at a queue's start, grid, signal))
+    self.stamped = None        # (the last read)
     built = {name: Program(self.dev, compile_cuda(src, self.arch), name, (256, 1, 1), 1) for name, src in BUILTINS.items()}
     self.copy4, self.copy1, self.fill4, self.fill1 = built["tg_copy4"], built["tg_copy1"], built["tg_fill4"], built["tg_fill1"]
     self.fast = None
-    if os.environ.get("TINYGPU_FAST") == "1" and not (self.SYNC_EACH or self.PROFILE):
-      try: self.fast = Fast(self.dev)
+    if os.environ.get("TINYGPU_FAST", "1") == "1" and not (self.SYNC_EACH or self.ALONE):
+      # (a checked launch is compared with tinygrad's, byte for byte: the arguments' addresses the ring's own)
+      mirror = os.environ.get("TINYGPU_ARGS_ON_CARD", "1") != "0" and os.environ.get("TINYGPU_FAST_CHECK") != "1"
+      try: self.fast = Fast(self.dev, mirror)
       except (NotImplementedError, KeyError, AttributeError) as e: print(f"tinygpu-webgpu: launches through tinygrad ({e})", file=sys.stderr, flush=True)
     self.check = self.fast is not None and os.environ.get("TINYGPU_FAST_CHECK") == "1"
     if self.fast is not None:
@@ -387,14 +434,45 @@ class Card:
 
   def begin(self):
     if self.q is None:
-      self.q = self.dev.hw_compute_queue_t().wait(self.dev.timeline_signal, self.dev.timeline_value - 1).memory_barrier()
+      self.q = self.dev.hw_compute_queue_t().wait(self.dev.timeline_signal, self.dev.timeline_value - 1)
+      # (the copy of the queue's launches to the card, made as it ends: its count the next)
+      if self.fast and self.fast.mirror is not None: self.q.wait(self.fast.copied, self.fast.copies + 1)
+      self.q.memory_barrier()
       if self.fast: self.fast.last = None
       self.ref = self.dev.hw_compute_queue_t() if self.check else None
+      if self.PROFILE and not self.ALONE: self.stamp(None, None)
+
+  def stamp(self, prog, grid):
+    """A timestamp in the queue (TINYGPU_PROFILE), once what is before it is done: the queue's start (no `prog`), else
+    `prog`'s end. Written by the queue itself, not by its last kernel's release (which writes no time): the chain of
+    kernels starts again after it, the wait for the card to be idle keeping their order."""
+    signal = self.dev.new_signal(value=1)
+    self.q.active_qmd = None
+    if self.fast: self.fast.last = None
+    self.q.timestamp(signal)
+    self.stamps.append((prog, grid, signal))
+
+  def settle(self):
+    """The timestamps the card has written (its value 1 made 0), each kernel's time from the one before it."""
+    while self.stamps and self.stamps[0][2].value == 0:
+      prog, grid, signal = self.stamps.pop(0)
+      at = float(signal.timestamp) / 1e6
+      if prog is not None and self.stamped is not None:
+        seen = self.profiled.setdefault(prog.label, [0, 0.0, grid, prog.workgroup])
+        seen[0] += 1
+        seen[1] += at - self.stamped
+        seen[2] = grid
+      self.stamped = at
 
   def end(self):
     if self.q is not None and self.queued:
       if self.fast: self.fast.ending(self.q)
-      self.q.signal(self.dev.timeline_signal, self.dev.next_timeline()).submit(self.dev)
+      self.q.signal(self.dev.timeline_signal, self.dev.next_timeline())
+      # (after the signal is written into the last QMD: the copy has it)
+      if self.fast and self.fast.mirror is not None: self.fast.flush()
+      self.q.submit(self.dev)
+    elif self.q is not None and self.stamps and self.stamps[-1][0] is None:
+      self.stamps.pop()   # (a queue with nothing in it is not submitted: its start is never written)
     self.q, self.queued = None, 0
 
   def launch_fast(self, prog: Program, ptrs: list, grid, vals):
@@ -404,6 +482,7 @@ class Card:
     self.begin()
     before = self.fast.last
     off = self.fast.launch(self.q, prog, ptrs, grid, vals)
+    if self.PROFILE: self.stamp(prog, grid)
     if self.check and self.ref is not None:
       try: self.compare(prog, ptrs, grid, vals, off, before)
       except Exception:
@@ -413,6 +492,10 @@ class Card:
     # (a checked launch takes two slots of the arguments' ring, its own and tinygrad's: counted so, or the ring would
     # wrap onto launches the card has yet to run)
     self.queued, self.since_sync = self.queued + 1, self.since_sync + (2 if self.check else 1)
+    if self.queued >= min(self.BATCH, self.FIRST << (2 * self.queues)):
+      self.end()
+      self.queues += 1
+      self.begin()
     if not inside: self.end()
     elif self.queued >= self.BATCH:
       self.end()
@@ -454,10 +537,11 @@ class Card:
 
   def launch(self, prog: Program, bufs, grid, vals=()):
     inside = self.q is not None   # (a submission's, else a launch of its own: an ALLOC's clear)
-    if self.PROFILE: return self.timed(prog, bufs, grid, vals, inside)
+    if self.ALONE: return self.timed(prog, bufs, grid, vals, inside)
     if self.since_sync >= self.ARGS_RING: self.sync()
     self.begin()
     self.q.exec(prog.prg, prog.args(bufs, grid, vals), grid, prog.workgroup)
+    if self.PROFILE: self.stamp(prog, grid)
     self.queued, self.since_sync = self.queued + 1, self.since_sync + 1
     if self.SYNC_EACH:
       self.end()
@@ -492,9 +576,12 @@ class Card:
 
   def report(self):
     """The kernels' times so far (TINYGPU_PROFILE), the most first, written to the cache's profile.txt."""
-    if not self.PROFILE or not self.profiled: return
+    if not self.PROFILE: return
+    self.sync()
+    if not self.profiled: return
     total = sum(s[1] for s in self.profiled.values())
-    lines = [f"{total * 1e3:10.1f} ms in {sum(s[0] for s in self.profiled.values())} kernels (each alone: a submission's 45 us in each)",
+    how = "each alone: a submission's 45 us in each" if self.ALONE else "each timed by the card, its launch in it"
+    lines = [f"{total * 1e3:10.1f} ms in {sum(s[0] for s in self.profiled.values())} kernels ({how})",
              f"{'ms':>10} {'%':>5} {'calls':>7} {'ms each':>9}  {'grid':<16} {'workgroup':<12} kernel (its CUDA: <cache>/<kernel>.cu)"]
     for label, (n, t, grid, wg) in sorted(self.profiled.items(), key=lambda kv: -kv[1][1]):
       lines.append(f"{t * 1e3:10.1f} {100 * t / total:5.1f} {n:7d} {t * 1e3 / n:9.3f}  {str(grid):<16} {str(wg):<12} {label}")
@@ -524,6 +611,7 @@ class Card:
     out = memoryview(bytearray(size))
     self.dev.allocator._copyout(out, self.view(buf, off, size))
     self.since_sync = 0
+    if self.stamps: self.settle()
     return bytes(out)
 
   def program(self, workgroup: tuple, src: str, sizes: int, scratch: bool):
@@ -556,6 +644,7 @@ class Card:
     self.end()
     self.dev.synchronize()
     self.since_sync = 0
+    if self.stamps: self.settle()
 
 
 # ---- no card: the kernels on the CPU ----
@@ -730,6 +819,7 @@ class Server:
 
   def submit(self, p):
     p, at = memoryview(p), 0
+    self.card.queues = 0
     self.card.begin()
     try: self.ops(p)
     finally: self.card.end()
@@ -779,6 +869,9 @@ def recv_exact(conn: socket.socket, n: int, into: bytearray | None = None) -> by
 # the time between requests (the client's), said on stderr every 5 seconds: where a program's time goes, the server's
 # Python or the card's work or the client.
 STATS = os.environ.get("TINYGPU_STATS") == "1"
+# TINYGPU_TRACE_IO=FILE: each request a line in FILE (its kind, its size, its buffer, when it came and how long it took,
+# and how long the server waited for it): what a program asks of the card, in order
+TRACE_IO = open(os.environ["TINYGPU_TRACE_IO"], "a", buffering=1 << 16) if os.environ.get("TINYGPU_TRACE_IO") else None
 # TINYGPU_CPROFILE=FILE: the server's Python profiled while it answers (cProfile), written to FILE as a client goes
 CPROFILE = os.environ.get("TINYGPU_CPROFILE")
 NAMES = {1: "hello", 2: "alloc", 3: "free", 4: "write", 5: "read", 6: "program", 7: "submit", 8: "sync"}
@@ -876,6 +969,10 @@ def handle(server: Server, conn: socket.socket, lock: threading.Lock, closing: t
           finally:
             if profile: profile.disable()
           if STATS: counted(cmd, time.perf_counter() - t, asked - answered, server.dispatched if cmd == 7 else 0)
+          if TRACE_IO:
+            what = struct.unpack_from("<Q", payload)[0] if cmd in (3, 4, 5) and len(payload) >= 8 else ""
+            size = struct.unpack_from("<Q", payload, 16)[0] if cmd == 5 else (len(payload) - 16 if cmd == 4 else len(payload))
+            TRACE_IO.write(f"{t:.6f} {NAMES.get(cmd, cmd)} {what} {size} {server.dispatched if cmd == 7 else ''} took {1e6 * (time.perf_counter() - t):.0f} waited {1e6 * (asked - answered):.0f}\n")
           if cmd == 2: owned.add(struct.unpack("<Q", out)[0])
           elif cmd == 3: owned.discard(struct.unpack_from("<Q", payload)[0])
         except Exception as e:
