@@ -59,16 +59,37 @@ impl FlashNext {
         // chunk's when it began)
         for (d, layers) in st.attn_of.iter().enumerate().filter(|_| !resumed) {
             let g = &mut m.kv[d];
+            let from = if g.owner == kv.id { kv.dirty_from.min(past) } else { 0 };
             if g.cap < past + t {
                 // (room for the rows the cache's user has said are coming, a prompt's: made once, not as they come)
                 let cap = (past + t).max(kv.expect.min(kv.max_len)).next_power_of_two().max(256);
-                g.layers = (0..layers.len()).map(|i| match g.layers.get(i) { Some(old) => chains[d].resize(old, cap * row), None => chains[d].vec(cap * row) }).collect();
-                g.raw = (0..layers.len()).map(|i| match g.raw.get(i) { Some(old) => chains[d].resize(old, cap * id_dim), None => chains[d].vec(cap * id_dim) }).collect();
-                g.out = chains[d].vec(chains[d].attention_out_len(nh, hd, cap));
+                // The old vectors go as the new ones come, a layer at a time, and before any new one where none of
+                // their rows is kept (`from`: the rest is written again below): made all at once beside the old ones,
+                // a cache's growth took both caches' memory of a card that holds little more than one (the 27B's did,
+                // llama-rs's `reserve`).
+                g.out = chains[d].vec(1);
                 g.qsa = None;
+                if from == 0 {
+                    g.layers.clear();
+                    g.raw.clear();
+                }
+                g.layers.truncate(layers.len());
+                g.raw.truncate(layers.len());
+                for i in 0..layers.len() {
+                    if i < g.layers.len() {
+                        g.layers[i] = chains[d].resize(&g.layers[i], cap * row);
+                    } else {
+                        g.layers.push(chains[d].vec(cap * row));
+                    }
+                    if i < g.raw.len() {
+                        g.raw[i] = chains[d].resize(&g.raw[i], cap * id_dim);
+                    } else {
+                        g.raw.push(chains[d].vec(cap * id_dim));
+                    }
+                }
+                g.out = chains[d].vec(chains[d].attention_out_len(nh, hd, cap));
                 g.cap = cap;
             }
-            let from = if g.owner == kv.id { kv.dirty_from.min(past) } else { 0 };
             if from < past {
                 for (slot, &l) in layers.iter().enumerate() {
                     let (kh, vh) = (kv.k_buffer(l).to_host(), kv.v_buffer(l).to_host());

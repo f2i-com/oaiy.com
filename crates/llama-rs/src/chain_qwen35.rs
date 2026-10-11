@@ -591,26 +591,134 @@ mod position_tests {
         // (and the axes matter: the same rows at their time alone rotate otherwise)
         assert_ne!(rope_table_at(theta, rot, &positions[3..4]), rope_table(theta, rot, 5, 1));
     }
+
+    /// A device that only counts: the bytes of the vectors it has made that are still held, and the most at once.
+    struct Counting {
+        live: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        most: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct Counted(usize, std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            self.1.fetch_sub(self.0, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl ggml_rs::DeviceChain for Counting {
+        fn vec(&self, len: usize) -> ggml_rs::DeviceVec {
+            use std::sync::atomic::Ordering::SeqCst;
+            let now = self.live.fetch_add(len * 4, SeqCst) + len * 4;
+            self.most.fetch_max(now, SeqCst);
+            ggml_rs::DeviceVec { len, inner: std::sync::Arc::new(Counted(len * 4, std::sync::Arc::clone(&self.live))) }
+        }
+        fn zero(&self, _: &ggml_rs::DeviceVec) {}
+        fn alias(&self, _: &ggml_rs::DeviceVec, _: Vec<usize>) -> Tensor {
+            unimplemented!()
+        }
+        fn aliased(&self, _: &Tensor) -> Option<ggml_rs::DeviceVec> {
+            None
+        }
+        fn upload_at(&self, _: &ggml_rs::DeviceVec, _: usize, _: &[f32]) {}
+        fn resize(&self, _: &ggml_rs::DeviceVec, len: usize) -> ggml_rs::DeviceVec {
+            self.vec(len)
+        }
+        fn holds(&self, _: &ggml_rs::QuantizedTensor) -> bool {
+            false
+        }
+        fn holds_exl3(&self, _: &dyn ggml_rs::exl3::PackedLinear) -> bool {
+            false
+        }
+        fn holds_experts(&self, _: &dyn ggml_rs::exl3::Experts) -> bool {
+            false
+        }
+        fn attention_out_len(&self, n_h: usize, head_dim: usize, _: usize) -> usize {
+            n_h * head_dim
+        }
+        fn attention_rows_out_len(&self, _: usize, _: usize, _: usize, _: usize) -> usize {
+            0
+        }
+        fn begin(&self) -> Box<dyn ggml_rs::ChainRecorder + '_> {
+            unimplemented!()
+        }
+    }
+
+    /// The 27B's attention cache on a 24 GB card: 16 layers of 4 KV heads of 256, grown from 16,384 rows to 32,768 by
+    /// a prompt past the first's length. All the new layers made beside all the old ones is 6 GB at once, which the
+    /// card did not have beside the model's weights. A layer at a time it is the new cache and one old layer; and
+    /// with no row of the old one kept (a prompt begun again), the new cache alone.
+    #[test]
+    fn a_cache_grows_without_holding_the_old_one_beside_the_new() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let s = super::Dims { d: 5120, n_h: 24, n_kv: 4, hd: 256, rot: 0, ff: 0, nv: 0, nk: 0, dk: 0, dv: 0, ch: 0, kern: 0, vocab: 0 };
+        let (slots, row) = (16, 2 * s.n_kv * s.hd);
+        let layer = |cap: usize| cap * row * 4;
+        for keep in [16_384, 0] {
+            let chain = Counting { live: Default::default(), most: Default::default() };
+            let mut g = super::Kv { layers: Vec::new(), cap: 0, out: ggml_rs::DeviceChain::vec(&chain, 1), owner: 0, half: Vec::new(), halved: 0, refused: 0 };
+            super::reserve(&chain, &mut g, &s, slots, 15_088, 0);
+            assert_eq!((g.cap, g.layers.len()), (16_384, slots));
+            // (its halves, as a step deep in it makes them)
+            g.half = (0..slots).map(|_| ggml_rs::DeviceChain::vec(&chain, 16_384 * row / 2)).collect();
+            let old = chain.live.load(SeqCst);
+            assert!(old >= slots * layer(16_384) * 3 / 2);
+            chain.most.store(old, SeqCst);
+            super::reserve(&chain, &mut g, &s, slots, 17_621, keep);
+            assert_eq!((g.cap, g.layers.len(), g.half.len()), (32_768, slots, 0));
+            let (new, most) = (chain.live.load(SeqCst), chain.most.load(SeqCst));
+            assert!(new >= slots * layer(32_768) && new < slots * layer(32_768) + (1 << 20), "{new}");
+            // the most at once, past what the grown cache holds: one old layer where rows are kept, nothing where none
+            // (but the one value that stands for the attention's output meanwhile)
+            let over = most.max(new) - new;
+            let allowed = if keep == 0 { 4 } else { layer(16_384) + 4 };
+            assert!(most <= old.max(new + allowed), "keep {keep}: {most} at once, of {old} before and {new} after ({over} over)");
+        }
+    }
 }
 
-/// Room in the chain's copy of the attention cache for `needed` rows (grown to a power of two, its rows kept).
-fn reserve(chain: &dyn DeviceChain, g: &mut Kv, s: &Dims, slots: usize, needed: usize) {
+/// Room in the chain's copy of the attention cache for `needed` rows (grown to a power of two). Its first `keep` rows
+/// are the ones still wanted of it (what [`sync`] will not write again: [`kept`]); with none, nothing of it is.
+///
+/// The old vectors go as the new ones come: what is made from the layers' rows first (the halves, the attention's
+/// output), then a layer at a time, or every layer before any new one where no row is kept. Made all at once beside
+/// the old ones, a cache grown from 16,384 rows to 32,768 took both caches' memory together, 6 GB of the 27B's on a
+/// 24 GB card with 15.8 GB of weights on it, and the halves' gigabyte: the card had no room ("Allocation of
+/// 256.00 MB failed"), and a 17,621-token prompt that came after a 15,088-token one failed, every time.
+fn reserve(chain: &dyn DeviceChain, g: &mut Kv, s: &Dims, slots: usize, needed: usize, keep: usize) {
     if g.cap >= needed {
         return;
     }
     let row = 2 * s.n_kv * s.hd;
     let cap = needed.next_power_of_two().max(256);
-    g.layers = (0..slots)
-        .map(|i| match g.layers.get(i) {
-            Some(old) => chain.resize(old, cap * row),
-            None => chain.vec(cap * row),
-        })
-        .collect();
-    g.out = chain.vec(chain.attention_out_len(s.n_h, s.hd, cap));
-    g.cap = cap;
     // (the halves' vectors are the old layers': made again, and filled, at the next step that reads them)
     g.half.clear();
     g.halved = 0;
+    g.out = chain.vec(1);
+    if keep == 0 {
+        g.layers.clear();
+    }
+    g.layers.truncate(slots);
+    for i in 0..slots {
+        if i < g.layers.len() {
+            // (the old layer's vector is let go as this one takes its place)
+            g.layers[i] = chain.resize(&g.layers[i], cap * row);
+        } else {
+            g.layers.push(chain.vec(cap * row));
+        }
+    }
+    g.out = chain.vec(chain.attention_out_len(s.n_h, s.hd, cap));
+    g.cap = cap;
+}
+
+/// The rows of the chain's copy that are still the cache's, of its first `past`: those [`sync`] leaves as they are
+/// (none for a cache the copy is not of, or one begun again).
+fn kept(g: &Kv, kv: &KvCache, past: usize) -> usize {
+    if g.owner == kv.id {
+        kv.dirty_from.min(past)
+    } else {
+        0
+    }
 }
 
 /// Bring the chain's copy of the attention cache up to `past` rows: the rows the host wrote since (all of them for a
@@ -1216,7 +1324,8 @@ impl Qwen35Chain {
         let eps = cfg.rms_eps;
         self.split_written(kv, past);
         let mut g = st.kv.lock().unwrap_or_else(|p| p.into_inner());
-        reserve(chain, &mut g, &s, st.attention_layers.len(), (past + t).max(kv.expect.min(kv.max_len)));
+        let keep = kept(&g, kv, past);
+        reserve(chain, &mut g, &s, st.attention_layers.len(), (past + t).max(kv.expect.min(kv.max_len)), keep);
         sync(chain, &mut g, &s, &st.attention_layers, kv, past);
         // the layers' rows from `past` on are written here: their halves' rows end there; a step deep in a long cache
         // reads the halves, brought up to its own row as it goes

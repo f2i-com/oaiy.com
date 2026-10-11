@@ -244,7 +244,11 @@ impl DeviceChain for WgpuBackend {
         if keep > 0 {
             let mut enc = self.gpu.device.create_command_encoder(&Default::default());
             enc.copy_buffer_to_buffer(buffer(v), 0, buffer(&grown), 0, (keep * 4) as u64);
-            self.gpu.queue().submit([enc.finish()]);
+            let copied = self.gpu.queue().submit([enc.finish()]);
+            // The copy done before this returns: until it is, the device holds `v`'s buffer for it, and whoever
+            // grows a cache a vector at a time (letting each old one go as its new one comes) would have every old
+            // one still there beside every new one.
+            self.gpu.wait(Some(copied));
         }
         grown
     }
