@@ -112,6 +112,32 @@ function zippBytes(): Promise<ArrayBuffer> {
   return engineBytes;
 }
 
+let softnEngine: Promise<ArrayBuffer> | null = null;
+/**
+ * The engine a SoftN app's frame is given. SoftN's runtime takes the module from its parent and binds it with the
+ * bindings of the ZIPP release it was built with, and another release's module does not fit them (the frame fails
+ * with "Import … requires a callable"). The runtime's manifest names its engine by its digest: that is the Agent's
+ * own engine when both are one release, and else the copy the runtime carries among its assets.
+ */
+function softnZippBytes(): Promise<ArrayBuffer> {
+  softnEngine ??= (async () => {
+    const json = (url: string) =>
+      fetch(url, { cache: 'no-store' })
+        .then((r) => (r.ok ? r.json() : null))
+        .catch(() => null);
+    const [manifest, own] = await Promise.all([json(`${import.meta.env.BASE_URL}softn/runtime-manifest.json`), json(`${zippBase()}SOURCE.json`)]);
+    const wanted: unknown = manifest?.zipp?.sha256;
+    if (typeof wanted !== 'string' || own?.files?.['zipp_wasm_bg.wasm'] === wanted) return zippBytes();
+    const carried = Object.entries((manifest.files ?? {}) as Record<string, unknown>).find(([name, digest]) => digest === wanted && /^assets\/zipp_wasm_bg-[\w-]+\.wasm$/.test(name));
+    if (!carried) return zippBytes();
+    const r = await fetch(`${import.meta.env.BASE_URL}softn/${carried[0]}`);
+    if (!r.ok) throw new Error(`SoftN's Zipp engine could not be loaded (${r.status})`);
+    return r.arrayBuffer();
+  })();
+  softnEngine.catch(() => (softnEngine = null));
+  return softnEngine;
+}
+
 let glueSource: Promise<string> | null = null;
 /** The engine's JavaScript bindings, which the page frame imports itself (it has an opaque origin). */
 function zippGlue(): Promise<string> {
@@ -754,7 +780,7 @@ export class Preview {
     }
     let bytes: ArrayBuffer;
     try {
-      bytes = await zippBytes();
+      bytes = await softnZippBytes();
     } catch (error) {
       this.setStatus('failed', 'error');
       this.settle({ ok: false, errors: [(error as Error).message] });

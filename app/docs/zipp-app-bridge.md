@@ -4,14 +4,22 @@ OAIY's sandbox gives guest programs synchronous file and network access (Node's 
 
 ## Status
 
-The bridge is implemented in zipp.org on the branch `feature/app-host-bridge` (`crates/zipp-wasm`), with the boundary check `tests/node/app-bridge.cjs`. The full boundary suite passes (27 of 27).
+The bridge is in ZIPP since v0.0.22 (`crates/zipp-wasm`, with the boundary check `tests/node/app-bridge.cjs`), and
+OAIY installs that release (`scripts/fetch-zipp.mjs`).
 
-OAIY already uses it: the sandbox Worker feature-detects `Engine.prototype.setAppBridge`.
+The sandbox Worker feature-detects `Engine.prototype.setAppBridge`.
 
-- **An engine with the bridge** answers `host.callSync(kind, …)` through it, with each of the sandbox's operations granted exactly as `app.<kind>`.
-- **The released engine (v0.0.21)** has no bridge, so the same calls ride the synchronous `localStorage.getItem` bridge with a reserved key prefix. Ordinary `localStorage` keys stay inert.
+- **An engine with the bridge** (v0.0.22 and later) answers `host.callSync(kind, …)` through it, with each of the
+  sandbox's operations granted exactly as `app.<kind>`.
+- **An engine without it** (v0.0.21 and earlier) has the same calls ride the synchronous `localStorage.getItem`
+  bridge with a reserved key prefix. Ordinary `localStorage` keys stay inert. The tunnel stays as the fallback.
 
-Both paths pass `tests/e2e/run.mjs`. Once a Zipp release includes the bridge, bumping `RELEASE` in `scripts/fetch-zipp.mjs` switches OAIY over; the tunnel stays as the fallback for older engines.
+Both paths passed `tests/e2e/run.mjs`: the tunnel on v0.0.21, the bridge on v0.0.22 (11 October 2026).
+
+SoftN's hosted runtime is another matter: it takes the engine's module from the Agent and binds it with the
+bindings of the ZIPP release it was built with, so it is given that release's module and not necessarily the Agent's
+(`softnZippBytes` in `src/preview/preview.ts`: the Agent's own when the runtime's manifest names the same module, else
+the copy the runtime carries). SoftN v0.0.18 was built with ZIPP v0.0.21.
 
 ## The API (zipp-wasm)
 
