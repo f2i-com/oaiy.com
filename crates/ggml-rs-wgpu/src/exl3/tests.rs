@@ -1366,3 +1366,40 @@ fn experts_held_in_slots_take_their_low_rank_updates_with_them() {
     let (held, not, taken) = moe.rest_counts().unwrap();
     assert!(held > 0 && not > 0 && taken > 3, "the slots were used and changed hands: {held} held, {not} not, {taken} taken in");
 }
+
+/// A few rows routed on the GPU to the slots (a prompt's last tokens after a kept state, a check's rows), several of
+/// a row's experts not held: each row's sum with the host's rest is the definition's. (An expert the card lacks goes
+/// by slot 0's place, a row's several at once: they must not be taken for one expert's rows, a row each.)
+#[test]
+fn a_few_rows_routed_to_slots_with_several_experts_not_held_are_the_definitions_sums() {
+    let Some(b) = backend() else { return };
+    let (count, hidden, ff, top_k, tw) = (12, 256, 128, 5, 48);
+    let (layout, records, shared) = as_records(experts(count, hidden, ff, tw));
+    let moe = b.exl3_experts_tiered(layout, Arc::new(records), shared, 3, 0).unwrap();
+    for round in 0..3 {
+        for rows in [2usize, 3, 5, 8] {
+            let x: Vec<f32> = (0..rows * hidden).map(|i| ((i * 37 % 101 + round * 7 + rows) as f32 - 50.0) / 60.0).collect();
+            let logits: Vec<f32> = (0..rows * (count + 1)).map(|i| ((i * 53 % 29 + round * 11 + rows * 3) as f32 % 29.0 - 14.0) / 7.0).collect();
+            let want = reference(experts(count, hidden, ff, tw), &x, &logits, top_k);
+            let size = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let (xd, out, ld) = (b.vec(rows * hidden), b.vec(rows * hidden), b.vec(rows * (count + 1)));
+            DeviceChain::upload(&b, &xd, &x);
+            DeviceChain::upload(&b, &ld, &logits);
+            let mut rec = b.begin();
+            rec.keep_groups(true);
+            assert!(rec.moe_routed(moe.as_ref(), &xd, &out, &ld, top_k, rows), "{rows} rows routed on the GPU");
+            rec.read(&out);
+            let mut got = rec.finish().pop().unwrap();
+            if let Some(r) = moe.forward_rest(&Tensor::from_vec(x.clone(), vec![rows, hidden]), &Tensor::from_vec(logits.clone(), vec![rows, count + 1]), top_k) {
+                for (g, v) in got.iter_mut().zip(r.data()) {
+                    *g += v;
+                }
+            }
+            for (i, (a, e)) in got[..rows * hidden].iter().zip(&want).enumerate() {
+                assert!((a - e).abs() <= 0.003 + 1e-3 * size, "round {round}, {rows} rows [{i}]: {a} != {e}");
+            }
+        }
+    }
+    let (held, not, _) = moe.rest_counts().unwrap();
+    assert!(held > 0 && not > held, "most routings were to experts not held: {held} held, {not} not");
+}

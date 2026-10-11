@@ -636,8 +636,10 @@ impl Exl3MoeGrouped {
             return true;
         }
         // a check's few rows: an expert the rows share decoded once for them (its jobs one block; OAIY_MOE_UNGROUPED:
-        // a job each)
-        let grouped = (2..=FEW_MAX).contains(&rows) && pairs <= 256 && std::env::var_os("OAIY_MOE_UNGROUPED").is_none();
+        // a job each). Not where the experts go by a map of slots: a row's several experts the device does not hold
+        // all go by slot 0's place, and a block is a row an expert (its places are the rows'): more jobs of one place
+        // than rows ran over into the next expert's block, and that expert's rows were another's.
+        let grouped = map.is_none() && (2..=FEW_MAX).contains(&rows) && pairs <= 256 && std::env::var_os("OAIY_MOE_UNGROUPED").is_none();
         let (ogu, od) = if grouped {
             rec.dispatch_wide("moe-group", GROUP, [&buf(&st.jobs_d), &d, &d, &d, &d, &d, &buf(&st.order_gu), &buf(&st.order_d)], &[pairs as u32, rows as u32], (1, 1, 1));
             (Order::Few(&st.order_gu, 2 * pairs, rows), Order::Few(&st.order_d, pairs, rows))

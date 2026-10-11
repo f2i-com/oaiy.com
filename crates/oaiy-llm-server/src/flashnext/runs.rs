@@ -118,6 +118,15 @@ impl FlashNext {
         asked.unwrap_or(if self.devices.len() == 1 && self.layers.iter().any(|l| l.moe.experts.part_held() || l.moe.experts.host_rest()) { 1024 } else { 512 })
     }
 
+    /// Which of its cache's slots hold keys and values a token ([`Self::new_kv_cache`]'s: the attention layers' and
+    /// their indexers'; the delta-net layers' and the n-gram layer's hold recurrent tensors alone): what a whole state
+    /// of the cache, for the disk, is made and restored by.
+    pub fn row_slots(&self) -> Vec<bool> {
+        let cfg = &self.config;
+        let indexers = cfg.attention.iter().filter(|&&a| a).count();
+        cfg.attention.iter().copied().chain([false]).chain(std::iter::repeat_n(true, indexers)).collect()
+    }
+
     /// The layers whose experts a GPU holds some of (the host running the rest), and the layers; and over them the
     /// experts the GPUs have slots for, of how many.
     pub fn rest_layers(&self) -> (usize, usize, usize, usize) {

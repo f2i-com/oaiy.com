@@ -267,6 +267,15 @@ impl Hybrid {
     fn qwen35(&self) -> Option<&llama_rs::Qwen35Model> {
         match self { Self::Qwen35(Model::Qwen35(m)) => Some(m), _ => None }
     }
+    /// Qwen3.8-Flash-Next's cache: which of its slots hold keys and values a token (`FlashNext::row_slots`), for a
+    /// whole state of it on the disk. None for the other models (the Qwen3.5 hybrid's states are its own shape).
+    fn row_slots(&self) -> Option<Vec<bool>> {
+        match self {
+            #[cfg(feature = "webgpu")]
+            Self::Flash(f) => Some(f.row_slots()),
+            _ => None,
+        }
+    }
     fn tokenizer(&self) -> Result<&tokenizer::Tokenizer, String> {
         match self {
             Self::Qwen35(Model::Qwen35(m)) => Ok(&m.tokenizer),
@@ -722,6 +731,20 @@ impl QwenEngine {
                 }
             }
         }
+        // Qwen3.8-Flash-Next's, a whole state of its cache's slots (no images' yet: their positions are not keyed).
+        if let Some(rows) = hybrid.row_slots().filter(|_| model.is_none() && job.images.is_empty()) {
+            if let Some((saved, snap)) = self.disk.as_mut().and_then(|d| d.load_best(&keys, keys.len()-1, start, self.log)) {
+                match snap.restore_whole(&mut self.kv, &rows) {
+                    Ok(()) => {
+                        // (as above: the attention's rows are the disk's now, so no older checkpoint goes with them)
+                        self.checkpoints.clear();
+                        self.checkpoints.push((saved.clone(), RecurrentSnapshot::from_snapshot(&snap), stops.first() == Some(&snap.pos)));
+                        self.covered = saved; start = snap.pos; source = "disk";
+                    }
+                    Err(e) => { if self.log { eprintln!("Qwen checkpoint skipped: {e}"); } }
+                }
+            }
+        }
         // What came back from RAM is not "memory" or a checkpoint of this process's own making.
         if swapped && start > 0 { source = "ram"; }
         if start == 0 { self.kv.reset(); self.covered.clear(); self.checkpoints.clear(); }
@@ -857,7 +880,7 @@ impl QwenEngine {
         let mut logits = Row::Logits(logits.unwrap());
         // (a greedy request's rows: the token alone where the model picks it on its GPU, megabytes of logits a check
         // not read back)
-        let greedy = job.sampling.temperature <= 0.0 && job.images.is_empty();
+        let greedy = job.sampling.temperature <= 0.0 && job.images.is_empty() && !top_log();
         let mut finish = Finish::Length;
         // Where decoding's time goes, for the log: sampling, the text (decode and stream), the model.
         let (mut t_sample, mut t_text, mut t_model) = (0f64, 0f64, 0f64);
@@ -1023,6 +1046,19 @@ impl QwenEngine {
                 }
             }
         }
+        // (Qwen3.8-Flash-Next's: its cache's slots, the keys and values of those that hold them up to the checkpoint)
+        if let (Some(rows), Some(disk)) = (self.model.row_slots().filter(|_| job.images.is_empty()), self.disk.as_mut().filter(|_| !job.forget)) {
+            for &at in &to_disk {
+                if disk.has(&keys[..at]) {
+                    continue;
+                }
+                let Some((_, snap, base)) = self.checkpoints.iter().find(|(saved, _, _)| saved.as_slice() == &keys[..at]) else { continue };
+                let Some(backend) = self.kv.layer_backends.first().cloned() else { continue };
+                if let Some(whole) = Snapshot::from_checkpoint(snap, &self.kv, &rows, backend.as_ref()) {
+                    disk.save(keys[..at].to_vec(), Arc::new(whole), *base);
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -1040,10 +1076,27 @@ impl Row {
     /// The token sampled from the row.
     fn sample(&self, s: &crate::job::Sampling, rng: &mut u64) -> u32 {
         match self {
-            Row::Logits(l) => sample(l.data(), s, rng),
+            Row::Logits(l) => {
+                if top_log() {
+                    let mut top: Vec<(usize, f32)> = l.data().iter().copied().enumerate().collect();
+                    top.select_nth_unstable_by(5, |a, b| b.1.total_cmp(&a.1));
+                    top.truncate(5);
+                    top.sort_by(|a, b| b.1.total_cmp(&a.1));
+                    eprintln!("  top: {}", top.iter().map(|(t, v)| format!("{t}:{v:.3}")).collect::<Vec<_>>().join(" "));
+                }
+                sample(l.data(), s, rng)
+            }
             Row::Pick(token) => *token,
         }
     }
+}
+
+/// OAIY_TOP_LOG: each row's five largest logits and their tokens said as it is sampled (a greedy request's rows read
+/// back for it, where the model would pick on its GPU): two runs of one prompt held against each other, by their
+/// numbers and not by their text alone.
+fn top_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("OAIY_TOP_LOG").is_some())
 }
 
 const DRAFTS: usize = 3;

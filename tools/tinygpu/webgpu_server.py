@@ -418,6 +418,11 @@ class Card:
     pa = getattr(mm, "pa_allocator", None)
     return None if pa is None else sum(size for size, _nxt, _prev, free in pa.blocks.values() if free)
 
+  def cached_memory(self) -> int:
+    """The bytes of the buffers let go that tinygrad keeps for the next of their size (given back to the card when it
+    is full): with what is free, the room there is."""
+    return sum(size * len(bufs) for (size, _spec), bufs in getattr(self.dev.allocator, "cache", {}).items())
+
   def local_memory(self):
     """The card's local memory (a thread's spills and stack) grown as tinygrad's NVDevice._ensure_has_local_memory does,
     but safely: the work in flight, which spills into the old buffer, waited for first; the new buffer made before the
@@ -840,7 +845,7 @@ class Server:
     # launch were most of a dispatch's 5 us here. Emptied when a buffer is let go (its number is never given again, but
     # a kept launch must not outlive what it points at). TINYGPU_NO_KEPT=1: none kept.
     self.kept = None if os.environ.get("TINYGPU_NO_KEPT") == "1" else {}
-    if hasattr(card, "free_memory"): stats_memory[0] = card.free_memory
+    if hasattr(card, "free_memory"): stats_memory[0] = lambda: (card.free_memory(), card.cached_memory())
 
   def new_id(self) -> int:
     self.next_id += 1
@@ -984,8 +989,8 @@ def counted(cmd: int, took: float, idle: float, dispatches: int):
   if now - stats["since"] < 5: return
   span = now - stats["since"]
   kinds = "  ".join(f"{NAMES.get(k, k)} {n} {1e3 * t:.0f} ms" for k, (n, t) in sorted((k, v) for k, v in stats.items() if isinstance(k, int)))
-  free = stats_memory[0]() if stats_memory[0] else None
-  memory = "" if free is None else f"  card memory free {free >> 20} MB"
+  free, cached = stats_memory[0]() if stats_memory[0] else (None, 0)
+  memory = "" if free is None else f"  card memory free {free >> 20} MB and {cached >> 20} MB kept of buffers let go"
   print(f"tinygpu-webgpu: {span:.1f} s: {kinds}  dispatches {stats['dispatches']} ({1e6 * stats.get(7, (0, 0.0))[1] / max(1, stats['dispatches']):.1f} us each in submits)  between requests {1e3 * stats['idle']:.0f} ms{memory}", file=sys.stderr, flush=True)
   stats.clear()
   stats.update({"since": now, "idle": 0.0, "dispatches": 0})

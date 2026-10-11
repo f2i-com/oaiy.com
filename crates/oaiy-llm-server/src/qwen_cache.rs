@@ -203,6 +203,37 @@ impl Snapshot {
         self.restore_inner(kv, attention, ssm, backend, false)
     }
 
+    /// [`Self::restore`] onto a cache whose slots are not the Qwen3.5 hybrid's (Qwen3.8-Flash-Next's: its layers, its
+    /// n-gram layer's and its indexers'): `rows` says which slots hold keys and values a token ([`Self::
+    /// from_checkpoint`] made the state with the same), each of the cache's own heads and width; the other slots'
+    /// recurrent tensors go back whatever their shape, each on its slot's device. The cache is emptied first, and
+    /// nothing is touched where the state is not of its shape.
+    pub fn restore_whole(&self, kv: &mut KvCache, rows: &[bool]) -> Result<(), String> {
+        if self.pos == 0 || self.pos > kv.max_len || self.layers.len() != rows.len() || rows.len() != kv.ssm_state.len() {
+            return Err("a prompt state of another cache's shape".into());
+        }
+        for (i, (layer, &held)) in self.layers.iter().zip(rows).enumerate() {
+            let shape = [self.pos, kv.n_kv_heads_per_layer[i], kv.head_dims[i]];
+            let fits = |t: &Option<Tensor>| if held { t.as_ref().is_some_and(|t| t.shape() == shape) } else { t.is_none() };
+            if !fits(&layer[0]) || !fits(&layer[1]) || (held && (layer[2].is_some() || layer[3].is_some())) {
+                return Err("a prompt state whose keys and values are not this cache's".into());
+            }
+        }
+        kv.reset();
+        for (i, layer) in self.layers.iter().enumerate() {
+            let backend = kv.layer_backends[i].clone();
+            if let (Some(k), Some(v)) = (&layer[0], &layer[1]) {
+                kv.reserve_layer(backend.as_ref(), i, self.pos);
+                backend.copy_axis0_into(&mut kv.k[i], 0, &backend.to_device(k.clone()));
+                backend.copy_axis0_into(&mut kv.v[i], 0, &backend.to_device(v.clone()));
+            }
+            kv.ssm_state[i] = layer[2].as_ref().map(|t| backend.to_device(its_own(t)));
+            kv.ssm_conv[i] = layer[3].as_ref().map(|t| backend.to_device(its_own(t)));
+        }
+        kv.len = self.pos;
+        Ok(())
+    }
+
     fn restore_inner(&self, kv: &mut KvCache, attention: &[bool], ssm: SsmConfig, backend: &dyn Backend, reuse_attention: bool) -> Result<(), String> {
         if self.pos == 0 || self.pos > kv.max_len || self.layers.len() != attention.len() {
             return Err("incompatible Qwen checkpoint dimensions".into());
@@ -344,6 +375,55 @@ mod tests {
         assert_eq!(&kv.v[0].data()[..6], &[3.0; 6]);
         assert_eq!(kv.ssm_state[1].as_ref().unwrap().data(), &[4.0; 4]);
         assert_eq!(kv.ssm_conv[1].as_ref().unwrap().data(), &[5.0; 12]);
+    }
+
+    /// A whole state of a cache whose slots are Flash-Next's (a layer that attends, a delta-net layer, the n-gram
+    /// layer's slot, an indexer's) goes to the disk's bytes and back onto an empty cache as it was at its checkpoint:
+    /// the keys and values up to it, the recurrent tensors whatever their shapes; and not onto a cache of another shape.
+    #[test]
+    fn a_whole_state_of_a_cache_of_slots_goes_to_the_disk_and_back() {
+        let backend: Arc<dyn Backend> = Arc::new(ggml_rs::CpuBackend::new());
+        let make = || KvCache::new_lazy_per_layer_kv(vec![backend.clone(); 4], 64, &[2, 1, 1, 1], &[3, 1, 1, 4]);
+        let rows = [true, false, false, true];
+        let mut kv = make();
+        let fill = |seq: usize, heads: usize, dim: usize, from: f32| Tensor::from_vec((0..seq * heads * dim).map(|i| from + i as f32).collect(), vec![seq, heads, dim]);
+        kv.append(backend.as_ref(), 0, &fill(5, 2, 3, 100.0), &fill(5, 2, 3, 200.0));
+        kv.append(backend.as_ref(), 3, &fill(5, 1, 4, 300.0), &fill(5, 1, 4, 300.0));
+        kv.commit(5);
+        kv.ssm_state[1] = Some(Tensor::from_vec(vec![4.0; 8], vec![2, 2, 2]));
+        kv.ssm_conv[1] = Some(Tensor::from_vec(vec![5.0; 6], vec![1, 6]));
+        kv.ssm_state[2] = Some(Tensor::from_vec(vec![11.0, 12.0], vec![2]));
+        kv.ssm_conv[2] = Some(Tensor::from_vec(vec![6.0; 9], vec![3, 3]));
+        let checkpoint = RecurrentSnapshot::capture(&kv);
+        // the run goes on past the checkpoint
+        kv.append(backend.as_ref(), 0, &fill(2, 2, 3, 900.0), &fill(2, 2, 3, 950.0));
+        kv.append(backend.as_ref(), 3, &fill(2, 1, 4, 970.0), &fill(2, 1, 4, 970.0));
+        kv.commit(2);
+        kv.ssm_state[1].as_mut().unwrap().data_mut().fill(97.0);
+        kv.ssm_state[2] = Some(Tensor::from_vec(vec![13.0, 14.0], vec![2]));
+        let whole = Snapshot::from_checkpoint(&checkpoint, &kv, &rows, backend.as_ref()).unwrap();
+        let mut bytes = Vec::new();
+        Arc::new(whole).encode(&mut bytes);
+        let back = <Arc<Snapshot> as PromptState>::decode(&bytes).unwrap();
+        assert_eq!(back.pos, 5);
+        let mut fresh = make();
+        back.restore_whole(&mut fresh, &rows).unwrap();
+        assert_eq!(fresh.len, 5);
+        assert_eq!(backend.slice_axis0(&fresh.k[0], 5).to_host().data(), fill(5, 2, 3, 100.0).data());
+        assert_eq!(backend.slice_axis0(&fresh.v[0], 5).to_host().data(), fill(5, 2, 3, 200.0).data());
+        assert_eq!(backend.slice_axis0(&fresh.k[3], 5).to_host().data(), fill(5, 1, 4, 300.0).data());
+        assert_eq!(fresh.ssm_state[1].as_ref().unwrap().data(), &[4.0; 8]);
+        assert_eq!(fresh.ssm_conv[1].as_ref().unwrap().shape(), &[1, 6]);
+        assert_eq!(fresh.ssm_state[2].as_ref().unwrap().data(), &[11.0, 12.0]);
+        assert_eq!(fresh.ssm_conv[2].as_ref().unwrap().data(), &[6.0; 9]);
+        assert!(fresh.ssm_state[0].is_none() && fresh.ssm_state[3].is_none());
+        // a cache of other slots, or of other heads: refused, and left as it was
+        let mut other = KvCache::new_lazy_per_layer_kv(vec![backend.clone(); 4], 64, &[1, 1, 1, 1], &[3, 1, 1, 4]);
+        other.len = 1;
+        assert!(back.restore_whole(&mut other, &rows).is_err());
+        assert_eq!(other.len, 1);
+        assert!(back.restore_whole(&mut make(), &[true, false, true, true]).is_err());
+        assert!(back.restore_whole(&mut make(), &[true, false, false]).is_err());
     }
 
     #[test]

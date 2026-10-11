@@ -743,7 +743,31 @@ impl Models {
         };
         let (jobs, rx) = std::sync::mpsc::channel();
         let park = crate::qwen_park::budget(o.park_gb, ggml_rs_wgpu::host_memory().map(|(free, _)| free as u64));
-        let e = crate::qwen::QwenEngine::new(crate::qwen::Hybrid::Flash(Box::new(model)), projector, max_seq, !o.quiet && !o.silent).park_up_to(park);
+        let mut e = crate::qwen::QwenEngine::new(crate::qwen::Hybrid::Flash(Box::new(model)), projector, max_seq, !o.quiet && !o.silent).park_up_to(park);
+        // Its prompt states on the disk (a whole state of its cache at a prompt's boundaries): a conversation, or a
+        // system prompt, is not read again by the next process to load the model. The states are this checkpoint's
+        // under these adapters and no other's.
+        if let Some(dir) = &o.prompt_cache {
+            let mut fp = disk::fnv(b"flashnext-exl3-state-v1", 0);
+            fp = disk::fnv(spec.path.as_os_str().as_encoded_bytes(), fp);
+            let mut files: Vec<_> = std::fs::read_dir(&spec.path)?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|x| x == "safetensors" || x == "json"))
+                .collect();
+            files.sort();
+            for p in files {
+                let meta = std::fs::metadata(&p)?;
+                fp = disk::fnv(p.as_os_str().as_encoded_bytes(), fp);
+                fp = disk::fnv(&meta.len().to_le_bytes(), fp);
+            }
+            for adapter in &adapters {
+                fp = disk::fnv(&adapter.fingerprint.to_le_bytes(), fp);
+            }
+            match disk::DiskCache::open(dir, fp, (o.prompt_cache_gb * 1e9) as u64) {
+                Ok(cache) => e.disk = Some(cache),
+                Err(err) => self.say(format!("{}: prompt cache unavailable: {err}", spec.name)),
+            }
+        }
         let thread = std::thread::Builder::new().name("flashnext-model".into()).spawn(move || e.run(rx))?;
         Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Qwen(tok)) })
     }
