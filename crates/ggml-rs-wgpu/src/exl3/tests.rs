@@ -1265,3 +1265,38 @@ fn the_vectors_decode_every_code_as_mul1() {
         }
     }
 }
+
+/// A prompt's rows over many experts read as records (each expert a task of its own: its record read, then run) are
+/// the definition's sums, with an adapter's low-rank updates beside some of them.
+#[test]
+fn many_experts_read_as_records_each_a_task_are_the_definitions_sums() {
+    let Some(b) = backend() else { return };
+    let (count, hidden, ff, top_k, tw, rows) = (40, 256, 128, 6, 48, 30);
+    let lora: Pairs = [
+        lora_pairs(count, &[3, 7, 21, count], 2, hidden, ff, 15),
+        lora_pairs(count, &[3, 8], 4, hidden, ff, 16),
+        lora_pairs(count, &[1, 3, 4, 26, count], 2, ff, hidden, 17),
+    ];
+    let x: Vec<f32> = (0..rows * hidden).map(|i| ((i * 37 % 101) as f32 - 50.0) / 60.0).collect();
+    let logits: Vec<f32> = (0..rows * (count + 1)).map(|i| ((i * 53 % 67) as f32 - 33.0) / 9.0).collect();
+    let (xt, lt) = (Tensor::from_vec(x.clone(), vec![rows, hidden]), Tensor::from_vec(logits.clone(), vec![rows, count + 1]));
+    let used: std::collections::BTreeSet<usize> = (0..rows).flat_map(|r| route(&logits[r * (count + 1)..(r + 1) * (count + 1)], top_k)).map(|(e, _)| e).filter(|&e| e < count).collect();
+    assert!(used.len() >= 24, "the rows route to {} experts", used.len());
+    let none: Pairs = [None, None, None];
+    for (adapted, l) in [(false, &none), (true, &lora)] {
+        let want = reference_adapted(experts(count, hidden, ff, tw), l, &x, &logits, top_k);
+        let size = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let (layout, records, shared) = as_records(experts(count, hidden, ff, tw));
+        let mut moe = b.exl3_experts_tiered(layout, Arc::new(records), shared, 0, 0).unwrap();
+        if adapted {
+            for (which, p) in l.iter().enumerate() {
+                let (s, a, bb, r) = p.as_ref().unwrap();
+                moe.low_rank(which, s, a, bb, *r).unwrap();
+            }
+        }
+        let got = moe.forward(&xt, &lt, top_k);
+        for (i, (a, e)) in got.data().iter().zip(&want).enumerate() {
+            assert!((a - e).abs() <= 0.003 + 1e-3 * size, "many experts, adapted={adapted} [{i}]: {a} != {e}");
+        }
+    }
+}

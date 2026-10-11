@@ -134,6 +134,9 @@ fn transform(record: &[u8], p: &ProjAt) -> Transform {
     Transform { k: p.k, n: p.n, suh: halves(p.suh, p.k), svh: halves(p.svh, p.n), input_map: (0..p.k as u32).collect(), output_map: (0..p.n as u32).collect() }
 }
 
+/// Experts from which each is a task of its own ([`Exl3MoeTiered::run_each`]): enough of them for every core.
+const MANY_EXPERTS: usize = 24;
+
 /// Tiles a task of the host's experts decodes: a projection's tile columns in runs of about this many tiles (a gate's
 /// or an up's one column of 160, a down's four of 40), so even one expert's projections are tasks enough for every
 /// core (some 40 us each).
@@ -224,6 +227,12 @@ fn io_pool() -> &'static rayon::ThreadPool {
 fn take_per_run() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| std::env::var("OAIY_FN_TAKE").ok().and_then(|v| v.parse().ok()).unwrap_or(2))
+}
+
+/// Experts a prompt's chunk takes into the slots of experts it does not use, at most a layer (`OAIY_FN_PROMPT_TAKE`).
+fn take_per_chunk() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("OAIY_FN_PROMPT_TAKE").ok().and_then(|v| v.parse().ok()).unwrap_or(64))
 }
 
 /// Runs within which an expert's second miss takes it in (`OAIY_FN_TAKE_WINDOW`; 0: its first miss does).
@@ -481,11 +490,61 @@ impl Exl3MoeTiered {
         down
     }
 
+    /// [`Self::run_host`] where the experts are many (a prompt's chunk routes to most of a layer's): each expert a task
+    /// of its own, its record read and then run, a projection's every column in turn. So the reads and the cores' work
+    /// overlap, and a record is let go as soon as its expert has run (a layer's records read together first were 600 MB
+    /// held at once, and the cores idle while the drive read them).
+    fn run_each(&self, x: &[f32], used: &[usize], by: &[Vec<usize>]) -> Vec<Vec<f32>> {
+        let (h, f) = (self.hidden, self.ff);
+        counted(3, used.len() as u64);
+        counted(4, (used.len() * self.layout.bytes) as u64);
+        let read_us = AtomicU64::new(0);
+        let outs = (0..used.len())
+            .into_par_iter()
+            .map(|i| {
+                let (e, rows) = (used[i], &by[i]);
+                let t = std::time::Instant::now();
+                let mut record = Vec::new();
+                self.source.read(e, &mut record).unwrap_or_else(|err| panic!("expert {e}'s record could not be read: {err}"));
+                read_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+                let ts = self.layout.proj.map(|p| transform(&record, &p));
+                let m = rows.len();
+                let project = |which: usize, row: &dyn Fn(usize) -> Vec<f32>| -> Vec<f32> {
+                    let p = self.layout.proj[which];
+                    let mut xh = vec![0f32; m * p.k];
+                    for (slot, chunk) in xh.chunks_exact_mut(p.k).enumerate() {
+                        ts[which].pre(&row(slot), chunk);
+                    }
+                    let words = LeWords(&record[p.trellis..p.trellis + p.trellis_bytes()]);
+                    let mut y = tile_columns(&words, p.k, p.n, p.tile_words, &xh, m, 0..p.n / 16);
+                    let mut o = vec![0f32; m * p.n];
+                    for (yr, or) in y.chunks_exact_mut(p.n).zip(o.chunks_exact_mut(p.n)) {
+                        ts[which].post(yr, or);
+                    }
+                    o
+                };
+                let row_of = |slot: usize| x[rows[slot] * h..(rows[slot] + 1) * h].to_vec();
+                let (mut gate, mut up) = (project(0, &row_of), project(1, &row_of));
+                if self.lora[0].rank != 0 || self.lora[1].rank != 0 {
+                    let its: Vec<f32> = rows.iter().flat_map(|&r| x[r * h..(r + 1) * h].iter().copied()).collect();
+                    self.lora[0].add(e, h, f, &its, &mut gate);
+                    self.lora[1].add(e, h, f, &its, &mut up);
+                }
+                let hidden: Vec<f32> = gate.iter().zip(&up).map(|(&g, &u)| g / (1.0 + (-g).exp()) * u).collect();
+                let mut down = project(2, &|slot: usize| hidden[slot * f..(slot + 1) * f].to_vec());
+                self.lora[2].add(e, f, h, &hidden, &mut down);
+                down
+            })
+            .collect();
+        // (the readers' time as a share of the wall's: they read side by side)
+        counted(5, read_us.load(Ordering::Relaxed) / rayon::current_num_threads().max(1) as u64);
+        outs
+    }
+
     /// The sums of each row's routed experts that `skip` does not pass over (`assign[r]`: the row's experts and
     /// weights, the shared one last and not among them), each weighted, in the row's own order; the experts read and
     /// run on the host. Also each expert's record, by expert, of those run.
     fn sum_host(&self, x: &[f32], assign: &[Vec<(usize, f32)>], skip: &dyn Fn(usize) -> bool, records: Option<Vec<(usize, Arc<Vec<u8>>)>>) -> (Vec<f32>, Vec<(usize, Arc<Vec<u8>>)>) {
-        let h = self.hidden;
         let mut by_expert: Vec<Vec<(usize, usize)>> = vec![Vec::new(); self.routed];
         for (r, a) in assign.iter().enumerate() {
             for (j, &(e, _)) in a[..a.len() - 1].iter().enumerate() {
@@ -496,6 +555,13 @@ impl Exl3MoeTiered {
         }
         let used: Vec<usize> = (0..self.routed).filter(|&e| !by_expert[e].is_empty()).collect();
         let by: Vec<Vec<usize>> = used.iter().map(|&e| by_expert[e].iter().map(|&(r, _)| r).collect()).collect();
+        // many experts (a prompt's chunk): each read and run as a task of its own, its record not kept
+        if records.is_none() && used.len() >= MANY_EXPERTS {
+            let t = std::time::Instant::now();
+            let outs = self.run_each(x, &used, &by);
+            timed(6, t);
+            return (self.weigh(assign, &by_expert, &used, &outs), Vec::new());
+        }
         // (records already read are taken as they are, the rest read now)
         let mut have: Vec<Option<Arc<Vec<u8>>>> = vec![None; self.routed];
         for (e, r) in records.into_iter().flatten() {
@@ -515,6 +581,13 @@ impl Exl3MoeTiered {
         let t = std::time::Instant::now();
         let outs = self.run_host(x, &used, &by, &records);
         timed(6, t);
+        (self.weigh(assign, &by_expert, &used, &outs), used.into_iter().zip(records).collect())
+    }
+
+    /// Each row's sum of its experts' outputs (`outs[n]`: expert `used[n]`'s, for its rows in `by_expert`), each
+    /// weighted, in the row's own order; an expert not among them adds nothing.
+    fn weigh(&self, assign: &[Vec<(usize, f32)>], by_expert: &[Vec<(usize, usize)>], used: &[usize], outs: &[Vec<f32>]) -> Vec<f32> {
+        let h = self.hidden;
         let mut placed: Vec<Vec<Option<&[f32]>>> = assign.iter().map(|a| vec![None; a.len()]).collect();
         for (n, &e) in used.iter().enumerate() {
             for (slot, &(r, j)) in by_expert[e].iter().enumerate() {
@@ -522,7 +595,7 @@ impl Exl3MoeTiered {
             }
         }
         let mut out = vec![0f32; assign.len() * h];
-        for (r, row) in out.chunks_exact_mut(h).enumerate() {
+        out.par_chunks_exact_mut(h).enumerate().for_each(|(r, row)| {
             let a = &assign[r];
             for (j, &(_, w)) in a[..a.len() - 1].iter().enumerate() {
                 if let Some(y) = placed[r][j] {
@@ -531,8 +604,8 @@ impl Exl3MoeTiered {
                     }
                 }
             }
-        }
-        (out, used.into_iter().zip(records).collect())
+        });
+        out
     }
 
     /// Each row's routed experts (`assign`, the shared one last) summed in its own order, each weighted, and then the
@@ -638,12 +711,16 @@ impl Exl3MoeTiered {
         let mut st = tier.state.lock().unwrap_or_else(|p| p.into_inner());
         st.runs += 1;
         let now = st.runs;
-        // what the chunk uses and the GPU lacks, the most used first: taken in while slots of experts it does not use
-        // (or free ones) last
+        // what the chunk uses and the GPU lacks, the most used first: taken into free slots while there are any, then
+        // into the slots of experts it does not use, those that two rows or more use and a layer's share at most (an
+        // expert taken in is an upload, 0.7 ms of the link, where the host's cores run one in a fifth of that beside
+        // the others: it is taken in for the reply's steps, which mostly route where the prompt did)
         let mut lacking: Vec<usize> = (0..self.routed).filter(|&e| count[e] > 0 && st.slot_of[e] == NONE).collect();
         lacking.sort_by_key(|&e| (std::cmp::Reverse(count[e]), e));
-        let room = st.owner.iter().filter(|&&o| o == NONE || count[o as usize] == 0).count();
-        let taking: Vec<usize> = lacking.iter().copied().take(room).collect();
+        let free = st.owner.iter().filter(|&&o| o == NONE).count();
+        let idle = st.owner.iter().filter(|&&o| o != NONE && count[o as usize] == 0).count();
+        let again = lacking.iter().skip(free).take_while(|&&e| count[e] >= 2).count().min(idle).min(take_per_chunk());
+        let taking: Vec<usize> = lacking.iter().copied().take(free + again).collect();
         drop(st);
         let read = self.records(&taking);
         let mut st = tier.state.lock().unwrap_or_else(|p| p.into_inner());
