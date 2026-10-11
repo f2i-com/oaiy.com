@@ -1,4 +1,4 @@
-//! Weights onto a WebGPU device fast: a checkpoint's stored bytes (BF16, GGUF's blocks) converted to f16 or Q8_0 on
+//! Weights onto a WebGPU device fast: a checkpoint's stored bytes (BF16, GGUF's blocks, fp8 and int8 codes) converted to f16 or Q8_0 on
 //! every core, straight from those bytes (Candle's decode to f32 on one core and the copies after it were most of a
 //! model's load), and written into the card's staging memory from every core (the chain's upload).
 use crate::lora::Loras;
@@ -12,12 +12,17 @@ fn err(e: impl std::fmt::Display) -> candle_core::Error {
 
 /// `f` over `src` and `dst` in matching runs on every core: `per` of `src`'s items to `per_out` of `dst`'s.
 pub(crate) fn on_cores<S: Sync, T: Send>(src: &[S], per: usize, dst: &mut [T], per_out: usize, f: impl Fn(&[S], &mut [T]) + Sync) {
+    on_cores_at(src, per, dst, per_out, |_, a, b| f(a, b));
+}
+
+/// [`on_cores`], `f` told where its run starts too (the index in `src` of its first item).
+pub(crate) fn on_cores_at<S: Sync, T: Send>(src: &[S], per: usize, dst: &mut [T], per_out: usize, f: impl Fn(usize, &[S], &mut [T]) + Sync) {
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(32);
     let each = src.len().div_ceil(per).div_ceil(threads).max(1);
     std::thread::scope(|s| {
-        for (a, b) in src.chunks(each * per).zip(dst.chunks_mut(each * per_out)) {
+        for (i, (a, b)) in src.chunks(each * per).zip(dst.chunks_mut(each * per_out)).enumerate() {
             let f = &f;
-            s.spawn(move || f(a, b));
+            s.spawn(move || f(i * each * per, a, b));
         }
     });
 }
@@ -48,6 +53,22 @@ pub(crate) fn q8_0_bf16(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+/// A weight kept as a code a value (a byte: fp8, int8) as Q8_0's blocks, made from its codes on every core, `group`
+/// of them at a time (a multiple of 32 that divides them): `values(at, codes, x)` puts in `x` the values of `codes`,
+/// the first of them at `at` (Candle's decode to f32 on one core and the copies after it took most of an fp8
+/// transformer's load).
+pub(crate) fn q8_0_codes(codes: &[u8], group: usize, values: impl Fn(usize, &[u8], &mut [f32]) + Sync) -> Vec<u8> {
+    let mut out = vec![0u8; codes.len() / 32 * 34];
+    on_cores_at(codes, group, &mut out, group / 32 * 34, |at, src, dst| {
+        let mut x = vec![0f32; group];
+        for (i, (c, q)) in src.chunks_exact(group).zip(dst.chunks_exact_mut(group / 32 * 34)).enumerate() {
+            values(at + i * group, c, &mut x);
+            ggml_quants::q8_0::quantize(&x, q);
+        }
+    });
+    out
+}
+
 /// A pair's f16 word (the first value low), as the chain's f16 matrices hold them; false where a value is past f16's
 /// range.
 fn f16_word(lo: f32, hi: f32, ok: &mut bool) -> f32 {
@@ -55,13 +76,14 @@ fn f16_word(lo: f32, hi: f32, ok: &mut bool) -> f32 {
     f32::from_bits(half::f16::from_f32(lo).to_bits() as u32 | (half::f16::from_f32(hi).to_bits() as u32) << 16)
 }
 
-/// Runs `f` (each run's words, its range kept) on every core: None where a value was past f16's range.
-fn checked<S: Sync>(src: &[S], per: usize, words: usize, per_out: usize, f: impl Fn(&[S], &mut [f32], &mut bool) + Sync) -> Option<Vec<f32>> {
+/// Runs `f` (each run's start in `src`, its words, its range kept) on every core: None where a value was past f16's
+/// range.
+fn checked<S: Sync>(src: &[S], per: usize, words: usize, per_out: usize, f: impl Fn(usize, &[S], &mut [f32], &mut bool) + Sync) -> Option<Vec<f32>> {
     let mut out = vec![0f32; words];
     let ok = std::sync::atomic::AtomicBool::new(true);
-    on_cores(src, per, &mut out, per_out, |s, d| {
+    on_cores_at(src, per, &mut out, per_out, |at, s, d| {
         let mut fine = true;
-        f(s, d, &mut fine);
+        f(at, s, d, &mut fine);
         if !fine {
             ok.store(false, std::sync::atomic::Ordering::Relaxed);
         }
@@ -74,7 +96,7 @@ pub fn f16_words(bytes: &[u8]) -> Option<Vec<f32>> {
     if bytes.len() % 4 != 0 {
         return None;
     }
-    checked(bytes, 4, bytes.len() / 4, 1, |src, dst, fine| {
+    checked(bytes, 4, bytes.len() / 4, 1, |_, src, dst, fine| {
         for (b, w) in src.chunks_exact(4).zip(dst.iter_mut()) {
             *w = f16_word(bf16(&b[..2]), bf16(&b[2..]), fine);
         }
@@ -87,7 +109,7 @@ pub fn f16_words_halves(bytes: &[u8]) -> Option<Vec<f32>> {
     if bytes.len() % 4 != 0 {
         return None;
     }
-    checked(bytes, 4, bytes.len() / 4, 1, |src, dst, fine| {
+    checked(bytes, 4, bytes.len() / 4, 1, |_, src, dst, fine| {
         for (b, w) in src.chunks_exact(4).zip(dst.iter_mut()) {
             let word = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
             *fine &= word & 0x7c00 != 0x7c00 && word & 0x7c00_0000 != 0x7c00_0000;
@@ -101,9 +123,25 @@ pub fn f16_words_f32(values: &[f32]) -> Option<Vec<f32>> {
     if values.len() % 2 != 0 {
         return None;
     }
-    checked(values, 2, values.len() / 2, 1, |src, dst, fine| {
+    checked(values, 2, values.len() / 2, 1, |_, src, dst, fine| {
         for (p, w) in src.chunks_exact(2).zip(dst.iter_mut()) {
             *w = f16_word(p[0], p[1], fine);
+        }
+    })
+}
+
+/// [`f16_words`] of a weight kept as a code a value ([`q8_0_codes`]'s `values`; `group` even).
+pub fn f16_words_codes(codes: &[u8], group: usize, values: impl Fn(usize, &[u8], &mut [f32]) + Sync) -> Option<Vec<f32>> {
+    if codes.len() % group != 0 || group % 2 != 0 {
+        return None;
+    }
+    checked(codes, group, codes.len() / 2, group / 2, |at, src, dst, fine| {
+        let mut x = vec![0f32; group];
+        for (i, (c, w)) in src.chunks_exact(group).zip(dst.chunks_exact_mut(group / 2)).enumerate() {
+            values(at + i * group, c, &mut x);
+            for (p, w) in x.chunks_exact(2).zip(w.iter_mut()) {
+                *w = f16_word(p[0], p[1], fine);
+            }
         }
     })
 }
@@ -139,7 +177,7 @@ fn rows_of(t: GgmlDType, bytes: &[u8], rows: usize, k: usize) -> Option<(ggml_qu
 /// A GGUF matrix (`rows` rows of `k`) as f16 words: each row decoded and rounded on one of every core.
 pub fn f16_words_ggml(t: GgmlDType, bytes: &[u8], rows: usize, k: usize) -> Option<Vec<f32>> {
     let (g, row) = rows_of(t, bytes, rows, k)?;
-    checked(bytes, row, rows * k / 2, k / 2, |src, dst, fine| {
+    checked(bytes, row, rows * k / 2, k / 2, |_, src, dst, fine| {
         let mut values = vec![0f32; k];
         for (r, w) in src.chunks_exact(row).zip(dst.chunks_exact_mut(k / 2)) {
             if ggml_quants::dequantize(g, r, &mut values).is_err() {

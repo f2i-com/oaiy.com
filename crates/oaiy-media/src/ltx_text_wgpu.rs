@@ -147,7 +147,10 @@ fn mat_host(store: &mut Store, names: &[String]) -> Result<MatHost> {
     for name in names {
         let part = match store.bf16_bytes(name)? {
             Some(bytes) => crate::wgpu_weights::f16_words(&bytes),
-            None => crate::wgpu_weights::f16_words_f32(&store.tensor_f32(name, &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?),
+            None => match store.coded(name)? {
+                Some(codes) => codes.f16_words(),
+                None => crate::wgpu_weights::f16_words_f32(&store.tensor_f32(name, &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?),
+            },
         }
         .ok_or_else(|| err(format!("{name}: a weight past f16's range")))?;
         if words.is_empty() {
@@ -593,9 +596,13 @@ fn projection(store: &mut Store, gpu: &ggml_rs_wgpu::WgpuBackend, name: &str, sc
     }
     // (BF16 as its file holds it, widened where it is permuted: 770 million values made f32 on one core first took
     // half of the projection's time)
+    // (an fp8 or int8 checkpoint's values made from its codes on every core)
     let (halves, wide) = match store.bf16_bytes(&key)? {
         Some(bytes) => (bytes, Vec::new()),
-        None => (Vec::new(), store.tensor_f32(&key, &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?),
+        None => match store.coded(&key)? {
+            Some(codes) => (Vec::new(), codes.values()),
+            None => (Vec::new(), store.tensor_f32(&key, &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?),
+        },
     };
     let at = |i: usize| if wide.is_empty() { f32::from_bits((u16::from_le_bytes([halves[2 * i], halves[2 * i + 1]]) as u32) << 16) } else { wide[i] };
     // each row's (state, channel) word pairs, rounded to f16 on every core

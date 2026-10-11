@@ -5,7 +5,7 @@
 //! for them (NVFP4 packed, the tensor cores decoding it as they multiply: Lightricks' `-nvfp4` release's 44 blocks of
 //! 48), else Q8_0 where the tensor cores take it (a BF16 checkpoint's video stream is 28 GB as f16, 15 as Q8_0), else
 //! f16 (BF16 rounded); its activations f32.
-use crate::ltx::store::{untile_scales, Store};
+use crate::ltx::store::{untile_scales, Coded, ReadAhead, Store};
 use candle_core::{Device, Result};
 use dsv41::safetensors::Dtype;
 use ggml_rs::{Backend, ChainRecorder, CleanRows, DeviceChain, DeviceVec, QuantizedTensor, RowNorm};
@@ -25,6 +25,20 @@ fn err(e: impl std::fmt::Display) -> candle_core::Error {
     candle_core::Error::Msg(e.to_string())
 }
 
+/// Where a load's time went (OAIY_LOAD_PROFILE), in nanoseconds: its weights read, made what the GPU holds, put there.
+static LOAD_TIME: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+const READ: usize = 0;
+const MAKE: usize = 1;
+const PUT: usize = 2;
+
+/// `f`, its time counted as `part`'s.
+fn timed<T>(part: usize, f: impl FnOnce() -> T) -> T {
+    let clock = std::time::Instant::now();
+    let r = f();
+    LOAD_TIME[part].fetch_add(clock.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    r
+}
+
 /// A linear layer on the GPU: its weight NVFP4 (its words and its scale's vector), Q8_0 or f16, and its bias.
 pub enum Weight {
     Nvfp4 { w: DeviceVec, scale: DeviceVec },
@@ -32,21 +46,30 @@ pub enum Weight {
     F16(DeviceVec),
 }
 
-/// A dense weight's values as stored: a BF16 checkpoint's bytes (converted on every core), else f32.
+/// A dense weight's values as stored: a BF16 checkpoint's bytes or an fp8 or int8 one's codes (each converted on
+/// every core), else f32.
 enum Values {
     Bf16(Vec<u8>),
+    Coded(Coded),
     F32(Vec<f32>),
 }
 
 impl Values {
     fn of(store: &mut Store, key: &str) -> Result<Self> {
+        timed(READ, || Self::read(store, key))
+    }
+
+    fn read(store: &mut Store, key: &str) -> Result<Self> {
         // (a weight a LoRA adapts: the store's sum of the two, rounded as the reference rounds it, where the bytes as
         // stored are the weight alone)
         if store.adapted(key) {
             return Ok(Self::F32(store.tensor(key, &Device::Cpu, false)?.to_dtype(candle_core::DType::F32)?.flatten_all()?.to_vec1::<f32>()?));
         }
-        Ok(match store.bf16_bytes(key)? {
-            Some(bytes) => Self::Bf16(bytes),
+        if let Some(bytes) = store.bf16_bytes(key)? {
+            return Ok(Self::Bf16(bytes));
+        }
+        Ok(match store.coded(key)? {
+            Some(codes) => Self::Coded(codes),
             None => Self::F32(store.tensor_f32(key, &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?),
         })
     }
@@ -58,24 +81,26 @@ impl Values {
 fn dense(gpu: &ggml_rs_wgpu::WgpuBackend, key: &str, values: Values, n: usize, k: usize) -> Result<Weight> {
     let f16 = std::env::var("OAIY_LTX_WEBGPU_WEIGHTS").is_ok_and(|v| v.eq_ignore_ascii_case("f16"));
     if k % 256 == 0 && !f16 {
-        let bytes = match values {
+        let bytes = timed(MAKE, || match values {
             Values::Bf16(b) => q8_0_bf16(&b),
+            Values::Coded(c) => c.q8_0(),
             Values::F32(v) => q8_0(&v),
-        };
+        });
         let size = bytes.len();
-        let w = gpu.to_device_quant(QuantizedTensor::from_bytes_cpu(bytes, vec![n, k], ggml_quants::GgmlType::Q8_0));
+        let w = timed(PUT, || gpu.to_device_quant(QuantizedTensor::from_bytes_cpu(bytes, vec![n, k], ggml_quants::GgmlType::Q8_0)));
         if !w.is_device() {
             candle_core::bail!("{key}: no room on the GPU for its {} MB (as Q8_0)", size >> 20);
         }
         return Ok(Weight::Q8(w));
     }
-    let words = match values {
+    let words = timed(MAKE, || match values {
         Values::Bf16(b) => f16_words(&b),
+        Values::Coded(c) => c.f16_words(),
         Values::F32(v) => f16_words_f32(&v),
-    }
+    })
     .ok_or_else(|| err(format!("{key}: past f16's range")))?;
     let v = gpu.vec(words.len());
-    gpu.upload(&v, &words);
+    timed(PUT, || gpu.upload(&v, &words));
     Ok(Weight::F16(v))
 }
 
@@ -392,6 +417,8 @@ impl WgpuLtx {
     /// [`Self::load`], with the audio stream beside the video's where `audio` (a clip with sound: each block's audio
     /// layers and those between the streams, some half as much again).
     pub fn load_streams(store: &mut Store, device: usize, audio: bool, mut progress: impl FnMut(usize)) -> Result<Self> {
+        let started = std::time::Instant::now();
+        LOAD_TIME.iter().for_each(|t| t.store(0, std::sync::atomic::Ordering::Relaxed));
         let gpu = ggml_rs_wgpu::WgpuBackend::nth(device, None).map_err(err)?;
         let g = |n: &str| format!("{PREFIX}{n}");
         let patchify = Linear::load(store, &gpu, &g("patchify_proj"))?;
@@ -403,8 +430,17 @@ impl WgpuLtx {
         if patchify.n != D || adaln.linear.n != 9 * D || out_table.len != 2 * D {
             candle_core::bail!("not LTX 2.3's video stream (patchify {}, modulation {}, output table {})", patchify.n, adaln.linear.n, out_table.len);
         }
+        // (each block's weights read into the system's cache by a thread of their own, two blocks ahead: the disk
+        // busy while one is made Q8_0 and put on the GPU, where they took turns; the audio's only where it loads;
+        // OAIY_LTX_READ_AHEAD=0 not)
+        let audio_part = |rest: &str| rest.starts_with("audio_") || rest.starts_with("video_to_audio") || rest.contains("a2v");
+        let ahead = (std::env::var("OAIY_LTX_READ_AHEAD").as_deref() != Ok("0"))
+            .then(|| ReadAhead::start((0..BLOCKS).map(|i| store.spans(&g(&format!("transformer_blocks.{i}.")), |rest| audio || !audio_part(rest))).collect(), 2));
         let mut blocks = Vec::with_capacity(BLOCKS);
         for i in 0..BLOCKS {
+            if let Some(a) = &ahead {
+                a.reached(i);
+            }
             let p = g(&format!("transformer_blocks.{i}"));
             blocks.push(Block {
                 attn1: Attn::load(store, &gpu, &format!("{p}.attn1"))?,
@@ -437,6 +473,10 @@ impl WgpuLtx {
         } else {
             None
         };
+        if std::env::var_os("OAIY_LOAD_PROFILE").is_some() {
+            let [read, make, put] = LOAD_TIME.each_ref().map(|t| t.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9);
+            eprintln!("the video model: {:.2} s, its weights read {read:.2} s, made what the GPU holds {make:.2} s, put there {put:.2} s", started.elapsed().as_secs_f64());
+        }
         Ok(Self { gpu, patchify, keyframe, adaln, prompt, out_table, proj_out, blocks, audio, nag: None })
     }
 

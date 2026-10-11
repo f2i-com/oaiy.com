@@ -214,6 +214,98 @@ mod tests {
         Ok(())
     }
 
+    /// fp8 and int8 codes made Q8_0 and f16 on every core ([`Store::coded`]) are what their values from
+    /// [`Store::tensor_f32`] make, bit for bit: a tensor's one scale, a scale a row, none, every code.
+    #[cfg(feature = "webgpu")]
+    #[test]
+    fn coded_weights_convert_as_their_decoded_values_do() -> Result<()> {
+        let f32s = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let (rows, cols) = (8, 256);
+        let codes: Vec<u8> = (0..rows * cols).map(|i| (i * 89 % 256) as u8).collect();
+        // (fp8's NaNs, 0x7F and 0xFF, left out: past f16's range as the decoded values are too)
+        let finite: Vec<u8> = codes.iter().map(|&c| if c & 0x7F == 0x7F { 0x7E } else { c }).collect();
+        let row_scales: Vec<f32> = (0..rows).map(|r| 0.001 * (r + 1) as f32).collect();
+        let path = write_st("coded", &[
+            ("a.weight", "F8_E4M3", &[rows, cols], finite.clone()),
+            ("a.weight_scale", "F32", &[1], f32s(&[0.0137])),
+            ("b.weight", "I8", &[rows, cols], codes.clone()),
+            ("b.weight_scale", "F32", &[1], f32s(&[0.0021])),
+            ("c.weight", "I8", &[rows, cols], codes.clone()),
+            ("c.weight_scale", "F32", &[rows, 1], f32s(&row_scales)),
+            ("d.weight", "F8_E4M3", &[rows, cols], finite),
+            ("e.weight", "BF16", &[2, 2], vec![0; 8]),
+        ], "{}");
+        let mut store = Store::open(&path, 0)?;
+        for key in ["a.weight", "b.weight", "c.weight", "d.weight"] {
+            let values = store.tensor_f32(key, &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+            let coded = store.coded(key)?.expect("coded");
+            assert_eq!(coded.q8_0(), crate::wgpu_weights::q8_0(&values), "{key}: Q8_0");
+            let words = |w: Vec<f32>| w.into_iter().map(f32::to_bits).collect::<Vec<u32>>();
+            assert_eq!(words(coded.f16_words().expect("in range")), words(crate::wgpu_weights::f16_words_f32(&values).expect("in range")), "{key}: f16");
+            assert!(coded.values().iter().zip(&values).all(|(a, b)| a.to_bits() == b.to_bits()), "{key}: values");
+        }
+        assert!(store.coded("e.weight")?.is_none(), "BF16 is not coded");
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    /// Comfy's ConvRot int8 codes made on every core (the rotation's fast transform) are its decoded values (the
+    /// rotation's matrix) within f32's rounding.
+    #[cfg(feature = "webgpu")]
+    #[test]
+    fn rotated_coded_weights_are_their_decoded_values() -> Result<()> {
+        let f32s = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let (rows, cols) = (4, 512);
+        let codes: Vec<u8> = (0..rows * cols).map(|i| (i * 89 % 255) as u8).collect();
+        let note = br#"{"format": "int8_tensorwise", "convrot": true, "convrot_groupsize": 256}"#.to_vec();
+        let path = write_st("coded-rotated", &[
+            ("f.weight", "I8", &[rows, cols], codes),
+            ("f.weight_scale", "F32", &[rows, 1], f32s(&[0.01, 0.02, 0.005, 0.03])),
+            ("f.comfy_quant", "U8", &[note.len()], note.clone()),
+        ], "{}");
+        let mut store = Store::open(&path, 0)?;
+        let values = store.tensor_f32("f.weight", &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+        let coded = store.coded("f.weight")?.expect("coded");
+        let made = coded.values();
+        let most = values.iter().fold(0f32, |m, v| m.max(v.abs()));
+        assert!(most > 0. && made.iter().zip(&values).all(|(a, b)| (a - b).abs() <= most * 1e-5), "the rotation undone");
+        assert_eq!(coded.q8_0(), crate::wgpu_weights::q8_0(&made), "Q8_0 of its values");
+        let words = |w: Vec<f32>| w.into_iter().map(f32::to_bits).collect::<Vec<u32>>();
+        assert_eq!(words(coded.f16_words().expect("in range")), words(crate::wgpu_weights::f16_words_f32(&made).expect("in range")), "f16 of its values");
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    /// What an fp8 or int8 checkpoint's weights cost to make Q8_0 (`--ignored --nocapture`, `OAIY_LTX_CODED` its
+    /// file): three blocks' through [`Store::coded`], three others' as their values from [`Store::tensor_f32`] (each
+    /// read from the disk, not the system's cache, where the file is bigger than the memory).
+    #[cfg(feature = "webgpu")]
+    #[test]
+    #[ignore = "a timing; needs an fp8 or int8 LTX checkpoint (OAIY_LTX_CODED)"]
+    fn measure_coded_weights_made_q8_0() -> Result<()> {
+        let Some(path) = std::env::var_os("OAIY_LTX_CODED") else { return Ok(()) };
+        let mut store = Store::open(std::path::Path::new(&path), 0)?;
+        let of = |store: &Store, blocks: std::ops::Range<usize>| -> Vec<String> {
+            let mut names: Vec<String> = store.index.names().filter(|n| blocks.clone().any(|b| n.contains(&format!(".transformer_blocks.{b}.")) && !n.contains("connector")) && n.ends_with(".weight")).filter(|n| store.index.get(n).is_some_and(|i| matches!(i.dtype, Dtype::F8E4M3 | Dtype::I8))).map(str::to_owned).collect();
+            names.sort();
+            names
+        };
+        for (way, blocks) in [("coded", 20..23), ("decoded", 30..33), ("coded", 40..43)] {
+            let (started, mut bytes) = (std::time::Instant::now(), 0usize);
+            for name in of(&store, blocks) {
+                let q = if way == "coded" {
+                    store.coded(&name)?.expect("coded").q8_0()
+                } else {
+                    crate::wgpu_weights::q8_0(&store.tensor_f32(&name, &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?)
+                };
+                bytes += q.len() / 34 * 32;
+            }
+            let s = started.elapsed().as_secs_f64();
+            eprintln!("{way}: {:.2} GB of codes made Q8_0 in {s:.2} s ({:.0} MB/s)", bytes as f64 / 1e9, bytes as f64 / 1e6 / s);
+        }
+        Ok(())
+    }
+
     #[test]
     fn the_e4m3_table_matches_the_reference_conversion() -> Result<()> {
         let bytes: Vec<u8> = (0..=255u8).collect();
@@ -411,6 +503,49 @@ impl Store {
         let bytes = self.index.read_par(key).map_err(candle_core::Error::wrap)?;
         self.disk_bytes += bytes.len() as u64;
         Ok(Some(bytes))
+    }
+    /// `key`'s codes where it is stored as fp8 (E4M3) or int8 with no LoRA on it, with what each stands for and the
+    /// rotation its rows' groups take back (Comfy's ConvRot): for a device that converts them itself, on every core,
+    /// to the values [`Self::tensor_f32`] gives (as they are, where no rotation is undone; else the same within f32's
+    /// rounding, the rotation's fast transform where the decode multiplies by its matrix).
+    #[cfg(feature = "webgpu")]
+    pub fn coded(&mut self, key: &str) -> Result<Option<Coded>> {
+        let info = self.index.info(key).map_err(candle_core::Error::wrap)?.clone();
+        if !matches!(info.dtype, Dtype::F8E4M3 | Dtype::I8) || self.lora.contains_key(key) {
+            return Ok(None);
+        }
+        let rotation = self.rotation(key)?;
+        if rotation.is_some_and(|gs| !matches!(info.shape.as_slice(), [_, cols] if cols % gs == 0)) {
+            return Ok(None);
+        }
+        // (as `decode_as` scales them: a tensor's one scale in the codes' table, a row's after it)
+        let (scale, rows) = match self.scale(key)? {
+            None => (1., None),
+            Some(s) if s.len() == 1 => (s[0], None),
+            Some(s) if info.shape.first() == Some(&s.len()) => (1., Some(s)),
+            Some(_) => return Ok(None),
+        };
+        let table = std::array::from_fn(|b| match info.dtype {
+            Dtype::F8E4M3 => e4m3_table()[b] * scale,
+            _ => b as u8 as i8 as f32 * scale,
+        });
+        let codes = self.index.read_par(key).map_err(candle_core::Error::wrap)?;
+        self.disk_bytes += codes.len() as u64;
+        let per_row = rows.as_ref().map_or(1, |r| codes.len() / r.len().max(1));
+        Ok(Some(Coded { table, rows, per_row, rotation, codes }))
+    }
+    /// Where the tensors named `prefix` and then a name `wanted` takes lie: each one's file, its bytes' start there and
+    /// how many, in the files' order ([`ReadAhead`]'s groups).
+    #[cfg(feature = "webgpu")]
+    pub fn spans(&self, prefix: &str, wanted: impl Fn(&str) -> bool) -> Vec<(std::path::PathBuf, u64, usize)> {
+        let mut found: Vec<_> = self
+            .index
+            .names()
+            .filter_map(|n| n.strip_prefix(prefix).filter(|rest| wanted(rest)).and_then(|_| self.index.get(n)))
+            .map(|i| (i.shard, i.start, i.nbytes as usize))
+            .collect();
+        found.sort_unstable();
+        found.into_iter().map(|(shard, start, len)| (self.index.shard_path(shard).to_path_buf(), start, len)).collect()
     }
     /// A tensor at full precision (the audio decoder and vocoder run in F32).
     pub fn tensor_f32(&mut self, key: &str, dev: &Device) -> Result<Tensor> {
@@ -687,6 +822,135 @@ pub(crate) fn untile_scales(tiled: &[u8], rows: usize, cols: usize) -> Result<Ve
         out[(rb * 128 + j * 32 + i) * cols + cb * 4 + k] = b;
     }
     Ok(out)
+}
+
+/// Tensors' bytes read ahead of a loader into the system's cache by a thread of their own, a group of them at a time
+/// (a block's), at most `lead` groups past the one the loader is at ([`Self::reached`]); a group it has reached is
+/// left to it. The disk reads the next blocks while the loader converts this one and puts it on the GPU, where they
+/// took turns (an LTX transformer on a USB disk read at 0.95 GB/s: 41 s to load, of them some 20 the disk's).
+/// It changes no value: what the loader reads is the file's either way.
+#[cfg(feature = "webgpu")]
+pub struct ReadAhead {
+    at: std::sync::Arc<(std::sync::Mutex<(usize, bool)>, std::sync::Condvar)>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(feature = "webgpu")]
+impl ReadAhead {
+    /// Read `groups` (each its tensors' files, their bytes' start there and how many) ahead of a loader at the
+    /// first.
+    pub fn start(groups: Vec<Vec<(std::path::PathBuf, u64, usize)>>, lead: usize) -> Self {
+        let at = std::sync::Arc::new((std::sync::Mutex::new((0usize, false)), std::sync::Condvar::new()));
+        let shared = std::sync::Arc::clone(&at);
+        let thread = std::thread::spawn(move || {
+            let (state, moved) = &*shared;
+            let mut piece = vec![0u8; 16 << 20];
+            let mut open: Option<(std::path::PathBuf, std::fs::File)> = None;
+            for (g, spans) in groups.into_iter().enumerate() {
+                {
+                    let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+                    while !s.1 && s.0 + lead < g {
+                        s = moved.wait(s).unwrap_or_else(|p| p.into_inner());
+                    }
+                    if s.1 {
+                        return;
+                    }
+                    if g <= s.0 {
+                        continue;
+                    }
+                }
+                for (path, start, len) in spans {
+                    if open.as_ref().is_none_or(|(p, _)| *p != path) {
+                        match std::fs::File::open(&path) {
+                            Ok(f) => open = Some((path, f)),
+                            Err(_) => return,
+                        }
+                    }
+                    let Some((_, file)) = &open else { return };
+                    let mut done = 0;
+                    while done < len {
+                        let n = piece.len().min(len - done);
+                        if dsv41::io::read_exact_at(file, &mut piece[..n], start + done as u64).is_err() {
+                            return;
+                        }
+                        done += n;
+                    }
+                }
+            }
+        });
+        Self { at, thread: Some(thread) }
+    }
+
+    /// The loader is at group `g`.
+    pub fn reached(&self, g: usize) {
+        let (state, moved) = &*self.at;
+        state.lock().unwrap_or_else(|p| p.into_inner()).0 = g;
+        moved.notify_all();
+    }
+}
+
+#[cfg(feature = "webgpu")]
+impl Drop for ReadAhead {
+    fn drop(&mut self) {
+        let (state, moved) = &*self.at;
+        state.lock().unwrap_or_else(|p| p.into_inner()).1 = true;
+        moved.notify_all();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// A weight's fp8 or int8 codes as stored ([`Store::coded`]): the value each code stands for (the tensor's scale in
+/// it), where it has a scale a row its rows' scales, and the group its rotation is undone in, where it was rotated.
+#[cfg(feature = "webgpu")]
+pub struct Coded {
+    table: [f32; 256],
+    rows: Option<Vec<f32>>,
+    per_row: usize,
+    rotation: Option<usize>,
+    codes: Vec<u8>,
+}
+
+#[cfg(feature = "webgpu")]
+impl Coded {
+    /// Its values as Q8_0's blocks, made on every core.
+    pub fn q8_0(&self) -> Vec<u8> {
+        crate::wgpu_weights::q8_0_codes(&self.codes, self.group(32), |at, c, x| self.fill(at, c, x))
+    }
+
+    /// Its values as f16 words, made on every core; None where one is past f16's range.
+    pub fn f16_words(&self) -> Option<Vec<f32>> {
+        crate::wgpu_weights::f16_words_codes(&self.codes, self.group(2), |at, c, x| self.fill(at, c, x))
+    }
+
+    /// Its values, made on every core.
+    pub fn values(&self) -> Vec<f32> {
+        let mut out = vec![0f32; self.codes.len()];
+        let group = self.group(1);
+        crate::wgpu_weights::on_cores_at(&self.codes, group, &mut out, group, |at, c, x| self.fill(at, c, x));
+        out
+    }
+
+    /// The fewest codes made at a time: `least` (a power of two), and whole groups of its rotation.
+    fn group(&self, least: usize) -> usize {
+        self.rotation.map_or(least, |gs| gs.max(least))
+    }
+
+    /// The values of `codes` (the first of them at `at`, whole groups of its rotation) in `x`.
+    fn fill(&self, at: usize, codes: &[u8], x: &mut [f32]) {
+        match &self.rows {
+            None => x.iter_mut().zip(codes).for_each(|(v, &c)| *v = self.table[c as usize]),
+            Some(rows) => {
+                for (j, (v, &c)) in x.iter_mut().zip(codes).enumerate() {
+                    *v = self.table[c as usize] * rows[(at + j) / self.per_row];
+                }
+            }
+        }
+        if let Some(gs) = self.rotation {
+            x[..codes.len()].chunks_exact_mut(gs).for_each(crate::comfy_quant::rotate);
+        }
+    }
 }
 
 /// E2M1: 1 sign, 2 exponent and 1 mantissa bits.

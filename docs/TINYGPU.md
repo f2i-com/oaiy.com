@@ -133,7 +133,25 @@ it on the Mac's GPU, beside the card's language model rather than in its place.
 
 LTX 2.5's WebGPU path takes Lightricks' `-nvfp4` transformer as it is stored (18.7 GB, its blocks decoded by the
 tensor cores as they multiply) and a BF16 checkpoint as Q8_0, so the card holds it; its files are gated (a Hugging Face
-token, the licence accepted).
+token, the licence accepted). ComfyUI's fp8 and int8 checkpoints (`weight_scale` a tensor or a row, ConvRot's
+rotation undone) are Q8_0 on the card too, made from their codes on every core (`Store::coded`; bit for bit what
+their decoded values make, the rotation within f32's rounding), each block's bytes read ahead of the loader by a
+thread of their own (`ReadAhead`). The video decoder must be the conv one (`ltx-2.5-video-vae-conv`): the
+NADiffusionDecoder some LTX 2.5 releases ship is not implemented. A prompt in sections (`[VISUAL]`, `[SPEECH]`,
+`[SOUNDS]`) is followed far better than plain prose.
+
+A 5 s clip with sound (768 x 512, 121 frames, 8 steps) from a 21.5 GB fp8 transformer and a 13 GB int8 Gemma 4 on a
+USB disk (0.95 GB/s) takes 116 s on the card (81 s with its prompt's context cached), where it took 187 to 219 s:
+
+| part | before | now |
+|---|---|---|
+| the prompt's context (Gemma's 48 layers, the projections, the connectors) | 54 s | 20 s |
+| the transformer loaded | 75 s | 21 s (the disk's 19.6) |
+| denoised | 35 s | 35 s |
+| decoded (video, then audio) | 24 s | 24 s |
+
+(`OAIY_LOAD_PROFILE=1` says where a load's time goes; `OAIY_LTX_READ_AHEAD=0` turns the read-ahead off.) On a short
+clip the card denoises in 3.1 s where the Mac's GPU takes 35.7, and decodes in 1.1 s where it takes 9.0.
 
 ## Without the card: the emulator
 

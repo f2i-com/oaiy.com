@@ -287,7 +287,7 @@ fn parallel_rows(data: &mut [f32], cols: usize, decode: impl Fn(usize, &mut [f32
 
 /// `group` (a power of four long) times [`hadamard`]'s matrix of its size, in place: the matrix is the 4x4 one's
 /// Kronecker power (an entry the product of the 4x4's at its indices' base-4 digits), so a pass of fours a digit.
-fn rotate(group: &mut [f32]) {
+pub(crate) fn rotate(group: &mut [f32]) {
     let n = group.len();
     let mut h = 1;
     while h < n {
