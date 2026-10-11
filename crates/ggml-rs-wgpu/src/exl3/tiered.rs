@@ -137,7 +137,7 @@ fn transform(record: &[u8], p: &ProjAt) -> Transform {
 /// Tiles a task of the host's experts decodes: a projection's tile columns in runs of about this many tiles (a gate's
 /// or an up's one column of 160, a down's four of 40), so even one expert's projections are tasks enough for every
 /// core (some 40 us each).
-const TASK_TILES: usize = 160;
+const TASK_TILES: usize = 320;
 
 /// A MoE layer's experts, the routed ones read as records from `source` and computed on the host, the shared one on
 /// the GPU (see the module's notes).

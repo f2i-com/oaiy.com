@@ -1252,3 +1252,16 @@ fn time_host_experts_of_a_step() {
         eprintln!("{used} experts, one row: {ms:.3} ms ({:.3} ms an expert)", ms / used as f64);
     }
 }
+
+/// Arm's vectors give every code mul1's value, to the bit.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn the_vectors_decode_every_code_as_mul1() {
+    for first in (0..65536u32).step_by(4) {
+        let codes = [first, first + 1, first + 2, first + 3];
+        let got = host::neon::values_of(codes);
+        for (c, v) in codes.iter().zip(got) {
+            assert_eq!(v.to_bits(), mul1(*c).to_bits(), "code {c}: {v} where {}", mul1(*c));
+        }
+    }
+}

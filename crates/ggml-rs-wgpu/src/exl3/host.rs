@@ -238,8 +238,16 @@ fn bytesum(code: u32) -> usize {
 /// The sums of tile columns `cols` of a `k -> n` projection's packed `words` for `m` prepared rows: `[m, 16 cols]`,
 /// each tile decoded once for every row.
 pub(super) fn tile_columns<W: Words + ?Sized>(words: &W, k: usize, n: usize, tile_words: usize, xh: &[f32], m: usize, cols: std::ops::Range<usize>) -> Vec<f32> {
-    // (a whole number of bits a weight, up to 6: each of a tile's 32 lanes' eight codes from one 64-bit window)
-    if tile_words % 16 == 0 && (16..=96).contains(&tile_words) && std::env::var_os("OAIY_EXL3_CPU_TABLE").is_none() {
+    // (a whole number of bits a weight, up to 6: each of a tile's 32 lanes' eight codes from one 64-bit window; on Arm
+    // four codes a vector. OAIY_EXL3_CPU: `table` for every code's table, `lanes` for the lanes without vectors.)
+    static ASKED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let asked = ASKED.get_or_init(|| std::env::var("OAIY_EXL3_CPU").ok()).as_deref();
+    if tile_words % 16 == 0 && (16..=96).contains(&tile_words) && asked != Some("table") {
+        #[cfg(target_arch = "aarch64")]
+        if asked != Some("lanes") {
+            // SAFETY: NEON is part of every AArch64 target this is built for (the function asks for nothing else).
+            return unsafe { neon::tile_columns(words, k, n, tile_words, xh, m, cols) };
+        }
         return tile_columns_lanes(words, k, n, tile_words, xh, m, cols);
     }
     let (ktiles, ntiles, nw) = (k / 16, n / 16, tile_words / 2);
@@ -325,6 +333,115 @@ fn tile_columns_lanes<W: Words + ?Sized>(words: &W, k: usize, n: usize, tile_wor
         }
     }
     acc
+}
+
+/// [`tile_columns_lanes`] on Arm's vectors: a lane's eight codes are four shifts of its window (two codes each), their
+/// values four at a time in the closed form ([`decode`]'s: the product's bytes summed in pairs, the one rounding to f16
+/// the conversion's, to nearest even as `half` rounds), and a lane's two quads of values (rows `2a, 2a + 1, 2a + 8, 2a
+/// + 9` of columns `l / 4` and `l / 4 + 8`) each multiplied by the row's same four inputs. An output's sum is kept as
+/// four partial sums (one a lane of the quads), added up at the end: another order than the lanes without vectors
+/// add in, the same for a row whatever rows are beside it.
+#[cfg(target_arch = "aarch64")]
+pub(super) mod neon {
+    use super::Words;
+    use std::arch::aarch64::*;
+
+    #[inline(always)]
+    fn load(s: &[f32]) -> float32x4_t {
+        let s: &[f32; 4] = s[..4].try_into().expect("four floats");
+        // SAFETY: `s` is four floats.
+        unsafe { vld1q_f32(s.as_ptr()) }
+    }
+
+    #[inline(always)]
+    fn store(v: float32x4_t, s: &mut [f32]) {
+        let s: &mut [f32; 4] = (&mut s[..4]).try_into().expect("four floats");
+        // SAFETY: `s` is four floats.
+        unsafe { vst1q_f32(s.as_mut_ptr(), v) }
+    }
+
+    /// mul1's values of four codes.
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn values(codes: uint32x4_t) -> float32x4_t {
+        let x = vmulq_u32(codes, vdupq_n_u32(0x83dc_d12d));
+        let sum = vpaddlq_u16(vpaddlq_u8(vreinterpretq_u8_u32(x)));
+        let f = vcvtq_f32_u32(vaddq_u32(sum, vdupq_n_u32(1024)));
+        // (the product and the difference are both exact in f32, so fused or not they are the same)
+        let v = vfmaq_f32(vdupq_n_f32(-10.382_812_5), f, vdupq_n_f32(1774.0 / 262_144.0));
+        vcvt_f32_f16(vcvt_f16_f32(v))
+    }
+
+    /// [`values`] of four codes, for a test.
+    #[cfg(test)]
+    pub(in super::super) fn values_of(codes: [u32; 4]) -> [f32; 4] {
+        let mut out = [0f32; 4];
+        // SAFETY: NEON is part of every AArch64 target; the load and the store are of four values each.
+        unsafe { vst1q_f32(out.as_mut_ptr(), values(vld1q_u32(codes.as_ptr()))) };
+        out
+    }
+
+    #[target_feature(enable = "neon")]
+    pub(super) fn tile_columns<W: Words + ?Sized>(words: &W, k: usize, n: usize, tile_words: usize, xh: &[f32], m: usize, cols: std::ops::Range<usize>) -> Vec<f32> {
+        let (ktiles, ntiles, nw, b) = (k / 16, n / 16, tile_words / 2, (tile_words / 16) as i64);
+        let bits = nw * 32;
+        let width = cols.len() * 16;
+        // each row's inputs as the lanes take them: a tile's sixteen as four quads, quad `a` rows 2a, 2a + 1, 2a + 8, 2a + 9
+        let mut xq = vec![0f32; m * k];
+        for row in 0..m {
+            for kt in 0..ktiles {
+                let xs = &xh[row * k + kt * 16..row * k + kt * 16 + 16];
+                let q = &mut xq[(row * ktiles + kt) * 16..(row * ktiles + kt) * 16 + 16];
+                for a in 0..4 {
+                    q[4 * a..4 * a + 4].copy_from_slice(&[xs[2 * a], xs[2 * a + 1], xs[2 * a + 8], xs[2 * a + 9]]);
+                }
+            }
+        }
+        // each lane's window: its three words and the shift into the first (the stream read round)
+        let starts: [(usize, usize, usize, u32); 32] = std::array::from_fn(|l| {
+            let first = (b as usize * (8 * l + 1) + bits - 16) % bits;
+            (first / 32, (first / 32 + 1) % nw, (first / 32 + 2) % nw, (first % 32) as u32)
+        });
+        // codes j and j + 1 of a window: right shifts by 48 - b j
+        let shifts: [int64x2_t; 4] = std::array::from_fn(|p| vcombine_s64(vdup_n_s64(-(48 - b * (2 * p as i64))), vdup_n_s64(-(48 - b * (2 * p as i64 + 1)))));
+        let mask = vdupq_n_u32(0xffff);
+        // four partial sums an output
+        let mut acc = vec![0f32; m * width * 4];
+        let mut tile = [0u32; 64];
+        let zero = vdupq_n_f32(0.0);
+        let (mut lo, mut hi) = ([zero; 32], [zero; 32]);
+        for kt in 0..ktiles {
+            for nt in cols.clone() {
+                let base = (kt * ntiles + nt) * nw;
+                for (i, t) in tile[..nw].iter_mut().enumerate() {
+                    *t = words.word(base + i);
+                }
+                for (l, &(q0, q1, q2, sh)) in starts.iter().enumerate() {
+                    let (a, bb, c) = (tile[q0] as u64, tile[q1] as u64, tile[q2] as u64);
+                    let win = vdupq_n_u64(((a << 32 | bb) << sh) | ((c << sh) >> 32));
+                    let code = |p: usize| vmovn_u64(vshlq_u64(win, shifts[p]));
+                    lo[l] = values(vandq_u32(vcombine_u32(code(0), code(1)), mask));
+                    hi[l] = values(vandq_u32(vcombine_u32(code(2), code(3)), mask));
+                }
+                for row in 0..m {
+                    let q = &xq[(row * ktiles + kt) * 16..(row * ktiles + kt) * 16 + 16];
+                    let x4 = [load(&q[0..]), load(&q[4..]), load(&q[8..]), load(&q[12..])];
+                    let at = (row * width + (nt - cols.start) * 16) * 4;
+                    let out = &mut acc[at..at + 64];
+                    for c in 0..8 {
+                        let (mut left, mut right) = (load(&out[4 * c..]), load(&out[4 * (c + 8)..]));
+                        for (a, &x) in x4.iter().enumerate() {
+                            left = vfmaq_f32(left, lo[4 * c + a], x);
+                            right = vfmaq_f32(right, hi[4 * c + a], x);
+                        }
+                        store(left, &mut out[4 * c..]);
+                        store(right, &mut out[4 * (c + 8)..]);
+                    }
+                }
+            }
+        }
+        acc.chunks_exact(4).map(|p| (p[0] + p[1]) + (p[2] + p[3])).collect()
+    }
 }
 
 /// [`positions`] of each bitrate, made once.
