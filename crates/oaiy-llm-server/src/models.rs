@@ -712,8 +712,8 @@ impl Models {
             self.say(format!("{}: its MTP layer is not all on a GPU, so it does not draft", spec.name));
         }
         if tiered {
-            let (held, layers) = model.rest_layers();
-            self.say(format!("{}: {held} of its {layers} layers' experts partly on the GPU (slots taken in as they are used), the rest read and run on the host", spec.name));
+            let (held, layers, slots, experts) = model.rest_layers();
+            self.say(format!("{}: {held} of its {layers} layers' experts partly on the GPU ({slots} slots for its {experts} experts, {} a layer, taken as they are used), the rest read and run on the host", spec.name, slots / layers.max(1)));
         }
         for (d, g) in gpus.iter().enumerate() {
             let (used, budget) = g.usage();

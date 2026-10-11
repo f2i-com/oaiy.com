@@ -797,6 +797,11 @@ impl Exl3MoeTiered {
         self.tier.as_ref().expect("rows planned for experts the GPU holds some of").grouped.record(rec, x, out, assign)
     }
 
+    /// The experts the GPU has slots for, of how many.
+    pub fn slots(&self) -> (usize, usize) {
+        (self.tier.as_ref().map_or(0, |t| t.grouped.slots()), self.routed)
+    }
+
     /// The slots' counts so far: experts the runs found held and not, and those taken in.
     pub fn tier_counts(&self) -> Option<(u64, u64, u64)> {
         self.tier.as_ref().map(|t| {

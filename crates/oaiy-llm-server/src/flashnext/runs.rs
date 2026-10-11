@@ -118,9 +118,11 @@ impl FlashNext {
         asked.unwrap_or(if self.devices.len() == 1 && self.layers.iter().any(|l| l.moe.experts.part_held() || l.moe.experts.host_rest()) { 1024 } else { 512 })
     }
 
-    /// The layers whose experts a GPU holds some of (the host running the rest), and the layers.
-    pub fn rest_layers(&self) -> (usize, usize) {
-        (self.layers.iter().filter(|l| l.moe.experts.host_rest()).count(), self.layers.len())
+    /// The layers whose experts a GPU holds some of (the host running the rest), and the layers; and over them the
+    /// experts the GPUs have slots for, of how many.
+    pub fn rest_layers(&self) -> (usize, usize, usize, usize) {
+        let slots = self.layers.iter().filter_map(|l| l.moe.experts.as_any()?.downcast_ref::<ggml_rs_wgpu::exl3::Exl3MoeTiered>()).map(|t| t.slots()).fold((0, 0), |a, s| (a.0 + s.0, a.1 + s.1));
+        (self.layers.iter().filter(|l| l.moe.experts.host_rest()).count(), self.layers.len(), slots.0, slots.1)
     }
 
     /// Over the layers whose experts a GPU holds some of: the routings it held and did not, and the experts taken in.

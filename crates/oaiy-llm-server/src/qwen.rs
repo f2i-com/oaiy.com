@@ -440,9 +440,12 @@ impl Hybrid {
     /// Whether the model is chained on GPUs, its kernels' pipelines made as each first runs
     /// ([`QwenEngine::warm_up`]): Flash-Next, a chained Qwen3.5 hybrid.
     fn warms(&self) -> bool {
+        // (Flash-Next with experts read as records: two chunks of tokens of no meaning would read some 30 GB of
+        // records and fill the card's free slots with experts no conversation routes to; its load ran a short
+        // prompt and a step already, which made the steps' kernels)
         #[cfg(feature = "webgpu")]
-        if let Self::Flash(_) = self {
-            return true;
+        if let Self::Flash(f) = self {
+            return f.rest_layers().0 == 0;
         }
         matches!(self, Self::Qwen35(Model::Qwen35(m)) if m.backend.chain().is_some())
     }

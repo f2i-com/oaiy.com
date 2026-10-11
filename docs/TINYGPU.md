@@ -153,6 +153,40 @@ USB disk (0.95 GB/s) takes 116 s on the card (81 s with its prompt's context cac
 (`OAIY_LOAD_PROFILE=1` says where a load's time goes; `OAIY_LTX_READ_AHEAD=0` turns the read-ahead off.) On a short
 clip the card denoises in 3.1 s where the Mac's GPU takes 35.7, and decodes in 1.1 s where it takes 9.0.
 
+## A model larger than the card: Qwen3.8-Flash-Next
+
+Its EXL3 checkpoint is 52 GB, 45.8 GB of it routed experts: more than the card's 24 GB and the Mac's 24 GB together.
+The engine reads the experts as records and keeps the recent ones in slots on the card
+([FLASHNEXT.md](FLASHNEXT.md#one-card-and-less-memory-than-the-experts)): 17.2 GB of EXL3 weights on the card at a 32K
+context (168 slots a layer), the host's cores running what a step routes elsewhere. On the RTX 4090, the M5 Pro's
+fifteen cores (11 October 2026; temperature 0, thinking off):
+
+| | checkpoint on a USB SSD (1 GB/s) | on the Mac's SSD (7 to 8 GB/s) |
+|---|---|---|
+| loaded | 19 to 21 s | 13 s |
+| a 175-token prompt, the card's slots empty | 19 s | 8.3 s |
+| its 160-token reply | 8.0 tokens a second | 12.8 |
+| a second reply, on another subject (code) | 4.3 | 8.1 |
+| a 3,931-token prompt | 103 s | 25 s |
+| a later turn of a conversation (30 to 70 new tokens) | | first token in 1.0 to 1.6 s |
+| a turn with a 560-token note pasted in | | first token in 5.0 s |
+| a five-turn conversation's replies | | 10.2 tokens a second |
+
+(The USB column is before the host's decode went on Arm's vectors and a chunk's experts became tasks of their own;
+its reads were what it waited on.) Every routed expert on the host, before the slots: 1.1 to 1.3 tokens a second. The
+card holds 79 to 92% of a reply's routings (the more the longer a subject lasts); a prompt chunk of a hundred rows
+routes to most of a layer's 512 experts, so a prompt reads some 15 to 20 GB of records whatever its length, which is
+why the drive decides a prompt's time. A tool call is made and answered (a 171-token request 11.6 s end to end).
+
+Where a reply's token goes on the Mac's SSD (77 ms at 12.8 a second): the card's kernels 12 ms, the server's
+launches of them 12 (some 2,500 small kernels a token), a round trip a layer 18, and the host 32 (its experts 19, their
+records 13, the uploads 3). A layer whose experts the card all holds still costs its round trip, since the host
+learns of a miss only by reading the routing back.
+
+In OAIY the model is one more set to the eGPU: a request that names it loads it on the card in place of the other
+(some 30 s with its first prompt). OAIY 0.1.3-mac.19 and earlier take a model on the eGPU to be one file, so there
+name it by its `config.json`.
+
 ## Without the card: the emulator
 
 `webgpu_server.py --emulate` is the same server with no card: each kernel's CUDA is compiled for the CPU (clang++, with

@@ -39,6 +39,46 @@ Studio passes a model's `devices` to oaiy-llm-server as `--devices-for NAME=0,1`
 model with GPUs of its own is enabled, a media job on any of those GPUs pauses the LLM
 (`llm_policy` `auto`), so image and video work never shares a GPU with it.
 
+## One card, and less memory than the experts
+
+The routed experts are 45.8 GB of the checkpoint. Where the GPUs and the memory that is free hold too little of them
+to keep them all (a 24 GB card beside a 24 GB Mac: `OAIY_FN_TIERED=1` for always, `0` for never), none is read as the
+model loads. Each expert is one record: its gate, up and down projections lie side by side in a shard, 1.86 MB, and
+are read as they lie when a row is routed to it (`ggml_rs_wgpu::exl3::Exl3MoeTiered`, `FileRecords`).
+
+- **Slots on the card.** What the weight budget leaves after the dense matrices, the attention's cache for the
+  context and 1.2 GiB for a prompt chunk's vectors is each layer's share of slots (168 of a layer's 512 experts on a
+  24 GB card at a 32K context; `OAIY_FN_SLOTS` for as many a layer). A slot is an expert's place in the layer's two
+  groups, as `Exl3MoeGrouped` keeps a layer's all, and a map on the card says each expert's slot.
+- **A step.** The layer's router and its routing run on the card as ever; two small kernels send each routed expert
+  to its slot, and one the card does not hold is weighted 0 there. The chain then reads the router's logits and the
+  experts' input back, the host runs the experts the card lacked from their records, and their sum is added to the
+  streams as the next layer begins. So a layer is one round trip, where the whole step is one without this.
+- **A prompt's chunk** is routed on the host. What the chunk uses and the card lacks is taken into free slots, then
+  into the slots of experts the chunk does not use (those two rows or more use, 64 a layer at most:
+  `OAIY_FN_PROMPT_TAKE`); the card runs what it holds, the host the rest, each expert a task of its own (its record
+  read, then run), so the drive's reads and the cores' work overlap.
+- **Which experts.** Slots are kept by recency. A step takes an expert in on its second miss within 256 steps (on
+  its first while a slot is free), two a layer a step at most (`OAIY_FN_TAKE`, `OAIY_FN_TAKE_WINDOW`): an upload is
+  0.7 ms of a Thunderbolt 3 link, a miss some 0.3 ms of the host's cores.
+- **The host's decode.** A tile's 32 lanes each take their eight codes from one 64-bit window, and a code's value
+  is the closed form (the product's bytes summed, one rounding to f16); on Arm four at a time (`host::neon`: 4 G
+  weights a second a core, where every code's 256 KB table gave 1.1 to 1.4). `OAIY_EXL3_CPU=table` or `lanes` for the
+  older paths.
+- **Adapters.** A LoRA's pairs for the routed experts are in each group's tables, and a slot is given its expert's as
+  the expert takes it; the host adds an expert's own where it runs it.
+
+A request's log says how it went: `Qwen experts: the prompt 92.8% of 84000 routings held on the GPU, 3988 taken in,
+7312 records read (13.62 GB); reading 1.45 s, running 0.98 s, taking in 3.06 s; the reply ...`. No drafting (the
+prediction layer's experts would be read the same way), and no read-ahead by default (`OAIY_FN_READ_AHEAD=1`: the
+next layer's router on this layer's input predicts its experts, but about three records were read for each one used).
+
+A host that takes a model to be one file may name the checkpoint by the `config.json` in it: the engine takes that
+file's folder.
+
+Measured on an RTX 4090 in a Thunderbolt 3 enclosure beside an M5 Pro with 24 GB (11 October 2026), see
+[TINYGPU.md](TINYGPU.md#a-model-larger-than-the-card-qwen38-flash-next).
+
 ## LoRA adapters
 
 Flash-Next takes LoRA adapters as the 27B does. Pass `--lora NAME=PATH` (repeat it to stack

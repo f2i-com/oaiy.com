@@ -304,6 +304,12 @@ step runs on the host, a head a thread, checked against the CUDA kernel while th
 hyper-connection matrices are f32 on the host (unpacked once, where the host op
 unpacked f16 every call).
 
+Since 2026-10-11, where one card and the memory that is free hold too little of the
+experts to keep them all, they are read as records and the card keeps the recent ones
+in slots (`Exl3MoeTiered`; [FLASHNEXT.md](FLASHNEXT.md#one-card-and-less-memory-than-the-experts)):
+an RTX 4090 beside a 24 GB Mac replies at 8 to 13 tokens a second, where the figures
+below (every expert held, on the card or in memory) are for a computer with room.
+
 On the RTX 5090 (2026-10-05), 27 GiB budget: loaded in 22 s with 27.9 GB of its
 weights in VRAM and 23 GB of RAM in use (its working set; Windows also charges the
 VRAM to its commit, 52 GB in all); 1.0 tokens a second and a 162-token prompt in
