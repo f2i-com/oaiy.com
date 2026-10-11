@@ -676,32 +676,36 @@ impl Exl3MoeTiered {
         if assign.iter().all(|a| a[..a.len() - 1].iter().all(|&(e, _)| held[e])) {
             return None;
         }
-        let (out, records) = self.sum_host(x.data(), &assign, &|e| held[e], None);
-        // the experts missed again (or while a slot is free) taken in, a few a run
-        let mut st = tier.state.lock().unwrap_or_else(|p| p.into_inner());
-        let now = st.runs;
-        let used: Vec<bool> = {
-            let mut u = vec![false; self.routed];
-            for a in &assign {
-                for &(e, _) in &a[..a.len() - 1] {
-                    u[e] = true;
-                }
-            }
-            u
-        };
-        let (window, most) = (take_window(), take_per_run());
-        let mut took = 0;
-        let t = std::time::Instant::now();
-        for (e, record) in &records {
-            let free = st.owner.contains(&NONE);
-            let again = window == 0 || (st.missed[*e] != 0 && now - st.missed[*e] <= window);
-            if took < most && (free || again) && tier.take(&mut st, *e, record, &self.layout, &|o| used[o]) {
-                took += 1;
-            } else {
-                st.missed[*e] = now;
+        // the records of the experts the card lacked; then those missed again (or while a slot is free) taken in, a few
+        // a run, their uploads begun before the host runs the experts: a record is 0.7 ms of the link, which what the
+        // card is given next waits behind, and the host's work on these experts is as long (the layer's run on the
+        // card is over, so the slots it read are not what changes)
+        let mut used = vec![false; self.routed];
+        for a in &assign {
+            for &(e, _) in &a[..a.len() - 1] {
+                used[e] = true;
             }
         }
-        timed(7, t);
+        let lacked: Vec<usize> = (0..self.routed).filter(|&e| used[e] && !held[e]).collect();
+        let records: Vec<(usize, Arc<Vec<u8>>)> = lacked.iter().copied().zip(self.records(&lacked)).collect();
+        {
+            let mut st = tier.state.lock().unwrap_or_else(|p| p.into_inner());
+            let now = st.runs;
+            let (window, most) = (take_window(), take_per_run());
+            let mut took = 0;
+            let t = std::time::Instant::now();
+            for (e, record) in &records {
+                let free = st.owner.contains(&NONE);
+                let again = window == 0 || (st.missed[*e] != 0 && now - st.missed[*e] <= window);
+                if took < most && record.len() == self.layout.bytes && (free || again) && tier.take(&mut st, *e, record, &self.layout, &|o| used[o]) {
+                    took += 1;
+                } else {
+                    st.missed[*e] = now;
+                }
+            }
+            timed(7, t);
+        }
+        let (out, _) = self.sum_host(x.data(), &assign, &|e| held[e], Some(records));
         Some(Tensor::from_vec(out, vec![rows, h]))
     }
 

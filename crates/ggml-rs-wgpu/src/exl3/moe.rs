@@ -369,9 +369,13 @@ impl Exl3MoeGrouped {
             let p = &layout.proj[which];
             assert!(p.k == g.k && p.n == g.n && p.tile_words == g.tw, "an expert's projection {which} unlike its group's");
             gpu.write(&g.words, (m * g.mwords * 4) as u64, &record[p.trellis..p.trellis + g.mwords * 4]);
-            gpu.write(&buf(&g.suh), (m * g.k * 4) as u64, &floats(p.suh, g.k));
-            gpu.write(&buf(&g.svh), (m * g.n * 4) as u64, &floats(p.svh, g.n));
         }
+        // (the gate's and the up's tables lie side by side in their group's: a write each for the two, where two each)
+        let (g, u, d) = (&layout.proj[0], &layout.proj[1], &layout.proj[2]);
+        gpu.write(&buf(&self.gu.suh), (2 * slot * self.gu.k * 4) as u64, &[floats(g.suh, g.k), floats(u.suh, u.k)].concat());
+        gpu.write(&buf(&self.gu.svh), (2 * slot * self.gu.n * 4) as u64, &[floats(g.svh, g.n), floats(u.svh, u.n)].concat());
+        gpu.write(&buf(&self.down.suh), (slot * self.down.k * 4) as u64, &floats(d.suh, d.k));
+        gpu.write(&buf(&self.down.svh), (slot * self.down.n * 4) as u64, &floats(d.svh, d.n));
     }
 
     /// A low-rank update's pairs (`a`, `b`, of `rank`) beside projection `which` of experts that take slots here

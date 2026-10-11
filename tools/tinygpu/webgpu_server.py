@@ -392,6 +392,13 @@ class Card:
     pa._remove_block(at, hi - lo)
     print(f"tinygpu-webgpu: the card's memory from {start:#x} to its top ({(top - start) >> 20} MB: the firmware's) kept from buffers", file=sys.stderr, flush=True)
 
+  def free_memory(self):
+    """The card's memory tinygrad's allocator has free, in bytes (None where the kernel's driver manages it): what is
+    left for buffers, the firmware's region and tinygrad's cache of freed buffers not in it."""
+    mm = getattr(getattr(self.dev.iface, "dev_impl", None), "mm", None)
+    pa = getattr(mm, "pa_allocator", None)
+    return None if pa is None else sum(size for size, _nxt, _prev, free in pa.blocks.values() if free)
+
   def local_memory(self):
     """The card's local memory (a thread's spills and stack) grown as tinygrad's NVDevice._ensure_has_local_memory does,
     but safely: the work in flight, which spills into the old buffer, waited for first; the new buffer made before the
@@ -770,6 +777,7 @@ class Server:
     self.programs: dict = {}
     self.next_id = 1
     self.dispatched = 0   # (the last submission's dispatches, for TINYGPU_STATS)
+    if hasattr(card, "free_memory"): stats_memory[0] = card.free_memory
 
   def new_id(self) -> int:
     self.next_id += 1
@@ -879,10 +887,13 @@ TRACE_IO = open(os.environ["TINYGPU_TRACE_IO"], "a", buffering=1 << 16) if os.en
 CPROFILE = os.environ.get("TINYGPU_CPROFILE")
 NAMES = {1: "hello", 2: "alloc", 3: "free", 4: "write", 5: "read", 6: "program", 7: "submit", 8: "sync"}
 stats = {"since": time.perf_counter(), "idle": 0.0, "dispatches": 0}
+# (what says the card's free memory, for the totals: the card's, once it is open)
+stats_memory = [None]
 
 
 def counted(cmd: int, took: float, idle: float, dispatches: int):
-  """A request's time added to its kind's (TINYGPU_STATS), and the totals said every 5 seconds."""
+  """A request's time added to its kind's (TINYGPU_STATS), and the totals said every 5 seconds, with the card's free
+  memory."""
   n, t = stats.get(cmd, (0, 0.0))
   stats[cmd] = (n + 1, t + took)
   stats["idle"] += idle
@@ -891,7 +902,9 @@ def counted(cmd: int, took: float, idle: float, dispatches: int):
   if now - stats["since"] < 5: return
   span = now - stats["since"]
   kinds = "  ".join(f"{NAMES.get(k, k)} {n} {1e3 * t:.0f} ms" for k, (n, t) in sorted((k, v) for k, v in stats.items() if isinstance(k, int)))
-  print(f"tinygpu-webgpu: {span:.1f} s: {kinds}  dispatches {stats['dispatches']} ({1e6 * stats.get(7, (0, 0.0))[1] / max(1, stats['dispatches']):.1f} us each in submits)  between requests {1e3 * stats['idle']:.0f} ms", file=sys.stderr, flush=True)
+  free = stats_memory[0]() if stats_memory[0] else None
+  memory = "" if free is None else f"  card memory free {free >> 20} MB"
+  print(f"tinygpu-webgpu: {span:.1f} s: {kinds}  dispatches {stats['dispatches']} ({1e6 * stats.get(7, (0, 0.0))[1] / max(1, stats['dispatches']):.1f} us each in submits)  between requests {1e3 * stats['idle']:.0f} ms{memory}", file=sys.stderr, flush=True)
   stats.clear()
   stats.update({"since": now, "idle": 0.0, "dispatches": 0})
 
