@@ -51,16 +51,28 @@ are read as they lie when a row is routed to it (`ggml_rs_wgpu::exl3::Exl3MoeTie
   24 GB card at a 32K context; `OAIY_FN_SLOTS` for as many a layer). A slot is an expert's place in the layer's two
   groups, as `Exl3MoeGrouped` keeps a layer's all, and a map on the card says each expert's slot.
 - **A step.** The layer's router and its routing run on the card as ever; two small kernels send each routed expert
-  to its slot, and one the card does not hold is weighted 0 there. The chain then reads the router's logits and the
-  experts' input back, the host runs the experts the card lacked from their records, and their sum is added to the
-  streams as the next layer begins. So a layer is one round trip, where the whole step is one without this.
+  to its slot, and one the card does not hold is weighted 0 there (its place in the jobs slot 0's). The chain then
+  reads the router's logits and the experts' input back, the host runs the experts the card lacked from their
+  records, and their sum is added to the streams as the next layer begins. So a layer is one round trip, where the
+  whole step is one without this. A few rows (a prompt's last tokens after a kept state) go the same way, a job
+  each: grouped by matrix, a row's several experts not held, all at slot 0's place, ran over into the next expert's
+  block, and that expert's rows were another's (the first logits 17.78 where the host's 20.17).
 - **A prompt's chunk** is routed on the host. What the chunk uses and the card lacks is taken into free slots, then
   into the slots of experts the chunk does not use (those two rows or more use, 64 a layer at most:
   `OAIY_FN_PROMPT_TAKE`); the card runs what it holds, the host the rest, each expert a task of its own (its record
   read, then run), so the drive's reads and the cores' work overlap.
 - **Which experts.** Slots are kept by recency. A step takes an expert in on its second miss within 256 steps (on
   its first while a slot is free), two a layer a step at most (`OAIY_FN_TAKE`, `OAIY_FN_TAKE_WINDOW`): an upload is
-  0.7 ms of a Thunderbolt 3 link, a miss some 0.3 ms of the host's cores.
+  0.7 ms of a Thunderbolt 3 link, a miss some 0.4 ms of the host's cores. The upload is begun before the host runs
+  the layer's misses, so it crosses the link under that work: begun after, the next layer's read-back waited behind
+  it (0.55 ms a layer where 0.35). Taking in on a first miss, or evicting by frequency or by the use before last,
+  was no faster (replayed over 1,278 steps' routings: 87% of routings held with any of them, and every 16 more slots
+  a layer 11% fewer misses, which is what a larger card would buy).
+- **Reading ahead.** A layer's run also applies the next layer's router to this layer's input, which predicts about
+  half of what the next layer will lack; those records are read on threads of their own meanwhile. About three are
+  read for each one used, so only where the drive is quick: a record read alone under 0.7 ms on a moving mean (a
+  computer's own SSD; not a USB drive at 1 GB/s, where those reads were what the steps waited on).
+  `OAIY_FN_READ_AHEAD=1` always, `0` never.
 - **The host's decode.** A tile's 32 lanes each take their eight codes from one 64-bit window, and a code's value
   is the closed form (the product's bytes summed, one rounding to f16); on Arm four at a time (`host::neon`: 4 G
   weights a second a core, where every code's 256 KB table gave 1.1 to 1.4). `OAIY_EXL3_CPU=table` or `lanes` for the
@@ -70,14 +82,28 @@ are read as they lie when a row is routed to it (`ggml_rs_wgpu::exl3::Exl3MoeTie
 
 A request's log says how it went: `Qwen experts: the prompt 92.8% of 84000 routings held on the GPU, 3988 taken in,
 7312 records read (13.62 GB); reading 1.45 s, running 0.98 s, taking in 3.06 s; the reply ...`. No drafting (the
-prediction layer's experts would be read the same way), and no read-ahead by default (`OAIY_FN_READ_AHEAD=1`: the
-next layer's router on this layer's input predicts its experts, but about three records were read for each one used).
+prediction layer's experts would be read the same way), and no warm-up on tokens of no meaning before the first
+request (two chunks of them read 30 GB of records and filled the slots with experts no conversation routes to).
+
+To hold this path to the host's own, `OAIY_TOP_LOG=1` says each row's five largest logits, and `OAIY_FN_SLOTS=0` runs
+every routed expert on the host: one request, from one prompt state on the disk, agrees within 0.03 a logit at every
+step with the slots warm, and within 0.1 to 0.3 after a cold 1,485-token prompt.
 
 A host that takes a model to be one file may name the checkpoint by the `config.json` in it: the engine takes that
 file's folder.
 
 Measured on an RTX 4090 in a Thunderbolt 3 enclosure beside an M5 Pro with 24 GB (11 October 2026), see
 [TINYGPU.md](TINYGPU.md#a-model-larger-than-the-card-qwen38-flash-next).
+
+## Prompt states on the disk
+
+With `--prompt-cache DIR`, the model's states go to the disk as the Qwen3.5 hybrid's do (`Snapshot::restore_whole`):
+at a prompt's boundaries (before the first user message, and before the last assistant header), the whole state of
+its cache's slots: the attention layers' and their indexers' keys and values up to there, and the delta-net layers'
+and the n-gram layer's recurrent tensors. Some 140 KB a token (208 MB for 1,478 tokens). A process that loads the
+model takes a prompt up from the longest state it shares, so a system prompt, or a conversation, is not read again
+after a restart or after the card went to another model: a 1,485-token prompt's first token in 3.5 s where 17.9. The
+states are a checkpoint's under its adapters, and no other's.
 
 ## LoRA adapters
 

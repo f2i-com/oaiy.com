@@ -164,28 +164,45 @@ fifteen cores (11 October 2026; temperature 0, thinking off):
 | | checkpoint on a USB SSD (1 GB/s) | on the Mac's SSD (7 to 8 GB/s) |
 |---|---|---|
 | loaded | 19 to 21 s | 13 s |
-| a 175-token prompt, the card's slots empty | 19 s | 8.3 s |
-| its 160-token reply | 8.0 tokens a second | 12.8 |
-| a second reply, on another subject (code) | 4.3 | 8.1 |
+| a 175-token prompt, the card's slots empty | 24 s | 10 s |
+| its 160-token reply | 8.9 tokens a second | 16.4 |
+| a second reply, on another subject (code) | 5.0 | 10.6 |
+| a third, a story | 8.1 | 15.2 |
 | a 3,931-token prompt | 103 s | 25 s |
+| a 15,631-token prompt | | 96 s |
 | a later turn of a conversation (30 to 70 new tokens) | | first token in 1.0 to 1.6 s |
-| a turn with a 560-token note pasted in | | first token in 5.0 s |
-| a five-turn conversation's replies | | 10.2 tokens a second |
+| a turn with a 560-token note pasted in | | first token in 4.6 s |
+| a five-turn conversation's replies | 7.0 | 12.5 |
+| a prompt whose state is on the disk, after a restart | | first token in 0.4 to 3.5 s |
 
-(The USB column is before the host's decode went on Arm's vectors and a chunk's experts became tasks of their own;
-its reads were what it waited on.) Every routed expert on the host, before the slots: 1.1 to 1.3 tokens a second. The
-card holds 79 to 92% of a reply's routings (the more the longer a subject lasts); a prompt chunk of a hundred rows
-routes to most of a layer's 512 experts, so a prompt reads some 15 to 20 GB of records whatever its length, which is
-why the drive decides a prompt's time. A tool call is made and answered (a 171-token request 11.6 s end to end).
+Every routed expert on the host, before the slots: 1.1 to 1.3 tokens a second. The card holds 81 to 92% of a
+reply's routings (the more the longer a subject lasts); a prompt chunk of a hundred rows routes to most of a layer's
+512 experts, so a prompt reads some 15 to 20 GB of records whatever its length, which is why the drive decides a
+prompt's time. A tool call is made and answered (a 171-token request 11.6 s end to end).
 
-Where a reply's token goes on the Mac's SSD (77 ms at 12.8 a second): the card's kernels 12 ms, the server's
-launches of them 12 (some 2,500 small kernels a token), a round trip a layer 18, and the host 32 (its experts 19, their
-records 13, the uploads 3). A layer whose experts the card all holds still costs its round trip, since the host
-learns of a miss only by reading the routing back.
+Where a reply's token goes on the Mac's SSD (61 ms at 16.4 a second): the card's kernels some 17 ms (it decodes
+about 10^12 weights a second, and a token is 5.9 x 10^9 of them), the server's launches of them and a round trip a
+layer 14, and the host 30 (its experts 18, their records 9, the uploads 3). A layer whose experts the card all holds
+still costs its round trip, since the host learns of a miss only by reading the routing back. The card's memory is
+all in use: under a 15.6K-token prompt 1.3 GB is free or kept of buffers let go, which the attention's cache needs to
+reach the context's 32K (`TINYGPU_STATS=1` says both every 5 s).
+
+What the card's server and the adapter gave it (and every model on the card):
+
+- **A step's launches kept.** A dispatch made before is launched again from its request's bytes (`Server.kept`): its
+  launch is the bytes of its slot, all but where the slot is (`Fast.template`), where each was read, its bindings
+  checked and its fields written. A Flash-Next layer's submission 133 us where 225. Emptied when a buffer is let go.
+  `tools/tinygpu/fast_check.py` launches kept ones again, each the same bytes as tinygrad's; `TINYGPU_NO_KEPT=1`
+  keeps none. (The 27B, bound by the card's own time, is 40 tokens a second with it as without.)
+- **Small read-backs in the computer's memory.** A buffer a program maps to read, of 256 KB or less, is asked for in
+  the computer's memory where the server's HELLO says it gives them (`host_buffers`: a server or an engine that does
+  not know of it goes on as before): the card writes it across the link as its kernels run, and a read is no copy by
+  the card and no second wait (a layer's read-back 0.33 ms where 0.35). `TINYGPU_NO_HOST_BUFFERS=1` asks for none.
 
 In OAIY the model is one more set to the eGPU: a request that names it loads it on the card in place of the other
-(some 30 s with its first prompt). OAIY 0.1.3-mac.19 and earlier take a model on the eGPU to be one file, so there
-name it by its `config.json`.
+(some 30 s with its first prompt; a conversation it has a state of on the disk goes on from there). OAIY
+0.1.3-mac.19 and earlier take a model on the eGPU to be one file, so there name it by its `config.json`. The eGPU
+plugin's kernel pack has its kernels (1,157 cubins).
 
 ## Without the card: the emulator
 
