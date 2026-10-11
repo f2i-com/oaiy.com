@@ -19,7 +19,8 @@ Both paths passed `tests/e2e/run.mjs`: the tunnel on v0.0.21, the bridge on v0.0
 SoftN's hosted runtime is another matter: it takes the engine's module from the Agent and binds it with the
 bindings of the ZIPP release it was built with, so it is given that release's module and not necessarily the Agent's
 (`softnZippBytes` in `src/preview/preview.ts`: the Agent's own when the runtime's manifest names the same module, else
-the copy the runtime carries). SoftN v0.0.18 was built with ZIPP v0.0.21.
+the copy the runtime carries). SoftN v0.0.18 was built with ZIPP v0.0.21; v0.0.19, which OAIY installs
+(`scripts/fetch-softn.mjs`), with v0.0.22, the Agent's own, so the two share one module.
 
 ## The API (zipp-wasm)
 

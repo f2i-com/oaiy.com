@@ -16,7 +16,7 @@
  * The output is committed (OAIY works offline); run this after a
  * SoftN update:   SOFTN_REPO=../softn.com node scripts/generate-softn-knowledge.mjs
  */
-import { readFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { unzipSync } from 'fflate';
@@ -46,6 +46,13 @@ for (const name of ['index.generated.ts', 'components.generated.ts', 'docs.gener
 // Small, varied, complete apps: CRUD with storage, a game with state and
 // sound, components and charts across pages, 3D, WebGPU, device permissions.
 const EXAMPLES = ['notes', 'twenty48', 'showcase', 'three-demo', 'gpu-demo', 'device-kit'];
+// The catalogue is the site's own data and is not in every checkout (softn.com's tags since v0.0.19 have none of
+// its apps): the examples committed here are then kept as they are.
+if (!EXAMPLES.every((slug) => existsSync(join(repo, 'apps/softn-api/data/apps', slug, 'v1.softn')))) {
+  console.log(`the catalogue's apps are not in ${repo}: examples.generated.ts is kept as it is`);
+  console.log(`wrote ${out}`);
+  process.exit(0);
+}
 const examples = [];
 for (const slug of EXAMPLES) {
   const dir = join(repo, 'apps/softn-api/data/apps', slug);
