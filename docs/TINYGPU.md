@@ -85,6 +85,17 @@ python3 tools/tinygpu/plugin/bundle.py --zip        # target/egpu-plugin, and ta
   models it should carry on a card with nvcc first, or name more sources with `--sources`.
 - tinygrad comes from `--tinygrad` (`~/tinygrad`), and the Python from that checkout's `.venv`: python-build-standalone's,
   as uv installs it, one program that needs only macOS's libraries.
+- `--no-firmware` leaves out NVIDIA's firmware and tinygrad's TinyGPU app, for a plugin given to others (a release's:
+  `docs/RELEASING.md`, "The eGPU plugin"): both are other people's programs, and tinygrad downloads them itself the
+  first time it opens a card (the server answers tinygrad's downloads from the plugin only where the plugin has
+  them). That first start then needs the network; 30 MB zipped where 86.
+- Nothing in it names the machine that built it: its bytecode records each file from the plugin's root (Python puts a
+  file's real place in as it loads one, so a traceback still names the file), and the Python's build notes name
+  python-build-standalone's own folder. The build stops if a file names the builder's home folder.
+
+The engine has to be one built with the feature `tinygpu`: the card is given the engine the app runs this computer's
+models on, and one without the feature answers "this build has no TinyGPU adapter". A Mac's image has it since 0.1.3
+(`mac-build.yml`); an engine in the app's `engines` folder is preferred to the image's, as ever.
 
 Install it on the Plugins page (*Install a plugin*: its folder or its zip), trust it and start it. It provides OAIY's
 `egpu` module: the desktop asks its connector `egpu` for `card.runtime` (where its Python, tinygrad and launcher are,

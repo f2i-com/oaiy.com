@@ -19,6 +19,8 @@ by hand on its own, because automatic CI is paused).
 | `oaiy-web-<v>.zip`, `oaiy-web-<v>.tar.gz` | The flow editor's site (landing page, `/app.html`, `/desktop.html`), for any static host, built for this release: its download buttons name this release's files (see [The web site](#the-web-site)) |
 | `SHA256SUMS.txt` | The checksum of every file above, `latest.json` and the `.sig` files included |
 | `release-evidence-web.json`, `-linux.json`, `-windows.json` | For each build: the revision, target, toolchain, digests, and the verification run that passed before anything was published |
+| `oaiy-desktop-<v>-macos-arm64.dmg`, and its `.sha256` | OAIY Desktop for an Apple-silicon Mac, signed with the Developer ID and notarised by Apple. Added after the release is published, by the Mac build ([A Mac's image](#a-macs-image)): `SHA256SUMS.txt` was written before it and does not list it, so its checksum is the file beside it. The update feed has no entry for a Mac: a newer image is installed over the app. |
+| `oaiy-egpu-plugin-<v>-macos-arm64-rtx40.zip`, and its `.sha256` | The eGPU plugin for that Mac app: an NVIDIA RTX 40 card in a Thunderbolt enclosure, with its kernels compiled ahead of time. Built on a Mac that has such a card and added by hand ([The eGPU plugin](#the-egpu-plugin)). |
 
 An OAIY Desktop installer is complete by itself for what it shows. Besides the dashboard
 it carries the CLI that runs flows (`resources/cli`), the Agent (`resources/app`, opening
@@ -291,6 +293,49 @@ everywhere, on a developer's machine and in the workflow, and the `sign` job sig
    on a host, and until it is replaced the site's download buttons still offer the previous
    release (see the next section).
 
+### A Mac's image
+
+Once the release is published, and with `main` still at the tagged commit:
+
+```sh
+gh workflow run mac-build.yml --ref main -f version=0.1.3 -f release=v0.1.3
+```
+
+The run builds the image as any Mac build does, its job `sign` waits for the owner's approval
+(the environment `mac-signing`: the Developer ID certificate and the notary's key), and its
+last job, `publish`, adds `oaiy-desktop-<v>-macos-arm64.dmg` and its `.sha256` to the release.
+That job stops, adding nothing, unless the image is the one `sign` made (by its digest, that
+job's own word), Apple notarised it, its version is the release's, and the commit the run built
+is the one the tag names; it replaces no file a release already has. Started before the
+release is published it fails at that last job, which can be run again from the run's page.
+
+The run is on `main` and not on the tag because the environment `mac-signing` gives its
+secrets to that branch alone (its deployment rule): so the image can only be made while `main`
+is still the tagged commit. To make one later, add the tag patterns to that environment's
+rule (as the environment `release` has them) and run the workflow on the tag.
+
+The image's engine is built with the feature `tinygpu` as well, so it is the engine an NVIDIA
+card in an enclosure is given ([TINYGPU.md](TINYGPU.md)).
+
+### The eGPU plugin
+
+Built on a Mac with the card, because its kernels are the ones that card's server has seen and
+nvcc has compiled ([TINYGPU.md](TINYGPU.md#the-egpu-plugin-no-docker-no-compiler)), from the
+tagged commit, and added to the release by hand:
+
+```sh
+python3 tools/tinygpu/plugin/bundle.py target/egpu-plugin-public --no-firmware --zip
+cp target/egpu-plugin-public.zip oaiy-egpu-plugin-0.1.3-macos-arm64-rtx40.zip
+shasum -a 256 oaiy-egpu-plugin-0.1.3-macos-arm64-rtx40.zip > oaiy-egpu-plugin-0.1.3-macos-arm64-rtx40.zip.sha256
+gh release upload v0.1.3 oaiy-egpu-plugin-0.1.3-macos-arm64-rtx40.zip oaiy-egpu-plugin-0.1.3-macos-arm64-rtx40.zip.sha256
+```
+
+`--no-firmware` leaves out the two things in it that are other people's programs (NVIDIA's GSP
+firmware and tinygrad's TinyGPU app): tinygrad downloads both itself the first time it opens
+the card. Run a model on the card from the unpacked zip before it is uploaded. Its kernels are
+the ones of the engine at that commit, for the models that Mac has run: another model's are
+compiled as they are met, which needs nvcc (Docker) on the Mac that meets them.
+
 To try the build without publishing, run the same workflow on a branch instead:
 `gh workflow run release.yml --ref <branch> -f version=0.1.0`. It builds everything and
 keeps the files as the run's artifacts, and creates no release. Its installers are
@@ -352,11 +397,10 @@ a release matter here:
   on the branch `backup/cuda-support-2026-10-08`.)
 - **Aokie**, the phone plugin. It is a separate product: OAIY installs it from a folder or
   an archive, and no release of OAIY contains it.
-- **A Mac build.** No release has one, and the update feed has no entry for a Mac. The
-  workflow `mac-build.yml` makes OAIY Desktop's `.dmg` for Apple silicon on demand, as a
-  run's artifact: signed by nobody (ad hoc), not notarised, published nowhere
-  ([MAC.md](MAC.md#the-app-from-a-disk-image)). A Mac release needs an Apple Developer ID
-  to sign and notarise with.
+- **A Mac build, from the release's own workflow.** `release.yml` builds for Windows and
+  Linux, and the update feed has no entry for a Mac. The Mac's image is made by
+  `mac-build.yml`, signed with the Developer ID and notarised, and added to the published
+  release as one more file ([A Mac's image](#a-macs-image)). Releases up to 0.1.2 have none.
 - **Windows code signing.** The installers are not signed with a certificate
   (Authenticode), so Windows SmartScreen warns on a download (below). The update signature
   above is another thing: OAIY checks it, Windows does not.
@@ -364,7 +408,8 @@ a release matter here:
   itself, when its owner presses the button. The engines are a separate channel, plugins
   are installed from a folder or an archive, and `oaiy-server` only tells you that a newer
   release exists. See [UPDATES.md](UPDATES.md).
-- **macOS.** Only Windows and Linux are built.
+- **A Mac's headless server.** The Mac build makes one (`oaiy-server-<v>-macos-arm64.tar.gz`,
+  an artifact of its run), signed by nobody: it is not added to a release.
 
 ## Installing a release
 

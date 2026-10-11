@@ -36,7 +36,10 @@ the repository's owner to approve it on the run's page (its certificate and nota
 in the environment `mac-signing`, which nothing else may use), and uploads the image as the
 artifact `oaiy-macos-arm64-signed`. That image opens like any app: macOS says "Notarized
 Developer ID" of it and of the app inside (run 38021513866, 10 October 2026, which also ran
-a flow in the signed app). The rest of this part is for an image that is not signed so.
+a flow in the signed app). Told a published release's tag (the input `release`), the run's
+last job adds that image to the release
+([RELEASING.md](RELEASING.md#a-macs-image)). The rest of this part is for an image that is
+not signed so.
 
 **Opening an unsigned one the first time.** The build's own image is signed, but by
 nobody: there is no Apple Developer ID behind it, so Apple has not checked it (it is not
@@ -47,12 +50,12 @@ notarised), and macOS will not open a downloaded app like that on a double-click
   **Open**, **Open**); or
 - in a terminal: `xattr -dr com.apple.quarantine /Applications/OAIY.app`
 
-Once is enough. A build with an Apple Developer ID, notarised, would open like any app:
-that needs the identity, which the workflow is not given.
+Once is enough.
 
 **What it carries, and what it fetches.** The language-model engine is inside it
-(`oaiy-llm-server-webgpu`, on the Mac's GPU through Metal): add a model's `.gguf` under
-**Engines** and it runs. Flows run on Node, which the app installs under its own data
+(`oaiy-llm-server-webgpu`, on the Mac's GPU through Metal, and on an NVIDIA card in a
+Thunderbolt enclosure where the eGPU plugin gives it one: [below](#a-card-in-a-thunderbolt-enclosure-through-tinygrad)):
+add a model's `.gguf` under **Engines** and it runs. Flows run on Node, which the app installs under its own data
 folder the first time, at a press of **Install Node** on the Overview (from nodejs.org:
 that once, it needs the network). Pictures, video and speech are another program
 (`oaiy-media`), which no installer carries on any system. The app's data is in

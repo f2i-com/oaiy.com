@@ -3,8 +3,8 @@
 # A manual run only (Actions, "Mac build", Run workflow): nothing starts it by itself, a push or a tag least of all.
 # It builds what the release workflow's `desktop` job builds, step for step, on a macOS runner, because a .dmg can
 # only be made on a Mac: the bundler needs macOS's own tools. The run uploads the disk image and the headless server
-# for a Mac as its artifacts and does nothing else: it publishes no release, pushes no tag, and is given no secret
-# (no updater key, no signing certificate).
+# for a Mac as its artifacts. It pushes no tag and makes no release; told a published release's tag (the input
+# `release`), its last job adds the signed, notarised image to that release, and that is all it ever publishes.
 #
 # The build signs the app ad hoc (tauri.conf.json, bundle.macOS.signingIdentity "-"): a signature an Apple-silicon
 # Mac will run, with no Apple Developer ID behind it, which macOS asks about before it opens it the first time
@@ -33,8 +33,13 @@ on:
         type: choice
         options: [all, engine, webkit]
         default: all
+      release:
+        description: "A published release's tag (v0.1.3) to add the signed, notarised image to; the version above must be that release's (0.1.3) and the run on the tag's commit. Empty: the image stays an artifact."
+        required: false
+        default: ''
 
-# Nothing may write: the run builds and uploads its own artifacts.
+# Nothing may write by default: the run builds and uploads its own artifacts. The job that adds the image to a release
+# says so for itself.
 permissions:
   contents: read
 
@@ -229,9 +234,12 @@ jobs:
         working-directory: platform/desktop
         run: npm ci
 
-      # The engine the app carries: on a Mac its GPU is Metal's, through WebGPU.
+      # The engine the app carries: on a Mac its GPU is Metal's, through WebGPU. Built with `tinygpu` too (which
+      # holds `webgpu`): the same engine then runs on an NVIDIA card in a Thunderbolt enclosure, through tinygrad,
+      # when the eGPU plugin gives it one (docs/TINYGPU.md). An engine without it answers such a start with "this
+      # build has no TinyGPU adapter", and the app's is the engine the card is given.
       - name: Build the portable language-model engine
-        run: cargo build --release --locked -p oaiy-llm-server --no-default-features --features webgpu --bin oaiy-llm-server-webgpu
+        run: cargo build --release --locked -p oaiy-llm-server --no-default-features --features tinygpu --bin oaiy-llm-server-webgpu
 
       - name: Build OAIY Desktop
         working-directory: platform/desktop
@@ -332,6 +340,9 @@ jobs:
     runs-on: macos-15
     environment: mac-signing
     timeout-minutes: 90
+    outputs:
+      notarised: ${{ steps.notary.outputs.notarised }}
+      sha256: ${{ steps.said.outputs.sha256 }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -400,6 +411,7 @@ jobs:
           echo "IMAGE=$image" >> "$GITHUB_ENV"
 
       - name: Have Apple notarise the image
+        id: notary
         env:
           APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
@@ -409,6 +421,7 @@ jobs:
           if [ -z "$APPLE_API_KEY_P8" ] || [ -z "$APPLE_API_KEY_ID" ] || [ -z "$APPLE_API_ISSUER" ]; then
             echo "::warning::the environment mac-signing has no notary key: the image is signed with the Developer ID and NOT notarised, so macOS still asks before it opens it the first time."
             echo "NOTARISED=no" >> "$GITHUB_ENV"
+            echo "notarised=no" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           printf '%s' "$APPLE_API_KEY_P8" > "$RUNNER_TEMP/notary.p8"
@@ -427,9 +440,11 @@ jobs:
           xcrun stapler staple "$IMAGE"
           xcrun stapler validate "$IMAGE"
           echo "NOTARISED=yes" >> "$GITHUB_ENV"
+          echo "notarised=yes" >> "$GITHUB_OUTPUT"
 
       # What macOS itself will say of it on a Mac, and the signed app used as the build's was.
       - name: What Gatekeeper says, and a flow in the signed app
+        id: said
         env:
           SMOKE_OWN_NODE: '1'
         run: |
@@ -447,6 +462,9 @@ jobs:
           fi
           node platform/desktop/scripts/smoke-desktop.mjs "$apps/OAIY.app/Contents/MacOS/oaiy-desktop"
           ( cd signed && shasum -a 256 *.dmg > SHA256SUMS.txt && cat SHA256SUMS.txt )
+          # The image's digest as this job's own word: it travels apart from the artifact store, where the job that
+          # adds the image to a release takes the file from.
+          echo "sha256=$(shasum -a 256 "$IMAGE" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -454,3 +472,52 @@ jobs:
           path: signed/
           if-no-files-found: error
           retention-days: 30
+
+  # ---------------------------------------------------------------- release
+  # The signed, notarised image added to a release that is already published. A release's own workflow builds for
+  # Windows and Linux (release.yml) and knows nothing of a Mac; the image is made here, where the Developer ID is, and
+  # joins the release as one more file, with its checksum beside it (the release's SHA256SUMS.txt was written before
+  # it and does not list it). Only when the run names the release: the image must be the one the job above signed
+  # (its digest, that job's own word), notarised, of the release's version, and built from the commit the release's
+  # tag names. It replaces nothing: a release that has the image already is left as it is, and the job fails.
+  # The one job here that may write, and it runs none of the project's code: it has no checkout.
+  publish:
+    name: Add the signed image to the release
+    needs: sign
+    if: ${{ inputs.release != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: oaiy-macos-arm64-signed
+          path: signed
+
+      - name: Add the image to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ inputs.release }}
+          VERSION: ${{ inputs.version }}
+          NOTARISED: ${{ needs.sign.outputs.notarised }}
+          SIGNED_SHA256: ${{ needs.sign.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          tag='^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          [[ "$RELEASE" =~ $tag ]] || { echo "::error::'$RELEASE' is not a release's tag (v0.1.3)"; exit 1; }
+          [ "${RELEASE#v}" = "$VERSION" ] || { echo "::error::the image is version $VERSION and the release is $RELEASE: run with the release's version"; exit 1; }
+          [ "$NOTARISED" = yes ] || { echo "::error::Apple did not notarise the image: it is not added to a release"; exit 1; }
+          tagged="$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE" --jq .sha)"
+          [ "$tagged" = "$GITHUB_SHA" ] || { echo "::error::$RELEASE is commit $tagged, and this run built $GITHUB_SHA: run on the tag's commit"; exit 1; }
+          draft="$(gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" || { echo "::error::there is no release $RELEASE yet: run this job again when it is published"; exit 1; }
+          [ "$draft" = false ] || { echo "::error::the release $RELEASE is a draft"; exit 1; }
+          name="oaiy-desktop-$VERSION-macos-arm64.dmg"
+          [ -f "signed/$name" ] || { echo "::error::the signed artifact has no $name"; exit 1; }
+          got="$(sha256sum "signed/$name" | cut -d' ' -f1)"
+          [[ "$SIGNED_SHA256" =~ ^[0-9a-f]{64}$ ]] && [ "$got" = "$SIGNED_SHA256" ] || { echo "::error::the image is not the one the job that signed it recorded ($got, not ${SIGNED_SHA256:-nothing})"; exit 1; }
+          ( cd signed && sha256sum "$name" > "$name.sha256" && cat "$name.sha256" )
+          # No --clobber: a file a release already has is never replaced.
+          gh release upload "$RELEASE" "signed/$name" "signed/$name.sha256" --repo "$GITHUB_REPOSITORY"
+          echo "## $name added to $RELEASE" >> "$GITHUB_STEP_SUMMARY"
+          echo "sha256 \`$got\`: signed with the Developer ID, notarised by Apple, built from $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"

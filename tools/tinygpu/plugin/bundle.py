@@ -1,7 +1,7 @@
 """tools/tinygpu/plugin/bundle.py: the eGPU plugin for OAIY Desktop, built into a folder (docs/TINYGPU.md, "The eGPU
 plugin").
 
-    python3 tools/tinygpu/plugin/bundle.py [OUT] [--tinygrad DIR] [--python DIR] [--arch sm_89,...] [--zip]
+    python3 tools/tinygpu/plugin/bundle.py [OUT] [--tinygrad DIR] [--python DIR] [--arch sm_89,...] [--no-firmware] [--zip]
 
 OUT (target/egpu-plugin unless named) is the plugin, for OAIY's Plugins page to install (or OUT.zip, with --zip):
 
@@ -12,10 +12,15 @@ OUT (target/egpu-plugin unless named) is the plugin, for OAIY's Plugins page to 
   card/            plugin.py (what OAIY talks to), egpu_serve.py (OAIY's launcher), webgpu_server.py (the card's server)
   card/kernels/    the kernel pack for --arch (tools/tinygpu/kernel_pack.py: nvcc only for what the cache lacks)
   card/firmware/   what tinygrad downloads as it first opens a card: NVIDIA's GSP firmware (linux-firmware's, for every
-                   card tinygrad knows) and its TinyGPU app, from tinygrad's download cache where it has them
+                   card tinygrad knows) and its TinyGPU app, from tinygrad's download cache where it has them. Not
+                   with --no-firmware, for a plugin given to others: both are other people's programs (NVIDIA's
+                   under LICENCE.nvidia, tinygrad's app with no licence stated where it is published), and tinygrad
+                   downloads them itself, from where they are published, the first time it opens a card
 
 There are no links in it (OAIY refuses a plugin with one), and every Python file has its .pyc beside it, checked by
 nothing (unchecked-hash): a plugin is trusted by the digest of its files, so its Python runs with -B and writes none.
+Nothing in it names the folders of the machine that built it: the bytecode records its files from the plugin's root
+(Python puts a file's real place in as it loads one), and the Python's own build notes name its builder's folder.
 """
 from __future__ import annotations
 
@@ -60,6 +65,11 @@ def the_python(src: pathlib.Path, out: pathlib.Path):
   def skip(rel: pathlib.Path) -> bool:
     return rel.parts[0] in TRIMMED or rel.parts[0].startswith("config-") or (rel.parts[0] == "lib-dynload" and "_tkinter" in rel.name)
   n = copy_files(stdlib, out / "lib" / "python3.12", skip)
+  # What the Python was built with (read only to build an extension, which nothing here does) names the folder uv
+  # installed it in, the home folder of whoever builds the plugin in it: back to python-build-standalone's own.
+  for notes in (out / "lib" / "python3.12").glob("_sysconfigdata*.py"):
+    text = notes.read_text()
+    if str(src) in text: notes.write_text(text.replace(str(src), "/install"))
   print(f"python: {src} ({n} files of its library)")
 
 
@@ -132,6 +142,7 @@ def main():
   ap.add_argument("--python", help="a CPython 3.12 install (python-build-standalone's); the checkout's Python's own by default")
   ap.add_argument("--arch", default="sm_89", help="the cards' architectures, comma-separated (sm_86 RTX 30, sm_89 RTX 40, sm_120 RTX 50)")
   ap.add_argument("--sources", action="append", default=[], help="more kernel sources for the pack (kernel_pack.py --sources)")
+  ap.add_argument("--no-firmware", action="store_true", help="without NVIDIA's firmware and tinygrad's TinyGPU app: tinygrad downloads them as it first opens a card")
   ap.add_argument("--zip", action="store_true", help="and OUT.zip of it, to install")
   args = ap.parse_args()
   sys.stdout.reconfigure(line_buffering=True)   # (in order with the kernel pack's)
@@ -149,13 +160,15 @@ def main():
   card.mkdir()
   for f in (HERE / "plugin.py", REPO / "crates" / "oaiy-studio" / "src" / "egpu_serve.py", HERE.parent / "webgpu_server.py"):
     shutil.copy2(f, card / f.name)
-  firmware(src, card / "firmware")
+  if args.no_firmware: print("firmware: left out (tinygrad downloads NVIDIA's and its TinyGPU app as it first opens a card)")
+  else: firmware(src, card / "firmware")
   pack = [sys.executable, str(HERE.parent / "kernel_pack.py"), str(card / "kernels"), "--arch", args.arch]
   for s in args.sources: pack += ["--sources", s]
   subprocess.run(pack, check=True)
   program = out / "python" / "bin" / "python3.12"
+  # (-s, -p: each file recorded as egpu/... and not by where this machine built it)
   subprocess.run([str(program), "-I", "-B", "-m", "compileall", "-q", "-f", "-j", "0", "--invalidation-mode", "unchecked-hash",
-                  str(out / "python" / "lib" / "python3.12"), str(out / "lib"), str(card)], check=True)
+                  "-s", str(out), "-p", "egpu", str(out / "python" / "lib" / "python3.12"), str(out / "lib"), str(card)], check=True)
   said = subprocess.run([str(program), "-I", "-B", "-c", "import sys; sys.path.insert(0, sys.argv[1]); import tinygrad, jinja2, ssl, sqlite3, ctypes; print(sys.version.split()[0])",
                          str(out / "lib")], capture_output=True, text=True)
   if said.returncode != 0: sys.exit(f"the plugin's Python does not start with tinygrad:\n{said.stderr}")
@@ -164,6 +177,9 @@ def main():
   files = [p for p in everything if p.is_file() and not p.is_symlink()]
   size = sum(p.stat().st_size for p in files)
   if links: sys.exit(f"links in the plugin (OAIY refuses them): {[str(p) for p in links[:10]]}")
+  home = str(pathlib.Path.home()).encode()
+  named = [p for p in files if p.suffix in (".py", ".pyc", ".json", ".txt") and home in p.read_bytes()]
+  if named: sys.exit(f"files in the plugin that name this machine's home folder: {[str(p.relative_to(out)) for p in named[:10]]}")
   if len(everything) > MOST_FILES or size > MOST_BYTES:
     sys.exit(f"{len(everything)} files and folders, {size / 2**20:.0f} MiB: more than OAIY takes in a plugin ({MOST_FILES}, {MOST_BYTES >> 20} MiB)")
   print(f"the eGPU plugin, Python {said.stdout.strip()}: {len(files)} files, {size / 2**20:.0f} MiB, in {out}")
