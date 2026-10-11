@@ -293,6 +293,28 @@ fn a_models_weights_are_said_to_be_on_the_gpu_or_read_from_the_file() {
     assert!(placement("m", 12 * gb, 10 * gb, None).ends_with("as they are used"));
 }
 
+/// Where a model's weights are, given what names it: a checkpoint that is a folder (EXL3, safetensors) may be named by
+/// the `config.json` in it (a host that takes a model to be one file can then name it), and is that file's folder.
+pub(crate) fn checkpoint(path: &Path) -> PathBuf {
+    match (path.file_name().and_then(|n| n.to_str()), path.parent()) {
+        (Some("config.json"), Some(folder)) if path.is_file() => folder.to_path_buf(),
+        _ => path.to_path_buf(),
+    }
+}
+
+#[test]
+fn a_checkpoint_named_by_its_config_is_its_folder() {
+    let dir = std::env::temp_dir().join(format!("oaiy-checkpoint-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("config.json"), b"{}").unwrap();
+    assert_eq!(checkpoint(&dir.join("config.json")), dir);
+    assert_eq!(checkpoint(&dir), dir);
+    // (a file of another name, or a config.json that is not there, is left as it is named)
+    assert_eq!(checkpoint(&dir.join("model.gguf")), dir.join("model.gguf"));
+    assert_eq!(checkpoint(&dir.join("none").join("config.json")), dir.join("none").join("config.json"));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// The architecture of a dense GGUF, which is loaded whole (see `load_gguf`); None for Qwen3.5 (a path of its
 /// own), the MoE families expert streaming serves, and what llama-rs does not know.
 fn dense_arch(gguf: &gguf::GgufFile) -> Option<llama_rs::Architecture> {
@@ -340,20 +362,14 @@ impl Models {
             if !root.is_absolute() { return Err(Error::Arg("media output root must be absolute".into())); }
             if let Some(config) = &mut image_config { config.output_root = root.clone(); }
         }
-        let mut specs = vec![Spec {
-            name: opts.name.clone(),
-            path: opts.model.clone(),
-            kind: Kind::detect(&opts.model),
-        }];
+        let first = checkpoint(&opts.model);
+        let mut specs = vec![Spec { name: opts.name.clone(), kind: Kind::detect(&first), path: first }];
         for (name, path) in &opts.extra_models {
             if specs.iter().any(|s| &s.name == name) {
                 return Err(Error::Arg(format!("two models are both called {name}")));
             }
-            specs.push(Spec {
-                name: name.clone(),
-                path: path.clone(),
-                kind: Kind::detect(path),
-            });
+            let path = checkpoint(path);
+            specs.push(Spec { name: name.clone(), kind: Kind::detect(&path), path });
         }
         if let Some(c) = &image_config {
             if let Some(spec) = specs.iter().find(|s|s.name==c.controller_name) {
