@@ -49,7 +49,7 @@ struct Conn {
 
 /// The largest buffer asked for in the computer's memory: a step's read-backs (a layer's routing and input, a
 /// model's logits' picks) are a few kilobytes, read a round trip each, where a prompt chunk's megabytes go as fast
-/// by the card's own copy. TINYGPU_NO_HOST_BUFFERS=1 asks for none.
+/// by the card's own copy. Asked for only with TINYGPU_HOST_BUFFERS=1 (see `adapter`).
 const HOST_LARGEST: u64 = 256 << 10;
 
 /// The socket, and how many requests sent on it have answers not read yet: a write, a submission and a buffer let go
@@ -261,7 +261,10 @@ pub fn adapter(socket: &Path) -> Result<wgpu::Adapter, String> {
     if protocol != PROTOCOL {
         return Err(format!("tinygpu: the server at {} speaks version {protocol} of its requests, this program {PROTOCOL}: run the webgpu_server.py of this program's version", socket.display()));
     }
-    if field("host_buffers").as_deref() == Some("1") && std::env::var("TINYGPU_NO_HOST_BUFFERS").map_or(true, |v| v != "1") {
+    // (asked for only with TINYGPU_HOST_BUFFERS=1: each such buffer is a mapping of the computer's memory with a file
+    // of its own in the server, and a server that held the card for a day's models ran out of them, 256 a process:
+    // its next ALLOC failed, and the engine with it. A layer's read-back was 0.33 ms with them where 0.35.)
+    if field("host_buffers").as_deref() == Some("1") && std::env::var("TINYGPU_HOST_BUFFERS").is_ok_and(|v| v == "1") {
         conn.host_buffers.store(true, Ordering::Relaxed);
     }
     let arch = field("arch").unwrap_or_default();

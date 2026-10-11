@@ -194,10 +194,13 @@ What the card's server and the adapter gave it (and every model on the card):
   checked and its fields written. A Flash-Next layer's submission 133 us where 225. Emptied when a buffer is let go.
   `tools/tinygpu/fast_check.py` launches kept ones again, each the same bytes as tinygrad's; `TINYGPU_NO_KEPT=1`
   keeps none. (The 27B, bound by the card's own time, is 40 tokens a second with it as without.)
-- **Small read-backs in the computer's memory.** A buffer a program maps to read, of 256 KB or less, is asked for in
-  the computer's memory where the server's HELLO says it gives them (`host_buffers`: a server or an engine that does
-  not know of it goes on as before): the card writes it across the link as its kernels run, and a read is no copy by
-  the card and no second wait (a layer's read-back 0.33 ms where 0.35). `TINYGPU_NO_HOST_BUFFERS=1` asks for none.
+- **Small read-backs in the computer's memory, where asked for.** With `TINYGPU_HOST_BUFFERS=1` a buffer a program
+  maps to read, of 256 KB or less, is asked for in the computer's memory where the server's HELLO says it gives them
+  (`host_buffers`): the card writes it across the link as its kernels run, and a read is no copy by the card and no
+  second wait (a layer's read-back 0.33 ms where 0.35). Not by default: each such buffer is a mapping with a file of
+  its own in the server, and OAIY's launcher, which holds the card through a day's models, ran out of them (its
+  next ALLOC failed with tinygrad's `IndexError` in `alloc_sysmem`, the engine with it, and the request went to the
+  Mac's own engine). They would want one mapping shared out among them.
 
 In OAIY the model is one more set to the eGPU: a request that names it loads it on the card in place of the other
 (some 30 s with its first prompt; a conversation it has a state of on the disk goes on from there). OAIY
