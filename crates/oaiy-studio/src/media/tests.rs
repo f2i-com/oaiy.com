@@ -369,6 +369,9 @@ fn webgpu_media_goes_to_the_egpu_where_it_runs_oaiys_engine() {
     for kind in [Kind::Video, Kind::Music, Kind::Sound, Kind::Speech, Kind::Model3d, Kind::Picture] {
         assert!(on_card(&c, kind, &body("{}")), "{kind:?}");
     }
+    // speech takes the card only where it is lent already or holds no language model; the rest take it
+    assert!(takes_card(Kind::Speech, true, true) && takes_card(Kind::Speech, false, false) && !takes_card(Kind::Speech, false, true));
+    assert!(takes_card(Kind::Music, false, true) && takes_card(Kind::Image, false, true));
     // (the kept worker takes Qwen Image pictures; the others are a worker's of their own)
     assert!(kept_on_card(Kind::Image, &qwen) && !kept_on_card(Kind::Image, &sdxl) && !kept_on_card(Kind::Music, &body("{}")));
     assert!(!on_card(&c, Kind::Image, &body(r#"{"base":"b","backend":"cpu"}"#)), "not on WebGPU");

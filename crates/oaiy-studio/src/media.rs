@@ -963,6 +963,15 @@ pub fn on_card(cfg: &Json, kind: Kind, request: &Json) -> bool {
     wanted && crate::egpu::enabled(llm) && crate::egpu::webgpu(llm) && request.get("backend").is_none_or(|b| b.as_str() == Some("webgpu"))
 }
 
+/// Whether a job the card could make takes it now: speech only where the card is lent already, or its language model
+/// is not loaded there. A line is spoken about as fast on the Mac's GPU as on the card (its talker's steps are small
+/// kernels, each a launch across the link), and lending the card for it would put the language model away for a
+/// reload of a minute or more (the 27B from an external drive); a picture, a song or a sound effect is made 8 to 17
+/// times as fast there, and takes it.
+fn takes_card(kind: Kind, lent: bool, llm_loaded: bool) -> bool {
+    kind != Kind::Speech || lent || !llm_loaded
+}
+
 /// Whether a job on the card is the kept worker's (`oaiy-media --serve`, which takes Qwen Image pictures alone): the
 /// others are a worker's of their own, as on this computer.
 fn kept_on_card(kind: Kind, request: &Json) -> bool {
@@ -1391,7 +1400,7 @@ impl Media {
         let cfg = studio.config();
         let media = cfg.get("media").cloned().unwrap_or(Json::Null);
         let device = int_or(&media, "device", 0);
-        if on_card(&cfg, job.kind, &job.request) && !job.cancel.load(Ordering::Relaxed) {
+        if on_card(&cfg, job.kind, &job.request) && takes_card(job.kind, studio.egpu.is_lent(), studio.egpu.is_running()) && !job.cancel.load(Ordering::Relaxed) {
             let label = if job.incognito { "incognito job" } else { job.id.as_str() };
             match studio.egpu.lend(&cfg, &studio.root, CARD_WAIT) {
                 Ok(socket) => {
