@@ -731,6 +731,8 @@ impl QwenEngine {
         #[cfg(feature = "webgpu")]
         let cold_at_start = ggml_rs_wgpu::quant_moe::cached_experts();
         #[cfg(feature = "webgpu")]
+        let tiered_at_start = ggml_rs_wgpu::exl3::tiered_experts();
+        #[cfg(feature = "webgpu")]
         let scratch_at_start = ggml_rs_wgpu::scratch_made();
         let clock = std::time::Instant::now();
         let mut soft = Vec::new();
@@ -845,6 +847,8 @@ impl QwenEngine {
         // the request's line)
         #[cfg(feature = "webgpu")]
         let (cold_before, cold_prompt) = (cold_at_start, ggml_rs_wgpu::quant_moe::cached_experts());
+        #[cfg(feature = "webgpu")]
+        let (tiered_before, tiered_prompt) = (tiered_at_start, ggml_rs_wgpu::exl3::tiered_experts());
         #[cfg(feature = "webgpu")]
         let scratch_prompt = ggml_rs_wgpu::scratch_made();
         let mut logits = Row::Logits(logits.unwrap());
@@ -980,6 +984,16 @@ impl QwenEngine {
             let now = ggml_rs_wgpu::quant_moe::cached_experts();
             if now.0 > cold_before.0 {
                 eprintln!("  Qwen experts: the prompt read {} from the host's memory and brought {} to the card, the reply {} and {}", cold_prompt.0 - cold_before.0, cold_prompt.1 - cold_before.1, now.0 - cold_prompt.0, now.1 - cold_prompt.1);
+            }
+            // (experts read as records, a GPU holding some: how many of the routings it held, what it took in, what was read)
+            let t = ggml_rs_wgpu::exl3::tiered_experts();
+            if t[0] + t[1] > tiered_before[0] + tiered_before[1] {
+                let part = |a: [u64; 10], b: [u64; 10]| {
+                    let (held, not) = (b[0] - a[0], b[1] - a[1]);
+                    let s = |i: usize| (b[i] - a[i]) as f64 / 1e6;
+                    format!("{:.1}% of {} routings held on the GPU, {} taken in, {} records read ({:.2} GB; {} read ahead used, {} not); reading {:.2} s, running {:.2} s, taking in {:.2} s", 100.0 * held as f64 / (held + not).max(1) as f64, held + not, b[2] - a[2], b[3] - a[3], (b[4] - a[4]) as f64 / 1e9, b[8] - a[8], b[9] - a[9], s(5), s(6), s(7))
+                };
+                eprintln!("  Qwen experts: the prompt {}; the reply {}", part(tiered_before, tiered_prompt), part(tiered_prompt, t));
             }
             // (scratch its recordings found none of in the pool: new memory, which the system zeroes as it gives it)
             let made = ggml_rs_wgpu::scratch_made();

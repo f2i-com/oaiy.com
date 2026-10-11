@@ -645,7 +645,42 @@ impl Models {
             .map_err(Error::Arg)
         };
         let tower_backend = backends.last().map(Arc::clone);
-        let model = crate::flashnext::load_portable_with(&spec.path, backends, &adapters, &packed, &experts, o.mtp.contains(&spec.name)).map_err(|e| match adapters.is_empty() {
+        // Its routed experts read as records, as rows are routed to them, where the GPUs and the memory that is free
+        // hold too little of them to keep them all (a 24 GB card beside a 24 GB Mac: 46.7 GB of them).
+        // OAIY_FN_TIERED=1 always, 0 never.
+        let expert_bytes = crate::flashnext::routed_expert_bytes(&spec.path)?;
+        let gpu_room: u64 = gpus.iter().map(|g| g.usage().1.saturating_sub(reserve)).sum();
+        let ram_free = ggml_rs_wgpu::host_memory().map_or(0, |(free, _)| free as u64);
+        let tiered = match std::env::var("OAIY_FN_TIERED").ok().as_deref() {
+            Some("1") => true,
+            Some("0") => false,
+            _ => !gpus.is_empty() && expert_bytes > gpu_room + ram_free / 4 * 3,
+        };
+        // Each layer's share of what the budget leaves (less the reserve, the attention's cache for the context, and
+        // some 1.2 GB for the chain's vectors and a prompt chunk's scratch) as slots of experts the GPU holds, taken in
+        // as they are used (OAIY_FN_SLOTS: as many a layer).
+        let slots_asked: Option<usize> = std::env::var("OAIY_FN_SLOTS").ok().and_then(|v| v.parse().ok());
+        let fc = crate::flashnext::Config::read(&spec.path)?;
+        let cache_bytes = (self.dense_context(fc.context_length) * fc.attention.iter().filter(|&&a| a).count() * (2 * fc.kv_heads * fc.head_dim + fc.index_dim) * 4) as u64;
+        let kept_free = reserve + cache_bytes + (12 << 30) / 10;
+        let tiered_make = |device: usize, _layer: &str, layout: ggml_rs_wgpu::exl3::RecordLayout, source: Arc<dyn ggml_rs_wgpu::exl3::ExpertSource>, shared: [ggml_rs::exl3::Exl3Data; 3]| -> Result<Box<dyn ggml_rs::exl3::Experts>> {
+            let g = gpus.get(device).ok_or_else(|| Error::Arg("Flash-Next's experts read as records need a GPU for the rest of the model".into()))?;
+            let layer_bytes = (source.experts() * layout.bytes) as u64;
+            let layers = (expert_bytes / layer_bytes.max(1)).max(1) as usize;
+            let slot_bytes: usize = layout.proj.iter().map(|p| p.k / 16 * (p.n / 16) * p.tile_words * 2 + (p.k + p.n) * 4).sum();
+            let room = g.usage().1.saturating_sub(kept_free);
+            let slots = slots_asked.unwrap_or((room / layers as u64 / slot_bytes.max(1) as u64) as usize);
+            g.exl3_experts_tiered(layout, source, shared, slots, reserve).map_err(Error::Arg)
+        };
+        if tiered {
+            self.say(format!("{}: its {:.1} GB of routed experts read as records as they are routed to (the GPUs' room {:.1} GB, {:.1} GB of memory free)", spec.name, expert_bytes as f64 / 1e9, gpu_room as f64 / 1e9, ram_free as f64 / 1e9));
+        }
+        let loaded = if tiered {
+            crate::flashnext::load_portable_tiered(&spec.path, backends, &adapters, &packed, &experts, &tiered_make)
+        } else {
+            crate::flashnext::load_portable_with(&spec.path, backends, &adapters, &packed, &experts, o.mtp.contains(&spec.name))
+        };
+        let model = loaded.map_err(|e| match adapters.is_empty() {
             true => e,
             // (an adapter's target that no matrix of the model took, or experts that take no update)
             false => Error::Arg(format!("{}: {e} (a LoRA is applied beside the attention, dense and expert projections of the model; this one names something else, or experts that take none)", spec.name)),
@@ -659,6 +694,10 @@ impl Models {
         }
         if o.mtp.contains(&spec.name) && !model.drafts() {
             self.say(format!("{}: its MTP layer is not all on a GPU, so it does not draft", spec.name));
+        }
+        if tiered {
+            let (held, layers) = model.rest_layers();
+            self.say(format!("{}: {held} of its {layers} layers' experts partly on the GPU (slots taken in as they are used), the rest read and run on the host", spec.name));
         }
         for (d, g) in gpus.iter().enumerate() {
             let (used, budget) = g.usage();

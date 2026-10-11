@@ -213,6 +213,9 @@ impl ChainRecorder for Recorder<'_> {
         if let Some(q) = experts.as_any().and_then(|a| a.downcast_ref::<crate::quant_moe::QuantMoe>()) {
             return q.record(self, x, out, assign);
         }
+        if let Some(t) = experts.as_any().and_then(|a| a.downcast_ref::<crate::exl3::Exl3MoeTiered>()) {
+            return t.record(self, x, out, assign);
+        }
         let g = experts.as_any().and_then(|a| a.downcast_ref::<crate::exl3::Exl3MoeGrouped>()).expect("experts this adapter holds as groups");
         g.record(self, x, out, assign);
     }
@@ -220,6 +223,9 @@ impl ChainRecorder for Recorder<'_> {
     fn moe_routed(&mut self, experts: &dyn ggml_rs::exl3::Experts, x: &DeviceVec, out: &DeviceVec, logits: &DeviceVec, top_k: usize, rows: usize) -> bool {
         if let Some(q) = experts.as_any().and_then(|a| a.downcast_ref::<crate::quant_moe::QuantMoe>()) {
             return q.record_routed(self, x, out, logits, top_k, rows, None);
+        }
+        if let Some(t) = experts.as_any().and_then(|a| a.downcast_ref::<crate::exl3::Exl3MoeTiered>()) {
+            return t.record_routed(self, x, out, logits, top_k, rows, None);
         }
         let Some(g) = experts.as_any().and_then(|a| a.downcast_ref::<crate::exl3::Exl3MoeGrouped>()) else { return false };
         g.record_routed(self, x, out, logits, top_k, rows, None)
@@ -232,11 +238,17 @@ impl ChainRecorder for Recorder<'_> {
         if let Some(q) = experts.as_any().and_then(|a| a.downcast_ref::<crate::quant_moe::QuantMoe>()) {
             return q.record_routed(self, x, &out, logits, top_k, rows, Some((streams_x, post, streams)));
         }
+        if let Some(t) = experts.as_any().and_then(|a| a.downcast_ref::<crate::exl3::Exl3MoeTiered>()) {
+            return t.record_routed(self, x, &out, logits, top_k, rows, Some((streams_x, post, streams)));
+        }
         let Some(g) = experts.as_any().and_then(|a| a.downcast_ref::<crate::exl3::Exl3MoeGrouped>()) else { return false };
         g.record_routed(self, x, &out, logits, top_k, rows, Some((streams_x, post, streams)))
     }
 
     fn moe_shared(&mut self, experts: &dyn ggml_rs::exl3::Experts, x: &DeviceVec, out: &DeviceVec, rows: usize) -> bool {
+        if let Some(t) = experts.as_any().and_then(|a| a.downcast_ref::<crate::exl3::Exl3MoeTiered>()) {
+            return t.record_shared(self, x, out, rows);
+        }
         let Some(host) = experts.as_any().and_then(|a| a.downcast_ref::<crate::quant_host::QuantMoeHost>()) else { return false };
         host.record_shared(self, x, out, rows)
     }

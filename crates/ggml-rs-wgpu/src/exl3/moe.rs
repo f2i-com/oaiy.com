@@ -75,7 +75,7 @@ pub(super) struct LoraTables {
     slot: Vec<u32>,
     a: Vec<f32>,
     b: Vec<f32>,
-    rank: usize,
+    pub(super) rank: usize,
 }
 
 impl LoraTables {
@@ -83,7 +83,7 @@ impl LoraTables {
     /// rank, k]`) and `b` (`[slots, n, rank]`) beside the matrices `at` names (a matrix and its slot in them), at the
     /// larger of the two ranks: the other's further rows of A and columns of B are zeros, which add nothing.
     #[allow(clippy::too_many_arguments)]
-    fn with(mut self, matrices: usize, at: &[(usize, u32)], a: &[f32], b: &[f32], rank: usize, k: usize, n: usize) -> Result<Self, String> {
+    pub(super) fn with(mut self, matrices: usize, at: &[(usize, u32)], a: &[f32], b: &[f32], rank: usize, k: usize, n: usize) -> Result<Self, String> {
         if rank == 0 || a.is_empty() || a.len() % (rank * k) != 0 || b.len() != a.len() / (rank * k) * n * rank {
             return Err(format!("a rank {rank} update of {} and {} floats beside projections [{n}, {k}]", a.len(), b.len()));
         }
@@ -120,7 +120,7 @@ impl LoraTables {
 
     /// The update of matrix `m` (`[n, k]`) added to `y` (`[rows, n]`) for its inputs `x` (`[rows, k]`), as the kernels
     /// add it ([`LORA_A`], [`LORA_B`]): nothing where the matrix has none.
-    fn add(&self, m: usize, k: usize, n: usize, x: &[f32], y: &mut [f32]) {
+    pub(super) fn add(&self, m: usize, k: usize, n: usize, x: &[f32], y: &mut [f32]) {
         if self.rank == 0 || self.slot[m] == NONE {
             return;
         }
@@ -175,15 +175,15 @@ impl GroupLora {
 /// One kind of a layer's routed experts' projection as a group (their gate and up matrices, or their down ones): their
 /// words in one buffer, a matrix's after another, and their transforms' tables (the maps the identity).
 pub(super) struct Group {
-    words: wgpu::Buffer,
+    pub(super) words: wgpu::Buffer,
     pub(super) suh: DeviceVec,
     pub(super) svh: DeviceVec,
     pub(super) k: usize,
     pub(super) n: usize,
-    tw: usize,
+    pub(super) tw: usize,
     /// Words a matrix.
-    mwords: usize,
-    splits: u32,
+    pub(super) mwords: usize,
+    pub(super) splits: u32,
 }
 
 /// A decode step's scratch: one row, `top_k` experts (the bind groups of a step made once).
@@ -212,14 +212,14 @@ pub(crate) struct Step {
 /// few dispatches from a job list, their transforms on the GPU too, where a projection was a dispatch (and its
 /// transforms the host's) in a layer's two round trips.
 pub struct Exl3MoeGrouped {
-    b: WgpuBackend,
+    pub(super) b: WgpuBackend,
     routed: usize,
     hidden: usize,
     ff: usize,
     pub(super) gu: Group,
     down: Group,
     /// The shared expert's projections: EXL3 ones, each with an adapter's low-rank update beside it where it has one.
-    shared: [Arc<dyn PackedLinear>; 3],
+    pub(super) shared: [Arc<dyn PackedLinear>; 3],
     /// The routed experts' low-rank updates (a LoRA adapter's): the gate and up group's, the down group's.
     gu_lora: Option<GroupLora>,
     down_lora: Option<GroupLora>,
@@ -305,6 +305,78 @@ impl Exl3MoeGrouped {
         let shared = shared.map(|s| Arc::new(s) as Arc<dyn PackedLinear>);
         // the routed groups' bytes stay counted as long as the layer lives
         Ok(Some(Exl3MoeGrouped { b: b.clone(), routed: routed.len(), hidden, ff, gu, down, shared, gu_lora: None, down_lora: None }))
+    }
+
+    /// `slots` places for experts of a layer of `hidden -> ff` experts (`tw` words a tile: the gate and up matrices',
+    /// the down ones'), empty until [`Self::put`] fills them, and `shared` as its shared expert: as [`Self::try_new`]
+    /// makes a layer's experts, with slots where experts. None where the groups would be past a binding or the budget
+    /// less `reserve`.
+    pub(super) fn with_slots(b: &WgpuBackend, slots: usize, hidden: usize, ff: usize, tw: [usize; 2], shared: &[Exl3Data; 3], reserve: u64) -> Result<Option<Exl3MoeGrouped>, String> {
+        if slots == 0 || hidden % 128 != 0 || ff % 128 != 0 {
+            return Ok(None);
+        }
+        for d in shared {
+            d.validate()?;
+        }
+        let mwords = |k: usize, n: usize, tw: usize| k / 16 * n / 16 * (tw / 2);
+        let (gu_words, d_words) = (mwords(hidden, ff, tw[0]), mwords(ff, hidden, tw[1]));
+        let (gu_bytes, d_bytes) = ((2 * slots * gu_words * 4) as u64, (slots * d_words * 4) as u64);
+        let tables = (slots * 3 * (hidden + ff) * 4) as u64;
+        let limit = chunk_limit(&b.gpu.limits);
+        if gu_bytes > limit || d_bytes > limit {
+            return Ok(None);
+        }
+        let total = gu_bytes + d_bytes + tables;
+        let prev = b.used.fetch_add(total, Ordering::Relaxed);
+        if prev + total > b.budget.saturating_sub(reserve) {
+            b.used.fetch_sub(total, Ordering::Relaxed);
+            return Ok(None);
+        }
+        let group = |matrices: usize, k: usize, n: usize, tw: usize| -> Group {
+            let mw = mwords(k, n, tw);
+            let words = b.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("oaiy-expert-slots"),
+                size: (matrices * mw * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let ntiles = n / 16;
+            let splits = 4096usize.div_ceil(ntiles).next_power_of_two().min(8).min(k / 16).max(1) as u32;
+            Group { words, suh: b.vec(matrices * k), svh: b.vec(matrices * n), k, n, tw, mwords: mw, splits }
+        };
+        let gu = group(2 * slots, hidden, ff, tw[0]);
+        let down = group(slots, ff, hidden, tw[1]);
+        let one = |d: &Exl3Data| Exl3Gpu::upload(b, Exl3Data { words: d.words.clone(), suh: d.suh.clone(), svh: d.svh.clone(), tile_words: d.tile_words, input_map: d.input_map.clone(), output_map: d.output_map.clone() }, None);
+        let shared = [one(&shared[0]), one(&shared[1]), one(&shared[2])];
+        if shared.iter().any(|s| s.single_chunk().is_none()) {
+            b.used.fetch_sub(total, Ordering::Relaxed);
+            return Ok(None);
+        }
+        let shared = shared.map(|s| Arc::new(s) as Arc<dyn PackedLinear>);
+        Ok(Some(Exl3MoeGrouped { b: b.clone(), routed: slots, hidden, ff, gu, down, shared, gu_lora: None, down_lora: None }))
+    }
+
+    /// Slot `slot`'s expert made `record`'s (as `layout` lays it out): its matrices' words and their transforms'
+    /// tables written where the groups keep that slot's (in the queue's order: the runs recorded after see it).
+    pub(super) fn put(&self, slot: usize, record: &[u8], layout: &RecordLayout) {
+        assert!(slot < self.routed, "slot {slot} of {}", self.routed);
+        let gpu = &self.b.gpu;
+        let floats = |at: usize, len: usize| -> Vec<u8> {
+            (0..len).flat_map(|i| half::f16::from_bits(u16::from_le_bytes([record[at + 2 * i], record[at + 2 * i + 1]])).to_f32().to_le_bytes()).collect()
+        };
+        let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU vector").clone();
+        for (which, (g, m)) in [(&self.gu, 2 * slot), (&self.gu, 2 * slot + 1), (&self.down, slot)].into_iter().enumerate() {
+            let p = &layout.proj[which];
+            assert!(p.k == g.k && p.n == g.n && p.tile_words == g.tw, "an expert's projection {which} unlike its group's");
+            gpu.write(&g.words, (m * g.mwords * 4) as u64, &record[p.trellis..p.trellis + g.mwords * 4]);
+            gpu.write(&buf(&g.suh), (m * g.k * 4) as u64, &floats(p.suh, g.k));
+            gpu.write(&buf(&g.svh), (m * g.n * 4) as u64, &floats(p.svh, g.n));
+        }
+    }
+
+    /// The slots (or the routed experts) these hold.
+    pub(super) fn slots(&self) -> usize {
+        self.routed
     }
 
     pub(crate) fn is_on(&self, gpu: &Arc<Gpu>) -> bool {
@@ -474,9 +546,18 @@ impl Exl3MoeGrouped {
     /// its streams (the streams, their write weights, how many) where it would be `out`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_routed(&self, rec: &mut crate::chain::Recorder<'_>, x: &DeviceVec, out: &DeviceVec, logits: &DeviceVec, top_k: usize, rows: usize, into: Option<(&DeviceVec, &DeviceVec, usize)>) -> bool {
+        self.record_routed_mapped(rec, x, out, logits, self.routed, None, top_k, rows, into)
+    }
+
+    /// [`Self::record_routed`] of a layer of `over` routed experts these hold some of, at the slots `map` names (an
+    /// expert's slot, [`NONE`] for one not held): the router's `logits` are `[rows, over + 1]`, each row's top `top_k` of
+    /// the `over` its experts, and one not held is weighted 0 here (its sum the host's to add). No map: these are the
+    /// layer's experts, `over` their count.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_routed_mapped(&self, rec: &mut crate::chain::Recorder<'_>, x: &DeviceVec, out: &DeviceVec, logits: &DeviceVec, over: usize, map: Option<&DeviceVec>, top_k: usize, rows: usize, into: Option<(&DeviceVec, &DeviceVec, usize)>) -> bool {
         // a prompt's rows (more than a check's) grouped by expert on the GPU, where the tensor cores take its blocks
         let many = rows > FEW_MAX && coop_on(rec.gpu());
-        if self.routed > 1024 || top_k == 0 || top_k > 32.min(self.routed) || rows == 0 || (rows > 64 && !many) || rows > 65535 || logits.len < rows * (self.routed + 1) {
+        if over > 1024 || self.routed > 1024 || top_k == 0 || top_k > 32.min(over) || rows == 0 || (rows > 64 && !many) || rows > 65535 || logits.len < rows * (over + 1) {
             return false;
         }
         assert!(x.len >= rows * self.hidden && (into.is_some() || out.len >= rows * self.hidden), "moe: {rows} rows of {}", self.hidden);
@@ -503,7 +584,10 @@ impl Exl3MoeGrouped {
         let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
         let d = rec.gpu().dummy().clone();
         let drw = rec.gpu().dummy_rw().clone();
-        record_route(rec, &buf(logits), &st, self.routed, top_k, rows);
+        record_route(rec, &buf(logits), &st, over, top_k, rows);
+        if let Some(map) = map {
+            record_slot_map(rec, &st, map, top_k, rows);
+        }
         let pairs = rows * top_k;
         if many {
             // blocks of as many jobs as an expert has on average (16 to 64: an expert's tiles decoded once a block,

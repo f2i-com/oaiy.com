@@ -35,6 +35,38 @@ pub trait Experts: std::fmt::Debug + Send + Sync {
     fn part_held(&self) -> bool {
         false
     }
+    /// VENDORED-LOCAL: whether a device holds some of these and the host runs the rest (`ggml_rs_wgpu::exl3::
+    /// Exl3MoeTiered`): a chain routes a step's and a check's rows on the device (each expert it holds by its place
+    /// there, one it does not weighted 0), reads the layer's router and input back and adds what
+    /// [`Self::forward_rest`] gives; a prompt's rows it routes on the host, as [`Self::plan_rows`] plans them. Not by
+    /// default.
+    fn host_rest(&self) -> bool {
+        false
+    }
+    /// VENDORED-LOCAL: the routed experts a device does not hold, for `x`'s rows (`[rows, hidden]`) routed by `logits`,
+    /// run on the host and summed by their weights; None where the device held every one.
+    fn forward_rest(&self, x: &Tensor, logits: &Tensor, top_k: usize) -> Option<Tensor> {
+        let _ = (x, logits, top_k);
+        None
+    }
+    /// VENDORED-LOCAL: a prompt's rows (`x` routed by `logits`) as a device that holds some of these runs them: each
+    /// row's experts by their places there (the shared one last), after the device has taken in what it can, and the
+    /// sums of the rest, run on the host (None: none). None where no device holds any.
+    #[allow(clippy::type_complexity)]
+    fn plan_rows(&self, x: &Tensor, logits: &Tensor, top_k: usize) -> Option<(Vec<Vec<(usize, f32)>>, Option<Tensor>)> {
+        let _ = (x, logits, top_k);
+        None
+    }
+    /// VENDORED-LOCAL: a hint, for experts a device holds some of ([`Self::host_rest`]): the next run's rows will be
+    /// routed about as `logits` (this layer's router on the layer before's input) routes them, so what it would need
+    /// from the drive may be read ahead. Nothing by default.
+    fn read_ahead(&self, logits: &Tensor, top_k: usize) {
+        let _ = (logits, top_k);
+    }
+    /// VENDORED-LOCAL: of experts a device holds some of, the routings it held and did not, and the experts taken in.
+    fn rest_counts(&self) -> Option<(u64, u64, u64)> {
+        None
+    }
     /// VENDORED-LOCAL: [`Self::forward`] of experts on the host whose shared expert a device ran
     /// (`ChainRecorder::moe_shared`): `shared` its outputs (`[rows, hidden]`, not yet weighted), added by its gate to
     /// the routed experts' sums. By default the shared expert is run again here.

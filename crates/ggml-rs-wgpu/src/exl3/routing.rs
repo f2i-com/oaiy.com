@@ -21,7 +21,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let r = i / h;
     let c = i % h;
     var acc = 0.0;
-    for (var j = 0u; j < kk; j++) { acc += w[r * (kk + 1u) + j] * d[(r * kk + j) * h + c]; }
+    // (a weight of 0 adds nothing: an expert the device does not hold, whose place another's output fills)
+    for (var j = 0u; j < kk; j++) {
+        let wj = w[r * (kk + 1u) + j];
+        if (wj != 0.0) { acc += wj * d[(r * kk + j) * h + c]; }
+    }
     acc += w[r * (kk + 1u) + kk] * sh[r * h + c];
     out[i] = acc;
 }
@@ -47,7 +51,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let r = i / h;
     let c = i % h;
     var acc = 0.0;
-    for (var j = 0u; j < kk; j++) { acc += w[r * (kk + 1u) + j] * d[(r * kk + j) * h + c]; }
+    // (a weight of 0 adds nothing: an expert the device does not hold, whose place another's output fills)
+    for (var j = 0u; j < kk; j++) {
+        let wj = w[r * (kk + 1u) + j];
+        if (wj != 0.0) { acc += wj * d[(r * kk + j) * h + c]; }
+    }
     acc += w[r * (kk + 1u) + kk] * sh[r * h + c];
     for (var s = 0u; s < streams; s++) {
         let at = (r * streams + s) * h + c;
@@ -160,6 +168,57 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) j
     }
 }
 "#;
+
+/// A row's routed experts sent to the slots a device holds them in (`map[e]`, [`NONE`] for one it does not), before
+/// [`ROUTE_SLOT_JOBS`]: an expert it does not hold weighted 0, for the host to add (its place in the jobs is slot 0's,
+/// whose output the weighted sums then pass over). A thread a pair. `p[0]`: pairs, k.
+pub(crate) const ROUTE_SLOT_WEIGHTS: &str = r#"
+@group(0) @binding(0) var<storage, read> jd: array<u32>;
+@group(0) @binding(1) var<storage, read> map: array<u32>;
+@group(0) @binding(6) var<storage, read_write> w: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let j = id.x;
+    if (j >= p[0].x) { return; }
+    let k = p[0].y;
+    if (map[jd[2u * j]] == 0xffffffffu) {
+        w[(j / k) * (k + 1u) + j % k] = 0.0;
+    }
+}
+"#;
+
+/// [`ROUTE_SLOT_WEIGHTS`]'s second kernel: each pair's down job and its gate and up jobs at its expert's slot (slot 0
+/// where the device does not hold it). A thread a pair. `p[0]`: pairs.
+pub(crate) const ROUTE_SLOT_JOBS: &str = r#"
+@group(0) @binding(0) var<storage, read> map: array<u32>;
+@group(0) @binding(6) var<storage, read_write> jd: array<u32>;
+@group(0) @binding(7) var<storage, read_write> jobs: array<u32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let j = id.x;
+    if (j >= p[0].x) { return; }
+    var s = map[jd[2u * j]];
+    if (s == 0xffffffffu) { s = 0u; }
+    jd[2u * j] = s;
+    jobs[4u * j] = 2u * s;
+    jobs[4u * j + 2u] = 2u * s + 1u;
+}
+"#;
+
+/// `rows` rows' routed experts (`st`'s jobs and weights, as [`record_route`] left them) sent to the slots `map` names.
+pub(crate) fn record_slot_map(rec: &mut crate::chain::Recorder<'_>, st: &Step, map: &DeviceVec, top_k: usize, rows: usize) {
+    let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
+    let d = rec.gpu().dummy().clone();
+    let drw = rec.gpu().dummy_rw().clone();
+    let pairs = (rows * top_k) as u32;
+    let (jd, mb) = (buf(&st.jobs_d), buf(map));
+    rec.dispatch_wide("moe-slot-weights", ROUTE_SLOT_WEIGHTS, [&jd, &mb, &d, &d, &d, &d, &buf(&st.w), &drw], &[pairs, top_k as u32], (pairs.div_ceil(256), 1, 1));
+    rec.dispatch_wide("moe-slot-jobs", ROUTE_SLOT_JOBS, [&mb, &d, &d, &d, &d, &d, &jd, &buf(&st.jobs_gu)], &[pairs], (pairs.div_ceil(256), 1, 1));
+}
 
 /// `rows` rows' routing recorded from their router's `logits` (`[rows, routed + 1]`): each row's top `top_k` experts'
 /// down jobs by rank into `st` ([`ROUTE_RANK`]), then their weights and gate and up jobs ([`ROUTE_WEIGHTS`]).

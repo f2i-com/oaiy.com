@@ -290,7 +290,11 @@ impl DeviceChain for WgpuBackend {
 
     fn holds_experts(&self, e: &dyn ggml_rs::exl3::Experts) -> bool {
         // (EXL3's groups, or a GGUF's quant blocks)
-        e.as_any().is_some_and(|a| a.downcast_ref::<crate::exl3::Exl3MoeGrouped>().is_some_and(|g| g.is_on(&self.gpu)) || a.downcast_ref::<crate::quant_moe::QuantMoe>().is_some_and(|g| g.is_on(&self.gpu)))
+        e.as_any().is_some_and(|a| {
+            a.downcast_ref::<crate::exl3::Exl3MoeGrouped>().is_some_and(|g| g.is_on(&self.gpu))
+                || a.downcast_ref::<crate::quant_moe::QuantMoe>().is_some_and(|g| g.is_on(&self.gpu))
+                || a.downcast_ref::<crate::exl3::Exl3MoeTiered>().is_some_and(|t| t.held_on(&self.gpu))
+        })
     }
 
     fn holds(&self, w: &QuantizedTensor) -> bool {

@@ -335,10 +335,22 @@ impl FlashNext {
             Host(Vec<Vec<(usize, f32)>>),
             /// A layer's experts run on the host (none of its GPU's): their sums, for the device they go up to.
             Summed(usize, Vec<f32>),
+            /// A layer's experts its GPU holds some of, a prompt's rows as the host planned them: those it holds by
+            /// their places there, and the sums of the rest, run on the host, for the device they go up to.
+            Both(usize, Vec<Vec<(usize, f32)>>, Option<Vec<f32>>),
         }
         let experts = |rec: &mut dyn ChainRecorder, dv: &ChainDev, layer: usize, routed: Routed| match routed {
             Routed::Host(assign) => rec.moe_rows(self.layers[layer].moe.experts.as_ref(), &dv.y2_in, &dv.moe_out, &assign),
             Routed::Summed(device, sums) => chains[device].upload(&dv.moe_out, &sums),
+            Routed::Both(device, assign, sums) => {
+                rec.moe_rows(self.layers[layer].moe.experts.as_ref(), &dv.y2_in, &dv.moe_out, &assign);
+                if let Some(sums) = sums {
+                    // (the attention's output vector is free until this layer's attention writes it)
+                    chains[device].upload(&dv.y_out, &sums);
+                    let rows = sums.len();
+                    rec.add(&ggml_rs::DeviceVec { len: rows, inner: dv.moe_out.inner.clone() }, &ggml_rs::DeviceVec { len: rows, inner: dv.y_out.inner.clone() });
+                }
+            }
         };
         // an attention layer's K and V rows and its indexer keys (`[t, index_dim]`), read back, into the host's cache
         let (iq, id) = (cfg.index_heads * cfg.index_dim, cfg.index_dim);
@@ -629,6 +641,8 @@ impl FlashNext {
             }
             hc(&mut *rec, dv, t, &cl.mlp_hc, Some((&dv.y_out, &dv.post)), &dv.post2, &dv.y2_in);
             cl.router.mul(&mut *rec, cfg.experts + 1, h, &dv.y2_in, &dv.router, t);
+            // (experts the GPU holds some of: the rest are the host's, which reads the layer's router and input back)
+            let rest = layer.moe.experts.host_rest();
             if on_gpu && !cl.host && rec.moe_routed_into(layer.moe.experts.as_ref(), &dv.y2_in, &dv.x, &dv.post2, &dv.router, cfg.top_k, t, s) {
                 // the experts after it, on the device, their sums into the streams; the recording goes on
                 if let ChainMixer::Attn { slot, .. } = &cl.mixer {
@@ -640,6 +654,57 @@ impl FlashNext {
                     }
                     attn_reads.push(i);
                 }
+                if !rest {
+                    continue;
+                }
+                // the experts the device does not hold: its run waited for, the rest run here, their sum added to the
+                // streams as the next layer begins; and the next layer's router on this one's input, which predicts
+                // most of the experts it will route to (those it does not hold read ahead from the drive meanwhile)
+                rec.read(&dv.router);
+                rec.read_range(&dv.y2_in, 0, t * h);
+                // (OAIY_FN_READ_AHEAD=1: read ahead; off, it read about three records for each one used from a USB
+                // drive whose reads were what the steps waited on)
+                static AHEAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let ahead = *AHEAD.get_or_init(|| std::env::var_os("OAIY_FN_READ_AHEAD").is_some_and(|v| v == "1"));
+                let next = (ahead && i + 1 < cfg.layers && self.layers[i + 1].device == d && self.layers[i + 1].moe.experts.host_rest()).then(|| &st.layers[i + 1]);
+                if let Some(nl) = next {
+                    nl.router.mul(&mut *rec, cfg.experts + 1, h, &dv.y2_in, &dv.router_next, t);
+                    rec.read_range(&dv.router_next, 0, t * (cfg.experts + 1));
+                }
+                if let Some(p) = prev.take() {
+                    p.finish(self, kv);
+                }
+                for (from, to, reads) in handoffs.drain(..) {
+                    let mut got = from.finish().into_iter();
+                    for &a in &reads {
+                        let (kvrows, raw) = (got.next().expect("a layer's K and V"), got.next().expect("its indexer keys"));
+                        to_store.push((a, kvrows, raw));
+                    }
+                    chains[to].upload(&devs[to].x, &got.next().expect("the streams"));
+                }
+                let waiting = std::time::Instant::now();
+                let mut got = open.take().expect("the layer's recording").finish().into_iter();
+                host_waited += waiting.elapsed().as_secs_f64() * 1e3;
+                for a in attn_reads.drain(..) {
+                    let (kvrows, raw) = (got.next().expect("a layer's K and V"), got.next().expect("its indexer keys"));
+                    to_store.push((a, kvrows, raw));
+                }
+                let width = cfg.experts + 1;
+                let logits = got.next().expect("the router's logits");
+                let x = got.next().expect("the experts' input");
+                if next.is_some() {
+                    let predicted = got.next().expect("the next layer's router on this one's input");
+                    self.layers[i + 1].moe.experts.read_ahead(&Tensor::from_vec(predicted, vec![t, width]), cfg.top_k);
+                }
+                let running = std::time::Instant::now();
+                if route_dumping() {
+                    let assign: Vec<Vec<(usize, f32)>> = (0..t).map(|r| ggml_rs::exl3::route(&logits[r * width..(r + 1) * width], cfg.top_k)).collect();
+                    route_dump(i, past, &assign);
+                }
+                let sums = layer.moe.experts.forward_rest(&Tensor::from_vec(x, vec![t, h]), &Tensor::from_vec(logits[..t * width].to_vec(), vec![t, width]), cfg.top_k);
+                host_layers += 1;
+                host_ran += running.elapsed().as_secs_f64() * 1e3;
+                pending = sums.map(|sums| Routed::Summed(d, sums.to_host().data().to_vec()));
                 continue;
             }
             // The host between this layer's submits: to route its rows, or (a layer no GPU had room for) to run its
@@ -648,7 +713,7 @@ impl FlashNext {
             // (a host layer's shared expert on the device where it is there: its outputs read back with the rest)
             let shared = cl.host && rec.moe_shared(layer.moe.experts.as_ref(), &dv.y2_in, &dv.moe_out, t);
             rec.read(&dv.router);
-            if cl.host {
+            if cl.host || rest {
                 rec.read_range(&dv.y2_in, 0, t * h);
             }
             if shared {
@@ -684,7 +749,7 @@ impl FlashNext {
                 to_store.push((a, kvrows, raw));
             }
             let logits = got.next().expect("the router's logits");
-            let input = cl.host.then(|| got.next().expect("the experts' input"));
+            let input = (cl.host || rest).then(|| got.next().expect("the experts' input"));
             let shared = shared.then(|| got.next().expect("the shared expert's outputs"));
             if attn_slot {
                 let (kvrows, index) = (got.next().expect("the run's K and V"), got.next().expect("the run's indexer keys"));
@@ -692,8 +757,25 @@ impl FlashNext {
                 to_cache(i, kvrows, raw, kv);
             }
             pending = Some(match input {
+                // a prompt's rows of experts the GPU holds some of: planned on the host (what it lacks taken in first)
+                Some(x) if rest && !cl.host => {
+                    let running = std::time::Instant::now();
+                    let (x, logits) = (Tensor::from_vec(x, vec![t, h]), Tensor::from_vec(logits[..t * width].to_vec(), vec![t, width]));
+                    if route_dumping() {
+                        let assign: Vec<Vec<(usize, f32)>> = (0..t).map(|r| ggml_rs::exl3::route(&logits.data()[r * width..(r + 1) * width], cfg.top_k)).collect();
+                        route_dump(i, past, &assign);
+                    }
+                    let (assign, sums) = layer.moe.experts.plan_rows(&x, &logits, cfg.top_k).expect("a plan of experts the GPU holds some of");
+                    host_layers += 1;
+                    host_ran += running.elapsed().as_secs_f64() * 1e3;
+                    Routed::Both(d, assign, sums.map(|s| s.to_host().data().to_vec()))
+                }
                 Some(x) => {
                     let running = std::time::Instant::now();
+                    if route_dumping() {
+                        let assign: Vec<Vec<(usize, f32)>> = (0..t).map(|r| ggml_rs::exl3::route(&logits[r * width..(r + 1) * width], cfg.top_k)).collect();
+                        route_dump(i, past, &assign);
+                    }
                     let (x, logits) = (Tensor::from_vec(x, vec![t, h]), Tensor::from_vec(logits[..t * width].to_vec(), vec![t, width]));
                     let sums = match &shared {
                         Some(shared) => layer.moe.experts.forward_given(&x, &logits, cfg.top_k, shared),

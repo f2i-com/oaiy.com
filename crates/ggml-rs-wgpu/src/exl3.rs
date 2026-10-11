@@ -20,9 +20,10 @@ mod kernels;
 mod moe;
 mod routing;
 mod source;
+mod tiered;
 
 // (what this file gave the crate and its users, and what the files make for each other)
-pub use {host::*, moe::*, source::*};
+pub use {host::*, moe::*, source::*, tiered::*};
 pub(crate) use {kernels::*, routing::*};
 
 /// An EXL3 projection with its packed weights on the GPU, in buffers of whole tile rows below the binding limit.

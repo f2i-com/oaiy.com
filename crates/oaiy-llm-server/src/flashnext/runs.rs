@@ -115,7 +115,17 @@ impl FlashNext {
     pub fn prompt_rows(&self) -> usize {
         static ASKED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
         let asked = *ASKED.get_or_init(|| std::env::var("OAIY_FN_ROWS").ok().and_then(|v| v.parse().ok()).filter(|n| (64..=1024).contains(n)));
-        asked.unwrap_or(if self.devices.len() == 1 && self.layers.iter().any(|l| l.moe.experts.part_held()) { 1024 } else { 512 })
+        asked.unwrap_or(if self.devices.len() == 1 && self.layers.iter().any(|l| l.moe.experts.part_held() || l.moe.experts.host_rest()) { 1024 } else { 512 })
+    }
+
+    /// The layers whose experts a GPU holds some of (the host running the rest), and the layers.
+    pub fn rest_layers(&self) -> (usize, usize) {
+        (self.layers.iter().filter(|l| l.moe.experts.host_rest()).count(), self.layers.len())
+    }
+
+    /// Over the layers whose experts a GPU holds some of: the routings it held and did not, and the experts taken in.
+    pub fn rest_counts(&self) -> Option<(u64, u64, u64)> {
+        self.layers.iter().filter_map(|l| l.moe.experts.rest_counts()).reduce(|a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2))
     }
 
     /// The layers whose experts run on the host (no GPU had room for them).

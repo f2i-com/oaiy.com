@@ -1037,3 +1037,218 @@ fn a_low_rank_update_beside_the_experts_is_its_definition_on_the_gpu_and_the_hos
     assert!(zeros.low_rank(2, &slot_of[..count], &a, &bm, rank).is_err(), "pairs for another count of experts");
     assert!(zeros.low_rank(2, &slot_of, &a, &bm, rank).is_err(), "a second update of the same matrices");
 }
+
+/// How long the CPU takes for one decode row of a Flash-Next expert's projections (`--ignored --nocapture`).
+#[test]
+#[ignore = "timing"]
+fn time_cpu_expert_rows() {
+    let gate = Exl3Cpu::new(random_exl3(2560, 640, 48, 5)).unwrap();
+    let down = Exl3Cpu::new(random_exl3(640, 2560, 48, 6)).unwrap();
+    // a projection's words as a record holds them, a tile's columns a task
+    for (name, p) in [("gate", &gate), ("down", &down)] {
+        let bytes: Vec<u8> = p.words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let xh = inputs(1, p.t.k);
+        let t = std::time::Instant::now();
+        for _ in 0..20 {
+            tile_columns(&LeWords(&bytes), p.t.k, p.t.n, 48, &xh, 1, 0..p.t.n / 16);
+        }
+        let ms = t.elapsed().as_secs_f64() * 1e3 / 20.0;
+        eprintln!("{name} from bytes, 1 row, 1 thread: {ms:.3} ms ({:.2} G weights/s)", (p.t.k * p.t.n) as f64 / ms / 1e6);
+    }
+    for threads in [1, 2, 5, 15] {
+        for (name, p) in [("gate", &gate), ("down", &down)] {
+            let xh = inputs(1, p.t.k);
+            for _ in 0..3 {
+                p.matmul(&xh, 1, threads);
+            }
+            let t = std::time::Instant::now();
+            for _ in 0..20 {
+                p.matmul(&xh, 1, threads);
+            }
+            let ms = t.elapsed().as_secs_f64() * 1e3 / 20.0;
+            eprintln!("{name} 1 row, {threads} threads: {ms:.3} ms ({:.2} G weights/s)", (p.t.k * p.t.n) as f64 / ms / 1e6);
+        }
+    }
+}
+
+/// Records held in memory, as [`FileRecords`] reads them from files.
+#[derive(Debug)]
+struct MemRecords(Vec<Vec<u8>>);
+
+impl ExpertSource for MemRecords {
+    fn experts(&self) -> usize {
+        self.0.len()
+    }
+
+    fn read(&self, e: usize, into: &mut Vec<u8>) -> std::io::Result<()> {
+        into.clear();
+        into.extend_from_slice(&self.0[e]);
+        Ok(())
+    }
+}
+
+/// `experts`' routed ones as records (each projection's scales as f16, then its words as a file stores them), and their
+/// layout; the shared expert (the last) apart.
+fn as_records(mut experts: Vec<[Exl3Data; 3]>) -> (RecordLayout, MemRecords, [Exl3Data; 3]) {
+    let shared = experts.pop().unwrap();
+    let mut layout = None;
+    let records = experts
+        .iter()
+        .map(|e| {
+            let mut bytes = Vec::new();
+            let proj = [0, 1, 2].map(|w| {
+                let d = &e[w];
+                let half = |v: &f32| half::f16::from_f32(*v).to_bits().to_le_bytes();
+                let suh = bytes.len();
+                bytes.extend(d.suh.iter().flat_map(half));
+                let svh = bytes.len();
+                bytes.extend(d.svh.iter().flat_map(half));
+                let mul1 = bytes.len();
+                bytes.extend(0x83dc_d12du32.to_le_bytes());
+                let trellis = bytes.len();
+                bytes.extend(d.words.iter().flat_map(|w| w.to_le_bytes()));
+                ProjAt { suh, svh, mul1, trellis, k: d.suh.len(), n: d.svh.len(), tile_words: d.tile_words }
+            });
+            layout = Some(RecordLayout { bytes: bytes.len(), proj });
+            bytes
+        })
+        .collect();
+    (layout.unwrap(), MemRecords(records), shared)
+}
+
+/// Experts read as records and computed on the host, the shared one on the GPU, are the definition's sums: alone, with
+/// an adapter's low-rank updates, and in a chain that runs the shared expert on the GPU and reads its output back.
+#[test]
+fn experts_read_as_records_are_the_definitions_sums() {
+    let Some(b) = backend() else { return };
+    let (count, hidden, ff, top_k, tw) = (8, 256, 128, 3, 48);
+    let lora: Pairs = [
+        lora_pairs(count, &[2, count], 2, hidden, ff, 5),
+        lora_pairs(count, &[2, 5], 4, hidden, ff, 6),
+        lora_pairs(count, &[1, 3, 4, 6, count], 2, ff, hidden, 7),
+    ];
+    let none: Pairs = [None, None, None];
+    for rows in [1usize, 7] {
+        let x: Vec<f32> = (0..rows * hidden).map(|i| ((i * 37 % 101) as f32 - 50.0) / 60.0).collect();
+        let logits: Vec<f32> = (0..rows * (count + 1)).map(|i| ((i * 53 % 29) as f32 - 14.0) / 7.0).collect();
+        let xt = Tensor::from_vec(x.clone(), vec![rows, hidden]);
+        let lt = Tensor::from_vec(logits.clone(), vec![rows, count + 1]);
+        for (adapted, l) in [(false, &none), (true, &lora)] {
+            let want = reference_adapted(experts(count, hidden, ff, tw), l, &x, &logits, top_k);
+            let size = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let (layout, records, shared) = as_records(experts(count, hidden, ff, tw));
+            let mut moe = b.exl3_experts_tiered(layout, Arc::new(records), shared, 0, 0).unwrap();
+            if adapted {
+                for (which, p) in l.iter().enumerate() {
+                    let (s, a, bb, r) = p.as_ref().unwrap();
+                    moe.low_rank(which, s, a, bb, *r).unwrap();
+                }
+            }
+            assert!(moe.on_host());
+            let what = format!("tiered moe rows={rows} adapted={adapted}");
+            let got = moe.forward(&xt, &lt, top_k);
+            for (i, (a, e)) in got.data().iter().zip(&want).enumerate() {
+                assert!((a - e).abs() <= 0.003 + 1e-3 * size, "{what} [{i}]: {a} != {e}");
+            }
+            // the shared expert chained, its output read back and given
+            let (xd, sd) = (b.vec(rows * hidden), b.vec(rows * hidden));
+            DeviceChain::upload(&b, &xd, &x);
+            let mut rec = b.begin();
+            assert!(rec.moe_shared(moe.as_ref(), &xd, &sd, rows), "{what}: the shared expert chained");
+            rec.read(&sd);
+            let shared = rec.finish().pop().unwrap();
+            let given = moe.forward_given(&xt, &lt, top_k, &shared);
+            for (i, (a, e)) in given.data().iter().zip(&want).enumerate() {
+                assert!((a - e).abs() <= 0.003 + 1e-3 * size, "{what}, the shared expert given [{i}]: {a} != {e}");
+            }
+        }
+    }
+}
+
+/// Experts a GPU holds some of in slots: a prompt's rows planned on the host (what they use taken in, the rest summed
+/// there) and a step's row routed on the GPU to the slots (the rest the host's) add up to the definition's sums, before
+/// and after slots change hands.
+#[test]
+fn experts_held_in_slots_and_the_rest_on_the_host_are_the_definitions_sums() {
+    let Some(b) = backend() else { return };
+    let (count, hidden, ff, top_k, tw) = (8, 256, 128, 3, 48);
+    let near = |got: &[f32], want: &[f32], what: &str| {
+        let size = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+        for (i, (a, e)) in got.iter().zip(want).enumerate() {
+            assert!((a - e).abs() <= 0.003 + 1e-3 * size, "{what} [{i}]: {a} != {e}");
+        }
+    };
+    let (layout, records, shared) = as_records(experts(count, hidden, ff, tw));
+    let moe = b.exl3_experts_tiered(layout, Arc::new(records), shared, 3, 0).unwrap();
+    assert!(moe.host_rest() && !moe.on_host(), "{moe:?}");
+    for round in 0..4 {
+        // a prompt's rows, planned
+        let rows = 5;
+        let x: Vec<f32> = (0..rows * hidden).map(|i| ((i * 37 % 101 + round * 7) as f32 - 50.0) / 60.0).collect();
+        let logits: Vec<f32> = (0..rows * (count + 1)).map(|i| ((i * 53 % 29 + round * 11) as f32 % 29.0 - 14.0) / 7.0).collect();
+        let want = reference(experts(count, hidden, ff, tw), &x, &logits, top_k);
+        let (xt, lt) = (Tensor::from_vec(x.clone(), vec![rows, hidden]), Tensor::from_vec(logits.clone(), vec![rows, count + 1]));
+        let (assign, rest) = moe.plan_rows(&xt, &lt, top_k).unwrap();
+        let (xd, out) = (b.vec(rows * hidden), b.vec(rows * hidden));
+        DeviceChain::upload(&b, &xd, &x);
+        let mut rec = b.begin();
+        rec.moe_rows(moe.as_ref(), &xd, &out, &assign);
+        rec.read(&out);
+        let mut got = rec.finish().pop().unwrap();
+        if let Some(r) = rest {
+            for (g, v) in got.iter_mut().zip(r.data()) {
+                *g += v;
+            }
+        }
+        near(&got, &want, &format!("round {round}: a prompt's rows planned"));
+        // a step's row routed on the GPU, the rest the host's
+        for step in 0..3 {
+            let x: Vec<f32> = (0..hidden).map(|i| ((i * 29 % 97 + step * 13 + round) as f32 - 48.0) / 50.0).collect();
+            let logits: Vec<f32> = (0..count + 1).map(|i| ((i * 31 % 23 + step * 5 + round * 3) as f32 % 23.0 - 11.0) / 5.0).collect();
+            let want = reference(experts(count, hidden, ff, tw), &x, &logits, top_k);
+            let (xd, out, ld) = (b.vec(hidden), b.vec(hidden), b.vec(count + 1));
+            DeviceChain::upload(&b, &xd, &x);
+            DeviceChain::upload(&b, &ld, &logits);
+            let mut rec = b.begin();
+            rec.keep_groups(true);
+            assert!(rec.moe_routed(moe.as_ref(), &xd, &out, &ld, top_k, 1), "a step routed on the GPU");
+            rec.read(&out);
+            let mut got = rec.finish().pop().unwrap();
+            let rest = moe.forward_rest(&Tensor::from_vec(x.clone(), vec![1, hidden]), &Tensor::from_vec(logits.clone(), vec![1, count + 1]), top_k);
+            if let Some(r) = rest {
+                for (g, v) in got.iter_mut().zip(r.data()) {
+                    *g += v;
+                }
+            }
+            near(&got, &want, &format!("round {round} step {step}: routed to the slots"));
+        }
+    }
+    let (held, not, taken) = moe.rest_counts().unwrap();
+    assert!(held > 0 && not > 0 && taken > 3, "the slots were used and changed hands: {held} held, {not} not, {taken} taken in");
+}
+
+/// How long the host takes for a step's row through 1 to 10 of Flash-Next's experts read as records (`--ignored
+/// --nocapture`).
+#[test]
+#[ignore = "timing"]
+fn time_host_experts_of_a_step() {
+    let Some(b) = backend() else { return };
+    let (count, hidden, ff, tw) = (16, 2560, 640, 48);
+    let (layout, records, shared) = as_records(experts(count, hidden, ff, tw));
+    let moe = b.exl3_experts_tiered(layout, Arc::new(records), shared, 0, 0).unwrap();
+    let t = moe.as_any().unwrap().downcast_ref::<Exl3MoeTiered>().unwrap();
+    let x: Vec<f32> = (0..hidden).map(|i| ((i * 37 % 101) as f32 - 50.0) / 60.0).collect();
+    for used in [1usize, 2, 4, 10] {
+        let assign = vec![(0..used).map(|e| (e, 0.1)).chain([(count, 0.5)]).collect::<Vec<_>>()];
+        for _ in 0..3 {
+            t.time_sum_host(&x, &assign);
+        }
+        let n = 30;
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            t.time_sum_host(&x, &assign);
+        }
+        let ms = start.elapsed().as_secs_f64() * 1e3 / n as f64;
+        eprintln!("{used} experts, one row: {ms:.3} ms ({:.3} ms an expert)", ms / used as f64);
+    }
+}

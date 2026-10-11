@@ -48,6 +48,9 @@ impl NoCard {
 pub type Packer<'a> = &'a (dyn Fn(usize) -> Box<dyn Fn(Exl3Data) -> std::result::Result<Arc<dyn PackedLinear>, String> + Send + Sync + 'a> + Sync);
 /// Makes a layer's experts (the shared one last) on a device, given the layer's MLP prefix (for its adapters).
 pub type ExpertMaker<'a> = &'a (dyn Fn(usize, &str, Vec<[Exl3Data; 3]>) -> Result<Box<dyn Experts>> + Sync);
+/// Makes a layer's experts on a device where they are read as records ([`load_portable_tiered`]): given the layer's MLP
+/// prefix, its routed experts' record layout and source, and its shared expert.
+pub type TieredMaker<'a> = &'a (dyn Fn(usize, &str, ggml_rs_wgpu::exl3::RecordLayout, Arc<dyn ggml_rs_wgpu::exl3::ExpertSource>, [Exl3Data; 3]) -> Result<Box<dyn Experts>> + Sync);
 use llama_rs::{
     loader::Weight,
     KvCache,
@@ -125,7 +128,7 @@ pub struct Config {
 }
 
 impl Config {
-    fn read(path: &Path) -> Result<Self> {
+    pub(crate) fn read(path: &Path) -> Result<Self> {
         let raw = Json::parse(&std::fs::read(path.join("config.json"))?)?;
         let c = raw.get("text_config").unwrap_or(&raw);
         let rope = c.get("rope_parameters").ok_or_else(|| bad("missing rope parameters"))?;
@@ -786,6 +789,12 @@ impl FlashNext {
 /// OAIY_ROUTE_DUMP names a file: each row's routed experts of each layer the host routes (OAIY_HOST_ROUTE: all of
 /// them) appended to it, a line a row (the layer, the row's position, its experts), for a look at a model's experts'
 /// use (which a card that does not hold them all would keep).
+/// Whether each layer's routing is written down (`OAIY_ROUTE_DUMP`: the file it goes to).
+fn route_dumping() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("OAIY_ROUTE_DUMP").is_some())
+}
+
 fn route_dump(layer: usize, past: usize, assign: &[Vec<(usize, f32)>]) {
     use std::io::Write;
     static FILE: std::sync::OnceLock<Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>> = std::sync::OnceLock::new();

@@ -40,6 +40,54 @@ pub(crate) fn exl3_data(idx: &StIndex, name: &str, k: usize, n: usize, input: Op
     Ok(data)
 }
 
+/// Where each of a layer's routed experts (`m`'s) lies as one record: its three projections' tensors side by side in a
+/// shard (the checkpoint writes an expert's twelve so), the same layout for every expert. The layout and each
+/// expert's shard and offset; an error where an expert's tensors are apart or laid out otherwise.
+pub(super) fn expert_records(idx: &StIndex, m: &str, cfg: &Config) -> Result<(ggml_rs_wgpu::exl3::RecordLayout, Vec<(u32, u64)>)> {
+    use ggml_rs_wgpu::exl3::{ProjAt, RecordLayout};
+    let (h, f) = (cfg.hidden, cfg.moe_ff);
+    let mut layout: Option<RecordLayout> = None;
+    let mut at = Vec::with_capacity(cfg.experts);
+    for e in 0..cfg.experts {
+        let p = format!("{m}.experts.{e}");
+        let parts = [("gate_proj", h, f), ("up_proj", h, f), ("down_proj", f, h)];
+        let infos: Vec<[&dsv41::safetensors::TensorInfo; 4]> = parts
+            .iter()
+            .map(|(proj, _, _)| ["suh", "svh", "mul1", "trellis"].map(|t| idx.info(&format!("{p}.{proj}.{t}"))).into_iter().collect::<Result<Vec<_>>>().map(|v| [v[0], v[1], v[2], v[3]]))
+            .collect::<Result<_>>()?;
+        let shard = infos[0][0].shard;
+        let start = infos.iter().flatten().map(|i| i.start).min().expect("twelve tensors");
+        let end = infos.iter().flatten().map(|i| i.start + i.nbytes).max().expect("twelve tensors");
+        let whole: u64 = infos.iter().flatten().map(|i| i.nbytes).sum();
+        // (each tensor in the one shard, and nothing else among them but padding)
+        if infos.iter().flatten().any(|i| i.shard != shard) || end - start > whole + 4096 {
+            return Err(bad(format!("{p}: its tensors are not one record")));
+        }
+        let proj = [0, 1, 2].map(|w| {
+            let [suh, svh, mul1, trellis] = infos[w];
+            let tw = trellis.shape.get(2).copied().unwrap_or(0);
+            ProjAt { suh: (suh.start - start) as usize, svh: (svh.start - start) as usize, mul1: (mul1.start - start) as usize, trellis: (trellis.start - start) as usize, k: parts[w].1, n: parts[w].2, tile_words: tw }
+        });
+        for (w, i) in infos.iter().enumerate() {
+            let (k, n) = (parts[w].1, parts[w].2);
+            if i[0].dtype != Dtype::F16 || i[0].numel() != k || i[1].dtype != Dtype::F16 || i[1].numel() != n || i[2].nbytes != 4 || i[3].dtype != Dtype::I16 || i[3].shape.len() != 3 || i[3].shape[..2] != [k / 16, n / 16] {
+                return Err(bad(format!("{p}.{}: not an EXL3 projection of {k} -> {n} as a record holds one", parts[w].0)));
+            }
+        }
+        let this = RecordLayout { bytes: (end - start) as usize, proj };
+        match &layout {
+            None => {
+                this.check(h, f).map_err(bad)?;
+                layout = Some(this);
+            }
+            Some(l) if *l != this => return Err(bad(format!("{p}: laid out unlike {m}.experts.0"))),
+            Some(_) => {}
+        }
+        at.push((shard as u32, start));
+    }
+    Ok((layout.ok_or_else(|| bad("a layer without experts"))?, at))
+}
+
 pub(super) struct Loader<'a> {
     pub(super) idx: &'a StIndex,
     pub(super) backend: Arc<dyn Backend>,
@@ -231,6 +279,13 @@ pub(crate) fn dense_exl3_bytes(path: &Path) -> Result<u64> {
     Ok(idx.names().filter(|n| reserved(n)).filter_map(|n| idx.get(n).map(|i| i.nbytes)).sum())
 }
 
+/// The bytes of Flash-Next's routed experts (its prediction layer's left out): what a computer's GPUs and memory must
+/// hold between them for the experts to be held at all, else they are read as records ([`load_portable_tiered`]).
+pub(crate) fn routed_expert_bytes(path: &Path) -> Result<u64> {
+    let idx = StIndex::open(path)?;
+    Ok(idx.names().filter(|n| n.starts_with("model.language_model.") && n.contains(".experts.")).filter_map(|n| idx.get(n).map(|i| i.nbytes)).sum())
+}
+
 /// Whether a tensor is one of the matrices `dense_exl3_bytes` keeps GPU budget for. Not the experts, and not the n-gram
 /// table: its rows are trellis-quantized too, but it is read from the disk as needed and never placed on the GPU, and
 /// counted (32.6 GB) it left the experts none of a 27 GiB budget.
@@ -273,17 +328,30 @@ pub(crate) fn load_portable(path: &Path, backends: Vec<Arc<dyn Backend>>, packed
 /// they adapt, on its device, and beside the experts' projections (the shared expert's and the routed ones'), which
 /// the experts `experts` makes are then given ([`adapt_experts`]).
 pub(crate) fn load_portable_with(path: &Path, backends: Vec<Arc<dyn Backend>>, lora: &[Adapter], packed: Packer<'_>, experts: ExpertMaker<'_>, mtp: bool) -> Result<FlashNext> {
-    build(path, backends, Vec::new(), lora, packed, experts, mtp)
+    build(path, backends, Vec::new(), lora, packed, experts, None, mtp)
+}
+
+/// [`load_portable_with`] for a computer whose GPUs and memory together hold too little of its 46.7 GB of routed
+/// experts: none of them read as it loads, each layer's made by `tiered` from where its records lie (the routed experts
+/// read as rows are routed to them, from the drive or the page cache) and its shared expert. No drafting (the
+/// prediction layer's experts would be read the same way).
+pub(crate) fn load_portable_tiered(path: &Path, backends: Vec<Arc<dyn Backend>>, lora: &[Adapter], packed: Packer<'_>, experts: ExpertMaker<'_>, tiered: TieredMaker<'_>) -> Result<FlashNext> {
+    build(path, backends, Vec::new(), lora, packed, experts, Some(tiered), false)
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn build(path: &Path, backends: Vec<Arc<dyn Backend>>, cudas: Vec<Arc<Card>>, lora: &[Adapter], packed: Packer<'_>, make_experts: ExpertMaker<'_>, mtp: bool) -> Result<FlashNext> {
+pub(super) fn build(path: &Path, backends: Vec<Arc<dyn Backend>>, cudas: Vec<Arc<Card>>, lora: &[Adapter], packed: Packer<'_>, make_experts: ExpertMaker<'_>, tiered: Option<TieredMaker<'_>>, mtp: bool) -> Result<FlashNext> {
     if !detect(path) {
         return Err(bad("not a Qwen3.8-Flash-Next EXL3 checkpoint"));
     }
     let cfg = Config::read(path)?;
     let tok = tokenizer(path, cfg.vocab)?;
     let idx = StIndex::open(path)?;
+    // (the shards, open once for every layer's expert records)
+    let shards: Vec<Arc<File>> = match tiered {
+        Some(_) => (0..idx.shard_count()).map(|i| File::open(idx.shard_path(i)).map(Arc::new)).collect::<std::io::Result<_>>()?,
+        None => Vec::new(),
+    };
     let on = |d: usize| Loader { idx: &idx, backend: backends[d].clone(), card: cudas.get(d).cloned(), lora, packed: packed(d) };
     let p = "model.language_model";
     let h = cfg.hidden;
@@ -357,14 +425,25 @@ pub(super) fn build(path: &Path, backends: Vec<Arc<dyn Backend>>, cudas: Vec<Arc
                 exl3_data(&idx, &format!("{p}.down_proj"), cfg.moe_ff, h, None, None)?,
             ])
         };
-        let per = names.len().div_ceil(16);
-        let experts: Vec<[Exl3Data; 3]> = std::thread::scope(|scope| {
-            let parts: Vec<_> = names.chunks(per).map(|part| scope.spawn(|| part.iter().map(read).collect::<Result<Vec<_>>>())).collect();
-            parts.into_iter().map(|t| t.join().expect("expert reader")).collect::<Result<Vec<Vec<_>>>>()
-        })?.into_iter().flatten().collect();
+        let experts = match tiered {
+            // the routed experts where their records lie, the shared one read
+            Some(make) => {
+                let (layout, at) = expert_records(&idx, &m, &cfg)?;
+                let source = ggml_rs_wgpu::exl3::FileRecords::new(shards.clone(), at, layout.bytes).map_err(bad)?;
+                make(device, &m, layout, Arc::new(source), read(&names[cfg.experts])?)?
+            }
+            None => {
+                let per = names.len().div_ceil(16);
+                let experts: Vec<[Exl3Data; 3]> = std::thread::scope(|scope| {
+                    let parts: Vec<_> = names.chunks(per).map(|part| scope.spawn(|| part.iter().map(read).collect::<Result<Vec<_>>>())).collect();
+                    parts.into_iter().map(|t| t.join().expect("expert reader")).collect::<Result<Vec<Vec<_>>>>()
+                })?.into_iter().flatten().collect();
+                make_experts(device, &m, experts)?
+            }
+        };
         let mut router = l.host(&format!("{m}.gate.weight"), cfg.experts * h, false, None)?;
         router.extend(l.host(&format!("{m}.shared_expert_gate.weight"), h, false, None)?);
-        let experts = adapt_experts(lora, &m, &cfg, make_experts(device, &m, experts)?)?;
+        let experts = adapt_experts(lora, &m, &cfg, experts)?;
         let moe = Moe {
             router: l.adapt(half_or_dense(cudas.get(device), &backends[device], router, cfg.experts + 1, h), &[
                 Part { name: format!("{m}.gate"), offset: 0, rows: cfg.experts, output: None },
