@@ -374,6 +374,30 @@ impl Exl3MoeGrouped {
         }
     }
 
+    /// A low-rank update's pairs (`a`, `b`, of `rank`) beside projection `which` of experts that take slots here
+    /// ([`Self::with_slots`]): kept in the group's tables, no slot's matrix given one of them yet ([`Self::slot_lora`]
+    /// gives a slot its expert's as the expert takes it; the group's tables are made anew here, so every slot's is to
+    /// be given again). The place of these pairs' first among the group's: pair `s` of these is that and `s`.
+    pub(super) fn slots_low_rank(&mut self, which: usize, a: &[f32], b: &[f32], rank: usize) -> Result<u32, String> {
+        let (k, n) = if which == 2 { (self.ff, self.hidden) } else { (self.hidden, self.ff) };
+        let backend = self.b.clone();
+        let (matrices, group) = if which == 2 { (self.routed, &mut self.down_lora) } else { (2 * self.routed, &mut self.gu_lora) };
+        let first = group.as_ref().map_or(0, |l| if l.host.rank == 0 { 0 } else { l.host.a.len() / (l.host.rank * k) });
+        let mut host = group.take().map(|l| l.host).unwrap_or_default().with(matrices, &[], a, b, rank, k, n)?;
+        host.slot = vec![NONE; matrices];
+        *group = Some(GroupLora::new(&backend, host));
+        Ok(first as u32)
+    }
+
+    /// Slot `slot`'s projection `which` given pair `pair` of its group's tables ([`NONE`]: none), in the queue's order.
+    pub(super) fn slot_lora(&self, which: usize, slot: usize, pair: u32) {
+        let (group, matrix) = if which == 2 { (&self.down_lora, slot) } else { (&self.gu_lora, 2 * slot + which) };
+        if let Some(l) = group {
+            let buffer = l.slot.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU vector");
+            self.b.gpu.write(buffer, (matrix * 4) as u64, &pair.to_le_bytes());
+        }
+    }
+
     /// The slots (or the routed experts) these hold.
     pub(super) fn slots(&self) -> usize {
         self.routed

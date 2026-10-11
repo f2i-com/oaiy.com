@@ -1300,3 +1300,69 @@ fn many_experts_read_as_records_each_a_task_are_the_definitions_sums() {
         }
     }
 }
+
+/// An adapter's low-rank updates follow experts into the slots a GPU holds them in: a prompt's planned rows and a
+/// step's row routed to the slots, the rest on the host, add up to the adapted definition's sums as slots change hands.
+#[test]
+fn experts_held_in_slots_take_their_low_rank_updates_with_them() {
+    let Some(b) = backend() else { return };
+    let (count, hidden, ff, top_k, tw) = (8, 256, 128, 3, 48);
+    let lora: Pairs = [
+        lora_pairs(count, &[2, 6, count], 2, hidden, ff, 5),
+        lora_pairs(count, &[2, 5], 4, hidden, ff, 6),
+        lora_pairs(count, &[0, 1, 3, 4, 6, count], 2, ff, hidden, 7),
+    ];
+    let near = |got: &[f32], want: &[f32], what: &str| {
+        let size = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+        for (i, (a, e)) in got.iter().zip(want).enumerate() {
+            assert!((a - e).abs() <= 0.003 + 2e-3 * size, "{what} [{i}]: {a} != {e} (sums up to {size})");
+        }
+    };
+    let (layout, records, shared) = as_records(experts(count, hidden, ff, tw));
+    let mut moe = b.exl3_experts_tiered(layout, Arc::new(records), shared, 3, 0).unwrap();
+    for (which, p) in lora.iter().enumerate() {
+        let (s, a, bb, r) = p.as_ref().unwrap();
+        moe.low_rank(which, s, a, bb, *r).unwrap();
+    }
+    for round in 0..4 {
+        let rows = 5;
+        let x: Vec<f32> = (0..rows * hidden).map(|i| ((i * 37 % 101 + round * 7) as f32 - 50.0) / 60.0).collect();
+        let logits: Vec<f32> = (0..rows * (count + 1)).map(|i| ((i * 53 % 29 + round * 11) as f32 % 29.0 - 14.0) / 7.0).collect();
+        let want = reference_adapted(experts(count, hidden, ff, tw), &lora, &x, &logits, top_k);
+        let (xt, lt) = (Tensor::from_vec(x.clone(), vec![rows, hidden]), Tensor::from_vec(logits.clone(), vec![rows, count + 1]));
+        let (assign, rest) = moe.plan_rows(&xt, &lt, top_k).unwrap();
+        let (xd, out) = (b.vec(rows * hidden), b.vec(rows * hidden));
+        DeviceChain::upload(&b, &xd, &x);
+        let mut rec = b.begin();
+        rec.moe_rows(moe.as_ref(), &xd, &out, &assign);
+        rec.read(&out);
+        let mut got = rec.finish().pop().unwrap();
+        if let Some(r) = rest {
+            for (g, v) in got.iter_mut().zip(r.data()) {
+                *g += v;
+            }
+        }
+        near(&got, &want, &format!("round {round}: a prompt's rows planned, adapted"));
+        for step in 0..3 {
+            let x: Vec<f32> = (0..hidden).map(|i| ((i * 29 % 97 + step * 13 + round) as f32 - 48.0) / 50.0).collect();
+            let logits: Vec<f32> = (0..count + 1).map(|i| ((i * 31 % 23 + step * 5 + round * 3) as f32 % 23.0 - 11.0) / 5.0).collect();
+            let want = reference_adapted(experts(count, hidden, ff, tw), &lora, &x, &logits, top_k);
+            let (xd, out, ld) = (b.vec(hidden), b.vec(hidden), b.vec(count + 1));
+            DeviceChain::upload(&b, &xd, &x);
+            DeviceChain::upload(&b, &ld, &logits);
+            let mut rec = b.begin();
+            rec.keep_groups(true);
+            assert!(rec.moe_routed(moe.as_ref(), &xd, &out, &ld, top_k, 1), "a step routed on the GPU");
+            rec.read(&out);
+            let mut got = rec.finish().pop().unwrap();
+            if let Some(r) = moe.forward_rest(&Tensor::from_vec(x.clone(), vec![1, hidden]), &Tensor::from_vec(logits.clone(), vec![1, count + 1]), top_k) {
+                for (g, v) in got.iter_mut().zip(r.data()) {
+                    *g += v;
+                }
+            }
+            near(&got, &want, &format!("round {round} step {step}: routed to the slots, adapted"));
+        }
+    }
+    let (held, not, taken) = moe.rest_counts().unwrap();
+    assert!(held > 0 && not > 0 && taken > 3, "the slots were used and changed hands: {held} held, {not} not, {taken} taken in");
+}

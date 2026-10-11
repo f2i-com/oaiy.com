@@ -179,6 +179,9 @@ struct Tier {
     grouped: Exl3MoeGrouped,
     map: DeviceVec,
     state: Mutex<TierState>,
+    /// An adapter's low-rank updates beside the experts' gate, up and down projections: each expert's pair among its
+    /// group's ([`NONE`]: none; empty: the projection has none), which a slot is given as the expert takes it.
+    lora_of: [Vec<u32>; 3],
 }
 
 /// What the host knows of a layer's slots: each expert's slot ([`NONE`]: none) and each slot's expert, the run each
@@ -242,6 +245,15 @@ fn take_window() -> u64 {
 }
 
 impl Tier {
+    /// Slot `slot` given expert `e`'s low-rank updates, where the adapter has any for the experts.
+    fn slot_lora(&self, slot: usize, e: usize) {
+        for (which, of) in self.lora_of.iter().enumerate() {
+            if !of.is_empty() {
+                self.grouped.slot_lora(which, slot, of[e]);
+            }
+        }
+    }
+
     /// Expert `e` taken into a slot (`record` its record), if one can be had: a free one, else the least recently used
     /// whose expert this run does not use (`busy`). Its slot and the map written (in the queue's order).
     fn take(&self, st: &mut TierState, e: usize, record: &[u8], layout: &RecordLayout, busy: &dyn Fn(usize) -> bool) -> bool {
@@ -257,6 +269,7 @@ impl Tier {
             gpu.write(map, old as u64 * 4, &NONE.to_le_bytes());
         }
         self.grouped.put(slot, record, layout);
+        self.slot_lora(slot, e);
         st.owner[slot] = e as u32;
         st.slot_of[e] = slot as u32;
         st.last[slot] = now;
@@ -289,7 +302,7 @@ impl WgpuBackend {
             let map = self.vec(routed);
             upload_u32(self, &map, &vec![NONE; routed]);
             let state = TierState { slot_of: vec![NONE; routed], owner: vec![NONE; n], last: vec![0; n], missed: vec![0; routed], ..Default::default() };
-            Tier { grouped, map, state: Mutex::new(state) }
+            Tier { grouped, map, state: Mutex::new(state), lora_of: Default::default() }
         });
         let shared: [Arc<dyn PackedLinear>; 3] = match &tier {
             Some(t) => t.grouped.shared.clone(),
@@ -849,8 +862,18 @@ impl ggml_rs::exl3::Experts for Exl3MoeTiered {
             return Err(format!("a rank {rank} update of {} and {} floats beside experts' projections [{n}, {k}]", a.len(), b.len()));
         }
         let at: Vec<(usize, u32)> = slot_of[..self.routed].iter().enumerate().filter(|(_, &s)| s != NONE).map(|(e, &s)| (e, s)).collect();
-        if !at.is_empty() && self.tier.is_some() {
-            return Err("a low-rank update of routed experts the GPU holds some of (not yet: the updates would follow the experts' slots)".into());
+        if slot_of.iter().any(|&s| s != NONE && s as usize >= a.len() / (rank * k)) {
+            return Err(format!("a low-rank update names a slot past its {}", a.len() / (rank * k)));
+        }
+        // the experts the GPU holds: the pairs in their group's tables, each slot given its expert's (now, and as
+        // experts take slots)
+        if let (false, Some(t)) = (at.is_empty(), &mut self.tier) {
+            let first = t.grouped.slots_low_rank(which, a, b, rank)?;
+            t.lora_of[which] = slot_of[..self.routed].iter().map(|&s| if s == NONE { NONE } else { first + s }).collect();
+            let owners: Vec<(usize, usize)> = t.state.lock().unwrap_or_else(|p| p.into_inner()).owner.iter().enumerate().filter(|(_, &o)| o != NONE).map(|(slot, &o)| (slot, o as usize)).collect();
+            for (slot, e) in owners {
+                t.slot_lora(slot, e);
+            }
         }
         if slot_of[self.routed] != NONE {
             let s = slot_of[self.routed] as usize;
