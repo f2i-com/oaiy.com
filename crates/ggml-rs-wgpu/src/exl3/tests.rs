@@ -237,10 +237,10 @@ fn a_moe_layer_routes_and_mixes_as_its_definition_on_the_gpu_on_the_cpu_and_spli
                 }
             }
             drop(gpu);
-            // projections a dispatch each, as a layer whose experts differ in shape or bitrate goes
-            std::env::set_var("OAIY_EXL3_UNGROUPED", "1");
-            let host = b.exl3_experts(experts(count, hidden, ff, tw)).unwrap();
-            std::env::remove_var("OAIY_EXL3_UNGROUPED");
+            // projections a dispatch each, as a layer whose experts differ in shape or bitrate goes (made so here: the
+            // environment's OAIY_EXL3_UNGROUPED is the process's, and set here it sent the other tests' layers that way)
+            let each: Vec<[Proj; 3]> = experts(count, hidden, ff, tw).into_iter().map(|[g, u, d]| [b.proj(g, 0).unwrap(), b.proj(u, 0).unwrap(), b.proj(d, 0).unwrap()]).collect();
+            let host: Box<dyn ggml_rs::exl3::Experts> = Box::new(Exl3MoeHost::new(each, Some((Arc::clone(&b.gpu), Arc::clone(&b.serial)))).unwrap());
             assert!(format!("{host:?}").contains(&format!("{} of {} projections on the GPU", 3 * (count + 1), 3 * (count + 1))), "{host:?}");
             close(host.forward(&xt, &lt, top_k).data(), &want, &format!("gpu moe tw={tw} rows={rows}"));
             drop(host);
