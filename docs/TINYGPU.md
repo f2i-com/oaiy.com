@@ -26,7 +26,7 @@ Four parts, each its own:
   bindings.
 - **`tools/tinygpu/webgpu_server.py`**: one process that holds the card through tinygrad and does what WebGPU's compute
   needs, over a Unix socket: buffers (zeroed), writes and reads, kernels (CUDA compiled by nvcc, kept by the source's
-  hash), and submissions of dispatches, copies and clears, run in order on the card's compute queue. A submission's
+  hash, or compiled ahead of time in a kernel pack: below), and submissions of dispatches, copies and clears, run in order on the card's compute queue. A submission's
   kernels go to the card as one queue of tinygrad's (each launched as the one before it ends, as tinygrad's own graphs
   chain them), and a write goes by the copy queue, which waits for what was submitted before it: neither waits for the
   card. Clients connect at once, their requests one at a time; a client's buffers are freed as it goes.
@@ -60,6 +60,47 @@ OAIY stops it or goes, the launcher's lifeline stops the engine and Python's exi
 The Agent's page chooses the model on the card from its header (its **eGPU** menu), and the model the engine runs
 from the menu beside it.
 
+## The eGPU plugin: no Docker, no compiler
+
+Docker is there for nvcc alone, and nvcc for the kernels alone: each is the CUDA C++ a WGSL kernel of the engine's
+becomes, compiled once and kept by its hash. They are known before a card sees them, so they can be compiled once,
+elsewhere, for every card of an architecture: a **kernel pack** (`tools/tinygpu/kernel_pack.py`), a folder of cubins
+named as the server's cache names them, which the server looks in first (a `kernels` folder beside it, and the folders
+`TINYGPU_KERNELS` lists). A kernel no pack has, on a Mac with no nvcc, is an error that names it, and its source is
+kept in the cache's `missing` folder for the next pack.
+
+The **eGPU plugin** carries everything else a Mac needs for the card, besides tinygrad's TinyGPU app and its driver
+extension (which macOS asks the person to allow): a Python 3.12 of its own, tinygrad (the commit below, with the
+patch), the launcher and the card's server, the kernel pack, and what tinygrad would download as it first opens a card
+(NVIDIA's GSP firmware from linux-firmware, for every card tinygrad knows, and the TinyGPU app's zip, which tinygrad
+installs from where `/Applications` has none). So neither Docker, nor a compiler, nor the network:
+
+```sh
+python3 tools/tinygpu/plugin/bundle.py --zip        # target/egpu-plugin, and target/egpu-plugin.zip
+```
+
+- `--arch sm_86,sm_89,sm_120` packs the kernels for the RTX 30, 40 and 50 series (`sm_89` alone unless named). What the
+  cache does not have is compiled, so nvcc is needed on the machine that builds the plugin, never on one that runs it.
+- The pack's kernels are the ones the cache has seen (`~/.cache/tinygpu-webgpu`, and its `missing` folder): run the
+  models it should carry on a card with nvcc first, or name more sources with `--sources`.
+- tinygrad comes from `--tinygrad` (`~/tinygrad`), and the Python from that checkout's `.venv`: python-build-standalone's,
+  as uv installs it, one program that needs only macOS's libraries.
+
+Install it on the Plugins page (*Install a plugin*: its folder or its zip), trust it and start it. It provides OAIY's
+`egpu` module: the desktop asks its connector `egpu` for `card.runtime` (where its Python, tinygrad and launcher are,
+each checked to be inside its own folder) and gives those to the engines, in place of the eGPU settings' *Python* and
+*tinygrad folder* and of the launcher the app carries; an idle eGPU is started again on them at once. Its own process
+holds nothing: the engines start the launcher and stop it cleanly, as before (a plugin is killed within seconds of being
+stopped, and a card's holder killed has taken its link down). `card.status` says whether the card can be used, and why
+not (the driver extension not installed, or not allowed). Turned off or removed, the engines go back to their settings.
+
+A plugin is trusted by the digest of its files, so nothing in its folder may change: every Python file has its bytecode
+beside it (unchecked-hash, so a source edited in place is not what runs: build the plugin again), its Python runs with
+`-B` and `PYTHONDONTWRITEBYTECODE`, and it has no links. Checked on 11 October 2026 on the RTX 4090: the plugin's Python,
+with an empty kernel cache, an empty tinygrad cache, no nvcc on the PATH and the network refused (a proxy that answers
+nothing), opened the card, loaded Qwen3.5 9B in 6.3 s, and answered chats and a tool call, every kernel from the pack
+(1,122 cubins, 19 MB); the plugin's folder was unchanged after, and the card's link up.
+
 ## Without the card: the emulator
 
 `webgpu_server.py --emulate` is the same server with no card: each kernel's CUDA is compiled for the CPU (clang++, with
@@ -82,6 +123,8 @@ an integer divided by zero, shifts past the width, workgroup memory zeroed and s
 holds it.
 
 ## Set up
+
+(Or the eGPU plugin, above, for steps 1 to 3 and OAIY's side.)
 
 1. **TinyGPU and its driver**, by tinygrad's own instructions (`docs/tinygpu.md` in tinygrad), and **NVIDIA's compiler**
    in Docker: `sh extra/setup_nvcc_osx.sh` from a tinygrad checkout (nvcc behind `~/.local/bin/nvcc`).

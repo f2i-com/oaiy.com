@@ -234,6 +234,8 @@ mod embed;
 #[cfg(feature = "gui")]
 mod engines;
 #[cfg(feature = "gui")]
+mod egpu;
+#[cfg(feature = "gui")]
 mod migrate;
 #[cfg(feature = "gui")]
 mod notify;

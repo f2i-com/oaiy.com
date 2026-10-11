@@ -1579,7 +1579,8 @@ mod tests {
         assert_eq!(reg.autostart_ids(), vec!["aokie".to_string()]);
         // What it brings to the product is there: the phone and the calendar.
         let resolved = crate::modules::resolve(&reg.list());
-        assert!(resolved.modules.iter().all(|m| m.enabled), "{:?}", resolved.modules.iter().map(|m| (&m.id, &m.reason)).collect::<Vec<_>>());
+        let on = |id: &str| resolved.modules.iter().any(|m| m.id == id && m.enabled);
+        assert!(on("phone") && on("calendar"), "{:?}", resolved.modules.iter().map(|m| (&m.id, &m.reason)).collect::<Vec<_>>());
         // Not running yet, and not refused for its package either.
         assert!(matches!(
             reg.gate("aokie", "phone.status", None),

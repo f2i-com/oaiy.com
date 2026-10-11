@@ -1,4 +1,4 @@
-import { Bot, CalendarDays, Mail, MessageSquare, Phone, Puzzle, type LucideIcon } from 'lucide-react';
+import { Bot, CalendarDays, Cpu, Mail, MessageSquare, Phone, Puzzle, type LucideIcon } from 'lucide-react';
 import type { ModulesSnapshot, PageContribution, SectionContribution } from './api';
 
 /**
@@ -73,6 +73,7 @@ export const PLUGIN_ICONS: Record<string, LucideIcon> = {
   message: MessageSquare,
   mail: Mail,
   bot: Bot,
+  gpu: Cpu,
 };
 
 export function pluginIcon(name?: string): LucideIcon {

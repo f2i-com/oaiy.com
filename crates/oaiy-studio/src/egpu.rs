@@ -52,6 +52,19 @@ const CHECK_WAIT: Duration = Duration::from_secs(30);
 /// What a start, or a request waiting for one, is told when the server was stopped by someone meanwhile.
 const STOPPED: &str = "the eGPU was stopped, or its settings changed, while it was being started";
 
+/// What runs the card when a plugin provides it (OAIY Desktop's eGPU module: tools/tinygpu/plugin): its own Python,
+/// the folder put on that Python's path (tinygrad and what it needs), and the folder with the launcher and the card's
+/// server (and the card's kernels and firmware beside them). In place of the settings' Python and tinygrad
+/// (`llm.egpu.python`, `llm.egpu.tinygrad`) and of the launcher this build carries ([`Egpu::provide`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Runtime {
+    pub python: PathBuf,
+    pub pythonpath: PathBuf,
+    pub scripts: PathBuf,
+    /// Who provides it, as the log and the status say it ("eGPU 0.1.0").
+    pub by: String,
+}
+
 /// Whether this build offers it at all: a Mac's (and the tests', which run its logic on any computer).
 pub fn available() -> bool {
     cfg!(any(target_os = "macos", test))
@@ -108,10 +121,14 @@ pub fn context(llm: &Json) -> i64 {
     }
 }
 
-/// The Pythons to ask, in order: the one `llm.egpu.python` names and no other; else a virtual environment inside the
-/// tinygrad folder (`llm.egpu.tinygrad`), Homebrew's, the system's, and whatever `python3` the PATH finds. An app
-/// opened from the Finder has a PATH without Homebrew's folders, so those are named outright.
-pub fn pythons(llm: &Json, root: &Path) -> Vec<PathBuf> {
+/// The Pythons to ask, in order: a provider's ([`Runtime`]) and no other; else the one `llm.egpu.python` names and no
+/// other; else a virtual environment inside the tinygrad folder (`llm.egpu.tinygrad`), Homebrew's, the system's, and
+/// whatever `python3` the PATH finds. An app opened from the Finder has a PATH without Homebrew's folders, so those are
+/// named outright.
+pub fn pythons(llm: &Json, root: &Path, runtime: Option<&Runtime>) -> Vec<PathBuf> {
+    if let Some(r) = runtime {
+        return vec![r.python.clone()];
+    }
     let egpu = section(llm);
     let named = str_or(egpu, "python", "").trim();
     if !named.is_empty() {
@@ -165,13 +182,17 @@ pub fn search_path(home: Option<&str>, current: &str) -> String {
 }
 
 /// What a start adds to the server's environment: the device tinygrad uses (`llm.egpu.device`, `NV` unless set: an
-/// NVIDIA card; `AMD` for a Radeon), the tinygrad folder on Python's path, and whatever `llm.egpu.env` names
-/// (`JITBEAM` and the like).
-fn environment(llm: &Json, root: &Path) -> Vec<(String, String)> {
+/// NVIDIA card; `AMD` for a Radeon), the tinygrad folder on Python's path (a provider's, else the settings'), and
+/// whatever `llm.egpu.env` names (`JITBEAM` and the like).
+fn environment(llm: &Json, root: &Path, runtime: Option<&Runtime>) -> Vec<(String, String)> {
     let egpu = section(llm);
     let device = str_or(egpu, "device", "NV").trim();
     let mut env = vec![("DEV".to_string(), if device.is_empty() { "NV".to_string() } else { device.to_string() }), ("PYTHONUNBUFFERED".into(), "1".into())];
-    if let Some(folder) = tinygrad_folder(llm, root) {
+    if runtime.is_some() {
+        // (a plugin's files are trusted by their digest: its Python writes no bytecode beside them)
+        env.push(("PYTHONDONTWRITEBYTECODE".into(), "1".into()));
+    }
+    if let Some(folder) = runtime.map(|r| r.pythonpath.clone()).or_else(|| tinygrad_folder(llm, root)) {
         let folder = folder.to_string_lossy().into_owned();
         let sep = if cfg!(windows) { ";" } else { ":" };
         env.push(("PYTHONPATH".into(), match std::env::var("PYTHONPATH") {
@@ -339,6 +360,8 @@ struct Inner {
     resume_after: bool,
     /// A request waits for the lent card: whoever has it gives it back as soon as it may (`crate::media`).
     wanted: bool,
+    /// The card's Python, tinygrad and launcher from a provider ([`Egpu::provide`]); None: the settings'.
+    runtime: Option<Runtime>,
 }
 
 pub struct Egpu {
@@ -499,6 +522,7 @@ impl Egpu {
                 paused: false,
                 resume_after: false,
                 wanted: false,
+                runtime: None,
             }),
             changed: Condvar::new(),
             launching: Mutex::new(()),
@@ -581,9 +605,14 @@ impl Egpu {
         (g.busy == 0).then(|| g.last_used.elapsed())
     }
 
-    /// The launcher's file, made what this OAIY carries at each use (an older OAIY's copy must not linger). Written
-    /// only where it differs: a Python that is starting on it must not read half of it.
-    fn script(root: &Path) -> Result<PathBuf, String> {
+    /// The launcher's file: a provider's own (beside its card's server, kernels and firmware), else made what this OAIY
+    /// carries at each use (an older OAIY's copy must not linger). Written only where it differs: a Python that is
+    /// starting on it must not read half of it.
+    fn script(root: &Path, runtime: Option<&Runtime>) -> Result<PathBuf, String> {
+        if let Some(r) = runtime {
+            let launcher = r.scripts.join("egpu_serve.py");
+            return if launcher.is_file() { Ok(launcher) } else { Err(format!("{} has no egpu_serve.py ({} provides the eGPU)", r.scripts.display(), r.by)) };
+        }
         let dir = root.join("cache").join("egpu");
         std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         for (name, text) in [("webgpu_server.py", CARD_PY), ("egpu_serve.py", SERVE_PY)] {
@@ -602,20 +631,25 @@ impl Egpu {
         if !available() {
             return Json::obj([("ok", Json::Bool(false)), ("error", Json::str("tinygrad's server is used on a Mac only"))]);
         }
-        let script = match Self::script(root) {
+        let runtime = self.lock().runtime.clone();
+        let runtime = runtime.as_ref();
+        let script = match Self::script(root, runtime) {
             Ok(s) => s,
             Err(e) => return Json::obj([("ok", Json::Bool(false)), ("error", Json::str(e))]),
         };
-        let env = environment(&llm, root);
-        let cwd = tinygrad_folder(&llm, root);
+        let env = environment(&llm, root, runtime);
+        let cwd = working_dir(&llm, root, runtime);
         let mut tried = Vec::new();
-        for python in pythons(&llm, root) {
+        for python in pythons(&llm, root, runtime) {
             let shown = python.to_string_lossy().into_owned();
-            match probe(&python, &script, &env, cwd.as_deref()) {
+            match probe(&python, &script, &env, Some(&cwd)) {
                 Ok(mut said) if said.get("server").and_then(Json::as_str).is_some() => {
                     crate::util::set(&mut said, "ok", Json::Bool(true));
                     crate::util::set(&mut said, "tried", Json::Arr(tried));
-                    self.lock().python = Some((python_key(&llm), python));
+                    if let Some(r) = runtime {
+                        crate::util::set(&mut said, "provided_by", Json::str(&r.by));
+                    }
+                    self.lock().python = Some((python_key(&llm, runtime), python));
                     return said;
                 }
                 Ok(said) => tried.push(Json::obj([("python", Json::str(shown)), ("error", Json::str(str_or(&said, "error", "it has no tinygrad")))])),
@@ -629,14 +663,18 @@ impl Egpu {
     /// The Python to start: the one a check found under this configuration, else found now.
     fn python(&self, cfg: &Json, root: &Path) -> Result<PathBuf, String> {
         let llm = cfg.get("llm").cloned().unwrap_or(Json::Null);
-        if let Some((key, python)) = self.lock().python.clone() {
-            if key == python_key(&llm) {
+        let key_now = || {
+            let g = self.lock();
+            (python_key(&llm, g.runtime.as_ref()), g.python.clone())
+        };
+        if let (key, Some((found, python))) = key_now() {
+            if key == found {
                 return Ok(python);
             }
         }
         let said = self.check(cfg, root);
-        match self.lock().python.clone() {
-            Some((key, python)) if key == python_key(&llm) && bool_or(&said, "ok", false) => Ok(python),
+        match key_now() {
+            (key, Some((found, python))) if key == found && bool_or(&said, "ok", false) => Ok(python),
             _ => Err(str_or(&said, "error", "no Python with tinygrad was found").to_string()),
         }
     }
@@ -710,7 +748,9 @@ impl Egpu {
     fn launch(self: &Arc<Self>, cfg: &Json, llm: &Json, root: &Path, name: &str, epoch: u64, count: bool, paused: bool) -> Result<bool, String> {
         self.wait_gone(GONE_WAIT)?;
         let python = self.python(cfg, root)?;
-        let script = Self::script(root)?;
+        let runtime = self.lock().runtime.clone();
+        let runtime = runtime.as_ref();
+        let script = Self::script(root, runtime)?;
         let port = free_port()?;
         let key = random_id("sk-egpu-");
         let mut args = arguments(llm, root, name, &script, port)?;
@@ -724,11 +764,11 @@ impl Egpu {
         if !file.is_file() {
             return Err(format!("{} is not there", file.display()));
         }
-        let env = environment(llm, root);
+        let env = environment(llm, root, runtime);
         let mut command = Command::new(&python);
         command.args(&args).envs(env.iter().map(|(k, v)| (k, v))).env("OAIY_EGPU_KEY", &key);
         command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        command.current_dir(tinygrad_folder(llm, root).filter(|d| d.is_dir()).unwrap_or_else(|| root.to_path_buf()));
+        command.current_dir(working_dir(llm, root, runtime));
         hide_window(&mut command);
         let device = env.iter().find(|(k, _)| k == "DEV").map_or("NV", |(_, v)| v.as_str());
         let shown = format!("DEV={device} {} {}", python.display(), args.join(" "));
@@ -879,6 +919,34 @@ impl Egpu {
         g.paused = false;
         g.resume_after = false;
         g.wanted = false;
+    }
+
+    /// The card's Python, tinygrad and launcher from a provider (OAIY Desktop's eGPU plugin), in place of the
+    /// settings' and of the launcher this build carries; None: the settings' again. It is used from the next start. A
+    /// server that is idle on the other is stopped, and its model said, for the caller to start it again on this one;
+    /// one that is answering, or lent, goes on as it is.
+    pub fn provide(&self, runtime: Option<Runtime>) -> Option<String> {
+        let mut g = self.lock();
+        if g.runtime == runtime {
+            return None;
+        }
+        self.log.push(match &runtime {
+            Some(r) => format!("studio: the eGPU's Python, tinygrad and launcher are {}'s ({})", r.by, r.scripts.display()),
+            None => "studio: the eGPU's Python and tinygrad are the settings' again".into(),
+        });
+        g.runtime = runtime;
+        g.python = None;
+        // (a start that failed on the other is tried again at once)
+        g.failed_at = None;
+        let idle = matches!(g.state, State::Starting | State::Ready) && g.busy == 0 && g.waiting == 0 && !g.lent;
+        let again = if idle { g.model.clone() } else { None };
+        if again.is_some() {
+            g.epoch += 1;
+            self.halt(&mut g);
+        }
+        drop(g);
+        self.changed.notify_all();
+        again
     }
 
     /// Stop the server because someone asked: Stop, a change of settings, the studio going. A start that is under
@@ -1148,6 +1216,7 @@ impl Egpu {
             ("retry_seconds", retry.map_or(Json::Null, Json::Int)),
             ("command", Json::str(&g.command)),
             ("python", g.python.as_ref().map_or(Json::Null, |(_, p)| Json::str(p.to_string_lossy()))),
+            ("provided_by", g.runtime.as_ref().map_or(Json::Null, |r| Json::str(&r.by))),
             ("runs_on", self.runs_on().filter(|_| g.state == State::Ready).map_or(Json::Null, Json::str)),
             // the card lent to the image worker, and the engine on it paused (for that, or since)
             ("lent", Json::Bool(g.lent)),
@@ -1162,10 +1231,19 @@ impl Drop for Egpu {
     }
 }
 
-/// What a found Python stands for: the settings it was looked for under.
-fn python_key(llm: &Json) -> String {
+/// What a found Python stands for: the settings it was looked for under, or the provider's.
+fn python_key(llm: &Json, runtime: Option<&Runtime>) -> String {
     let egpu = section(llm);
-    format!("{}|{}", str_or(egpu, "python", ""), str_or(egpu, "tinygrad", ""))
+    match runtime {
+        Some(r) => format!("provided|{}", r.python.display()),
+        None => format!("{}|{}", str_or(egpu, "python", ""), str_or(egpu, "tinygrad", "")),
+    }
+}
+
+/// Where the server is started: the tinygrad folder the settings name (tinygrad's own instructions run it from
+/// there), else the configuration's folder. A provider's runtime needs no folder of its own.
+fn working_dir(llm: &Json, root: &Path, runtime: Option<&Runtime>) -> PathBuf {
+    runtime.is_none().then(|| tinygrad_folder(llm, root)).flatten().filter(|d| d.is_dir()).unwrap_or_else(|| root.to_path_buf())
 }
 
 #[cfg(test)]
@@ -1201,6 +1279,51 @@ mod tests {
         *egpu.going.0.lock().unwrap() += 1;
         let err = egpu.wait_gone(Duration::from_millis(50)).unwrap_err();
         assert!(err.contains("not let the card go"), "{err}");
+    }
+
+    fn provided(scripts: &Path) -> Runtime {
+        Runtime { python: "/plugins/egpu/python/bin/python3.12".into(), pythonpath: "/plugins/egpu/lib".into(), scripts: scripts.into(), by: "eGPU 0.1.0".into() }
+    }
+
+    #[test]
+    fn a_provided_runtime_is_the_python_the_path_and_the_launcher_the_card_is_run_with() {
+        let dir = std::env::temp_dir().join(format!("oaiy-egpu-provided-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runtime = provided(&dir);
+        let settings = llm(r#"{"egpu": {"python": "/usr/bin/python3", "tinygrad": "/src/tinygrad"}}"#);
+        assert_eq!(pythons(&settings, Path::new("/data"), Some(&runtime)), [runtime.python.clone()], "the provider's Python and no other");
+        let env = environment(&settings, Path::new("/data"), Some(&runtime));
+        assert!(env.iter().any(|(k, v)| k == "PYTHONPATH" && v.replace('\\', "/").starts_with("/plugins/egpu/lib")), "{env:?}");
+        assert!(!env.iter().any(|(_, v)| v.contains("/src/tinygrad")), "not the settings' tinygrad: {env:?}");
+        assert!(env.contains(&("PYTHONDONTWRITEBYTECODE".into(), "1".into())), "a plugin's folder is not written to");
+        assert!(!environment(&settings, Path::new("/data"), None).iter().any(|(k, _)| k == "PYTHONDONTWRITEBYTECODE"));
+        assert_eq!(working_dir(&settings, Path::new("/data"), Some(&runtime)), Path::new("/data"));
+        assert_ne!(python_key(&settings, Some(&runtime)), python_key(&settings, None), "a Python found for the settings is not the provider's");
+        // its own launcher, not this build's copy; and none there is said
+        let err = Egpu::script(Path::new("/data"), Some(&runtime)).unwrap_err();
+        assert!(err.contains("egpu_serve.py") && err.contains("eGPU 0.1.0"), "{err}");
+        std::fs::write(dir.join("egpu_serve.py"), "").unwrap();
+        assert_eq!(Egpu::script(Path::new("/data"), Some(&runtime)).unwrap(), dir.join("egpu_serve.py"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_new_provider_stops_an_idle_server_for_its_model_to_be_started_again_and_leaves_a_busy_one() {
+        let egpu = Egpu::new();
+        let runtime = provided(Path::new("/plugins/egpu/card"));
+        assert_eq!(egpu.provide(Some(runtime.clone())), None, "nothing running: nothing to start again");
+        assert_eq!(egpu.provide(Some(runtime.clone())), None, "the same again changes nothing");
+        assert_eq!(egpu.status(&Json::Null).get("provided_by").and_then(Json::as_str), Some("eGPU 0.1.0"));
+        egpu.adopt("127.0.0.1:1", "k", "big", None);
+        egpu.lock().busy = 1;
+        assert_eq!(egpu.provide(None), None, "a server answering a request goes on");
+        assert_eq!(egpu.lock().state, State::Ready);
+        assert!(egpu.lock().runtime.is_none(), "and the next start uses the settings'");
+        egpu.lock().busy = 0;
+        let epoch = egpu.lock().epoch;
+        assert_eq!(egpu.provide(Some(runtime)).as_deref(), Some("big"), "an idle one is stopped, and its model said");
+        let g = egpu.lock();
+        assert_eq!((g.state, g.epoch), (State::Stopped, epoch + 1), "a start under way stands down");
     }
 
     #[test]
@@ -1272,7 +1395,7 @@ mod tests {
 
     #[test]
     fn the_servers_environment_names_the_device_and_what_the_settings_add() {
-        let env = environment(&llm(TWO), Path::new("/data"));
+        let env = environment(&llm(TWO), Path::new("/data"), None);
         let get = |k: &str| env.iter().find(|(have, _)| have == k).map(|(_, v)| v.as_str());
         assert_eq!(get("DEV"), Some("AMD"), "the settings' own value wins over the device");
         assert_eq!(get("JITBEAM"), Some("2"));
@@ -1280,7 +1403,7 @@ mod tests {
         assert_eq!(get("PYTHONPATH"), None, "no tinygrad folder named");
         assert_eq!(env.iter().filter(|(k, _)| k == "DEV").count(), 1);
         // An NVIDIA card unless told, and a checkout's folder on Python's path.
-        let env = environment(&llm(r#"{"egpu": {"tinygrad": "/src/tinygrad"}}"#), Path::new("/data"));
+        let env = environment(&llm(r#"{"egpu": {"tinygrad": "/src/tinygrad"}}"#), Path::new("/data"), None);
         assert!(env.contains(&("DEV".into(), "NV".into())));
         assert!(env.iter().any(|(k, v)| k == "PYTHONPATH" && v.replace('\\', "/").starts_with("/src/tinygrad")), "{env:?}");
     }
@@ -1303,7 +1426,7 @@ mod tests {
     #[test]
     fn a_named_python_that_is_a_bare_name_is_the_paths_to_find() {
         let root = Path::new("/conf");
-        let named = |python: &str| pythons(&Json::parse(format!(r#"{{"egpu": {{"python": "{python}"}}}}"#).as_bytes()).unwrap(), root);
+        let named = |python: &str| pythons(&Json::parse(format!(r#"{{"egpu": {{"python": "{python}"}}}}"#).as_bytes()).unwrap(), root, None);
         assert_eq!(named("python3.12"), [PathBuf::from("python3.12")], "not a file beside the configuration");
         assert_eq!(named("bin/python3"), [config::resolve(root, "bin/python3")]);
     }
@@ -1311,9 +1434,9 @@ mod tests {
     #[test]
     fn a_named_python_is_the_only_one_asked() {
         let named = llm(r#"{"egpu": {"python": "/opt/venv/bin/python3", "tinygrad": "/src/tinygrad"}}"#);
-        assert_eq!(pythons(&named, Path::new("/data")).len(), 1);
+        assert_eq!(pythons(&named, Path::new("/data"), None).len(), 1);
         // None named: whatever is installed, and the PATH's own last.
-        let found = pythons(&llm("{}"), Path::new("/data"));
+        let found = pythons(&llm("{}"), Path::new("/data"), None);
         assert_eq!(found.last().map(|p| p.to_string_lossy().into_owned()).as_deref(), Some(if cfg!(windows) { "python" } else { "python3" }));
     }
 

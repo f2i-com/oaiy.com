@@ -1628,8 +1628,11 @@ pub async fn serve(
         &data_dir_for_auth,
         guard.config().exposure,
     );
-    // Which modules (the phone, the calendar) a plugin provides: worked out now, then kept up to date.
+    // Which modules (the phone, the calendar, the eGPU) a plugin provides: worked out now, then kept up to date.
     crate::modules::start(bridge.plugins.clone());
+    // The eGPU's provider: what it says runs the card goes to the engines.
+    #[cfg(feature = "gui")]
+    crate::egpu::start(bridge.host.clone(), bridge.plugins.clone());
     // The setup wizard's record. Made now when there is none, so a desktop
     // already in use is recorded as set up before any window asks.
     let setup_routes = {

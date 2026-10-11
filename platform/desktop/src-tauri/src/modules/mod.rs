@@ -2,7 +2,10 @@
 //!
 //! The phone (calls and texts, the Front desk's agents) and the calendar (the
 //! phone receptionist's diary) come with a plugin: without one, OAIY shows no
-//! Front desk, no phone and no calendar. Everything else is core.
+//! Front desk, no phone and no calendar. So does a Mac's eGPU (an NVIDIA card in
+//! a Thunderbolt enclosure, see `crate::egpu`): the plugin carries what runs
+//! it, and without one the engines use what their settings name. Everything
+//! else is core.
 //!
 //! ```text
 //!   plugin manifests ──► claims()  ─┐
@@ -65,6 +68,7 @@ use crate::plugins::{PluginManifest, PluginRecord, PluginRegistry, PluginRegistr
 
 pub const PHONE: &str = "phone";
 pub const CALENDAR: &str = "calendar";
+pub const EGPU: &str = "egpu";
 
 /// The plugin that provided the phone and the calendar before manifests could say so.
 pub const LEGACY_PROVIDER: &str = "aokie";
@@ -102,6 +106,8 @@ pub const BUILTIN: &[ModuleDef] = &[
         store: &["callers.json", "voices/"],
     },
     ModuleDef { id: CALENDAR, name: "Calendar", noun: "the calendar", uses: &[], live: &[], leases: &[], store: &["calendar/"] },
+    // (the card's Python, tinygrad, server and kernels: what the provider says at `card.runtime` goes to the engines)
+    ModuleDef { id: EGPU, name: "eGPU", noun: "the eGPU", uses: &["card.runtime"], live: &[], leases: &[], store: &[] },
 ];
 
 pub fn def(id: &str) -> Option<&'static ModuleDef> {
@@ -1547,6 +1553,24 @@ mod tests {
         let r = resolve(&[record(acme(ui), PluginState::Running, false), record(aokie_manifest(), PluginState::Running, false)]);
         let ids: Vec<&str> = r.contributions.sections.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, vec!["calendar", "connections", "plugin-section:acme:tools"]);
+    }
+
+    #[test]
+    fn the_egpu_plugin_turns_the_egpu_on_and_says_how_its_card_is_on_the_overview() {
+        let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tools/tinygpu/plugin/manifest.json");
+        let egpu: Value = serde_json::from_slice(&std::fs::read(shipped).unwrap()).unwrap();
+        let r = resolve(&[record(egpu.clone(), PluginState::Running, false)]);
+        let m = r.modules.iter().find(|m| m.id == EGPU).unwrap();
+        assert!(m.enabled, "{m:?}");
+        assert_eq!(m.provider.as_ref().and_then(|p| p.connector.as_deref()), Some("egpu"));
+        assert!(r.warnings.is_empty(), "{:#?}", r.warnings);
+        let c = &r.contributions;
+        assert!(c.overview.iter().any(|o| o.id == "egpu-card" && o.kind == "status"), "{:?}", c.overview);
+        assert!(c.polls.iter().any(|p| p.id == "card" && p.command == "card.status"), "{:?}", c.polls);
+        assert!(!r.modules.iter().any(|m| m.id != EGPU && m.enabled), "it provides the eGPU alone");
+        // turned off, it provides nothing
+        let r = resolve(&[record(egpu, PluginState::Disabled, true)]);
+        assert!(!r.modules.iter().find(|m| m.id == EGPU).unwrap().enabled);
     }
 
     #[test]

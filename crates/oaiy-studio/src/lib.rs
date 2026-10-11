@@ -20,6 +20,8 @@ pub use config::MAC_AGENT_ORIGIN;
 mod detect;
 mod discovery;
 mod egpu;
+/// What runs a Mac's eGPU when a plugin provides it ([`Studio::provide_egpu`]).
+pub use egpu::{available as egpu_available, Runtime as EgpuRuntime};
 mod gateway;
 mod llm;
 mod media;
@@ -82,6 +84,20 @@ pub struct Studio {
 impl Studio {
     pub fn config(&self) -> Json {
         self.config.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// The eGPU's Python, tinygrad and launcher from a provider (OAIY Desktop's eGPU plugin), or the settings' again
+    /// (None). A server that was idle on the other is started again on this, with its model; one that is answering
+    /// changes at its next start.
+    pub fn provide_egpu(self: &Arc<Self>, runtime: Option<EgpuRuntime>) {
+        if let Some(model) = self.egpu.provide(runtime) {
+            let studio = Arc::clone(self);
+            std::thread::spawn(move || {
+                if let Err(e) = studio.egpu.start(&studio.config(), &studio.root, &model) {
+                    studio.egpu.log.push(format!("studio: the eGPU was not started again with {model}: {e}"));
+                }
+            });
+        }
     }
 
     pub fn output_root(&self) -> PathBuf {

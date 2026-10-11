@@ -374,6 +374,18 @@ or Linux at all.
 
 ### Set up
 
+**The eGPU plugin** is the short way for OAIY's own engine on an NVIDIA card: it carries
+its own Python, tinygrad, the card's server and its kernels compiled ahead of time, so the
+Mac needs neither Docker nor NVIDIA's compiler (built with
+`python3 tools/tinygpu/plugin/bundle.py --zip`; [TINYGPU.md](TINYGPU.md), "The eGPU
+plugin"). Install it on the Plugins page, trust it and start it, and set step 2's *Engine
+on the card* to OAIY's own: its Python and tinygrad take the place of the two settings
+there. tinygrad's TinyGPU app and its driver extension are still needed (step 1's first
+part): where `/Applications` has no TinyGPU app, tinygrad installs the one the plugin
+carries as it first opens the card, and macOS asks for its extension to be allowed
+(System Settings → General → Login Items & Extensions). The plugin's **card.status** says
+whether it is.
+
 1. **tinygrad's side first**, by [its own instructions](https://docs.tinygrad.org/tinygpu/):
    the TinyGPU app and its driver extension, and for an NVIDIA card Docker and
    `extra/setup_nvcc_osx.sh` (NVIDIA's compiler). It is ready when this answers in a

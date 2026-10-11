@@ -19,6 +19,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 static RUNNING: Mutex<Option<oaiy_studio::Running>> = Mutex::new(None);
+/// What runs the eGPU, as the plugin providing it says (`crate::egpu`): given to the engines started here now, and
+/// again whenever they start.
+static EGPU_RUNTIME: Mutex<Option<oaiy_studio::EgpuRuntime>> = Mutex::new(None);
 static UI_URL: OnceLock<String> = OnceLock::new();
 static BUNDLED: OnceLock<PathBuf> = OnceLock::new();
 
@@ -159,6 +162,9 @@ fn start_with(data_dir: &Path, m: Mode) -> Result<String, String> {
         return Err("no engines are running for this configuration, and this build only uses running ones (OAIY_ENGINES=attach)".into());
     }
     let running = oaiy_studio::launch(&args, true)?;
+    if let Some(runtime) = EGPU_RUNTIME.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        running.studio.provide_egpu(Some(runtime));
+    }
     let url = running.ui_url.clone();
     log::info!("engines: started (control pages {url}, gateway {})", running.gateway_url);
     crate::http::set_engines_ui(&url);
@@ -381,6 +387,15 @@ pub async fn add_model_file(raw: &str) -> Result<serde_json::Value, String> {
     let added = crate::http::studio_json(&ui, reqwest::Method::POST, "/api/models/add", Some(body)).await.map_err(|(_, e)| e)?;
     log::info!("engines: added the language model {} ({arch})", path.display());
     Ok(serde_json::json!({ "name": added.get("name"), "architecture": arch, "tools": tools }))
+}
+
+/// The eGPU's Python, tinygrad and launcher from the plugin providing it, or the engines' settings' again (None). For
+/// the engines started here (a studio found running keeps its own settings), now and at each start.
+pub fn provide_egpu(runtime: Option<oaiy_studio::EgpuRuntime>) {
+    *EGPU_RUNTIME.lock().unwrap_or_else(|e| e.into_inner()) = runtime.clone();
+    if let Some(running) = RUNNING.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        running.studio.provide_egpu(runtime);
+    }
 }
 
 /// Stop the engines this desktop started (a studio that was already running is left running).

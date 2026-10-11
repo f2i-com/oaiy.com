@@ -1,0 +1,86 @@
+{
+  "schemaVersion": 4,
+  "id": "egpu",
+  "name": "eGPU",
+  "version": "0.1.0",
+  "publisher": "OAIY",
+  "description": "An NVIDIA card in a Thunderbolt enclosure for OAIY's engines on a Mac, through tinygrad's TinyGPU driver: its own Python, tinygrad, the card's server and its kernels compiled ahead of time, so neither Docker nor a compiler is needed.",
+  "pluginApiVersion": 1,
+  "minDesktopVersion": "0.1.0",
+  "entry": {
+    "kind": "process",
+    "command": "python/bin/python3.12",
+    "args": [
+      "-I",
+      "-B",
+      "card/plugin.py"
+    ]
+  },
+  "capabilities": [
+    "connector.egpu.card.runtime",
+    "connector.egpu.card.status"
+  ],
+  "connectors": [
+    {
+      "id": "egpu",
+      "name": "eGPU",
+      "commands": [
+        "card.runtime",
+        "card.status"
+      ]
+    }
+  ],
+  "modules": {
+    "provides": [
+      "egpu"
+    ],
+    "connector": "egpu"
+  },
+  "ui": {
+    "statusCards": [
+      {
+        "id": "card",
+        "title": "eGPU",
+        "poll": {
+          "command": "card.status",
+          "intervalMs": 30000
+        },
+        "fields": [
+          {
+            "label": "Ready",
+            "path": "ready"
+          },
+          {
+            "label": "Why not",
+            "path": "why"
+          },
+          {
+            "label": "Driver allowed",
+            "path": "driver.enabled"
+          },
+          {
+            "label": "Kernels",
+            "path": "pack.kernels"
+          },
+          {
+            "label": "tinygrad",
+            "path": "tinygrad"
+          }
+        ]
+      }
+    ],
+    "overview": [
+      {
+        "id": "egpu-card",
+        "kind": "status",
+        "title": "eGPU",
+        "icon": "gpu",
+        "module": "egpu",
+        "bind": {
+          "value": "$poll.card.state",
+          "detail": "$poll.card.detail"
+        }
+      }
+    ]
+  }
+}
