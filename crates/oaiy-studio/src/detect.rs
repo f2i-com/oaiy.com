@@ -806,7 +806,7 @@ mod tests {
         assert!(r.fields.iter().any(|(k, v)| k == "distilled" && *v == Json::Bool(true)), "{:?}", r.fields);
         assert!(r.summary.contains("Turbo"), "{}", r.summary);
         assert!(!detect(&image).unwrap().fields.iter().any(|(k, _)| k == "distilled"));
-        let encoder = d.0.join("Qwen-Image-2.1-Turbo-Abliterated-Uncensored-AD-Q4_K.gguf");
+        let encoder = d.0.join("Qwen-Image-2.1-Turbo-TextEncoder-Q4_K.gguf");
         gguf(&encoder, &[("general.architecture", "qwen3vl")], &["token_embd.weight"]);
         assert_eq!(detect(&encoder).unwrap().kind(), "text_encoder");
         let chat = d.0.join("Qwen3-VL-8B-Instruct-Q4_K_M.gguf");

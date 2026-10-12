@@ -361,13 +361,13 @@ the card's reset (which came back): "A red apple on a wooden table, soft morning
 
 ```sh
 TINYGPU_NO_COOP=1 OAIY_WEBGPU_ADAPTER=tinygpu target/release/oaiy-media --request request.json
-# {"base": "/Volumes/T9/Qwen-Image-2.1", "transformer": "/Volumes/T9/qwen-image-2.1-UC-Q4_K_M.gguf", "output_dir": "...",
+# {"base": "/Volumes/T9/Qwen-Image-2.1", "transformer": "/Volumes/T9/qwen-image-2.1-Q4_K_M.gguf", "output_dir": "...",
 #  "prompt": "...", "width": 1024, "height": 1024, "steps": 30}
 ```
 
 **Qwen-Image-2.1-Turbo** (the distilled checkpoint: 8 steps at CFG 1, its own sigmas; AtomicChat's GGUFs, the
-denoiser `Qwen-Image-2.1-Turbo-AD-Q4_K.gguf` and the abliterated text encoder
-`Qwen-Image-2.1-Turbo-Abliterated-Uncensored-AD-Q4_K.gguf`, the base model's folder for the VAE and tokenizer) on the
+denoiser `Qwen-Image-2.1-Turbo-AD-Q4_K.gguf` and a Qwen3-VL text encoder as a GGUF whose name says it is Qwen
+Image's, the base model's folder for the VAE and tokenizer) on the
 card, on its tensor cores, the guards below in place (and the run that faulted run again, clean):
 
 | 1024 x 1024 | sampling | in all |
@@ -380,7 +380,7 @@ card, on its tensor cores, the guards below in place (and the run that faulted r
 ```sh
 OAIY_WEBGPU_ADAPTER=tinygpu target/release/oaiy-media --request request.json
 # {"base": "/Volumes/T9/Qwen-Image-2.1", "transformer": ".../Qwen-Image-2.1-Turbo-AD-Q4_K.gguf",
-#  "text_encoder": ".../Qwen-Image-2.1-Turbo-Abliterated-Uncensored-AD-Q4_K.gguf", "output_dir": "...",
+#  "text_encoder": ".../Qwen-Image-2.1-Turbo-TextEncoder-Q4_K.gguf", "output_dir": "...",
 #  "prompt": "...", "width": 1024, "height": 1024}
 ```
 
