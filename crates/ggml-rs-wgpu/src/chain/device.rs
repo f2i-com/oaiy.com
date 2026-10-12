@@ -92,6 +92,10 @@ impl DeviceChain for WgpuBackend {
         self.memory_budget().is_some_and(|(budget, used)| used.saturating_add(bytes).saturating_add(1 << 30) <= budget)
     }
 
+    fn room_known(&self) -> bool {
+        self.memory_budget().is_some()
+    }
+
     fn refuses_at_once(&self) -> bool {
         // (the card's adapter answers each buffer as it is asked for: `wgpu_tinygpu`'s, at "tinygpu" on no bus)
         self.adapter().pci_bus_id == "tinygpu"

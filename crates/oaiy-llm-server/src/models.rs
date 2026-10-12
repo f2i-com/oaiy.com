@@ -262,6 +262,27 @@ pub(crate) fn dense_context(ctx: usize, asked: bool, model_max: usize) -> usize 
     if asked && ctx != 0 { most } else { most.min(DENSE_CTX) }
 }
 
+/// What a model whose cache is sized by its context is served with when nobody has said and its GPUs have the room
+/// for that cache: 65,536 positions (the model's own maximum at most). OAIY's Agent, its instructions and OAIY's
+/// tools beside them, takes some 19,000 tokens before a word of the conversation: in [`DENSE_CTX`]'s 16,384 it
+/// refused every request, and the person asked for "like 64000 by default".
+pub(crate) const AUTO_CTX: usize = 65536;
+
+/// The context nobody gave: from `most` (the model's maximum at most) down in steps of 4,096 to the first that `fits`
+/// says the model's GPUs have room for, never below `base` ([`dense_context`]'s), and `base` itself where `fits`
+/// cannot say (a device that gives no figure for its memory, the CPU). With whether it could say.
+pub(crate) fn auto_context(base: usize, model_max: usize, most: usize, fits: impl Fn(usize) -> Option<bool>) -> (usize, bool) {
+    let mut n = most.min(model_max);
+    while n > base {
+        match fits(n) {
+            Some(true) => return (n, true),
+            Some(false) => n = n.saturating_sub(4096),
+            None => return (base, false),
+        }
+    }
+    (base, n < most.min(model_max))
+}
+
 pub(crate) fn placement(name: &str, on_gpu: u64, left: u64, free: Option<u64>) -> String {
     let gb = |bytes: u64| bytes as f64 / 1e9;
     if left == 0 {
@@ -593,6 +614,29 @@ impl Models {
         dense_context(self.opts.ctx, self.opts.ctx_asked, model_max)
     }
 
+    /// The bytes a GPU keeps free beside a cache the default's context makes (`--vram-headroom-gb`: for what a prompt's
+    /// run makes over its chunk's rows, which the cache's count does not hold).
+    fn activations_spare(&self) -> u64 {
+        (self.opts.headroom_gb.max(0.0) * 1e9) as u64
+    }
+
+    /// The context of a model loaded with `base` ([`Self::dense_context`]'s) where nobody gave one: [`auto_context`]
+    /// up to `most`, its devices' room for the cache said by `fits` (taken after its weights and its warm-up, before a
+    /// request makes any of the larger cache), [`Self::activations_spare`] left beside it. A number the person gave
+    /// (`--ctx N`) is theirs whatever the room.
+    fn auto_context(&self, name: &str, base: usize, model_max: usize, most: usize, fits: impl Fn(usize) -> Option<bool>) -> usize {
+        if self.opts.ctx_asked && self.opts.ctx != 0 {
+            return base;
+        }
+        let (n, said) = auto_context(base, model_max, most, fits);
+        if n > base {
+            self.say(format!("{name}: its context is {n} positions, what its GPUs have room for its cache in ({} at most where nobody sets one)", most.min(model_max)));
+        } else if said {
+            self.say(format!("{name}: its GPUs have room for its cache at {base} positions, not more: its context is {base}"));
+        }
+        n
+    }
+
     fn say(&self, msg: String) {
         if !self.opts.silent {
             eprintln!("{msg}");
@@ -723,8 +767,13 @@ impl Models {
             self.say(format!("{}: {:.1} GB of EXL3 weights on GPU {d} ({} at {}, budget {:.0} GB), the rest on the CPU", spec.name, used as f64 / 1e9, g.adapter().name, g.adapter().pci_bus_id, budget as f64 / 1e9));
         }
         let tok = Arc::new(model.tokenizer.clone());
-        // The cache is on the host: bound it as the other portable models are.
-        let max_seq = self.dense_context(model.config.context_length);
+        // Bound as the other portable models are, and made longer where nobody set it and the GPUs have room for
+        // their copies of the cache (on one GPU at most what it keeps its copy for: past that a request's cache is
+        // the host's, and slower, which is not the default's to choose); not where its experts are read as records,
+        // whose slots are sized around the cache at `resident`.
+        let base = self.dense_context(model.config.context_length);
+        let most = if gpus.len() > 1 { AUTO_CTX } else { AUTO_CTX.min(crate::flashnext::resident_rows()) };
+        let max_seq = if tiered { base } else { self.auto_context(&spec.name, base, model.config.context_length, most, |n| model.cache_fits(n, self.activations_spare())) };
         let mut cfg = self.base_cfg(spec, max_seq);
         cfg.image_token_id = tok.token_id("<|image_pad|>").ok_or_else(|| Error::Arg("Flash-Next tokenizer lacks image_pad".into()))?;
         // Its vision tower, where the alias is given one: on the last GPU (the first carries the head's side of the
@@ -904,8 +953,13 @@ impl Models {
             self.say(format!("{}: {:.1} GB of EXL3 weights on the GPU (budget {:.0} GB)", spec.name, used as f64 / 1e9, budget as f64 / 1e9));
         }
         let tok = Arc::new(model.tokenizer().clone());
-        // The cache is on the host: bound it as the other portable models are.
-        let max_seq = self.dense_context(model.config().context_length);
+        // Bound as the other portable models are, and made longer where nobody set it and the GPU has room for the
+        // chain's copy of the cache (as the GGUF's: `Qwen35Chain::context_fits`).
+        let base = self.dense_context(model.config().context_length);
+        let max_seq = match &model {
+            llama_rs::Model::Qwen35(m) => self.auto_context(&spec.name, base, model.config().context_length, AUTO_CTX, |n| m.chain.context_fits(m, n, self.activations_spare())),
+            _ => base,
+        };
         let mut cfg = self.base_cfg(spec, max_seq);
         cfg.image_token_id = tok.token_id("<|image_pad|>").ok_or_else(|| Error::Arg("Orca tokenizer lacks image_pad".into()))?;
         // Its vision tower, where the alias is given one (the checkpoint's `vision` folder): on the model's backend.
@@ -991,7 +1045,10 @@ impl Models {
             self.say(format!("{}: {:.1} GB of its weights on GPU {d} ({} at {}, budget {:.0} GB), the rest on the CPU", spec.name, used as f64 / 1e9, g.adapter().name, g.adapter().pci_bus_id, budget as f64 / 1e9));
         }
         let tok = Arc::new(model.tokenizer.clone());
-        let max_seq = self.dense_context(model.config.context_length);
+        // (made longer where nobody set it and the GPUs have room, as the EXL3 checkpoint's: `load_flashnext_portable`)
+        let base = self.dense_context(model.config.context_length);
+        let most = if gpus.len() > 1 { AUTO_CTX } else { AUTO_CTX.min(crate::flashnext::resident_rows()) };
+        let max_seq = self.auto_context(&spec.name, base, model.config.context_length, most, |n| model.cache_fits(n, self.activations_spare()));
         let mut cfg = self.base_cfg(spec, max_seq);
         cfg.image_token_id = tok.token_id("<|image_pad|>").ok_or_else(|| Error::Arg("Flash-Next tokenizer lacks image_pad".into()))?;
         let (jobs, rx) = std::sync::mpsc::channel();
@@ -1088,6 +1145,9 @@ impl Models {
             } else { None };
             let mut max_seq = self.dense_context(model.config().context_length);
             if let llama_rs::Model::Qwen35(m) = &model {
+                // (longer where nobody set it and a GPU that says what it holds has the room: `context_fits`; a card
+                // that says so only by refusing measures it below, for the context as it is)
+                max_seq = self.auto_context(&spec.name, max_seq, model.config().context_length, AUTO_CTX, |n| m.chain.context_fits(m, n, self.activations_spare()));
                 match m.chain.context_room(m, max_seq) {
                     Some(0) => self.say(format!("{}: the GPU has no room for its attention cache at 4,096 positions beside its weights", spec.name)),
                     Some(room) if room < max_seq => {
@@ -1279,6 +1339,30 @@ mod tests {
         // Never more than the model allows, asked or not.
         assert_eq!(dense_context(64_000, true, 8192), 8192);
         assert_eq!(dense_context(0, false, 8192), 8192);
+    }
+
+    #[test]
+    fn the_context_nobody_set_is_as_long_as_the_gpus_have_room_for() {
+        const QWEN: usize = 262_144;
+        // Room for all of it: the default's most, the model's maximum at most.
+        assert_eq!(auto_context(DENSE_CTX, QWEN, AUTO_CTX, |_| Some(true)), (AUTO_CTX, true));
+        assert_eq!(auto_context(DENSE_CTX, 40_960, AUTO_CTX, |_| Some(true)), (40_960, true));
+        // Room for less: down in steps of 4,096 to what fits.
+        let asked = std::cell::RefCell::new(Vec::new());
+        let fits = |n: usize| {
+            asked.borrow_mut().push(n);
+            Some(n <= 50_000)
+        };
+        assert_eq!(auto_context(DENSE_CTX, QWEN, AUTO_CTX, fits), (49_152, true));
+        assert_eq!(asked.borrow().as_slice(), &[65_536, 61_440, 57_344, 53_248, 49_152]);
+        // Room for none of it past the old default: the old default, said.
+        assert_eq!(auto_context(DENSE_CTX, QWEN, AUTO_CTX, |_| Some(false)), (DENSE_CTX, true));
+        // Devices that say nothing of their memory (the CPU, a card that only refuses): the old default, as before.
+        assert_eq!(auto_context(DENSE_CTX, QWEN, AUTO_CTX, |_| None), (DENSE_CTX, false));
+        // A most of its own (one GPU's copy of Flash-Next's cache), and a model whose maximum is the old default's or less.
+        assert_eq!(auto_context(DENSE_CTX, QWEN, 32_768, |_| Some(true)), (32_768, true));
+        assert_eq!(auto_context(8192, 8192, AUTO_CTX, |_| Some(true)), (8192, false));
+        assert_eq!(auto_context(DENSE_CTX, DENSE_CTX, AUTO_CTX, |_| Some(true)), (DENSE_CTX, false));
     }
 
     #[test]

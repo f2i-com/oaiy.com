@@ -1352,7 +1352,7 @@ ${this.instructions}` : ''}`;
   private async fit(provider: ProviderConfig, emit: (e: AgentEvent) => void, signal?: AbortSignal, force = false): Promise<void> {
     const b = this.budget(provider);
     // Too small to hold the instructions and tools with room to work: say so, rather than fail in circles.
-    if (b.prompt < 1024) throw new Error(`The model's context window (${formatTokens(b.window)} tokens) is too small for OAIY: its instructions and tools alone take about ${formatTokens(b.fixed)}. Give the model a bigger window (Ollama: OLLAMA_CONTEXT_LENGTH=16384 or more; then Detect in Settings), or set the size in Settings if the detected one is wrong.`);
+    if (b.prompt < 1024) throw new Error(`The model's context window (${formatTokens(b.window)} tokens) is too small for OAIY: its instructions and tools alone take about ${formatTokens(b.fixed)}. Give the model a bigger window (OAIY's engine: Engines → Settings → Context, 65536; Ollama: OLLAMA_CONTEXT_LENGTH=32768 or more, then Detect in Settings), or set the size in Settings if the detected one is wrong.`);
     const used = this.estimate(this.view());
     emit({ type: 'context', used: used + b.fixed, window: b.window });
     const threshold = b.prompt * (this.options.compactAt?.() ?? DEFAULT_COMPACT_AT);

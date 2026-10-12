@@ -426,6 +426,30 @@ pub(super) fn chain_packed(w: &Weight) -> Option<&dyn PackedLinear> {
 }
 
 impl FlashNext {
+    /// Whether every GPU has room for its attention layers' copy of the cache at `positions` (the rows a run grows
+    /// it to for them, a power of two: each layer's K and V and raw indexer keys, and the attention's output), by the
+    /// device's own figure for its memory, beside what it holds now (its copy as it is, the warm-up's, is room the
+    /// larger one takes) and `spare` bytes more: what a prompt's run makes over its chunk's rows, which this does not
+    /// count (two cards, a 59,874-token prompt over a cache of 65,536 rows: 4.0 and 5.5 GB past the load, the cache
+    /// 1.8 GB of it). None where the model runs no chain, or a device says nothing of its memory or refuses a vector
+    /// as it is asked for (the card's adapter: a run's growth finds its room there, `ChainKv::grow`).
+    pub fn cache_fits(&self, positions: usize, spare: u64) -> Option<bool> {
+        let st = self.chain_state()?;
+        let cfg = &self.config;
+        let chains: Vec<&dyn ggml_rs::DeviceChain> = self.devices.iter().map(|b| b.chain()).collect::<Option<_>>()?;
+        if positions == 0 || chains.iter().any(|c| c.refuses_at_once() || !c.room_known()) {
+            return None;
+        }
+        let cap = positions.next_power_of_two().max(256);
+        let row = 2 * cfg.kv_heads * cfg.head_dim;
+        let m = st.m.lock().unwrap_or_else(|p| p.into_inner());
+        Some(st.attn_of.iter().enumerate().filter(|(_, layers)| !layers.is_empty()).all(|(d, layers)| {
+            let held = m.kv.get(d).map_or(0, |g| g.layers.iter().chain(&g.raw).map(|v| v.len).sum::<usize>() + g.out.len);
+            let need = layers.len() * cap * (row + cfg.index_dim) + chains[d].attention_out_len(cfg.heads, cfg.head_dim, cap);
+            chains[d].has_room((need.saturating_sub(held) as u64) * 4 + spare)
+        }))
+    }
+
     /// The chained step's state, made at the first step that can use one: None when a device has no chain, or a
     /// matrix is not where a chain reads it, or a layer's experts are neither there nor on the host (a layer no GPU
     /// had room for: [`ChainLayer::host`]).

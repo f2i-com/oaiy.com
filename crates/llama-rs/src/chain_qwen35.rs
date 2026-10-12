@@ -825,6 +825,24 @@ fn halves_cap(needed: usize) -> usize {
     (needed + 4096).div_ceil(4096) * 4096
 }
 
+/// 768 MB of the recordings' own scratch and reads, in vectors an adapter does not keep to hand out again once let go.
+const SPARE: [usize; 2] = [(384 << 20) / 4; 2];
+
+/// A prompt chunk's attention scratch over a cache of `cap` rows, in words.
+fn scratch_words(chain: &dyn DeviceChain, s: &Dims, cap: usize) -> usize {
+    let need = chain.attention_rows_out_len(2 * MAX_ROWS, s.n_h, s.hd, cap).min(ATTENTION_SCRATCH / 4);
+    need + need / 2
+}
+
+/// What a prompt's run makes on the device beside an attention cache of `cap` rows, in words: the attention's
+/// output, a second chunk's vectors and their attention's scratch (a chunk records while the one before runs), three
+/// states kept from inside a run and their rows' vectors, and the recordings' own ([`SPARE`]).
+fn beside_words(chain: &dyn DeviceChain, st: &State, cap: usize) -> usize {
+    let s = st.dims;
+    let (state, conv) = (s.nv * s.dv * s.dk, (s.kern - 1) * s.ch);
+    chain.attention_out_len(s.n_h, s.hd, cap) + Work::words(&s, 2 * MAX_ROWS) + 2 * scratch_words(chain, &s, cap) + 3 * st.ssm_layers.len() * (state + conv) + TAP_ROWS * 2 * (s.ch + s.nv * s.dv + s.nv) + SPARE.iter().sum::<usize>()
+}
+
 /// `make`, or None where the device refused one of its vectors for want of room (its panic [`ggml_rs::chain::no_room`]
 /// knows, which is not said as it is: a refusal is the answer looked for); any other panic goes on as it came.
 fn if_room<T>(make: impl FnOnce() -> T) -> Option<T> {
@@ -1252,12 +1270,7 @@ impl Qwen35Chain {
         let words = if st.halves_only { row / 2 } else { row };
         let cap_of = |positions: usize| if st.halves_only { halves_cap(positions) } else { positions.next_power_of_two().max(256) };
         let (state, conv) = (s.nv * s.dv * s.dk, (s.kern - 1) * s.ch);
-        let scratch_of = |cap: usize| {
-            let need = chain.attention_rows_out_len(2 * MAX_ROWS, s.n_h, s.hd, cap).min(ATTENTION_SCRATCH / 4);
-            need + need / 2
-        };
-        // (768 MB of the recordings' own, in vectors an adapter does not keep to hand out again once let go)
-        const SPARE: [usize; 2] = [(384 << 20) / 4; 2];
+        let scratch_of = |cap: usize| scratch_words(chain, &s, cap);
         // what a prompt's run makes beside a cache of `cap` rows, and the words of it
         let beside = |cap: usize| {
             let out = chain.vec(chain.attention_out_len(s.n_h, s.hd, cap));
@@ -1268,9 +1281,7 @@ impl Qwen35Chain {
             let spare: Vec<DeviceVec> = SPARE.iter().map(|&n| chain.vec(n)).collect();
             (out, set, scratch, kept, seg, spare)
         };
-        let beside_words = |cap: usize| {
-            chain.attention_out_len(s.n_h, s.hd, cap) + Work::words(&s, 2 * MAX_ROWS) + 2 * scratch_of(cap) + 3 * st.ssm_layers.len() * (state + conv) + TAP_ROWS * 2 * (s.ch + s.nv * s.dv + s.nv) + SPARE.iter().sum::<usize>()
-        };
+        let beside_words = |cap: usize| beside_words(chain, st, cap);
         // The cache's room, measured: as many words as those in vectors of 128 MB or more (which no adapter keeps to
         // hand out again: small ones kept so, where a run's own lay, left the whole vectors of the cache no place
         // between them), then the cache 4,096 rows at a time (or as many of those as make 128 MB), every layer's rows
@@ -1316,6 +1327,32 @@ impl Qwen35Chain {
             room = if st.halves_only { room.saturating_sub(4096) } else { room / 2 };
         }
         Some(room.min(want))
+    }
+
+    /// Whether the model's device has room for its attention cache at `want` positions beside what a prompt's run
+    /// makes with it (what [`Self::context_room`] makes vectors of), by the device's own figure for its memory, before
+    /// any of it is made: a device of wgpu's own does not refuse a vector it has no room for, it pages it, and every
+    /// run after slows to a crawl. The cache's rows as a run makes them: the halves alone, or the f32 rows and the
+    /// halves a step deep in the cache reads beside them, at the rows the cache is grown to for `want`. What the
+    /// device holds of a cache now (the warm-up's) is room the larger one takes; `spare` bytes are left beside it (what
+    /// a run makes that this does not count). None where the device says nothing of its memory, refuses a vector as it
+    /// is asked for (measured so by [`Self::context_room`]), a second device takes a prompt's later layers, or the
+    /// model runs no chain.
+    pub fn context_fits(&self, m: &Qwen35Model, want: usize, spare: u64) -> Option<bool> {
+        let st = self.state(m)?;
+        let chain = m.backend.chain()?;
+        if chain.refuses_at_once() || !chain.room_known() || self.second.get().is_some() || want == 0 {
+            return None;
+        }
+        let s = st.dims;
+        let row = 2 * s.n_kv * s.hd;
+        let (cap, words) = if st.halves_only { (halves_cap(want), row / 2) } else { (want.next_power_of_two().max(256), row + row / 2) };
+        let held: usize = {
+            let g = st.kv.lock().unwrap_or_else(|p| p.into_inner());
+            g.layers.iter().chain(&g.half).map(|v| v.len).sum::<usize>() + g.out.len
+        };
+        let need = st.attention_layers.len() * cap * words + beside_words(chain, st, cap);
+        Some(chain.has_room((need.saturating_sub(held) as u64) * 4 + spare))
     }
 
     /// What the chain keeps on its device between runs let go: its prompt chunks' pooled vectors and their scratch,

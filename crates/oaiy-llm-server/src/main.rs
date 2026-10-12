@@ -19,8 +19,11 @@ const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|
                        first carries a model, the rest what one spreads over
                        more than one (default: the first GPU, and every other
                        discrete one for a model that spreads)
-  --ctx N|auto         context length in tokens, prompt + reply (default 65536);
-                       auto: the most the model allows
+  --ctx N|auto         context length in tokens, prompt + reply. Unset or auto: a
+                       Qwen3.5/3.8 or Flash-Next model gets up to 65536 where its
+                       GPUs have room for the cache (and --vram-headroom-gb beside
+                       it), 16384 where they have not or do not say; DeepSeek
+                       65536; other models 16384; the model's maximum at most
   --ram-gb N           host RAM for the expert cache (default: 80% of what is
                        free, so it leaves a fifth for everything else)
   --start NAME         which configured model to load at start (default: the one
@@ -66,7 +69,8 @@ const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|
                        once per pass, up to N tokens a pass (default 20480;
                        halved if a pass runs out of VRAM)
   --chunk N            attention sub-chunk of a layered pass (default 1024)
-  --vram-headroom-gb F VRAM kept free for activations; the rest caches experts
+  --vram-headroom-gb F VRAM kept free for activations (default 2): beside the
+                       cache of a context nobody set, and the rest caches experts
                        (default 2)
   --checkpoints N      prefix-cache checkpoints kept (~10 MB each, default 256)
   --prompt-cache DIR   keep prompt states in DIR between runs, so a restart does

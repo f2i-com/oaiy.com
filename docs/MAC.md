@@ -573,6 +573,16 @@ engine opened the model with. A conversation whose state is larger than the prom
 whole allowance (`prompt_cache_gb`, 4: about 30,000 of the 27B's tokens) is not written to
 the disk after its replies; raise the allowance to have long ones survive a restart.
 
+**A context nobody set, on a Mac.** On Windows and Linux an engine whose context is left at 0
+(`--ctx auto`) gives a Qwen3.5/3.8 model or Flash-Next up to 65,536 positions where Vulkan's
+budget for the process has room for the cache (ENGINES.md, "DeepSeek-V4.1 context" and after):
+OAIY's Agent, its instructions and OAIY's tools, takes some 19,000 tokens, and in 16,384 it
+refused every request. Metal says nothing of what the GPU has free, and the eGPU's card says it
+only by refusing, so on a Mac a context left at 0 stays 16,384 (on the card it is then measured
+as above for that). Set Engines → Settings → Context on a Mac (65536 for the 9B on the Mac's
+own GPU, or the card's measured most on the eGPU) for the Agent to have room. Not tried on a
+Mac.
+
 **DeepSeek-V4.1 on the card, from a USB drive.** The 510 GB checkpoint runs with the card,
 this Mac's memory and the drive it is on as its three tiers (WEBGPU.md, "DeepSeek-V4.1"):
 its dense trunk (9.7 GB) and 650 of its 15,360 routed experts on the card, as many experts

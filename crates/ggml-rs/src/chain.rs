@@ -175,6 +175,11 @@ pub trait DeviceChain: Send + Sync {
         let _ = bytes;
         false
     }
+    /// Whether the device says what memory it has, so that [`Self::has_room`] answers from its own figure: false
+    /// where it says nothing (and [`Self::has_room`] is then false whatever is asked).
+    fn room_known(&self) -> bool {
+        false
+    }
     /// Whether a vector the device has no room for is refused as it is asked for, by a panic [`no_room`] knows (the
     /// card's adapter, tinygrad's, which says nothing of what it has free): trying to make vectors is then how to
     /// know whether they fit. False where a refusal comes later or not at all (wgpu's own devices report it as an

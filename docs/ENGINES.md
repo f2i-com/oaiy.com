@@ -430,9 +430,20 @@ The CUDA engine's gates (`dsv41-cuda`'s `gpu_model`, `gpu_vision` and
 - DeepSeek-V4.1 runs through `oaiy-llm-server`; `oaiy-llm-cli` takes GGUF files.
 - **DeepSeek-V4.1 context:** the model is trained for 1,048,576 tokens (YaRN ×16 over
   65,536). OAIY's caches cost ~7 KB a token, so `--ctx` can go far (65,536 by default).
-  `--ctx auto` serves every other model at the most it allows (its
-  `max_position_embeddings`) and DeepSeek at the default; Studio passes it when
-  the context setting is 0, its default.
+  `--ctx auto` (or no `--ctx`) serves DeepSeek at the default. A Qwen3.5/3.8 model
+  (GGUF or EXL3) and Flash-Next get up to 65,536 positions where their GPUs have room
+  for the attention cache by the device's own figure for its memory (Vulkan's budget
+  for the process), with `--vram-headroom-gb` (2) and a gigabyte more left beside it:
+  the engine steps down 4,096 at a time to what fits, and keeps 16,384 where nothing
+  fits past that or the device says nothing of its memory (DX12, a Mac's Metal, the
+  CPU, a card that only refuses). Flash-Next on one GPU gets 32,768 at most (past
+  that its cache is the host's). Every other model is held to 16,384. Studio passes
+  `auto` when the context setting is 0, its default; a number set there (`--ctx N`)
+  is served whatever the memory. Two RTX 5090s with Flash-Next's EXL3 (24 GB of
+  weights each): 65,536, a 59,874-token prompt in 29.6 s, the process at most about
+  1 GB under its budget on either card. OAIY's Agent, with its instructions and
+  OAIY's tools, takes some 19,000 tokens before the conversation: in 16,384 it
+  refused every request.
   Verified against the reference oracle up to 247 tokens; longer contexts run the same
   code, but candidate filtering only engages past ~32K tokens and is unverified there.
 - **DeepSeek-V4.1 vision** (the CUDA engine's: on WebGPU the model takes no images
