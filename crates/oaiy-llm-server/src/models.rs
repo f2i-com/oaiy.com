@@ -728,9 +728,30 @@ impl Models {
         let mut cfg = self.base_cfg(spec, max_seq);
         cfg.image_token_id = tok.token_id("<|image_pad|>").ok_or_else(|| Error::Arg("Flash-Next tokenizer lacks image_pad".into()))?;
         // Its vision tower, where the alias is given one: on the last GPU (the first carries the head's side of the
-        // text model), the matrices the checkpoint stores as EXL3 packed there.
+        // text model), the matrices the checkpoint stores as EXL3 packed there. The checkpoint's own folder, or a
+        // GGUF projector (an mmproj file, as llama.cpp's GGUF of the model comes with: its matrices in f16).
         let vision_path = o.vision.then(|| o.vision_projectors.get(&spec.name)).flatten();
         let projector = match (vision_path, tower_backend) {
+            (Some(path), Some(backend)) if path.is_file() => {
+                let file = gguf::GgufFile::open(path).map_err(|e| Error::Arg(format!("{}: {e}", path.display())))?;
+                let mm = llama_rs::MmProj::from_gguf(&file, backend).map_err(|e| Error::Arg(format!("{}: {e}", path.display())))?;
+                let width = match &mm {
+                    llama_rs::MmProj::Qwen3Vl(q) => Some(q.projector.mm2.shape()[0]),
+                    _ => None,
+                };
+                if width != Some(model.config.hidden) {
+                    return Err(Error::Arg(format!(
+                        "{}: {} is not a projector for this model (a Qwen vision tower into {} wide, where it {})",
+                        spec.name,
+                        path.display(),
+                        model.config.hidden,
+                        width.map_or("is not a Qwen one".to_string(), |w| format!("is into {w}"))
+                    )));
+                }
+                cfg.qwen_vision = Some(mm.config().clone());
+                self.say(format!("{}: vision projector loaded from {} (576 tokens an image)", spec.name, path.display()));
+                Some(mm)
+            }
             (Some(path), Some(backend)) => {
                 let last = gpus.last().copied();
                 let make = |d: ggml_rs::exl3::Exl3Data| match last {
@@ -1053,6 +1074,18 @@ impl Models {
             // refusing what it has no room for (tinygrad's), the context is what the chain's cache has room for there
             // beside a prompt's work: a longer prompt is then refused as one past any context is, where it failed
             // halfway through for want of room (and OAIY answered it with the Mac's copy of the model).
+            // (its vision tower first, where it has one: on the card it is 0.9 GB of the room the cache is measured in)
+            let projector = if o.vision {
+                o.vision_projectors.get(&spec.name).map(|p| {
+                    let file = gguf::GgufFile::open(p).map_err(|e| Error::Arg(e.to_string()))?;
+                    let mm = llama_rs::MmProj::from_gguf(&file, Arc::clone(&backend)).map_err(|e| Error::Arg(e.to_string()))?;
+                    if !matches!(&mm, llama_rs::MmProj::Qwen3Vl(q) if q.projector.mm2.shape()[0] == model.config().embedding_dim) {
+                        return Err(Error::Arg("Qwen vision projector does not match the text model".into()));
+                    }
+                    self.say(format!("{}: vision projector loaded from {}", spec.name, p.display()));
+                    Ok(mm)
+                }).transpose()?
+            } else { None };
             let mut max_seq = self.dense_context(model.config().context_length);
             if let llama_rs::Model::Qwen35(m) = &model {
                 match m.chain.context_room(m, max_seq) {
@@ -1067,16 +1100,6 @@ impl Models {
             }
             let mut cfg = self.base_cfg(spec, max_seq);
             cfg.image_token_id = tok.token_id("<|image_pad|>").ok_or_else(|| Error::Arg("Qwen tokenizer lacks image_pad".into()))?;
-            let projector = if o.vision {
-                o.vision_projectors.get(&spec.name).map(|p| {
-                    let file = gguf::GgufFile::open(p).map_err(|e| Error::Arg(e.to_string()))?;
-                    let mm = llama_rs::MmProj::from_gguf(&file, Arc::clone(&backend)).map_err(|e| Error::Arg(e.to_string()))?;
-                    if !matches!(&mm, llama_rs::MmProj::Qwen3Vl(q) if q.projector.mm2.shape()[0] == model.config().embedding_dim) {
-                        return Err(Error::Arg("Qwen vision projector does not match the text model".into()));
-                    }
-                    Ok(mm)
-                }).transpose()?
-            } else { None };
             cfg.qwen_vision = projector.as_ref().map(|p|p.config().clone());
             let (jobs,rx) = std::sync::mpsc::channel();
             let mut e = crate::qwen::QwenEngine::new(model,projector,max_seq,!o.quiet && !o.silent).repetition_guard(o.repetition_guard);

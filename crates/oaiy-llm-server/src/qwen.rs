@@ -448,6 +448,14 @@ impl Hybrid {
     }
     /// Whether the model is chained on GPUs, its kernels' pipelines made as each first runs
     /// ([`QwenEngine::warm_up`]): Flash-Next, a chained Qwen3.5 hybrid.
+    /// What the model keeps on its GPU between requests let go ([`llama_rs::Qwen35Chain::let_go_of_spare`]); with
+    /// `cache`, its attention cache's copy there too. Other models keep nothing of the kind.
+    fn let_go_of_spare(&self, cache: bool) {
+        if let Self::Qwen35(Model::Qwen35(m)) = self {
+            m.chain.let_go_of_spare(m, cache);
+        }
+    }
+
     fn warms(&self) -> bool {
         // (Flash-Next with experts read as records: two chunks of tokens of no meaning would read some 30 GB of
         // records and fill the card's free slots with experts no conversation routes to; its load ran a short
@@ -564,6 +572,8 @@ pub struct QwenEngine {
     /// A run that repeats without end is turned from, and stopped where it goes on all the same
     /// (`--repetition-guard`, on unless said): [`crate::repetition::CycleGuard`].
     cycles: bool,
+    /// The request has begun its reply (its prompt is read): a failure from here on is not run again.
+    replying: bool,
 }
 
 /// The times a reply is turned from a run without end before it is stopped: a model turned from one may write
@@ -574,7 +584,7 @@ impl QwenEngine {
     pub fn new(model: impl Into<Hybrid>, projector: Option<MmProj>, max_seq: usize, log: bool) -> Self {
         let model = model.into();
         let kv = model.new_kv_cache(max_seq);
-        Self { model, projector, kv, covered: Vec::new(), vision_cache: Default::default(), log, checkpoints: Vec::new(), disk: None, image_disk_cache:false, private_session: None, parking: Parking::new(0, log), cycles: true }
+        Self { model, projector, kv, covered: Vec::new(), vision_cache: Default::default(), log, checkpoints: Vec::new(), disk: None, image_disk_cache:false, private_session: None, parking: Parking::new(0, log), cycles: true, replying: false }
     }
     /// Whether a run that repeats without end is turned from and stopped (it is, unless this says not).
     pub fn repetition_guard(mut self, on: bool) -> Self {
@@ -601,7 +611,21 @@ impl QwenEngine {
             if self.private_session.is_some() && !(job.forget && job.session.is_some() && job.session == self.private_session) {
                 self.forget_state();
             }
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.generate(&job)));
+            self.replying = false;
+            let mut result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.generate(&job)));
+            // A GPU that had no room while the prompt was read (no word of the reply sent): what the model keeps on it
+            // between requests let go, its cache's copy too, and the request run once more from the start. Left as it
+            // was, every request after failed the same way until the engine was started again.
+            if result.as_ref().is_err_and(|p| ggml_rs::chain::no_room(p.as_ref())) && !self.replying {
+                if self.log { eprintln!("  Qwen: the GPU had no room for this request; what the model keeps there between requests let go, and the request run again"); }
+                self.kv.reset(); self.covered.clear();
+                self.model.let_go_of_spare(true);
+                result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.generate(&job)));
+            }
+            // (a picture's prompt keeps vectors of its own on the GPU: let go, for the text prompts that come after)
+            if !job.images.is_empty() || result.is_err() {
+                self.model.let_go_of_spare(result.is_err());
+            }
             let error = match result { Ok(Ok(())) => None, Ok(Err(e)) => Some(e), Err(_) => Some("native Qwen inference failed".into()) };
             if let Some(e) = error { self.kv.reset(); self.covered.clear(); let _ = job.events.send(Event::Error(e)); }
             if job.forget {
@@ -908,6 +932,7 @@ impl QwenEngine {
         // (OAIY_DECODE_LOG: the model's time at every fiftieth token)
         let mut by_fifty: Vec<f64> = Vec::new();
         let (mut cycles, mut turned) = (crate::repetition::CycleGuard::default(), 0usize);
+        self.replying = true;
         while generated.len() < job.max_tokens && self.kv.len < self.kv.max_len {
             if job.cancel.load(Ordering::Relaxed) {
                 if let (Some(m), false) = (drafter, pending.is_empty()) { m.rollback(&mut self.kv, check_rows, check_rows - pending.len()); }

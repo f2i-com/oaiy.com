@@ -810,6 +810,16 @@ fn reserve_halves(chain: &dyn DeviceChain, g: &mut Kv, s: &Dims, slots: usize, n
     g.owner = owner;
 }
 
+/// The attention cache's copy on the device let go: nobody's, of no rows (the next run makes it and writes every row).
+fn drop_cache(chain: &dyn DeviceChain, g: &mut Kv) {
+    g.owner = 0;
+    g.cap = 0;
+    g.layers.clear();
+    g.half.clear();
+    g.halved = 0;
+    g.out = chain.vec(1);
+}
+
 /// The rows [`reserve_halves`] holds for `needed`: as many again as 4,096 past it, in steps of 4,096.
 fn halves_cap(needed: usize) -> usize {
     (needed + 4096).div_ceil(4096) * 4096
@@ -1236,15 +1246,7 @@ impl Qwen35Chain {
         let s = st.dims;
         let row = 2 * s.n_kv * s.hd;
         let slots = st.attention_layers.len();
-        {
-            let mut g = st.kv.lock().unwrap_or_else(|p| p.into_inner());
-            g.owner = 0;
-            g.cap = 0;
-            g.layers.clear();
-            g.half.clear();
-            g.halved = 0;
-            g.out = chain.vec(1);
-        }
+        drop_cache(chain, &mut st.kv.lock().unwrap_or_else(|p| p.into_inner()));
         chain.let_go_of_spare();
         // (a layer's words a position, and the rows a cache of `positions` is made with: `reserve_halves`', `reserve`'s)
         let words = if st.halves_only { row / 2 } else { row };
@@ -1314,6 +1316,20 @@ impl Qwen35Chain {
             room = if st.halves_only { room.saturating_sub(4096) } else { room / 2 };
         }
         Some(room.min(want))
+    }
+
+    /// What the chain keeps on its device between runs let go: its prompt chunks' pooled vectors and their scratch,
+    /// and with `cache` its attention cache's copy too (the next run makes it again and writes every row), then the
+    /// device's own spare. `cache`: after a run the device refused room for, which a run of the same prompt may then
+    /// have; without it, after a picture's prompt, whose run keeps vectors of its own beside a text prompt's (1.4 GB
+    /// of them on the 27B at 61,000 positions, and a text prompt after it had then no room for its own).
+    pub fn let_go_of_spare(&self, m: &Qwen35Model, cache: bool) {
+        let (Some(Some(st)), Some(chain)) = (self.state.get(), m.backend.chain()) else { return };
+        st.prompt_sets.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        if cache {
+            drop_cache(chain, &mut st.kv.lock().unwrap_or_else(|p| p.into_inner()));
+        }
+        chain.let_go_of_spare();
     }
 
     fn state(&self, m: &Qwen35Model) -> Option<&State> {

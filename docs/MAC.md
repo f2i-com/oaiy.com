@@ -531,10 +531,25 @@ it) and `POST /api/egpu/stop`; `/api/state` has an `egpu` section, and the Logs 
 
 **Pictures in a chat** (the `webgpu` engine). A request with a picture goes to the card's
 engine like any other: it reads the picture where its model has a vision projector
-(`llm.models[].vision_projector`), and where it has none it says so at once ("… has no vision
-here …; images are not supported"), which OAIY's Agent answers by going on in text, a
-screenshot becoming the page's description. Only tinygrad's own server, which reads text
-alone, leaves such a request to this Mac's engine.
+(`llm.models[].vision_projector`, the Models page's *Vision projector*), and where it has none
+it says so at once ("… has no vision here …; images are not supported"), which OAIY's Agent
+answers by going on in text, a screenshot becoming the page's description. Only tinygrad's own
+server, which reads text alone, leaves such a request to this Mac's engine.
+
+- Qwen3.8-27B (a GGUF) takes its GGUF's mmproj file (`mmproj-F16.gguf`, 0.93 GB, from the
+  model's GGUF repository). On the RTX 4090 a picture is 576 tokens: a screenshot described in
+  3 s to the first token, replies at 38 tokens a second. The projector is on the card before
+  the engine measures the cache's room; with it the 27B still holds 77,824 positions there
+  (the measure stops a step short of the tightest fit, and the projector took that step).
+- Qwen3.8-Flash-Next (its EXL3 folder) takes the vision tower its own checkpoint holds (the
+  folder itself as the projector: `model.visual.*`, packed as EXL3), or a GGUF mmproj file
+  for it; a projector into another width is refused at load. 12 s to the first token on a
+  cold card, replies at 11 tokens a second.
+- A prompt with a picture runs through the model chunk by chunk at the picture's positions,
+  and keeps vectors of its own on the card beside a text prompt's (1.4 GB at 61,000 tokens):
+  they are let go after it. And where the card has no room while a prompt is read, what the
+  model keeps there between requests is let go and the request run once more, where every
+  request after failed until the engine was started again.
 
 **How much context fits on the card** (the `webgpu` engine). Qwen3.8-Flash-Next keeps the
 newest 32,768 positions of its cache on the card and the rest in this Mac's memory
