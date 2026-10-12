@@ -3,7 +3,7 @@ use std::sync::{mpsc::Receiver, atomic::Ordering};
 use dsv41::chat::{Encoded, Mode, Options, DSML};
 use ggml_rs::Tensor;
 use std::sync::Arc;
-use crate::qwen_cache::{Snapshot, RecurrentSnapshot};
+use crate::qwen_cache::{Snapshot, RecurrentSnapshot, WholeBuilder};
 use crate::qwen_park::{Held, Parking};
 use llama_rs::{Model, MmProj, MmProjConfig, KvCache};
 use oaiy_engine::json::Json;
@@ -509,6 +509,20 @@ impl Hybrid {
     }
     /// [`Self::forward_chunks`] with the recurrent states as they are once each of `taps` rows of the chunks is in
     /// (what a checkpoint there holds, the run not stopping for it), where [`Self::can_tap`] said it can.
+    /// [`Self::forward_chunks`] and [`Self::forward_chunks_tapped`] (no `taps`: the former) for a dense Qwen hybrid's
+    /// rows at `at`, as [`Self::forward`] places them: the text after a picture the cache holds already, in one
+    /// chained run as any text is. Another model's: Err (it runs such text a chunk at a time).
+    fn forward_chunks_at(&self, chunks: &[(&[u32], Tensor)], kv: &mut KvCache, done: &mut dyn FnMut(usize), taps: &[usize], at: &[[u32; 3]]) -> Result<(Tensor, Vec<llama_rs::Tapped>), String> {
+        let Self::Qwen35(Model::Qwen35(m)) = self else { return Err("not a dense Qwen hybrid".into()) };
+        let (tokens, emb) = self.joined(chunks);
+        let embeds = m.backend.to_device(emb);
+        let (logits, kept) = m.forward_embeds_tapped_at(&embeds, tokens.len(), kv, taps, at).ok_or("the run at its positions could not be chained")?;
+        for i in 0..chunks.len() {
+            done(i);
+        }
+        Ok((logits.to_host(), kept))
+    }
+
     fn forward_chunks_tapped(&self, chunks: &[(&[u32], Tensor)], kv: &mut KvCache, done: &mut dyn FnMut(usize), taps: &[usize]) -> Result<(Tensor, Vec<llama_rs::Tapped>), String> {
         #[cfg(feature = "webgpu")]
         if let Self::Flash(f) = self {
@@ -574,6 +588,11 @@ pub struct QwenEngine {
     cycles: bool,
     /// The request has begun its reply (its prompt is read): a failure from here on is not run again.
     replying: bool,
+    /// Prompts whose whole states go to the disk between requests ([`QwenEngine::save_some`]), the newest last.
+    unsaved: Vec<Vec<u64>>,
+    /// The state being made for the disk, a layer at a time: its prompt, whether it is a system prompt's, and when
+    /// it began.
+    building: Option<(Vec<u64>, bool, WholeBuilder, std::time::Instant)>,
 }
 
 /// The times a reply is turned from a run without end before it is stopped: a model turned from one may write
@@ -584,7 +603,7 @@ impl QwenEngine {
     pub fn new(model: impl Into<Hybrid>, projector: Option<MmProj>, max_seq: usize, log: bool) -> Self {
         let model = model.into();
         let kv = model.new_kv_cache(max_seq);
-        Self { model, projector, kv, covered: Vec::new(), vision_cache: Default::default(), log, checkpoints: Vec::new(), disk: None, image_disk_cache:false, private_session: None, parking: Parking::new(0, log), cycles: true, replying: false }
+        Self { model, projector, kv, covered: Vec::new(), vision_cache: Default::default(), log, checkpoints: Vec::new(), disk: None, image_disk_cache:false, private_session: None, parking: Parking::new(0, log), cycles: true, replying: false, unsaved: Vec::new(), building: None }
     }
     /// Whether a run that repeats without end is turned from and stopped (it is, unless this says not).
     pub fn repetition_guard(mut self, on: bool) -> Self {
@@ -599,7 +618,20 @@ impl QwenEngine {
     }
     pub fn run(mut self, jobs: Receiver<Job>) {
         self.warm_up();
-        for job in jobs {
+        loop {
+            // (between requests the states for the disk are made, a layer at a time, a request taken between layers:
+            // made after a reply, one held the next request back while its rows were copied, 2 s of an agent's step
+            // at 26,000 tokens)
+            let job = if self.unsaved.is_empty() && self.building.is_none() {
+                match jobs.recv() { Ok(job) => job, Err(_) => break }
+            } else {
+                match jobs.try_recv() {
+                    Ok(job) => job,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => { self.save_some(); continue; }
+                    // (the engine let go: what it had to write, written first)
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => { while self.save_some() {} break; }
+                }
+            };
             // The end of an incognito session: wipe what is held of it.
             if job.wipe {
                 if self.private_session.is_some() && self.private_session == job.session { self.forget_state(); }
@@ -701,6 +733,8 @@ impl QwenEngine {
     /// goes too: the engine holds nothing afterwards, as it never did (the states set aside are
     /// never a private session's, but an incognito request ends with an empty engine).
     fn forget_state(&mut self) {
+        self.unsaved.clear();
+        self.building = None;
         self.kv.reset();
         self.covered.clear();
         self.checkpoints.clear();
@@ -819,7 +853,11 @@ impl QwenEngine {
             let (from, began) = (pos, std::time::Instant::now());
             // a text prompt's chunks up to the next checkpoint together, where the model runs them so (some at a time,
             // between cancellations' looks)
-            if hybrid.pipelines() && job.images.is_empty() {
+            // (text after pictures the cache holds already goes that way too, at its positions: a dense hybrid's; a
+            // picture still to be read, or another model's text after one, goes a chunk at a time below)
+            let placed = !job.images.is_empty();
+            let cached = job.images.iter().all(|image| image.start + image.prep.n_tokens() <= pos);
+            if hybrid.pipelines() && (!placed || (cached && hybrid.qwen35().is_some())) {
                 // the checkpoints this run would reach that are not kept yet: kept from inside it where the model can
                 // (its states copied as the run goes: a prompt's last two, before the assistant's header and before
                 // its last token, were a run of 6 rows and a run of 1 of their own), else a run's end each as before
@@ -841,8 +879,18 @@ impl QwenEngine {
                 let chunks: Vec<(&[u32], Tensor)> = spans.iter().zip(embeds).map(|(&(a, b), e)| (&job.prompt[a..b], e)).collect();
                 let events = &job.events;
                 let mut done = |i: usize| { let _ = events.send(Event::Progress { done: spans[i].1 - start, total }); };
-                if inside {
-                    let (out, kept) = hybrid.forward_chunks_tapped(&chunks, &mut self.kv, &mut done, &due.iter().map(|s| s - pos).collect::<Vec<_>>())?;
+                let taps: Vec<usize> = if inside { due.iter().map(|s| s - pos).collect() } else { Vec::new() };
+                if placed {
+                    let (out, kept) = hybrid.forward_chunks_at(&chunks, &mut self.kv, &mut done, &taps, &positions[pos..stop])?;
+                    logits = Some(out);
+                    for tap in kept {
+                        if self.log { eprintln!("  Qwen checkpoint: {} tokens; from inside the run (after a picture)", tap.at); }
+                        let base = stops.first() == Some(&tap.at);
+                        self.checkpoints.push((keys[..tap.at].to_vec(), RecurrentSnapshot::tapped(tap.at, tap.states, tap.convs), base));
+                        trim_checkpoints(&mut self.checkpoints);
+                    }
+                } else if inside {
+                    let (out, kept) = hybrid.forward_chunks_tapped(&chunks, &mut self.kv, &mut done, &taps)?;
                     logits = Some(out);
                     for tap in kept {
                         if self.log { eprintln!("  Qwen checkpoint: {} tokens; from inside the run", tap.at); }
@@ -1090,40 +1138,71 @@ impl QwenEngine {
         for (_, snap, _) in &mut self.checkpoints {
             snap.settle(&self.kv, device);
         }
-        // and the disk's whole states of them (disk states are the Qwen3.5 hybrid's; memory checkpoints any model's)
-        if let (Some(model), Some(disk)) = (self.model.qwen35().filter(|_| job.images.is_empty() || self.image_disk_cache), self.disk.as_mut().filter(|_| !job.forget)) {
+        // and the disk's whole states of them, once the engine is idle (disk states are the Qwen3.5 hybrid's and
+        // Flash-Next's, of text; memory checkpoints any model's): `save_unsaved`
+        let stored = (self.model.qwen35().is_some() && (job.images.is_empty() || self.image_disk_cache)) || (self.model.row_slots().is_some() && job.images.is_empty());
+        if let Some(disk) = self.disk.as_ref().filter(|_| stored && !job.forget) {
             for &at in &to_disk {
-                if disk.has(&keys[..at]) {
-                    continue;
-                }
-                let Some((_, snap, base)) = self.checkpoints.iter().find(|(saved, _, _)| saved.as_slice() == &keys[..at]) else { continue };
-                if too_large(disk, at, Snapshot::whole_bytes(at, &self.kv, &model.attention_layers), self.log) {
-                    continue;
-                }
-                if let Some(whole) = Snapshot::from_checkpoint(snap, &self.kv, &model.attention_layers, model.backend.as_ref()) {
-                    disk.save(keys[..at].to_vec(), Arc::new(whole), *base);
+                let saved = keys[..at].to_vec();
+                if !disk.has(&saved) && !self.unsaved.contains(&saved) {
+                    self.unsaved.push(saved);
                 }
             }
-        }
-        // (Qwen3.8-Flash-Next's: its cache's slots, the keys and values of those that hold them up to the checkpoint)
-        if let (Some(rows), Some(disk)) = (self.model.row_slots().filter(|_| job.images.is_empty()), self.disk.as_mut().filter(|_| !job.forget)) {
-            for &at in &to_disk {
-                if disk.has(&keys[..at]) {
-                    continue;
-                }
-                let Some((_, snap, base)) = self.checkpoints.iter().find(|(saved, _, _)| saved.as_slice() == &keys[..at]) else { continue };
-                let Some(backend) = self.kv.layer_backends.first().cloned() else { continue };
-                if too_large(disk, at, Snapshot::whole_bytes(at, &self.kv, &rows), self.log) {
-                    continue;
-                }
-                if let Some(whole) = Snapshot::from_checkpoint(snap, &self.kv, &rows, backend.as_ref()) {
-                    disk.save(keys[..at].to_vec(), Arc::new(whole), *base);
-                }
-            }
+            // (the newest few: the conversation's latest, and its system prompt's)
+            let extra = self.unsaved.len().saturating_sub(4);
+            self.unsaved.drain(..extra);
         }
         Ok(())
     }
+
+    /// A step of the disk's states ([`QwenEngine::unsaved`]): the next attention layer of the one being made, or
+    /// the newest still to make begun (where it is still what the cache holds: its rows up to there unchanged, and
+    /// its checkpoint kept). Whether there is more to do.
+    fn save_some(&mut self) -> bool {
+        let Some(disk) = self.disk.as_mut() else { self.unsaved.clear(); self.building = None; return false };
+        if let Some((saved, base, builder, began)) = &mut self.building {
+            // (a request between steps that went on from it leaves its rows as they were; one that went back does not)
+            if !self.covered.starts_with(saved) || builder.pos() > self.kv.len {
+                self.building = None;
+            } else if let Some(whole) = builder.step(&self.kv) {
+                if self.log { eprintln!("  Qwen: the prompt's state at {} tokens made for the disk between requests in {:.2}s", saved.len(), began.elapsed().as_secs_f64()); }
+                disk.save(std::mem::take(saved), Arc::new(whole), *base);
+                self.building = None;
+            }
+            return self.building.is_some() || !self.unsaved.is_empty();
+        }
+        while let Some(saved) = self.unsaved.pop() {
+            let at = saved.len();
+            if disk.has(&saved) || !self.covered.starts_with(&saved) || at > self.kv.len {
+                continue;
+            }
+            let Some((_, snap, base)) = self.checkpoints.iter().find(|(kept, _, _)| *kept == saved) else { continue };
+            // (Qwen3.8-Flash-Next's: its cache's slots, the keys and values of those that hold them up to there)
+            let (rows, backend) = match (self.model.qwen35(), self.model.row_slots()) {
+                (Some(model), _) => (model.attention_layers.clone(), Arc::clone(&model.backend)),
+                (None, Some(rows)) => match self.kv.layer_backends.first().cloned() {
+                    Some(backend) => (rows, backend),
+                    None => continue,
+                },
+                (None, None) => continue,
+            };
+            let bytes = Snapshot::whole_bytes(at, &self.kv, &rows);
+            if (!*base && disk.near(&saved, NEAR)) || too_large(disk, at, bytes, self.log) || !disk.worth(&saved, bytes, *base, &self.covered) {
+                continue;
+            }
+            if let Some(builder) = Snapshot::builder(snap, &self.kv, &rows, backend) {
+                self.building = Some((saved, *base, builder, std::time::Instant::now()));
+                break;
+            }
+        }
+        self.building.is_some() || !self.unsaved.is_empty()
+    }
 }
+
+/// A conversation's state goes to the disk again once it is this many tokens past the one there: a restart reads
+/// at most these again (some 4 s of the 27B's on the eGPU), where a state at every step of an agent's was 3.5 GB
+/// written every few seconds at 27,000 tokens.
+const NEAR: usize = 4096;
 
 /// Tokens drafted a check, where a model drafts (its multi-token-prediction layer): Qwen3.8 27B's take 0.86, 0.73
 /// and 0.65 in turn (each where the ones before it were).

@@ -256,6 +256,16 @@ OpenAI's.
   states use `--prompt-cache` across restarts; image-conditioned states stay in
   memory. An identical retry leaves one token to recompute the sampling logits.
   The initial uncached prompt still needs a full prefill.
+- **An agent's steps, back to back.** A conversation's turns each read only what is new
+  (the system prompt and the tool definitions, and every turn before, come from the
+  checkpoints in memory): on the RTX 4090 the 27B reads an agent step's few hundred new
+  tokens in about 0.6 s at 30,000 tokens. The whole state for the disk (a restart's) is made
+  between requests, a layer at a time, a request taken between layers, where it was made
+  after each reply and held the next step back while gigabytes were copied: back to back at
+  27,000 tokens a step took 3.8 s, now 1.65. A conversation's state goes to the disk again
+  only 4,096 tokens past the one there (3.5 GB were written at every step), and a system
+  prompt's state does not push out the state of the conversation it begins. A conversation
+  with pictures reads its text after a picture the cache holds the same way as any text.
 - **A reply that repeats without end** (the Qwen engine: the GGUF models and Flash-Next).
   A model can write the same few tokens over and over and not stop: the 27B, testing a
   game through a tool, filled the call's list with `{"key":"ArrowRight"},` until it was

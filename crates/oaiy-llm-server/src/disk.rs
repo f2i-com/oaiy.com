@@ -261,6 +261,26 @@ impl<S: PromptState> DiskCache<S> {
     }
 
     /// Whether an entry holds exactly these keys.
+    /// Whether a state of `bytes` after `keys` should be made: one the budget takes, and not a system prompt's that
+    /// would push out the state of the conversation it begins (`live`: what the model holds now, a longer prompt of
+    /// the same conversation on the disk): the two of the 27B at 26,000 tokens were each more than half the budget,
+    /// and each was made and written again at every turn in place of the other.
+    pub fn worth(&self, keys: &[u64], bytes: u64, base: bool, live: &[u64]) -> bool {
+        if bytes > self.budget {
+            return false;
+        }
+        let held: u64 = self.entries.iter().filter(|e| e.ready.load(Ordering::Acquire) != 2).map(|e| e.bytes).sum();
+        let crowds = held + bytes > self.budget;
+        !(base && crowds && self.entries.iter().any(|e| e.ready.load(Ordering::Acquire) != 2 && e.keys.len() > keys.len() && e.keys.starts_with(keys) && live.starts_with(&e.keys)))
+    }
+
+    /// Whether a state of this conversation fewer than `within` tokens short of `keys` is kept already (not a system
+    /// prompt's): a restart from it reads those tokens again, where a state at every turn of an agent's was gigabytes
+    /// written at every step.
+    pub fn near(&self, keys: &[u64], within: usize) -> bool {
+        self.entries.iter().any(|e| e.ready.load(Ordering::Acquire) != 2 && !e.base && keys.starts_with(&e.keys) && keys.len() - e.keys.len() < within)
+    }
+
     pub fn has(&self, keys: &[u64]) -> bool {
         self.entries.iter().any(|e| e.ready.load(Ordering::Acquire) != 2 && e.keys == keys)
     }
@@ -330,6 +350,24 @@ mod publication_tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         panic!("cache writer did not finish");
+    }
+
+    #[test]
+    fn a_state_close_to_one_kept_is_not_made_again_and_a_system_prompts_does_not_push_out_its_conversation() {
+        let dir = directory("near");
+        let mut cache = DiskCache::open(&dir, 1, 1000).unwrap();
+        cache.save(vec![1, 2, 3, 4], state(4), false);
+        settled(&cache);
+        assert!(cache.near(&[1, 2, 3, 4, 5, 6], 4), "two tokens on");
+        assert!(!cache.near(&[1, 2, 3, 4, 5, 6, 7, 8], 4), "four on: made");
+        assert!(!cache.near(&[9, 2, 3, 4, 5, 6], 4), "another conversation");
+        // a system prompt's state that the budget holds beside the conversation's: made; one that would push it out:
+        // not, while the conversation is the model's
+        assert!(cache.worth(&[1, 2], 500, true, &[1, 2, 3, 4, 5]));
+        assert!(!cache.worth(&[1, 2], 990, true, &[1, 2, 3, 4, 5]));
+        assert!(cache.worth(&[1, 2], 990, true, &[1, 2, 7]), "another conversation now: the new one's start");
+        assert!(!cache.worth(&[1, 2], 1001, true, &[1, 2, 7]), "past the whole budget");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

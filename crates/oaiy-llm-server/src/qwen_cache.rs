@@ -96,6 +96,38 @@ pub struct Snapshot {
 #[derive(Clone)]
 pub struct RecurrentSnapshot(Snapshot);
 
+/// A whole state ([`Snapshot::from_checkpoint`]) made a layer at a time: [`WholeBuilder::step`] copies the next
+/// attention layer's keys and values up to its position from the cache, which must hold the same rows there at each
+/// step (the cache appended to after, between steps, holds them still).
+pub struct WholeBuilder {
+    pos: usize,
+    attention: Vec<bool>,
+    backend: Arc<dyn Backend>,
+    layers: Vec<[Option<Tensor>; 4]>,
+    next: usize,
+}
+
+impl WholeBuilder {
+    /// The next attention layer's rows copied: the whole state once the last is in, else None.
+    pub fn step(&mut self, kv: &KvCache) -> Option<Snapshot> {
+        while self.next < self.attention.len() && !self.attention[self.next] {
+            self.next += 1;
+        }
+        if let Some(i) = (self.next < self.attention.len()).then_some(self.next) {
+            let backend = kv.layer_backends.get(i).map(|b| b.as_ref()).unwrap_or(self.backend.as_ref());
+            self.layers[i][0] = Some(backend.slice_axis0(&kv.k[i], self.pos).to_host());
+            self.layers[i][1] = Some(backend.slice_axis0(&kv.v[i], self.pos).to_host());
+            self.next += 1;
+            return None;
+        }
+        Some(Snapshot { pos: self.pos, layers: std::mem::take(&mut self.layers) })
+    }
+
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+}
+
 impl RecurrentSnapshot {
     pub fn from_snapshot(snapshot: &Snapshot) -> Self {
         Self(Snapshot { pos: snapshot.pos, layers: snapshot.layers.iter()
@@ -203,6 +235,19 @@ impl Snapshot {
             }
         }).collect();
         Some(Self { pos, layers })
+    }
+
+    /// [`Self::from_checkpoint`] a layer at a time, so the work can stop between layers ([`WholeBuilder`]).
+    pub fn builder(checkpoint: &RecurrentSnapshot, kv: &KvCache, attention: &[bool], backend: Arc<dyn Backend>) -> Option<WholeBuilder> {
+        let pos = checkpoint.0.pos;
+        if pos == 0 || pos > kv.len || checkpoint.0.layers.len() != attention.len() {
+            return None;
+        }
+        // (the recurrent tensors now, small and the checkpoint's: it may be let go before the keys and values are in)
+        let layers = attention.iter().enumerate().map(|(i, &attn)| {
+            if attn { [None, None, None, None] } else { let layer = &checkpoint.0.layers[i]; [None, None, layer[2].as_ref().map(its_own), layer[3].as_ref().map(its_own)] }
+        }).collect();
+        Some(WholeBuilder { pos, attention: attention.to_vec(), backend, layers, next: 0 })
     }
 
     pub fn restore(&self, kv: &mut KvCache, attention: &[bool], ssm: SsmConfig, backend: &dyn Backend) -> Result<(), String> {

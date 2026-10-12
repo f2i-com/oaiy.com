@@ -167,6 +167,8 @@
 
   // --- acting on the page -----------------------------------------------------
   const MOST_ACTIONS = 20;
+  const HOLD_MOST = 8_000;
+  let holdLeft = HOLD_MOST;
   const candidates = (selector, withClickable) => {
     const all = [...document.querySelectorAll(selector)];
     if (withClickable) for (const el of document.body.querySelectorAll('*')) if (!all.includes(el) && clickable(el)) all.push(el);
@@ -248,9 +250,13 @@
     if (typeof action.key === 'string') {
       const target = document.activeElement && document.activeElement !== document.body ? document.activeElement : document.body;
       const init = { key: action.key, code: action.key.length === 1 ? `Key${action.key.toUpperCase()}` : action.key, bubbles: true, cancelable: true };
-      // `hold`: the key kept down that long (ms; 10 s over all its presses at most) before it is let go, as a game
-      // that moves while a key is down reads it: down and up in one instant is no time held, and nothing moves.
-      const hold = Math.min(Math.max(Number(action.hold) || 0, 0), 10_000 / times);
+      // `hold`: the key kept down that long (ms) before it is let go, as a game that moves while a key is down reads
+      // it: down and up in one instant is no time held, and nothing moves. A call's holds are HOLD_MOST in all: a
+      // model that saw a game not do what it wanted asked for 20 s, 60 s, 120 s, a call after another (each 44 s
+      // of the agent's time, 24 of them), and the result said the hold it got, not that it was cut.
+      const asked = Math.max(Number(action.hold) || 0, 0);
+      const hold = Math.min(asked, holdLeft / times);
+      holdLeft -= hold * times;
       for (let i = 0; i < times; i++) {
         if (i) await moment();
         target.dispatchEvent(new KeyboardEvent('keydown', init));
@@ -258,7 +264,8 @@
         target.dispatchEvent(new KeyboardEvent('keyup', init));
       }
       if (action.key === 'Enter' && target.form) target.form.requestSubmit?.();
-      return `pressed ${action.key}${again}${hold ? `, held ${Math.round(hold)} ms${times > 1 ? ' each' : ''}` : ''}`;
+      const cut = asked > hold + 1 ? ` (${Math.round(asked)} ms asked: a call holds keys ${HOLD_MOST / 1000} s at most in all; a few hundred ms moves a game a step or two)` : '';
+      return `pressed ${action.key}${again}${hold ? `, held ${Math.round(hold)} ms${times > 1 ? ' each' : ''}` : ''}${cut}`;
     }
     if (typeof action.wait === 'number') {
       await new Promise((resolve) => setTimeout(resolve, Math.min(Math.max(action.wait, 0), 10_000)));
@@ -408,6 +415,7 @@
         // (20 actions a call, and said where there were more: the rest were dropped without a word, and a model
         // that saw nothing come of them wrote them again)
         const actions = Array.isArray(data.actions) ? data.actions : [];
+        holdLeft = HOLD_MOST;
         for (const action of actions.slice(0, MOST_ACTIONS)) {
           done.push(await act(action));
           await settle();

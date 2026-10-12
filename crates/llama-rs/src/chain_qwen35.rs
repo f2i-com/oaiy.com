@@ -1518,6 +1518,20 @@ impl Qwen35Chain {
         self.forward_with(m, embeds, rows, kv, taps)
     }
 
+    /// [`Self::forward_tapped`] (with no `taps`: [`Self::forward`]) for rows at `positions`, as
+    /// [`Self::forward_positions`] places them: the text after a picture, in a conversation whose picture the cache
+    /// holds already, keeps its states from inside the run as any text does (it went op by op through the run's ends
+    /// before: a turn's 772 new tokens in 3.1 s, where 447 took 0.7). None, and nothing run, where it cannot.
+    pub(crate) fn forward_tapped_at(&self, m: &Qwen35Model, embeds: &Tensor, rows: usize, kv: &mut KvCache, taps: &[usize], positions: &[[u32; 3]]) -> Option<(Tensor, Vec<Tapped>)> {
+        if m.config.rope_dim != 64 || positions.len() != rows || embeds.numel() != rows * m.config.embedding_dim || (!taps.is_empty() && !self.can_tap(m, rows, kv, taps)) {
+            return None;
+        }
+        *self.positions.lock().unwrap_or_else(|p| p.into_inner()) = Some((kv.len, positions.to_vec()));
+        let out = self.forward_with(m, embeds, rows, kv, taps);
+        *self.positions.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        out
+    }
+
     /// Whether a run of `rows` after what `kv` holds can keep its recurrent states from inside it once each of `taps`
     /// rows is in ([`Self::forward_tapped`]): chained (on one device or a prompt's chunks over two, each keeping its
     /// own layers'), and each chunk's rows after the first state it keeps few ([`TAP_ROWS`]: their recurrence goes

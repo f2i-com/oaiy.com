@@ -555,6 +555,13 @@ impl Qwen35Model {
         self.chain.forward_tapped(self, embeds, seq, kv, taps)
     }
 
+    /// VENDORED-LOCAL: [`Self::forward_embeds_tapped`] for rows at `positions` (three axes a row, as
+    /// [`Self::forward_embeds_positions`] takes them: text after a picture); with no `taps`, a chained run at them.
+    /// None, and nothing run, where the chain cannot.
+    pub fn forward_embeds_tapped_at(&self, embeds: &Tensor, seq: usize, kv: &mut KvCache, taps: &[usize], positions: &[[u32; 3]]) -> Option<(Tensor, Vec<crate::Tapped>)> {
+        self.chain.forward_tapped_at(self, embeds, seq, kv, taps, positions)
+    }
+
     /// VENDORED-LOCAL: [`Self::forward_embeds_positions`] op by op through the backend, never chained (what a chained
     /// run is checked against).
     pub fn forward_embeds_host(&self, embeds: &Tensor, seq: usize, kv: &mut KvCache, multimodal: Option<&[[u32; 3]]>) -> Result<Tensor> {
