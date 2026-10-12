@@ -2299,17 +2299,28 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     void s.syncContacts().then(() => s.refreshContacts());
   }
 
+  // A refused phone.status (Aokie starting, restarting after a driver install, or waiting for its Trust click
+  // after an update) is asked again, soon at first, until it answers: while the desktop's events stay up nothing
+  // else would ask, and the chip said "desktop offline" with Aokie long running.
+  let phoneRetry: number | undefined;
+  let phoneRetryMs = 5000;
   async function refreshPhone(): Promise<void> {
     // Asked only while there is a phone (a plugin provides it).
     if (!desktop || !phoneOn()) return;
+    window.clearTimeout(phoneRetry);
+    phoneRetry = undefined;
     try {
       const status = (await desktop.command('aokie', 'phone.status', {}, `oaiy:phone.status:${crypto.randomUUID()}`, AbortSignal.timeout(8000))) as Record<string, unknown> | null;
       phoneConnected = !!status?.connected;
       desktopProblem = '';
+      phoneRetryMs = 5000;
       giveCallerNames();
       followContacts();
     } catch (error) {
       desktopProblem = (error as Error).message;
+      window.clearTimeout(phoneRetry);
+      phoneRetry = window.setTimeout(() => void refreshPhone(), phoneRetryMs);
+      phoneRetryMs = Math.min(phoneRetryMs * 2, 60_000);
     }
     renderPhoneChip();
   }
@@ -2323,6 +2334,8 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     if (event.name === 'aokie.phone.connected' || event.name === 'aokie.phone.disconnected') {
       phoneConnected = event.name === 'aokie.phone.connected';
       renderPhoneChip();
+      // Aokie runs (it said so): a status it refused before is asked for now.
+      if (desktopProblem) void refreshPhone();
     }
     await sessions?.desktopEvent(event);
     await callbacks?.event(event);
