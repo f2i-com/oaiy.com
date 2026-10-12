@@ -1041,6 +1041,9 @@ impl QwenEngine {
                     continue;
                 }
                 let Some((_, snap, base)) = self.checkpoints.iter().find(|(saved, _, _)| saved.as_slice() == &keys[..at]) else { continue };
+                if too_large(disk, at, Snapshot::whole_bytes(at, &self.kv, &model.attention_layers), self.log) {
+                    continue;
+                }
                 if let Some(whole) = Snapshot::from_checkpoint(snap, &self.kv, &model.attention_layers, model.backend.as_ref()) {
                     disk.save(keys[..at].to_vec(), Arc::new(whole), *base);
                 }
@@ -1054,6 +1057,9 @@ impl QwenEngine {
                 }
                 let Some((_, snap, base)) = self.checkpoints.iter().find(|(saved, _, _)| saved.as_slice() == &keys[..at]) else { continue };
                 let Some(backend) = self.kv.layer_backends.first().cloned() else { continue };
+                if too_large(disk, at, Snapshot::whole_bytes(at, &self.kv, &rows), self.log) {
+                    continue;
+                }
                 if let Some(whole) = Snapshot::from_checkpoint(snap, &self.kv, &rows, backend.as_ref()) {
                     disk.save(keys[..at].to_vec(), Arc::new(whole), *base);
                 }
@@ -1114,6 +1120,18 @@ fn drafts_most() -> usize {
 /// reply before a tool's answer otherwise (a call's, twice in one call) went back to the base: 768 and 1,010 tokens
 /// read again on the eGPU's 27B, 0.8 and 1.0 s, where they were 30 or so. Its recurrent states are some 150 MB each.
 const KEPT_CHECKPOINTS: usize = 5;
+
+/// Whether a prompt's state at `at` tokens, `bytes` of keys and values, is more than the disk's cache is allowed in all
+/// (said, with `log`): it is then not copied out of the cache and written, where a long conversation's was after
+/// every reply (the 27B's at 80,000 tokens 10 GB, on a computer with 24). The memory's checkpoints still serve the
+/// conversation while the engine runs; a larger `--prompt-cache-gb` keeps such states too.
+fn too_large<S: crate::disk::PromptState>(disk: &crate::disk::DiskCache<S>, at: usize, bytes: u64, log: bool) -> bool {
+    let large = !disk.takes(bytes);
+    if large && log {
+        eprintln!("  Qwen: the prompt's state at {at} tokens ({:.1} GB) is more than the prompt cache's whole allowance: not kept on the disk", bytes as f64 / 1e9);
+    }
+    large
+}
 
 fn trim_checkpoints(checkpoints: &mut Vec<(Vec<u64>, RecurrentSnapshot, bool)>) {
     while checkpoints.len() > 1 && (checkpoints.len() > KEPT_CHECKPOINTS ||

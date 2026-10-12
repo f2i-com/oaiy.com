@@ -181,6 +181,12 @@ impl Snapshot {
     /// once the reply is out, not between the prompt's last tokens: the 27B's keys and values for 2,800 tokens are
     /// some 350 MB, which a card in a Thunderbolt enclosure gave back in a quarter of a second each. `None` where the
     /// checkpoint is not of this cache's shape, or past what it holds.
+    /// The bytes [`Self::from_checkpoint`]'s state takes at `pos` positions, known before it is made: the attention
+    /// layers' keys and values (the recurrent tensors are small beside them).
+    pub fn whole_bytes(pos: usize, kv: &KvCache, attention: &[bool]) -> u64 {
+        attention.iter().enumerate().filter(|&(_, &held)| held).map(|(i, _)| 8 * pos as u64 * (kv.n_kv_heads_per_layer[i] * kv.head_dims[i]) as u64).sum()
+    }
+
     pub fn from_checkpoint(checkpoint: &RecurrentSnapshot, kv: &KvCache, attention: &[bool], backend: &dyn Backend) -> Option<Self> {
         let pos = checkpoint.0.pos;
         if pos == 0 || pos > kv.len || checkpoint.0.layers.len() != attention.len() {
@@ -443,6 +449,10 @@ mod tests {
         kv.len = 7;
         kv.ssm_state[1].as_mut().unwrap().data_mut().fill(97.0);
         let later = Snapshot::from_checkpoint(&checkpoint, &kv, &[true, false], &backend).unwrap();
+        // its size known before it is made: the keys and values, which the rest is little beside
+        let rows: usize = later.layers.iter().flat_map(|l| &l[..2]).flatten().map(|t| 4 * t.numel()).sum();
+        assert_eq!(Snapshot::whole_bytes(3, &kv, &[true, false]), rows as u64);
+        assert_eq!(rows, 2 * 3 * 2 * 4);
         let (mut a, mut b) = (Vec::new(), Vec::new());
         Arc::new(then).encode(&mut a);
         Arc::new(later).encode(&mut b);

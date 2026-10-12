@@ -545,7 +545,9 @@ refused at once as one past any context is (`context_length_exceeded`, "… maxi
 length is 81920 tokens here"), and the Agent compacts the conversation and asks again, where
 the prompt used to fail halfway through for want of room and be answered by this Mac's copy of
 the model. The eGPU's status (`context_tokens`) and `/v1/discovery` report the context the
-engine opened the model with.
+engine opened the model with. A conversation whose state is larger than the prompt cache's
+whole allowance (`prompt_cache_gb`, 4: about 30,000 of the 27B's tokens) is not written to
+the disk after its replies; raise the allowance to have long ones survive a restart.
 
 ### Checked, and not
 

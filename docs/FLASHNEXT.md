@@ -135,7 +135,8 @@ computer's memory alone, where the engine has always kept a copy of it, and the 
   are sized around the resident cache, not the context).
 - **The model's place for it.** The engine's `--ctx` is the context; OAIY gives a model its own on the card
   (Models, the model's *Context on the eGPU*: `llm.models[].egpu_ctx`), so Flash-Next can have 262,144 while a dense
-  27B on the same card keeps the 32,768 that fills the card beside it.
+  27B on the same card has what its cache fits there (it reads every position at every token, so its cache stays on
+  the card, as f16: 81,920 positions beside its weights, which the engine finds as it loads it and keeps to; MAC.md).
 
 On the RTX 4090 beside an M5 Pro with 24 GB (12 October 2026), each answer right:
 
@@ -144,13 +145,23 @@ On the RTX 4090 beside an M5 Pro with 24 GB (12 October 2026), each answer right
 | 12,087 tokens, offloaded at 4,096 (a check against the card's own) | 70 s (61 on the card) | 7.7 tokens/s (6.9) | | |
 | 53,334 tokens | 338 s | 7.7 tokens/s | 4.3 GB | 1.9 GB |
 | 110,794 tokens | 853 s | 7.5 tokens/s | 4.7 GB | 1.3 GB |
+| 197,801 tokens | 1,888 s | 7.3 tokens/s | 4.6 GB | 0.6 GB |
 
 A prompt's chunk takes 4 s near its start and 10 s at 100,000 positions: the experts much as ever, the rest the rows
 streamed up (5 GB a chunk there) and the scores over more blocks. A reply's tokens cost about as they did. The same
 12,087-token request offloaded and on the card agrees at every step to within 0.4 a logit, their texts parting at a
 step where the top three were within 0.05. The CPU's attention is held to the CPU backend's reference in a test.
-The cache in the computer's memory is 54 KB a position in f32 (6 GB at 110,000 positions): macOS compresses it and,
-where memory is short, pages it to the drive, and a step touches 2,048 positions of a layer.
+The cache in the computer's memory is 54 KB a position in f32 (6 GB at 110,000 positions, 10.7 at 198,000): macOS
+compresses it and, where memory is short, pages it to the drive, and a step touches 2,048 positions of a layer. That
+is the drive's part in it, and the system's own: at 198,000 positions the engine held 4.6 GB at most, the rest
+compressed, with a third of the Mac's 24 GB still free. The card's least room there is one layer's rows for the whole
+prompt (0.9 GB at 198,000 positions, 1.2 at the model's 262,144); a card with no room for them runs the prompt on the
+host and says so.
+
+A long conversation's state is not written to the prompt cache on the disk where it alone is more than the cache's
+allowance (`--prompt-cache-gb`, 4 unless said: some 30,000 positions of this model or of the 27B). It was copied in
+memory and written after every reply whatever its size, 10 GB for the 27B at 80,000 tokens. The engine says when it
+leaves one out; the checkpoints in memory serve the conversation as long as the engine runs.
 
 ## Prompt states on the disk
 

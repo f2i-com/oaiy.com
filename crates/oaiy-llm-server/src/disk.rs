@@ -268,6 +268,13 @@ impl<S: PromptState> DiskCache<S> {
     /// Keep `snap`, the state after `keys` (`base`: a system prompt's).
     /// Prefix entries remain useful for branches and re-rendered tool messages;
     /// least recently used entries go when the byte budget is exceeded.
+    /// Whether a state of `bytes` is one the cache has room for at all: its whole budget at most. One larger was
+    /// made and written all the same and kept as the cache's only entry: the 27B's at 80,000 tokens is 10 GB, copied
+    /// in the computer's memory and written out after every reply.
+    pub fn takes(&self, bytes: u64) -> bool {
+        bytes <= self.budget
+    }
+
     pub fn save(&mut self, keys: Vec<u64>, snap: S, base: bool) {
         let path = self.dir.join(format!("{:016x}-{:016x}.{EXT}", self.fingerprint, keys_hash(&keys)));
         let header = header(self.fingerprint, base, &keys);
@@ -323,6 +330,15 @@ mod publication_tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         panic!("cache writer did not finish");
+    }
+
+    #[test]
+    fn a_state_past_the_whole_budget_is_not_one_the_cache_takes() {
+        let dir = directory("takes");
+        let cache: DiskCache<State> = DiskCache::open(&dir, 1, 10000).unwrap();
+        assert!(cache.takes(10000) && cache.takes(1));
+        assert!(!cache.takes(10001));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
