@@ -1087,6 +1087,29 @@ const fileUrl = u => !u || !key ? u : u + (u.includes("?") ? "&" : "?") + "key="
 // Remote control ports need the key on media links too (an <img> sends no header).
 const keyed = jobs => { for (const j of jobs || []) { j.files = (j.files || []).map(fileUrl); j.preview = fileUrl(j.preview); } return jobs; };
 const key = (() => { try { const k = new URLSearchParams(location.search).get("key"); if (k) sessionStorage.setItem("studio-key", k); return sessionStorage.getItem("studio-key") || ""; } catch { return ""; } })();
+// A list's rows kept from one render to the next: each item's markup is one element, known by the item's id, and an
+// element whose markup is what it was stays as it is, in its place. The page reads its state every 1.5 s, and a list
+// written whole each time made every picture in it a new element, loaded and drawn again: the pictures flickered,
+// and a video played under the pointer began again.
+function keepRows(box, items, markup, empty) {
+  if (!items.length) {
+    if (box.dataset.rows !== "none") { box.innerHTML = empty; box.dataset.rows = "none"; }
+    return;
+  }
+  if (box.dataset.rows !== "some") { box.innerHTML = ""; box.dataset.rows = "some"; }
+  const had = new Map([...box.children].map(el => [el.dataset.row, el]));
+  const want = items.map(item => {
+    const id = String(item.id), html = markup(item).trim(), was = had.get(id);
+    if (was && was.rowMarkup === html) return was;
+    const made = document.createElement("template");
+    made.innerHTML = html;
+    const el = made.content.firstElementChild;
+    el.dataset.row = id; el.rowMarkup = html;
+    return el;
+  });
+  want.forEach((el, i) => { if (box.children[i] !== el) box.insertBefore(el, box.children[i] || null); });
+  while (box.children.length > want.length) box.lastElementChild.remove();
+}
 
 async function api(path, opts = {}) {
   const headers = Object.assign({}, opts.body ? {"Content-Type": "application/json"} : {}, key ? {Authorization: "Bearer " + key} : {});
@@ -1790,10 +1813,10 @@ function renderState() {
     + `<div class="endpoint"><span class="muted">Base URL</span><code>${esc(state.gateway_url)}/v1</code><button class="btn quiet" data-copy="${esc(state.gateway_url)}/v1">Copy</button></div>`;
   $$("[data-copy]").forEach(b => b.onclick = () => navigator.clipboard.writeText(b.dataset.copy).then(() => toast("Copied")));
   const jobs = state.media.jobs.slice(0, 8);
-  $("#ov-jobs").innerHTML = jobs.length ? jobs.map(j => `<div class="job">${j.preview ? `<img src="${esc(j.preview)}" alt="" loading="lazy" data-job="${esc(j.id)}">` : '<div class="ph"></div>'}
+  keepRows($("#ov-jobs"), jobs, j => `<div class="job">${j.preview ? `<img src="${esc(j.preview)}" alt="" data-job="${esc(j.id)}">` : '<div class="ph"></div>'}
     <div><div class="p">${esc(j.prompt || (j.kind === "model3d" ? "3D model" : ""))}</div><div class="muted small">${esc(j.model)}, ${esc(j.size)}, ${statusText(j)}</div></div>
-    <div class="row">${j.status === "in_progress" || j.status === "queued" ? `<button class="btn quiet warn" data-cancel="${j.id}">Cancel</button>` : j.files[0] ? `<a class="btn quiet" href="${esc(j.files[0])}" target="_blank">Open</a>` : ""}</div></div>`).join("")
-    : '<div class="empty">Nothing generated yet. Try the Playground.</div>';
+    <div class="row">${j.status === "in_progress" || j.status === "queued" ? `<button class="btn quiet warn" data-cancel="${j.id}">Cancel</button>` : j.files[0] ? `<a class="btn quiet" href="${esc(j.files[0])}" target="_blank">Open</a>` : ""}</div></div>`,
+    '<div class="empty">Nothing generated yet. Try the Playground.</div>');
   $$("#ov-jobs img[data-job]").forEach(img => img.onclick = () => openViewer(img.dataset.job));
   const all = [...state.media.jobs, ...priv];
   const now = all.find(j => j.status === "in_progress") || all.find(j => j.status === "queued");
@@ -2401,7 +2424,7 @@ function renderGallery(fresh) {
   const pick = {all: () => true, image: j => j.kind === "image", video: j => j.kind === "video", speech: j => j.kind === "speech", music: j => j.kind === "music", sound: j => j.kind === "sound", model3d: j => j.kind === "model3d",
     active: j => j.status === "in_progress" || j.status === "queued", failed: j => j.status === "failed"}[galleryFilter];
   const items = galleryJobs.filter(pick);
-  $("#gallery").innerHTML = items.length ? items.map(j => {
+  keepRows($("#gallery"), items, j => {
     const done = j.status === "completed";
     const media = !done ? `<div class="fail" style="color:${j.status === "failed" ? "var(--bad)" : "var(--muted)"}">${statusText(j)}</div>`
       : j.kind === "video" ? `<video src="${esc(j.files[0] || "")}" poster="${esc(j.preview || "")}" muted loop playsinline preload="none" onmouseenter="this.play()" onmouseleave="this.pause()"></video>`
@@ -2412,7 +2435,7 @@ function renderGallery(fresh) {
       : j.kind === "model3d" ? (j.preview ? `<img src="${esc(j.preview)}" alt="3D model" loading="lazy">` : `<div class="audio-card"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M4 7.5l8 4.5 8-4.5M12 12v9"/></svg></div>`)
       : `<img src="${esc(j.preview || j.files[0] || "")}" alt="${esc(j.prompt)}" loading="lazy">`;
     return `<figure data-job="${j.id}">${media}<figcaption><span class="p">${esc(j.kind === "model3d" ? "3D model" : j.prompt.slice(0, 60))}</span><span>${esc(j.kind === "model3d" ? j.size : j.kind === "video" || j.kind === "speech" || j.kind === "music" || j.kind === "sound" ? (j.seconds ? j.seconds.toFixed(1) + " s" : j.kind) : (j.files.length > 1 ? j.files.length + " images" : j.size))}</span></figcaption></figure>`;
-  }).join("") : '<div class="empty">Nothing here yet. Generate something in the Playground.</div>';
+  }, '<div class="empty">Nothing here yet. Generate something in the Playground.</div>');
   $$("#gallery figure").forEach(f => f.onclick = () => openViewer(f.dataset.job));
 }
 $$("#gallery-filter button").forEach(b => b.onclick = () => { galleryFilter = b.dataset.f; $$("#gallery-filter button").forEach(x => x.setAttribute("aria-pressed", x === b)); renderGallery(); });
