@@ -126,6 +126,13 @@ describe('speaking what the agent writes', () => {
     expect(promisesBooking("I'm doing well, thanks! Let me just get that Friday booked in for you.")).toBe(true);
     expect(promisesBooking('Let me just double-check that date for you.')).toBe(false);
     expect(promisesBooking('Let me get you some information about what we do.')).toBe(false);
+    expect(promisesBooking('Let me get you down for Friday at two.')).toBe(true);
+    // a message taken, or the caller put in touch, is not a booking promised
+    expect(promisesBooking('Sure, let me note that for the owner.')).toBe(false);
+    expect(promisesBooking('Let me note your message for the team.')).toBe(false);
+    expect(promisesBooking('Let me get you in touch with the owner.')).toBe(false);
+    expect(promisesBooking('Let me get that message down for the owner.')).toBe(false);
+    expect(promisesBooking("I'll pass your message on to the owner.")).toBe(false);
   });
 
   it('a reply in quotation marks is said without them', () => {

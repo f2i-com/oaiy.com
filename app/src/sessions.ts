@@ -625,7 +625,12 @@ export function promisesBooking(text: string): boolean {
   const t = text.trim();
   // Asking, or offering on a condition ("tell me a time and I'll take it as a request"), is not a promise.
   if (!t || /\?\s*$/.test(t) || /\b(if|tell me|let me know|would you like|what day|what time|which day|when would)\b/i.test(t)) return false;
-  return /\b(i['’]ll|i will|i['’]ve|i have|i['’]m going to|let me)\s+(just\s+)?(request|book|note|pencil|lock|put (you|it|that|this|them) (in|down)|get (you|it|that|this|them)\b[^.?!]{0,30}?\b(in|down|booked|requested)\b)/i.test(t);
+  // Taking a message, or putting the caller in touch, is not a booking: "Let me get that message down for the owner".
+  if (/\b(message|in touch)\b/i.test(t)) return false;
+  const booking = String.raw`(just\s+)?(request|book|pencil|lock|put (you|it|that|this|them) (in|down)|get (you|it|that|this|them)\b[^.?!]{0,30}?\b(in|down|booked|requested)\b)`;
+  // "Let me…" says what is about to be done, booking or not: only a booking's own words count after it, so "let me
+  // note that for the owner" is a message taken, while "I'll note…" and "I've noted…" tell of a booking.
+  return new RegExp(String.raw`\b(i['’]ll|i will|i['’]ve|i have|i['’]m going to)\s+(just\s+)?note|\b(i['’]ll|i will|i['’]ve|i have|i['’]m going to|let me)\s+${booking}`, 'i').test(t);
 }
 
 /** Whether the caller has said when they want to come: a day, a date or a time. */
@@ -634,7 +639,7 @@ export function namesATime(turns: Turn[]): boolean {
 }
 
 /** What a call's agent is told when it promised a booking without requesting it. */
-const BOOKING_NUDGE = "[OAIY] You said you would book it, but nothing is recorded: request_appointment was not called, or it was refused (its answer says why). Call it now, or first ask the caller what its answer says to check. Then tell them it is requested.";
+const BOOKING_NUDGE = "[OAIY] You said you would book it, but nothing is recorded: request_appointment was not called, or it was refused (its answer says why). Call it now, or, where its answer says something must be checked with the caller first, ask them that. Then tell them it is requested.";
 
 /** How long a tool may run on a call before a short line is said, and the line. */
 const HOLD_AFTER_MS = 2_000;
