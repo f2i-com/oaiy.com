@@ -45,12 +45,19 @@ export function copyBridge(dir) {
  * never loads (and Scene3D refuses a model's data: URL anyway). In the file
  * that receives the app, these edits add glTF models to the runtime's list of
  * asset types and make their URLs blob: URLs, which Scene3D accepts. Each is
- * [the runtime's code, as it reads, and what it becomes]; the code is matched
- * exactly, and a release that words it differently is left as it is.
+ * [the runtime's code, as a pattern that takes any of its minifier's names, what
+ * it becomes, and a piece of the edit that says it is made]; the code must be
+ * found once, and a release that words it otherwise is left as it is, and said so
+ * (v0.0.20 named a variable `s` that v0.0.19 named `c`).
  */
+const ID = '[\\w$]+';
 const MODEL_ASSETS = [
-  ['woff2:`font/woff2`}', 'woff2:`font/woff2`,glb:`model/gltf-binary`,gltf:`model/gltf+json`}'],
-  ['c.set(t,`data:${e};base64,${n}`)', 'c.set(t,/^model\\//.test(e)?URL.createObjectURL(new Blob([Uint8Array.from(atob(n),e=>e.charCodeAt(0))],{type:e})):`data:${e};base64,${n}`)'],
+  [/woff2:`font\/woff2`\}/g, () => 'woff2:`font/woff2`,glb:`model/gltf-binary`,gltf:`model/gltf+json`}', 'glb:`model/gltf-binary`'],
+  [
+    new RegExp(`(${ID})\\.set\\((${ID}),\`data:\\$\\{(${ID})\\};base64,\\$\\{(${ID})\\}\`\\)`, 'g'),
+    (_, map, key, type, b64) => `${map}.set(${key},/^model\\//.test(${type})?URL.createObjectURL(new Blob([Uint8Array.from(atob(${b64}),c=>c.charCodeAt(0))],{type:${type}})):\`data:\${${type}};base64,\${${b64}}\`)`,
+    'URL.createObjectURL(new Blob([Uint8Array.from(atob(',
+  ],
 ];
 
 /** Lets a SoftN app's Scene3D load a 3D model from its assets/ folder (see MODEL_ASSETS). */
@@ -61,9 +68,12 @@ function allowModelAssets(dir) {
     if (!name.endsWith('.js')) continue;
     const file = join(assets, name);
     const code = readFileSync(file, 'utf8');
-    if (!code.includes('formlogic:init') || MODEL_ASSETS.every(([, to]) => code.includes(to))) continue;
-    if (!MODEL_ASSETS.every(([from]) => code.split(from).length === 2)) continue;
-    writeFileSync(file, MODEL_ASSETS.reduce((text, [from, to]) => text.replace(from, () => to), code));
+    if (!code.includes('formlogic:init') || MODEL_ASSETS.every(([, , made]) => code.includes(made))) continue;
+    if (!MODEL_ASSETS.every(([from]) => (code.match(from) ?? []).length === 1)) {
+      console.warn(`softn-bridge: ${name} does not read as the edits for 3D models expect: a SoftN app's Scene3D cannot load a model from its assets in the preview`);
+      continue;
+    }
+    writeFileSync(file, MODEL_ASSETS.reduce((text, [from, to]) => text.replace(from, to), code));
   }
 }
 

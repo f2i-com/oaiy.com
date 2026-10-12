@@ -5,7 +5,7 @@ OAIY's sandbox gives guest programs synchronous file and network access (Node's 
 ## Status
 
 The bridge is in ZIPP since v0.0.22 (`crates/zipp-wasm`, with the boundary check `tests/node/app-bridge.cjs`), and
-OAIY installs that release (`scripts/fetch-zipp.mjs`).
+OAIY installs v0.0.23 (`scripts/fetch-zipp.mjs`).
 
 The sandbox Worker feature-detects `Engine.prototype.setAppBridge`.
 
@@ -14,13 +14,14 @@ The sandbox Worker feature-detects `Engine.prototype.setAppBridge`.
 - **An engine without it** (v0.0.21 and earlier) has the same calls ride the synchronous `localStorage.getItem`
   bridge with a reserved key prefix. Ordinary `localStorage` keys stay inert. The tunnel stays as the fallback.
 
-Both paths passed `tests/e2e/run.mjs`: the tunnel on v0.0.21, the bridge on v0.0.22 (11 October 2026).
+Both paths passed `tests/e2e/run.mjs`: the tunnel on v0.0.21, the bridge on v0.0.22 (11 October 2026) and on
+v0.0.23 (13 October 2026).
 
 SoftN's hosted runtime is another matter: it takes the engine's module from the Agent and binds it with the
 bindings of the ZIPP release it was built with, so it is given that release's module and not necessarily the Agent's
 (`softnZippBytes` in `src/preview/preview.ts`: the Agent's own when the runtime's manifest names the same module, else
-the copy the runtime carries). SoftN v0.0.18 was built with ZIPP v0.0.21; v0.0.19, which OAIY installs
-(`scripts/fetch-softn.mjs`), with v0.0.22, the Agent's own, so the two share one module.
+the copy the runtime carries). SoftN v0.0.18 was built with ZIPP v0.0.21, v0.0.19 with v0.0.22; v0.0.20, which OAIY
+installs (`scripts/fetch-softn.mjs`), with v0.0.23, the Agent's own, so the two share one module.
 
 ## The API (zipp-wasm)
 

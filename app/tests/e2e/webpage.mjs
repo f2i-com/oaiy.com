@@ -106,6 +106,24 @@ const colouredQuarters = (path) =>
     return quarters;
   }, path);
 
+/** How many pixels of a saved screenshot are clearly red, and clearly cyan, read in the page. */
+const redAndCyan = (path) =>
+  page.evaluate(async (path) => {
+    const bitmap = await createImageBitmap(new Blob([window.harness.read(path)], { type: 'image/png' }));
+    const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(bitmap, 0, 0);
+    const { data } = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
+    let red = 0;
+    let cyan = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      const [r, g, b] = [data[i], data[i + 1], data[i + 2]];
+      if (r - Math.max(g, b) > 60) red++;
+      if (Math.min(g, b) - r > 60) cyan++;
+    }
+    return { red, cyan };
+  }, path);
+
 /** A PNG's width and height, from its header. */
 const pngSize = (bytes) => [bytes[16] * 2 ** 24 + bytes[17] * 2 ** 16 + bytes[18] * 256 + bytes[19], bytes[20] * 2 ** 24 + bytes[21] * 2 ** 16 + bytes[22] * 256 + bytes[23]];
 
@@ -348,6 +366,10 @@ await check('a SoftN app shows a 3D model from its assets in a Scene3D, and its 
   writeFileSync(join(shots, 'scene3d.png'), Buffer.from(await page.evaluate(() => Array.from(window.harness.read('shots/scene3d.png')))));
   const quarters = await colouredQuarters('shots/scene3d.png');
   expect(quarters.reduce((a, b) => a + b) > 3000, `coloured pixels: ${quarters.join(', ')}`);
+  // The cube's own faces, red (+z) and cyan (+y), face the camera: Scene3D's stand-in for a model it could not
+  // load is one flat colour.
+  const faces = await redAndCyan('shots/scene3d.png');
+  expect(faces.red > 1000 && faces.cyan > 1000, `the model's faces are not in the screenshot (red ${faces.red}, cyan ${faces.cyan} pixels)`);
 });
 
 console.log(`\nscreenshots in ${shots}`);
