@@ -125,6 +125,16 @@ input[type=checkbox] { accent-color: var(--gpu); width: 16px; height: 16px; }
 input[type=range] { width: 100%; accent-color: var(--gpu); }
 .check { display: flex; gap: 8px; align-items: center; font-size: 13px; cursor: pointer; }
 .grid-f { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(170px, 100%), 1fr)); gap: 14px; }
+/* Each field of a grid is three rows of the grid itself (subgrid): its name, its box and a help line under it,
+   so the boxes in a line of fields start level whatever their names wrap to, and a name sits on its box. Every
+   field spans the three (a check's name is empty): one that spanned fewer would leave a row a later field
+   could be put in. A box keeps its own height (a textarea beside it does not stretch it). */
+.grid-f { row-gap: 0; }
+.grid-f > .f { display: grid; grid-row: span 3; grid-template-rows: subgrid; grid-template-columns: minmax(0, 1fr); row-gap: 5px; margin-bottom: 14px; align-content: normal; }
+.grid-f > .f > :first-child { align-self: end; }
+.grid-f > .f > :not(:first-child) { align-self: start; }
+.grid-f > .f > .check { align-self: center; }
+.f > .help { color: var(--faint); font-size: 11.5px; line-height: 1.45; }
 .pathfield { display: flex; gap: 6px; min-width: 0; } .pathfield input { font: 12px var(--code); min-width: 0; }
 .seg { display: inline-flex; border: 1px solid var(--line-2); border-radius: var(--r); overflow: hidden; max-width: 100%; }
 .seg button { all: unset; cursor: pointer; padding: 6px 13px; color: var(--muted); font: 500 13px var(--display); letter-spacing: .02em; }
@@ -619,7 +629,7 @@ dialog::backdrop { background: var(--backdrop); }
               </div>
               <details><summary>More options</summary>
                 <div class="grid-f" style="grid-template-columns:1fr">
-                  <label class="f"><span>Steps (empty = the model's default)</span><input type="number" id="img-steps" min="2" max="100" placeholder="auto"></label>
+                  <label class="f"><span>Steps</span><input type="number" id="img-steps" min="2" max="100" placeholder="auto"><small class="help">Empty = the model's default.</small></label>
                   <label class="f"><span>Negative prompt (SDXL)</span><input type="text" id="img-neg" placeholder="blurry, low quality"></label>
                 </div>
               </details>
@@ -902,22 +912,22 @@ dialog::backdrop { background: var(--backdrop); }
             <option value="llm_all">Language model on every GPU; media pauses it</option>
             <option value="custom">Custom</option></select></label>
           <div class="f"><span class="small muted">Language model GPUs</span><div class="row" id="llm-devices"></div></div>
-          <label class="f"><span>Media GPU (images, video, speech, music, sound effects, 3D models)</span><select id="media-device"></select></label>
+          <label class="f"><span>Media GPU</span><select id="media-device"></select><small class="help">Images, video, speech, music, sound effects and 3D models.</small></label>
           <label class="f"><span>When media needs the LLM's GPU</span><select id="llm-policy">
             <option value="auto">Pause the LLM only if they share a GPU</option>
             <option value="pause_llm">Always pause the LLM</option>
             <option value="coexist">Never pause (both fit)</option></select></label>
-          <label class="check" style="align-self:end"><input type="checkbox" id="resume-llm"> Restart the LLM after media jobs</label>
+          <div class="f"><span></span><label class="check"><input type="checkbox" id="resume-llm"> Restart the LLM after media jobs</label></div>
         </div>
         <p class="muted small" id="share-note"></p>
       </div>
       <div class="block">
         <h2>Language model memory</h2>
         <div class="grid-f">
-          <label class="f"><span>RAM expert cache (GB, 0 = 80% of free)</span><input type="number" min="0" id="llm-ram" data-bind="llm.ram_gb" data-type="int"></label>
+          <label class="f"><span>RAM expert cache (GB)</span><input type="number" min="0" id="llm-ram" data-bind="llm.ram_gb" data-type="int"><small class="help">0 = 80% of the free memory.</small></label>
           <label class="f"><span>VRAM headroom (GB)</span><input type="number" min="0" step="0.5" id="llm-headroom" data-bind="llm.vram_headroom_gb" data-type="num"></label>
-          <label class="f"><span>CPU threads for missed experts (empty = all cores)</span><input type="number" min="0" data-bind="llm.cpu_threads" data-type="intnull" placeholder="all cores"></label>
-          <label class="f"><span>Stop when idle (minutes, 0 = never)</span><input type="number" min="0" data-bind="llm.idle_stop_minutes" data-type="int"></label>
+          <label class="f"><span>CPU threads for missed experts</span><input type="number" min="0" data-bind="llm.cpu_threads" data-type="intnull" placeholder="all cores"><small class="help">Empty = all cores.</small></label>
+          <label class="f"><span>Stop when idle (minutes)</span><input type="number" min="0" data-bind="llm.idle_stop_minutes" data-type="int"><small class="help">0 = never.</small></label>
         </div>
         <p class="muted small">Mixture-of-experts models keep their shared weights on the GPU, cache hot experts in VRAM and RAM, and read the rest from the SSD a token at a time.</p>
       </div>
@@ -932,9 +942,9 @@ dialog::backdrop { background: var(--backdrop); }
         <div class="grid-f">
           <label class="f"><span>Listen address</span><input type="text" data-bind="gateway.host" placeholder="127.0.0.1"></label>
           <label class="f"><span>Port</span><input type="number" data-bind="gateway.port" data-type="int"></label>
-          <label class="f"><span>API key (empty = none)</span><input type="password" data-bind="gateway.api_key" autocomplete="off"></label>
+          <label class="f"><span>API key</span><input type="password" data-bind="gateway.api_key" autocomplete="off"><small class="help">Empty = none.</small></label>
           <label class="f"><span>Public URL for file links</span><input type="text" data-bind="gateway.public_url" placeholder="http://my-pc:8080"></label>
-          <label class="f"><span>Allowed web origins (one per line, * for any)</span><textarea data-bind="gateway.cors_origins" data-type="lines" rows="2" placeholder="http://localhost:3000"></textarea></label>
+          <label class="f"><span>Allowed web origins</span><textarea data-bind="gateway.cors_origins" data-type="lines" rows="2" placeholder="http://localhost:3000"></textarea><small class="help">One per line, * for any.</small></label>
         </div>
         <p class="muted small">Web pages can reach this port too, so without an API key, browser requests are refused unless their origin is listed. Apps, scripts and SDKs outside a browser are unaffected.</p>
         <p class="muted small">Use 0.0.0.0 to serve your network, and set an API key when you do. Address changes apply the next time the studio starts.</p>
@@ -960,18 +970,18 @@ dialog::backdrop { background: var(--backdrop); }
       <div class="block">
         <h2>Language model</h2>
         <div class="grid-f">
-          <label class="f"><span>Context (tokens; 0 = the engine's choice: up to 65,536 where the GPUs have room for it, 16,384 at least. A number set here is used whatever the memory)</span><input type="number" min="0" data-bind="llm.ctx" data-type="int"></label>
+          <label class="f"><span>Context (tokens)</span><input type="number" min="0" data-bind="llm.ctx" data-type="int"><small class="help">0 = the engine's choice: up to 65,536 where the GPUs have room for it, 16,384 at least. A number set here is used whatever the memory.</small></label>
           <label class="f"><span>Reply limit (tokens)</span><input type="number" data-bind="llm.max_tokens" data-type="int"></label>
           <label class="f"><span>Temperature</span><input type="number" step="0.05" data-bind="llm.temperature" data-type="num"></label>
           <label class="f"><span>Top-p</span><input type="number" step="0.01" data-bind="llm.top_p" data-type="num"></label>
-          <label class="f"><span>Repeat penalty (1 = off; 1.1 stops a reply looping on a phrase)</span><input type="number" step="0.05" min="1" max="2" data-bind="llm.repeat_penalty" data-type="num"></label>
+          <label class="f"><span>Repeat penalty</span><input type="number" step="0.05" min="1" max="2" data-bind="llm.repeat_penalty" data-type="num"><small class="help">1 = off; 1.1 stops a reply looping on a phrase.</small></label>
           <label class="f"><span>Prompt cache on disk (GB)</span><input type="number" step="0.5" data-bind="llm.prompt_cache_gb" data-type="num"></label>
-          <label class="f"><span>Flash-Next: conversations set aside in RAM (GB, 0 = off, empty = the server's default)</span><input type="number" step="0.5" min="0" data-bind="llm.park_gb" data-type="numnull" placeholder="8"></label>
+          <label class="f"><span>Conversations in RAM (GB)</span><input type="number" step="0.5" min="0" data-bind="llm.park_gb" data-type="numnull" placeholder="8"><small class="help">Flash-Next sets conversations aside there. 0 = off, empty = the server's default.</small></label>
           <label class="f"><span>Runs on</span><select data-bind="llm.backend">
             <option value="auto">Auto: a GPU (WebGPU), else the CPU</option>
             <option value="webgpu">WebGPU (any GPU)</option>
             <option value="cpu">CPU only</option></select></label>
-          <label class="f"><span>WebGPU weights (GB, empty = by the GPU's memory)</span><input type="number" min="0" data-bind="llm.webgpu_gb" data-type="intnull" placeholder="a card's memory less 4, a Mac's share"></label>
+          <label class="f"><span>WebGPU weights (GB)</span><input type="number" min="0" data-bind="llm.webgpu_gb" data-type="intnull" placeholder="a card's memory less 4, a Mac's share"><small class="help">Empty = by the GPU's memory.</small></label>
         </div>
         <p class="muted small">WebGPU runs every model on any Direct3D 12, Vulkan or Metal GPU: weights past the limit stay in RAM and run on the CPU. A Mac's own GPU shares the computer's memory: left empty, it holds what a card with two thirds of that memory would.</p>
         <div class="row" style="margin-top:14px; gap:22px">
@@ -987,8 +997,8 @@ dialog::backdrop { background: var(--backdrop); }
         <h2>eGPU through tinygrad</h2>
         <p class="muted small" style="margin-top:0">macOS has no driver for a graphics card in a Thunderbolt enclosure, so OAIY's own engine cannot see one. tinygrad can, through its TinyGPU app. With that set up, a model ticked "On the eGPU" under Models is answered by tinygrad's server on the card, and by this Mac's own GPU whenever the card is not there. It holds one model at a time, reads GGUF files, and answers chats: a request with a picture goes to this Mac's engine.</p>
         <div class="grid-f" style="grid-template-columns:1fr">
-          <label class="f"><span>Python that has tinygrad (empty = look for one)</span><div class="pathfield"><input type="text" data-bind="llm.egpu.python" placeholder="/opt/homebrew/bin/python3"><button class="btn" type="button" data-pick="llm.egpu.python">Browse</button></div></label>
-          <label class="f"><span>tinygrad folder (a checkout that is not installed; else empty)</span><div class="pathfield"><input type="text" data-bind="llm.egpu.tinygrad" placeholder="/Users/you/tinygrad"><button class="btn" type="button" data-pick="llm.egpu.tinygrad" data-dir="1">Browse</button></div></label>
+          <label class="f"><span>Python that has tinygrad</span><div class="pathfield"><input type="text" data-bind="llm.egpu.python" placeholder="/opt/homebrew/bin/python3"><button class="btn" type="button" data-pick="llm.egpu.python">Browse</button></div><small class="help">Empty = look for one.</small></label>
+          <label class="f"><span>tinygrad folder</span><div class="pathfield"><input type="text" data-bind="llm.egpu.tinygrad" placeholder="/Users/you/tinygrad"><button class="btn" type="button" data-pick="llm.egpu.tinygrad" data-dir="1">Browse</button></div><small class="help">A checkout that is not installed; else empty.</small></label>
         </div>
         <div class="grid-f" style="margin-top:12px">
           <label class="f"><span>Card</span><select data-bind="llm.egpu.device" id="egpu-device">
@@ -997,7 +1007,7 @@ dialog::backdrop { background: var(--backdrop); }
           <label class="f" title="tinygrad's own LLM server, or OAIY's engine run on the card over WebGPU through tinygrad (NVIDIA only; NVIDIA's compiler in Docker, as tinygrad's setup puts it): every model OAIY runs, and a 27B model about ten times as fast"><span>Engine on the card</span><select data-bind="llm.egpu.engine" id="egpu-engine">
             <option value="tinygrad">tinygrad's LLM server</option>
             <option value="webgpu">OAIY's own, over WebGPU (NVIDIA)</option></select></label>
-          <label class="f"><span>Context (tokens; the card's memory for it is taken at the start)</span><input type="number" min="512" step="1024" data-bind="llm.egpu.ctx" data-type="intnull" placeholder="8192"></label>
+          <label class="f"><span>Context (tokens)</span><input type="number" min="512" step="1024" data-bind="llm.egpu.ctx" data-type="intnull" placeholder="8192"><small class="help">The card's memory for it is taken at the start.</small></label>
           <label class="f"><span>When the card is not there, answer with</span><select data-bind="llm.egpu.fallback_model" id="egpu-fallback"></select></label>
         </div>
         <div class="row" style="margin-top:14px; gap:14px; align-items:center">
@@ -1016,11 +1026,11 @@ dialog::backdrop { background: var(--backdrop); }
         <h2>Programs and folders</h2>
         <div class="grid-f" style="grid-template-columns:1fr">
           <label class="f"><span>oaiy-llm-server</span><div class="pathfield"><input type="text" data-bind="llm.server"><button class="btn" type="button" data-pick="llm.server">Browse</button></div></label>
-          <label class="f"><span>oaiy-llm-server-webgpu (the same server's other name: used when the one above is not there)</span><div class="pathfield"><input type="text" data-bind="llm.server_webgpu"><button class="btn" type="button" data-pick="llm.server_webgpu">Browse</button></div></label>
+          <label class="f"><span>oaiy-llm-server-webgpu</span><div class="pathfield"><input type="text" data-bind="llm.server_webgpu"><button class="btn" type="button" data-pick="llm.server_webgpu">Browse</button></div><small class="help">The same server's other name: used when the one above is not there.</small></label>
           <label class="f"><span>oaiy-media</span><div class="pathfield"><input type="text" data-bind="media.worker"><button class="btn" type="button" data-pick="media.worker">Browse</button></div></label>
           <label class="f"><span>FFmpeg</span><div class="pathfield"><input type="text" data-bind="media.video.ffmpeg"><button class="btn" type="button" data-pick="media.video.ffmpeg">Browse</button></div></label>
           <label class="f"><span>Output folder</span><div class="pathfield"><input type="text" data-bind="media.output_dir"><button class="btn" type="button" data-pick="media.output_dir" data-dir="1">Browse</button></div></label>
-          <label class="f"><span>Extra oaiy-llm-server arguments (one per line)</span><textarea data-bind="llm.extra_args" data-type="lines" rows="2"></textarea></label>
+          <label class="f"><span>Extra oaiy-llm-server arguments</span><textarea data-bind="llm.extra_args" data-type="lines" rows="2"></textarea><small class="help">One per line.</small></label>
         </div>
       </div>
       <div class="block">
@@ -1634,7 +1644,7 @@ function renderMemory() {
       <div class="grid-f" style="margin-top:6px">
         <label class="f"><span>VRAM cap <b class="num" id="${kind}-vram-v">${s.vram_gb == null ? "free VRAM" : s.vram_gb + " GB"}</b></span><input type="range" min="0" max="${Math.round(gpuTotalGb(cfg.media.device))}" value="${s.vram_gb ?? Math.round(vcap)}" id="${kind}-vram"></label>
         <label class="f"><span>RAM for weights <b class="num" id="${kind}-ram-v">${s.ram_gb ?? 32} GB</b></span><input type="range" min="0" max="${Math.max(8, Math.round((state?.ram_total_mb || sys?.ram?.total_mb || 65536) / 1024))}" value="${s.ram_gb ?? 32}" id="${kind}-ram"></label>
-        <label class="check" style="align-self:end"><input type="checkbox" id="${kind}-vram-auto" ${s.vram_gb == null ? "checked" : ""}> Use whatever VRAM is free</label>
+        <div class="f"><span></span><label class="check"><input type="checkbox" id="${kind}-vram-auto" ${s.vram_gb == null ? "checked" : ""}> Use whatever VRAM is free</label></div>
       </div>`;
     segment($("#seg-" + kind), s.memory || "auto", v => { s.memory = v; renderMemory(); touch(); });
     $("#" + kind + "-vram").oninput = e => { s.vram_gb = +e.target.value; $("#" + kind + "-vram-auto").checked = false; renderStripOnly(kind); touch(); };
