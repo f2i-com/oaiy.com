@@ -991,8 +991,9 @@ impl QwenEngine {
             // A run that repeats without end (a list's same item again and again): the model picks another token
             // than the run's next, at the run's comma or line end where it has one (a list's place to close) and
             // anywhere once a whole turn has passed with none. Each time halves what the next run is let be. A reply
-            // turned so `TURNS` times is stopped, as is one whose rows are the model's pick alone (a greedy request's:
-            // there is no other token to take).
+            // turned so `TURNS` times is stopped. A greedy request's rows near a run's limit are read back whole
+            // (`CycleGuard::near`, below), so it is turned as another is; one whose row is still the model's pick
+            // alone (no other token to take) is stopped.
             if let Some(cycle) = cycles.over(next, turned).filter(|_| self.cycles) {
                 if cycle.past >= cycle.period || tok.decode(&[next]).contains([',', ';', '\n']) {
                     let other = if turned < TURNS { logits.sample_but(next, &job.sampling, &mut rng) } else { None };
@@ -1042,6 +1043,9 @@ impl QwenEngine {
                 logits = after;
                 drafts_taken += 1;
             } else {
+                // (a greedy request's next rows read back whole where a run nears its limit, for the guard to have
+                // another token to take than the run's: the model's pick alone has none)
+                let pick = greedy && !(self.cycles && cycles.near(turned, 16));
                 // its drafts, then the token and them in one check; else the token alone
                 let checked = drafter.filter(|_| self.kv.len + 1 + drafts_most() <= self.kv.max_len).and_then(|m| {
                     let recent: Vec<u32> = self.covered[self.covered.len().saturating_sub(m.draft_window())..].iter().map(|&k| k as u32).chain([next]).collect();
@@ -1052,7 +1056,7 @@ impl QwenEngine {
                     let drafts = drafts?;
                     let rows: Vec<u32> = std::iter::once(next).chain(drafts.iter().copied()).collect();
                     let began = std::time::Instant::now();
-                    let picked = if greedy { m.check_picks(&rows, &mut self.kv) } else { None };
+                    let picked = if pick { m.check_picks(&rows, &mut self.kv) } else { None };
                     let checked: Option<Vec<Row>> = match picked {
                         Some(tokens) => Some(tokens.into_iter().map(Row::Pick).collect()),
                         None => m.check(&rows, &mut self.kv).map(|l| l.into_iter().map(Row::Logits).collect()),
@@ -1070,7 +1074,7 @@ impl QwenEngine {
                         pending = drafts.into_iter().zip(rows).collect();
                     }
                     None => {
-                        logits = match if greedy { hybrid.step_pick(next, &mut self.kv) } else { None } {
+                        logits = match if pick { hybrid.step_pick(next, &mut self.kv) } else { None } {
                             Some(token) => Row::Pick(token),
                             None => {
                                 let embeds = hybrid.embed(&[next])?;

@@ -263,7 +263,9 @@ mod tests {
         let error = reply.error.expect("stopped");
         assert!(error.contains(crate::repetition::CODE) && error.contains("repeating the same 5 tokens"), "{error}");
         assert_eq!(reply.words.iter().filter(|&&w| w == 50).count(), 3, "turned three times first");
-        assert!(reply.words.len() < 4 * 600, "{} words", reply.words.len());
+        // (each turn halves the next run's limit: stopped within twice the first, where 20,000 were asked for)
+        let limit = crate::repetition::CycleGuard::limit(run.len());
+        assert!(reply.words.len() < 2 * limit + 4 * run.len(), "{} words", reply.words.len());
         // and the engine answers the next request (the state the stopped one left is not taken for a whole one)
         let e = Engine::start_stuck(&run, 50, true);
         assert!(e.ask(&prompt, 20_000).error.is_some());

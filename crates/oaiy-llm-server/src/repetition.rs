@@ -63,11 +63,25 @@ impl CycleGuard {
     /// The longest period watched.
     pub const MOST: usize = 64;
 
-    /// The tokens a run of `period` may be before it is taken for one without end: 64 of its turns and 512 tokens at
-    /// least (some 73 of a seven-token item), or 3,072 tokens of a run of one to three tokens, which data is made of
-    /// (`0,` in a map of 1,500 cells).
+    /// The tokens a run of `period` may be before it is taken for one without end: 128 of its turns and 2,048 tokens
+    /// at least, or 4,096 tokens of a run of one to three tokens. What a reply means to write repeats for that long:
+    /// a CSV of 200 rows the same (six tokens a row: 1,200; at 512 tokens, the limit this had first, it was refused
+    /// after 85 of them), a map's 41-token row 128 times over, `0,` in a map of 2,000 cells. A run without end (the
+    /// 27B's `{"key":"ArrowRight"},` toward the reply's 64,000 tokens) is still turned within the first few thousand.
     pub fn limit(period: usize) -> usize {
-        if period <= 3 { 3072 } else { (64 * period).max(512) }
+        if period <= 3 { 4096 } else { (128 * period).max(2048) }
+    }
+
+    /// Whether a run is within `margin` tokens of its limit, so that [`Self::over`] may soon say so of a token: a
+    /// greedy request's rows are then read back whole, as the model's pick alone (made on its GPU) leaves no other
+    /// token to take, and the reply would be stopped where it could have been turned. `margin` covers the rows a
+    /// check of drafts made before this was asked.
+    pub fn near(&self, turned: usize, margin: usize) -> bool {
+        let n = self.last.len();
+        (1..=Self::MOST.min(n)).any(|period| {
+            let limit = (Self::limit(period) >> turned.min(8)).max(8 * period);
+            self.run[period] > 0 && self.run[period] + 1 + period + margin >= limit
+        })
     }
 
     /// The token is the reply's next.
@@ -206,21 +220,21 @@ mod tests {
             guard.push(t);
         }
         let (pushed, cycle) = until_over(&mut guard, &[1, 2, 3, 4, 5, 6, 7], 10_000).expect("a run without end");
-        assert_eq!((cycle.period, cycle.span, cycle.past), (7, 512, 0));
-        assert_eq!(pushed, 511, "the 512th token of the run is the one refused: 73 items written");
+        assert_eq!((cycle.period, cycle.span, cycle.past), (7, 2048, 0));
+        assert_eq!(pushed, 2047, "the 2,048th token of the run is the one refused: 292 items written, not 64,000 tokens");
         // the model picks another token: the run is over, and what follows is judged anew
         guard.push(77);
         assert_eq!(guard.over(1, 0), None);
-        assert!(until_over(&mut guard, &[1, 2, 3, 4, 5, 6, 7], 400).is_none());
+        assert!(until_over(&mut guard, &[1, 2, 3, 4, 5, 6, 7], 1600).is_none());
         // refused again and again where the caller lets it go on: how far past the limit is said
         let mut guard = CycleGuard::default();
-        for i in 0..600 {
+        for i in 0..2100 {
             guard.push([1, 2, 3, 4, 5, 6, 7][i % 7]);
         }
-        assert_eq!(guard.over([1, 2, 3, 4, 5, 6, 7][600 % 7], 0).map(|c| (c.period, c.past)), Some((7, 89)));
-        // a reply turned from a run before is given half as long at the next, and half again: 256, 128, then eight
-        // turns of the run and no less
-        for (turned, limit) in [(1, 256), (2, 128), (3, 64), (4, 56), (9, 56)] {
+        assert_eq!(guard.over([1, 2, 3, 4, 5, 6, 7][2100 % 7], 0).map(|c| (c.period, c.past)), Some((7, 53)));
+        // a reply turned from a run before is given half as long at the next, and half again, down to eight turns
+        // of the run and no less
+        for (turned, limit) in [(1, 1024), (2, 512), (3, 256), (4, 128), (5, 64), (6, 56), (9, 56)] {
             let mut guard = CycleGuard::default();
             let mut written = 0;
             while guard.over([1, 2, 3, 4, 5, 6, 7][written % 7], turned).is_none() {
@@ -233,19 +247,53 @@ mod tests {
 
     #[test]
     fn what_data_is_made_of_is_let_be_far_longer() {
-        // a map's cells: `0` and `,`, 1,500 of them
+        // a map's cells: `0` and `,`, 2,000 of them
         let mut guard = CycleGuard::default();
         let (pushed, cycle) = until_over(&mut guard, &[10, 11], 10_000).unwrap();
-        assert_eq!((cycle.period, pushed), (2, 3071));
+        assert_eq!((cycle.period, pushed), (2, 4095));
         // one token over and over (a rule of dashes, a run of spaces): its own period's limit, not four's
         let mut guard = CycleGuard::default();
         let (pushed, cycle) = until_over(&mut guard, &[5], 10_000).unwrap();
-        assert_eq!((cycle.period, pushed), (1, 3071));
-        // a map's row of twenty cells, forty tokens: 64 rows the same
+        assert_eq!((cycle.period, pushed), (1, 4095));
+        // a map's row of twenty cells, forty tokens: 128 rows the same
         let row: Vec<u32> = (0..20).flat_map(|_| [10, 11]).chain([12]).collect();
         let mut guard = CycleGuard::default();
         let (pushed, cycle) = until_over(&mut guard, &row, 10_000).unwrap();
-        assert_eq!((cycle.period, pushed), (41, 64 * 41 - 1));
+        assert_eq!((cycle.period, pushed), (41, 128 * 41 - 1));
+        // a CSV's 200 rows the same, `0,ok,0` and its line end as six tokens (asked for through OAIY: refused after
+        // 513 tokens at the limit this had first)
+        let mut guard = CycleGuard::default();
+        for t in [20, 21, 22, 23] {
+            guard.push(t); // its header
+        }
+        assert!(until_over(&mut guard, &[30, 31, 32, 31, 30, 33], 200 * 6).is_none());
+    }
+
+    #[test]
+    fn a_run_is_near_its_limit_a_margin_before_it_is_over() {
+        let unit = [1, 2, 3, 4, 5, 6, 7];
+        let mut guard = CycleGuard::default();
+        let mut written = 0;
+        while !guard.near(0, 16) {
+            assert!(guard.over(unit[written % 7], 0).is_none(), "over before near, at {written}");
+            guard.push(unit[written % 7]);
+            written += 1;
+        }
+        // near 16 tokens before the 2,048th is refused, and near from there until it is
+        assert_eq!(written, 2048 - 1 - 16);
+        while guard.over(unit[written % 7], 0).is_none() {
+            assert!(guard.near(0, 16));
+            guard.push(unit[written % 7]);
+            written += 1;
+        }
+        assert_eq!(written, 2047);
+        // a turned reply's next run is near at its own, halved, limit; one that does not repeat never is
+        let mut guard = CycleGuard::default();
+        (0..1007).for_each(|i| guard.push(unit[i % 7]));
+        assert!(guard.near(1, 16) && !guard.near(0, 16));
+        let mut guard = CycleGuard::default();
+        (0..10_000u32).for_each(|i| guard.push(i));
+        assert!(!guard.near(0, 16));
     }
 
     #[test]
