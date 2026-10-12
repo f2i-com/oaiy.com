@@ -627,9 +627,9 @@ impl QwenEngine {
             } else {
                 match jobs.try_recv() {
                     Ok(job) => job,
-                    Err(std::sync::mpsc::TryRecvError::Empty) => { self.save_some(); continue; }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => { self.save_guarded(); continue; }
                     // (the engine let go: what it had to write, written first)
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => { while self.save_some() {} break; }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => { while self.save_guarded() {} break; }
                 }
             };
             // The end of an incognito session: wipe what is held of it.
@@ -1157,6 +1157,21 @@ impl QwenEngine {
             self.unsaved.drain(..extra);
         }
         Ok(())
+    }
+
+    /// [`Self::save_some`] as a request's run is, its panic caught: a step of a disk state runs between requests, in
+    /// the model's own thread, and a panic there ended that thread (nothing starts it again), and every request
+    /// after failed. A step that panics gives up the states still to make, and says so.
+    fn save_guarded(&mut self) -> bool {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.save_some())) {
+            Ok(more) => more,
+            Err(_) => {
+                eprintln!("  Qwen: making a prompt's state for the disk failed; the states still to make are not made");
+                self.building = None;
+                self.unsaved.clear();
+                false
+            }
+        }
     }
 
     /// A step of the disk's states ([`QwenEngine::unsaved`]): the next attention layer of the one being made, or
