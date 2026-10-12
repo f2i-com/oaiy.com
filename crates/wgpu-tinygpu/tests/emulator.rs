@@ -2,6 +2,8 @@
 //! (`tools/tinygpu/webgpu_server.py --emulate`: each kernel compiled for the CPU), so no card is needed. Skipped where
 //! the emulator cannot start (no python3 or clang++). With `TINYGPU_TEST_SOCKET` set they run on the server there
 //! instead: the card itself.
+// The adapter is Unix's alone (its server's socket).
+#![cfg(unix)]
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};

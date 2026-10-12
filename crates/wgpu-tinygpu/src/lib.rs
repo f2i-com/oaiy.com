@@ -10,6 +10,10 @@
 //!
 //! Compute alone: render pipelines, textures, samplers, queries and acceleration structures are refused (a panic
 //! naming them, as wgpu's own validation errors panic without a handler).
+//!
+//! The server is reached over a Unix socket, so off Unix (Windows) the crate is empty: a workspace's build there
+//! still compiles, and nothing of Windows' engines asks for the adapter.
+#![cfg(unix)]
 
 use std::collections::HashMap;
 use std::io::{Read, Write};

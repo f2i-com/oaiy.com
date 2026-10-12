@@ -1432,9 +1432,9 @@ mod tests {
         let after = |flag: &str| a.iter().position(|x| x == flag).map(|i| a[i + 1].clone());
         assert_eq!(after("--model"), Some(root.join("models/big.gguf").to_string_lossy().into_owned()));
         assert_eq!((after("--name").as_deref(), after("--port").as_deref(), after("--ctx").as_deref()), (Some("big"), Some("18000"), Some("16384")));
-        assert_eq!(after("--prompt-cache"), Some(root.join("cache/prompt-states-egpu").to_string_lossy().into_owned()));
+        assert_eq!(after("--prompt-cache"), Some(root.join("cache").join("prompt-states-egpu").to_string_lossy().into_owned()));
         // (DeepSeek's experts' counts of uses: the card's engine's own, not this computer's engine's)
-        assert_eq!(after("--usage"), Some(root.join("cache/expert-usage-egpu.bin").to_string_lossy().into_owned()));
+        assert_eq!(after("--usage"), Some(root.join("cache").join("expert-usage-egpu.bin").to_string_lossy().into_owned()));
         assert_eq!(a.iter().filter(|x| *x == "--usage").count(), 1);
         // This model alone, the key out of sight, and nothing of this computer's GPUs or tinygrad's own arguments.
         for absent in ["--also", "--api-key", "--devices", "--devices-for", "--shard", "--serve", "--max_context"] {

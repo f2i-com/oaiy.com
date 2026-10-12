@@ -10,6 +10,9 @@
 //!
 //! The adapter is the server's at `TINYGPU_SOCKET` (else ~/.cache/tinygpu-webgpu/server.sock);
 //! `WEBGPU_TINYGPU_BACKEND=native` takes wgpu's own instead (Metal on a Mac), to check a program against both.
+//!
+//! Unix's alone, as the adapter is: off Unix (Windows) the library is empty and build.rs compiles no C.
+#![cfg(unix)]
 #![allow(clippy::missing_safety_doc)]
 
 use std::collections::VecDeque;

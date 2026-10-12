@@ -1772,6 +1772,7 @@ S(("", a.serve), H).serve_forever()
 
     /// A stand-in for OAIY's engine on the card: it takes a buffer on the card through its socket (as its weights
     /// would), says it has its model, and answers every chat "from the card".
+    #[cfg(unix)]
     const FAKE_ENGINE: &str = r#"#!/usr/bin/env python3
 import http.server, json, os, socket, struct, sys
 port = int(sys.argv[sys.argv.index("--port") + 1])
@@ -1825,6 +1826,7 @@ http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
 
     /// A stand-in for `oaiy-media --serve`: each job a line in, its answer a line out (a picture's path), and when it
     /// started (with its adapter) and ended noted beside it, in `fake-media.log`.
+    #[cfg(unix)]
     const FAKE_SERVE: &str = r#"#!/usr/bin/env python3
 import json, os, sys
 log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fake-media.log")

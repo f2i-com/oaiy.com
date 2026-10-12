@@ -1,7 +1,13 @@
 //! A wgpu program as any is written, on the TinyGPU adapter: `cargo run --release -p wgpu-tinygpu --example smoke`
 //! (with tools/tinygpu/webgpu_server.py running).
+#[cfg(unix)]
 use wgpu::util::DeviceExt;
 
+/// The adapter is Unix's alone (its server's socket): elsewhere there is nothing to run.
+#[cfg(not(unix))]
+fn main() {}
+
+#[cfg(unix)]
 fn main() {
     let adapter = wgpu_tinygpu::adapter(&wgpu_tinygpu::default_socket()).unwrap_or_else(|e| panic!("{e}"));
     println!("adapter: {:?}", adapter.get_info().name);

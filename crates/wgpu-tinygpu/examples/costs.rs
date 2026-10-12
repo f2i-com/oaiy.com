@@ -1,9 +1,16 @@
 //! What the TinyGPU adapter's work costs, apart from the kernels' own time: a dispatch in a long command buffer, a
 //! submission, a write, a read, and the bandwidth of each. `cargo run --release -p wgpu-tinygpu --example costs`
 //! (with tools/tinygpu/webgpu_server.py running; TINYGPU_SOCKET for another).
+#[cfg(unix)]
 use std::time::Instant;
+#[cfg(unix)]
 use wgpu::util::DeviceExt;
 
+/// The adapter is Unix's alone (its server's socket): elsewhere there is nothing to measure.
+#[cfg(not(unix))]
+fn main() {}
+
+#[cfg(unix)]
 fn main() {
     let adapter = wgpu_tinygpu::adapter(&wgpu_tinygpu::default_socket()).unwrap_or_else(|e| panic!("{e}"));
     println!("adapter: {}", adapter.get_info().name);

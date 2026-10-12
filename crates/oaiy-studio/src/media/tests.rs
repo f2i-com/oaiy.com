@@ -348,7 +348,7 @@ fn qwen_image_turbo_takes_its_own_eight_steps_at_cfg_one_and_no_adapter() {
     assert_eq!(r.get("distilled"), Some(&Json::Bool(true)));
     assert!(r.get("cfg").is_none(), "the worker's own, 1");
     assert_eq!(r.get("adapter"), Some(&Json::Null));
-    assert_eq!(r.get("text_encoder").and_then(Json::as_str), Some("/install/te.gguf"));
+    assert_eq!(r.get("text_encoder").and_then(Json::as_str), Some(root.join("te.gguf").to_string_lossy().as_ref()));
     let err = image_request(&c, root, root, &body(r#"{"model":"turbo","prompt":"a fox","steps":30}"#), false).unwrap_err();
     assert!(err.contains("8 steps"), "{err}");
     // An adapter beside a distilled checkpoint is refused where it is set.
