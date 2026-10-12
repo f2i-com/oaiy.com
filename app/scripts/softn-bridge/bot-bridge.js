@@ -155,6 +155,7 @@
   };
 
   // --- acting on the page -----------------------------------------------------
+  const MOST_ACTIONS = 20;
   const candidates = (selector, withClickable) => {
     const all = [...document.querySelectorAll(selector)];
     if (withClickable) for (const el of document.body.querySelectorAll('*')) if (!all.includes(el) && clickable(el)) all.push(el);
@@ -184,12 +185,20 @@
     el.dispatchEvent(new Event('change', { bubbles: true }));
   };
   const act = async (action) => {
+    // `times`: the click or the key press again and again (50 at most), a moment between them for the page to
+    // take each; a list of the same action over and over is what a model without it writes, and may not stop writing.
+    const times = Math.min(Math.max(Math.floor(Number(action.times)) || 1, 1), 50);
+    const again = times > 1 ? ` ${times} times` : '';
+    const moment = () => new Promise((resolve) => setTimeout(resolve, 40));
     if (typeof action.click === 'string') {
       const el = find(action.click, `${CONTROL}, label, [onclick], [tabindex]`, action.nth, true);
       el.scrollIntoView?.({ block: 'center' });
-      for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup']) el.dispatchEvent(new (type.startsWith('pointer') ? PointerEvent : MouseEvent)(type, { bubbles: true, cancelable: true }));
-      el.click();
-      return `clicked ${describeControl(el) || `"${action.click}"`}`;
+      for (let i = 0; i < times; i++) {
+        if (i) await moment();
+        for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup']) el.dispatchEvent(new (type.startsWith('pointer') ? PointerEvent : MouseEvent)(type, { bubbles: true, cancelable: true }));
+        el.click();
+      }
+      return `clicked ${describeControl(el) || `"${action.click}"`}${again}`;
     }
     if (typeof action.fill === 'string') {
       const el = find(action.fill, 'input, textarea, [contenteditable="true"]', action.nth);
@@ -210,16 +219,23 @@
     if (typeof action.key === 'string') {
       const target = document.activeElement && document.activeElement !== document.body ? document.activeElement : document.body;
       const init = { key: action.key, code: action.key.length === 1 ? `Key${action.key.toUpperCase()}` : action.key, bubbles: true, cancelable: true };
-      target.dispatchEvent(new KeyboardEvent('keydown', init));
-      target.dispatchEvent(new KeyboardEvent('keyup', init));
+      // `hold`: the key kept down that long (ms; 10 s over all its presses at most) before it is let go, as a game
+      // that moves while a key is down reads it: down and up in one instant is no time held, and nothing moves.
+      const hold = Math.min(Math.max(Number(action.hold) || 0, 0), 10_000 / times);
+      for (let i = 0; i < times; i++) {
+        if (i) await moment();
+        target.dispatchEvent(new KeyboardEvent('keydown', init));
+        if (hold) await new Promise((resolve) => setTimeout(resolve, hold));
+        target.dispatchEvent(new KeyboardEvent('keyup', init));
+      }
       if (action.key === 'Enter' && target.form) target.form.requestSubmit?.();
-      return `pressed ${action.key}`;
+      return `pressed ${action.key}${again}${hold ? `, held ${Math.round(hold)} ms${times > 1 ? ' each' : ''}` : ''}`;
     }
     if (typeof action.wait === 'number') {
       await new Promise((resolve) => setTimeout(resolve, Math.min(Math.max(action.wait, 0), 10_000)));
       return `waited ${action.wait} ms`;
     }
-    throw new Error(`unknown action ${JSON.stringify(action)}: use {click}, {fill, value}, {select, value}, {key} or {wait}`);
+    throw new Error(`unknown action ${JSON.stringify(action)}: use {click}, {fill, value}, {select, value}, {key} (with times or hold) or {wait}`);
   };
   // A frame off screen gets no animation frames, so a timer also ends the wait.
   const settle = () =>
@@ -353,10 +369,14 @@
       if (data.type === 'bot:inspect') {
         result = { ok: true, page: describe() };
       } else if (data.type === 'bot:act') {
-        for (const action of Array.isArray(data.actions) ? data.actions.slice(0, 20) : []) {
+        // (20 actions a call, and said where there were more: the rest were dropped without a word, and a model
+        // that saw nothing come of them wrote them again)
+        const actions = Array.isArray(data.actions) ? data.actions : [];
+        for (const action of actions.slice(0, MOST_ACTIONS)) {
           done.push(await act(action));
           await settle();
         }
+        if (actions.length > MOST_ACTIONS) done.push(`the other ${actions.length - MOST_ACTIONS} actions were not run (${MOST_ACTIONS} a call at most; "times" repeats one)`);
         result = { ok: true, done, page: describe() };
       } else if (data.type === 'bot:screenshot') {
         result = { ok: true, page: '', shot: await shoot(data.fullPage === true) };

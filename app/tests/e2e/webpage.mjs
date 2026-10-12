@@ -216,6 +216,12 @@ await check('a canvas game animates and takes the keyboard', async () => {
   expect(!result.isError, result.content);
   const moved = await tool('page_interact', { actions: [{ wait: 400 }, { key: 'ArrowRight' }, { key: 'ArrowRight' }, { wait: 200 }] });
   expect(moved.content.includes('x 50 animating'), moved.content);
+  // a press repeated by its count and a key held, where a model wrote the same action out again and again; and a
+  // list past what a call runs is said to be
+  const more = await tool('page_interact', { actions: [{ key: 'ArrowRight', times: 3 }, { key: 'ArrowRight', hold: 150 }] });
+  expect(more.content.includes('x 130 animating') && more.content.includes('pressed ArrowRight 3 times') && more.content.includes('held 150 ms'), more.content);
+  const many = await tool('page_interact', { actions: Array.from({ length: 23 }, () => ({ key: 'ArrowLeft' })) });
+  expect(many.content.includes('the other 3 actions were not run'), many.content);
   const shot = await tool('preview_screenshot', { save_to: 'shots/game.png' });
   expect(!shot.isError && shot.images === 1, JSON.stringify(shot));
   writeFileSync(join(shots, 'game.png'), Buffer.from(await page.evaluate(() => Array.from(window.harness.read('shots/game.png')))));

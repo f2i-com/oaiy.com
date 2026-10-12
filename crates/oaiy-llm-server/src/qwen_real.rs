@@ -28,6 +28,9 @@ pub(crate) struct FakeModel {
     pub panic_on: Option<u32>,
     /// Tokens run through the model (prefill and decode).
     pub forwarded: Arc<AtomicUsize>,
+    /// A model stuck in a run: whatever it has read, its likeliest next token is the next of these in turn, and its
+    /// next likeliest the other one (the end of the reply, or a word after which it goes back to its run).
+    pub stuck: Option<(Vec<u32>, u32)>,
 }
 
 impl FakeModel {
@@ -35,7 +38,7 @@ impl FakeModel {
         let mut tokens = vec!["<pad>".to_string(), "<|im_start|>".into(), "<|im_end|>".into(), "</think>".into()];
         for i in FIRST..FIRST + WORDS { tokens.push(format!("{i}.")); }
         let tok = Tokenizer::from_qwen3_bpe_parts(tokens, vec![], vec![1, 2, 3], END).unwrap();
-        FakeModel { tok, width: 4, panic_on, forwarded }
+        FakeModel { tok, width: 4, panic_on, forwarded, stuck: None }
     }
 
     fn mix(t: u32, pos: u32, salt: u32, j: u32) -> f32 {
@@ -82,7 +85,13 @@ impl FakeModel {
         }
         for t in kv.ssm_state.iter().chain(&kv.ssm_conv).flatten() { for x in t.data() { eat(x.to_bits()); } }
         let mut logits = vec![0.0f32; (FIRST + WORDS) as usize];
-        logits[(FIRST as u64 + h % WORDS as u64) as usize] = 1.0;
+        match &self.stuck {
+            Some((run, other)) => {
+                logits[run[kv.len % run.len()] as usize] = 10.0;
+                logits[*other as usize] = 5.0;
+            }
+            None => logits[(FIRST as u64 + h % WORDS as u64) as usize] = 1.0,
+        }
         Ok(Tensor::from_vec(logits, vec![(FIRST + WORDS) as usize]))
     }
 }
@@ -110,8 +119,18 @@ pub(crate) struct Engine {
 impl Engine {
     /// `budget` bytes of stash (0: parking off).
     pub fn start(budget: usize, panic_on: Option<u32>) -> Self {
+        Self::start_with(budget, panic_on, None, true)
+    }
+
+    /// An engine whose model is stuck in `run` (its next likeliest token `other`), with the guard on such runs or not.
+    pub fn start_stuck(run: &[u32], other: u32, guard: bool) -> Self {
+        Self::start_with(0, None, Some((run.to_vec(), other)), guard)
+    }
+
+    fn start_with(budget: usize, panic_on: Option<u32>, stuck: Option<(Vec<u32>, u32)>, guard: bool) -> Self {
         let forwarded = Arc::new(AtomicUsize::new(0));
-        let engine = QwenEngine::new(Hybrid::Fake(Box::new(FakeModel::new(panic_on, forwarded.clone()))), None, 65536, false).park_up_to(budget);
+        let model = FakeModel { stuck, ..FakeModel::new(panic_on, forwarded.clone()) };
+        let engine = QwenEngine::new(Hybrid::Fake(Box::new(model)), None, 65536, false).park_up_to(budget).repetition_guard(guard);
         let (tx, rx) = channel();
         let thread = std::thread::spawn(move || engine.run(rx));
         Engine { tx: Some(tx), thread: Some(thread), forwarded }
@@ -216,6 +235,40 @@ mod tests {
             }
         }
         out
+    }
+
+    /// A model stuck writing the same five tokens (a tool call's list, the same item again and again): the engine
+    /// has it pick another token once the run is past its limit, and the reply ends where the model's other choice
+    /// ends it, as a list closes. Left alone it wrote to the reply's last token.
+    #[test]
+    fn a_reply_stuck_in_a_run_is_turned_from_it_and_ends() {
+        let run = [10, 11, 12, 13, 14];
+        let prompt: Vec<u32> = std::iter::once(IM).chain(20..40).collect();
+        let left = Engine::start_stuck(&run, END, false).ask(&prompt, 3_000);
+        assert_eq!((left.words.len(), left.done, left.error.is_none()), (3_000, true, true), "unguarded: to the reply's limit");
+        let turned = Engine::start_stuck(&run, END, true).ask(&prompt, 3_000);
+        assert!(turned.done && turned.error.is_none(), "{:?}", turned.error);
+        // (its limit of 512 tokens, and a turn of the run more: these words have no comma to be turned at)
+        let limit = crate::repetition::CycleGuard::limit(run.len());
+        assert_eq!(turned.words.len(), limit + run.len() - 1);
+        assert!(turned.words.iter().all(|w| run.contains(w)), "what it wrote before is its own");
+    }
+
+    /// One that goes back to its run each time it is turned is stopped, saying why.
+    #[test]
+    fn a_reply_that_goes_back_to_its_run_is_stopped() {
+        let run = [10, 11, 12, 13, 14];
+        let prompt: Vec<u32> = std::iter::once(IM).chain(20..40).collect();
+        let reply = Engine::start_stuck(&run, 50, true).ask(&prompt, 20_000);
+        let error = reply.error.expect("stopped");
+        assert!(error.contains(crate::repetition::CODE) && error.contains("repeating the same 5 tokens"), "{error}");
+        assert_eq!(reply.words.iter().filter(|&&w| w == 50).count(), 3, "turned three times first");
+        assert!(reply.words.len() < 4 * 600, "{} words", reply.words.len());
+        // and the engine answers the next request (the state the stopped one left is not taken for a whole one)
+        let e = Engine::start_stuck(&run, 50, true);
+        assert!(e.ask(&prompt, 20_000).error.is_some());
+        let again = e.ask(&prompt, 40);
+        assert_eq!((again.words.len(), again.error), (40, None));
     }
 
     #[test]

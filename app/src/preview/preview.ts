@@ -100,7 +100,12 @@ export const VIEWPORTS: Record<string, Viewport & { label: string }> = {
 export const MIN_VIEWPORT = 200;
 export const MAX_VIEWPORT = 3840;
 
-export type PreviewAction = { click: string; nth?: number } | { fill: string; value: string; nth?: number } | { select: string; value: string; nth?: number } | { key: string } | { wait: number };
+export type PreviewAction =
+  | { click: string; nth?: number; times?: number }
+  | { fill: string; value: string; nth?: number }
+  | { select: string; value: string; nth?: number }
+  | { key: string; times?: number; hold?: number }
+  | { wait: number };
 
 let engineBytes: Promise<ArrayBuffer> | null = null;
 function zippBytes(): Promise<ArrayBuffer> {

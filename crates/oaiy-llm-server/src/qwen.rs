@@ -561,13 +561,25 @@ pub struct QwenEngine {
     /// with the engine, so a model reload (the only way its weights or LoRA change) starts it
     /// empty, and `kv` is never rebuilt for another context length.
     parking: Parking,
+    /// A run that repeats without end is turned from, and stopped where it goes on all the same
+    /// (`--repetition-guard`, on unless said): [`crate::repetition::CycleGuard`].
+    cycles: bool,
 }
+
+/// The times a reply is turned from a run without end before it is stopped: a model turned from one may write
+/// another, and a reply that has written three is not going anywhere.
+const TURNS: usize = 3;
 
 impl QwenEngine {
     pub fn new(model: impl Into<Hybrid>, projector: Option<MmProj>, max_seq: usize, log: bool) -> Self {
         let model = model.into();
         let kv = model.new_kv_cache(max_seq);
-        Self { model, projector, kv, covered: Vec::new(), vision_cache: Default::default(), log, checkpoints: Vec::new(), disk: None, image_disk_cache:false, private_session: None, parking: Parking::new(0, log) }
+        Self { model, projector, kv, covered: Vec::new(), vision_cache: Default::default(), log, checkpoints: Vec::new(), disk: None, image_disk_cache:false, private_session: None, parking: Parking::new(0, log), cycles: true }
+    }
+    /// Whether a run that repeats without end is turned from and stopped (it is, unless this says not).
+    pub fn repetition_guard(mut self, on: bool) -> Self {
+        self.cycles = on;
+        self
     }
     /// Let the engine set conversations aside in host RAM, up to `bytes` (0: not at all), when
     /// its model can: only Qwen3.8-Flash-Next, which has no disk states of its own.
@@ -895,6 +907,7 @@ impl QwenEngine {
         let (mut checks, mut rows_checked, mut t_draft, mut t_check, mut t_undo) = (0usize, 0usize, 0f64, 0f64, 0f64);
         // (OAIY_DECODE_LOG: the model's time at every fiftieth token)
         let mut by_fifty: Vec<f64> = Vec::new();
+        let (mut cycles, mut turned) = (crate::repetition::CycleGuard::default(), 0usize);
         while generated.len() < job.max_tokens && self.kv.len < self.kv.max_len {
             if job.cancel.load(Ordering::Relaxed) {
                 if let (Some(m), false) = (drafter, pending.is_empty()) { m.rollback(&mut self.kv, check_rows, check_rows - pending.len()); }
@@ -902,6 +915,22 @@ impl QwenEngine {
             }
             let clock = std::time::Instant::now();
             let mut next = logits.sample(&job.sampling, &mut rng);
+            // A run that repeats without end (a list's same item again and again): the model picks another token
+            // than the run's next, at the run's comma or line end where it has one (a list's place to close) and
+            // anywhere once a whole turn has passed with none. A reply turned so `TURNS` times is stopped, as is one
+            // whose rows are the model's pick alone (a greedy request's: there is no other token to take).
+            if let Some(cycle) = cycles.over(next).filter(|_| self.cycles) {
+                if cycle.past >= cycle.period || tok.decode(&[next]).contains([',', ';', '\n']) {
+                    let other = if turned < TURNS { logits.sample_but(next, &job.sampling, &mut rng) } else { None };
+                    let Some(other) = other else {
+                        if let (Some(m), false) = (drafter, pending.is_empty()) { m.rollback(&mut self.kv, check_rows, check_rows - pending.len()); }
+                        return Err(format!("{}: the reply went on repeating the same {} tokens ({} tokens of them) and was stopped", crate::repetition::CODE, cycle.period, cycle.span));
+                    };
+                    turned += 1;
+                    if self.log { eprintln!("  Qwen: the reply repeated the same {} tokens for {} tokens: turned from it ({turned} of {TURNS})", cycle.period, cycle.span); }
+                    next = other;
+                }
+            }
             t_sample += clock.elapsed().as_secs_f64();
             if thinking && job.think_budget.is_some_and(|n|think_used >= n) { if let Some(end) = think_end { next = end; } }
             let stop = next == eos || Some(next) == tok.eos();
@@ -916,6 +945,7 @@ impl QwenEngine {
             }
             if stop { finish = Finish::Stop; break; }
             generated.push(next);
+            cycles.push(next);
             let clock = std::time::Instant::now();
             let decoded = tok.decode(&generated);
             let delta = stream.push(&decoded, &job.tools, false)?;
@@ -1093,6 +1123,20 @@ impl Row {
                 sample(l.data(), s, rng)
             }
             Row::Pick(token) => *token,
+        }
+    }
+
+    /// A token sampled from the row with `banned` out of it; None where the row is the model's pick alone.
+    fn sample_but(&self, banned: u32, s: &crate::job::Sampling, rng: &mut u64) -> Option<u32> {
+        match self {
+            Row::Logits(l) => {
+                let mut logits = l.data().to_vec();
+                if let Some(x) = logits.get_mut(banned as usize) {
+                    *x = f32::NEG_INFINITY;
+                }
+                Some(sample(&logits, s, rng))
+            }
+            Row::Pick(_) => None,
         }
     }
 }

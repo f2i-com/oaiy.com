@@ -28,6 +28,75 @@ impl Guard {
     }
 }
 
+/// A run of tokens that repeats without end, wherever it is: prose, reasoning, or a tool call's payload, where the
+/// guards above do not look. The 27B, testing a game it had written, filled a tool call's list of actions with
+/// `{"key":"ArrowRight"},` until it was stopped (a list no penalty on prose reaches, and nothing else ended it before
+/// the reply's 64,000 tokens).
+///
+/// A run is the reply's last tokens being the same every `period` tokens, 64 at most. What a reply means to write
+/// repeats too (a map's rows of zeros, a table's rules), so a run is let be until it is longer than such things are:
+/// [`CycleGuard::limit`]. Past that, [`CycleGuard::over`] says of the token sampled next whether it is the run's
+/// next, and the caller has the model pick another, which ends a list where its next item was the same again.
+pub(crate) struct CycleGuard {
+    /// The last [`CycleGuard::MOST`] tokens, the newest last.
+    last: std::collections::VecDeque<u32>,
+    /// For each period, how many of the newest tokens are each the token that period before it.
+    run: [usize; CycleGuard::MOST + 1],
+}
+
+/// A run past its limit that the token sampled would go on: its period, its length with that token, and how far
+/// past the limit that is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Cycle {
+    pub period: usize,
+    pub span: usize,
+    pub past: usize,
+}
+
+impl Default for CycleGuard {
+    fn default() -> Self {
+        Self { last: Default::default(), run: [0; Self::MOST + 1] }
+    }
+}
+
+impl CycleGuard {
+    /// The longest period watched.
+    pub const MOST: usize = 64;
+
+    /// The tokens a run of `period` may be before it is taken for one without end: 64 of its turns and 512 tokens at
+    /// least (some 73 of a seven-token item), or 3,072 tokens of a run of one to three tokens, which data is made of
+    /// (`0,` in a map of 1,500 cells).
+    pub fn limit(period: usize) -> usize {
+        if period <= 3 { 3072 } else { (64 * period).max(512) }
+    }
+
+    /// The token is the reply's next.
+    pub fn push(&mut self, token: u32) {
+        let n = self.last.len();
+        for period in 1..=Self::MOST {
+            self.run[period] = if period <= n && self.last[n - period] == token { self.run[period] + 1 } else { 0 };
+        }
+        if n == Self::MOST {
+            self.last.pop_front();
+        }
+        self.last.push_back(token);
+    }
+
+    /// Whether `next` would go on a run that is at its limit or past it (the run's own period: one that is a run of
+    /// a shorter period too is that period's, by its limit).
+    pub fn over(&self, next: u32) -> Option<Cycle> {
+        let n = self.last.len();
+        (1..=Self::MOST.min(n)).find_map(|period| {
+            if self.last[n - period] != next {
+                return None;
+            }
+            let span = self.run[period] + 1 + period;
+            let shorter = (1..period).any(|d| period % d == 0 && self.last[n - d] == next && self.run[d] + 1 + d >= span);
+            (!shorter && span >= Self::limit(period)).then(|| Cycle { period, span, past: span - Self::limit(period) })
+        })
+    }
+}
+
 /// Tiny exact cycles such as repeated intentions to call a tool. Only used
 /// inside reasoning: prose and code may legitimately repeat short sequences.
 #[derive(Default)]
@@ -112,6 +181,74 @@ impl ProseGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tokens of `unit` over and over, pushed until [`CycleGuard::over`] says the next is one too many: how many
+    /// were pushed, and what it said.
+    fn until_over(guard: &mut CycleGuard, unit: &[u32], most: usize) -> Option<(usize, Cycle)> {
+        for i in 0..most {
+            let next = unit[i % unit.len()];
+            if let Some(cycle) = guard.over(next) {
+                return Some((i, cycle));
+            }
+            guard.push(next);
+        }
+        None
+    }
+
+    #[test]
+    fn a_list_item_repeated_without_end_is_a_cycle_after_its_limit() {
+        // `{"key":"ArrowRight"},` as seven tokens, after a call's opening
+        let mut guard = CycleGuard::default();
+        for t in [900, 901, 902] {
+            guard.push(t);
+        }
+        let (pushed, cycle) = until_over(&mut guard, &[1, 2, 3, 4, 5, 6, 7], 10_000).expect("a run without end");
+        assert_eq!((cycle.period, cycle.span, cycle.past), (7, 512, 0));
+        assert_eq!(pushed, 511, "the 512th token of the run is the one refused: 73 items written");
+        // the model picks another token: the run is over, and what follows is judged anew
+        guard.push(77);
+        assert_eq!(guard.over(1), None);
+        assert!(until_over(&mut guard, &[1, 2, 3, 4, 5, 6, 7], 400).is_none());
+        // refused again and again where the caller lets it go on: how far past the limit is said
+        let mut guard = CycleGuard::default();
+        for i in 0..600 {
+            guard.push([1, 2, 3, 4, 5, 6, 7][i % 7]);
+        }
+        assert_eq!(guard.over([1, 2, 3, 4, 5, 6, 7][600 % 7]).map(|c| (c.period, c.past)), Some((7, 89)));
+    }
+
+    #[test]
+    fn what_data_is_made_of_is_let_be_far_longer() {
+        // a map's cells: `0` and `,`, 1,500 of them
+        let mut guard = CycleGuard::default();
+        let (pushed, cycle) = until_over(&mut guard, &[10, 11], 10_000).unwrap();
+        assert_eq!((cycle.period, pushed), (2, 3071));
+        // one token over and over (a rule of dashes, a run of spaces): its own period's limit, not four's
+        let mut guard = CycleGuard::default();
+        let (pushed, cycle) = until_over(&mut guard, &[5], 10_000).unwrap();
+        assert_eq!((cycle.period, pushed), (1, 3071));
+        // a map's row of twenty cells, forty tokens: 64 rows the same
+        let row: Vec<u32> = (0..20).flat_map(|_| [10, 11]).chain([12]).collect();
+        let mut guard = CycleGuard::default();
+        let (pushed, cycle) = until_over(&mut guard, &row, 10_000).unwrap();
+        assert_eq!((cycle.period, pushed), (41, 64 * 41 - 1));
+    }
+
+    #[test]
+    fn a_reply_that_does_not_repeat_is_never_a_cycle() {
+        let mut guard = CycleGuard::default();
+        let mut x = 12345u32;
+        for _ in 0..20_000 {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            let next = (x >> 16) % 50;
+            assert_eq!(guard.over(next), None);
+            guard.push(next);
+        }
+        // nor one whose repeats are longer than it watches (a verse sung again: the other guards' to judge)
+        let verse: Vec<u32> = (0..80).collect();
+        let mut guard = CycleGuard::default();
+        assert!(until_over(&mut guard, &verse, 8_000).is_none());
+    }
 
     #[test]
     #[ignore = "requires OAIY_LOOP_EVENTS; replays local saved deltas without model inference"]

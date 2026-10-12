@@ -792,6 +792,7 @@ export const TOOLS: ToolSpec[] = [
     description:
       'Use a SoftN app in the live preview the way a person would, to test that it works: a list of actions, run in order, then the page as text and any errors the app raised. ' +
       'Actions: {"click": "<button or link text or label>"}, {"fill": "<input label or placeholder>", "value": "..."}, {"select": "<select label>", "value": "<option>"}, {"key": "Enter" | "ArrowUp" | "a" …}, {"wait": 500}. Add "nth": 2 to pick the second match. ' +
+      'To repeat a key or a click add "times": {"key": "ArrowRight", "times": 10}; to keep a key down, as a game needs to move, add "hold" in ms: {"key": "ArrowRight", "hold": 800}. At most 20 actions a call. ' +
       'State carries over between calls until the app is changed or re-rendered.',
     parameters: {
       type: 'object',
@@ -816,6 +817,7 @@ export const TOOLS: ToolSpec[] = [
     description:
       'Use a web page in the live preview the way a person would, to test that it works: a list of actions, run in order, then the page as text and any errors it raised. ' +
       'Actions: {"click": "<button, link or clickable text, or a label>"}, {"fill": "<input label or placeholder>", "value": "..."}, {"select": "<select label>", "value": "<option>"}, {"key": "Enter" | "ArrowUp" | "a" …}, {"wait": 500}. Add "nth": 2 to pick the second match. ' +
+      'To repeat a key or a click add "times": {"key": "ArrowRight", "times": 10}; to keep a key down, as a game needs to move, add "hold" in ms: {"key": "ArrowRight", "hold": 800}. At most 20 actions a call. ' +
       'State carries over between calls until the page is changed or re-rendered.',
     parameters: {
       type: 'object',

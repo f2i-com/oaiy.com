@@ -1452,6 +1452,7 @@ ${this.instructions}` : ''}`;
     let lastError: unknown;
     let overflowRetried = false;
     let callRetried = false;
+    let repeatRetried = false;
     for (let attempt = 0; attempt < 4; attempt++) {
       const b = this.budget(provider);
       const sent = wellFormed(trimmed(this.view(), this.keepImages, b.prompt * this.charsPerToken));
@@ -1507,6 +1508,13 @@ ${this.instructions}` : ''}`;
         if (unreadableCall && !callRetried) {
           callRetried = true;
           emit({ type: 'status', message: 'The model wrote a tool call the server could not read; asking again' });
+          continue;
+        }
+        // A reply OAIY's engine stopped because it kept repeating itself (generation_repetition): another sample
+        // usually does not.
+        if (/generation_repetition/.test(said) && !repeatRetried) {
+          repeatRetried = true;
+          emit({ type: 'status', message: 'The model got stuck repeating itself; asking again' });
           continue;
         }
         // A model without vision refuses image content: carry on in text (an image that is too big is not that).

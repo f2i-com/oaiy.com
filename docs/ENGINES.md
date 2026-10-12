@@ -256,6 +256,20 @@ OpenAI's.
   states use `--prompt-cache` across restarts; image-conditioned states stay in
   memory. An identical retry leaves one token to recompute the sampling logits.
   The initial uncached prompt still needs a full prefill.
+- **A reply that repeats without end** (the Qwen engine: the GGUF models and Flash-Next).
+  A model can write the same few tokens over and over and not stop: the 27B, testing a
+  game through a tool, filled the call's list with `{"key":"ArrowRight"},` until it was
+  cut off. The engine watches every reply, a tool call's payload too, for its last tokens
+  being the same every 1 to 64 tokens, and lets such a run be until it is longer than
+  what a reply means to write is (64 turns and 512 tokens; 3,072 tokens of a run of one
+  to three tokens, which data is made of). Past that it has the model pick another token
+  than the run's next, at the run's comma or line end where it has one, which closes a
+  list: the same request then ended as a readable call of 74 actions in 14 s, where
+  unguarded it ran to its 6,000-token limit and was unreadable. A reply turned three
+  times that goes back to its run is stopped with `generation_repetition` (HTTP 422, or
+  the stream's error), which OAIY's Agent answers by asking once more.
+  `--repetition-guard off` turns it off. The engine's `repeat_penalty` and the other
+  penalties are not applied by this engine's sampler.
 - **Long prompts** run layer by layer: every expert is read once for the whole prompt
   instead of once per chunk (~6× faster here than chunked prefill), up to 20,480 tokens a
   pass (`--layered-max`); a longer prompt splits into equal passes, and a pass that runs out

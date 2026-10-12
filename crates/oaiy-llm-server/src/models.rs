@@ -746,7 +746,7 @@ impl Models {
         };
         let (jobs, rx) = std::sync::mpsc::channel();
         let park = crate::qwen_park::budget(o.park_gb, ggml_rs_wgpu::host_memory().map(|(free, _)| free as u64));
-        let mut e = crate::qwen::QwenEngine::new(crate::qwen::Hybrid::Flash(Box::new(model)), projector, max_seq, !o.quiet && !o.silent).park_up_to(park);
+        let mut e = crate::qwen::QwenEngine::new(crate::qwen::Hybrid::Flash(Box::new(model)), projector, max_seq, !o.quiet && !o.silent).park_up_to(park).repetition_guard(o.repetition_guard);
         // Its prompt states on the disk (a whole state of its cache at a prompt's boundaries): a conversation, or a
         // system prompt, is not read again by the next process to load the model. The states are this checkpoint's
         // under these adapters and no other's.
@@ -899,7 +899,7 @@ impl Models {
             None => None,
         };
         let (jobs, rx) = std::sync::mpsc::channel();
-        let mut e = crate::qwen::QwenEngine::new(model, projector, max_seq, !o.quiet && !o.silent);
+        let mut e = crate::qwen::QwenEngine::new(model, projector, max_seq, !o.quiet && !o.silent).repetition_guard(o.repetition_guard);
         e.image_disk_cache = vision_path.is_some();
         if let Some(dir) = &o.prompt_cache {
             let mut fp = disk::fnv(b"orcasaq2-exl3-qwen-state-portable-v1", 0);
@@ -975,7 +975,7 @@ impl Models {
         cfg.image_token_id = tok.token_id("<|image_pad|>").ok_or_else(|| Error::Arg("Flash-Next tokenizer lacks image_pad".into()))?;
         let (jobs, rx) = std::sync::mpsc::channel();
         let park = crate::qwen_park::budget(o.park_gb, ggml_rs_wgpu::host_memory().map(|(free, _)| free as u64));
-        let e = crate::qwen::QwenEngine::new(crate::qwen::Hybrid::Flash(Box::new(model)), None, max_seq, !o.quiet && !o.silent).park_up_to(park);
+        let e = crate::qwen::QwenEngine::new(crate::qwen::Hybrid::Flash(Box::new(model)), None, max_seq, !o.quiet && !o.silent).park_up_to(park).repetition_guard(o.repetition_guard);
         let thread = std::thread::Builder::new().name("flashnext-model".into()).spawn(move || e.run(rx))?;
         Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Qwen(tok)) })
     }
@@ -1079,7 +1079,7 @@ impl Models {
             } else { None };
             cfg.qwen_vision = projector.as_ref().map(|p|p.config().clone());
             let (jobs,rx) = std::sync::mpsc::channel();
-            let mut e = crate::qwen::QwenEngine::new(model,projector,max_seq,!o.quiet && !o.silent);
+            let mut e = crate::qwen::QwenEngine::new(model,projector,max_seq,!o.quiet && !o.silent).repetition_guard(o.repetition_guard);
             if let Some(dir) = &o.prompt_cache {
                 // Separate format/implementation namespace; replacing weights
                 // in place also invalidates states via size and modification time.

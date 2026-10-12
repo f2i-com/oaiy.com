@@ -46,7 +46,9 @@ const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|
   --also-tools-experts NAME=DIR original experts for that model's tool payloads
   --tools-experts DIR  original MXFP4 experts during generated DSML tool calls;
                        ternary elsewhere, trunk stays loaded (experimental)
-  --repetition-guard on|off  stop repeated prose/reasoning blocks (default on)
+  --repetition-guard on|off  turn a reply from a run that repeats without end (a list's same
+                       item again and again, in a tool call too), and stop one that goes on
+                       all the same (default on)
   --expert-trace FILE  write JSONL token/layer/expert/precision routing records
   --api-key KEY        require `Authorization: Bearer KEY` (else OAIY_LLM_API_KEY)
   --thinking           reason before answering unless a request says otherwise
