@@ -328,7 +328,7 @@ pub fn thinks(llm: &Json, body: &Json) -> bool {
 }
 
 /// Whether a chat request carries a picture: tinygrad's server reads text only, so such a request is this
-/// computer's engine's.
+/// computer's engine's (OAIY's own engine on the card takes it as any other).
 pub fn has_picture(body: &Json) -> bool {
     let parts = |m: &Json| m.get("content").and_then(Json::as_array).map(<[Json]>::to_vec).unwrap_or_default();
     body.get("messages").and_then(Json::as_array).unwrap_or(&[]).iter().flat_map(parts).any(|p| str_or(&p, "type", "text") != "text")

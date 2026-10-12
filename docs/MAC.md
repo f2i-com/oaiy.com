@@ -529,6 +529,13 @@ server's command line. The control port has
 it) and `POST /api/egpu/stop`; `/api/state` has an `egpu` section, and the Logs page's
 **eGPU** tab (`/api/logs?source=egpu`) is tinygrad's own output.
 
+**Pictures in a chat** (the `webgpu` engine). A request with a picture goes to the card's
+engine like any other: it reads the picture where its model has a vision projector
+(`llm.models[].vision_projector`), and where it has none it says so at once ("… has no vision
+here …; images are not supported"), which OAIY's Agent answers by going on in text, a
+screenshot becoming the page's description. Only tinygrad's own server, which reads text
+alone, leaves such a request to this Mac's engine.
+
 **How much context fits on the card** (the `webgpu` engine). Qwen3.8-Flash-Next keeps the
 newest 32,768 positions of its cache on the card and the rest in this Mac's memory
 (FLASHNEXT.md), so its context is the setting's. The dense 27B reads every position of its

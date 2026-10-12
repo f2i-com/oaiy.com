@@ -222,15 +222,19 @@ fn relay_to_its_end(w: &mut TcpStream, response: oaiy_engine::http::Response, en
     }
 }
 
-/// A chat request for a model set to run on the eGPU (macOS, `crate::egpu`): answered by tinygrad's server there
-/// (`Some`), or left to this computer's engine (`None`) because the request has a picture, which tinygrad's server
-/// does not read, or because that server cannot be started or has gone: the card unplugged, tinygrad not installed.
+/// A chat request for a model set to run on the eGPU (macOS, `crate::egpu`): answered by the server there (`Some`),
+/// or left to this computer's engine (`None`) because the request has a picture and the server is tinygrad's, which
+/// does not read one, or because that server cannot be started or has gone: the card unplugged, tinygrad not installed.
 /// A server that is only still loading is waited for, and past the wait the client is told to try again.
 fn egpu_chat(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, cfg: &Json, name: &str) -> Option<io::Result<bool>> {
     use crate::egpu::{self, Unready};
     let llm = cfg.get("llm")?;
     let asked = Json::parse(&req.body).ok()?;
-    if egpu::has_picture(&asked) {
+    // (tinygrad's server reads text alone. OAIY's own engine on the card reads a picture as it does anywhere, where
+    // its model has a vision projector, and says at once where it has none: sent to this computer's engine instead,
+    // the request had that engine load the card's model here, 16 GB of the 27B beside its copy on the card, to be
+    // told the same)
+    if !egpu::webgpu(llm) && egpu::has_picture(&asked) {
         return None;
     }
     let body = egpu::request_body(llm, name, &req.body)?;
@@ -1424,6 +1428,25 @@ mod tests {
                 "media": {{"llm_policy": "coexist"}}}}"#
         );
         Arc::new(Studio::for_test(root, Json::parse(cfg.as_bytes()).unwrap()))
+    }
+
+    /// A picture for a model on the card, where the card runs OAIY's own engine: that engine's to answer (it reads
+    /// pictures, or says its model has no vision), not this computer's, which would load the model here to say so.
+    #[test]
+    fn a_picture_for_a_model_on_the_egpu_goes_to_oaiys_own_engine_there() {
+        let root = std::env::temp_dir();
+        let mut cfg = egpu_studio(&root, "small").config();
+        crate::util::set(crate::registry::obj_mut(&mut cfg, &["llm", "egpu"]).unwrap(), "engine", Json::str("webgpu"));
+        let studio = Arc::new(Studio::for_test(&root, cfg));
+        let (card, engine) = (StandIn::new(TINYGRAD_SAYS), StandIn::new(ENGINE_SAYS));
+        studio.egpu.adopt(&card.addr, "sk-egpu-test", "big", None);
+        studio.llm.adopt(&engine.addr, "sk-studio-test");
+        let picture = r#"{"model": "big", "stream": true, "messages": [{"role": "user", "content": [{"type": "text", "text": "what is this"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]}]}"#;
+        let (status, _, body) = chat(&studio, picture);
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("from the eGPU"), "{body}");
+        assert_eq!(card.requests().len(), 1);
+        assert!(engine.requests().is_empty(), "this computer's engine was not asked");
     }
 
     #[test]

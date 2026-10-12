@@ -283,6 +283,29 @@ await check('a SoftN app\'s buttons are clicked, and text that only looks like o
   expect(none.isError && none.content.includes('nothing matches "Subtract"') && !none.content.includes('as text'), none.content);
 });
 
+await check('a page of many gradients is screenshotted in WebKit\'s time too', async () => {
+  // The screenshot library draws again for every image a page holds where the browser says it is Safari, 100 ms and
+  // more apart, and counts a gradient as one: 300 cells were 300 draws, past the 60 s the preview waits. Chrome
+  // saying it is Safari takes that road.
+  const safari = await browser.newPage();
+  await safari.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15');
+  await safari.setViewport({ width: 1000, height: 700 });
+  await safari.goto(`${base}/tests/e2e/preview-harness.html`);
+  await safari.waitForFunction(() => document.title === 'ready', { timeout: 60_000 });
+  const cells = Array.from({ length: 300 }, () => '    <Box className="cell"><Text> </Text></Box>').join('\n');
+  await safari.evaluate((files) => { for (const [p, t] of Object.entries(files)) window.harness.write(p, t); }, {
+    'board/manifest.json': JSON.stringify({ name: 'Board', version: '1.0.0', main: 'ui/main.ui', files: { ui: ['ui/main.ui'], logic: ['logic/main.logic'] } }),
+    'board/logic/main.logic': 'let n = 0\n',
+    'board/ui/main.ui': `<logic src="../logic/main.logic" />\n<style>\n.board { display: grid; grid-template-columns: repeat(20, 24px); }\n.cell { width: 24px; height: 24px; background: radial-gradient(circle at 35% 30%, #fff3c4, #d99a1f); }\n</style>\n<App>\n  <Box className="board">\n${cells}\n  </Box>\n</App>\n`,
+  });
+  const started = Date.now();
+  const shot = await safari.evaluate(() => window.harness.tool('preview_screenshot', { app: 'board', save_to: 'shots/board.png' }).then((r) => r, (e) => ({ isError: true, content: String(e.message) })));
+  const took = Date.now() - started;
+  await safari.close();
+  expect(!shot.isError && shot.images === 1, JSON.stringify(shot).slice(0, 300));
+  expect(took < 15_000, `the screenshot took ${took} ms`);
+});
+
 await check('a 3D model is shown by the viewer and screenshotted from four sides, and from one angle', async () => {
   await page.evaluate((bytes) => window.harness.writeBytes('models/cube.glb', bytes), Array.from(cubeGlb()));
   await tool('preview_viewport', { width: 800, height: 600 });

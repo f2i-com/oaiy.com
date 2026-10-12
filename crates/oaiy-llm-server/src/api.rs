@@ -387,7 +387,8 @@ impl Server {
             return crate::qwen::prepare_images(records, prompt, a.cfg.image_token_id, vc, self.local_images, a.cfg.max_seq).map_err(bad);
         }
         let Some(vc) = &a.cfg.vision else {
-            return Err(bad("this server runs without the vision tower (started with --no-vision); images are not supported"));
+            // (worded for a client that looks for "image" or "vision" to go on in text, as OAIY's Agent does)
+            return Err(bad(format!("{} has no vision here (no vision projector is set for it, or the server runs with --no-vision); images are not supported", a.cfg.model_name)));
         };
         let mut preps = Vec::with_capacity(records.len());
         let mut hashes = Vec::with_capacity(records.len());

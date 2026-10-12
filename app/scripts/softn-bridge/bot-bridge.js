@@ -175,7 +175,14 @@
   const find = (target, selector, nth = 1, withClickable = false) => {
     const want = clean(target).toLowerCase();
     const all = candidates(selector, withClickable);
-    const texts = all.map((el) => [el, clean(el.tagName === 'INPUT' ? el.value || labelOf(el) : el.textContent || labelOf(el)).toLowerCase(), labelOf(el).toLowerCase()]);
+    const shownAs = new Map();
+    const texts = all.map((el) => {
+      const text = clean(el.tagName === 'INPUT' ? el.value || labelOf(el) : el.textContent || labelOf(el));
+      const label = labelOf(el);
+      // (named as the page's description names it: a field by its label, anything else by its text)
+      shownAs.set(el, /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName) ? label || text : text || label);
+      return [el, text.toLowerCase(), label.toLowerCase()];
+    });
     const exact = texts.filter(([, t, l]) => t === want || l === want).map(([el]) => el);
     const partial = texts.filter(([, t, l]) => t.includes(want) || l.includes(want)).map(([el]) => el);
     // The innermost of what matches: an element that holds another match is that match's surroundings (a board that
@@ -188,9 +195,7 @@
     const el = list.length === 1 ? list[0] : list[at - 1];
     if (!el) {
       if (list.length) throw new Error(`"${target}" matches ${list.length} controls: "nth" is 1 to ${list.length}, not ${at}`);
-      // (named as the page's description names them: a field by its label, anything else by its text)
-      const field = (el) => /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName);
-      const names = [...new Set(texts.map(([el, t, l]) => (field(el) ? l || t : t || l)).filter((n) => n && n.length <= 80))].slice(0, 30);
+      const names = [...new Set(all.map((el) => shownAs.get(el)).filter((n) => n && n.length <= 80))].slice(0, 30);
       const there = names.map((n) => `"${n.slice(0, 40)}"`).join(', ') || 'nothing';
       // (shown, and not a control: text that looks like a button and has nothing behind it is said to be that)
       const shown = withClickable && [...document.body.querySelectorAll('*')].some((el) => el.children.length === 0 && !hidden(el) && clean(el.textContent).toLowerCase().includes(want));
@@ -336,6 +341,7 @@
 
   // --- screenshots ------------------------------------------------------------
   const MAX_PAGE_HEIGHT = 12_000;
+  const MOST_DRAWS = 5;
   const opaque = (color) => color && color !== 'transparent' && !/rgba\([^)]*,\s*0\)$/.test(color);
   const shoot = async (fullPage) => {
     const lib = window.modernScreenshot;
@@ -365,6 +371,12 @@
     try {
       const context = await lib.createContext(root, { width, height, scale: 1, backgroundColor: background, timeout: 15_000, filter: (node) => node !== host });
       context.sandbox = sandbox;
+      // In WebKit and Firefox the library draws the picture again for each image the page holds, 100 ms and more
+      // apart (a picture's own images show only on a later draw there), and it counts every element with a
+      // gradient as one. A game board of 400 cells with gradients was 400 draws and two minutes, which the preview
+      // does not wait for: "did not answer within 60 s", every time, in OAIY's own window. A few draws show the images.
+      let draws = 0;
+      Object.defineProperty(context, 'drawImageCount', { configurable: true, get: () => Math.min(draws, MOST_DRAWS), set: (n) => (draws = n) });
       whole = await lib.domToCanvas(context);
       lib.destroyContext(context);
     } finally {
