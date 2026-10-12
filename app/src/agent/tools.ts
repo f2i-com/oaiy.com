@@ -16,7 +16,7 @@ import { appLabel, checkProject, describeApp, findApps, formatFindings, guideFor
 import { VIEWPORTS, targetLabel, type PageReport, type PreviewAction, type PreviewResult, type PreviewTarget, type ModelView, type Problem, type Shot, type Viewport, type ViewportInfo } from '../preview/preview';
 import { findPages, resolvePage } from '../preview/page';
 import { findModels, isModelPath, resolveModel } from '../preview/model';
-import { describeExample, docsMap, installExample, listExamples, lookupComponents, readTopic, searchKnowledge } from '../softn/knowledge';
+import { checkEvents, describeExample, docsMap, installExample, listExamples, lookupComponents, readTopic, searchKnowledge } from '../softn/knowledge';
 import { DEFAULT_VIEW_SIZE, MAX_VIEW_SIZE, imageMimeFor, imageSize, viewImage, type ImagePart } from './images';
 import { FRAME_KINDS, MAX_REDOS, MAX_REVIEW_FAILURES, awaitingReview, contentHash, readReviews, reviewOf, storyFolder, writeReviews, type FrameKind } from './review';
 import { VOICES_FILE, keepVoice, ownVoice, projectVoiceList, readProjectVoices, savedName, voiceFor, writeProjectVoices, type ProjectVoices } from './voices';
@@ -1289,6 +1289,8 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       if (!ctx.preview) throw new Error('there is no live preview in this session');
       const app: PreviewTarget = { kind: 'app', root: target.root };
       const report = call.name === 'softn_inspect' ? await ctx.preview.inspect(app) : await ctx.preview.act(app, Array.isArray(input.actions) ? (input.actions as PreviewAction[]) : []);
+      // (text that was meant as a button: in SoftN that is most often a handler on a component that takes none)
+      if (report.error && /nothing takes a click there/.test(report.error)) report.error += ' In a SoftN app only some components take @click (Button, Box, Card, …); softn_check names a handler that is ignored.';
       return pageReport(`App: ${appLabel(target.root)}`, report);
     }
     case 'page_check': {
@@ -1858,7 +1860,7 @@ function pageReport(title: string, report: PageReport): string {
 }
 
 export async function checkApp(ctx: ToolContext, root: string): Promise<{ ok: boolean; text: string; signature: string }> {
-  const findings = [...checkProject(ctx.vfs, root), ...(await logicSyntax(ctx.vfs, root).catch(() => []))];
+  const findings = [...checkProject(ctx.vfs, root), ...(await logicSyntax(ctx.vfs, root).catch(() => [])), ...(await checkEvents(ctx.vfs, root).catch(() => []))];
   const lines = [`App: ${appLabel(root)}`, `Files: ${formatFindings(findings)}`];
   const problems: string[] = findings.filter((f) => f.level === 'error').map((f) => `${f.file}: ${f.message}`);
   if (problems.length) {

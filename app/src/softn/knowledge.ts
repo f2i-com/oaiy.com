@@ -11,13 +11,55 @@
 import { unzipSync } from 'fflate';
 import type { Vfs } from '../vfs/vfs';
 import { COMPONENT_INDEX, DOC_INDEX } from './knowledge/index.generated';
-import { importSoftn } from './softn';
+import { appFiles, handlersIn, importSoftn, type Finding } from './softn';
 
 const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
 
 const components = () => import('./knowledge/components.generated').then((m) => m.COMPONENT_REFERENCE);
 const docs = () => import('./knowledge/docs.generated').then((m) => m.DOC_PAGES);
 const examples = () => import('./knowledge/examples.generated').then((m) => m.SOFTN_EXAMPLES);
+
+/** Each component's events as its reference lists them ("Events …", then "- @name" lines), in lower case. */
+let eventsOf: Promise<Map<string, Set<string>>> | null = null;
+export function componentEvents(): Promise<Map<string, Set<string>>> {
+  eventsOf ??= components().then((reference) => {
+    const map = new Map<string, Set<string>>();
+    for (const [name, text] of Object.entries(reference)) {
+      const lines = text.split('\n');
+      const at = lines.findIndex((l) => l.startsWith('Events'));
+      const events = new Set<string>();
+      for (let i = at + 1; at >= 0 && i < lines.length && lines[i].startsWith('- @'); i++) events.add(/^- @([A-Za-z0-9]+)/.exec(lines[i])![1].toLowerCase());
+      map.set(name, events);
+    }
+    return map;
+  });
+  return eventsOf;
+}
+
+/**
+ * Handlers a page writes on components that do not take them. The runtime drops
+ * such a handler without a word: a `<Text @click={…}>` renders, looks like the
+ * button it was meant as, and does nothing when clicked. A component with no
+ * events at all is an error; one that has events but not this one a warning.
+ */
+export async function checkEvents(vfs: Vfs, root = ''): Promise<Finding[]> {
+  const events = await componentEvents();
+  const out: Finding[] = [];
+  for (const [path, data] of appFiles(vfs, root)) {
+    if (!/\.ui$/i.test(path)) continue;
+    for (const h of handlersIn(new TextDecoder().decode(data))) {
+      const takes = events.get(h.tag);
+      if (!takes || takes.has(h.event.toLowerCase())) continue;
+      if (!takes.size) {
+        const fix = /^(click|press|tap)$/i.test(h.event) ? ' Use <Button>, or put it inside a <Box @click={…}>.' : '';
+        out.push({ level: 'error', file: path, message: `line ${h.line}: <${h.tag}> takes no events, so its @${h.event} never runs.${fix}` });
+      } else {
+        out.push({ level: 'warning', file: path, message: `line ${h.line}: <${h.tag}> has no @${h.event}, so it never runs; its events: ${[...takes].map((e) => `@${e}`).join(', ')}` });
+      }
+    }
+  }
+  return out;
+}
 
 /** Load everything once, so the service worker caches it for offline use. */
 export function warmKnowledge(): void {

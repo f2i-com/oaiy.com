@@ -307,6 +307,45 @@ export function checkProject(vfs: Vfs, root = ''): Finding[] {
   return out;
 }
 
+/** An event handler written on a component in a .ui page: `<Text @click={…}>` is Text, click, and its line. */
+export interface Handler {
+  tag: string;
+  event: string;
+  line: number;
+}
+
+/**
+ * The event handlers a .ui page writes on its components (tags that begin with a
+ * capital): each `@name` among an opening tag's attributes, outside its strings and
+ * its `{…}` values.
+ */
+export function handlersIn(source: string): Handler[] {
+  const out: Handler[] = [];
+  const open = /<([A-Z][A-Za-z0-9]*)(?=[\s/>])/g;
+  for (let m = open.exec(source); m; m = open.exec(source)) {
+    const line = source.slice(0, m.index).split('\n').length;
+    let depth = 0;
+    let quote = '';
+    let i = open.lastIndex;
+    for (; i < source.length; i++) {
+      const c = source[i];
+      if (quote) {
+        if (c === '\\') i++;
+        else if (c === quote) quote = '';
+      } else if (c === '"' || c === "'" || c === '`') quote = c;
+      else if (c === '{') depth++;
+      else if (c === '}') depth = Math.max(0, depth - 1);
+      else if (depth === 0 && c === '>') break;
+      else if (depth === 0 && c === '@') {
+        const name = /^[A-Za-z][A-Za-z0-9]*/.exec(source.slice(i + 1));
+        if (name) out.push({ tag: m[1], event: name[0], line });
+      }
+    }
+    open.lastIndex = i;
+  }
+  return out;
+}
+
 /**
  * Syntax errors in the app's JavaScript logic, found by compiling each .logic
  * file on the Zipp sandbox (the same engine the app runs on). The hosted

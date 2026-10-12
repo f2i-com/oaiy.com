@@ -265,6 +265,24 @@ await check('a SoftN app is screenshotted in the same preview', async () => {
   writeFileSync(join(shots, 'app.png'), Buffer.from(await page.evaluate(() => Array.from(window.harness.read('shots/app.png')))));
 });
 
+await check('a SoftN app\'s buttons are clicked, and text that only looks like one is said to be text', async () => {
+  // (a Text takes no @click: the runtime drops it, and what was written as a button does nothing)
+  await write({
+    'clicks/manifest.json': JSON.stringify({ name: 'Clicks', version: '1.0.0', main: 'ui/main.ui', files: { ui: ['ui/main.ui'], logic: ['logic/main.logic'] } }),
+    'clicks/logic/main.logic': 'let count = 0\nfunction add() { count = count + 1 }\nfunction addTen() { count = count + 10 }\n',
+    'clicks/ui/main.ui': '<logic src="../logic/main.logic" />\n<App>\n  <Text>count is {count}</Text>\n  <Button @click={add}>Add one</Button>\n  <Box @click={addTen}><Text>Add ten</Text></Box>\n  <Text className="fake" @click={add}>Sound on</Text>\n</App>\n',
+  });
+  const checked = await tool('softn_check', { app: 'clicks' });
+  expect(checked.content.includes('line 6: <Text> takes no events, so its @click never runs') && !checked.content.includes('line 4') && !checked.content.includes('line 5'), checked.content);
+  // one match and an "nth" past it is that match; a box that takes clicks is clicked by its text
+  const one = await tool('softn_interact', { app: 'clicks', actions: [{ click: 'Add one', nth: 11 }, { click: 'Add ten' }] });
+  expect(!one.isError && /count is\s*11/.test(one.content), one.content);
+  const text = await tool('softn_interact', { app: 'clicks', actions: [{ click: 'Sound on', nth: 11 }] });
+  expect(text.isError && text.content.includes('"Sound on" is on the page as text, but nothing takes a click there') && text.content.includes('softn_check names a handler that is ignored') && text.content.includes('"Add one"'), text.content);
+  const none = await tool('softn_interact', { app: 'clicks', actions: [{ click: 'Subtract' }] });
+  expect(none.isError && none.content.includes('nothing matches "Subtract"') && !none.content.includes('as text'), none.content);
+});
+
 await check('a 3D model is shown by the viewer and screenshotted from four sides, and from one angle', async () => {
   await page.evaluate((bytes) => window.harness.writeBytes('models/cube.glb', bytes), Array.from(cubeGlb()));
   await tool('preview_viewport', { width: 800, height: 600 });

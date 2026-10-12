@@ -84,11 +84,22 @@
     return clean(el.getAttribute('placeholder') || el.getAttribute('name') || el.getAttribute('title') || '');
   };
   const CONTROL = 'button, a[href], input, textarea, select, [role="button"], [role="checkbox"], [role="switch"], [role="tab"], [role="slider"], [contenteditable="true"]';
-  // An element the page listens to clicks on (the web page preview, whose pages run on Zipp, keeps track).
+  // An element the page listens to clicks on. The web page preview, whose pages run on Zipp, keeps track of each
+  // element's listeners. A SoftN app's are React's, which listens at the root itself and keeps an element's handlers
+  // with the element (`__reactProps$…`): a `<Text @click=…>` is a span no selector tells from any other, and an app
+  // whose "Sound on" and "Restart" were such was described without them and could not be clicked.
   const CLICK_TYPES = ['click', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'touchstart'];
+  const CLICK_PROPS = ['onClick', 'onPointerDown', 'onMouseDown', 'onPointerUp', 'onMouseUp', 'onTouchStart'];
+  let reactProps = null;
+  const propsOf = (el) => {
+    if (!reactProps) reactProps = Object.keys(el).find((k) => k.startsWith('__reactProps$')) || null;
+    return reactProps ? el[reactProps] : null;
+  };
   const clickable = (el) => {
     const types = window.__botComputerListening && window.__botComputerListening.get(el);
-    return !!types && CLICK_TYPES.some((t) => types.has(t));
+    if (types && CLICK_TYPES.some((t) => types.has(t))) return true;
+    const props = propsOf(el);
+    return !!props && CLICK_PROPS.some((p) => typeof props[p] === 'function');
   };
   const describeControl = (el) => {
     const tag = el.tagName.toLowerCase();
@@ -167,11 +178,24 @@
     const texts = all.map((el) => [el, clean(el.tagName === 'INPUT' ? el.value || labelOf(el) : el.textContent || labelOf(el)).toLowerCase(), labelOf(el).toLowerCase()]);
     const exact = texts.filter(([, t, l]) => t === want || l === want).map(([el]) => el);
     const partial = texts.filter(([, t, l]) => t.includes(want) || l.includes(want)).map(([el]) => el);
-    const list = exact.length ? exact : partial;
-    const el = list[Math.max(0, nth - 1)];
+    // The innermost of what matches: an element that holds another match is that match's surroundings (a board that
+    // takes clicks, with the button asked for inside it).
+    const matched = exact.length ? exact : partial;
+    const list = matched.filter((el) => !matched.some((other) => other !== el && el.contains(other)));
+    const at = Math.max(1, Math.floor(Number(nth)) || 1);
+    // (one match and an "nth" past it: that one. A model counts the page's lines or its controls, where nth counts
+    // what matches, and was told nothing matched a button that was there)
+    const el = list.length === 1 ? list[0] : list[at - 1];
     if (!el) {
-      const names = texts.map(([, t, l]) => l || t).filter(Boolean).slice(0, 30);
-      throw new Error(`nothing matches "${target}"${nth > 1 ? ` (#${nth})` : ''}. On the page: ${names.map((n) => `"${n.slice(0, 40)}"`).join(', ') || 'no controls'}`);
+      if (list.length) throw new Error(`"${target}" matches ${list.length} controls: "nth" is 1 to ${list.length}, not ${at}`);
+      // (named as the page's description names them: a field by its label, anything else by its text)
+      const field = (el) => /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName);
+      const names = [...new Set(texts.map(([el, t, l]) => (field(el) ? l || t : t || l)).filter((n) => n && n.length <= 80))].slice(0, 30);
+      const there = names.map((n) => `"${n.slice(0, 40)}"`).join(', ') || 'nothing';
+      // (shown, and not a control: text that looks like a button and has nothing behind it is said to be that)
+      const shown = withClickable && [...document.body.querySelectorAll('*')].some((el) => el.children.length === 0 && !hidden(el) && clean(el.textContent).toLowerCase().includes(want));
+      if (shown) throw new Error(`"${target}" is on the page as text, but nothing takes a click there. What can be clicked: ${there}.`);
+      throw new Error(`nothing matches "${target}". On the page: ${there}`);
     }
     return el;
   };
