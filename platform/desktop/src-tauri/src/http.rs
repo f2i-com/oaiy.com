@@ -872,6 +872,9 @@ async fn engines_status() -> axum::response::Response {
     Json(serde_json::json!({
         "running": true,
         "uiUrl": ui,
+        // (where the gateway is, as the engines say: the port they have, which is not their configuration's where another
+        // program held that one; the Agent's page looks for OAIY here)
+        "gatewayUrl": state.get("gateway_url"),
         "llm": {
             "state": llm.get("state"),
             "resident": llm.get("resident"),

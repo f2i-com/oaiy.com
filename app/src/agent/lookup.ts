@@ -9,7 +9,8 @@
  * The decisions are here, pure, so a test can hold them: main.ts asks and does what it is told.
  */
 import { looksOnLoad, type Host } from '@oaiy/shared/capabilities/host';
-import { OAIY_ORIGIN } from './media';
+import { OAIY_ORIGIN, originOf, type MediaSettings } from './media';
+import type { ProviderConfig } from './providers/types';
 
 /** Where to look, and whether the API key the person typed may go with the request. */
 export interface LookTarget {
@@ -44,4 +45,48 @@ export function whereToLook(input: { host: Host; asked: string | null; discovere
 export function whereToFollow(input: { host: Host; discovered?: string }): string | null {
   if (input.host.automated) return null;
   return input.discovered ?? (looksOnLoad(input.host) ? OAIY_ORIGIN : null);
+}
+
+/** An origin, or '' for an address that is not one. */
+const originOr = (url?: string | null): string => {
+  try {
+    return url ? originOf(url) : '';
+  } catch {
+    return '';
+  }
+};
+
+/** Whether an origin is this computer's own (OAIY's engines on it). */
+const loopback = (origin: string): boolean => /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i.test(origin);
+
+/**
+ * Where OAIY's engines now serve their gateway (`gateway`, as OAIY Desktop says), where the page knows this computer's OAIY
+ * at another address (`known`: the one found before, else the usual one): the engines took a free port, theirs being
+ * held by another program. Null where nothing moved, OAIY Desktop does not say, or the OAIY the page knows is another
+ * computer's (the person's own choice, not moved).
+ */
+export function movedGateway(known: string | null | undefined, gateway: string | null | undefined): { from: string; to: string } | null {
+  const to = originOr(gateway);
+  const from = originOr(known ?? OAIY_ORIGIN);
+  return to && from && to !== from && loopback(to) && loopback(from) ? { from, to } : null;
+}
+
+/**
+ * What the page keeps of OAIY moved from `from` to `to` (an origin each): the OAIY it found, the media service's address
+ * and the chat providers at it, each keeping its path (`/v1`). Whether anything moved.
+ */
+export function moveOaiy(media: MediaSettings, providers: ProviderConfig[], from: string, to: string): { media: MediaSettings; changed: boolean } {
+  const moved = (url: string): string => (originOr(url) === from ? `${to}${url.slice(from.length)}` : url);
+  let changed = false;
+  for (const p of providers) {
+    if (!p.baseUrl || originOr(p.baseUrl) !== from) continue;
+    p.baseUrl = moved(p.baseUrl);
+    changed = true;
+  }
+  let next = media;
+  if (media.discovered?.origin === from || (media.baseUrl && originOr(media.baseUrl) === from)) {
+    next = { ...media, baseUrl: media.baseUrl ? moved(media.baseUrl) : media.baseUrl, ...(media.discovered ? { discovered: { ...media.discovered, origin: media.discovered.origin === from ? to : media.discovered.origin } } : {}) };
+    changed = true;
+  }
+  return { media: next, changed };
 }

@@ -2014,6 +2014,8 @@ export const ring = {
 export interface EnginesStatus {
   running: boolean;
   uiUrl?: string;
+  /** Where the engines' gateway is: the port they have, which is not their configuration's where another program held it. */
+  gatewayUrl?: string | null;
   llm?: { state: string | null; resident: string | null; models: string[] | null; loadSeconds: number | null };
   gpus?: Array<{ index: number; name: string; memory_used_mb: number; memory_total_mb: number }> | null;
 }

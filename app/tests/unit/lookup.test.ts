@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { readHost, type Host, type HostEnv } from '@oaiy/shared/capabilities/host';
-import { OAIY_ORIGIN } from '../../src/agent/media';
-import { whereToFollow, whereToLook } from '../../src/agent/lookup';
+import { EMPTY_MEDIA, OAIY_ORIGIN } from '../../src/agent/media';
+import { moveOaiy, movedGateway, whereToFollow, whereToLook } from '../../src/agent/lookup';
+import type { ProviderConfig } from '../../src/agent/providers/types';
 
 /** The page's globals in each place the Agent runs. */
 const at = (env: HostEnv): Host => readHost(env);
@@ -99,5 +100,32 @@ describe('the Agent has no other way to look at OAIY as it loads', () => {
     expect(naming(/\bpageHost\(/)).toEqual(['main.ts', 'ui/settings.ts']);
     // (Not "any port of a host name": the origin OAIY serves from is matched exactly, once, in shared/capabilities/host.ts.)
     expect(naming(/hostname\s*===\s*'(oaiy|oaiyflows|botcomputer)\.localhost'/)).toEqual([]);
+  });
+});
+
+describe("OAIY's engines on another port (theirs held by another program)", () => {
+  it('the gateway OAIY Desktop names is where this computer’s OAIY is looked for, and an OAIY elsewhere is left alone', () => {
+    expect(movedGateway(undefined, 'http://127.0.0.1:8081')).toEqual({ from: OAIY_ORIGIN, to: 'http://127.0.0.1:8081' });
+    expect(movedGateway('http://127.0.0.1:8080', 'http://127.0.0.1:8081/')).toEqual({ from: 'http://127.0.0.1:8080', to: 'http://127.0.0.1:8081' });
+    expect(movedGateway('http://localhost:8080', 'http://127.0.0.1:52011')?.to).toBe('http://127.0.0.1:52011');
+    // nothing moved, nothing said, or another computer's OAIY (the person's own choice)
+    expect(movedGateway(OAIY_ORIGIN, OAIY_ORIGIN)).toBeNull();
+    expect(movedGateway(undefined, OAIY_ORIGIN)).toBeNull();
+    expect(movedGateway(OAIY_ORIGIN, null)).toBeNull();
+    expect(movedGateway('http://studio.lan:8080', 'http://127.0.0.1:8081')).toBeNull();
+    expect(movedGateway(OAIY_ORIGIN, 'http://studio.lan:8081')).toBeNull();
+  });
+
+  it('what the page keeps of OAIY moves with it: the OAIY it found, its media address and the chat providers there', () => {
+    const at = (id: string, baseUrl: string): ProviderConfig => ({ id, type: 'local', serverKind: 'oaiy', name: id, apiKey: '', baseUrl, modelId: 'm' }) as ProviderConfig;
+    const providers = [at('local', 'http://127.0.0.1:8080/v1'), at('elsewhere', 'http://studio.lan:8080/v1'), at('origin only', 'http://127.0.0.1:8080')];
+    const media = { ...EMPTY_MEDIA, baseUrl: 'http://127.0.0.1:8080/v1', discovered: { service: 'oaiy-studio', version: '0.1.0', origin: 'http://127.0.0.1:8080', at: 1 } };
+    const moved = moveOaiy(media, providers, 'http://127.0.0.1:8080', 'http://127.0.0.1:8081');
+    expect(moved.changed).toBe(true);
+    expect(moved.media.baseUrl).toBe('http://127.0.0.1:8081/v1');
+    expect(moved.media.discovered?.origin).toBe('http://127.0.0.1:8081');
+    expect(providers.map((p) => p.baseUrl)).toEqual(['http://127.0.0.1:8081/v1', 'http://studio.lan:8080/v1', 'http://127.0.0.1:8081']);
+    // again: nothing more to move
+    expect(moveOaiy(moved.media, providers, 'http://127.0.0.1:8080', 'http://127.0.0.1:8081').changed).toBe(false);
   });
 });

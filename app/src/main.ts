@@ -36,7 +36,7 @@ import type { SessionTool, ToolHook } from './agent/agent';
 import { editPhone } from './ui/phone';
 import { startTheme } from './ui/theme';
 import { discoverOaiy, mediaAbilities, mergeDiscovered, originOf, type Discovery } from './agent/media';
-import { whereToFollow, whereToLook } from './agent/lookup';
+import { moveOaiy, movedGateway, whereToFollow, whereToLook } from './agent/lookup';
 import { pageHost } from '@oaiy/shared/capabilities/host';
 import type { FeatureId } from '@oaiy/shared/capabilities/features';
 import { agentCaps } from './desktop/caps';
@@ -1775,8 +1775,33 @@ A project can hold several apps, each in its own folder (any folder whose manife
    * windows at OAIY's usual address, a tab in a browser only at an OAIY it
    * found before (Settings → Find OAIY looks whenever it is pressed).
    */
+  /**
+   * Where OAIY Desktop says its engines' gateway is now, the page's OAIY moved there first where that is this computer's
+   * at another port (the engines took a free one, theirs being held by another program: it was looked for at 8080 and
+   * not found, and the chat providers at it failed). Null where there is no desktop, or it does not say.
+   */
+  async function followGateway(): Promise<string | null> {
+    const d = desktop;
+    if (!d || HOST.automated) return null;
+    const gateway = await d.gatewayUrl(AbortSignal.timeout(3000)).catch(() => null);
+    const move = movedGateway(media.discovered?.origin, gateway);
+    if (move) {
+      const moved = moveOaiy(media, providers, move.from, move.to);
+      if (moved.changed) {
+        media = moved.media;
+        await saveMedia(media);
+        await saveProviders(providers, activeId);
+        renderChips();
+      }
+    }
+    return gateway;
+  }
+
   async function lookForOaiy(): Promise<void> {
-    const target = whereToLook({ host: HOST, asked: new URLSearchParams(location.search).get('oaiy'), discovered: media.discovered?.origin, setByHand: !!media.baseUrl && !media.discovered });
+    const gateway = await followGateway();
+    // (OAIY's engines at the port they have, where the page had not found them before: not the usual one by habit)
+    const known = media.discovered?.origin ?? movedGateway(undefined, gateway)?.to;
+    const target = whereToLook({ host: HOST, asked: new URLSearchParams(location.search).get('oaiy'), discovered: known, setByHand: !!media.baseUrl && !media.discovered });
     if (!target) return;
     // The person's key goes only to the OAIY they set up, never to an address a link named.
     const found = await discoverOaiy(target.origin, target.withKey ? media.apiKey : '', undefined, 3000).catch(() => null);
@@ -1869,10 +1894,13 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       return;
     }
     if (!providers.some((p) => p.followEngine) && !engineFound) return;
-    const origin = whereToFollow({ host: HOST, discovered: media.discovered?.origin });
-    if (!origin) return;
-    void discoverOaiy(origin, media.apiKey, undefined, 3000).then((found) => {
-      if (found.state === 'found') followEngine(found);
+    // (the engines may have started again on another port: what the page keeps of them follows first)
+    void followGateway().then(() => {
+      const origin = whereToFollow({ host: HOST, discovered: media.discovered?.origin });
+      if (!origin) return;
+      return discoverOaiy(origin, media.apiKey, undefined, 3000).then((found) => {
+        if (found.state === 'found') followEngine(found);
+      });
     }).catch(() => {});
   }, 60_000);
 

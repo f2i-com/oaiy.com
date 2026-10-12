@@ -385,6 +385,15 @@ export class Desktop {
     await reply(await fetch(`${this.origin}/api/bridge/flows/${encodeURIComponent(id)}`, { method: 'PUT', headers: this.headers(), body: JSON.stringify(doc), signal }));
   }
 
+  /**
+   * Where OAIY's engines serve their gateway, as they say (`GET /api/engines`): the port they have, which is not their
+   * configuration's where another program held that one. Null when they are not running or do not say.
+   */
+  async gatewayUrl(signal?: AbortSignal): Promise<string | null> {
+    const body = await reply(await fetch(`${this.origin}/api/engines`, { headers: this.headers(), signal }));
+    return isRecord(body) && typeof body.gatewayUrl === 'string' && body.gatewayUrl ? body.gatewayUrl : null;
+  }
+
   /** Choose the language model OAIY's engines run, as their Engines page does (it loads when it is first asked). */
   async chooseEngineModel(model: string, signal?: AbortSignal): Promise<void> {
     await reply(await fetch(`${this.origin}/api/engines/defaults`, { method: 'PUT', headers: this.headers(), body: JSON.stringify({ group: 'llm', model }), signal }));

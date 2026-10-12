@@ -316,8 +316,30 @@ pub fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Args, Strin
     Ok(a)
 }
 
-fn listen(host: &str, port: u16, what: &str) -> Result<TcpListener, String> {
-    TcpListener::bind((host, port)).map_err(|e| format!("{what}: cannot listen on {host}:{port}: {e} (change the port with --{}port or in the configuration)", if what == "UI" { "ui-" } else { "" }))
+/// How many ports past the configured one are tried before any free one the system gives.
+const PORTS_AFTER: u16 = 20;
+
+/// A listener on `host:port`, or, where that port is not to be had, on the next free one of the [`PORTS_AFTER`] after
+/// it, else on any the system gives: with what was taken instead, for the log. Another program may hold the port
+/// (8080 is many a program's), Windows may keep it reserved (Hyper-V's and Docker's excluded ranges refuse a bind
+/// as access denied), or hold it a minute or two after an OAIY that ended suddenly (a desktop could not start its
+/// engines at all: "Only one usage of each socket address ... is normally permitted"). What the studio says of its
+/// addresses (`ui_url`, `gateway_url`, the discovery document's) is the port it has, and OAIY Desktop asks it.
+fn listen(host: &str, port: u16, what: &str) -> Result<(TcpListener, Option<String>), String> {
+    let taken = |e: &std::io::Error| matches!(e.kind(), std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied);
+    let first = match TcpListener::bind((host, port)) {
+        Ok(l) => return Ok((l, None)),
+        Err(e) if port != 0 && taken(&e) => e,
+        Err(e) => return Err(format!("{what}: cannot listen on {host}:{port}: {e} (change the port with --{}port or in the configuration)", if what == "UI" { "ui-" } else { "" })),
+    };
+    let next = (1..=PORTS_AFTER).filter_map(|d| port.checked_add(d)).chain([0]);
+    for other in next {
+        if let Ok(l) = TcpListener::bind((host, other)) {
+            let got = l.local_addr().map(|a| a.port()).unwrap_or(other);
+            return Ok((l, Some(format!("{what}: {host}:{port} is not to be had ({first}): listening on {host}:{got} instead"))));
+        }
+    }
+    Err(format!("{what}: cannot listen on {host}:{port} ({first}), nor on any other port"))
 }
 
 fn serve(listener: TcpListener, studio: Arc<Studio>, admin: bool) {
@@ -541,8 +563,14 @@ pub fn launch(args: &Args, quiet: bool) -> Result<Running, String> {
     let ui = cfg.get("ui").cloned().unwrap_or(Json::Null);
     let gw = cfg.get("gateway").cloned().unwrap_or(Json::Null);
     let (ui_host, gw_host) = (str_or(&ui, "host", "127.0.0.1").to_string(), str_or(&gw, "host", "127.0.0.1").to_string());
-    let ui_listener = listen(&ui_host, int_or(&ui, "port", 7860) as u16, "UI")?;
-    let gw_listener = listen(&gw_host, int_or(&gw, "port", 8080) as u16, "gateway")?;
+    let (ui_listener, ui_moved) = listen(&ui_host, int_or(&ui, "port", 7860) as u16, "UI")?;
+    let (gw_listener, gw_moved) = listen(&gw_host, int_or(&gw, "port", 8080) as u16, "gateway")?;
+    for moved in [ui_moved, gw_moved].into_iter().flatten() {
+        if !quiet {
+            println!("{moved}");
+        }
+        studio.log.push(moved);
+    }
     let shown = |host: &str| if host == "0.0.0.0" || host == "::" { "127.0.0.1".to_string() } else { host.to_string() };
     let ui_url = format!("http://{}:{}", shown(&ui_host), ui_listener.local_addr().map_err(|e| e.to_string())?.port());
     let gw_url = format!("http://{}:{}", shown(&gw_host), gw_listener.local_addr().map_err(|e| e.to_string())?.port());
@@ -649,6 +677,24 @@ pub fn console(studio: &Arc<Studio>, ui_url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_port_another_program_holds_is_listened_beside_and_said() {
+        // a free port, then held by another listener, as another program holds 8080
+        let held = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = held.local_addr().unwrap().port();
+        let (l, moved) = listen("127.0.0.1", port, "gateway").unwrap();
+        let got = l.local_addr().unwrap().port();
+        assert_ne!(got, port);
+        let said = moved.expect("the move is said");
+        assert!(said.contains(&format!("127.0.0.1:{port} is not to be had")) && said.contains(&format!("listening on 127.0.0.1:{got} instead")), "{said}");
+        // the port free: it is the one listened on, and nothing is said
+        drop((held, l));
+        let (l, moved) = listen("127.0.0.1", port, "gateway").unwrap();
+        assert_eq!((l.local_addr().unwrap().port(), moved), (port, None));
+        // a host that is not this computer's is not worked around
+        assert!(listen("203.0.113.9", port, "UI").is_err());
+    }
 
     #[test]
     fn a_host_reads_and_sets_the_server_and_keeps_the_rest_of_the_configuration() {

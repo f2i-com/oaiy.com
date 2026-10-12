@@ -207,6 +207,13 @@ desktop's own process (`oaiy_studio::launch`); a debug build attaches to an
 | `7860` | The engines' control pages and API |
 | `8783` | OAIY Voice |
 
+Where another program holds `8080` or `7860` (or Windows keeps it reserved, or holds it a
+minute after an OAIY that ended suddenly), the engines take the next free port of the 20
+after it, else any free one, and say so in Engines → Logs. The window, the Engines page,
+the Agent and the flows ask OAIY Desktop where they are (`GET /api/engines`'s `gatewayUrl`),
+so nothing needs changing; an address typed by hand elsewhere (a CLI's `--backend`, another
+program's settings) does.
+
 ## Getting started
 
 ### Prerequisites
