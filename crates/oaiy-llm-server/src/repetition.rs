@@ -83,8 +83,10 @@ impl CycleGuard {
     }
 
     /// Whether `next` would go on a run that is at its limit or past it (the run's own period: one that is a run of
-    /// a shorter period too is that period's, by its limit).
-    pub fn over(&self, next: u32) -> Option<Cycle> {
+    /// a shorter period too is that period's, by its limit). `turned`: the times this reply was turned from a run
+    /// already, each of which halves the limit (eight turns of the run at least): a model turned from a list's item
+    /// that goes on with the same item spelt another way has shown what it is doing, and is not given as long again.
+    pub fn over(&self, next: u32, turned: usize) -> Option<Cycle> {
         let n = self.last.len();
         (1..=Self::MOST.min(n)).find_map(|period| {
             if self.last[n - period] != next {
@@ -92,7 +94,8 @@ impl CycleGuard {
             }
             let span = self.run[period] + 1 + period;
             let shorter = (1..period).any(|d| period % d == 0 && self.last[n - d] == next && self.run[d] + 1 + d >= span);
-            (!shorter && span >= Self::limit(period)).then(|| Cycle { period, span, past: span - Self::limit(period) })
+            let limit = (Self::limit(period) >> turned.min(8)).max(8 * period);
+            (!shorter && span >= limit).then(|| Cycle { period, span, past: span - limit })
         })
     }
 }
@@ -187,7 +190,7 @@ mod tests {
     fn until_over(guard: &mut CycleGuard, unit: &[u32], most: usize) -> Option<(usize, Cycle)> {
         for i in 0..most {
             let next = unit[i % unit.len()];
-            if let Some(cycle) = guard.over(next) {
+            if let Some(cycle) = guard.over(next, 0) {
                 return Some((i, cycle));
             }
             guard.push(next);
@@ -207,14 +210,25 @@ mod tests {
         assert_eq!(pushed, 511, "the 512th token of the run is the one refused: 73 items written");
         // the model picks another token: the run is over, and what follows is judged anew
         guard.push(77);
-        assert_eq!(guard.over(1), None);
+        assert_eq!(guard.over(1, 0), None);
         assert!(until_over(&mut guard, &[1, 2, 3, 4, 5, 6, 7], 400).is_none());
         // refused again and again where the caller lets it go on: how far past the limit is said
         let mut guard = CycleGuard::default();
         for i in 0..600 {
             guard.push([1, 2, 3, 4, 5, 6, 7][i % 7]);
         }
-        assert_eq!(guard.over([1, 2, 3, 4, 5, 6, 7][600 % 7]).map(|c| (c.period, c.past)), Some((7, 89)));
+        assert_eq!(guard.over([1, 2, 3, 4, 5, 6, 7][600 % 7], 0).map(|c| (c.period, c.past)), Some((7, 89)));
+        // a reply turned from a run before is given half as long at the next, and half again: 256, 128, then eight
+        // turns of the run and no less
+        for (turned, limit) in [(1, 256), (2, 128), (3, 64), (4, 56), (9, 56)] {
+            let mut guard = CycleGuard::default();
+            let mut written = 0;
+            while guard.over([1, 2, 3, 4, 5, 6, 7][written % 7], turned).is_none() {
+                guard.push([1, 2, 3, 4, 5, 6, 7][written % 7]);
+                written += 1;
+            }
+            assert_eq!(written + 1, limit, "turned {turned} times");
+        }
     }
 
     #[test]
@@ -241,7 +255,7 @@ mod tests {
         for _ in 0..20_000 {
             x = x.wrapping_mul(1664525).wrapping_add(1013904223);
             let next = (x >> 16) % 50;
-            assert_eq!(guard.over(next), None);
+            assert_eq!(guard.over(next, 0), None);
             guard.push(next);
         }
         // nor one whose repeats are longer than it watches (a verse sung again: the other guards' to judge)

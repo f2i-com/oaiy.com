@@ -265,9 +265,11 @@ OpenAI's.
   to three tokens, which data is made of). Past that it has the model pick another token
   than the run's next, at the run's comma or line end where it has one, which closes a
   list: the same request then ended as a readable call of 74 actions in 14 s, where
-  unguarded it ran to its 6,000-token limit and was unreadable. A reply turned three
-  times that goes back to its run is stopped with `generation_repetition` (HTTP 422, or
-  the stream's error), which OAIY's Agent answers by asking once more.
+  unguarded it ran to its 6,000-token limit and was unreadable. Each time halves what
+  the reply's next run is let be (a model turned from an item may go on with the same
+  item spelt another way). A reply turned three times that goes back to its run is
+  stopped with `generation_repetition` (HTTP 422, or the stream's error), which OAIY's
+  Agent answers by asking once more.
   `--repetition-guard off` turns it off. The engine's `repeat_penalty` and the other
   penalties are not applied by this engine's sampler.
 - **Long prompts** run layer by layer: every expert is read once for the whole prompt

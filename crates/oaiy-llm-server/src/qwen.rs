@@ -917,9 +917,10 @@ impl QwenEngine {
             let mut next = logits.sample(&job.sampling, &mut rng);
             // A run that repeats without end (a list's same item again and again): the model picks another token
             // than the run's next, at the run's comma or line end where it has one (a list's place to close) and
-            // anywhere once a whole turn has passed with none. A reply turned so `TURNS` times is stopped, as is one
-            // whose rows are the model's pick alone (a greedy request's: there is no other token to take).
-            if let Some(cycle) = cycles.over(next).filter(|_| self.cycles) {
+            // anywhere once a whole turn has passed with none. Each time halves what the next run is let be. A reply
+            // turned so `TURNS` times is stopped, as is one whose rows are the model's pick alone (a greedy request's:
+            // there is no other token to take).
+            if let Some(cycle) = cycles.over(next, turned).filter(|_| self.cycles) {
                 if cycle.past >= cycle.period || tok.decode(&[next]).contains([',', ';', '\n']) {
                     let other = if turned < TURNS { logits.sample_but(next, &job.sampling, &mut rng) } else { None };
                     let Some(other) = other else {
