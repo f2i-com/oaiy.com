@@ -261,6 +261,9 @@ impl crate::server::TextToSpeech for Speaker {
             return Ok(());
         }
         let mut heard: Option<Vec<i16>> = line.is_some().then(Vec::new);
+        // (the line's own stop, which the listener's going sets too: the engine may have made all of it before then,
+        // and its pieces still waiting are let go unheard, so its "not cancelled" is not that the line was heard whole)
+        let stopped = Arc::clone(&cancel);
         let spoken = self.say(text, voice, cancel, &mut |pcm| {
             if let Some(h) = heard.as_mut() {
                 h.extend_from_slice(pcm);
@@ -274,7 +277,8 @@ impl crate::server::TextToSpeech for Speaker {
                 spoken.total_seconds,
                 spoken.first_chunk_seconds.unwrap_or(0.) * 1e3
             );
-            if let (Some(line), Some(pcm)) = (line, heard.filter(|h| !h.is_empty())) {
+            // Kept only where it was heard to its end: a line cut short, kept, was said cut short every time after.
+            if let (Some(line), Some(pcm), false) = (line, heard.filter(|h| !h.is_empty()), stopped.load(Ordering::Relaxed)) {
                 self.remember(line, pcm);
             }
         }
@@ -401,6 +405,44 @@ mod tests {
         }
         assert!(speaker.recall(&speaker.line("line 0", None).unwrap()).is_none());
         assert_eq!(speaker.recall(&speaker.line(&format!("line {}", REMEMBERED + 1), None).unwrap()).as_deref(), Some(&vec![(REMEMBERED + 1) as i16]));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_line_cut_short_after_it_was_made_is_not_kept() {
+        use crate::server::TextToSpeech as _;
+        let dir = folder("cut", &[("phone.wav", "RIFF")]);
+        let (jobs, inbox) = mpsc::channel::<Job>();
+        // A stand-in engine: the whole line made, its pieces waiting to be heard, and the line said done (not
+        // cancelled) before the listener has heard the first of them.
+        std::thread::spawn(move || {
+            for job in inbox {
+                for piece in [vec![1i16; 4], vec![2; 4], vec![3; 4]] {
+                    let _ = job.chunks.send(piece);
+                }
+                let _ = job.done.send(Ok(Spoken { audio_seconds: 0.0005, first_chunk_seconds: Some(0.0), total_seconds: 0.0, cancelled: false }));
+            }
+        });
+        let speaker = Speaker { jobs, model: "m".into(), device: "webgpu:0".into(), voices: Voices { dir: Some(dir.clone()), default: Some("phone".into()) }, remembered: Mutex::default() };
+        // the caller hangs up after the first piece: it is not kept as the line, to be said cut short next time
+        let mut heard = Vec::new();
+        speaker.speak("Okay —", None, Arc::new(AtomicBool::new(false)), &mut |pcm| {
+            heard.extend_from_slice(pcm);
+            false
+        }).unwrap();
+        assert_eq!(heard, vec![1; 4]);
+        assert!(speaker.recall(&speaker.line("Okay —", None).unwrap()).is_none(), "a line cut short is not said again as if whole");
+        // nor one cancelled by its caller as its pieces wait
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&cancel);
+        speaker.speak("Okay —", None, cancel, &mut |_| {
+            stop.store(true, Ordering::Relaxed);
+            true
+        }).unwrap();
+        assert!(speaker.recall(&speaker.line("Okay —", None).unwrap()).is_none());
+        // heard to its end: kept whole
+        speaker.speak("Okay —", None, Arc::new(AtomicBool::new(false)), &mut |_| true).unwrap();
+        assert_eq!(speaker.recall(&speaker.line("Okay —", None).unwrap()).as_deref(), Some(&[vec![1i16; 4], vec![2; 4], vec![3; 4]].concat()));
         let _ = std::fs::remove_dir_all(dir);
     }
 
