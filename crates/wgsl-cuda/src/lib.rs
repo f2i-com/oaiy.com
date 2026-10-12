@@ -335,7 +335,7 @@ impl<'a> Writer<'a> {
                         }
                         let (mty, msize) = match &self.module.types[m.ty].inner {
                             // (a runtime-sized array last in a buffer's struct: its first element, the rest past it)
-                            T::Array { size: ArraySize::Dynamic, base, .. } => (format!("{}", self.type_name(*base)?), 0),
+                            T::Array { size: ArraySize::Dynamic, base, .. } => (self.type_name(*base)?, 0),
                             inner => (self.type_name(m.ty)?, inner.size(self.module.to_ctx())),
                         };
                         // (a vec3 member is its 12 bytes, as WGSL lays it out: the next member may take the 4 after)
@@ -956,7 +956,7 @@ fn indent(level: usize) -> String {
 
 fn short<D: std::fmt::Debug>(d: &D) -> String {
     let s = format!("{d:?}");
-    s.split(|c: char| c == ' ' || c == '(' || c == '{').next().unwrap_or("?").to_string()
+    s.split([' ', '(', '{']).next().unwrap_or("?").to_string()
 }
 
 fn ends_in_jump(block: &naga::Block) -> bool {
@@ -976,7 +976,7 @@ fn literal(l: &Literal) -> Result<String, String> {
         Literal::I64(v) => format!("{v}ll"),
         Literal::Bool(b) => format!("{b}"),
         Literal::AbstractInt(v) => format!("{v}"),
-        Literal::AbstractFloat(v) => format!("{}", f32_literal(v as f32)),
+        Literal::AbstractFloat(v) => f32_literal(v as f32),
     })
 }
 

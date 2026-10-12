@@ -232,6 +232,8 @@ fn roomy(stream: &UnixStream) {
     let size: libc::c_int = 4 << 20;
     for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
         // (a smaller buffer only costs speed: what the system will not give is left as it is)
+        // SAFETY: setsockopt has no safe wrapper in std; the descriptor is the stream's own, open for the call, and the
+        // value is a c_int on the stack whose size is the length given.
         unsafe {
             libc::setsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, option, (&size as *const libc::c_int).cast(), std::mem::size_of::<libc::c_int>() as libc::socklen_t);
         }

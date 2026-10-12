@@ -12,7 +12,24 @@
 //! `WEBGPU_TINYGPU_BACKEND=native` takes wgpu's own instead (Metal on a Mac), to check a program against both.
 //!
 //! Unix's alone, as the adapter is: off Unix (Windows) the library is empty and build.rs compiles no C.
+//!
+//! # Safety
+//!
+//! Every `tgw_*` function is `unsafe extern "C"`: its caller is `src/webgpu.c` (nothing else links to them), and
+//! safe Rust cannot check what a C caller hands over. Each one relies on this contract, which is why none of them
+//! carries a `# Safety` section of its own:
+//! - A `*mut Tgw…` argument is null only where the function says it may be, and otherwise one this crate returned
+//!   (`boxed`) and has not freed: a live `Box` of that type. webgpu.c keeps each object's reference count and calls
+//!   the matching `tgw_*_free` once, at the last release, and never uses the pointer after.
+//! - An object is used from one thread at a time: webgpu.c makes no call on an object while another call on it is
+//!   under way (a buffer's map, range and unmap above all, which take `&mut` of it).
+//! - A pointer and length pair (`text`, a write's bytes, an array of entries) is a readable region of that many
+//!   elements for the length of the call; an out-pointer (`*mut TgwLimits`, `*mut TgwInfo`, `*mut *mut c_char`, …)
+//!   is writable, and a string this crate returns is given back to `tgw_string_free` alone.
+//! - A panic is never let past the C boundary: what wgpu reports by panicking is caught by `TgwDevice::guard` and
+//!   made the device's error; what is left unguarded aborts (the adapter's `expect`s on a lost socket).
 #![cfg(unix)]
+// (the contract above is every function's `# Safety`)
 #![allow(clippy::missing_safety_doc)]
 
 use std::collections::VecDeque;
@@ -166,6 +183,7 @@ fn boxed<T>(v: Option<T>) -> *mut T {
 
 unsafe fn free<T>(p: *mut T) {
     if !p.is_null() {
+        // SAFETY: a non-null `p` is one `boxed` made and nobody has freed (the crate's contract): taken back once.
         drop(Box::from_raw(p));
     }
 }
@@ -174,6 +192,8 @@ unsafe fn text<'a>(p: *const c_char, len: usize) -> &'a str {
     if p.is_null() {
         return "";
     }
+    // SAFETY: the caller's `p` is `len` readable bytes for the length of the call (the crate's contract); the bytes
+    // are checked as UTF-8, and the borrow is used within the call only.
     std::str::from_utf8(std::slice::from_raw_parts(p as *const u8, len)).unwrap_or("")
 }
 
@@ -192,6 +212,7 @@ fn copy_into(dst: &mut [c_char], s: &str) {
 #[no_mangle]
 pub unsafe extern "C" fn tgw_string_free(s: *mut c_char) {
     if !s.is_null() {
+        // SAFETY: a string this crate returned (`c_string`'s `CString::into_raw`), given back once.
         drop(CString::from_raw(s));
     }
 }

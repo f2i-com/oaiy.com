@@ -522,3 +522,35 @@ past its array is, and the server refuses a copy, clear, write, read or binding 
 it). The server and the adapter say their protocol's version at HELLO (3), and a program of another is refused: an
 older build would send a kernel's header short and the server read its first bytes as the source's. Each dispatch is
 still a Python call (tinygrad's launch), batched to one doorbell a submission.
+
+## Open: from a review on Windows (2026-10-12)
+
+Read, not run: nothing of this can run off a Mac with the card (the crates are Unix's, the emulator needs clang++).
+Each is for a session on the Mac to look at and, where it holds, put right with a test there.
+
+- **The tensor cores' scratch is sized for 160 SMs.** A fragment staged where it is not as `wmma` takes it goes to
+  a slot `(smid * 64 + warpid) * 256` floats (`wgsl-cuda/src/coop.cuh`) in a scratch the server makes for 160 SMs
+  (`webgpu_server.py`). The RTX 4090 has 128; an RTX 5090 has 170, and `bundle.py` offers `sm_120`: its SMs past the
+  160th would stage past the scratch. Size it from the card's SM count (or 256, a few MB).
+- **A dispatch's bindings are not counted against its program's.** DISPATCH takes the bindings sent and never
+  compares their number with what PROGRAM declared: too few and the kernel reads zeroed pointers, and the card
+  faults. OAIY's adapter always sends the right count; a program through `webgpu-tinygpu` may not.
+- **A binding shorter than its type.** wgpu's `custom` backend skips wgpu-core's minimum binding size, and neither
+  the adapter nor the server compares a binding's size with the shader's type: a fixed-size global is read through
+  its pointer unchecked, and `wgsl_index` of a binding of length 0 gives index 0. The server's 256-byte rounding
+  hides a small overrun except for a binding at a buffer's very end.
+- **A cooperative-matrix load whose pointer is not `&array[i]`** takes `avail` as unlimited, and `15u*stride+16u`
+  (`coop.cuh`) overflows for very large strides, so the unchecked fast path is taken.
+- **`wgpuBufferGetMappedRange` copies the whole range at each call** (`webgpu.c`), kept until unmap: two write
+  copies of overlapping ranges are written back in order, and the later, stale, copy undoes the earlier's writes.
+- **Two exports can panic outside `guard`**, which aborts the program that loaded the library: `tgw_buffer_range`
+  (the adapter's `expect` and its slicing) and `tgw_buffer_unmap` (a socket error). A buffer mapped from two
+  threads at once would alias `&mut` (the crate's safety contract now says webgpu.c must not).
+- **The emulator's test fails, not skips, without clang++** (it skips only where python3 is missing).
+- **What the plugin's bundle takes is not checked when it is made:** `bundle.py` packs `~/tinygrad` as it is
+  (uncommitted changes allowed, said in `tinygrad-commit.txt`) and unpinned jinja2/markupsafe, and copies firmware
+  and `TinyGPU.zip` from tinygrad's cache without their digests; at run time the firmware is checked
+  (`webgpu_server.py`), the app's zip is not.
+- **The card's socket is any process of this user's.** It is a Unix socket in a 0700 folder (`mkdtemp`, mode 0600),
+  so no other user and no web page reaches it, but a process of the same user may read, overwrite or free another
+  client's buffers (ids are sequential), stop the server, or load any CUDA it has a cubin for.
