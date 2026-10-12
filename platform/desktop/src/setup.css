@@ -193,7 +193,7 @@
   padding: 22px 24px 22px;
 }
 /* A plugin's screen sits flush in the pane: the pane draws no padding, the screen none (--host-page-pad: 0). */
-.setup-pane.is-flush { gap: 0; overflow: hidden; padding: 0; }
+.setup-pane.is-flush { gap: 0; overflow: hidden auto; padding: 0; }
 
 .setup-foot {
   display: flex;
@@ -466,14 +466,23 @@ details.setup-more-source > summary:hover { color: var(--text); }
 
 /* ---- a plugin screen as a step --------------------------------------------- */
 
-.setup-screen-step { display: flex; min-height: 0; flex: 1 1 auto; flex-direction: column; }
-.setup-screen-step > .setup-step-head { border-bottom: 1px solid var(--border); padding: 20px 24px 14px; }
-.setup-screen-status { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; padding: 10px 24px 0; }
+/* The step fills the pane, and its screen takes what the heading leaves: the screen's document scrolls inside
+   itself, so its buttons are never under the pane's edge. Only where even the screen's floor does not fit does
+   the pane scroll (it never clips). */
+.setup-screen-step { display: flex; flex: 1 0 auto; flex-direction: column; }
+.setup-screen-step > .setup-step-head { flex-wrap: wrap; align-items: flex-start; border-bottom: 1px solid var(--border); padding: 16px 24px 13px; }
+.setup-screen-step > .setup-step-head > .setup-step-titles { flex: 1 1 320px; }
+.setup-screen-step > .setup-step-head p { margin-top: 4px; font-size: 13px; }
+/* What the screen says it is doing, beside the heading (below it where they do not fit side by side). */
+.setup-screen-status { display: flex; max-width: 100%; flex: 0 1 300px; flex-direction: column; align-items: flex-end; gap: 6px; padding-top: 3px; }
 .setup-screen-status:empty { display: none; }
-.setup-check { color: var(--faint); font-family: var(--font-mono); font-size: 11px; overflow-wrap: anywhere; }
-.plugin-setup-frame { display: flex; min-height: 0; max-width: none; flex: 1 1 auto; flex-direction: column; gap: 0; }
+.setup-screen-status .setup-req-progress { align-items: flex-end; text-align: right; }
+.setup-screen-status .setup-req-progress .setup-progress { max-width: 220px; }
+.setup-screen-status .card-warn { text-align: right; }
+.setup-check { color: var(--faint); font-family: var(--font-mono); font-size: 11px; overflow-wrap: anywhere; text-align: right; }
+.plugin-setup-frame { display: flex; max-width: none; flex: 1 1 auto; flex-direction: column; gap: 0; }
 .plugin-setup-frame > .plugin-screen {
-  min-height: 440px;
+  min-height: 240px;
   flex: 1 1 auto;
   border: 0;
   border-radius: 0;
@@ -533,7 +542,7 @@ details.setup-more-source > summary:hover { color: var(--text); }
 .setup-substeps li.is-done button { color: var(--green); }
 .setup-substeps li.is-current button { border-color: var(--primary); background: var(--primary-soft); color: var(--primary); }
 .setup-embedded-body { display: flex; min-height: 0; flex: 1 1 auto; flex-direction: column; gap: 18px; overflow: auto; padding: 22px 24px; }
-.setup-embedded.is-flush .setup-embedded-body { gap: 0; overflow: hidden; padding: 0; }
+.setup-embedded.is-flush .setup-embedded-body { gap: 0; overflow: hidden auto; padding: 0; }
 
 /* ---- the Overview's card, and a plugin card's nudge -------------------------- */
 
@@ -716,9 +725,12 @@ input[type='checkbox'].switch:focus-visible { box-shadow: 0 0 0 3px var(--primar
   .setup-hero-side .setup-progress { flex: 1; width: auto; }
   .setup-pane,
   .setup-embedded-body { padding: 16px; }
-  .setup-screen-step > .setup-step-head { padding: 16px 16px 12px; }
+  .setup-screen-step > .setup-step-head { padding: 14px 16px 12px; }
   .setup-screen-step > .setup-run-note { margin: 8px 16px 0; }
-  .setup-screen-status { padding: 8px 16px 0; }
+  .setup-screen-status { flex-basis: 100%; align-items: flex-start; padding-top: 0; }
+  .setup-screen-status .setup-req-progress,
+  .setup-screen-status .card-warn,
+  .setup-check { align-items: flex-start; text-align: left; }
   .setup-req { flex-wrap: wrap; }
   .setup-req-action { width: 100%; justify-content: flex-end; }
   .setup-foot { flex-wrap: wrap; }

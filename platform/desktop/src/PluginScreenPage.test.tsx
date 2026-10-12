@@ -7,7 +7,7 @@
 // `data-theme` on ITS OWN document, and nothing ever crossed the frame
 // boundary, so the plugin screens rendered light under every theme.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { assembleScreenDocument, HOST_BOOTSTRAP, isPluginNavTarget, pluginAiSources, pluginFontCss, pluginNavAllowed, pluginOaiyStatus } from './PluginScreenPage';
+import { assembleScreenDocument, HOST_BOOTSTRAP, isPluginNavTarget, pluginAiSources, pluginFontCss, pluginNavAllowed, pluginOaiyStatus, SETUP_SCREEN_GUTTER } from './PluginScreenPage';
 import { installTestChannel, type testPorts } from './pluginScreenRpc.testTransport';
 let latestTestPorts: ReturnType<typeof testPorts>;
 import { API_BASE, engines, voices, type ModulesSnapshot } from './api';
@@ -281,11 +281,11 @@ describe('plugin iframe bootstrap: setup mode', () => {
     await expect(finish).resolves.toBe(true);
   });
 
-  it('keeps the gutter at 0 in a wizard step: the pane draws its own', () => {
+  it('keeps the wizard pane’s gutter in a wizard step: the page’s gutters do not move it', () => {
     const handle = bootSetup();
-    document.documentElement.style.setProperty('--host-page-pad', '0');
+    document.documentElement.style.setProperty('--host-page-pad', SETUP_SCREEN_GUTTER);
     handle(new MessageEvent('message', { data: { __pluginHost: 1, documentNonce: TEST_DOCUMENT_NONCE, gutter: '18px 16px 30px' }, source: window.parent as unknown as Window }));
-    expect(document.documentElement.style.getPropertyValue('--host-page-pad')).toBe('0');
+    expect(document.documentElement.style.getPropertyValue('--host-page-pad')).toBe(SETUP_SCREEN_GUTTER);
     // While a theme still applies.
     handle(new MessageEvent('message', { data: { __pluginHost: 1, documentNonce: TEST_DOCUMENT_NONCE, theme: 'dark' }, source: window.parent as unknown as Window }));
     expect(document.documentElement.classList.contains('fl-dark')).toBe(true);
@@ -326,9 +326,10 @@ describe('plugin screen document', () => {
     expect(doc).toContain('<script>x("<\\/script>")</script>');
   });
 
-  it('a setup step is stamped for its view before first paint, the context before the bootstrap, gutter 0', () => {
+  it('a setup step is stamped for its view before first paint, the context before the bootstrap, the pane’s gutter', () => {
     const doc = assembleScreenDocument({ ...parts, dark: false, setup: { step: 'pair', view: 'phone' } });
-    expect(doc).toMatch(/^<!doctype html><html data-theme="light" data-oaiy-setup="phone" style="--host-page-pad: 0">/);
+    expect(SETUP_SCREEN_GUTTER).toBe('14px 24px 20px');
+    expect(doc.startsWith(`<!doctype html><html data-theme="light" data-oaiy-setup="phone" style="--host-page-pad: ${SETUP_SCREEN_GUTTER}">`)).toBe(true);
     const stamp = doc.indexOf('<script>window.__oaiySetup={"mode":"setup","step":"pair","view":"phone"};</script>');
     expect(stamp).toBeGreaterThan(0);
     expect(stamp).toBeLessThan(doc.indexOf('<body>'));

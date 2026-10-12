@@ -173,6 +173,12 @@ export function pluginFontCss(): Promise<string> {
 /** The page's gutters as a padding (top, sides, bottom): a plugin screen runs
  *  edge to edge and draws them inside its own document, so its cards line up
  *  with the page's header as a built-in page's do. */
+/**
+ * A wizard step's gutter. The step's pane draws no padding, so the screen runs to its edges (its scrollbar at the
+ * pane's edge) and draws the gutter itself: the step heading's 24px either side, so its cards line up with it.
+ */
+export const SETUP_SCREEN_GUTTER = '14px 24px 20px';
+
 export function pageGutter(): string {
   const style = getComputedStyle(document.documentElement);
   const read = (name: string, fallback: string) => style.getPropertyValue(name).trim() || fallback;
@@ -439,7 +445,7 @@ export interface ScreenParts {
   /** Its scripts, one `<script>` each, in manifest order. */
   scripts: string[];
   dark: boolean;
-  /** The page's gutters (ignored in setup mode, where the gutter is 0). */
+  /** The page's gutters (ignored in setup mode, where the gutter is the wizard pane's: SETUP_SCREEN_GUTTER). */
   gutter: string;
   /** Setup mode: the wizard step's context, stamped before the bootstrap runs. */
   setup?: { step: string; view: string };
@@ -451,13 +457,14 @@ export interface ScreenParts {
  * In setup mode it is stamped for the step before first paint: the view on
  * `<html data-oaiy-setup>` (so the plugin's CSS can hide its own chrome), the
  * context as `window.__oaiySetup` ahead of the bootstrap (which then defines
- * `PluginHost.setup`), and a gutter of 0 (the wizard pane draws its own).
+ * `PluginHost.setup`), and the wizard pane's gutter (SETUP_SCREEN_GUTTER), which the
+ * page's resizes do not change.
  */
 export function assembleScreenDocument(parts: ScreenParts): string {
   const documentNonce = parts.documentNonce ?? crypto.randomUUID();
   const theme = parts.dark ? ' class="fl-dark" data-theme="dark"' : ' data-theme="light"';
   const setupAttr = parts.setup ? ` data-oaiy-setup="${attr(parts.setup.view)}"` : '';
-  const pad = parts.setup ? '0' : parts.gutter;
+  const pad = parts.setup ? SETUP_SCREEN_GUTTER : parts.gutter;
   // JSON in a script: `<` escaped so a view can never close the tag.
   const stamp = parts.setup
     ? `<script>window.__oaiySetup=${JSON.stringify({ mode: 'setup', step: parts.setup.step, view: parts.setup.view }).replace(/</g, '\\u003c')};</script>`

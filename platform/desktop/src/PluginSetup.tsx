@@ -291,29 +291,33 @@ export default function PluginWizard({ pluginId, layout, onFinished, onLeave, on
       case 'screen': {
         flush = true;
         const check = checks[s.id];
+        // Beside the heading, so the plugin's screen keeps the pane's height: what the screen says it is
+        // doing (not once the step is done, where the Done badge says it), a failure, and the done check.
+        const status = (
+          <div className="setup-screen-status" role="status">
+            {progress && current.state !== 'done' && (
+              <span className="setup-req-progress">
+                <span className="setup-progress" aria-hidden>
+                  <i className={progress.fraction === null ? 'is-indeterminate' : undefined} style={progress.fraction === null ? undefined : { width: `${progress.fraction * 100}%` }} />
+                </span>
+                <small>{progress.text}</small>
+              </span>
+            )}
+            {failure && (
+              <span className="card-warn">
+                <TriangleAlert size={12} /> {failure}
+              </span>
+            )}
+            {s.done !== undefined && current.state !== 'done' && check && record.state === 'running' && (
+              <small className="setup-check" title={check.detail}>
+                Not done yet: this step checks itself every few seconds.
+              </small>
+            )}
+          </div>
+        );
         content = (
           <div className="setup-screen-step">
-            {head}
-            <div className="setup-screen-status" role="status">
-              {progress && (
-                <span className="setup-req-progress">
-                  <span className="setup-progress" aria-hidden>
-                    <i className={progress.fraction === null ? 'is-indeterminate' : undefined} style={progress.fraction === null ? undefined : { width: `${progress.fraction * 100}%` }} />
-                  </span>
-                  <small>{progress.text}</small>
-                </span>
-              )}
-              {failure && (
-                <span className="card-warn">
-                  <TriangleAlert size={12} /> {failure}
-                </span>
-              )}
-              {s.done !== undefined && current.state !== 'done' && check && record.state === 'running' && (
-                <small className="setup-check" title={check.detail}>
-                  Not done yet: this step checks itself every few seconds.
-                </small>
-              )}
-            </div>
+            <StepHeader kicker={kicker} title={s.title} description={s.description} state={current.state} aside={status} />
             <PluginRunNote record={record} onStarted={() => void refreshPlugins()} />
             <PluginScreenPage
               pluginId={pluginId}
