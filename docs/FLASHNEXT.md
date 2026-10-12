@@ -136,7 +136,7 @@ computer's memory alone, where the engine has always kept a copy of it, and the 
 - **The model's place for it.** The engine's `--ctx` is the context; OAIY gives a model its own on the card
   (Models, the model's *Context on the eGPU*: `llm.models[].egpu_ctx`), so Flash-Next can have 262,144 while a dense
   27B on the same card has what its cache fits there (it reads every position at every token, so its cache stays on
-  the card, as f16: 81,920 positions beside its weights, which the engine finds as it loads it and keeps to; MAC.md).
+  the card, as f16: 77,824 positions beside its weights, which the engine finds as it loads it and keeps to; MAC.md).
 
 On the RTX 4090 beside an M5 Pro with 24 GB (12 October 2026), each answer right:
 

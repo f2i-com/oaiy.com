@@ -1080,7 +1080,9 @@ def handle(server: Server, conn: socket.socket, lock: threading.Lock, closing: t
           elif cmd == 3: owned.discard(struct.unpack_from("<Q", payload)[0])
         except Exception as e:
           out, status = f"{type(e).__name__}: {e}".encode(), 1
-          traceback.print_exc()
+          # (no room for a buffer is an answer, which a client may ask for to know what fits: a line, not a traceback)
+          if cmd == 2 and isinstance(e, MemoryError): print(f"tinygpu-webgpu: no room for a buffer of {struct.unpack_from('<Q', payload)[0] >> 20} MB", file=sys.stderr, flush=True)
+          else: traceback.print_exc()
       conn.sendall(struct.pack("<IQ", status, len(out)) + out)
       answered = time.perf_counter()
   except OSError:   # (the client gone: ConnectionError, BrokenPipeError)

@@ -79,6 +79,12 @@ impl CleanRows {
 pub trait DeviceChain: Send + Sync {
     /// A zeroed vector of `len`.
     fn vec(&self, len: usize) -> DeviceVec;
+    /// [`Self::vec`] asked for once: a device with no room refuses (as it does, [`Self::refuses_at_once`]) with
+    /// nothing let go and no second asking, where `vec` lets its spare go first and asks again. For finding what a
+    /// device has room for, where the refusal is the answer.
+    fn vec_once(&self, len: usize) -> DeviceVec {
+        self.vec(len)
+    }
     /// `values` (a matrix's, an even number) as f16, two to a word, if each is an f16 value exactly (a checkpoint's
     /// f16 weights held as f32): for [`ChainRecorder::matmul_f16_rows`]. None where the device keeps no such matrices.
     fn vec_f16(&self, values: &[f32]) -> Option<DeviceVec> {

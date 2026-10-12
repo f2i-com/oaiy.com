@@ -105,7 +105,7 @@ impl DeviceChain for WgpuBackend {
             && self.gpu.coop16()
             && matches!(head_dim, 64 | 128 | 256)
             && n_kv > 0
-            && n_h % n_kv == 0
+            && n_h.is_multiple_of(n_kv)
     }
 
     fn attention_halves(&self, n_h: usize, n_kv: usize, head_dim: usize) -> bool {
@@ -119,6 +119,10 @@ impl DeviceChain for WgpuBackend {
 
     fn vec(&self, len: usize) -> DeviceVec {
         DeviceVec { len, inner: Arc::new(self.gpu.with_room(|| vec_buffer(&self.gpu, len))) }
+    }
+
+    fn vec_once(&self, len: usize) -> DeviceVec {
+        DeviceVec { len, inner: Arc::new(vec_buffer(&self.gpu, len)) }
     }
 
     fn let_go_of_spare(&self) {

@@ -461,7 +461,21 @@ impl Work {
     }
 
     fn new(chain: &dyn DeviceChain, s: &Dims, t: usize) -> Work {
-        let v = |n: usize| chain.vec(n);
+        Self::made(s, t, |n| chain.vec(n))
+    }
+
+    /// The words [`Self::new`]'s vectors hold between them, none of them made.
+    fn words(s: &Dims, t: usize) -> usize {
+        let mut words = 0;
+        Self::made(s, t, |n| {
+            words += n;
+            DeviceVec { len: n, inner: Arc::new(()) }
+        });
+        words
+    }
+
+    /// A set for `t` rows, each vector `v`'s of its length.
+    fn made(s: &Dims, t: usize, mut v: impl FnMut(usize) -> DeviceVec) -> Work {
         Work {
             x: v(t * s.d),
             xn: v(t * s.d),
@@ -512,7 +526,7 @@ struct State {
     /// The attention cache held as f16 halves alone, with no f32 copy (`DeviceChain::halves_only`: a card with tensor
     /// cores, and no drafting layer, whose cache is f32): [`reserve_halves`]. The 27B's cache at 32,768 positions was
     /// 4.3 GB of f32 and 2.1 of halves beside it on a 24 GB card with 15.8 GB of weights; as halves alone the card holds
-    /// 81,920 positions beside a prompt's work ([`Qwen35Chain::context_room`]), and a step's attention read the halves
+    /// 77,824 positions beside a prompt's work ([`Qwen35Chain::context_room`]), and a step's attention read the halves
     /// already.
     halves_only: bool,
 }
@@ -1202,14 +1216,17 @@ impl Qwen35Run<'_> {
 impl Qwen35Chain {
     /// The most positions, `want` at most, whose attention cache the model's device holds beside what a prompt's run
     /// makes with it, found by making them where that is how a device says (one that refuses a vector as it is asked
-    /// for: the card's adapter): the cache at that many positions as [`reserve_halves`] (or [`reserve`]) would make it,
-    /// a second prompt chunk's vectors and their attention's scratch (a chunk records while the one before runs),
-    /// three states kept from inside a run and their rows' vectors, and 768 MB for the recordings' own scratch and
-    /// reads. Tried at `want`, then halved over steps of 4,096 positions; all of it let go after. The cache the
-    /// warm-up made is let go first (the next run makes its own and writes every row). None where the device cannot
-    /// say, a second device takes a prompt's later layers, or the model runs no chain. The 27B on a 24 GB card: a
-    /// 79,273-token prompt left the card 651 MB, and one of 91,093 failed halfway for want of room; this found 81,920
-    /// positions, and a prompt of 81,243 left 156 MB.
+    /// for: the card's adapter). Beside the cache a prompt's run has a second chunk's vectors and their attention's
+    /// scratch (a chunk records while the one before runs), three states kept from inside a run and their rows'
+    /// vectors, and 768 MB of the recordings' own scratch and reads: their room is taken first, then the cache 4,096
+    /// positions at a time until the device refuses (once, where trying whole caches of this size and that was a
+    /// dozen refusals, each a traceback in the card's log) or `want` has its room. What that says fits is then made
+    /// as a run would make it, each layer's vector whole, and a device that refuses that is asked for 4,096 positions
+    /// fewer. All of it is let go after, and the cache the warm-up made before (the next run makes its own
+    /// and writes every row). None where the device cannot say, a second device takes a prompt's later layers, or the
+    /// model runs no chain. The 27B on a 24 GB card: a 79,273-token prompt left the card 651 MB, and one of 91,093
+    /// failed halfway for want of room; this finds 77,824 positions, and a prompt of 77,630 leaves 427 MB (whole
+    /// vectors of 128 MB do not take the small gaps a run's own vectors do, so it stops a step short of the most).
     pub fn context_room(&self, m: &Qwen35Model, want: usize) -> Option<usize> {
         let st = self.state(m)?;
         let chain = m.backend.chain()?;
@@ -1229,39 +1246,74 @@ impl Qwen35Chain {
             g.out = chain.vec(1);
         }
         chain.let_go_of_spare();
+        // (a layer's words a position, and the rows a cache of `positions` is made with: `reserve_halves`', `reserve`'s)
+        let words = if st.halves_only { row / 2 } else { row };
+        let cap_of = |positions: usize| if st.halves_only { halves_cap(positions) } else { positions.next_power_of_two().max(256) };
         let (state, conv) = (s.nv * s.dv * s.dk, (s.kern - 1) * s.ch);
-        let holds = |positions: usize| -> bool {
-            let (cap, words) = if st.halves_only { let c = halves_cap(positions); (c, c * row / 2) } else { let c = positions.next_power_of_two().max(256); (c, c * row) };
-            let made = if_room(|| {
-                let cache: Vec<DeviceVec> = (0..slots).map(|_| chain.vec(words)).collect();
-                let out = chain.vec(chain.attention_out_len(s.n_h, s.hd, cap));
-                let set = Work::new(chain, &s, 2 * MAX_ROWS);
-                let scratch_words = chain.attention_rows_out_len(2 * MAX_ROWS, s.n_h, s.hd, cap).min(ATTENTION_SCRATCH / 4);
-                let scratch: Vec<DeviceVec> = (0..2).map(|_| chain.vec(scratch_words + scratch_words / 2)).collect();
-                let kept: Vec<DeviceVec> = (0..3).flat_map(|_| st.ssm_layers.iter().flat_map(|_| [chain.vec(state), chain.vec(conv)])).collect();
-                let seg = Seg::new(chain, &s);
-                let spare: Vec<DeviceVec> = (0..12).map(|_| chain.vec((64 << 20) / 4)).collect();
-                (cache, out, set, scratch, kept, seg, spare)
-            });
+        let scratch_of = |cap: usize| {
+            let need = chain.attention_rows_out_len(2 * MAX_ROWS, s.n_h, s.hd, cap).min(ATTENTION_SCRATCH / 4);
+            need + need / 2
+        };
+        // (768 MB of the recordings' own, in vectors an adapter does not keep to hand out again once let go)
+        const SPARE: [usize; 2] = [(384 << 20) / 4; 2];
+        // what a prompt's run makes beside a cache of `cap` rows, and the words of it
+        let beside = |cap: usize| {
+            let out = chain.vec(chain.attention_out_len(s.n_h, s.hd, cap));
+            let set = Work::new(chain, &s, 2 * MAX_ROWS);
+            let scratch: Vec<DeviceVec> = (0..2).map(|_| chain.vec(scratch_of(cap))).collect();
+            let kept: Vec<DeviceVec> = (0..3).flat_map(|_| st.ssm_layers.iter().flat_map(|_| [chain.vec(state), chain.vec(conv)])).collect();
+            let seg = Seg::new(chain, &s);
+            let spare: Vec<DeviceVec> = SPARE.iter().map(|&n| chain.vec(n)).collect();
+            (out, set, scratch, kept, seg, spare)
+        };
+        let beside_words = |cap: usize| {
+            chain.attention_out_len(s.n_h, s.hd, cap) + Work::words(&s, 2 * MAX_ROWS) + 2 * scratch_of(cap) + 3 * st.ssm_layers.len() * (state + conv) + TAP_ROWS * 2 * (s.ch + s.nv * s.dv + s.nv) + SPARE.iter().sum::<usize>()
+        };
+        // The cache's room, measured: as many words as those in vectors of 128 MB or more (which no adapter keeps to
+        // hand out again: small ones kept so, where a run's own lay, left the whole vectors of the cache no place
+        // between them), then the cache 4,096 rows at a time (or as many of those as make 128 MB), every layer's rows
+        // in one vector a step, until the device refuses or the cache `want` is made with has its room.
+        let large = (128usize << 20) / 4;
+        let step = 4096 * large.div_ceil(slots.max(1) * 4096 * words).max(1);
+        let most = cap_of(want).div_ceil(step);
+        let mut steps = 0usize;
+        let mut held: Vec<DeviceVec> = Vec::new();
+        let all = if_room(|| {
+            let mut left = beside_words(cap_of(want));
+            while left > 0 {
+                let n = if left < 2 * large { left } else { large };
+                held.push(chain.vec_once(n));
+                left -= n;
+            }
+            for _ in 0..most {
+                held.push(chain.vec_once(slots * step * words));
+                steps += 1;
+            }
+        });
+        let fitted = all.is_some();
+        drop(held);
+        chain.let_go_of_spare();
+        if fitted {
+            return Some(want);
+        }
+        // the positions a cache of that many rows serves (what the reservation adds past them taken off), and that
+        // cache as a run makes it; fewer where the device has not that in whole vectors
+        let rows = steps * step;
+        let mut room = if st.halves_only { rows.saturating_sub(4096) } else if rows >= 256 { 1usize << rows.ilog2() } else { 0 };
+        while room > 0 {
+            let cap = cap_of(room);
+            // (asked for as a run asks, a second time where refused: the card's server gives back what was just let
+            // go a request late, and a vector of a new size straight after is refused once for that alone)
+            let made = if_room(|| ((0..slots).map(|_| chain.vec(cap * words)).collect::<Vec<_>>(), beside(cap)));
             let fits = made.is_some();
             drop(made);
             chain.let_go_of_spare();
-            fits
-        };
-        if holds(want) {
-            return Some(want);
-        }
-        // (`lo` steps fit, `hi` do not)
-        let (mut lo, mut hi) = (0, want.div_ceil(4096));
-        while hi - lo > 1 {
-            let mid = (lo + hi) / 2;
-            if holds(mid * 4096) {
-                lo = mid;
-            } else {
-                hi = mid;
+            if fits {
+                break;
             }
+            room = if st.halves_only { room.saturating_sub(4096) } else { room / 2 };
         }
-        Some(lo * 4096)
+        Some(room.min(want))
     }
 
     fn state(&self, m: &Qwen35Model) -> Option<&State> {
