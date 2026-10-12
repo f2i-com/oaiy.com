@@ -2909,14 +2909,19 @@ function keptTurns(turns: Turn[]): Turn[] {
   return turns.slice(from > 0 ? from : turns.length - MAX_KEPT_TURNS);
 }
 
-/** Whether this call's agent has requested an appointment. */
 /**
- * Whether this call's agent has a booking request on record: request_appointment called, and its answer not a
- * refusal (the phone's: it ends "(The phone refused it.)", or says nothing was recorded). A refused one is no request:
- * an agent that promised a booking after one ("Let me get that in for you now.") booked nothing, and was not told.
+ * Whether this call's agent has a booking request on record: request_appointment called in this call, and its latest
+ * answer not a refusal (the phone's: it ends "(The phone refused it.)", or says nothing was recorded). A refused one
+ * is no request: an agent that promised a booking after one ("Let me get that in for you now.") booked nothing, and
+ * was not told. The latest decides: a time taken earlier in the call, then a move to another the phone refused, is no
+ * request of the new time (any answer taken at all said "requested", and the move's promise was let be).
  */
 function requested(session: Session): boolean {
   const turns = session.agent.view();
-  const asked = new Set(turns.flatMap((t) => (t.role === 'assistant' ? t.calls.filter((c) => c.name === 'request_appointment').map((c) => c.id) : [])));
-  return turns.some((t) => t.role === 'tool' && t.results.some((r) => asked.has(r.id) && !r.isError && !/\(The phone refused it\.\)\s*$/.test(r.content) && !/"recorded":\s*false/.test(r.content)));
+  // (this call's turns: what an earlier call of the same caller booked is not this one's)
+  const from = turns.map(isCallStart).lastIndexOf(true);
+  const call = from >= 0 ? turns.slice(from) : turns;
+  const asked = new Set(call.flatMap((t) => (t.role === 'assistant' ? t.calls.filter((c) => c.name === 'request_appointment').map((c) => c.id) : [])));
+  const last = call.flatMap((t) => (t.role === 'tool' ? t.results.filter((r) => asked.has(r.id)) : [])).at(-1);
+  return !!last && !last.isError && !/\(The phone refused it\.\)\s*$/.test(last.content) && !/"recorded":\s*false/.test(last.content);
 }

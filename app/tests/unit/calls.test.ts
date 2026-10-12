@@ -993,6 +993,40 @@ describe('a phone call answered by the agent', () => {
     expect(fake.bodies).toHaveLength(4);
   });
 
+  it('a booking the phone took earlier in the call does not hide a later one it refused', async () => {
+    const thursday = { callerName: 'Lance', service: 'Lawn mowing', date: '2026-10-15', time: '10:00', agreementPhrase: 'Thursday at ten, yes' };
+    const friday = { ...thursday, date: '2026-10-16', agreementPhrase: 'Friday at ten instead' };
+    const fake = fakeProvider('openai', [
+      { text: '', calls: [{ name: 'request_appointment', input: thursday }] },
+      { text: "That's requested for Thursday at ten." },
+      { text: '', calls: [{ name: 'request_appointment', input: friday }] },
+      { text: 'Let me get that Friday booked in for you.' },
+      (body) => {
+        expect(JSON.stringify(body.messages)).toContain('or it was refused');
+        return { text: '', calls: [{ name: 'request_appointment', input: friday }] };
+      },
+      { text: "That's requested for Friday at ten." },
+    ]);
+    const { sessions, calls, desktop } = setup();
+    let asked = 0;
+    const accept = desktop.callTool;
+    desktop.callTool = async (callId: string, name: string, args: unknown) => {
+      // (the move's first asking refused, as the phone refuses a time it cannot take)
+      if (name === 'request_appointment' && ++asked === 2) {
+        calls.push([name, callId, args]);
+        return { ok: false, output: { error: 'that time is taken: offer another', recorded: false, status: 'not_recorded' } } as never;
+      }
+      return accept(callId, name, args);
+    };
+    await sessions.callEvent({ type: 'call.started', callId: 'call_m1', from: '+61400000042' });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_m1', text: 'Book me in Thursday at ten please.' });
+    await settled(sessions);
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_m1', text: 'Actually, make it Friday at ten instead.' });
+    await settled(sessions);
+    expect(calls.filter((c) => c[0] === 'request_appointment')).toHaveLength(3);
+    expect(fake.bodies).toHaveLength(6);
+  });
+
   it('a booking promised but not requested: the agent is told once, and requests it', async () => {
     const fake = fakeProvider('openai', [
       { text: "Thanks, Liam! I'll request Tuesday at one for a mow." },
