@@ -115,6 +115,43 @@ prompts of 30,000 one after the other, alone and through OAIY with a LoRA; the l
 Measured on an RTX 4090 in a Thunderbolt 3 enclosure beside an M5 Pro with 24 GB (11 October 2026), see
 [TINYGPU.md](TINYGPU.md#a-model-larger-than-the-card-qwen38-flash-next).
 
+## Longer contexts: the cache in the computer's memory
+
+A 24 GB card holds Flash-Next's attention cache for 32,768 positions beside its expert slots (1.8 GB: 12 attention
+layers, each position's keys and values 4 KB a layer and its raw indexer key 0.5 KB). Its model takes 262,144. Past
+what the card keeps (`OAIY_FN_RESIDENT`, 32,768 unless said, 4,096 at least) a request runs with the cache in the
+computer's memory alone, where the engine has always kept a copy of it, and the card holds none of it
+(`flashnext/offload.rs`):
+
+- **A reply's tokens: the attention on the CPU.** Past the dense span each query attends to its 512 best blocks of
+  four positions and its own last few, so a step reads 2,048 positions of a layer whatever the context. The card's run
+  waits at each attention layer for its queries; the CPU scores the cache's blocks by their pooled keys (pooled,
+  normed and rotated once each, and kept), chooses and attends as the card's QSA does, in parallel over the blocks
+  and the heads, and the card goes on with the output: 12 waits a token more.
+- **A prompt's chunks: the card, a layer at a time.** A chunk's thousand rows choose most of the blocks between them,
+  so its attention stays on the card: each attention layer's rows (and raw keys) are streamed up from the computer's
+  memory as the layer begins, into one layer's vectors that every layer uses in turn. The card holds one layer's rows
+  for the prompt where it held every layer's for the whole context, and its expert slots keep their room (the slots
+  are sized around the resident cache, not the context).
+- **The model's place for it.** The engine's `--ctx` is the context; OAIY gives a model its own on the card
+  (Models, the model's *Context on the eGPU*: `llm.models[].egpu_ctx`), so Flash-Next can have 262,144 while a dense
+  27B on the same card keeps the 32,768 that fills the card beside it.
+
+On the RTX 4090 beside an M5 Pro with 24 GB (12 October 2026), each answer right:
+
+| Prompt | Read in | Reply | The engine's memory | The card's least free |
+|---|---|---|---|---|
+| 12,087 tokens, offloaded at 4,096 (a check against the card's own) | 70 s (61 on the card) | 7.7 tokens/s (6.9) | | |
+| 53,334 tokens | 338 s | 7.7 tokens/s | 4.3 GB | 1.9 GB |
+| 110,794 tokens | 853 s | 7.5 tokens/s | 4.7 GB | 1.3 GB |
+
+A prompt's chunk takes 4 s near its start and 10 s at 100,000 positions: the experts much as ever, the rest the rows
+streamed up (5 GB a chunk there) and the scores over more blocks. A reply's tokens cost about as they did. The same
+12,087-token request offloaded and on the card agrees at every step to within 0.4 a logit, their texts parting at a
+step where the top three were within 0.05. The CPU's attention is held to the CPU backend's reference in a test.
+The cache in the computer's memory is 54 KB a position in f32 (6 GB at 110,000 positions): macOS compresses it and,
+where memory is short, pages it to the drive, and a step touches 2,048 positions of a layer.
+
 ## Prompt states on the disk
 
 With `--prompt-cache DIR`, the model's states go to the disk as the Qwen3.5 hybrid's do (`Snapshot::restore_whole`):

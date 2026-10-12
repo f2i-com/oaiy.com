@@ -60,39 +60,102 @@ impl FlashNext {
         let mut m = st.m.lock().unwrap_or_else(|p| p.into_inner());
         // the devices' copies of the attention caches: room for this run, the rows the host wrote since (a resumed
         // chunk's when it began)
+        // A request that needs more rows than the device keeps its cache for (`resident_rows`) runs with the cache on
+        // the host (`offload.rs`): one device's, and not a check of drafts, whose undoing is the device copy's. So does
+        // one whose copy the device has no room for at all.
+        let offloadable = st.attn_of.len() == 1 && !check && !resumed;
+        let mut offload = false;
         for (d, layers) in st.attn_of.iter().enumerate().filter(|_| !resumed) {
             let g = &mut m.kv[d];
             let kept = |g: &ChainKv| if g.owner == kv.id { kv.dirty_from.min(past) } else { 0 };
-            // Room for this run's rows, and for those the cache's user has said are coming (a prompt's): made at the
-            // prompt's first run, before anything of the prompt is on the device, and not as its rows come. (It was
-            // made when a run first reached past what was there: for a prompt longer than the last, in the middle of
-            // it, beside its chunk's scratch and its experts just taken in, and a 17,619-token prompt after a
-            // 14,974-token one found no room, "Allocation of 512.00 MB failed", where the same prompt alone had it.)
-            // The old vectors go as the new ones come, a layer at a time, and before any new one where none of their
-            // rows is kept: made all at once beside the old ones, a cache's growth took both caches' memory of a card
-            // that holds little more than one (the 27B's did, llama-rs's `reserve`).
-            let least = (past + t).next_power_of_two().max(256);
-            let whole = (past + t).max(kv.expect.min(kv.max_len)).next_power_of_two().max(256);
-            let out_len = |cap: usize| chains[d].attention_out_len(nh, hd, cap);
-            // (a size the device had no room for is not asked for again in the same request, nor a larger one;
-            // another request, a prompt of another length or one begun anew, asks afresh)
-            if past == 0 || kv.expect != g.refused_for {
-                g.refused = 0;
+            let needed = (past + t).max(kv.expect.min(kv.max_len));
+            let mut off = offloadable && needed > resident_rows();
+            if !off {
+                // (the device's copy of the cache: the offloaded run's stream let go first, for its room)
+                if let Some(o) = g.off.as_mut() {
+                    o.stream = None;
+                }
+                // Room for this run's rows, and for those the cache's user has said are coming (a prompt's): made at
+                // the prompt's first run, before anything of the prompt is on the device, and not as its rows come.
+                // (It was made when a run first reached past what was there: for a prompt longer than the last, in
+                // the middle of it, beside its chunk's scratch and its experts just taken in, and a 17,619-token
+                // prompt after a 14,974-token one found no room, "Allocation of 512.00 MB failed", where the same
+                // prompt alone had it.) The old vectors go as the new ones come, a layer at a time, and before any
+                // new one where none of their rows is kept: made all at once beside the old ones, a cache's growth
+                // took both caches' memory of a card that holds little more than one (the 27B's did, llama-rs's
+                // `reserve`).
+                let least = (past + t).next_power_of_two().max(256);
+                let whole = needed.next_power_of_two().max(256);
+                let out_len = |cap: usize| chains[d].attention_out_len(nh, hd, cap);
+                // (a size the device had no room for is not asked for again in the same request, nor a larger one;
+                // another request, a prompt of another length or one begun anew, asks afresh)
+                if past == 0 || kv.expect != g.refused_for {
+                    g.refused = 0;
+                }
+                let refused = |g: &ChainKv, cap: usize| g.refused != 0 && cap >= g.refused;
+                if g.cap < whole && !refused(g, whole) && !g.grow(chains[d], layers.len(), whole, kept(g), row, id_dim, out_len(whole)) {
+                    (g.refused, g.refused_for) = (whole, kv.expect);
+                    eprintln!("flash-next: the GPU has no room for its attention cache at {whole} rows: the cache is the host's past {} rows", whole / 2);
+                }
+                // (no room for the whole of it, at this run or an earlier one: for this run's rows then, else the
+                // cache is the host's)
+                if g.cap < past + t && (refused(g, least) || !g.grow(chains[d], layers.len(), least, kept(g), row, id_dim, out_len(least))) {
+                    (g.refused, g.refused_for) = (least, kv.expect);
+                    // Over two devices a chunk's first part may have gone ahead on the other device, and its second
+                    // part reads this copy: the run is not left to the host from here. The refusal is the request's,
+                    // as a device's refusal was before any of this.
+                    assert!(st.attn_of.len() == 1, "flash-next: no room on GPU {d} for its attention cache at {least} rows (MemoryError)");
+                    if !offloadable {
+                        return None;
+                    }
+                    off = true;
+                }
             }
-            let refused = |g: &ChainKv, cap: usize| g.refused != 0 && cap >= g.refused;
-            if g.cap < whole && !refused(g, whole) && !g.grow(chains[d], layers.len(), whole, kept(g), row, id_dim, out_len(whole)) {
-                (g.refused, g.refused_for) = (whole, kv.expect);
-                eprintln!("flash-next: the GPU has no room for its attention cache at {whole} rows: what reaches past {} rows is run on the host, slowly", whole / 2);
-            }
-            // (no room for the whole of it, at this run or an earlier one: for this run's rows then, or the run is the
-            // host's, as every run past 16,384 rows was)
-            if g.cap < past + t && (refused(g, least) || !g.grow(chains[d], layers.len(), least, kept(g), row, id_dim, out_len(least))) {
-                (g.refused, g.refused_for) = (least, kv.expect);
-                // Over two devices a chunk's first part may have gone ahead on the other device, and its second
-                // part reads this copy: the run is not left to the host from here. The refusal is the request's, as
-                // a device's refusal was before any of this.
-                assert!(st.attn_of.len() == 1, "flash-next: no room on GPU {d} for its attention cache at {least} rows (MemoryError)");
-                return None;
+            if off {
+                offload = true;
+                // the device's copy let go (its room the stream's, and the expert slots'), and the host's pooled keys
+                // kept for the rows unchanged since they were pooled (as a device's copy keeps its rows)
+                g.layers.clear();
+                g.raw.clear();
+                g.qsa = None;
+                g.cap = 0;
+                g.owner = 0;
+                g.out = chains[d].vec(1);
+                let unchanged = if g.pooled_owner == kv.id { kv.dirty_from.min(past) } else { 0 };
+                g.pooled.resize_with(layers.len(), Default::default);
+                for p in g.pooled.iter_mut() {
+                    p.valid = p.valid.min(unchanged / cfg.index_ratio);
+                }
+                g.pooled_owner = kv.id;
+                if g.off.is_none() {
+                    let c = chains[d];
+                    g.off = Some(Offload {
+                        iqv: c.vec(CHECK_ROWS * cfg.index_heads * id_dim),
+                        iqn: c.vec(CHECK_ROWS * cfg.index_heads * id_dim),
+                        out: c.vec(CHECK_ROWS * nh * hd),
+                        stream: None,
+                    });
+                }
+                // a prompt's chunk: one layer's rows at a time, up to the prompt's whole length (made once a prompt)
+                if t > CHECK_ROWS {
+                    let o = g.off.as_mut().expect("made");
+                    if o.stream.as_ref().is_none_or(|s| s.cap < past + t) {
+                        o.stream = None;
+                        let cap = needed.div_ceil(1024) * 1024;
+                        let c = chains[d];
+                        c.let_go_of_spare();
+                        let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Stream { layer: c.vec(cap * row), raw: c.vec(cap * id_dim), cap }));
+                        match made {
+                            Ok(stream) => o.stream = Some(stream),
+                            Err(panic) if ggml_rs::chain::no_room(panic.as_ref()) => {
+                                eprintln!("flash-next: the GPU has no room for one attention layer's {cap} rows: the prompt is run on the host, slowly");
+                                return None;
+                            }
+                            Err(panic) => std::panic::resume_unwind(panic),
+                        }
+                    }
+                }
+                continue;
             }
             // (a growth the device refused left nobody's copy: every row is written again)
             let from = kept(g);
@@ -116,6 +179,16 @@ impl FlashNext {
                 g.qsa = Some(self.qsa_vecs(chains[d], CHECK_ROWS, g.cap));
             }
         }
+        // (the host's pooled keys out of the device's state for the run, back at its end; the vectors a layer's rows
+        // are in on the device: its copy of the cache, or a prompt's stream of it)
+        let mut host_pooled: Vec<HostPooled> = if offload { std::mem::take(&mut m.kv[0].pooled) } else { Vec::new() };
+        let mut staging: Vec<f32> = Vec::new();
+        let cache_vecs = |g: &ChainKv, slot: usize| -> (ggml_rs::DeviceVec, ggml_rs::DeviceVec) {
+            match g.off.as_ref().and_then(|o| o.stream.as_ref()).filter(|_| offload) {
+                Some(s) => (s.layer.clone(), s.raw.clone()),
+                None => (g.layers[slot].clone(), g.raw[slot].clone()),
+            }
+        };
         // the delta-net layers' recurrent states as the chain's vectors (the cache aliasing them)
         let mut states = Vec::with_capacity(st.gdn.len());
         for (slot, &l) in st.gdn.iter().enumerate() {
@@ -295,7 +368,17 @@ impl FlashNext {
         // attention layers
         let prompt_qsa: Arc<Vec<Option<QsaVecs>>> = match &parked {
             Some(p) => Arc::clone(&p.qsa),
-            None => Arc::new(chains.iter().enumerate().map(|(d, c)| (sparse && t > CHECK_ROWS && !st.attn_of[d].is_empty()).then(|| self.qsa_vecs(*c, t, m.kv[d].cap))).collect()),
+            None => Arc::new(
+                chains
+                    .iter()
+                    .enumerate()
+                    .map(|(d, c)| {
+                        // (over the device's copy of the cache, or a layer's stream of it)
+                        let cap = m.kv[d].off.as_ref().and_then(|o| o.stream.as_ref()).filter(|_| offload).map_or(m.kv[d].cap, |s| s.cap);
+                        (sparse && t > CHECK_ROWS && !st.attn_of[d].is_empty()).then(|| self.qsa_vecs(*c, t, cap))
+                    })
+                    .collect(),
+            ),
         };
         let prompt_keys: Vec<Option<ggml_rs::DeviceVec>> = match &parked {
             Some(p) => p.keys.clone(),
@@ -589,8 +672,26 @@ impl FlashNext {
                     rec.exl3_rows(chain_packed(&g.out)?, &dv.core, &dv.y_out, t);
                 }
                 (Mixer::Attn(a), ChainMixer::Attn { q_norm, k_norm, iq_norm, ik_norm, slot }) => {
+                    // the cache the host's: a prompt's chunk reads this layer's rows streamed up from it (the chunk
+                    // before's in it first, and the device's work so far gone ahead of the write, whose last layer read
+                    // the same vectors); a step's or a few rows' attention is the host's (below)
+                    let hosted = offload && t <= CHECK_ROWS;
+                    if offload && !hosted {
+                        if let Some(p) = prev.take() {
+                            p.finish(self, kv);
+                        }
+                        rec.flush();
+                        let s = m.kv[d].off.as_ref().and_then(|o| o.stream.as_ref()).expect("a prompt's stream");
+                        self.stream_rows(chains[d], kv, i, a.index_slot, past, s, &mut staging);
+                    }
                     let g = &m.kv[d];
-                    let kvl = &g.layers[*slot];
+                    let streamed = g.off.as_ref().and_then(|o| o.stream.as_ref()).filter(|_| offload && !hosted);
+                    // (where the device holds the layer's rows: its copy of the cache, or the stream)
+                    let (kvl, rawl) = match streamed {
+                        Some(s) => (Some(s.layer.clone()), Some(s.raw.clone())),
+                        None if hosted => (None, None),
+                        None => (Some(g.layers[*slot].clone()), Some(g.raw[*slot].clone())),
+                    };
                     rec.exl3_rows(chain_packed(&a.q)?, &dv.y_in, &dv.qfull, t);
                     rec.exl3_rows(chain_packed(&a.k)?, &dv.y_in, &dv.k, t);
                     rec.exl3_rows(chain_packed(&a.v)?, &dv.y_in, &dv.v, t);
@@ -605,12 +706,13 @@ impl FlashNext {
                         }
                     }
                     // and into the device's copy of the raw keys (QSA's pool reads them past the dense span)
-                    match (t, few_set, &prompt_keys[d]) {
-                        (1, _, _) => rec.copy(&dv.index, iq, &g.raw[*slot], past * id, id),
-                        (_, Some(f), _) => rec.store_rows(&f.keys[d][*slot], &g.raw[*slot], t, id, past, id, 0),
-                        (_, None, Some(keys)) => {
+                    match (t, few_set, &prompt_keys[d], &rawl) {
+                        (_, _, _, None) => {}
+                        (1, _, _, Some(rawl)) => rec.copy(&dv.index, iq, rawl, past * id, id),
+                        (_, Some(f), _, Some(rawl)) => rec.store_rows(&f.keys[d][*slot], rawl, t, id, past, id, 0),
+                        (_, None, Some(keys), Some(rawl)) => {
                             rec.copy_cols(&dv.index, keys, t, id, iq + id, iq);
-                            rec.store_rows(keys, &g.raw[*slot], t, id, past, id, 0);
+                            rec.store_rows(keys, rawl, t, id, past, id, 0);
                         }
                         _ => unreachable!("a run's raw keys have a place"),
                     }
@@ -620,12 +722,48 @@ impl FlashNext {
                     rec.rmsnorm_rows(&dv.k, k_norm, &dv.kn, t * nkv, eps);
                     rec.rope_partial_rows(&dv.qn, t, nh, hd, rot, &dv.table);
                     rec.rope_partial_rows(&dv.kn, t, nkv, hd, rot, &dv.table);
-                    rec.store_rows(&dv.kn, kvl, t, kvd, past, row, 0);
-                    rec.store_rows(&dv.v, kvl, t, kvd, past, row, kvd);
+                    if let Some(kvl) = &kvl {
+                        rec.store_rows(&dv.kn, kvl, t, kvd, past, row, 0);
+                        rec.store_rows(&dv.v, kvl, t, kvd, past, row, kvd);
+                    }
                     let scale = 1.0 / (hd as f32).sqrt();
                     let qsa = g.qsa.as_ref().filter(|q| q.rows >= t).or(prompt_qsa[d].as_ref());
-                    let out = match (&attn_rows[d], qsa) {
-                        (_, Some(q)) if sparse => {
+                    let hosted_out;
+                    let out = match (&attn_rows[d], qsa, &kvl, &rawl) {
+                        (_, _, None, _) | (_, _, _, None) => {
+                            // The host's: the rows' queries and index queries (normed and rotated as the device's
+                            // are), their keys and values and raw indexer keys read back, the rows into the host's
+                            // cache, and their attention there, its output up for the layer to go on with.
+                            let o = g.off.as_ref().expect("the offloaded run's vectors");
+                            let (ih, ow) = (cfg.index_heads, nh * hd);
+                            let (iqv, iqn, out) = (first(&o.iqv, t * ih * id), first(&o.iqn, t * ih * id), first(&o.out, t * ow));
+                            rec.copy_cols(&dv.index, &iqv, t, ih * id, iq + id, 0);
+                            rec.rmsnorm_rows(&iqv, iq_norm, &iqn, t * ih, eps);
+                            rec.rope_partial_rows(&iqn, t, ih, id, rot, &dv.table);
+                            rec.flush();
+                            let mut r = chains[d].begin();
+                            r.read_range(&dv.qn, 0, t * ow);
+                            r.read_range(&iqn, 0, t * ih * id);
+                            r.read_range(&dv.kn, 0, t * kvd);
+                            r.read_range(&dv.v, 0, t * kvd);
+                            r.read_range(&dv.index, 0, t * (iq + id));
+                            let waiting = std::time::Instant::now();
+                            let mut got = r.finish().into_iter();
+                            host_waited += waiting.elapsed().as_secs_f64() * 1e3;
+                            let running = std::time::Instant::now();
+                            let (qn, iqn_h, kn, v, index) = (got.next().expect("q"), got.next().expect("index q"), got.next().expect("k"), got.next().expect("v"), got.next().expect("index"));
+                            let kvrows: Vec<f32> = kn.chunks_exact(kvd).zip(v.chunks_exact(kvd)).flat_map(|(k, v)| k.iter().chain(v).copied()).collect();
+                            let raw: Vec<f32> = index.chunks_exact(iq + id).take(t).flat_map(|r| r[iq..].iter().copied()).collect();
+                            to_cache(i, kvrows, raw, kv);
+                            let blocks = (past + t) / cfg.index_ratio;
+                            self.pool_host(a, kv, &mut host_pooled[*slot], blocks);
+                            let y = self.host_attention(i, kv, &host_pooled[*slot], &qn, &iqn_h, past, t);
+                            chains[d].upload_at(&out, 0, &y);
+                            host_ran += running.elapsed().as_secs_f64() * 1e3;
+                            hosted_out = out;
+                            &hosted_out
+                        }
+                        (_, Some(q), Some(kvl), Some(rawl)) if sparse => {
                             // past the dense span: the indexer's queries, the cache's pooled block keys, each row's top
                             // blocks, and its attention over them and its tail block
                             let (ih, nb, keep) = (cfg.index_heads, (past + t) / ratio, cfg.index_budget / ratio);
@@ -633,7 +771,7 @@ impl FlashNext {
                             rec.copy_cols(&dv.index, &iqv, t, ih * id, iq + id, 0);
                             rec.rmsnorm_rows(&iqv, iq_norm, &iqn, t * ih, eps);
                             rec.rope_partial_rows(&iqn, t, ih, id, rot, &dv.table);
-                            rec.qsa_pool(&g.raw[*slot], &pooled, nb, ratio, id);
+                            rec.qsa_pool(rawl, &pooled, nb, ratio, id);
                             rec.rmsnorm_rows(&pooled, ik_norm, &pooledn, nb, eps);
                             rec.rope_partial_rows(&pooledn, nb, 1, id, rot, &q.table);
                             rec.qsa_scores(&iqn, &pooledn, &q.scores, t, ih, id, nb, past, ratio, 1.0 / (id as f32).sqrt());
@@ -641,7 +779,7 @@ impl FlashNext {
                             rec.qsa_attention(&dv.qn, kvl, &q.list, &q.out, t, nh, nkv, hd, past, ratio, keep, scale);
                             &q.out
                         }
-                        (Some(scratch), _) if few => {
+                        (Some(scratch), _, Some(kvl), _) if few => {
                             // a row at a time as a step attends (the decode kernel's sums: a check's rows a step's bit
                             // for bit)
                             let (q1, qh) = (&few_set.expect("a few rows' vectors").q1[d], nh * hd);
@@ -652,11 +790,11 @@ impl FlashNext {
                             }
                             scratch
                         }
-                        (Some(scratch), _) => {
+                        (Some(scratch), _, Some(kvl), _) => {
                             rec.attention_rows(&dv.qn, kvl, scratch, t, nh, nkv, hd, past, None, scale);
                             scratch
                         }
-                        (None, _) => {
+                        (None, _, Some(kvl), _) => {
                             rec.attention(&dv.qn, kvl, &g.out, nh, nkv, hd, 0, past + 1, g.cap, scale);
                             &g.out
                         }
@@ -672,14 +810,18 @@ impl FlashNext {
             let rest = layer.moe.experts.host_rest();
             if on_gpu && !cl.host && rec.moe_routed_into(layer.moe.experts.as_ref(), &dv.y2_in, &dv.x, &dv.post2, &dv.router, cfg.top_k, t, s) {
                 // the experts after it, on the device, their sums into the streams; the recording goes on
+                // (a step's or a few rows' rows the host's already, where the cache is)
                 if let ChainMixer::Attn { slot, .. } = &cl.mixer {
-                    rec.read_range(&m.kv[d].layers[*slot], past * row, t * row);
-                    match few_set {
-                        Some(f) => rec.read(&f.keys[d][*slot]),
-                        None if t == 1 => rec.read_range(&st.keys[d], slot * id, id),
-                        None => rec.read_range(&m.kv[d].raw[*slot], past * id, t * id),
+                    if !(offload && t <= CHECK_ROWS) {
+                        let (lv, rv) = cache_vecs(&m.kv[d], *slot);
+                        rec.read_range(&lv, past * row, t * row);
+                        match few_set {
+                            Some(f) => rec.read(&f.keys[d][*slot]),
+                            None if t == 1 => rec.read_range(&st.keys[d], slot * id, id),
+                            None => rec.read_range(&rv, past * id, t * id),
+                        }
+                        attn_reads.push(i);
                     }
-                    attn_reads.push(i);
                 }
                 if !rest {
                     continue;
@@ -747,8 +889,8 @@ impl FlashNext {
                 rec.read_range(&dv.moe_out, 0, t * h);
             }
             let attn_slot = match &cl.mixer {
-                ChainMixer::Attn { slot, .. } => {
-                    rec.read_range(&m.kv[d].layers[*slot], past * row, t * row);
+                ChainMixer::Attn { slot, .. } if !(offload && t <= CHECK_ROWS) => {
+                    rec.read_range(&cache_vecs(&m.kv[d], *slot).0, past * row, t * row);
                     rec.read(&dv.index);
                     true
                 }
@@ -897,6 +1039,9 @@ impl FlashNext {
         }
         for (a, kvrows, raw) in to_store.drain(..) {
             to_cache(a, kvrows, raw, kv);
+        }
+        if offload {
+            m.kv[0].pooled = host_pooled;
         }
         if let Some(at) = hid {
             m.mtp_hid = at;

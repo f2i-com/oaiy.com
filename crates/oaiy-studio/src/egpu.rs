@@ -121,6 +121,16 @@ pub fn context(llm: &Json) -> i64 {
     }
 }
 
+/// The context model `name` is started with on the card: its own (`llm.models[].egpu_ctx`) where it has one, else the
+/// eGPU's ([`context`]). A model whose cache can be the host's past what the card holds (Qwen3.8-Flash-Next's) may be
+/// given far more than one whose cache must be all on the card (a dense 27B's: 32,768 fills a 24 GB card beside it).
+pub fn model_context(llm: &Json, name: &str) -> i64 {
+    match model(llm, name).map(|m| int_or(m, "egpu_ctx", 0)) {
+        Some(n) if n >= 512 => n,
+        _ => context(llm),
+    }
+}
+
 /// The Pythons to ask, in order: a provider's ([`Runtime`]) and no other; else the one `llm.egpu.python` names and no
 /// other; else a virtual environment inside the tinygrad folder (`llm.egpu.tinygrad`), Homebrew's, the system's, and
 /// whatever `python3` the PATH finds. An app opened from the Finder has a PATH without Homebrew's folders, so those are
@@ -253,7 +263,7 @@ fn engine_arguments(llm: &Json, root: &Path, m: &Json, script: &Path, port: u16)
     crate::util::set(&mut one, "egpu", Json::Bool(false));
     crate::util::set(&mut one, "devices", Json::Arr(Vec::new()));
     crate::util::set(&mut alone, "models", Json::Arr(vec![one]));
-    crate::util::set(&mut alone, "ctx", Json::Int(context(llm)));
+    crate::util::set(&mut alone, "ctx", Json::Int(model_context(llm, str_or(m, "name", ""))));
     crate::util::set(&mut alone, "devices", Json::Arr(Vec::new()));
     let (engine, _) = crate::llm::arguments_for(&alone, root, port, "", false, Some(str_or(m, "name", "")))?;
     let mut a = vec!["-u".to_string(), script.to_string_lossy().into_owned(), "--watch-stdin".into(), "--webgpu".into(), program.to_string_lossy().into_owned()];
@@ -1217,7 +1227,7 @@ impl Egpu {
             // page's own card of that name
             ("holds_all", Json::Bool(!crate::llm::holds_a_model(llm))),
             ("device", Json::str(match str_or(egpu, "device", "NV").trim() { "" => "NV", d => d })),
-            ("context_tokens", Json::Int(context(llm))),
+            ("context_tokens", Json::Int(g.model.as_deref().map_or_else(|| context(llm), |m| model_context(llm, m)))),
             ("busy", Json::Int(g.busy as i64)),
             ("load_seconds", g.ready_after.map_or(Json::Null, Json::Num)),
             ("idle_seconds", Json::Int(g.last_used.elapsed().as_secs() as i64)),
@@ -1402,6 +1412,14 @@ mod tests {
         assert_eq!(a.iter().filter(|x| *x == "--backend").count(), 1);
         // Any model the engine reads, not only a GGUF file.
         assert!(arguments(&on, root, "folder", &script, 1).is_ok());
+        // A model's own context on the card, where it has one; the eGPU's for the others.
+        let own = llm(&text.replace(r#"{"name": "folder", "path": "models/exl3", "egpu": true}"#, r#"{"name": "folder", "path": "models/exl3", "egpu": true, "egpu_ctx": 262144}"#));
+        let ctx_of = |name: &str| {
+            let a = arguments(&own, root, name, &script, 1).unwrap();
+            a.iter().position(|x| x == "--ctx").map(|i| a[i + 1].clone())
+        };
+        assert_eq!((ctx_of("folder").as_deref(), ctx_of("big").as_deref()), (Some("262144"), Some("16384")));
+        assert_eq!((model_context(&own, "folder"), model_context(&own, "big"), model_context(&own, "nobody")), (262144, 16384, 16384));
     }
 
     #[test]

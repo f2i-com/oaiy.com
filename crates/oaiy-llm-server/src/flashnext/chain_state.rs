@@ -141,6 +141,11 @@ pub(super) struct ChainKv {
     pub(super) refused: usize,
     /// The prompt's length (`KvCache::expect`) of the request `refused` is of.
     pub(super) refused_for: usize,
+    /// The device's vectors where the cache is the host's alone (a request past [`resident_rows`]: `offload.rs`).
+    pub(super) off: Option<Offload>,
+    /// The host's pooled indexer keys of each attention layer then, and the `KvCache::id` they are of (0: none).
+    pub(super) pooled: Vec<HostPooled>,
+    pub(super) pooled_owner: u64,
 }
 
 impl ChainKv {
@@ -514,7 +519,7 @@ impl FlashNext {
                 let rank = layers.iter().map(|l| l.attn_hc.rank.max(l.mlp_hc.rank)).max().unwrap_or(0).max(collapse.rank).max(mtp_rank);
                 let devs = chains.iter().map(|c| chain_dev(*c, cfg, rank, 1, 1)).collect();
                 let keys = chains.iter().zip(&attn_of).map(|(c, a)| c.vec(a.len().max(1) * cfg.index_dim)).collect();
-                let kv = chains.iter().map(|c| ChainKv { layers: Vec::new(), raw: Vec::new(), cap: 0, out: c.vec(1), qsa: None, owner: 0, refused: 0, refused_for: 0 }).collect();
+                let kv = chains.iter().map(|c| ChainKv { layers: Vec::new(), raw: Vec::new(), cap: 0, out: c.vec(1), qsa: None, owner: 0, refused: 0, refused_for: 0, off: None, pooled: Vec::new(), pooled_owner: 0 }).collect();
                 let pool = gdn
                     .iter()
                     .map(|&i| {
@@ -615,7 +620,7 @@ mod grow_tests {
         for kept in [0usize, 1000] {
             // room for the cache at 16,384 rows and half as much again: not for it at 32,768
             let chain = Small { held: Default::default(), room: bytes(16_384) * 3 / 2, let_go: 0.into() };
-            let mut g = ChainKv { layers: Vec::new(), raw: Vec::new(), cap: 0, out: chain.vec(1), qsa: None, owner: 0, refused: 0, refused_for: 0 };
+            let mut g = ChainKv { layers: Vec::new(), raw: Vec::new(), cap: 0, out: chain.vec(1), qsa: None, owner: 0, refused: 0, refused_for: 0, off: None, pooled: Vec::new(), pooled_owner: 0 };
             assert!(g.grow(&chain, slots, 16_384, 0, row, id_dim, 8));
             g.owner = 7;
             assert_eq!((g.cap, g.layers.len(), g.raw.len()), (16_384, slots, slots));
@@ -631,7 +636,7 @@ mod grow_tests {
         // Room for the copy at 32,768 rows and its output, and not for an old layer beside it: with rows kept that
         // is refused, and asked for once more from nothing it is made, nobody's, so that its rows are written again.
         let chain = Small { held: Default::default(), room: bytes(32_768) + 8 + 4, let_go: 0.into() };
-        let mut g = ChainKv { layers: Vec::new(), raw: Vec::new(), cap: 0, out: chain.vec(1), qsa: None, owner: 0, refused: 0, refused_for: 0 };
+        let mut g = ChainKv { layers: Vec::new(), raw: Vec::new(), cap: 0, out: chain.vec(1), qsa: None, owner: 0, refused: 0, refused_for: 0, off: None, pooled: Vec::new(), pooled_owner: 0 };
         assert!(g.grow(&chain, slots, 16_384, 0, row, id_dim, 2));
         g.owner = 7;
         assert!(g.grow(&chain, slots, 32_768, 1000, row, id_dim, 2));
@@ -683,7 +688,7 @@ mod grow_tests {
             }
         }
         let chain = Broken(Small { held: Default::default(), room: usize::MAX, let_go: 0.into() });
-        let mut g = ChainKv { layers: Vec::new(), raw: Vec::new(), cap: 0, out: chain.vec(1), qsa: None, owner: 0, refused: 0, refused_for: 0 };
+        let mut g = ChainKv { layers: Vec::new(), raw: Vec::new(), cap: 0, out: chain.vec(1), qsa: None, owner: 0, refused: 0, refused_for: 0, off: None, pooled: Vec::new(), pooled_owner: 0 };
         let passed_on = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| g.grow(&chain, 12, 1024, 0, 1024, 128, 1)));
         assert!(passed_on.is_err(), "not taken for a want of room");
         assert_eq!((g.cap, g.layers.len()), (0, 0));

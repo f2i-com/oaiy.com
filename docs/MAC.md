@@ -520,7 +520,8 @@ tinygrad's is built on, where to listen and whom to answer, then runs `tinygrad.
 
 `engine` is `tinygrad` (its LLM server, the default) or `webgpu` (OAIY's own engine on the
 card: the launcher, `egpu_serve.py --webgpu`, runs the engine's program with the model, the
-eGPU's context and the engine's other settings, its key in the environment, and its prompt
+eGPU's context (or the model's own, `egpu_ctx` on its entry: Qwen3.8-Flash-Next's cache can be
+this Mac's past what the card holds, FLASHNEXT.md) and the engine's other settings, its key in the environment, and its prompt
 cache in `cache/prompt-states-egpu`). `env` adds to the server's environment (`JITBEAM=2`
 has tinygrad search for faster kernels once and keep them); `extra_args` to tinygrad's
 server's command line. The control port has

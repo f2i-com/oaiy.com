@@ -677,7 +677,10 @@ impl Models {
         // as they are used (OAIY_FN_SLOTS: as many a layer).
         let slots_asked: Option<usize> = std::env::var("OAIY_FN_SLOTS").ok().and_then(|v| v.parse().ok());
         let fc = crate::flashnext::Config::read(&spec.path)?;
-        let cache_bytes = (self.dense_context(fc.context_length) * fc.attention.iter().filter(|&&a| a).count() * (2 * fc.kv_heads * fc.head_dim + fc.index_dim) * 4) as u64;
+        // (the cache for the context where the GPU keeps it, and no more: past `resident_rows` its rows are the host's,
+        // and the GPU holds one attention layer's of them at most, for a prompt)
+        let resident = self.dense_context(fc.context_length).min(crate::flashnext::resident_rows());
+        let cache_bytes = (resident * fc.attention.iter().filter(|&&a| a).count() * (2 * fc.kv_heads * fc.head_dim + fc.index_dim) * 4) as u64;
         let kept_free = reserve + cache_bytes + (12 << 30) / 10;
         let tiered_make = |device: usize, _layer: &str, layout: ggml_rs_wgpu::exl3::RecordLayout, source: Arc<dyn ggml_rs_wgpu::exl3::ExpertSource>, shared: [ggml_rs::exl3::Exl3Data; 3]| -> Result<Box<dyn ggml_rs::exl3::Experts>> {
             let g = gpus.get(device).ok_or_else(|| Error::Arg("Flash-Next's experts read as records need a GPU for the rest of the model".into()))?;
