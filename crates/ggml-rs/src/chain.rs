@@ -169,9 +169,24 @@ pub trait DeviceChain: Send + Sync {
         let _ = bytes;
         false
     }
+    /// Whether a vector the device has no room for is refused as it is asked for, by a panic [`no_room`] knows (the
+    /// card's adapter, tinygrad's, which says nothing of what it has free): trying to make vectors is then how to
+    /// know whether they fit. False where a refusal comes later or not at all (wgpu's own devices report it as an
+    /// error after; a Mac's GPU pages).
+    fn refuses_at_once(&self) -> bool {
+        false
+    }
     /// Whether a step's attention of `n_h` heads of `head_dim` over `n_kv` KV heads can read its cache as f16 halves
     /// ([`ChainRecorder::halve`], [`ChainRecorder::attention_halved`]).
     fn attention_halves(&self, n_h: usize, n_kv: usize, head_dim: usize) -> bool {
+        let _ = (n_h, n_kv, head_dim);
+        false
+    }
+    /// Whether an attention cache of `n_h` heads of `head_dim` over `n_kv` KV heads can be held as f16 halves alone, with
+    /// no f32 copy: a step's attention reads the halves ([`Self::attention_halves`]), and a prompt's
+    /// ([`ChainRecorder::attention_rows_halved`]) does too. Half the bytes of the f32 copy, where the halves were
+    /// besides it.
+    fn halves_only(&self, n_h: usize, n_kv: usize, head_dim: usize) -> bool {
         let _ = (n_h, n_kv, head_dim);
         false
     }
@@ -289,6 +304,22 @@ pub trait ChainRecorder {
     fn halve(&mut self, src: &DeviceVec, dst: &DeviceVec, at: usize, len: usize) {
         let _ = (src, dst, at, len);
         unreachable!("chain: no f16 halves on this device")
+    }
+    /// [`Self::store_rows`] into a cache held as f16 halves (`dst`'s values two a word, as [`Self::halve`] writes them):
+    /// `rows` rows of `len` of `src`'s values into rows `start..` of `stride` values, from value `at` (all even). Only
+    /// where [`DeviceChain::halves_only`].
+    #[allow(clippy::too_many_arguments)]
+    fn store_rows_halved(&mut self, src: &DeviceVec, dst: &DeviceVec, rows: usize, len: usize, start: usize, stride: usize, at: usize) {
+        let _ = (src, dst, rows, len, start, stride, at);
+        unreachable!("chain: no f16 halves on this device")
+    }
+    /// [`Self::attention_rows`] over a cache held as f16 halves (`kv`: rows of `2 * n_kv * head_dim` values, two a
+    /// word), on the tensor cores: false (nothing recorded) where it cannot be (fewer than 16 rows, say), and the
+    /// caller attends a row at a time ([`Self::attention_halved`]).
+    #[allow(clippy::too_many_arguments)]
+    fn attention_rows_halved(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, past: usize, scale: f32) -> bool {
+        let _ = (q, kv, out, rows, n_h, n_kv, head_dim, past, scale);
+        false
     }
     /// [`Self::attention`] over the cache as f16 halves (`kv` what [`Self::halve`] made of the cache's rows: `cap` rows
     /// of `n_kv * head_dim` words): half the bytes a step reads of a long cache, which bound it. Only where

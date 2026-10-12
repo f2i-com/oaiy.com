@@ -887,6 +887,25 @@ impl ChainRecorder for Recorder<'_> {
         self.dispatch(&pipeline, buffer(src), buffer(src), buffer(dst), &params, grid(((rows * len) as u32).div_ceil(256)));
     }
 
+    fn store_rows_halved(&mut self, src: &DeviceVec, dst: &DeviceVec, rows: usize, len: usize, start: usize, stride: usize, at: usize) {
+        assert!(
+            len % 2 == 0 && stride % 2 == 0 && at % 2 == 0 && src.len >= rows * len && at + len <= stride && dst.len * 2 >= (start + rows) * stride,
+            "chain: storing {rows} rows as halves"
+        );
+        if rows == 0 {
+            return;
+        }
+        let pipeline = self.gpu().named_pipeline("chain-store-rows-halved", || STORE_ROWS_HALVED.to_string());
+        let params = self.uniform(&[(len / 2) as u32, start as u32, (stride / 2) as u32, (at / 2) as u32, rows as u32]);
+        let d = self.gpu().dummy().clone();
+        let groups = ((rows * len / 2) as u32).div_ceil(256);
+        self.dispatch(&pipeline, &d, buffer(src), buffer(dst), &params, (groups.min(65535), groups.div_ceil(65535), 1));
+    }
+
+    fn attention_rows_halved(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, past: usize, scale: f32) -> bool {
+        self.attention_rows_coop_of(q, kv, true, out, rows, n_h, n_kv, head_dim, past, None, scale, false)
+    }
+
     fn attention_rows(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, past: usize, window: Option<usize>, scale: f32) {
         if !self.attention_rows_coop(q, kv, out, rows, n_h, n_kv, head_dim, past, window, scale) {
             self.attention_rows_f32(q, kv, out, rows, n_h, n_kv, head_dim, past, window, scale);

@@ -1046,8 +1046,22 @@ impl Models {
             }
             self.say_placement(&spec.name, backend.as_ref());
             let tok = Arc::new(model.tokenizer().clone());
-            // Dense Qwen fits one card; bound the initial KV allocation.
-            let max_seq = self.dense_context(model.config().context_length);
+            // Dense Qwen fits one card; bound the initial KV allocation. On a card that says what it holds only by
+            // refusing what it has no room for (tinygrad's), the context is what the chain's cache has room for there
+            // beside a prompt's work: a longer prompt is then refused as one past any context is, where it failed
+            // halfway through for want of room (and OAIY answered it with the Mac's copy of the model).
+            let mut max_seq = self.dense_context(model.config().context_length);
+            if let llama_rs::Model::Qwen35(m) = &model {
+                match m.chain.context_room(m, max_seq) {
+                    Some(0) => self.say(format!("{}: the GPU has no room for its attention cache at 4,096 positions beside its weights", spec.name)),
+                    Some(room) if room < max_seq => {
+                        self.say(format!("{}: the GPU holds its attention cache for {room} positions beside its weights and a prompt's work: its context here is {room}, not {max_seq}", spec.name));
+                        max_seq = room;
+                    }
+                    Some(_) => self.say(format!("{}: the GPU holds its attention cache for all {max_seq} positions", spec.name)),
+                    None => {}
+                }
+            }
             let mut cfg = self.base_cfg(spec, max_seq);
             cfg.image_token_id = tok.token_id("<|image_pad|>").ok_or_else(|| Error::Arg("Qwen tokenizer lacks image_pad".into()))?;
             let projector = if o.vision {

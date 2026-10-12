@@ -439,8 +439,9 @@ impl Server {
         if prompt.len() + 1 > a.cfg.max_seq {
             return Err(ApiError {
                 status: 400,
+                // (worded as OpenAI's is, which clients look for: OAIY's Agent compacts the conversation and asks again)
                 message: format!(
-                    "the prompt is {} tokens; {}'s context here is {}",
+                    "the prompt is {} tokens, and {}'s maximum context length is {} tokens here",
                     prompt.len(),
                     a.cfg.model_name,
                     a.cfg.max_seq

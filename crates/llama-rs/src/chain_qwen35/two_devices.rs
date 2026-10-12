@@ -122,7 +122,7 @@ impl<'a> SplitRun<'a> {
         let mut added = false;
         let kept = self.tap(i, c, self.states, &|j| Some(self.st.ssm_layers[j]).filter(|&l| l < self.sp.from));
         let seg = kept.first().filter(|tap| tap.row < t).map(|_| self.st.seg.get_or_init(|| Seg::new(c, &s)));
-        let bound = Bound { kvl: self.kv0.0, half: None, one: None, cap: self.kv0.1, states: self.states, w: &w, attn: &attn, taps: &kept, seg };
+        let bound = Bound { kvl: self.kv0.0, half: None, one: None, halves_only: false, cap: self.kv0.1, states: self.states, w: &w, attn: &attn, taps: &kept, seg };
         let from = self.sp.from;
         record_layers(&mut *rec, &s, cfg.rms_eps, self.m.blocks[..from].iter().map(LayerW::of).zip(&self.st.layers[..from]), &bound, t, pos, None, &mut added);
         // to the second: the residual stream and the last layer's output (their add fused with its first layer's norm)
@@ -162,7 +162,7 @@ impl<'a> SplitRun<'a> {
         let mut added = true;
         let kept = self.tap(i, c, self.states1, &|k| Some(self.st.ssm_layers[self.sp.ssm_slots[k]]));
         let seg = kept.first().filter(|tap| tap.row < t).map(|_| self.sp.seg.get_or_init(|| Seg::new(c, &s)));
-        let bound = Bound { kvl: self.kv1.0, half: None, one: None, cap: self.kv1.1, states: self.states1, w: &w, attn: &attn, taps: &kept, seg };
+        let bound = Bound { kvl: self.kv1.0, half: None, one: None, halves_only: false, cap: self.kv1.1, states: self.states1, w: &w, attn: &attn, taps: &kept, seg };
         record_layers(&mut *rec, &s, cfg.rms_eps, self.sp.weights.iter().map(SplitW::view).zip(&self.sp.layers), &bound, t, pos, None, &mut added);
         rec.add_rmsnorm_rows(&w.x, &w.proj, &self.sp.output_norm, &w.xn, t, cfg.rms_eps);
         if last {
@@ -273,7 +273,8 @@ impl Qwen35Chain {
     /// The second device's share of a prompt's layers, made at the first prompt that can use it: None where there
     /// is no second device, no room on it for them, or prompts are not split (`split_off`, OAIY_NO_SPLIT).
     pub(super) fn split(&self, m: &Qwen35Model, st: &State) -> Option<&Split> {
-        if self.split_off.load(Ordering::Relaxed) || std::env::var_os("OAIY_NO_SPLIT").is_some() {
+        // (nor where the cache is held as halves alone: a split's copies of it are f32)
+        if self.split_off.load(Ordering::Relaxed) || std::env::var_os("OAIY_NO_SPLIT").is_some() || st.halves_only {
             return None;
         }
         self.split

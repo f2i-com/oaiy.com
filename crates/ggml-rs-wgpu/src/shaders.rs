@@ -394,6 +394,54 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+/// [`KV_F16_TILED`] from a cache held as f16 halves (two a word, as the f32 rows laid out): the same fragments, each
+/// word the cache's own. `p[0]` as [`KV_F16_TILED`]'s.
+pub const KV_HALVES_TILED: &str = r#"
+@group(0) @binding(0) var<storage, read> unused: array<u32>;
+@group(0) @binding(1) var<storage, read> x: array<u32>;
+@group(0) @binding(2) var<storage, read_write> q: array<u32>;
+@group(0) @binding(3) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let n_kv = p[0].x;
+    let hd = p[0].y;
+    let per_head = (p[0].w / 16u) * (hd / 16u);
+    let per_region = n_kv * per_head;
+    let i = id.x + id.y * 65535u * 256u;
+    if (i >= 2u * per_region * 128u) { return; }
+    let frag = i / 128u;
+    let within = i % 128u;
+    let region = frag / per_region;
+    let kh = (frag % per_region) / per_head;
+    let rem = frag % per_head;
+    let key = (rem / (hd / 16u)) * 16u + within / 8u;
+    let dim = (rem % (hd / 16u)) * 16u + (within % 8u) * 2u;
+    var v = 0u;
+    if (key < p[0].z) { v = x[(key * 2u * n_kv * hd + region * n_kv * hd + kh * hd + dim) / 2u]; }
+    q[i] = v;
+}
+"#;
+
+/// [`X_F16`] from rows already f16 halves: `p[0].z` rows of `p[0].x` values (`p[0].x / 2` words), those past `p[0].y`
+/// zero. `p[0]`: k, rows, padded rows.
+pub const HALVES_PADDED: &str = r#"
+@group(0) @binding(0) var<storage, read> unused: array<u32>;
+@group(0) @binding(1) var<storage, read> x: array<u32>;
+@group(0) @binding(2) var<storage, read_write> q: array<u32>;
+@group(0) @binding(3) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let k2 = p[0].x / 2u;
+    let i = id.x + id.y * 65535u * 256u;
+    if (i >= p[0].z * k2) { return; }
+    var v = 0u;
+    if (i / k2 < p[0].y) { v = x[i]; }
+    q[i] = v;
+}
+"#;
+
 /// [`X_F16`] for [`coop_tiled`]: the tokens' rows as f16 a step's 32 of `k` at a time, each step's for every (padded)
 /// token together (a token's 32 after the one before's), so a step's loads of a tile's tokens are one run (a warp's
 /// 1 KB, where the rows in place made it 16 runs of 64 bytes: the matmul 0.89 ms where 0.96); a last step short of 32

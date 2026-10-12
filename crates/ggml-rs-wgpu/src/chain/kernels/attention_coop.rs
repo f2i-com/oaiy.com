@@ -405,13 +405,30 @@ STORES
 
 /// [`ATTENTION_COOP_ONE`] for a head `hd` wide (64, 128 or 256), every query over every position with `full`.
 pub(in crate::chain) fn attention_coop_one(hd: usize, full: bool) -> String {
+    attention_coop_one_of(hd, full, true)
+}
+
+/// [`ATTENTION_COOP_ONE`] over a cache of f16 rows as they lie (each position's keys then its values, `kv16` padded to
+/// 128 positions with rows whose weights are none: a cache held as halves, read where it is), not its copy a fragment at
+/// a time: the keys' and values' fragments loaded as [`ATTENTION_COOP_WIDE`] loads them. A causal attention.
+pub(in crate::chain) fn attention_coop_one_rows(hd: usize) -> String {
+    attention_coop_one_of(hd, false, false)
+}
+
+fn attention_coop_one_of(hd: usize, full: bool, tiled: bool) -> String {
     let frags = hd / 64;
     let declare: String = (0..2).flat_map(|q| (0..frags).map(move |f| format!("    var o{q}_{f} = coop_mat16x16<f32, C>();\n"))).collect();
     let values: String = (0..frags)
         .map(|f| {
-            format!(
-                "            {{\n                let ib = voff + ((kh * nb + kb * 8u + kk / 16u) * (HD / 16u) + sg * (HD / 64u) + {f}u) * 256u;\n                let sv = 16u;\n                let vb = coopLoadT<coop_mat16x16<f16, B>>(&kv16[ib], sv);\n                o0_{f} = coopMultiplyAdd(pa, vb, o0_{f});\n                o1_{f} = coopMultiplyAdd(pb, vb, o1_{f});\n            }}\n"
-            )
+            if tiled {
+                format!(
+                    "            {{\n                let ib = voff + ((kh * nb + kb * 8u + kk / 16u) * (HD / 16u) + sg * (HD / 64u) + {f}u) * 256u;\n                let sv = 16u;\n                let vb = coopLoadT<coop_mat16x16<f16, B>>(&kv16[ib], sv);\n                o0_{f} = coopMultiplyAdd(pa, vb, o0_{f});\n                o1_{f} = coopMultiplyAdd(pb, vb, o1_{f});\n            }}\n"
+                )
+            } else {
+                format!(
+                    "            {{\n                let ib = (kb * 128u + kk) * row + kvd + kh * HD + sg * (HD / 4u) + {f}u * 16u;\n                let vb = coopLoadT<coop_mat16x16<f16, B>>(&kv16[ib], row);\n                o0_{f} = coopMultiplyAdd(pa, vb, o0_{f});\n                o1_{f} = coopMultiplyAdd(pb, vb, o1_{f});\n            }}\n"
+                )
+            }
         })
         .collect();
     // (a subgroup's sums' places in the output: its 32 queries' rows, its quarter of the head)
@@ -437,12 +454,18 @@ pub(in crate::chain) fn attention_coop_one(hd: usize, full: bool) -> String {
     };
     // (the scores' fragments stored into vec4s: their places and stride in those; the keys' fragments each a run)
     let mut scores = ATTENTION_COOP_WIDE_SCORES.to_string();
-    for (scalars, fours) in [
-        ("let ik0 = (kb * 128u + sg * 32u) * row + kh * HD + dd;", "let ik0 = ((kh * nb + kb * 8u + sg * 2u) * (HD / 16u) + dd / 16u) * 256u;"),
-        ("let ik1 = (kb * 128u + sg * 32u + 16u) * row + kh * HD + dd;", "let ik1 = ((kh * nb + kb * 8u + sg * 2u + 1u) * (HD / 16u) + dd / 16u) * 256u;"),
-        ("let ka = coopLoad<coop_mat16x16<f16, B>>(&kv16[ik0], row);", "let sk = 16u;\n                let ka = coopLoad<coop_mat16x16<f16, B>>(&kv16[ik0], sk);"),
-        ("let kc = coopLoad<coop_mat16x16<f16, B>>(&kv16[ik1], row);", "let kc = coopLoad<coop_mat16x16<f16, B>>(&kv16[ik1], sk);"),
-    ] {
+    // (the rows as they lie: the keys' fragments as the wide kernel loads them)
+    let keys: &[(&str, &str)] = if tiled {
+        &[
+            ("let ik0 = (kb * 128u + sg * 32u) * row + kh * HD + dd;", "let ik0 = ((kh * nb + kb * 8u + sg * 2u) * (HD / 16u) + dd / 16u) * 256u;"),
+            ("let ik1 = (kb * 128u + sg * 32u + 16u) * row + kh * HD + dd;", "let ik1 = ((kh * nb + kb * 8u + sg * 2u + 1u) * (HD / 16u) + dd / 16u) * 256u;"),
+            ("let ka = coopLoad<coop_mat16x16<f16, B>>(&kv16[ik0], row);", "let sk = 16u;\n                let ka = coopLoad<coop_mat16x16<f16, B>>(&kv16[ik0], sk);"),
+            ("let kc = coopLoad<coop_mat16x16<f16, B>>(&kv16[ik1], row);", "let kc = coopLoad<coop_mat16x16<f16, B>>(&kv16[ik1], sk);"),
+        ]
+    } else {
+        &[]
+    };
+    for &(scalars, fours) in keys {
         assert_eq!(scores.matches(scalars).count(), 1, "the scores' keys");
         scores = scores.replace(scalars, fours);
     }
@@ -450,8 +473,15 @@ pub(in crate::chain) fn attention_coop_one(hd: usize, full: bool) -> String {
         assert_eq!(scores.matches(scalars).count(), 1, "the scores' places");
         scores = scores.replace(scalars, fours);
     }
-    ATTENTION_COOP_ONE
-        .replace("HEAD_DIM", &hd.to_string())
+    // (the rows as they lie: a position's row and where its values begin, for the loads above)
+    let one = if tiled {
+        ATTENTION_COOP_ONE.to_string()
+    } else {
+        let at = "    let scale = bitcast<f32>(p.scale);\n";
+        assert_eq!(ATTENTION_COOP_ONE.matches(at).count(), 1, "the kernel's scale");
+        ATTENTION_COOP_ONE.replace(at, &format!("{at}    let kvd = p.n_kv * HD;\n    let row = 2u * kvd;\n"))
+    };
+    one.replace("HEAD_DIM", &hd.to_string())
         .replace("LIMIT", limit)
         .replace("SCORES\n", &scores)
         .replace("LOAD_S\n", &load)

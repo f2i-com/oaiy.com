@@ -41,6 +41,8 @@ describe('the context window', () => {
 
   it("reads the window out of servers' overflow errors", () => {
     expect(overflowWindow("This model's maximum context length is 32768 tokens. However, you requested 40000 tokens")).toEqual({ overflow: true, tokens: 32768 });
+    // oaiy-llm-server's own (a model on the eGPU whose card holds less than it was asked to)
+    expect(overflowWindow("the prompt is 91093 tokens, and m27's maximum context length is 81920 tokens here")).toEqual({ overflow: true, tokens: 81920 });
     expect(overflowWindow('the request exceeds the available context size (8192 tokens), try increasing it')).toEqual({ overflow: true, tokens: 8192 });
     expect(overflowWindow('prompt is too long: 250000 tokens > 200000 maximum').overflow).toBe(true);
     expect(overflowWindow('invalid tools field').overflow).toBe(false);

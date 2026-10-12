@@ -529,6 +529,24 @@ server's command line. The control port has
 it) and `POST /api/egpu/stop`; `/api/state` has an `egpu` section, and the Logs page's
 **eGPU** tab (`/api/logs?source=egpu`) is tinygrad's own output.
 
+**How much context fits on the card** (the `webgpu` engine). Qwen3.8-Flash-Next keeps the
+newest 32,768 positions of its cache on the card and the rest in this Mac's memory
+(FLASHNEXT.md), so its context is the setting's. The dense 27B reads every position of its
+cache at every token, so its cache stays on the card: held as f16 alone (no f32 copy beside
+it, on a card with tensor cores and with no drafting layer), it takes 64 KB a position, and
+some 82,000 positions fit beside the 27B's 15.8 GB of weights on a 24 GB card (about 40,000
+as f32). Read from this Mac's memory instead, the cache would cost each token about 0.35 s at
+128,000 positions (the CPU's 50 GB/s against the card's 1 TB/s), a tenth of the card's speed.
+When the engine loads a model on the card it tries the cache at the context it was given,
+beside a prompt's working memory, and where that does not fit it opens the model with what does,
+in steps of 4,096 (its log: "the GPU holds its attention cache for 81920 positions beside its
+weights and a prompt's work: its context here is 81920, not 131072"). A longer prompt is then
+refused at once as one past any context is (`context_length_exceeded`, "… maximum context
+length is 81920 tokens here"), and the Agent compacts the conversation and asks again, where
+the prompt used to fail halfway through for want of room and be answered by this Mac's copy of
+the model. The eGPU's status (`context_tokens`) and `/v1/discovery` report the context the
+engine opened the model with.
+
 ### Checked, and not
 
 **Checked** (2026-10-10): the real tinygrad, at commit `ebe4623e` (2026-10-09), in a Linux

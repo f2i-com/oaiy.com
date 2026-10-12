@@ -92,6 +92,22 @@ impl DeviceChain for WgpuBackend {
         self.memory_budget().is_some_and(|(budget, used)| used.saturating_add(bytes).saturating_add(1 << 30) <= budget)
     }
 
+    fn refuses_at_once(&self) -> bool {
+        // (the card's adapter answers each buffer as it is asked for: `wgpu_tinygpu`'s, at "tinygpu" on no bus)
+        self.adapter().pci_bus_id == "tinygpu"
+    }
+
+    fn halves_only(&self, n_h: usize, n_kv: usize, head_dim: usize) -> bool {
+        // (OAIY_KV_F32: the cache's f32 copy kept, and its halves beside it where a step reads them, as before)
+        static F32: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        !*F32.get_or_init(|| std::env::var_os("OAIY_KV_F32").is_some())
+            && self.attention_halves(n_h, n_kv, head_dim)
+            && self.gpu.coop16()
+            && matches!(head_dim, 64 | 128 | 256)
+            && n_kv > 0
+            && n_h % n_kv == 0
+    }
+
     fn attention_halves(&self, n_h: usize, n_kv: usize, head_dim: usize) -> bool {
         // (OAIY_ATTENTION_F32: a step's attention over the cache as it is)
         static F32: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

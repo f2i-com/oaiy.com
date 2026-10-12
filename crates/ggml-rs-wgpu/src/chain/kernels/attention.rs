@@ -805,6 +805,25 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+/// [`STORE_ROWS`] into a cache held as f16 halves ([`HALVE`]'s): `p[1].x` rows of `p[0].x` pairs of `x2`'s values, each
+/// into row `p[0].y + r` of `p[0].z` pairs from pair `p[0].w`, two halves a word. A cache whose only copy is its halves
+/// takes its new rows so.
+pub(in crate::chain) const STORE_ROWS_HALVED: &str = r#"
+@group(0) @binding(0) var<storage, read> unused: array<u32>;
+@group(0) @binding(1) var<storage, read> x2: array<vec2<f32>>;
+@group(0) @binding(2) var<storage, read_write> q: array<u32>;
+@group(0) @binding(3) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 65535u * 256u;
+    let len = p[0].x;
+    if (i >= len * p[1].x) { return; }
+    let r = i / len;
+    q[(p[0].y + r) * p[0].z + p[0].w + i % len] = pack2x16float(x2[i]);
+}
+"#;
+
 /// [`attention_part_group`] for QSA's entries ([`QSA_ATTENTION_PART`]'s: a query's kept blocks' positions from `list`,
 /// then its tail block's), the grid's third axis the queries, the parts laid out as [`ATTENTION_ROWS_PART`]'s for
 /// [`ATTENTION_ROWS_JOIN`]: the same sums as the step's kernel over the same entries, so a query that keeps every

@@ -707,3 +707,61 @@ fn what_is_kept_for_the_next_run_is_let_go_where_a_buffer_is_refused() {
     DeviceChain::let_go_of_spare(&b);
     assert_eq!(kept(&b), (0, 0));
 }
+
+/// A cache held as f16 halves alone (the 27B's on a card with tensor cores): rows stored as halves are the halves of
+/// the f32 rows (`halve`'s, bit for bit), and a prompt's attention over them on the tensor cores is the f32 cache's,
+/// whose rows the tensor cores read as the same f16 values (bit for bit); with fewer rows than the tensor cores take,
+/// it declines and records nothing.
+#[test]
+fn a_cache_held_as_halves_alone_is_stored_and_attended_as_the_f32_one() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    let (n_h, n_kv, hd) = (24usize, 4usize, 256usize);
+    if !DeviceChain::attention_halves(&b, n_h, n_kv, hd) {
+        return;
+    }
+    let (kvd, row) = (n_kv * hd, 2 * n_kv * hd);
+    let (past, rows, cap) = (300usize, 64usize, 512usize);
+    let total = past + rows;
+    let mut r = rng(41);
+    let rows_f32: Vec<f32> = (0..total * row).map(|_| r()).collect();
+    let q: Vec<f32> = (0..rows * n_h * hd).map(|_| r() * 0.5).collect();
+    let up = |v: &[f32]| {
+        let d = b.vec(v.len());
+        DeviceChain::upload(&b, &d, v);
+        d
+    };
+    let kv32 = b.vec(cap * row);
+    DeviceChain::upload_at(&b, &kv32, 0, &rows_f32);
+    // the run's own rows as the chain has them: their keys and their values, each `[rows, kvd]`
+    let k_new: Vec<f32> = rows_f32[past * row..].chunks_exact(row).flat_map(|r| r[..kvd].to_vec()).collect();
+    let v_new: Vec<f32> = rows_f32[past * row..].chunks_exact(row).flat_map(|r| r[kvd..].to_vec()).collect();
+    let (kn, vn, qd) = (up(&k_new), up(&v_new), up(&q));
+    let (want_half, half) = (b.vec(cap * row / 2), b.vec(cap * row / 2));
+    let mut rec = b.begin();
+    rec.halve(&kv32, &want_half, 0, total * row);
+    rec.halve(&kv32, &half, 0, past * row);
+    rec.store_rows_halved(&kn, &half, rows, kvd, past, row, 0);
+    rec.store_rows_halved(&vn, &half, rows, kvd, past, row, kvd);
+    rec.read_range(&want_half, 0, total * row / 2);
+    rec.read_range(&half, 0, total * row / 2);
+    let got = rec.finish();
+    let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+    assert_eq!(bits(&got[1]), bits(&got[0]), "the rows stored as halves are the f32 rows' halves");
+    if !DeviceChain::halves_only(&b, n_h, n_kv, hd) {
+        // (no tensor cores here: the prompt's attention over halves is the card's)
+        return;
+    }
+    let len = DeviceChain::attention_rows_out_len(&b, rows, n_h, hd, total);
+    let (out32, out16) = (b.vec(len), b.vec(len));
+    let scale = 1.0 / (hd as f32).sqrt();
+    let mut rec = b.begin();
+    rec.attention_rows(&qd, &kv32, &out32, rows, n_h, n_kv, hd, past, None, scale);
+    assert!(rec.attention_rows_halved(&qd, &half, &out16, rows, n_h, n_kv, hd, past, scale), "the tensor cores take a prompt's {rows} rows");
+    assert!(!rec.attention_rows_halved(&qd, &half, &out16, 8, n_h, n_kv, hd, past, scale), "and decline 8");
+    rec.read_range(&out32, 0, rows * n_h * hd);
+    rec.read_range(&out16, 0, rows * n_h * hd);
+    let got = rec.finish();
+    assert!(got[0].iter().any(|v| *v != 0.0), "values to compare");
+    // (read where they lie, by the one pass's kernel over rows as they are: the f32 cache's tiled copy's sums, to the bit)
+    assert_eq!(bits(&got[1]), bits(&got[0]), "a prompt's attention over the halves is the f32 cache's");
+}

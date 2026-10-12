@@ -446,9 +446,10 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
             Json::obj([
                 ("state", status.get("state").cloned().unwrap_or(Json::Null)),
                 ("runs_on", status.get("runs_on").cloned().unwrap_or(Json::Null)),
-                // What the loaded model was opened with; before it loads, the setting
-                // (0, the model's maximum, is not known until then).
+                // What the loaded model was opened with; else, where the eGPU holds a model (it answers that model's
+                // requests), that one's; before either loads, the setting (0, the model's maximum, is not known until then).
                 ("context_tokens", status.get("context_tokens").filter(|c| !matches!(c, Json::Null)).cloned()
+                    .or_else(|| egpu_context(studio, &llm))
                     .unwrap_or_else(|| match int_or(&llm, "ctx", 0) { 0 => Json::Null, n => Json::Int(n) })),
                 ("starts_on_demand", Json::Bool(true)),
             ]),
@@ -486,6 +487,16 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
         ),
     ]);
     Json::Obj(doc)
+}
+
+/// The context of the model the eGPU holds or is loading (a Mac's): its engine's once it has said it, else the
+/// model's setting. None where there is no eGPU, it is off, or it holds nothing.
+fn egpu_context(studio: &Studio, llm: &Json) -> Option<Json> {
+    if !crate::egpu::available() || !crate::egpu::enabled(llm) {
+        return None;
+    }
+    let e = studio.egpu.status(llm);
+    matches!(e.get("state").and_then(Json::as_str), Some("ready" | "starting")).then(|| e.get("context_tokens").cloned()).flatten()
 }
 
 #[cfg(test)]

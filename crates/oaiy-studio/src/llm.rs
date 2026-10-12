@@ -16,6 +16,12 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+/// The context oaiy-llm-server last said it opened a model with, in its log ("… loaded in 35.3s (81920 token context)"):
+/// the setting, or less where the model's own maximum is less, or where the card holds its cache for fewer positions.
+pub(crate) fn context_said(log: &str) -> Option<i64> {
+    log.lines().rev().find_map(|l| l.strip_suffix(" token context)")?.rsplit_once('(')?.1.parse().ok())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
     Stopped,
@@ -537,8 +543,7 @@ impl Llm {
 
     /// "… loaded in 8.1s (262144 token context)", as oaiy-llm-server reported it.
     fn loaded_context(&self) -> Option<i64> {
-        let tail = self.log.tail(400);
-        tail.lines().rev().find_map(|l| l.strip_suffix(" token context)")?.rsplit_once('(')?.1.parse().ok())
+        context_said(&self.log.tail(400))
     }
 
     /// "WebGPU on …" or "the CPU", as oaiy-llm-server reported it.

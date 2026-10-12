@@ -1206,6 +1206,12 @@ impl Egpu {
         true
     }
 
+    /// The context the card's oaiy-llm-server said it opened its model with (`crate::llm::context_said`): none from
+    /// tinygrad's server, which says none.
+    fn loaded_context(&self, llm: &Json) -> Option<i64> {
+        webgpu(llm).then(|| crate::llm::context_said(&self.log.tail(400))).flatten()
+    }
+
     /// "… on NV", as tinygrad's server reported where the model's weights are.
     fn runs_on(&self) -> Option<String> {
         let tail = self.log.tail(400);
@@ -1227,7 +1233,8 @@ impl Egpu {
             // page's own card of that name
             ("holds_all", Json::Bool(!crate::llm::holds_a_model(llm))),
             ("device", Json::str(match str_or(egpu, "device", "NV").trim() { "" => "NV", d => d })),
-            ("context_tokens", Json::Int(g.model.as_deref().map_or_else(|| context(llm), |m| model_context(llm, m)))),
+            // (the engine's own once it has loaded the model: the card may hold the cache for fewer positions than asked)
+            ("context_tokens", Json::Int(self.loaded_context(llm).filter(|_| g.state == State::Ready).unwrap_or_else(|| g.model.as_deref().map_or_else(|| context(llm), |m| model_context(llm, m))))),
             ("busy", Json::Int(g.busy as i64)),
             ("load_seconds", g.ready_after.map_or(Json::Null, Json::Num)),
             ("idle_seconds", Json::Int(g.last_used.elapsed().as_secs() as i64)),
@@ -1276,6 +1283,21 @@ mod tests {
         "egpu": {"enabled": true, "ctx": 16384, "fallback_model": "small", "env": {"JITBEAM": 2, "DEV": "AMD"}, "extra_args": ["--shard", "1"]},
         "models": [{"name": "big", "path": "models/big.gguf", "egpu": true}, {"name": "small", "path": "models/small.gguf"},
                    {"name": "off", "path": "models/off.gguf", "egpu": true, "enabled": false}, {"name": "folder", "path": "models/exl3", "egpu": true}]}"#;
+
+    #[test]
+    fn the_context_said_is_the_card_engines_own_once_it_has_loaded() {
+        let egpu = Egpu::new();
+        let cfg = llm(&TWO.replace(r#""ctx": 16384,"#, r#""ctx": 16384, "engine": "webgpu","#).replace(r#""path": "models/big.gguf", "egpu": true"#, r#""path": "models/big.gguf", "egpu": true, "egpu_ctx": 131072"#));
+        let said = |egpu: &Egpu, llm: &Json| egpu.status(llm).get("context_tokens").and_then(Json::as_i64);
+        egpu.log.push("oaiy-llm-server: small loaded in 3.0s (16384 token context)");
+        egpu.lock().model = Some("big".into());
+        assert_eq!(said(&egpu, &cfg), Some(131072), "loading: the model's setting, not the last engine's");
+        egpu.adopt("127.0.0.1:1", "k", "big", None);
+        egpu.log.push("m27: the GPU holds its attention cache for 81920 positions beside its weights and a prompt's work");
+        egpu.log.push("oaiy-llm-server: big loaded in 35.3s (81920 token context)");
+        assert_eq!(said(&egpu, &cfg), Some(81920), "loaded: what the card holds");
+        assert_eq!(said(&egpu, &llm(TWO)), Some(16384), "tinygrad's server says none: the setting");
+    }
 
     #[test]
     fn a_start_waits_for_the_last_server_to_let_the_card_go() {

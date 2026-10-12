@@ -124,6 +124,15 @@ impl Recorder<'_> {
     /// [`Self::attention_rows_coop`], with `full` every query over every position (no causal mask).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn attention_rows_coop_masked(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, past: usize, window: Option<usize>, scale: f32, full: bool) -> bool {
+        self.attention_rows_coop_of(q, kv, false, out, rows, n_h, n_kv, head_dim, past, window, scale, full)
+    }
+
+    /// [`Self::attention_rows_coop_masked`] over a cache that is `halves` (its rows f16, two a word, as
+    /// [`ChainRecorder::halve`] writes them) or f32.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn attention_rows_coop_of(&mut self, q: &DeviceVec, kv: &DeviceVec, halves: bool, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, past: usize, window: Option<usize>, scale: f32, full: bool) -> bool {
+        // (the cache's values: two a word where it is halves)
+        let kv_values = if halves { kv.len * 2 } else { kv.len };
         let name = match (head_dim, full) {
             (64, false) => "chain-attention-coop-64",
             (128, false) => "chain-attention-coop-128",
@@ -139,8 +148,8 @@ impl Recorder<'_> {
         // (OAIY_ATTENTION_KERNEL=rows: a full attention's queries 64 a workgroup, each subgroup's 16 rows its own)
         if full && matches!(head_dim, 64 | 128) && rows_kernel() {
             let (qs, row) = (n_h * head_dim, 2 * n_kv * head_dim);
-            assert!(kv.len >= past * row && q.len >= rows * qs && out.len >= rows.div_ceil(64) * 64 * qs, "chain: a full attention's buffers");
-            let (q16, kv16) = self.attention_f16(q, kv, rows, past, qs, row, Some((n_kv, head_dim)));
+            assert!(kv_values >= past * row && q.len >= rows * qs && out.len >= rows.div_ceil(64) * 64 * qs, "chain: a full attention's buffers");
+            let (q16, kv16) = self.attention_f16(q, kv, halves, rows, past, qs, row, Some((n_kv, head_dim)));
             let words = [n_h as u32, n_kv as u32, past as u32, rows as u32, past as u32, scale.to_bits(), 0, 0];
             let name = if head_dim == 64 { "chain-attention-coop-rows-64" } else { "chain-attention-coop-rows-128" };
             let pipeline = self.gpu().named_pipeline(name, || attention_coop_rows(head_dim));
@@ -156,16 +165,35 @@ impl Recorder<'_> {
         // the padding's rows are stored past the output (in a causal attention's scratch, at least as long: 16 rows or
         // more; a full one's out is as long as they need, `attention_rows_full_out_len`)
         assert!(
-            kv.len >= kv_len * row && q.len >= rows * qs && out.len >= rp * qs && (full || out.len >= self.backend.attention_rows_out_len(rows, n_h, head_dim, kv_len)),
+            kv_values >= kv_len * row && q.len >= rows * qs && out.len >= rp * qs && (full || out.len >= self.backend.attention_rows_out_len(rows, n_h, head_dim, kv_len)),
             "chain: a prompt's attention's buffers"
         );
         // (the keys 128 a block, their scores once; OAIY_ATTENTION_PASSES=2: twice, the first pass each query's largest
         // score and sum; OAIY_ATTENTION_NARROW: twice, the keys 32 a block)
         static KERNEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
         let kernel = *KERNEL.get_or_init(|| if std::env::var_os("OAIY_ATTENTION_NARROW").is_some() { 0 } else if std::env::var("OAIY_ATTENTION_PASSES").is_ok_and(|v| v == "2") { 2 } else { 1 });
-        // (the one pass reads the cache's copy a fragment at a time)
-        let (q16, kv16) = self.attention_f16(q, kv, rows, kv_len, qs, row, (kernel == 1).then_some((n_kv, head_dim)));
         let words = [n_h as u32, n_kv as u32, past as u32, rows as u32, kv_len as u32, scale.to_bits(), 0, 0];
+        // A cache held as halves is read where it lies, its rows' fragments loaded as they are (the one pass's kernel
+        // or, with OAIY_ATTENTION_PASSES=2, the two passes'): not copied a fragment at a time first, a layer's cache
+        // again (512 MB at 79,000 of the 27B's positions, which a 24 GB card beside its weights had not). Its rows
+        // past `kv_len` are zeros or its own, whose weights are none (a cache without rows to 128 past them is copied).
+        if halves && !full && halves_in_place() && kv.len * 2 >= kv_len.div_ceil(128) * 128 * row {
+            let rp = rows.div_ceil(64) * 64;
+            let q16 = self.attention_q16(q, rows, rp, qs);
+            const NAMES: [[&str; 3]; 2] = [
+                ["chain-attention-coop-one-halves-64", "chain-attention-coop-one-halves-128", "chain-attention-coop-one-halves-256"],
+                ["chain-attention-coop-wide-halves-64", "chain-attention-coop-wide-halves-128", "chain-attention-coop-wide-halves-256"],
+            ];
+            let (two, at) = (kernel != 1, match head_dim { 64 => 0, 128 => 1, _ => 2 });
+            let pipeline = self.gpu().named_pipeline(NAMES[usize::from(two)][at], || if two { attention_coop_wide(head_dim, false) } else { attention_coop_one_rows(head_dim) });
+            self.dispatch_kept(&pipeline, buffer(kv), buffer(&q16), buffer(out), &words, (n_h as u32, (rows.div_ceil(32)) as u32, 1));
+            // (the next layer's queries in it again)
+            self.done_with(&q16);
+            self.weigh(4.0 * rows as f64 * kv_len as f64 * (n_h * head_dim) as f64);
+            return true;
+        }
+        // (the one pass reads the cache's copy a fragment at a time)
+        let (q16, kv16) = self.attention_f16(q, kv, halves, rows, kv_len, qs, row, (kernel == 1).then_some((n_kv, head_dim)));
         let pipeline = self.gpu().named_pipeline(name, || match (kernel, full) {
             (1, _) => attention_coop_one(head_dim, full),
             (2, _) => attention_coop_wide(head_dim, full),
@@ -178,10 +206,22 @@ impl Recorder<'_> {
         true
     }
 
+    /// A prompt's queries (`rows` of `qs`) as f16 for the tensor cores, padded to `padded` rows with zeros, in a scratch
+    /// of the recording's (the cache's rows left where they are).
+    fn attention_q16(&mut self, q: &DeviceVec, rows: usize, padded: usize, qs: usize) -> DeviceVec {
+        let q16 = self.scratch(padded * qs / 2);
+        let conv = self.gpu().named_pipeline("chain-x-f16", || crate::shaders::X_F16.to_string());
+        let d = self.gpu().dummy().clone();
+        let groups = ((padded * qs / 2) as u32).div_ceil(256);
+        self.dispatch_kept(&conv, &d, buffer(q), buffer(&q16), &[qs as u32, rows as u32, padded as u32], (groups.min(65535), groups.div_ceil(65535), 1));
+        q16
+    }
+
     /// A prompt's queries (`rows` of `qs`) and its cache's rows (`kv_len` of `row`) as f16 for the tensor cores'
     /// attention, each padded to 32 (the copies one pair a recording, grown as it needs: each attention's converted
     /// as it runs; put back in `att16` once used).
-    pub(super) fn attention_f16(&mut self, q: &DeviceVec, kv: &DeviceVec, rows: usize, kv_len: usize, qs: usize, row: usize, tiled: Option<(usize, usize)>) -> (DeviceVec, DeviceVec) {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn attention_f16(&mut self, q: &DeviceVec, kv: &DeviceVec, kv_halves: bool, rows: usize, kv_len: usize, qs: usize, row: usize, tiled: Option<(usize, usize)>) -> (DeviceVec, DeviceVec) {
         // (the keys to a block of the wide kernel's: 128; the queries to the rows kernel's workgroup: 64)
         let (rp, kp) = (rows.div_ceil(64) * 64, kv_len.div_ceil(128) * 128);
         let (q16, kv16) = match self.att16.take() {
@@ -192,11 +232,21 @@ impl Recorder<'_> {
         let d = self.gpu().dummy().clone();
         for (src, dst, width, n, padded) in [(q, &q16, qs, rows, rp), (kv, &kv16, row, kv_len, kp)] {
             let groups = ((padded * width / 2) as u32).div_ceil(256);
+            // (a cache held as halves: its words as they are, laid out the same)
+            let halved = kv_halves && std::ptr::eq(dst, &kv16);
             match tiled.filter(|_| std::ptr::eq(dst, &kv16)) {
                 // the cache's a fragment at a time (`tiled`: its KV heads and their width), the one-pass kernels'
                 Some((n_kv, head_dim)) => {
-                    let tile = self.gpu().named_pipeline("chain-kv-f16-tiled", || crate::shaders::KV_F16_TILED.to_string());
+                    let tile = if halved {
+                        self.gpu().named_pipeline("chain-kv-halves-tiled", || crate::shaders::KV_HALVES_TILED.to_string())
+                    } else {
+                        self.gpu().named_pipeline("chain-kv-f16-tiled", || crate::shaders::KV_F16_TILED.to_string())
+                    };
                     self.dispatch_kept(&tile, &d, buffer(src), buffer(dst), &[n_kv as u32, head_dim as u32, n as u32, padded as u32], (groups.min(65535), groups.div_ceil(65535), 1));
+                }
+                None if halved => {
+                    let copy = self.gpu().named_pipeline("chain-halves-padded", || crate::shaders::HALVES_PADDED.to_string());
+                    self.dispatch_kept(&copy, &d, buffer(src), buffer(dst), &[width as u32, n as u32, padded as u32], (groups.min(65535), groups.div_ceil(65535), 1));
                 }
                 None => self.dispatch_kept(&conv, &d, buffer(src), buffer(dst), &[width as u32, n as u32, padded as u32], (groups.min(65535), groups.div_ceil(65535), 1)),
             }
@@ -269,13 +319,20 @@ impl Recorder<'_> {
         // (the keys 128 a block, their scores once; OAIY_ATTENTION_PASSES=2 or OAIY_ATTENTION_NARROW: twice, 32 a block)
         static OLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let old = *OLD.get_or_init(|| std::env::var_os("OAIY_ATTENTION_NARROW").is_some() || std::env::var("OAIY_ATTENTION_PASSES").is_ok_and(|v| v == "2"));
-        let (q16, kv16) = self.attention_f16(q, kv, rows, kv_len, qs, row, (!old).then_some((n_kv, head_dim)));
+        let (q16, kv16) = self.attention_f16(q, kv, false, rows, kv_len, qs, row, (!old).then_some((n_kv, head_dim)));
         let src = if old { attention_coop_masked(head_dim) } else { attention_coop_one_masked(head_dim) };
         let words = [n_h as u32, n_kv as u32, first as u32, rows as u32, kv_len as u32, scale.to_bits(), ratio as u32, mw as u32];
         self.dispatch_wide(name, &src, [buffer(&kv16), buffer(&q16), buffer(&mask), &d, &d, &d, buffer(out), &drw], &words, (n_h as u32, rows.div_ceil(32) as u32, 1));
         self.att16 = Some((q16, kv16));
         true
     }
+}
+
+/// Whether a prompt's attention reads a cache held as halves where it lies (OAIY_HALVES_TILED=1: copied a fragment at a
+/// time for the one-pass kernel, as an f32 cache is).
+fn halves_in_place() -> bool {
+    static IN_PLACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *IN_PLACE.get_or_init(|| std::env::var("OAIY_HALVES_TILED").map_or(true, |v| v != "1"))
 }
 
 /// Whether a full attention takes [`attention_coop_rows`]'s kernel (OAIY_ATTENTION_KERNEL=rows).
