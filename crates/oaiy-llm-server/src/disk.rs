@@ -150,12 +150,58 @@ fn namespace(fingerprint: u64) -> u64 {
     }
 }
 
+/// The folder's states in all, as models' budgets: two models' full budgets (an engine's model and the one it switches
+/// to), the rest of what other models left going first.
+const FOLDER_BUDGETS: u64 = 2;
+
+/// The states in `dir` that are not this model's (`fingerprint`'s) deleted, those last used longest ago first, until the
+/// folder's states take `most` bytes at most; how many went. A model's own states are held to its budget as it saves
+/// them, but those of another are held by nothing once that model is not served: each model, each set of adapters on
+/// it and each file of it replaced (its time is in the fingerprint) left up to its whole budget for good, 4 GB each by
+/// default. Another model's states in use are kept by that use (`load` marks a state's file used).
+fn prune_others(dir: &Path, fingerprint: u64, most: u64) -> usize {
+    let Ok(items) = fs::read_dir(dir) else { return 0 };
+    let mut total = 0u64;
+    let mut others: Vec<(SystemTime, u64, PathBuf)> = Vec::new();
+    for item in items.flatten() {
+        let path = item.path();
+        if path.extension().and_then(|e| e.to_str()) != Some(EXT) {
+            continue;
+        }
+        let Ok(meta) = item.metadata() else { continue };
+        total += meta.len();
+        let mut head = [0u8; 16];
+        let mine = File::open(&path).and_then(|mut f| f.read_exact(&mut head)).is_ok() && &head[..8] == MAGIC && head[8..16] == fingerprint.to_le_bytes();
+        if !mine {
+            others.push((meta.modified().unwrap_or(SystemTime::UNIX_EPOCH), meta.len(), path));
+        }
+    }
+    others.sort();
+    let mut gone = 0;
+    for (_, bytes, path) in others {
+        if total <= most {
+            break;
+        }
+        if fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(bytes);
+            gone += 1;
+        }
+    }
+    gone
+}
+
 impl<S: PromptState> DiskCache<S> {
     /// Open (or make) the directory and index this model's entries. This model's states from before its
     /// [`namespace`] moved on are deleted: they are wrong, and as another namespace's no budget would ever take them.
+    /// Other models' states past [`FOLDER_BUDGETS`] of this one's budget in all are deleted, the longest unused first
+    /// ([`prune_others`]).
     pub fn open(dir: &Path, fingerprint: u64, budget_bytes: u64) -> oaiy_engine::Result<DiskCache<S>> {
         let (before, fingerprint) = (fingerprint, namespace(fingerprint));
         fs::create_dir_all(dir)?;
+        let pruned = prune_others(dir, fingerprint, budget_bytes.saturating_mul(FOLDER_BUDGETS));
+        if pruned > 0 {
+            eprintln!("oaiy-llm-server: {pruned} prompt states of other models deleted from {}, the longest unused first (the folder holds {} GB at most)", dir.display(), budget_bytes.saturating_mul(FOLDER_BUDGETS) / 1_000_000_000);
+        }
         let mut entries = Vec::new();
         for item in fs::read_dir(dir)?.flatten() {
             let path = item.path();
@@ -367,6 +413,40 @@ mod publication_tests {
         assert!(!cache.worth(&[1, 2], 990, true, &[1, 2, 3, 4, 5]));
         assert!(cache.worth(&[1, 2], 990, true, &[1, 2, 7]), "another conversation now: the new one's start");
         assert!(!cache.worth(&[1, 2], 1001, true, &[1, 2, 7]), "past the whole budget");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn other_models_states_past_the_folders_share_go_the_longest_unused_first() {
+        let dir = directory("prune");
+        // states of 400 bytes: this model's (its fingerprint as this computer keeps it) and three others', last used
+        // so many seconds ago
+        let file = |fp: u64, key: u64, age: u64| {
+            let path = dir.join(format!("{fp:016x}-{key:016x}.{EXT}"));
+            let mut body = header(fp, false, &[key]);
+            body.resize(400, 0);
+            fs::write(&path, body).unwrap();
+            File::options().write(true).open(&path).unwrap().set_modified(SystemTime::now() - std::time::Duration::from_secs(age)).unwrap();
+            path
+        };
+        let mine = file(namespace(1), 1, 500);
+        let (a, b, c, d) = (file(2, 1, 400), file(3, 1, 300), file(4, 1, 100), file(2, 2, 50));
+        let other = dir.join("notes.txt");
+        fs::write(&other, vec![0u8; 5000]).unwrap();
+        // 2,000 bytes of states, twice a budget of 500 at most: the others go, the longest unused first, until 1,000
+        let cache = DiskCache::<State>::open(&dir, 1, 500).unwrap();
+        assert_eq!(cache.len(), 1, "this model's own is kept: its budget holds it, however old");
+        assert!(mine.exists() && d.exists());
+        assert!(!a.exists() && !b.exists() && !c.exists());
+        assert!(other.exists(), "nothing but states is touched");
+        drop(cache);
+        // within the folder's share (800 bytes): nothing goes
+        let _ = DiskCache::<State>::open(&dir, 1, 500).unwrap();
+        assert!(mine.exists() && d.exists());
+        // past it again: the longest unused of the others, not the one used last
+        let e = file(5, 1, 900);
+        let _ = DiskCache::<State>::open(&dir, 1, 500).unwrap();
+        assert!(!e.exists() && d.exists() && mine.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
