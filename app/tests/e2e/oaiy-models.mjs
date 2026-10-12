@@ -174,6 +174,17 @@ try {
     expect(asked.at(-1).url === '/api/engines/egpu' && asked.at(-1).body.model === null, JSON.stringify(asked.at(-1)));
   });
 
+  await check('the header drawn again with nothing changed leaves its menus as they are (one open stays open)', async () => {
+    await page.$eval('select.model.pick', (s) => { window.__modelOption = s.options[0]; });
+    await page.$eval('select.egpu.pick', (s) => { window.__egpuOption = s.options[0]; });
+    const before = asked.length;
+    // the model it runs already: nothing to choose, the header drawn again (as the minute's timer draws it)
+    await page.select('select.model.pick', 'qwen3.5-9b');
+    await new Promise((r) => setTimeout(r, 300));
+    expect(asked.length === before, `asked ${JSON.stringify(asked.slice(before))}`);
+    expect(await page.evaluate(() => window.__modelOption.isConnected && window.__egpuOption.isConnected), "the menus' options were made again");
+  });
+
   if (process.env.SHOT) await page.screenshot({ path: process.env.SHOT, clip: { x: 0, y: 0, width: 1400, height: 70 } });
 } finally {
   await browser.close();

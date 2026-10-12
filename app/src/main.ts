@@ -545,6 +545,18 @@ async function main(): Promise<void> {
   };
 
   /**
+   * A picker's options made `options`, where they differ from what it shows: the header is drawn again every minute,
+   * and every 3 s while the eGPU loads, and a menu whose options were replaced as the person had it open closed under
+   * them, or took the replaced list's selection.
+   */
+  function replaceOptions(pick: HTMLSelectElement, options: HTMLElement[]): void {
+    const said = (o: HTMLOptionElement): string => JSON.stringify([o.value, o.textContent, o.selected, o.disabled]);
+    const now = Array.from(pick.options).map(said).join('\n');
+    const next = (options as HTMLOptionElement[]).map(said).join('\n');
+    if (now !== next) pick.replaceChildren(...options);
+  }
+
+  /**
    * The header's pickers. The model menu stands in for the provider chip while `p`, the Agent's provider, is the OAIY
    * whose discovery was read: its language models, each one on the eGPU said so. The eGPU's menu shows where the
    * engine offers one and it is switched on (in Engines → Settings → eGPU, where the card is set up), with a desktop to
@@ -561,7 +573,7 @@ async function main(): Promise<void> {
       // A model set by hand that the engine does not have (or none yet) is shown as it is.
       if (!models.some((m) => m.id === p.modelId)) options.unshift(h('option', { value: '', selected: true, disabled: true }, `${p.name} · ${p.modelId || 'no model'}`));
       options.push(h('option', { value: PROVIDERS }, 'AI providers…'));
-      modelPick.replaceChildren(...options);
+      replaceOptions(modelPick, options);
       modelPick.title = p.followEngine
         ? "The model OAIY's engine runs, as chosen in Engines: the Agent, the phone's agents and flows use it. Choosing another here chooses it there, and it loads with the next message."
         : `The model this page asks OAIY for (set in Settings, not following Engines). Choosing one here chooses it in Engines too.`;
@@ -572,10 +584,10 @@ async function main(): Promise<void> {
     if (!showEgpu || !egpu) return;
     const held = models.find((m) => m.egpu)?.id ?? '';
     const how = !held ? '' : egpu.lent ? ' · making a picture' : egpu.paused ? ' · paused' : egpu.state === 'ready' ? ' · ready' : egpu.state === 'starting' ? ' · loading…' : egpu.state === 'failed' ? ' · failed' : ' · not loaded';
-    egpuPick.replaceChildren(
+    replaceOptions(egpuPick, [
       h('option', { value: '', selected: !held }, 'eGPU: no model'),
       ...models.map((m) => h('option', { value: m.id, selected: m.id === held }, `eGPU: ${m.id}${m.id === held ? how : ''}`)),
-    );
+    ]);
     egpuPick.dataset.state = !held ? 'none' : egpu.lent || egpu.paused ? 'starting' : (egpu.state ?? 'stopped');
     egpuPick.title = `The language model on the eGPU (${egpu.engine === 'webgpu' ? "OAIY's engine over WebGPU" : "tinygrad's LLM server"} on the card): a chat with it is answered there. ${held ? `${held} is ${egpu.lent ? 'paused while the card makes a picture' : egpu.paused ? 'paused after a picture, and loads with the next chat' : egpu.state === 'ready' ? 'loaded' : egpu.state === 'starting' ? 'loading' : egpu.state === 'failed' ? 'set, but did not load (see Engines → Logs)' : 'set, and loads when it is first asked'}.` : 'None is set.'}`;
   }
