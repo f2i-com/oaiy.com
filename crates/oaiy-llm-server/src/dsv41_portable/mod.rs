@@ -22,6 +22,6 @@ mod trunk;
 mod usage;
 
 pub(crate) use engine::Engine;
-pub(crate) use experts::WgpuExperts;
+pub(crate) use experts::{WgpuExperts, ALONE};
 pub(crate) use trunk::offload;
 pub(crate) use usage::{read_usage, write_usage};

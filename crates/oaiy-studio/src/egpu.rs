@@ -251,8 +251,8 @@ pub fn arguments(llm: &Json, root: &Path, name: &str, script: &Path, port: u16) 
 /// The launcher's command line for OAIY's own engine on the card: `--webgpu`, the engine's program (the one this
 /// computer's engine runs), and the engine's arguments as this computer's are made, for this model alone, with the
 /// eGPU's context. Not among them: the key (the launcher passes it in the environment), the GPUs to use (the card is
-/// the engine's one adapter), the stdin watch (the launcher's own, which gives the engine one of its own pipe), and the
-/// expert counts kept with this computer's engine; the prompt cache is a folder of its own. And the backend is the
+/// the engine's one adapter) and the stdin watch (the launcher's own, which gives the engine one of its own pipe);
+/// the prompt cache and DeepSeek's experts' counts of uses are each a folder or a file of the card's own. And the backend is the
 /// GPU's and nothing else (`--backend webgpu`): an engine that cannot reach the card ends, saying so, where one left
 /// to choose ran the model on this computer's CPU under the eGPU's name (Flash-Next at a token a second).
 fn engine_arguments(llm: &Json, root: &Path, m: &Json, script: &Path, port: u16) -> Result<Vec<String>, String> {
@@ -270,7 +270,7 @@ fn engine_arguments(llm: &Json, root: &Path, m: &Json, script: &Path, port: u16)
     let mut it = engine.into_iter();
     while let Some(flag) = it.next() {
         match flag.as_str() {
-            "--api-key" | "--usage" | "--devices" => {
+            "--api-key" | "--devices" => {
                 it.next();
             }
             "--watch-stdin" => {}
@@ -278,6 +278,15 @@ fn engine_arguments(llm: &Json, root: &Path, m: &Json, script: &Path, port: u16)
                 it.next();
                 a.push(flag);
                 a.push(root.join("cache").join("prompt-states-egpu").to_string_lossy().into_owned());
+            }
+            // (DeepSeek-V4.1's experts' counts of uses: the card's engine keeps its own, as its prompt states, since
+            // what its card and this computer's memory hold is not what this computer's engine's tiers do. With none
+            // its card began each start with whichever experts the first prompt met: 7% of a reply's on the card
+            // where 56% with the counts of a session before, the rest read from the drive)
+            "--usage" => {
+                it.next();
+                a.push(flag);
+                a.push(root.join("cache").join("expert-usage-egpu.bin").to_string_lossy().into_owned());
             }
             _ => a.push(flag),
         }
@@ -1424,8 +1433,11 @@ mod tests {
         assert_eq!(after("--model"), Some(root.join("models/big.gguf").to_string_lossy().into_owned()));
         assert_eq!((after("--name").as_deref(), after("--port").as_deref(), after("--ctx").as_deref()), (Some("big"), Some("18000"), Some("16384")));
         assert_eq!(after("--prompt-cache"), Some(root.join("cache/prompt-states-egpu").to_string_lossy().into_owned()));
+        // (DeepSeek's experts' counts of uses: the card's engine's own, not this computer's engine's)
+        assert_eq!(after("--usage"), Some(root.join("cache/expert-usage-egpu.bin").to_string_lossy().into_owned()));
+        assert_eq!(a.iter().filter(|x| *x == "--usage").count(), 1);
         // This model alone, the key out of sight, and nothing of this computer's GPUs or tinygrad's own arguments.
-        for absent in ["--also", "--api-key", "--devices", "--devices-for", "--usage", "--shard", "--serve", "--max_context"] {
+        for absent in ["--also", "--api-key", "--devices", "--devices-for", "--shard", "--serve", "--max_context"] {
             assert!(!a.contains(&absent.to_string()), "{absent} in {a:?}");
         }
         assert_eq!(a.iter().filter(|x| *x == "--watch-stdin").count(), 1, "the launcher's own");

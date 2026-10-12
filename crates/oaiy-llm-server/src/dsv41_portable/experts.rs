@@ -109,15 +109,22 @@ fn read_records(store: &dyn oaiy_engine::store::WeightStore, keys: &[(u32, u32)]
 /// make outputs of a few hundred MB).
 pub(super) const MARGIN: u64 = 1 << 30;
 
+/// What the experts' tier takes of the 4 GiB a card's default weight budget leaves for the rest of the computer's use
+/// of the card and a model's own cache there, on a card that has neither: tinygrad's in an enclosure draws no desktop,
+/// and this model's cache is the host's. 3.8 GB of a 24 GB card stood idle beside 536 experts while half of each
+/// token's experts were read from the drive; with this it holds 650, and its least room through a prompt was 1.6 GB.
+pub(crate) const ALONE: u64 = 2 << 30;
+
 impl WgpuExperts {
     /// Slots for a call of [`dsv41::moe::GPU_GROUP`] experts, or as many as the weight budget has left (after the trunk),
-    /// and a resident tier in what is left after them but [`MARGIN`]; None if not one slot fits.
-    pub(crate) fn new(gpu: &WgpuBackend) -> Option<WgpuExperts> {
+    /// and a resident tier in what is left after them but [`MARGIN`], and in `more` bytes past the budget (0, or
+    /// [`ALONE`]); None if not one slot fits.
+    pub(crate) fn new(gpu: &WgpuBackend, more: u64) -> Option<WgpuExperts> {
         let record = dsv41::expert::RECORD_BYTES;
         let group = gpu.record_slots(dsv41::moe::GPU_GROUP, record)?;
         let (used, budget) = gpu.usage();
-        let room = (budget.saturating_sub(used).saturating_sub(MARGIN) / record as u64) as usize;
-        let resident = (room > 0).then(|| gpu.record_slots(room, record)).flatten().map(|slots| Mutex::new(Resident::new(slots)));
+        let room = ((budget + more).saturating_sub(used).saturating_sub(MARGIN) / record as u64) as usize;
+        let resident = (room > 0).then(|| gpu.record_slots_past(room, record, more)).flatten().map(|slots| Mutex::new(Resident::new(slots)));
         Some(WgpuExperts {
             group: Mutex::new(group),
             resident,

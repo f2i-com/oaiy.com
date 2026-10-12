@@ -551,6 +551,37 @@ engine opened the model with. A conversation whose state is larger than the prom
 whole allowance (`prompt_cache_gb`, 4: about 30,000 of the 27B's tokens) is not written to
 the disk after its replies; raise the allowance to have long ones survive a restart.
 
+**DeepSeek-V4.1 on the card, from a USB drive.** The 510 GB checkpoint runs with the card,
+this Mac's memory and the drive it is on as its three tiers (WEBGPU.md, "DeepSeek-V4.1"):
+its dense trunk (9.7 GB) and 650 of its 15,360 routed experts on the card, as many experts
+again in the Mac's memory (four fifths of what is free: 8 to 15 GiB of 24), and the rest read
+from the drive as each token routes to them, 18.8 MB a record. A token routes to 240, so
+what the two tiers do not hold is what a token costs. On an RTX 4090 in a Thunderbolt
+enclosure, an M5 Pro with 24 GB and the checkpoint on a Samsung T9 (a 10 Gb/s USB link:
+1.0 GB/s, one reader or eight), 12 October 2026:
+
+| | Time | Read from the drive |
+|---|---|---|
+| Loading | 20 s (and 9 GB of experts into memory while idle, 10 to 25 s) | |
+| A 16-token prompt | 30 to 44 s | 25 to 35 GB |
+| A 159-token prompt | 105 s | 99 GB |
+| A reply on a subject new to it | 0.46 to 0.54 tokens a second | 1.5 to 1.9 GB a token |
+| A reply on one its usage profile knows | 0.62 to 0.66 | 1.3 GB a token |
+| A conversation's next turn (17 new tokens after 56 kept) | 31 s to its first token | |
+
+Every answer was right. The drive is what bounds it: of a 60-token reply's 89 s, 73 were
+reads, the CPU's experts 9 and the card's work under 4, so the same reply with nothing to
+read would run at some 2.7 tokens a second. A prompt of a few hundred tokens routes to nearly
+every expert (290 GB: five minutes at this drive's rate), so an Agent's first turn, with its
+instructions and tools, takes that long, and each later turn the time its new tokens take.
+The engine keeps the experts' counts of uses from one run to the next (the card's engine in
+`cache/expert-usage-egpu.bin`), and a start that finds them puts the most used on the card:
+56% of a reply's experts came from the card then, where 7 to 20% with none. On a card that
+is the engine's alone its experts take 2 GiB of the 4 a card's budget otherwise leaves (650
+experts where 536; the card's least room through these was 1.7 GB). While it is loaded it
+holds most of the memory that was free, and other programs' idle memory goes to swap.
+A drive on a faster link is the gain to be had (USB4 or Thunderbolt: three times this one's rate).
+
 ### Checked, and not
 
 **Checked** (2026-10-10): the real tinygrad, at commit `ebe4623e` (2026-10-09), in a Linux

@@ -809,7 +809,10 @@ impl Models {
                 // A prompt's busy experts there too, through record slots in what the budget has left after the trunk,
                 // and the experts used most kept there in what is left after those (a decode step's computed there while
                 // the CPU reads and computes the rest).
-                let experts = match crate::dsv41_portable::WgpuExperts::new(b) {
+                // (a card of tinygrad's is the engine's alone: its experts take half of what the default budget leaves
+                // for other uses of a card; a budget that was asked for is kept to)
+                let more = if o.webgpu_gb.is_none() && b.adapter().pci_bus_id == "tinygpu" { crate::dsv41_portable::ALONE } else { 0 };
+                let experts = match crate::dsv41_portable::WgpuExperts::new(b, more) {
                     Some(mut k) => {
                         let (n, kept) = (k.slots(), k.tier().0);
                         // The other GPUs it may use (the rest of its devices; every other discrete one where none is

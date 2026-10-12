@@ -67,10 +67,16 @@ impl WgpuBackend {
     /// Up to `count` slots for records of `record_bytes`, as many as the weight budget has room for; None if not one,
     /// or if a record is not whole words or is past the binding limit.
     pub fn record_slots(&self, count: usize, record_bytes: usize) -> Option<RecordSlots> {
+        self.record_slots_past(count, record_bytes, 0)
+    }
+
+    /// [`Self::record_slots`] with room for `more` bytes past the weight budget: for a card whose default budget
+    /// leaves what nothing else there uses (a card that is the engine's alone, and a model with no cache on it).
+    pub fn record_slots_past(&self, count: usize, record_bytes: usize, more: u64) -> Option<RecordSlots> {
         if record_bytes == 0 || record_bytes % 4 != 0 || record_bytes as u64 > chunk_limit(&self.gpu.limits) {
             return None;
         }
-        let free = self.budget.saturating_sub(self.used.load(Ordering::Relaxed));
+        let free = (self.budget + more).saturating_sub(self.used.load(Ordering::Relaxed));
         let n = count.min((free / record_bytes as u64) as usize);
         if n == 0 {
             return None;

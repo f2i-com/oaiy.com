@@ -53,7 +53,7 @@ fn an_expert_on_the_gpu_gives_the_cpus_output_but_for_its_sums_order() {
     let x: Vec<f32> = (0..rows * DIM).map(|_| (((next() % 2001) as f32 / 1000.0) - 1.0) * 0.5).collect();
     let weights: Vec<f32> = (0..rows).map(|i| 0.05 + 0.01 * i as f32).collect();
     let cpu = expert_forward_batch(&record, &x, Some(&weights), 10.0);
-    let gpu = WgpuExperts::new(&b).unwrap().forward(&[ExpertJob { record: &record, x: &x, weights: &weights }], 10.0).pop().unwrap();
+    let gpu = WgpuExperts::new(&b, 0).unwrap().forward(&[ExpertJob { record: &record, x: &x, weights: &weights }], 10.0).pop().unwrap();
     assert_eq!(cpu.len(), gpu.len());
     let same = cpu.iter().zip(&gpu).filter(|(a, b)| a == b).count();
     let scale = cpu.iter().fold(0.0f32, |m, v| m.max(v.abs()));
@@ -85,7 +85,7 @@ fn measure_a_group_of_experts_on_the_gpu() {
     let x: Vec<f32> = (0..rows * DIM).map(|_| (((next() % 2001) as f32 / 1000.0) - 1.0) * 0.5).collect();
     let weights: Vec<f32> = (0..rows).map(|i| 0.05 + 0.01 * i as f32).collect();
     let jobs: Vec<ExpertJob<'_>> = records.iter().map(|r| ExpertJob { record: r, x: &x, weights: &weights }).collect();
-    let kernel = WgpuExperts::new(&b).unwrap();
+    let kernel = WgpuExperts::new(&b, 0).unwrap();
     kernel.forward(&jobs[..2], 10.0);
     for round in 0..3 {
         let t = Instant::now();
@@ -224,7 +224,7 @@ fn an_idle_rebalance_gives_the_card_the_most_used_experts_and_ram_the_displaced(
     use oaiy_engine::store::WeightStore;
     let record = RECORD_BYTES as u64;
     let b = WgpuBackend::new(Some(dsv41::moe::GPU_GROUP as u64 * record + MARGIN + 4 * record + record / 2)).expect("a WebGPU adapter");
-    let k = WgpuExperts::new(&b).unwrap();
+    let k = WgpuExperts::new(&b, 0).unwrap();
     assert_eq!(k.tier().0, 4, "a tier of four slots");
     k.set_exclusive(true);
     let (store, cache) = (Made, oaiy_engine::ecache::Ecache::new(8 * RECORD_BYTES, RECORD_BYTES, oaiy_engine::CachePolicy::Lfru));
@@ -329,7 +329,7 @@ fn a_usage_profile_orders_a_start_ups_tiers() {
     // a tier of four slots takes the first four of the order, read from the drive while idle, not RAM's
     let record = RECORD_BYTES as u64;
     let b = WgpuBackend::new(Some(dsv41::moe::GPU_GROUP as u64 * record + MARGIN + 4 * record + record / 2)).expect("a WebGPU adapter");
-    let mut k = WgpuExperts::new(&b).unwrap();
+    let mut k = WgpuExperts::new(&b, 0).unwrap();
     k.set_exclusive(true);
     k.start_from(&order);
     let (store, cache) = (Made, oaiy_engine::ecache::Ecache::new(8 * RECORD_BYTES, RECORD_BYTES, oaiy_engine::CachePolicy::Lfru));
@@ -366,7 +366,7 @@ fn the_trunk_and_the_experts_on_the_gpu_answer_as_the_cpu_model_does() {
     let backend: Arc<dyn ggml_rs::Backend> = Arc::new(gpu());
     let mut model = Model::load(&dir, &meta, &opts).unwrap();
     let (count, bytes) = offload(&mut model, backend.as_any().downcast_ref::<WgpuBackend>().unwrap());
-    let kernel = Arc::new(WgpuExperts::new(backend.as_any().downcast_ref::<WgpuBackend>().unwrap()).unwrap());
+    let kernel = Arc::new(WgpuExperts::new(backend.as_any().downcast_ref::<WgpuBackend>().unwrap(), 0).unwrap());
     model.set_experts_kernel(Some(Arc::clone(&kernel) as Arc<dyn dsv41::expert::ExpertsKernel>));
     eprintln!("{count} dense matrices on the GPU, {:.2} GB, and the experts", bytes as f64 / 1e9);
     let (gpu_logits, gpu_tokens) = run(&mut model);
@@ -408,7 +408,7 @@ fn measure_prefill_and_warm_decode_with_the_trunk_on_the_gpu() {
     eprintln!("{count} dense matrices on the GPU, {:.2} GB, in {:.1} s", bytes as f64 / 1e9, t.elapsed().as_secs_f64());
     let mut kernel = None;
     if std::env::var("DSV41_GPU_EXPERTS").map_or(true, |v| v != "0") {
-        let k = Arc::new(WgpuExperts::new(backend.as_any().downcast_ref::<WgpuBackend>().unwrap()).expect("room for a record"));
+        let k = Arc::new(WgpuExperts::new(backend.as_any().downcast_ref::<WgpuBackend>().unwrap(), 0).expect("room for a record"));
         eprintln!("{} record slots for a prompt's experts, {} kept between passes", k.slots(), k.tier().0);
         if std::env::var("DSV41_TIER_EXCLUSIVE").is_ok_and(|v| v == "1") {
             k.set_exclusive(true);
