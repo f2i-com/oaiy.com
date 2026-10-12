@@ -126,6 +126,13 @@ try {
     expect((await chip()) === `OAIY · ${MODEL}`, await chip());
   });
 
+  // (A chip's own display beat the hidden attribute: with no eGPU offered, its menu was an empty dropdown in the header.)
+  await check('the header shows no eGPU menu where OAIY offers no eGPU, and no hidden chip at all', async () => {
+    const shown = await page.$$eval('.chip', (cs) => cs.filter((c) => c.hidden && getComputedStyle(c).display !== 'none').map((c) => c.className));
+    expect(shown.length === 0, `hidden chips displayed: ${JSON.stringify(shown)}`);
+    expect(await page.$eval('select.egpu.pick', (s) => s.hidden && getComputedStyle(s).display === 'none'), 'the eGPU menu is displayed');
+  });
+
   // The Clear button beside the context meter: asked first, then the conversation starts again.
   await check('Clear asks first, and Cancel leaves the conversation as it is', async () => {
     await page.waitForFunction(() => !document.querySelector('.chat-clear')?.disabled, { timeout: 15_000 });

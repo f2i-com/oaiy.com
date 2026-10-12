@@ -210,6 +210,8 @@ button:focus-visible, summary:focus-visible, [tabindex]:focus-visible { outline:
 .update-notice .update-later { padding: 0; width: 28px; border-color: transparent; background: transparent; color: var(--muted); font-size: 16px; line-height: 1; }
 /* Status pills, as the dashboard draws them: a soft fill, a 1px edge, and a lit dot. */
 .chip { display: inline-flex; align-items: center; gap: 7px; height: 30px; padding: 0 12px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface-soft); color: var(--muted); font-size: 12px; font-weight: 600; white-space: nowrap; }
+/* (a chip's own display beats the hidden attribute: a chip hidden is not shown; the menus' own rule is below) */
+.chip[hidden] { display: none; }
 .chip:hover:not(:disabled) { border-color: var(--strong-border); background: var(--panel-2); color: var(--text); }
 .chip.toggle::before { content: ''; flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--ok); box-shadow: var(--glow) var(--ok); }
 .chip[data-mode='blocked']::before { background: var(--err); box-shadow: none; }
@@ -1087,6 +1089,8 @@ footer.dialog-buttons { flex: none; padding: 12px 22px 16px; border-top: 1px sol
 .chip[hidden] { display: none; }
 select.chip.pick { appearance: none; -webkit-appearance: none; display: inline-block; max-width: 30vw; padding: 0 26px 0 12px; line-height: 28px; overflow: hidden; text-overflow: ellipsis; cursor: pointer; background: var(--surface-soft) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none' stroke='%23888' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 4.5l3 3 3-3'/%3E%3C/svg%3E") no-repeat right 9px center / 11px; }
 select.chip.pick:disabled { opacity: 0.6; cursor: progress; }
+/* (its display above beat the hidden attribute: the eGPU's menu, with no eGPU to offer, was an empty dropdown) */
+select.chip.pick[hidden] { display: none; }
 select.chip.egpu[data-state='ready'] { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, var(--border)); }
 select.chip.egpu[data-state='starting'] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--border)); background-color: var(--warn-soft); }
 select.chip.egpu[data-state='failed'] { color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, var(--border)); background-color: var(--err-soft); }
