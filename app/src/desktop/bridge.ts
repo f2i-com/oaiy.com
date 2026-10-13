@@ -234,6 +234,12 @@ export class Desktop {
     return this.follow('/api/voice/events', "OAIY Desktop's call events", onEvent, signal);
   }
 
+  /** The calls the desktop is on now (their ids): those it answers, and those the owner has taken. */
+  async liveCalls(signal?: AbortSignal): Promise<string[]> {
+    const body = await reply(await fetch(`${this.origin}/api/voice/calls`, { headers: this.headers(), signal }));
+    return isRecord(body) && Array.isArray(body.calls) ? body.calls.map(String) : [];
+  }
+
   /**
    * Which of the desktop's modules (the phone, the calendar) are on: its
    * snapshot, as `modules.ts` reads it. An older desktop answers 404 (a

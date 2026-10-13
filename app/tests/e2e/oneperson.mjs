@@ -103,6 +103,7 @@ const voiceClients = new Set();
 let liveCalls = [];
 const bridgeEvents = [];
 const sent = [];
+const hangups = [];
 const spoken = [];
 const named = [];
 const desktopServer = createHttpServer(async (req, res) => {
@@ -139,11 +140,17 @@ const desktopServer = createHttpServer(async (req, res) => {
   if (path.startsWith('/api/bridge/connectors/')) {
     const { command, payload } = JSON.parse(body || '{}');
     if (command === 'sms.send') sent.push(payload);
+    // Aokie hangs up on its call; a call it does not have is stale.
+    if (command === 'call.hangup') {
+      hangups.push(payload.callId);
+      if (!liveCalls.includes(payload.callId)) return json({ ok: false, error: { code: 'node_failed', message: `callId "${payload.callId}" is stale: there is no current call` } }, 502);
+    }
     return json({ ok: true, result: { ok: true, data: command === 'phone.status' ? { connected: true } : command === 'settings.get' ? { value: '' } : command === 'sms.send' ? { messageId: `m${sent.length}` } : {} } });
   }
   if (path === '/api/bridge/flows') return json({ flows: [] });
   if (path === '/api/plugins') return json({ plugins: [{ id: 'aokie', state: 'running' }] });
   if (path.startsWith('/api/calendar')) return json({ available: true, settings: {}, appointments: [], now: new Date().toISOString() });
+  if (path === '/api/voice/calls') return json({ calls: liveCalls });
   if (path.startsWith('/api/voice/calls/')) {
     if (path.endsWith('/say')) spoken.push(JSON.parse(body || '{}').text);
     return json({ result: { ok: true, output: {} } });
@@ -432,6 +439,22 @@ try {
     const liam = (await pickerOptions(page)).filter((o) => o.name?.startsWith('Liam'));
     expect(liam.length === 1, JSON.stringify(liam));
     await closePicker(page);
+  });
+
+  await check('End call on a call whose end never reached the page: asked first, then closed, and the phone is not asked', async () => {
+    // The desktop had the call, and its end was lost: it is on no call now.
+    liveCalls = ['live-3'];
+    voice({ type: 'call.started', callId: 'live-3', from: '0491570006', name: '' });
+    await page.waitForFunction(() => !document.querySelector('.call-live')?.hidden, { timeout: 10_000 });
+    liveCalls = [];
+    await shoot(page, 'end-call');
+    await page.click('.call-live .live-end');
+    await page.waitForSelector('dialog.modal[open] button.primary');
+    const asked = await page.$eval('dialog.modal[open]', (d) => d.textContent);
+    await page.click('dialog.modal button.primary');
+    await page.waitForFunction(() => document.querySelector('.call-live')?.hidden, { timeout: 10_000 });
+    const chip = await page.evaluate(() => document.querySelector('.chip.on-call')?.hidden);
+    expect(/End the call with Liam/.test(asked) && chip === true && hangups.length === 0, JSON.stringify({ asked, chip, hangups }));
   });
 
   await check('the page raised no errors', async () => {

@@ -297,6 +297,54 @@ describe('a phone call answered by the agent', () => {
     expect(said('Caller [0:08]: Um')).toHaveLength(1);
   });
 
+  it('End call: the phone is asked to hang up, and the call ends when its end comes', async () => {
+    const { sessions, desktop } = setup();
+    const asked: Array<[string, Record<string, unknown>]> = [];
+    Object.assign(desktop, {
+      liveCalls: async () => ['call_end1'],
+      command: async (_c: string, command: string, payload: Record<string, unknown>) => {
+        asked.push([command, payload]);
+        return { accepted: true, queued: true };
+      },
+    });
+    const call = await sessions.callEvent({ type: 'call.started', callId: 'call_end1', from: '+61400000050' });
+    expect(await sessions.hangUp(call!)).toBe('asked');
+    expect(asked).toEqual([['call.hangup', { callId: 'call_end1' }]]);
+    expect(call?.callId).toBe('call_end1');
+    await sessions.callEvent({ type: 'call.ended', callId: 'call_end1', reason: 'operator_hangup' });
+    expect(call?.callId).toBeUndefined();
+  });
+
+  it('End call on a call that is over (its end never came): closed here, whether the desktop or the phone says so', async () => {
+    const { sessions, desktop } = setup();
+    let live: string[] = [];
+    const asked: string[] = [];
+    Object.assign(desktop, {
+      liveCalls: async () => live,
+      command: async (_c: string, _command: string, payload: Record<string, unknown>) => {
+        asked.push(String(payload.callId));
+        throw new Error(`callId "${String(payload.callId)}" is stale: there is no current call`);
+      },
+    });
+    // The desktop is not on it: the phone is not asked.
+    const gone = await sessions.callEvent({ type: 'call.started', callId: 'call_gone', from: '+61400000051' });
+    expect(await sessions.hangUp(gone!)).toBe('ended');
+    expect(asked).toEqual([]);
+    expect(gone?.callId).toBeUndefined();
+    expect(gone?.agent.turns.at(-1)).toMatchObject({ text: '[OAIY] 📞 The call ended.' });
+    // The desktop still lists it, and the phone has no such call.
+    live = ['call_stale'];
+    const stale = await sessions.callEvent({ type: 'call.started', callId: 'call_stale', from: '+61400000052' });
+    expect(await sessions.hangUp(stale!)).toBe('ended');
+    expect(asked).toEqual(['call_stale']);
+    expect(sessions.list.some((s) => s.callId)).toBe(false);
+    // Any other refusal is the person's to see: the call stays.
+    Object.assign(desktop, { command: async () => { throw new Error('the plugin did not answer call.hangup within 30s'); } });
+    const busy = await sessions.callEvent({ type: 'call.started', callId: 'call_stale', from: '+61400000052' });
+    await expect(sessions.hangUp(busy!)).rejects.toThrow(/did not answer/);
+    expect(busy?.callId).toBe('call_stale');
+  });
+
   it('a call whose end was missed (the desktop restarted) ends when the desktop says which calls go on', async () => {
     const { sessions } = setup();
     const call = await sessions.callEvent({ type: 'call.started', callId: 'call_h', from: '+61400000018' });

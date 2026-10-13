@@ -2127,6 +2127,37 @@ export class Sessions {
     return session;
   }
 
+  /**
+   * The person ends the call `session` is on (the End call button): the phone
+   * is asked to hang up, and the call ends here when its end comes ('asked').
+   * A call the desktop is not on, or the phone no longer has, ended without
+   * its end coming here (the page was held back through it): it ends here now
+   * ('ended'), so the page is never left on a call that is over.
+   */
+  async hangUp(session: Session): Promise<'asked' | 'ended'> {
+    const callId = session.callId;
+    if (!callId) return 'ended';
+    const desktop = this.desktop();
+    // (null: the desktop cannot say which calls it is on, and the phone is asked all the same)
+    const live = desktop ? await desktop.liveCalls().catch(() => null) : null;
+    let over = !desktop || (live !== null && !live.includes(callId));
+    if (!over) {
+      // A call of ours is the phone's under its own id (an outreach's dial); any other has the same id there.
+      const link = session.outreach && !session.outreach.inbound ? session.outreach : undefined;
+      try {
+        await desktop!.command('aokie', 'call.hangup', { callId: link?.phoneCallId() ?? callId }, `oaiy:hangup:${callId}:${crypto.randomUUID()}`);
+      } catch (error) {
+        // Aokie: "callId … is stale: there is no current call", or "… is not the current call".
+        if (!/\bstale\b|not the current call/i.test((error as Error).message)) throw error;
+        over = true;
+      }
+    }
+    if (!over) return 'asked';
+    // As the desktop would have said it: after any of the call's events still being taken.
+    await this.callEvent({ type: 'call.ended', callId });
+    return 'ended';
+  }
+
   /** The call `session` is on has ended: it stops speaking and working, and its conversation says so (and why, when it failed). */
   private async endCall(session: Session, reason = ''): Promise<void> {
     if (session.callId) this.noteEnded(session.callId, session);

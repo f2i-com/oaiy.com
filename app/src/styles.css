@@ -519,7 +519,11 @@ kbd { display: inline-block; padding: 1px 6px; border: 1px solid var(--border); 
 .live-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--err); box-shadow: var(--glow) var(--err); animation: pulse 1.2s ease-in-out infinite; }
 .live-label { font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; font-size: 10.5px; }
 .live-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); font-weight: 600; }
+.live-status { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; }
 .live-time { margin-left: auto; font-family: var(--mono); font-weight: 600; font-variant-numeric: tabular-nums; }
+.live-end { flex: none; padding: 3px 10px; border: 1px solid color-mix(in srgb, var(--err) 45%, var(--border)); border-radius: var(--r-ctl); background: var(--surface-soft); color: var(--err); font-size: 11.5px; font-weight: 600; }
+.live-end:hover:not(:disabled) { background: var(--err); border-color: var(--err); color: #fff; }
+.live-end[hidden] { display: none; }
 
 /* One speaker's run: their avatar and name, over what they said (newest first). */
 .run { display: flex; flex-direction: column; gap: 6px; min-width: 0; }

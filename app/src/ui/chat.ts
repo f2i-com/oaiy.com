@@ -156,8 +156,10 @@ export class ChatPane {
   private contactTab: ConversationTab | null = null;
   /** A person's conversation: their number onto the phone's blocked list (or off it again), without typing it into the phone's settings. */
   private readonly blockButton = h('button.convo-block', { type: 'button', hidden: true, 'aria-pressed': 'false' }, icon('ban'), h('span', 'Block'));
-  /** A call going on now, in the conversation shown: how long it has run. */
-  private readonly liveBar = h('div.call-live', { role: 'status', hidden: true });
+  /** A call going on now, in the conversation shown: how long it has run, and a button that ends it. */
+  private readonly liveBar = h('div.call-live', { hidden: true });
+  private readonly liveStatus = h('div.live-status', { role: 'status' });
+  private readonly liveEnd = h('button.live-end', { type: 'button', title: 'Hang up on this call (asked first)' }, 'End call');
   private liveTimer: ReturnType<typeof setInterval> | null = null;
   /** The person's choice to show or hide the steps; null follows the run (hidden once finished). */
   private planOpen: boolean | null = null;
@@ -229,6 +231,8 @@ export class ChatPane {
       contact?: (tab: ConversationTab, anchor: HTMLElement) => void;
       /** Block the person of a conversation, or unblock one who is (`tab.blocked`): asked first, by the handler. */
       block?: (tab: ConversationTab) => void;
+      /** End the call going on in the conversation shown (the live strip's End call): asked first, by the handler. */
+      hangUp?: () => void;
     },
   ) {
     this.planBox.hidden = true;
@@ -236,6 +240,9 @@ export class ChatPane {
     this.log.append(this.feed);
     this.feed.append(this.status);
     this.sessionTabs.append(this.sessionPicker.element, this.contactButton, this.blockButton);
+    this.liveBar.append(this.liveStatus, this.liveEnd);
+    this.liveEnd.hidden = !this.handlers.hangUp;
+    this.liveEnd.addEventListener('click', () => this.handlers.hangUp?.());
     this.contactButton.addEventListener('click', () => {
       if (this.contactTab) this.handlers.contact?.(this.contactTab, this.contactButton);
     });
@@ -615,10 +622,11 @@ export class ChatPane {
     if (this.liveTimer) clearInterval(this.liveTimer);
     this.liveTimer = null;
     if (!live) return;
+    // (Only what it says is drawn again each second: the End call button stays, under the pointer.)
     const tick = () => {
-      clear(this.liveBar);
+      clear(this.liveStatus);
       const time = this.callStartAt ? clock(Date.now() - this.callStartAt) : '';
-      this.liveBar.append(h('span.live-dot', { 'aria-hidden': 'true' }), h('span.live-label', 'Live call'), h('span.live-name', this.callName !== 'Caller' ? this.callName : name), h('span.live-time', { title: 'How long the call has run' }, time));
+      this.liveStatus.append(h('span.live-dot', { 'aria-hidden': 'true' }), h('span.live-label', 'Live call'), h('span.live-name', this.callName !== 'Caller' ? this.callName : name), h('span.live-time', { title: 'How long the call has run' }, time));
     };
     tick();
     this.liveTimer = setInterval(tick, 1000);

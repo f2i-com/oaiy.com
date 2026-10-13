@@ -371,7 +371,33 @@ async function main(): Promise<void> {
     contact: (tab, anchor) => void openContact(tab.key ?? '', tab.name ?? '', anchor),
     // Their number onto the phone's blocked list, or off it: from their conversation, with nothing to type.
     block: (tab) => void toggleBlocked(tab.key ?? '', tab.name ?? ''),
+    // The call in the conversation shown, ended from its live strip.
+    hangUp: () => void endShownCall(),
   });
+
+  /**
+   * End the call going on in the conversation shown (its live strip's End call): asked first. The phone hangs up,
+   * and a call that is over already, whose end never came here, is closed (Sessions.hangUp).
+   */
+  async function endShownCall(): Promise<void> {
+    const live = viewing ? sessions?.list.find((s) => s.thread === viewing && s.callId) : undefined;
+    if (!live || !sessions) return;
+    const who = live.title === live.key && !live.hidden ? displayNumber(live.key) : live.title;
+    if (!(await confirmAction({ title: `End the call with ${who}?`, message: 'The phone hangs up on them. A call that is over already (its end never reached this page) is closed here.', ok: 'End call', danger: true }))) return;
+    try {
+      const how = await sessions.hangUp(live);
+      chat.system(
+        how === 'asked'
+          ? `📞 The phone is hanging up on ${who}.`
+          : desktop
+            ? `📞 The call with ${who} had ended on the phone (its end never reached this page): it is closed here.`
+            : `📞 The call with ${who} is closed here. OAIY Desktop is not connected: if it goes on, end it on the phone.`,
+      );
+    } catch (error) {
+      chat.system(`The phone did not hang up on ${who} (${(error as Error).message}). End the call on the phone itself.`, 'error');
+    }
+    renderSessions();
+  }
 
   /** Stop an outreach from its card: asked first. */
   async function stopOutreach(id: string): Promise<void> {
