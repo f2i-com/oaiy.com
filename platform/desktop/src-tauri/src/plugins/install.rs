@@ -203,6 +203,39 @@ fn keep_executable(_file: &std::fs::File, _mode: Option<u32>) -> Result<(), Stri
     Ok(())
 }
 
+/// On Unix, an installed plugin's modes are the installer's own, whatever its archive or folder said and whatever this
+/// process's umask is: a folder 0755, a program (a file it was given with an executable bit) 0755, any other file
+/// 0644. Under Ubuntu's umask (0002) its files and folders were group-writable, and where a user's primary group is
+/// shared (`users`, on some systems) another account could have changed a trusted plugin's code.
+#[cfg(unix)]
+fn settle_modes(dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let set = |path: &Path, mode: u32| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(|e| format!("cannot set the mode of {}: {e}", path.display()))
+    };
+    set(dir, 0o755)?;
+    for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        let meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+        if meta.file_type().is_symlink() {
+            // (an archive's links are refused, and a folder's are not copied as links: none is here to follow)
+            continue;
+        }
+        if meta.is_dir() {
+            settle_modes(&path)?;
+        } else {
+            set(&path, if meta.permissions().mode() & 0o111 != 0 { 0o755 } else { 0o644 })?;
+        }
+    }
+    Ok(())
+}
+
+/// Elsewhere a file's access is its folder's.
+#[cfg(not(unix))]
+fn settle_modes(_dir: &Path) -> Result<(), String> {
+    Ok(())
+}
+
 /// The directory that actually holds the manifest: either `root` itself, or a
 /// single top-level folder inside it (the usual shape of a packaged archive).
 fn manifest_root(root: &Path) -> PathBuf {
@@ -301,6 +334,7 @@ pub fn install_from_path(source: &Path, plugins_root: &Path, trust: &TrustServic
             }
         }
 
+        settle_modes(&staging)?;
         let staged = manifest_root(&staging);
         let manifest = read_manifest(&staged)?;
         // Before anything is moved: a package that fails its signature must not replace

@@ -2144,15 +2144,16 @@ mod tests {
         let (code, out, _) = run_in(&dir, "auth token create --preset cli", &[], None);
         assert_eq!(code, EXIT_OK, "{out}");
         // The lifetimes, as the list rounds them down: 30 days as asked, one day for a dangerous preset (so none whole
-        // days are left) and ninety for the rest.
+        // days are left) and ninety for the rest: 89 once a millisecond has passed since it was made, and 90 where the
+        // list came within the same millisecond (a fast machine's, here and there).
         let (_, listed, _) = run_in(&dir, "auth token list", &[], None);
         for left in [
             "expires in 29 days",
             "expires in 0 days",
-            "expires in 89 days",
         ] {
             assert_eq!(listed.matches(left).count(), 1, "{left}:\n{listed}");
         }
+        assert_eq!(listed.matches("expires in 89 days").count() + listed.matches("expires in 90 days").count(), 1, "ninety days:\n{listed}");
         for bad in [
             "auth token create --preset owner",
             "auth token create --preset nonsense",
