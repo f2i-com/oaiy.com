@@ -1423,13 +1423,15 @@ fn measure_q8_rows_9b() {
         let raw: Vec<u8> = (0..n * (k / 256) * bytes).map(|i| (i as u32).wrapping_mul(2_654_435_761).wrapping_shr(13) as u8 & 0x3b).collect();
         let nbytes = raw.len();
         let w = ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(raw, vec![n, k], dtype));
-        let (x, y) = (b.vec(k), b.vec(n));
+        // (OAIY_Q8_M: that many rows of x, a check's)
+        let m: usize = std::env::var("OAIY_Q8_M").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        let (x, y) = (b.vec(m * k), b.vec(m * n));
         let reps = 16;
         let run = || {
             let mut rq = Recorder::new(&b);
             for _ in 0..reps {
                 rq.q8.clear();
-                rq.matmul_rows_q8(&w, &x, &y, 1);
+                rq.matmul_rows_q8(&w, &x, &y, m);
             }
             rq.read_range(&y, 0, 1);
             Box::new(rq).finish();
@@ -1641,4 +1643,115 @@ fn measure_step_attention() {
     let top = outs[0].iter().fold(0f32, |m, v| m.max(v.abs()));
     let worst = outs[1].iter().zip(&outs[0]).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
     eprintln!("{line}; lanes' within {:.1e} of the largest", worst / top);
+}
+
+/// What moving bytes between the host and the card costs by each way there is (`--ignored --nocapture`), for a device
+/// with read-mappable storage buffers: 256 MB read back; 64 MB written by the CPU into a buffer made mapped (read-
+/// mappable: wgpu's Vulkan backend gives it the host's memory) and into one mapped for writing (read- and
+/// write-mappable: the card's memory, through its BAR), and into the host's own memory for scale; 1 GiB copied by a
+/// kernel from each (its threads' reads many in flight); 1 GiB by the queue's write ([`Gpu::write`]); 1 GiB copied on
+/// the GPU from staging in the host's memory. An NVIDIA A2 in a Thunderbolt 3 enclosure on an Ice Lake laptop (the
+/// card's IOMMU group strict, as an external device's is): back 0.8 GB/s; the CPU's writes into the host's buffer 0.1,
+/// into the card's 0.2, into its own memory 19; the kernel's copy from the host's buffer 2.2, from the card's 65; the
+/// queue's write 0.2 (a model's weights load at that: Qwen3.5 9B's 5.1 GB in 27 s); the GPU's copy 0.08. Every way
+/// the CPU writes memory the card reads is 0.1 to 0.2 GB/s there, where a Thunderbolt 3 card's uploads are some 2.5.
+#[test]
+#[ignore = "a measurement"]
+fn measure_upload_paths() {
+    let Ok(b) = WgpuBackend::new(Some(4 << 30)) else { return };
+    let gpu = &b.gpu;
+    if !gpu.device.features().contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS) {
+        return;
+    }
+    let len = 1usize << 30;
+    let piece = 64usize << 20;
+    let data: Vec<u8> = (0..len).map(|i| (i as u32).wrapping_mul(2_654_435_761).wrapping_shr(13) as u8).collect();
+    let dst = gpu.device.create_buffer(&wgpu::BufferDescriptor { label: Some("measure-dst"), size: len as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+    let fill = |base: usize, from: &[u8]| {
+        let each = from.len().div_ceil(8);
+        std::thread::scope(|s| {
+            for (i, part) in from.chunks(each).enumerate() {
+                // SAFETY: each thread its own bytes of memory mapped for writing (or the host's own) past this scope
+                s.spawn(move || unsafe { std::ptr::copy_nonoverlapping(part.as_ptr(), (base + i * each) as *mut u8, part.len()) });
+            }
+        });
+    };
+    let gb = |bytes: usize, secs: f64| bytes as f64 / secs / 1e9;
+    let t = std::time::Instant::now();
+    let got = gpu.read(&dst, 256 << 20);
+    eprintln!("256 MB read back: {:.2} GB/s", gb(got.len(), t.elapsed().as_secs_f64()));
+    // the host's buffer: made mapped, filled
+    let t = std::time::Instant::now();
+    let in_host = gpu.device.create_buffer(&wgpu::BufferDescriptor { label: Some("measure-host"), size: piece as u64, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::STORAGE, mapped_at_creation: true });
+    {
+        let mut view = in_host.slice(..).get_mapped_range_mut().expect("mapped at creation");
+        let mut whole = view.slice(..);
+        fill(whole.as_raw_ptr().cast::<u8>().as_ptr() as usize, &data[..piece]);
+    }
+    in_host.unmap();
+    let host_fill = gb(piece, t.elapsed().as_secs_f64());
+    // the card's: mapped for writing, filled (the best of three)
+    let in_card = gpu.device.create_buffer(&wgpu::BufferDescriptor { label: Some("measure-card"), size: piece as u64, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
+    let mut best = f64::MAX;
+    for _ in 0..3 {
+        in_card.slice(..).map_async(wgpu::MapMode::Write, |_| {});
+        gpu.wait(None);
+        let t = std::time::Instant::now();
+        {
+            let mut view = in_card.slice(..).get_mapped_range_mut().expect("mapped for writing");
+            let mut whole = view.slice(..);
+            fill(whole.as_raw_ptr().cast::<u8>().as_ptr() as usize, &data[..piece]);
+        }
+        best = best.min(t.elapsed().as_secs_f64());
+        in_card.unmap();
+    }
+    let mut ram = vec![0u8; piece];
+    fill(ram.as_mut_ptr() as usize, &data[..piece]);
+    let t = std::time::Instant::now();
+    fill(ram.as_mut_ptr() as usize, &data[..piece]);
+    eprintln!("64 MB written by the CPU: into the host's buffer {host_fill:.2} GB/s, into the card's {:.2}, into the host's own memory {:.1}", gb(piece, best), gb(piece, t.elapsed().as_secs_f64()));
+    const COPY: &str = r#"
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read> unused: array<u32>;
+@group(0) @binding(2) var<storage, read_write> dst: array<u32>;
+@group(0) @binding(3) var<uniform> p: array<vec4<u32>, 2>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
+    let threads = nw.x * 256u;
+    for (var i = id.x; i < p[0].x; i += threads) { dst[p[0].y + i] = src[i]; }
+}
+"#;
+    let pipeline = gpu.named_pipeline("measure-host-copy", || COPY.to_string());
+    let dstv = DeviceVec { len: len / 4, inner: std::sync::Arc::new(dst.clone()) };
+    for (what, from) in [("the host's buffer", &in_host), ("the card's", &in_card)] {
+        let fromv = DeviceVec { len: piece / 4, inner: std::sync::Arc::new(from.clone()) };
+        let t = std::time::Instant::now();
+        let mut rec = Recorder::new(&b);
+        for i in 0..len / piece {
+            rec.dispatch_kept(&pipeline, buffer(&fromv), buffer(&fromv), buffer(&dstv), &[(piece / 4) as u32, (i * piece / 4) as u32], (640, 1, 1));
+        }
+        rec.read_range(&dstv, 0, 1);
+        Box::new(rec).finish();
+        eprintln!("1 GiB copied by a kernel from {what}: {:.2} GB/s", gb(len, t.elapsed().as_secs_f64()));
+    }
+    let t = std::time::Instant::now();
+    gpu.write(&dst, 0, &data);
+    gpu.queue().submit([]);
+    gpu.wait(None);
+    eprintln!("1 GiB by the queue's write: {:.2} GB/s", gb(len, t.elapsed().as_secs_f64()));
+    let t = std::time::Instant::now();
+    for (i, part) in data.chunks(piece).enumerate() {
+        let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor { label: Some("measure-staging"), size: part.len() as u64, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: true });
+        {
+            let mut view = staging.slice(..).get_mapped_range_mut().expect("mapped at creation");
+            let mut whole = view.slice(..);
+            fill(whole.as_raw_ptr().cast::<u8>().as_ptr() as usize, part);
+        }
+        staging.unmap();
+        let mut enc = gpu.device.create_command_encoder(&Default::default());
+        enc.copy_buffer_to_buffer(&staging, 0, &dst, (i * piece) as u64, part.len() as u64);
+        gpu.queue().submit([enc.finish()]);
+        gpu.wait(None);
+    }
+    eprintln!("1 GiB copied on the GPU from staging in the host's memory: {:.2} GB/s", gb(len, t.elapsed().as_secs_f64()));
 }
