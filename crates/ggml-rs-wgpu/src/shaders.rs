@@ -301,8 +301,8 @@ pub(crate) fn rb_rows_q8(dtype: GgmlType, mr: u32) -> u32 {
 /// The grid of [`rb_kernel_q8`]'s kernel for `mr` rows of `x` a workgroup over `rows` weight rows, `m` rows of `x`
 /// (beyond 65535 a group of them wraps into the next axis): the kernel's own rows a workgroup, whichever it is (one row
 /// of `x` takes the several rows' kernel where a recording's rows are alike).
-pub fn grid_q8(dtype: GgmlType, m: usize, mr: u32, rows: u32) -> (u32, u32, u32) {
-    let groups = rows.div_ceil(4 * rb_rows_q8(dtype, mr));
+pub fn grid_q8(dtype: GgmlType, m: usize, mr: u32, rows: u32, subgroups: bool) -> (u32, u32, u32) {
+    let groups = rows.div_ceil(q8_threads(subgroups) / 32 * rb_rows_q8(dtype, mr));
     ((m as u32).div_ceil(mr), groups.min(65535), groups.div_ceil(65535))
 }
 

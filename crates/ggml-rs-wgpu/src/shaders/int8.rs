@@ -106,6 +106,13 @@ pub fn q8_len(rows: usize, k: usize) -> (usize, usize) {
     (rows * k / 4 + rows * k / 32 * 4, rows * k / 16)
 }
 
+/// Threads a workgroup of [`rb_kernel_q8`]'s kernel has: 256 where subgroups add its sums (on an NVIDIA A2 at 1,200 MHz
+/// Qwen3.5 9B's Q4_K [12288, 4096] in 191 us where 128 threads took 199, its [4096, 4096] in 72 where 76, Q5_K's 1 to
+/// 3% sooner, Q6_K's the same; 64 and 512 no better), else 128 (the sums' halving through the workgroup's memory).
+pub fn q8_threads(subgroups: bool) -> u32 {
+    if subgroups { 256 } else { 128 }
+}
+
 /// [`rb_kernel`]'s matmul from rows of `x` as int8 ([`QUANT_Q8`]'s): a weight run's values packed as bytes and each 4 of
 /// them against 4 of a row's in one `dot4I8Packed`, a 32-block's scale and its halves' sums for the offsets and the
 /// minimums; the same lanes, runs and rows. For several rows of `x` (a check of drafts, a short prompt's chunk) it
@@ -145,11 +152,11 @@ pub fn rb_kernel_q8(dtype: GgmlType, r: u32, mr: u32, subgroups: bool) -> Option
     l("fn q3_bytes(qw: u32, hw: u32, j: u32, h: u32) -> u32 {");
     l("    return ((qw >> (2u * j)) & 0x03030303u) | (((hw >> (j + 4u * h)) & 0x01010101u) << 2u);");
     l("}");
-    l("@compute @workgroup_size(128)");
+    l(&format!("@compute @workgroup_size({})", q8_threads(subgroups)));
     if subgroups {
-        // (a subgroup's lanes and which of the four it is as the device has them: its sums are its own lanes')
+        // (a subgroup's lanes and which of the eight it is as the device has them: its sums are its own lanes')
         l("fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(subgroup_invocation_id) lane: u32, @builtin(subgroup_id) sgi: u32) {");
-        l(&format!("    let rbase = (wg.y + wg.z * 65535u) * {}u + sgi * {r}u;", 4 * r));
+        l(&format!("    let rbase = (wg.y + wg.z * 65535u) * {}u + sgi * {r}u;", q8_threads(subgroups) / 32 * r));
     } else {
         l("fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {");
         l("    let lane = li & 31u;");

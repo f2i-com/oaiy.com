@@ -473,8 +473,10 @@ thread a block had a row of 4,096 on one workgroup's 128 threads); Q8_0's step r
 through the int8 kernels too where timed faster (the delta nets' gates [64, 4096] in 13 us
 where 50); and a delta net's one token is a subgroup a state's row (`DELTA_NET_STEP`, 35 us
 a layer where the scan's thread a row took 91; not where a recording's rows are alike).
-The 9B's replies at 1,200 MHz: 23.1 tokens a second and now 25.7; after a 20,190-token
-prompt 18.1 and now 22.4 (20.5 with the attention alone).
+The int8 one-row kernels' workgroups are 256 threads where subgroups add their sums
+(`shaders::q8_threads`; 128 took Q4_K's [12288, 4096] in 199 us, 256 in 191). The 9B's
+replies at 1,200 MHz: 23.1 tokens a second and now 26.3; after a 20,190-token prompt 18.1
+and now 22.4 (20.5 with the attention alone).
 
 A prompt's delta-net scan (a thread a state's row, through the chunk's tokens in turn) is
 the largest of what is left past the matmuls: some 6% of the 9B's prompt, 6.5 ms a layer
