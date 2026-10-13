@@ -1006,6 +1006,8 @@ export class Sessions {
    * kept, and the call is not taken up again.
    */
   private ended = new Map<string, Session | null>();
+  /** The call events taken so far (`callEvent`): the next waits for these. */
+  private calling: Promise<unknown> = Promise.resolve();
   /** Each conversation's turns in the order they happened, as last kept (the order of what was there before). */
   private orders = new Map<string, { turns: Turn[]; has: Set<Turn> }>();
   /** Each conversation's file being written: one write at a time, each with all its lanes' turns as they are then. */
@@ -1836,8 +1838,21 @@ export class Sessions {
    * the caller's history), the caller speaks (the agent answers, before
    * anyone else waiting), the caller speaks over it (the rest of that reply is
    * dropped), and the call ends.
+   *
+   * Taken one at a time, in the order they came: each once the one before it
+   * is done. A page that was held back (a Mac's hidden page, 2026-10-13) is
+   * given a whole call at once, and its end, taken while its start still
+   * looked for the caller's conversation, found no call to end; the start
+   * then had the conversation on a call that was over, for good, and the
+   * caller's words, taken meanwhile, each began a conversation of their own.
    */
-  async callEvent(event: Record<string, unknown>): Promise<Session | null> {
+  callEvent(event: Record<string, unknown>): Promise<Session | null> {
+    const taken = this.calling.then(() => this.takeCallEvent(event));
+    this.calling = taken.catch(() => {});
+    return taken;
+  }
+
+  private async takeCallEvent(event: Record<string, unknown>): Promise<Session | null> {
     const callId = typeof event.callId === 'string' ? event.callId : '';
     const type = String(event.type ?? '');
     // The desktop's live calls, sent as its event stream opens: a call not among them has ended

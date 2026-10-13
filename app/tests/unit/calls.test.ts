@@ -273,6 +273,30 @@ describe('a phone call answered by the agent', () => {
     expect(sessions.list.some((s) => s.callId)).toBe(false);
   });
 
+  it('a whole call that comes at once (the page was held back) is taken in order: it ends, in one conversation', async () => {
+    fakeProvider('openai', [{ text: 'Hello, how can I help?' }, { text: 'Sorry?' }]);
+    const { sessions } = setup();
+    // As a Mac's hidden page was given it, a minute late: no wait between them.
+    const taking = [
+      sessions.callEvent({ type: 'call.started', callId: 'call_burst', from: '+61283901963', greeting: 'Hello, thanks for calling.' }),
+      sessions.callEvent({ type: 'call.caller', callId: 'call_burst', text: 'Please submit a medical examination report.', startMs: 3_000, endMs: 6_000, over: true }),
+      sessions.callEvent({ type: 'call.caller', callId: 'call_burst', text: 'Um', startMs: 8_000, endMs: 8_400 }),
+      sessions.callEvent({ type: 'call.ended', callId: 'call_burst', reason: 'hung up' }),
+    ];
+    const [started] = await Promise.all(taking);
+    await settled(sessions);
+    expect(sessions.list.some((s) => s.callId)).toBe(false);
+    // One conversation: the caller's, not a "Hidden number" one for their words.
+    expect(sessions.list.map((s) => s.key)).toEqual(['+61283901963']);
+    expect(sessions.list.some((s) => s.hidden)).toBe(false);
+    const turns = started!.agent.turns;
+    const said = (start: string) => turns.filter((t) => t.role === 'user' && t.text.includes(start));
+    expect(said('[OAIY] 📞 A call from')).toHaveLength(1);
+    expect(said('[OAIY] 📞 The call ended.')).toHaveLength(1);
+    expect(said('medical examination report')).toHaveLength(1);
+    expect(said('Caller [0:08]: Um')).toHaveLength(1);
+  });
+
   it('a call whose end was missed (the desktop restarted) ends when the desktop says which calls go on', async () => {
     const { sessions } = setup();
     const call = await sessions.callEvent({ type: 'call.started', callId: 'call_h', from: '+61400000018' });
