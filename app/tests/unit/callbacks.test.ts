@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { AU_PATTERN, Callbacks, callsBack, isBlocked, retryAfter, type Callback, type Screening } from '../../src/callbacks';
+import { AU_PATTERN, Callbacks, callsBack, isAllowed, isBlocked, retryAfter, type Callback, type Screening } from '../../src/callbacks';
 import type { Desktop, DesktopEvent } from '../../src/desktop/bridge';
 import { setLocalCountry } from '../../src/phoneNumbers';
 import { DEFAULT_MESSAGE_SETTINGS, type MessageSettings } from '../../src/settings';
@@ -138,6 +138,35 @@ describe('missed calls, called back', () => {
       expect(callsBack(number, 'answered', answered), number).toBe(asAokie);
       expect(callsBack(number, 'any', answered), number).toBe(true);
     }
+  });
+
+  it('while the phone keeps to its allowed numbers, only they are rung back (and never a hidden caller); texts-only rings anyone', () => {
+    setLocalCountry('AU');
+    const only: Screening = { acceptPattern: '', blockedNumbers: '', rejectPrivate: false, allowedNumbers: '0491 570 006, +61 400 000 040', callsAllowedOnly: true, otherCallers: 'ring', textsAllowedOnly: false };
+    expect(callsBack('+61491570006', 'any', only)).toBe(true);
+    expect(callsBack('0400000040', 'any', only)).toBe(true);
+    expect(callsBack('+61283901963', 'any', only)).toBe(false);
+    expect(callsBack('+61283901963', 'au', only)).toBe(false);
+    // Texts kept to the list: calls are not.
+    expect(callsBack('+61283901963', 'any', { ...only, callsAllowedOnly: false, textsAllowedOnly: true })).toBe(true);
+    expect(isAllowed('+61283901963', { ...only, callsAllowedOnly: false, textsAllowedOnly: true }, 'text')).toBe(false);
+    expect(isAllowed('0491570006', { ...only, textsAllowedOnly: true }, 'text')).toBe(true);
+    // A hidden caller is on no list; an Aokie that says nothing of the list (or none read) keeps to none.
+    expect(isAllowed('Private', { ...only, allowedNumbers: 'Private' }, 'call')).toBe(false);
+    expect(isAllowed('+61283901963', {}, 'call')).toBe(true);
+    expect(isAllowed('+61283901963', null, 'text')).toBe(true);
+    // An empty list while it is on: no one.
+    expect(isAllowed('0491570006', { ...only, allowedNumbers: '' }, 'call')).toBe(false);
+  });
+
+  it('a missed call from a number that is not allowed is not rung back', async () => {
+    const t0 = Date.now();
+    const { callbacks, dials } = setup({ acceptPattern: '', blockedNumbers: '', rejectPrivate: false, allowedNumbers: '0400000041', callsAllowedOnly: true, otherCallers: 'ring' });
+    await callbacks.missed('+61283901963', t0);
+    await callbacks.missed('0400000041', t0);
+    await callbacks.tick(t0 + 120_000);
+    await callbacks.tick(t0 + 240_000);
+    expect(dials.map((d) => d.number)).toEqual(['0400000041']);
   });
 
   it('a missed call is the same person as their text or their next call, however each number is written', async () => {

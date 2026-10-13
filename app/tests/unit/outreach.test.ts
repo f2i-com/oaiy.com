@@ -168,6 +168,26 @@ describe('planning an outreach', () => {
     expect(plan.window).toEqual({ from: '09:00', to: '19:00' });
   });
 
+  it('while the phone keeps to its allowed numbers, a list skips everyone else: calls by the calls list, texts by the texts one', () => {
+    const allowed: Screening = { acceptPattern: '', blockedNumbers: '', rejectPrivate: false, allowedNumbers: '0412 345 678', callsAllowedOnly: true, otherCallers: 'reject', textsAllowedOnly: false };
+    const ctx = (screening: Screening) => ({ identity: GREEN, screening, doNotContact: [], inTextCampaign: () => null, slugs: new Set<string>() });
+    const people = [
+      { name: 'Jane', number: '0412 345 678', fields: { service: 'mow', appointment: 'Fri' } },
+      { name: 'Tom', number: '0498 765 432', fields: { service: 'mow', appointment: 'Fri' } },
+    ];
+    const calls = planOutreach({ ...CALLS, people }, ctx(allowed));
+    if (typeof calls === 'string') throw new Error(calls);
+    expect(calls.people.map((p) => p.name)).toEqual(['Jane']);
+    expect(calls.skipped).toEqual([expect.objectContaining({ name: 'Tom', why: expect.stringContaining('not one of the allowed numbers') })]);
+    // Calls kept to the list: a text goes to anyone; texts kept to it, not.
+    const texts = planOutreach({ ...TEXTS, people }, ctx(allowed));
+    if (typeof texts === 'string') throw new Error(texts);
+    expect(texts.people.map((p) => p.name)).toEqual(['Jane', 'Tom']);
+    const textsOnly = planOutreach({ ...TEXTS, people }, ctx({ ...allowed, callsAllowedOnly: false, textsAllowedOnly: true }));
+    if (typeof textsOnly === 'string') throw new Error(textsOnly);
+    expect(textsOnly.people.map((p) => p.name)).toEqual(['Jane']);
+  });
+
   it('refuses a placeholder that has no value for someone, an opening line that is too long, and results outside /outreach', () => {
     const ctx = { identity: GREEN, screening: null, doNotContact: [], inTextCampaign: () => null, slugs: new Set<string>() };
     expect(planOutreach({ ...CALLS, people: [{ name: 'Jane', number: '0412345678', fields: { service: 'mow' } }] }, ctx)).toMatch(/\{appointment\} has no value for Jane/);

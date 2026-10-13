@@ -18,7 +18,7 @@
  */
 import type { SessionTool } from './agent/agent';
 import type { Desktop, DesktopEvent } from './desktop/bridge';
-import { callsBack, isBlocked, retryAfter, type Screening } from './callbacks';
+import { NOT_ALLOWED, callsBack, isAllowed, isBlocked, retryAfter, type Screening } from './callbacks';
 import { displayNumber, samePerson, toE164 } from './phoneNumbers';
 import type { PhoneLine } from './phoneLine';
 import type { Vfs } from './vfs/vfs';
@@ -472,6 +472,7 @@ export function planOutreach(input: Record<string, unknown>, ctx: PlanContext): 
     }
     const why = test ? null
       : isBlocked(number, blocked) ? "on the phone's blocked list"
+      : !isAllowed(number, ctx.screening, kind) ? NOT_ALLOWED
       : kind === 'call' && !callsBack(number, 'answered', ctx.screening) ? 'not a number the phone answers (its filter)'
       : ctx.doNotContact.some((d) => samePerson(d.number, number)) ? 'asked not to be contacted'
       : kind === 'text' && ctx.inTextCampaign(number) ? `already texted in "${ctx.inTextCampaign(number)}", waiting for their reply`
@@ -993,7 +994,7 @@ export class Outreach {
       }
       // Screened again: they may have been blocked, or asked not to be called, since.
       const screening = await this.deps.screening().catch(() => null);
-      const why = isBlocked(p.number, screening?.blockedNumbers ?? '') ? "on the phone's blocked list" : !callsBack(p.number, 'answered', screening) ? 'not a number the phone answers (its filter)' : this.doNotContact.some((d) => samePerson(d.number, p.number)) ? 'asked not to be contacted' : '';
+      const why = isBlocked(p.number, screening?.blockedNumbers ?? '') ? "on the phone's blocked list" : !isAllowed(p.number, screening, 'call') ? NOT_ALLOWED : !callsBack(p.number, 'answered', screening) ? 'not a number the phone answers (its filter)' : this.doNotContact.some((d) => samePerson(d.number, p.number)) ? 'asked not to be contacted' : '';
       if (why) {
         p.why = why;
         this.settlePerson(c, p, 'skipped', now);
@@ -1127,7 +1128,7 @@ export class Outreach {
       }
       if (p.number !== TEST) {
         const screening = await this.deps.screening().catch(() => null);
-        const why = isBlocked(p.number, screening?.blockedNumbers ?? '') ? "on the phone's blocked list" : this.doNotContact.some((d) => samePerson(d.number, p.number)) ? 'asked not to be contacted' : '';
+        const why = isBlocked(p.number, screening?.blockedNumbers ?? '') ? "on the phone's blocked list" : !isAllowed(p.number, screening, 'text') ? NOT_ALLOWED : this.doNotContact.some((d) => samePerson(d.number, p.number)) ? 'asked not to be contacted' : '';
         if (why) {
           p.why = why;
           this.settlePerson(c, p, 'skipped', now);

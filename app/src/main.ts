@@ -863,9 +863,10 @@ async function main(): Promise<void> {
       () => desktop,
       {
         changed: () => renderSessions(),
-        // A number on the phone's blocked list is not answered or texted by a text thread either: the list alone
-        // is asked for (a text's answer does not wait on, or fail with, the rest of the screening), and kept for
-        // when the phone cannot say it.
+        // A number on the phone's blocked list is not answered or texted by a text thread either, nor one that is
+        // not allowed while the phone keeps to its allowed numbers: those lists alone are asked for (a text's answer
+        // does not wait on, or fail with, the rest of the screening), and the blocked one kept for when the phone
+        // cannot say it.
         screening: readBlockedNumbers,
         blockedKept: {
           read: () => {
@@ -1061,19 +1062,26 @@ async function main(): Promise<void> {
     const d = desktop;
     if (!d) return null;
     const read = async (key: string) => ((await d.command('aokie', 'settings.get', { key }, `oaiy:settings.get:${key}:${crypto.randomUUID()}`)) as { value?: unknown } | null)?.value;
-    const [accept, blocked, hidden] = await Promise.all([read('acceptPattern'), read('blockedNumbers'), read('rejectPrivate')]);
-    return { acceptPattern: typeof accept === 'string' ? accept : '', blockedNumbers: typeof blocked === 'string' ? blocked : '', rejectPrivate: hidden === true || hidden === 'true' };
+    const [accept, blocked, hidden, allowed] = await Promise.all([read('acceptPattern'), read('blockedNumbers'), read('rejectPrivate'), readAllowed(read)]);
+    return { acceptPattern: typeof accept === 'string' ? accept : '', blockedNumbers: typeof blocked === 'string' ? blocked : '', rejectPrivate: hidden === true || hidden === 'true', ...allowed };
+  }
+
+  /** Aokie's allowed numbers, and what they are for (as off, from an Aokie that has none), each setting read with `read`. */
+  async function readAllowed(read: (key: string) => Promise<unknown>): Promise<Pick<Screening, 'allowedNumbers' | 'callsAllowedOnly' | 'otherCallers' | 'textsAllowedOnly'>> {
+    const [numbers, calls, others, texts] = await Promise.all([read('allowedNumbers'), read('callsAllowedOnly'), read('otherCallers'), read('textsAllowedOnly')]);
+    return { allowedNumbers: typeof numbers === 'string' ? numbers : '', callsAllowedOnly: calls === true || calls === 'true', otherCallers: others === 'reject' ? 'reject' : 'ring', textsAllowedOnly: texts === true || texts === 'true' };
   }
 
   /** Where the blocked list is kept as it was last read (see `SessionHooks.blockedKept`). */
   const BLOCKED_KEPT = 'oaiy.phone.blockedNumbers';
 
-  /** Aokie's blocked numbers alone, as a screening that says nothing else; null when the phone cannot be asked. */
+  /** Aokie's blocked numbers and its allowed numbers, as a screening that says nothing else; null when the phone cannot be asked. */
   async function readBlockedNumbers(): Promise<Screening | null> {
     const d = desktop;
     if (!d) return null;
-    const value = ((await d.command('aokie', 'settings.get', { key: 'blockedNumbers' }, `oaiy:settings.get:blockedNumbers:${crypto.randomUUID()}`)) as { value?: unknown } | null)?.value;
-    return { acceptPattern: '', blockedNumbers: typeof value === 'string' ? value : '', rejectPrivate: false };
+    const read = async (key: string) => ((await d.command('aokie', 'settings.get', { key }, `oaiy:settings.get:${key}:${crypto.randomUUID()}`)) as { value?: unknown } | null)?.value;
+    const [value, allowed] = await Promise.all([read('blockedNumbers'), readAllowed(read)]);
+    return { acceptPattern: '', blockedNumbers: typeof value === 'string' ? value : '', rejectPrivate: false, ...allowed };
   }
 
   /** Whether Aokie sends its calls to OAIY (its realtime route, with OAIY's provider); null when the phone cannot be asked. */

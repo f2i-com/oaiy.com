@@ -169,6 +169,32 @@ describe('text-message conversations', () => {
     expect(desktop.commands.map((c) => c.payload.body)).toEqual(['Hello!']);
   });
 
+  it('while the phone keeps to its allowed numbers, a text from anyone else is kept, not answered; one from an allowed number is', async () => {
+    const fake = fakeProvider('openai', []);
+    let textsOnly = true;
+    const screening = async () => ({ acceptPattern: '', blockedNumbers: '', rejectPrivate: false, allowedNumbers: '0400 000 008', callsAllowedOnly: false, otherCallers: 'ring' as const, textsAllowedOnly: textsOnly });
+    const { sessions, desktop } = setup({ answer: true, instructions: '' }, fakeDesktop(), { screening });
+    const stranger = await sessions.textArrived('+61400000009', '', 'Hi, is this the lawn people?');
+    await settled(sessions);
+    expect(stranger.agent.turns).toHaveLength(1);
+    expect(fake.bodies).toHaveLength(0);
+    expect(desktop.commands).toEqual([]);
+    expect(sessions.notAnswered(stranger)).toContain('not one of the allowed numbers');
+    expect(sessions.unanswered(sessions.thread(stranger.thread)!).why).toBe('Not answered (not an allowed number)');
+    expect(sessions.answerWaiting()).toBe(0);
+    // An allowed number is answered.
+    fakeProvider('openai', [{ calls: [{ name: 'send_text_message', input: { body: 'Hi Jane!' } }] }, { text: 'Replied.' }]);
+    await sessions.textArrived('+61400000008', '', 'Hi, it is Jane');
+    await settled(sessions);
+    expect(desktop.commands.map((c) => [c.payload.to, c.payload.body])).toEqual([['+61400000008', 'Hi Jane!']]);
+    // Turned off: anyone is answered again.
+    textsOnly = false;
+    fakeProvider('openai', [{ calls: [{ name: 'send_text_message', input: { body: 'Yes, that is us.' } }] }, { text: 'Replied.' }]);
+    await sessions.textArrived('+61400000009', '', 'Hello?');
+    await settled(sessions);
+    expect(desktop.commands.map((c) => c.payload.body)).toEqual(['Hi Jane!', 'Yes, that is us.']);
+  });
+
   it('a number blocked while its reply is being written is not texted: the reply tool refuses', async () => {
     let blocked = '';
     fakeProvider('openai', [

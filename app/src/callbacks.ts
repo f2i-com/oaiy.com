@@ -36,6 +36,29 @@ export interface Screening {
   blockedNumbers: string;
   /** Callers who hide their number are not answered. */
   rejectPrivate: boolean;
+  /**
+   * The numbers the receptionist deals with while the person tries it out, one a line (matched as blockedNumbers
+   * is). An older Aokie says nothing of these four, and the blocked list read alone neither: none is then as off.
+   */
+  allowedNumbers?: string;
+  /** Only callers on allowedNumbers are answered, and only they are rung (call backs, outreach). */
+  callsAllowedOnly?: boolean;
+  /** A call from a number that is not allowed: left ringing on the phone for the person ('ring'), or rejected as it rings. */
+  otherCallers?: 'ring' | 'reject';
+  /** Only texts from allowedNumbers are answered, and only they are texted. */
+  textsAllowedOnly?: boolean;
+}
+
+/** Why a number is not rung, texted or answered while the phone deals with its allowed numbers alone. */
+export const NOT_ALLOWED = 'not one of the allowed numbers (the phone deals with those alone for now)';
+
+/**
+ * Whether `number` is one the phone deals with by `way` while it keeps to its allowed numbers: anyone while that is off,
+ * else a number on the list (never a hidden one).
+ */
+export function isAllowed(number: string, screening: Pick<Screening, 'allowedNumbers' | 'callsAllowedOnly' | 'textsAllowedOnly'> | null, way: 'call' | 'text'): boolean {
+  if (!(way === 'call' ? screening?.callsAllowedOnly : screening?.textsAllowedOnly)) return true;
+  return !isHidden(number) && onList(number, screening?.allowedNumbers ?? '');
 }
 
 /** Australian numbers, as a caller id shows them: +61…, 61… or 0… (Aokie's acceptPattern). */
@@ -61,16 +84,22 @@ const TOO_OLD_MS = 24 * 60 * 60_000;
  * person however either is written (phoneNumbers.ts). Either one blocks it.
  */
 export function isBlocked(number: string, blockedNumbers: string): boolean {
+  return onList(number, blockedNumbers);
+}
+
+/** Whether a list of numbers (one a line, or with commas) has `number`, by isBlocked's rule. */
+export function onList(number: string, list: string): boolean {
   const suffix = (n: string) => n.replace(/\D/g, '').slice(-9);
-  const entries = blockedNumbers.split(/[,;\n]/).map((b) => b.trim()).filter(Boolean);
+  const entries = list.split(/[,;\n]/).map((b) => b.trim()).filter(Boolean);
   return entries.some((b) => (suffix(b).length >= 6 && suffix(b) === suffix(number)) || samePerson(b, number));
 }
 
-/** Whether `number` is one the filter calls back (given Aokie's screening). Never a hidden or blocked one. */
+/** Whether `number` is one the filter calls back (given Aokie's screening). Never a hidden or blocked one, nor one that is not allowed. */
 export function callsBack(number: string, filter: CallBackFilter, screening: Screening | null): boolean {
   const digits = number.replace(/\D/g, '');
   if (digits.length < 6 || isHidden(number)) return false;
   if (isBlocked(number, screening?.blockedNumbers ?? '')) return false;
+  if (!isAllowed(number, screening, 'call')) return false;
   const matches = (pattern: string) => {
     try {
       return new RegExp(pattern).test(number.trim());

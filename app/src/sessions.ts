@@ -15,7 +15,7 @@ import { TOOLS } from './agent/tools';
 import type { Turn } from './agent/protocol';
 import type { Contact, Desktop, DesktopEvent } from './desktop/bridge';
 import { callCalendarTools, textCalendarTools } from './desktop/calendarTools';
-import { isBlocked, type Screening } from './callbacks';
+import { NOT_ALLOWED, isAllowed, isBlocked, type Screening } from './callbacks';
 import { isHidden, isPersonNumber, localCountry, phoneKey, samePerson } from './phoneNumbers';
 import type { MessageSettings } from './settings';
 import { MAX_FACTS, regroup, threadId, threadOrder, type Way } from './threads';
@@ -2276,6 +2276,11 @@ export class Sessions {
   /** The phone's blocked list, as last read (here, or before the last restart: `hooks.blockedKept`). */
   private blocked = '';
   private blockedKnown = false;
+  /**
+   * Whom the phone deals with while the person tries it out (Aokie's allowed numbers), as last read here: none of
+   * it is said by the phone (an older Aokie), or it is off, until the phone says otherwise.
+   */
+  private allowed: Pick<Screening, 'allowedNumbers' | 'callsAllowedOnly' | 'textsAllowedOnly'> | null = null;
 
   /**
    * The phone's blocked list read again. While the phone cannot be asked, or
@@ -2298,6 +2303,7 @@ export class Sessions {
     const late = new Promise<null>((resolve) => (timer = setTimeout(() => resolve(null), BLOCKED_WAIT_MS)));
     const read = await Promise.race([asked, late]);
     clearTimeout(timer);
+    if (read) this.allowed = { allowedNumbers: read.allowedNumbers, callsAllowedOnly: read.callsAllowedOnly, textsAllowedOnly: read.textsAllowedOnly };
     if (read && read.blockedNumbers !== this.blocked) {
       this.blocked = read.blockedNumbers;
       try {
@@ -2324,20 +2330,23 @@ export class Sessions {
     if (!thread.hidden && isBlocked(thread.key, this.blocked)) return { blocked: true, why: 'Blocked' };
     if (!thread.sms) return { blocked: false, why: '' };
     const refused = this.notAnswered(thread.sms);
-    return { blocked: false, why: refused === NOT_A_PERSON ? "Not answered (not a person's number)" : refused === OPENED_WITH_LINK ? 'Not answered (opened with a link)' : refused ? 'Not answered' : '' };
+    return { blocked: false, why: refused === NOT_A_PERSON ? "Not answered (not a person's number)" : refused === OPENED_WITH_LINK ? 'Not answered (opened with a link)' : refused === NOT_ALLOWED ? 'Not answered (not an allowed number)' : refused ? 'Not answered' : '' };
   }
 
   /**
    * Why the sender of a text thread is not answered or texted ('' when they
    * are): no person's phone number (a sender id of letters such as the
-   * carrier's "Missed calls", a short code, a hidden caller), or a number on the
-   * phone's blocked list. Their texts are kept, as when answering is off. The
-   * pretend conversation is always answered.
+   * carrier's "Missed calls", a short code, a hidden caller), a number on the
+   * phone's blocked list, or one that is not allowed while the phone deals with
+   * its allowed numbers alone. Their texts are kept, as when answering is off.
+   * The pretend conversation is always answered.
    */
   notAnswered(session: Session, blocked = this.blocked, incoming = ''): string {
     if (session.key === TEST_NUMBER) return '';
     if (session.hidden || !isPersonNumber(session.key)) return NOT_A_PERSON;
     if (isBlocked(session.key, blocked)) return ON_BLOCKED_LIST;
+    // The phone deals with its allowed numbers alone for now (the person is trying it out): no one else is answered.
+    if (!isAllowed(session.key, this.allowed, 'text')) return NOT_ALLOWED;
     // A scam or an advertisement nearly always opens with a link. The phone may have its number blocked or
     // marked as spam: neither is known here (they do not cross Bluetooth).
     if (this.unsolicited(session, incoming)) return OPENED_WITH_LINK;
@@ -2444,8 +2453,8 @@ export class Sessions {
     if (event.name === 'aokie.call.incoming') {
       // (Not one heard of late, as when the desktop was out of reach a while: it has been answered or missed by now.)
       const at = Date.parse(event.occurredAt);
-      // (Nor a blocked number's: the phone hangs up on it.)
-      if (this.answersCalls() && !(now - at > RING_FRESH_MS) && !isBlocked(String(event.data.from ?? ''), this.blocked)) this.warmCall({ number: String(event.data.from ?? ''), name: String(event.data.name ?? ''), ...(call ? { callId: call } : {}) });
+      // (Nor a blocked number's: the phone hangs up on it. Nor one it is not to answer while it keeps to its allowed numbers.)
+      if (this.answersCalls() && !(now - at > RING_FRESH_MS) && !isBlocked(String(event.data.from ?? ''), this.blocked) && isAllowed(String(event.data.from ?? ''), this.allowed, 'call')) this.warmCall({ number: String(event.data.from ?? ''), name: String(event.data.name ?? ''), ...(call ? { callId: call } : {}) });
       return null;
     }
     if (event.name === 'aokie.call.ended') {
@@ -2482,8 +2491,8 @@ export class Sessions {
     // Someone the business texted for an outreach is someone it deals with, from their first reply on
     // (the outreach itself is forgotten two days after it ends; they are not).
     if (!session.vouched && this.outreach?.forText(session.key)) session.vouched = true;
-    // A sender that is no person's number (the carrier's "Missed calls", a short code), or one on the
-    // phone's blocked list, is never answered: kept, as when answering is off.
+    // A sender that is no person's number (the carrier's "Missed calls", a short code), one on the
+    // phone's blocked list, or one not allowed while it keeps to those, is never answered: kept, as when answering is off.
     const blocked = await this.readBlocked();
     let refused = this.notAnswered(session, blocked, body);
     // Before a sender is kept for their link: their contact as it is now (the person may have named them

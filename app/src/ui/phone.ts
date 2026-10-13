@@ -137,15 +137,32 @@ export async function editPhone(options: PhoneDialog): Promise<MessageSettings |
   const pattern = h('input', { placeholder: 'A regular expression the caller id must match, e.g. ^\\+?61' }) as HTMLInputElement;
   const blocked = h('textarea', { placeholder: 'One number a line: never answered (any format: 0400 000 000, +61400000000)' }) as HTMLTextAreaElement;
   const rejectPrivate = h('input', { type: 'checkbox' }) as HTMLInputElement;
+  // While the person tries the receptionist out: the few numbers it deals with, and what happens to everyone else.
+  const allowed = h('textarea', { placeholder: 'One number a line: yours, and whoever helps you try it (any format)' }) as HTMLTextAreaElement;
+  const callsAllowedOnly = h('input', { type: 'checkbox' }) as HTMLInputElement;
+  const otherCallers = h('select', {},
+    h('option', { value: 'ring' }, 'Leave them ringing on your phone, to answer yourself'),
+    h('option', { value: 'reject' }, 'Reject them as they ring'),
+  ) as HTMLSelectElement;
+  const otherCallersRow = h('label', 'Calls from any other number', otherCallers);
+  const textsAllowedOnly = h('input', { type: 'checkbox' }) as HTMLInputElement;
   const screenNote = h('p.muted', 'Reading the phone\'s call screening…');
   const screenFields = h('div.phone-screening', { hidden: true },
     h('label', 'Answer calls from', accept),
     pattern,
     h('label', 'Blocked numbers', blocked),
     h('label.row', rejectPrivate, ' Do not answer callers who hide their number'),
+    h('label', 'Allowed numbers', allowed),
+    h('label.row', callsAllowedOnly, ' Answer calls only from the allowed numbers, and ring no one else'),
+    otherCallersRow,
+    h('label.row', textsAllowedOnly, ' Answer texts only from the allowed numbers, and text no one else'),
   );
   const showPattern = () => (pattern.hidden = accept.value !== 'pattern');
   accept.addEventListener('change', showPattern);
+  const showOthers = () => (otherCallersRow.hidden = !callsAllowedOnly.checked);
+  callsAllowedOnly.addEventListener('change', showOthers);
+  /** A list of numbers as one compares with another: one a line, in the order written, with commas between. */
+  const listOf = (text: string) => text.split(/[,;\n]/).map((n) => n.trim()).filter(Boolean).join(', ');
   let screeningLoaded: Screening | null = null;
   if (options.screening && phone) {
     void options.screening.load().then((s) => {
@@ -158,7 +175,12 @@ export async function editPhone(options: PhoneDialog): Promise<MessageSettings |
       pattern.value = accept.value === 'pattern' ? s.acceptPattern : '';
       blocked.value = s.blockedNumbers.split(/[,;\n]/).map((n) => n.trim()).filter(Boolean).join('\n');
       rejectPrivate.checked = s.rejectPrivate;
+      allowed.value = (s.allowedNumbers ?? '').split(/[,;\n]/).map((n) => n.trim()).filter(Boolean).join('\n');
+      callsAllowedOnly.checked = !!s.callsAllowedOnly;
+      otherCallers.value = s.otherCallers === 'reject' ? 'reject' : 'ring';
+      textsAllowedOnly.checked = !!s.textsAllowedOnly;
       showPattern();
+      showOthers();
       screenNote.hidden = true;
       screenFields.hidden = false;
     }, (e: unknown) => (screenNote.textContent = `Could not read the phone's call screening: ${(e as Error).message}`));
@@ -242,11 +264,23 @@ export async function editPhone(options: PhoneDialog): Promise<MessageSettings |
   if (result && options.screening && screeningLoaded) {
     const next: Screening = {
       acceptPattern: accept.value === 'au' ? AU_PATTERN : accept.value === 'pattern' ? pattern.value.trim() : '',
-      blockedNumbers: blocked.value.split(/\n/).map((n) => n.trim()).filter(Boolean).join(', '),
+      blockedNumbers: listOf(blocked.value),
       rejectPrivate: rejectPrivate.checked,
+      allowedNumbers: listOf(allowed.value),
+      callsAllowedOnly: callsAllowedOnly.checked,
+      otherCallers: otherCallers.value === 'reject' ? 'reject' : 'ring',
+      textsAllowedOnly: textsAllowedOnly.checked,
     };
     const was = screeningLoaded as Screening;
-    if (next.acceptPattern !== was.acceptPattern || next.blockedNumbers !== was.blockedNumbers.split(/[,;\n]/).map((n) => n.trim()).filter(Boolean).join(', ') || next.rejectPrivate !== was.rejectPrivate) await options.screening.save(next);
+    const changed =
+      next.acceptPattern !== was.acceptPattern ||
+      next.blockedNumbers !== listOf(was.blockedNumbers) ||
+      next.rejectPrivate !== was.rejectPrivate ||
+      next.allowedNumbers !== listOf(was.allowedNumbers ?? '') ||
+      next.callsAllowedOnly !== !!was.callsAllowedOnly ||
+      next.otherCallers !== (was.otherCallers ?? 'ring') ||
+      next.textsAllowedOnly !== !!was.textsAllowedOnly;
+    if (changed) await options.screening.save(next);
   }
   return result;
 }

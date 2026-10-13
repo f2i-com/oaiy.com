@@ -1107,6 +1107,7 @@ select.chip.egpu[data-state='none'] { color: var(--muted); }
 .phone-form .phone-screening { display: flex; flex-direction: column; gap: 10px; }
 .phone-form .phone-screening[hidden] { display: none; }
 .phone-form label:not(.row) { display: flex; flex-direction: column; gap: 4px; }
+.phone-form label[hidden] { display: none; }
 .phone-form select, .phone-form input:not([type='checkbox']) { width: 100%; }
 .phone-form textarea.blocked { min-height: 70px; }
 .phone-callbacks { margin: 0; padding-left: 18px; font-size: 12.5px; display: flex; flex-direction: column; gap: 2px; }
