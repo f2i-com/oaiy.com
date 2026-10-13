@@ -512,8 +512,7 @@ fn show_at<R: Runtime>(app: &AppHandle<R>, window: &tauri::Window<R>, page: Page
     }
     let (position, size) = (LogicalPosition::new(x.max(0.0), y.max(0.0)), LogicalSize::new(width.max(1.0), height.max(1.0)));
     if let Some(webview) = app.get_webview(page.label()) {
-        webview.set_position(position).map_err(|e| e.to_string())?;
-        webview.set_size(size).map_err(|e| e.to_string())?;
+        place(&webview, position, size)?;
         webview.show().map_err(|e| e.to_string())?;
         let _ = webview.set_focus();
         let _ = webview.eval(theme_script(theme(app)));
@@ -530,10 +529,87 @@ fn show_at<R: Runtime>(app: &AppHandle<R>, window: &tauri::Window<R>, page: Page
         }));
     }
     let webview = window.add_child(builder(app, page), position, size).map_err(|e| e.to_string())?;
+    // (made where it was asked for, but on Linux, where it is only packed into the window)
+    if cfg!(target_os = "linux") {
+        place(&webview, position, size)?;
+    }
     if page == Page::Agent {
         webkit_features(&webview, page);
     }
     Ok(())
+}
+
+/// A page's webview put at `position`, `size` over the dashboard. On Linux Tauri packs a window's webviews into its
+/// GTK box, one under another, where a webview's position and size are not its own to set (wry moves only one in a
+/// `GtkFixed`): shown, the agent's took the whole window and left the dashboard a pixel high, its sidebar gone. There
+/// the page is laid over the dashboard instead ([`overlay::place`]).
+fn place<R: Runtime>(webview: &tauri::Webview<R>, position: LogicalPosition<f64>, size: LogicalSize<f64>) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        overlay::place(webview, position, size)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        webview.set_position(position).map_err(|e| e.to_string())?;
+        webview.set_size(size).map_err(|e| e.to_string())
+    }
+}
+
+/// Linux's placing of the pages: the dashboard's webview in a `GtkOverlay` where it was in the window's box (made the
+/// first time a page is placed), and each page an overlay child of it, at its place by its margins and as large as
+/// its size request.
+#[cfg(target_os = "linux")]
+mod overlay {
+    use gtk::prelude::*;
+    use tauri::{LogicalPosition, LogicalSize, Runtime};
+
+    pub fn place<R: Runtime>(webview: &tauri::Webview<R>, position: LogicalPosition<f64>, size: LogicalSize<f64>) -> Result<(), String> {
+        // (GTK's own pixels are logical ones)
+        let (x, y) = (position.x.round() as i32, position.y.round() as i32);
+        let (width, height) = (size.width.round().max(1.0) as i32, size.height.round().max(1.0) as i32);
+        webview
+            .with_webview(move |w| {
+                let page: gtk::Widget = w.inner().upcast();
+                if let Err(e) = over_the_dashboard(&page) {
+                    log::warn!("embed: a page could not be laid over the dashboard: {e}");
+                    return;
+                }
+                page.set_halign(gtk::Align::Start);
+                page.set_valign(gtk::Align::Start);
+                page.set_margin_start(x);
+                page.set_margin_top(y);
+                page.set_size_request(width, height);
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    /// `page` an overlay child over the dashboard's webview, the overlay made where the dashboard was in the window's
+    /// box the first time. (Each widget moved is held here while it is moved, so it is not let go.)
+    fn over_the_dashboard(page: &gtk::Widget) -> Result<(), String> {
+        let parent = page.parent().ok_or("it has no parent")?;
+        if parent.is::<gtk::Overlay>() {
+            return Ok(());
+        }
+        let vbox = parent.downcast::<gtk::Box>().map_err(|p| format!("it is in a {}, not the window's box", p.type_().name()))?;
+        let children = vbox.children();
+        let overlay = match children.iter().find_map(|c| c.clone().downcast::<gtk::Overlay>().ok()) {
+            Some(overlay) => overlay,
+            None => {
+                let at = children.iter().position(|c| c != page && c.is::<webkit2gtk::WebView>()).ok_or("the window's box has no dashboard")?;
+                let dashboard = &children[at];
+                let overlay = gtk::Overlay::new();
+                vbox.remove(dashboard);
+                overlay.add(dashboard);
+                vbox.pack_start(&overlay, true, true, 0);
+                vbox.reorder_child(&overlay, at as i32);
+                overlay.show();
+                overlay
+            }
+        };
+        vbox.remove(page);
+        overlay.add_overlay(page);
+        Ok(())
+    }
 }
 
 /// Make the agent's page at startup, hidden: it answers texts and calls in
@@ -550,6 +626,9 @@ pub fn preload<R: Runtime>(app: &AppHandle<R>) {
         match window.add_child(builder(&app, Page::Agent), LogicalPosition::new(0.0, 0.0), LogicalSize::new(1.0, 1.0)) {
             Ok(webview) => {
                 let _ = webview.hide();
+                if cfg!(target_os = "linux") {
+                    let _ = place(&webview, LogicalPosition::new(0.0, 0.0), LogicalSize::new(1.0, 1.0));
+                }
                 webkit_features(&webview, Page::Agent);
             }
             Err(e) => log::warn!("the agent's page was not made at startup: {e}"),

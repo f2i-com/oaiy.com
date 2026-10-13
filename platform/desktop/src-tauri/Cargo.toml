@@ -31,6 +31,7 @@ gui = [
     "dep:oaiy-studio",
     "dep:tauri-build",
     "dep:webkit2gtk",
+    "dep:gtk",
 ]
 # The browser login of `oaiy-server` (design 4.7): the Argon2id password, the strength estimate and
 # the console. Enabled for the headless server and left off for the desktop, so the GUI carries the
@@ -196,10 +197,11 @@ scrypt = { version = "0.11", default-features = false }
 zeroize = "1"
 
 # Linux-only, with the window: the webviews' WebKitGTK, whose settings the agent's page needs
-# turned on (embed.rs). Already in the tree (tauri, wry); named here because a crate cannot `use`
-# an undeclared transitive dependency.
+# turned on, and GTK, to lay the pages over the dashboard (embed.rs). Already in the tree (tauri,
+# wry); named here because a crate cannot `use` an undeclared transitive dependency.
 [target.'cfg(target_os = "linux")'.dependencies]
 webkit2gtk = { version = "2.0", optional = true }
+gtk = { version = "0.18", optional = true }
 
 # Windows-only: the job object that kills child processes when this process
 # dies, however it dies. Already in the tree transitively (tauri, tokio); named
