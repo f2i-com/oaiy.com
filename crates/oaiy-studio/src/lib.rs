@@ -243,7 +243,7 @@ pub fn open_path(target: &str) {
     #[cfg(target_os = "macos")]
     let r = std::process::Command::new("open").arg(target).spawn();
     #[cfg(not(any(windows, target_os = "macos")))]
-    let r = std::process::Command::new("xdg-open").arg(target).spawn();
+    let r = oaiy_host_env::command("xdg-open").arg(target).spawn();
     let _ = r;
 }
 
@@ -268,7 +268,7 @@ pub fn open_ui(url: &str, mode: &str) {
             candidates.push(PathBuf::from(p));
         }
         for exe in candidates.into_iter().filter(|p| p.is_file()) {
-            if std::process::Command::new(exe).arg(format!("--app={url}")).arg("--window-size=1400,900").spawn().is_ok() {
+            if oaiy_host_env::command(exe).arg(format!("--app={url}")).arg("--window-size=1400,900").spawn().is_ok() {
                 return;
             }
         }

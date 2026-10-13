@@ -18,7 +18,7 @@ use oaiy_engine::json::Json;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -1503,7 +1503,7 @@ impl Media {
             slot = self.serving.lock().unwrap_or_else(|p| p.into_inner());
         }
         if slot.is_none() {
-            let mut command = Command::new(&program);
+            let mut command = oaiy_host_env::command(&program);
             command.arg("--serve").env("OAIY_WEBGPU_ADAPTER", format!("tinygpu:{card}"));
             // (the full attention's rows kernel: a picture's steps 5% faster on the card, its answers the f32 kernel's
             // there; elsewhere it is still to be tried, docs/TINYGPU.md)
@@ -1604,7 +1604,7 @@ impl Media {
         let program = config::program(&studio.root, str_or(media, "worker", "oaiy-media"));
         let output_root = studio.output_root();
         std::fs::create_dir_all(&output_root).map_err(|e| e.to_string())?;
-        let mut command = Command::new(&program);
+        let mut command = oaiy_host_env::command(&program);
         command.arg("--stdin").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         if let Some(socket) = card {
             command.env("OAIY_WEBGPU_ADAPTER", format!("tinygpu:{socket}"));

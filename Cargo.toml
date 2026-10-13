@@ -24,6 +24,9 @@ members = [
     # The portable host: supervises oaiy-llm-server and oaiy-media, serves the
     # control UI and the configurable API gateway. std-only, so a default member.
     "crates/oaiy-studio",
+    # The computer's own environment for a program OAIY starts from an AppImage (the studio's and OAIY Desktop's).
+    # std-only.
+    "crates/oaiy-host-env",
     # The studio as a Windows notification-area app (windows-sys; the only
     # unsafe is its Win32 calls, in src/tray.rs).
     "crates/oaiy-studio-tray",
@@ -67,6 +70,7 @@ default-members = [
     "crates/dsv41",
     "crates/oaiy-image",
     "crates/oaiy-studio",
+    "crates/oaiy-host-env",
     "crates/oaiy-studio-tray",
     "crates/gguf",
     "crates/ggml-quants",

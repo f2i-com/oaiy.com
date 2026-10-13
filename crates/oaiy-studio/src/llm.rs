@@ -12,7 +12,7 @@ use crate::util::{bool_or, int_or, num_or, random_id, str_or, LogRing};
 use oaiy_engine::json::Json;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -429,7 +429,7 @@ impl Llm {
     /// Start one launch: the process with piped output (read into the log) and
     /// the stdin lifeline. Returns the child and the command line shown in logs.
     fn spawn(&self, launch: &Launch, args: &[String], key: &str, root: &Path) -> Result<(Child, String), String> {
-        let mut command = Command::new(&launch.program);
+        let mut command = oaiy_host_env::command(&launch.program);
         command.args(args).args(["--backend", launch.backend]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).current_dir(root);
         #[cfg(windows)]
         {

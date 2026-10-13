@@ -690,7 +690,7 @@ fn convert_audio(studio: &Arc<Studio>, cfg: &Json, wav: &std::path::Path, format
     }
     let ffmpeg = crate::config::program(&studio.root, cfg.get("media").and_then(|m| m.get("video")).map_or("ffmpeg", |v| str_or(v, "ffmpeg", "ffmpeg")));
     let args = if music { crate::music::convert_args(format, speed) } else { crate::speech::convert_args(format, speed) };
-    let mut command = std::process::Command::new(&ffmpeg);
+    let mut command = oaiy_host_env::command(&ffmpeg);
     command.args(["-hide_banner", "-loglevel", "error", "-i"]).arg(wav).args(args).arg("pipe:1");
     #[cfg(windows)]
     {

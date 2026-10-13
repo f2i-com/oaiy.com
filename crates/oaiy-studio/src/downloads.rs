@@ -82,7 +82,8 @@ fn curl_program(cfg: &Json) -> String {
 }
 
 fn command(program: &str) -> Command {
-    let mut c = Command::new(program);
+    // (curl with the computer's environment, where OAIY runs from an AppImage: the system's curl failed with its libraries)
+    let mut c = oaiy_host_env::command(program);
     c.stdin(Stdio::null());
     #[cfg(windows)]
     {

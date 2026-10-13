@@ -185,8 +185,10 @@ fn spawn_codex(codex_home: &Path) -> Result<Transport, CodexError> {
     // Nothing of this process's environment reaches the child except an
     // explicit allow-list: no PATH games, no OPENAI_API_KEY, no proxy vars.
     cmd.env_clear();
+    // (from the computer's environment, where OAIY runs from an AppImage: its PATH without the AppImage's programs)
+    let host: std::collections::HashMap<String, String> = oaiy_host_env::vars().into_iter().collect();
     for key in env_allow_list() {
-        if let Ok(v) = std::env::var(key) {
+        if let Some(v) = host.get(*key) {
             cmd.env(key, v);
         }
     }
@@ -476,7 +478,7 @@ fn base_command() -> Command {
     }
     #[cfg(not(windows))]
     {
-        Command::new("codex")
+        oaiy_host_env::command("codex")
     }
 }
 

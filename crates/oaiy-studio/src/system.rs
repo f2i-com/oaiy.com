@@ -19,7 +19,7 @@ pub struct System {
 }
 
 fn quiet(program: &str) -> Command {
-    let mut c = Command::new(program);
+    let mut c = oaiy_host_env::command(program);
     c.stdin(Stdio::null()).stderr(Stdio::null());
     #[cfg(windows)]
     {

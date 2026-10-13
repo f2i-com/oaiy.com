@@ -16,3 +16,5 @@ path = "src/main.rs"
 # subprocesses, so it builds (and runs its UI) on machines with no GPU at all.
 [dependencies]
 oaiy-engine = { path = "../oaiy-engine" }
+# A program it starts gets the computer's environment, where OAIY runs from an AppImage (std-only too).
+oaiy-host-env = { path = "../oaiy-host-env" }

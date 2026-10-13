@@ -22,7 +22,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 // One definition of "this archive member escapes the package", shared with the
@@ -725,7 +725,7 @@ fn link_stays_inside(member: &Path, target: &Path) -> bool {
 /// Returns the exit code (or -1 on spawn/wait failure). No shell — the
 /// program is invoked directly, so there's no quoting/encoding surface.
 fn run_logged(program: &Path, args: &[String], logs: &LogBuffer) -> i32 {
-    let mut cmd = Command::new(program);
+    let mut cmd = oaiy_host_env::command(program);
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
     // This is an installer too: `pip install` runs the setup code of whatever
     // package it is asked for, so OAIY's tokens are not in what it inherits.

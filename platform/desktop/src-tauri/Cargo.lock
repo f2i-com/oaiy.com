@@ -3089,6 +3089,7 @@ dependencies = [
  "hmac",
  "log",
  "minisign-verify",
+ "oaiy-host-env",
  "oaiy-studio",
  "percent-encoding",
  "qrcode",
@@ -3129,10 +3130,15 @@ name = "oaiy-engine"
 version = "0.7.0"
 
 [[package]]
+name = "oaiy-host-env"
+version = "0.1.0"
+
+[[package]]
 name = "oaiy-studio"
 version = "0.1.0"
 dependencies = [
  "oaiy-engine",
+ "oaiy-host-env",
 ]
 
 [[package]]

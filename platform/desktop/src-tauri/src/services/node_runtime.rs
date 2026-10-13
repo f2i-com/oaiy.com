@@ -104,7 +104,7 @@ fn bundled_exe() -> Option<PathBuf> {
 /// `node` on PATH, if any.
 fn system_exe() -> Option<PathBuf> {
     let finder = if cfg!(windows) { "where" } else { "which" };
-    let out = std::process::Command::new(finder)
+    let out = oaiy_host_env::command(finder)
         .arg("node")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -125,7 +125,7 @@ fn system_exe() -> Option<PathBuf> {
 }
 
 fn probe_version(exe: &Path) -> Option<String> {
-    let out = std::process::Command::new(exe)
+    let out = oaiy_host_env::command(exe)
         .arg("-v")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

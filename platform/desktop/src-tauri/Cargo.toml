@@ -77,6 +77,8 @@ tauri-plugin-updater = { version = "2", optional = true }
 reqwest13 = { package = "reqwest", version = "0.13", default-features = false, optional = true }
 # The engines (language models, media), run by the desktop: std-only, nothing of a GPU's to build.
 oaiy-studio = { path = "../../../crates/oaiy-studio", optional = true }
+# A program the desktop starts gets the computer's environment, where OAIY runs from an AppImage (std-only).
+oaiy-host-env = { path = "../../../crates/oaiy-host-env" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 

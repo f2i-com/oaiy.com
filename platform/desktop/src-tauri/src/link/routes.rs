@@ -112,7 +112,7 @@ pub fn open_in_browser(url: &str) -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("could not open the browser: {e}"))?;
     #[cfg(target_os = "linux")]
-    std::process::Command::new("xdg-open")
+    oaiy_host_env::command("xdg-open")
         .arg(url)
         .spawn()
         .map_err(|e| format!("could not open the browser: {e}"))?;

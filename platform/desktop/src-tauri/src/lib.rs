@@ -334,7 +334,7 @@ fn open_path(path: String) -> Result<(), String> {
         } else {
             path.clone()
         };
-        std::process::Command::new("xdg-open")
+        oaiy_host_env::command("xdg-open")
             .arg(target)
             .spawn()
             .map_err(|e| format!("xdg-open spawn failed: {e}"))?;
@@ -371,7 +371,7 @@ fn open_url(url: String) -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("open url failed: {e}"))?;
     #[cfg(target_os = "linux")]
-    std::process::Command::new("xdg-open")
+    oaiy_host_env::command("xdg-open")
         .arg(&url)
         .spawn()
         .map_err(|e| format!("open url failed: {e}"))?;

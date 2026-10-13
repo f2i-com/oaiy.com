@@ -344,11 +344,11 @@ pub(crate) fn cli_command(cli: &CliInvocation, node_exe: Option<&Path>) -> Comma
         CliInvocation::Node { script } => {
             // Prefer a resolved Node (portable install, else PATH) over the
             // bare name: a packaged app cannot assume `node` is on PATH.
-            let mut c = Command::new(node_exe.map_or_else(|| PathBuf::from("node"), Path::to_path_buf));
+            let mut c = oaiy_host_env::command(node_exe.map_or_else(|| PathBuf::from("node"), Path::to_path_buf));
             c.arg(script);
             c
         }
-        CliInvocation::Binary { path } => Command::new(path),
+        CliInvocation::Binary { path } => oaiy_host_env::command(path),
     }
 }
 
@@ -716,7 +716,7 @@ pub fn resolve_cli(
 /// `where`/`which` lookup for the default path.
 fn lookup_on_path(name: &str) -> Option<PathBuf> {
     let finder = if cfg!(windows) { "where" } else { "which" };
-    let out = Command::new(finder)
+    let out = oaiy_host_env::command(finder)
         .arg(name)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

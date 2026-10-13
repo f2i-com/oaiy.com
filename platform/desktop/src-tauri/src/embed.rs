@@ -402,12 +402,21 @@ pub fn agent_webview<R: Runtime>(app: &AppHandle<R>) -> Option<tauri::Webview<R>
     app.get_webview(Page::Agent.label())
 }
 
-/// A link that leaves an embedded page: to the system browser.
+/// A link that leaves an embedded page: to the system browser. (On Linux through `xdg-open` with the computer's
+/// environment, where OAIY runs from an AppImage: the shell plugin's opener hands it the AppImage's libraries.)
 fn open_outside<R: Runtime>(app: &AppHandle<R>, url: &Url) {
-    use tauri_plugin_shell::ShellExt;
     if matches!(url.scheme(), "http" | "https" | "mailto") {
-        #[allow(deprecated)]
-        let _ = app.shell().open(url.as_str(), None);
+        #[cfg(target_os = "linux")]
+        {
+            let _ = app;
+            let _ = oaiy_host_env::command("xdg-open").arg(url.as_str()).spawn();
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            use tauri_plugin_shell::ShellExt;
+            #[allow(deprecated)]
+            let _ = app.shell().open(url.as_str(), None);
+        }
     }
 }
 

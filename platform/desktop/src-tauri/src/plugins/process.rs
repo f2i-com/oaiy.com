@@ -188,8 +188,9 @@ impl PluginProcess {
         crate::secret_file::create_private_dir(&data_dir)
             .map_err(|e| format!("cannot create plugin data dir {}: {e}", data_dir.display()))?;
 
+        // (the computer's environment, where OAIY runs from an AppImage: not its libraries and programs)
         let env = plugin_env(
-            std::env::vars().collect::<Vec<_>>(),
+            oaiy_host_env::vars(),
             &manifest.id,
             &data_dir,
             &opts.desktop_version,

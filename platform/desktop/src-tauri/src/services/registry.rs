@@ -2548,7 +2548,7 @@ pub(crate) fn kill_process_tree(pid: u32) {
         // renderer under Playwright) can't linger and keep a port bound — matching
         // the forceful `taskkill /T /F` on Windows. Detached (no .wait()) so app
         // exit / a held Registry lock never blocks on the grace sleep.
-        let _ = std::process::Command::new("sh")
+        let _ = oaiy_host_env::command("sh")
             .args([
                 "-c",
                 &format!("kill -TERM -{pid} 2>/dev/null; sleep 2; kill -KILL -{pid} 2>/dev/null"),

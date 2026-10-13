@@ -132,7 +132,7 @@ impl Runner {
     pub fn spawn(cfg: SpawnConfig<'_>) -> std::io::Result<Self> {
         let logs = LogBuffer::new();
 
-        let mut cmd = Command::new(cfg.command);
+        let mut cmd = oaiy_host_env::command(cfg.command);
         cmd.args(cfg.args);
         // Managed services and the installers both come through here.
         scrub_inherited_tokens(&mut cmd);

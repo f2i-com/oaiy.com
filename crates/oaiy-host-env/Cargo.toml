@@ -1,0 +1,12 @@
+[package]
+name = "oaiy-host-env"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "The computer's own environment for a program OAIY starts, where OAIY runs from an AppImage"
+
+[lib]
+path = "src/lib.rs"
+
+# std-only, so oaiy-studio (std-only) and OAIY Desktop, with or without its window, can both use it.
+[dependencies]
