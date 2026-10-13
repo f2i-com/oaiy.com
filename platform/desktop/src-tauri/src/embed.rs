@@ -569,6 +569,11 @@ fn builder<R: Runtime>(app: &AppHandle<R>, page: Page) -> WebviewBuilder<R> {
     } else {
         WebviewBuilder::new(page.label(), WebviewUrl::CustomProtocol(page.url())).initialization_script(&desktop_script(first, page))
     };
+    // The agent answers calls and texts while it is hidden (`preload`), or while the window is behind another or
+    // minimized. WebKit slows such a page down and then suspends it (BROWSER_ARGS are WebView2's alone): on a Mac a
+    // whole call came to it a minute after the call had ended, in one burst, as the person looked at it. On macOS 14
+    // and later this keeps it running as if it were shown. (The other pages have nothing to do while hidden.)
+    let made = if page == Page::Agent { made.background_throttling(tauri::utils::config::BackgroundThrottlingPolicy::Disabled) } else { made };
     made
         .additional_browser_args(BROWSER_ARGS)
         // A page that (re)loads starts in the theme it was made with: tell it the one now.
