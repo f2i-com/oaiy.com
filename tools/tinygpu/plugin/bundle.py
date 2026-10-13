@@ -185,7 +185,7 @@ def main():
   print(f"the eGPU plugin, Python {said.stdout.strip()}: {len(files)} files, {size / 2**20:.0f} MiB, in {out}")
   if args.zip:
     import zipfile
-    zipped = out.with_suffix(".zip")
+    zipped = out.with_name(out.name + ".zip")  # (not with_suffix: OUT may end in a version, egpu-plugin-0.1.4)
     # (each file's mode with it: OAIY's install keeps a program's executable bit from the archive)
     with zipfile.ZipFile(zipped, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
       for p in everything:
