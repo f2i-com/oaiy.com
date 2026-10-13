@@ -314,7 +314,10 @@ const HD: u32 = HEAD_DIMu;
 var<workgroup> s_sh: array<vec4<f32>, 1024>;
 var<workgroup> p_sh: array<vec4<f16>, 1024>;
 var<workgroup> m_sh: array<f32, 128>;
-var<workgroup> moved: u32;
+// (the flag is four words, not one: after the arrays, a lone u32 had NVIDIA's Vulkan driver (580, an A2 on Linux)
+// lay the workgroup's memory out one way for the tensor cores' loads of `p_sh` and another for the threads' stores, the
+// loads 8 bytes early: each query's weights shifted by four, the first query's the scores' last bytes, NaN)
+var<workgroup> moved: array<u32, 4>;
 
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
@@ -348,8 +351,8 @@ LOAD_S
         let tm = max(max(bm.x, bm.y), max(bm.z, bm.w));
         m_sh[li] = tm;
         // (a thread whose largest is more than 8 past its query's reference: that reference moves, as below)
-        if (c > -1.0e38 && tm > c + 8.0) { moved = 1u; }
-        let go = workgroupUniformLoad(&moved);
+        if (c > -1.0e38 && tm > c + 8.0) { moved[0] = 1u; }
+        let go = workgroupUniformLoad(&moved[0]);
         // the block's largest for the query: its first is the reference, one more than 8 past the reference the new
         // one, what is summed so far scaled down to it
         let bq = max(max(m_sh[r4], m_sh[r4 + 1u]), max(m_sh[r4 + 2u], m_sh[r4 + 3u]));
@@ -370,7 +373,7 @@ STORES
             if (factor != 1.0) {
                 for (var d = 0u; d < HD / 4u; d++) { y[yb + d] = y[yb + d] * factor; }
             }
-            if (li == 0u) { moved = 0u; }
+            if (li == 0u) { moved[0] = 0u; }
             storageBarrier();
             workgroupBarrier();
 RELOADS
@@ -518,7 +521,10 @@ var<workgroup> s_sh: array<vec4<f32>, 1024>;
 var<workgroup> p_sh: array<vec4<f16>, 1024>;
 // each thread's largest score of the block (then its sum), and whether some query's reference moves at this block
 var<workgroup> m_sh: array<f32, 128>;
-var<workgroup> moved: u32;
+// (the flag is four words, not one: after the arrays, a lone u32 had NVIDIA's Vulkan driver (580, an A2 on Linux)
+// lay the workgroup's memory out one way for the tensor cores' loads of `p_sh` and another for the threads' stores, the
+// loads 8 bytes early: each query's weights shifted by four, the first query's the scores' last bytes, NaN)
+var<workgroup> moved: array<u32, 4>;
 
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
@@ -556,8 +562,8 @@ SCORES
 LOAD_S
         let tm = max(max(bm.x, bm.y), max(bm.z, bm.w));
         m_sh[li] = tm;
-        if (c > -1.0e38 && tm > c + 8.0) { moved = 1u; }
-        let go = workgroupUniformLoad(&moved);
+        if (c > -1.0e38 && tm > c + 8.0) { moved[0] = 1u; }
+        let go = workgroupUniformLoad(&moved[0]);
         let bq = max(m_sh[li], m_sh[li ^ 1u]);
         var factor = 1.0;
         if (bq > -1.0e38) {
@@ -576,7 +582,7 @@ STORES
             if (factor != 1.0) {
                 for (var d = 0u; d < HD / 2u; d++) { y[yb + d] = y[yb + d] * factor; }
             }
-            if (li == 0u) { moved = 0u; }
+            if (li == 0u) { moved[0] = 0u; }
             storageBarrier();
             workgroupBarrier();
 RELOADS
