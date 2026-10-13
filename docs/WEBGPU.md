@@ -403,7 +403,9 @@ and each high-bits byte four times (2-byte aligned, the 210-byte blocks), and on
 at 1,200 MHz a row of [5120, 6144] took 327 us where it takes 275, Qwen3.5 9B's replies
 15.8 tokens a second where 16.9. (A few rows keep the 16-weight tasks: the 64-weight
 ones' rows' values were too many registers, 2 to 4 rows in 477 to 498 us where 404 to
-410.)
+410.) Its lanes take 4 weight rows each, as the other K-quants' do (`shaders::rb_rows_q8`;
+the f32 kernel's 1, as on the RTX 5090): the 9B's output [248320, 4096] in 5.7 ms where
+8.3, its FFN down [4096, 12288] in 295 us where 436, and its replies 19.1 tokens a second.
 
 A prompt's tensor-core matmuls (`shaders::coop_tiled`) load each step's tokens two steps
 ahead of their multiplies, and every K-quant's and Q8_0's weights a step ahead into

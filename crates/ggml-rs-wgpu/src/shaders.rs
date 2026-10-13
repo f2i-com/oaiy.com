@@ -283,6 +283,25 @@ pub(crate) fn rb_rows(dtype: GgmlType, mr: u32) -> u32 {
     }
 }
 
+/// [`rb_rows`] for the int8 kernels ([`rb_kernel_q8`]): Q6_K's one-row tasks there are 64 weights, and it takes 4 rows
+/// a lane as the other K-quants do (on an NVIDIA A2 at 1,200 MHz, Qwen3.5 9B's output [248320, 4096] in 5.7 ms where a
+/// row a lane took 8.3, its FFN down [4096, 12288] in 295 us where 436; 2 rows took 7.0 ms and 349 us, 8 the same as
+/// 4).
+pub(crate) fn rb_rows_q8(dtype: GgmlType, mr: u32) -> u32 {
+    if dtype == GgmlType::Q6_K && mr == 1 {
+        return 4;
+    }
+    rb_rows(dtype, mr)
+}
+
+/// The grid of [`rb_kernel_q8`]'s kernel for `mr` rows of `x` a workgroup over `rows` weight rows, `m` rows of `x`
+/// (beyond 65535 a group of them wraps into the next axis): the kernel's own rows a workgroup, whichever it is (one row
+/// of `x` takes the several rows' kernel where a recording's rows are alike).
+pub fn grid_q8(dtype: GgmlType, m: usize, mr: u32, rows: u32) -> (u32, u32, u32) {
+    let groups = rows.div_ceil(4 * rb_rows_q8(dtype, mr));
+    ((m as u32).div_ceil(mr), groups.min(65535), groups.div_ceil(65535))
+}
+
 /// Rows of `x` a workgroup of the multi-row kernels takes ([`source_multi`]).
 pub const MULTI_ROWS: u32 = 4;
 
