@@ -177,6 +177,38 @@ impl Recorder<'_> {
         // or, with OAIY_ATTENTION_PASSES=2, the two passes'): not copied a fragment at a time first, a layer's cache
         // again (512 MB at 79,000 of the 27B's positions, which a 24 GB card beside its weights had not). Its rows
         // past `kv_len` are zeros or its own, whose weights are none (a cache without rows to 128 past them is copied).
+        // (a causal attention whose query heads share their KV heads 1, 2 or 4 at a time: [`attention_coop_grouped`]'s
+        // kernel, a KV head's queries a workgroup, the cache's rows read once for all of them; OAIY_ATTENTION_GROUPED=0:
+        // the kernels below)
+        let g = n_h / n_kv;
+        let grouped = !full && kernel == 1 && matches!(g, 1 | 2 | 4) && grouped_on();
+        if grouped && (!halves || halves_in_place()) {
+            let rp = rows.div_ceil(64) * 64;
+            // the cache's rows as they lie where they are halves with room to 128 positions past `kv_len`, else as an
+            // f16 copy of them so padded
+            let (q16, kv16) = if halves && kv.len * 2 >= kv_len.div_ceil(128) * 128 * row {
+                (self.attention_q16(q, rows, rp, qs), None)
+            } else {
+                let (q16, kv16) = self.attention_f16(q, kv, halves, rows, kv_len, qs, row, None);
+                (q16, Some(kv16))
+            };
+            const NAMES: [[&str; 3]; 3] = [
+                ["chain-attention-grouped-64-1", "chain-attention-grouped-128-1", "chain-attention-grouped-256-1"],
+                ["chain-attention-grouped-64-2", "chain-attention-grouped-128-2", "chain-attention-grouped-256-2"],
+                ["chain-attention-grouped-64-4", "chain-attention-grouped-128-4", "chain-attention-grouped-256-4"],
+            ];
+            let at = match head_dim { 64 => 0, 128 => 1, _ => 2 };
+            let pipeline = self.gpu().named_pipeline(NAMES[g / 2][at], || attention_coop_grouped(head_dim, g));
+            let per = 64 / g;
+            self.dispatch_kept(&pipeline, kv16.as_ref().map_or(buffer(kv), buffer), buffer(&q16), buffer(out), &words, (n_kv as u32, rows.div_ceil(per) as u32, 1));
+            match kv16 {
+                Some(kv16) => self.att16 = Some((q16, kv16)),
+                // (the next layer's queries in it again)
+                None => self.done_with(&q16),
+            }
+            self.weigh(4.0 * rows as f64 * kv_len as f64 * (n_h * head_dim) as f64);
+            return true;
+        }
         if halves && !full && halves_in_place() && kv.len * 2 >= kv_len.div_ceil(128) * 128 * row {
             let rp = rows.div_ceil(64) * 64;
             let q16 = self.attention_q16(q, rows, rp, qs);
@@ -333,6 +365,12 @@ impl Recorder<'_> {
 fn halves_in_place() -> bool {
     static IN_PLACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *IN_PLACE.get_or_init(|| std::env::var("OAIY_HALVES_TILED").map_or(true, |v| v != "1"))
+}
+
+/// Whether a causal attention takes [`attention_coop_grouped`]'s kernel where it can (OAIY_ATTENTION_GROUPED=0: not).
+fn grouped_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OAIY_ATTENTION_GROUPED").map_or(true, |v| v != "0"))
 }
 
 /// Whether a full attention takes [`attention_coop_rows`]'s kernel (OAIY_ATTENTION_KERNEL=rows).

@@ -686,3 +686,207 @@ pub(in crate::chain) fn attention_coop_one_masked(hd: usize) -> String {
     }
     src
 }
+
+/// A prompt's causal attention on the tensor cores over a cache of f16 rows read where they lie, FlashAttention's way
+/// ([`attention_coop_grouped`]'s kernel before its head's width and group are put in): a workgroup of 8 subgroups a
+/// (KV head, `P` positions) for all `G` of that KV head's query heads (64 rows: `G` heads by `P` positions), the keys
+/// 32 a block, each block's keys and values staged once in the workgroup's memory for every head of the group (the
+/// next block's loaded into registers as this one is multiplied). [`ATTENTION_COOP_ONE`] read each head's keys and
+/// values as fragments from memory, a (head, 32 positions) a workgroup: the same keys `G` times over and, a fragment's
+/// loads waited on in turn, at some 1.9 TFLOPS on an NVIDIA A2 (Qwen3.5 9B's 16 heads of 256 on 4, 1,024 queries
+/// after 3,072). A subgroup's rows are a head's 16 positions; with its pair it makes their scores (each half the
+/// block's keys) and sums their weights' values (each half the head). Its weights' reference is
+/// [`ATTENTION_COOP_ONE`]'s (a query's first block's largest score; one more than 8 past it the new one, the sums so far
+/// scaled down to it through the output).
+pub(in crate::chain) const ATTENTION_COOP_GROUPED: &str = r#"enable f16;
+enable wgpu_cooperative_matrix;
+struct Params { n_h: u32, n_kv: u32, past: u32, rows: u32, kv_len: u32, scale: u32, _pad0: u32, _pad1: u32, }
+@group(0) @binding(0) var<storage, read> kv4: array<vec4<f16>>;
+@group(0) @binding(1) var<storage, read> q16: array<f16>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> p: Params;
+
+const HD: u32 = HEAD_DIMu;
+// the query heads a KV head has, and the positions a workgroup takes (64 rows)
+const G: u32 = GROUPu;
+const P: u32 = 64u / G;
+// a block's keys and values [key][d] as vec4s, a key's row KS4 apart (8 halves past the head: a fragment's rows a load
+// in banks of their own)
+const KS4: u32 = HD / 4u + 2u;
+var<workgroup> kt: array<vec4<f16>, 32u * KS4>;
+var<workgroup> vt: array<vec4<f16>, 32u * KS4>;
+// the block's scores [row][key] and its weights as f16, 9 vec4s a row (past the block's 8: a fragment's rows in banks
+// of their own, 2.5% of the kernel's time), each thread's largest score (then its sum), and whether some row's
+// reference moves at this block
+var<workgroup> s_sh: array<vec4<f32>, 576>;
+var<workgroup> p_sh: array<vec4<f16>, 576>;
+var<workgroup> m_sh: array<f32, 256>;
+// (four words, as ATTENTION_COOP_ONE's flag: a lone u32 after the arrays moved NVIDIA's layout of them)
+var<workgroup> moved: array<u32, 4>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let kh = wg.x;
+    let q0 = wg.y * P;
+    let sg = li / 32u;
+    let qs = p.n_h * HD;
+    let scale = bitcast<f32>(p.scale);
+    // a position's row of the cache in vec4s (its keys, then its values `kvd4` on), the KV head's keys in it
+    let row4 = p.n_kv * HD / 2u;
+    let kvd4 = p.n_kv * HD / 4u;
+    let kho4 = kh * HD / 4u;
+    // the subgroup's rows: row group rg (a head's 16 positions), and its half of the block's keys and of the head
+    let rg = sg / 2u;
+    let half = sg % 2u;
+    let sh = kh * G + rg / (P / 16u);
+    let sp = q0 + (rg % (P / 16u)) * 16u;
+    // the thread's row of the 64 (its head and position), its 8 keys of a block, its quarter of the row's output
+    let tr = li / 4u;
+    let tq = li % 4u;
+    let th = kh * G + (tr / 16u) / (P / 16u);
+    let tpos = q0 + ((tr / 16u) % (P / 16u)) * 16u + tr % 16u;
+    let qpos = p.past + tpos;
+    let r4 = tr * 4u;
+    let yb = tpos * qs + th * HD + tq * (HD / 4u);
+    // the blocks the last position sees
+    let hi = min(p.kv_len, p.past + q0 + P);
+    let blocks = (hi + 31u) / 32u;
+    let none = vec4<f32>(-3.4e38);
+    // the thread's share of staging a block: 8 of its keys' vec4s, 8 of its values' (`KV4` a key's vec4s)
+    let ke = li % (HD / 4u);
+    let kr = li / (HD / 4u);
+DECLARE_Q
+DECLARE_O
+DECLARE_STAGE
+    var c = -3.4e38;
+    var l = 0.0;
+    // the first block staged
+    {
+        let kb = 0u;
+STAGE_LOAD_K
+STAGE_LOAD_V
+STAGE_STORE_K
+STAGE_STORE_V
+    }
+    workgroupBarrier();
+    for (var kb = 0u; kb < blocks; kb++) {
+        // the next block's loads (the last's own again past the end), in flight as this one is multiplied
+        {
+            let kb = min(kb + 1u, blocks - 1u);
+STAGE_LOAD_K
+STAGE_LOAD_V
+        }
+SCORES
+        workgroupBarrier();
+        // the next block's keys in this one's place (its scores made), the block's weights
+STAGE_STORE_K
+SOFTMAX
+        workgroupBarrier();
+VALUES
+        workgroupBarrier();
+        // the next block's values in this one's place
+STAGE_STORE_V
+    }
+    // the row's weights' sum (its 4 threads'), and its output over it
+    m_sh[li] = l;
+    workgroupBarrier();
+    let lq = m_sh[r4] + m_sh[r4 + 1u] + m_sh[r4 + 2u] + m_sh[r4 + 3u];
+    let inv = 1.0 / max(lq, 1.0e-30);
+STORES
+    storageBarrier();
+    workgroupBarrier();
+    for (var d = 0u; d < HD / 4u; d++) { y[yb + d] = y[yb + d] * inv; }
+}
+"#;
+
+/// [`ATTENTION_COOP_GROUPED`]'s softmax of block `kb`'s scores (staged in `s_sh`): a thread its row's 8 of them, the
+/// row's reference moved where its largest grew by more than 8 (the sums so far scaled through the output), its
+/// weights (f16) into `p_sh` and their sum into `l`.
+const ATTENTION_COOP_GROUPED_SOFTMAX: &str = r#"        let k0 = vec4<u32>(kb * 32u + tq * 8u) + vec4<u32>(0u, 1u, 2u, 3u);
+        let k1 = k0 + vec4<u32>(4u);
+        let v0 = select(none, s_sh[tr * 9u + tq * 2u] * scale, (k0 <= vec4<u32>(qpos)) & (k0 < vec4<u32>(p.kv_len)));
+        let v1 = select(none, s_sh[tr * 9u + tq * 2u + 1u] * scale, (k1 <= vec4<u32>(qpos)) & (k1 < vec4<u32>(p.kv_len)));
+        let bm = max(v0, v1);
+        let tm = max(max(bm.x, bm.y), max(bm.z, bm.w));
+        m_sh[li] = tm;
+        if (c > -1.0e38 && tm > c + 8.0) { moved[0] = 1u; }
+        let go = workgroupUniformLoad(&moved[0]);
+        let bq = max(max(m_sh[r4], m_sh[r4 + 1u]), max(m_sh[r4 + 2u], m_sh[r4 + 3u]));
+        var factor = 1.0;
+        if (bq > -1.0e38) {
+            if (c < -1.0e38) {
+                c = bq;
+            } else if (bq > c + 8.0) {
+                factor = exp(c - bq);
+                c = bq;
+            }
+        }
+        l *= factor;
+        if (go != 0u) {
+STORES
+            storageBarrier();
+            workgroupBarrier();
+            if (factor != 1.0) {
+                for (var d = 0u; d < HD / 4u; d++) { y[yb + d] = y[yb + d] * factor; }
+            }
+            if (li == 0u) { moved[0] = 0u; }
+            storageBarrier();
+            workgroupBarrier();
+RELOADS
+        }
+        let on = select(0.0, 1.0, c > -1.0e38);
+        let w0 = vec4<f16>(exp(v0 - vec4<f32>(c)) * on);
+        let w1 = vec4<f16>(exp(v1 - vec4<f32>(c)) * on);
+        p_sh[tr * 9u + tq * 2u] = w0;
+        p_sh[tr * 9u + tq * 2u + 1u] = w1;
+        let add = vec4<f32>(w0) + vec4<f32>(w1);
+        l += add.x + add.y + add.z + add.w;
+"#;
+
+/// [`ATTENTION_COOP_GROUPED`] for a head `hd` wide (64, 128 or 256) and `g` query heads a KV head (1, 2 or 4).
+pub(in crate::chain) fn attention_coop_grouped(hd: usize, g: usize) -> String {
+    assert!(matches!(hd, 64 | 128 | 256) && matches!(g, 1 | 2 | 4), "the grouped attention's heads");
+    let (q, o) = (hd / 16, hd / 32);
+    let declare_q: String = (0..q).map(|d| format!("    let qi{d} = sp * qs + sh * HD + {}u;\n    let qf{d} = coopLoadT<coop_mat16x16<f16, A>>(&q16[qi{d}], qs);\n", 16 * d)).collect();
+    let declare_o: String = (0..o).map(|f| format!("    var o{f} = coop_mat16x16<f32, C>();\n")).collect();
+    // a block's keys and values: 32 keys of HD / 4 vec4s each, `per` vec4s of each a thread (256 threads)
+    let per = 32 * hd / 4 / 256;
+    let declare_stage: String = (0..per).map(|i| format!("    var sk{i} = vec4<f16>();\n    var sv{i} = vec4<f16>();\n")).collect();
+    let stage = |reg: &str, off: &str| -> String {
+        (0..per).map(|i| format!("        {{\n            let at = (kb * 32u + kr + {}u) * row4 + kho4 + ke{off};\n            {reg}{i} = kv4[at];\n        }}\n", i * 256 / (hd / 4))).collect()
+    };
+    let store = |buf: &str, reg: &str| -> String { (0..per).map(|i| format!("        {buf}[(kr + {}u) * KS4 + ke] = {reg}{i};\n", i * 256 / (hd / 4))).collect() };
+    // the subgroup's 16 rows' scores of its half of the staged keys, stored for the softmax
+    let mut scores = String::from("    {\n        var acc = coop_mat16x16<f32, C>();\n");
+    for d in 0..q {
+        scores += &format!("        {{\n            let ik = half * 16u * KS4 + {}u;\n            let ks = KS4;\n            let kf = coopLoad<coop_mat16x16<f16, B>>(&kt[ik], ks);\n            acc = coopMultiplyAdd(qf{d}, kf, acc);\n        }}\n", 4 * d);
+    }
+    scores += "        let io = rg * 144u + half * 4u;\n        let s9 = 9u;\n        coopStoreT(acc, &s_sh[io], s9);\n    }\n";
+    // the subgroup's 16 rows' sums of its half of the head: the staged weights times the staged values
+    let mut values = String::new();
+    for kk in [0usize, 16] {
+        values += &format!("    {{\n        let ia = rg * 144u + {}u;\n        let s9 = 9u;\n        let pa = coopLoadT<coop_mat16x16<f16, A>>(&p_sh[ia], s9);\n", kk / 4);
+        for f in 0..o {
+            values += &format!("        {{\n            let iv = {}u * KS4 + half * (HD / 8u) + {}u;\n            let vs = KS4;\n            let vb = coopLoadT<coop_mat16x16<f16, B>>(&vt[iv], vs);\n            o{f} = coopMultiplyAdd(pa, vb, o{f});\n        }}\n", kk, 4 * f);
+        }
+        values += "    }\n";
+    }
+    let place = |f: usize| format!("sp * qs + sh * HD + half * (HD / 2u) + {}u", 16 * f);
+    let stores: String = (0..o).map(|f| format!("    {{\n        let io = {};\n        coopStoreT(o{f}, &y[io], qs);\n    }}\n", place(f))).collect();
+    let reloads: String = (0..o).map(|f| format!("    {{\n        let io = {};\n        o{f} = coopLoadT<coop_mat16x16<f32, C>>(&y[io], qs);\n    }}\n", place(f))).collect();
+    ATTENTION_COOP_GROUPED
+        .replace("HEAD_DIM", &hd.to_string())
+        .replace("GROUP", &g.to_string())
+        .replace("DECLARE_Q\n", &declare_q)
+        .replace("DECLARE_O\n", &declare_o)
+        .replace("DECLARE_STAGE\n", &declare_stage)
+        .replace("SOFTMAX\n", ATTENTION_COOP_GROUPED_SOFTMAX)
+        .replace("STAGE_LOAD_K\n", &stage("sk", ""))
+        .replace("STAGE_LOAD_V\n", &stage("sv", " + kvd4"))
+        .replace("STAGE_STORE_K\n", &store("kt", "sk"))
+        .replace("STAGE_STORE_V\n", &store("vt", "sv"))
+        .replace("SCORES\n", &scores)
+        .replace("VALUES\n", &values)
+        .replace("RELOADS\n", &reloads)
+        .replace("STORES\n", &stores)
+}

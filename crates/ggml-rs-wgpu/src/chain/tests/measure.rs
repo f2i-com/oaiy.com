@@ -1504,3 +1504,58 @@ fn measure_coop_kernels() {
         eprintln!("{line}; apart's sums within {:.1e} of the RMS", worst / rms);
     }
 }
+
+/// A prompt's causal attention over a cache of halves each way (`--ignored --nocapture`): the one-pass kernel a (head,
+/// 32 positions) a workgroup ([`attention_coop_one_rows`]) and the grouped one a (KV head, its query heads' positions)
+/// ([`attention_coop_grouped`]), Qwen3.5 9B's heads (16 of 256 on 4; OAIY_ATT_NH, OAIY_ATT_NKV, OAIY_ATT_HD others) for
+/// OAIY_ATT_ROWS (1,024) queries after OAIY_ATT_PAST (3,072), and how far apart their outputs are.
+#[test]
+#[ignore = "a measurement"]
+fn measure_grouped_attention() {
+    let Ok(b) = WgpuBackend::new(Some(4 << 30)) else { return };
+    if !b.gpu.coop16() {
+        return;
+    }
+    let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let (n_h, n_kv, hd) = (env("OAIY_ATT_NH", 16), env("OAIY_ATT_NKV", 4), env("OAIY_ATT_HD", 256));
+    let (rows, past) = (env("OAIY_ATT_ROWS", 1024), env("OAIY_ATT_PAST", 3072));
+    let (kv_len, g) = (past + rows, n_h / n_kv);
+    let (qs, row) = (n_h * hd, 2 * n_kv * hd);
+    let mut next = rng(17);
+    let mut halves = |n: usize| -> Vec<f32> { (0..n / 2).map(|_| f32::from_bits(half::f16::from_f32(next()).to_bits() as u32 | (half::f16::from_f32(next()).to_bits() as u32) << 16)).collect() };
+    // the cache's rows as halves to 128 positions past its end, the queries' to 128 rows
+    let (kvp, rp) = (kv_len.div_ceil(128) * 128, rows.div_ceil(128) * 128);
+    let (kv, q16, out) = (b.vec(kvp * row / 2), b.vec(rp * qs / 2), b.vec(rp * qs));
+    DeviceChain::upload(&b, &kv, &halves(kvp * row));
+    DeviceChain::upload(&b, &q16, &halves(rp * qs));
+    let words = [n_h as u32, n_kv as u32, past as u32, rows as u32, kv_len as u32, (1.0 / (hd as f32).sqrt()).to_bits(), 0, 0];
+    let flops = 4.0 * (0..rows).map(|r| (past + r + 1) as f64).sum::<f64>() * qs as f64;
+    let mut line = format!("{n_h} heads ({n_kv} kv) {hd} wide, {rows} queries after {past}:");
+    let mut outs: Vec<Vec<f32>> = Vec::new();
+    for (way, src, grid) in [("one pass", attention_coop_one_rows(hd), (n_h as u32, rows.div_ceil(32) as u32, 1)), ("grouped", attention_coop_grouped(hd, g), (n_kv as u32, rows.div_ceil(64 / g) as u32, 1))] {
+        let name: &'static str = Box::leak(format!("bench-attention-{way}-{hd}-{g}").into_boxed_str());
+        let pipeline = b.gpu.named_pipeline(name, || src.clone());
+        let mut rec = Recorder::new(&b);
+        rec.dispatch_kept(&pipeline, buffer(&kv), buffer(&q16), buffer(&out), &words, grid);
+        rec.read_range(&out, 0, rows * qs);
+        outs.push(Box::new(rec).finish().pop().expect("the output"));
+        let run = || {
+            let mut rec = Recorder::new(&b);
+            for _ in 0..4 {
+                rec.dispatch_kept(&pipeline, buffer(&kv), buffer(&q16), buffer(&out), &words, grid);
+            }
+            rec.read_range(&out, 0, 1);
+            Box::new(rec).finish();
+        };
+        run();
+        let t = std::time::Instant::now();
+        for _ in 0..3 {
+            run();
+        }
+        let ms = t.elapsed().as_secs_f64() / 12.0 * 1e3;
+        line += &format!(" {way} {ms:.3} ms ({:.2} TFLOPS)", flops / ms / 1e9);
+    }
+    let rms = (outs[0].iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / outs[0].len() as f64).sqrt();
+    let worst = outs[1].iter().zip(&outs[0]).map(|(a, e)| ((a - e) as f64).abs()).fold(0.0, f64::max);
+    eprintln!("{line}; grouped's within {:.1e} of the RMS", worst / rms);
+}

@@ -343,8 +343,9 @@ fn a_prompts_attention_on_the_tensor_cores_is_the_f32_kernels() {
     if !b.gpu.coop16() {
         return;
     }
-    // (each as it is, then with keys far past the rest planted)
-    let shapes = [(8usize, 2usize, 64usize, 300usize, 37usize, 1.0f32), (16, 2, 128, 0, 100, 2.0), (24, 4, 256, 214, 64, 1.0), (24, 4, 256, 1000, 150, 3.0)];
+    // (each as it is, then with keys far past the rest planted; the grouped kernel's where a KV head has 1, 2 or 4
+    // query heads, Qwen3.5 9B's 16 of 256 on 4 among them, the one-pass kernel's where 6 or 8)
+    let shapes = [(8usize, 2usize, 64usize, 300usize, 37usize, 1.0f32), (16, 2, 128, 0, 100, 2.0), (24, 4, 256, 214, 64, 1.0), (24, 4, 256, 1000, 150, 3.0), (16, 4, 256, 1000, 150, 3.0), (8, 4, 128, 61, 300, 2.0), (4, 4, 64, 214, 70, 1.0)];
     for (planted, (n_h, n_kv, hd, past, rows, spread)) in [false, true].into_iter().flat_map(|p| shapes.into_iter().map(move |s| (p, s))) {
         let (qd, row, kv_len) = (n_h * hd, 2 * n_kv * hd, past + rows);
         let mut next = rng((qd + past) as u32);
@@ -711,11 +712,18 @@ fn what_is_kept_for_the_next_run_is_let_go_where_a_buffer_is_refused() {
 /// A cache held as f16 halves alone (the 27B's on a card with tensor cores): rows stored as halves are the halves of
 /// the f32 rows (`halve`'s, bit for bit), and a prompt's attention over them on the tensor cores is the f32 cache's,
 /// whose rows the tensor cores read as the same f16 values (bit for bit); with fewer rows than the tensor cores take,
-/// it declines and records nothing.
+/// it declines and records nothing. The 27B's heads (24 of 256 on 4: the one-pass kernels) and Qwen3.5 9B's (16 on 4:
+/// the grouped one).
 #[test]
 fn a_cache_held_as_halves_alone_is_stored_and_attended_as_the_f32_one() {
+    for n_h in [24usize, 16] {
+        halves_alone_case(n_h);
+    }
+}
+
+fn halves_alone_case(n_h: usize) {
     let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
-    let (n_h, n_kv, hd) = (24usize, 4usize, 256usize);
+    let (n_kv, hd) = (4usize, 256usize);
     if !DeviceChain::attention_halves(&b, n_h, n_kv, hd) {
         return;
     }

@@ -447,6 +447,21 @@ The together kernel's decode lost its branch on rows past the weight's (they dec
 last row's words; their sums are not stored) and Q4_K's and Q5_K's scales are made both
 ways and one chosen, 5.9 to 6.2 TFLOPS for Q4_K.
 
+A prompt's causal attention takes `attention_coop_grouped` where a KV head has 1, 2 or 4
+query heads and the head is 64, 128 or 256 wide (`OAIY_ATTENTION_GROUPED=0`: the one-pass
+kernels): a workgroup of 8 subgroups a (KV head, 64 / G positions) for all G of its query
+heads, the keys 32 a block, each block's keys and values staged in the workgroup's memory
+once for all of them (coalesced, the next block's loaded into registers as this one is
+multiplied), the queries' fragments held in registers. The one-pass kernel read each
+head's keys and values as fragments from memory, its multiplies waiting on those loads in
+turn: reloading the queries' fragments from memory each block put the grouped kernel back
+at the one-pass kernel's time. Qwen3.5 9B's heads (16 of 256 on 4), 1,024 queries after
+3,072: 32.4 ms (1.9 TFLOPS) and now 12.5 (4.8); 128 wide 3.5 times faster, 64 wide 3.6
+(`measure_grouped_attention`). Taking a block's scores and its values' multiplies
+together, the next block's scores made as this one's values are, ran slower (4.3 TFLOPS:
+more registers live at once). The 9B's 6,933-token prompt is now 382 tokens a second (322
+before the two), a 20,973-token one 365 (292).
+
 Against the request Strata's benchmark makes (a synthetic Python module up to 4,096
 prompt tokens, greedy, 256 tokens), the same two cards: the prompt at 3,600 tokens a
 second (Strata 4,270), the reply at 78 to 81 tokens a second plain and 108 to 120
