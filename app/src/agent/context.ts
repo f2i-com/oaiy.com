@@ -38,11 +38,14 @@ const KNOWN: Array<[RegExp, number]> = [
 export const DEFAULT_CLOUD_WINDOW = 128_000;
 export const DEFAULT_LOCAL_WINDOW = 8_192;
 /**
- * OAIY's own engine, before it has said: it tells a model's window only once the model is loaded, and serves every
- * model with at least this much. Planned for 8,192, a first message could not be sent at all: the instructions and
- * tools alone are past that, so the model was never loaded and never said. Asked again once it has answered.
+ * OAIY's own engine, before it has said: it tells a model's window only once the model is loaded, and serves a model
+ * with 65,536 positions where its GPU has room for the cache (oaiy-llm-server's AUTO_CTX; 16,384 where it has not).
+ * Planned for 8,192, and then for 16,384, a first message could not be sent at all: the instructions and tools alone
+ * (some 11,500 tokens) left less than 1,024 of either for the conversation, so the model was never loaded and never
+ * said ("The model's context window (16.4k tokens) is too small for OAIY", an A2 whose engine had 65,536). Asked again
+ * once it has answered; a smaller window than this, on a GPU without the room, is said then or by its overflow error.
  */
-export const OAIY_ENGINE_WINDOW = 16_384;
+export const OAIY_ENGINE_WINDOW = 65_536;
 
 export function knownWindow(provider: Pick<ProviderConfig, 'type' | 'modelId'>): number | null {
   const id = provider.modelId ?? '';
