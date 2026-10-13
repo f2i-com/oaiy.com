@@ -156,6 +156,8 @@ impl Recorder<'_> {
         let dtype = q.dtype;
         let pipeline = if eight {
             self.gpu().named_pipeline(names.1, || crate::shaders::coop8_tiled(dtype).expect("a K-quant's kernel in 8 x 8 fragments"))
+        } else if let Some(name) = split_name(dtype).filter(|_| coop_split_for(self.backend, dtype)) {
+            self.gpu().named_pipeline(name, || crate::shaders::coop_tiled_split(dtype).expect("a K-quant's tensor-core kernel, its work apart"))
         } else {
             self.gpu().named_pipeline(names.0, || crate::shaders::coop_tiled(dtype).expect("a K-quant's tensor-core kernel"))
         };
@@ -384,6 +386,114 @@ pub(crate) fn decode_in_int8(backend: &WgpuBackend, w: &QuantizedTensor) -> bool
     };
     gpu.decode_int8.lock().unwrap_or_else(|p| p.into_inner()).insert(dtype, int8);
     int8
+}
+
+/// [`crate::shaders::coop_tiled_split`]'s pipeline's name for `dtype`, where it has one.
+fn split_name(dtype: ggml_quants::GgmlType) -> Option<&'static str> {
+    use ggml_quants::GgmlType as T;
+    Some(match dtype {
+        T::Q3_K => "chain-coop-split-Q3_K",
+        T::Q4_K => "chain-coop-split-Q4_K",
+        T::Q5_K => "chain-coop-split-Q5_K",
+        T::Q6_K => "chain-coop-split-Q6_K",
+        T::Q8_0 => "chain-coop-split-Q8_0",
+        _ => return None,
+    })
+}
+
+/// Whether a prompt's tensor-core matmul of `dtype` takes [`crate::shaders::coop_tiled_split`] (subgroups that decode
+/// apart from those that multiply) on this device rather than [`crate::shaders::coop_tiled`] (each subgroup both, in
+/// turn). The split kernel wants a device whose subgroups are 32 lanes (`Gpu::subgroups32`; every other device takes
+/// the other); there, which is the faster is timed, once a type, at its first matmul ([`time_coop`]): an NVIDIA A2 at
+/// 1,200 MHz ran Q4_K's [12288, 4096] by 512 tokens at 6.8 TFLOPS split and 6.2 together, Q6_K's at 5.7 and 5.1, Q5_K's
+/// at 5.9 and 5.7 (Qwen3.5 9B's 6,933-token prompt 322 tokens a second together, 361 split), its f32 sums the nearer
+/// the host's. The split kernel is taken where it is 3% faster or more. `OAIY_COOP_SPLIT=1` or `0` decides without
+/// timing (as profiling wants: `OAIY_CHAIN_PROFILE`'s pass a dispatch slowed the split kernel's timing to a tie).
+pub(crate) fn coop_split_for(backend: &WgpuBackend, dtype: ggml_quants::GgmlType) -> bool {
+    let gpu = &backend.gpu;
+    if !gpu.subgroups32() || split_name(dtype).is_none() {
+        return false;
+    }
+    if let Some(known) = gpu.coop_split.lock().unwrap_or_else(|p| p.into_inner()).get(&dtype) {
+        return *known;
+    }
+    static ASKED: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let asked = *ASKED.get_or_init(|| match std::env::var("OAIY_COOP_SPLIT").as_deref() {
+        Ok("1") => Some(true),
+        Ok("0") => Some(false),
+        _ => None,
+    });
+    let timed = if asked.is_some() { None } else { time_coop(backend, dtype) };
+    let split = match (asked, timed) {
+        (Some(asked), _) => asked,
+        (None, Some((together, split))) => {
+            let faster = split < together * 0.97;
+            eprintln!(
+                "{dtype:?}: a prompt's matmul in {:.2} ms with its decode apart, {:.2} ms together (a 4096 x 4096 weight by 512 tokens): {}",
+                split * 1e3,
+                together * 1e3,
+                if faster { "apart" } else { "together" }
+            );
+            faster
+        }
+        (None, None) => false,
+    };
+    gpu.coop_split.lock().unwrap_or_else(|p| p.into_inner()).insert(dtype, split);
+    split
+}
+
+/// A prompt's matmul of a 4096 x 4096 `dtype` weight by 512 tokens on the tensor cores, each kernel's (together,
+/// apart): the better of three chains of 4. None where the weight finds no room on the device.
+fn time_coop(backend: &WgpuBackend, dtype: ggml_quants::GgmlType) -> Option<(f64, f64)> {
+    use ggml_quants::GgmlType as T;
+    let (n, k, m) = (4096usize, 4096usize, 512usize);
+    let (block, bytes) = match dtype {
+        T::Q3_K => (256, 110),
+        T::Q4_K => (256, 144),
+        T::Q5_K => (256, 176),
+        T::Q6_K => (256, 210),
+        T::Q8_0 => (32, 34),
+        _ => return None,
+    };
+    // (any bytes will do for a time: the kernels do the same work whatever the weights are)
+    let raw: Vec<u8> = (0..n * (k / block) * bytes).map(|i| (i as u32).wrapping_mul(2_654_435_761).wrapping_shr(13) as u8).collect();
+    let w = ggml_rs::Backend::to_device_quant(backend, QuantizedTensor::from_bytes_cpu(raw, vec![n, k], dtype));
+    let q = w.device_storage()?.as_any().downcast_ref::<WgpuQuant>()?;
+    let padded = m.div_ceil(crate::shaders::COOP_TILE as usize) * crate::shaders::COOP_TILE as usize;
+    let (x16, y) = (backend.vec(crate::shaders::x_f16_tiled_words(m, k).max(padded * k / 2)), backend.vec(m * n));
+    let gpu = &backend.gpu;
+    // (the names [`Recorder::matmul_rows_coop_split`]'s pipelines go by)
+    let name = match dtype {
+        T::Q3_K => "chain-coop-Q3_K",
+        T::Q4_K => "chain-coop-Q4_K",
+        T::Q5_K => "chain-coop-Q5_K",
+        T::Q6_K => "chain-coop-Q6_K",
+        _ => "chain-coop-Q8_0",
+    };
+    let together = gpu.named_pipeline(name, || crate::shaders::coop_tiled(dtype).expect("a K-quant's tensor-core kernel"));
+    let apart = gpu.named_pipeline(split_name(dtype)?, || crate::shaders::coop_tiled_split(dtype).expect("a K-quant's tensor-core kernel, its work apart"));
+    let time = |pipeline: &std::sync::Arc<wgpu::ComputePipeline>| -> f64 {
+        let run = || {
+            let mut rec = Recorder::new(backend);
+            for _ in 0..4 {
+                for (chunk, row0, rows) in &q.chunks {
+                    let words = [k as u32, n as u32, m as u32, *row0, *rows, q.row_bytes as u32, 1, 0];
+                    rec.dispatch_kept(pipeline, chunk, buffer(&x16), buffer(&y), &words, (rows.div_ceil(128), (m as u32).div_ceil(128), 1));
+                }
+            }
+            rec.read_range(&y, 0, 1);
+            Box::new(rec).finish();
+        };
+        run();
+        (0..3)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                run();
+                t.elapsed().as_secs_f64() / 4.0
+            })
+            .fold(f64::MAX, f64::min)
+    };
+    Some((time(&together), time(&apart)))
 }
 
 /// What [`decode_in_int8`] decided for `dtype` on this device, once it has (false before): for a test's tolerance.

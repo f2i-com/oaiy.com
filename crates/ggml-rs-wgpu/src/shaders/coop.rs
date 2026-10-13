@@ -503,13 +503,14 @@ fn sbyte(h: vec4<u32>, b: u32) -> u32 {
     let wd = select(select(h.w, h.z, b < 8u), h.y, b < 4u);
     return (wd >> (8u * (b % 4u))) & 255u;
 }
-// Sub-block `j`'s 6-bit scale and minimum, as ggml's get_scale_min_k4.
+// Sub-block `j`'s 6-bit scale and minimum, as ggml's get_scale_min_k4 (both of its ways made and one chosen: with
+// the decode's branch on its rows gone too, Q4_K's [12288, 4096] by 512 tokens 5.9 to 6.2 TFLOPS on an NVIDIA A2).
 fn scale_min(h: vec4<u32>, j: u32) -> vec2<f32> {
-    if (j < 4u) {
-        return vec2<f32>(f32(sbyte(h, j) & 63u), f32(sbyte(h, j + 4u) & 63u));
-    }
-    let sc = (sbyte(h, j + 4u) & 15u) | ((sbyte(h, j - 4u) >> 6u) << 4u);
-    let mn = (sbyte(h, j + 4u) >> 4u) | ((sbyte(h, j) >> 6u) << 4u);
+    let bj = sbyte(h, j);
+    let b4 = sbyte(h, j + 4u);
+    let bl = sbyte(h, j % 4u);
+    let sc = select((b4 & 15u) | ((bl >> 6u) << 4u), bj & 63u, j < 4u);
+    let mn = select((b4 >> 4u) | ((bj >> 6u) << 4u), b4 & 63u, j < 4u);
     return vec2<f32>(f32(sc), f32(mn));
 }
 "#;
@@ -525,7 +526,7 @@ const COOP_Q4K_LOAD: &str = r#"let lb4 = rl * (p.row_bytes / 16u) + (b / 8u) * 9
         q2w = w4[lb4 + 5u + lh];
         q3w = w4[lb4 + 7u + lh];"#;
 const COOP_Q4K_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
-        if (rr < p.rows) {
+        {
             let sb = b % 8u;
             let sh = 4u * (sb % 2u);
             let pr = sb / 2u;
@@ -538,8 +539,6 @@ const COOP_Q4K_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
             wt[at4 + 1u] = vec4<f16>(dsc * byte_less((qw.y >> sh) & 0x0f0f0f0fu, 0.0) - dmn);
             wt[at4 + 2u] = vec4<f16>(dsc * byte_less((qw.z >> sh) & 0x0f0f0f0fu, 0.0) - dmn);
             wt[at4 + 3u] = vec4<f16>(dsc * byte_less((qw.w >> sh) & 0x0f0f0f0fu, 0.0) - dmn);
-        } else {
-            for (var i = 0u; i < 4u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }
         }"#;
 const COOP_Q5K_REGS: &str = r#"    var hdw = vec4<u32>();
     var hw = vec4<u32>();
@@ -555,7 +554,7 @@ const COOP_Q5K_LOAD: &str = r#"let lb4 = rl * (p.row_bytes / 16u) + (b / 8u) * 1
         q2w = w4[lb4 + 7u + lh];
         q3w = w4[lb4 + 9u + lh];"#;
 const COOP_Q5K_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
-        if (rr < p.rows) {
+        {
             let sb = b % 8u;
             let sh = 4u * (sb % 2u);
             let pr = sb / 2u;
@@ -568,8 +567,6 @@ const COOP_Q5K_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
             wt[at4 + 1u] = vec4<f16>(dsc * byte_less(((qw.y >> sh) & 0x0f0f0f0fu) | (((hw.y >> sb) & 0x01010101u) << 4u), 0.0) - dmn);
             wt[at4 + 2u] = vec4<f16>(dsc * byte_less(((qw.z >> sh) & 0x0f0f0f0fu) | (((hw.z >> sb) & 0x01010101u) << 4u), 0.0) - dmn);
             wt[at4 + 3u] = vec4<f16>(dsc * byte_less(((qw.w >> sh) & 0x0f0f0f0fu) | (((hw.w >> sb) & 0x01010101u) << 4u), 0.0) - dmn);
-        } else {
-            for (var i = 0u; i < 4u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }
         }"#;
 const COOP_Q6K_HELPERS: &str = r#"fn byte(o: u32) -> u32 { return (w[o >> 2u] >> ((o & 3u) * 8u)) & 0xffu; }
 // The four bytes at `o`, an even offset (a word, or the halves of two).
@@ -603,7 +600,7 @@ const COOP_Q6K_AHEAD_LOAD: &str = r#"let l6 = rl * p.row_bytes + (b / 8u) * 210u
         q6h = words4_at(l6 + 128u + l6h * 32u + lh * 16u);
         q6s = byte(l6 + 208u) | (byte(l6 + 209u) << 8u) | (byte(l6 + 192u + l6h * 8u + 2u * l6d + lh) << 16u);"#;
 const COOP_Q6K_AHEAD_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
-        if (rr < p.rows) {
+        {
             let qd = b % 4u;
             let lshift = select(0u, 4u, qd >= 2u);
             let hshift = 2u * qd;
@@ -613,8 +610,6 @@ const COOP_Q6K_AHEAD_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
             wt[at4 + 1u] = vec4<f16>(sc * byte_less(((q6l.y >> lshift) & 0x0f0f0f0fu) | (((q6h.y >> hshift) & 0x03030303u) << 4u), 32.0));
             wt[at4 + 2u] = vec4<f16>(sc * byte_less(((q6l.z >> lshift) & 0x0f0f0f0fu) | (((q6h.z >> hshift) & 0x03030303u) << 4u), 32.0));
             wt[at4 + 3u] = vec4<f16>(sc * byte_less(((q6l.w >> lshift) & 0x0f0f0f0fu) | (((q6h.w >> hshift) & 0x03030303u) << 4u), 32.0));
-        } else {
-            for (var i = 0u; i < 4u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }
         }"#;
 const COOP_Q8_0_AHEAD_REGS: &str = r#"    var q8w = vec4<u32>();
     var q8d = 0u;"#;
@@ -622,14 +617,12 @@ const COOP_Q8_0_AHEAD_LOAD: &str = r#"let l8 = rl * p.row_bytes + b * 34u;
         q8w = words4_at(l8 + 2u + lh * 16u);
         q8d = byte(l8) | (byte(l8 + 1u) << 8u);"#;
 const COOP_Q8_0_AHEAD_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
-        if (rr < p.rows) {
+        {
             let d = unpack2x16float(q8d).x;
             wt[at4] = vec4<f16>(d * byte_less(q8w.x ^ 0x80808080u, 128.0));
             wt[at4 + 1u] = vec4<f16>(d * byte_less(q8w.y ^ 0x80808080u, 128.0));
             wt[at4 + 2u] = vec4<f16>(d * byte_less(q8w.z ^ 0x80808080u, 128.0));
             wt[at4 + 3u] = vec4<f16>(d * byte_less(q8w.w ^ 0x80808080u, 128.0));
-        } else {
-            for (var i = 0u; i < 4u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }
         }"#;
 const COOP_Q6K_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
         if (rr < p.rows) {
@@ -661,7 +654,7 @@ const COOP_Q3K_LOAD: &str = r#"let lb4 = rl * (p.row_bytes / 16u) + (b / 8u) * 7
         qs1w = w4[lb4 + 4u + lh];
         sdw = w4[lb4 + 6u];"#;
 const COOP_Q3K_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
-        if (rr < p.rows) {
+        {
             let q = b % 8u;
             let h = q / 4u;
             let j = q % 4u;
@@ -672,8 +665,6 @@ const COOP_Q3K_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
             wt[at4 + 1u] = vec4<f16>(sc * byte_less(q3_bytes(qsw.y, hmw.y, j, h), 4.0));
             wt[at4 + 2u] = vec4<f16>(sc * byte_less(q3_bytes(qsw.z, hmw.z, j, h), 4.0));
             wt[at4 + 3u] = vec4<f16>(sc * byte_less(q3_bytes(qsw.w, hmw.w, j, h), 4.0));
-        } else {
-            for (var i = 0u; i < 4u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }
         }"#;
 
 /// Q8_0's decode for [`coop_tiled`] (its 34-byte blocks read as words, [`COOP_Q6K_HELPERS`]'): a step one block, a
@@ -890,6 +881,361 @@ const COOP_NVFP4_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
             for (var i = 0u; i < 4u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }
         }"#;
 
+/// [`coop_tiled_split`]'s kernel before its type's parts are put in: [`COOP_KERNEL`]'s tiles and steps, its subgroups'
+/// work apart. In [`COOP_KERNEL`] every subgroup decodes its share of a step and then multiplies, and the tensor cores
+/// wait out each step's decode: a step's barrier holds every subgroup to it. Here subgroups 0..7 multiply (each its 32
+/// rows by 64 tokens, f32 sums) as subgroups 8..15 decode and copy the next step (a thread a weight row's half of it and
+/// a token row's), the barrier between steps the only wait. A decoding thread's words come in two sets, a step's in one
+/// and the next's in the other, each loaded a whole step before it is decoded (a set shifted into the other at the end
+/// of a step waited on its loads there). Every subgroup its own 32 lanes (`li / 32`), its branch its own: a device
+/// whose subgroups are 32 lanes (`Gpu::subgroups32`). `diagnostic(off, derivative_uniformity)`: naga holds a
+/// cooperative op to uniform control flow by that rule, where a subgroup's is what the tensor cores need.
+///
+/// Q4_K's [12288, 4096] by 512 tokens on an NVIDIA A2 at 1,200 MHz: 5.9 TFLOPS in [`COOP_KERNEL`], 6.7 so (its
+/// multiplies alone 8.2, its decodes alone 9.3: they share the SM's issue and its memory's paths). f16 sums ran the
+/// multiplies alone at 10.2, but folding them into f32 ones wants registers a thread of 512 has not (128).
+const COOP_SPLIT_KERNEL: &str = r#"diagnostic(off, derivative_uniformity);
+enable f16;
+enable wgpu_cooperative_matrix;
+struct Params { k: u32, n: u32, m: u32, row0: u32, rows: u32, row_bytes: u32, splits: u32, _pad1: u32, }
+WEIGHTS_BINDING
+@group(0) @binding(1) var<storage, read> x16: array<vec4<f16>>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> p: Params;
+
+// [`COOP_KERNEL`]'s two steps' weights and tokens, and a multiplying subgroup's fragment staged at a tile's edge
+const S4: u32 = 10u;
+const BUF4: u32 = 1280u;
+var<workgroup> wt: array<vec4<f16>, 2560>;
+var<workgroup> xt: array<vec4<f16>, 2560>;
+var<workgroup> edge: array<f32, 2048>;
+
+DECODE_HELPERS
+
+// a byte as f32, less `o`: its bits in 2^23's mantissa (exact, no conversion)
+fn byte_less(w: u32, o: f32) -> vec4<f32> {
+    let b = vec4<u32>(w & 255u, (w >> 8u) & 255u, (w >> 16u) & 255u, w >> 24u);
+    return bitcast<vec4<f32>>(b | vec4<u32>(0x4b000000u)) - vec4<f32>(8388608.0 + o);
+}
+
+@compute @workgroup_size(512)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let r0 = wg.x * 128u;
+    let t0 = wg.y * 128u;
+    let sg = li / 32u;
+    let lane = li % 32u;
+    // subgroups 0..7 multiply, each its 32 rows by 64 tokens of the tile
+    let mult = sg < 8u;
+    let sr = (sg % 4u) * 32u;
+    let st = ((sg / 4u) % 2u) * 64u;
+    // subgroups 8..15 decode and copy: a thread weight row lr's half lh of a step, and token row lr's (a row past the
+    // weight's its last's again: its sums are not stored)
+    let lr = (li % 256u) / 2u;
+    let lh = li % 2u;
+    let rl = min(r0 + lr, p.rows - 1u);
+    let kx = p.k;
+    // the workgroup's split of the steps (`wg.z` of `p.splits`, none empty), its sums that split's part of `y`
+    let all = (p.k + 31u) / 32u;
+    let per = (all + p.splits - 1u) / p.splits;
+    let s0 = wg.z * per;
+    let s1 = min(all, s0 + per);
+    let zo = wg.z * p.m * p.n;
+    // (the tokens as [`X_F16_TILED`] gives them: a step's for every padded token together)
+    let padded = ((p.m + 127u) / 128u) * 128u;
+    let xo = (t0 + lr) * 8u + lh * 4u;
+    let xs = padded * 8u;
+    var c00 = coop_mat16x16<f32, C>();
+    var c01 = coop_mat16x16<f32, C>();
+    var c02 = coop_mat16x16<f32, C>();
+    var c03 = coop_mat16x16<f32, C>();
+    var c10 = coop_mat16x16<f32, C>();
+    var c11 = coop_mat16x16<f32, C>();
+    var c12 = coop_mat16x16<f32, C>();
+    var c13 = coop_mat16x16<f32, C>();
+    // a decoding thread's two sets of a step's words and tokens
+SETS
+    // the first step decoded, the next two's loaded; then each step multiplied as the next is decoded and the one
+    // after that's loaded, two steps a turn of the loop (the sets taking turns)
+    if (!mult) {
+        {
+            let b = s0;
+LOAD_FIRST_0
+        }
+        {
+            let b = min(s0 + 1u, s1 - 1u);
+LOAD_FIRST_1
+        }
+        {
+            let b = s0;
+            let buf = (s0 % 2u) * BUF4;
+DECODE_0
+        }
+    }
+    workgroupBarrier();
+    for (var b0 = s0; b0 < s1; b0 += 2u) {
+        {
+            let cur = (b0 % 2u) * BUF4;
+            if (mult) {
+MULTIPLY
+            } else {
+                {
+                    let b = min(b0 + 1u, s1 - 1u);
+                    let buf = ((b0 + 1u) % 2u) * BUF4;
+DECODE_1
+                }
+                {
+                    let b = min(b0 + 2u, s1 - 1u);
+LOAD_0
+                }
+            }
+            workgroupBarrier();
+        }
+        // (the second of the two where there is one: the condition the workgroup's alike)
+        if (b0 + 1u < s1) {
+            let cur = ((b0 + 1u) % 2u) * BUF4;
+            if (mult) {
+MULTIPLY
+            } else {
+                {
+                    let b = min(b0 + 2u, s1 - 1u);
+                    let buf = (b0 % 2u) * BUF4;
+DECODE_0
+                }
+                {
+                    let b = min(b0 + 3u, s1 - 1u);
+LOAD_1
+                }
+            }
+            workgroupBarrier();
+        }
+    }
+    // out: y[token, row] is the tile's (row, token) column-major, a token's rows `n` apart
+    let ns = p.n;
+    let full = r0 + 128u <= p.rows && t0 + 128u <= p.m;
+    if (full) {
+        if (mult) {
+            let o = zo + (t0 + st) * ns + p.row0 + r0 + sr;
+            let o01 = o + 16u * ns;
+            let o02 = o + 32u * ns;
+            let o03 = o + 48u * ns;
+            let o10 = o + 16u;
+            let o11 = o + 16u + 16u * ns;
+            let o12 = o + 16u + 32u * ns;
+            let o13 = o + 16u + 48u * ns;
+            coopStore(c00, &y[o], ns);
+            coopStore(c01, &y[o01], ns);
+            coopStore(c02, &y[o02], ns);
+            coopStore(c03, &y[o03], ns);
+            coopStore(c10, &y[o10], ns);
+            coopStore(c11, &y[o11], ns);
+            coopStore(c12, &y[o12], ns);
+            coopStore(c13, &y[o13], ns);
+        }
+    } else {
+        // a tile at the edge: each fragment through the subgroup's staging, its rows and tokens in bounds
+EDGE_STORES
+    }
+}
+"#;
+
+/// [`coop_tiled_split`]'s store of a fragment at a tile's edge (by the multiplying subgroups; the barriers the
+/// workgroup's).
+const COOP_SPLIT_EDGE: &str = r#"        {
+            if (mult) {
+                let eo = sg * 256u;
+                coopStore(CF, &edge[eo], 16u);
+            }
+            workgroupBarrier();
+            if (mult) {
+                for (var e = lane; e < 256u; e += 32u) {
+                    let row = r0 + sr + FR + e % 16u;
+                    let t = t0 + st + FT + e / 16u;
+                    if (row < p.rows && t < p.m) { y[zo + t * p.n + p.row0 + row] = edge[sg * 256u + e]; }
+                }
+            }
+            workgroupBarrier();
+        }
+"#;
+
+/// [`COOP_SPLIT_KERNEL`]'s step multiplied by a subgroup: k's two halves of 16 (every index and stride a `let` of its
+/// own, for naga's SPIR-V).
+const COOP_SPLIT_MULTIPLY: &str = r#"                {
+                    let ia0 = cur + sr * S4 + KK4;
+                    let ia1 = cur + (sr + 16u) * S4 + KK4;
+                    let ib0 = cur + st * S4 + KK4;
+                    let ib1 = ib0 + 16u * S4;
+                    let ib2 = ib0 + 32u * S4;
+                    let ib3 = ib0 + 48u * S4;
+                    let s10 = S4;
+                    let a0 = coopLoadT<coop_mat16x16<f16, A>>(&wt[ia0], s10);
+                    let a1 = coopLoadT<coop_mat16x16<f16, A>>(&wt[ia1], s10);
+                    let b0f = coopLoad<coop_mat16x16<f16, B>>(&xt[ib0], s10);
+                    let b1f = coopLoad<coop_mat16x16<f16, B>>(&xt[ib1], s10);
+                    let b2f = coopLoad<coop_mat16x16<f16, B>>(&xt[ib2], s10);
+                    let b3f = coopLoad<coop_mat16x16<f16, B>>(&xt[ib3], s10);
+                    c00 = coopMultiplyAdd(a0, b0f, c00);
+                    c01 = coopMultiplyAdd(a0, b1f, c01);
+                    c02 = coopMultiplyAdd(a0, b2f, c02);
+                    c03 = coopMultiplyAdd(a0, b3f, c03);
+                    c10 = coopMultiplyAdd(a1, b0f, c10);
+                    c11 = coopMultiplyAdd(a1, b1f, c11);
+                    c12 = coopMultiplyAdd(a1, b2f, c12);
+                    c13 = coopMultiplyAdd(a1, b3f, c13);
+                }
+"#;
+
+/// [`COOP_SPLIT_KERNEL`]'s tokens: a set's registers, a step's loads into them, their stores (`SET` the set).
+const COOP_SPLIT_X_REGS: &str = "    var xaSET = vec4<f16>();\n    var xbSET = vec4<f16>();\n    var xcSET = vec4<f16>();\n    var xdSET = vec4<f16>();\n";
+const COOP_SPLIT_X_LOAD: &str = r#"            let xb = xo + b * xs;
+            xaSET = x16[xb];
+            xbSET = x16[xb + 1u];
+            xcSET = x16[xb + 2u];
+            xdSET = x16[xb + 3u];
+"#;
+const COOP_SPLIT_X_STORE: &str = r#"            xt[at4] = xaSET;
+            xt[at4 + 1u] = xbSET;
+            xt[at4 + 2u] = xcSET;
+            xt[at4 + 3u] = xdSET;
+"#;
+
+/// Q4_K's parts of [`coop_tiled_split`]: a step's words the block's header and the thread's 16 bytes of the step's
+/// pair of sub-blocks (its nibbles low or high).
+const COOP_SPLIT_Q4K_REGS: &str = "    var hdSET = vec4<u32>();\n    var qvSET = vec4<u32>();\n";
+const COOP_SPLIT_Q4K_LOAD: &str = r#"            let lb4 = rl * (p.row_bytes / 16u) + (b / 8u) * 9u;
+            if (FIRST || b % 8u < 2u) {
+                hdSET = w4[lb4];
+            }
+            qvSET = w4[lb4 + 1u + 2u * ((b % 8u) / 2u) + lh];
+"#;
+const COOP_SPLIT_Q4K_DECODE: &str = r#"            let sb = b % 8u;
+            let sh = 4u * (sb % 2u);
+            let dm = unpack2x16float(hdSET.x);
+            let smn = scale_min(hdSET, sb);
+            let dsc = dm.x * smn.x;
+            let dmn = vec4<f32>(dm.y * smn.y);
+            wt[at4] = vec4<f16>(dsc * byte_less((qvSET.x >> sh) & 0x0f0f0f0fu, 0.0) - dmn);
+            wt[at4 + 1u] = vec4<f16>(dsc * byte_less((qvSET.y >> sh) & 0x0f0f0f0fu, 0.0) - dmn);
+            wt[at4 + 2u] = vec4<f16>(dsc * byte_less((qvSET.z >> sh) & 0x0f0f0f0fu, 0.0) - dmn);
+            wt[at4 + 3u] = vec4<f16>(dsc * byte_less((qvSET.w >> sh) & 0x0f0f0f0fu, 0.0) - dmn);
+"#;
+
+/// Q5_K's: Q4_K's and the thread's 16 bytes of the block's high bits.
+const COOP_SPLIT_Q5K_REGS: &str = "    var hdSET = vec4<u32>();\n    var hwSET = vec4<u32>();\n    var qvSET = vec4<u32>();\n";
+const COOP_SPLIT_Q5K_LOAD: &str = r#"            let lb4 = rl * (p.row_bytes / 16u) + (b / 8u) * 11u;
+            if (FIRST || b % 8u < 2u) {
+                hdSET = w4[lb4];
+                hwSET = w4[lb4 + 1u + lh];
+            }
+            qvSET = w4[lb4 + 3u + 2u * ((b % 8u) / 2u) + lh];
+"#;
+const COOP_SPLIT_Q5K_DECODE: &str = r#"            let sb = b % 8u;
+            let sh = 4u * (sb % 2u);
+            let dm = unpack2x16float(hdSET.x);
+            let smn = scale_min(hdSET, sb);
+            let dsc = dm.x * smn.x;
+            let dmn = vec4<f32>(dm.y * smn.y);
+            wt[at4] = vec4<f16>(dsc * byte_less(((qvSET.x >> sh) & 0x0f0f0f0fu) | (((hwSET.x >> sb) & 0x01010101u) << 4u), 0.0) - dmn);
+            wt[at4 + 1u] = vec4<f16>(dsc * byte_less(((qvSET.y >> sh) & 0x0f0f0f0fu) | (((hwSET.y >> sb) & 0x01010101u) << 4u), 0.0) - dmn);
+            wt[at4 + 2u] = vec4<f16>(dsc * byte_less(((qvSET.z >> sh) & 0x0f0f0f0fu) | (((hwSET.z >> sb) & 0x01010101u) << 4u), 0.0) - dmn);
+            wt[at4 + 3u] = vec4<f16>(dsc * byte_less(((qvSET.w >> sh) & 0x0f0f0f0fu) | (((hwSET.w >> sb) & 0x01010101u) << 4u), 0.0) - dmn);
+"#;
+
+/// Q3_K's: the thread's 16 bytes of the block's high bits and of the step's half of its low ones, and the scales.
+const COOP_SPLIT_Q3K_REGS: &str = "    var hmSET = vec4<u32>();\n    var qsSET = vec4<u32>();\n    var sdSET = vec4<u32>();\n";
+const COOP_SPLIT_Q3K_LOAD: &str = r#"            let lb4 = rl * (p.row_bytes / 16u) + (b / 8u) * 7u;
+            if (FIRST || b % 8u < 2u) {
+                hmSET = w4[lb4 + lh];
+                sdSET = w4[lb4 + 6u];
+            }
+            qsSET = w4[lb4 + 2u + 2u * ((b % 8u) / 4u) + lh];
+"#;
+const COOP_SPLIT_Q3K_DECODE: &str = r#"            let q = b % 8u;
+            let h = q / 4u;
+            let j = q % 4u;
+            let scs = q3_scales32(sdSET, h, j) * unpack2x16float(sdSET.w & 0xffffu).x;
+            let sc = select(scs.x, scs.y, lh == 1u);
+            wt[at4] = vec4<f16>(sc * byte_less(q3_bytes(qsSET.x, hmSET.x, j, h), 4.0));
+            wt[at4 + 1u] = vec4<f16>(sc * byte_less(q3_bytes(qsSET.y, hmSET.y, j, h), 4.0));
+            wt[at4 + 2u] = vec4<f16>(sc * byte_less(q3_bytes(qsSET.z, hmSET.z, j, h), 4.0));
+            wt[at4 + 3u] = vec4<f16>(sc * byte_less(q3_bytes(qsSET.w, hmSET.w, j, h), 4.0));
+"#;
+
+/// Q6_K's ([`COOP_Q6K_AHEAD_LOAD`]'s words, as a set).
+const COOP_SPLIT_Q6K_REGS: &str = "    var q6lSET = vec4<u32>();\n    var q6hSET = vec4<u32>();\n    var q6dSET = 0u;\n    var q6sSET = 0u;\n";
+// (a step's low bits are its step two before's in a set's alternate steps where `b % 4` is 2 or 3 (their high
+// nibbles), its high bits the same four steps', its scale the block's)
+const COOP_SPLIT_Q6K_LOAD: &str = r#"            let l6 = rl * p.row_bytes + (b / 8u) * 210u;
+            let l6h = (b % 8u) / 4u;
+            let l6d = b % 4u;
+            if (FIRST || l6d < 2u) {
+                q6lSET = words4_at(l6 + l6h * 64u + (l6d & 1u) * 32u + lh * 16u);
+                q6hSET = words4_at(l6 + 128u + l6h * 32u + lh * 16u);
+            }
+            if (FIRST || b % 8u < 2u) {
+                q6dSET = byte(l6 + 208u) | (byte(l6 + 209u) << 8u);
+            }
+            q6sSET = byte(l6 + 192u + l6h * 8u + 2u * l6d + lh);
+"#;
+const COOP_SPLIT_Q6K_DECODE: &str = r#"            let qd = b % 4u;
+            let lshift = select(0u, 4u, qd >= 2u);
+            let hshift = 2u * qd;
+            let scb = q6sSET;
+            let sc = unpack2x16float(q6dSET).x * f32(i32(scb) - select(0, 256, scb >= 128u));
+            wt[at4] = vec4<f16>(sc * byte_less(((q6lSET.x >> lshift) & 0x0f0f0f0fu) | (((q6hSET.x >> hshift) & 0x03030303u) << 4u), 32.0));
+            wt[at4 + 1u] = vec4<f16>(sc * byte_less(((q6lSET.y >> lshift) & 0x0f0f0f0fu) | (((q6hSET.y >> hshift) & 0x03030303u) << 4u), 32.0));
+            wt[at4 + 2u] = vec4<f16>(sc * byte_less(((q6lSET.z >> lshift) & 0x0f0f0f0fu) | (((q6hSET.z >> hshift) & 0x03030303u) << 4u), 32.0));
+            wt[at4 + 3u] = vec4<f16>(sc * byte_less(((q6lSET.w >> lshift) & 0x0f0f0f0fu) | (((q6hSET.w >> hshift) & 0x03030303u) << 4u), 32.0));
+"#;
+
+/// Q8_0's ([`COOP_Q8_0_AHEAD_LOAD`]'s words, as a set).
+const COOP_SPLIT_Q8_0_REGS: &str = "    var q8wSET = vec4<u32>();\n    var q8dSET = 0u;\n";
+const COOP_SPLIT_Q8_0_LOAD: &str = r#"            let l8 = rl * p.row_bytes + b * 34u;
+            q8wSET = words4_at(l8 + 2u + lh * 16u);
+            q8dSET = byte(l8) | (byte(l8 + 1u) << 8u);
+"#;
+const COOP_SPLIT_Q8_0_DECODE: &str = r#"            let d = unpack2x16float(q8dSET).x;
+            wt[at4] = vec4<f16>(d * byte_less(q8wSET.x ^ 0x80808080u, 128.0));
+            wt[at4 + 1u] = vec4<f16>(d * byte_less(q8wSET.y ^ 0x80808080u, 128.0));
+            wt[at4 + 2u] = vec4<f16>(d * byte_less(q8wSET.z ^ 0x80808080u, 128.0));
+            wt[at4 + 3u] = vec4<f16>(d * byte_less(q8wSET.w ^ 0x80808080u, 128.0));
+"#;
+
+/// [`coop_tiled`] with its subgroups' work apart ([`COOP_SPLIT_KERNEL`]): for a device whose subgroups are 32 lanes,
+/// where it is the faster ([`crate::chain`]'s `coop_split_for`). None for a type without its parts.
+pub fn coop_tiled_split(dtype: GgmlType) -> Option<String> {
+    let vec4s = "@group(0) @binding(0) var<storage, read> w4: array<vec4<u32>>;";
+    let words = "@group(0) @binding(0) var<storage, read> w: array<u32>;";
+    let (binding, helpers, regs, load, decode) = match dtype {
+        GgmlType::Q3_K => (vec4s, COOP_Q3K_HELPERS, COOP_SPLIT_Q3K_REGS, COOP_SPLIT_Q3K_LOAD, COOP_SPLIT_Q3K_DECODE),
+        GgmlType::Q4_K => (vec4s, COOP_K_HELPERS, COOP_SPLIT_Q4K_REGS, COOP_SPLIT_Q4K_LOAD, COOP_SPLIT_Q4K_DECODE),
+        GgmlType::Q5_K => (vec4s, COOP_K_HELPERS, COOP_SPLIT_Q5K_REGS, COOP_SPLIT_Q5K_LOAD, COOP_SPLIT_Q5K_DECODE),
+        GgmlType::Q6_K => (words, COOP_AHEAD_HELPERS, COOP_SPLIT_Q6K_REGS, COOP_SPLIT_Q6K_LOAD, COOP_SPLIT_Q6K_DECODE),
+        GgmlType::Q8_0 => (words, COOP_AHEAD_HELPERS, COOP_SPLIT_Q8_0_REGS, COOP_SPLIT_Q8_0_LOAD, COOP_SPLIT_Q8_0_DECODE),
+        _ => return None,
+    };
+    let set = |part: &str, s: &str| part.replace("SET", s);
+    let sets = format!("{}{}{}{}", set(regs, "0"), set(COOP_SPLIT_X_REGS, "0"), set(regs, "1"), set(COOP_SPLIT_X_REGS, "1"));
+    let load_of = |s: &str| format!("{}{}", set(load, s), set(COOP_SPLIT_X_LOAD, s));
+    let decode_of = |s: &str| format!("            let at4 = buf + lr * S4 + lh * 4u;\n{}{}", set(decode, s), set(COOP_SPLIT_X_STORE, s));
+    let multiply = format!("{}{}", COOP_SPLIT_MULTIPLY.replace("KK4", "0u"), COOP_SPLIT_MULTIPLY.replace("KK4", "4u"));
+    let frags = [("c00", 0u32, 0u32), ("c01", 0, 16), ("c02", 0, 32), ("c03", 0, 48), ("c10", 16, 0), ("c11", 16, 16), ("c12", 16, 32), ("c13", 16, 48)];
+    let edges: String = frags.iter().map(|(cf, fr, ft)| COOP_SPLIT_EDGE.replace("CF", cf).replace("FR", &format!("{fr}u")).replace("FT", &format!("{ft}u"))).collect();
+    Some(
+        COOP_SPLIT_KERNEL
+            .replace("WEIGHTS_BINDING", binding)
+            .replace("DECODE_HELPERS", helpers)
+            .replace("SETS\n", &sets)
+            .replace("LOAD_FIRST_0\n", &load_of("0").replace("FIRST", "true"))
+            .replace("LOAD_FIRST_1\n", &load_of("1").replace("FIRST", "true"))
+            .replace("LOAD_0\n", &load_of("0").replace("FIRST", "false"))
+            .replace("LOAD_1\n", &load_of("1").replace("FIRST", "false"))
+            .replace("DECODE_0\n", &decode_of("0"))
+            .replace("DECODE_1\n", &decode_of("1"))
+            .replace("MULTIPLY\n", &multiply)
+            .replace("EDGE_STORES\n", &edges),
+    )
+}
+
 /// [`coop_tiled`] for NVFP4 weights ([`COOP_NVFP4_HELPERS`]'s layout; `k` of 64), its sums f32 throughout.
 pub fn coop_tiled_nvfp4() -> String {
     f32_sums(&coop_source("@group(0) @binding(0) var<storage, read> w: array<u32>;", COOP_NVFP4_HELPERS, COOP_NVFP4_REGS, "", COOP_NVFP4_LOAD, COOP_NVFP4_STEP, COOP_X_TILED))
@@ -1094,3 +1440,4 @@ pub(crate) fn coop_tiled_marked(dtype: GgmlType) -> Option<String> {
     let marked = marked.replacen("SECOND_STEP", "        // DECODE BEGIN\n        DECODE_STEP\n        // DECODE END\n        let xa = buf + lr * S4 + lh * 4u;\n        xt[xa] = xr0;", 1);
     Some(marked.replace("FOLDu", &format!("{COOP_FOLD}u")).replace("WEIGHTS_BINDING", binding).replace("DECODE_HELPERS", helpers).replace("DECODE_REGS", regs).replace("LOAD_BLOCK", load).replace("STEP_LOAD", "").replace("X_LOAD", COOP_X_TILED).replace("X_NEXT", &COOP_X_TILED.replace("xr", "xn")).replace("DECODE_STEP", step).replace("EDGE_STORES", &edges))
 }
+

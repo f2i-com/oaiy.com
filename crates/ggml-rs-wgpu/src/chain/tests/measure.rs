@@ -428,9 +428,11 @@ fn measure_coop_parts() {
     let (x16, y) = (b.vec(m * k / 2), b.vec(m * n));
     DeviceChain::upload(&b, &x16, &vec![f32::from_bits(0x3c003c00); m * k / 2]);
     let full = crate::shaders::coop_tiled(GgmlType::Q3_K).unwrap();
-    let tail = "        } else {\n            for (var i = 0u; i < 4u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }\n        }";
-    let step = &full[full.find("let at4 = buf").unwrap()..full.find(tail).unwrap() + tail.len()];
-    let constants = full.replace(step, "let at4 = buf + lr * S4 + lh * 4u;\n        for (var i = 0u; i < 4u; i++) { wt[at4 + i] = vec4<f16>(0.5h); }");
+    // (the loop's decode: its tile's place, then a block to the stores of its tokens)
+    let loop_at = full.find("for (var b0 = w0").unwrap();
+    let from = loop_at + full[loop_at..].find("let at4 = buf").unwrap();
+    let step = &full[from..from + full[from..].find("        let xa = buf").unwrap()];
+    let constants = full.replace(step, "let at4 = buf + lr * S4 + lh * 4u;\n        for (var i = 0u; i < 4u; i++) { wt[at4 + i] = vec4<f16>(0.5h); }\n");
     let nothing = full.replace(step, "");
     let mut no_mma = full.clone();
     for (c, a, bf) in [("c00", "a0", "b0f"), ("c01", "a0", "b1f"), ("c02", "a0", "b2f"), ("c03", "a0", "b3f"), ("c10", "a1", "b0f"), ("c11", "a1", "b1f"), ("c12", "a1", "b2f"), ("c13", "a1", "b3f")] {
@@ -1436,4 +1438,69 @@ fn measure_q8_rows_9b() {
         line += &format!("\n{dtype:?} [{n}, {k}]: {:.1} us, {:.0} GB/s", s * 1e6, nbytes as f64 / s / 1e9);
     }
     eprintln!("{line}");
+}
+
+/// A prompt's tensor-core matmul each way (`--ignored --nocapture`): [`crate::shaders::coop_tiled`] (each subgroup
+/// decodes, then multiplies) and [`crate::shaders::coop_tiled_split`] (subgroups that decode apart from those that
+/// multiply), on Qwen3.5 9B's FFN gate ([12288, 4096] by 512 tokens; OAIY_COOP_NK another `NxK`), each type's, and how
+/// far apart their sums are (the worst element's, of their RMS: f16 windows' against f32 sums).
+#[test]
+#[ignore = "a measurement"]
+fn measure_coop_kernels() {
+    let Ok(b) = WgpuBackend::new(Some(4 << 30)) else { return };
+    if !b.gpu.coop16() || !b.gpu.subgroups32() {
+        return;
+    }
+    let nk = std::env::var("OAIY_COOP_NK").unwrap_or_else(|_| "12288x4096".into());
+    let (n, k): (usize, usize) = {
+        let mut it = nk.split('x').map(|v| v.parse().expect("NxK"));
+        (it.next().expect("N"), it.next().expect("K"))
+    };
+    let m = 512usize;
+    let padded = m.div_ceil(128) * 128;
+    let x16 = b.vec(padded * k / 2);
+    let mut next = rng(11);
+    let halves: Vec<f32> = (0..padded * k / 2).map(|_| f32::from_bits(half::f16::from_f32(next()).to_bits() as u32 | (half::f16::from_f32(next()).to_bits() as u32) << 16)).collect();
+    DeviceChain::upload(&b, &x16, &halves);
+    let y = b.vec(m * n);
+    for (dtype, block, bytes) in [(GgmlType::Q4_K, 256usize, 144usize), (GgmlType::Q5_K, 256, 176), (GgmlType::Q6_K, 256, 210), (GgmlType::Q8_0, 32, 34), (GgmlType::Q3_K, 256, 110)] {
+        // (bytes whose f16 scales are small and finite)
+        let raw: Vec<u8> = (0..n * (k / block) * bytes).map(|i| (i as u32).wrapping_mul(2_654_435_761).wrapping_shr(13) as u8 & 0x3b).collect();
+        let w = ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(raw, vec![n, k], dtype));
+        let q = w.device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).expect("on the GPU");
+        let mut line = format!("{dtype:?} [{n}, {k}] by {m}:");
+        let mut sums: Vec<Vec<f32>> = Vec::new();
+        for (way, src) in [("together", crate::shaders::coop_tiled(dtype).expect("its kernel")), ("apart", crate::shaders::coop_tiled_split(dtype).expect("its kernel"))] {
+            let name: &'static str = Box::leak(format!("bench-coop-{way}-{dtype:?}").into_boxed_str());
+            let pipeline = b.gpu.named_pipeline(name, || src.clone());
+            let dispatch = |rec: &mut Recorder| {
+                for (chunk, row0, rows) in &q.chunks {
+                    let words = [k as u32, n as u32, m as u32, *row0, *rows, q.row_bytes as u32, 1, 0];
+                    rec.dispatch_kept(&pipeline, chunk, buffer(&x16), buffer(&y), &words, (rows.div_ceil(128), (m as u32).div_ceil(128), 1));
+                }
+            };
+            let mut rec = Recorder::new(&b);
+            dispatch(&mut rec);
+            rec.read(&y);
+            sums.push(Box::new(rec).finish().pop().expect("the sums"));
+            let run = || {
+                let mut rec = Recorder::new(&b);
+                for _ in 0..8 {
+                    dispatch(&mut rec);
+                }
+                rec.read_range(&y, 0, 1);
+                Box::new(rec).finish();
+            };
+            run();
+            let t = std::time::Instant::now();
+            for _ in 0..3 {
+                run();
+            }
+            let ms = t.elapsed().as_secs_f64() / 24.0 * 1e3;
+            line += &format!(" {way} {ms:.3} ms ({:.2} TFLOPS)", 2.0 * (m * n * k) as f64 / ms / 1e9);
+        }
+        let rms = (sums[0].iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / sums[0].len() as f64).sqrt();
+        let worst = sums[1].iter().zip(&sums[0]).map(|(a, e)| ((a - e) as f64).abs()).fold(0.0, f64::max);
+        eprintln!("{line}; apart's sums within {:.1e} of the RMS", worst / rms);
+    }
 }

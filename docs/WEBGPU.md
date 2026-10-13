@@ -427,6 +427,26 @@ same arithmetic (Q4_K's sums checked bit for bit); Qwen3.5 9B Q4_K_M's 6,933-tok
 at 251 tokens a second and now 321. (The step's barrier is what is left: without it, invalid
 as that is, Q4_K's would be 8.7.)
 
+The barrier itself was not the cost: the step's loop without its decode (the weights the
+first step's, the tokens copied each step) ran at 10.2 TFLOPS with it. What it held up was
+every subgroup decoding its share of a step and only then multiplying, the tensor cores
+idle through each step's decode. Where a device's subgroups are 32 lanes
+(`Gpu::subgroups32`) a prompt's matmul may take `shaders::coop_tiled_split`: 512 threads,
+subgroups 0..7 multiplying (f32 sums) as 8..15 decode and copy the next step, each
+decoding thread's words in two sets that take turns, a step's loaded a whole step before it
+is decoded (a register set shifted at the end of a step waited on its loads there), and a
+block's header loaded once a block a set. naga holds a cooperative op to uniform control
+flow under its `derivative_uniformity` rule; the kernel turns it off
+(`diagnostic(off, derivative_uniformity)`), a subgroup's control flow being what the tensor
+cores need. On the A2 at 1,200 MHz 512 tokens through [12288, 4096]: Q4_K 6.2 TFLOPS
+together and 6.8 apart, Q6_K 5.1 and 5.7, Q3_K 6.0 and 6.6, Q5_K 5.7 and 5.9, Q8_0 5.1 and
+5.3 (`measure_coop_kernels`; the decodes alone 9.3, the multiplies alone 8.2, together
+they share the SM's issue and its memory's paths). Which is the faster is timed on each
+device once a type (`chain::matmul::coop_split_for`; `OAIY_COOP_SPLIT=1` or `0` decides).
+The together kernel's decode lost its branch on rows past the weight's (they decode the
+last row's words; their sums are not stored) and Q4_K's and Q5_K's scales are made both
+ways and one chosen, 5.9 to 6.2 TFLOPS for Q4_K.
+
 Against the request Strata's benchmark makes (a synthetic Python module up to 4,096
 prompt tokens, greedy, 256 tokens), the same two cards: the prompt at 3,600 tokens a
 second (Strata 4,270), the reply at 78 to 81 tokens a second plain and 108 to 120
